@@ -29,12 +29,10 @@
 
 enum {
     BROOK_THEME_GLASS = 0,
-    BROOK_THEME_OPAQUE_LIGHT = 1,
-    BROOK_THEME_OPAQUE_DARK = 2,
-    BROOK_THEME_COUNT = 3
+    BROOK_THEME_OPAQUE = 1,
+    BROOK_THEME_COUNT = 2
 };
-/* Glass only: Light glass and light apps, Mixed (dark glass around light
- * apps; the default) or Dark. An Opaque theme is one mode throughout. */
+/* Mixed uses dark system chrome around light app content in either material. */
 enum {
     BROOK_MODE_LIGHT = 0,
     BROOK_MODE_MIXED = 1,
@@ -45,7 +43,8 @@ enum {
     BROOK_HUE_BLUE = 0, BROOK_HUE_NAVY, BROOK_HUE_TEAL, BROOK_HUE_PINE, BROOK_HUE_PHOSPHOR,
     BROOK_HUE_LIME, BROOK_HUE_AMBER, BROOK_HUE_ORANGE, BROOK_HUE_RED, BROOK_HUE_PINK,
     BROOK_HUE_VIOLET, BROOK_HUE_SLATE, BROOK_HUE_WALLPAPER,
-    BROOK_HUE_COUNT
+    BROOK_HUE_COUNT,
+    BROOK_HUE_CUSTOM = BROOK_HUE_COUNT
 };
 /* The palettes before Clearwater, as numbered by settings.ini theme=0..2 and
  * 0xB02 ops 0/1. They survive as hues: Smoked is Slate, Opal is Pine green. */
@@ -64,49 +63,62 @@ static inline unsigned brook_hue_legacy_palette(unsigned hue) {
            hue == BROOK_HUE_SLATE ? (unsigned)BROOK_LEGACY_PALETTE_SMOKED : (unsigned)BROOK_LEGACY_PALETTE_CLEARWATER;
 }
 
-/* The selection word (0xB02 ops 2/3): theme in bits 0-3, mode in bits 4-7,
- * hue in bits 8-12; every other bit is zero. */
+/* Ops 6/7 use the selection word below and reserve bits 16-39 for an
+ * exact sRGB custom accent. Ops 2/3 retain the older three-theme encoding. */
 #define BROOK_THEME_SELECTION(theme, mode, hue) \
     ((uint32_t)(theme) | (uint32_t)(mode) << 4 | (uint32_t)(hue) << 8)
 #define BROOK_THEME_SELECTION_DEFAULT BROOK_THEME_SELECTION(BROOK_THEME_GLASS, BROOK_MODE_MIXED, BROOK_HUE_BLUE)
-static inline unsigned brook_selection_theme(uint32_t s) { return s & 15u; }
-static inline unsigned brook_selection_mode(uint32_t s) { return (s >> 4) & 15u; }
-static inline unsigned brook_selection_hue(uint32_t s) { return (s >> 8) & 31u; }
-static inline int brook_selection_valid(uint32_t s) {
-    return !(s & ~0x1fffu) && brook_selection_theme(s) < BROOK_THEME_COUNT &&
-           brook_selection_mode(s) < BROOK_MODE_COUNT && brook_selection_hue(s) < BROOK_HUE_COUNT;
+static inline unsigned brook_selection_theme(uint64_t s) { return s & 15u; }
+static inline unsigned brook_selection_mode(uint64_t s) { return (s >> 4) & 15u; }
+static inline unsigned brook_selection_hue(uint64_t s) { return (s >> 8) & 31u; }
+static inline uint32_t brook_selection_rgb(uint64_t s) { return (s >> 16) & 0xffffffu; }
+static inline uint64_t brook_selection_make(unsigned material, unsigned mode, unsigned hue, uint32_t rgb) {
+    return BROOK_THEME_SELECTION(material, mode, hue) | ((uint64_t)rgb << 16);
 }
-/* 0xB02 ops. 0/1: the legacy palette id (query; set = choose its hue).
- * 2/3: the selection word (query; set). 4: status (brook_appearance.h). */
+static inline int brook_selection_valid(uint64_t s) {
+    return !(s & ~0xffffff1fffULL) && brook_selection_theme(s) < BROOK_THEME_COUNT &&
+           brook_selection_mode(s) < BROOK_MODE_COUNT && brook_selection_hue(s) <= BROOK_HUE_CUSTOM &&
+           (brook_selection_hue(s) == BROOK_HUE_CUSTOM || !brook_selection_rgb(s));
+}
 enum {
     BROOK_THEME_OP_LEGACY_QUERY = 0,
     BROOK_THEME_OP_LEGACY_SET = 1,
     BROOK_THEME_OP_QUERY = 2,
-    BROOK_THEME_OP_SET = 3
+    BROOK_THEME_OP_SET = 3,
+    BROOK_THEME_OP_MATERIAL_QUERY = 6,
+    BROOK_THEME_OP_MATERIAL_SET = 7
 };
-
-/* Glass resolves to its Opaque stand-in when the backend cannot blur:
- * Opaque Light if the mode was Light, otherwise Opaque Dark. */
-static inline unsigned brook_theme_resolve(unsigned theme, unsigned mode, int glassAvailable) {
-    if (theme == BROOK_THEME_GLASS && !glassAvailable)
-        return mode == BROOK_MODE_LIGHT ? (unsigned)BROOK_THEME_OPAQUE_LIGHT : (unsigned)BROOK_THEME_OPAQUE_DARK;
-    return theme < BROOK_THEME_COUNT ? theme : (unsigned)BROOK_THEME_GLASS;
+static inline int brook_selection_from_legacy(uint64_t old, uint64_t* selection) {
+    const unsigned theme = brook_selection_theme(old), mode = brook_selection_mode(old);
+    if ((old & ~0x1fffULL) || theme > 2 || mode >= BROOK_MODE_COUNT ||
+        brook_selection_hue(old) >= BROOK_HUE_COUNT) return 0;
+    *selection = BROOK_THEME_SELECTION(theme ? BROOK_THEME_OPAQUE : BROOK_THEME_GLASS,
+                                       theme == 1 ? BROOK_MODE_LIGHT : theme == 2 ? BROOK_MODE_DARK : mode,
+                                       brook_selection_hue(old));
+    return 1;
 }
-/* For a resolved theme: dark chrome, and dark app content. Mixed is dark
- * glass with light apps. */
-static inline int brook_theme_chrome_dark(unsigned resolved, unsigned mode) {
-    return resolved == BROOK_THEME_GLASS ? mode != BROOK_MODE_LIGHT : resolved == BROOK_THEME_OPAQUE_DARK;
+static inline uint32_t brook_selection_legacy(uint64_t selection) {
+    const unsigned theme = brook_selection_theme(selection), mode = brook_selection_mode(selection);
+    const unsigned hue = brook_selection_hue(selection);
+    return BROOK_THEME_SELECTION(theme == BROOK_THEME_GLASS ? 0 : mode == BROOK_MODE_LIGHT ? 1 : 2,
+                                 mode, hue < BROOK_HUE_COUNT ? hue : BROOK_HUE_BLUE);
 }
-static inline int brook_theme_content_dark(unsigned resolved, unsigned mode) {
-    return resolved == BROOK_THEME_GLASS ? mode == BROOK_MODE_DARK : resolved == BROOK_THEME_OPAQUE_DARK;
+static inline unsigned brook_theme_resolve(unsigned material, int glassAvailable) {
+    return material == BROOK_THEME_GLASS && glassAvailable ? BROOK_THEME_GLASS : BROOK_THEME_OPAQUE;
+}
+static inline int brook_theme_chrome_dark(unsigned mode) {
+    return mode != BROOK_MODE_LIGHT;
+}
+static inline int brook_theme_content_dark(unsigned mode) {
+    return mode == BROOK_MODE_DARK;
 }
 
 static inline const char* brook_theme_key(unsigned theme) {
-    static const char* const keys[BROOK_THEME_COUNT] = {"glass", "opaque-light", "opaque-dark"};
+    static const char* const keys[BROOK_THEME_COUNT] = {"glass", "opaque"};
     return theme < BROOK_THEME_COUNT ? keys[theme] : "glass";
 }
 static inline const char* brook_theme_name(unsigned theme) {
-    static const char* const names[BROOK_THEME_COUNT] = {"Glass", "Opaque Light", "Opaque Dark"};
+    static const char* const names[BROOK_THEME_COUNT] = {"Glass", "Opaque"};
     return theme < BROOK_THEME_COUNT ? names[theme] : "Glass";
 }
 static inline const char* brook_mode_key(unsigned mode) {
@@ -120,32 +132,32 @@ static inline const char* brook_mode_name(unsigned mode) {
 static inline const char* brook_hue_key(unsigned hue) {
     static const char* const keys[BROOK_HUE_COUNT] = {"blue", "navy", "teal", "pine", "phosphor", "lime", "amber",
                                                       "orange", "red", "pink", "violet", "slate", "wallpaper"};
-    return hue < BROOK_HUE_COUNT ? keys[hue] : "blue";
+    return hue < BROOK_HUE_COUNT ? keys[hue] : "custom";
 }
 static inline const char* brook_hue_name(unsigned hue) {
     static const char* const names[BROOK_HUE_COUNT] = {"Blue", "Navy", "Teal", "Pine green", "Phosphor", "Lime",
                                                        "Amber", "Orange", "Red", "Hot pink", "Violet", "Slate",
                                                        "Wallpaper"};
-    return hue < BROOK_HUE_COUNT ? names[hue] : "Blue";
+    return hue < BROOK_HUE_COUNT ? names[hue] : "Custom";
 }
 
-/* ------------------------------------------------------------------------
- * settings.ini [Desktop]: theme=glass|opaque-light|opaque-dark, mode=light|
- * mixed|dark, accent=<hue key>. Older values are aliases: theme=0|1|2 (the
- * legacy palettes: Clearwater, Opal = Pine green, Smoked = Slate),
- * palette=tinted|clearwater (Glass), palette=smoked|opal (Glass with Slate or
- * Pine green), dark=0|1 (the mode when mode= is absent) and performance=1
- * (the Opaque theme for that mode when theme= names none). Named keys win
- * whatever the order. Malformed values are ignored.
- * ---------------------------------------------------------------------- */
+/* settings.ini [Desktop]. Named legacy Opaque themes and numeric themes
+ * preserve their fixed modes. The older palette aliases still select hues. */
 typedef struct BrookThemeSettings {
-    int theme, mode, hue;          /* named keys; -1 unset */
-    int legacyPalette, paletteHue; /* theme=0..2; palette= (-1 unset; -2 the default hue) */
-    int dark, performance;         /* -1 unset */
+    int theme, mode, hue;
+    int legacyPalette, paletteHue, fixedMode;
+    int dark, performance;
+    uint32_t rgb;
 } BrookThemeSettings;
 static inline BrookThemeSettings brook_theme_settings_init(void) {
-    BrookThemeSettings s = {-1, -1, -1, -1, -1, -1, -1};
+    BrookThemeSettings s = {-1, -1, -1, -1, -1, -1, -1, -1, 0};
     return s;
+}
+static inline void brook_custom_accent_key(uint32_t rgb, char out[8]) {
+    const char* hex = "0123456789abcdef";
+    out[0] = '#';
+    for (unsigned i = 0; i < 6; ++i) out[i + 1] = hex[(rgb >> (20 - 4 * i)) & 15u];
+    out[7] = 0;
 }
 /* The value after "key=", trailing blanks dropped, equals word. */
 static inline int brook_theme_value_is(const char* value, const char* word) {
@@ -163,8 +175,14 @@ static inline int brook_theme_settings_line(BrookThemeSettings* s, const char* l
     const char* v;
     unsigned i;
     if ((v = brook_theme_after_key(line, "theme="))) {
+        const int opaqueLight = brook_theme_value_is(v, "opaque-light");
+        if (opaqueLight || brook_theme_value_is(v, "opaque-dark")) {
+            s->theme = BROOK_THEME_OPAQUE;
+            s->fixedMode = opaqueLight ? BROOK_MODE_LIGHT : BROOK_MODE_DARK;
+            return 1;
+        }
         for (i = 0; i < BROOK_THEME_COUNT; ++i)
-            if (brook_theme_value_is(v, brook_theme_key(i))) { s->theme = (int)i; return 1; }
+            if (brook_theme_value_is(v, brook_theme_key(i))) { s->theme = (int)i; s->fixedMode = -1; return 1; }
         for (i = 0; i < BROOK_LEGACY_PALETTE_COUNT; ++i) {
             const char digit[2] = {(char)('0' + i), 0};
             if (brook_theme_value_is(v, digit)) { s->legacyPalette = (int)i; return 1; }
@@ -177,6 +195,20 @@ static inline int brook_theme_settings_line(BrookThemeSettings* s, const char* l
         return 1;
     }
     if ((v = brook_theme_after_key(line, "accent="))) {
+        if (*v == '#') {
+            uint32_t rgb = 0;
+            for (i = 1; i <= 6; ++i) {
+                const char c = v[i];
+                unsigned digit;
+                if (c >= '0' && c <= '9') digit = c - '0';
+                else if (c >= 'a' && c <= 'f') digit = c - 'a' + 10;
+                else if (c >= 'A' && c <= 'F') digit = c - 'A' + 10;
+                else return 1;
+                rgb = rgb * 16 + digit;
+            }
+            if (brook_theme_value_is(v + 7, "")) { s->hue = BROOK_HUE_CUSTOM; s->rgb = rgb; }
+            return 1;
+        }
         for (i = 0; i < BROOK_HUE_COUNT; ++i)
             if (brook_theme_value_is(v, brook_hue_key(i))) { s->hue = (int)i; return 1; }
         return 1;
@@ -197,20 +229,22 @@ static inline int brook_theme_settings_line(BrookThemeSettings* s, const char* l
     }
     return 0;
 }
-static inline uint32_t brook_theme_settings_selection(const BrookThemeSettings* s) {
-    const unsigned mode = s->mode >= 0 ? (unsigned)s->mode :
+static inline uint64_t brook_theme_settings_selection(const BrookThemeSettings* s) {
+    const unsigned mode = s->fixedMode >= 0 ? (unsigned)s->fixedMode :
+                          s->theme < 0 && s->legacyPalette == 1 ? (unsigned)BROOK_MODE_LIGHT :
+                          s->theme < 0 && s->legacyPalette == 2 ? (unsigned)BROOK_MODE_DARK :
+                          s->mode >= 0 ? (unsigned)s->mode :
                           s->dark >= 0 ? (s->dark ? (unsigned)BROOK_MODE_DARK : (unsigned)BROOK_MODE_LIGHT) :
                           (unsigned)BROOK_MODE_MIXED;
     const unsigned theme = s->theme >= 0 ? (unsigned)s->theme :
-                           s->performance == 1 ? (mode == BROOK_MODE_LIGHT ? (unsigned)BROOK_THEME_OPAQUE_LIGHT :
-                                                                             (unsigned)BROOK_THEME_OPAQUE_DARK) :
+                           s->legacyPalette > 0 || s->performance == 1 ? (unsigned)BROOK_THEME_OPAQUE :
                            (unsigned)BROOK_THEME_GLASS;
     const unsigned hue = s->hue >= 0 ? (unsigned)s->hue :
                          s->paletteHue >= 0 ? (unsigned)s->paletteHue :
                          s->paletteHue == -2 ? (unsigned)BROOK_HUE_BLUE :
                          s->legacyPalette >= 0 ? brook_legacy_palette_hue((unsigned)s->legacyPalette) :
                          (unsigned)BROOK_HUE_BLUE;
-    return BROOK_THEME_SELECTION(theme, mode, hue);
+    return brook_selection_make(theme, mode, hue, hue == BROOK_HUE_CUSTOM ? s->rgb : 0);
 }
 
 /* ------------------------------------------------------------------------
@@ -439,20 +473,21 @@ enum {
     BROOK_OK_LIGHT = 0x157040, BROOK_WARM_LIGHT = 0x855400, BROOK_HOT_LIGHT = 0xc0271f
 };
 
-/* The rotation of the reference set onto one hue (steps 1 and 2): the hue
- * angle difference to Blue's accent as a rotation, and min(1, accent chroma
- * / Blue's chroma). */
+/* Rotate one OKLab hue onto another. Neutral accents produce neutral tints. */
 typedef struct BrookHueRotation { double cosine, sine, chroma; } BrookHueRotation;
-static inline BrookHueRotation brook_hue_rotation(uint32_t bright) {
-    const BrookOklab ref = brook_oklab(0x6aaeffu), acc = brook_oklab(bright);
+static inline BrookHueRotation brook_hue_rotation_between(uint32_t reference, uint32_t target) {
+    const BrookOklab ref = brook_oklab(reference), acc = brook_oklab(target);
     const double c0 = brook_th_sqrt(ref.a * ref.a + ref.b * ref.b), c1 = brook_th_sqrt(acc.a * acc.a + acc.b * acc.b);
-    BrookHueRotation r = {1, 0, 1};
-    if (c1 > 1e-9) {
+    BrookHueRotation r = {1, 0, 0};
+    if (c0 > 1e-7 && c1 > 1e-7) {
         r.cosine = (ref.a * acc.a + ref.b * acc.b) / (c0 * c1);
         r.sine = (ref.a * acc.b - ref.b * acc.a) / (c0 * c1);
+        r.chroma = c1 / c0 < 1 ? c1 / c0 : 1;
     }
-    r.chroma = c1 / c0 < 1 ? c1 / c0 : 1;
     return r;
+}
+static inline BrookHueRotation brook_hue_rotation(uint32_t bright) {
+    return brook_hue_rotation_between(0x6aaeffu, bright);
 }
 /* A reference token rotated onto the hue, its lightness offset by dl and
  * its chroma scaled by cf (step 3), clipped to sRGB (step 4), then its
@@ -491,10 +526,31 @@ static inline unsigned brook_ink_alpha(uint32_t ink, unsigned start, const uint3
     return percent > 100 ? 100 : percent;
 }
 
+/* Anchor large surfaces to the swatch hue itself. A stronger chroma
+ * survives translucent composition, subject to the gamut and text checks. */
+static inline uint32_t brook_chrome_tint(uint32_t reference, uint32_t swatch, double swatchChroma, int keepBlue,
+                                       double lightness, double chroma, const BrookContrastCheck* checks,
+                                       unsigned count, int step) {
+    BrookHueRotation r = keepBlue ? brook_hue_rotation(0x6aaeffu) :
+                                    brook_hue_rotation_between(reference, swatch);
+    if (!keepBlue) r.chroma = swatchChroma;
+    return brook_hue_token(reference, r, lightness, chroma * (keepBlue ? 1.0 : 1.6), checks, count, step);
+}
+static inline void brook_custom_accent_ink(BrookChromeTokens* t) {
+    const uint32_t ink = brook_contrast(t->accent, 0) >= brook_contrast(t->accent, 0xffffffu)
+                         ? 0 : 0xffffffu;
+    const uint32_t opposite = ink ^ 0xffffffu;
+    t->onAccent = ink;
+    if (brook_contrast(t->accentHover, ink) < 4.5) t->accentHover = brook_mix(t->accent, opposite, 14);
+    if (brook_contrast(t->accentPressed, ink) < 4.5) t->accentPressed = brook_mix(t->accent, opposite, 18);
+}
+
 /* Derive one hue's token set from its accent and shaping (none for a
  * sampled wallpaper hue). Blue reproduces the reference exactly. */
-static inline void brook_hue_derive_from(const BrookHueAccent* accent, BrookHueShaping sh, BrookHueTokens* out) {
+static inline void brook_hue_derive_from(const BrookHueAccent* accent, BrookHueShaping sh, int custom, BrookHueTokens* out) {
     const BrookHueRotation r = brook_hue_rotation(accent->bright);
+    const int keepBlue = !custom && accent->swatch == 0x3f8cffu;
+    const double swatchChroma = brook_hue_rotation(accent->swatch).chroma;
     const uint32_t bright = accent->bright, deep = accent->deep;
     BrookChromeTokens* d = &out->chrome[1];
     BrookChromeTokens* l = &out->chrome[0];
@@ -505,13 +561,13 @@ static inline void brook_hue_derive_from(const BrookHueAccent* accent, BrookHueS
      * 4.5; the title top carries ink at 4.5 and the accent line at 3.0. */
     d->ink = brook_hue_token(BROOK_REF_DARK_INK, r, 0, 1, 0, 0, 0);
     {
-        const BrookContrastCheck surface[5] = {{d->ink, 4.5}, {bright, 4.5}, {BROOK_OK_DARK, 4.5},
-                                               {BROOK_WARM_DARK, 4.5}, {BROOK_HOT_DARK, 4.5}};
+        const BrookContrastCheck surface[5] = {{d->ink, 4.5}, {BROOK_OK_DARK, 4.5}, {BROOK_WARM_DARK, 4.5},
+                                               {BROOK_HOT_DARK, 4.5}, {bright, 4.5}};
         const BrookContrastCheck title[2] = {{d->ink, 4.5}, {bright, 3.0}};
         uint32_t both[2];
-        d->glass = brook_hue_token(BROOK_REF_DARK_GLASS, r, sh.glassL, sh.glassC, surface, 5, -1);
-        d->flat = brook_hue_token(BROOK_REF_DARK_FLAT, r, sh.glassL, sh.glassC, surface, 5, -1);
-        d->titleTop = brook_hue_token(BROOK_REF_DARK_TITLE, r, sh.titleL, sh.titleC, title, 2, -1);
+        d->glass = brook_chrome_tint(BROOK_REF_DARK_GLASS, accent->swatch, swatchChroma, keepBlue, sh.glassL, sh.glassC, surface, custom ? 4 : 5, -1);
+        d->flat = brook_chrome_tint(BROOK_REF_DARK_FLAT, accent->swatch, swatchChroma, keepBlue, sh.glassL, sh.glassC, surface, custom ? 4 : 5, -1);
+        d->titleTop = brook_chrome_tint(BROOK_REF_DARK_TITLE, accent->swatch, swatchChroma, keepBlue, sh.titleL, sh.titleC, title, custom ? 1 : 2, -1);
         both[0] = d->glass; both[1] = d->flat;
         d->ink2 = brook_ink_alpha(d->ink, 74, both, 2);
         d->ink3 = brook_ink_alpha(d->ink, 52, both, 2);
@@ -524,13 +580,13 @@ static inline void brook_hue_derive_from(const BrookHueAccent* accent, BrookHueS
     /* Light chrome: the same checks, lightening. */
     l->ink = brook_hue_token(BROOK_REF_LIGHT_INK, r, 0, 1, 0, 0, 0);
     {
-        const BrookContrastCheck surface[5] = {{l->ink, 4.5}, {deep, 4.5}, {BROOK_OK_LIGHT, 4.5},
-                                               {BROOK_WARM_LIGHT, 4.5}, {BROOK_HOT_LIGHT, 4.5}};
+        const BrookContrastCheck surface[5] = {{l->ink, 4.5}, {BROOK_OK_LIGHT, 4.5}, {BROOK_WARM_LIGHT, 4.5},
+                                               {BROOK_HOT_LIGHT, 4.5}, {deep, 4.5}};
         const BrookContrastCheck title[2] = {{l->ink, 4.5}, {deep, 3.0}};
         uint32_t both[2];
-        l->glass = brook_hue_token(BROOK_REF_LIGHT_GLASS, r, 0, sh.lightC, surface, 5, 1);
-        l->flat = brook_hue_token(BROOK_REF_LIGHT_FLAT, r, 0, sh.lightC, surface, 5, 1);
-        l->titleTop = brook_hue_token(BROOK_REF_LIGHT_TITLE, r, 0, sh.lightC, title, 2, 1);
+        l->glass = brook_chrome_tint(BROOK_REF_LIGHT_GLASS, accent->swatch, swatchChroma, keepBlue, 0, sh.lightC, surface, custom ? 4 : 5, 1);
+        l->flat = brook_chrome_tint(BROOK_REF_LIGHT_FLAT, accent->swatch, swatchChroma, keepBlue, 0, sh.lightC, surface, custom ? 4 : 5, 1);
+        l->titleTop = brook_chrome_tint(BROOK_REF_LIGHT_TITLE, accent->swatch, swatchChroma, keepBlue, 0, sh.lightC, title, custom ? 1 : 2, 1);
         both[0] = l->glass; both[1] = l->flat;
         l->ink2 = brook_ink_alpha(l->ink, 78, both, 2);
         l->ink3 = brook_ink_alpha(l->ink, 66, both, 2);
@@ -551,6 +607,10 @@ static inline void brook_hue_derive_from(const BrookHueAccent* accent, BrookHueS
     l->accentPressed = brook_mix(deep, 0x000000u, 24);
     l->onAccent = 0xffffffu;
     l->rim.rgb = deep; l->rim.percent = 60;
+    if (custom) {
+        brook_custom_accent_ink(d);
+        brook_custom_accent_ink(l);
+    }
     d->ok = BROOK_OK_DARK; d->warm = BROOK_WARM_DARK; d->hot = BROOK_HOT_DARK;
     l->ok = BROOK_OK_LIGHT; l->warm = BROOK_WARM_LIGHT; l->hot = BROOK_HOT_LIGHT;
     {
@@ -583,7 +643,18 @@ static inline void brook_hue_derive_from(const BrookHueAccent* accent, BrookHueS
 }
 static inline void brook_hue_derive(unsigned hue, BrookHueTokens* out) {
     if (hue >= BROOK_HUE_COUNT) hue = BROOK_HUE_BLUE;
-    brook_hue_derive_from(brook_hue_accent(hue), brook_hue_shaping(hue), out);
+    brook_hue_derive_from(brook_hue_accent(hue), brook_hue_shaping(hue), 0, out);
+}
+
+static inline void brook_hue_derive_selection(uint64_t selection, BrookHueTokens* out) {
+    const unsigned hue = brook_selection_hue(selection);
+    if (hue != BROOK_HUE_CUSTOM) {
+        brook_hue_derive(hue, out);
+        return;
+    }
+    const uint32_t rgb = brook_selection_rgb(selection);
+    const BrookHueAccent accent = {rgb, rgb, rgb};
+    brook_hue_derive_from(&accent, brook_hue_shaping(BROOK_HUE_BLUE), 1, out);
 }
 
 /* ------------------------------------------------------------------------
@@ -618,6 +689,8 @@ typedef struct BrookThemePalette {
     uint32_t gpu2d;
     uint32_t gpuInactive;
     uint32_t accent;       /* focus stroke, active task, slider fill, graph bars */
+    uint32_t onAccent;     /* text on a solid accent fill */
+    uint32_t accentText;   /* emphasis on the chrome fill */
     uint32_t halo;         /* outline behind pale text over translucent material */
     uint32_t ok;           /* load and temperature levels */
     uint32_t warm;
@@ -661,6 +734,8 @@ static inline void brook_theme_build_palette(const BrookHueTokens* hue, unsigned
     p->gpu2d = t->comp;
     p->gpuInactive = p->mutedText;
     p->accent = t->accent;
+    p->onAccent = t->onAccent;
+    p->accentText = brook_contrast(t->accent, bar) >= 4.5 ? t->accent : t->ink;
     p->halo = t->shadow;
     p->ok = t->ok;
     p->warm = t->warm;

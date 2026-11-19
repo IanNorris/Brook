@@ -44,9 +44,9 @@ int FindI(const char* hay, const char* needle) {
     return -1;
 }
 
-// DESIGN.md tokens that the palette does not carry.
+// Launcher tokens resolved from the system palette.
 struct Tokens {
-    uint32_t panel, ink, ink2, ink3, hover, press, hairline, well, accent, onAccent, menu;
+    uint32_t panel, ink, ink2, ink3, hover, press, hairline, well, accent, accentText, onAccent, menu;
 };
 Tokens TokensFor(const ChromeStyle& s) {
     const auto& p = s.P();
@@ -61,8 +61,8 @@ Tokens TokensFor(const ChromeStyle& s) {
     t.hairline = ChromeBlendColor(p.text, p.launcher, p.chromeDark ? 36 : 61);
     t.well = p.chromeDark ? ChromeBlendColor(0x000000, p.launcher, 56) : ChromeBlendColor(0xffffff, p.launcher, 128);
     t.accent = p.accent;
-    const unsigned luma = (((p.accent >> 16) & 255) * 3 + ((p.accent >> 8) & 255) * 6 + (p.accent & 255)) / 10;
-    t.onAccent = luma > 150 ? 0x101e2e : 0xffffff;
+    t.accentText = p.accentText;
+    t.onAccent = p.onAccent;
     t.menu = p.launcher;
     return t;
 }
@@ -240,7 +240,7 @@ struct Builder {
         while (q[n]) ++n;
         for (i = 0; i < n && name[at + i]; ++i) part[i] = name[at + i];
         part[i] = 0;
-        dl.Text(CF::Strong, x, y, part, t.accent);
+        dl.Text(CF::Strong, x, y, part, t.accentText);
         x += s.TextWidth(part, CF::Strong);
         dl.Text(CF::Body, x, y, name + at + i, ink);
     }

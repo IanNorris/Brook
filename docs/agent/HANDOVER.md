@@ -41,6 +41,20 @@ _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review 
   Nix packages passed. The waylandd fixture checked v4/v5/v7/v8 wire events.
   Logs are in `/data/Programming/Brook/wayland-fine-scroll/build/fine-scroll-*.log`.
   Hardware feel and a live X11 app remain unverified.
+## Clearwater material and mode (19 November 2026)
+
+- `work/theme-redesign` on integration57, feature commits `a6ac48fa` and
+  `93f6ccb6`. Glass and Opaque each offer Light, Mixed and Dark. Settings
+  supports thirteen presets and an exact custom sRGB accent. Older selections
+  migrate on load and Glass fallback preserves the mode and accent.
+- Headless Release, the Settings package, 385 non-stress tests and 728 chrome
+  goldens passed. Astra checked the Blue scale matrix, preset tint palette
+  and custom magenta. Sheets and logs are in `build/theme-redesign-evidence`.
+  The updated tint and final Glass composition await Dell validation.
+- Stage 3 at `8e1e31ed` passed its original integration49 validation. A
+  read-only integration57 merge check found conflicts in the launcher glue,
+  chrome golden driver, image builder, kernel build configuration and
+  handover. Resolve those before rerunning the pixel and shell restart checks.
 
 ## Wayland latency diagnostics (19 November 2026)
 

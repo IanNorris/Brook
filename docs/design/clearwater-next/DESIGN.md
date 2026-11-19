@@ -9,10 +9,10 @@ document now describes the result, not the route:
 
 - **One Glass theme, two opaque ones.** The hue tints the whole chrome. Tinted,
   Smoked and Opal are folded into a single **Glass** theme with a hue picker.
-  **Opaque Light** and **Opaque Dark** sit beside it for lower-end hardware,
-  and Glass is locked when the GPU is not accelerated. There are thirteen
-  hues: Navy is new, Amber is a warmer yellow, Orange and Red are more
-  vivid. See [Hue and accent colours](#hue-and-accent-colours).
+  **Opaque** supplies solid fills on any hardware. Glass falls back to Opaque
+  when the backend lacks backdrop blur. Both materials offer Light, Mixed
+  and Dark modes, thirteen preset hues and a custom accent.
+  See [Hue and accent colours](#hue-and-accent-colours).
 - **The launcher is organised by dragging.** The right-click menu is Pin or
   Unpin and Uninstall, nothing else. “New category” is a drop target that
   appears while an app is dragged. Typing anywhere searches. See
@@ -134,55 +134,40 @@ Ian's two reviews of the settled design, 15 November:
 
 ## Hue and accent colours
 
-Settings › Appearance has three theme cards and a row of thirteen hue
-swatches: twelve fixed hues and **Wallpaper**.
-
-![Theme cards and the hue row, Amber chosen](screenshots/hue-row@2x.png)
+Settings › Appearance has separate Material and Mode controls. The picker
+offers thirteen presets, including Wallpaper, and a custom sRGB accent chosen
+with the HSV colour dialog. Swatches show the resolved chrome tint around the
+accent and the preview shows the title bar, taskbar and app content.
 
 ### Themes
 
-Ian's decision: one Glass theme, and two opaque themes for lower-end hardware.
+| Material | Surfaces | Cost |
+| --- | --- | --- |
+| **Glass** | Translucent chrome with backdrop blur, sheen and shadows. Settings exposes opacity and blur for this material. | Requires backdrop blur support |
+| **Opaque** | Solid tinted fills with an accent line and rim on the active window. | One opaque quad per surface |
 
-| Theme | What it is | Mode | Cost |
-| --- | --- | --- | --- |
-| **Glass** | The settled design: translucent chrome with backdrop blur, sheen and shadows. Opacity and blur are its own settings. | Light, Mixed or Dark | Needs an accelerated GPU |
-| **Opaque Light** | Every chrome surface is one flat, opaque fill. No blur, no alpha, no shadows, no motion. Light chrome and light apps. | Light throughout | One opaque quad per surface |
-| **Opaque Dark** | The same, dark chrome and dark apps. | Dark throughout | The same |
+| Mode | System chrome | App content |
+| --- | --- | --- |
+| **Light** | Light | Light |
+| **Mixed** (default) | Dark | Light |
+| **Dark** | Dark | Dark |
 
-![Glass, Opaque Light, Opaque Dark, and Glass locked without acceleration](screenshots/themes.png)
+Both materials offer every mode. The mode applies to title bars, taskbar,
+launcher, menus, flyouts, toasts and HUD. When the active backend lacks
+backdrop blur, Glass uses Opaque with the selected mode and accent. The saved
+material stays Glass so it can take effect when the capability returns.
 
-- **The hue applies in all three.** The Opaque themes fill with the hue's flat
-  fill, so an Amber desktop is amber whether or not it is glass. A hue costs
-  nothing to composite.
-- **The Opaque themes are what Performance mode was.** They use the flat fill
-  that mode already had, and draw every title bar in it; the active window is
-  marked by its accent line, rim and full-strength title. The separate
-  Performance switch is gone.
-- **Glass is locked when the GPU is not accelerated.** Its card is greyed and
-  cannot be chosen, and a line under the cards says why: “Glass needs GPU
-  acceleration, which this display does not have.” Mode, opacity and blur are
-  greyed with it.
-- **The saved choice is kept.** If Glass was chosen, an opaque theme stands in
-  until acceleration returns: Opaque Light if the mode was Light, otherwise
-  Opaque Dark. Nothing is rewritten in `BROOK.CFG`.
-- **Smoked and Opal are folded in as hues.** Smoked was neutral glass: Slate
-  gives glass `31 37 46` against Smoked's `22 26 34`. Opal dark was Pine green
-  (`0 44 30` against `12 40 30`, the same accent) and Opal light was Teal.
-  Nothing else was unique to them, so neither survives as a theme. What is
-  lost is Smoked's “neutral glass, coloured details”; Slate tints its details
-  slate too.
-- **Tinted is gone as a name.** It was the palette where the hue tinted
-  everything. That is now simply how Brook works. Clearwater remains the name
-  of the design and of the Glass chrome style in Lab.
+The earlier prototype screenshots illustrate the three-card layout. The native
+Settings page now uses the two independent controls.
 
 ### What the hue drives
 
 | On screen | Token | From the hue |
 | --- | --- | --- |
-| Taskbar, inactive title bars, launcher, flyouts, HUD, toasts, the dock | Glass tint | The Blue value, rotated to the hue |
+| Taskbar, inactive title bars, launcher, flyouts, HUD, toasts, the dock | Glass tint | A tint anchored to the accent swatch hue |
 | Active title bar | Active title top, over the glass tint | same |
 | Every chrome surface in the Opaque themes; menus, the undo bar and drop chips in Glass | Flat fill | same |
-| Text and icons on the chrome | Ink, with its secondary and tertiary alphas | same; it stays near white or near black with a trace of the hue |
+| Text and icons on the chrome | Ink, with its secondary and tertiary alphas | Near white or near black, rotated from Blue with a trace of the hue |
 | Hairlines, dividers, hover and pressed fills on light chrome | Line and hover tints | same |
 | Window and panel shadows | Shadow colour | same |
 | App surfaces: backgrounds, cards, sidebars, lines, text | Content background, raised, sunken, line, ink, dim ink | same |
@@ -199,8 +184,10 @@ hue:
 
 1. Convert the hue's bright accent to OKLCH and take its hue angle and chroma.
    Blue's `#6aaeff` has hue 254° and chroma 0.14.
-2. For each reference token, keep its lightness, add the difference in hue
-   angle, and multiply its chroma by min(1, accent chroma ÷ Blue's chroma).
+2. For glass, flat fill and the active title top, set the hue angle to the
+   swatch angle. Scale reference chroma by 1.6 × min(1, swatch chroma ÷ Blue
+   accent chroma). For other tokens, rotate each Blue reference by the bright
+   accent's hue difference and scale it by the bright accent's chroma factor.
 3. Apply the hue's shaping, if it has any (below).
 4. Reduce chroma until the colour is inside sRGB.
 5. Check the contrast targets. If a surface fails, move its lightness away
@@ -222,14 +209,19 @@ contrast loop in step 5 then gives back whatever lightness the text cannot
 afford, which is why the figures in the tables are not simply the reference
 plus the shaping.
 
-What follows from that:
+Blue retains the reference. The supported gamut and contrast checks bound
+the saturation of each tint. Slate's lower swatch chroma still gives a muted
+result, while Hot pink stays pink in Light and magenta in Mixed and Dark.
+For Hot pink the light Glass tint changes from `#f8e6ee` to `#ffe5ef` and the
+dark Glass tint changes from `#3b1626` to `#450528`.
 
-- Blue reproduces the reference exactly. The default has not moved.
-- A greyish hue gives greyish glass. Slate has a factor of 0.31. The dawn
-  wallpaper has 0.68 and gives a soft brown, not orange.
-- Teal and Pine green run out of gamut in the dark, so their glass has a zero
-  red channel.
-- Navy is darker than Blue everywhere, which is the point of it.
+A custom accent is used at the exact chosen RGB on both light and dark
+surfaces. It uses the same tint derivation with default shaping. Ink on the
+accent is whichever of black and white has the higher contrast. Hover and
+pressed fills adjust towards the opposite ink when needed. Launcher badges
+use that ink. Search matches use bold chrome ink if the custom accent has
+low contrast against the panel. Chrome and signal text keep their checks. Preset-only accent-as-ink contrast targets
+are omitted for custom accents so users can choose any colour.
 
 ![All thirteen hues: Files in Mixed and Dark, and the taskbar](screenshots/hue-all.png)
 
@@ -253,7 +245,7 @@ What follows from that:
   light content with white text on it. Mixed mode uses the bright value in the
   chrome and the deep value inside apps.
 - Each hue also has a **swatch**: the colour that stands for it in the picker,
-  the same in every mode. It is not used anywhere else.
+  the same in every mode. It also sets the hue of the large chrome tints.
 - The light ok, warm and hot values are new. The bright ones were being drawn
   on light chrome, where they do not reach 3.0.
 - Phosphor is the green from the Phosphor style, as a colour only.
@@ -280,23 +272,24 @@ What follows from that:
 
 RGB triplets are chrome fills. In Glass the opacity setting supplies alpha to
 the glass tint and the title top; the flat fill is always opaque. “Chroma” is
-the factor from step 2.
+the original bright-accent factor used for detail and app tokens. The hue of
+the large chrome tints comes from each swatch.
 
 | Hue | Angle | Chroma | Dark glass | Dark title top | Dark flat fill | Dark app background | Dark app raised | Light glass | Light title top | Light flat fill | Light app background | Light app sunken |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Blue | 254° | 1.00 | 16 36 66 | 40 80 138 | 22 40 68 | `#111c2b` | `#18263a` | 226 237 251 | 186 213 248 | 226 235 247 | `#f5f8fc` | `#eaf0f8` |
-| Navy | 264° | 1.00 | 9 18 68 | 35 56 145 | 14 24 69 | `#0c1328` | `#131d38` | 227 236 255 | 190 210 255 | 227 234 251 | `#f6f8fc` | `#ebeff8` |
-| Teal | 185° | 0.85 | 0 43 41 | 0 94 89 | 0 47 45 | `#0a201e` | `#0d2b29` | 223 240 237 | 176 221 215 | 223 238 236 | `#f4f9f8` | `#e8f2f0` |
-| Pine green | 161° | 0.96 | 0 44 30 | 0 96 68 | 2 49 34 | `#0c2017` | `#102c20` | 224 241 231 | 179 222 200 | 224 238 230 | `#f4f9f6` | `#e9f2ed` |
-| Phosphor | 149° | 1.00 | 3 45 22 | 11 97 51 | 12 48 27 | `#0f2014` | `#142b1b` | 226 240 228 | 185 222 191 | 226 238 228 | `#f5f9f6` | `#eaf2eb` |
-| Lime | 124° | 1.00 | 27 42 4 | 63 91 13 | 31 45 12 | `#171e0d` | `#202912` | 232 239 223 | 201 218 177 | 231 237 223 | `#f7f9f4` | `#edf1e8` |
-| Amber | 83° | 1.00 | 67 50 0 | 139 106 0 | 67 50 0 | `#241a02` | `#312301` | 252 234 199 | 249 204 108 | 247 233 203 | `#faf7f3` | `#f3efe6` |
-| Orange | 51° | 1.00 | 77 36 0 | 139 69 0 | 83 39 0 | `#2a1608` | `#381e0b` | 255 230 216 | 255 196 161 | 253 229 215 | `#fbf7f4` | `#f7ede8` |
-| Red | 26° | 1.00 | 87 4 0 | 151 10 0 | 94 7 0 | `#2c1310` | `#3b1b16` | 255 229 225 | 255 193 185 | 254 227 223 | `#fcf6f5` | `#f8eceb` |
-| Hot pink | 350° | 1.00 | 59 22 38 | 124 52 85 | 62 27 41 | `#28151d` | `#361d27` | 248 230 238 | 241 196 215 | 246 231 237 | `#fbf6f8` | `#f7ecf0` |
-| Violet | 295° | 1.00 | 41 28 62 | 90 65 130 | 45 33 64 | `#1d1829` | `#282137` | 237 233 250 | 214 203 244 | 235 232 246 | `#f8f7fc` | `#f0eef7` |
-| Slate | 254° | 0.31 | 31 37 46 | 70 81 99 | 35 40 49 | `#181c20` | `#22262c` | 233 236 240 | 203 211 222 | 232 234 238 | `#f7f8f9` | `#eeeff2` |
-| Wallpaper (dawn) | 59° | 0.68 | 51 31 13 | 109 71 35 | 54 36 19 | `#231910` | `#302217` | 244 234 226 | 230 205 186 | 241 232 226 | `#faf7f5` | `#f4eeea` |
+| Navy | 264° | 1.00 | 0 17 75 | 0 49 168 | 0 20 83 | `#0c1328` | `#131d38` | 226 236 255 | 188 211 255 | 224 235 255 | `#f6f8fc` | `#ebeff8` |
+| Teal | 185° | 0.85 | 0 43 39 | 0 94 86 | 0 48 43 | `#0a201e` | `#0d2b29` | 214 243 239 | 150 228 218 | 216 240 236 | `#f4f9f8` | `#e8f2f0` |
+| Pine green | 161° | 0.96 | 0 45 25 | 0 97 60 | 0 49 28 | `#0c2017` | `#102c20` | 218 243 228 | 161 229 190 | 219 240 227 | `#f4f9f6` | `#e9f2ed` |
+| Phosphor | 149° | 1.00 | 0 46 12 | 0 98 34 | 0 50 14 | `#0f2014` | `#142b1b` | 221 243 223 | 170 227 177 | 221 240 223 | `#f5f9f6` | `#eaf2eb` |
+| Lime | 124° | 1.00 | 28 42 0 | 66 91 0 | 31 46 0 | `#171e0d` | `#202912` | 230 241 215 | 196 222 156 | 229 238 217 | `#f7f9f4` | `#edf1e8` |
+| Amber | 83° | 1.00 | 69 49 0 | 142 104 0 | 69 49 0 | `#241a02` | `#312301` | 255 233 192 | 255 202 89 | 255 231 186 | `#faf7f3` | `#f3efe6` |
+| Orange | 51° | 1.00 | 81 32 0 | 146 64 0 | 87 35 0 | `#2a1608` | `#381e0b` | 255 230 217 | 255 195 164 | 255 228 214 | `#fbf7f4` | `#f7ede8` |
+| Red | 26° | 1.00 | 89 0 1 | 153 0 4 | 96 0 2 | `#2c1310` | `#3b1b16` | 255 229 225 | 255 193 184 | 255 227 222 | `#fcf6f5` | `#f8eceb` |
+| Hot pink | 350° | 1.00 | 69 5 40 | 144 14 88 | 71 14 44 | `#28151d` | `#361d27` | 255 229 239 | 255 188 215 | 254 229 238 | `#fbf6f8` | `#f7ecf0` |
+| Violet | 295° | 1.00 | 40 22 79 | 88 51 163 | 43 28 80 | `#1d1829` | `#282137` | 236 232 255 | 212 202 255 | 234 231 253 | `#f8f7fc` | `#f0eef7` |
+| Slate | 254° | 0.31 | 23 37 56 | 54 82 118 | 28 41 58 | `#181c20` | `#22262c` | 230 236 246 | 195 212 235 | 229 235 243 | `#f7f8f9` | `#eeeff2` |
+| Wallpaper (dawn) | 59° | 0.68 | 58 27 0 | 121 64 0 | 62 31 2 | `#231910` | `#302217` | 249 232 220 | 242 201 171 | 247 232 222 | `#faf7f5` | `#f4eeea` |
 
 The full set per hue (ink, lines, shadow, sunken and line colours for both
 modes) is in the generated block of `index.html`.
@@ -307,104 +300,50 @@ Contrast is the WCAG 2 ratio, computed by script and floored to one decimal, so
 no figure is flattered by rounding. The targets are 4.5 for anything used as or
 under text and 3.0 for the accent line on the active title gradient.
 
-Each chrome figure is the worse of two surfaces: the glass tint, which is
-Glass, and the flat fill, which is the Opaque themes. So one table covers
-Glass in Dark and Mixed and Opaque Dark, and the other covers Glass in Light
-and Opaque Light. Glass is translucent, so its real contrast varies with the
-wallpaper behind it; the opaque tint is the reference, as before.
+Each chrome figure is the worse of the Glass tint and the Opaque flat fill.
+Mixed uses the dark chrome columns and the light app columns. Glass is
+translucent, so its visible contrast depends on the backdrop. These checks
+use the solid tint as their reference.
 
 Dark chrome and dark apps:
 
 | Hue | Accent | Ink | Secondary ink | Tertiary ink | Ink on title top | Accent on chrome | Accent line on title top | Text on accent | App ink (worst surface) | App dim ink (worst) | Accent on app surfaces (worst) | Ok / warm / hot on chrome |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Blue | `#6aaeff` | 13.3 | 7.9 | 4.6 | 7.2 | 6.4 | 3.4 | 7.3 | 12.9 | 6.0 | 6.6 | 7.6 / 7.9 / 5.4 |
-| Navy | `#739fff` | 15.2 | 8.7 | 4.9 | 9.2 | 6.5 | 3.9 | 6.6 | 14.0 | 6.5 | 6.4 | 8.7 / 9.1 / 6.2 |
-| Teal | `#4fd3c4` | 13.1 | 7.8 | 4.6 | 6.9 | 7.9 | 4.1 | 8.9 | 12.7 | 6.0 | 8.2 | 7.4 / 7.8 / 5.3 |
-| Pine green | `#62d6a0` | 13.0 | 7.7 | 4.5 | 6.9 | 7.9 | 4.2 | 9.1 | 12.7 | 5.9 | 8.2 | 7.3 / 7.7 / 5.2 |
-| Phosphor | `#7dff9b` | 13.1 | 7.8 | 4.6 | 6.8 | 11.4 | 6.0 | 12.4 | 12.9 | 6.0 | 11.9 | 7.4 / 7.7 / 5.3 |
-| Lime | `#b4e04a` | 13.2 | 7.8 | 4.6 | 7.0 | 9.5 | 5.0 | 10.4 | 12.9 | 6.0 | 9.8 | 7.5 / 7.8 / 5.3 |
-| Amber | `#ffc233` | 11.1 | 6.8 | 4.6 | 4.5 | 7.6 | 3.1 | 10.1 | 12.9 | 5.9 | 9.4 | 6.3 / 6.6 / 4.5 |
-| Orange | `#ff8a3c` | 11.3 | 6.9 | 4.6 | 6.4 | 5.3 | 3.0 | 7.3 | 13.0 | 5.9 | 6.5 | 6.5 / 6.8 / 4.6 |
-| Red | `#ff625a` | 12.5 | 7.2 | 4.6 | 7.9 | 4.7 | 3.0 | 6.0 | 13.1 | 6.0 | 5.2 | 7.1 / 7.5 / 5.1 |
-| Hot pink | `#ff6cba` | 13.5 | 8.0 | 4.6 | 7.6 | 5.8 | 3.2 | 6.6 | 12.9 | 5.9 | 5.9 | 7.7 / 8.1 / 5.5 |
-| Violet | `#b79cff` | 13.4 | 8.0 | 4.7 | 7.5 | 6.5 | 3.6 | 7.3 | 12.9 | 6.0 | 6.7 | 7.7 / 8.0 / 5.5 |
-| Slate | `#a9bdd6` | 13.3 | 7.9 | 4.7 | 7.2 | 7.7 | 4.1 | 8.6 | 12.8 | 5.9 | 7.9 | 7.6 / 7.9 / 5.4 |
-| Wallpaper (dawn) | `#f6b98a` | 13.3 | 7.9 | 4.6 | 7.3 | 8.6 | 4.7 | 9.5 | 13.0 | 5.9 | 8.9 | 7.6 / 7.9 / 5.4 |
+| Navy | `#739fff` | 15.4 | 8.7 | 4.8 | 9.4 | 6.6 | 4.0 | 6.6 | 14.0 | 6.5 | 6.4 | 8.8 / 9.2 / 6.3 |
+| Teal | `#4fd3c4` | 13.0 | 7.8 | 4.5 | 6.9 | 7.8 | 4.1 | 8.9 | 12.7 | 6.0 | 8.2 | 7.4 / 7.7 / 5.3 |
+| Pine green | `#62d6a0` | 13.0 | 7.7 | 4.5 | 6.8 | 7.9 | 4.1 | 9.1 | 12.7 | 5.9 | 8.2 | 7.4 / 7.7 / 5.3 |
+| Phosphor | `#7dff9b` | 13.0 | 7.7 | 4.5 | 6.8 | 11.3 | 6.0 | 12.4 | 12.9 | 6.0 | 11.9 | 7.3 / 7.7 / 5.2 |
+| Lime | `#b4e04a` | 13.1 | 7.8 | 4.6 | 6.9 | 9.4 | 5.0 | 10.4 | 12.9 | 6.0 | 9.8 | 7.4 / 7.7 / 5.3 |
+| Amber | `#ffc233` | 11.2 | 6.9 | 4.6 | 4.5 | 7.6 | 3.1 | 10.1 | 12.9 | 5.9 | 9.4 | 6.3 / 6.6 / 4.5 |
+| Orange | `#ff8a3c` | 11.4 | 6.9 | 4.6 | 6.3 | 5.4 | 3.0 | 7.3 | 13.0 | 5.9 | 6.5 | 6.5 / 6.8 / 4.6 |
+| Red | `#ff625a` | 12.5 | 7.1 | 4.5 | 7.9 | 4.7 | 3.0 | 6.0 | 13.1 | 6.0 | 5.2 | 7.2 / 7.5 / 5.1 |
+| Hot pink | `#ff6cba` | 13.8 | 8.0 | 4.6 | 7.8 | 5.9 | 3.3 | 6.6 | 12.9 | 5.9 | 5.9 | 7.9 / 8.2 / 5.6 |
+| Violet | `#b79cff` | 13.6 | 8.0 | 4.7 | 7.8 | 6.6 | 3.8 | 7.3 | 12.9 | 6.0 | 6.7 | 7.8 / 8.1 / 5.5 |
+| Slate | `#a9bdd6` | 13.2 | 7.8 | 4.6 | 7.2 | 7.6 | 4.1 | 8.6 | 12.8 | 5.9 | 7.9 | 7.5 / 7.9 / 5.4 |
+| Wallpaper (dawn) | `#f6b98a` | 13.5 | 7.9 | 4.6 | 7.4 | 8.7 | 4.8 | 9.5 | 13.0 | 5.9 | 8.9 | 7.7 / 8.0 / 5.5 |
 
 Light chrome and light apps:
 
 | Hue | Accent | Ink | Secondary ink | Tertiary ink | Ink on title top | Accent on chrome | Accent line on title top | White on accent | App ink (worst surface) | App dim ink (worst) | Accent on app background and sunken (worst) | Ok / warm / hot on chrome |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Blue | `#1c65cc` | 12.7 | 6.7 | 4.6 | 10.1 | 4.6 | 3.6 | 5.5 | 12.4 | 4.6 | 4.8 | 5.0 / 5.3 / 4.9 |
-| Navy | `#17409c` | 12.7 | 6.7 | 4.6 | 10.1 | 7.7 | 6.1 | 9.3 | 12.4 | 4.6 | 8.1 | 5.0 / 5.3 / 4.9 |
-| Teal | `#09747e` | 12.5 | 6.6 | 4.6 | 10.1 | 4.6 | 3.7 | 5.5 | 12.3 | 4.5 | 4.8 | 5.1 / 5.3 / 4.9 |
-| Pine green | `#1b7650` | 12.6 | 6.6 | 4.6 | 10.2 | 4.6 | 3.7 | 5.5 | 12.2 | 4.5 | 4.8 | 5.1 / 5.3 / 4.9 |
+| Navy | `#17409c` | 12.8 | 6.7 | 4.6 | 10.1 | 7.7 | 6.1 | 9.3 | 12.4 | 4.6 | 8.1 | 5.1 / 5.3 / 4.9 |
+| Teal | `#09747e` | 12.5 | 6.6 | 4.6 | 10.3 | 4.6 | 3.7 | 5.5 | 12.3 | 4.5 | 4.8 | 5.1 / 5.3 / 4.9 |
+| Pine green | `#1b7650` | 12.6 | 6.6 | 4.6 | 10.3 | 4.6 | 3.8 | 5.5 | 12.2 | 4.5 | 4.8 | 5.1 / 5.3 / 4.9 |
 | Phosphor | `#0f7a33` | 12.5 | 6.6 | 4.6 | 10.2 | 4.5 | 3.7 | 5.4 | 12.3 | 4.5 | 4.7 | 5.1 / 5.3 / 4.9 |
-| Lime | `#53710c` | 12.5 | 6.6 | 4.6 | 10.1 | 4.7 | 3.7 | 5.6 | 12.3 | 4.5 | 4.9 | 5.1 / 5.3 / 4.9 |
-| Amber | `#8f5d00` | 12.7 | 6.7 | 4.6 | 10.1 | 4.6 | 3.7 | 5.6 | 12.4 | 4.6 | 4.9 | 5.1 / 5.3 / 4.9 |
-| Orange | `#b54600` | 12.7 | 6.7 | 4.6 | 10.0 | 4.5 | 3.5 | 5.4 | 12.5 | 4.6 | 4.7 | 5.0 / 5.3 / 4.8 |
-| Red | `#c9211d` | 12.7 | 6.8 | 4.7 | 10.0 | 4.6 | 3.6 | 5.6 | 12.5 | 4.6 | 4.8 | 5.0 / 5.2 / 4.8 |
-| Hot pink | `#c71d7b` | 12.9 | 6.8 | 4.7 | 10.0 | 4.5 | 3.5 | 5.3 | 12.7 | 4.7 | 4.6 | 5.1 / 5.3 / 4.9 |
-| Violet | `#6a43d6` | 12.8 | 6.7 | 4.6 | 10.0 | 5.1 | 4.0 | 6.2 | 12.5 | 4.6 | 5.3 | 5.0 / 5.3 / 4.9 |
-| Slate | `#47607f` | 12.6 | 6.6 | 4.6 | 10.0 | 5.3 | 4.2 | 6.4 | 12.4 | 4.6 | 5.6 | 5.0 / 5.3 / 4.9 |
-| Wallpaper (dawn) | `#a8511d` | 12.7 | 6.7 | 4.6 | 10.1 | 4.5 | 3.5 | 5.4 | 12.5 | 4.6 | 4.7 | 5.0 / 5.3 / 4.8 |
+| Lime | `#53710c` | 12.5 | 6.6 | 4.5 | 10.2 | 4.7 | 3.8 | 5.6 | 12.3 | 4.5 | 4.9 | 5.1 / 5.3 / 4.9 |
+| Amber | `#8f5d00` | 12.7 | 6.6 | 4.6 | 10.1 | 4.6 | 3.7 | 5.6 | 12.4 | 4.6 | 4.9 | 5.0 / 5.3 / 4.8 |
+| Orange | `#b54600` | 12.7 | 6.7 | 4.6 | 9.9 | 4.5 | 3.5 | 5.4 | 12.5 | 4.6 | 4.7 | 5.0 / 5.3 / 4.8 |
+| Red | `#c9211d` | 12.8 | 6.8 | 4.7 | 10.0 | 4.6 | 3.6 | 5.6 | 12.5 | 4.6 | 4.8 | 5.0 / 5.2 / 4.8 |
+| Hot pink | `#c71d7b` | 13.0 | 6.8 | 4.7 | 9.9 | 4.5 | 3.4 | 5.3 | 12.7 | 4.7 | 4.6 | 5.1 / 5.4 / 4.9 |
+| Violet | `#6a43d6` | 12.7 | 6.6 | 4.6 | 10.0 | 5.1 | 4.0 | 6.2 | 12.5 | 4.6 | 5.3 | 5.0 / 5.3 / 4.8 |
+| Slate | `#47607f` | 12.6 | 6.6 | 4.6 | 10.1 | 5.3 | 4.2 | 6.4 | 12.4 | 4.6 | 5.6 | 5.1 / 5.3 / 4.9 |
+| Wallpaper (dawn) | `#a8511d` | 12.8 | 6.7 | 4.6 | 10.0 | 4.5 | 3.5 | 5.4 | 12.5 | 4.6 | 4.7 | 5.1 / 5.3 / 4.9 |
 
-Every cell meets its target. `index.html?selftest=1` reads the live tokens back
-from the page and measures them again: thirteen hues in Glass dark, Glass
-light, Opaque Dark and Opaque Light, 806 pairs, with the alpha inks composited
-on their surface first.
-
-### What moved, and the limits
-
-Changed in this pass:
-
-- **Amber** went from `#f2bb4e` to `#ffc233`, and its deep value from `#8a5a00`
-  to `#8f5d00`. Dark glass went from `48 34 0` to `67 50 0`, the active title
-  top from `102 76 0` to `139 106 0`, and light glass from `243 235 219` to
-  `252 234 199`.
-- **Orange** went from `#ff9a57` to `#ff8a3c` (deep `#ae4e0f` to `#b54600`), and
-  its glass from `58 27 1` to `77 36 0`.
-- **Red** went from `#ff7a72` to `#ff625a` (deep `#c4302b` to `#c9211d`), and its
-  glass from `61 23 17` to `87 4 0`.
-- **Navy** is new: `#739fff` on dark, `#17409c` on light, glass `9 18 68`.
-- **The picker shows each hue's swatch.** It used to show the accent for the
-  current mode, so in Mixed and Light the Amber swatch was the deep value, a
-  brown, and Orange and Red were their dullest versions.
-- **Tertiary ink on light chrome went from 62% to 66%.** At 62% it was 4.1 to
-  4.2 for every hue, including the approved Blue. That was left alone while
-  only Glass drew it, and recommended for change. Opaque Light draws it on a
-  solid fill with nothing behind it to blame, so it now meets 4.5. This is the
-  one change to the approved Blue look: hints, key caps and counts on light
-  chrome are slightly darker.
-- **Tertiary ink on dark chrome is 56% for Amber, Orange and Red**, against 52%
-  elsewhere, because their chrome is lighter.
-
-Limits that the checks impose, which Ian should see before deciding the warm
-hues are right:
-
-- **A dark yellow is a brown or an olive, and nothing in the palette can change
-  that.** Amber's dark glass is as light as it can be while the hot signal
-  (4.5) and tertiary ink (4.6) still read on it. It is now a dark gold, not
-  the old brown, but it is not yellow. The active title bar is the limit of
-  white ink at 4.5.
-- **Amber's deep accent stays a dark gold.** On light apps the accent carries
-  white text and is itself read against white, so it cannot be lighter than
-  about `#8f5d00`. The swatch, the dark-chrome accent and the light chrome
-  itself are the true warm yellow.
-- **The way to a properly yellow desktop is dark ink on bright chrome**: an
-  Amber taskbar and title bars around `#e9b020` with near-black text, as
-  Windows does with a light accent. That would make Amber the one hue whose
-  “dark” chrome is light. I did not do it unasked. It is a small change to
-  the generator if wanted.
-- **Red's vivid accent keeps its glass dark.** `#ff625a` has less luminance
-  than the old red, so the glass under it has to stay dark for the accent to read on it
-  (4.7). The chroma went up instead.
-- **The lowest accent line** is Orange and Red at 3.0 on their own title top,
-  the target. Amber is 3.1 and Hot pink 3.2.
-- On Red, Orange and Hot pink chrome the warm and hot signals keep their
-  contrast but lose their separation by hue. A hot tray temperature is red
-  text on dark red. The HUD already switches its APP bars to neutral ink for
-  these three. The red Close hover is in the same position.
+The native host test checks the thirteen presets against these tables and
+checks custom accents for text contrast. App surfaces and preset accent RGB
+values retain their prior tokens.
 
 ![Amber, Orange, Red and Navy in Mixed mode](screenshots/hue-warm.png)
 
@@ -428,32 +367,21 @@ hues are right:
 
 ### Native notes
 
-- `[Desktop]` holds `theme=glass`, `opaque-light` or `opaque-dark`, and
-  `accent=<name>`, default `blue`. Older values are read as aliases:
-  `palette=tinted` or `clearwater` is Glass, `palette=smoked` is Glass with
-  `accent=slate`, `palette=opal` is Glass with `accent=pine`, and a
-  saved Performance mode is the opaque theme for the saved mode. The prototype does
-  the same for URLs.
-- **Acceleration is a fact the compositor reports, not a setting.** Settings
-  reads it to grey the Glass card. The theme code reads it to pick the
-  stand-in. It has to be re-read when the renderer falls back at runtime, so
-  a GPU fault degrades to an opaque theme instead of a slow glass one.
-- An opaque theme is one material: the flat fill. The blur chain, the sheen
-  gradient, the shadow nine-slices and the animation clock are all skipped.
-  That is the Performance mode path, reached from the theme and not from a
-  switch.
-- `brook_theme.h` keeps the 13 rows × 2 accent values and the swatch, and gains
-  the Blue reference set, the shaping table and the derivation above. Hover,
-  pressed, rim and selection are computed at material-cache rebuild, as
-  before. So is the token set. It is about thirty tokens of floating-point
-  maths, once per hue change.
-- The derivation has to exist in code and not only as a table, because the
-  Wallpaper row is not known until a wallpaper is set. The tables in this
-  section are its test vectors: a host test derives the thirteen hues,
-  compares them with these values and asserts the contrast targets.
-- The Wallpaper row is filled at wallpaper-set time: take the most saturated
-  cluster of a downsampled histogram, then run the same lighten-or-darken loop
-  until it meets 4.5 on both surface sets. A sampled hue gets no shaping.
+- `[Desktop]` holds `theme=glass|opaque`, `mode=light|mixed|dark` and either
+  a preset key or `#rrggbb` in `accent`. Numeric `theme=1` and `theme=2` and
+  named `opaque-light` and `opaque-dark` migrate to Opaque with their fixed
+  modes. Glass retains its mode. Older palette aliases still select their
+  hues. A saved Performance flag chooses Opaque when no material is named.
+- Brook's theme syscall uses ops 6/7 for the selected material, mode, hue and
+  optional RGB. Ops 0–3 continue to support old clients. Op 4 reports
+  backdrop blur capability and op 5 returns the active app colours.
+- Opaque uses the flat fill. Its renderer skips the blur chain and Glass
+  sheen. The theme model retains the selected opacity and blur when the
+  user switches materials.
+- Preset token palettes are derived once per boot. Selecting a custom accent
+  updates its cached palettes. Chrome draws from a consistent palette
+  snapshot at frame build time.
+
 - App surfaces follow the hue, so the content colours have to reach apps at
   runtime. Settings is GTK3: write them as `@define-color` lines in a small
   generated CSS file and reload it on change. Native Brook apps read them from
@@ -1079,8 +1007,7 @@ are in [Values per hue](#values-per-hue).
 | Shadow colour | 3 10 22 | 20 34 56 |
 | Ok / warm / hot | `#5fcf8f` / `#f0b35a` / `#ff6f6a` | `#157040` / `#855400` / `#c0271f` |
 
-Mixed mode uses the dark chrome column with the light content column. Opaque
-Dark is dark and dark; Opaque Light is light and light.
+Mixed uses the dark chrome column with the light content column in both materials.
 
 Alpha, in Glass: the taskbar and inactive titlebars use the opacity setting.
 Active titlebars add 8 points. Text-heavy panels add 10. All cap at 100%.

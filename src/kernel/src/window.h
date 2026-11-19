@@ -107,16 +107,15 @@ static constexpr uint32_t WM_BTN_ICON_PAD_BOT  = 6;   // minimize icon bottom of
 using WmPalette = BrookThemePalette;
 // The painters' palette for the theme in use (selection resolved against the
 // backend), and the hue's full token set (app content colours and more).
-const WmPalette& WmCurrentPalette();
-const BrookHueTokens& WmHueTokens();
+WmPalette WmCurrentPalette();
 // 0xB02 op 1: a legacy palette id (0..2) chooses its hue.
 bool WmSetTheme(uint32_t legacyPalette);
 // A key that changes with the selection and with what it resolves to.
 uint32_t WmGetTheme();
 // Clearwater selection word (brook_theme.h: theme, mode, hue) and the theme
 // in use (Glass, or its Opaque stand-in without backdrop blur).
-uint32_t WmGetThemeSelection();
-bool WmSetThemeSelection(uint32_t selection);
+uint64_t WmGetThemeSelection();
+bool WmSetThemeSelection(uint64_t selection);
 uint32_t WmResolvedTheme();
 // One app content colour (BROOK_CONTENT_*) of the theme in use.
 uint32_t WmContentColour(unsigned index);

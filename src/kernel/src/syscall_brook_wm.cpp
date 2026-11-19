@@ -227,17 +227,19 @@ int64_t sys_brook_wm_refresh_apps(uint64_t, uint64_t, uint64_t,
 
 // 0xB02: desktop theme (brook_theme.h). Ops 0/1: the legacy palette id
 // (query; set chooses its hue). Ops 2/3: the Clearwater selection word
-// (theme, mode, hue). Op 4: status.
+// (theme, mode, hue). Ops 6/7 support independent material and custom RGB.
 int64_t sys_brook_wm_theme(uint64_t op, uint64_t theme,
                           uint64_t, uint64_t, uint64_t, uint64_t)
 {
     if (!ProcessCurrent()) return -ESRCH;
     if (op == BROOK_THEME_OP_LEGACY_QUERY) return brook_hue_legacy_palette(brook_selection_hue(brook::WmGetThemeSelection()));
-    if (op == BROOK_THEME_OP_QUERY) return brook::WmGetThemeSelection();
-    if (op == BROOK_THEME_OP_SET)
-        return theme <= 0xffffffffULL && brook::WmSetThemeSelection(static_cast<uint32_t>(theme)) ? 0 : -EINVAL;
-    // Stage 1.5: whether Glass can be chosen (the active backend can blur its
-    // backdrop) and whether it is in use; Settings greys the Glass card.
+    if (op == BROOK_THEME_OP_MATERIAL_QUERY) return brook::WmGetThemeSelection();
+    if (op == BROOK_THEME_OP_MATERIAL_SET) return brook::WmSetThemeSelection(theme) ? 0 : -EINVAL;
+    if (op == BROOK_THEME_OP_QUERY) return brook_selection_legacy(brook::WmGetThemeSelection());
+    if (op == BROOK_THEME_OP_SET) {
+        uint64_t selection;
+        return brook_selection_from_legacy(theme,&selection) && brook::WmSetThemeSelection(selection) ? 0 : -EINVAL;
+    }
     if (op == BROOK_THEME_OP_STATUS)
         return (brook::WmBackendBlur() ? BROOK_THEME_STATUS_GLASS_AVAILABLE : 0u) |
                (brook::CompositorGlassActive() ? BROOK_THEME_STATUS_GLASS_ACTIVE : 0u);

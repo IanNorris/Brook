@@ -113,24 +113,20 @@ void MakeIcon() {
 
 ChromeMaterialCache glassCache;
 
-// A Clearwater theme as the painters see it: (theme, hue), Glass in Mixed
-// mode (dark chrome). Glass goldens rasterise explicit alpha for capture;
-// opaque goldens exercise the solid CPU fallback.
-struct GoldenTheme { const char* name; unsigned theme, hue; };
-BrookThemePalette palettes[8];
-const BrookThemePalette* PaletteFor(unsigned index, const GoldenTheme& t) {
+// The renderer captures explicit alpha for Glass and solid pixels for Opaque.
+struct GoldenTheme { const char* name; unsigned material, mode, hue; uint32_t rgb = 0; };
+BrookThemePalette currentPalette;
+void SetPalette(const GoldenTheme& t) {
     BrookHueTokens tokens;
-    brook_hue_derive(t.hue, &tokens);
-    brook_theme_build_palette(&tokens, t.theme, brook_theme_chrome_dark(t.theme, BROOK_MODE_MIXED), &palettes[index]);
-    return &palettes[index];
+    brook_hue_derive_selection(brook_selection_make(t.material,t.mode,t.hue,t.rgb), &tokens);
+    brook_theme_build_palette(&tokens, t.material, brook_theme_chrome_dark(t.mode), &currentPalette);
 }
-const BrookThemePalette* currentPalette;
 
 ChromeStyle StyleFor(uint32_t, const DesktopMetrics& m, bool glass) {
     static const ChromeFontSet* fonts[] = {&g_chromeFonts100, &g_chromeFonts150, &g_chromeFonts200};
     const ChromeFontSet* font = fonts[m.percent == 100 ? 0 : m.percent == 150 ? 1 : 2];
-    const BrookThemePalette* p = currentPalette;
-    ChromeStyle s{p, &m, font, glass, glass ? 200u : 255u, nullptr};
+    const BrookThemePalette* p = &currentPalette;
+    ChromeStyle s{*p, &m, font, glass, glass ? 200u : 255u, nullptr};
     if (glass) {
         glassCache.Ensure(p->titleActive, p->titleInactive, 200, s.M(DesktopMetrics::TitleBase), s.M(8),
                           s.M(2), p, s.M(DesktopMetrics::TaskbarBase));
@@ -308,7 +304,7 @@ DesktopIntervals<> compositorCadence;
 const uint64_t now = 100000;
 
 void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
-    const bool glass = theme == 0 || theme == 3;
+    const bool glass = theme == BROOK_THEME_GLASS;
     const ChromeStyle s = StyleFor(theme, m, glass);
     const uint32_t screenW = 1280 * m.percent / 100, screenH = 800 * m.percent / 100;
     static ChromeShellStorage storage;
@@ -467,22 +463,31 @@ int main(int argc, char** argv) {
             pos = end + 1;
         }
     }
-    // The three themes in Blue at every scale (stage 2.2), and two more hues
-    // at 100% (stage 2.3: a painter that hard-codes a blue shows up here).
+    // Cover every material and mode at each scale in Blue. Compare the
+    // accent mapping in a few other presets and custom magenta at 100%.
     static const GoldenTheme themes[] = {
-        {"glass", BROOK_THEME_GLASS, BROOK_HUE_BLUE},
-        {"opaque-light", BROOK_THEME_OPAQUE_LIGHT, BROOK_HUE_BLUE},
-        {"opaque-dark", BROOK_THEME_OPAQUE_DARK, BROOK_HUE_BLUE},
-        {"amber-glass", BROOK_THEME_GLASS, BROOK_HUE_AMBER},
-        {"teal-opaque-light", BROOK_THEME_OPAQUE_LIGHT, BROOK_HUE_TEAL},
+        {"glass-light", BROOK_THEME_GLASS, BROOK_MODE_LIGHT, BROOK_HUE_BLUE},
+        {"glass", BROOK_THEME_GLASS, BROOK_MODE_MIXED, BROOK_HUE_BLUE},
+        {"glass-dark", BROOK_THEME_GLASS, BROOK_MODE_DARK, BROOK_HUE_BLUE},
+        {"opaque-light", BROOK_THEME_OPAQUE, BROOK_MODE_LIGHT, BROOK_HUE_BLUE},
+        {"opaque-mixed", BROOK_THEME_OPAQUE, BROOK_MODE_MIXED, BROOK_HUE_BLUE},
+        {"opaque-dark", BROOK_THEME_OPAQUE, BROOK_MODE_DARK, BROOK_HUE_BLUE},
+        {"amber-glass", BROOK_THEME_GLASS, BROOK_MODE_MIXED, BROOK_HUE_AMBER},
+        {"teal-opaque-light", BROOK_THEME_OPAQUE, BROOK_MODE_LIGHT, BROOK_HUE_TEAL},
+        {"magenta-glass-light", BROOK_THEME_GLASS, BROOK_MODE_LIGHT, BROOK_HUE_CUSTOM, 0xff00ff},
+        {"magenta-glass-mixed", BROOK_THEME_GLASS, BROOK_MODE_MIXED, BROOK_HUE_CUSTOM, 0xff00ff},
+        {"magenta-glass-dark", BROOK_THEME_GLASS, BROOK_MODE_DARK, BROOK_HUE_CUSTOM, 0xff00ff},
+        {"magenta-opaque-light", BROOK_THEME_OPAQUE, BROOK_MODE_LIGHT, BROOK_HUE_CUSTOM, 0xff00ff},
+        {"magenta-opaque-mixed", BROOK_THEME_OPAQUE, BROOK_MODE_MIXED, BROOK_HUE_CUSTOM, 0xff00ff},
+        {"magenta-opaque-dark", BROOK_THEME_OPAQUE, BROOK_MODE_DARK, BROOK_HUE_CUSTOM, 0xff00ff},
     };
-    for (uint32_t theme = 0; theme < sizeof(themes) / sizeof(themes[0]); ++theme) {
-        currentPalette = PaletteFor(theme, themes[theme]);
+    for (const GoldenTheme& theme : themes) {
+        SetPalette(theme);
         for (const DesktopMetrics* m : {&DesktopMetric100, &DesktopMetric150, &DesktopMetric200}) {
-            if (theme >= 3 && m->percent != 100) continue;
-            const std::string prefix = std::string(themes[theme].name) + "-" + std::to_string(m->percent) + "-";
-            Frames(prefix, theme, *m);
-            Shell(prefix, theme, *m);
+            if (theme.hue != BROOK_HUE_BLUE && m->percent != 100) continue;
+            const std::string prefix = std::string(theme.name) + "-" + std::to_string(m->percent) + "-";
+            Frames(prefix, theme.material, *m);
+            Shell(prefix, theme.material, *m);
         }
     }
     if (update) {

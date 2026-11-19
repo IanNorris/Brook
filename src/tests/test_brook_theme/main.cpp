@@ -1,10 +1,5 @@
-// Clearwater hue derivation and theme selection (compositor refactor stages
-// 2.2 and 2.3). The test vectors are DESIGN.md's tables ("Derived tokens",
-// "Values per hue", "Computed contrast") and the generated per-hue block of
-// docs/design/clearwater-next/index.html, which hold the full token set:
-// brook_hue_derive must reproduce every colour to within one 8-bit level
-// (the gamut clip and rounding differ in the last bit for 11 of 338
-// colours), every alpha exactly, and every contrast target.
+// Clearwater token vectors and contrast from DESIGN.md. Check the colour
+// maths, independent material/mode, settings migration and custom accents.
 #include "../../shared/brook_theme.h"
 #include "../../shared/brook_appearance.h"
 #include <cmath>
@@ -25,18 +20,18 @@ struct Vector {
 };
 static const Vector vectors[BROOK_HUE_COUNT] = {
     {"blue", {0x102442,0x28508a,0x162844,0xeef4fc,74,52,0x030a16}, {0xe2edfb,0xbad5f8,0xe2ebf7,0x14263d,78,66,0x142c50,24,0x142c50,13,0x143264,8,0x143264,14,0x142238}, {0x111c2b,0x18263a,0x0c1522,0x26374f,0xe6edf7,0x93a4bb}, {0xf5f8fc,0xffffff,0xeaf0f8,0xd7e0ed,0x1c2b3f,0x5c6d84}},
-    {"navy", {0x091244,0x233891,0x0e1845,0xeff3fc,74,52,0x050916}, {0xe3ecff,0xbed2ff,0xe3eafb,0x1a243e,78,66,0x1e2a50,24,0x1e2a50,13,0x222f64,8,0x222f64,14,0x192138}, {0x0c1328,0x131d38,0x070d1f,0x212d4e,0xe8ecf7,0x97a2bc}, {0xf6f8fc,0xffffff,0xebeff8,0xd9dfed,0x212a3f,0x616b84}},
-    {"teal", {0x002b29,0x005e59,0x002f2d,0xecf6f4,74,52,0x000d0b}, {0xdff0ed,0xb0ddd7,0xdfeeec,0x062c28,78,66,0x003532,24,0x003532,13,0x003d3b,8,0x003d3b,14,0x052826}, {0x0a201e,0x0d2b29,0x061817,0x1a3d3a,0xe3efee,0x8caaa6}, {0xf4f9f8,0xffffff,0xe8f2f0,0xd3e3e1,0x13302d,0x54736f}},
-    {"pine", {0x002c1e,0x006044,0x023122,0xedf6f1,74,52,0x010d07}, {0xe0f1e7,0xb3dec8,0xe0eee6,0x0a2c1e,78,66,0x003625,24,0x003625,13,0x003f2d,8,0x003f2d,14,0x07291d}, {0x0c2017,0x102c20,0x071911,0x1d3e30,0xe4f0ea,0x8eaa9c}, {0xf4f9f6,0xffffff,0xe9f2ed,0xd4e4dc,0x153124,0x577365}},
-    {"phosphor", {0x032d16,0x0b6133,0x0c301b,0xeef6ef,74,52,0x020d04}, {0xe2f0e4,0xb9debf,0xe2eee4,0x112c18,78,66,0x03371b,24,0x03371b,13,0x004021,8,0x004021,14,0x0d2818}, {0x0f2014,0x142b1b,0x09190e,0x223d2a,0xe5f0e7,0x91aa96}, {0xf5f9f6,0xffffff,0xeaf2eb,0xd6e3d9,0x1a301f,0x5a7360}},
-    {"lime", {0x1b2a04,0x3f5b0d,0x1f2d0c,0xf1f5ec,74,52,0x070c01}, {0xe8efdf,0xc9dab1,0xe7eddf,0x1f2a0d,78,66,0x213305,24,0x213305,13,0x243d00,8,0x243d00,14,0x1b260d}, {0x171e0d,0x202912,0x111708,0x2f3b1f,0xe9efe4,0x9ca78d}, {0xf7f9f4,0xffffff,0xedf1e8,0xdbe2d4,0x252e16,0x657056}},
-    {"amber", {0x433200,0x8b6a00,0x433200,0xf7f3ea,74,56,0x0f0900}, {0xfceac7,0xf9cc6c,0xf7e9cb,0x302304,78,66,0x392a00,24,0x392a00,13,0x423200,8,0x423200,14,0x2b2004}, {0x241a02,0x312301,0x1c1301,0x44340a,0xf1ece1,0xada187}, {0xfaf7f3,0xffffff,0xf3efe6,0xe5dfd0,0x342910,0x776a50}},
-    {"orange", {0x4d2400,0x8b4500,0x532700,0xfbf1ec,74,56,0x130601}, {0xffe6d8,0xffc4a1,0xfde5d7,0x381e0d,78,66,0x472100,24,0x472100,13,0x512700,8,0x512700,14,0x331c0a}, {0x2a1608,0x381e0b,0x211005,0x4d2d17,0xf5eae3,0xb79c8c}, {0xfbf7f4,0xffffff,0xf7ede8,0xebdcd3,0x3b2416,0x806555}},
-    {"red", {0x570400,0x970a00,0x5e0700,0xfcf0ef,74,56,0x140504}, {0xffe5e1,0xffc1b9,0xfee3df,0x3a1b18,78,66,0x4a1c15,24,0x4a1c15,13,0x5b1c11,8,0x5b1c11,14,0x351914}, {0x2c1310,0x3b1b16,0x230e0a,0x512924,0xf7e9e6,0xba9a95}, {0xfcf6f5,0xffffff,0xf8eceb,0xecdbd7,0x3d221e,0x82635e}},
-    {"pink", {0x3b1626,0x7c3455,0x3e1b29,0xfbf0f4,74,52,0x13050b}, {0xf8e6ee,0xf1c4d7,0xf6e7ed,0x371b28,78,66,0x471b2f,24,0x471b2f,13,0x581a35,8,0x581a35,14,0x331823}, {0x28151d,0x361d27,0x1f0f16,0x4a2c38,0xf5e8ed,0xb799a5}, {0xfbf6f8,0xffffff,0xf7ecf0,0xebdae0,0x3a212c,0x7f626e}},
-    {"violet", {0x291c3e,0x5a4182,0x2d2140,0xf4f2fb,74,52,0x0b0715}, {0xede9fa,0xd6cbf4,0xebe8f6,0x28203a,78,66,0x32234b,24,0x32234b,13,0x3d255c,8,0x3d255c,14,0x261c35}, {0x1d1829,0x282137,0x171220,0x39314c,0xedeaf6,0xa59eb8}, {0xf8f7fc,0xffffff,0xf0eef7,0xe1ddeb,0x2d263d,0x6e6781}},
-    {"slate", {0x1f252e,0x465163,0x232831,0xf2f3f6,74,52,0x070a0e}, {0xe9ecf0,0xcbd3de,0xe8eaee,0x21262d,78,66,0x262d38,24,0x262d38,13,0x2c3543,8,0x2c3543,14,0x1e2229}, {0x181c20,0x22262c,0x121519,0x32373e,0xeaecf0,0x9ea3aa}, {0xf7f8f9,0xffffff,0xeeeff2,0xdddfe3,0x262b31,0x676c73}},
-    {"wallpaper", {0x331f0d,0x6d4723,0x362413,0xf8f2ee,74,52,0x100803}, {0xf4eae2,0xe6cdba,0xf1e8e2,0x322114,78,66,0x3e2710,24,0x3e2710,13,0x4b2c09,8,0x4b2c09,14,0x2d1f11}, {0x231910,0x302217,0x1b130b,0x433325,0xf2ebe5,0xaf9f92}, {0xfaf7f5,0xffffff,0xf4eeea,0xe6ddd6,0x35271c,0x78685b}},
+    {"navy", {0x00114b,0x0031a8,0x001453,0xeff3fc,74,52,0x050916}, {0xe2ecff,0xbcd3ff,0xe0ebff,0x1a243e,78,66,0x1e2a50,24,0x1e2a50,13,0x222f64,8,0x222f64,14,0x192138}, {0x0c1328,0x131d38,0x070d1f,0x212d4e,0xe8ecf7,0x97a2bc}, {0xf6f8fc,0xffffff,0xebeff8,0xd9dfed,0x212a3f,0x616b84}},
+    {"teal", {0x002b27,0x005e56,0x00302b,0xecf6f4,74,52,0x000d0b}, {0xd6f3ef,0x96e4da,0xd8f0ec,0x062c28,78,66,0x003532,24,0x003532,13,0x003d3b,8,0x003d3b,14,0x052826}, {0x0a201e,0x0d2b29,0x061817,0x1a3d3a,0xe3efee,0x8caaa6}, {0xf4f9f8,0xffffff,0xe8f2f0,0xd3e3e1,0x13302d,0x54736f}},
+    {"pine", {0x002d19,0x00613c,0x00311c,0xedf6f1,74,52,0x010d07}, {0xdaf3e4,0xa1e5be,0xdbf0e3,0x0a2c1e,78,66,0x003625,24,0x003625,13,0x003f2d,8,0x003f2d,14,0x07291d}, {0x0c2017,0x102c20,0x071911,0x1d3e30,0xe4f0ea,0x8eaa9c}, {0xf4f9f6,0xffffff,0xe9f2ed,0xd4e4dc,0x153124,0x577365}},
+    {"phosphor", {0x002e0c,0x006222,0x00320e,0xeef6ef,74,52,0x020d04}, {0xddf3df,0xaae3b1,0xddf0df,0x112c18,78,66,0x03371b,24,0x03371b,13,0x004021,8,0x004021,14,0x0d2818}, {0x0f2014,0x142b1b,0x09190e,0x223d2a,0xe5f0e7,0x91aa96}, {0xf5f9f6,0xffffff,0xeaf2eb,0xd6e3d9,0x1a301f,0x5a7360}},
+    {"lime", {0x1c2a00,0x425b00,0x1f2e00,0xf1f5ec,74,52,0x070c01}, {0xe6f1d7,0xc4de9c,0xe5eed9,0x1f2a0d,78,66,0x213305,24,0x213305,13,0x243d00,8,0x243d00,14,0x1b260d}, {0x171e0d,0x202912,0x111708,0x2f3b1f,0xe9efe4,0x9ca78d}, {0xf7f9f4,0xffffff,0xedf1e8,0xdbe2d4,0x252e16,0x657056}},
+    {"amber", {0x453100,0x8e6800,0x453100,0xf7f3ea,74,56,0x0f0900}, {0xffe9c0,0xffca59,0xffe7ba,0x302304,78,66,0x392a00,24,0x392a00,13,0x423200,8,0x423200,14,0x2b2004}, {0x241a02,0x312301,0x1c1301,0x44340a,0xf1ece1,0xada187}, {0xfaf7f3,0xffffff,0xf3efe6,0xe5dfd0,0x342910,0x776a50}},
+    {"orange", {0x512000,0x924000,0x572300,0xfbf1ec,74,56,0x130601}, {0xffe6d9,0xffc3a4,0xffe4d6,0x381e0d,78,66,0x472100,24,0x472100,13,0x512700,8,0x512700,14,0x331c0a}, {0x2a1608,0x381e0b,0x211005,0x4d2d17,0xf5eae3,0xb79c8c}, {0xfbf7f4,0xffffff,0xf7ede8,0xebdcd3,0x3b2416,0x806555}},
+    {"red", {0x590001,0x990004,0x600002,0xfcf0ef,74,56,0x140504}, {0xffe5e1,0xffc1b8,0xffe3de,0x3a1b18,78,66,0x4a1c15,24,0x4a1c15,13,0x5b1c11,8,0x5b1c11,14,0x351914}, {0x2c1310,0x3b1b16,0x230e0a,0x512924,0xf7e9e6,0xba9a95}, {0xfcf6f5,0xffffff,0xf8eceb,0xecdbd7,0x3d221e,0x82635e}},
+    {"pink", {0x450528,0x900e58,0x470e2c,0xfbf0f4,74,52,0x13050b}, {0xffe5ef,0xffbcd7,0xfee5ee,0x371b28,78,66,0x471b2f,24,0x471b2f,13,0x581a35,8,0x581a35,14,0x331823}, {0x28151d,0x361d27,0x1f0f16,0x4a2c38,0xf5e8ed,0xb799a5}, {0xfbf6f8,0xffffff,0xf7ecf0,0xebdae0,0x3a212c,0x7f626e}},
+    {"violet", {0x28164f,0x5833a3,0x2b1c50,0xf4f2fb,74,52,0x0b0715}, {0xece8ff,0xd4caff,0xeae7fd,0x28203a,78,66,0x32234b,24,0x32234b,13,0x3d255c,8,0x3d255c,14,0x261c35}, {0x1d1829,0x282137,0x171220,0x39314c,0xedeaf6,0xa59eb8}, {0xf8f7fc,0xffffff,0xf0eef7,0xe1ddeb,0x2d263d,0x6e6781}},
+    {"slate", {0x172538,0x365276,0x1c293a,0xf2f3f6,74,52,0x070a0e}, {0xe6ecf6,0xc3d4eb,0xe5ebf3,0x21262d,78,66,0x262d38,24,0x262d38,13,0x2c3543,8,0x2c3543,14,0x1e2229}, {0x181c20,0x22262c,0x121519,0x32373e,0xeaecf0,0x9ea3aa}, {0xf7f8f9,0xffffff,0xeeeff2,0xdddfe3,0x262b31,0x676c73}},
+    {"wallpaper", {0x3a1b00,0x794000,0x3e1f02,0xf8f2ee,74,52,0x100803}, {0xf9e8dc,0xf2c9ab,0xf7e8de,0x322114,78,66,0x3e2710,24,0x3e2710,13,0x4b2c09,8,0x4b2c09,14,0x2d1f11}, {0x231910,0x302217,0x1b130b,0x433325,0xf2ebe5,0xaf9f92}, {0xfaf7f5,0xffffff,0xf4eeea,0xe6ddd6,0x35271c,0x78685b}},
 };
 // DESIGN.md "Derived tokens": hue, swatch, bright, its hover, pressed and
 // text-on, deep, its hover and pressed.
@@ -61,18 +56,18 @@ static const AccentVector accents[BROOK_HUE_COUNT] = {
 // accent on chrome, accent line on the title top; dark then light chrome.
 static const double contrast[BROOK_HUE_COUNT][2][6] = {
     {{13.3,7.9,4.6,7.2,6.4,3.4},{12.7,6.7,4.6,10.1,4.6,3.6}},
-    {{15.2,8.7,4.9,9.2,6.5,3.9},{12.7,6.7,4.6,10.1,7.7,6.1}},
-    {{13.1,7.8,4.6,6.9,7.9,4.1},{12.5,6.6,4.6,10.1,4.6,3.7}},
-    {{13.0,7.7,4.5,6.9,7.9,4.2},{12.6,6.6,4.6,10.2,4.6,3.7}},
-    {{13.1,7.8,4.6,6.8,11.4,6.0},{12.5,6.6,4.6,10.2,4.5,3.7}},
-    {{13.2,7.8,4.6,7.0,9.5,5.0},{12.5,6.6,4.6,10.1,4.7,3.7}},
-    {{11.1,6.8,4.6,4.5,7.6,3.1},{12.7,6.7,4.6,10.1,4.6,3.7}},
-    {{11.3,6.9,4.6,6.4,5.3,3.0},{12.7,6.7,4.6,10.0,4.5,3.5}},
-    {{12.5,7.2,4.6,7.9,4.7,3.0},{12.7,6.8,4.7,10.0,4.6,3.6}},
-    {{13.5,8.0,4.6,7.6,5.8,3.2},{12.9,6.8,4.7,10.0,4.5,3.5}},
-    {{13.4,8.0,4.7,7.5,6.5,3.6},{12.8,6.7,4.6,10.0,5.1,4.0}},
-    {{13.3,7.9,4.7,7.2,7.7,4.1},{12.6,6.6,4.6,10.0,5.3,4.2}},
-    {{13.3,7.9,4.6,7.3,8.6,4.7},{12.7,6.7,4.6,10.1,4.5,3.5}},
+    {{15.4,8.7,4.8,9.4,6.6,4.0},{12.8,6.7,4.6,10.1,7.7,6.1}},
+    {{13.0,7.8,4.5,6.9,7.8,4.1},{12.5,6.6,4.6,10.3,4.6,3.7}},
+    {{13.0,7.7,4.5,6.8,7.9,4.1},{12.6,6.6,4.6,10.3,4.6,3.8}},
+    {{13.0,7.7,4.5,6.8,11.3,6.0},{12.5,6.6,4.6,10.2,4.5,3.7}},
+    {{13.1,7.8,4.6,6.9,9.4,5.0},{12.5,6.6,4.5,10.2,4.7,3.8}},
+    {{11.2,6.9,4.6,4.5,7.6,3.1},{12.7,6.6,4.6,10.1,4.6,3.7}},
+    {{11.4,6.9,4.6,6.3,5.4,3.0},{12.7,6.7,4.6,9.9,4.5,3.5}},
+    {{12.5,7.1,4.5,7.9,4.7,3.0},{12.8,6.8,4.7,10.0,4.6,3.6}},
+    {{13.8,8.0,4.6,7.8,5.9,3.3},{13.0,6.8,4.7,9.9,4.5,3.4}},
+    {{13.6,8.0,4.7,7.8,6.6,3.8},{12.7,6.6,4.6,10.0,5.1,4.0}},
+    {{13.2,7.8,4.6,7.2,7.6,4.1},{12.6,6.6,4.6,10.1,5.3,4.2}},
+    {{13.5,7.9,4.6,7.4,8.7,4.8},{12.8,6.7,4.6,10.0,4.5,3.5}},
 };
 
 static unsigned near = 0, exact = 0;
@@ -194,22 +189,54 @@ int main() {
               t.content[1].background == BROOK_REF_DARK_BG && t.content[0].background == BROOK_REF_LIGHT_BG);
     }
 
-    // Resolution: Glass needs backdrop blur; its stand-in follows the mode.
-    CHECK(brook_theme_resolve(BROOK_THEME_GLASS, BROOK_MODE_MIXED, 1) == BROOK_THEME_GLASS);
-    CHECK(brook_theme_resolve(BROOK_THEME_GLASS, BROOK_MODE_MIXED, 0) == BROOK_THEME_OPAQUE_DARK);
-    CHECK(brook_theme_resolve(BROOK_THEME_GLASS, BROOK_MODE_DARK, 0) == BROOK_THEME_OPAQUE_DARK);
-    CHECK(brook_theme_resolve(BROOK_THEME_GLASS, BROOK_MODE_LIGHT, 0) == BROOK_THEME_OPAQUE_LIGHT);
-    CHECK(brook_theme_resolve(BROOK_THEME_OPAQUE_LIGHT, BROOK_MODE_DARK, 1) == BROOK_THEME_OPAQUE_LIGHT);
-    CHECK(brook_theme_chrome_dark(BROOK_THEME_GLASS, BROOK_MODE_MIXED) && !brook_theme_content_dark(BROOK_THEME_GLASS, BROOK_MODE_MIXED));
-    CHECK(!brook_theme_chrome_dark(BROOK_THEME_GLASS, BROOK_MODE_LIGHT) && brook_theme_content_dark(BROOK_THEME_GLASS, BROOK_MODE_DARK));
-    CHECK(brook_theme_chrome_dark(BROOK_THEME_OPAQUE_DARK, BROOK_MODE_LIGHT) && brook_theme_content_dark(BROOK_THEME_OPAQUE_DARK, BROOK_MODE_LIGHT));
-    CHECK(!brook_theme_chrome_dark(BROOK_THEME_OPAQUE_LIGHT, BROOK_MODE_DARK) && !brook_theme_content_dark(BROOK_THEME_OPAQUE_LIGHT, BROOK_MODE_DARK));
-
-    // Selection word.
+    for (unsigned material = 0; material < BROOK_THEME_COUNT; ++material)
+        for (unsigned mode = 0; mode < BROOK_MODE_COUNT; ++mode) {
+            CHECK(brook_theme_resolve(material, 1) == material);
+            CHECK(brook_theme_resolve(material, 0) == BROOK_THEME_OPAQUE);
+            CHECK(brook_theme_chrome_dark(mode) == (mode != BROOK_MODE_LIGHT));
+            CHECK(brook_theme_content_dark(mode) == (mode == BROOK_MODE_DARK));
+        }
     CHECK(brook_selection_valid(BROOK_THEME_SELECTION_DEFAULT) && BROOK_THEME_SELECTION_DEFAULT == 0x10u);
-    CHECK(!brook_selection_valid(BROOK_THEME_SELECTION(3, 0, 0)) && !brook_selection_valid(BROOK_THEME_SELECTION(0, 3, 0)) &&
-          !brook_selection_valid(BROOK_THEME_SELECTION(0, 0, 13)) && !brook_selection_valid(1u << 13));
-    CHECK(brook_selection_valid(BROOK_THEME_SELECTION(2, 2, 12)));
+    CHECK(!brook_selection_valid(BROOK_THEME_SELECTION(2, 0, 0)) && !brook_selection_valid(BROOK_THEME_SELECTION(0, 3, 0)) &&
+          !brook_selection_valid(BROOK_THEME_SELECTION(0, 0, 14)) && !brook_selection_valid(1u << 13));
+    CHECK(!brook_selection_valid(brook_selection_make(BROOK_THEME_OPAQUE, BROOK_MODE_DARK, BROOK_HUE_BLUE, 1)));
+    uint64_t selection;
+    CHECK(brook_selection_from_legacy(BROOK_THEME_SELECTION(1, 1, 0), &selection) &&
+          selection == BROOK_THEME_SELECTION(BROOK_THEME_OPAQUE, BROOK_MODE_LIGHT, BROOK_HUE_BLUE));
+    CHECK(brook_selection_from_legacy(BROOK_THEME_SELECTION(2, 1, 0), &selection) &&
+          selection == BROOK_THEME_SELECTION(BROOK_THEME_OPAQUE, BROOK_MODE_DARK, BROOK_HUE_BLUE));
+    CHECK(!brook_selection_from_legacy(UINT64_C(1) << 32, &selection));
+    CHECK(brook_selection_legacy(BROOK_THEME_SELECTION(BROOK_THEME_OPAQUE, BROOK_MODE_MIXED, BROOK_HUE_BLUE)) == 0x12);
+
+    for (uint32_t rgb : {0x000000u, 0xffffffu, 0xff00ffu, 0x00ff00u, 0x777777u, 0x12112bu}) {
+        const uint64_t custom = brook_selection_make(BROOK_THEME_OPAQUE, BROOK_MODE_MIXED, BROOK_HUE_CUSTOM, rgb);
+        CHECK(brook_selection_valid(custom) && brook_selection_rgb(custom) == rgb);
+        BrookHueTokens t;
+        brook_hue_derive_selection(custom, &t);
+        CHECK(t.swatch == rgb);
+        for (unsigned i = 0; i < 2; ++i) {
+            const auto& c = t.chrome[i];
+            CHECK(c.accent == rgb && t.content[i].accent == rgb);
+            for (uint32_t background : {c.glass, c.flat, c.titleTop}) CHECK(brook_contrast(c.ink, background) >= 4.5);
+            for (uint32_t background : {c.accent, c.accentHover, c.accentPressed})
+                CHECK(brook_contrast(c.onAccent, background) >= 4.5);
+            for (unsigned material = 0; material < BROOK_THEME_COUNT; ++material) {
+                BrookThemePalette p;
+                brook_theme_build_palette(&t, material, i, &p);
+                CHECK(p.accent == rgb && brook_contrast(p.onAccent, p.accent) >= 4.5 &&
+                      brook_contrast(p.accentText, p.launcher) >= 4.5);
+            }
+            if (rgb == 0xff00ff) {
+                for (uint32_t tint : {c.glass, c.flat, c.titleTop})
+                    CHECK(((tint >> 16) & 255) > ((tint >> 8) & 255) && (tint & 255) > ((tint >> 8) & 255));
+            }
+        }
+    }
+    BrookHueTokens pink;
+    brook_hue_derive(BROOK_HUE_PINK, &pink);
+    for (const auto& c : pink.chrome)
+        for (uint32_t tint : {c.glass, c.flat, c.titleTop})
+            CHECK(((tint >> 16) & 255) > ((tint >> 8) & 255) && (tint & 255) > ((tint >> 8) & 255));
 
     // settings.ini: named keys and the aliases (DESIGN.md "Native notes").
     auto parse = [](std::initializer_list<const char*> lines) {
@@ -218,16 +245,26 @@ int main() {
         return brook_theme_settings_selection(&s);
     };
     CHECK(parse({}) == BROOK_THEME_SELECTION_DEFAULT);
-    CHECK(parse({"theme=opaque-light", "mode=dark", "accent=amber"}) == BROOK_THEME_SELECTION(1, 2, BROOK_HUE_AMBER));
+    CHECK(parse({"theme=opaque-light", "mode=dark", "accent=amber"}) == BROOK_THEME_SELECTION(1, 0, BROOK_HUE_AMBER));
     CHECK(parse({"accent=wallpaper ", "theme=glass\r", "mode=light"}) == BROOK_THEME_SELECTION(0, 0, BROOK_HUE_WALLPAPER));
     CHECK(parse({"palette=tinted"}) == BROOK_THEME_SELECTION(0, 1, 0));
     CHECK(parse({"palette=clearwater", "dark=1"}) == BROOK_THEME_SELECTION(0, 2, 0));
     CHECK(parse({"palette=smoked"}) == BROOK_THEME_SELECTION(0, 1, BROOK_HUE_SLATE));
     CHECK(parse({"palette=opal", "dark=0"}) == BROOK_THEME_SELECTION(0, 0, BROOK_HUE_PINE));
-    CHECK(parse({"theme=1", "dark=1"}) == BROOK_THEME_SELECTION(0, 2, BROOK_HUE_PINE));
-    CHECK(parse({"theme=2", "dark=0", "performance=1"}) == BROOK_THEME_SELECTION(1, 0, BROOK_HUE_SLATE));
-    CHECK(parse({"theme=0", "dark=1", "performance=1"}) == BROOK_THEME_SELECTION(2, 2, 0));
-    CHECK(parse({"performance=1"}) == BROOK_THEME_SELECTION(2, 1, 0)); // the default mode is Mixed: Opaque Dark
+    CHECK(parse({"theme=1", "dark=1"}) == BROOK_THEME_SELECTION(1, 0, BROOK_HUE_PINE));
+    CHECK(parse({"theme=2", "dark=0", "performance=1"}) == BROOK_THEME_SELECTION(1, 2, BROOK_HUE_SLATE));
+    CHECK(parse({"theme=0", "dark=1", "performance=1"}) == BROOK_THEME_SELECTION(1, 2, 0));
+    CHECK(parse({"performance=1"}) == BROOK_THEME_SELECTION(1, 1, 0));
+    CHECK(parse({"theme=opaque", "accent=#fF00Ff ", "mode=mixed"}) ==
+          brook_selection_make(BROOK_THEME_OPAQUE, BROOK_MODE_MIXED, BROOK_HUE_CUSTOM, 0xff00ff));
+    CHECK(parse({"accent=#000000", "theme=glass", "mode=dark"}) ==
+          brook_selection_make(BROOK_THEME_GLASS, BROOK_MODE_DARK, BROOK_HUE_CUSTOM, 0));
+    CHECK(parse({"accent=#ff00f"}) == BROOK_THEME_SELECTION_DEFAULT);
+    CHECK(parse({"accent=#ff00ff00"}) == BROOK_THEME_SELECTION_DEFAULT);
+    CHECK(parse({"accent=#ff00ff", "accent=blue"}) == BROOK_THEME_SELECTION_DEFAULT);
+    char hex[8];
+    brook_custom_accent_key(0xff00ff, hex);
+    CHECK(!std::strcmp(hex, "#ff00ff"));
     CHECK(parse({"performance=1", "theme=glass", "dark=1", "mode=mixed"}) == BROOK_THEME_SELECTION(0, 1, 0)); // named keys win
     CHECK(parse({"accent=slate", "palette=opal"}) == BROOK_THEME_SELECTION(0, 1, BROOK_HUE_SLATE));
     CHECK(parse({"theme=sparkly", "mode=dim", "accent=chartreuse", "dark=2"}) == BROOK_THEME_SELECTION_DEFAULT);

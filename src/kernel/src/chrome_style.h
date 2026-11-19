@@ -23,14 +23,14 @@ struct ChromeTaskbarSpacing {
 };
 
 struct ChromeStyle {
-    const BrookThemePalette* palette;
+    BrookThemePalette palette;
     const DesktopMetrics* metrics;
     const ChromeFontSet* fonts;
     bool glass;                          // translucent material (virgl glass)
     uint32_t materialOpacity;            // material alpha under glass
     const ChromeMaterialCache* material; // glass title rows and rims; may be null otherwise
 
-    const BrookThemePalette& P() const { return *palette; }
+    const BrookThemePalette& P() const { return palette; }
     const FontAtlas& Font(ChromeFont role = ChromeFont::Body) const { return (*fonts)[role]; }
     int Line(ChromeFont role = ChromeFont::Body) const { return Font(role).lineHeight; }
     // Scaled metric, typed like the WM's WmMetric.

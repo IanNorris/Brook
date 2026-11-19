@@ -32,17 +32,12 @@ static long pointer_speed=-1;
 static long touchpad_tap=-1;
 static uint32_t audio_control=BROOK_AUDIO_DEFAULT;
 static int audio_supported;
-/* Clearwater appearance (refactor stages 2.2 and 2.3): theme cards, the
- * Glass mode, the hue row, and Glass's opacity and blur. Glass is locked
- * when the compositor reports no backdrop blur (0xB02 op 4): its card, mode,
- * opacity and blur are greyed, a line says why, and the opaque stand-in is
- * what the preview shows. The saved choice is kept. */
 static GtkWidget *opacity_slider,*opacity_value,*blur_choice,*accel_note;
-static GtkWidget *theme_cards[BROOK_THEME_COUNT],*theme_samples[BROOK_THEME_COUNT],*mode_buttons[BROOK_MODE_COUNT];
-static GtkWidget *hue_buttons[BROOK_HUE_COUNT];
+static GtkWidget *material_buttons[BROOK_THEME_COUNT],*mode_buttons[BROOK_MODE_COUNT];
+static GtkWidget *hue_buttons[BROOK_HUE_COUNT],*custom_picker,*custom_swatch;
 static BrookGtkAppearance *appearance_style;
 static uint32_t selected_appearance=BROOK_APPEARANCE_DEFAULT;
-static uint32_t selected_theme=BROOK_THEME_SELECTION_DEFAULT; /* selection word */
+static uint64_t selected_theme=BROOK_THEME_SELECTION_DEFAULT; /* selection word */
 static int theme_supported,glass_available=1,updating_controls;
 static BrookHueTokens hue_tokens[BROOK_HUE_COUNT];
 static int hue_derived[BROOK_HUE_COUNT];
@@ -68,15 +63,30 @@ static void label(cairo_t *cr,int x,int y,const char *text,uint32_t rgb,int size
     pango_font_description_free(font);g_object_unref(layout);
 }
 static const BrookHueTokens *tokens_for(unsigned hue){
-    if(hue>=BROOK_HUE_COUNT)hue=BROOK_HUE_BLUE;
+    if(hue==BROOK_HUE_CUSTOM){
+        static BrookHueTokens custom;
+        static uint32_t rgb;
+        static int ready;
+        if(!ready || rgb!=brook_selection_rgb(selected_theme)){
+            brook_hue_derive_selection(selected_theme,&custom);
+            rgb=brook_selection_rgb(selected_theme);ready=1;
+        }
+        return &custom;
+    }
     if(!hue_derived[hue]){brook_hue_derive(hue,&hue_tokens[hue]);hue_derived[hue]=1;}
     return &hue_tokens[hue];
 }
 static unsigned sel_theme(void){return brook_selection_theme(selected_theme);}
 static unsigned sel_mode(void){return brook_selection_mode(selected_theme);}
 static unsigned sel_hue(void){return brook_selection_hue(selected_theme);}
+static const char *accent_key(uint64_t selection,char hex[8]){
+    const unsigned hue=brook_selection_hue(selection);
+    if(hue!=BROOK_HUE_CUSTOM)return brook_hue_key(hue);
+    brook_custom_accent_key(brook_selection_rgb(selection),hex);
+    return hex;
+}
 /* What the selection shows on this display: Glass, or its stand-in. */
-static unsigned resolved_theme(void){return brook_theme_resolve(sel_theme(),sel_mode(),glass_available);}
+static unsigned resolved_theme(void){return brook_theme_resolve(sel_theme(),glass_available);}
 static void rgba(cairo_t *cr,uint32_t rgb,double alpha){
     cairo_set_source_rgba(cr,((rgb>>16)&255)/255.,((rgb>>8)&255)/255.,(rgb&255)/255.,alpha);
 }
@@ -84,9 +94,9 @@ static gboolean draw_preview(GtkWidget *widget,cairo_t *cr,gpointer unused) {
     (void)unused;
     const unsigned resolved=resolved_theme(),mode=sel_mode();
     const BrookHueTokens *t=tokens_for(sel_hue());
-    BrookThemePalette palette;brook_theme_build_palette(t,resolved,brook_theme_chrome_dark(resolved,mode),&palette);
+    BrookThemePalette palette;brook_theme_build_palette(t,resolved,brook_theme_chrome_dark(mode),&palette);
     const BrookThemePalette *p=&palette;
-    const BrookContentTokens *content=&t->content[brook_theme_content_dark(resolved,mode)?1:0];
+    const BrookContentTokens *content=&t->content[brook_theme_content_dark(mode)?1:0];
     int w=gtk_widget_get_allocated_width(widget),h=gtk_widget_get_allocated_height(widget);
     cairo_pattern_t *bg=cairo_pattern_create_linear(0,0,w,h);
     cairo_pattern_add_color_stop_rgb(bg,0,.55,.66,.82);
@@ -102,32 +112,24 @@ static gboolean draw_preview(GtkWidget *widget,cairo_t *cr,gpointer unused) {
     rect(cr,x+10,y+1,60,2,p->accent);
     label(cr,x+9,y+6,"•  Window preview",p->text,9);
     label(cr,x+ww-43,y+6,"−  □  ×",p->text,9);
-    rect(cr,x+1,y+24,ww-2,h-y-24,content->background);
+    const int bar_h=8;
+    rect(cr,x+1,y+24,ww-2,h-y-24-bar_h,content->background);
     for(int i=0;i<3;++i)rect(cr,x+9+i*34,y+31,27,17,i==0?content->accent:content->raised);
     label(cr,x+120,y+31,"Apps",content->ink,9);
-    return FALSE;
-}
-/* A theme card's sample: Glass shows the title top over the glass tint, an
- * Opaque theme its flat fill; each with the hue's accent line. */
-static gboolean draw_theme_card(GtkWidget *widget,cairo_t *cr,gpointer data) {
-    const unsigned theme=GPOINTER_TO_UINT(data);
-    const BrookHueTokens *t=tokens_for(sel_hue());
-    const int dark=brook_theme_chrome_dark(theme,sel_mode());
-    const BrookChromeTokens *c=&t->chrome[dark?1:0];
-    int w=gtk_widget_get_allocated_width(widget),h=gtk_widget_get_allocated_height(widget);
-    const int locked=theme==BROOK_THEME_GLASS && !glass_available;
-    if(theme==BROOK_THEME_GLASS){
-        rect(cr,0,0,w,h,c->glass);rect(cr,0,0,w,h/2,c->titleTop);
-    }else rect(cr,0,0,w,h,c->flat);
-    rect(cr,6,h/2-2,w/2,2,c->accent);
-    if(locked){cairo_set_source_rgba(cr,.5,.5,.5,.55);cairo_paint(cr);}
+    rgba(cr,p->taskbar,alpha);cairo_rectangle(cr,0,h-bar_h,w,bar_h);cairo_fill(cr);
     return FALSE;
 }
 static gboolean draw_hue(GtkWidget *widget,cairo_t *cr,gpointer data) {
     const unsigned hue=GPOINTER_TO_UINT(data);
-    int w=gtk_widget_get_allocated_width(widget),h=gtk_widget_get_allocated_height(widget);
+    const BrookHueTokens *t=tokens_for(hue);
+    const unsigned material=resolved_theme();
+    const BrookChromeTokens *c=&t->chrome[brook_theme_chrome_dark(sel_mode())?1:0];
+    const uint32_t tint=material==BROOK_THEME_GLASS?c->glass:c->flat;
+    const int w=gtk_widget_get_allocated_width(widget),h=gtk_widget_get_allocated_height(widget);
     const double r=(w<h?w:h)/2.-1;
-    rgba(cr,brook_hue_accent(hue)->swatch,1);cairo_arc(cr,w/2.,h/2.,r,0,6.2832);cairo_fill(cr);
+    rgba(cr,tint,1);cairo_arc(cr,w/2.,h/2.,r,0,6.2832);cairo_fill_preserve(cr);
+    rgba(cr,c->ink,0.3);cairo_set_line_width(cr,1);cairo_stroke(cr);
+    rgba(cr,t->swatch,1);cairo_arc(cr,w/2.,h/2.,r/2.,0,6.2832);cairo_fill(cr);
     return FALSE;
 }
 static void set_class(GtkWidget *widget,const char *name,int on){
@@ -137,46 +139,59 @@ static void set_class(GtkWidget *widget,const char *name,int on){
 /* Selection, availability and the controls agree; the preview and the
  * app colours follow the selection as it would show on this display. */
 static void refresh_appearance(void){
-    const unsigned theme=sel_theme(),mode=sel_mode(),hue=sel_hue(),resolved=resolved_theme();
+    const unsigned theme=sel_theme(),mode=sel_mode(),hue=sel_hue();
     updating_controls=1;
     for(unsigned i=0;i<BROOK_THEME_COUNT;++i){
-        set_class(theme_cards[i],"selected",i==theme);
-        gtk_widget_set_sensitive(theme_cards[i],theme_supported && (i!=BROOK_THEME_GLASS || glass_available));
-        gtk_widget_queue_draw(theme_samples[i]);
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(material_buttons[i]),i==theme);
+        gtk_widget_set_sensitive(material_buttons[i],theme_supported);
     }
     for(unsigned i=0;i<BROOK_MODE_COUNT;++i){
         gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(mode_buttons[i]),i==mode);
-        gtk_widget_set_sensitive(mode_buttons[i],theme_supported && theme==BROOK_THEME_GLASS && glass_available);
+        gtk_widget_set_sensitive(mode_buttons[i],theme_supported);
     }
     for(unsigned i=0;i<BROOK_HUE_COUNT;++i){
         set_class(hue_buttons[i],"selected",i==hue);
         gtk_widget_set_sensitive(hue_buttons[i],theme_supported);
+        gtk_widget_queue_draw(hue_buttons[i]);
     }
-    const int glass=theme_supported && resolved==BROOK_THEME_GLASS;
+    const uint32_t rgb=tokens_for(hue)->swatch;
+    const GdkRGBA rgba_value={((rgb>>16)&255)/255.,((rgb>>8)&255)/255.,(rgb&255)/255.,1};
+    gtk_color_chooser_set_rgba(GTK_COLOR_CHOOSER(custom_picker),&rgba_value);
+    gtk_widget_set_sensitive(custom_picker,theme_supported);
+    set_class(custom_picker,"selected",hue==BROOK_HUE_CUSTOM);
+    gtk_widget_set_visible(custom_swatch,hue==BROOK_HUE_CUSTOM);
+    gtk_widget_queue_draw(custom_swatch);
+    const int glass=theme_supported && theme==BROOK_THEME_GLASS;
     gtk_widget_set_sensitive(opacity_slider,glass);gtk_widget_set_sensitive(blur_choice,glass);
-    if(glass_available)gtk_widget_hide(accel_note);
-    else {
-        char *text=theme==BROOK_THEME_GLASS?
-            g_strdup_printf("Glass needs GPU acceleration, which this display does not have. %s is in use until it does.",
-                            brook_theme_name(resolved)):
-            g_strdup("Glass needs GPU acceleration, which this display does not have. It will be available again when it does.");
-        gtk_label_set_text(GTK_LABEL(accel_note),text);g_free(text);gtk_widget_show(accel_note);
-    }
+    gtk_label_set_text(GTK_LABEL(accel_note),"Opaque is in use until backdrop blur is available.");
+    gtk_widget_set_visible(accel_note,glass && !glass_available);
     updating_controls=0;
     /* This window's own colours preview the selection's app content. */
-    const BrookContentTokens *c=&tokens_for(hue)->content[brook_theme_content_dark(resolved,mode)?1:0];
+    const BrookContentTokens *c=&tokens_for(hue)->content[brook_theme_content_dark(mode)?1:0];
     BrookSurfacePalette app={c->background,c->ink,c->dim,c->line,c->raised,brook_tint_over(c->selection,c->background),
                              c->sunken,c->accent,c->accentHover,c->onAccent};
-    brook_gtk_appearance_apply(appearance_style,&app,brook_theme_content_dark(resolved,mode));
+    brook_gtk_appearance_apply(appearance_style,&app,brook_theme_content_dark(mode));
     gtk_widget_queue_draw(preview);
 }
-static void select_theme(GtkButton *button,gpointer data) {
-    (void)button;
-    selected_theme=BROOK_THEME_SELECTION(GPOINTER_TO_UINT(data),sel_mode(),sel_hue());refresh_appearance();
+static void select_material(GtkToggleButton *button,gpointer data) {
+    if(updating_controls || !gtk_toggle_button_get_active(button))return;
+    selected_theme=brook_selection_make(GPOINTER_TO_UINT(data),sel_mode(),sel_hue(),brook_selection_rgb(selected_theme));
+    refresh_appearance();
 }
 static void select_mode(GtkToggleButton *button,gpointer data) {
     if(updating_controls || !gtk_toggle_button_get_active(button))return;
-    selected_theme=BROOK_THEME_SELECTION(sel_theme(),GPOINTER_TO_UINT(data),sel_hue());refresh_appearance();
+    selected_theme=brook_selection_make(sel_theme(),GPOINTER_TO_UINT(data),sel_hue(),brook_selection_rgb(selected_theme));
+    refresh_appearance();
+}
+static void select_custom(GtkColorButton *button,gpointer unused) {
+    (void)unused;
+    GdkRGBA value;
+    gtk_color_chooser_get_rgba(GTK_COLOR_CHOOSER(button),&value);
+    const uint32_t rgb=(uint32_t)(value.red*255+0.5)<<16 |
+                       (uint32_t)(value.green*255+0.5)<<8 |
+                       (uint32_t)(value.blue*255+0.5);
+    selected_theme=brook_selection_make(sel_theme(),sel_mode(),BROOK_HUE_CUSTOM,rgb);
+    refresh_appearance();
 }
 static void select_hue(GtkButton *button,gpointer data) {
     (void)button;
@@ -190,7 +205,7 @@ static gboolean follow_status(gpointer unused){
     if(available!=glass_available){glass_available=available;refresh_appearance();}
     return G_SOURCE_CONTINUE;
 }
-static int save_appearance(uint32_t theme,unsigned scale,uint32_t appearance,GError **error) {
+static int save_appearance(uint64_t theme,unsigned scale,uint32_t appearance,GError **error) {
     char *directory=g_path_get_dirname(settings_path);
     if(g_mkdir_with_parents(directory,0700)<0) {
         g_set_error(error,G_FILE_ERROR,g_file_error_from_errno(errno),"Cannot create settings directory: %s",strerror(errno));g_free(directory);return 0;
@@ -206,13 +221,13 @@ static int save_appearance(uint32_t theme,unsigned scale,uint32_t appearance,GEr
     g_clear_error(&load_error);
     g_key_file_set_string(settings,"Desktop","theme",brook_theme_key(brook_selection_theme(theme)));
     g_key_file_set_string(settings,"Desktop","mode",brook_mode_key(brook_selection_mode(theme)));
-    g_key_file_set_string(settings,"Desktop","accent",brook_hue_key(brook_selection_hue(theme)));
+    char hex[8];
+    g_key_file_set_string(settings,"Desktop","accent",accent_key(theme,hex));
     g_key_file_remove_key(settings,"Desktop","palette",NULL);
     g_key_file_set_integer(settings,"Desktop","scale",(int)scale);
     /* For an older kernel, which reads only these: dark apps, and an Opaque
      * theme as Performance mode. A Clearwater kernel prefers the names. */
-    g_key_file_set_integer(settings,"Desktop","dark",brook_selection_mode(theme)==BROOK_MODE_DARK ||
-                                                     brook_selection_theme(theme)==BROOK_THEME_OPAQUE_DARK);
+    g_key_file_set_integer(settings,"Desktop","dark",brook_selection_mode(theme)==BROOK_MODE_DARK);
     g_key_file_set_integer(settings,"Desktop","performance",brook_selection_theme(theme)!=BROOK_THEME_GLASS);
     g_key_file_set_integer(settings,"Desktop","opacity",brook_appearance_opacity(appearance));
     g_key_file_set_integer(settings,"Desktop","blur",brook_appearance_blur(appearance));
@@ -299,7 +314,8 @@ static int saved_matches_selection(void){
     for(unsigned i=0;matches && i<4;++i){GError *error=NULL;int value=g_key_file_get_integer(file,"Desktop",names[i],&error);
         matches=!error && value==values[i];g_clear_error(&error);}
     const char* keys[]={"theme","mode","accent"};
-    const char* words[]={brook_theme_key(sel_theme()),brook_mode_key(sel_mode()),brook_hue_key(sel_hue())};
+    char hex[8];
+    const char* words[]={brook_theme_key(sel_theme()),brook_mode_key(sel_mode()),accent_key(selected_theme,hex)};
     for(unsigned i=0;matches && i<3;++i){char *value=g_key_file_get_string(file,"Desktop",keys[i],NULL);
         matches=value && !strcmp(value,words[i]);g_free(value);}
     GError *experience_error=NULL;
@@ -312,13 +328,13 @@ static int saved_matches_selection(void){
 }
 static void apply(GtkButton *button,gpointer unused) {
     (void)button;(void)unused;
-    long previous=syscall(0xB02L,(long)BROOK_THEME_OP_QUERY,0L),previous_scale=syscall(0xB04L,0L,0L);
+    long previous=syscall(0xB02L,(long)BROOK_THEME_OP_MATERIAL_QUERY,0L),previous_scale=syscall(0xB04L,0L,0L);
     long previous_appearance=syscall(BROOK_SYS_WM_APPEARANCE,0L,0L);
     long previous_metrics=syscall(BROOK_SYS_WM_TASKBAR_METRICS,0L,0L);
     selected_metrics=0;
     for(unsigned i=0;i<7;++i)if(gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(metric_choices[i])))selected_metrics|=1u<<i;
     if(previous<0||previous_scale<0||previous_appearance<0||previous_metrics<0){gtk_label_set_text(GTK_LABEL(status),"Appearance controls need a matching Brook kernel.");return;}
-    int applied=syscall(0xB02L,(long)BROOK_THEME_OP_SET,(long)selected_theme)==0 && syscall(0xB04L,1L,(long)selected_scale)==0;
+    int applied=syscall(0xB02L,(long)BROOK_THEME_OP_MATERIAL_SET,(long)selected_theme)==0 && syscall(0xB04L,1L,(long)selected_scale)==0;
     if(applied){
         /* Opacity and blur; the dark and performance bits as the kernel now
          * reports them for the new selection, so they change nothing. */
@@ -336,7 +352,7 @@ static void apply(GtkButton *button,gpointer unused) {
     if(applied && saved_matches_selection()) {
         gtk_label_set_text(GTK_LABEL(status),"Appearance applied; file updated, but save durability is unconfirmed.");g_clear_error(&error);return;
     }
-    int restored=syscall(0xB02L,(long)BROOK_THEME_OP_SET,previous)==0;
+    int restored=syscall(0xB02L,(long)BROOK_THEME_OP_MATERIAL_SET,previous)==0;
     restored=(syscall(0xB04L,1L,previous_scale)==0)&&restored;
     restored=(syscall(BROOK_SYS_WM_APPEARANCE,1L,previous_appearance)==0)&&restored;
     restored=(syscall(BROOK_SYS_WM_TASKBAR_METRICS,1L,previous_metrics)==0)&&restored;
@@ -379,9 +395,9 @@ int main(int argc,char **argv) {
     g_object_unref(brook_css);
     selected_appearance=brook_appearance_read();appearance_style=brook_gtk_appearance_new(0);
     {
-        const long theme=syscall(0xB02L,(long)BROOK_THEME_OP_QUERY,0L);
-        theme_supported=theme>=0 && brook_selection_valid((uint32_t)theme);
-        if(theme_supported)selected_theme=(uint32_t)theme;
+        const long theme=syscall(0xB02L,(long)BROOK_THEME_OP_MATERIAL_QUERY,0L);
+        theme_supported=theme>=0 && brook_selection_valid((uint64_t)theme);
+        if(theme_supported)selected_theme=(uint64_t)theme;
         const long glass=syscall(0xB02L,(long)BROOK_THEME_OP_STATUS,0L);
         glass_available=glass<0?1:(glass&BROOK_THEME_STATUS_GLASS_AVAILABLE)!=0;
     }
@@ -455,22 +471,23 @@ int main(int argc,char **argv) {
     gtk_style_context_add_class(gtk_widget_get_style_context(helper),"muted");gtk_box_pack_start(GTK_BOX(box),helper,FALSE,FALSE,0);
     preview=gtk_drawing_area_new();gtk_widget_set_size_request(preview,-1,77);gtk_box_pack_start(GTK_BOX(box),preview,FALSE,FALSE,0);
     g_signal_connect(preview,"draw",G_CALLBACK(draw_preview),NULL);
-    /* Three theme cards. */
-    GtkWidget *card_row=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,8);gtk_box_pack_start(GTK_BOX(box),card_row,FALSE,FALSE,0);
-    for(unsigned id=0;id<BROOK_THEME_COUNT;++id) {
-        GtkWidget *button=gtk_button_new();theme_cards[id]=button;
-        gtk_style_context_add_class(gtk_widget_get_style_context(button),"swatch");
-        GtkWidget *contents=gtk_box_new(GTK_ORIENTATION_VERTICAL,5);gtk_container_add(GTK_CONTAINER(button),contents);
-        GtkWidget *sample=gtk_drawing_area_new();theme_samples[id]=sample;gtk_widget_set_size_request(sample,-1,24);
-        gtk_box_pack_start(GTK_BOX(contents),sample,FALSE,FALSE,0);
-        g_signal_connect(sample,"draw",G_CALLBACK(draw_theme_card),GUINT_TO_POINTER(id));
-        gtk_box_pack_start(GTK_BOX(contents),gtk_label_new(brook_theme_name(id)),FALSE,FALSE,0);
-        gtk_box_pack_start(GTK_BOX(card_row),button,TRUE,TRUE,0);g_signal_connect(button,"clicked",G_CALLBACK(select_theme),GUINT_TO_POINTER(id));
+    GtkWidget *material_row=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,12);gtk_box_pack_start(GTK_BOX(box),material_row,FALSE,FALSE,0);
+    GtkWidget *material_label=gtk_label_new("Material");gtk_widget_set_halign(material_label,GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(material_row),material_label,TRUE,TRUE,0);
+    GtkWidget *material_group=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(material_group),"linked");
+    gtk_box_pack_end(GTK_BOX(material_row),material_group,FALSE,FALSE,0);
+    for(unsigned id=0;id<BROOK_THEME_COUNT;++id){
+        material_buttons[id]=id?gtk_radio_button_new_with_label_from_widget(GTK_RADIO_BUTTON(material_buttons[0]),brook_theme_name(id)):
+                                gtk_radio_button_new_with_label(NULL,brook_theme_name(id));
+        gtk_toggle_button_set_mode(GTK_TOGGLE_BUTTON(material_buttons[id]),FALSE);
+        gtk_box_pack_start(GTK_BOX(material_group),material_buttons[id],FALSE,FALSE,0);
+        g_signal_connect(material_buttons[id],"toggled",G_CALLBACK(select_material),GUINT_TO_POINTER(id));
     }
     accel_note=gtk_label_new("");gtk_label_set_line_wrap(GTK_LABEL(accel_note),TRUE);gtk_label_set_xalign(GTK_LABEL(accel_note),0);
     gtk_style_context_add_class(gtk_widget_get_style_context(accel_note),"muted");gtk_box_pack_start(GTK_BOX(box),accel_note,FALSE,FALSE,0);
     gtk_widget_set_no_show_all(accel_note,TRUE);
-    /* Glass mode: Light, Mixed, Dark. */
+
     GtkWidget *mode_row=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,12);gtk_box_pack_start(GTK_BOX(box),mode_row,FALSE,FALSE,0);
     GtkWidget *mode_label=gtk_label_new("Mode");gtk_widget_set_halign(mode_label,GTK_ALIGN_START);gtk_box_pack_start(GTK_BOX(mode_row),mode_label,TRUE,TRUE,0);
     GtkWidget *mode_group=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,0);
@@ -482,7 +499,7 @@ int main(int argc,char **argv) {
         gtk_box_pack_start(GTK_BOX(mode_group),mode_buttons[id],FALSE,FALSE,0);
         g_signal_connect(mode_buttons[id],"toggled",G_CALLBACK(select_mode),GUINT_TO_POINTER(id));
     }
-    gtk_widget_set_tooltip_text(mode_group,"Light glass and light apps; dark glass around light apps; or dark throughout.");
+    gtk_widget_set_tooltip_text(mode_group,"Light throughout, dark chrome around light apps, or dark throughout.");
     /* Thirteen hues, each shown by its swatch. */
     GtkWidget *hue_label=gtk_label_new("Colour");gtk_widget_set_halign(hue_label,GTK_ALIGN_START);gtk_box_pack_start(GTK_BOX(box),hue_label,FALSE,FALSE,0);
     GtkWidget *hue_row=gtk_flow_box_new();gtk_flow_box_set_selection_mode(GTK_FLOW_BOX(hue_row),GTK_SELECTION_NONE);
@@ -498,6 +515,21 @@ int main(int argc,char **argv) {
         g_signal_connect(sample,"draw",G_CALLBACK(draw_hue),GUINT_TO_POINTER(id));
         gtk_container_add(GTK_CONTAINER(hue_row),button);g_signal_connect(button,"clicked",G_CALLBACK(select_hue),GUINT_TO_POINTER(id));
     }
+    GtkWidget *custom_row=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,8);
+    gtk_box_pack_start(GTK_BOX(box),custom_row,FALSE,FALSE,0);
+    GtkWidget *custom_label=gtk_label_new("Custom colour");gtk_widget_set_halign(custom_label,GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(custom_row),custom_label,TRUE,TRUE,0);
+    custom_picker=gtk_color_button_new();
+    gtk_style_context_add_class(gtk_widget_get_style_context(custom_picker),"swatch");
+    gtk_color_button_set_title(GTK_COLOR_BUTTON(custom_picker),"Choose an accent colour");
+    gtk_color_chooser_set_use_alpha(GTK_COLOR_CHOOSER(custom_picker),FALSE);
+    atk_object_set_name(gtk_widget_get_accessible(custom_picker),"Custom accent colour");
+    gtk_box_pack_end(GTK_BOX(custom_row),custom_picker,FALSE,FALSE,0);
+    g_signal_connect(custom_picker,"color-set",G_CALLBACK(select_custom),NULL);
+    custom_swatch=gtk_drawing_area_new();gtk_widget_set_size_request(custom_swatch,20,20);
+    gtk_widget_set_no_show_all(custom_swatch,TRUE);
+    g_signal_connect(custom_swatch,"draw",G_CALLBACK(draw_hue),GUINT_TO_POINTER(BROOK_HUE_CUSTOM));
+    gtk_box_pack_end(GTK_BOX(custom_row),custom_swatch,FALSE,FALSE,0);
     GtkWidget *opacity_row=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,12);gtk_box_pack_start(GTK_BOX(box),opacity_row,FALSE,FALSE,0);
     GtkWidget *opacity_label=gtk_label_new("Glass opacity");gtk_widget_set_halign(opacity_label,GTK_ALIGN_START);gtk_box_pack_start(GTK_BOX(opacity_row),opacity_label,TRUE,TRUE,0);
     opacity_value=gtk_label_new("");gtk_box_pack_end(GTK_BOX(opacity_row),opacity_value,FALSE,FALSE,0);
