@@ -171,14 +171,31 @@ uint32_t ChromeBlendColor(uint32_t fg, uint32_t bg, uint32_t alpha)
     return out;
 }
 
-void ChromeExecute(const ChromeDisplayList& list, const ChromeTarget& t, const ChromeFontSet& fonts)
+void ChromeExecute(const ChromeDisplayList& list, const ChromeTarget& base, const ChromeFontSet& fonts)
 {
-    if (!t.pixels || !t.width || !t.height) return;
+    if (!base.pixels || !base.width || !base.height) return;
+    // Every primitive clips to its target, so a Clip is a sub-target.
+    ChromeTarget t = base;
     for (uint32_t i = 0; i < list.Count(); ++i)
     {
         const ChromeCmd& c = list.At(i);
         switch (c.op)
         {
+        case ChromeOp::Clip: {
+            t = base;
+            if (c.w <= 0 || c.h <= 0) break;
+            const int bx0 = base.originX, by0 = base.originY;
+            const int bx1 = bx0 + static_cast<int>(base.width), by1 = by0 + static_cast<int>(base.height);
+            const int x0 = c.x > bx0 ? c.x : bx0, y0 = c.y > by0 ? c.y : by0;
+            const int x1 = c.x + c.w < bx1 ? c.x + c.w : bx1, y1 = c.y + c.h < by1 ? c.y + c.h : by1;
+            if (x1 <= x0 || y1 <= y0) { t.width = t.height = 0; break; }
+            t.pixels = base.pixels + static_cast<uint64_t>(y0 - by0) * base.stride + static_cast<uint32_t>(x0 - bx0);
+            t.width = static_cast<uint32_t>(x1 - x0);
+            t.height = static_cast<uint32_t>(y1 - y0);
+            t.originX = x0;
+            t.originY = y0;
+            break;
+        }
         case ChromeOp::FadeX: {
             const int left = c.x - t.originX, top = c.y - t.originY;
             for (int column = 0; column < c.w; ++column) {

@@ -42,7 +42,7 @@ std::unique_ptr<LauncherModel> Fresh() {
     auto m = std::make_unique<LauncherModel>();
     m->Init();
     m->SetCatalog(Catalog, CatalogCount);
-    m->SetViewport({36, 48, 40, 96, 48 * 6 + 36});
+    m->SetViewport({36, 48, 40, 96, 48 * 6 + 36, 20});
     m->Open();
     return m;
 }
@@ -181,10 +181,17 @@ void Navigation() {
     m->Press({LauncherTargetKind::Rail, 0}, false, 0, 0);
     CHECK(!m->Query()[0] && m->View() == LauncherViewAll);
     CHECK(m->Press({LauncherTargetKind::Row, uint16_t(Idx(*m, "doom"))}, false, 0, 0).app == Idx(*m, "doom"));
-    // Scrolling stays within range.
-    CHECK(m->ScrollBy(100) && m->Scroll() == m->MaxScroll());
-    CHECK(m->ScrollBy(-100) && m->Scroll() == 0);
+    // Scrolling is in pixels and stays within range; a wheel tick is the
+    // viewport step, positive ticks scrolling up.
+    CHECK(m->MaxScroll() == m->ContentHeight() - (48 * 6 + 36));
+    CHECK(m->ScrollTicks(-1) && m->Scroll() == 20);
+    CHECK(m->ScrollTicks(1) && m->Scroll() == 0);
+    CHECK(m->ScrollBy(100000) && m->Scroll() == m->MaxScroll());
+    CHECK(m->ScrollBy(-100000) && m->Scroll() == 0);
     CHECK(!m->ScrollBy(-1));
+    // Keyboard selection scrolls the selected row fully into view.
+    m->Key(LauncherKey::End);
+    CHECK(m->Scroll() == m->MaxScroll());
 }
 
 void PinsAndRecent() {

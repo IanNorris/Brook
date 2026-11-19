@@ -158,7 +158,7 @@ static const ChromeLauncherFrame& LauncherFrame(uint32_t screenW, uint32_t scree
     const ChromeLauncherChrome chrome = LauncherChrome(mouseX, mouseY);
     ChromeLauncherFrameFor(g_launcherModel, chrome, style, screenW, screenH, g_launcherFrame);
     g_launcherModel.SetViewport(g_launcherFrame.viewport);
-    if (g_launcherModel.Scroll() != g_launcherFrame.firstLine)
+    if (g_launcherModel.Scroll() != g_launcherFrame.scroll)
         ChromeLauncherFrameFor(g_launcherModel, chrome, style, screenW, screenH, g_launcherFrame);
     return g_launcherFrame;
 }
@@ -191,8 +191,9 @@ static void LauncherRun(const LauncherResult& r)
 void WmLauncherScroll(int delta, uint32_t, uint32_t)
 {
     if (!g_launcherOpen || !delta) return;
-    // Two lines a notch; the list scrolls by whole lines.
-    if (g_launcherModel.ScrollBy(delta < 0 ? 2 : -2)) CompositorMarkDirty();
+    // Pixel scrolling, a viewport step a tick (Ian, gen 458: two whole rows a
+    // tick was too far and jumpy on the touchpad).
+    if (g_launcherModel.ScrollTicks(delta)) CompositorMarkDirty();
 }
 
 void WmLauncherGetRect(uint32_t screenW, uint32_t screenH,

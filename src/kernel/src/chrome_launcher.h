@@ -25,6 +25,7 @@ struct ChromeLauncherMetrics {
     static constexpr int TilesPerRow = 5, Rail = 180, RailRow = 40, Row = 48, RowIcon = 28, Heading = 36;
     static constexpr int Chips = 44, Empty = 96, Footer = 52, Button = 44, ButtonFace = 36;
     static constexpr int Menu = 228, MenuItem = 36, MenuPad = 6;
+    static constexpr int ScrollStep = 20; // per wheel tick (~2 mm of two-finger travel)
 };
 
 // Everything besides the model: icons, identity, the power prompt (owned by
@@ -48,10 +49,11 @@ struct ChromeLauncherFrame {
     static constexpr uint32_t TargetLimit = 160, LineLimit = 32;
     DesktopRect panel, search, top, mid, rail, list, footer, menu;
     LauncherViewport viewport;    // for LauncherModel::SetViewport
-    // Visible list lines, from the model's scroll position.
+    // Visible list lines (whole rects; partly visible ones extend past list),
+    // from the model's scroll position in pixels.
     LauncherLine lines[LineLimit];
     DesktopRect lineRects[LineLimit];
-    uint32_t lineCount, firstLine, totalLines;
+    uint32_t lineCount, firstLine, totalLines, scroll;
     uint16_t tiles[LauncherLimits::Pins];
     uint32_t tileCount;
     ChromeLauncherHit targets[TargetLimit]; // menu first, then panel contents; the last is the panel
@@ -62,6 +64,11 @@ struct ChromeLauncherFrame {
 DesktopRect ChromeLauncherRect(const ChromeStyle& s, uint32_t screenW, uint32_t screenH);
 void ChromeLauncherFrameFor(const LauncherModel& model, const ChromeLauncherChrome& chrome, const ChromeStyle& s,
                           uint32_t screenW, uint32_t screenH, ChromeLauncherFrame& out);
+// Where the scrolled list shows: the list's columns, from the divider under
+// the top row to the footer (rows scroll through the list's padding).
+inline DesktopRect ChromeLauncherListClip(const ChromeLauncherFrame& f) {
+    return {f.list.x, f.mid.y + 1, f.list.w, f.mid.h > 1 ? f.mid.h - 1 : 0};
+}
 // The target under (x, y): None outside the panel.
 LauncherTarget ChromeLauncherHitTest(const ChromeLauncherFrame& frame, int32_t x, int32_t y);
 void ChromeBuildLauncher(const LauncherModel& model, const ChromeLauncherChrome& chrome, const ChromeLauncherFrame& frame,
