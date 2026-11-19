@@ -244,6 +244,8 @@ bool ProcessCleanupStep() {
     IrqSpinLockRelease(&g_cleanupLock,robustFlags);
     if(robust) {
         RobustFutexCleanup(robust);
+        // The robust hold keeps this member (and so its leader) unreaped.
+        SchedulerReleaseDeadGroupFiles(robust);
         SchedulerReleaseWaitReference(robust);
         robustFlags=IrqSpinLockAcquire(&g_cleanupLock);
         --g_cleanupStatus.activeFinalizers;
