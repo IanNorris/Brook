@@ -85,7 +85,9 @@ inline BrookDesktopSurface ChromeShellSurfaceRecord(uint32_t kind, const Desktop
     s.opacity = glass ? (materialOpacity > 255 ? 255 : materialOpacity) : 255;
     if (glass && kind != BROOK_DESKTOP_SURFACE_TASKBAR) {
         const uint32_t half = (s.width < s.height ? s.width : s.height) / 2;
-        const uint32_t radius = e.shellRadius < half ? e.shellRadius : half;
+        // Panels take the shell radius (12); a tooltip the small one (6).
+        const uint32_t wanted = kind == BROOK_DESKTOP_SURFACE_TOOLTIP ? e.shellRadius / 2 : e.shellRadius;
+        const uint32_t radius = wanted < half ? wanted : half;
         for (auto& corner : s.radii) corner = uint16_t(radius);
         if (kind != BROOK_DESKTOP_SURFACE_TOOLTIP) {
             s.shadow = BROOK_DESKTOP_SHADOW_PANEL;

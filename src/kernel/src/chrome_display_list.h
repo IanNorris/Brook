@@ -17,6 +17,32 @@
 
 namespace brook {
 
+// Type roles (DESIGN.md "Type"): every text command names one. The executor
+// is given one baked atlas per role at the desktop scale (ChromeFontSet,
+// chrome_raster.h). Icons is the 16 px line-icon set as coverage masks,
+// tinted like text (ChromeGlyph).
+enum class ChromeFont : uint8_t {
+    Body,   // 13: window titles, list rows, values
+    Label,  // 12: task labels, clock, secondary text, tooltips
+    Small,  // 11: captions, chips, HUD labels, legends
+    Strong, // 13 bold: toast and HUD titles
+    Lead,   // 15 bold: flyout titles
+    Hero,   // 20: toast and flyout readouts
+    Mono,   // 11 monospace: build label
+    Icons,  // 16 px icon masks
+    Count
+};
+// Icons, as character codes in the Icons atlas (scripts/bake_icons.py keeps
+// the same order).
+enum class ChromeGlyph : uint8_t {
+    Minimise = 'A', Maximise, Restore, Close, Network, NetworkOff, VolumeHigh, VolumeLow, VolumeMuted,
+    Temperature, Power, Restart, Bolt, ChevronRight, ChevronUp, ChevronDown,
+};
+
+// Text fonts carry two glyphs after ASCII (scripts/bake_font.py "extra").
+#define BROOK_CHROME_DEGREE "\x7f"
+#define BROOK_CHROME_DOT "\x80"
+
 enum class ChromeOp : uint8_t {
     FadeX,        // source-over horizontal stroke, from solid to clear
     Fill,         // solid rect, replaces the destination
@@ -34,7 +60,7 @@ struct ChromeCmd {
     int32_t x, y, w, h; // Text: pen origin, w = maximum width (0: none); Icon: w = size
     uint32_t color;
     uint32_t arg;       // Text: arena offset; CornerFill/MaterialRect: radius; Squares: count
-    int32_t dx, dy;     // Squares: step
+    int32_t dx, dy;     // Squares: step; Text: dx = clip given, dy = ChromeFont
     DesktopRect clip;   // Text: glyph clip when dx != 0; CornerFill: rounded block
     const void* data;   // Rows: uint32_t[h] colours; Icon: pixels
 };
@@ -74,7 +100,8 @@ public:
         Push({ChromeOp::Icon, x, y, size, size, 0, opacity, 0, 0, {}, pixels});
     }
     // maxWidth <= 0: unbounded. clip: glyph pixels outside it are skipped.
-    void Text(int x, int y, const char* text, uint32_t fg, int maxWidth = 0, const DesktopRect* clip = nullptr) {
+    void Text(int x, int y, const char* text, uint32_t fg, int maxWidth = 0, const DesktopRect* clip = nullptr,
+              ChromeFont font = ChromeFont::Body) {
         uint32_t length = 0;
         while (text[length]) ++length;
         if (!length) return;
@@ -83,7 +110,16 @@ public:
         for (uint32_t i = 0; i < length; ++i) text_[offset + i] = text[i];
         text_[offset + length] = 0;
         textUsed_ += length + 1;
-        Push({ChromeOp::Text, x, y, maxWidth, 0, fg, offset, clip ? 1 : 0, 0, clip ? *clip : DesktopRect{}, nullptr});
+        Push({ChromeOp::Text, x, y, maxWidth, 0, fg, offset, clip ? 1 : 0, static_cast<int32_t>(font),
+              clip ? *clip : DesktopRect{}, nullptr});
+    }
+    void Text(ChromeFont font, int x, int y, const char* text, uint32_t fg, int maxWidth = 0) {
+        Text(x, y, text, fg, maxWidth, nullptr, font);
+    }
+    // One icon mask, its top-left at (x, y), tinted fg.
+    void Glyph(ChromeGlyph glyph, int x, int y, uint32_t fg) {
+        const char text[2] = {static_cast<char>(glyph), 0};
+        Text(x, y, text, fg, 0, nullptr, ChromeFont::Icons);
     }
 
 private:

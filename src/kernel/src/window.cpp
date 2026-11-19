@@ -89,6 +89,10 @@ const FontAtlas& WmDesktopFont() {
     uint32_t scale=WmGetAppliedScale();
     return scale==200 ? g_desktopFont200 : scale==150 ? g_desktopFont150 : g_desktopFont100;
 }
+const ChromeFontSet& WmChromeFonts() {
+    uint32_t scale=WmGetAppliedScale();
+    return scale==200 ? g_chromeFonts200 : scale==150 ? g_chromeFonts150 : g_chromeFonts100;
+}
 bool WmSetScale(uint32_t percent) {
     if (!DesktopMetricsFor(percent)) return false;
     __atomic_store_n(&g_requestedScale,percent,__ATOMIC_RELEASE);
@@ -1828,10 +1832,9 @@ uint64_t WmMaterialCacheRebuilds(){return __atomic_load_n(&g_materialRebuilds,__
 ChromeStyle WmChromeStyle()
 {
     const bool glass = CompositorGlassActive();
-    return {&WmCurrentPalette(), &WmDesktopMetrics(), &WmDesktopFont(), glass, CompositorMaterialOpacity(),
+    return {&WmCurrentPalette(), &WmDesktopMetrics(), &WmChromeFonts(), glass, CompositorMaterialOpacity(),
             glass ? &WmChromeMaterial() : nullptr};
 }
-static int WmTextWidth(const char* text) { return ChromeTextWidth(WmDesktopFont(), text); }
 // Shell surfaces are built and executed on the compositor thread only; they
 // share this list storage (too large for the stack).
 static ChromeShellStorage g_shellListStorage;
@@ -1851,7 +1854,7 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
     ChromeFrameStorage storage;
     ChromeDisplayList list = ChromeListOn(storage);
     ChromeBuildFrame(model, WmChromeStyle(), list);
-    ChromeExecute(list, {buf, stride, screenW, screenH}, WmDesktopFont());
+    ChromeExecute(list, {buf, stride, screenW, screenH}, WmChromeFonts());
 }
 
 void WmRenderChrome(uint32_t* backBuffer, uint32_t stride,
@@ -2428,7 +2431,7 @@ bool WmLauncherVisible()
 uint64_t WmShellSurfaceKey(const WmShellSurface& s, uint32_t screenW, uint32_t screenH,
                            uint64_t uptimeMs, int32_t mx, int32_t my)
 {
-    const FontAtlas& font = WmDesktopFont();
+    const ChromeFontSet& fonts = WmChromeFonts();
     constexpr uint64_t prime = 0x100000001b3ull;
     uint64_t seed = 0x6b65792d7368656cull;
     auto word = [&](uint64_t v) { seed = (seed ^ v) * prime; };
@@ -2436,8 +2439,8 @@ uint64_t WmShellSurfaceKey(const WmShellSurface& s, uint32_t screenW, uint32_t s
     word(uint64_t(uint32_t(s.x)) << 32 | uint32_t(s.y));
     word(uint64_t(s.w) << 32 | s.h);
     word(uint64_t(screenW) << 32 | screenH);
-    word(reinterpret_cast<uintptr_t>(&font));
-    word(uint64_t(uint32_t(font.lineHeight)) << 32 | uint32_t(font.glyphCount));
+    word(reinterpret_cast<uintptr_t>(&fonts));
+    word(uint64_t(uint32_t(fonts[ChromeFont::Body].lineHeight)) << 32 | uint32_t(fonts[ChromeFont::Body].glyphCount));
     word(uint64_t(CompositorGlassActive()) << 32 | CompositorMaterialOpacity());
     uint64_t key = 0;
     switch (s.kind) {

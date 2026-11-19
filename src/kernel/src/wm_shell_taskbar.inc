@@ -30,23 +30,27 @@ static TaskbarLayout GetTaskbarLayout(uint32_t screenW, uint32_t screenH)
         WmStrCopy(buildText + 6, BuildGitHash(), sizeof(buildText) - 6);
     }
     int ids[WM_MAX_WINDOWS + LaunchFeedbackTable::Capacity], total = 0, focused = 0;
+    const char* labels[WM_MAX_WINDOWS + LaunchFeedbackTable::Capacity];
     for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
     {
         const Window& w = g_windows[i];
         if (!w.proc || !w.visible || !w.focusable) continue;
         if (w.focused) focused = total;
+        labels[total] = w.title;
         ids[total++] = static_cast<int>(i);
     }
     SpinLockAcquire(&g_launchLock);
     for (unsigned i = 0; i < LaunchFeedbackTable::Capacity; ++i) {
         if (!g_launches.entries[i].present()) continue;
         if (g_taskbarPageTarget == -10 - static_cast<int>(i)) focused = total;
+        labels[total] = nullptr; // launch feedback: icon only
         ids[total++] = -10 - static_cast<int>(i);
     }
     SpinLockRelease(&g_launchLock);
     return ChromeTaskbarLayoutFor(WmChromeStyle(), screenW, screenH, clockText,
                                   __atomic_load_n(&g_agentIndicatorState, __ATOMIC_ACQUIRE) != 0,
-                                  WmGetTaskbarMetrics(), ids, total, focused, buildText, g_hudMode == WmHudMode::Compact);
+                                  WmGetTaskbarMetrics(), ids, total, focused, buildText, g_hudMode == WmHudMode::Compact,
+                                  labels);
 }
 
 // Network indicator. The compositor thread refreshes this cache at most once
@@ -209,7 +213,7 @@ static void WmVolumeApply(uint32_t control)
 static TaskbarVolumePopupLayout WmVolumePopupLayout(uint32_t screenW, uint32_t screenH)
 {
     const TaskbarLayout t = GetTaskbarLayout(screenW, screenH);
-    return TaskbarVolumePopup(WmDesktopMetrics(), t.volume, t.y, static_cast<int>(screenW), WmTextWidth("100%"));
+    return TaskbarVolumePopup(WmDesktopMetrics(), t.volume, t.y, static_cast<int>(screenW), ChromeVolumeValueWidth(WmChromeStyle()));
 }
 
 static bool WmVolumeIconContains(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)
@@ -294,7 +298,7 @@ static void WmVolumePopupSurface(uint32_t* pixels, uint32_t stride, uint32_t scr
     ChromeDisplayList list = ChromeListOn(g_shellListStorage);
     ChromeBuildVolumePopup(model, WmChromeStyle(), list);
     if (key) *key = ChromeListKey(list, keySeed);
-    else ChromeExecute(list, {pixels, stride, screenW, screenH}, WmDesktopFont());
+    else ChromeExecute(list, {pixels, stride, screenW, screenH}, WmChromeFonts());
 }
 void WmVolumePopupRender(uint32_t* pixels, uint32_t stride, uint32_t screenW, uint32_t screenH,
                          int32_t mouseX, int32_t mouseY)
@@ -341,24 +345,42 @@ bool WmTrayFlyoutPress(int32_t mx, int32_t my, uint32_t sw, uint32_t sh)
     return true;
 }
 
+// Whether the open flyout has live content: the network has an address, or a
+// package temperature is available. It sizes the panel to its content.
+static bool WmTrayFlyoutLive()
+{
+    if (g_trayFlyout == WmTrayFlyout::Network) return __atomic_load_n(&g_netIndicatorAddress, __ATOMIC_ACQUIRE) != 0;
+    ThermalSnapshot snap{};
+    return ThermalReadSnapshot(snap) && snap.latest.pkgC >= 0;
+}
+
 static DesktopRect WmTrayFlyoutLayout(uint32_t sw, uint32_t sh)
 {
     if (!WmTrayFlyoutVisible() || WmTaskbarHidden()) return {};
     const auto l = GetTaskbarLayout(sw, sh);
     const auto anchor = g_trayFlyout == WmTrayFlyout::Network ? l.network : l.metrics[6];
-    const int gap = WmMetric(8), h = WmDesktopFont().lineHeight * 4 + WmMetric(42);
+    const int gap = WmMetric(ChromeShellMetrics::PanelMargin);
+    const int h = ChromeTrayFlyoutHeight(WmChromeStyle(), g_trayFlyout == WmTrayFlyout::Network, WmTrayFlyoutLive());
     if (!anchor.w || l.y < h + 2 * gap || sw < WmMetric(180)) return {};
+    // 304 wide, 8 px from the right screen edge and the taskbar (DESIGN.md
+    // "Geometry"), whichever tray target opened it.
     const int available = int(sw) - 2 * gap;
-    const int preferred = WmMetric(304);
-    return TaskbarTooltipBox(anchor, preferred < available ? preferred : available, h, l.y, gap, sw, gap);
+    const int preferred = WmMetric(304), w = preferred < available ? preferred : available;
+    return {int(sw) - gap - w, l.y - gap - h, w, h};
+}
+
+static bool WmHudThermal()
+{
+    ThermalSnapshot snap{};
+    return ThermalReadSnapshot(snap) && snap.latest.pkgC >= 0;
 }
 
 static DesktopRect WmPerformanceHudLayout(uint32_t sw, uint32_t sh)
 {
     if (WmTaskbarHidden() || g_hudMode != WmHudMode::Panel) return {};
-    const int margin = WmMetric(8);
+    const int margin = WmMetric(ChromeShellMetrics::PanelMargin);
     const int deskH = WmDesktopHeight(sh);
-    const int h = WmDesktopFont().lineHeight * 7 + WmMetric(112);
+    const int h = ChromePerformanceHudHeight(WmChromeStyle(), WmHudThermal());
     const int w = WmMetric(348);
     if (int(sw) < w + 2 * margin || deskH < h + 2 * margin) return {};
     return {int(sw) - w - margin, deskH - h - margin, w, h};
@@ -411,21 +433,19 @@ static void WmTrayFlyoutSurface(uint32_t* pixels, uint32_t stride, uint32_t sw, 
     const bool network = g_trayFlyout == WmTrayFlyout::Network;
     const uint32_t address = __atomic_load_n(&g_netIndicatorAddress, __ATOMIC_ACQUIRE);
     char text[48]{};
-    if (network) {
+    if (network && address) {
         BootText label(text, sizeof(text));
-        if (address) {
-            const auto* bytes = reinterpret_cast<const uint8_t*>(&address);
-            for (unsigned i = 0; i < 4; ++i) {
-                if (i) label.Add(".");
-                label.Number(bytes[i]);
-            }
-        } else label.Add("Disconnected");
-    } else DesktopThermalTooltip(text);
+        const auto* bytes = reinterpret_cast<const uint8_t*>(&address);
+        for (unsigned i = 0; i < 4; ++i) {
+            if (i) label.Add(".");
+            label.Number(bytes[i]);
+        }
+    }
     const ChromeTrayFlyoutModel model{rect, network, address != 0, text, WmTelemetryModel(false, !network)};
     ChromeDisplayList list = ChromeListOn(g_shellListStorage);
     ChromeBuildTrayFlyout(model, WmChromeStyle(), list);
     if (key) *key = ChromeListKey(list, seed);
-    else ChromeExecute(list, {pixels, stride, sw, sh}, WmDesktopFont());
+    else ChromeExecute(list, {pixels, stride, sw, sh}, WmChromeFonts());
 }
 
 static void WmPerformanceHudSurface(uint32_t* pixels, uint32_t stride, uint32_t sw, uint32_t sh,
@@ -436,7 +456,7 @@ static void WmPerformanceHudSurface(uint32_t* pixels, uint32_t stride, uint32_t 
     ChromeDisplayList list = ChromeListOn(g_shellListStorage);
     ChromeBuildPerformanceHud(WmHudModel(rect), WmChromeStyle(), list);
     if (key) *key = ChromeListKey(list, seed);
-    else ChromeExecute(list, {pixels, stride, sw, sh}, WmDesktopFont());
+    else ChromeExecute(list, {pixels, stride, sw, sh}, WmChromeFonts());
 }
 
 void WmRenderTrayFlyout(uint32_t* pixels, uint32_t stride, uint32_t sw, uint32_t sh)
@@ -508,7 +528,7 @@ static void WmTaskbarSurface(uint32_t* backBuffer, uint32_t stride,
     ChromeBuildTaskbar(model, style, list);
     if (l.hud.w > 0) ChromeBuildCompactHud(WmHudModel(l.hud), style, list);
     if (key) *key = ChromeListKey(list, keySeed);
-    else ChromeExecute(list, {backBuffer, stride, screenW, screenH}, WmDesktopFont());
+    else ChromeExecute(list, {backBuffer, stride, screenW, screenH}, WmChromeFonts());
 }
 void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
                      uint32_t screenW, uint32_t screenH,
@@ -585,15 +605,12 @@ static bool WmTrayTooltip(uint32_t screenW, uint32_t screenH, int32_t mx, int32_
         if (g_buildPayloadId[0]) detail = g_buildPayloadId;
     }
     if (!anchor) return false;
-    const int pad = ChromeTooltipPadding(WmChromeStyle());
+    const ChromeStyle style = WmChromeStyle();
     const int margin = WmMetric(4);
-    const int textWidth = WmTextWidth(text);
-    const int detailWidth = detail ? WmTextWidth(detail) : 0;
-    int width = (textWidth > detailWidth ? textWidth : detailWidth) + 2 * pad;
+    int width = ChromeTooltipWidth(style, text, detail);
     if (width > int(screenW) - 2 * margin) width = int(screenW) - 2 * margin;
-    box = TaskbarTooltipBox(*anchor, width,
-                            WmDesktopFont().lineHeight * (detail ? 2 : 1) + static_cast<int>(WmMetric(10)), l.y,
-                            margin, static_cast<int>(screenW), margin);
+    box = TaskbarTooltipBox(*anchor, width, ChromeTooltipHeight(style, detail != nullptr), l.y,
+                            WmMetric(ChromeShellMetrics::PanelMargin), static_cast<int>(screenW), margin);
     return box.w > 0 && box.h > 0;
 }
 
@@ -618,7 +635,7 @@ static void WmTrayTooltipSurface(uint32_t* pixels, uint32_t stride, uint32_t scr
     ChromeDisplayList list = ChromeListOn(g_shellListStorage);
     ChromeBuildTooltip({p, text, detail}, WmChromeStyle(), list);
     if (key) *key = ChromeListKey(list, keySeed);
-    else ChromeExecute(list, {pixels, stride, screenW, screenH}, WmDesktopFont());
+    else ChromeExecute(list, {pixels, stride, screenW, screenH}, WmChromeFonts());
 }
 void WmTrayTooltipRender(uint32_t* pixels, uint32_t stride, uint32_t screenW, uint32_t screenH,
                          int32_t mx, int32_t my)

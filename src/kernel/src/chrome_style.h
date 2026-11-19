@@ -15,39 +15,41 @@ namespace brook {
 struct ChromeStyle {
     const BrookThemePalette* palette;
     const DesktopMetrics* metrics;
-    const FontAtlas* font;
+    const ChromeFontSet* fonts;
     bool glass;                          // translucent material (virgl glass)
     uint32_t materialOpacity;            // material alpha under glass
     const ChromeMaterialCache* material; // glass title rows and rims; may be null otherwise
 
     const BrookThemePalette& P() const { return *palette; }
-    const FontAtlas& Font() const { return *font; }
+    const FontAtlas& Font(ChromeFont role = ChromeFont::Body) const { return (*fonts)[role]; }
+    int Line(ChromeFont role = ChromeFont::Body) const { return Font(role).lineHeight; }
     // Scaled metric, typed like the WM's WmMetric.
     uint32_t M(uint32_t base) const { return static_cast<uint32_t>(metrics->pixels(static_cast<int>(base))); }
-    int TextWidth(const char* text) const { return ChromeTextWidth(*font, text); }
+    int TextWidth(const char* text, ChromeFont role = ChromeFont::Body) const { return ChromeTextWidth(Font(role), text); }
     // A chrome colour with the material alpha (glass) or opaque.
     uint32_t MaterialColor(uint32_t color) const {
         return (color & 0xffffff) | (glass ? materialOpacity << 24 : 0xff000000u);
     }
 };
 
-// A filled rectangle in the material colour, corner-rounded under glass.
-inline void ChromeMaterialRect(ChromeDisplayList& dl, const ChromeStyle& s, const DesktopRect& r, uint32_t color) {
-    dl.MaterialRect(r, s.MaterialColor(color), s.glass ? s.M(4) : 0);
+// A filled rectangle in the material colour with rounded (r-sm) corners.
+inline void ChromeMaterialRect(ChromeDisplayList& dl, const ChromeStyle& s, const DesktopRect& r, uint32_t color,
+                               unsigned radius = 6) {
+    dl.MaterialRect(r, s.MaterialColor(color), s.M(radius));
 }
 
 // A string with a halo that keeps pale text legible over thin glass.
 inline void ChromeMaterialString(ChromeDisplayList& dl, const ChromeStyle& s, int x, int y, const char* text,
-                                 uint32_t fg, int width = 0) {
+                                 uint32_t fg, int width = 0, ChromeFont font = ChromeFont::Body) {
     const unsigned brightness = (((fg >> 16) & 255) + ((fg >> 8) & 255) + (fg & 255)) / 3;
     if (s.glass && s.materialOpacity < 180 && brightness > 128) {
         const int offset = s.M(1);
-        dl.Text(x - offset, y, text, s.P().halo, width);
-        dl.Text(x + offset, y, text, s.P().halo, width);
-        dl.Text(x, y - offset, text, s.P().halo, width);
-        dl.Text(x, y + offset, text, s.P().halo, width);
+        dl.Text(x - offset, y, text, s.P().halo, width, nullptr, font);
+        dl.Text(x + offset, y, text, s.P().halo, width, nullptr, font);
+        dl.Text(x, y - offset, text, s.P().halo, width, nullptr, font);
+        dl.Text(x, y + offset, text, s.P().halo, width, nullptr, font);
     }
-    dl.Text(x, y, text, fg, width);
+    dl.Text(x, y, text, fg, width, nullptr, font);
 }
 
 // An icon, or the neutral missing-icon glyph when pixels is null (never a

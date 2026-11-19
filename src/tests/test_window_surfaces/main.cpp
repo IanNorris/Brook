@@ -24,6 +24,10 @@ static GlyphInfo badgeGlyphs[95]{};
 extern const FontAtlas g_desktopFont100{badgeAtlas,2,2,badgeGlyphs,95,32,2,0,4};
 extern const FontAtlas g_desktopFont150{badgeAtlas,2,2,badgeGlyphs,95,32,2,0,4};
 extern const FontAtlas g_desktopFont200{badgeAtlas,2,2,badgeGlyphs,95,32,2,0,4};
+#define TEST_FONT_SET {{&g_desktopFont100,&g_desktopFont100,&g_desktopFont100,&g_desktopFont100,&g_desktopFont100,&g_desktopFont100,&g_desktopFont100,&g_desktopFont100}}
+extern const ChromeFontSet g_chromeFonts100 TEST_FONT_SET;
+extern const ChromeFontSet g_chromeFonts150 TEST_FONT_SET;
+extern const ChromeFontSet g_chromeFonts200 TEST_FONT_SET;
 const char* BuildGitHash(){return "test";}
 bool CompositorGlassActive() { return false; }
 uint32_t CompositorMaterialOpacity() { return 255; }

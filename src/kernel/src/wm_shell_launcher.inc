@@ -101,7 +101,7 @@ static void WmLauncherSurface(uint32_t* backBuffer, uint32_t stride,
     ChromeDisplayList list = ChromeListOn(g_shellListStorage);
     ChromeBuildLauncher(model, style, list);
     if (key) *key = ChromeListKey(list, keySeed);
-    else ChromeExecute(list, {backBuffer, stride, screenW, screenH}, WmDesktopFont());
+    else ChromeExecute(list, {backBuffer, stride, screenW, screenH}, WmChromeFonts());
 }
 void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
                       uint32_t screenW, uint32_t screenH,
