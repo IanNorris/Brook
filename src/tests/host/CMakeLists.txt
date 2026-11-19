@@ -782,6 +782,8 @@ else()
 endif()
 target_compile_options(test_taskbar_volume PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_launcher_power)
+add_host_test(test_launcher_model "${BROOK_ROOT}/src/kernel/src/launcher_model.cpp")
+target_compile_options(test_launcher_model PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 target_compile_options(test_launcher_power PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 
 add_host_test(test_debug_job_wire)
