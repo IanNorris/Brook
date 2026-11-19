@@ -142,8 +142,8 @@ bool WmBootSummaryRect(uint32_t sw,uint32_t sh,int32_t* x,int32_t* y,uint32_t* w
     if(sw<margin*2+WmMetric(100)||sh<h+margin+WmMetric(WM_TASKBAR_HEIGHT))return false;
     *width=w<sw-margin*2?w:sw-margin*2;*height=h;*x=sw-*width-margin;*y=margin;return true;
 }
-void WmRenderBootSummary(uint32_t* pixels,uint32_t stride,uint32_t sw,uint32_t sh) {
-    int32_t x,y;uint32_t w,h;if(!WmBootSummaryRect(sw,sh,&x,&y,&w,&h))return;
+static void WmBootSummarySurface(uint32_t* pixels,uint32_t stride,uint32_t sw,uint32_t sh,uint64_t keySeed,uint64_t* key) {
+    int32_t x,y;uint32_t w,h;if((!pixels && !key) || !WmBootSummaryRect(sw,sh,&x,&y,&w,&h))return;
     char number[16],headline[96],timing[96],machine[96],build[96];
     if(const BootTimingSummary* timing0=BootTimingRead()) {
         // Firmware | boot menu | loader | kernel; fold the loader into the
@@ -166,7 +166,11 @@ void WmRenderBootSummary(uint32_t* pixels,uint32_t stride,uint32_t sw,uint32_t s
         CompositorGlassActive()?"GPU composition | glass":CompositorGpuActive()?"GPU composition | flat":"Software composition | flat",build}};
     ChromeDisplayList list=ChromeListOn(g_shellListStorage);
     ChromeBuildBootSummary(model,WmChromeStyle(),list);
-    ChromeExecute(list,{pixels,stride,sw,sh},WmDesktopFont());
+    if(key)*key=ChromeListKey(list,keySeed);
+    else ChromeExecute(list,{pixels,stride,sw,sh},WmDesktopFont());
+}
+void WmRenderBootSummary(uint32_t* pixels,uint32_t stride,uint32_t sw,uint32_t sh) {
+    WmBootSummarySurface(pixels,stride,sw,sh,0,nullptr);
 }
 
 // Tray tooltip for the TEMP metric (fits the 48-byte tooltip buffer).

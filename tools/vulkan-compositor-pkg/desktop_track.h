@@ -35,6 +35,9 @@ struct DesktopTrackWindow {
      * for GPU sources, whose identity is the commit. */
     uint32_t layer[BROOK_VK_LAYER_WORDS];
     int32_t chromeX,chromeY;uint32_t chromeWidth,chromeHeight;
+    /* Shadow drawn beneath the window (surface record): its alpha and the
+     * output rectangle it can touch; shadowWidth 0 = none. */
+    uint32_t shadowAlpha;int32_t shadowX,shadowY;uint32_t shadowWidth,shadowHeight;
     struct DesktopTrackBands content,chrome;
 };
 struct DesktopTrackState {
@@ -105,6 +108,8 @@ static inline void desktop_track_footprint(const struct DesktopTrackWindow *w,st
     desktop_damage_add(d,desktop_track_layer_bounds(w->layer),width,height);
     if(w->hasChrome)desktop_damage_add(d,(struct DesktopDamageRect){w->chromeX,w->chromeY,
         (int64_t)w->chromeX+w->chromeWidth,(int64_t)w->chromeY+w->chromeHeight},width,height);
+    if(w->shadowWidth && w->shadowHeight)desktop_damage_add(d,(struct DesktopDamageRect){w->shadowX,w->shadowY,
+        (int64_t)w->shadowX+w->shadowWidth,(int64_t)w->shadowY+w->shadowHeight},width,height);
 }
 /* Output rows that may sample source rows [r0,r1) of the layer (relative
  * to its crop), widened by a row for the nearest-sampling rounding. */
@@ -136,6 +141,8 @@ static inline int desktop_track_same_geometry(const struct DesktopTrackWindow *a
     if(memcmp(a->layer+first,b->layer+first,(BROOK_VK_LAYER_WORDS-first)*sizeof(uint32_t)))return 0;
     if(a->hasChrome && (a->chromeX!=b->chromeX || a->chromeY!=b->chromeY || a->chromeWidth!=b->chromeWidth ||
        a->chromeHeight!=b->chromeHeight || a->chromeOpacity!=b->chromeOpacity))return 0;
+    if(a->shadowAlpha!=b->shadowAlpha || a->shadowX!=b->shadowX || a->shadowY!=b->shadowY ||
+       a->shadowWidth!=b->shadowWidth || a->shadowHeight!=b->shadowHeight)return 0;
     return 1;
 }
 /* Adds to damage every output rectangle that can differ between the

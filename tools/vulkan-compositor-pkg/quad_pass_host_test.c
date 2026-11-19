@@ -15,6 +15,8 @@
 #include "desktop_tile.h"
 #include "desktop_graphics_damage.h"
 #include "intel_tiling.h"
+#include "desktop_surfaces.h"
+#include "desktop_chrome_spans.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -147,6 +149,67 @@ static void random_scene(unsigned iteration){
                     i,l[2],l[3],l[1],l[4],l[5],l[6],l[7],(int)l[8],(int)l[9],l[10],l[11],(int)l[12],(int)l[13],l[14],l[15],l[16]);}
             exit(1);
         }
+    }
+}
+
+/* Surface records (stage 1.3/1.4): two windows with shadow nine-slices from
+ * their records (one shared 64x64 source, as the quad pass may share), an
+ * opaque frame drawn as in-place spans marked BROOK_VK_OPAQUE_SOURCE, and a
+ * translucent one whose spans are not. The quad pass must match the CPU
+ * oracle exactly, for full and partial damage, and never sample a chrome
+ * interior (filled with garbage here). */
+static void surface_scene(void){
+    enum {SW=800,SH=600,MAXS=40};
+    static struct Gem bg,shadowSrc,content[2],chromeSrc[2],a,b;static int ready;
+    if(!ready){gem_new(SW*SH*4,&bg);gem_new(64*64*4,&shadowSrc);for(unsigned i=0;i<2;++i){gem_new(300*200*4,&content[i]);gem_new(312*228*4,&chromeSrc[i]);}
+        gem_new(SW*SH*4,&a);gem_new(SW*SH*4,&b);ready=1;}
+    gem_cpu(&bg,1);for(uint32_t k=0;k<SW*SH;++k)bg.map[k]=0xff000000u|((k*2654435761u)>>8);
+    gem_cpu(&shadowSrc,1);desktop_shadow_source(shadowSrc.map);
+    const int32_t wx[2]={200,-60},wy[2]={150,330};const uint32_t opacity[2]={255,200};
+    uint32_t scene[BROOK_VK_SCENE_HEADER+MAXS*BROOK_VK_LAYER_WORDS]={SW,SH,0,0};struct Gem src[MAXS];const uint32_t *pixels[MAXS];unsigned n=0;
+#define ADD(gem,...) do{const struct BrookVkSceneLayer l_={__VA_ARGS__};memcpy(scene+BROOK_VK_SCENE_HEADER+n*BROOK_VK_LAYER_WORDS,&l_,sizeof(l_));src[n]=(gem);pixels[n]=(gem).map;++n;}while(0)
+    ADD(bg,0,SW,SW,SH,0,0,SW,SH,0,0,SW,SH,0,0,SW,SH,255);
+    for(unsigned w=0;w<2;++w){
+        gem_cpu(&content[w],1);for(uint32_t k=0;k<300*200;++k)content[w].map[k]=0xff000000u|(k*40503u+w);
+        gem_cpu(&chromeSrc[w],1);
+        for(uint32_t y=0;y<228;++y)for(uint32_t x=0;x<312;++x){const int interior=x>=6 && x<306 && y>=22 && y<222;
+            chromeSrc[w].map[y*312+x]=interior?0x5a5a5a5au:0xff000000u|((x*7+y*13+w*99)&0xffffffu);}
+        struct BrookDesktopSurface r;memset(&r,0,sizeof(r));
+        r.kind=BROOK_DESKTOP_SURFACE_FRAME;r.window=w+1;r.x=wx[w]-6;r.y=wy[w]-22;r.width=312;r.height=228;
+        r.clientX=wx[w];r.clientY=wy[w];r.clientWidth=300;r.clientHeight=200;r.opacity=opacity[w];r.flags=BROOK_DESKTOP_SURFACE_OPAQUE;
+        r.shadow=BROOK_DESKTOP_SHADOW_WINDOW;r.shadowAlpha=w?180:255;r.shadowSpread=32;r.shadowCorner=48;
+        struct BrookVkSceneLayer pieces[8];const unsigned np=desktop_surface_shadow_layers(&r,SW,SH,pieces);CHECK(np>=5);
+        for(unsigned k=0;k<np;++k){memcpy(scene+BROOK_VK_SCENE_HEADER+n*BROOK_VK_LAYER_WORDS,&pieces[k],sizeof(pieces[k]));src[n]=shadowSrc;pixels[n]=shadowSrc.map;++n;}
+        ADD(content[w],0,300,300,200,0,0,300,200,wx[w],wy[w],300,200,0,0,SW,SH,opacity[w]|BROOK_VK_STRAIGHT_ALPHA|(opacity[w]==255?BROOK_VK_OPAQUE_SOURCE:0u));
+        struct BrookDesktopLayer cl;memset(&cl,0,sizeof(cl));cl.window=w+1;cl.clientX=wx[w];cl.clientY=wy[w];cl.clientWidth=300;cl.clientHeight=200;
+        struct BrookDesktopLayer cr=cl;cr.clientX=r.x;cr.clientY=r.y;cr.width=cr.stride=312;cr.height=228;
+        struct DesktopChromeSpan spans[4];const unsigned ns=desktop_chrome_spans(&cl,&cr,spans);CHECK(ns==4);
+        const uint32_t flags=desktop_surface_frame_opaque(&r,opacity[w])?BROOK_VK_OPAQUE_SOURCE:0u;CHECK(!!flags==(w==0));
+        for(unsigned j=0;j<ns;++j)ADD(chromeSrc[w],0,312,312,228,spans[j].x,spans[j].y,spans[j].width,spans[j].height,
+            r.x+(int32_t)spans[j].x,r.y+(int32_t)spans[j].y,spans[j].width,spans[j].height,0,0,SW,SH,opacity[w]|BROOK_VK_STRAIGHT_ALPHA|flags);
+    }
+#undef ADD
+    scene[2]=n;
+    for(unsigned pass=0;pass<3;++pass){
+        struct DesktopDamageSet damage={1,{{0,0,SW,SH}}};
+        if(pass==1){damage.count=0;desktop_damage_add(&damage,(struct DesktopDamageRect){150,100,420,180},SW,SH);
+            desktop_damage_add(&damage,(struct DesktopDamageRect){0,300,300,600},SW,SH);}
+        if(pass==2){damage.count=0;desktop_damage_add(&damage,(struct DesktopDamageRect){190,128,530,180},SW,SH);} /* title strip only */
+        static struct QuadPlan plan;CHECK(quad_plan_build_auto(scene,BROOK_VK_SCENE_HEADER+n*BROOK_VK_LAYER_WORDS,NULL,&damage,1,&plan));
+        gem_cpu(&b,1);static uint32_t garbage[SW*SH];for(uint32_t k=0;k<SW*SH;++k)b.map[k]=garbage[k]=next();
+        (void)quad_run(scene,BROOK_VK_SCENE_HEADER+n*BROOK_VK_LAYER_WORDS,src,NULL,n,&b,&plan,NULL);gem_cpu(&b,0);
+        for(uint32_t y=0;y<SH;++y)for(uint32_t x=0;x<SW;++x){
+            int damaged=0;for(uint32_t r=0;r<damage.count;++r){const struct DesktopDamageRect *d=&damage.rects[r];
+                if(x>=d->left && x<d->right && y>=d->top && y<d->bottom)damaged=1;}
+            const uint32_t expected=damaged?quad_reference_pixel(scene,pixels,x,y):garbage[y*SW+x],got=b.map[y*SW+x];
+            if(got!=expected){fprintf(stderr,"QUAD_HOST_SURFACE_MISMATCH pass=%u x=%u y=%u quad=%08x expected=%08x\n",pass,x,y,got,expected);exit(1);}
+        }
+        /* Nothing below the opaque title strip of window 0 is shaded. */
+        const struct QuadRect title={194,128,506,150};uint64_t under=0;
+        for(uint32_t i=0;i<plan.drawCount;++i){const unsigned l=plan.draws[i].layer;
+            if(l<1+8+1)under+=quad_rect_area(quad_rect_intersect(plan.draws[i].rect,title));}
+        CHECK(under==0);
+        printf("QUAD_HOST_SURFACE_EXACT pass=%u layers=%u draws=%u shaded=%llu\n",pass,n,plan.drawCount,(unsigned long long)plan.pixelsShaded);
     }
 }
 
@@ -336,6 +399,7 @@ int main(int argc,char **argv){
     ring_targets();
     for(unsigned i=0;i<iterations;++i)random_scene(i);
     printf("QUAD_HOST_RANDOM_EXACT iterations=%u\n",iterations);
+    surface_scene();
     desktop();
     CHECK(brook_vk_quad_pass_destroy(quad));CHECK(brook_vk_renderer_destroy(batch));CHECK(brook_vk_renderer_destroy(compute));
     printf("QUAD_HOST_PASS\n");

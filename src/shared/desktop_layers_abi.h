@@ -47,6 +47,12 @@
 // recaptures into the same buffer.
 #define BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_KEYED 11
 #define BROOK_DESKTOP_CHROME_TRACKED_KEEP 12
+// Span-only chrome (stage 1.4): as TRACKED_CAPTURE_KEYED, but only the frame
+// strips (outer minus client rectangle, as in BrookDesktopSurface) are
+// written; the client interior of the caller's buffer is left untouched, so
+// the caller must sample only the strips. A caption block is written whole.
+// Older kernels return EINVAL; use TRACKED_CAPTURE_KEYED.
+#define BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_SPANS 17
 // Change-based client layers. As CAPTURE_TRACKED_SELECTIVE (a = skip mask),
 // plus b = a 32-bit mask of layers whose pixels the caller already holds.
 // For a keep layer the caller sets generation/bytes/width/height/stride to
@@ -96,6 +102,57 @@ struct BrookDesktopFocus {
     uint32_t reserved[2];
 };
 #define BROOK_DESKTOP_FOCUS_V1_SIZE 32
+// Layers ABI v2: surface records (compositor refactor stage 1.3). Every
+// chrome and shell surface carries how it is composited, resolved by the
+// kernel against the active backend before any backend sees it: material
+// (opaque, or glass with a blur level), opacity, corner radii, shadow class
+// and a content key. A backend draws what the record asks and nothing else;
+// a backend that cannot do an effect is never handed it.
+// Op 16: address = struct BrookDesktopSurfaces, size = its size, a = b = c =
+// 0. version must be BROOK_DESKTOP_SURFACES_VERSION on input. Returns one
+// FRAME or CAPTION_BLOCK record per visible window with chrome, matched to
+// the layers by window and incarnation (not by order). Older kernels return
+// EINVAL: the renderer then draws no shadows and treats every frame as
+// translucent, exactly as before. Older renderers never call it.
+#define BROOK_DESKTOP_SURFACES_QUERY 16
+#define BROOK_DESKTOP_SURFACES_VERSION 2
+#define BROOK_DESKTOP_SURFACE_FRAME 1          // title bar and border around a client
+#define BROOK_DESKTOP_SURFACE_CAPTION_BLOCK 2  // overlaid caption buttons (client-decorated)
+#define BROOK_DESKTOP_SURFACE_TASKBAR 3
+#define BROOK_DESKTOP_SURFACE_LAUNCHER 4
+#define BROOK_DESKTOP_SURFACE_VOLUME_POPUP 5
+#define BROOK_DESKTOP_SURFACE_TOOLTIP 6
+#define BROOK_DESKTOP_SURFACE_BOOT_SUMMARY 7
+#define BROOK_DESKTOP_MATERIAL_OPAQUE 0
+#define BROOK_DESKTOP_MATERIAL_GLASS 1         // needs backdrop blur; level = blur radius
+// The 64 px nine-slice of brook_chrome_shadow.h, spread past each outer edge
+// and drawn beneath the surface at shadowAlpha.
+#define BROOK_DESKTOP_SHADOW_NONE 0
+#define BROOK_DESKTOP_SHADOW_WINDOW 1
+// Every pixel of the surface outside its client rectangle has alpha 255 (at
+// opacity 255 it may replace what lies beneath).
+#define BROOK_DESKTOP_SURFACE_OPAQUE 1u
+struct BrookDesktopSurface {
+    uint32_t kind,window;           // window: the layer's window id (0: a shell surface)
+    uint64_t incarnation;           // the layer's incarnation (0: a shell surface)
+    uint64_t key;                   // content key: equal keys, identical pixels (0: unknown)
+    int32_t x,y; uint32_t width,height;                          // outer rectangle, desktop pixels
+    int32_t clientX,clientY; uint32_t clientWidth,clientHeight;  // transparent interior (frames)
+    uint32_t material,level,opacity,flags;
+    uint16_t radii[4];              // top-left, top-right, bottom-right, bottom-left
+    uint32_t shadow,shadowAlpha;    // class; 0..255
+    uint32_t shadowSpread,shadowCorner; // pixels past each edge; nine-slice corner, output pixels
+};
+struct BrookDesktopSurfaces {
+    uint32_t version,count;
+    uint64_t reserved;
+    struct BrookDesktopSurface surfaces[BROOK_DESKTOP_LAYER_LIMIT];
+};
+// Overlay op 10 (BROOK_DESKTOP_OVERLAY_SURFACES, brook_debug_frame.h).
+struct BrookDesktopOverlaySurfaces {
+    uint32_t count,reserved;
+    struct BrookDesktopSurface surfaces[4];
+};
 #define BROOK_DESKTOP_LAYER_LEGACY_OPAQUE 1u
 // Omitted means 255; older renderers reject these new flag bits safely.
 #define BROOK_DESKTOP_LAYER_HAS_OPACITY 2u
@@ -117,7 +174,11 @@ struct BrookDesktopLayers {
 #ifdef __cplusplus
 static_assert(sizeof(BrookDesktopLayer)==80 && sizeof(BrookDesktopLayers)==2576,"desktop layer ABI layout");
 static_assert(sizeof(BrookDesktopFocus)==48,"desktop focus ABI layout");
+static_assert(sizeof(BrookDesktopSurface)==96 && sizeof(BrookDesktopSurfaces)==16+96*BROOK_DESKTOP_LAYER_LIMIT &&
+              sizeof(BrookDesktopOverlaySurfaces)==8+96*4,"desktop surface ABI layout");
 #else
 _Static_assert(sizeof(struct BrookDesktopLayer)==80 && sizeof(struct BrookDesktopLayers)==2576,"desktop layer ABI layout");
 _Static_assert(sizeof(struct BrookDesktopFocus)==48,"desktop focus ABI layout");
+_Static_assert(sizeof(struct BrookDesktopSurface)==96 && sizeof(struct BrookDesktopSurfaces)==16+96*BROOK_DESKTOP_LAYER_LIMIT &&
+               sizeof(struct BrookDesktopOverlaySurfaces)==8+96*4,"desktop surface ABI layout");
 #endif

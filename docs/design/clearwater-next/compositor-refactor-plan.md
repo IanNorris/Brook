@@ -3,7 +3,9 @@
 15 November 2026. Status: accepted by Ian, with his answers recorded in
 [Decisions (Ian)](#decisions-ian-15-november). Stages 0.1–0.5 are
 implemented on `work/compositor-refactor`; stages 1.1 and 1.2 on
-`work/clearwater-s1` (see [Stage 1.1/1.2 evidence](#stage-11-and-12-evidence)). It covers the [Clearwater Next design](DESIGN.md)
+`work/clearwater-s1` (see [Stage 1.1/1.2 evidence](#stage-11-and-12-evidence));
+stages 1.3 and 1.4 on `work/clearwater-s1b` (see [Stage 1.3/1.4
+evidence](#stage-13-and-14-evidence)). It covers the [Clearwater Next design](DESIGN.md)
 and the [compositor direction](../../compositor-direction.md).
 
 Line numbers refer to `main` at `0ae38b0d`, before stage 0.1.
@@ -300,8 +302,8 @@ Steps 0.3 and 0.4 landed after `work/chrome-csd` merged into main.
 | --- | --- | --- |
 | **1.1 (done)** | Part table plus `WmHitTest` on parts, with edge-to-edge captions (DESIGN.md T0, implementation step 1):<br>• `chrome_layout.h`: freestanding part table per window state (role, visual rect, hit rect), in the spec's test order;<br>• the full DESIGN.md zone table at today's metrics (title 36, buttons 46): 6 px outer margin on every side with 16 px diagonal corners, buttons hit from y = 0 and Close to the outer right edge, 2 px inner band with 8 px corner squares, no zones when maximised, none on an edge touching the screen;<br>• chrome-csd's `captionOverlay` is three button parts on a CSD window, hit where drawn;<br>• hover follows the hit rect. | `test_chrome_layout` (DESIGN.md "Conformance test") at 100/150/200%. Intended change: hit areas only (see Stage 1.1/1.2 evidence). |
 | **1.2 (done)** | Display lists: frame and shell painters become *build list* plus *CPU execute*:<br>• `chrome_display_list.h` (7 primitives: fill, title rows, corner-clipped fill, material rect, text, icon, square runs), `chrome_style.h` (palette, metrics, font, resolved material);<br>• `chrome_raster` is the freestanding executor; `chrome_frame` and `chrome_shell` are freestanding builders with the taskbar and launcher layouts;<br>• the WM snapshots state into models (`wm_shell_*.inc`) and keeps hit tests and the build-badge spans. | `test_chrome_goldens`: 144 goldens (16 elements × 3 themes × 3 scales); QEMU CPU screenshots identical |
-| 1.3 | Surface records (material, radii, shadow class):<br>• virgl consumes them, replacing its own blur and shadow geometry;<br>• layers ABI v2 carries them to VKRENDER, which draws the shadow nine-slice. | Virgl screenshot identical; VKRENDER host quad test against the CPU reference |
-| 1.4 | Per-surface overlay keys and bands, replacing the 100 ms full re-render and hash; no CPU raster under lease; span-only chrome copy; opaque occlusion | Dell measurement (below): compositor GPU ms and job count no worse, kernel CPU lower |
+| **1.3 (done)** | Surface records (material, radii, shadow class, content key):<br>• `chrome_surface.h` builds one record per frame and shell surface, resolved against the backend (shadow and glass radii only under glass);<br>• virgl takes its shadow quads, title-blur radius and shell blur from them; the shadow nine-slice is shared (`brook_chrome_shadow.h`);<br>• layers ABI v2: op 16 (frame records), overlay op 10 (shell records); VKRENDER draws the shadow nine-slice. | Virgl screenshot identical; VKRENDER host quad test against the CPU reference (see Stage 1.3/1.4 evidence) |
+| **1.4 (done)** | • Per-surface overlay keys (display-list hash): the 100 ms check builds lists only, a capture rasterises only changed surfaces, band keys come from surface keys;<br>• no CPU raster of wallpaper, windows or chrome under a lease (one full repaint after);<br>• span-only chrome (op 17) drawn as in-place spans;<br>• opaque frames (spans, caption blocks) occlude in the quad plan, with `work/shell-opaque`'s bands. | Host tests and QEMU screenshots; Dell measurement plan below (not yet run) |
 | 1.5 | Backend `backdrop-blur` capability and theme resolution, replacing `CompositorGlassActive()` | QEMU: software → Opaque, gl → Glass; renderer kill → Opaque stand-in |
 
 ### Stage 2: Clearwater visuals, implemented once
@@ -674,3 +676,154 @@ overlaid captions behave as before.
 `base/`, `cand/`, `cand-edge/`, `compare-cpu.txt`, `scenes_qmp.py`,
 `scenes_extra.py`, `scenes_edge.py`, `compare.py`, serial logs, and the
 pair build and QEMU check logs.
+
+## Stage 1.3 and 1.4 evidence
+
+Branch `work/clearwater-s1b`, based on `work/integration36` (`c1b926f2`).
+Commits: `31447592` (per-surface overlay keys), `9b0fa2cb` (no CPU raster
+under a lease), `aad73960` (surface records, ABI v2, virgl), `8b8e4158`
+(VKRENDER).
+
+**What changed.**
+
+- **Overlay keys (1.4).** Each shell surface's display list is hashed
+  (`ChromeListKey`, seeded with kind, rectangle, screen, font and material;
+  `WmShellSurfaceKey`). The 100 ms / input check (`CheckDesktopOverlay`)
+  builds the lists and compares keys; it no longer rasterises or hashes
+  pixels, and it no longer touches the capture buffer, so it also runs
+  while a capture lease is held. A capture rasterises only surfaces whose
+  key or rectangle changed, plus anything that shares pixels with them
+  (`desktop_overlay_surfaces.h`, planned to a fixed point; a pointer
+  composited into a debug capture is cleared and the surfaces beneath it
+  redrawn next time). Op 9 band keys are folded from the surface keys, so
+  an unchanged launcher keeps its band key while the taskbar graph or a
+  hover changes. Counters in `compositor idle`: `overlay_surface_draws`,
+  `overlay_surface_keeps`, `overlay_key_checks`.
+- **No CPU raster under a lease (1.4).** While a renderer holds the
+  present lease, the WM loop skips the wallpaper, window contents, carets
+  and chrome into the back buffer (`cpu_scene_skips`). The first loop
+  without the lease (expiry, release, GOP writer) repaints everything once.
+- **Surface records (1.3).** `chrome_surface.h` builds a record per window
+  frame (or overlaid caption block) and per shell surface: rectangle,
+  client interior, material and blur level, opacity, radii, shadow class,
+  alpha, spread and corner, an opaque flag and the content key. Today's
+  rules are kept: a shadow and rounded glass corners exist only under
+  glass, never maximised or client-decorated; opaque frames and shell
+  surfaces are opaque in every pixel. The nine-slice source and slicing
+  are shared C/C++ (`brook_chrome_shadow.h`).
+- **virgl** takes its shadow quads, title-blur radius and shell blur
+  decision from the records (pixel-identical by construction).
+- **Layers ABI v2** (`desktop_layers_abi.h`): op 16
+  `BROOK_DESKTOP_SURFACES_QUERY` (version 2) returns the frame records,
+  matched to layers by window and incarnation; overlay op 10 returns the
+  shell records of a capture lease; op 17
+  `BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_SPANS` is a keyed capture that
+  clears, renders and copies only the frame strips, never the client
+  interior. **Fallbacks**, as KEYED/KEEP: an older kernel returns EINVAL
+  for 16, 10 and 17; the renderer then turns records off for good (no
+  shadows, nothing marked opaque) and uses the keyed full capture. Older
+  renderers never call the new ops. `BROOK_RENDER_SURFACES=0` and
+  `BROOK_RENDER_CHROME_SPANS=0` turn the renderer features off.
+- **VKRENDER** draws each record's shadow (eight straight-alpha quads
+  beneath the window, top four windows as virgl; each piece has its own
+  64x64 source, because the compute and graphics fallbacks reject layers
+  sharing a buffer), with the shadow bounds in change tracking. Chrome is
+  drawn as in-place spans of the chrome surface (no per-frame span copy);
+  in-place spans share a buffer, so they are used on quad-pass frames only
+  and a quad rejection retries with whole layers for a second. The chrome
+  buffer's interior is zeroed once per allocation and geometry, so a whole
+  layer never shows stale pixels. Spans and caption blocks of a record
+  marked opaque, at opacity 255, are `BROOK_VK_OPAQUE_SOURCE`: together
+  with `work/shell-opaque`'s bands, nothing beneath an opaque frame or
+  shell surface is shaded. Shell records are captured and adopted with the
+  bands but draw nothing yet (no shell shadows until stage 2.6).
+- **On the Dell nothing looks different.** Glass is never active under
+  VKRENDER (it yields), so every record has shadow none and opaque
+  material: the visible effects are fewer layers shaded, no span copies,
+  less kernel CPU and cheaper overlay captures. The shadow path is
+  exercised by host tests and on virgl until stage 1.5.
+
+**Host tests** (kernel, ctest): 380 run. `test_audio_delivery` times out,
+on the baseline build as well, under host load 30–56; four others timed out
+under parallel load and passed alone. New or extended:
+- `test_desktop_overlay_surfaces`: 200 000 random steps (overlapping,
+  moving, appearing and leaving surfaces, unknown keys, composited
+  pointers, wiped buffers); incremental redraw equals a full redraw every
+  step; band keys change exactly with their surfaces.
+- `test_gpu_capture_queue`: an unchanged surface is kept (no raster), a
+  changed taskbar is redrawn while the launcher is kept, and only the
+  taskbar band's key changes; op 10 records; key-only checks never touch
+  the buffer.
+- `test_chrome_goldens`: equal list keys mean equal pixels over the 144
+  goldens (goldens unchanged).
+- `test_chrome_surface`: record rules at 100/200%; the shared nine-slice
+  equals the old `GpuComposeShadow` quads and the old source pixels.
+
+**Compositor package** (`nix-build tools/vulkan-compositor-pkg`): all
+built-in tests pass, plus `desktop_surfaces_test` (shadow quads against a
+direct nine-slice raster through `quad_reference.h`, 155 M pixel checks;
+opaque spans change no pixel and occlude in the plan; shadow damage).
+
+**VKRENDER on the host GPU (i915, headless):**
+- `brook-quad-pass-host-test`: `QUAD_HOST_PASS`, including a new surface
+  scene (two windows with record shadows sharing one source, in-place
+  spans, one opaque and one translucent frame) exact against the CPU
+  oracle for full, partial and title-only damage, with nothing shaded
+  under the opaque title strip.
+- `brook-desktop-renderer-host-test` (fake kernel serving ops 16/17,
+  interior left untouched, CPU reference with shadows): `HOST_E2E_PASS` in
+  serial, pipelined async-partial, direct GPU sources (`HOST_E2E_DIRECT=1
+  HOST_E2E_LAYERS=1`), game and no-spans runs, and with
+  `HOST_E2E_OLD_KERNEL_NO_SURFACES=1` (old-kernel fallback).
+
+**QEMU, headless, QMP input, no NIC or bridge.** Baseline `c1b926f2`
+against the candidate, the stage 1.1/1.2 scene set (11 scenes; the
+taskbar-hover probe times out on both builds, the frame is still compared):
+- `gpu=software`: all 11 scenes **pixel-identical** outside the usual masks
+  (clock, telemetry, build label, caret) (`compare-cpu.txt`).
+- `gpu=gl` (virgl, glass active, record-driven shadows visible beside the
+  terminal): all 11 **identical** outside the usual masks plus the two blur
+  halos of stage 0.3/0.4 (build label, caret) (`compare-gl-blurmask.txt`).
+  QMP `screendump` cannot read the egl-headless scanout ("no surface"), so
+  these frames were read from a VNC socket on the same QEMU
+  (`vncgrab.py`, raw RFB).
+
+**Dell pair:** `build/dell/pair-cw1b` (payload `dell-cw1b-20261119`, scanout
+flip, persistent scanout map, zero-copy scanout and video engine on; clean
+tree at `f07dad86`; kernel `1c43a2d4…`). `check_dell_image_qemu.py
+--attempts 4`: PASS. Nothing has run on the Dell.
+
+Evidence (not committed): `build/cw1b-evidence/` in the worktree.
+
+### Dell measurement plan (stage 1.4)
+
+Deploy the pair with Ian present. Matched against the gen 441 runs
+(`display-perf/build/dell/q2-441-launcher{,-off}/`), the same yquake2 GL3
+demo, 20–30 s windows, desktop stats `s0`/`s1` diffed with
+`scripts/desktop_stats_diff.py`, plus `compositor idle` and `desktop chrome
+status` before and after:
+
+1. **Quake II fullscreen, launcher open, pointer moving** (the gen 441
+   case). Expect the renderer's overlay capture wait (`overlay` wait in the
+   stats, `DESKTOP_OVERLAY_TIMING wait_ms` with `BROOK_RENDER_TIMING`) near
+   zero, against 12–14 ms; `overlay_surface_keeps` rising with the launcher
+   kept and `overlay_surface_draws` about one per capture (the taskbar);
+   prepare ms/frame back near the launcher-off value (2.7 ms), displayed
+   fps no worse than launcher-off.
+2. **Quake II fullscreen, launcher closed.** Compositor GPU ms per
+   displayed frame and compositor job count no worse than gen 441;
+   `cpu_scene_skips` equal to the leased loops.
+3. **Kernel CPU:** compositor-thread time (profiler or worker idle %) lower
+   than gen 441 in cases 1 and 2.
+4. **Idle desktop, terminal plus a windowed app, hover the taskbar and the
+   caption buttons:** compositor jobs/s no worse; renderer `chrome`
+   `span_captures` rising and `bytes_copied` per capture about the frame
+   strips; `opaque_spans` rising; `surfaces.records` 1 and `shadows` 0
+   (opaque material).
+5. **Lease loss:** kill the renderer; the CPU desktop must come back in one
+   full repaint (about 15 ms) with every window and its chrome.
+
+Accept if 1–4 hold and 5 shows a complete desktop. Rollback without a
+rebuild: `BROOK_RENDER_SURFACES=0` and `BROOK_RENDER_CHROME_SPANS=0` in the
+renderer environment; the kernel changes have no switch (the previous pair
+is the rollback).

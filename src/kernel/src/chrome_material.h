@@ -1,15 +1,12 @@
 #pragma once
 #include <stdint.h>
 #include "../../shared/brook_theme.h"
+#include "../../shared/brook_chrome_shadow.h"
 namespace brook {
 // Pixel-centre circle coverage, shared by the decoration mask and backdrop.
 // Native scale is bounded to 100/150/200%.
 inline unsigned ChromeCornerInset(unsigned radius,unsigned row) {
-    if(!radius || row>=radius)return 0;
-    const int dy=int(2*(radius-row)-1);
-    for(unsigned x=0;x<radius;++x){const int dx=int(2*(radius-x)-1);
-        if(dx*dx+dy*dy<=int(4*radius*radius))return x;}
-    return radius;
+    return brook_chrome_corner_inset(radius,row);
 }
 inline uint32_t ChromeMix(uint32_t base,uint32_t tint,unsigned alpha) {
     uint32_t out=0;
@@ -102,22 +99,10 @@ inline uint32_t ChromeMaskedRim(uint32_t fill,unsigned coverage,unsigned inner,u
         out|=(((((fill>>shift)&255)*a+((rim>>shift)&255)*b)+sum/2)/sum)<<shift;
     return out;
 }
-// A cached 64px nine-slice shadow. The centre is a rounded, transparent hole;
-// shading never darkens the window through its own translucent title bar.
+// The cached 64px nine-slice shadow (brook_chrome_shadow.h, shared with the
+// user-mode renderer).
 inline uint32_t ChromeShadowPixel(unsigned x,unsigned y) {
-    if(x>=64 || y>=64)return 0;
-    if(x>=16 && x<48 && y>=16 && y<48) {
-        const unsigned row=y<32?y-16:47-y;
-        const unsigned inset=ChromeCornerInset(y<32?7:2,row);
-        if(x>=16+inset && x<48-inset)return 0;
-    }
-    const unsigned dx=x<16?16-x:x>=48?x-47:0;
-    const unsigned dy=y<16?16-y:y>=48?y-47:0;
-    const unsigned distance=(dx>dy?dx:dy)+(dx<dy?dx:dy)/2;
-    static constexpr uint8_t opacity[]={136,113,92,73,56,42,30,21,14,9,5,3,2,1,0,0,0};
-    unsigned alpha=distance<17?opacity[distance]:0;
-    if(y<16)alpha=alpha*3/4;
-    return alpha?(alpha<<24)|BROOK_CHROME_SHADE:0;
+    return brook_chrome_shadow_pixel(x,y);
 }
 static constexpr unsigned ChromeGlassWindowLimit=8,ChromeShadowWindowLimit=4;
 // 32 clients+four decoration strips; up to six rounded backdrop bands/window;
