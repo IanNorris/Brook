@@ -447,6 +447,30 @@ int64_t sys_brook_debug_frame(uint64_t op,uint64_t token,uint64_t destination,ui
             BROOK_DEBUG_FRAME_BGRA8,uint64_t(frame.width)*frame.height*4,frame.tick,frame.epoch},frame.source,0},frame.presentationMode,0};
         return CopyToUser(destination,&info,sizeof(info))?0:-EFAULT;
     }
+    if(op==BROOK_DEBUG_FRAME_REQUEST){
+        if(token||offset||length!=sizeof(BrookDebugFrameRequest))return -EINVAL;
+        BrookDebugFrameRequest request{};
+        if(!CopyFromUser(&request,destination,sizeof(request)))return -EFAULT;
+        constexpr uint32_t known=BROOK_DEBUG_FRAME_FLAG_CURSOR|BROOK_DEBUG_FRAME_FLAG_WINDOW_BUFFER;
+        const bool window=(request.flags&BROOK_DEBUG_FRAME_FLAG_WINDOW_BUFFER)!=0;
+        if((request.flags&~known) || (window?(!request.window_id || !request.window_incarnation):
+           (request.window_id || request.window_incarnation)))return -EINVAL;
+        int error=0;
+        const auto frame=CompositorRequestDebugFrameOptions(owner,request.flags,request.window_id,request.window_incarnation,&error);
+        if(frame.state==DebugFrameState::Busy)return -16; // EBUSY
+        if(error)return error;
+        return frame.token?int64_t(frame.token):-EIO;
+    }
+    if(op==BROOK_DEBUG_FRAME_INFO_V4){
+        if(offset || length!=sizeof(BrookDebugFrameInfoV4))return -EINVAL;
+        const auto frame=CompositorDebugFrameStatus(uint32_t(token),owner);
+        if(frame.state==DebugFrameState::Expired)return -116;
+        BrookDebugFrameInfoV4 info{{{{frame.token,uint32_t(frame.state),frame.width,frame.height,frame.stride,
+            BROOK_DEBUG_FRAME_BGRA8,uint64_t(frame.width)*frame.height*4,frame.tick,frame.epoch},frame.source,0},frame.presentationMode,0},
+            frame.plane,frame.planeSurface,frame.planeControl,frame.planeStride,frame.infoFlags,frame.windowId,
+            frame.windowScale?frame.windowScale:1,frame.copyUs};
+        return CopyToUser(destination,&info,sizeof(info))?0:-EFAULT;
+    }
     if(op==2){
         if(!length || length>BROOK_DEBUG_FRAME_CHUNK)return -EINVAL;
         void* staged=kmalloc(uint32_t(length));if(!staged)return -ENOMEM;

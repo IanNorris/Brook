@@ -173,6 +173,14 @@ def main():
          '--vulkan-renderer', renderer, '--gpu-source-provider', provider]
         + ([] if a.show_kernel_console else ['--hide-kernel-console']), cwd=ROOT / 'scripts')
 
+    # 3b. Binary-bridge helper from this checkout (frame options and scanout
+    # provenance; the pinned source initrd carries an older HWBULK.ELF).
+    helper = a.output / 'HWBULK.ELF'
+    run([os.environ['MUSL_CC'], '-static', '-O2', '-Wall', '-Wextra', '-Werror', ROOT / 'tools/hardware_bulk.c', '-o', helper])
+    run(['mcopy', '-o', '-i', a.output / 'INITRD.IMG', helper, '::/BOOT/HWBULK.ELF'])
+    if subprocess.check_output(['mtype', '-i', str(a.output / 'INITRD.IMG'), '::/BOOT/HWBULK.ELF']) != helper.read_bytes():
+        sys.exit('HWBULK.ELF readback mismatch')
+
     # 4. Independent verification
     verify = [sys.executable, ROOT / 'scripts/verify_guarded_desktop_candidate.py', '--candidate', a.output,
               '--source', source, '--reference', source, '--build', build, '--expected-kernel', sha(kernel),
@@ -194,6 +202,7 @@ def main():
         'kernel_options': options, 'kernel_console_hidden': not a.show_kernel_console, 'kernel_sha256': sha(a.output / 'kernel.elf'),
         'initrd_sha256': sha(a.output / 'INITRD.IMG'), 'source_initrd_sha256': SOURCE_INITRD_SHA,
         'packages': {'vulkan_compositor': str(compositor), 'waylandd_vulkan': str(waylandd)},
+        'bulk_helper': {'source': 'tools/hardware_bulk.c', 'sha256': sha(helper)},
         'boot_services': {name: {'source': str(path), 'sha256': sha(path), 'runtime_store_paths': runtime_paths(path)}
                           for name, path in (('VKSUP.ELF', supervisor), ('VKRENDER.ELF', renderer), ('INTLWL.ELF', provider))},
     }

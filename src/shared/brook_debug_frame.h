@@ -30,6 +30,40 @@ struct BrookDebugFrameInfoV3 {
     struct BrookDebugFrameInfoV2 v2;
     uint32_t presentation_mode,reserved;
 };
+/* Op 6 (optional; older kernels return -EINVAL) requests a capture like op
+ * 0 with options: destination/length describe one BrookDebugFrameRequest
+ * (exact length). CURSOR composites the visible hardware cursor plane over
+ * the image (a software cursor is already part of the pixels).
+ * WINDOW_BUFFER copies the current client buffer of the named window
+ * (unoccluded, buffer pixels, no chrome) instead of the screen; it fails
+ * with -ENOENT for an unknown window and -EOPNOTSUPP without a CPU buffer.
+ * Op 7 fills BrookDebugFrameInfoV4 (exact length) for the same token.
+ * Sources 4..7 extend the V2 source field: on Dell builds full-screen
+ * captures read the surface primary plane A is fetching (DSPASURFLIVE), so
+ * a renderer image, kernel flip buffer or direct client buffer replaces
+ * the GOP framebuffer whenever it is the one on the panel. */
+enum { BROOK_DEBUG_FRAME_REQUEST=6, BROOK_DEBUG_FRAME_INFO_V4=7 };
+enum { BROOK_DEBUG_FRAME_FLAG_CURSOR=1, BROOK_DEBUG_FRAME_FLAG_WINDOW_BUFFER=2 };
+struct BrookDebugFrameRequest {
+    uint32_t flags,window_id;
+    uint64_t window_incarnation;
+};
+enum { BROOK_DEBUG_FRAME_SOURCE_FLIP=4, BROOK_DEBUG_FRAME_SOURCE_ZERO_COPY=5,
+       BROOK_DEBUG_FRAME_SOURCE_DIRECT_CLIENT=6, BROOK_DEBUG_FRAME_SOURCE_WINDOW_BUFFER=7 };
+/* What primary plane A was fetching when the pixels were copied. UNREAD:
+ * no plane readback on this build/device (the GOP or VM framebuffer is the
+ * display). UNKNOWN: an unrecognised surface; the GOP was copied instead. */
+enum { BROOK_DEBUG_FRAME_PLANE_UNREAD=0, BROOK_DEBUG_FRAME_PLANE_GOP=1, BROOK_DEBUG_FRAME_PLANE_FLIP=2,
+       BROOK_DEBUG_FRAME_PLANE_ZERO_COPY=3, BROOK_DEBUG_FRAME_PLANE_CLIENT=4, BROOK_DEBUG_FRAME_PLANE_UNKNOWN=5 };
+enum { BROOK_DEBUG_FRAME_INFO_CURSOR_COMPOSITED=1, BROOK_DEBUG_FRAME_INFO_DETILED=2,
+       BROOK_DEBUG_FRAME_INFO_CURSOR_PLANE_VISIBLE=4, BROOK_DEBUG_FRAME_INFO_SWAPPED_RB=8 };
+struct BrookDebugFrameInfoV4 {
+    struct BrookDebugFrameInfoV3 v3;
+    uint32_t plane,plane_surface,plane_control,plane_stride;
+    uint32_t flags,window_id;
+    /* Window captures: the buffer's integer upscale on screen (1 = 1:1). */
+    uint32_t window_scale,copy_us;
+};
 /* Overlay syscall op 4 returns the disjoint semantic row bands of the same
  * immutable capture lease. Coordinates refer to the full packed image; use
  * op 2 to read the corresponding rows. At most seven bands are returned.

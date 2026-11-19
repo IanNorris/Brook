@@ -182,14 +182,40 @@ class Hardware:
     def command(self,session,command,**_):
         with self.session_lock(session) as data:return self.guest(data,command)
 
-    def transfer(self,session,request_id,action,key_file,output,source=None,artifact_id=None,port=1236,keep_raw=False,**_):
+    def transfer(self,session,request_id,action,key_file,output,source=None,artifact_id=None,port=1236,keep_raw=False,
+                 window=None,window_area='frame',cursor=False,**_):
         # Payloads never pass through the MCP serializer. One job identity,
         # binary socket, verified artifact, metadata-only result.
-        from hardware_bulk_workflow import BulkRun
-        result=BulkRun(self,output).execute(session,key_file,action,source,artifact_id,port,request_id,keep_raw)
-        return {'session':session,'state':result['state'],'transaction_id':result['transaction_id'],
-                'receipt_path':str(Path(output).absolute()/'receipt.json'),
-                'artifact_path':result.get('artifact_path'),'binary_phase_s':result['binary_phase_s'],'transfer':result['transfer']}
+        from hardware_bulk_workflow import BulkRun,FRAME_CURSOR,FRAME_WINDOW_BUFFER
+        from window_crop import AREAS,find_window,window_rect
+        if not isinstance(cursor,bool):raise ValueError('cursor must be a boolean')
+        if window_area not in AREAS:raise ValueError('window_area must be frame, client or buffer')
+        if (window is not None or cursor or window_area!='frame') and action!='frame':
+            raise ValueError('window, window_area and cursor apply to action frame only')
+        if window is None and window_area!='frame':raise ValueError('window_area requires window')
+        options=None;row=None;rect=None
+        if window is not None:
+            self.ui.validate_reference(window)
+            # Window geometry comes from one snapshot taken just before the
+            # capture; the two reads are not atomic.
+            row=find_window(self.ui.windows(session),window)
+            if window_area=='buffer':
+                options={'flags':FRAME_WINDOW_BUFFER|(FRAME_CURSOR if cursor else 0),'window_id':window['window_id'],
+                         'incarnation':int(window['incarnation'])}
+            else:rect=window_rect(row,window_area)
+        if cursor and options is None:options={'flags':FRAME_CURSOR}
+        result=BulkRun(self,output).execute(session,key_file,action,source,artifact_id,port,request_id,keep_raw,
+                                            frame_options=options,crop=rect)
+        reply={'session':session,'state':result['state'],'transaction_id':result['transaction_id'],
+               'receipt_path':str(Path(output).absolute()/'receipt.json'),
+               'artifact_path':result.get('artifact_path'),'binary_phase_s':result['binary_phase_s'],'transfer':result['transfer']}
+        if action=='frame':
+            reply['frame']=result.get('frame')
+            if window is not None:
+                reply['window']={'reference':window,'area':window_area,'title':row.get('title'),
+                                 'crop':result.get('crop'),'full_artifact_path':result.get('full_artifact_path'),
+                                 'consistency':'window snapshot taken before the capture; not atomic with the frame'}
+        return reply
 
     def panic_report(self,session,request_id,key_file,output,port=1236,**_):
         from hardware_panic_workflow import PanicRun

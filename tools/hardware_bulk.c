@@ -78,8 +78,33 @@ static int directory_open(const char* path){
 #endif
     return fd;
 }
+/* Frame options (argv[4] "o:<flags>:<window_id>:<incarnation>"): requested
+ * through debug-frame op 6; provenance read back with op 7 (V4), falling
+ * back to op 5/4 on older kernels. */
+static struct BrookDebugFrameRequest frame_request;
+static int frame_options;
+static struct BrookDebugFrameInfoV4 frame_info;
+static unsigned frame_info_version;
+static int parse_u64(const char** p,uint64_t* out,char end){
+    const char* s=*p;uint64_t v=0;if(*s<'0'||*s>'9')return -1;
+    for(;*s>='0'&&*s<='9';++s){if(v>(UINT64_MAX-(uint64_t)(*s-'0'))/10)return -1;v=v*10+(uint64_t)(*s-'0');}
+    if(*s!=end)return -1;
+    *p=end?s+1:s;*out=v;return 0;
+}
+__attribute__((unused)) static int parse_frame_options(const char* text){
+    uint64_t flags,id,incarnation;const char* p=text;
+    if(strncmp(p,"o:",2))return -1;
+    p+=2;
+    if(parse_u64(&p,&flags,':')||parse_u64(&p,&id,':')||parse_u64(&p,&incarnation,0))return -1;
+    if(flags&~(uint64_t)(BROOK_DEBUG_FRAME_FLAG_CURSOR|BROOK_DEBUG_FRAME_FLAG_WINDOW_BUFFER)||id>256)return -1;
+    if((flags&BROOK_DEBUG_FRAME_FLAG_WINDOW_BUFFER)?(!id||!incarnation):(id||incarnation))return -1;
+    frame_request.flags=(uint32_t)flags;frame_request.window_id=(uint32_t)id;frame_request.window_incarnation=incarnation;
+    frame_options=1;return 0;
+}
 static int capture(uint8_t** output,uint64_t* bytes,struct BrookDebugFrameInfo* info){
-    long token=syscall(BROOK_SYS_DEBUG_FRAME,0L,0L,0L,0L,0L,0L);if(token<0)return -1;
+    long token=frame_options?syscall(BROOK_SYS_DEBUG_FRAME,(long)BROOK_DEBUG_FRAME_REQUEST,0L,(long)&frame_request,(long)sizeof(frame_request),0L,0L):
+        syscall(BROOK_SYS_DEBUG_FRAME,0L,0L,0L,0L,0L,0L);
+    if(token<0)return -1;
     int result=-1;uint8_t* data=NULL;struct timespec pause={0,10000000};
     for(unsigned i=0;i<500;i++){
         if(syscall(BROOK_SYS_DEBUG_FRAME,1L,token,(long)info,(long)sizeof(*info),0L,0L))goto done;
@@ -96,6 +121,11 @@ static int capture(uint8_t** output,uint64_t* bytes,struct BrookDebugFrameInfo* 
     }
     struct BrookDebugFrameInfo check;
     if(syscall(BROOK_SYS_DEBUG_FRAME,1L,token,(long)&check,(long)sizeof(check),0L,0L)||memcmp(&check,info,sizeof(check)))goto done;
+    memset(&frame_info,0,sizeof(frame_info));frame_info_version=0;
+    if(!syscall(BROOK_SYS_DEBUG_FRAME,(long)BROOK_DEBUG_FRAME_INFO_V4,token,(long)&frame_info,(long)sizeof(frame_info),0L,0L))frame_info_version=4;
+    else if(!syscall(BROOK_SYS_DEBUG_FRAME,5L,token,(long)&frame_info.v3,(long)sizeof(frame_info.v3),0L,0L))frame_info_version=3;
+    else if(!syscall(BROOK_SYS_DEBUG_FRAME,4L,token,(long)&frame_info.v3.v2,(long)sizeof(frame_info.v3.v2),0L,0L))frame_info_version=2;
+    if(frame_info_version && memcmp(&frame_info.v3.v2.frame,info,sizeof(*info)))goto done;
     *output=data;*bytes=info->bytes;data=NULL;result=0;
 done:
     free(data);if(syscall(BROOK_SYS_DEBUG_FRAME,3L,token,0L,0L,0L,0L)&&!result){free(*output);*output=NULL;result=-1;}
@@ -211,9 +241,17 @@ static int serve(int client,int directory,const char* key,const char* boot,const
         if(capture(&frame,&bytes,&info)){result=24;goto done;}
         BrookUpdateHash(frame,(size_t)bytes,hash);
     }
-    char text[512],digest[65];hex_hash(hash,digest);
+    char text[1024],digest[65];hex_hash(hash,digest);
     if(strcmp(action,"put") && strcmp(action,"disk")){
-        snprintf(text,sizeof(text),"{\"state\":\"payload\",\"bytes\":%"PRIu64",\"sha256\":\"%s\",\"width\":%u,\"height\":%u,\"format\":%u,\"frame_epoch\":%"PRIu64",\"frame_tick_ms\":%"PRIu64"}\n",bytes,digest,info.width,info.height,info.format,info.epoch,info.tick_ms);
+        int used=snprintf(text,sizeof(text),"{\"state\":\"payload\",\"bytes\":%"PRIu64",\"sha256\":\"%s\",\"width\":%u,\"height\":%u,\"format\":%u,\"frame_epoch\":%"PRIu64",\"frame_tick_ms\":%"PRIu64"",bytes,digest,info.width,info.height,info.format,info.epoch,info.tick_ms);
+        if(frameAction && used>0 && (size_t)used<sizeof(text)){
+            const struct BrookDebugFrameInfoV4* v=&frame_info;
+            used+=snprintf(text+used,sizeof(text)-(size_t)used,",\"info_version\":%u,\"request_flags\":%u,\"source_kind\":%u,\"presentation_mode\":%u,\"plane\":%u,\"plane_surface\":%u,\"plane_control\":%u,\"plane_stride\":%u,\"info_flags\":%u,\"window_id\":%u,\"window_scale\":%u,\"copy_us\":%u",
+                frame_info_version,frame_request.flags,frame_info_version>=2?v->v3.v2.source:0,frame_info_version>=3?v->v3.presentation_mode:0,
+                v->plane,v->plane_surface,v->plane_control,v->plane_stride,v->flags,v->window_id,frame_info_version>=4?v->window_scale:1,v->copy_us);
+        }
+        if(used<=0 || (size_t)used+2>sizeof(text)){result=25;goto done;}
+        strcpy(text+used,"}\n");
         if(message(client,text)){result=25;goto done;}
         uint8_t chunk[65536];uint64_t offset=0;
         while(offset<bytes){size_t n=bytes-offset>sizeof(chunk)?sizeof(chunk):(size_t)(bytes-offset);
@@ -281,7 +319,8 @@ int main(int argc,char** argv){
     if(!strcmp(argv[3],"getz")){get=1;valid=1;}
     if(!strcmp(argv[3],"framez"))valid=1;
 #endif
-    if(!valid || (get?(argc!=5||!valid_id(argv[4])):argc!=4))return 2;
+    int frame=!strcmp(argv[3],"frame")||!strcmp(argv[3],"framez");
+    if(!valid || (get?(argc!=5||!valid_id(argv[4])):frame?(argc==5&&parse_frame_options(argv[4])):argc!=4))return 2;
 #endif
     const char *root=BULK_ROOT,*keypath="/etc/hardware-update-key";unsigned port=1236;
 #ifdef BROOK_BULK_INSTALL_MEDIA
