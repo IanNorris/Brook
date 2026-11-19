@@ -4,6 +4,9 @@ namespace brook {
 // Allow slow GPU frames under contention, but return display control to the
 // software compositor within a bounded interval after the last present.
 static constexpr uint64_t COMPOSITOR_PRESENT_LEASE_MS=500;
+// A renderer still reserving frames keeps the lease this long after its last
+// accepted present (CompositorRenewLiveRendererLease).
+static constexpr uint64_t COMPOSITOR_PRESENT_LEASE_STALL_MS=2000;
 // Caller serializes access with the display mapping lock. A lease merely
 // defers software framebuffer copies; it never transfers display ownership.
 struct CompositorPresentLease {

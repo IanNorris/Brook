@@ -7379,7 +7379,23 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",\"active\":");r.text(CompositorGlassActive()?"true":"false");
         r.text(",\"gpu_composition\":");r.text(CompositorGpuActive()?"true":"false");
         r.text(",\"backend_blur\":");r.text(CompositorBackendBlurActive()?"true":"false");
-        r.text(",");r.field("backend_blur_changes",CompositorBackendBlurChanges());
+        {const auto d=CompositorReadBlurDiagnostics();
+         static const char* const reasons[]={"renderer","gpu","writer_unleased","writer_revoked","foreign_writer",
+             "caps_owner_mismatch","caps_bit_clear","lease_lapsed","no_renderer"};
+         static_assert(sizeof(reasons)/sizeof(reasons[0])==uint32_t(CompositorBlurReason::Count),"blur reason names");
+         r.text(",");r.field("backend_blur_changes",d.changes);
+         r.text(",\"backend_blur_change_reasons\":{");
+         for(uint32_t i=0;i<uint32_t(CompositorBlurReason::Count);++i){if(i)r.text(",");r.field(reasons[i],d.reasons[i]);}
+         r.text("},\"backend_blur_recent\":[");bool first=true;
+         for(uint32_t k=0;k<COMPOSITOR_BLUR_CHANGE_RING;++k){
+             const auto& c=d.ring[(d.changes+k)%COMPOSITOR_BLUR_CHANGE_RING];
+             if(!c.tick || c.reason>=uint32_t(CompositorBlurReason::Count))continue;
+             if(!first)r.text(",");first=false;
+             r.text("{");r.field("tick_ms",c.tick);r.text(",\"blur\":");r.text(c.blur?"true":"false");
+             r.text(",\"reason\":\"");r.text(reasons[c.reason]);r.text("\",");r.field("leased_frame_age_ms",c.leasedFrameAgeMs);r.text("}");
+         }
+         r.text("],");r.field("cpu_frames_over_renderer",d.cpuFramesOverRenderer);
+         r.text(",");r.field("lease_live_renewals",d.leaseLiveRenewals);}
         r.text(",");r.field("appearance",WmGetAppearance());
         r.text(",");r.field("effective_opacity",CompositorGlassActive()?CompositorMaterialOpacity():255);
         r.text(",");r.field("effective_blur_strength",CompositorGlassActive()?CompositorMaterialBlur():0);
