@@ -289,7 +289,7 @@ static struct DesktopAppCadence g_appCadence;
 /* Set by render_frame when it defers non-app damage: the idle wait ends then. */
 static uint64_t g_appWakeNs;
 static struct {int app,direct;uint64_t deferNs;uint32_t dominant;
-    uint64_t dominance[DESKTOP_APP_REASONS],actions[DESKTOP_APP_ACTIONS],earlyNotifies;} g_app;
+    uint64_t dominance[DESKTOP_APP_REASONS],actions[DESKTOP_APP_ACTIONS],earlyNotifies,overlayCaptureSkips,pointerOnly,pointerOnlyDriven;} g_app;
 static struct {uint64_t evaluated,eligible,frames,enters,exits,reasons[DESKTOP_DIRECT_REASONS];int last,wasEligible;} g_direct;
 static void app_present_env(void){
     const char *app=getenv("BROOK_RENDER_APP_PRESENT"),*direct=getenv("BROOK_RENDER_DIRECT_SCANOUT");
@@ -562,6 +562,24 @@ static int overlay_adopt(int drm,struct RenderContext *ctx,uint64_t generation,u
         ctx->overlayBands=*bands;ctx->overlayGeneration=generation;ctx->overlayWidth=width;ctx->overlayHeight=height;
         ctx->overlayOpaque=peer->overlayOpaque;memcpy(ctx->overlayKeys,peer->overlayKeys,sizeof(ctx->overlayKeys));
         ++g_stats.pipeline.overlayAdopted;return 1;
+    }
+    return 0;
+}
+/* App-driven cadence: a changed overlay is recaptured at most every
+ * DESKTOP_APP_OVERLAY_CAPTURE_NS (desktop_app_overlay_capture_due). Until
+ * then the frame uses the newest complete capture of this output size that
+ * any context holds (copied in when a peer's is newer, so pipelined
+ * contexts never alternate between two captures). 1: reuse, 0: capture. */
+static uint64_t g_lastOverlayCaptureNs;
+static int overlay_capture_deferred(int drm,struct RenderContext *ctx,uint32_t width,uint32_t height){
+    const struct RenderContext *best=ctx->overlayGeneration && ctx->overlayWidth==width && ctx->overlayHeight==height?ctx:NULL;
+    for(unsigned k=0;k<g_contextCount;++k){const struct RenderContext *peer=&g_contexts[k];
+        if(peer==ctx || !peer->overlayGeneration || peer->overlayWidth!=width || peer->overlayHeight!=height)continue;
+        if(!best || peer->overlayGeneration>best->overlayGeneration)best=peer;}
+    if(!desktop_app_overlay_capture_due(g_app.app && g_app.dominant,best!=NULL,g_lastOverlayCaptureNs,monotonic_ns(),
+                                        DESKTOP_APP_OVERLAY_CAPTURE_NS)){
+        if(best!=ctx && !overlay_adopt(drm,ctx,best->overlayGeneration,width,height))return 0;
+        ++g_app.overlayCaptureSkips;return 1;
     }
     return 0;
 }
@@ -881,8 +899,9 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     /* Recapture only when the kernel's overlay content generation changed. */
     const uint64_t overlayGeneration=overlay_generation();
     if(!desktop_overlay_cache_valid(ctx->overlayGeneration,ctx->overlayWidth,ctx->overlayHeight,overlayGeneration,width,height) &&
-       !overlay_adopt(drm,ctx,overlayGeneration,width,height)){
-        uint64_t captured=0;ctx->overlayGeneration=0;
+       !overlay_adopt(drm,ctx,overlayGeneration,width,height) &&
+       !overlay_capture_deferred(drm,ctx,width,height)){
+        uint64_t captured=0;ctx->overlayGeneration=0;g_lastOverlayCaptureNs=monotonic_ns();
         if(capture_overlay(drm,overlay,width,height,&ctx->overlayBands,&ctx->overlayOpaque,ctx->overlayKeys,&captured))goto done;
         ctx->overlayGeneration=captured;ctx->overlayWidth=width;ctx->overlayHeight=height;
     }
@@ -911,7 +930,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     /* Change-based damage against the displayed frame, when that frame is
      * known and no other frame can present first; pipelined, against the
      * latest submitted frame (its in-flight regions are carried below). */
-    int tracked=0;
+    int tracked=0,pointerOnly=0;
     const int baselineOk=ctx->damage.display==identity.display && ctx->damage.backdrop==identity.generation &&
         ctx->damage.width==width && ctx->damage.height==height;
     if((pipe || (quiescent && !baselineTicket)) && track->valid && trackBase && baselineOk){
@@ -921,6 +940,10 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             const uint32_t sceneChanges=changes.count;
             desktop_overlay_damage(overlayBase,&frameOverlay,&changes);
             damage=changes;tracked=1;
+            /* Pointer-only: no scene change, the same overlay capture, and
+             * only the pointer moved or changed (stats "pointer_only"). */
+            pointerOnly=!sceneChanges && changes.count && overlayBase->generation==frameOverlay.generation &&
+                !desktop_overlay_cursor_equal(&overlayBase->cursor,&frameOverlay.cursor);
             /* The kernel overlay carries the compositor cadence graph, which
              * changes with every present: a frame whose only change is the
              * overlay would cause the next one forever. Present such frames
@@ -1287,6 +1310,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
          * callbacks now rather than after the OS present. */
         if(g_app.app && dominant>=0 && frameSources[dominant].commit &&
            desktop_gpu_channel_notify_early(&g_gpuChannel,frame,layers.layers[dominant].window))++g_app.earlyNotifies;
+        if(pointerOnly){++g_app.pointerOnly;if(dominant>=0)++g_app.pointerOnlyDriven;}
         direct_scanout_evaluate(dominant,&layers,track,dominant>=0?layerOffer[dominant]:NULL,dominant>=0 && frameSources[dominant].commit,
             &frameOverlay,ctx->scanoutCount && g_scanoutActive,width,height);
         return 1;
@@ -1618,8 +1642,10 @@ static void stats_publish(uint64_t now){
              * included), cadence actions; "direct_scanout": eligibility of
              * presented frames, by first blocker. */
             used+=(size_t)snprintf(rows+used,sizeof(rows)-used,",\"app_present\":{\"mode\":\"%s\",\"focus_query\":%d,\"defer_us\":%llu,"
-                "\"dominant\":%u,\"early_notifies\":%llu,\"dominance\":{",g_app.app?"on":"off",g_focusSupported,
-                (unsigned long long)(g_app.deferNs/1000ull),g_app.dominant,(unsigned long long)g_app.earlyNotifies);
+                "\"dominant\":%u,\"early_notifies\":%llu,\"overlay_capture_skips\":%llu,\"pointer_only\":%llu,"
+                "\"pointer_only_driven\":%llu,\"dominance\":{",g_app.app?"on":"off",g_focusSupported,
+                (unsigned long long)(g_app.deferNs/1000ull),g_app.dominant,(unsigned long long)g_app.earlyNotifies,
+                (unsigned long long)g_app.overlayCaptureSkips,(unsigned long long)g_app.pointerOnly,(unsigned long long)g_app.pointerOnlyDriven);
             for(unsigned r=0;r<DESKTOP_APP_REASONS;++r)used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"%s\"%s\":%llu",r?",":"",
                 desktop_app_reason_names[r],(unsigned long long)g_app.dominance[r]);
             used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"},\"actions\":{");
