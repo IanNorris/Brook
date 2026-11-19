@@ -11,6 +11,9 @@ fi
 # absolute path even when clients have separate runtime directories.
 export XDG_SESSION_TYPE=wayland WAYLAND_DISPLAY="$1/wayland-0"
 
+export XDG_CONFIG_DIRS="${XDG_CONFIG_DIRS:-/nix/profile/etc/xdg:/etc/xdg}"
+export GSETTINGS_SCHEMA_DIR="${GSETTINGS_SCHEMA_DIR:-/nix/profile/share/brook/gsettings}"
+
 # Qt's built-in KDE platform theme reads the user's kdeglobals and defaults
 # to Breeze. Select it without setting a desktop identity for other toolkits.
 if [[ -z "${QT_QPA_PLATFORMTHEME:-}" ]]; then

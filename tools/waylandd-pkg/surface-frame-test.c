@@ -55,6 +55,7 @@ int main(void) {
     {
         char *json = NULL;size_t length = 0;FILE *f = open_memstream(&json,&length);assert(f);
         latency_stats_json(f);assert(!fclose(f));
+        assert(strstr(json,"\"latency\":{\"stats_epoch\":1,"));
         assert(strstr(json,"\"bucket_upper_ms\":[4,8,16,33,50,100,250,500,1000,null]"));
         assert(strstr(json,"\"commit_to_callback_done\":{\"count\":1,"));
         assert(strstr(json,"\"input_receive_to_queue\":{\"motion\":"));
@@ -271,9 +272,38 @@ int main(void) {
 
     assert(lat->data.done_to_commit.count);
     const uint64_t epoch = g_stats_epoch;
-    latency_stats_reset();
+    char reset_dir[] = "latency-reset-test.XXXXXX";
+    assert(mkdtemp(reset_dir));
+    char marker[128];
+    snprintf(marker,sizeof(marker),"%s/reset",reset_dir);
+    assert(symlink("unrelated",marker)==0);
+    latency_stats_check_reset(marker);
+    assert(g_stats_epoch == epoch);
+    assert(unlink(marker)==0);
+    int fd = open(marker,O_CREAT|O_WRONLY,0600);
+    assert(fd>=0 && close(fd)==0);
+    latency_stats_check_reset(marker);
+    assert(access(marker,F_OK)==-1 && errno==ENOENT);
     assert(g_stats_epoch == epoch + 1 && !lat->data.commit_to_done.hist.count &&
            !lat->data.done_to_commit.count && !surface.latency.hist.count);
+    if (geteuid() != 0) {
+        /* A read-only parent gives the unprivileged test the same unlink
+         * failure as a root-owned request in the real sticky /tmp. */
+        fd = open(marker,O_CREAT|O_WRONLY,0600);
+        assert(fd>=0 && close(fd)==0 && chmod(reset_dir,0500)==0);
+        latency_stats_check_reset(marker);
+        assert(g_stats_epoch == epoch + 2 && access(marker,F_OK)==0);
+        latency_stats_check_reset(marker);
+        assert(g_stats_epoch == epoch + 2);
+        struct timespec touched[2] = {{.tv_nsec=UTIME_OMIT}, {.tv_sec=200}};
+        assert(utimensat(AT_FDCWD,marker,touched,0)==0);
+        latency_stats_check_reset(marker);
+        assert(g_stats_epoch == epoch + 3);
+        latency_stats_check_reset(marker);
+        assert(g_stats_epoch == epoch + 3);
+        assert(chmod(reset_dir,0700)==0 && unlink(marker)==0);
+    }
+    assert(rmdir(reset_dir)==0);
     g_seat_clients=NULL;wl_client_destroy(foreign);close(foreignSockets[1]);
     wl_client_destroy(client);
     assert(surface.trace_done==3 && surface.trace_cancelled==25);

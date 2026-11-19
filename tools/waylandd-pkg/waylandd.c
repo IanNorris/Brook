@@ -4294,6 +4294,32 @@ static void latency_stats_reset(void) {
         s->latency = (struct frame_latency){0};
 }
 
+static void latency_stats_check_reset(const char *path) {
+    static struct stat consumed;
+    static int retained_marker;
+    struct stat marker;
+    if (lstat(path, &marker) != 0) {
+        if (errno == ENOENT) retained_marker = 0;
+        return;
+    }
+    if (!S_ISREG(marker.st_mode) || (marker.st_uid != 0 && marker.st_uid != geteuid())) return;
+
+    /* A non-root provider cannot unlink root's marker from sticky /tmp.
+     * Acknowledge that version once and treat a later touch as a new request. */
+    if (retained_marker && marker.st_dev == consumed.st_dev && marker.st_ino == consumed.st_ino &&
+        marker.st_mtim.tv_sec == consumed.st_mtim.tv_sec && marker.st_mtim.tv_nsec == consumed.st_mtim.tv_nsec &&
+        marker.st_ctim.tv_sec == consumed.st_ctim.tv_sec && marker.st_ctim.tv_nsec == consumed.st_ctim.tv_nsec)
+        return;
+    if (unlink(path) == 0) {
+        retained_marker = 0;
+    } else {
+        if (errno == ENOENT) return;
+        consumed = marker;
+        retained_marker = 1;
+    }
+    latency_stats_reset();
+}
+
 static void latency_hist_json(FILE *f, const struct latency_hist *hist) {
     fprintf(f, "{\"count\":%llu,\"max_us\":%llu,\"buckets\":[",
             (unsigned long long)hist->count, (unsigned long long)hist->max_us);
@@ -4321,7 +4347,8 @@ static void latency_frame_json(FILE *f, const struct frame_latency *frame) {
 }
 
 static void latency_stats_json(FILE *f) {
-    fputs("\"latency\":{\"bucket_upper_ms\":[", f);
+    fprintf(f, "\"latency\":{\"stats_epoch\":%llu,\"bucket_upper_ms\":[",
+            (unsigned long long)g_stats_epoch);
     for (unsigned i = 0; i + 1 < LATENCY_BUCKETS; ++i)
         fprintf(f, "%u,", latency_bounds_ms[i]);
     fprintf(f, "null],\"axis_burst_break_us\":%u,\"kernel_input_timestamp_available\":false,\"clients\":[",
@@ -4372,7 +4399,7 @@ static void waylandd_status_write(const char *display){
     const uint32_t interval_ms = wl_list_empty(&g_latency_clients) ? 2000 : 200;
     if(last && now-last<interval_ms)return;
     last=now?now:1;
-    if (unlink("/tmp/brook-waylandd-stats-reset") == 0) latency_stats_reset();
+    latency_stats_check_reset("/tmp/brook-waylandd-stats-reset");
     const char *dir=getenv("XDG_RUNTIME_DIR");if(!dir || !*dir)dir="/tmp";
     char path[256],tmp[272];
     if(snprintf(path,sizeof(path),"%s/brook-waylandd-%s.json",dir,display)>=(int)sizeof(path))return;

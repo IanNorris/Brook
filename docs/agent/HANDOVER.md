@@ -16,15 +16,26 @@ _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review 
   as `reclaimable_exec_cache_pages`. `Cached` includes the full executable
   cache. `MemAvailable` includes only its reclaimable subset alongside free
   pages.
-- Release, both kernel audits and all 386 non-stress host tests passed. Logs
-  are in `build/session-env-release.log` and `build/session-env-ctest.log`.
+- The desktop profiles ship GTK 3 and GTK 4 settings and a GSettings schema
+  default for `icon:minimize,maximize,close`. Chromium 148 reads the GTK
+  property. Its launcher carries forward existing keyfile preferences and
+  replaces `BROOK_CHROMIUM_BUTTON_LAYOUT` with normal GTK/GSettings overrides.
+- Release, both kernel audits and all 386 non-stress host tests passed after
+  the follow-up. Both pinned GTK versions respected the packaged defaults and
+  existing overrides on headless displays. Evidence is in
+  `build/session-env-followup-{release,ctest}.log` and
+  `build/session-env-{gtk-probe,desktop-settings,waylandd}.log`.
 
 ## Wayland latency diagnostics (19 November 2026)
 
 - `work/wayland-latency` at `ee769aec` adds per-connection and per-toplevel
   callback timings, client turnaround and input delivery to the existing
-  waylandd status JSON. Touch `/tmp/brook-waylandd-stats-reset` as the server
-  user to start a new `stats_epoch`. WM_POP_INPUT supplies no timestamp.
+  waylandd status JSON. WM_POP_INPUT supplies no timestamp.
+- The reset follow-up accepts a regular `/tmp/brook-waylandd-stats-reset`
+  owned by root or the provider. A marker that the provider cannot remove
+  stays on disk and is acknowledged once per touch. The epoch appears in
+  `latency.stats_epoch` as well as at the top level. Both Wayland provider
+  packages passed host checks, including the unprivileged reset fixture.
 - The pair is `/data/Programming/Brook/wayland-latency/build/dell/pair-wlstats`
   (`dell-wlstats-20261119`). Guarded QEMU passed on attempt 1. The Dell has
   yet to run this diagnostic. Release and all non-stress host tests passed

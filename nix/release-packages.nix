@@ -48,7 +48,7 @@ let
     pkgs.ffmpeg.bin pkgs.wayland pkgs.xwayland graphics.mesaRuntime pkgs.tzdata
     pkgs.hicolor-icon-theme pkgs.adwaita-icon-theme pkgs.kdePackages.breeze-icons pkgs.shared-mime-info
     pkgs.gimp pkgs.qalculate-gtk pkgs.xfce.mousepad pkgs.openttd pkgs.gnome-commander
-    chromium vlc fonts cursors launchers
+    chromium vlc fonts cursors launchers (import ./desktop-settings.nix { inherit pkgs; })
   ] ++ native;
 in {
   inherit packages;
