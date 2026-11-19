@@ -1,4 +1,5 @@
 #pragma once
+#include "proc_wait_info.h"
 
 #include "core_dump.h"
 #include "core_autodump_policy.h"
@@ -559,6 +560,13 @@ struct Process
 
     UserCapabilityState capabilities; // credential lock; meaningful in private user namespaces
     UserNamespace* userNamespace; // owned immutable identity after publication; null is initial
+
+    // Wait diagnostics (proc_wait_info.h), written by the task itself in
+    // SchedulerBlock: ApicTickCount() when the latest wait began and the
+    // kernel return addresses above SchedulerBlock. Meaningful only while
+    // state==Blocked; read racily by procfs and the debug bridge.
+    uint64_t blockedSinceMs;
+    uint64_t blockSites[ProcWaitSiteDepth];
 
     // Independent live-task membership and owned namespace storage reference.
     // Exchange only through process_fs.h; logical exit retires before reaping.

@@ -197,6 +197,15 @@ struct ProcessSnapshot {
     uint64_t sysTicks;
     char exePath[256];
     char cwd[256];
+    // Syscall/wait diagnostics (/proc/<pid>/syscall, wchan, `proc blocked`).
+    bool kernelThread;
+    bool blockedOnRwLock;
+    uint64_t syscallNr;
+    uint64_t syscallArgs[6];
+    uint64_t syscallSp, syscallPc;
+    uint64_t blockedSinceMs;
+    uint64_t wakeupTick;
+    uint64_t blockSites[ProcWaitSiteDepth];
 };
 
 // Take a snapshot of all processes.  Fills `out` with up to `maxCount` entries.

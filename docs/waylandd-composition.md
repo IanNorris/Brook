@@ -182,6 +182,7 @@ Captures: `display-perf/build/ssd-probe-frame/` (double frame) and `ssd-pref-fra
 - `opaque_regions`: counts of NULL / infinite / by-number-of-ops calls, the last call's kind and first op, and `opaque_views`;
 - per window: the root's `opaque_region` `[set,x,y,w,h]`;
 - per layer: `opaque` bit 0 = XRGB pixels, bit 1 = view marked opaque.
+- `surfaces` (one entry per toplevel, Xwayland and subsurface, at most 32): `client_pid`; `frames` pending (requested, not committed), waiting (committed, tree not yet applied), committed (eligible), `oldest_ms` and `state` — why committed callbacks are not sent: `due`, `image_pending` (GPU readback/fence), `presented` (offer awaiting PRESENTED), `group`, `layers`, `no_window`, `unapplied_commit`; `configure` newest serial sent vs the client's newest ack, their ages, and the pending size transaction; `pending_buffer` size; commit ages; tree sequence; and the current and latest images (size, view, pending_cpu, offer_state, gpu_presented, client buffer size, `buffer_uses` > 0 = not yet released, `buffer_alive`).
 
 ## A game in front of an idle window (`work/occlusion`, 16 Nov 2026)
 

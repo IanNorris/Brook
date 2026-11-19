@@ -165,16 +165,20 @@ void KRwLockReadLock(KRwLock* rw)
     // and the wait queue). Kernel rwlocks are not interruptible; a pending signal
     // is delivered after the syscall completes. We remain enqueued across
     // re-blocks (enqueued exactly once above; the waker dequeues us on grant).
+    // Preserve an outer wait's wake latch (see KMutexLock).
+    bool outerWake = false;
     for (;;)
     {
-        __atomic_store_n(&self->pendingWakeup, 0, __ATOMIC_RELEASE);
+        if (__atomic_exchange_n(&self->pendingWakeup, 0, __ATOMIC_ACQ_REL)) outerWake = true;
         RwGuardRelease(rw, flags);
         SchedulerBlock(self);
         flags = RwGuardAcquire(rw);
         if (self->blockedOnRwLock != rw)   // granted (waker cleared it)
             break;
+        outerWake = true;
     }
     RwGuardRelease(rw, flags);
+    if (outerWake) __atomic_store_n(&self->pendingWakeup, 1, __ATOMIC_RELEASE);
 }
 
 void KRwLockReadUnlock(KRwLock* rw)
@@ -261,16 +265,20 @@ void KRwLockWriteLock(KRwLock* rw)
     // spurious wake blockedOnRwLock == rw, so we re-block rather than wrongly
     // running as the writer. writersWaiting is incremented exactly once above and
     // decremented by the waker on the real grant, so re-blocks don't miscount.
+    // Preserve an outer wait's wake latch (see KMutexLock).
+    bool outerWake = false;
     for (;;)
     {
-        __atomic_store_n(&self->pendingWakeup, 0, __ATOMIC_RELEASE);
+        if (__atomic_exchange_n(&self->pendingWakeup, 0, __ATOMIC_ACQ_REL)) outerWake = true;
         RwGuardRelease(rw, flags);
         SchedulerBlock(self);
         flags = RwGuardAcquire(rw);
         if (self->blockedOnRwLock != rw)   // granted (waker cleared it)
             break;
+        outerWake = true;
     }
     RwGuardRelease(rw, flags);
+    if (outerWake) __atomic_store_n(&self->pendingWakeup, 1, __ATOMIC_RELEASE);
     self->heldWriteLock = rw;   // already set by the waker; reasserted for clarity
 }
 

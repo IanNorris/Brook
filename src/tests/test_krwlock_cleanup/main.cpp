@@ -36,6 +36,8 @@ void SchedulerBlock(Process* p) {
     std::unique_lock<std::mutex> lock(ready);
     p->blocked = true; changed.notify_all();
     changed.wait(lock, [&] { return __atomic_load_n(&p->pendingWakeup, __ATOMIC_ACQUIRE); });
+    // Like the real scheduler, a wake (or a latch seen on entry) is consumed.
+    __atomic_store_n(&p->pendingWakeup, 0, __ATOMIC_RELEASE);
     p->blocked = false;
 }
 void SchedulerUnblock(Process* p) {
@@ -225,8 +227,36 @@ static void testDeferredReaderAdmission() {
     assert(!rw.readerCount && !rw.writerActive && !rw.readWaitHead && !rw.writeWaitHead);
     std::puts("RW DEFERRED ADMISSION PASS new reader cannot bypass a deferred cohort");
 }
+// A task already published on another wait queue (futex, poll) may take a
+// contended kernel lock before it blocks. Its real wakeup can arrive as a
+// latch set before the lock is reached, or as a non-grant wake while it waits
+// for the lock; either must survive to the outer SchedulerBlock.
+static void testOuterLatch(bool rw, bool whileBlocked) {
+    KMutex mutex{}; KMutexInit(&mutex); KRwLock lock{}; KRwLockInit(&lock);
+    Process owner{40, 700}, waiter{41, 701};
+    current = &owner; if (rw) KRwLockWriteLock(&lock); else KMutexLock(&mutex);
+    std::thread t([&] {
+        current = &waiter;
+        if (!whileBlocked) __atomic_store_n(&waiter.pendingWakeup, 1, __ATOMIC_RELEASE);
+        if (rw) KRwLockReadLock(&lock); else KMutexLock(&mutex);
+        assert(__atomic_load_n(&waiter.pendingWakeup, __ATOMIC_ACQUIRE) == 1);
+        if (rw) KRwLockReadUnlock(&lock); else KMutexUnlock(&mutex);
+        boundary(waiter);
+    });
+    waitFor([&] { return waiter.blocked; });
+    if (whileBlocked) {
+        { std::lock_guard<std::mutex> g(ready); __atomic_store_n(&waiter.pendingWakeup, 1, __ATOMIC_RELEASE); changed.notify_all(); }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        waitFor([&] { return waiter.blocked; }); // re-blocked: no grant yet
+    }
+    current = &owner; if (rw) KRwLockWriteUnlock(&lock); else KMutexUnlock(&mutex);
+    boundary(owner); t.join();
+    KRwLockCleanupOnExit(&owner); KRwLockCleanupOnExit(&waiter);
+}
 int main() {
     alarm(30);
+    for (int i = 0; i < 4; ++i) testOuterLatch(i & 1, i & 2);
+    std::puts("OUTER LATCH PASS a contended KMutex/KRwLock keeps the caller's wake latch");
     testTryDispatchCancellation();
     testDeferredReaderAdmission();
     testLargeReaderQueue(128,false,false);
