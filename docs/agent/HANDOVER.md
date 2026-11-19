@@ -2,7 +2,7 @@
 
 Current state and immediate goal. Keep this short and current: replace stale lines rather than appending. Put detailed run records in [AGENT_JOURNAL.md](AGENT_JOURNAL.md), the previous agent's ~1 MB append-only log (newest entries at the top). Decisions belong in [DECISIONS.md](DECISIONS.md), and working preferences in [WORKING_STYLE.md](WORKING_STYLE.md).
 
-_Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review follow-up)._
+_Last updated: 19 November 2026 (early), by a Claude Code session; see "19 Nov early: resume here"._
 
 ## Workspace
 
@@ -94,6 +94,32 @@ _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review 
 - `clock status` reports `tsc`/`invariant-tsc`. Under load, monotonic tracks TSC; LAPIC ticks lose ~7%, which no longer matters.
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
+
+**19 Nov early: resume here.**
+- **The Dell is on gen 440:** `work/integration33`, payload `dell-int33b-20261118`, session `e66205da44274cc59d7b75a0899ce4bc`. gen 440 = int32 plus:
+  - the per-window hidden cursor (`work/cursor-hide`; Ian confirmed it fixes Q2 and Stardew);
+  - Clearwater stage 1.1/1.2 (`work/clearwater-s1`: part table, edge-to-edge caption hits, outer resize margins, display lists, 144 goldens; Ian has not checked it yet);
+  - the 600 MHz boot clock;
+  - thermal-trip hysteresis (recovers after 5 s at ≤75 °C).
+
+  int32 = int31 + app-driven cadence + hang diagnostics. The cadence is OFF on the Dell; I turned it off live.
+- **Ready, not deployed:** `work/integration34` (b2a53743), pair `/data/Programming/Brook/integration27/build/dell/pair-int34`, payload `dell-int34-20261119`, QEMU PASS. It adds:
+  - `work/app-present` 9618802f + 96994652: the cadence never defers over shell surfaces, popups, a pointer outside the game or a paused app, and defers at most 33 ms (Ian: aim for the next 33 ms slot);
+  - `work/gpu-poll-starvation` 5a5da780: deadline grace plus stall instrumentation.
+- **The gen 440 "GPU hang" was a false failure:**
+  - **What happened:** the RCS job completed (started marker and breadcrumb both equal the nonce), but one `BdwYieldGpuWait` on the CPU-0-pinned gpu-submit thread returned after ~2.19 s. The 2000 ms deadline reset a finished job; it was marked sticky-failed, Mesa reported device lost and Q2 crashed. The renderer skipped the failed buffer, so the desktop flashed.
+  - **Scope:** the gen 428 and 16 Nov `submit=10` failures share the signature.
+  - **Fix in int34:** one more breadcrumb/CSB check at the deadline (`late_completions` in `gpu hang status`).
+  - **Root cause still open:** Brook never preempts ring 0, so a ~2 s ring-0 run or an interrupts-off stretch on CPU 0 would do it; a `cp` read/write fallback was running. The new `gpu-hang:  longest yield` line, `from_pid`/`from_ran_us` and `apic_ticks` will name it.
+  - **Evidence:** `display-perf/build/dell/q2-440-launcher/`; reading guide in `docs/gpu-hang-diagnostics.md`.
+- **Next steps:**
+  1. Deploy int34 while Ian is present.
+  2. Q2 fullscreen with the cadence off (baseline 34.4 fps), then `desktop present app on` and the checks: launcher over Q2 with the pointer moving (Ian saw a ~5 fps stutter on gen 440, probably the starvation), a paused game, a popup over the game, Alt-Tab. Counters are `app_present.actions` (shell, window_above, pointer_outside, app_stalled, app_not_due, defer, deadline).
+  3. Ian checks the Clearwater hit areas at 200%.
+  4. If all is good, merge `work/integration34` to main (int32 and int33 are not on main yet; main has int31).
+- **TRIM:** Codex finished `work/ssd-trim` 5afe1344 (in `/tmp/brook-ssd-trim`; docs/ssd-trim.md, QEMU pass, reviewed: 30 s DSM timeout, timing in the summary, multi-command fixture). Each physical step needs Ian's approval. Step 1 is a dry-run maintenance pair (IDENTIFY check plus the range list), reviewed against the partition table.
+- **Stardew gameplay at 600 MHz:** 39 fps, or 29 fps when the old latched trip fired. It is GPU-bound: game 10–19 ms plus compositor 14 ms per frame.
+- **Q2:** fullscreen 1080p 34–38 fps, 640×480 56 fps. Ian declared the performance goal met. Panel-fitter "true fullscreen" is in the backlog.
 
 **18 Nov late, gens 432–438 (autonomous, Ian away; current image gen 438 = `work/integration31` 39bf431f, payload `dell-int31-20261118`, session `c074200fc09541a4a0897600dc5bf5c5`):**
 - **Gen 430 merged to main** (`b6dfbb0d`; Ian confirmed fullscreen).
