@@ -4,6 +4,20 @@ Current state and immediate goal. Keep this short and current: replace stale lin
 
 _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review follow-up)._
 
+## Clearwater Stage 3 (19 November 2026)
+
+- `work/clearwater-s3` from integration49 now runs the taskbar, launcher,
+  flyouts, boot toast and HUD through a supervised user shell. The final
+  implementation revision is `70c0e720`. The kernel retains window state
+  and input routing, and shows the fallback taskbar during shell restart.
+- The tested pair is `/data/Programming/Brook/clearwater-s3/build/dell/pair-cws3-warm`
+  (`dell-cws3-20261119`). Guarded QEMU passed on attempt 1 with the shell
+  publishing its taskbar. Use this pair for Stage 3. Earlier Stage 3 pairs
+  precede the launcher latency fix. No Dell deployment.
+- Visual checks and timings are in `clearwater-s3/build/cws3-evidence`.
+  See [the compositor plan](../design/clearwater-next/compositor-refactor-plan.md#stage-3-implementation-and-validation)
+  for test results and the `--clearwater-shell` staging option.
+
 ## Workspace
 
 - **Root:** `/data/Programming/Brook/`. `main/` is a fresh GitHub clone kept on `main`. Each agent or task gets its own worktree, `git worktree add ../<task> -b <branch>`, with its own `build/`. Never share a build directory or drive the Dell from two agents at once.
