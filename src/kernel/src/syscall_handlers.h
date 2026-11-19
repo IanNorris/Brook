@@ -431,6 +431,8 @@ int64_t sys_sysinfo(uint64_t infoAddr, uint64_t, uint64_t,
                      uint64_t, uint64_t, uint64_t);
 int64_t sys_times(uint64_t bufAddr, uint64_t, uint64_t,
                    uint64_t, uint64_t, uint64_t);
+int64_t sys_setrlimit(uint64_t resource,uint64_t address,uint64_t,uint64_t,uint64_t,uint64_t);
+int64_t sys_brook_core_dump(uint64_t pid,uint64_t flags,uint64_t,uint64_t,uint64_t,uint64_t);
 int64_t sys_getrlimit(uint64_t resource, uint64_t rlimAddr, uint64_t,
                        uint64_t, uint64_t, uint64_t);
 

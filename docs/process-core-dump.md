@@ -41,3 +41,40 @@ The host test checks Linux x86-64 note and register layouts. The optional
 `check_dell_image_qemu.py --proc-dump-qa` fixture launches one user thread
 stuck in a pipe read and one executing userspace, downloads the core over a
 private loopback bulk port, and verifies both backtraces in GDB.
+
+## Automatic crash and hang dumps
+
+By default, a fatal SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE, SIGSEGV or
+SIGSYS can queue a dump for a user task whose real, effective and saved
+UIDs are all 1000. Kernel threads are excluded. The per-group
+`RLIMIT_CORE` is inherited by fork and retained across exec. A limit of
+zero disables managed dumps, and smaller nonzero limits cap the file.
+`proc autodump off` disables managed dumps. `proc autodump on` opts in all
+matching real, effective and saved UIDs, including root-owned bridge tasks.
+A reboot restores the default. `proc autodump status` reports the current
+policy, worker readiness, completed dumps, timeouts, failures and rejected
+rate or capacity admissions.
+
+Completed cores are published as
+`/data/home/.local/share/brook/cores/<comm>.<pid>.<unix-time>.core` in a
+root-owned, private directory. An existing directory must be owned by
+root with mode `0700`. The writer caps each core at 2 GiB and rotates its
+oldest files to keep at most five cores and 8 GiB total. Each executable
+path can queue at most one managed dump per 60 seconds. Filenames use a
+sanitized command name. The kernel queues the notes and pins the address
+space before termination. The worker owns all filesystem I/O, so
+termination continues even if a single storage operation cannot return.
+The worker abandons an expired job at the next I/O boundary after its
+20-second deadline. Only one managed dump can be pending or writing.
+
+A privileged window watchdog can request a managed live dump via
+`syscall(BROOK_SYS_CORE_DUMP, pid, 0)` using
+`src/shared/brook_core_dump.h`. The caller needs initial-user-namespace
+`CAP_SYS_PTRACE`. Return value zero means queued, `ESRCH` means the target has
+gone and `EAGAIN` means the policy, rate or worker capacity declined it.
+The same lifetime, output, budget and limit rules apply to this syscall.
+
+The `--proc-autodump-qa` option in the guarded QEMU checker runs the manual
+dump check, verifies that a zero core limit suppresses a test crash dump,
+then downloads an automatic SIGSEGV core from an ordinary user task and
+checks its faulting frame with host GDB.

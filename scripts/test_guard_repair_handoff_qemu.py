@@ -87,7 +87,10 @@ def main():
     parser.add_argument('--normal-kernel',type=Path,help='Use this normal kernel for the final boot')
     parser.add_argument('--normal-network-module',type=Path,help='Matching virtio-net module for normal boot')
     parser.add_argument('--proc-dump-qa',type=Path,help='Run the live core fixture with this matching virtio NIC module')
+    parser.add_argument('--proc-autodump-qa',action='store_true',help='Also verify automatic fatal-signal core capture')
     a=parser.parse_args()
+    if a.proc_autodump_qa and not a.proc_dump_qa:
+        parser.error('automatic core QA requires the live core fixture')
     if a.proc_dump_qa and not a.auto_desktop_dell_initrd:
         parser.error('live core QA requires the guarded Dell startup fixture')
     if (a.torn_journal_before_desktop or a.torn_journal_before_repair) and (not a.auto_desktop_reset or a.two_panic_records or a.auto_desktop_serial_stall or a.auto_desktop_nested_panic or (a.torn_journal_before_desktop and a.torn_journal_before_repair)):
@@ -730,6 +733,50 @@ def main():
                 if bridge.job(session,request,wait_s=1).get('state')!='running':
                     raise RuntimeError('the fixture did not stay alive after the dump')
                 print('PROC_DUMP_GDB_PASS',flush=True)
+
+                if not a.proc_autodump_qa:return
+                from hardware_bulk_workflow import BulkRun
+                before=bridge.command(session,'proc autodump status')
+                if before.get('policy')!='uid_1000' or not before.get('worker'):
+                    raise RuntimeError(f'automatic core worker is unavailable: {before}')
+                disabled=bridge.guest_run(session,uuid.uuid4().hex,['/boot/PROCDUMP.ELF','--crash-limit-zero'],
+                                          cwd='/tmp',uid=1000,wait_s=8)
+                if 'PROC_DUMP_LIMIT_ZERO' not in disabled.get('stdout',{}).get('text',''):
+                    raise RuntimeError(f'RLIMIT_CORE probe failed: {disabled}')
+                if bridge.command(session,'proc autodump status').get('queued')!=before['queued']:
+                    raise RuntimeError('RLIMIT_CORE=0 queued an unexpected crash dump')
+                crashed=bridge.guest_run(session,uuid.uuid4().hex,['/boot/PROCDUMP.ELF','--crash'],
+                                         cwd='/tmp',uid=1000,wait_s=8)
+                fault=re.search(r'PROC_DUMP_CRASH (\d+)',crashed.get('stdout',{}).get('text',''))
+                if not fault or crashed.get('state')!='completed':
+                    raise RuntimeError(f'faulting fixture did not terminate: {crashed}')
+                deadline=time.monotonic()+22
+                while True:
+                    after=bridge.command(session,'proc autodump status')
+                    if after.get('completed',0)>before['completed']:break
+                    if (time.monotonic()>=deadline or after.get('failed',0)>before['failed'] or
+                        after.get('timed_out',0)>before['timed_out']):
+                        raise RuntimeError(f'automatic core did not publish: {after}; see desktop serial')
+                    time.sleep(.15)
+                artifact=uuid.uuid4().hex
+                export=bridge.guest_run(session,uuid.uuid4().hex,
+                                        ['/boot/PROCDUMP.ELF','--export-crash',fault[1],artifact],
+                                        cwd='/tmp',uid=0,wait_s=8)
+                if export.get('exit',{}).get('code')!=0:
+                    raise RuntimeError(f'core export failed: {export}')
+                receipt=BulkRun(bridge,a.output/'core-auto-transfer').execute(
+                    session,key,'getz',artifact_id=artifact,port=bulk_port)
+                crash_core=Path(receipt['artifact_path'])
+                trace=subprocess.run(['gdb','-batch','-iex','set sysroot /','-ex','bt',
+                                      str(probe_executable),str(crash_core)],capture_output=True,text=True,timeout=30)
+                transcript=trace.stdout+trace.stderr
+                (a.output/'core-auto-gdb.log').write_text(transcript)
+                (a.output/'core-auto-result.json').write_text(json.dumps({
+                    'before':before,'after':after,'pid':int(fault[1]),'exit':crashed.get('exit',{})
+                },indent=2)+'\n')
+                if trace.returncode or not re.search(r'^#0\s+.*\bcrash_frame\b',transcript,re.M):
+                    raise RuntimeError('automatic core did not unwind to the faulting frame')
+                print('PROC_AUTODUMP_GDB_PASS',flush=True)
 
             try:
                 boot(disk,a.firmware,second,False,'GUARD_DESKTOP_HANDOFF_SCRIPT status=0',120,True,

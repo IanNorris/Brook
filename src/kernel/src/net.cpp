@@ -1,4 +1,5 @@
 #include "core_dump.h"
+#include "core_autodump.h"
 #include "desktop_layers_export.h"
 #include "intel_bdw_worker_overhead.h"
 #include "native_tsc_observe.h"
@@ -5602,6 +5603,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "\n"
             "Profiler:\n"
             "  proc dump PID /path [--full] - write a live ELF core\n"
+            "  proc autodump on|off|status - control managed crash dumps\n"
             "  prof start [ms]  - start profiler (ms=0 or omitted: indefinite)\n"
             "  prof stop        - stop profiler + flush\n"
             "  prof status      - profiler status\n"
@@ -5662,8 +5664,26 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
     }
 
     // -----------------------------------------------------------------------
-    // procs — process list
+    // Process dump controls and process list
     // -----------------------------------------------------------------------
+    else if(NetStrEq(cmd,"proc autodump on") || NetStrEq(cmd,"proc autodump off") ||
+            NetStrEq(cmd,"proc autodump status")){
+        if(NetStrEq(cmd,"proc autodump on"))CoreAutoSetMode(CoreAutoMode::AllUsers);
+        if(NetStrEq(cmd,"proc autodump off"))CoreAutoSetMode(CoreAutoMode::Off);
+        const auto s=CoreAutoReadStats();
+        BridgeReply reply;
+        reply.text("{\"policy\":");
+        reply.quoted(s.mode==CoreAutoMode::Off?"off":s.mode==CoreAutoMode::AllUsers?"all_users":"uid_1000");
+        reply.text(",\"worker\":");reply.text(s.worker?"true":"false");
+        reply.text(",");reply.field("queued",s.queued);
+        reply.text(",");reply.field("completed",s.completed);
+        reply.text(",");reply.field("failed",s.failed);
+        reply.text(",");reply.field("timed_out",s.timedOut);
+        reply.text(",");reply.field("busy",s.busy);
+        reply.text(",");reply.field("rate_limited",s.rateLimited);
+        reply.text(",");reply.field("active_ms",s.activeMs);
+        reply.text("}\n");reply.send();
+    }
     else if(StrStartsWith(cmd,"proc dump ")){
         const char* argument=cmd+sizeof("proc dump ")-1;
         uint32_t pid=0;
