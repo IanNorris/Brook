@@ -452,9 +452,9 @@ void ChromeBuildTaskbar(const ChromeTaskbarModel& m, const ChromeStyle& s, Chrom
         if (r.w >= Px(s, SM::TaskbarLabelMin) && r.h >= icon && b.hoverTitle && b.hoverTitle[0]) {
             const int ix = r.x + Px(s, SM::TaskbarButtonPad), tx = ix + icon + Px(s, SM::TaskbarLabelGap);
             IconAt(dl, s, ix, r.y + (r.h - icon) / 2, icon, b.icon, opacity);
-            dl.Text(CF::Label, tx, labelY, b.hoverTitle,
-                    b.active || hovered ? p.text : b.minimized ? p.mutedText : p.secondaryText,
-                    r.x + r.w - tx - Px(s, SM::TaskbarButtonPad));
+            ChromeElidedText(dl, s, CF::Label, tx, labelY, b.hoverTitle,
+                             b.active || hovered ? p.text : b.minimized ? p.mutedText : p.secondaryText,
+                             r.x + r.w - tx - Px(s, SM::TaskbarButtonPad));
         } else if (r.w >= icon && r.h >= icon)
             IconAt(dl, s, r.x + (r.w - icon) / 2, r.y + (r.h - icon) / 2, icon, b.icon, opacity);
     }

@@ -362,11 +362,11 @@ static DesktopRect WmTrayFlyoutLayout(uint32_t sw, uint32_t sh)
     const int gap = WmMetric(ChromeShellMetrics::PanelMargin);
     const int h = ChromeTrayFlyoutHeight(WmChromeStyle(), g_trayFlyout == WmTrayFlyout::Network, WmTrayFlyoutLive());
     if (!anchor.w || l.y < h + 2 * gap || sw < WmMetric(180)) return {};
-    // 304 wide, 8 px from the right screen edge and the taskbar (DESIGN.md
-    // "Geometry"), whichever tray target opened it.
+    // 304 wide, centred on its tray target and kept 8 px from the screen
+    // edge and the taskbar (as the prototype's fly()).
     const int available = int(sw) - 2 * gap;
-    const int preferred = WmMetric(304), w = preferred < available ? preferred : available;
-    return {int(sw) - gap - w, l.y - gap - h, w, h};
+    const int preferred = WmMetric(304);
+    return TaskbarTooltipBox(anchor, preferred < available ? preferred : available, h, l.y, gap, sw, gap);
 }
 
 static bool WmHudThermal()

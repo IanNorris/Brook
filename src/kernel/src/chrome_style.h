@@ -52,6 +52,29 @@ inline void ChromeMaterialString(ChromeDisplayList& dl, const ChromeStyle& s, in
     dl.Text(x, y, text, fg, width, nullptr, font);
 }
 
+// A single line that ends in "..." when it does not fit width (the
+// prototype's text-overflow: ellipsis), instead of a glyph cut in half.
+inline void ChromeElidedText(ChromeDisplayList& dl, const ChromeStyle& s, ChromeFont font, int x, int y,
+                             const char* text, uint32_t fg, int width) {
+    if (width <= 0 || !text) return;
+    if (s.TextWidth(text, font) <= width) { dl.Text(font, x, y, text, fg, width); return; }
+    char shown[96];
+    const FontAtlas& atlas = s.Font(font);
+    const int dots = 3 * ChromeTextWidth(atlas, ".");
+    unsigned n = 0;
+    for (int used = 0; text[n] && n + 4 < sizeof(shown); ++n) {
+        const char one[2] = {text[n], 0};
+        const int advance = ChromeTextWidth(atlas, one);
+        if (used + advance + dots > width) break;
+        used += advance;
+        shown[n] = text[n];
+    }
+    while (n && shown[n - 1] == ' ') --n;
+    shown[n] = shown[n + 1] = shown[n + 2] = '.';
+    shown[n + 3] = 0;
+    dl.Text(font, x, y, shown, fg, width);
+}
+
 // An icon, or the neutral missing-icon glyph when pixels is null (never a
 // misleading letter tile or a guessed application logo).
 inline void ChromeIcon(ChromeDisplayList& dl, const ChromeStyle& s, int x, int y, int size, const uint32_t* pixels) {

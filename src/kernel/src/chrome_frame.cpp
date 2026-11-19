@@ -114,7 +114,7 @@ void ChromeBuildFrame(const ChromeFrameModel& m, const ChromeStyle& s, ChromeDis
     }
     const int textW = runLeft - textX - s.M(8);
     if (textW > 0)
-        dl.Text(textX, ty + (titleH - s.Line()) / 2, m.title, fg, textW);
+        ChromeElidedText(dl, s, ChromeFont::Body, textX, ty + (titleH - s.Line()) / 2, m.title, fg, textW);
     CaptionButtons(dl, s, m, fg, s.MaterialColor(p.captionHover), p.text);
 }
 
