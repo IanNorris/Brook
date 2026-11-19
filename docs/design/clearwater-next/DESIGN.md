@@ -218,8 +218,9 @@ dark Glass tint changes from `#3b1626` to `#450528`.
 A custom accent is used at the exact chosen RGB on both light and dark
 surfaces. It uses the same tint derivation with default shaping. Ink on the
 accent is whichever of black and white has the higher contrast. Hover and
-pressed fills adjust towards the opposite ink when needed. Chrome and signal
-text keep their contrast checks. Preset-only accent-as-ink contrast targets
+pressed fills adjust towards the opposite ink when needed. Launcher badges
+use that ink. Search matches use bold chrome ink if the custom accent has
+low contrast against the panel. Chrome and signal text keep their checks. Preset-only accent-as-ink contrast targets
 are omitted for custom accents so users can choose any colour.
 
 ![All thirteen hues: Files in Mixed and Dark, and the taskbar](screenshots/hue-all.png)

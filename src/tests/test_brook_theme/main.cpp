@@ -220,6 +220,12 @@ int main() {
             for (uint32_t background : {c.glass, c.flat, c.titleTop}) CHECK(brook_contrast(c.ink, background) >= 4.5);
             for (uint32_t background : {c.accent, c.accentHover, c.accentPressed})
                 CHECK(brook_contrast(c.onAccent, background) >= 4.5);
+            for (unsigned material = 0; material < BROOK_THEME_COUNT; ++material) {
+                BrookThemePalette p;
+                brook_theme_build_palette(&t, material, i, &p);
+                CHECK(p.accent == rgb && brook_contrast(p.onAccent, p.accent) >= 4.5 &&
+                      brook_contrast(p.accentText, p.launcher) >= 4.5);
+            }
             if (rgb == 0xff00ff) {
                 for (uint32_t tint : {c.glass, c.flat, c.titleTop})
                     CHECK(((tint >> 16) & 255) > ((tint >> 8) & 255) && (tint & 255) > ((tint >> 8) & 255));

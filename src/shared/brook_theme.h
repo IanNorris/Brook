@@ -689,6 +689,8 @@ typedef struct BrookThemePalette {
     uint32_t gpu2d;
     uint32_t gpuInactive;
     uint32_t accent;       /* focus stroke, active task, slider fill, graph bars */
+    uint32_t onAccent;     /* text on a solid accent fill */
+    uint32_t accentText;   /* emphasis on the chrome fill */
     uint32_t halo;         /* outline behind pale text over translucent material */
     uint32_t ok;           /* load and temperature levels */
     uint32_t warm;
@@ -732,6 +734,8 @@ static inline void brook_theme_build_palette(const BrookHueTokens* hue, unsigned
     p->gpu2d = t->comp;
     p->gpuInactive = p->mutedText;
     p->accent = t->accent;
+    p->onAccent = t->onAccent;
+    p->accentText = brook_contrast(t->accent, bar) >= 4.5 ? t->accent : t->ink;
     p->halo = t->shadow;
     p->ok = t->ok;
     p->warm = t->warm;
