@@ -864,6 +864,9 @@ Two independent code reviews (compositor and driver), Dell measurements on the g
 - **Job table:** a long campaign can exhaust the 256-slot table, and the current boot may lack the terminate API. Archive completed work and plan a checked restart.
 
 ## Backlog (outside the immediate goal)
+- **Dell screenshots (Ian, 19 Nov):** there is no way to capture the Dell's screen except through the bridge, and the hardware bridge has no frame capture. Add a debug command that writes the current scanout to PNG under `/data/home`, plus a bridge fetch, for visual reviews.
+- **SYSTEM boot volume (Ian, 19 Nov):** file managers (Nautilus, Dolphin) show the FAT boot volume `SYSTEM` as an ejectable drive. Hide it by default and refuse eject (udisks hints / not user-mountable).
+- **`/data` is a 706 MB RAM tmpfs:** large staging bundles overflow it. Stage under `/data/home` (ext2) instead; the launcher-stage docs and tools should default to that.
 - **Apps to add later (Ian, 19 Nov):**
   - Signal Desktop (Electron; nixpkgs `signal-desktop`).
   - A simple PWA container for web apps such as WhatsApp. Proposed: a `brook-webapp NAME URL` wrapper that runs Chromium `--app=URL` with a per-app profile dir and an Apps entry and icon.
