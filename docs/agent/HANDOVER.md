@@ -98,7 +98,8 @@ _Last updated: 19 November 2026 (early), by a Claude Code session; see "19 Nov e
 **19 Nov afternoon: gen 445 = `work/integration43` 2d99e5c4, merged to main (payload `dell-int43-20261119`, session `1438af9a2cac42d38eb38a383c482026`).**
 - **Hardware cursor:** working; Ian saw no issues. Active with a stationary arrow, 0 fallbacks. Still open: 1,695 image re-uploads in minutes (dedupe requested from Codex).
 - **YouTube 1080p fullscreen:** 23.4 displayed fps (24 fps content), GPU source, `udp_rx_full` 0. Gen 442 gave 11 fps on the CPU path, and gen 444 would not start playback (937 UDP drops). Shadow direct scanout: 40 of 632 frames eligible, 592 blocked only by `cursor`. Codex is fixing hidden/hardware-cursor eligibility, which unlocks direct scanout for fullscreen video.
-- **Still to test on gen 445:** SuperTuxKart saturation (no flashing, flat `gop_returns`) and a single-connection download (> 30 Mbps).
+- **Single-connection Firefox download (gen 445):** 27 MB/s, rising to **70 MB/s** (~560 Mbps) as TCP autotuning grew the window (25 growths). Gen 444 managed 25–33 Mbps. CPU 62% idle, no backpressure (`display-perf/build/dell/ffdl-445`).
+- **Still to test on gen 445:** SuperTuxKart saturation (no flashing, flat `gop_returns`).
 - **In flight:**
   - Claude: `work/clearwater-s2` (Clearwater 1.5 + 2.1–2.3).
   - Codex: VKRENDER blur (2.4), auto-mount, cursor dedupe/eligibility.
