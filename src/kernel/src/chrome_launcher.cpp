@@ -74,7 +74,7 @@ constexpr ChromeGlyph CategoryGlyphs[] = {
 constexpr uint32_t CategoryInk = 0x0b1a2b;
 
 const char* TopLabels[] = {"PINNED", "RECENT"};
-const char* MenuPin = "Pin to top";
+const char* MenuPin = "Pin";
 const char* MenuUnpin = "Unpin";
 const char* MenuUninstall = "Uninstall";
 
@@ -174,7 +174,7 @@ struct Builder {
         const DesktopRect r{f.top.x, f.top.y + LPx(s, LM::Tab) + LPx(s, 4), f.top.w, LPx(s, LM::Tile)};
         Outline(r, t.hairline, 8);
         const char* text = m.Top() == LauncherTop::Pinned ?
-            "Nothing pinned yet. Right-click an app and choose Pin to top." : "Apps you open will appear here.";
+            "Nothing pinned yet. Right-click an app and choose Pin." : "Apps you open will appear here.";
         const int w = s.TextWidth(text, CF::Label);
         ChromeElidedText(dl, s, CF::Label, w < r.w ? r.x + (r.w - w) / 2 : r.x + LPx(s, 8), Center(r, CF::Label), text,
                          t.ink3, r.w - LPx(s, 16));
