@@ -131,9 +131,12 @@ bool BdwZeroCopyOnReserve(BdwGpuBuffer* buffer);
 void BdwZeroCopyOnRelease(BdwGpuBuffer* buffer);
 // Present worker, after the BCS admission: Copy = not an image or zero-copy
 // inactive (do the normal BCS copy from it), Presented = armed or queued
-// with no copy, RepairRequired = fail the present with a software repair.
-enum class BdwZeroCopyOutcome : uint8_t {Copy,Presented,RepairRequired};
+// with no copy, Deferred = keep the current front and drop this frame,
+// RepairRequired = fail the present with a software repair.
+enum class BdwZeroCopyOutcome : uint8_t {Copy,Presented,RepairRequired,Deferred};
 BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer* source,const CompositorPresentRegion* regions,uint32_t regionCount);
+bool BdwZeroCopyCanHoldFront(uint64_t owner);
+void BdwZeroCopyNoteWorkerWait();
 // Present thread, before handing a present to the worker: in "flush" cache
 // mode CLFLUSH the image's drawn lines there, off the gpu-submit worker.
 void BdwZeroCopyPrepareScanout(BdwGpuBuffer* source,const CompositorPresentRegion* regions,uint32_t count);

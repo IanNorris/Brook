@@ -117,6 +117,7 @@ pkgs.stdenv.mkDerivation {
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_layers_vulkan_test.c renderer.o -lvulkan -o brook-desktop-layers-vulkan-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror quad_pass_host_test.c renderer.o quad_pass.o -lvulkan -o brook-quad-pass-host-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_renderer_host_test.c renderer.o graphics_image.o graphics_pass.o quad_pass.o -lvulkan -o brook-desktop-renderer-host-test
+    ./brook-desktop-renderer-host-test --scanout-backpressure-qa
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_renderer.c renderer.o graphics_image.o graphics_pass.o quad_pass.o -lvulkan -o brook-desktop-renderer
     $CC -std=c11 -O2 -Wall -Wextra -Werror -DBROOK_SUPERVISOR_DIAGNOSTIC_REUSE_BACKDROP=1 desktop_supervisor.c -o brook-desktop-supervisor-reuse-backdrop
     $CC -std=c11 -O2 -Wall -Wextra -Werror -DBROOK_SUPERVISOR_DIAGNOSTIC_BARE=1 desktop_supervisor.c -o brook-desktop-supervisor-bare

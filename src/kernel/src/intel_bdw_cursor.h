@@ -45,32 +45,51 @@ inline bool BdwCursorHasAlpha(const uint32_t* pixels, uint32_t width, uint32_t h
     return false;
 }
 
-// The renderer omits the layer as soon as an offer exists. The hardware
-// cannot turn on until that renderer acknowledges a cursor-free present and
-// the primary plane shows that image or a later one from the same epoch.
+// Prove the plane can latch a transparent image while software still draws
+// the cursor. Only then request a cursor-free primary frame. Make the real
+// cursor visible once that primary frame has itself latched.
 class BdwCursorHandoff {
-    uint64_t epoch_ = 0, offeredAfter_ = 0, firstClean_ = 0;
-    bool offered_ = false;
+    enum class State : uint8_t { Idle, Probing, Cleaning, Arming, Owned };
+    State state_ = State::Idle;
+    uint64_t epoch_ = 0, started_ = 0, offeredAfter_ = 0, firstClean_ = 0;
+    static constexpr uint64_t TimeoutMs = 250;
 
 public:
-    uint64_t offer(uint64_t sequence) {
-        if (!offered_) {
-            if (epoch_ == (uint64_t{1} << 63) - 1)
-                return 0;
+    bool prepare(uint64_t now) {
+        if (state_ != State::Idle)
+            return false;
+        started_ = now;
+        state_ = State::Probing;
+        return true;
+    }
+    bool inProgress() const { return state_ != State::Idle; }
+    bool probing() const { return state_ == State::Probing; }
+    bool owned() const { return state_ == State::Owned; }
+    bool expired(uint64_t now) const {
+        return inProgress() && !owned() && now >= started_ && now - started_ >= TimeoutMs;
+    }
+    uint64_t offer(uint64_t sequence, uint64_t now, bool probeLatched) {
+        if (probing() && probeLatched && epoch_ != (uint64_t{1} << 63) - 1) {
             ++epoch_;
+            started_ = now;
             offeredAfter_ = sequence;
-            offered_ = true;
+            state_ = State::Cleaning;
         }
-        return epoch_;
+        return epoch();
     }
-    void cancel() { offered_ = false; firstClean_ = 0; }
-    uint64_t epoch() const { return offered_ ? epoch_ : 0; }
-    void presented(uint64_t epoch, uint64_t sequence) {
-        if (epoch && epoch == this->epoch() && !firstClean_ && sequence > offeredAfter_)
-            firstClean_ = sequence;
+    void cancel() { state_ = State::Idle; firstClean_ = 0; }
+    uint64_t epoch() const { return inProgress() && !probing() ? epoch_ : 0; }
+    bool suppress(bool hardwareMayBeVisible) const { return epoch() || hardwareMayBeVisible; }
+    bool presented(uint64_t epoch, uint64_t sequence) {
+        if (!awaitingPresent() || !epoch || epoch != this->epoch() || sequence <= offeredAfter_)
+            return false;
+        firstClean_ = sequence;
+        return true;
     }
-    bool awaitingPresent() const { return offered_ && !firstClean_; }
-    bool mayEnable(uint64_t front) const { return firstClean_ && front >= firstClean_; }
+    bool awaitingPresent() const { return state_ == State::Cleaning && !firstClean_; }
+    bool mayEnable(uint64_t front) const { return state_ == State::Cleaning && firstClean_ && front >= firstClean_; }
+    void arm(uint64_t now) { state_ = State::Arming; started_ = now; }
+    void latched() { if (state_ == State::Arming) state_ = State::Owned; }
 };
 
 class BdwCursorPlane {

@@ -233,8 +233,9 @@ static struct DesktopTimelineRow g_timeline[DESKTOP_TIMELINE];static uint64_t g_
 /* Zero-copy active at the last pick: presents then name every region drawn
  * into the image (own damage plus buffer-age repair), which the kernel's
  * "flush" cache mode writes back before scanning the image out. */
-static int g_scanoutActive; /* render_frame stage of the last failure, for DESKTOP_ASYNC_RETRY */
-static uint64_t g_scanoutPicks,g_scanoutWaits,g_scanoutStarved,g_scanoutFullDraws,g_scanoutPartialDraws,g_scanoutRepairPixels;
+static int g_scanoutActive,g_scanoutRequested;
+static uint64_t g_scanoutPicks,g_scanoutWaits,g_scanoutStarved,g_scanoutPresentDefers;
+static uint64_t g_scanoutFullDraws,g_scanoutPartialDraws,g_scanoutRepairPixels;
 /* The ring is process-wide: registered once (the kernel accepts one
  * registration per boot) and used by every render context. */
 static struct DesktopScanoutRing g_ring;static int g_ringFds[DESKTOP_AGE_MAX_IMAGES]={-1,-1,-1,-1};
@@ -279,26 +280,27 @@ static int scanout_ring_open(uint32_t width,uint32_t height){
     fprintf(stderr,"DESKTOP_SCANOUT_RING images=%u\n",g_ring.count);
     return 0;
 }
-/* Pick the image for the next frame: free per the kernel (not displayed,
- * armed, queued or reserved), not in flight here, and youngest. Waits up to
- * about 25 ms for a latch or a retirement. */
+/* Do not block a renderer context here: it may need to retire its
+ * pending frames before a locally held image becomes available. */
 static int scanout_pick(void){
-    for(unsigned attempt=0;attempt<26;++attempt){
-        struct BrookGpuScanoutStatus status;memset(&status,0,sizeof(status));
-        if(syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_SCANOUT_STATUS,&status,0,0,0,0))return -1;
-        const int image=desktop_scanout_ring_pick(&g_ring,status.freeMask);
-        g_scanoutActive=(status.flags&BROOK_GPU_SCANOUT_ACTIVE)!=0;
-        if(image>=0){++g_scanoutPicks;return image;}
-        ++g_scanoutWaits;usleep(1000);
-        if(attempt==25){
-            ++g_scanoutStarved;
-            if(g_scanoutStarved<=8 || !(g_scanoutStarved&(g_scanoutStarved-1)))
-                fprintf(stderr,"DESKTOP_SCANOUT_STARVED kernel_free=0x%x in_flight=0x%x flags=0x%x front=%u armed=%u queued=%u count=%llu\n",
-                    status.freeMask,desktop_scanout_ring_busy(&g_ring),status.flags,status.front,status.armed,status.queued,
-                    (unsigned long long)g_scanoutStarved);
-        }
+    struct BrookGpuScanoutStatus status={0};
+    if(syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_SCANOUT_STATUS,&status,0,0,0,0))return -1;
+    g_scanoutActive=(status.flags&BROOK_GPU_SCANOUT_ACTIVE)!=0;
+    g_scanoutRequested=(status.flags&BROOK_GPU_SCANOUT_REQUESTED)!=0;
+    if(status.flags&BROOK_GPU_SCANOUT_DISABLED){
+        g_scanoutImages=0;
+        errno=EIO;
+        return -1;
     }
-    errno=EAGAIN;return -1;
+    const int image=desktop_scanout_ring_pick(&g_ring,status.freeMask);
+    if(image>=0){++g_scanoutPicks;return image;}
+    ++g_scanoutWaits;++g_scanoutStarved;
+    if(g_scanoutStarved<=8 || !(g_scanoutStarved&(g_scanoutStarved-1)))
+        fprintf(stderr,"DESKTOP_SCANOUT_STARVED kernel_free=0x%x in_flight=0x%x flags=0x%x front=%u armed=%u queued=%u count=%llu\n",
+            status.freeMask,desktop_scanout_ring_busy(&g_ring),status.flags,status.front,status.armed,status.queued,
+            (unsigned long long)g_scanoutStarved);
+    errno=EAGAIN;
+    return -1;
 }
 /* ---- App-driven present cadence and direct scanout ----------------------
  * (desktop_app_present.h, docs/app-driven-present.md.) The mode is the
@@ -419,7 +421,7 @@ static void context_close(int drm,struct RenderContext *ctx){
     context_init(ctx);
 }
 static int context_prepare(int drm,struct RenderContext *ctx,uint32_t width,uint32_t height,size_t words){
-    if(ctx->renderer && ctx->width==width && ctx->height==height)return 0;
+    if(ctx->renderer && ctx->width==width && ctx->height==height && (!ctx->scanoutCount || g_scanoutImages))return 0;
     /* The damage baseline describes the screen, not this context's
      * resources; keep it (identity and size are checked on use). */
     const struct DesktopDamageState baseline=ctx->damage;
@@ -624,7 +626,7 @@ static int overlay_cursor(int drm,struct RenderContext *ctx,struct DesktopOverla
     *state=(struct DesktopOverlayCursorState){0};
     if(g_overlayTracked!=1)return 0;
     const uint64_t known=ctx->cursor.handle?ctx->cursorSerial:0;
-    long result=syscall(BROOK_SYS_DESKTOP_OVERLAY,BROOK_DESKTOP_OVERLAY_CURSOR,0,&g_cursorInfo,sizeof(g_cursorInfo),known,BROOK_DESKTOP_CURSOR_PLANE_V2);
+    long result=syscall(BROOK_SYS_DESKTOP_OVERLAY,BROOK_DESKTOP_OVERLAY_CURSOR,0,&g_cursorInfo,sizeof(g_cursorInfo),known,BROOK_DESKTOP_CURSOR_PLANE_V3);
     if(result<0 && errno==EINVAL)
         result=syscall(BROOK_SYS_DESKTOP_OVERLAY,BROOK_DESKTOP_OVERLAY_CURSOR,0,&g_cursorInfo,sizeof(g_cursorInfo),known,0);
     if(result<0)return -1;
@@ -688,6 +690,14 @@ static long reserve_output(int output,uint64_t baseline,const struct PipelineBas
     if(ticket<=0 && baseline && errno==ESTALE && pipe && !pipe->carry)
         ticket=syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_RESERVE,output,0,0,0,0);
     return ticket;
+}
+/* A transient refusal after the free-mask query is another deferred frame.
+ * Retry with fresh state instead of falling through to a different target. */
+static int scanout_reserve_wait(int image){
+    if(image<0 || (errno!=EBUSY && errno!=EAGAIN))return -1;
+    ++g_scanoutWaits;
+    g_appWakeNs=monotonic_ns()+2000000ull;
+    return 2;
 }
 /* Returns 0 for a presented frame, 1 for a submitted asynchronous frame,
  * 2 when nothing changed since the displayed frame (no GPU work; poll
@@ -1029,14 +1039,18 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     }
     desktop_overlay_damage(overlayBase,&frameOverlay,&footprint);
     scene[2]=count;
-    struct DesktopDamageSet damage=desktop_damage_current(ctx->damage,identity.display,identity.generation,width,height,footprint);
+    /* A cursor handoff needs a clean scanout image even if cached damage
+     * says the desktop was idle or the previous cursor was hidden. */
+    const int cursorHandoff=cursorEpoch && ctx->scanoutCount;
+    struct DesktopDamageSet damage=cursorHandoff?(struct DesktopDamageSet){1,{{0,0,width,height}}}:
+        desktop_damage_current(ctx->damage,identity.display,identity.generation,width,height,footprint);
     /* Change-based damage against the displayed frame, when that frame is
      * known and no other frame can present first; pipelined, against the
      * latest submitted frame (its in-flight regions are carried below). */
     int tracked=0,pointerOnly=0;
     const int baselineOk=ctx->damage.display==identity.display && ctx->damage.backdrop==identity.generation &&
         ctx->damage.width==width && ctx->damage.height==height;
-    if((pipe || (quiescent && !baselineTicket)) && track->valid && trackBase && baselineOk){
+    if(!cursorHandoff && (pipe || (quiescent && !baselineTicket)) && track->valid && trackBase && baselineOk){
         struct DesktopDamageSet changes={0};
         if(desktop_track_diff(trackBase,track,&changes)){
             desktop_overlay_clip_opaque(overlayBase,&frameOverlay,&changes);
@@ -1144,7 +1158,11 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     int ringImage=-1,ringDrawPartial=0;struct DesktopDamageSet ringDraw={0};
     if(ctx->scanoutCount){
         desktop_buffer_age_bind(&g_ring.age,identity.display,identity.generation,width,height);
-        stage="scanout_pick";ringImage=scanout_pick();if(ringImage<0)goto done;
+        stage="scanout_pick";ringImage=scanout_pick();
+        if(ringImage<0){
+            if(errno==EAGAIN){g_appWakeNs=monotonic_ns()+2000000ull;result=2;}
+            goto done;
+        }
         ctx->scanoutImage=ringImage;ctx->output=g_ringFds[ringImage];
     }
     /* Default path: per-layer quads limited to the (16-pixel aligned)
@@ -1173,7 +1191,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
            async_sources_mark_omitted(frameSources,layers.count,clientSourceIndex,desktop_offer_used_merge(directOffer,plan->used,count,mergedUsed),count)){
             stage="quad_reserve";
             ticket=reserve_output(ctx->output,qpartial?baselineTicket:0,pipe,&rebased);
-            if(ticket<=0)goto done;
+            if(ticket<=0){result=scanout_reserve_wait(ringImage);goto done;}
             struct BrookVkQuadSource inputs[BROOK_VK_MAX_LAYERS];
             for(unsigned i=0;i<count;++i){const uint32_t *l=scene+BROOK_VK_SCENE_HEADER+i*BROOK_VK_LAYER_WORDS;
                 inputs[i]=(struct BrookVkQuadSource){{sources[i].fd,sources[i].syncFd,l[2],l[3],l[0],l[1],(uint64_t)sources[i].words*4u},
@@ -1250,6 +1268,9 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             directOffer[i]->failed=directOffer[i]->retire=1;directOffer[i]->current=0;tiled=1;}
         if(tiled){stage="tiled_fallback";goto done;}
     }
+    // Keep an active ring's fallback on a complete registered image.
+    // A packed partial buffer would make the kernel leave zero-copy.
+    if(!quadUsed && ringImage>=0 && (g_scanoutActive || g_scanoutRequested))attemptPartial=0;
     if(quadUsed){}
     else if(attemptPartial){
         stage="batch_prepare";
@@ -1344,7 +1365,8 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     }else{
         for(unsigned i=0;i<count;++i)frameDirect+=directSource[i];
         statsDraws=1;
-        stage="full_reserve";ticket=syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_RESERVE,ctx->output,0,0,0,0);if(ticket<=0)goto done;
+        stage="full_reserve";ticket=syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_RESERVE,ctx->output,0,0,0,0);
+        if(ticket<=0){result=scanout_reserve_wait(ringImage);goto done;}
         stage="full_test_arm";testArmed=arm_test_block(ticket);if(testArmed<0)goto done;
         stage="full_compose";
         statsSubmitStart=monotonic_ns();
@@ -1547,7 +1569,13 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
 done:
     savedErrno=errno;
     if(result<0)g_failStage=stage;
-    if(result<0){if(presentFailed){++g_stats.presentFailures;if(savedErrno==ESTALE)++g_stats.presentStale;}else ++g_stats.prepareFailures;}
+    if(result<0){
+        if(presentFailed){
+            if(ctx->scanoutCount)desktop_buffer_age_reset(&g_ring.age);
+            if(ctx->scanoutCount && savedErrno==EAGAIN)++g_scanoutPresentDefers;
+            else {++g_stats.presentFailures;if(savedErrno==ESTALE)++g_stats.presentStale;}
+        }else ++g_stats.prepareFailures;
+    }
     /* A failed present may have changed what is on screen. */
     if(result<0 && presentFailed && g_trackDisplayed)g_trackDisplayed->valid=0;
     desktop_gpu_channel_finish(&g_gpuChannel,frame);
@@ -1658,7 +1686,10 @@ static int retire_async_frame(struct RenderContext *ctx,struct PendingDesktopFra
             fprintf(stderr,"DESKTOP_ASYNC_SOURCE ticket=%ld window=%u incarnation=%llu generation=%llu source=%s commit=%llu snapshot_commit=%llu omitted=%u\n",
                 p->ticket,s->window,(unsigned long long)s->incarnation,(unsigned long long)s->generation,
                 s->commit?"gpu":"cpu",(unsigned long long)s->commit,(unsigned long long)s->snapshotCommit,s->omitted);}
-    }else {++g_stats.presentFailures;if(savedErrno==ESTALE)++g_stats.presentStale;
+    }else {
+        if(p->ringImage)desktop_buffer_age_reset(&g_ring.age);
+        if(p->ringImage && savedErrno==EAGAIN)++g_scanoutPresentDefers;
+        else {++g_stats.presentFailures;if(savedErrno==ESTALE)++g_stats.presentStale;}
         /* An older ticket refused behind a newer accepted one left the
          * screen alone (pipelined frames never present out of order). */
         if(g_trackDisplayed && !(g_pipeline>1 && lastPresentedTicket && (uint64_t)p->ticket<lastPresentedTicket))g_trackDisplayed->valid=0;
@@ -1720,7 +1751,7 @@ static void stats_publish(uint64_t now){
     if(length){
         size_t end=length;while(end && g_statsJson[end-1]!='}')--end;
         if(end){char tail[2048];
-            const int n=snprintf(tail,sizeof(tail),",\"scanout\":{\"images\":%u,\"picks\":%llu,\"waits\":%llu,\"starved\":%llu,"
+            const int n=snprintf(tail,sizeof(tail),",\"scanout\":{\"images\":%u,\"picks\":%llu,\"waits\":%llu,\"starved\":%llu,\"present_defers\":%llu,"
                 "\"full_draws\":%llu,\"partial_draws\":%llu,\"repair_pixels\":%llu},\"overlay_only_skips\":%llu,\"overlay_bands_kept\":%llu,"
                 "\"chrome\":{\"keep\":%d,\"keeps\":%llu,\"keep_misses\":%llu,\"captures\":%llu,\"bytes_copied\":%llu,"
                 "\"spans\":%d,\"span_capture\":%d,\"span_captures\":%llu,\"span_layers\":%llu,\"opaque_spans\":%llu,\"interior_clears\":%llu},"
@@ -1728,6 +1759,7 @@ static void stats_publish(uint64_t now){
                 "\"overlay_records\":%d,\"overlay_record_captures\":%llu,\"shared_fallbacks\":%llu},"
                 "\"client\":{\"keep\":%d,\"keeps\":%llu,\"keep_misses\":%llu,\"captures\":%llu,\"bytes_copied\":%llu,\"bytes_kept\":%llu,\"band_reuses\":%llu}}\n",g_ring.count,
                 (unsigned long long)g_scanoutPicks,(unsigned long long)g_scanoutWaits,(unsigned long long)g_scanoutStarved,
+                (unsigned long long)g_scanoutPresentDefers,
                 (unsigned long long)g_scanoutFullDraws,(unsigned long long)g_scanoutPartialDraws,(unsigned long long)g_scanoutRepairPixels,
                 (unsigned long long)g_overlayOnlySkips,(unsigned long long)g_overlayBandsKept,g_chromeKeep,g_chromeStats.keeps,g_chromeStats.keepMisses,
                 g_chromeStats.captures,g_chromeStats.bytesCopied,
@@ -2063,7 +2095,11 @@ int main(int argc,char **argv){
         uint32_t visible=0;uint64_t presented=0;
         stats_tick(0);
         const int rendered=render_frame(drm,&ctx,&visible,&presented,NULL,0,0,1,NULL);
-        if(rendered==2){(void)desktop_channel_wait(&g_gpuChannel,(int)(g_idlePollNs/1000000ull));continue;}
+        if(rendered==2){
+            const uint64_t until=idle_until(),now=monotonic_ns();
+            (void)desktop_channel_wait(&g_gpuChannel,until>now?(int)((until-now+999999ull)/1000000ull):0);
+            continue;
+        }
         if(!rendered){
             ++frames;failures=0;failureStart=0;
             uint64_t interval=previous && presented>=previous?(presented-previous)/1000000ull:0;

@@ -925,7 +925,8 @@ static bool ServiceScanout(void*,BdwSubmissionQueue& queue){
 #endif
     scanoutWork.status=BdwExecuteBcsScanout(scanoutWork.source,scanoutWork.token,scanoutWork.regions,scanoutWork.count);
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
-    if(scanoutWork.status!=BdwScanoutStatus::Completed && OnWorkerStatsThread())workerStats.PresentFailed();
+    if(scanoutWork.status!=BdwScanoutStatus::Completed && scanoutWork.status!=BdwScanoutStatus::Deferred &&
+       OnWorkerStatsThread())workerStats.PresentFailed();
 #endif
     __atomic_store_n(&scanoutWork.state,ScanoutDone,__ATOMIC_RELEASE);
     BdwGpuEventSignal(BdwGpuEvent::Retire); // PresentOnBcs waits on Retire
@@ -1072,34 +1073,47 @@ static int64_t InitApplicationWorker(){
 // offscreenMutex serializes the producer and holds the exact completed
 // source until the worker finishes. Cancellation can win only before the
 // worker claims the request.
-enum class BdwPresentCopy { Completed, Unavailable, Expired, RepairRequired };
-static BdwPresentCopy PresentOnBcs(BdwGpuBuffer* source,uint64_t token,const CompositorPresentRegion* regions,uint32_t count){
+enum class BdwPresentCopy { Completed, Unavailable, Expired, RepairRequired, Deferred };
+static BdwPresentCopy PresentOnBcs(BdwGpuBuffer* source,uint64_t token,const CompositorPresentRegion* regions,uint32_t count,uint64_t owner){
     if(!source || !token || !regions || !count || count>COMPOSITOR_MAX_REGIONS ||
        !BdwBcsScanoutEnabled() || InitApplicationWorker() ||
        __atomic_load_n(&scanoutWork.state,__ATOMIC_ACQUIRE)!=ScanoutIdle)return BdwPresentCopy::Unavailable;
+    bool canDefer=false;
 #if defined(BROOK_BDW_ZERO_COPY_SCANOUT)
+    canDefer=BdwGpuBufferIsScanoutImage(source) && BdwZeroCopyCanHoldFront(owner);
     BdwZeroCopyPrepareScanout(source,regions,count);
+#else
+    (void)owner;
 #endif
     scanoutWork.source=source;scanoutWork.token=token;scanoutWork.count=count;
     for(uint32_t i=0;i<count;++i)scanoutWork.regions[i]=regions[i];
     __atomic_store_n(&scanoutWork.state,ScanoutQueued,__ATOMIC_RELEASE);
     applicationWorker.Wake();
-    const auto deadline=ApicTickCount()+32;
+    // A ring present can wait behind one long app job without writing
+    // the GOP. Keep the queue bound shorter than the presentation lease.
+    const auto deadline=ApicTickCount()+(canDefer?128:32);
     for(;;){
         const uint64_t seen=BdwGpuEventGeneration(BdwGpuEvent::Retire);
         if(__atomic_load_n(&scanoutWork.state,__ATOMIC_ACQUIRE)==ScanoutDone){
             const auto result=scanoutWork.status;
             scanoutWork.source=nullptr;
             __atomic_store_n(&scanoutWork.state,ScanoutIdle,__ATOMIC_RELEASE);
-            return result==BdwScanoutStatus::Completed?BdwPresentCopy::Completed:
-                   result==BdwScanoutStatus::RepairRequired?BdwPresentCopy::RepairRequired:BdwPresentCopy::Unavailable;
+            switch(result){
+            case BdwScanoutStatus::Completed:return BdwPresentCopy::Completed;
+            case BdwScanoutStatus::RepairRequired:return BdwPresentCopy::RepairRequired;
+            case BdwScanoutStatus::Deferred:return BdwPresentCopy::Deferred;
+            case BdwScanoutStatus::Unavailable:return BdwPresentCopy::Unavailable;
+            }
         }
         if(ApicTickCount()>=deadline){
             uint32_t queued=ScanoutQueued;
             if(__atomic_compare_exchange_n(&scanoutWork.state,&queued,ScanoutIdle,false,
                                            __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)){
                 scanoutWork.source=nullptr;
-                return BdwPresentCopy::Expired;
+#if defined(BROOK_BDW_ZERO_COPY_SCANOUT)
+                if(canDefer)BdwZeroCopyNoteWorkerWait();
+#endif
+                return canDefer?BdwPresentCopy::Deferred:BdwPresentCopy::Expired;
             }
         }
         BdwGpuEventWaitTick(BdwGpuEvent::Retire,seen);
@@ -1279,13 +1293,13 @@ static int64_t PresentGopWrite(const WmDesktopLayers& scene,const WmDesktopLayer
     const auto admitted=base?WmDesktopLayersUseIfBothPresentable(*base,scene,&admission,reserve):
                              WmDesktopLayersUseIfPresentable(scene,&admission,reserve);
     if(admitted)return admitted;
-    auto copied=PresentOnBcs(source,token,regions,count);
+    auto copied=PresentOnBcs(source,token,regions,count,owner);
 #if defined(BROOK_BDW_SCANOUT_FLIP)
     // With a kernel buffer live, a CPU copy into the GOP would be invisible.
     if(copied==BdwPresentCopy::Unavailable && BdwScanoutFlipAwayFromGop())copied=BdwPresentCopy::RepairRequired;
 #endif
     bool touched=copied==BdwPresentCopy::Completed;
-    int result=copied==BdwPresentCopy::Expired?-62:0;
+    int result=copied==BdwPresentCopy::Deferred?-11:copied==BdwPresentCopy::Expired?-62:0;
     if(copied==BdwPresentCopy::RepairRequired){
         // A kernel flip buffer may be live, or the chain is frozen: a CPU
         // copy into the GOP would not be what the panel shows. Fail and let

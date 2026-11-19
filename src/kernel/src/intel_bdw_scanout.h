@@ -36,9 +36,10 @@ bool BdwScanoutFairness();
 void BdwScanoutFairnessCounts(uint64_t&,uint64_t&,uint64_t&,uint64_t&);
 // Completed: the frame reached the scanout (copied, or flipped/queued).
 // Unavailable: nothing was committed; the caller may use the CPU fallback.
+// Deferred: a healthy front is retained; the submitted frame was dropped.
 // RepairRequired: a kernel flip buffer may be live or the flip chain is no
 // longer trustworthy; the compositor must repaint the GOP in full.
-enum class BdwScanoutStatus : uint8_t {Completed,Unavailable,RepairRequired};
+enum class BdwScanoutStatus : uint8_t {Completed,Unavailable,RepairRequired,Deferred};
 BdwScanoutStatus BdwExecuteBcsScanout(BdwGpuBuffer*,uint64_t token,const CompositorPresentRegion*,uint32_t count);
 #if defined(BROOK_BDW_PERSISTENT_SCANOUT_MAP) || defined(BROOK_BDW_SCANOUT_FLIP)
 struct BdwPpgttLeaf;struct BdwBlitRegion;struct BdwBlitBuffer;
