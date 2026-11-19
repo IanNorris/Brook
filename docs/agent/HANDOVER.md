@@ -95,7 +95,16 @@ _Last updated: 19 November 2026 (early), by a Claude Code session; see "19 Nov e
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
-**19 Nov night: Dell on gen 457 = `work/integration54` b07a9d01** (int53 + `work/hw-capture` 7bb9001b: scanout readback screenshots and window capture; session `816429bf13934a8bb7c3f719d9ffb6bd`). 384 non-stress tests pass; QEMU passes.
+**19 Nov night: Dell on gen 458 = `work/integration55` 16753e94** (int54 + `work/launcher` 584dc701: new launcher plus condensed taskbar; session `f6a042f7dc224160940012b28176854d`). 385 non-stress tests pass; QEMU passes. Healthy; glass changes 1.
+- **Taskbar screenshot:** `display-perf/build/dell/shots/full-458/`.
+- **Launcher evidence:** `launcher/build/launcher-evidence/compare/`.
+- **Expected stage 3 merge conflicts:** `wm_shell_launcher.inc`, `chrome_shell_model.h`.
+- **Next:**
+  - Ian tries the launcher (Super, type, keyboard navigation, pin, reboot persistence).
+  - Fable review of the launcher using Dell captures.
+  - Nautilus/Dolphin latency readout.
+
+**Previous: gen 457 = `work/integration54` b07a9d01** (int53 + `work/hw-capture` 7bb9001b: scanout readback screenshots and window capture; session `816429bf13934a8bb7c3f719d9ffb6bd`). 384 non-stress tests pass; QEMU passes.
 - **Capture works on the Dell:** source `gpu-present`, scanout `zero-copy`, copy 11.7 ms, glass visible.
 - **Run the int54+ bridge copy:** `BROOK_ROOT=/data/Programming/Brook/display-perf python3 /data/Programming/Brook/integration27/tools/vm_bridge/server.py --call hw_transfer` with `action=frame`, optional `window` (an hw_windows reference), `window_area` frame|client|buffer, `cursor`.
 - **Known gaps:** `cursor:true` reported cursor_composited false; `window_area=buffer` returned `window-buffer` / scanout `unverified`, copy_us 0 (check the image).
