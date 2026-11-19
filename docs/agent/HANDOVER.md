@@ -95,6 +95,19 @@ _Last updated: 19 November 2026 (early), by a Claude Code session; see "19 Nov e
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**19 Nov evening: Ian away overnight; Claude is in control of the Dell (Ian: "I'll leave you in control of the Dell").**
+- **Priorities:** Clearwater first. Then the renewed launcher, taskbar, file manager and App Gallery (DECISIONS "Shell apps direction"). Ian considers the backlog large enough; no new big threads tonight.
+- **Dell state:** gen 445 (int43). HDA audio is quarantined after one stream fault until reboot. `~/.asoundrc` is now installed (Brook ALSA default → /dev/dsp). Steam's launcher entry has been restored in the idx.
+- **Landing overnight, to integrate into int44+ and deploy:**
+  - Codex: `work/dump-segments` 4b0c5de2 (done); cursor dedupe/eligibility; automount.
+  - Claude: `work/clearwater-s2` (1.5, 2.1–2.3); `work/chromium-gpu-death`; `work/hda-fault`.
+  - Codex `work/vkrender-blur` (2.4, done; Glass A/B needs a Dell measurement).
+- **Overnight rules:**
+  - Deploy only images whose QEMU check passes. Keep the previous slot as rollback.
+  - After each boot, verify zero-copy, cadence, gpu hang counters, network and audio.
+  - Leave any UI-dependent test for Ian.
+  - Never leave the Dell in recovery.
+
 **19 Nov afternoon: gen 445 = `work/integration43` 2d99e5c4, merged to main (payload `dell-int43-20261119`, session `1438af9a2cac42d38eb38a383c482026`).**
 - **Hardware cursor:** working; Ian saw no issues. Active with a stationary arrow, 0 fallbacks. Still open: 1,695 image re-uploads in minutes (dedupe requested from Codex).
 - **YouTube 1080p fullscreen:** 23.4 displayed fps (24 fps content), GPU source, `udp_rx_full` 0. Gen 442 gave 11 fps on the CPU path, and gen 444 would not start playback (937 UDP drops). Shadow direct scanout: 40 of 632 frames eligible, 592 blocked only by `cursor`. Codex is fixing hidden/hardware-cursor eligibility, which unlocks direct scanout for fullscreen video.
