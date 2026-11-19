@@ -87,6 +87,7 @@ struct LauncherTarget {
 // Heights the list is laid out with (device pixels), from the builder.
 struct LauncherViewport {
     int heading, row, chips, empty, height;
+    int step; // pixels a wheel tick scrolls
 };
 
 // Trivially constructible (it lives in kernel static storage, which runs no
@@ -141,7 +142,7 @@ public:
     int SelectedTile() const { return tile_; }       // Tiles: slot
     int SelectedRail() const { return rail_; }       // Rail: row (0 All, 1.. categories, last Unsorted)
     bool KeyboardActive() const { return keyboard_; } // draw the keyboard selection
-    uint32_t Scroll() const { return scroll_; }
+    uint32_t Scroll() const { return scroll_; } // pixels from the top of the list
     // Rail rows: All apps, each category, then Unsorted while it has apps.
     uint32_t RailRows() const { return 1 + categoryCount_ + (UnsortedCount() || view_ == LauncherViewUnsorted ? 1 : 0); }
     int RailView(uint32_t row) const { return row == 0 ? LauncherViewAll : row <= categoryCount_ ? int(row - 1) : LauncherViewUnsorted; }
@@ -151,8 +152,10 @@ public:
     // Search: the ranked results and matching categories.
     uint32_t SearchResults(uint16_t* out, uint32_t capacity) const;
     uint32_t SearchCategories(uint16_t* out, uint32_t capacity) const;
-    // Lowest line of the visible page, and whether more is below.
+    // Pixels of list below the visible page at the top (0: it all fits).
     uint32_t MaxScroll() const;
+    // Total list height, in pixels.
+    uint32_t ContentHeight() const;
 
     // Context menu (Pin or Unpin, Uninstall) for one app.
     bool MenuOpen() const { return menuApp_ >= 0; }
@@ -165,7 +168,9 @@ public:
 
     LauncherResult Key(LauncherKey key, char ch = 0, uint8_t mods = 0);
     LauncherResult Press(const LauncherTarget& target, bool secondary, int32_t x, int32_t y);
-    bool ScrollBy(int lines);
+    bool ScrollBy(int pixels);
+    // Wheel ticks, positive up (the step a tick is from the viewport).
+    bool ScrollTicks(int ticks) { return ScrollBy(-ticks * (viewport_.step > 0 ? viewport_.step : 1)); }
 
     static int Rank(const char* name, const char* category, const char* desc, const char* term);
     // Default category ID for a freedesktop Categories= list, or "".

@@ -249,7 +249,7 @@ struct Builder {
         const DesktopRect& r = h.rect;
         const uint32_t app = h.target.index;
         const bool kb = m.KeyboardActive() && m.Section() == LauncherSection::List && m.Selected() == int(app);
-        const bool hover = Hover(r) && !m.MenuOpen();
+        const bool hover = Hover(r) && Hover(ChromeLauncherListClip(f)) && !m.MenuOpen();
         if (kb) { Rect(r, t.press, 6); Outline(r, t.hairline, 6); }
         else if (hover || (m.MenuOpen() && m.MenuApp() == int(app))) Rect(r, t.hover, 6);
         const int icon = LPx(s, LM::RowIcon), x = r.x + LPx(s, 8);
@@ -295,7 +295,7 @@ struct Builder {
 
     void ChipButton(const ChromeLauncherHit& h) {
         const DesktopRect& r = h.rect;
-        const bool hover = Hover(r) && !m.MenuOpen();
+        const bool hover = Hover(r) && Hover(ChromeLauncherListClip(f)) && !m.MenuOpen();
         if (hover) Rect(r, t.hover, 6);
         Outline(r, t.hairline, 6);
         const int tile = LPx(s, 22), x = r.x + LPx(s, 8);
@@ -337,14 +337,14 @@ struct Builder {
     }
 
     void Scrollbar() {
-        const uint32_t max = m.MaxScroll();
-        if (!max || f.list.w <= 0 || f.totalLines <= 0) return;
+        const uint32_t max = m.MaxScroll(), total = m.ContentHeight();
+        if (!max || f.list.w <= 0 || !total) return;
         const DesktopRect& l = f.list;
         const int track = l.h, w = LPx(s, 3);
-        const uint32_t visible = f.totalLines - max;
-        int thumb = int(int64_t(track) * visible / f.totalLines);
+        int thumb = int(int64_t(track) * (total - max) / total);
         if (thumb < LPx(s, 24)) thumb = LPx(s, 24);
-        const int y = l.y + int(int64_t(track - thumb) * f.firstLine / max);
+        const uint32_t at = f.scroll < max ? f.scroll : max;
+        const int y = l.y + int(int64_t(track - thumb) * at / max);
         dl.MaterialRect({Right(l) + LPx(s, 3), y, w, thumb}, Mat(t.ink3), w / 2);
     }
 
@@ -453,6 +453,8 @@ struct Builder {
         if (f.top.w > 0) TilesEmpty();
         dl.Fill(f.panel.x, f.mid.y, f.panel.w, 1, Mat(t.hairline));
         if (f.rail.w > 0) dl.Fill(Right(f.rail) - 1, f.mid.y, 1, f.mid.h, Mat(t.hairline));
+        // The scrolled list draws inside its rectangle only.
+        dl.Clip(ChromeLauncherListClip(f));
         for (uint32_t i = 0; i < f.lineCount; ++i) {
             const LauncherLine& line = f.lines[i];
             if (line.kind == LauncherLineKind::Heading) Heading(line, f.lineRects[i]);
@@ -461,11 +463,18 @@ struct Builder {
         for (uint32_t i = 0; i < f.targetCount; ++i) {
             const auto& h = f.targets[i];
             switch (h.target.kind) {
+            case TK::Row: Row(h); break;
+            case TK::Chip: ChipButton(h); break;
+            default: break;
+            }
+        }
+        dl.Unclip();
+        for (uint32_t i = 0; i < f.targetCount; ++i) {
+            const auto& h = f.targets[i];
+            switch (h.target.kind) {
             case TK::TopTab: TopTab(h); break;
             case TK::Tile: Tile(h); break;
             case TK::Rail: RailRow(h); break;
-            case TK::Row: Row(h); break;
-            case TK::Chip: ChipButton(h); break;
             default: break;
             }
         }
@@ -498,10 +507,10 @@ void ChromeLauncherFrameFor(const LauncherModel& m, const ChromeLauncherChrome& 
                           uint32_t screenW, uint32_t screenH, ChromeLauncherFrame& f) {
     f.panel = ChromeLauncherRect(s, screenW, screenH);
     f.search = f.top = f.mid = f.rail = f.list = f.footer = f.menu = {};
-    f.lineCount = f.firstLine = f.totalLines = f.tileCount = f.targetCount = 0;
+    f.lineCount = f.firstLine = f.totalLines = f.scroll = f.tileCount = f.targetCount = 0;
     const DesktopRect& p = f.panel;
     const int pad = LPx(s, LM::Pad);
-    f.viewport = {LPx(s, LM::Heading), LPx(s, LM::Row), LPx(s, LM::Chips), LPx(s, LM::Empty), 0};
+    f.viewport = {LPx(s, LM::Heading), LPx(s, LM::Row), LPx(s, LM::Chips), LPx(s, LM::Empty), 0, LPx(s, LM::ScrollStep)};
     if (p.w < 4 * pad || p.h < LPx(s, LM::Search) + LPx(s, LM::Footer) + 2 * pad) {
         f.targets[f.targetCount++] = {p, {TK::Panel, 0}};
         return;
@@ -552,17 +561,22 @@ void ChromeLauncherFrameFor(const LauncherModel& m, const ChromeLauncherChrome& 
         add(r, TK::Rail, row);
     }
 
-    // List lines from the scroll position while they fit.
+    // List lines that meet the list rectangle at the scroll offset; the
+    // builder clips the partly visible ones to it.
     LauncherLine all[LauncherLimits::Lines];
     f.totalLines = m.Lines(all, LauncherLimits::Lines);
-    f.firstLine = m.Scroll() < f.totalLines ? m.Scroll() : 0;
-    int ly = f.list.y;
+    f.scroll = m.Scroll();
+    f.firstLine = f.totalLines;
+    int ly = f.list.y - int(f.scroll);
     const int colGap = LPx(s, 4);
-    for (uint32_t i = f.firstLine; i < f.totalLines && f.lineCount < ChromeLauncherFrame::LineLimit; ++i) {
+    for (uint32_t i = 0; i < f.totalLines && f.lineCount < ChromeLauncherFrame::LineLimit; ++i) {
         const LauncherLine& line = all[i];
         const int h = line.kind == LauncherLineKind::Heading ? f.viewport.heading : line.kind == LauncherLineKind::Apps ? f.viewport.row
                     : line.kind == LauncherLineKind::Chips ? f.viewport.chips : f.viewport.empty;
-        if (ly + h > Bottom(f.list)) break;
+        const DesktopRect shown = ChromeLauncherListClip(f);
+        if (ly >= Bottom(shown)) break;
+        if (ly + h <= shown.y) { ly += h; continue; }
+        if (f.firstLine == f.totalLines) f.firstLine = i;
         const DesktopRect r{f.list.x, ly, f.list.w, h};
         f.lines[f.lineCount] = line;
         f.lineRects[f.lineCount++] = r;
@@ -643,8 +657,12 @@ void ChromeLauncherFrameFor(const LauncherModel& m, const ChromeLauncherChrome& 
 }
 
 LauncherTarget ChromeLauncherHitTest(const ChromeLauncherFrame& f, int32_t x, int32_t y) {
-    for (uint32_t i = 0; i < f.targetCount; ++i)
-        if (f.targets[i].rect.contains(x, y)) return f.targets[i].target;
+    for (uint32_t i = 0; i < f.targetCount; ++i) {
+        const ChromeLauncherHit& h = f.targets[i];
+        // List targets scroll: only their part inside the list is live.
+        if ((h.target.kind == TK::Row || h.target.kind == TK::Chip) && !ChromeLauncherListClip(f).contains(x, y)) continue;
+        if (h.rect.contains(x, y)) return h.target;
+    }
     return {TK::None, 0};
 }
 

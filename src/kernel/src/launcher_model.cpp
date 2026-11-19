@@ -90,7 +90,7 @@ private:
 void LauncherModel::Init() {
     appCount_ = keyCount_ = 0;
     layoutEpoch_ = 0;
-    viewport_ = {36, 48, 40, 96, 400};
+    viewport_ = {36, 48, 40, 96, 400, 20};
     menuItem_ = 0; menuX_ = menuY_ = 0;
     Open();
     ResetLayout();
@@ -609,13 +609,18 @@ int LauncherModel::LineHeight(const LauncherLine& line) const {
     return viewport_.row;
 }
 
-uint32_t LauncherModel::MaxScroll() const {
+uint32_t LauncherModel::ContentHeight() const {
     LauncherLine lines[LL::Lines];
     const uint32_t n = Lines(lines, LL::Lines);
     int used = 0;
-    uint32_t first = n;
-    while (first > 0 && used + LineHeight(lines[first - 1]) <= viewport_.height) used += LineHeight(lines[--first]);
-    return first;
+    for (uint32_t i = 0; i < n; ++i) used += LineHeight(lines[i]);
+    return used > 0 ? uint32_t(used) : 0;
+}
+
+uint32_t LauncherModel::MaxScroll() const {
+    const uint32_t total = ContentHeight();
+    const uint32_t page = viewport_.height > 0 ? uint32_t(viewport_.height) : 0;
+    return total > page ? total - page : 0;
 }
 
 void LauncherModel::ClampScroll() {
@@ -623,10 +628,10 @@ void LauncherModel::ClampScroll() {
     if (scroll_ > max) scroll_ = max;
 }
 
-bool LauncherModel::ScrollBy(int lines) {
+bool LauncherModel::ScrollBy(int pixels) {
     const uint32_t before = scroll_;
-    if (lines < 0) scroll_ = uint32_t(-lines) > scroll_ ? 0 : scroll_ - uint32_t(-lines);
-    else scroll_ += uint32_t(lines);
+    if (pixels < 0) scroll_ = uint32_t(-pixels) > scroll_ ? 0 : scroll_ - uint32_t(-pixels);
+    else scroll_ += uint32_t(pixels);
     ClampScroll();
     return scroll_ != before;
 }
@@ -647,15 +652,16 @@ void LauncherModel::EnsureVisible() {
     LauncherLine lines[LL::Lines];
     const uint32_t n = Lines(lines, LL::Lines);
     // Keep the section heading in view with its first row.
-    uint32_t top = uint32_t(line);
-    if (top > 0 && lines[top - 1].kind == LauncherLineKind::Heading) --top;
-    if (top < scroll_) scroll_ = top;
-    for (;;) {
-        int used = 0;
-        for (uint32_t i = scroll_; i <= uint32_t(line) && i < n; ++i) used += LineHeight(lines[i]);
-        if (used <= viewport_.height || scroll_ >= uint32_t(line)) break;
-        ++scroll_;
+    uint32_t first = uint32_t(line);
+    if (first > 0 && lines[first - 1].kind == LauncherLineKind::Heading) --first;
+    int top = 0, y = 0, bottom = 0;
+    for (uint32_t i = 0; i < n && i <= uint32_t(line); ++i) {
+        if (i == first) top = y;
+        y += LineHeight(lines[i]);
+        if (i == uint32_t(line)) bottom = y;
     }
+    if (bottom - int(scroll_) > viewport_.height) scroll_ = uint32_t(bottom - viewport_.height > 0 ? bottom - viewport_.height : 0);
+    if (top < int(scroll_)) scroll_ = uint32_t(top);
     ClampScroll();
 }
 

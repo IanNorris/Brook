@@ -274,10 +274,11 @@ void Launcher(const std::string& prefix, const ChromeStyle& s, uint32_t screenW,
                     m.Press(f.targets[i].target, true, r.x + r.w * 45 / 100, r.y + r.h * 6 / 10);
                     c.mouseX = f.targets[i].rect.x + 5; c.mouseY = f.targets[i].rect.y + 5;
                 } }},
-        // A category view, scrolled, with nothing pinned.
+        // A category view, scrolled part way into a row (the list clips it),
+        // with nothing pinned.
         {"launcher-category", [](LauncherModel& m, const ChromeLauncherFrame&, ChromeLauncherChrome&) {
             for (const char* key : {"brook-files", "terminal", "brook-settings", "firefox", "quake"}) m.TogglePin(m.FindApp(key));
-            m.Press({LauncherTargetKind::Rail, 0}, false, 0, 0); m.ScrollBy(3); }},
+            m.Press({LauncherTargetKind::Rail, 0}, false, 0, 0); m.ScrollTicks(-5); }},
         // The restart confirmation in the footer.
         {"launcher-prompt", [](LauncherModel&, const ChromeLauncherFrame&, ChromeLauncherChrome& c) {
             c.prompt = c.promptRestart = c.confirmFocused = true; }},

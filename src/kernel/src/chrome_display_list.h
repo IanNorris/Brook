@@ -54,6 +54,7 @@ enum class ChromeOp : uint8_t {
     Text,         // glyph run, source-over by coverage
     Icon,         // straight-alpha ARGB icon, source-over, scaled
     Squares,      // a run of equal rects stepping by (dx, dy): drawn strokes
+    Clip,         // later commands draw only inside (x, y, w, h); w or h 0: no clip
 };
 
 struct ChromeCmd {
@@ -97,6 +98,10 @@ public:
     void Squares(int x, int y, int w, int h, int dx, int dy, int count, uint32_t color) {
         if (count > 0) Push({ChromeOp::Squares, x, y, w, h, color, static_cast<uint32_t>(count), dx, dy, {}, nullptr});
     }
+    // Scissor for the commands that follow (until Unclip): a scrolled list
+    // draws its partly visible lines whole and lets the clip cut them.
+    void Clip(const DesktopRect& r) { Push({ChromeOp::Clip, r.x, r.y, r.w > 0 ? r.w : 0, r.h > 0 ? r.h : 0, 0, 0, 0, 0, {}, nullptr}); }
+    void Unclip() { Push({ChromeOp::Clip, 0, 0, 0, 0, 0, 0, 0, 0, {}, nullptr}); }
     void Icon(int x, int y, int size, const uint32_t* pixels, unsigned opacity = 255) {
         Push({ChromeOp::Icon, x, y, size, size, 0, opacity, 0, 0, {}, pixels});
     }
