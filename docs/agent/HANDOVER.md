@@ -95,6 +95,18 @@ _Last updated: 19 November 2026 (early), by a Claude Code session; see "19 Nov e
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**19 Nov night: Dell on gen 447 = `work/integration45` 7ffc16b0** (payload `dell-int45-20261119`, session `6cfbb9c3d02b4186be956f0b08f77249`). Contents: int44 (int43 + `work/dump-segments`) + `work/clearwater-s2` (1.5 capability, 2.1 metrics, 2.2 themes, 2.3 hues) + `work/vkrender-blur` (2.4, opt-in `BROOK_RENDER_BLUR=1`) + `work/cursor-dedupe` + `work/chromium-gpu-death` (exit teardown closes fds for SIGKILL and thread-fault deaths) + `work/hda-fault` (fault record, restart storm stopped, opt-in `/etc/dell-hda-fault-recovery`).
+- **Host tests:** 383 non-stress and 2 stress pass. QEMU check passes.
+- **Staged store apps** (tx `cw2apps1119`): Settings `k175fhfh…`, Files `8x2hyqvp…`, Message `i5p0n498…`.
+- **Verified on the Dell:**
+  - Health: zero-copy on, cadence on, no GPU failures, HDA healthy (0 faults), rx_depth 128, Glass inactive (Opaque stand-in, as expected without blur).
+  - **Chromium GPU-process kill:** relaunched in ~7 s; after a maximise/restore, configures were sent 7, acked 7, with a fresh commit. Before the fix the browser hung forever.
+- **Memory (gen 446 fresh vs gen 445 after session):** see backlog. Per-cycle GTK and Chromium open/close shows no growth; the first Chromium run retains ~330 MB of page cache.
+- **For Ian (UI):**
+  - check the 2.1 metrics at 200%: 80 px title bars, 96 px taskbar, bottom row and bottom-left corner hit taskbar buttons;
+  - Settings theme cards, mode and 13 hues; changes should apply live and survive a reboot;
+  - the hardware cursor (`gpu cursor on`), now deduped.
+
 **19 Nov evening: Ian away overnight; Claude is in control of the Dell (Ian: "I'll leave you in control of the Dell").**
 - **Priorities:** Clearwater first. Then the renewed launcher, taskbar, file manager and App Gallery (DECISIONS "Shell apps direction"). Ian considers the backlog large enough; no new big threads tonight.
 - **Dell state:** gen 445 (int43). HDA audio is quarantined after one stream fault until reboot. `~/.asoundrc` is now installed (Brook ALSA default → /dev/dsp). Steam's launcher entry has been restored in the idx.
