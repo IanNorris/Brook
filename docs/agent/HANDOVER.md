@@ -95,6 +95,10 @@ _Last updated: 19 November 2026 (early), by a Claude Code session; see "19 Nov e
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**19 Nov night: Dell on gen 455 = `work/integration52` e7cd6e06** (int51 + `work/glass-stale` 8b7aa052: live-renderer lease renewal plus blur-reason diagnostics; session `437a4a2c40ec42158368f7fbb718bfe2`).
+- **Glass glitch FIXED** (Ian scrolled Nautilus and Dolphin): backend_blur_changes 1, cpu_frames_over_renderer flat at 5 (startup), lease_live_renewals 74 → 2,635, presents.lease_gaps 0, gap_max 318 ms.
+- **Ready to merge:** Codex `work/wayland-latency` ee769aec (pair dell-wlstats, QEMU PASS). Fields: `latency.clients[]` with commit_to_callback_done, callback_done_to_next_commit, input_receive_to_queue.*, axis_burst_max_gap_us; `latency.toplevels[]`; reset by touching `/tmp/brook-waylandd-stats-reset`.
+
 **Clearwater launcher and taskbar (Ian, 19 Nov):** Claude agent on `work/launcher` (from int51).
 - **Launcher:** freestanding model and builder for stage 3; search, Pinned, Recent, All apps, keyboard navigation, pin/unpin; Glass and Opaque.
 - **Launcher footer:** no keyboard hints and no Organise button.
