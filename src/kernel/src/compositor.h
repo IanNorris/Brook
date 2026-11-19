@@ -147,7 +147,11 @@ struct CompositorIdleStats {
     uint64_t cpuOverlayDraws;     // CPU-path taskbar/launcher draws
     uint64_t cpuOverlaySkips;     // skipped: a renderer holds the present lease
     uint64_t overlayRenders;      // renderer overlay capture renders
-    uint64_t overlayBumps;        // of which changed the overlay generation
+    uint64_t overlayBumps;        // overlay generation changes (keys, rectangles or kinds)
+    uint64_t overlaySurfaceDraws; // shell surfaces rasterised by overlay captures
+    uint64_t overlaySurfaceKeeps; // unchanged surfaces a capture kept (no raster)
+    uint64_t overlayKeyChecks;    // key-only change checks (no raster)
+    uint64_t cpuSceneSkips;       // loops that skipped the CPU scene raster under a lease
     uint64_t leaseActiveLoops;    // loops while a renderer held the lease
 };
 CompositorIdleStats CompositorReadIdleStats(bool reset);

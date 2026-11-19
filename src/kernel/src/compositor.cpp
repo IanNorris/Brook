@@ -32,6 +32,7 @@
 #include "mouse.h"
 #include "window.h"
 #include "desktop_shell_surfaces.h"
+#include "desktop_overlay_surfaces.h"
 #include "debug_ui.h"
 #include "shutdown.h"
 #include "terminal.h"
@@ -394,25 +395,26 @@ static VirtualAddress g_debugFrameBuffer{};
 static uint64_t g_debugFramePages;
 // One blocked op-7 waiter (referenced), woken when its capture leaves Pending.
 static Process* g_debugFrameWaiter;
-// Overlay content generation, pointer excluded: bumped whenever the hash of
-// the rendered overlay rectangles (pixels plus geometry) changes. Writers hold
-// g_debugFrameLock; readers load it atomically.
+// Overlay content generation, pointer excluded: bumped whenever the shell
+// surfaces' kinds, rectangles or content keys change (stage 1.4: keys, not a
+// pixel hash). Writers hold g_debugFrameLock; readers load it atomically.
 static uint64_t g_overlayGeneration=1;
-static uint64_t g_overlayHash;
-static bool g_overlayHashValid;
+static DesktopOverlaySurfaceSlot g_overlaySignature[DESKTOP_OVERLAY_SURFACE_LIMIT];
+static uint32_t g_overlaySignatureCount;
+static bool g_overlaySignatureValid;
 // Last op-6 query; change detection runs only while a renderer is polling.
 static uint64_t g_overlayQueryTick;
 static constexpr uint64_t OVERLAY_SUBSCRIPTION_MS=3000,OVERLAY_RECHECK_MS=100;
 static uint64_t g_overlayCheckTick,g_overlayCheckInput;
 static int32_t g_overlayCheckX=-1,g_overlayCheckY=-1;
 static bool g_overlayChecked;
-// g_debugFrameBuffer is all zero outside these rectangles while its address
-// and geometry match (a full debug screenshot invalidates this), so overlay
-// captures clear only what was drawn before and full-image reads stay exact.
+// While its address and geometry match (a full debug screenshot invalidates
+// this), g_debugFrameBuffer holds exactly the cached shell surfaces on zero,
+// so overlay captures redraw only changed surfaces and full-image reads stay
+// exact.
 static uint64_t g_debugFrameCleanAddress;
 static uint32_t g_debugFrameCleanWidth,g_debugFrameCleanHeight;
-static DesktopOverlayRect g_debugFrameDirty[4];
-static uint32_t g_debugFrameDirtyCount;
+static DesktopOverlaySurfaceCache g_overlaySurfaceCache;
 static constexpr uint64_t DEBUG_FRAME_LEASE_MS=30000;
 
 static void ExpireDebugFrameLocked()
@@ -1890,46 +1892,61 @@ static uint32_t* OverlayBufferPrepare(uint32_t width,uint32_t height)
     if(g_debugFrameCleanAddress!=g_debugFrameBuffer.raw() || g_debugFrameCleanWidth!=width || g_debugFrameCleanHeight!=height){
         __builtin_memset(pixels,0,bytes);
         g_debugFrameCleanAddress=g_debugFrameBuffer.raw();g_debugFrameCleanWidth=width;g_debugFrameCleanHeight=height;
-    }else for(uint32_t i=0;i<g_debugFrameDirtyCount;++i){
-        const auto& r=g_debugFrameDirty[i];
-        const int64_t left=r.x<0?0:r.x,top=r.y<0?0:r.y;
-        const int64_t right=int64_t(r.x)+r.width>width?width:int64_t(r.x)+r.width;
-        const int64_t bottom=int64_t(r.y)+r.height>height?height:int64_t(r.y)+r.height;
-        if(right<=left || bottom<=top)continue;
-        for(int64_t row=top;row<bottom;++row)
-            __builtin_memset(pixels+uint64_t(row)*width+left,0,size_t(right-left)*4);
+        g_overlaySurfaceCache={};g_overlaySurfaceCache.valid=true;
     }
-    g_debugFrameDirtyCount=0;
     return pixels;
 }
 
-static uint64_t OverlayHashRects(const uint32_t* pixels,uint32_t width,uint32_t height,
-                                 const DesktopOverlayRect* rects,uint32_t count)
+static void OverlayZeroRect(uint32_t* pixels,uint32_t width,uint32_t height,const DesktopOverlayRect& r)
 {
-    constexpr uint64_t prime=0x100000001b3ull;
-    uint64_t h=0xcbf29ce484222325ull^(uint64_t(width)<<32|height);
-    for(uint32_t i=0;i<count;++i){
-        const auto& r=rects[i];
-        h=(h^(uint64_t(uint32_t(r.x))<<32|uint32_t(r.y)))*prime;
-        h=(h^(uint64_t(r.width)<<32|r.height))*prime;
-        const int64_t left=r.x<0?0:r.x,top=r.y<0?0:r.y;
-        const int64_t right=int64_t(r.x)+r.width>width?width:int64_t(r.x)+r.width;
-        const int64_t bottom=int64_t(r.y)+r.height>height?height:int64_t(r.y)+r.height;
-        for(int64_t row=top;row<bottom;++row){
-            const uint32_t* line=pixels+uint64_t(row)*width;int64_t col=left;
-            for(;col+1<right;col+=2){uint64_t pair;__builtin_memcpy(&pair,line+col,8);h=(h^pair)*prime;}
-            if(col<right)h=(h^line[col])*prime;
-        }
-    }
-    return h;
+    const int64_t left=r.x<0?0:r.x,top=r.y<0?0:r.y;
+    const int64_t right=int64_t(r.x)+r.width>width?width:int64_t(r.x)+r.width;
+    const int64_t bottom=int64_t(r.y)+r.height>height?height:int64_t(r.y)+r.height;
+    if(right<=left || bottom<=top)return;
+    for(int64_t row=top;row<bottom;++row)
+        __builtin_memset(pixels+uint64_t(row)*width+left,0,size_t(right-left)*4);
 }
 
-// Draw the taskbar, launcher and boot summary (never the pointer), then fold
-// their hash into the content generation. Returns the rectangle count.
-static uint32_t RenderDesktopOverlay(uint32_t* pixels,uint32_t width,uint32_t height,uint64_t now,
-                                     int32_t mouseX,int32_t mouseY,DesktopOverlayRect* rects)
+// The shell surfaces with their content keys, back to front (no raster).
+static uint32_t OverlaySurfaceSlots(uint32_t width,uint32_t height,uint64_t now,int32_t mouseX,int32_t mouseY,
+                                    WmShellSurface (&surfaces)[WM_SHELL_SURFACE_LIMIT],
+                                    DesktopOverlaySurfaceSlot (&slots)[DESKTOP_OVERLAY_SURFACE_LIMIT])
 {
-    uint32_t rectCount=0;
+    static_assert(WM_SHELL_SURFACE_LIMIT<=DESKTOP_OVERLAY_SURFACE_LIMIT,"overlay surface budget");
+    const uint32_t count=WmShellSurfaces(width,height,mouseX,mouseY,surfaces);
+    for(uint32_t i=0;i<count;++i){const auto& s=surfaces[i];
+        slots[i]={uint32_t(s.kind),{s.x,s.y,s.w,s.h},WmShellSurfaceKey(s,width,height,now,mouseX,mouseY)};}
+    return count;
+}
+
+// Bump the content generation when the surfaces differ from the last ones
+// seen (kind, rectangle or key). Caller holds g_debugFrameLock.
+static void OverlayNoteSignature(const DesktopOverlaySurfaceSlot* slots,uint32_t count)
+{
+    bool same=g_overlaySignatureValid && count==g_overlaySignatureCount;
+    for(uint32_t i=0;i<count && same;++i)same=DesktopOverlaySlotEqual(slots[i],g_overlaySignature[i]);
+    if(same)return;
+    ++g_idleStats.overlayBumps;
+    for(uint32_t i=0;i<count;++i)g_overlaySignature[i]=slots[i];
+    g_overlaySignatureCount=count;g_overlaySignatureValid=true;
+    __atomic_add_fetch(&g_overlayGeneration,1,__ATOMIC_ACQ_REL);
+}
+
+// Bring the taskbar, launcher and boot summary (never the pointer) in pixels
+// up to date, rasterising only surfaces whose key or rectangle changed (and
+// whatever shares pixels with them), then fold their keys into the content
+// generation. Returns the rectangle count; keys[i] is rects[i]'s key.
+static uint32_t RenderDesktopOverlay(uint32_t* pixels,uint32_t width,uint32_t height,uint64_t now,
+                                     int32_t mouseX,int32_t mouseY,DesktopOverlayRect* rects,uint64_t* keys)
+{
+    // At most three shell surfaces, so the four-rectangle budget (plus the
+    // optional cursor appended by CaptureDesktopOverlay) holds.
+    WmShellSurface surfaces[WM_SHELL_SURFACE_LIMIT];
+    DesktopOverlaySurfaceSlot slots[DESKTOP_OVERLAY_SURFACE_LIMIT]{};
+    const uint32_t count=OverlaySurfaceSlots(width,height,now,mouseX,mouseY,surfaces,slots);
+    const auto plan=DesktopOverlayPlanSurfaces(g_overlaySurfaceCache,slots,count);
+    if(plan.wipe)__builtin_memset(pixels,0,uint64_t(width)*height*4);
+    for(uint32_t i=0;i<plan.clearCount;++i)OverlayZeroRect(pixels,width,height,plan.clears[i]);
     auto opaque=[&](int32_t x,int32_t y,uint32_t w,uint32_t h){
         int64_t left=x,top=y,right=left+w,bottom=top+h;
         if(left<0)left=0;if(top<0)top=0;
@@ -1937,25 +1954,18 @@ static uint32_t RenderDesktopOverlay(uint32_t* pixels,uint32_t width,uint32_t he
         for(int64_t row=top;row<bottom;++row)for(int64_t col=left;col<right;++col)
             pixels[uint64_t(row)*width+col]|=0xff000000u;
     };
-    // At most three shell surfaces, so the four-rectangle budget (plus the
-    // optional cursor appended by CaptureDesktopOverlay) holds.
-    WmShellSurface surfaces[WM_SHELL_SURFACE_LIMIT];
-    const uint32_t surfaceCount=WmShellSurfaces(width,height,mouseX,mouseY,surfaces);
-    for(uint32_t i=0;i<surfaceCount;++i){
+    for(uint32_t i=0;i<count;++i){
         const auto& s=surfaces[i];
-        WmRenderShellSurface(s,pixels,width,width,height,now,mouseX,mouseY);opaque(s.x,s.y,s.w,s.h);
-        rects[rectCount++]={s.x,s.y,s.w,s.h};
+        if(plan.draw>>i&1u){
+            WmRenderShellSurface(s,pixels,width,width,height,now,mouseX,mouseY);opaque(s.x,s.y,s.w,s.h);
+            ++g_idleStats.overlaySurfaceDraws;
+        }else ++g_idleStats.overlaySurfaceKeeps;
+        rects[i]={s.x,s.y,s.w,s.h};keys[i]=slots[i].key;
     }
-    for(uint32_t i=0;i<rectCount;++i)g_debugFrameDirty[i]=rects[i];
-    g_debugFrameDirtyCount=rectCount;
-    const uint64_t hash=OverlayHashRects(pixels,width,height,rects,rectCount);
+    DesktopOverlayCommitSurfaces(g_overlaySurfaceCache,slots,count);
     ++g_idleStats.overlayRenders;
-    if(!g_overlayHashValid || hash!=g_overlayHash){
-        ++g_idleStats.overlayBumps;
-        g_overlayHash=hash;g_overlayHashValid=true;
-        __atomic_add_fetch(&g_overlayGeneration,1,__ATOMIC_ACQ_REL);
-    }
-    return rectCount;
+    OverlayNoteSignature(slots,count);
+    return count;
 }
 
 uint64_t CompositorOverlayGeneration()
@@ -1965,29 +1975,31 @@ uint64_t CompositorOverlayGeneration()
     return __atomic_load_n(&g_overlayGeneration,__ATOMIC_ACQUIRE);
 }
 
-// Compositor thread: while a renderer polls op 6, re-render the overlay when
+// Compositor thread: while a renderer polls op 6, re-key the overlay when
 // input arrived or the pointer moved (hover), and at least every 100 ms
 // (clock, network, animations, launcher), so the generation tracks content.
-// Skipped while any lease holds the shared buffer; retried next loop.
+// Keys come from the surfaces' display lists: nothing is rasterised or
+// hashed pixel by pixel here, and the shared buffer is not touched.
 static void CheckDesktopOverlay(uint64_t now,int32_t mouseX,int32_t mouseY)
 {
     const uint64_t queried=__atomic_load_n(&g_overlayQueryTick,__ATOMIC_ACQUIRE);
     if(!queried || now<queried || now-queried>OVERLAY_SUBSCRIPTION_MS)return;
     // Input to a pointer-capturing client (a game) cannot change hover, so it
-    // does not trigger re-rendering; the periodic check still covers shortcuts.
+    // does not trigger re-keying; the periodic check still covers shortcuts.
     const uint64_t input=InputLatestSequence();
     const bool inputChanged=input!=g_overlayCheckInput && !WmPointerCaptureActive();
     if(g_overlayChecked && !inputChanged && mouseX==g_overlayCheckX && mouseY==g_overlayCheckY &&
        now>=g_overlayCheckTick && now-g_overlayCheckTick<OVERLAY_RECHECK_MS)return;
-    CompositorMutexGuard capture(&g_debugFrameLock);
-    ExpireDebugFrameLocked();
-    if(g_debugFrame.token)return;
-    CompositorMutexGuard geometry(&g_scanoutMappingLock);
     const uint32_t width=g_physFbWidth,height=g_physFbHeight;
     if(!g_physFb || !width || !height || width>4096 || height>2160 || CompositorGlassActive())return;
-    uint32_t* pixels=OverlayBufferPrepare(width,height);if(!pixels)return;
-    DesktopOverlayRect rects[4]{};
-    (void)RenderDesktopOverlay(pixels,width,height,now,mouseX,mouseY,rects);
+    WmShellSurface surfaces[WM_SHELL_SURFACE_LIMIT];
+    DesktopOverlaySurfaceSlot slots[DESKTOP_OVERLAY_SURFACE_LIMIT]{};
+    const uint32_t count=OverlaySurfaceSlots(width,height,now,mouseX,mouseY,surfaces,slots);
+    ++g_idleStats.overlayKeyChecks;
+    {
+        CompositorMutexGuard capture(&g_debugFrameLock);
+        OverlayNoteSignature(slots,count);
+    }
     g_overlayChecked=true;g_overlayCheckTick=now;g_overlayCheckInput=input;g_overlayCheckX=mouseX;g_overlayCheckY=mouseY;
 }
 
@@ -2041,8 +2053,8 @@ static void CaptureDesktopOverlay(uint64_t now,int32_t mouseX,int32_t mouseY,boo
     const uint32_t width=g_physFbWidth,height=g_physFbHeight;
     if(!g_physFb || !width || !height || width>4096 || height>2160 || CompositorGlassActive())return;
     uint32_t* pixels=OverlayBufferPrepare(width,height);if(!pixels)return;
-    DesktopOverlayRect rects[4]{};
-    uint32_t rectCount=RenderDesktopOverlay(pixels,width,height,now,mouseX,mouseY,rects);
+    DesktopOverlayRect rects[4]{};uint64_t keys[4]{};
+    uint32_t rectCount=RenderDesktopOverlay(pixels,width,height,now,mouseX,mouseY,rects,keys);
     // RenderDesktopOverlay sets alpha 255 across every surface rectangle it
     // returns (the overlay is never captured under glass), so each is opaque;
     // a composited pointer rectangle appended below is not.
@@ -2058,8 +2070,11 @@ static void CaptureDesktopOverlay(uint64_t now,int32_t mouseX,int32_t mouseY,boo
         const int64_t cursorBottom=top+(g_cursorFrame.height<CURSOR_MAX?g_cursorFrame.height:CURSOR_MAX);
         if(clippedLeft<int64_t(width) && clippedTop<int64_t(height) && cursorRight>clippedLeft && cursorBottom>clippedTop){
             const int64_t right=cursorRight>width?width:cursorRight,bottom=cursorBottom>height?height:cursorBottom;
+            keys[rectCount]=0; // unkeyed: its bands hash their pixels
             rects[rectCount++]={int32_t(clippedLeft),int32_t(clippedTop),uint32_t(right-clippedLeft),uint32_t(bottom-clippedTop)};
-            g_debugFrameDirty[g_debugFrameDirtyCount++]=rects[rectCount-1];
+            // The pointer is blended over the cached surfaces: clear it and
+            // redraw what lies under it next time.
+            DesktopOverlayAddForeign(g_overlaySurfaceCache,rects[rectCount-1]);
         }
         for(uint32_t row=0;row<g_cursorFrame.height && row<CURSOR_MAX;++row){
             const int64_t py=top+row;if(py<0 || py>=height)continue;
@@ -2078,7 +2093,7 @@ static void CaptureDesktopOverlay(uint64_t now,int32_t mouseX,int32_t mouseY,boo
         }
     }
     if(!DesktopOverlayMakeBands(width,height,rects,rectCount,g_debugOverlayBands,opaqueRects))return;
-    DesktopOverlayKeyBands(pixels,width,height,g_debugOverlayBands);
+    DesktopOverlayKeyBandsFromRects(pixels,width,height,g_debugOverlayBands,rects,keys,rectCount);
     g_debugFrame.width=width;g_debugFrame.height=height;g_debugFrame.stride=width;
     g_debugFrame.address=g_debugFrameBuffer.raw();g_debugFrame.tick=now;
     g_debugFrame.epoch=__atomic_load_n(&g_compositorEpoch,__ATOMIC_ACQUIRE);

@@ -278,15 +278,23 @@ bool WmVolumeToggleMuteAt(int32_t mx, int32_t my, uint32_t screenW, uint32_t scr
     return true;
 }
 
-void WmVolumePopupRender(uint32_t* pixels, uint32_t stride, uint32_t screenW, uint32_t screenH,
-                         int32_t mouseX, int32_t mouseY)
+// Shell painters build their list, then either execute it (key == nullptr)
+// or return its content key seeded with keySeed (WmShellSurfaceKey).
+static void WmVolumePopupSurface(uint32_t* pixels, uint32_t stride, uint32_t screenW, uint32_t screenH,
+                                 int32_t mouseX, int32_t mouseY, uint64_t keySeed, uint64_t* key)
 {
-    if (!g_volumePopupOpen || !pixels) return;
+    if (!g_volumePopupOpen || (!pixels && !key)) return;
     const ChromeVolumePopupModel model{WmVolumePopupLayout(screenW, screenH), g_volumeControl, g_volumeAvailable,
                                        g_volumeDragging, mouseX, mouseY};
     ChromeDisplayList list = ChromeListOn(g_shellListStorage);
     ChromeBuildVolumePopup(model, WmChromeStyle(), list);
-    ChromeExecute(list, {pixels, stride, screenW, screenH}, WmDesktopFont());
+    if (key) *key = ChromeListKey(list, keySeed);
+    else ChromeExecute(list, {pixels, stride, screenW, screenH}, WmDesktopFont());
+}
+void WmVolumePopupRender(uint32_t* pixels, uint32_t stride, uint32_t screenW, uint32_t screenH,
+                         int32_t mouseX, int32_t mouseY)
+{
+    WmVolumePopupSurface(pixels, stride, screenW, screenH, mouseX, mouseY, 0, nullptr);
 }
 
 // Taskbar model: per-button icons and hover labels, tray state and the
@@ -297,11 +305,11 @@ static char g_taskbarLaunchLabels[LaunchFeedbackTable::Capacity][80];
 static ChromeTaskbarButton g_taskbarButtons[ChromeTaskbarButtonLimit];
 static TaskbarLayout g_taskbarLayout;
 
-void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
-                     uint32_t screenW, uint32_t screenH,
-                     uint64_t uptimeMs, int32_t mouseX, int32_t mouseY)
+static void WmTaskbarSurface(uint32_t* backBuffer, uint32_t stride,
+                             uint32_t screenW, uint32_t screenH,
+                             uint64_t uptimeMs, int32_t mouseX, int32_t mouseY, uint64_t keySeed, uint64_t* key)
 {
-    if (!g_wmActive || !backBuffer) return;
+    if (!g_wmActive || (!backBuffer && !key)) return;
     LauncherReadGuard icons;
     TaskbarLayout& l = g_taskbarLayout;
     l = GetTaskbarLayout(screenW, screenH);
@@ -353,7 +361,14 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
     model.mouseX = mouseX; model.mouseY = mouseY;
     ChromeDisplayList list = ChromeListOn(g_shellListStorage);
     ChromeBuildTaskbar(model, WmChromeStyle(), list);
-    ChromeExecute(list, {backBuffer, stride, screenW, screenH}, WmDesktopFont());
+    if (key) *key = ChromeListKey(list, keySeed);
+    else ChromeExecute(list, {backBuffer, stride, screenW, screenH}, WmDesktopFont());
+}
+void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
+                     uint32_t screenW, uint32_t screenH,
+                     uint64_t uptimeMs, int32_t mouseX, int32_t mouseY)
+{
+    WmTaskbarSurface(backBuffer, stride, screenW, screenH, uptimeMs, mouseX, mouseY, 0, nullptr);
 }
 
 // Volume and network tooltips float in a small panel just above the
@@ -407,15 +422,21 @@ bool WmTrayTooltipGetRect(uint32_t screenW, uint32_t screenH, int32_t mx, int32_
     return true;
 }
 
-void WmTrayTooltipRender(uint32_t* pixels, uint32_t stride, uint32_t screenW, uint32_t screenH,
-                         int32_t mx, int32_t my)
+static void WmTrayTooltipSurface(uint32_t* pixels, uint32_t stride, uint32_t screenW, uint32_t screenH,
+                                 int32_t mx, int32_t my, uint64_t keySeed, uint64_t* key)
 {
     char text[48]{};
     DesktopRect p{};
-    if (!pixels || !WmTrayTooltip(screenW, screenH, mx, my, text, p)) return;
+    if ((!pixels && !key) || !WmTrayTooltip(screenW, screenH, mx, my, text, p)) return;
     ChromeDisplayList list = ChromeListOn(g_shellListStorage);
     ChromeBuildTooltip({p, text}, WmChromeStyle(), list);
-    ChromeExecute(list, {pixels, stride, screenW, screenH}, WmDesktopFont());
+    if (key) *key = ChromeListKey(list, keySeed);
+    else ChromeExecute(list, {pixels, stride, screenW, screenH}, WmDesktopFont());
+}
+void WmTrayTooltipRender(uint32_t* pixels, uint32_t stride, uint32_t screenW, uint32_t screenH,
+                         int32_t mx, int32_t my)
+{
+    WmTrayTooltipSurface(pixels, stride, screenW, screenH, mx, my, 0, nullptr);
 }
 
 int WmTaskbarHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)

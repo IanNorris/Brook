@@ -47,6 +47,13 @@ inline uint32_t WmShellSurfaces(uint32_t screenW, uint32_t screenH, int32_t mx, 
     return count;
 }
 
+// Content key of the surface as it would render now: equal keys mean
+// identical pixels when rasterised onto a cleared buffer. Builds the
+// surface's display list without executing it (window.cpp; compositor
+// thread only). 0: the surface draws nothing.
+uint64_t WmShellSurfaceKey(const WmShellSurface& surface, uint32_t screenW, uint32_t screenH,
+                           uint64_t uptimeMs, int32_t mx, int32_t my);
+
 // Rasterise one surface with the WM's CPU painters into a full-screen buffer.
 inline void WmRenderShellSurface(const WmShellSurface& surface, uint32_t* pixels, uint32_t stride,
                                  uint32_t screenW, uint32_t screenH, uint64_t uptimeMs,

@@ -42,6 +42,7 @@
 #include "chrome_layout.h"
 #include "chrome_frame.h"
 #include "chrome_shell.h"
+#include "desktop_shell_surfaces.h"
 #include "input.h"
 #include "mouse.h"
 #include "serial.h"
@@ -2284,6 +2285,34 @@ bool WmLauncherVisible()
 }
 
 #include "wm_shell_launcher.inc"
+
+// Content key of one shell surface as it would render now (stage 1.4): its
+// display list hashed with what the list does not carry. Compositor thread
+// only (shares the shell list storage). 0: the surface draws nothing.
+uint64_t WmShellSurfaceKey(const WmShellSurface& s, uint32_t screenW, uint32_t screenH,
+                           uint64_t uptimeMs, int32_t mx, int32_t my)
+{
+    const FontAtlas& font = WmDesktopFont();
+    constexpr uint64_t prime = 0x100000001b3ull;
+    uint64_t seed = 0x6b65792d7368656cull;
+    auto word = [&](uint64_t v) { seed = (seed ^ v) * prime; };
+    word(uint64_t(s.kind) << 32 | uint32_t(s.material));
+    word(uint64_t(uint32_t(s.x)) << 32 | uint32_t(s.y));
+    word(uint64_t(s.w) << 32 | s.h);
+    word(uint64_t(screenW) << 32 | screenH);
+    word(reinterpret_cast<uintptr_t>(&font));
+    word(uint64_t(uint32_t(font.lineHeight)) << 32 | uint32_t(font.glyphCount));
+    word(uint64_t(CompositorGlassActive()) << 32 | CompositorMaterialOpacity());
+    uint64_t key = 0;
+    switch (s.kind) {
+    case WmShellSurfaceKind::Taskbar: WmTaskbarSurface(nullptr, 0, screenW, screenH, uptimeMs, mx, my, seed, &key); break;
+    case WmShellSurfaceKind::Launcher: WmLauncherSurface(nullptr, 0, screenW, screenH, mx, my, seed, &key); break;
+    case WmShellSurfaceKind::VolumePopup: WmVolumePopupSurface(nullptr, 0, screenW, screenH, mx, my, seed, &key); break;
+    case WmShellSurfaceKind::TrayTooltip: WmTrayTooltipSurface(nullptr, 0, screenW, screenH, mx, my, seed, &key); break;
+    case WmShellSurfaceKind::BootSummary: WmBootSummarySurface(nullptr, 0, screenW, screenH, seed, &key); break;
+    }
+    return key;
+}
 
 static int AdmitLauncherItem(const LauncherSnapshot& catalog,int itemIdx,bool tracked,
                              uint64_t* token,bool* coalesced)

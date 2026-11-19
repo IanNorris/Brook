@@ -53,6 +53,7 @@ void WriteFile(const std::string& path, const std::vector<uint8_t>& data) {
     std::fclose(f);
 }
 
+std::map<uint64_t, uint64_t> listKeys; // display list key -> pixel hash
 uint64_t Fnv(const uint32_t* pixels, size_t n) {
     uint64_t h = 1469598103934665603ull;
     for (size_t i = 0; i < n; ++i)
@@ -70,6 +71,19 @@ void Check(const std::string& name, const ChromeDisplayList& list, const ChromeS
     std::vector<uint32_t> pixels(static_cast<size_t>(w) * h, 0x00303030u);
     ChromeTarget target{pixels.data(), static_cast<uint32_t>(w), static_cast<uint32_t>(w), static_cast<uint32_t>(h), ox, oy};
     ChromeExecute(list, target, style.Font());
+    // Content keys (stage 1.4): equal keys must mean equal pixels. The kernel
+    // seeds the key with the font and the surface rectangle, as here.
+    {
+        const uint64_t seed = reinterpret_cast<uintptr_t>(&style.Font()) ^ (uint64_t(uint32_t(ox)) << 32 | uint32_t(oy)) ^
+                              (uint64_t(uint32_t(w)) << 48) ^ (uint64_t(uint32_t(h)) << 16);
+        const uint64_t key = ChromeListKey(list, seed), pixelsKey = Fnv(pixels.data(), pixels.size());
+        if (!key || ChromeListKey(list, seed) != key) { std::fprintf(stderr, "%s: unstable or zero key\n", name.c_str()); ++failures; }
+        const auto seen = listKeys.find(key);
+        if (seen != listKeys.end() && seen->second != pixelsKey) {
+            std::fprintf(stderr, "%s: content key collides with an image of different pixels\n", name.c_str()); ++failures;
+        }
+        listKeys[key] = pixelsKey;
+    }
     const std::vector<uint8_t> png = chrome_png::EncodeRgb(pixels.data(), w, h);
     char hash[32];
     std::snprintf(hash, sizeof(hash), "%016llx", static_cast<unsigned long long>(Fnv(pixels.data(), pixels.size())));

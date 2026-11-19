@@ -6920,7 +6920,9 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",");r.field("shadow_invalidations",s.shadowInvalidations);r.text(",");r.field("shadow_unavailable",s.shadowUnavailable);
         r.text(",");r.field("cpu_overlay_draws",s.cpuOverlayDraws);r.text(",");r.field("cpu_overlay_skips",s.cpuOverlaySkips);
         r.text(",");r.field("overlay_renders",s.overlayRenders);r.text(",");r.field("overlay_bumps",s.overlayBumps);
-        r.text(",\"scope\":\"cumulative since boot or reset; loops=compositor frames (wakes); software flips copy back buffer rows to the firmware framebuffer, skipping rows equal to the cached shadow; cpu_overlay_* = CPU-path taskbar/popup draws vs skips while a renderer holds the present lease; overlay_* = renderer overlay capture renders and generation bumps\"}\n");r.send();
+        r.text(",");r.field("overlay_surface_draws",s.overlaySurfaceDraws);r.text(",");r.field("overlay_surface_keeps",s.overlaySurfaceKeeps);
+        r.text(",");r.field("overlay_key_checks",s.overlayKeyChecks);r.text(",");r.field("cpu_scene_skips",s.cpuSceneSkips);
+        r.text(",\"scope\":\"cumulative since boot or reset; loops=compositor frames (wakes); software flips copy back buffer rows to the firmware framebuffer, skipping rows equal to the cached shadow; cpu_overlay_* = CPU-path taskbar/popup draws vs skips while a renderer holds the present lease; overlay_* = renderer overlay captures, generation bumps, shell surfaces rasterised vs kept by key, key-only checks; cpu_scene_skips = loops without CPU window/chrome raster under a lease\"}\n");r.send();
     }
     else if(NetStrEq(cmd,"desktop chrome status") || NetStrEq(cmd,"desktop chrome reset")) {
         auto& g=g_chromeCaptureStats;

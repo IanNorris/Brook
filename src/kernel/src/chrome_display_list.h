@@ -102,6 +102,44 @@ inline ChromeDisplayList ChromeListOn(ChromeListStorage<Commands, TextBytes>& st
     return ChromeDisplayList(storage.cmds, Commands, storage.text, TextBytes);
 }
 
+// Content key of a list (compositor refactor stage 1.4): a nonzero FNV-1a
+// hash of every command, the text it draws and the colours and icon pixels it
+// borrows. Executed by the same executor with the same font onto the same
+// (cleared) target, two lists with equal keys produce identical pixels, so a
+// surface whose key is unchanged need not be rasterised again. seed folds in
+// what the list does not carry: the surface kind and rectangle, the target
+// size and the font.
+inline uint64_t ChromeListKey(const ChromeDisplayList& list, uint64_t seed) {
+    constexpr uint64_t prime = 0x100000001b3ull;
+    uint64_t h = 0xcbf29ce484222325ull ^ seed;
+    auto word = [&](uint64_t v) { h = (h ^ v) * prime; };
+    auto pair = [&](int32_t a, int32_t b) { word(uint64_t(uint32_t(a)) << 32 | uint32_t(b)); };
+    for (uint32_t i = 0; i < list.Count(); ++i) {
+        const ChromeCmd& c = list.At(i);
+        word(uint64_t(c.op) << 32 | c.color);
+        pair(c.x, c.y); pair(c.w, c.h); pair(c.dx, c.dy);
+        pair(c.clip.x, c.clip.y); pair(c.clip.w, c.clip.h);
+        if (c.op == ChromeOp::Text) {
+            // The arena offset depends on earlier texts; hash the string.
+            const char* text = list.TextAt(c.arg);
+            uint32_t n = 0;
+            for (; text[n]; ++n) word(uint8_t(text[n]));
+            word(n);
+        } else word(c.arg);
+        if (c.op == ChromeOp::Rows && c.data) {
+            const uint32_t* rows = static_cast<const uint32_t*>(c.data);
+            for (int32_t r = 0; r < c.h; ++r) word(rows[r]);
+        } else if (c.op == ChromeOp::Icon) {
+            // Icons are 24x24 straight-alpha sources (LAUNCHER_ICON_PX).
+            const uint32_t* icon = static_cast<const uint32_t*>(c.data);
+            word(icon != nullptr);
+            if (icon) for (uint32_t p = 0; p < 24 * 24; p += 2) word(uint64_t(icon[p]) << 32 | icon[p + 1]);
+        }
+    }
+    word(list.Count()); word(list.Overflowed());
+    return h ? h : 1;
+}
+
 // Budgets: DESIGN.md allows 64 primitives per window frame.
 using ChromeFrameStorage = ChromeListStorage<64, 128>;
 using ChromeShellStorage = ChromeListStorage<1536, 4096>;
