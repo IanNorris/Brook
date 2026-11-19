@@ -5,7 +5,8 @@
  * (i915 GEM). A scripted scenario changes the desktop between frames; after
  * every present the fake screen must equal an independent CPU composition
  * (composite.comp semantics) of the state that frame captured. Not run by
- * the nix build (no GPU there).
+ * the nix build (no GPU there). The --client-scanout-qa protocol test
+ * below uses fake status, software fences and the real socket channel.
  *
  * The fake handoff follows the kernel's admission rules
  * (intel_bdw_prepare.cpp, desktop_frame_scenes.h): a plain reservation made
@@ -42,6 +43,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -52,13 +54,16 @@
 #include <unistd.h>
 long fake_syscall(long number,...);
 int fake_open(const char *path,int flags,...);
+int fake_ioctl(int fd,unsigned long request,...);
 #define main renderer_main
 #define syscall fake_syscall
 #define open fake_open
+#define ioctl fake_ioctl
 #include "desktop_renderer.c"
 #undef main
 #undef syscall
 #undef open
+#undef ioctl
 #include "quad_reference.h"
 
 enum {FW=640,FH=384,BAND=32,CURSOR=16,MAXW=4,TICKETS=8,DEPS=32,POOL=16};
@@ -586,6 +591,40 @@ static long handoff_call(long op,long arg,long a){
     default:return fail(-ENOSYS);
     }
 }
+/* Exercise the client-plane protocol without a GPU. State advances only
+ * when the fixture changes the kernel's observed front, armed and queued. */
+static struct {
+    int enabled,failStatus;
+    unsigned requests,leaves;
+    struct BrookGpuClientScanoutStatus status;
+    struct BrookGpuClientScanoutPresent request;
+} clientQa;
+int fake_ioctl(int fd,unsigned long request,...){
+    va_list ap;va_start(ap,request);void *arg=va_arg(ap,void*);va_end(ap);
+    if(clientQa.enabled && request==DESKTOP_SYNC_IOC_FILE_INFO){
+        struct DesktopSyncFileInfo *info=arg;
+        info->status=1;
+        return 0;
+    }
+    return ioctl(fd,request,arg);
+}
+static long client_scanout_qa_syscall(long op,long arg){
+    switch(op){
+    case BROOK_GPU_HANDOFF_CLIENT_SCANOUT_STATUS:
+        if(clientQa.failStatus)return fail(-EIO);
+        *(struct BrookGpuClientScanoutStatus *)arg=clientQa.status;
+        return 0;
+    case BROOK_GPU_HANDOFF_CLIENT_SCANOUT_PRESENT:
+        clientQa.request=*(const struct BrookGpuClientScanoutPresent *)arg;
+        ++clientQa.requests;
+        return 0;
+    case BROOK_GPU_HANDOFF_CLIENT_SCANOUT_LEAVE:
+        assert(!arg);
+        ++clientQa.leaves;
+        return 0;
+    default:return fail(-ENOSYS);
+    }
+}
 long fake_syscall(long number,...){
     va_list ap;va_start(ap,number);long a[6];for(int i=0;i<6;++i)a[i]=va_arg(ap,long);va_end(ap);
     queue_progress();
@@ -595,7 +634,8 @@ long fake_syscall(long number,...){
     case BROOK_SYS_WM_QUERY_SOURCE_COMMIT:if(a[3])*(uint64_t*)a[3]=0;return 0;
     case BROOK_SYS_DESKTOP_LAYERS:return layers_call(a[0],(struct BrookDesktopLayers*)a[1],a[3],a[4]);
     case BROOK_SYS_DESKTOP_OVERLAY:return overlay_call(a[0],a[1],(void*)a[2],a[3],a[4]);
-    case BROOK_SYS_GPU_HANDOFF_CTL:return handoff_call(a[0],a[1],a[2]);
+    case BROOK_SYS_GPU_HANDOFF_CTL:
+        return clientQa.enabled?client_scanout_qa_syscall(a[0],a[1]):handoff_call(a[0],a[1],a[2]);
     case BROOK_SYS_GPU_OUTPUT_ALLOC:{
         struct create c={(uint64_t)a[0],0,0};if(ioctl(K.intel,IOC(0x5b,sizeof(c)),&c))return -1;
         struct prime p={c.handle,O_CLOEXEC|O_RDWR,-1};if(ioctl(K.intel,IOC(0x2d,sizeof(p)),&p))return -1;
@@ -630,8 +670,101 @@ static int scanout_backpressure_qa(void){
     puts("HOST_SCANOUT_BACKPRESSURE_PASS");
     return 0;
 }
+static struct DesktopGpuOffer *client_scanout_qa_offer(unsigned slot,uint64_t buffer,uint64_t frame,int signaled){
+    struct DesktopGpuOffer *offer=&g_gpuChannel.offers[slot];
+    offer->state=2;
+    offer->buffer=dup(STDERR_FILENO);
+    offer->fence=eventfd(signaled,EFD_NONBLOCK|EFD_CLOEXEC);
+    assert(offer->buffer>=0 && offer->fence>=0);
+    offer->frame=offer->uses[0]=frame;
+    offer->packet.version=BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN;
+    offer->packet.identity=(struct BrookGpuWindowIdentity){.window=2,.incarnation=7,.commit=frame,.device=3,.inode=buffer};
+    return offer;
+}
+static void client_scanout_qa_reply(int peer,uint32_t type,uint64_t commit){
+    struct BrookGpuWindowPacket reply={0};
+    int fds[2];
+    const int received=brook_gpu_window_receive(peer,&reply,fds);
+    if(!type){assert(received==0);return;}
+    if(received!=1 || reply.type!=type || reply.identity.commit!=commit){
+        fprintf(stderr,"CLIENT_SCANOUT_QA reply received=%d type=%u commit=%llu expected=%u/%llu\n",
+            received,reply.type,(unsigned long long)reply.identity.commit,type,(unsigned long long)commit);
+        abort();
+    }
+}
+static int client_scanout_qa(void){
+    clientQa.enabled=1;
+    clientQa.status.version=BROOK_GPU_CLIENT_SCANOUT_VERSION;
+    K.win[1]=(struct FakeWindow){.live=1,.window=2,.incarnation=7};K.count=1;K.order[0]=1;
+    int peers[2];
+    assert(!socketpair(AF_UNIX,SOCK_SEQPACKET|SOCK_NONBLOCK,0,peers));
+    g_gpuChannel.listener=-1;g_gpuChannel.peer=peers[0];
+    for(unsigned i=0;i<DESKTOP_GPU_OFFERS;++i)g_gpuChannel.offers[i].buffer=g_gpuChannel.offers[i].fence=-1;
+    struct DesktopDirectBuffer layout={.width=640,.height=384,.stride=640};
+    struct DesktopGpuOffer *a=client_scanout_qa_offer(0,101,1,0);
+    assert(!direct_scanout_frame(a,&layout,1,0) && clientQa.requests==0 && !a->scanoutHeld);
+    const uint64_t signaled=1;
+    assert(write(a->fence,&signaled,sizeof(signaled))==sizeof(signaled));
+    assert(direct_scanout_frame(a,&layout,1,1) && clientQa.requests==0 && g_appWakeNs);
+    g_directRingWaitSince=0;
+    ++clientQa.status.version;
+    assert(!direct_scanout_frame(a,&layout,1,0) && clientQa.requests==0);
+    --clientQa.status.version;
+    assert(direct_scanout_frame(a,&layout,1,0) && a->scanoutHeld && clientQa.requests==1);
+    assert(clientQa.request.providerSocket==peers[0] && clientQa.request.primeFd==a->buffer &&
+           clientQa.request.offer==1 && clientQa.request.stride==2560 && !clientQa.request.tiling);
+    struct DesktopGpuOffer *alias=client_scanout_qa_offer(1,101,2,1);
+    alias->state=3;
+    clientQa.status.queued=101;
+    assert(!direct_scanout_poll() && g_directPending.frame==1);
+    client_scanout_qa_reply(peers[1],0,0);
+    clientQa.status.queued=0;clientQa.status.armed=101;
+    assert(!direct_scanout_poll() && a->scanoutHeld);
+    client_scanout_qa_reply(peers[1],0,0);
+    clientQa.status.armed=0;clientQa.status.front=101;
+    assert(direct_scanout_poll() && a->scanoutHeld);
+    client_scanout_qa_reply(peers[1],BROOK_GPU_WINDOW_PRESENTED,1);
+    client_scanout_qa_reply(peers[1],0,0);
+    struct DesktopGpuOffer *b=client_scanout_qa_offer(2,102,3,1);
+    layout.flags=BROOK_GPU_WINDOW_LAYER_TILED_X;
+    assert(direct_scanout_frame(b,&layout,3,0) && b->scanoutHeld && clientQa.request.tiling==1);
+    clientQa.status.armed=102;
+    assert(!direct_scanout_poll() && a->scanoutHeld && b->scanoutHeld);
+    client_scanout_qa_reply(peers[1],0,0);
+    clientQa.status.armed=0;clientQa.status.front=102;
+    assert(direct_scanout_poll() && !a->scanoutHeld && b->scanoutHeld);
+    client_scanout_qa_reply(peers[1],BROOK_GPU_WINDOW_PRESENTED,3);
+    client_scanout_qa_reply(peers[1],BROOK_GPU_WINDOW_SAFE,1);
+    client_scanout_qa_reply(peers[1],BROOK_GPU_WINDOW_SAFE,2);
+    struct DesktopGpuOffer *cancelled=client_scanout_qa_offer(3,103,4,1);
+    assert(direct_scanout_frame(cancelled,&layout,4,0));
+    clientQa.status.armed=103;
+    direct_scanout_leave();direct_scanout_leave();
+    assert(clientQa.leaves==1 && g_directMachine.fullDrawOwed);
+    b->retire=1;
+    desktop_gpu_channel_finish(&g_gpuChannel,5);
+    clientQa.failStatus=1;
+    assert(!direct_scanout_poll() && g_directMachine.held==2);
+    client_scanout_qa_reply(peers[1],0,0);
+    clientQa.failStatus=0;
+    clientQa.status.flags=BROOK_GPU_CLIENT_SCANOUT_UNCERTAIN;
+    assert(!direct_scanout_poll() && g_directMachine.held==2);
+    client_scanout_qa_reply(peers[1],0,0);
+    clientQa.status.flags=0;clientQa.status.front=clientQa.status.armed=0;
+    clientQa.status.error=-EAGAIN;clientQa.status.failedOffer=4;
+    assert(!direct_scanout_poll() && !g_directMachine.held && g_directMachine.fullDrawOwed);
+    assert(g_direct.latched==2 && g_direct.rejected==1 && g_directMachine.released==3);
+    client_scanout_qa_reply(peers[1],BROOK_GPU_WINDOW_SAFE,3);
+    client_scanout_qa_reply(peers[1],0,0); /* failed newest offer is retained for composition */
+    direct_scanout_repainted();
+    assert(!g_directMachine.fullDrawOwed && g_directMachine.state==DESKTOP_DIRECT_COMPOSITING);
+    desktop_gpu_channel_close(&g_gpuChannel);close(peers[1]);
+    puts("HOST_CLIENT_SCANOUT_PASS");
+    return 0;
+}
 int main(int argc,char **argv){
     if(argc==2 && !strcmp(argv[1],"--scanout-backpressure-qa"))return scanout_backpressure_qa();
+    if(argc==2 && !strcmp(argv[1],"--client-scanout-qa"))return client_scanout_qa();
     const char *frames=argc>1?argv[1]:"60";
     for(int n=128;n<136 && !K.intel;++n){char path[32];snprintf(path,sizeof(path),"/dev/dri/renderD%d",n);
         int fd=open(path,O_RDWR|O_CLOEXEC);if(fd<0)continue;
