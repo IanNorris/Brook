@@ -5,6 +5,17 @@ Current state and immediate goal. Keep this short and current: replace stale lin
 _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review follow-up)._
 
 
+## Desktop chooser schemas (19 November 2026)
+
+- `work/settings-schemas` compiles GTK3, GTK4 and GNOME GSettings schemas
+  into the existing Brook profile lookup directory. The build checks both
+  chooser schemas for both GTK versions and preserves existing keyfile
+  layout values.
+- The pinned GTK3 color button opened its chooser on a private virtual
+  display with the new schema directory as its only source.
+  Package `/nix/store/r6lz8cqz7hyk4l9j7lyymdzfhsgxgv49-brook-desktop-settings`.
+  Logs are in `build/schema-evidence`. Dell validation is pending.
+
 ## Session environment and executable cache (19 November 2026)
 
 - `work/session-env` uses an app-owned `/tmp/brook-$UID` directory with mode
