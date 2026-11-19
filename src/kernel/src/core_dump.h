@@ -42,6 +42,7 @@ struct CoreDumpResult {
     uint64_t bytes=0,holes=0,durationMs=0;
     uint32_t threads=0,missingRegisters=0,mappings=0;
     char executable[256]{};
+    const char* stage="snapshot";
 };
 
 void CoreDumpPublishRegisters(Process*,const CoreRegisters&);

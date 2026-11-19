@@ -732,9 +732,13 @@ def main():
                     raise RuntimeError('the fixture did not stay alive after the dump')
                 print('PROC_DUMP_GDB_PASS',flush=True)
 
-            boot(disk,a.firmware,second,False,'GUARD_DESKTOP_HANDOFF_SCRIPT status=0',120,True,
-                 sata_snapshot=False,sata_serial='BROOK-RECOVERY-QA',failure_marker='GUARD_DESKTOP_HANDOFF_FAILED',
-                 network_port=network_port,bulk_port=bulk_port,on_marker=check_core)
+            try:
+                boot(disk,a.firmware,second,False,'GUARD_DESKTOP_HANDOFF_SCRIPT status=0',120,True,
+                     sata_snapshot=False,sata_serial='BROOK-RECOVERY-QA',failure_marker='GUARD_DESKTOP_HANDOFF_FAILED',
+                     network_port=network_port,bulk_port=bulk_port,on_marker=check_core)
+            finally:
+                for name in ('serial.log','qemu.log'):
+                    if (second/name).exists():shutil.copyfile(second/name,a.output/('desktop-attempt-'+name))
         elif a.auto_desktop:
             boot(disk,a.firmware,second,False,'GUARD_DESKTOP_HANDOFF_SCRIPT status=0',120,True,sata_snapshot=False,
                  hold_after_marker=5,sata_serial='BROOK-RECOVERY-QA',failure_marker='GUARD_DESKTOP_HANDOFF_FAILED')
