@@ -18,9 +18,11 @@
 namespace brook {
 
 enum class ChromeOp : uint8_t {
+    FadeX,        // source-over horizontal stroke, from solid to clear
     Fill,         // solid rect, replaces the destination
     Rows,         // one colour per row (title material gradient)
     CornerFill,   // solid rect clipped to a rounded top-right corner of clip
+    MaterialOutline, // one-pixel stroke with rounded corners
     MaterialRect, // solid rect with rounded corners, top and bottom
     Text,         // glyph run, source-over by coverage
     Icon,         // straight-alpha ARGB icon, source-over, scaled
@@ -51,10 +53,16 @@ public:
     bool Overflowed() const { return overflow_; }
     void Clear() { count_ = textUsed_ = 0; overflow_ = false; }
 
+    void FadeX(int x, int y, int w, int h, uint32_t color) {
+        Push({ChromeOp::FadeX, x, y, w, h, color, 0, 0, 0, {}, nullptr});
+    }
     void Fill(int x, int y, int w, int h, uint32_t color) { Push({ChromeOp::Fill, x, y, w, h, color, 0, 0, 0, {}, nullptr}); }
     void Rows(int x, int y, int w, int h, const uint32_t* colors) { Push({ChromeOp::Rows, x, y, w, h, 0, 0, 0, 0, {}, colors}); }
     void CornerFill(int x, int y, int w, int h, uint32_t color, const DesktopRect& block, unsigned radius) {
         Push({ChromeOp::CornerFill, x, y, w, h, color, radius, 0, 0, block, nullptr});
+    }
+    void MaterialOutline(const DesktopRect& r, uint32_t color, unsigned radius) {
+        Push({ChromeOp::MaterialOutline, r.x, r.y, r.w, r.h, color, radius, 0, 0, {}, nullptr});
     }
     void MaterialRect(const DesktopRect& r, uint32_t color, unsigned radius) {
         Push({ChromeOp::MaterialRect, r.x, r.y, r.w, r.h, color, radius, 0, 0, {}, nullptr});
@@ -62,8 +70,8 @@ public:
     void Squares(int x, int y, int w, int h, int dx, int dy, int count, uint32_t color) {
         if (count > 0) Push({ChromeOp::Squares, x, y, w, h, color, static_cast<uint32_t>(count), dx, dy, {}, nullptr});
     }
-    void Icon(int x, int y, int size, const uint32_t* pixels) {
-        Push({ChromeOp::Icon, x, y, size, size, 0, 0, 0, 0, {}, pixels});
+    void Icon(int x, int y, int size, const uint32_t* pixels, unsigned opacity = 255) {
+        Push({ChromeOp::Icon, x, y, size, size, 0, opacity, 0, 0, {}, pixels});
     }
     // maxWidth <= 0: unbounded. clip: glyph pixels outside it are skipped.
     void Text(int x, int y, const char* text, uint32_t fg, int maxWidth = 0, const DesktopRect* clip = nullptr) {

@@ -29,7 +29,7 @@ int ChromeRenderGlyph(const ChromeTarget& t, const FontAtlas& font, int penX, in
 void ChromeRenderString(const ChromeTarget& t, const FontAtlas& font, int x, int y, const char* str,
                         uint32_t fg, int maxWidth = 0, const DesktopRect* clip = nullptr);
 // A straight-alpha 24x24 (LAUNCHER_ICON_PX) icon scaled to size.
-void ChromeDrawIcon(const ChromeTarget& t, int x, int y, int size, const uint32_t* pixels);
+void ChromeDrawIcon(const ChromeTarget& t, int x, int y, int size, const uint32_t* pixels, unsigned opacity = 255);
 uint32_t ChromeBlendColor(uint32_t fg, uint32_t bg, uint32_t alpha);
 
 // Rasterise every command of the list, in order.

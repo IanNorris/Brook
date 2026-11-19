@@ -54,9 +54,9 @@ inline void ChromeMaterialString(ChromeDisplayList& dl, const ChromeStyle& s, in
 // misleading letter tile or a guessed application logo).
 inline void ChromeIcon(ChromeDisplayList& dl, const ChromeStyle& s, int x, int y, int size, const uint32_t* pixels) {
     if (pixels) { dl.Icon(x, y, size, pixels); return; }
-    dl.Fill(x + 2, y + 3, size - 4, size - 6, s.P().mutedText);
-    dl.Fill(x + 3, y + 7, size - 6, size - 11, s.P().itemHover);
-    dl.Fill(x + 5, y + 5, 2, 1, s.P().titleInactive);
+    dl.Fill(x + 2, y + 3, size - 4, size - 6, 0xff000000u | s.P().mutedText);
+    dl.Fill(x + 3, y + 7, size - 6, size - 11, 0xff000000u | s.P().itemHover);
+    dl.Fill(x + 5, y + 5, 2, 1, 0xff000000u | s.P().titleInactive);
 }
 
 } // namespace brook

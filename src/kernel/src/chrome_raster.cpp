@@ -92,7 +92,7 @@ void ChromeRenderString(const ChromeTarget& t, const FontAtlas& font, int x, int
     }
 }
 
-void ChromeDrawIcon(const ChromeTarget& t, int x, int y, int size, const uint32_t* pixels)
+void ChromeDrawIcon(const ChromeTarget& t, int x, int y, int size, const uint32_t* pixels, unsigned opacity)
 {
     if (!pixels) return;
     for (int row = 0; row < size; ++row)
@@ -104,7 +104,8 @@ void ChromeDrawIcon(const ChromeTarget& t, int x, int y, int size, const uint32_
                                         col * ChromeIconSourcePx / size];
             if (!(src >> 24)) continue;
             auto& destination = t.pixels[static_cast<uint64_t>(ty) * t.stride + tx];
-            destination = ChromePixelOver(destination, src);
+            const unsigned alpha = ((src >> 24) * opacity + 127) / 255;
+            destination = ChromePixelOver(destination, (alpha << 24) | (src & 0xffffff));
         }
 }
 
@@ -126,6 +127,20 @@ void ChromeExecute(const ChromeDisplayList& list, const ChromeTarget& t, const F
         const ChromeCmd& c = list.At(i);
         switch (c.op)
         {
+        case ChromeOp::FadeX: {
+            const int left = c.x - t.originX, top = c.y - t.originY;
+            for (int column = 0; column < c.w; ++column) {
+                const int x = left + column;
+                if (x < 0 || x >= static_cast<int>(t.width)) continue;
+                const unsigned alpha = c.w > 1 ? (c.color >> 24) * (c.w - 1 - column) / (c.w - 1) : c.color >> 24;
+                for (int row = top; row < top + c.h; ++row) {
+                    if (row < 0 || row >= static_cast<int>(t.height)) continue;
+                    auto& dst = t.pixels[static_cast<uint64_t>(row) * t.stride + x];
+                    dst = ChromePixelOver(dst, (alpha << 24) | (c.color & 0xffffff));
+                }
+            }
+            break;
+        }
         case ChromeOp::Fill:
             ChromeFillRect(t, c.x, c.y, c.w, c.h, c.color);
             break;
@@ -144,19 +159,32 @@ void ChromeExecute(const ChromeDisplayList& list, const ChromeTarget& t, const F
                 if (end > c.x) ChromeFillRect(t, c.x, row, end - c.x, 1, c.color);
             }
             break;
-        case ChromeOp::MaterialRect:
+        case ChromeOp::MaterialOutline:
+        case ChromeOp::MaterialRect: {
+            const int half = (c.w < c.h ? c.w : c.h) / 2;
+            if (half < 0) break;
+            const unsigned radius = c.arg > static_cast<unsigned>(half) ? half : c.arg;
+            const bool outline = c.op == ChromeOp::MaterialOutline;
             for (int y = 0; y < c.h; ++y)
             {
                 const unsigned row = y < c.h / 2 ? y : c.h - 1 - y;
-                const int inset = ChromeCornerInset(c.arg, row);
-                ChromeFillRect(t, c.x + inset, c.y + y, c.w - 2 * inset, 1, c.color);
+                const int inset = ChromeCornerInset(radius, row);
+                if (!outline || row == 0) {
+                    ChromeFillRect(t, c.x + inset, c.y + y, c.w - 2 * inset, 1, c.color);
+                } else {
+                    const int inner = 1 + ChromeCornerInset(radius ? radius - 1 : 0, row - 1);
+                    const int stroke = inner - inset;
+                    ChromeFillRect(t, c.x + inset, c.y + y, stroke, 1, c.color);
+                    ChromeFillRect(t, c.x + c.w - inner, c.y + y, stroke, 1, c.color);
+                }
             }
             break;
+        }
         case ChromeOp::Text:
             ChromeRenderString(t, font, c.x, c.y, list.TextAt(c.arg), c.color, c.w, c.dx ? &c.clip : nullptr);
             break;
         case ChromeOp::Icon:
-            ChromeDrawIcon(t, c.x, c.y, c.w, static_cast<const uint32_t*>(c.data));
+            ChromeDrawIcon(t, c.x, c.y, c.w, static_cast<const uint32_t*>(c.data), c.arg);
             break;
         case ChromeOp::Squares:
             for (uint32_t n = 0; n < c.arg; ++n)

@@ -117,8 +117,8 @@ void MakeIcon() {
 ChromeMaterialCache glassCache;
 
 // A Clearwater theme as the painters see it: (theme, hue), Glass in Mixed
-// mode (dark chrome). The CPU executor never draws glass material, so every
-// element is opaque except the frame-active-glass case (virgl's material).
+// mode (dark chrome). Glass goldens rasterise explicit alpha for capture;
+// opaque goldens exercise the solid CPU fallback.
 struct GoldenTheme { const char* name; unsigned theme, hue; };
 BrookThemePalette palettes[8];
 const BrookThemePalette* PaletteFor(unsigned index, const GoldenTheme& t) {
@@ -135,8 +135,8 @@ ChromeStyle StyleFor(uint32_t, const DesktopMetrics& m, bool glass) {
     const BrookThemePalette* p = currentPalette;
     ChromeStyle s{p, &m, font, glass, glass ? 200u : 255u, nullptr};
     if (glass) {
-        glassCache.Ensure(p->titleActive, p->titleInactive, 200, s.M(DesktopMetrics::TitleBase), s.M(7),
-                          s.M(DesktopMetrics::BorderBase));
+        glassCache.Ensure(p->titleActive, p->titleInactive, 200, s.M(DesktopMetrics::TitleBase), s.M(8),
+                          s.M(2), p, s.M(DesktopMetrics::TaskbarBase));
         s.material = &glassCache;
     }
     return s;
@@ -207,7 +207,8 @@ DesktopIntervals<> compositorCadence;
 const uint64_t now = 100000;
 
 void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
-    const ChromeStyle s = StyleFor(theme, m, false);
+    const bool glass = theme == 0 || theme == 3;
+    const ChromeStyle s = StyleFor(theme, m, glass);
     const uint32_t screenW = 1280 * m.percent / 100, screenH = 800 * m.percent / 100;
     static ChromeShellStorage storage;
 
@@ -215,7 +216,7 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
     // a failed launch; CPU, MEM, disk and COMP metrics; agent stale.
     const int ids[] = {0, 1, 2, -10, -11};
     const uint32_t metrics = 1u << 0 | 1u << 1 | 1u << 2 | 1u << 4;
-    const ChromeTaskbarLayout layout = ChromeTaskbarLayoutFor(s, screenW, screenH, "14:05", true, metrics, ids, 5, 0);
+    const ChromeTaskbarLayout layout = ChromeTaskbarLayoutFor(s, screenW, screenH, "14:05 19 Nov 2026", true, metrics, ids, 5, 0, "dev  6785ca29  debug");
     const ChromeTaskbarButton buttons[] = {
         {testIcon, "Terminal", true, false, false, false},
         {nullptr, "Files", false, true, false, false},
@@ -303,9 +304,24 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
                                   {"Desktop ready in 4.21 s (VM start)", "Boot timing n/a",
                                    "8 cores | 7712 MiB available", "Software composition | flat", "Build test"}};
         ChromeDisplayList list = ChromeListOn(storage);
+        bm.phaseMs[0]=420;bm.phaseMs[1]=340;bm.phaseMs[2]=940;bm.phaseMs[3]=2510;
         ChromeBuildBootSummary(bm, s, list);
         Check(prefix + "boot-summary", list, s, bm.rect.x, bm.rect.y, w, h);
     }
+
+    const DesktopRect flyout{0, 0, int(s.M(320)), int(s.M(208))};
+    ChromeTelemetryModel telemetry=tb.telemetry;
+    telemetry.tjmax=100;telemetry.thermal=true;
+    for (const bool network : {true, false}) {
+        ChromeDisplayList list = ChromeListOn(storage);
+        ChromeBuildTrayFlyout({flyout, network, true, "192.168.1.35", telemetry}, s, list);
+        Check(prefix + (network ? "network-flyout" : "temperature-flyout"), list, s,
+              flyout.x, flyout.y, flyout.w, flyout.h);
+    }
+    const DesktopRect hud{0, 0, int(s.M(400)), int(s.M(240))};
+    ChromeDisplayList list = ChromeListOn(storage);
+    ChromeBuildPerformanceHud({hud, telemetry, now + 300}, s, list);
+    Check(prefix + "hud", list, s, hud.x, hud.y, hud.w, hud.h);
 }
 
 } // namespace

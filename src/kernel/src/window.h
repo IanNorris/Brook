@@ -142,8 +142,6 @@ struct ChromeSurfaceEffects;
 ChromeSurfaceEffects WmChromeSurfaceEffects();
 uint32_t WmDesktopSurfaceRecords(BrookDesktopSurface* out,uint32_t max);
 using WmRect = DesktopRect;
-void WmDrawBuildId(uint32_t*,uint32_t,uint32_t,uint32_t,const WmRect* clip=nullptr);
-void WmDrawBuildIdSpan(uint32_t*,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);
 // Even nonzero values identify a stable badge style; odd means an update is in progress.
 uint64_t WmBackdropStyleVersion();
 bool WmBootSummaryRect(uint32_t,uint32_t,int32_t*,int32_t*,uint32_t*,uint32_t*);
@@ -484,6 +482,15 @@ bool WmAgentIndicatorRefresh(uint64_t now);
 bool WmVolumeIndicatorRefresh();
 // Plays the volume-change pop when a user change is observed (compositor loop).
 void WmVolumeFeedbackTick(uint64_t nowMs);
+bool WmTrayFlyoutVisible();
+bool WmTrayFlyoutPress(int32_t mx, int32_t my, uint32_t width, uint32_t height);
+void WmTrayFlyoutClose();
+bool WmTrayFlyoutRect(uint32_t width, uint32_t height, int32_t*, int32_t*, uint32_t*, uint32_t*);
+void WmRenderTrayFlyout(uint32_t*, uint32_t stride, uint32_t width, uint32_t height);
+void WmCyclePerformanceHud();
+bool WmPerformanceHudRect(uint32_t width, uint32_t height, int32_t*, int32_t*, uint32_t*, uint32_t*);
+void WmRenderPerformanceHud(uint32_t*, uint32_t stride, uint32_t width, uint32_t height);
+
 bool WmVolumePopupVisible();
 void WmVolumePopupClose();
 void WmVolumePopupGetRect(uint32_t screenW, uint32_t screenH,

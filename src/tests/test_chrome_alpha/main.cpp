@@ -52,53 +52,21 @@ static void oracleBlockCapture(uint32_t* pixels,uint32_t width,uint32_t height,u
             pixels[uint64_t(row)*width+x]=0;
 }
 
-// The glass branch of virgl's chrome layer before stage 1.5 moved it into
-// chrome_alpha.h (ChromeMarkFrameGlass), as the oracle for that move.
-static void oracleGlass(uint32_t* buf,uint32_t stride,uint32_t fbW,uint32_t fbH,int ox,int oy,int ow,int oh,
-                        int cx,int cy,int cw,int ch,int topBorderH,uint32_t opacity,uint32_t fgColor,uint32_t accentColor,
-                        const ChromeMaterialCache* material,bool focused){
-    auto setAlpha = [&](int x, int y, int rw, int rh, uint32_t a,bool preserve=false) {
-        if (rw <= 0 || rh <= 0) return;
-        if (x < 0) { rw += x; x = 0; }
-        if (y < 0) { rh += y; y = 0; }
-        if (x + rw > (int)fbW)  rw = (int)fbW  - x;
-        if (y + rh > (int)fbH) rh = (int)fbH - y;
-        uint32_t aShift = a << 24;
-        for (int yy = y; yy < y + rh; ++yy)
-        {
-            uint32_t* row = buf + (uint32_t)yy * stride;
-            for (int xx = x; xx < x + rw; ++xx) if(!preserve || !(row[xx]>>24))row[xx] = (row[xx] & 0x00FFFFFFu) | aShift;
-        }
-    };
-    int titleBarH  = (cy - oy) - topBorderH;
-    setAlpha(ox, oy, ow, topBorderH, 0xFF,true);
-    setAlpha(ox, oy + topBorderH, ow, titleBarH, opacity,true);
-    setAlpha(ox, cy + ch, ow, (oy + oh) - (cy + ch), 0xFF,true);
-    setAlpha(ox, cy, cx - ox, ch, 0xFF,true);
-    setAlpha(cx + cw, cy, (ox + ow) - (cx + cw), ch, 0xFF,true);
-    {
-        const uint32_t fg=fgColor;
-        const uint32_t accent=accentColor&0xffffff;
-        for(int y=oy+topBorderH;y<cy;++y)for(int x=ox;x<ox+ow;++x) {
-            if(x<0||y<0||x>=int(fbW)||y>=int(fbH))continue;
-            auto& pixel=buf[uint64_t(y)*stride+x];
-            const uint32_t rgb=pixel&0xffffff;
-            if(rgb==fg||rgb==accent)pixel|=0xff000000;
-        }
-    }
-    if(material) {
-        if(ow>=int(material->top.radius*2)&&oh>=int(material->top.radius*2))
-        for(unsigned corner=0;corner<4;++corner){
-            const auto& mask=corner<2?material->top:material->bottom;
-            for(unsigned row=0;row<mask.radius;++row)for(unsigned col=0;col<mask.radius;++col){
-                const int y=corner<2?oy+int(row):oy+oh-1-int(row);
-                const int x=(corner&1)?ox+ow-1-int(col):ox+int(col);
-                if(x<0||y<0||x>=int(fbW)||y>=int(fbH))continue;
-                auto& pixel=buf[uint64_t(y)*stride+x];
-                const uint32_t rim=material->rims[focused][corner<2?(row<mask.radius/2?0:1):2];
-                pixel=ChromeMaskedRim(pixel,mask.coverage[row][col],mask.inner[row][col],rim);
-            }
-        }
+// Compare against a screen traversal that applies only the four corner
+// masks. It must preserve painted alpha across every other pixel, including
+// title ink and the client hole.
+static void oracleGlassCorners(uint32_t* buf,uint32_t stride,uint32_t fbW,uint32_t fbH,
+                               int ox,int oy,int ow,int oh,const ChromeMaterialCache& material,bool focused){
+    if(ow<int(material.top.radius*2) || oh<int(material.top.radius*2))return;
+    for(int y=0;y<int(fbH);++y)for(int x=0;x<int(fbW);++x){
+        const unsigned row=y-oy<oh/2 ? y-oy : oy+oh-1-y;
+        const unsigned col=x-ox<ow/2 ? x-ox : ox+ow-1-x;
+        const bool top=y-oy<oh/2;
+        const auto& mask=top?material.top:material.bottom;
+        if(row>=mask.radius || col>=mask.radius)continue;
+        const uint32_t rim=material.rims[focused][top?(row<mask.radius/2?0:1):2];
+        auto& pixel=buf[uint64_t(y)*stride+x];
+        pixel=ChromeMaskedRim(pixel,mask.coverage[row][col],mask.inner[row][col],rim);
     }
 }
 
@@ -152,27 +120,20 @@ int main(){
             CHECK(a==b);
         }
     }
-    // Glass frames (virgl's layer, and stage 1.5's capture for a renderer
-    // that can blur): exact against the old loop, with and without corners,
-    // on a framebuffer (partly off-screen) and as a capture at the origin.
     for(int iter=0;iter<3000;++iter){
         ChromeMaterialCache material;
-        const uint32_t fg=0x00e5edf8u,accent=0x0068acffu;
         const int border=1+next(3),title=4+next(20),cw=1+next(60),ch=1+next(40);
         material.Ensure(0x0028466fu,0x00253851u,40+next(200),title,next(8),border);
-        const bool capture=next(2),focused=next(2),corners=next(2);
-        const uint32_t fbW=capture?uint32_t(cw+2*border):8+next(90),fbH=capture?uint32_t(border+title+ch+border):8+next(70);
+        const bool capture=next(2),focused=next(2);
+        const int ow=cw+2*border,oh=border+title+ch+border;
+        const uint32_t fbW=capture?uint32_t(ow):8+next(90),fbH=capture?uint32_t(oh):8+next(70);
         const uint32_t stride=capture?fbW:fbW+next(5);
         const int ox=capture?0:int(next(fbW+20))-10,oy=capture?0:int(next(fbH+20))-10;
-        const int cx=ox+border,cy=oy+border+title,ow=cw+2*border,oh=(cy-oy)+ch+border;
         std::vector<uint32_t> a(stride*fbH),b;
-        // Painted pixels: some with alpha, some the text or accent colour.
-        for(auto& p:a){const uint32_t pick=next(8);p=pick==0?fg:pick==1?accent:pick==2?(next(256)<<24|next(0x01000000u)):next(0x01000000u);}
+        for(auto& p:a)p=((1+next(255))<<24)|next(0x01000000u);
         b=a;
-        const uint32_t opacity=next(256);
-        oracleGlass(a.data(),stride,fbW,fbH,ox,oy,ow,oh,cx,cy,cw,ch,border,opacity,fg,accent,corners?&material:nullptr,focused);
-        ChromeMarkFrameGlass(b.data(),stride,fbW,fbH,{ox,oy,ow,oh},{cx,cy,cw,ch},border,opacity,fg,accent,
-                             corners?&material:nullptr,focused);
+        oracleGlassCorners(a.data(),stride,fbW,fbH,ox,oy,ow,oh,material,focused);
+        ChromeMaskFrameCorners(b.data(),stride,fbW,fbH,{ox,oy,ow,oh},material,focused);
         CHECK(a==b);
     }
     // A block (overlaid captions) is opaque as a whole, clipped.

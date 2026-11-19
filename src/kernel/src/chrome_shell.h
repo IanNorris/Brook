@@ -1,7 +1,6 @@
 #pragma once
 // Shell-surface layouts and display list builders (compositor refactor stage
-// 1.2): taskbar with tray and telemetry, launcher, volume popup, tray tooltip
-// and boot summary. The WM snapshots its state into the models below
+// 1.2): taskbar, launcher, tray flyouts, boot toast and performance HUD. The WM snapshots its state into the models below
 // (wm_shell_*.inc); the builders read only the model and the style. These
 // are the pieces a user-mode shell takes over at stage 3. Freestanding.
 #include <stdint.h>
@@ -20,7 +19,7 @@ namespace brook {
 // each side (38 high), so a click anywhere in the column hits it.
 struct ChromeShellMetrics {
     static constexpr uint32_t TaskbarButtonWidth = 48, TaskbarButtonHeight = 48, TaskbarPadding = 0;
-    static constexpr uint32_t TaskbarLauncherWidth = 56, TaskbarPillInsetX = 2, TaskbarPillInsetY = 5;
+    static constexpr uint32_t TaskbarMaxButtonWidth = 188, TaskbarLauncherWidth = 56, TaskbarPillInsetX = 2, TaskbarPillInsetY = 5;
     static constexpr uint32_t LauncherIconSize = 24, LauncherIconMargin = 8, LauncherItemHeight = 40;
     static constexpr uint32_t LauncherItemWidth = 230, LauncherPadding = 6, LauncherMaxRows = 14, LauncherMaxCols = 3;
 };
@@ -46,23 +45,23 @@ static constexpr uint32_t ChromeTaskbarButtonLimit = 40; // windows + launch fee
 
 struct ChromeTaskbarLayout {
     int y, textY, screenW, screenH;
-    DesktopRect apps, terminal, next, clock, network, volume, agent;
+    DesktopRect apps, terminal, next, clock, network, volume, agent, build, hud;
     DesktopRect metrics[7];
     DesktopRect buttons[ChromeTaskbarButtonLimit];
     int indices[ChromeTaskbarButtonLimit];
     int count, nextIndex;
-    char clockText[32];
+    char clockText[32], clockDate[24], buildText[32];
 };
 
 // ids: the taskbar entries in order (WM window indices, or -10 - launch
 // slot); focused selects the page. agent: the agent indicator is shown.
 ChromeTaskbarLayout ChromeTaskbarLayoutFor(const ChromeStyle& s, uint32_t screenW, uint32_t screenH,
                                            const char* clockText, bool agent, uint32_t enabledMetrics,
-                                           const int* ids, int total, int focused);
+                                           const int* ids, int total, int focused, const char* buildText = nullptr, bool compactHud = false);
 
 struct ChromeTaskbarButton {
     const uint32_t* icon;   // borrowed; null: missing glyph
-    const char* hoverTitle; // shown in the tray while hovered
+    const char* hoverTitle; // window label; launch state is held by the WM
     bool active, minimized; // window entries
     bool launch, busy;      // launch feedback entries: progress ring, or "!"
 };
@@ -115,6 +114,7 @@ void ChromeBuildVolumePopup(const ChromeVolumePopupModel& model, const ChromeSty
 struct ChromeTooltipModel {
     DesktopRect box;
     const char* text;
+    const char* detail = nullptr;
 };
 // The tooltip's padded box for its text.
 inline int ChromeTooltipPadding(const ChromeStyle& s) { return static_cast<int>(s.M(8)); }
@@ -159,7 +159,27 @@ void ChromeBuildLauncher(const ChromeLauncherModel& model, const ChromeStyle& st
 struct ChromeBootSummaryModel {
     DesktopRect rect;
     const char* rows[5]; // headline, timing, machine, composition, build
+    uint64_t phaseMs[4]{}; // firmware, menu, loader, kernel
+    const char* phaseLabels[4]{};
 };
 void ChromeBuildBootSummary(const ChromeBootSummaryModel& model, const ChromeStyle& style, ChromeDisplayList& out);
+
+struct ChromeTrayFlyoutModel {
+    DesktopRect rect;
+    bool network, connected;
+    const char* readout;
+    ChromeTelemetryModel telemetry;
+};
+
+void ChromeBuildTrayFlyout(const ChromeTrayFlyoutModel&, const ChromeStyle&, ChromeDisplayList&);
+
+struct ChromePerformanceHudModel {
+    DesktopRect rect;
+    ChromeTelemetryModel telemetry;
+    uint64_t tick;
+};
+
+void ChromeBuildCompactHud(const ChromePerformanceHudModel&, const ChromeStyle&, ChromeDisplayList&);
+void ChromeBuildPerformanceHud(const ChromePerformanceHudModel&, const ChromeStyle&, ChromeDisplayList&);
 
 } // namespace brook

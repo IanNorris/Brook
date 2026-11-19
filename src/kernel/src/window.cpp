@@ -117,6 +117,7 @@ static void EndBackdropStyleChange(){
 static bool g_themeSettingsLoaded = false;
 static uint32_t g_appearance = BROOK_APPEARANCE_DEFAULT;
 static uint32_t g_taskbarMetrics = BROOK_TASKBAR_DEFAULT;
+static bool g_buildChip = true;
 uint32_t WmGetTaskbarMetrics(){return __atomic_load_n(&g_taskbarMetrics,__ATOMIC_ACQUIRE);}
 bool WmSetTaskbarMetrics(uint32_t value){
     if(!brook_taskbar_metrics_valid(value))return false;
@@ -335,6 +336,11 @@ static void WmRestoreTheme()
                     selectedScale=!*p && digits==3 && DesktopMetrics::Supported(value) ? value : 100;
                 }
                 else if(desktopSection){
+                    if(strncmp(p,"build_chip=",11)==0 && (p[11]=='0' || p[11]=='1')){
+                        const char* tail=p+12;
+                        while(*tail==' ' || *tail=='\t' || *tail=='\r')++tail;
+                        if(!*tail)g_buildChip=p[11]=='1';
+                    }
                     appearance=brook_appearance_setting(appearance,p);
                     taskbarMetrics=brook_taskbar_metrics_setting(taskbarMetrics,p);
                     pointerSpeed=brook_pointer_speed_setting(pointerSpeed,p);
@@ -426,7 +432,7 @@ static void PointerCaptureValidateLocked() {
     if(!g_wmActive || !w.proc || !w.vfb || !w.visible || w.minimized ||
        !w.focused || g_focusedIdx!=g_pointerCaptureIndex ||
        w.creationIdentity!=g_pointerCaptureIdentity ||
-       InputDroppedEvents()!=g_pointerCaptureDrops || WmLauncherVisible() || WmVolumePopupVisible())
+       InputDroppedEvents()!=g_pointerCaptureDrops || WmLauncherVisible() || WmVolumePopupVisible() || WmTrayFlyoutVisible())
         PointerCaptureReleaseLocked();
 }
 bool WmPointerCaptureActive() {
@@ -509,13 +515,13 @@ int64_t WmPointerCapture(Process* provider,uint32_t wmId,uint32_t operation,uint
     if(operation!=1 || token)return -22;
     if(owned)return g_pointerCaptureToken;
     if(g_pointerCaptureIndex>=0)return -16;
-    if(WmLauncherVisible() || WmVolumePopupVisible())PointerActivationCancel();
+    if(WmLauncherVisible() || WmVolumePopupVisible() || WmTrayFlyoutVisible())PointerActivationCancel();
     const bool hovered=__atomic_load_n(&g_pointerHoverIdentity,__ATOMIC_ACQUIRE)==w->creationIdentity;
     // An activation waiver never inherits the activating click: the taskbar
     // press/release pair must finish in the shell before the game is granted.
     const bool waived=!hovered && activated && !MouseGetButtons();
     if(!g_wmActive || !w->vfb || !w->visible || w->minimized || !w->focused ||
-       g_focusedIdx!=static_cast<int>(wmId)-1 || WmLauncherVisible() || WmVolumePopupVisible() ||
+       g_focusedIdx!=static_cast<int>(wmId)-1 || WmLauncherVisible() || WmVolumePopupVisible() || WmTrayFlyoutVisible() ||
        WmPointerSuppressedButtons() || w->pointerDisengaged || (!hovered && !waived))return -11;
     if(g_nextPointerCaptureToken==0xffffffffu)return -75;
     PointerActivationCancel();
@@ -1423,7 +1429,7 @@ bool WmSetFullscreen(int idx, bool enable) { VfbGuard guard; return SetFullscree
 
 bool WmTaskbarHidden()
 {
-    if (!g_wmActive || WmLauncherVisible() || WmVolumePopupVisible()) return false;
+    if (!g_wmActive || WmLauncherVisible() || WmVolumePopupVisible() || WmTrayFlyoutVisible()) return false;
     const int idx = __atomic_load_n(&g_focusedIdx, __ATOMIC_ACQUIRE);
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return false;
     const Window& w = g_windows[idx];
@@ -1810,7 +1816,8 @@ const ChromeMaterialCache& WmChromeMaterial(){
     const auto& p=WmCurrentPalette();
     SpinLockAcquire(&g_chromeMaterialLock);
     if(g_chromeMaterial.Ensure(p.titleActive,p.titleInactive,CompositorMaterialOpacity(),
-                              WmMetric(WM_TITLE_BAR_HEIGHT),WmMetric(7),WmMetric(WM_BORDER_WIDTH)))
+                              WmMetric(WM_TITLE_BAR_HEIGHT),WmMetric(8),WmMetric(WM_BORDER_WIDTH),
+                              &p,WmMetric(WM_TASKBAR_HEIGHT)))
         __atomic_add_fetch(&g_materialRebuilds,1,__ATOMIC_RELAXED);
     SpinLockRelease(&g_chromeMaterialLock);
     return g_chromeMaterial;
@@ -2400,7 +2407,8 @@ void WmLauncherToggle()
     g_launcherPower.Reset();
     if (g_launcherOpen) {
         PointerActivationCancel();
-        WmVolumePopupClose(); // the two popups share one overlay slot
+        WmVolumePopupClose();
+        WmTrayFlyoutClose();
         g_launcherError = 0;
         g_launcherScroll = 0;
         WmRequestLauncherRefresh(); // also catches installs/removals outside the installer
@@ -2437,6 +2445,8 @@ uint64_t WmShellSurfaceKey(const WmShellSurface& s, uint32_t screenW, uint32_t s
     case WmShellSurfaceKind::Launcher: WmLauncherSurface(nullptr, 0, screenW, screenH, mx, my, seed, &key); break;
     case WmShellSurfaceKind::VolumePopup: WmVolumePopupSurface(nullptr, 0, screenW, screenH, mx, my, seed, &key); break;
     case WmShellSurfaceKind::TrayTooltip: WmTrayTooltipSurface(nullptr, 0, screenW, screenH, mx, my, seed, &key); break;
+    case WmShellSurfaceKind::TrayFlyout: WmTrayFlyoutSurface(nullptr, 0, screenW, screenH, seed, &key); break;
+    case WmShellSurfaceKind::PerformanceHud: WmPerformanceHudSurface(nullptr, 0, screenW, screenH, seed, &key); break;
     case WmShellSurfaceKind::BootSummary: WmBootSummarySurface(nullptr, 0, screenW, screenH, seed, &key); break;
     }
     return key;
@@ -2985,7 +2995,8 @@ static uint64_t DesktopChromeKeyLocked(const DesktopChromeEpochs& layers,const W
 ChromeSurfaceEffects WmChromeSurfaceEffects() {
     ChromeSurfaceEffects e{};
     e.glass=CompositorGlassActive();e.blur=CompositorMaterialBlur();
-    e.shadowSpread=WmMetric(16);e.shadowCorner=WmMetric(24);e.shellRadius=e.glass?WmMetric(4):0;
+    e.lightShadow=!WmCurrentPalette().chromeDark;
+    e.shadowSpread=WmMetric(16);e.shadowCorner=WmMetric(28);e.shellRadius=e.glass?WmMetric(12):0;
     if(e.glass){const auto& material=WmChromeMaterial();e.topRadius=material.top.radius;e.bottomRadius=material.bottom.radius;}
     return e;
 }
@@ -3008,7 +3019,7 @@ static bool WindowSurfaceLocked(const Window& w,const DesktopChromeEpochs& epoch
     m.clientDecorated=w.noChrome;m.maximised=w.state==WindowState::Maximized;m.focused=w.focused;
     m.outer=block;m.client={w.clientX(),w.clientY(),int(w.clientW),int(w.clientH)};
     m.captionRadius=(w.captionStyle&DesktopCaptionStyleValid)?DesktopCaptionStyleRadius(w.captionStyle):0;
-    m.opacity=w.opacity;
+    m.opacity=w.opacity;m.fullWindowBlur=w.blurRadius!=0;
     out=ChromeFrameSurface(m,effects);return true;
 }
 uint32_t WmDesktopSurfaceRecords(BrookDesktopSurface* out,uint32_t max) {
@@ -3036,6 +3047,8 @@ BrookDesktopSurface WmShellSurfaceRecord(const WmShellSurface& surface,uint64_t 
     case WmShellSurfaceKind::Launcher: kind=BROOK_DESKTOP_SURFACE_LAUNCHER;break;
     case WmShellSurfaceKind::VolumePopup: kind=BROOK_DESKTOP_SURFACE_VOLUME_POPUP;break;
     case WmShellSurfaceKind::TrayTooltip: kind=BROOK_DESKTOP_SURFACE_TOOLTIP;break;
+    case WmShellSurfaceKind::TrayFlyout: kind=BROOK_DESKTOP_SURFACE_TRAY_FLYOUT;break;
+    case WmShellSurfaceKind::PerformanceHud: kind=BROOK_DESKTOP_SURFACE_PERFORMANCE_HUD;break;
     case WmShellSurfaceKind::BootSummary: kind=BROOK_DESKTOP_SURFACE_BOOT_SUMMARY;break;
     }
     return ChromeShellSurfaceRecord(kind,{surface.x,surface.y,int(surface.w),int(surface.h)},surface.material,key,
@@ -3114,18 +3127,8 @@ int64_t WmDesktopChromeCapture(const WmDesktopLayers& layers,uint32_t index,
     };
     const bool noMouse=mouseX==-1 && mouseY==-1;
     RenderWindowChrome(pixels,width,width,height,local,noMouse?-1:relative(mouseX,originX),noMouse?-1:relative(mouseY,originY));
-    // The client interior remains transparent; only the frame is marked.
-    // Glass resolves only for a renderer that reported backdrop blur (layers
-    // op 18): it then gets the same glass alpha as virgl's chrome layer.
-    if(CompositorGlassActive()){
-        const bool rounded=local.state!=WindowState::Maximized && !local.blurRadius;
-        ChromeMarkFrameGlass(pixels,width,width,height,{0,0,width,height},
-                             {local.clientX(),local.clientY(),local.clientW,local.clientH},WmMetric(WM_BORDER_WIDTH),
-                             CompositorMaterialOpacity(),local.focused?WmCurrentPalette().text:WmCurrentPalette().mutedText,
-                             WmCurrentPalette().accent,rounded?&WmChromeMaterial():nullptr,local.focused);
-    }else
-    ChromeMarkFrameOpaque(pixels,width,width,height,{0,0,width,height},
-                          {local.clientX(),local.clientY(),local.clientW,local.clientH});
+    if(CompositorGlassActive() && local.state!=WindowState::Maximized && !local.blurRadius)
+        ChromeMaskFrameCorners(pixels,width,width,height,{0,0,width,height},WmChromeMaterial(),local.focused);
     ProcessUnref(local.proc);
     return (tolerateVisualChanges?WmDesktopLayersCaptureCurrent(layers):WmDesktopLayersCurrent(layers))?0:-116;
 }

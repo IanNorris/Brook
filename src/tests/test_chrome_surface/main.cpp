@@ -39,7 +39,7 @@ int main(){
     for(unsigned r=0;r<20;++r)for(unsigned row=0;row<24;++row)CHECK(brook_chrome_corner_inset(r,row)==OldCornerInset(r,row));
     for(uint32_t scale:{1u,2u}){
         const ChromeSurfaceEffects opaque{false,0,0,0,16*scale,24*scale,0};
-        const ChromeSurfaceEffects glass{true,6,7*scale,2*scale,16*scale,24*scale,4*scale};
+        const ChromeSurfaceEffects glass{true,6,8*scale,2*scale,16*scale,28*scale,12*scale,true};
         for(int maximised=0;maximised<2;++maximised)for(int focused=0;focused<2;++focused)for(int csd=0;csd<2;++csd){
             ChromeFrameSurfaceModel m{};
             m.window=3;m.incarnation=99;m.key=1234;m.clientDecorated=csd;m.maximised=maximised;m.focused=focused;
@@ -54,23 +54,31 @@ int main(){
             CHECK(((o.flags&BROOK_DESKTOP_SURFACE_OPAQUE)!=0)==(!csd || maximised));
             if(!csd)CHECK(o.clientX==104 && o.clientY==90 && o.clientWidth==392 && o.clientHeight==256);
             else CHECK(!o.clientWidth && !o.clientHeight);
-            // Glass: translucent, the window shadow when normal, radii from the masks.
-            CHECK(g.material==BROOK_DESKTOP_MATERIAL_GLASS && g.level==6 && !(g.flags&BROOK_DESKTOP_SURFACE_OPAQUE));
+            // A CSD overlay remains opaque over the client's own title strip.
+            CHECK(g.material==(csd?BROOK_DESKTOP_MATERIAL_OPAQUE:BROOK_DESKTOP_MATERIAL_GLASS));
+            CHECK(g.level==(csd?0u:6u));
+            CHECK((g.flags&BROOK_DESKTOP_SURFACE_OPAQUE)!=0 ? csd && maximised : !csd || !maximised);
             const bool shadow=!csd && !maximised;
-            CHECK((g.shadow==BROOK_DESKTOP_SHADOW_WINDOW)==shadow);
-            if(shadow)CHECK(g.shadowAlpha==(focused?255u:180u) && g.shadowSpread==16*scale && g.shadowCorner==24*scale &&
-                            g.radii[0]==7*scale && g.radii[1]==7*scale && g.radii[2]==2*scale && g.radii[3]==2*scale);
+            CHECK(g.shadow==(shadow?(focused?BROOK_DESKTOP_SHADOW_WINDOW_ACTIVE:BROOK_DESKTOP_SHADOW_WINDOW_INACTIVE):
+                                     BROOK_DESKTOP_SHADOW_NONE));
+            if(shadow)CHECK(g.shadowAlpha==255 && g.shadowSpread==16*scale && g.shadowCorner==28*scale &&
+                            g.radii[0]==8*scale && g.radii[1]==8*scale && g.radii[2]==2*scale && g.radii[3]==2*scale &&
+                            (g.flags&BROOK_DESKTOP_SURFACE_LIGHT_SHADOW));
             if(!csd && maximised)CHECK(!g.radii[0] && !g.radii[1] && !g.radii[2] && !g.radii[3]);
         }
         // Shell surfaces: opaque outside glass; material ones translucent under it.
-        for(uint32_t kind=BROOK_DESKTOP_SURFACE_TASKBAR;kind<=BROOK_DESKTOP_SURFACE_BOOT_SUMMARY;++kind){
-            const bool material=kind!=BROOK_DESKTOP_SURFACE_BOOT_SUMMARY;
+        for(uint32_t kind=BROOK_DESKTOP_SURFACE_TASKBAR;kind<=BROOK_DESKTOP_SURFACE_PERFORMANCE_HUD;++kind){
+            const bool material = true;
             const auto o=ChromeShellSurfaceRecord(kind,{0,1000,1920,80},material,77,180,opaque);
             const auto g=ChromeShellSurfaceRecord(kind,{0,1000,1920,80},material,77,180,glass);
             CHECK(o.kind==kind && o.key==77 && o.opacity==255 && (o.flags&BROOK_DESKTOP_SURFACE_OPAQUE) && !o.radii[0] && !o.shadow);
             CHECK(g.material==(material?BROOK_DESKTOP_MATERIAL_GLASS:BROOK_DESKTOP_MATERIAL_OPAQUE));
-            CHECK(g.opacity==(material?180u:255u) && ((g.flags&BROOK_DESKTOP_SURFACE_OPAQUE)!=0)==!material && !g.shadow);
-            CHECK(g.radii[0]==(material && kind!=BROOK_DESKTOP_SURFACE_TASKBAR?4*scale:0));
+            CHECK(g.opacity==180 && !(g.flags&BROOK_DESKTOP_SURFACE_OPAQUE));
+            const bool panel = kind != BROOK_DESKTOP_SURFACE_TASKBAR;
+            const bool shadow = panel && kind != BROOK_DESKTOP_SURFACE_TOOLTIP;
+            for (auto radius : g.radii) CHECK(radius == (panel ? 12 * scale : 0));
+            CHECK(g.shadow == (shadow ? BROOK_DESKTOP_SHADOW_PANEL : BROOK_DESKTOP_SHADOW_NONE));
+            if (shadow) CHECK(g.shadowAlpha == 255 && g.shadowSpread == 16 * scale && g.shadowCorner == 28 * scale);
         }
     }
     // Nine-slice pieces against the old GpuComposeShadow arithmetic.
@@ -94,5 +102,18 @@ int main(){
     CHECK(brook_chrome_shadow_pixel(32,32)==0 && brook_chrome_shadow_pixel(0,0)==0);
     CHECK((brook_chrome_shadow_pixel(10,32)&0xffffff)==BROOK_CHROME_SHADE);
     for(unsigned y=0;y<64;++y)for(unsigned x=0;x<64;++x)CHECK(brook_chrome_shadow_pixel(x,y)==OldShadowPixel(x,y));
+    for(unsigned kind=BROOK_DESKTOP_SHADOW_WINDOW_ACTIVE;kind<=BROOK_DESKTOP_SHADOW_PANEL;++kind){
+        const unsigned y=brook_chrome_shadow_tile_y(kind,BROOK_DESKTOP_SURFACE_LIGHT_SHADOW);
+        CHECK(brook_chrome_shadow_atlas_pixel(32,y+32)==0);
+        CHECK(brook_chrome_shadow_atlas_pixel(32,y)==0 && brook_chrome_shadow_atlas_pixel(32,y+63)==0);
+        CHECK((brook_chrome_shadow_atlas_pixel(32,y+49)&0xffffff)==0x142238);
+        BrookChromeShadowPiece piece{};
+        CHECK(brook_chrome_shadow_variant_piece(10,20,400,300,16,28,4,kind,BROOK_DESKTOP_SURFACE_LIGHT_SHADOW,&piece));
+        CHECK(piece.sy==y+28 && piece.sw==28 && piece.sh==8);
+    }
+    const unsigned active=brook_chrome_shadow_atlas_pixel(32,brook_chrome_shadow_tile_y(BROOK_DESKTOP_SHADOW_WINDOW_ACTIVE,0)+54)>>24;
+    const unsigned panel=brook_chrome_shadow_atlas_pixel(32,brook_chrome_shadow_tile_y(BROOK_DESKTOP_SHADOW_PANEL,0)+54)>>24;
+    const unsigned inactive=brook_chrome_shadow_atlas_pixel(32,brook_chrome_shadow_tile_y(BROOK_DESKTOP_SHADOW_WINDOW_INACTIVE,0)+54)>>24;
+    CHECK(active>panel && panel>inactive);
     std::puts("CHROME_SURFACE PASS");
 }

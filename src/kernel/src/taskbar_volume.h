@@ -55,7 +55,8 @@ inline int TaskbarVolumeSliderX(const DesktopRect& track, uint32_t percent) {
 }
 
 struct TaskbarVolumePopupLayout {
-    DesktopRect panel, mute, track, value;
+    DesktopRect panel, title, mute, track, value;
+    int thumbSize;
 };
 
 // A panel above the taskbar centred on the icon and kept on screen:
@@ -65,24 +66,32 @@ inline TaskbarVolumePopupLayout TaskbarVolumePopup(const DesktopMetrics& m, cons
                                                    int taskbarY, int screenW, int valueTextW,
                                                    const DesktopRect* avoid = nullptr) {
     TaskbarVolumePopupLayout l{};
-    const int pad = m.pixels(10), button = m.pixels(32);
-    const int w = m.pixels(240), h = button + 2 * pad;
-    const int margin = m.pixels(4);
+    const int pad = m.pixels(16), button = m.pixels(36), header = m.pixels(32);
+    const int margin = m.pixels(8);
+    const int available = screenW - 2 * margin;
+    const int preferred = m.pixels(304);
+    const int w = preferred < available ? preferred : available;
+    const int h = button + header + 2 * pad;
+    if (w < m.pixels(160)) return l;
+    l.thumbSize = m.pixels(20);
     int x = icon.x + icon.w / 2 - w / 2;
     if (x + w > screenW - margin) x = screenW - margin - w;
     if (x < margin) x = margin;
-    int y = taskbarY - h - m.pixels(2);
+    int y = taskbarY - h - margin;
     if (avoid && avoid->w > 0 && avoid->h > 0 && x < avoid->x + avoid->w && avoid->x < x + w &&
         y < avoid->y + avoid->h && avoid->y < y + h)
-        y = avoid->y - h - m.pixels(2);
+        y = avoid->y - h - margin;
     if (y < 0) y = 0;
     l.panel = {x, y, w, h};
-    l.mute = {x + pad, y + pad, button, button};
+    l.title = {x + pad, y + pad, w - 2 * pad, header};
+    const int controlsY = y + pad + header;
+    l.mute = {x + pad, controlsY, button, button};
     const int valueW = valueTextW > 0 ? valueTextW : m.pixels(36);
-    l.value = {x + w - pad - valueW, y + pad, valueW, button};
-    const int trackX = l.mute.x + button + pad + m.pixels(6);
-    const int trackRight = l.value.x - pad - m.pixels(6);
-    l.track = {trackX, y + pad, trackRight > trackX ? trackRight - trackX : 0, button};
+    l.value = {x + w - pad - valueW, controlsY, valueW, button};
+    const int trackGap = m.pixels(12);
+    const int trackX = l.mute.x + button + trackGap;
+    const int trackRight = l.value.x - trackGap;
+    l.track = {trackX, controlsY, trackRight > trackX ? trackRight - trackX : 0, button};
     return l;
 }
 
@@ -101,11 +110,11 @@ inline DesktopRect TaskbarTooltipBox(const DesktopRect& icon, int w, int h, int 
 enum class TaskbarVolumeHit : uint8_t { Outside, Panel, Mute, Slider };
 
 // The slider accepts the whole row height, plus the knob overhang at the ends.
-inline TaskbarVolumeHit TaskbarVolumePopupHit(const DesktopMetrics& m, const TaskbarVolumePopupLayout& l,
+inline TaskbarVolumeHit TaskbarVolumePopupHit(const DesktopMetrics&, const TaskbarVolumePopupLayout& l,
                                               int x, int y) {
     if (!l.panel.contains(x, y)) return TaskbarVolumeHit::Outside;
     if (l.mute.contains(x, y)) return TaskbarVolumeHit::Mute;
-    const int slop = m.pixels(6);
+    const int slop = l.thumbSize / 2;
     const DesktopRect grab{l.track.x - slop, l.track.y, l.track.w + 2 * slop, l.track.h};
     if (grab.contains(x, y)) return TaskbarVolumeHit::Slider;
     return TaskbarVolumeHit::Panel;
