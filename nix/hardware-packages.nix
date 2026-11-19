@@ -65,7 +65,7 @@ let
     # its container; ship it in the profile rather than relying on /usr/bin.
     (pkgs.lib.getBin pkgs.util-linuxMinimal)
     pkgs.hicolor-icon-theme pkgs.adwaita-icon-theme pkgs.kdePackages.breeze-icons pkgs.shared-mime-info
-    fonts cursors launchers
+    fonts cursors launchers (import ./desktop-settings.nix { inherit pkgs; })
   ] ++ native;
 in {
   inherit packages;

@@ -80,7 +80,7 @@ in {
       pkgs.bash pkgs.coreutils pkgs.curl.bin pkgs.xz.bin pkgs.zstd.bin pkgs.cacert
       pkgs.python3 pkgs.ffmpeg.bin pkgs.wayland pkgs.mesa
       pkgs.libreoffice pkgs.gimp pkgs.qalculate-gtk pkgs.xfce.mousepad
-      pkgs.kdePackages.breeze-icons
+      pkgs.kdePackages.breeze-icons (import ./desktop-settings.nix { inherit pkgs; })
       firefox chromium
       waylandd calc player files settings message gallery fonts cursors launchers session
     ];

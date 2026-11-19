@@ -16,8 +16,15 @@ _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review 
   as `reclaimable_exec_cache_pages`. `Cached` includes the full executable
   cache. `MemAvailable` includes only its reclaimable subset alongside free
   pages.
-- Release, both kernel audits and all 386 non-stress host tests passed. Logs
-  are in `build/session-env-release.log` and `build/session-env-ctest.log`.
+- The desktop profiles ship GTK 3 and GTK 4 settings and a GSettings schema
+  default for `icon:minimize,maximize,close`. Chromium 148 reads the GTK
+  property. Its launcher carries forward existing keyfile preferences and
+  replaces `BROOK_CHROMIUM_BUTTON_LAYOUT` with normal GTK/GSettings overrides.
+- Release, both kernel audits and all 386 non-stress host tests passed after
+  the follow-up. Both pinned GTK versions respected the packaged defaults and
+  existing overrides on headless displays. Evidence is in
+  `build/session-env-followup-{release,ctest}.log` and
+  `build/session-env-{gtk-probe,desktop-settings,waylandd}.log`.
 
 ## Wayland latency diagnostics (19 November 2026)
 
