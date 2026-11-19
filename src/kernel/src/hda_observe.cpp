@@ -22,6 +22,7 @@
 #include "native_tsc_audio_clock.h"
 #include "audio.h"
 #include "sync/kmutex.h"
+#include "klog.h"
 #include <stddef.h>
 #ifdef BROOK_HOST_TEST
 #include <cstring>
@@ -342,22 +343,56 @@ void ObserveCachePages(Io& io){
 struct RuntimeLock {KMutex mutex{};void init(){KMutexInit(&mutex);}void lock(){KMutexLock(&mutex);}
     bool tryLock(){return KMutexTryLock(&mutex);}void unlock(){KMutexUnlock(&mutex);}};
 using RuntimeOwner=HdaDellStreamOwner<TonePlatform>;using RuntimeBridge=HdaDellAudioBridge<RuntimeOwner,RuntimeLock,true,true>;
-RuntimeOwner* runtimeOwner=nullptr;RuntimeBridge* runtimeBridge=nullptr;
+RuntimeOwner* runtimeOwner=nullptr;RuntimeBridge* runtimeBridge=nullptr;TonePlatform* runtimePlatform=nullptr;
 bool runtimeAudibleEnabled=false,runtimeVolumeHardware=false;
+uint64_t runtimeReportedFaults=0;
+// One line per recorded queue fault, from process context after the bridge
+// call that raised it (never under the bridge lock).
+void ReportRuntimeFault(){
+    if(!runtimeBridge)return;const uint64_t count=runtimeBridge->faultCount();
+    if(__atomic_exchange_n(&runtimeReportedFaults,count,__ATOMIC_ACQ_REL)==count)return;
+    const auto f=runtimeBridge->lastFault();
+    const uint64_t elapsed=f.sampleAfterNs>=f.previousSampleNs && f.previousSampleNs?f.sampleAfterNs-f.previousSampleNs:0;
+    const uint8_t clockFail=runtimePlatform?runtimePlatform->runtimeClock.failReason():0;
+    KLog("HDA_RUNTIME fault %lu stage=%s reason=%s sample=%s epoch=%lu elapsed_ns=%lu lpib=%u prev=%u delta=%u allowed=%lu "
+         "sdctl=0x%x sdsts=0x%x reg_lpib=%u stop_ctl=0x%x muted=%u stopped=%u recoverable=%u clock_fail=%u",
+         f.ordinal,HdaDellFaultStageName(f.stage),HdaDellFaultReasonName(f.reason),HdaDellFaultReasonName(f.sampleReason),
+         f.epoch,elapsed,f.position,f.previousPosition,f.delta,f.allowed,f.atFault.control,unsigned(f.atFault.status),
+         f.atFault.lpib,f.afterStop.control,unsigned(f.muted),unsigned(f.stopped),unsigned(f.recoverable),unsigned(clockFail));
+    SerialPrintf("HDA_RUNTIME fault %lu stage=%s reason=%s sample=%s sdsts=0x%x recoverable=%u clock_fail=%u\n",
+         f.ordinal,HdaDellFaultStageName(f.stage),HdaDellFaultReasonName(f.reason),HdaDellFaultReasonName(f.sampleReason),
+         unsigned(f.atFault.status),unsigned(f.recoverable),unsigned(clockFail));
+}
 int RuntimePlay(const void* p,uint32_t n,uint32_t hz,uint8_t ch,uint8_t bits,bool){return runtimeBridge?runtimeBridge->play(p,n,hz,ch,bits):-19;}
 void RuntimeStop(){if(runtimeBridge){const bool ok=runtimeBridge->stop();
     __atomic_fetch_add(&observation.runtimeStops,1u,__ATOMIC_RELAXED);
-    if(!ok)__atomic_fetch_add(&observation.runtimeStopFailures,1u,__ATOMIC_RELAXED);}}
+    if(!ok)__atomic_fetch_add(&observation.runtimeStopFailures,1u,__ATOMIC_RELAXED);ReportRuntimeFault();}}
 bool RuntimePlaying(){return runtimeBridge && runtimeBridge->isPlaying();}
-uint32_t RuntimePosition(){AudioDeviceProgress p{};return runtimeBridge && runtimeBridge->progress(&p)?uint32_t(p.completed):0;}
+uint32_t RuntimePosition(){AudioDeviceProgress p{};const bool ok=runtimeBridge && runtimeBridge->progress(&p);ReportRuntimeFault();return ok?uint32_t(p.completed):0;}
 void RuntimeService(){if(runtimeBridge){runtimeBridge->service();
     if(runtimeAudibleEnabled)runtimeBridge->reconcileOutput([]{const auto value=AudioOutputControlSnapshot();
-        return HdaDellOutputRequest{(value&AudioUserUnmuteBit)!=0,value&~AudioUserUnmuteBit};},runtimeVolumeHardware);}}
-AudioSubmitReceipt RuntimeSubmit(const void* p,uint32_t n){return runtimeBridge?runtimeBridge->submit(p,n):AudioSubmitReceipt{0,0,0,-19};}
-bool RuntimeProgress(AudioDeviceProgress* p){return runtimeBridge && runtimeBridge->progress(p);}
-bool RuntimeRestart(uint64_t epoch){if(!runtimeBridge)return false;const bool ok=runtimeBridge->restart(epoch);
+        return HdaDellOutputRequest{(value&AudioUserUnmuteBit)!=0,value&~AudioUserUnmuteBit};},runtimeVolumeHardware);
+    ReportRuntimeFault();}}
+AudioSubmitReceipt RuntimeSubmit(const void* p,uint32_t n){if(!runtimeBridge)return AudioSubmitReceipt{0,0,0,-19};
+    const auto r=runtimeBridge->submit(p,n);ReportRuntimeFault();return r;}
+bool RuntimeProgress(AudioDeviceProgress* p){const bool ok=runtimeBridge && runtimeBridge->progress(p);ReportRuntimeFault();return ok;}
+// A quarantined runtime can never restart this boot: refuse without counting
+// it as an attempt (the mixer also backs off), and log only the first refusal.
+bool RuntimeRestart(uint64_t epoch){if(!runtimeBridge)return false;
+    if(runtimeBridge->restartPermanentlyRefused()){
+        if(!__atomic_fetch_add(&observation.runtimeRestartRefused,1u,__ATOMIC_RELAXED))
+            KLog("HDA_RUNTIME restart refused: runtime quarantined for this boot (epoch %lu)",epoch);
+        return false;}
+    const bool recovering=runtimeBridge->recovery().pending;
+    const bool ok=runtimeBridge->restart(epoch);
     __atomic_fetch_add(&observation.runtimeRestarts,1u,__ATOMIC_RELAXED);
-    if(!ok)__atomic_fetch_add(&observation.runtimeRestartFailures,1u,__ATOMIC_RELAXED);return ok;}
+    if(!ok)__atomic_fetch_add(&observation.runtimeRestartFailures,1u,__ATOMIC_RELAXED);
+    if(recovering){const auto r=runtimeBridge->recovery();
+        KLog("HDA_RUNTIME fault recovery %s attempt=%u successes=%u/%u failed_step=%u",ok?"ok":"failed; quarantined",
+             r.attempts,r.successes,r.budget,unsigned(r.lastFailure));
+        SerialPrintf("HDA_RUNTIME fault recovery %s attempt=%u successes=%u failed_step=%u\n",ok?"ok":"failed",
+             r.attempts,r.successes,unsigned(r.lastFailure));}
+    ReportRuntimeFault();return ok;}
 void PrepareRuntime(Io& io){
     // Admission is boot-bound. Hotplug, suspend and cache reprogramming must
     // invalidate it before any of those features can be used with this driver.
@@ -370,6 +405,7 @@ void PrepareRuntime(Io& io){
     const auto& clock=NativeTscObserveRead();if(!clock.consistent || !Marker("/etc/audio-muted")){observation.runtimeReason="native clock or boot mute unavailable";return;}
     alignas(TonePlatform) static unsigned char platformStorage[sizeof(TonePlatform)];
     auto* platform=::new(platformStorage) TonePlatform{io,observation.session};platform->expectedPages=17;platform->runtimeMode=true;
+    runtimePlatform=platform;
 #ifdef BROOK_HOST_TEST
     const uint64_t origin=1;
 #else
@@ -385,6 +421,11 @@ void PrepareRuntime(Io& io){
     // offset bound, not systematic PIT calibration error or future drift.
     runtimeBridge=::new(bridgeStorage) RuntimeBridge(*runtimeOwner,lock,line,4096,1024,20000,Marker("/etc/dell-hda-queue-probe"));
     runtimeAudibleEnabled=Marker("/etc/dell-hda-audible");
+    // Opt-in bounded recovery from software-timing faults (see
+    // HdaDellAudioBridge::enableFaultRecovery). Off by default until a
+    // physical trial; every uncertain step still quarantines permanently.
+    if(Marker("/etc/dell-hda-fault-recovery"))
+        observation.runtimeFaultRecoveryEnabled=runtimeBridge->enableFaultRecovery(HdaRuntimeFaultRecoveryBudget,HdaRuntimeFaultRecoverySpacingNs);
     observation.runtimeAudibleEnabled=runtimeAudibleEnabled;
     observation.runtimePrepared=true;observation.runtimeReason="prepared muted";
 }
@@ -543,4 +584,12 @@ uint32_t HdaRuntimeStreamFailureDetail(){return runtimeOwner?runtimeOwner->faile
 bool HdaRuntimeDrainClockAvailable(){return observation.runtimeRegistered && runtimeBridge;}
 uint64_t HdaRuntimeDrainClockNs(){return HdaRuntimeDrainClockAvailable()?runtimeBridge->drainClockNs():0;}
 HdaDellQueueDiagnostics HdaRuntimeQueueDiagnostics(){return runtimeBridge?runtimeBridge->diagnostics():HdaDellQueueDiagnostics{};}
+HdaRuntimeFaultSnapshot HdaRuntimeFaults(){
+    HdaRuntimeFaultSnapshot s{};if(!runtimeBridge)return s;
+    s.count=runtimeBridge->faultCount();s.first=runtimeBridge->firstFault();s.last=runtimeBridge->lastFault();
+    s.recovery=runtimeBridge->recovery();
+    if(runtimePlatform){const auto& c=runtimePlatform->runtimeClock;s.clockFailed=c.failed();s.clockFailReason=c.failReason();
+        s.clockFailCpu=c.failCpu();s.clockLastCpu=c.lastCpu();s.clockFailTsc=c.failTsc();s.clockFailLast=c.failLast();s.clockKhz=c.khz();}
+    return s;
+}
 }

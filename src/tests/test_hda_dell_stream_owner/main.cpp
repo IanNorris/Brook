@@ -23,8 +23,54 @@ struct Platform:Chip {
     uint32_t read32(uint32_t o){if(o==base+4 && (read16(base)&2)){pos=(pos+192)%65536;return pos;}return Chip::read32(o);}
     void quarantine(){held=true;}
 };
+// Real owner + queue over the fake controller: the recovery path is the
+// owner's verified stop, retire (SRST + descriptor clear) and reprepare.
+static void FaultRecovery(const HdaSessionReport& snapshot){
+    using Owner=HdaDellStreamOwner<Platform>;uint8_t samples[128];std::memset(samples,0x39,sizeof(samples));
+    {Platform p;p.format=0x31;Owner owner(p,snapshot,64);assert(owner.prepare());
+        HdaDellStreamQueue<Owner> q(owner,64,4096);q.allowRecovery(true);assert(q.start());
+        assert(q.submit(samples,sizeof(samples)).accepted);for(unsigned i=0;i<10;++i)assert(q.service());
+        p.ns+=AudioDmaClock::MaxSampleNs;assert(!q.service() && q.recoverable());
+        auto f=q.lastFault();assert(f.reason==HdaDellFaultReason::ServiceLate && f.muted && f.stopped && f.recoverable);
+        assert(f.atFault.valid && (f.atFault.control&2) && f.atFault.command==6 && f.atFault.bdpl==0x1000 && f.atFault.cbl==65536);
+        assert(f.afterStop.valid && !(f.afterStop.control&3) && f.afterStop.command==2);
+        assert(!p.held && p.pci==2 && p.pin[0]==0x80 && p.pin[1]==0x80 && !owner.failureStage());
+        const auto epoch=q.progress().epoch;
+        assert(owner.retireRetained() && owner.prepareRetained() && q.recoverAfterVerifiedFault(epoch));
+        assert(p.allocated==17 && !p.freed && !p.held && p.pos==0);
+        assert(q.start() && p.pci==6);for(unsigned i=1;i<17;++i)for(unsigned j=0;j<4096;++j)assert(p.device[i][j]==0);
+        auto r=q.submit(samples,sizeof(samples));assert(r.accepted && r.epoch==epoch+1);for(unsigned i=0;i<10;++i)assert(q.service());
+        assert(q.shutdown() && owner.retire() && p.freed==17 && p.pci==0 && !p.held);}
+    // FIFOE alone (output underrun) is admitted; the reprepare clears it.
+    {Platform p;p.format=0x31;Owner owner(p,snapshot,64);assert(owner.prepare());
+        HdaDellStreamQueue<Owner> q(owner,64,4096);q.allowRecovery(true);assert(q.start());
+        p.mem[Chip::base+3]|=0x08;assert(!q.service() && q.recoverable() && q.lastFault().reason==HdaDellFaultReason::DeviceError);
+        assert(q.lastFault().atFault.status&0x08);
+        assert(owner.retireRetained() && owner.prepareRetained() && q.recoverAfterVerifiedFault(q.progress().epoch));
+        assert(!(p.mem[Chip::base+3]&0x18) && q.start() && q.service());}
+    // DESE (descriptor error) is never admitted: quarantined, pages retained.
+    {Platform p;p.format=0x31;Owner owner(p,snapshot,64);assert(owner.prepare());
+        HdaDellStreamQueue<Owner> q(owner,64,4096);q.allowRecovery(true);assert(q.start());
+        p.mem[Chip::base+3]|=0x10;assert(!q.service() && !q.recoverable() && p.held && !p.freed && p.pci==2);
+        assert(owner.failureStage()==10 && !owner.retireRetained() && !owner.prepareRetained());}
+    // A stop that never observes RUN clear is never admitted.
+    {Platform p;p.format=0x31;Owner owner(p,snapshot,64);assert(owner.prepare());
+        HdaDellStreamQueue<Owner> q(owner,64,4096);q.allowRecovery(true);assert(q.start());p.dropStop=true;
+        p.ns+=AudioDmaClock::MaxSampleNs;assert(!q.service() && !q.recoverable() && p.held && p.pci==6 && !q.lastFault().stopped);}
+    // A stream reset that does not complete during retire quarantines.
+    {Platform p;p.format=0x31;Owner owner(p,snapshot,64);assert(owner.prepare());
+        HdaDellStreamQueue<Owner> q(owner,64,4096);q.allowRecovery(true);assert(q.start());
+        p.ns+=AudioDmaClock::MaxSampleNs;assert(!q.service() && q.recoverable());p.dropRetireReset=true;
+        assert(!owner.retireRetained() && p.held && !p.freed && p.pin[0]==0x80 && owner.failureStage()==14);
+        q.abandonRecovery();assert(!q.recoverAfterVerifiedFault(q.progress().epoch));}
+    // Identity change before reprepare quarantines.
+    {Platform p;p.format=0x31;Owner owner(p,snapshot,64);assert(owner.prepare());
+        HdaDellStreamQueue<Owner> q(owner,64,4096);q.allowRecovery(true);assert(q.start());
+        p.ns+=AudioDmaClock::MaxSampleNs;assert(!q.service() && owner.retireRetained());p.identity=false;
+        assert(!owner.prepareRetained() && p.held && !p.freed && owner.failureStage()==20);}
+}
 int main(){
-    auto snapshot=makeSnapshot();snapshot.converterFormat=0x31;
+    auto snapshot=makeSnapshot();snapshot.converterFormat=0x31;FaultRecovery(snapshot);
     Platform p;p.format=0x31;HdaDellStreamOwner<Platform> owner(p,snapshot,64);assert(owner.prepare());
     HdaDellStreamQueue<HdaDellStreamOwner<Platform>> q(owner,64,4096);assert(q.start());
     assert(p.pci==6 && p.pin[0]==0x80 && p.pin[1]==0x80 && p.runConverterFormat==0x4011 && p.runStreamFormat==0x4011);

@@ -23,7 +23,8 @@ struct HdaObservation {
     bool runtimeAudibleEnabled=false;
     uint32_t runtimePagesValidated=0,runtimePageRejections=0;
     bool runtimeShutdown=false,runtimeShutdownOk=false;
-    uint32_t runtimeStops=0,runtimeStopFailures=0,runtimeRestarts=0,runtimeRestartFailures=0;
+    uint32_t runtimeStops=0,runtimeStopFailures=0,runtimeRestarts=0,runtimeRestartFailures=0,runtimeRestartRefused=0;
+    bool runtimeFaultRecoveryEnabled=false;
     uint32_t runtimeDelayInterruptsOff=0;
     const char* runtimeReason="not requested";
     bool cacheRequested=false,cacheCaptured=false,cacheMatch=false;
@@ -48,4 +49,14 @@ uint32_t HdaRuntimeStreamFailureDetail();
 bool HdaRuntimeDrainClockAvailable();
 uint64_t HdaRuntimeDrainClockNs();
 HdaDellQueueDiagnostics HdaRuntimeQueueDiagnostics();
+// /etc/dell-hda-fault-recovery: at most this many verified recoveries per
+// boot; a fault sooner than the spacing after the last recovery is terminal.
+inline constexpr uint32_t HdaRuntimeFaultRecoveryBudget=3;
+inline constexpr uint64_t HdaRuntimeFaultRecoverySpacingNs=10000000000ULL;
+struct HdaRuntimeFaultSnapshot {
+    uint64_t count=0;HdaDellQueueFault first{},last{};HdaDellRecoveryStatus recovery{};
+    bool clockFailed=false;uint8_t clockFailReason=0;uint32_t clockFailCpu=0,clockLastCpu=0,clockKhz=0;
+    uint64_t clockFailTsc=0,clockFailLast=0;
+};
+HdaRuntimeFaultSnapshot HdaRuntimeFaults();
 }
