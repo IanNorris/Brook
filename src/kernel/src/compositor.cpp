@@ -3906,10 +3906,16 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
             for (unsigned i = 0; i < cache.count; ++i) {
                 const auto& r = records[i];
                 if (r.material != BROOK_DESKTOP_MATERIAL_GLASS) continue;
-                // Leave the curved rim over the sharp scene to keep this
-                // shared shell barrier within the frame's quad budget.
+                // Leave only the curved corners sharp. The centre of the
+                // top and bottom edges shares the same blurred backdrop.
                 const int radius = r.radii[0];
-                GpuComposeRectBlur(gpu, r.x, r.y + radius, r.width, r.height - 2 * radius);
+                const int width = r.width, height = r.height;
+                GpuComposeRectBlur(gpu, r.x, r.y + radius, width, height - 2 * radius);
+                if (radius) {
+                    const int inner = width - 2 * radius;
+                    GpuComposeRectBlur(gpu, r.x + radius, r.y, inner, radius);
+                    GpuComposeRectBlur(gpu, r.x + radius, r.y + height - radius, inner, radius);
+                }
             }
         }
         for (unsigned i = 0; i < cache.count; ++i) {

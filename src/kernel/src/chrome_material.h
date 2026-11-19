@@ -123,9 +123,10 @@ inline uint32_t ChromeMaskedRim(uint32_t fill,unsigned coverage,unsigned inner,u
 inline uint32_t ChromeShadowPixel(unsigned x,unsigned y) {
     return brook_chrome_shadow_pixel(x,y);
 }
-static constexpr unsigned ChromeGlassWindowLimit=7,ChromeShadowWindowLimit=3,ChromeShadowShellLimit=2;
+static constexpr unsigned ChromeGlassWindowLimit=6,ChromeShadowWindowLimit=3,ChromeShadowShellLimit=2;
 // 32 clients+four decoration strips; up to six rounded backdrop bands/window;
-// eight shadow patches per eligible window; desktop/shell/cursor/boot popup.
-static_assert(32*5+ChromeGlassWindowLimit*6+(ChromeShadowWindowLimit+ChromeShadowShellLimit)*8+9<=256,
+// Eight patches per shadow, up to ten shell blur bands (one taskbar and
+// three rounded panels), four shell surfaces, wallpaper and cursor.
+static_assert(32*5+ChromeGlassWindowLimit*6+(ChromeShadowWindowLimit+ChromeShadowShellLimit)*8+16<=256,
               "Material effects must fit the driver's frame quad budget");
 }
