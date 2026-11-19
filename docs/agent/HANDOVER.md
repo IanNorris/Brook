@@ -95,7 +95,14 @@ _Last updated: 19 November 2026 (early), by a Claude Code session; see "19 Nov e
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
-**19 Nov early morning: Dell on gen 450 = `work/integration48` 4d178694** (int47 + `work/clearwater-review` a6fa4b03, the Fable 5.2 High visual review; session `1c46db9ff14d4ab0bf3799c507d50bfa`).
+**19 Nov: Dell on gen 451 = `work/integration49` 095ae70e** (int48 + the supervisor blur marker; session `3fee9d88a60c4cd6b5c8c05260c9de3d`).
+- **Glass is live.** Blur is enabled by the persistent marker `/nix/var/brook/render-blur`; delete it and reboot to turn blur off. `/etc` is rebuilt from the initrd at every boot.
+- **Ian's verdict:** a little stuttery while dragging (touchpad possibly a factor). The blur is low quality over text and shimmers.
+- **Drag numbers:** 32 fps, 17 ms submit→fence, 2,246 blur rebuilds.
+- **Cause:** point-sampled decimation into a 480×270 atlas plus sparse 5-tap crosses.
+- **Fix in progress** (Claude agent, `work/glass-blur`): Ian's technique, a progressive 2× bilinear downsample mip chain whose depth sets strength, then a progressive bilinear upsample. Capture origin snapped to the grid. GPU timestamps for the blur passes.
+
+**Previous: gen 450 = `work/integration48` 4d178694** (int47 + `work/clearwater-review` a6fa4b03, the Fable 5.2 High visual review; session `1c46db9ff14d4ab0bf3799c507d50bfa`).
 - **Review changes:** a seven-role type scale (was one 16 px face), prototype line icons, a state-based taskbar (pill only when focused, open or hovered), one-line CPU/MEM chips, Hack build label, flyout/HUD/boot-toast layout.
 - **Evidence:** `clearwater-review/build/cwreview-evidence/final/compare/`; sent to Ian. 383 non-stress tests pass; QEMU check passes.
 - **Ian to eye at 200%:** text size (26 px titles, from 32), icons, taskbar states, live network/temperature/volume flyouts, Alt+P, the boot toast, the launcher margins.
