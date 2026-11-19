@@ -5,7 +5,10 @@
 implemented on `work/compositor-refactor`; stages 1.1 and 1.2 on
 `work/clearwater-s1` (see [Stage 1.1/1.2 evidence](#stage-11-and-12-evidence));
 stages 1.3 and 1.4 on `work/clearwater-s1b` (see [Stage 1.3/1.4
-evidence](#stage-13-and-14-evidence)). It covers the [Clearwater Next design](DESIGN.md)
+evidence](#stage-13-and-14-evidence)); stage 1.5 and stage 2 steps 2.1–2.3
+on `work/clearwater-s2` (see [Stage 1.5 and 2.1–2.3
+evidence](#stage-15-and-21-23-evidence), which also specifies the
+capability ABI). It covers the [Clearwater Next design](DESIGN.md)
 and the [compositor direction](../../compositor-direction.md).
 
 Line numbers refer to `main` at `0ae38b0d`, before stage 0.1.
@@ -304,17 +307,17 @@ Steps 0.3 and 0.4 landed after `work/chrome-csd` merged into main.
 | **1.2 (done)** | Display lists: frame and shell painters become *build list* plus *CPU execute*:<br>• `chrome_display_list.h` (7 primitives: fill, title rows, corner-clipped fill, material rect, text, icon, square runs), `chrome_style.h` (palette, metrics, font, resolved material);<br>• `chrome_raster` is the freestanding executor; `chrome_frame` and `chrome_shell` are freestanding builders with the taskbar and launcher layouts;<br>• the WM snapshots state into models (`wm_shell_*.inc`) and keeps hit tests and the build-badge spans. | `test_chrome_goldens`: 144 goldens (16 elements × 3 themes × 3 scales); QEMU CPU screenshots identical |
 | **1.3 (done)** | Surface records (material, radii, shadow class, content key):<br>• `chrome_surface.h` builds one record per frame and shell surface, resolved against the backend (shadow and glass radii only under glass);<br>• virgl takes its shadow quads, title-blur radius and shell blur from them; the shadow nine-slice is shared (`brook_chrome_shadow.h`);<br>• layers ABI v2: op 16 (frame records), overlay op 10 (shell records); VKRENDER draws the shadow nine-slice. | Virgl screenshot identical; VKRENDER host quad test against the CPU reference (see Stage 1.3/1.4 evidence) |
 | **1.4 (done)** | • Per-surface overlay keys (display-list hash): the 100 ms check builds lists only, a capture rasterises only changed surfaces, band keys come from surface keys;<br>• no CPU raster of wallpaper, windows or chrome under a lease (one full repaint after);<br>• span-only chrome (op 17) drawn as in-place spans;<br>• opaque frames (spans, caption blocks) occlude in the quad plan, with `work/shell-opaque`'s bands. | Host tests and QEMU screenshots; Dell measurement plan below (not yet run) |
-| 1.5 | Backend `backdrop-blur` capability and theme resolution, replacing `CompositorGlassActive()` | QEMU: software → Opaque, gl → Glass; renderer kill → Opaque stand-in |
+| **1.5 (done)** | Backend `backdrop-blur` capability and theme resolution, replacing `CompositorGlassActive()`:<br>• layers op 18 `BROOK_DESKTOP_RENDERER_CAPS` (bit `BROOK_DESKTOP_CAP_BACKDROP_BLUR`); virgl `BlurSupported`; CPU never;<br>• resolved at every frame boundary, re-resolved on lease loss, renderer exit or a GOP writer;<br>• the VKRENDER yield is removed (glass alpha in chrome and overlay captures for a renderer that reports blur). | QEMU: software → Opaque stand-in, gl → Glass; renderer-kill path by host test (no VKRENDER in QEMU). See [evidence](#stage-15-and-21-23-evidence). |
 
 ### Stage 2: Clearwater visuals, implemented once
 
 This follows DESIGN.md's implementation order. Each step changes the
 builder and theme only, and every backend picks it up.
 
-1. Metrics: title bar 40, taskbar 48 with full-height targets.
-2. Themes: `theme=glass|opaque-light|opaque-dark`, Mixed mode, aliases from
+1. **(done)** Metrics: title bar 40, taskbar 48 with full-height targets.
+2. **(done)** Themes: `theme=glass|opaque-light|opaque-dark`, Mixed mode, aliases from
    the old palette and Performance settings.
-3. Hue derivation in `BrookTheme` with the DESIGN.md tables as test
+3. **(done)** Hue derivation in `BrookTheme` with the DESIGN.md tables as test
    vectors, plus content colours for GTK and native apps.
 4. **VKRENDER backdrop blur** under the glass budget above. Until it lands,
    the Dell resolves Glass to its Opaque stand-in. Once it exists, run the
@@ -827,3 +830,183 @@ Accept if 1–4 hold and 5 shows a complete desktop. Rollback without a
 rebuild: `BROOK_RENDER_SURFACES=0` and `BROOK_RENDER_CHROME_SPANS=0` in the
 renderer environment; the kernel changes have no switch (the previous pair
 is the rollback).
+
+## Stage 1.5 and 2.1–2.3 evidence
+
+Branch `work/clearwater-s2`, based on `work/integration42` (`335de89e`).
+Commits: `97414567` (1.5), `14e5536d` (2.1), `816273d8` (2.2/2.3 themes,
+hue tokens, kernel), `c40a47d1` (2.2/2.3 Settings and app colours).
+
+### Stage 1.5: backdrop-blur capability (renderer ABI)
+
+The material is resolved before any backend sees it. At every frame
+boundary the compositor asks which backend shows the desktop and whether it
+can blur (`CompositorBackendBlur`), and the WM resolves the theme against
+it (`WmSetBackendBlur`); a change bumps the chrome epoch (every chrome key
+changes, one full repaint). `CompositorGlassActive()` now just reads the
+frame-latched result. The saved selection is never rewritten.
+
+| Backend showing the desktop | backdrop-blur |
+| --- | --- |
+| A renderer holding the present lease | what that process reported with op 18 (below) |
+| virgl (kernel GPU path) | `GpuCompositorOps::BlurSupported()` |
+| CPU path, including lease expiry and a GOP writer | never |
+
+**Layers ABI: op 18, `BROOK_DESKTOP_RENDERER_CAPS`** (syscall `0xB19`,
+`src/shared/desktop_layers_abi.h`):
+
+- Call: `syscall(BROOK_SYS_DESKTOP_LAYERS, 18, address = 0, size = 0,
+  a = BROOK_DESKTOP_CAPS_VERSION (1), b = capability bits, c = 0)`.
+- Bits: `BROOK_DESKTOP_CAP_BACKDROP_BLUR = 1u` (bit 0). All other bits are
+  reserved: unknown bits are dropped, not rejected
+  (`BROOK_DESKTOP_CAP_KNOWN`).
+- Returns (≥ 0) the bits this kernel recorded. Any other argument shape
+  returns `EINVAL`.
+- Owner: the calling process's leader incarnation, the same identity as the
+  present lease and the capture ops. The record counts **only while that
+  owner holds the present lease**. Lease expiry (500 ms without a
+  present), lease release, `GPU_HANDOFF_DETACH` and owner exit all end it;
+  detach and exit also delete the record, so a renderer reports after every
+  attach. A new report replaces the old; `b = 0` withdraws.
+- **Older kernels** return `EINVAL`: a renderer must then assume nothing it
+  reports is used (the kernel keeps Glass at its Opaque stand-in).
+- **Older renderers** never call op 18, so the kernel never resolves Glass
+  for them: every record they receive is opaque, exactly as before.
+- **What the bit promises:** the renderer blurs the desktop beneath every
+  surface record whose `material` is `BROOK_DESKTOP_MATERIAL_GLASS`, with
+  radius `level` (the virgl radius: 2, 8 or 16 output pixels for
+  Light/Moderate/Heavy, `brook_appearance_blur_strength`), and composites
+  the surface over that blurred backdrop at its alpha and `opacity`.
+- **What the kernel then sends,** while the owner holds the lease and the
+  Glass theme is selected:
+  - op 16 frame records and overlay op 10 shell records carry
+    `MATERIAL_GLASS` with the level, glass corner radii and window shadows,
+    and are not marked `BROOK_DESKTOP_SURFACE_OPAQUE`;
+  - chrome captures (ops 7, 8, 11, 12, 17) carry the glass alpha of virgl's
+    chrome layer (`ChromeMarkFrameGlass`, chrome_alpha.h): borders 255,
+    the title bar at the material alpha, title text and the accent stroke
+    255, rounded corners from the material masks. Spans-only captures (op
+    17) write it within the strips. The capture no longer returns `-95`
+    under glass;
+  - overlay captures give glass shell surfaces (taskbar, launcher, volume
+    popup, tooltip) the material alpha where the painters left none, and
+    their op 9 bands are not opaque; the boot summary stays opaque.
+- The renderer (`desktop_renderer.c`, `renderer_capabilities()`) reports 0
+  today and logs `DESKTOP_RENDERER_CAPS requested=… accepted=…`. The blur
+  pass (2.4) sets the bit there. Until then the Dell resolves Glass to its
+  stand-in and nothing changes on screen.
+
+Settings reads the same fact: `0xB02` op 4 returns
+`BROOK_THEME_STATUS_GLASS_AVAILABLE` (1) and `…_GLASS_ACTIVE` (2). The
+debug command `gpu glass status` adds `backend_blur`.
+
+### Stage 2.1: metrics
+
+Title bar 40 (was 36), caption targets 48×40 (was 46), taskbar 48 (was 44).
+Taskbar targets span its full height and abut: launcher button 56 wide,
+terminal and window buttons 48; each pill is drawn inset 5 top and bottom
+and 2 each side (38 high), hover follows the target, so the screen's bottom
+edge and bottom-left corner hit. The caption hover fill, title icon size
+and the repaint stay for 2.5. `test_chrome_layout` checks the spec at
+40/48.
+
+### Stages 2.2 and 2.3: themes and hue
+
+- `brook_theme.h` holds the model: Glass (Light, Mixed or Dark), Opaque
+  Light, Opaque Dark; thirteen hues. The selection word (theme bits 0–3,
+  mode 4–7, hue 8–12; default Glass, Mixed, Blue) is `0xB02` ops 2/3.
+  Without backdrop blur Glass resolves to Opaque Light (Light mode) or
+  Opaque Dark (Mixed and Dark).
+- settings.ini `[Desktop]`: `theme=glass|opaque-light|opaque-dark`,
+  `mode=light|mixed|dark`, `accent=<hue>`. Aliases: `theme=0|1|2` (Blue,
+  Pine green, Slate), `palette=tinted|clearwater|smoked|opal`, `dark=` (the
+  mode when `mode=` is absent), `performance=1` (the Opaque theme for that
+  mode). Named keys win in any order. `opt/glass` on QEMU picks Glass or the
+  Opaque theme for the mode.
+- The appearance word (`0xB0B`) keeps opacity and blur; its dark bit is now
+  "the app content in use is dark" and its performance bit "an Opaque
+  theme is selected". An older Settings that writes disagreeing bits is
+  read through the same aliases. `0xB02` ops 0/1 keep the legacy palette
+  id, mapped to its hue.
+- `brook_hue_derive` (no libm) rotates the Blue reference in OKLCH,
+  applies the Amber/Orange/Red/Navy shaping, clips to sRGB and runs the
+  contrast loop. `brook_theme_build_palette` maps tokens to the painters'
+  palette (Glass: glass tint and title top; Opaque: flat fill everywhere;
+  rim from the accent; red Close hover `#c8414f`).
+- App content colours: `0xB02` op 5 returns one colour of the content set
+  in use (`BROOK_CONTENT_*`, brook_appearance.h). `brook_gtk_appearance.h`
+  writes them as `@define-color brook_*` lines plus rules and follows
+  changes (Settings, Message, and the Gallery when rebuilt); Files reads the
+  same set. Older kernels give the Blue set.
+- Settings: three theme cards, Mode (Light/Mixed/Dark), thirteen hue
+  swatches, Glass opacity and blur. Glass locked: its card, mode, opacity
+  and blur greyed, with "Glass needs GPU acceleration, which this display
+  does not have. Opaque Dark is in use until it does." The Performance
+  switch is gone. Checked headless (Xvfb, syscall shim): glass available,
+  locked, Amber Opaque Light, Slate Opaque Dark locked.
+- Not done here: the re-spaced blur ramp and panels 10 points more solid
+  (both glass visuals, 2.4/2.5), wallpaper sampling (the Wallpaper hue uses
+  `brook-dawn.png`'s value), Files' and the Gallery's other literals.
+
+### Tests
+
+- `test_brook_theme` (new): all thirteen hues against DESIGN.md "Derived
+  tokens", "Values per hue", "Computed contrast" and index.html's generated
+  rows: 327 of 338 colours exact, 11 within one 8-bit level (gamut-clip
+  rounding), every ink alpha, accent token and HUD colour exact, every
+  contrast figure within 0.1 and every target met; Blue reproduces the
+  reference exactly; resolution, selection word and settings aliases.
+- `test_gpu_capture_queue`: the backend capability table (CPU, virgl with
+  and without `BlurSupported`, lease holder with and without the report,
+  another process's report, lease lapse, GOP writer, release drops the
+  report, withdrawal); glass and opaque overlay alpha and opaque masks.
+- `test_window_surfaces`: re-resolution on backend change stales captures;
+  default Glass Mixed Blue resolves to Opaque Dark without blur and Glass
+  with it; appearance-bit aliases; content colours per resolved mode.
+- `test_chrome_alpha`: `ChromeMarkFrameGlass` exact against the old virgl
+  loop (3000 random frames, layer and capture).
+- Goldens, regenerated only for intended changes: 2.1 changed the 99 frame
+  and taskbar images (launcher, popup, tooltip, boot summary unchanged);
+  2.2/2.3 renamed the themes to `glass`, `opaque-light`, `opaque-dark`
+  (Blue, three scales) and added `amber-glass` and `teal-opaque-light` at
+  100%: 176 images.
+- Host suite: 383 run; `test_sched_lock_owner`, `test_audio_delivery` and
+  `test_exec_page_cache` timed out under load 27–40 and pass alone.
+- Compositor package: built with its tests;
+  `brook-desktop-renderer-host-test` (headless, host i915): `HOST_E2E_PASS`,
+  one op 18 report of 0; with `HOST_E2E_OLD_KERNEL_NO_SURFACES=1` (op 18
+  refused): `HOST_E2E_PASS`.
+
+### QEMU (headless, QMP input, no NIC or bridge)
+
+Evidence in `build/cw2-evidence/` (not committed): `cand-cpu/`,
+`cand-gl/`, `detail.png`, `sheet-qemu.png`.
+
+- `gpu=software`: Glass, Mixed, Blue resolves to **Opaque Dark**: flat
+  fill title bar and taskbar, no translucency.
+- `gpu=gl` (virgl): serial `WM: backend backdrop blur available`; **Glass**:
+  translucent blurred taskbar and launcher, the Blue title top.
+- 48 px taskbar with inset pills; a pointer on the screen's bottom row
+  hovers the button above it.
+- Renderer kill → stand-in cannot run in QEMU (no VKRENDER); covered by the
+  host tests above. Two QEMUs sharing the worktree's disk image make one
+  fail to spawn bash; run one at a time.
+
+### Dell pair
+
+`build/dell/pair-cw2` (payload `dell-cw2-20261119`; scanout flip,
+persistent scanout map, zero-copy scanout and video engine on; clean tree
+at `c40a47d1`; kernel `ea51ec3f…`). `check_dell_image_qemu.py --attempts
+4`: PASS. Nothing has run on the Dell. Settings is a store app and needs
+staging separately (and Files, Message for the hue's app colours).
+
+**Check by hand on the Dell (200%):** the desktop comes up Opaque Dark
+(Glass, Mixed saved; the renderer reports no blur yet) or Opaque Light if
+the saved mode was light (an old `dark=0`); title bars 80 px, taskbar 96 px,
+and the bottom screen row and bottom-left corner hit taskbar buttons; in
+Settings the Glass card is greyed with the stand-in named, mode/opacity/blur
+greyed, a hue (e.g. Amber) and Opaque Light apply live to chrome and GTK
+apps and survive a reboot; renderer kill: the CPU desktop returns complete
+and in the same Opaque theme; `DESKTOP_RENDERER_CAPS requested=0 accepted=0`
+in the renderer log.
+
