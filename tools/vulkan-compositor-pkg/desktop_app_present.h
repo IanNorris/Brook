@@ -225,7 +225,7 @@ enum DesktopDirectReason {
     DESKTOP_DIRECT_STRIDE,       /* stride/offset/size outside the plane rules */
     DESKTOP_DIRECT_ABOVE,        /* another window (popup, menu, dialog) over the output */
     DESKTOP_DIRECT_OVERLAY,      /* shell overlay band visible (taskbar, notification) */
-    DESKTOP_DIRECT_CURSOR,       /* pointer visible: Brook has no hardware cursor plane */
+    DESKTOP_DIRECT_CURSOR,       /* software cursor needs composition */
     DESKTOP_DIRECT_NO_RING,      /* zero-copy scanout not active */
     DESKTOP_DIRECT_KERNEL,       /* kernel cannot scan out client buffers (no CLIENT_SCANOUT cap) */
     DESKTOP_DIRECT_REASONS

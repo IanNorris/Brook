@@ -10,6 +10,15 @@ struct CursorImage {
     uint32_t pixels[CursorCapacity * CursorCapacity]{};
 };
 
+inline bool CursorPixelsHaveAlpha(const uint32_t* pixels, uint32_t width, uint32_t height)
+{
+    for (uint32_t row = 0; row < height; ++row)
+        for (uint32_t col = 0; col < width; ++col)
+            if (pixels[row * CursorCapacity + col] >> 24)
+                return true;
+    return false;
+}
+
 // Whether a client cursor image is shown. It belongs to the window it was
 // set for (its creation identity, 0 = everywhere) and is shown only while
 // pointer input goes to that window's client area (`hover`, 0 over shell

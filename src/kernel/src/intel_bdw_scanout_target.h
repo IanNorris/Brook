@@ -10,8 +10,8 @@ struct BrookGpuClientScanoutStatus;
 
 namespace brook {
 struct BdwCursorStatus {
-    bool requested=false, bound=false, active=false;
-    uint64_t images=0, positions=0, fallbacks=0;
+    bool requested=false, bound=false, active=false, armed=false, transparentTarget=false;
+    uint64_t images=0, cachedArms=0, positions=0, fallbacks=0;
 };
 bool BdwCursorRequest(bool enable);
 BdwCursorStatus BdwCursorReadStatus();
@@ -28,7 +28,7 @@ inline bool BdwCursorBaseOwned(uint32_t base){
     return false;
 }
 void BdwCursorUpdate(uint64_t leaseOwner,bool visible,int32_t x,int32_t y,
-                     const uint32_t* pixels,uint32_t width,uint32_t height,uint64_t serial);
+                     const uint32_t* pixels,uint32_t width,uint32_t height);
 
 struct BdwGpuBuffer;
 int64_t BdwClientScanoutPresent(uint64_t owner,BdwGpuBuffer*,const BdwClientScanoutLayout&,uint64_t offer);

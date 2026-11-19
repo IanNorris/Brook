@@ -130,14 +130,23 @@ int main()
     // software layer even while the next hardware image is still pending.
     uint32_t fallbacks=0;
     uint32_t pixels[64*64]{};
-    assert(!BdwCursorHasAlpha(pixels,1,1));
+    assert(!BdwCursorImageKey(pixels,1,1));
     pixels[0]=0x00ffffff;
-    assert(!BdwCursorHasAlpha(pixels,1,1));
+    assert(!BdwCursorImageKey(pixels,1,1));
+    BdwCursorImages images;
+    unsigned uploads=0;
     for(uint32_t frame=12;frame<1012;++frame){
         pixels[0]=(frame&1)?0xff010203:0x00010203;
-        assert(BdwCursorHasAlpha(pixels,1,1)==bool(frame&1));
+        assert(bool(BdwCursorImageKey(pixels,1,1))==bool(frame&1));
         const bool rendererHasCursor=!handoff.suppress(plane.blocksSoftware());
-        if(!plane.update(regs,(frame&1)?0x2000:0x6000,frame,0,0)){
+        const auto key=BdwCursorImageKey(pixels,1,1);
+        assert(key==BdwCursorImageKey(pixels,2,2));
+        const auto slot=images.select(key,false);
+        uploads+=images.needsUpload(slot,key);
+        images.selectProgrammed(slot,key);
+        assert(images.transparent()==!key);
+        assert(images.select(key,false)==slot && !images.needsUpload(slot,key));
+        if(!plane.update(regs,slot?0x6000:0x2000,frame,0,0)){
             ++fallbacks;plane.disable(regs,frame);
         }
         assert(plane.active() && !plane.ready());
@@ -149,7 +158,7 @@ int main()
         }
         assert(plane.active() && plane.ready() && plane.blocksSoftware());
     }
-    assert(fallbacks==0);
+    assert(fallbacks==0 && uploads==2);
 
     // A disable write does not allow composition to expose its cursor yet.
     handoff.cancel();

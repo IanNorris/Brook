@@ -7,6 +7,11 @@ using namespace brook;
 int main()
 {
     CursorImage source, first, next, restored;
+    source.pixels[0]=0x00abcdef;
+    source.pixels[1]=0x01000000;
+    CHECK(!CursorPixelsHaveAlpha(source.pixels,1,1));
+    CHECK(CursorPixelsHaveAlpha(source.pixels,2,1));
+    source={};
     source.width=24;source.height=32;source.hotX=7;source.hotY=9;
     source.pixels[0]=0x80776655;source.pixels[8*CursorCapacity+7]=0xff112233;
     CursorImage original=source;
