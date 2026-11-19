@@ -5,6 +5,23 @@ Current state and immediate goal. Keep this short and current: replace stale lin
 _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review follow-up)._
 
 
+## Wayland fine scrolling (19 November 2026)
+
+- `work/wayland-fine-scroll` at `241826c1` adds fractional two-finger scroll
+  and gesture-end events to opted-in WM windows. The 12-byte event carries
+  signed vertical/horizontal v120 in bytes 4–7 and the local pointer position
+  in bytes 8–11. The raw input ABI, launcher, kernel Terminal and captured
+  scroll retain their existing paths. Older kernels use whole ticks with the
+  new waylandd.
+- waylandd sends finger axes and stops only axes that moved. Wheels retain
+  discrete events on pointer v5–7 and get v120 events from v8. Brook Files
+  carries fractional motion into row scrolling. Pinned Xwayland 24.1.11
+  source confirms its scroll valuator and legacy button emulation paths.
+- Release, entry and scheduler audits, all 385 non-stress host tests and both
+  Nix packages passed. The waylandd fixture checked v4/v5/v7/v8 wire events.
+  Logs are in `/data/Programming/Brook/wayland-fine-scroll/build/fine-scroll-*.log`.
+  Hardware feel and a live X11 app remain unverified.
+
 ## Wayland latency diagnostics (19 November 2026)
 
 - `work/wayland-latency` at `ee769aec` adds per-connection and per-toplevel
