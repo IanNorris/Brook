@@ -95,6 +95,12 @@ _Last updated: 19 November 2026 (early), by a Claude Code session; see "19 Nov e
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**GTK4/Nautilus on the Dell (19 Nov, gen 451):** staged tx `naut1119b`: Nautilus 49.4 `nznpdd9x…` plus `gtk4-demo` (gtk4.dev). 24 missing store paths, 118 MB; the bundler now stores hard links as regular files (545f2c5a).
+- **Works:** both apps render; GTK picks Vulkan `hasvk`.
+- **Freeze — root cause found:** waylandd sent `xdg_popup.configure` before `repositioned`. GTK4 reuses its tooltip popup through reposition, so it blocked in `gdk_wayland_surface_present_popup`. Fixed in 6a4eaa00 (on `work/glass-blur`); this may also be the old "GTK popup grab" backlog bug.
+- **Still open:** scrolling stutter and high app frame times with both the Vulkan and Cairo GSK renderers. Profile next.
+- **Missing services:** XDG_SESSION_TYPE in brook-run, Tracker, GVfs (trash/mounts; ties into automount).
+
 **Clearwater stage 3 (Ian approved, 19 Nov):** sent to Codex as `work/clearwater-s3`, based on int49. User-mode shell process for the taskbar, launcher, toasts and HUD; pixel-identical; fallback taskbar plus restart. File manager: Nautilus (see DECISIONS). It needs the GTK4 smoke test first.
 
 **19 Nov: Dell on gen 451 = `work/integration49` 095ae70e** (int48 + the supervisor blur marker; session `3fee9d88a60c4cd6b5c8c05260c9de3d`).
