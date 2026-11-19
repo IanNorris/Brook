@@ -95,7 +95,13 @@ _Last updated: 19 November 2026 (early), by a Claude Code session; see "19 Nov e
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
-**19 Nov late night: Dell on gen 449 = `work/integration47` 9d9ca872** (int46 + Codex `work/mem-accounting` b09b00ff; session `e95c9b28f6be41d58324afc8ed3eca88`). Host tests: 383 non-stress and 2 stress pass. QEMU check passes.
+**19 Nov early morning: Dell on gen 450 = `work/integration48` 4d178694** (int47 + `work/clearwater-review` a6fa4b03, the Fable 5.2 High visual review; session `1c46db9ff14d4ab0bf3799c507d50bfa`).
+- **Review changes:** a seven-role type scale (was one 16 px face), prototype line icons, a state-based taskbar (pill only when focused, open or hovered), one-line CPU/MEM chips, Hack build label, flyout/HUD/boot-toast layout.
+- **Evidence:** `clearwater-review/build/cwreview-evidence/final/compare/`; sent to Ian. 383 non-stress tests pass; QEMU check passes.
+- **Ian to eye at 200%:** text size (26 px titles, from 32), icons, taskbar states, live network/temperature/volume flyouts, Alt+P, the boot toast, the launcher margins.
+- **Deferred:** launcher content (stage 3), 24 px icon sources, some panel content.
+
+**Previous: gen 449 = `work/integration47` 9d9ca872** (int46 + Codex `work/mem-accounting` b09b00ff; session `e95c9b28f6be41d58324afc8ed3eca88`). Host tests: 383 non-stress and 2 stress pass. QEMU check passes.
 - **New commands:** `mem breakdown` (JSON, per-class), `mem exec-cache`, `mem heap`. `/proc/meminfo` and `/proc/PID/status` VmRSS are now real.
 - **Memory result** (evidence in `display-perf/build/dell/mem-449-*.json`):
   - **Fresh boot:** 607 MB used. Largest classes: other 180, driver_dma 88, scanout 88, kernel_heap 82, gpu 59, file 39, user 31 MB.
