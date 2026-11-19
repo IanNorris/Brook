@@ -392,18 +392,32 @@ struct CursorBacking {
 };
 CursorBacking cursorBacking[2];
 BdwCursorPlane cursorPlane;
+BdwCursorHandoff cursorHandoff;
 BdwCursorStatus cursorStatus;
-bool cursorSetupFailed=false;
-uint64_t cursorNegotiatedOwner=0,cursorSerial=0;
-uint32_t cursorSlot=0,cursorArmFrame=0;
+bool cursorSetupFailed=false,cursorTransparent=false,zcLeavingForGop=false;
+uint64_t cursorSerial=0;
+uint32_t cursorSlot=0;
 
-void CursorOffLocked() {
-    if(cursorPlane.enabled()) {
+void CursorOffLocked(bool failed=false) {
+    const bool enabled=cursorPlane.enabled();
+    if(failed && (enabled || cursorHandoff.epoch()))++cursorStatus.fallbacks;
+    cursorHandoff.cancel();
+    if(enabled){
         PlaneIo io{displayRegs[2]};
-        (void)cursorPlane.disable(io,io.read32(BdwFlipRegs::FrameCountA));
-        ++cursorStatus.fallbacks;
+        cursorPlane.disable(io,io.read32(BdwFlipRegs::FrameCountA));
     }
     cursorStatus.active=false;
+}
+bool CursorPollLocked(){
+    if(!cursorPlane.blocksSoftware())return true;
+    PlaneIo io{displayRegs[2]};
+    if(!cursorPlane.poll(io,io.read32(BdwFlipRegs::FrameCountA))){
+        CursorOffLocked(true);
+        cursorSetupFailed=true;cursorStatus.requested=false;
+        return false;
+    }
+    cursorStatus.active=cursorPlane.active();
+    return true;
 }
 // Called only by the BSP submission worker after it has bound the desktop
 // ring, so the scratch page, zero page and display mapping are valid.
@@ -542,11 +556,15 @@ void ZcFallback(BdwZeroCopyFallback f){zcLast=f;++zcStats.fallback[uint32_t(f)];
 // Permanent for the boot. Best effort, never waits: re-arm the GOP; the
 // caller returns RepairRequired so the compositor repaints it in full.
 void ZcDisableLocked(const char* why){
-    CursorOffLocked();
+    CursorOffLocked(true);
     ClientRestoreLocked(true);
     if(!zcDisabled){zcDisabled=true;zcReason=why;zcPendingLog=why;zcRepairOwed=zcActive;}
     zcRing.MarkUncertain();zcActive=false;
-    if(displayMapped){PlaneIo io{displayRegs[2]};(void)BdwFlipRestoreGop(io,0,0);}
+    // The old GOP can still contain a software cursor. Wait for the
+    // disable latch before making it visible again.
+    if(displayMapped && !cursorPlane.blocksSoftware()){
+        PlaneIo io{displayRegs[2]};(void)BdwFlipRestoreGop(io,0,0);
+    }
     ++zcStats.uncertain;
 }
 void ZcLogPending(){
@@ -567,7 +585,11 @@ bool ZcArmLocked(uint32_t slot){
     return true;
 }
 void ZcPollLocked(){
+    CursorPollLocked();
     ClientPollLocked();
+    if(zcDisabled && displayMapped && !cursorPlane.blocksSoftware() && Read(BdwFlipRegs::Surface)!=0){
+        PlaneIo io{displayRegs[2]};(void)BdwFlipRestoreGop(io,0,0);
+    }
     if(!zcActive || zcDisabled || ClientShowing())return;
     if(zcRing.HasArmed()){
         const uint32_t frame=Read(BdwFlipRegs::FrameCountA),live=Read(BdwFlipRegs::SurfaceLive);
@@ -662,12 +684,31 @@ bool ZcActivate(){
 // "gpu zerocopy off": return to the GOP, waiting (bounded) for the latch so
 // the renderer never writes an image the display still fetches.
 void ZcLeave(){
-    {const uint64_t f=IrqSpinLockAcquire(&lock);CursorOffLocked();IrqSpinLockRelease(&lock,f);}
+    {
+        const uint64_t f=IrqSpinLockAcquire(&lock);
+        if(zcLeavingForGop){IrqSpinLockRelease(&lock,f);return;}
+        zcLeavingForGop=true;
+        CursorOffLocked();
+        IrqSpinLockRelease(&lock,f);
+    }
+    // Both the present worker and the adopting renderer use this path. Do
+    // not reintroduce the old GOP cursor while the hardware can still show.
+    const uint64_t start=Rdtsc(),budget=__atomic_load_n(&g_restoreBudgetTicks,__ATOMIC_RELAXED);
+    while(BdwCursorBlocksSoftware()){
+        if(Rdtsc()-start>=budget){
+            const uint64_t f=IrqSpinLockAcquire(&lock);
+            zcLeavingForGop=false;
+            IrqSpinLockRelease(&lock,f);
+            return;
+        }
+        SchedulerSleepMs(1);
+    }
     PlaneIo io{displayRegs[2]};
     const auto restored=BdwFlipRestoreGop(io,0,__atomic_load_n(&g_restoreBudgetTicks,__ATOMIC_RELAXED));
     const uint64_t f=IrqSpinLockAcquire(&lock);
     if(restored.latched){zcActive=false;zcRing=BdwZeroCopyRing{};zcRepairOwed=true;++zcGopReturns;zcReason="off";}
     else ZcDisableLocked("leave-latch-timeout");
+    zcLeavingForGop=false;
     IrqSpinLockRelease(&lock,f);ZcLogPending();
 }
 #endif
@@ -778,8 +819,13 @@ void BdwScanoutFlipReturnToGop(){
     // re-activates zero-copy on a fresh ring (front = GOP).
     if(__atomic_load_n(&zcActive,__ATOMIC_ACQUIRE)){
         const uint64_t f=IrqSpinLockAcquire(&lock);
-        if(zcActive){CursorOffLocked();ClientRestoreLocked(true);PlaneIo io{displayRegs[2]};(void)BdwFlipRestoreGop(io,0,0);
-            zcActive=false;zcRing=BdwZeroCopyRing{};++zcGopReturns;if(!zcDisabled)zcReason="software takeover";}
+        if(zcActive){
+            CursorOffLocked();
+            if(!cursorPlane.blocksSoftware()){
+                ClientRestoreLocked(true);PlaneIo io{displayRegs[2]};(void)BdwFlipRestoreGop(io,0,0);
+                zcActive=false;zcRing=BdwZeroCopyRing{};++zcGopReturns;if(!zcDisabled)zcReason="software takeover";
+            }
+        }
         IrqSpinLockRelease(&lock,f);
     }
 #endif
@@ -1066,7 +1112,9 @@ BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer* source,const Composito
         // As the M3 flip: the GOP must be live again and owes one full repaint.
         const uint64_t f=IrqSpinLockAcquire(&lock);
         const bool onGop=displayMapped && Read(BdwFlipRegs::Surface)==0 && Read(BdwFlipRegs::SurfaceLive)==0;
-        if(!onGop && displayMapped){PlaneIo io{displayRegs[2]};(void)BdwFlipRestoreGop(io,0,0);}
+        if(!onGop && displayMapped && !cursorPlane.blocksSoftware()){
+            PlaneIo io{displayRegs[2]};(void)BdwFlipRestoreGop(io,0,0);
+        }
         const bool repair=!onGop || zcRepairOwed;
         if(onGop)zcRepairOwed=false;
         IrqSpinLockRelease(&lock,f);
@@ -1420,44 +1468,73 @@ BdwCursorStatus BdwCursorReadStatus(){
     IrqSpinLockRelease(&lock,f);
     return status;
 }
-bool BdwCursorRendererQuery(uint64_t owner){
+uint64_t BdwCursorRendererQuery(uint64_t owner,bool supportsHandoff,bool& suppress){
     const uint64_t f=IrqSpinLockAcquire(&lock);
-    const bool match=owner && owner==zcOwner;
-    if(match)cursorNegotiatedOwner=owner;
-    const bool active=match && cursorStatus.active;
+    CursorPollLocked();
+    const bool canOffer=supportsHandoff && owner && owner==zcOwner &&
+        cursorStatus.requested && cursorStatus.bound && zcActive && zcRequested &&
+        !zcDisabled && !zcLeavingForGop && cursorPlane.ready();
+    // Continue the existing offer across a cursor image swap. During disable
+    // both the renderer and the software compositor wait for the off latch.
+    const bool keepOffer=supportsHandoff && owner && owner==zcOwner && cursorHandoff.epoch();
+    const uint64_t epoch=canOffer || keepOffer?cursorHandoff.offer(zcRing.Sequence()):0;
+    suppress=epoch || cursorPlane.blocksSoftware();
+    const uint64_t ack=cursorHandoff.awaitingPresent()?epoch:0;
     IrqSpinLockRelease(&lock,f);
-    return active;
+    return ack;
+}
+void BdwCursorRendererPresented(uint64_t owner,uint64_t epoch){
+    const uint64_t f=IrqSpinLockAcquire(&lock);
+    if(owner && owner==zcOwner && zcActive && zcRequested && !zcDisabled)
+        cursorHandoff.presented(epoch,zcRing.Sequence());
+    IrqSpinLockRelease(&lock,f);
+}
+bool BdwCursorBlocksSoftware(){
+    const uint64_t f=IrqSpinLockAcquire(&lock);
+    CursorPollLocked();
+    const bool blocks=cursorPlane.blocksSoftware();
+    IrqSpinLockRelease(&lock,f);
+    return blocks;
 }
 void BdwCursorUpdate(uint64_t leaseOwner,bool visible,int32_t x,int32_t y,
                      const uint32_t* pixels,uint32_t width,uint32_t height,uint64_t serial){
     const uint64_t f=IrqSpinLockAcquire(&lock);
     struct Unlock {uint64_t flags;~Unlock(){IrqSpinLockRelease(&lock,flags);}} unlock{f};
-    if(!cursorStatus.requested || !cursorStatus.bound || !zcActive || !leaseOwner || leaseOwner!=zcOwner ||
-       !cursorNegotiatedOwner || cursorNegotiatedOwner!=zcOwner ||
-       !visible || !pixels || !width || !height || width>64 || height>64) {
+    if(!CursorPollLocked()){
+        ClientRestoreLocked(false);return;
+    }
+    if(!cursorStatus.requested || !cursorStatus.bound || !zcActive || !zcRequested ||
+       !leaseOwner || leaseOwner!=zcOwner || !cursorHandoff.epoch()) {
         if(visible)ClientRestoreLocked(false);
         CursorOffLocked();return;
     }
+    if(visible && (!pixels || !width || !height || width>64 || height>64)){
+        ClientRestoreLocked(false);CursorOffLocked(true);return;
+    }
+    if(!cursorPlane.ready())return;
     PlaneIo io{displayRegs[2]};
     const uint32_t primary=io.read32(BdwFlipRegs::SurfaceLive);
     const uint32_t frame=io.read32(BdwFlipRegs::FrameCountA);
-    const uint32_t live=io.read32(BdwCursorRegs::Live);
-    if(!primary || primary==0xffffffffu || frame==0xffffffffu || live==0xffffffffu){
-        ClientRestoreLocked(false);CursorOffLocked();return;
-    }
-    if(cursorPlane.enabled() && live!=cursorPlane.base()){
-        if(uint32_t(frame-cursorArmFrame)>=4){ClientRestoreLocked(false);CursorOffLocked();cursorSetupFailed=true;cursorStatus.requested=false;}
-        return;
-    }
-    if(cursorPlane.enabled())cursorStatus.active=true;
-    const bool upload=!cursorPlane.enabled() || serial!=cursorSerial;
-    if(upload && cursorPlane.canUpload(frame,live)){
+    if(primary==0xffffffffu || frame==0xffffffffu)return;
+    // Use the live primary slot, rather than an accepted or queued present,
+    // to prove that the preceding software cursor is no longer on screen.
+    const uint32_t front=zcRing.Front();
+    if(!cursorPlane.enabled() &&
+       (!front || primary!=zcRing.Surface(front) || !cursorHandoff.mayEnable(zcSlotSequence[front])))return;
+
+    const bool transparent=!visible || !BdwCursorHasAlpha(pixels,width,height);
+    // A fully transparent image keeps ownership. Fetch it on screen so a
+    // pointer parked outside the output cannot prevent its surface latch.
+    if(transparent)x=y=0;
+    const bool upload=!cursorPlane.enabled() || transparent!=cursorTransparent ||
+                      (!transparent && serial!=cursorSerial);
+    if(upload){
         const uint32_t slot=cursorSlot^1u;
         auto& image=cursorBacking[slot];
         for(uint32_t row=0;row<64;++row){
             auto* dest=reinterpret_cast<uint32_t*>(image.pixels[row/16].cpu)+(row%16)*64;
             for(uint32_t col=0;col<64;++col){
-                const uint32_t argb=row<height && col<width ? pixels[row*64+col] : 0;
+                const uint32_t argb=!transparent && row<height && col<width ? pixels[row*64+col] : 0;
                 const uint32_t a=argb>>24;
                 auto scale=[&](unsigned shift){return (((argb>>shift)&255u)*a+127)/255;};
                 dest[col]=(a<<24)|(scale(16)<<16)|(scale(8)<<8)|scale(0);
@@ -1466,15 +1543,19 @@ void BdwCursorUpdate(uint64_t leaseOwner,bool visible,int32_t x,int32_t y,
         __atomic_store_n(&g_cursorTouched,true,__ATOMIC_RELEASE);
         if(!BdwPrivatePagesPublish(image.pixels,CursorImagePages) ||
            !cursorPlane.update(io,image.reservation.first*4096,frame,x,y)){
-            CursorOffLocked();cursorStatus.requested=false;return;
+            CursorOffLocked(true);cursorSetupFailed=true;cursorStatus.requested=false;
+            ClientRestoreLocked(false);return;
         }
-        cursorSlot=slot;cursorSerial=serial;cursorArmFrame=frame;++cursorStatus.images;
-    } else if(cursorPlane.enabled()){
+        cursorSlot=slot;cursorSerial=serial;cursorTransparent=transparent;++cursorStatus.images;
+    } else {
         const uint32_t previous=cursorPlane.position();
-        if(!cursorPlane.update(io,cursorPlane.base(),frame,x,y))CursorOffLocked();
-        else if(previous!=cursorPlane.position())++cursorStatus.positions;
+        if(!cursorPlane.update(io,cursorBacking[cursorSlot].reservation.first*4096,frame,x,y)){
+            CursorOffLocked(true);cursorSetupFailed=true;cursorStatus.requested=false;
+            ClientRestoreLocked(false);
+        }else if(previous!=cursorPlane.position())++cursorStatus.positions;
     }
 }
+
 #else
 int64_t BdwClientScanoutPresent(uint64_t,BdwGpuBuffer*,const BdwClientScanoutLayout&,uint64_t){return -38;}
 int64_t BdwClientScanoutStatus(uint64_t,BrookGpuClientScanoutStatus&){return -38;}
@@ -1483,7 +1564,9 @@ bool BdwClientScanoutWorkPending(){return false;}
 bool BdwClientScanoutService(bool){return false;}
 bool BdwCursorRequest(bool){return false;}
 BdwCursorStatus BdwCursorReadStatus(){return {};}
-bool BdwCursorRendererQuery(uint64_t){return false;}
+uint64_t BdwCursorRendererQuery(uint64_t,bool,bool& suppress){suppress=false;return 0;}
+void BdwCursorRendererPresented(uint64_t,uint64_t){}
+bool BdwCursorBlocksSoftware(){return false;}
 void BdwCursorUpdate(uint64_t,bool,int32_t,int32_t,const uint32_t*,uint32_t,uint32_t,uint64_t){}
 #endif
 

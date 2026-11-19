@@ -15,6 +15,7 @@ struct BdwCursorRegs {
     static constexpr uint32_t Argb64 = 0x27;
     static constexpr uint32_t Alignment = 4096;
     static constexpr uint32_t Side = 64;
+    static constexpr uint32_t AddressMask = 0xfffff000u;
 };
 
 inline bool BdwCursorPosition(int32_t x, int32_t y, uint32_t& encoded)
@@ -35,72 +36,127 @@ void BdwCursorDisable(Io& io)
     (void)io.read32(BdwCursorRegs::Control);
 }
 
-class BdwCursorPlane {
-    uint32_t base_ = 0, position_ = 0;
-    uint32_t armFrame_ = 0;
-    bool enabled_ = false, retiring_ = false;
+inline bool BdwCursorHasAlpha(const uint32_t* pixels, uint32_t width, uint32_t height)
+{
+    for (uint32_t row = 0; row < height; ++row)
+        for (uint32_t col = 0; col < width; ++col)
+            if (pixels[row * BdwCursorRegs::Side + col] >> 24)
+                return true;
+    return false;
+}
+
+// The renderer omits the layer as soon as an offer exists. The hardware
+// cannot turn on until that renderer acknowledges a cursor-free present and
+// the primary plane shows that image or a later one from the same epoch.
+class BdwCursorHandoff {
+    uint64_t epoch_ = 0, offeredAfter_ = 0, firstClean_ = 0;
+    bool offered_ = false;
 
 public:
-    bool enabled() const { return enabled_; }
-    uint32_t base() const { return base_; }
+    uint64_t offer(uint64_t sequence) {
+        if (!offered_) {
+            if (epoch_ == (uint64_t{1} << 63) - 1)
+                return 0;
+            ++epoch_;
+            offeredAfter_ = sequence;
+            offered_ = true;
+        }
+        return epoch_;
+    }
+    void cancel() { offered_ = false; firstClean_ = 0; }
+    uint64_t epoch() const { return offered_ ? epoch_ : 0; }
+    void presented(uint64_t epoch, uint64_t sequence) {
+        if (epoch && epoch == this->epoch() && !firstClean_ && sequence > offeredAfter_)
+            firstClean_ = sequence;
+    }
+    bool awaitingPresent() const { return offered_ && !firstClean_; }
+    bool mayEnable(uint64_t front) const { return firstClean_ && front >= firstClean_; }
+};
+
+class BdwCursorPlane {
+    enum class State : uint8_t { Off, Arming, On, Disarming };
+    State state_ = State::Off;
+    uint32_t base_ = 0, position_ = 0, armFrame_ = 0;
+    bool latched_ = false;
+
+public:
+    // True from the first arm request through the final disable latch.
+    bool blocksSoftware() const { return state_ != State::Off; }
+    bool enabled() const { return state_ == State::On || state_ == State::Arming; }
+    bool active() const { return enabled() && latched_; }
+    bool ready() const { return state_ == State::Off || state_ == State::On; }
     uint32_t position() const { return position_; }
 
-    // After a base change, wait at least two vblank observations before
-    // reusing the other image. Both allocations stay pinned for this boot.
-    bool canUpload(uint32_t frame, uint32_t live) const {
-        return frame != 0xffffffffu && live == (enabled_ ? base_ : 0) &&
-            (!retiring_ || uint32_t(frame - armFrame_) >= 2);
+    template<class Io>
+    void disable(Io& io, uint32_t frame) {
+        if (!enabled())
+            return;
+        BdwCursorDisable(io);
+        state_ = State::Disarming;
+        armFrame_ = frame;
+        latched_ = false;
     }
 
     template<class Io>
-    bool disable(Io& io, uint32_t frame) {
-        if (!enabled_)
+    bool poll(Io& io, uint32_t frame) {
+        if (state_ == State::Off || frame == 0xffffffffu)
             return true;
-        BdwCursorDisable(io);
-        enabled_ = false;
-        retiring_ = true;
-        armFrame_ = frame;
-        return io.read32(BdwCursorRegs::Control) == 0;
+        if (state_ == State::Disarming) {
+            if (armFrame_ == 0xffffffffu)
+                armFrame_ = frame;
+            if (uint32_t(frame - armFrame_) >= 2) {
+                // CURSURFLIVE can still report the last address when the
+                // plane is off. Check the programmed disable and two vblanks.
+                if (!io.read32(BdwCursorRegs::Control) && !io.read32(BdwCursorRegs::Base))
+                    state_ = State::Off;
+                else {
+                    BdwCursorDisable(io);
+                    armFrame_ = frame;
+                    return false;
+                }
+            }
+            return true;
+        }
+        const uint32_t live = io.read32(BdwCursorRegs::Live);
+        if (live != 0xffffffffu && (live & BdwCursorRegs::AddressMask) == base_) {
+            if (state_ == State::Arming && frame != armFrame_) {
+                latched_ = true;
+                state_ = State::On;
+            }
+            return true;
+        }
+        return state_ == State::Arming && uint32_t(frame - armFrame_) < 4;
     }
 
     template<class Io>
     bool update(Io& io, uint32_t base, uint32_t frame, int32_t x, int32_t y) {
         uint32_t pos = 0;
-        if (!base || base % BdwCursorRegs::Alignment || frame == 0xffffffffu ||
+        if (!ready() || !base || base % BdwCursorRegs::Alignment || frame == 0xffffffffu ||
             !BdwCursorPosition(x, y, pos))
             return false;
-        const bool changesBase = !enabled_ || base != base_;
-        if (changesBase && !canUpload(frame, io.read32(BdwCursorRegs::Live)))
-            return false;
+        const bool enabling = state_ == State::Off;
+        const bool changesBase = enabling || base != base_;
         if (!changesBase && pos == position_)
             return true;
+        if (enabling && io.read32(BdwCursorRegs::Control))
+            return false;
 
-        if (!enabled_) {
-            if(io.read32(BdwCursorRegs::Control)!=0)
-                return false;
+        if (changesBase) {
             io.write32(BdwCursorRegs::Fbc, 0);
             io.write32(BdwCursorRegs::Control, BdwCursorRegs::Argb64);
         }
         io.write32(BdwCursorRegs::Position, pos);
-        // i915 rearms with the same base on a position update. No surface
-        // change, pixel upload, or composition is needed for motion.
+        // i915 rearms with the same base on a position update. A new image
+        // waits for its own latch before either cursor buffer is reused.
         io.write32(BdwCursorRegs::Base, base);
-        if (io.read32(BdwCursorRegs::Control) != BdwCursorRegs::Argb64 ||
-            io.read32(BdwCursorRegs::Base) != base) {
-            BdwCursorDisable(io);
-            enabled_ = false;
-            retiring_ = true;
+        if (changesBase) {
+            state_ = State::Arming;
             armFrame_ = frame;
-            return false;
         }
-        enabled_ = true;
         base_ = base;
         position_ = pos;
-        if (changesBase) {
-            armFrame_ = frame;
-            retiring_ = true;
-        }
-        return true;
+        return io.read32(BdwCursorRegs::Control) == BdwCursorRegs::Argb64 &&
+               (io.read32(BdwCursorRegs::Base) & BdwCursorRegs::AddressMask) == base;
     }
 };
 

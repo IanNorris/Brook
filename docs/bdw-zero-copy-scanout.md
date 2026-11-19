@@ -297,37 +297,38 @@ Build: `nix-shell --run 'python3 scripts/build_dell_image.py --payload-id dell-z
 The Dell build with zero-copy scanout can opt in with `gpu cursor on`.
 `gpu cursor off` restores the compositor cursor. The feature is off at boot.
 It needs an active pipe A scanout ring, a current presentation lease, and a
-renderer that negotiates cursor-plane version 1 on the overlay cursor query.
-The wire struct is unchanged. A version 1 renderer retries the original query
-if the kernel rejects the new argument.
+renderer that negotiates cursor-plane version 2 on the overlay cursor query.
+The query offers an epoch and suppresses the software layer. The renderer
+acknowledges its successful zero-copy present with that epoch. Brook waits for
+that cursor-free primary image or a later image in the same epoch to latch
+before arming the cursor. Older query formats use software composition.
 
 The BSP submission worker binds two 64×64 ARGB8888 images into persistent
-GGTT extents. Both allocations are aligned to 256 KiB for Brook’s checked extent binder, which also satisfies
-the stricter VT-d alignment case, and have safe trailing mappings. Before
-arming a changed image, Brook premultiplies alpha and flushes its CPU writes.
-The other image is reused only after the live register reports the new
-address and two vblanks have passed. Cursor control, base, position and live
-registers are at `0x70080`, `0x70084`, `0x70088` and `0x700ac`.
-Motion changes position and rewrites the same base to arm the update.
-This follows the ordering in
-[Linux i915's cursor code](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/i915/display/intel_cursor.c)
-and [register definitions](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/i915/display/intel_cursor_regs.h).
+GGTT extents. Both allocations are aligned to 256 KiB for Brook’s checked
+extent binder, which also satisfies the stricter VT-d alignment case, and
+have safe trailing mappings. Before arming a changed image, Brook
+premultiplies alpha and flushes its CPU writes. The other image is reused only
+after a subsequent vblank and observation of the new live address. Shape
+changes and fully transparent cursors retain ownership of the plane. Cursor
+control, base, position and live registers are at `0x70080`, `0x70084`,
+`0x70088` and `0x700ac`. Motion changes position and rewrites the same base
+to arm the update. The write ordering follows the
+[Linux i915 cursor code](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/i915/display/intel_cursor.c).
 
-The renderer drops its cursor layer once the kernel observes the hardware
-base latch. GOP takeover, a lost presentation lease, invalid register
-readback and panic restoration disable the plane. The mappings remain
-pinned for the boot.
+GOP takeover, lease loss and runtime off disable the cursor plane. The
+renderer and compositor resume drawing their pointers after disabled
+register readback and two vblanks. Failed hardware transitions count as
+fallbacks. The cursor mappings remain pinned for the boot.
 
-For the first Dell test, leave the renderer in its zero-copy desktop path,
-enable the cursor, and check `gpu cursor status`. Expect `bound` and then
-`active`. Move the pointer through all four screen edges and check that
-`positions` increases while `images` stays stable. Change the cursor shape
-and check that `images` increases and only one pointer remains visible.
-Exercise cursor hide and reappear, `gpu cursor off`, and a renderer restart.
-Expect `active` to clear on fallback, `fallbacks` to advance if the plane
-was enabled, and the software pointer to return. QEMU validates boot and
-fallback plumbing. The fake MMIO test exercises register order and latching
-rules, while the Dell is needed to validate actual scanout.
+On the Dell, use the zero-copy desktop path, enable the cursor, and check
+`gpu cursor status`. Expect a bound plane followed by an active plane. Sweep
+across a fullscreen client that hides its cursor and over desktop or launcher
+chrome. Expect the cursor to hide and reappear without double images or
+fallbacks. Move the pointer through the screen edges and check that positions
+increase while the cursor image remains stable. Turn the feature off and
+restart the renderer to check the handoff back to software. The fake MMIO
+test checks rapid alternating images and both handoff directions. QEMU checks
+the image boot path. Actual cursor scanout requires a Dell test.
 
 ## Client primary-plane scanout
 

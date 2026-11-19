@@ -78,8 +78,12 @@ struct BrookDesktopOverlayInfo {
     struct BrookDebugFrameInfo frame;
     uint64_t generation;
 };
-/* Final syscall argument for op 8. Older kernels reject it with EINVAL. */
+/* Final syscall argument for op 8. V2 returns a positive epoch when
+ * preparing a cursor-free frame. Older kernels reject it with EINVAL. */
 #define BROOK_DESKTOP_CURSOR_PLANE_V1 1
+#define BROOK_DESKTOP_CURSOR_PLANE_V2 2
+/* After presenting that frame, pass the epoch in the offset argument. */
+enum { BROOK_DESKTOP_OVERLAY_CURSOR_PRESENTED=10 };
 struct BrookDesktopOverlayCursor {
     uint32_t visible,width,height,stride;
     int32_t x,y;

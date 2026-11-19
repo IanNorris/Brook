@@ -37,7 +37,9 @@ template<class Accept> bool BdwDisplayCompatible(const BdwDisplaySnapshot& displ
     for(unsigned pipe=0;pipe<3;++pipe)
         for(unsigned reg=pipe?0:4;reg<registers;++reg){
             if(!pipe && reg==7 && registers>=10 && cursorBaseOwned){
-                const uint32_t control=primary[7], base=primary[8], live=primary[9];
+                const uint32_t control=primary[7];
+                const uint32_t base=primary[8] & BdwCursorRegs::AddressMask;
+                const uint32_t live=primary[9] & BdwCursorRegs::AddressMask;
                 // Arm and disable take effect at vblank. Both kernel-owned
                 // bases may still be fetched during the transition.
                 if((control!=0 && control!=BdwCursorRegs::Argb64) ||

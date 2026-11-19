@@ -3875,6 +3875,9 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
     }
     // Cursor (alpha) on top of everything.
     if (!WmPointerCaptureActive() && __atomic_load_n(&g_defaultCursorVisible, __ATOMIC_ACQUIRE) && g_cursorTex &&
+#if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
+        !brook::BdwCursorBlocksSoftware() &&
+#endif
         MouseIsAvailable())
     {
         int32_t mx = 0, my = 0;
@@ -4141,7 +4144,11 @@ static void CompositorLoop()
 
     // Draw mouse cursor on top of everything (CPU path only — GPU mode blits
     // the cursor as a sprite in CompositorPresentGPU).
-    if (MouseIsAvailable() && cursorVisibleThisFrame && !CompositorGpuActive())
+    if (MouseIsAvailable() && cursorVisibleThisFrame && !CompositorGpuActive()
+#if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
+        && !brook::BdwCursorBlocksSoftware()
+#endif
+        )
     {
         int32_t mx, my;
         MouseGetPosition(&mx, &my);

@@ -83,7 +83,7 @@ struct PendingDesktopFrame {
     /* Regions handed to the kernel when they differ from the frame's own
      * damage (zero-copy: everything drawn into the image). */
     struct BrookGpuPresentRegions kernelRegions;int hasKernelRegions;
-    uint64_t presentCallNs,drawPixels;int drawPartial;
+    uint64_t presentCallNs,drawPixels,cursorEpoch;int drawPartial;
     /* Pipelined: an older in-flight frame failed, so this frame's success
      * must not re-establish the change-tracking baseline. */
     int tainted;
@@ -584,12 +584,16 @@ static int overlay_capture_deferred(int drm,struct RenderContext *ctx,uint32_t w
     return 0;
 }
 /* Pointer layer state; refreshes the context's 64x64 image on a new serial. */
-static int overlay_cursor(int drm,struct RenderContext *ctx,struct DesktopOverlayCursorState *state){
+static int overlay_cursor(int drm,struct RenderContext *ctx,struct DesktopOverlayCursorState *state,uint64_t *epoch){
+    *epoch=0;
     *state=(struct DesktopOverlayCursorState){0};
     if(g_overlayTracked!=1)return 0;
     const uint64_t known=ctx->cursor.handle?ctx->cursorSerial:0;
-    if(syscall(BROOK_SYS_DESKTOP_OVERLAY,BROOK_DESKTOP_OVERLAY_CURSOR,0,&g_cursorInfo,sizeof(g_cursorInfo),known,BROOK_DESKTOP_CURSOR_PLANE_V1) &&
-       (errno!=EINVAL || syscall(BROOK_SYS_DESKTOP_OVERLAY,BROOK_DESKTOP_OVERLAY_CURSOR,0,&g_cursorInfo,sizeof(g_cursorInfo),known,0)))return -1;
+    long result=syscall(BROOK_SYS_DESKTOP_OVERLAY,BROOK_DESKTOP_OVERLAY_CURSOR,0,&g_cursorInfo,sizeof(g_cursorInfo),known,BROOK_DESKTOP_CURSOR_PLANE_V2);
+    if(result<0 && errno==EINVAL)
+        result=syscall(BROOK_SYS_DESKTOP_OVERLAY,BROOK_DESKTOP_OVERLAY_CURSOR,0,&g_cursorInfo,sizeof(g_cursorInfo),known,0);
+    if(result<0)return -1;
+    *epoch=(uint64_t)result;
     const struct BrookDesktopOverlayCursor *c=&g_cursorInfo;
     if(!c->visible || !c->width || !c->height || c->width>BROOK_DESKTOP_CURSOR_MAX ||
        c->height>BROOK_DESKTOP_CURSOR_MAX || c->stride!=BROOK_DESKTOP_CURSOR_MAX)return 0;
@@ -599,6 +603,9 @@ static int overlay_cursor(int drm,struct RenderContext *ctx,struct DesktopOverla
     }
     *state=(struct DesktopOverlayCursorState){1,c->width,c->height,c->x,c->y,c->serial};
     return 0;
+}
+static void cursor_presented(uint64_t epoch){
+    if(epoch)(void)syscall(BROOK_SYS_DESKTOP_OVERLAY,BROOK_DESKTOP_OVERLAY_CURSOR_PRESENTED,0,0,0,epoch,0);
 }
 static int push(uint32_t *scene,unsigned *count,struct BrookVkExternalSource *sources,
                 const struct Source *source,const struct BrookVkSceneLayer *layer){
@@ -910,7 +917,8 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     struct DesktopOverlayFrameState frameOverlay={1,width,height,ctx->overlayGeneration,bands,{0},ctx->overlayOpaque,{0}};
     memcpy(frameOverlay.keys,ctx->overlayKeys,sizeof(frameOverlay.keys));
     stage="overlay_cursor";
-    if(overlay_cursor(drm,ctx,&frameOverlay.cursor))goto done;
+    uint64_t cursorEpoch=0;
+    if(overlay_cursor(drm,ctx,&frameOverlay.cursor,&cursorEpoch))goto done;
     timing[3]=monotonic_ns();
     for(uint32_t i=0;i<bands.count;++i){const struct BrookDesktopOverlayBand *b=&bands.bands[i];
         struct BrookVkSceneLayer layer={0,b->width,b->width,b->height,0,0,b->width,b->height,
@@ -1301,7 +1309,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             .nextReport=now && now<=UINT64_MAX-30000000000ull?now+30000000000ull:0,
             .skippedBytes=skippedBytes,.width=width,.height=height,.visible=layers.count,.skippedLayers=skipped,.direct=frameDirect,
             .partial=attemptPartial,.graphics=graphicsUsed,.quad=quadUsed,.regions=regionBatch,.ringImage=ringImage+1,
-            .kernelRegions=kernelRegions,.hasKernelRegions=hasKernelRegions,
+            .kernelRegions=kernelRegions,.hasKernelRegions=hasKernelRegions,.cursorEpoch=cursorEpoch,
             .drawPixels=quadUsed?plan_draw_pixels(ctx->plan):0,.drawPartial=ringImage>=0?ringDrawPartial:attemptPartial,
             .statsLayers=traceLayers,.statsDraws=statsDraws,.statsShaded=statsShaded,.statsDamage=statsDamage,
             .damage={identity.display,identity.generation,width,height,footprint},.overlay=frameOverlay,
@@ -1370,6 +1378,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
         if(hasKernelRegions)kernelRegions.ticket=(uint64_t)ticket;
         if(syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_PRESENT_REGIONS,hasKernelRegions?&kernelRegions:&regionBatch,0,0,0,0)){presentFailed=1;goto done;}
     }else if(present_full((uint64_t)ticket,width,height)){presentFailed=1;goto done;}
+    if(ctx->scanoutCount)cursor_presented(cursorEpoch);
     *presentedNs=monotonic_ns();ctx->lastPresentNs=*presentedNs;timing[5]=*presentedNs;ticket=-1;*visible=layers.count;result=0;
     desktop_stats_presented(&g_stats,&(struct DesktopStatsFrame){frameSources,layers.count,frameDirect,attemptPartial,graphicsUsed,
         *presentedNs,timing[0],statsSubmitStart,timing[4],0,0,graphicsUsed?DESKTOP_STATS_PATH_GRAPHICS:DESKTOP_STATS_PATH_COMPUTE,
@@ -1530,6 +1539,7 @@ static int retire_async_frame(struct RenderContext *ctx,struct PendingDesktopFra
     }
     int savedErrno=errno;
     if(!result){
+        if(p->ringImage)cursor_presented(p->cursorEpoch);
         *presented=monotonic_ns();ctx->lastPresentNs=*presented;ctx->lastPartial=p->partial;
         desktop_async_damage_retire(displayedDamage,p->damage,p->partial,1);
         g_lastPresentNs=*presented;
