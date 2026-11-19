@@ -214,10 +214,8 @@ def main():
             payloads += ((service,'::/BOOT/VKSUP.ELF'),(service,'::/BOOT/VKRENDER.ELF'))
         if a.proc_dump_qa:
             probe_executable=a.output/'PROCDUMP.ELF'
-            bulk=work/'HWBULK.ELF'
             subprocess.run([os.environ['MUSL_CC'],'-static','-no-pie','-pthread','-g','-O1',
                             '-fno-omit-frame-pointer',str(ROOT/'scripts/workloads/proc_dump_probe.c'),'-o',str(probe_executable)],check=True)
-            subprocess.run([os.environ['MUSL_CC'],'-static','-O2',str(ROOT/'tools/hardware_bulk.c'),'-o',str(bulk)],check=True)
             key=work/'hardware-update-key'
             key.write_text(uuid.uuid4().hex);key.chmod(0o600)
             for name,data in (('hardware-bulk',b'1\n'),('hardware-maintenance',b'1\n'),('hardware-update-key',key.read_bytes())):
@@ -225,7 +223,7 @@ def main():
             for name in ('arp-async-probe','tcp-async-neighbor','tcp-try-transmit','tcp-async-send',
                          'tcp-async-retry-1ms','tcp-worker-waiter','tcp-adaptive-flight16'):
                 subprocess.run(['mdel','-i',str(normal),'::/ETC/'+name],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-            payloads+=((probe_executable,'::/BOOT/PROCDUMP.ELF'),(bulk,'::/BOOT/HWBULK.ELF'))
+            payloads+=((probe_executable,'::/BOOT/PROCDUMP.ELF'),)
         for src,target in payloads:
             subprocess.run(['mcopy','-o','-i',str(normal),str(src),target],check=True)
         if a.auto_desktop_startup_panic:
@@ -717,15 +715,16 @@ def main():
                         raise RuntimeError(f'core fixture failed to start: {job}')
                     time.sleep(.1)
                 core=a.output/'probe.core'
-                result=capture(bridge,session,int(ready[1]),core,key,bulk_port,compressed=False)
+                result=capture(bridge,session,int(ready[1]),core,key,bulk_port)
                 (a.output/'core-result.json').write_text(json.dumps(result,indent=2)+'\n')
-                trace=subprocess.run(['gdb','-batch','-iex','set sysroot /','-ex','thread apply all bt',
+                trace=subprocess.run(['gdb','-batch','-iex','set sysroot /','-ex','thread apply all bt','-ex','info proc mappings',
                                       str(probe_executable),str(core)],capture_output=True,text=True,timeout=30)
                 transcript=trace.stdout+trace.stderr
                 (a.output/'core-gdb.log').write_text(transcript)
                 if (trace.returncode or result['threads']!=2 or result.get('missing_registers') or
                     len(re.findall(r'^Thread \d+',transcript,re.M))!=2 or
                     'pipe_waiter' not in transcript or 'running_main' not in transcript or
+                    not re.search(r'^0x[0-9a-f]+.* /boot/procdump\.elf\s*$',transcript,re.M|re.I) or
                     not re.search(r'\bread \(',transcript)):
                     raise RuntimeError('GDB could not unwind both live threads; see core-gdb.log')
                 if bridge.job(session,request,wait_s=1).get('state')!='running':

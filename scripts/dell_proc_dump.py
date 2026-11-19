@@ -19,7 +19,7 @@ from hardware_bulk_workflow import BulkRun
 DEFAULT_KEY = Path("/data/Programming/Brook/shared/dell/hardware-update-key")
 
 
-def capture(bridge, session, pid, output, key_file, port=1236, full=False, compressed=True):
+def capture(bridge, session, pid, output, key_file, port=1236, full=False):
     output = output.absolute()
     if output.exists() or output.is_symlink():
         raise FileExistsError(output)
@@ -35,7 +35,7 @@ def capture(bridge, session, pid, output, key_file, port=1236, full=False, compr
     # artifact can be published without overwriting an existing local path.
     with tempfile.TemporaryDirectory(prefix=".brook-core-", dir=output.parent) as staging:
         receipt = BulkRun(bridge, Path(staging) / "transfer").execute(
-            session, key_file, "getz" if compressed else "get", artifact_id=artifact_id, port=port
+            session, key_file, "getz", artifact_id=artifact_id, port=port
         )
         artifact = Path(receipt["artifact_path"])
         if artifact.stat().st_size != result["bytes"]:
