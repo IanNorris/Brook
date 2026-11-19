@@ -95,7 +95,13 @@ _Last updated: 19 November 2026 (early), by a Claude Code session; see "19 Nov e
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
-**19 Nov night: Dell on gen 456 = `work/integration53` 80458076** (int52 + `work/wayland-latency`; session `1d3cf53854c64e9a91a8850dd6c374e9`). 383 non-stress tests pass; QEMU passes. **Next:** Ian scrolls Nautilus/Dolphin, then read `latency.clients[]` from `/tmp/brook-waylandd-wayland-0.json` (reset with `/tmp/brook-waylandd-stats-reset`).
+**19 Nov night: Dell on gen 457 = `work/integration54` b07a9d01** (int53 + `work/hw-capture` 7bb9001b: scanout readback screenshots and window capture; session `816429bf13934a8bb7c3f719d9ffb6bd`). 384 non-stress tests pass; QEMU passes.
+- **Capture works on the Dell:** source `gpu-present`, scanout `zero-copy`, copy 11.7 ms, glass visible.
+- **Run the int54+ bridge copy:** `BROOK_ROOT=/data/Programming/Brook/display-perf python3 /data/Programming/Brook/integration27/tools/vm_bridge/server.py --call hw_transfer` with `action=frame`, optional `window` (an hw_windows reference), `window_area` frame|client|buffer, `cursor`.
+- **Known gaps:** `cursor:true` reported cursor_composited false; `window_area=buffer` returned `window-buffer` / scanout `unverified`, copy_us 0 (check the image).
+- **Evidence:** `display-perf/build/dell/shots/`.
+
+**Previous: gen 456 = `work/integration53` 80458076** (int52 + `work/wayland-latency`; session `1d3cf53854c64e9a91a8850dd6c374e9`). 383 non-stress tests pass; QEMU passes. **Next:** Ian scrolls Nautilus/Dolphin, then read `latency.clients[]` from `/tmp/brook-waylandd-wayland-0.json` (reset with `/tmp/brook-waylandd-stats-reset`).
 
 **Previous: gen 455 = `work/integration52` e7cd6e06** (int51 + `work/glass-stale` 8b7aa052: live-renderer lease renewal plus blur-reason diagnostics; session `437a4a2c40ec42158368f7fbb718bfe2`).
 - **Glass glitch FIXED** (Ian scrolled Nautilus and Dolphin): backend_blur_changes 1, cpu_frames_over_renderer flat at 5 (startup), lease_live_renewals 74 → 2,635, presents.lease_gaps 0, gap_max 318 ms.
