@@ -767,6 +767,7 @@ Two independent code reviews (compositor and driver), Dell measurements on the g
 - **Steam:** Ian's attempt to start it failed before this restart. That boot's logs are lost, so it is not yet investigated. Earlier Dell Steam-client attempts hung the machine; see `docs/steam-dell-software-glx-checkpoint.md`.
 
 ## Operating notes
+- **Boot pairs don't update store apps.** Apps such as `brook-settings` (`tools/*-pkg`) live in the Dell's /nix/store and profile, so a new pair leaves them unchanged. After changing an app, stage it with `tools/launcher-stage/make_bundle.py OUT --path <store> --link /nix/profile/bin/<app>=<store>/bin/<app>`, put `bundle.tar`, then run `install.py … TX --check` followed by the real run (rollback with `--rollback TX`). Example: tx `settings1119` (19 Nov). Ian's slider retest failed until it was staged.
 
 - **The `brook-vm` MCP isn't registered in Claude Code.** Use `BROOK_ROOT=$PWD python3 tools/vm_bridge/server.py --call TOOL --arguments 'JSON'`. It has the same tools and side effects. Read `tools/vm_bridge/skills/brook-vm/SKILL.md` and its references first.
 - **The Dell debug listener is single-connection.** Only one agent should operate the Dell at a time.
