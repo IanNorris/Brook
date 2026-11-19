@@ -86,6 +86,8 @@ struct FakeNet {
     brook::SockAddrIn source{},peer{};
     bool acceptReady=false;
     uint32_t localIp=0,remoteIp=0;uint16_t localPort=0,remotePort=0;
+    int32_t receiveBufferRequest=0;
+    int receiveBuffer=262144;
     bool tcp=false;uint8_t tcpState=4;uint16_t peerMss=1400; // TCP_INFO source
 };
 extern FakeNet g_net;

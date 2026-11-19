@@ -1809,6 +1809,7 @@ BdwScanoutStatus BdwExecuteBcsScanout(BdwGpuBuffer* source,uint64_t token,const 
 #endif
         stage(5);return BdwScanoutStatus::Completed;
     case BdwZeroCopyOutcome::RepairRequired:return BdwScanoutStatus::RepairRequired;
+    case BdwZeroCopyOutcome::Deferred:return BdwScanoutStatus::Deferred;
     case BdwZeroCopyOutcome::Copy:break;
     }
 #endif

@@ -76,7 +76,7 @@ inline BdwZeroCopyAdoption BdwZeroCopyAdoptDecision(uint32_t registered,bool cal
     for(uint32_t i=0;i<registered;++i)if(!idle || !idle[i])return BdwZeroCopyAdoption::Busy;
     return BdwZeroCopyAdoption::Adopt;
 }
-enum class BdwZeroCopyPresent : uint8_t {Rejected,ArmNow,Queued};
+enum class BdwZeroCopyPresent : uint8_t {Rejected,ArmNow,Queued,Deferred};
 class BdwZeroCopyRing {
     uint32_t surfaces_[BdwZeroCopyMaxImages+1]{};
     uint64_t identities_[BdwZeroCopyMaxImages+1]{};
@@ -152,6 +152,21 @@ public:
         }
         toArm_=slot;hasToArm_=true;return BdwZeroCopyPresent::ArmNow;
     }
+    // The handoff ticket already proves GPU completion. Allow a free slot
+    // whose ticket was reserved before ring activation, but never adopt a
+    // slot the display may fetch. A busy, healthy ring needs no repair.
+    BdwZeroCopyPresent PresentCompleted(uint32_t slot,bool& adopted){
+        adopted=false;
+        if(!slot || slot>=slots_ || uncertain_ || leaving_)return BdwZeroCopyPresent::Rejected;
+        if(!(writing_&Bit(slot))){
+            if(!BeginWrite(slot))return BdwZeroCopyPresent::Deferred;
+            adopted=true;
+        }
+        return Present(slot);
+    }
+    bool HoldsFront(uint32_t live)const{
+        return front_ && !uncertain_ && !leaving_ && live==surfaces_[front_];
+    }
     // frame is the counter value read before the DSPASURF write.
     bool Armed(uint32_t slot,uint32_t frame,uint64_t ticks){
         if(!hasToArm_ || slot!=toArm_ || uncertain_)return false;
@@ -225,6 +240,7 @@ inline const char* BdwZeroCopyFallbackName(BdwZeroCopyFallback f){
 }
 struct BdwZeroCopyStats {
     uint64_t presents=0,armedNow=0,queued=0,replaced=0,latched=0,missedVblanks=0,uncertain=0,refusedReserve=0;
+    uint64_t deferredPresents=0,adoptedPresents=0,workerWaits=0;
     uint64_t fallback[uint32_t(BdwZeroCopyFallback::Count_)]{};
     uint64_t latchUsSum=0,latchUsMax=0;
     uint64_t flushes=0,fullFlushes=0,flushBytes=0,flushUsSum=0,flushUsMax=0; // "flush" cache mode

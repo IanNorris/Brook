@@ -464,7 +464,8 @@ int64_t sys_brook_desktop_overlay(uint64_t op,uint64_t token,uint64_t destinatio
     if(!brook::BdwRenderExperimentEnabled())return -ENODEV;
     if(token>0xffffffffULL || (reserved &&
        (op!=BROOK_DESKTOP_OVERLAY_CURSOR ||
-        (reserved!=BROOK_DESKTOP_CURSOR_PLANE_V1 && reserved!=BROOK_DESKTOP_CURSOR_PLANE_V2))))return -EINVAL;
+        (reserved!=BROOK_DESKTOP_CURSOR_PLANE_V1 && reserved!=BROOK_DESKTOP_CURSOR_PLANE_V2 &&
+         reserved!=BROOK_DESKTOP_CURSOR_PLANE_V3))))return -EINVAL;
     const uint64_t owner=proc->leaderIncarnation?proc->leaderIncarnation:proc->incarnation;
     if(op==0){
         if(token || destination || length || (offset & ~uint64_t(BROOK_DESKTOP_OVERLAY_NO_CURSOR)))return -EINVAL;
@@ -541,7 +542,7 @@ int64_t sys_brook_desktop_overlay(uint64_t op,uint64_t token,uint64_t destinatio
         if(!cursor)return -ENOMEM;
         CompositorOverlayCursor(*cursor,offset);
         bool suppress=false;
-        const uint64_t epoch=brook::BdwCursorRendererQuery(owner,reserved==BROOK_DESKTOP_CURSOR_PLANE_V2,suppress);
+        const uint64_t epoch=brook::BdwCursorRendererQuery(owner,reserved==BROOK_DESKTOP_CURSOR_PLANE_V3,suppress);
         if(suppress)cursor->visible=0;
         const uint64_t bytes=cursor->serial==offset?offsetof(BrookDesktopOverlayCursor,pixels):sizeof(*cursor);
         const bool copied=CopyToUser(destination,cursor,bytes);

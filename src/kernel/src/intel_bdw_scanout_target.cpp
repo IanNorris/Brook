@@ -30,6 +30,7 @@
 #include "native_tsc_observe.h"
 #include "boot_protocol/boot_protocol.h"
 #include "acpi.h"
+#include "apic.h"
 #include "spinlock.h"
 #include "scheduler.h"
 #include "process.h"
@@ -394,13 +395,13 @@ CursorBacking cursorBacking[2];
 BdwCursorPlane cursorPlane;
 BdwCursorHandoff cursorHandoff;
 BdwCursorStatus cursorStatus;
-bool cursorSetupFailed=false,cursorTransparent=false,zcLeavingForGop=false;
+bool cursorSetupFailed=false,cursorTransparent=false,cursorMayBeVisible=false,zcLeavingForGop=false;
 uint64_t cursorSerial=0;
 uint32_t cursorSlot=0;
 
 void CursorOffLocked(bool failed=false) {
     const bool enabled=cursorPlane.enabled();
-    if(failed && (enabled || cursorHandoff.epoch()))++cursorStatus.fallbacks;
+    if(failed && (enabled || cursorHandoff.inProgress()))++cursorStatus.fallbacks;
     cursorHandoff.cancel();
     if(enabled){
         PlaneIo io{displayRegs[2]};
@@ -409,14 +410,22 @@ void CursorOffLocked(bool failed=false) {
     cursorStatus.active=false;
 }
 bool CursorPollLocked(){
-    if(!cursorPlane.blocksSoftware())return true;
-    PlaneIo io{displayRegs[2]};
-    if(!cursorPlane.poll(io,io.read32(BdwFlipRegs::FrameCountA))){
+    if(cursorPlane.blocksSoftware()){
+        PlaneIo io{displayRegs[2]};
+        if(!cursorPlane.poll(io,io.read32(BdwFlipRegs::FrameCountA))){
+            CursorOffLocked(true);
+            cursorSetupFailed=true;cursorStatus.requested=false;
+            return false;
+        }
+    }
+    if(!cursorPlane.blocksSoftware())cursorMayBeVisible=false;
+    if(cursorPlane.ready() && cursorPlane.active())cursorHandoff.latched();
+    if(cursorHandoff.inProgress() && !cursorHandoff.owned() && cursorHandoff.expired(ApicTickCount())){
         CursorOffLocked(true);
-        cursorSetupFailed=true;cursorStatus.requested=false;
+        cursorStatus.requested=false;
         return false;
     }
-    cursorStatus.active=cursorPlane.active();
+    cursorStatus.active=cursorHandoff.owned() && cursorPlane.active();
     return true;
 }
 // Called only by the BSP submission worker after it has bound the desktop
@@ -1145,11 +1154,12 @@ BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer* source,const Composito
         return BdwZeroCopyOutcome::RepairRequired;
     }
     if(!zcActive || zcDisabled){IrqSpinLockRelease(&lock,f);return BdwZeroCopyOutcome::Copy;}
-    auto p=zcRing.Present(slot);
-    if(p==BdwZeroCopyPresent::Rejected && zcRing.BeginWrite(slot)){
-        // Reserved before activation: not tracked as written, but provably not
-        // displayed, armed or queued now, so it may be presented.
-        ZcFallback(BdwZeroCopyFallback::NotWriting);p=zcRing.Present(slot);
+    bool adopted=false;
+    const auto p=zcRing.PresentCompleted(slot,adopted);
+    if(p==BdwZeroCopyPresent::Deferred){
+        ++zcStats.deferredPresents;
+        IrqSpinLockRelease(&lock,f);
+        return BdwZeroCopyOutcome::Deferred;
     }
     BdwZeroCopyOutcome outcome=BdwZeroCopyOutcome::Presented;
     if(p==BdwZeroCopyPresent::Rejected){
@@ -1157,6 +1167,7 @@ BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer* source,const Composito
         ZcDisableLocked("image-busy");outcome=BdwZeroCopyOutcome::RepairRequired;
     }else{
         ++zcStats.presents;
+        if(adopted)++zcStats.adoptedPresents;
         {const uint64_t seq=zcRing.Sequence();auto& e=zcTimeline[seq%ZcTimelineSize];
          e={seq,slot,p==BdwZeroCopyPresent::Queued,Rdtsc(),0,0,0};zcSlotSequence[slot]=seq;}
         if(p==BdwZeroCopyPresent::ArmNow){++zcStats.armedNow;
@@ -1166,6 +1177,19 @@ BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer* source,const Composito
     }
     IrqSpinLockRelease(&lock,f);ZcLogPending();
     return outcome;
+}
+// A verified, owned front can remain on screen during present back-pressure.
+bool BdwZeroCopyCanHoldFront(uint64_t owner){
+    const uint64_t f=IrqSpinLockAcquire(&lock);
+    const bool canHold=owner && zcOwner==owner && zcActive && zcRequested && !zcDisabled &&
+        !zcLeavingForGop && !ClientShowing() && zcRing.HoldsFront(Read(BdwFlipRegs::SurfaceLive));
+    IrqSpinLockRelease(&lock,f);
+    return canHold;
+}
+void BdwZeroCopyNoteWorkerWait(){
+    const uint64_t f=IrqSpinLockAcquire(&lock);
+    ++zcStats.workerWaits;
+    IrqSpinLockRelease(&lock,f);
 }
 uint64_t zcRenderUc=0,zcRenderWb=0;
 bool BdwZeroCopyUncachedRender(){return __atomic_load_n(&zcCacheMode,__ATOMIC_ACQUIRE)!=ZcCacheFlush;}
@@ -1288,6 +1312,8 @@ int64_t BdwZeroCopyRegister(uint64_t,BdwGpuBuffer* const*,uint32_t,const BdwZero
 bool BdwZeroCopyOnReserve(BdwGpuBuffer*){return true;}
 void BdwZeroCopyOnRelease(BdwGpuBuffer*){}
 BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer*,const CompositorPresentRegion*,uint32_t){return BdwZeroCopyOutcome::Copy;}
+bool BdwZeroCopyCanHoldFront(uint64_t){return false;}
+void BdwZeroCopyNoteWorkerWait(){}
 void BdwZeroCopyPrepareScanout(BdwGpuBuffer*,const CompositorPresentRegion*,uint32_t){}
 uint32_t BdwZeroCopyReadTimeline(BdwZeroCopyTimelineEntry*,uint32_t,uint64_t& khz){khz=0;return 0;}
 void BdwZeroCopyReadStatus(BdwZeroCopyStatus& out){out={};out.reason="not built";out.last=BdwZeroCopyFallback::NotBuilt;}
@@ -1309,6 +1335,8 @@ int64_t BdwZeroCopyRegister(uint64_t,BdwGpuBuffer* const*,uint32_t,const BdwZero
 bool BdwZeroCopyOnReserve(BdwGpuBuffer*){return true;}
 void BdwZeroCopyOnRelease(BdwGpuBuffer*){}
 BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer*,const CompositorPresentRegion*,uint32_t){return BdwZeroCopyOutcome::Copy;}
+bool BdwZeroCopyCanHoldFront(uint64_t){return false;}
+void BdwZeroCopyNoteWorkerWait(){}
 void BdwZeroCopyPrepareScanout(BdwGpuBuffer*,const CompositorPresentRegion*,uint32_t){}
 uint32_t BdwZeroCopyReadTimeline(BdwZeroCopyTimelineEntry*,uint32_t,uint64_t& khz){khz=0;return 0;}
 void BdwZeroCopyReadStatus(BdwZeroCopyStatus& out){out={};out.reason="not built";out.last=BdwZeroCopyFallback::NotBuilt;}
@@ -1341,6 +1369,8 @@ int64_t BdwZeroCopyRegister(uint64_t,BdwGpuBuffer* const*,uint32_t,const BdwZero
 bool BdwZeroCopyOnReserve(BdwGpuBuffer*){return true;}
 void BdwZeroCopyOnRelease(BdwGpuBuffer*){}
 BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer*,const CompositorPresentRegion*,uint32_t){return BdwZeroCopyOutcome::Copy;}
+bool BdwZeroCopyCanHoldFront(uint64_t){return false;}
+void BdwZeroCopyNoteWorkerWait(){}
 void BdwZeroCopyPrepareScanout(BdwGpuBuffer*,const CompositorPresentRegion*,uint32_t){}
 uint32_t BdwZeroCopyReadTimeline(BdwZeroCopyTimelineEntry*,uint32_t,uint64_t& khz){khz=0;return 0;}
 void BdwZeroCopyReadStatus(BdwZeroCopyStatus& out){out={};out.reason="not built";out.last=BdwZeroCopyFallback::NotBuilt;}
@@ -1456,10 +1486,11 @@ bool BdwClientScanoutService(bool canPresent){
 
 bool BdwCursorRequest(bool enable){
     const uint64_t f=IrqSpinLockAcquire(&lock);
-    cursorStatus.requested=enable;
-    if(!enable){CursorOffLocked();ClientRestoreLocked(false);}
     const bool ok=!enable || !cursorSetupFailed;
+    cursorStatus.requested=enable && ok;
+    if(!enable){CursorOffLocked();ClientRestoreLocked(false);}
     IrqSpinLockRelease(&lock,f);
+    if(ok)CompositorWake();
     return ok;
 }
 BdwCursorStatus BdwCursorReadStatus(){
@@ -1471,28 +1502,31 @@ BdwCursorStatus BdwCursorReadStatus(){
 uint64_t BdwCursorRendererQuery(uint64_t owner,bool supportsHandoff,bool& suppress){
     const uint64_t f=IrqSpinLockAcquire(&lock);
     CursorPollLocked();
-    const bool canOffer=supportsHandoff && owner && owner==zcOwner &&
+    const bool eligible=supportsHandoff && owner && owner==zcOwner &&
         cursorStatus.requested && cursorStatus.bound && zcActive && zcRequested &&
-        !zcDisabled && !zcLeavingForGop && cursorPlane.ready();
-    // Continue the existing offer across a cursor image swap. During disable
-    // both the renderer and the software compositor wait for the off latch.
-    const bool keepOffer=supportsHandoff && owner && owner==zcOwner && cursorHandoff.epoch();
-    const uint64_t epoch=canOffer || keepOffer?cursorHandoff.offer(zcRing.Sequence()):0;
-    suppress=epoch || cursorPlane.blocksSoftware();
+        !zcDisabled && !zcLeavingForGop;
+    const uint64_t now=eligible?ApicTickCount():0;
+    const bool wake=eligible && cursorPlane.ready() && cursorHandoff.prepare(now);
+    const uint64_t epoch=eligible ?
+        cursorHandoff.offer(zcRing.Sequence(),now,cursorPlane.active() && cursorPlane.ready()):0;
+    const bool hardwareMayBeVisible=cursorMayBeVisible && cursorPlane.blocksSoftware();
+    suppress=eligible?cursorHandoff.suppress(hardwareMayBeVisible):hardwareMayBeVisible;
     const uint64_t ack=cursorHandoff.awaitingPresent()?epoch:0;
     IrqSpinLockRelease(&lock,f);
+    if(wake)CompositorWake();
     return ack;
 }
 void BdwCursorRendererPresented(uint64_t owner,uint64_t epoch){
     const uint64_t f=IrqSpinLockAcquire(&lock);
-    if(owner && owner==zcOwner && zcActive && zcRequested && !zcDisabled)
+    const bool wake=owner && owner==zcOwner && zcActive && zcRequested && !zcDisabled &&
         cursorHandoff.presented(epoch,zcRing.Sequence());
     IrqSpinLockRelease(&lock,f);
+    if(wake)CompositorWake();
 }
 bool BdwCursorBlocksSoftware(){
     const uint64_t f=IrqSpinLockAcquire(&lock);
     CursorPollLocked();
-    const bool blocks=cursorPlane.blocksSoftware();
+    const bool blocks=cursorMayBeVisible && cursorPlane.blocksSoftware();
     IrqSpinLockRelease(&lock,f);
     return blocks;
 }
@@ -1504,7 +1538,7 @@ void BdwCursorUpdate(uint64_t leaseOwner,bool visible,int32_t x,int32_t y,
         ClientRestoreLocked(false);return;
     }
     if(!cursorStatus.requested || !cursorStatus.bound || !zcActive || !zcRequested ||
-       !leaseOwner || leaseOwner!=zcOwner || !cursorHandoff.epoch()) {
+       !leaseOwner || leaseOwner!=zcOwner || !cursorHandoff.inProgress()) {
         if(visible)ClientRestoreLocked(false);
         CursorOffLocked();return;
     }
@@ -1512,21 +1546,25 @@ void BdwCursorUpdate(uint64_t leaseOwner,bool visible,int32_t x,int32_t y,
         ClientRestoreLocked(false);CursorOffLocked(true);return;
     }
     if(!cursorPlane.ready())return;
+    const bool probe=cursorHandoff.probing();
+    if(probe && cursorPlane.enabled())return;
     PlaneIo io{displayRegs[2]};
-    const uint32_t primary=io.read32(BdwFlipRegs::SurfaceLive);
     const uint32_t frame=io.read32(BdwFlipRegs::FrameCountA);
-    if(primary==0xffffffffu || frame==0xffffffffu)return;
-    // Use the live primary slot, rather than an accepted or queued present,
-    // to prove that the preceding software cursor is no longer on screen.
-    const uint32_t front=zcRing.Front();
-    if(!cursorPlane.enabled() &&
-       (!front || primary!=zcRing.Surface(front) || !cursorHandoff.mayEnable(zcSlotSequence[front])))return;
+    if(frame==0xffffffffu)return;
+    const bool activating=!probe && !cursorHandoff.owned();
+    if(activating){
+        // The transparent probe stays on while the renderer clears its old
+        // cursor. Only the live slot proves the old pixels are gone.
+        const uint32_t front=zcRing.Front();
+        if(!front || io.read32(BdwFlipRegs::SurfaceLive)!=zcRing.Surface(front) ||
+           !cursorHandoff.mayEnable(zcSlotSequence[front]))return;
+    }
 
-    const bool transparent=!visible || !BdwCursorHasAlpha(pixels,width,height);
+    const bool transparent=probe || !visible || !BdwCursorHasAlpha(pixels,width,height);
     // A fully transparent image keeps ownership. Fetch it on screen so a
     // pointer parked outside the output cannot prevent its surface latch.
     if(transparent)x=y=0;
-    const bool upload=!cursorPlane.enabled() || transparent!=cursorTransparent ||
+    const bool upload=probe || activating || transparent!=cursorTransparent ||
                       (!transparent && serial!=cursorSerial);
     if(upload){
         const uint32_t slot=cursorSlot^1u;
@@ -1540,6 +1578,8 @@ void BdwCursorUpdate(uint64_t leaseOwner,bool visible,int32_t x,int32_t y,
                 dest[col]=(a<<24)|(scale(16)<<16)|(scale(8)<<8)|scale(0);
             }
         }
+        if(activating)cursorHandoff.arm(ApicTickCount());
+        cursorMayBeVisible|=!transparent;
         __atomic_store_n(&g_cursorTouched,true,__ATOMIC_RELEASE);
         if(!BdwPrivatePagesPublish(image.pixels,CursorImagePages) ||
            !cursorPlane.update(io,image.reservation.first*4096,frame,x,y)){

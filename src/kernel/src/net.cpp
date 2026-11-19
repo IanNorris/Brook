@@ -219,8 +219,6 @@ static bool     g_loopbackDraining = false;  // guarded by g_loopbackLock
 // Socket table
 // TODO: Replace with per-process dynamic socket pool to support high socket
 // counts. The current global fixed table limits the whole system to
-// MAX_SOCKETS simultaneous sockets. Each socket heap-allocates 64KB for its
-// RX ring, so the practical limit is bounded by physical RAM anyway.
 static constexpr uint32_t MAX_SOCKETS = 1024;
 static Socket g_sockets[MAX_SOCKETS];
 // Slot-owned, like Socket::lock: never clear or reinitialise on reuse.
@@ -376,6 +374,8 @@ static volatile uint16_t g_ipId = 1;
 static uint32_t g_tcpEphemeralPort = 49200; // accessed via atomic fetch-add
 
 static uint32_t TcpReceiveFree(const Socket& s);
+static constexpr uint64_t SocketRxBudget = 256ull * 1024 * 1024;
+static uint64_t g_socketRxBytes, g_socketRxDenied, g_tcpRxGrowths;
 // Fixed before networking is configured; never change the cap on live flows.
 static uint32_t g_tcpReceiveWindowCap=~uint32_t(0);
 
@@ -384,13 +384,25 @@ struct TcpTxSnapshot {
     uint16_t localPort, remotePort, window, synWindow;
     uint8_t windowScale;
 };
-static TcpTxSnapshot CaptureTcpTxLocked(const Socket& s)
+static TcpTxSnapshot CaptureTcpTxLocked(Socket& s)
 {
-    uint32_t free = TcpReceiveFree(s);
+    const uint32_t free = TcpReceiveFree(s);
+    const uint16_t window = TcpAdvertisedWindow(free, s.tcpRcvWndScale, 0, g_tcpReceiveWindowCap);
+    const uint16_t synWindow = TcpAdvertisedWindow(free, s.tcpRcvWndScale, TCP_SYN, g_tcpReceiveWindowCap);
+    if (s.tcpState == TcpState::SynSent && synWindow > s.tcpRxSynGrant) {
+        s.tcpRxSynGrant = synWindow;
+    } else if (s.tcpState != TcpState::Closed && s.tcpState != TcpState::SynSent &&
+               s.tcpState != TcpState::Listen) {
+        const uint32_t grant = s.tcpState == TcpState::SynRecv ? synWindow : uint32_t(window) << s.tcpRcvWndScale;
+        const uint32_t edge = s.tcpRcvNxt + grant;
+        if (!s.tcpRxRightEdgeValid || static_cast<int32_t>(edge - s.tcpRxRightEdge) > 0) {
+            s.tcpRxRightEdge = edge;
+            s.tcpRxRightEdgeValid = true;
+        }
+    }
     return {s.localIp, s.remoteIp, s.tcpRcvNxt, s.tcpSndNxt, s.tcpSndIss,
             s.ownerPid, s.localPort, s.remotePort,
-            TcpAdvertisedWindow(free, s.tcpRcvWndScale, 0, g_tcpReceiveWindowCap),
-            TcpAdvertisedWindow(free, s.tcpRcvWndScale, TCP_SYN, g_tcpReceiveWindowCap), s.tcpRcvWndScale};
+            window, synWindow, s.tcpRcvWndScale};
 }
 static int TcpSendSnapshot(Socket& s, const TcpTxSnapshot& snapshot, uint32_t seq,
                             uint8_t flags, const void* data, uint32_t dataLen,
@@ -2167,8 +2179,51 @@ void SockSetAcceptedOwner(int sockIdx, uint32_t uid, uint32_t gid)
     IrqSpinLockRelease(&g_socketRegistryLock, flags);
 }
 
+// Include the TCP reassembly bitmap and both allocations during a resize.
+struct SocketRxStorage {
+    uint8_t* ring;
+    uint64_t* bitmap;
+    uint32_t capacity;
+};
+static uint64_t SocketRxCharge(uint32_t capacity, bool stream)
+{
+    return capacity + (stream ? capacity / 8 : 0);
+}
+static void FreeSocketRx(SocketRxStorage storage, bool stream)
+{
+    if (storage.bitmap) kfree(storage.bitmap);
+    if (storage.ring) kfree(storage.ring);
+    __atomic_fetch_sub(&g_socketRxBytes, SocketRxCharge(storage.capacity, stream), __ATOMIC_RELAXED);
+}
+static SocketRxStorage AllocateSocketRx(uint32_t limit, bool stream)
+{
+    uint32_t capacity = 4096;
+    while (capacity < limit) capacity *= 2;
+    const uint64_t charge = SocketRxCharge(capacity, stream);
+    uint64_t used = __atomic_load_n(&g_socketRxBytes, __ATOMIC_RELAXED);
+    do {
+        if (charge > SocketRxBudget - used) {
+            __atomic_fetch_add(&g_socketRxDenied, 1, __ATOMIC_RELAXED);
+            return {};
+        }
+    } while (!__atomic_compare_exchange_n(&g_socketRxBytes, &used, used + charge, false,
+                                          __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+
+    SocketRxStorage storage{static_cast<uint8_t*>(kmalloc(capacity)), nullptr, capacity};
+    if (storage.ring && stream) {
+        storage.bitmap = static_cast<uint64_t*>(kmalloc(capacity / 8));
+        if (storage.bitmap) memset(storage.bitmap, 0, capacity / 8);
+    }
+    if (!storage.ring || (stream && !storage.bitmap)) {
+        FreeSocketRx(storage, stream);
+        return {};
+    }
+    return storage;
+}
+
 static int SockCreateOwned(int domain, int type, int protocol, uint32_t pid,
-                           uint32_t uid, uint32_t gid)
+                           uint32_t uid, uint32_t gid, uint32_t receiveLimit=Socket::RX_DEFAULT,
+                           bool receiveLocked=false)
 {
     if (domain != AF_INET) return -1;
     if (type != SOCK_DGRAM && type != SOCK_STREAM) return -1;
@@ -2186,20 +2241,20 @@ static int SockCreateOwned(int domain, int type, int protocol, uint32_t pid,
         socket.protocol = protocol ? protocol : (type == SOCK_DGRAM ? IPPROTO_UDP : IPPROTO_TCP);
         socket.identity = {g_socketInodes.allocate(), uid, gid};
         socket.ownerPid = pid;
-        socket.rxBuf = static_cast<uint8_t*>(kmalloc(Socket::RX_BUF_SIZE));
-        if (socket.rxBuf && type == SOCK_STREAM) {
-            socket.tcpOooMap = static_cast<uint64_t*>(kmalloc(Socket::TCP_OOO_WORDS * sizeof(uint64_t)));
-            if(socket.tcpOooMap)memset(socket.tcpOooMap,0,Socket::TCP_OOO_WORDS*sizeof(uint64_t));
-        }
-        if (!socket.identity.inode || !socket.rxBuf || (type == SOCK_STREAM && !socket.tcpOooMap)) {
-            if (socket.rxBuf) kfree(socket.rxBuf);
-            if (socket.tcpOooMap) kfree(socket.tcpOooMap);
+        const auto storage = socket.identity.inode ? AllocateSocketRx(receiveLimit, type == SOCK_STREAM)
+                                                    : SocketRxStorage{};
+        if (!storage.ring) {
             flags = IrqSpinLockAcquire(&g_socketRegistryLock);
             ResetSocketPayload(socket);
             g_sockReserved[i] = false;
             IrqSpinLockRelease(&g_socketRegistryLock, flags);
             return -1;
         }
+        socket.rxBuf = storage.ring;
+        socket.tcpOooMap = storage.bitmap;
+        socket.rxCapacity = storage.capacity;
+        socket.rxLimit = receiveLimit;
+        socket.rxUserLimit = receiveLocked;
         socket.refCount = 1;
         flags = IrqSpinLockAcquire(&g_socketRegistryLock);
         ++g_sockGeneration[i];
@@ -2308,9 +2363,108 @@ int SockSendTo(int sockIdx, const void* buf, uint32_t len,
 }
 
 // Copy n bytes out of a socket rx ring starting at tail (wraps once at most).
-static void SockRingRead(const uint8_t* ring,uint32_t tail,void* out,uint32_t n){
-    const uint32_t first=n<Socket::RX_BUF_SIZE-tail?n:Socket::RX_BUF_SIZE-tail;
-    if(out){memcpy(out,ring+tail,first);if(n>first)memcpy(static_cast<uint8_t*>(out)+first,ring,n-first);}
+static void SockRingRead(const Socket& s, uint32_t tail, void* out, uint32_t n)
+{
+    const uint32_t first = n < s.rxCapacity - tail ? n : s.rxCapacity - tail;
+    if (out) {
+        memcpy(out, s.rxBuf + tail, first);
+        if (n > first) memcpy(static_cast<uint8_t*>(out) + first, s.rxBuf, n - first);
+    }
+}
+
+// Rebase readable and future bytes to the new tail without changing the
+// sequence numbers represented by their ring offsets.
+static SocketRxStorage InstallSocketRxLocked(Socket& s, SocketRxStorage fresh)
+{
+    const SocketRxStorage old{s.rxBuf, s.tcpOooMap, s.rxCapacity};
+    SockRingRead(s, s.rxTail, fresh.ring, s.rxCount);
+    if (s.tcpOooBytes) {
+        for (uint32_t word = 0; word < old.capacity / 64; ++word) {
+            uint64_t bits = old.bitmap[word];
+            while (bits) {
+                const unsigned bit = __builtin_ctzll(bits);
+                const uint64_t clear = ~bits >> bit;
+                const uint32_t run = clear ? __builtin_ctzll(clear) : 64 - bit;
+                const uint32_t index = word * 64 + bit;
+                const uint32_t offset = (index - s.rxTail) & (old.capacity - 1);
+                const uint32_t first = run < old.capacity - offset ? run : old.capacity - offset;
+                memcpy(fresh.ring + offset, old.ring + index, first);
+                if (run > first) memcpy(fresh.ring, old.ring + index + first, run - first);
+                // The old ring boundary is word-aligned, so a shifted word
+                // crosses at most one destination-word boundary.
+                const uint64_t mask = first == 64 ? ~uint64_t{0} : (uint64_t{1} << first) - 1;
+                const unsigned shift = offset % 64;
+                fresh.bitmap[offset / 64] |= mask << shift;
+                if (first > 64 - shift) fresh.bitmap[offset / 64 + 1] |= mask >> (64 - shift);
+                if (run > first) fresh.bitmap[0] |= (uint64_t{1} << (run - first)) - 1;
+                const uint64_t consumed = run == 64 ? ~uint64_t{0} : ((uint64_t{1} << run) - 1) << bit;
+                bits &= ~consumed;
+            }
+        }
+    }
+    s.rxTail = 0;
+    s.rxHead = s.rxCount & (fresh.capacity - 1);
+    s.rxBuf = fresh.ring;
+    s.tcpOooMap = fresh.bitmap;
+    s.rxCapacity = fresh.capacity;
+    return old;
+}
+
+// Allocate outside the socket lock. A concurrent setter or reader can change
+// the desired limit while allocation is in progress, so recheck before swap.
+static int SetSocketRxLimit(Socket& s, uint32_t limit, bool user)
+{
+    const bool stream = s.type == SOCK_STREAM;
+    SocketRxStorage staging{};
+    for (;;) {
+        SpinLockAcquire(&s.lock);
+        if (!user && (s.rxUserLimit || s.rxLimit >= limit || s.tcpState != TcpState::Established)) {
+            SpinLockRelease(&s.lock);
+            FreeSocketRx(staging, stream);
+            return 0;
+        }
+        if (limit <= s.rxCapacity || staging.capacity >= limit) {
+            if (limit > s.rxCapacity) staging = InstallSocketRxLocked(s, staging);
+            if (stream && limit > s.rxLimit && s.tcpState == TcpState::Established && !s.tcpUnackedSegs) {
+                s.tcpUnackedSegs = 1;
+                s.tcpLastDataTick = ApicTickCount();
+            }
+            s.rxLimit = limit;
+            s.rxUserLimit |= user;
+            if (!user) __atomic_fetch_add(&g_tcpRxGrowths, 1, __ATOMIC_RELAXED);
+            SpinLockRelease(&s.lock);
+            FreeSocketRx(staging, stream);
+            return 0;
+        }
+        SpinLockRelease(&s.lock);
+
+        staging = AllocateSocketRx(limit, stream);
+        if (!staging.ring) return -105; // ENOBUFS
+    }
+}
+
+int SockSetReceiveBuffer(int sockIdx, int32_t requested)
+{
+    if (sockIdx < 0) return -9;
+    SocketBorrow borrow(static_cast<uint32_t>(sockIdx));
+    if (!borrow) return -9;
+    const uint32_t capped = static_cast<uint32_t>(requested) < Socket::RX_MAX / 2 ?
+                            static_cast<uint32_t>(requested) : Socket::RX_MAX / 2;
+    const uint32_t doubled = capped * 2;
+    const uint32_t limit = doubled < Socket::RX_MIN ? Socket::RX_MIN : doubled;
+    return SetSocketRxLimit(g_sockets[sockIdx], limit, true);
+}
+
+int SockGetReceiveBuffer(int sockIdx)
+{
+    if (sockIdx < 0) return -9;
+    SocketBorrow borrow(static_cast<uint32_t>(sockIdx));
+    if (!borrow) return -9;
+    auto& s = g_sockets[sockIdx];
+    SpinLockAcquire(&s.lock);
+    const int limit = static_cast<int>(s.rxLimit);
+    SpinLockRelease(&s.lock);
+    return limit;
 }
 
 int SockRecvFrom(int sockIdx, void* buf, uint32_t len,
@@ -2348,7 +2502,7 @@ int SockRecvFrom(int sockIdx, void* buf, uint32_t len,
         NetCount(g_netCounters.udpRxCorrupt);
         return -11;
     }
-    SockRingRead(s.rxBuf, s.rxTail, header, sizeof(header));
+    SockRingRead(s, s.rxTail, header, sizeof(header));
     const uint32_t dgLen = uint32_t(header[0]) | uint32_t(header[1]) << 8 |
                            uint32_t(header[2]) << 16 | uint32_t(header[3]) << 24;
     if (dgLen > 65535 || dgLen > count - sizeof(header)) {
@@ -2361,10 +2515,10 @@ int SockRecvFrom(int sockIdx, void* buf, uint32_t len,
     const uint32_t srcIp = uint32_t(header[4]) | uint32_t(header[5]) << 8 |
                            uint32_t(header[6]) << 16 | uint32_t(header[7]) << 24;
     const uint16_t srcPort = static_cast<uint16_t>(header[8] | header[9] << 8);
-    const uint32_t dataTail = (s.rxTail + sizeof(header)) % Socket::RX_BUF_SIZE;
+    const uint32_t dataTail = (s.rxTail + sizeof(header)) & (s.rxCapacity - 1);
     const uint32_t copyLen = dgLen < len ? dgLen : len;
-    SockRingRead(s.rxBuf, dataTail, buf, copyLen);
-    s.rxTail = (dataTail + dgLen) % Socket::RX_BUF_SIZE; // skips any truncated remainder
+    SockRingRead(s, dataTail, buf, copyLen);
+    s.rxTail = (dataTail + dgLen) & (s.rxCapacity - 1); // skips any truncated remainder
     s.rxCount = count - (sizeof(header) + dgLen);
     SpinLockRelease(&s.lock);
 
@@ -2476,8 +2630,7 @@ static void SockFinalize(int sockIdx)
     SpinLockAcquire(&s.lock);
     SetSocketWaiterLocked(s, nullptr);
     SpinLockRelease(&s.lock);
-    if (s.tcpOooMap) kfree(s.tcpOooMap);
-    if (s.rxBuf) kfree(s.rxBuf);
+    FreeSocketRx({s.rxBuf, s.tcpOooMap, s.rxCapacity}, s.type == SOCK_STREAM);
     ResetSocketPayload(s);
     flags = IrqSpinLockAcquire(&g_socketRegistryLock);
     g_sockReserved[sockIdx] = false;
@@ -2586,7 +2739,7 @@ bool SockGetTcpInfo(int sockIdx, TcpInfoSource* out)
     out->ssthreshBytes = s.tcpFlightControl.threshold;
     out->peerWindow = s.tcpSndWnd;
     const uint64_t held = static_cast<uint64_t>(s.rxCount) + s.tcpOooBytes;
-    out->receiveFree = held < Socket::RX_BUF_SIZE ? static_cast<uint32_t>(Socket::RX_BUF_SIZE - held) : 0;
+    out->receiveFree = held < s.rxLimit ? static_cast<uint32_t>(s.rxLimit - held) : 0;
     out->segmentsIn = s.rxPktCount;
     out->segmentsOut = s.txPktCount;
     out->lastReceiveMs = s.tcpLastRxTick;
@@ -2624,7 +2777,7 @@ void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
         // Datagram layout: [len:4][srcIp:4][srcPort:2][data:len].
         uint32_t needed = 10 + len;
 
-        uint32_t avail = Socket::RX_BUF_SIZE - s.rxCount;
+        uint32_t avail = s.rxCount < s.rxLimit ? s.rxLimit - s.rxCount : 0;
         if (needed > avail) {
             SpinLockRelease(&s.lock);
             // An application that stops reading must cost one counter, not a
@@ -2639,23 +2792,23 @@ void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
         // Write length
         for (int b = 0; b < 4; b++) {
             s.rxBuf[s.rxHead] = static_cast<uint8_t>(len >> (b * 8));
-            s.rxHead = (s.rxHead + 1) % Socket::RX_BUF_SIZE;
+            s.rxHead = (s.rxHead + 1) & (s.rxCapacity - 1);
         }
         // Write source IP
         for (int b = 0; b < 4; b++) {
             s.rxBuf[s.rxHead] = static_cast<uint8_t>(srcIp >> (b * 8));
-            s.rxHead = (s.rxHead + 1) % Socket::RX_BUF_SIZE;
+            s.rxHead = (s.rxHead + 1) & (s.rxCapacity - 1);
         }
         // Write source port
         s.rxBuf[s.rxHead] = static_cast<uint8_t>(srcPort);
-        s.rxHead = (s.rxHead + 1) % Socket::RX_BUF_SIZE;
+        s.rxHead = (s.rxHead + 1) & (s.rxCapacity - 1);
         s.rxBuf[s.rxHead] = static_cast<uint8_t>(srcPort >> 8);
-        s.rxHead = (s.rxHead + 1) % Socket::RX_BUF_SIZE;
+        s.rxHead = (s.rxHead + 1) & (s.rxCapacity - 1);
         // Write data
         const uint8_t* d = static_cast<const uint8_t*>(data);
         for (uint32_t j = 0; j < len; j++) {
             s.rxBuf[s.rxHead] = d[j];
-            s.rxHead = (s.rxHead + 1) % Socket::RX_BUF_SIZE;
+            s.rxHead = (s.rxHead + 1) & (s.rxCapacity - 1);
         }
 
         __asm__ volatile("mfence" ::: "memory");
@@ -2767,7 +2920,7 @@ static void TcpStatsMaybeFlush()
             TcpReceiveFree(s) >= WINDOW_KEEPALIVE_MSS;
         if (delayed) s.tcpUnackedSegs = 0;
         if (keepalive) s.tcpLastRxTick = now;
-        const auto snapshot = CaptureTcpTxLocked(s);
+        const auto snapshot = (delayed || keepalive) ? CaptureTcpTxLocked(s) : TcpTxSnapshot{};
         SpinLockRelease(&s.lock);
         if (delayed || keepalive) {
             int result=TcpSendSnapshot(s, snapshot, snapshot.nextSeq, TCP_ACK, nullptr, 0,
@@ -2842,14 +2995,18 @@ static uint32_t TcpReceiveFree(const Socket& s)
     // The window is a sequence span, not a count of unallocated bytes.
     // Future bytes already occupy positions within that span. Subtracting
     // them again moves its right edge backwards after every reordered packet.
-    return s.rxCount<Socket::RX_BUF_SIZE ? Socket::RX_BUF_SIZE-s.rxCount : 0;
+    const uint32_t space = s.rxCount < s.rxLimit ? s.rxLimit - s.rxCount : 0;
+    if (!s.tcpRxRightEdgeValid) return space;
+    // SO_RCVBUF must not revoke already-advertised sequence space.
+    const int32_t granted = static_cast<int32_t>(s.tcpRxRightEdge - s.tcpRcvNxt);
+    return granted > static_cast<int32_t>(space) ? static_cast<uint32_t>(granted) : space;
 }
 
 static void TcpReapOoo(Socket& s,uint64_t now)
 {
     static constexpr uint64_t TCP_OOO_REAP_MS = 30000;
     if(!s.tcpOooBytes || !TcpTimerElapsed(now,s.tcpOooSince,TCP_OOO_REAP_MS))return;
-    memset(s.tcpOooMap,0,Socket::TCP_OOO_WORDS*sizeof(uint64_t));
+    memset(s.tcpOooMap,0,s.rxCapacity / 8);
     s.tcpOooBytes=0;
 }
 
@@ -2860,7 +3017,7 @@ static uint64_t TcpOooMask(uint32_t count)
 
 // The start and length are always within the same receive window. Traverse
 // ring words rather than packet descriptors, including across ring wrap.
-template<class Apply> static void TcpVisitOooWords(uint32_t position,uint32_t length,Apply&& apply)
+template<class Apply> static void TcpVisitOooWords(const Socket& s,uint32_t position,uint32_t length,Apply&& apply)
 {
     uint32_t consumed=0;
     while(consumed<length){
@@ -2868,7 +3025,7 @@ template<class Apply> static void TcpVisitOooWords(uint32_t position,uint32_t le
         uint32_t count=64-bit;
         if(count>length-consumed)count=length-consumed;
         apply(position,bit,count,consumed);
-        position=(position+count)%Socket::RX_BUF_SIZE;
+        position=(position+count) & (s.rxCapacity - 1);
         consumed+=count;
     }
 }
@@ -2876,7 +3033,7 @@ template<class Apply> static void TcpVisitOooWords(uint32_t position,uint32_t le
 static void TcpClearOoo(Socket& s,uint32_t position,uint32_t length)
 {
     if(!s.tcpOooBytes)return;
-    TcpVisitOooWords(position,length,[&](uint32_t byte,uint32_t bit,uint32_t count,uint32_t){
+    TcpVisitOooWords(s,position,length,[&](uint32_t byte,uint32_t bit,uint32_t count,uint32_t){
         const uint64_t mask=TcpOooMask(count)<<bit;
         auto& word=s.tcpOooMap[byte/64];
         // Clang lowers 64-bit popcount to a runtime helper on builds
@@ -2903,7 +3060,7 @@ static bool TcpStoreOoo(Socket& s,uint32_t seq,const uint8_t* data,uint32_t len,
         len=window-distance;
     }
     uint32_t added=0;
-    TcpVisitOooWords((s.rxHead+distance)%Socket::RX_BUF_SIZE,len,
+    TcpVisitOooWords(s,(s.rxHead+distance) & (s.rxCapacity - 1),len,
         [&](uint32_t position,uint32_t bit,uint32_t count,uint32_t consumed){
             const uint64_t mask=TcpOooMask(count)<<bit;
             auto& word=s.tcpOooMap[position/64];
@@ -2936,7 +3093,7 @@ static bool TcpDrainOoo(Socket& s)
     // FIN consumes sequence space without moving the ring write index.
     // Discard any pre-FIN speculative data beyond that end of stream.
     if(s.tcpFinRecv || s.tcpRstRecv){
-        if(s.tcpOooBytes)memset(s.tcpOooMap,0,Socket::TCP_OOO_WORDS*sizeof(uint64_t));
+        if(s.tcpOooBytes)memset(s.tcpOooMap,0,s.rxCapacity / 8);
         s.tcpOooBytes=0;
         return false;
     }
@@ -2949,7 +3106,7 @@ static bool TcpDrainOoo(Socket& s)
         const uint64_t missing=(~pending)&TcpOooMask(64-bit);
         const unsigned count=missing ? __builtin_ctzll(missing) : 64-bit;
         word&=~(TcpOooMask(count)<<bit);
-        s.rxHead=(s.rxHead+count)%Socket::RX_BUF_SIZE;
+        s.rxHead=(s.rxHead+count) & (s.rxCapacity - 1);
         s.tcpOooBytes-=count;
         drained+=count;
     }
@@ -3038,16 +3195,16 @@ static int TcpSendSegment(Socket& s, uint8_t flags,
 // Caller MUST hold s.lock.
 static void TcpEnqueueData(Socket& s, const void* data, uint32_t len)
 {
-    uint32_t avail = Socket::RX_BUF_SIZE - s.rxCount;
+    uint32_t avail = s.rxCapacity - s.rxCount;
     if (len > avail) len = avail;
 
     TcpClearOoo(s,s.rxHead,len);
     const auto* bytes=static_cast<const uint8_t*>(data);
-    const uint32_t tail=Socket::RX_BUF_SIZE-s.rxHead;
+    const uint32_t tail=s.rxCapacity-s.rxHead;
     const uint32_t first=len<tail?len:tail;
     memcpy(s.rxBuf+s.rxHead,bytes,first);
     if(len>first)memcpy(s.rxBuf,bytes+first,len-first);
-    s.rxHead=(s.rxHead+len)%Socket::RX_BUF_SIZE;
+    s.rxHead=(s.rxHead+len) & (s.rxCapacity - 1);
     s.rxCount += len;
     // Caller (HandleTcp) wakes pollWaiter after releasing the lock.
 }
@@ -3152,7 +3309,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
         if ((flags & (TCP_SYN | TCP_ACK | TCP_RST)) == (TCP_SYN | TCP_ACK) &&
             s.tcpState == TcpState::SynSent && ack == s.tcpSndNxt) {
             const uint8_t* optPtr = static_cast<const uint8_t*>(payload) + sizeof(TcpHeader);
-            TcpAcceptActiveSynOptions(s, optPtr, dataOff - sizeof(TcpHeader));
+            TcpAcceptSynOptions(s, optPtr, dataOff - sizeof(TcpHeader));
         }
 
         const uint32_t available=TcpReceiveFree(s);
@@ -3218,7 +3375,18 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
         // Delegate to testable state machine
         uint32_t prevRxCount = s.rxCount;
         uint32_t prevSndUna = s.tcpSndUna;
+        const TcpState oldState = s.tcpState;
         TcpAction act = TcpProcessSegment(s, seq, ack, flags, tcpData, dataLen);
+        if ((oldState == TcpState::SynSent || oldState == TcpState::SynRecv) &&
+            s.tcpState == TcpState::Established) {
+            const uint64_t rtt = ApicTickCount() - s.tcpRxSynTick;
+            s.tcpRxRtt = rtt < 10 ? 10 : rtt <= 1000 ? static_cast<uint32_t>(rtt) : 1000;
+            if (oldState == TcpState::SynSent) {
+                // A SYN offers an unscaled window before we learn the peer's ISN.
+                s.tcpRxRightEdge = seq + 1 + s.tcpRxSynGrant;
+                s.tcpRxRightEdgeValid = true;
+            }
+        }
         if (g_tcpSendProbe && s.tcpSndUna!=prevSndUna && g_tcpProbeWorkerWaiting[i] &&
             g_tcpProbeWorkerDisplaced[i])
             TcpProbeAdd(g_tcpSendProbeStats.ackWhileWorkerDisplaced);
@@ -3320,6 +3488,8 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
             const bool matches = s.type == SOCK_STREAM && s.localPort == dstPort &&
                 (!s.localIp || s.localIp == ip->dstIp);
             const uint32_t ownerPid = s.ownerPid, uid = s.identity.uid, gid = s.identity.gid;
+            const uint32_t receiveLimit = s.rxLimit;
+            const bool receiveLocked = s.rxUserLimit;
             SpinLockRelease(&s.lock);
             if (!matches) continue;
             uint64_t listenerFlags = IrqSpinLockAcquire(&g_acceptQueueLock);
@@ -3349,7 +3519,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
 
             // Create a new socket for this connection
             int childIdx = SockCreateOwned(AF_INET, SOCK_STREAM, IPPROTO_TCP,
-                                           ownerPid, uid, gid);
+                                           ownerPid, uid, gid, receiveLimit, receiveLocked);
             if (childIdx < 0)
             {
                 NetCount(g_netCounters.synNoSocket);
@@ -3368,8 +3538,10 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
             child.tcpState   = TcpState::SynRecv;
             child.tcpLastRxTick = ApicTickCount(); // passive-open deadline origin
             child.tcpRcvNxt  = seq + 1;
-            child.tcpPeerMss = TcpPeerMss(static_cast<const uint8_t*>(payload) + sizeof(TcpHeader),
-                                          dataOff - sizeof(TcpHeader));
+            child.tcpRxSynTick = child.tcpLastRxTick;
+            child.tcpRcvWndScale = Socket::RX_WINDOW_SCALE;
+            TcpAcceptSynOptions(child, static_cast<const uint8_t*>(payload) + sizeof(TcpHeader),
+                                dataOff - sizeof(TcpHeader));
             child.listenSockIdx = static_cast<int>(i);
 
             // Generate ISS for the server side
@@ -3522,8 +3694,11 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
     s.tcpFlightControl = {};
     s.tcpSndWl1=s.tcpSndWl2=0;s.tcpSndWlValid=false;
     s.tcpSndWndScale = 0; // no peer scale until SYN-ACK parsed
-    // Window scale: RX_BUF_SIZE=512KB needs shift 3 (÷8) to fit in uint16_t
-    s.tcpRcvWndScale = 3;
+    s.tcpRcvWndScale = Socket::RX_WINDOW_SCALE;
+    s.tcpRxSynTick = ApicTickCount();
+    s.tcpRxRightEdgeValid = false;
+    s.tcpRxSynGrant = 0;
+    s.tcpRxDrained = 0;
     s.tcpState = TcpState::SynSent;
     SpinLockRelease(&s.lock);
 
@@ -4134,6 +4309,23 @@ int SockSendUserVector(int sockIdx, const TcpSendVector* vectors, unsigned count
     return g_tcpAsyncSend ? TcpSendAsync(sockIdx,source,len) : SockSendImpl(sockIdx,source,len);
 }
 
+// Grow when the app drains most of a window within two measured RTTs.
+static uint32_t TcpReceiveGrowthLocked(Socket& s, uint32_t read, uint64_t now)
+{
+    if (s.rxUserLimit || !s.tcpRcvWndScale || !s.tcpRxRtt ||
+        s.tcpState != TcpState::Established || s.rxLimit >= Socket::RX_MAX ||
+        s.rxLimit >= g_tcpReceiveWindowCap) return 0;
+
+    if (!s.tcpRxDrained || TcpTimerElapsed(now, s.tcpRxDrainStart, 2 * s.tcpRxRtt)) {
+        s.tcpRxDrainStart = now;
+        s.tcpRxDrained = 0;
+    }
+    s.tcpRxDrained += read;
+    if (s.tcpRxDrained < s.rxLimit - s.rxLimit / 4) return 0;
+    s.tcpRxDrained = 0;
+    return s.rxLimit * 2 < Socket::RX_MAX ? s.rxLimit * 2 : Socket::RX_MAX;
+}
+
 int SockRecv(int sockIdx, void* buf, uint32_t len, bool dontwait)
 {
     if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return -1;
@@ -4171,18 +4363,19 @@ int SockRecv(int sockIdx, void* buf, uint32_t len, bool dontwait)
     // Stream read — no framing, just read bytes from the resident kernel ring.
     uint32_t copyLen = s.rxCount < len ? s.rxCount : len;
     // Capture free space BEFORE consuming, to decide whether window was constrained.
-    uint32_t freeBefore = Socket::RX_BUF_SIZE - s.rxCount;
+    uint32_t freeBefore = TcpReceiveFree(s);
     uint8_t* dst = static_cast<uint8_t*>(buf);
     // Copy in up to two contiguous chunks (ring buffer wrap)
-    uint32_t firstChunk = Socket::RX_BUF_SIZE - s.rxTail;
+    uint32_t firstChunk = s.rxCapacity - s.rxTail;
     if (firstChunk > copyLen) firstChunk = copyLen;
     memcpy(dst, s.rxBuf + s.rxTail, firstChunk);
     if (copyLen > firstChunk)
         memcpy(dst + firstChunk, s.rxBuf, copyLen - firstChunk);
-    s.rxTail = (s.rxTail + copyLen) % Socket::RX_BUF_SIZE;
+    s.rxTail = (s.rxTail + copyLen) & (s.rxCapacity - 1);
     __asm__ volatile("mfence" ::: "memory");
     s.rxCount -= copyLen;
-    uint32_t freeAfter = Socket::RX_BUF_SIZE - s.rxCount;
+    uint32_t freeAfter = TcpReceiveFree(s);
+    const uint32_t growth = TcpReceiveGrowthLocked(s, copyLen, ApicTickCount());
     TcpState stateSnap = s.tcpState;
     SpinLockRelease(&s.lock);
 
@@ -4195,12 +4388,15 @@ int SockRecv(int sockIdx, void* buf, uint32_t len, bool dontwait)
     static constexpr uint32_t MSS = 1460;
     bool wasConstrained = freeBefore < 2 * MSS;
     bool nowOpen        = freeAfter  >= MSS;
-    if (wasConstrained && nowOpen && stateSnap == TcpState::Established) {
+    if (growth || (wasConstrained && nowOpen && stateSnap == TcpState::Established)) {
         // Pin the existing socket only for the unlocked send and its possible
         // retry scheduling, not for the blocking receive loop above.
         SocketBorrow borrow(static_cast<uint32_t>(sockIdx));
-        if(borrow && TcpSendSegment(s, TCP_ACK, nullptr, 0, "wnd-update"))
-            TcpRequeueFailedAck(s);
+        if (borrow) {
+            if (growth) SetSocketRxLimit(s, growth, false);
+            if (wasConstrained && nowOpen && stateSnap == TcpState::Established &&
+                TcpSendSegment(s, TCP_ACK, nullptr, 0, "wnd-update")) TcpRequeueFailedAck(s);
+        }
     }
 
     return static_cast<int>(copyLen);
@@ -4506,7 +4702,11 @@ static void DebugChannelThreadFn(void* /*arg*/)
     s.tcpFlightControl = {};
     s.tcpSndWl1=s.tcpSndWl2=0;s.tcpSndWlValid=false;
     s.tcpSndWndScale = 0;
-    s.tcpRcvWndScale = 3;
+    s.tcpRcvWndScale = Socket::RX_WINDOW_SCALE;
+    s.tcpRxSynTick = ApicTickCount();
+    s.tcpRxRightEdgeValid = false;
+    s.tcpRxSynGrant = 0;
+    s.tcpRxDrained = 0;
     s.tcpState   = TcpState::SynSent;
 
     TcpSendSegmentAtSeq(s, s.tcpSndIss, TCP_SYN, nullptr, 0, "connect-poll");
@@ -5373,6 +5573,8 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             field("resolve_blocking",c.resolveBlocking);field("resolve_blocking_failed",c.resolveBlockingFailed);
             field("resolve_nonblocking",c.resolveNonBlocking);field("resolve_queued",c.resolveQueued);
             field("send_no_neighbor",c.sendNoNeighbor);field("rx_thread_overflow",c.rxThreadOverflow);
+            field("socket_rx_bytes",g_socketRxBytes);field("socket_rx_denied",g_socketRxDenied);
+            field("tcp_rx_growths",g_tcpRxGrowths);
             field("udp_rx_full",c.udpRxFull);field("udp_rx_corrupt",c.udpRxCorrupt);field("syn_queue_full",c.synQueueFull);
             field("syn_no_socket",c.synNoSocket);field("syn_recv_evicted",c.synRecvEvicted);
             uint32_t rxThreads = 0;
@@ -5406,6 +5608,10 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",");r.field("tcp_ack_submit_failures",__atomic_load_n(&g_tcpAckSubmissionFailures,__ATOMIC_RELAXED));
         r.text(",");r.field("single_interface_generation",singleInterface?interface.generation:0);
         r.text(",");r.field("tcp_recv_window_cap_bytes",g_tcpReceiveWindowCap==~uint32_t(0)?0:g_tcpReceiveWindowCap);
+        r.text(",");r.field("socket_rx_bytes",__atomic_load_n(&g_socketRxBytes,__ATOMIC_RELAXED));
+        r.text(",");r.field("socket_rx_budget_bytes",SocketRxBudget);
+        r.text(",");r.field("socket_rx_denied",__atomic_load_n(&g_socketRxDenied,__ATOMIC_RELAXED));
+        r.text(",");r.field("tcp_rx_growths",__atomic_load_n(&g_tcpRxGrowths,__ATOMIC_RELAXED));
         r.text(",\"tcp_receive\":{");r.field("ooo_arrivals",__atomic_load_n(&g_tcpReceiveDiagnostics.oooArrivals,__ATOMIC_RELAXED));
         r.text(",");r.field("ooo_stored",__atomic_load_n(&g_tcpReceiveDiagnostics.oooStored,__ATOMIC_RELAXED));
         r.text(",");r.field("ooo_overlap",__atomic_load_n(&g_tcpReceiveDiagnostics.oooOverlap,__ATOMIC_RELAXED));
@@ -5683,6 +5889,13 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         reply.text(",");reply.field("busy",s.busy);
         reply.text(",");reply.field("rate_limited",s.rateLimited);
         reply.text(",");reply.field("active_ms",s.activeMs);
+        reply.text(",\"last_error\":");
+        if(s.lastError.stage){
+            reply.text("{\"stage\":");reply.quoted(s.lastError.stage);
+            reply.text(",");reply.field("pid",s.lastError.pid);
+            reply.text(",");reply.field("errno",s.lastError.error);
+            reply.text("}");
+        }else reply.text("null");
         reply.text("}\n");reply.send();
     }
     else if(StrStartsWith(cmd,"proc dump ")){
@@ -6906,6 +7119,8 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",");r.field("queued",st.queued);r.text(",");r.field("replaced",st.replaced);
         r.text(",");r.field("latched",st.latched);r.text(",");r.field("missed_vblanks",st.missedVblanks);
         r.text(",");r.field("uncertain",st.uncertain);r.text(",");r.field("refused_reserve",st.refusedReserve);
+        r.text(",");r.field("deferred_presents",st.deferredPresents);r.text(",");r.field("adopted_presents",st.adoptedPresents);
+        r.text(",");r.field("worker_waits",st.workerWaits);
         r.text(",");r.field("flushes",st.flushes);r.text(",");r.field("full_flushes",st.fullFlushes);
         r.text(",");r.field("flush_bytes",st.flushBytes);
         r.text(",\"flush_us\":[");r.number(st.flushes?st.flushUsSum/st.flushes:0);r.text(",");r.number(st.flushUsMax);r.text("]");

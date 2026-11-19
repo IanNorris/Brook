@@ -178,6 +178,25 @@ static void TcpInfo() {
     CHECK(brook::sys_getsockopt(SocketFd,6,1,value,length,0)==-92);
 }
 
+static void ReceiveBufferOption()
+{
+    Begin();
+    const uint64_t value=UserAddress(0),length=UserAddress(PageSize);
+    Put<int32_t>(value,1048576);
+    CHECK(brook::sys_setsockopt(SocketFd,1,8,value,3,0)==-brook::EINVAL);
+    CHECK(brook::sys_setsockopt(SocketFd,1,8,g_kernel.Address(),4,0)==-brook::EFAULT);
+    CHECK(g_net.receiveBufferRequest==0);
+    CHECK(brook::sys_setsockopt(SocketFd,1,8,value,4,0)==0);
+    CHECK(g_net.receiveBufferRequest==1048576);
+    Put<int32_t>(length,16);
+    CHECK(brook::sys_getsockopt(SocketFd,1,8,value,length,0)==0);
+    CHECK(Get<uint32_t>(length)==4 && Get<int32_t>(value)==g_net.receiveBuffer);
+    Put<int32_t>(length,2);
+    Put<uint32_t>(value,0xffffffff);
+    CHECK(brook::sys_getsockopt(SocketFd,1,8,value,length,0)==0);
+    CHECK(Get<uint32_t>(length)==2 && Get<uint32_t>(value)==0xffff0000);
+}
+
 // socketpair() with one free slot publishes neither end (no rollback that
 // closes a possibly reused number) and releases both endpoints.
 static void SocketpairAtFullTable() {
@@ -197,6 +216,7 @@ static void SocketpairAtFullTable() {
 
 void RunSocketTests() {
     TcpInfo();
+    ReceiveBufferOption();
     SocketpairAtFullTable();
     RightsShareDescription();
     Bind();

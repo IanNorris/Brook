@@ -500,6 +500,13 @@ int64_t sys_setsockopt(uint64_t fdVal, uint64_t levelVal, uint64_t optionVal,
         SpinLockAcquire(&socket->lock);socket->receiveLimit=2*limit;SpinLockRelease(&socket->lock);return 0;
     }
     if (descriptor->type != FdType::UnixSocket && descriptor->type != FdType::Socket) return -88;
+    if (descriptor->type == FdType::Socket && levelVal == 1 && optionVal == 8) {
+        int32_t requested;
+        if (length < sizeof(requested)) return -EINVAL;
+        if (!CopyFromUser(&requested, valueAddr, sizeof(requested))) return -EFAULT;
+        const int index = static_cast<int>(reinterpret_cast<uintptr_t>(descriptor->handle)) - 1;
+        return brook::SockSetReceiveBuffer(index, requested);
+    }
     if (descriptor->type == FdType::UnixSocket && levelVal == 1 && optionVal == 16) {
         if (length < sizeof(int32_t)) return -EINVAL;
         if (!UserBufferReadable(valueAddr, sizeof(int32_t))) return -EFAULT;
@@ -598,6 +605,10 @@ int64_t sys_getsockopt(uint64_t fdVal, uint64_t levelVal, uint64_t optnameVal,
     } else {
         int index = static_cast<int>(reinterpret_cast<uintptr_t>(entry->handle)) - 1;
         switch (option) {
+        case 8: // SO_RCVBUF
+            value = brook::SockGetReceiveBuffer(index);
+            if (value < 0) return value;
+            break;
         case 3: // SO_TYPE: required by runtimes before wrapping a TCP socket in TLS.
             value = brook::SockGetType(index);
             if (value < 0) return -EBADF;

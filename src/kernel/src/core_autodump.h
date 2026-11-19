@@ -18,10 +18,15 @@ CoreAutoJob* CoreAutoClaim(const Process* target,const Process* leader,int signa
 void CoreAutoCommit(CoreAutoJob*);
 void CoreAutoStart();
 void CoreAutoSetMode(CoreAutoMode);
+struct CoreAutoFailure {
+    const char* stage=nullptr;
+    uint32_t pid=0,error=0;
+};
 struct CoreAutoStats {
     CoreAutoMode mode;
     uint64_t queued, completed, failed, timedOut, busy, rateLimited, activeMs;
     bool worker;
+    CoreAutoFailure lastError;
 };
 CoreAutoStats CoreAutoReadStats();
 

@@ -15,6 +15,9 @@ struct CompositorPresentLease {
         if(!duration || !CanAcquire(candidate,now) || now>~uint64_t{0}-duration)return false;
         owner=candidate;deadline=now+duration;return true;
     }
+    bool Renew(uint64_t candidate,uint64_t now,uint64_t duration) {
+        return Active(now) && owner==candidate && Acquire(candidate,now,duration);
+    }
     bool Release(uint64_t candidate) {if(!candidate || owner!=candidate)return false;owner=deadline=0;return true;}
     bool Clear() {if(!owner)return false;owner=deadline=0;return true;}
 };

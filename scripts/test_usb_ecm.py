@@ -5,7 +5,7 @@ Run inside nix-shell after building the kernel. Only disposable images are
 opened; no physical USB, host desktop or audio is used. The workload only contacts localhost services;
 the guest may also perform its ordinary boot-time DNS probe.
 """
-import argparse,hashlib,json,os,re,shutil,socket,struct,subprocess,tempfile,threading,time
+import argparse,hashlib,json,os,re,shutil,socket,struct,subprocess,tempfile,threading,time,sys
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--output',required=True,type=Path)
@@ -22,6 +22,8 @@ ap.add_argument('--tcp-adaptive-flight',action='store_true',help='Exercise the b
 ap.add_argument('--tcp-adaptive-flight16',action='store_true',help='Exercise the bounded adaptive 16-slot TCP send flight')
 ap.add_argument('--tcp-send-probe',action='store_true',help='Enable and query aggregate TCP sender diagnostics')
 ap.add_argument('--network-delay-us',type=int,default=0,help='Optional QEMU filter-buffer interval in microseconds (maximum 50000)')
+ap.add_argument('--rx-rtt-ms',type=int,choices=range(501),default=0,metavar='0..500',
+                help='Use a private TAP link with Linux netem delay instead of SLIRP')
 ap.add_argument('--drop-tcp-packet',action='store_true',help='Drop one guest TCP payload through a private QEMU packet relay')
 ap.add_argument('--send-concurrency',action='store_true',help='Also verify two guest writers share a TCP stream without interleaving')
 ap.add_argument('--send-close-race',action='store_true',help='Also close a shared descriptor while two guest writes are active')
@@ -38,7 +40,7 @@ ap.add_argument('--tcp-async-retry-1ms',action='store_true',help='Use the experi
 ap.add_argument('--small-write-benchmark',action='store_true',help='Measure a 1 MiB stream of 1 KiB writes')
 ap.add_argument('--async-pool-test',action='store_true',help='Exercise poll/epoll while the async TCP worker pool is saturated')
 ap.add_argument('--async-blocked-close',action='store_true',help='Exercise close while an async writer is blocked by backpressure')
-args=ap.parse_args();base=args.output.resolve();base.mkdir(parents=True,exist_ok=False);out=base/'probe'
+args=ap.parse_args()
 expected_rx_depth=args.expected_rx_depth or (128 if args.rx_depth8 else 1)
 if args.send_close_race and not args.send_concurrency:ap.error('--send-close-race requires --send-concurrency')
 if args.tcp_async_neighbor and (not args.arp_async_probe or not any((args.tcp_flight2,args.tcp_flight4,args.tcp_adaptive_flight,args.tcp_adaptive_flight16))):ap.error('--tcp-async-neighbor requires --arp-async-probe and a TCP flight mode')
@@ -51,10 +53,33 @@ if args.tcp_producer_wake and not args.tcp_async_send:ap.error('--tcp-producer-w
 if args.tcp_async_retry_1ms and not args.tcp_producer_wake:ap.error('--tcp-async-retry-1ms requires --tcp-producer-wake')
 if sum((args.tcp_flight2,args.tcp_flight4,args.tcp_adaptive_flight,args.tcp_adaptive_flight16))>1:ap.error('choose only one flight mode')
 if not 0<=args.network_delay_us<=50000:ap.error('network delay must be between 0 and 50000 microseconds')
+if args.rx_rtt_ms and (not args.rx_throughput_mib or args.network_delay_us or args.drop_tcp_packet):
+ ap.error('--rx-rtt-ms requires the receive benchmark without other packet filters')
 def run(*cmd):subprocess.run(list(map(str,cmd)),check=True,cwd=ROOT)
-tcp=socket.socket();tcp.bind(('127.0.0.1',0));port=tcp.getsockname()[1];tcp.listen();tcp.settimeout(90)
-udp=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);udp.bind(('127.0.0.1',port));udp.settimeout(.2)
-with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as s:s.bind(('127.0.0.1',0));udp_forward=s.getsockname()[1]
+if args.rx_rtt_ms:
+ # SLIRP's guest forward proxies TCP and does not negotiate window scaling.
+ # Re-exec in a private network namespace before touching any interface.
+ current=str(os.stat('/proc/self/ns/net').st_ino)
+ initial=os.environ.get('BROOK_ECM_TEST_PARENT_NETNS')
+ if initial is None:
+  os.environ['BROOK_ECM_TEST_PARENT_NETNS']=current
+  os.execvp('unshare',['unshare','-Urn','--',sys.executable,*sys.argv])
+ if initial==current:raise RuntimeError('TAP benchmark requires a new network namespace')
+ run('ip','link','set','lo','up')
+ run('ip','tuntap','add','dev','brookrx','mode','tap')
+ run('ip','addr','add','10.0.2.100/24','dev','brookrx')
+ run('ip','addr','add','10.0.2.2/24','dev','brookrx')
+ run('ip','link','set','brookrx','up')
+ run('tc','qdisc','add','dev','brookrx','root','netem','limit','16384','delay',f'{args.rx_rtt_ms}ms')
+base=args.output.resolve();base.mkdir(parents=True,exist_ok=False);out=base/'probe'
+bind_host='10.0.2.100' if args.rx_rtt_ms else '127.0.0.1'
+tcp=socket.socket();tcp.bind((bind_host,0));port=tcp.getsockname()[1];tcp.listen();tcp.settimeout(90)
+udp=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);udp.bind((bind_host,port));udp.settimeout(.2)
+if args.rx_rtt_ms:
+ udp_target=('10.0.2.15',port)
+else:
+ with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as s:s.bind(('127.0.0.1',0));udp_forward=s.getsockname()[1]
+ udp_target=('127.0.0.1',udp_forward)
 errors=[];completed=[];tcp_tail_receive_ns=[];small_write_receive_ns=[]
 def exact(s,n):
  b=b''
@@ -96,7 +121,7 @@ def echo_udp():
  try:
   expected=bytes((i*13+7*7)%251 for i in range(982));deadline=time.monotonic()+100
   while time.monotonic()<deadline:
-   udp.sendto(expected,('127.0.0.1',udp_forward))
+   udp.sendto(expected,udp_target)
    try:b,address=udp.recvfrom(2048)
    except socket.timeout:continue
    assert b==expected;completed.append('udp');return
@@ -109,6 +134,9 @@ run('python3',ROOT/'scripts/make_uefi_probe.py','--output',out,'--build',args.bu
 initrd=out/'payload/INITRD.IMG';run('mcopy','-i',initrd,base/'ECMTEST.ELF','::BOOT/ECMTEST.ELF')
 rc=base/'INIT.RC';rc.write_text(f'set wm\nset vfb none\nkconsole\nhwprobe on\nrun /boot/ECMTEST.ELF {port}{" concurrency" if args.send_concurrency else ""}{" close-race" if args.send_close_race else ""}{" user-copy" if args.send_user_copy else ""}{" async" if args.tcp_async_send else ""}{" bench-small" if args.small_write_benchmark else ""}{" pool-test" if args.async_pool_test else ""}{" blocked-close" if args.async_blocked_close else ""}{f" rx-mib={args.rx_throughput_mib}" if args.rx_throughput_mib else ""}\n')
 run('mcopy','-o','-i',initrd,rc,'::BOOT/INIT.RC')
+if args.rx_rtt_ms:
+ config=base/'BROOK.CFG';config.write_text('NET0_MODE=static\nNET0_IP=10.0.2.15\n')
+ run('mcopy','-o','-i',initrd,config,'::BOOT/BROOK.CFG')
 marker=base/'usb-net-probe';marker.write_text('1\n');run('mcopy','-i',initrd,marker,'::ETC/usb-net-probe')
 if args.rx_depth8:run('mcopy','-i',initrd,marker,'::ETC/usb-net-rx8')
 if args.tx_depth16:run('mcopy','-i',initrd,marker,'::ETC/usb-net-tx16')
@@ -139,14 +167,20 @@ for name,row in manifest['files'].items():
  p=out/'payload'/name;row.update(bytes=p.stat().st_size,sha256=hashlib.sha256(p.read_bytes()).hexdigest())
 (out/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
 variables=base/'VARS.fd';shutil.copy2(os.environ['OVMF_VARS'],variables);variables.chmod(0o600)
-with socket.socket() as s:s.bind(('127.0.0.1',0));debug_port=s.getsockname()[1]
+if args.rx_rtt_ms:
+ debug_host,debug_port='10.0.2.15',1234
+ backend='tap,id=network,ifname=brookrx,script=no,downscript=no,vnet_hdr=off'
+else:
+ debug_host='127.0.0.1'
+ with socket.socket() as s:s.bind((debug_host,0));debug_port=s.getsockname()[1]
+ backend=f'user,id=network,hostfwd=tcp:127.0.0.1:{debug_port}-:1234,hostfwd=udp:127.0.0.1:{udp_forward}-:{port},guestfwd=tcp:10.0.2.100:{port}-tcp:127.0.0.1:{port}'
 qemu=['qemu-system-x86_64','-machine','q35','-accel','kvm','-cpu','host','-smp','4','-m','2048','-nodefaults',
  '-drive','if=pflash,format=raw,readonly=on,file='+os.environ['OVMF_CODE'],'-drive','if=pflash,format=raw,file='+str(variables),
  '-device','VGA','-device','qemu-xhci,id=usbc','-drive','if=none,id=stick,format=raw,readonly=on,file='+str(out/'probe.raw'),
  '-device','usb-storage,bus=usbc.0,port=1,drive=stick,bootindex=1',
  '-device','usb-kbd,bus=usbc.0,port=3','-device','usb-mouse,bus=usbc.0,port=4',
  '-display','none','-serial','file:'+str(base/'serial.log'),'-qmp','unix:'+str(base/'qmp.sock')+',server=on,wait=off','-no-reboot',
- '-netdev',f'user,id=network,hostfwd=tcp:127.0.0.1:{debug_port}-:1234,hostfwd=udp:127.0.0.1:{udp_forward}-:{port},guestfwd=tcp:10.0.2.100:{port}-tcp:127.0.0.1:{port}',
+ '-netdev',backend,
  '-device','usb-net,id=usbnet,bus=usbc.0,port=2,netdev=network']
 # Place the capture on the guest side of the delay: backend-to-guest packets
 # must be recorded after the buffer releases them, not when the backend emits.
@@ -237,7 +271,7 @@ try:
    break
   time.sleep(.05)
  else:raise TimeoutError(serial[-3000:])
- with socket.create_connection(('127.0.0.1',debug_port),timeout=8) as s:
+ with socket.create_connection((debug_host,debug_port),timeout=8) as s:
   s.settimeout(8);s.sendall(b'@71 mem\n');reply=b''
   while b'BRIDGE_END 71' not in reply and len(reply)<65536:
    chunk=s.recv(8192)
@@ -271,6 +305,7 @@ try:
   assert stats['rx_completed']>0 and stats['tx_completed']>0 and not stats['failed'],stats
   assert 0<=stats['rx_queued']<=stats['rx_queue_high_water']<=256,stats
   (base/'network-snapshot.json').write_text(json.dumps(stats,indent=2)+'\n')
+  if args.rx_rtt_ms:(base/'network-report.json').write_text(json.dumps(report,indent=2)+'\n')
   if args.arp_async_probe:
    deadline=time.monotonic()+5;probe=None
    while time.monotonic()<deadline:
@@ -360,10 +395,10 @@ try:
   (base/'loss-result.json').write_text(json.dumps(loss,indent=2)+'\n')
  for thread in threads:thread.join(2)
  assert not errors and set(completed)=={'tcp','udp'},(errors,completed)
- sizes=[];windows=[];scales={};pending={};max_flight=0;raw=(base/'wire.pcap').read_bytes();at=24
+ sizes=[];windows=[];scales={};syn_times={};pending={};max_flight=0;raw=(base/'wire.pcap').read_bytes();at=24
  assert raw[:4]==b'\xd4\xc3\xb2\xa1'
  while at+16<=len(raw):
-  _,_,captured,_=struct.unpack_from('<4I',raw,at);at+=16
+  seconds,micros,captured,_=struct.unpack_from('<4I',raw,at);at+=16
   packet=raw[at:at+captured];at+=captured
   if len(packet)>=34 and packet[12:14]==b'\x08\x00':
    outbound=packet[26:30]==bytes([10,0,2,15]);inbound=packet[30:34]==bytes([10,0,2,15])
@@ -389,6 +424,7 @@ try:
      ack=struct.unpack_from('!I',packet,tcp_offset+8)[0]
      pending[flow]=[(start,end) for start,end in pending.get(flow,[]) if ((ack-end)&0xffffffff)>=0x80000000]
     if flags&2:
+     syn_times.setdefault(flow,{}).setdefault('guest' if outbound else 'peer',seconds*1000000+micros)
      hdr_len=(packet[tcp_offset+12]>>4)*4;opts=packet[tcp_offset+20:tcp_offset+hdr_len];i=0;scale=None
      while i<len(opts):
       kind=opts[i]
@@ -419,6 +455,20 @@ try:
   match=re.search(r'ECM_RX_BENCH bytes=(\d+) ns=(\d+)',serial)
   assert match and int(match[1])==args.rx_throughput_mib*1024**2 and int(match[2])>0
   rx_benchmark=dict(bytes=int(match[1]),elapsed_ns=int(match[2]),mbps=int(match[1])*8000/int(match[2]))
+ if rx_benchmark:
+  flows=[flow for flow in scales if flow[1]==socket.inet_aton('10.0.2.100') and flow[2]==port]
+  assert len(flows)==1,flows
+  flow=flows[0]
+  pair=scales[flow];shift=(pair.get('guest') or 0) if pair.get('peer') is not None else 0
+  advertised=[window<<shift for key,flags,window in windows if key==flow and flags&16 and not flags&2]
+  rtt_ms=(syn_times[flow]['peer']-syn_times[flow]['guest'])/1000
+  if args.rx_rtt_ms:
+   assert pair.get('guest') is not None and pair.get('peer') is not None,pair
+   assert rtt_ms>=args.rx_rtt_ms-1,rtt_ms
+   with (base/'netem.txt').open('w') as stats:
+    subprocess.run(['tc','-s','qdisc','show','dev','brookrx'],check=True,stdout=stats)
+  rx_benchmark.update(rx_window_max=max(advertised,default=0),added_rtt_ms=args.rx_rtt_ms,
+                      wire_syn_rtt_ms=round(rtt_ms,2),window_scales=pair)
  result=dict(passed=True,rx_benchmark=rx_benchmark,rx_depth=expected_rx_depth,tx_depth=16 if args.tx_depth16 else 8,tcp_window_cap=16384 if args.tcp_window16 else 0,tcp_flight2=args.tcp_flight2,tcp_flight4=args.tcp_flight4,tcp_adaptive_flight=args.tcp_adaptive_flight,tcp_adaptive_flight16=args.tcp_adaptive_flight16,tcp_async_send=args.tcp_async_send,network_delay_us=args.network_delay_us,max_flight_observed=max_flight,tcp_verified_bytes=262144,udp_verified_bytes=982,zero_length_termination_frames=[64,1024],
   dropped_tcp_packet=bool(args.drop_tcp_packet),idle_rx_seconds=1.5,bridge_framed_reply=True,usb_storage_concurrent=True,usb_storage_after_nic_removal=True,usb_keyboard_after_nic_removal=True,
   tcp_tail_receive_ns=tcp_tail_receive_ns,small_write_receive_ns=small_write_receive_ns)
