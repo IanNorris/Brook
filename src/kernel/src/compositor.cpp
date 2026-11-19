@@ -2521,12 +2521,12 @@ static void CompositorLoopWM()
     }
     summaryShown=showSummary;
     const bool overlayCursor=MouseIsAvailable() && !WmPointerCaptureActive() &&
-        __atomic_load_n(&g_defaultCursorVisible,__ATOMIC_ACQUIRE)!=0;
+        __atomic_load_n(&g_defaultCursorVisible,__ATOMIC_ACQUIRE)!=0 &&
+        CursorPixelsHaveAlpha(g_cursorFrame.pixels,g_cursorFrame.width,g_cursorFrame.height);
     PublishOverlayCursor(now,overlayCursor);
 #if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
     BdwCursorUpdate(cursorLeaseOwner,overlayCursor,chromeMx-g_cursorFrame.hotX,
-        chromeMy-g_cursorFrame.hotY,g_cursorFrame.pixels,g_cursorFrame.width,
-        g_cursorFrame.height,g_overlayCursorSerial);
+        chromeMy-g_cursorFrame.hotY,g_cursorFrame.pixels,g_cursorFrame.width,g_cursorFrame.height);
 #endif
     CaptureDesktopOverlay(now,chromeMx,chromeMy,overlayCursor);
     CheckDesktopOverlay(now,chromeMx,chromeMy);

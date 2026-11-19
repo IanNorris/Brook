@@ -395,9 +395,8 @@ CursorBacking cursorBacking[2];
 BdwCursorPlane cursorPlane;
 BdwCursorHandoff cursorHandoff;
 BdwCursorStatus cursorStatus;
-bool cursorSetupFailed=false,cursorTransparent=false,cursorMayBeVisible=false,zcLeavingForGop=false;
-uint64_t cursorSerial=0;
-uint32_t cursorSlot=0;
+bool cursorSetupFailed=false,cursorMayBeVisible=false,zcLeavingForGop=false;
+BdwCursorImages cursorImages;
 
 void CursorOffLocked(bool failed=false) {
     const bool enabled=cursorPlane.enabled();
@@ -1495,7 +1494,9 @@ bool BdwCursorRequest(bool enable){
 }
 BdwCursorStatus BdwCursorReadStatus(){
     const uint64_t f=IrqSpinLockAcquire(&lock);
-    const auto status=cursorStatus;
+    auto status=cursorStatus;
+    status.armed=cursorPlane.enabled();
+    status.transparentTarget=status.armed && cursorImages.transparent();
     IrqSpinLockRelease(&lock,f);
     return status;
 }
@@ -1531,7 +1532,7 @@ bool BdwCursorBlocksSoftware(){
     return blocks;
 }
 void BdwCursorUpdate(uint64_t leaseOwner,bool visible,int32_t x,int32_t y,
-                     const uint32_t* pixels,uint32_t width,uint32_t height,uint64_t serial){
+                     const uint32_t* pixels,uint32_t width,uint32_t height){
     const uint64_t f=IrqSpinLockAcquire(&lock);
     struct Unlock {uint64_t flags;~Unlock(){IrqSpinLockRelease(&lock,flags);}} unlock{f};
     if(!CursorPollLocked()){
@@ -1560,40 +1561,36 @@ void BdwCursorUpdate(uint64_t leaseOwner,bool visible,int32_t x,int32_t y,
            !cursorHandoff.mayEnable(zcSlotSequence[front]))return;
     }
 
-    const bool transparent=probe || !visible || !BdwCursorHasAlpha(pixels,width,height);
-    // A fully transparent image keeps ownership. Fetch it on screen so a
-    // pointer parked outside the output cannot prevent its surface latch.
-    if(transparent)x=y=0;
-    const bool upload=probe || activating || transparent!=cursorTransparent ||
-                      (!transparent && serial!=cursorSerial);
+    const uint64_t key=probe || !visible ? 0 : BdwCursorImageKey(pixels,width,height);
+    // Fetch a transparent image on screen to ensure the surface can latch.
+    if(!key)x=y=0;
+    const uint32_t slot=cursorImages.select(key,probe || activating);
+    const bool upload=cursorImages.needsUpload(slot,key);
+    auto& image=cursorBacking[slot];
     if(upload){
-        const uint32_t slot=cursorSlot^1u;
-        auto& image=cursorBacking[slot];
         for(uint32_t row=0;row<64;++row){
             auto* dest=reinterpret_cast<uint32_t*>(image.pixels[row/16].cpu)+(row%16)*64;
             for(uint32_t col=0;col<64;++col){
-                const uint32_t argb=!transparent && row<height && col<width ? pixels[row*64+col] : 0;
+                const uint32_t argb=key && row<height && col<width ? pixels[row*64+col] : 0;
                 const uint32_t a=argb>>24;
                 auto scale=[&](unsigned shift){return (((argb>>shift)&255u)*a+127)/255;};
                 dest[col]=(a<<24)|(scale(16)<<16)|(scale(8)<<8)|scale(0);
             }
         }
-        if(activating)cursorHandoff.arm(ApicTickCount());
-        cursorMayBeVisible|=!transparent;
-        __atomic_store_n(&g_cursorTouched,true,__ATOMIC_RELEASE);
-        if(!BdwPrivatePagesPublish(image.pixels,CursorImagePages) ||
-           !cursorPlane.update(io,image.reservation.first*4096,frame,x,y)){
-            CursorOffLocked(true);cursorSetupFailed=true;cursorStatus.requested=false;
-            ClientRestoreLocked(false);return;
-        }
-        cursorSlot=slot;cursorSerial=serial;cursorTransparent=transparent;++cursorStatus.images;
-    } else {
-        const uint32_t previous=cursorPlane.position();
-        if(!cursorPlane.update(io,cursorBacking[cursorSlot].reservation.first*4096,frame,x,y)){
-            CursorOffLocked(true);cursorSetupFailed=true;cursorStatus.requested=false;
-            ClientRestoreLocked(false);
-        }else if(previous!=cursorPlane.position())++cursorStatus.positions;
     }
+    if(activating)cursorHandoff.arm(ApicTickCount());
+    cursorMayBeVisible|=key!=0;
+    __atomic_store_n(&g_cursorTouched,true,__ATOMIC_RELEASE);
+    const auto previous=cursorPlane.position();
+    if((upload && !BdwPrivatePagesPublish(image.pixels,CursorImagePages)) ||
+       !cursorPlane.update(io,image.reservation.first*4096,frame,x,y)){
+        CursorOffLocked(true);cursorSetupFailed=true;cursorStatus.requested=false;
+        ClientRestoreLocked(false);return;
+    }
+    if(upload)++cursorStatus.images;
+    else if(!cursorPlane.ready())++cursorStatus.cachedArms;
+    else if(previous!=cursorPlane.position())++cursorStatus.positions;
+    cursorImages.selectProgrammed(slot,key);
 }
 
 #else
@@ -1607,7 +1604,7 @@ BdwCursorStatus BdwCursorReadStatus(){return {};}
 uint64_t BdwCursorRendererQuery(uint64_t,bool,bool& suppress){suppress=false;return 0;}
 void BdwCursorRendererPresented(uint64_t,uint64_t){}
 bool BdwCursorBlocksSoftware(){return false;}
-void BdwCursorUpdate(uint64_t,bool,int32_t,int32_t,const uint32_t*,uint32_t,uint32_t,uint64_t){}
+void BdwCursorUpdate(uint64_t,bool,int32_t,int32_t,const uint32_t*,uint32_t,uint32_t){}
 #endif
 
 }

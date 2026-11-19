@@ -7153,7 +7153,10 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             r.text(",\"requested\":");r.text(cursor.requested?"true":"false");
             r.text(",\"bound\":");r.text(cursor.bound?"true":"false");
             r.text(",\"active\":");r.text(cursor.active?"true":"false");
+            r.text(",\"armed\":");r.text(cursor.armed?"true":"false");
+            r.text(",\"transparent_target\":");r.text(cursor.transparentTarget?"true":"false");
             r.text(",");r.field("images",cursor.images);
+            r.text(",");r.field("cached_arms",cursor.cachedArms);
             r.text(",");r.field("positions",cursor.positions);
             r.text(",");r.field("fallbacks",cursor.fallbacks);
             r.text("}\n");r.send();
