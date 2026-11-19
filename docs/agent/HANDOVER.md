@@ -23,8 +23,12 @@ _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review 
 
 - `work/wayland-latency` at `ee769aec` adds per-connection and per-toplevel
   callback timings, client turnaround and input delivery to the existing
-  waylandd status JSON. Touch `/tmp/brook-waylandd-stats-reset` as the server
-  user to start a new `stats_epoch`. WM_POP_INPUT supplies no timestamp.
+  waylandd status JSON. WM_POP_INPUT supplies no timestamp.
+- The reset follow-up accepts a regular `/tmp/brook-waylandd-stats-reset`
+  owned by root or the provider. A marker that the provider cannot remove
+  stays on disk and is acknowledged once per touch. The epoch appears in
+  `latency.stats_epoch` as well as at the top level. Both Wayland provider
+  packages passed host checks, including the unprivileged reset fixture.
 - The pair is `/data/Programming/Brook/wayland-latency/build/dell/pair-wlstats`
   (`dell-wlstats-20261119`). Guarded QEMU passed on attempt 1. The Dell has
   yet to run this diagnostic. Release and all non-stress host tests passed
