@@ -188,12 +188,18 @@ static void LauncherRun(const LauncherResult& r)
     CompositorMarkDirty();
 }
 
-void WmLauncherScroll(int delta, uint32_t, uint32_t)
+void WmLauncherScroll(int delta120, uint32_t, uint32_t)
 {
-    if (!g_launcherOpen || !delta) return;
-    // Pixel scrolling, a viewport step a tick (Ian, gen 458: two whole rows a
-    // tick was too far and jumpy on the touchpad).
-    if (g_launcherModel.ScrollTicks(delta)) CompositorMarkDirty();
+    if (!g_launcherOpen || !delta120) return;
+    // Pixel scrolling in proportion to the motion: a viewport step a wheel
+    // tick, and touchpad motion finer than a tick (Ian, gen 458/459: whole
+    // rows, then whole ticks, were jumpy; it should follow scroll speed).
+    static int remainder = 0;
+    const int step = g_launcherFrame.viewport.step > 0 ? g_launcherFrame.viewport.step : 20;
+    const int total = delta120 * step + remainder;
+    const int pixels = total / 120;
+    remainder = total - pixels * 120;
+    if (pixels && g_launcherModel.ScrollBy(-pixels)) CompositorMarkDirty();
 }
 
 void WmLauncherGetRect(uint32_t screenW, uint32_t screenH,

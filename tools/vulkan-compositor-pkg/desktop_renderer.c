@@ -1391,8 +1391,11 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
              * changes with every present: a frame whose only change is the
              * overlay would cause the next one forever. Present such frames
              * at most every DESKTOP_OVERLAY_ONLY_NS (clock and indicators
-             * still update); scene, client and cursor changes are immediate. */
-            const int overlayOnly=!sceneChanges && changes.count &&
+             * still update); scene, client and cursor changes are immediate.
+             * Not while a shell popup is open: the launcher and volume popup
+             * animate and scroll at the display rate (Ian, gen 459: launcher
+             * scrolling stuttered at 4 fps unless an app was presenting). */
+            const int overlayOnly=!sceneChanges && changes.count && !focus.shell &&
                 desktop_overlay_cursor_equal(&overlayBase->cursor,&frameOverlay.cursor);
             if(overlayOnly){const uint64_t now=monotonic_ns();
                 if(g_lastOverlayOnlyNs && now>=g_lastOverlayOnlyNs && now-g_lastOverlayOnlyNs<DESKTOP_OVERLAY_ONLY_NS){

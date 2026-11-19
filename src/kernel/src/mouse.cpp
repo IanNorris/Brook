@@ -156,8 +156,12 @@ static InputDeviceOps g_mouseOps = { "ps2_mouse", nullptr };
 static InputDevice    g_mouseInputDev = { &g_mouseOps, {}, 0, 0, nullptr };
 
 // Push motion, scroll and button events for one decoded packet.
-static void EmitPointer(int32_t dx, int32_t dyDown, int8_t wheelY, int8_t wheelX, uint8_t buttons)
+static void EmitPointer(int32_t dx, int32_t dyDown, int8_t wheelY, int8_t wheelX, uint8_t buttons,
+                        int32_t fineY120 = 0, int32_t fineX120 = 0)
 {
+    // A wheel tick is 120; a touchpad reports its finer motion as well.
+    if (!fineY120) fineY120 = int32_t(wheelY) * 120;
+    if (!fineX120) fineX120 = int32_t(wheelX) * 120;
     // Only the desktop position is scaled; the event below retains raw deltas.
     MouseMoveRelative(dx, dyDown);
     g_prevButtons = g_buttons;
@@ -171,13 +175,15 @@ static void EmitPointer(int32_t dx, int32_t dyDown, int8_t wheelY, int8_t wheelX
         ev.deltaY = dyDown;
         InputDevicePush(&g_mouseInputDev, ev);
     }
-    if (wheelY != 0 || wheelX != 0)
+    if (wheelY != 0 || wheelX != 0 || fineY120 != 0 || fineX120 != 0)
     {
         InputEvent ev{};
         ev.type     = InputEventType::MouseScroll;
         ev.scanCode = static_cast<uint8_t>(wheelY); // int8 dy (up positive)
         ev.ascii    = static_cast<char>(wheelX);    // int8 dx (right positive)
         ev.modifiers = g_buttons;
+        ev.deltaY = fineY120;
+        ev.deltaX = fineX120;
         InputDevicePush(&g_mouseInputDev, ev);
     }
     uint8_t changed = g_buttons ^ g_prevButtons;
@@ -250,8 +256,8 @@ static void SynapticsByte(uint8_t data)
     g_synPhysButtons = o.buttons;
     const uint8_t buttons = static_cast<uint8_t>(o.buttons | g_synTap.Held());
     if (o.scrollY || o.scrollX) g_synScrollTicks += uint32_t((o.scrollY < 0 ? -o.scrollY : o.scrollY) + (o.scrollX < 0 ? -o.scrollX : o.scrollX));
-    if (o.dx || o.dy || o.scrollY || o.scrollX || buttons != g_buttons)
-        EmitPointer(o.dx, o.dy, ClampTicks(o.scrollY), ClampTicks(o.scrollX), buttons);
+    if (o.dx || o.dy || o.scrollY || o.scrollX || o.scrollY120 || o.scrollX120 || buttons != g_buttons)
+        EmitPointer(o.dx, o.dy, ClampTicks(o.scrollY), ClampTicks(o.scrollX), buttons, o.scrollY120, o.scrollX120);
     IrqSpinLockRelease(&g_synLock, flags);
 }
 
@@ -397,6 +403,8 @@ extern "C" void MouseIrqHandlerInner(void)
         ev.scanCode = static_cast<uint8_t>(wheelY); // int8 dy (up positive)
         ev.ascii    = static_cast<char>(wheelX);    // int8 dx (right positive)
         ev.modifiers = g_buttons;
+        ev.deltaY = int32_t(wheelY) * 120;
+        ev.deltaX = int32_t(wheelX) * 120;
         InputDevicePush(&g_mouseInputDev, ev);
     }
 

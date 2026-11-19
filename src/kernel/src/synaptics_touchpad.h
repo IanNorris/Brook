@@ -182,6 +182,7 @@ struct SynapticsOutput {
     int32_t dx = 0, dy = 0;       // pointer motion in PS/2-style counts; dy positive = down
     int32_t scrollY = 0;          // wheel ticks, positive = up
     int32_t scrollX = 0;          // wheel ticks, positive = right
+    int32_t scrollY120 = 0, scrollX120 = 0; // the same motion in 1/120 ticks (smooth scrolling)
     uint8_t buttons = 0;          // bit0 left, bit1 right
 };
 
@@ -210,7 +211,7 @@ public:
     void Reset() {
         ++resets;
         lastFingers_ = 0; haveAnchor_ = false; haveAgm_ = false; stable_ = 0;
-        fracX_ = fracY_ = scrollAccX_ = scrollAccY_ = 0; lastZ_ = 0;
+        fracX_ = fracY_ = scrollAccX_ = scrollAccY_ = 0; fine120X_ = fine120Y_ = 0; lastZ_ = 0;
         haveContact_ = false; contactRaw_ = 0;
     }
 
@@ -253,7 +254,7 @@ public:
             stable_ = 0;
             haveAnchor_ = fingers != 0 && fingers < 3;
             ax_ = p.x; ay_ = p.y; lastZ_ = p.z;
-            fracX_ = fracY_ = 0; scrollAccX_ = scrollAccY_ = 0;
+            fracX_ = fracY_ = 0; scrollAccX_ = scrollAccY_ = 0; fine120X_ = fine120Y_ = 0;
             lastFingers_ = fingers;
             return o;
         }
@@ -289,13 +290,15 @@ public:
             if (prevZ < cfg_.touchZ || stable_ < cfg_.scrollStablePackets ||
                 Abs(dx) > cfg_.scrollJumpUnits || Abs(dy) > cfg_.scrollJumpUnits) {
                 if (stable_ >= cfg_.scrollStablePackets) ++scrollRejected;
-                scrollAccX_ = scrollAccY_ = 0;
+                scrollAccX_ = scrollAccY_ = 0; fine120X_ = fine120Y_ = 0;
                 return o;
             }
             const int32_t sy = cfg_.naturalScroll ? -dy : dy;
             const int32_t sx = cfg_.naturalScroll ? -dx : dx;
             o.scrollY = Ticks(scrollAccY_, sy);
             o.scrollX = Ticks(scrollAccX_, sx);
+            o.scrollY120 = Fine120(fine120Y_, sy);
+            o.scrollX120 = Fine120(fine120X_, sx);
             if ((o.scrollY || o.scrollX) && (p.z < 2 * cfg_.touchZ || prevZ < 2 * cfg_.touchZ))
                 scrollTicksLowZ += unsigned(Abs(o.scrollY) + Abs(o.scrollX));
         }
@@ -393,10 +396,19 @@ private:
         acc -= t * cfg_.scrollUnitsPerTick;
         return t;
     }
+    // Scroll units to 1/120 ticks, carrying the remainder.
+    int32_t Fine120(int32_t& acc, int32_t d) {
+        if (cfg_.scrollUnitsPerTick <= 0) return 0;
+        acc += d * 120;
+        const int32_t out = acc / cfg_.scrollUnitsPerTick;
+        acc -= out * cfg_.scrollUnitsPerTick;
+        return out;
+    }
     SynapticsGestureConfig cfg_;
     int lastFingers_ = 0;
     bool haveAnchor_ = false;
     int32_t ax_ = 0, ay_ = 0, fracX_ = 0, fracY_ = 0, scrollAccX_ = 0, scrollAccY_ = 0;
+    int32_t fine120X_ = 0, fine120Y_ = 0;
     bool clickDown_ = false, clickTwoFinger_ = false;
     uint8_t clickButton_ = 1;
     bool haveContact_ = false;      // last raw contact position (any packet with Z >= touchZ)

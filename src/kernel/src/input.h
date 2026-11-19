@@ -25,7 +25,10 @@ enum class InputEventType : uint8_t {
     MouseMove       = 2,
     MouseButtonDown = 3,
     MouseButtonUp   = 4,
-    MouseScroll     = 5,   // scanCode=int8 dy (up positive), ascii=int8 dx (right positive)
+    MouseScroll     = 5,   // scanCode=int8 dy (up positive), ascii=int8 dx (right positive);
+                           // deltaY/deltaX = the same in 1/120 ticks (up/right positive),
+                           // finer than a tick for a touchpad: an event may carry
+                           // fine motion with no whole tick (scanCode = ascii = 0)
     MouseRelativeMove = 6, // raw signed motion, independent of cursor clamping
 };
 
