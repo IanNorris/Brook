@@ -61,6 +61,13 @@ These entries preserve accepted direction and the scope of prior evidence. Curre
 
 The archived approvals to merge, delete branches, wipe an old SSD installation, play audio or manipulate a private Steam copy belonged to particular tasks and states. They remain historical context. Apply current authorization and recovery requirements to the next operation.
 
+## File manager: Nautilus is the base, as Brook "Files" (Ian, 19 Nov)
+
+- Nautilus (GTK4/libadwaita) is Brook's file manager; it fits the Clearwater look better than Dolphin once its window buttons are fixed.
+- The UI doesn't need to say "Nautilus" (like other distros, it shows as Files), but the About dialog stays untouched: no changes to credits, authors, licence text or links.
+- Brook's changes to it live in a separate repository under Nautilus's own licence (GPL-3.0-or-later; confirm against the packaged source's COPYING), not in the Brook repo. The Brook image builds from that repo.
+- Performance work belongs to the platform (GTK4 renderer path, GPU waits), not to the fork.
+
 ## Theme model: material x mode, custom accent (Ian, 19 Nov)
 
 - Material (Glass | Opaque) and mode (Light | Mixed | Dark) are independent; mode applies to both materials (Opaque gains Mixed). Replaces Glass / Opaque Light / Opaque Dark.
