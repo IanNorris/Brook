@@ -779,6 +779,8 @@ Two independent code reviews (compositor and driver), Dell measurements on the g
 - **Job table:** a long campaign can exhaust the 256-slot table, and the current boot may lack the terminate API. Archive completed work and plan a checked restart.
 
 ## Backlog (outside the immediate goal)
+- **Torchlight II crash on gen 444:** Ogre `RenderingAPIException: Zero sized texture surface on texture …/rt_output/…` (SIGABRT); the window's render target was recreated at 0×0. Beforehand, HUD and pause input stopped responding while world input worked. Suspect a 0×0 or minimised configure from brook-xwm/waylandd on a focus or size change. TL2 log: `/data/home/steam-20261022/user/t2.log`. The autodump failed (queued 1, failed 1, no reason logged); Codex is fixing it (namespace/directory ownership).
+- **Gen 444 under heavy GPU load** (SuperTuxKart + 4 windows; GPU ~100%; 94 °C, tripped to 500 MHz): the screen flashes because `image-not-reserved` sends the zero-copy ring back to GOP (191 returns). Codex is fixing this as back-pressure instead of a GOP fallback.
 - **Chromium 1080p YouTube on gen 442: 11 displayed fps, `cpu_single` path.** `chrome://gpu` (`/data/home/Downloads/about-gpu-2026-11-19T01-52-22-010Z.txt`) shows hardware compositing, GPU process crash count 0, and video decode software only. It also lists the `rely_on_implicit_sync_for_swap_buffers` workaround. waylandd refused the GPU path (`offer_skipped.no_channel_or_fence` 3,396), so it reads frames back on the CPU (`readback_bytes` ~71 GB). Gen 441's capture showed `src gpu`, so find what differs.
 
   Fixes:
