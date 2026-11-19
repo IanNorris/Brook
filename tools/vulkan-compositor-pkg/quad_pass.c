@@ -11,7 +11,7 @@
  * frames) is dropped, so a replaced buffer is not pinned for long while the
  * wallpaper survives long runs of game-only frames that never sample it. */
 enum { QUAD_CACHE_SLOTS=48, QUAD_CACHE_MAX_AGE=120, QUAD_FRAME_SLOTS=BROOK_VK_MAX_LAYERS+1 };
-enum { QUAD_MODE_STRAIGHT=1, QUAD_MODE_OPAQUE=2, QUAD_MODE_OVER_ZERO=4, QUAD_MODE_SAMPLER=8, QUAD_MODE_DIVIDE=16, QUAD_MODE_READ=32, QUAD_MODE_CAPTURE=64 };
+enum { QUAD_MODE_STRAIGHT=1, QUAD_MODE_OPAQUE=2, QUAD_MODE_OVER_ZERO=4, QUAD_MODE_SAMPLER=8, QUAD_MODE_DIVIDE=16, QUAD_MODE_READ=32, QUAD_MODE_CAPTURE=64, QUAD_MODE_CAPTURE_FILTER=128 };
 enum { QUAD_PIPELINE_STRAIGHT=0, QUAD_PIPELINE_PREMULTIPLIED=1, QUAD_PIPELINE_NONE=2, QUAD_PIPELINE_GLASS=3, QUAD_PIPELINES=4 };
 struct QuadPush {int32_t rect[4];float invHalf[2];int32_t dst[2];uint32_t dstSize[2],src[2],srcSize[2];float scale[2];uint32_t opacity,mode;};
 _Static_assert(sizeof(struct QuadPush)==72,"quad push constant layout");
@@ -46,7 +46,8 @@ struct BrookVkQuadPass {
     VkDescriptorSet atlasSample;
     uint64_t atlasKey;
     unsigned timestampNext;
-    int atlasTimed,glassTimed,timingOverflow;
+    uint8_t timestampClass[QUAD_TIMESTAMP_COUNT/2];
+    int atlasTimed,chromeTimed,timingOverflow;
     struct BrookVkBackdropStats backdropStats;
     uint64_t clock;int pending,uncertain;VkResult lastResult;
     struct BrookVkQuadStats stats;
@@ -374,8 +375,9 @@ static VkRect2D quad_vk_rect(struct QuadRect r){
     return (VkRect2D){{r.x0,r.y0},{(uint32_t)(r.x1-r.x0),(uint32_t)(r.y1-r.y0)}};
 }
 
-static int quad_atlas_create(BrookVkQuadPass *p)
+int brook_vk_quad_pass_enable_backdrop(BrookVkQuadPass *p)
 {
+    if(!p)return 0;
     if(p->atlas.framebuffer)return 1;
     struct QuadImage *a=&p->atlas;
     VkFormatProperties properties;
@@ -439,11 +441,26 @@ static void quad_blend_barrier(BrookVkQuadPass *p)
         VK_DEPENDENCY_BY_REGION_BIT,1,&self,0,NULL,0,NULL);
 }
 
+static int quad_chrome_begin(BrookVkQuadPass *p,unsigned category)
+{
+    if(!p->timestamps)return 0;
+    p->chromeTimed=1;
+    if(p->timestampNext+1>=QUAD_TIMESTAMP_COUNT){p->timingOverflow=1;return 0;}
+    p->timestampClass[p->timestampNext/2]=(uint8_t)category;
+    vkCmdWriteTimestamp(p->command,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,p->timestamps,p->timestampNext++);
+    return 1;
+}
+static void quad_chrome_end(BrookVkQuadPass *p,int recorded)
+{
+    if(recorded)vkCmdWriteTimestamp(p->command,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,p->timestamps,p->timestampNext++);
+}
 static void quad_draw_rect(BrookVkQuadPass *p,const uint32_t *scene,const uint32_t *l,struct QuadRect rect,
                            unsigned kind,int capture,const struct QuadBackdropTile *glass)
 {
     const int blending=kind==QUAD_KIND_STRAIGHT || kind==QUAD_KIND_PREMULTIPLIED;
-    const int exact=capture || glass || !p->fixedBlend;
+    const int effect=glass && !capture;
+    const int prefilter=glass && capture;
+    const int exact=capture || effect || !p->fixedBlend;
     const struct QuadGlassPush push={.quad={
         {rect.x0,rect.y0,rect.x1,rect.y1},{2.0f/(float)scene[0],2.0f/(float)scene[1]},
         {(int32_t)l[8],(int32_t)l[9]},{l[10],l[11]},{l[4],l[5]},{l[6],l[7]},
@@ -451,11 +468,13 @@ static void quad_draw_rect(BrookVkQuadPass *p,const uint32_t *scene,const uint32
         ((l[16]&BROOK_VK_STRAIGHT_ALPHA)?QUAD_MODE_STRAIGHT:0u)|
         ((l[16]&BROOK_VK_OPAQUE_SOURCE)?QUAD_MODE_OPAQUE:0u)|
         (kind==QUAD_KIND_OVER_ZERO?QUAD_MODE_OVER_ZERO:0u)|
-        ((blending && exact) || glass?QUAD_MODE_READ:0u)|(capture?QUAD_MODE_CAPTURE:0u)|fetch_mode(l)},
+        ((blending && exact) || effect?QUAD_MODE_READ:0u)|(capture?QUAD_MODE_CAPTURE:0u)|
+        (prefilter?QUAD_MODE_CAPTURE_FILTER:0u)|fetch_mode(l)},
         .screen=glass?glass->screen:(struct QuadRect){0},
-        .atlas=glass?glass->atlas:(struct QuadRect){0},.radius=glass?glass->radius:0};
+        .atlas=glass?glass->atlas:(struct QuadRect){0},
+        .radius=prefilter || (effect && !glass->filterSource)?glass->radius:0};
     vkCmdPushConstants(p->command,p->layout,VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,
-        0,glass?sizeof(push):sizeof(push.quad),&push);
+        0,sizeof(push),&push);
     vkCmdDraw(p->command,4,1,0,0);
 }
 
@@ -488,7 +507,7 @@ static void quad_capture_backdrop(BrookVkQuadPass *p,const uint32_t *scene,
                 l[16]&BROOK_VK_STRAIGHT_ALPHA?QUAD_KIND_STRAIGHT:QUAD_KIND_PREMULTIPLIED;
             if(kind!=QUAD_KIND_REPLACE)quad_blend_barrier(p);
             vkCmdBindDescriptorSets(p->command,VK_PIPELINE_BIND_POINT_GRAPHICS,p->layout,0,1,&images[i]->set,0,NULL);
-            for(unsigned k=0;k<n;++k)quad_draw_rect(p,scene,l,rects[k],kind,1,NULL);
+            for(unsigned k=0;k<n;++k)quad_draw_rect(p,scene,l,rects[k],kind,1,tile->filterSource==i+1?tile:NULL);
         }
     }
     vkCmdEndRenderPass(p->command);
@@ -550,7 +569,8 @@ static BrookVkResult quad_pass_submit(BrookVkQuadPass *p,const uint32_t *scene,s
     uint8_t used[BROOK_VK_MAX_LAYERS]={0};
     for(uint32_t i=0;i<plan->drawCount;++i)used[plan->draws[i].layer]=1;
     if(backdrop && backdrop->count && (!backdrop->key || backdrop->count>QUAD_BACKDROP_TILES))return BROOK_VK_REJECTED;
-    const int glass=backdrop && backdrop->count && quad_atlas_create(p);
+    const int glass=backdrop && backdrop->count;
+    if(glass && !brook_vk_quad_pass_enable_backdrop(p))return BROOK_VK_REJECTED;
     const int rebuild=glass && p->atlasKey!=backdrop->key;
     if(rebuild)for(size_t i=0;i<count;++i)used[i]|=backdrop->used[i];
     struct stat ids[BROOK_VK_MAX_LAYERS],outputId;
@@ -588,7 +608,7 @@ static BrookVkResult quad_pass_submit(BrookVkQuadPass *p,const uint32_t *scene,s
     if(vkResetCommandBuffer(p->command,0)!=VK_SUCCESS || vkResetFences(p->device,1,&p->fence)!=VK_SUCCESS)goto reject;
     VkCommandBufferBeginInfo begin={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     if(vkBeginCommandBuffer(p->command,&begin)!=VK_SUCCESS)goto reject;
-    p->gpuValid=0;p->atlasTimed=p->glassTimed=p->timingOverflow=0;p->timestampNext=4;
+    p->gpuValid=0;p->atlasTimed=p->chromeTimed=p->timingOverflow=0;p->timestampNext=4;
     if(p->timestamps){vkCmdResetQueryPool(p->command,p->timestamps,0,QUAD_TIMESTAMP_COUNT);
         vkCmdWriteTimestamp(p->command,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,p->timestamps,0);}
     /* Acquire every image from its external owner (the producer, the CPU
@@ -665,18 +685,18 @@ static BrookVkResult quad_pass_submit(BrookVkQuadPass *p,const uint32_t *scene,s
         if(effectCount){
             if(boundPipeline!=QUAD_PIPELINE_GLASS)vkCmdBindPipeline(p->command,VK_PIPELINE_BIND_POINT_GRAPHICS,p->pipeline[QUAD_PIPELINE_GLASS]);
             boundPipeline=QUAD_PIPELINE_GLASS;
-            const int timing=p->timestamps && p->timestampNext+1<QUAD_TIMESTAMP_COUNT;
-            if(timing)vkCmdWriteTimestamp(p->command,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,p->timestamps,p->timestampNext++);
+            const int timing=quad_chrome_begin(p,QUAD_GPU_GLASS);
             for(unsigned t=0;t<effectCount;++t)quad_draw_rect(p,scene,l,effects[t],d->kind,0,tiles[t]);
-            if(timing)vkCmdWriteTimestamp(p->command,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,p->timestamps,p->timestampNext++);
-            else p->timingOverflow=1;
-            p->glassTimed=1;
+            quad_chrome_end(p,timing);
         }
         if(n){
             const int pipeline=!p->fixedBlend || !blend?QUAD_PIPELINE_NONE:d->kind==QUAD_KIND_STRAIGHT?
                 QUAD_PIPELINE_STRAIGHT:QUAD_PIPELINE_PREMULTIPLIED;
             if(pipeline!=boundPipeline){vkCmdBindPipeline(p->command,VK_PIPELINE_BIND_POINT_GRAPHICS,p->pipeline[pipeline]);boundPipeline=pipeline;}
+            const unsigned category=backdrop?backdrop->chromeClass[d->layer]:0;
+            const int timing=category?quad_chrome_begin(p,category):0;
             for(unsigned k=0;k<n;++k)quad_draw_rect(p,scene,l,ordinary[k],d->kind,0,NULL);
+            quad_chrome_end(p,timing);
         }
         written=1;
     }
@@ -713,7 +733,7 @@ static BrookVkResult retire(BrookVkQuadPass *p,VkResult status){
             if(ns>=0 && ns<(double)UINT64_MAX){p->gpuNs=(uint64_t)ns;p->gpuValid=1;}
         }
     }
-    if(p->timestamps && (p->glassTimed || p->atlasTimed) && !p->timingOverflow){
+    if(p->timestamps && (p->chromeTimed || p->atlasTimed) && !p->timingOverflow){
         uint64_t ticks[QUAD_TIMESTAMP_COUNT]={0};
         const uint64_t mask=p->timestampBits==64?UINT64_MAX:(UINT64_C(1)<<p->timestampBits)-1;
         const int atlasValid=!p->atlasTimed || vkGetQueryPoolResults(p->device,p->timestamps,2,2,2*sizeof(uint64_t),
@@ -722,9 +742,15 @@ static BrookVkResult retire(BrookVkQuadPass *p,VkResult status){
         const int glassValid=!draws || vkGetQueryPoolResults(p->device,p->timestamps,4,draws,draws*sizeof(uint64_t),
             ticks+4,sizeof(uint64_t),VK_QUERY_RESULT_64_BIT)==VK_SUCCESS;
         if(atlasValid && glassValid){
-            p->backdropStats.atlasNs+=(uint64_t)((double)((ticks[3]-ticks[2])&mask)*p->timestampPeriod);
-            for(unsigned i=4;i<p->timestampNext;i+=2)
-                p->backdropStats.glassNs+=(uint64_t)((double)((ticks[i+1]-ticks[i])&mask)*p->timestampPeriod);
+            uint64_t sums[QUAD_GPU_CLASSES]={0};
+            sums[QUAD_GPU_ATLAS]=(uint64_t)((double)((ticks[3]-ticks[2])&mask)*p->timestampPeriod);
+            for(unsigned i=4;i<p->timestampNext;i+=2){
+                const unsigned category=p->timestampClass[i/2];
+                if(category && category<QUAD_GPU_CLASSES)
+                    sums[category]+=(uint64_t)((double)((ticks[i+1]-ticks[i])&mask)*p->timestampPeriod);
+            }
+            p->backdropStats.atlasNs+=sums[QUAD_GPU_ATLAS];p->backdropStats.glassNs+=sums[QUAD_GPU_GLASS];
+            p->backdropStats.frameNs+=sums[QUAD_GPU_FRAME];p->backdropStats.shellNs+=sums[QUAD_GPU_SHELL];
             ++p->backdropStats.timedFrames;
         }
     }

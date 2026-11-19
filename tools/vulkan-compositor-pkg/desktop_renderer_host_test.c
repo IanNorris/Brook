@@ -846,10 +846,12 @@ int main(int argc,char **argv){
     if(getenv("HOST_E2E_EXPECT_CHROME_KEEP") && (K.chromeKeeps<=K.chromeCaptures || !K.chromeKeepMisses))++bad;
     if(getenv("HOST_E2E_MIN_IDLE") && g_stats.idleSkips<strtoull(getenv("HOST_E2E_MIN_IDLE"),NULL,10))++bad;
     if(getenv("HOST_E2E_MAX_FAILURES") && g_stats.presentFailures>strtoull(getenv("HOST_E2E_MAX_FAILURES"),NULL,10))++bad;
-    /* Stage 1.5: the renderer reports its capabilities once, after attach,
-     * and has no backdrop blur yet (the kernel keeps Glass opaque for it). */
+    /* The experimental path reports blur only once the atlas is ready. */
     printf("HOST_E2E_CAPS reports=%u requested=%#lx\n",K.capsReports,(unsigned long)K.capsRequested);
-    if(!K.oldSurfaces && (K.capsReports!=1 || K.capsRequested))++bad;
+    if(!K.oldSurfaces){
+        const unsigned blur=g_backdropBlur && g_quadSubmitted?BROOK_DESKTOP_CAP_BACKDROP_BLUR:0;
+        if(K.capsReports!=(blur?2u:1u) || K.capsRequested!=(long)blur)++bad;
+    }
     if(bad)printf("HOST_E2E_EXPECTATION_FAILED\n");
     else if(!K.failures && !result)printf("HOST_E2E_PASS\n");
     if(K.direct)unlink(K.socketPath);

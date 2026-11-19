@@ -7,13 +7,14 @@
 enum { QUAD_BACKDROP_WIDTH=480, QUAD_BACKDROP_HEIGHT=270, QUAD_BACKDROP_TILES=24 };
 struct QuadBackdropTile {
     struct QuadRect screen, atlas;
-    uint16_t layer, below;
+    uint16_t layer, below, filterSource;
     uint32_t radius;
 };
+enum { QUAD_GPU_ATLAS, QUAD_GPU_GLASS, QUAD_GPU_FRAME, QUAD_GPU_SHELL, QUAD_GPU_CLASSES };
 struct QuadBackdrop {
     uint32_t count;
-    uint64_t key;
-    uint8_t used[BROOK_VK_MAX_LAYERS];
+    uint64_t key,damageKey;
+    uint8_t used[BROOK_VK_MAX_LAYERS],chromeClass[BROOK_VK_MAX_LAYERS];
     struct QuadBackdropTile tiles[QUAD_BACKDROP_TILES];
 };
 
@@ -64,7 +65,14 @@ static inline int quad_backdrop_layout(struct QuadBackdrop *p,const uint32_t *sc
         if(t->layer>=scene[2] || !t->below || t->below>t->layer)goto fail;
         const uint32_t *own=quad_backdrop_layer(scene,t->layer);
         t->screen=quad_rect_intersect(t->screen,quad_layer_bounds(own,scene[0],scene[1]));
-        if(quad_rect_empty(t->screen)){
+        int covered=0;
+        for(unsigned top=t->layer+1;!covered && top<scene[2];++top){
+            const uint32_t *higher=quad_backdrop_layer(scene,top);
+            covered=quad_layer_replaces(higher) &&
+                quad_rect_contains(quad_layer_bounds(higher,scene[0],scene[1]),t->screen) &&
+                (!holes || quad_rect_empty(quad_rect_intersect(holes[top],t->screen)));
+        }
+        if(quad_rect_empty(t->screen) || covered){
             --p->count;
             memmove(t,t+1,(p->count-i)*sizeof(*t));
             --i;continue;
@@ -83,12 +91,16 @@ static inline int quad_backdrop_layout(struct QuadBackdrop *p,const uint32_t *sc
         key=quad_backdrop_mix(key,(uint32_t)t->screen.y0);
         key=quad_backdrop_mix(key,(uint32_t)t->screen.x1);
         key=quad_backdrop_mix(key,(uint32_t)t->screen.y1);
-        key=quad_backdrop_mix(key,t->layer);
-        key=quad_backdrop_mix(key,t->radius);
+        key=quad_backdrop_mix(key,UINT64_C(0x74696c65));
+        unsigned contributor=0,contributors=0;
         for(unsigned src=quad_backdrop_bottom(scene,holes,t);src<t->below;++src){
             const uint32_t *l=quad_backdrop_layer(scene,src);
             const struct QuadRect r=quad_rect_intersect(t->screen,quad_layer_bounds(l,scene[0],scene[1]));
             if(quad_rect_empty(r) || (holes && quad_rect_contains(holes[src],r)))continue;
+            ++contributors;
+            if(quad_rect_contains(r,t->screen) &&
+               (!holes || quad_rect_empty(quad_rect_intersect(holes[src],t->screen))) &&
+               (quad_layer_replaces(l) || (src==0 && !(l[16]&BROOK_VK_STRAIGHT_ALPHA))))contributor=src+1;
             p->used[src]=1;
             key=quad_backdrop_mix(key,keys[src]);
             for(unsigned k=0;k<BROOK_VK_LAYER_WORDS;++k)key=quad_backdrop_mix(key,l[k]);
@@ -99,10 +111,20 @@ static inline int quad_backdrop_layout(struct QuadBackdrop *p,const uint32_t *sc
                 key=quad_backdrop_mix(key,(uint32_t)holes[src].y1);
             }
         }
+        // A single opaque or premultiplied wallpaper source can be filtered
+        // while the atlas is written. The full-size draw then needs one tap.
+        if(contributors==1 && contributor && t->radius>3){
+            t->filterSource=(uint16_t)contributor;
+            key=quad_backdrop_mix(key,t->radius);
+        }
     }
-    p->key=key?key:1;
+    if(p->count){
+        p->key=key?key:1;
+        for(unsigned i=0;i<p->count;++i)key=quad_backdrop_mix(key,p->tiles[i].radius);
+        p->damageKey=key?key:1;
+    }
     return 1;
 fail:
-    *p=(struct QuadBackdrop){0};
+    p->key=p->damageKey=p->count=0;memset(p->used,0,sizeof(p->used));
     return 0;
 }

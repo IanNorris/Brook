@@ -10,6 +10,24 @@ static inline uint32_t quad_backdrop_ref_texel(const struct QuadBackdropTile *t,
     const uint32_t w=t->atlas.x1-t->atlas.x0,h=t->atlas.y1-t->atlas.y0;
     const uint32_t sx=t->screen.x0+(2*x+1)*(t->screen.x1-t->screen.x0)/(2*w);
     const uint32_t sy=t->screen.y0+(2*y+1)*(t->screen.y1-t->screen.y0)/(2*h);
+    if(t->filterSource){
+        const unsigned source=t->filterSource-1;
+        const uint32_t *l=quad_backdrop_layer(scene,source);
+        const int r=(int)t->radius/2,dx[]={0,r,-r,0,0},dy[]={0,0,0,r,-r};
+        uint32_t c[4]={0};
+        for(unsigned i=0;i<5;++i){
+            int px=(int)sx+dx[i],py=(int)sy+dy[i];
+            if(px<t->screen.x0)px=t->screen.x0;
+            if(px>=t->screen.x1)px=t->screen.x1-1;
+            if(py<t->screen.y0)py=t->screen.y0;
+            if(py>=t->screen.y1)py=t->screen.y1-1;
+            uint32_t sample=0;
+            (void)quad_ref_sample(l,sources[source],px,py,&sample);
+            for(unsigned k=0;k<4;++k)c[k]+=quad_ref_channel(sample,k)*(i==0?4:1);
+        }
+        for(unsigned k=0;k<4;++k)c[k]=(c[k]+4)/8;
+        return quad_ref_blend(l[16],quad_ref_pack(c),0);
+    }
     uint32_t pixel=0;
     for(unsigned i=0;i<t->below;++i){
         const uint32_t *layer=quad_backdrop_layer(scene,i);
@@ -53,8 +71,9 @@ static inline uint32_t quad_backdrop_reference_pixel(const struct QuadBackdrop *
             const double sy=(double)(t->atlas.y1-t->atlas.y0)/(r.y1-r.y0);
             const double px=(x+0.5-r.x0)*sx-0.5,py=(y+0.5-r.y0)*sy-0.5;
             double channels[4]={0};
-            quad_backdrop_ref_linear(t,scene,sources,px,py,t->radius<=3?1:0.5,channels);
-            if(t->radius>3){
+            const int sampled=t->radius<=3 || t->filterSource;
+            quad_backdrop_ref_linear(t,scene,sources,px,py,sampled?1:0.5,channels);
+            if(!sampled){
                 const double dx=t->radius*sx/2,dy=t->radius*sy/2;
                 quad_backdrop_ref_linear(t,scene,sources,px+dx,py,0.125,channels);
                 quad_backdrop_ref_linear(t,scene,sources,px-dx,py,0.125,channels);

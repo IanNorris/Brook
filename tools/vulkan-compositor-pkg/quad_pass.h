@@ -58,8 +58,9 @@ BrookVkResult brook_vk_quad_pass_submit(BrookVkQuadPass *,const uint32_t *scene,
 BrookVkResult brook_vk_quad_pass_submit_backdrop(BrookVkQuadPass *,const uint32_t *scene,size_t words,
         const struct BrookVkQuadSource *sources,size_t count,const struct BrookVkQuadSource *output,
         const struct QuadPlan *plan,const struct QuadBackdrop *,const struct QuadRect *holes);
+int brook_vk_quad_pass_enable_backdrop(BrookVkQuadPass *);
 struct BrookVkBackdropStats {
-    uint64_t rebuilds,reuses,atlasNs,glassNs;
+    uint64_t rebuilds,reuses,atlasNs,glassNs,frameNs,shellNs;
     uint32_t timedFrames;
 };
 struct BrookVkBackdropStats brook_vk_quad_pass_backdrop_stats(const BrookVkQuadPass *);

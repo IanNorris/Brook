@@ -387,15 +387,15 @@ static void tiled_sources(void){
 }
 enum { BLUR_TEST_LAYERS=5, BLUR_TEST_WORDS=BROOK_VK_SCENE_HEADER+BLUR_TEST_LAYERS*BROOK_VK_LAYER_WORDS };
 static const struct BrookVkSceneLayer blurSceneLayers[BLUR_TEST_LAYERS]={
-    {0,DW,DW,DH,0,0,DW,DH,0,0,DW,DH,0,0,DW,DH,255|BROOK_VK_OPAQUE_SOURCE},
-    {0,DW,DW,1680,0,0,DW,1680,0,56,DW,1680,0,0,DW,DH,255|BROOK_VK_OPAQUE_SOURCE},
+    {0,DW,DW,DH,0,0,DW,DH,0,0,DW,DH,0,0,DW,DH,255|BROOK_VK_STRAIGHT_ALPHA|BROOK_VK_OPAQUE_SOURCE},
+    {0,DW,DW,1680,0,0,DW,1680,0,56,DW,1680,0,0,DW,DH,255|BROOK_VK_STRAIGHT_ALPHA|BROOK_VK_OPAQUE_SOURCE},
     {0,DW,DW,56,0,0,DW,56,0,0,DW,56,0,0,DW,DH,255|BROOK_VK_STRAIGHT_ALPHA},
     {0,DW,DW,64,0,0,DW,64,0,1736,DW,64,0,0,DW,DH,255|BROOK_VK_STRAIGHT_ALPHA},
     {0,640,640,320,0,0,640,320,360,480,640,320,0,0,DW,DH,222|BROOK_VK_STRAIGHT_ALPHA},
 };
 static struct QuadBackdrop blur_test_plan(const uint32_t *scene,uint64_t wallpaper,uint64_t game,int panel)
 {
-    struct QuadBackdrop plan={0};
+    struct QuadBackdrop plan={.chromeClass={0,0,QUAD_GPU_FRAME,QUAD_GPU_SHELL,QUAD_GPU_SHELL}};
     const uint64_t keys[BLUR_TEST_LAYERS]={wallpaper,game,3,4,5};
     quad_backdrop_add(&plan,(struct QuadRect){0,0,DW,56},2,1,3);
     quad_backdrop_add(&plan,(struct QuadRect){0,1736,DW,DH},3,3,9);
@@ -446,12 +446,17 @@ static void blur_scene(void)
     const struct QuadBackdrop panel=blur_test_plan(scene,1,1,1);
     uint64_t offNs=0,onNs=0;
     for(unsigned iteration=0;iteration<120;++iteration){
-        const struct QuadBackdrop *effect=iteration<60?NULL:&steady;
-        CHECK(brook_vk_quad_pass_submit_backdrop(quad,scene,BLUR_TEST_WORDS,sources,BLUR_TEST_LAYERS,&target,&plan,effect,NULL)==BROOK_VK_PENDING);
+        const struct QuadBackdrop *effect=iteration%2==0?NULL:&steady;
+        const BrookVkResult submitted=brook_vk_quad_pass_submit_backdrop(quad,scene,BLUR_TEST_WORDS,sources,
+            BLUR_TEST_LAYERS,&target,&plan,effect,NULL);
+        if(submitted!=BROOK_VK_PENDING)
+            fprintf(stderr,"QUAD_HOST_GLASS_SUBMIT frame=%u result=%d vk=%d\n",
+                    iteration,submitted,brook_vk_quad_pass_last_result(quad));
+        CHECK(submitted==BROOK_VK_PENDING);
         CHECK(brook_vk_quad_pass_wait(quad,5000000000ull)==BROOK_VK_COMPLETE);
         uint64_t ns;
         CHECK(brook_vk_quad_pass_gpu_timestamp_ns(quad,&ns));
-        if(iteration<60)offNs+=ns;else onNs+=ns;
+        if(iteration%2==0)offNs+=ns;else onNs+=ns;
     }
     struct BrookVkBackdropStats stats=brook_vk_quad_pass_backdrop_stats(quad);
     CHECK(stats.rebuilds==1 && stats.reuses==59 && stats.timedFrames==60);
