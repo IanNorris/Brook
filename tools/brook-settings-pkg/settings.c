@@ -16,6 +16,17 @@
 
 static GtkWidget *scale_choice,*preview,*status,*swatches[3];
 static GtkWidget *volume_slider,*mute_check,*audio_status;
+
+/* Sliders never take the mouse wheel: GtkScale's default handler changes the
+ * value when a scroll merely passes over it, which stops the page scrolling
+ * and can jump the master volume. Stop the scale's handler and return FALSE so
+ * the event bubbles to the scrolled window. Drag, click and keys still work. */
+static gboolean slider_pass_scroll(GtkWidget *w,GdkEvent *e,gpointer unused){
+    (void)e;(void)unused;g_signal_stop_emission_by_name(w,"scroll-event");return FALSE;
+}
+static void slider_ignore_wheel(GtkWidget *slider){
+    g_signal_connect(slider,"scroll-event",G_CALLBACK(slider_pass_scroll),NULL);
+}
 static GtkWidget *pointer_slider,*pointer_status,*tap_check;
 static long pointer_speed=-1;
 static long touchpad_tap=-1;
@@ -296,7 +307,7 @@ int main(int argc,char **argv) {
     gtk_label_set_line_wrap(GTK_LABEL(audio_status),TRUE);gtk_label_set_xalign(GTK_LABEL(audio_status),0);
     gtk_style_context_add_class(gtk_widget_get_style_context(audio_status),"muted");gtk_box_pack_start(GTK_BOX(audio_box),audio_status,FALSE,FALSE,0);
     gtk_widget_set_sensitive(volume_slider,audio_supported);gtk_widget_set_sensitive(mute_check,audio_supported);
-    g_signal_connect(volume_slider,"value-changed",G_CALLBACK(audio_changed),NULL);g_signal_connect(mute_check,"toggled",G_CALLBACK(audio_changed),NULL);
+    slider_ignore_wheel(volume_slider);g_signal_connect(volume_slider,"value-changed",G_CALLBACK(audio_changed),NULL);g_signal_connect(mute_check,"toggled",G_CALLBACK(audio_changed),NULL);
     if(audio_supported)g_timeout_add(500,audio_follow,NULL);
     pointer_speed=syscall(BROOK_SYS_POINTER_SPEED,0L,0L);
     GtkWidget *pointer_panel=gtk_frame_new("Touchpad");
@@ -312,7 +323,7 @@ int main(int argc,char **argv) {
     gtk_label_set_line_wrap(GTK_LABEL(pointer_status),TRUE);gtk_label_set_xalign(GTK_LABEL(pointer_status),0);
     gtk_style_context_add_class(gtk_widget_get_style_context(pointer_status),"muted");gtk_box_pack_start(GTK_BOX(pointer_box),pointer_status,FALSE,FALSE,0);
     gtk_widget_set_sensitive(pointer_slider,pointer_speed>0);
-    g_signal_connect(pointer_slider,"value-changed",G_CALLBACK(pointer_changed),NULL);
+    slider_ignore_wheel(pointer_slider);g_signal_connect(pointer_slider,"value-changed",G_CALLBACK(pointer_changed),NULL);
     touchpad_tap=syscall(BROOK_SYS_TOUCHPAD_TAP,0L,0L);
     tap_check=gtk_check_button_new_with_label("Tap to click");
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(tap_check),touchpad_tap>0);
@@ -357,7 +368,7 @@ int main(int argc,char **argv) {
     performance=gtk_check_button_new_with_label("Performance mode");gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(performance),(selected_appearance&BROOK_APPEARANCE_PERFORMANCE)!=0);
     gtk_widget_set_tooltip_text(performance,"Flat opaque frames, without blur or shadows. Your glass settings are remembered.");gtk_box_pack_start(GTK_BOX(box),performance,FALSE,FALSE,0);
     g_signal_connect(dark_switch,"notify::active",G_CALLBACK(dark_changed),NULL);
-    g_signal_connect(opacity_slider,"value-changed",G_CALLBACK(controls_changed),NULL);
+    slider_ignore_wheel(opacity_slider);g_signal_connect(opacity_slider,"value-changed",G_CALLBACK(controls_changed),NULL);
     g_signal_connect(blur_choice,"changed",G_CALLBACK(controls_changed),NULL);
     g_signal_connect(performance,"toggled",G_CALLBACK(controls_changed),NULL);
     GtkWidget *scale_row=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,16);gtk_box_pack_start(GTK_BOX(box),scale_row,FALSE,FALSE,4);
