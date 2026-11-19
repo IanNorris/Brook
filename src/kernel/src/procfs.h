@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vfs.h"
+#include "proc_wait_info.h"
 
 namespace brook {
 
@@ -18,5 +19,18 @@ int ProcFsStatPath(const char* relPath, VnodeStat* st);
 
 // Open the /proc directory itself for readdir.
 Vnode* ProcFsOpenDir(const char* relPath);
+
+// What a task is waiting for, derived from a scheduler snapshot (shared by
+// /proc/<pid>/wchan and the `proc blocked` debug command).
+struct ProcessSnapshot;
+struct ProcWaitDescription {
+    const char* kind;          // "running", "futex", "poll", "pipe", "gpu-wait", ...
+    int fd;                    // fd argument of the current syscall, or -1
+    int fdType;                // FdType of that fd, or -1
+    uint64_t blockedForMs;     // 0 unless blocked
+    char sites[ProcWaitSiteDepth][48]; // kernel wait sites, innermost first
+    uint32_t siteCount;
+};
+void ProcDescribeWait(const ProcessSnapshot& snap, ProcWaitDescription* out);
 
 } // namespace brook

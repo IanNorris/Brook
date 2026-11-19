@@ -3589,6 +3589,16 @@ static void FillProcessSnapshot(const Process* p, ProcessSnapshot* out)
     j = 0;
     for (; j + 1 < sizeof(out->exePath) && p->exePath[j]; ++j) out->exePath[j] = p->exePath[j];
     ProcessFsReadDisplay(p,out->cwd,sizeof(out->cwd));
+    out->kernelThread = p->isKernelThread;
+    out->blockedOnRwLock = p->blockedOnRwLock != nullptr;
+    out->syscallNr = p->currentSyscallNum;
+    out->syscallArgs[0] = p->syscallUserRdi; out->syscallArgs[1] = p->syscallUserRsi;
+    out->syscallArgs[2] = p->syscallUserRdx; out->syscallArgs[3] = p->syscallUserR10;
+    out->syscallArgs[4] = p->syscallUserR8;  out->syscallArgs[5] = p->syscallUserR9;
+    out->syscallSp = p->syscallUserRsp; out->syscallPc = p->syscallUserRip;
+    out->blockedSinceMs = __atomic_load_n(&p->blockedSinceMs, __ATOMIC_RELAXED);
+    out->wakeupTick = p->wakeupTick;
+    for (uint32_t i = 0; i < ProcWaitSiteDepth; ++i) out->blockSites[i] = p->blockSites[i];
 }
 
 uint32_t SchedulerSnapshotProcesses(ProcessSnapshot* out, uint32_t maxCount)

@@ -33,6 +33,7 @@
 #include "native_tsc_observe.h"
 #endif
 #include "bridge_reply.h"
+#include "procfs.h"
 #include "debug_hardware.h"
 #if defined(BROOK_SSD_AUTO_RECOVERY)
 #include "recovery_debug_policy.h"
@@ -5720,6 +5721,66 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         const char* done = "---\n";
         DebugReplySend( done, 4);
         kfree(snaps);
+    }
+
+    // -----------------------------------------------------------------------
+    // proc blocked <pid> — per-thread syscall and wait site of a thread group
+    // -----------------------------------------------------------------------
+    else if (StrStartsWith(cmd, "proc blocked ")) {
+        uint32_t pid = 0;
+        const char* arg = cmd + 13;
+        while (*arg == ' ') ++arg;
+        if (ParseUint(arg, &pid) <= 0 || !pid || pid > 65535) {
+            DebugChannelSend("{\"error\":\"usage: proc blocked <pid>\"}\n"); return;
+        }
+        auto* snap = static_cast<ProcessSnapshot*>(kmalloc(sizeof(ProcessSnapshot)));
+        auto* wait = static_cast<ProcWaitDescription*>(kmalloc(sizeof(ProcWaitDescription)));
+        if (!snap || !wait) {
+            if (snap) kfree(snap); if (wait) kfree(wait);
+            DebugChannelSend("{\"error\":\"out_of_memory\"}\n"); return;
+        }
+        if (!SchedulerSnapshotProcess(static_cast<uint16_t>(pid), snap)) {
+            kfree(snap); kfree(wait);
+            DebugChannelSend("{\"error\":\"no_such_process\"}\n"); return;
+        }
+        const uint16_t tgid = snap->tgid;
+        const uint64_t group = snap->groupIncarnation;
+        BridgeReply r;
+        r.text("{");r.field("pid",pid);r.text(",");r.field("tgid",tgid);
+        r.text(",");r.field("now_ms",ApicTickCount());r.text(",\"threads\":[");
+        const char* states[] = {"ready","running","blocked","stopped","terminated"};
+        uint32_t minTid = 0, count = 0;
+        while (count < 512 && SchedulerSnapshotTask(tgid, group, 0, minTid, snap)) {
+            minTid = uint32_t{snap->pid} + 1;
+            ProcDescribeWait(*snap, wait);
+            if (count++) r.text(",");
+            r.text("{");r.field("tid",snap->pid);r.text(",\"name\":");r.quoted(snap->name);
+            const uint32_t st = static_cast<uint32_t>(snap->state);
+            r.text(",\"state\":\"");r.text(st < 5 ? states[st] : "unknown");r.text("\"");
+            r.text(",\"cpu\":");
+            if (snap->runningOnCpu < 0) r.text("-1"); else r.number(static_cast<uint32_t>(snap->runningOnCpu));
+            r.text(",\"wait\":\"");r.text(wait->kind);r.text("\"");
+            if (snap->state == ProcessState::Blocked || snap->state == ProcessState::Stopped) {
+                if (!snap->kernelThread) {
+                    r.text(",");r.field("syscall",snap->syscallNr);r.text(",\"args\":[");
+                    for (int i = 0; i < 3; ++i) { if (i) r.text(","); r.text("\"0x"); r.number(snap->syscallArgs[i], true); r.text("\""); }
+                    r.text("]");
+                }
+                r.text(",");r.field("blocked_ms",wait->blockedForMs);
+                if (snap->wakeupTick) { r.text(",");r.field("wakeup_tick",snap->wakeupTick); }
+                if (wait->fd >= 0) {
+                    r.text(",");r.field("fd",static_cast<uint32_t>(wait->fd));
+                    r.text(",\"fd_type\":");
+                    if (wait->fdType < 0) r.text("-1"); else r.number(static_cast<uint32_t>(wait->fdType));
+                }
+                r.text(",\"sites\":[");
+                for (uint32_t i = 0; i < wait->siteCount; ++i) { if (i) r.text(","); r.quoted(wait->sites[i]); }
+                r.text("]");
+            }
+            r.text("}");
+        }
+        r.text("]}\n");r.send();
+        kfree(snap); kfree(wait);
     }
 
     // -----------------------------------------------------------------------

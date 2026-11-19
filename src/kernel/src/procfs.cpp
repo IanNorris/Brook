@@ -30,6 +30,9 @@
 #include "ext2_vfs.h"
 #include "fs/compressed_vfs.h"
 #include "string.h"
+#include "ksym_addrs.h"
+#include "fd_table.h"
+#include "proc_wait_info.h"
 
 namespace brook {
 
@@ -731,6 +734,83 @@ static Vnode* GenPidStatus(const ProcessSnapshot& proc)
         vsize / 1024,
         (proc.stackTop - proc.stackBase) / 1024, proc.threadCount);
 
+    return MakeProcVnode(buf, n);
+}
+
+static_assert(ProcFd::Pipe==int(FdType::Pipe) && ProcFd::Socket==int(FdType::Socket) &&
+              ProcFd::UnixSocket==int(FdType::UnixSocket) && ProcFd::EventFd==int(FdType::EventFd) &&
+              ProcFd::TimerFd==int(FdType::TimerFd) && ProcFd::SignalFd==int(FdType::SignalFd) &&
+              ProcFd::DevTty==int(FdType::DevTty) && ProcFd::DevKeyboard==int(FdType::DevKeyboard) &&
+              ProcFd::DevDsp==int(FdType::DevDsp) && ProcFd::DevKlog==int(FdType::DevKlog) &&
+              ProcFd::EpollFd==int(FdType::EpollFd) && ProcFd::DevDri==int(FdType::DevDri) &&
+              ProcFd::DrmPrime==int(FdType::DrmPrime) && ProcFd::SyncFile==int(FdType::SyncFile) &&
+              ProcFd::DevIntelDri==int(FdType::DevIntelDri) && ProcFd::IntelPrime==int(FdType::IntelPrime) &&
+              ProcFd::IntelSyncObj==int(FdType::IntelSyncObj) && ProcFd::Vnode==int(FdType::Vnode) &&
+              ProcFd::BlockDevice==int(FdType::BlockDevice) && ProcFd::NetlinkSocket==int(FdType::NetlinkSocket),
+              "proc_wait_info.h FdType mirror");
+
+static bool SnapshotInWait(const ProcessSnapshot& s)
+{ return s.state == ProcessState::Blocked || s.state == ProcessState::Stopped; }
+
+void ProcDescribeWait(const ProcessSnapshot& snap, ProcWaitDescription* out)
+{
+    *out = {};
+    out->fd = -1; out->fdType = -1;
+    const bool blocked = snap.state == ProcessState::Blocked;
+    if (blocked) {
+        for (uint32_t i = 0; i < ProcWaitSiteDepth && snap.blockSites[i]; ++i) {
+            const char* name = nullptr; uint64_t offset = 0;
+            char* dst = out->sites[out->siteCount];
+            if (KsymFindByAddr(snap.blockSites[i], &name, &offset) && name) {
+                uint32_t n = ProcWaitShortSymbol(name, dst, sizeof(out->sites[0]));
+                if (offset <= 0xffffffffULL && n + 12 < sizeof(out->sites[0])) {
+                    dst[n++] = '+'; dst[n++] = '0'; dst[n++] = 'x';
+                    char* end = U64ToHex(dst + n, offset); *end = 0;
+                }
+            } else {
+                dst[0] = '0'; dst[1] = 'x'; char* end = U64ToHex(dst + 2, snap.blockSites[i]); *end = 0;
+            }
+            ++out->siteCount;
+        }
+        const uint64_t now = ApicTickCount();
+        if (snap.blockedSinceMs && now >= snap.blockedSinceMs) out->blockedForMs = now - snap.blockedSinceMs;
+    }
+    if (!snap.kernelThread && ProcWaitSyscallUsesFd(snap.syscallNr) && snap.syscallArgs[0] < MAX_FDS) {
+        out->fd = static_cast<int>(snap.syscallArgs[0]);
+        FdSnapshot fd{};
+        if (SchedulerGetFdInfo(snap.pid, out->fd, &fd, snap.incarnation)) out->fdType = fd.type;
+    }
+    out->kind = ProcWaitKind(blocked, snap.state == ProcessState::Stopped, snap.kernelThread,
+                             snap.syscallNr, out->fdType, snap.blockedOnRwLock,
+                             out->siteCount ? out->sites[0] : nullptr);
+}
+
+// /proc/[pid]/syscall — Linux format: "nr args.. sp pc", or "running".
+static Vnode* GenPidSyscall(const ProcessSnapshot& proc)
+{
+    auto* buf = static_cast<char*>(kmalloc(256));
+    if (!buf) return nullptr;
+    const bool running = !SnapshotInWait(proc) || proc.kernelThread;
+    uint32_t n = ProcFormatSyscall(buf, 256, running, proc.syscallNr, proc.syscallArgs,
+                                   proc.syscallSp, proc.syscallPc);
+    return MakeProcVnode(buf, n);
+}
+
+// /proc/[pid]/wchan — wait kind ("futex", "pipe", "gpu-wait", ... or "0"
+// when running, as Linux prints) followed by the innermost kernel wait site.
+static Vnode* GenPidWchan(const ProcessSnapshot& proc)
+{
+    auto* buf = static_cast<char*>(kmalloc(128));
+    if (!buf) return nullptr;
+    ProcWaitDescription wait;
+    ProcDescribeWait(proc, &wait);
+    uint32_t n;
+    if (proc.state != ProcessState::Blocked && proc.state != ProcessState::Stopped)
+        n = ProcFmt(buf, 128, "0");
+    else if (wait.siteCount)
+        n = ProcFmt(buf, 128, "%s %s", wait.kind, wait.sites[0]);
+    else
+        n = ProcFmt(buf, 128, "%s", wait.kind);
     return MakeProcVnode(buf, n);
 }
 
@@ -1455,6 +1535,8 @@ static ProcPidEntry g_pidEntries[] = {
     { "root",    GenPidRoot },
     { "mountinfo", GenPidMountInfo },
     { "cgroup",  GenPidCgroup },
+    { "syscall", GenPidSyscall },
+    { "wchan",   GenPidWchan },
 };
 static constexpr uint32_t NUM_PID_ENTRIES = sizeof(g_pidEntries) / sizeof(g_pidEntries[0]);
 

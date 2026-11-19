@@ -15,6 +15,31 @@ static inline void BlockRestoreIrq(uint64_t flags){
 #endif
 }
 
+// Diagnostics for /proc/<pid>/wchan and `proc blocked`: when the wait began
+// and the kernel return addresses above SchedulerBlock (frame-pointer walk,
+// bounded to the current kernel stack). Written only by the blocking task.
+static inline void BlockRecordWaitSite(Process* proc, const void* frame)
+{
+#ifdef BROOK_SCHED_BLOCK_HOST_TEST
+    (void)proc;(void)frame;
+#else
+    if (proc != g_perCpu[ThisCpu()].currentProcess) return;
+    __atomic_store_n(&proc->blockedSinceMs, ApicTickCount(), __ATOMIC_RELAXED);
+    uint64_t rbp = reinterpret_cast<uint64_t>(frame);
+    const uint64_t base = proc->kernelStackBase, top = proc->kernelStackTop;
+    uint32_t depth = 0;
+    while (depth < ProcWaitSiteDepth && rbp && !(rbp & 7) && rbp >= base && rbp + 16 <= top) {
+        const auto* f = reinterpret_cast<const uint64_t*>(rbp);
+        const uint64_t ret = f[1];
+        if (ret < 0xffffffff80000000ULL) break;
+        proc->blockSites[depth++] = ret;
+        if (f[0] <= rbp) break;
+        rbp = f[0];
+    }
+    for (uint32_t i = depth; i < ProcWaitSiteDepth; ++i) proc->blockSites[i] = 0;
+#endif
+}
+
 static void SchedulerBlockImpl(Process* proc, bool interruptible)
 {
     // UAF guard — same rationale as in DoSwitch.
@@ -135,13 +160,15 @@ static void SchedulerBlockImpl(Process* proc, bool interruptible)
     BlockRestoreIrq(flags);
 }
 
-void SchedulerBlock(Process* proc)
+__attribute__((noinline)) void SchedulerBlock(Process* proc)
 {
+    BlockRecordWaitSite(proc, __builtin_frame_address(0));
     SchedulerBlockImpl(proc, false);
 }
 
-void SchedulerBlockInterruptible(Process* proc)
+__attribute__((noinline)) void SchedulerBlockInterruptible(Process* proc)
 {
+    BlockRecordWaitSite(proc, __builtin_frame_address(0));
     // Keep even otherwise-unprotected waits alive until their caller unwinds.
     // Leave retains the latch until syscall return; it is not a terminal boundary.
     SchedulerKernelRegionEnter(proc);
