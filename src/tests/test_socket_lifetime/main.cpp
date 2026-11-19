@@ -2076,6 +2076,28 @@ int main() {
         static uint8_t dns[512];const auto fullBefore=g_netCounters.udpRxFull;
         for(unsigned n=0;n<2000;++n)SockDeliverUdp(2,53,1,5353,dns,sizeof(dns));
         assert(g_netCounters.udpRxFull-fullBefore==2000-Socket::RX_BUF_SIZE/(10+sizeof(dns)));
+        // Drain: every queued datagram comes back whole, then EAGAIN.
+        {const unsigned queued=Socket::RX_BUF_SIZE/(10+sizeof(dns));uint8_t out[600];SockAddrIn from{};
+         for(unsigned n=0;n<queued;++n)assert(SockRecvFrom(u,out,sizeof(out),&from)==int(sizeof(dns)) && from.sin_port==htons(53));
+         assert(SockRecvFrom(u,out,sizeof(out),&from)==-11 && g_sockets[u].rxCount==0);}
+        // Gen 441: delivery appends under s.lock while a reader dequeues. A
+        // lost rxCount update used to misframe the ring. Stress both sides.
+        {const auto corruptBefore=g_netCounters.udpRxCorrupt;std::atomic<bool> stop{false};std::atomic<unsigned> sent{0};
+         std::thread producer([&]{uint8_t d[1400];for(unsigned n=0;n<40000;++n){const unsigned len=1+(n*37)%1400;
+             for(unsigned i=0;i<len;++i)d[i]=uint8_t(n+i);d[0]=uint8_t(n);SockDeliverUdp(2,443,1,5353,d,len);sent=n+1;}stop=true;});
+         unsigned got=0;uint8_t out[1500];SockAddrIn from{};
+         for(;;){const int r=SockRecvFrom(u,out,sizeof(out),&from);
+             if(r==-11){if(stop.load() && g_sockets[u].rxCount==0)break;continue;}
+             assert(r>=1 && r<=1400 && from.sin_port==htons(443));
+             for(int i=1;i<r;++i)assert(out[i]==uint8_t(out[0]+i)); // payload intact and framed
+             ++got;}
+         producer.join();
+         assert(g_netCounters.udpRxCorrupt==corruptBefore && got==sent.load()-(g_netCounters.udpRxFull-fullBefore-(2000-Socket::RX_BUF_SIZE/(10+sizeof(dns)))));}
+        // An inconsistent length resets the ring instead of spinning.
+        {uint8_t one=7;SockDeliverUdp(2,53,1,5353,&one,1);auto& q=g_sockets[u];
+         q.rxBuf[q.rxTail]=0xff;q.rxBuf[(q.rxTail+1)%Socket::RX_BUF_SIZE]=0xff; // length 0xffff+ > rxCount
+         const auto corrupt=g_netCounters.udpRxCorrupt;uint8_t out[16];
+         assert(SockRecvFrom(u,out,sizeof(out),nullptr)==-11 && q.rxCount==0 && g_netCounters.udpRxCorrupt==corrupt+1);}
         int l=create();g_sockets[l].listening=true;g_sockets[l].listenBacklog=2;
         g_sockets[l].localPort=htons(1234);g_sockets[l].tcpState=TcpState::Listen;
         auto syn=[&](uint16_t port){Ipv4Header ip{};ip.srcIp=2;ip.dstIp=1;TcpHeader t{};
