@@ -61,7 +61,6 @@ bool CoreDumpReadRegisters(const Process* process,uint64_t addressSpace,CoreRegi
 
 namespace {
 constexpr uint32_t MaxPrograms=4096,MaxFileNotes=2048;
-constexpr uint64_t MaxResidentPages=CoreDumpLimit/CorePageSize;
 
 template<class T> struct Allocation {
     T* ptr;
@@ -75,6 +74,7 @@ struct CoreFileName {
 };
 struct Writer {
     Vnode* node;
+    const CoreDumpDestination& destination;
     uint64_t offset=0;
     int error=0;
 
@@ -82,6 +82,7 @@ struct Writer {
         if(!size)return true;
         const auto* bytes=static_cast<const uint8_t*>(data);
         while(size){
+            if(destination.expired && destination.expired(destination.context)){error=-110;return false;}
             const int written=VfsWrite(node,bytes,size,&offset);
             if(written<=0){error=written?written:-5;return false;}
             bytes+=written;size-=written;
@@ -107,23 +108,25 @@ void CopyName(char* destination,uint32_t capacity,const char* name){
 }
 }
 
-int CoreDumpProcess(uint16_t pid,const char* path,bool full,CoreDumpResult& result)
+int CoreDumpWriteSnapshot(CoreDumpSnapshot& snapshot,const char* path,bool full,
+                          const CoreDumpDestination& destination)
 {
+    auto& result=snapshot.result;
+    auto& info=snapshot.info;
+    auto* space=snapshot.space;
+    auto* threads=snapshot.threads;
     const uint64_t start=ApicTickCount();
     struct Duration { CoreDumpResult& result;uint64_t start;~Duration(){result.durationMs=ApicTickCount()-start;} } duration{result,start};
-    if(!ProcessCurrent() || !pid || !path || *path!='/')return -22;
-    Allocation<CoreThreadNote> threads(MAX_PROCESSES);
+    const uint64_t byteLimit=destination.byteLimit?destination.byteLimit:CoreDumpLimit;
+    if(byteLimit<CorePageSize)return -27;
+    const auto expired=[&]{return destination.expired && destination.expired(destination.context);};
+    if(expired())return -110;
+    const uint64_t maxResidentPages=byteLimit/CorePageSize;
     Allocation<CoreProgramHeader> programs(MaxPrograms);
-    Allocation<uint64_t> identities(MaxPrograms),addresses(MaxResidentPages);
+    Allocation<uint64_t> identities(MaxPrograms),addresses(maxResidentPages);
     Allocation<CoreFileName> files(MaxFileNotes);
     Allocation<uint8_t> page(CorePageSize);
-    if(!threads.ptr || !programs.ptr || !identities.ptr || !addresses.ptr || !files.ptr || !page.ptr)return -12;
-
-    CoreProcessNote info{};
-    struct AddressPin {AddressSpaceState* p;~AddressPin(){if(p)AddressSpaceUnref(p);} } pin{
-        SchedulerCoreDumpThreads(pid,threads.ptr,MAX_PROCESSES,info,result)};
-    if(!pin.p)return -3;
-    auto* space=pin.p;
+    if(!programs.ptr || !identities.ptr || !addresses.ptr || !files.ptr || !page.ptr)return -12;
 
     const uint32_t argBytes=UserMappingReadArguments(space,0,info.args,sizeof(info.args)-1);
     for(uint32_t i=0;i<argBytes;++i)if(!info.args[i])info.args[i]=' ';
@@ -139,6 +142,7 @@ int CoreDumpProcess(uint16_t pid,const char* path,bool full,CoreDumpResult& resu
         if(auxWords>AddressSpaceState::SavedAuxvWords)return -5;
         memcpy(aux,space->savedAuxv,uint64_t(auxWords)*sizeof(*aux));
         for(const auto* node=space->ranges.head;node;node=node->next){
+            if(expired())return -110;
             const auto& range=node->range;
             if(range.kind==MappingKind::Device || !(range.protection&1))continue;
             if(range.sharing==MappingSharing::Shared && range.kind!=MappingKind::File && !full)continue;
@@ -155,11 +159,12 @@ int CoreDumpProcess(uint16_t pid,const char* path,bool full,CoreDumpResult& resu
             ++result.mappings;
             uint64_t pages=0;
             if(!VmmCollectRangeAddresses(space->pageTable,range.begin,range.end,addresses.ptr,
-                                         MaxResidentPages,&pages))return -7;
+                                         maxResidentPages,&pages))return -7;
             const uint32_t flags=ElfProtection(range.protection);
             if(!named || full)result.holes+=(range.end-range.begin)/CorePageSize-pages;
             uint32_t active=0;
             for(uint64_t i=0;i<pages;++i){
+                if((i&255)==0 && expired())return -110;
                 const uint64_t va=addresses.ptr[i];
                 const uint64_t leaf=VmmReadLeaf(space->pageTable,VirtualAddress(va));
                 if((leaf&(VMM_PRESENT|VMM_USER))!=(VMM_PRESENT|VMM_USER)){
@@ -170,7 +175,7 @@ int CoreDumpProcess(uint16_t pid,const char* path,bool full,CoreDumpResult& resu
                 // if a concurrent protection change cleared their dirty bit.
                 if(!full && named && !(leaf&VMM_DIRTY) &&
                    !(range.sharing==MappingSharing::Private && (range.protection&2)))continue;
-                if(loadBytes>CoreDumpLimit-CorePageSize){layoutError=-27;break;}
+                if(loadBytes>byteLimit-CorePageSize){layoutError=-27;break;}
                 if(active && programs.ptr[active].address+programs.ptr[active].memorySize==va){
                     programs.ptr[active].memorySize+=CorePageSize;
                     programs.ptr[active].fileSize+=CorePageSize;
@@ -194,32 +199,42 @@ int CoreDumpProcess(uint16_t pid,const char* path,bool full,CoreDumpResult& resu
     const uint64_t noteOffset=sizeof(CoreElfHeader)+uint64_t(programCount)*sizeof(CoreProgramHeader);
     programs.ptr[0]={4,0,noteOffset,0,0,notes,0,4};
     uint64_t finalBytes=CorePageAlign(noteOffset+notes);
-    if(finalBytes>CoreDumpLimit || loadBytes>CoreDumpLimit-finalBytes)return -27;
+    if(finalBytes>byteLimit || loadBytes>byteLimit-finalBytes)return -27;
     for(uint32_t i=1;i<programCount;++i){
         programs.ptr[i].offset=finalBytes;
         finalBytes+=programs.ptr[i].fileSize;
     }
 
     struct RootPin {VfsPath path{};~RootPin(){VfsPathRelease(path);} } root;
-    result.stage="root";
-    if(int error=VfsPathRoot(&root.path))return error;
+    if(expired())return -110;
+    if(!destination.root){
+        result.stage="root";
+        if(int error=VfsPathRoot(&root.path))return error;
+    }
+    const auto& tree=destination.root?*destination.root:root.path;
+    const auto& directory=destination.directory?*destination.directory:tree;
+    if(destination.reserve){
+        result.stage="rotation";
+        if(int status=destination.reserve(destination.context,finalBytes))return status;
+    }
     constexpr char transferRoot[]="/data/.brook-transfer";
     uint32_t match=0;
     while(transferRoot[match] && path[match]==transferRoot[match])++match;
     if(!transferRoot[match] && path[match]=='/'){
         result.stage="transfer-directory";
-        const int directory=VfsMkdirAt(root.path,root.path,transferRoot,0700,0);
-        if(directory && directory!=-17)return directory;
+        const int mkdirResult=VfsMkdirAt(tree,tree,transferRoot,0700,0);
+        if(mkdirResult && mkdirResult!=-17)return mkdirResult;
     }
+    if(expired())return -110;
     int openError=0;
     result.stage="open";
-    auto* node=VfsOpenAt(root.path,root.path,path,VFS_O_WRITE|VFS_O_CREATE|VFS_O_EXCL,0600,0,&openError);
+    auto* node=VfsOpenAt(tree,directory,path,VFS_O_WRITE|VFS_O_CREATE|VFS_O_EXCL,0600,0,&openError);
     if(!node)return openError?openError:-5;
-    Writer out{node};
+    Writer out{node,destination};
     const auto emit=[&]{
         if(!CoreWriteHeader(out,programs.ptr,programCount) || !CoreWriteNote(out,CoreNtInfo,&info,sizeof(info)))return false;
         for(uint32_t i=0;i<result.threads;++i)
-            if(!CoreWriteNote(out,CoreNtStatus,&threads.ptr[i],sizeof(CoreThreadNote)))return false;
+            if(!CoreWriteNote(out,CoreNtStatus,&threads[i],sizeof(CoreThreadNote)))return false;
         if(auxWords && !CoreWriteNote(out,CoreNtAuxv,aux,auxWords*8))return false;
         if(fileCount){
             const CoreNoteHeader header{5,uint32_t(fileNoteBytes),CoreNtFile};
@@ -240,6 +255,7 @@ int CoreDumpProcess(uint16_t pid,const char* path,bool full,CoreDumpResult& resu
         for(uint32_t i=1;i<programCount;++i){
             const auto& load=programs.ptr[i];
             for(uint64_t offset=0;offset<load.fileSize;offset+=CorePageSize){
+                if(expired()){out.error=-110;return false;}
                 if(!UserMappingReadResidentPage(space,load.address+offset,identities.ptr[i],page.ptr)){
                     ++result.holes;
                     continue;
@@ -254,12 +270,31 @@ int CoreDumpProcess(uint16_t pid,const char* path,bool full,CoreDumpResult& resu
     int status=out.error;
     if(emit()){
         result.stage="size";
-        status=VfsTruncate(node,finalBytes);
+        status=expired()?-110:VfsTruncate(node,finalBytes);
     }else status=out.error;
+    if(!status && expired())status=-110;
     if(!status){result.stage="sync";status=VfsSync(node);}
+    if(!status && expired())status=-110;
     VfsClose(node);
     if(status)return status; // an exclusive output may be incomplete on I/O failure
     result.bytes=finalBytes;
     return 0;
 }
+int CoreDumpProcess(uint16_t pid,const char* path,bool full,CoreDumpResult& result)
+{
+    if(!ProcessCurrent() || !pid || !path || *path!='/')return -22;
+    Allocation<CoreThreadNote> threads(MAX_PROCESSES);
+    if(!threads.ptr)return -12;
+    CoreDumpSnapshot snapshot{};
+    snapshot.threads=threads.ptr;
+    snapshot.capacity=MAX_PROCESSES;
+    struct AddressPin {AddressSpaceState* p;~AddressPin(){if(p)AddressSpaceUnref(p);} } pin{
+        SchedulerCoreDumpThreads(pid,snapshot.threads,snapshot.capacity,snapshot.info,snapshot.result)};
+    if(!pin.p)return -3;
+    snapshot.space=pin.p;
+    const int status=CoreDumpWriteSnapshot(snapshot,path,full,{});
+    result=snapshot.result;
+    return status;
+}
+
 }

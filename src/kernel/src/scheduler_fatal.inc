@@ -19,6 +19,9 @@ static bool RequestFatalSignalImpl(Process* anchor,int signal,AddressSpaceState*
         return false;
     }
     if(expectedSpace)__atomic_store_n(&expectedSpace->oomTerminating,true,__ATOMIC_RELEASE);
+#ifndef BROOK_HOST_TEST
+    if(!expectedSpace && CoreAutoSignal(signal))(void)QueueCoreDumpLocked(anchor,signal);
+#endif
     const uint16_t tgid = anchor->tgid;
     const uint64_t generation = anchor->isThread ? anchor->leaderIncarnation : anchor->incarnation;
     for (uint32_t i = 0; i < g_processCount; ++i) {

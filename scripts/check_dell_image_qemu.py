@@ -114,10 +114,13 @@ def main():
     p.add_argument('--attempts', type=int, default=2,
                    help='maximum runs; only a firmware stall before boot selection is retried (default 2)')
     p.add_argument('--proc-dump-qa', action='store_true', help='Also run the two-thread live core and GDB fixture')
+    p.add_argument('--proc-autodump-qa', action='store_true', help='Run the live core fixture and verify an automatic fault core')
     a = p.parse_args()
     mode_flags = list(MODE_FLAGS)
-    if a.proc_dump_qa:
+    if a.proc_dump_qa or a.proc_autodump_qa:
         mode_flags += ['--proc-dump-qa', str(a.kernel_build.resolve() / 'drivers/virtio_net.mod')]
+    if a.proc_autodump_qa:
+        mode_flags.append('--proc-autodump-qa')
     pair, shared = a.pair.resolve(), a.shared.resolve()
     out = (a.output or pair / 'qemu-check').resolve()
     if 'OVMF_CODE' not in os.environ and not a.firmware:

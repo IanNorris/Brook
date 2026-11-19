@@ -1,3 +1,4 @@
+#include "core_autodump.h"
 #include "signal_defaults.h"
 #include "signal_restart.h"
 #include "syscall_timing.h"
@@ -808,6 +809,7 @@ static Process* ProcessCreateImpl(const uint8_t* elfData, uint64_t elfSize,
     proc->pgid = proc->pid;
     proc->sid = proc->pid;
     proc->tgid = proc->pid;         // Process is its own thread group leader
+    proc->coreLimits={};
     proc->threadLeader = proc;
     proc->state = ProcessState::Ready;
     proc->runningOnCpu = -1;
@@ -1241,6 +1243,8 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     child->pgid = parent->pgid;      // Inherit process group from parent
     child->sid = parent->sid;         // Inherit session from parent
     child->tgid = child->pid;         // Fork creates a new thread group
+    child->coreLimits={};
+    (void)SchedulerCoreResourceLimit(parent,0,nullptr,child->coreLimits,false);
     child->threadLeader = child;
     child->isThread = false;
     child->clearChildTid = 0;

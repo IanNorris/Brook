@@ -933,6 +933,14 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector,
     }
 
     bool fromUser = (ef->cs & 3) != 0;
+    const auto captureFatalRegisters=[&]{
+        if(!fromUser)return;
+        if(auto* task=brook::ProcessCurrent())brook::CoreDumpPublishRegisters(task,{
+            ef->r15,ef->r14,ef->r13,ef->r12,ef->rbp,ef->rbx,ef->r11,ef->r10,ef->r9,ef->r8,
+            ef->rax,ef->rcx,ef->rdx,ef->rsi,ef->rdi,~uint64_t{0},ef->rip,ef->cs,ef->rflags,
+            ef->rsp,ef->ss,task->fsBase,task->savedCtx.gsBase,0,0,0,0
+        });
+    };
 
     // Only the two explicit user-copy instructions can recover here. No locks,
     // lazy faults or scheduling: return through that stub's residual-count RET,
@@ -1699,6 +1707,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector,
     {
         if(!brook::UserReturnAddress(sa.handler)) {
             SerialPrintf("SIGNAL: invalid fault handler pid %u address=%lx\n",proc->pid,sa.handler);
+            captureFatalRegisters();
             __asm__ volatile("sti":::"memory");
             brook::SchedulerKillThreadGroup(proc->tgid,proc,128+11,11);
             brook::SchedulerExitCurrentProcess(128+11,11);
@@ -1758,6 +1767,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector,
                                     useAlt,sizeof(brook::SignalFrame)+brook::SIGNAL_FP_EXTRA,&userRsp,
                                     previousStackFlags==1)) {
             SerialPrintf("SIGNAL: invalid fault-frame location pid %u signal %u\n",proc->pid,signum);
+            captureFatalRegisters();
             __asm__ volatile("sti":::"memory");
             brook::SchedulerKillThreadGroup(proc->tgid,proc,128+11,11);
             brook::SchedulerExitCurrentProcess(128+11,11);
@@ -1821,6 +1831,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector,
         if(brook::SchedulerKernelOperationBoundary()) {brook::SchedulerYield();__builtin_trap();}
         if(!copied) {
             SerialPrintf("SIGNAL: inaccessible fault frame pid %u signal %u rsp=%lx\n",proc->pid,signum,userRsp);
+            captureFatalRegisters();
             __asm__ volatile("sti":::"memory");
             brook::SchedulerKillThreadGroup(proc->tgid,proc,128+11,11);
             brook::SchedulerExitCurrentProcess(128+11,11);
@@ -2057,6 +2068,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector,
     ifrm.flags = ef->rflags;
     ifrm.sp    = ef->rsp;
     ifrm.ss    = ef->ss;
+    captureFatalRegisters();
     HandleException(static_cast<uint8_t>(vector), &ifrm, ef->errorCode, true, true /*swapgsDone*/, &cr2,mappingSignal);
     // HandleException never returns for user-mode faults (it exits the process).
     for (;;) __asm__ volatile("cli; pause");
