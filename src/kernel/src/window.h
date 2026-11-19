@@ -113,6 +113,11 @@ bool WmSetAppearance(uint32_t value);
 uint32_t WmGetTaskbarMetrics();
 bool WmSetTaskbarMetrics(uint32_t value);
 void WmSetPerformanceMode(bool enabled);
+// Stage 1.5: the compositor reports the active backend's backdrop-blur
+// capability at each frame boundary; the theme resolves against it.
+void WmSetBackendBlur(bool blur);
+bool WmBackendBlur();
+uint32_t WmResolvedAppearance();
 void WmObserveDesktopTick(uint64_t now);
 // Latest taskbar sample (CPU, memory, disk and network rates), for diagnostics.
 struct DesktopTelemetry;

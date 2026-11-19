@@ -7079,6 +7079,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         BridgeReply r;r.text("{\"requested\":");r.text(CompositorGlassRequested()?"true":"false");
         r.text(",\"active\":");r.text(CompositorGlassActive()?"true":"false");
         r.text(",\"gpu_composition\":");r.text(CompositorGpuActive()?"true":"false");
+        r.text(",\"backend_blur\":");r.text(CompositorBackendBlurActive()?"true":"false");
         r.text(",");r.field("appearance",WmGetAppearance());
         r.text(",");r.field("effective_opacity",CompositorGlassActive()?CompositorMaterialOpacity():255);
         r.text(",");r.field("effective_blur_strength",CompositorGlassActive()?CompositorMaterialBlur():0);

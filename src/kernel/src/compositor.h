@@ -29,8 +29,15 @@ void CompositorBootAssetsPending(bool pending);
 uint64_t CompositorDesktopReadyTick();
 uint64_t CompositorBootDurationMs();
 bool CompositorGpuActive();
+// The resolved theme is Glass (latched at the frame boundary): the Glass
+// theme is selected and the active backend can blur its backdrop.
 bool CompositorGlassActive();
 bool CompositorGlassRequested();
+// Layers op 18: record the calling renderer's BROOK_DESKTOP_CAP_* bits
+// (owner: the present-lease owner identity). Returns the bits recorded.
+uint32_t CompositorSetRendererCapabilities(uint64_t owner,uint32_t caps);
+// The active backend can blur (latched at the last frame boundary).
+bool CompositorBackendBlurActive();
 uint32_t CompositorMaterialOpacity();
 uint32_t CompositorMaterialBlur();
 // Opacity of material shell surfaces (taskbar, launcher, popups) under glass.

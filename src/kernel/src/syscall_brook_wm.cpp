@@ -228,6 +228,11 @@ int64_t sys_brook_wm_theme(uint64_t op, uint64_t theme,
 {
     if (!ProcessCurrent()) return -ESRCH;
     if (op == 0) return brook::WmGetTheme();
+    // Stage 1.5: whether Glass can be chosen (the active backend can blur its
+    // backdrop) and whether it is in use; Settings greys the Glass card.
+    if (op == BROOK_THEME_OP_STATUS)
+        return (brook::WmBackendBlur() ? BROOK_THEME_STATUS_GLASS_AVAILABLE : 0u) |
+               (brook::CompositorGlassActive() ? BROOK_THEME_STATUS_GLASS_ACTIVE : 0u);
     if (op != 1 || theme > 0xffffffffULL) return -EINVAL;
     return brook::WmSetTheme(static_cast<uint32_t>(theme)) ? 0 : -EINVAL;
 }
