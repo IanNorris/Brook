@@ -63,17 +63,22 @@ void WmLauncherGetRect(uint32_t screenW, uint32_t screenH,
 static void WmCaptureLauncher(uint32_t screenW, uint32_t screenH, int32_t mouseX, int32_t mouseY,
                               ChromeShellModel& snapshot)
 {
-    if (!g_launcherOpen) return;
+    if (!g_launcherLoaded) return;
+    // A closed launcher can prepare exactly the default page it will show
+    // on open. Hover, scroll, errors and confirmations only belong to the
+    // open session.
+    const int error = g_launcherOpen ? g_launcherError : 0;
     LauncherReadGuard guard;
     const auto& launcher = guard.get();
 
     snapshot.kind = ChromeShellKind::Launcher;
     snapshot.launcher = GetLauncherLayout(screenW, screenH, launcher);
+    const uint32_t scroll = g_launcherOpen ? g_launcherScroll : 0;
     snapshot.shutdownActive = LauncherShutdownActive();
-    snapshot.prompt = g_launcherPower.prompt();
-    snapshot.promptRestart = g_launcherPower.pending() == LauncherPowerAction::Restart;
-    snapshot.confirmFocused = g_launcherPower.confirmFocused();
-    const char* header = g_launcherError == -2 ? "App launch already pending" : g_launcherError ? "Launch queue full" :
+    snapshot.prompt = g_launcherOpen && g_launcherPower.prompt();
+    snapshot.promptRestart = g_launcherOpen && g_launcherPower.pending() == LauncherPowerAction::Restart;
+    snapshot.confirmFocused = g_launcherOpen && g_launcherPower.confirmFocused();
+    const char* header = error == -2 ? "App launch already pending" : error ? "Launch queue full" :
         snapshot.prompt && !snapshot.shutdownActive ?
             (snapshot.promptRestart ? "Restart? Open apps will be asked to close" :
                                       "Shut down? Open apps will be asked to close") :
@@ -84,7 +89,7 @@ static void WmCaptureLauncher(uint32_t screenW, uint32_t screenH, int32_t mouseX
     for (uint32_t i = 0; i < launcher.count; ++i) {
         const auto& item = launcher.items[i];
         if (!item.valid) continue;
-        if (totalValid >= g_launcherScroll && snapshot.launcherCount < snapshot.launcher.capacity &&
+        if (totalValid >= scroll && snapshot.launcherCount < snapshot.launcher.capacity &&
             snapshot.launcherCount < ChromeShellModel::LauncherLimit) {
             const uint32_t slot = snapshot.launcherCount++;
             WmStrCopy(snapshot.entries[slot].label, item.title, sizeof(snapshot.entries[slot].label));
@@ -92,11 +97,11 @@ static void WmCaptureLauncher(uint32_t screenW, uint32_t screenH, int32_t mouseX
         }
         ++totalValid;
     }
-    snapshot.scrollUp = g_launcherScroll > 0;
-    snapshot.scrollDown = g_launcherScroll + snapshot.launcher.capacity < totalValid;
+    snapshot.scrollUp = scroll > 0;
+    snapshot.scrollDown = scroll + snapshot.launcher.capacity < totalValid;
     const auto& layout = snapshot.launcher;
     const DesktopRect bounds{layout.x, layout.y, int(layout.w), int(layout.h)};
-    const bool hovered = bounds.contains(mouseX, mouseY);
+    const bool hovered = g_launcherOpen && bounds.contains(mouseX, mouseY);
     snapshot.mouseX = hovered ? mouseX : -1;
     snapshot.mouseY = hovered ? mouseY : -1;
 }

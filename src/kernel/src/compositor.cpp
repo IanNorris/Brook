@@ -1937,6 +1937,10 @@ static ShellFrame CaptureShellFrame(uint32_t width, uint32_t height, uint64_t no
         frame.records[j] = record;
         frame.slots[j] = {uint32_t(surface.kind), {surface.x, surface.y, surface.w, surface.h}, record.key};
     }
+    if ((kindMask & (1u << uint32_t(WmShellSurfaceKind::Taskbar))) &&
+        !(kindMask & (1u << uint32_t(WmShellSurfaceKind::Launcher))) &&
+        ShellServiceWarmLauncher(width, height, now))
+        kindMask |= 1u << uint32_t(WmShellSurfaceKind::Launcher);
     ShellServiceEndCapture(kindMask);
     return frame;
 }

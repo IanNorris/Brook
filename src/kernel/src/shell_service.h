@@ -7,6 +7,7 @@ struct WmShellSurface;
 void ShellServiceBeginFrame(uint64_t now);
 uint64_t ShellServiceCapture(const WmShellSurface&, uint32_t width, uint32_t height,
                              uint64_t now, int32_t mx, int32_t my);
+bool ShellServiceWarmLauncher(uint32_t width, uint32_t height, uint64_t now);
 void ShellServiceEndCapture(uint32_t kindMask);
 void ShellServiceDraw(const WmShellSurface&, uint32_t* pixels, uint32_t stride,
                       uint32_t width, uint32_t height);

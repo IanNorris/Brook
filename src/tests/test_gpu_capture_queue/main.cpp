@@ -97,6 +97,7 @@ void ShellServiceBeginFrame(uint64_t) {
     publishedKeyBump = shellKeyBump;
     publishedShellRunning = shellRunning;
 }
+bool ShellServiceWarmLauncher(uint32_t, uint32_t, uint64_t) { return false; }
 void ShellServiceEndCapture(uint32_t) {}
 uint64_t ShellServiceCapture(const WmShellSurface& s,uint32_t,uint32_t,uint64_t,int32_t,int32_t) {
     if (!publishedShellRunning) return 0;

@@ -27,7 +27,7 @@ struct Geometry {
 
 struct Submission {
     Geometry geometry;
-    uint64_t key;
+    uint64_t key, sequence;
     uint32_t count, textBytes;
     ChromeCmd* cmds;
     char* text;
@@ -39,6 +39,8 @@ struct Slot {
     ChromeShellConfig style;
     Geometry requestedGeometry, offeredGeometry;
     uint64_t requested, offered, lastSample, lastInput;
+    uint64_t visibleFrom;
+    bool visible;
     int32_t lastMouseX, lastMouseY;
     uint32_t offeredScale;
     Submission* staged;
@@ -184,7 +186,7 @@ int64_t Present(Process& proc, uint64_t exchange, uint64_t address)
     if (!error) {
         ChromeDisplayList list(commands, count, text, textBytes, count, textBytes);
         const uint64_t key = ChromeListKey(list, geometry.style ^ (uint64_t(offer.kind) << 32));
-        *result = {geometry, key, count, textBytes, commands, text, scale};
+        *result = {geometry, key, offer.sequence, count, textBytes, commands, text, scale};
         Lock lock;
         auto& slot = g_slots[offer.kind];
         if (!SameOwner(proc) || slot.offered != offer.sequence ||
@@ -226,6 +228,7 @@ void ShellServiceBeginFrame(uint64_t now)
                     retired[count++] = slot.staged;
                     slot.active = slot.staged = nullptr;
                     slot.requested = slot.offered = 0;
+                    slot.visible = false;
                 }
             }
         }
@@ -240,8 +243,8 @@ void ShellServiceBeginFrame(uint64_t now)
     for (unsigned i = 0; i < count; ++i) kfree(retired[i]);
 }
 
-uint64_t ShellServiceCapture(const WmShellSurface& surface, uint32_t width, uint32_t height,
-                             uint64_t now, int32_t mx, int32_t my)
+static uint64_t CaptureModel(const WmShellSurface& surface, uint32_t width, uint32_t height,
+                             uint64_t now, int32_t mx, int32_t my, bool visible)
 {
     if (!__atomic_load_n(&g_registered, __ATOMIC_ACQUIRE)) return 0;
     auto& slot = g_slots[unsigned(surface.kind)];
@@ -254,7 +257,7 @@ uint64_t ShellServiceCapture(const WmShellSurface& surface, uint32_t width, uint
     const auto input = InputLatestSequence();
     // Keep input-driven changes immediate. Sample clock and telemetry at the
     // existing overlay recheck cadence while the pointer and input are idle.
-    if (changedGeometry || input != slot.lastInput || mx != slot.lastMouseX || my != slot.lastMouseY ||
+    if (changedGeometry || slot.visible != visible || input != slot.lastInput || mx != slot.lastMouseX || my != slot.lastMouseY ||
         now < slot.lastSample || now - slot.lastSample >= 100) {
         if (WmCaptureShellModel(surface, width, height, now, mx, my, g_capture) &&
             (changedGeometry || memcmp(&slot.model, &g_capture, sizeof(g_capture)))) {
@@ -270,8 +273,33 @@ uint64_t ShellServiceCapture(const WmShellSurface& surface, uint32_t width, uint
         slot.lastMouseX = mx;
         slot.lastMouseY = my;
     }
-    return slot.active && SameGeometry(slot.active->geometry, geometry) &&
+    // Use the hidden launcher list immediately when opening captured the
+    // same model. If opening changed its model, wait for that publication
+    // so a previous session's scroll, hover or confirmation cannot flash.
+    if (visible && !slot.visible) slot.visibleFrom = slot.requested;
+    slot.visible = visible;
+    return visible && slot.active && SameGeometry(slot.active->geometry, geometry) &&
+           slot.active->sequence >= slot.visibleFrom &&
            slot.active->scale == config.metrics.percent ? slot.active->key : 0;
+}
+
+uint64_t ShellServiceCapture(const WmShellSurface& surface, uint32_t width, uint32_t height,
+                             uint64_t now, int32_t mx, int32_t my)
+{
+    return CaptureModel(surface, width, height, now, mx, my, true);
+}
+
+bool ShellServiceWarmLauncher(uint32_t width, uint32_t height, uint64_t now)
+{
+    if (!__atomic_load_n(&g_registered, __ATOMIC_ACQUIRE)) return false;
+    const auto& launcher = g_slots[unsigned(WmShellSurfaceKind::Launcher)];
+    if (launcher.requested && !launcher.visible && now >= launcher.lastSample &&
+        now - launcher.lastSample < 100 && launcher.requestedGeometry.width == width &&
+        launcher.requestedGeometry.height == height) return true;
+    WmShellSurface surface{WmShellSurfaceKind::Launcher, 0, 0, 0, 0, true};
+    WmLauncherGetRect(width, height, &surface.x, &surface.y, &surface.w, &surface.h);
+    (void)CaptureModel(surface, width, height, now, -1, -1, false);
+    return true;
 }
 
 void ShellServiceEndCapture(uint32_t kindMask)
@@ -288,6 +316,7 @@ void ShellServiceEndCapture(uint32_t kindMask)
             staged = slot.staged;
             slot.active = slot.staged = nullptr;
             slot.requested = slot.offered = 0;
+            slot.visible = false;
         }
         kfree(active);
         kfree(staged);
