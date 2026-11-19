@@ -50,7 +50,7 @@ struct ChromeTaskbarLayout {
     DesktopRect buttons[ChromeTaskbarButtonLimit];
     int indices[ChromeTaskbarButtonLimit];
     int count, nextIndex;
-    char clockText[32], clockDate[24], buildText[112];
+    char clockText[32], clockDate[24], buildText[32];
 };
 
 // ids: the taskbar entries in order (WM window indices, or -10 - launch
@@ -114,6 +114,7 @@ void ChromeBuildVolumePopup(const ChromeVolumePopupModel& model, const ChromeSty
 struct ChromeTooltipModel {
     DesktopRect box;
     const char* text;
+    const char* detail = nullptr;
 };
 // The tooltip's padded box for its text.
 inline int ChromeTooltipPadding(const ChromeStyle& s) { return static_cast<int>(s.M(8)); }

@@ -24,17 +24,10 @@ static TaskbarLayout GetTaskbarLayout(uint32_t screenW, uint32_t screenH)
 {
     char clockText[32];
     RtcFormatTaskbar(clockText, RtcNow(), false);
-    char buildText[112]{};
+    char buildText[48]{};
     if (g_buildChip) {
         WmStrCopy(buildText, "Brook ", sizeof(buildText));
         WmStrCopy(buildText + 6, BuildGitHash(), sizeof(buildText) - 6);
-        if (g_buildPayloadId[0]) {
-            const size_t length = strlen(buildText);
-            if (length + 1 < sizeof(buildText)) {
-                buildText[length] = ' ';
-                WmStrCopy(buildText + length + 1, g_buildPayloadId, sizeof(buildText) - length - 1);
-            }
-        }
     }
     int ids[WM_MAX_WINDOWS + LaunchFeedbackTable::Capacity], total = 0, focused = 0;
     for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
@@ -368,7 +361,7 @@ static DesktopRect WmPerformanceHudLayout(uint32_t sw, uint32_t sh)
     const int h = WmDesktopFont().lineHeight * 7 + WmMetric(112);
     const int w = WmMetric(348);
     if (int(sw) < w + 2 * margin || deskH < h + 2 * margin) return {};
-    return {margin, deskH - h - margin, w, h};
+    return {int(sw) - w - margin, deskH - h - margin, w, h};
 }
 
 static bool WmPanelRect(DesktopRect r, int32_t* x, int32_t* y, uint32_t* w, uint32_t* h)
@@ -527,7 +520,7 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
 // Tooltips float above the taskbar, centred on the hovered control. The
 // launcher, volume popup and tray flyout take precedence.
 static bool WmTrayTooltip(uint32_t screenW, uint32_t screenH, int32_t mx, int32_t my,
-                          char (&text)[48], DesktopRect& box)
+                          char (&text)[48], const char*& detail, DesktopRect& box)
 {
     if (!g_wmActive || g_launcherOpen || g_volumePopupOpen || WmTrayFlyoutVisible() || WmTaskbarHidden()) return false;
     const TaskbarLayout l = GetTaskbarLayout(screenW, screenH);
@@ -557,8 +550,8 @@ static bool WmTrayTooltip(uint32_t screenW, uint32_t screenH, int32_t mx, int32_
         } else WmStrCopy(text, "Network: disconnected", sizeof(text));
     }
     if (!anchor) {
-        const WmRect* controls[] = {&l.apps, &l.terminal, &l.next, &l.build};
-        const char* labels[] = {"Applications", "New terminal", "More windows", l.buildText};
+        const WmRect* controls[] = {&l.apps, &l.terminal, &l.next};
+        const char* labels[] = {"Applications", "New terminal", "More windows"};
         for (unsigned i = 0; i < sizeof(controls) / sizeof(*controls); ++i) {
             if (!controls[i]->contains(mx, my)) continue;
             anchor = controls[i];
@@ -585,11 +578,22 @@ static bool WmTrayTooltip(uint32_t screenW, uint32_t screenH, int32_t mx, int32_
             break;
         }
     }
+    if (!anchor && l.build.contains(mx, my)) {
+        anchor = &l.build;
+        WmStrCopy(text, "Brook ", sizeof(text));
+        WmStrCopy(text + 6, BuildGitHash(), sizeof(text) - 6);
+        if (g_buildPayloadId[0]) detail = g_buildPayloadId;
+    }
     if (!anchor) return false;
     const int pad = ChromeTooltipPadding(WmChromeStyle());
-    box = TaskbarTooltipBox(*anchor, WmTextWidth(text) + 2 * pad,
-                            WmDesktopFont().lineHeight + static_cast<int>(WmMetric(10)), l.y,
-                            static_cast<int>(WmMetric(4)), static_cast<int>(screenW), static_cast<int>(WmMetric(4)));
+    const int margin = WmMetric(4);
+    const int textWidth = WmTextWidth(text);
+    const int detailWidth = detail ? WmTextWidth(detail) : 0;
+    int width = (textWidth > detailWidth ? textWidth : detailWidth) + 2 * pad;
+    if (width > int(screenW) - 2 * margin) width = int(screenW) - 2 * margin;
+    box = TaskbarTooltipBox(*anchor, width,
+                            WmDesktopFont().lineHeight * (detail ? 2 : 1) + static_cast<int>(WmMetric(10)), l.y,
+                            margin, static_cast<int>(screenW), margin);
     return box.w > 0 && box.h > 0;
 }
 
@@ -597,8 +601,9 @@ bool WmTrayTooltipGetRect(uint32_t screenW, uint32_t screenH, int32_t mx, int32_
                           int32_t* outX, int32_t* outY, uint32_t* outW, uint32_t* outH)
 {
     char text[48]{};
+    const char* detail = nullptr;
     DesktopRect box{};
-    if (!WmTrayTooltip(screenW, screenH, mx, my, text, box)) return false;
+    if (!WmTrayTooltip(screenW, screenH, mx, my, text, detail, box)) return false;
     *outX = box.x; *outY = box.y; *outW = static_cast<uint32_t>(box.w); *outH = static_cast<uint32_t>(box.h);
     return true;
 }
@@ -607,10 +612,11 @@ static void WmTrayTooltipSurface(uint32_t* pixels, uint32_t stride, uint32_t scr
                                  int32_t mx, int32_t my, uint64_t keySeed, uint64_t* key)
 {
     char text[48]{};
+    const char* detail = nullptr;
     DesktopRect p{};
-    if ((!pixels && !key) || !WmTrayTooltip(screenW, screenH, mx, my, text, p)) return;
+    if ((!pixels && !key) || !WmTrayTooltip(screenW, screenH, mx, my, text, detail, p)) return;
     ChromeDisplayList list = ChromeListOn(g_shellListStorage);
-    ChromeBuildTooltip({p, text}, WmChromeStyle(), list);
+    ChromeBuildTooltip({p, text, detail}, WmChromeStyle(), list);
     if (key) *key = ChromeListKey(list, keySeed);
     else ChromeExecute(list, {pixels, stride, screenW, screenH}, WmDesktopFont());
 }

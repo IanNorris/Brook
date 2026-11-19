@@ -52,27 +52,49 @@ ChromeTaskbarLayout ChromeTaskbarLayoutFor(const ChromeStyle& s, uint32_t screen
         l.clockText[i] = 0;
         break;
     }
-    CopyText(l.buildText, buildText, sizeof(l.buildText));
     int right = sw - s.M(8);
     // Reserve measured widgets from right to left. Keep one useful window
     // button on small displays; diagnostics yield before the clock does.
-    auto reserve = [&](DesktopRect& r, int width) {
+    auto reserve = [&](DesktopRect& r, int width, bool gap = true) {
         if (right - width - static_cast<int>(s.M(12)) < x + static_cast<int>(s.M(80))) return;
         right -= width;
         r = {right, by, width, bh};
-        right -= s.M(12);
+        if (gap) right -= s.M(12);
     };
     if (l.clockText[0]) reserve(l.clock, s.M(76));
-    if (enabledMetrics & (1u << 6)) reserve(l.metrics[6], s.M(42));
-    reserve(l.network, s.M(16));
-    reserve(l.volume, s.M(16));
+    const int trayTarget = s.M(44);
+    if (enabledMetrics & (1u << 6)) reserve(l.metrics[6], trayTarget, false);
+    reserve(l.network, trayTarget, false);
+    reserve(l.volume, trayTarget);
     // Leftmost fixed icon, so its appearance never moves the volume target.
     if (agent) reserve(l.agent, s.M(16));
-    if (l.buildText[0]) {
-        unsigned length = 0;
-        while (l.buildText[length]) ++length;
-        const int width = length * s.TextWidth("0") + s.M(12);
-        reserve(l.build, width < static_cast<int>(s.M(188)) ? width : s.M(188));
+    if (buildText && *buildText) {
+        // Choose the complete build ID before adding the product name. A
+        // dirty build can fall back to its complete base hash on tight trays.
+        const char prefix[] = "Brook ";
+        unsigned name = 0;
+        while (prefix[name] && buildText[name] == prefix[name]) ++name;
+        if (prefix[name]) name = 0;
+        const char* id = buildText + name;
+        unsigned length = 0, base = 0;
+        while (id[length] && (!name || id[length] != ' ')) {
+            if (id[length] == '+' && !base) base = length;
+            ++length;
+        }
+        auto reserveBuild = [&](unsigned start, unsigned count) {
+            const int cell = s.TextWidth("0");
+            if (!count || count >= sizeof(l.buildText) || cell <= 0) return false;
+            const int width = count * cell + s.M(12);
+            if (width > static_cast<int>(s.M(188))) return false;
+            reserve(l.build, width);
+            if (!l.build.w) return false;
+            for (unsigned i = 0; i < count; ++i) l.buildText[i] = buildText[start + i];
+            l.buildText[count] = 0;
+            return true;
+        };
+        if (!reserveBuild(0, name + length) && !reserveBuild(name, length) && base) {
+            if (!reserveBuild(0, name + base)) reserveBuild(name, base);
+        }
     }
     if (compactHud) reserve(l.hud, s.M(164));
     const int widths[] = {64, 64, 112, 112, 240, 240};
@@ -125,11 +147,12 @@ static void NetworkIndicator(ChromeDisplayList& dl, const ChromeStyle& s, const 
     const uint32_t fg = s.P().secondaryText;
     const uint32_t bar = connected ? fg : ChromeBlendColor(fg, s.P().taskbar, 90);
     const int size = static_cast<int>(s.M(16));
-    const int barW = static_cast<int>(s.M(3)), gap = static_cast<int>(s.M(1));
-    const int x0 = r.x, top = r.y + (r.h - size) / 2, bottom = top + size;
+    const int x0 = r.x + (r.w - size) / 2, top = r.y + (r.h - size) / 2, bottom = top + size;
     for (int i = 0; i < 4; ++i) {
         const int h = size * (i + 1) / 4;
-        dl.Fill(x0 + i * (barW + gap), bottom - h, barW, h, bar);
+        const int x = i * 4 * size / 16;
+        const int w = (i * 4 + 3) * size / 16 - x;
+        dl.Fill(x0 + x, bottom - h, w, h, bar);
     }
     if (connected) return;
     const int span = size * 5 / 8, t = static_cast<int>(s.M(2));
@@ -389,10 +412,7 @@ void ChromeBuildTaskbar(const ChromeTaskbarModel& m, const ChromeStyle& s, Chrom
     }
     const auto trayHover = [&](const DesktopRect& r) {
         if (r.contains(mouseX, mouseY)) {
-            const int pad = s.M(4);
-            const auto inset = pill(r);
-            dl.MaterialRect({inset.x - pad, inset.y, inset.w + 2 * pad, inset.h},
-                            s.MaterialColor(p.taskHover), s.M(6));
+            dl.MaterialRect(pill(r), s.MaterialColor(p.taskHover), s.M(6));
         }
     };
     trayHover(l.network);
@@ -406,14 +426,17 @@ void ChromeBuildTaskbar(const ChromeTaskbarModel& m, const ChromeStyle& s, Chrom
         while (value[len]) ++len;
         value[len++] = 'C';
         value[len] = 0;
-        dl.Text(l.metrics[6].x, l.textY, value, ThermalColour(t.latest.pkgC, t.tjmax), l.metrics[6].w);
+        const auto& r = l.metrics[6];
+        dl.Text(r.x + (r.w - s.TextWidth(value)) / 2, l.textY, value, ThermalColour(t.latest.pkgC, t.tjmax), r.w);
     } else if (l.metrics[6].w > 0) {
-        dl.Text(l.metrics[6].x, l.textY, "n/a", p.mutedText, l.metrics[6].w);
+        const auto& r = l.metrics[6];
+        dl.Text(r.x + (r.w - s.TextWidth("n/a")) / 2, l.textY, "n/a", p.mutedText, r.w);
     }
     NetworkIndicator(dl, s, l.network, m.networkConnected);
     if (l.volume.w > 0) {
         const int size = static_cast<int>(s.M(16));
-        ChromeBuildVolumeGlyph(dl, s, l.volume.x, l.volume.y + (l.volume.h - size) / 2, size,
+        ChromeBuildVolumeGlyph(dl, s, l.volume.x + (l.volume.w - size) / 2,
+                               l.volume.y + (l.volume.h - size) / 2, size,
                                m.volumeControl, m.volumeAvailable, p.taskbar);
     }
     AgentIndicator(dl, s, l.agent, m.agentShown, m.agentStale);
@@ -441,6 +464,8 @@ void ChromeBuildVolumePopup(const ChromeVolumePopupModel& m, const ChromeStyle& 
     const DesktopRect& p = l.panel;
     if (p.w <= 2 || p.h <= 2) return;
     PanelFrame(dl, s, p);
+    ChromeMaterialString(dl, s, l.title.x, l.title.y + (l.title.h - s.Font().lineHeight) / 2,
+                         "Volume", pal.text, l.title.w);
     const bool muted = (m.control & BROOK_AUDIO_MUTED) != 0;
     const uint32_t buttonBg = l.mute.contains(m.mouseX, m.mouseY) ? pal.taskHover : pal.taskButton;
     ChromeMaterialRect(dl, s, l.mute, buttonBg);
@@ -453,9 +478,9 @@ void ChromeBuildVolumePopup(const ChromeVolumePopupModel& m, const ChromeStyle& 
     const uint32_t fill = muted || !m.available ? ChromeBlendColor(pal.secondaryText, pal.launcher, 110) : pal.accent;
     dl.Fill(l.track.x, barY, l.track.w, barH, pal.launcherBorder);
     dl.Fill(l.track.x, barY, knobX - l.track.x + 1, barH, fill);
-    const int knob = static_cast<int>(s.M(12));
-    ChromeMaterialRect(dl, s, {knobX - knob / 2, l.track.y + (l.track.h - knob) / 2, knob, knob},
-                       m.dragging ? pal.accent : pal.text);
+    const int knob = l.thumbSize;
+    dl.MaterialRect({knobX - knob / 2, l.track.y + (l.track.h - knob) / 2, knob, knob},
+                    s.MaterialColor(m.dragging ? pal.accent : pal.text), knob / 2);
     char value[8]{};
     char* out = value;
     DesktopNumber(out, level);
@@ -472,7 +497,13 @@ void ChromeBuildTooltip(const ChromeTooltipModel& m, const ChromeStyle& s, Chrom
     if (p.w <= 0 || p.h <= 0 || !m.text) return;
     PanelFrame(dl, s, p);
     const int pad = ChromeTooltipPadding(s);
-    ChromeMaterialString(dl, s, p.x + pad, p.y + (p.h - s.Font().lineHeight) / 2, m.text, s.P().text, p.w - pad);
+    const int line = s.Font().lineHeight;
+    const int y = p.y + (p.h - line * (m.detail ? 2 : 1)) / 2;
+    const int width = p.w - 2 * pad;
+    if (width <= 0) return;
+    ChromeMaterialString(dl, s, p.x + pad, y, m.text, s.P().text, width);
+    if (m.detail)
+        ChromeMaterialString(dl, s, p.x + pad, y + line, m.detail, s.P().secondaryText, width);
 }
 
 // ---------------------------------------------------------------------------

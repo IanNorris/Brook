@@ -595,7 +595,9 @@ int main() {
         CHECK(GetTaskbarLayout(sw, sh).hud.w > 0);
         WmCyclePerformanceHud();
         n = kinds(s);
-        CHECK(s[n - 1].kind == WmShellSurfaceKind::PerformanceHud);
+        const auto& hud = s[n - 1];
+        CHECK(hud.kind == WmShellSurfaceKind::PerformanceHud);
+        CHECK(hud.x + hud.w + WmMetric(8) == sw && hud.y + hud.h + WmMetric(8) == WmDesktopHeight(sh));
         WmCyclePerformanceHud();
         CHECK(GetTaskbarLayout(sw, sh).hud.w == 0);
     }
