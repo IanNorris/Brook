@@ -8,6 +8,8 @@
 #include "../../shared/brook_taskbar.h"
 #include "../../shared/wm_window_state.h"
 
+struct BrookDesktopSurface;
+
 namespace brook {
 
 struct Process;
@@ -87,10 +89,14 @@ bool WmCopyDesktopLayers(const WmDesktopLayers& layers,const WmDesktopLayerCopy*
 void WmReleaseDesktopLayers(WmDesktopLayers* layers);
 // Offscreen opaque-chrome prototype, one independent surface per window.
 // It excludes glass effects and does not yet version theme, title or hover.
-struct WmDesktopChrome {int32_t x,y;uint32_t width,height;uint64_t key;}; // key: WmChromeKey of the rendered pixels
+// key: WmChromeKey of the rendered pixels. interior: the transparent client
+// rectangle relative to the surface (frames; empty for a caption block).
+struct WmDesktopChrome {int32_t x,y;uint32_t width,height;uint64_t key;uint32_t interiorX,interiorY,interiorW,interiorH;};
+// spansOnly: clear and render only the frame strips (outer minus interior);
+// interior pixels of the buffer are left as they were.
 int64_t WmDesktopChromeCapture(const WmDesktopLayers& layers,uint32_t index,
                                WmDesktopChrome* info,uint32_t* pixels,uint64_t capacity,
-                               int32_t mouseX,int32_t mouseY,bool tolerateVisualChanges=false);
+                               int32_t mouseX,int32_t mouseY,bool tolerateVisualChanges=false,bool spansOnly=false);
 static constexpr uint32_t WM_TASKBAR_HEIGHT   = DesktopMetrics::TaskbarBase; // bottom taskbar height
 
 // Chrome layout constants
@@ -113,6 +119,11 @@ struct DesktopTelemetry;
 DesktopTelemetry WmDesktopTelemetryRead();
 // The renderer composited a GPU-source frame for window identity/commit.
 void WmNoteClientFrame(uint64_t identity,uint64_t commit);
+// Surface records (layers ABI v2, chrome_surface.h): one per visible window
+// with chrome, back to front, resolved against the active backend.
+struct ChromeSurfaceEffects;
+ChromeSurfaceEffects WmChromeSurfaceEffects();
+uint32_t WmDesktopSurfaceRecords(BrookDesktopSurface* out,uint32_t max);
 using WmRect = DesktopRect;
 void WmDrawBuildId(uint32_t*,uint32_t,uint32_t,uint32_t,const WmRect* clip=nullptr);
 void WmDrawBuildIdSpan(uint32_t*,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);

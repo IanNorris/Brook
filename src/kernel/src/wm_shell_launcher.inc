@@ -60,13 +60,13 @@ void WmLauncherGetRect(uint32_t screenW, uint32_t screenH,
     LauncherGetRect(screenW, screenH, outX, outY, outW, outH, guard.get());
 }
 
-void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
-                      uint32_t screenW, uint32_t screenH,
-                      int32_t mouseX, int32_t mouseY)
+static void WmLauncherSurface(uint32_t* backBuffer, uint32_t stride,
+                              uint32_t screenW, uint32_t screenH,
+                              int32_t mouseX, int32_t mouseY, uint64_t keySeed, uint64_t* key)
 {
     LauncherReadGuard guard;
     const auto& launcher = guard.get();
-    if (!g_launcherOpen) return;
+    if (!g_launcherOpen || (!backBuffer && !key)) return;
 
     // Compositor thread only: the shell surfaces share one list storage.
     static ChromeLauncherItem items[ChromeShellMetrics::LauncherMaxRows * ChromeShellMetrics::LauncherMaxCols];
@@ -100,7 +100,14 @@ void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
     model.mouseX = mouseX; model.mouseY = mouseY;
     ChromeDisplayList list = ChromeListOn(g_shellListStorage);
     ChromeBuildLauncher(model, style, list);
-    ChromeExecute(list, {backBuffer, stride, screenW, screenH}, WmDesktopFont());
+    if (key) *key = ChromeListKey(list, keySeed);
+    else ChromeExecute(list, {backBuffer, stride, screenW, screenH}, WmDesktopFont());
+}
+void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
+                      uint32_t screenW, uint32_t screenH,
+                      int32_t mouseX, int32_t mouseY)
+{
+    WmLauncherSurface(backBuffer, stride, screenW, screenH, mouseX, mouseY, 0, nullptr);
 }
 
 int WmLauncherHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)

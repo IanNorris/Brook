@@ -722,6 +722,7 @@ target_compile_options(test_cursor_composition PRIVATE "-iquote${BROOK_ROOT}/src
 
 add_host_test(test_desktop_metrics)
 add_host_test(test_desktop_overlay_regions)
+add_host_test(test_desktop_overlay_surfaces)
 add_host_test(test_global_shortcuts)
 target_compile_options(test_global_shortcuts PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 
@@ -738,6 +739,8 @@ add_host_test(test_taskbar_volume)
 add_host_test(test_chrome_alpha)
 add_host_test(test_chrome_layout)
 target_compile_options(test_chrome_layout PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
+add_host_test(test_chrome_surface)
+target_compile_options(test_chrome_surface PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 
 # Chrome golden images: the freestanding display list builders and executor,
 # with the desktop fonts baked exactly as the kernel bakes them.

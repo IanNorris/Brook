@@ -17,6 +17,8 @@ pkgs.stdenv.mkDerivation {
     cp ${../../scripts/workloads/desktop_pair_pixel_probe.c} desktop_pair_pixel_probe.c
     cp ${../../src/shared/wm_window_state.h} wm_window_state.h
     cp ${../../src/shared/brook_debug_frame.h} brook_debug_frame.h
+    cp ${../../src/shared/brook_theme.h} brook_theme.h
+    cp ${../../src/shared/brook_chrome_shadow.h} brook_chrome_shadow.h
     glslangValidator -V --target-env vulkan1.1 composite.comp -o composite.spv
     glslangValidator -V --target-env vulkan1.1 -DBROOK_EXTERNAL_SOURCE=1 composite.comp -o composite_external.spv
     glslangValidator -V --target-env vulkan1.1 -DBROOK_MULTI_SOURCE=1 composite.comp -o composite_multi.spv
@@ -145,6 +147,8 @@ pkgs.stdenv.mkDerivation {
     ./brook-desktop-client-cache-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_chrome_spans_test.c -o brook-desktop-chrome-spans-test
     ./brook-desktop-chrome-spans-test
+    $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_surfaces_test.c -o brook-desktop-surfaces-test
+    ./brook-desktop-surfaces-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_fence_recovery_test.c -o brook-desktop-fence-recovery-test
     ./brook-desktop-fence-recovery-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_blocked_recovery_test.c -o brook-desktop-blocked-recovery-test
