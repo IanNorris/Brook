@@ -1366,3 +1366,30 @@ attempt. Nothing has run on the Dell.
   bar, short disk rates, COMP and APP with p95, the payload name as the
   build label (hover for commit and date), and the network rates in the
   network flyout.
+
+
+### Stage 3 reconciliation on integration60
+
+The merge uses integration60 `a3f6685e` and Stage 3 `8e1e31ed`.
+The kernel retains launcher state, hit testing and the fractional scroll
+remainder. It snapshots the current launcher model, viewport and frame.
+The shell calls the same launcher builder and submits its clip commands
+with the version 2 wire format. The WM continues reporting `focus.shell`
+through the existing renderer ABI. Palette changes invalidate submitted
+lists, including changes to custom RGB. The buffers live in zero-initialized
+kernel memory and the kernel file stays below the 8 MiB guarded limit.
+
+`build/s3r-evidence/pixel-verdict.json` records 48 comparisons across 12
+matched QEMU configurations, with Glass using virgl. It covers the initial
+desktop, first launcher open, scroll and search. The launcher comparisons
+exclude the footer build hash. The taskbar comparisons cover its stable
+left 280 logical pixels. The 728 integration60 goldens also cover complete
+taskbar fixtures, all six material and mode combinations and custom accents.
+The Opaque captures used `85176b32`. The final `c11c9043` checks ownership
+before accessing storage and retains the same rendering path. Glass and
+the rerun of the shell-kill fixture used the final revision.
+
+The shell supervisor replaced pid 19 with pid 22 after SIGKILL. The
+fallback taskbar appeared and the open launcher and terminal returned.
+The guarded pair `build/dell/pair-s3r` at `c11c9043` passed QEMU on its
+first attempt. Physical touchpad and Intel scanout checks remain pending.
