@@ -112,20 +112,34 @@ void KMutexLock(KMutex* m)
     // The grant is published by KMutexUnlock under this same guard (it sets
     // m->ownerPid = our pid AND dequeues us), so checking m->ownerPid == self->pid
     // while holding the guard is race-free.
+    //
+    // The wake latch (pendingWakeup) is shared with the caller's own wait: a
+    // futex/poll/pipe waiter that takes a contended mutex after publishing
+    // itself on a wait queue but before blocking may receive its real wakeup
+    // here, either as a latch set before we arrived or as a non-grant wake
+    // while we sleep. Consuming it would leave the outer wait asleep forever
+    // (an untimed futex has no safety tick). Re-assert it on return instead;
+    // at worst the outer wait returns once spuriously, which every caller
+    // already tolerates (signals do the same).
+    bool outerWake = false;
     for (;;)
     {
         if (m->owner == self && m->ownerIncarnation == self->incarnation)
         {
             // Granted — KMutexUnlock has already dequeued us and set m->locked.
             GuardRelease(m, flags);
+            if (outerWake) __atomic_store_n(&self->pendingWakeup, 1, __ATOMIC_RELEASE);
             return;
         }
-        __atomic_store_n(&self->pendingWakeup, 0, __ATOMIC_RELEASE);
+        // Not granted (checked under the guard that publishes grants), so a
+        // latch seen here belongs to someone else's wake.
+        if (__atomic_exchange_n(&self->pendingWakeup, 0, __ATOMIC_ACQ_REL)) outerWake = true;
         GuardRelease(m, flags);
         // SchedulerBlock checks pendingWakeup to avoid a lost wakeup if
         // KMutexUnlock fires between GuardRelease and here.
         SchedulerBlock(self);
         flags = GuardAcquire(m);
+        if (!(m->owner == self && m->ownerIncarnation == self->incarnation)) outerWake = true;
     }
 }
 
