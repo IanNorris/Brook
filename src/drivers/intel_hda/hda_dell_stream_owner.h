@@ -4,6 +4,7 @@
 #include "hda_dell_tone_ici.h"
 #include "hda_dell_tone_stream.h"
 #include "hda_dell_volume.h"
+#include "hda_dell_queue_diagnostics.h"
 
 namespace brook {
 // Exclusively owns one Dell controller and its 64 KiB streaming ring. This is
@@ -63,6 +64,17 @@ public:
         active_=true;return configure();
     }
     uint64_t nowNs(){return p_.nowNs();}
+    // Read-only fault evidence. Only reads while memory decode is enabled;
+    // SDnSTS is read, never written, so latched W1C bits stay visible.
+    void faultRegisters(HdaDellStreamRegisters& r){
+        r=HdaDellStreamRegisters{};r.command=p_.command();
+        if(!active_ || !base_ || !(r.command&2))return;
+        r.control=uint32_t(p_.read16(base_))|(uint32_t(p_.read8(base_+2))<<16);r.status=p_.read8(base_+3);
+        r.lpib=p_.read32(base_+4);r.cbl=p_.read32(base_+8);r.lvi=p_.read16(base_+0x0c);r.fifos=p_.read16(base_+0x10);
+        r.format=p_.read16(base_+0x12);r.bdpl=p_.read32(base_+0x18);r.bdpu=p_.read32(base_+0x1c);
+        r.intctl=p_.read32(0x20);r.intsts=p_.read32(0x24);r.wallclock=p_.read32(0x30);r.dplbase=p_.read32(0x70);
+        r.valid=true;
+    }
     bool position(uint32_t& raw,bool& error,bool& running){
         if(!prepared_ || held_ || stopped_ || p_.command()!=6)return false;
         raw=p_.read32(base_+4);const uint8_t status=p_.read8(base_+3);

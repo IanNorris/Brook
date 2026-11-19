@@ -24,11 +24,11 @@ struct Owner {
     bool stop(){running=false;return true;}bool retire(){return true;}void quarantine(){held=true;}
 };
 static Owner owner;static Lock lock;static HdaDellAudioBridge<Owner,Lock> bridge(owner,lock,64,4096);
-static unsigned progressCalls=0;
+static unsigned progressCalls=0,restartCalls=0;
 static int play(const void* p,uint32_t n,uint32_t hz,uint8_t c,uint8_t b,bool){return bridge.play(p,n,hz,c,b);}
 static void stop(){bridge.stop();}static bool playing(){return bridge.isPlaying();}static uint32_t pending(){return bridge.pending();}
 static void service(){bridge.service();}static AudioSubmitReceipt submit(const void* p,uint32_t n){return bridge.submit(p,n);}
-static bool progress(AudioDeviceProgress* p){++progressCalls;return bridge.progress(p);}static bool restart(uint64_t e){return bridge.restart(e);}
+static bool progress(AudioDeviceProgress* p){++progressCalls;return bridge.progress(p);}static bool restart(uint64_t e){++restartCalls;return bridge.restart(e);}
 int main(){
     AudioMixerInit();const AudioDriver driver{"dell_hda_test",play,stop,playing,pending,service,submit,progress,restart};assert(AudioRegister(&driver));
     assert(AudioSetOutputControl(BROOK_AUDIO_MUTED|20) && !AudioUserUnmuteRequested());
@@ -54,5 +54,9 @@ int main(){
     for(unsigned i=0;i<20;++i){AudioMixerRefresh();AudioMixerTick();}
     AudioStreamProgress progressA{};assert(AudioMixerGetProgress(a,&progressA) && progressA.clocked && !progressA.discontinuity);
     assert(AudioMixerClose(a) && AudioMixerClose(b));AudioStop();assert(!owner.running && !owner.held);
+    // This bridge treats STOP as final: every restart is refused. The mixer
+    // retries the same epoch with exponential backoff, not every refresh.
+    restartCalls=0;for(unsigned i=0;i<4000;++i)AudioMixerRefresh();
+    assert(restartCalls>=11 && restartCalls<=15);
     AudioPrepareShutdown();const auto calls=progressCalls;AudioMixerRefresh();AudioMixerFlush();AudioMixerTick();assert(progressCalls==calls);
 }

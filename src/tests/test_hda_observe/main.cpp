@@ -10,7 +10,11 @@
 #include "memory/physical_memory.h"
 #include "../../drivers/intel_hda/hda_dell_volume.h"
 #include <cassert>
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
+#include <string>
+#include <vector>
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -25,6 +29,8 @@ constexpr uint64_t bar=0xf7418000,ram=0x12345000;
 const AudioDriver* registered=nullptr;unsigned registerCalls=0;
 uint32_t fakeCpu=0;bool rejectRetainedMapping=false;
 uint32_t fakeOutput=BROOK_AUDIO_PROBE_DEFAULT;bool fakeAuthorized=false;
+std::vector<std::string> klogLines;
+unsigned klogMatches(const char* text){unsigned n=0;for(const auto& l:klogLines)if(l.find(text)!=std::string::npos)++n;return n;}
 }
 bool CpuObserveMemoryTypes(uint64_t,uint64_t,CpuMemoryTypeObservation& out){out={};out.patSlot0=6;out.page0.type=0;return scenario!=7;}
 namespace brook {
@@ -34,7 +40,8 @@ extern "C" Vnode* VfsOpen(const char* path,int){
  if(std::strcmp(path,"/etc/dell-hda-quiet-tone")==0 && (scenario==17 || scenario==18 || scenario==26 || scenario==37))return &marker;
  if(std::strcmp(path,"/etc/dell-hda-mixer-format-probe")==0 && (scenario==36 || scenario==37))return &marker;
  if(std::strcmp(path,"/etc/dell-hda-stream-probe")==0 && (scenario>=38 && scenario<=43))return &marker;
- if(std::strcmp(path,"/etc/dell-hda-audio")==0 && ((scenario>=44 && scenario<=47) || (scenario>=53 && scenario<=61)))return &marker;
+ if(std::strcmp(path,"/etc/dell-hda-audio")==0 && ((scenario>=44 && scenario<=47) || (scenario>=53 && scenario<=63)))return &marker;
+ if(std::strcmp(path,"/etc/dell-hda-fault-recovery")==0 && scenario==62)return &marker;
  if(std::strcmp(path,"/etc/dell-hda-queue-probe")==0 && scenario==44)return &marker;
  if(std::strcmp(path,"/etc/dell-hda-audible")==0 && (scenario==60 || scenario==61))return &marker;
  if(std::strcmp(path,"/etc/dell-hda-cache-observe")==0 && scenario>=48 && scenario<=52)return &marker;
@@ -42,6 +49,7 @@ extern "C" Vnode* VfsOpen(const char* path,int){
  if(std::strcmp(path,"/etc/audio-muted")==0 && scenario>=44 && scenario!=46)return &marker;
  return nullptr;}
 extern "C" void VfsClose(Vnode*){}
+void KLog(const char* fmt,...){char buffer[1024];va_list a;va_start(a,fmt);vsnprintf(buffer,sizeof(buffer),fmt,a);va_end(a);klogLines.emplace_back(buffer);}
 uint32_t SmpCurrentCpuIndex(){return fakeCpu;}
 uint32_t SmpGetCpuCount(){return scenario==58?2:1;}
 bool SmpObserveCacheSnapshots(CpuCacheSnapshot* out,uint32_t count){if(count<1 || scenario==47)return false;out[0].valid=true;out[0].clflush=scenario!=55;out[0].clflushLine=64;out[0].pat=0x0007040100070406ULL^(scenario==56?1ull<<24:0);
@@ -231,6 +239,36 @@ static void one(int which){
   fakeOutput=20;fakeAuthorized=true;chip.dropPinUnmuteRight=true;registered->service();
   assert(o.runtimeQuarantined && !toneFrees && cmd==2 && chip.pin[0]==0x80 && chip.pin[1]==0x80 && HdaRuntimeFailureStage()==40);
   AudioDeviceProgress fault{};assert(registered->progress(&fault) && fault.discontinuity && !registered->restart(fault.epoch));}
+ if(which==62){assert(o.runtimePrepared && o.runtimeFaultRecoveryEnabled);HdaRuntimeRegister();assert(registered);
+  unsigned char samples[128]{};const auto first=registered->trySubmit(samples,sizeof(samples));assert(first.accepted==sizeof(samples) && cmd==6);
+  fakeNs+=300000000ULL;registered->service(); // missed service deadline
+  assert(!o.runtimeQuarantined && cmd==2 && chip.pin[0]==0x80 && chip.pin[1]==0x80 && !(chip.read16(Chip::base)&2));
+  auto faults=HdaRuntimeFaults();assert(faults.count==1 && faults.last.recoverable && faults.recovery.pending && faults.recovery.enabled);
+  assert(faults.last.reason==HdaDellFaultReason::ServiceLate && faults.last.atFault.valid && (faults.last.atFault.control&2));
+  assert(!(faults.last.afterStop.control&3) && faults.last.afterStop.command==2 && !faults.clockFailed);
+  assert(klogMatches("HDA_RUNTIME fault 1 stage=service reason=service-late")==1 && klogMatches("recoverable=1")==1);
+  registered->service();assert(klogMatches("HDA_RUNTIME fault")==1); // one line per fault
+  AudioDeviceProgress fault{};assert(registered->progress(&fault) && fault.discontinuity && fault.epoch==first.epoch);
+  assert(registered->restart(fault.epoch) && o.runtimePagesValidated==34 && !o.runtimeQuarantined && o.runtimeRestarts==1 && !o.runtimeRestartFailures);
+  assert(klogMatches("fault recovery ok")==1 && toneFrees==0);
+  const auto second=registered->trySubmit(samples,sizeof(samples));assert(second.accepted==sizeof(samples) && second.epoch==first.epoch+1 && cmd==6);
+  // A repeat inside the spacing window is terminal; pages stay owned.
+  fakeNs+=300000000ULL;registered->service();assert(HdaRuntimeFaults().count==2 && klogMatches("HDA_RUNTIME fault 2")==1);
+  assert(registered->progress(&fault) && fault.discontinuity && !registered->restart(fault.epoch));
+  assert(o.runtimeQuarantined && toneFrees==0 && cmd==2 && chip.pin[0]==0x80 && klogMatches("fault recovery failed")==1);
+  faults=HdaRuntimeFaults();assert(faults.recovery.permanent && faults.recovery.lastFailure==HdaDellRecoveryStep::Admission && faults.first.ordinal==1);
+  for(unsigned i=0;i<5;++i)assert(!registered->restart(fault.epoch));
+  assert(o.runtimeRestarts==2 && o.runtimeRestartRefused==5 && klogMatches("restart refused")==1);
+  HdaRuntimeShutdown();assert(o.runtimeShutdown && !o.runtimeShutdownOk && toneFrees==0);}
+ if(which==63){assert(o.runtimePrepared && !o.runtimeFaultRecoveryEnabled);HdaRuntimeRegister();assert(registered);
+  unsigned char samples[128]{};assert(registered->trySubmit(samples,sizeof(samples)).accepted==sizeof(samples));
+  fakeNs+=300000000ULL;registered->service();
+  assert(o.runtimeQuarantined && toneFrees==0 && cmd==2 && HdaRuntimeFailureStage()==10);
+  const auto faults=HdaRuntimeFaults();assert(faults.count==1 && !faults.last.recoverable && faults.last.muted && faults.last.stopped);
+  assert(klogMatches("reason=service-late")==1 && klogMatches("recoverable=0")==1);
+  AudioDeviceProgress fault{};assert(registered->progress(&fault) && fault.discontinuity);
+  for(unsigned i=0;i<100;++i)assert(!registered->restart(fault.epoch));
+  assert(!o.runtimeRestarts && !o.runtimeRestartFailures && o.runtimeRestartRefused==100 && klogMatches("restart refused")==1);}
  const auto oldWrites=writes;HdaObserveConfigure(&boot);assert(writes==oldWrites);munmap(page,4096);
 }
-int main(){for(int i=0;i<=61;++i){pid_t pid=fork();assert(pid>=0);if(!pid){one(i);_exit(0);}int status=0;assert(waitpid(pid,&status,0)==pid && WIFEXITED(status) && WEXITSTATUS(status)==0);}return 0;}
+int main(){for(int i=0;i<=63;++i){pid_t pid=fork();assert(pid>=0);if(!pid){one(i);_exit(0);}int status=0;assert(waitpid(pid,&status,0)==pid && WIFEXITED(status) && WEXITSTATUS(status)==0);}return 0;}

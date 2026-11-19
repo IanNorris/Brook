@@ -19,7 +19,33 @@ template<class T> struct HdaDellHasOutputGain<T,decltype(void(static_cast<T*>(nu
 template<class Owner,class Lock,bool AllowCleanRestart=false,bool AllowAudible=false> class HdaDellAudioBridge {
     Owner& owner_;Lock& lock_;HdaDellStreamQueue<Owner> queue_;uint32_t capacity_;
     bool started_=false,closed_=false,retiredClean_=false,terminal_=false,hardwareMuted_=true,epochHasData_=false;
+    HdaDellRecoveryStatus recovery_{};
     struct Guard {Lock& lock;~Guard(){lock.unlock();}};
+    // One attempt per admitted fault; never retried. Every failure leaves the
+    // owner quarantined with pages retained. The steps are exactly the clean
+    // stop path: verified mute + RUN clear + BME off were already observed by
+    // the queue fault; retireRetained() verifies mute, disconnects the
+    // converter and performs a verified stream reset (SRST) and descriptor
+    // clear; prepareRetained() rechecks identity, decode, page mappings and
+    // controller idleness before reprogramming the stream muted.
+    bool recoverLocked(uint64_t expectedEpoch){
+        if constexpr(!AllowCleanRestart){(void)expectedEpoch;return false;}
+        else {
+            if(expectedEpoch!=queue_.progress().epoch || expectedEpoch==~uint64_t(0))return false; // stale caller: nothing consumed
+            ++recovery_.attempts;const uint64_t now=owner_.nowNs();
+            const auto give=[&](HdaDellRecoveryStep step){recovery_.lastFailure=step;recovery_.permanent=true;
+                queue_.abandonRecovery();closed_=true;return false;}; // abandon quarantines the owner
+            if(!recovery_.enabled || closed_ || terminal_ || !started_ || !now || recovery_.successes>=recovery_.budget ||
+               (recovery_.lastRecoveryNs && (now<recovery_.lastRecoveryNs || now-recovery_.lastRecoveryNs<recovery_.minSpacingNs)))
+                return give(HdaDellRecoveryStep::Admission);
+            if(!owner_.retireRetained())return give(HdaDellRecoveryStep::Retire);
+            if(!owner_.prepareRetained())return give(HdaDellRecoveryStep::Reprepare);
+            if(!queue_.recoverAfterVerifiedFault(expectedEpoch))return give(HdaDellRecoveryStep::Queue);
+            ++recovery_.successes;recovery_.lastRecoveryNs=now;recovery_.lastFailure=HdaDellRecoveryStep::None;
+            queue_.allowRecovery(recovery_.successes<recovery_.budget);
+            started_=closed_=retiredClean_=false;hardwareMuted_=true;epochHasData_=false;return true;
+        }
+    }
 public:
     HdaDellAudioBridge(Owner& owner,Lock& lock,uint32_t line,uint32_t guard,uint32_t burst=1024,uint64_t clockUncertaintyNs=0,bool diagnostics=false):
         owner_(owner),lock_(lock),queue_(owner,line,guard,burst,clockUncertaintyNs,diagnostics),
@@ -85,11 +111,33 @@ public:
     uint64_t drainClockNs(){lock_.lock();Guard guard{lock_};
         return !terminal_ && !closed_ && !queue_.failed()?owner_.nowNs():0;}
     HdaDellQueueDiagnostics diagnostics(){lock_.lock();Guard guard{lock_};return queue_.diagnostics();}
+    // Fault evidence. faultCount() is a lock-free hint for one-shot logging.
+    uint64_t faultCount()const{return queue_.faultCount();}
+    HdaDellQueueFault firstFault(){lock_.lock();Guard guard{lock_};return queue_.firstFault();}
+    HdaDellQueueFault lastFault(){lock_.lock();Guard guard{lock_};return queue_.lastFault();}
+    HdaDellRecoveryStatus recovery(){lock_.lock();Guard guard{lock_};auto r=recovery_;r.pending=queue_.recoverable();return r;}
+    // Opt-in, clean-restart specialization only. A later admitted fault is
+    // left muted and stopped (not quarantined) so restart() can attempt one
+    // verified retire/reprepare. budget bounds successes per boot; a fault
+    // within minSpacingNs of the previous recovery is terminal.
+    bool enableFaultRecovery(uint32_t budget,uint64_t minSpacingNs){
+        if constexpr(!AllowCleanRestart){(void)budget;(void)minSpacingNs;return false;}
+        else {lock_.lock();Guard guard{lock_};if(terminal_ || closed_ || started_)return false;
+            recovery_.enabled=budget!=0;recovery_.budget=budget;recovery_.minSpacingNs=minSpacingNs;
+            queue_.allowRecovery(recovery_.enabled);return recovery_.enabled;}
+    }
+    // True when restart() can never succeed again this boot. Callers use it
+    // to stop polling a quarantined driver; it touches no hardware.
+    bool restartPermanentlyRefused(){
+        lock_.lock();Guard guard{lock_};
+        if constexpr(!AllowCleanRestart)return true;
+        else return terminal_ || (queue_.failed() && !queue_.recoverable()) || (closed_ && !retiredClean_);
+    }
     // A clean close still requires descriptor retirement; uncertain failures
     // are quarantined and cannot be restarted by either specialization.
     bool stop(){
         lock_.lock();Guard guard{lock_};if(closed_)return false;closed_=true;
-        if(queue_.failed())return false;
+        if(queue_.failed()){queue_.abandonRecovery();return false;}
         if(started_){if(!queue_.shutdown())return false;}
         else {const bool muted=owner_.mute(),stopped=owner_.stop();if(!muted || !stopped){owner_.quarantine();return false;}}
         if constexpr(AllowCleanRestart){
@@ -102,6 +150,7 @@ public:
         if constexpr(!AllowCleanRestart){(void)expectedEpoch;return false;}
         else {
             lock_.lock();Guard guard{lock_};
+            if(!terminal_ && !closed_ && queue_.recoverable())return recoverLocked(expectedEpoch);
             if(terminal_ || !closed_ || !retiredClean_ || queue_.failed() || expectedEpoch!=queue_.progress().epoch || expectedEpoch==~uint64_t(0))return false;
             retiredClean_=false; // an attempted reprepare can change hardware; never retry on failure
             if(!owner_.prepareRetained()){owner_.quarantine();return false;}
@@ -114,7 +163,7 @@ public:
     bool shutdown(){
         lock_.lock();Guard guard{lock_};if(terminal_)return false;terminal_=true;
         if(closed_){if(!retiredClean_ || queue_.failed())return false;retiredClean_=false;return owner_.retire();}
-        closed_=true;if(queue_.failed())return false;
+        closed_=true;if(queue_.failed()){queue_.abandonRecovery();return false;}
         if(started_){if(!queue_.shutdown())return false;}
         else {const bool muted=owner_.mute(),stopped=owner_.stop();if(!muted || !stopped){owner_.quarantine();return false;}}
         return owner_.retire();

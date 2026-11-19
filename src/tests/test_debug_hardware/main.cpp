@@ -92,6 +92,8 @@ uint32_t HdaRuntimeStreamFailureStage(){return 0;}
 uint32_t HdaRuntimeStreamFailureDetail(){return 0;}
 HdaDellQueueDiagnostics queueDiagnostics{};
 HdaDellQueueDiagnostics HdaRuntimeQueueDiagnostics(){return queueDiagnostics;}
+HdaRuntimeFaultSnapshot runtimeFaults{};
+HdaRuntimeFaultSnapshot HdaRuntimeFaults(){return runtimeFaults;}
 bool AcpiInventoryRead(uint32_t index,uint32_t offset,void* out,uint32_t bytes,AcpiSdtHeader& h){
     if(index || offset>1024 || bytes>1024-offset)return false;
     h={};h.length=1024;if(bytes)std::memset(out,0xab,bytes);return true;
@@ -314,6 +316,17 @@ int main(){
            reply.find("\"startup_gap_bytes\":5184")!=std::string::npos &&
            reply.find("\"empty_after_bytes\":1200")!=std::string::npos &&
            reply.find("\"published_bytes\":4096")!=std::string::npos);
+    assert(reply.find("\"fault_count\":0")!=std::string::npos && reply.find("\"last_fault\":null")!=std::string::npos);
+    brook::runtimeFaults.count=1;{auto& f=brook::runtimeFaults.last;f.recorded=true;f.ordinal=1;f.stage=brook::HdaDellFaultStage::Service;
+        f.reason=brook::HdaDellFaultReason::ServiceLate;f.atFault.valid=true;f.atFault.status=8;f.atFault.control=0x100002;f.recoverable=true;}
+    brook::runtimeFaults.recovery.enabled=true;brook::runtimeFaults.recovery.budget=3;brook::runtimeFaults.clockFailReason=3;
+    assert(handle("bridge hardware dell-hda-queue") && reply.find("\"fault_count\":1")!=std::string::npos &&
+           reply.find("\"first_fault\":null")!=std::string::npos && reply.find("\"reason\":\"service-late\"")!=std::string::npos &&
+           reply.find("\"fifoe\":true")!=std::string::npos && reply.find("\"sdctl\":1048578")!=std::string::npos &&
+           reply.find("\"recoverable\":true")!=std::string::npos && reply.find("\"after_stop\":{\"valid\":false")!=std::string::npos);
+    assert(handle("bridge hardware dell-hda-runtime") && reply.find("\"fault_reason\":\"service-late\"")!=std::string::npos &&
+           reply.find("\"restart_refused\":0")!=std::string::npos && reply.find("\"fail_reason\":3")!=std::string::npos &&
+           reply.find("\"recovery\":{\"enabled\":true")!=std::string::npos && reply.find("\"budget\":3")!=std::string::npos);
     assert(handle("bridge hardware dell-hda-memory") && reply.find("\"present\":false")!=std::string::npos);
     hdaPciPresent=true;
     assert(handle("bridge hardware dell-hda-memory") && reply.find("\"present\":true")!=std::string::npos &&

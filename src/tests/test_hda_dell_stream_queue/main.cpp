@@ -22,7 +22,103 @@ struct Fake {
         absolute+=n;now+=uint64_t(n)*1000000000ULL/AudioDmaClock::BytesPerSecond;
     }
 };
+// Register-capable fake: stop() clears RUN and BME, as the owner verifies.
+struct RegFake:Fake {
+    uint8_t status=0;bool muteFails=false;
+    bool mute(){++mutes;return !muteFails;}bool stop(){++stops;if(stopFails)return false;running=false;return true;}
+    bool start(){running=true;return Fake::start();}
+    void faultRegisters(HdaDellStreamRegisters& r){r={};r.valid=true;r.command=running?6:2;r.control=running?0x100002:0x100000;
+        r.status=status;r.lpib=uint32_t(absolute%Ring);r.cbl=Ring;}
+};
+static void FaultRecords(){
+    uint8_t samples[128];std::memset(samples,0x11,sizeof(samples));
+    // Late service: elapsed since the last accepted sample exceeds the budget.
+    Fake late;HdaDellStreamQueue<Fake> l(late,64,4096,1024,20000);assert(l.start() && !l.faultCount());
+    late.now+=AudioDmaClock::MaxSampleNs;assert(!l.service() && late.quarantines==1);
+    auto f=l.lastFault();assert(f.recorded && f.ordinal==1 && l.faultCount()==1 && f.stage==HdaDellFaultStage::Service);
+    assert(f.reason==HdaDellFaultReason::ServiceLate && f.sampleReason==HdaDellFaultReason::ServiceLate && f.muted && f.stopped);
+    assert(!f.recoverable && !f.atFault.valid && f.sampleAfterNs-f.previousSampleNs==AudioDmaClock::MaxSampleNs && f.epoch==1);
+    assert(l.firstFault().ordinal==1 && !l.recoverable());
+    assert(!l.service() && l.faultCount()==1 && late.quarantines==1); // terminal: no second record or retry
+    // RUN observed clear by hardware.
+    Fake halted;HdaDellStreamQueue<Fake> h(halted,64,4096);assert(h.start());halted.running=false;
+    assert(!h.service() && h.lastFault().reason==HdaDellFaultReason::NotRunning && !h.lastFault().sampledRunning);
+    // DMA position frozen for 150 ms.
+    Fake stalled;HdaDellStreamQueue<Fake> st(stalled,64,4096);assert(st.start());
+    for(unsigned i=0;i<4;++i){stalled.now+=40000000;if(i<3)assert(st.service());}
+    assert(!st.service() && st.lastFault().reason==HdaDellFaultReason::Stalled && st.lastFault().lastMovementNs);
+    // Impossible jump: recorded with the observed delta and allowance.
+    Fake jump;HdaDellStreamQueue<Fake> j(jump,64,4096);assert(j.start());jump.absolute=8192;jump.now+=1000000;
+    assert(!j.service());f=j.lastFault();assert(f.reason==HdaDellFaultReason::PositionJump && f.delta==8192 && f.allowed<8192 && f.position==8192);
+    // Clock unavailable (owner clock failed).
+    Fake zero;HdaDellStreamQueue<Fake> z(zero,64,4096);assert(z.start());zero.now=0;
+    assert(!z.service() && z.lastFault().reason==HdaDellFaultReason::ClockUnavailable && !z.lastFault().atNs);
+    // Device error bit reported by the position read.
+    struct ErrorFake:Fake{bool position(uint32_t& p,bool& e,bool& r){Fake::position(p,e,r);e=true;return true;}};
+    ErrorFake err;HdaDellStreamQueue<ErrorFake> e(err,64,4096);assert(e.start());err.now+=1000;
+    assert(!e.service() && e.lastFault().reason==HdaDellFaultReason::DeviceError && e.lastFault().sampledError);
+    // Publication: a cache flush failure is I/O, a moving cursor is uncertain.
+    Fake flush;HdaDellStreamQueue<Fake> fl(flush,64,4096);assert(fl.start());flush.failFlush=true;
+    assert(fl.submit(samples,sizeof(samples)).error);f=fl.lastFault();
+    assert(f.stage==HdaDellFaultStage::Publish && f.reason==HdaDellFaultReason::PublishIo);
+    Fake moving;HdaDellStreamQueue<Fake> mv(moving,64,4096);assert(mv.start());moving.moveOnFlush=true;
+    assert(mv.submit(samples,sizeof(samples)).error);f=mv.lastFault();
+    assert(f.stage==HdaDellFaultStage::Publish && f.reason==HdaDellFaultReason::PublishUncertain && f.completed>f.submitted); // DMA overran the copy
+    // Shutdown whose stop is not verified, and an external abort.
+    Fake closing;HdaDellStreamQueue<Fake> sh(closing,64,4096);assert(sh.start());closing.stopFails=true;
+    assert(!sh.shutdown() && sh.lastFault().stage==HdaDellFaultStage::Shutdown && !sh.lastFault().stopped && closing.quarantines==1);
+    Fake aborted;HdaDellStreamQueue<Fake> ab(aborted,64,4096);assert(ab.start() && !ab.abort());
+    assert(ab.lastFault().reason==HdaDellFaultReason::ExternalAbort && aborted.quarantines==1);
+    // Register snapshots before and after the bounded stop.
+    RegFake regs;HdaDellStreamQueue<RegFake> rq(regs,64,4096);assert(rq.start());regs.status=8;regs.now+=AudioDmaClock::MaxSampleNs;
+    assert(!rq.service());f=rq.lastFault();
+    assert(f.atFault.valid && (f.atFault.control&2) && f.atFault.status==8 && f.atFault.command==6);
+    assert(f.afterStop.valid && !(f.afterStop.control&2) && f.afterStop.command==2 && !f.recoverable && regs.quarantines==1);
+}
+static void Recovery(){
+    uint8_t samples[128];std::memset(samples,0x22,sizeof(samples));
+    // Admitted: late service with verified mute/stop, no DESE. Left stopped
+    // and not quarantined until the owner retires and reprepares it.
+    RegFake a;HdaDellStreamQueue<RegFake> q(a,64,4096);q.allowRecovery(true);assert(q.start());
+    assert(q.submit(samples,sizeof(samples)).accepted);a.now+=AudioDmaClock::MaxSampleNs;
+    assert(!q.service() && q.failed() && q.recoverable() && !a.quarantines && !a.running && a.mutes==1 && a.stops==1);
+    assert(q.lastFault().recoverable && q.progress().discontinuity);
+    const auto epoch=q.progress().epoch;assert(!q.recoverAfterVerifiedFault(epoch+1) && q.recoverable());
+    assert(q.recoverAfterVerifiedFault(epoch) && !q.failed() && !q.recoverable() && q.progress().epoch==epoch+1);
+    assert(!q.recoverAfterVerifiedFault(epoch+1)); // one use per fault
+    a.absolute=0;assert(q.start() && a.running);auto r=q.submit(samples,sizeof(samples));assert(r.accepted && r.epoch==epoch+1);
+    assert(q.lastFault().ordinal==1 && q.faultCount()==1 && !a.quarantines);
+    // A second fault is recorded separately; the first is retained.
+    a.now+=AudioDmaClock::MaxSampleNs;assert(!q.service() && q.faultCount()==2 && q.lastFault().ordinal==2 && q.firstFault().ordinal==1);
+    q.abandonRecovery();assert(a.quarantines==1 && !q.recoverable() && !q.lastFault().recoverable);
+    assert(!q.recoverAfterVerifiedFault(q.progress().epoch));
+    // Never admitted: latched DESE, RUN cleared by hardware, unverified mute,
+    // failed stop, flush I/O failure, or recovery not enabled.
+    RegFake dese;HdaDellStreamQueue<RegFake> d(dese,64,4096);d.allowRecovery(true);assert(d.start());dese.status=0x18;dese.now+=1000;
+    struct ErrorRegFake:RegFake{bool position(uint32_t& p,bool& e,bool& r){Fake::position(p,e,r);e=(status&0x18)!=0;return true;}};
+    ErrorRegFake desePos;HdaDellStreamQueue<ErrorRegFake> dp(desePos,64,4096);dp.allowRecovery(true);assert(dp.start());desePos.status=0x10;desePos.now+=1000;
+    assert(!dp.service() && dp.lastFault().reason==HdaDellFaultReason::DeviceError && !dp.recoverable() && desePos.quarantines==1);
+    ErrorRegFake fifo;HdaDellStreamQueue<ErrorRegFake> fq(fifo,64,4096);fq.allowRecovery(true);assert(fq.start());fifo.status=0x08;fifo.now+=1000;
+    assert(!fq.service() && fq.lastFault().reason==HdaDellFaultReason::DeviceError && fq.recoverable() && !fifo.quarantines); // FIFOE only
+    dese.now+=AudioDmaClock::MaxSampleNs;assert(!d.service() && !d.recoverable() && dese.quarantines==1);
+    RegFake halted;HdaDellStreamQueue<RegFake> h(halted,64,4096);h.allowRecovery(true);assert(h.start());halted.running=false;
+    assert(!h.service() && !h.recoverable() && halted.quarantines==1);
+    RegFake loud;HdaDellStreamQueue<RegFake> m(loud,64,4096);m.allowRecovery(true);assert(m.start());loud.muteFails=true;loud.now+=AudioDmaClock::MaxSampleNs;
+    assert(!m.service() && !m.recoverable() && loud.quarantines==1 && !m.lastFault().muted);
+    RegFake running;HdaDellStreamQueue<RegFake> rs(running,64,4096);rs.allowRecovery(true);assert(rs.start());running.stopFails=true;running.now+=AudioDmaClock::MaxSampleNs;
+    assert(!rs.service() && !rs.recoverable() && running.quarantines==1 && !rs.lastFault().stopped);
+    RegFake io;HdaDellStreamQueue<RegFake> fi(io,64,4096);fi.allowRecovery(true);assert(fi.start());io.failFlush=true;
+    assert(fi.submit(samples,sizeof(samples)).error && !fi.recoverable() && io.quarantines==1);
+    RegFake off;HdaDellStreamQueue<RegFake> o(off,64,4096);assert(o.start());off.now+=AudioDmaClock::MaxSampleNs;
+    assert(!o.service() && !o.recoverable() && off.quarantines==1);
+    // A publication overrun is a timing judgement: admitted.
+    RegFake moving;HdaDellStreamQueue<RegFake> mv(moving,64,4096);mv.allowRecovery(true);assert(mv.start());moving.moveOnFlush=true;
+    assert(mv.submit(samples,sizeof(samples)).error && mv.recoverable() && !moving.quarantines);
+    // abort() on a pending recovery quarantines.
+    assert(!mv.abort() && moving.quarantines==1 && !mv.recoverable());
+}
 int main(){
+    FaultRecords();Recovery();
     Fake f;HdaDellStreamQueue<Fake> q(f,64,4096);assert(q.start() && f.started);
     std::vector<uint8_t> expected(200000,0);uint8_t samples[128];
     for(unsigned step=0;step<140;++step){

@@ -735,6 +735,21 @@ static void Reconcile(const AudioDeviceProgress& device)
     }
     SpinLockRelease(&g_mixerLock);
 }
+// A refused driver restart is not retried every refresh: the same epoch is
+// retried after 1, 2, 4 ... 1024 skipped refreshes (about 10 s at the 10 ms
+// service period). Only the flush owner (g_flushBusy) touches this state.
+static uint64_t g_restartRefusedEpoch = 0;
+static uint32_t g_restartSkip = 0, g_restartBackoff = 0;
+static void RestartDriver(uint64_t epoch)
+{
+    if (g_restartRefusedEpoch == epoch && g_restartSkip) { --g_restartSkip; return; }
+    if (g_audioDriver->restart(epoch)) { g_restartRefusedEpoch = 0; g_restartSkip = g_restartBackoff = 0; return; }
+    if (g_restartRefusedEpoch != epoch) {
+        g_restartRefusedEpoch = epoch; g_restartBackoff = 1;
+        SerialPrintf("audio: driver '%s' refused restart of epoch %lu; retrying with backoff\n", g_audioDriver->name, epoch);
+    } else if (g_restartBackoff < 1024) g_restartBackoff *= 2;
+    g_restartSkip = g_restartBackoff;
+}
 static void RefreshDevice(uint64_t epoch, AudioDeviceProgress* fresh = nullptr)
 {
     if (fresh) *fresh = {};
@@ -769,7 +784,7 @@ static void RefreshDevice(uint64_t epoch, AudioDeviceProgress* fresh = nullptr)
     if (fresh) *fresh = device;
     // The terminal snapshot was reconciled before retiring this epoch. A failed
     // restart leaves the driver's fault and its last proven watermark latched.
-    if (device.discontinuity) g_audioDriver->restart(device.epoch);
+    if (device.discontinuity) RestartDriver(device.epoch);
 }
 void AudioMixerRefresh()
 {
