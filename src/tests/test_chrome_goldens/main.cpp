@@ -403,17 +403,19 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
         const uint32_t set = all ? 127u : (1u << 0 | 1u << 1 | 1u << 6);
         const ChromeTaskbarLayout wide = ChromeTaskbarLayoutFor(s, wideW, screenH, "14:05 19 Nov 2026", false, set, ids, 3, 0,
                                                                 "dell-int51-20261119", false, labels);
-        ChromeTaskbarModel wm = tb;
-        wm.layout = &wide;
+        static ChromeShellModel wm;
+        wm = model;
+        wm.taskbar = wide;
         wm.agentShown = false;
         wm.mouseX = wm.mouseY = -1;
         wm.launcherOpen = false;
-        wm.telemetry.app = &compositorCadence;
+        wm.telemetry.hasApp = true;
+        wm.telemetry.app = compositorCadence;
         wm.telemetry.stats.downBytesPerSecond = 2400000;
         wm.telemetry.stats.upBytesPerSecond = 150000;
         wm.telemetry.thermal = true; wm.telemetry.tjmax = 100; wm.telemetry.latest.pkgC = 57;
         ChromeDisplayList list = ChromeListOn(storage);
-        ChromeBuildTaskbar(wm, s, list);
+        RenderSnapshot(wm, s, list);
         Check(prefix + (all ? "taskbar-diagnostics" : "taskbar-default"), list, s, 0, wide.y, wideW, screenH - wide.y);
     }
     // The compact HUD and the temperature target, without the diagnostics.

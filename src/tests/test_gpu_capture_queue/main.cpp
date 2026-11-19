@@ -51,7 +51,7 @@ void VmmFreePages(VirtualAddress,uint64_t) { std::abort(); }
 uint32_t WmDesktopHeight(uint32_t h) { return h-1; }
 bool taskbarHidden=false;
 bool WmTaskbarHidden() { return taskbarHidden; }
-const WmPalette& WmCurrentPalette() {
+WmPalette WmCurrentPalette() {
     static const WmPalette palette = [] { WmPalette value{}; value.taskbar = 0x00abc123; return value; }();
     return palette;
 }

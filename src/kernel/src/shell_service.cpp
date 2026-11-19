@@ -14,6 +14,8 @@
 #include "syscall_internal.h"
 #include "user_copy.h"
 
+inline void* operator new(size_t, void* storage) noexcept { return storage; }
+
 namespace brook {
 namespace {
 
@@ -49,9 +51,15 @@ struct Slot {
 };
 
 KMutex g_lock{};
-Slot g_slots[KindCount]{};
-ChromeShellModel g_capture{};
-ShellSnapshot g_receive{};
+struct ShellStorage {
+    Slot slots[KindCount];
+    ChromeShellModel capture;
+    ShellSnapshot receive;
+};
+// Model defaults are populated when the service first starts. Keeping these
+// screen-sized buffers in BSS leaves the guarded boot kernel size unchanged.
+alignas(ShellStorage) unsigned char g_storage[sizeof(ShellStorage)];
+ShellStorage* g_shell = nullptr;
 Process* g_waiter = nullptr;
 uint16_t g_pid = 0;
 uint64_t g_incarnation = 0;
@@ -96,6 +104,7 @@ int64_t Register(Process& proc)
         Lock lock;
         if (SameOwner(proc)) return 0;
         if (g_pid) return -16; // Previous owner has not yet been retired by the compositor.
+        if (!g_shell) g_shell = new (g_storage) ShellStorage{};
         g_pid = proc.pid;
         g_incarnation = proc.incarnation;
         __atomic_store_n(&g_registered, true, __ATOMIC_RELEASE);
@@ -112,13 +121,13 @@ int64_t Receive(Process& proc, uint64_t exchange, uint64_t modelAddress)
             Lock lock;
             if (!SameOwner(proc)) return -1;
             Slot* slot = nullptr;
-            for (auto& candidate : g_slots)
+            for (auto& candidate : g_shell->slots)
                 if (candidate.requested > candidate.offered &&
                     (!slot || candidate.requested < slot->requested)) slot = &candidate;
             if (slot) {
-                g_receive.config = slot->style;
-                g_receive.model = slot->model;
-                offer = {slot->requested, unsigned(slot - g_slots), ShellServiceVersion};
+                g_shell->receive.config = slot->style;
+                g_shell->receive.model = slot->model;
+                offer = {slot->requested, unsigned(slot - g_shell->slots), ShellServiceVersion};
                 slot->offered = offer.sequence;
                 slot->offeredGeometry = slot->requestedGeometry;
                 slot->offeredScale = slot->style.metrics.percent;
@@ -134,11 +143,11 @@ int64_t Receive(Process& proc, uint64_t exchange, uint64_t modelAddress)
             g_waiter = nullptr;
         }
     }
-    if (CopyToUser(modelAddress, &g_receive, sizeof(g_receive)) &&
+    if (CopyToUser(modelAddress, &g_shell->receive, sizeof(g_shell->receive)) &&
         CopyToUser(exchange, &offer, sizeof(offer))) return 0;
     // Let a retry receive the same work if the destination faulted.
     Lock lock;
-    auto& slot = g_slots[offer.kind];
+    auto& slot = g_shell->slots[offer.kind];
     if (slot.offered == offer.sequence) slot.offered = 0;
     return -14;
 }
@@ -157,7 +166,7 @@ int64_t Present(Process& proc, uint64_t exchange, uint64_t address)
     uint32_t scale = 0;
     {
         Lock lock;
-        auto& slot = g_slots[offer.kind];
+        auto& slot = g_shell->slots[offer.kind];
         if (!SameOwner(proc)) return -1;
         if (slot.offered != offer.sequence) return -116;
         geometry = slot.offeredGeometry;
@@ -188,7 +197,7 @@ int64_t Present(Process& proc, uint64_t exchange, uint64_t address)
         const uint64_t key = ChromeListKey(list, geometry.style ^ (uint64_t(offer.kind) << 32));
         *result = {geometry, key, offer.sequence, count, textBytes, commands, text, scale};
         Lock lock;
-        auto& slot = g_slots[offer.kind];
+        auto& slot = g_shell->slots[offer.kind];
         if (!SameOwner(proc) || slot.offered != offer.sequence ||
             !SameGeometry(geometry, slot.requestedGeometry)) error = -116;
         else {
@@ -223,7 +232,7 @@ void ShellServiceBeginFrame(uint64_t now)
                 g_pid = 0;
                 g_incarnation = 0;
                 __atomic_store_n(&g_registered, false, __ATOMIC_RELEASE);
-                for (auto& slot : g_slots) {
+                for (auto& slot : g_shell->slots) {
                     retired[count++] = slot.active;
                     retired[count++] = slot.staged;
                     slot.active = slot.staged = nullptr;
@@ -233,7 +242,7 @@ void ShellServiceBeginFrame(uint64_t now)
             }
         }
         if (__atomic_exchange_n(&g_adoptionPending, false, __ATOMIC_ACQ_REL)) {
-            for (auto& slot : g_slots) if (slot.staged) {
+            for (auto& slot : g_shell->slots) if (slot.staged) {
                 retired[count++] = slot.active;
                 slot.active = slot.staged;
                 slot.staged = nullptr;
@@ -247,7 +256,7 @@ static uint64_t CaptureModel(const WmShellSurface& surface, uint32_t width, uint
                              uint64_t now, int32_t mx, int32_t my, bool visible)
 {
     if (!__atomic_load_n(&g_registered, __ATOMIC_ACQUIRE)) return 0;
-    auto& slot = g_slots[unsigned(surface.kind)];
+    auto& slot = g_shell->slots[unsigned(surface.kind)];
     const auto config = WmCaptureShellConfig();
     uint64_t style = (WmBackdropStyleVersion() * 0x100000001b3ull) ^
                            (uint64_t(config.metrics.percent) << 32) ^
@@ -263,10 +272,10 @@ static uint64_t CaptureModel(const WmShellSurface& surface, uint32_t width, uint
     // existing overlay recheck cadence while the pointer and input are idle.
     if (changedGeometry || slot.visible != visible || input != slot.lastInput || mx != slot.lastMouseX || my != slot.lastMouseY ||
         now < slot.lastSample || now - slot.lastSample >= 100) {
-        if (WmCaptureShellModel(surface, width, height, now, mx, my, g_capture) &&
-            (changedGeometry || memcmp(&slot.model, &g_capture, sizeof(g_capture)))) {
+        if (WmCaptureShellModel(surface, width, height, now, mx, my, g_shell->capture) &&
+            (changedGeometry || memcmp(&slot.model, &g_shell->capture, sizeof(g_shell->capture)))) {
             Lock lock;
-            slot.model = g_capture;
+            slot.model = g_shell->capture;
             slot.style = config;
             slot.requestedGeometry = geometry;
             slot.requested = ++g_sequence;
@@ -296,7 +305,7 @@ uint64_t ShellServiceCapture(const WmShellSurface& surface, uint32_t width, uint
 bool ShellServiceWarmLauncher(uint32_t width, uint32_t height, uint64_t now)
 {
     if (!__atomic_load_n(&g_registered, __ATOMIC_ACQUIRE)) return false;
-    const auto& launcher = g_slots[unsigned(WmShellSurfaceKind::Launcher)];
+    const auto& launcher = g_shell->slots[unsigned(WmShellSurfaceKind::Launcher)];
     if (launcher.requested && !launcher.visible && now >= launcher.lastSample &&
         now - launcher.lastSample < 100 && launcher.requestedGeometry.width == width &&
         launcher.requestedGeometry.height == height) return true;
@@ -310,7 +319,7 @@ void ShellServiceEndCapture(uint32_t kindMask)
 {
     if (!__atomic_load_n(&g_registered, __ATOMIC_ACQUIRE)) return;
     for (unsigned kind = 0; kind < KindCount; ++kind) {
-        auto& slot = g_slots[kind];
+        auto& slot = g_shell->slots[kind];
         if ((kindMask & (1u << kind)) || !slot.requested) continue;
         Submission* active;
         Submission* staged;
@@ -330,7 +339,7 @@ void ShellServiceEndCapture(uint32_t kindMask)
 void ShellServiceDraw(const WmShellSurface& surface, uint32_t* pixels, uint32_t stride,
                       uint32_t width, uint32_t height)
 {
-    const auto* list = g_slots[unsigned(surface.kind)].active;
+    const auto* list = g_shell->slots[unsigned(surface.kind)].active;
     if (!list || !SameGeometry(list->geometry, {surface, width, height, list->geometry.style})) return;
     if (surface.x < 0 || surface.y < 0 || uint64_t(surface.x) + surface.w > width ||
         uint64_t(surface.y) + surface.h > height) return;
