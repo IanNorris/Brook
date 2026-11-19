@@ -802,6 +802,13 @@ Two independent code reviews (compositor and driver), Dell measurements on the g
 - **Job table:** a long campaign can exhaust the 256-slot table, and the current boot may lack the terminate API. Archive completed work and plan a checked restart.
 
 ## Backlog (outside the immediate goal)
+- **Memory growth / leak suspects (19 Nov; Dell after a heavy session vs a fresh boot, `display-perf/build/dell/mem-445-after-session` vs `mem-446-fresh`):**
+  - **Totals:** used 1,582 vs 601 MB. User space (`mem census`) 320 vs 137 MB.
+  - **waylandd heap: 62.5 vs 1.2 MB.** Likely a leak: nothing was open at measurement.
+  - **VKRENDER GPU mappings: 173 vs 57 MB.** Probably client-buffer imports retained after their clients closed.
+  - **Kernel side: ~1.26 GB vs ~0.46 GB, unattributed.** File cache and/or orphaned GPU buffers; `/proc/meminfo` Cached = 0.
+  - **VmRSS is wrong** (a flat 7 MB for every process).
+  - **Next:** Codex `work/mem-accounting` adds the per-class page accounting, `mem breakdown`, GPU BO owners and a VmRSS fix; then the Claude leak hunt.
 - **Firefox needs Brook's caption button set, like Chromium (Ian, 19 Nov):** Firefox draws its own client-side title bar, so give it the same `captionOverlay` treatment as Chromium (`work/chrome-csd`; button parts on a CSD window, absorbed into the part table in Clearwater 1.1). Do it after Clearwater 2.1 lands (title bar 40 px / new caption metrics, on `work/clearwater-s2`). Identify Firefox's CSD title-bar region (GTK headerbar / `MOZ_GTK_TITLEBAR_DECORATION`) the way the Chromium path does.
 - **Firefox audio silent on gen 445 (Ian, 19 Nov):** no tab speaker icon, even after restarting Firefox. No Firefox process maps any audio library (cubeb never started) and no audio fd is open. Today's installs added `pulseaudio-17.0` libs (04:14) and `alsa-lib-1.2.15.3` libasound (04:31) to `/nix/profile/lib`. Next: test Chromium/VLC/DeaDBeeF audio to split Firefox-specific from system-wide.
 - **Staged launcher entries are lost on every package install (gen 445; Steam vanished):** `tools/nix-install/nix-install.c` regenerates `applications.idx` only from profile `.desktop` files. `tools/launcher-stage/install.py --apps` upserts write only to the idx, so the next install drops them.
