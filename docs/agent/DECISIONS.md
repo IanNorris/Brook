@@ -60,3 +60,12 @@ These entries preserve accepted direction and the scope of prior evidence. Curre
 | Evidence retention | User previously reported terabytes of stale review/workload artifacts. Keep useful evidence and recovery assets, and avoid cloning large images or repeating full builds without a decision need. | Artifact cleanup is requested or storage pressure matters. Confirm ownership and active use before removing anything. | 30–31 October history |
 
 The archived approvals to merge, delete branches, wipe an old SSD installation, play audio or manipulate a private Steam copy belonged to particular tasks and states. They remain historical context. Apply current authorization and recovery requirements to the next operation.
+
+## Theme model: material x mode, custom accent (Ian, 19 Nov)
+
+- Material (Glass | Opaque) and mode (Light | Mixed | Dark) are independent; mode applies to both materials (Opaque gains Mixed). Replaces Glass / Opaque Light / Opaque Dark.
+- System chrome and panels always follow the mode, taskbar included. Mixed = dark chrome, light app content; only window content stays light.
+- Users can pick any accent with an HSV-style picker; the 13 hues remain presets. No taste clamping of the chosen colour ("eye-searing colours are their choice"); only ink legibility is enforced.
+- Light/dark tints must keep the hue: magenta reads pink, not peach. Swatches and preview show the resolved tint for the current material and mode.
+- Assigned to Codex as work/theme-redesign (19 Nov).
+
