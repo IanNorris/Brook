@@ -280,7 +280,7 @@ static int scanout_pick(void){
  * kernel policy, set by the "desktop present ..." debug command and read
  * with BROOK_DESKTOP_FOCUS_QUERY every frame, unless pinned with
  * BROOK_RENDER_APP_PRESENT=0|1 or BROOK_RENDER_DIRECT_SCANOUT=off|shadow|on.
- * The boot default evaluates direct scanout eligibility only (counters). */
+ * The boot default is cadence on, direct scanout shadow (counters only). */
 static uint64_t monotonic_ns(void);
 enum { DIRECT_MODE_OFF=0, DIRECT_MODE_SHADOW=1, DIRECT_MODE_ON=2 };
 static const char *const g_directModeNames[3]={"off","shadow","on"};

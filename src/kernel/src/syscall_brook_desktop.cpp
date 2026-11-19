@@ -23,7 +23,7 @@ namespace brook {
 
 WmChromeCaptureStats g_chromeCaptureStats{}; // window.h / wm_chrome_key.h
 DesktopCaptureCounters g_desktopCaptureStats{}; // desktop_layers_export.h
-uint32_t g_desktopPresentPolicy=BROOK_DESKTOP_POLICY_DIRECT_SHADOW,g_desktopPresentDeferUs=0; // desktop_present_policy.h
+uint32_t g_desktopPresentPolicy=BROOK_DESKTOP_POLICY_APP_CADENCE|BROOK_DESKTOP_POLICY_DIRECT_SHADOW,g_desktopPresentDeferUs=0; // desktop_present_policy.h
 #if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
 static int64_t CaptureDesktopChrome(uint64_t owner,uint64_t op,uint64_t address,uint64_t size)
 {

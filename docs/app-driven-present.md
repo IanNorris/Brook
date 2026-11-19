@@ -1,6 +1,6 @@
 # App-driven present cadence and direct scanout
 
-**Status (18 Nov 2026, branch `work/app-present`):** stage 1 (app-driven cadence) and the stage 2 decision logic are implemented in the renderer, behind a RAM-only kernel switch that is off at boot. Direct scanout of a client buffer is evaluated and counted but never performed: the kernel cannot scan out client buffers yet (section 4). Host tests and the QEMU image check pass. Nothing has run on the Dell.
+**Status (18 Nov 2026, branch `work/app-present`):** stage 1 (app-driven cadence) and the stage 2 decision logic are implemented in the renderer, behind a RAM-only kernel switch. Since 19 Nov (Ian) the cadence is **on at boot**; `desktop present app off` or `BROOK_RENDER_APP_PRESENT=0` turns it off. Direct scanout of a client buffer is evaluated and counted but never performed: the kernel cannot scan out client buffers yet (section 4). Host tests and the QEMU image check pass. Nothing has run on the Dell.
 
 **Decision (Ian, 18 Nov, DECISIONS.md "App-driven present cadence"):** a focused, visible window covering more than 60% of the output's pixel area takes over the present cadence. When it exactly covers the output with an opaque, scanout-compatible buffer, it is scanned out directly.
 
@@ -154,7 +154,7 @@ A hardware cursor plane (CURACNTR/CURABASE/CURAPOS, 64×64 ARGB on gen8) would r
 | Command (debug channel) | Effect |
 |---|---|
 | `desktop present` / `desktop present status` | report |
-| `desktop present app on` / `app off` | stage 1 cadence |
+| `desktop present app on` / `app off` | stage 1 cadence (on at boot since 19 Nov) |
 | `desktop present direct off` / `direct shadow` / `direct on` | eligibility counters off, shadow (boot default), or real (falls back with `kernel`) |
 | `desktop present defer <ms>` | non-app deferral, 0 to 100 ms; 0 = 33 ms default |
 
@@ -179,7 +179,7 @@ The env vars `BROOK_RENDER_APP_PRESENT=0|1` and `BROOK_RENDER_DIRECT_SCANOUT=off
 
 Deploy the pair. Zero-copy arms at boot (auto-arm). In each case take the desktop stats before and after a 20 to 30 s window, and diff them.
 
-1. **Baseline**, nothing armed (`desktop present` reports `app_cadence:false`, `direct:"shadow"`).
+1. **Baseline:** run `desktop present app off` first (the boot default is now `app_cadence:true`, `direct:"shadow"`).
    - **Stardew fullscreen.** Expect:
      - `dominance` mostly `driven`;
      - `actions` all `free` (cadence off);
@@ -199,6 +199,6 @@ Deploy the pair. Zero-copy arms at boot (auto-arm). In each case take the deskto
      - `early_notifies` rising for native clients only.
    - **Interaction:** move the mouse over the paused game (the pointer must stay smooth: `app_stalled` rises, `defer` stays flat), open a menu or popup, Alt-Tab away and back (`transition`), and open the launcher.
    - **Compare** compositor job time per displayed frame in `gpu worker stats` against step 1.
-3. **Rollback:** `desktop present app off` (live), or reboot.
+3. **Rollback:** `desktop present app off` (live; RAM only, so the next boot is on again), or pin `BROOK_RENDER_APP_PRESENT=0` in the renderer environment.
 
 The decision criterion for keeping stage 1 on is the same or higher displayed fps for the four cases, no visible pointer stutter on an idle desktop, and no rise in `presents.failed`.
