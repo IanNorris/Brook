@@ -563,7 +563,8 @@ static void context_init(struct RenderContext *ctx){
 static void backdrop_stats_merge(struct BrookVkBackdropStats *total,struct BrookVkBackdropStats s){
     total->rebuilds+=s.rebuilds;total->reuses+=s.reuses;total->atlasNs+=s.atlasNs;
     total->glassNs+=s.glassNs;total->frameNs+=s.frameNs;total->shellNs+=s.shellNs;
-    total->timedFrames+=s.timedFrames;
+    total->tileRebuilds+=s.tileRebuilds;total->tileReuses+=s.tileReuses;
+    total->timedFrames+=s.timedFrames;total->atlasTimedFrames+=s.atlasTimedFrames;
 }
 static void context_close(int drm,struct RenderContext *ctx){
     backdrop_stats_merge(&g_backdropRetired,brook_vk_quad_pass_backdrop_stats(ctx->quad));
@@ -1199,6 +1200,10 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
         }
         if(c->bytes){
             uint32_t opacity=0;if(!desktop_layer_opacity(l,&opacity))goto done;
+            /* Chrome pixels follow the keyed capture's render key (hover,
+             * focus, title, theme), not the content generation; without
+             * one, every frame is new. */
+            const uint64_t chromeBlurKey=quad_backdrop_mix(l->incarnation,decor.reserved?decor.reserved:frame);
             /* The OS leaves the client interior of the chrome transparent. */
             const struct DesktopTrackHole hole=desktop_track_chrome_hole(l,c);
             trackWindow->hasChrome=1;trackWindow->chromeOpacity=opacity;trackWindow->chromeX=c->clientX;trackWindow->chromeY=c->clientY;
@@ -1221,7 +1226,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
                     if(blurEnabled && count<BROOK_VK_MAX_LAYERS){
                         const struct QuadRect r={span.x,span.y,span.x+(int32_t)span.width,span.y+(int32_t)span.height};
                         desktop_glass_frame(&blur,surface,r,count,belowWindow);
-                        blurKeys[count]=quad_backdrop_mix(l->incarnation,c->generation?c->generation:frame);
+                        blurKeys[count]=chromeBlurKey;
                     }
                     if(count<BROOK_VK_MAX_LAYERS)blur.chromeClass[count]=QUAD_GPU_FRAME;
                     if(push(scene,&count,sources,&chrome[i],&span))goto done;
@@ -1239,7 +1244,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
                 if(blurEnabled && count<BROOK_VK_MAX_LAYERS){
                     const struct QuadRect r={layer.x,layer.y,layer.x+(int32_t)layer.width,layer.y+(int32_t)layer.height};
                     desktop_glass_frame(&blur,surface,r,count,belowWindow);
-                    blurKeys[count]=quad_backdrop_mix(l->incarnation,c->generation?c->generation:frame);
+                    blurKeys[count]=chromeBlurKey;
                 }
                 if(count<BROOK_VK_MAX_LAYERS)blur.chromeClass[count]=QUAD_GPU_FRAME;
                 if(push(scene,&count,sources,&chrome[i],&layer))goto done;
@@ -2082,7 +2087,7 @@ static void stats_publish(uint64_t now){
      * closing brace. */
     if(length){
         size_t end=length;while(end && g_statsJson[end-1]!='}')--end;
-        if(end){char tail[2048];
+        if(end){char tail[2560];
             const struct BrookVkBackdropStats blur=desktop_backdrop_stats();
             const int n=snprintf(tail,sizeof(tail),",\"scanout\":{\"images\":%u,\"picks\":%llu,\"waits\":%llu,\"starved\":%llu,\"present_defers\":%llu,"
                 "\"full_draws\":%llu,\"partial_draws\":%llu,\"repair_pixels\":%llu},\"overlay_only_skips\":%llu,\"overlay_bands_kept\":%llu,"
@@ -2091,7 +2096,8 @@ static void stats_publish(uint64_t now){
                 "\"surfaces\":{\"records\":%d,\"queries\":%llu,\"shadows\":%llu,\"shadow_layers\":%llu,\"shadow_skips\":%llu,"
                 "\"overlay_records\":%d,\"overlay_record_captures\":%llu,\"shared_fallbacks\":%llu},"
                 "\"blur\":{\"enabled\":%d,\"capable\":%u,\"unavailable\":%d,\"rebuilds\":%llu,\"reuses\":%llu,\"layout_skips\":%llu,"
-                "\"atlas_gpu_ns\":%llu,\"glass_gpu_ns\":%llu,\"frame_gpu_ns\":%llu,\"shell_gpu_ns\":%llu,\"timed_frames\":%u},"
+                "\"atlas_gpu_ns\":%llu,\"glass_gpu_ns\":%llu,\"frame_gpu_ns\":%llu,\"shell_gpu_ns\":%llu,\"timed_frames\":%u,"
+                "\"atlas_timed_frames\":%u,\"tile_rebuilds\":%llu,\"tile_reuses\":%llu},"
                 "\"client\":{\"keep\":%d,\"keeps\":%llu,\"keep_misses\":%llu,\"captures\":%llu,\"bytes_copied\":%llu,\"bytes_kept\":%llu,\"band_reuses\":%llu}}\n",g_ring.count,
                 (unsigned long long)g_scanoutPicks,(unsigned long long)g_scanoutWaits,(unsigned long long)g_scanoutStarved,
                 (unsigned long long)g_scanoutPresentDefers,
@@ -2104,6 +2110,7 @@ static void stats_publish(uint64_t now){
                 g_backdropBlur,g_rendererCapsAccepted,g_backdropUnavailable,(unsigned long long)blur.rebuilds,(unsigned long long)blur.reuses,(unsigned long long)g_backdropSkips,
                 (unsigned long long)blur.atlasNs,(unsigned long long)blur.glassNs,
                 (unsigned long long)blur.frameNs,(unsigned long long)blur.shellNs,blur.timedFrames,
+                blur.atlasTimedFrames,(unsigned long long)blur.tileRebuilds,(unsigned long long)blur.tileReuses,
                 g_clientKeep,g_clientStats.keeps,g_clientStats.keepMisses,
                 g_clientStats.captures,g_clientStats.bytesCopied,g_clientStats.bytesKept,g_clientStats.bandReuses);
             if(n>0 && end-1+(size_t)n<sizeof(g_statsJson)){memcpy(g_statsJson+end-1,tail,(size_t)n);length=end-1+(size_t)n;}

@@ -29,6 +29,8 @@ pkgs.stdenv.mkDerivation {
     glslangValidator -V --target-env vulkan1.1 quad.vert -o quad_vertex.spv
     glslangValidator -V --target-env vulkan1.1 quad.frag -o quad_fragment.spv
     glslangValidator -V --target-env vulkan1.1 -DBROOK_QUAD_BLUR=1 quad.frag -o quad_blur.spv
+    glslangValidator -V --target-env vulkan1.1 -DBROOK_BACKDROP_CAPTURE=1 quad_backdrop.frag -o quad_backdrop_capture.spv
+    glslangValidator -V --target-env vulkan1.1 quad_backdrop.frag -o quad_backdrop_filter.spv
     python3 - <<'PY'
     import struct
     from pathlib import Path
@@ -55,7 +57,8 @@ pkgs.stdenv.mkDerivation {
         text += 'static const uint32_t '+symbol+'[] = {\n'+',\n'.join('0x%08xu' % word for word in words)+'\n};\n'
     Path('graphics_pass_spv.h').write_text(text)
     text = ""
-    for name,symbol in (('quad_vertex','quadVertexCode'),('quad_fragment','quadFragmentCode'),('quad_blur','quadBlurCode')):
+    for name,symbol in (('quad_vertex','quadVertexCode'),('quad_fragment','quadFragmentCode'),('quad_blur','quadBlurCode'),
+                        ('quad_backdrop_capture','quadBackdropCaptureCode'),('quad_backdrop_filter','quadBackdropFilterCode')):
         data = Path(name+'.spv').read_bytes()
         words = struct.unpack('<'+'I'*(len(data)//4),data)
         text += 'static const uint32_t '+symbol+'[] = {\n'+',\n'.join('0x%08xu' % word for word in words)+'\n};\n'
