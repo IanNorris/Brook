@@ -168,6 +168,20 @@ int main(){
          f.pte=before;assert(b.BindTakenOver(l,f,before.data(),0x400000));f.failInvalidate=f.invalidations+2;
          assert(!b.RetireToInvalid(f) && !b.SafeToRelease() && b.State()==BdwGgttExtentState::Quarantined);}
     }
+    {
+        uint64_t pages[]={0x100000,0x101000},snapshot[]={0xdead0001,0xbeef0000};
+        const BdwGgttExtentLease lease{{65536,2,777},pages};
+        BdwGgttExtentBind bind;
+        ExtentFake bindIo;
+        bindIo.transaction=&bind;
+        bindIo.pte.assign(snapshot,snapshot+2);
+        assert(bind.BindReversible(lease,bindIo,snapshot,0x400000));
+        ExtentFake retireIo;
+        retireIo.transaction=&bind;
+        retireIo.pte=bindIo.pte;
+        assert(bind.RetireReversible(retireIo) && bind.SafeToRelease());
+        assert(!retireIo.pte[0] && !retireIo.pte[1] && bind.Recycle());
+    }
     {MmioOwner owner;uint64_t pte=119971841;uint32_t flush=0;
      BdwScratchMmio<MmioOwner> io(owner,&pte,&flush,65536,0);
      auto r=BdwClearKnownScratchSlot(io,65536,119971841);

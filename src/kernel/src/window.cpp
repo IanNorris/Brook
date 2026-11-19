@@ -2434,6 +2434,17 @@ bool WmGpuSourceProviderMatches(uint32_t window,uint64_t incarnation,uint32_t pi
         (w.proc->isThread?w.proc->leaderIncarnation:w.proc->incarnation)==providerIncarnation;
 }
 
+bool WmClientScanoutWindowMatches(uint32_t window,uint64_t incarnation,uint32_t width,uint32_t height)
+{
+    if(!window || window>WM_MAX_WINDOWS || !incarnation)return false;
+    VfbGuard guard;
+    const int idx=__atomic_load_n(&g_focusedIdx,__ATOMIC_ACQUIRE);
+    if(idx!=static_cast<int>(window)-1)return false;
+    const Window& w=g_windows[idx];
+    return w.proc && w.wmId==window && w.creationIdentity==incarnation && w.visible && !w.minimized &&
+        w.noChrome && !w.clientX() && !w.clientY() && w.clientW==width && w.clientH==height;
+}
+
 bool WmSnapshotFocus(uint32_t* window, uint64_t* incarnation, uint32_t* flags)
 {
     if (!window || !incarnation || !flags) return false;

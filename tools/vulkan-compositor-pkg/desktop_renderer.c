@@ -588,7 +588,8 @@ static int overlay_cursor(int drm,struct RenderContext *ctx,struct DesktopOverla
     *state=(struct DesktopOverlayCursorState){0};
     if(g_overlayTracked!=1)return 0;
     const uint64_t known=ctx->cursor.handle?ctx->cursorSerial:0;
-    if(syscall(BROOK_SYS_DESKTOP_OVERLAY,BROOK_DESKTOP_OVERLAY_CURSOR,0,&g_cursorInfo,sizeof(g_cursorInfo),known,0))return -1;
+    if(syscall(BROOK_SYS_DESKTOP_OVERLAY,BROOK_DESKTOP_OVERLAY_CURSOR,0,&g_cursorInfo,sizeof(g_cursorInfo),known,BROOK_DESKTOP_CURSOR_PLANE_V1) &&
+       (errno!=EINVAL || syscall(BROOK_SYS_DESKTOP_OVERLAY,BROOK_DESKTOP_OVERLAY_CURSOR,0,&g_cursorInfo,sizeof(g_cursorInfo),known,0)))return -1;
     const struct BrookDesktopOverlayCursor *c=&g_cursorInfo;
     if(!c->visible || !c->width || !c->height || c->width>BROOK_DESKTOP_CURSOR_MAX ||
        c->height>BROOK_DESKTOP_CURSOR_MAX || c->stride!=BROOK_DESKTOP_CURSOR_MAX)return 0;

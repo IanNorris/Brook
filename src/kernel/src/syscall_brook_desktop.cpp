@@ -1,3 +1,4 @@
+#include "intel_bdw_scanout_target.h"
 // syscall_brook_desktop.cpp -- Brook desktop syscalls: layer capture, scene graph, debug frame, overlay.
 //
 // Split from syscall.cpp (see docs/agent/syscall-split-plan.md).
@@ -428,7 +429,8 @@ int64_t sys_brook_desktop_overlay(uint64_t op,uint64_t token,uint64_t destinatio
     auto* proc=ProcessCurrent();if(!proc)return -ESRCH;
     KernelOperationGuard operation(proc);
     if(!brook::BdwRenderExperimentEnabled())return -ENODEV;
-    if(reserved || token>0xffffffffULL)return -EINVAL;
+    if(token>0xffffffffULL || (reserved &&
+       (op!=BROOK_DESKTOP_OVERLAY_CURSOR || reserved!=BROOK_DESKTOP_CURSOR_PLANE_V1)))return -EINVAL;
     const uint64_t owner=proc->leaderIncarnation?proc->leaderIncarnation:proc->incarnation;
     if(op==0){
         if(token || destination || length || (offset & ~uint64_t(BROOK_DESKTOP_OVERLAY_NO_CURSOR)))return -EINVAL;
@@ -493,6 +495,7 @@ int64_t sys_brook_desktop_overlay(uint64_t op,uint64_t token,uint64_t destinatio
         auto* cursor=static_cast<BrookDesktopOverlayCursor*>(kmalloc(sizeof(BrookDesktopOverlayCursor)));
         if(!cursor)return -ENOMEM;
         CompositorOverlayCursor(*cursor,offset);
+        if(reserved && brook::BdwCursorRendererQuery(owner))cursor->visible=0;
         const uint64_t bytes=cursor->serial==offset?offsetof(BrookDesktopOverlayCursor,pixels):sizeof(*cursor);
         const bool copied=CopyToUser(destination,cursor,bytes);
         kfree(cursor);return copied?0:-EFAULT;
