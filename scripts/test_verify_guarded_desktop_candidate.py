@@ -8,6 +8,8 @@ import unittest
 from unittest import mock
 
 import verify_guarded_desktop_candidate as verifier
+from prepare_hardware_kernel_pair import CHROMIUM_POLICY_DIRS
+from stage_clearwater_shell import CLEARWATER_START
 
 
 @unittest.skipUnless(all(shutil.which(x) for x in ('mformat','mmd','mcopy','mtype','mdir','fsck.fat')),'requires FAT tools')
@@ -39,7 +41,11 @@ class VerifyGuardedDesktop(unittest.TestCase):
         shutil.copyfile(self.image,self.source);shutil.copyfile(self.image,self.ref)
     def copy(self,name,data):
         subprocess.run(['mcopy','-o','-i',str(self.image),'-','::/'+name],input=data,check=True)
-    def check(self, allow_gpu_submission_timing=False, allow_vulkan_desktop=False, allow_vulkan_partial=False, allow_gpu_blocked_recovery_test=False, expected_gpu_provider=None, allow_gpu_source_trace=False, allow_vulkan_async_partial=False, allow_dell_bcs_present=False, allow_irq_signal_probe=False, allow_hidden_kernel_console=False):
+    def stage_chromium_policy(self):
+        for directory in CHROMIUM_POLICY_DIRS:
+            subprocess.run(['mmd', '-i', str(self.image), '::/' + directory], check=True)
+        self.copy(verifier.CHROMIUM_POLICY_PATH, verifier.CHROMIUM_POLICY)
+    def check(self, allow_gpu_submission_timing=False, allow_vulkan_desktop=False, allow_vulkan_partial=False, allow_gpu_blocked_recovery_test=False, expected_gpu_provider=None, allow_gpu_source_trace=False, allow_vulkan_async_partial=False, allow_dell_bcs_present=False, allow_irq_signal_probe=False, allow_hidden_kernel_console=False, **kwargs):
         with mock.patch.object(verifier,'CHECKER_SHA',hashlib.sha256(self.fat).hexdigest()), \
              mock.patch.object(verifier,'E2FSCK_SHA',hashlib.sha256(self.ext).hexdigest()), \
              mock.patch.object(verifier,'module_version',return_value=65):
@@ -50,7 +56,7 @@ class VerifyGuardedDesktop(unittest.TestCase):
                                    allow_vulkan_partial=allow_vulkan_partial,allow_gpu_blocked_recovery_test=allow_gpu_blocked_recovery_test,
                                    expected_gpu_provider=expected_gpu_provider,allow_gpu_source_trace=allow_gpu_source_trace,
                                    allow_vulkan_async_partial=allow_vulkan_async_partial,allow_dell_bcs_present=allow_dell_bcs_present,
-                                   allow_irq_signal_probe=allow_irq_signal_probe,allow_hidden_kernel_console=allow_hidden_kernel_console)
+                                   allow_irq_signal_probe=allow_irq_signal_probe,allow_hidden_kernel_console=allow_hidden_kernel_console, **kwargs)
     def test_irq_signal_probe_requires_exact_opt_in(self):
         with self.assertRaisesRegex(ValueError, 'Missing or invalid opt-in irq-signal-probe'):
             self.check(allow_irq_signal_probe=True)
@@ -82,6 +88,7 @@ class VerifyGuardedDesktop(unittest.TestCase):
         shutil.copyfile(self.source,self.image);self.copy('BOOT/INIT.RC',b'changed\n')
         with self.assertRaisesRegex(ValueError,'startup script mismatch'):self.check()
     def test_vulkan_start_requires_exact_opt_in(self):
+        self.stage_chromium_policy()
         self.copy('BOOT/INIT.RC',verifier.add_vulkan_desktop_start(b'set wm\n'))
         self.copy('BOOT/VKSUP.ELF',b'\x7fELF-sup');self.copy('BOOT/VKRENDER.ELF',b'\x7fELF-render')
         with self.assertRaisesRegex(ValueError,'startup script mismatch'):self.check()
@@ -91,13 +98,33 @@ class VerifyGuardedDesktop(unittest.TestCase):
         self.copy('BOOT/VKRENDER.ELF',b'\x7fELF-render')
         self.copy('BOOT/INIT.RC',verifier.add_vulkan_desktop_start(b'set wm\n')+b'run unexpected\n')
         with self.assertRaisesRegex(ValueError,'startup script mismatch'):self.check(allow_vulkan_desktop=True)
+    def test_clearwater_requires_exact_startup_and_executables(self):
+        supervisor = b'\x7fELF-cw-supervisor'
+        shell = b'\x7fELF-cw-shell'
+        hashes = dict(expected_clearwater_supervisor=verifier.sha(supervisor),
+                      expected_clearwater_shell=verifier.sha(shell))
+        self.copy('BOOT/CWSUP.ELF', supervisor)
+        self.copy('BOOT/CWSHELL.ELF', shell)
+        with self.assertRaisesRegex(ValueError, 'Unexpected Clearwater executable'):
+            self.check()
+        with self.assertRaisesRegex(ValueError, 'startup script mismatch'):
+            self.check(**hashes)
+        self.copy('BOOT/INIT.RC', b'set wm\n' + CLEARWATER_START + b'\n')
+        self.assertEqual(self.check(**hashes)['clearwater_executables_sha256']['CWSHELL.ELF'],
+                         hashes['expected_clearwater_shell'])
+        self.copy('BOOT/CWSHELL.ELF', shell + b'changed')
+        with self.assertRaisesRegex(ValueError, 'Clearwater executable mismatch CWSHELL.ELF'):
+            self.check(**hashes)
+
     def test_partial_requires_separate_exact_opt_in(self):
+        self.stage_chromium_policy()
         self.copy('BOOT/INIT.RC',verifier.add_vulkan_desktop_start(b'set wm\n',True))
         self.copy('BOOT/VKSUP.ELF',b'\x7fELF-sup');self.copy('BOOT/VKRENDER.ELF',b'\x7fELF-render')
         with self.assertRaisesRegex(ValueError,'startup script mismatch'):self.check(allow_vulkan_desktop=True)
         with self.assertRaisesRegex(ValueError,'requires Vulkan'):self.check(allow_vulkan_partial=True)
         self.assertTrue(self.check(allow_vulkan_desktop=True,allow_vulkan_partial=True)['vulkan_partial_enabled'])
     def test_async_blitter_requires_exact_opt_ins(self):
+        self.stage_chromium_policy()
         self.copy('BOOT/INIT.RC',verifier.add_vulkan_desktop_start(b'set wm\n',async_partial=True))
         self.copy('BOOT/VKSUP.ELF',b'\x7fELF-sup');self.copy('BOOT/VKRENDER.ELF',b'\x7fELF-render')
         self.copy('ETC/dell-gpu-bcs-present',b'1\n')
@@ -113,6 +140,7 @@ class VerifyGuardedDesktop(unittest.TestCase):
     def test_gpu_source_requires_provider_pin_and_exact_start(self):
         base=b'set wm\nrun --service --once --uid 1000 /boot/INTLWL.ELF\n'
         self.copy('BOOT/INIT.RC',base);shutil.copyfile(self.image,self.source);shutil.copyfile(self.image,self.ref)
+        self.stage_chromium_policy()
         self.copy('BOOT/INIT.RC',verifier.add_vulkan_desktop_start(base,True,True))
         self.copy('BOOT/VKSUP.ELF',b'\x7fELF-sup');self.copy('BOOT/VKRENDER.ELF',b'\x7fELF-render')
         self.copy('BOOT/INTLWL.ELF',b'\x7fELF-provider')

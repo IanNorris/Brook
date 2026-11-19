@@ -340,6 +340,48 @@ submits surfaces through the stage 1.3 ABI. Launcher organisation
 built in the kernel painter first. The kernel keeps a minimal
 taskbar and frame for when the shell is down (DESIGN.md T3).
 
+#### Stage 3 implementation and validation
+
+`work/clearwater-s3` is based on integration49 (`095ae70e`). The kernel
+takes bounded, pointer-free snapshots of the active shell surfaces and
+keeps input routing, hit testing, window identity, focus and popup geometry.
+`CWSHELL.ELF` builds display lists with the same fonts and shared builders.
+The kernel validates the submitted commands and replays them through the
+existing surface records and overlay cache. A replacement shell receives
+fresh snapshots without taking ownership of any window. The compositor
+uses a themed fallback bar if the shell exits, and `CWSUP.ELF` restarts it.
+
+The frame paths keep their existing GPU passes and reuse unchanged shell
+rasters. A changed surface sends a model of about 115 KiB plus its bounded
+list and used assets. Idle sampling runs at the 100 ms overlay cadence.
+The shell prepares a default launcher list while it is closed. Opening
+uses that list only when the current snapshot matches. A stale page or
+confirmation is never shown while a fresh list is pending.
+
+Build the guarded image with `scripts/build_dell_image.py --clearwater-shell`
+and the four Broadwell options. The final code is `70c0e720` and the pair is
+`build/dell/pair-cws3-warm` (`dell-cws3-20261119`). Guarded QEMU passed on
+attempt 1 and recorded the shell's first taskbar publication. The fresh
+kernel build fit the existing 8 MiB loader limit. The incremental build
+that included the expanded symbol table exceeded that limit.
+
+The evidence is under `build/cws3-evidence`. Release, 383 non-stress tests,
+both stress tests and 25 image-staging tests passed. All 220 golden PNGs
+are unchanged. The nine final launcher regions match pixel for pixel.
+The broader theme and scale matrix also matches static chrome, with live
+telemetry, build labels, boot timings and the terminal caret varying
+between boots. The shell-kill fixture caught the fallback bar and saw PID
+19 replaced by PID 22. The launcher reopened in its previous state and
+the terminal survived.
+
+For Opaque Dark at 100% in software QEMU, two runs per revision sampled
+the guest's framebuffer directly. Launcher open was 11.94 to 12.84 ms at
+the median and 19.99 to 18.99 ms at p95 (110 samples per revision). Taskbar
+minimize/restore was 11.16 to 12.04 ms at the median and 19.00 to 19.25 ms
+at p95 (160 samples per revision). Idle host QEMU CPU was 0.080–0.083 core
+before and 0.083–0.086 core after. These are VM observations. Intel GPU and
+physical input costs remain unmeasured.
+
 ## Tests
 
 - **Host unit tests (ctest):**

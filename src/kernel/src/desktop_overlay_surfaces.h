@@ -3,7 +3,7 @@
 // overlay capture used to re-rasterise every shell surface (taskbar,
 // launcher, popups, boot summary) into the shared capture buffer and hash all
 // of their pixels. Each surface now has a content key (its display list's
-// hash, WmShellSurfaceKey), and the buffer remembers which surface, rectangle
+// hash), and the buffer remembers which surface, rectangle
 // and key it holds. A capture rasterises only the surfaces whose key or
 // rectangle changed, and anything that shares pixels with them, so an
 // unchanged launcher costs nothing while the taskbar graph or a hover

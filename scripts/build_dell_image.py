@@ -111,6 +111,7 @@ def main():
                    help='override one kernel option (repeatable)')
     p.add_argument('--supervisor', default='brook-desktop-supervisor-serial',
                    help='supervisor variant from the vulkan-compositor package')
+    p.add_argument('--clearwater-shell', action='store_true', help='build and start the supervised Clearwater shell')
     p.add_argument('--show-kernel-console', action='store_true',
                    help='keep the source startup script\'s Kernel Console window (hidden by default; '
                         'otherwise it opens from Apps > Kernel Console)')
@@ -162,6 +163,23 @@ def main():
     supervisor = compositor / 'bin' / a.supervisor
     renderer = compositor / 'bin/brook-desktop-renderer'
     provider = waylandd / 'bin/waylandd'
+    packages = {'vulkan_compositor': str(compositor), 'waylandd_vulkan': str(waylandd)}
+    boot_services = {'VKSUP.ELF': supervisor, 'VKRENDER.ELF': renderer, 'INTLWL.ELF': provider}
+    clearwater_stage = []
+    clearwater_verify = []
+    if a.clearwater_shell:
+        for filename, option, nix_path in (
+            ('CWSUP.ELF', 'clearwater-supervisor', 'tools/vulkan-compositor-pkg/clearwater-supervisor.nix'),
+            ('CWSHELL.ELF', 'clearwater-shell', 'tools/clearwater-shell-pkg/default.nix'),
+        ):
+            result = run(['nix-build', '--no-out-link', ROOT / nix_path], cwd=ROOT,
+                         stdout=subprocess.PIPE, text=True)
+            package = Path(result.stdout.strip())
+            executable = package / 'bin' / filename
+            packages[option.replace('-', '_')] = str(package)
+            boot_services[filename] = executable
+            clearwater_stage.extend(['--' + option, executable])
+            clearwater_verify.extend(['--expected-' + option, sha(executable)])
 
     # 3. Prepare the pair
     abi = module_abi()
@@ -171,7 +189,7 @@ def main():
          '--enable-dell-acpi-monitor', '--enable-ac-loss-poweroff', '--enable-vulkan-desktop',
          '--enable-vulkan-async-partial', '--enable-dell-bcs-present', '--vulkan-supervisor', supervisor,
          '--vulkan-renderer', renderer, '--gpu-source-provider', provider]
-        + ([] if a.show_kernel_console else ['--hide-kernel-console']), cwd=ROOT / 'scripts')
+        + clearwater_stage + ([] if a.show_kernel_console else ['--hide-kernel-console']), cwd=ROOT / 'scripts')
 
     # 3b. Binary-bridge helper from this checkout (frame options and scanout
     # provenance; the pinned source initrd carries an older HWBULK.ELF).
@@ -188,6 +206,7 @@ def main():
               '--allow-vulkan-desktop', '--allow-vulkan-async-partial', '--allow-dell-bcs-present',
               '--allow-ac-loss-poweroff', '--expected-vulkan-supervisor', sha(supervisor),
               '--expected-vulkan-renderer', sha(renderer), '--expected-gpu-provider', sha(provider)]
+    verify += clearwater_verify
     verify += [flag for name, flag in VERIFY_ALLOW.items() if options.get(name) == 'ON']
     if not a.show_kernel_console:
         verify.append('--allow-hidden-kernel-console')
@@ -201,10 +220,10 @@ def main():
         'payload_id': a.payload_id, 'commit': commit, 'dirty': dirty, 'module_abi': abi,
         'kernel_options': options, 'kernel_console_hidden': not a.show_kernel_console, 'kernel_sha256': sha(a.output / 'kernel.elf'),
         'initrd_sha256': sha(a.output / 'INITRD.IMG'), 'source_initrd_sha256': SOURCE_INITRD_SHA,
-        'packages': {'vulkan_compositor': str(compositor), 'waylandd_vulkan': str(waylandd)},
+        'packages': packages,
         'bulk_helper': {'source': 'tools/hardware_bulk.c', 'sha256': sha(helper)},
         'boot_services': {name: {'source': str(path), 'sha256': sha(path), 'runtime_store_paths': runtime_paths(path)}
-                          for name, path in (('VKSUP.ELF', supervisor), ('VKRENDER.ELF', renderer), ('INTLWL.ELF', provider))},
+                          for name, path in boot_services.items()},
     }
     (a.output / 'build-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     print(json.dumps({k: manifest[k] for k in ('payload_id', 'commit', 'dirty', 'kernel_sha256', 'initrd_sha256')}, indent=2))

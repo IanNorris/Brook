@@ -93,7 +93,7 @@ static inline int brook_selection_from_legacy(uint64_t old, uint64_t* selection)
     if ((old & ~0x1fffULL) || theme > 2 || mode >= BROOK_MODE_COUNT ||
         brook_selection_hue(old) >= BROOK_HUE_COUNT) return 0;
     *selection = BROOK_THEME_SELECTION(theme ? BROOK_THEME_OPAQUE : BROOK_THEME_GLASS,
-                                       theme == 1 ? BROOK_MODE_LIGHT : theme == 2 ? BROOK_MODE_DARK : mode,
+                                       theme == 1 ? (unsigned)BROOK_MODE_LIGHT : theme == 2 ? (unsigned)BROOK_MODE_DARK : mode,
                                        brook_selection_hue(old));
     return 1;
 }
@@ -101,7 +101,7 @@ static inline uint32_t brook_selection_legacy(uint64_t selection) {
     const unsigned theme = brook_selection_theme(selection), mode = brook_selection_mode(selection);
     const unsigned hue = brook_selection_hue(selection);
     return BROOK_THEME_SELECTION(theme == BROOK_THEME_GLASS ? 0 : mode == BROOK_MODE_LIGHT ? 1 : 2,
-                                 mode, hue < BROOK_HUE_COUNT ? hue : BROOK_HUE_BLUE);
+                                 mode, hue < BROOK_HUE_COUNT ? hue : (unsigned)BROOK_HUE_BLUE);
 }
 static inline unsigned brook_theme_resolve(unsigned material, int glassAvailable) {
     return material == BROOK_THEME_GLASS && glassAvailable ? BROOK_THEME_GLASS : BROOK_THEME_OPAQUE;
