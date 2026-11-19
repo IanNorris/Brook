@@ -165,6 +165,7 @@ void RobustFutexCleanup(Process* process) {
     process->robustListHead=0;process->robustExitState=3;++robustCleanups;
 }
 void SchedulerReleaseWaitReference(Process* process) {CHECK(process->robustExitState==3);ProcessUnref(process);}
+void SchedulerReleaseDeadGroupFiles(Process*) {}
 extern "C" void SchedulerSleepMs(uint32_t) {++robustDelays;}
 void ProcessDestroyNow(Process* process) {
     CHECK(process==expectedDestroy);

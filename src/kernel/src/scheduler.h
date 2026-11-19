@@ -97,6 +97,10 @@ bool SchedulerKernelOperationBoundary();
 // Caller keeps anchor alive for this call; cooperative cancellation drains waits.
 void SchedulerRequestFatalSignal(Process* anchor, int signal);
 void SchedulerMarkTerminated(Process* proc, int waitStatus);
+// Cleanup worker, after a forced-exit victim is off-CPU: when its whole thread
+// group is now terminated and quiesced, close the group's shared descriptors.
+// Linux releases files when the last task exits, not when the parent reaps.
+void SchedulerReleaseDeadGroupFiles(Process* member);
 // Request a stop without yielding (for the syscall signal-return path).
 void SchedulerMarkStopped(Process* proc, int signal = 19);
 // Drop an owned wait reference and notify a parent if this made it reapable.
