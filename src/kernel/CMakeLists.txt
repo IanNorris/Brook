@@ -143,24 +143,7 @@ add_custom_command(
     VERBATIM
 )
 
-# Bake the font atlas at configure time so it's available immediately.
-message(STATUS "Baking font atlas: ${BROOK_FONT_TTF} @ ${BROOK_FONT_SIZE}px")
-execute_process(
-    COMMAND ${BROOK_PYTHON3}
-            "${BROOK_ROOT}/scripts/bake_font.py"
-            "${BROOK_FONT_TTF}"
-            "${BROOK_FONT_SIZE}"
-            "${FONT_ATLAS_CPP}"
-    RESULT_VARIABLE BAKE_RESULT
-    OUTPUT_VARIABLE BAKE_OUTPUT
-    ERROR_VARIABLE  BAKE_ERROR
-)
-if(NOT BAKE_RESULT EQUAL 0)
-    message(FATAL_ERROR "Font baking failed:\n${BAKE_ERROR}")
-endif()
-message(STATUS "${BAKE_OUTPUT}")
-
-# Also add a custom target so the atlas is re-baked if the font or script changes.
+# Generate the atlas as a build dependency so unchanged inputs preserve it.
 add_custom_command(
     OUTPUT  "${FONT_ATLAS_CPP}"
     COMMAND ${BROOK_PYTHON3}
@@ -168,7 +151,7 @@ add_custom_command(
             "${BROOK_FONT_TTF}"
             "${BROOK_FONT_SIZE}"
             "${FONT_ATLAS_CPP}"
-    DEPENDS "${BROOK_ROOT}/scripts/bake_font.py" "${BROOK_FONT_TTF}"
+    DEPENDS "${BROOK_ROOT}/scripts/bake_font.py" "${BROOK_FONT_TTF}" "${BROOK_PYTHON3}"
     COMMENT "Baking font atlas (${BROOK_FONT_SIZE}px Hack)"
     VERBATIM
 )
@@ -199,28 +182,13 @@ endforeach()
 # ---------------------------------------------------------------------------
 
 set(FAT_IMAGE_SIZE_KB 360)
-message(STATUS "Baking FAT test image (${FAT_IMAGE_SIZE_KB} KB)")
-execute_process(
-    COMMAND ${BROOK_PYTHON3}
-            "${BROOK_ROOT}/scripts/make_fat_image.py"
-            "${FAT_IMAGE_CPP}"
-            "${FAT_IMAGE_SIZE_KB}"
-    RESULT_VARIABLE FAT_RESULT
-    OUTPUT_VARIABLE FAT_OUTPUT
-    ERROR_VARIABLE  FAT_ERROR
-)
-if(NOT FAT_RESULT EQUAL 0)
-    message(FATAL_ERROR "FAT image baking failed:\n${FAT_ERROR}")
-endif()
-message(STATUS "${FAT_OUTPUT}")
-
 add_custom_command(
     OUTPUT  "${FAT_IMAGE_CPP}"
     COMMAND ${BROOK_PYTHON3}
             "${BROOK_ROOT}/scripts/make_fat_image.py"
             "${FAT_IMAGE_CPP}"
             "${FAT_IMAGE_SIZE_KB}"
-    DEPENDS "${BROOK_ROOT}/scripts/make_fat_image.py"
+    DEPENDS "${BROOK_ROOT}/scripts/make_fat_image.py" "${BROOK_PYTHON3}"
     COMMENT "Baking FAT test image (${FAT_IMAGE_SIZE_KB} KB)"
     VERBATIM
 )
@@ -734,7 +702,9 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL "" FORCE)
 # ---------------------------------------------------------------------------
 add_custom_command(TARGET kernel POST_BUILD
     COMMAND ${BROOK_PYTHON3} "${BROOK_ROOT}/scripts/gen_ksym_table.py"
-            "$<TARGET_FILE:kernel>" "${KSYM_TABLE_CPP}"
+            "$<TARGET_FILE:kernel>" "${KSYM_TABLE_CPP}.tmp"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KSYM_TABLE_CPP}.tmp" "${KSYM_TABLE_CPP}"
+    COMMAND ${CMAKE_COMMAND} -E rm "${KSYM_TABLE_CPP}.tmp"
     COMMENT "Generating kernel symbol address table (rebuild to link it in)"
     VERBATIM
 )

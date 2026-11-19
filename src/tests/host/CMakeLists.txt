@@ -518,6 +518,8 @@ target_compile_options(test_futex_pool PRIVATE
     "-iquote${BROOK_ROOT}/src/kernel/src"
 )
 add_host_test(test_fd_table)
+# The full suite includes stress tests; use ctest -LE stress for a quick local run.
+set_tests_properties(test_fd_table PROPERTIES LABELS stress)
 add_host_test(test_record_locks
     "${BROOK_ROOT}/src/kernel/src/record_locks.cpp"
     "${BROOK_ROOT}/src/kernel/src/file_locks.cpp"
@@ -617,6 +619,7 @@ target_compile_options(test_vmm_leaf PRIVATE
     "-iquote${BROOK_ROOT}/src/shared/inc_km"
 )
 target_link_options(test_vmm_leaf PRIVATE -Wl,--gc-sections)
+set_tests_properties(test_vmm_leaf PROPERTIES LABELS stress)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(test_vmm_leaf PRIVATE -Wno-error=class-memaccess -Wno-error=attributes -Wno-error=array-bounds)
 endif()
