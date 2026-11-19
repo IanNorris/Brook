@@ -377,7 +377,26 @@ def reset_status(session,**_):
 
 
 def observe(session, crop=None, max_width=None, include=None, since_event_cursor=None,
-            error_limit_bytes=65536,error_limit_events=64, **_):
+            error_limit_bytes=65536,error_limit_events=64, window=None, window_area='frame', **_):
+    if window is not None:
+        # QEMU equivalent of hw_transfer window crops: frame (outer incl.
+        # chrome) or client area of one window, from a snapshot taken just
+        # before the capture (not atomic with it).
+        from window_crop import find_window, window_rect
+        if include is not None or crop is not None:raise ValueError('window cannot be combined with include or crop')
+        if window_area not in ('frame','client'):raise ValueError('vm_observe window_area must be frame or client')
+        ui=window_ui();ui.validate_reference(window)
+        row=find_window(ui.windows(session),window)
+        x,y,w,h=window_rect(row,window_area)
+        with session_lock(session) as data:
+            full=capture(session,data)
+        fw,fh=full['data']['width'],full['data']['height']
+        x0,y0,x1,y1=max(0,x),max(0,y),min(fw,x+w),min(fh,y+h)
+        if x1<=x0 or y1<=y0:raise ValueError('Window rectangle is entirely off screen')
+        result=frame_views(session).view(full['data']['frame_id'],{'x':x0,'y':y0,'width':x1-x0,'height':y1-y0},max_width)
+        result['data']['window']={'reference':window,'area':window_area,'title':row.get('title'),
+            'full_frame_id':full['data']['frame_id'],'consistency':'window snapshot taken before the capture; not atomic with the frame'}
+        return result
     if include is not None:
         return Observations(window_ui(),capture,panic_state).collect(session,include,crop,max_width,
             since_event_cursor,error_limit_bytes,error_limit_events)
@@ -981,7 +1000,13 @@ def register(name,fn,description,props=None,required=None,readonly=False):
     TOOLS[name]=(fn,{"name":name,"description":description,"inputSchema":schema(props,required),
                     "annotations":{"readOnlyHint":readonly,"destructiveHint":not readonly,"openWorldHint":False}})
 hardware=Hardware()
-register("hw_transfer",hardware.transfer,"Transfer a staged file or completed screenshot over the authenticated binary socket; returns local paths/metadata only, never base64; frame defaults to PNG only; inspect the same hw_job after uncertain delivery",{**SESSION,"request_id":STR,"action":{"type":"string","enum":["put","get","frame"]},"key_file":STR,"output":STR,"source":STR,"artifact_id":STR,"port":INT,"keep_raw":{"type":"boolean"}},["session","request_id","action","key_file","output"])
+register("hw_transfer",hardware.transfer,"Transfer a staged file or a screenshot of what the panel shows (scanout readback; frame.source/scanout give provenance) over the authenticated binary socket; optional window crop; returns local paths/metadata only, never base64; frame defaults to PNG only; inspect the same hw_job after uncertain delivery",{**SESSION,"request_id":STR,"action":{"type":"string","enum":["put","get","frame"]},"key_file":STR,"output":STR,"source":STR,"artifact_id":STR,"port":INT,"keep_raw":{"type":"boolean"},
+    "window":{**schema({"window_id":INT,"incarnation":STR,"session_generation":STR,"guest_boot_id":STR},["window_id","incarnation","session_generation","guest_boot_id"]),
+              "description":"frame only: exact reference from hw_windows; crops the screen capture to that window (screenshot.png keeps the full frame)"},
+    "window_area":{"type":"string","enum":["frame","client","buffer"],"default":"frame",
+                   "description":"with window: frame = on-screen outer rectangle incl. chrome; client = on-screen client area (may be occluded); buffer = the client's own current CPU buffer, unoccluded (not GPU-published windows)"},
+    "cursor":{"type":"boolean","default":False,"description":"frame only: composite the hardware cursor plane (a software cursor is always in the pixels)"}},
+    ["session","request_id","action","key_file","output"])
 register("hw_panic_report",hardware.panic_report,"Retrieve the newest valid preallocated panic journal record after reboot through the authenticated binary bridge; writes a local packet and receipts, never retries an uncertain operation",{**SESSION,"request_id":STR,"key_file":STR,"output":STR,"port":INT},["session","request_id","key_file","output"])
 register("hw_recovery_panic",hardware.recovery_panic,"Read the newest or previous boot-pinned recovery panic snapshot into a new local file and verify its checksum",{**SESSION,"output":STR,"previous":{"type":"boolean"}},["session","output"],True)
 register("hw_attach",hardware.attach,"Attach an explicit physical Brook IPv4 endpoint and pin its boot; no network discovery or QEMU required",{"host":STR,"port":INT},["host"])
@@ -1010,7 +1035,10 @@ OBSERVATION_OPTIONS={**IMAGE_OPTION,
     "include":{"type":"array","items":{"type":"string","enum":["frame","windows","processes","launches","errors"]},"minItems":1,"maxItems":5},
     "since_event_cursor":{"type":"object"},"error_limit_bytes":INT,"error_limit_events":INT,
     "crop":schema({"x":INT,"y":INT,"width":INT,"height":INT},["x","y","width","height"]),"max_width":INT}
-register("vm_observe",observe,"Completed-frame artifact or selectable boot-bound frame/windows/tasks/launches/error bundle with per-component timing; snapshots are not atomic; serial errors are best-effort",{**SESSION,**OBSERVATION_OPTIONS},["session"])
+register("vm_observe",observe,"Completed-frame artifact or selectable boot-bound frame/windows/tasks/launches/error bundle with per-component timing; snapshots are not atomic; serial errors are best-effort; window crops one window",{**SESSION,**OBSERVATION_OPTIONS,
+    "window":{**schema({"window_id":INT,"incarnation":STR,"session_generation":STR,"guest_boot_id":STR},["window_id","incarnation","session_generation","guest_boot_id"]),
+              "description":"exact reference from vm_windows: crop the capture to that window (not with include/crop)"},
+    "window_area":{"type":"string","enum":["frame","client"],"default":"frame","description":"with window: outer rectangle incl. chrome, or client area"}},["session"])
 register("vm_frame",frame_view,"Read a saved frame as tiny/medium/full or a native-coordinate crop; no VM capture or pause; views retain capture provenance and work after stop",{**SESSION,**IMAGE_OPTION,
     "frame_id":STR,"size":{"type":"string","enum":["tiny","medium","full"]},
     "overlay":{"type":"boolean","default":False,"description":"Add a diagnostic ruler/grid labelled in native-frame coordinates; clean source retained"},

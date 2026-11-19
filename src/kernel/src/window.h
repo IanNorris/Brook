@@ -400,6 +400,12 @@ enum class WmDebugAction : uint32_t { Focus,Minimize,Maximize,Restore,Close };
 Process* WmReferenceTerminatedOwner();
 // Value-only snapshots; no raw Window/Process pointers escape this API.
 uint32_t WmSnapshotDebugWindows(WmDebugWindow* out,uint32_t capacity,uint64_t* tick);
+// Debug capture: copy one window's current CPU client buffer (packed rows of
+// *width pixels; *scale is its on-screen upscale). out=nullptr only reports
+// the size. -2 unknown window, -95 no CPU buffer (GPU-published or none),
+// -11 the buffer outgrew capacityPixels since it was sized.
+int WmCopyDebugWindowBuffer(uint32_t id,uint64_t incarnation,uint32_t* out,uint64_t capacityPixels,
+                            uint32_t* width,uint32_t* height,uint32_t* scale);
 // Compositor context only. restoreTarget: 0 previous, 1 normal, 2 maximized.
 int WmApplyDebugAction(uint32_t id,uint64_t incarnation,WmDebugAction action,
                       uint32_t restoreTarget,WmDebugWindow* result,uint32_t* closeMethod);

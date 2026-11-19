@@ -1725,6 +1725,24 @@ uint32_t WmSnapshotDebugWindows(WmDebugWindow* out,uint32_t capacity,uint64_t* t
     *tick=ApicTickCount();return count;
 }
 
+int WmCopyDebugWindowBuffer(uint32_t id,uint64_t incarnation,uint32_t* out,uint64_t capacityPixels,
+                            uint32_t* width,uint32_t* height,uint32_t* scale)
+{
+    VfbGuard guard;
+    if (!id || id>WM_MAX_WINDOWS) return -2;
+    const auto& w=g_windows[id-1];
+    if (!w.proc || w.creationIdentity!=incarnation) return -2;
+    // GPU-published windows have no current CPU pixels to copy.
+    if (!w.vfb || w.externalCaptured || !w.vfbWidth || !w.vfbHeight || w.vfbStride<w.vfbWidth ||
+        uint64_t(w.vfbStride)*w.vfbHeight*4>w.vfbBytes) return -95;
+    *width=w.vfbWidth;*height=w.vfbHeight;*scale=w.upscale?w.upscale:1;
+    if (!out) return 0;
+    if (uint64_t(w.vfbWidth)*w.vfbHeight>capacityPixels) return -11; // resized since sized: retry
+    for (uint32_t y=0;y<w.vfbHeight;++y)
+        memcpy(out+uint64_t(y)*w.vfbWidth,w.vfb+uint64_t(y)*w.vfbStride,uint64_t(w.vfbWidth)*4);
+    return 0;
+}
+
 int WmApplyDebugAction(uint32_t id,uint64_t incarnation,WmDebugAction action,
                       uint32_t restoreTarget,WmDebugWindow* result,uint32_t* closeMethod)
 {

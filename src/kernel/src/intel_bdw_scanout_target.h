@@ -180,5 +180,22 @@ struct BdwZeroCopyVerify {
     uint32_t before[2],after[2],flushedPages;bool stableBefore,stableAfter,changed;
 };
 bool BdwZeroCopyVerifyFront(BdwZeroCopyVerify& out);
+
+// Debug screenshot of what primary plane A is fetching (DSPASURFLIVE).
+// Compositor thread, inside its scanout mapping lock. Gop: the plane shows
+// the firmware GOP (or no flip path ever moved it), so read the GOP
+// framebuffer. Copied: destination holds width x height packed B,G,R,X rows
+// of the live kernel flip buffer, renderer image or direct client buffer
+// (X-tiled surfaces detiled). The copied image is held off the display
+// queue for the copy (presents are mailboxed, not armed, for ~1-2 frames),
+// so it cannot be rewritten underneath. Busy: the image left the display
+// during the copy; retry at the next frame. Unsupported: unknown surface,
+// plane offset or pixel format.
+enum class BdwScanoutCaptureKind : uint8_t {Gop,Copied,Busy,Unsupported};
+struct BdwScanoutCaptureInfo {uint32_t plane=0,surface=0,control=0,stride=0,flags=0,copyUs=0;};
+BdwScanoutCaptureKind BdwScanoutCaptureLive(uint32_t* destination,uint32_t width,uint32_t height,BdwScanoutCaptureInfo& info);
+// Composites the visible hardware cursor plane (premultiplied ARGB) over a
+// captured frame. Returns true when a cursor image was on the plane.
+bool BdwScanoutCaptureCursor(uint32_t* destination,uint32_t width,uint32_t height);
 #endif
 }

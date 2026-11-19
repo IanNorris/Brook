@@ -97,9 +97,16 @@ struct DebugFrameSnapshot {
     DebugFrameState state;
     uint32_t source,presentationMode;
     uint64_t overlayGeneration; // overlay captures: content generation (pointer excluded)
+    // BROOK_DEBUG_FRAME_PLANE_* and INFO_* (brook_debug_frame.h).
+    uint32_t plane,planeSurface,planeControl,planeStride,infoFlags,windowId,windowScale,copyUs;
 };
 // An overlay request with overlayCursor=false omits the pointer image.
 DebugFrameSnapshot CompositorRequestDebugFrame(uint64_t owner=0,bool overlay=false,bool overlayCursor=true);
+// Root debug capture with options (BROOK_DEBUG_FRAME_FLAG_*). A window-buffer
+// request is filled immediately from the window's CPU buffer. On failure the
+// state is Failed (or Busy) and *error is a negative errno.
+DebugFrameSnapshot CompositorRequestDebugFrameOptions(uint64_t owner,uint32_t flags,uint32_t windowId,
+                                                      uint64_t windowIncarnation,int* error);
 // Block (no locks held) while the owner's capture is pending, at most
 // timeoutMs. Returns -116 for an unknown/expired token, else 0 with status.
 int CompositorWaitDebugFrame(uint32_t token,uint64_t owner,uint32_t timeoutMs,DebugFrameSnapshot& out);
