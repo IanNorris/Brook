@@ -166,8 +166,8 @@ int64_t Present(Process& proc, uint64_t exchange, uint64_t address)
     uint32_t scale = 0;
     {
         Lock lock;
-        auto& slot = g_shell->slots[offer.kind];
         if (!SameOwner(proc)) return -1;
+        auto& slot = g_shell->slots[offer.kind];
         if (slot.offered != offer.sequence) return -116;
         geometry = slot.offeredGeometry;
         scale = slot.offeredScale;
