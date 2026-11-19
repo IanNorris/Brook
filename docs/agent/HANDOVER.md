@@ -789,6 +789,10 @@ Two independent code reviews (compositor and driver), Dell measurements on the g
 - **Job table:** a long campaign can exhaust the 256-slot table, and the current boot may lack the terminate API. Archive completed work and plan a checked restart.
 
 ## Backlog (outside the immediate goal)
+- **Staged launcher entries are lost on every package install (gen 445; Steam vanished):** `tools/nix-install/nix-install.c` regenerates `applications.idx` only from profile `.desktop` files. `tools/launcher-stage/install.py --apps` upserts write only to the idx, so the next install drops them.
+  - **Fix:** install.py also records its upserts in a persistent overlay (e.g. `/nix/share/applications/applications.extra.idx`), and nix-install merges it after regeneration (profile entries win on app-id clashes).
+  - **Restored manually on 19 Nov:** the Steam line, from `/nix/.brook-apps-rollback-apps1118.idx`.
+  - **Side note:** `shutil.copy2` fails on Brook (`listxattr` ENOSYS; codex-queue compat item).
 - **Chromium "stuck render" root cause (gen 445, from cores and `proc blocked`):**
   - The browser UI thread is blocked forever in a synchronous Mojo call to viz: `StatusBubbleViews::DestroyPopup` → `~Compositor` → `FrameSinkManager::DestroyCompositorFrameSink`. The GPU process had died (pid 131).
   - The IO threads never saw the channel close, so Wayland configures went unacked (sent 55, acked 38).
