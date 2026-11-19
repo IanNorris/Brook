@@ -708,8 +708,10 @@ LauncherResult LauncherModel::Key(LauncherKey key, char ch, uint8_t mods) {
     auto requery = [&]() {
         scroll_ = 0;
         section_ = LauncherSection::List;
+        // The best match is selected (Enter opens it); a cleared query
+        // starts the list afresh.
         uint16_t first[LL::Apps];
-        selected_ = ItemOrder(first, LL::Apps) ? first[0] : -1;
+        selected_ = query_[0] && ItemOrder(first, LL::Apps) ? first[0] : -1;
         keyboard_ = query_[0] != 0;
         return changed;
     };

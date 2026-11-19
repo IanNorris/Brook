@@ -101,7 +101,7 @@ void Search() {
     CHECK(m->Selected() == Idx(*m, "quake") && m->KeyboardActive());
     // Category names: typing "games" lists everything filed under Games.
     m->Key(LauncherKey::Escape);
-    CHECK(!m->Query()[0]);
+    CHECK(!m->Query()[0] && m->Selected() == -1 && !m->KeyboardActive());
     Type(*m, "games");
     CHECK(Results(*m) == "DOOM,Quake,Quake II");
     uint16_t cats[4];
