@@ -45,7 +45,12 @@ closure = subprocess.run(['nix-store', '-qR'] + a.path, check=True, capture_outp
 with open(os.path.join(a.out, 'manifest.json'), 'w') as f: json.dump(man, f, indent=1, sort_keys=True)
 with open(os.path.join(a.out, 'links.json'), 'w') as f: json.dump(links, f, indent=1, sort_keys=True)
 with open(os.path.join(a.out, 'closure.txt'), 'w') as f: f.write(''.join(c + '\n' for c in sorted(closure)))
+class _NoHardLinks(dict):
+    # install.py accepts only files, dirs and symlinks: store hard-linked
+    # files (e.g. apache-httpd's envvars) as independent regular files.
+    def __setitem__(self, k, v): pass
 with tarfile.open(os.path.join(a.out, 'store.tar'), 'w', format=tarfile.PAX_FORMAT) as t:
+    t.inodes = _NoHardLinks()
     def root_owned(m):
         m.uid = m.gid = 0; m.uname = m.gname = 'root'; return m
     for p in a.path: t.add(p, p.lstrip('/'), filter=root_owned)
