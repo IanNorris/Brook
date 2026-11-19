@@ -24,7 +24,7 @@
 #include <string.h>
 
 /* Shadows on the top four windows, as virgl (ChromeShadowWindowLimit). */
-enum { DESKTOP_SHADOW_PIECES = 8, DESKTOP_SHADOW_WINDOWS = 4, DESKTOP_SHADOW_MAX_EXTENT = 1024 };
+enum { DESKTOP_SHADOW_PIECES = 8, DESKTOP_SHADOW_WINDOWS = 4, DESKTOP_SHADOW_PANELS = 2, DESKTOP_SHADOW_MAX_EXTENT = 1024 };
 
 struct DesktopSurfaceSet {
     uint32_t count;
@@ -32,10 +32,10 @@ struct DesktopSurfaceSet {
 };
 
 static inline int desktop_surface_valid(const struct BrookDesktopSurface *s){
-    if(!s || s->kind<BROOK_DESKTOP_SURFACE_FRAME || s->kind>BROOK_DESKTOP_SURFACE_BOOT_SUMMARY)return 0;
+    if(!s || s->kind<BROOK_DESKTOP_SURFACE_FRAME || s->kind>BROOK_DESKTOP_SURFACE_PERFORMANCE_HUD)return 0;
     if(!s->width || !s->height || s->width>BROOK_VK_MAX_DIMENSION || s->height>BROOK_VK_MAX_DIMENSION)return 0;
     if(s->x<-BROOK_VK_MAX_DIMENSION || s->x>BROOK_VK_MAX_DIMENSION || s->y<-BROOK_VK_MAX_DIMENSION || s->y>BROOK_VK_MAX_DIMENSION)return 0;
-    if(s->opacity>255 || s->material>BROOK_DESKTOP_MATERIAL_GLASS || s->shadow>BROOK_DESKTOP_SHADOW_WINDOW)return 0;
+    if(s->opacity>255 || s->material>BROOK_DESKTOP_MATERIAL_GLASS || s->shadow>BROOK_DESKTOP_SHADOW_PANEL)return 0;
     if(s->shadow && (s->shadowAlpha>255 || s->shadowSpread>DESKTOP_SHADOW_MAX_EXTENT ||
                      !s->shadowCorner || s->shadowCorner>DESKTOP_SHADOW_MAX_EXTENT))return 0;
     return 1;
@@ -58,14 +58,22 @@ static inline const struct BrookDesktopSurface *desktop_surface_find(const struc
     return NULL;
 }
 
-/* The shared 64x64 shadow source, BGRA8 straight alpha (as kernel ARGB). */
-static inline void desktop_shadow_source(uint32_t *pixels){
-    for(unsigned y=0;y<BROOK_CHROME_SHADOW_SIZE;++y)for(unsigned x=0;x<BROOK_CHROME_SHADOW_SIZE;++x)
-        pixels[y*BROOK_CHROME_SHADOW_SIZE+x]=brook_chrome_shadow_pixel(x,y);
+/* The renderer owns these immutable straight-alpha tiles. Bake them once,
+ * then upload only when a piece's source is allocated or changes class. */
+static inline const uint32_t *desktop_shadow_tile(const struct BrookDesktopSurface *s){
+    static uint32_t atlas[BROOK_CHROME_SHADOW_SIZE*BROOK_CHROME_SHADOW_ATLAS_HEIGHT];
+    static int prepared;
+    if(!prepared){
+        for(unsigned y=0;y<BROOK_CHROME_SHADOW_ATLAS_HEIGHT;++y)
+            for(unsigned x=0;x<BROOK_CHROME_SHADOW_SIZE;++x)
+                atlas[y*BROOK_CHROME_SHADOW_SIZE+x]=brook_chrome_shadow_atlas_pixel(x,y);
+        prepared=1;
+    }
+    return atlas+brook_chrome_shadow_tile_y(s->shadow,s->flags)*BROOK_CHROME_SHADOW_SIZE;
 }
 
 static inline int desktop_surface_has_shadow(const struct BrookDesktopSurface *s){
-    return s && s->shadow==BROOK_DESKTOP_SHADOW_WINDOW && s->shadowAlpha && desktop_surface_valid(s);
+    return s && s->shadow && s->shadowAlpha && desktop_surface_valid(s);
 }
 
 /* Output rectangle the shadow can touch (the outer rectangle grown by the
@@ -85,7 +93,9 @@ static inline unsigned desktop_surface_shadow_layers(const struct BrookDesktopSu
     unsigned n=0;
     for(unsigned piece=0;piece<DESKTOP_SHADOW_PIECES;++piece){
         struct BrookChromeShadowPiece p;
-        if(!brook_chrome_shadow_piece(s->x,s->y,s->width,s->height,s->shadowSpread,s->shadowCorner,piece,&p))continue;
+        if(!brook_chrome_shadow_variant_piece(s->x,s->y,s->width,s->height,s->shadowSpread,s->shadowCorner,
+            piece,s->shadow,s->flags,&p))continue;
+        p.sy-=brook_chrome_shadow_tile_y(s->shadow,s->flags);
         if(p.dx>=(int64_t)outputWidth || p.dy>=(int64_t)outputHeight || (int64_t)p.dx+p.dw<=0 || (int64_t)p.dy+p.dh<=0)continue;
         if(p.dw>BROOK_VK_MAX_DIMENSION || p.dh>BROOK_VK_MAX_DIMENSION)continue;
         out[n++]=(struct BrookVkSceneLayer){0,BROOK_CHROME_SHADOW_SIZE,BROOK_CHROME_SHADOW_SIZE,BROOK_CHROME_SHADOW_SIZE,

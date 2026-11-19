@@ -16,7 +16,7 @@ std::atomic<unsigned> wakeRequests{0};
 std::atomic<bool> workerDone{false};
 std::thread worker;
 int mode=0,created=0,destroyed=0;
-uint64_t backdropStyle=2;bool badgeEnabled=false,changeStyleDuringDraw=false;
+uint64_t backdropStyle=2;unsigned readsUntilStyleChange=0;
 bool allocationFails=false;
 unsigned sourcePixel=0x00ff00,pixels[256]{};
 brook::Process* caller;
@@ -26,10 +26,9 @@ brook::CaptureRequest* running;
 brook::GpuCompositorOps ops{};
 }
 namespace brook {
-uint64_t WmBackdropStyleVersion(){return backdropStyle;}
-void WmDrawBuildIdSpan(uint32_t* out,uint32_t,uint32_t count,uint32_t,uint32_t,uint32_t){
-    if(badgeEnabled && count)out[0]=0x00abcdef;
-    if(changeStyleDuringDraw)backdropStyle+=2;
+uint64_t WmBackdropStyleVersion(){
+    if(readsUntilStyleChange && --readsUntilStyleChange==0)backdropStyle+=2;
+    return backdropStyle;
 }
 void SerialPrintf(const char*,...) {}
 volatile uint64_t g_lapicTickCount=0;
@@ -63,14 +62,36 @@ void WmTrayTooltipRender(uint32_t*,uint32_t,uint32_t,uint32_t,int32_t,int32_t){}
 bool WmVolumePopupVisible(){return volumeVisible;}
 void WmVolumePopupGetRect(uint32_t,uint32_t,int32_t* x,int32_t* y,uint32_t* w,uint32_t* h){*x=4;*y=1;*w=2;*h=2;}
 void WmVolumePopupRender(uint32_t* p,uint32_t stride,uint32_t,uint32_t,int32_t,int32_t){for(unsigned y=1;y<3;++y)for(unsigned x=4;x<6;++x)p[y*stride+x]=0x00777777;}
-bool WmBootSummaryRect(uint32_t,uint32_t,int32_t*,int32_t*,uint32_t*,uint32_t*){return false;}
-void WmRenderBootSummary(uint32_t*,uint32_t,uint32_t,uint32_t){std::abort();}
+bool WmPointerCaptureActive(){return false;}
+bool WmTrayFlyoutRect(uint32_t,uint32_t,int32_t*,int32_t*,uint32_t*,uint32_t*){return false;}
+bool summaryAndHudVisible = false;
+bool WmPerformanceHudRect(uint32_t,uint32_t,int32_t* x,int32_t* y,uint32_t* w,uint32_t* h) {
+    *x = 3; *y = 3; *w = 1; *h = 1;
+    return summaryAndHudVisible;
+}
+void WmRenderTrayFlyout(uint32_t*,uint32_t,uint32_t,uint32_t){std::abort();}
+void WmRenderPerformanceHud(uint32_t* pixels,uint32_t stride,uint32_t,uint32_t) {
+    CHECK(summaryAndHudVisible);
+    pixels[3 * stride + 3] = 0x00112233;
+}
+bool WmBootSummaryRect(uint32_t,uint32_t,int32_t* x,int32_t* y,uint32_t* w,uint32_t* h) {
+    *x = 7; *y = 0; *w = 1; *h = 1;
+    return summaryAndHudVisible;
+}
+void WmRenderBootSummary(uint32_t* pixels,uint32_t,uint32_t,uint32_t) {
+    CHECK(summaryAndHudVisible);
+    pixels[7] = 0x00445566;
+}
 // Content keys (window.cpp builds and hashes the display lists): constant
 // per kind here, so only appearing, leaving or moving surfaces change them.
 uint64_t shellKeyBump=0;unsigned taskbarDraws=0;
 BrookDesktopSurface WmShellSurfaceRecord(const WmShellSurface& s,uint64_t key){
     BrookDesktopSurface r{};r.kind=uint32_t(s.kind)+3;r.key=key;r.x=s.x;r.y=s.y;r.width=s.w;r.height=s.h;
-    r.flags=BROOK_DESKTOP_SURFACE_OPAQUE;r.opacity=255;return r;}
+    if (s.material && CompositorGlassActive()) r.material = BROOK_DESKTOP_MATERIAL_GLASS;
+    else r.flags = BROOK_DESKTOP_SURFACE_OPAQUE;
+    r.opacity = 255;
+    return r;
+}
 uint64_t WmShellSurfaceKey(const WmShellSurface& s,uint32_t,uint32_t,uint64_t,int32_t,int32_t){
     return 0x100+uint64_t(s.kind)+(s.kind==WmShellSurfaceKind::Taskbar?shellKeyBump:0);}
 extern "C" void* kmalloc(uint64_t bytes) { return allocationFails?nullptr:std::calloc(1,bytes); }
@@ -215,13 +236,12 @@ int main() {
     CHECK(changedBackdrop.generation!=backdropInfo.generation && changedBackdrop.display==backdropInfo.display);
     CHECK(CompositorReadBackdropSpan(changedBackdrop,2,2,3,backdrop));
     CHECK(backdrop[0]==0xff000015 && backdrop[1]==0xff000016 && backdrop[2]==0xff000017);
-    badgeEnabled=true;backdropStyle+=2;
+    backdropStyle+=2;
     CHECK(!CompositorReadBackdropSpan(changedBackdrop,2,2,3,backdrop));
     CHECK(CompositorGetBackdropInfo(&changedBackdrop));
-    CHECK(CompositorReadBackdropSpan(changedBackdrop,2,2,3,backdrop) && backdrop[0]==0xffabcdef);
-    changeStyleDuringDraw=true;
+    CHECK(CompositorReadBackdropSpan(changedBackdrop,2,2,3,backdrop) && backdrop[0]==0xff000015);
+    readsUntilStyleChange=2;
     CHECK(!CompositorReadBackdropSpan(changedBackdrop,2,2,3,backdrop));
-    changeStyleDuringDraw=false;badgeEnabled=false;
     CHECK(CompositorGetBackdropInfo(&changedBackdrop));
     ++backdropStyle;CHECK(!CompositorGetBackdropInfo(&backdropInfo));++backdropStyle;
     CHECK(CompositorGetBackdropInfo(&backdropInfo));++g_displayGeneration;
@@ -449,6 +469,30 @@ int main() {
         for(unsigned i=0;i<2;++i){const bool taskbar=first.bands[i].y==5;
             CHECK(taskbar?first.keys[i]!=second.keys[i]:first.keys[i]==second.keys[i]);}
         CHECK(CompositorReleaseDebugFrame(overlay.token,77));overlayPixels[9]=0xff654321;
+        // The legacy capture can pack four shell surfaces and a cursor
+        // into the same seven-band ABI. A later cursorless capture erases it.
+        summaryAndHudVisible = true;
+        overlay = CompositorRequestDebugFrame(77, true, true);
+        CaptureDesktopOverlay(703, 6, 4, true);
+        CHECK(CompositorDebugFrameStatus(overlay.token, 77).state == DebugFrameState::Ready);
+        BrookDesktopOverlaySurfaces records{};
+        CHECK(!CompositorOverlaySurfaces(overlay.token, 77, records) && records.count == 4);
+        DesktopOverlayBands withCursor{};
+        CHECK(!CompositorOverlayBands(overlay.token, 77, withCursor) && withCursor.count <= 7);
+        CHECK(overlayPixels[7] == 0xff445566 && overlayPixels[27] == 0xff112233 &&
+              overlayPixels[38] == g_cursorFrame.pixels[0]);
+        bool cursorPacked = false;
+        for (unsigned i = 0; i < withCursor.count; ++i) {
+            const auto& r = withCursor.bands[i];
+            cursorPacked |= r.x <= 6 && r.x + r.width > 6 && r.y <= 4 && r.y + r.height > 4;
+        }
+        CHECK(cursorPacked);
+        CHECK(CompositorReleaseDebugFrame(overlay.token, 77));
+        overlay = CompositorRequestDebugFrame(77, true, false);
+        CaptureDesktopOverlay(704, 6, 4, true);
+        CHECK(overlayPixels[38] == 0 && overlayPixels[7] == 0xff445566 && overlayPixels[27] == 0xff112233);
+        CHECK(CompositorReleaseDebugFrame(overlay.token, 77));
+        summaryAndHudVisible = false;
         g_debugFrameCleanAddress=0;
     }
     g_debugFramePages=0;g_debugFrameBuffer=VirtualAddress{};

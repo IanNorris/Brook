@@ -624,6 +624,9 @@ typedef struct BrookThemePalette {
     uint32_t hot;
     uint32_t badgeText;    /* build label */
     uint32_t badgeFill;
+    uint32_t titleDivider;
+    unsigned sheen, innerHighlight;
+    int chromeDark;
 } BrookThemePalette;
 
 static inline void brook_theme_build_palette(const BrookHueTokens* hue, unsigned resolved, int chromeDark,
@@ -664,5 +667,9 @@ static inline void brook_theme_build_palette(const BrookHueTokens* hue, unsigned
     p->hot = t->hot;
     p->badgeText = p->secondaryText;
     p->badgeFill = t->flat;
+    p->titleDivider = brook_tint_over(t->divider, inactive);
+    p->sheen = chromeDark ? 23 : 87;
+    p->innerHighlight = chromeDark ? 51 : 191;
+    p->chromeDark = chromeDark;
 }
 #endif

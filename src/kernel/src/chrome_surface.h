@@ -18,8 +18,9 @@ struct ChromeSurfaceEffects {
     bool glass;                 // translucent material with backdrop blur
     uint32_t blur;              // material blur radius under glass
     unsigned topRadius, bottomRadius; // glass frame corner radii (chrome material masks)
-    uint32_t shadowSpread, shadowCorner; // WmMetric(16), WmMetric(24)
-    uint32_t shellRadius;       // glass shell panel corners (ChromeMaterialRect: M(4))
+    uint32_t shadowSpread, shadowCorner; // WmMetric(16), WmMetric(28)
+    uint32_t shellRadius;       // glass shell panel corners
+    bool lightShadow = false;
 };
 
 struct ChromeFrameSurfaceModel {
@@ -30,6 +31,7 @@ struct ChromeFrameSurfaceModel {
     DesktopRect outer, client;  // desktop pixels; outer is the caption block when clientDecorated
     unsigned captionRadius;     // client-matched caption block corner (0: square)
     uint32_t opacity;
+    bool fullWindowBlur = false; // existing rectangular client backdrop
 };
 
 inline BrookDesktopSurface ChromeFrameSurface(const ChromeFrameSurfaceModel& m, const ChromeSurfaceEffects& e) {
@@ -44,9 +46,8 @@ inline BrookDesktopSurface ChromeFrameSurface(const ChromeFrameSurfaceModel& m, 
         s.radii[1] = uint16_t(radius);
         // The client keeps its own shadow; the block is opaque except a
         // rounded top-right corner (chrome_alpha.h).
-        s.material = e.glass ? BROOK_DESKTOP_MATERIAL_GLASS : BROOK_DESKTOP_MATERIAL_OPAQUE;
-        s.level = e.glass ? e.blur : 0;
-        if (!e.glass && !radius) s.flags |= BROOK_DESKTOP_SURFACE_OPAQUE;
+        s.material = BROOK_DESKTOP_MATERIAL_OPAQUE;
+        if (!radius) s.flags |= BROOK_DESKTOP_SURFACE_OPAQUE;
         return s;
     }
     s.kind = BROOK_DESKTOP_SURFACE_FRAME;
@@ -55,10 +56,14 @@ inline BrookDesktopSurface ChromeFrameSurface(const ChromeFrameSurfaceModel& m, 
     if (e.glass) {
         s.material = BROOK_DESKTOP_MATERIAL_GLASS; s.level = e.blur;
         if (!m.maximised) {
-            s.radii[0] = s.radii[1] = uint16_t(e.topRadius);
-            s.radii[2] = s.radii[3] = uint16_t(e.bottomRadius);
-            s.shadow = BROOK_DESKTOP_SHADOW_WINDOW; s.shadowAlpha = m.focused ? 255 : 180;
+            if (!m.fullWindowBlur && s.width >= 2 * e.topRadius && s.height >= 2 * e.topRadius) {
+                s.radii[0] = s.radii[1] = uint16_t(e.topRadius);
+                s.radii[2] = s.radii[3] = uint16_t(e.bottomRadius);
+            }
+            s.shadow = m.focused ? BROOK_DESKTOP_SHADOW_WINDOW_ACTIVE : BROOK_DESKTOP_SHADOW_WINDOW_INACTIVE;
+            s.shadowAlpha = 255;
             s.shadowSpread = e.shadowSpread; s.shadowCorner = e.shadowCorner;
+            if(e.lightShadow)s.flags |= BROOK_DESKTOP_SURFACE_LIGHT_SHADOW;
         }
     } else {
         // Opaque material: frame = outer minus client, alpha 255 throughout.
@@ -68,8 +73,7 @@ inline BrookDesktopSurface ChromeFrameSurface(const ChromeFrameSurfaceModel& m, 
     return s;
 }
 
-// kind: BROOK_DESKTOP_SURFACE_TASKBAR..BOOT_SUMMARY. material: the surface
-// takes the translucent shell material when glass is active.
+// Material surfaces take the translucent shell material when glass is active.
 inline BrookDesktopSurface ChromeShellSurfaceRecord(uint32_t kind, const DesktopRect& r, bool material, uint64_t key,
                                                     uint32_t materialOpacity, const ChromeSurfaceEffects& e) {
     BrookDesktopSurface s{};
@@ -79,11 +83,19 @@ inline BrookDesktopSurface ChromeShellSurfaceRecord(uint32_t kind, const Desktop
     s.material = glass ? BROOK_DESKTOP_MATERIAL_GLASS : BROOK_DESKTOP_MATERIAL_OPAQUE;
     s.level = glass ? e.blur : 0;
     s.opacity = glass ? (materialOpacity > 255 ? 255 : materialOpacity) : 255;
-    if (glass && kind != BROOK_DESKTOP_SURFACE_TASKBAR)
-        for (auto& radius : s.radii) radius = uint16_t(e.shellRadius);
+    if (glass && kind != BROOK_DESKTOP_SURFACE_TASKBAR) {
+        const uint32_t half = (s.width < s.height ? s.width : s.height) / 2;
+        const uint32_t radius = e.shellRadius < half ? e.shellRadius : half;
+        for (auto& corner : s.radii) corner = uint16_t(radius);
+        if (kind != BROOK_DESKTOP_SURFACE_TOOLTIP) {
+            s.shadow = BROOK_DESKTOP_SHADOW_PANEL;
+            s.shadowAlpha = 255;
+            s.shadowSpread = e.shadowSpread;
+            s.shadowCorner = radius + e.shadowSpread;
+            if (e.lightShadow) s.flags |= BROOK_DESKTOP_SURFACE_LIGHT_SHADOW;
+        }
+    }
     if (!glass) s.flags |= BROOK_DESKTOP_SURFACE_OPAQUE;
-    // DESIGN.md: the taskbar has no drop shadow; panel shadows are stage 2.
-    s.shadow = BROOK_DESKTOP_SHADOW_NONE;
     return s;
 }
 

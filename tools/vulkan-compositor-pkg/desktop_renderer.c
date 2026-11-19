@@ -64,10 +64,13 @@ struct RenderContext {
      * untouched: the interior zeroed last (per buffer allocation), so a
      * frame that falls back to the whole chrome layer samples transparency. */
     struct DesktopTrackHole chromeInterior[BROOK_DESKTOP_LAYER_LIMIT];uint64_t chromeInteriorSerial[BROOK_DESKTOP_LAYER_LIMIT];
-    /* The 64x64 window shadow nine-slice (desktop_surfaces.h), one copy per
-     * piece of each shadowed window: the compute and graphics paths reject
-     * layers that share a buffer, and a shadow must not vanish on them. */
-    struct Source shadow[DESKTOP_SHADOW_WINDOWS][DESKTOP_SHADOW_PIECES];uint64_t shadowSerial[DESKTOP_SHADOW_WINDOWS][DESKTOP_SHADOW_PIECES];
+    /* Compute and graphics reject shared input buffers. Keep a compact,
+     * lazily populated source per piece for window and panel shadows. */
+    struct {
+        struct Source source;
+        uint64_t serial;
+        uint32_t tile;
+    } shadow[DESKTOP_SHADOW_WINDOWS+BROOK_DESKTOP_OVERLAY_MAX_SURFACES][DESKTOP_SHADOW_PIECES];
     struct DesktopChromeHeld chromeHeld[BROOK_DESKTOP_LAYER_LIMIT];
     struct DesktopClientHeld clientHeld[BROOK_DESKTOP_LAYER_LIMIT];
     struct Source background,overlay[BROOK_DESKTOP_OVERLAY_MAX_BANDS];
@@ -76,9 +79,7 @@ struct RenderContext {
     struct BrookDesktopOverlayBands overlayBands;
     /* Per band, from kernel op 9: opaque bits and content keys (0 = unknown). */
     uint32_t overlayOpaque;uint64_t overlayKeys[BROOK_DESKTOP_OVERLAY_MAX_BANDS];
-    /* Overlay op 10: the shell surface records of that capture (layers ABI
-     * v2). Shell surfaces carry no shadow yet (stage 2.6), so they are kept
-     * and counted only; count 0 from an older kernel. */
+    /* Overlay op 10: shell surface records for the held capture. */
     struct BrookDesktopOverlaySurfaces overlaySurfaces;
     struct Source cursor;uint64_t cursorSerial;
     struct BackdropIdentity backdropIdentity;
@@ -553,7 +554,8 @@ static void direct_scanout_drain(void){
 static void context_init(struct RenderContext *ctx){
     memset(ctx,0,sizeof(*ctx));ctx->output=-1;ctx->batchOutput=-1;ctx->background.fd=-1;ctx->batchBackdrop.fd=-1;ctx->cursor.fd=-1;
     ctx->scanoutImage=-1;
-    for(unsigned w=0;w<DESKTOP_SHADOW_WINDOWS;++w)for(unsigned k=0;k<DESKTOP_SHADOW_PIECES;++k)ctx->shadow[w][k].fd=-1;
+    for(unsigned w=0;w<DESKTOP_SHADOW_WINDOWS+BROOK_DESKTOP_OVERLAY_MAX_SURFACES;++w)
+        for(unsigned k=0;k<DESKTOP_SHADOW_PIECES;++k)ctx->shadow[w][k].source.fd=-1;
     for(unsigned i=0;i<BROOK_DESKTOP_OVERLAY_MAX_BANDS;++i)ctx->overlay[i].fd=-1;
     for(unsigned i=0;i<BROOK_DESKTOP_LAYER_LIMIT;++i){ctx->client[i].fd=-1;ctx->chrome[i].fd=-1;}
 }
@@ -583,7 +585,8 @@ static void context_close(int drm,struct RenderContext *ctx){
     if(!ctx->scanoutCount && ctx->output>=0)close(ctx->output); /* ring images are process-wide */
     for(unsigned i=0;i<BROOK_DESKTOP_OVERLAY_MAX_BANDS;++i)source_close(drm,&ctx->overlay[i]);
     source_close(drm,&ctx->cursor);
-    for(unsigned w=0;w<DESKTOP_SHADOW_WINDOWS;++w)for(unsigned k=0;k<DESKTOP_SHADOW_PIECES;++k)source_close(drm,&ctx->shadow[w][k]);
+    for(unsigned w=0;w<DESKTOP_SHADOW_WINDOWS+BROOK_DESKTOP_OVERLAY_MAX_SURFACES;++w)
+        for(unsigned k=0;k<DESKTOP_SHADOW_PIECES;++k)source_close(drm,&ctx->shadow[w][k].source);
     source_close(drm,&ctx->background);
     for(unsigned i=0;i<BROOK_DESKTOP_LAYER_LIMIT;++i){source_close(drm,&ctx->chrome[i]);source_close(drm,&ctx->client[i]);}
     context_init(ctx);
@@ -841,6 +844,28 @@ static int push(uint32_t *scene,unsigned *count,struct BrookVkExternalSource *so
     sources[*count]=(struct BrookVkExternalSource){source->fd,source->size/4,-1};
     memcpy(scene+BROOK_VK_SCENE_HEADER+(*count)*BROOK_VK_LAYER_WORDS,layer,sizeof(*layer));++*count;return 0;
 }
+static int push_shadow(int drm,struct RenderContext *ctx,unsigned slot,const struct BrookDesktopSurface *surface,
+                       const struct BrookVkSceneLayer *pieces,unsigned pieceCount,uint32_t *scene,unsigned *count,
+                       struct BrookVkExternalSource *sources,struct QuadBackdrop *blur,uint64_t *keys,unsigned chromeClass){
+    const uint32_t tile=brook_chrome_shadow_tile_y(surface->shadow,surface->flags);
+    const size_t bytes=BROOK_CHROME_SHADOW_SIZE*BROOK_CHROME_SHADOW_SIZE*sizeof(uint32_t);
+    for(unsigned k=0;k<pieceCount;++k){
+        struct Source *source=&ctx->shadow[slot][k].source;
+        if(source_ensure(drm,bytes,source) || *count>=BROOK_VK_MAX_LAYERS)return -1;
+        if(ctx->shadow[slot][k].serial!=source->serial || ctx->shadow[slot][k].tile!=tile){
+            memcpy(source->map,desktop_shadow_tile(surface),bytes);
+            ctx->shadow[slot][k].serial=source->serial;
+            ctx->shadow[slot][k].tile=tile;
+        }
+        blur->chromeClass[*count]=chromeClass;
+        keys[*count]=tile;
+        if(push(scene,count,sources,source,&pieces[k]))return -1;
+    }
+    ++g_surfaceStats.shadows;
+    g_surfaceStats.shadowLayers+=pieceCount;
+    return 0;
+}
+
 // Returns 0 for a presented frame, -1 for a safe retry, and never returns if
 // GPU completion is uncertain: the retained process allows OS fallback while
 // preserving all userspace resources until device recovery.
@@ -966,7 +991,9 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     struct QuadBackdrop blur={0};
     uint64_t blurKeys[BROOK_VK_MAX_LAYERS]={0};
     const int blurEnabled=(g_rendererCapsAccepted&BROOK_DESKTOP_CAP_BACKDROP_BLUR) && pending && ctx->quad;
-    track->glassKey=0;track->glassDamage=(struct DesktopDamageSet){0};
+    track->glassKey=track->shellShadowKey=0;
+    track->glassDamage=(struct DesktopDamageSet){0};
+    track->shellShadowDamage=(struct DesktopDamageSet){0};
     const int sharedOk=pending && ctx->quad && !getenv("BROOK_RENDER_TEST_BLOCKED_FENCE") && monotonic_ns()>=g_sharedLayersHoldNs;
     int sharedUsed=0;unsigned shadowWindows=0;
     for(unsigned i=0;i<layers.count;++i){
@@ -1050,15 +1077,11 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
                 desktop_surface_shadow_layers(surface,width,height,pieces):0;
             /* Headroom of 4 for layered GPU offers beyond the 2-per-window reserve. */
             if(n && count+n+2*(layers.count-i)+4+BROOK_DESKTOP_OVERLAY_MAX_BANDS+1<=BROOK_VK_MAX_LAYERS){
-                for(unsigned k=0;k<n;++k){struct Source *piece=&ctx->shadow[shadowWindows][k];
-                    if(source_ensure(drm,BROOK_CHROME_SHADOW_SIZE*BROOK_CHROME_SHADOW_SIZE*4,piece))goto done;
-                    if(ctx->shadowSerial[shadowWindows][k]!=piece->serial){desktop_shadow_source(piece->map);ctx->shadowSerial[shadowWindows][k]=piece->serial;}
-                    if(count<BROOK_VK_MAX_LAYERS)blur.chromeClass[count]=QUAD_GPU_FRAME;
-                    if(push(scene,&count,sources,piece,&pieces[k]))goto done;}
+                if(push_shadow(drm,ctx,shadowWindows,surface,pieces,n,scene,&count,sources,&blur,blurKeys,QUAD_GPU_FRAME))
+                    goto done;
                 ++shadowWindows;
                 (void)desktop_surface_shadow_bounds(surface,&shadowBounds);shadowShown=1;
                 desktop_damage_add(&footprint,shadowBounds,width,height);
-                ++g_surfaceStats.shadows;g_surfaceStats.shadowLayers+=n;
             }else if(n)++g_surfaceStats.shadowSkips;
         }
         struct DesktopGpuOffer *direct=desktop_gpu_channel_select(&g_gpuChannel,l,width,height,&content,frame);
@@ -1104,7 +1127,9 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
         struct DesktopTrackWindow *trackWindow=&track->windows[i];
         *trackWindow=(struct DesktopTrackWindow){.window=l->window,.incarnation=l->incarnation,.direct=direct!=NULL,
             .commit=direct?direct->packet.identity.commit:0};
-        if(shadowShown){trackWindow->shadowAlpha=surface->shadowAlpha;trackWindow->shadowX=(int32_t)shadowBounds.left;
+        if(shadowShown){trackWindow->shadowAlpha=surface->shadowAlpha;trackWindow->shadowCorner=surface->shadowCorner;
+            trackWindow->shadowTile=brook_chrome_shadow_tile_y(surface->shadow,surface->flags);
+            trackWindow->shadowX=(int32_t)shadowBounds.left;
             trackWindow->shadowY=(int32_t)shadowBounds.top;trackWindow->shadowWidth=(uint32_t)(shadowBounds.right-shadowBounds.left);
             trackWindow->shadowHeight=(uint32_t)(shadowBounds.bottom-shadowBounds.top);}
         memcpy(trackWindow->layer,&content,sizeof(content));
@@ -1246,6 +1271,34 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     if(overlay_cursor(drm,ctx,&frameOverlay.cursor,&cursorEpoch))goto done;
     timing[3]=monotonic_ns();
     const unsigned belowShell=count;
+    /* The shell captures pack material pixels into bands. Draw panel
+     * shadows beneath those bands, but exclude them from the glass sample. */
+    unsigned panelCount=0;
+    for(unsigned i=ctx->overlaySurfaces.count;i>0;--i)
+        if(ctx->overlaySurfaces.surfaces[i-1].shadow==BROOK_DESKTOP_SHADOW_PANEL)++panelCount;
+    for(unsigned i=0;i<ctx->overlaySurfaces.count;++i){
+        const struct BrookDesktopSurface *surface=&ctx->overlaySurfaces.surfaces[i];
+        if(surface->shadow!=BROOK_DESKTOP_SHADOW_PANEL)continue;
+        if(panelCount-- > DESKTOP_SHADOW_PANELS)continue;
+        struct BrookVkSceneLayer pieces[DESKTOP_SHADOW_PIECES];
+        const unsigned n=desktop_surface_shadow_layers(surface,width,height,pieces);
+        if(!n)continue;
+        if(count+n+bands.count+1>BROOK_VK_MAX_LAYERS){++g_surfaceStats.shadowSkips;continue;}
+        if(push_shadow(drm,ctx,DESKTOP_SHADOW_WINDOWS+i,surface,pieces,n,scene,&count,sources,&blur,blurKeys,QUAD_GPU_SHELL))
+            goto done;
+        struct DesktopDamageRect bounds;
+        if(desktop_surface_shadow_bounds(surface,&bounds)){
+            desktop_damage_add(&footprint,bounds,width,height);
+            desktop_damage_add(&track->shellShadowDamage,bounds,width,height);
+        }
+        track->shellShadowKey=quad_backdrop_mix(track->shellShadowKey,brook_chrome_shadow_tile_y(surface->shadow,surface->flags));
+        for(unsigned k=0;k<n;++k){
+            uint32_t words[BROOK_VK_LAYER_WORDS];
+            memcpy(words,&pieces[k],sizeof(words));
+            for(unsigned word=0;word<BROOK_VK_LAYER_WORDS;++word)
+                track->shellShadowKey=quad_backdrop_mix(track->shellShadowKey,words[word]);
+        }
+    }
     for(uint32_t i=0;i<bands.count;++i){const struct BrookDesktopOverlayBand *b=&bands.bands[i];
         struct BrookVkSceneLayer layer={0,b->width,b->width,b->height,0,0,b->width,b->height,
             b->x,b->y,b->width,b->height,0,0,width,height,255|BROOK_VK_STRAIGHT_ALPHA};
@@ -1315,6 +1368,12 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
                     desktop_damage_add(&changes,trackBase->glassDamage.rects[n],width,height);
                 for(unsigned n=0;n<track->glassDamage.count;++n)
                     desktop_damage_add(&changes,track->glassDamage.rects[n],width,height);
+            }
+            if(trackBase->shellShadowKey!=track->shellShadowKey){
+                for(unsigned n=0;n<trackBase->shellShadowDamage.count;++n)
+                    desktop_damage_add(&changes,trackBase->shellShadowDamage.rects[n],width,height);
+                for(unsigned n=0;n<track->shellShadowDamage.count;++n)
+                    desktop_damage_add(&changes,track->shellShadowDamage.rects[n],width,height);
             }
             const uint32_t sceneChanges=changes.count;
             desktop_overlay_damage(overlayBase,&frameOverlay,&changes);

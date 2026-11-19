@@ -72,6 +72,12 @@ static void altF4() {
     r=up(s,GlobalShortcuts::ScF4);CHECK(!r.deliver); // swallowed after Alt released
     r=down(s,GlobalShortcuts::ScF4);CHECK(r.deliver && r.action==Action::None); // plain F4
     CHECK(up(s,GlobalShortcuts::ScF4).deliver);
+    r = down(s, GlobalShortcuts::ScP, INPUT_MOD_ALT);
+    CHECK(!r.deliver && r.action == Action::CyclePerformanceHud);
+    r = down(s, GlobalShortcuts::ScP, INPUT_MOD_ALT);
+    CHECK(!r.deliver && r.action == Action::None);
+    CHECK(!up(s, GlobalShortcuts::ScP).deliver);
+    CHECK(down(s, GlobalShortcuts::ScP).deliver && up(s, GlobalShortcuts::ScP).deliver);
     // Alt+Tab repeats cycle focus, and its release is swallowed.
     r=down(s,GlobalShortcuts::ScTab,INPUT_MOD_ALT);CHECK(!r.deliver && r.action==Action::CycleFocus);
     r=down(s,GlobalShortcuts::ScTab,INPUT_MOD_ALT);CHECK(!r.deliver && r.action==Action::CycleFocus);

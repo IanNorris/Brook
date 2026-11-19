@@ -165,7 +165,8 @@ static void surface_scene(void){
     if(!ready){gem_new(SW*SH*4,&bg);gem_new(64*64*4,&shadowSrc);for(unsigned i=0;i<2;++i){gem_new(300*200*4,&content[i]);gem_new(312*228*4,&chromeSrc[i]);}
         gem_new(SW*SH*4,&a);gem_new(SW*SH*4,&b);ready=1;}
     gem_cpu(&bg,1);for(uint32_t k=0;k<SW*SH;++k)bg.map[k]=0xff000000u|((k*2654435761u)>>8);
-    gem_cpu(&shadowSrc,1);desktop_shadow_source(shadowSrc.map);
+    const struct BrookDesktopSurface legacyShadow={.shadow=BROOK_DESKTOP_SHADOW_WINDOW};
+    gem_cpu(&shadowSrc,1);memcpy(shadowSrc.map,desktop_shadow_tile(&legacyShadow),64*64*sizeof(uint32_t));
     const int32_t wx[2]={200,-60},wy[2]={150,330};const uint32_t opacity[2]={255,200};
     uint32_t scene[BROOK_VK_SCENE_HEADER+MAXS*BROOK_VK_LAYER_WORDS]={SW,SH,0,0};struct Gem src[MAXS];const uint32_t *pixels[MAXS];unsigned n=0;
 #define ADD(gem,...) do{const struct BrookVkSceneLayer l_={__VA_ARGS__};memcpy(scene+BROOK_VK_SCENE_HEADER+n*BROOK_VK_LAYER_WORDS,&l_,sizeof(l_));src[n]=(gem);pixels[n]=(gem).map;++n;}while(0)

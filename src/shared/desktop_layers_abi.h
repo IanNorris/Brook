@@ -123,15 +123,21 @@ struct BrookDesktopFocus {
 #define BROOK_DESKTOP_SURFACE_VOLUME_POPUP 5
 #define BROOK_DESKTOP_SURFACE_TOOLTIP 6
 #define BROOK_DESKTOP_SURFACE_BOOT_SUMMARY 7
+#define BROOK_DESKTOP_SURFACE_TRAY_FLYOUT 8
+#define BROOK_DESKTOP_SURFACE_PERFORMANCE_HUD 9
 #define BROOK_DESKTOP_MATERIAL_OPAQUE 0
 #define BROOK_DESKTOP_MATERIAL_GLASS 1         // needs backdrop blur; level = blur radius
 // The 64 px nine-slice of brook_chrome_shadow.h, spread past each outer edge
 // and drawn beneath the surface at shadowAlpha.
 #define BROOK_DESKTOP_SHADOW_NONE 0
-#define BROOK_DESKTOP_SHADOW_WINDOW 1
+#define BROOK_DESKTOP_SHADOW_WINDOW 1          // legacy tile
+#define BROOK_DESKTOP_SHADOW_WINDOW_ACTIVE 2
+#define BROOK_DESKTOP_SHADOW_WINDOW_INACTIVE 3
+#define BROOK_DESKTOP_SHADOW_PANEL 4
 // Every pixel of the surface outside its client rectangle has alpha 255 (at
 // opacity 255 it may replace what lies beneath).
 #define BROOK_DESKTOP_SURFACE_OPAQUE 1u
+#define BROOK_DESKTOP_SURFACE_LIGHT_SHADOW 2u
 struct BrookDesktopSurface {
     uint32_t kind,window;           // window: the layer's window id (0: a shell surface)
     uint64_t incarnation;           // the layer's incarnation (0: a shell surface)

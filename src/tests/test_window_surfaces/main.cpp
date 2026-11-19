@@ -67,26 +67,9 @@ extern "C" void KernelPanic(const char*,...) { std::abort(); }
 
 int main() {
     using namespace brook;
-    // Independent full-frame rendering is the oracle for translated spans,
-    // including glyph antialiasing and cuts through both sides of the badge.
     for(auto& glyph:badgeGlyphs)glyph={0,0,2,2,0,2,3};
     const uint64_t initialStyle=WmBackdropStyleVersion();
     SetWmActiveLocked(true);CHECK(WmBackdropStyleVersion()==initialStyle+2);
-    constexpr uint32_t badgeW=320,badgeH=240;
-    uint32_t full[badgeW*badgeH],spans[badgeW*badgeH];
-    for(const auto* metrics:{&DesktopMetric100,&DesktopMetric150,&DesktopMetric200}){
-        g_desktopMetrics=metrics;
-        for(unsigned i=0;i<badgeW*badgeH;++i)full[i]=spans[i]=0xff123456;
-        WmDrawBuildId(full,badgeW,badgeW,badgeH);
-        bool changed=false;for(auto pixel:full)if(pixel!=0xff123456){changed=true;break;}
-        CHECK(changed);
-        for(uint32_t y=0;y<badgeH;++y)for(uint32_t x=0;x<badgeW;){
-            uint32_t n=badgeW-x<17?badgeW-x:17;
-            WmDrawBuildIdSpan(spans+y*badgeW+x,x,n,y,badgeW,badgeH);x+=n;
-        }
-        CHECK(!__builtin_memcmp(full,spans,sizeof(full)));
-    }
-    g_desktopMetrics=&DesktopMetric100;
     BeginBackdropStyleChange();CHECK(WmBackdropStyleVersion()&1);EndBackdropStyleChange();
     const auto beforeInactive=WmBackdropStyleVersion();
     SetWmActiveLocked(false);CHECK(WmBackdropStyleVersion()==beforeInactive+2);
@@ -579,7 +562,7 @@ int main() {
     owner->fbBacking=nullptr;owner->fbVirtual=nullptr;window.vfbBacking=nullptr;
     std::free(owner);std::free(stranger);
     // One shell-surface list for every compositor path: the taskbar first,
-    // then at most one popup in the shared slot, the boot summary last.
+    // then one shared popup slot, the boot toast and the expanded HUD.
     {
         constexpr uint32_t sw=1024,sh=768;
         auto kinds=[&](WmShellSurface (&s)[WM_SHELL_SURFACE_LIMIT]){
@@ -587,9 +570,7 @@ int main() {
             CHECK(n>=1 && n<=WM_SHELL_SURFACE_LIMIT);
             CHECK(s[0].kind==WmShellSurfaceKind::Taskbar && s[0].material && s[0].x==0 &&
                   s[0].y==int32_t(WmDesktopHeight(sh)) && s[0].w==sw && s[0].h==sh-WmDesktopHeight(sh));
-            for(uint32_t i=1;i<n;++i)CHECK(s[i].kind!=WmShellSurfaceKind::Taskbar &&
-                (s[i].kind==WmShellSurfaceKind::BootSummary)==!s[i].material);
-            if(n>1 && s[n-1].kind!=WmShellSurfaceKind::BootSummary)CHECK(n==2);
+            for(uint32_t i=1;i<n;++i)CHECK(s[i].kind!=WmShellSurfaceKind::Taskbar && s[i].material);
             return n;
         };
         WmShellSurface s[WM_SHELL_SURFACE_LIMIT];
@@ -605,6 +586,18 @@ int main() {
         CHECK(n>=2 && s[1].kind==WmShellSurfaceKind::Launcher);
         for(uint32_t i=2;i<n;++i)CHECK(s[i].kind==WmShellSurfaceKind::BootSummary);
         g_launcherOpen=false;g_volumePopupOpen=false;
+        const auto tray = GetTaskbarLayout(sw, sh).network;
+        CHECK(WmTrayFlyoutPress(tray.x, tray.y, sw, sh));
+        CHECK(kinds(s) >= 2 && s[1].kind == WmShellSurfaceKind::TrayFlyout);
+        CHECK(WmTrayFlyoutPress(s[1].x + 12, s[1].y + 12, sw, sh) && WmTrayFlyoutVisible());
+        CHECK(WmTrayFlyoutPress(tray.x, tray.y, sw, sh) && !WmTrayFlyoutVisible());
+        WmCyclePerformanceHud();
+        CHECK(GetTaskbarLayout(sw, sh).hud.w > 0);
+        WmCyclePerformanceHud();
+        n = kinds(s);
+        CHECK(s[n - 1].kind == WmShellSurfaceKind::PerformanceHud);
+        WmCyclePerformanceHud();
+        CHECK(GetTaskbarLayout(sw, sh).hud.w == 0);
     }
     // Fullscreen: the client covers the whole output without chrome, and while
     // it is focused the taskbar is neither drawn nor hit-tested (the launcher

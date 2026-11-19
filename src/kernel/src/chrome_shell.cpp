@@ -21,7 +21,7 @@ static void CopyText(char* dst, const char* src, uint32_t capacity)
 
 ChromeTaskbarLayout ChromeTaskbarLayoutFor(const ChromeStyle& s, uint32_t screenW, uint32_t screenH,
                                            const char* clockText, bool agent, uint32_t enabledMetrics,
-                                           const int* ids, int total, int focused)
+                                           const int* ids, int total, int focused, const char* buildText, bool compactHud)
 {
     ChromeTaskbarLayout l = {};
     l.nextIndex = -1;
@@ -40,6 +40,19 @@ ChromeTaskbarLayout ChromeTaskbarLayoutFor(const ChromeStyle& s, uint32_t screen
     l.terminal = {x, by, static_cast<int>(s.M(SM::TaskbarButtonWidth)), bh};
     x += s.M(SM::TaskbarButtonWidth) + s.M(SM::TaskbarPadding);
     CopyText(l.clockText, clockText, sizeof(l.clockText));
+    for (unsigned i = 0; l.clockText[i] && l.clockText[i + 1]; ++i) {
+        if (l.clockText[i] != ' ') continue;
+        const char* date = l.clockText + i + 1;
+        while (*date == ' ') ++date;
+        CopyText(l.clockDate, date, sizeof(l.clockDate));
+        // The tray keeps the day and abbreviated month on the second line.
+        for (unsigned j = 0, spaces = 0; l.clockDate[j]; ++j) {
+            if (l.clockDate[j] == ' ' && ++spaces == 2) { l.clockDate[j] = 0; break; }
+        }
+        l.clockText[i] = 0;
+        break;
+    }
+    CopyText(l.buildText, buildText, sizeof(l.buildText));
     int right = sw - s.M(8);
     // Reserve measured widgets from right to left. Keep one useful window
     // button on small displays; diagnostics yield before the clock does.
@@ -49,13 +62,21 @@ ChromeTaskbarLayout ChromeTaskbarLayoutFor(const ChromeStyle& s, uint32_t screen
         r = {right, by, width, bh};
         right -= s.M(12);
     };
-    reserve(l.clock, s.TextWidth(l.clockText));
+    if (l.clockText[0]) reserve(l.clock, s.M(76));
+    if (enabledMetrics & (1u << 6)) reserve(l.metrics[6], s.M(42));
     reserve(l.network, s.M(16));
     reserve(l.volume, s.M(16));
     // Leftmost fixed icon, so its appearance never moves the volume target.
     if (agent) reserve(l.agent, s.M(16));
-    const int widths[7] = {64, 64, 112, 112, 240, 240, 150};
-    for (int i = 6; i >= 0; --i) if (enabledMetrics & (1u << i)) {
+    if (l.buildText[0]) {
+        unsigned length = 0;
+        while (l.buildText[length]) ++length;
+        const int width = length * s.TextWidth("0") + s.M(12);
+        reserve(l.build, width < static_cast<int>(s.M(188)) ? width : s.M(188));
+    }
+    if (compactHud) reserve(l.hud, s.M(164));
+    const int widths[] = {64, 64, 112, 112, 240, 240};
+    for (int i = 5; i >= 0; --i) if (enabledMetrics & (1u << i)) {
         reserve(l.metrics[i], s.M(widths[i]));
         if (l.metrics[i].w) {
             // Two 19-pixel text lines do not fit the 32-pixel task buttons.
@@ -85,7 +106,7 @@ ChromeTaskbarLayout ChromeTaskbarLayoutFor(const ChromeStyle& s, uint32_t screen
     const int first = (focused / capacity) * capacity;
     l.count = total - first < capacity ? total - first : capacity;
     int width = (available - (capacity - 1) * s.M(SM::TaskbarPadding)) / capacity;
-    if (width > static_cast<int>(s.M(SM::TaskbarButtonWidth))) width = s.M(SM::TaskbarButtonWidth);
+    if (width > static_cast<int>(s.M(SM::TaskbarMaxButtonWidth))) width = s.M(SM::TaskbarMaxButtonWidth);
     for (int i = 0; i < l.count; ++i)
     {
         l.indices[i] = ids[first + i];
@@ -280,74 +301,115 @@ void ChromeBuildTaskbar(const ChromeTaskbarModel& m, const ChromeStyle& s, Chrom
     const auto& p = s.P();
     const int screenW = l.screenW, screenH = l.screenH;
     const int32_t mouseX = m.mouseX, mouseY = m.mouseY;
-    dl.Fill(0, l.y, screenW, screenH - l.y, s.MaterialColor(p.taskbar));
-    dl.Fill(0, l.y, screenW, 1, p.separator);
-    // The visual pill of a full-height target (hover follows the target).
+    const int barHeight = screenH - l.y;
+    if (s.glass && s.material && s.material->taskbarHeight >= static_cast<unsigned>(barHeight))
+        dl.Rows(0, l.y, screenW, barHeight, s.material->taskbarRows);
+    else dl.Fill(0, l.y, screenW, barHeight, s.MaterialColor(p.taskbar));
+    if (!s.glass) dl.Fill(0, l.y, screenW, 1, 0xff000000u | p.launcherBorder);
     auto pill = [&](const DesktopRect& r) {
         const int ix = r.w > static_cast<int>(4 * s.M(SM::TaskbarPillInsetX)) ? s.M(SM::TaskbarPillInsetX) : 0;
         const int iy = r.h > static_cast<int>(4 * s.M(SM::TaskbarPillInsetY)) ? s.M(SM::TaskbarPillInsetY) : 0;
         return DesktopRect{r.x + ix, r.y + iy, r.w - 2 * ix, r.h - 2 * iy};
     };
-    auto button = [&](const DesktopRect& target, const char* title, bool active, bool minimized) {
+    const auto outlined = 0xff000000u | p.minimized;
+    auto button = [&](const DesktopRect& target, bool active, bool minimized, bool running) {
         const DesktopRect r = pill(target);
-        uint32_t bg = active ? p.taskActive : target.contains(mouseX, mouseY) ? p.taskHover : p.taskButton;
-        ChromeMaterialRect(dl, s, r, bg);
-        if (active || minimized)
-            dl.Fill(r.x + s.M(6), r.y + r.h - s.M(2), r.w - s.M(12), s.M(2), active ? p.accent : p.minimized);
-        if (r.w > static_cast<int>(s.M(12))) dl.Text(r.x + s.M(6), l.textY, title, p.taskText, r.w - s.M(12));
+        const bool hovered = target.contains(mouseX, mouseY);
+        if (active || hovered || !minimized)
+            dl.MaterialRect(r, s.MaterialColor(active ? p.taskActive : hovered ? p.taskHover : p.taskButton), s.M(6));
+        if (minimized)
+            dl.MaterialOutline(r, outlined, s.M(6));
+        else if (active || running) {
+            const int desired = active ? r.w / 2 : static_cast<int>(s.M(10));
+            const int indicator = desired < r.w ? desired : r.w;
+            dl.MaterialRect({r.x + (r.w - indicator) / 2, r.y + r.h - static_cast<int>(s.M(4)),
+                             indicator, static_cast<int>(s.M(2))},
+                            0xff000000u | (active ? p.accent : p.secondaryText), s.M(1));
+        }
     };
-    const int icon = static_cast<int>(s.M(24));
-    button(l.apps, "", m.launcherOpen, false);
-    button(l.terminal, "", false, false);
-    ChromeIcon(dl, s, l.apps.x + (l.apps.w - icon) / 2, l.apps.y + (l.apps.h - icon) / 2, icon, m.appsIcon);
-    ChromeIcon(dl, s, l.terminal.x + (l.terminal.w - icon) / 2, l.terminal.y + (l.terminal.h - icon) / 2, icon,
-               m.terminalIcon);
-    const char* hoverTitle = l.apps.contains(mouseX, mouseY) ? "Applications" :
-        l.terminal.contains(mouseX, mouseY) ? "New terminal" : nullptr;
-    for (int i = 0; i < l.count; ++i)
-    {
+    const int icon = s.M(24);
+    auto centeredIcon = [&](const DesktopRect& r, const uint32_t* pixels) {
+        if (r.w >= icon && r.h >= icon)
+            ChromeIcon(dl, s, r.x + (r.w - icon) / 2, r.y + (r.h - icon) / 2, icon, pixels);
+    };
+    button(l.apps, m.launcherOpen, false, false);
+    button(l.terminal, false, false, false);
+    centeredIcon(l.apps, m.appsIcon);
+    centeredIcon(l.terminal, m.terminalIcon);
+    for (int i = 0; i < l.count; ++i) {
         const DesktopRect& r = l.buttons[i];
         const ChromeTaskbarButton& b = m.buttons[i];
+        button(r, b.active, b.minimized, !b.launch);
         if (b.launch) {
-            button(r, "", false, false);
-            if (r.w >= icon && r.h >= icon)
-                ChromeIcon(dl, s, r.x + (r.w - icon) / 2, r.y + (r.h - icon) / 2, icon, b.icon);
+            centeredIcon(r, b.icon);
             const DesktopRect pr = pill(r);
             if (b.busy) {
-                // Eight positions form a bounded animated progress ring.
                 static const int dx[8] = {0, 3, 4, 3, 0, -3, -4, -3};
                 static const int dy[8] = {-4, -3, 0, 3, 4, 3, 0, -3};
                 unsigned step = (m.uptimeMs / 100) % 8;
                 for (unsigned dot = 0; dot < 8; ++dot)
                     dl.Fill(pr.x + pr.w - 8 + dx[dot], pr.y + pr.h - 8 + dy[dot], 2, 2,
-                            dot == step ? p.taskText : p.minimized);
-            } else {
+                            0xff000000u | (dot == step ? p.taskText : p.minimized));
+            } else if (pr.w > static_cast<int>(s.M(10))) {
                 dl.Text(pr.x + pr.w - s.M(10), l.textY, "!", p.taskText, s.M(10));
             }
-            if (r.contains(mouseX, mouseY)) hoverTitle = b.hoverTitle;
             continue;
         }
-        button(r, "", b.active, b.minimized);
-        if (r.w >= icon && r.h >= icon)
-            ChromeIcon(dl, s, r.x + (r.w - icon) / 2, r.y + (r.h - icon) / 2, icon, b.icon);
-        if (r.contains(mouseX, mouseY)) hoverTitle = b.hoverTitle;
+        if (r.w >= static_cast<int>(s.M(72)) && r.h >= icon && b.hoverTitle && b.hoverTitle[0]) {
+            const int ix = r.x + s.M(10), tx = ix + icon + s.M(8);
+            ChromeIcon(dl, s, ix, r.y + (r.h - icon) / 2, icon, b.icon);
+            dl.Text(tx, l.textY, b.hoverTitle, p.taskText, r.x + r.w - tx - s.M(10));
+        } else centeredIcon(r, b.icon);
     }
     if (l.next.w > 0) {
-        button(l.next, ">", false, false);
-        if (l.next.contains(mouseX, mouseY)) hoverTitle = "More windows";
+        button(l.next, false, false, false);
+        const int w = s.TextWidth(">");
+        if (w <= l.next.w) dl.Text(l.next.x + (l.next.w - w) / 2, l.textY, ">", p.taskText, w);
     }
-    // Use the already-reserved tray for the hover label. Geometry stays fixed
-    // and no additional empty strip is reserved when nothing is hovered.
-    int labelX = screenW;
-    const DesktopRect trayRects[] = {l.metrics[0], l.metrics[1], l.metrics[2], l.metrics[3], l.metrics[4], l.metrics[5],
-                                     l.metrics[6], l.agent, l.volume, l.network, l.clock};
-    for (const auto& r : trayRects) if (r.w && r.x < labelX) labelX = r.x;
-    if (hoverTitle && labelX + static_cast<int>(s.M(12)) < screenW)
-    {
-        dl.Text(labelX, l.textY, hoverTitle, p.text, screenW - labelX - s.M(8));
-        return;
+    if (l.build.w > 0) {
+        const int line = s.Font().lineHeight;
+        dl.MaterialRect({l.build.x, l.textY - static_cast<int>(s.M(3)), l.build.w, line + static_cast<int>(s.M(6))},
+                        0xff000000u | p.badgeFill, s.M(4));
+        const int cell = s.TextWidth("0"), end = l.build.x + l.build.w - s.M(6);
+        int x = l.build.x + s.M(6);
+        for (const char* c = l.buildText; cell > 0 && *c && x + cell <= end; ++c, x += cell) {
+            const char ch[] = {*c, 0};
+            dl.Text(x, l.textY, ch, p.badgeText, cell);
+        }
     }
-    if (l.clock.w > 0) dl.Text(l.clock.x, l.textY, l.clockText, p.secondaryText, l.clock.w);
+    if (l.clock.w > 0) {
+        const int line = s.Font().lineHeight;
+        auto clockLine = [&](const char* text, int y, uint32_t color) {
+            const int w = s.TextWidth(text);
+            dl.Text(l.clock.x + (w < l.clock.w ? l.clock.w - w : 0), y, text, color, l.clock.w);
+        };
+        const bool twoLines = l.clockDate[0] && l.clock.h >= 2 * line;
+        clockLine(l.clockText, twoLines ? l.clock.y + (l.clock.h - 2 * line) / 2 : l.textY, p.text);
+        if (twoLines) clockLine(l.clockDate, l.clock.y + l.clock.h / 2, p.secondaryText);
+    }
+    const auto trayHover = [&](const DesktopRect& r) {
+        if (r.contains(mouseX, mouseY)) {
+            const int pad = s.M(4);
+            const auto inset = pill(r);
+            dl.MaterialRect({inset.x - pad, inset.y, inset.w + 2 * pad, inset.h},
+                            s.MaterialColor(p.taskHover), s.M(6));
+        }
+    };
+    trayHover(l.network);
+    trayHover(l.volume);
+    trayHover(l.metrics[6]);
+    if (l.metrics[6].w > 0 && m.telemetry.thermal && m.telemetry.latest.pkgC >= 0) {
+        const auto& t = m.telemetry;
+        char value[12];
+        DesktopNumber(value, static_cast<unsigned>(t.latest.pkgC));
+        unsigned len = 0;
+        while (value[len]) ++len;
+        value[len++] = 'C';
+        value[len] = 0;
+        dl.Text(l.metrics[6].x, l.textY, value, ThermalColour(t.latest.pkgC, t.tjmax), l.metrics[6].w);
+    } else if (l.metrics[6].w > 0) {
+        dl.Text(l.metrics[6].x, l.textY, "n/a", p.mutedText, l.metrics[6].w);
+    }
     NetworkIndicator(dl, s, l.network, m.networkConnected);
     if (l.volume.w > 0) {
         const int size = static_cast<int>(s.M(16));
@@ -355,7 +417,7 @@ void ChromeBuildTaskbar(const ChromeTaskbarModel& m, const ChromeStyle& s, Chrom
                                m.volumeControl, m.volumeAvailable, p.taskbar);
     }
     AgentIndicator(dl, s, l.agent, m.agentShown, m.agentStale);
-    for (unsigned i = 0; i < 7; ++i) DesktopMetric(dl, s, m.telemetry, l.metrics[i], i, m.uptimeMs);
+    for (unsigned i = 0; i < 6; ++i) DesktopMetric(dl, s, m.telemetry, l.metrics[i], i, m.uptimeMs);
 }
 
 // ---------------------------------------------------------------------------
@@ -595,14 +657,136 @@ void ChromeBuildBootSummary(const ChromeBootSummaryModel& m, const ChromeStyle& 
     const uint32_t w = static_cast<uint32_t>(m.rect.w), h = static_cast<uint32_t>(m.rect.h);
     if (!w || !h) return;
     const auto& p = s.P();
-    dl.Fill(x, y, w, h, p.taskbar);
-    dl.Fill(x, y, w, s.M(3), p.accent);
+    PanelFrame(dl, s, m.rect);
     int py = y + s.M(11); const int line = s.Font().lineHeight;
     const uint32_t colors[5] = {p.text, p.secondaryText, p.secondaryText, p.secondaryText, p.mutedText};
     for (int i = 0; i < 5; ++i) {
-        if (m.rows[i]) dl.Text(x + s.M(12), py, m.rows[i], colors[i], w - s.M(24));
-        py += line;
+        if (m.rows[i]) {
+            dl.Text(x + s.M(12), py, m.rows[i], colors[i], w - s.M(24));
+            py += line;
+        }
+        if (i != 0) continue;
+        uint64_t total = 0;
+        for (uint64_t ms : m.phaseMs) total += ms;
+        const int trackWidth = int(w) - int(s.M(24));
+        const uint32_t inks[] = {p.accent, p.warm, p.ok, p.secondaryText};
+        int last = 0;
+        uint64_t elapsed = 0;
+        for (unsigned phase = 0; total && phase < 4; ++phase) {
+            elapsed += m.phaseMs[phase];
+            const int edge = elapsed * trackWidth / total;
+            if (edge > last)
+                dl.Fill(x + int(s.M(12)) + last, py + s.M(4), edge - last, s.M(5), inks[phase]);
+            last = edge;
+        }
+        if (total) py += s.M(13);
+        const int swatch = s.M(5), gap = s.M(5);
+        for (unsigned phase = 0; phase < 4; ++phase) {
+            if (!m.phaseLabels[phase]) continue;
+            const int column = x + s.M(12) + int(phase & 1u) * trackWidth / 2;
+            const int row = py + int(phase / 2) * line;
+            dl.Fill(column, row + (line - swatch) / 2, swatch, swatch, inks[phase]);
+            dl.Text(column + swatch + gap, row, m.phaseLabels[phase], p.secondaryText,
+                    trackWidth / 2 - swatch - gap);
+        }
+        if (m.phaseLabels[0]) py += 2 * line;
     }
+}
+
+
+void ChromeBuildTrayFlyout(const ChromeTrayFlyoutModel& m, const ChromeStyle& s, ChromeDisplayList& dl)
+{
+    const DesktopRect& p = m.rect;
+    const auto& pal = s.P();
+    PanelFrame(dl, s, p);
+    const int pad = s.M(14), x = p.x + pad, w = p.w - 2 * pad;
+    const int line = s.Font().lineHeight;
+    const int y = p.y + pad;
+    dl.Text(x, y, m.network ? "Network" : "Temperature", pal.text, w);
+    dl.Text(x, y + line + s.M(6), m.readout, pal.secondaryText, w);
+    if (m.network && m.connected) {
+        DesktopMetric(dl, s, m.telemetry, {x, y + 2 * line + int(s.M(14)), w, 2 * line}, 3, 0);
+    } else if (!m.network && m.telemetry.thermal) {
+        DesktopMetric(dl, s, m.telemetry, {x, y + 2 * line + int(s.M(14)), w, 2 * line}, 6, 0);
+    }
+}
+
+static void HudCadence(ChromeDisplayList& dl, const ChromeStyle& s, const DesktopRect& r,
+                       const DesktopIntervals<>& history, uint64_t tick, const char* label, uint32_t ink)
+{
+    const int line = s.Font().lineHeight, graphH = r.h - 2 * line;
+    if (graphH <= 0) return;
+    const auto& p = s.P();
+    dl.Text(r.x, r.y, label, p.text, r.w);
+    const int graphY = r.y + line;
+    const int pitch = s.M(3);
+    const unsigned maxBars = r.w / pitch;
+    const unsigned shown = history.count < maxBars ? history.count : maxBars;
+    const int budgetY = graphY + graphH - graphH * 167 / 240;
+    dl.Fill(r.x, budgetY, r.w, 1, p.launcherBorder);
+    for (unsigned i = 0; i < shown; ++i) {
+        const auto& sample = history.samples[(history.next + 128 - shown + i) % 128];
+        if (tick < sample.tick || tick - sample.tick > 10000) continue;
+        const unsigned ms = sample.ms < 24 ? sample.ms : 24;
+        const int height = 1 + (graphH - 1) * ms / 24;
+        const int x = r.x + r.w - int(shown - i) * pitch;
+        dl.Fill(x, graphY + graphH - height, pitch - 1, height, ms >= 17 ? p.hot : ink);
+    }
+    const auto summary = history.Read(tick);
+    char value[64]{};
+    if (summary.count) {
+        char number[12];
+        DesktopNumber(number, summary.p80);
+        CopyText(value, "p80 ", sizeof(value));
+        unsigned n = 4;
+        for (const char* c = number; *c; ++c) value[n++] = *c;
+        CopyText(value + n, " ms   p95 ", sizeof(value) - n);
+        n += 10;
+        DesktopNumber(value + n, summary.p95);
+        while (value[n]) ++n;
+        CopyText(value + n, " ms", sizeof(value) - n);
+    } else CopyText(value, "No recent frames", sizeof(value));
+    dl.Text(r.x, graphY + graphH, value, p.secondaryText, r.w);
+}
+
+void ChromeBuildCompactHud(const ChromePerformanceHudModel& m, const ChromeStyle& s, ChromeDisplayList& dl)
+{
+    const auto& p = s.P();
+    const int half = m.rect.w / 2, pad = s.M(4), line = s.Font().lineHeight;
+    const int pitch = s.M(3), graphH = s.M(15);
+    const int y = m.rect.y + (m.rect.h - line - graphH) / 2;
+    for (unsigned series = 0; series < 2; ++series) {
+        const int x = m.rect.x + series * half + pad;
+        const auto* h = series ? m.telemetry.compositor : m.telemetry.app;
+        dl.Text(x, y, series ? "COMP" : "APP", p.secondaryText, half - pad);
+        if (!h) continue;
+        const unsigned capacity = (half - 2 * pad) / pitch;
+        const unsigned shown = h->count < capacity ? h->count : capacity;
+        const int bottom = y + line + graphH;
+        for (unsigned i = 0; i < shown; ++i) {
+            const auto& v = h->samples[(h->next + 128 - shown + i) % 128];
+            if (m.tick < v.tick || m.tick - v.tick > 10000) continue;
+            const unsigned value = v.ms < 17 ? v.ms : 17;
+            const int bar = 1 + (graphH - 1) * value / 17;
+            dl.Fill(x + (capacity - shown + i) * pitch, bottom - bar, pitch - 1, bar,
+                    value >= 17 ? p.hot : series ? p.ok : p.accent);
+        }
+    }
+}
+
+void ChromeBuildPerformanceHud(const ChromePerformanceHudModel& m, const ChromeStyle& s, ChromeDisplayList& dl)
+{
+    const auto& p = s.P();
+    const int pad = s.M(14), x = m.rect.x + pad, w = m.rect.w - 2 * pad;
+    const int line = s.Font().lineHeight, graph = 2 * line + int(s.M(30)), gap = s.M(8);
+    const int y = m.rect.y + pad;
+    PanelFrame(dl, s, m.rect);
+    dl.Text(x, y, "Performance", p.text, w);
+    const int appY = y + line + gap, compY = appY + graph + gap;
+    const auto& t = m.telemetry;
+    if (t.app) HudCadence(dl, s, {x, appY, w, graph}, *t.app, m.tick, "APP", p.accent);
+    if (t.compositor) HudCadence(dl, s, {x, compY, w, graph}, *t.compositor, m.tick, "COMP", p.ok);
+    DesktopMetric(dl, s, t, {x, compY + graph + gap, w, 2 * line}, 6, m.tick);
 }
 
 } // namespace brook
