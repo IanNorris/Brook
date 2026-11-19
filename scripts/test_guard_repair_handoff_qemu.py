@@ -745,10 +745,15 @@ def main():
                     raise RuntimeError(f'RLIMIT_CORE probe failed: {disabled}')
                 if bridge.command(session,'proc autodump status').get('queued')!=before['queued']:
                     raise RuntimeError('RLIMIT_CORE=0 queued an unexpected crash dump')
-                crashed=bridge.guest_run(session,uuid.uuid4().hex,['/boot/PROCDUMP.ELF','--crash'],
-                                         cwd='/tmp',uid=1000,wait_s=8)
-                fault=re.search(r'PROC_DUMP_CRASH (\d+)',crashed.get('stdout',{}).get('text',''))
-                if not fault or crashed.get('state')!='completed':
+                legacy=bridge.guest_run(session,uuid.uuid4().hex,['/boot/PROCDUMP.ELF','--legacy-core-directory'],
+                                        cwd='/tmp',uid=0,wait_s=8)
+                if legacy.get('exit',{}).get('code')!=0:
+                    raise RuntimeError(f'could not install the legacy root-only directory: {legacy}')
+                crashed=bridge.guest_run(session,uuid.uuid4().hex,['/boot/PROCDUMP.ELF','--crash-mount-ns'],
+                                         cwd='/tmp',uid=0,wait_s=8)
+                output=crashed.get('stdout',{}).get('text','')
+                fault=re.search(r'PROC_DUMP_CRASH (\d+)',output)
+                if not fault or 'PROC_DUMP_PRIVATE_HOME' not in output or crashed.get('exit',{}).get('code')!=0:
                     raise RuntimeError(f'faulting fixture did not terminate: {crashed}')
                 deadline=time.monotonic()+22
                 while True:
@@ -758,6 +763,11 @@ def main():
                         after.get('timed_out',0)>before['timed_out']):
                         raise RuntimeError(f'automatic core did not publish: {after}; see desktop serial')
                     time.sleep(.15)
+                owned=bridge.guest_run(session,uuid.uuid4().hex,
+                                      ['/boot/PROCDUMP.ELF','--read-owned-crash',fault[1]],
+                                      cwd='/tmp',uid=1000,wait_s=8)
+                if 'PROC_DUMP_OWNER_READ_PASS' not in owned.get('stdout',{}).get('text',''):
+                    raise RuntimeError(f'uid 1000 could not read the published core: {owned}')
                 artifact=uuid.uuid4().hex
                 export=bridge.guest_run(session,uuid.uuid4().hex,
                                         ['/boot/PROCDUMP.ELF','--export-crash',fault[1],artifact],
@@ -772,7 +782,8 @@ def main():
                 transcript=trace.stdout+trace.stderr
                 (a.output/'core-auto-gdb.log').write_text(transcript)
                 (a.output/'core-auto-result.json').write_text(json.dumps({
-                    'before':before,'after':after,'pid':int(fault[1]),'exit':crashed.get('exit',{})
+                    'before':before,'after':after,'pid':int(fault[1]),'exit':crashed.get('exit',{}),
+                    'private_home':True,'owner_readable':True
                 },indent=2)+'\n')
                 if trace.returncode or not re.search(r'^#0\s+.*\bcrash_frame\b',transcript,re.M):
                     raise RuntimeError('automatic core did not unwind to the faulting frame')

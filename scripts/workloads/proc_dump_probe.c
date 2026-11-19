@@ -1,5 +1,9 @@
+#define _GNU_SOURCE
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <sched.h>
+#include <signal.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -7,6 +11,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
 #include <sys/resource.h>
 #include <unistd.h>
 
@@ -47,14 +55,41 @@ static int crash_probe(int disable)
     return 5;
 }
 
-static int export_crash(const char* pid_text,const char* artifact)
+static const char directory[]="/data/home/.local/share/brook/cores";
+
+static int crash_mount_namespace(void)
 {
-    static const char directory[]="/data/home/.local/share/brook/cores";
+    const long child=syscall(SYS_clone,CLONE_NEWNS|SIGCHLD,0L,0L,0L,0L);
+    if(child<0){perror("clone mount namespace");return 14;}
+    if(child){
+        int status=0;
+        return waitpid(child,&status,0)==child && WIFSIGNALED(status) && WTERMSIG(status)==SIGSEGV?0:15;
+    }
+    if(mount("tmpfs","/data/home/.local","tmpfs",MS_NODEV|MS_NOSUID,"mode=0755")){
+        perror("mount private home");_exit(16);
+    }
+    if(access(directory,F_OK)==0 || errno!=ENOENT)_exit(17);
+    if(setgid(1000) || setuid(1000) || getuid()!=1000 || geteuid()!=1000)_exit(18);
+    puts("PROC_DUMP_PRIVATE_HOME");
+    return crash_probe(0);
+}
+
+static int install_legacy_directory(void)
+{
+    const char* paths[]={"/data/home/.local","/data/home/.local/share",
+                         "/data/home/.local/share/brook",directory};
+    for(unsigned i=0;i<sizeof(paths)/sizeof(paths[0]);++i)
+        if(mkdir(paths[i],paths[i]==directory?0700:0755) && errno!=EEXIST)return 19;
+    struct stat st;
+    return stat(directory,&st) || st.st_uid || (st.st_mode&0777)!=0700?20:0;
+}
+
+static int open_crash_core(const char* pid_text)
+{
     const long pid=strtol(pid_text,NULL,10);
-    if(pid<=0 || pid>65535 || strlen(artifact)!=32 ||
-       strspn(artifact,"0123456789abcdef")!=32)return 6;
+    if(pid<=0 || pid>65535)return -1;
     DIR* listing=opendir(directory);
-    if(!listing)return 7;
+    if(!listing)return -1;
     char source[512]={};
     struct dirent* entry;
     while((entry=readdir(listing))){
@@ -68,8 +103,29 @@ static int export_crash(const char* pid_text,const char* artifact)
         break;
     }
     closedir(listing);
-    if(!source[0])return 8;
-    const int input=open(source,O_RDONLY|O_NOFOLLOW);
+    return source[0]?open(source,O_RDONLY|O_NOFOLLOW):-1;
+}
+
+static int read_owned_crash(const char* pid_text)
+{
+    struct stat dir;
+    if(getuid()!=1000 || stat(directory,&dir) || dir.st_uid!=1000 || (dir.st_mode&0777)!=0700)return 21;
+    const int fd=open_crash_core(pid_text);
+    if(fd<0)return 22;
+    struct stat file;
+    char magic[4];
+    const int ok=!fstat(fd,&file) && file.st_uid==1000 && (file.st_mode&0777)==0600 &&
+        read(fd,magic,sizeof(magic))==(ssize_t)sizeof(magic) && !memcmp(magic,"\177ELF",4);
+    close(fd);
+    if(!ok)return 23;
+    puts("PROC_DUMP_OWNER_READ_PASS");
+    return 0;
+}
+
+static int export_crash(const char* pid_text,const char* artifact)
+{
+    if(strlen(artifact)!=32 || strspn(artifact,"0123456789abcdef")!=32)return 6;
+    const int input=open_crash_core(pid_text);
     if(input<0)return 9;
     char dest[128];
     snprintf(dest,sizeof(dest),"/data/.brook-transfer/%s.bin",artifact);
@@ -95,6 +151,9 @@ static int export_crash(const char* pid_text,const char* artifact)
 int main(int argc,char** argv)
 {
     if(argc==2 && !strcmp(argv[1],"--crash"))return crash_probe(0);
+    if(argc==2 && !strcmp(argv[1],"--crash-mount-ns"))return crash_mount_namespace();
+    if(argc==2 && !strcmp(argv[1],"--legacy-core-directory"))return install_legacy_directory();
+    if(argc==3 && !strcmp(argv[1],"--read-owned-crash"))return read_owned_crash(argv[2]);
     if(argc==2 && !strcmp(argv[1],"--crash-limit-zero"))return crash_probe(1);
     if(argc==4 && !strcmp(argv[1],"--export-crash"))return export_crash(argv[2],argv[3]);
     if(argc!=1)return 13;

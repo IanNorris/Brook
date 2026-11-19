@@ -62,6 +62,9 @@ struct CoreDumpDestination {
     bool (*expired)(void*)=nullptr;
     int (*reserve)(void*,uint64_t)=nullptr;
     void* context=nullptr;
+    // Managed output is created exclusively in a private staging directory.
+    bool setOwner=false;
+    uint32_t uid=0,gid=0;
 };
 
 void CoreDumpPublishRegisters(Process*,const CoreRegisters&);

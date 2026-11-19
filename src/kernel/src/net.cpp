@@ -5683,6 +5683,13 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         reply.text(",");reply.field("busy",s.busy);
         reply.text(",");reply.field("rate_limited",s.rateLimited);
         reply.text(",");reply.field("active_ms",s.activeMs);
+        reply.text(",\"last_error\":");
+        if(s.lastError.stage){
+            reply.text("{\"stage\":");reply.quoted(s.lastError.stage);
+            reply.text(",");reply.field("pid",s.lastError.pid);
+            reply.text(",");reply.field("errno",s.lastError.error);
+            reply.text("}");
+        }else reply.text("null");
         reply.text("}\n");reply.send();
     }
     else if(StrStartsWith(cmd,"proc dump ")){
