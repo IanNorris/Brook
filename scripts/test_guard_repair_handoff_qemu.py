@@ -2,6 +2,7 @@
 """Exercise automatic repair, reset and guarded desktop on a disposable QEMU disk."""
 import argparse
 import hashlib
+import os
 import json
 import re
 from pathlib import Path
@@ -85,7 +86,10 @@ def main():
     parser.add_argument('--auto-desktop-dell-async-network',action='store_true',help='Retain Dell asynchronous TCP settings with the emulated NIC')
     parser.add_argument('--normal-kernel',type=Path,help='Use this normal kernel for the final boot')
     parser.add_argument('--normal-network-module',type=Path,help='Matching virtio-net module for normal boot')
+    parser.add_argument('--proc-dump-qa',type=Path,help='Run the live core fixture with this matching virtio NIC module')
     a=parser.parse_args()
+    if a.proc_dump_qa and not a.auto_desktop_dell_initrd:
+        parser.error('live core QA requires the guarded Dell startup fixture')
     if (a.torn_journal_before_desktop or a.torn_journal_before_repair) and (not a.auto_desktop_reset or a.two_panic_records or a.auto_desktop_serial_stall or a.auto_desktop_nested_panic or (a.torn_journal_before_desktop and a.torn_journal_before_repair)):
         parser.error('torn journal requires an ordinary desktop panic and reset')
     if a.auto_desktop_corrupt_counts and (not a.auto_desktop_reset or a.auto_desktop_startup_panic or
@@ -208,6 +212,18 @@ def main():
             payloads += ((service,'::/BOOT/INTLWL.ELF'),)
         if a.auto_desktop_vulkan_service:
             payloads += ((service,'::/BOOT/VKSUP.ELF'),(service,'::/BOOT/VKRENDER.ELF'))
+        if a.proc_dump_qa:
+            probe_executable=a.output/'PROCDUMP.ELF'
+            subprocess.run([os.environ['MUSL_CC'],'-static','-no-pie','-pthread','-g','-O1',
+                            '-fno-omit-frame-pointer',str(ROOT/'scripts/workloads/proc_dump_probe.c'),'-o',str(probe_executable)],check=True)
+            key=work/'hardware-update-key'
+            key.write_text(uuid.uuid4().hex);key.chmod(0o600)
+            for name,data in (('hardware-bulk',b'1\n'),('hardware-maintenance',b'1\n'),('hardware-update-key',key.read_bytes())):
+                subprocess.run(['mcopy','-o','-i',str(normal),'-','::/ETC/'+name],input=data,check=True)
+            for name in ('arp-async-probe','tcp-async-neighbor','tcp-try-transmit','tcp-async-send',
+                         'tcp-async-retry-1ms','tcp-worker-waiter','tcp-adaptive-flight16'):
+                subprocess.run(['mdel','-i',str(normal),'::/ETC/'+name],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            payloads+=((probe_executable,'::/BOOT/PROCDUMP.ELF'),)
         for src,target in payloads:
             subprocess.run(['mcopy','-o','-i',str(normal),str(src),target],check=True)
         if a.auto_desktop_startup_panic:
@@ -220,10 +236,10 @@ def main():
                 additional=b'run --service --console --uid 1000 /boot/CONTEND.ELF\n'
             script.write_bytes(startup.rstrip(b'\r\n')+b'\n'+additional+b'panic GDBTEST\n')
             subprocess.run(['mcopy','-o','-i',str(normal),str(script),'::/BOOT/INIT.RC'],check=True)
-        if a.normal_kernel or a.auto_desktop_network_module or a.auto_desktop_dell_shutdown_module:
+        if a.normal_kernel or a.auto_desktop_network_module or a.auto_desktop_dell_shutdown_module or a.proc_dump_qa:
             if subprocess.run(['mdir','-i',str(normal),'::/DRIVERS'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode:
                 subprocess.run(['mmd','-i',str(normal),'::/DRIVERS'],check=True)
-            subprocess.run(['mcopy','-o','-i',str(normal),str(a.normal_network_module or a.auto_desktop_network_module or a.auto_desktop_dell_shutdown_module),'::/DRIVERS/virtio_net.mod'],check=True)
+            subprocess.run(['mcopy','-o','-i',str(normal),str(a.normal_network_module or a.auto_desktop_network_module or a.auto_desktop_dell_shutdown_module or a.proc_dump_qa),'::/DRIVERS/virtio_net.mod'],check=True)
         selection=work/'select.bin';selection.write_bytes(record(1,0,(a.recovery_pair/'KERNEL.ELF').read_bytes(),recovery.read_bytes()))
         for src,target in ((a.efi,'::/EFI/BOOT/BOOTX64.EFI'),(a.normal_kernel or a.desktop_pair/'KERNEL.ELF','::/KERNEL/BROOK.ELF'),
                            (normal,'::/INITRD.IMG'),(a.recovery_pair/'KERNEL.ELF','::/RECOVERY/KERNEL.ELF'),
@@ -671,6 +687,54 @@ def main():
                 boot(disk,a.firmware,second,False,'GUARD_DESKTOP_HANDOFF_SCRIPT status=0',120,True,sata_snapshot=False,
                      hold_after_marker=5,sata_serial='BROOK-RECOVERY-QA',failure_marker='GUARD_DESKTOP_HANDOFF_FAILED',
                      network_port=network_port,network_usb=a.auto_desktop_dell_usb_network,on_marker=shutdown_real_provider)
+            finally:
+                for name in ('serial.log','qemu.log'):
+                    if (second/name).exists():shutil.copyfile(second/name,a.output/('desktop-attempt-'+name))
+        elif a.proc_dump_qa:
+            with socket.socket() as debug_listener, socket.socket() as bulk_listener:
+                debug_listener.bind(('127.0.0.1',0));network_port=debug_listener.getsockname()[1]
+                bulk_listener.bind(('127.0.0.1',0));bulk_port=bulk_listener.getsockname()[1]
+
+            def check_core():
+                from dell_proc_dump import Hardware, capture
+                bridge=Hardware(work/'core-registry')
+                deadline=time.monotonic()+20
+                while True:
+                    try:session=bridge.attach('127.0.0.1',network_port)['session'];break
+                    except (OSError,RuntimeError):
+                        if time.monotonic()>=deadline:raise
+                        time.sleep(.1)
+                request=uuid.uuid4().hex
+                bridge.guest_run(session,request,['/boot/PROCDUMP.ELF'],cwd='/tmp',uid=1000,wait_s=2)
+                deadline=time.monotonic()+20
+                while True:
+                    job=bridge.job(session,request,wait_s=2)
+                    ready=re.search(r'PROC_DUMP_READY (\d+)',job.get('stdout',{}).get('text',''))
+                    if ready:break
+                    if time.monotonic()>=deadline or job.get('state') in ('failed','completed','rejected'):
+                        raise RuntimeError(f'core fixture failed to start: {job}')
+                    time.sleep(.1)
+                core=a.output/'probe.core'
+                result=capture(bridge,session,int(ready[1]),core,key,bulk_port)
+                (a.output/'core-result.json').write_text(json.dumps(result,indent=2)+'\n')
+                trace=subprocess.run(['gdb','-batch','-iex','set sysroot /','-ex','thread apply all bt','-ex','info proc mappings',
+                                      str(probe_executable),str(core)],capture_output=True,text=True,timeout=30)
+                transcript=trace.stdout+trace.stderr
+                (a.output/'core-gdb.log').write_text(transcript)
+                if (trace.returncode or result['threads']!=2 or result.get('missing_registers') or
+                    len(re.findall(r'^Thread \d+',transcript,re.M))!=2 or
+                    'pipe_waiter' not in transcript or 'running_main' not in transcript or
+                    not re.search(r'^0x[0-9a-f]+.* /boot/procdump\.elf\s*$',transcript,re.M|re.I) or
+                    not re.search(r'\bread \(',transcript)):
+                    raise RuntimeError('GDB could not unwind both live threads; see core-gdb.log')
+                if bridge.job(session,request,wait_s=1).get('state')!='running':
+                    raise RuntimeError('the fixture did not stay alive after the dump')
+                print('PROC_DUMP_GDB_PASS',flush=True)
+
+            try:
+                boot(disk,a.firmware,second,False,'GUARD_DESKTOP_HANDOFF_SCRIPT status=0',120,True,
+                     sata_snapshot=False,sata_serial='BROOK-RECOVERY-QA',failure_marker='GUARD_DESKTOP_HANDOFF_FAILED',
+                     network_port=network_port,bulk_port=bulk_port,on_marker=check_core)
             finally:
                 for name in ('serial.log','qemu.log'):
                     if (second/name).exists():shutil.copyfile(second/name,a.output/('desktop-attempt-'+name))

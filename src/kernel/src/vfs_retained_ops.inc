@@ -60,6 +60,16 @@ static int VfsObjectStatLocked(VfsObject* object,VnodeStat* stat)
     if(!stat)return -22;
     *stat={};return object && object->ops->stat?object->ops->stat(object,stat):-95;
 }
+// Keep a best-effort opening name with retained, mappable regular files.
+static void VfsRememberFileName(Vnode* node,const VfsPath& parent,const char* leaf)
+{
+    if(!node || node->type!=VnodeType::File || node->directoryPath || !parent.object)return;
+    char path[1024];
+    if(VfsGlobalDirectoryLocked(parent,path,sizeof(path)) || VfsAppendLeaf(path,sizeof(path),leaf))return;
+    const uint32_t length=StrLen(path)+1;
+    node->directoryPath=static_cast<char*>(kmalloc(length));
+    if(node->directoryPath)StrCopy(node->directoryPath,path,length);
+}
 Vnode* VfsOpenAt(const VfsPath& root,const VfsPath& start,const char* text,int flags,
                  uint16_t mode,uint16_t mask,int* error,bool followFinal)
 {
@@ -80,7 +90,9 @@ Vnode* VfsOpenAt(const VfsPath& root,const VfsPath& start,const char* text,int f
             if(*error)return nullptr;
             if(stat.isDir) { *error=-21;return nullptr; }
         }
-        return VfsPathOpenLocked(result.object,flags&~(VFS_O_CREATE|VFS_O_EXCL),error);
+        auto* node=VfsPathOpenLocked(result.object,flags&~(VFS_O_CREATE|VFS_O_EXCL),error);
+        VfsRememberFileName(node,result.parent,result.leaf);
+        return node;
     }
     if(!result.missing) { *error=-2;return nullptr; }
     VfsOwnedObject target;*error=VfsMutationTargetLocked(result.parent,result.leaf,target);
@@ -108,6 +120,7 @@ Vnode* VfsOpenAt(const VfsPath& root,const VfsPath& start,const char* text,int f
         }
         node->backendObject=object;
     }
+    VfsRememberFileName(node,result.parent,result.leaf);
     return node;
 }
 int VfsOpenExecutableAt(const VfsPath& root,const VfsPath& start,const char* text,
@@ -129,6 +142,7 @@ int VfsOpenExecutableAt(const VfsPath& root,const VfsPath& start,const char* tex
     resolved[prefix++]='/';StrCopy(resolved+prefix,walk.value.leaf,capacity-prefix);
     int error=0;Vnode* node=VfsPathOpenLocked(walk.value.object,VFS_O_EXEC,&error);
     if(!node)return error?error:-5;
+    VfsRememberFileName(node,walk.value.parent,walk.value.leaf);
     *out=node;return 0;
 }
 int VfsStatAt(const VfsPath& root,const VfsPath& start,const char* text,VnodeStat* out,bool followFinal)

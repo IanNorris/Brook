@@ -43,6 +43,8 @@ int64_t UserMappingAdviseFork(Process* actor, AddressSpaceState* space, uint64_t
 bool UserMappingClone(Process* actor, AddressSpaceState* source, AddressSpaceState* destination, uint16_t pid);
 // Caller retains space and supplies a kernel buffer. Copies live argument bytes
 // from readable user leaves while mutation prevents unmap/frame retirement.
+// Read one resident user RAM page from a retained foreign address space.
+bool UserMappingReadResidentPage(AddressSpaceState*,uint64_t address,uint64_t identity,void* out);
 uint32_t UserMappingReadArguments(AddressSpaceState* space, uint64_t offset, void* buffer, uint32_t capacity);
 // Source allocation must remain owned while the snapshot translates and pins
 // its pages. The returned descriptor owns those pins independently of the source.

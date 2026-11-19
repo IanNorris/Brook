@@ -1,3 +1,4 @@
+#include "gdt.h"
 #include "../../shared/brook_pointer.h"
 // syscall.cpp -- SYSCALL/SYSRET dispatcher, syscall table, and user-mode entry.
 //
@@ -98,6 +99,11 @@ extern "C" void SyscallSnapshotCurrentC()
     proc->syscallUserR9 = userR9;
     proc->syscallUserR10 = userR10;
     proc->currentSyscallNum = syscallNum;
+    brook::CoreDumpPublishRegisters(proc,{
+        userR15,userR14,userR13,userR12,userRbp,userRbx,userRflags,userR10,userR9,userR8,
+        syscallNum,userRip,userRdx,userRsi,userRdi,syscallNum,userRip,GDT_USER_CODE,userRflags,
+        userRsp,GDT_USER_DATA,proc->fsBase,proc->savedCtx.gsBase,0,0,0,0
+    });
 }
 
 // ---------------------------------------------------------------------------

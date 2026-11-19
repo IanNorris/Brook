@@ -421,6 +421,7 @@ add_executable(kernel
     src/procfs.cpp
     src/procfs_vfs.cpp
     src/net.cpp
+    src/core_dump.cpp
     src/shutdown.cpp
     src/platform_power.cpp
     src/usb_boot_health.cpp
