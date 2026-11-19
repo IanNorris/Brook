@@ -155,6 +155,13 @@ def main():
         print(f'\napp-driven cadence: mode={a_after["mode"]} focus_query={a_after["focus_query"]} '
               f'defer={a_after["defer_us"] / 1000:.1f}ms dominant_window={a_after["dominant"] or "-"} '
               f'early_frame_notifies {early / seconds:.2f}/s ({early})')
+        if 'overlay_capture_skips' in a_after:
+            skips = a_after['overlay_capture_skips'] - (a_before or {}).get('overlay_capture_skips', 0)
+            print(f'  overlay captures reused (app-driven limit) {skips / seconds:.2f}/s ({skips})')
+        if 'pointer_only' in a_after:
+            po = a_after['pointer_only'] - (a_before or {}).get('pointer_only', 0)
+            pd = a_after['pointer_only_driven'] - (a_before or {}).get('pointer_only_driven', 0)
+            print(f'  pointer-only frames submitted {po / seconds:.2f}/s ({po}), of which with a dominant window {pd}')
         print('  actions/s   ' + '  '.join(f'{k} {v / seconds:.2f} ({v})' for k, v in actions.items()))
         total = sum(dominance.values())
         print('  dominance   ' + '  '.join(f'{k} {100 * v / total:.0f}%' for k, v in dominance.items() if v) if total

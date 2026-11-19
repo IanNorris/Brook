@@ -190,6 +190,7 @@ struct NetStackCounters {
     uint64_t sendNoNeighbor;           // NetSendIpv4 returned -2
     uint64_t rxThreadOverflow;         // NetReceive callers beyond the tracking table
     uint64_t udpRxFull;                // datagrams dropped: receive buffer full
+    uint64_t udpRxCorrupt;             // UDP rx rings reset: inconsistent datagram framing
     uint64_t synQueueFull, synNoSocket, synRecvEvicted;
 };
 static NetStackCounters g_netCounters;
@@ -2301,6 +2302,12 @@ int SockSendTo(int sockIdx, const void* buf, uint32_t len,
     return NetSendUdpFrom(s.localIp, dstIp, ntohs(s.localPort), dstPort, buf, len);
 }
 
+// Copy n bytes out of a socket rx ring starting at tail (wraps once at most).
+static void SockRingRead(const uint8_t* ring,uint32_t tail,void* out,uint32_t n){
+    const uint32_t first=n<Socket::RX_BUF_SIZE-tail?n:Socket::RX_BUF_SIZE-tail;
+    if(out){memcpy(out,ring+tail,first);if(n>first)memcpy(static_cast<uint8_t*>(out)+first,ring,n-first);}
+}
+
 int SockRecvFrom(int sockIdx, void* buf, uint32_t len,
                  SockAddrIn* src)
 {
@@ -2314,41 +2321,47 @@ int SockRecvFrom(int sockIdx, void* buf, uint32_t len,
     // packets, but don't spin. Caller uses non-blocking semantics (returns
     // -EAGAIN below); the prior 100k-iteration pause-spin was burning ~6ms
     // per empty call and caused per-frame stalls (Q2 loopback polling).
-    if (s.rxCount == 0 && g_netIf && g_netIf->poll) {
+    // Outside s.lock: delivery takes it.
+    if (__atomic_load_n(&s.rxCount, __ATOMIC_ACQUIRE) == 0 && g_netIf && g_netIf->poll) {
         g_netIf->poll(g_netIf);
     }
 
-    if (s.rxCount == 0) return -11; // EAGAIN
+    // The ring is shared with the delivery path, which appends under s.lock;
+    // dequeue under the same lock. Without it (gen 441, YouTube over QUIC)
+    // the two rxCount updates raced, a lost update made the reader parse
+    // payload bytes as a datagram length, and the byte-wise skip loop ran for
+    // seconds in ring 0 on CPU 0, starving the GPU submission worker.
+    SpinLockAcquire(&s.lock);
+    const uint32_t count = s.rxCount;
+    if (count == 0) { SpinLockRelease(&s.lock); return -11; } // EAGAIN
 
-    // Read datagram length prefix (4 bytes) then data
-    uint32_t dgLen = 0;
-    for (int i = 0; i < 4; i++) {
-        dgLen |= static_cast<uint32_t>(s.rxBuf[s.rxTail]) << (i * 8);
-        s.rxTail = (s.rxTail + 1) % Socket::RX_BUF_SIZE;
+    // Datagram layout: [len:4][srcIp:4][srcPort:2][data:len].
+    uint8_t header[10];
+    if (count < sizeof(header)) {
+        s.rxHead = s.rxTail = 0; s.rxCount = 0;
+        SpinLockRelease(&s.lock);
+        NetCount(g_netCounters.udpRxCorrupt);
+        return -11;
     }
-
-    // Read source IP (4 bytes) and port (2 bytes)
-    uint32_t srcIp = 0;
-    for (int i = 0; i < 4; i++) {
-        srcIp |= static_cast<uint32_t>(s.rxBuf[s.rxTail]) << (i * 8);
-        s.rxTail = (s.rxTail + 1) % Socket::RX_BUF_SIZE;
+    SockRingRead(s.rxBuf, s.rxTail, header, sizeof(header));
+    const uint32_t dgLen = uint32_t(header[0]) | uint32_t(header[1]) << 8 |
+                           uint32_t(header[2]) << 16 | uint32_t(header[3]) << 24;
+    if (dgLen > 65535 || dgLen > count - sizeof(header)) {
+        // Never trust an inconsistent length: drop the whole ring.
+        s.rxHead = s.rxTail = 0; s.rxCount = 0;
+        SpinLockRelease(&s.lock);
+        NetCount(g_netCounters.udpRxCorrupt);
+        return -11;
     }
-    uint16_t srcPort = 0;
-    srcPort = s.rxBuf[s.rxTail]; s.rxTail = (s.rxTail + 1) % Socket::RX_BUF_SIZE;
-    srcPort |= static_cast<uint16_t>(s.rxBuf[s.rxTail]) << 8;
-    s.rxTail = (s.rxTail + 1) % Socket::RX_BUF_SIZE;
-
-    uint32_t copyLen = dgLen < len ? dgLen : len;
-    for (uint32_t i = 0; i < copyLen; i++) {
-        static_cast<uint8_t*>(buf)[i] = s.rxBuf[s.rxTail];
-        s.rxTail = (s.rxTail + 1) % Socket::RX_BUF_SIZE;
-    }
-    // Skip remainder if dgLen > len
-    for (uint32_t i = copyLen; i < dgLen; i++)
-        s.rxTail = (s.rxTail + 1) % Socket::RX_BUF_SIZE;
-
-    __asm__ volatile("mfence" ::: "memory");
-    s.rxCount -= (10 + dgLen); // 4 len + 4 ip + 2 port + data
+    const uint32_t srcIp = uint32_t(header[4]) | uint32_t(header[5]) << 8 |
+                           uint32_t(header[6]) << 16 | uint32_t(header[7]) << 24;
+    const uint16_t srcPort = static_cast<uint16_t>(header[8] | header[9] << 8);
+    const uint32_t dataTail = (s.rxTail + sizeof(header)) % Socket::RX_BUF_SIZE;
+    const uint32_t copyLen = dgLen < len ? dgLen : len;
+    SockRingRead(s.rxBuf, dataTail, buf, copyLen);
+    s.rxTail = (dataTail + dgLen) % Socket::RX_BUF_SIZE; // skips any truncated remainder
+    s.rxCount = count - (sizeof(header) + dgLen);
+    SpinLockRelease(&s.lock);
 
     if (src) {
         src->sin_family = AF_INET;
@@ -5384,7 +5397,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             field("resolve_blocking",c.resolveBlocking);field("resolve_blocking_failed",c.resolveBlockingFailed);
             field("resolve_nonblocking",c.resolveNonBlocking);field("resolve_queued",c.resolveQueued);
             field("send_no_neighbor",c.sendNoNeighbor);field("rx_thread_overflow",c.rxThreadOverflow);
-            field("udp_rx_full",c.udpRxFull);field("syn_queue_full",c.synQueueFull);
+            field("udp_rx_full",c.udpRxFull);field("udp_rx_corrupt",c.udpRxCorrupt);field("syn_queue_full",c.synQueueFull);
             field("syn_no_socket",c.synNoSocket);field("syn_recv_evicted",c.synRecvEvicted);
             uint32_t rxThreads = 0;
             for (auto* p : g_netRxThreads) rxThreads += __atomic_load_n(&p, __ATOMIC_RELAXED) != nullptr;

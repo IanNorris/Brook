@@ -168,6 +168,23 @@ static inline enum DesktopAppAction desktop_app_cadence(struct DesktopAppCadence
     if(wakeNs)*wakeNs=wake;
     return DESKTOP_APP_DEFER;
 }
+/* Overlay (shell band) captures while an app drives the cadence. A capture
+ * makes the kernel compositor thread render the overlay and the renderer
+ * wait for it (gen 441: about 14 ms each); its content changes with every
+ * present (the taskbar cadence graph) and every hover, so with the launcher
+ * open over a game each frame recaptured: 17.5 captures/s against 8.3/s
+ * with the cadence off, and prepare 13.3 ms against 2.7 ms per frame. While
+ * an app drives, a changed overlay is captured at most every
+ * DESKTOP_APP_OVERLAY_CAPTURE_NS (the kernel's own minimum overlay refresh,
+ * 100 ms); in between, frames reuse the newest capture any context holds.
+ * The pointer is a separate layer and still moves every frame. A context
+ * with no usable capture (first frame, output size change) always captures,
+ * as does the desktop when no app drives. */
+#define DESKTOP_APP_OVERLAY_CAPTURE_NS 100000000ull
+static inline int desktop_app_overlay_capture_due(int appDriven,int haveCapture,uint64_t lastCaptureNs,uint64_t now,uint64_t minNs){
+    if(!appDriven || !haveCapture || !lastCaptureNs || now<lastCaptureNs)return 1;
+    return now-lastCaptureNs>=minNs;
+}
 /* A frame with no damage at all: nothing waits any more. */
 static inline void desktop_app_cadence_idle(struct DesktopAppCadence *s){s->foreignSinceNs=0;}
 /* Whether point (x,y) lies in the layer's on-screen client rectangle. */
