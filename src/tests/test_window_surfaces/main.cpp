@@ -31,6 +31,7 @@ extern const ChromeFontSet g_chromeFonts100 TEST_FONT_SET;
 extern const ChromeFontSet g_chromeFonts150 TEST_FONT_SET;
 extern const ChromeFontSet g_chromeFonts200 TEST_FONT_SET;
 const char* BuildGitHash(){return "test";}
+const char* BuildDate(){return "2026-11-19";}
 bool CompositorGlassActive() { return false; }
 uint32_t CompositorMaterialOpacity() { return 255; }
 Terminal* TerminalFindByProcess(Process*) { return nullptr; }
