@@ -95,6 +95,12 @@ _Last updated: 19 November 2026 (early), by a Claude Code session; see "19 Nov e
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**19 Nov evening: Dell on gen 454 = `work/integration51` 6c18bafd** (int50 + `work/glass-stale`: lighter blur levels, renderer's own present keeps blur; session `7400bb3e38f64a26a2834571c6e5e89d`).
+- **Lighter blur:** Ian says Light "looks great".
+- **Glass→opaque glitch persists:** backend_blur_changes 29. Likely a lease lapse during direct-scanout/stale streaks. The agent was re-briefed on `work/glass-stale` to add per-branch reason counters and fix.
+- **File manager comparison:** Thunar (GTK3 SHM) smooth; Dolphin (Qt, staged tx `dolph1119`) good averages but occasional >1 s stalls with its main thread idle in ppoll; Nautilus (GTK4) stutters.
+- **Codex `work/wayland-latency`:** waylandd per-client histograms of commit→frame-callback, callback→commit and input delivery.
+
 **GTK4 performance (19 Nov, gen 453), Nautilus scroll stutter:**
 - **Not thermal:** GPU at 600 MHz with no trips; CPU 2.8 GHz.
 - **Not waylandd or the compositor:** compositor ~13 ms per frame with spare time; GTK main thread at ~11% CPU.
