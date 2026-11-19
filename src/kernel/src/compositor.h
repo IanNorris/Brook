@@ -164,6 +164,7 @@ int CompositorPresentRegions(const CompositorPresentRegion* regions,uint32_t cou
                              void* source,bool (*copy)(void*,uint64_t,void*,uint64_t),
                              uint64_t display,uint64_t backdrop,uint64_t owner);
 void CompositorReleasePresentLease(uint64_t owner);
+bool CompositorRefreshClientScanoutLease(uint64_t owner);
 
 // Begin a WM drag operation for a window at the current mouse position.
 // Used by Wayland clients via xdg_toplevel.move when they draw their own chrome.

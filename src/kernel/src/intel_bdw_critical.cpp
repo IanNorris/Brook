@@ -1424,8 +1424,8 @@ void VmmDellBcsScanout(uint32_t khz,uint32_t index,uint64_t token,uint64_t scrat
 }
 #endif
 #if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
-bool VmmDellFlipGgttBind(BdwGgttExtentBind& bind,const BdwGgttExtentLease& lease,uint64_t* snapshot,
-                         uint64_t takeoverScratch,BdwFlipGgttDiag& diag) {
+bool VmmDellFlipGgttUpdate(BdwGgttExtentBind& bind,const BdwGgttExtentLease& lease,uint64_t* snapshot,
+                         uint64_t takeoverScratch,BdwFlipGgttDiag& diag, BdwFlipGgttOperation op) {
     constexpr uint32_t maxPages=16;
     const auto& r=lease.reservation;
     diag.first=r.first;diag.count=r.count;diag.stage=BdwFlipGgttStage::Precondition;
@@ -1478,6 +1478,13 @@ bool VmmDellFlipGgttBind(BdwGgttExtentBind& bind,const BdwGgttExtentLease& lease
     BdwGgttExtentMmio<Owner> io(owner,lease,pages,pageCount,flush,takeoverScratch);
     return VmmWithKernelPtCritical([&](){
         if(!Owner::Audit(BdwDellBar0+0x101000)){diag.stage=BdwFlipGgttStage::FlushAudit;return false;}
+        // The scanout worker calls retirement only after confirming a latch
+        // away and removing this extent from plane admission.
+        if(op==BdwFlipGgttOperation::Retire){
+            const bool ok=bind.RetireReversible(io);
+            diag.stage=ok?BdwFlipGgttStage::Bound:BdwFlipGgttStage::Uncertain;
+            return ok;
+        }
         // Stable twice-read snapshot of the inherited entries.
         for(unsigned pass=0;pass<2;++pass)for(uint32_t i=0;i<r.count;++i){
             uint64_t v=0;
@@ -1491,7 +1498,10 @@ bool VmmDellFlipGgttBind(BdwGgttExtentBind& bind,const BdwGgttExtentLease& lease
         BdwFlipGgttClassify(snapshot,r.first,r.count,diag);
         // All-zero ranges use the plain binder; anything inherited is taken
         // over against the exact snapshot (BindTakenOver re-reads it first).
-        const bool ok=diag.takeover?bind.BindTakenOver(lease,io,snapshot,takeoverScratch):bind.Bind(lease,io);
+        const bool ok=op==BdwFlipGgttOperation::BindReversible
+            ? bind.BindReversible(lease,io,snapshot,takeoverScratch)
+            : diag.takeover ? bind.BindTakenOver(lease,io,snapshot,takeoverScratch)
+                            : bind.Bind(lease,io);
         if(ok){diag.stage=BdwFlipGgttStage::Bound;return true;}
         diag.stage=bind.State()==BdwGgttExtentState::Fresh?BdwFlipGgttStage::Refused:BdwFlipGgttStage::Uncertain;
         if(owner.failedPage){diag.auditPage=owner.failedPage;}

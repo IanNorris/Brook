@@ -63,8 +63,9 @@ class BdwGgttExtentBind;struct BdwGgttExtentLease;struct BdwFlipGgttDiag;
 // lifetime) and the takeover scratch page. Inherited nonzero entries (left
 // by an earlier OS in stolen memory) are taken over from a stable snapshot;
 // a failed bind restores touched entries to the scratch page.
-bool VmmDellFlipGgttBind(BdwGgttExtentBind& bind,const BdwGgttExtentLease& lease,uint64_t* snapshot,
-                         uint64_t takeoverScratch,BdwFlipGgttDiag& diag);
+enum class BdwFlipGgttOperation { Bind, BindReversible, Retire };
+bool VmmDellFlipGgttUpdate(BdwGgttExtentBind& bind,const BdwGgttExtentLease& lease,uint64_t* snapshot,
+                         uint64_t takeoverScratch,BdwFlipGgttDiag& diag,BdwFlipGgttOperation op=BdwFlipGgttOperation::Bind);
 #endif
 #if defined(BROOK_SSD_AUTO_RECOVERY)
 void VmmDellBcsScanout(uint32_t khz,uint32_t index,uint64_t token,uint64_t scratch,BdwForcewakeAdapterResult& result,BdwBcsRunResult& copy);

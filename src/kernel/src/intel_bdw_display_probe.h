@@ -27,10 +27,13 @@ inline bool BdwDisplayUsesGop(const BdwDisplaySnapshot& display) {
 // the trailing primary tile offset of pipes B and C).
 template<class Accept> bool BdwDisplayCompatible(const BdwDisplaySnapshot& display,Accept accept,
                                                  unsigned registers=BdwDisplaySnapshot::RegisterCount,
-                                                 bool (*cursorBaseOwned)(uint32_t)=nullptr) {
+                                                 bool (*cursorBaseOwned)(uint32_t)=nullptr,
+                                                 bool (*clientLayout)(uint32_t,uint32_t&,uint32_t&)=nullptr) {
     const auto& primary=display.regs[0];
     if(registers<4 || registers>BdwDisplaySnapshot::RegisterCount)return false;
-    if(primary[0]!=0x98000000u || primary[1]!=12800 || !accept(primary[2]) || !accept(primary[3]))return false;
+    uint32_t primaryControl=0x98000000u,stride=12800;
+    if(clientLayout)(void)clientLayout(primary[2],primaryControl,stride);
+    if(primary[0]!=primaryControl || primary[1]!=stride || !accept(primary[2]) || !accept(primary[3]))return false;
     for(unsigned pipe=0;pipe<3;++pipe)
         for(unsigned reg=pipe?0:4;reg<registers;++reg){
             if(!pipe && reg==7 && registers>=10 && cursorBaseOwned){

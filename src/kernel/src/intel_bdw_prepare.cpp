@@ -892,6 +892,9 @@ static bool ScanoutPending(void*){
     BdwScanoutFlipPoll();
 #endif
     return __atomic_load_n(&scanoutWork.state,__ATOMIC_ACQUIRE)==ScanoutQueued
+#if defined(BROOK_BDW_ZERO_COPY_SCANOUT)
+        || BdwClientScanoutWorkPending()
+#endif
 #if defined(BROOK_BDW_VIDEO_ENGINE)
         || BdwVideoWorkerPending()
 #endif
@@ -908,7 +911,12 @@ static bool ServiceScanout(void*,BdwSubmissionQueue& queue){
 #else
     const bool video=false;
 #endif
-    if(__atomic_load_n(&scanoutWork.state,__ATOMIC_ACQUIRE)!=ScanoutQueued || queue.Poisoned())return video;
+#if defined(BROOK_BDW_ZERO_COPY_SCANOUT)
+    const bool direct=BdwClientScanoutService(!queue.Poisoned());
+#else
+    const bool direct=false;
+#endif
+    if(__atomic_load_n(&scanoutWork.state,__ATOMIC_ACQUIRE)!=ScanoutQueued || queue.Poisoned())return video || direct;
     uint32_t queued=ScanoutQueued;
     if(!__atomic_compare_exchange_n(&scanoutWork.state,&queued,ScanoutRunning,false,
                                     __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))return false;
@@ -1097,6 +1105,9 @@ static BdwPresentCopy PresentOnBcs(BdwGpuBuffer* source,uint64_t token,const Com
         BdwGpuEventWaitTick(BdwGpuEvent::Retire,seen);
     }
 }
+#if defined(BROOK_BDW_ZERO_COPY_SCANOUT)
+bool BdwClientScanoutWakeWorker(){if(InitApplicationWorker())return false;applicationWorker.Wake();return true;}
+#endif
 #if defined(BROOK_BDW_VIDEO_ENGINE)
 // Wake the application worker so it services a queued VCS diagnostic.
 bool BdwVideoWakeWorker(){if(InitApplicationWorker())return false;applicationWorker.Wake();return true;}

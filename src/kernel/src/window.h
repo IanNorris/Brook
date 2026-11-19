@@ -566,6 +566,7 @@ Window* WmFindWindowById(Process* proc, uint32_t wmId);
 // its identity and BROOK_WINDOW_STATE_* flags (VISIBLE, FOCUSED, MINIMIZED,
 // MAXIMIZED, FULLSCREEN, CLIENT_CHROME). False when nothing is focused.
 bool WmSnapshotFocus(uint32_t* window, uint64_t* incarnation, uint32_t* flags);
+bool WmClientScanoutWindowMatches(uint32_t window,uint64_t incarnation,uint32_t width,uint32_t height);
 int WmSnapshotOwnedWindowState(Process* proc, uint32_t wmId,
                                uint64_t expectedIncarnation, BrookWindowState* out);
 int WmPlaceOwnedWindow(Process* proc, uint32_t wmId, uint64_t incarnation,

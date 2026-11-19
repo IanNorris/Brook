@@ -132,7 +132,7 @@ bool BdwObserveDisplayAccepted(BdwDisplaySnapshot& out,unsigned registers) {
     for(unsigned i=0;i<attempts;++i){
         BdwDisplaySnapshot display{};
         if(!BdwObserveDisplayLive(display))continue;
-        if(!BdwDisplayCompatible(display,BdwScanoutSurfaceAccepted,registers,BdwCursorBaseOwned))return false;
+        if(!BdwDisplayCompatible(display,BdwScanoutSurfaceAccepted,registers,BdwCursorBaseOwned,BdwClientScanoutSurface))continue;
         out=display;return true;
     }
     return false;

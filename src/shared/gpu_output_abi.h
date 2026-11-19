@@ -80,6 +80,31 @@
  * a client's buffer before sampling it, so one failed client frame cannot
  * make the compositor's submission fail. */
 #define BROOK_GPU_HANDOFF_BUFFER_FAILED 23
+/* Version 1 client scanout. Only the attached renderer may present a
+ * focused, opaque fullscreen offer from its authenticated provider socket.
+ * A successful PRESENT queues work; STATUS identifies the buffers still
+ * held by the kernel. LEAVE changes back to the last kernel desktop image.
+ * An uncertain status requires retaining all held provider offers.
+ */
+#define BROOK_GPU_PRESENT_CAP_CLIENT_SCANOUT 16
+#define BROOK_GPU_HANDOFF_CLIENT_SCANOUT_PRESENT 24
+#define BROOK_GPU_HANDOFF_CLIENT_SCANOUT_STATUS 25
+#define BROOK_GPU_HANDOFF_CLIENT_SCANOUT_LEAVE 26
+#define BROOK_GPU_CLIENT_SCANOUT_VERSION 1
+#define BROOK_GPU_CLIENT_SCANOUT_UNCERTAIN 1u
+#define BROOK_GPU_CLIENT_SCANOUT_RESTORING 2u
+struct BrookGpuClientScanoutPresent {
+    uint32_t version, width, height, stride;
+    uint32_t fourcc, tiling, window, reserved;
+    int32_t primeFd, providerSocket;
+    uint64_t incarnation, offer;
+};
+struct BrookGpuClientScanoutStatus {
+    uint32_t version, flags;
+    int32_t error;
+    uint32_t reserved;
+    uint64_t front, armed, queued, failedOffer, presents, latched, restores;
+};
 #define BROOK_GPU_SCANOUT_MAX_IMAGES 4
 #define BROOK_GPU_SCANOUT_FOURCC_XRGB8888 0x34325258u
 #define BROOK_GPU_SCANOUT_REGISTERED 1u

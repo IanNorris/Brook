@@ -4572,6 +4572,21 @@ int CompositorPresentRegions(const CompositorPresentRegion* regions,uint32_t cou
     return result;
 }
 
+#if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP) && defined(BROOK_BDW_ZERO_COPY_SCANOUT)
+bool CompositorRefreshClientScanoutLease(uint64_t owner)
+{
+    CompositorMutexGuard geometry(&g_scanoutMappingLock);
+    const uint64_t tick=ApicTickCount();
+    if(g_gopWriter || g_scanoutNeedsRepair || !g_presentLease.Active(tick) || g_presentLease.owner!=owner)
+        return false;
+    SpinLockAcquire(&g_overlayCursorLock);
+    const bool softwareCursor=g_overlayCursorVisible && g_overlayCursorImage.width && g_overlayCursorImage.height;
+    SpinLockRelease(&g_overlayCursorLock);
+    if(softwareCursor && !BdwCursorReadStatus().active)return false;
+    return g_presentLease.Acquire(owner,tick,COMPOSITOR_PRESENT_LEASE_MS);
+}
+#endif
+
 void CompositorReleasePresentLease(uint64_t owner)
 {
     bool released;

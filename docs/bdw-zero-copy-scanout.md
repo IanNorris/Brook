@@ -328,3 +328,65 @@ Expect `active` to clear on fallback, `fallbacks` to advance if the plane
 was enabled, and the software pointer to return. QEMU validates boot and
 fallback plumbing. The fake MMIO test exercises register order and latching
 rules, while the Dell is needed to validate actual scanout.
+
+## Client primary-plane scanout
+
+The boot policy remains `desktop present direct shadow`. Only
+`desktop present direct on` admits a client scanout request, and it requires
+an active zero-copy ring and the current compositor presentation lease.
+The first version accepts exactly the Dell panel size, XRGB8888, a zero
+source offset, and a focused, visible window whose client area covers the
+panel without chrome. The provider socket must match the window creation
+identity. A visible pointer needs an active hardware cursor. Linear pitch
+must be 64-byte aligned, X-tiled pitch 512-byte aligned, and the kernel
+checks the buffer size and Intel tiling metadata. Broadwell uses the
+combined DSPOFFSET register and supports linear and X-tiled primary
+surfaces. See [Linux i915 primary plane programming](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/i915/display/i9xx_plane.c).
+
+The BSP submission worker holds an exclusive buffer transition from
+admission through latch-away. The RCS ring flushes render and data caches
+before the completion breadcrumb. The worker flushes the coherent LLC
+before arming the non-snooping display. This first version deliberately
+uses a full buffer flush. Its cost and live panel correctness need Dell
+measurements. Three cached GGTT bindings retain references and have
+guard PTEs. Eviction checks the old mapping, clears the PTEs, and
+invalidates the extent after the buffer has left the display. Uncertain
+bindings stay pinned. The per-job display check admits only the published
+client address and layout or a known kernel surface.
+
+The capability `BROOK_GPU_PRESENT_CAP_CLIENT_SCANOUT` advertises ABI
+version 1 of the client operations in `src/shared/gpu_output_abi.h`.
+Each operation uses `BROOK_SYS_GPU_HANDOFF_CTL` with the unused syscall
+arguments set to zero.
+
+| Operation | Renderer contract |
+| --- | --- |
+| `CLIENT_SCANOUT_PRESENT` | Pass the version, authenticated provider socket, window creation identity, PRIME fd, exact layout, and a nonzero offer cookie. Wait for the producer fence first. Return 0 queues the request. A negative result leaves the offer with the renderer and permits the normal composited path. |
+| `CLIENT_SCANOUT_STATUS` | Query a separate versioned status structure. Front, armed, and queued are kernel buffer identities. The last asynchronous error includes the input offer cookie. Retain an accepted offer while its identity appears in any of the three fields. An uncertain state keeps all held offers. |
+| `CLIENT_SCANOUT_LEAVE` | Cancel an unarmed request and return to the last known kernel desktop image. Wait for status to clear before releasing held offers or sampling the prior front, then repaint the composited scene in full. |
+
+The kernel tracks only one armed flip. An additional proposal can be
+retried after the current latch. A normal fallback restores the last
+kernel image. Software takeover and panic restore the linear GOP layout.
+A pending client flip remains held until a later vblank confirms the
+restore target, including when the target was already in the live register.
+
+The kernel-only pair boots with the existing renderer. Once the renderer
+wiring lands, run the following checks on the Dell.
+
+1. Boot with the shadow default. Run an opaque fullscreen client and confirm
+   the existing compositor still presents while client present and latch
+   counters stay at zero.
+2. Enable direct scanout on a zero-copy desktop. Exercise separately
+   confirmed linear and X-tiled offers, with a hidden or hardware cursor.
+   Expect the ABI's `presents` and `latched` counters to advance and
+   the front identity to match the actual provider buffer. Check visual
+   geometry, row alignment, and changing content at each layout.
+3. Trigger a popup, resize, mode-off, or lease expiry while a client flip
+   is pending. Expect `restores` to advance on the known surface's
+   latch, with holds persisting until the front and armed identities
+   clear. Verify the desktop gets a full repaint and the provider receives
+   SAFE only after that latch.
+4. Compare compositor work, frame pacing, and cache-flush cost against
+   shadow mode over the same fullscreen scene. Verify the panic return to
+   GOP from an X-tiled front on a separately authorized test.

@@ -4,6 +4,9 @@
 #include "intel_bdw_ppgtt.h"
 #include "intel_bdw_display_flip.h"
 #include "intel_bdw_zero_copy.h"
+#include "intel_bdw_client_scanout.h"
+
+struct BrookGpuClientScanoutStatus;
 
 namespace brook {
 struct BdwCursorStatus {
@@ -25,6 +28,29 @@ inline bool BdwCursorBaseOwned(uint32_t base){
 void BdwCursorUpdate(uint64_t leaseOwner,bool visible,int32_t x,int32_t y,
                      const uint32_t* pixels,uint32_t width,uint32_t height,uint64_t serial);
 
+struct BdwGpuBuffer;
+int64_t BdwClientScanoutPresent(uint64_t owner,BdwGpuBuffer*,const BdwClientScanoutLayout&,uint64_t offer);
+int64_t BdwClientScanoutStatus(uint64_t owner,BrookGpuClientScanoutStatus&);
+int64_t BdwClientScanoutLeave(uint64_t owner);
+bool BdwClientScanoutWorkPending();
+bool BdwClientScanoutService(bool canPresent);
+bool BdwClientScanoutWakeWorker();
+// Address and layout are published together. Changes are permitted only
+// after the worker proves the mapping is neither programmed nor live.
+constexpr uint32_t BdwClientScanoutSlots=3;
+inline uint64_t g_bdwClientSurface[BdwClientScanoutSlots]{};
+inline bool BdwClientScanoutSurface(uint32_t base,uint32_t& control,uint32_t& stride){
+    if(!base)return false;
+    for(const auto& entry:g_bdwClientSurface){
+        const uint64_t value=__atomic_load_n(&entry,__ATOMIC_ACQUIRE);
+        if(uint32_t(value)!=base)continue;
+        const BdwClientScanoutLayout layout{uint32_t(value>>32)&~0x80000000u,(value>>63)!=0};
+        control=layout.Control();stride=layout.stride;
+        return true;
+    }
+    return false;
+}
+
 struct CompositorPresentRegion;
 // Display surfaces Brook may legitimately leave on primary plane A. The GOP
 // surface (GGTT offset 0) is always accepted; kernel flip buffers are added
@@ -37,7 +63,8 @@ inline uint32_t g_bdwScanoutSurfaces[BdwScanoutSurfaceSlots]{};
 inline bool BdwScanoutSurfaceAccepted(uint32_t surface){
     if(!surface)return true;
     for(auto& s:g_bdwScanoutSurfaces)if(__atomic_load_n(&s,__ATOMIC_ACQUIRE)==surface)return true;
-    return false;
+    uint32_t control=0,stride=0;
+    return BdwClientScanoutSurface(surface,control,stride);
 }
 // Re-arm the firmware GOP surface. MMIO only and lock-free; a no-op unless a
 // flip path has published its display mapping. Safe from panic and exception

@@ -129,4 +129,19 @@ int main(){
     observed.regs[1][9]=0x40000;
     assert(!BdwDisplayCompatible(observed,primary,10,cursor));
 
+    observed.regs[1][9]=0;
+    const auto surfaces=[](uint32_t base){return base==0 || base==0x10000000;};
+    const auto layout=[](uint32_t base,uint32_t& control,uint32_t& stride){
+        if(base!=0x10000000)return false;
+        control=0x98000400u;stride=13312;return true;
+    };
+    observed.regs[0][9]=0;
+    observed.regs[0][0]=0x98000400u;observed.regs[0][1]=13312;
+    observed.regs[0][2]=0x10000000;
+    assert(BdwDisplayCompatible(observed,surfaces,10,cursor,layout));
+    observed.regs[0][1]=12800;
+    assert(!BdwDisplayCompatible(observed,surfaces,10,cursor,layout));
+    observed.regs[0][0]=0x98000000u;observed.regs[0][2]=0;observed.regs[0][3]=0x10000000;
+    assert(BdwDisplayCompatible(observed,surfaces,10,cursor,layout));
+
 }

@@ -15,6 +15,7 @@
 #include "intel_bdw_scanout_target.h"
 #include "intel_bdw_refusal.h"
 #include "compositor.h"
+#include "desktop_present_policy.h"
 #include "ahci_readonly.h"
 #include "audio.h"
 #include "user_copy.h"
@@ -93,6 +94,22 @@ int64_t sys_brook_gpu_buffer_snapshot_fence(uint64_t fd,uint64_t flags,uint64_t 
 
 static_assert(BROOK_SYS_GPU_HANDOFF_CTL!=BROOK_SYS_GPU_OUTPUT_ALLOC && BROOK_SYS_GPU_HANDOFF_CTL==0xB18,
               "GPU handoff syscall must be distinct");
+static int64_t ValidateGpuWindowProvider(Process* proc,uint64_t fdValue,uint64_t window,uint64_t incarnation)
+{
+    if(fdValue>=MAX_FDS || !window || window>WM_MAX_WINDOWS || !incarnation)return -EINVAL;
+    FdRef descriptor(proc,static_cast<int>(fdValue));auto* entry=descriptor.get();
+    if(!entry || entry->type!=FdType::UnixSocket || !entry->handle)return -EBADF;
+    auto* socket=static_cast<UnixSocketData*>(entry->handle);
+    UnixCredentials peer{};uint64_t peerIncarnation=0;
+    SpinLockAcquire(&g_unixRegistryLock);
+    const bool accepted=socket->state==UnixSocketData::State::Connected && socket->acceptedEndpoint && socket->socketType==5;
+    if(accepted){peer=socket->peerCredentials;peerIncarnation=socket->peerIncarnation;}
+    SpinLockRelease(&g_unixRegistryLock);
+    if(!accepted || peer.pid<=0 || !peerIncarnation)return -EPERM;
+    return brook::WmGpuSourceProviderMatches(static_cast<uint32_t>(window),incarnation,
+                                             static_cast<uint32_t>(peer.pid),peerIncarnation)?0:-EPERM;
+}
+
 int64_t sys_brook_gpu_handoff_ctl(uint64_t op,uint64_t arg,uint64_t a,uint64_t b,uint64_t c,uint64_t d)
 {
 #if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
@@ -104,9 +121,45 @@ int64_t sys_brook_gpu_handoff_ctl(uint64_t op,uint64_t arg,uint64_t a,uint64_t b
         return arg?-EINVAL:(BROOK_GPU_PRESENT_CAP_FRAME|BROOK_GPU_PRESENT_CAP_ASYNC|BROOK_GPU_PRESENT_CAP_DEPENDENT
 #if defined(BROOK_BDW_ZERO_COPY_SCANOUT)
             |BROOK_GPU_PRESENT_CAP_SCANOUT
+#if defined(BROOK_BDW_SCANOUT_FLIP)
+            |BROOK_GPU_PRESENT_CAP_CLIENT_SCANOUT
+#endif
 #endif
             );
 #if defined(BROOK_BDW_ZERO_COPY_SCANOUT)
+#if defined(BROOK_BDW_SCANOUT_FLIP)
+    if(op==BROOK_GPU_HANDOFF_CLIENT_SCANOUT_PRESENT){
+        if(!(DesktopPresentPolicy()&BROOK_DESKTOP_POLICY_DIRECT_ON))return -95;
+        BrookGpuClientScanoutPresent wire{};
+        if(!CopyFromUser(&wire,arg,sizeof(wire)))return -EFAULT;
+        const BdwClientScanoutLayout layout{wire.stride,wire.tiling==1};
+        if(wire.version!=BROOK_GPU_CLIENT_SCANOUT_VERSION || wire.reserved || !wire.offer ||
+           wire.width!=BdwZeroCopyWidth || wire.height!=BdwZeroCopyHeight ||
+           wire.fourcc!=BROOK_GPU_SCANOUT_FOURCC_XRGB8888 || wire.tiling>1 || !layout.Valid())return -EINVAL;
+        if(wire.primeFd<0 || uint32_t(wire.primeFd)>=MAX_FDS ||
+           wire.providerSocket<0 || uint32_t(wire.providerSocket)>=MAX_FDS)return -EBADF;
+        if(!BdwOffscreenRendererOwnedBy(owner))return -EPERM;
+        const auto provider=ValidateGpuWindowProvider(proc,wire.providerSocket,wire.window,wire.incarnation);
+        if(provider)return provider;
+        if(!WmClientScanoutWindowMatches(wire.window,wire.incarnation,wire.width,wire.height) ||
+           !WmTaskbarHidden())return -EPERM;
+        FdRef ref(proc,wire.primeFd);
+        if(!ref || ref->type!=FdType::IntelPrime || !ref->handle)return -EBADF;
+        auto* buffer=static_cast<BdwGpuBuffer*>(ref->handle);
+        uint32_t tiling=0,stride=0;
+        BdwGpuBufferTiling(buffer,tiling,stride);
+        if(tiling!=wire.tiling || (tiling && stride!=wire.stride))return -EINVAL;
+        if(!CompositorRefreshClientScanoutLease(owner))return -EAGAIN;
+        return BdwClientScanoutPresent(owner,buffer,layout,wire.offer);
+    }
+    if(op==BROOK_GPU_HANDOFF_CLIENT_SCANOUT_STATUS){
+        BrookGpuClientScanoutStatus status{};
+        const auto result=BdwClientScanoutStatus(owner,status);
+        return result?result:CopyToUser(arg,&status,sizeof(status))?0:-EFAULT;
+    }
+    if(op==BROOK_GPU_HANDOFF_CLIENT_SCANOUT_LEAVE)
+        return arg?-EINVAL:BdwClientScanoutLeave(owner);
+#endif
     if(op==BROOK_GPU_HANDOFF_SCANOUT_REGISTER){
         BrookGpuScanoutImages wire{};
         if(!CopyFromUser(&wire,arg,sizeof(wire)))return -EFAULT;
@@ -221,18 +274,8 @@ int64_t sys_brook_gpu_window_validate(uint64_t fdValue,uint64_t window,uint64_t 
 {
     auto* proc=ProcessCurrent();if(!proc)return -ESRCH;
     KernelOperationGuard operation(proc);
-    if(fdValue>=MAX_FDS || !window || window>WM_MAX_WINDOWS || !incarnation || a || b || c)return -EINVAL;
-    FdRef descriptor(proc,static_cast<int>(fdValue));auto* entry=descriptor.get();
-    if(!entry || entry->type!=FdType::UnixSocket || !entry->handle)return -EBADF;
-    auto* socket=static_cast<UnixSocketData*>(entry->handle);
-    UnixCredentials peer{};uint64_t peerIncarnation=0;
-    SpinLockAcquire(&g_unixRegistryLock);
-    const bool accepted=socket->state==UnixSocketData::State::Connected && socket->acceptedEndpoint && socket->socketType==5;
-    if(accepted){peer=socket->peerCredentials;peerIncarnation=socket->peerIncarnation;}
-    SpinLockRelease(&g_unixRegistryLock);
-    if(!accepted || peer.pid<=0 || !peerIncarnation)return -EPERM;
-    return brook::WmGpuSourceProviderMatches(static_cast<uint32_t>(window),incarnation,
-                                             static_cast<uint32_t>(peer.pid),peerIncarnation)?0:-EPERM;
+    if(a || b || c)return -EINVAL;
+    return ValidateGpuWindowProvider(proc,fdValue,window,incarnation);
 }
 
 int64_t sys_brook_gpu_window_peer_recovery(uint64_t fdValue,uint64_t op,uint64_t bufferFd,
