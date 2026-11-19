@@ -746,7 +746,9 @@ Two independent code reviews (compositor and driver), Dell measurements on the g
 - **Job table:** a long campaign can exhaust the 256-slot table, and the current boot may lack the terminate API. Archive completed work and plan a checked restart.
 
 ## Backlog (outside the immediate goal)
-- **User-mode process dump (Ian, 19 Nov; Codex `work/proc-dump`):** `proc dump <pid> <path>` writes a gdb-readable ELF core (PRSTATUS per thread, NT_FILE, PT_LOAD), and `scripts/dell_proc_dump.py` fetches it and prints the gdb command. Motivation: the gen 442 Chromium resize freeze (all threads asleep; we could not see where they were blocked). The procfs `syscall`/`wchan` and `proc blocked` work is on `work/chromium-freeze` (Claude agent).
+- **User-mode process dump (Ian, 19 Nov; Codex `work/proc-dump`):** `proc dump <pid> <path>` writes a gdb-readable ELF core (PRSTATUS per thread, NT_FILE, PT_LOAD), and `scripts/dell_proc_dump.py` fetches it and prints the gdb command. Follow-ons (Ian, 19 Nov):
+  - an automatic core on crash signals: uid 1000 by default, `RLIMIT_CORE` honoured, written to `/data/home/.local/share/brook/cores/`, with a budget and rate limit and a `proc autodump` toggle;
+  - a kernel hook for hang dumps, which waylandd will call when a window ignores xdg ping for 10 s. Motivation: the gen 442 Chromium resize freeze (all threads asleep; we could not see where they were blocked). The procfs `syscall`/`wchan` and `proc blocked` work is on `work/chromium-freeze` (Claude agent).
 - **"True" fullscreen modes through the panel fitter (Ian, 18 Nov; investigation):** scan out a game's lower-resolution fullscreen buffer (e.g. 1080p or 1600×900) and let the display engine upscale it, instead of the compositor's 13.6 ms per-frame scale (Q2 1080p fullscreen: `display-perf/build/dell/q2-439-fs`, direct-scanout fallback `scaled`). Open questions:
   - restoring the panel mode when the program crashes, hangs or loses focus;
   - the cursor and overlays without a hardware cursor plane;
