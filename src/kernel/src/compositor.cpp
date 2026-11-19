@@ -2182,7 +2182,17 @@ static void CompositorLoopWM()
     }
     if(rendererLeased)++g_idleStats.leaseActiveLoops;
     g_backBufferOverlayOmitted=rendererLeased;
-    bool forceAll = !CompositorGpuActive() && !rendererLeased && (now - g_lastForceBlitTick >= FORCE_BLIT_INTERVAL_MS);
+    // Stage 1.4: while a renderer holds the lease nothing scans the back
+    // buffer out, so windows, their chrome and the wallpaper are not
+    // rasterised into it either (the renderer captures them itself). The
+    // first loop without the lease repaints everything once (Ian accepted
+    // the one-off ~15 ms at 3200x1800).
+    static bool cpuSceneStale=false;
+    const bool skipCpuScene=rendererLeased && !CompositorGpuActive();
+    bool sceneRepair=false;
+    if(skipCpuScene){cpuSceneStale=true;++g_idleStats.cpuSceneSkips;}
+    else if(cpuSceneStale){cpuSceneStale=false;sceneRepair=true;}
+    bool forceAll = !CompositorGpuActive() && !rendererLeased && (sceneRepair || now - g_lastForceBlitTick >= FORCE_BLIT_INTERVAL_MS);
     if (forceAll) g_lastForceBlitTick = now;
 
     // Determine if we need a full scene repaint (wallpaper + all windows)
@@ -2237,7 +2247,7 @@ static void CompositorLoopWM()
     }
 
     // 1. Draw wallpaper only when the scene structure changed
-    if (fullRepaint)
+    if (fullRepaint && !skipCpuScene)
         BlitWallpaper();
 
     // 2. Get windows in z-order (back to front) and blit their VFBs
@@ -2249,7 +2259,7 @@ static void CompositorLoopWM()
     TraceDesktopCycle(FrameDesktopCadence,now);
 #endif
     SceneRect cpuDamage;
-    const bool cpuPartial=!CompositorGpuActive() && !fullRepaint;
+    const bool cpuPartial=!CompositorGpuActive() && !fullRepaint && !skipCpuScene;
     if(cpuPartial) {
         SceneRect layers[WM_MAX_WINDOWS]{};
         for(uint32_t i=0;i<wcount;++i) {
@@ -2306,6 +2316,7 @@ static void CompositorLoopWM()
         // Update process destX/destY to match window client area
         p->fbDestX = w->clientX();
         p->fbDestY = w->clientY();
+        if (skipCpuScene) continue;
 
         // Blit content then chrome per-window so z-order is respected.
         // Snapshot VFB fields once to avoid TOCTOU: waylandd can destroy
