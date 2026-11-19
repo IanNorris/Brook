@@ -814,6 +814,11 @@ Two independent code reviews (compositor and driver), Dell measurements on the g
 - **Job table:** a long campaign can exhaust the 256-slot table, and the current boot may lack the terminate API. Archive completed work and plan a checked restart.
 
 ## Backlog (outside the immediate goal)
+- **Apps to add later (Ian, 19 Nov):**
+  - Signal Desktop (Electron; nixpkgs `signal-desktop`).
+  - A simple PWA container for web apps such as WhatsApp. Proposed: a `brook-webapp NAME URL` wrapper that runs Chromium `--app=URL` with a per-app profile dir and an Apps entry and icon.
+  - `brook-message` is Brook's system message/notification service, not a messaging app.
+- **Screenshots (Ian, 19 Nov):** send Clearwater screenshots to Ian (SendUserFile) as the work progresses.
 - **Memory growth / leak suspects (19 Nov; Dell after a heavy session vs a fresh boot, `display-perf/build/dell/mem-445-after-session` vs `mem-446-fresh`):**
   - **Totals:** used 1,582 vs 601 MB. User space (`mem census`) 320 vs 137 MB.
   - **waylandd heap: 62.5 vs 1.2 MB.** Likely a leak: nothing was open at measurement.
