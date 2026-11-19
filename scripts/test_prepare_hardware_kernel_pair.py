@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import prepare_hardware_kernel_pair as pair
 from test_hardware_recovery_fsck import elf
+from stage_clearwater_shell import CLEARWATER_START, stage
 
 
 @unittest.skipUnless(all(shutil.which(x) for x in ('mkfs.fat', 'mmd', 'mcopy', 'mtype', 'mdir', 'mattrib')),
@@ -105,6 +106,33 @@ class PreparePair(unittest.TestCase):
             with self.assertRaises(ValueError):
                 pair.prepare(self.image,self.build,64,'test',self.root/'bad',pair.digest(b'kernel'),exporter)
         self.assertFalse((self.root/'bad').exists())
+
+    def test_clearwater_stages_without_vulkan(self):
+        supervisor = self.root / 'CWSUP.ELF'
+        supervisor.write_bytes(elf())
+        shell = self.root / 'CWSHELL.ELF'
+        shell.write_bytes(elf() + b'shell')
+        out = self.root / 'clearwater'
+        qemu = self.root / 'qemu.img'
+        original = pair.digest(self.image.read_bytes())
+        with patch.object(pair, 'module_version', return_value=64):
+            result = pair.prepare(self.image, self.build, 64, 'test', out, pair.digest(b'kernel'),
+                                  clearwater_supervisor=supervisor, clearwater_shell=shell)
+        stage(self.image, qemu, supervisor, shell)
+        self.assertEqual(result['enabled_boot_options'], ['clearwater-shell'])
+        self.assertEqual(result['clearwater_executables_sha256']['CWSHELL.ELF'], pair.digest(shell.read_bytes()))
+        for image in (out / 'INITRD.IMG', qemu):
+            for name, expected in (('INIT.RC', b'set wm\n' + CLEARWATER_START + b'\n'),
+                                   (supervisor.name, supervisor.read_bytes()), (shell.name, shell.read_bytes())):
+                self.assertEqual(subprocess.check_output(['mtype', '-i', str(image), f'::/BOOT/{name}']), expected)
+        self.assertEqual(pair.digest(self.image.read_bytes()), original)
+        with self.assertRaisesRegex(ValueError, 'already launches Clearwater'):
+            stage(qemu, self.root / 'duplicate.img', supervisor, shell)
+        self.assertFalse((self.root / 'duplicate.img').exists())
+        shell.write_bytes(elf(program_type=3))
+        with self.assertRaisesRegex(ValueError, 'static x86-64'):
+            stage(self.image, self.root / 'dynamic.img', supervisor, shell)
+        self.assertFalse((self.root / 'dynamic.img').exists())
 
     def test_hidden_kernel_console_removes_startup_and_adds_shortcut(self):
         source=b'set wm\nset vfb none\nkconsole\nrun /boot/HWSTATUS.ELF\n'
