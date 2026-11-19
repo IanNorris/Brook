@@ -788,6 +788,13 @@ Two independent code reviews (compositor and driver), Dell measurements on the g
 - **Job table:** a long campaign can exhaust the 256-slot table, and the current boot may lack the terminate API. Archive completed work and plan a checked restart.
 
 ## Backlog (outside the immediate goal)
+- **Chromium "stuck render" root cause (gen 445, from cores and `proc blocked`):**
+  - The browser UI thread is blocked forever in a synchronous Mojo call to viz: `StatusBubbleViews::DestroyPopup` → `~Compositor` → `FrameSinkManager::DestroyCompositorFrameSink`. The GPU process had died (pid 131).
+  - The IO threads never saw the channel close, so Wayland configures went unacked (sent 55, acked 38).
+  - Suspect AF_UNIX peer-close / SCM_RIGHTS lifetime. Claude agent: `work/chromium-gpu-death`.
+  - Evidence: `display-perf/build/dell/chromium-freeze-445/`.
+  - Why the GPU process crashed is still unknown; its core failed on the legacy root-owned cores dir, now moved to `cores-legacy-root/`.
+- **Firefox crashed on resize (gen 445):** the autodump failed with `load-segments` E2BIG (too many PT_LOADs). Codex is fixing segment merging and the PN_XNUM limit.
 - **GTK popup menus block clicks elsewhere (Ian, 19 Nov):** with a GTK popup menu open, clicking another part of the window (e.g. the caption's close button) does nothing until a menu item is chosen.
   - **Likely cause:** the xdg_popup grab is never dismissed. Clicks on kernel-WM chrome, the taskbar or the desktop don't reach waylandd, so it never sends `xdg_popup.popup_done`.
   - **Fix:** the kernel WM reports a press outside the client's surface tree (like `WM_EVT_POINTER_LEFT`); waylandd dismisses the grabbed popup chain.
