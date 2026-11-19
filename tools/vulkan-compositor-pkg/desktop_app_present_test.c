@@ -106,11 +106,17 @@ static void test_cadence(void){
     /* Gen 440 (Quake at 34 fps, commits every 29 ms): a pointer move early
      * in the frame is not deferred (the commit is more than a refresh
      * away); late in the frame it rides the commit. */
+    /* Default limit (33 ms, two refreshes): even an early move rides the next
+     * 29 ms frame. */
     {struct DesktopAppCadence q={0};struct DesktopAppFrame g=app;g.now=1*MS;assert(step(&q,g,&wake)==DESKTOP_APP_TRANSITION);
+     g.appChanged=1;for(uint64_t t=10;t<=126;t+=29){g.now=t*MS;assert(step(&q,g,&wake)==DESKTOP_APP_PRESENT);}
+     g.appChanged=0;g.now=130*MS;assert(d==33*MS && step(&q,g,&wake)==DESKTOP_APP_DEFER && wake==(126+29)*MS+DESKTOP_APP_COMMIT_SLACK_NS);}
+    /* With `desktop present defer 16`: */
+    {struct DesktopAppCadence q={0};struct DesktopAppFrame g=app;g.deferNs=16*MS;g.now=1*MS;assert(step(&q,g,&wake)==DESKTOP_APP_TRANSITION);
      g.appChanged=1;for(uint64_t t=10;t<=126;t+=29){g.now=t*MS;assert(step(&q,g,&wake)==DESKTOP_APP_PRESENT);}
      assert(q.intervalNs==29*MS);g.appChanged=0;
      g.now=130*MS;assert(step(&q,g,&wake)==DESKTOP_APP_NOT_DUE && !wake);
-     g.now=145*MS;assert(step(&q,g,&wake)==DESKTOP_APP_DEFER && wake<=145*MS+d && wake==(126+29)*MS+DESKTOP_APP_COMMIT_SLACK_NS);
+     g.now=145*MS;assert(step(&q,g,&wake)==DESKTOP_APP_DEFER && wake<=145*MS+16*MS && wake==(126+29)*MS+DESKTOP_APP_COMMIT_SLACK_NS);
      /* Launcher open over the game (the gen 440 stutter): never deferred. */
      g.shellOpen=1;g.now=146*MS;assert(step(&q,g,&wake)==DESKTOP_APP_SHELL && !wake && !q.foreignSinceNs);g.shellOpen=0;
      /* A menu or popup over the game. */

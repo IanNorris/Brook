@@ -48,7 +48,7 @@ So every pointer move, overlay change or popup commit costs its own composition.
    | The pointer is outside the dominant client area, or its position is unknown | `pointer_outside`: present at once |
    | No commit for longer than 1.25 app intervals + 2 ms (paused game), or no interval history yet | `app_stalled`: present at once |
    | The next commit (last + smoothed interval) is due later than the deferral | `app_not_due`: present at once |
-   | Otherwise | `defer` until the expected commit + 2 ms, at most **16 ms** (`DESKTOP_APP_DEFER_NS`, one 60 Hz refresh; `desktop present defer <ms>` overrides it) |
+   | Otherwise | `defer` until the expected commit + 2 ms, at most **33 ms** (`DESKTOP_APP_DEFER_NS`, two 60 Hz refreshes so a ~30 fps game's next frame can carry it; Ian, 19 Nov; `desktop present defer <ms>` overrides it) |
    | The deferred damage's wake time passed without a commit | `deadline`: present it |
 
    The interval is smoothed (7/8), ignores pauses longer than 4 intervals and resets after 1 s. A deferred frame is an idle poll. `idle_until` ends the wait at the wake time instead of the next 16 ms poll, and a GPU offer still wakes the renderer at once. A frame without damage clears the wait.
@@ -65,7 +65,7 @@ So every pointer move, overlay change or popup commit costs its own composition.
 | Case | Behaviour |
 |---|---|
 | Popup or menu over the dominant window | It is a separate layer over the window, so no damage is deferred while it shows (`window_above`). If the popup takes focus it is small, so no window drives and the cadence is the desktop's own. |
-| Pointer movement | Over the app it rides the next app commit only when that commit is due within 16 ms. Outside the client area, or with the app paused, it presents at once. |
+| Pointer movement | Over the app it rides the next app commit only when that commit is due within 33 ms. Outside the client area, or with the app paused, it presents at once. |
 | Launcher, volume popup, tooltip, toasts | Never deferred while open or while a band overlaps the window (`shell`). The taskbar clock beside a maximized window may still ride app frames, and the existing 250 ms overlay-only limit still applies. |
 | Focus loss | Dominance ends at the next frame and waiting damage presents at once (`free`). A newly dominant window presents at once (`transition`). |
 | Two large windows | Only the focused one can drive. A large unfocused window never does. A small focused window over a large one means no window drives. |
@@ -154,7 +154,7 @@ A hardware cursor plane (CURACNTR/CURABASE/CURAPOS, 64×64 ARGB on gen8) would r
 | `desktop present` / `desktop present status` | report |
 | `desktop present app on` / `app off` | stage 1 cadence |
 | `desktop present direct off` / `direct shadow` / `direct on` | eligibility counters off, shadow (boot default), or real (falls back with `kernel`) |
-| `desktop present defer <ms>` | non-app deferral, 0 to 100 ms; 0 = 16 ms default |
+| `desktop present defer <ms>` | non-app deferral, 0 to 100 ms; 0 = 33 ms default |
 
 The env vars `BROOK_RENDER_APP_PRESENT=0|1` and `BROOK_RENDER_DIRECT_SCANOUT=off|shadow|on` pin the renderer and override the kernel.
 

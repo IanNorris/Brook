@@ -21,10 +21,12 @@
 #include <string.h>
 
 enum { DESKTOP_APP_THRESHOLD_PERCENT=60 };
-/* Non-app damage waits at most this long for an app commit: one 60 Hz
- * refresh. It waits only when the app's next commit is expected within it
- * (see desktop_app_cadence). Overridden by the kernel policy's deferUs. */
-#define DESKTOP_APP_DEFER_NS 16000000ull
+/* Non-app damage waits at most this long for an app commit: two 60 Hz
+ * refreshes, so a ~30 fps game's next frame can carry it (Ian, 19 Nov: aim
+ * for the next 33 ms slot rather than demanding 60 fps). It waits only when
+ * the app's next commit is expected within it (see desktop_app_cadence).
+ * Overridden by the kernel policy's deferUs (`desktop present defer <ms>`). */
+#define DESKTOP_APP_DEFER_NS 33000000ull
 /* After the expected commit, allow this much lateness before giving up. */
 #define DESKTOP_APP_COMMIT_SLACK_NS 2000000ull
 
