@@ -21,7 +21,8 @@ let
     cat > $out/bin/brook-run <<'SCRIPT'
     #!${pkgs.bash}/bin/bash
     export PATH=/nix/bin:/nix/profile/bin:/boot/BIN:/data/bin
-    export HOME=/data/home XDG_RUNTIME_DIR=/tmp WAYLAND_DISPLAY=wayland-0
+    export HOME=/data/home
+    source ${../data/nix-wrappers/brook-session-env.sh} /tmp || exit 1
     export GDK_BACKEND=wayland SDL_VIDEODRIVER=wayland
     export DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/brook-session-bus
     export FONTCONFIG_FILE=${fonts}/etc/fonts/fonts.conf FONTCONFIG_PATH=${fonts}/etc/fonts

@@ -5323,7 +5323,10 @@ static void DebugMemoryBreakdown()
     r.text("{\"version\":1,");
     r.field("ram_pages", memory.ramPages); r.text(",");
     r.field("free_pages", memory.freePages); r.text(",");
-    r.field("quarantined_pages", memory.quarantinedPages);
+    r.field("quarantined_pages", memory.quarantinedPages); r.text(",");
+    r.field("cached_pages", memory.CachedPages()); r.text(",");
+    r.field("available_pages", memory.AvailablePages()); r.text(",");
+    r.field("reclaimable_exec_cache_pages", memory.idleExecCachePages);
     r.text(",\"classes\":{");
     for (unsigned i = 1; i < PmmOwnerCount; ++i) {
         if (i > 1) r.text(",");

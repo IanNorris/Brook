@@ -18,7 +18,8 @@ let
     #!${pkgs.bash}/bin/bash
     export PATH=/nix/bin:/nix/profile/bin:/boot/BIN:/data/bin
     export HOME=/data/home
-    export XDG_RUNTIME_DIR=/tmp WAYLAND_DISPLAY=wayland-0 DISPLAY=:0
+    export DISPLAY=:0
+    source ${../data/nix-wrappers/brook-session-env.sh} /tmp || exit 1
     export GDK_BACKEND=wayland SDL_VIDEODRIVER=wayland
     export FONTCONFIG_FILE=${fonts}/etc/fonts/fonts.conf FONTCONFIG_PATH=${fonts}/etc/fonts
     export XCURSOR_PATH=${cursors}/share/icons XCURSOR_THEME=default
@@ -45,7 +46,7 @@ let
     pkgs.bash pkgs.coreutils pkgs.curl.bin pkgs.xz.bin pkgs.zstd.bin pkgs.cacert
     pkgs.gnutar pkgs.unzip pkgs.python3 pkgs.gitMinimal pkgs.vim pkgs.tinycc
     pkgs.ffmpeg.bin pkgs.wayland pkgs.xwayland graphics.mesaRuntime pkgs.tzdata
-    pkgs.hicolor-icon-theme pkgs.adwaita-icon-theme pkgs.shared-mime-info
+    pkgs.hicolor-icon-theme pkgs.adwaita-icon-theme pkgs.kdePackages.breeze-icons pkgs.shared-mime-info
     pkgs.gimp pkgs.qalculate-gtk pkgs.xfce.mousepad pkgs.openttd pkgs.gnome-commander
     chromium vlc fonts cursors launchers
   ] ++ native;

@@ -60,6 +60,25 @@ int main() {
     CHECK(measured.Pages(PmmOwner::KernelHeap)==1 && measured.Pages(PmmOwner::XhciDma)==8);
     CHECK(measured.Pages(PmmOwner::FileCache)==1 && measured.Pages(PmmOwner::KernelStacks)==1);
     CHECK(measured.Pages(PmmOwner::Shmem)==1 && measured.freePages==accountingBefore.freePages-12);
+    // Exec admits a pinned staging frame. Its second reference after admission
+    // makes it cached, and releasing that reference makes it reclaimable.
+    PmmRefPage(heap);
+    PmmReassignOwner(heap, PmmOwner::KernelHeap, PmmOwner::ExecCache);
+    measured = PmmReadOwnerStats();
+    CHECK(measured.Pages(PmmOwner::KernelHeap) == 0);
+    CHECK(measured.Pages(PmmOwner::ExecCache) == 1 && measured.CachedPages() == 2);
+    CHECK(measured.idleExecCachePages == 0 && measured.AvailablePages() == measured.freePages);
+    PmmFreePage(heap);
+    measured = PmmReadOwnerStats();
+    CHECK(measured.idleExecCachePages == 1 && measured.AvailablePages() == measured.freePages + 1);
+    CHECK(PmmRefPageIfAlive(heap));
+    CHECK(PmmReadOwnerStats().idleExecCachePages == 0);
+    PmmUnrefPage(heap);
+    CHECK(PmmReadOwnerStats().idleExecCachePages == 1);
+    PmmRefPage(heap);
+    CHECK(PmmReadOwnerStats().idleExecCachePages == 0);
+    PmmUnrefPage(heap);
+    CHECK(PmmReadOwnerStats().idleExecCachePages == 1);
     PmmRefPage(cache);
     PmmFreePage(cache);
     CHECK(PmmReadOwnerStats().Pages(PmmOwner::FileCache)==1);
