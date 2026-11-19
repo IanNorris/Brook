@@ -12,6 +12,7 @@
 #include "graphics_pass.h"
 #include "quad_pass.h"
 #include "quad_reference.h"
+#include "quad_backdrop_reference.h"
 #include "desktop_tile.h"
 #include "desktop_graphics_damage.h"
 #include "intel_tiling.h"
@@ -384,7 +385,105 @@ static void tiled_sources(void){
     gem_free(&linear);gem_free(&tiled);gem_free(&outLinear);gem_free(&outTiled);
     printf("QUAD_HOST_TILED_PASS\n");
 }
+enum { BLUR_TEST_LAYERS=5, BLUR_TEST_WORDS=BROOK_VK_SCENE_HEADER+BLUR_TEST_LAYERS*BROOK_VK_LAYER_WORDS };
+static const struct BrookVkSceneLayer blurSceneLayers[BLUR_TEST_LAYERS]={
+    {0,DW,DW,DH,0,0,DW,DH,0,0,DW,DH,0,0,DW,DH,255|BROOK_VK_OPAQUE_SOURCE},
+    {0,DW,DW,1680,0,0,DW,1680,0,56,DW,1680,0,0,DW,DH,255|BROOK_VK_OPAQUE_SOURCE},
+    {0,DW,DW,56,0,0,DW,56,0,0,DW,56,0,0,DW,DH,255|BROOK_VK_STRAIGHT_ALPHA},
+    {0,DW,DW,64,0,0,DW,64,0,1736,DW,64,0,0,DW,DH,255|BROOK_VK_STRAIGHT_ALPHA},
+    {0,640,640,320,0,0,640,320,360,480,640,320,0,0,DW,DH,222|BROOK_VK_STRAIGHT_ALPHA},
+};
+static struct QuadBackdrop blur_test_plan(const uint32_t *scene,uint64_t wallpaper,uint64_t game,int panel)
+{
+    struct QuadBackdrop plan={0};
+    const uint64_t keys[BLUR_TEST_LAYERS]={wallpaper,game,3,4,5};
+    quad_backdrop_add(&plan,(struct QuadRect){0,0,DW,56},2,1,3);
+    quad_backdrop_add(&plan,(struct QuadRect){0,1736,DW,DH},3,3,9);
+    if(panel)quad_backdrop_add(&plan,(struct QuadRect){360,480,1000,800},4,3,18);
+    CHECK(quad_backdrop_layout(&plan,scene,NULL,keys) && plan.count==(panel?3:2));
+    return plan;
+}
+static void blur_test_layout(void)
+{
+    uint32_t scene[BLUR_TEST_WORDS]={DW,DH,BLUR_TEST_LAYERS,0};
+    memcpy(scene+BROOK_VK_SCENE_HEADER,blurSceneLayers,sizeof(blurSceneLayers));
+    struct QuadBackdrop p=blur_test_plan(scene,1,1,0);
+    CHECK(p.used[0] && !p.used[1] && !p.used[2]);
+    CHECK(blur_test_plan(scene,1,2,0).key==p.key);
+    CHECK(blur_test_plan(scene,2,2,0).key!=p.key);
+    p=blur_test_plan(scene,1,1,1);
+    CHECK(p.used[1] && blur_test_plan(scene,1,2,1).key!=p.key);
+    CHECK(quad_rect_empty(quad_rect_intersect(p.tiles[0].atlas,p.tiles[1].atlas)));
+    puts("QUAD_HOST_GLASS_LAYOUT_PASS");
+}
+
+static void blur_scene(void)
+{
+    blur_test_layout();
+    uint32_t scene[BLUR_TEST_WORDS]={DW,DH,BLUR_TEST_LAYERS,0};
+    memcpy(scene+BROOK_VK_SCENE_HEADER,blurSceneLayers,sizeof(blurSceneLayers));
+    struct Gem in[BLUR_TEST_LAYERS],out;
+    struct BrookVkQuadSource sources[BLUR_TEST_LAYERS];
+    const uint32_t *pixels[BLUR_TEST_LAYERS];
+    for(unsigned i=0;i<BLUR_TEST_LAYERS;++i){
+        const uint32_t *l=quad_backdrop_layer(scene,i);
+        gem_new((uint64_t)l[2]*l[3]*4,&in[i]);
+        gem_cpu(&in[i],1);
+        for(unsigned y=0;y<l[3];++y)for(unsigned x=0;x<l[2];++x){
+            const unsigned r=(x/20+y/25+41*i)&255,g=(x/25+33*i)&255,b=(y/14+21*i)&255;
+            const unsigned alpha=i<2?255:x%200<10?0:144;
+            in[i].map[(size_t)y*l[2]+x]=(alpha<<24)|(r<<16)|(g<<8)|b;
+        }
+        sources[i]=(struct BrookVkQuadSource){{in[i].fd,-1,l[2],l[3],0,l[2],in[i].size},1};
+        pixels[i]=in[i].map;
+    }
+    gem_new((uint64_t)DW*DH*4,&out);
+    const struct BrookVkQuadSource target={{out.fd,-1,DW,DH,0,DW,out.size},1};
+    static struct QuadPlan plan;
+    const struct DesktopDamageSet full={1,{{0,0,DW,DH}}};
+    CHECK(quad_plan_build_auto(scene,BLUR_TEST_WORDS,NULL,&full,1,&plan));
+    const struct QuadBackdrop steady=blur_test_plan(scene,1,1,0);
+    const struct QuadBackdrop panel=blur_test_plan(scene,1,1,1);
+    uint64_t offNs=0,onNs=0;
+    for(unsigned iteration=0;iteration<120;++iteration){
+        const struct QuadBackdrop *effect=iteration<60?NULL:&steady;
+        CHECK(brook_vk_quad_pass_submit_backdrop(quad,scene,BLUR_TEST_WORDS,sources,BLUR_TEST_LAYERS,&target,&plan,effect,NULL)==BROOK_VK_PENDING);
+        CHECK(brook_vk_quad_pass_wait(quad,5000000000ull)==BROOK_VK_COMPLETE);
+        uint64_t ns;
+        CHECK(brook_vk_quad_pass_gpu_timestamp_ns(quad,&ns));
+        if(iteration<60)offNs+=ns;else onNs+=ns;
+    }
+    struct BrookVkBackdropStats stats=brook_vk_quad_pass_backdrop_stats(quad);
+    CHECK(stats.rebuilds==1 && stats.reuses==59 && stats.timedFrames==60);
+    printf("QUAD_HOST_GLASS_BUDGET off_gpu_ms=%.4f on_gpu_ms=%.4f atlas_gpu_ms=%.4f glass_gpu_ms=%.4f frames=%u\n",
+        offNs/60e6,onNs/60e6,stats.atlasNs/1e6,stats.glassNs/60e6,stats.timedFrames);
+
+    unsigned different=0,checked=0;
+    for(unsigned n=0;n<2;++n){
+        const struct QuadBackdrop *effect=n?&panel:&steady;
+        CHECK(brook_vk_quad_pass_submit_backdrop(quad,scene,BLUR_TEST_WORDS,sources,BLUR_TEST_LAYERS,&target,&plan,effect,NULL)==BROOK_VK_PENDING);
+        CHECK(brook_vk_quad_pass_wait(quad,5000000000ull)==BROOK_VK_COMPLETE);
+        gem_cpu(&out,0);
+        for(int y=0;y<DH;y+=5)for(int x=0;x<DW;x+=7){
+            const uint32_t expected=quad_backdrop_reference_pixel(effect,scene,pixels,x,y);
+            const uint32_t actual=out.map[y*DW+x];
+            for(unsigned c=0;c<4;++c)if(abs((int)quad_ref_channel(expected,c)-(int)quad_ref_channel(actual,c))>2){
+                fprintf(stderr,"QUAD_HOST_GLASS_MISMATCH panel=%u x=%d y=%d expected=%08x actual=%08x\n",n,x,y,expected,actual);
+                CHECK(0);
+            }
+            different+=expected!=quad_reference_pixel(scene,pixels,x,y);
+            ++checked;
+        }
+    }
+    stats=brook_vk_quad_pass_backdrop_stats(quad);
+    CHECK(stats.rebuilds==2 && stats.reuses==60 && stats.timedFrames==62 && different>100);
+    printf("QUAD_HOST_GLASS_PIXELS_PASS checked=%u blurred=%u\n",checked,different);
+    gem_free(&out);
+    for(unsigned i=0;i<BLUR_TEST_LAYERS;++i)gem_free(&in[i]);
+}
 int main(int argc,char **argv){
+    if(argc>1 && !strcmp(argv[1],"--blur-layout")){blur_test_layout();return 0;}
+    const int blurOnly=argc>1 && !strcmp(argv[1],"--blur");
     const unsigned iterations=argc>1?(unsigned)strtoul(argv[1],NULL,10):300;
     setenv("BROOK_RENDER_GPU_TIMESTAMPS","1",0);
     open_intel();
@@ -395,12 +494,14 @@ int main(int argc,char **argv){
     CHECK(brook_vk_renderer_graphics_context(compute,&physical,&device,&queue,&family));
     quad=brook_vk_quad_pass_create(physical,device,queue,family);CHECK(quad);
     brook_vk_quad_pass_set_modifiers(quad,brook_vk_renderer_modifiers(compute));
+    if(blurOnly){blur_scene();goto done;}
     tiled_sources();
     ring_targets();
     for(unsigned i=0;i<iterations;++i)random_scene(i);
     printf("QUAD_HOST_RANDOM_EXACT iterations=%u\n",iterations);
     surface_scene();
     desktop();
+done:
     CHECK(brook_vk_quad_pass_destroy(quad));CHECK(brook_vk_renderer_destroy(batch));CHECK(brook_vk_renderer_destroy(compute));
     printf("QUAD_HOST_PASS\n");
     return 0;
