@@ -45,6 +45,9 @@ int main(int argc,char **argv){
      * kept as an explicit, harmless request. An explicit environment value,
      * including BROOK_RENDER_PIPELINE=1, wins. */
     if(pipeline && setenv("BROOK_RENDER_PIPELINE","2",0))return 1;
+    /* Opt-in Glass backdrop blur without rebuilding the image: the marker
+     * /etc/brook-render-blur enables it; an explicit environment value wins. */
+    if(access("/etc/brook-render-blur",F_OK)==0 && setenv("BROOK_RENDER_BLUR","1",0))return 1;
 #ifdef BROOK_SUPERVISOR_SERIAL
     if(!asyncPartial || setenv("BROOK_RENDER_ASYNC_PARTIAL_SERIAL","1",1))return 1;
 #endif
