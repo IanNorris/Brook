@@ -58,10 +58,26 @@ def run(argv, **kw):
     return subprocess.run([str(a) for a in argv], check=True, **kw)
 
 
-def nix_build(expr_path, *args):
-    out = subprocess.run(['nix-build', str(expr_path), '--no-out-link', *args], check=True,
-                         capture_output=True, text=True).stdout.strip().splitlines()[-1]
-    return Path(out)
+def build_boot_services():
+    # Share one pinned package set across both builds and Wayland's dependencies.
+    packages = """
+        let pkgs = import ./nix/nixpkgs.nix {};
+        in {
+            compositor = import ./tools/vulkan-compositor-pkg { inherit pkgs; };
+            waylandd = pkgs.callPackage ./tools/waylandd-pkg {
+                enableVulkanCompositor = true;
+                vulkanHeaders = pkgs.vulkan-headers;
+                vulkanLoader = pkgs.vulkan-loader;
+            };
+        }
+    """
+    result = subprocess.run(['nix-build', '--no-out-link', '-E', packages,
+                             '-A', 'compositor', '-A', 'waylandd'],
+                            cwd=ROOT, capture_output=True, text=True)
+    if result.returncode:
+        sys.exit('Nix boot service build failed:\n' + result.stderr)
+    compositor, waylandd = map(Path, result.stdout.splitlines())
+    return compositor, waylandd
 
 
 def runtime_paths(elf):
@@ -142,8 +158,7 @@ def main():
     kernel = build / 'BROOK.elf'
 
     # 2. Userspace boot services
-    compositor = nix_build(ROOT / 'tools/vulkan-compositor-pkg')
-    waylandd = nix_build(ROOT / 'tools/waylandd-pkg', '--arg', 'enableVulkanCompositor', 'true')
+    compositor, waylandd = build_boot_services()
     supervisor = compositor / 'bin' / a.supervisor
     renderer = compositor / 'bin/brook-desktop-renderer'
     provider = waylandd / 'bin/waylandd'

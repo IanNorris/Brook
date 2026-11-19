@@ -46,15 +46,56 @@ cmake \
 echo "Building..."
 cmake --build "${BUILD_DIR}"
 
-echo "Auditing compiled entry/return templates..."
-python3 "${ROOT_DIR}/scripts/audit_entry_state.py" \
-    "${BUILD_DIR}/kernel/BROOK.elf" --mutations \
-    --output "${BUILD_DIR}/entry-state-audit.json" >"${BUILD_DIR}/entry-state-audit.log"
-echo "Entry audit passed for supported templates (coverage: ${BUILD_DIR}/entry-state-audit.json)."
-python3 "${ROOT_DIR}/scripts/audit_scheduler_start.py" \
-    "${BUILD_DIR}/kernel/BROOK.elf" --mutations \
-    --output "${BUILD_DIR}/scheduler-start-audit.json" >"${BUILD_DIR}/scheduler-start-audit.log"
-echo "Scheduler startup saved-context call contract passed."
+KERNEL_ELF="${BUILD_DIR}/kernel/BROOK.elf"
+ENTRY_AUDIT="${BUILD_DIR}/entry-state-audit.json"
+SCHED_AUDIT="${BUILD_DIR}/scheduler-start-audit.json"
+AUDIT_STAMP="${BUILD_DIR}/kernel-audits.sha256"
+PYTHON=$(command -v python3)
+AUDIT_PYTHON=("${PYTHON}")
+
+audit_inputs() {
+    printf 'Interpreter: %s\nLibrary path: %s\n' "${PYTHON}" "${LD_LIBRARY_PATH:-}" || return
+    sha256sum "${KERNEL_ELF}" "${SCRIPT_DIR}/build.sh" \
+        "${SCRIPT_DIR}/audit_entry_state.py" "${SCRIPT_DIR}/audit_scheduler_start.py"
+}
+
+# Reuse only successful audits of the exact kernel and unchanged audit inputs.
+# The dev shell's immutable Python environment pins Capstone and pyelftools.
+# Isolated mode keeps Python's imports within that environment.
+CACHE_AUDITS=false
+NIX_LIB_DIRECTORY='^/nix/store/[0-9a-z]{32}-[^/:]+/lib$'
+if [[ "${PYTHON}" == /nix/store/*-env/bin/python3 &&
+      ( -z "${LD_LIBRARY_PATH:-}" || "${LD_LIBRARY_PATH}" =~ ${NIX_LIB_DIRECTORY} ) &&
+      -z "${LD_PRELOAD:-}${LD_AUDIT:-}${LIBCAPSTONE_PATH:-}${NIX_PYTHONPATH:-}" ]]; then
+    CACHE_AUDITS=true
+    AUDIT_PYTHON+=(-I)
+fi
+
+if "${CACHE_AUDITS}"; then
+    AUDIT_INPUTS=$(audit_inputs)
+fi
+if "${CACHE_AUDITS}" && [[ -s "${AUDIT_STAMP}" ]] &&
+   AUDIT_OUTPUTS=$(sha256sum "${ENTRY_AUDIT}" "${SCHED_AUDIT}" 2>/dev/null) &&
+   [[ "${AUDIT_INPUTS}"$'\n'"${AUDIT_OUTPUTS}" == "$(<"${AUDIT_STAMP}")" ]]; then
+    echo "Entry and scheduler audits already passed for this kernel."
+else
+    rm -f "${AUDIT_STAMP}"
+    echo "Auditing compiled entry/return templates..."
+    "${AUDIT_PYTHON[@]}" "${SCRIPT_DIR}/audit_entry_state.py" \
+        "${KERNEL_ELF}" --mutations \
+        --output "${ENTRY_AUDIT}" >"${BUILD_DIR}/entry-state-audit.log"
+    echo "Entry audit passed for supported templates (coverage: ${ENTRY_AUDIT})."
+    "${AUDIT_PYTHON[@]}" "${SCRIPT_DIR}/audit_scheduler_start.py" \
+        "${KERNEL_ELF}" --mutations \
+        --output "${SCHED_AUDIT}" >"${BUILD_DIR}/scheduler-start-audit.log"
+    echo "Scheduler startup saved-context call contract passed."
+    if "${CACHE_AUDITS}" && [[ "${AUDIT_INPUTS}" == "$(audit_inputs)" ]]; then
+        {
+            printf '%s\n' "${AUDIT_INPUTS}"
+            sha256sum "${ENTRY_AUDIT}" "${SCHED_AUDIT}"
+        } >"${AUDIT_STAMP}"
+    fi
+fi
 
 # Build host-native tests (uses nix-wrapped clang++ with standard host libs).
 # HOST_CXX is set by shell.nix to the wrapped Clang+libc++ toolchain;
