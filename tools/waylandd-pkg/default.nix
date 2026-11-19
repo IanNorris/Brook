@@ -53,6 +53,8 @@ stdenv.mkDerivation {
   doCheck = true;
 
   checkPhase = ''
+    $CC -O2 -UNDEBUG -Wall -Wextra -Werror latency-stats-test.c -o latency-stats-test
+    ./latency-stats-test
     $CC -O2 -UNDEBUG -Wall -Wextra -I. surface-blit-test.c -o surface-blit-test
     ./surface-blit-test
     $CC -O2 -UNDEBUG -Wall -Wextra intel-pending-drain-test.c -o intel-pending-drain-test

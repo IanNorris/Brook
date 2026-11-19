@@ -46,6 +46,21 @@ int main(void) {
     wl_display_flush_clients(display);uint32_t pending_wire[32];
     assert(recv(sockets[1],pending_wire,sizeof(pending_wire),MSG_DONTWAIT)>0);
     image_unref(pending);
+    struct client_latency *lat = latency_client(client);
+    assert(lat && lat->pid == getpid() && lat->data.commit_to_done.hist.count == 1);
+    assert(surface.latency.hist.count == 1 && surface.latency.worst.root_wm == 1);
+    assert(lat->data.commit_to_done.worst.surface_object == 2);
+    assert(lat->data.commit_to_done.worst.committed == 1);
+    assert(lat->data.commit_to_done.worst.done_us == lat->data.last_done_us);
+    {
+        char *json = NULL;size_t length = 0;FILE *f = open_memstream(&json,&length);assert(f);
+        latency_stats_json(f);assert(!fclose(f));
+        assert(strstr(json,"\"bucket_upper_ms\":[4,8,16,33,50,100,250,500,1000,null]"));
+        assert(strstr(json,"\"commit_to_callback_done\":{\"count\":1,"));
+        assert(strstr(json,"\"input_receive_to_queue\":{\"motion\":"));
+        assert(strstr(json,"\"toplevels\":[{"));
+        free(json);
+    }
     surface.trace_requests=surface.trace_done=0;
     for(unsigned round=0;round<3;++round) {
         surface_frame(client,surface.resource,3+round);
@@ -254,6 +269,11 @@ int main(void) {
     }
     assert(resizeConfigs==4);
 
+    assert(lat->data.done_to_commit.count);
+    const uint64_t epoch = g_stats_epoch;
+    latency_stats_reset();
+    assert(g_stats_epoch == epoch + 1 && !lat->data.commit_to_done.hist.count &&
+           !lat->data.done_to_commit.count && !surface.latency.hist.count);
     g_seat_clients=NULL;wl_client_destroy(foreign);close(foreignSockets[1]);
     wl_client_destroy(client);
     assert(surface.trace_done==3 && surface.trace_cancelled==25);
