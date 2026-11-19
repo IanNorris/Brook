@@ -95,7 +95,19 @@ _Last updated: 19 November 2026 (early), by a Claude Code session; see "19 Nov e
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
-**19 Nov late night: Dell on gen 448 = `work/integration46` c1f21a4d** (payload `dell-int46-20261119`, session `e7b5573baca64277acd3e727eecc42ce`) = int45 + Codex `work/clearwater-s2b`: 2.5 glass repaint (material lists, shadow tiles, caption pills, tray targets) and 2.6 toasts/flyouts/HUD (Alt+P). Healthy at boot. Staged Settings `gyfdys3x…` and Message `favg7xpp…` (tx `cw2b1119`). Fable 5.2 High visual review in progress on `work/clearwater-review`. Comparison screenshots were sent to Ian.
+**19 Nov late night: Dell on gen 449 = `work/integration47` 9d9ca872** (int46 + Codex `work/mem-accounting` b09b00ff; session `e95c9b28f6be41d58324afc8ed3eca88`). Host tests: 383 non-stress and 2 stress pass. QEMU check passes.
+- **New commands:** `mem breakdown` (JSON, per-class), `mem exec-cache`, `mem heap`. `/proc/meminfo` and `/proc/PID/status` VmRSS are now real.
+- **Memory result** (evidence in `display-perf/build/dell/mem-449-*.json`):
+  - **Fresh boot:** 607 MB used. Largest classes: other 180, driver_dma 88, scanout 88, kernel_heap 82, gpu 59, file 39, user 31 MB.
+  - **Chromium open/close ×3:** used goes 607 → 960 → 969 → 969 MB. It plateaus, so this is **not a growing leak**.
+  - **What is retained:** +340 MB in "kernel_heap", which is the **exec page cache**: 77,872 shared ELF text pages ≈ 304 MB. `mem exec-cache` reports capacity 131,072 entries (512 MB max). The cache is reclaimed by step trims, below 128 MB free, and by the OOM worker. The heap itself is 119 MB (79 used).
+  - **GPU buffers:** no orphaned or exited-owner BOs (unref 0, exited 0) after closes.
+  - The 1.26 GB of kernel memory after the heavy session was mostly this cache (Chromium + Firefox + games).
+  - **Follow-ups:**
+    - Exec-cache pages are tagged `MemTag::Heap`. Give them their own class in `mem breakdown` and report them as Cached in `/proc/meminfo`, so the desktop's memory % shows them as reclaimable cache.
+    - The waylandd heap growth (1.2 → 63 MB after the heavy session) did not reproduce with Settings, Mousepad or Chromium cycles. Re-check after the next long session.
+
+**Previous: gen 448 = `work/integration46` c1f21a4d** (payload `dell-int46-20261119`, session `e7b5573baca64277acd3e727eecc42ce`) = int45 + Codex `work/clearwater-s2b`: 2.5 glass repaint (material lists, shadow tiles, caption pills, tray targets) and 2.6 toasts/flyouts/HUD (Alt+P). Healthy at boot. Staged Settings `gyfdys3x…` and Message `favg7xpp…` (tx `cw2b1119`). Fable 5.2 High visual review in progress on `work/clearwater-review`. Comparison screenshots were sent to Ian.
 
 **Previous: gen 447 = `work/integration45` 7ffc16b0** (payload `dell-int45-20261119`, session `6cfbb9c3d02b4186be956f0b08f77249`). Contents: int44 (int43 + `work/dump-segments`) + `work/clearwater-s2` (1.5 capability, 2.1 metrics, 2.2 themes, 2.3 hues) + `work/vkrender-blur` (2.4, opt-in `BROOK_RENDER_BLUR=1`) + `work/cursor-dedupe` + `work/chromium-gpu-death` (exit teardown closes fds for SIGKILL and thread-fault deaths) + `work/hda-fault` (fault record, restart storm stopped, opt-in `/etc/dell-hda-fault-recovery`).
 - **Host tests:** 383 non-stress and 2 stress pass. QEMU check passes.
