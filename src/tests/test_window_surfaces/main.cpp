@@ -373,8 +373,8 @@ int main() {
     window.focused=!window.focused;CHECK(!WmDesktopLayersCurrent(layers));window.focused=!window.focused;
     window.appId[0]='x';CHECK(!WmDesktopLayersCurrent(layers));window.appId[0]=0;
     ++g_launcherSnapshotEpoch;CHECK(!WmDesktopLayersCurrent(layers));--g_launcherSnapshotEpoch;
-    const auto theme=WmGetTheme();CHECK(WmSetTheme(theme==0?1:0));
-    CHECK(!WmDesktopLayersCurrent(layers));CHECK(WmSetTheme(theme));CHECK(!WmDesktopLayersCurrent(layers));
+    CHECK(WmSetTheme(BROOK_LEGACY_PALETTE_OPAL));
+    CHECK(!WmDesktopLayersCurrent(layers));CHECK(WmSetTheme(BROOK_LEGACY_PALETTE_CLEARWATER));CHECK(!WmDesktopLayersCurrent(layers));
     g_chromeSettingsEpoch=layers.settingsGeneration; // test restores the fixture snapshot
     // Stage 1.5: a backend change re-resolves the theme (Glass needs blur;
     // without it the opaque material stands in) and stales every capture;
@@ -688,12 +688,46 @@ int main() {
         }
         g_desktopMetrics=&DesktopMetric100;
     }
-    // Chrome tokens: until the Clearwater hue derivation, every theme keeps
-    // the values the painters previously hard-coded (no visual change).
-    for(uint32_t id=0;id<BROOK_THEME_COUNT;++id){
-        const auto& p=*brook_theme_palette(id);
-        CHECK(p.accent==0x0068ACFFu && p.halo==0x00071526u && p.ok==0x0063B782u && p.warm==0x00E5BF69u &&
-              p.hot==0x00E06C75u && p.badgeText==0x00A4B2C7u && p.badgeFill==0x00172335u);
+    // Clearwater (stages 2.2/2.3): the default selection is Glass, Mixed,
+    // Blue. Without backdrop blur it resolves to Opaque Dark (dark chrome and
+    // apps, one flat fill); with it to Glass (dark glass, light apps).
+    {
+        CHECK(WmGetThemeSelection()==BROOK_THEME_SELECTION_DEFAULT);
+        WmSetBackendBlur(false);
+        CHECK(WmResolvedTheme()==BROOK_THEME_OPAQUE_DARK && WmCurrentPalette().titleActive==BROOK_REF_DARK_FLAT &&
+              WmCurrentPalette().titleInactive==BROOK_REF_DARK_FLAT && (WmGetAppearance()&BROOK_APPEARANCE_DARK));
+        CHECK(WmCurrentPalette().accent==0x6aaeffu && WmCurrentPalette().closeHover==BROOK_CLOSE_HOVER);
+        WmSetBackendBlur(true);
+        CHECK(WmResolvedTheme()==BROOK_THEME_GLASS && WmCurrentPalette().titleActive==BROOK_REF_DARK_TITLE &&
+              WmCurrentPalette().taskbar==BROOK_REF_DARK_GLASS && !(WmGetAppearance()&BROOK_APPEARANCE_DARK));
+        CHECK(WmHueTokens().content[0].background==BROOK_REF_LIGHT_BG);
+        // App content follows the theme in use: Mixed glass has light apps,
+        // its Opaque Dark stand-in dark ones.
+        CHECK(WmContentColour(BROOK_CONTENT_BACKGROUND)==BROOK_REF_LIGHT_BG && WmContentColour(BROOK_CONTENT_ACCENT)==0x1c65ccu);
+        CHECK(WmContentColour(BROOK_CONTENT_SELECTION)==brook_surface_palette(0)->selection);
+        WmSetBackendBlur(false);
+        CHECK(WmContentColour(BROOK_CONTENT_BACKGROUND)==BROOK_REF_DARK_BG && WmContentColour(BROOK_CONTENT_ON_ACCENT)==0x101e2eu);
+        for(unsigned i=0;i<BROOK_CONTENT_COUNT;++i){
+            BrookSurfacePalette fallback=*brook_surface_palette(1);
+            CHECK(WmContentColour(i)==*brook_surface_palette_field(&fallback,i));
+        }
+        WmSetBackendBlur(true);
+        // Older Settings write the appearance word: bits that agree with the
+        // selection change nothing; others are read as aliases.
+        const uint32_t a=WmGetAppearance();
+        CHECK(WmSetAppearance(a) && WmGetThemeSelection()==BROOK_THEME_SELECTION_DEFAULT);
+        CHECK(WmSetAppearance((a&~3u)|BROOK_APPEARANCE_PERFORMANCE));
+        CHECK(WmGetThemeSelection()==BROOK_THEME_SELECTION(BROOK_THEME_OPAQUE_LIGHT,BROOK_MODE_LIGHT,BROOK_HUE_BLUE));
+        CHECK(WmCurrentPalette().titleActive==BROOK_REF_LIGHT_FLAT && WmCurrentPalette().accent==0x1c65ccu);
+        CHECK(WmSetAppearance((a&~3u)|BROOK_APPEARANCE_DARK));
+        CHECK(WmGetThemeSelection()==BROOK_THEME_SELECTION(BROOK_THEME_GLASS,BROOK_MODE_DARK,BROOK_HUE_BLUE));
+        CHECK(WmSetAppearance(a&~3u) && WmGetThemeSelection()==BROOK_THEME_SELECTION(BROOK_THEME_GLASS,BROOK_MODE_LIGHT,BROOK_HUE_BLUE));
+        CHECK(brook_appearance_opacity(WmGetAppearance())==brook_appearance_opacity(a));
+        CHECK(WmSetTheme(BROOK_LEGACY_PALETTE_SMOKED) && brook_selection_hue(WmGetThemeSelection())==BROOK_HUE_SLATE);
+        CHECK(!WmSetTheme(3) && !WmSetThemeSelection(BROOK_THEME_SELECTION(0,0,13)));
+        CHECK(WmSetThemeSelection(BROOK_THEME_SELECTION(BROOK_THEME_GLASS,BROOK_MODE_MIXED,BROOK_HUE_AMBER)));
+        CHECK(WmCurrentPalette().titleActive==0x8b6a00u && WmCurrentPalette().accent==0xffc233u);
+        CHECK(WmSetThemeSelection(BROOK_THEME_SELECTION_DEFAULT));WmSetBackendBlur(false);
     }
     std::puts("WINDOW_SURFACES PASS: stale slot, GL/SHM transition, destruction, reuse, owned geometry, chrome and fullscreen");
 }

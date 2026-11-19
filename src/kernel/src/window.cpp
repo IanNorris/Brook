@@ -97,7 +97,9 @@ bool WmSetScale(uint32_t percent) {
 static bool ResizeWindowLocked(int idx,uint16_t newClientW,uint16_t newClientH);
 static void FocusWindowLocked(int idx);
 
-static uint32_t g_themeId = BROOK_THEME_BROOK;
+// Clearwater (refactor stages 2.2 and 2.3): the saved selection (theme,
+// mode, hue). Writers hold g_vfbLock and bump the chrome epoch.
+static uint32_t g_themeSelection = BROOK_THEME_SELECTION_DEFAULT;
 // Protected by g_vfbLock. Never reuse an epoch after counter exhaustion.
 static uint64_t g_chromeSettingsEpoch=1;
 // Writers hold g_vfbLock; lock-free readers use this as a sequence counter.
@@ -121,26 +123,70 @@ bool WmSetTaskbarMetrics(uint32_t value){
     __atomic_store_n(&g_taskbarMetrics,value,__ATOMIC_RELEASE);
     CompositorMarkDirty();CompositorWake();return true;
 }
-uint32_t WmGetAppearance(){return __atomic_load_n(&g_appearance,__ATOMIC_ACQUIRE);}
+static bool g_backendBlur=false;
+uint32_t WmGetThemeSelection(){return __atomic_load_n(&g_themeSelection,__ATOMIC_ACQUIRE);}
+bool WmBackendBlur(){return __atomic_load_n(&g_backendBlur,__ATOMIC_ACQUIRE);}
+// The theme in use: the selection resolved against the backend's backdrop
+// blur (Glass, or its Opaque stand-in).
+uint32_t WmResolvedTheme(){
+    const uint32_t s=WmGetThemeSelection();
+    return brook_theme_resolve(brook_selection_theme(s),brook_selection_mode(s),WmBackendBlur());
+}
+// The appearance word keeps opacity and blur; its dark and performance bits
+// are views of the selection, for older Settings and GTK apps: dark = the app
+// content in use is dark (Mixed is light), performance = an Opaque theme is
+// selected.
+static uint32_t AppearanceViewBits(uint32_t selection,bool blur){
+    const unsigned theme=brook_selection_theme(selection),mode=brook_selection_mode(selection);
+    const unsigned resolved=brook_theme_resolve(theme,mode,blur);
+    return (brook_theme_content_dark(resolved,mode)?BROOK_APPEARANCE_DARK:0u)|
+           (theme!=BROOK_THEME_GLASS?BROOK_APPEARANCE_PERFORMANCE:0u);
+}
+uint32_t WmGetAppearance(){
+    const uint32_t stored=__atomic_load_n(&g_appearance,__ATOMIC_ACQUIRE)&~uint32_t(BROOK_APPEARANCE_DARK|BROOK_APPEARANCE_PERFORMANCE);
+    return stored|AppearanceViewBits(WmGetThemeSelection(),WmBackendBlur());
+}
+static void PublishThemeSelectionLocked(uint32_t selection){
+    if(g_chromeSettingsEpoch)++g_chromeSettingsEpoch;
+    __atomic_store_n(&g_themeSelection,selection,__ATOMIC_RELEASE);
+}
 bool WmSetAppearance(uint32_t value){
     if(!brook_appearance_valid(value))return false;
-    VfbGuard guard;
-    if(g_chromeSettingsEpoch)++g_chromeSettingsEpoch;
-    __atomic_store_n(&g_appearance,value,__ATOMIC_RELEASE);
+    {
+        VfbGuard guard;
+        if(g_chromeSettingsEpoch)++g_chromeSettingsEpoch;
+        // Dark and performance bits that disagree with the selection are an
+        // older Settings speaking: read them as aliases, as settings.ini's.
+        const uint32_t selection=WmGetThemeSelection();
+        const uint32_t view=AppearanceViewBits(selection,WmBackendBlur());
+        const uint32_t asked=value&(BROOK_APPEARANCE_DARK|BROOK_APPEARANCE_PERFORMANCE);
+        if(asked!=view){
+            const bool dark=value&BROOK_APPEARANCE_DARK;
+            unsigned theme=BROOK_THEME_GLASS,mode=brook_selection_mode(selection);
+            if(value&BROOK_APPEARANCE_PERFORMANCE)theme=dark?BROOK_THEME_OPAQUE_DARK:BROOK_THEME_OPAQUE_LIGHT;
+            if(theme!=BROOK_THEME_GLASS || brook_theme_content_dark(brook_theme_resolve(theme,mode,WmBackendBlur()),mode)!=dark)
+                mode=dark?BROOK_MODE_DARK:BROOK_MODE_LIGHT;
+            PublishThemeSelectionLocked(BROOK_THEME_SELECTION(theme,mode,brook_selection_hue(selection)));
+        }
+        __atomic_store_n(&g_appearance,value&~uint32_t(BROOK_APPEARANCE_DARK|BROOK_APPEARANCE_PERFORMANCE),__ATOMIC_RELEASE);
+    }
     CompositorMarkDirty();CompositorWake();return true;
 }
+bool WmSetThemeSelection(uint32_t selection){
+    if(!brook_selection_valid(selection))return false;
+    {VfbGuard guard;PublishThemeSelectionLocked(selection);}
+    CompositorMarkDirty();CompositorWake();return true;
+}
+// Debug "gpu glass on|off": Glass, or the Opaque theme for the mode.
 void WmSetPerformanceMode(bool enabled){
-    VfbGuard guard;
-    if(g_chromeSettingsEpoch)++g_chromeSettingsEpoch;
-    if(enabled)__atomic_fetch_or(&g_appearance,uint32_t(BROOK_APPEARANCE_PERFORMANCE),__ATOMIC_ACQ_REL);
-    else __atomic_fetch_and(&g_appearance,~uint32_t(BROOK_APPEARANCE_PERFORMANCE),__ATOMIC_ACQ_REL);
-    CompositorMarkDirty();CompositorWake();
+    const uint32_t s=WmGetThemeSelection();
+    const unsigned mode=brook_selection_mode(s);
+    const unsigned theme=!enabled?BROOK_THEME_GLASS:mode==BROOK_MODE_LIGHT?BROOK_THEME_OPAQUE_LIGHT:BROOK_THEME_OPAQUE_DARK;
+    WmSetThemeSelection(BROOK_THEME_SELECTION(theme,mode,brook_selection_hue(s)));
 }
 // Stage 1.5: the backend's backdrop-blur capability, set by the compositor at
 // each frame boundary. A change re-resolves the theme (Glass or its Opaque
 // stand-in): every chrome key changes and everything is repainted once.
-static bool g_backendBlur=false;
-bool WmBackendBlur(){return __atomic_load_n(&g_backendBlur,__ATOMIC_ACQUIRE);}
 void WmSetBackendBlur(bool blur){
     if(WmBackendBlur()==blur)return;
     {
@@ -151,24 +197,75 @@ void WmSetBackendBlur(bool blur){
     SerialPrintf("WM: backend backdrop blur %s\n",blur?"available":"unavailable");
     CompositorMarkDirty();
 }
-// The appearance as resolved against the backend: Glass needs backdrop blur,
-// so without it the opaque material (BROOK_APPEARANCE_PERFORMANCE) stands in.
-// The saved selection is never rewritten.
+// The appearance as resolved against the backend: the opaque material
+// (BROOK_APPEARANCE_PERFORMANCE) unless the theme in use is Glass. The saved
+// selection is never rewritten.
 uint32_t WmResolvedAppearance(){
     const uint32_t value=WmGetAppearance();
-    return WmBackendBlur()?value:value|BROOK_APPEARANCE_PERFORMANCE;
+    return WmResolvedTheme()==BROOK_THEME_GLASS?value&~uint32_t(BROOK_APPEARANCE_PERFORMANCE):
+                                                value|BROOK_APPEARANCE_PERFORMANCE;
 }
-uint32_t WmGetTheme() { return __atomic_load_n(&g_themeId, __ATOMIC_ACQUIRE); }
-const WmPalette& WmCurrentPalette() { return *brook_theme_palette(WmGetTheme()); }
-bool WmSetTheme(uint32_t theme)
+// Every hue's token set and painter palettes, derived once (about thirty
+// tokens of floating-point maths per hue) and immutable afterwards, so the
+// painters read them lock-free on any thread.
+static BrookHueTokens g_hueTokens[BROOK_HUE_COUNT];
+static BrookThemePalette g_themePalettes[BROOK_HUE_COUNT][2][2]; // [hue][dark chrome][glass]
+static bool g_themeTablesReady=false;
+static SpinLock g_themeTablesLock;
+static void EnsureThemeTables(){
+    if(__atomic_load_n(&g_themeTablesReady,__ATOMIC_ACQUIRE))return;
+    SpinLockAcquire(&g_themeTablesLock);
+    if(!g_themeTablesReady){
+        for(unsigned hue=0;hue<BROOK_HUE_COUNT;++hue){
+            brook_hue_derive(hue,&g_hueTokens[hue]);
+            for(unsigned dark=0;dark<2;++dark)for(unsigned glass=0;glass<2;++glass)
+                brook_theme_build_palette(&g_hueTokens[hue],glass?BROOK_THEME_GLASS:
+                                          dark?BROOK_THEME_OPAQUE_DARK:BROOK_THEME_OPAQUE_LIGHT,
+                                          int(dark),&g_themePalettes[hue][dark][glass]);
+        }
+        __atomic_store_n(&g_themeTablesReady,true,__ATOMIC_RELEASE);
+    }
+    SpinLockRelease(&g_themeTablesLock);
+}
+const BrookHueTokens& WmHueTokens(){
+    EnsureThemeTables();
+    const uint32_t hue=brook_selection_hue(WmGetThemeSelection());
+    return g_hueTokens[hue<BROOK_HUE_COUNT?hue:0];
+}
+// Changes with the selection and with what it resolves to (chrome keys).
+uint32_t WmGetTheme() { return WmGetThemeSelection() | WmResolvedTheme() << 16; }
+const WmPalette& WmCurrentPalette() {
+    EnsureThemeTables();
+    const uint32_t s=WmGetThemeSelection();
+    const unsigned resolved=WmResolvedTheme(),hue=brook_selection_hue(s);
+    const unsigned dark=brook_theme_chrome_dark(resolved,brook_selection_mode(s))?1:0;
+    return g_themePalettes[hue<BROOK_HUE_COUNT?hue:0][dark][resolved==BROOK_THEME_GLASS?1:0];
+}
+uint32_t WmContentColour(unsigned index){
+    const uint32_t s=WmGetThemeSelection();
+    const unsigned mode=brook_selection_mode(s);
+    const BrookContentTokens& c=WmHueTokens().content[brook_theme_content_dark(WmResolvedTheme(),mode)?1:0];
+    switch(index){
+    case BROOK_CONTENT_BACKGROUND: return c.background;
+    case BROOK_CONTENT_INK: return c.ink;
+    case BROOK_CONTENT_DIM: return c.dim;
+    case BROOK_CONTENT_LINE: return c.line;
+    case BROOK_CONTENT_RAISED: return c.raised;
+    case BROOK_CONTENT_SELECTION: return brook_tint_over(c.selection,c.background);
+    case BROOK_CONTENT_SUNKEN: return c.sunken;
+    case BROOK_CONTENT_ACCENT: return c.accent;
+    case BROOK_CONTENT_ACCENT_HOVER: return c.accentHover;
+    case BROOK_CONTENT_ON_ACCENT: return c.onAccent;
+    default: return 0;
+    }
+}
+// 0xB02 op 1 (older Settings): a legacy palette id chooses its hue.
+bool WmSetTheme(uint32_t legacyPalette)
 {
-    if (!brook_theme_palette(theme)) return false;
-    VfbGuard guard;
-    if(g_chromeSettingsEpoch)++g_chromeSettingsEpoch;
-    __atomic_store_n(&g_themeId, theme, __ATOMIC_RELEASE);
-    CompositorMarkDirty();
-    CompositorWake();
-    return true;
+    if (legacyPalette >= BROOK_LEGACY_PALETTE_COUNT) return false;
+    const uint32_t s=WmGetThemeSelection();
+    return WmSetThemeSelection(BROOK_THEME_SELECTION(brook_selection_theme(s),brook_selection_mode(s),
+                                                     brook_legacy_palette_hue(legacyPalette)));
 }
 
 // Hardware payload name for the desktop build label, read once at activation
@@ -184,7 +281,7 @@ static void WmRestoreTheme()
     if (HardwarePayloadIdRead(g_buildPayloadId, sizeof(g_buildPayloadId)))
         SerialPrintf("WM: build label payload %s\n", g_buildPayloadId);
     else g_buildPayloadId[0] = 0;
-    uint32_t selected = BROOK_THEME_BROOK;
+    BrookThemeSettings themeSettings=brook_theme_settings_init();
     uint32_t selectedScale = 100;
     uint32_t appearance=WmGetAppearance();
     uint32_t taskbarMetrics=BROOK_TASKBAR_DEFAULT;
@@ -229,17 +326,8 @@ static void WmRestoreTheme()
                     }
                 }
                 else if(audioSection) audioControl=brook_audio_control_setting(audioControl,p);
-                else if (desktopSection && strncmp(p, "theme=", 6) == 0)
-                {
-                    p += 6;
-                    if (*p >= '0' && *p < '0' + BROOK_THEME_COUNT)
-                    {
-                        uint32_t value = *p++ - '0';
-                        while (*p == ' ' || *p == '\t' || *p == '\r') ++p;
-                        selected = !*p ? value : BROOK_THEME_BROOK;
-                    }
-                    else selected = BROOK_THEME_BROOK;
-                }
+                else if (desktopSection && brook_theme_settings_line(&themeSettings, p) &&
+                         strncmp(p,"dark=",5)!=0 && strncmp(p,"performance=",12)!=0) {}
                 else if (desktopSection && strncmp(p,"scale=",6)==0) {
                     p+=6;uint32_t value=0,digits=0;
                     while (*p>='0' && *p<='9' && digits<4) {value=value*10+(*p++-'0');++digits;}
@@ -257,17 +345,27 @@ static void WmRestoreTheme()
             }
         }
     }
+    uint32_t selection=brook_theme_settings_selection(&themeSettings);
     char glass[8]{};
     if(FwCfgReadFile("opt/glass",glass,sizeof(glass)-1)) {
-        if(glass[0]=='0'||(glass[0]=='o'&&glass[1]=='f'))appearance|=BROOK_APPEARANCE_PERFORMANCE;
-        else if(glass[0]=='1'||(glass[0]=='o'&&glass[1]=='n'))appearance&=~BROOK_APPEARANCE_PERFORMANCE;
+        // QEMU's glass switch: Glass, or the Opaque theme for the mode.
+        const unsigned mode=brook_selection_mode(selection),hue=brook_selection_hue(selection);
+        if(glass[0]=='0'||(glass[0]=='o'&&glass[1]=='f'))
+            selection=BROOK_THEME_SELECTION(mode==BROOK_MODE_LIGHT?BROOK_THEME_OPAQUE_LIGHT:BROOK_THEME_OPAQUE_DARK,mode,hue);
+        else if(glass[0]=='1'||(glass[0]=='o'&&glass[1]=='n'))
+            selection=BROOK_THEME_SELECTION(BROOK_THEME_GLASS,mode,hue);
     }
-    WmSetAppearance(appearance);
+    WmSetThemeSelection(selection);
+    SerialPrintf("WM: theme %s mode %s accent %s\n",brook_theme_key(brook_selection_theme(selection)),
+                 brook_mode_key(brook_selection_mode(selection)),brook_hue_key(brook_selection_hue(selection)));
+    // Opacity and blur; the dark and performance bits are views of the
+    // selection just set (their saved values were read as aliases above).
+    WmSetAppearance((appearance&~uint32_t(BROOK_APPEARANCE_DARK|BROOK_APPEARANCE_PERFORMANCE))|
+                    (WmGetAppearance()&(BROOK_APPEARANCE_DARK|BROOK_APPEARANCE_PERFORMANCE)));
     WmSetTaskbarMetrics(taskbarMetrics);
     MouseTouchpadSetSpeed(pointerSpeed);
     MouseTouchpadSetTap(touchpadTap!=0);
     WmSetScale(selectedScale);
-    WmSetTheme(selected);
     AudioSetOutputControl(audioControl|(forceMuted?BROOK_AUDIO_MUTED:0));
 }
 

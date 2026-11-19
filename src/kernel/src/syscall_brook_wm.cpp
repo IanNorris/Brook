@@ -222,18 +222,29 @@ int64_t sys_brook_wm_refresh_apps(uint64_t, uint64_t, uint64_t,
     return 0;
 }
 
-// 0xB02: desktop theme query (op 0) or select immutable named palette (op 1).
+// 0xB02: desktop theme (brook_theme.h). Ops 0/1: the legacy palette id
+// (query; set chooses its hue). Ops 2/3: the Clearwater selection word
+// (theme, mode, hue). Op 4: status.
 int64_t sys_brook_wm_theme(uint64_t op, uint64_t theme,
                           uint64_t, uint64_t, uint64_t, uint64_t)
 {
     if (!ProcessCurrent()) return -ESRCH;
-    if (op == 0) return brook::WmGetTheme();
+    if (op == BROOK_THEME_OP_LEGACY_QUERY) return brook_hue_legacy_palette(brook_selection_hue(brook::WmGetThemeSelection()));
+    if (op == BROOK_THEME_OP_QUERY) return brook::WmGetThemeSelection();
+    if (op == BROOK_THEME_OP_SET)
+        return theme <= 0xffffffffULL && brook::WmSetThemeSelection(static_cast<uint32_t>(theme)) ? 0 : -EINVAL;
     // Stage 1.5: whether Glass can be chosen (the active backend can blur its
     // backdrop) and whether it is in use; Settings greys the Glass card.
     if (op == BROOK_THEME_OP_STATUS)
         return (brook::WmBackendBlur() ? BROOK_THEME_STATUS_GLASS_AVAILABLE : 0u) |
                (brook::CompositorGlassActive() ? BROOK_THEME_STATUS_GLASS_ACTIVE : 0u);
-    if (op != 1 || theme > 0xffffffffULL) return -EINVAL;
+    // Stage 2.3: one app content colour of the theme in use (hue, and the
+    // content mode it resolves to), for GTK and native apps.
+    if (op == BROOK_THEME_OP_CONTENT) {
+        if (theme >= BROOK_CONTENT_COUNT) return -EINVAL;
+        return brook::WmContentColour(static_cast<unsigned>(theme));
+    }
+    if (op != BROOK_THEME_OP_LEGACY_SET || theme > 0xffffffffULL) return -EINVAL;
     return brook::WmSetTheme(static_cast<uint32_t>(theme)) ? 0 : -EINVAL;
 }
 

@@ -116,10 +116,23 @@ void MakeIcon() {
 
 ChromeMaterialCache glassCache;
 
-ChromeStyle StyleFor(uint32_t theme, const DesktopMetrics& m, bool glass) {
+// A Clearwater theme as the painters see it: (theme, hue), Glass in Mixed
+// mode (dark chrome). The CPU executor never draws glass material, so every
+// element is opaque except the frame-active-glass case (virgl's material).
+struct GoldenTheme { const char* name; unsigned theme, hue; };
+BrookThemePalette palettes[8];
+const BrookThemePalette* PaletteFor(unsigned index, const GoldenTheme& t) {
+    BrookHueTokens tokens;
+    brook_hue_derive(t.hue, &tokens);
+    brook_theme_build_palette(&tokens, t.theme, brook_theme_chrome_dark(t.theme, BROOK_MODE_MIXED), &palettes[index]);
+    return &palettes[index];
+}
+const BrookThemePalette* currentPalette;
+
+ChromeStyle StyleFor(uint32_t, const DesktopMetrics& m, bool glass) {
     static const FontAtlas* fonts[] = {&g_desktopFont100, &g_desktopFont150, &g_desktopFont200};
     const FontAtlas* font = fonts[m.percent == 100 ? 0 : m.percent == 150 ? 1 : 2];
-    const BrookThemePalette* p = brook_theme_palette(theme);
+    const BrookThemePalette* p = currentPalette;
     ChromeStyle s{p, &m, font, glass, glass ? 200u : 255u, nullptr};
     if (glass) {
         glassCache.Ensure(p->titleActive, p->titleInactive, 200, s.M(DesktopMetrics::TitleBase), s.M(7),
@@ -315,13 +328,24 @@ int main(int argc, char** argv) {
             pos = end + 1;
         }
     }
-    static const char* themeNames[] = {"clearwater", "opal", "smoked"};
-    for (uint32_t theme = 0; theme < BROOK_THEME_COUNT; ++theme)
+    // The three themes in Blue at every scale (stage 2.2), and two more hues
+    // at 100% (stage 2.3: a painter that hard-codes a blue shows up here).
+    static const GoldenTheme themes[] = {
+        {"glass", BROOK_THEME_GLASS, BROOK_HUE_BLUE},
+        {"opaque-light", BROOK_THEME_OPAQUE_LIGHT, BROOK_HUE_BLUE},
+        {"opaque-dark", BROOK_THEME_OPAQUE_DARK, BROOK_HUE_BLUE},
+        {"amber-glass", BROOK_THEME_GLASS, BROOK_HUE_AMBER},
+        {"teal-opaque-light", BROOK_THEME_OPAQUE_LIGHT, BROOK_HUE_TEAL},
+    };
+    for (uint32_t theme = 0; theme < sizeof(themes) / sizeof(themes[0]); ++theme) {
+        currentPalette = PaletteFor(theme, themes[theme]);
         for (const DesktopMetrics* m : {&DesktopMetric100, &DesktopMetric150, &DesktopMetric200}) {
-            const std::string prefix = std::string(themeNames[theme]) + "-" + std::to_string(m->percent) + "-";
+            if (theme >= 3 && m->percent != 100) continue;
+            const std::string prefix = std::string(themes[theme].name) + "-" + std::to_string(m->percent) + "-";
             Frames(prefix, theme, *m);
             Shell(prefix, theme, *m);
         }
+    }
     if (update) {
         std::string text = "# name FNV-1a of the ARGB buffer (alpha included); see test_chrome_goldens.\n";
         for (const auto& e : manifest) text += e.first + " " + e.second + "\n";
