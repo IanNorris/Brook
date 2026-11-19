@@ -52,6 +52,12 @@ uint64_t SchedulerContextSwitchGeneration(unsigned cpu);
 // Yield the current timeslice voluntarily.
 extern "C" void SchedulerYield();
 
+// Most recent context switch on `cpu`: the process switched away from and
+// how long (TSC ticks) it had held the CPU since the previous switch. Read
+// on the same CPU right after being switched in, it names who ran meanwhile.
+struct SchedulerSwitchInfo { uint64_t sequence = 0, fromRanTsc = 0; uint32_t fromPid = 0; bool fromKernel = false, fromIdle = false; };
+SchedulerSwitchInfo SchedulerLastSwitch(uint32_t cpu);
+
 // True once the BSP has dispatched its first process; blocking or yielding
 // before then must not be attempted by drivers that also run during boot.
 bool SchedulerIsRunning();

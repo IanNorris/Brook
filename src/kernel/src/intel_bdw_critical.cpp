@@ -37,6 +37,7 @@
 #include "intel_bdw_poll_pacer.h"
 #include "intel_bdw_prompt_wake.h"
 #include "scheduler.h"
+#include "apic.h"
 #include "smp.h"
 
 inline void* operator new(__SIZE_TYPE__,void* storage) noexcept{return storage;}
@@ -373,6 +374,9 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
         // slice (yielding first to any ready CPU-0 work) instead of a tick.
         void Wait(){
             BdwOverheadScope waitScope(BdwOhYieldWait);
+            // Yield diagnostics (gen 440 starved completion poll): TSC and
+            // APIC tick around the wait, and the CPU's last context switch.
+            tsc(waitBegin);waitBeginTick=ApicTickCount();switchBefore=SchedulerLastSwitch(SmpCurrentCpuIndex());
             if(spinTicks){
                 struct Cpu {Io& io;
                     uint64_t flags(){uint64_t f;__asm__ volatile("pushfq; popq %0":"=r"(f)::"memory");return f;}
@@ -390,9 +394,11 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                 uint64_t f;__asm__ volatile("pushfq; popq %0":"=r"(f)::"memory");
                 if(!(f&0x200)){__asm__ volatile("sti":::"memory");BdwPromptWakeCount(BdwPromptWake().ifRestores);}
             }
-            tsc(waitEnd);
+            tsc(waitEnd);waitEndTick=ApicTickCount();switchAfter=SchedulerLastSwitch(SmpCurrentCpuIndex());
         }
-        void Lock(){*irq=VmmKernelPtCriticalEnter();}
+        void Lock(){*irq=VmmKernelPtCriticalEnter();tsc(lockedTsc);}
+        uint64_t waitBegin=0,lockedTsc=0,waitBeginTick=0,waitEndTick=0;
+        SchedulerSwitchInfo switchBefore{},switchAfter{};
         bool Audit(){
             if(SmpCurrentCpuIndex()!=0)return false;
             BdwOverheadScope scope(BdwOhAudit);
@@ -505,6 +511,27 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                     p.Begin({k,k/10,k/20,k/4},now,expected,result.pollSpinRequested?spinBudget:0);
                     pacer=&p;
                 }
+                // Longest yield of this run: where its time went (hang diagnostics).
+                void noteYield(uint64_t start,bool spin){
+                    uint64_t end=0;io.tsc(end);auto& d=result.diag;++d.yields;
+                    const uint64_t total=end>start?end-start:0;
+                    if(total<=d.longest.totalTicks || !io.waitBegin || !io.waitEnd || !io.lockedTsc)return;
+                    auto& y=d.longest;y={};y.valid=true;y.spin=spin;y.totalTicks=total;
+                    y.unlockTicks=io.waitBegin>start?io.waitBegin-start:0;
+                    y.waitTicks=io.waitEnd>io.waitBegin?io.waitEnd-io.waitBegin:0;
+                    y.lockTicks=io.lockedTsc>io.waitEnd?io.lockedTsc-io.waitEnd:0;
+                    y.auditTicks=end>io.lockedTsc?end-io.lockedTsc:0;
+                    y.apicTicks=uint32_t(io.waitEndTick-io.waitBeginTick);
+                    y.switches=uint32_t(io.switchAfter.sequence-io.switchBefore.sequence);
+                    if(y.switches){y.fromPid=io.switchAfter.fromPid;y.fromKernel=io.switchAfter.fromKernel;
+                        y.fromIdle=io.switchAfter.fromIdle;y.fromRanTicks=io.switchAfter.fromRanTsc;}
+                    y.offsetTicks=start>d.originTsc?start-d.originTsc:0;
+                }
+                // gen 440: one further check under ownership after the
+                // deadline, so a completed job whose poll was starved is not
+                // reset as failed. Never after a failed yield or uncertainty.
+                BdwDeadlineGrace completionGrace{},retirementGrace{};
+                bool graceEligible(){return result.diag.deadline && !result.pollYieldFailed && !fault && owned();}
                 bool pollContinue(){
                     if(!owned() || !inTime())return false;
                     if(result.pollYieldRequested){
@@ -517,7 +544,9 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                         // A job is in flight: keep this CPU out of deep
                         // C-states for its completion polls (governor only).
                         CpuIdleLatencyHint(4000);
+                        io.waitBegin=io.lockedTsc=0;
                         const bool yielded=BdwYieldGpuWait(io);
+                        noteYield(start,slice!=0);
                         io.spinTicks=0;
                         if(!yielded){result.pollYieldFailed=true;fault=true;return false;}
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
@@ -571,13 +600,16 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
                     const auto yieldsBefore=result.pollYields;
                     const auto spinsBefore=result.pollSpins;
-                    const bool more=BdwFirstGpuPoll(*this,firstCompletionPoll);
+                    const bool more=completionGrace.Continue(*this,firstCompletionPoll,[this]{return graceEligible();});
+                    if(completionGrace.used)result.diag.grace|=1;
                     result.completionPollYields+=result.pollYields-yieldsBefore;
                     result.completionPollSpins+=result.pollSpins-spinsBefore;
                     if(!more)return false;
                     sampleRenderFrequency();
 #else
-                    if(!BdwFirstGpuPoll(*this,firstCompletionPoll))return false;
+                    const bool more=completionGrace.Continue(*this,firstCompletionPoll,[this]{return graceEligible();});
+                    if(completionGrace.used)result.diag.grace|=1;
+                    if(!more)return false;
 #endif
                     // The breadcrumb check follows; on success this is the
                     // observing poll, which feeds the completion predictor.
@@ -587,7 +619,9 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                 bool retirementContinue(){
                     if(firstRetirementPoll)beginPacer(retirementPacer,0,khz/2);
                     pacer=&retirementPacer;
-                    return BdwFirstGpuPoll(*this,firstRetirementPoll);
+                    const bool more=retirementGrace.Continue(*this,firstRetirementPoll,[this]{return graceEligible();});
+                    if(retirementGrace.used)result.diag.grace|=2;
+                    return more;
                 }
                 void relax(){io.relax();}
                 bool renderStateReady(){return owned() && gtReady;}

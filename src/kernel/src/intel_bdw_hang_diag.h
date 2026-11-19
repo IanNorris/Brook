@@ -31,6 +31,14 @@ struct BdwSubmitSample {
     bool valid=false;
 };
 struct BdwSubmitSampler {virtual void sampleBefore(BdwSubmitSample&)=0;virtual void sampleAfter(BdwSubmitSample&)=0;};
+// The longest poll yield of a run, split by phase (TSC ticks): unlock, the
+// sleep or spin slice itself, re-taking the page-table lock, re-audit. The
+// APIC tick delta shows whether timer interrupts ran meanwhile; the last
+// context switch into this CPU names who held it before the worker resumed.
+struct BdwHangYieldDiag {
+    uint64_t totalTicks=0,unlockTicks=0,waitTicks=0,lockTicks=0,auditTicks=0,fromRanTicks=0,offsetTicks=0;
+    uint32_t apicTicks=0,switches=0,fromPid=0;bool spin=false,fromKernel=false,fromIdle=false,valid=false;
+};
 struct BdwHangEngineBrief {uint32_t head=0,tail=0,mode=0,control=0,execlistLo=0,execlistHi=0,ringMode=0;};
 
 // Filled inside the critical section for every attempted render job. All
@@ -48,6 +56,8 @@ struct BdwRenderJobDiag {
     // BdwBcsResetResult+1 for the takeover and stop resets (0 = not run).
     uint8_t takeoverReset=0,stopReset=0;
     uint8_t portWrites=0;bool marker=false,captured=false;
+    uint8_t grace=0; // deadline grace used: 1 completion check, 2 retirement check
+    uint32_t yields=0;BdwHangYieldDiag longest{};
     uint8_t deadline=0; // why the render critical section stopped waiting: 1 budget, 2 clock, 3 2000 ms
     uint32_t seen=0,polls=0; // last breadcrumb value read and polls made
     uint32_t nonQuiescent=0;BdwHangEngineBrief busy{}; // last non-quiescent observation
@@ -95,11 +105,13 @@ struct BdwHangBreadcrumb {
     uint32_t objects=0,pages=0,batchLen=0,seen=0;
     uint64_t batch=0,descriptor=0,prepareTsc=0;
     uint8_t engine=0,outcome=0,runFailSite=0,submitSite=0;
-    uint8_t initStage=0,csbSite=0,portWrites=0,flags=0; // flags: 1 captured, 2 marker
+    uint8_t initStage=0,csbSite=0,portWrites=0,flags=0; // flags: 1 captured, 2 marker, 4 late (deadline grace)
     uint32_t ringHead=0,ringTail=0;
     uint32_t execlistBefore=0,csbPtrBefore=0,execlistAfter=0,execlistHiAfter=0,csbPtrAfter=0;
     uint32_t fwAck=0,rcState=0,coreStatus=0,polls=0;
     uint32_t elspUs=0,firstPollUs=0,breadcrumbUs=0,csbUs=0,doneUs=0,maxPollGapUs=0;
+    // Longest yield (us) and its sleep part; pid that held the CPU meanwhile.
+    uint32_t yieldUs=0,yieldWaitUs=0,yieldFromPid=0,yieldFromRanUs=0;
 };
 enum BdwHangOutcome : uint8_t {BdwHangOk=0,BdwHangRecovered=1,BdwHangUncertain=2};
 inline const char* BdwHangOutcomeName(uint8_t o){
@@ -251,6 +263,18 @@ template<class W> void BdwHangHexArray(W& r,const char* name,const uint32_t* v,u
     for(unsigned i=0;i<n;++i){if(i)r.text(",");BdwHangHex(r,v[i]);}
     r.text("]");
 }
+template<class W> void BdwHangYieldJson(W& r,const BdwRenderJobDiag& d,uint64_t khz){
+    const auto& y=d.longest;auto us=[&](uint64_t t)->uint64_t{return khz?t*1000/khz:0;};
+    r.text(",\"yields\":");r.number(d.yields);r.text(",");r.field("grace",d.grace);
+    r.text(",\"longest_yield\":{\"valid\":");r.text(y.valid?"true":"false");
+    r.text(",\"spin\":");r.text(y.spin?"true":"false");
+    r.text(",");r.field("at_us",us(y.offsetTicks));r.text(",");r.field("total_us",us(y.totalTicks));
+    r.text(",");r.field("unlock_us",us(y.unlockTicks));r.text(",");r.field("wait_us",us(y.waitTicks));
+    r.text(",");r.field("lock_us",us(y.lockTicks));r.text(",");r.field("audit_us",us(y.auditTicks));
+    r.text(",");r.field("apic_ticks",y.apicTicks);r.text(",");r.field("switches",y.switches);
+    r.text(",");r.field("from_pid",y.fromPid);r.text(",\"from_kernel\":");r.text(y.fromKernel?"true":"false");
+    r.text(",\"from_idle\":");r.text(y.fromIdle?"true":"false");r.text(",");r.field("from_ran_us",us(y.fromRanTicks));r.text("}");
+}
 template<class W> void BdwHangCrumbJson(W& r,const BdwHangBreadcrumb& b){
     r.text("{");r.field("job",b.job);r.text(",");r.field("pid",b.pid);r.text(",");r.field("ctx",b.ctx);
     r.text(",\"outcome\":\"");r.text(BdwHangOutcomeName(b.outcome));r.text("\",");
@@ -268,7 +292,9 @@ template<class W> void BdwHangCrumbJson(W& r,const BdwHangBreadcrumb& b){
     r.text(",");BdwHangHexField(r,"fw_ack",b.fwAck);r.text(",");BdwHangHexField(r,"rc_state",b.rcState);
     r.text(",");BdwHangHexField(r,"core_status",b.coreStatus);r.text(",");r.field("polls",b.polls);
     r.text(",\"us\":[");r.number(b.elspUs);r.text(",");r.number(b.firstPollUs);r.text(",");r.number(b.breadcrumbUs);
-    r.text(",");r.number(b.csbUs);r.text(",");r.number(b.doneUs);r.text(",");r.number(b.maxPollGapUs);r.text("]}");
+    r.text(",");r.number(b.csbUs);r.text(",");r.number(b.doneUs);r.text(",");r.number(b.maxPollGapUs);r.text("]");
+    r.text(",\"yield\":[");r.number(b.yieldUs);r.text(",");r.number(b.yieldWaitUs);r.text(",");r.number(b.yieldFromPid);
+    r.text(",");r.number(b.yieldFromRanUs);r.text("]}");
 }
 template<class W> void BdwHangCaptureJson(W& r,const BdwHangCapture& c){
     const auto& d=c.diag;
@@ -304,6 +330,7 @@ template<class W> void BdwHangCaptureJson(W& r,const BdwHangCapture& c){
     r.text(",");r.field("breadcrumb",us(d.breadcrumbTsc));r.text(",");r.field("first_csb",us(d.firstCsbTsc));
     r.text(",");r.field("run_end",us(d.runEndTsc));r.text(",");r.field("capture",us(c.captureTsc));
     r.text(",");r.field("max_poll_gap",c.khz?d.maxPollGapTicks*1000/c.khz:0);r.text("}");
+    BdwHangYieldJson(r,d,c.khz);
     r.text(",\"breadcrumb\":{");BdwHangHexField(r,"now",c.completion[0]);r.text(",");BdwHangHexField(r,"now_hi",c.completion[1]);
     r.text(",");BdwHangHexField(r,"started",c.completion[BdwHangStartedOffset/4]);
     r.text(",");BdwHangHexField(r,"started_hi",c.completion[BdwHangStartedOffset/4+1]);r.text("}");

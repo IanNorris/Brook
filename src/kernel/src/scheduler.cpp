@@ -298,6 +298,9 @@ struct PerCpuSchedState {
     Process*         pendingRetire;    // Owns a ProcessRef until post-switch retirement
     volatile uint64_t busyTicks;      // ticks spent running non-idle processes
     volatile uint64_t idleTicks;      // ticks spent in idle process
+    // Last context switch on this CPU (diagnostics; SchedulerLastSwitch).
+    uint64_t switchSeq, lastDispatchTsc, lastFromRanTsc;
+    uint32_t lastFromPid; bool lastFromKernel, lastFromIdle;
 };
 
 static PerCpuSchedState g_perCpu[SCHED_MAX_CPUS] = {};
@@ -1987,6 +1990,15 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
         SchedLockRelease(g_readyLock, runtimeFlags);
     }
     g_perCpu[cpu].currentProcess = newProc;
+    {   // Who held this CPU until now, and for how long (one TSC read).
+        auto& s = g_perCpu[cpu];
+        uint32_t lo, hi; __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+        const uint64_t now = (uint64_t(hi) << 32) | lo;
+        s.lastFromRanTsc = s.lastDispatchTsc && now > s.lastDispatchTsc ? now - s.lastDispatchTsc : 0;
+        s.lastFromPid = oldProc->pid; s.lastFromKernel = oldProc->isKernelThread;
+        s.lastFromIdle = oldProc == s.idleProcess; s.lastDispatchTsc = now;
+        __atomic_store_n(&s.switchSeq, s.switchSeq + 1, __ATOMIC_RELEASE);
+    }
     if (g_perCpu[cpu].cpuEnv) {
         g_perCpu[cpu].cpuEnv->currentPid = newProc->pid;
         g_perCpu[cpu].cpuEnv->currentProcess = reinterpret_cast<uint64_t>(newProc);
@@ -2506,6 +2518,17 @@ void SchedulerYield()
     }
     // DoSwitch claims next + releases g_readyLock (raw) before context_switch.
     DoSwitch(old, next, requeue, /* holdingReadyLock */ true);
+}
+
+SchedulerSwitchInfo SchedulerLastSwitch(uint32_t cpu)
+{
+    SchedulerSwitchInfo info{};
+    if (cpu >= SCHED_MAX_CPUS) return info;
+    const auto& s = g_perCpu[cpu];
+    info.sequence = __atomic_load_n(&s.switchSeq, __ATOMIC_ACQUIRE);
+    info.fromPid = s.lastFromPid; info.fromKernel = s.lastFromKernel; info.fromIdle = s.lastFromIdle;
+    info.fromRanTsc = s.lastFromRanTsc;
+    return info;
 }
 
 bool SchedulerIsRunning()

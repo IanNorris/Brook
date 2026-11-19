@@ -1445,7 +1445,8 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
     const bool ok=t.contextSaved && t.resetComplete && t.patRestored && !t.uncertain && run.ggttCleared &&
         !run.pollYieldFailed && out.sequence.workComplete && out.clearDelivered && out.sequence.released &&
         LiveGpuMatches(entry) && PowerD0(entry.device);
-    if(ok && run.completionEndTicks>run.completionStartTicks)
+    // A deadline-grace completion (starved poll) is not a completion-time sample.
+    if(ok && !run.diag.grace && run.completionEndTicks>run.completionStartTicks)
         completionPredictor.Record(predictionKey,run.completionEndTicks-run.completionStartTicks);
     // gen 400: the job ran but its completion was not observed cleanly (for
     // example an unexpected context-status event). If the engine reset was
