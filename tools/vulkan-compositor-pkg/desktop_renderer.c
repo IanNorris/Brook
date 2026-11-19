@@ -317,7 +317,7 @@ static struct {int app,direct;uint64_t deferNs;uint32_t dominant;
     uint64_t dominance[DESKTOP_APP_REASONS],actions[DESKTOP_APP_ACTIONS],earlyNotifies,overlayCaptureSkips,pointerOnly,pointerOnlyDriven;} g_app;
 static struct {uint64_t evaluated,eligible,eligibleEnters,eligibleExits,latched,rejected,reasons[DESKTOP_DIRECT_REASONS];
     int last,wasEligible;} g_direct;
-static int g_clientScanoutCap,g_directLeaveSent;
+static int g_clientScanoutCap,g_directLeaveSent,g_directStatusKnown;
 static uint64_t g_directLeaveSince,g_directSubmitNs,g_directRingWaitSince;
 static struct DesktopDirectMachine g_directMachine;
 static struct BrookGpuClientScanoutStatus g_directStatus;
@@ -400,9 +400,11 @@ static int direct_scanout_evaluate(int dominant,const struct BrookDesktopLayers 
     return 1;
 }
 static int direct_scanout_status(void){
-    g_directStatus=(struct BrookGpuClientScanoutStatus){0};
-    return !syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_CLIENT_SCANOUT_STATUS,&g_directStatus,0,0,0,0) &&
-        g_directStatus.version==BROOK_GPU_CLIENT_SCANOUT_VERSION;
+    struct BrookGpuClientScanoutStatus status={0};
+    g_directStatusKnown=!syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_CLIENT_SCANOUT_STATUS,&status,0,0,0,0) &&
+        status.version==BROOK_GPU_CLIENT_SCANOUT_VERSION;
+    if(g_directStatusKnown)g_directStatus=status;
+    return g_directStatusKnown;
 }
 static void direct_scanout_leave(void){
     if(g_directMachine.state==DESKTOP_DIRECT_SCANNING){
@@ -411,8 +413,11 @@ static void direct_scanout_leave(void){
         if(g_trackDisplayed)g_trackDisplayed->valid=0;
         g_directLeaveSince=monotonic_ns();
     }
-    if(g_directMachine.held && !g_directLeaveSent &&
+    if(!g_directMachine.held)return;
+    if(!g_directLeaveSent &&
        !syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_CLIENT_SCANOUT_LEAVE,0,0,0,0,0))g_directLeaveSent=1;
+    if(desktop_stop_drain_expired(g_directLeaveSince,monotonic_ns()))
+        renderer_exit_for_restart("client_scanout_release_unknown",0);
 }
 /* Only an unambiguous snapshot can retire an offer. PRESENTED is tied to
  * observing the client front, while SAFE also waits for latch-away and any
@@ -446,7 +451,8 @@ static uint64_t direct_scanout_poll(void){
         if(offer->scanoutHeld && offer->packet.identity.inode==released[i].buffer)offer->scanoutHeld=0;
     }
     if(n)desktop_gpu_channel_flush(&g_gpuChannel);
-    if((g_directStatus.flags&BROOK_GPU_CLIENT_SCANOUT_RESTORING) || !g_directMachine.held)direct_scanout_leave();
+    if(g_directMachine.fullDrawOwed || (g_directStatus.flags&BROOK_GPU_CLIENT_SCANOUT_RESTORING) ||
+       !g_directMachine.held)direct_scanout_leave();
     if(!g_directMachine.held)g_directLeaveSent=0;
     return latched;
 }
@@ -1183,8 +1189,6 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     g_directRingWaitSince=0;
     if(g_directMachine.held){
         direct_scanout_leave();
-        if(desktop_stop_drain_expired(g_directLeaveSince,monotonic_ns()))
-            renderer_exit_for_restart("client_scanout_release_unknown",0);
         result=2;stage="client_scanout_restore";goto done;
     }
     const int forceFull=g_directMachine.fullDrawOwed;
@@ -1927,12 +1931,17 @@ static void stats_publish(uint64_t now){
                 desktop_app_action_names[a],(unsigned long long)g_app.actions[a]);
             used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"}},\"direct_scanout\":{\"mode\":\"%s\",\"evaluated\":%llu,\"eligible\":%llu,"
                 "\"frames\":%llu,\"enters\":%llu,\"exits\":%llu,\"latched\":%llu,\"released\":%llu,\"rejected\":%llu,"
-                "\"held\":%u,\"full_draw_owed\":%d,\"last\":\"%s\",\"reasons\":{",g_directModeNames[g_app.direct],
+                "\"held\":%u,\"full_draw_owed\":%d,\"kernel_status_known\":%d,\"kernel_front\":%llu,"
+                "\"kernel_armed\":%llu,\"kernel_queued\":%llu,\"kernel_flags\":%u,\"restores\":%llu,"
+                "\"last\":\"%s\",\"reasons\":{",g_directModeNames[g_app.direct],
                 (unsigned long long)g_direct.evaluated,(unsigned long long)g_direct.eligible,(unsigned long long)g_directMachine.frames,
                 (unsigned long long)(g_app.direct==DIRECT_MODE_SHADOW?g_direct.eligibleEnters:g_directMachine.enters),
                 (unsigned long long)(g_app.direct==DIRECT_MODE_SHADOW?g_direct.eligibleExits:g_directMachine.exits),
                 (unsigned long long)g_direct.latched,(unsigned long long)g_directMachine.released,(unsigned long long)g_direct.rejected,
-                g_directMachine.held,g_directMachine.fullDrawOwed,desktop_direct_reason_names[g_direct.last]);
+                g_directMachine.held,g_directMachine.fullDrawOwed,g_directStatusKnown,
+                (unsigned long long)g_directStatus.front,(unsigned long long)g_directStatus.armed,
+                (unsigned long long)g_directStatus.queued,g_directStatus.flags,(unsigned long long)g_directStatus.restores,
+                desktop_direct_reason_names[g_direct.last]);
             for(unsigned r=1;r<DESKTOP_DIRECT_REASONS;++r)used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"%s\"%s\":%llu",r>1?",":"",
                 desktop_direct_reason_names[r],(unsigned long long)g_direct.reasons[r]);
             used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"}}}\n");
