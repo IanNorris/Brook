@@ -87,6 +87,7 @@ extern "C" int VfsLstatPath(const char*,VnodeStat* out){assert(mounted);*out={};
     return Is("payload")||Is("unmount")?-2:0;
 }
 extern "C" int VfsStatPath(const char*,VnodeStat* out){assert(mounted);*out={};out->size=1;out->mode=0100755;return 0;}
+int VfsReadlink(const char*,char*,uint64_t){return -22;}
 int VfsMountNamespaceBindAt(MountNamespace*,const VfsPath&,const VfsPath&,const char* from,const char* to,bool){
     assert(roots&&mounted&&target&&!std::strcmp(from,"/nix/home/brook")&&!std::strcmp(to,"/data/home"));
     if(Is("home"))return -12;homeBound=true;return 0;
