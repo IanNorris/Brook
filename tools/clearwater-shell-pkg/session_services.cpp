@@ -152,8 +152,9 @@ bool IconName(const std::string& name, uint32_t (&out)[TrayIconWords])
 
 struct Item {
     std::string bus, owner, path, menu;
-    PendingCall refresh;
+    PendingCall refresh, activation;
     ChromeTrayItem view{};
+    bool isMenu = false;
     bool visible = false;
     bool dirty = true;
 };
@@ -349,6 +350,7 @@ struct Session {
         ChromeTrayItem view{};
         view.id = item.view.id;
         item.visible = true;
+        item.isMenu = false;
         item.menu.clear();
         std::string name, attention;
         uint32_t attentionPixels[TrayIconWords]{};
@@ -365,6 +367,7 @@ struct Session {
             else if (Same(key, "IconPixmap")) view.hasIcon = Pixels(value, view.icon);
             else if (Same(key, "AttentionIconPixmap")) hasAttention = Pixels(value, attentionPixels);
             else if (Same(key, "Menu") && text && dbus_validate_path(text, nullptr)) item.menu = text;
+            else if (Same(key, "ItemIsMenu")) item.isMenu = Boolean(value, false);
             else if (Same(key, "ToolTip") && dbus_message_iter_get_arg_type(&value) == DBUS_TYPE_STRUCT) {
                 auto fields = Into(value);
                 dbus_message_iter_next(&fields);
@@ -453,16 +456,39 @@ struct Session {
         return true;
     }
 
-    void ItemAction(const Item& item, const char* member, const TrayInput& event)
+    void ItemAction(Item& item, const char* member, const TrayInput& event)
     {
+        if (event.kind == TrayInputKind::Activate && item.isMenu) {
+            FetchMenu(item, 0);
+            return;
+        }
         auto m = Hold(dbus_message_new_method_call(item.owner.c_str(), item.path.c_str(), ItemInterface, member));
         if (!m) return;
         if (event.kind == TrayInputKind::Scroll) {
             const char* orientation = "vertical";
             dbus_message_append_args(m.get(), DBUS_TYPE_INT32, &event.argument, DBUS_TYPE_STRING, &orientation, DBUS_TYPE_INVALID);
         } else dbus_message_append_args(m.get(), DBUS_TYPE_INT32, &event.x, DBUS_TYPE_INT32, &event.y, DBUS_TYPE_INVALID);
+        if (event.kind == TrayInputKind::Activate) {
+            if (item.activation) return;
+            DBusPendingCall* pending = nullptr;
+            if (dbus_connection_send_with_reply(bus, m.get(), &pending, 2000) && pending)
+                item.activation.reset(pending);
+            else FetchMenu(item, 0);
+            return;
+        }
         dbus_message_set_no_reply(m.get(), true);
         Send(std::move(m));
+    }
+
+    void FinishActivations()
+    {
+        for (auto& item : items) {
+            if (!item.activation || !dbus_pending_call_get_completed(item.activation.get())) continue;
+            auto reply = Hold(dbus_pending_call_steal_reply(item.activation.get()));
+            item.activation.reset();
+            if (item.visible && (!reply || dbus_message_get_type(reply.get()) != DBUS_MESSAGE_TYPE_METHOD_RETURN))
+                FetchMenu(item, 0);
+        }
     }
 
     void MenuSelect(const Item& item, int32_t id)
@@ -617,6 +643,7 @@ struct Session {
         switch (e.kind) {
         case TrayInputKind::Activate: ItemAction(*item, "Activate", e); break;
         case TrayInputKind::Context:
+            item->activation.reset();
             if (!FetchMenu(*item, 0)) ItemAction(*item, "ContextMenu", e);
             break;
         case TrayInputKind::Scroll: ItemAction(*item, "Scroll", e); break;
@@ -712,6 +739,7 @@ int RunSessionServices(TrayPublish publish, TrayReadInput readInput, int parent)
         while (dbus_connection_read_write_dispatch(connection, 50)) {
             if (parent && getppid() != parent) { stopping = true; break; }
             service.RefreshItems();
+            service.FinishActivations();
             for (unsigned i = 0; i < 32; ++i) {
                 TrayInput input{};
                 const int status = readInput(input);

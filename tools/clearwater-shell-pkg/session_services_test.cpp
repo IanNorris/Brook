@@ -21,8 +21,11 @@ constexpr char Menu[] = "com.canonical.dbusmenu";
 constexpr char Notes[] = "org.freedesktop.Notifications";
 constexpr char NotesPath[] = "/org/freedesktop/Notifications";
 int stateFd, inputFd;
-bool activated = false, scrolled = false, menuClicked = false, actionInvoked = false, closed = false;
+bool scrolled = false, menuClicked = false, actionInvoked = false, closed = false;
+bool itemIsMenu = false, rejectActivation = false;
+unsigned activateCalls = 0;
 const char* status = "Active";
+const char* title = "Steam fixture";
 DBusConnection* peer;
 ChromeTrayState state{};
 int received = 0;
@@ -105,7 +108,7 @@ DBusHandlerResult Fake(DBusConnection* bus, DBusMessage* msg, void*)
         DBusMessageIter out, properties, pair, variant;
         dbus_message_iter_init_append(reply, &out);
         dbus_message_iter_open_container(&out, DBUS_TYPE_ARRAY, "{sv}", &properties);
-        StringProperty(properties, "Title", "Steam fixture");
+        StringProperty(properties, "Title", title);
         StringProperty(properties, "Status", status);
         IconPixmapProperty(properties);
         const char* key = "Menu", *value = "/Menu";
@@ -115,6 +118,14 @@ DBusHandlerResult Fake(DBusConnection* bus, DBusMessage* msg, void*)
         dbus_message_iter_append_basic(&variant, DBUS_TYPE_OBJECT_PATH, &value);
         dbus_message_iter_close_container(&pair, &variant);
         dbus_message_iter_close_container(&properties, &pair);
+        const char* menuKey = "ItemIsMenu";
+        const dbus_bool_t isMenu = itemIsMenu;
+        assert(dbus_message_iter_open_container(&properties, DBUS_TYPE_DICT_ENTRY, nullptr, &pair));
+        assert(dbus_message_iter_append_basic(&pair, DBUS_TYPE_STRING, &menuKey));
+        assert(dbus_message_iter_open_container(&pair, DBUS_TYPE_VARIANT, "b", &variant));
+        assert(dbus_message_iter_append_basic(&variant, DBUS_TYPE_BOOLEAN, &isMenu));
+        assert(dbus_message_iter_close_container(&pair, &variant));
+        assert(dbus_message_iter_close_container(&properties, &pair));
         dbus_message_iter_close_container(&out, &properties);
         send(reply);
     } else if (dbus_message_is_method_call(msg, Menu, "GetLayout")) {
@@ -127,7 +138,9 @@ DBusHandlerResult Fake(DBusConnection* bus, DBusMessage* msg, void*)
         send(reply);
     } else if (dbus_message_is_method_call(msg, Item, "Activate")) {
         assert(dbus_message_has_signature(msg, "ii"));
-        activated = true;
+        ++activateCalls;
+        send(rejectActivation ? dbus_message_new_error(msg, DBUS_ERROR_UNKNOWN_METHOD, "This app only provides a menu")
+                              : dbus_message_new_method_return(msg));
     } else if (dbus_message_is_method_call(msg, Item, "Scroll")) {
         assert(dbus_message_has_signature(msg, "is"));
         scrolled = true;
@@ -242,12 +255,38 @@ int main()
     const uint32_t id = state.items[0].id;
     Action(TrayInputKind::Activate, id);
     Action(TrayInputKind::Scroll, id, 120);
-    Wait([] { return activated && scrolled; });
+    Wait([] { return activateCalls == 1 && scrolled; });
+    assert(state.menuCount == 0);
     Action(TrayInputKind::Context, id);
     Wait([] { return state.menuCount == 1; });
     assert(std::strcmp(state.menu[0].label, "Show Library") == 0);
     Action(TrayInputKind::MenuSelect, id, 41);
     Wait([] { return menuClicked && state.menuCount == 0; });
+
+    itemIsMenu = true;
+    title = "Steam menu-only fixture";
+    auto* refresh = dbus_message_new_signal(path, Item, "NewTitle");
+    assert(dbus_connection_send(peer, refresh, nullptr));
+    dbus_message_unref(refresh);
+    Wait([] { return std::strcmp(state.items[0].title, title) == 0; });
+    Action(TrayInputKind::Activate, id);
+    Wait([] { return state.menuCount == 1; });
+    assert(activateCalls == 1);
+    Action(TrayInputKind::DismissMenu, id);
+    Wait([] { return state.menuCount == 0; });
+
+    itemIsMenu = false;
+    rejectActivation = true;
+    title = "Steam no Activate fixture";
+    refresh = dbus_message_new_signal(path, Item, "NewTitle");
+    assert(dbus_connection_send(peer, refresh, nullptr));
+    dbus_message_unref(refresh);
+    Wait([] { return std::strcmp(state.items[0].title, title) == 0; });
+    Action(TrayInputKind::Activate, id);
+    Wait([] { return state.menuCount == 1; });
+    assert(activateCalls == 2);
+    Action(TrayInputKind::DismissMenu, id);
+    Wait([] { return state.menuCount == 0; });
 
     for (const char* value : {"NeedsAttention", "Passive"}) {
         status = value;
