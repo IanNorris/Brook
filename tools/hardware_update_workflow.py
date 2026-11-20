@@ -73,8 +73,17 @@ class UpdateRun:
             initrd={'path':str(Path(initrd_path).resolve()),'bytes':len(initrd),'sha256':hashlib.sha256(initrd).hexdigest()})
         try:
             self.save(state='receiver_launch_dispatched')
-            self.bridge.guest_run(session,tx,[helpers[helper],boot,tx],cwd='/tmp',uid=0,wait_s=2)
-            listening=self.wait_job(session,tx,lambda r:'HWUPDATE_LISTENING' in r.get('stdout',{}).get('text',''))
+            argv=[helpers[helper],boot,tx]
+            if helper=='system':argv.append('--require-slot-aware')
+            self.bridge.guest_run(session,tx,argv,cwd='/tmp',uid=0,wait_s=2)
+            try:
+                listening=self.wait_job(session,tx,lambda r:'HWUPDATE_LISTENING' in r.get('stdout',{}).get('text',''))
+            except RuntimeError as error:
+                job=error.args[0] if error.args else None
+                if helper=='system' and isinstance(job,dict) and job.get('exit',{}).get('code')==2:
+                    raise RuntimeError('The booted system receiver lacks running-slot support. '
+                                       'Use authorized maintenance to stage a matching updater before retrying.') from error
+                raise
             self.save(state='receiver_listening',job=listening)
             upload_start=self.clock()
             if pace_bytes_per_second is None:result=self.uploader(data['host'],port,key,boot,tx,kernel,initrd,activate)

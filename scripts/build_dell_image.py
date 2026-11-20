@@ -204,6 +204,12 @@ def main():
     if subprocess.check_output(['mtype', '-i', str(a.output / 'INITRD.IMG'), '::/BOOT/HWBULK.ELF']) != helper.read_bytes():
         sys.exit('HWBULK.ELF readback mismatch')
 
+    # System updates must use the same running-slot ABI as this kernel.
+    system_updater = a.output / 'HWUPSYS.ELF'
+    run([os.environ['MUSL_CC'], '-static', '-O2', '-Wall', '-Wextra', '-Werror',
+         '-DBROOK_UPDATE_SYSTEM', ROOT / 'tools/hardware_update.c', '-o', system_updater])
+    run(['mcopy', '-o', '-i', a.output / 'INITRD.IMG', system_updater, '::/BOOT/HWUPSYS.ELF'])
+
     # 4. Independent verification
     verify = [sys.executable, ROOT / 'scripts/verify_guarded_desktop_candidate.py', '--candidate', a.output,
               '--source', source, '--reference', source, '--build', build, '--expected-kernel', sha(kernel),
@@ -211,7 +217,7 @@ def main():
               '--allow-vulkan-desktop', '--allow-vulkan-async-partial', '--allow-dell-bcs-present',
               '--allow-ac-loss-poweroff', '--expected-vulkan-supervisor', sha(supervisor),
               '--expected-vulkan-renderer', sha(renderer), '--expected-gpu-provider', sha(provider)]
-    verify += clearwater_verify
+    verify += clearwater_verify + ['--expected-system-updater', sha(system_updater)]
     verify += [flag for name, flag in VERIFY_ALLOW.items() if options.get(name) == 'ON']
     if not a.show_kernel_console:
         verify.append('--allow-hidden-kernel-console')
@@ -227,6 +233,7 @@ def main():
         'initrd_sha256': sha(a.output / 'INITRD.IMG'), 'source_initrd_sha256': SOURCE_INITRD_SHA,
         'packages': packages,
         'bulk_helper': {'source': 'tools/hardware_bulk.c', 'sha256': sha(helper)},
+        'system_updater': {'source': 'tools/hardware_update.c', 'sha256': sha(system_updater)},
         'boot_services': {name: {'source': str(path), 'sha256': sha(path), 'runtime_store_paths': runtime_paths(path)}
                           for name, path in boot_services.items()},
     }

@@ -3,7 +3,7 @@
 
 Launches /boot/HWUPSYS.ELF on the attached boot, then uses the BRPROMOT protocol to make the
 verified older pair (exact kernel/initrd identity required) the newest selection, without rewriting
-any payload. One attempt only: the output directory is created exclusively and holds receipt.json
+any payload. It requires the running-slot-aware receiver packaged with the kernel. One attempt only: the output directory is created exclusively and holds receipt.json
 with the transaction ID. On any uncertain outcome inspect that SAME job with hw_job; never rerun.
 
 Usage (repo root): python3 scripts/hardware_promote_slot.py --session S --key-file K --slot 0|1
@@ -42,12 +42,16 @@ tx = uuid.uuid4().hex
 save(state='prepared', session=a.session, boot_id=boot, transaction_id=tx, slot=a.slot,
      expected_generation=a.expected_generation, activate=a.activate,
      kernel_sha256=hashlib.sha256(kernel).hexdigest(), initrd_sha256=hashlib.sha256(initrd).hexdigest())
-job = h.guest_run(a.session, tx, ['/boot/HWUPSYS.ELF', boot, tx], cwd='/tmp', uid=0, wait_s=2)
+job = h.guest_run(a.session, tx, ['/boot/HWUPSYS.ELF', boot, tx, '--require-slot-aware'], cwd='/tmp', uid=0, wait_s=2)
 save(state='helper_dispatched', job_initial=job)
 end = time.monotonic() + 60
 while 'HWUPDATE_LISTENING' not in job.get('stdout', {}).get('text', ''):
     if job.get('state') in ('completed', 'failed') or time.monotonic() > end:
-        save(state='helper_not_listening', job=job); sys.exit('helper did not listen; inspect job ' + tx)
+        save(state='helper_not_listening', job=job)
+        if job.get('exit',{}).get('code')==2:
+            sys.exit('The booted system receiver lacks running-slot support. '
+                     'Use authorized maintenance to stage a matching updater before retrying.')
+        sys.exit('helper did not listen; inspect job ' + tx)
     job = h.job(a.session, tx, wait_s=2)
 save(state='helper_listening')
 try:

@@ -23,7 +23,7 @@ def main():
     p.add_argument('--activate',action='store_true');p.add_argument('--restart',action='store_true')
     p.add_argument('--expected-payload-id')
     p.add_argument('--boot-timeout-s',type=int,default=120,help='Observe the same restart for 1..900s; a timeout never retries it')
-    p.add_argument('--helper',choices=['usb','system'],default='usb',help='Select the explicitly provisioned update target')
+    p.add_argument('--helper',choices=['usb','system'],default='usb',help='System requires the running-slot-aware receiver packaged with the kernel')
     p.add_argument('--pace-bytes-per-second',type=int,help='Optional Linux TCP pacing cap for the upload')
     a=p.parse_args()
     bridge = Hardware()

@@ -71,7 +71,16 @@ class Tests(unittest.TestCase):
         result=UpdateRun(self.bridge,self.output,self.uploader,self.clock.time,self.clock.sleep).execute(
             'original',self.key,self.kernel,self.initrd,True,helper='system')
         self.assertEqual(result['helper'],'system')
-        self.assertEqual([x for x in self.bridge.calls if x[0]=='run'][0][3][0],'/boot/HWUPSYS.ELF')
+        argv=[x for x in self.bridge.calls if x[0]=='run'][0][3]
+        self.assertEqual(argv[0],'/boot/HWUPSYS.ELF')
+        self.assertEqual(argv[-1],'--require-slot-aware')
+    def test_system_refuses_old_helper(self):
+        with patch.object(self.bridge,'job',return_value={'state':'completed','exit':{'code':2}}):
+            with self.assertRaisesRegex(RuntimeError,'lacks running-slot support'):
+                UpdateRun(self.bridge,self.output,self.uploader,self.clock.time,self.clock.sleep).execute(
+                    'original',self.key,self.kernel,self.initrd,True,helper='system')
+        self.assertFalse(self.bridge.activated)
+        self.assertEqual(self.receipt()['last_stage'],'receiver_launch_dispatched')
     def test_invalid_pacing_prevents_launch(self):
         for rate in (0,-1,True,1<<31):
             with self.subTest(rate=rate),self.assertRaises(ValueError):

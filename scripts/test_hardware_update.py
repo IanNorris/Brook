@@ -25,12 +25,17 @@ def hashes():
     for p in files:
         with p.open('rb') as stream:result[str(p.relative_to(out))]=hashlib.file_digest(stream,'sha256').hexdigest()
     return result
-def run_case(name,action,expected,unchanged=True,failure=None):
+def run_case(name,action,expected,unchanged=True,failure=None,boot_slot=None):
     before=hashes()
     with socket.socket() as r:r.bind(('127.0.0.1',0));port=r.getsockname()[1]
     env={**os.environ,'BROOK_UPDATE_TEST_ROOT':str(out),'BROOK_UPDATE_TEST_KEY':str(out/'key'),
         'BROOK_UPDATE_TEST_LOCK':str(out/'lock'),'BROOK_UPDATE_TEST_PORT':str(port)}
     if failure:env['BROOK_UPDATE_TEST_FAILURE']=failure
+    if boot_slot is not None:
+        (out/'boot-slot').write_bytes(boot_slot)
+        env['BROOK_UPDATE_TEST_BOOT_SLOT']=str(out/'boot-slot')
+    else:
+        env.pop('BROOK_UPDATE_TEST_BOOT_SLOT',None)
     with (out/(name+'.log')).open('w') as log:
         proc=subprocess.Popen([str(a.program.resolve()),boot,tx],env=env,stdout=log,stderr=subprocess.STDOUT)
         try:
@@ -158,5 +163,66 @@ results.append(run_case('promote-invalid-older',lambda port:rejected_promotion(p
 (out/'SELECT0.BIN').write_bytes(record(7,0,kernel,initrd))
 (out/'SELECT1.BIN').write_bytes(record(2**64-1,1,kernel,initrd))
 results.append(run_case('promote-generation-overflow',lambda port:rejected_promotion(port,14),14))
+# System ESP selection follows live loader provenance even when both disk
+# pairs hash correctly and the loader deliberately chose the older one.
+older=record(41,0,kernel,initrd)
+newer=record(42,1,kernel_b,initrd_b)
+(out/'SELECT0.BIN').write_bytes(older)
+(out/'SELECT1.BIN').write_bytes(newer)
+with (out/'B/KERNEL.ELF').open('r+b') as f:f.write(kernel_b)
+with (out/'B/INITRD.IMG').open('r+b') as f:f.write(initrd_b)
+(out/'BOOTSTAT.BIN').write_bytes(bytes(1024))
+def boot_context(mode, generation=0, slot=0, selector=None):
+    return struct.pack('<IIQII32s',1,mode,generation,slot,0,
+                       hashlib.sha256(selector).digest() if selector is not None else bytes(32))
+def rejected_system(port,code):
+    with socket.create_connection(('127.0.0.1',port)) as c:
+        c.sendall(b'BRUPLOAD'+key.encode()+boot.encode()+tx.encode());assert line(c)['code']==code
+def confirm_plan_then_abort(port,generation,slot,selector):
+    with socket.create_connection(('127.0.0.1',port)) as c:
+        assert authenticate(c,key,boot,tx)=={
+            'state':'ready','generation':generation,'slot':slot,'selector':selector}
+results.append(run_case('tracked-legacy-unknown',lambda port:rejected_system(port,29),29))
+results.append(run_case('tracked-no-slot',lambda port:rejected_system(port,29),29,
+                        boot_slot=boot_context(0)))
+results.append(run_case('tracked-explicit-recovery',lambda port:confirm_plan_then_abort(port,43,0,0),16,
+                        boot_slot=boot_context(2)))
+results.append(run_case('malformed-live-boot-key',lambda port:rejected_system(port,29),29,
+                        boot_slot=boot_context(3,41,0,older)))
+results.append(run_case('stale-live-generation',lambda port:rejected_system(port,29),29,
+                        boot_slot=boot_context(1,40,0,older)))
+results.append(run_case('malformed-live-abi-length',lambda port:rejected_system(port,29),29,
+                        boot_slot=boot_context(1,41,0,older)[:-1]))
+results.append(run_case('live-selector-digest-mismatch',lambda port:rejected_system(port,29),29,
+                        boot_slot=boot_context(1,41,0,newer)))
+live=boot_context(1,41,0,older)
+def swap_selector_during_stage(port):
+    with socket.create_connection(('127.0.0.1',port)) as c:
+        plan=authenticate(c,key,boot,tx)
+        assert (plan['generation'],plan['slot'],plan['selector'])==(43,1,1),plan
+        c.sendall(record(43,1,kernel,initrd)+kernel+initrd)
+        assert line(c)['state']=='staged'
+        (out/'SELECT0.BIN').write_bytes(record(40,0,kernel,initrd))
+        c.sendall(b'ACTIVATE')
+        assert line(c)['code']==30
+before=hashes()
+results.append(run_case('selectors-change-after-stage',swap_selector_during_stage,30,False,boot_slot=live))
+assert all(hashes()[name]==digest for name,digest in before.items() if name!='SELECT0.BIN')
+(out/'SELECT0.BIN').write_bytes(older)
+def upload_live_fallback(port):
+    with socket.create_connection(('127.0.0.1',port)) as c:
+        plan=authenticate(c,key,boot,tx)
+        assert (plan['generation'],plan['slot'],plan['selector'])==(43,1,1),plan
+        c.sendall(record(43,1,kernel,initrd)+kernel+initrd)
+        assert line(c)['state']=='staged'
+        c.sendall(b'ACTIVATE')
+        assert line(c)['state']=='activated'
+before=hashes()
+results.append(run_case('update-while-running-fallback',upload_live_fallback,0,False,boot_slot=live))
+after=hashes()
+assert all(after[name]==digest for name,digest in before.items() if name.startswith('A/'))
+assert (out/'SELECT0.BIN').read_bytes()==older
+assert (out/'SELECT1.BIN').read_bytes()==record(43,1,kernel,initrd)
+
 (out/'result.json').write_text(json.dumps({'passed':True,'cases':results},indent=2)+'\n')
 print('HARDWARE_UPDATE_HOST_PASS')

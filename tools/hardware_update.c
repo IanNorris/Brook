@@ -14,12 +14,17 @@
 #include <sys/stat.h>
 #ifdef BROOK_UPDATE_SYSTEM
 #include <sys/statfs.h>
+#include <sys/ioctl.h>
 #endif
 #include <unistd.h>
+#include "../src/shared/brook_system_esp.h"
 #include "../src/shared/update/payload.h"
 #include "../src/shared/update/executable.h"
 static const char* names[6]={"A/KERNEL.ELF","A/INITRD.IMG","B/KERNEL.ELF","B/INITRD.IMG","SELECT0.BIN","SELECT1.BIN"};
 static int directory=-1;
+#ifdef BROOK_UPDATE_SYSTEM
+static int system_esp=-1;
+#endif
 static unsigned mutated;
 static int open_existing(unsigned index) {
     int fd=openat(directory,names[index],O_RDWR|O_CLOEXEC|O_NOFOLLOW);
@@ -70,13 +75,81 @@ static int read_records(uint8_t record[2][128]) {
     }
     return 0;
 }
+static int selectors_unchanged(const uint8_t before[2][128]) {
+    uint8_t now[2][128];
+    return !read_records(now) && BrookUpdateEqual(before[0],now[0],sizeof(now[0])) &&
+        BrookUpdateEqual(before[1],now[1],sizeof(now[1]));
+}
+
+#if defined(BROOK_UPDATE_SYSTEM) || defined(BROOK_UPDATE_TEST)
+static int load_boot_slot(struct BrookSystemEspBootSlot* slot) {
+    memset(slot,0,sizeof(*slot));
+#ifdef BROOK_UPDATE_TEST
+    const char* fixture=getenv("BROOK_UPDATE_TEST_BOOT_SLOT");
+    if(!fixture){errno=ENOTTY;return -1;}
+    int fd=open(fixture,O_RDONLY|O_CLOEXEC|O_NOFOLLOW);
+    if(fd<0)return -1;
+    uint8_t extra;
+    int ok=!file_read(fd,(uint8_t*)slot,sizeof(*slot))&&read(fd,&extra,1)==0;
+    if(close(fd))ok=0;
+    if(!ok){errno=EINVAL;return -1;}
+    return 0;
+#else
+    return ioctl(system_esp,BROOK_IOCTL_GET_SYSTEM_ESP_BOOT_SLOT,slot);
+#endif
+}
+
+static int journal_absent(void) {
+    struct stat st;
+#ifdef BROOK_UPDATE_TEST
+    const int result=fstatat(directory,"BOOTSTAT.BIN",&st,AT_SYMLINK_NOFOLLOW);
+#else
+    const int result=fstatat(system_esp,"RECOVERY/BOOTSTAT.BIN",&st,AT_SYMLINK_NOFOLLOW);
+#endif
+    return result<0 && errno==ENOENT;
+}
+#endif
+
+// 0: verified live A/B selector, 1: a proven non-slot or legacy boot, -1:
+// missing/stale data on a tracked installation. Never guess a victim there.
+static int running_selector(const uint8_t records[2][128],int* active) {
+#if defined(BROOK_UPDATE_SYSTEM) || defined(BROOK_UPDATE_TEST)
+    struct BrookSystemEspBootSlot boot;
+    if(load_boot_slot(&boot))return errno==ENOTTY && journal_absent()?1:-1;
+    uint8_t empty[32]={0};
+    int digest_is_zero=BrookUpdateEqual(boot.selector_digest,empty,sizeof(empty));
+    if(boot.version!=BROOK_ESP_BOOT_SLOT_VERSION || boot.reserved)return -1;
+    if(boot.mode==BROOK_ESP_BOOT_SLOT_UNTRACKED || boot.mode==BROOK_ESP_BOOT_SLOT_RECOVERY) {
+        if(boot.generation || boot.slot || !digest_is_zero)return -1;
+        return boot.mode==BROOK_ESP_BOOT_SLOT_RECOVERY || journal_absent()?1:-1;
+    }
+    if(boot.mode!=BROOK_ESP_BOOT_SLOT_VERIFIED || !boot.generation || boot.slot>1 || digest_is_zero)return -1;
+    for(unsigned i=0;i<2;++i) {
+        const uint8_t* record=records[i];
+        if(!BrookUpdateRecordValid(record) || BrookUpdateGet64(record+8)!=boot.generation ||
+           BrookUpdateGet32(record+16)!=boot.slot)continue;
+        uint8_t hash[32];
+        BrookUpdateHash(record,128,hash);
+        if(!BrookUpdateEqual(hash,boot.selector_digest,sizeof(hash)))continue;
+        if(pair_valid(record)!=1)return -1;
+        *active=(int)i;
+        return 0;
+    }
+    return -1;
+#else
+    (void)records;
+    (void)active;
+    return 1; // The USB updater never writes the boot-admitted system ESP.
+#endif
+}
 static int write_file(unsigned index,const uint8_t* bytes,size_t length) {
     int fd=open_existing(index);if(fd<0)return -1;
     int result=0;mutated=1;
 #ifdef BROOK_UPDATE_TEST
     const char* failure=getenv("BROOK_UPDATE_TEST_FAILURE");
     if(index>=4 && failure && !strcmp(failure,"selector-short")){
-        (void)write(fd,bytes,32);(void)fsync(fd);close(fd);return -1;
+        if(write(fd,bytes,32)==32)(void)fsync(fd);
+        close(fd);return -1;
     }
 #endif
     while(length) {
@@ -123,13 +196,17 @@ static int serve(int client,const char* key,const char* boot,const char* transac
     uint8_t records[2][128];if(read_records(records))return 11;
     int newest=BrookUpdateNewest(records[0],records[1]);if(newest<0)return 12;
     int active=-1;
-    for(unsigned attempt=0;attempt<2;attempt++){
-        int candidate=attempt?1-newest:newest;
-        int eligibility=pair_valid(records[candidate]);
-        if(eligibility<0)return 27; // Ambiguous media/resource failure: never pick a victim slot.
-        if(eligibility==1){active=candidate;break;}
+    const int running=running_selector(records,&active);
+    if(running<0)return 29;
+    if(running) {
+        for(unsigned attempt=0;attempt<2;attempt++){
+            int candidate=attempt?1-newest:newest;
+            int eligibility=pair_valid(records[candidate]);
+            if(eligibility<0)return 27; // Ambiguous media/resource failure: never pick a victim slot.
+            if(eligibility==1){active=candidate;break;}
+        }
+        if(active<0)return 13;
     }
-    if(active<0)return 13;
     uint64_t generation=BrookUpdateGet64(records[newest]+8);
     if(generation==UINT64_MAX)return 14;
     generation++;
@@ -137,7 +214,7 @@ static int serve(int client,const char* key,const char* boot,const char* transac
         /* Promote only a separately recorded, verified older pair. Keep its
          * existing selector untouched until the new selector is durable. */
         unsigned older=1-(unsigned)newest;
-        if(active!=newest || pair_valid(records[older])!=1 ||
+        if((running && active!=newest) || pair_valid(records[older])!=1 ||
            BrookUpdateGet32(records[older]+16)==BrookUpdateGet32(records[newest]+16))return 28;
         uint8_t expected[128];memcpy(expected,records[older],sizeof(expected));
         BrookUpdatePut64(expected+8,generation);BrookUpdatePut32(expected+124,BrookUpdateCrc(expected,124));
@@ -148,6 +225,7 @@ static int serve(int client,const char* key,const char* boot,const char* transac
         if(network_bytes(client,incoming,sizeof(incoming))||!BrookUpdateEqual(incoming,expected,sizeof(expected)))return 16;
         if(reply(client,"{\"state\":\"staged\",\"storage_modified\":false}\n"))return 21;
         if(network_bytes(client,activate,sizeof(activate))||memcmp(activate,"ACTIVATE",8))return 22;
+        if(!selectors_unchanged(records))return 30;
         if(write_file(4+(unsigned)newest,expected,sizeof(expected)))return 25;
         if(read_records(records)||!BrookUpdateEqual(records[newest],expected,sizeof(expected))||pair_valid(expected)!=1)return 26;
         printf("HWUPDATE_PROMOTED generation=%" PRIu64 " slot=%u transaction=%s reboot_required=1\n",
@@ -173,6 +251,7 @@ static int serve(int client,const char* key,const char* boot,const char* transac
     if(reply(client,"{\"state\":\"staged\",\"storage_modified\":false}\n")){result=21;goto done;}
     uint8_t activate[8];
     if(network_bytes(client,activate,8)||memcmp(activate,"ACTIVATE",8)){result=22;goto done;}
+    if(!selectors_unchanged(records)){result=30;goto done;}
     // Only the inactive pair is modified, and selection is published last.
     if(write_file(slot*2,kernel,kb)||write_file(slot*2+1,initrd,ib)){result=23;goto done;}
     if(pair_valid(incoming)!=1){result=24;goto done;}
@@ -188,14 +267,21 @@ done:
     free(kernel);free(initrd);return result;
 }
 int main(int argc,char** argv) {
-    if(argc!=3||!hex32(argv[1])||!hex32(argv[2])){fputs("usage: HWUPDATE.ELF BOOT_ID32 TRANSACTION_ID32\n",stderr);return 2;}
+    int arguments=argc==3;
+#if defined(BROOK_UPDATE_SYSTEM) || defined(BROOK_UPDATE_TEST)
+    // Host workflows pass this last argument for system updates. An older
+    // receiver rejects it before listening, even on an older fallback pair.
+    arguments|=argc==4&&!strcmp(argv[3],"--require-slot-aware");
+#endif
+    if(!arguments||!hex32(argv[1])||!hex32(argv[2])){
+        fputs("usage: HWUPDATE.ELF BOOT_ID32 TRANSACTION_ID32 [--require-slot-aware]\n",stderr);return 2;
+    }
 #if defined(BROOK_UPDATE_SYSTEM) && !defined(BROOK_UPDATE_TEST)
     if(geteuid()!=0)return 3;
 #endif
-#ifdef BROOK_UPDATE_SYSTEM
-    const char* root="/media/system/UPDATES";const char* keypath="/etc/hardware-update-key";
-#else
-    const char* root="/media/usb/UPDATES";const char* keypath="/etc/hardware-update-key";
+    const char* keypath="/etc/hardware-update-key";
+#if !defined(BROOK_UPDATE_SYSTEM) || defined(BROOK_UPDATE_TEST)
+    const char* root="/media/usb/UPDATES";
 #endif
     const char* marker="/etc/hardware-maintenance";const char* lock="/tmp/hardware-update.lock";unsigned port=1235;
 #ifdef BROOK_UPDATE_TEST
@@ -209,21 +295,28 @@ int main(int argc,char** argv) {
     if(read_error||tail!=0||close_error||!hex32(key))return 3;
     fd=open(lock,O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0600);if(fd<0)return 4;
     if(close(fd))return 4;
-    directory=open(root,O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);int listener=-1,client=-1,result=5;
-    if(directory<0)goto done;
-#ifdef BROOK_UPDATE_SYSTEM
-    /* The system volume is mounted only by the kernel's identity-bound AHCI
-     * admission path. Refuse an unmounted RAM directory or other FS. */
-    struct stat st,parent;struct statfs fs;
+    int listener=-1,client=-1,result=5;
+#if defined(BROOK_UPDATE_SYSTEM) && !defined(BROOK_UPDATE_TEST)
+    /* Open UPDATES from the verified root whose boot slot the ioctl reports.
+     * Refuse a RAM placeholder, foreign mount or over-mounted UPDATES. */
+    system_esp=open("/media/system",O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
+    if(system_esp<0 || ioctl(system_esp,BROOK_IOCTL_VERIFY_SYSTEM_ESP_ROOT,0))goto done;
+    directory=openat(system_esp,"UPDATES",O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
+    if(directory<0 || ioctl(directory,BROOK_IOCTL_VERIFY_SYSTEM_ESP_MEMBER,0))goto done;
+    struct stat st,parent,root_stat;struct statfs fs;
     int selector=open("/etc/ahci-boot-volume",O_RDONLY|O_NOFOLLOW|O_CLOEXEC);
     int target=open("/etc/ahci-write-target",O_RDONLY|O_NOFOLLOW|O_CLOEXEC);
-    if(selector<0 || target<0 || fstat(directory,&st) || stat("/media",&parent) || fstatfs(directory,&fs) ||
+    if(selector<0 || target<0 || fstat(directory,&st) || fstat(system_esp,&root_stat) ||
+       stat("/media",&parent) || fstatfs(directory,&fs) || st.st_dev!=root_stat.st_dev ||
        st.st_dev==parent.st_dev || (uint64_t)fs.f_type!=0x4d44) {
         if(selector>=0)close(selector);
         if(target>=0)close(target);
         goto done;
     }
     close(selector);close(target);
+#else
+    directory=open(root,O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
+    if(directory<0)goto done;
 #endif
     listener=socket(AF_INET,SOCK_STREAM|SOCK_CLOEXEC,0);if(listener<0)goto done;
     struct sockaddr_in address={.sin_family=AF_INET,.sin_port=htons((uint16_t)port),.sin_addr={.s_addr=htonl(INADDR_ANY)}};
@@ -237,8 +330,13 @@ done:
     if(client>=0)close(client);
     if(listener>=0)close(listener);
     if(directory>=0)close(directory);
+#ifdef BROOK_UPDATE_SYSTEM
+    if(system_esp>=0)close(system_esp);
+#endif
     // A failed write locks out further updates until a fresh maintenance boot.
     if(!result||!mutated)unlink(lock);
+    if(result==29)fputs("HWUPDATE: Cannot verify the current system slot; use checked maintenance.\n",stderr);
+    if(result==30)fputs("HWUPDATE: Selectors changed before activation; inspect the current selection.\n",stderr);
     if(result)fprintf(stderr,"HWUPDATE_FAILED code=%d storage_modified=%u\n",result,mutated);
     return result;
 }
