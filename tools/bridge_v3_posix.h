@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -15,6 +16,10 @@
 #include "../src/shared/update/bridge_v3.h"
 #include "../src/shared/update/payload.h"
 #include "../src/third_party/monocypher/monocypher.h"
+
+#if !defined(BROOK_BRIDGE_V3_TEST) && !defined(BROOK_BRIDGE_V3_POLICY_SHA256)
+#error "v3 helpers require the SHA-256 of the boot operator policy"
+#endif
 
 typedef struct {
     int fd;
@@ -78,18 +83,22 @@ static inline int BridgeV3PosixHex(const char *text, uint8_t *result, size_t siz
 }
 
 static inline int BridgeV3PosixFindKey(const uint8_t operator_id[32], uint8_t key[32]) {
-    const char *path = "/etc/bridge-v3-operators";
 #ifdef BROOK_BRIDGE_V3_TEST
-    path = getenv("BROOK_BRIDGE_V3_TEST_ALLOWLIST");
-    if (!path) return 0;
+    const char *path = getenv("BROOK_BRIDGE_V3_TEST_ALLOWLIST");
+    const char *policy = getenv("BROOK_BRIDGE_V3_TEST_POLICY_SHA256");
+#else
+    const char *path = "/etc/bridge-v3-operators";
+    const char *policy = BROOK_BRIDGE_V3_POLICY_SHA256;
 #endif
+    uint8_t expected[32], actual[32];
+    if (!path || !policy || strlen(policy) != 64 || !BridgeV3PosixHex(policy, expected, 32)) return -1;
     const int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
-    if (fd < 0) return 0;
+    if (fd < 0) return -1;
     struct stat st;
     char text[131];
     size_t used = 0;
     int clean = !fstat(fd, &st) && S_ISREG(st.st_mode) && st.st_uid == geteuid() &&
-        !(st.st_mode & 0022) && (st.st_size == 65 || st.st_size == 130);
+        !(st.st_mode & 0022) && (st.st_size == 0 || st.st_size == 65 || st.st_size == 130);
     while (clean && used < sizeof(text)) {
         const ssize_t n = read(fd, text + used, sizeof(text) - used);
         if (n < 0 && errno == EINTR) continue;
@@ -99,12 +108,14 @@ static inline int BridgeV3PosixFindKey(const uint8_t operator_id[32], uint8_t ke
         }
         used += (size_t)n;
     }
-    if (close(fd) || !clean || used != (size_t)st.st_size) return 0;
+    if (close(fd) || !clean || used != (size_t)st.st_size) return -1;
+    BrookUpdateHash((const uint8_t *)text, used, actual);
+    if (!BrookUpdateEqual(expected, actual, sizeof(expected))) return -1;
     uint8_t keys[2][32];
     int found = 0;
     for (size_t i = 0; i < used / 65; ++i) {
         if (text[i * 65 + 64] != '\n' || !BridgeV3PosixHex(text + i * 65, keys[i], 32) ||
-            (i && BrookUpdateEqual(keys[i - 1], keys[i], 32))) return 0;
+            (i && BrookUpdateEqual(keys[i - 1], keys[i], 32))) return -1;
         uint8_t id[32];
         BrookBridgeV3OperatorId(id, keys[i]);
         if (BrookUpdateEqual(id, operator_id, 32)) {
@@ -155,8 +166,10 @@ static inline int BridgeV3PosixAccept(BridgeV3Posix *session, int fd, uint8_t pr
         !BrookBridgeV3DecodeClient(&client, wire) || client.protocol != protocol ||
         client.operation > 31 || !(operations & (1u << client.operation)) ||
         !BrookUpdateEqual(client.boot_id, boot_id, sizeof(boot_id)) ||
-        !BrookUpdateEqual(client.transaction_id, transaction_id, sizeof(transaction_id)) ||
-        !BridgeV3PosixFindKey(client.operator_id, public_key) || !BridgeV3PosixEntropy(random)) {
+        !BrookUpdateEqual(client.transaction_id, transaction_id, sizeof(transaction_id))) return -1;
+    const int policy = BridgeV3PosixFindKey(client.operator_id, public_key);
+    if (policy < 0) fputs("BRIDGE_V3_POLICY_REFUSED\n", stderr);
+    if (policy <= 0 || !BridgeV3PosixEntropy(random)) {
         crypto_wipe(random, sizeof(random));
         return -1;
     }
