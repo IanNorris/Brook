@@ -371,7 +371,7 @@ int main(){
     assert(handle("bridge hardware caps") && reply.find("\"ready\":true")!=std::string::npos && reply.find("\"bytes\":1234")!=std::string::npos);
     const std::string request(32,'1'),boot(32,'a');
     assert(handle("bridge hardware power "+request+" shutdown "+boot) && powerCalls==1 && powerVerb=="shutdown");
-    assert(reply.find("\"stage\":\"sigterm\",\"blocker_count\":2,\"next_signal_ms\":3500,\"blockers\":[{\"pid\":51,\"name\":\"pulse\\\"audio\",\"window\":false,\"service\":false}]}")!=std::string::npos);
+    assert(reply.find("\"stage\":\"sigterm\",\"force_apps_available\":true,\"blocker_count\":2,\"next_signal_ms\":3500,\"blockers\":[{\"pid\":51,\"name\":\"pulse\\\"audio\",\"window\":false,\"service\":false}]}")!=std::string::npos);
     assert(reply.find("\"status\":\"Closing apps - no window: pulse\\\"audio pid 51; SIGKILL in 4 s, or Cancel\"")!=std::string::npos);
     assert(reply.find("\"force_apps_available\":true")!=std::string::npos);
     assert(handle("bridge hardware power "+request+" force_apps "+boot) && powerCalls==2 && powerVerb=="force_apps");
