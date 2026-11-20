@@ -69,7 +69,7 @@ def stage_profile():
                 raise ValueError(f'{source.name} changed during transfer')
             arguments.append(receipt['transfer']['guest_path'])
         journal.save(state='profile_job_dispatched')
-        bridge.guest_run(a.session, job, arguments, cwd='/tmp', uid=0, wait_s=2)
+        bridge.guest_run(a.session, job, arguments, cwd='/tmp', uid=1000, wait_s=2)
         result = journal.wait_job(a.session, job, lambda status: status.get('state') == 'completed',
                                   timeout=a.profile_timeout_s)
         if result.get('exit', {}).get('code') != 0:

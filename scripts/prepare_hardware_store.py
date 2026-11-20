@@ -55,7 +55,7 @@ def profile_tree(source, target, closure, ancestors=()):
 
 def mutable(path):
     return path == 'store' or any(path == root or path.startswith(root+'/')
-        for root in ('profile', '.brook-profile-legacy', 'var', 'home/brook', 'share/applications'))
+        for root in ('profile', 'var', 'home/brook', 'share/applications'))
 
 
 def seed_intel_vulkan(seed, driver, closure):
@@ -172,8 +172,12 @@ def main():
         run('cp', '-a', '--reflink=auto', '--', item, seed/'store'/Path(item).name)
     intel_vulkan = (seed_intel_vulkan(seed, metadata['intelVulkanDriver'], closure)
                     if metadata['intelVulkanDriver'] else None)
-    profile_tree(profile, seed/'.brook-profile-legacy', {Path(p).name for p in closure})
-    (seed/'profile').symlink_to('.brook-profile-legacy')
+    profiles = seed/'var/.brook-profiles'
+    profiles.mkdir(parents=True)
+    profile_tree(profile, profiles/'.brook-profile-legacy', {Path(p).name for p in closure})
+    (profiles/'current').symlink_to('.brook-profile-legacy')
+    (profiles/'store').symlink_to('../../store')
+    (seed/'profile').symlink_to('var/.brook-profiles/current')
     (seed/'share').mkdir()
     (seed/'share/applications').symlink_to('../profile/.brook-launcher')
     (seed/'profile/.brook-launcher').mkdir()

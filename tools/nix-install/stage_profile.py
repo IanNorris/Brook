@@ -23,6 +23,8 @@ GENERATION = re.compile(r"[.]brook-profile-(?:legacy|[0-9a-f]{32})")
 TX = re.compile(r"[0-9a-f]{32}")
 LAUNCHER = ".brook-launcher"
 APP_ALIAS = "../profile/" + LAUNCHER
+PROFILE_HOME = "var/.brook-profiles"
+PROFILE_ALIAS = PROFILE_HOME + "/current"
 
 
 def safe_name(value):
@@ -129,8 +131,11 @@ def durable_text(path, text):
 
 
 def active_generation(nix):
-    current = os.readlink(nix / "profile")
-    if not GENERATION.fullmatch(current) or not (nix / current).is_dir():
+    if os.readlink(nix / "profile") != PROFILE_ALIAS:
+        raise ValueError("Run stage-profile initialize during maintenance first")
+    home = nix / PROFILE_HOME
+    current = os.readlink(home / "current")
+    if not GENERATION.fullmatch(current) or not (home / current).is_dir():
         raise ValueError("Invalid /nix/profile generation")
     apps = nix / "share/applications"
     if os.readlink(apps) != APP_ALIAS or not apps.is_dir():
@@ -138,14 +143,14 @@ def active_generation(nix):
     return current
 
 
-def switch(nix, generation):
-    if not GENERATION.fullmatch(generation) or not (nix / generation).is_dir():
+def switch(home, generation):
+    if not GENERATION.fullmatch(generation) or not (home / generation).is_dir():
         raise ValueError("Invalid profile generation name")
-    temp = nix / ".brook-profile-next"
+    temp = home / ".next"
     temp.unlink(missing_ok=True)
     temp.symlink_to(generation)
-    os.replace(temp, nix / "profile")
-    flush_directory(nix)
+    os.replace(temp, home / "current")
+    flush_directory(home)
 
 
 def manifest_rows(profile):
@@ -184,7 +189,7 @@ def collect_user_overlay(nix, old):
 
 
 def prepare(nix, plan, previous, destination):
-    old = nix / previous
+    old = nix / PROFILE_HOME / previous
     rows, overlay = collect_user_overlay(nix, old)
     manifest = {p["name"].casefold(): (p["name"], p["version"], p["store"])
                 for p in plan["packages"]}
@@ -209,11 +214,6 @@ def prepare(nix, plan, previous, destination):
     launcher = destination / LAUNCHER
     (destination / "share/applications").mkdir(parents=True, exist_ok=True)
     collect(nix / "store", launcher, profile=destination, hardware=True)
-    if nix == Path("/nix"):
-        for directory, _, files in os.walk(destination, followlinks=False):
-            os.chown(directory, DESKTOP_UID, DESKTOP_UID)
-            for file in files:
-                os.chown(Path(directory) / file, DESKTOP_UID, DESKTOP_UID, follow_symlinks=False)
     os.sync()
 
 
@@ -235,7 +235,8 @@ def notify(nix):
 
 
 def apply(nix, plan, digest, transaction, tools):
-    state = nix / ".brook-stage"
+    home = nix / PROFILE_HOME
+    state = home / ".stage"
     state.mkdir(mode=0o700, exist_ok=True)
     target = ".brook-profile-" + transaction
     record = state / (transaction + ".json")
@@ -256,33 +257,34 @@ def apply(nix, plan, digest, transaction, tools):
             counts[result] += 1
         print(json.dumps({"closure": counts}), flush=True)
         if not record.is_file():
-            if (nix / target).exists():
+            if (home / target).exists():
                 raise ValueError("Unjournaled generation requires inspection")
             # Both staging and live generation must be at the same depth.
-            temp = Path(tempfile.mkdtemp(prefix=".brook-profile-building-", dir=nix))
+            temp = Path(tempfile.mkdtemp(prefix=".brook-profile-building-", dir=home))
             try:
                 prepare(nix, plan, previous, temp)
                 temp.chmod(0o755)
-                rename_no_replace(temp, nix / target)
-                flush_directory(nix)
+                rename_no_replace(temp, home / target)
+                flush_directory(home)
             finally:
                 if temp.exists():
                     shutil.rmtree(temp)
             durable_text(record, json.dumps({"previous": previous, "digest": digest}) + "\n")
-        switch(nix, target)
+        switch(home, target)
     notify(nix)
 
 
 def rollback(nix, transaction):
     with mutation_lock(nix):
-        path = nix / ".brook-stage" / (transaction + ".json")
+        home = nix / PROFILE_HOME
+        path = home / ".stage" / (transaction + ".json")
         previous = json.loads(path.read_text())["previous"]
         current = active_generation(nix)
         if current == previous:
             return
         if current != ".brook-profile-" + transaction:
             raise ValueError("A newer profile is active; refusing to roll it back")
-        switch(nix, previous)
+        switch(home, previous)
     notify(nix)
 
 
@@ -290,12 +292,20 @@ def initialize(nix):
     """Migrate a quiescent legacy image. Re-entry resumes an interrupted migration."""
     with mutation_lock(nix):
         profile = nix / "profile"
-        previous = nix / ".brook-profile-legacy"
+        home = nix / PROFILE_HOME
+        previous = home / ".brook-profile-legacy"
         apps = nix / "share/applications"
         apps_previous = apps.with_name(".brook-applications-legacy")
         if profile.is_symlink() and apps.is_symlink():
             active_generation(nix)
+            if nix == Path("/nix"):
+                os.chown(home, DESKTOP_UID, DESKTOP_UID)
             return
+        home.mkdir(mode=0o755, exist_ok=True)
+        # Gallery-generated relative links still climb to a sibling store.
+        # This alias keeps those links valid in every generation.
+        if not (home / "store").is_symlink():
+            (home / "store").symlink_to("../../store")
         if not previous.exists():
             if profile.is_symlink() or not profile.is_dir() or apps.is_symlink() or not apps.is_dir():
                 raise ValueError("Legacy profile or launcher directory missing")
@@ -314,14 +324,20 @@ def initialize(nix):
                     rename_no_replace(copy, launcher)
                     flush_directory(profile)
             rename_no_replace(profile, previous)
+            flush_directory(home)
             flush_directory(nix)
+        if not (home / "current").is_symlink():
+            switch(home, previous.name)
         if not profile.is_symlink():
-            switch(nix, previous.name)
+            profile.symlink_to(PROFILE_ALIAS)
+            flush_directory(nix)
         if not apps.is_symlink():
             if apps.exists():
                 rename_no_replace(apps, apps_previous)
             apps.symlink_to(APP_ALIAS)
             flush_directory(apps.parent)
+        if nix == Path("/nix"):
+            os.chown(home, DESKTOP_UID, DESKTOP_UID)
         active_generation(nix)
 
 
@@ -336,8 +352,10 @@ def main():
         parser.error("Expected a 32-digit hexadecimal transaction ID")
     fake = os.environ.get("BROOK_STAGE_ROOT")
     nix = Path(fake).resolve() / "nix" if fake else Path("/nix")
-    if not fake and os.geteuid() != 0:
-        parser.error("Closure staging requires the maintenance operator")
+    if not fake:
+        expected_uid = 0 if args.action == "initialize" else DESKTOP_UID
+        if os.geteuid() != expected_uid:
+            parser.error(f"{args.action} must run as uid {expected_uid}")
     if args.action == "initialize":
         initialize(nix)
     elif args.action == "rollback":

@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 from stage_closure import generate_plan, publish_cache
 import stage_nar
-from stage_profile import apply, initialize, rollback, validate_plan, verified_plan
+from stage_profile import PROFILE_ALIAS, apply, initialize, rollback, validate_plan, verified_plan
 
 NIX = ["nix", "--extra-experimental-features", "nix-command"]
 
@@ -97,7 +97,7 @@ class PlanIntegration(unittest.TestCase):
                     # failure and verify a machine with host-only reachability can apply.
                     with patch.object(stage_nar, "UPSTREAM", "http://127.0.0.1:1"):
                         apply(root, signed_plan, digest, tx, tools)
-                    self.assertEqual(os.readlink(root / "profile"), ".brook-profile-" + tx)
+                    self.assertEqual(os.readlink(root / PROFILE_ALIAS), ".brook-profile-" + tx)
                     self.assertEqual((root / "profile/bin/session.conf").read_text(), "session settings\n")
                     self.assertTrue((root / "profile/bin/user-app").is_file())
                     self.assertIn("User App", (root / "profile/manifest.tsv").read_text())
@@ -118,7 +118,7 @@ class PlanIntegration(unittest.TestCase):
                     (root / "store" / installed.name).write_text("modified data\n")
                     with self.assertRaises(ValueError):
                         apply(root, signed_plan, digest, "2" * 32, tools)
-                    self.assertEqual(os.readlink(root / "profile"), ".brook-profile-legacy")
+                    self.assertEqual(os.readlink(root / PROFILE_ALIAS), ".brook-profile-legacy")
                     plan["profile"]["links"]["../bad"] = str(built)
                     with self.assertRaises(ValueError):
                         validate_plan(plan)
