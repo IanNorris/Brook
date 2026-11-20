@@ -29,7 +29,8 @@ static long call5(long n, long a, long b, long c, long d, long e)
     return result;
 }
 
-__attribute__((noreturn)) void _start(void)
+/* A raw ELF entry has no return address on the initial process stack. */
+__attribute__((force_align_arg_pointer, noreturn)) void _start(void)
 {
     static const char title[] = "Guard health fixture";
     static const char pass[] = "GUARD_NATIVE_FRAMES_PASS\n";
