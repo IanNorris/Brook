@@ -115,18 +115,10 @@ uint8_t ProcessFilePermissions(Process* proc, uint32_t owner, uint32_t group, ui
 // credential-grant path MUST honor this irreversible per-task restriction.
 void ProcessSetNoNewPrivs(Process* proc) {
     if (!proc) return;
-    ProcessOperationGuard operation(ProcessCurrent());
-    SpinLockAcquire(&g_credentialsLock);
-    proc->noNewPrivs = 1;
-    SpinLockRelease(&g_credentialsLock);
+    __atomic_store_n(&proc->noNewPrivs, 1, __ATOMIC_RELEASE);
 }
 bool ProcessGetNoNewPrivs(Process* proc) {
-    if (!proc) return false;
-    ProcessOperationGuard operation(ProcessCurrent());
-    SpinLockAcquire(&g_credentialsLock);
-    bool value = proc->noNewPrivs != 0;
-    SpinLockRelease(&g_credentialsLock);
-    return value;
+    return proc && __atomic_load_n(&proc->noNewPrivs, __ATOMIC_ACQUIRE) != 0;
 }
 
 static void InheritCredentials(Process* child, Process* parent) {
@@ -134,7 +126,7 @@ static void InheritCredentials(Process* child, Process* parent) {
     SpinLockAcquire(&g_credentialsLock);
     child->uid = parent->uid; child->euid = parent->euid; child->suid = parent->suid;
     child->gid = parent->gid; child->egid = parent->egid; child->sgid = parent->sgid;
-    child->noNewPrivs = parent->noNewPrivs;
+    child->noNewPrivs = ProcessGetNoNewPrivs(parent);
     child->userNamespace=parent->userNamespace;UserNamespaceRetain(child->userNamespace);
     child->capabilities=parent->capabilities;
     child->groups = parent->groups;
