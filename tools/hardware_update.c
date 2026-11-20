@@ -20,6 +20,11 @@
 #include "../src/shared/brook_system_esp.h"
 #include "../src/shared/update/payload.h"
 #include "../src/shared/update/executable.h"
+#ifdef BROOK_BRIDGE_V3
+#include "bridge_v3_posix.h"
+static BridgeV3Posix transport;
+static uint64_t data_deadline;
+#endif
 static const char* names[6]={"A/KERNEL.ELF","A/INITRD.IMG","B/KERNEL.ELF","B/INITRD.IMG","SELECT0.BIN","SELECT1.BIN"};
 static int directory=-1;
 #ifdef BROOK_UPDATE_SYSTEM
@@ -166,6 +171,9 @@ static int write_file(unsigned index,const uint8_t* bytes,size_t length) {
     return result;
 }
 static int network_bytes(int fd,uint8_t* p,size_t n) {
+#ifdef BROOK_BRIDGE_V3
+    return fd == transport.fd ? BridgeV3PosixRead(&transport,p,n,data_deadline) : -1;
+#else
     while(n) {
         struct pollfd wait={fd,POLLIN,0};int ready;
         do{ready=poll(&wait,1,15000);}while(ready<0&&errno==EINTR);
@@ -175,10 +183,24 @@ static int network_bytes(int fd,uint8_t* p,size_t n) {
         p+=got;n-=(size_t)got;
     }
     return 0;
+#endif
 }
 static int reply(int fd,const char* text) {
+#ifdef BROOK_BRIDGE_V3
+    return fd == transport.fd ? BridgeV3PosixWrite(&transport,text,strlen(text),data_deadline) : -1;
+#else
     size_t left=strlen(text);
     while(left){ssize_t n=send(fd,text,left,MSG_NOSIGNAL);if(n<0&&errno==EINTR)continue;if(n<=0)return -1;text+=n;left-=(size_t)n;}return 0;
+#endif
+}
+static int authorize_activation(int fd) {
+    uint8_t command[8];
+    if(network_bytes(fd,command,sizeof(command))||memcmp(command,"ACTIVATE",8))return 0;
+#ifdef BROOK_BRIDGE_V3
+    return !BridgeV3PosixRequireEnd(&transport,data_deadline);
+#else
+    return 1;
+#endif
 }
 static int hex32(const char* p) {
     if(strlen(p)!=32)return 0;
@@ -187,12 +209,20 @@ static int hex32(const char* p) {
 }
 static int serve(int client,const char* key,const char* boot,const char* transaction) {
     uint8_t header[104];
+#ifdef BROOK_BRIDGE_V3
+    static const uint8_t no_key[32]={0};
+    (void)key;
+    key=(const char*)no_key;
+#endif
     if(network_bytes(client,header,sizeof(header))||
        (memcmp(header,"BRUPLOAD",8)&&memcmp(header,"BRPROMOT",8))||
        !BrookUpdateEqual(header+8,(const uint8_t*)key,32)||
        !BrookUpdateEqual(header+40,(const uint8_t*)boot,32)||
        !BrookUpdateEqual(header+72,(const uint8_t*)transaction,32))return 10;
     int promote=!memcmp(header,"BRPROMOT",8);
+#ifdef BROOK_BRIDGE_V3
+    if(transport.operation!=(promote?2:1))return 10;
+#endif
     uint8_t records[2][128];if(read_records(records))return 11;
     int newest=BrookUpdateNewest(records[0],records[1]);if(newest<0)return 12;
     int active=-1;
@@ -221,10 +251,10 @@ static int serve(int client,const char* key,const char* boot,const char* transac
         char plan[160];snprintf(plan,sizeof(plan),"{\"state\":\"promote_ready\",\"generation\":%" PRIu64 ",\"slot\":%u,\"selector\":%u}\n",
                                 generation,BrookUpdateGet32(expected+16),(unsigned)newest);
         if(reply(client,plan))return 15;
-        uint8_t incoming[128],activate[8];
+        uint8_t incoming[128];
         if(network_bytes(client,incoming,sizeof(incoming))||!BrookUpdateEqual(incoming,expected,sizeof(expected)))return 16;
         if(reply(client,"{\"state\":\"staged\",\"storage_modified\":false}\n"))return 21;
-        if(network_bytes(client,activate,sizeof(activate))||memcmp(activate,"ACTIVATE",8))return 22;
+        if(!authorize_activation(client))return 22;
         if(!selectors_unchanged(records))return 30;
         if(write_file(4+(unsigned)newest,expected,sizeof(expected)))return 25;
         if(read_records(records)||!BrookUpdateEqual(records[newest],expected,sizeof(expected))||pair_valid(expected)!=1)return 26;
@@ -249,8 +279,7 @@ static int serve(int client,const char* key,const char* boot,const char* transac
     BrookUpdateHash(initrd,ib,h);if(!BrookUpdateEqual(h,incoming+72,32)){result=19;goto done;}
     if(!BrookUpdateExecutable(kernel,kb)||initrd[510]!=0x55||initrd[511]!=0xaa){result=20;goto done;}
     if(reply(client,"{\"state\":\"staged\",\"storage_modified\":false}\n")){result=21;goto done;}
-    uint8_t activate[8];
-    if(network_bytes(client,activate,8)||memcmp(activate,"ACTIVATE",8)){result=22;goto done;}
+    if(!authorize_activation(client)){result=22;goto done;}
     if(!selectors_unchanged(records)){result=30;goto done;}
     // Only the inactive pair is modified, and selection is published last.
     if(write_file(slot*2,kernel,kb)||write_file(slot*2+1,initrd,ib)){result=23;goto done;}
@@ -294,10 +323,16 @@ int main(int argc,char** argv) {
     if(!root||!keypath||!lock||!port)return 2;
 #endif
     int check=open(marker,O_RDONLY|O_CLOEXEC|O_NOFOLLOW);if(check<0)return 3;close(check);
-    int fd=open(keypath,O_RDONLY|O_CLOEXEC|O_NOFOLLOW);char key[33]={0};
+    int fd;
+    char key[33]={0};
+#ifdef BROOK_BRIDGE_V3
+    (void)keypath;
+#else
+    fd=open(keypath,O_RDONLY|O_CLOEXEC|O_NOFOLLOW);
     if(fd<0)return 3;
     int read_error=file_read(fd,(uint8_t*)key,32);char extra;ssize_t tail=read(fd,&extra,1);int close_error=close(fd);
     if(read_error||tail!=0||close_error||!hex32(key))return 3;
+#endif
     fd=open(lock,O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0600);if(fd<0)return 4;
     if(close(fd))return 4;
     int listener=-1,client=-1,result=5;
@@ -330,9 +365,24 @@ int main(int argc,char** argv) {
     puts("HWUPDATE_LISTENING port=1235 maintenance_only=1");fflush(stdout);
     struct pollfd wait={listener,POLLIN,0};if(poll(&wait,1,60000)<=0){result=6;goto done;}
     client=accept(listener,NULL,NULL);if(client<0){result=7;goto done;}
+#ifdef BROOK_BRIDGE_V3
+    if(BridgeV3PosixAccept(&transport,client,BrookBridgeV3Update,(1u<<1)|(1u<<2),argv[1],argv[2])) {
+        fputs("HWUPDATE_AUTH_REFUSED version=3\n",stderr);result=10;goto done;
+    }
+    data_deadline=BridgeV3PosixDeadline(600000);
+#endif
     result=serve(client,key,argv[1],argv[2]);
+#ifdef BROOK_BRIDGE_V3
+    const int staged_only=result==22 && transport.peer_end && !transport.failed;
+    if(result && !staged_only){char error[80];snprintf(error,sizeof(error),"{\"state\":\"failed\",\"code\":%d}\n",result);(void)reply(client,error);}
+    (void)BridgeV3PosixReplyEnd(&transport,data_deadline);
+#else
     if(result){char error[80];snprintf(error,sizeof(error),"{\"state\":\"failed\",\"code\":%d}\n",result);(void)reply(client,error);}
+#endif
 done:
+#ifdef BROOK_BRIDGE_V3
+    BridgeV3PosixClear(&transport);
+#endif
     if(client>=0)close(client);
     if(listener>=0)close(listener);
     if(directory>=0)close(directory);

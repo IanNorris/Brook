@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 static int failure() { return errno ? -errno : -EIO; }
@@ -27,9 +28,9 @@ int HardwareStoreTransaction::begin(int directory,const char *record,size_t leng
     int e=absent(directory,"STORE.IMG");if(e)return e;
     e=absent(directory,"STORE.OK");if(e)return e;
     e=absent(directory,"STORE.TMP");if(e)return e;
-    file_=openat(directory,"STORE.IMG",O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0644);
+    file_=openat(directory,image_name(),O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0644);
     if(file_<0)return failure();
-    created_=true;
+    directory_=directory;created_=true;
     struct stat st{};if(fstat(file_,&st) || !S_ISREG(st.st_mode)){failed_=true;return -EIO;}
     device_=st.st_dev;inode_=st.st_ino;
     directory_=directory; size_=p.bytes; record_length_=length;
@@ -48,7 +49,7 @@ int HardwareStoreTransaction::stage() {
     if(!BrookUpdateEqual(hash,digest_,32))return -EBADMSG;
     if(fsync(file_))return failure();
     if(close(file_)){file_=-1;return failure();}file_=-1;
-    file_=openat(directory_,"STORE.IMG",O_RDWR|O_NOFOLLOW|O_CLOEXEC);if(file_<0)return failure();
+    file_=openat(directory_,image_name(),O_RDWR|O_NOFOLLOW|O_CLOEXEC);if(file_<0)return failure();
     struct stat st{};if(fstat(file_,&st)||static_cast<uint64_t>(st.st_dev)!=device_ || static_cast<uint64_t>(st.st_ino)!=inode_)return -EIO;
     int e=hardware_store_validate(file_,record_,record_length_);if(e)return e;
     BrookSha256 verify{};BrookShaInit(&verify);uint8_t buf[65536];uint64_t left=size_;
@@ -57,12 +58,31 @@ int HardwareStoreTransaction::stage() {
     BrookShaFinish(&verify,hash);if(!BrookUpdateEqual(hash,digest_,32))return -EBADMSG;
     if(close(file_)){file_=-1;return failure();}file_=-1;staged_=true;failed_=false;return 0;
 }
+int HardwareStoreTransaction::discard_staging() {
+    if(!temporary_ || !created_ || image_published_)return 0;
+    if(file_>=0){int fd=file_;file_=-1;if(close(fd))return failure();}
+    struct stat st{};
+    if(fstatat(directory_,image_name(),&st,AT_SYMLINK_NOFOLLOW) || !S_ISREG(st.st_mode) ||
+       static_cast<uint64_t>(st.st_dev)!=device_ || static_cast<uint64_t>(st.st_ino)!=inode_)return -EIO;
+    if(unlinkat(directory_,image_name(),0) || fsync(directory_))return failure();
+    created_=false;
+    return 0;
+}
 int HardwareStoreTransaction::finalize() {
     if(!staged_)return -EINVAL;staged_=false;
 #ifdef BROOK_STORE_TEST
     const char *inject=getenv("BROOK_STORE_TEST_FAILURE");
     if(inject && !strcmp(inject,"before-create"))return -EIO;
 #endif
+    if(temporary_) {
+        struct stat st{};
+        if(fstatat(directory_,image_name(),&st,AT_SYMLINK_NOFOLLOW) || !S_ISREG(st.st_mode) ||
+           static_cast<uint64_t>(st.st_dev)!=device_ || static_cast<uint64_t>(st.st_ino)!=inode_ ||
+           static_cast<uint64_t>(st.st_size)!=size_)return -EIO;
+        if(syscall(SYS_renameat2,(long)directory_,image_name(),(long)directory_,"STORE.IMG",1UL))return failure();
+        image_published_=true;
+        if(fsync(directory_))return failure();
+    }
     // Boot is the only consumer and accepts only a complete matching record.
     // The image was synced and rehashed before this exclusive creation.
     int fd=openat(directory_,"STORE.OK",O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0644);
