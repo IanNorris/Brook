@@ -3,7 +3,7 @@
 
 namespace brook {
 
-enum class DesktopStatsPanel : uint8_t { None, Cpu, Memory, Compositor, App };
+enum class DesktopStatsPanel : uint8_t { None, CpuMemory, Compositor, App };
 inline constexpr unsigned DetailedCoreLimit = 64, DetailedTopTasks = 4;
 inline constexpr uint8_t DetailedNoPercent = 255;
 
@@ -50,6 +50,11 @@ struct DesktopDetailedStats {
     DesktopTopTask tasks[DetailedTopTasks];
     uint64_t total, used, available, cached, kernel, gpu;
 };
+
+inline int DesktopStatsScrollOffset(int64_t offset, int limit) {
+    if (offset <= 0 || limit <= 0) return 0;
+    return offset > limit ? limit : int(offset);
+}
 
 struct DesktopMemoryRegions { uint64_t other, cache, kernel, available; };
 

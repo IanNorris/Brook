@@ -2899,7 +2899,7 @@ static void CompositorInputWM()
                     WmLauncherScroll(LauncherScroll120(ev),g_physFbWidth,g_physFbHeight);
                 else if(kind==DesktopPointerEvent::Scroll &&
                         !WmDiskFlyoutScroll(mx,my,LauncherScroll120(ev),g_physFbWidth,g_physFbHeight) &&
-                        !WmCpuFlyoutScroll(mx,my,LauncherScroll120(ev),g_physFbWidth,g_physFbHeight) &&
+                        !WmStatsFlyoutScroll(mx,my,LauncherScroll120(ev),g_physFbWidth,g_physFbHeight) &&
                         (ev.scanCode || ev.ascii))
                     WmVolumeScroll(mx,my,static_cast<int8_t>(ev.scanCode),g_physFbWidth,g_physFbHeight);
                 // Right click on the volume icon (or its popup) toggles mute.

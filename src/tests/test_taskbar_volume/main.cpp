@@ -141,6 +141,10 @@ static void checkDetailedStats() {
     CHECK(DesktopCpuDelta({120, 0}, {100, 0}, usage) == 0 && usage == DetailedNoPercent);
     CHECK(DesktopCpuDelta({100, 100}, {100, 100}, usage) == 0 && usage == DetailedNoPercent);
 
+    CHECK(DesktopStatsScrollOffset(-100, 48) == 0);
+    CHECK(DesktopStatsScrollOffset(24, 48) == 24);
+    CHECK(DesktopStatsScrollOffset(0x7fffffffffffffffLL, 48) == 48);
+    CHECK(DesktopStatsScrollOffset(42, 0) == 0);
     DesktopDetailedStats memory{};
     memory.total = 1000;
     memory.used = 700;

@@ -515,7 +515,7 @@ bool WmPerformanceHudPress(int32_t mx, int32_t my, uint32_t width, uint32_t heig
 enum class DesktopStatsPanel : uint8_t;
 DesktopStatsPanel WmDetailedStatsSelected();
 bool WmDiskFlyoutSelected();
-bool WmCpuFlyoutScroll(int32_t mx, int32_t my, int delta120, uint32_t width, uint32_t height);
+bool WmStatsFlyoutScroll(int32_t mx, int32_t my, int delta120, uint32_t width, uint32_t height);
 bool WmDiskFlyoutScroll(int32_t mx, int32_t my, int delta120, uint32_t width, uint32_t height);
 bool WmTrayFlyoutVisible();
 bool WmTrayFlyoutPress(int32_t mx, int32_t my, uint32_t width, uint32_t height);

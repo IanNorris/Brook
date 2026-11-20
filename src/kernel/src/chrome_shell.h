@@ -257,13 +257,13 @@ void ChromeBuildDiskPopup(const ChromeDiskPopupLayout&, const DesktopDiskPage&, 
                           const ChromeStyle&, ChromeDisplayList&);
 
 struct ChromeStatsPopupLayout {
-    DesktopRect panel, pin, body, previous, next;
+    DesktopRect panel, pin, body, previous, next, scrollUp, scrollDown;
     uint32_t coreRows;
-    int rowHeight;
+    int rowHeight, cpuHeight, contentOffset, scrollLimit;
 };
 ChromeStatsPopupLayout ChromeStatsPopupLayoutFor(const ChromeStyle&, DesktopRect anchor, int screenW,
                                                  int taskbarY, DesktopStatsPanel, uint32_t cores,
-                                                 bool keepPinReachable = false);
+                                                 bool keepPinReachable = false, int contentOffset = 0);
 void ChromeBuildStatsPopup(const ChromeStatsPopupLayout&, DesktopStatsPanel, const DesktopDetailedStats&,
                            uint32_t firstCoreRow, const DesktopIntervals<>*, uint64_t tick, bool pinned,
                            int32_t mouseX, int32_t mouseY, const ChromeStyle&, ChromeDisplayList&);

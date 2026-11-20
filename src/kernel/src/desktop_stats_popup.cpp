@@ -102,7 +102,7 @@ void Worker(void*)
     for (;;) {
         const uint32_t request = Request();
         const auto panel = Panel(request);
-        if (panel != DesktopStatsPanel::Cpu || request != served) {
+        if (panel == DesktopStatsPanel::None || request != served) {
             if (cpu) kfree(cpu);
             cpu = nullptr;
         }
@@ -114,15 +114,12 @@ void Worker(void*)
         const auto now = ApicTickCount();
         if (served != request || now - last >= 1000) {
             DesktopDetailedStats sample{};
-            if (panel == DesktopStatsPanel::Cpu) {
-                if (!cpu) {
-                    cpu = static_cast<CpuWorkspace*>(kmalloc(sizeof(CpuWorkspace)));
-                    if (cpu) memset(cpu, 0, sizeof(*cpu));
-                }
-                if (cpu) SampleCpu(*cpu, sample);
-            } else {
-                SampleMemory(sample);
+            if (!cpu) {
+                cpu = static_cast<CpuWorkspace*>(kmalloc(sizeof(CpuWorkspace)));
+                if (cpu) memset(cpu, 0, sizeof(*cpu));
             }
+            if (cpu) SampleCpu(*cpu, sample);
+            SampleMemory(sample);
             SpinLockAcquire(&g_lock);
             if (Request() == request) {
                 g_snapshot = sample;
@@ -149,7 +146,7 @@ void DesktopStatsWorkerStart()
 
 void DesktopStatsSetVisible(DesktopStatsPanel panel)
 {
-    if (panel != DesktopStatsPanel::Cpu && panel != DesktopStatsPanel::Memory) panel = DesktopStatsPanel::None;
+    if (panel != DesktopStatsPanel::CpuMemory) panel = DesktopStatsPanel::None;
     const auto previous = Request();
     if (Panel(previous) == panel) return;
     const uint32_t request = ((previous + 256) & ~uint32_t{255}) | uint8_t(panel);

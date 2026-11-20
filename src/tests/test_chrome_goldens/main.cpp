@@ -699,7 +699,7 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
         model.diskPopup = false;
         model.popupPinned = true;
         model.hudTick = now;
-        for (const auto panel : {DesktopStatsPanel::Cpu, DesktopStatsPanel::Memory,
+        for (const auto panel : {DesktopStatsPanel::CpuMemory,
                                  DesktopStatsPanel::Compositor, DesktopStatsPanel::App}) {
             model.statsPanel = panel;
             model.statsLayout = ChromeStatsPopupLayoutFor(s, layout.volume, screenW, screenH - m.taskbar(), panel, 64);
@@ -721,11 +721,21 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
             stats.kernel = 510ull << 20;
             stats.gpu = 228ull << 20;
             telemetry.hasApp = prefix != "opaque-dark-200-";
-            const char* name = panel == DesktopStatsPanel::Cpu ? "cpu" : panel == DesktopStatsPanel::Memory ? "memory" :
+            const char* name = panel == DesktopStatsPanel::CpuMemory ? "cpu-memory" :
                                panel == DesktopStatsPanel::Compositor ? "compositor" : "app";
             auto statsList = ChromeListOn(storage);
             RenderSnapshot(model, s, statsList);
             Check(prefix + "stats-" + name, statsList, s, model.rect.x, model.rect.y, model.rect.w, model.rect.h);
+            if (panel == DesktopStatsPanel::CpuMemory && prefix == "opaque-dark-200-") {
+                const int desktop = 600 - m.taskbar();
+                model.statsLayout = ChromeStatsPopupLayoutFor(s, {360, desktop, 80, 60}, 800, desktop,
+                                                               panel, 64, true, 10000);
+                model.rect = model.statsLayout.panel;
+                auto scrolledList = ChromeListOn(storage);
+                RenderSnapshot(model, s, scrolledList);
+                Check(prefix + "stats-cpu-memory-scrolled", scrolledList, s,
+                      model.rect.x, model.rect.y, model.rect.w, model.rect.h);
+            }
         }
         model.popupPinned = false;
         telemetry.hasApp = true;
