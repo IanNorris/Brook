@@ -67,6 +67,9 @@ int FatFsPrivateRecoverySlotStatus(FatPrivateMount* mount, GuardRecoverySlotStat
 #if defined(BROOK_SSD_GUARDED_DESKTOP)
 struct AcShutdownRecord;
 struct BootGuardSlot;
+// One when the canonical slot journal still matches a validated live pin,
+// zero when there is no pin, and a negative error on uncertain state.
+int FatFsPrivateRecoveryCheckPinnedSlotHealth(FatPrivateMount*,const uint8_t (&digest)[32]);
 int FatFsPrivateRecoveryStartSlot(FatPrivateMount* mount, const BootGuardSlot& slot, uint32_t& starts);
 int FatFsPrivateRecoveryFinishSlot(FatPrivateMount* mount, bool profileRejected);
 // Call only on the checked, private ESP before publishing the desktop mount.

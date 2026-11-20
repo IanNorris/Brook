@@ -8,9 +8,11 @@ enum { BROOK_IOCTL_VERIFY_SYSTEM_ESP_ROOT = 0xb2e0,
        BROOK_IOCTL_CHECK_SYSTEM_ESP_GUARD_IDENTITY = 0xb2e3 };
 
 /* BROOK_IOCTL_CHECK_SYSTEM_ESP_GUARD_IDENTITY takes a 32-byte SHA-256
- * digest of the 96 lowercase ASCII identity characters. Success matches
- * the clean guard pair verified and retained at guarded desktop admission.
- * The comparison grants no file access and does not change the media. */
+ * digest of the 96 lowercase ASCII identity characters. Zero matches
+ * the clean guard pair retained at guarded desktop admission. One also
+ * verifies that canonical RECOVERY/BOOTSTAT.BIN is already valid and
+ * exclusively pinned. No file access or write authority is granted. */
+enum { BROOK_ESP_GUARD_PINNED_SLOT_HEALTH = 1 };
 
 enum { BROOK_ESP_BOOT_SLOT_VERSION = 1,
        BROOK_ESP_BOOT_SLOT_UNTRACKED = 0,

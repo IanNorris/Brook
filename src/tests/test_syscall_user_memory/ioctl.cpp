@@ -15,6 +15,7 @@ brook::Vnode* g_espRoot;
 brook::BootGuardSlot g_bootSlot{};
 uint32_t g_bootFlags;
 bool g_guardIdentityReady;
+int g_guardIdentityResult;
 unsigned g_guardDigestCalls;
 uint8_t g_guardIdentityDigest[32];
 int32_t FakeGetCapset(uint32_t,uint32_t,void* out,uint32_t bytes) {
@@ -42,7 +43,7 @@ uint32_t BootTimingHandoffFlags() { return g_bootFlags; }
 int GuardedDesktopCheckGuardIdentity(const uint8_t (&digest)[32]) {
     ++g_guardDigestCalls;
     if(!g_guardIdentityReady)return -11;
-    return BrookUpdateEqual(digest,g_guardIdentityDigest,sizeof(digest))?0:-116;
+    return BrookUpdateEqual(digest,g_guardIdentityDigest,sizeof(digest))?g_guardIdentityResult:-116;
 }
 }
 
@@ -170,6 +171,9 @@ static void SystemEspGuardIdentity() {
     CHECK(query(input)==-116 && g_guardDigestCalls==2);
     __builtin_memset(g_guardIdentityDigest,0x5a,sizeof(g_guardIdentityDigest));
     CHECK(query(input)==0 && g_guardDigestCalls==3);
+    g_guardIdentityResult=BROOK_ESP_GUARD_PINNED_SLOT_HEALTH;
+    CHECK(query(input)==BROOK_ESP_GUARD_PINNED_SLOT_HEALTH && g_guardDigestCalls==4);
+    g_guardIdentityResult=0;
     CHECK(Untouched(input,sizeof(g_guardIdentityDigest)));
     g_guardIdentityReady=false;
     g_guardDigestCalls=0;

@@ -92,8 +92,12 @@ int main(int argc,char **argv) {
         if(!provision_slot_health(root,dir,st.st_dev,identity,mutated)||mutated||errno!=denial)return 30;
     }
     guard_ioctl_error=ENOTTY;
-    guard_ioctl_result=1; // Unexpected successful return must not fall back.
-    if(!provision_slot_health(root,dir,st.st_dev,identity,mutated)||mutated)return 31;
+    guard_ioctl_result=BROOK_ESP_GUARD_PINNED_SLOT_HEALTH;
+    if(provision_slot_health(root,dir,st.st_dev,identity,mutated)||mutated)return 31;
+    struct stat pinnedProbe{};
+    if(fstatat(dir,"BOOTSTAT.BIN",&pinnedProbe,AT_SYMLINK_NOFOLLOW)==0 || errno!=ENOENT)return 32;
+    guard_ioctl_result=2; // Unexpected successful return must not fall back.
+    if(!provision_slot_health(root,dir,st.st_dev,identity,mutated)||mutated)return 33;
     guard_ioctl_result=-1;
     low_space=true;
     if(!provision_slot_health(root,dir,st.st_dev,identity,mutated)||mutated||errno!=ENOSPC)return 16;

@@ -24,6 +24,7 @@ static uint64_t failReadSector=~uint64_t{0};
 static bool failRead=false, failWrite=false, failSync=false, failDriveFlush=false, intrinsicReadOnly=false, driveAcquired=false;
 static brook::Device* exclusiveBound=nullptr;
 static brook::Device* reservedRecoveryDevice=nullptr;
+static brook::Device* slotHealthDevice=nullptr;
 static unsigned diskReads=0,diskWrites=0;
 static int driveFlushes=0,failDriveFlushAt=-1;
 static LBA_t lastReadSector=0;
@@ -89,6 +90,7 @@ bool FatFsBindExclusiveDrive(uint8_t drive,Device* device){if(drive!=(guardDrive
 bool FatFsAcquireExclusiveDrive(uint8_t drive,Device* expected,bool* ro){if(drive!=(guardDrive?1:0) || !ro || driveAcquired || !exclusiveBound || expected!=exclusiveBound)return false;driveAcquired=true;*ro=intrinsicReadOnly;return true;}
 void FatFsReleaseDrive(uint8_t){assert(driveAcquired);if(!exclusiveBound)driveAcquired=false;}
 bool FatFsDriveReadOnly(uint8_t){return intrinsicReadOnly;}
+Device* FatFsBoundDevice(uint8_t drive){return drive==0?slotHealthDevice:nullptr;}
 extern "C" void SerialPrintf(const char*,...){}
 extern "C" void SerialPuts(const char*){}
 }
@@ -760,6 +762,79 @@ int main(int argc,char** argv){
         Vnode* file=FatFsOpen(mount,0,path,VFS_O_CREATE|VFS_O_WRITE);assert(file);
         uint8_t bytes[128]{};bytes[0]=uint8_t(50+i);uint64_t position=0;
         assert(file->ops->write(file,bytes,sizeof(bytes),&position)==128);closeNode(file);
+    }
+    {
+        constexpr char path[]="/RECOVERY/BOOTSTAT.BIN";
+        uint8_t blank[GuardSlotCount*GuardSlotSectorBytes]{};
+        Vnode* owner=FatFsOpen(mount,0,path,VFS_O_CREATE|VFS_O_WRITE|VFS_O_READWRITE);assert(owner);
+        uint64_t offset=0;
+        assert(owner->ops->write(owner,blank,sizeof(blank),&offset)==sizeof(blank));
+
+        FatPrivateMount boot{};
+        boot.mount=mount;
+        uint8_t digest[32]{0x29};
+        assert(!FatFsPrivateRecoveryCheckPinnedSlotHealth(&boot,digest));
+        assert(!FatFsAcquireImageLease(owner,sizeof(blank),&boot.slotHealthLease));
+        assert(!FatFsImageSectorMap(boot.slotHealthLease,boot.slotHealthSectors,GuardSlotCount));
+        std::memcpy(boot.slotHealthDisk,digest,sizeof(digest));
+        boot.slotHealthReady=true;
+
+        DeviceOps deviceOps{};
+        deviceOps.read=[](Device*,uint64_t position,void* bytes,uint64_t size) {
+            if(position%512 || size!=512)return -5;
+            return disk_read(0,static_cast<BYTE*>(bytes),position/512,1)==RES_OK?int(size):-5;
+        };
+        Device device{&deviceOps,"guard-health-fixture",DeviceType::Block,nullptr};
+        slotHealthDevice=&device;
+        assert(!FatFsOpen(mount,0,path,VFS_O_STREAM));
+        auto readOnly=[&](const uint8_t (&identity)[32],int expected){
+            const auto writes=diskWrites;
+            const auto flushes=driveFlushes;
+            assert(FatFsPrivateRecoveryCheckPinnedSlotHealth(&boot,identity)==expected);
+            assert(writes==diskWrites && flushes==driveFlushes);
+        };
+        readOnly(digest,BROOK_ESP_GUARD_PINNED_SLOT_HEALTH);
+        uint8_t foreign[32]{0x46};
+        readOnly(foreign,-116);
+
+        mount->fs.wflag=1;
+        readOnly(digest,-11);
+        mount->fs.wflag=0;
+        boot.slotHealthLease->error=-5;
+        readOnly(digest,-5);
+        boot.slotHealthLease->error=0;
+        auto& damaged=disk[boot.slotHealthSectors[0]*GuardSlotSectorBytes];
+        damaged=1;
+        readOnly(digest,-117);
+        damaged=0;
+        uint8_t* record=&damaged;
+        std::memcpy(record,GuardSlotMagic,sizeof(GuardSlotMagic));
+        BrookUpdatePut64(record+8,1);
+        std::memcpy(record+16,digest,sizeof(digest));
+        BrookUpdatePut32(record+GuardSlotCrcOffset,BrookUpdateCrc(record,GuardSlotCrcOffset));
+        readOnly(digest,BROOK_ESP_GUARD_PINNED_SLOT_HEALTH);
+        failReadSector=boot.slotHealthSectors[1];
+        readOnly(digest,-5); // An accessible valid sibling cannot hide I/O failure.
+        failReadSector=~uint64_t{0};
+        std::memset(record,0,GuardSlotSectorBytes);
+
+        VfsObject* recoveryParent=nullptr;
+        assert(!FatRootObject(mount,0,&recoveryParent));
+        assert(!FatObjectRename(recoveryParent,"RECOVERY",recoveryParent,"RELOC"));
+        assert(!FatFsMkdir(mount,0,"/RECOVERY",0755));
+        Vnode* decoy=FatFsOpen(mount,0,path,VFS_O_CREATE|VFS_O_WRITE);assert(decoy);
+        offset=0;
+        assert(decoy->ops->write(decoy,blank,sizeof(blank),&offset)==sizeof(blank));closeNode(decoy);
+        readOnly(digest,-116);
+        assert(!FatFsUnlink(mount,0,path));
+        assert(!FatFsUnlink(mount,0,"/RECOVERY"));
+        assert(!FatObjectRename(recoveryParent,"RELOC",recoveryParent,"RECOVERY"));
+        VfsObjectRelease(recoveryParent);
+        readOnly(digest,BROOK_ESP_GUARD_PINNED_SLOT_HEALTH);
+        slotHealthDevice=nullptr;
+        assert(!FatFsReleaseImageLease(boot.slotHealthLease));
+        closeNode(owner);
+        assert(!FatFsUnlink(mount,0,path));
     }
     assert(!FatFsUnmount(mount));assert(allocations.empty() && pages.empty() && !driveAcquired);
     if(profile.total)for(unsigned mode=0;mode<5;++mode) {

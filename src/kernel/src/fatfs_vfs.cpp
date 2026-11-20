@@ -20,6 +20,7 @@
 #include "../../shared/update/guard_slot_health.h"
 #endif
 #include "fatfs_object.h"
+#include "../../shared/brook_system_esp.h"
 #include "process.h"
 #include "fatfs_glue.h"
 #include "ahci_system_volume.h"
@@ -2185,6 +2186,48 @@ int FatFsPrivateRecoverySlotStatus(FatPrivateMount* session,GuardRecoverySlotSta
 }
 
 #if defined(BROOK_SSD_GUARDED_DESKTOP)
+int FatFsPrivateRecoveryCheckPinnedSlotHealth(FatPrivateMount* session,const uint8_t (&digest)[32])
+{
+    if(!session || !session->mount)return -11;
+    auto* mount=session->mount;
+    GuardFatLock lock;
+    auto* lease=session->slotHealthLease;
+    if(!lease)return 0; // Legacy loader or journal provisioned during this boot.
+    auto* file=lease->owner?static_cast<FatOpenFile*>(lease->owner->priv):nullptr;
+    if(!session->slotHealthReady || lease->error || mount->deferredCloseError ||
+       !file || file->imageLease!=lease || file->mount!=mount || file->fil.cltbl!=lease->linkMap ||
+       lease->guard || lease->bytes!=GuardSlotCount*GuardSlotSectorBytes)return -5;
+    if(!BrookUpdateEqual(session->slotHealthDisk,digest,sizeof(digest)))return -116;
+    // FatFs may synchronize a dirty shared window on lookup. A proof must
+    // not trigger that write. Resolve metadata without opening the file.
+    if(mount->fs.wflag)return -11;
+    FF_OBJECT root{},directory{},journalFile{};
+    auto looked=f_object_root(&mount->fs,&root);
+    if(looked==FR_OK)looked=f_object_lookup(&root,"RECOVERY",&directory);
+    if(looked==FR_OK)looked=f_object_lookup(&directory,"BOOTSTAT.BIN",&journalFile);
+    if(looked!=FR_OK)return FrToErrno(looked);
+    // The child itself cannot be renamed while pinned, but a parent rename
+    // followed by recreation can put another file at the canonical spelling.
+    if((journalFile.object.attr&AM_DIR) || journalFile.object.objsize!=lease->bytes ||
+       FatObjectIdentity(journalFile)!=lease->identity ||
+       journalFile.object.sclust!=file->fil.obj.sclust)return -116;
+    auto* device=FatFsBoundDevice(mount->pdrv);
+    if(!device || !device->ops || !device->ops->read)return -5;
+    struct Readback {
+        SlotHealthSectorIo io;
+        bool failed=false;
+        bool read(unsigned slot,uint8_t* bytes) {
+            const bool ok=io.read(slot,bytes);
+            failed|=!ok;
+            return ok;
+        }
+    } readback{{device,session->slotHealthSectors}};
+    GuardSlotJournal journal;
+    const bool valid=GuardSlotRead(readback,session->slotHealthDisk,journal);
+    if(readback.failed)return -5;
+    return valid?BROOK_ESP_GUARD_PINNED_SLOT_HEALTH:-117;
+}
+
 int FatFsPrivateRecoveryStartSlot(FatPrivateMount* session, const BootGuardSlot& slot, uint32_t& starts)
 {
     starts = 0;

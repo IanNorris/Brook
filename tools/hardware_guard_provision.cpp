@@ -75,7 +75,7 @@ static int verify_clean_guards(int root,int directory,dev_t device,const char (&
     uint8_t digest[32];
     BrookUpdateHash(reinterpret_cast<const uint8_t*>(identity),96,digest);
     const int result=ioctl(root,BROOK_IOCTL_CHECK_SYSTEM_ESP_GUARD_IDENTITY,digest);
-    if(!result)return 0;
+    if(result==0 || result==BROOK_ESP_GUARD_PINNED_SLOT_HEALTH)return result;
     if(result!=-1 || errno!=ENOTTY)return -1;
 
     // Old or non-guarded kernels retain ordinary access to the guard files.
@@ -90,7 +90,9 @@ static int verify_clean_guards(int root,int directory,dev_t device,const char (&
 }
 
 static int provision_slot_health(int root,int directory,dev_t device,const char (&identity)[97],int& mutated) {
-    if(verify_clean_guards(root,directory,device,identity))return -1;
+    const int admitted=verify_clean_guards(root,directory,device,identity);
+    if(admitted<0)return -1;
+    if(admitted==BROOK_ESP_GUARD_PINNED_SLOT_HEALTH)return 0;
     struct SlotFile {
         uint8_t bytes[SlotHealthBytes]{};
         bool read(unsigned index,uint8_t* out) const {
@@ -175,7 +177,8 @@ int main(int argc,char **argv) {
     dir=openat(root,"RECOVERY",O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
     if(dir<0||ioctl(dir,BROOK_IOCTL_VERIFY_SYSTEM_ESP_MEMBER,0)||fstat(dir,&dst)||dst.st_dev!=rst.st_dev)goto done;
     if(slotOnly) {
-        if(provision_slot_health(root,dir,rst.st_dev,identity,mutated)||fsync(dir)||fsync(root))goto done;
+        if(provision_slot_health(root,dir,rst.st_dev,identity,mutated) ||
+           (mutated && (fsync(dir)||fsync(root))))goto done;
     } else {
         if(fstatat(dir,"GUARD0.BIN",&check,AT_SYMLINK_NOFOLLOW)==0 || errno!=ENOENT)goto done;
         if(fstatat(dir,"GUARD1.BIN",&check,AT_SYMLINK_NOFOLLOW)==0 || errno!=ENOENT)goto done;
