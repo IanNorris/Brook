@@ -79,6 +79,19 @@ void ProcessSetGroupView(Process* process, const Process* source, bool session, 
     }
 }
 
+UserNamespace* PidNamespaceOwner(const PidNamespace* view)
+{
+    return view ? view->owner : nullptr;
+}
+
+bool PidNamespaceContains(const PidNamespace* ancestor, const PidNamespace* view)
+{
+    if (!ancestor) return true;
+    for (; view; view = view->parent)
+        if (view == ancestor) return true;
+    return false;
+}
+
 uint64_t PidNamespaceTag(const PidNamespace* view)
 {
     return view ? view->tag : 0;

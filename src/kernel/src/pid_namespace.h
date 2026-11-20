@@ -13,6 +13,8 @@ uint32_t ProcessVisibleGroup(const Process* process, const PidNamespace* view, b
 void ProcessSetGroupView(Process* process, const Process* source, bool session, bool newGroup);
 
 uint64_t PidNamespaceTag(const PidNamespace* view);
+UserNamespace* PidNamespaceOwner(const PidNamespace* view);
+bool PidNamespaceContains(const PidNamespace* ancestor, const PidNamespace* view);
 void PidNamespaceRetain(const PidNamespace* view);
 void PidNamespaceRelease(const PidNamespace* view);
 

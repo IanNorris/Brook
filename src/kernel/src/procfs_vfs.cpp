@@ -5,6 +5,7 @@
 #include "memory/heap.h"
 #include "pid_namespace.h"
 #include "process.h"
+#include "process_user_namespace.h"
 
 namespace brook {
 
@@ -63,14 +64,26 @@ static const VfsFsOps g_procFsOps = {
     .vnode_object=ProcFsVnodeObject,
 };
 
-int ProcFsMountPrivate(MountNamespace* ns,const VfsPath& target,uint64_t attributes)
+static bool ProcMountCovers(const void* existing, const void* requested)
 {
+    const auto* current = static_cast<const ProcMountView*>(existing);
+    const auto* fresh = static_cast<const ProcMountView*>(requested);
+    return PidNamespaceContains(current ? current->pid : nullptr, fresh->pid);
+}
+
+int ProcFsMountPrivate(MountNamespace* ns,const VfsPath& root,const VfsPath& target,uint64_t attributes)
+{
+    auto* process = ProcessCurrent();
+    const auto* pidView = ProcessPidView(process);
+    if (!ProcessCapable(process, PidNamespaceOwner(pidView), CapSysAdmin)) return -1;
+
     auto* instance = static_cast<ProcMountView*>(kmalloc(sizeof(ProcMountView)));
     if (!instance) return -12;
-    instance->pid = ProcessPidView(ProcessCurrent());
+    instance->pid = pidView;
     PidNamespaceRetain(instance->pid);
+    const VfsFreshMountVisibility visibility{root, ProcMountCovers};
     const int error = VfsMountNamespaceMountFresh(ns,target,"procfs",&g_procFsOps,instance,0,
-        attributes|MountNoSuid|MountNoDev|MountNoExec);
+        attributes|MountNoSuid|MountNoDev|MountNoExec,nullptr,&visibility);
     if (error) ProcFsUnmountCb(instance);
     return error;
 }

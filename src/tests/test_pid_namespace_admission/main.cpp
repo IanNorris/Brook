@@ -45,6 +45,8 @@ int main()
     const auto* nested = ProcessPidView(&sibling);
     assert(ProcessVisibleTgid(&sibling, view) == 3 && ProcessVisibleTgid(&sibling, nested) == 1);
     assert(ProcessVisibleTgid(&init, nested) == 0);
+    assert(PidNamespaceContains(nullptr, nested) && PidNamespaceContains(view, nested));
+    assert(PidNamespaceContains(nested, nested) && !PidNamespaceContains(nested, view));
 
     assert(ProcessPidPrepareChild(&child, &sibling, false) == 0);
     assert(PidNamespaceStopBirths(view));
