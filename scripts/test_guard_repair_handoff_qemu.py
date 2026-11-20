@@ -38,9 +38,16 @@ def check_pair(path,identity,automatic):
             raise ValueError('pair manifest mismatch: '+name)
 
 
-def compact(source,dest,tree,size=8*1024*1024):
+def compact(source,dest,tree,size=8*1024*1024,scrub_deployment=False):
     tree.mkdir()
     subprocess.run(['mcopy','-s','-i',str(source),'::*',str(tree)],check=True)
+    if scrub_deployment:
+        # Format a fresh image after removal so no deployment credential or
+        # maintenance grant (including stale FAT clusters) reaches the guest.
+        etc = next(item for item in tree.iterdir() if item.name.lower() == 'etc')
+        for item in etc.iterdir():
+            if item.name.lower() in ('hardware-update-key', 'hardware-maintenance', 'hardware-bulk'):
+                item.unlink()
     with dest.open('wb') as f:f.truncate(size)
     subprocess.run(['mformat','-i',str(dest),'::'],check=True)
     subprocess.run(['mcopy','-s','-i',str(dest),*[str(p) for p in tree.iterdir()],'::/'],check=True)
@@ -90,7 +97,16 @@ def main():
     parser.add_argument('--normal-network-module',type=Path,help='Matching virtio-net module for normal boot')
     parser.add_argument('--proc-dump-qa',type=Path,help='Run the live core fixture with this matching virtio NIC module')
     parser.add_argument('--proc-autodump-qa',action='store_true',help='Also verify automatic fatal-signal core capture')
+    parser.add_argument('--bridge-local-policy-qa',type=Path,help='Use this static guest probe for bridge and reserved-port policy')
     a=parser.parse_args()
+    if a.bridge_local_policy_qa:
+        allowed = {'image', 'efi', 'firmware', 'desktop_pair', 'recovery_pair', 'output', 'identity',
+                   'auto_desktop', 'auto_desktop_dell_initrd', 'auto_desktop_intel_provider',
+                   'auto_desktop_vulkan_service', 'managed_profile', 'auto_desktop_network_module',
+                   'bridge_local_policy_qa'}
+        if (not a.auto_desktop_dell_initrd or not a.auto_desktop_network_module or
+                any(value for name, value in vars(a).items() if name not in allowed)):
+            parser.error('bridge local policy QA requires the standard guarded Dell startup fixture and matching virtio module')
     if a.proc_autodump_qa and not a.proc_dump_qa:
         parser.error('automatic core QA requires the live core fixture')
     if a.proc_dump_qa and not a.auto_desktop_dell_initrd:
@@ -145,7 +161,9 @@ def main():
         parser.error('startup-script failure requires the desktop bridge fixture')
     if a.auto_desktop_shutdown and (not a.auto_desktop_network_module or a.auto_desktop_script_fail):
         parser.error('checked shutdown requires a successful desktop bridge fixture')
-    if a.auto_desktop_dell_initrd and (not a.auto_desktop or (a.auto_desktop_panic and not a.auto_desktop_usb_panic_retrieval) or a.auto_desktop_network_module or a.inject_panic):
+    if a.auto_desktop_dell_initrd and (not a.auto_desktop or a.inject_panic or
+            (a.auto_desktop_panic and not a.auto_desktop_usb_panic_retrieval) or
+            (a.auto_desktop_network_module and not a.bridge_local_policy_qa)):
         parser.error('Dell initrd fixture requires a non-panic auto desktop')
     if a.auto_desktop_real_provider and not a.auto_desktop_dell_initrd:
         parser.error('real provider requires the Dell initrd fixture')
@@ -175,7 +193,9 @@ def main():
     with tempfile.TemporaryDirectory(prefix='brk-auto-handoff-') as tmp:
         work=Path(tmp);disk=work/'disk.raw';shutil.copyfile(a.image,disk);media=str(disk)+'@@1048576'
         normal=work/'normal.img';recovery=work/'recovery.img'
-        compact(a.desktop_pair/'INITRD.IMG',normal,work/'normal-tree',16*1024*1024 if a.auto_desktop_dell_initrd else 8*1024*1024)
+        compact(a.desktop_pair/'INITRD.IMG',normal,work/'normal-tree',
+                16*1024*1024 if a.auto_desktop_dell_initrd else 8*1024*1024,
+                scrub_deployment=bool(a.bridge_local_policy_qa))
         compact(a.recovery_pair/'INITRD.IMG',recovery,work/'recovery-tree')
         if a.auto_desktop_dell_initrd:
             # Keep the Dell startup script, but bind the private image to the
@@ -187,7 +207,7 @@ def main():
             if startup!=subprocess.check_output(['mtype','-i',str(a.desktop_pair/'INITRD.IMG'),'::/BOOT/INIT.RC']):
                 raise RuntimeError('Dell startup script changed during compaction')
             (a.output/'dell-startup-script.sha256').write_text(hashlib.sha256(startup).hexdigest()+'\n')
-            if dell_shutdown and not a.auto_desktop_dell_async_network:
+            if a.bridge_local_policy_qa or (dell_shutdown and not a.auto_desktop_dell_async_network):
                 # Dell's opt-in asynchronous TCP stack is tailored to its USB
                 # NIC; the synthetic virtio NIC uses the ordinary TCP path.
                 for name in ('arp-async-probe','tcp-async-neighbor','tcp-try-transmit','tcp-async-send',
@@ -231,6 +251,12 @@ def main():
             payloads+=((probe_executable,'::/BOOT/PROCDUMP.ELF'),)
         for src,target in payloads:
             subprocess.run(['mcopy','-o','-i',str(normal),str(src),target],check=True)
+        if a.bridge_local_policy_qa:
+            subprocess.run(['mcopy','-o','-i',str(normal),str(a.bridge_local_policy_qa),
+                            '::/BOOT/LOCBRDG.ELF'],check=True)
+            script.write_bytes(startup.rstrip(b'\r\n')+
+                               b'\nrun --service --once --console --uid 0 /boot/LOCBRDG.ELF --disposable-fixture\n')
+            subprocess.run(['mcopy','-o','-i',str(normal),str(script),'::/BOOT/INIT.RC'],check=True)
         if a.auto_desktop_startup_panic:
             additional=b''
             if a.auto_desktop_contention_panic:
@@ -622,6 +648,17 @@ def main():
                     raise RuntimeError('watchdog did not observe a sustained vCPU stall')
             if a.auto_desktop_reset and not (a.auto_desktop_shutdown_panic or a.auto_desktop_serial_stall) and (not capture_seen or time.monotonic()-capture_seen[0]<4):
                 raise RuntimeError('desktop panic reset occurred before the expected delay')
+        elif a.bridge_local_policy_qa:
+            with socket.socket() as probe:
+                probe.bind(('127.0.0.1',0));network_port=probe.getsockname()[1]
+            try:
+                boot(disk,a.firmware,second,False,'BRIDGE_LOCAL_POLICY_PASS',120,True,
+                     sata_snapshot=False,sata_serial='BROOK-RECOVERY-QA',hold_after_marker=5,
+                     network_port=network_port,failure_marker='BRIDGE_LOCAL_POLICY_FAIL',
+                     forbidden='GUARD_DESKTOP_HANDOFF_FAILED')
+            finally:
+                for name in ('serial.log','qemu.log'):
+                    if (second/name).exists():shutil.copyfile(second/name,a.output/('bridge-local-'+name))
         elif a.auto_desktop_network_module:
             with socket.socket() as probe:
                 probe.bind(('127.0.0.1',0));network_port=probe.getsockname()[1]
@@ -828,6 +865,8 @@ def main():
                  extra_fw_cfg=['name=opt/guard-journal-pin,string=test-b','name=opt/guard-panic-capture,string=test-1'])
         shutil.copyfile(second/'serial.log',a.output/'desktop-serial.log')
         serial=(second/'serial.log').read_text(errors='replace')
+        if a.bridge_local_policy_qa and 'GUARD_DESKTOP_HANDOFF_SCRIPT status=0' not in serial:
+            raise RuntimeError('bridge policy probe passed without successful guarded desktop handoff')
         if a.auto_desktop_contention_panic and not all(marker in serial for marker in
                 ('PANIC_CONTENTION_WRITER_HELD','PANIC_DISK_RESERVE_WAIT','PANIC_CONTENTION_NEXT_COMMAND_YIELDED','PANIC_DISK_RESERVE_READY')):
             raise RuntimeError('panic did not transfer ownership from the live disk writer')
