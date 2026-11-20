@@ -375,6 +375,9 @@ void Worker(void*) {
                 for(uint8_t i=0;i<16;++i){Ext2SyncProbe p{};if(Ext2GetSyncProbe(i,p))
                     SerialPrintf("EFI_SHUTDOWN_PRE_SYNC drive=%u pending=%lu dirty=%u\n",i,p.pendingOps,p.backingDirty?1u:0u);}
 #endif
+#if defined(BROOK_SSD_GUARDED_DESKTOP)
+                GuardPrepareCheckedSlotShutdown();
+#endif
                 if(!DeviceCloseWrites()){SchedulerSleepMs(25);continue;}
                 SetPhase(selected,Phase::Syncing);AudioPrepareShutdown();AudioStop();HdaRuntimeShutdown();
                 int error=VfsSync(nullptr);
@@ -393,6 +396,7 @@ void Worker(void*) {
             // Allow the UART reply and a final progress frame to be delivered.
             SchedulerSleepMs(500);
 #if defined(BROOK_SSD_GUARDED_DESKTOP)
+            GuardRecordCheckedSlotShutdown();
             if(op.acLoss) {
                 char bootId[33];DebugEpochCopy(bootId);
                 const bool recorded=GuardRecordCheckedAcShutdown(bootId);

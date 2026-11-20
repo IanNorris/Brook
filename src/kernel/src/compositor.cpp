@@ -1467,14 +1467,14 @@ static ProcessFramebufferSnapshot SnapshotProcessFramebuffer(Process* process) {
 
 // Blit a process's VFB onto the physical FB with optional downscaling.
 // If forceAll is true, blit regardless of dirty flag (periodic refresh).
-static void BlitProcess(Process* proc, bool forceAll)
+static bool BlitProcess(Process* proc, bool forceAll)
 {
     auto snapshot=SnapshotProcessFramebuffer(proc);
     const uint32_t* src=snapshot.pixels;
-    if (!src || !snapshot.width || !snapshot.height || snapshot.stride<snapshot.width) return;
-    if (proc->state == ProcessState::Terminated) return;
-    if (!forceAll && !proc->fbDirty) return;
-    __atomic_store_n(&proc->fbDirty, 0, __ATOMIC_RELAXED);
+    if (!src || !snapshot.width || !snapshot.height || snapshot.stride<snapshot.width) return false;
+    if (proc->state == ProcessState::Terminated) return false;
+    const bool fresh = __atomic_exchange_n(&proc->fbDirty, 0, __ATOMIC_ACQ_REL) != 0;
+    if (!forceAll && !fresh) return false;
 
     // One-time diagnostic: log first blit for each process
     static uint32_t s_blitLogMask = 0;
@@ -1511,6 +1511,8 @@ static void BlitProcess(Process* proc, bool forceAll)
         endDy = g_physFbHeight - static_cast<uint32_t>(dstY0);
     if (dstX0 + static_cast<int>(endDx) > static_cast<int>(g_physFbWidth))
         endDx = g_physFbWidth - static_cast<uint32_t>(dstX0);
+
+    if (startDx >= endDx || startDy >= endDy) return false;
 
     // Track dirty scanlines for this blit.
     uint32_t blitMinY = static_cast<uint32_t>(dstY0) + startDy;
@@ -1554,21 +1556,22 @@ static void BlitProcess(Process* proc, bool forceAll)
             }
         }
     }
+    return fresh && !proc->isKernelThread;
 }
 
 // Blit a process VFB at an explicit destination (for WM-managed windows).
 // Supports integer upscaling via nearest-neighbor (for DOOM at 320×200 → 4×).
-static void BlitProcessAt(Process* proc, int dstX0, int dstY0, bool forceAll,
+static bool BlitProcessAt(Process* proc, int dstX0, int dstY0, bool forceAll,
                            uint32_t clientW, uint32_t clientH, uint8_t upscale = 1)
 {
     // Snapshot VFB pointer atomically to avoid TOCTOU race with process exit
     // (another CPU may null fbVirtual between check and use).
     auto snapshot=SnapshotProcessFramebuffer(proc);
     const uint32_t* src=snapshot.pixels;
-    if (!src || !snapshot.width || !snapshot.height || snapshot.stride<snapshot.width) return;
-    if (proc->state == ProcessState::Terminated) return;
-    if (!forceAll && !proc->fbDirty) return;
-    __atomic_store_n(&proc->fbDirty, 0, __ATOMIC_RELAXED);
+    if (!src || !snapshot.width || !snapshot.height || snapshot.stride<snapshot.width) return false;
+    if (proc->state == ProcessState::Terminated) return false;
+    const bool fresh = __atomic_exchange_n(&proc->fbDirty, 0, __ATOMIC_ACQ_REL) != 0;
+    if (!forceAll && !fresh) return false;
 
     const uint32_t  srcW = snapshot.width;
     const uint32_t  srcH = snapshot.height;
@@ -1579,7 +1582,7 @@ static void BlitProcessAt(Process* proc, int dstX0, int dstY0, bool forceAll,
 
     const SceneRect clip=SceneClientBlitRect(dstX0,dstY0,srcW,srcH,clientW,clientH,
                                              upscale,g_physFbWidth,g_physFbHeight);
-    if(clip.empty())return;
+    if(clip.empty())return false;
     const uint32_t startDx=static_cast<uint32_t>(clip.left-dstX0);
     const uint32_t startDy=static_cast<uint32_t>(clip.top-dstY0);
     const uint32_t endDx=static_cast<uint32_t>(clip.right-dstX0);
@@ -1624,22 +1627,23 @@ static void BlitProcessAt(Process* proc, int dstX0, int dstY0, bool forceAll,
             }
         }
     }
+    return fresh && !proc->isKernelThread;
 }
 
 // Blit a kernel-resident VFB at an explicit destination.  Used for
 // per-window VFBs (Window::vfb) — separate from the per-process
 // `BlitProcessAt` so we don't need to fake a Process struct.
-static void BlitWindowVfb(const uint32_t* src,
+static bool BlitWindowVfb(const uint32_t* src,
                            uint32_t srcW, uint32_t srcH, uint32_t srcStride,
                            int dstX0, int dstY0)
 {
-    if (!src || srcW == 0) return;
+    if (!src || srcW == 0) return false;
     uint32_t* dstBase = g_backBuffer ? g_backBuffer : const_cast<uint32_t*>(g_physFb);
     const uint32_t dstStride = g_backBuffer ? g_backBufStride : g_physFbStride;
 
     const SceneRect clip=SceneClientBlitRect(dstX0,dstY0,srcW,srcH,srcW,srcH,1,
                                            g_physFbWidth,g_physFbHeight);
-    if (clip.empty()) return;
+    if (clip.empty()) return false;
     const uint32_t sourceX=static_cast<uint32_t>(clip.left-static_cast<int64_t>(dstX0));
     const uint32_t rowLen=static_cast<uint32_t>(clip.right-clip.left);
     MarkDirtyRows(static_cast<uint32_t>(clip.top),static_cast<uint32_t>(clip.bottom));
@@ -1685,6 +1689,7 @@ static void BlitWindowVfb(const uint32_t* src,
             dstRow[dx] = 0xff000000u | (r << 16) | (g << 8) | b;
         }
     }
+    return true;
 }
 
 // Draw wallpaper (or solid background) into backbuffer.
@@ -2374,7 +2379,7 @@ static void TraceDesktopCycle(FrameGpuStage stage,uint64_t tick)
         ProfilerTraceGpu(ProcessCurrent()->pid,stage,desktopTraceCycle,tick);
 }
 #endif
-static void CompositorLoopWM()
+static void CompositorLoopWM(bool& clientFrame)
 {
     // Apply movement/focus/resize before rendering either chrome or content.
     // GPU composition later samples chrome using the current window geometry.
@@ -2590,9 +2595,12 @@ static void CompositorLoopWM()
                 uint32_t vfbH = static_cast<uint32_t>(localBytes / (uint64_t)localStride / 4);
                 uint32_t blitW = w->clientW < vfbW ? w->clientW : vfbW;
                 uint32_t blitH = w->clientH < vfbH ? w->clientH : vfbH;
-                if (blitW && blitH)
-                    BlitWindowVfb(localVfb, blitW, blitH, localStride,
-                                  w->clientX(), w->clientY());
+                const bool freshClient = w->vfbDirty && !p->isKernelThread && p->state != ProcessState::Terminated;
+                if (blitW && blitH) {
+                    const bool copied = BlitWindowVfb(localVfb, blitW, blitH, localStride,
+                                                      w->clientX(), w->clientY());
+                    clientFrame |= freshClient && copied;
+                }
                 w->vfbDirty = 0;  // single-writer (compositor thread), no race
             }
         }
@@ -2602,7 +2610,7 @@ static void CompositorLoopWM()
                 continue;
             anyBelowBlitted = true;
             if (!CompositorGpuActive())
-                BlitProcessAt(p, w->clientX(), w->clientY(), true, w->clientW, w->clientH, w->upscale);
+                clientFrame |= BlitProcessAt(p, w->clientX(), w->clientY(), true, w->clientW, w->clientH, w->upscale);
         }
 
         // Draw text cursor for terminal windows
@@ -4281,7 +4289,7 @@ static bool GopShadowEnsure()
     g_gopShadowWidth=g_physFbWidth;g_gopShadowHeight=g_physFbHeight;
     return true;
 }
-static void CompositorFlipSoftware()
+static void CompositorFlipSoftware(bool clientFrame)
 {
     CompositorMutexGuard geometry(&g_scanoutMappingLock);
 #if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
@@ -4335,7 +4343,8 @@ static void CompositorFlipSoftware()
 #endif
     if (flushMin < flushMax) {
         brook::DisplayFlush(flushMin, flushMax);
-        CompositorRecordDesktopPresent();
+        // Cursor, chrome and kernel-console redraws cannot establish app health.
+        if (clientFrame) CompositorRecordDesktopPresent();
     }
     if(g_scanoutContainsLeasedFrame){
         ++g_softwareTakeover.count;
@@ -4425,10 +4434,11 @@ static void CompositorLoop()
     if (WmIsActive()) WmLaunchFeedbackPoll();
     CursorPrepareFrame(WmIsActive() && WmLaunchBusy(), loopStartTick);
 
+    bool clientFrame = false;
     // Branch: WM mode vs legacy mode
     if (WmIsActive())
     {
-        CompositorLoopWM();
+        CompositorLoopWM(clientFrame);
     }
     else
     {
@@ -4493,7 +4503,7 @@ static void CompositorLoop()
         if (!p->fbVirtual || p->fbVfbWidth == 0)
             continue;
 
-        BlitProcess(p, forceAll);
+        clientFrame |= BlitProcess(p, forceAll);
     }
     } // end if (g_compositedCount > 0)
     // Even with no composited windows, drain input events so the grabber
@@ -4567,7 +4577,7 @@ static void CompositorLoop()
     // Flip: copy only dirty scanlines from backbuffer → MMIO framebuffer.
     else
     {
-        CompositorFlipSoftware();
+        CompositorFlipSoftware(clientFrame);
     }
 
     const uint64_t probePresentEnd=ApicTickCount();

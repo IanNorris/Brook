@@ -1,4 +1,5 @@
 #include "guard_checker_runner.h"
+#include "sync/kmutex.h"
 #include "guard_checker_session.h"
 #include "guard_fat_profile.h"
 #include "ahci_system_volume.h"
@@ -54,8 +55,35 @@ namespace {
 bool guardedDesktopBridge=false;
 uint8_t guardedDesktopIdentityDigest[32]{};
 FatPrivateMount* guardedDesktopMount=nullptr;
+KMutex slotTransition{};
+struct DesktopSlotStart {
+    FatPrivateMount* mount;
+    BootGuardSlot slot;
+    uint64_t firstPresent;
+};
+DesktopSlotStart slotStart{};
+bool checkedSlotShutdown = false;
 }
 bool GuardedDesktopBridgeEnabled() {return __atomic_load_n(&guardedDesktopBridge,__ATOMIC_ACQUIRE);}
+void GuardPrepareCheckedSlotShutdown()
+{
+    KMutexLock(&slotTransition);
+    checkedSlotShutdown = true;
+    KMutexUnlock(&slotTransition);
+}
+void GuardRecordCheckedSlotShutdown()
+{
+    KMutexLock(&slotTransition);
+    const auto presents = CompositorDesktopPresentCount();
+    if (checkedSlotShutdown && DeviceFinalSyncOwner() && !KernelPanicActive() &&
+        slotStart.mount && GuardDesktopHasPresentEvidence(slotStart.firstPresent, presents)) {
+        const int recorded = FatFsPrivateRecoveryFinishSlot(slotStart.mount, GuardSlotCompletion::CheckedShutdown);
+        KPrintf("GUARD_SLOT_CHECKED_SHUTDOWN status=%d generation=%lu slot=%u presents=%lu\n",
+                recorded, slotStart.slot.generation, slotStart.slot.slot, presents-slotStart.firstPresent);
+        slotStart.mount = nullptr;
+    }
+    KMutexUnlock(&slotTransition);
+}
 int GuardedDesktopCheckGuardIdentity(const uint8_t (&digest)[32]) {
     if(!GuardedDesktopBridgeEnabled())return -11;
     if(!BrookUpdateEqual(digest,guardedDesktopIdentityDigest,sizeof(digest)))return -116;
@@ -346,7 +374,7 @@ void Worker(void* arg) {
         }
         if(handoff) {
             if(slotStarted && sharedProfileRejected) {
-                const int recorded=FatFsPrivateRecoveryFinishSlot(mount,true);
+                const int recorded=FatFsPrivateRecoveryFinishSlot(mount,GuardSlotCompletion::ProfileRejected);
                 KPrintf("GUARD_SLOT_PROFILE_REJECTED status=%d generation=%lu slot=%u\n",
                         recorded,guardedBootSlot.generation,guardedBootSlot.slot);
             }
@@ -390,6 +418,11 @@ void Worker(void* arg) {
                 PublishRecoverySlotStatus(mount,"desktop-failure");
             return;
         }
+        if(slotStarted) {
+            KMutexLock(&slotTransition);
+            slotStart = {mount, guardedBootSlot, firstPresent};
+            KMutexUnlock(&slotTransition);
+        }
         if(!ShutdownLaunchAllowed())return;
         // Both clean guard records were verified together and their canonical
         // files remain exclusively leased for the lifetime of this mount.
@@ -406,10 +439,15 @@ void Worker(void* arg) {
                 const auto now=ApicTickCount();
                 const auto presents=CompositorDesktopPresentCount();
                 if(GuardDesktopHealthReady(startedAt,now,firstPresent,presents)) {
-                    const int confirmed=FatFsPrivateRecoveryFinishSlot(mount,false);
-                    KPrintf("GUARD_SLOT_CONFIRMED status=%d generation=%lu slot=%u healthy_ms=%lu presents=%lu\n",
-                            confirmed,guardedBootSlot.generation,guardedBootSlot.slot,
-                            now-startedAt,presents-firstPresent);
+                    KMutexLock(&slotTransition);
+                    if (!checkedSlotShutdown && ShutdownLaunchAllowed() && !KernelPanicActive()) {
+                        const int confirmed=FatFsPrivateRecoveryFinishSlot(mount,GuardSlotCompletion::Confirmed);
+                        KPrintf("GUARD_SLOT_CONFIRMED status=%d generation=%lu slot=%u healthy_ms=%lu presents=%lu\n",
+                                confirmed,guardedBootSlot.generation,guardedBootSlot.slot,
+                                now-startedAt,presents-firstPresent);
+                        slotStart.mount = nullptr;
+                    }
+                    KMutexUnlock(&slotTransition);
                     break;
                 }
                 SchedulerSleepMs(250);

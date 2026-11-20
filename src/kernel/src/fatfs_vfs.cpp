@@ -2252,7 +2252,7 @@ int FatFsPrivateRecoveryStartSlot(FatPrivateMount* session, const BootGuardSlot&
     return 0;
 }
 
-int FatFsPrivateRecoveryFinishSlot(FatPrivateMount* session, bool profileRejected)
+int FatFsPrivateRecoveryFinishSlot(FatPrivateMount* session, GuardSlotCompletion completion)
 {
     if (!session) return -22;
     auto* device = FatFsImageLeaseDevice(session->slotHealthLease);
@@ -2264,7 +2264,11 @@ int FatFsPrivateRecoveryFinishSlot(FatPrivateMount* session, bool profileRejecte
     GuardSlotJournal journal;
     if (!GuardSlotRead(io, session->slotHealthDisk, journal)) return -117;
     if (journal.health.sequence != session->slotStartSequence) return -116;
-    if (!GuardSlotFinish(journal.health, session->slotHealthKey, profileRejected)) return -13;
+    const bool recorded = completion == GuardSlotCompletion::CheckedShutdown
+        ? GuardSlotWithdrawStart(journal.health, session->slotHealthKey)
+        : GuardSlotFinish(journal.health, session->slotHealthKey,
+                          completion == GuardSlotCompletion::ProfileRejected);
+    if (!recorded) return -13;
     if (GuardSlotWrite(io, session->slotHealthDisk, journal.health)) return 0;
     session->slotHealthReady = false;
     return -5;

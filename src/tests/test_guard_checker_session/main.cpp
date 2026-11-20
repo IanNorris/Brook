@@ -73,6 +73,9 @@ static Process process(uint16_t pid,uint16_t tgid,uint64_t incarnation,uint64_t 
 }
 static void childDone(pid_t pid) {int status=0;assert(waitpid(pid,&status,0)==pid && WIFEXITED(status) && !WEXITSTATUS(status));}
 int main() {
+    assert(!brook::GuardDesktopHasPresentEvidence(10,9));
+    assert(!brook::GuardDesktopHasPresentEvidence(10,11));
+    assert(brook::GuardDesktopHasPresentEvidence(10,12));
     assert(!brook::GuardDesktopHealthReady(1000,60999,2,200));
     assert(!brook::GuardDesktopHealthReady(1000,61000,25,26));
     assert(!brook::GuardDesktopHealthReady(1000,1000,25,27));

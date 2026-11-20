@@ -116,6 +116,25 @@ struct SlotHealthIo {
     bool flush() const { return !failFlush; }
 };
 
+static void SlotHealthCheckedShutdown() {
+    using namespace brook;
+    const BootGuardSlot active{2,1,0,{20}};
+    const BootGuardSlot unrelated{2,1,0,{21}};
+    const BootGuardSlot older{1,0,0,{10}};
+    GuardSlotHealth health{};
+
+    assert(GuardSlotStart(health,older));
+    assert(GuardSlotFinish(health,older,true));
+    assert(GuardSlotStart(health,active)); // Earlier failed boot.
+    assert(GuardSlotStart(health,active)); // Current checked-shutdown boot.
+    assert(!GuardSlotWithdrawStart(health,unrelated));
+    assert(!GuardSlotWithdrawStart(health,older));
+    assert(GuardSlotWithdrawStart(health,active));
+    assert(health.slots[1].starts==1);
+    assert(health.slots[0].starts==1 && health.slots[0].profileRejected);
+    assert(GuardChooseSlot(health,active,older)==GuardSlotChoice::Newest);
+}
+
 static void SlotHealthPolicy() {
     using namespace brook;
     const BootGuardSlot previous{1,0,0,{10}};
@@ -375,6 +394,7 @@ static void EmergencySlotSelection()
 }
 
 int main() {
+    SlotHealthCheckedShutdown();
     SlotHealthPolicy();
     SlotProfileRejectionPolicy();
     SlotHealthPersistence();

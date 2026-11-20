@@ -21,6 +21,8 @@ int GuardedDesktopCheckGuardIdentity(const uint8_t (&digest)[32]);
 #endif
 #if defined(BROOK_SSD_GUARDED_DESKTOP)
 bool GuardedDesktopBridgeEnabled();
+void GuardPrepareCheckedSlotShutdown();
+void GuardRecordCheckedSlotShutdown();
 #if defined(BROOK_SSD_AUTO_RECOVERY)
 struct AcShutdownRecord;
 bool GuardCheckedAcShutdownPrior(AcShutdownRecord& out);

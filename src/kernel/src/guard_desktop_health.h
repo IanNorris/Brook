@@ -7,11 +7,16 @@ namespace brook {
 // well as time for failures in asynchronously launched services to surface.
 constexpr uint64_t GuardDesktopHealthWindowMs = 60000;
 
+inline bool GuardDesktopHasPresentEvidence(uint64_t firstCount, uint64_t presents)
+{
+    return presents >= firstCount && presents - firstCount >= 2;
+}
+
 inline bool GuardDesktopHealthReady(uint64_t start, uint64_t now,
                                     uint64_t firstCount, uint64_t presents)
 {
     return now >= start && now - start >= GuardDesktopHealthWindowMs &&
-           presents >= firstCount && presents - firstCount >= 2;
+           GuardDesktopHasPresentEvidence(firstCount, presents);
 }
 
 }

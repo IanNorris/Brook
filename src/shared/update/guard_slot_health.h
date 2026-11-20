@@ -78,6 +78,15 @@ inline bool GuardSlotFinish(GuardSlotHealth& health, const BootGuardSlot& key, b
     return true;
 }
 
+inline bool GuardSlotWithdrawStart(GuardSlotHealth& health, const BootGuardSlot& key)
+{
+    if (!GuardSlotMatches(health, key)) return false;
+    auto& entry = health.slots[key.slot];
+    if (!entry.starts || entry.profileRejected) return false;
+    --entry.starts;
+    return true;
+}
+
 enum class GuardSlotChoice { Newest, Previous, Recovery };
 
 inline GuardSlotChoice GuardChooseSlot(const GuardSlotHealth& health, const BootGuardSlot& newest,

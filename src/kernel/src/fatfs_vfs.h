@@ -71,7 +71,8 @@ struct BootGuardSlot;
 // zero when there is no pin, and a negative error on uncertain state.
 int FatFsPrivateRecoveryCheckPinnedSlotHealth(FatPrivateMount*,const uint8_t (&digest)[32]);
 int FatFsPrivateRecoveryStartSlot(FatPrivateMount* mount, const BootGuardSlot& slot, uint32_t& starts);
-int FatFsPrivateRecoveryFinishSlot(FatPrivateMount* mount, bool profileRejected);
+enum class GuardSlotCompletion { Confirmed, ProfileRejected, CheckedShutdown };
+int FatFsPrivateRecoveryFinishSlot(FatPrivateMount* mount, GuardSlotCompletion completion);
 // Call only on the checked, private ESP before publishing the desktop mount.
 int FatFsPrivateRecoveryPinAcShutdown(FatPrivateMount* mount,AcShutdownRecord& previous);
 // Shutdown coordinator only, after checked filesystem sync and clean readback.
