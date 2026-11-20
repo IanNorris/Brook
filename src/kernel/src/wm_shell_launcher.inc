@@ -12,17 +12,31 @@ static const uint32_t* g_launcherModelIcon[LauncherLimits::Apps];
 static uint32_t g_launcherModelGeneration = 0;
 static ChromeLauncherFrame g_launcherFrame;
 
-// Persistence: the compositor serialises a changed layout; the launcher
-// worker writes it, at most once a second, as a temporary file and a rename.
+// The compositor queues serialized layouts. Only the worker writes them.
 static constexpr const char* LauncherLayoutPath = "/data/home/.config/brook/launcher.ini";
-static constexpr const char* LauncherLayoutTemp = "/data/home/.config/brook/launcher.ini.tmp";
+static constexpr const char* LauncherLayoutName = "launcher.ini";
+static constexpr const char* LauncherLayoutTemp = "launcher.ini.tmp";
 static constexpr uint32_t LauncherLayoutLimit = 16 * 1024;
 static SpinLock g_launcherSaveLock;
+static LauncherPersistenceStatus g_launcherPersistence;
 static char g_launcherSaveText[LauncherLayoutLimit];
 static uint32_t g_launcherSaveBytes = 0;
-static bool g_launcherSavePending = false;
-static uint64_t g_launcherSaveChanged = 0;
-static uint32_t g_launcherSavedEpoch = 0;
+static uint32_t g_launcherQueuedEpoch = 0;
+static uint64_t g_launcherSaveSince = 0;
+static uint32_t g_launcherSaveDelay = 0;
+
+static void LauncherNoteLayout(bool firstCatalog = false);
+
+void WmLauncherPersistenceStatus(LauncherPersistenceStatus& out)
+{
+    SpinLockAcquire(&g_launcherSaveLock);
+    out = g_launcherPersistence;
+    SpinLockRelease(&g_launcherSaveLock);
+    const bool running = __atomic_load_n(&g_launcherWorkerRunning, __ATOMIC_ACQUIRE);
+    const bool started = __atomic_load_n(&g_launcherWorkerStarted, __ATOMIC_ACQUIRE);
+    out.worker = running ? "running" : started ? "starting" : "stopped";
+    out.path = LauncherLayoutPath;
+}
 
 // The model's stable key for a catalog item: the app_id, or the shortcut
 // file name ("/boot/SHORTCUTS/QUAKE.RC" -> "quake"), or a desktop title.
@@ -61,77 +75,196 @@ static void LauncherSyncModel(const LauncherSnapshot& catalog)
         g_launcherModelIcon[count] = item.iconPixels ? item.iconPixels : catalog.applicationIcon;
         ++count;
     }
+    const bool firstCatalog = g_launcherModelGeneration == 0;
     g_launcherModel.SetCatalog(apps, count);
     g_launcherModelGeneration = catalog.generation;
+    LauncherNoteLayout(firstCatalog);
 }
 
-// Shell context, once, before the first catalog: a bad or missing file keeps
-// the defaults (never an error).
+static LauncherPersistenceResult LauncherReadLayout()
+{
+    VfsPath root{};
+    int error = VfsPathRoot(&root);
+    if (error) return {"root", error};
+    VfsPath path{};
+    error = VfsPathResolve(root, root, LauncherLayoutPath, &path, false);
+    VfsPathRelease(root);
+    if (error) return {error == -2 ? "missing" : "lookup", error};
+    VnodeStat stat{};
+    error = VfsPathStat(path, &stat);
+    if (error || (stat.mode & 0170000) != 0100000) {
+        VfsPathRelease(path);
+        return {"type", error ? error : -22};
+    }
+    auto* file = VfsPathOpen(path, VFS_O_READ, &error);
+    VfsPathRelease(path);
+    if (!file) return {"open", error};
+    auto* text = static_cast<char*>(kmalloc(LauncherLayoutLimit));
+    uint32_t done = 0;
+    if (!text) error = -12;
+    uint64_t offset = 0;
+    while (!error && done < LauncherLayoutLimit) {
+        const int rd = VfsRead(file, text + done, LauncherLayoutLimit - done, &offset);
+        if (rd <= 0) { error = rd; break; }
+        done += static_cast<uint32_t>(rd);
+    }
+    VfsClose(file);
+    LauncherPersistenceResult result{"restored", 0};
+    if (error) result = {"read", error};
+    else if (done == LauncherLayoutLimit) result = {"size", -7};
+    else {
+        text[done] = 0;
+        if (!g_launcherModel.Parse(text)) result = {"parse", -22};
+    }
+    kfree(text);
+    return result;
+}
+
 static void LauncherLoadLayout()
 {
     g_launcherModel.Init();
-    Vnode* vn = VfsOpen(LauncherLayoutPath, 0);
-    if (!vn) return;
-    char* text = static_cast<char*>(kmalloc(LauncherLayoutLimit + 1));
-    uint32_t done = 0;
-    bool ok = text != nullptr;
-    if (ok) {
-        uint64_t offset = 0;
-        while (done < LauncherLayoutLimit) {
-            const int rd = VfsRead(vn, text + done, LauncherLayoutLimit - done, &offset);
-            if (rd < 0) { ok = false; break; }
-            if (!rd) break;
-            done += static_cast<uint32_t>(rd);
-        }
-    }
-    VfsClose(vn);
-    if (ok && done < LauncherLayoutLimit) {
-        text[done] = 0;
-        SerialPrintf("WM: launcher layout %s (%u bytes)\n", g_launcherModel.Parse(text) ? "restored" : "invalid; defaults", done);
-    }
-    kfree(text);
+    const auto result = LauncherReadLayout();
+    SpinLockAcquire(&g_launcherSaveLock);
+    g_launcherPersistence.load = result;
+    if (!result.error) g_launcherPersistence.savedEpoch = g_launcherModel.LayoutEpoch();
+    SpinLockRelease(&g_launcherSaveLock);
+    if (!result.error) KLOG_INFO(Wm, "launcher: layout restored");
+    else if (strcmp(result.stage, "missing"))
+        KLogCatConsole(LogCat::Wm, LogLevel::Warn, "launcher: load failed stage=%s errno=%d", result.stage, -result.error);
 }
 
-// Compositor thread: hand a changed layout to the worker.
-static void LauncherNoteLayout()
+// The model is owned by the compositor after initial activation. Publish a
+// snapshot of the stable keys and serialized bytes for the other readers.
+static void LauncherNoteLayout(bool firstCatalog)
 {
     const uint32_t epoch = g_launcherModel.LayoutEpoch();
-    if (epoch == g_launcherSavedEpoch) return;
     static char text[LauncherLayoutLimit];
-    const uint32_t bytes = g_launcherModel.Serialize(text, sizeof(text));
-    g_launcherSavedEpoch = epoch;
-    if (!bytes) { SerialPuts("WM: launcher layout exceeds 16 KiB; not saved\n"); return; }
     SpinLockAcquire(&g_launcherSaveLock);
-    memcpy(g_launcherSaveText, text, bytes);
-    g_launcherSaveBytes = bytes;
-    g_launcherSavePending = true;
-    g_launcherSaveChanged = ApicTickCount();
+    auto& state = g_launcherPersistence;
+    if (epoch == state.layoutEpoch) {
+        SpinLockRelease(&g_launcherSaveLock);
+        return;
+    }
+    state.layoutEpoch = epoch;
+    state.pinCount = g_launcherModel.PinCount();
+    for (uint32_t i = 0; i < state.pinCount; ++i)
+        WmStrCopy(state.pins[i], g_launcherModel.PinKey(i), sizeof(state.pins[i]));
+
+    // Seed missing layouts at first boot. Preserve an unreadable or invalid
+    // existing file until the user actually changes the layout.
+    const bool seed = !strcmp(state.load.stage, "missing");
+    if (firstCatalog && !seed) {
+        SpinLockRelease(&g_launcherSaveLock);
+        return;
+    }
     SpinLockRelease(&g_launcherSaveLock);
+    const uint32_t bytes = g_launcherModel.Serialize(text, sizeof(text));
+    SpinLockAcquire(&g_launcherSaveLock);
+    if (bytes) memcpy(g_launcherSaveText, text, bytes);
+    g_launcherSaveBytes = bytes;
+    g_launcherQueuedEpoch = epoch;
+    state.pending = g_launcherSaveBytes != 0;
+    g_launcherSaveSince = ApicTickCount();
+    g_launcherSaveDelay = 1000;
+    if (!state.pending) state.save = {"serialize", -7};
+    const bool queued = state.pending;
+    SpinLockRelease(&g_launcherSaveLock);
+    if (!queued) KLogCatConsole(LogCat::Wm, LogLevel::Warn, "launcher: save failed stage=serialize errno=7");
 }
 
-// Launcher worker: debounced atomic write.
+// Open config directories relative to the actual home attachment. Create
+// only the two launcher config ancestors, leaving existing ownership alone.
+static int LauncherConfigDir(const VfsPath& root, VfsPath* out)
+{
+    VfsPath directory{};
+    int error = VfsPathResolve(root, root, "/data/home", &directory);
+    const char* parts[] = {".config", "brook"};
+    for (const char* part : parts) {
+        if (error) break;
+        VfsPath next{};
+        error = VfsPathResolve(root, directory, part, &next, false);
+        if (error == -2) {
+            error = VfsMkdirAt(root, directory, part, 0700, 0);
+            if (!error) error = VfsChownAt(root, directory, part, DesktopUid, DesktopGid, false);
+            if (!error || error == -17) error = VfsPathResolve(root, directory, part, &next, false);
+        }
+        VfsPathRelease(directory);
+        directory = next;
+    }
+    if (error) VfsPathRelease(directory);
+    else *out = directory;
+    return error;
+}
+
+static LauncherPersistenceResult LauncherWriteLayout(const VfsPath& root, const VfsPath& directory,
+                                                     const char* text, uint32_t bytes)
+{
+    // A power cut can leave our temporary entry behind. Unlink the entry
+    // itself, then create exclusively so we never truncate an existing inode.
+    int error = VfsRemoveAt(root, directory, LauncherLayoutTemp, false);
+    if (error && error != -2) return {"remove-temp", error};
+    auto* file = VfsOpenAt(root, directory, LauncherLayoutTemp,
+                           VFS_O_WRITE | VFS_O_CREATE | VFS_O_EXCL, 0600, 0, &error, false);
+    if (!file) return {"create", error};
+
+    LauncherPersistenceResult result{"saved", 0};
+    uint64_t offset = 0;
+    while (offset < bytes) {
+        const int written = VfsWrite(file, text + offset, bytes - offset, &offset);
+        if (written <= 0) { result = {"write", written ? written : -5}; break; }
+    }
+    if (!result.error && (error = VfsChown(file, DesktopUid, DesktopGid))) result = {"chown", error};
+    if (!result.error && (error = VfsFsync(file))) result = {"sync-file", error};
+    VfsClose(file);
+    if (!result.error && (error = VfsRenameAt(root, directory, LauncherLayoutTemp, directory, LauncherLayoutName)))
+        result = {"rename", error};
+    if (result.error) {
+        VfsRemoveAt(root, directory, LauncherLayoutTemp, false);
+        return result;
+    }
+    auto* dir = VfsPathOpen(directory, VFS_O_READ, &error);
+    if (!dir) return {"open-directory", error};
+    error = VfsFsync(dir);
+    VfsClose(dir);
+    return error ? LauncherPersistenceResult{"sync-directory", error} : result;
+}
+
 static void LauncherSaveLayout()
 {
     static char text[LauncherLayoutLimit];
-    uint32_t bytes = 0;
     SpinLockAcquire(&g_launcherSaveLock);
-    const bool due = g_launcherSavePending && ApicTickCount() - g_launcherSaveChanged >= 1000;
-    if (due) {
-        memcpy(text, g_launcherSaveText, g_launcherSaveBytes);
-        bytes = g_launcherSaveBytes;
-        g_launcherSavePending = false;
+    auto& state = g_launcherPersistence;
+    if (!state.pending || ApicTickCount() - g_launcherSaveSince < g_launcherSaveDelay) {
+        SpinLockRelease(&g_launcherSaveLock);
+        return;
+    }
+    const uint32_t epoch = g_launcherQueuedEpoch, bytes = g_launcherSaveBytes;
+    memcpy(text, g_launcherSaveText, bytes);
+    state.saving = true;
+    SpinLockRelease(&g_launcherSaveLock);
+
+    VfsPath root{}, directory{};
+    LauncherPersistenceResult result;
+    if (const int error = VfsPathRoot(&root)) result = {"root", error};
+    else if (const int dirError = LauncherConfigDir(root, &directory)) result = {"directory", dirError};
+    else result = LauncherWriteLayout(root, directory, text, bytes);
+    VfsPathRelease(directory);
+    VfsPathRelease(root);
+
+    SpinLockAcquire(&g_launcherSaveLock);
+    const bool newResult = result.error != state.save.error || strcmp(result.stage, state.save.stage);
+    state.save = result;
+    state.saving = false;
+    if (!result.error) state.savedEpoch = epoch;
+    if (g_launcherQueuedEpoch == epoch) {
+        state.pending = result.error != 0;
+        g_launcherSaveSince = ApicTickCount();
+        g_launcherSaveDelay = 5000;
     }
     SpinLockRelease(&g_launcherSaveLock);
-    if (!due) return;
-    Vnode* vn = VfsOpenMode(LauncherLayoutTemp, VFS_O_WRITE | VFS_O_CREATE | VFS_O_TRUNC, 0644);
-    if (!vn) { SerialPuts("WM: launcher layout: cannot create the temporary file\n"); return; }
-    uint64_t offset = 0;
-    const int written = VfsWrite(vn, text, bytes, &offset);
-    VfsChown(vn, DesktopUid, DesktopGid);
-    VfsClose(vn);
-    if (written != static_cast<int>(bytes) || VfsRename(LauncherLayoutTemp, LauncherLayoutPath) != 0)
-        SerialPrintf("WM: launcher layout save failed (wrote %d of %u)\n", written, bytes);
-    else SerialPrintf("WM: launcher layout saved (%u bytes)\n", bytes);
+    if (result.error && newResult)
+        KLogCatConsole(LogCat::Wm, LogLevel::Warn, "launcher: save failed stage=%s errno=%d", result.stage, -result.error);
+    if (!result.error) KLOG_INFO(Wm, "launcher: layout saved epoch=%u bytes=%u", epoch, bytes);
 }
 
 static ChromeLauncherChrome LauncherChrome(int32_t mouseX, int32_t mouseY)

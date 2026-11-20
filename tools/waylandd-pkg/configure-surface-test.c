@@ -11,9 +11,14 @@ static long test_syscall(long,...);
 #undef syscall
 
 static unsigned created_windows;
+static uint32_t screen_width, screen_height;
 static uint32_t remap_vfb[4];
 static long test_syscall(long number,...) {
     if (number==0xB06) { errno=EOPNOTSUPP;return -1; }
+    if (number==BROOK_SYS_WM_GET_SCREEN_INFO) {
+        va_list ap; va_start(ap,number); uint32_t *out=(void *)va_arg(ap,long); va_end(ap);
+        out[0]=screen_width; out[1]=screen_height;
+    }
     if (number==BROOK_SYS_WM_CREATE_WINDOW) {
         va_list ap;va_start(ap,number);long w=va_arg(ap,long),h=va_arg(ap,long);
         (void)va_arg(ap,long);struct brook_wm_create_out *out=(void *)va_arg(ap,long);va_end(ap);
@@ -39,6 +44,8 @@ static void requests(struct wl_display *connection, struct wl_event_loop *loop) 
 }
 static uint32_t observed_toplevel;
 static int32_t observed_width,observed_height;
+static unsigned bounds_events, capability_events;
+static int32_t bounds_width, bounds_height;
 static uint32_t configure_serial(struct wl_display *display, int fd, uint32_t object) {
     wl_display_flush_clients(display);
     uint32_t wire[256];
@@ -46,10 +53,29 @@ static uint32_t configure_serial(struct wl_display *display, int fd, uint32_t ob
     assert(bytes > 0);
     uint32_t serial = 0;
     unsigned count = 0;
+    int configured = 0;
+    bounds_events = capability_events = 0;
     for (size_t i = 0; i < (size_t)bytes / 4;) {
         uint32_t id = wire[i], op = wire[i+1] & 65535, size = wire[i+1] >> 16;
         assert(size >= 8 && i * 4 + size <= (size_t)bytes);
-        if(id==observed_toplevel && op==XDG_TOPLEVEL_CONFIGURE){observed_width=(int32_t)wire[i+2];observed_height=(int32_t)wire[i+3];}
+        if (id == observed_toplevel && op == XDG_TOPLEVEL_CONFIGURE) {
+            observed_width = (int32_t)wire[i+2];
+            observed_height = (int32_t)wire[i+3];
+            configured = 1;
+        }
+        if (id == observed_toplevel && op == XDG_TOPLEVEL_CONFIGURE_BOUNDS) {
+            assert(!configured && !count && size == 16);
+            ++bounds_events;
+            bounds_width = (int32_t)wire[i+2];
+            bounds_height = (int32_t)wire[i+3];
+        }
+        if (id == observed_toplevel && op == XDG_TOPLEVEL_WM_CAPABILITIES) {
+            assert(!configured && !count && size == 24 && wire[i+2] == 12);
+            assert(wire[i+3] == XDG_TOPLEVEL_WM_CAPABILITIES_MAXIMIZE);
+            assert(wire[i+4] == XDG_TOPLEVEL_WM_CAPABILITIES_MINIMIZE);
+            assert(wire[i+5] == XDG_TOPLEVEL_WM_CAPABILITIES_FULLSCREEN);
+            ++capability_events;
+        }
         if (id == object && op == XDG_SURFACE_CONFIGURE) {
             assert(size == 12); serial = wire[i+2]; ++count;
         }
@@ -58,12 +84,56 @@ static uint32_t configure_serial(struct wl_display *display, int fd, uint32_t ob
     assert(count == 1);
     return serial;
 }
+static void check_toplevel_versions(struct wl_display *display, struct wl_client *client, int fd)
+{
+    const unsigned previous_scale = g_output_scale;
+    g_output_scale = 2;
+    for (int version = 3; version <= BROOK_XDG_WM_BASE_VERSION; ++version) {
+        screen_width = 3200; screen_height = 1800;
+        struct brook_surface surface = {0};
+        surface_tree_init(&surface);
+        surface.resource = wl_resource_create(client, &wl_surface_interface, 4, 0);
+        surface.xdg_surface = wl_resource_create(client, &xdg_surface_interface, version, 0);
+        assert(surface.resource && surface.xdg_surface);
+        wl_resource_set_user_data(surface.resource, &surface);
+        wl_resource_set_user_data(surface.xdg_surface, &surface);
+        xdg_surface_get_toplevel(client, surface.xdg_surface, 0);
+        assert(surface.xdg_toplevel && wl_resource_get_version(surface.xdg_toplevel) == version);
+        observed_toplevel = wl_resource_get_id(surface.xdg_toplevel);
+        const uint32_t id = wl_resource_get_id(surface.xdg_surface);
+        surface_commit(client, surface.resource);
+        configure_serial(display, fd, id);
+        assert(observed_width == 800 && observed_height == 600);
+        assert(bounds_events == (version >= 4) && capability_events == (version >= 5));
+        if (version >= 4) assert(bounds_width == 1600 && bounds_height == 900);
+
+        assert(toplevel_send_state(&surface, 800, 600));
+        configure_serial(display, fd, id);
+        assert(!bounds_events && !capability_events);
+
+        screen_width = 2560; screen_height = 1440;
+        assert(toplevel_send_state(&surface, 800, 600));
+        configure_serial(display, fd, id);
+        assert(bounds_events == (version >= 4) && !capability_events);
+        if (version >= 4) assert(bounds_width == 1280 && bounds_height == 720);
+
+        wl_resource_destroy(surface.xdg_toplevel);
+        wl_resource_destroy(surface.xdg_surface);
+        wl_resource_destroy(surface.resource);
+        wl_display_flush_clients(display);
+        uint32_t deleted[64];
+        while (recv(fd, deleted, sizeof(deleted), MSG_DONTWAIT) > 0) {}
+    }
+    screen_width = screen_height = 0;
+    g_output_scale = previous_scale;
+}
 int main(void) {
     int sockets[2]; assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
     struct wl_display *display = wl_display_create(); assert(display);
     assert(wl_display_init_shm(display) == 0);
     struct wl_event_loop *loop = wl_display_get_event_loop(display);
     struct wl_client *client = wl_client_create(display, sockets[0]); assert(client);
+    check_toplevel_versions(display, client, sockets[1]);
     struct wl_display *connection = wl_display_connect_to_fd(sockets[1]); assert(connection);
     struct wl_registry *registry = wl_display_get_registry(connection); assert(registry);
     assert(wl_registry_add_listener(registry, &registry_listener, NULL) == 0);

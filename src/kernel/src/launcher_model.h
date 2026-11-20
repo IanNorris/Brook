@@ -119,6 +119,8 @@ public:
     int CategoryOf(uint32_t app) const { return appCategory_[app]; } // -1: Unsorted
     uint32_t UnsortedCount() const;
 
+    uint32_t PinCount() const { return pinCount_; }
+    const char* PinKey(uint32_t index) const { return keys_[pins_[index]]; }
     bool Pinned(uint32_t app) const;
     void TogglePin(uint32_t app);
     void NoteLaunch(uint32_t app);     // front of Recent

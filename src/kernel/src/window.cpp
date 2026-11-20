@@ -51,6 +51,7 @@
 #include "input.h"
 #include "mouse.h"
 #include "serial.h"
+#include "klog.h"
 #include "panic.h"
 #include "rtc.h"
 #include "terminal.h"
@@ -664,6 +665,7 @@ static SpinLock g_launcherLock;
 static uint64_t g_launcherSnapshotEpoch=1;
 static uint32_t g_launcherRequested = 1;
 static bool g_launcherWorkerStarted = false;
+static bool g_launcherWorkerRunning = false;
 static bool g_launcherLoaded = false;
 static bool g_launcherOpen = false;
 static int g_launcherError = 0;
@@ -674,6 +676,7 @@ static void LauncherStartWorker();
 // and the open launcher's state. Init() runs in WmLauncherLoad.
 static LauncherModel g_launcherModel;
 static void LauncherLoadLayout();
+static void LauncherSyncModel(const LauncherSnapshot& catalog);
 static void LauncherSaveLayout();
 static void LauncherPowerRun(LauncherPowerCommand command);
 
@@ -2364,6 +2367,7 @@ static LauncherSnapshot* BuildLauncherSnapshot(uint32_t generation)
 static bool g_launchInhibited=false;
 static void LauncherWorker(void*)
 {
+    __atomic_store_n(&g_launcherWorkerRunning, true, __ATOMIC_RELEASE);
     uint32_t attempted = 0;
     { LauncherReadGuard guard; attempted = guard.get().generation; }
     for (;;)
@@ -2452,7 +2456,7 @@ static void LauncherStartWorker()
     Process* worker = KernelThreadCreate("launcher", LauncherWorker, nullptr, 3);
     if (!worker) {
         __atomic_store_n(&g_launcherWorkerStarted, false, __ATOMIC_RELEASE);
-        SerialPuts("WM: launcher worker allocation failed\n");
+        KLogCatConsole(LogCat::Wm, LogLevel::Warn, "launcher: worker allocation failed errno=12");
         return;
     }
     SchedulerAddProcess(worker);
@@ -2474,6 +2478,7 @@ void WmLauncherLoad()
           if(g_launcherSnapshotEpoch)++g_launcherSnapshotEpoch;
           SpinLockRelease(&g_launcherLock);
         }
+        LauncherSyncModel(*snapshot);
         SerialPrintf("WM: launcher initial generation=%u items=%u\n", generation, snapshot->count);
     }
     g_launcherLoaded = true;

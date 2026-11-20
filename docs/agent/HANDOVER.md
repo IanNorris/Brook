@@ -23,6 +23,25 @@ _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review 
 - The pair `build/dell/pair-s3r` (`dell-s3r-20261119`) was built from
   `c11c9043` with Clearwater enabled and the four Broadwell options.
   Guarded QEMU passed on attempt 1. Dell deployment is pending.
+## Desktop chooser schemas (19 November 2026)
+
+- `work/settings-schemas` compiles GTK3, GTK4 and GNOME GSettings schemas
+  into the existing Brook profile lookup directory. The build checks both
+  chooser schemas for both GTK versions and preserves existing keyfile
+  layout values.
+- The pinned GTK3 color button opened its chooser on a private virtual
+  display with the new schema directory as its only source.
+  Package `/nix/store/r6lz8cqz7hyk4l9j7lyymdzfhsgxgv49-brook-desktop-settings`.
+  Logs are in `build/schema-evidence`. Dell validation is pending.
+## xdg-shell window controls (20 November 2026)
+
+- `work/xdg-wm-capabilities` advertises v5 with logical configure bounds and
+  Maximise, Minimise and Fullscreen capabilities. GTK4 enabled both formerly
+  insensitive controls on a private Wayland display. GTK3 and Chromium
+  retained the initial configure handshake.
+- Headless Release, 386 non-stress host tests and the standard and Vulkan
+  waylandd package fixtures passed. Logs and matched client traces are in
+  `build/xdg-evidence`. The Dell still needs to exercise the buttons.
 
 ## Session environment and executable cache (19 November 2026)
 
