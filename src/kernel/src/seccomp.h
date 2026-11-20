@@ -10,6 +10,7 @@ struct SeccompFilter {
     uint32_t references;
     unsigned count;
     unsigned pathInstructions;
+    bool logRequested;
     SeccompInstruction code[];
 };
 
@@ -23,5 +24,6 @@ int64_t SeccompPrctl(uint64_t option, uint64_t mode, uint64_t program);
 int64_t SysSeccomp(uint64_t operation, uint64_t flags, uint64_t argument,
                   uint64_t, uint64_t, uint64_t);
 int64_t SeccompDenied(Process* process, uint64_t syscall, uint32_t verdict);
-uint32_t SeccompEvaluate(const SeccompFilter* filter, const SeccompData& data);
+uint32_t SeccompEvaluate(const SeccompFilter* filter, const SeccompData& data, bool* audit);
+void SeccompAudit(const Process* process, uint64_t syscall, uint32_t verdict);
 }

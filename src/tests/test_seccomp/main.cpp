@@ -72,11 +72,20 @@ int main()
 
     assert(!SeccompVerify(policy, 0));
     assert(!SeccompVerify(policy, SeccompMaxFilterInstructions + 1));
-    assert(SeccompSupportedAction(SeccompAllow) && !SeccompSupportedAction(0x7fc00000));
+    assert(SeccompSupportedAction(SeccompAllow) && SeccompSupportedAction(SeccompLog));
+    assert(SeccompSupportedAction(SeccompTrace) && !SeccompSupportedAction(SeccompUserNotify));
     assert(SeccompSelectAction(SeccompAllow, SeccompErrno | 1) == (SeccompErrno | 1));
     assert(SeccompSelectAction(SeccompErrno | 1, SeccompErrno | 2) == (SeccompErrno | 1));
     assert(SeccompSelectAction(SeccompErrno | 1, SeccompTrap | 3) == (SeccompTrap | 3));
     assert(SeccompSelectAction(SeccompTrap, SeccompKillThread) == SeccompKillThread);
     assert(SeccompSelectAction(SeccompKillThread, SeccompKillProcess) == SeccompKillProcess);
-    assert(SeccompSelectAction(SeccompAllow, 0x7fc00000) == SeccompKillProcess);
+    assert(SeccompSelectAction(SeccompAllow, SeccompLog) == SeccompLog);
+    assert(SeccompSelectAction(SeccompLog, SeccompTrace | 7) == (SeccompTrace | 7));
+    assert(SeccompSelectAction(SeccompTrace, SeccompUserNotify) == SeccompUserNotify);
+    assert(SeccompEnforceAction(SeccompUserNotify) == SeccompUserNotify);
+    constexpr uint32_t unknown = 0x7ffe0000;
+    const auto winner = SeccompSelectAction(SeccompAllow, unknown);
+    assert(winner == unknown && SeccompEnforceAction(winner) == SeccompKillProcess);
+    assert(SeccompEnforceAction(SeccompSelectAction(winner, SeccompErrno)) == SeccompErrno);
+    assert(SeccompSelectAction(SeccompErrno, unknown) == SeccompErrno);
 }
