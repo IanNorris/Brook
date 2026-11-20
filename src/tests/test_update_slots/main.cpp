@@ -12,6 +12,7 @@
 #include "elf.h"
 #include "../../shared/update/payload.h"
 #include "../../shared/update/recovery_guard.h"
+#include "../../shared/boot_protocol/boot_protocol.h"
 using Bytes=std::vector<uint8_t>;
 static std::map<std::u16string,Bytes> files;
 static std::map<void*,UINTN> allocations;
@@ -45,9 +46,25 @@ static void provision(unsigned slot,uint64_t generation,Bytes elf=kernel()) {
     files[std::u16string(directory)+u"KERNEL.ELF"]=elf;files[std::u16string(directory)+u"INITRD.IMG"]=initrd;
     files[slot?u"UPDATES\\SELECT1.BIN":u"UPDATES\\SELECT0.BIN"]=r;
 }
-static void expect(bool success) {
+static void expect(bool success,uint64_t generation=0) {
     uint8_t *k=nullptr,*i=nullptr;UINTN kb=0,ib=0;
-    assert(brook::bootloader::LoadUpdatePair(nullptr,nullptr,k,kb,i,ib)==success);
+    brook::BootProtocol boot{};
+    boot.version=brook::BootProtocolVersion;
+    boot.extensions=brook::BootExtensionTimingMagic;
+    assert(!brook::BootHasGuardSlot(&boot));
+    boot.guardSlot.generation=100; // Failed selection must clear stale metadata.
+    assert(brook::bootloader::LoadUpdatePair(nullptr,nullptr,k,kb,i,ib,&boot.guardSlot)==success);
+    boot.timing.flags|=brook::BootTimingGuardSlot;
+    assert(brook::BootHasGuardSlot(&boot)==success);
+    if(success) {
+        const auto& selection=boot.guardSlot;
+        const auto& record=files.at(selection.slot?u"UPDATES\\SELECT1.BIN":u"UPDATES\\SELECT0.BIN");
+        uint8_t expected[32]{};
+        BrookUpdateHash(record.data(),record.size(),expected);
+        assert(selection.generation==BrookUpdateGet64(record.data()+8));
+        assert(!generation || selection.generation==generation);
+        assert(BrookUpdateEqual(selection.selectorDigest,expected,sizeof(expected)));
+    }
     if(success){assert(k&&i&&kb==4096&&ib==512);brook::bootloader::FreePages(nullptr,(EFI_PHYSICAL_ADDRESS)k,kb);brook::bootloader::FreePages(nullptr,(EFI_PHYSICAL_ADDRESS)i,ib);}
     else assert(!k&&!i);
     assert(allocations.empty());
@@ -85,8 +102,8 @@ int main() {
     files[u"RECOVERY\\GUARD1.BIN"]=g;
     BrookUpdatePut32(g.data()+16,BROOK_RECOVERY_GUARD_PENDING);BrookUpdatePut32(g.data()+124,BrookUpdateCrc(g.data(),124));
     files[u"RECOVERY\\GUARD0.BIN"]=g;files[u"RECOVERY\\GUARD1.BIN"]=g;guard(false);
-    expect(false);provision(0,1);expect(true);provision(1,2);expect(true);
-    files.erase(u"UPDATES\\B\\INITRD.IMG");expect(true); // no mixed root/A initrd
+    expect(false);provision(0,1);expect(true,1);provision(1,2);expect(true,2);
+    files.erase(u"UPDATES\\B\\INITRD.IMG");expect(true,1); // no mixed root/A initrd
     files.erase(u"UPDATES\\A\\INITRD.IMG");expect(false);
     provision(0,1);provision(1,2);files[u"UPDATES\\B\\KERNEL.ELF"][200]^=1;expect(true);
     // Correct hash does not excuse an out-of-range ELF program-header table.

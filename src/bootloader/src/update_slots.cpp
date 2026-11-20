@@ -5,6 +5,7 @@
 #include "../../shared/update/payload.h"
 #include "../../shared/update/executable.h"
 #include "../../shared/update/recovery_guard.h"
+#include "../../shared/boot_protocol/boot_protocol.h"
 namespace brook { namespace bootloader {
 bool RecoveryGuardAllowsNormal(EFI_HANDLE image,EFI_BOOT_SERVICES* bs,const char* identity) {
     UINTN an=0,bn=0;
@@ -49,7 +50,9 @@ bool LoadAlternateRecoveryPair(EFI_HANDLE image,EFI_BOOT_SERVICES* bs,
     return LoadRecovery(image,bs,kernel,kb,initrd,ib,2);
 }
 bool LoadUpdatePair(EFI_HANDLE image,EFI_BOOT_SERVICES* bs,
-                    uint8_t*& kernel,UINTN& kb,uint8_t*& initrd,UINTN& ib) {
+                    uint8_t*& kernel,UINTN& kb,uint8_t*& initrd,UINTN& ib,
+                    BootGuardSlot* selection) {
+    if(selection)*selection={};
     uint8_t records[2][128]{};
     for(unsigned i=0;i<2;i++) {
         UINTN n=0;auto* p=ReadFile(image,bs,i?u"UPDATES\\SELECT1.BIN":u"UPDATES\\SELECT0.BIN",&n,128);
@@ -62,6 +65,11 @@ bool LoadUpdatePair(EFI_HANDLE image,EFI_BOOT_SERVICES* bs,
             unsigned index=attempt?1u-static_cast<unsigned>(first):static_cast<unsigned>(first);
             if(!BrookUpdateRecordValid(records[index]))continue;
             if(Pair(image,bs,records[index],kernel,kb,initrd,ib)) {
+                if(selection) {
+                    selection->generation=BrookUpdateGet64(records[index]+8);
+                    selection->slot=BrookUpdateGet32(records[index]+16);
+                    BrookUpdateHash(records[index],sizeof(records[index]),selection->selectorDigest);
+                }
                 ConsolePrint(u"Brook update generation ");ConsolePrintDec(BrookUpdateGet64(records[index]+8));ConsolePrintLine(u" verified");return true;
             }
         }

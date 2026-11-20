@@ -143,6 +143,7 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
         ConsoleSetQuiet(!g_bootConfig.debugText);
     }
     bool updatePair = false;
+    brook::BootGuardSlot selectedSlot{};
 #if defined(BROOK_GUARD_ALTERNATE_RECOVERY)
     if (recoveryRequested) updatePair = LoadAlternateRecoveryPair(imageHandle,
         systemTable->BootServices, kernelData, kernelFileSize, initrdData, initrdFileSize);
@@ -162,7 +163,7 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
         Halt(EFI_NOT_FOUND, u"Recovery payload invalid or missing; restart to boot normally.");
     }
     if (!updatePair) updatePair = g_bootConfig.updateSlots && LoadUpdatePair(imageHandle,
-        systemTable->BootServices, kernelData, kernelFileSize, initrdData, initrdFileSize);
+        systemTable->BootServices, kernelData, kernelFileSize, initrdData, initrdFileSize, &selectedSlot);
     if (!updatePair) kernelData = ReadFile(imageHandle, systemTable->BootServices,
         g_bootConfig.target, &kernelFileSize);
     if (kernelData == nullptr)
@@ -262,6 +263,10 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
     bootProtocol.efiRuntimeMtrrFingerprint = firmwareRuntimeCache.mtrr;
     bootProtocol.efiRuntimeMtrrValid = firmwareRuntimeCache.mtrr ? 1 : 0;
     timing.flags |= brook::BootTimingValid;
+    if (selectedSlot.generation) {
+        timing.flags |= brook::BootTimingGuardSlot;
+        bootProtocol.guardSlot = selectedSlot;
+    }
     timing.kernelJumpTsc = ReadTsc();
     bootProtocol.timing = timing;
     bootProtocol.extensions = brook::BootExtensionTimingMagic;

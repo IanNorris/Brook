@@ -97,6 +97,7 @@ constexpr uint32_t BootTimingValid      = 1u << 0; // stamps below were taken
 constexpr uint32_t BootTimingWaitRan    = 1u << 1; // the boot-menu wait ran
 constexpr uint32_t BootTimingWaitKey    = 1u << 2; // a recovery key ended the wait
 constexpr uint32_t BootTimingRecovery   = 1u << 3; // recovery pair selected (key or guard)
+constexpr uint32_t BootTimingGuardSlot  = 1u << 4; // verified A/B selector metadata follows timing
 
 struct BootTiming
 {
@@ -109,6 +110,14 @@ struct BootTiming
     uint32_t waitConfiguredMs;   // configured wait (0 when the menu is disabled)
     uint32_t waitKeyCount;       // keystrokes ConIn returned during the wait
     uint32_t waitLastKey;        // last one: ScanCode | UnicodeChar << 16
+};
+
+struct BootGuardSlot
+{
+    uint64_t generation;
+    uint32_t slot;
+    uint32_t reserved;
+    uint8_t selectorDigest[32]; // SHA-256 of the entire verified selector
 };
 
 struct BootProtocol
@@ -151,6 +160,9 @@ struct BootProtocol
     // A zero stamp was not taken. The kernel converts them with its own
     // calibrated TSC frequency; the loader performs no conversion.
     BootTiming timing;
+    // The original timing extent stays intact for installed kernels.
+    // Read this field only when the loader advertises BootTimingGuardSlot.
+    BootGuardSlot guardSlot;
 };
 
 // Size of the handoff every version-5 loader provides; never read past it
@@ -161,6 +173,12 @@ static_assert(BootProtocolV5Size == 152, "version-5 BootProtocol layout changed 
 inline bool BootHasTiming(const BootProtocol* p)
 {
     return p && p->version >= 5 && p->extensions == BootExtensionTimingMagic;
+}
+
+inline bool BootHasGuardSlot(const BootProtocol* p)
+{
+    return BootHasTiming(p) && (p->timing.flags & BootTimingGuardSlot) &&
+           p->guardSlot.generation && p->guardSlot.slot < 2 && !p->guardSlot.reserved;
 }
 
 constexpr bool BootEfiRuntimeCodeContains(const MemoryDescriptor* map, uint32_t count, uint64_t address)
