@@ -355,6 +355,10 @@ int main()
     Action(TrayInputKind::Context, id);
     Wait([] { return state.menuCount == 1; });
     assert(std::strcmp(state.menu[0].label, "Show Library") == 0);
+    Action(TrayInputKind::MenuSelectPinned, id, 41);
+    Wait([] { return menuClicked && state.menuCount == 1; });
+    assert(state.menuOwner == id);
+    menuClicked = false;
     Action(TrayInputKind::MenuSelect, id, 41);
     Wait([] { return menuClicked && state.menuCount == 0; });
 

@@ -250,6 +250,7 @@ bool OwnerAlive(uint16_t pid, uint64_t incarnation)
 // compositor-owned, and the input and staged state are shared with the child.
 void ClearTray()
 {
+    WmTaskbarPopupForgetMenu();
     memset(&g_tray, 0, sizeof(g_tray));
     memset(&g_trayStaged, 0, sizeof(g_trayStaged));
     g_trayPending = false;

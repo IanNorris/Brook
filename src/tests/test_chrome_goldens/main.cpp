@@ -555,6 +555,7 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
         Check(prefix + "app-tray", list, s, 0, model.taskbar.y, screenW, screenH - model.taskbar.y);
 
         model.kind = ChromeShellKind::AppTrayMenu;
+        model.popupPinnable = true;
         model.tray.menuOwner = 1;
         model.tray.menuCount = 4;
         model.tray.menu[0] = {1, "Show Library", true, false, false};
@@ -563,7 +564,7 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
         model.tray.menu[3] = {4, "Exit", false, false, false};
         model.rect = ChromeTrayMenuRect(s, anchor, model.tray.menuCount, screenW);
         model.mouseX = model.rect.x + int(s.M(14));
-        model.mouseY = model.rect.y + int(s.M(18));
+        model.mouseY = ChromeTrayMenuRowRect(s, model.rect, 0, true).y + int(s.M(12));
         auto menuList = ChromeListOn(storage);
         RenderSnapshot(model, s, menuList);
         Check(prefix + "app-tray-menu", menuList, s, model.rect.x, model.rect.y, model.rect.w, model.rect.h);
@@ -594,6 +595,14 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
         RenderSnapshot(model, s, list);
         const DesktopRect& p = vm.layout.panel;
         Check(prefix + "volume-popup", list, s, p.x, p.y, p.w, p.h);
+        if (theme == BROOK_THEME_GLASS && m.percent == 100 && prefix == "glass-100-") {
+            vm.pinned = true;
+            vm.mouseX = vm.layout.pin.x + 1;
+            vm.mouseY = vm.layout.pin.y + 1;
+            auto pinned = ChromeListOn(storage);
+            RenderSnapshot(model, s, pinned);
+            Check(prefix + "volume-popup-pinned", pinned, s, p.x, p.y, p.w, p.h);
+        }
     }
 
     // Tray tooltip.

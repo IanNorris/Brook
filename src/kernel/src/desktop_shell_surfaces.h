@@ -20,7 +20,7 @@ struct WmShellSurface {
 };
 struct WmShellTrayGeometry {
     DesktopRect popup, notice;
-    bool menu;
+    bool menu, windowMenu;
 };
 // Taskbar, dock (strip or edge tab), popup slot, notice or boot toast,
 // and optional expanded HUD.
@@ -29,7 +29,7 @@ static constexpr uint32_t WM_SHELL_SURFACE_LIMIT = 5;
 // Back to front. (mx,my) is the pointer the caller renders hover state with.
 inline uint32_t WmShellSurfaces(uint32_t screenW, uint32_t screenH, int32_t mx, int32_t my,
                                 WmShellSurface (&out)[WM_SHELL_SURFACE_LIMIT],
-                                DesktopRect trayPopup = {}, bool trayMenu = false, DesktopRect notice = {})
+                                DesktopRect trayPopup = {}, bool trayMenu = false, DesktopRect notice = {}, bool windowMenu = false)
 {
     uint32_t count = 0;
     // A focused fullscreen window owns the whole output (WmTaskbarHidden).
@@ -44,13 +44,16 @@ inline uint32_t WmShellSurfaces(uint32_t screenW, uint32_t screenH, int32_t mx, 
         if (!WmTaskbarHidden() && WmDockSurfaceRect(screenW, screenH, &x, &y, &w, &h, &material))
             out[count++] = {WmShellSurfaceKind::Dock, x, y, w, h, material};
     }
-    // One popup slot: opening the launcher closes the volume popup and vice
-    // versa, and the tray tooltip yields to either of them.
+    // One popup slot: the launcher and the window menu temporarily cover a
+    // pinned taskbar popup. A tooltip yields to an interactive popup.
     int32_t x = 0, y = 0; uint32_t w = 0, h = 0;
     if (WmLauncherVisible()) {
         WmLauncherGetRect(screenW, screenH, &x, &y, &w, &h);
         out[count++] = {WmShellSurfaceKind::Launcher, x, y, w, h, true};
-    } else if (WmVolumePopupVisible()) {
+    } else if (windowMenu) {
+        out[count++] = {WmShellSurfaceKind::AppTrayMenu, trayPopup.x, trayPopup.y,
+                        uint32_t(trayPopup.w), uint32_t(trayPopup.h), true};
+    } else if (!WmTaskbarHidden() && WmVolumePopupVisible()) {
         WmVolumePopupGetRect(screenW, screenH, &x, &y, &w, &h);
         out[count++] = {WmShellSurfaceKind::VolumePopup, x, y, w, h, true};
     } else if (WmTrayFlyoutRect(screenW, screenH, &x, &y, &w, &h)) {
@@ -72,13 +75,13 @@ inline uint32_t WmShellSurfaces(uint32_t screenW, uint32_t screenH, int32_t mx, 
         }
         return true;
     };
+    if (WmPerformanceHudRect(screenW, screenH, &x, &y, &w, &h) && freeSpace())
+        out[count++] = {WmShellSurfaceKind::PerformanceHud, x, y, w, h, true};
     if (notice.w > 0 && notice.h > 0) {
         x = notice.x; y = notice.y; w = notice.w; h = notice.h;
         if (freeSpace()) out[count++] = {WmShellSurfaceKind::Notification, x, y, w, h, true};
     } else if (WmBootSummaryRect(screenW, screenH, &x, &y, &w, &h) && freeSpace())
         out[count++] = {WmShellSurfaceKind::BootSummary, x, y, w, h, true};
-    if (WmPerformanceHudRect(screenW, screenH, &x, &y, &w, &h) && freeSpace())
-        out[count++] = {WmShellSurfaceKind::PerformanceHud, x, y, w, h, true};
     return count;
 }
 

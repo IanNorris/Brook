@@ -67,6 +67,9 @@ static void checkPopup() {
         l=TaskbarVolumePopup(*m,icon,taskbarY,screenW,m->pixels(36));
         CHECK(l.panel.x+l.panel.w<=screenW);
         CHECK(l.track.w>0 && l.mute.x+l.mute.w<l.track.x && l.track.x+l.track.w<l.value.x);
+        CHECK(l.pin.w==m->pixels(68) && l.panel.contains(l.pin.x,l.pin.y));
+        CHECK(l.title.x+l.title.w<l.pin.x && l.pin.y+l.pin.h<=l.track.y);
+        CHECK(TaskbarVolumePopupHit(*m,l,l.pin.x+1,l.pin.y+1)==TaskbarVolumeHit::Pin);
         CHECK(TaskbarVolumePopupHit(*m,l,l.mute.x+1,l.mute.y+1)==TaskbarVolumeHit::Mute);
         CHECK(TaskbarVolumePopupHit(*m,l,l.track.x+l.track.w/2,l.track.y+l.track.h/2)==TaskbarVolumeHit::Slider);
         CHECK(TaskbarVolumePopupHit(*m,l,l.track.x-l.thumbSize/2,l.track.y+1)==TaskbarVolumeHit::Slider); // knob overhang

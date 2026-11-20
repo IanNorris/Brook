@@ -1,5 +1,6 @@
 #pragma once
 #include "chrome_style.h"
+#include "taskbar_popup_pin.h"
 
 namespace brook {
 
@@ -36,7 +37,7 @@ struct ChromeTrayState {
     ChromeNotice notice;
 };
 
-enum class TrayInputKind : uint32_t { Activate, Context, Scroll, MenuSelect, DismissMenu, NoticeAction, CloseNotice };
+enum class TrayInputKind : uint32_t { Activate, Context, Scroll, MenuSelect, DismissMenu, NoticeAction, CloseNotice, MenuSelectPinned, ActivateWithoutMenu };
 struct TrayInput {
     TrayInputKind kind;
     uint32_t owner;
@@ -46,7 +47,7 @@ struct TrayInput {
 inline DesktopRect ChromeTrayMenuRect(const ChromeStyle& s, DesktopRect anchor, uint32_t count, int sw)
 {
     if (!anchor.w || !count || sw <= 0) return {};
-    const int margin = s.M(8), width = s.M(228), height = s.M(12) + int(count) * s.M(36);
+    const int margin = s.M(8), width = s.M(228), height = s.M(44) + int(count) * s.M(36);
     const int w = width < sw - 2 * margin ? width : sw - 2 * margin;
     if (w <= 0 || anchor.y < height + margin) return {};
     const int right = anchor.x + anchor.w < sw - margin ? anchor.x + anchor.w : sw - margin;
@@ -79,10 +80,16 @@ inline DesktopRect ChromeNoticeRect(const ChromeStyle& s, int sw, int desktopH, 
     return w > 0 && desktopH >= h + 2 * margin ? DesktopRect{sw - margin - w, margin, w, h} : DesktopRect{};
 }
 
-inline DesktopRect ChromeTrayMenuRowRect(const ChromeStyle& s, const DesktopRect& panel, uint32_t row)
+inline DesktopRect ChromeTrayMenuPinRect(const ChromeStyle& s, DesktopRect panel)
 {
-    const int pad = s.M(6), h = s.M(36);
-    return {panel.x + pad, panel.y + pad + int(row) * h, panel.w - 2 * pad, h};
+    return TaskbarPopupPinRect(*s.metrics, panel, s.M(6), s.M(24));
+}
+
+inline DesktopRect ChromeTrayMenuRowRect(const ChromeStyle& s, const DesktopRect& panel, uint32_t row,
+                                         bool pinnable = false)
+{
+    const int pad = s.M(6), h = s.M(36), header = pinnable ? s.M(32) : 0;
+    return {panel.x + pad, panel.y + pad + header + int(row) * h, panel.w - 2 * pad, h};
 }
 
 inline DesktopRect ChromeNoticeCloseRect(const ChromeStyle& s, const DesktopRect& rect)
@@ -100,7 +107,7 @@ inline DesktopRect ChromeNoticeActionRect(const ChromeStyle& s, const DesktopRec
 }
 
 void ChromeBuildAppTrayMenu(const ChromeTrayState&, DesktopRect, int32_t mx, int32_t my,
-                            const ChromeStyle&, ChromeDisplayList&);
+                            const ChromeStyle&, ChromeDisplayList&, bool pinnable = false, bool pinned = false);
 void ChromeBuildNotice(const ChromeNotice&, DesktopRect, int32_t mx, int32_t my,
                        const ChromeStyle&, ChromeDisplayList&);
 

@@ -487,7 +487,7 @@ static void PointerCaptureValidateLocked() {
     if(!g_wmActive || !w.proc || !w.vfb || !w.visible || w.minimized ||
        !w.focused || g_focusedIdx!=g_pointerCaptureIndex ||
        w.creationIdentity!=g_pointerCaptureIdentity ||
-       InputDroppedEvents()!=g_pointerCaptureDrops || WmLauncherVisible() || WmVolumePopupVisible() || WmTrayFlyoutVisible())
+       InputDroppedEvents()!=g_pointerCaptureDrops || WmLauncherVisible() || WmTaskbarSystemPopupModal())
         PointerCaptureReleaseLocked();
 }
 bool WmPointerCaptureActive() {
@@ -570,13 +570,13 @@ int64_t WmPointerCapture(Process* provider,uint32_t wmId,uint32_t operation,uint
     if(operation!=1 || token)return -22;
     if(owned)return g_pointerCaptureToken;
     if(g_pointerCaptureIndex>=0)return -16;
-    if(WmLauncherVisible() || WmVolumePopupVisible() || WmTrayFlyoutVisible())PointerActivationCancel();
+    if(WmLauncherVisible() || WmTaskbarSystemPopupModal())PointerActivationCancel();
     const bool hovered=__atomic_load_n(&g_pointerHoverIdentity,__ATOMIC_ACQUIRE)==w->creationIdentity;
     // An activation waiver never inherits the activating click: the taskbar
     // press/release pair must finish in the shell before the game is granted.
     const bool waived=!hovered && activated && !MouseGetButtons();
     if(!g_wmActive || !w->vfb || !w->visible || w->minimized || !w->focused ||
-       g_focusedIdx!=static_cast<int>(wmId)-1 || WmLauncherVisible() || WmVolumePopupVisible() || WmTrayFlyoutVisible() ||
+       g_focusedIdx!=static_cast<int>(wmId)-1 || WmLauncherVisible() || WmTaskbarSystemPopupModal() ||
        WmPointerSuppressedButtons() || w->pointerDisengaged || (!hovered && !waived))return -11;
     if(g_nextPointerCaptureToken==0xffffffffu)return -75;
     PointerActivationCancel();
@@ -1577,7 +1577,7 @@ bool WmSetFullscreen(int idx, bool enable) { VfbGuard guard; return SetFullscree
 
 bool WmTaskbarHidden()
 {
-    if (!g_wmActive || WmLauncherVisible() || WmVolumePopupVisible() || WmTrayFlyoutVisible()) return false;
+    if (!g_wmActive || WmLauncherVisible() || WmTaskbarSystemPopupModal()) return false;
     const int idx = __atomic_load_n(&g_focusedIdx, __ATOMIC_ACQUIRE);
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return false;
     const Window& w = g_windows[idx];
@@ -2681,8 +2681,8 @@ bool WmCaptureShellModel(const WmShellSurface& s, uint32_t screenW, uint32_t scr
     case WmShellSurfaceKind::Launcher: WmCaptureLauncher(screenW, screenH, mx, my, model); break;
     case WmShellSurfaceKind::VolumePopup: WmCaptureVolumePopup(screenW, screenH, mx, my, model); break;
     case WmShellSurfaceKind::TrayTooltip: WmCaptureTooltip(screenW, screenH, mx, my, model); break;
-    case WmShellSurfaceKind::TrayFlyout: WmCaptureTrayFlyout(screenW, screenH, model); break;
-    case WmShellSurfaceKind::PerformanceHud: WmCapturePerformanceHud(screenW, screenH, model); break;
+    case WmShellSurfaceKind::TrayFlyout: WmCaptureTrayFlyout(screenW, screenH, mx, my, model); break;
+    case WmShellSurfaceKind::PerformanceHud: WmCapturePerformanceHud(screenW, screenH, mx, my, model); break;
     case WmShellSurfaceKind::BootSummary: WmCaptureBootSummary(screenW, screenH, model); break;
     case WmShellSurfaceKind::Dock: WmCaptureDock(screenW, screenH, mx, my, model); break;
     case WmShellSurfaceKind::AppTrayMenu:
