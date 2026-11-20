@@ -50,9 +50,9 @@ class BootstrapTest(unittest.TestCase):
             manifest.write_text(json.dumps(manifest_for(path, updated, key), sort_keys=True))
             identity = sha(manifest)
 
-            def command(action, *args, fail=False):
+            def command(action, *args, fail=False, digest=identity):
                 result = subprocess.run(
-                    [sys.executable, stage_py, action, identity, *args],
+                    [sys.executable, stage_py, action, digest, *args],
                     env=dict(os.environ, BROOK_STAGE_ROOT=str(root)), capture_output=True, text=True)
                 if fail:
                     self.assertNotEqual(result.returncode, 0, result.stdout)
@@ -86,6 +86,32 @@ class BootstrapTest(unittest.TestCase):
             self.assertEqual((nix / "etc/brook/stage-plan.pub").stat().st_mode & 0o777, 0o644)
             self.assertEqual(command("apply", manifest, archive, json.dumps(state)), state)
             self.assertTrue((nix / "profile/bin/brook-webapp").is_file())
+
+            # Refresh the helper with a new closure while keeping the active
+            # profile, install binary and original bootstrap receipt.
+            old_link = (nix / "bin/brook-stage-profile").readlink()
+            helper.write_text(helper.read_text() + "# replacement helper\n")
+            replacement = Path(subprocess.check_output(
+                ["nix-store", "--add", fixture], text=True).strip())
+            refresh_manifest = work / "refresh.json"
+            refresh = manifest_for(replacement, updated, key)
+            refresh_manifest.write_text(json.dumps(refresh, sort_keys=True))
+            refresh_id = sha(refresh_manifest)
+            refresh_check = command("refresh-check", refresh_manifest, digest=refresh_id)
+            self.assertEqual(refresh_check["phase"], "refresh-required")
+            self.assertEqual((nix / "bin/brook-stage-profile").readlink(), old_link)
+            self.assertEqual(refresh_check["missing"], [0])
+            refresh_archive = work / "refresh.tar"
+            runtime_archive(refresh_archive, refresh, refresh_check["missing"], updated, key)
+            state = command("refresh", refresh_manifest, refresh_archive,
+                            json.dumps(refresh_check), digest=refresh_id)
+            self.assertEqual(state["phase"], "complete")
+            self.assertEqual(state["generation"], ".brook-profile-legacy")
+            self.assertEqual(install.read_bytes(), updated.read_bytes())
+            self.assertEqual((nix / "bin/brook-stage-profile").readlink(),
+                             replacement / "bin/brook-stage-profile")
+            self.assertEqual(command("refresh", refresh_manifest, refresh_archive,
+                                     json.dumps(refresh_check), digest=refresh_id), state)
 
             self.assertEqual(command("rollback")["phase"], "rolled_back")
             self.assertEqual(install.read_bytes(), b"original installer")

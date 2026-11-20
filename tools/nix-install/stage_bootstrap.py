@@ -196,6 +196,70 @@ def import_runtime(nix, manifest, archive, missing):
         return installer.read_bytes(), key.read_bytes()
 
 
+def refresh_probe(nix, manifest):
+    saved = read_record(nix)
+    if not saved or saved["phase"] != "complete" or not aliases(nix):
+        raise ValueError("A completed profile bootstrap is required")
+    installer = nix / "bin/nix-install"
+    key = nix / "etc/brook/stage-plan.pub"
+    helper = nix / "bin/brook-stage-profile"
+    trusted_file(installer, executable=True)
+    trusted_file(key)
+    if digest(installer) != saved["newInstaller"] or digest(key) != saved["key"]:
+        raise ValueError("Installed bootstrap runtime or key changed")
+    if manifest["keySha256"] != saved["key"]:
+        raise ValueError("Helper refresh cannot rotate the plan key")
+    expected = f"/nix/store/{manifest['helper']}/bin/brook-stage-profile"
+    pending = saved.get("helperNext")
+    if (pending and pending != expected) or not helper.is_symlink() or (
+            os.readlink(helper) not in (saved["helper"], pending)):
+        raise ValueError("Unexpected active or pending bootstrap helper")
+    missing = []
+    for index, (name, entry) in enumerate(manifest["closure"].items()):
+        path = nix / "store" / name
+        if os.path.lexists(path):
+            verify_tree(path, entry)
+        else:
+            missing.append(index)
+    complete = expected == saved["helper"] and not pending and not missing
+    return {"phase": "complete" if complete else "refresh-required", "kind": "managed",
+            "generation": os.readlink(nix / PROFILE_ALIAS), "missing": missing,
+            "previousHelper": saved["helper"], "helper": expected}
+
+
+def refresh_helper(nix, manifest, archive, expected):
+    house = nix / "etc/brook"
+    mutex = house / ".profile-stage-bootstrap-lock"
+    mutex.mkdir(mode=0o700)
+    lock = nix / "var/.brook-profile-lock"
+    locked = False
+    try:
+        lock.mkdir(mode=0o700)
+        locked = True
+        current = refresh_probe(nix, manifest)
+        if current["phase"] == "complete":
+            return current
+        if current != expected:
+            raise ValueError("The current device state differs from the helper preflight")
+        import_runtime(nix, manifest, archive, current["missing"])
+        saved = read_record(nix)
+        saved["helperNext"] = current["helper"]
+        save(nix / BOOTSTRAP, saved)
+        helper = nix / "bin/brook-stage-profile"
+        with tempfile.TemporaryDirectory(dir=helper.parent, prefix=".stage-helper-") as work:
+            new_link = Path(work) / helper.name
+            new_link.symlink_to(saved["helperNext"])
+            os.replace(new_link, helper)
+            fsync_dir(helper.parent)
+        saved["helper"] = saved.pop("helperNext")
+        save(nix / BOOTSTRAP, saved)
+        return refresh_probe(nix, manifest)
+    finally:
+        if locked:
+            lock.rmdir()
+        mutex.rmdir()
+
+
 def remove_own_lock(nix, identity):
     for lock in (nix / "profile/.mutation-lock",
                  nix / PROFILE_ALIAS.rsplit("/", 1)[0] / LEGACY / ".mutation-lock"):
@@ -300,7 +364,9 @@ def rollback(nix, identity):
             raise ValueError("Nix installer or backup changed")
         helper = nix / "bin/brook-stage-profile"
         key = house / "stage-plan.pub"
-        if os.path.lexists(helper) and not link_equals(helper, saved["helper"]):
+        if os.path.lexists(helper) and not any(
+                link_equals(helper, target) for target in (saved["helper"], saved.get("helperNext"))
+                if target):
             raise ValueError("Stage helper changed")
         if os.path.lexists(key) and digest(key) != saved["key"]:
             raise ValueError("Stage plan key changed")
@@ -352,6 +418,10 @@ def main():
         manifest = manifest_data(path)
         if action == "check":
             state = probe(nix, manifest, identity)
+        elif action == "refresh-check":
+            state = refresh_probe(nix, manifest)
+        elif action == "refresh":
+            state = refresh_helper(nix, manifest, Path(rest[1]), json.loads(rest[2]))
         elif action == "apply":
             state = apply(nix, manifest, identity, Path(rest[1]), json.loads(rest[2]), bool(root))
         else:

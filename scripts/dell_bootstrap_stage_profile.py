@@ -114,11 +114,14 @@ def main():
     parser.add_argument("--guest-python", default="/nix/profile/bin/python3")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--timeout", type=int, default=900)
+    parser.add_argument("--dry-run", action="store_true", help="check reusable store paths and bootstrap state")
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--dry-run", action="store_true", help="check legacy layout and reusable store paths")
+    mode.add_argument("--refresh-helper", action="store_true", help="update the helper after a completed bootstrap")
     mode.add_argument("--rollback-receipt", type=Path,
                       help="undo the bootstrap named in this receipt while its legacy generation is active")
     args = parser.parse_args()
+    if args.dry_run and args.rollback_receipt:
+        parser.error("--dry-run does not apply to rollback")
     if not args.guest_python.startswith("/nix/") or not 1 <= args.timeout <= 3600:
         parser.error("Expected an absolute Nix Python path and a timeout in 1..3600 seconds")
 
@@ -158,12 +161,15 @@ def main():
                 identity = sha(document)
                 journal.save(bootstrap_id=identity)
                 remote_manifest = transfer(bridge, args.session, key, args.output / "manifest", document)
-                report = guest_action(bridge, journal, args, remote_program, "check", identity, remote_manifest)
+                check_action = "refresh-check" if args.refresh_helper else "check"
+                apply_action = "refresh" if args.refresh_helper else "apply"
+                report = guest_action(bridge, journal, args, remote_program, check_action,
+                                      identity, remote_manifest)
                 if not args.dry_run and report["phase"] != "complete":
                     archive = args.output / "runtime.tar"
                     runtime_archive(archive, manifest, report["missing"], installer, public_key)
                     remote_runtime = transfer(bridge, args.session, key, args.output / "runtime", archive)
-                    report = guest_action(bridge, journal, args, remote_program, "apply", identity,
+                    report = guest_action(bridge, journal, args, remote_program, apply_action, identity,
                                           remote_manifest, remote_runtime,
                                           json.dumps(report, separators=(",", ":")))
         print(json.dumps(report, indent=2))
