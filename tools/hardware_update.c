@@ -226,6 +226,7 @@ int main(int argc,char** argv) {
     close(selector);close(target);
 #endif
     listener=socket(AF_INET,SOCK_STREAM|SOCK_CLOEXEC,0);if(listener<0)goto done;
+    int reuse=1;if(setsockopt(listener,SOL_SOCKET,SO_REUSEADDR,&reuse,sizeof(reuse)))goto done;
     struct sockaddr_in address={.sin_family=AF_INET,.sin_port=htons((uint16_t)port),.sin_addr={.s_addr=htonl(INADDR_ANY)}};
     if(bind(listener,(struct sockaddr*)&address,sizeof(address))||listen(listener,1))goto done;
     puts("HWUPDATE_LISTENING port=1235 maintenance_only=1");fflush(stdout);

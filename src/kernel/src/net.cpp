@@ -373,7 +373,192 @@ public:
 // IPv4 identification counter (atomic for SMP safety)
 static volatile uint16_t g_ipId = 1;
 
-static uint32_t g_tcpEphemeralPort = 49200; // accessed via atomic fetch-add
+// Bind claims and reuse options are published under g_socketRegistryLock.
+// Keep the receive address separate from the outbound source address.
+enum class PortUse : uint8_t { Bound, Listen, Connection };
+struct PortBinding {
+    uint32_t ip, uid, sourceIp, peerIp;
+    uint16_t port, peerPort; // network byte order
+    uint8_t options, boundOptions;
+    PortUse use;
+};
+static PortBinding g_bindings[MAX_SOCKETS];
+static unsigned g_bindingLimit; // one past the last occupied slot
+static constexpr uint16_t FirstEphemeralPort = 49200;
+static uint32_t g_nextEphemeralPort = FirstEphemeralPort;
+
+struct TcpTimeWaitPort {
+    uint64_t expires, scope;
+    PortBinding binding;
+};
+static constexpr uint64_t TcpTimeWaitMs = 60000;
+static TcpTimeWaitPort g_tcpTimeWait[1024][4]; // bounded recent tuples per port bucket
+
+static bool BridgeReservedPort(uint16_t port)
+{
+    return ntohs(port) >= 1234 && ntohs(port) <= 1237;
+}
+
+static bool BindingReuse(uint8_t options, SocketReuse option)
+{
+    return (options & static_cast<uint8_t>(option)) != 0;
+}
+
+static bool AddressesOverlap(uint32_t first, uint32_t second)
+{
+    return !first || !second || first == second;
+}
+
+// Live TCP listeners require SO_REUSEPORT. Both sides may otherwise use
+// SO_REUSEADDR for an overlapping address, including a TCP close in TIME_WAIT.
+static bool LivePortConflict(const PortBinding& requested, const PortBinding& existing, bool tcp)
+{
+    if (requested.port != existing.port || !AddressesOverlap(requested.ip, existing.ip))
+        return false;
+    if (BindingReuse(requested.boundOptions & existing.boundOptions, SocketReuse::Port) &&
+        requested.uid == existing.uid)
+        return false;
+    return (tcp && existing.use == PortUse::Listen) ||
+           !BindingReuse(requested.options & existing.options, SocketReuse::Address);
+}
+
+static auto& TimeWaitBucket(uint16_t port)
+{
+    return g_tcpTimeWait[ntohs(port) % (sizeof(g_tcpTimeWait) / sizeof(g_tcpTimeWait[0]))];
+}
+
+static bool PortConflicts(unsigned index, const PortBinding& requested, uint64_t now, bool automatic)
+{
+    const auto& socket = g_sockets[index];
+    const bool tcp = socket.type == SOCK_STREAM;
+    for (unsigned i = 0; i < g_bindingLimit; ++i) {
+        const auto& other = g_bindings[i];
+        if (i == index || other.port != requested.port || g_sockets[i].type != socket.type ||
+            g_sockets[i].networkScope != socket.networkScope)
+            continue;
+        if (automatic ? AddressesOverlap(requested.ip, other.ip)
+                      : LivePortConflict(requested, other, tcp))
+            return true;
+    }
+    if (tcp) {
+        for (const auto& entry : TimeWaitBucket(requested.port)) {
+            if (entry.expires > now && entry.scope == socket.networkScope &&
+                requested.port == entry.binding.port &&
+                AddressesOverlap(requested.ip, entry.binding.sourceIp) &&
+                (automatic || !BindingReuse(requested.options & entry.binding.options, SocketReuse::Address)))
+                return true;
+        }
+    }
+    return false;
+}
+
+static bool TcpPeerConflicts(unsigned index, const PortBinding& requested, uint64_t now)
+{
+    const auto scope = g_sockets[index].networkScope;
+    const auto samePeer = [&](const PortBinding& binding) {
+        return requested.port == binding.port && requested.sourceIp == binding.sourceIp &&
+               requested.peerIp == binding.peerIp && requested.peerPort == binding.peerPort;
+    };
+    for (unsigned i = 0; i < g_bindingLimit; ++i) {
+        if (i != index && g_bindings[i].use == PortUse::Connection &&
+            g_sockets[i].type == SOCK_STREAM && g_sockets[i].networkScope == scope &&
+            samePeer(g_bindings[i]))
+            return true;
+    }
+    for (const auto& entry : TimeWaitBucket(requested.port))
+        if (entry.expires > now && entry.scope == scope && samePeer(entry.binding)) return true;
+    return false;
+}
+
+static void RetainTimeWaitPort(unsigned index, uint64_t now)
+{
+    const auto& binding = g_bindings[index];
+    if (!binding.port) return;
+    auto& bucket = TimeWaitBucket(binding.port);
+    auto* earliest = &bucket[0];
+    for (auto& entry : bucket)
+        if (entry.expires < earliest->expires) earliest = &entry;
+    *earliest = {now + TcpTimeWaitMs, g_sockets[index].networkScope, binding};
+}
+
+// Caller holds socket.lock; do not acquire a socket lock under the registry lock.
+static int PublishPort(unsigned index, uint32_t ip, uint16_t port, SocketBindActor actor)
+{
+    auto& socket = g_sockets[index];
+    const auto now = ApicTickCount();
+    const auto flags = IrqSpinLockAcquire(&g_socketRegistryLock);
+    auto& current = g_bindings[index];
+    PortBinding requested{};
+    requested.ip = ip;
+    requested.uid = actor.uid;
+    requested.options = requested.boundOptions = current.options;
+    int error = -98; // EADDRINUSE
+    if (port) {
+        requested.port = port;
+        if (!PortConflicts(index, requested, now, false)) error = 0;
+    } else {
+        for (unsigned attempt = FirstEphemeralPort; attempt <= 65535; ++attempt) {
+            requested.port = htons(static_cast<uint16_t>(g_nextEphemeralPort));
+            g_nextEphemeralPort = g_nextEphemeralPort == 65535 ? FirstEphemeralPort : g_nextEphemeralPort + 1;
+            if (!PortConflicts(index, requested, now, true)) {
+                error = 0;
+                break;
+            }
+        }
+    }
+    if (!error) {
+        current = requested;
+        if (index >= g_bindingLimit) g_bindingLimit = index + 1;
+        socket.localIp = ip;
+        socket.localPort = requested.port;
+        socket.bound = true;
+    }
+    IrqSpinLockRelease(&g_socketRegistryLock, flags);
+    return error;
+}
+
+struct InboundSocket {
+    unsigned index = MAX_SOCKETS;
+    uint64_t generation = 0;
+};
+
+static InboundSocket SelectInboundSocket(uint64_t scope, bool tcp, uint32_t localIp,
+                                         uint16_t localPort, uint32_t peerIp, uint16_t peerPort)
+{
+    const auto flags = IrqSpinLockAcquire(&g_socketRegistryLock);
+    InboundSocket result{};
+    uint32_t bestScore = 0;
+    const uint32_t flow = peerIp ^ localIp ^ (static_cast<uint32_t>(peerPort) << 16) ^ localPort;
+    for (unsigned i = 0; i < g_bindingLimit; ++i) {
+        const auto& binding = g_bindings[i];
+        if (binding.port != localPort || g_sockClosing[i] || g_sockets[i].networkScope != scope ||
+            g_sockets[i].type != (tcp ? SOCK_STREAM : SOCK_DGRAM) ||
+            (tcp && binding.use != PortUse::Listen) || (binding.ip && binding.ip != localIp))
+            continue;
+        const auto prior = result.index;
+        const bool exact = binding.ip != 0;
+        const bool priorExact = prior != MAX_SOCKETS && g_bindings[prior].ip != 0;
+        if (!exact && priorExact) continue;
+        const bool connected = !tcp && binding.use == PortUse::Connection;
+        const bool priorConnected = prior != MAX_SOCKETS && !tcp && g_bindings[prior].use == PortUse::Connection;
+        if (connected && (binding.peerIp != peerIp || binding.peerPort != peerPort)) continue;
+        if (exact == priorExact && !connected && priorConnected) continue;
+        uint32_t score = flow ^ (i * 0x9e3779b9u);
+        score = (score ^ (score >> 16)) * 0x7feb352du;
+        score = (score ^ (score >> 15)) * 0x846ca68bu;
+        score ^= score >> 16;
+        const bool sameReuseGroup = prior != MAX_SOCKETS && binding.ip == g_bindings[prior].ip &&
+            binding.uid == g_bindings[prior].uid &&
+            BindingReuse(binding.boundOptions & g_bindings[prior].boundOptions, SocketReuse::Port);
+        if (prior == MAX_SOCKETS || (exact && !priorExact) || (connected && !priorConnected) ||
+            (sameReuseGroup && score > bestScore)) {
+            result = {i, g_sockGeneration[i]};
+            bestScore = score;
+        }
+    }
+    IrqSpinLockRelease(&g_socketRegistryLock, flags);
+    return result;
+}
 
 static uint32_t TcpReceiveFree(const Socket& s);
 static constexpr uint64_t SocketRxBudget = 256ull * 1024 * 1024;
@@ -2311,25 +2496,45 @@ uint64_t SockNetworkScope(int sockIdx)
     return borrow ? g_sockets[sockIdx].networkScope : 0;
 }
 
-int SockBind(int sockIdx, const SockAddrIn* addr)
+int SockSetReuse(int sockIdx, SocketReuse option, bool enabled)
 {
-    if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return -1;
-    if (!g_sockUsed[sockIdx]) return -1;
-
-    Socket& s = g_sockets[sockIdx];
-    if(s.networkScope && addr->sin_addr && !Ipv4IsLoopback(addr->sin_addr))return -99;
-    s.localIp   = addr->sin_addr;
-
-    // bind(port=0) means "assign an ephemeral port" (Linux semantics)
-    if (addr->sin_port == 0) {
-        uint32_t port = __atomic_fetch_add(&g_tcpEphemeralPort, 1, __ATOMIC_RELAXED);
-        if (port >= 65535) __atomic_store_n(&g_tcpEphemeralPort, 49200, __ATOMIC_RELAXED);
-        s.localPort = htons(static_cast<uint16_t>(port));
+    SocketBorrow borrow(sockIdx);
+    if (!borrow) return -9;
+    const auto flags = IrqSpinLockAcquire(&g_socketRegistryLock);
+    auto& binding = g_bindings[sockIdx];
+    const auto bit = static_cast<uint8_t>(option);
+    if (enabled) {
+        binding.options |= bit;
     } else {
-        s.localPort = addr->sin_port; // already big-endian
+        binding.options &= ~bit;
+        binding.boundOptions &= ~bit;
     }
-    s.bound = true;
+    IrqSpinLockRelease(&g_socketRegistryLock, flags);
     return 0;
+}
+
+int SockGetReuse(int sockIdx, SocketReuse option)
+{
+    SocketBorrow borrow(sockIdx);
+    if (!borrow) return -9;
+    const auto flags = IrqSpinLockAcquire(&g_socketRegistryLock);
+    const bool enabled = BindingReuse(g_bindings[sockIdx].options, option);
+    IrqSpinLockRelease(&g_socketRegistryLock, flags);
+    return enabled ? 1 : 0;
+}
+
+int SockBind(int sockIdx, const SockAddrIn* addr, SocketBindActor actor)
+{
+    SocketBorrow borrow(sockIdx);
+    if (!borrow) return -9;
+    if (addr->sin_family != AF_INET) return -97; // EAFNOSUPPORT
+    if (BridgeReservedPort(addr->sin_port) && !actor.initialRoot) return -13;
+    auto& socket = g_sockets[sockIdx];
+    if (socket.networkScope && addr->sin_addr && !Ipv4IsLoopback(addr->sin_addr)) return -99;
+    SpinLockAcquire(&socket.lock);
+    const int result = socket.bound ? -22 : PublishPort(sockIdx, addr->sin_addr, addr->sin_port, actor);
+    SpinLockRelease(&socket.lock);
+    return result;
 }
 
 int SockSendTo(int sockIdx, const void* buf, uint32_t len,
@@ -2343,6 +2548,7 @@ int SockSendTo(int sockIdx, const void* buf, uint32_t len,
     uint32_t dstIp;
     uint16_t dstPort;
 
+    SpinLockAcquire(&s.lock);
     if (dest) {
         dstIp   = dest->sin_addr;
         dstPort = ntohs(dest->sin_port);
@@ -2350,17 +2556,15 @@ int SockSendTo(int sockIdx, const void* buf, uint32_t len,
         dstIp   = s.remoteIp;
         dstPort = ntohs(s.remotePort);
     } else {
+        SpinLockRelease(&s.lock);
         return -1;
     }
 
-    // Auto-bind if not yet bound
-    if (!s.bound) {
-        uint32_t port = __atomic_fetch_add(&g_tcpEphemeralPort, 1, __ATOMIC_RELAXED);
-        if (port >= 65535) __atomic_store_n(&g_tcpEphemeralPort, 49200, __ATOMIC_RELAXED);
-        s.localPort = htons(static_cast<uint16_t>(port));
-        s.localIp = 0; // Unconnected UDP retains a wildcard source; route each send.
-        s.bound = true;
-    }
+    const int bindError = s.bound ? 0 : PublishPort(sockIdx, 0, 0, {s.identity.uid, false});
+    const uint32_t source = s.localIp;
+    const uint16_t sourcePort = s.localPort;
+    SpinLockRelease(&s.lock);
+    if (bindError) return bindError;
 
     // Profile DNS sends (port 53)
     if (dstPort == 53) {
@@ -2372,7 +2576,7 @@ int SockSendTo(int sockIdx, const void* buf, uint32_t len,
                      ntohl(dstIp) & 0xFF);
     }
 
-    return NetSendUdpFrom(s.localIp,dstIp,ntohs(s.localPort),dstPort,buf,len,s.networkScope);
+    return NetSendUdpFrom(source,dstIp,ntohs(sourcePort),dstPort,buf,len,s.networkScope);
 }
 
 // Copy n bytes out of a socket rx ring starting at tail (wraps once at most).
@@ -2630,9 +2834,14 @@ static void SockFinalize(int sockIdx)
 
     // Stop new callbacks, then let existing RX/TX/wakeup tails finish. Keep
     // the reservation until both buffers and payload have been retired.
+    SpinLockAcquire(&s.lock);
     uint64_t flags = IrqSpinLockAcquire(&g_socketRegistryLock);
+    if (s.tcpState == TcpState::TimeWait) RetainTimeWaitPort(sockIdx, ApicTickCount());
+    g_bindings[sockIdx] = {};
+    while (g_bindingLimit && !g_bindings[g_bindingLimit - 1].port) --g_bindingLimit;
     __atomic_store_n(&g_sockUsed[sockIdx], false, __ATOMIC_RELEASE);
     IrqSpinLockRelease(&g_socketRegistryLock, flags);
+    SpinLockRelease(&s.lock);
     for (;;) {
         flags = IrqSpinLockAcquire(&g_socketRegistryLock);
         const bool drained = g_sockBorrowers[sockIdx] == 0;
@@ -2777,16 +2986,15 @@ void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
                      (ntohl(srcIp) >> 8) & 0xFF,
                      ntohl(srcIp) & 0xFF);
     }
-    uint16_t dstPortBE = htons(dstPort);
-    for (uint32_t i = 0; i < MAX_SOCKETS; i++) {
-        SocketBorrow borrow(i);
-        if (!borrow) continue;
+    const auto selected = SelectInboundSocket(scope, false, dstIp, htons(dstPort), srcIp, htons(srcPort));
+    const unsigned i = selected.index;
+    SocketBorrow borrow(i, selected.generation);
+    if (borrow) {
         Socket& s = g_sockets[i];
         SpinLockAcquire(&s.lock);
-        if (s.type != SOCK_DGRAM || s.networkScope!=scope || !s.bound || s.localPort != dstPortBE ||
-            (scope && s.localIp && s.localIp!=dstIp)) {
+        if (s.connected && (s.remoteIp != srcIp || s.remotePort != htons(srcPort))) {
             SpinLockRelease(&s.lock);
-            continue;
+            return;
         }
         // Datagram layout: [len:4][srcIp:4][srcPort:2][data:len].
         uint32_t needed = 10 + len;
@@ -3493,23 +3701,16 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len,uint64_t 
     // No connected socket — check for listening socket (incoming SYN)
     if (flags & TCP_SYN)
     {
-        for (uint32_t i = 0; i < MAX_SOCKETS; i++)
-        {
-            SocketBorrow borrow(i);
-            if (!borrow) continue;
+        const auto selected = SelectInboundSocket(scope, true, ip->dstIp, dstPort, ip->srcIp, srcPort);
+        const unsigned i = selected.index;
+        SocketBorrow borrow(i, selected.generation);
+        if (borrow) {
             Socket& s = g_sockets[i];
             SpinLockAcquire(&s.lock);
-            const bool matches = s.type == SOCK_STREAM && s.networkScope==scope && s.localPort == dstPort &&
-                (!s.localIp || s.localIp == ip->dstIp);
             const uint32_t ownerPid = s.ownerPid, uid = s.identity.uid, gid = s.identity.gid;
             const uint32_t receiveLimit = s.rxLimit;
             const bool receiveLocked = s.rxUserLimit;
             SpinLockRelease(&s.lock);
-            if (!matches) continue;
-            uint64_t listenerFlags = IrqSpinLockAcquire(&g_acceptQueueLock);
-            const bool listening = s.listening;
-            IrqSpinLockRelease(&g_acceptQueueLock, listenerFlags);
-            if (!listening) continue;
 
             // Reclaim abandoned children even while accept's consumer is still
             // closing its active FD; dead queue entries must not refuse a SYN.
@@ -3528,7 +3729,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len,uint64_t 
                 if (NetLogPowerOfTwo(drops))
                     SerialPrintf("net: TCP SYN dropped — accept queue full (port %u, drops=%lu)\n",
                                  ntohs(dstPort), drops);
-                break;
+                return;
             }
 
             // Create a new socket for this connection
@@ -3539,7 +3740,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len,uint64_t 
                 NetCount(g_netCounters.synNoSocket);
                 if (NetLogPowerOfTwo(__atomic_load_n(&g_netCounters.synNoSocket, __ATOMIC_RELAXED)))
                     SerialPrintf("net: TCP SYN dropped — no free sockets\n");
-                break;
+                return;
             }
 
             Socket& child = g_sockets[childIdx];
@@ -3567,6 +3768,15 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len,uint64_t 
             child.tcpSndUna = child.tcpSndIss;
             child.tcpSndWnd = window; // passive SYN windows are unscaled
 
+            const auto bindingFlags = IrqSpinLockAcquire(&g_socketRegistryLock);
+            auto binding = g_bindings[i];
+            binding.ip = binding.sourceIp = child.localIp;
+            binding.peerIp = child.remoteIp;
+            binding.peerPort = child.remotePort;
+            binding.use = PortUse::Connection;
+            g_bindings[childIdx] = binding;
+            if (static_cast<unsigned>(childIdx) >= g_bindingLimit) g_bindingLimit = childIdx + 1;
+            IrqSpinLockRelease(&g_socketRegistryLock, bindingFlags);
             const auto childSnapshot = CaptureTcpTxLocked(child);
             SpinLockRelease(&child.lock);
             // Retain the creator ownership through send and queue publication.
@@ -3649,27 +3859,14 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
     const uint32_t destination = addr->sin_addr ? addr->sin_addr : htonl(0x7f000001);
     if(s.networkScope && !Ipv4IsLoopback(destination))return -101;
 
-    // UDP connect: just set default destination
-    if (s.type == SOCK_DGRAM) {
-        s.remoteIp   = destination;
-        s.remotePort = addr->sin_port;
-        s.connected  = true;
-        // Auto-bind if not yet bound
-        if (!s.bound) {
-            uint32_t port = __atomic_fetch_add(&g_tcpEphemeralPort, 1, __ATOMIC_RELAXED);
-            if (port >= 65535) __atomic_store_n(&g_tcpEphemeralPort, 49200, __ATOMIC_RELAXED);
-            s.localPort = htons(static_cast<uint16_t>(port));
-            s.localIp = Ipv4Source(0, s.remoteIp, g_netIf ? g_netIf->ipAddr : 0);
-            s.bound = true;
-        }
-        s.localIp = Ipv4Source(s.localIp, s.remoteIp, g_netIf ? g_netIf->ipAddr : 0);
-        return 0;
-    }
-
-    if (s.type != SOCK_STREAM) return -95; // -EOPNOTSUPP
-
     // Serialize stream incarnation changes with async-job publication.
     SpinLockAcquire(&s.lock);
+    if (s.type == SOCK_STREAM && (s.tcpState == TcpState::Listen ||
+        s.tcpState == TcpState::FinWait1 || s.tcpState == TcpState::FinWait2 ||
+        s.tcpState == TcpState::LastAck || s.tcpState == TcpState::TimeWait)) {
+        SpinLockRelease(&s.lock);
+        return -106;
+    }
     if (g_tcpAsyncSend && g_tcpAsyncJobs[sockIdx]) {SpinLockRelease(&s.lock);return -114;}
     // Already connecting (nonblocking connect in progress)
     if (s.tcpState == TcpState::SynSent) {SpinLockRelease(&s.lock);return -114;}
@@ -3682,19 +3879,37 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
         ++g_tcpAsyncEpoch[sockIdx];
     }
 
-    s.remoteIp   = destination;
-    s.remotePort = addr->sin_port; // already big-endian
-
-    // Auto-bind local port
+    const uint32_t source = Ipv4Source(s.localIp, destination, g_netIf ? g_netIf->ipAddr : 0);
     if (!s.bound) {
-        uint32_t port = __atomic_fetch_add(&g_tcpEphemeralPort, 1, __ATOMIC_RELAXED);
-        if (port >= 65535) __atomic_store_n(&g_tcpEphemeralPort, 49200, __ATOMIC_RELAXED);
-        s.localPort = htons(static_cast<uint16_t>(port));
-        s.localIp = Ipv4Source(0, s.remoteIp, g_netIf ? g_netIf->ipAddr : 0);
-        s.bound = true;
+        const int error = PublishPort(sockIdx, s.type == SOCK_STREAM ? source : 0, 0,
+                                      {s.identity.uid, false});
+        if (error) {
+            SpinLockRelease(&s.lock);
+            return error;
+        }
     }
-
-    s.localIp = Ipv4Source(s.localIp, s.remoteIp, g_netIf ? g_netIf->ipAddr : 0);
+    const auto now = ApicTickCount();
+    const auto bindingFlags = IrqSpinLockAcquire(&g_socketRegistryLock);
+    auto binding = g_bindings[sockIdx];
+    binding.use = PortUse::Connection;
+    binding.ip = binding.sourceIp = source;
+    binding.peerIp = destination;
+    binding.peerPort = addr->sin_port;
+    const bool conflict = s.type == SOCK_STREAM && TcpPeerConflicts(sockIdx, binding, now);
+    if (!conflict) g_bindings[sockIdx] = binding;
+    IrqSpinLockRelease(&g_socketRegistryLock, bindingFlags);
+    if (conflict) {
+        SpinLockRelease(&s.lock);
+        return -99;
+    }
+    s.localIp = source;
+    s.remoteIp = destination;
+    s.remotePort = addr->sin_port;
+    if (s.type == SOCK_DGRAM) {
+        s.connected = true;
+        SpinLockRelease(&s.lock);
+        return 0;
+    }
 
     // Initialize TCP state
     // Use a simple ISS from the IP ID counter + port for uniqueness
@@ -4552,27 +4767,37 @@ uint32_t SockRxCount(int sockIdx)
     return g_sockets[sockIdx].rxCount;
 }
 
-int SockListen(int sockIdx, int backlog)
+int SockListen(int sockIdx, int backlog, SocketBindActor actor)
 {
-    if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return -1;
-    if (!g_sockUsed[sockIdx]) return -1;
-
-    Socket& s = g_sockets[sockIdx];
-    if (s.type != SOCK_STREAM) return -1;
-    if (!s.bound) return -1;
-
-    uint64_t queueFlags = IrqSpinLockAcquire(&g_acceptQueueLock);
-    s.listening = true;
-    s.listenBacklog = (backlog > Socket::ACCEPT_QUEUE_MAX)
-                        ? Socket::ACCEPT_QUEUE_MAX : (backlog < 1 ? 1 : backlog);
-    s.acceptQueueCount = 0;
-    s.tcpState = TcpState::Listen;
-    s.listenSockIdx = -1;
+    SocketBorrow borrow(sockIdx);
+    if (!borrow) return -9;
+    auto& socket = g_sockets[sockIdx];
+    if (socket.type != SOCK_STREAM) return -95;
+    const auto queueFlags = IrqSpinLockAcquire(&g_acceptQueueLock);
+    SpinLockAcquire(&socket.lock);
+    int error = 0;
+    if (BridgeReservedPort(socket.localPort) && !actor.initialRoot) error = -13;
+    else if (socket.tcpState != TcpState::Closed && socket.tcpState != TcpState::Listen) error = -22;
+    else if (!socket.bound) error = PublishPort(sockIdx, 0, 0, actor);
+    if (!error && !socket.listening) {
+        const auto flags = IrqSpinLockAcquire(&g_socketRegistryLock);
+        auto& binding = g_bindings[sockIdx];
+        if (PortConflicts(sockIdx, binding, ApicTickCount(), false)) {
+            error = -98;
+        } else {
+            binding.use = PortUse::Listen;
+            socket.listening = true;
+            socket.tcpState = TcpState::Listen;
+            socket.listenSockIdx = -1;
+        }
+        IrqSpinLockRelease(&g_socketRegistryLock, flags);
+    }
+    if (!error)
+        socket.listenBacklog = backlog > Socket::ACCEPT_QUEUE_MAX
+                             ? Socket::ACCEPT_QUEUE_MAX : (backlog < 1 ? 1 : backlog);
+    SpinLockRelease(&socket.lock);
     IrqSpinLockRelease(&g_acceptQueueLock, queueFlags);
-
-    SerialPrintf("net: listen sockIdx=%d port=%u backlog=%d\n",
-                 sockIdx, ntohs(s.localPort), s.listenBacklog);
-    return 0;
+    return error;
 }
 
 int SockAccept(int sockIdx, SockAddrIn* addr, bool* peerLocalIngress)
@@ -4699,12 +4924,12 @@ static void DebugChannelThreadFn(void* /*arg*/)
     s.remoteIp   = addr.sin_addr;
     s.remotePort = addr.sin_port;
 
-    if (!s.bound) {
-        uint32_t port = __atomic_fetch_add(&g_tcpEphemeralPort, 1, __ATOMIC_RELAXED);
-        if (port >= 65535) __atomic_store_n(&g_tcpEphemeralPort, 49200, __ATOMIC_RELAXED);
-        s.localPort = htons(static_cast<uint16_t>(port));
-        s.localIp   = g_netIf ? g_netIf->ipAddr : 0;
-        s.bound     = true;
+    SpinLockAcquire(&s.lock);
+    const int bindError = PublishPort(idx, g_netIf ? g_netIf->ipAddr : 0, 0, {});
+    SpinLockRelease(&s.lock);
+    if (bindError) {
+        SockClose(idx);
+        return;
     }
 
     s.tcpSndIss  = static_cast<uint32_t>(__atomic_load_n(&g_ipId, __ATOMIC_RELAXED)) * 12345 + ntohs(s.localPort) * 67890;

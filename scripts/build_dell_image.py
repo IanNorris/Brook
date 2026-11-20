@@ -204,6 +204,16 @@ def main():
     if subprocess.check_output(['mtype', '-i', str(a.output / 'INITRD.IMG'), '::/BOOT/HWBULK.ELF']) != helper.read_bytes():
         sys.exit('HWBULK.ELF readback mismatch')
 
+    # Update receivers also need the checkout's socket restart behavior.
+    update_helpers = {}
+    updater_source = ROOT / 'tools/hardware_update.c'
+    for name, flags in (('HWUPDATE.ELF', []), ('HWUPSYS.ELF', ['-DBROOK_UPDATE_SYSTEM'])):
+        binary = a.output / name
+        run([os.environ['MUSL_CC'], '-static', '-O2', '-Wall', '-Wextra', '-Werror', *flags,
+             updater_source, '-o', binary])
+        run(['mcopy', '-o', '-i', a.output / 'INITRD.IMG', binary, '::/BOOT/' + name])
+        update_helpers[name] = sha(binary)
+
     # 4. Independent verification
     verify = [sys.executable, ROOT / 'scripts/verify_guarded_desktop_candidate.py', '--candidate', a.output,
               '--source', source, '--reference', source, '--build', build, '--expected-kernel', sha(kernel),
@@ -212,6 +222,8 @@ def main():
               '--allow-ac-loss-poweroff', '--expected-vulkan-supervisor', sha(supervisor),
               '--expected-vulkan-renderer', sha(renderer), '--expected-gpu-provider', sha(provider)]
     verify += clearwater_verify
+    for name, digest in update_helpers.items():
+        verify.extend(['--expected-update-helper', name, digest])
     verify += [flag for name, flag in VERIFY_ALLOW.items() if options.get(name) == 'ON']
     if not a.show_kernel_console:
         verify.append('--allow-hidden-kernel-console')
@@ -227,6 +239,8 @@ def main():
         'initrd_sha256': sha(a.output / 'INITRD.IMG'), 'source_initrd_sha256': SOURCE_INITRD_SHA,
         'packages': packages,
         'bulk_helper': {'source': 'tools/hardware_bulk.c', 'sha256': sha(helper)},
+        'update_helpers': {name: {'source': 'tools/hardware_update.c', 'sha256': digest}
+                           for name, digest in update_helpers.items()},
         'boot_services': {name: {'source': str(path), 'sha256': sha(path), 'runtime_store_paths': runtime_paths(path)}
                           for name, path in boot_services.items()},
     }

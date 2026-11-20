@@ -421,7 +421,14 @@ uint64_t SockNetworkScope(int sockIdx);
 bool SockGetIdentity(int sockIdx, SocketIdentity* out);
 // Dequeued child only, before publishing any FD or descriptor alias.
 void SockSetAcceptedOwner(int sockIdx, uint32_t uid, uint32_t gid);
-int  SockBind(int sockIdx, const SockAddrIn* addr);
+struct SocketBindActor {
+    uint32_t uid = 0;
+    bool initialRoot = true; // Default only for direct kernel callers.
+};
+enum class SocketReuse : uint8_t { Address = 1, Port = 2 };
+int SockSetReuse(int sockIdx, SocketReuse option, bool enabled);
+int SockGetReuse(int sockIdx, SocketReuse option);
+int SockBind(int sockIdx, const SockAddrIn* addr, SocketBindActor actor = {});
 int  SockConnect(int sockIdx, const SockAddrIn* addr);
 int  SockSendTo(int sockIdx, const void* buf, uint32_t len,
                 const SockAddrIn* dest);
@@ -445,7 +452,7 @@ int  SockGetType(int sockIdx);  // returns SOCK_STREAM(1) or SOCK_DGRAM(2)
 int  SockGetProtocol(int sockIdx); // immutable creation protocol, or -1 for invalid slot
 void SockGetLocal(int sockIdx, uint32_t* ip, uint16_t* port);
 void SockGetRemote(int sockIdx, uint32_t* ip, uint16_t* port);
-int  SockListen(int sockIdx, int backlog);
+int  SockListen(int sockIdx, int backlog, SocketBindActor actor = {});
 int  SockAccept(int sockIdx, SockAddrIn* addr, bool* peerLocalIngress=nullptr);
 bool SockPollReady(int sockIdx, bool checkRead, bool checkWrite);
 // Optional async-send worker-pool notification for a poll/epoll invocation.
