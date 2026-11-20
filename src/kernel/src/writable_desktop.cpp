@@ -52,10 +52,42 @@ bool Directory(const char* path,bool writable) {
     return !VfsLstatPath(path,&st) && st.isDir && !st.isSymlink &&
         (!writable || (st.uid==1000 && st.gid==1000 && (st.mode&0300)==0300));
 }
+// Signed profile staging publishes immutable generations through two fixed
+// relative aliases. Only these exact spellings are admitted; anything else
+// (an absolute target, a different generation root) stays in maintenance.
+bool ManagedAlias(const char* path,const char* expected) {
+    VnodeStat st{};
+    if(VfsLstatPath(path,&st) || !st.isSymlink)return false;
+    char target[64]{};
+    const int length=VfsReadlink(path,target,sizeof(target)-1);
+    const int want=int(strlen(expected));
+    if(length!=want || memcmp(target,expected,want)!=0)return false;
+    VnodeStat resolved{};
+    return !VfsStatPath(path,&resolved) && resolved.isDir;
+}
+bool ResolvedDirectory(const char* path) {
+    VnodeStat st{};return !VfsStatPath(path,&st) && st.isDir;
+}
+bool ProfileValid() {
+    const char* inner[]={"/nix/profile/bin","/nix/profile/lib","/nix/profile/share/applications"};
+    // Legacy layout: the installer mutates the profile in place.
+    if(Directory("/nix/profile",true) && Directory("/nix/share/applications",true)) {
+        for(const char* path:inner)if(!Directory(path,true))return false;
+        return true;
+    }
+    // Managed layout: generations are replaced, never edited, so only
+    // structure is required inside them.
+    VnodeStat current{};
+    if(VfsLstatPath("/nix/var/.brook-profiles/current",&current) || !current.isSymlink ||
+       !ManagedAlias("/nix/profile","var/.brook-profiles/current") ||
+       !ManagedAlias("/nix/share/applications","../profile/.brook-launcher"))return false;
+    for(const char* path:inner)if(!ResolvedDirectory(path))return false;
+    return true;
+}
 bool PayloadValid() {
-    const char* directories[]={"/nix/store","/nix/profile","/nix/profile/bin","/nix/profile/lib",
-        "/nix/profile/share/applications","/nix/home/brook","/nix/var/cache/narinfo","/nix/share/applications"};
+    const char* directories[]={"/nix/store","/nix/home/brook","/nix/var/cache/narinfo"};
     for(const char* path:directories)if(!Directory(path,true))return false;
+    if(!ProfileValid())return false;
     const char* files[]={"/nix/profile/manifest.tsv","/nix/index/packages.idx","/nix/share/applications/applications.idx"};
     for(const char* path:files){VnodeStat st{};if(VfsStatPath(path,&st)||st.isDir||!st.size)return false;}
     const char* executables[]={"/nix/bin/nix","/nix/bin/nix-fetch","/nix/bin/nar-unpack",

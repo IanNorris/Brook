@@ -84,6 +84,7 @@ def main():
     parser.add_argument('--auto-desktop-dell-shutdown-module',type=Path,help='Use this matching virtio-net module for checked Dell-script shutdown')
     parser.add_argument('--auto-desktop-dell-usb-network',action='store_true',help='Use the Dell initrd xHCI module and emulated USB Ethernet for checked shutdown')
     parser.add_argument('--auto-desktop-dell-async-network',action='store_true',help='Retain Dell asynchronous TCP settings with the emulated NIC')
+    parser.add_argument('--managed-profile',action='store_true',help='Lay out /nix as a signed staging generation behind relative aliases')
     parser.add_argument('--normal-kernel',type=Path,help='Use this normal kernel for the final boot')
     parser.add_argument('--normal-network-module',type=Path,help='Matching virtio-net module for normal boot')
     parser.add_argument('--proc-dump-qa',type=Path,help='Run the live core fixture with this matching virtio NIC module')
@@ -254,17 +255,37 @@ def main():
         subprocess.run(['mke2fs','-q','-F','-t','ext2','-b','4096','-I','128','-N','1024','-m','0',
                         '-O','none,filetype,sparse_super,large_file','-U',str(fs_uuid),str(partition)],check=True,stderr=subprocess.DEVNULL)
         witness=work/'placeholder';witness.write_text('synthetic fixture\n')
-        for name in DIRS:
+        generation='var/.brook-profiles/.brook-profile-legacy'
+        def place(name):
+            # Managed staging keeps the profile in a generation directory and
+            # exposes the launcher directory from inside it.
+            if not a.managed_profile:return name
+            if name=='profile' or name.startswith('profile/'):return generation+name[len('profile'):]
+            if name=='share/applications' or name.startswith('share/applications/'):
+                return generation+'/.brook-launcher'+name[len('share/applications'):]
+            return name
+        dirs=list(DIRS)
+        if a.managed_profile:
+            # Parents first; 'share' stays a real directory holding the alias.
+            dirs=['var','var/.brook-profiles']+[place(d) for d in DIRS if d!='var']
+        assert len(dirs)==len(set(dirs))
+        for name in dirs:
             for command in (f'mkdir /{name}',f'set_inode_field /{name} uid 1000',f'set_inode_field /{name} gid 1000'):
                 subprocess.run(['debugfs','-w','-R',command,str(partition)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-        for name in FILES:
+        for logical in FILES:
+            name=place(logical)
             subprocess.run(['debugfs','-w','-R',f'write {witness} /{name}',str(partition)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-            if name.startswith(('bin/','profile/bin/')):
+            if logical.startswith(('bin/','profile/bin/')):
                 subprocess.run(['debugfs','-w','-R',f'set_inode_field /{name} mode 0100755',str(partition)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        if a.managed_profile:
+            for link,target in (('/var/.brook-profiles/current','.brook-profile-legacy'),
+                                ('/profile','var/.brook-profiles/current'),
+                                ('/share/applications','../profile/.brook-launcher')):
+                subprocess.run(['debugfs','-w','-R',f'symlink {link} {target}',str(partition)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         if a.auto_desktop_dell_initrd:
             names=('waylandd','hardware-dbus','hardware-message')
             for name in names:
-                target='/profile/bin/'+name
+                target='/'+place('profile/bin/'+name)
                 binary=(a.auto_desktop_real_provider.resolve(strict=True) if name=='waylandd' and a.auto_desktop_real_provider else
                         client if name=='hardware-message' and a.auto_desktop_wayland_client else service)
                 subprocess.run(['debugfs','-w','-R',f'write {binary} {target}',str(partition)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)

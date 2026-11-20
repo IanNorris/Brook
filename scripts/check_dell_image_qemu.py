@@ -115,8 +115,12 @@ def main():
                    help='maximum runs; only a firmware stall before boot selection is retried (default 2)')
     p.add_argument('--proc-dump-qa', action='store_true', help='Also run the two-thread live core and GDB fixture')
     p.add_argument('--proc-autodump-qa', action='store_true', help='Run the live core fixture and verify an automatic fault core')
+    p.add_argument('--managed-profile', action='store_true',
+                   help='Seed the data volume with the signed-staging profile layout (aliases into a generation)')
     a = p.parse_args()
     mode_flags = list(MODE_FLAGS)
+    if a.managed_profile:
+        mode_flags.append('--managed-profile')
     if a.proc_dump_qa or a.proc_autodump_qa:
         mode_flags += ['--proc-dump-qa', str(a.kernel_build.resolve() / 'drivers/virtio_net.mod')]
     if a.proc_autodump_qa:
