@@ -527,7 +527,8 @@ void AhciSystemDataInspect() {
         KPrintf("ahci data inspect: offline filesystem check required (read only)\n");
     else KPrintf("ahci data inspect: identity or format rejected (read only)\n");
 }
-bool AhciSystemDirectDesktopMount(uint8_t* nextDrive) {
+bool AhciSystemDirectDesktopMount(uint8_t* nextDrive,bool* sharedProfileRejected) {
+    if(sharedProfileRejected)*sharedProfileRejected=false;
     if(!directPrepared || directReady || !nextDrive || !Ext2DriveAvailable(*nextDrive))return false;
     directPrepared=false; // failed admission is not replayed during this boot
     if(!WritableDesktopPrepareDirect())return false;
@@ -544,7 +545,9 @@ bool AhciSystemDirectDesktopMount(uint8_t* nextDrive) {
         if(VfsSync(nullptr) || VfsMountCleanupPending())KPrintf("ahci direct: backing cleanup pending; maintenance only\n");
         return false;
     }
-    if(!WritableDesktopPublishDirect()) {
+    const auto publication=WritableDesktopPublishDirect();
+    if(publication!=WritableDesktopPublish::Ready) {
+        if(sharedProfileRejected)*sharedProfileRejected=publication==WritableDesktopPublish::SharedProfileRejected;
         if(!VfsUnmount("/nix"))KPrintf("ahci direct: unmount failed; maintenance only\n");
         return false;
     }
@@ -568,7 +571,8 @@ bool AhciSystemGuardTestAdoptSystemMount(Device* adapter,uint8_t drive,uint64_t 
     guardSystemVolumeDevice=adapter;systemVolumeDrive=drive;systemVolumePublication=publication;
     return true;
 }
-bool AhciSystemGuardTestMountDesktop(Device* adapter,uint8_t* nextDrive) {
+bool AhciSystemGuardTestMountDesktop(Device* adapter,uint8_t* nextDrive,bool* sharedProfileRejected) {
+    if(sharedProfileRejected)*sharedProfileRejected=false;
     static bool desktopAttempted=false;
     if(__atomic_exchange_n(&desktopAttempted,true,__ATOMIC_ACQ_REL) || adapter!=&guardTestPartition ||
        guardTestPhase!=GuardTestPhase::Writing || guardDataPhase!=GuardDataPhase::Disabled ||
@@ -579,7 +583,7 @@ bool AhciSystemGuardTestMountDesktop(Device* adapter,uint8_t* nextDrive) {
     if(!DeviceRegister(&largePartition))return false;
     largeRange=guardDataRange;guardDesktopLeaseOwner=&guardDataPartition;
     directLeased=true;directPrepared=true;guardDesktopPhase=GuardDesktopPhase::Preparing;
-    const bool ready=AhciSystemDirectDesktopMount(nextDrive);
+    const bool ready=AhciSystemDirectDesktopMount(nextDrive,sharedProfileRejected);
     guardDesktopPhase=ready?GuardDesktopPhase::Ready:GuardDesktopPhase::Failed;
     return ready;
 }
@@ -642,7 +646,7 @@ bool AhciSystemQemuLargeDataMount(uint8_t* nextDrive) {
             KPrintf("ahci direct test: backing cleanup pending; maintenance only\n");
         return false;
     }
-    if(desktop && !WritableDesktopPublishDirect()) {
+    if(desktop && WritableDesktopPublishDirect()!=WritableDesktopPublish::Ready) {
         if(!VfsUnmount(target))KPrintf("ahci direct test: unmount failed; maintenance only\n");
         return false;
     }

@@ -7,7 +7,7 @@ enum class AhciSystemBoot { Absent, Ready, Maintenance };
 // An explicit direct-store selector always requires direct admission; failures
 // are maintenance-only rather than selecting a different desktop store.
 bool AhciSystemDirectRequested();
-bool AhciSystemDirectDesktopMount(uint8_t* nextDrive);
+bool AhciSystemDirectDesktopMount(uint8_t* nextDrive,bool* sharedProfileRejected=nullptr);
 int AhciSystemDirectFinalSync();
 // Boot only. An existing selector which fails at any stage is Maintenance.
 AhciSystemBoot AhciSystemVolumeMount(uint8_t* nextDrive);
@@ -47,7 +47,7 @@ bool AhciSystemGuardPanicTestArm(Device* adapter,const uint64_t* sectors,uint32_
 bool AhciSystemGuardTestAdoptSystemMount(Device* adapter,uint8_t drive,uint64_t publication);
 // Caller must already have checked both guards and published the checked ESP.
 // Retains the guard-owned data lease and never retries failure.
-bool AhciSystemGuardTestMountDesktop(Device* adapter,uint8_t* nextDrive);
+bool AhciSystemGuardTestMountDesktop(Device* adapter,uint8_t* nextDrive,bool* sharedProfileRejected=nullptr);
 int AhciSystemGuardTestFailedDesktopWrite();
 #if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_SSD_GUARDED_DESKTOP)
 // Recheck the admitted desktop data superblock from disk after final sync.

@@ -103,6 +103,18 @@ int main(int argc,char** argv){
     record="BRKSTORE1 16777216 cf16f1ae-68c5-5fac-89e9-382b8af5cd5c\n";
     if(Is("header"))disk[1080]=0;
     if(Is("unclean")||Is("system-unclean"))disk[1082]=0;
+    if(scenario.rfind("direct-",0)==0) {
+        scenario.erase(0,7);
+        assert(brook::WritableDesktopPrepareDirect());
+        mounted=true;
+        const auto result=brook::WritableDesktopPublishDirect();
+        using Publish=brook::WritableDesktopPublish;
+        if(Is("payload"))assert(result==Publish::SharedProfileRejected);
+        else if(Is("home"))assert(result==Publish::HomeBindFailed);
+        else assert(Is("ready")&&result==Publish::Ready);
+        assert(homeBound==Is("ready")&&!roots);
+        return 0;
+    }
     uint8_t drive=3;const auto sourceVolume=scenario.rfind("system-",0)==0?brook::WritableDesktopSource::System:brook::WritableDesktopSource::Usb;
     const auto result=brook::WritableDesktopBootMount(&drive,sourceVolume);auto info=brook::WritableDesktopRead();
     assert(!opens&&!roots);

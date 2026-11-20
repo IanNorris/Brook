@@ -5,7 +5,8 @@ enum class WritableDesktopBoot { Absent,Fallback,Ready,Maintenance };
 enum class WritableDesktopSource { Usb,System };
 // Direct stores use the same namespace and payload checks as image stores.
 bool WritableDesktopPrepareDirect();
-bool WritableDesktopPublishDirect();
+enum class WritableDesktopPublish { Ready, SharedProfileRejected, HomeBindFailed };
+WritableDesktopPublish WritableDesktopPublishDirect();
 void WritableDesktopMarkDirectReady(uint8_t drive,uint64_t bytes);
 void WritableDesktopDirectFinalResult(int error,bool attempted);
 struct WritableDesktopInfo {

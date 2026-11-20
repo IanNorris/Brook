@@ -128,11 +128,12 @@ void DestroyPrivate() {
 }
 }
 bool WritableDesktopPrepareDirect() {return NamespaceClear() && !PrepareTarget();}
-bool WritableDesktopPublishDirect() {
-    if(!PayloadValid())return false;
+WritableDesktopPublish WritableDesktopPublishDirect() {
+    if(!PayloadValid())return WritableDesktopPublish::SharedProfileRejected;
     VfsPath root{};int error=VfsPathRoot(&root);
     if(!error)error=VfsMountNamespaceBindAt(VfsMountNamespaceInitial(),root,root,"/nix/home/brook","/data/home");
-    VfsPathRelease(root);return !error;
+    VfsPathRelease(root);
+    return error ? WritableDesktopPublish::HomeBindFailed : WritableDesktopPublish::Ready;
 }
 void WritableDesktopMarkDirectReady(uint8_t drive,uint64_t bytes) {
     directStore=true;attempted=true;info.configured=true;info.ready=true;info.pinned=true;

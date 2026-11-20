@@ -280,8 +280,13 @@ void Worker(void* arg) {
         if(!handoff && !AhciSystemGuardTestAdoptSystemMount(adapter,1,publication))handoff=-13;
         if(!handoff)handoff=FatFsPrivateRecoveryArmJournal(mount);
         uint8_t drive=2;
-        if(!handoff && !AhciSystemGuardTestMountDesktop(adapter,&drive))handoff=-5;
-        if(handoff) {KPrintf("GUARD_DESKTOP_HANDOFF_FAILED status=%d\n",handoff);return;}
+        bool sharedProfileRejected=false;
+        if(!handoff && !AhciSystemGuardTestMountDesktop(adapter,&drive,&sharedProfileRejected))handoff=-5;
+        if(handoff) {
+            KPrintf("GUARD_DESKTOP_HANDOFF_FAILED status=%d shared_profile_rejected=%u\n",
+                    handoff,sharedProfileRejected?1u:0u);
+            return;
+        }
         if(haveShutdownRecord) {
             previousAcShutdown=prior;
             __atomic_store_n(&acShutdownMount,mount,__ATOMIC_RELEASE);
