@@ -1319,23 +1319,6 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector,
                     sysInfo.gitHash[brook::PANIC_GIT_HASH_LEN - 1] = '\0';
                 }
 
-                // Raw stack dump from exception RSP
-                static brook::PanicStackDump stackDump = {};
-                {
-                    stackDump.rsp = ef->rsp;
-                    stackDump.length = 0;
-                    const uint8_t* rspPtr = reinterpret_cast<const uint8_t*>(ef->rsp);
-                    const uint32_t bytes=stackBounds.Available(ef->rsp,brook::PANIC_STACK_DUMP_BYTES);
-                    if (bytes)
-                    {
-                        for (uint16_t i = 0; i < bytes; i++)
-                        {
-                            stackDump.data[i] = rspPtr[i];
-                            stackDump.length = i + 1;
-                        }
-                    }
-                }
-
                 static brook::PanicCpuList cpuList;
                 brook::PanicCaptureCpuList(&cpuList);
                 brook::PanicScreenInfo psi = {};
@@ -1345,7 +1328,6 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector,
                 psi.excInfo   = &excInfo;
                 psi.procList  = &procList;
                 psi.sysInfo   = &sysInfo;
-                psi.stackDump = &stackDump;
                 psi.cpuList   = &cpuList;
                 psi.vector    = vector;
                 psi.errorCode = ef->errorCode;

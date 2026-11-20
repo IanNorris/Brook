@@ -564,24 +564,7 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
             sysInfo.gitBranch[brook::PANIC_GIT_BRANCH_LEN - 1] = '\0';
         }
 
-        // Capture raw stack bytes from RSP
-        static brook::PanicStackDump stackDump = {};
-        {
-            stackDump.rsp = regs.rsp;
-            stackDump.length = 0;
-            const uint8_t* rspPtr = reinterpret_cast<const uint8_t*>(regs.rsp);
-            uint64_t rspAddr = regs.rsp;
-            const uint16_t maxBytes=static_cast<uint16_t>(brook::PanicCurrentStackBounds().Available(rspAddr,brook::PANIC_STACK_DUMP_BYTES));
-            if (maxBytes)
-            {
-                for (uint16_t i = 0; i < maxBytes; i++)
-                {
-                    stackDump.data[i] = rspPtr[i];
-                    stackDump.length = i + 1;
-                }
-            }
-        }
-
+        // Panic reports keep the stack trace without copying credential-bearing stack data.
         uint32_t fbStride = physStride * 4; // pixel stride → byte stride
         static brook::PanicCpuList cpuList;
         brook::PanicCaptureCpuList(&cpuList);
@@ -592,7 +575,6 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
         psi.excInfo   = nullptr;  // KernelPanic — no exception
         psi.procList  = &procList;
         psi.sysInfo   = &sysInfo;
-        psi.stackDump = &stackDump;
         psi.cpuList   = &cpuList;
         psi.vector    = 0;
         psi.errorCode = 0;
@@ -607,7 +589,7 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
         {
             // Preserve the same structured evidence without a framebuffer.
             brook::PanicRenderQR(nullptr, 0, 0, 0, &fullRegs, &trace,
-                                 nullptr, &procList, &sysInfo, &stackDump, &cpuList, g_panicBuf);
+                                 nullptr, &procList, &sysInfo, nullptr, &cpuList, g_panicBuf);
         }
     }
 
