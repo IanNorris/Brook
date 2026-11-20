@@ -59,6 +59,7 @@ pkgs.mkShellNoCC {
     pkgs.e2fsprogs.fuse2fs # fuse2fs for mounting ext2 images without sudo
     pkgs.fuse             # fusermount for fuse2fs
     pkgs.cacert           # standard root trust bundle in the guest initrd
+    (pkgs.lib.getBin pkgs.openssl) # sign and verify closure stage plans
   ];
 
   shellHook = ''

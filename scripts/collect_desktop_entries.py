@@ -188,12 +188,21 @@ def main():
         print("  output_dir:    Output directory for applications.idx and icons/")
         sys.exit(1)
 
-    store_dir = sys.argv[1]
-    output_dir = sys.argv[2]
+    collect(Path(sys.argv[1]), Path(sys.argv[2]))
 
-    if not os.path.isdir(store_dir):
-        print(f"ERROR: Store directory not found: {store_dir}")
-        sys.exit(1)
+
+def collect(store_dir, output_dir, *, profile=None, hardware=False, profile_only=False):
+    if not store_dir.is_dir():
+        raise ValueError(f"Store directory not found: {store_dir}")
+    nix_dir = store_dir.parent
+    profile = profile or nix_dir / 'profile'
+
+    def guest_path(path):
+        if path.startswith('/nix/profile/'):
+            return profile / path.removeprefix('/nix/profile/')
+        if path.startswith('/nix/'):
+            return nix_dir / path.removeprefix('/nix/')
+        return Path(path)
 
     os.makedirs(output_dir, exist_ok=True)
     icons_dir = os.path.join(output_dir, 'icons')
@@ -209,23 +218,25 @@ def main():
             raise RuntimeError(f'Cannot convert built-in icon {asset}')
 
     # Scan for .desktop files
-    profile_apps = Path(store_dir).parent/'profile/share/applications'
-    desktop_files = (glob.glob(str(profile_apps/'*.desktop')) if profile_apps.is_dir()
+    profile_apps = profile/'share/applications'
+    desktop_files = (glob.glob(str(profile_apps/'*.desktop')) if profile_only or profile_apps.is_dir()
                      else glob.glob(os.path.join(store_dir, '*/share/applications/*.desktop')))
     print(f"Found {len(desktop_files)} .desktop files")
 
     entries = []
     seen_names = set()
 
-    for df in sorted(desktop_files):
+    # Files reserves its display name for Brook's default directory handler.
+    for df in sorted(desktop_files, key=lambda path: (Path(path).name != "org.gnome.Nautilus.desktop", path)):
         result = parse_desktop_file(df)
         if result is None:
             continue
 
         name, exec_cmd, icon_name, categories, comment = result
 
-        # Deduplicate by name
-        if name in seen_names:
+        # Managed launchers use case-insensitive title ownership.
+        title_key = name.casefold() if profile_only else name
+        if title_key in seen_names:
             continue
 
         # Validate: check that the binary actually exists in the store.
@@ -236,9 +247,7 @@ def main():
         if binary.startswith('/'):
             # Absolute path — check directly (relative to store root parent)
             # e.g. /nix/store/xxx/bin/vlc -> store_dir/../xxx/bin/vlc
-            store_parent = os.path.dirname(store_dir)  # parent of "store/"
-            abs_check = os.path.join(store_parent, binary.lstrip('/').replace('nix/', '', 1))
-            if os.path.isfile(abs_check):
+            if guest_path(binary).is_file():
                 binary_found = True
         else:
             # Bare command name — search all store packages' bin/ directories
@@ -251,7 +260,7 @@ def main():
             print(f"  Skip: {name} [{binary}] — binary not found in store")
             continue
 
-        seen_names.add(name)
+        seen_names.add(title_key)
 
         # Try to find and convert the icon
         icon_file = ""
@@ -259,7 +268,8 @@ def main():
             icon_path = find_icon(store_dir, icon_name)
             if icon_path:
                 safe_name = ''.join(c for c in icon_name.replace('/', '_').replace(' ', '_') if c.isascii() and (c.isalnum() or c in '-_'))
-                rgba_filename = f"{safe_name}.rgba"
+                rgba_filename = ("org.gnome.nautilus.rgba" if Path(df).stem == "org.gnome.Nautilus"
+                                 else f"{safe_name}.rgba")
                 rgba_path = os.path.join(icons_dir, rgba_filename)
                 if convert_icon_to_rgba(icon_path, rgba_path):
                     icon_file = rgba_filename
@@ -276,8 +286,8 @@ def main():
         binary_name = Path(binary).name
         if binary_name in ('chromium', 'firefox', 'codium', 'vscodium', 'vlc'):
             wrapper = 'brook-' + ('codium' if binary_name == 'vscodium' else binary_name)
-            candidates = [(Path(store_dir).parent/'bin'/wrapper, '/nix/bin/'),
-                          (Path(store_dir).parent/'profile/bin'/wrapper, '/nix/profile/bin/')]
+            candidates = [(nix_dir/'bin'/wrapper, '/nix/bin/'),
+                          (profile/'bin'/wrapper, '/nix/profile/bin/')]
             deployed = next((prefix for path, prefix in candidates
                              if path.is_file() and os.access(path, os.X_OK)), None)
             if deployed:
@@ -286,14 +296,21 @@ def main():
                 if binary_name in ('firefox', 'codium', 'vscodium', 'vlc'):
                     exec_cmd = '--uid 1000 ' + exec_cmd
 
-        if binary_name == 'brook-nautilus':
+        if hardware and binary in (binary_name, '/nix/profile/bin/' + binary_name):
+            hardware_names = ('mousepad', 'brook-settings', 'wayland-calc', 'brook-gallery')
+            if binary_name in hardware_names:
+                wrapper = '/nix/profile/bin/hardware-' + binary_name
+                if guest_path(wrapper).is_file():
+                    exec_cmd = wrapper
+
+        if binary_name in ('brook-nautilus', 'brook-quake2'):
             exec_cmd = '--uid 1000 ' + exec_cmd
 
         entries.append((name, exec_cmd, icon_file, categories, Path(df).stem, comment))
         print(f"  App: {name} [{exec_cmd}]")
 
     # Synthetic entries for games with a Brook play wrapper but no .desktop file.
-    for name, wrapper_exec, icon_file, categories, probe in EXTRA_ENTRIES:
+    for name, wrapper_exec, icon_file, categories, probe in (() if profile_only else EXTRA_ENTRIES):
         if name in seen_names:
             continue
         found = any(os.path.isfile(sp)
