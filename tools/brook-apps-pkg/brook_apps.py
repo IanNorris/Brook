@@ -23,7 +23,7 @@ from pathlib import Path
 
 ICON_SIZE = 24
 PROFILE_BIN = Path('/nix/profile/bin')
-COMMAND_LIMIT = 255       # LauncherItem::scriptPath capacity, minus the NUL
+COMMAND_LIMIT = 127 - len("--uid 1000 ")  # kernel: 127 bytes including its run prefix
 APP_ID_LIMIT = 63
 # The kernel splits the command on spaces and starts the program directly (no
 # shell), so only its own quoting characters and controls are unsafe.
