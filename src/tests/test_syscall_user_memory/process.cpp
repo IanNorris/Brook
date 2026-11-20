@@ -26,6 +26,7 @@ bool ProcessCapable(Process*,UserNamespace*,unsigned) { return g_namespaceAdmin;
 int ProcessFsIsolateMounts(Process*) { return 0; }
 int SysvSemClone(Process*,Process*,bool) { return 0; }
 void SysvSemExit(Process*) {}
+void SysvSemRetireNamespace(const IpcNamespace*) {}
 void ProcessDiscardUnpublished(Process*) {}
 void ResetSignalActions(uint16_t,bool) {}
 void SchedulerAddProcess(Process* child) {
@@ -131,14 +132,16 @@ static void UtsNamespaceIsolation() {
     CHECK(!strcmp(host,"brook")&&!strcmp(domain,"(none)"));
     ProcessUtsRead(child,host,domain);
     CHECK(!strcmp(host,"isolated")&&!strcmp(domain,"(none)"));
-    ProcessUtsRelease(child);
+    ProcessNamespacesRelease(child);
     free(child);
     g_child=nullptr;
-    CHECK(!sys_unshare(CloneNewUts,0,0,0,0,0));
+    CHECK(!ProcessIpcScope(parent));
+    CHECK(!sys_unshare(CloneNewUts|CloneNewIpc,0,0,0,0,0));
+    CHECK(ProcessIpcScope(parent));
     CHECK(!ProcessUtsWrite(parent,true,"test-domain",11));
     ProcessUtsRead(parent,host,domain);
     CHECK(!strcmp(host,"brook")&&!strcmp(domain,"test-domain"));
-    ProcessUtsRelease(parent);
+    ProcessNamespacesRelease(parent);
     g_namespaceAdmin=false;
 }
 

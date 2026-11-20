@@ -4,6 +4,7 @@ namespace {
 constexpr unsigned SemMaxSets=32000, SemMaxPerSet=32767, SemMaxOperations=500;
 struct SemSet {
     SemSet* next;
+    const IpcNamespace* scope;
     int id;
     SysvSemDs ds;
     uint16_t* values;
@@ -20,6 +21,7 @@ struct SemAlias { uint64_t incarnation; SemUndoGroup* group; };
 struct SemWaiter {
     SemWaiter* next;
     Process* process;
+    const IpcNamespace* scope;
     int id;
     uint16_t number;
     bool zero, notified;
@@ -36,8 +38,12 @@ SemWaiter* semWaiters=nullptr;
 uint64_t semWaitSerial=0;
 struct SemCredentials {
     uint32_t uid,gid;bool privileged;
+    const IpcNamespace* scope;
     SupplementaryGroups* groups;
-    explicit SemCredentials(Process* p):uid(p->euid),gid(p->egid),groups(ProcessGroupsAcquire(p)){privileged=ProcessCapable(p,nullptr,CapSysAdmin);}
+    explicit SemCredentials(Process* p):uid(p->euid),gid(p->egid),scope(ProcessIpcScope(p)),groups(ProcessGroupsAcquire(p))
+    {
+        privileged=ProcessCapable(p,ProcessIpcOwner(scope),CapSysAdmin);
+    }
     ~SemCredentials(){ProcessGroupsRelease(groups);}
     bool member(uint32_t g) const {
         if(g==gid)return true;
@@ -56,13 +62,13 @@ struct SemCredentials {
         return privileged || uid==s->ds.permission.uid || uid==s->ds.permission.cuid;
     }
 };
-SemSet* SemLookup(int id) {
-    for(auto* s=semSets;s;s=s->next)if(s->id==id)return s;
+SemSet* SemLookup(const IpcNamespace* scope,int id) {
+    for(auto* s=semSets;s;s=s->next)if(s->id==id && s->scope==scope)return s;
     return nullptr;
 }
-SemSet* SemKey(int32_t key) {
+SemSet* SemKey(const IpcNamespace* scope,int32_t key) {
     if(!key)return nullptr;
-    for(auto* s=semSets;s;s=s->next)if(s->ds.permission.key==key)return s;
+    for(auto* s=semSets;s;s=s->next)if(s->scope==scope && s->ds.permission.key==key)return s;
     return nullptr;
 }
 SemUndoGroup* SemGroup(Process* p,bool create) {
@@ -87,12 +93,12 @@ void SemDrainGarbage() {
 }
 // Capture a finite registration frontier. New/rearmed waiters are not chased.
 // Pin only the Process, never a stack waiter, across each unlocked wake.
-void SemNotify() {
+void SemNotify(const IpcNamespace* scope) {
     auto f=IrqSpinLockAcquire(&semLock);
     const uint64_t cutoff=semWaitSerial;
     for(;;) {
         Process* target=nullptr;
-        for(auto* w=semWaiters;w;w=w->next)if(w->serial<=cutoff && !w->notified) {
+        for(auto* w=semWaiters;w;w=w->next)if(w->scope==scope && w->serial<=cutoff && !w->notified) {
             w->notified=true;target=w->process;ProcessRef(target);break;
         }
         // Do not restore IF while a notifier owns a temporary process hold.
@@ -119,7 +125,7 @@ int SysvSemGet(Process* p,int32_t key,int count,int flags) {
     SemSet* candidate=nullptr;
     for(;;) {
         auto f=IrqSpinLockAcquire(&semLock);
-        auto* s=SemKey(key);
+        auto* s=SemKey(credentials.scope,key);
         int result=0;
         if(s) {
             if((flags&01000)&&(flags&02000))result=-17;
@@ -131,6 +137,7 @@ int SysvSemGet(Process* p,int32_t key,int count,int flags) {
         else if(semSetCount>=SemMaxSets || semNextId>0x7fffffffU)result=-28;
         else if(candidate) {
             candidate->id=int(semNextId++);
+            candidate->scope=credentials.scope;
             candidate->ds.permission={key,credentials.uid,credentials.gid,credentials.uid,credentials.gid,uint32_t(flags&0777),0,0,0,{0,0}};
             candidate->ds.count=unsigned(count);candidate->ds.changeTime=RtcNow();
             candidate->next=semSets;semSets=candidate;++semSetCount;
@@ -147,15 +154,17 @@ int SysvSemGet(Process* p,int32_t key,int count,int flags) {
         for(int i=0;i<count;++i){candidate->values[i]=0;candidate->pids[i]=0;}
     }
 }
-int SysvSemCount(Process*,int id) {
-    auto f=IrqSpinLockAcquire(&semLock);auto* s=SemLookup(id);
+int SysvSemCount(Process* p,int id) {
+    if(!p)return -22;
+    auto* scope=ProcessIpcScope(p);
+    auto f=IrqSpinLockAcquire(&semLock);auto* s=SemLookup(scope,id);
     const int result=s?int(s->ds.count):-22;IrqSpinLockRelease(&semLock,f);return result;
 }
 int SysvSemControl(Process* p,int id,int number,int command,int value,SysvSemDs* ds,uint16_t* values,unsigned count) {
     if(!p)return -22;
     SemOperationRegion region(p);SemCredentials credentials(p);SemDrainGarbage();
     command &= ~0x100; // IPC_64 is redundant in the native x86-64 ABI.
-    auto f=IrqSpinLockAcquire(&semLock);auto* s=SemLookup(id);
+    auto f=IrqSpinLockAcquire(&semLock);auto* s=SemLookup(credentials.scope,id);
     int result=0;bool notify=false;SemSet* retired=nullptr;
     if(!s)result=-22;
     else if(command==0 || command==1) {
@@ -190,10 +199,11 @@ int SysvSemControl(Process* p,int id,int number,int command,int value,SysvSemDs*
         if(value<0 || value>SysvSemMaxValue)result=-34;
         else {s->values[number]=uint16_t(value);s->pids[number]=p->tgid;SemClearUndo(id,number);s->ds.changeTime=RtcNow();notify=true;}
     } else result=-22;
-    IrqSpinLockRelease(&semLock,f);kfree(retired);if(notify)SemNotify();return result;
+    IrqSpinLockRelease(&semLock,f);kfree(retired);if(notify)SemNotify(credentials.scope);return result;
 }
 int SysvSemClone(Process* parent,Process* child,bool share) {
     if(!share)return 0;
+    if(ProcessIpcScope(parent)!=ProcessIpcScope(child))return -22;
     auto f=IrqSpinLockAcquire(&semLock);
     auto* group=SemGroup(parent,true);
     int result=-12;
@@ -210,6 +220,7 @@ uintptr_t SysvSemUndoIdentity(Process* p) {
 }
 void SysvSemExit(Process* p) {
     if(!p || p->pid>=MAX_PROCESSES)return;
+    auto* scope=ProcessIpcScope(p);
     auto f=IrqSpinLockAcquire(&semLock);auto& a=semAliases[p->pid];
     bool notify=false;
     if(a.group && a.incarnation==p->incarnation) {
@@ -217,7 +228,7 @@ void SysvSemExit(Process* p) {
         if(!--g->references) {
             while(g->records) {
                 auto* r=g->records;g->records=r->next;
-                if(auto* s=SemLookup(r->id)) {
+                if(auto* s=SemLookup(scope,r->id)) {
                     bool touched=false;
                     for(unsigned i=0;i<r->count;++i)if(r->adjustments[i]) {
                         int64_t n=int64_t(s->values[i])+r->adjustments[i];
@@ -230,7 +241,29 @@ void SysvSemExit(Process* p) {
             }
         }
     }
-    IrqSpinLockRelease(&semLock,f);if(notify)SemNotify();
+    IrqSpinLockRelease(&semLock,f);if(notify)SemNotify(scope);
+}
+void SysvSemRetireNamespace(const IpcNamespace* scope)
+{
+    if(!scope)return;
+    auto f=IrqSpinLockAcquire(&semLock);
+    SemSet* retired=nullptr;
+    auto** link=&semSets;
+    while(*link) {
+        auto* candidate=*link;
+        if(candidate->scope!=scope) {link=&candidate->next;continue;}
+        *link=candidate->next;
+        candidate->next=retired;
+        retired=candidate;
+        --semSetCount;
+        SemClearUndo(candidate->id,-1);
+    }
+    IrqSpinLockRelease(&semLock,f);
+    while(retired) {
+        auto* next=retired->next;
+        kfree(retired);
+        retired=next;
+    }
 }
 int SysvSemOperate(Process* p,int id,const SysvSemOp* ops,unsigned operations,uint64_t deadlineNs) {
     if(!p || !operations)return -22;
@@ -249,7 +282,7 @@ int SysvSemOperate(Process* p,int id,const SysvSemOp* ops,unsigned operations,ui
     auto* proposed=reinterpret_cast<uint16_t*>(proposedUndo+size);
     int result=0;bool waited=false;
     for(;;) {
-        auto f=IrqSpinLockAcquire(&semLock);auto* s=SemLookup(id);
+        auto f=IrqSpinLockAcquire(&semLock);auto* s=SemLookup(credentials.scope,id);
         SemUndoGroup* group=nullptr;SemUndoRecord* record=nullptr;
         if(!s){result=waited?-43:-22;IrqSpinLockRelease(&semLock,f);break;}
         if(!credentials.permitted(s,alter?2:4)){result=-13;IrqSpinLockRelease(&semLock,f);break;}
@@ -266,12 +299,12 @@ int SysvSemOperate(Process* p,int id,const SysvSemOp* ops,unsigned operations,ui
             for(unsigned i=0;i<operations;++i)s->pids[ops[i].number]=p->tgid;
             s->ds.operationTime=RtcNow();
             if(record==memory && undo)memory=nullptr;
-            IrqSpinLockRelease(&semLock,f);SemNotify();break;
+            IrqSpinLockRelease(&semLock,f);SemNotify(credentials.scope);break;
         }
         if(SemInterrupted(p)){result=-4;IrqSpinLockRelease(&semLock,f);break;}
         if(deadlineNs!=~uint64_t{0} && SemNowNs()>=deadlineNs){result=-11;IrqSpinLockRelease(&semLock,f);break;}
         if(semWaitSerial==~uint64_t{0}){result=-28;IrqSpinLockRelease(&semLock,f);break;}
-        SemWaiter waiter{semWaiters,p,id,preview.waitSemaphore,preview.waitZero,false,++semWaitSerial};
+        SemWaiter waiter{semWaiters,p,credentials.scope,id,preview.waitSemaphore,preview.waitZero,false,++semWaitSerial};
         semWaiters=&waiter;
         __atomic_store_n(&p->pendingWakeup,0,__ATOMIC_RELEASE);p->wakeupTick=SemWakeupTick(deadlineNs);
         IrqSpinLockRelease(&semLock,f);
@@ -281,7 +314,7 @@ int SysvSemOperate(Process* p,int id,const SysvSemOp* ops,unsigned operations,ui
         f=IrqSpinLockAcquire(&semLock);
         SemWaiter** link=&semWaiters;while(*link!=&waiter)link=&(*link)->next;
         *link=waiter.next;
-        const bool removed=!SemLookup(id);
+        const bool removed=!SemLookup(credentials.scope,id);
         IrqSpinLockRelease(&semLock,f);
         if(removed){result=-43;break;}
         if(interrupted){result=-4;break;}

@@ -5,7 +5,7 @@
 
 #include "core_autodump.h"
 #include "process_user_namespace.h"
-#include "process_uts.h"
+#include "process_namespaces.h"
 #include "memory/physical_memory.h"
 #include "tsc_clock.h"
 #include "user_copy.h"
