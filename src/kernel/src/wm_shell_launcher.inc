@@ -325,13 +325,15 @@ static void LauncherRun(const LauncherResult& r, const LauncherSnapshot& catalog
     switch (r.command) {
     case LauncherCommand::None: return;
     case LauncherCommand::Changed: break;
-    case LauncherCommand::Undo:
+    case LauncherCommand::Undo: {
         if (!g_launcherHistoryCount) return;
-        g_launcherHistoryNext = (g_launcherHistoryNext + LauncherUndoLimit - 1) % LauncherUndoLimit;
+        const uint32_t previous = (g_launcherHistoryNext + LauncherUndoLimit - 1) % LauncherUndoLimit;
+        if (!g_launcherModel.RestoreLayout(g_launcherHistory[previous])) return;
+        g_launcherHistoryNext = previous;
         --g_launcherHistoryCount;
-        if (!g_launcherModel.RestoreLayout(g_launcherHistory[g_launcherHistoryNext])) return;
         g_launcherUndoSince = ApicTickCount();
         break;
+    }
     case LauncherCommand::Launch: LauncherLaunch(r.app, catalog); break;
     case LauncherCommand::Close: if (g_launcherOpen) WmLauncherToggle(); break;
     case LauncherCommand::OpenSettings: {
