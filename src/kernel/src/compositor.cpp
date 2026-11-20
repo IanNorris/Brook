@@ -1775,12 +1775,19 @@ static void CursorLoadBuiltinPixels()
     g_cursorBuiltin = true;
 }
 
+static CursorShape CompositorCursorShape();
+static CursorImage g_cursorShapeSource;
+static CursorShape g_cursorShapeLoaded = CursorShape::Arrow;
+
 static void CursorPrepareFrame(bool busy, uint64_t now)
 {
     // Ownership follows the hover except while a button is held, so a drag
     // (selection, WM resize) keeps the cursor it started with.
     const uint64_t hover = WmPointerHoverIdentity();
     const bool buttons = MouseGetButtons() != 0;
+    // Away from client areas the built-in cursor takes the WM's shape: the
+    // resize arrows over frame edges and the dock's grip.
+    const CursorShape shape = CompositorCursorShape();
     SpinLockAcquire(&g_cursorSourceLock);
     if (!g_cursorSourceReady) CursorLoadBuiltinPixels();
     const bool showClient = g_cursorOwnership.Update(hover, buttons);
@@ -1789,7 +1796,12 @@ static void CursorPrepareFrame(bool busy, uint64_t now)
         CursorFillBuiltin(g_cursorBuiltinSource);
         g_cursorBuiltinReady = true;
     }
-    const CursorImage& source = g_cursorBuiltin || showClient ? g_cursorSource : g_cursorBuiltinSource;
+    const CursorImage* chosen = g_cursorBuiltin || showClient ? &g_cursorSource : &g_cursorBuiltinSource;
+    if (builtin && shape != CursorShape::Arrow) {
+        if (g_cursorShapeLoaded != shape && CursorFillShape(shape, g_cursorShapeSource)) g_cursorShapeLoaded = shape;
+        if (g_cursorShapeLoaded == shape) chosen = &g_cursorShapeSource;
+    }
+    const CursorImage& source = *chosen;
     if(builtin && WmGetAppliedScale()!=100) {
         ComposeCursor(source,g_cursorLogicalFrame,busy,now,WmCurrentPalette().borderActive);
         ScaleCursor(g_cursorLogicalFrame,g_cursorFrame,WmGetAppliedScale());
@@ -3169,6 +3181,26 @@ static void CompositorReconcilePointerCapture() {
     g_titleClicks.Reset();
     g_desktopPointerGate.ownedButtons=0;
     g_wmLastBtnDown=(MouseGetButtons()&~WmPointerSuppressedButtons()&MOUSE_BTN_LEFT)!=0;
+}
+
+// The built-in cursor's shape: what a press here would do (or the drag in
+// progress). Shell surfaces, popups and client areas keep the arrow; a
+// client sets its own cursor over its client area anyway.
+static CursorShape CompositorCursorShape()
+{
+    if (WmDockDragActive()) return CursorShape::ResizeH;
+    if (g_wmResizing)
+        return CursorShapeForEdges(uint8_t((g_wmResizeLeft ? 1 : 0) | (g_wmResizeTop ? 2 : 0) |
+                                           (g_wmResizeRight ? 4 : 0) | (g_wmResizeBottom ? 8 : 0)));
+    if (g_wmDragging || !MouseIsAvailable()) return CursorShape::Arrow;
+    int32_t mx = 0, my = 0;
+    MouseGetPosition(&mx, &my);
+    if (WmDockGripAt(mx, my, g_physFbWidth, g_physFbHeight)) return CursorShape::ResizeH;
+    if (WmLauncherVisible() || WmVolumePopupVisible() || WmTrayFlyoutVisible() || WmWindowMenuOpen() ||
+        my >= static_cast<int32_t>(WmTaskbarTop(g_physFbHeight)) ||
+        WmDockPointerOwned(mx, my, g_physFbWidth, g_physFbHeight))
+        return CursorShape::Arrow;
+    return CursorShapeForEdges(WmHitZoneResizeEdges(WmHitTest(mx, my).zone));
 }
 
 bool CompositorBeginWindowMove(int windowIdx)

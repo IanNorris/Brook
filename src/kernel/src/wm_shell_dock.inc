@@ -552,6 +552,12 @@ bool WmDockPointerOwned(int32_t mx, int32_t my, uint32_t screenW, uint32_t scree
     return (l.open ? l.strip : l.tab).contains(mx, my) || l.grip.contains(mx, my);
 }
 
+bool WmDockGripAt(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)
+{
+    if (!g_wmActive || !g_dock.count || WmTaskbarHidden() || !DockShown()) return false;
+    return DockLayoutFor(WmDesktopMetrics(), screenW, screenH).grip.contains(mx, my);
+}
+
 bool WmDockPress(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)
 {
     if (!g_wmActive || !g_dock.count || WmTaskbarHidden()) return false;
