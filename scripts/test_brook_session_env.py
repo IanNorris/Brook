@@ -47,7 +47,8 @@ with TemporaryDirectory(prefix="brook-session-test-") as temporary:
 
     runtime.rmdir()
     target = root / "target"
-    target.mkdir(mode=0o755)
+    target.mkdir()
+    target.chmod(0o755)
     runtime.symlink_to(target, target_is_directory=True)
     result = launch(root)
     assert result.returncode != 0 and "private runtime directory" in result.stderr

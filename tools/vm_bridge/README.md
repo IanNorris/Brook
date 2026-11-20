@@ -1,6 +1,6 @@
 # Brook VM bridge
 
-Follow-up roadmap: [efficiency, artifact delivery and UI control specification](../../docs/vm-bridge-next.md).
+Follow-up roadmap: efficiency, artifact delivery and UI control specification.
 Reference-first artifacts, command jobs, semantic UI controls, selectable/action-attached
 observations and cached screenshot views are implemented. See the roadmap for remaining work.
 
@@ -11,7 +11,7 @@ QMP sockets and Brook's guest debug channel. It never captures the host desktop.
 ## Start and connect
 
 Build/update the boot image and create experiment seed disks using the existing
-[fresh-build instructions](../../docs/experiments.md). Then opt in a user launch:
+fresh-build instructions. Then opt in a user launch:
 
 ```sh
 BROOK_VM_BRIDGE=1 BROOK_AUDIODEV=none nix-shell --run './scripts/run_experiment.sh desktop'
@@ -295,7 +295,7 @@ error cursor continuity and actual reference-only MCP delivery. Human UI actions
 remain separate from observation, and still-frame capture is not video recording.
 `accept_observe_reboot.py --session SESSION --out build/observe-reboot --panic`
 explicitly resets an empty agent VM with cloned disks, tests reused lease tokens,
-and optionally leaves it panicked. See [acceptance evidence](../../docs/vm-bridge-observations.md).
+and optionally leaves it panicked. See acceptance evidence.
 
 ### App discovery (bridge 0.5.1)
 
@@ -522,7 +522,7 @@ Host records survive server reconnect; output remains in the guest's bounded
 ring. Reset invalidates old operations. After shutdown, only saved status/exit
 metadata is returned with `cached: true`; full output artifacts and automatic
 job-output retention after shutdown remain future work; see the
-[durable output proposal](../../docs/vm-bridge-next.md#durable-command-output-and-guest-produced-artifacts--proposed). Check `observation_error`
+durable output proposal. Check `observation_error`
 and per-stream `read_error`/`read_timed_out` before treating a snapshot as fresh.
 Normal CLI exit or stdio EOF waits for an in-flight upload to finish staging;
 the queued response is flushed immediately. A forced server termination may
@@ -677,8 +677,8 @@ queried OS stats. A controlled panic preserved a readable panic screenshot,
 registers and bounded physical RAM inspection. These checks validate the
 bridge, not the deferred GL3 rendering, ext2 or audio-stutter fixes.
 
-See [VM design](../../docs/vm-control-mcp.md),
-[backlog](../../docs/backlog.md) and [month roadmap](../../docs/roadmap.md).
+See VM design,
+backlog and month roadmap.
 
 
 ### Executable-sharing counters
@@ -730,7 +730,7 @@ to pick up `server.py`. The source CLI and showcase helper use the updated code
 immediately. No desktop automation backend is introduced.
 
 CPU and GPU lease acceptance, failure tests and remaining recording work are
-recorded in [completed-frame capture](../../docs/completed-frame-capture.md).
+recorded in completed-frame capture.
 This still-capture protocol is intrusive and is not a continuous video recorder.
 
 ## Continuous recording

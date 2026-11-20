@@ -37,6 +37,7 @@ struct BrookDebugFrameInfoV3 {
  * WINDOW_BUFFER copies the current client buffer of the named window
  * (unoccluded, buffer pixels, no chrome) instead of the screen; it fails
  * with -ENOENT for an unknown window and -EOPNOTSUPP without a CPU buffer.
+ * CURSOR and WINDOW_BUFFER cannot be combined.
  * Op 7 fills BrookDebugFrameInfoV4 (exact length) for the same token.
  * Sources 4..7 extend the V2 source field: on Dell builds full-screen
  * captures read the surface primary plane A is fetching (DSPASURFLIVE), so

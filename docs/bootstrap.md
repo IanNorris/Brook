@@ -484,7 +484,7 @@ sectors instead of 568. A virtio timeout/reset appears during checkout; an
 ignored final inode-write failure is a supported hypothesis, not an identified
 failed request. The original disk is preserved, with no automatic repair.
 
-The immediate prerequisite is the [fast I/O gate](io-benchmark.md). At this checkpoint, both full prepared/clean acceptance runs remained outstanding;
+The immediate prerequisite is the fast I/O gate. At this checkpoint, both full prepared/clean acceptance runs remained outstanding;
 the later clean-image result is recorded below. Historical timings above
 used one vCPU; new launch/build defaults use eight. The metadata-batching
 candidate is on an experimental branch because small-file performance still
@@ -540,7 +540,7 @@ synchronization work; that observation does not establish race freedom.
 The newer prepared-image run built the kernel in 53 seconds and passed both
 native test runs, but failed offline checking with ten leaked ext2 blocks.
 The mixed-append cache regression and its validated fix are described in
-[io-cache-regression.md](io-cache-regression.md). Fresh prepared and clean
+io-cache-regression.md. Fresh prepared and clean
 acceptance remains required at one matching revision.
 
 ### Worker-page ownership diagnosis (2026-10-15)
@@ -839,7 +839,7 @@ The verifier matched each hash to its booted kernel.
 A subsequent ancestor-permission correction has separate targeted guest
 acceptance: the corrected kernel booted a clone of the prepared verification
 disks, compiled its expanded VMM test inside Brook, and passed all 14 tests,
-CoW/wait stress, heap and filesystem checks. See [workload evidence](workloads.md#page-table-ownership-prerequisite-for-shared-files-15-october-2026).
+CoW/wait stress, heap and filesystem checks. See workload evidence.
 The full two-path results above remain tied to `bf9f82a`.
 
 
@@ -956,7 +956,7 @@ loaded 4,096 pages through eight concurrent callers, measured 12,189 chain
 visits over one complete lookup sweep, and passed allocation-failure recovery,
 ordinary-I/O overlays, failed-truncate invalidation and exact reference recovery.
 The combined candidate with the CR2 address correction passed the real-guest
-race/lifecycle gates described in [workloads.md](workloads.md).
+race/lifecycle gates described in workloads.md.
 
 That did not translate into faster native rebuilds: the combined candidate took
 71.94/70.97 seconds (18-test suites 19.64/15.80). An original-kernel control
@@ -1245,7 +1245,7 @@ separate work.
 ### Matching 39-suite acceptance after TX ownership (2026-10-18)
 
 Both full paths pass at `610592de4f5463f8d5a453844b07d7f6e1c30614` after
-[serializing virtio-net TX ownership](package-pipeline.md). The new actual-driver
+serializing virtio-net TX ownership. The new actual-driver
 fixture brings the suite to 39 tests. Each path cloned that exact remote source
 and its required submodules, built the kernel/EFI loader, 12 modules and seven
 bare-metal test ELFs, and passed all 39 native suites twice, including a clean

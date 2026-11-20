@@ -1,6 +1,6 @@
 # Dell default loader promotion (v5 guarded → timing loader)
 
-This replaces `EFI/BOOT/BOOTX64.EFI` on the Dell's SSD ESP with a newly built guarded loader. It keeps every earlier loader and both recovery paths. It is a supervised step: Ian has to select the USB maintenance boot, and must be nearby in case the firmware falls back to F5 or the USB.
+This replaces `EFI/BOOT/BOOTX64.EFI` on the Dell's SSD ESP with a newly built guarded loader. It keeps every earlier loader and both recovery paths. It is a supervised step: the operator has to select the USB maintenance boot, and must be nearby in case the firmware falls back to F5 or the USB.
 
 ## Why the USB maintenance boot
 
@@ -33,7 +33,7 @@ nix-shell --run 'python3 scripts/build_dell_loader.py --output build/dell/loader
 The script reads the private identity and data bounds from `shared/dell/guard-loader-options.txt` (mode 600). It writes `BROOKGUARD.efi` and `manifest.json`. The build directory is mode 700 and contains the identity; never commit it. The build is reproducible: two clean builds of `e550476b` gave the same hash.
 
 **QEMU check of the same source:**
-1. Build again with `--shared /data/Programming/Brook/shared/dell/qemu-check/loader-options-qemu`. That file holds the QEMU fixture identity; every other option is identical.
+1. Build again with `--shared PRIVATE_DIR/qemu-check/loader-options-qemu`. That file holds the QEMU fixture identity; every other option is identical.
 2. Run:
    ```sh
    scripts/check_dell_image_qemu.py --pair <pair> --efi <qemu-loader>/BROOKGUARD.efi --output <dir>
@@ -43,14 +43,14 @@ A physical-identity loader correctly refuses the VM disk, so it can't be tested 
 
 ## Procedure
 
-Run every command from the repo root with `BROOK_ROOT=/data/Programming/Brook/display-perf`, the registry holding the Dell session. Each step writes a new `--output` directory containing `receipt.json` with every job and transfer ID.
+Run every command from the repo root with `BROOK_ROOT` set to the checkout whose `build/hardware-bridge` registry holds the Dell session. Each step writes a new `--output` directory containing `receipt.json` with every job and transfer ID.
 
 1. **Before restarting.** Stop or finish any manual bridge jobs; a running supervisor job blocks the checked restart ("Closing apps"). Note the current generation and payload (`hw_doctor`, `/boot/HWSTATUS.ELF`).
 2. **Restart and choose the USB stick.** Restart:
    ```sh
    tools/vm_bridge/server.py --call hw_power --arguments '{"session":S,"request_id":<new>,"operation":"restart"}'
    ```
-   Then `commit` when asked. Ian presses F12 at the Dell logo and picks the USB maintenance stick, which is not the default.
+   Then `commit` when asked. The operator presses F12 at the Dell logo and picks the USB maintenance stick, which is not the default.
 3. **Attach.** Use `hw_attach` with the Dell IP (<dell-ip> at last use) to get a new session. Run `hw_doctor`; it must be `verified` with `identity_matches`.
 4. **Dry run, read-only** (safe to repeat):
    ```sh

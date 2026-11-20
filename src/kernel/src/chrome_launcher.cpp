@@ -356,7 +356,9 @@ struct Builder {
         int right = r.x + r.w;
         for (uint32_t i = 0; i < f.targetCount; ++i) {
             const auto& h = f.targets[i];
-            if (h.target.kind >= TK::Settings && h.target.kind <= TK::CancelShutdown && h.rect.x < right) right = h.rect.x;
+            const auto kind = h.target.kind;
+            if (((kind >= TK::Settings && kind <= TK::CancelShutdown) || kind == TK::ForceApps) &&
+                h.rect.x < right) right = h.rect.x;
         }
         const char* status = c.prompt && !c.shutdownActive ?
             (c.promptRestart ? "Restart? Open apps will be asked to close" : "Shut down? Open apps will be asked to close") :
@@ -384,6 +386,7 @@ struct Builder {
             case TK::Confirm: TextButton(h.rect, c.promptRestart ? "Restart now" : "Shut down now", true, c.confirmFocused); break;
             case TK::Dismiss: TextButton(h.rect, "Cancel", false, !c.confirmFocused); break;
             case TK::CancelShutdown: TextButton(h.rect, "Cancel shutdown", false, false); break;
+            case TK::ForceApps: TextButton(h.rect, "Force close apps", true, false); break;
             default: break;
             }
         }
@@ -611,8 +614,10 @@ void ChromeLauncherFrameFor(const LauncherModel& m, const ChromeLauncherChrome& 
         add({right, by, w, button}, kind, 0);
         right -= LPx(s, 8);
     };
-    if (c.shutdownActive) textButton(TK::CancelShutdown, "Cancel shutdown");
-    else if (c.prompt) {
+    if (c.shutdownActive) {
+        textButton(TK::CancelShutdown, "Cancel shutdown");
+        if(c.forceApps)textButton(TK::ForceApps, "Force close apps");
+    } else if (c.prompt) {
         textButton(TK::Dismiss, "Cancel");
         textButton(TK::Confirm, c.promptRestart ? "Restart now" : "Shut down now");
     } else {

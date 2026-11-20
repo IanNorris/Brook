@@ -38,6 +38,7 @@ struct ChromeLauncherChrome {
     const char* status;           // replaces the identity: launch errors, shutdown progress; may be null
     bool prompt, promptRestart, confirmFocused, shutdownActive;
     int32_t mouseX, mouseY;
+    bool forceApps = false;
 };
 
 struct ChromeLauncherHit {

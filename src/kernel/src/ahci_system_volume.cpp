@@ -411,6 +411,7 @@ AhciSystemBoot AhciSystemVolumeMount(uint8_t* nextDrive) {
     const uint8_t drive=(*nextDrive)++; // binding remains pinned on failure
     uint64_t publication=0;
     if(!VfsMountConfiguredWithPublication("/media/system","fatfs",drive,0,&publication) || !publication)return Fail("FAT mount");
+    if(!VfsProtectBootMount(publication))return Fail("FAT protection");
     systemVolumePublication=publication;
     systemVolumeDrive=drive;
     KPrintf("ahci system: verified GPT entry %u mounted at /media/system\n",selected.entry);
@@ -563,7 +564,7 @@ bool AhciSystemGuardTestAdoptSystemMount(Device* adapter,uint8_t drive,uint64_t 
     auto* root=!status?VfsOpenAt(namespaceRoot,namespaceRoot,"/media/system",VFS_O_METADATA,0,0,nullptr):nullptr;
     const bool valid=root && VfsVnodeIsPublishedRoot(root,publication,drive);
     if(root)VfsRelease(root);VfsPathRelease(namespaceRoot);
-    if(!valid)return false;
+    if(!valid || !VfsProtectBootMount(publication))return false;
     guardSystemVolumeDevice=adapter;systemVolumeDrive=drive;systemVolumePublication=publication;
     return true;
 }

@@ -101,7 +101,7 @@ struct DebugFrameSnapshot {
     uint32_t plane,planeSurface,planeControl,planeStride,infoFlags,windowId,windowScale,copyUs;
 };
 // An overlay request with overlayCursor=false omits the pointer image.
-DebugFrameSnapshot CompositorRequestDebugFrame(uint64_t owner=0,bool overlay=false,bool overlayCursor=true);
+DebugFrameSnapshot CompositorRequestDebugFrame(uint64_t owner=0,bool overlay=false,bool overlayCursor=true,uint32_t flags=0);
 // Root debug capture with options (BROOK_DEBUG_FRAME_FLAG_*). A window-buffer
 // request is filled immediately from the window's CPU buffer. On failure the
 // state is Failed (or Busy) and *error is a negative errno.

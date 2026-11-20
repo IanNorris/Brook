@@ -23,7 +23,7 @@ document now describes the result, not the route:
   See [Dock and side drawer](#dock-and-side-drawer).
 
 A browser-rendered design proposal that builds on
-the [October glass study](../glass/README.md). Nothing here is a Brook guest
+the October glass study. Nothing here is a Brook guest
 capture or a native change. Main, the VM and the Dell are untouched.
 
 Open `index.html` directly, or serve the folder with any static server. It is one
@@ -1138,7 +1138,7 @@ so decide before step 6 whether to build them in the kernel or wait for it.
   blur.
 
 The compositor work that leads there is in
-[compositor-refactor-plan.md](compositor-refactor-plan.md).
+compositor-refactor-plan.md.
 
 ## Native implementation, in priority order
 

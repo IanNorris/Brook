@@ -1,9 +1,0 @@
-{
-  "header": {
-    "magic": "0x2D",
-    "version": 2,
-    "page": 1,
-    "page_count": 1,
-    "compressed": true
-  }
-}

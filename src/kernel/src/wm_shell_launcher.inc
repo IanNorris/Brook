@@ -292,7 +292,7 @@ static ChromeLauncherChrome LauncherChrome(int32_t mouseX, int32_t mouseY)
     if (!status && desktop && strcmp(desktop, "Applications")) status = desktop;
     return {g_launcherModelIcon, g_launcherModel.AppCount(), "brook", build, status,
             g_launcherPower.prompt(), g_launcherPower.pending() == LauncherPowerAction::Restart,
-            g_launcherPower.confirmFocused(), shutdownActive, mouseX, mouseY};
+            g_launcherPower.confirmFocused(), shutdownActive, mouseX, mouseY, ShutdownCanForceApps()};
 }
 
 // The frame for the current model, with the model's viewport in step.
@@ -385,6 +385,7 @@ static void WmCaptureLauncher(uint32_t screenW, uint32_t screenH, int32_t mouseX
     snapshot.mouseX = mx;
     snapshot.mouseY = my;
     snapshot.shutdownActive = chrome.shutdownActive;
+    snapshot.forceApps = chrome.forceApps;
     snapshot.prompt = chrome.prompt;
     snapshot.promptRestart = chrome.promptRestart;
     snapshot.confirmFocused = chrome.confirmFocused;
@@ -417,6 +418,7 @@ bool WmLauncherPress(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH,
     case LauncherTargetKind::Confirm: power = LauncherPowerTarget::Confirm; break;
     case LauncherTargetKind::Dismiss: power = LauncherPowerTarget::Dismiss; break;
     case LauncherTargetKind::CancelShutdown: power = LauncherPowerTarget::CancelShutdown; break;
+    case LauncherTargetKind::ForceApps: power = LauncherPowerTarget::ForceApps; break;
     case LauncherTargetKind::Footer: power = LauncherPowerTarget::Footer; break;
     default: break;
     }

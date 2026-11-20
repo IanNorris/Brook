@@ -116,7 +116,7 @@ For separate host-buffer experiments, Brook accepts `BROOK_AUDIO_BUFFER_US`
 value with the backend and codec mode. The Linux reference reproduced the
 large-buffer slowdown, while smaller-buffer runs improved both guests; this
 is an experimental configuration, not a default change or a completed diagnosis.
-See [matched buffer controls](../../docs/linux-audio-buffer-control.md).
+See matched buffer controls.
 
 A second analysis can retain server-causal bounds without assuming a 1× page
 clock:

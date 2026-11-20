@@ -300,7 +300,7 @@ Evidence: `build/workloads/lifecycle-channel-20261018/acceptance-audit.json`,
 
 ## Next prerequisite: process birth admission
 
-The [process-birth reservation work](process-birth-shutdown.md) now accounts for
+The process-birth reservation work now accounts for
 user processes between PID allocation and scheduler publication. The future
 coordinator closes user admission and waits for those reservations before its
 final task census. The gate remains open in ordinary use. Existing processes,

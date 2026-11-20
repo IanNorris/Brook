@@ -16,7 +16,7 @@ and the audio server within a bounded time.
 
 `--check` verifies prerequisites and the target display; `--probe` also
 creates a GLX context on it and reports the renderer. Design notes:
-docs/desktop-game-launchers.md ("Rootless Steam on the Dell").
+the rootless Steam launcher.
 """
 import argparse
 import glob

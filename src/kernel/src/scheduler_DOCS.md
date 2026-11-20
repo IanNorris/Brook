@@ -8,7 +8,7 @@ mechanism (context switch, per-CPU state, lock management) lives in
 abstracted behind the `SchedOps` vtable. The built-in default is round-robin
 (`src/modules/sched_rr.cpp`); `sched_mlfq` registers the optional MLFQ policy
 (`src/modules/sched_mlfq.cpp`). The separate `sched_policy.cpp` implementation
-is not the active policy. See the current [timing and scheduler audit](../../../docs/timing-scheduler-audit.md)
+is not the active policy. See the current timing and scheduler audit
 for clock dependencies, verified coverage and open safety gates.
 
 ## Files
@@ -153,7 +153,7 @@ switches at runtime. Idle timer ticks skip the ready lock while the lock-free
 ready hint is zero (`sched idle-skip`). Kernel-region entry and leave take no lock
 (`kernel_region.h`, store-then-load pair with `SchedulerMarkTerminated`). `sched lock-stats` reports hold, wait
 and handoff histograms and per-site totals. See
-[the convoy note](../../../docs/sched-lock-convoy.md).
+the convoy note.
 
 **Lock ordering:** Code that needs both `g_readyLock` and `g_allProcLock` must
 acquire `g_readyLock` first (see `SchedulerSwitchPolicy`). However, most paths

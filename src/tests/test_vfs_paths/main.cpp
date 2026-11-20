@@ -1389,6 +1389,21 @@ int main(){
     assert(VfsUnmount("/synthetic/deep/mount"));VfsMountNamespaceRelease(initial);
     assert(VfsUnmount("/rename-tree/slot"));
     assert(!g_retiredMounts);
+    // A protected boot volume keeps normal path access and its filesystem
+    // type while advertising an internal source to file-manager monitors.
+    uint64_t bootPublication=0;
+    assert(VfsMountConfiguredWithPublication("/ns-target","objects",2,0,&bootPublication));
+    assert(!VfsProtectBootMount(bootPublication+1));
+    assert(VfsProtectBootMount(bootPublication));
+    auto system=resolve(stableRoot,stableRoot,"/ns-target");
+    auto rows=infoRows(&g_initialNamespace,stableRoot);
+    std::string report(rows.size()*4600+1,'\0');uint32_t written=0;
+    assert(!FormatMountInfo(rows.data(),rows.size(),report.data(),report.size(),&written));
+    assert(report.find("/ns-target rw - objects none rw\n")!=std::string::npos);
+    assert(VfsMountNamespaceDetach(&g_initialNamespace,system)==-16);
+    assert(!VfsUnmount("/ns-target"));
+    static_cast<MountEntry*>(system.attachment)->backing->systemInternal=false; // fixture teardown
+    VfsPathRelease(system);assert(VfsUnmount("/ns-target"));
     VfsPathRelease(stableRoot);
     // Model the final-release window after the diagnostic count is cleared but
     // before its combined attachment lease is dropped. Backing must stay live.

@@ -56,7 +56,11 @@ static Vnode layoutFile{}, layoutDirectory{};
 static char layoutText[LauncherLayoutLimit];
 static unsigned layoutAttempts=0, layoutSyncs=0;
 static bool layoutWritable=false, layoutRenamed=false;
-bool ShutdownLaunchAllowed() { return true; }
+static bool shutdownPending=false,forceAppsOffered=false;
+static unsigned forceCloseCalls=0;
+bool ShutdownLaunchAllowed() { return !shutdownPending; }
+bool ShutdownCanForceApps(const char*) { return forceAppsOffered; }
+void ShutdownDesktopForceApps() { CHECK(forceAppsOffered);++forceCloseCalls; }
 const char* ShutdownDesktopStatus() { return "Applications"; }
 void ShutdownDesktopRequest(bool) { std::abort(); }
 void ShutdownDesktopCancel() { std::abort(); }
@@ -742,6 +746,16 @@ int main() {
         static ChromeShellModel snapshot{};
         WmCaptureLauncher(sw, sh, -1, -1, snapshot);
         CHECK(snapshot.launcherModel.Pinned(1));
+
+        shutdownPending=true;
+        CHECK(!press(LauncherTargetKind::ForceApps, 0, false));
+        forceAppsOffered=true;
+        WmCaptureLauncher(sw, sh, -1, -1, snapshot);
+        CHECK(snapshot.shutdownActive && snapshot.forceApps);
+        CHECK(press(LauncherTargetKind::ForceApps, 0, true) && !forceCloseCalls);
+        CHECK(press(LauncherTargetKind::ForceApps, 0, false) && forceCloseCalls==1);
+        shutdownPending=forceAppsOffered=false;
+
         testTick = 1199;
         LauncherSaveLayout();
         CHECK(!layoutAttempts);

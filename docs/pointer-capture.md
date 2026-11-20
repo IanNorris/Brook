@@ -192,7 +192,7 @@ That diagnostic VM subsequently loses its host QEMU process to SIGSEGV during
 the Q3 smoke-test attempt. Its core is truncated and cannot provide a usable
 library map/backtrace; its unsynced data disk has bitmap discrepancies. Preserve
 the entire review as failure evidence; it is not an accepted image seed.
-See [backlog](backlog.md) for the bounded follow-up.
+See backlog for the bounded follow-up.
 
 A fresh quiet review from the preceding checked images,
 `build/reviews/pointer-quiet-20261025`, stages and round-trips the Q3 runtime

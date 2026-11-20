@@ -2,7 +2,7 @@
 
 Active work branch: `wip/vulkan-desktop-20261019`, starting at `f5573cef`.
 The initial bring-up proved hardware Venus compute, offscreen rasterization and
-native Wayland swapchains with Mesa CPU staging. See [bring-up evidence](vulkan-bringup.md).
+native Wayland swapchains with Mesa CPU staging. See bring-up evidence.
 Direct DMA-BUF presentation, automatic policy and safe staging fallback now pass
 the final acceptance below on the pinned Intel configuration. Tested checkpoints
 remain on the work branch; merging to main requires approval.

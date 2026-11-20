@@ -23,6 +23,9 @@ ShutdownAcStatus ShutdownGetAcStatus();
 void ShutdownCommand(const char* id,const char* verb,char state[24],int* error);
 void ShutdownDesktopRequest(bool restart);
 void ShutdownDesktopCancel();
+void ShutdownDesktopForceApps();
+// Explicit escalation of already-prompted, still-open app windows.
+bool ShutdownCanForceApps(const char* requestId=nullptr);
 const char* ShutdownDesktopStatus();
 const char* ShutdownRequestStatus(const char* requestId);
 // Processes still holding the current request in closing/services, for the

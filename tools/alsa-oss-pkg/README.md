@@ -171,7 +171,7 @@ name and `clock`, `boundaries` or `exact`. Exact mode emits the same 9,660 known
 nonzero frames as `dsp_short_tail.py`; capture the entire source interval and
 compare the samples, not just RMS or a success message. Keep host audio silent.
 
-See [audio evidence](../../docs/audio-clock.md) for accepted identities, limits
+See audio evidence for accepted identities, limits
 and remaining Firefox integration. Client-rate/format conversion, browser IPC,
 normal-launcher behavior and wider application regressions remain separate
 acceptance work. The default file-over-null route remains unchanged.

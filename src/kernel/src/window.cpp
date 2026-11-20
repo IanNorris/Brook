@@ -2733,6 +2733,7 @@ static void LauncherPowerRun(LauncherPowerCommand command)
     case LauncherPowerCommand::Restart:SerialPuts("WM: launcher restart confirmed\n");ShutdownDesktopRequest(true);break;
     case LauncherPowerCommand::Shutdown:SerialPuts("WM: launcher shutdown confirmed\n");ShutdownDesktopRequest(false);break;
     case LauncherPowerCommand::CancelShutdown:ShutdownDesktopCancel();break;
+    case LauncherPowerCommand::ForceApps:ShutdownDesktopForceApps();break;
     }
     CompositorMarkDirty();CompositorWake();
 }

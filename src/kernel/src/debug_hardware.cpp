@@ -1202,7 +1202,7 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         valid=valid && bytes && *p++==' ' && ReadId(p,boot) && !*p;
         if(!valid){DebugChannelSend("{\"power_error\":\"Expected request_id verb boot_id\"}\n");return true;}
         if(!DebugEpochMatches(boot)){DebugChannelSend("{\"boot_error\":\"Guest boot changed; attach explicitly again\"}\n");return true;}
-        if(strcmp(verb,"shutdown") && strcmp(verb,"restart") && strcmp(verb,"power_status") && strcmp(verb,"cancel") && strcmp(verb,"commit")){
+        if(strcmp(verb,"shutdown") && strcmp(verb,"restart") && strcmp(verb,"power_status") && strcmp(verb,"cancel") && strcmp(verb,"commit") && strcmp(verb,"force_apps")){
             DebugChannelSend("{\"power_error\":\"Unsupported power operation\"}\n");return true;
         }
         char state[24]{};int error=0;ShutdownCommand(id,verb,state,&error);
@@ -1212,6 +1212,7 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         ShutdownBlockerReport blockers{};ShutdownRequestBlockers(id,&blockers);
         r.text(",\"status\":");r.quoted(blockers.status);
         r.text(",\"stage\":");r.quoted(blockers.stage);
+        r.text(",\"force_apps_available\":");r.text(ShutdownCanForceApps(id)?"true":"false");
         r.text(",");r.field("blocker_count",blockers.count);
         r.text(",");r.field("next_signal_ms",blockers.nextSignalMs);
         r.text(",\"blockers\":[");
