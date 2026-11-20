@@ -5,6 +5,24 @@ Current state and immediate goal. Keep this short and current: replace stale lin
 _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review follow-up)._
 
 
+## Launcher persistence (20 November 2026)
+
+- `work/launcher-persist` fixes the legacy temporary-file creation failure on
+  the guarded home mount. The worker now uses retained VFS paths, creates
+  missing config directories, and advances the saved epoch after file and
+  directory sync. First-run defaults are queued and failed writes retry.
+- `launcher status` exposes worker state, epochs, load/save stages and errno,
+  and pin keys. Failures reach the kernel console log read by `hw_logs`.
+- Implementation `c7c82b31`. Headless Release and 386 non-stress tests passed.
+  Guarded QEMU passed on attempt 1 with Clearwater ready. A separate guarded
+  fixture persisted the default Firefox pin, added Chromium through the
+  context menu, verified uid 1000 and mode 0600 directly on ext2, and restored
+  those bytes on a subsequent boot. Evidence is in
+  `build/launcher-persist-evidence`.
+- Pair `build/dell/pair-launcherpersist` (`dell-launcherpersist-20261120`) was
+  built with Clearwater and the four Broadwell options. Dell validation is
+  pending.
+
 ## Clearwater Stage 3 reconciliation (19 November 2026)
 
 - `work/clearwater-s3-reconcile` merges Stage 3 into integration60 `a3f6685e`.
