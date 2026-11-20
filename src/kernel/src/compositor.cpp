@@ -2348,6 +2348,9 @@ static void CompositorLoopWM()
 {
     // Apply movement/focus/resize before rendering either chrome or content.
     // GPU composition later samples chrome using the current window geometry.
+    // Retire tray input ownership before the input loop can route through an
+    // open menu left by an exited tray service.
+    ShellServiceBeginFrame(ApicTickCount());
     CompositorInputWM();
     // Consume a worker-built launcher only after clicks against the old frame
     // are handled. One snapshot then serves geometry, render and GPU compose.
