@@ -31,6 +31,9 @@ in pkgs.runCommand "brook-dell-app-launchers" {} ''
   mkdir -p $out/bin $out/share/applications $out/share/brook-icons $out/share/brook-quake2
   cp ${alsoftConf} $out/share/brook-quake2/alsoft-oss.conf
   cp ${quakeIcon} $out/share/brook-icons/brook-quake2.rgba
+  # Signed profiles build the launcher index from hicolor icons.
+  mkdir -p $out/share/icons/hicolor/256x256/apps
+  cp ${yquake.src}/stuff/icon/Quake2.png $out/share/icons/hicolor/256x256/apps/brook-quake2.png
 
   substitute ${../data/nix-wrappers/brook-quake2.in} $out/bin/brook-quake2 \
     --subst-var-by BASH ${pkgs.bash}/bin/bash \
