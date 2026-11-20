@@ -4,6 +4,11 @@ namespace brook {
 struct MountNamespace;
 struct UserNamespace;
 struct VfsFsOps;
+inline constexpr uint64_t MountReadOnly = 1;
+inline constexpr uint64_t MountNoSuid = 2;
+inline constexpr uint64_t MountNoDev = 4;
+inline constexpr uint64_t MountNoExec = 8;
+inline constexpr uint64_t MountRestrictionMask = MountReadOnly | MountNoSuid | MountNoDev | MountNoExec;
 // Namespace handles own an active topology lease plus storage, independently
 // of task membership. Plain paths/snapshots retain storage only.
 bool VfsMountNamespaceHandleAcquire(MountNamespace* borrowed);
@@ -51,10 +56,10 @@ int VfsMountNamespacePivotRoot(MountNamespace* ns,const VfsPath& oldRoot,const V
 // and has no master/peers. Validate a live owned mount root; no topology change.
 // Shared/unbindable support must replace this private-only contract first.
 int VfsMountNamespacePrivatePropagation(MountNamespace* ns,const VfsPath& target);
-// Bounded bind remount: NOSUID is mandatory; NODEV and RO may be added.
-// Unsupported flags, initial namespaces and weakened restrictions fail without
-// mutation. First RO admission requires a retained root and retired data holds.
-int VfsMountNamespaceRemount(MountNamespace* ns,const VfsPath& target,uint64_t attributes);
+// Replace the per-mount restrictions, optionally across a subtree. Flags
+// inherited from a more privileged namespace and boot restrictions are floors.
+// Validate the whole subtree before applying any change.
+int VfsMountNamespaceRemount(MountNamespace* ns,const VfsPath& target,uint64_t attributes,bool recursive=false);
 int VfsMountNamespaceDetach(MountNamespace* ns,const VfsPath& target);
 // Borrowed namespace must have a live storage owner. Each value is copied
 // under the metadata view lock; count/index sequences may race mutation.

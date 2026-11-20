@@ -4,6 +4,7 @@
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "mount_namespace.h"
+#include "procfs_vfs.h"
 #include "tmpfs_mount_options.h"
 #include "process_user_namespace.h"
 

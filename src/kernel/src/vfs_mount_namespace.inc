@@ -64,7 +64,10 @@ int VfsMountNamespaceSetUserOwnerPrepared(MountNamespace* ns,UserNamespace* owne
     if(ns->userOwner==owner)return 0;
     FileMutationGuard transaction;
     UserNamespaceRetain(owner);auto* old=ns->userOwner;ns->userOwner=owner;
-    for(auto& mount:g_mounts)if(mount.owner==ns)mount.lockedInherited=true;
+    for(auto& mount:g_mounts)if(mount.owner==ns) {
+        mount.lockedInherited=true;
+        mount.lockedAttributes=mount.attributes;
+    }
     UserNamespaceRelease(old);return 0;
 }
 uint64_t VfsMountNamespaceIdentity(MountNamespace* ns) { return ns?ns->identity:0; }
@@ -176,7 +179,8 @@ int VfsMountNamespaceCopy(MountNamespace* source,const VfsPath& root,const VfsPa
         mount->backing->RetainLocked();mount->used=true;mount->linked=original->linked;mount->lockedInherited=original->lockedInherited;
         mount->publication=++g_mountPublication;mount->rootIdentity=original->rootIdentity;
         mount->rootObjectOps=original->rootObjectOps;mount->rootIdentityKnown=original->rootIdentityKnown;
-        mount->rootDevice=original->rootDevice;mount->attributes=original->attributes;mount->rootFileUnlinked=original->rootFileUnlinked;
+        mount->rootDevice=original->rootDevice;mount->attributes=original->attributes;mount->lockedAttributes=original->lockedAttributes;
+        mount->rootFileUnlinked=original->rootFileUnlinked;
         StrCopy(mount->physicalRoot,original->physicalRoot,sizeof(mount->physicalRoot));
         StrCopy(mount->coveredName,original->coveredName,sizeof(mount->coveredName));
         StrCopy(mount->mountPoint,original->mountPoint,sizeof(mount->mountPoint));
@@ -304,7 +308,10 @@ int VfsMountNamespaceMountFresh(MountNamespace* ns,const VfsPath& inputTarget,
     VfsMountTargetLease lease;if(int error=lease.Follow(inputTarget))return error;
     const auto& target=lease.value;
     // tmpfs: NODEV|NOSUID, or NOSUID alone for the boot device directory.
-    if(attributes && ((attributes!=6 && attributes!=2) || !StrEq(fsName,"tmpfs")))return -95;
+    const bool proc=StrEq(fsName,"procfs");
+    if(proc && ns->initial)return -95;
+    if(attributes && ((attributes&~MountRestrictionMask) ||
+       (!proc && ((attributes!=6 && attributes!=2) || !StrEq(fsName,"tmpfs")))))return -95;
     // Registered tables/callbacks are permanently provider-pinned. Unregistered
     // or mismatched tables cannot become a backing through this entry point.
     if(FindFsDriver(fsName)!=ops || !ops->root_object || !ops->unmount)return -95;
@@ -332,7 +339,9 @@ int VfsMountNamespaceMountFresh(MountNamespace* ns,const VfsPath& inputTarget,
     *backing={};backing->fsOps=ops;backing->mountPriv=privateData;backing->pdrv=pdrv;backing->references=1;backing->independent=true;
     mount->owner=ns;mount->referenceState=1;mount->backing=backing;
     mount->rootObject=root;mount->rootIdentity=root->identity;mount->rootObjectOps=root->ops;mount->rootIdentityKnown=true;
-    mount->rootDevice=stat.dev;mount->attributes=attributes;StrCopy(mount->physicalRoot,"/",sizeof(mount->physicalRoot));
+    mount->rootDevice=stat.dev;mount->attributes=attributes;
+    if(proc)mount->lockedAttributes=MountNoSuid|MountNoDev|MountNoExec;
+    StrCopy(mount->physicalRoot,"/",sizeof(mount->physicalRoot));
     mount->covered=target;VfsPathRetain(target);mount->used=true;mount->linked=true;
     mount->publication=++g_mountPublication;StrCopy(mount->fsType,fsName,sizeof(mount->fsType));
     backing->next=g_backings;g_backings=backing;g_mounts.Publish(mount);
@@ -382,7 +391,8 @@ static int VfsMountNamespaceRecursiveBindLocked(MountNamespace* ns,const VfsPath
         mount->lockedInherited=original->lockedInherited;
         mount->rootIdentity=original->rootIdentity;mount->rootObjectOps=original->rootObjectOps;
         mount->rootIdentityKnown=original->rootIdentityKnown;
-        mount->rootDevice=original->rootDevice;mount->attributes=original->attributes;mount->rootFileUnlinked=original->rootFileUnlinked;
+        mount->rootDevice=original->rootDevice;mount->attributes=original->attributes;mount->lockedAttributes=original->lockedAttributes;
+        mount->rootFileUnlinked=original->rootFileUnlinked;
         StrCopy(mount->physicalRoot,original->physicalRoot,sizeof(mount->physicalRoot));
         StrCopy(mount->coveredName,original->coveredName,sizeof(mount->coveredName));
         StrCopy(mount->fsType,original->fsType,sizeof(mount->fsType));
@@ -517,7 +527,8 @@ static int VfsMountNamespaceBindLocked(MountNamespace* ns,const VfsPath& source,
         else {StrCopy(mount->physicalRoot,sourceLabel,sizeof(mount->physicalRoot));StrCopy(mount->mountPoint,targetLabel,sizeof(mount->mountPoint));StrCopy(mount->coveredName,coveredName,sizeof(mount->coveredName));}
     }
     if(error) {kfree(mount);return error;}
-    mount->rootDevice=static_cast<MountEntry*>(source.attachment)->rootDevice;mount->attributes=static_cast<MountEntry*>(source.attachment)->attributes;
+    auto* sourceAttachment=static_cast<MountEntry*>(source.attachment);
+    mount->rootDevice=sourceAttachment->rootDevice;mount->attributes=sourceAttachment->attributes;mount->lockedAttributes=sourceAttachment->lockedAttributes;
     mount->owner=ns;mount->referenceState=1;mount->backing=static_cast<MountEntry*>(source.attachment)->backing;
     mount->backing->RetainLocked();mount->rootObject=source.object;VfsObjectRetain(source.object);
     mount->rootIdentity=source.object->identity;mount->rootObjectOps=source.object->ops;mount->rootIdentityKnown=true;
@@ -686,27 +697,42 @@ int VfsMountNamespacePrivatePropagation(MountNamespace* ns,const VfsPath& target
     // Do not use this path after introducing shared peers or master links.
     return 0;
 }
-int VfsMountNamespaceRemount(MountNamespace* ns,const VfsPath& target,uint64_t attributes)
+int VfsMountNamespaceRemount(MountNamespace* ns,const VfsPath& target,uint64_t attributes,bool recursive)
 {
-    if(!ns || !target.object || !target.attachment)return -22;
-    if(attributes!=2 && attributes!=3 && attributes!=6 && attributes!=7)return -22;
+    if(!ns || !target.object || !target.attachment || (attributes&~MountRestrictionMask))return -22;
     FileMutationGuard transaction;
     if(!ns->life.Published())return -3;
     if(ns->initial)return -95;
     VfsMountTargetLease lease;if(int error=lease.Follow(target))return error;
-    auto* mount=static_cast<MountEntry*>(lease.value.attachment);
-    if(!VfsMountPublished(*mount) || mount->owner!=ns ||
-       lease.value.object->identity!=mount->rootIdentity || lease.value.object->ops!=mount->rootObjectOps)return -22;
-    const uint64_t old=VfsMountAttributes(mount);
-    if(old&~attributes)return -1;
-    // Legacy synthetic storage has no attachment provenance. Only retained
-    // roots suppress those brokers; do not claim RO on an unbounded root.
-    if((attributes&1) && !(old&1) && !mount->rootObject)return -95;
-    // Conservative: even ordinary read handles may trigger atime/writeback.
-    // O_PATH and directories carry no data capability. Pending mapping writeback
-    // retains its vnode and keeps this count nonzero until final retirement.
-    if((attributes&1) && !(old&1) && __atomic_load_n(&mount->nonDirectoryHolds,__ATOMIC_ACQUIRE))return -16;
-    MountViewGuard view;__atomic_store_n(&mount->attributes,attributes,__ATOMIC_RELEASE);return 0;
+    auto* selected=static_cast<MountEntry*>(lease.value.attachment);
+    if(!VfsMountPublished(*selected) || selected->owner!=ns ||
+       lease.value.object->identity!=selected->rootIdentity || lease.value.object->ops!=selected->rootObjectOps)return -22;
+    auto inScope=[&](MountEntry& mount) {
+        if(mount.owner!=ns || !VfsMountPublished(mount))return false;
+        if(&mount==selected)return true;
+        if(!recursive)return false;
+        auto* parent=static_cast<MountEntry*>(mount.covered.attachment);
+        for(uint32_t depth=0;parent && depth<VFS_MAX_MOUNT_DEPTH;++depth) {
+            if(parent==selected)return true;
+            parent=static_cast<MountEntry*>(parent->covered.attachment);
+        }
+        return false;
+    };
+    for(auto& mount:g_mounts)if(inScope(mount)) {
+        if(mount.lockedAttributes&~attributes)return -1;
+        if((attributes&MountReadOnly) && !(mount.attributes&MountReadOnly)) {
+            // Namespace roots with the legacy synthetic-device fallback are
+            // not attachment-complete. Linked procfs/sysfs mounts are.
+            if(!mount.rootObject && (!mount.rootIdentityKnown || &mount==ns->root))return -95;
+            // A data vnode can retain pending writeback even after its FD is
+            // closed. O_PATH and directories carry no data capability.
+            if(__atomic_load_n(&mount.nonDirectoryHolds,__ATOMIC_ACQUIRE))return -16;
+        }
+    }
+    MountViewGuard view;
+    for(auto& mount:g_mounts)if(inScope(mount))
+        __atomic_store_n(&mount.attributes,attributes,__ATOMIC_RELEASE);
+    return 0;
 }
 int VfsMountNamespaceDetach(MountNamespace* ns,const VfsPath& target)
 {

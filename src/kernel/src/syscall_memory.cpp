@@ -480,6 +480,8 @@ int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         return result;
     };
     auto* vnode=static_cast<Vnode*>(entry->handle);
+    const bool noExec=VfsMountNoExec(vnode);
+    if(noExec && (prot&4))return -EPERM;
     if(vnode->ops->deny_mapping)return -95;
     auto* fileObject=vnode->ops->file_object?vnode->ops->file_object(vnode):nullptr;
     if((flags&MAP_SHARED) && (prot&2) && (!fileObject || !vnode->ops->write))return -95;
@@ -496,6 +498,7 @@ int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     request.range.kind=MappingKind::File;request.range.backing=backing.value;
     if (flags & MAP_SHARED) request.range.maximumProtection=5u|
         ((fileObject && vnode->ops->write && (FdStatus(entry)&3)!=0)?2u:0u);
+    if(noExec)request.range.maximumProtection&=~4u;
     if (pin == -95) { request.preparedPages=length/4096;request.prepare=PrepareFileMapping; }
     else if (length<=16*1024*1024 && stat.size>offset)
         PageCachePreload(vnode,offset/4096,stat.size,static_cast<uint32_t>(length/4096));
