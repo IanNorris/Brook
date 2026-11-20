@@ -29,7 +29,8 @@ class BuildProvenance(unittest.TestCase):
                 build_provenance('ab' * 20, False, value)
         with self.assertRaises(ValueError):
             build_provenance('ab', False, None)
-        marker, fields = build_provenance('ab' * 32, False, None)
+        with patch.dict('os.environ', {'SOURCE_DATE_EPOCH': '315532800'}):
+            marker, fields = build_provenance('ab' * 32, False, None)
         self.assertIn(b'\nclock\nclean\n', marker)
         self.assertEqual(fields['time_source'], 'clock')
 

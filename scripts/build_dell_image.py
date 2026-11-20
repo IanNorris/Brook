@@ -167,6 +167,8 @@ def main():
                         'otherwise it opens from Apps > Kernel Console)')
     p.add_argument('--bridge-v3-operators', type=Path,
                    help='LF-terminated allowlist of up to two lowercase Ed25519 public keys')
+    p.add_argument('--source-date-epoch', help='explicit Unix timestamp for reproducible assembly metadata; '
+                   'pass the desired SOURCE_DATE_EPOCH value here')
     p.add_argument('--allow-dirty', action='store_true', help='permit uncommitted changes (recorded)')
     p.add_argument('--qemu-check', action='store_true',
                    help='then run scripts/check_dell_image_qemu.py on the pair (results in <output>/qemu-check)')
@@ -302,7 +304,9 @@ def main():
 
     # Record assembly provenance inside the initrd and check the exact bytes
     # before hashing the completed image. These fields describe the builder.
-    provenance, assembly = build_provenance(commit, dirty, os.environ.get('SOURCE_DATE_EPOCH'))
+    # nix-shell exports an epoch even when the caller wants the build clock.
+    # Use only the explicit argument to override the current UTC time.
+    provenance, assembly = build_provenance(commit, dirty, a.source_date_epoch)
     image = a.output / 'INITRD.IMG'
     run(['mcopy', '-o', '-i', image, '-', '::/ETC/build-provenance'], input=provenance)
     if subprocess.check_output(['mtype', '-i', str(image), '::/ETC/build-provenance']) != provenance:
