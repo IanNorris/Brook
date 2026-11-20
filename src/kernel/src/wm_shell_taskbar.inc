@@ -436,6 +436,7 @@ void WmCyclePerformanceHud()
 
 static uint32_t g_cpuFirstRow;
 static int32_t g_cpuScrollRemainder, g_statsContentOffset;
+static bool g_statsExpanded;
 
 static ChromeStatsPopupLayout WmStatsPopupLayout(uint32_t sw, uint32_t sh, DesktopStatsPanel panel)
 {
@@ -453,7 +454,7 @@ static ChromeStatsPopupLayout WmStatsPopupLayout(uint32_t sw, uint32_t sh, Deskt
     DesktopDetailedStats stats{};
     if (panel == DesktopStatsPanel::CpuMemory) DesktopStatsRead(panel, stats);
     return ChromeStatsPopupLayoutFor(WmChromeStyle(), anchor, int(sw), bar.y, panel, DesktopStatsCoreCount(),
-                                     pinned, g_statsContentOffset, DesktopStatsTaskRows(stats));
+                                     pinned, g_statsContentOffset, DesktopStatsTaskRows(stats), g_statsExpanded);
 }
 
 static void WmStepCpuPopup(const ChromeStatsPopupLayout& layout, int64_t step)
@@ -473,12 +474,12 @@ bool WmStatsFlyoutScroll(int32_t x, int32_t y, int delta120, uint32_t sw, uint32
     if (WmDetailedStatsSelected() != DesktopStatsPanel::CpuMemory ||
         WmTaskbarHidden() || WmLauncherVisible() || WmWindowMenuOpen()) return false;
     const auto layout = WmStatsPopupLayout(sw, sh, DesktopStatsPanel::CpuMemory);
-    if (!layout.coreRows || !layout.panel.contains(x, y)) return false;
+    if (!layout.panel.contains(x, y)) return false;
     const int64_t movement = g_cpuScrollRemainder + int64_t(delta120);
     g_cpuScrollRemainder = int32_t(movement % 120);
     const int64_t step = -(movement / 120);
     if (layout.scrollLimit) WmStepStatsContent(layout, step * 2);
-    else WmStepCpuPopup(layout, step);
+    else if (layout.coreRows) WmStepCpuPopup(layout, step);
     return true;
 }
 
@@ -520,7 +521,10 @@ bool WmTrayFlyoutPress(int32_t mx, int32_t my, uint32_t sw, uint32_t sh)
             if (layout.next.contains(mx, my)) WmStepDiskPopup(layout, layout.pageRows);
         } else if (WmDetailedStatsSelected() == DesktopStatsPanel::CpuMemory) {
             const auto layout = WmStatsPopupLayout(sw, sh, DesktopStatsPanel::CpuMemory);
-            if (layout.scrollUp.contains(mx, my)) WmStepStatsContent(layout, -3);
+            if (layout.modeToggle.contains(mx, my)) {
+                g_statsExpanded = !g_statsExpanded;
+                g_cpuScrollRemainder = g_statsContentOffset = 0;
+            } else if (layout.scrollUp.contains(mx, my)) WmStepStatsContent(layout, -3);
             else if (layout.scrollDown.contains(mx, my)) WmStepStatsContent(layout, 3);
             else if (layout.body.contains(mx, my)) {
                 if (layout.previous.contains(mx, my)) WmStepCpuPopup(layout, -int64_t(layout.coreRows));
@@ -551,8 +555,10 @@ bool WmTrayFlyoutPress(int32_t mx, int32_t my, uint32_t sw, uint32_t sh)
     if (WmTrayFlyoutVisible()) {
         if (g_trayFlyout == WmTrayFlyout::Calendar) g_calendarMonth = {};
         if (WmDiskFlyoutSelected()) g_diskPopupFirst = g_diskScrollRemainder = 0;
-        if (WmDetailedStatsSelected() == DesktopStatsPanel::CpuMemory)
+        if (WmDetailedStatsSelected() == DesktopStatsPanel::CpuMemory) {
             g_cpuFirstRow = g_cpuScrollRemainder = g_statsContentOffset = 0;
+            g_statsExpanded = WmGetShowAdvancedDetails();
+        }
         if (WmTrayFlyoutLayout(sw, sh).w <= 0) {
             WmTrayFlyoutClose();
             return true;
@@ -728,6 +734,7 @@ static void WmCaptureTrayFlyout(const WmShellSurface& surface, uint32_t sw, uint
         snapshot.statsPanel = panel;
         const bool overBody = layout.body.contains(mx, my);
         const auto hover = layout.pin.contains(mx, my) ? layout.pin :
+                           layout.modeToggle.contains(mx, my) ? layout.modeToggle :
                            layout.scrollUp.contains(mx, my) ? layout.scrollUp :
                            layout.scrollDown.contains(mx, my) ? layout.scrollDown :
                            overBody && layout.previous.contains(mx, my) ? layout.previous :
@@ -739,8 +746,10 @@ static void WmCaptureTrayFlyout(const WmShellSurface& surface, uint32_t sw, uint
             auto& stats = snapshot.detailedStats;
             for (unsigned i = stats.coreCount; i < cores; ++i) stats.cores[i] = DetailedNoPercent;
             stats.coreCount = cores;
-            snapshot.firstCoreRow = DesktopDiskPageFirst(g_cpuFirstRow, (cores + 1) / 2, layout.coreRows);
-            g_cpuFirstRow = snapshot.firstCoreRow;
+            if (layout.expanded && layout.coreRows) {
+                snapshot.firstCoreRow = DesktopDiskPageFirst(g_cpuFirstRow, (cores + 1) / 2, layout.coreRows);
+                g_cpuFirstRow = snapshot.firstCoreRow;
+            }
             if (layout.body.h > 0) g_statsContentOffset = layout.contentOffset;
         } else {
             snapshot.hudTick = ShellCadenceTick;

@@ -719,6 +719,7 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
             stats.coreCount = 64;
             for (unsigned i = 0; i < stats.coreCount; ++i) stats.cores[i] = i * 37 % 101;
             stats.cores[8] = DetailedNoPercent;
+            stats.cpuPercent = 37;
             stats.tasks[0] = {"clearwater-shell", 820, 49, 82};
             stats.tasks[1] = {"Worker with a long process name", 145, 651, 14};
             stats.total = 8ull << 30;
@@ -738,6 +739,18 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
             auto statsList = ChromeListOn(storage);
             RenderSnapshot(model, s, statsList);
             Check(prefix + "stats-" + name, statsList, s, model.rect.x, model.rect.y, model.rect.w, model.rect.h);
+            if (panel == DesktopStatsPanel::CpuMemory) {
+                stats.tasks[2] = {"frame publisher", 24, 65, 2};
+                stats.tasks[3] = {"background task", 10, 66, 1};
+                model.statsLayout = ChromeStatsPopupLayoutFor(s, layout.volume, screenW, screenH - m.taskbar(),
+                                                               panel, 64, false, 0, DesktopStatsTaskRows(stats), false);
+                model.rect = model.statsLayout.panel;
+                auto compactList = ChromeListOn(storage);
+                RenderSnapshot(model, s, compactList);
+                Check(prefix + "stats-cpu-memory-compact", compactList, s,
+                      model.rect.x, model.rect.y, model.rect.w, model.rect.h);
+                stats.tasks[2] = stats.tasks[3] = {};
+            }
             if (panel == DesktopStatsPanel::CpuMemory && prefix == "opaque-dark-200-") {
                 const int desktop = 600 - m.taskbar();
                 model.statsLayout = ChromeStatsPopupLayoutFor(s, {360, desktop, 80, 60}, 800, desktop,

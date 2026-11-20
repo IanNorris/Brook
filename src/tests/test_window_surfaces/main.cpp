@@ -810,6 +810,7 @@ int main() {
             DesktopStatsPanel::Compositor, DesktopStatsPanel::App};
         const uint32_t detailMask = BROOK_TASKBAR_CPU | BROOK_TASKBAR_MEMORY | BROOK_TASKBAR_COMPOSITOR | BROOK_TASKBAR_APP;
         CHECK(WmSetTaskbarMetrics(detailMask));
+        CHECK(!WmGetShowAdvancedDetails());
         fixtureDetailedStats.tasksMeasured = true;
         fixtureDetailedStats.tasks[0].ticks = 40;
         fixtureDetailedStats.tasks[1].ticks = 2;
@@ -818,13 +819,17 @@ int main() {
             const auto anchor = GetTaskbarLayout(sw, sh).metrics[statMetrics[i]];
             CHECK(anchor.w > 0 && WmTrayFlyoutPress(anchor.x, anchor.y, sw, sh));
             CHECK(WmDetailedStatsSelected() == statPanels[i]);
-            const auto popup = WmStatsPopupLayout(sw, sh, statPanels[i]);
+            auto popup = WmStatsPopupLayout(sw, sh, statPanels[i]);
             CHECK(popup.panel.w > 0 && popup.panel.y >= 0);
             CHECK(WmTrayFlyoutPress(popup.pin.x, popup.pin.y, sw, sh));
             CHECK(WmTaskbarPopupPinned() && !WmTaskbarPopupPointerOwned(10, 10, sw, sh));
             CHECK(!WmTrayFlyoutPress(10, 10, sw, sh));
             if (statPanels[i] == DesktopStatsPanel::CpuMemory) {
-                CHECK(popup.coreRows > 0 && popup.next.w > 0 && popup.scrollLimit == 0);
+                CHECK(!popup.expanded && !popup.coreRows && popup.modeToggle.w > 0);
+                CHECK(WmTrayFlyoutPress(popup.modeToggle.x, popup.modeToggle.y, sw, sh));
+                CHECK(WmTaskbarPopupPinned());
+                popup = WmStatsPopupLayout(sw, sh, statPanels[i]);
+                CHECK(popup.expanded && popup.coreRows > 0 && popup.next.w > 0 && popup.scrollLimit == 0);
                 CHECK(popup.taskRows == 2);
                 fixtureDetailedStats.tasks[1].ticks = 0;
                 const auto shorter = WmStatsPopupLayout(sw, sh, DesktopStatsPanel::CpuMemory);
@@ -851,11 +856,30 @@ int main() {
             CHECK(kinds(s) >= 2 && WmCaptureShellModel(s[1], sw, sh, 0, -1, -1, pinSnapshot));
             CHECK(pinSnapshot.statsPanel == statPanels[i] && pinSnapshot.popupPinned);
             CHECK(pinSnapshot.firstCoreRow == 0);
+            if (statPanels[i] == DesktopStatsPanel::CpuMemory) {
+                const auto details = WmStatsPopupLayout(sw, sh, statPanels[i]);
+                CHECK(WmTrayFlyoutPress(details.modeToggle.x, details.modeToggle.y, sw, sh));
+                CHECK(WmTaskbarPopupPinned() && !WmStatsPopupLayout(sw, sh, statPanels[i]).expanded);
+            }
             if (i == 3) CHECK(WmSetTaskbarMetrics(BROOK_TASKBAR_CPU)); // the pinned panel is still reachable
             const auto resized = WmStatsPopupLayout(sw, sh, statPanels[i]);
             CHECK(WmTrayFlyoutPress(resized.pin.x, resized.pin.y, sw, sh) && !WmTaskbarPopupPinned());
             CHECK(WmTrayFlyoutPress(10, 10, sw, sh) && !WmTrayFlyoutVisible());
         }
+        WmSetShowAdvancedDetails(true);
+        CHECK(WmGetShowAdvancedDetails());
+        const auto cpuAnchor = GetTaskbarLayout(sw, sh).metrics[0];
+        CHECK(WmTrayFlyoutPress(cpuAnchor.x, cpuAnchor.y, sw, sh));
+        const auto details = WmStatsPopupLayout(sw, sh, DesktopStatsPanel::CpuMemory);
+        CHECK(details.expanded);
+        CHECK(WmTrayFlyoutPress(details.modeToggle.x, details.modeToggle.y, sw, sh));
+        CHECK(!WmStatsPopupLayout(sw, sh, DesktopStatsPanel::CpuMemory).expanded);
+        CHECK(WmTrayFlyoutPress(10, 10, sw, sh) && !WmTrayFlyoutVisible());
+        CHECK(WmTrayFlyoutPress(cpuAnchor.x, cpuAnchor.y, sw, sh));
+        CHECK(WmStatsPopupLayout(sw, sh, DesktopStatsPanel::CpuMemory).expanded);
+        CHECK(WmTrayFlyoutPress(10, 10, sw, sh) && !WmTrayFlyoutVisible());
+        WmSetShowAdvancedDetails(false);
+
         const auto collapsed = ChromeStatsPopupLayoutFor(WmChromeStyle(), {400, 100, 30, 20}, sw, 100,
                                                             DesktopStatsPanel::CpuMemory, 4, true);
         CHECK(collapsed.panel.w > 0 && collapsed.body.h == 0 && collapsed.pin.w > 0);

@@ -37,7 +37,7 @@ DesktopStatsPanel Panel(uint32_t request) { return DesktopStatsPanel(uint8_t(req
 void SampleCpu(CpuWorkspace& work, DesktopDetailedStats& out)
 {
     out.coreCount = DesktopStatsCoreCount();
-    uint64_t elapsed = 0;
+    uint64_t elapsed = 0, busy = 0;
     uint32_t usable = 0;
     for (uint32_t i = 0; i < out.coreCount; ++i) {
         DesktopCpuCounter current{};
@@ -45,13 +45,17 @@ void SampleCpu(CpuWorkspace& work, DesktopDetailedStats& out)
         out.cores[i] = DetailedNoPercent;
         if (i < work.count) {
             const auto ticks = DesktopCpuDelta(work.cores[i], current, out.cores[i]);
-            usable += ticks != 0;
-            elapsed += ticks;
+            if (ticks) {
+                ++usable;
+                elapsed += ticks;
+                busy += current.busy - work.cores[i].busy;
+            }
         }
         work.cores[i] = current;
     }
     work.count = out.coreCount;
-    out.cpuMeasured = usable != 0;
+    out.cpuMeasured = elapsed != 0;
+    out.cpuPercent = elapsed ? uint8_t(100 * busy / elapsed) : DetailedNoPercent;
 
     uint32_t total = 0;
     uint64_t begin = 0, end = 0;

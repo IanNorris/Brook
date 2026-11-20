@@ -4,7 +4,7 @@
 namespace brook {
 
 enum class DesktopStatsPanel : uint8_t { None, CpuMemory, Compositor, App };
-inline constexpr unsigned DetailedCoreLimit = 64, DetailedTopTasks = 4;
+inline constexpr unsigned DetailedCoreLimit = 64, DetailedTopTasks = 4, CompactTopTasks = 3;
 inline constexpr uint8_t DetailedNoPercent = 255;
 
 struct DesktopCpuCounter { uint64_t busy, idle; };
@@ -44,7 +44,7 @@ inline void DesktopRankTask(DesktopTopTask (&top)[DetailedTopTasks], const Deskt
 }
 
 struct DesktopDetailedStats {
-    uint8_t cores[DetailedCoreLimit];
+    uint8_t cores[DetailedCoreLimit], cpuPercent;
     uint32_t coreCount;
     bool cpuMeasured, tasksMeasured, memoryMeasured, gpuMeasured;
     DesktopTopTask tasks[DetailedTopTasks];

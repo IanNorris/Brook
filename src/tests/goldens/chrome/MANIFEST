@@ -83,7 +83,8 @@ glass-100-launcher-unsorted c53917eb02781c39
 glass-100-network-flyout a3a73f4a383ad764
 glass-100-stats-app 2e2be0fea4d009bd
 glass-100-stats-compositor b56fa9e6239ed7d9
-glass-100-stats-cpu-memory 28ee049c99bcf153
+glass-100-stats-cpu-memory 51b2c1a3f5ba47c9
+glass-100-stats-cpu-memory-compact 4020797c3ac00c6d
 glass-100-taskbar ec24c801c5ea611c
 glass-100-taskbar-default 53fe06fc326f9238
 glass-100-taskbar-diagnostics d7b63d36d9272592
@@ -757,8 +758,9 @@ opaque-dark-200-launcher-unsorted af4d78260a430168
 opaque-dark-200-network-flyout 9abb7b11dd340a67
 opaque-dark-200-stats-app 949cf996d356cf5f
 opaque-dark-200-stats-compositor 435276d0377ba63b
-opaque-dark-200-stats-cpu-memory 6f77a54b2eaf9ca8
-opaque-dark-200-stats-cpu-memory-scrolled c4a892fea863c3cc
+opaque-dark-200-stats-cpu-memory 2d28a826f2bfebd5
+opaque-dark-200-stats-cpu-memory-compact 1fe6da26c98ef748
+opaque-dark-200-stats-cpu-memory-scrolled 7312613342795204
 opaque-dark-200-taskbar 46a76409ce48efa6
 opaque-dark-200-taskbar-default 84604c4685c5ce8d
 opaque-dark-200-taskbar-diagnostics 819aebad945f5906
@@ -839,7 +841,8 @@ opaque-light-150-launcher-unsorted 3085b272b4e9255b
 opaque-light-150-network-flyout 883c5eb621edab5d
 opaque-light-150-stats-app af5983c5c02efb42
 opaque-light-150-stats-compositor f1da32c4e4230a9b
-opaque-light-150-stats-cpu-memory 3bee0368f5c81bc9
+opaque-light-150-stats-cpu-memory 435c73de30e07465
+opaque-light-150-stats-cpu-memory-compact d8536b6f469b36e6
 opaque-light-150-taskbar 8671c8f6053d89c9
 opaque-light-150-taskbar-default 7041ddfafee3bf18
 opaque-light-150-taskbar-diagnostics 26e09b0b86f9a98e
