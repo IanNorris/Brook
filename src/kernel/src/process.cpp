@@ -1867,7 +1867,16 @@ static uint64_t ProcessExecImpl(Process* proc, const uint8_t* elfData, uint64_t 
     proc->suid = proc->euid; proc->sgid = proc->egid;
     if(proc->userNamespace) {
         const bool root=UserIdFromCanonical(proc->userNamespace,false,proc->uid)==0 || UserIdFromCanonical(proc->userNamespace,false,proc->euid)==0;
+        const uint64_t previousPermitted = proc->capabilities.permitted;
         UserCapabilitiesExec(proc->capabilities,root,ProcessGetNoNewPrivs(proc));
+        // TSYNC can set no_new_privs from another CPU without taking the
+        // credential lock. Order the tentative grant before the last check.
+        // If its update came first, readers cannot observe the grant.
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        if (ProcessGetNoNewPrivs(proc)) {
+            proc->capabilities.permitted &= previousPermitted;
+            proc->capabilities.effective &= proc->capabilities.permitted;
+        }
         if(UserIdFromCanonical(proc->userNamespace,false,proc->euid)!=0)proc->capabilities.effective=0;
     }
     SpinLockRelease(&g_credentialsLock);
