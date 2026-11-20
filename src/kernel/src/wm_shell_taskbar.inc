@@ -55,7 +55,7 @@ static TaskbarLayout GetTaskbarLayout(uint32_t screenW, uint32_t screenH)
     return ChromeTaskbarLayoutFor(WmChromeStyle(), screenW, screenH, clockText,
                                   __atomic_load_n(&g_agentIndicatorState, __ATOMIC_ACQUIRE) != 0,
                                   WmGetTaskbarMetrics(), ids, total, focused, buildText, g_hudMode == WmHudMode::Compact,
-                                  labels);
+                                  labels, ShellServiceTrayState().itemCount);
 }
 
 // Network indicator. The compositor thread refreshes this cache at most once
@@ -483,6 +483,9 @@ static void WmCaptureTaskbar(uint32_t screenW, uint32_t screenH, uint64_t uptime
     if (!g_wmActive) return;
     LauncherReadGuard icons;
     snapshot.kind = ChromeShellKind::Taskbar;
+    const auto& tray = ShellServiceTrayState();
+    snapshot.tray.itemCount = tray.itemCount;
+    for (uint32_t i = 0; i < tray.itemCount; ++i) snapshot.tray.items[i] = tray.items[i];
     snapshot.taskbar = GetTaskbarLayout(screenW, screenH);
     auto& layout = snapshot.taskbar;
     bool busy = false;
@@ -682,4 +685,114 @@ int WmTaskbarHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)
     for (int i = 0; i < l.count; ++i)
         if (l.buttons[i].contains(mx, my)) return l.indices[i];
     return -1;
+}
+
+
+static int ShellTrayAt(const ChromeTaskbarLayout& bar, int32_t x, int32_t y)
+{
+    for (uint32_t i = 0; i < bar.trayAppCount; ++i)
+        if (bar.trayApps[i].contains(x, y)) return static_cast<int>(i);
+    return -1;
+}
+
+void WmGetShellTrayGeometry(uint32_t sw, uint32_t sh, int32_t x, int32_t y, WmShellTrayGeometry& out)
+{
+    out = {};
+    const auto& tray = ShellServiceTrayState();
+    const auto style = WmChromeStyle();
+    if (tray.notice.id) out.notice = ChromeNoticeRect(style, sw, WmDesktopHeight(sh), tray.notice.actionCount);
+    if (!tray.itemCount || WmTaskbarHidden() || WmLauncherVisible() ||
+        WmVolumePopupVisible() || WmTrayFlyoutVisible()) return;
+    if (y < static_cast<int32_t>(WmTaskbarTop(sh)) && !tray.menuOwner) return;
+    const auto bar = GetTaskbarLayout(sw, sh);
+    if (tray.menuOwner) {
+        for (uint32_t i = 0; i < bar.trayAppCount; ++i) {
+            if (tray.items[i].id != tray.menuOwner) continue;
+            out.popup = ChromeTrayMenuRect(style, bar.trayApps[i], tray.menuCount, sw);
+            out.menu = out.popup.w > 0;
+            return;
+        }
+        return;
+    }
+    const int hover = ShellTrayAt(bar, x, y);
+    if (hover < 0) return;
+    const auto& item = tray.items[hover];
+    const auto anchor = bar.trayApps[hover];
+    const int widthLimit = static_cast<int>(sw) - int(style.M(16));
+    if (widthLimit <= 0) return;
+    int width = style.TextWidth(item.title, ChromeFont::Label);
+    const int detail = style.TextWidth(item.tooltip, ChromeFont::Label);
+    if (detail > width) width = detail;
+    width += 2 * ChromeTooltipPadding(style);
+    if (width > widthLimit) width = widthLimit;
+    const int height = style.Line(ChromeFont::Label) * (item.tooltip[0] ? 2 : 1) + 2 * style.M(8);
+    int start = anchor.x + anchor.w - width;
+    if (start < int(style.M(8))) start = style.M(8);
+    if (anchor.y >= height + int(style.M(8)))
+        out.popup = {start, anchor.y - height - int(style.M(8)), width, height};
+}
+
+bool WmShellTrayPointer(uint32_t sw, uint32_t sh, int32_t x, int32_t y,
+                       bool pressed, int button, int scroll)
+{
+    const auto& tray = ShellServiceTrayState();
+    if (!tray.itemCount && !tray.notice.id) return false;
+    WmShellTrayGeometry geometry{};
+    WmGetShellTrayGeometry(sw, sh, x, y, geometry);
+    const auto style = WmChromeStyle();
+    auto send = [&](TrayInputKind kind, uint32_t id, int32_t argument) {
+        ShellServiceQueueTrayInput({kind, id, argument, x, y});
+    };
+    if (geometry.menu) {
+        if (pressed) {
+            if (!geometry.popup.contains(x, y)) send(TrayInputKind::DismissMenu, tray.menuOwner, 0);
+            else if (!button) for (uint32_t i = 0; i < tray.menuCount; ++i) {
+                const auto& row = tray.menu[i];
+                if (row.enabled && !row.separator && ChromeTrayMenuRowRect(style, geometry.popup, i).contains(x, y))
+                    send(TrayInputKind::MenuSelect, tray.menuOwner, row.id);
+            }
+        }
+        return true;
+    }
+    if (geometry.notice.contains(x, y) && !WmLauncherVisible() && !WmVolumePopupVisible() && !WmTrayFlyoutVisible()) {
+        if (pressed && !button) {
+            if (ChromeNoticeCloseRect(style, geometry.notice).contains(x, y))
+                send(TrayInputKind::CloseNotice, tray.notice.id, 0);
+            for (uint32_t i = 0; i < tray.notice.actionCount; ++i)
+                if (ChromeNoticeActionRect(style, geometry.notice, tray.notice.actionCount, i).contains(x, y))
+                    send(TrayInputKind::NoticeAction, tray.notice.id, i);
+        }
+        return true;
+    }
+    if (!tray.itemCount || WmTaskbarHidden() || WmLauncherVisible() ||
+        WmVolumePopupVisible() || WmTrayFlyoutVisible() || y < static_cast<int32_t>(WmTaskbarTop(sh))) return false;
+    const int hover = ShellTrayAt(GetTaskbarLayout(sw, sh), x, y);
+    if (hover < 0) return false;
+    if (pressed && button <= 1)
+        send(button ? TrayInputKind::Context : TrayInputKind::Activate, tray.items[hover].id, 0);
+    if (scroll) send(TrayInputKind::Scroll, tray.items[hover].id, scroll);
+    return true;
+}
+
+static void WmCaptureAppTray(const WmShellSurface& surface, uint32_t sw, uint32_t sh,
+                            int32_t x, int32_t y, ChromeShellModel& model)
+{
+    const auto& tray = ShellServiceTrayState();
+    model.rect = {surface.x, surface.y, int(surface.w), int(surface.h)};
+    model.mouseX = x;
+    model.mouseY = y;
+    if (surface.kind == WmShellSurfaceKind::Notification) {
+        model.kind = ChromeShellKind::Notification;
+        model.tray.notice = tray.notice;
+    } else if (surface.kind == WmShellSurfaceKind::AppTrayMenu) {
+        model.kind = ChromeShellKind::AppTrayMenu;
+        model.tray.menuCount = tray.menuCount;
+        for (uint32_t i = 0; i < tray.menuCount; ++i) model.tray.menu[i] = tray.menu[i];
+    } else {
+        const int hover = ShellTrayAt(GetTaskbarLayout(sw, sh), x, y);
+        if (hover < 0) return;
+        model.kind = ChromeShellKind::Tooltip;
+        WmStrCopy(model.text, tray.items[hover].title, sizeof(model.text));
+        WmStrCopy(model.detail, tray.items[hover].tooltip, sizeof(model.detail));
+    }
 }

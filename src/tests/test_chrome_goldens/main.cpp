@@ -476,6 +476,48 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
         Check(prefix + "taskbar-hud", list, s, 0, hudLayout.y, screenW, screenH - hudLayout.y);
     }
 
+    {
+        model.tray = {};
+        model.tray.itemCount = 2;
+        model.tray.items[0].id = 1;
+        model.tray.items[0].hasIcon = true;
+        std::memcpy(model.tray.items[0].icon, testIcon, sizeof(testIcon));
+        std::strcpy(model.tray.items[0].title, "Steam");
+        model.tray.items[1].id = 2;
+        model.tray.items[1].attention = true;
+        std::strcpy(model.tray.items[1].title, "Updater");
+        model.taskbar = ChromeTaskbarLayoutFor(s, screenW, screenH, "14:05 19 Nov 2026", false,
+                                              metrics, ids, 3, 0, nullptr, false, labels, 2);
+        const auto anchor = model.taskbar.trayApps[0];
+        model.mouseX = anchor.x + 5; model.mouseY = anchor.y + 5;
+        ChromeDisplayList list = ChromeListOn(storage);
+        RenderSnapshot(model, s, list);
+        Check(prefix + "app-tray", list, s, 0, model.taskbar.y, screenW, screenH - model.taskbar.y);
+
+        model.kind = ChromeShellKind::AppTrayMenu;
+        model.tray.menuOwner = 1;
+        model.tray.menuCount = 4;
+        model.tray.menu[0] = {1, "Show Library", true, false, false};
+        model.tray.menu[1] = {2, "", false, true, false};
+        model.tray.menu[2] = {3, "Recent games", true, false, true};
+        model.tray.menu[3] = {4, "Exit", false, false, false};
+        model.rect = ChromeTrayMenuRect(s, anchor, model.tray.menuCount, screenW);
+        model.mouseX = model.rect.x + int(s.M(14));
+        model.mouseY = model.rect.y + int(s.M(18));
+        auto menuList = ChromeListOn(storage);
+        RenderSnapshot(model, s, menuList);
+        Check(prefix + "app-tray-menu", menuList, s, model.rect.x, model.rect.y, model.rect.w, model.rect.h);
+
+        model.kind = ChromeShellKind::Notification;
+        model.tray.notice = {42, 2, "Steam", "Download complete", "Quake II is ready to play", {"Open library", "Dismiss"}};
+        model.rect = ChromeNoticeRect(s, screenW, model.taskbar.y, model.tray.notice.actionCount);
+        model.mouseX = model.rect.x + int(s.M(20));
+        model.mouseY = model.rect.y + model.rect.h - int(s.M(29));
+        auto noticeList = ChromeListOn(storage);
+        RenderSnapshot(model, s, noticeList);
+        Check(prefix + "app-notification", noticeList, s, model.rect.x, model.rect.y, model.rect.w, model.rect.h);
+    }
+
     Launcher(prefix, s, screenW, screenH);
 
     // Volume popup over the tray icon, mute button hovered.

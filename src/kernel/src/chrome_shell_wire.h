@@ -11,7 +11,7 @@ inline constexpr uint32_t ShellCommandLimit = 1536;
 inline constexpr uint32_t ShellTextLimit = 4096;
 // One 24x24 icon per launcher row, plus room for the material gradient.
 inline constexpr uint32_t ShellAssetLimit = 128 * 24 * 24 + 256;
-enum class ShellServiceOp : uint64_t { Register, Receive, Present };
+enum class ShellServiceOp : uint64_t { Register, Receive, Present, TrayPublish, TrayNextInput };
 
 struct ShellExchange {
     uint64_t sequence;

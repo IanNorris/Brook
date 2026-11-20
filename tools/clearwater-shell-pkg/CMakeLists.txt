@@ -3,14 +3,33 @@ project(brook_clearwater_shell LANGUAGES CXX)
 
 include("${BROOK_ROOT}/cmake/ChromeFonts.cmake")
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(DBUS REQUIRED IMPORTED_TARGET dbus-1)
+find_package(PNG REQUIRED)
 brook_chrome_fonts(FONTS "${Python3_EXECUTABLE}" "${BROOK_DESKTOP_FONT_TTF}" "${BROOK_MONO_FONT_TTF}"
                    "${CMAKE_CURRENT_BINARY_DIR}")
 set(KERNEL_SOURCE "${BROOK_ROOT}/src/kernel/src")
-add_executable(CWSHELL.ELF main.cpp "${KERNEL_SOURCE}/chrome_shell.cpp"
+add_executable(CWSHELL.ELF main.cpp session_services.cpp "${KERNEL_SOURCE}/chrome_shell.cpp"
     "${KERNEL_SOURCE}/chrome_launcher.cpp" "${KERNEL_SOURCE}/launcher_model.cpp"
     "${KERNEL_SOURCE}/chrome_raster.cpp" ${FONTS})
-target_include_directories(CWSHELL.ELF PRIVATE "${KERNEL_SOURCE}" "${BROOK_ROOT}/src/shared")
+target_compile_options(CWSHELL.ELF PRIVATE "-iquote${KERNEL_SOURCE}" "-iquote${BROOK_ROOT}/src/shared")
 target_compile_features(CWSHELL.ELF PRIVATE cxx_std_17)
 target_compile_options(CWSHELL.ELF PRIVATE -Wall -Wextra -Werror -fno-exceptions -fno-rtti)
+target_link_libraries(CWSHELL.ELF PRIVATE PkgConfig::DBUS PNG::PNG)
 target_link_options(CWSHELL.ELF PRIVATE -static)
 install(TARGETS CWSHELL.ELF RUNTIME DESTINATION bin)
+
+enable_testing()
+add_executable(session-services-test session_services_test.cpp session_services.cpp)
+target_compile_options(session-services-test PRIVATE "-iquote${KERNEL_SOURCE}" "-iquote${BROOK_ROOT}/src/shared")
+target_compile_features(session-services-test PRIVATE cxx_std_17)
+target_compile_options(session-services-test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+target_link_libraries(session-services-test PRIVATE PkgConfig::DBUS PNG::PNG)
+target_link_options(session-services-test PRIVATE -static)
+if(BROOK_TEST_DBUS_CONFIG)
+    add_test(NAME session-services COMMAND dbus-run-session --config-file "${BROOK_TEST_DBUS_CONFIG}"
+             -- "${CMAKE_CURRENT_BINARY_DIR}/session-services-test")
+else()
+    add_test(NAME session-services COMMAND dbus-run-session -- "${CMAKE_CURRENT_BINARY_DIR}/session-services-test")
+endif()
+set_tests_properties(session-services PROPERTIES TIMEOUT 20)
