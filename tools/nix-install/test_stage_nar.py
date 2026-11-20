@@ -19,6 +19,61 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class NarImport(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("nix-store"), "requires Nix")
+    def test_reuse_keeps_only_verified_legacy_library_aliases(self):
+        def metadata(path, references=()):
+            archive = subprocess.check_output(["nix-store", "--dump", path])
+            return {
+                "narHash": "sha256-" + base64.b64encode(hashlib.sha256(archive).digest()).decode(),
+                "narSize": len(archive), "references": list(references), "source": "upstream",
+            }
+
+        with tempfile.TemporaryDirectory(prefix="brook-legacy-library-") as scratch:
+            store = Path(scratch)
+            pkg, dep = store / ("0" * 32 + "-pkg"), store / ("1" * 32 + "-dep")
+            library = dep / "lib/runtime.so"
+            library.parent.mkdir(parents=True)
+            library.write_bytes(b"runtime")
+            pkg.mkdir()
+            payload = pkg / "program"
+            payload.write_bytes(b"signed program")
+            expected = metadata(pkg, [dep.name])
+            alias = pkg / "lib/runtime.so"
+            alias.parent.mkdir()
+            alias.symlink_to(f"../../{dep.name}/lib/runtime.so")
+            canonical_paths = set()
+            self.assertEqual(stage_nar.ensure_path(
+                store, pkg.name, expected, {}, {}, legacy_paths=canonical_paths), "present")
+            self.assertEqual(canonical_paths, {alias, alias.parent})
+            stage_nar.check_legacy_links(store, {dep.name, pkg.name}, canonical_paths)
+            self.assertTrue(alias.is_symlink())
+
+            profile = store / ("2" * 32 + "-profile")
+            profile.mkdir()
+            (profile / "export").symlink_to(pkg)
+            self.assertEqual(stage_nar.profile_layout(
+                profile, {pkg.name, dep.name, profile.name}, store=store,
+                legacy_paths=canonical_paths)["directories"], ["export"])
+
+            with self.assertRaisesRegex(ValueError, "Existing store path failed verification"):
+                stage_nar.ensure_path(store, pkg.name, expected, {}, {})
+            for target in (f"../../{dep.name}/lib/other.so", f"/nix/store/{dep.name}/lib/runtime.so",
+                           f"../../{pkg.name}/lib/runtime.so", "../../outside/lib/runtime.so"):
+                alias.unlink()
+                alias.symlink_to(target)
+                with self.assertRaisesRegex(ValueError, "Existing store path failed verification"):
+                    stage_nar.ensure_path(store, pkg.name, expected, {}, {}, legacy_paths=set())
+            alias.unlink()
+            alias.symlink_to(f"../../{dep.name}/lib/runtime.so")
+            library.unlink()
+            outside = store.parent / "unverified-runtime.so"
+            library.symlink_to(outside)
+            with self.assertRaises(OSError):
+                stage_nar.check_legacy_links(store, {dep.name, pkg.name}, canonical_paths)
+            payload.write_bytes(b"changed program")
+            with self.assertRaisesRegex(ValueError, "Existing store path failed verification"):
+                stage_nar.ensure_path(store, pkg.name, expected, {}, {}, legacy_paths=set())
+
     @unittest.skipUnless(all(shutil.which(name) for name in
                              ("cc", "curl", "nix-store", "xz", "zstd")),
                          "requires the host Nix and archive tools")

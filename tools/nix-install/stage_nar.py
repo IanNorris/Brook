@@ -27,7 +27,7 @@ def store_name(value):
     return path.name
 
 
-def profile_layout(profile, closure, *, store=STORE):
+def profile_layout(profile, closure, *, store=STORE, legacy_paths=()):
     """Expand a verified profile root without changing its store references."""
     links = {}
     directories = []
@@ -44,7 +44,8 @@ def profile_layout(profile, closure, *, store=STORE):
             if relative.parts:
                 directories.append(relative.as_posix())
             for child in sorted(resolved.iterdir()):
-                walk(child, relative / child.name, (*ancestors, resolved))
+                if child not in legacy_paths:
+                    walk(child, relative / child.name, (*ancestors, resolved))
         elif resolved.is_file() and relative.parts:
             links[relative.as_posix()] = str(STORE / suffix)
         else:
@@ -74,7 +75,7 @@ def nar_hash(value):
     return "sha256-" + base64.b64encode(raw).decode("ascii")
 
 
-def hash_tree(path, expected_size):
+def hash_tree(path, expected_size, *, legacy_paths=()):
     """Produce the digest of a canonical NAR without writing an archive."""
     digest = hashlib.sha256()
     size = 0
@@ -108,6 +109,8 @@ def hash_tree(path, expected_size):
         elif stat.S_ISDIR(mode):
             string(b"directory")
             for child in sorted(entry.iterdir(), key=lambda item: os.fsencode(item.name)):
+                if child in legacy_paths:
+                    continue
                 string(b"entry")
                 string(b"(")
                 string(b"name")
@@ -148,8 +151,8 @@ def hash_tree(path, expected_size):
     return "sha256-" + base64.b64encode(digest.digest()).decode("ascii")
 
 
-def verify_tree(path, entry):
-    if hash_tree(path, entry["narSize"]) != entry["narHash"]:
+def verify_tree(path, entry, *, legacy_paths=()):
+    if hash_tree(path, entry["narSize"], legacy_paths=legacy_paths) != entry["narHash"]:
         raise ValueError(f"NAR hash mismatch for {path}")
 
 
@@ -229,17 +232,61 @@ def rename_no_replace(source, target):
         raise OSError(error, os.strerror(error), str(target))
 
 
-def verify_installed(path, entry):
+def legacy_lib_links(path, references):
+    """Identify direct runtime aliases made by nix-install's legacy linker."""
+    directory = path / "lib"
+    if path.is_symlink() or directory.is_symlink() or not directory.is_dir():
+        return set()
+    dependencies = set(references) - {path.name}
+    return {
+        child for child in directory.iterdir()
+        if child.is_symlink() and not child.name.startswith(".")
+        and (parts := os.readlink(child).split("/"))[:2] == ["..", ".."]
+        and len(parts) == 5 and parts[2] in dependencies
+        and parts[3:] == ["lib", child.name]
+    }
+
+
+def verify_installed(path, entry, legacy_paths):
     try:
         verify_tree(path, entry)
-    except (OSError, ValueError) as error:
-        raise ValueError(f"Existing store path failed verification: {error}") from error
+        return
+    except (OSError, ValueError) as strict_error:
+        if legacy_paths is None or entry["source"] != "upstream":
+            raise ValueError(f"Existing store path failed verification: {strict_error}") from strict_error
+        try:
+            links = legacy_lib_links(path, entry["references"])
+            if not links:
+                raise strict_error
+            try:
+                verify_tree(path, entry, legacy_paths=links)
+            except ValueError:
+                # The legacy linker also creates lib/ when a package lacked it.
+                directory = path / "lib"
+                if any(child not in links for child in directory.iterdir()):
+                    raise
+                links.add(directory)
+                verify_tree(path, entry, legacy_paths=links)
+        except (OSError, ValueError) as error:
+            raise ValueError(f"Existing store path failed verification: {error}") from error
+        legacy_paths.update(links)
 
 
-def ensure_path(store, name, entry, cache, tools):
+def check_legacy_links(store, closure, legacy_paths):
+    for link in sorted(legacy_paths):
+        if not link.is_symlink():
+            continue  # The optional legacy lib/ directory itself is not a link.
+        resolved = link.resolve(strict=True)
+        if (not resolved.is_file() or not resolved.is_relative_to(store)
+                or resolved.relative_to(store).parts[0] not in closure
+                or resolved in legacy_paths):
+            raise ValueError(f"Legacy runtime library link does not resolve to a verified file: {link}")
+
+
+def ensure_path(store, name, entry, cache, tools, *, legacy_paths=None):
     target = store / name
     if os.path.lexists(target):
-        verify_installed(target, entry)
+        verify_installed(target, entry, legacy_paths)
         return "present"
     sources = [cache["brook"]]
     if entry["source"] == "upstream":
@@ -268,6 +315,6 @@ def ensure_path(store, name, entry, cache, tools):
         except OSError as error:
             if error.errno != errno.EEXIST:
                 raise
-            verify_installed(target, entry)
+            verify_installed(target, entry, legacy_paths)
             return "present"
         return "upstream" if source == UPSTREAM else "brook"

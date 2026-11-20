@@ -15,7 +15,8 @@ import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from stage_nar import STORE, STORE_NAME, ensure_path, layout_digest, nar_hash, profile_layout, rename_no_replace
+from stage_nar import (STORE, STORE_NAME, check_legacy_links, ensure_path, layout_digest,
+                       nar_hash, profile_layout, rename_no_replace)
 from collect_desktop_entries import collect
 
 MAX_PLAN = 16 * 1024 * 1024
@@ -199,7 +200,7 @@ def collect_user_overlay(nix, old):
     return rows, links
 
 
-def prepare(nix, plan, previous, destination):
+def prepare(nix, plan, previous, destination, legacy_paths):
     old = nix / PROFILE_HOME / previous
     rows, overlay = collect_user_overlay(nix, old)
     manifest = {p["name"].casefold(): (p["name"], p["version"], p["store"])
@@ -208,7 +209,8 @@ def prepare(nix, plan, previous, destination):
     layout = plan["profile"]
     if plan["format"] == 2:
         store = nix / "store"
-        layout = profile_layout(store / layout["root"], plan["closure"], store=store)
+        layout = profile_layout(store / layout["root"], plan["closure"], store=store,
+                                legacy_paths=legacy_paths)
         if layout_digest(layout) != plan["profile"]["layoutSha256"]:
             raise ValueError("Reconstructed profile differs from the signed layout")
         validate_layout(layout, plan["closure"])
@@ -270,17 +272,21 @@ def apply(nix, plan, digest, transaction, tools):
                 raise ValueError("Another profile is active; refusing to overwrite it")
             # A prepared generation and journal are durable before publication.
         counts = {"present": 0, "upstream": 0, "brook": 0}
+        legacy_paths = set()
         for name, entry in sorted(plan["closure"].items()):
-            result = ensure_path(nix / "store", name, entry, plan["cache"], tools)
+            result = ensure_path(nix / "store", name, entry, plan["cache"], tools,
+                                 legacy_paths=legacy_paths)
             counts[result] += 1
-        print(json.dumps({"closure": counts}), flush=True)
+        check_legacy_links(nix / "store", plan["closure"], legacy_paths)
+        legacy_link_count = sum(path.is_symlink() for path in legacy_paths)
+        print(json.dumps({"closure": counts, "legacy_library_links": legacy_link_count}), flush=True)
         if not record.is_file():
             if (home / target).exists():
                 raise ValueError("Unjournaled generation requires inspection")
             # Both staging and live generation must be at the same depth.
             temp = Path(tempfile.mkdtemp(prefix=".brook-profile-building-", dir=home))
             try:
-                prepare(nix, plan, previous, temp)
+                prepare(nix, plan, previous, temp, legacy_paths)
                 temp.chmod(0o755)
                 rename_no_replace(temp, home / target)
                 flush_directory(home)
