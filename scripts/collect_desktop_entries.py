@@ -296,14 +296,14 @@ def collect(store_dir, output_dir, *, profile=None, hardware=False, profile_only
                 if binary_name in ('firefox', 'codium', 'vscodium', 'vlc'):
                     exec_cmd = '--uid 1000 ' + exec_cmd
 
-        if hardware and binary in (binary_name, '/nix/profile/bin/' + binary_name):
+        if binary in (binary_name, '/nix/profile/bin/' + binary_name):
             hardware_names = ('mousepad', 'brook-settings', 'wayland-calc', 'brook-gallery')
-            if binary_name in hardware_names:
+            if binary_name == 'brook-task-manager' or (hardware and binary_name in hardware_names):
                 wrapper = '/nix/profile/bin/hardware-' + binary_name
                 if guest_path(wrapper).is_file():
                     exec_cmd = wrapper
 
-        if binary_name in ('brook-nautilus', 'brook-quake2'):
+        if binary_name in ('brook-nautilus', 'brook-quake2', 'brook-task-manager'):
             exec_cmd = '--uid 1000 ' + exec_cmd
 
         entries.append((name, exec_cmd, icon_file, categories, Path(df).stem, comment))

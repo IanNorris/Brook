@@ -9,7 +9,7 @@ let
     f (if builtins.hasAttr "pkgs" (builtins.functionArgs f) then { inherit pkgs; } else {})) [
     "waylandd-pkg" "wayland-calc-pkg"
     "brook-settings-pkg" "brook-message-pkg" "brook-session-pkg"
-    "brook-apps-pkg"
+    "brook-apps-pkg" "brook-task-manager-pkg"
   ];
   launchers = pkgs.runCommand "brook-hardware-launchers" {} ''
     mkdir -p $out/bin $out/share/applications
@@ -27,7 +27,7 @@ let
     mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME"
     exec "$@"
     SCRIPT
-    for app in mousepad brook-settings wayland-calc; do
+    for app in mousepad brook-settings wayland-calc brook-task-manager; do
       cat > $out/bin/hardware-$app <<SCRIPT
     #!${pkgs.bash}/bin/bash
     exec /nix/profile/bin/brook-run /nix/profile/bin/$app "\$@"

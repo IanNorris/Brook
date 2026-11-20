@@ -87,4 +87,31 @@ class DesktopEntriesTest(unittest.TestCase):
             (package/'bin/chromium').unlink()
             self.assertEqual(collect_manifest(),'')
 
+    def test_task_manager_manifest_keeps_desktop_identity(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            store = root / 'store'
+            (store / 'task-manager/bin').mkdir(parents=True)
+            profile = root / 'profile'
+            (profile / 'bin').mkdir(parents=True)
+            (profile / 'share/applications').mkdir(parents=True)
+            for name in ('brook-task-manager', 'hardware-brook-task-manager'):
+                command = profile / 'bin' / name
+                command.write_text('#!/bin/sh\n')
+                command.chmod(0o755)
+            (store / 'task-manager/bin/brook-task-manager').symlink_to(profile / 'bin/brook-task-manager')
+            desktop = 'org.brook.TaskManager.desktop'
+            package = Path(__file__).resolve().parents[1] / 'tools/brook-task-manager-pkg'
+            (profile / 'share/applications' / desktop).symlink_to(package / desktop)
+            output = root / 'applications'
+            for hardware in (False, True):
+                with self.subTest(hardware=hardware), contextlib.redirect_stdout(io.StringIO()):
+                    collect.collect(store, output, hardware=hardware, profile_only=True)
+                    fields = (output / 'applications.idx').read_text().strip().split('\t')
+                    self.assertEqual(fields[:2], [
+                        'Task Manager', '--uid 1000 /nix/profile/bin/hardware-brook-task-manager',
+                    ])
+                    self.assertEqual(fields[4], 'org.brook.TaskManager')
+
+
 if __name__=='__main__':unittest.main()
