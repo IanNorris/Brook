@@ -84,16 +84,28 @@ def require_response_end(stream):
         stream.require_response_end()
 
 
+def session_auth_mode(session):
+    """Require an explicitly attached transport before opening any connection."""
+    mode = session.get("auth_mode")
+    if mode not in ("legacy", "v3"):
+        raise ValueError("Missing or invalid hardware authentication mode; reattach explicitly")
+    if mode == "v3":
+        operator_key = session.get("operator_key_file")
+        if not isinstance(operator_key, str) or not operator_key:
+            raise ValueError("Missing hardware operator key path; reattach explicitly")
+    return mode
+
+
 def receiver_key(session, legacy_key_file):
     """Use the same selected authentication for commands and data transfers."""
     from pathlib import Path
 
-    if session.get("auth_mode", "legacy") == "v3":
+    if session_auth_mode(session) == "v3":
         from bridge_v3 import read_operator_key
 
         return read_operator_key(Path(session["operator_key_file"]))
-    if session.get("auth_mode", "legacy") != "legacy":
-        raise ValueError("unsupported bridge transport")
+    if legacy_key_file is None:
+        raise ValueError("An explicit legacy hardware session requires a legacy key file")
     with Path(legacy_key_file).open() as stream:
         text = stream.read(33)
     if len(text) != 32 or any(c not in "0123456789abcdef" for c in text):

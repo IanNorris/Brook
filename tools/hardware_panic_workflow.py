@@ -3,6 +3,7 @@ import hashlib
 import re
 import zlib
 from pathlib import Path
+from binary_bridge import receiver_key
 from hardware_bulk_protocol import identifier
 from hardware_bulk_workflow import BulkRun
 from hardware_update_workflow import UpdateRun
@@ -13,11 +14,10 @@ class PanicRun(UpdateRun):
         export_id=identifier(request_id)
         if isinstance(port,bool) or not isinstance(port,int) or not 1<=port<=65535:
             raise ValueError('Invalid bulk port')
-        with Path(key_file).open() as stream:
-            identifier(stream.read(33))
         transfer_id=hashlib.sha256(('brook-panic-transfer-v1:'+export_id).encode()).hexdigest()[:32]
         data=self.bridge.load_session(session)
         boot=identifier(data['guest_boot_id'])
+        receiver_key(data,key_file)
         doctor=self.bridge.doctor(session)
         if doctor.get('probe_stage')!='verified' or not doctor.get('reachable') or not doctor.get('identity_matches'):
             raise RuntimeError('Pinned guest boot probe is incomplete or not reachable/matching')

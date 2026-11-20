@@ -10,11 +10,12 @@ import zlib
 
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'tools'))
+from bridge_v3 import create_operator_key
 from hardware_panic_workflow import PanicRun
 
 class Bridge:
     def __init__(self):self.launches=[];self.payload=b'crash packet';self.mismatch=False;self.stale=False
-    def load_session(self,session):return {'guest_boot_id':'a'*32,'host':'127.0.0.1'}
+    def load_session(self,session):return {'auth_mode':'legacy','guest_boot_id':'a'*32,'host':'127.0.0.1'}
     def doctor(self,session):return {'probe_stage':'verified','reachable':True,'identity_matches':not self.stale,'guest':{'bulk_helper_api':1}}
     def guest_run(self,session,request,argv,**kw):self.launches.append((request,argv))
     def job(self,session,request,**kw):
@@ -38,6 +39,16 @@ class Tests(unittest.TestCase):
         self.assertEqual(r['state'],'completed');self.assertEqual(r['sequence'],3)
         self.assertEqual(Path(r['artifact_path']).read_bytes(),self.bridge.payload)
         self.assertEqual(self.bridge.launches[0][1],['/boot/PANICLOG.ELF','--bridge','b'*32])
+    def test_v3_works_without_the_legacy_key(self):
+        seed = self.root / 'operator.seed'
+        create_operator_key(seed)
+        self.key.unlink()
+        data = {**self.bridge.load_session('session'), 'auth_mode': 'v3', 'operator_key_file': str(seed)}
+        with patch.object(self.bridge, 'load_session', return_value=data), patch(
+                'hardware_panic_workflow.BulkRun.execute', autospec=True, side_effect=self.transfer):
+            result = PanicRun(self.bridge, self.root/'result').execute('session', None, 'b'*32)
+        self.assertEqual(result['state'], 'completed')
+
     def test_mismatch_retains_receipt_and_does_not_replay(self):
         self.bridge.mismatch=True
         with patch('hardware_panic_workflow.BulkRun.execute',autospec=True,side_effect=self.transfer):

@@ -20,7 +20,7 @@ class Bridge:
         self.cap_job=None;self.cap_legacy=False;self.cap_fault=None;self.launch_code=None
         self.guard_caps={'boot_id':'a'*32,'ac_shutdown_record':None,
                          'writable_desktop':{'ready':True,'source_pinned':True}}
-    def load_session(self,session):return {'guest_boot_id':'a'*32,'host':'192.0.2.1','port':1234}
+    def load_session(self,session):return {'auth_mode':'legacy','guest_boot_id':'a'*32,'host':'192.0.2.1','port':1234}
     def doctor(self,session):return {'probe_stage':'verified','reachable':True,'identity_matches':not (self.stale or self.newboot),
         'capabilities':{'power':{'reset':self.reset}},'guest':self.guard_caps}
     def guest_run(self,session,ident,argv,**kwargs):
@@ -63,7 +63,8 @@ class Bridge:
         self.newboot=self.boot_changes
         if self.missing_commit:raise ConnectionError('Reset dropped reply')
         return {'state':'ready','error':0}
-    def attach(self,host,port):
+    def attach(self,host,port,*,auth_mode):
+        assert auth_mode=='legacy'
         self.calls.append(('attach',host,port));return {'session':'fresh','guest_boot_id':'b'*32}
 
 class Tests(unittest.TestCase):

@@ -88,6 +88,19 @@ class HardwareTests(unittest.TestCase):
     def setUp(self):self.tmp=tempfile.TemporaryDirectory();self.endpoint=Endpoint();self.hardware=Hardware(self.tmp.name)
     def tearDown(self):self.endpoint.close();self.tmp.cleanup()
     def attach(self):return self.hardware.attach('127.0.0.1',self.endpoint.port,auth_mode='legacy')['session']
+    def test_missing_session_auth_mode_requires_reattach_before_network(self):
+        session = self.attach()
+        path = Path(self.tmp.name) / session / 'session.json'
+        data = json.loads(path.read_text())
+        del data['auth_mode']
+        path.write_text(json.dumps(data))
+        with patch('hardware.exchange', side_effect=AssertionError('unexpected connection')), patch(
+                'hardware.exchange_v3', side_effect=AssertionError('unexpected connection')):
+            with self.assertRaisesRegex(ValueError, 'reattach explicitly'):
+                self.hardware.load_session(session)
+            with self.assertRaisesRegex(ValueError, 'reattach explicitly'):
+                self.hardware.guest_batch(data, ['bridge hardware caps'])
+
     def test_recovery_panic_verified_and_exclusive(self):
         session=self.attach();self.endpoint.panic_packet=bytes(range(256))*5
         path=Path(self.tmp.name)/'packet.bin';result=self.hardware.recovery_panic(session,path)

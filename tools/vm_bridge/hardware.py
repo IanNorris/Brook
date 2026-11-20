@@ -19,6 +19,8 @@ from ui import Ui
 if str(Path(__file__).resolve().parents[1]) not in sys.path:
     sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 
+from binary_bridge import session_auth_mode
+
 class HardwareBootChanged(GuestJobError):
     pass
 
@@ -38,9 +40,7 @@ class Hardware:
         if live and data.get('state')!='running':raise RuntimeError('Hardware session is detached')
         self.endpoint(data['host'],data['port']);validate_id(data['guest_boot_id'])
         if data['guest_boot_id']=='0'*32:raise ValueError('Unset hardware boot identity')
-        mode=data.get('auth_mode','legacy')
-        if mode not in ('v3','legacy') or (mode=='v3' and not isinstance(data.get('operator_key_file'),str)):
-            raise ValueError('Invalid hardware session authentication policy')
+        session_auth_mode(data)
         return data
 
     @staticmethod
@@ -76,7 +76,7 @@ class Hardware:
 
     def guest_batch(self,data,commands,timeout=8,progress=None,on_reply=None):
         arguments=(data['host'],data['port'],[self.guarded(data,c) for c in commands],timeout)
-        if data.get('auth_mode')=='v3':
+        if session_auth_mode(data)=='v3':
             from bridge_v3 import BridgeV3BootMismatch
 
             try:
@@ -247,8 +247,9 @@ class Hardware:
                                  'consistency':'window snapshot taken before the capture; not atomic with the frame'}
         return reply
 
-    def panic_report(self,session,request_id,key_file,output,port=1236,**_):
+    def panic_report(self,session,request_id,key_file=None,output=None,port=1236,**_):
         from hardware_panic_workflow import PanicRun
+        if output is None:raise ValueError('A panic report output directory is required')
         result=PanicRun(self,output).execute(session,key_file,request_id,port)
         return {'session':session,'state':result['state'],'guest_boot_id':result['guest_boot_id'],
                 'sequence':result['sequence'],'bytes':result['packet_bytes'],
