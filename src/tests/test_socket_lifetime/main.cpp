@@ -2419,6 +2419,109 @@ int main() {
         g_netIfCount = 0;
     }
     {
+        // A pre-address DHCP response is a destination exception only on
+        // the physical primary NIC; normal IPv4 source checks still apply.
+        NetIf primary{}, secondary{};
+        primary.transmit = captureFrame;
+        primary.mac = {{0x52, 0x54, 0, 0x12, 0x34, 0x56}};
+        secondary.ipAddr = Ipv4Addr(192, 0, 2, 2);
+        secondary.netmask = Ipv4Addr(255, 255, 255, 0);
+        assert(!g_netIf && !g_netIfCount);
+        g_netIf = g_netIfs[0] = &primary;
+        g_netIfs[1] = &secondary;
+        g_netIfCount = 2;
+
+        struct Wire {
+            EthHeader eth;
+            Ipv4Header ip;
+            UdpHeader udp;
+            DhcpPacket dhcp;
+        };
+        static_assert(sizeof(Wire) == sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader) + sizeof(DhcpPacket));
+        const uint32_t server = Ipv4Addr(192, 0, 2, 1);
+        const uint32_t lease = Ipv4Addr(192, 0, 2, 20);
+        Wire offer{};
+        offer.eth.etherType = htons(ETH_TYPE_IPV4);
+        offer.eth.dst = primary.mac;
+        offer.ip.verIhl = 0x45;
+        offer.ip.totalLen = htons(sizeof(Wire) - sizeof(EthHeader));
+        offer.ip.protocol = IP_PROTO_UDP;
+        offer.ip.srcIp = server;
+        offer.ip.dstIp = lease;
+        offer.udp.srcPort = htons(DHCP_SERVER_PORT);
+        offer.udp.dstPort = htons(DHCP_CLIENT_PORT);
+        offer.udp.length = htons(sizeof(UdpHeader) + sizeof(DhcpPacket));
+        offer.dhcp.op = 2;
+        offer.dhcp.htype = 1;
+        offer.dhcp.hlen = sizeof(primary.mac.b);
+        offer.dhcp.xid = g_dhcpXid;
+        offer.dhcp.yiaddr = lease;
+        offer.dhcp.magic = DHCP_MAGIC;
+        memcpy(offer.dhcp.chaddr, primary.mac.b, sizeof(primary.mac.b));
+        const uint8_t options[] = {53,1,DHCP_OFFER,54,4,192,0,2,1,1,4,255,255,255,0,255};
+        memcpy(offer.dhcp.options, options, sizeof(options));
+        frameTransmitCalls = 0;
+        g_dhcpState = 1;
+        g_dhcpDone = false;
+        auto ignored = [&](NetIf& nic, const Wire& packet) {
+            NetReceive(&nic, &packet, sizeof(packet));
+            assert(g_dhcpState == 1 && !g_dhcpDone && !primary.ipAddr && frameTransmitCalls == 0);
+        };
+        ignored(secondary, offer);
+        auto bad = offer;
+        bad.ip.dstIp = Ipv4Addr(192, 0, 2, 21);
+        ignored(primary, bad);
+        bad = offer;
+        bad.udp.srcPort = htons(69);
+        ignored(primary, bad);
+        bad = offer;
+        bad.udp.length = htons(sizeof(UdpHeader) + DHCP_FIXED_BYTES - 1);
+        ignored(primary, bad);
+        bad = offer;
+        bad.dhcp.xid ^= 1;
+        ignored(primary, bad);
+        bad = offer;
+        bad.dhcp.chaddr[0] ^= 1;
+        ignored(primary, bad);
+        bad = offer;
+        bad.ip.flagsFrag = htons(0x2000);
+        ignored(primary, bad);
+        for (const auto invalid : {0u, 0xffffffffu, secondary.ipAddr, Ipv4Addr(192, 0, 2, 255),
+                                  Ipv4Addr(224, 0, 0, 1), Ipv4Addr(127, 0, 0, 1)}) {
+            bad = offer;
+            bad.ip.srcIp = invalid;
+            ignored(primary, bad);
+        }
+        HandleIpv4(reinterpret_cast<const uint8_t*>(&offer), sizeof(offer), true, 0);
+        assert(g_dhcpState == 1 && frameTransmitCalls == 0);
+
+        for (const auto destination : {lease, 0xffffffffu}) {
+            primary.ipAddr = 0;
+            g_dhcpState = 1;
+            g_dhcpDone = false;
+            frameTransmitCalls = 0;
+            auto packet = offer;
+            packet.ip.dstIp = destination;
+            NetReceive(&primary, &packet, sizeof(packet));
+            assert(g_dhcpState == 2 && !g_dhcpDone && !primary.ipAddr && frameTransmitCalls == 1);
+            packet.dhcp.options[2] = DHCP_ACK;
+            NetReceive(&primary, &packet, sizeof(packet));
+            assert(g_dhcpState == 3 && g_dhcpDone && primary.ipAddr == lease);
+            assert(primary.netmask == Ipv4Addr(255, 255, 255, 0));
+            NetReceive(&primary, &offer, sizeof(offer));
+            assert(g_dhcpState == 3 && frameTransmitCalls == 1);
+        }
+
+        primary.ipAddr = 0;
+        g_dhcpState = 0;
+        g_dhcpDone = false;
+        frameTransmitCalls = 0;
+        NetReceive(&primary, &offer, sizeof(offer));
+        assert(g_dhcpState == 0 && !g_dhcpDone && frameTransmitCalls == 0);
+        g_netIf = g_netIfs[0] = g_netIfs[1] = nullptr;
+        g_netIfCount = 0;
+    }
+    {
         const int listener = create();
         listenPort(listener, 1234, 2);
         auto syn = [&](uint16_t sourcePort, bool local) {
