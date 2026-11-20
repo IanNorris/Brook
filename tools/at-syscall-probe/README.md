@@ -8,7 +8,7 @@ then run the **same binary** on Linux and Brook as `unixwritecheck large` and
 every byte, reports requested versus accepted bytes, short-write/EAGAIN counts,
 write-call and overall durations, and checks the reader's actual exit status.
 A 30-second alarm bounds failure. These are diagnostic timings, not thresholds
-for a noisy host. See [the measured writev change](../../docs/unix-stream-writev-checkpoint.md).
+for a noisy host. See the measured writev change.
 
 Build the C probes in `nix-shell` using `$MUSL_CC -static -O2` (add
 `-pthread` for `fdstress.c` and `brkcheck.c`). Keep binaries in ignored `build/`.
@@ -78,7 +78,7 @@ absolute timeout clock modes, 3,200 private/shared-alias acquisitions, forced
 death of a raw owner without a robust list, and caught-signal restart without
 SA_RESTART. Every successful lock must exclude peers and name its actual TID.
 These checks do not certify PI condition-variable requeue or Linux realtime
-scheduler policies. See [the implementation checkpoint](../../docs/pi-futex-implementation.md).
+scheduler policies. See the implementation checkpoint.
 
 `map32check.c` targets x86-64. Build static and non-PIE, for example with
 `$MUSL_CC -O2 -static -fno-pie -no-pie map32check.c -o map32check`. It advances

@@ -37,4 +37,4 @@ Build `tools/vulkan-probe-pkg` and run its `vulkan-wsi-probe` using the candidat
 
 Keep an external observer/deadline. Probe success does not establish game
 rendering, audio or clean-exit acceptance. See the
-[checkpoint](../../docs/steam-api-and-present-wait-checkpoint.md).
+checkpoint.

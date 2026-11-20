@@ -1,7 +1,7 @@
 # Dell Apps launchers staged into an existing desktop: Quake II and VSCodium.
 #
 # Build:   nix-build nix/dell-app-launchers.nix --no-out-link
-# Stage:   tools/launcher-stage/make_bundle.py (see docs/desktop-game-launchers.md
+# Stage:   tools/launcher-stage/make_bundle.py (see tools/launcher-stage
 #          "Quake II and VSCodium Apps entries").
 #
 # The store closure is deliberately small (bash and the OpenAL config): the

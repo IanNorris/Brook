@@ -86,7 +86,7 @@ hardware guest execution, not substitutes for it.
 
 ## Coverage required before claiming all handlers
 
-The subsequent [signal target/snapshot checkpoint](signal-return-targets.md)
+The subsequent signal target/snapshot checkpoint
 strengthens SYSRET's full-range guard, validates signal targets and protects
 the action table. It adds independent native invalid-handler/copy/concurrency
 controls; complete static modeling of the syscall dispatcher is still open.

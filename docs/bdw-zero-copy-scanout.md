@@ -1,6 +1,6 @@
 # Broadwell zero-copy scanout (M6)
 
-**Status:** phase 1 is implemented behind `BROOK_BDW_ZERO_COPY_SCANOUT` (OFF by default; it requires `BROOK_BDW_SCANOUT_FLIP`) and a RAM-only runtime gate, `gpu zerocopy arm`. Host tests and a QEMU image check pass. It has not been run on the Dell. Branch `work/zero-copy`.
+**Status (November 2026):** in use on the Dell. Dell images enable `BROOK_BDW_ZERO_COPY_SCANOUT`, and the kernel arms it at boot. The design notes below date from the original implementation.
 
 **Goal:** the display (pipe A, plane A, `DSPASURF`) scans out the Vulkan desktop renderer's own output image, so a present costs a register write instead of a BCS copy.
 
@@ -267,7 +267,7 @@ These are unchanged from M3. `BdwScanoutPanicRestore` writes `DSPASURF=0` and wa
 - Buffer age in the compute/graphics fallback paths (they reset the ring today).
 - A display CRC or readback check of coherency.
 
-## 5. Dell test plan (Ian present; staged)
+## 5. Dell test plan (operator present; staged)
 
 Build: `nix-shell --run 'python3 scripts/build_dell_image.py --payload-id dell-zero-copy-<date> --output build/dell/pair-zero-copy --kernel-option BROOK_BDW_SCANOUT_FLIP=ON --kernel-option BROOK_BDW_PERSISTENT_SCANOUT_MAP=ON --kernel-option BROOK_BDW_ZERO_COPY_SCANOUT=ON --qemu-check'`. Deploy with `scripts/dell_deploy.py` (BROOK_ROOT = the registry holding the session).
 

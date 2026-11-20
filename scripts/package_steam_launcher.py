@@ -121,7 +121,7 @@ On the Dell, as uid 1000, after copying this directory there:
   /data/home/.local/share/brook/steam/brook-steam --probe
 Roll back:
   /nix/profile/bin/python3 install.py --rollback
-See docs/desktop-game-launchers.md, "Rootless Steam on the Dell".
+
 '''
 
 

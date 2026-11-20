@@ -32,7 +32,7 @@ bits (zero in v1), image length, block size 65536, root inode zero, table offset
 and counts, string offset/length, payload offset, a nonzero 16-byte identity,
 metadata checksum, header checksum, and sixteen reserved zero bytes. Metadata
 checksum covers bytes from offset 160 through the payload boundary, including
-zero padding. Header checksum covers bytes [0,136), including the metadata
+zero padding. Header checksum covers bytes 0,136), including the metadata
 checksum. Unknown features, unsupported versions and noncanonical table layouts
 fail closed. Image length may be smaller than its backing device, but may not
 exceed it. The reader caps the complete serialized index including header/padding
@@ -156,7 +156,7 @@ normalizes timestamps to zero. With `--source-metadata`, the read-only ext2
 exporter's complete namespace/content manifest supplies original UID/GID, mode
 and whole-second mtime without privileged host chown. Packing verifies content,
 hardlink identity and literal symlinks against it. See
-[the full-store workflow](full-store-compression-20261029.md).
+[the full-store workflow.
 It strips privileged mode bits. This is not an atomic
 snapshot of a changing source filesystem. Images are created exclusively and
 never overwrite an existing path. A failed build may leave an incomplete new

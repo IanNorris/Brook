@@ -1,6 +1,6 @@
 # Broadwell page flip and persistent scanout map (M3)
 
-Status: implemented behind two kernel options that are OFF by default. Each is also gated off at runtime on every boot. Not yet run on the Dell. Branch `work/m3-flip`.
+Status (November 2026): in use on the Dell. Dell images enable `BROOK_BDW_SCANOUT_FLIP` and `BROOK_BDW_PERSISTENT_SCANOUT_MAP`. The design notes below date from the original implementation.
 
 ## 1. Findings: how Brook sees the display today
 
@@ -137,7 +137,7 @@ After a disable, the GOP is re-armed and one full repaint is owed.
 
 **QEMU.** QEMU has no Intel display or GT, so none of the Intel paths run there. The guarded QEMU check (`--qemu-check`) proves the default image boots, repairs and reaches the desktop with the changed code compiled in. It does not prove probe values, the latch, the GGTT bind, display coherency or panic restore on hardware.
 
-## 6. Dell test plan (staged; Ian present for every flip-build boot)
+## 6. Dell test plan (staged; operator present for every flip-build boot)
 
 1. **Image with `BROOK_BDW_SCANOUT_FLIP=ON` and `BROOK_BDW_PERSISTENT_SCANOUT_MAP=ON`, no commands issued.** This must behave exactly like the baseline: every gate is off at boot, and no display register is written. Check that the boot is verified and that `gpu flip status` reports `active:false` with `probe.sampled:false`. Rollback: the previous slot, via `hardware_promote_slot.py` from the USB maintenance boot if needed.
 2. **Read-only: `gpu flip probe`, about three times, idle and under the Quake demo.** Expect `ddi_edp` bit 31 set, input select 0 or 4, `pipeconf_edp` with bits 31:30 set, and `psr_ctl` bit 31 clear. Expect `dspacntr` 0x98000000, stride 12800, surf and live both 0, and `pipesrc_a` 0x0c7f0707. Expect `frame1-frame0` ≈ 6 over about 100 ms. Also run `bridge hardware gpu-display-state` and compare. Any refusal ends M3 on this design until it is understood.

@@ -9,6 +9,7 @@ let
     f (if builtins.hasAttr "pkgs" (builtins.functionArgs f) then { inherit pkgs; } else {})) [
     "waylandd-pkg" "wayland-calc-pkg"
     "brook-settings-pkg" "brook-message-pkg" "brook-session-pkg"
+    "brook-apps-pkg"
   ];
   launchers = pkgs.runCommand "brook-hardware-launchers" {} ''
     mkdir -p $out/bin $out/share/applications

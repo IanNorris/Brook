@@ -157,7 +157,7 @@ workload controller takes matching backend/timer options and verifies live QOM
 state. Keep the default PipeWire/callback/200-ms reference separate from each
 variant. A 20-ms SDL callback control restored normal media pacing on Linux and
 improved Brook; defaults stay unchanged. See the
-[matched controls and limitations](../../docs/linux-audio-buffer-control.md).
+matched controls and limitations.
 
 `analyze_http_media_rates.py PHASE_DIRECTORY` supplies a separate server-causal
 rate analysis when the strict buffered clock model rejects a run. It preserves
@@ -168,7 +168,7 @@ frequency-discipline state without setting any clock.
 
 The browser controller now records `guest-scheduler.json` with a read-only
 per-thread `sched_getattr` inventory, readable kernel configuration and group
-metadata. The [live slice audit](../../docs/desktop-scheduler-tuning.md) verifies
+metadata. The live slice audit verifies
 2.8-ms requests on Linux 6.18.26 versus Brook EEVDF's 4-ms normal request,
 and records a callback/20-ms reference cohort. Unreadable debugfs values remain
 unknown; requests are not guarantees of uninterrupted execution time.
