@@ -135,16 +135,30 @@ class Tests(unittest.TestCase):
     def test_frame_options_reach_helper_argv_and_provenance_is_named(self):
         with patch('hardware_bulk_workflow.download',self.provenance_download):
             r=BulkRun(self.bridge,self.root/'frame').execute('session',self.key,'frame',request_id='c'*32,
-                frame_options={'flags':3,'window_id':4,'incarnation':77})
-        self.assertEqual(self.bridge.launches[0][1][-1],'o:3:4:77')
+                frame_options={'flags':1})
+        self.assertEqual(self.bridge.launches[0][1][-1],'o:1:0:0')
         frame=r['frame'];self.assertEqual((frame['source'],frame['scanout']),('gpu-present','zero-copy'))
         self.assertTrue(frame['cursor_composited']);self.assertEqual(frame['scanout_surface'],'0x1c40000')
+    def test_window_buffer_does_not_claim_scanout(self):
+        def window_buffer(*args):
+            reply=self.frame_download(*args)
+            reply['payload'].update(info_version=4,source_kind=7,plane=0,copy_us=12)
+            return reply
+        with patch('hardware_bulk_workflow.download',window_buffer):
+            r=BulkRun(self.bridge,self.root/'window').execute('session',self.key,'frame',
+                frame_options={'flags':2,'window_id':4,'incarnation':77})
+        self.assertEqual(self.bridge.launches[0][1][-1],'o:2:4:77')
+        frame=r['frame']
+        self.assertEqual((frame['source'],frame['scanout']),('window-buffer','not-applicable'))
+        self.assertIsNone(frame['scanout_surface'])
+        self.assertEqual(frame['copy_us'],12)
     def test_old_helper_payload_reports_no_provenance(self):
         with patch('hardware_bulk_workflow.download',self.frame_download):
             r=BulkRun(self.bridge,self.root/'frame').execute('session',self.key,'frame')
         self.assertIsNone(r['frame']['source']);self.assertEqual(len(self.bridge.launches[0][1]),4)
     def test_invalid_frame_options_prevent_launch(self):
-        for options in ({'flags':2},{'flags':1,'window_id':3,'incarnation':1},{'flags':8},{'flags':2,'window_id':300,'incarnation':1}):
+        for options in ({'flags':2},{'flags':1,'window_id':3,'incarnation':1},{'flags':8},{'flags':3,'window_id':4,'incarnation':77},
+                        {'flags':2,'window_id':300,'incarnation':1}):
             with self.subTest(options=options),self.assertRaises(ValueError):
                 BulkRun(self.bridge,self.root/'frame').execute('session',self.key,'frame',frame_options=options)
         with self.assertRaises(ValueError):

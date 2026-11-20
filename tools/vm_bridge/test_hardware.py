@@ -204,6 +204,7 @@ class HardwareTests(unittest.TestCase):
         session=self.attach();count=len(self.endpoint.commands)
         ref={'window_id':1,'incarnation':'5','session_generation':'g','guest_boot_id':'a'*32}
         for kwargs in [{'action':'put','cursor':True},{'action':'frame','window_area':'buffer'},
+                       {'action':'frame','window_area':'buffer','window':ref,'cursor':True},
                        {'action':'frame','window_area':'nope','window':ref},{'action':'frame','cursor':1},
                        {'action':'frame','window':{'window_id':1}}]:
             with self.subTest(kwargs=kwargs),self.assertRaises(ValueError):
@@ -231,6 +232,12 @@ class HardwareTests(unittest.TestCase):
         self.assertEqual(self.hardware.power(session,request,'shutdown')['state'],'ready')
         self.assertEqual(self.hardware.power(session,request,'status')['state'],'ready')
         self.assertEqual(self.hardware.power(session,request,'commit')['error'],-95)
+        self.assertEqual(self.endpoint.power_effects,1)
+    def test_force_apps_reuses_the_shutdown_request_identity(self):
+        session=self.attach();request='1'*32
+        self.hardware.power(session,request,'restart')
+        result=self.hardware.power(session,request,'force_apps')
+        self.assertEqual((result['request_id'],result['operation']),(request,'force_apps'))
         self.assertEqual(self.endpoint.power_effects,1)
     def test_hardware_power_unknown_delivery_is_recovered_without_replay(self):
         session=self.attach();request='2'*32;self.endpoint.power_drop=True

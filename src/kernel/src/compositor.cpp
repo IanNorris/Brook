@@ -16,6 +16,7 @@
 #include "../../shared/brook_debug_frame.h"
 #include "boot_logo.h"
 #include "kvmclock.h"
+#include "tsc_clock.h"
 #include "compositor_scene.h"
 #include "cursor_composition.h"
 #include "spinlock.h"
@@ -425,7 +426,7 @@ static void ExpireDebugFrameLocked()
         g_debugFrame={};
 }
 
-DebugFrameSnapshot CompositorRequestDebugFrame(uint64_t owner,bool overlay,bool overlayCursor)
+DebugFrameSnapshot CompositorRequestDebugFrame(uint64_t owner,bool overlay,bool overlayCursor,uint32_t flags)
 {
     CompositorMutexGuard guard(&g_debugFrameLock);
     ExpireDebugFrameLocked();
@@ -438,7 +439,7 @@ DebugFrameSnapshot CompositorRequestDebugFrame(uint64_t owner,bool overlay,bool 
     }
     g_debugFrame={};g_debugOverlayBands={};g_debugOverlaySurfaces={};g_debugFrame.token=++g_debugFrameNextToken;
     g_debugFrameOwner=owner;
-    g_debugFrameOverlay=overlay;g_debugFrameOverlayCursor=overlayCursor;g_debugFrameFlags=0;
+    g_debugFrameOverlay=overlay;g_debugFrameOverlayCursor=overlayCursor;g_debugFrameFlags=flags;
     g_debugFrame.state=DebugFrameState::Pending;
     g_debugFrameDeadline=ApicTickCount()+DEBUG_FRAME_LEASE_MS;
     CompositorWake();
@@ -461,14 +462,8 @@ DebugFrameSnapshot CompositorRequestDebugFrameOptions(uint64_t owner,uint32_t fl
                                                       uint64_t windowIncarnation,int* error)
 {
     if(error)*error=0;
-    if(!(flags&BROOK_DEBUG_FRAME_FLAG_WINDOW_BUFFER)){
-        auto frame=CompositorRequestDebugFrame(owner);
-        if(frame.state==DebugFrameState::Pending){
-            CompositorMutexGuard guard(&g_debugFrameLock);
-            if(g_debugFrame.token==frame.token)g_debugFrameFlags=flags&BROOK_DEBUG_FRAME_FLAG_CURSOR;
-        }
-        return frame;
-    }
+    if(!(flags&BROOK_DEBUG_FRAME_FLAG_WINDOW_BUFFER))
+        return CompositorRequestDebugFrame(owner,false,true,flags&BROOK_DEBUG_FRAME_FLAG_CURSOR);
     // The window's CPU buffer is copied now; the lease then behaves exactly
     // like a completed screen capture. The WM buffer lock is never taken
     // inside the capture lock: reserve the lease, copy under the WM lock
@@ -494,7 +489,9 @@ DebugFrameSnapshot CompositorRequestDebugFrameOptions(uint64_t owner,uint32_t fl
         g_debugFrameCleanAddress=0; // overlay must clear fully next time
         pixels=reinterpret_cast<uint32_t*>(g_debugFrameBuffer.raw());capacity=g_debugFramePages*1024;
     }
+    const uint64_t started=ElapsedClockNs();
     result=WmCopyDebugWindowBuffer(windowId,windowIncarnation,pixels,capacity,&width,&height,&scale);
+    const uint64_t elapsed=ElapsedClockNs();
     CompositorMutexGuard guard(&g_debugFrameLock);
     g_debugFrameWindowFill=false;
     if(g_debugFrame.token!=token || g_debugFrameOwner!=owner){if(error)*error=-116;return failed;}
@@ -503,6 +500,7 @@ DebugFrameSnapshot CompositorRequestDebugFrameOptions(uint64_t owner,uint32_t fl
     g_debugFrame.address=g_debugFrameBuffer.raw();g_debugFrame.tick=ApicTickCount();
     g_debugFrame.epoch=__atomic_load_n(&g_compositorEpoch,__ATOMIC_ACQUIRE);
     g_debugFrame.source=BROOK_DEBUG_FRAME_SOURCE_WINDOW_BUFFER;g_debugFrame.windowId=windowId;g_debugFrame.windowScale=scale;
+    g_debugFrame.copyUs=elapsed>started?uint32_t((elapsed-started)/1000):0;
     g_debugFrameDeadline=ApicTickCount()+DEBUG_FRAME_LEASE_MS;
     g_debugFrame.state=DebugFrameState::Ready;
     return g_debugFrame;

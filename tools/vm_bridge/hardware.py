@@ -193,6 +193,7 @@ class Hardware:
         if (window is not None or cursor or window_area!='frame') and action!='frame':
             raise ValueError('window, window_area and cursor apply to action frame only')
         if window is None and window_area!='frame':raise ValueError('window_area requires window')
+        if cursor and window_area=='buffer':raise ValueError('cursor requires a screen capture')
         options=None;row=None;rect=None
         if window is not None:
             self.ui.validate_reference(window)
@@ -200,7 +201,7 @@ class Hardware:
             # capture; the two reads are not atomic.
             row=find_window(self.ui.windows(session),window)
             if window_area=='buffer':
-                options={'flags':FRAME_WINDOW_BUFFER|(FRAME_CURSOR if cursor else 0),'window_id':window['window_id'],
+                options={'flags':FRAME_WINDOW_BUFFER,'window_id':window['window_id'],
                          'incarnation':int(window['incarnation'])}
             else:rect=window_rect(row,window_area)
         if cursor and options is None:options={'flags':FRAME_CURSOR}
@@ -262,8 +263,8 @@ class Hardware:
 
     def power(self,session,request_id,operation,**_):
         validate_id(request_id)
-        verbs={'shutdown':'shutdown','restart':'restart','status':'power_status','cancel':'cancel','commit':'commit'}
-        if not isinstance(operation,str) or operation not in verbs:raise ValueError('Expected shutdown, restart, status, cancel or commit')
+        verbs={'shutdown':'shutdown','restart':'restart','status':'power_status','cancel':'cancel','commit':'commit','force_apps':'force_apps'}
+        if not isinstance(operation,str) or operation not in verbs:raise ValueError('Expected shutdown, restart, status, cancel, commit or force_apps')
         with self.session_lock(session) as data:
             result=self.guest(data,f"bridge hardware power {request_id} {verbs[operation]} {data['guest_boot_id']}")
         if 'power_error' in result:raise GuestJobError(result['power_error'])
