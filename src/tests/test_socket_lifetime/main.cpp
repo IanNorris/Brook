@@ -2261,14 +2261,18 @@ int main() {
                 const int isolated = SockCreateOwned(AF_INET, type, 0, 3, 1000, 1000, 56);
                 auto address = localAddress(port, Ipv4Addr(127, 0, 0, 1));
                 assert(SockSetReuse(app, SocketReuse::Port, true) == 0);
-                assert(SockBind(app, &address, desktop) == -13);
-                assert(SockBind(isolated, &address, namespaceRoot) == -13);
-                assert(SockBind(service, &address, root) == 0);
+                assert(SockBind(isolated, &address, namespaceRoot) == 0);
                 if (type == SOCK_STREAM) {
+                    assert(SockBind(app, &address, desktop) == -13);
+                    assert(SockBind(service, &address, root) == 0);
                     assert(SockListen(service, 4, desktop) == -13);
                     assert(SockListen(service, 4, root) == 0);
+                    assert(SockListen(isolated, 4, namespaceRoot) == 0);
+                    assert(SockBind(app, &address, root) == -98);
+                } else {
+                    assert(SockBind(service, &address, desktop) == 0);
+                    assert(SockBind(app, &address, root) == -98);
                 }
-                assert(SockBind(app, &address, root) == -98);
                 for (int socket : {service, app, isolated}) SockClose(socket);
             }
         }
@@ -2358,6 +2362,125 @@ int main() {
         one.join(); two.join();
         assert((first == 0 && second == -98) || (first == -98 && second == 0));
         SockClose(a); SockClose(b);
+    }
+    {
+        // The first route on a shared subnet would choose interface A.
+        // Addresses assigned to either interface must still use local input.
+        NetIf first{}, second{};
+        first.ipAddr = Ipv4Addr(192, 0, 2, 1);
+        second.ipAddr = Ipv4Addr(192, 0, 2, 2);
+        first.netmask = second.netmask = Ipv4Addr(255, 255, 255, 0);
+        assert(!g_netIf && !g_netIfCount);
+        g_netIf = g_netIfs[0] = &first;
+        g_netIfs[1] = &second;
+        g_netIfCount = 2;
+        assert(NetIfForDst(second.ipAddr) == &first && NetFindOwnInterface(second.ipAddr) == &second);
+
+        const SocketBindActor desktop{1000, false};
+        const int socket = create(SOCK_DGRAM);
+        const auto custom = localAddress(44910, Ipv4Addr(192, 0, 2, 100));
+        const auto broadcast = localAddress(44910, Ipv4Addr(192, 0, 2, 255));
+        const auto ours = localAddress(44910, second.ipAddr);
+        assert(SockBind(socket, &custom, desktop) == -99);
+        assert(SockBind(socket, &broadcast, desktop) == -99);
+        assert(SockBind(socket, &ours, desktop) == 0);
+        SockSetNonblock(socket, true);
+
+        uint8_t packet[sizeof(UdpHeader) + 1]{};
+        auto& udp = *reinterpret_cast<UdpHeader*>(packet);
+        udp.length = htons(sizeof(packet));
+        udp.srcPort = htons(42000);
+        udp.dstPort = ours.sin_port;
+        packet[sizeof(UdpHeader)] = 0xa5;
+        assert(NetSendIpv4From(0, second.ipAddr, IP_PROTO_UDP, packet, sizeof(packet)) == 0);
+        uint8_t byte = 0;
+        SockAddrIn source{};
+        assert(SockRecvFrom(socket, &byte, sizeof(byte), &source) == 1 && byte == 0xa5);
+        assert(source.sin_addr == second.ipAddr && source.sin_port == udp.srcPort);
+
+        uint8_t wire[sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(packet)]{};
+        auto& ip = *reinterpret_cast<Ipv4Header*>(wire + sizeof(EthHeader));
+        ip.verIhl = 0x45;
+        ip.totalLen = htons(sizeof(Ipv4Header) + sizeof(packet));
+        ip.protocol = IP_PROTO_UDP;
+        ip.dstIp = second.ipAddr;
+        memcpy(wire + sizeof(EthHeader) + sizeof(Ipv4Header), packet, sizeof(packet));
+        for (uint32_t badSource : {0u, 0xffffffffu, broadcast.sin_addr, first.ipAddr, second.ipAddr,
+                                   Ipv4Addr(224, 0, 0, 1), Ipv4Addr(127, 0, 0, 1)}) {
+            ip.srcIp = badSource;
+            HandleIpv4(wire, sizeof(wire), false, 0);
+            assert(SockRecvFrom(socket, &byte, sizeof(byte), nullptr) == -11);
+        }
+        ip.srcIp = custom.sin_addr;
+        HandleIpv4(wire, sizeof(wire), false, 0);
+        assert(SockRecvFrom(socket, &byte, sizeof(byte), &source) == 1 && source.sin_addr == custom.sin_addr);
+        SockClose(socket);
+        g_netIf = g_netIfs[0] = g_netIfs[1] = nullptr;
+        g_netIfCount = 0;
+    }
+    {
+        const int listener = create();
+        listenPort(listener, 1234, 2);
+        auto syn = [&](uint16_t sourcePort, bool local) {
+            Ipv4Header ip{};
+            ip.dstIp = Ipv4Addr(127, 0, 0, 1);
+            ip.srcIp = local ? Ipv4Addr(127, 0, 0, 2) : Ipv4Addr(192, 0, 2, 70);
+            TcpHeader packet{};
+            packet.srcPort = htons(sourcePort);
+            packet.dstPort = htons(1234);
+            packet.seqNum = htonl(70);
+            packet.flags = TCP_SYN;
+            packet.dataOff = 5 << 4;
+            packet.window = htons(1000);
+            HandleTcp(&ip, &packet, sizeof(packet), 0, local);
+        };
+        syn(44001, true);
+        assert(g_sockets[listener].acceptQueueCount == 1);
+        const int local = g_sockets[listener].acceptQueue[0];
+        deliverControl(local, 71, g_sockets[local].tcpSndNxt, TCP_ACK, 1000);
+        assert(TcpCanAccept(g_sockets[local]));
+        syn(44002, true);
+        assert(g_sockets[listener].acceptQueueCount == 1);
+        syn(44003, false);
+        assert(g_sockets[listener].acceptQueueCount == 2);
+        const int remote = g_sockets[listener].acceptQueue[1];
+        deliverControl(remote, 71, g_sockets[remote].tcpSndNxt, TCP_ACK, 1000);
+        bool localIngress = true;
+        assert(SockAccept(listener, nullptr, &localIngress) == remote && !localIngress);
+        assert(SockAccept(listener, nullptr, &localIngress) == local && localIngress);
+        SockClose(remote);
+        SockClose(local);
+        SockClose(listener);
+    }
+    {
+        // A stalled peer gets neither the global asynchronous send path nor
+        // the ordinary 30-second send and 500-ms close budgets.
+        auto* sender = new Process{};
+        sender->pid = 41;
+        sender->refCount = 1;
+        currentProcess = sender;
+        int local = create();
+        setupTcp(local);
+        g_sockets[local].localIp = Ipv4Addr(127, 0, 0, 1);
+        g_sockets[local].remoteIp = Ipv4Addr(127, 0, 0, 2);
+        const uint64_t deadline = ticks + 17;
+        DebugChannelSetReplySock(local, deadline);
+        assert(DebugReplySocket() == local);
+        assert(DebugSendAll(local, "byte", 4) == -110 && ticks == deadline);
+        DebugChannelClearReplySock();
+        assert(!g_debugReplyDeadlines[local] && !DebugReplyOverride());
+        SockUnrefUntil(local, deadline);
+        assert(!published(local) && ticks == deadline);
+
+        local = create();
+        setupTcp(local);
+        g_sockets[local].localIp = Ipv4Addr(127, 0, 0, 1);
+        g_sockets[local].remoteIp = Ipv4Addr(127, 0, 0, 2);
+        const uint64_t closeBy = ticks + 11;
+        SockUnrefUntil(local, closeBy);
+        assert(!published(local) && ticks == closeBy);
+        currentProcess = nullptr;
+        delete sender;
     }
     assert(allocations == frees && g_socketRxBytes == 0);
     std::puts("socket lifetime: PASS");

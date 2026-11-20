@@ -394,9 +394,15 @@ struct TcpTimeWaitPort {
 static constexpr uint64_t TcpTimeWaitMs = 60000;
 static TcpTimeWaitPort g_tcpTimeWait[1024][4]; // bounded recent tuples per port bucket
 
-static bool BridgeReservedPort(uint16_t port)
+static bool BridgeReservedPort(const Socket& socket, uint16_t port)
 {
-    return ntohs(port) >= 1234 && ntohs(port) <= 1237;
+    return socket.type == SOCK_STREAM && socket.networkScope == 0 &&
+           ntohs(port) >= 1234 && ntohs(port) <= 1237;
+}
+
+static bool BridgeCommandListener(const Socket& listener)
+{
+    return listener.networkScope == 0 && listener.localPort == htons(1234);
 }
 
 static bool BindingReuse(uint8_t options, SocketReuse option)
@@ -593,7 +599,7 @@ static TcpTxSnapshot CaptureTcpTxLocked(Socket& s)
 }
 static int TcpSendSnapshot(Socket& s, const TcpTxSnapshot& snapshot, uint32_t seq,
                             uint8_t flags, const void* data, uint32_t dataLen,
-                            const char* why, bool asyncNeighbor=false);
+                            const char* why,bool asyncNeighbor=false,bool localOnly=false);
 
 // The caller retains a SocketBorrow across submission and retry scheduling.
 // Preserve any newer pending ACK and its earlier timer.
@@ -619,7 +625,8 @@ static int TcpSendSegment(Socket& s, uint8_t flags,
                            const char* why = "?");
 static void TcpSendSegmentAtSeq(Socket& s, uint32_t seq, uint8_t flags,
                                 const void* data, uint32_t dataLen,
-                                const char* why);
+                                const char* why,
+                                bool localOnly = false);
 static void TcpEnqueueData(Socket& s, const void* data, uint32_t len);
 
 // ---------------------------------------------------------------------------
@@ -1109,24 +1116,69 @@ static int NetSendIpv4Resolved(NetIf* nif, const MacAddr& dstMac,
     reinterpret_cast<EthHeader*>(frame)->dst = dstMac;
     return tryOnly ? nif->tryTransmit(nif,frame,frameLen) : nif->transmit(nif,frame,frameLen);
 }
+static NetIf* NetFindOwnInterface(uint32_t ip)
+{
+    if (!ip) return nullptr;
+    NetIf* result = nullptr;
+    const auto flags = IrqSpinLockAcquire(&g_interfaceViewLock);
+    for (uint32_t i = 0; i < g_netIfCount; ++i) {
+        NetIf* interface = g_netIfs[i];
+        if (interface && interface->ipAddr == ip) { result = interface; break; }
+    }
+    IrqSpinLockRelease(&g_interfaceViewLock, flags);
+    return result;
+}
+
+static bool Ipv4DirectedBroadcast(uint32_t ip, const NetIf& network)
+{
+    // /31 and /32 have no available broadcast addresses.
+    return network.ipAddr && network.netmask && (ntohl(network.netmask) & 3) == 0 &&
+           (ip | network.netmask) == 0xffffffffu &&
+           (ip & network.netmask) == (network.ipAddr & network.netmask);
+}
+
+static bool NetIpv4AcceptAddresses(uint32_t source, uint32_t destination, bool local)
+{
+    if (!local && (!source || source == 0xffffffffu || Ipv4IsLoopback(source) ||
+                   (ntohl(source) >> 28) == 0xe || Ipv4IsLoopback(destination))) return false;
+    bool forUs = destination == 0xffffffffu || (local && Ipv4IsLoopback(destination));
+    bool invalidSource = false;
+    const auto flags = IrqSpinLockAcquire(&g_interfaceViewLock);
+    for (uint32_t i = 0; i < g_netIfCount; ++i) {
+        const auto* interface = g_netIfs[i];
+        if (!interface || !interface->ipAddr) continue;
+        forUs |= destination == interface->ipAddr || Ipv4DirectedBroadcast(destination, *interface);
+        if (!local)
+            invalidSource |= source == interface->ipAddr || Ipv4DirectedBroadcast(source, *interface);
+    }
+    IrqSpinLockRelease(&g_interfaceViewLock, flags);
+    return forUs && !invalidSource;
+}
+
 static int NetSendIpv4From(uint32_t source, uint32_t dstIp, uint8_t proto,
-                          const void* payload, uint32_t payloadLen,uint64_t scope=0)
+                          const void* payload, uint32_t payloadLen,uint64_t scope=0,
+                          bool localOnly=false)
 {
     if(scope && (!Ipv4IsLoopback(dstIp) || (source && !Ipv4IsLoopback(source))))return -101;
+    const bool loopback = Ipv4IsLoopback(dstIp);
+    NetIf* own = scope || loopback ? nullptr : NetFindOwnInterface(dstIp);
+    if (localOnly && !loopback && !own) return -101;
 #ifdef BROOK_SOCKET_LIFETIME_TEST
     extern int SocketLifetimeTestTransmit(uint32_t, uint32_t, uint8_t, const void*, uint32_t);
-    return SocketLifetimeTestTransmit(source, dstIp, proto, payload, payloadLen);
+    // Exercise the real assigned-interface loopback path in the host fixture.
+    if (!own) return SocketLifetimeTestTransmit(source, dstIp, proto, payload, payloadLen);
 #else
     NetSendStackWatermark(dstIp, proto, payloadLen);
+#endif
 
-    NetIf* nif = scope ? nullptr : NetIfForDst(dstIp);
-    const bool loopback = Ipv4IsLoopback(dstIp);
-    source = Ipv4Source(source, dstIp, nif ? nif->ipAddr : 0);
-    if (!source || (!loopback && (!nif || !nif->ipAddr || Ipv4IsLoopback(source)))) return -1;
+    const bool local = loopback || own;
+    NetIf* nif = own ? own : scope ? nullptr : NetIfForDst(dstIp);
+    source = Ipv4Source(source, dstIp, own ? dstIp : nif ? nif->ipAddr : 0);
+    if (!source || (!local && (!nif || !nif->ipAddr || Ipv4IsLoopback(source)))) return -1;
 
-    // 127/8 never leaves the machine and works without a configured NIC.
-    // Connections to our physical interface address are delivered locally too.
-    if (loopback || dstIp == nif->ipAddr)
+    // Every assigned address uses the local input path regardless of which
+    // Ethernet interface the subnet routing lookup would have chosen.
+    if (local)
     {
         if (!NetIpv4PayloadFits(payloadLen)) return -3;
         uint32_t ipLen = sizeof(Ipv4Header) + payloadLen;
@@ -1180,7 +1232,6 @@ static int NetSendIpv4From(uint32_t source, uint32_t dstIp, uint8_t proto,
     const int result = NetNeighborTransmit(nif, nextHop, frame, frameLen);
     if (result == -2) NetCount(g_netCounters.sendNoNeighbor); // ARP failed
     return result;
-#endif
 }
 
 int NetSendIpv4(uint32_t dstIp, uint8_t proto, const void* payload, uint32_t payloadLen)
@@ -1262,27 +1313,9 @@ static void HandleIpv4(const uint8_t* frame, uint32_t len, bool local,uint64_t s
     uint8_t ihl = (ip->verIhl & 0x0F) * 4;
     uint16_t totalLen = ntohs(ip->totalLen);
 
-    if (totalLen < ihl) return;
-    if (sizeof(EthHeader) + totalLen > len) return;
-    // A physical NIC must never inject packets from/to the loopback range.
-    if (!local && (Ipv4IsLoopback(ip->srcIp) || Ipv4IsLoopback(ip->dstIp))) return;
-
-    // Check destination: accept if it targets any of our interface IPs,
-    // the global broadcast, or any of our subnet-directed broadcasts.
-    bool forUs = (ip->dstIp == 0xFFFFFFFF) || (local && Ipv4IsLoopback(ip->dstIp));
-    if (!forUs) {
-        for (uint32_t i = 0; i < g_netIfCount; i++) {
-            NetIf* n = g_netIfs[i];
-            if (!n) continue;
-            if (ip->dstIp == n->ipAddr) { forUs = true; break; }
-            if (n->netmask &&
-                (ip->dstIp | n->netmask) == 0xFFFFFFFF &&
-                (ip->dstIp & n->netmask) == (n->ipAddr & n->netmask)) {
-                forUs = true; break;
-            }
-        }
-    }
-    if (!forUs) return;
+    if ((ip->verIhl >> 4) != 4 || ihl < sizeof(Ipv4Header) || totalLen < ihl ||
+        sizeof(EthHeader) + totalLen > len) return;
+    if (!NetIpv4AcceptAddresses(ip->srcIp, ip->dstIp, local)) return;
 
     const uint8_t* payload = frame + sizeof(EthHeader) + ihl;
     uint32_t payloadLen = totalLen - ihl;
@@ -1557,12 +1590,12 @@ static void ArpAsyncProbeReceive(NetIf* nif,const void* frame,uint32_t length)
 static int NetSendIpv4AsyncNeighbor(uint32_t source,uint32_t destination,uint8_t protocol,
                                    const void* payload,uint32_t length,uint64_t scope=0)
 {
-    if(scope || Ipv4IsLoopback(destination))
-        return NetSendIpv4From(source,destination,protocol,payload,length,scope);
+    if(scope || Ipv4IsLoopback(destination) || NetFindOwnInterface(destination))
+        return NetSendIpv4From(source,destination,protocol,payload,length,scope,true);
     NetSingleInterfaceSnapshot view{},current{};
     if(!NetReadSingleInterface(&view))return -95;
     if(destination==view.ip)
-        return NetSendIpv4From(source,destination,protocol,payload,length);
+        return NetSendIpv4From(source,destination,protocol,payload,length,0,true);
     if(source!=view.ip)return -99;
     const uint32_t nextHop=(destination&view.netmask)==(view.ip&view.netmask)?destination:view.gateway;
     if(!nextHop)return -113;
@@ -2528,9 +2561,11 @@ int SockBind(int sockIdx, const SockAddrIn* addr, SocketBindActor actor)
     SocketBorrow borrow(sockIdx);
     if (!borrow) return -9;
     if (addr->sin_family != AF_INET) return -97; // EAFNOSUPPORT
-    if (BridgeReservedPort(addr->sin_port) && !actor.initialRoot) return -13;
     auto& socket = g_sockets[sockIdx];
-    if (socket.networkScope && addr->sin_addr && !Ipv4IsLoopback(addr->sin_addr)) return -99;
+    if (BridgeReservedPort(socket, addr->sin_port) && !actor.initialRoot) return -13;
+    if (addr->sin_addr && !Ipv4IsLoopback(addr->sin_addr) &&
+        (socket.networkScope || (!actor.initialRoot && !NetFindOwnInterface(addr->sin_addr))))
+        return -99; // EADDRNOTAVAIL
     SpinLockAcquire(&socket.lock);
     const int result = socket.bound ? -22 : PublishPort(sockIdx, addr->sin_addr, addr->sin_port, actor);
     SpinLockRelease(&socket.lock);
@@ -2749,7 +2784,7 @@ int SockRecvFrom(int sockIdx, void* buf, uint32_t len,
     return static_cast<int>(copyLen);
 }
 
-static void SockFinalize(int sockIdx)
+static void SockFinalize(int sockIdx, uint64_t localDeadline)
 {
     if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return;
     if (!g_sockUsed[sockIdx]) return;
@@ -2804,7 +2839,8 @@ static void SockFinalize(int sockIdx)
         // Publish the closing state first, and never overwrite its response.
         const auto snapshot = CaptureTcpTxLocked(s);
         SpinLockRelease(&s.lock);
-        TcpSendSnapshot(s, snapshot, seq, TCP_FIN | TCP_ACK, nullptr, 0, "close");
+        TcpSendSnapshot(s, snapshot, seq, TCP_FIN | TCP_ACK, nullptr, 0, "close", false,
+                        localDeadline != 0);
 
         // Wait up to 500ms for the peer to acknowledge our FIN.
         // We must use SchedulerBlock (not SchedulerYield) because SchedulerYield
@@ -2814,6 +2850,7 @@ static void SockFinalize(int sockIdx)
         Process* self = ProcessCurrent();
         if (self) {
             uint64_t deadline = ApicTickCount() + 500;
+            if (localDeadline && localDeadline < deadline) deadline = localDeadline;
             for (;;) {
                 SpinLockAcquire(&s.lock);
                 const bool waiting = s.tcpState == TcpState::FinWait1 ||
@@ -2823,7 +2860,8 @@ static void SockFinalize(int sockIdx)
                     break;
                 }
                 SetSocketWaiterLocked(s, self);
-                self->wakeupTick = ApicTickCount() + 50;
+                const uint64_t next = ApicTickCount() + 50;
+                self->wakeupTick = next < deadline ? next : deadline;
                 SpinLockRelease(&s.lock);
                 SchedulerBlock(self);
             }
@@ -2878,7 +2916,7 @@ void SockRef(int sockIdx)
     (void)SockTryRef(sockIdx);
 }
 
-void SockUnref(int sockIdx)
+void SockUnrefUntil(int sockIdx, uint64_t localDeadline)
 {
     if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return;
     const uint64_t flags = IrqSpinLockAcquire(&g_socketRegistryLock);
@@ -2890,8 +2928,10 @@ void SockUnref(int sockIdx)
         }
     }
     IrqSpinLockRelease(&g_socketRegistryLock, flags);
-    if (finalize) SockFinalize(sockIdx);
+    if (finalize) SockFinalize(sockIdx, localDeadline);
 }
+
+void SockUnref(int sockIdx) { SockUnrefUntil(sockIdx, 0); }
 
 // Direct close callers own exactly one reference, just like FD/queue teardown.
 void SockClose(int sockIdx) { SockUnref(sockIdx); }
@@ -3340,7 +3380,7 @@ static bool TcpDrainOoo(Socket& s)
 
 static int TcpSendSnapshot(Socket& s, const TcpTxSnapshot& snapshot, uint32_t seq, uint8_t flags,
                                 const void* data, uint32_t dataLen,
-                                const char* why,bool asyncNeighbor)
+                                const char* why,bool asyncNeighbor,bool localOnly)
 {
     uint8_t options[8];
     uint32_t optLen = TcpWriteSynOptions(flags, snapshot.windowScale, options);
@@ -3367,7 +3407,7 @@ static int TcpSendSnapshot(Socket& s, const TcpTxSnapshot& snapshot, uint32_t se
     tcp->checksum = TcpChecksum(snapshot.localIp, snapshot.remoteIp, buf, tcpLen);
 
     int sendResult = asyncNeighbor ? NetSendIpv4AsyncNeighbor(snapshot.localIp,snapshot.remoteIp,IP_PROTO_TCP,buf,tcpLen,s.networkScope)
-                                   : NetSendIpv4From(snapshot.localIp,snapshot.remoteIp,IP_PROTO_TCP,buf,tcpLen,s.networkScope);
+                                   : NetSendIpv4From(snapshot.localIp,snapshot.remoteIp,IP_PROTO_TCP,buf,tcpLen,s.networkScope,localOnly);
     if (sendResult != 0) {
         if(!asyncNeighbor || sendResult!=-11){TcpTotalAdd(g_tcpTotals.sendFailures,1);SerialPrintf("tcp: send failed flags=0x%02x err=%d\n", flags, sendResult);}
     } else {
@@ -3395,12 +3435,12 @@ static int TcpSendSnapshot(Socket& s, const TcpTxSnapshot& snapshot, uint32_t se
 
 static void TcpSendSegmentAtSeq(Socket& s, uint32_t seq, uint8_t flags,
                                 const void* data, uint32_t dataLen,
-                                const char* why)
+                                const char* why, bool localOnly)
 {
     SpinLockAcquire(&s.lock);
     const auto snapshot = CaptureTcpTxLocked(s);
     SpinLockRelease(&s.lock);
-    TcpSendSnapshot(s, snapshot, seq, flags, data, dataLen, why);
+    TcpSendSnapshot(s, snapshot, seq, flags, data, dataLen, why, false, localOnly);
 }
 
 static int TcpSendSegment(Socket& s, uint8_t flags,
@@ -3469,6 +3509,14 @@ static int EvictStaleSynRecvLocked(Socket& listener, uint64_t now)
         return childIdx;
     }
     return -1;
+}
+
+// The command bridge always leaves one pending position for a packet
+// received from a NIC. Test both before allocating a child and at publish.
+static bool AcceptQueueHasRoom(const Socket& listener, bool localIngress)
+{
+    const int remoteReserve = localIngress && BridgeCommandListener(listener) ? 1 : 0;
+    return listener.listening && listener.acceptQueueCount < listener.listenBacklog - remoteReserve;
 }
 
 static void PruneAcceptQueue(Socket& listener)
@@ -3716,11 +3764,13 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len,uint64_t 
             // closing its active FD; dead queue entries must not refuse a SYN.
             PruneAcceptQueue(s);
             uint64_t queueFlags = IrqSpinLockAcquire(&g_acceptQueueLock);
-            bool full = !s.listening || s.acceptQueueCount >= s.listenBacklog;
-            // Half-open children count against the small backlog (2 for the
-            // debug listener); stale ones must not lock out new clients.
-            const int evicted = full && s.listening ? EvictStaleSynRecvLocked(s, ApicTickCount()) : -1;
-            if (evicted >= 0) full = false;
+            bool full = !AcceptQueueHasRoom(s, localIngress);
+            // A local SYN cannot evict a pending remote handshake to make
+            // room for itself. Normal listeners retain stale-child eviction.
+            const bool canEvict = !(localIngress && BridgeCommandListener(s));
+            const int evicted = full && s.listening && canEvict
+                              ? EvictStaleSynRecvLocked(s, ApicTickCount()) : -1;
+            if (evicted >= 0) full = !AcceptQueueHasRoom(s, localIngress);
             IrqSpinLockRelease(&g_acceptQueueLock, queueFlags);
             if (evicted >= 0) { NetCount(g_netCounters.synRecvEvicted); SockUnref(evicted); }
             if (full) {
@@ -3795,7 +3845,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len,uint64_t 
             // successful publication must be our last access to this child.
             queueFlags = IrqSpinLockAcquire(&g_acceptQueueLock);
             SpinLockAcquire(&child.lock);
-            bool publish = s.listening && s.acceptQueueCount < s.listenBacklog
+            bool publish = AcceptQueueHasRoom(s, child.peerLocalIngress)
                            && !RetireAbandonedQueuedChild(child, ApicTickCount())
                            && (child.tcpState == TcpState::SynRecv
                                || child.tcpState == TcpState::Established
@@ -3879,7 +3929,9 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
         ++g_tcpAsyncEpoch[sockIdx];
     }
 
-    const uint32_t source = Ipv4Source(s.localIp, destination, g_netIf ? g_netIf->ipAddr : 0);
+    const uint32_t primary = !s.networkScope && NetFindOwnInterface(destination)
+                           ? destination : g_netIf ? g_netIf->ipAddr : 0;
+    const uint32_t source = Ipv4Source(s.localIp, destination, primary);
     if (!s.bound) {
         const int error = PublishPort(sockIdx, s.type == SOCK_STREAM ? source : 0, 0,
                                       {s.identity.uid, false});
@@ -3988,7 +4040,7 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
 
 static int TcpWaitForDataAck(Socket& s, int sockIdx,
                              uint32_t seq, const uint8_t* data, uint32_t len,
-                             uint64_t operationDeadline = 0)
+                             uint64_t operationDeadline = 0, bool localOnly = false)
 {
 
     Process* self = SchedulerCurrentProcess();
@@ -4043,7 +4095,7 @@ static int TcpWaitForDataAck(Socket& s, int sockIdx,
         if (now >= nextRetransmit) {
             retransmits++;
             TcpSendSegmentAtSeq(s, seq, TCP_ACK | TCP_PSH, data, len,
-                                "data-retry");
+                                "data-retry", localOnly);
             uint64_t backoff = 200ULL << (retransmits < 4 ? retransmits : 4);
             nextRetransmit = now + backoff;
             continue;
@@ -4444,11 +4496,12 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const TcpSendSource& so
     }
 }
 
-static int SockSendImpl(int sockIdx, const TcpSendSource& source, uint32_t len)
+static int SockSendImpl(int sockIdx, const TcpSendSource& source, uint32_t len,
+                        uint64_t localDeadline = 0)
 {
     if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return -1;
     Process* self = SchedulerCurrentProcess();
-    const uint64_t deadline = ApicTickCount() + 30000;
+    const uint64_t deadline = localDeadline ? localDeadline : ApicTickCount() + 30000;
     TcpSendOwnership ownership(sockIdx, self);
     const int acquire = ownership.Acquire(deadline);
     if (acquire) return acquire;
@@ -4470,7 +4523,7 @@ static int SockSendImpl(int sockIdx, const TcpSendSource& source, uint32_t len)
     uint32_t sent = 0;
     uint8_t staged[ETH_MTU];
     if (!mss || mss > sizeof(staged)) return -22;
-    if ((g_tcpTwoPacketFlight || g_tcpFourPacketFlight || g_tcpAdaptiveFlight) && len)
+    if (!localDeadline && (g_tcpTwoPacketFlight || g_tcpFourPacketFlight || g_tcpAdaptiveFlight) && len)
         return TcpSendPacketFlight(s, self, source, len, mss, deadline,
                                    g_tcpAdaptiveFlight ? (g_tcpAdaptiveFlight16?16:8) : g_tcpFourPacketFlight ? 4 : 2,
                                    g_tcpAdaptiveFlight);
@@ -4498,9 +4551,11 @@ static int SockSendImpl(int sockIdx, const TcpSendSource& source, uint32_t len)
         uint32_t seq = s.tcpSndNxt;
         s.tcpSndNxt += chunk;
         SpinLockRelease(&s.lock);
-        TcpSendSegmentAtSeq(s, seq, TCP_ACK | TCP_PSH, staged, chunk, "data");
+        TcpSendSegmentAtSeq(s, seq, TCP_ACK | TCP_PSH, staged, chunk, "data",
+                            localDeadline != 0);
 
-        int ackStatus = TcpWaitForDataAck(s, sockIdx, seq, staged, chunk, deadline);
+        int ackStatus = TcpWaitForDataAck(s, sockIdx, seq, staged, chunk, deadline,
+                                         localDeadline != 0);
         if (ackStatus != 0)
             return sent ? static_cast<int>(sent) : ackStatus;
 
@@ -4526,6 +4581,13 @@ int SockSend(int sockIdx, const void* buf, uint32_t len)
 {
     const TcpSendSource source{static_cast<const uint8_t*>(buf), false, nullptr, 0};
     return g_tcpAsyncSend ? TcpSendAsync(sockIdx,source,len) : SockSendImpl(sockIdx,source,len);
+}
+
+int SockSendUntil(int sockIdx, const void* buf, uint32_t len, uint64_t deadline)
+{
+    if (!deadline) return -22;
+    const TcpSendSource source{static_cast<const uint8_t*>(buf), false, nullptr, 0};
+    return SockSendImpl(sockIdx, source, len, deadline);
 }
 
 int SockSendUser(int sockIdx, uint64_t address, uint32_t len)
@@ -4776,7 +4838,7 @@ int SockListen(int sockIdx, int backlog, SocketBindActor actor)
     const auto queueFlags = IrqSpinLockAcquire(&g_acceptQueueLock);
     SpinLockAcquire(&socket.lock);
     int error = 0;
-    if (BridgeReservedPort(socket.localPort) && !actor.initialRoot) error = -13;
+    if (BridgeReservedPort(socket, socket.localPort) && !actor.initialRoot) error = -13;
     else if (socket.tcpState != TcpState::Closed && socket.tcpState != TcpState::Listen) error = -22;
     else if (!socket.bound) error = PublishPort(sockIdx, 0, 0, actor);
     if (!error && !socket.listening) {
@@ -4825,37 +4887,40 @@ int SockAccept(int sockIdx, SockAddrIn* addr, bool* peerLocalIngress)
         int retiredCount = 0;
         int accepted = -1;
         uint64_t queueFlags = IrqSpinLockAcquire(&g_acceptQueueLock);
-        for (int qi = 0; qi < s.acceptQueueCount;) {
-            int childIdx = s.acceptQueue[qi];
-            bool valid = childIdx >= 0 && childIdx < static_cast<int>(MAX_SOCKETS) && g_sockUsed[childIdx];
-            bool discard = !valid;
-            bool accept = false;
-            if (valid) {
-                Socket& child = g_sockets[childIdx];
-                SpinLockAcquire(&child.lock);
-                discard = RetireAbandonedQueuedChild(child, ApicTickCount());
-                accept = !discard && TcpCanAccept(child);
-                if (discard || accept) {
-                    child.listenSockIdx = -1;
-                    if (accept && addr) {
-                        addr->sin_family = AF_INET;
-                        addr->sin_port = child.remotePort;
-                        addr->sin_addr = child.remoteIp;
+        for (bool remoteOnly = BridgeCommandListener(s); ; remoteOnly = false) {
+            for (int qi = 0; qi < s.acceptQueueCount;) {
+                int childIdx = s.acceptQueue[qi];
+                bool valid = childIdx >= 0 && childIdx < static_cast<int>(MAX_SOCKETS) && g_sockUsed[childIdx];
+                bool discard = !valid;
+                bool accept = false;
+                if (valid) {
+                    Socket& child = g_sockets[childIdx];
+                    SpinLockAcquire(&child.lock);
+                    discard = RetireAbandonedQueuedChild(child, ApicTickCount());
+                    accept = !discard && TcpCanAccept(child) && (!remoteOnly || !child.peerLocalIngress);
+                    if (discard || accept) {
+                        child.listenSockIdx = -1;
+                        if (accept && addr) {
+                            addr->sin_family = AF_INET;
+                            addr->sin_port = child.remotePort;
+                            addr->sin_addr = child.remoteIp;
+                        }
+                        if (accept && peerLocalIngress) *peerLocalIngress = child.peerLocalIngress;
                     }
-                    if (accept && peerLocalIngress) *peerLocalIngress = child.peerLocalIngress;
+                    SpinLockRelease(&child.lock);
                 }
-                SpinLockRelease(&child.lock);
+                if (!discard && !accept) { ++qi; continue; }
+                for (int j = qi; j < s.acceptQueueCount - 1; ++j)
+                    s.acceptQueue[j] = s.acceptQueue[j + 1];
+                --s.acceptQueueCount;
+                if (discard) {
+                    if (valid) retired[retiredCount++] = childIdx;
+                    continue;
+                }
+                accepted = childIdx; // queue reference transfers to caller
+                break;
             }
-            if (!discard && !accept) { ++qi; continue; }
-            for (int j = qi; j < s.acceptQueueCount - 1; ++j)
-                s.acceptQueue[j] = s.acceptQueue[j + 1];
-            --s.acceptQueueCount;
-            if (discard) {
-                if (valid) retired[retiredCount++] = childIdx;
-                continue;
-            }
-            accepted = childIdx; // queue reference transfers to caller
-            break;
+            if (accepted >= 0 || !remoteOnly) break;
         }
         IrqSpinLockRelease(&g_acceptQueueLock, queueFlags);
         for (int i = 0; i < retiredCount; ++i) SockUnref(retired[i]);
@@ -4986,26 +5051,46 @@ void DebugChannelInit()
 // Thread-local override for routing DebugChannelSend responses to
 // whichever socket initiated the command (port 1234 or outbound 9999).
 static uint16_t g_debugReplySockets[65536] = {}; // socket+1, scoped by kernel-thread PID
+static uint64_t g_debugReplyDeadlines[MAX_SOCKETS]; // live reply socket, read by its owner only
+
+static uint16_t DebugReplyOverride()
+{
+    Process* process = ProcessCurrent();
+    return process ? __atomic_load_n(&g_debugReplySockets[process->pid], __ATOMIC_ACQUIRE) : 0;
+}
+
 static int DebugReplySocket()
 {
-    Process* p=ProcessCurrent();
-    uint16_t value=p ? __atomic_load_n(&g_debugReplySockets[p->pid],__ATOMIC_ACQUIRE) : 0;
-    return value ? static_cast<int>(value)-1 : g_debugSockIdx;
+    const uint16_t value = DebugReplyOverride();
+    return value ? static_cast<int>(value) - 1 : g_debugSockIdx;
 }
-void DebugChannelSetReplySock(int sock) {
-    Process* p=ProcessCurrent();
-    if(p) __atomic_store_n(&g_debugReplySockets[p->pid],static_cast<uint16_t>(sock+1),__ATOMIC_RELEASE);
+
+void DebugChannelSetReplySock(int sock, uint64_t deadline)
+{
+    Process* process = ProcessCurrent();
+    if (!process || sock < 0 || sock >= static_cast<int>(MAX_SOCKETS)) return;
+    __atomic_store_n(&g_debugReplyDeadlines[sock], deadline, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_debugReplySockets[process->pid], static_cast<uint16_t>(sock + 1),
+                     __ATOMIC_RELEASE);
 }
-void DebugChannelClearReplySock() {
-    Process* p=ProcessCurrent();
-    if(p) __atomic_store_n(&g_debugReplySockets[p->pid],static_cast<uint16_t>(0),__ATOMIC_RELEASE);
+
+void DebugChannelClearReplySock()
+{
+    Process* process = ProcessCurrent();
+    if (!process) return;
+    const uint16_t value = __atomic_exchange_n(&g_debugReplySockets[process->pid], 0, __ATOMIC_ACQ_REL);
+    if (value) __atomic_store_n(&g_debugReplyDeadlines[value - 1], 0, __ATOMIC_RELAXED);
 }
 
 static int DebugSendAll(int sock, const char* data, uint32_t length)
 {
+    if (sock < 0 || sock >= static_cast<int>(MAX_SOCKETS)) return -9;
+    const uint64_t deadline = DebugReplyOverride() == sock + 1 ?
+        __atomic_load_n(&g_debugReplyDeadlines[sock], __ATOMIC_RELAXED) : 0;
     uint32_t sent = 0;
     while (sent < length) {
-        int result = SockSend(sock, data + sent, length - sent);
+        const int result = deadline ? SockSendUntil(sock, data + sent, length - sent, deadline)
+                                    : SockSend(sock, data + sent, length - sent);
         if (result <= 0) return result < 0 ? result : -104;
         if (static_cast<uint32_t>(result) > length - sent) return -5;
         sent += static_cast<uint32_t>(result);
