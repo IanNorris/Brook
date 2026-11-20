@@ -44,6 +44,8 @@
 #endif
 #if defined(BROOK_SSD_GUARDED_DESKTOP)
 #include "ac_shutdown_record.h"
+#endif
+#if defined(BROOK_SSD_AUTO_RECOVERY)
 #include "guard_checker_runner.h"
 #endif
 #if !defined(BROOK_HOST_TEST)
@@ -85,6 +87,52 @@ bool HardwarePayloadIdRead(char* id,uint32_t capacity) {
 }
 namespace {
 using Reply=BridgeReplyBuffer<DebugChannelSend>;
+#if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
+void RecoverySlotsReply()
+{
+    GuardRecoverySlotState state{};
+    const int result = GuardRecoverySlotStatus(state);
+    Reply reply;
+    reply.text("{\"slot_api\":1,\"available\":");
+    if (result) {
+        reply.text("false,\"errno\":");
+        reply.number(-int64_t(result));
+        reply.text("}\n");
+        reply.send();
+        return;
+    }
+
+    reply.text("true,");
+    reply.field("sequence", state.sequence);
+    reply.append(',');
+    reply.field("newest_generation", state.newestGeneration);
+    reply.text(",\"slots\":[");
+    constexpr char hex[] = "0123456789abcdef";
+    for (unsigned slot = 0; slot < 2; ++slot) {
+        if (slot) reply.append(',');
+        reply.append('{');
+        reply.field("generation", state.generations[slot]);
+        reply.append(',');
+        reply.field("starts", state.starts[slot]);
+        reply.text(",\"profile_rejected\":");
+        reply.text(state.profileRejected[slot] ? "true" : "false");
+        reply.text(",\"selector_sha256\":");
+        if (state.generations[slot]) {
+            reply.append('"');
+            for (auto byte : state.selectorDigests[slot]) {
+                reply.append(hex[byte >> 4]);
+                reply.append(hex[byte & 15]);
+            }
+            reply.append('"');
+        } else {
+            reply.text("null");
+        }
+        reply.append('}');
+    }
+    reply.text("]}\n");
+    reply.send();
+}
+#endif
 // Dell HDA fault record JSON (read-only copies taken under the bridge lock).
 void HdaRegistersJson(Reply& r,const char* name,const HdaDellStreamRegisters& g){
     r.text("\"");r.text(name);r.text("\":{\"valid\":");r.text(g.valid?"true":"false");
@@ -274,6 +322,12 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         if(*body=='@' || Prefix(body,guard)){
             DebugChannelSend("{\"boot_error\":\"Nested request envelopes are unsupported\"}\n");return true;
         }
+#if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
+        if (!strcmp(body, "bridge slot status")) {
+            RecoverySlotsReply();
+            return true;
+        }
+#endif
         DebugHandleCommand(body,length-46);return true;
     }
     if(!strcmp(command,"bridge hardware caps")){
