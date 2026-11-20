@@ -4,6 +4,7 @@
 #include <initializer_list>
 #include "taskbar_volume.h"
 #include "desktop_disk_popup.h"
+#include "desktop_stats_popup.h"
 using namespace brook;
 #define CHECK(x) do {if(!(x)){std::fprintf(stderr,"FAIL %d: %s\n",__LINE__,#x);std::abort();}} while(0)
 
@@ -141,8 +142,50 @@ static void checkDiskVolumes() {
     CHECK(DesktopDiskPageStep(8, 24, 5, 3) == 11);
 }
 
+static void checkDetailedStats() {
+    uint8_t usage = 0;
+    CHECK(DesktopCpuDelta({100, 200}, {120, 260}, usage) == 80 && usage == 25);
+    CHECK(DesktopCpuDelta({100, 100}, {100, 120}, usage) == 20 && usage == 0);
+    CHECK(DesktopCpuDelta({120, 0}, {100, 0}, usage) == 0 && usage == DetailedNoPercent);
+    CHECK(DesktopCpuDelta({100, 100}, {100, 100}, usage) == 0 && usage == DetailedNoPercent);
+
+    CHECK(DesktopStatsScrollOffset(-100, 48) == 0);
+    CHECK(DesktopStatsScrollOffset(24, 48) == 24);
+    CHECK(DesktopStatsScrollOffset(0x7fffffffffffffffLL, 48) == 48);
+    CHECK(DesktopStatsScrollOffset(42, 0) == 0);
+    DesktopDetailedStats memory{};
+    memory.total = 1000;
+    memory.used = 700;
+    memory.available = 400;
+    memory.cached = 250;
+    memory.kernel = 120;
+    auto regions = DesktopMemoryUsageRegions(memory);
+    CHECK(regions.other == 330 && regions.cache == 150 && regions.kernel == 120 && regions.available == 400);
+    memory.available = 1300;
+    regions = DesktopMemoryUsageRegions(memory);
+    CHECK(regions.other == 0 && regions.cache == 0 && regions.kernel == 0 && regions.available == 1000);
+    memory.available = 0;
+    memory.cached = 500;
+    memory.kernel = 400;
+    regions = DesktopMemoryUsageRegions(memory);
+    CHECK(regions.other == 0 && regions.cache == 500 && regions.kernel == 200 && regions.available == 300);
+    CHECK(DesktopTaskDelta({18, 200}, {18, 225}) == 25);
+    CHECK(DesktopTaskDelta({18, 200}, {20, 225}) == 0); // reused TID
+    CHECK(DesktopTaskDelta({18, 200}, {18, 100}) == 0);
+    CHECK(DesktopTaskDelta({}, {18, 200}) == 0);
+    DesktopTopTask top[DetailedTopTasks]{};
+    DesktopRankTask(top, {"idle", 0, 8, 0});
+    DesktopRankTask(top, {"low", 8, 9, 9});
+    DesktopRankTask(top, {"middle", 12, 3, 13});
+    DesktopRankTask(top, {"high 2", 24, 7, 27});
+    DesktopRankTask(top, {"high 1", 24, 6, 27});
+    DesktopRankTask(top, {"middle 2", 10, 11, 11});
+    CHECK(top[0].tid == 6 && top[1].tid == 7 && top[2].tid == 3 && top[3].tid == 11);
+}
+
 int main() {
     checkDiskVolumes();
+    checkDetailedStats();
     checkGlyph();checkWheel();checkSlider();checkPopup();checkTooltipBox();checkTooltip();
     std::puts("test_taskbar_volume: ok");
     return 0;

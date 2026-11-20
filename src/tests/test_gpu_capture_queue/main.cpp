@@ -89,6 +89,8 @@ void WmVolumePopupGetRect(uint32_t,uint32_t,int32_t* x,int32_t* y,uint32_t* w,ui
 bool WmPointerCaptureActive(){return false;}
 void WmGetShellTrayGeometry(uint32_t, uint32_t, int32_t, int32_t, WmShellTrayGeometry& out) { out = {}; }
 void DesktopDiskSetVisible(bool) {}
+void DesktopStatsSetVisible(DesktopStatsPanel) {}
+DesktopStatsPanel WmDetailedStatsSelected() { return DesktopStatsPanel::None; }
 bool WmDiskFlyoutSelected() { return false; }
 bool WmTrayFlyoutRect(uint32_t,uint32_t,int32_t*,int32_t*,uint32_t*,uint32_t*){return false;}
 bool dockVisible=false;

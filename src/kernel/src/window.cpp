@@ -1024,6 +1024,7 @@ void WmSetActive(bool active)
     if (active) {
         LauncherStartWorker();
         DesktopDiskWorkerStart();
+        DesktopStatsWorkerStart();
     }
     { VfbGuard guard;SetWmActiveLocked(active); }
     if (active)
@@ -2684,7 +2685,7 @@ bool WmCaptureShellModel(const WmShellSurface& s, uint32_t screenW, uint32_t scr
     case WmShellSurfaceKind::Launcher: WmCaptureLauncher(screenW, screenH, mx, my, model); break;
     case WmShellSurfaceKind::VolumePopup: WmCaptureVolumePopup(screenW, screenH, mx, my, model); break;
     case WmShellSurfaceKind::TrayTooltip: WmCaptureTooltip(screenW, screenH, mx, my, model); break;
-    case WmShellSurfaceKind::TrayFlyout: WmCaptureTrayFlyout(s, screenW, screenH, mx, my, model); break;
+    case WmShellSurfaceKind::TrayFlyout: WmCaptureTrayFlyout(s, screenW, screenH, uptimeMs, mx, my, model); break;
     case WmShellSurfaceKind::PerformanceHud: WmCapturePerformanceHud(screenW, screenH, mx, my, model); break;
     case WmShellSurfaceKind::BootSummary: WmCaptureBootSummary(screenW, screenH, model); break;
     case WmShellSurfaceKind::Dock: WmCaptureDock(screenW, screenH, mx, my, model); break;

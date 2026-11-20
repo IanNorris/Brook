@@ -9,6 +9,7 @@
 #include "thermal_sampler.h"
 #include "taskbar_volume.h"
 #include "desktop_disk_popup.h"
+#include "desktop_stats_popup.h"
 
 #include "launcher_model.h"
 #include "chrome_tray.h"
@@ -254,6 +255,18 @@ ChromeDiskPopupLayout ChromeDiskPopupLayoutFor(const ChromeStyle&, DesktopRect a
 void ChromeBuildDiskPopup(const ChromeDiskPopupLayout&, const DesktopDiskPage&, uint64_t readRate,
                           uint64_t writeRate, bool pinned, int32_t mouseX, int32_t mouseY,
                           const ChromeStyle&, ChromeDisplayList&);
+
+struct ChromeStatsPopupLayout {
+    DesktopRect panel, pin, body, previous, next, scrollUp, scrollDown;
+    uint32_t coreRows;
+    int rowHeight, cpuHeight, contentOffset, scrollLimit;
+};
+ChromeStatsPopupLayout ChromeStatsPopupLayoutFor(const ChromeStyle&, DesktopRect anchor, int screenW,
+                                                 int taskbarY, DesktopStatsPanel, uint32_t cores,
+                                                 bool keepPinReachable = false, int contentOffset = 0);
+void ChromeBuildStatsPopup(const ChromeStatsPopupLayout&, DesktopStatsPanel, const DesktopDetailedStats&,
+                           uint32_t firstCoreRow, const DesktopIntervals<>*, uint64_t tick, bool pinned,
+                           int32_t mouseX, int32_t mouseY, const ChromeStyle&, ChromeDisplayList&);
 
 struct ChromePerformanceHudModel {
     DesktopRect rect;

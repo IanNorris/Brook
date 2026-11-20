@@ -148,6 +148,10 @@ void ShellServiceQueueTrayInput(const TrayInput& event) {
 bool ThermalReadSnapshot(ThermalSnapshot&) { return false; }
 static uint32_t fixtureDiskVolumes;
 void DesktopDiskWorkerStart() {}
+static uint32_t fixtureCpuCount = 4;
+void DesktopStatsWorkerStart() {}
+uint32_t DesktopStatsCoreCount() { return fixtureCpuCount; }
+void DesktopStatsRead(DesktopStatsPanel, DesktopDetailedStats&) {}
 uint32_t DesktopDiskVolumeCount() { return fixtureDiskVolumes; }
 uint32_t DesktopDiskReadPage(uint32_t first, uint32_t capacity, DesktopDiskPage& out) {
     out.total = fixtureDiskVolumes;
@@ -798,6 +802,68 @@ int main() {
         CHECK(fallback.panel.w > 0 && WmTrayFlyoutPress(fallback.pin.x, fallback.pin.y, sw, sh));
         CHECK(!WmTaskbarPopupPinned() && WmTrayFlyoutPress(10, 10, sw, sh) && !WmDiskFlyoutSelected());
         fixtureDiskVolumes = 0;
+
+        constexpr unsigned statMetrics[] = {0, 1, 4, 5};
+        constexpr DesktopStatsPanel statPanels[] = {DesktopStatsPanel::CpuMemory, DesktopStatsPanel::CpuMemory,
+            DesktopStatsPanel::Compositor, DesktopStatsPanel::App};
+        const uint32_t detailMask = BROOK_TASKBAR_CPU | BROOK_TASKBAR_MEMORY | BROOK_TASKBAR_COMPOSITOR | BROOK_TASKBAR_APP;
+        CHECK(WmSetTaskbarMetrics(detailMask));
+        for (unsigned i = 0; i < 4; ++i) {
+            fixtureCpuCount = DetailedCoreLimit;
+            const auto anchor = GetTaskbarLayout(sw, sh).metrics[statMetrics[i]];
+            CHECK(anchor.w > 0 && WmTrayFlyoutPress(anchor.x, anchor.y, sw, sh));
+            CHECK(WmDetailedStatsSelected() == statPanels[i]);
+            const auto popup = WmStatsPopupLayout(sw, sh, statPanels[i]);
+            CHECK(popup.panel.w > 0 && popup.panel.y >= 0);
+            CHECK(WmTrayFlyoutPress(popup.pin.x, popup.pin.y, sw, sh));
+            CHECK(WmTaskbarPopupPinned() && !WmTaskbarPopupPointerOwned(10, 10, sw, sh));
+            CHECK(!WmTrayFlyoutPress(10, 10, sw, sh));
+            if (statPanels[i] == DesktopStatsPanel::CpuMemory) {
+                CHECK(popup.coreRows > 0 && popup.next.w > 0 && popup.scrollLimit == 0);
+                const auto otherAnchor = GetTaskbarLayout(sw, sh).metrics[statMetrics[1 - i]];
+                CHECK(WmTrayFlyoutPress(otherAnchor.x, otherAnchor.y, sw, sh));
+                CHECK(WmDetailedStatsSelected() == DesktopStatsPanel::CpuMemory && WmTaskbarPopupPinned());
+                CHECK(WmStatsFlyoutScroll(popup.body.x, popup.body.y, -60, sw, sh) && g_cpuFirstRow == 0);
+                CHECK(WmStatsFlyoutScroll(popup.body.x, popup.body.y, -60, sw, sh) && g_cpuFirstRow == 1);
+                CHECK(WmTrayFlyoutPress(popup.next.x, popup.next.y, sw, sh));
+                CHECK(g_cpuFirstRow == 1 + popup.coreRows);
+                const uint32_t shortHeight = uint32_t(popup.panel.h - int(popup.coreRows + 1) * popup.rowHeight) +
+                    (sh - WmDesktopHeight(sh)) + 2 * WmMetric(8);
+                const auto shortPopup = WmStatsPopupLayout(sw, shortHeight, DesktopStatsPanel::CpuMemory);
+                CHECK(shortPopup.coreRows == 1 && shortPopup.scrollLimit > 0);
+                CHECK(shortPopup.panel.y >= 0 && shortPopup.panel.y + shortPopup.panel.h <= int(shortHeight));
+                CHECK(WmTrayFlyoutPress(shortPopup.scrollDown.x, shortPopup.scrollDown.y, sw, shortHeight));
+                CHECK(g_statsContentOffset > 0);
+                CHECK(WmStatsFlyoutScroll(shortPopup.body.x, shortPopup.body.y, -12000, sw, shortHeight));
+                CHECK(g_statsContentOffset == shortPopup.scrollLimit);
+                fixtureCpuCount = 4;
+            }
+            CHECK(kinds(s) >= 2 && WmCaptureShellModel(s[1], sw, sh, 0, -1, -1, pinSnapshot));
+            CHECK(pinSnapshot.statsPanel == statPanels[i] && pinSnapshot.popupPinned);
+            CHECK(pinSnapshot.firstCoreRow == 0);
+            if (i == 3) CHECK(WmSetTaskbarMetrics(BROOK_TASKBAR_CPU)); // the pinned panel is still reachable
+            const auto resized = WmStatsPopupLayout(sw, sh, statPanels[i]);
+            CHECK(WmTrayFlyoutPress(resized.pin.x, resized.pin.y, sw, sh) && !WmTaskbarPopupPinned());
+            CHECK(WmTrayFlyoutPress(10, 10, sw, sh) && !WmTrayFlyoutVisible());
+        }
+        const auto collapsed = ChromeStatsPopupLayoutFor(WmChromeStyle(), {400, 100, 30, 20}, sw, 100,
+                                                            DesktopStatsPanel::CpuMemory, 4, true);
+        CHECK(collapsed.panel.w > 0 && collapsed.body.h == 0 && collapsed.pin.w > 0);
+        const auto* originalMetrics = g_desktopMetrics;
+        for (const auto* scale : {&DesktopMetric100, &DesktopMetric150, &DesktopMetric200}) {
+            g_desktopMetrics = scale;
+            const auto tall = ChromeStatsPopupLayoutFor(WmChromeStyle(), {400, 2400, 30, 20}, sw, 2400,
+                                                        DesktopStatsPanel::CpuMemory, 64, true);
+            const int bottom = tall.panel.h - int(tall.coreRows + 1) * tall.rowHeight + 2 * scale->pixels(8);
+            const auto layout = ChromeStatsPopupLayoutFor(WmChromeStyle(), {400, bottom, 30, 20}, sw, bottom,
+                                                          DesktopStatsPanel::CpuMemory, 64, true, 10000);
+            CHECK(layout.coreRows == 1 && layout.scrollLimit > 0 && layout.contentOffset == layout.scrollLimit);
+            CHECK(layout.panel.y >= 0 && layout.panel.y + layout.panel.h <= bottom);
+            CHECK(layout.body.y + layout.body.h <= layout.scrollDown.y);
+            CHECK(layout.body.y - layout.contentOffset + layout.cpuHeight < layout.body.y + layout.body.h);
+        }
+        g_desktopMetrics = originalMetrics;
+        CHECK(WmSetTaskbarMetrics(metrics));
 
         fixtureTray.itemCount = fixtureTray.menuCount = 1;
         fixtureTray.menuOwner = fixtureTray.items[0].id = 11;
