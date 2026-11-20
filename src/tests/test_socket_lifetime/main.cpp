@@ -2524,10 +2524,10 @@ int main() {
     {
         const int listener = create();
         listenPort(listener, 1234, 2);
-        auto syn = [&](uint16_t sourcePort, bool local) {
+        auto syn = [&](uint16_t sourcePort, bool local, uint8_t wirePeer=70) {
             Ipv4Header ip{};
             ip.dstIp = Ipv4Addr(127, 0, 0, 1);
-            ip.srcIp = local ? Ipv4Addr(127, 0, 0, 2) : Ipv4Addr(192, 0, 2, 70);
+            ip.srcIp = local ? Ipv4Addr(127, 0, 0, 2) : Ipv4Addr(192, 0, 2, wirePeer);
             TcpHeader packet{};
             packet.srcPort = htons(sourcePort);
             packet.dstPort = htons(1234);
@@ -2553,6 +2553,30 @@ int main() {
         assert(SockAccept(listener, nullptr, &localIngress) == local && localIngress);
         SockClose(remote);
         SockClose(local);
+
+        // A repeated wire peer leaves capacity for an independent operator.
+        // A local connection still cannot take the reserved second slot.
+        syn(44011, false);
+        const int first = g_sockets[listener].acceptQueue[0];
+        assert(g_sockets[listener].acceptQueueCount == 1);
+        syn(44012, false);
+        assert(g_sockets[listener].acceptQueueCount == 1);
+        syn(44013, true);
+        assert(g_sockets[listener].acceptQueueCount == 1);
+        syn(44014, false, 71);
+        assert(g_sockets[listener].acceptQueueCount == 2);
+        const int independent = g_sockets[listener].acceptQueue[1];
+        deliverControl(first, 71, g_sockets[first].tcpSndNxt, TCP_ACK, 1000);
+        deliverControl(independent, 71, g_sockets[independent].tcpSndNxt, TCP_ACK, 1000);
+        assert(SockAccept(listener, nullptr, &localIngress) == first && !localIngress);
+        assert(SockAccept(listener, nullptr, &localIngress) == independent && !localIngress);
+        SockClose(first);
+        SockClose(independent);
+
+        // The cap applies to pending sockets, so sequential requests by the
+        // same approved operator continue to use this listener.
+        syn(44015, false);
+        assert(g_sockets[listener].acceptQueueCount == 1);
         SockClose(listener);
     }
     {

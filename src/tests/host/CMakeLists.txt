@@ -1158,3 +1158,11 @@ add_library(bridge_v3_interop SHARED
 target_include_directories(bridge_v3_interop PRIVATE "${BROOK_ROOT}/src/third_party/monocypher")
 add_test(NAME test_bridge_v3_interop COMMAND python3
     "${BROOK_ROOT}/tools/test_bridge_v3.py" "$<TARGET_FILE:bridge_v3_interop>")
+
+add_host_test(test_debug_bridge_v3_listener "${BROOK_ROOT}/src/kernel/src/debug_bridge_v3.cpp")
+target_compile_definitions(test_debug_bridge_v3_listener PRIVATE BROOK_HOST_TEST BROOK_BRIDGE_V3=1)
+target_compile_options(test_debug_bridge_v3_listener PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src"
+    "-iquote${BROOK_ROOT}/src/shared")
+target_include_directories(test_debug_bridge_v3_listener PRIVATE
+    "${BROOK_ROOT}/src/tests/test_debug_bridge_v3_listener" "${BROOK_ROOT}/src/third_party/monocypher")
+target_link_libraries(test_debug_bridge_v3_listener PRIVATE bridge_v3_interop)

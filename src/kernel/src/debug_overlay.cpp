@@ -432,7 +432,8 @@ void KernelConsoleSpawn()
 
 static constexpr uint16_t DEBUG_TCP_PORT = 1234;
 #if defined(BROOK_BRIDGE_V3)
-static constexpr uint64_t TCP_REMOTE_HELLO_TIMEOUT_MS = 4000;
+// An unproved peer may hold the single listener only for this interval.
+static constexpr uint64_t TCP_REMOTE_HELLO_TIMEOUT_MS = 2000;
 #else
 static constexpr uint32_t TCP_LINE_LEN   = 160;
 static constexpr uint32_t TCP_BATCH      = 32; // lines per send batch

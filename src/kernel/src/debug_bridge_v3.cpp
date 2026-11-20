@@ -3,8 +3,10 @@
 #include "debug_bridge_v3_policy.h"
 
 #include "apic.h"
+#include "build_info.h"
 #include "debug_epoch.h"
 #include "debug_presence.h"
+#include "kprintf.h"
 #include "monocypher.h"
 #include "net.h"
 #include "scheduler.h"
@@ -21,6 +23,7 @@ constexpr uint64_t ReplyTimeoutMs = 10000;
 constexpr uint32_t ReplyBytes = 4096;
 constexpr uint32_t ReplyLimit = 2 * 1024 * 1024;
 constexpr char ClientMagic[] = "BRKAUTH3";
+constexpr char Refusal[] = "BRKREFU3";
 constexpr char Banner[] = "=== Brook OS Debug Console ===\r\n";
 constexpr char Hex[] = "0123456789abcdef";
 
@@ -200,14 +203,19 @@ struct EphemeralKey {
 bool Authenticate(Session& session, const uint8_t (&client)[BrookBridgeV3ClientBytes],
                   BrookBridgeV3ClientHello& request, uint64_t deadline)
 {
-    if (!authAvailable || !BrookBridgeV3DecodeClient(&request, client) ||
+    if (!BrookBridgeV3DecodeClient(&request, client) ||
         request.protocol != BrookBridgeV3Command) return false;
 
+    const auto refused = [&]() {
+        WriteExact(session.socket, Refusal, sizeof(Refusal) - 1, deadline);
+        return false;
+    };
+    if (!authAvailable) return refused();
     const Operator* allowed = nullptr;
     for (unsigned i = 0; i < OperatorCount; ++i)
         if (BrookUpdateEqual(operators[i].id, request.operator_id, sizeof(request.operator_id)))
             allowed = &operators[i];
-    if (!allowed) return false;
+    if (!allowed) return refused();
     const bool currentBoot = !Nonzero(request.boot_id, sizeof(request.boot_id)) ||
         BrookUpdateEqual(bootId, request.boot_id, sizeof(bootId));
 
@@ -216,7 +224,7 @@ bool Authenticate(Session& session, const uint8_t (&client)[BrookBridgeV3ClientB
     if (!StrongRandomBytes(privateKey.bytes, sizeof(privateKey.bytes)) ||
         !Nonzero(privateKey.bytes, sizeof(privateKey.bytes)) ||
         !StrongRandomBytes(challenge.nonce, sizeof(challenge.nonce)) ||
-        !Nonzero(challenge.nonce, sizeof(challenge.nonce))) return false;
+        !Nonzero(challenge.nonce, sizeof(challenge.nonce))) return refused();
 
     memcpy(challenge.boot_id, bootId, sizeof(bootId));
     crypto_x25519_public_key(challenge.ephemeral, privateKey.bytes);
@@ -244,10 +252,13 @@ void DebugBridgeV3Initialize()
             entry.key[j] = static_cast<uint8_t>((HexDigit(hex[j * 2]) << 4) | HexDigit(hex[j * 2 + 1]));
         BrookBridgeV3OperatorId(entry.id, entry.key);
     }
-    if (!StrongRandomBytes(bootId, sizeof(bootId)) || !Nonzero(bootId, sizeof(bootId))) return;
-    char epoch[33];
-    EncodeHex(epoch, bootId, sizeof(bootId));
-    authAvailable = DebugEpochInitialize(epoch) && DebugEpochMatches(epoch) && OperatorCount;
+    if (StrongRandomBytes(bootId, sizeof(bootId)) && Nonzero(bootId, sizeof(bootId))) {
+        char epoch[33];
+        EncodeHex(epoch, bootId, sizeof(bootId));
+        authAvailable = DebugEpochInitialize(epoch) && DebugEpochMatches(epoch) && OperatorCount;
+    }
+    KPrintf("BRIDGE_V3_LOCAL build=%s policy_sha256=%s operators=%u ready=%u\n",
+            BuildGitHash(), policySha, OperatorCount, authAvailable ? 1u : 0u);
 }
 
 void DebugBridgeV3MeasureInitrd(const uint8_t* bytes, uint64_t length)
@@ -265,7 +276,8 @@ void DebugBridgeV3Serve(int socket, uint32_t peerAddress, bool local, uint64_t h
     uint8_t client[BrookBridgeV3ClientBytes];
     if (!ReadExact(socket, client, 1, helloDeadline)) return;
     if (client[0] != ClientMagic[0]) {
-        ServePublicCaps(socket, static_cast<char>(client[0]), local, helloDeadline);
+        if (client[0] == '@' || client[0] == 'b')
+            ServePublicCaps(socket, static_cast<char>(client[0]), local, helloDeadline);
         return;
     }
     constexpr uint32_t magicBytes = sizeof(ClientMagic) - 1;

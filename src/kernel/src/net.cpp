@@ -3601,6 +3601,24 @@ static bool AcceptQueueHasRoom(const Socket& listener, bool localIngress)
     return listener.listening && listener.acceptQueueCount < listener.listenBacklog - remoteReserve;
 }
 
+// One pending command connection per wire peer. The queue owns each child
+// reference, and the peer address/ingress are immutable while it is queued.
+// Caller holds g_acceptQueueLock.
+static bool AcceptQueuePeerAllowed(const Socket& listener, uint32_t peer, bool localIngress)
+{
+#if defined(BROOK_BRIDGE_V3) || defined(BROOK_SOCKET_LIFETIME_TEST)
+    if (localIngress || !BridgeCommandListener(listener)) return true;
+    for (int qi = 0; qi < listener.acceptQueueCount; ++qi) {
+        const int childIdx = listener.acceptQueue[qi];
+        if (childIdx < 0 || childIdx >= static_cast<int>(MAX_SOCKETS) || !g_sockUsed[childIdx])
+            continue;
+        const Socket& child = g_sockets[childIdx];
+        if (!child.peerLocalIngress && child.remoteIp == peer) return false;
+    }
+#endif
+    return true;
+}
+
 static void PruneAcceptQueue(Socket& listener)
 {
     int retired[Socket::ACCEPT_QUEUE_MAX];
@@ -3846,10 +3864,11 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len,uint64_t 
             // closing its active FD; dead queue entries must not refuse a SYN.
             PruneAcceptQueue(s);
             uint64_t queueFlags = IrqSpinLockAcquire(&g_acceptQueueLock);
-            bool full = !AcceptQueueHasRoom(s, localIngress);
+            const bool peerAllowed = AcceptQueuePeerAllowed(s, ip->srcIp, localIngress);
+            bool full = !peerAllowed || !AcceptQueueHasRoom(s, localIngress);
             // A local SYN cannot evict a pending remote handshake to make
             // room for itself. Normal listeners retain stale-child eviction.
-            const bool canEvict = !(localIngress && BridgeCommandListener(s));
+            const bool canEvict = peerAllowed && !(localIngress && BridgeCommandListener(s));
             const int evicted = full && s.listening && canEvict
                               ? EvictStaleSynRecvLocked(s, ApicTickCount()) : -1;
             if (evicted >= 0) full = !AcceptQueueHasRoom(s, localIngress);
@@ -3928,6 +3947,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len,uint64_t 
             queueFlags = IrqSpinLockAcquire(&g_acceptQueueLock);
             SpinLockAcquire(&child.lock);
             bool publish = AcceptQueueHasRoom(s, child.peerLocalIngress)
+                           && AcceptQueuePeerAllowed(s, child.remoteIp, child.peerLocalIngress)
                            && !RetireAbandonedQueuedChild(child, ApicTickCount())
                            && (child.tcpState == TcpState::SynRecv
                                || child.tcpState == TcpState::Established
