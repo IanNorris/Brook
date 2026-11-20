@@ -10,6 +10,8 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include "../src/shared/brook_system_esp.h"
 #include "../src/shared/update/recovery_guard.h"
@@ -35,11 +37,14 @@ static int read_record(int directory,const char* name,uint8_t* record,size_t siz
     return error?-1:0;
 }
 
-static int create_record(int directory,const char* name,const uint8_t* record,size_t size,dev_t device) {
+static int create_record(int directory,const char* name,const uint8_t* record,size_t size,dev_t device,
+                         bool* created=nullptr) {
+    if(created)*created=false;
     uint8_t check[SlotHealthBytes];
     if(size>sizeof(check))return -1;
     int fd=openat(directory,name,O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0644);
     if(fd<0)return -1;
+    if(created)*created=true;
     size_t done=0;
     int error=0;
     while(done<size) {
@@ -52,6 +57,18 @@ static int create_record(int directory,const char* name,const uint8_t* record,si
     if(close(fd))error=1;
     if(error || read_record(directory,name,check,size,device))return -1;
     return memcmp(record,check,size)?-1:0;
+}
+
+static int slot_capacity(int directory) {
+    struct statfs space{};
+    if(fstatfs(directory,&space))return -1;
+    if(space.f_bsize<=0){errno=EIO;return -1;}
+    const uint64_t cluster=uint64_t(space.f_bsize);
+    // Leave room for both directory entries even if FAT needs to grow the
+    // RECOVERY directory while staging and publishing.
+    const uint64_t needed=(SlotHealthBytes+cluster-1)/cluster+2;
+    if(uint64_t(space.f_bavail)<needed){errno=ENOSPC;return -1;}
+    return 0;
 }
 
 static int provision_slot_health(int directory,dev_t device,const char (&identity)[97],int& mutated) {
@@ -68,18 +85,58 @@ static int provision_slot_health(int directory,dev_t device,const char (&identit
             return true;
         }
     } file;
-    constexpr char name[]="BOOTSTAT.BIN";
-    struct stat st;
-    if(fstatat(directory,name,&st,AT_SYMLINK_NOFOLLOW)==0) {
-        if(read_record(directory,name,file.bytes,sizeof(file.bytes),device))return -1;
-        uint8_t digest[32];
-        BrookUpdateHash(reinterpret_cast<const uint8_t*>(identity),96,digest);
-        brook::GuardSlotJournal journal;
-        return brook::GuardSlotRead(file,digest,journal)?0:-1;
+    constexpr char name[]="BOOTSTAT.BIN",temp[]="BOOTSTAT.TMP";
+    struct stat existing{};
+    const bool present=fstatat(directory,name,&existing,AT_SYMLINK_NOFOLLOW)==0;
+    if(present) {
+        if(!S_ISREG(existing.st_mode)||existing.st_dev!=device)return -1;
+        if(existing.st_size) {
+            if(read_record(directory,name,file.bytes,sizeof(file.bytes),device))return -1;
+            uint8_t digest[32];
+            BrookUpdateHash(reinterpret_cast<const uint8_t*>(identity),96,digest);
+            brook::GuardSlotJournal journal;
+            return brook::GuardSlotRead(file,digest,journal)?0:-1;
+        }
+        // A zero-byte file from older, interrupted provisioning is equivalent
+        // to the absent journal. Leave it intact until the replacement is ready.
+    } else if(errno!=ENOENT)return -1;
+
+    struct stat stage{};
+    if(fstatat(directory,temp,&stage,AT_SYMLINK_NOFOLLOW)==0) {
+        uint8_t previous[SlotHealthBytes]{};
+        if(!S_ISREG(stage.st_mode)||stage.st_dev!=device||stage.st_size<0||
+           uint64_t(stage.st_size)>sizeof(previous)||
+           read_record(directory,temp,previous,size_t(stage.st_size),device)||
+           !BrookUpdateEqual(previous,file.bytes,sizeof(previous)))return -1;
+        if(unlinkat(directory,temp,0))return -1;
+        if(fsync(directory)){mutated=1;return -1;}
+    } else if(errno!=ENOENT)return -1;
+
+    if(slot_capacity(directory))return -1;
+    auto abandon=[&]() {
+        const int failure=errno;
+        if((unlinkat(directory,temp,0) && errno!=ENOENT) || fsync(directory))mutated=1;
+        errno=failure;
+        return -1;
+    };
+    bool created=false;
+    if(create_record(directory,temp,file.bytes,sizeof(file.bytes),device,&created))
+        return created?abandon():-1;
+
+    if(present) {
+        struct stat current{};
+        if(fstatat(directory,name,&current,AT_SYMLINK_NOFOLLOW) || !S_ISREG(current.st_mode) ||
+           current.st_dev!=device || current.st_ino!=existing.st_ino || current.st_size ||
+           unlinkat(directory,name,0))return abandon();
     }
-    if(errno!=ENOENT)return -1;
+    // Use the kernel's same-directory, no-replace transaction. A separately
+    // published final journal is never replaced, even by a racing root tool.
+    if(syscall(SYS_renameat2,directory,temp,directory,name,1 /* RENAME_NOREPLACE */))
+        return abandon();
     mutated=1;
-    return create_record(directory,name,file.bytes,sizeof(file.bytes),device);
+    uint8_t readback[SlotHealthBytes]{};
+    return fsync(directory) || read_record(directory,name,readback,sizeof(readback),device) ||
+        !BrookUpdateEqual(file.bytes,readback,sizeof(readback)) ? -1 : 0;
 }
 
 int main(int argc,char **argv) {
