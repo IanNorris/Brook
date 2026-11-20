@@ -5,6 +5,30 @@ Current state and immediate goal. Keep this short and current: replace stale lin
 _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review follow-up)._
 
 
+## Per-user launcher manifest and web-app titles (20 November 2026)
+
+- `work/user-app-manifest` accepts regular `user-apps.idx` files under
+  `/data/home/.local/share/brook` owned by uid 1000, with mode 0600 or 0644.
+  Profile executables are validated at load and dispatch. The kernel adds
+  uid 1000 and preserves trusted catalog precedence. `launcher status`
+  reports counts and errors, and the kernel console shows rejected lines.
+- Writers can atomically rename the new index into place and notify syscall
+  `0xB03`. Desktop-user requests coalesce at up to one per second. Opening
+  the launcher also refreshes the catalog.
+- The `X-Brook-WebApp` category token enables display names for matching
+  window app IDs in native chrome, taskbar and tooltips. Empty, matching
+  and hostname titles use the name alone. Other client titles follow the
+  name and an en dash. `hw_windows` exposes `raw_title` for diagnostics.
+- Implementation `edd5f871` and `eee62b61`. Release, 386 non-stress tests
+  and 734 chrome goldens passed. Guarded QEMU passed on attempt 2 after a
+  pre-selection firmware stall. A separate fixture verified catalog
+  rejections, two launches as uid 1000, manifest refresh with the launcher
+  closed, and a live web-app title update.
+- Pair `build/dell/pair-user-app-manifest-final`
+  (`dell-userapp-title-20261120`) includes Clearwater and the four Broadwell
+  options. The shell's en-dash glyph updates its boot package. No profile
+  changes. Evidence is under `build/launcher-user-manifest-evidence`.
+
 ## Launcher persistence (20 November 2026)
 
 - `work/launcher-persist` fixes the legacy temporary-file creation failure on
