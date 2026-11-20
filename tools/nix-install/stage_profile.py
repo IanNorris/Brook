@@ -388,9 +388,16 @@ def initialize(nix):
         active_generation(nix)
 
 
+def cache_capabilities(nix):
+    transfer = nix.parent / "data/.brook-transfer"
+    space = os.statvfs(transfer if transfer.is_dir() else transfer.parent)
+    unit = space.f_frsize or space.f_bsize
+    return {"bridge_cache_api": 1, "free_bytes": unit * space.f_bavail, "block_bytes": unit}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("apply", "rollback", "initialize"))
+    parser.add_argument("action", choices=("apply", "rollback", "initialize", "cache-capabilities"))
     parser.add_argument("transaction", nargs="?")
     parser.add_argument("plan", nargs="?", type=Path)
     parser.add_argument("signature", nargs="?", type=Path)
@@ -398,7 +405,7 @@ def main():
     args = parser.parse_args()
     if args.cache_bundle and args.action != "apply":
         parser.error("--cache-bundle requires apply")
-    if args.action != "initialize" and (not args.transaction or not TX.fullmatch(args.transaction)):
+    if args.action in ("apply", "rollback") and (not args.transaction or not TX.fullmatch(args.transaction)):
         parser.error("Expected a 32-digit hexadecimal transaction ID")
     fake = os.environ.get("BROOK_STAGE_ROOT")
     nix = Path(fake).resolve() / "nix" if fake else Path("/nix")
@@ -406,6 +413,9 @@ def main():
         expected_uid = 0 if args.action == "initialize" else DESKTOP_UID
         if os.geteuid() != expected_uid:
             parser.error(f"{args.action} must run as uid {expected_uid}")
+    if args.action == "cache-capabilities":
+        print(json.dumps(cache_capabilities(nix)))
+        return
     if args.action == "initialize":
         initialize(nix)
     elif args.action == "rollback":

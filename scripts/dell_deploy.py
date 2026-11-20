@@ -13,6 +13,7 @@ Usage (repo root, BROOK_ROOT set to the checkout holding the bridge session):
   python3 scripts/dell_deploy.py --session S --pair build/dell/pair-X --output build/dell/deploy-X
 """
 import argparse, hashlib, json, subprocess, sys, tempfile, uuid
+from contextlib import ExitStack
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -66,30 +67,45 @@ def stage_profile():
                  profile_files={path.name: sha(path) for path in files})
     arguments = ['/nix/bin/nix', 'stage-profile', action, tx]
     try:
-        for source in files:
-            bulk = BulkRun(bridge, journal.output / source.name)
-            receipt = bulk.execute(a.session, KEY, 'put', source=source)
-            if receipt['transfer']['sha256'] != journal.receipt['profile_files'][source.name]:
-                raise ValueError(f'{source.name} changed during transfer')
-            arguments.append(receipt['transfer']['guest_path'])
-        if a.profile_plan:
-            plan = json.loads(files[0].read_text())
-            if a.push_profile_cache or plan['cache']['brook'] is None:
-                from profile_cache_bundle import pack_cache
-                pushed = []
-                with tempfile.TemporaryDirectory(prefix='.cache-bundles-', dir=journal.output) as temp:
-                    for source in pack_cache(a.profile_plan / 'cache', plan, Path(temp)):
-                        digest = sha(source)
-                        bulk = BulkRun(bridge, journal.output / source.stem)
-                        receipt = bulk.execute(a.session, KEY, 'put', source=source)
-                        transfer = receipt['transfer']
-                        if transfer['sha256'] != digest:
-                            raise ValueError(f'{source.name} changed during transfer')
-                        pushed.append({'sha256': digest, 'guest_path': transfer['guest_path'],
-                                       'receipt': str(bulk.output / 'receipt.json')})
-                        journal.save(state='profile_cache_pushed', profile_cache_bundles=pushed)
-                        arguments += ['--cache-bundle', transfer['guest_path']]
-                        source.unlink()
+        with ExitStack() as resources:
+            bundles = []
+            if a.profile_plan:
+                plan = json.loads(files[0].read_text())
+                if a.push_profile_cache or plan['cache']['brook'] is None:
+                    from profile_cache_bundle import pack_cache, validate_push_capacity
+                    probe = uuid.uuid4().hex
+                    journal.save(state='profile_cache_probe_dispatched', cache_probe_job_id=probe)
+                    bridge.guest_run(a.session, probe, ['/nix/bin/nix', 'stage-profile', 'cache-capabilities'],
+                                     cwd='/tmp', uid=1000, wait_s=2)
+                    status = journal.wait_job(a.session, probe, lambda job: job.get('state') == 'completed',
+                                              timeout=60)
+                    journal.save(cache_probe_job=status)
+                    if status.get('exit', {}).get('code') != 0:
+                        raise ValueError('Guest stage helper lacks bridge cache capability; refresh it first')
+                    capabilities = json.loads(status['stdout']['text'])
+                    work = Path(resources.enter_context(tempfile.TemporaryDirectory(
+                        prefix='.cache-bundles-', dir=journal.output)))
+                    bundles = list(pack_cache(a.profile_plan / 'cache', plan, work))
+                    required = validate_push_capacity([*files, *bundles], capabilities)
+                    journal.save(state='profile_cache_preflight_verified', cache_required_bytes=required,
+                                 cache_capabilities=capabilities)
+
+            pushed = []
+            for source in [*files, *bundles]:
+                is_bundle = source in bundles
+                digest = sha(source) if is_bundle else journal.receipt['profile_files'][source.name]
+                bulk = BulkRun(bridge, journal.output / (source.stem if is_bundle else source.name))
+                receipt = bulk.execute(a.session, KEY, 'put', source=source)
+                transfer = receipt['transfer']
+                if transfer['sha256'] != digest:
+                    raise ValueError(f'{source.name} changed during transfer')
+                if is_bundle:
+                    pushed.append({'sha256': digest, 'guest_path': transfer['guest_path'],
+                                   'receipt': str(bulk.output / 'receipt.json')})
+                    journal.save(state='profile_cache_pushed', profile_cache_bundles=pushed)
+                    arguments.append('--cache-bundle')
+                    source.unlink()
+                arguments.append(transfer['guest_path'])
         journal.save(state='profile_job_dispatched')
         bridge.guest_run(a.session, job, arguments, cwd='/tmp', uid=1000, wait_s=2)
         result = journal.wait_job(a.session, job, lambda status: status.get('state') == 'completed',

@@ -60,3 +60,17 @@ def pack_cache(cache, plan, out, *, limit=CACHE_BUNDLE_LIMIT):
         if path.stat().st_size > limit:
             raise ValueError(f"Cache bundle exceeds its transfer bound: {path}")
         yield path
+
+
+
+def validate_push_capacity(paths, capabilities):
+    block = capabilities.get("block_bytes")
+    free = capabilities.get("free_bytes")
+    if (capabilities.get("bridge_cache_api") != 1 or type(block) is not int or block <= 0
+            or type(free) is not int or free < 0):
+        raise ValueError("Invalid bridge cache capacity response")
+    sizes = (path.stat().st_size for path in paths)
+    required = sum(((size + block - 1) // block) * block for size in sizes)
+    if required > free:
+        raise ValueError(f"Bridge cache needs {required} guest bytes; {free} available on /data")
+    return required
