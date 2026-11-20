@@ -24,6 +24,9 @@ void SchedulerSetCpuEnv(uint32_t cpuIndex, KernelCpuEnv* env);
 
 // Add a process to the ready queue.
 void SchedulerAddProcess(Process* proc);
+void SchedulerAddProcessWithSeccomp(Process* proc, Process* parent);
+struct SeccompFilter;
+int SchedulerAttachSeccomp(Process* process, SeccompFilter* filter, bool synchronize);
 
 // Remove a process from the ready queue.
 void SchedulerRemoveProcess(Process* proc);

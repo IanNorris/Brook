@@ -14,6 +14,7 @@
 #include "user_copy.h"
 #include "syscall_internal.h"
 #include "syscall_handlers.h"
+#include "seccomp.h"
 
 namespace brook {
 
@@ -185,7 +186,7 @@ int64_t sys_fork(uint64_t, uint64_t, uint64_t,
     child->forkR9  = parent->syscallUserR9;
     child->forkR10 = parent->syscallUserR10;
 
-    SchedulerAddProcess(child);
+    SchedulerAddProcessWithSeccomp(child, parent);
 
     DbgPrintf("FORK: parent pid=%u tgid=%u -> child pid=%u tgid=%u\n",
               parent->pid, parent->tgid, child->pid, child->tgid);
@@ -313,7 +314,7 @@ int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAddr,
         __atomic_store_n(&child->vforkParent, parent, __ATOMIC_RELEASE);
     }
 
-    SchedulerAddProcess(child);
+    SchedulerAddProcessWithSeccomp(child, parent);
 
     {
         if (!(flags & CLONE_THREAD))
@@ -653,10 +654,13 @@ int64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
         if(arg3 || arg4 || arg5)return -EINVAL;
         auto* process=ProcessCurrent();return process?ProcessCapabilityControl(process,unsigned(option),arg2):-ESRCH;
     }
+    if (option == 21 || option == 22) { // PR_GET/SET_SECCOMP
+        if (arg4 || arg5 || (option == 21 && (arg2 || arg3))) return -EINVAL;
+        return SeccompPrctl(option, arg2, arg3);
+    }
     // Remaining capability/secure-exec operations are explicit errors.
     switch (option) {
         case 7: case 8:   // GET/SET_KEEPCAPS
-        case 21: case 22: // GET/SET_SECCOMP
         case 23: case 24: // CAPBSET_READ/DROP
         case 27: case 28: // GET/SET_SECUREBITS
         case 47:         // CAP_AMBIENT

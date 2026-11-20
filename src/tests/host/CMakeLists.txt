@@ -684,6 +684,8 @@ target_compile_options(test_profiler_stack PRIVATE
 # Saved-ID transitions and all-or-nothing unprivileged credential changes.
 add_host_test(test_credential_ids)
 add_host_test(test_user_namespace)
+add_host_test(test_seccomp "${BROOK_ROOT}/src/kernel/src/seccomp_bpf.cpp")
+target_compile_options(test_seccomp PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_user_credentials)
 target_compile_options(test_user_credentials PRIVATE -UNDEBUG -DBROOK_HOST_TEST
     "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/src/shared/inc_km")

@@ -9,6 +9,7 @@
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "process.h"
+#include "seccomp.h"
 #include "robust_futex.h"
 #include "process_fs.h"
 #include <stddef.h>
@@ -101,7 +102,7 @@ struct ProcessOperationGuard {
 #include "process_anonymous_metadata.inc"
 
 // Exclude independently synchronized state from the raw process snapshot.
-// NNP is inherited under the credentials lock below; other credentials are
+// NNP is inherited by atomic load; other credentials are
 // refreshed there using the existing path. The FS pointer is acquired separately
 // and must never escape as a borrowed reference.
 static void CopyParentProcess(Process* child, Process* parent) {
@@ -183,6 +184,7 @@ static inline void FreeProcessStruct(Process* p)
                          haveSym ? sym : "?", off);
         }
 
+        SeccompRelease(SeccompLoad(p));
         ProcessFsClear(p);
         ProcessGroupsRelease(p->groups); p->groups = nullptr;
         UserNamespaceRelease(p->userNamespace);p->userNamespace=nullptr;
@@ -1702,7 +1704,7 @@ uint16_t CreateRemoteThread(Process* target, uint64_t entry,
                  thread->pid, target->tgid, entry, userRsp, argVA, argLen,
                  stackBase, stackBase + stackSize);
 
-    SchedulerAddProcess(thread);
+    SchedulerAddProcessWithSeccomp(thread, target);
     return thread->pid;
 }
 
@@ -1865,7 +1867,7 @@ static uint64_t ProcessExecImpl(Process* proc, const uint8_t* elfData, uint64_t 
     proc->suid = proc->euid; proc->sgid = proc->egid;
     if(proc->userNamespace) {
         const bool root=UserIdFromCanonical(proc->userNamespace,false,proc->uid)==0 || UserIdFromCanonical(proc->userNamespace,false,proc->euid)==0;
-        UserCapabilitiesExec(proc->capabilities,root,proc->noNewPrivs!=0);
+        UserCapabilitiesExec(proc->capabilities,root,ProcessGetNoNewPrivs(proc));
         if(UserIdFromCanonical(proc->userNamespace,false,proc->euid)!=0)proc->capabilities.effective=0;
     }
     SpinLockRelease(&g_credentialsLock);
@@ -2111,21 +2113,37 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
     // User-space context restoration (e.g. siglongjmp/CoreCLR) may bypass
     // sigreturn. Eligibility is defined by signal masks, never a handler flag.
 
-    uint64_t deliverable = (ProcessPendingSignals(proc) | PosixTimerPending(proc)) & ~proc->sigMask;
-    if (deliverable == 0) return timing.Result(syscallResult);
-
-    // Find lowest pending signal
-    int signum = __builtin_ctzll(deliverable) + 1;
-
+    int signum;
     SignalInfo signalInfo{};
-    if (!PosixTimerDequeue(proc, 1ULL << (signum - 1), &signalInfo)) {
-        if (!ProcessDequeueSignal(proc, signum, &signalInfo)) return timing.Result(syscallResult);
+    const uint32_t seccompTrap = proc->seccompTrap;
+    proc->seccompTrap = 0;
+    if (seccompTrap) {
+        // A filter trap is synchronous and takes priority over ordinary
+        // pending signals. Its siginfo carries the filter data and syscall.
+        signum = SeccompSignal;
+        signalInfo.si_signo = signum;
+        signalInfo.si_code = 1; // SYS_SECCOMP
+        signalInfo.si_errno = static_cast<uint16_t>(seccompTrap);
+        const auto syscallNumber = static_cast<int32_t>(proc->currentSyscallNum);
+        const uint64_t address = frame->rcx;
+        const uint32_t arch = SeccompX86_64;
+        memcpy(signalInfo._data, &address, sizeof(address));
+        memcpy(signalInfo._data + 8, &syscallNumber, sizeof(syscallNumber));
+        memcpy(signalInfo._data + 12, &arch, sizeof(arch));
+    } else {
+        const uint64_t deliverable = (ProcessPendingSignals(proc) | PosixTimerPending(proc)) & ~proc->sigMask;
+        if (deliverable == 0) return timing.Result(syscallResult);
+        signum = __builtin_ctzll(deliverable) + 1;
+        if (!PosixTimerDequeue(proc, 1ULL << (signum - 1), &signalInfo) &&
+            !ProcessDequeueSignal(proc, signum, &signalInfo)) return timing.Result(syscallResult);
     }
 
     uint16_t pid = proc->tgid;
     if (pid >= MAX_PROCESSES) return timing.Result(syscallResult);
 
-    const KernelSigaction sa = ReadSignalAction(pid,signum - 1);
+    KernelSigaction sa = ReadSignalAction(pid,signum - 1);
+    if (seccompTrap && (sa.handler == 1 || (proc->sigMask & (1ULL << (signum - 1)))))
+        sa = {}; // A blocked or ignored synchronous SIGSYS forces the default.
 
     // SIG_DFL (0) — default action
     if (sa.handler == 0)
