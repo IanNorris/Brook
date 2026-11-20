@@ -8431,6 +8431,41 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
     }
 
     // -----------------------------------------------------------------------
+    // wm dock — drive the side dock without a keyboard (bridge testing)
+    // -----------------------------------------------------------------------
+    else if (StrStartsWith(cmd, "wm dock")) {
+        const char* arg = cmd + 7;
+        while (*arg == ' ') arg++;
+        uint32_t n = 0;
+        bool ok = true;
+        if (NetStrEq(arg, "toggle")) WmDockToggle();
+        else if (NetStrEq(arg, "focused")) WmDockFocusedWindow();
+        else if (NetStrEq(arg, "dismiss")) ok = WmDockDismiss();
+        else if (NetStrEq(arg, "pin on")) WmDockSetPinned(true);
+        else if (NetStrEq(arg, "pin off")) WmDockSetPinned(false);
+        else if (StrStartsWith(arg, "select ")) { ParseUint(arg + 7, &n); ok = WmDockSelect(static_cast<int>(n)); }
+        else if (StrStartsWith(arg, "return ")) { ParseUint(arg + 7, &n); ok = WmDockReturnWindow(static_cast<int>(n)); }
+        else if (StrStartsWith(arg, "window ")) { ParseUint(arg + 7, &n); ok = WmDockWindow(static_cast<int>(n)); }
+        else if (*arg && !NetStrEq(arg, "status")) ok = false;
+        CompositorMarkDirty();
+        char buf[160];
+        int p = 0;
+        const char* head = ok ? "dock: ok entries=" : "dock: failed entries=";
+        for (int j = 0; head[j]; j++) buf[p++] = head[j];
+        p += UintToStr(buf + p, WmDockEntryCount());
+        const char* o = WmDockOpen() ? " open" : " closed";
+        for (int j = 0; o[j]; j++) buf[p++] = o[j];
+        const char* pin = WmDockPinned() ? " pinned" : " unpinned";
+        for (int j = 0; pin[j]; j++) buf[p++] = pin[j];
+        for (uint32_t e = 0; e < WmDockEntryCount() && p < 140; e++) {
+            buf[p++] = ' '; buf[p++] = 'w';
+            p += IntToStr(buf + p, WmDockEntryWindow(e));
+        }
+        buf[p++] = '\n';
+        DebugReplySend(buf, static_cast<uint32_t>(p));
+    }
+
+    // -----------------------------------------------------------------------
     // exec <path> — execute a shell script by path
     // -----------------------------------------------------------------------
     else if (StrStartsWith(cmd, "exec ")) {
