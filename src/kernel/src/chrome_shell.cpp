@@ -70,7 +70,7 @@ static int ChromeLoadBarWidth(const ChromeStyle& s)
 ChromeTaskbarLayout ChromeTaskbarLayoutFor(const ChromeStyle& s, uint32_t screenW, uint32_t screenH,
                                            const char* clockText, bool agent, uint32_t enabledMetrics,
                                            const int* ids, int total, int focused, const char* buildText,
-                                           bool compactHud, const char* const* labels)
+                                           bool compactHud, const char* const* labels, uint32_t trayAppCount)
 {
     ChromeTaskbarLayout l = {};
     l.nextIndex = -1;
@@ -133,6 +133,9 @@ ChromeTaskbarLayout ChromeTaskbarLayoutFor(const ChromeStyle& s, uint32_t screen
     reserve(l.network, trayTarget);
     // Leftmost fixed icon, so its appearance never moves the tray targets.
     if (agent) reserve(l.agent, Px(s, 16) + Px(s, 12));
+    while (l.trayAppCount < trayAppCount && l.trayAppCount < TrayItemLimit &&
+           reserve(l.trayApps[l.trayAppCount], Px(s, 36)))
+        ++l.trayAppCount;
     {
         DesktopRect separator{};
         if (reserve(separator, 2 * sepGap + 1))
@@ -467,6 +470,18 @@ void ChromeBuildTaskbar(const ChromeTaskbarModel& m, const ChromeStyle& s, Chrom
     target(l.terminal, false);
     centeredIcon(l.apps, m.appsIcon, mark);
     centeredIcon(l.terminal, m.terminalIcon, icon);
+    if (m.tray) for (uint32_t i = 0; i < l.trayAppCount; ++i) {
+        const auto& item = m.tray->items[i];
+        const auto& r = l.trayApps[i];
+        target(r, item.attention);
+        if (item.hasIcon) centeredIcon(r, item.icon, Px(s, 20));
+        else {
+            char initial[2] = {item.title[0] ? item.title[0] : '?', 0};
+            const int x = r.x + (r.w - s.TextWidth(initial, CF::Strong)) / 2;
+            dl.Text(CF::Strong, x, r.y + (r.h - s.Line(CF::Strong)) / 2, initial,
+                    p.taskText, r.w);
+        }
+    }
     const int labelY = l.textY;
     for (int i = 0; i < l.count; ++i) {
         const DesktopRect& r = l.buttons[i];
@@ -842,6 +857,50 @@ void ChromeBuildTooltip(const ChromeTooltipModel& m, const ChromeStyle& s, Chrom
     ChromeMaterialString(dl, s, p.x + pad, y, m.text, s.P().text, width, CF::Label);
     if (m.detail)
         ChromeMaterialString(dl, s, p.x + pad, y + line, m.detail, s.P().secondaryText, width, CF::Label);
+}
+
+void ChromeBuildAppTrayMenu(const ChromeTrayState& state, DesktopRect rect, int32_t mx, int32_t my,
+                            const ChromeStyle& s, ChromeDisplayList& dl)
+{
+    PanelFrame(dl, s, rect);
+    for (uint32_t i = 0; i < state.menuCount; ++i) {
+        const auto& row = state.menu[i];
+        const auto r = ChromeTrayMenuRowRect(s, rect, i);
+        const int pad = Px(s, 8);
+        if (row.separator) {
+            dl.Fill(r.x + pad, r.y + r.h / 2, r.w - 2 * pad, 1, HairlineColor(s, s.P().launcher));
+            continue;
+        }
+        if (row.enabled && r.contains(mx, my))
+            dl.MaterialRect(r, s.MaterialColor(s.P().taskHover), Px(s, 6));
+        ChromeElidedText(dl, s, CF::Label, r.x + pad, r.y + (r.h - s.Line(CF::Label)) / 2, row.label,
+                         row.enabled ? s.P().text : s.P().mutedText, r.w - 2 * pad - Px(s, 16));
+        if (row.submenu)
+            dl.Glyph(ChromeGlyph::ChevronRight, r.x + r.w - Px(s, 20), r.y + (r.h - Px(s, 16)) / 2, s.P().taskText);
+    }
+}
+
+void ChromeBuildNotice(const ChromeNotice& notice, DesktopRect rect, int32_t mx, int32_t my,
+                       const ChromeStyle& s, ChromeDisplayList& dl)
+{
+    PanelFrame(dl, s, rect);
+    const int x = rect.x + Px(s, 16), y = rect.y + Px(s, 12);
+    const auto close = ChromeNoticeCloseRect(s, rect);
+    const auto& p = s.P();
+    if (close.contains(mx, my)) dl.MaterialRect(close, s.MaterialColor(p.taskHover), Px(s, 6));
+    dl.Glyph(ChromeGlyph::Close, close.x + (close.w - Px(s, 16)) / 2,
+             close.y + (close.h - Px(s, 16)) / 2, p.taskText);
+    ChromeElidedText(dl, s, CF::Small, x, y, notice.app, p.mutedText, close.x - x);
+    ChromeElidedText(dl, s, CF::Strong, x, y + s.Line(CF::Small) + Px(s, 3), notice.title, p.text, close.x - x);
+    ChromeElidedText(dl, s, CF::Label, x, y + s.Line(CF::Small) + s.Line(CF::Strong) + Px(s, 8),
+                     notice.body, p.secondaryText, rect.w - Px(s, 32));
+    for (uint32_t i = 0; i < notice.actionCount; ++i) {
+        const auto r = ChromeNoticeActionRect(s, rect, notice.actionCount, i);
+        if (r.w <= 0) continue;
+        dl.MaterialRect(r, s.MaterialColor(r.contains(mx, my) ? p.taskHover : p.taskActive), Px(s, 6));
+        ChromeElidedText(dl, s, CF::Label, r.x + Px(s, 8), r.y + (r.h - s.Line(CF::Label)) / 2,
+                         notice.actions[i], p.text, r.w - Px(s, 16));
+    }
 }
 
 // ---------------------------------------------------------------------------

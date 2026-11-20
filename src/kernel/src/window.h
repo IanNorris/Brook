@@ -801,6 +801,10 @@ bool WmLauncherApplyPending();
 void WmLauncherToggle();
 
 // Is the launcher popup currently visible?
+struct WmShellTrayGeometry;
+void WmGetShellTrayGeometry(uint32_t sw, uint32_t sh, int32_t x, int32_t y, WmShellTrayGeometry&);
+bool WmShellTrayPointer(uint32_t sw, uint32_t sh, int32_t x, int32_t y,
+                       bool pressed, int button, int scroll);
 bool WmLauncherVisible();
 
 // Scroll the launcher by delta (negative = up, positive = down).

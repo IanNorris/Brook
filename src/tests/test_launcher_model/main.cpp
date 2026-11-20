@@ -358,6 +358,48 @@ void Organisation() {
     CHECK(m->CategoryOf(1) == -1 && m->View() == LauncherViewUnsorted);
 }
 
+void CatalogRefreshDuringInput() {
+    auto m = Fresh();
+    using TK = LauncherTargetKind;
+    const int doom = Idx(*m, "doom");
+    const LauncherTarget row{TK::Row, uint16_t(doom)};
+    CHECK(m->BeginPointer(row, 10, 10));
+    m->SetCatalog(Catalog, CatalogCount);
+    CHECK(m->PointerHeld());
+    const auto launch = m->ReleasePointer(row, false);
+    CHECK(launch.command == LauncherCommand::Launch && launch.app == doom);
+
+    m->Press({TK::Organise, 0}, false, 0, 0);
+    m->Press(row, false, 0, 0);
+    m->Press({TK::RenameApp, 0}, false, 0, 0);
+    Type(*m, "Classic");
+    m->SetCatalog(Catalog, CatalogCount);
+    CHECK(m->Marked(doom) && m->EditorOpen() && !strcmp(m->EditName(), "Classic"));
+    m->Key(LauncherKey::Enter);
+    CHECK(!strcmp(m->Name(doom), "Classic"));
+
+    const int games = Cat(*m, "Games");
+    m->Press({TK::Rail, uint16_t(m->RailRowFor(games))}, false, 0, 0);
+    m->Key(LauncherKey::BackTab);
+    const LauncherTarget rail{TK::Rail, uint16_t(m->RailRowFor(games))};
+    CHECK(m->BeginPointer(rail, 10, 10));
+    CHECK(m->MovePointer(rail, 34, 34, 6, false));
+    m->SetCatalog(Catalog, CatalogCount);
+    CHECK(m->PointerHeld() && m->Dragging() && m->Marked(doom));
+    CHECK(m->Key(LauncherKey::Delete).command == LauncherCommand::None);
+    CHECK(m->Key(LauncherKey::Rename).command == LauncherCommand::None);
+    CHECK(m->Key(LauncherKey::Up, 0, LauncherModAlt).command == LauncherCommand::None);
+    CHECK(Cat(*m, "Games") == games && !m->EditorOpen() && m->Dragging());
+    CHECK(m->Key(LauncherKey::Escape).command == LauncherCommand::Changed && !m->PointerHeld());
+
+    CHECK(m->BeginPointer(row, 10, 10));
+    LauncherApp reordered[CatalogCount];
+    for (uint32_t i = 0; i < CatalogCount; ++i) reordered[i] = Catalog[CatalogCount - i - 1];
+    m->SetCatalog(reordered, CatalogCount);
+    CHECK(!m->PointerHeld() && m->MarkedCount() == 0);
+    CHECK(m->ReleasePointer(row, false).command == LauncherCommand::None);
+}
+
 void Persistence() {
     auto m = Fresh();
     m->TogglePin(Idx(*m, "doom"));
@@ -443,6 +485,7 @@ int main() {
     PinsAndRecent();
     Reorder();
     Organisation();
+    CatalogRefreshDuringInput();
     Persistence();
     std::printf("LAUNCHER_MODEL_OK\n");
     return 0;

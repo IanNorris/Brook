@@ -87,6 +87,7 @@ bool WmTrayTooltipGetRect(uint32_t,uint32_t,int32_t,int32_t,int32_t*,int32_t*,ui
 bool WmVolumePopupVisible(){return volumeVisible;}
 void WmVolumePopupGetRect(uint32_t,uint32_t,int32_t* x,int32_t* y,uint32_t* w,uint32_t* h){*x=4;*y=1;*w=2;*h=2;}
 bool WmPointerCaptureActive(){return false;}
+void WmGetShellTrayGeometry(uint32_t, uint32_t, int32_t, int32_t, WmShellTrayGeometry& out) { out = {}; }
 bool WmTrayFlyoutRect(uint32_t,uint32_t,int32_t*,int32_t*,uint32_t*,uint32_t*){return false;}
 bool dockVisible=false;
 bool WmDockSurfaceRect(uint32_t,uint32_t,int32_t* x,int32_t* y,uint32_t* w,uint32_t* h,bool* material){
