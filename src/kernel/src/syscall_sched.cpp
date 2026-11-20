@@ -3,6 +3,7 @@
 // Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
+#include "pid_namespace.h"
 #include "apic.h"
 #include "user_copy.h"
 #include "syscall_internal.h"
@@ -44,6 +45,22 @@ int64_t sys_membarrier(uint64_t command,uint64_t flags,uint64_t,
     return ApicMemoryBarrierAllCpus() ? 0 : -ETIMEDOUT;
 }
 
+// These compatibility calls expose fixed values. A PID outside the
+// caller's namespace must still fail lookup.
+static int CheckSchedTarget(uint64_t argument)
+{
+    auto* caller = ProcessCurrent();
+    const auto* view = ProcessPidView(caller);
+    if (!view) return 0;
+    const int32_t pid = static_cast<int32_t>(argument);
+    if (pid < 0) return -EINVAL;
+    if (!pid) return 0;
+    auto* target = SchedulerFindVisibleProcessReference(view, pid);
+    if (!target) return -ESRCH;
+    ProcessUnref(target);
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 // sys_sched_getaffinity (204) — get CPU affinity mask
 // ---------------------------------------------------------------------------
@@ -51,7 +68,7 @@ int64_t sys_membarrier(uint64_t command,uint64_t flags,uint64_t,
 int64_t sys_sched_getaffinity(uint64_t pid, uint64_t cpusetsize,
                                uint64_t maskAddr, uint64_t, uint64_t, uint64_t)
 {
-    (void)pid;
+    if (const int error = CheckSchedTarget(pid)) return error;
     if (cpusetsize < 8) return -EINVAL;
     // Report all 8 CPUs available
     const uint64_t mask = 0xFF; // 8 CPUs
@@ -63,9 +80,10 @@ int64_t sys_sched_getaffinity(uint64_t pid, uint64_t cpusetsize,
 // sys_sched_setaffinity (203) — set CPU affinity mask (stub: succeed)
 // ---------------------------------------------------------------------------
 
-int64_t sys_sched_setaffinity(uint64_t, uint64_t, uint64_t,
+int64_t sys_sched_setaffinity(uint64_t pid, uint64_t, uint64_t,
                                uint64_t, uint64_t, uint64_t)
 {
+    if (const int error = CheckSchedTarget(pid)) return error;
     return 0; // no-op
 }
 
@@ -75,15 +93,17 @@ int64_t sys_sched_setaffinity(uint64_t, uint64_t, uint64_t,
 // sys_sched_get_priority_max (146) / sys_sched_get_priority_min (147)
 // ---------------------------------------------------------------------------
 
-int64_t sys_sched_setparam(uint64_t, uint64_t, uint64_t,
+int64_t sys_sched_setparam(uint64_t pid, uint64_t, uint64_t,
                             uint64_t, uint64_t, uint64_t)
 {
+    if (const int error = CheckSchedTarget(pid)) return error;
     return 0; // pretend success
 }
 
-int64_t sys_sched_getparam(uint64_t, uint64_t paramAddr, uint64_t,
+int64_t sys_sched_getparam(uint64_t pid, uint64_t paramAddr, uint64_t,
                             uint64_t, uint64_t, uint64_t)
 {
+    if (const int error = CheckSchedTarget(pid)) return error;
     // Return sched_priority = 0 (default for SCHED_OTHER). The old check
     // tested readability and then wrote, so a read-only page was written
     // and a bad pointer reported success.
@@ -92,15 +112,17 @@ int64_t sys_sched_getparam(uint64_t, uint64_t paramAddr, uint64_t,
     return CopyToUser(paramAddr, &priority, sizeof(priority)) ? 0 : -EFAULT;
 }
 
-int64_t sys_sched_setscheduler(uint64_t, uint64_t, uint64_t,
+int64_t sys_sched_setscheduler(uint64_t pid, uint64_t, uint64_t,
                                 uint64_t, uint64_t, uint64_t)
 {
+    if (const int error = CheckSchedTarget(pid)) return error;
     return 0; // pretend success
 }
 
-int64_t sys_sched_getscheduler(uint64_t, uint64_t, uint64_t,
+int64_t sys_sched_getscheduler(uint64_t pid, uint64_t, uint64_t,
                                 uint64_t, uint64_t, uint64_t)
 {
+    if (const int error = CheckSchedTarget(pid)) return error;
     return 0; // SCHED_OTHER
 }
 
@@ -119,18 +141,30 @@ int64_t sys_sched_get_priority_min(uint64_t policy, uint64_t, uint64_t,
     return 0;
 }
 
-int64_t sys_getpriority(uint64_t, uint64_t, uint64_t,
+int64_t sys_getpriority(uint64_t which, uint64_t who, uint64_t,
                          uint64_t, uint64_t, uint64_t)
 {
+    if (who && which == 0) {
+        if (const int error = CheckSchedTarget(who)) return error;
+    } else if (who && which == 1) {
+        auto* caller = ProcessCurrent();
+        if (ProcessPidView(caller) && !SchedulerTranslateProcessGroup(caller, who, true)) return -ESRCH;
+    }
     // Linux's successful syscall result is 20 - nice, not libc's signed nice.
     // All tasks currently expose fixed nice 0; selectors and nice changes
     // remain compatibility stubs, separate from the scheduler priority hint.
     return 20;
 }
 
-int64_t sys_setpriority(uint64_t, uint64_t, uint64_t,
+int64_t sys_setpriority(uint64_t which, uint64_t who, uint64_t,
                          uint64_t, uint64_t, uint64_t)
 {
+    if (who && which == 0) {
+        if (const int error = CheckSchedTarget(who)) return error;
+    } else if (who && which == 1) {
+        auto* caller = ProcessCurrent();
+        if (ProcessPidView(caller) && !SchedulerTranslateProcessGroup(caller, who, true)) return -ESRCH;
+    }
     return 0; // priority changes are currently ignored
 }
 

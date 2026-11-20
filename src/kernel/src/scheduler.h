@@ -112,6 +112,7 @@ void SchedulerReleaseWaitReference(Process* proc);
 Process* SchedulerFindProcessReference(uint16_t pid);
 Process* SchedulerFindVisibleProcessReference(const PidNamespace* view, uint32_t tid);
 uint32_t SchedulerVisibleParentTid(const Process* process, const PidNamespace* view);
+uint32_t SchedulerTranslateProcessGroup(const Process* process, uint32_t group, bool toGlobal);
 uint32_t SchedulerCollectVisibleSignalTargets(Process* caller, int32_t selector,
                                                Process** targets, uint32_t capacity);
 int SchedulerGetProcessGroup(Process* caller, uint32_t tid, bool session);
@@ -137,7 +138,7 @@ AddressSpaceState* SchedulerReferenceProcessAddressSpace(uint16_t pid, uint64_t 
 void SchedulerReplaceProcessAddressSpace(Process* process, AddressSpaceState* replacement);
 
 // Resolve a timer target under the process registry lock; returns only a token.
-bool SchedulerTimerTargetIncarnation(Process* owner, int32_t tid, uint64_t* incarnation);
+bool SchedulerTimerTargetIncarnation(Process* owner, int32_t tid, uint16_t* globalTid, uint64_t* incarnation);
 
 // Get the current process running on this CPU (nullptr if none).
 Process* SchedulerCurrentProcess();
@@ -220,7 +221,15 @@ struct ProcessSnapshot {
     uint64_t blockedSinceMs;
     uint64_t wakeupTick;
     uint64_t blockSites[ProcWaitSiteDepth];
+    // Filled for a retained PID namespace view. Internal identity stays above.
+    uint32_t viewTid, viewTgid, viewParent, viewGroup, viewSession;
 };
+
+// Retained proc mounts enumerate and look up only this PID view. Numeric
+// cursors select the lowest remaining local ID, independently of registry order.
+bool SchedulerSnapshotProcView(const PidNamespace* view, uint32_t tid, uint32_t minTid,
+                               uint16_t tgid, uint64_t group, bool leadersOnly,
+                               ProcessSnapshot* out);
 
 // Take a snapshot of all processes.  Fills `out` with up to `maxCount` entries.
 // Returns the number of entries written.

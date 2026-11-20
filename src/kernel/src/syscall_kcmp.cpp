@@ -8,6 +8,7 @@
 // answer, as on Linux.
 
 #include "kcmp.h"
+#include "pid_namespace.h"
 #include "fd_table.h"
 #include "process.h"
 #include "process_user_namespace.h"
@@ -71,8 +72,8 @@ uint64_t SighandIdentity(Process* task)
 
 struct TaskRef {
     Process* task;
-    explicit TaskRef(int32_t pid)
-        : task(pid > 0 && pid <= 0xffff ? SchedulerFindProcessReference(static_cast<uint16_t>(pid)) : nullptr) {}
+    explicit TaskRef(const PidNamespace* view, int32_t pid)
+        : task(pid > 0 ? SchedulerFindVisibleProcessReference(view, pid) : nullptr) {}
     ~TaskRef() { if (task) ProcessUnref(task); }
     TaskRef(const TaskRef&) = delete;
     TaskRef& operator=(const TaskRef&) = delete;
@@ -131,7 +132,8 @@ int64_t sys_kcmp(uint64_t pid1, uint64_t pid2, uint64_t type,
     SchedulerKernelRegionEnter(self);
     int64_t result;
     {
-        TaskRef first(static_cast<int32_t>(pid1)), second(static_cast<int32_t>(pid2));
+        const auto* view = ProcessPidView(self);
+        TaskRef first(view, static_cast<int32_t>(pid1)), second(view, static_cast<int32_t>(pid2));
         result = KcmpTasks(self, first.task, second.task, static_cast<uint32_t>(type), index1, index2);
     }
     SchedulerKernelRegionLeave(self);

@@ -8,15 +8,18 @@ namespace brook {
 struct PidNamespace {
     const PidNamespace* parent;
     UserNamespace* owner;
+    uint64_t tag;
     mutable uint32_t references;
     unsigned depth;
     uint32_t next;
     bool initPublished;
     bool dying;
+    bool draining;
 };
 
 namespace {
 IrqSpinLock pidViewLock;
+uint64_t nextViewTag = 1;
 constexpr uint32_t PidLimit = 1u << 22;
 
 PidNamespace* Create(const PidNamespace* parent, Process* ownerTask)
@@ -24,8 +27,10 @@ PidNamespace* Create(const PidNamespace* parent, Process* ownerTask)
     auto* ns = static_cast<PidNamespace*>(kmalloc(sizeof(PidNamespace)));
     if (!ns) return nullptr;
     PidNamespaceRetain(parent);
-    *ns = {parent, ProcessUserNamespaceAcquire(ownerTask), 1,
-           parent ? parent->depth + 1 : 1, 1, false, false};
+    const uint64_t tag = __atomic_fetch_add(&nextViewTag, 1, __ATOMIC_RELAXED);
+    if (!tag) __builtin_trap();
+    *ns = {parent, ProcessUserNamespaceAcquire(ownerTask), tag, 1,
+           parent ? parent->depth + 1 : 1, 1, false, false, false};
     return ns;
 }
 
@@ -72,6 +77,24 @@ void ProcessSetGroupView(Process* process, const Process* source, bool session, 
         (session ? entry.session : entry.group) = newGroup
             ? ProcessVisibleTgid(source, entry.ns) : ProcessVisibleGroup(source, entry.ns, session);
     }
+}
+
+uint64_t PidNamespaceTag(const PidNamespace* view)
+{
+    return view ? view->tag : 0;
+}
+
+PidGroupIdentity ProcessPidGroupIdentity(const Process* process)
+{
+    PidGroupIdentity identity{};
+    identity.global = ProcessVisibleTgid(process, nullptr);
+    if (!process) return identity;
+    identity.count = process->pidNamespaceIds.count;
+    for (unsigned i = 0; i < identity.count; ++i) {
+        const auto& entry = process->pidNamespaceIds.entries[i];
+        identity.entries[i] = {PidNamespaceTag(entry.ns), entry.tgid};
+    }
+    return identity;
 }
 
 void PidNamespaceRetain(const PidNamespace* view)
@@ -174,11 +197,27 @@ bool ProcessPidIsNamespaceInit(const Process* process)
     return active && ProcessVisibleTgid(process, active) == 1;
 }
 
-void PidNamespaceStopBirths(const PidNamespace* view)
+bool PidNamespaceStopBirths(const PidNamespace* view)
 {
-    if (!view) return;
+    if (!view) return false;
     const auto flags = IrqSpinLockAcquire(&pidViewLock);
-    const_cast<PidNamespace*>(view)->dying = true;
+    auto* state = const_cast<PidNamespace*>(view);
+    const bool started = !state->dying && state->initPublished;
+    if (started) {
+        state->dying = true;
+        __atomic_store_n(&state->draining, true, __ATOMIC_RELEASE);
+    }
     IrqSpinLockRelease(&pidViewLock, flags);
+    return started;
+}
+
+bool PidNamespaceDraining(const PidNamespace* view)
+{
+    return view && __atomic_load_n(&view->draining, __ATOMIC_ACQUIRE);
+}
+
+void PidNamespaceFinishDrain(const PidNamespace* view)
+{
+    __atomic_store_n(&const_cast<PidNamespace*>(view)->draining, false, __ATOMIC_RELEASE);
 }
 }

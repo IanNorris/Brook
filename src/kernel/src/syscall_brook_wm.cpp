@@ -320,7 +320,7 @@ int64_t sys_brook_wm_set_client_socket(uint64_t wmId,uint64_t fdValue,
     const bool accepted=socket->state==UnixSocketData::State::Connected &&
                         socket->acceptedEndpoint && socket->socketType==1;
     if (accepted) {
-        credentials=socket->peerCredentials;incarnation=socket->peerIncarnation;launchId=socket->peerLaunchId;
+        credentials=socket->peerCredentials.raw;incarnation=socket->peerIncarnation;launchId=socket->peerLaunchId;
     }
     SpinLockRelease(&g_unixRegistryLock);
     if (!accepted) return -95; // EOPNOTSUPP

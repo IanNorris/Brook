@@ -6,6 +6,9 @@
 #include <stdlib.h>
 
 using namespace harness;
+namespace brook {
+uint32_t SchedulerTranslateProcessGroup(const Process*, uint32_t group, bool) { return group; }
+}
 namespace {
 bool g_capsetSawUserPointer;
 int32_t FakeGetCapset(uint32_t,uint32_t,void* out,uint32_t bytes) {

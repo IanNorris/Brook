@@ -12,6 +12,7 @@ uint32_t ProcessVisibleTgid(const Process* process, const PidNamespace* view);
 uint32_t ProcessVisibleGroup(const Process* process, const PidNamespace* view, bool session);
 void ProcessSetGroupView(Process* process, const Process* source, bool session, bool newGroup);
 
+uint64_t PidNamespaceTag(const PidNamespace* view);
 void PidNamespaceRetain(const PidNamespace* view);
 void PidNamespaceRelease(const PidNamespace* view);
 
@@ -21,7 +22,24 @@ int ProcessPidPrepareChild(Process* child, const Process* parent, bool newNamesp
 bool ProcessPidPublish(Process* process);
 void ProcessPidRelease(Process* process);
 
+// Delayed reports (e.g. queued SCM_CREDENTIALS) may outlive the task and
+// its namespace. Use non-reused view tags so they require no owning pointers.
+struct PidGroupIdentity {
+    uint32_t global;
+    unsigned count;
+    struct Entry { uint64_t viewTag; uint32_t tgid; } entries[PidNamespaceIds::MaxDepth];
+
+    uint32_t Visible(uint64_t viewTag) const {
+        if (!viewTag) return global;
+        for (unsigned i = 0; i < count; ++i)
+            if (entries[i].viewTag == viewTag) return entries[i].tgid;
+        return 0;
+    }
+};
+PidGroupIdentity ProcessPidGroupIdentity(const Process* process);
 int ProcessPidUnshare(Process* process);
 bool ProcessPidIsNamespaceInit(const Process* process);
-void PidNamespaceStopBirths(const PidNamespace* view);
+bool PidNamespaceStopBirths(const PidNamespace* view);
+bool PidNamespaceDraining(const PidNamespace* view);
+void PidNamespaceFinishDrain(const PidNamespace* view);
 }

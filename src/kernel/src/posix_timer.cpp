@@ -280,9 +280,10 @@ int PosixTimerCreate(Process* p, int clock, const PosixSigevent* ev, int32_t* id
     // delivery, which this syscall-return signal engine does not yet provide.
     if (event.notify != 1 && (event.signo == 9 || event.signo == 18 ||
         event.signo == 19 || event.signo == 20 || event.signo == 21 || event.signo == 22)) return -95;
+    uint16_t globalTarget = 0;
     uint64_t targetIncarnation = 0;
     if (event.notify == 4 &&
-        !SchedulerTimerTargetIncarnation(p, event.targetTid, &targetIncarnation)) return -22;
+        !SchedulerTimerTargetIncarnation(p, event.targetTid, &globalTarget, &targetIncarnation)) return -22;
     uint64_t flags = IrqSpinLockAcquire(&timerLock);
     if (p->state == ProcessState::Terminated ||
         __atomic_load_n(&p->tgidExiting, __ATOMIC_ACQUIRE)) {
@@ -295,7 +296,7 @@ int PosixTimerCreate(Process* p, int clock, const PosixSigevent* ev, int32_t* id
         t.id = (int32_t)nextId++;
         t.owner = p->tgid;
         t.ownerIncarnation = OwnerIncarnation(p);
-        t.target = event.notify == 4 ? (uint16_t)event.targetTid : 0;
+        t.target = globalTarget;
         t.targetIncarnation = targetIncarnation;
         t.clock = clock; t.basis = clock; t.notify = event.notify; t.signo = event.signo;
         t.value = ev ? event.value : (uint64_t)t.id;

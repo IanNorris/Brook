@@ -15,6 +15,7 @@
 #include "proc_inode.h"
 #include "vfs.h"
 #include "process.h"
+#include "pid_namespace.h"
 #include "process_namespaces.h"
 #include "scheduler.h"
 #include "smp.h"
@@ -181,6 +182,7 @@ struct ProcPriv {
 
 static int ProcReportedInode(VfsObject*,uint64_t*);
 static int ProcOpenedIdentity(Vnode*,VnodeStat*);
+static const PidNamespace* ProcOpenedPidView(const Vnode*);
 
 static constexpr unsigned ProcStatusCapacity = 768;
 
@@ -761,8 +763,10 @@ static Vnode* GenPidStat(const ProcessSnapshot& proc)
         "20 0 %u 0 0 %lu %lu "
         "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 "
         "0 0 0 0 0 0 0 0 0 0\n",
-        (uint32_t)proc.pid, proc.name, StateChar(proc.state),
-        (uint32_t)proc.parentPid, (uint32_t)proc.pgid, (uint32_t)proc.sid,
+        proc.viewTid ? proc.viewTid : proc.pid, proc.name, StateChar(proc.state),
+        proc.viewTid ? proc.viewParent : proc.parentPid,
+        proc.viewTid ? proc.viewGroup : proc.pgid,
+        proc.viewTid ? proc.viewSession : proc.sid,
         utime, stime, proc.threadCount,
         vsize, rss);
 
@@ -788,11 +792,11 @@ static Vnode* GenPidStatus(const ProcessSnapshot& proc)
         "Threads:\t%u\n",
         proc.name,
         StateStr(proc.state), proc.name,
-        (uint32_t)proc.tgid,
-        (uint32_t)proc.pid,
-        (uint32_t)proc.parentPid,
-        (uint32_t)proc.pgid,
-        (uint32_t)proc.sid,
+        proc.viewTid ? proc.viewTgid : proc.tgid,
+        proc.viewTid ? proc.viewTid : proc.pid,
+        proc.viewTid ? proc.viewParent : proc.parentPid,
+        proc.viewTid ? proc.viewGroup : proc.pgid,
+        proc.viewTid ? proc.viewSession : proc.sid,
         ProcessReportId(ProcessCurrent(),false,proc.uid),ProcessReportId(ProcessCurrent(),false,proc.euid),
         ProcessReportId(ProcessCurrent(),false,proc.suid),ProcessReportId(ProcessCurrent(),false,proc.euid),
         ProcessReportId(ProcessCurrent(),true,proc.gid),ProcessReportId(ProcessCurrent(),true,proc.egid),
@@ -1068,14 +1072,14 @@ static Vnode* GenPidLimits(const ProcessSnapshot& /*proc*/)
 
 static bool IsDigit(char c) { return c >= '0' && c <= '9'; }
 
-static uint32_t ParseUint(const char* s, const char** end)
+static uint32_t ParseUint(const char* s, const char** end, uint32_t limit = 65535u)
 {
     uint32_t val = 0;
     while (IsDigit(*s)) {
-        if (val > (65535u - static_cast<uint32_t>(*s - '0')) / 10) {
+        if (val > (limit - static_cast<uint32_t>(*s - '0')) / 10) {
             while (IsDigit(*s)) ++s;
             if (end) *end = s;
-            return 65536;
+            return limit + 1;
         }
         val = val * 10 + (*s++ - '0');
     }
@@ -1789,7 +1793,7 @@ Vnode* ProcFsOpenDir(const char* relPath)
 // ---- Readdir implementations ----
 
 // /proc root: list global files + PID directories
-static int ProcRootReaddir(Vnode* /*vn*/, DirEntry* out, uint32_t* cookie)
+static int ProcRootReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie)
 {
     uint32_t idx = *cookie;
 
@@ -1808,16 +1812,26 @@ static int ProcRootReaddir(Vnode* /*vn*/, DirEntry* out, uint32_t* cookie)
     }
     // Then: PID directories — use indexed lookup to avoid large heap allocation
     uint32_t pidIdx = idx - NUM_GLOBAL - 1;
-    uint16_t pid = 0;
-    if (!SchedulerGetPidByIndex(pidIdx, &pid)) return 0;
+    uint32_t pid;
+    uint32_t next = idx + 1;
+    if (const auto* view = ProcOpenedPidView(vn)) {
+        ProcessSnapshot snapshot{};
+        if (!SchedulerSnapshotProcView(view, 0, pidIdx + 1, 0, 0, true, &snapshot)) return 0;
+        pid = snapshot.viewTid;
+        next = pid + NUM_GLOBAL + 1;
+    } else {
+        uint16_t globalPid = 0;
+        if (!SchedulerGetPidByIndex(pidIdx, &globalPid)) return 0;
+        pid = globalPid;
+    }
 
-    char pidStr[8];
+    char pidStr[16];
     char* p = U64ToDec(pidStr, pid);
     *p = '\0';
     ProcStrCopy(out->name, pidStr, sizeof(out->name));
     out->size = 0;
     out->isDir = true;
-    *cookie = idx + 1;
+    *cookie = next;
     return 1;
 }
 
@@ -1887,10 +1901,16 @@ static int ProcTaskReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie)
         return 1;
     }
     ProcessSnapshot task;
-    if (!SchedulerSnapshotTask(pp->tgid, pp->groupIncarnation, 0, *cookie - 2, &task)) return 0;
-    char* end = U64ToDec(out->name, task.pid); *end = 0;
+    if (const auto* view = ProcOpenedPidView(vn)) {
+        if (!SchedulerSnapshotProcView(view, 0, *cookie - 2, pp->tgid, pp->groupIncarnation,
+                                      false, &task)) return 0;
+    } else if (!SchedulerSnapshotTask(pp->tgid, pp->groupIncarnation, 0, *cookie - 2, &task)) {
+        return 0;
+    }
+    const uint32_t tid = task.viewTid ? task.viewTid : task.pid;
+    char* end = U64ToDec(out->name, tid); *end = 0;
     out->size = 0; out->isDir = true;
-    *cookie = uint32_t{task.pid} + 3;
+    *cookie = tid + 3;
     return 1;
 }
 

@@ -47,11 +47,23 @@ int main()
     assert(ProcessVisibleTgid(&init, nested) == 0);
 
     assert(ProcessPidPrepareChild(&child, &sibling, false) == 0);
-    PidNamespaceStopBirths(view);
+    assert(PidNamespaceStopBirths(view));
+    assert(PidNamespaceDraining(view));
+    assert(!PidNamespaceStopBirths(view));
     assert(!ProcessPidPublish(&child));
     ProcessPidRelease(&child);
     Process childAfterExit{};
     assert(ProcessPidPrepareChild(&childAfterExit, &sibling, false) == -12);
+
+    PidNamespaceFinishDrain(view);
+    assert(!PidNamespaceDraining(view));
+    assert(ProcessPidPrepareChild(&childAfterExit, &sibling, false) == -12);
+
+    const auto credentials = ProcessPidGroupIdentity(&sibling);
+    const auto nestedTag = PidNamespaceTag(nested);
+    const auto parentTag = PidNamespaceTag(view);
+    assert(credentials.Visible(0) == 904);
+    assert(credentials.Visible(nestedTag) == 1 && credentials.Visible(parentTag) == 3);
 
     // A retained proc view pins both namespaces independently of the tasks.
     PidNamespaceRetain(nested);
@@ -61,5 +73,17 @@ int main()
     ProcessPidRelease(&outer);
     assert(allocated == 2);
     PidNamespaceRelease(nested);
+    assert(allocated == 0);
+    assert(credentials.Visible(nestedTag) == 1);
+    Process replacementParent{}, replacementInit{};
+    replacementParent.pid = replacementParent.tgid = 900;
+    replacementInit.pid = replacementInit.tgid = 904;
+    assert(ProcessPidUnshare(&replacementParent) == 0);
+    assert(ProcessPidPrepareChild(&replacementInit, &replacementParent, false) == 0);
+    const auto* replacement = ProcessPidView(&replacementInit);
+    assert(PidNamespaceTag(replacement) != nestedTag);
+    assert(credentials.Visible(PidNamespaceTag(replacement)) == 0);
+    ProcessPidRelease(&replacementInit);
+    ProcessPidRelease(&replacementParent);
     assert(allocated == 0);
 }
