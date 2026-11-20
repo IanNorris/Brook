@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from dell_recovery import AC_OFF_SECONDS, Journal, OUTAGE_SECONDS, Recovery, read_caps
+from dell_recovery import AC_OFF_SECONDS, Journal, OUTAGE_SECONDS, Recovery, RecoveryBridgeRefused, read_caps
 from dell_recovery_lock import inhibit_recovery, maintenance_lock, state_directory
 
 
@@ -89,6 +89,15 @@ class RecoveryTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.recovery.arm()
         self.assertEqual(self.actions, [])
+
+    def test_refused_v3_session_never_sends_relay_command(self):
+        self.recovery.arm()
+        def rejected(host, port):
+            raise RecoveryBridgeRefused("fixture refusal")
+        self.recovery.caps = rejected
+        self.assertEqual(self.recovery.poll(), 1)
+        self.assertEqual(self.journal.load()["outcome"], "bridge_authentication_refused")
+        self.assertEqual(self.actions, [(0, "status")])
 
     def test_ambiguous_off_is_reconciled_once(self):
         self.recovery.arm()

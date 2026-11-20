@@ -19,7 +19,7 @@ from dell_recovery_lock import (
     PENDING_CYCLE, endpoint_lock, inhibit_recovery, maintenance_epoch,
     maintenance_lock, state_directory,
 )
-from guest_transport import exchange
+from guest_transport import exchange, exchange_v3
 from hardware import Hardware
 from probe_hardware_link import probe
 
@@ -97,7 +97,28 @@ class Journal:
                 temporary.unlink(missing_ok=True)
 
 
+class RecoveryBridgeRefused(RuntimeError):
+    pass
+
+
 def read_caps(host, port):
+    key_path = os.environ.get("BROOK_BRIDGE_V3_OPERATOR_KEY")
+    if key_path:
+        from bridge_v3 import BridgeV3NoChallenge
+
+        try:
+            caps, = exchange_v3(host, port, ["bridge hardware caps"], 5, key_path)
+        except (BridgeV3NoChallenge, ConnectionRefusedError, TimeoutError):
+            return None
+        except OSError as error:
+            if error.errno in (101, 113): # ENETUNREACH, EHOSTUNREACH
+                return None
+            raise RecoveryBridgeRefused("v3 bridge handshake was not accepted") from error
+        except (ValueError, RuntimeError) as error:
+            raise RecoveryBridgeRefused("v3 bridge verification failed") from error
+        if (caps.get("auth_version"), caps.get("auth_suite")) != (3, 1):
+            raise RecoveryBridgeRefused("Unexpected recovery bridge suite")
+        return caps
     try:
         caps, = exchange(host, port, ["bridge hardware caps"], 5)
         if caps.get("boot_id") == "0" * 32 and caps.get("boot_guard") is True:
@@ -200,7 +221,13 @@ class Recovery:
                 and self.state.get("maintenance_epoch") != maintenance_epoch(self.journal.directory)):
             self.record("spent", outcome="maintenance_invalidated_arm")
             return 1
-        caps = self.caps(self.host, self.port)
+        try:
+            caps = self.caps(self.host, self.port)
+        except RecoveryBridgeRefused as error:
+            if self.state["state"] == "armed":
+                self.record("spent", outcome="bridge_authentication_refused", error=str(error))
+                return 1
+            raise
         if caps is not None:
             if self.state["state"] == "armed" and (
                 caps["boot_id"] != self.state["boot_id"] or not ready(caps)
