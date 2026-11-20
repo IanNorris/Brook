@@ -417,7 +417,7 @@ def main():
         def retrieve_during_repair():
             sys.path.insert(0,str(ROOT/'tools/vm_bridge'))
             from hardware import Hardware
-            bridge=Hardware(work/'recovery-registry');session=bridge.attach('127.0.0.1',recovery_port)['session']
+            bridge=Hardware(work/'recovery-registry');session=bridge.attach('127.0.0.1',recovery_port,auth_mode='legacy')['session']
             for previous,packet in ((False,seeded_packets[1]),(True,seeded_packets[0])):
                 destination=a.output/('recovery-older-panic.bin' if previous else 'recovery-newer-panic.bin')
                 report=bridge.recovery_panic(session,destination,previous=previous)
@@ -469,7 +469,7 @@ def main():
                 from hardware import Hardware
                 bridge=Hardware(work/'normal-registry');deadline=time.monotonic()+30
                 while True:
-                    try:session=bridge.attach('127.0.0.1',network_port)['session'];break
+                    try:session=bridge.attach('127.0.0.1',network_port,auth_mode='legacy')['session'];break
                     except (OSError,RuntimeError):
                         if time.monotonic()>=deadline:raise
                         time.sleep(.2)
@@ -698,7 +698,7 @@ def main():
                 from hardware import Hardware
                 bridge=Hardware(work/'desktop-registry');deadline=time.monotonic()+6
                 while True:
-                    try:attached=bridge.attach('127.0.0.1',network_port);break
+                    try:attached=bridge.attach('127.0.0.1',network_port,auth_mode='legacy');break
                     except (OSError,RuntimeError):
                         if time.monotonic()>=deadline:raise
                         time.sleep(.1)
@@ -710,7 +710,7 @@ def main():
                 if a.two_panic_records:
                     sys.path.insert(0,str(ROOT/'tools/vm_bridge'))
                     from hardware import Hardware
-                    bridge=Hardware(work/'desktop-registry');attached=bridge.attach('127.0.0.1',network_port)
+                    bridge=Hardware(work/'desktop-registry');attached=bridge.attach('127.0.0.1',network_port,auth_mode='legacy')
                     bridge_state.update(bridge=bridge,session=attached['session'],before=None)
                 bridge=bridge_state['bridge'];session=bridge_state['session']
                 doctor=bridge.doctor(session)
@@ -760,7 +760,7 @@ def main():
                 from hardware import Hardware
                 bridge=Hardware(work/'dell-desktop-registry');deadline=time.monotonic()+20
                 while True:
-                    try:session=bridge.attach('127.0.0.1',network_port)['session'];break
+                    try:session=bridge.attach('127.0.0.1',network_port,auth_mode='legacy')['session'];break
                     except (OSError,RuntimeError):
                         if time.monotonic()>=deadline:raise
                         time.sleep(.2)
@@ -793,7 +793,7 @@ def main():
                 bridge=Hardware(work/'core-registry')
                 deadline=time.monotonic()+20
                 while True:
-                    try:session=bridge.attach('127.0.0.1',network_port)['session'];break
+                    try:session=bridge.attach('127.0.0.1',network_port,auth_mode='legacy')['session'];break
                     except (OSError,RuntimeError):
                         if time.monotonic()>=deadline:raise
                         time.sleep(.1)
@@ -1015,7 +1015,7 @@ def main():
                     from hardware import Hardware
                     bridge=Hardware(work/'desktop-panic-recovery-registry');deadline=time.monotonic()+8
                     while True:
-                        try:session=bridge.attach('127.0.0.1',recovery_port)['session'];break
+                        try:session=bridge.attach('127.0.0.1',recovery_port,auth_mode='legacy')['session'];break
                         except (OSError,RuntimeError):
                             if time.monotonic()>=deadline:raise
                             time.sleep(.1)

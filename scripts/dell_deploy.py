@@ -23,6 +23,7 @@ p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDes
 p.add_argument('--session', required=True); p.add_argument('--pair', type=Path, required=True)
 p.add_argument('--output', type=Path, required=True); p.add_argument('--allow-dirty', action='store_true')
 p.add_argument('--boot-timeout-s', type=int, default=240)
+p.add_argument('--operator-key-file', type=Path, help='Host private key admitted by the new v3 image')
 p.add_argument('--profile-timeout-s', type=int, default=3600)
 profile = p.add_mutually_exclusive_group()
 profile.add_argument('--profile-plan', type=Path, metavar='DIRECTORY')
@@ -127,6 +128,40 @@ for name, path in (('kernel_sha256', kernel), ('initrd_sha256', initrd)):
     if verdict.get(name) not in (None, sha(path)) or manifest.get(name) != sha(path):
         sys.exit(f'refusing: {name} does not match the checked/manifest pair')
 if manifest.get('dirty') and not a.allow_dirty: sys.exit('refusing: built from a dirty tree')
+next_v3 = []
+if manifest.get('bridge_v3') is not None:
+    sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools/vm_bridge')]
+    from bridge_v3 import read_operator_key
+    from bridge_operator_policy import validate_operator_policy
+    from hardware import Hardware
+
+    if (verdict.get('kernel_sha256'), verdict.get('initrd_sha256')) != (sha(kernel), sha(initrd)):
+        sys.exit('refusing: v3 requires the exact checked kernel and initrd')
+    policy_metadata = manifest['bridge_v3']
+    if (policy_metadata.get('version'), policy_metadata.get('suite')) != (3, 1):
+        sys.exit('refusing: unexpected protocol version or suite in the new image')
+    try:
+        session = Hardware().load_session(a.session)
+        key_path = a.operator_key_file or session.get('operator_key_file')
+        if not key_path:
+            raise ValueError('The v3 image needs --operator-key-file for the first legacy cutover')
+        path = Path(key_path).absolute()
+        key = read_operator_key(path)
+        policy = subprocess.check_output(['mtype', '-i', str(initrd), '::/ETC/bridge-v3-operators'])
+        digest = hashlib.sha256(policy).hexdigest()
+        verified = json.loads((a.pair / 'verify.json').read_text())
+        if (digest != policy_metadata.get('policy_sha256') or
+                digest != verified.get('bridge_policy_sha256') or
+                verified.get('initrd_sha256') != sha(initrd) or
+                bytes(key.verify_key) not in validate_operator_policy(policy)):
+            raise ValueError('The checked image policy does not admit the selected operator key')
+        build_id = manifest['build_id']
+    except (KeyError, OSError, ValueError, subprocess.SubprocessError) as error:
+        sys.exit(f'refusing v3 cutover: {error}')
+    next_v3 = ['--next-operator-key-file', str(path), '--next-operator-policy', digest,
+               '--next-build-id', build_id]
+elif a.operator_key_file:
+    p.error('--operator-key-file only applies to a v3 image')
 stage = None
 kernel_output = a.output
 if a.profile_plan or a.rollback_profile:
@@ -138,7 +173,7 @@ if a.profile_plan or a.rollback_profile:
 cmd = [sys.executable, str(ROOT / 'scripts/hardware_update_device.py'), '--session', a.session, '--key-file', str(KEY),
        '--kernel', str(kernel), '--initrd', str(initrd), '--output', str(kernel_output), '--activate', '--restart',
        '--expected-payload-id', manifest['payload_id'], '--helper', 'system', '--boot-timeout-s', str(a.boot_timeout_s)]
-code = subprocess.call(cmd)
+code = subprocess.call(cmd + next_v3)
 receipt_path = kernel_output / 'receipt.json'
 if stage:
     stage.save(kernel_receipt=str(receipt_path.resolve()),

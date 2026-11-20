@@ -442,7 +442,7 @@ quit
                                 from hardware import Hardware
                                 bridge=Hardware(d/'hardware-registry');attach_deadline=time.monotonic()+30
                                 while True:
-                                    try:session=bridge.attach('127.0.0.1',network_port)['session'];break
+                                    try:session=bridge.attach('127.0.0.1',network_port,auth_mode='legacy')['session'];break
                                     except (OSError,RuntimeError):
                                         if time.monotonic()>=attach_deadline:raise
                                         time.sleep(.2)

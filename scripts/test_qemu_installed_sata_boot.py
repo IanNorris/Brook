@@ -65,7 +65,7 @@ def main():
                 if 'HARDWARE_NETWORK_READY' in serial and 'DEBUG_TCP: listening' in serial and 'BOOT: desktop presented' in serial:break
                 time.sleep(.2)
             else:raise TimeoutError(serial[-4000:])
-            h=Hardware(out/'registry');attached=h.attach('127.0.0.1',port);s=attached['session'];status=h.command(s,'bridge hardware ahci-ro')
+            h=Hardware(out/'registry');attached=h.attach('127.0.0.1',port,auth_mode='legacy');s=attached['session'];status=h.command(s,'bridge hardware ahci-ro')
             assert status['ready'] and status['sectors']==expected//512,status
             if a.desktop_store:
                 doctor=h.doctor(s);(out/'doctor.json').write_text(json.dumps(doctor,indent=2)+'\n')

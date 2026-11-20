@@ -91,16 +91,21 @@ class Hardware:
 
     def guest(self,data,command,timeout=8):return self.guest_batch(data,[command],timeout)[0]
 
+    def probe_v3(self, host, port, operator_key_file=None, timeout=8):
+        host,port=self.endpoint(host,port)
+        configured=operator_key_file or os.environ.get('BROOK_BRIDGE_V3_OPERATOR_KEY')
+        if not configured:
+            raise ValueError('Set BROOK_BRIDGE_V3_OPERATOR_KEY or give an operator key file')
+        path=str(Path(configured).absolute())
+        caps,=exchange_v3(host,port,['bridge hardware caps'],timeout,path)
+        if caps.get('auth_version')!=3 or caps.get('auth_suite')!=1:
+            raise RuntimeError('Guest does not advertise bridge v3 phase 1')
+        return path,caps
+
     def attach(self,host,port=1234,auth_mode='v3',operator_key_file=None,**_):
         host,port=self.endpoint(host,port)
         if auth_mode=='v3':
-            configured=operator_key_file or os.environ.get('BROOK_BRIDGE_V3_OPERATOR_KEY')
-            if not configured:
-                raise ValueError('Set BROOK_BRIDGE_V3_OPERATOR_KEY or give an operator key file')
-            operator_key_file=str(Path(configured).absolute())
-            caps,=exchange_v3(host,port,['bridge hardware caps'],8,operator_key_file)
-            if caps.get('auth_version')!=3 or caps.get('auth_suite')!=1:
-                raise RuntimeError('Guest does not advertise bridge v3 phase 1')
+            operator_key_file,caps=self.probe_v3(host,port,operator_key_file)
             boot=caps.get('boot_id')
         elif auth_mode=='legacy':
             epoch,caps=exchange(host,port,['bridge epoch init '+uuid.uuid4().hex,'bridge hardware caps'],8)

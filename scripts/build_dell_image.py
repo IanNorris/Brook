@@ -19,7 +19,7 @@ Steps (each is deterministic for a given checkout and asset set):
 This prepares private files only. Deployment is separate (scripts/hardware_update_device.py) and needs
 the target to already contain the runtime store paths listed in the manifest.
 """
-import argparse, hashlib, json, os, subprocess, sys
+import argparse, hashlib, json, os, re, subprocess, sys
 from pathlib import Path
 
 from bridge_operator_policy import validate_operator_policy
@@ -253,7 +253,7 @@ def main():
     bridge_objects = []
     if operator_input is not None:
         vendor, bridge_objects = build_bridge_objects(build)
-        bridge_flags = ['-DBROOK_BRIDGE_V3', '-I', vendor]
+        bridge_flags = ['-DBROOK_BRIDGE_V3', f'-DBROOK_BRIDGE_V3_POLICY_SHA256="{sha(operator_input)}"', '-I', vendor]
         run(['mcopy', '-o', '-i', boot_image, operator_input, '::/ETC/bridge-v3-operators'])
     cc = os.environ['MUSL_CC']
     cxx = os.environ.get('MUSL_CXX') or cc.removesuffix('gcc') + 'g++'
@@ -311,6 +311,11 @@ def main():
                           for name, path in boot_services.items()},
     }
     if operator_input is not None:
+        info = (build / 'build_info_generated.cpp').read_text()
+        build_id = re.search(r'BuildGitHash\(\) \{ return "([0-9a-f+]+)"; \}', info)
+        if not build_id or not commit.startswith(build_id[1].split('+')[0]):
+            sys.exit('Kernel build information does not match the candidate source')
+        manifest['build_id'] = build_id[1]
         manifest['bridge_v3'] = {'version': 3, 'suite': 1, 'policy_sha256': sha(operator_input),
                                  'helpers_sha256': compiled_helpers}
     (a.output / 'build-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')

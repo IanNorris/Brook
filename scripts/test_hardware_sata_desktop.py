@@ -123,7 +123,7 @@ def main():
                     if 'HARDWARE_NETWORK_READY' in serial and 'DEBUG_TCP: listening' in serial:break
                     time.sleep(.2)
                 else:raise TimeoutError(serial[-4000:])
-                h=Hardware(base/'registry');attached=h.attach('127.0.0.1',port);s=attached['session'];doctor=h.doctor(s)
+                h=Hardware(base/'registry');attached=h.attach('127.0.0.1',port,auth_mode='legacy');s=attached['session'];doctor=h.doctor(s)
                 save(base/'doctor.json',doctor)
                 assert 'ahci system: verified GPT entry' in serial and 'writable desktop: ready' in serial,serial[-5000:]
                 assert doctor['guest']['writable_desktop']['ready'] and not doctor['guest']['app_snapshot']['configured'],doctor

@@ -75,7 +75,7 @@ def main():
             else:raise TimeoutError(serial[-4000:])
             expected='GPT validation or selection failed' if a.case=='wrong-guid' else 'mount namespace failed'
             assert expected in serial and 'writable desktop: ready' not in serial,serial[-5000:]
-            h=Hardware(out/'registry');attached=h.attach('127.0.0.1',port);s=attached['session'];caps=h.command(s,'bridge hardware caps')
+            h=Hardware(out/'registry');attached=h.attach('127.0.0.1',port,auth_mode='legacy');s=attached['session'];caps=h.command(s,'bridge hardware caps')
             assert not caps['writable_desktop']['ready'] and not caps['app_snapshot']['configured'],caps
             request=uuid.uuid4().hex;state=h.power(s,request,'shutdown');end=time.monotonic()+120
             while state['state']!='ready':

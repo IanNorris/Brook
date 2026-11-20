@@ -1030,7 +1030,7 @@ def main():
                     from hardware import Hardware
                     bridge=Hardware(work/'recovery-registry');deadline=time.monotonic()+20
                     while True:
-                        try:session=bridge.attach('127.0.0.1',network_port)['session'];break
+                        try:session=bridge.attach('127.0.0.1',network_port,auth_mode='legacy')['session'];break
                         except (OSError,RuntimeError):
                             if time.monotonic()>=deadline:raise
                             time.sleep(.2)

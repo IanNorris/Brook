@@ -28,7 +28,17 @@ def main():
         help='Verify RECOVERY/BOOTSTAT.BIN is absent or empty on this boot. Install the first '
              'slot-aware pair on the old loader, then install the new loader and verify both slots before provisioning slot health.')
     p.add_argument('--pace-bytes-per-second',type=int,help='Optional Linux TCP pacing cap for the upload')
+    p.add_argument('--next-operator-key-file',type=Path)
+    p.add_argument('--next-operator-policy',help='Expected SHA-256 of the next canonical v3 public key list')
+    p.add_argument('--next-build-id',help='Expected embedded kernel build ID')
     a=p.parse_args()
+    if any((a.next_operator_key_file,a.next_operator_policy,a.next_build_id)):
+        if not all((a.next_operator_key_file,a.next_operator_policy,a.next_build_id)):
+            p.error('Next-image v3 verification requires its operator key, policy digest and build ID')
+        next_v3={'operator_key_file':str(a.next_operator_key_file.absolute()),
+                 'policy_sha256':a.next_operator_policy, 'build_id':a.next_build_id}
+    else:
+        next_v3=None
     bridge = Hardware()
     target = bridge.load_session(a.session)
     run=UpdateRun(bridge,a.output)
@@ -36,7 +46,7 @@ def main():
         with inhibit_recovery(target['host'], target['port']):
             result=run.execute(a.session,a.key_file,a.kernel,a.initrd,
                 a.activate,a.restart,a.expected_payload_id,a.port,a.boot_timeout_s,a.helper,a.pace_bytes_per_second,
-                first_slot_aware_install=a.first_slot_aware_install)
+                first_slot_aware_install=a.first_slot_aware_install,next_v3=next_v3)
     except Exception as error:
         receipt=run.receipt
         summary={'state':receipt.get('state','not_started'),'last_stage':receipt.get('last_stage'),'error':str(error),

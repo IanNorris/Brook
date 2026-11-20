@@ -26,6 +26,19 @@ def power_blocker_summary(status):
     if status.get('status'):parts.append(f"status={status['status']!r}")
     return ' '.join(parts)
 
+def verify_v3_boot(caps, expected, kernel_sha, initrd_sha):
+    if (caps.get('auth_version')!=3 or caps.get('auth_suite')!=1 or
+        caps.get('operator_policy_sha256')!=expected['policy_sha256'] or
+        caps.get('initrd_sha256')!=initrd_sha or caps.get('build_id')!=expected['build_id']):
+        raise RuntimeError('v3 boot policy, initrd or kernel build identity differs from the checked pair')
+    kernel_digest=caps.get('kernel_sha256')
+    if kernel_digest is not None and kernel_digest!=kernel_sha:
+        raise RuntimeError('v3 running kernel digest differs from the checked pair')
+    return {name:caps.get(name) for name in
+            ('build_id','operator_policy_sha256','kernel_sha256','kernel_sha256_source',
+             'initrd_sha256','initrd_sha256_source')}
+
+
 class UpdateRun:
     def __init__(self,bridge,output,uploader=upload,clock=time.monotonic,sleep=time.sleep):
         self.bridge=bridge;self.output=Path(output);self.uploader=uploader;self.clock=clock;self.sleep=sleep
@@ -101,7 +114,7 @@ class UpdateRun:
         finally:os.close(directory)
         self.save(first_install_claim=str(claim))
 
-    def execute(self,session,key_file,kernel_path,initrd_path,activate=False,restart=False,expected_payload_id=None,port=1235,boot_timeout_s=120,helper='usb',pace_bytes_per_second=None,*,first_slot_aware_install=None):
+    def execute(self,session,key_file,kernel_path,initrd_path,activate=False,restart=False,expected_payload_id=None,port=1235,boot_timeout_s=120,helper='usb',pace_bytes_per_second=None,*,first_slot_aware_install=None,next_v3=None):
         helpers={'usb':'/boot/HWUPDATE.ELF','system':'/boot/HWUPSYS.ELF'}
         if helper not in helpers:raise ValueError('Expected usb or system update helper')
         if first_slot_aware_install is not None and (helper!='system' or not activate or
@@ -110,6 +123,11 @@ class UpdateRun:
             raise ValueError('First slot-aware installation requires explicit system activation and a boot ID')
         validate_pacing(pace_bytes_per_second)
         if isinstance(boot_timeout_s,bool) or not isinstance(boot_timeout_s,int) or not 1<=boot_timeout_s<=900:raise ValueError('Boot observation timeout must be 1..900 seconds')
+        if next_v3 is not None and (not restart or not
+                isinstance(next_v3.get('operator_key_file'),str) or not
+                re.fullmatch('[0-9a-f]{64}',next_v3.get('policy_sha256','')) or not
+                re.fullmatch('[0-9a-f]{7,40}(?:[+][0-9a-f]{8})?',next_v3.get('build_id',''))):
+            raise ValueError('v3 cutover requires restart and checked operator-policy and build evidence')
         if restart and (not activate or not expected_payload_id):raise ValueError('Restart requires activation and an expected payload ID')
         if expected_payload_id and (not re.fullmatch(r'[a-zA-Z0-9_.-]{1,95}',expected_payload_id)):raise ValueError('Invalid expected payload ID')
         if isinstance(port,bool) or not isinstance(port,int) or not 1<=port<=65535:raise ValueError('Invalid upload port')
@@ -117,6 +135,8 @@ class UpdateRun:
         if len(kernel)<64 or len(initrd)<512:raise ValueError('Payload is too short')
         data=self.bridge.load_session(session);boot=data['guest_boot_id']
         key=receiver_key(data,key_file)
+        if restart and data.get('auth_mode')=='v3' and next_v3 is None:
+            raise ValueError('v3 restart needs checked next-image credentials and evidence')
         doctor=self.bridge.doctor(session)
         if doctor.get('probe_stage')!='verified' or not doctor.get('reachable') or not doctor.get('identity_matches'):raise RuntimeError('Original guest boot probe is incomplete or not reachable/matching')
         if first_slot_aware_install is not None and first_slot_aware_install!=boot:
@@ -199,11 +219,28 @@ class UpdateRun:
             self.save(state='awaiting_new_boot')
             end=self.clock()+boot_timeout_s;fresh=None
             while self.clock()<end:
-                observed=self.bridge.doctor(session)
-                if observed.get('reachable') and observed.get('identity_matches') is False:
-                    fresh=self.bridge.attach(data['host'],data['port'])
-                    if fresh['guest_boot_id']==boot:raise RuntimeError('Attach did not establish a different boot')
-                    break
+                if next_v3 is not None:
+                    try:
+                        _,caps=self.bridge.probe_v3(
+                            data['host'],data['port'],next_v3['operator_key_file'],timeout=4)
+                    except (OSError, ValueError, RuntimeError):
+                        self.sleep(1)
+                        continue
+                    if caps.get('boot_id')!=boot:
+                        evidence=verify_v3_boot(caps,next_v3,self.receipt['kernel']['sha256'],
+                                                self.receipt['initrd']['sha256'])
+                        fresh=self.bridge.attach(data['host'],data['port'],auth_mode='v3',
+                                                 operator_key_file=next_v3['operator_key_file'])
+                        if fresh['guest_boot_id']!=caps['boot_id']:
+                            raise RuntimeError('Boot changed between v3 verification and attachment')
+                        self.save(v3_boot_evidence=evidence)
+                        break
+                else:
+                    observed=self.bridge.doctor(session)
+                    if observed.get('reachable') and observed.get('identity_matches') is False:
+                        fresh=self.bridge.attach(data['host'],data['port'],auth_mode='legacy')
+                        if fresh['guest_boot_id']==boot:raise RuntimeError('Attach did not establish a different boot')
+                        break
                 self.sleep(1)
             if fresh is None:raise TimeoutError('Restart not verified; inspect the original power request, do not replay it')
             self.save(state='new_boot_observed',new_session=fresh['session'],new_guest_boot_id=fresh['guest_boot_id'])

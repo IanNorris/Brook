@@ -128,7 +128,7 @@ def main():
                     if process.poll() is not None:
                         raise RuntimeError('QEMU exited: ' + (work / 'qemu.log').read_text(errors='replace')[-2000:])
                     try:
-                        attached = bridge.attach('127.0.0.1', port)
+                        attached = bridge.attach('127.0.0.1',port,auth_mode='legacy')
                         break
                     except (OSError, RuntimeError, ValueError):
                         if time.monotonic() - start > 90:
