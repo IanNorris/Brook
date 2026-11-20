@@ -9,6 +9,7 @@ struct NetlinkWait;
 struct NetlinkSocket {
     SpinLock lock{};uint32_t refs=1;bool nonblock=false,connected=false;
     uint32_t port=0,type=0,queued=0,receiveLimit=65536;
+    uint64_t networkScope=0;
     SocketIdentity identity{};NetlinkSocket* next=nullptr;
     NetlinkPacket *head=nullptr,*tail=nullptr;NetlinkWait* waiters=nullptr;
 };

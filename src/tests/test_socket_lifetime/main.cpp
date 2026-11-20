@@ -2215,6 +2215,34 @@ int main() {
         assert(g_sockets[g_sockets[l].acceptQueue[1]].remotePort==htons(40002));
         SockClose(l);SockClose(u);
     }
+    {
+        const int initial=SockCreateOwned(AF_INET,SOCK_DGRAM,0,1,1000,1000);
+        const int first=SockCreateOwned(AF_INET,SOCK_DGRAM,0,2,1000,1000,41);
+        const int other=SockCreateOwned(AF_INET,SOCK_DGRAM,0,3,1000,1000,42);
+        const int sockets[]={initial,first,other};
+        SockAddrIn address{};address.sin_family=AF_INET;address.sin_addr=Ipv4Addr(127,0,0,1);
+        address.sin_port=htons(39123);
+        for(int socket:sockets) {
+            assert(socket>=0&&!SockBind(socket,&address));
+            SockSetNonblock(socket,true);
+        }
+        uint8_t packet=0x47,got=0;
+        SockDeliverUdp(address.sin_addr,39124,address.sin_addr,39123,&packet,1,41);
+        assert(SockRecvFrom(initial,&got,1,nullptr)==-11);
+        assert(SockRecvFrom(other,&got,1,nullptr)==-11);
+        assert(SockRecvFrom(first,&got,1,nullptr)==1&&got==packet);
+        SockDeliverUdp(address.sin_addr,39124,address.sin_addr,39123,&packet,1);
+        assert(SockRecvFrom(initial,&got,1,nullptr)==1&&got==packet);
+        assert(SockRecvFrom(first,&got,1,nullptr)==-11);
+        assert(NetSnapshotSocket(first).networkScope==41&&SockNetworkScope(other)==42);
+        address.sin_addr=Ipv4Addr(192,0,2,1);
+        assert(SockBind(first,&address)==-99);
+        assert(SockConnect(first,&address)==-101);
+        assert(SockSendTo(first,&packet,1,&address)==-101);
+        InterfaceView interfaces[5]{};
+        assert(NetInterfaceViews(interfaces,5,41)==1&&!std::strcmp(interfaces[0].name,"lo"));
+        for(int socket:sockets)SockClose(socket);
+    }
     assert(allocations == frees && g_socketRxBytes == 0);
     std::puts("socket lifetime: PASS");
 }

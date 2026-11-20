@@ -305,6 +305,7 @@ add_executable(kernel
     src/user_copy.S
     src/posix_timer.cpp
     src/sysv_sem.cpp
+    src/posix_mqueue.cpp
     src/signal_fd.cpp
     src/process.cpp
     src/system_message.cpp
@@ -388,6 +389,7 @@ add_executable(kernel
     src/tmpfs.cpp
     src/compat_paths.cpp
     src/process_fs.cpp
+    src/process_namespaces.cpp
     src/fs_context.cpp
     src/fatfs_vfs.cpp
     src/guard_readonly_view.cpp

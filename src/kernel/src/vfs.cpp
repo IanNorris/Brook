@@ -208,16 +208,19 @@ struct MountEntry {
     char             physicalRoot[512];
     uint64_t         rootDevice;
     uint64_t         attributes;
+    uint64_t         lockedAttributes;
 };
 static uint64_t VfsMountAttributes(const MountEntry* mount) {
     return __atomic_load_n(&mount->attributes,__ATOMIC_ACQUIRE);
 }
-static bool VfsReadOnly(const MountEntry* mount) { return mount && (VfsMountAttributes(mount)&1); }
+static bool VfsReadOnly(const MountEntry* mount) { return mount && (VfsMountAttributes(mount)&MountReadOnly); }
+static bool VfsNoExec(const MountEntry* mount) { return mount && (VfsMountAttributes(mount)&MountNoExec); }
+bool VfsMountNoExec(const Vnode* vn) { return vn && VfsNoExec(static_cast<MountEntry*>(vn->mountOwner)); }
 bool VfsMountReadOnly(const Vnode* vn) { return vn && VfsReadOnly(static_cast<MountEntry*>(vn->mountOwner)); }
 static bool VfsNodevDenied(const MountEntry* mount,const VnodeStat& stat,int flags)
 {
     const uint16_t type=stat.mode&0170000;
-    return (mount->attributes&4) && !(flags&VFS_O_METADATA) && (type==0020000 || type==0060000);
+    return (VfsMountAttributes(mount)&MountNoDev) && !(flags&VFS_O_METADATA) && (type==0020000 || type==0060000);
 }
 
 // Membership is protected by the sleeping VFS transaction. Short metadata
@@ -601,7 +604,7 @@ bool VfsMountConfigured(const char* mountPoint,const char* fsName,uint8_t pdrv,u
 bool VfsMountConfiguredWithPublication(const char* mountPoint,const char* fsName,uint8_t pdrv,uint64_t attributes,uint64_t* publication)
 {
     if(publication)*publication=0;
-    if(attributes&~uint64_t{7})return false;
+    if(attributes&~MountRestrictionMask)return false;
     FileMutationGuard mutation;
     if (!mountPoint || mountPoint[0]!='/' || !fsName ||
         StrLen(mountPoint)>=sizeof(MountEntry::mountPoint)) return false;
@@ -664,7 +667,7 @@ bool VfsMountConfiguredWithPublication(const char* mountPoint,const char* fsName
         VfsBackingDropLocked(backing,true);
         kfree(slot);return false;
     }
-    slot->attributes=attributes;
+    slot->attributes=slot->lockedAttributes=attributes;
     slot->linked=isRoot || slot->covered.object;
     slot->publication=++g_mountPublication;
     slot->used=true;
@@ -875,7 +878,8 @@ int VfsOpenExecutable(const char* path, Vnode** vnode, char* resolved, uint32_t 
     const char* relative=nullptr;
     MountEntry* mount=FindMount(resolved,&relative,physicalRelative);
     if (!mount || !mount->backing->fsOps) return -2;
-    if(mount->attributes&4) {
+    if(VfsNoExec(mount))return -13;
+    if(VfsMountAttributes(mount)&MountNoDev) {
         VnodeStat stat{};int result=VfsLstatPathRaw(resolved,&stat);
         if(result)return result;if(VfsNodevDenied(mount,stat,VFS_O_EXEC))return -13;
     }
@@ -952,7 +956,7 @@ Vnode* VfsOpenModeChecked(const char* path, int flags, uint16_t mode, int* error
         }
         if(deny) {if(error)*error=-30;return nullptr;}
     }
-    if((mount->attributes&4) && !(flags&VFS_O_METADATA)) {
+    if((VfsMountAttributes(mount)&MountNoDev) && !(flags&VFS_O_METADATA)) {
         VnodeStat stat{};int result=VfsLstatPathRaw(lookup,&stat);
         if(result!=-2 || !(flags&VFS_O_CREATE)) {
             if(!result && VfsNodevDenied(mount,stat,flags))result=-13;
@@ -1254,7 +1258,7 @@ int VfsSpaceInfo(Vnode* vn, VfsSpace* out)
     *out = {};
     if (!vn->ops || !vn->ops->space) return -38; // ENOSYS, never fabricated capacity.
     int error=vn->ops->space(vn,out);
-    if(!error && vn->mountOwner)out->flags|=VfsMountAttributes(static_cast<MountEntry*>(vn->mountOwner))&7;
+    if(!error && vn->mountOwner)out->flags|=VfsMountAttributes(static_cast<MountEntry*>(vn->mountOwner))&MountRestrictionMask;
     return error;
 }
 

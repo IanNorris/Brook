@@ -455,12 +455,14 @@ static void testMountRestrictions(brook::MountNamespace* initial,const brook::Vf
     int error=0;auto* held=VfsPathOpen(dev,VFS_O_READ,&error);assert(held&&!error);
     auto activations=deviceActivations;
     assert(VfsMountNamespaceRemount(initial,stableRoot,6)==-95);
-    for(uint64_t attributes:{0ULL,14ULL,2097158ULL})assert(VfsMountNamespaceRemount(ns,bind,attributes)==-22);
+    for(uint64_t attributes:{16ULL,2097158ULL})assert(VfsMountNamespaceRemount(ns,bind,attributes)==-22);
     assert(static_cast<MountEntry*>(bind.attachment)->attributes==0);
     assert(VfsMountNamespaceRemount(ns,dev,6)==-22);
     assert(!VfsMountNamespaceRemount(ns,bind,2));
     auto* deviceAllowed=VfsPathOpen(dev,VFS_O_READ,&error);assert(deviceAllowed&&!error);VfsRelease(deviceAllowed);activations=deviceActivations;
-    assert(!VfsMountNamespaceRemount(ns,bind,6));assert(VfsMountNamespaceRemount(ns,bind,2)==-1);
+    assert(!VfsMountNamespaceRemount(ns,bind,6));
+    assert(!VfsMountNamespaceRemount(ns,bind,2));
+    assert(!VfsMountNamespaceRemount(ns,bind,6));
     assert(!VfsPathOpen(dev,VFS_O_READ,&error)&&error==-13&&deviceActivations==activations);
     auto* metadata=VfsPathOpen(dev,VFS_O_METADATA,&error);assert(metadata&&!error&&deviceActivations==activations);VfsRelease(metadata);
     VnodeStat stat{};assert(!VfsStat(held,&stat)&&stat.mode==0020666);VfsRelease(held);
@@ -498,6 +500,48 @@ static void testMountRestrictions(brook::MountNamespace* initial,const brook::Vf
     mounts[6].root.children["ns-a"]->children.erase("device");
     assert(allocations.size()==allocated&&g_mounts.count==records);
 }
+static void testRecursiveRemount(brook::MountNamespace* initial,const brook::VfsPath& stableRoot) {
+    using namespace brook;
+    auto allocated=allocations.size();auto records=g_mounts.count;
+    MountNamespace* ns=nullptr;VfsPath root{},cwd{};
+    assert(!VfsMountNamespaceCopy(initial,stableRoot,stableRoot,&ns,&root,&cwd));
+    assert(VfsMountNamespaceActivate(ns));
+    auto source=resolve(root,root,"ns-a"),target=resolve(root,root,"ns-b"),childSource=resolve(root,root,"ns-target");
+    Node point{&mounts[6],720,true,&node(source.object),{},{}};
+    Node program{&mounts[6],721,false,&node(childSource.object),{},{},0100755};
+    node(source.object).children["child"]=&point;
+    node(childSource.object).children["program"]=&program;
+    assert(!VfsMountNamespaceBind(ns,source,target));
+    auto parent=resolve(root,root,"ns-b"),childTarget=resolve(root,parent,"child");
+    assert(!VfsMountNamespaceBind(ns,childSource,childTarget));
+    auto child=resolve(root,parent,"child"),file=resolve(root,child,"program");
+
+    int error=0;auto* reader=VfsPathOpen(file,VFS_O_READ,&error);assert(reader&&!error);
+    assert(VfsMountNamespaceRemount(ns,parent,MountReadOnly|MountNoExec,true)==-16);
+    assert(VfsMountAttributes(static_cast<MountEntry*>(parent.attachment))==0);
+    assert(VfsMountAttributes(static_cast<MountEntry*>(child.attachment))==0);
+    VfsRelease(reader);
+    assert(!VfsMountNamespaceRemount(ns,parent,MountRestrictionMask,true));
+    auto* metadata=VfsPathOpen(file,VFS_O_METADATA,&error);assert(metadata&&!error);
+    assert(VfsMountReadOnly(metadata)&&VfsMountNoExec(metadata));
+    assert(!VfsPathOpen(file,VFS_O_EXEC,&error)&&error==-13);
+    auto rows=infoRows(ns,root);std::string text(rows.size()*4600+1,'\0');uint32_t written=0;
+    assert(!FormatMountInfo(rows.data(),rows.size(),text.data(),text.size(),&written));
+    assert(text.find(" ro,nosuid,nodev,noexec - objects objects rw\n")!=std::string::npos);
+    assert(!VfsMountNamespaceRemount(ns,parent,0));
+    assert(VfsMountReadOnly(metadata)&&VfsMountNoExec(metadata));
+    assert(!VfsMountNamespaceRemount(ns,parent,0,true));
+    assert(!VfsMountReadOnly(metadata)&&!VfsMountNoExec(metadata));VfsRelease(metadata);
+    auto* executable=VfsPathOpen(file,VFS_O_EXEC,&error);assert(executable&&!error);VfsRelease(executable);
+
+    node(source.object).children.erase("child");
+    node(childSource.object).children.erase("program");
+    VfsPathRelease(file);VfsPathRelease(child);VfsPathRelease(childTarget);VfsPathRelease(parent);
+    VfsPathRelease(childSource);VfsPathRelease(target);VfsPathRelease(source);
+    VfsMountNamespaceLeave(ns);VfsPathRelease(root);VfsPathRelease(cwd);VfsMountNamespaceRelease(ns);VfsDrainMountCleanup();
+    assert(allocations.size()==allocated&&g_mounts.count==records);
+}
+
 static void testReadOnlyMount(brook::MountNamespace* initial,const brook::VfsPath& stableRoot) {
     using namespace brook;
     auto allocated=allocations.size();auto records=g_mounts.count;
@@ -516,14 +560,16 @@ static void testReadOnlyMount(brook::MountNamespace* initial,const brook::VfsPat
     // after the descriptor owner retires; final close releases the data hold.
     VfsRetain(reader);VfsRelease(reader);assert(VfsMountNamespaceRemount(ns,bind,3)==-16);VfsRelease(reader);
     assert(!VfsMountNamespaceRemount(ns,bind,3));assert(VfsMountReadOnly(metadata)&&VfsMountReadOnly(directory));
-    assert(VfsMountNamespaceRemount(ns,bind,2)==-1);
+    assert(!VfsMountNamespaceRemount(ns,bind,2));assert(!VfsMountReadOnly(directory));
+    assert(!VfsMountNamespaceRemount(ns,bind,3));
     // Character devices are not filesystem data: a read-only mount neither
     // refuses their writers nor truncates them (shell "> /dev/null").
     Node roDevice{&mounts[6],702,false,&node(source.object),{},{},0020666};node(source.object).children["ro-null"]=&roDevice;
     auto* deviceWriter=VfsOpenAt(root,bind,"ro-null",VFS_O_WRITE|VFS_O_TRUNC,0,0,&error);assert(deviceWriter&&!error);VfsRelease(deviceWriter);
     assert(!VfsAccessAt(root,bind,"ro-null",2));node(source.object).children.erase("ro-null");
     assert(!VfsPathOpen(path,VFS_O_WRITE,&error)&&error==-30);
-    reader=VfsPathOpen(path,VFS_O_READ,&error);assert(reader&&!error);assert(!VfsMountNamespaceRemount(ns,bind,7));assert(VfsMountNamespaceRemount(ns,bind,3)==-1);
+    reader=VfsPathOpen(path,VFS_O_READ,&error);assert(reader&&!error);assert(!VfsMountNamespaceRemount(ns,bind,7));
+    assert(!VfsMountNamespaceRemount(ns,bind,3));assert(!VfsMountNamespaceRemount(ns,bind,7));
     uint64_t offset=0;VnodeTime times[2]{};
     assert(VfsWrite(reader,"x",1,&offset)==-30&&VfsAppend(reader,"x",1,&offset)==-30&&VfsTruncate(reader,0)==-30);
     assert(VfsChmod(directory,0700)==-30&&VfsChown(directory,0,0)==-30&&VfsSetTimes(directory,times)==-30);
@@ -951,12 +997,41 @@ static void testRecursiveBinds(brook::MountNamespace* initial,const brook::VfsPa
     assert(VfsMountNamespaceCount(ns)==nestedCount);
     assert(!VfsMountNamespaceBind(ns,b,b,true));
     graft=resolve(root,root,"/ns-b");assert(!VfsMountNamespaceDetach(ns,graft));VfsPathRelease(graft);
+    // A retained source may come from the old mount namespace after a
+    // narrower user namespace takes ownership of a copy.
+    auto oldSource=resolve(root,root,"/ns-a/sub");
+    auto oldChild=resolve(root,oldSource,"sub");
+    constexpr uint32_t sourceFlags=MountReadOnly|MountNoExec;
+    constexpr uint32_t childFlags=MountReadOnly|MountNoDev|MountNoSuid;
+    assert(!VfsMountNamespaceRemount(ns,oldSource,sourceFlags));
+    assert(!VfsMountNamespaceRemount(ns,oldChild,childFlags));
+
+    // Binds within the same user owner keep its authority over these flags.
+    assert(!VfsMountNamespaceBind(ns,oldSource,target,true));
+    auto sameOwner=resolve(root,root,"/ns-target");
+    assert(!VfsMountNamespaceRemount(ns,sameOwner,0,true));
+    assert(!VfsMountNamespaceDetach(ns,sameOwner));VfsPathRelease(sameOwner);
     // A less-privileged namespace copy locks inherited descendant mounts.
     auto* owner=static_cast<UserNamespace*>(kmalloc(sizeof(UserNamespace)));*owner={};owner->owner=1000;
     MountNamespace* locked=nullptr;VfsPath lockedRoot{},lockedCwd{};
     assert(!VfsMountNamespaceCopy(ns,root,root,&locked,&lockedRoot,&lockedCwd));
     assert(!VfsMountNamespaceSetUserOwnerPrepared(locked,owner));assert(VfsMountNamespaceActivate(locked));
     auto lockedA=resolve(lockedRoot,lockedRoot,"/ns-a"),lockedTarget=resolve(lockedRoot,lockedRoot,"/ns-target");
+    for(bool recursive:{false,true}) {
+        assert(!VfsMountNamespaceBind(locked,oldSource,lockedTarget,recursive));
+        auto imported=resolve(lockedRoot,lockedRoot,"/ns-target");
+        assert(VfsMountNamespaceRemount(locked,imported,MountReadOnly)==-1);
+        assert(!VfsMountNamespaceRemount(locked,imported,sourceFlags));
+        if(recursive) {
+            auto importedChild=resolve(lockedRoot,imported,"sub");
+            assert(VfsMountNamespaceRemount(locked,importedChild,MountReadOnly)==-1);
+            assert(!VfsMountNamespaceRemount(locked,importedChild,childFlags));
+            assert(VfsMountNamespaceRemount(locked,imported,sourceFlags,true)==-1);
+            VfsPathRelease(importedChild);
+        }
+        assert(!VfsMountNamespaceDetach(locked,imported));VfsPathRelease(imported);
+    }
+    VfsPathRelease(oldChild);VfsPathRelease(oldSource);
     assert(!VfsMountNamespaceBind(locked,lockedA,lockedTarget,true));
     auto lockedSub=resolve(lockedRoot,lockedRoot,"/ns-target/sub");
     assert(VfsMountNamespaceDetach(locked,lockedSub)==-22);VfsPathRelease(lockedSub);
@@ -1213,6 +1288,7 @@ int main(){
     testPivotRoots(initial,stableRoot);
     testMountInfo(initial,stableRoot);
     testMountRestrictions(initial,stableRoot);
+    testRecursiveRemount(initial,stableRoot);
     testReadOnlyMount(initial,stableRoot);
     testFileBinds(initial,stableRoot);
     testMagicFileBinds(initial,stableRoot);

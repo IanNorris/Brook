@@ -804,7 +804,7 @@ static int NetNeighborTransmit(NetIf* nif, uint32_t nextHop, uint8_t* frame, uin
 // IPv4 send/receive
 // ---------------------------------------------------------------------------
 
-static void HandleIpv4(const uint8_t* frame, uint32_t len, bool local = false);
+static void HandleIpv4(const uint8_t* frame, uint32_t len, bool local=false,uint64_t scope=0);
 static void TcpStatsMaybeFlush();
 
 // BRO-163 instrument: detect dangerous kernel-stack depth on the egress path.
@@ -925,15 +925,16 @@ static int NetSendIpv4Resolved(NetIf* nif, const MacAddr& dstMac,
     return tryOnly ? nif->tryTransmit(nif,frame,frameLen) : nif->transmit(nif,frame,frameLen);
 }
 static int NetSendIpv4From(uint32_t source, uint32_t dstIp, uint8_t proto,
-                          const void* payload, uint32_t payloadLen)
+                          const void* payload, uint32_t payloadLen,uint64_t scope=0)
 {
+    if(scope && (!Ipv4IsLoopback(dstIp) || (source && !Ipv4IsLoopback(source))))return -101;
 #ifdef BROOK_SOCKET_LIFETIME_TEST
     extern int SocketLifetimeTestTransmit(uint32_t, uint32_t, uint8_t, const void*, uint32_t);
     return SocketLifetimeTestTransmit(source, dstIp, proto, payload, payloadLen);
 #else
     NetSendStackWatermark(dstIp, proto, payloadLen);
 
-    NetIf* nif = NetIfForDst(dstIp);
+    NetIf* nif = scope ? nullptr : NetIfForDst(dstIp);
     const bool loopback = Ipv4IsLoopback(dstIp);
     source = Ipv4Source(source, dstIp, nif ? nif->ipAddr : 0);
     if (!source || (!loopback && (!nif || !nif->ipAddr || Ipv4IsLoopback(source)))) return -1;
@@ -973,11 +974,11 @@ static int NetSendIpv4From(uint32_t source, uint32_t dstIp, uint8_t proto,
         // re-enter NetSendIpv4 -> HandleIpv4 and recurse until the kernel
         // stack overflows. LoopbackSubmit drains the queue iteratively so at
         // most one HandleIpv4 frame is ever live per drainer.
-        LoopbackSubmit(
-            g_loopbackQueue, g_loopbackDraining, frame, frameLen,
+        LoopbackSubmitScoped(
+            g_loopbackQueue, g_loopbackDraining, frame, frameLen, scope,
             []() { SpinLockAcquire(&g_loopbackLock); },
             []() { SpinLockRelease(&g_loopbackLock); },
-            [](const uint8_t* f, uint32_t l) { HandleIpv4(f, l, true); });
+            [](const uint8_t* f, uint32_t l,uint64_t receiverScope) { HandleIpv4(f,l,true,receiverScope); });
         return 0;
     }
 
@@ -1003,7 +1004,7 @@ int NetSendIpv4(uint32_t dstIp, uint8_t proto, const void* payload, uint32_t pay
 }
 
 static int NetSendUdpFrom(uint32_t source, uint32_t dstIp, uint16_t srcPort, uint16_t dstPort,
-                          const void* data, uint32_t dataLen)
+                          const void* data, uint32_t dataLen,uint64_t scope=0)
 {
     uint32_t udpLen = sizeof(UdpHeader) + dataLen;
     if (udpLen > ETH_MTU - sizeof(Ipv4Header)) return -1;
@@ -1017,7 +1018,7 @@ static int NetSendUdpFrom(uint32_t source, uint32_t dstIp, uint16_t srcPort, uin
 
     memcpy(buf + sizeof(UdpHeader), data, dataLen);
 
-    return NetSendIpv4From(source, dstIp, IP_PROTO_UDP, buf, udpLen);
+    return NetSendIpv4From(source,dstIp,IP_PROTO_UDP,buf,udpLen,scope);
 }
 
 int NetSendUdp(uint32_t dstIp, uint16_t srcPort, uint16_t dstPort,
@@ -1030,7 +1031,7 @@ int NetSendUdp(uint32_t dstIp, uint16_t srcPort, uint16_t dstPort,
 // ICMP handling
 // ---------------------------------------------------------------------------
 
-static void HandleIcmp(const Ipv4Header* ip, const uint8_t* payload, uint32_t payloadLen)
+static void HandleIcmp(const Ipv4Header* ip, const uint8_t* payload, uint32_t payloadLen,uint64_t scope)
 {
     if (payloadLen < sizeof(IcmpHeader)) return;
 
@@ -1051,7 +1052,7 @@ static void HandleIcmp(const Ipv4Header* ip, const uint8_t* payload, uint32_t pa
         replyIcmp->checksum = 0;
         replyIcmp->checksum = InetChecksum(reply, payloadLen);
 
-        NetSendIpv4(ip->srcIp, IP_PROTO_ICMP, reply, payloadLen);
+        NetSendIpv4From(0,ip->srcIp,IP_PROTO_ICMP,reply,payloadLen,scope);
     }
 }
 
@@ -1061,14 +1062,14 @@ static void HandleIcmp(const Ipv4Header* ip, const uint8_t* payload, uint32_t pa
 
 // Forward declarations
 static void HandleUdpWithDhcp(const Ipv4Header* ip,
-                               const uint8_t* payload, uint32_t payloadLen);
+                               const uint8_t* payload, uint32_t payloadLen,uint64_t scope);
 static bool IsDnsReply(uint16_t dstPort, const void* data, uint32_t len);
 
 // ---------------------------------------------------------------------------
 // IPv4 receive
 // ---------------------------------------------------------------------------
 
-static void HandleIpv4(const uint8_t* frame, uint32_t len, bool local)
+static void HandleIpv4(const uint8_t* frame, uint32_t len, bool local,uint64_t scope)
 {
     if (len < sizeof(EthHeader) + sizeof(Ipv4Header)) return;
 
@@ -1103,13 +1104,13 @@ static void HandleIpv4(const uint8_t* frame, uint32_t len, bool local)
 
     switch (ip->protocol) {
     case IP_PROTO_ICMP:
-        HandleIcmp(ip, payload, payloadLen);
+        HandleIcmp(ip,payload,payloadLen,scope);
         break;
     case IP_PROTO_UDP:
-        HandleUdpWithDhcp(ip, payload, payloadLen);
+        HandleUdpWithDhcp(ip,payload,payloadLen,scope);
         break;
     case IP_PROTO_TCP:
-        HandleTcp(ip, payload, payloadLen);
+        HandleTcp(ip,payload,payloadLen,scope);
         break;
     }
 }
@@ -1369,10 +1370,10 @@ static void ArpAsyncProbeReceive(NetIf* nif,const void* frame,uint32_t length)
 // as local busy, retaining the TCP slot for retry; success means the NIC has
 // accepted the frame. No shared worker or asynchronous write is enabled.
 static int NetSendIpv4AsyncNeighbor(uint32_t source,uint32_t destination,uint8_t protocol,
-                                   const void* payload,uint32_t length)
+                                   const void* payload,uint32_t length,uint64_t scope=0)
 {
-    if(Ipv4IsLoopback(destination))
-        return NetSendIpv4From(source,destination,protocol,payload,length);
+    if(scope || Ipv4IsLoopback(destination))
+        return NetSendIpv4From(source,destination,protocol,payload,length,scope);
     NetSingleInterfaceSnapshot view{},current{};
     if(!NetReadSingleInterface(&view))return -95;
     if(destination==view.ip)
@@ -1395,11 +1396,12 @@ static int NetSendIpv4AsyncNeighbor(uint32_t source,uint32_t destination,uint8_t
 SocketIdentity NetAllocateSocketIdentity(uint32_t uid,uint32_t gid)
 {return {g_socketInodes.allocate(),uid,gid};}
 
-uint32_t NetInterfaceViews(InterfaceView* out,uint32_t capacity)
+uint32_t NetInterfaceViews(InterfaceView* out,uint32_t capacity,uint64_t scope)
 {
     if(!capacity)return 0;
     uint32_t count=1;
     out[0]={1,0x49,65536,Ipv4Addr(127,0,0,1),Ipv4Addr(255,0,0,0),772,{},"lo"};
+    if(scope)return count;
     const uint64_t flags=IrqSpinLockAcquire(&g_interfaceViewLock);
     for(uint32_t i=0;i<g_netIfCount && count<capacity;++i) {
         auto* nif=g_netIfs[i];
@@ -1424,6 +1426,7 @@ SocketSnapshot NetSnapshotSocket(uint32_t idx)
     if (!snap.used) { IrqSpinLockRelease(&g_socketRegistryLock, flags); return snap; }
     const Socket& s = g_sockets[idx];
     snap.identity   = s.identity;
+    snap.networkScope = s.networkScope;
     snap.type       = s.type;
     snap.localIp    = s.localIp;
     snap.localPort  = s.localPort;
@@ -1877,7 +1880,7 @@ static bool IsDhcpReply(uint16_t dstPort, const void* data, uint32_t len)
 
 // Patched UDP handler that checks DHCP first
 static void HandleUdpWithDhcp(const Ipv4Header* ip,
-                               const uint8_t* payload, uint32_t payloadLen)
+                               const uint8_t* payload, uint32_t payloadLen,uint64_t scope)
 {
     if (payloadLen < sizeof(UdpHeader)) return;
 
@@ -1892,12 +1895,12 @@ static void HandleUdpWithDhcp(const Ipv4Header* ip,
     uint32_t dataLen = udpLen - sizeof(UdpHeader);
 
     // Check DHCP first, then DNS
-    if (IsDhcpReply(dstPort, data, dataLen))
+    if (!scope && IsDhcpReply(dstPort, data, dataLen))
         return;
-    if (IsDnsReply(dstPort, data, dataLen))
+    if (!scope && IsDnsReply(dstPort, data, dataLen))
         return;
 
-    SockDeliverUdp(ip->srcIp, srcPort, ip->dstIp, dstPort, data, dataLen);
+    SockDeliverUdp(ip->srcIp,srcPort,ip->dstIp,dstPort,data,dataLen,scope);
 }
 
 // ---------------------------------------------------------------------------
@@ -2224,7 +2227,7 @@ static SocketRxStorage AllocateSocketRx(uint32_t limit, bool stream)
 }
 
 static int SockCreateOwned(int domain, int type, int protocol, uint32_t pid,
-                           uint32_t uid, uint32_t gid, uint32_t receiveLimit=Socket::RX_DEFAULT,
+                           uint32_t uid, uint32_t gid,uint64_t scope=0,uint32_t receiveLimit=Socket::RX_DEFAULT,
                            bool receiveLocked=false)
 {
     if (domain != AF_INET) return -1;
@@ -2238,6 +2241,7 @@ static int SockCreateOwned(int domain, int type, int protocol, uint32_t pid,
         Socket& socket = g_sockets[i];
         ResetSocketPayload(socket);
         socket.domain = domain;
+        socket.networkScope = scope;
         socket.type = type;
         socket.tcpPeerMss = 536;
         socket.protocol = protocol ? protocol : (type == SOCK_DGRAM ? IPPROTO_UDP : IPPROTO_TCP);
@@ -2292,13 +2296,19 @@ static int SockCreateOwned(int domain, int type, int protocol, uint32_t pid,
 
 }
 
-int SockCreate(int domain, int type, int protocol)
+int SockCreate(int domain, int type, int protocol,uint64_t networkScope)
 {
     Process* self = ProcessCurrent();
     const auto credentials = ProcessFileActorAcquire(self, nullptr);
     const uint32_t uid = credentials.uid, gid = credentials.gid;
     ProcessGroupsRelease(credentials.groups);
-    return SockCreateOwned(domain, type, protocol, self ? self->tgid : 0, uid, gid);
+    return SockCreateOwned(domain, type, protocol, self ? self->tgid : 0,uid,gid,networkScope);
+}
+
+uint64_t SockNetworkScope(int sockIdx)
+{
+    SocketBorrow borrow(sockIdx);
+    return borrow ? g_sockets[sockIdx].networkScope : 0;
 }
 
 int SockBind(int sockIdx, const SockAddrIn* addr)
@@ -2307,6 +2317,7 @@ int SockBind(int sockIdx, const SockAddrIn* addr)
     if (!g_sockUsed[sockIdx]) return -1;
 
     Socket& s = g_sockets[sockIdx];
+    if(s.networkScope && addr->sin_addr && !Ipv4IsLoopback(addr->sin_addr))return -99;
     s.localIp   = addr->sin_addr;
 
     // bind(port=0) means "assign an ephemeral port" (Linux semantics)
@@ -2361,7 +2372,7 @@ int SockSendTo(int sockIdx, const void* buf, uint32_t len,
                      ntohl(dstIp) & 0xFF);
     }
 
-    return NetSendUdpFrom(s.localIp, dstIp, ntohs(s.localPort), dstPort, buf, len);
+    return NetSendUdpFrom(s.localIp,dstIp,ntohs(s.localPort),dstPort,buf,len,s.networkScope);
 }
 
 // Copy n bytes out of a socket rx ring starting at tail (wraps once at most).
@@ -2755,7 +2766,7 @@ bool SockGetTcpInfo(int sockIdx, TcpInfoSource* out)
 
 void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
                     uint32_t dstIp, uint16_t dstPort,
-                    const void* data, uint32_t len)
+                    const void* data, uint32_t len,uint64_t scope)
 {
     // Profile DNS responses (from port 53)
     if (srcPort == 53) {
@@ -2772,7 +2783,8 @@ void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
         if (!borrow) continue;
         Socket& s = g_sockets[i];
         SpinLockAcquire(&s.lock);
-        if (s.type != SOCK_DGRAM || !s.bound || s.localPort != dstPortBE) {
+        if (s.type != SOCK_DGRAM || s.networkScope!=scope || !s.bound || s.localPort != dstPortBE ||
+            (scope && s.localIp && s.localIp!=dstIp)) {
             SpinLockRelease(&s.lock);
             continue;
         }
@@ -3146,8 +3158,8 @@ static int TcpSendSnapshot(Socket& s, const TcpTxSnapshot& snapshot, uint32_t se
     tcp->checksum = 0;
     tcp->checksum = TcpChecksum(snapshot.localIp, snapshot.remoteIp, buf, tcpLen);
 
-    int sendResult = asyncNeighbor ? NetSendIpv4AsyncNeighbor(snapshot.localIp,snapshot.remoteIp,IP_PROTO_TCP,buf,tcpLen)
-                                   : NetSendIpv4From(snapshot.localIp, snapshot.remoteIp, IP_PROTO_TCP, buf, tcpLen);
+    int sendResult = asyncNeighbor ? NetSendIpv4AsyncNeighbor(snapshot.localIp,snapshot.remoteIp,IP_PROTO_TCP,buf,tcpLen,s.networkScope)
+                                   : NetSendIpv4From(snapshot.localIp,snapshot.remoteIp,IP_PROTO_TCP,buf,tcpLen,s.networkScope);
     if (sendResult != 0) {
         if(!asyncNeighbor || sendResult!=-11){TcpTotalAdd(g_tcpTotals.sendFailures,1);SerialPrintf("tcp: send failed flags=0x%02x err=%d\n", flags, sendResult);}
     } else {
@@ -3277,7 +3289,7 @@ static void PruneAcceptQueue(Socket& listener)
     for (int i = 0; i < retiredCount; ++i) SockUnref(retired[i]);
 }
 
-void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
+void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len,uint64_t scope)
 {
     if (len < sizeof(TcpHeader)) return;
 
@@ -3300,7 +3312,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
         if (!borrow) continue;
         Socket& s = g_sockets[i];
         SpinLockAcquire(&s.lock);
-        if (s.type != SOCK_STREAM || s.localPort != dstPort ||
+        if (s.type != SOCK_STREAM || s.networkScope!=scope || s.localPort != dstPort ||
             s.localIp != ip->dstIp || s.remotePort != srcPort || s.remoteIp != ip->srcIp) {
             SpinLockRelease(&s.lock);
             continue;
@@ -3487,7 +3499,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
             if (!borrow) continue;
             Socket& s = g_sockets[i];
             SpinLockAcquire(&s.lock);
-            const bool matches = s.type == SOCK_STREAM && s.localPort == dstPort &&
+            const bool matches = s.type == SOCK_STREAM && s.networkScope==scope && s.localPort == dstPort &&
                 (!s.localIp || s.localIp == ip->dstIp);
             const uint32_t ownerPid = s.ownerPid, uid = s.identity.uid, gid = s.identity.gid;
             const uint32_t receiveLimit = s.rxLimit;
@@ -3521,7 +3533,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
 
             // Create a new socket for this connection
             int childIdx = SockCreateOwned(AF_INET, SOCK_STREAM, IPPROTO_TCP,
-                                           ownerPid, uid, gid, receiveLimit, receiveLocked);
+                                           ownerPid,uid,gid,scope,receiveLimit,receiveLocked);
             if (childIdx < 0)
             {
                 NetCount(g_netCounters.synNoSocket);
@@ -3620,7 +3632,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
         rst->checksum = 0;
         rst->checksum = TcpChecksum(ip->dstIp, ip->srcIp,
                                      rstBuf, sizeof(TcpHeader));
-        NetSendIpv4From(ip->dstIp, ip->srcIp, IP_PROTO_TCP, rstBuf, sizeof(TcpHeader));
+        NetSendIpv4From(ip->dstIp,ip->srcIp,IP_PROTO_TCP,rstBuf,sizeof(TcpHeader),scope);
     }
 }
 
@@ -3634,6 +3646,7 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
     // resolvers answer 0.0.0.0; sending that SYN to the gateway left
     // Chromium's connects hanging instead of being refused immediately.
     const uint32_t destination = addr->sin_addr ? addr->sin_addr : htonl(0x7f000001);
+    if(s.networkScope && !Ipv4IsLoopback(destination))return -101;
 
     // UDP connect: just set default destination
     if (s.type == SOCK_DGRAM) {

@@ -194,8 +194,31 @@ static void TestQueuePrimitive() {
     ASSERT_TRUE(!q.Enqueue(big, 0));    // zero len
 }
 
+static void TestQueuedScopes() {
+    Queue q; q.Reset();
+    bool draining=false;
+    unsigned delivered=0;
+    auto submitLater=[&](const uint8_t*,uint32_t,uint64_t scope) {
+        ++delivered;
+        ASSERT_EQ(scope,42u);
+    };
+    auto deliver=[&](const uint8_t* bytes,uint32_t size,uint64_t scope) {
+        if(scope==41) {
+            ++delivered;
+            brook::LoopbackSubmitScoped(q,draining,bytes,size,42,[]{},[]{},submitLater);
+            ASSERT_EQ(delivered,1u);
+        } else {
+            submitLater(bytes,size,scope);
+        }
+    };
+    const uint8_t byte=1;
+    brook::LoopbackSubmitScoped(q,draining,&byte,1,41,[]{},[]{},deliver);
+    ASSERT_EQ(delivered,2u);
+}
+
 int main() {
     TestQueuePrimitive();
+    TestQueuedScopes();
     TestChainNoRecursion();
     TestDeepChainBounded();
     TestFifoFanout();

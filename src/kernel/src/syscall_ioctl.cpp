@@ -195,8 +195,21 @@ int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
     }
 #endif
 
-    if((fde->type==FdType::Socket || fde->type==FdType::UnixSocket || fde->type==FdType::NetlinkSocket) && ((cmd>=0x8910 && cmd<=0x891b) || cmd==0x8921 || cmd==0x8927 || cmd==0x8933))
-        return NetlinkInterfaceIoctl(cmd,arg);
+    if((fde->type==FdType::Socket || fde->type==FdType::UnixSocket || fde->type==FdType::NetlinkSocket) &&
+       ((cmd>=0x8910 && cmd<=0x891b) || cmd==0x8921 || cmd==0x8927 || cmd==0x8933)) {
+        if(!fde->handle)return -EBADF;
+        uint64_t scope=0;
+        switch(fde->type) {
+        case FdType::Socket:
+            scope=SockNetworkScope(static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle))-1);break;
+        case FdType::UnixSocket:
+            scope=static_cast<UnixSocketData*>(fde->handle)->networkScope;break;
+        case FdType::NetlinkSocket:
+            scope=static_cast<NetlinkSocket*>(fde->handle)->networkScope;break;
+        default:break;
+        }
+        return NetlinkInterfaceIoctl(cmd,arg,scope);
+    }
     if(fde->type==FdType::Vnode && fde->handle && static_cast<Vnode*>(fde->handle)->type==VnodeType::Namespace)
         return cmd==0xb703?0x20000:-25; // NS_GET_NSTYPE; other namespace ioctls unsupported.
     if(fde->type==FdType::SyncFile) {

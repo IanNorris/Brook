@@ -218,7 +218,7 @@ static bool UnixAbstractMatch(const UnixSocketData* candidate, const uint8_t* ad
 }
 
 UnixSocketData* UnixFindServer(const char* path, const VnodeStat* node,
-                               const uint8_t* abstractAddress, uint32_t abstractLength)
+                               const uint8_t* abstractAddress, uint32_t abstractLength,uint64_t scope)
 {
     SpinLockAcquire(&g_unixRegistryLock);
     UnixSocketData* found = nullptr;
@@ -228,8 +228,8 @@ UnixSocketData* UnixFindServer(const char* path, const VnodeStat* node,
         // An empty path names nothing; it must not match an unnamed listener.
         const bool match = node ? candidate->boundNode &&
             candidate->boundDev == node->dev && candidate->boundIno == node->ino :
-            abstractAddress ? UnixAbstractMatch(candidate, abstractAddress, abstractLength) :
-            path && path[0] && !candidate->boundNode && strcmp(candidate->path, path) == 0;
+            abstractAddress ? candidate->networkScope==scope && UnixAbstractMatch(candidate, abstractAddress, abstractLength) :
+            path && path[0] && !candidate->boundNode && candidate->networkScope==scope && strcmp(candidate->path, path) == 0;
         if (match) {
             uint32_t previous = __atomic_fetch_add(&candidate->refCount, 1, __ATOMIC_RELAXED);
             UNIX_LIFE(RegistryPin, candidate, previous, previous + 1, -1);
@@ -249,7 +249,7 @@ bool UnixAbstractNameInUse(const uint8_t* address, uint32_t length, const UnixSo
     bool used = false;
     for (int i = 0; i < UNIX_MAX_SERVERS && !used; i++) {
         auto* candidate = g_unixServers[i];
-        used = candidate && candidate != except &&
+        used = candidate && candidate != except && candidate->networkScope==(except ? except->networkScope : 0) &&
                candidate->state == UnixSocketData::State::Listening &&
                UnixAbstractMatch(candidate, address, length);
     }

@@ -16,18 +16,23 @@ namespace brook {
 
 constexpr unsigned MAX_PROCESSES=1024;
 struct SupplementaryGroups {unsigned count;unsigned ids[2];};
+struct IpcNamespace {};
+struct UserNamespace {};
 struct Process {
     unsigned pid,tgid,euid=1000,egid=1000;
     uint64_t incarnation=1,wakeupTick=0;
     bool terminalPending=false;
     int pendingWakeup=0;
     std::atomic<int> refs{1},regions{0};
+    const IpcNamespace* ipcScope=nullptr;
     std::mutex mutex;
     std::condition_variable cv;
     explicit Process(unsigned id):pid(id),tgid(id){}
 };
 static constexpr unsigned CapSysAdmin=21;
 static bool ProcessCapable(Process* p,void*,unsigned){return p && p->euid==0;}
+static const IpcNamespace* ProcessIpcScope(Process* p){return p->ipcScope;}
+static UserNamespace* ProcessIpcOwner(const IpcNamespace*){return nullptr;}
 static std::atomic<int> allocations{0};
 static bool failAllocation=false;
 extern "C" void* kmalloc(uint64_t size) {if(failAllocation)return nullptr;auto* p=std::malloc(size);if(p)++allocations;return p;}
@@ -125,6 +130,22 @@ int main(){
     std::vector<std::thread> workers;
     for(unsigned j=0;j<4;++j)workers.emplace_back([&,j]{Process p(10+j);for(unsigned i=0;i<500;++i)CHECK(op(p,id,1)==0);SysvSemExit(&p);CHECK(p.refs==1 && p.regions==0);});
     for(auto& t:workers)t.join();CHECK(ctl(a,id,12)==2000);CHECK(ctl(a,id,0)==0);
+    // Identical keys are distinct across IPC namespaces, even for the same
+    // desktop uid. IDs cannot be used to cross the namespace boundary.
+    IpcNamespace first,second;
+    Process x(20),y(21),xChild(22);
+    x.ipcScope=xChild.ipcScope=&first;y.ipcScope=&second;
+    const int privateId=SysvSemGet(&x,123,1,01000|0600);
+    const int otherId=SysvSemGet(&y,123,1,01000|0600);
+    CHECK(privateId>0&&otherId>privateId);
+    CHECK(SysvSemGet(&a,123,0,0400)==-2);
+    CHECK(SysvSemGet(&xChild,123,0,0400)==privateId);
+    CHECK(SysvSemCount(&y,privateId)==-22&&ctl(y,privateId,0)==-22);
+    CHECK(op(y,privateId,1)==-22&&SysvSemClone(&x,&y,true)==-22);
+    CHECK(ctl(x,privateId,16,0,9)==0&&ctl(y,otherId,12)==0);
+    SysvSemRetireNamespace(&first);
+    CHECK(SysvSemCount(&x,privateId)==-22&&SysvSemCount(&y,otherId)==1);
+    SysvSemRetireNamespace(&second);
     SysvSemExit(&a);SysvSemExit(&b);SysvSemExit(&c);SemDrainGarbage();
     CHECK(allocations==0 && a.refs==1 && b.refs==1 && c.refs==1);
     CHECK(a.regions==0 && b.regions==0 && c.regions==0 && !semWaiters && !semSets);

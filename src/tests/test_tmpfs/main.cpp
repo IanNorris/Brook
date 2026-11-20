@@ -763,6 +763,14 @@ int main()
         assert(!TmpfsDestroy(peer) && !TmpfsDestroy(large));clean();
     }
     TmpfsMountOptions options{};
+    uint16_t master=0123;
+    assert(!ParseDevptsOptions("newinstance,ptmxmode=0666,mode=620",&master) && master==0666);
+    assert(!ParseDevptsOptions("ptmxmode=0600,newinstance",&master) && master==0600);
+    assert(!ParseDevptsOptions("newinstance",&master) && master==0);
+    for(const char* data:{"ptmxmode=0666", "newinstance,", "newinstance,newinstance",
+                          "newinstance,ptmxmode=0008", "newinstance,mode=1777",
+                          "newinstance,gid=5", "newinstance,ptmxmode="})
+        assert(ParseDevptsOptions(data,&master)==-22 && master==0);
     assert(!ParseTmpfsMountOptions(nullptr,&options) && options.mode==01777);
     assert(!ParseTmpfsMountOptions("",&options) && options.mode==01777);
     assert(!ParseTmpfsMountOptions("mode=0700,mode=0755",&options) && options.mode==0755);

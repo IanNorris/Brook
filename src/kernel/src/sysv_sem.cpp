@@ -1,6 +1,7 @@
 #include "process_user_namespace.h"
 #include "sysv_sem.h"
 #include "process.h"
+#include "process_namespaces.h"
 #include "scheduler.h"
 #include "spinlock.h"
 #include "memory/heap.h"

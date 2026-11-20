@@ -1,5 +1,6 @@
 #include "procfs_vfs.h"
 #include "vfs.h"
+#include "mount_namespace.h"
 #include "procfs.h"
 #include "memory/heap.h"
 
@@ -47,6 +48,15 @@ static const VfsFsOps g_procFsOps = {
     .root_object=ProcFsRootObject,
     .vnode_object=ProcFsVnodeObject,
 };
+
+int ProcFsMountPrivate(MountNamespace* ns,const VfsPath& target,uint64_t attributes)
+{
+    // Proc objects query the caller's process view. This token separates
+    // backing lifetimes without presenting an additional system process table.
+    static uint8_t instanceToken;
+    return VfsMountNamespaceMountFresh(ns,target,"procfs",&g_procFsOps,&instanceToken,0,
+        attributes|MountNoSuid|MountNoDev|MountNoExec);
+}
 
 void ProcFsVfsRegister()
 {

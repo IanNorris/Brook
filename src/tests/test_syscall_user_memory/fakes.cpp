@@ -129,7 +129,8 @@ void TtyPutChar(char) {}
 bool WmIsActive() { return true; }
 int64_t SignalFdRead(Process*,SignalFd*,uint64_t,uint64_t,bool) { return -EBADF; }
 uint64_t TimerFdDeadline(TimerFdData*,uint64_t*) { return 0; }
-uint32_t NetInterfaceViews(InterfaceView*,uint32_t) { return 0; }
+uint64_t SockNetworkScope(int) { return 0; }
+uint32_t NetInterfaceViews(InterfaceView*,uint32_t,uint64_t) { return 0; }
 FileActorSnapshot ProcessFileActorAcquire(Process*,UserNamespace*,bool) { return {}; }
 void ProcessGroupsRelease(SupplementaryGroups*) {}
 CredentialIds ProcessReadIds(Process*,bool) { return {}; }

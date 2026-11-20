@@ -264,6 +264,7 @@ add_host_test(test_hda_dell_tone_ici)
 add_host_test(test_hda_dell_tone_integration)
 add_host_test(test_hda_dell_tone_adapter)
 add_host_test(test_audio_mix_contributions)
+add_host_test(test_posix_mqueue_order)
 add_host_test(test_sysv_sem_ops)
 add_host_test(test_sysv_sem_service)
 set_tests_properties(test_sysv_sem_service PROPERTIES TIMEOUT 20)
@@ -439,6 +440,7 @@ target_compile_options(test_tcp PRIVATE
 # Real syscall handlers against a fake user address space. Handlers must reach
 # user memory only through the checked copies; see harness.h.
 add_host_test(test_syscall_user_memory
+    "${BROOK_ROOT}/src/kernel/src/process_namespaces.cpp"
     "${BROOK_ROOT}/src/tests/test_syscall_user_memory/input_wm.cpp"
     "${BROOK_ROOT}/src/tests/test_syscall_user_memory/dir_open.cpp"
     "${BROOK_ROOT}/src/tests/test_syscall_user_memory/rw.cpp"
