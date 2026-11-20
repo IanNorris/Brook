@@ -86,19 +86,24 @@ def extract(disk, path, offset, size):
         dest.write(image)
 
 
-def check_volumes(disk, work, output, expect_clean):
+def check_volumes(disk, work, output, expect_clean, *, expect_repair=False):
     fat, data = work / 'esp.img', work / 'data.img'
     extract(disk, fat, ESP_OFFSET, ESP_BYTES)
     extract(disk, data, DATA_OFFSET, DATA_BYTES)
     with output.open('wb') as log:
         subprocess.run(['fsck.fat', '-n', str(fat)], check=True, stdout=log, stderr=subprocess.STDOUT)
-        subprocess.run(['e2fsck', '-f', '-n', str(data)], check=True, stdout=log, stderr=subprocess.STDOUT)
+        check = subprocess.run(['e2fsck', '-f', '-n', str(data)], stdout=log, stderr=subprocess.STDOUT)
+        # A crash can leave pending allocation metadata. Only the synthetic
+        # panic step can report uncorrected errors because it must be followed
+        # by the checked recovery boot and a clean, successful e2fsck.
+        if check.returncode and not (expect_repair and check.returncode == 4):
+            check.check_returncode()
     with data.open('rb') as image:
         image.seek(1024 + 58)
         clean = image.read(2) == b'\x01\0'
         if clean != expect_clean:
             raise RuntimeError(f'data-volume header clean={clean}, expected {expect_clean}')
-    return clean
+    return clean, check.returncode
 
 
 def finish_checked_shutdown(work, port, evidence, restart=False):
@@ -440,9 +445,11 @@ def run_matrix(a, base_disk, normal, work, guards, metadata, panic_journal):
                     guarded_records != expected_guards or
                     [read_fat(media, f'UPDATES/SELECT{j}.BIN') for j in range(2)] != selectors):
                 raise RuntimeError(f'{name}-{i}: shared guarded boot data changed')
-            clean = check_volumes(disk, scenario, prefix.with_name(prefix.name + '-fsck.log'),
-                                  expect_clean=result not in ('profile', 'panic'))
+            clean, fsck_exit = check_volumes(
+                disk, scenario, prefix.with_name(prefix.name + '-fsck.log'),
+                expect_clean=result not in ('profile', 'panic'), expect_repair=result == 'panic')
             verdict[name].append(dict(result=result, generation=GENERATIONS[slot] if slot is not None else None,
-                                      slot=slot, starts=count, fat_clean=True, ext2_clean=clean, **report))
+                                      slot=slot, starts=count, fat_clean=True, ext2_clean=clean,
+                                      ext2_fsck_exit=fsck_exit, **report))
             (a.output/'slot-matrix.json').write_text(json.dumps(verdict, indent=2) + '\n')
     print('GUARD_SLOT_FALLBACK_MATRIX_PASS', flush=True)
