@@ -2,6 +2,7 @@
 import json,re,uuid
 from pathlib import Path
 from hardware_update_workflow import UpdateRun
+from binary_bridge import receiver_key
 from hardware_store_protocol import provision,prepare_source
 from hardware_bulk_protocol import identifier
 
@@ -10,9 +11,12 @@ class StoreRun(UpdateRun):
         if isinstance(port,bool) or not isinstance(port,int) or not 1<=port<=65535:raise ValueError('Invalid store port')
         if helper!='/boot/HWSTORE.ELF' and not re.fullmatch(r'/data/\.brook-transfer/[0-9a-f]{32}\.bin',helper):raise ValueError('Invalid fixed helper path')
         image=Path(image).resolve(strict=True);record=Path(record).read_bytes()
-        with Path(key_file).open() as f:key=identifier(f.read(33))
         prepared=prepare_source(image,record,sha256)
-        data=self.bridge.load_session(session);boot=identifier(data['guest_boot_id']);doctor=self.bridge.doctor(session)
+        data=self.bridge.load_session(session);boot=identifier(data['guest_boot_id'])
+        key=receiver_key(data,key_file)
+        if data.get('auth_mode')=='v3' and helper!='/boot/HWSTORE.ELF':
+            raise ValueError('v3 requires its packaged boot store receiver')
+        doctor=self.bridge.doctor(session)
         if doctor.get('probe_stage')!='verified' or not doctor.get('reachable') or not doctor.get('identity_matches'):raise RuntimeError('Pinned guest boot probe is incomplete or not reachable/matching')
         tx=uuid.uuid4().hex;self.output.mkdir(parents=True,exist_ok=False,mode=0o700)
         self.save(state='prepared',session=session,guest_boot_id=boot,transaction_id=tx,image=str(image),record=record.decode('ascii'),sha256=sha256,helper=helper)

@@ -1150,3 +1150,11 @@ target_compile_options(test_arp_neighbor PRIVATE "-iquote${BROOK_ROOT}/src/kerne
 add_test(NAME test_launcher_stage COMMAND python3 "${BROOK_ROOT}/tools/launcher-stage/test_install.py")
 
 add_test(NAME test_brook_session_env COMMAND python3 "${BROOK_ROOT}/scripts/test_brook_session_env.py")
+
+add_library(bridge_v3_interop SHARED
+    "${BROOK_ROOT}/src/shared/update/bridge_v3.c"
+    "${BROOK_ROOT}/src/third_party/monocypher/monocypher.c"
+    "${BROOK_ROOT}/src/third_party/monocypher/monocypher-ed25519.c")
+target_include_directories(bridge_v3_interop PRIVATE "${BROOK_ROOT}/src/third_party/monocypher")
+add_test(NAME test_bridge_v3_interop COMMAND python3
+    "${BROOK_ROOT}/tools/test_bridge_v3.py" "$<TARGET_FILE:bridge_v3_interop>")

@@ -13,7 +13,7 @@ import hashlib
 import zlib
 
 from common import ROOT,write_json
-from guest_transport import exchange
+from guest_transport import exchange,exchange_v3
 from jobs import Jobs,GuestJobError,validate_id
 from ui import Ui
 if str(Path(__file__).resolve().parents[1]) not in sys.path:
@@ -38,6 +38,9 @@ class Hardware:
         if live and data.get('state')!='running':raise RuntimeError('Hardware session is detached')
         self.endpoint(data['host'],data['port']);validate_id(data['guest_boot_id'])
         if data['guest_boot_id']=='0'*32:raise ValueError('Unset hardware boot identity')
+        mode=data.get('auth_mode','legacy')
+        if mode not in ('v3','legacy') or (mode=='v3' and not isinstance(data.get('operator_key_file'),str)):
+            raise ValueError('Invalid hardware session authentication policy')
         return data
 
     @staticmethod
@@ -73,7 +76,14 @@ class Hardware:
 
     def guest_batch(self,data,commands,timeout=8,progress=None,on_reply=None):
         arguments=(data['host'],data['port'],[self.guarded(data,c) for c in commands],timeout)
-        if progress is not None or on_reply is not None:replies=exchange(*arguments,progress=progress,on_reply=on_reply)
+        if data.get('auth_mode')=='v3':
+            from bridge_v3 import BridgeV3BootMismatch
+
+            try:
+                replies=exchange_v3(*arguments,data['operator_key_file'],data['guest_boot_id'],progress=progress,on_reply=on_reply)
+            except BridgeV3BootMismatch as error:
+                raise HardwareBootChanged('Stale guest boot') from error
+        elif progress is not None or on_reply is not None:replies=exchange(*arguments,progress=progress,on_reply=on_reply)
         else:replies=exchange(*arguments)
         for reply in replies:
             if 'boot_error' in reply:raise HardwareBootChanged('Stale guest boot')
@@ -81,20 +91,34 @@ class Hardware:
 
     def guest(self,data,command,timeout=8):return self.guest_batch(data,[command],timeout)[0]
 
-    def attach(self,host,port=1234,**_):
-        host,port=self.endpoint(host,port);proposal=uuid.uuid4().hex
-        epoch,caps=exchange(host,port,['bridge epoch init '+proposal,'bridge hardware caps'],8)
-        boot=epoch.get('boot_id');validate_id(boot)
+    def attach(self,host,port=1234,auth_mode='v3',operator_key_file=None,**_):
+        host,port=self.endpoint(host,port)
+        if auth_mode=='v3':
+            configured=operator_key_file or os.environ.get('BROOK_BRIDGE_V3_OPERATOR_KEY')
+            if not configured:
+                raise ValueError('Set BROOK_BRIDGE_V3_OPERATOR_KEY or give an operator key file')
+            operator_key_file=str(Path(configured).absolute())
+            caps,=exchange_v3(host,port,['bridge hardware caps'],8,operator_key_file)
+            if caps.get('auth_version')!=3 or caps.get('auth_suite')!=1:
+                raise RuntimeError('Guest does not advertise bridge v3 phase 1')
+            boot=caps.get('boot_id')
+        elif auth_mode=='legacy':
+            epoch,caps=exchange(host,port,['bridge epoch init '+uuid.uuid4().hex,'bridge hardware caps'],8)
+            boot=epoch.get('boot_id')
+        else:
+            raise ValueError('Expected explicit bridge mode v3 or legacy')
+        validate_id(boot)
         if boot=='0'*32 or caps.get('hardware_api')!=1 or not caps.get('boot_guard') or caps.get('boot_id')!=boot:
             raise RuntimeError('Guest lacks matching hardware/boot-guard support; update the hardware image')
         if self.registry.is_symlink():raise ValueError('Hardware registry must not be a symlink')
         self.registry.mkdir(parents=True,exist_ok=True,mode=0o700)
         session=uuid.uuid4().hex;directory=self.registry/session;directory.mkdir(mode=0o700)
         data=dict(session=session,owner_uid=os.getuid(),transport='guest_tcp',host=host,port=port,state='running',
-            generation=uuid.uuid4().hex,guest_boot_id=boot,created_unix=time.time(),guest_capabilities=caps)
+            generation=uuid.uuid4().hex,guest_boot_id=boot,created_unix=time.time(),guest_capabilities=caps,auth_mode=auth_mode)
+        if auth_mode=='v3':data['operator_key_file']=operator_key_file
         write_json(directory/'session.json',data)
         return {'session':session,'generation':data['generation'],'guest_boot_id':boot,'endpoint':f'{host}:{port}',
-            'guest':caps,'note':'Pinned to this guest boot. Attach explicitly again after reboot; old operation IDs remain historical.'}
+            'guest':caps,'auth_mode':auth_mode,'note':'Pinned to this guest boot. Attach explicitly again after reboot; old operation IDs remain historical.'}
 
     def detach(self,session,**_):
         """Explicitly end this attachment: clear the guest agent indicator and

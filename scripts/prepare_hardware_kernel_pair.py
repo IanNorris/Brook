@@ -21,6 +21,7 @@ import subprocess
 import tempfile
 
 from elftools.elf.elffile import ELFFile
+from bridge_keyless_image import require_keyless_image
 from hardware_recovery_fsck import validate_checker
 from stage_clearwater_shell import add_clearwater_start, embed_clearwater_executables
 
@@ -149,6 +150,7 @@ def prepare(source, build, abi, payload_id, output, expected_kernel_sha256, pani
     with tempfile.TemporaryDirectory(prefix='brook-hardware-pair-') as directory:
         captured = Path(directory) / 'source.img'
         captured.write_bytes(source_data)
+        require_keyless_image(captured)
         listing = subprocess.check_output(['mdir', '-a', '-b', '-i', str(captured), '::/DRIVERS/*'], text=True)
     names = [line.rsplit('/', 1)[-1] for line in listing.splitlines() if line]
     if not names or len({n.lower() for n in names}) != len(names):

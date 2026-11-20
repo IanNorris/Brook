@@ -65,3 +65,57 @@ def exchange(host,port,commands,timeout=8,progress=None,on_reply=None):
                 del buffer[:finish+len(end)]
             if len(results)==len(frames):return results
     raise TimeoutError("No complete guest response; delivery/completion is unknown (not retried)")
+
+
+def exchange_v3(host, port, commands, timeout, key_file, boot_id=None, progress=None, on_reply=None):
+    """One authenticated command and terminal response per socket."""
+    from pathlib import Path
+    from bridge_v3 import COMMAND, DATA, END, ZERO_ID, BridgeV3Error, open_bridge_v3, read_operator_key
+
+    validate_commands(commands)
+    if boot_id is None and commands != ["bridge hardware caps"]:
+        raise ValueError("An unbound bridge boot supports only status discovery")
+    key = read_operator_key(Path(key_file))
+    expected = ZERO_ID if boot_id is None else bytes.fromhex(boot_id)
+    results = []
+    deadline = time.monotonic() + timeout
+    for command in commands:
+        token = str(int(uuid.uuid4().hex[:12], 16))
+        frame = f"@{token} {command}\n".encode()
+        if progress:
+            progress("connecting", len(results))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Bridge command batch deadline")
+        with socket.create_connection((host, port), timeout=min(remaining, 4)) as sock:
+            if progress:
+                progress("connected", len(results))
+            connection = open_bridge_v3(
+                sock, key, COMMAND, 0 if boot_id is None else 1, expected, uuid.uuid4().bytes,
+                deadline=min(deadline, time.monotonic() + 4),
+            )
+            connection.send(DATA, frame, deadline)
+            connection.send(END, b"", deadline)
+            if progress:
+                progress("request_sent", len(results))
+            reply = bytearray()
+            while True:
+                kind, payload = connection.receive(deadline)
+                if kind == END:
+                    break
+                reply.extend(payload)
+                if len(reply) > 2 * 1024 * 1024:
+                    raise BridgeV3Error("Guest reply exceeded bounded receive buffer")
+        begin = f"BRIDGE_BEGIN {token}\n".encode()
+        end = f"BRIDGE_END {token}\n".encode()
+        if not reply.startswith(begin) or not reply.endswith(end):
+            raise BridgeV3Error("Guest command reply lacks its complete framed response")
+        response = parse_guest_reply(reply[len(begin):-len(end)].decode(errors="replace"))
+        if boot_id is None and response.get("boot_id") != connection.boot_id.hex():
+            raise BridgeV3Error("Guest status boot differs from its handshake")
+        results.append(response)
+        if progress:
+            progress("frame_complete", len(results))
+        if on_reply:
+            on_reply(len(results), response)
+    return results

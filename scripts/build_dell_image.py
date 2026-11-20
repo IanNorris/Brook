@@ -24,8 +24,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SHARED = Path('/data/Programming/Brook/shared/dell')
-SOURCE_INITRD = 'source-initrd-cc876d82.img'
-SOURCE_INITRD_SHA = 'cc876d82a1f523f6b60bacabba883daf3a4482ab012e80580fabfa9bafdb6a11'
+SOURCE_INITRD = 'source-initrd-keyless-v1.img'
+SOURCE_INITRD_SHA = '1d08775083ce3ef2df8d4990d1c45f5ef463f1eba4048320149f7afd1b82460b'
 MODULE_ABI_HEADER = ROOT / 'src/kernel/src/module_abi.h'
 
 # Kernel options matching the accepted gen 338/355 Dell baseline.
