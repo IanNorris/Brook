@@ -5,6 +5,25 @@ Current state and immediate goal. Keep this short and current: replace stale lin
 _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review follow-up)._
 
 
+## Clearwater Stage 3 reconciliation (19 November 2026)
+
+- `work/clearwater-s3-reconcile` merges Stage 3 into integration60 `a3f6685e`.
+  Tested implementation `c11c9043`. The restartable shell builds the launcher
+  from the current owned model and frame. Hit testing, layout persistence,
+  fine-scroll remainder and `focus.shell` stay in the WM.
+- Headless Release, 386 non-stress host tests, all 728 unchanged chrome goldens
+  and 25 staging/verification tests passed. The shell, waylandd, compositor
+  and Settings packages built.
+- Baseline against candidate QEMU captures cover 12 material, mode and
+  scale combinations and 48 scenes. Launcher pixels match except for the
+  build label. The stable left taskbar regions match. Live timing and boot
+  overlays vary by boot. Killing the shell showed the fallback and restored
+  the open launcher and terminal. Captures, comparisons and logs are under
+  `build/s3r-evidence`.
+- The pair `build/dell/pair-s3r` (`dell-s3r-20261119`) was built from
+  `c11c9043` with Clearwater enabled and the four Broadwell options.
+  Guarded QEMU passed on attempt 1. Dell deployment is pending.
+
 ## Session environment and executable cache (19 November 2026)
 
 - `work/session-env` uses an app-owned `/tmp/brook-$UID` directory with mode

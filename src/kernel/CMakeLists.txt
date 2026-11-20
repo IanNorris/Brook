@@ -337,6 +337,7 @@ add_executable(kernel
     src/chrome_shell.cpp
     src/chrome_launcher.cpp
     src/launcher_model.cpp
+    src/shell_service.cpp
     src/terminal.cpp
     src/rtc.cpp
     src/kvmclock.cpp

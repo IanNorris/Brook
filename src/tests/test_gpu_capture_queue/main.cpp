@@ -24,6 +24,17 @@ brook::WmContentSnapshot content{true,false,1,1,0,0};
 uint64_t latest=1;
 brook::CaptureRequest* running;
 brook::GpuCompositorOps ops{};
+
+void CaptureOverlayAt(uint64_t now, int32_t mx, int32_t my, bool cursor) {
+    using namespace brook;
+    const auto frame = CaptureShellFrame(g_physFbWidth, g_physFbHeight, now, mx, my);
+    CaptureDesktopOverlay(frame, now, mx, my, cursor);
+}
+
+void CheckOverlayAt(uint64_t now, int32_t mx, int32_t my) {
+    using namespace brook;
+    CheckDesktopOverlay(now, CaptureShellFrame(g_physFbWidth, g_physFbHeight, now, mx, my));
+}
 }
 namespace brook {
 uint64_t WmBackdropStyleVersion(){
@@ -38,11 +49,11 @@ void KMutexUnlock(KMutex* m) { CHECK(locks>0);--locks;(m==&g_debugFrameLock?fram
 VirtualAddress VmmAllocPages(uint64_t,uint64_t,MemTag,uint16_t) { return VirtualAddress{}; }
 void VmmFreePages(VirtualAddress,uint64_t) { std::abort(); }
 uint32_t WmDesktopHeight(uint32_t h) { return h-1; }
-bool WmTaskbarHidden() { return false; }
-extern unsigned taskbarDraws;
-void WmRenderTaskbar(uint32_t* p,uint32_t stride,uint32_t w,uint32_t h,uint64_t,int32_t,int32_t) {
-    ++taskbarDraws;
-    for(uint32_t x=0;x<w;++x)p[(h-1)*stride+x]=0x00123456;
+bool taskbarHidden=false;
+bool WmTaskbarHidden() { return taskbarHidden; }
+WmPalette WmCurrentPalette() {
+    static const WmPalette palette = [] { WmPalette value{}; value.taskbar = 0x00abc123; return value; }();
+    return palette;
 }
 bool launcherVisible=true;
 bool WmLauncherVisible() {return launcherVisible;}
@@ -51,17 +62,14 @@ Process* waiterProc;int blockCalls=0;bool captureOnBlock=false;unsigned waiterWa
 Process* ProcessCurrent(){return waiterProc;}
 void SchedulerBlock(Process* p){
     CHECK(!locks && p==waiterProc);++blockCalls;
-    if(captureOnBlock){captureOnBlock=false;CaptureDesktopOverlay(g_lapicTickCount,0,0,false);}
+    if(captureOnBlock){captureOnBlock=false;CaptureOverlayAt(g_lapicTickCount,0,0,false);}
     else g_lapicTickCount=p->wakeupTick;
 }
 void WmLauncherGetRect(uint32_t,uint32_t,int32_t* x,int32_t* y,uint32_t* w,uint32_t* h){*x=1;*y=1;*w=2;*h=2;}
-void WmLauncherRender(uint32_t* p,uint32_t stride,uint32_t,uint32_t,int32_t,int32_t){for(unsigned y=1;y<3;++y)for(unsigned x=1;x<3;++x)p[y*stride+x]=0x00654321;}
 bool volumeVisible=false;
 bool WmTrayTooltipGetRect(uint32_t,uint32_t,int32_t,int32_t,int32_t*,int32_t*,uint32_t*,uint32_t*){return false;}
-void WmTrayTooltipRender(uint32_t*,uint32_t,uint32_t,uint32_t,int32_t,int32_t){}
 bool WmVolumePopupVisible(){return volumeVisible;}
 void WmVolumePopupGetRect(uint32_t,uint32_t,int32_t* x,int32_t* y,uint32_t* w,uint32_t* h){*x=4;*y=1;*w=2;*h=2;}
-void WmVolumePopupRender(uint32_t* p,uint32_t stride,uint32_t,uint32_t,int32_t,int32_t){for(unsigned y=1;y<3;++y)for(unsigned x=4;x<6;++x)p[y*stride+x]=0x00777777;}
 bool WmPointerCaptureActive(){return false;}
 bool WmTrayFlyoutRect(uint32_t,uint32_t,int32_t*,int32_t*,uint32_t*,uint32_t*){return false;}
 bool summaryAndHudVisible = false;
@@ -69,22 +77,15 @@ bool WmPerformanceHudRect(uint32_t,uint32_t,int32_t* x,int32_t* y,uint32_t* w,ui
     *x = 3; *y = 3; *w = 1; *h = 1;
     return summaryAndHudVisible;
 }
-void WmRenderTrayFlyout(uint32_t*,uint32_t,uint32_t,uint32_t){std::abort();}
-void WmRenderPerformanceHud(uint32_t* pixels,uint32_t stride,uint32_t,uint32_t) {
-    CHECK(summaryAndHudVisible);
-    pixels[3 * stride + 3] = 0x00112233;
-}
 bool WmBootSummaryRect(uint32_t,uint32_t,int32_t* x,int32_t* y,uint32_t* w,uint32_t* h) {
     *x = 7; *y = 0; *w = 1; *h = 1;
     return summaryAndHudVisible;
 }
-void WmRenderBootSummary(uint32_t* pixels,uint32_t,uint32_t,uint32_t) {
-    CHECK(summaryAndHudVisible);
-    pixels[7] = 0x00445566;
-}
-// Content keys (window.cpp builds and hashes the display lists): constant
-// per kind here, so only appearing, leaving or moving surfaces change them.
-uint64_t shellKeyBump=0;unsigned taskbarDraws=0;
+// Stage a publication for the next compositor frame. The fake rasterizer
+// counts cache misses and paints distinguishable data for each surface.
+uint64_t shellKeyBump=0, publishedKeyBump=0;
+unsigned taskbarDraws=0;
+bool shellRunning=true, publishedShellRunning=true;
 BrookDesktopSurface WmShellSurfaceRecord(const WmShellSurface& s,uint64_t key){
     BrookDesktopSurface r{};r.kind=uint32_t(s.kind)+3;r.key=key;r.x=s.x;r.y=s.y;r.width=s.w;r.height=s.h;
     if (s.material && CompositorGlassActive()) r.material = BROOK_DESKTOP_MATERIAL_GLASS;
@@ -92,8 +93,31 @@ BrookDesktopSurface WmShellSurfaceRecord(const WmShellSurface& s,uint64_t key){
     r.opacity = 255;
     return r;
 }
-uint64_t WmShellSurfaceKey(const WmShellSurface& s,uint32_t,uint32_t,uint64_t,int32_t,int32_t){
-    return 0x100+uint64_t(s.kind)+(s.kind==WmShellSurfaceKind::Taskbar?shellKeyBump:0);}
+void ShellServiceBeginFrame(uint64_t) {
+    publishedKeyBump = shellKeyBump;
+    publishedShellRunning = shellRunning;
+}
+bool ShellServiceWarmLauncher(uint32_t, uint32_t, uint64_t) { return false; }
+void ShellServiceEndCapture(uint32_t) {}
+uint64_t ShellServiceCapture(const WmShellSurface& s,uint32_t,uint32_t,uint64_t,int32_t,int32_t) {
+    if (!publishedShellRunning) return 0;
+    return 0x100 + uint64_t(s.kind) + (s.kind == WmShellSurfaceKind::Taskbar ? publishedKeyBump : 0);
+}
+void ShellServiceDraw(const WmShellSurface& s,uint32_t* p,uint32_t stride,uint32_t,uint32_t) {
+    CHECK(publishedShellRunning);
+    uint32_t color = 0;
+    switch (s.kind) {
+    case WmShellSurfaceKind::Taskbar: ++taskbarDraws; color = 0x00123456; break;
+    case WmShellSurfaceKind::Launcher: color = 0x00654321; break;
+    case WmShellSurfaceKind::VolumePopup: color = 0x00777777; break;
+    case WmShellSurfaceKind::PerformanceHud: color = 0x00112233; break;
+    case WmShellSurfaceKind::BootSummary: color = 0x00445566; break;
+    default: std::abort();
+    }
+    for (uint32_t y = 0; y < s.h; ++y)
+        for (uint32_t x = 0; x < s.w; ++x)
+            p[(s.y + y)*stride + s.x + x] = color;
+}
 extern "C" void* kmalloc(uint64_t bytes) { return allocationFails?nullptr:std::calloc(1,bytes); }
 extern "C" void kfree(void* p) { std::free(p); }
 void MappingBackingRef(MappingBacking*) { ++leases; }
@@ -374,7 +398,7 @@ int main() {
     g_backBuffer=nullptr;
     uint32_t overlayPixels[48]{};g_debugFrameBuffer=VirtualAddress(reinterpret_cast<uint64_t>(overlayPixels));g_debugFramePages=1;
     auto overlay=CompositorRequestDebugFrame(77,true);CHECK(overlay.state==DebugFrameState::Pending && overlay.token);
-    CaptureDesktopOverlay(400,0,0,false);auto ready=CompositorDebugFrameStatus(overlay.token,77);
+    CaptureOverlayAt(400,0,0,false);auto ready=CompositorDebugFrameStatus(overlay.token,77);
     CHECK(ready.state==DebugFrameState::Ready && ready.width==8 && ready.height==6);
     DesktopOverlayBands overlayBands{};
     CHECK(CompositorOverlayBands(overlay.token,78,overlayBands)==-116);
@@ -390,12 +414,12 @@ int main() {
     CHECK(CompositorReadDebugFrame(overlay.token,77,9*4,&pixel,4)==4 && pixel==0xff654321);
     CHECK(CompositorReleaseDebugFrame(overlay.token,77));
     g_cursorFrame={};g_cursorFrame.width=g_cursorFrame.height=1;g_cursorFrame.pixels[0]=0x80ff0000u;
-    overlay=CompositorRequestDebugFrame(77,true);CaptureDesktopOverlay(401,4,2,true);
+    overlay=CompositorRequestDebugFrame(77,true);CaptureOverlayAt(401,4,2,true);
     CHECK(overlayPixels[20]==0x80ff0000u);CHECK(!CompositorOverlayBands(overlay.token,77,overlayBands));
     {unsigned hits=0;for(unsigned i=0;i<overlayBands.count;++i){const auto& b=overlayBands.bands[i];
         if(4>=b.x && 4<b.x+b.width && 2>=b.y && 2<b.y+b.height)++hits;}CHECK(hits==1);}
     CHECK(CompositorReleaseDebugFrame(overlay.token,77));
-    overlay=CompositorRequestDebugFrame(77,true);CaptureDesktopOverlay(402,4,5,true);
+    overlay=CompositorRequestDebugFrame(77,true);CaptureOverlayAt(402,4,5,true);
     const uint32_t red=(255u*128u+0x12u*127u)/255u,green=0x34u*127u/255u,blue=0x56u*127u/255u;
     CHECK(overlayPixels[44]==(0xff000000u|(red<<16)|(green<<8)|blue));
     CHECK(CompositorReleaseDebugFrame(overlay.token,77));
@@ -403,7 +427,7 @@ int main() {
         // The generation excludes the pointer: a pointer-free capture of the
         // same content keeps it, and the pointer pixels are cleared.
         const uint64_t g0=CompositorOverlayGeneration();CHECK(g0>1);
-        overlay=CompositorRequestDebugFrame(77,true,false);CaptureDesktopOverlay(403,6,1,true);
+        overlay=CompositorRequestDebugFrame(77,true,false);CaptureOverlayAt(403,6,1,true);
         auto status=CompositorDebugFrameStatus(overlay.token,77);
         CHECK(status.state==DebugFrameState::Ready && status.overlayGeneration==g0 && overlayPixels[1*8+6]==0);
         CHECK(overlayPixels[44]==0xff123456); // the previous pointer was cleared, not blended
@@ -413,7 +437,7 @@ int main() {
         // Closing the launcher bumps the generation; only previously drawn
         // rectangles are cleared (a marker outside them survives).
         launcherVisible=false;overlayPixels[0]=0xdeadbeef;
-        overlay=CompositorRequestDebugFrame(77,true,false);CaptureDesktopOverlay(404,0,0,false);
+        overlay=CompositorRequestDebugFrame(77,true,false);CaptureOverlayAt(404,0,0,false);
         status=CompositorDebugFrameStatus(overlay.token,77);
         CHECK(status.state==DebugFrameState::Ready && status.overlayGeneration==g0+1 && CompositorOverlayGeneration()==g0+1);
         CHECK(overlayPixels[9]==0 && overlayPixels[0]==0xdeadbeef && overlayPixels[47]==0xff123456);
@@ -422,19 +446,19 @@ int main() {
         // update the generation without a capture request.
         // Keys only: nothing is rasterised into the shared buffer.
         launcherVisible=true;const uint64_t now=ApicTickCount();(void)CompositorOverlayGeneration();
-        CheckDesktopOverlay(now+1,0,0);CHECK(CompositorOverlayGeneration()==g0+2 && overlayPixels[9]==0);
-        launcherVisible=false;CheckDesktopOverlay(now+2,0,0); // same input, too soon: not rechecked
-        CHECK(CompositorOverlayGeneration()==g0+2);
-        CheckDesktopOverlay(now+2,1,0);CHECK(CompositorOverlayGeneration()==g0+3); // pointer moved (hover)
-        launcherVisible=true;CheckDesktopOverlay(now+2+OVERLAY_RECHECK_MS,1,0);CHECK(CompositorOverlayGeneration()==g0+4); // periodic
+        CheckOverlayAt(now+1,0,0);CHECK(CompositorOverlayGeneration()==g0+2 && overlayPixels[9]==0);
+        launcherVisible=false;CheckOverlayAt(now+2,0,0);
+        CHECK(CompositorOverlayGeneration()==g0+3); // close without pointer or input changes
+        CheckOverlayAt(now+3,1,0);CHECK(CompositorOverlayGeneration()==g0+3); // unchanged publication
+        launcherVisible=true;CheckOverlayAt(now+4,1,0);CHECK(CompositorOverlayGeneration()==g0+4);
         // The volume popup takes the launcher's rectangle slot and is keyed.
-        launcherVisible=false;volumeVisible=true;CheckDesktopOverlay(now+3+2*OVERLAY_RECHECK_MS,1,0);
+        launcherVisible=false;volumeVisible=true;CheckOverlayAt(now+5,1,0);
         CHECK(CompositorOverlayGeneration()==g0+5 && overlayPixels[1*8+4]==0 && overlayPixels[9]==0);
-        launcherVisible=true;volumeVisible=false;CheckDesktopOverlay(now+3+3*OVERLAY_RECHECK_MS,1,0);
+        launcherVisible=true;volumeVisible=false;CheckOverlayAt(now+6,1,0);
         CHECK(CompositorOverlayGeneration()==g0+6 && overlayPixels[1*8+4]==0);
         // Detection never touches the buffer, so it continues under a lease.
         launcherVisible=false;overlay=CompositorRequestDebugFrame(77,true,false);
-        CheckDesktopOverlay(now+500,2,0);CHECK(CompositorOverlayGeneration()==g0+7);
+        CheckOverlayAt(now+500,2,0);CHECK(CompositorOverlayGeneration()==g0+7);
         // Op-7 wait: blocks without locks, woken by completion.
         waiterProc=static_cast<Process*>(std::calloc(1,sizeof(Process)));CHECK(waiterProc);
         DebugFrameSnapshot waited{};captureOnBlock=true;blockCalls=0;
@@ -451,15 +475,15 @@ int main() {
         CHECK(g_debugFrameCleanAddress==g_debugFrameBuffer.raw());
         // Per-surface keys: an unchanged taskbar is kept (not rasterised),
         // a changed one is redrawn while the launcher is kept.
-        overlay=CompositorRequestDebugFrame(77,true,false);CaptureDesktopOverlay(700,9,9,false);
+        overlay=CompositorRequestDebugFrame(77,true,false);CaptureOverlayAt(700,9,9,false);
         CHECK(CompositorReleaseDebugFrame(overlay.token,77));
         const unsigned draws=taskbarDraws;overlayPixels[9]=0x11111111; // marker inside the launcher
-        overlay=CompositorRequestDebugFrame(77,true,false);CaptureDesktopOverlay(701,9,9,false);
+        overlay=CompositorRequestDebugFrame(77,true,false);CaptureOverlayAt(701,9,9,false);
         CHECK(taskbarDraws==draws && overlayPixels[9]==0x11111111);
         DesktopOverlayBands first{};CHECK(!CompositorOverlayBands(overlay.token,77,first));
         CHECK(CompositorReleaseDebugFrame(overlay.token,77));
         ++shellKeyBump;
-        overlay=CompositorRequestDebugFrame(77,true,false);CaptureDesktopOverlay(702,9,9,false);
+        overlay=CompositorRequestDebugFrame(77,true,false);CaptureOverlayAt(702,9,9,false);
         CHECK(taskbarDraws==draws+1 && overlayPixels[9]==0x11111111 && overlayPixels[47]==0xff123456);
         DesktopOverlayBands second{};CHECK(!CompositorOverlayBands(overlay.token,77,second));
         CHECK(first.count==2 && second.count==2);
@@ -473,7 +497,7 @@ int main() {
         // into the same seven-band ABI. A later cursorless capture erases it.
         summaryAndHudVisible = true;
         overlay = CompositorRequestDebugFrame(77, true, true);
-        CaptureDesktopOverlay(703, 6, 4, true);
+        CaptureOverlayAt(703, 6, 4, true);
         CHECK(CompositorDebugFrameStatus(overlay.token, 77).state == DebugFrameState::Ready);
         BrookDesktopOverlaySurfaces records{};
         CHECK(!CompositorOverlaySurfaces(overlay.token, 77, records) && records.count == 4);
@@ -489,7 +513,7 @@ int main() {
         CHECK(cursorPacked);
         CHECK(CompositorReleaseDebugFrame(overlay.token, 77));
         overlay = CompositorRequestDebugFrame(77, true, false);
-        CaptureDesktopOverlay(704, 6, 4, true);
+        CaptureOverlayAt(704, 6, 4, true);
         CHECK(overlayPixels[38] == 0 && overlayPixels[7] == 0xff445566 && overlayPixels[27] == 0xff112233);
         CHECK(CompositorReleaseDebugFrame(overlay.token, 77));
         summaryAndHudVisible = false;
@@ -584,11 +608,23 @@ int main() {
         // reports them translucent; opaque otherwise.
         uint32_t pixels[48]{};DesktopOverlayRect rects[4]{};uint64_t keys[4]{};uint32_t opaque=0xffu;
         g_materialFrame=BROOK_APPEARANCE_DEFAULT;CHECK(CompositorGlassActive());++shellKeyBump;
-        uint32_t count=RenderDesktopOverlay(pixels,8,6,600,0,0,rects,keys,nullptr,&opaque);
+        BrookDesktopOverlaySurfaces records{};
+        uint32_t count=RenderDesktopOverlay(pixels,CaptureShellFrame(8,6,600,0,0),rects,keys,records,opaque);
         CHECK(count && !opaque && pixels[47]==(CompositorMaterialOpacity()<<24|0x123456u) && CompositorMaterialOpacity()<255);
         g_materialFrame=BROOK_APPEARANCE_DEFAULT|BROOK_APPEARANCE_PERFORMANCE;CHECK(!CompositorGlassActive());++shellKeyBump;
-        count=RenderDesktopOverlay(pixels,8,6,601,0,0,rects,keys,nullptr,&opaque);
+        count=RenderDesktopOverlay(pixels,CaptureShellFrame(8,6,601,0,0),rects,keys,records,opaque);
         CHECK(count && opaque==(1u<<count)-1u && pixels[47]==0xff123456u);
+        // Service death clears its cached popup and restores a theme-colored
+        // taskbar. Fullscreen hides even the fallback.
+        launcherVisible = true;
+        RenderDesktopOverlay(pixels,CaptureShellFrame(8,6,602,0,0),rects,keys,records,opaque);
+        CHECK(pixels[9] == 0xff654321);
+        shellRunning = false;
+        count = RenderDesktopOverlay(pixels,CaptureShellFrame(8,6,603,0,0),rects,keys,records,opaque);
+        CHECK(count == 1 && opaque == 1 && pixels[9] == 0 && pixels[47] == 0xffabc123);
+        taskbarHidden = true;
+        count = RenderDesktopOverlay(pixels,CaptureShellFrame(8,6,604,0,0),rects,keys,records,opaque);
+        CHECK(count == 0 && opaque == 0 && !pixels[47]);
     }
     std::puts("CAPTURE_QUEUE_PASS bounded staging, SHM/reuse races, running cancellation, queued timeout, uncertain lease retention");
 }

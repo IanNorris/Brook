@@ -69,8 +69,9 @@ struct ChromeCmd {
 
 class ChromeDisplayList {
 public:
-    ChromeDisplayList(ChromeCmd* cmds, uint32_t capacity, char* text, uint32_t textCapacity)
-        : cmds_(cmds), capacity_(capacity), text_(text), textCapacity_(textCapacity) {}
+    ChromeDisplayList(ChromeCmd* cmds, uint32_t capacity, char* text, uint32_t textCapacity,
+                      uint32_t count = 0, uint32_t textUsed = 0)
+        : cmds_(cmds), capacity_(capacity), count_(count), text_(text), textCapacity_(textCapacity), textUsed_(textUsed) {}
     ChromeDisplayList(const ChromeDisplayList&) = delete;
     ChromeDisplayList& operator=(const ChromeDisplayList&) = delete;
 

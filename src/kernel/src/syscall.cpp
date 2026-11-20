@@ -1,5 +1,7 @@
 #include "brook_core_dump.h"
 #include "gdt.h"
+#include "chrome_shell_wire.h"
+#include "shell_service.h"
 #include "../../shared/brook_pointer.h"
 // syscall.cpp -- SYSCALL/SYSRET dispatcher, syscall table, and user-mode entry.
 //
@@ -595,6 +597,7 @@ void SyscallTableInit()
     g_syscallTable[0xB04]                = sys_brook_wm_scale;
     g_syscallTable[BROOK_SYS_DEBUG_FRAME] = sys_brook_debug_frame;
     g_syscallTable[BROOK_SYS_DESKTOP_OVERLAY] = sys_brook_desktop_overlay;
+    g_syscallTable[brook::ShellServiceSyscall] = brook::ShellServiceSyscallInvoke;
     g_syscallTable[BROOK_SYS_AHCI_EXPORT] = sys_brook_ahci_export;
     g_syscallTable[BROOK_SYS_SYSTEM_MESSAGE] = sys_brook_system_message;
     g_syscallTable[BROOK_SYS_CORE_DUMP] = sys_brook_core_dump;

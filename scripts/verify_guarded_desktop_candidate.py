@@ -13,6 +13,7 @@ import shlex
 import subprocess
 import tempfile
 
+from stage_clearwater_shell import CLEARWATER_EXECUTABLES
 from prepare_guard_check_pair import CHECKER_SHA, E2FSCK_SHA, REQUIRED, selector
 from prepare_hardware_kernel_pair import (INITRD_MAX, KERNEL_MAX, module_version, regular, desktop_startup, add_vulkan_desktop_start,
                                           KERNEL_CONSOLE_SHORTCUT, KERNEL_CONSOLE_SHORTCUT_PATH,
@@ -28,7 +29,9 @@ DERIVED={'BROOK_SSD_GUARD_TRANSACTION','BROOK_SSD_GUARD_REPAIR','BROOK_SSD_GUARD
 
 def sha(data):return hashlib.sha256(data).hexdigest()
 
-def verify(candidate, source, reference, build, expected_kernel, expected_source, expected_reference, abi, allow_gpu_capture_test=False, allow_gpu_submission_timing=False, allow_vulkan_desktop=False, expected_vulkan_supervisor=None, expected_vulkan_renderer=None, allow_vulkan_partial=False, allow_gpu_blocked_recovery_test=False, expected_gpu_provider=None, allow_gpu_source_trace=False, allow_dell_acpi_monitor=False, allow_ac_loss_poweroff=False, allow_dell_bcs_present=False, allow_vulkan_async_partial=False, allow_bdw_cache_probe=False, allow_bdw_rps_trial=False, allow_bdw_coherent_render=False, allow_irq_signal_probe=False, allow_hidden_kernel_console=False, allow_bdw_persistent_scanout_map=False, allow_bdw_scanout_flip=False, allow_bdw_zero_copy_scanout=False, allow_bdw_video_engine=False):
+def verify(candidate, source, reference, build, expected_kernel, expected_source, expected_reference, abi, allow_gpu_capture_test=False, allow_gpu_submission_timing=False, allow_vulkan_desktop=False, expected_vulkan_supervisor=None, expected_vulkan_renderer=None, allow_vulkan_partial=False, allow_gpu_blocked_recovery_test=False, expected_gpu_provider=None, allow_gpu_source_trace=False, allow_dell_acpi_monitor=False, allow_ac_loss_poweroff=False, allow_dell_bcs_present=False, allow_vulkan_async_partial=False, allow_bdw_cache_probe=False, allow_bdw_rps_trial=False, allow_bdw_coherent_render=False, allow_irq_signal_probe=False, allow_hidden_kernel_console=False, allow_bdw_persistent_scanout_map=False, allow_bdw_scanout_flip=False, allow_bdw_zero_copy_scanout=False, allow_bdw_video_engine=False, expected_clearwater_supervisor=None, expected_clearwater_shell=None):
+    if bool(expected_clearwater_supervisor) != bool(expected_clearwater_shell):
+        raise ValueError('Clearwater requires both executable hashes')
     if (allow_vulkan_partial or allow_vulkan_async_partial) and not allow_vulkan_desktop:
         raise ValueError('partial rendering requires Vulkan desktop opt-in')
     if allow_dell_bcs_present and not allow_vulkan_desktop:raise ValueError('Dell BCS presentation requires Vulkan desktop opt-in')
@@ -118,7 +121,7 @@ def verify(candidate, source, reference, build, expected_kernel, expected_source
         script=read(live,'BOOT/INIT.RC')
         original_script=read(base,'BOOT/INIT.RC')
         expected_script=desktop_startup(original_script,allow_hidden_kernel_console,allow_vulkan_desktop,allow_vulkan_partial,
-            bool(expected_gpu_provider),allow_gpu_source_trace,allow_vulkan_async_partial)
+            bool(expected_gpu_provider),allow_gpu_source_trace,allow_vulkan_async_partial, clearwater=bool(expected_clearwater_shell))
         if not script or script!=expected_script:raise ValueError('desktop startup script mismatch')
         def optional(path,name):
             found=subprocess.run(['mtype','-i',str(path),'::/'+name],capture_output=True)
@@ -138,6 +141,18 @@ def verify(candidate, source, reference, build, expected_kernel, expected_source
                 if not expected or not re.fullmatch('[0-9a-f]{64}',expected) or not content.startswith(b'\x7fELF') or sha(content)!=expected:
                     raise ValueError('Vulkan executable mismatch '+name)
                 vulkan_files[name]=sha(content)
+        clearwater_files = {}
+        expected_clearwater = zip(CLEARWATER_EXECUTABLES, (expected_clearwater_supervisor, expected_clearwater_shell))
+        for name, expected in expected_clearwater:
+            path = 'BOOT/' + name
+            content = optional(live, path)
+            if expected:
+                if (content is None or not re.fullmatch('[0-9a-f]{64}', expected)
+                        or not content.startswith(b'\x7fELF') or sha(content) != expected):
+                    raise ValueError('Clearwater executable mismatch ' + name)
+                clearwater_files[name] = expected
+            elif content != optional(base, path):
+                raise ValueError('Unexpected Clearwater executable ' + name)
         def modules(path):
             listing=subprocess.check_output(['mdir','-a','-b','-i',str(path),'::/DRIVERS/*'],text=True)
             names=[line.rsplit('/',1)[-1] for line in listing.splitlines() if line]
@@ -158,7 +173,7 @@ def verify(candidate, source, reference, build, expected_kernel, expected_source
             'guard_input_sha256':{name:sha(value) for name,value in values.items()},'module_abi':abi,'modules':module_hashes,
             'vulkan_desktop_enabled':allow_vulkan_desktop,'vulkan_partial_enabled':allow_vulkan_partial or allow_vulkan_async_partial,
             'vulkan_async_partial_enabled':allow_vulkan_async_partial,'vulkan_executables_sha256':vulkan_files,
-            'kernel_console_hidden':allow_hidden_kernel_console}
+            'kernel_console_hidden':allow_hidden_kernel_console, 'clearwater_executables_sha256':clearwater_files}
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
@@ -188,6 +203,9 @@ def main():
     p.add_argument('--allow-irq-signal-probe',action='store_true',help='expect experimental interrupt-return signal delivery')
     p.add_argument('--allow-hidden-kernel-console',action='store_true',
                    help='expect the boot kconsole line removed and the Kernel Console Apps entry added')
-    a=p.parse_args();print(json.dumps(verify(a.candidate,a.source,a.reference,a.build,a.expected_kernel,a.expected_source,a.expected_reference,a.abi,a.allow_gpu_capture_test,a.allow_gpu_submission_timing,a.allow_vulkan_desktop,a.expected_vulkan_supervisor,a.expected_vulkan_renderer,a.allow_vulkan_partial,a.allow_gpu_blocked_recovery_test,a.expected_gpu_provider,a.allow_gpu_source_trace,a.allow_dell_acpi_monitor,a.allow_ac_loss_poweroff,a.allow_dell_bcs_present,a.allow_vulkan_async_partial,a.allow_bdw_cache_probe,a.allow_bdw_rps_trial,a.allow_bdw_coherent_render,a.allow_irq_signal_probe,a.allow_hidden_kernel_console,a.allow_bdw_persistent_scanout_map,a.allow_bdw_scanout_flip,a.allow_bdw_zero_copy_scanout,a.allow_bdw_video_engine),indent=2))
+    p.add_argument('--expected-clearwater-supervisor', help='SHA-256 of the embedded Clearwater supervisor')
+    p.add_argument('--expected-clearwater-shell', help='SHA-256 of the embedded Clearwater shell')
+    a=p.parse_args();print(json.dumps(verify(a.candidate,a.source,a.reference,a.build,a.expected_kernel,a.expected_source,a.expected_reference,a.abi,a.allow_gpu_capture_test,a.allow_gpu_submission_timing,a.allow_vulkan_desktop,a.expected_vulkan_supervisor,a.expected_vulkan_renderer,a.allow_vulkan_partial,a.allow_gpu_blocked_recovery_test,a.expected_gpu_provider,a.allow_gpu_source_trace,a.allow_dell_acpi_monitor,a.allow_ac_loss_poweroff,a.allow_dell_bcs_present,a.allow_vulkan_async_partial,a.allow_bdw_cache_probe,a.allow_bdw_rps_trial,a.allow_bdw_coherent_render,a.allow_irq_signal_probe,a.allow_hidden_kernel_console,a.allow_bdw_persistent_scanout_map,a.allow_bdw_scanout_flip,a.allow_bdw_zero_copy_scanout,a.allow_bdw_video_engine,
+                                        a.expected_clearwater_supervisor, a.expected_clearwater_shell),indent=2))
 
 if __name__=='__main__':main()

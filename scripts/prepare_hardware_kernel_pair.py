@@ -22,6 +22,7 @@ import tempfile
 
 from elftools.elf.elffile import ELFFile
 from hardware_recovery_fsck import validate_checker
+from stage_clearwater_shell import add_clearwater_start, embed_clearwater_executables
 
 MAGIC = 0x4B524F42
 KERNEL_MAX = 8 * 1024 * 1024
@@ -57,10 +58,11 @@ def hide_kernel_console(script):
 
 
 def desktop_startup(script, hide_console=False, vulkan=False, partial=False, gpu_source=False,
-                    gpu_source_trace=False, async_partial=False):
+                    gpu_source_trace=False, async_partial=False, clearwater=False):
     """The exact startup script prepared (and later verified) for these options."""
     if hide_console:script=hide_kernel_console(script)
     if vulkan:script=add_vulkan_desktop_start(script,partial,gpu_source,gpu_source_trace,async_partial)
+    if clearwater:script=add_clearwater_start(script)
     return script
 
 def add_vulkan_desktop_start(script, partial=False, gpu_source=False, gpu_source_trace=False, async_partial=False):
@@ -115,7 +117,9 @@ def prepare(source, build, abi, payload_id, output, expected_kernel_sha256, pani
             vulkan_supervisor=None,vulkan_renderer=None,enable_vulkan_partial=False,
             gpu_source_provider=None,enable_gpu_source_trace=False,enable_ac_loss_poweroff=False,
             enable_dell_acpi_monitor=False,enable_dell_bcs_present=False,enable_vulkan_async_partial=False, enable_irq_signal_probe=False,
-            hide_kernel_console_window=False):
+            hide_kernel_console_window=False, clearwater_supervisor=None, clearwater_shell=None):
+    if bool(clearwater_supervisor) != bool(clearwater_shell):
+        raise ValueError('Clearwater requires both the supervisor and shell executables')
     if enable_gpu_source_trace and not gpu_source_provider:
         raise ValueError('GPU source trace requires GPU source opt-in')
     if gpu_source_provider and not enable_vulkan_desktop:
@@ -192,10 +196,15 @@ def prepare(source, build, abi, payload_id, output, expected_kernel_sha256, pani
             if enable_vulkan_async_partial:enabled.append('vulkan-async-partial')
             if gpu_source_provider:enabled.append('gpu-source')
             if enable_gpu_source_trace:enabled.append('gpu-source-trace')
-        if enable_vulkan_desktop or hide_kernel_console_window:
+        clearwater_files = {}
+        if clearwater_shell:
+            clearwater_files = embed_clearwater_executables(image, clearwater_supervisor, clearwater_shell)
+            enabled.append('clearwater-shell')
+        if enable_vulkan_desktop or hide_kernel_console_window or clearwater_shell:
             original=subprocess.check_output(['mtype','-i',str(image),'::/BOOT/INIT.RC'])
             startup=desktop_startup(original,hide_kernel_console_window,enable_vulkan_desktop,enable_vulkan_partial,
-                                    bool(gpu_source_provider),enable_gpu_source_trace,enable_vulkan_async_partial)
+                                    bool(gpu_source_provider),enable_gpu_source_trace,enable_vulkan_async_partial,
+                                    clearwater=bool(clearwater_shell))
             startup_path=output/'INIT.RC';startup_path.write_bytes(startup)
             subprocess.run(['mcopy','-o','-i',str(image),str(startup_path),'::/BOOT/INIT.RC'],check=True)
             if subprocess.check_output(['mtype','-i',str(image),'::/BOOT/INIT.RC'])!=startup:
@@ -264,6 +273,7 @@ def prepare(source, build, abi, payload_id, output, expected_kernel_sha256, pani
                   'modules': {name: sha for name, _, sha in inventory}}
         result['enabled_boot_options'] = enabled
         if vulkan_files:result['vulkan_executables_sha256']=vulkan_files
+        if clearwater_files:result['clearwater_executables_sha256']=clearwater_files
         if export_info is not None: result['panic_journal_exporter'] = export_info
         if fat_info is not None: result['fat_checker'] = fat_info
         (output / 'manifest.json').write_text(json.dumps(result, indent=2) + '\n')
@@ -298,6 +308,8 @@ def main():
     p.add_argument('--enable-irq-signal-probe',action='store_true',help='Enable experimental interrupt-return signal delivery')
     p.add_argument('--hide-kernel-console',action='store_true',
                    help='Do not open the Kernel Console window at boot; add an Apps menu entry that opens it')
+    p.add_argument('--clearwater-supervisor', type=Path, help='Embed the Clearwater restart supervisor')
+    p.add_argument('--clearwater-shell', type=Path, help='Embed and start the supervised Clearwater shell')
     a = p.parse_args()
     print(json.dumps(prepare(a.source_initrd, a.build, a.abi, a.payload_id, a.output,
                              a.expected_kernel_sha256, a.panic_exporter, a.fat_checker,
@@ -305,7 +317,7 @@ def main():
                              a.vulkan_supervisor,a.vulkan_renderer,a.enable_vulkan_partial,a.gpu_source_provider,
                              a.enable_gpu_source_trace,a.enable_ac_loss_poweroff,a.enable_dell_acpi_monitor,
                              a.enable_dell_bcs_present,a.enable_vulkan_async_partial,a.enable_irq_signal_probe,
-                             a.hide_kernel_console), indent=2))
+                             a.hide_kernel_console, a.clearwater_supervisor, a.clearwater_shell), indent=2))
 
 
 if __name__ == '__main__':

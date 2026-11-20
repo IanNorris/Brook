@@ -62,30 +62,6 @@ inline uint32_t WmShellSurfaces(uint32_t screenW, uint32_t screenH, int32_t mx, 
     return count;
 }
 
-// Content key of the surface as it would render now: equal keys mean
-// identical pixels when rasterised onto a cleared buffer. Builds the
-// surface's display list without executing it (window.cpp; compositor
-// thread only). 0: the surface draws nothing.
-uint64_t WmShellSurfaceKey(const WmShellSurface& surface, uint32_t screenW, uint32_t screenH,
-                           uint64_t uptimeMs, int32_t mx, int32_t my);
-
-// The surface's record (layers ABI v2): material, opacity, radii, shadow
-// and the given content key (window.cpp).
+// Material, opacity, radii and shadow for the published list's content key.
 BrookDesktopSurface WmShellSurfaceRecord(const WmShellSurface& surface, uint64_t key);
-
-// Rasterise one surface with the WM's CPU painters into a full-screen buffer.
-inline void WmRenderShellSurface(const WmShellSurface& surface, uint32_t* pixels, uint32_t stride,
-                                 uint32_t screenW, uint32_t screenH, uint64_t uptimeMs,
-                                 int32_t mx, int32_t my)
-{
-    switch (surface.kind) {
-    case WmShellSurfaceKind::Taskbar: WmRenderTaskbar(pixels, stride, screenW, screenH, uptimeMs, mx, my); break;
-    case WmShellSurfaceKind::Launcher: WmLauncherRender(pixels, stride, screenW, screenH, mx, my); break;
-    case WmShellSurfaceKind::VolumePopup: WmVolumePopupRender(pixels, stride, screenW, screenH, mx, my); break;
-    case WmShellSurfaceKind::TrayTooltip: WmTrayTooltipRender(pixels, stride, screenW, screenH, mx, my); break;
-    case WmShellSurfaceKind::TrayFlyout: WmRenderTrayFlyout(pixels, stride, screenW, screenH); break;
-    case WmShellSurfaceKind::PerformanceHud: WmRenderPerformanceHud(pixels, stride, screenW, screenH); break;
-    case WmShellSurfaceKind::BootSummary: WmRenderBootSummary(pixels, stride, screenW, screenH); break;
-    }
-}
 } // namespace brook

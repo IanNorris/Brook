@@ -132,6 +132,9 @@ def main():
         shutil.rmtree(out)
     out.mkdir(parents=True)
 
+    manifest_path = pair / 'manifest.json'
+    expect_clearwater = (manifest_path.exists() and
+                         bool(json.loads(manifest_path.read_text()).get('clearwater_executables_sha256')))
     kernel, initrd = pair / 'kernel.elf', pair / 'INITRD.IMG'
     kernel_sha, initrd_sha = sha(kernel), sha(initrd)
     flags, cache_sha, flag_source = build_flags(a, kernel_sha)
@@ -200,6 +203,13 @@ def main():
                 result = subprocess.run(argv, cwd=ROOT / 'scripts', env=env, stdout=log, stderr=subprocess.STDOUT)
             lines = log_path.read_text(errors='replace').splitlines()
             passed = result.returncode == 0 and PASS_MARKER in lines
+            clearwater_ready = False
+            if expect_clearwater and passed:
+                serial = (run_dir / 'desktop-serial.log').read_text(errors='replace')
+                clearwater_ready = bool(re.search(r'CLEARWATER_SHELL_READY pid=[1-9][0-9]*', serial))
+                if not clearwater_ready:
+                    lines.append('Clearwater shell did not publish a taskbar in the guarded desktop boot')
+                    passed = False
             last = lines[-1] if lines else ''
             # OVMF occasionally stalls before reaching boot selection (seen once: the serial log held
             # only the firmware's screen-clear sequences for the whole 120 s). Only that signature,
@@ -208,6 +218,8 @@ def main():
                               and 'BdsDxe' not in last)
             entry = {'attempt': attempt, 'command': argv, 'returncode': result.returncode, 'passed': passed,
                      'seconds': round(time.monotonic() - start, 1), 'log': log_path.name, 'output': run_dir.name}
+            if expect_clearwater:
+                entry['clearwater_shell_ready'] = clearwater_ready
             if not passed:
                 entry['log_tail'] = [x[:4000] for x in lines[-12:]]
                 entry['firmware_stall'] = firmware_stall

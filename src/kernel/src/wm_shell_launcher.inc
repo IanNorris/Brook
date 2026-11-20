@@ -210,25 +210,44 @@ void WmLauncherGetRect(uint32_t screenW, uint32_t screenH,
     *outX = r.x; *outY = r.y; *outW = static_cast<uint32_t>(r.w); *outH = static_cast<uint32_t>(r.h);
 }
 
-static void WmLauncherSurface(uint32_t* backBuffer, uint32_t stride,
-                              uint32_t screenW, uint32_t screenH,
-                              int32_t mouseX, int32_t mouseY, uint64_t keySeed, uint64_t* key)
+static void WmCaptureLauncher(uint32_t screenW, uint32_t screenH, int32_t mouseX, int32_t mouseY,
+                              ChromeShellModel& snapshot)
 {
-    if (!g_launcherOpen || (!backBuffer && !key)) return;
-    LauncherReadGuard guard; // the borrowed icons live in the active snapshot
+    if (!g_launcherLoaded) return;
+    LauncherReadGuard guard;
     if (guard.get().generation != g_launcherModelGeneration) LauncherSyncModel(guard.get());
     const ChromeStyle style = WmChromeStyle();
-    const ChromeLauncherFrame& frame = LauncherFrame(screenW, screenH, mouseX, mouseY);
-    ChromeDisplayList list = ChromeListOn(g_shellListStorage);
-    ChromeBuildLauncher(g_launcherModel, LauncherChrome(mouseX, mouseY), frame, style, list);
-    if (key) *key = ChromeListKey(list, keySeed);
-    else ChromeExecute(list, {backBuffer, stride, screenW, screenH}, WmChromeFonts());
-}
-void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
-                      uint32_t screenW, uint32_t screenH,
-                      int32_t mouseX, int32_t mouseY)
-{
-    WmLauncherSurface(backBuffer, stride, screenW, screenH, mouseX, mouseY, 0, nullptr);
+    const DesktopRect bounds = ChromeLauncherRect(style, screenW, screenH);
+    const bool hovered = g_launcherOpen && bounds.contains(mouseX, mouseY);
+    const int32_t mx = hovered ? mouseX : -1, my = hovered ? mouseY : -1;
+    auto chrome = LauncherChrome(mx, my);
+
+    snapshot.kind = ChromeShellKind::Launcher;
+    snapshot.launcherModel = g_launcherModel;
+    if (g_launcherOpen) {
+        snapshot.launcherFrame = LauncherFrame(screenW, screenH, mx, my);
+        snapshot.launcherModel = g_launcherModel; // captures the clamped viewport
+    } else {
+        // Prime the same default view WmLauncherToggle will open.
+        chrome.prompt = chrome.promptRestart = chrome.confirmFocused = false;
+        if (g_launcherError) {
+            const char* desktop = ShutdownDesktopStatus();
+            chrome.status = desktop && strcmp(desktop, "Applications") ? desktop : nullptr;
+        }
+        snapshot.launcherModel.Open();
+        ChromeLauncherFrameFor(snapshot.launcherModel, chrome, style, screenW, screenH, snapshot.launcherFrame);
+        snapshot.launcherModel.SetViewport(snapshot.launcherFrame.viewport);
+    }
+    snapshot.mouseX = mx;
+    snapshot.mouseY = my;
+    snapshot.shutdownActive = chrome.shutdownActive;
+    snapshot.prompt = chrome.prompt;
+    snapshot.promptRestart = chrome.promptRestart;
+    snapshot.confirmFocused = chrome.confirmFocused;
+    if (chrome.status) WmStrCopy(snapshot.text, chrome.status, sizeof(snapshot.text));
+    if (chrome.build) WmStrCopy(snapshot.launcherBuild, chrome.build, sizeof(snapshot.launcherBuild));
+    for (uint32_t i = 0; i < chrome.iconCount; ++i)
+        WmCaptureShellIcon(snapshot.icons[i], chrome.icons[i]);
 }
 
 int WmLauncherHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)

@@ -32,6 +32,7 @@
 #include "mouse.h"
 #include "window.h"
 #include "desktop_shell_surfaces.h"
+#include "shell_service.h"
 #include "desktop_overlay_surfaces.h"
 #include "chrome_surface.h"
 #include "debug_ui.h"
@@ -408,10 +409,7 @@ static uint32_t g_overlaySignatureCount;
 static bool g_overlaySignatureValid;
 // Last op-6 query; change detection runs only while a renderer is polling.
 static uint64_t g_overlayQueryTick;
-static constexpr uint64_t OVERLAY_SUBSCRIPTION_MS=3000,OVERLAY_RECHECK_MS=100;
-static uint64_t g_overlayCheckTick,g_overlayCheckInput;
-static int32_t g_overlayCheckX=-1,g_overlayCheckY=-1;
-static bool g_overlayChecked;
+static constexpr uint64_t OVERLAY_SUBSCRIPTION_MS=3000;
 // While its address and geometry match (a full debug screenshot invalidates
 // this), g_debugFrameBuffer holds exactly the cached shell surfaces on zero,
 // so overlay captures redraw only changed surfaces and full-image reads stay
@@ -794,7 +792,7 @@ static GpuTexId  g_overlayTex     = 0;       // g_overlayBuffer as an alpha text
 static bool      g_overlayTexNeedsFull = true; // force a full overlay upload
 static uint32_t  g_overlayOpacity = 255;     // opt/gpuoverlayopacity (255 = opaque)
 static DesktopOverlaySurfaceCache g_localShellCache;
-static WmShellSurface g_localShellSurfaces[WM_SHELL_SURFACE_LIMIT];
+static BrookDesktopSurface g_localShellRecords[WM_SHELL_SURFACE_LIMIT];
 static uint32_t g_shellUploadMinY = ~uint32_t(0), g_shellUploadMaxY = 0;
 static uint32_t  g_lastHoverSig   = 0xFFFFFFFFu; // last hovered caption-button signature
 static bool      g_gpuLaunchDemo  = false;   // opt/gpulaunch: auto-open launcher for capture
@@ -2047,20 +2045,81 @@ static void OverlayZeroRect(uint32_t* pixels,uint32_t stride,uint32_t width,uint
         __builtin_memset(pixels+uint64_t(row)*stride+left,0,size_t(right-left)*4);
 }
 
-// The shell surfaces with their content keys, back to front (no raster).
-static uint32_t OverlaySurfaceSlots(uint32_t width,uint32_t height,uint64_t now,int32_t mouseX,int32_t mouseY,
-                                    WmShellSurface (&surfaces)[WM_SHELL_SURFACE_LIMIT],
-                                    DesktopOverlaySurfaceSlot (&slots)[DESKTOP_OVERLAY_SURFACE_LIMIT])
+// One compositor-thread snapshot feeds the local layer and renderer capture.
+struct ShellFrame {
+    uint32_t width, height, count = 0, fallbackColor = 0;
+    WmShellSurface surfaces[WM_SHELL_SURFACE_LIMIT];
+    BrookDesktopSurface records[WM_SHELL_SURFACE_LIMIT];
+    DesktopOverlaySurfaceSlot slots[DESKTOP_OVERLAY_SURFACE_LIMIT];
+    uint32_t fallbackMask = 0;
+};
+
+static ShellFrame CaptureShellFrame(uint32_t width, uint32_t height, uint64_t now, int32_t mx, int32_t my)
 {
-    static_assert(WM_SHELL_SURFACE_LIMIT<=DESKTOP_OVERLAY_SURFACE_LIMIT,"overlay surface budget");
-    const uint32_t count=WmShellSurfaces(width,height,mouseX,mouseY,surfaces);
-    for(uint32_t i=0;i<count;++i){const auto& s=surfaces[i];
-        slots[i]={uint32_t(s.kind),{s.x,s.y,s.w,s.h},WmShellSurfaceKey(s,width,height,now,mouseX,mouseY)};}
-    return count;
+    static_assert(WM_SHELL_SURFACE_LIMIT <= DESKTOP_OVERLAY_SURFACE_LIMIT);
+    ShellFrame frame{};
+    frame.width = width;
+    frame.height = height;
+    ShellServiceBeginFrame(now);
+    if (!width || !height) {
+        ShellServiceEndCapture(0);
+        return frame;
+    }
+    WmShellSurface surfaces[WM_SHELL_SURFACE_LIMIT];
+    const uint32_t count = WmShellSurfaces(width, height, mx, my, surfaces);
+    uint32_t kindMask = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        auto surface = surfaces[i];
+        kindMask |= 1u << uint32_t(surface.kind);
+        uint64_t key = ShellServiceCapture(surface, width, height, now, mx, my);
+        const bool fallback = !key;
+        if (fallback) {
+            if (surface.kind != WmShellSurfaceKind::Taskbar) continue;
+            frame.fallbackMask |= 1u << frame.count;
+            frame.fallbackColor = WmCurrentPalette().taskbar | 0xff000000u;
+            key = frame.fallbackColor;
+            surface.material = false;
+        }
+        auto record = WmShellSurfaceRecord(surface, key);
+        // The renderer's generation also covers composition metadata. The
+        // cached layer applies alpha and corner coverage after list playback.
+        constexpr uint64_t prime = 0x100000001b3ull;
+        auto mix = [&](uint64_t word) { key = (key ^ word) * prime; };
+        mix(uint64_t(record.material) << 32 | record.level);
+        mix(uint64_t(record.opacity) << 32 | record.flags);
+        mix(uint64_t(record.radii[0]) << 32 | uint32_t(fallback));
+        mix(uint64_t(record.shadow) << 32 | record.shadowAlpha);
+        mix(uint64_t(record.shadowSpread) << 32 | record.shadowCorner);
+        if (record.material == BROOK_DESKTOP_MATERIAL_GLASS) mix(CompositorMaterialOpacity());
+        record.key = key ? key : 1;
+        const uint32_t j = frame.count++;
+        frame.surfaces[j] = surface;
+        frame.records[j] = record;
+        frame.slots[j] = {uint32_t(surface.kind), {surface.x, surface.y, surface.w, surface.h}, record.key};
+    }
+    if ((kindMask & (1u << uint32_t(WmShellSurfaceKind::Taskbar))) &&
+        !(kindMask & (1u << uint32_t(WmShellSurfaceKind::Launcher))) &&
+        ShellServiceWarmLauncher(width, height, now))
+        kindMask |= 1u << uint32_t(WmShellSurfaceKind::Launcher);
+    ShellServiceEndCapture(kindMask);
+    return frame;
+}
+
+static void DrawShellFrameSurface(const ShellFrame& frame, uint32_t i, uint32_t* pixels, uint32_t stride)
+{
+    const auto& surface = frame.surfaces[i];
+    if (!(frame.fallbackMask >> i & 1u)) {
+        ShellServiceDraw(surface, pixels, stride, frame.width, frame.height);
+        return;
+    }
+    for (uint32_t y = surface.y; y < frame.height; ++y) {
+        uint32_t* row = pixels + uint64_t(y) * stride;
+        for (uint32_t x = 0; x < frame.width; ++x) row[x] = frame.fallbackColor;
+    }
 }
 
 // Bump the content generation when the surfaces differ from the last ones
-// seen (kind, rectangle or key). Caller holds g_debugFrameLock.
+// seen (kind, rectangle or key). Only the compositor thread writes it.
 static void OverlayNoteSignature(const DesktopOverlaySurfaceSlot* slots,uint32_t count)
 {
     bool same=g_overlaySignatureValid && count==g_overlaySignatureCount;
@@ -2074,11 +2133,11 @@ static void OverlayNoteSignature(const DesktopOverlaySurfaceSlot* slots,uint32_t
 
 // Rasterise changed shell lists into a cached layer. Captures and the local
 // compositor keep separate caches because each owns its own pixel buffer.
-static DesktopOverlaySurfacePlan RasterShellLayer(uint32_t* pixels, uint32_t stride, uint32_t width, uint32_t height,
-        const WmShellSurface* surfaces, const DesktopOverlaySurfaceSlot* slots, uint32_t count,
-        DesktopOverlaySurfaceCache& cache, uint64_t now, int32_t mx, int32_t my, bool local)
+static DesktopOverlaySurfacePlan RasterShellLayer(uint32_t* pixels, uint32_t stride,
+        const ShellFrame& frame, DesktopOverlaySurfaceCache& cache, bool local)
 {
-    const auto plan = DesktopOverlayPlanSurfaces(cache, slots, count);
+    const uint32_t width = frame.width, height = frame.height, count = frame.count;
+    const auto plan = DesktopOverlayPlanSurfaces(cache, frame.slots, count);
     if (plan.wipe) __builtin_memset(pixels, 0, uint64_t(stride) * height * 4);
     for (uint32_t i = 0; i < plan.clearCount; ++i)
         OverlayZeroRect(pixels, stride, width, height, plan.clears[i]);
@@ -2087,9 +2146,9 @@ static DesktopOverlaySurfacePlan RasterShellLayer(uint32_t* pixels, uint32_t str
             if (!local) ++g_idleStats.overlaySurfaceKeeps;
             continue;
         }
-        const auto& s = surfaces[i];
-        WmRenderShellSurface(s, pixels, stride, width, height, now, mx, my);
-        const auto record = WmShellSurfaceRecord(s, slots[i].key);
+        const auto& s = frame.surfaces[i];
+        DrawShellFrameSurface(frame, i, pixels, stride);
+        const auto& record = frame.records[i];
         const ChromeAlphaRect rect{s.x, s.y, s.w, s.h};
         if (record.material == BROOK_DESKTOP_MATERIAL_GLASS) {
             ChromeFillAlpha(pixels, stride, width, height, rect, CompositorMaterialOpacity());
@@ -2105,32 +2164,28 @@ static DesktopOverlaySurfacePlan RasterShellLayer(uint32_t* pixels, uint32_t str
         } else ChromeMarkOpaque(pixels, stride, width, height, rect);
         if (!local) ++g_idleStats.overlaySurfaceDraws;
     }
-    DesktopOverlayCommitSurfaces(cache, slots, count);
+    DesktopOverlayCommitSurfaces(cache, frame.slots, count);
     return plan;
 }
 
-static uint32_t RenderDesktopOverlay(uint32_t* pixels,uint32_t width,uint32_t height,uint64_t now,
-                                     int32_t mouseX,int32_t mouseY,DesktopOverlayRect* rects,uint64_t* keys,
-                                     BrookDesktopOverlaySurfaces* records,uint32_t* opaqueMask)
+static uint32_t RenderDesktopOverlay(uint32_t* pixels, const ShellFrame& frame,
+                                     DesktopOverlayRect* rects, uint64_t* keys,
+                                     BrookDesktopOverlaySurfaces& records, uint32_t& opaqueMask)
 {
-    *opaqueMask = 0;
-    if (records) *records = {};
-    WmShellSurface surfaces[WM_SHELL_SURFACE_LIMIT];
-    DesktopOverlaySurfaceSlot slots[DESKTOP_OVERLAY_SURFACE_LIMIT]{};
-    const uint32_t count = OverlaySurfaceSlots(width, height, now, mouseX, mouseY, surfaces, slots);
+    opaqueMask = 0;
+    records = {};
     static_assert(WM_SHELL_SURFACE_LIMIT <= BROOK_DESKTOP_OVERLAY_MAX_SURFACES);
-    RasterShellLayer(pixels, width, width, height, surfaces, slots, count,
-                     g_overlaySurfaceCache, now, mouseX, mouseY, false);
-    for (uint32_t i = 0; i < count; ++i) {
-        const auto record = WmShellSurfaceRecord(surfaces[i], slots[i].key);
-        if (record.flags & BROOK_DESKTOP_SURFACE_OPAQUE) *opaqueMask |= 1u << i;
-        rects[i] = slots[i].rect;
-        keys[i] = slots[i].key;
-        if (records) records->surfaces[records->count++] = record;
+    RasterShellLayer(pixels, frame.width, frame, g_overlaySurfaceCache, false);
+    for (uint32_t i = 0; i < frame.count; ++i) {
+        const auto& record = frame.records[i];
+        if (record.flags & BROOK_DESKTOP_SURFACE_OPAQUE) opaqueMask |= 1u << i;
+        rects[i] = frame.slots[i].rect;
+        keys[i] = frame.slots[i].key;
+        records.surfaces[records.count++] = record;
     }
     ++g_idleStats.overlayRenders;
-    OverlayNoteSignature(slots,count);
-    return count;
+    OverlayNoteSignature(frame.slots, frame.count);
+    return frame.count;
 }
 
 uint64_t CompositorOverlayGeneration()
@@ -2140,32 +2195,15 @@ uint64_t CompositorOverlayGeneration()
     return __atomic_load_n(&g_overlayGeneration,__ATOMIC_ACQUIRE);
 }
 
-// Compositor thread: while a renderer polls op 6, re-key the overlay when
-// input arrived or the pointer moved (hover), and at least every 100 ms
-// (clock, network, animations, launcher), so the generation tracks content.
-// Keys come from the surfaces' display lists: nothing is rasterised or
-// hashed pixel by pixel here, and the shared buffer is not touched.
-static void CheckDesktopOverlay(uint64_t now,int32_t mouseX,int32_t mouseY)
+// Renderer polling compares the same surface keys used to rasterise. A
+// publication wakes the compositor, so a subscriber sees it this frame.
+static void CheckDesktopOverlay(uint64_t now, const ShellFrame& frame)
 {
     const uint64_t queried=__atomic_load_n(&g_overlayQueryTick,__ATOMIC_ACQUIRE);
-    if(!queried || now<queried || now-queried>OVERLAY_SUBSCRIPTION_MS)return;
-    // Input to a pointer-capturing client (a game) cannot change hover, so it
-    // does not trigger re-keying; the periodic check still covers shortcuts.
-    const uint64_t input=InputLatestSequence();
-    const bool inputChanged=input!=g_overlayCheckInput && !WmPointerCaptureActive();
-    if(g_overlayChecked && !inputChanged && mouseX==g_overlayCheckX && mouseY==g_overlayCheckY &&
-       now>=g_overlayCheckTick && now-g_overlayCheckTick<OVERLAY_RECHECK_MS)return;
-    const uint32_t width=g_physFbWidth,height=g_physFbHeight;
-    if(!g_physFb || !width || !height || width>4096 || height>2160)return;
-    WmShellSurface surfaces[WM_SHELL_SURFACE_LIMIT];
-    DesktopOverlaySurfaceSlot slots[DESKTOP_OVERLAY_SURFACE_LIMIT]{};
-    const uint32_t count=OverlaySurfaceSlots(width,height,now,mouseX,mouseY,surfaces,slots);
+    if (!queried || now < queried || now - queried > OVERLAY_SUBSCRIPTION_MS ||
+        !frame.width || !frame.height || frame.width > 4096 || frame.height > 2160) return;
     ++g_idleStats.overlayKeyChecks;
-    {
-        CompositorMutexGuard capture(&g_debugFrameLock);
-        OverlayNoteSignature(slots,count);
-    }
-    g_overlayChecked=true;g_overlayCheckTick=now;g_overlayCheckInput=input;g_overlayCheckX=mouseX;g_overlayCheckY=mouseY;
+    OverlayNoteSignature(frame.slots, frame.count);
 }
 
 // The compositor-thread copy of the pointer image used by op 8; positions are
@@ -2204,7 +2242,7 @@ void CompositorOverlayCursor(BrookDesktopOverlayCursor& out,uint64_t knownSerial
 // Runs only on the compositor thread, so taskbar/launcher state is sampled at
 // the same frame boundary as ordinary software rendering. The debug-frame
 // lease prevents replacement while a client copies its pixels.
-static void CaptureDesktopOverlay(uint64_t now,int32_t mouseX,int32_t mouseY,bool cursorVisible)
+static void CaptureDesktopOverlay(const ShellFrame& frame,uint64_t now,int32_t mouseX,int32_t mouseY,bool cursorVisible)
 {
     Process* waiter=nullptr;
     {
@@ -2216,7 +2254,8 @@ static void CaptureDesktopOverlay(uint64_t now,int32_t mouseX,int32_t mouseY,boo
     [&]{
     CompositorMutexGuard geometry(&g_scanoutMappingLock);
     const uint32_t width=g_physFbWidth,height=g_physFbHeight;
-    if(!g_physFb || !width || !height || width>4096 || height>2160)return;
+    if(!g_physFb || !width || !height || width>4096 || height>2160 ||
+       width != frame.width || height != frame.height)return;
     uint32_t* pixels=OverlayBufferPrepare(width,height);if(!pixels)return;
     DesktopOverlayRect rects[WM_SHELL_SURFACE_LIMIT + 1]{};
     uint64_t keys[WM_SHELL_SURFACE_LIMIT + 1]{};
@@ -2224,9 +2263,7 @@ static void CaptureDesktopOverlay(uint64_t now,int32_t mouseX,int32_t mouseY,boo
     // rectangle it returns; glass surfaces (only for a renderer that can
     // blur) and a composited pointer rectangle appended below are not.
     uint32_t opaqueRects=0;
-    uint32_t rectCount=RenderDesktopOverlay(pixels,width,height,now,mouseX,mouseY,rects,keys,&g_debugOverlaySurfaces,&opaqueRects);
-    g_overlayChecked=true;g_overlayCheckTick=now;g_overlayCheckInput=InputLatestSequence();
-    g_overlayCheckX=mouseX;g_overlayCheckY=mouseY;
+    uint32_t rectCount=RenderDesktopOverlay(pixels,frame,rects,keys,g_debugOverlaySurfaces,opaqueRects);
     if(cursorVisible && g_debugFrameOverlayCursor){
         const int64_t left=int64_t(mouseX)-g_cursorFrame.hotX,top=int64_t(mouseY)-g_cursorFrame.hotY;
         // Clamp before narrowing so even an invalid off-screen input cannot
@@ -2334,22 +2371,22 @@ static void CompositorLoopWM()
     WmAgentIndicatorRefresh(now);
     WmVolumeIndicatorRefresh();
     WmVolumeFeedbackTick(now);
-    // A shell surface that appears, moves or goes away exposes or covers scene
-    // pixels the paths mark only by the surface's own rows, so repaint once on
-    // the transition (both the CPU and overlay-layer paths).
+    int32_t chromeMx = 0, chromeMy = 0;
+    MouseGetPosition(&chromeMx, &chromeMy);
+    const ShellFrame shell = CaptureShellFrame(g_physFbWidth, g_physFbHeight, now, chromeMx, chromeMy);
+    // Software composition needs a full scene repaint when a shell surface
+    // moves or disappears, revealing pixels beneath the old rectangle.
     {
-        static WmShellSurface shown[WM_SHELL_SURFACE_LIMIT]{};
-        static uint32_t shownCount=0;
-        int32_t smx=0,smy=0;MouseGetPosition(&smx,&smy);
-        WmShellSurface current[WM_SHELL_SURFACE_LIMIT];
-        uint32_t count=WmShellSurfaces(g_physFbWidth,g_physFbHeight,smx,smy,current);
-        bool changed=count!=shownCount;
-        for(uint32_t i=0;i<count && !changed;++i)
-            changed=current[i].kind!=shown[i].kind || current[i].x!=shown[i].x || current[i].y!=shown[i].y ||
-                    current[i].w!=shown[i].w || current[i].h!=shown[i].h;
-        if(changed){
-            for(uint32_t i=0;i<count;++i)shown[i]=current[i];
-            shownCount=count;CompositorMarkDirty();
+        static DesktopOverlaySurfaceCache shown;
+        bool changed = shell.count != shown.count;
+        for (uint32_t i = 0; i < shell.count && !changed; ++i) {
+            auto previous = shown.slots[i];
+            previous.key = shell.slots[i].key;
+            changed = !DesktopOverlaySlotEqual(shell.slots[i], previous);
+        }
+        if (changed) {
+            DesktopOverlayCommitSurfaces(shown, shell.slots, shell.count);
+            CompositorMarkDirty();
         }
     }
     // A renderer holding the present lease owns the screen: the back buffer is
@@ -2423,9 +2460,6 @@ static void CompositorLoopWM()
         g_chromeTexNeedsFull=true;
     }
 
-    const bool gpuShell = CompositorGpuActive();
-    const bool cacheLocalShell = !rendererLeased && EnsureOverlayBuffer();
-    const bool drawOverlayLayer = gpuShell && cacheLocalShell;
 
     // 1. Draw wallpaper only when the scene structure changed
     if (fullRepaint && !skipCpuScene)
@@ -2477,10 +2511,6 @@ static void CompositorLoopWM()
     // must also be re-blitted to maintain correct occlusion (prevents
     // background window content bleeding through foreground windows).
     bool anyBelowBlitted = false;
-
-    // Get mouse position once for hover effects
-    int32_t chromeMx = 0, chromeMy = 0;
-    MouseGetPosition(&chromeMx, &chromeMy);
 
     for (uint32_t i = 0; i < wcount; ++i)
     {
@@ -2615,51 +2645,52 @@ static void CompositorLoopWM()
 
     // The local paths use the same keyed layer as overlay capture. On
     // software, copy the opaque rectangles over the completed scene.
-    if (!rendererLeased && g_backBuffer) {
-        WmShellSurface surfaces[WM_SHELL_SURFACE_LIMIT];
-        DesktopOverlaySurfaceSlot slots[DESKTOP_OVERLAY_SURFACE_LIMIT]{};
-        const uint32_t count = OverlaySurfaceSlots(g_physFbWidth, g_physFbHeight, now, chromeMx, chromeMy,
-                                                    surfaces, slots);
-        auto mark = [](const DesktopOverlayRect& r) {
-            int x = r.x, y = r.y, w = r.width, h = r.height;
-            if (ClampScreenRect(x, y, w, h)) MarkDirtyRows(y, y + h);
-        };
-        DesktopOverlaySurfacePlan plan{};
-        if (cacheLocalShell) {
-            plan = RasterShellLayer(g_overlayBuffer, g_backBufStride, g_physFbWidth, g_physFbHeight,
-                                    surfaces, slots, count, g_localShellCache, now, chromeMx, chromeMy, true);
-        }
-        if (drawOverlayLayer) {
-            for (unsigned i = 0; i < count; ++i) g_localShellSurfaces[i] = surfaces[i];
-            if (plan.wipe) g_overlayTexNeedsFull = true;
-            auto dirtyShell = [&](const DesktopOverlayRect& r) {
+    if (!rendererLeased) {
+        CompositorMutexGuard geometry(&g_scanoutMappingLock);
+        if (g_backBuffer && shell.width == g_physFbWidth && shell.height == g_physFbHeight) {
+            const bool cacheLocalShell = EnsureOverlayBuffer();
+            const bool drawOverlayLayer = CompositorGpuActive() && cacheLocalShell;
+            const uint32_t count = shell.count;
+            auto mark = [](const DesktopOverlayRect& r) {
                 int x = r.x, y = r.y, w = r.width, h = r.height;
-                if (!ClampScreenRect(x, y, w, h)) return;
-                if (uint32_t(y) < g_shellUploadMinY) g_shellUploadMinY = y;
-                if (uint32_t(y + h) > g_shellUploadMaxY) g_shellUploadMaxY = y + h;
-                MarkDirtyRows(y, y + h);
+                if (ClampScreenRect(x, y, w, h)) MarkDirtyRows(y, y + h);
             };
-            for (unsigned i = 0; i < plan.clearCount; ++i) dirtyShell(plan.clears[i]);
-            for (unsigned i = 0; i < count; ++i)
-                if (plan.draw >> i & 1u) dirtyShell(slots[i].rect);
-        } else {
-            ++g_idleStats.cpuOverlayDraws;
-            for (unsigned i = 0; i < count; ++i) {
-                if (cacheLocalShell) {
-                    int x = surfaces[i].x, y = surfaces[i].y, w = surfaces[i].w, h = surfaces[i].h;
-                    if (!ClampScreenRect(x, y, w, h)) continue;
-                    for (int row = y; row < y + h; ++row) {
-                        const uint64_t offset = uint64_t(row) * g_backBufStride + x;
-                        __builtin_memcpy(g_backBuffer + offset, g_overlayBuffer + offset, uint64_t(w) * 4);
+            DesktopOverlaySurfacePlan plan{};
+            if (cacheLocalShell) {
+                plan = RasterShellLayer(g_overlayBuffer, g_backBufStride, shell, g_localShellCache, true);
+            }
+            if (drawOverlayLayer) {
+                for (unsigned i = 0; i < count; ++i) g_localShellRecords[i] = shell.records[i];
+                if (plan.wipe) g_overlayTexNeedsFull = true;
+                auto dirtyShell = [&](const DesktopOverlayRect& r) {
+                    int x = r.x, y = r.y, w = r.width, h = r.height;
+                    if (!ClampScreenRect(x, y, w, h)) return;
+                    if (uint32_t(y) < g_shellUploadMinY) g_shellUploadMinY = y;
+                    if (uint32_t(y + h) > g_shellUploadMaxY) g_shellUploadMaxY = y + h;
+                    MarkDirtyRows(y, y + h);
+                };
+                for (unsigned i = 0; i < plan.clearCount; ++i) dirtyShell(plan.clears[i]);
+                for (unsigned i = 0; i < count; ++i)
+                    if (plan.draw >> i & 1u) dirtyShell(shell.slots[i].rect);
+            } else {
+                ++g_idleStats.cpuOverlayDraws;
+                for (unsigned i = 0; i < count; ++i) {
+                    if (cacheLocalShell) {
+                        const auto& rect = shell.slots[i].rect;
+                        int x = rect.x, y = rect.y, w = rect.width, h = rect.height;
+                        if (!ClampScreenRect(x, y, w, h)) continue;
+                        for (int row = y; row < y + h; ++row) {
+                            const uint64_t offset = uint64_t(row) * g_backBufStride + x;
+                            __builtin_memcpy(g_backBuffer + offset, g_overlayBuffer + offset, uint64_t(w) * 4);
+                        }
+                    } else {
+                        DrawShellFrameSurface(shell, i, g_backBuffer, g_backBufStride);
                     }
-                } else {
-                    WmRenderShellSurface(surfaces[i], g_backBuffer, g_backBufStride,
-                                         g_physFbWidth, g_physFbHeight, now, chromeMx, chromeMy);
+                    mark(shell.slots[i].rect);
                 }
-                mark(slots[i].rect);
             }
         }
-    } else if (rendererLeased) ++g_idleStats.cpuOverlaySkips;
+    } else ++g_idleStats.cpuOverlaySkips;
     const bool overlayCursor=MouseIsAvailable() && !WmPointerCaptureActive() &&
         __atomic_load_n(&g_defaultCursorVisible,__ATOMIC_ACQUIRE)!=0 &&
         CursorPixelsHaveAlpha(g_cursorFrame.pixels,g_cursorFrame.width,g_cursorFrame.height);
@@ -2668,8 +2699,8 @@ static void CompositorLoopWM()
     BdwCursorUpdate(cursorLeaseOwner,overlayCursor,chromeMx-g_cursorFrame.hotX,
         chromeMy-g_cursorFrame.hotY,g_cursorFrame.pixels,g_cursorFrame.width,g_cursorFrame.height);
 #endif
-    CaptureDesktopOverlay(now,chromeMx,chromeMy,overlayCursor);
-    CheckDesktopOverlay(now,chromeMx,chromeMy);
+    CaptureDesktopOverlay(shell,now,chromeMx,chromeMy,overlayCursor);
+    CheckDesktopOverlay(now,shell);
 }
 
 static DesktopPointerGate g_desktopPointerGate;
@@ -4063,7 +4094,7 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
         BrookDesktopSurface records[WM_SHELL_SURFACE_LIMIT]{};
         unsigned shadows = 0;
         for (unsigned i = cache.count; i > 0; --i) {
-            records[i - 1] = WmShellSurfaceRecord(g_localShellSurfaces[i - 1], cache.slots[i - 1].key);
+            records[i - 1] = g_localShellRecords[i - 1];
             if (records[i - 1].shadow == BROOK_DESKTOP_SHADOW_PANEL && ++shadows > ChromeShadowShellLimit)
                 records[i - 1].shadow = BROOK_DESKTOP_SHADOW_NONE;
         }
