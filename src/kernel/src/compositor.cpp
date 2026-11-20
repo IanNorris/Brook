@@ -3140,6 +3140,7 @@ static void CompositorInputWM()
 static bool    g_wmDragging      = false;
 static int     g_wmDragWindow    = -1;
 static int16_t g_wmDragOffsetX   = 0;
+static int16_t g_wmDragStartX = 0, g_wmDragStartY = 0; // window origin when the move began (drag to dock)
 static int16_t g_wmDragOffsetY   = 0;
 static bool    g_wmResizing      = false;
 static int     g_wmResizeWindow  = -1;
@@ -3181,6 +3182,8 @@ bool CompositorBeginWindowMove(int windowIdx)
     g_wmDragWindow = windowIdx;
     g_wmDragOffsetX = static_cast<int16_t>(mx - w->x);
     g_wmDragOffsetY = static_cast<int16_t>(my - w->y);
+    g_wmDragStartX = w->x;
+    g_wmDragStartY = w->y;
     g_wmLastBtnDown = true;
     WmSetFocus(windowIdx);
     return true;
@@ -3446,10 +3449,14 @@ static void CompositorHandleMouseWM()
     {
         g_titleClicks.Motion(mx,my);
         const Window* dragged=WmGetWindow(g_wmDragWindow);
-        if(!dragged||dragged->state==WindowState::Maximized){g_wmDragging=false;g_wmDragWindow=-1;}
-        else WmMoveWindow(g_wmDragWindow,
+        if(!dragged||dragged->state==WindowState::Maximized){
+            g_wmDragging=false;g_wmDragWindow=-1;WmDockWindowDragCancel();
+        } else {
+            WmMoveWindow(g_wmDragWindow,
                          static_cast<int16_t>(mx - g_wmDragOffsetX),
                          static_cast<int16_t>(my - g_wmDragOffsetY));
+            WmDockWindowDrag(g_wmDragWindow, mx, my);
+        }
     }
     else if (btnDown && g_wmResizing)
     {
@@ -3505,6 +3512,9 @@ static void CompositorHandleMouseWM()
     }
     else if (!btnDown && !releaseLatched)
     {
+        // A window move released over the dock's drop target docks it.
+        if (g_wmDragging && g_wmDragWindow >= 0)
+            WmDockWindowDrop(g_wmDragWindow, mx, my, g_wmDragStartX, g_wmDragStartY);
         // On release, do the actual VFB resize if we were resizing
         if (g_wmResizing && g_wmResizeWindow >= 0)
         {
@@ -3526,6 +3536,8 @@ static void CompositorHandleMouseWM()
 
     if (releaseLatched && !polledDown)
     {
+        if (g_wmDragging && g_wmDragWindow >= 0)
+            WmDockWindowDrop(g_wmDragWindow, mx, my, g_wmDragStartX, g_wmDragStartY);
         if (g_wmResizing && g_wmResizeWindow >= 0)
         {
             Window* w = WmGetWindow(g_wmResizeWindow);

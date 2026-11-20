@@ -661,6 +661,32 @@ void Dock(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
     RenderSnapshot(model, s, list);
     const DesktopRect& t = model.dock.tab;
     Check(prefix + "dock-tab", list, s, 0, t.y - m.pixels(8), m.pixels(24), t.h + m.pixels(16));
+    // Drag to dock: the shut dock's "Send to dock" chip (placed by the WM),
+    // on either edge, and the open strip lit as the target.
+    for (bool right : {false, true}) {
+        model = {};
+        model.kind = ChromeShellKind::Dock;
+        model.dock = ChromeDockLayoutFor(m, screenW, desktopH, 0, -1, false, {0, right});
+        model.dock.drop = true;
+        const int w = m.pixels(ChromeDockMetrics::DropChipW), h = m.pixels(ChromeDockMetrics::DropChipH);
+        model.dock.tab = {right ? int(screenW) - w : 0, (int(desktopH) - h) / 2, w, h};
+        model.mouseX = model.mouseY = -1;
+        ChromeDisplayList chip = ChromeListOn(storage);
+        RenderSnapshot(model, s, chip);
+        const DesktopRect& c = model.dock.tab;
+        Check(prefix + (right ? "dock-drop-chip-right" : "dock-drop-chip"), chip, s, c.x, c.y, c.w, c.h);
+    }
+    model = {};
+    model.kind = ChromeShellKind::Dock;
+    model.dock = ChromeDockLayoutFor(m, screenW, desktopH, 2, 0, true);
+    model.dock.drop = true;
+    SetTestIcon(model.icons[0]);SetTestIcon(model.icons[1]);
+    std::strcpy(model.text, "Files");
+    model.mouseX = model.mouseY = -1;
+    ChromeDisplayList lit = ChromeListOn(storage);
+    RenderSnapshot(model, s, lit);
+    const DesktopRect& r = model.dock.strip;
+    Check(prefix + "dock-drop-open", lit, s, r.x, r.y, r.w, r.h);
 }
 
 void WebAppTitles(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {

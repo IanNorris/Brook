@@ -124,7 +124,10 @@ void ChromeBuildVolumeGlyph(ChromeDisplayList& dl, const ChromeStyle& s, int x0,
 // resize grip, Grip wide, centred on the edge.
 struct ChromeDockMetrics {
     static constexpr int Width = 420, MinWidth = 360, MaxWidth = 720, Strip = 48, Cell = 42, Pin = 38, TileButton = 32;
-    static constexpr int Icon = 24, Tab = 5, TabHeight = 120, Grip = 8;
+    static constexpr int Icon = 24, Tab = 5, TabHeight = 120, Grip = 12;
+    // Drag to dock: with the dock shut, the last DropEdge px of its screen
+    // edge is the target, shown as a DropChipW x DropChipH chip on the edge.
+    static constexpr int DropEdge = 28, DropChipW = 168, DropChipH = 44;
 };
 // Where the sidebar sits: the edge, and its width in logical pixels (0: the
 // default Width). The width is clamped to [MinWidth, MaxWidth] and to half
@@ -144,6 +147,7 @@ struct ChromeDockLayout {
     int selected; // -1: none
     bool open;    // strip shown (open or pinned); else the tab, when there are entries
     bool right;   // the sidebar is on the right edge
+    bool drop;    // a dragged window is over the drop target (closed: tab is the chip)
 };
 
 enum class ChromeDockTarget : uint8_t { None, Entry, Tile, Return, Close, Pin, Strip, Tab, Side, Grip };

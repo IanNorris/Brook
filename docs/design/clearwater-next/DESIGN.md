@@ -1280,7 +1280,7 @@ meant, the top dock in Lab is most of it already.
 | Selection mark | The tile's lighter fill. No accent bar, no marker. |
 | Pin | A 38×48 button at the end of the strip. |
 | Side | A 38×48 button before the pin: moves the sidebar to the other screen edge. One dock at a time; saved as `side=left\|right`. |
-| Grip | The inner edge, 8 px centred on it, the full height: drag to resize (360 to 720, at most half the screen). The strip's inner hairline turns accent while it is hovered or dragged. |
+| Grip | The inner edge, 12 px centred on it, the full height: drag to resize (360 to 720, at most half the screen). A short handle pill sits on the strip's inner edge; it and the hairline turn accent while hovered or dragged. A resize cursor is still to come. |
 | Page | The rest of the column: 420×804. The app's window with no title bar of its own. |
 
 **Icons at the top** (the default): the selected tile sits where a title bar
@@ -1341,6 +1341,12 @@ taskbar button moves to the bottom-right corner and toasts move inboard.
   “Send to dock”.
 - **Key.** Super+Shift+S docks the focused window, or returns the page to the
   desktop.
+- **Native (D2).** Dragging a window by its title bar (Brook's or a
+  client's, via xdg move) over the shut dock's last 28 px of edge shows a
+  168×44 "Send to dock" chip on that edge; with the dock open the whole
+  sidebar is the target and the strip lights. Releasing docks the window;
+  Return puts it back where the drag began. Every way of docking opens the
+  dock on the new entry, focused.
 - **Button.** Title bars that Brook draws carry a fourth caption button, left
   of minimise: a window with a sidebar panel on the edge the dock is on. Apps
   that draw their own title bar (Chromium's overlaid captions, GTK header

@@ -577,6 +577,12 @@ void WmDockSetWidth(int width);
 // The sidebar's inner-edge grip, pressed in WmDockPress: motion while the
 // button is held resizes the page; the release settles and saves the width.
 bool WmDockDragActive();
+// Drag to dock, from the compositor's window move: each motion updates the
+// drop target (feedback in the dock surface); the release docks the window
+// if it is over the target, its return position being where the move began.
+void WmDockWindowDrag(int idx, int32_t mx, int32_t my);
+void WmDockWindowDragCancel();
+bool WmDockWindowDrop(int idx, int32_t mx, int32_t my, int16_t startX, int16_t startY);
 void WmDockDrag(int32_t mx, bool down);
 // Alt+Tab: send the frontmost desktop window back and focus the next one.
 // Docked windows take no part; an open, unpinned dock closes first. Returns

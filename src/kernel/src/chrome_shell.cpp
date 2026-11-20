@@ -687,6 +687,20 @@ void ChromeBuildDock(const ChromeDockModel& m, const ChromeStyle& s, ChromeDispl
 {
     const ChromeDockLayout& l = *m.layout;
     const auto& p = s.P();
+    if (!l.open && l.drop) {
+        // Drag to dock, dock shut: a glass chip on the edge, the accent bar
+        // on its screen side, the dock glyph and "Send to dock".
+        const DesktopRect& t = l.tab;
+        if (t.w <= 0 || t.h <= 0) return;
+        dl.MaterialRect(t, s.MaterialColor(p.taskbar), Px(s, 8));
+        const int bar = Px(s, 4);
+        dl.Fill(l.right ? t.x + t.w - bar : t.x, t.y, bar, t.h, 0xff000000u | p.accent);
+        const int glyph = Px(s, 16), gx = t.x + Px(s, 16), gy = t.y + (t.h - glyph) / 2;
+        dl.Glyph(l.right ? ChromeGlyph::DockRight : ChromeGlyph::DockLeft, gx, gy, p.text);
+        const int tx = gx + glyph + Px(s, 10);
+        dl.Text(CF::Label, tx, t.y + (t.h - s.Line(CF::Label)) / 2, "Send to dock", p.text, t.x + t.w - tx - Px(s, 8));
+        return;
+    }
     if (!l.open) {
         // At rest: a flat quad with a short grip, no glass.
         const DesktopRect& t = l.tab;
@@ -706,9 +720,17 @@ void ChromeBuildDock(const ChromeDockModel& m, const ChromeStyle& s, ChromeDispl
     dl.Fill(r.x, r.y + r.h - 1, r.w, 1, edge);
     // The inner edge: a hairline, the accent while the grip is hovered or dragged.
     const int innerX = l.right ? r.x : r.x + r.w - 1;
-    if (m.resizing || l.grip.contains(m.mouseX, m.mouseY))
+    const bool gripHot = m.resizing || l.grip.contains(m.mouseX, m.mouseY);
+    if (gripHot || l.drop)
         dl.Fill(l.right ? r.x : r.x + r.w - Px(s, 2), r.y, Px(s, 2), r.h, 0xff000000u | p.accent);
     else dl.Fill(innerX, r.y, 1, r.h - 1, edge);
+    if (l.drop) dl.Fill(r.x, r.y + r.h - Px(s, 2), r.w, Px(s, 2), 0xff000000u | p.accent);
+    // The resize handle: a short pill on the inner edge, always shown.
+    {
+        const int pw = Px(s, 3), ph = Px(s, 20) < r.h ? Px(s, 20) : r.h;
+        const int px = l.right ? r.x + Px(s, 3) : r.x + r.w - Px(s, 3) - pw;
+        dl.MaterialRect({px, r.y + (r.h - ph) / 2, pw, ph}, 0xff000000u | (gripHot ? p.accent : p.mutedText), Px(s, 1));
+    }
     auto pill = [&](const DesktopRect& c) {
         const int ix = c.w > 4 * Px(s, SM::TaskbarPillInsetX) ? Px(s, SM::TaskbarPillInsetX) : 0;
         const int iy = c.h > 4 * Px(s, SM::TaskbarPillInsetY) ? Px(s, SM::TaskbarPillInsetY) : 0;
