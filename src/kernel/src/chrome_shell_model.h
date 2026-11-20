@@ -7,7 +7,7 @@
 namespace brook {
 
 enum class ChromeShellKind : uint8_t {
-    Taskbar, Launcher, VolumePopup, Tooltip, BootSummary, TrayFlyout, PerformanceHud, None = 0xff,
+    Taskbar, Launcher, VolumePopup, Tooltip, BootSummary, TrayFlyout, PerformanceHud, AppTrayMenu, Notification, None = 0xff,
 };
 
 struct ChromeShellConfig {
@@ -79,6 +79,7 @@ struct ChromeShellModel {
     ChromeShellEntry entries[EntryLimit];
     ChromeShellTelemetry telemetry, compactTelemetry;
     ChromeShellBoot boot;
+    ChromeTrayState tray;
     ChromeTaskbarLayout taskbar;
     LauncherModel launcherModel;
     ChromeLauncherFrame launcherFrame;
@@ -113,7 +114,7 @@ inline void BuildShellModel(const ChromeShellModel& model, const ChromeStyle& st
         ChromeBuildTaskbar({&model.taskbar, buttons, model.launcherOpen, model.icons[ChromeShellModel::AppsIcon].View(),
                            model.icons[ChromeShellModel::TerminalIcon].View(), model.networkConnected,
                            model.volumeControl, model.volumeAvailable, model.agentShown, model.agentStale,
-                           model.telemetry.View(), model.uptimeMs, model.mouseX, model.mouseY}, style, list);
+                           model.telemetry.View(), model.uptimeMs, model.mouseX, model.mouseY, &model.tray}, style, list);
         if (model.taskbar.hud.w > 0)
             ChromeBuildCompactHud({model.taskbar.hud, model.compactTelemetry.View(), model.hudTick}, style, list);
         break;
@@ -140,6 +141,12 @@ inline void BuildShellModel(const ChromeShellModel& model, const ChromeStyle& st
     case ChromeShellKind::TrayFlyout:
         ChromeBuildTrayFlyout({model.rect, model.network, model.networkConnected, model.text, model.telemetry.View()},
                               style, list);
+        break;
+    case ChromeShellKind::AppTrayMenu:
+        ChromeBuildAppTrayMenu(model.tray, model.rect, model.mouseX, model.mouseY, style, list);
+        break;
+    case ChromeShellKind::Notification:
+        ChromeBuildNotice(model.tray.notice, model.rect, model.mouseX, model.mouseY, style, list);
         break;
     case ChromeShellKind::PerformanceHud:
         ChromeBuildPerformanceHud({model.rect, model.telemetry.View(), model.hudTick}, style, list);

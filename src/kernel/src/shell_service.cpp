@@ -5,6 +5,7 @@
 #include "compositor.h"
 #include "desktop_shell_surfaces.h"
 #include "input.h"
+#include "desktop_identity.h"
 #include "memory/heap.h"
 #include "process.h"
 #include "scheduler.h"
@@ -19,7 +20,7 @@ inline void* operator new(size_t, void* storage) noexcept { return storage; }
 namespace brook {
 namespace {
 
-constexpr unsigned KindCount = unsigned(WmShellSurfaceKind::PerformanceHud) + 1;
+constexpr unsigned KindCount = unsigned(WmShellSurfaceKind::Notification) + 1;
 
 struct Geometry {
     WmShellSurface surface;
@@ -67,6 +68,11 @@ uint64_t g_sequence = 0;
 uint64_t g_ownerCheck = 0;
 bool g_registered = false;
 bool g_adoptionPending = false;
+ChromeTrayState g_tray{}, g_trayStaged{};
+TrayInput g_trayInput[32]{};
+uint32_t g_trayHead = 0, g_trayCount = 0;
+bool g_trayPending = false;
+
 
 struct Lock {
     Lock() { KMutexLock(&g_lock); }
@@ -212,7 +218,82 @@ int64_t Present(Process& proc, uint64_t exchange, uint64_t address)
     return error;
 }
 
+bool TrayChild(const Process& proc)
+{
+    return proc.euid == DesktopUid && g_pid && proc.parentPid == g_pid;
+}
+
+template<size_t N> bool TrayString(const char (&text)[N])
+{
+    return text[N - 1] == 0;
+}
+
+bool ValidTray(const ChromeTrayState& tray)
+{
+    if (tray.itemCount > TrayItemLimit || tray.menuCount > TrayMenuLimit ||
+        tray.notice.actionCount > NoticeActionLimit) return false;
+    bool owner = tray.menuCount == 0 && tray.menuOwner == 0;
+    for (uint32_t i = 0; i < tray.itemCount; ++i) {
+        const auto& item = tray.items[i];
+        if (!item.id || !TrayString(item.title) || !TrayString(item.tooltip)) return false;
+        owner |= tray.menuCount && item.id == tray.menuOwner;
+        for (uint32_t j = 0; j < i; ++j) if (tray.items[j].id == item.id) return false;
+    }
+    if (!owner || !TrayString(tray.notice.app) || !TrayString(tray.notice.title) ||
+        !TrayString(tray.notice.body)) return false;
+    for (uint32_t i = 0; i < tray.menuCount; ++i)
+        if (!TrayString(tray.menu[i].label)) return false;
+    for (uint32_t i = 0; i < tray.notice.actionCount; ++i)
+        if (!TrayString(tray.notice.actions[i])) return false;
+    return true;
+}
+
+int64_t TrayPublish(const Process& proc, uint64_t address)
+{
+    auto* tray = static_cast<ChromeTrayState*>(kmalloc(sizeof(ChromeTrayState)));
+    if (!tray) return -12;
+    int64_t result = 0;
+    if (!CopyFromUser(tray, address, sizeof(ChromeTrayState))) result = -14;
+    else if (!ValidTray(*tray)) result = -22;
+    else {
+        Lock lock;
+        if (!TrayChild(proc)) result = -1;
+        else if (memcmp(tray, &g_trayStaged, sizeof(ChromeTrayState))) {
+            g_trayStaged = *tray;
+            g_trayPending = true;
+            __atomic_store_n(&g_adoptionPending, true, __ATOMIC_RELEASE);
+        }
+    }
+    kfree(tray);
+    if (!result) CompositorWake();
+    return result;
+}
+
+int64_t TrayNextInput(const Process& proc, uint64_t address)
+{
+    TrayInput input{};
+    {
+        Lock lock;
+        if (!TrayChild(proc)) return -1;
+        if (!g_trayCount) return -11;
+        input = g_trayInput[g_trayHead];
+        g_trayHead = (g_trayHead + 1) % 32;
+        --g_trayCount;
+    }
+    return CopyToUser(address, &input, sizeof(input)) ? 0 : -14;
+}
+
 } // namespace
+
+const ChromeTrayState& ShellServiceTrayState() { return g_tray; }
+
+void ShellServiceQueueTrayInput(const TrayInput& input)
+{
+    Lock lock;
+    if (!g_pid || g_trayCount == 32) return;
+    g_trayInput[(g_trayHead + g_trayCount) % 32] = input;
+    ++g_trayCount;
+}
 
 void ShellServiceBeginFrame(uint64_t now)
 {
@@ -229,6 +310,10 @@ void ShellServiceBeginFrame(uint64_t now)
             ProcessSnapshot owner{};
             if (g_pid && (!SchedulerSnapshotProcess(g_pid, &owner) || owner.incarnation != g_incarnation ||
                          owner.state == ProcessState::Terminated)) {
+                memset(&g_tray, 0, sizeof(g_tray));
+                memset(&g_trayStaged, 0, sizeof(g_trayStaged));
+                g_trayPending = false;
+                g_trayHead = g_trayCount = 0;
                 g_pid = 0;
                 g_incarnation = 0;
                 __atomic_store_n(&g_registered, false, __ATOMIC_RELEASE);
@@ -242,6 +327,10 @@ void ShellServiceBeginFrame(uint64_t now)
             }
         }
         if (__atomic_exchange_n(&g_adoptionPending, false, __ATOMIC_ACQ_REL)) {
+            if (g_trayPending) {
+                g_tray = g_trayStaged;
+                g_trayPending = false;
+            }
             for (auto& slot : g_shell->slots) if (slot.staged) {
                 retired[count++] = slot.active;
                 slot.active = slot.staged;
@@ -352,7 +441,10 @@ int64_t ShellServiceSyscallInvoke(uint64_t op, uint64_t exchange, uint64_t paylo
                                  uint64_t bytes, uint64_t reserved1, uint64_t reserved2)
 {
     auto* proc = ProcessCurrent();
-    if (!proc || proc->euid || proc->isThread) return -1;
+    if (!proc || proc->isThread) return -1;
+    const bool tray = op == uint64_t(ShellServiceOp::TrayPublish) ||
+                      op == uint64_t(ShellServiceOp::TrayNextInput);
+    if (tray ? proc->euid != DesktopUid : proc->euid != 0) return -1;
     // A mounted QEMU boot volume reports /boot. The guarded initrd keeps
     // the FAT directory's canonical /BOOT spelling in the executable path.
     if (strcmp(proc->exePath, "/boot/CWSHELL.ELF") && strcmp(proc->exePath, "/BOOT/CWSHELL.ELF")) {
@@ -361,6 +453,17 @@ int64_t ShellServiceSyscallInvoke(uint64_t op, uint64_t exchange, uint64_t paylo
         return -1;
     }
     if (reserved1 || reserved2) return -22;
+    if (tray) {
+        if (exchange || !payload) return -22;
+        {
+            Lock lock;
+            if (!TrayChild(*proc)) return -1;
+        }
+        KernelOperationGuard guard(proc);
+        if (op == uint64_t(ShellServiceOp::TrayPublish))
+            return bytes == sizeof(ChromeTrayState) ? TrayPublish(*proc, payload) : -22;
+        return bytes == sizeof(TrayInput) ? TrayNextInput(*proc, payload) : -22;
+    }
     if (op != uint64_t(ShellServiceOp::Register) && (!exchange ||
         payload > (~uint64_t{0}) - sizeof(ShellWireList) || !payload)) return -22;
     KernelOperationGuard guard(proc);
@@ -374,6 +477,9 @@ int64_t ShellServiceSyscallInvoke(uint64_t op, uint64_t exchange, uint64_t paylo
     case ShellServiceOp::Present:
         if (bytes != sizeof(ShellWireList)) return -22;
         return Present(*proc, exchange, payload);
+    case ShellServiceOp::TrayPublish:
+    case ShellServiceOp::TrayNextInput:
+        return -22;
     }
     return -22;
 }

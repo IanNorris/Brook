@@ -1,6 +1,7 @@
 #pragma once
 #include <stdint.h>
 #include "window.h"
+#include "chrome_layout.h"
 #include "../../shared/desktop_layers_abi.h"
 
 namespace brook {
@@ -10,19 +11,24 @@ namespace brook {
 // and the VKRENDER overlay capture. Add a new shell surface here, not in the
 // paths. Material surfaces take the translucent shell material when glass is
 // active; the others stay opaque.
-enum class WmShellSurfaceKind : uint8_t { Taskbar, Launcher, VolumePopup, TrayTooltip, BootSummary, TrayFlyout, PerformanceHud };
+enum class WmShellSurfaceKind : uint8_t { Taskbar, Launcher, VolumePopup, TrayTooltip, BootSummary, TrayFlyout, PerformanceHud, AppTrayMenu, AppTrayTooltip, Notification };
 struct WmShellSurface {
     WmShellSurfaceKind kind;
     int32_t x, y;
     uint32_t w, h;
     bool material;
 };
+struct WmShellTrayGeometry {
+    DesktopRect popup, notice;
+    bool menu;
+};
 // Taskbar, popup slot, boot toast and optional expanded HUD.
 static constexpr uint32_t WM_SHELL_SURFACE_LIMIT = 4;
 
 // Back to front. (mx,my) is the pointer the caller renders hover state with.
 inline uint32_t WmShellSurfaces(uint32_t screenW, uint32_t screenH, int32_t mx, int32_t my,
-                                WmShellSurface (&out)[WM_SHELL_SURFACE_LIMIT])
+                                WmShellSurface (&out)[WM_SHELL_SURFACE_LIMIT],
+                                DesktopRect trayPopup = {}, bool trayMenu = false, DesktopRect notice = {})
 {
     uint32_t count = 0;
     // A focused fullscreen window owns the whole output (WmTaskbarHidden).
@@ -41,6 +47,9 @@ inline uint32_t WmShellSurfaces(uint32_t screenW, uint32_t screenH, int32_t mx, 
         out[count++] = {WmShellSurfaceKind::VolumePopup, x, y, w, h, true};
     } else if (WmTrayFlyoutRect(screenW, screenH, &x, &y, &w, &h)) {
         out[count++] = {WmShellSurfaceKind::TrayFlyout, x, y, w, h, true};
+    } else if (trayPopup.w > 0 && trayPopup.h > 0) {
+        out[count++] = {trayMenu ? WmShellSurfaceKind::AppTrayMenu : WmShellSurfaceKind::AppTrayTooltip,
+                        trayPopup.x, trayPopup.y, uint32_t(trayPopup.w), uint32_t(trayPopup.h), true};
     } else if (WmTrayTooltipGetRect(screenW, screenH, mx, my, &x, &y, &w, &h)) {
         out[count++] = {WmShellSurfaceKind::TrayTooltip, x, y, w, h, true};
     }
@@ -55,7 +64,10 @@ inline uint32_t WmShellSurfaces(uint32_t screenW, uint32_t screenH, int32_t mx, 
         }
         return true;
     };
-    if (WmBootSummaryRect(screenW, screenH, &x, &y, &w, &h) && freeSpace())
+    if (notice.w > 0 && notice.h > 0) {
+        x = notice.x; y = notice.y; w = notice.w; h = notice.h;
+        if (freeSpace()) out[count++] = {WmShellSurfaceKind::Notification, x, y, w, h, true};
+    } else if (WmBootSummaryRect(screenW, screenH, &x, &y, &w, &h) && freeSpace())
         out[count++] = {WmShellSurfaceKind::BootSummary, x, y, w, h, true};
     if (WmPerformanceHudRect(screenW, screenH, &x, &y, &w, &h) && freeSpace())
         out[count++] = {WmShellSurfaceKind::PerformanceHud, x, y, w, h, true};

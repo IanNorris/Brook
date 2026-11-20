@@ -9,6 +9,8 @@
 #include "thermal_sampler.h"
 #include "taskbar_volume.h"
 
+#include "chrome_tray.h"
+
 namespace brook {
 
 // Logical sizes at 100% (window.h's WM_TASKBAR_* and the launcher's
@@ -49,6 +51,8 @@ struct ChromeTaskbarLayout {
     DesktopRect apps, terminal, next, clock, network, volume, agent, build, hud;
     DesktopRect separators[2]; // after the launcher button; before the tray
     DesktopRect metrics[7];
+    DesktopRect trayApps[TrayItemLimit];
+    uint32_t trayAppCount;
     DesktopRect buttons[ChromeTaskbarButtonLimit];
     int indices[ChromeTaskbarButtonLimit];
     int count, nextIndex;
@@ -62,7 +66,8 @@ struct ChromeTaskbarLayout {
 ChromeTaskbarLayout ChromeTaskbarLayoutFor(const ChromeStyle& s, uint32_t screenW, uint32_t screenH,
                                            const char* clockText, bool agent, uint32_t enabledMetrics,
                                            const int* ids, int total, int focused, const char* buildText = nullptr,
-                                           bool compactHud = false, const char* const* labels = nullptr);
+                                           bool compactHud = false, const char* const* labels = nullptr,
+                                           uint32_t trayAppCount = 0);
 
 struct ChromeTaskbarButton {
     const uint32_t* icon;   // borrowed; null: missing glyph
@@ -96,6 +101,7 @@ struct ChromeTaskbarModel {
     ChromeTelemetryModel telemetry;
     uint64_t uptimeMs;
     int32_t mouseX, mouseY;
+    const ChromeTrayState* tray = nullptr;
 };
 
 void ChromeBuildTaskbar(const ChromeTaskbarModel& model, const ChromeStyle& style, ChromeDisplayList& out);

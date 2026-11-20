@@ -66,6 +66,11 @@ void CompositorRetireVfb(CompositorVfbAllocation*) { std::abort(); }
 uint64_t CompositorDesktopReadyTick() { return 0; }
 uint64_t RtcNow() { return 0; }
 char* RtcFormatTaskbar(char* buf,uint64_t,bool) { buf[0]='0';buf[1]=0;return buf; }
+const ChromeTrayState& ShellServiceTrayState() {
+    static const ChromeTrayState empty{};
+    return empty;
+}
+void ShellServiceQueueTrayInput(const TrayInput&) { std::abort(); }
 bool ThermalReadSnapshot(ThermalSnapshot&) { return false; }
 uint32_t testScreenW=1024,testScreenH=768;
 extern "C" void CompositorGetPhysDims(uint32_t* w,uint32_t* h) { if(w)*w=testScreenW;if(h)*h=testScreenH; }

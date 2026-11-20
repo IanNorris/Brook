@@ -30,6 +30,7 @@
 #include "launch_feedback.h"
 #include "launcher_power.h"
 #include "shell.h"
+#include "shell_service.h"
 #include "process.h"
 #include "scheduler.h"
 #include "wayland_provider.h"
@@ -2518,6 +2519,11 @@ bool WmCaptureShellModel(const WmShellSurface& s, uint32_t screenW, uint32_t scr
     case WmShellSurfaceKind::TrayFlyout: WmCaptureTrayFlyout(screenW, screenH, model); break;
     case WmShellSurfaceKind::PerformanceHud: WmCapturePerformanceHud(screenW, screenH, model); break;
     case WmShellSurfaceKind::BootSummary: WmCaptureBootSummary(screenW, screenH, model); break;
+    case WmShellSurfaceKind::AppTrayMenu:
+    case WmShellSurfaceKind::AppTrayTooltip:
+    case WmShellSurfaceKind::Notification:
+        WmCaptureAppTray(s, screenW, screenH, mx, my, model);
+        break;
     }
     return model.kind != ChromeShellKind::None;
 }
@@ -3134,6 +3140,9 @@ BrookDesktopSurface WmShellSurfaceRecord(const WmShellSurface& surface,uint64_t 
     case WmShellSurfaceKind::TrayFlyout: kind=BROOK_DESKTOP_SURFACE_TRAY_FLYOUT;break;
     case WmShellSurfaceKind::PerformanceHud: kind=BROOK_DESKTOP_SURFACE_PERFORMANCE_HUD;break;
     case WmShellSurfaceKind::BootSummary: kind=BROOK_DESKTOP_SURFACE_BOOT_SUMMARY;break;
+    case WmShellSurfaceKind::AppTrayMenu: kind=BROOK_DESKTOP_SURFACE_TRAY_FLYOUT;break;
+    case WmShellSurfaceKind::AppTrayTooltip: kind=BROOK_DESKTOP_SURFACE_TOOLTIP;break;
+    case WmShellSurfaceKind::Notification: kind=BROOK_DESKTOP_SURFACE_BOOT_SUMMARY;break;
     }
     return ChromeShellSurfaceRecord(kind,{surface.x,surface.y,int(surface.w),int(surface.h)},surface.material,key,
                                     CompositorShellMaterialOpacity(),WmChromeSurfaceEffects());

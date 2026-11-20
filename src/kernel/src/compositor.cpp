@@ -2066,7 +2066,9 @@ static ShellFrame CaptureShellFrame(uint32_t width, uint32_t height, uint64_t no
         return frame;
     }
     WmShellSurface surfaces[WM_SHELL_SURFACE_LIMIT];
-    const uint32_t count = WmShellSurfaces(width, height, mx, my, surfaces);
+    WmShellTrayGeometry tray{};
+    WmGetShellTrayGeometry(width, height, mx, my, tray);
+    const uint32_t count = WmShellSurfaces(width, height, mx, my, surfaces, tray.popup, tray.menu, tray.notice);
     uint32_t kindMask = 0;
     for (uint32_t i = 0; i < count; ++i) {
         auto surface = surfaces[i];
@@ -2823,7 +2825,12 @@ static void CompositorInputWM()
             const auto kind=ev.type==InputEventType::MouseButtonDown?DesktopPointerEvent::Down:
                             ev.type==InputEventType::MouseButtonUp?DesktopPointerEvent::Up:
                             ev.type==InputEventType::MouseScroll?DesktopPointerEvent::Scroll:DesktopPointerEvent::Move;
+            const bool trayEvent = WmShellTrayPointer(g_physFbWidth, g_physFbHeight, mx, my,
+                    kind == DesktopPointerEvent::Down, ev.scanCode,
+                    kind == DesktopPointerEvent::Scroll ? LauncherScroll120(ev) : 0);
+            overlay |= trayEvent;
             if(g_desktopPointerGate.consume(kind,ev.scanCode,overlay)) {
+                if (trayEvent) { WmPointerSetHover(-1); continue; }
                 // The WM still needs its own primary-button transitions.
                 if(ev.scanCode==0 && kind==DesktopPointerEvent::Down)g_wmBtnLatch=true;
                 if(ev.scanCode==0 && kind==DesktopPointerEvent::Up)g_wmBtnReleaseLatch=true;

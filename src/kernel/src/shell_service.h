@@ -3,6 +3,10 @@
 
 namespace brook {
 struct WmShellSurface;
+struct ChromeTrayState;
+struct TrayInput;
+const ChromeTrayState& ShellServiceTrayState();
+void ShellServiceQueueTrayInput(const TrayInput&);
 
 void ShellServiceBeginFrame(uint64_t now);
 uint64_t ShellServiceCapture(const WmShellSurface&, uint32_t width, uint32_t height,

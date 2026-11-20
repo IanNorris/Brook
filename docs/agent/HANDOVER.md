@@ -5,6 +5,19 @@ Current state and immediate goal. Keep this short and current: replace stale lin
 _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review follow-up)._
 
 
+## Session tray work paused (20 November 2026)
+
+- `work/shell-tray` has a saved Stage 3 checkpoint. The desktop-user
+  child owns the StatusNotifier watcher, dbusmenu and notifications.
+  The privileged shell renders bounded application icons, menus and a
+  queued toast through the existing surfaces.
+- The Nix shell package and its private D-Bus fixture passed. Release and
+  the new chrome goldens were exercised. Results and attempts are in
+  `build/shell-tray-evidence`.
+- Resume by verifying that the child registers and publishes on Brook
+  in headless QEMU, then build and check a Clearwater-enabled Dell pair.
+  Real Steam behavior and XEmbed compatibility remain to be verified.
+
 ## Clearwater Stage 3 reconciliation (19 November 2026)
 
 - `work/clearwater-s3-reconcile` merges Stage 3 into integration60 `a3f6685e`.
