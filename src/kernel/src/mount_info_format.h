@@ -24,7 +24,7 @@ inline int FormatMountInfo(const VfsMountInfo* rows,uint32_t count,char* out,uin
         number((r.device&0xff)|((r.device>>12)&0xffffff00));character(' ');
         escape(r.root);character(' ');escape(r.mountPoint);literal(r.attributes&1?" ro":" rw");
         if(r.attributes&2)literal(",nosuid");if(r.attributes&4)literal(",nodev");
-        literal(" - ");escape(r.fsType);character(' ');escape(r.fsType);literal(" rw\n");
+        literal(" - ");escape(r.fsType);character(' ');escape(r.systemInternal ? "none" : r.fsType);literal(" rw\n");
     }
     out[used]=0;*written=error?0:used;return error;
 }

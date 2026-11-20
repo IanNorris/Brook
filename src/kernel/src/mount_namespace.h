@@ -34,6 +34,7 @@ int VfsMountNamespaceMountFresh(MountNamespace* ns,const VfsPath& target,
 struct VfsMountInfo {
     uint64_t id,parent,device,attributes;
     char root[512],mountPoint[512],fsType[16];
+    bool systemInternal;
 };
 int VfsMountNamespaceInfo(MountNamespace* ns,const VfsPath& root,VfsMountInfo** rows,uint32_t* count);
 void VfsMountInfoFree(VfsMountInfo* rows);
