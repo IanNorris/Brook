@@ -13,6 +13,8 @@ import shlex
 import subprocess
 import tempfile
 
+from bridge_keyless_image import require_keyless_image
+from bridge_operator_policy import validate_operator_policy
 from stage_clearwater_shell import CLEARWATER_EXECUTABLES
 from prepare_guard_check_pair import CHECKER_SHA, E2FSCK_SHA, REQUIRED, selector
 from prepare_hardware_kernel_pair import (INITRD_MAX, KERNEL_MAX, module_version, regular, desktop_startup, add_vulkan_desktop_start,
@@ -29,7 +31,7 @@ DERIVED={'BROOK_SSD_GUARD_TRANSACTION','BROOK_SSD_GUARD_REPAIR','BROOK_SSD_GUARD
 
 def sha(data):return hashlib.sha256(data).hexdigest()
 
-def verify(candidate, source, reference, build, expected_kernel, expected_source, expected_reference, abi, allow_gpu_capture_test=False, allow_gpu_submission_timing=False, allow_vulkan_desktop=False, expected_vulkan_supervisor=None, expected_vulkan_renderer=None, allow_vulkan_partial=False, allow_gpu_blocked_recovery_test=False, expected_gpu_provider=None, allow_gpu_source_trace=False, allow_dell_acpi_monitor=False, allow_ac_loss_poweroff=False, allow_dell_bcs_present=False, allow_vulkan_async_partial=False, allow_bdw_cache_probe=False, allow_bdw_rps_trial=False, allow_bdw_coherent_render=False, allow_irq_signal_probe=False, allow_hidden_kernel_console=False, allow_bdw_persistent_scanout_map=False, allow_bdw_scanout_flip=False, allow_bdw_zero_copy_scanout=False, allow_bdw_video_engine=False, expected_clearwater_supervisor=None, expected_clearwater_shell=None, expected_update_helpers=()):
+def verify(candidate, source, reference, build, expected_kernel, expected_source, expected_reference, abi, allow_gpu_capture_test=False, allow_gpu_submission_timing=False, allow_vulkan_desktop=False, expected_vulkan_supervisor=None, expected_vulkan_renderer=None, allow_vulkan_partial=False, allow_gpu_blocked_recovery_test=False, expected_gpu_provider=None, allow_gpu_source_trace=False, allow_dell_acpi_monitor=False, allow_ac_loss_poweroff=False, allow_dell_bcs_present=False, allow_vulkan_async_partial=False, allow_bdw_cache_probe=False, allow_bdw_rps_trial=False, allow_bdw_coherent_render=False, allow_irq_signal_probe=False, allow_hidden_kernel_console=False, allow_bdw_persistent_scanout_map=False, allow_bdw_scanout_flip=False, allow_bdw_zero_copy_scanout=False, allow_bdw_video_engine=False, expected_clearwater_supervisor=None, expected_clearwater_shell=None, expected_update_helpers=(), expected_bridge_policy=None):
     if bool(expected_clearwater_supervisor) != bool(expected_clearwater_shell):
         raise ValueError('Clearwater requires both executable hashes')
     if (allow_vulkan_partial or allow_vulkan_async_partial) and not allow_vulkan_desktop:
@@ -47,6 +49,10 @@ def verify(candidate, source, reference, build, expected_kernel, expected_source
     if kernel!=regular(build/'BROOK.elf',KERNEL_MAX):raise ValueError('candidate kernel differs from build')
     cache=regular(build/'CMakeCache.txt',1024*1024).decode()
     expected_options=dict(EXPECTED)
+    if expected_bridge_policy or 'BROOK_BRIDGE_V3:BOOL=' in cache:
+        expected_options['BROOK_BRIDGE_V3'] = 'ON' if expected_bridge_policy else 'OFF'
+    if expected_bridge_policy or 'BROOK_QEMU_LEGACY_OUTBOUND_DEBUG:BOOL=' in cache:
+        expected_options['BROOK_QEMU_LEGACY_OUTBOUND_DEBUG'] = 'OFF'
     monitor_option='BROOK_DELL_ACPI_MONITOR'
     if allow_dell_acpi_monitor or f'{monitor_option}:BOOL=' in cache:
         expected_options[monitor_option]='ON' if allow_dell_acpi_monitor else 'OFF'
@@ -99,6 +105,7 @@ def verify(candidate, source, reference, build, expected_kernel, expected_source
         for name,contents in (('candidate',image),('source',original),('reference',guard)):
             p=work/(name+'.img');p.write_bytes(contents);paths.append(p)
         live,base,ref=paths
+        require_keyless_image(live)
         subprocess.run(['fsck.fat','-n',str(live)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         def read(path,name):return subprocess.check_output(['mtype','-i',str(path),'::/'+name],stderr=subprocess.DEVNULL)
         for name,enabled in (('dell-acpi-monitor',allow_dell_acpi_monitor),
@@ -155,13 +162,22 @@ def verify(candidate, source, reference, build, expected_kernel, expected_source
                 raise ValueError('Unexpected Clearwater executable ' + name)
         update_files = {}
         for name, digest in expected_update_helpers:
-            if name not in ('HWUPDATE.ELF', 'HWUPSYS.ELF') or name in update_files:
+            if name not in ('HWUPDATE.ELF', 'HWUPSYS.ELF', 'HWBULK.ELF', 'HWBULKZ.ELF', 'HWSTORE.ELF', 'HWSTAGE.ELF') or name in update_files:
                 raise ValueError('Unexpected or duplicate update helper ' + name)
             content = optional(live, 'BOOT/' + name)
             if (content is None or not re.fullmatch('[0-9a-f]{64}', digest)
                     or not content.startswith(b'\x7fELF') or sha(content) != digest):
                 raise ValueError('Update helper mismatch ' + name)
             update_files[name] = digest
+        bridge_policy = optional(live, 'ETC/bridge-v3-operators')
+        if expected_bridge_policy:
+            if bridge_policy is None or sha(bridge_policy) != expected_bridge_policy:
+                raise ValueError('Bridge operator policy mismatch')
+            validate_operator_policy(bridge_policy)
+            if set(update_files) != {'HWUPDATE.ELF', 'HWUPSYS.ELF', 'HWBULK.ELF', 'HWBULKZ.ELF', 'HWSTORE.ELF', 'HWSTAGE.ELF'}:
+                raise ValueError('Bridge v3 requires hashes for all shipped receivers')
+        elif bridge_policy is not None:
+            raise ValueError('Unexpected bridge operator policy')
         def modules(path):
             listing=subprocess.check_output(['mdir','-a','-b','-i',str(path),'::/DRIVERS/*'],text=True)
             names=[line.rsplit('/',1)[-1] for line in listing.splitlines() if line]
@@ -183,7 +199,7 @@ def verify(candidate, source, reference, build, expected_kernel, expected_source
             'vulkan_desktop_enabled':allow_vulkan_desktop,'vulkan_partial_enabled':allow_vulkan_partial or allow_vulkan_async_partial,
             'vulkan_async_partial_enabled':allow_vulkan_async_partial,'vulkan_executables_sha256':vulkan_files,
             'kernel_console_hidden':allow_hidden_kernel_console, 'clearwater_executables_sha256':clearwater_files,
-            'update_helpers_sha256':update_files}
+            'update_helpers_sha256':update_files, 'bridge_policy_sha256':expected_bridge_policy}
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
@@ -216,8 +232,9 @@ def main():
     p.add_argument('--expected-clearwater-supervisor', help='SHA-256 of the embedded Clearwater supervisor')
     p.add_argument('--expected-clearwater-shell', help='SHA-256 of the embedded Clearwater shell')
     p.add_argument('--expected-update-helper', nargs=2, action='append', default=[], metavar=('NAME', 'SHA256'))
+    p.add_argument('--expected-bridge-policy', help='SHA-256 of canonical operator public key allowlist')
     a=p.parse_args();print(json.dumps(verify(a.candidate,a.source,a.reference,a.build,a.expected_kernel,a.expected_source,a.expected_reference,a.abi,a.allow_gpu_capture_test,a.allow_gpu_submission_timing,a.allow_vulkan_desktop,a.expected_vulkan_supervisor,a.expected_vulkan_renderer,a.allow_vulkan_partial,a.allow_gpu_blocked_recovery_test,a.expected_gpu_provider,a.allow_gpu_source_trace,a.allow_dell_acpi_monitor,a.allow_ac_loss_poweroff,a.allow_dell_bcs_present,a.allow_vulkan_async_partial,a.allow_bdw_cache_probe,a.allow_bdw_rps_trial,a.allow_bdw_coherent_render,a.allow_irq_signal_probe,a.allow_hidden_kernel_console,a.allow_bdw_persistent_scanout_map,a.allow_bdw_scanout_flip,a.allow_bdw_zero_copy_scanout,a.allow_bdw_video_engine,
                                         a.expected_clearwater_supervisor, a.expected_clearwater_shell,
-                                        a.expected_update_helper),indent=2))
+                                        a.expected_update_helper, a.expected_bridge_policy),indent=2))
 
 if __name__=='__main__':main()

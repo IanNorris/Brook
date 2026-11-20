@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Exercise automatic repair, reset and guarded desktop on a disposable QEMU disk."""
+from contextlib import ExitStack
 import argparse
 import hashlib
 import os
@@ -102,6 +103,8 @@ def main():
     parser.add_argument('--proc-dump-qa',type=Path,help='Run the live core fixture with this matching virtio NIC module')
     parser.add_argument('--proc-autodump-qa',action='store_true',help='Also verify automatic fatal-signal core capture')
     parser.add_argument('--bridge-local-policy-qa',type=Path,help='Use this static guest probe for bridge and reserved-port policy')
+    parser.add_argument('--bridge-v3-qa',type=Path,metavar='OPERATOR.SEED',
+                        help='Test the packaged v3 receivers in the guarded desktop with a synthetic operator')
     a=parser.parse_args()
     if a.auto_desktop_slot_fallback:
         other_modes = set(vars(a)) - {'image', 'efi', 'firmware', 'desktop_pair', 'recovery_pair', 'output',
@@ -111,14 +114,15 @@ def main():
             parser.error('slot fallback requires --auto-desktop and --auto-desktop-network-module, with optional --managed-profile')
     elif a.slot_fallback_case:
         parser.error('--slot-fallback-case requires --auto-desktop-slot-fallback')
-    if a.bridge_local_policy_qa:
+    if a.bridge_local_policy_qa or a.bridge_v3_qa:
+        fixture='bridge_v3_qa' if a.bridge_v3_qa else 'bridge_local_policy_qa'
         allowed = {'image', 'efi', 'firmware', 'desktop_pair', 'recovery_pair', 'output', 'identity',
                    'auto_desktop', 'auto_desktop_dell_initrd', 'auto_desktop_intel_provider',
                    'auto_desktop_vulkan_service', 'managed_profile', 'auto_desktop_network_module',
-                   'bridge_local_policy_qa'}
+                   fixture}
         if (not a.auto_desktop_dell_initrd or not a.auto_desktop_network_module or
                 any(value for name, value in vars(a).items() if name not in allowed)):
-            parser.error('bridge local policy QA requires the standard guarded Dell startup fixture and matching virtio module')
+            parser.error('bridge QA requires the standard guarded Dell startup fixture and matching virtio module')
     if a.proc_autodump_qa and not a.proc_dump_qa:
         parser.error('automatic core QA requires the live core fixture')
     if a.proc_dump_qa and not a.auto_desktop_dell_initrd:
@@ -175,7 +179,7 @@ def main():
         parser.error('checked shutdown requires a successful desktop bridge fixture')
     if a.auto_desktop_dell_initrd and (not a.auto_desktop or a.inject_panic or
             (a.auto_desktop_panic and not a.auto_desktop_usb_panic_retrieval) or
-            (a.auto_desktop_network_module and not a.bridge_local_policy_qa)):
+            (a.auto_desktop_network_module and not (a.bridge_local_policy_qa or a.bridge_v3_qa))):
         parser.error('Dell initrd fixture requires a non-panic auto desktop')
     if a.auto_desktop_real_provider and not a.auto_desktop_dell_initrd:
         parser.error('real provider requires the Dell initrd fixture')
@@ -225,7 +229,7 @@ def main():
             if startup!=subprocess.check_output(['mtype','-i',str(a.desktop_pair/'INITRD.IMG'),'::/BOOT/INIT.RC']):
                 raise RuntimeError('Dell startup script changed during compaction')
             (a.output/'dell-startup-script.sha256').write_text(hashlib.sha256(startup).hexdigest()+'\n')
-        if (a.auto_desktop_slot_fallback or a.bridge_local_policy_qa or
+        if (a.auto_desktop_slot_fallback or a.bridge_local_policy_qa or a.bridge_v3_qa or
                 (dell_shutdown and not a.auto_desktop_dell_async_network)):
             # Dell's opt-in asynchronous TCP stack is tailored to its USB
             # NIC; the synthetic virtio NIC uses the ordinary TCP path.
@@ -290,6 +294,12 @@ def main():
             if subprocess.run(['mdir','-i',str(normal),'::/DRIVERS'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode:
                 subprocess.run(['mmd','-i',str(normal),'::/DRIVERS'],check=True)
             subprocess.run(['mcopy','-o','-i',str(normal),str(a.normal_network_module or a.auto_desktop_network_module or a.auto_desktop_dell_shutdown_module or a.proc_dump_qa),'::/DRIVERS/virtio_net.mod'],check=True)
+        if a.bridge_v3_qa:
+            from guarded_bridge_v3_qa import prepare as prepare_bridge_qa
+            candidate=json.loads((a.desktop_pair/'manifest.json').read_text())
+            if candidate['kernel_build_flags'].get('BROOK_BRIDGE_V3')!='ON' or not candidate.get('bridge_v3_qa'):
+                raise ValueError('v3 QA requires the checked v3 pair and exact build metadata')
+            bridge_expected=prepare_bridge_qa(a.desktop_pair/'INITRD.IMG',normal,candidate['bridge_v3_qa'],a.bridge_v3_qa)
         selection=work/'select.bin';selection.write_bytes(record(1,0,(a.recovery_pair/'KERNEL.ELF').read_bytes(),recovery.read_bytes()))
         boot_payloads = ((a.efi,'::/EFI/BOOT/BOOTX64.EFI'),(a.recovery_pair/'KERNEL.ELF','::/RECOVERY/KERNEL.ELF'),
                          (recovery,'::/RECOVERY/INITRD.IMG'),(selection,'::/RECOVERY/SELECT.BIN'))
@@ -302,6 +312,8 @@ def main():
                               (normal,'::/INITRD.IMG'))
         for src,target in boot_payloads:
             subprocess.run(['mcopy','-o','-i',media,str(src),target],check=True)
+        if a.bridge_v3_qa:
+            subprocess.run(['mmd','-i',media,'::/UPDATES'],check=True)
         partition=work/'data.img'
         with disk.open('rb') as f:f.seek(133120*512+1024+104);fs_uuid=uuid.UUID(bytes=f.read(16))
         with partition.open('wb') as f:f.truncate(126976*512)
@@ -423,7 +435,7 @@ def main():
         def retrieve_during_repair():
             sys.path.insert(0,str(ROOT/'tools/vm_bridge'))
             from hardware import Hardware
-            bridge=Hardware(work/'recovery-registry');session=bridge.attach('127.0.0.1',recovery_port)['session']
+            bridge=Hardware(work/'recovery-registry');session=bridge.attach('127.0.0.1',recovery_port,auth_mode='legacy')['session']
             for previous,packet in ((False,seeded_packets[1]),(True,seeded_packets[0])):
                 destination=a.output/('recovery-older-panic.bin' if previous else 'recovery-newer-panic.bin')
                 report=bridge.recovery_panic(session,destination,previous=previous)
@@ -475,7 +487,7 @@ def main():
                 from hardware import Hardware
                 bridge=Hardware(work/'normal-registry');deadline=time.monotonic()+30
                 while True:
-                    try:session=bridge.attach('127.0.0.1',network_port)['session'];break
+                    try:session=bridge.attach('127.0.0.1',network_port,auth_mode='legacy')['session'];break
                     except (OSError,RuntimeError):
                         if time.monotonic()>=deadline:raise
                         time.sleep(.2)
@@ -695,6 +707,24 @@ def main():
             finally:
                 for name in ('serial.log','qemu.log'):
                     if (second/name).exists():shutil.copyfile(second/name,a.output/('bridge-local-'+name))
+        elif a.bridge_v3_qa:
+            from guarded_bridge_v3_qa import run as run_bridge_qa
+            with ExitStack() as stack:
+                ports=[]
+                for _ in range(4):
+                    listener=stack.enter_context(socket.socket())
+                    listener.bind(('127.0.0.1',0))
+                    ports.append(listener.getsockname()[1])
+            network_port,bulk_port,update_port,store_port=ports
+            try:
+                boot(disk,a.firmware,second,False,'GUARD_DESKTOP_HANDOFF_SCRIPT status=0',120,True,
+                     sata_snapshot=False,sata_serial='BROOK-RECOVERY-QA',failure_marker='GUARD_DESKTOP_HANDOFF_FAILED',
+                     network_port=network_port,bulk_port=bulk_port,update_port=update_port,store_port=store_port,
+                     on_marker=lambda:run_bridge_qa(a.output,work/'v3-registry',ports,
+                                                    a.bridge_v3_qa,bridge_expected))
+            finally:
+                for name in ('serial.log','qemu.log'):
+                    if (second/name).exists():shutil.copyfile(second/name,a.output/('desktop-attempt-'+name))
         elif a.auto_desktop_network_module:
             with socket.socket() as probe:
                 probe.bind(('127.0.0.1',0));network_port=probe.getsockname()[1]
@@ -704,7 +734,7 @@ def main():
                 from hardware import Hardware
                 bridge=Hardware(work/'desktop-registry');deadline=time.monotonic()+6
                 while True:
-                    try:attached=bridge.attach('127.0.0.1',network_port);break
+                    try:attached=bridge.attach('127.0.0.1',network_port,auth_mode='legacy');break
                     except (OSError,RuntimeError):
                         if time.monotonic()>=deadline:raise
                         time.sleep(.1)
@@ -716,7 +746,7 @@ def main():
                 if a.two_panic_records:
                     sys.path.insert(0,str(ROOT/'tools/vm_bridge'))
                     from hardware import Hardware
-                    bridge=Hardware(work/'desktop-registry');attached=bridge.attach('127.0.0.1',network_port)
+                    bridge=Hardware(work/'desktop-registry');attached=bridge.attach('127.0.0.1',network_port,auth_mode='legacy')
                     bridge_state.update(bridge=bridge,session=attached['session'],before=None)
                 bridge=bridge_state['bridge'];session=bridge_state['session']
                 doctor=bridge.doctor(session)
@@ -766,7 +796,7 @@ def main():
                 from hardware import Hardware
                 bridge=Hardware(work/'dell-desktop-registry');deadline=time.monotonic()+20
                 while True:
-                    try:session=bridge.attach('127.0.0.1',network_port)['session'];break
+                    try:session=bridge.attach('127.0.0.1',network_port,auth_mode='legacy')['session'];break
                     except (OSError,RuntimeError):
                         if time.monotonic()>=deadline:raise
                         time.sleep(.2)
@@ -799,7 +829,7 @@ def main():
                 bridge=Hardware(work/'core-registry')
                 deadline=time.monotonic()+20
                 while True:
-                    try:session=bridge.attach('127.0.0.1',network_port)['session'];break
+                    try:session=bridge.attach('127.0.0.1',network_port,auth_mode='legacy')['session'];break
                     except (OSError,RuntimeError):
                         if time.monotonic()>=deadline:raise
                         time.sleep(.1)
@@ -1021,7 +1051,7 @@ def main():
                     from hardware import Hardware
                     bridge=Hardware(work/'desktop-panic-recovery-registry');deadline=time.monotonic()+8
                     while True:
-                        try:session=bridge.attach('127.0.0.1',recovery_port)['session'];break
+                        try:session=bridge.attach('127.0.0.1',recovery_port,auth_mode='legacy')['session'];break
                         except (OSError,RuntimeError):
                             if time.monotonic()>=deadline:raise
                             time.sleep(.1)

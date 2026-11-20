@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from dell_recovery import AC_OFF_SECONDS, Journal, OUTAGE_SECONDS, Recovery, read_caps
+from dell_recovery import AC_OFF_SECONDS, Journal, OUTAGE_SECONDS, Recovery, RecoveryBridgeRefused, read_caps
 from dell_recovery_lock import inhibit_recovery, maintenance_lock, state_directory
 
 
@@ -90,6 +90,21 @@ class RecoveryTest(unittest.TestCase):
             self.recovery.arm()
         self.assertEqual(self.actions, [])
 
+    def test_missing_v3_key_does_not_use_legacy_caps(self):
+        with patch.dict(os.environ, clear=True), patch("dell_recovery.exchange") as legacy:
+            with self.assertRaisesRegex(RecoveryBridgeRefused, "operator key"):
+                read_caps(HOST, 1234)
+            legacy.assert_not_called()
+
+    def test_refused_v3_session_never_sends_relay_command(self):
+        self.recovery.arm()
+        def rejected(host, port):
+            raise RecoveryBridgeRefused("fixture refusal")
+        self.recovery.caps = rejected
+        self.assertEqual(self.recovery.poll(), 1)
+        self.assertEqual(self.journal.load()["outcome"], "bridge_authentication_refused")
+        self.assertEqual(self.actions, [(0, "status")])
+
     def test_ambiguous_off_is_reconciled_once(self):
         self.recovery.arm()
         self.lose_off_reply = True
@@ -124,6 +139,19 @@ class RecoveryTest(unittest.TestCase):
         self.assertEqual(self.controller().run(), 0)
         self.assertNotIn("off", [action for _, action in self.actions])
         self.assertIn((AC_OFF_SECONDS, "on"), self.actions)
+
+    def test_pending_cycle_restores_ac_without_an_operator_key(self):
+        self.recovery.arm()
+        self.recovery.record("switching_off", host_boot=self.recovery.host_boot)
+        self.ac = "OFF"
+        recovery = self.controller()
+        recovery.caps = read_caps
+        with patch.dict(os.environ, clear=True):
+            self.assertEqual(recovery.run(), 1)
+        self.assertEqual(self.ac, "ON")
+        self.assertEqual(self.journal.load()["outcome"],
+                         "bridge_authentication_refused_after_restore")
+        self.assertNotIn("off", [action for _, action in self.actions])
 
     def test_journal_error_after_off_still_restores_power(self):
         self.recovery.arm()
@@ -184,7 +212,7 @@ class RecoveryTest(unittest.TestCase):
         blank = {"hardware_api": 1, "boot_guard": True, "boot_id": "0" * 32}
         pinned = {**blank, "boot_id": NEW_BOOT}
         with patch("dell_recovery.exchange", side_effect=[(blank,), ({"boot_id": NEW_BOOT}, pinned)]) as exchange:
-            self.assertEqual(read_caps(HOST, 1234), pinned)
+            self.assertEqual(read_caps(HOST, 1234, auth_mode="legacy"), pinned)
             self.assertTrue(exchange.call_args.args[2][0].startswith("bridge epoch init "))
 
 

@@ -24,6 +24,10 @@
 #include "../src/shared/update/payload.h"
 #include "../src/shared/brook_debug_frame.h"
 #include "../src/shared/brook_ahci_export.h"
+#ifdef BROOK_BRIDGE_V3
+#include "bridge_v3_posix.h"
+static BridgeV3Posix transport;
+#endif
 #if defined(BROOK_BULK_INSTALL_MEDIA) && defined(BROOK_BULK_SYSTEM_SNAPSHOT)
 #error incompatible bulk helper profiles
 #endif
@@ -42,6 +46,14 @@ static int sliding_deadline;
 static uint64_t now_ms(void){struct timespec ts;if(clock_gettime(CLOCK_MONOTONIC,&ts))return UINT64_MAX;return (uint64_t)ts.tv_sec*1000+(uint64_t)ts.tv_nsec/1000000;}
 static int valid_id(const char* p){if(strlen(p)!=32)return 0;for(unsigned i=0;i<32;i++)if(!((p[i]>='0'&&p[i]<='9')||(p[i]>='a'&&p[i]<='f')))return 0;return 1;}
 static int io_bytes(int fd,void* data,size_t size,int writing,int network){
+#ifdef BROOK_BRIDGE_V3
+    if(network) {
+        if(fd!=transport.fd)return -1;
+        int result=writing?BridgeV3PosixWrite(&transport,data,size,deadline_ms):BridgeV3PosixRead(&transport,data,size,deadline_ms);
+        if(!result && sliding_deadline)deadline_ms=BridgeV3PosixDeadline(120000);
+        return result;
+    }
+#endif
     uint8_t* p=data;
     while(size){
         if(network){uint64_t now=now_ms();if(now>=deadline_ms)return -1;uint64_t left=deadline_ms-now;int timeout=left>30000?30000:(int)left;
@@ -147,16 +159,28 @@ static int serve(int client,int directory,const char* key,const char* boot,const
     int file_created=0,cleanup_failed=0;
 #endif
     char temporary[48],final[48];snprintf(temporary,sizeof(temporary),"%s.part",tx);snprintf(final,sizeof(final),"%s.bin",tx);
-#ifdef BROOK_BULK_INSTALL_MEDIA
+#if defined(BROOK_BULK_INSTALL_MEDIA) && !defined(BROOK_BRIDGE_V3)
     // FAT currently lacks rename-no-replace. Write an exclusive, narrowly
     // named installer file directly; incomplete files are rejected later by
     // the installer's boot-pinned full-package digest before any SSD write.
     snprintf(temporary,sizeof(temporary),"%s",source);
     snprintf(final,sizeof(final),"%s",source);
 #endif
+#if defined(BROOK_BULK_INSTALL_MEDIA) && defined(BROOK_BRIDGE_V3)
+    snprintf(final,sizeof(final),"%s",source);
+#endif
+#ifdef BROOK_BRIDGE_V3
+    static const uint8_t no_key[32]={0};
+    (void)key;
+    key=(const char*)no_key;
+#endif
     if(io_bytes(client,header,sizeof(header),0,1)||memcmp(header,"BRBULK01",8)||
        !BrookUpdateEqual(header+8,(const uint8_t*)key,32)||!BrookUpdateEqual(header+40,(const uint8_t*)boot,32)||
        !BrookUpdateEqual(header+72,(const uint8_t*)tx,32))goto done;
+#ifdef BROOK_BRIDGE_V3
+    if(strcmp(action,"put") && strcmp(action,"disk") &&
+       BridgeV3PosixRequireEnd(&transport,deadline_ms))goto done;
+#endif
     if(message(client,"{\"state\":\"ready\",\"bulk_api\":1}\n")){result=11;goto done;}
     uint8_t hash[32],meta[40];uint64_t bytes=0;struct BrookDebugFrameInfo info={0};
     if(!strcmp(action,"disk")){
@@ -173,6 +197,9 @@ static int serve(int client,int directory,const char* key,const char* boot,const
         memcpy(identity+90,boot,32);memcpy(identity+122,tx,32);
         if(io_bytes(client,identity,sizeof(identity),1,1)){result=29;goto done;}
         uint8_t proceed[8];if(io_bytes(client,proceed,sizeof(proceed),0,1)||memcmp(proceed,"READONLY",8)){result=30;goto done;}
+#ifdef BROOK_BRIDGE_V3
+        if(BridgeV3PosixRequireEnd(&transport,deadline_ms)){result=30;goto done;}
+#endif
         uint8_t chunk[65536];uint64_t offset=0;BrookSha256 context;BrookShaInit(&context);
         while(offset<bytes){size_t n=bytes-offset>sizeof(chunk)?sizeof(chunk):(size_t)(bytes-offset);
             if(syscall(BROOK_SYS_AHCI_EXPORT,1L,(long)chunk,(long)n,(long)offset,0L,0L)!=(long)n){result=31;goto done;}
@@ -209,10 +236,13 @@ static int serve(int client,int directory,const char* key,const char* boot,const
 #endif
         if(message(client,"{\"state\":\"staged\",\"published\":false}\n")){result=18;goto done;}
         uint8_t commit[8];if(io_bytes(client,commit,8,0,1)||memcmp(commit,"FINALIZE",8)){result=19;goto done;}
+#ifdef BROOK_BRIDGE_V3
+        if(BridgeV3PosixRequireEnd(&transport,deadline_ms)){result=19;goto done;}
+#endif
         /* Atomic no-replace publication; another transaction can never
          * replace an existing completed artifact, even under a race. */
-#ifndef BROOK_BULK_INSTALL_MEDIA
-        if(syscall(SYS_renameat2,directory,temporary,directory,final,1)){result=20;goto done;}
+#if !defined(BROOK_BULK_INSTALL_MEDIA) || defined(BROOK_BRIDGE_V3)
+        if(syscall(SYS_renameat2,(long)directory,temporary,(long)directory,final,1UL)){result=20;goto done;}
 #endif
         partial=0;published=1;
         char published_hash[65];hex_hash(hash,published_hash);
@@ -300,8 +330,15 @@ done:
     if(partial && unlinkat(directory,temporary,0))cleanup_failed=1;
     if(result){char error[320];snprintf(error,sizeof(error),"{\"state\":\"failed\",\"code\":%d,\"errno\":%d,\"transaction_id\":\"%s\",\"published\":%s,\"file_created\":%s,\"target_may_exist\":%s}\n",result,saved_errno,tx,published?"true":"false",file_created?"true":"false",(published||file_created||cleanup_failed||result==14)?"true":"false");(void)message(client,error);}
 #else
+#ifdef BROOK_BRIDGE_V3
+    if(partial && unlinkat(directory,temporary,0))fputs("HWBULK_STAGE_CLEANUP_FAILED\n",stderr);
+    const int staged_only=result==19 && transport.peer_end && !transport.failed;
+    if(result && !staged_only){char error[256];
+#else
     if(partial)unlinkat(directory,temporary,0);
-    if(result){char error[256];snprintf(error,sizeof(error),"{\"state\":\"failed\",\"code\":%d,\"errno\":%d,\"transaction_id\":\"%s\",\"published\":%s}\n",result,saved_errno,tx,published?"true":"false");(void)message(client,error);}
+    if(result){char error[256];
+#endif
+        snprintf(error,sizeof(error),"{\"state\":\"failed\",\"code\":%d,\"errno\":%d,\"transaction_id\":\"%s\",\"published\":%s}\n",result,saved_errno,tx,published?"true":"false");(void)message(client,error);}
 #endif
     return result;
 }
@@ -335,9 +372,15 @@ int main(int argc,char** argv){
     if(geteuid()!=0)return 3;
     int marker=open("/etc/hardware-maintenance",O_RDONLY|O_NOFOLLOW|O_CLOEXEC);if(marker<0)return 3;close(marker);
 #endif
-    int keyfd=open(keypath,O_RDONLY|O_NOFOLLOW|O_CLOEXEC);char key[33]={0},extra;int good=keyfd>=0&&!io_bytes(keyfd,key,32,0,0)&&read(keyfd,&extra,1)==0;
+    char key[33]={0};
+#ifdef BROOK_BRIDGE_V3
+    (void)keypath;
+#else
+    char extra;int keyfd=open(keypath,O_RDONLY|O_NOFOLLOW|O_CLOEXEC);
+    int good=keyfd>=0&&!io_bytes(keyfd,key,32,0,0)&&read(keyfd,&extra,1)==0;
     if(keyfd>=0)close(keyfd);
     if(!good||!valid_id(key))return 3;
+#endif
     int directory=directory_open(root);if(directory<0)return 4;
     int listener=socket(AF_INET,SOCK_STREAM|SOCK_CLOEXEC,0),client=-1,result=5;
     if(listener<0)goto done;
@@ -347,6 +390,15 @@ int main(int argc,char** argv){
     puts("HWBULK_LISTENING bulk_api=1");fflush(stdout);
     struct pollfd wait={listener,POLLIN,0};if(poll(&wait,1,60000)<=0){result=6;goto done;}
     client=accept(listener,NULL,NULL);if(client<0){result=7;goto done;}
+#ifdef BROOK_BRIDGE_V3
+    static const char* operations[]={"put","get","getz","frame","framez","disk"};
+    unsigned operation=0;
+    for(unsigned i=0;i<sizeof(operations)/sizeof(operations[0]);i++)
+        if(!strcmp(argv[3],operations[i]))operation=i+1;
+    if(!operation || BridgeV3PosixAccept(&transport,client,BrookBridgeV3Bulk,1u<<operation,argv[1],argv[2])) {
+        fputs("HWBULK_AUTH_REFUSED version=3\n",stderr);result=10;goto done;
+    }
+#endif
     sliding_deadline=!strcmp(argv[3],"disk");
 #if defined(BROOK_BULK_INSTALL_MEDIA) || defined(BROOK_BULK_SYSTEM_SNAPSHOT)
     sliding_deadline=1;
@@ -354,7 +406,13 @@ int main(int argc,char** argv){
     uint64_t now=now_ms(),allowance=sliding_deadline?120000:600000;
     if(now==UINT64_MAX || now>UINT64_MAX-allowance){result=8;goto done;}deadline_ms=now+allowance;
     result=serve(client,directory,key,argv[1],argv[2],argv[3],argc==5?argv[4]:NULL);
+#ifdef BROOK_BRIDGE_V3
+    (void)BridgeV3PosixReplyEnd(&transport,deadline_ms);
+#endif
 done:
+#ifdef BROOK_BRIDGE_V3
+    BridgeV3PosixClear(&transport);
+#endif
     if(client>=0)close(client);
     if(listener>=0)close(listener);
     close(directory);

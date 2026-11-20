@@ -2211,7 +2211,7 @@ int main() {
          const auto corrupt=g_netCounters.udpRxCorrupt;uint8_t out[16];
          assert(SockRecvFrom(u,out,sizeof(out),nullptr)==-11 && q.rxCount==0 && g_netCounters.udpRxCorrupt==corrupt+1);}
         int l=create();listenPort(l, 1234, 2);
-        auto syn=[&](uint16_t port){Ipv4Header ip{};ip.srcIp=2;ip.dstIp=1;TcpHeader t{};
+        auto syn=[&](uint16_t port){Ipv4Header ip{};ip.srcIp=2+(port-40000);ip.dstIp=1;TcpHeader t{};
             t.srcPort=htons(port);t.dstPort=htons(1234);t.seqNum=htonl(70);t.flags=TCP_SYN;
             t.window=htons(1000);t.dataOff=5<<4;HandleTcp(&ip,&t,sizeof(t));};
         syn(40000);syn(40001);assert(g_sockets[l].acceptQueueCount==2);
@@ -2523,11 +2523,11 @@ int main() {
     }
     {
         const int listener = create();
-        listenPort(listener, 1234, 2);
-        auto syn = [&](uint16_t sourcePort, bool local) {
+        listenPort(listener, 1234, 3);
+        auto syn = [&](uint16_t sourcePort, bool local, uint8_t wirePeer=70) {
             Ipv4Header ip{};
             ip.dstIp = Ipv4Addr(127, 0, 0, 1);
-            ip.srcIp = local ? Ipv4Addr(127, 0, 0, 2) : Ipv4Addr(192, 0, 2, 70);
+            ip.srcIp = local ? Ipv4Addr(127, 0, 0, 2) : Ipv4Addr(192, 0, 2, wirePeer);
             TcpHeader packet{};
             packet.srcPort = htons(sourcePort);
             packet.dstPort = htons(1234);
@@ -2553,7 +2553,56 @@ int main() {
         assert(SockAccept(listener, nullptr, &localIngress) == local && localIngress);
         SockClose(remote);
         SockClose(local);
+
+        // A queued incomplete connection must leave room for two legitimate
+        // requests from that address, even before the pending entry expires.
+        syn(44011, false);
+        const int incomplete = g_sockets[listener].acceptQueue[0];
+        assert(!TcpCanAccept(g_sockets[incomplete]));
+        syn(44012, false);
+        assert(g_sockets[listener].acceptQueueCount == 2);
+        const int first = g_sockets[listener].acceptQueue[1];
+        deliverControl(first, 71, g_sockets[first].tcpSndNxt, TCP_ACK, 1000);
+        syn(44013, false);
+        assert(g_sockets[listener].acceptQueueCount == 3);
+        const int second = g_sockets[listener].acceptQueue[2];
+        deliverControl(second, 71, g_sockets[second].tcpSndNxt, TCP_ACK, 1000);
+        assert(SockAccept(listener, nullptr, &localIngress) == first && !localIngress);
+        assert(SockAccept(listener, nullptr, &localIngress) == second && !localIngress);
+        assert(g_sockets[listener].acceptQueueCount == 1);
+        assert(g_sockets[listener].acceptQueue[0] == incomplete);
+        SockClose(first);
+        SockClose(second);
         SockClose(listener);
+
+        // Once two completed requests are waiting, a distinct remote peer
+        // can use the remaining slot. The ordinary listener's stale eviction
+        // is exercised separately below.
+        const int nextListener = create();
+        listenPort(nextListener, 1234, 3);
+        auto& queue = g_sockets[nextListener];
+        syn(44014, false);
+        const int pending = queue.acceptQueue[0];
+        deliverControl(pending, 71, g_sockets[pending].tcpSndNxt, TCP_ACK, 1000);
+        syn(44015, false);
+        const int another = queue.acceptQueue[1];
+        deliverControl(another, 71, g_sockets[another].tcpSndNxt, TCP_ACK, 1000);
+        assert(queue.acceptQueueCount == 2);
+        syn(44016, false);
+        assert(queue.acceptQueueCount == 2);
+        syn(44017, true);
+        assert(queue.acceptQueueCount == 2);
+        syn(44018, false, 71);
+        assert(queue.acceptQueueCount == 3);
+        SockClose(nextListener);
+
+        const int singleSlot = create();
+        listenPort(singleSlot, 1234, 1);
+        syn(44019, true);
+        assert(g_sockets[singleSlot].acceptQueueCount == 0);
+        syn(44020, false);
+        assert(g_sockets[singleSlot].acceptQueueCount == 1);
+        SockClose(singleSlot);
     }
     {
         // A stalled peer gets neither the global asynchronous send path nor
@@ -2584,6 +2633,95 @@ int main() {
         assert(!published(local) && ticks == closeBy);
         currentProcess = nullptr;
         delete sender;
+    }
+    {
+        NetIf primary{}, receiving{};
+        primary.ipAddr = Ipv4Addr(192, 0, 2, 2);
+        receiving.ipAddr = Ipv4Addr(198, 51, 100, 2);
+        primary.netmask = receiving.netmask = Ipv4Addr(255, 255, 255, 0);
+        primary.transmit = receiving.transmit = captureFrame;
+        receiving.tryTransmit = tryCaptureFrame;
+        const uint32_t peer = Ipv4Addr(198, 51, 100, 3);
+        const MacAddr peerMac{{8, 9, 10, 11, 12, 13}};
+        g_netIf = g_netIfs[0] = &primary;
+        g_netIfs[1] = &receiving;
+        g_netIfCount = 2;
+
+        auto* sender = new Process{};
+        sender->refCount = 1;
+        currentProcess = sender;
+        enum class SendCase { ResolvedAfterBusy, ResolveThenSend, ArpTimeout, AckTimeout, ZeroWindow, MissingCallback };
+        for (auto scenario : {SendCase::ResolvedAfterBusy, SendCase::ResolveThenSend, SendCase::ArpTimeout,
+                              SendCase::AckTimeout, SendCase::ZeroWindow, SendCase::MissingCallback}) {
+            const int socket = create();
+            setupTcp(socket);
+            auto& stream = g_sockets[socket];
+            stream.localIp = receiving.ipAddr;
+            stream.remoteIp = peer;
+            stream.tcpSndWnd = scenario == SendCase::ZeroWindow ? 0 : 65535;
+            ticks = 100;
+            g_arpTable.Flush();
+            if (scenario != SendCase::ResolveThenSend && scenario != SendCase::ArpTimeout)
+                ArpCacheInsert(peer, peerMac);
+            const bool shouldSend = scenario == SendCase::ResolvedAfterBusy || scenario == SendCase::ResolveThenSend;
+            injectTcpAck = shouldSend;
+            acknowledgeDataCount = shouldSend ? 1 : 0;
+            injectReplyDuringTransmit = scenario == SendCase::ResolveThenSend;
+            tryTransmitBusy = scenario == SendCase::ResolvedAfterBusy ? 1 : 0;
+            tryTransmitCalls = frameTransmitCalls = 0;
+            if (scenario == SendCase::MissingCallback) receiving.tryTransmit = nullptr;
+
+            const char banner[] = "test";
+            const uint64_t deadline = ticks + 41;
+            const int result = SockSendBefore(socket, banner, sizeof(banner), deadline);
+            if (shouldSend) {
+                assert(result == sizeof(banner) && ticks < deadline && tryTransmitCalls == 2);
+                assert(frameTransmitCalls == (scenario == SendCase::ResolveThenSend ? 2u : 1u));
+                assert(stream.tcpSndUna == stream.tcpSndNxt);
+                const auto* ethernet = reinterpret_cast<const EthHeader*>(capturedFrame);
+                const auto* packet = reinterpret_cast<const Ipv4Header*>(capturedFrame + sizeof(EthHeader));
+                assert(!memcmp(ethernet->dst.b, peerMac.b, sizeof(peerMac.b)));
+                assert(packet->srcIp == receiving.ipAddr && packet->dstIp == peer);
+            } else if (scenario == SendCase::MissingCallback) {
+                assert(result == -95 && !frameTransmitCalls && !tryTransmitCalls && ticks < deadline);
+            } else {
+                assert(result == -110 && ticks == deadline);
+                const unsigned expected = scenario == SendCase::ZeroWindow ? 0 : 1;
+                assert(tryTransmitCalls == expected && frameTransmitCalls == expected);
+                if (scenario == SendCase::ZeroWindow)
+                    assert(stream.tcpSndNxt == 10 && stream.tcpState == TcpState::Established);
+                else
+                    assert(stream.tcpState == TcpState::Closed);
+            }
+            assert(g_arpTable.QueuedFrames() == 0);
+            SockUnrefUntil(socket, ticks);
+        }
+        injectTcpAck = false;
+        receiving.tryTransmit = tryCaptureFrame;
+        for (bool beforeDeadline : {true, false}) {
+            const int socket = create();
+            setupTcp(socket);
+            auto& stream = g_sockets[socket];
+            stream.localIp = receiving.ipAddr;
+            stream.remoteIp = peer;
+            g_arpTable.Flush();
+            ArpCacheInsert(peer, peerMac);
+            tryTransmitCalls = frameTransmitCalls = 0;
+            const uint64_t closeBy = ticks + (beforeDeadline ? 11 : 0);
+            SockUnrefBefore(socket, closeBy);
+            assert(!published(socket) && ticks == closeBy);
+            assert(tryTransmitCalls == (beforeDeadline ? 1u : 0u));
+            if (beforeDeadline) {
+                const auto* tcp = reinterpret_cast<const TcpHeader*>(
+                    capturedFrame + sizeof(EthHeader) + sizeof(Ipv4Header));
+                assert(frameTransmitCalls == 1 && tcp->flags == (TCP_FIN | TCP_ACK));
+            }
+        }
+        g_arpTable.Flush();
+        currentProcess = nullptr;
+        delete sender;
+        g_netIf = g_netIfs[0] = g_netIfs[1] = nullptr;
+        g_netIfCount = 0;
     }
     assert(allocations == frees && g_socketRxBytes == 0);
     std::puts("socket lifetime: PASS");

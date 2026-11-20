@@ -19,7 +19,7 @@ from dell_recovery_lock import (
     PENDING_CYCLE, endpoint_lock, inhibit_recovery, maintenance_epoch,
     maintenance_lock, state_directory,
 )
-from guest_transport import exchange
+from guest_transport import exchange, exchange_v3
 from hardware import Hardware
 from probe_hardware_link import probe
 
@@ -97,7 +97,32 @@ class Journal:
                 temporary.unlink(missing_ok=True)
 
 
-def read_caps(host, port):
+class RecoveryBridgeRefused(RuntimeError):
+    pass
+
+
+def read_caps(host, port, *, auth_mode="v3", key_path=None):
+    if auth_mode == "v3":
+        key_path = key_path or os.environ.get("BROOK_BRIDGE_V3_OPERATOR_KEY")
+        if not key_path:
+            raise RecoveryBridgeRefused("v3 recovery requires an operator key file")
+        from bridge_v3 import BridgeV3NoChallenge
+
+        try:
+            caps, = exchange_v3(host, port, ["bridge hardware caps"], 5, key_path)
+        except (BridgeV3NoChallenge, ConnectionRefusedError, TimeoutError):
+            return None
+        except OSError as error:
+            if error.errno in (101, 113): # ENETUNREACH, EHOSTUNREACH
+                return None
+            raise RecoveryBridgeRefused("v3 bridge handshake was not accepted") from error
+        except (ValueError, RuntimeError) as error:
+            raise RecoveryBridgeRefused("v3 bridge verification failed") from error
+        if (caps.get("auth_version"), caps.get("auth_suite")) != (3, 1):
+            raise RecoveryBridgeRefused("Unexpected recovery bridge suite")
+        return caps
+    if auth_mode != "legacy":
+        raise RecoveryBridgeRefused("unknown recovery bridge mode")
     try:
         caps, = exchange(host, port, ["bridge hardware caps"], 5)
         if caps.get("boot_id") == "0" * 32 and caps.get("boot_guard") is True:
@@ -200,7 +225,13 @@ class Recovery:
                 and self.state.get("maintenance_epoch") != maintenance_epoch(self.journal.directory)):
             self.record("spent", outcome="maintenance_invalidated_arm")
             return 1
-        caps = self.caps(self.host, self.port)
+        try:
+            caps = self.caps(self.host, self.port)
+        except RecoveryBridgeRefused as error:
+            if self.state["state"] == "armed":
+                self.record("spent", outcome="bridge_authentication_refused", error=str(error))
+                return 1
+            raise
         if caps is not None:
             if self.state["state"] == "armed" and (
                 caps["boot_id"] != self.state["boot_id"] or not ready(caps)
@@ -301,7 +332,11 @@ class Recovery:
         deadline = self.state["deadline"] if self.state["host_boot"] == self.host_boot else self.clock() + VERIFY_SECONDS
         last_caps = None
         while self.clock() < deadline:
-            caps = self.caps(self.host, self.port)
+            try:
+                caps = self.caps(self.host, self.port)
+            except RecoveryBridgeRefused as error:
+                self.record("spent", outcome="bridge_authentication_refused_after_restore", error=str(error))
+                return 1
             if caps is not None:
                 last_caps = caps
                 payload = payload_id(caps)
@@ -329,6 +364,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", required=True, help="Explicit Dell IPv4 address")
     parser.add_argument("--port", default=1234, type=int)
+    parser.add_argument("--auth-mode", choices=("v3", "legacy"), default="v3")
+    parser.add_argument("--operator-key-file", type=Path)
     parser.add_argument("--config", default=Path.home() / ".config/dellpower.txt", type=Path)
     commands = parser.add_subparsers(dest="action", required=True)
     for action in ("arm", "disarm", "status", "run"):
@@ -348,10 +385,17 @@ def main():
             parser.error("inhibit requires a command")
         with inhibit_recovery(host, port):
             return subprocess.run(command, check=False).returncode
+    key_path = args.operator_key_file or os.environ.get("BROOK_BRIDGE_V3_OPERATOR_KEY")
+    if args.action == "arm" and args.auth_mode == "v3" and not key_path:
+        parser.error("v3 recovery requires --operator-key-file or BROOK_BRIDGE_V3_OPERATOR_KEY")
+    if args.operator_key_file and args.auth_mode == "legacy":
+        parser.error("--operator-key-file requires v3 recovery mode")
+    def configured_caps(host, port):
+        return read_caps(host, port, auth_mode=args.auth_mode, key_path=key_path)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     try:
         with endpoint_lock(directory, "controller.lock", nonblocking=True):
-            recovery = Recovery(journal, host, port, args.config)
+            recovery = Recovery(journal, host, port, args.config, caps=configured_caps)
             return getattr(recovery, args.action)()
     except BlockingIOError:
         parser.exit(1, "Dell recovery controller or maintenance already holds the lock\n")

@@ -77,7 +77,7 @@ def main():
                     if proc.poll() is not None:raise RuntimeError('QEMU exited: '+text[-3000:])
                     time.sleep(.1)
                 else:raise RuntimeError('debug listener timed out: '+text[-3000:])
-                bridge=Hardware(registry=d/'registry');session=bridge.attach('127.0.0.1',debug_port)['session']
+                bridge=Hardware(registry=d/'registry');session=bridge.attach('127.0.0.1',debug_port,auth_mode='legacy')['session']
                 result=bridge.panic_report(session,'a'*32,key,d/'result',bulk_port)
                 assert result['sequence']==7 and Path(result['artifact_path']).read_bytes()==packet
                 assert result['sha256']==hashlib.sha256(packet).hexdigest() and result['bytes']==len(packet)

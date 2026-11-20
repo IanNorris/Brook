@@ -815,6 +815,8 @@ target_compile_options(test_panic_snapshot PRIVATE -UNDEBUG -DBROOK_HOST_TEST
     "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/src/shared/inc_km")
 target_compile_definitions(test_debug_hardware_recovery PRIVATE BROOK_SSD_AUTO_RECOVERY=1)
 add_host_test(test_recovery_debug_policy)
+add_host_test(test_debug_bridge_v3_policy)
+target_compile_options(test_debug_bridge_v3_policy PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_display_power)
 target_compile_options(test_display_power PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_intel_bdw_inventory)
@@ -1148,3 +1150,19 @@ target_compile_options(test_arp_neighbor PRIVATE "-iquote${BROOK_ROOT}/src/kerne
 add_test(NAME test_launcher_stage COMMAND python3 "${BROOK_ROOT}/tools/launcher-stage/test_install.py")
 
 add_test(NAME test_brook_session_env COMMAND python3 "${BROOK_ROOT}/scripts/test_brook_session_env.py")
+
+add_library(bridge_v3_interop SHARED
+    "${BROOK_ROOT}/src/shared/update/bridge_v3.c"
+    "${BROOK_ROOT}/src/third_party/monocypher/monocypher.c"
+    "${BROOK_ROOT}/src/third_party/monocypher/monocypher-ed25519.c")
+target_include_directories(bridge_v3_interop PRIVATE "${BROOK_ROOT}/src/third_party/monocypher")
+add_test(NAME test_bridge_v3_interop COMMAND python3
+    "${BROOK_ROOT}/tools/test_bridge_v3.py" "$<TARGET_FILE:bridge_v3_interop>")
+
+add_host_test(test_debug_bridge_v3_listener "${BROOK_ROOT}/src/kernel/src/debug_bridge_v3.cpp")
+target_compile_definitions(test_debug_bridge_v3_listener PRIVATE BROOK_HOST_TEST BROOK_BRIDGE_V3=1)
+target_compile_options(test_debug_bridge_v3_listener PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src"
+    "-iquote${BROOK_ROOT}/src/shared")
+target_include_directories(test_debug_bridge_v3_listener PRIVATE
+    "${BROOK_ROOT}/src/tests/test_debug_bridge_v3_listener" "${BROOK_ROOT}/src/third_party/monocypher")
+target_link_libraries(test_debug_bridge_v3_listener PRIVATE bridge_v3_interop)

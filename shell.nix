@@ -48,7 +48,7 @@ pkgs.mkShellNoCC {
     # Font baking (build-time TTF → kernel glyph atlas)
     pkgs.hack-font
     pkgs.dejavu_fonts
-    (pkgs.python3.withPackages (ps: [ ps.freetype-py ps.pillow ps.cairosvg ps.capstone ps.pyelftools ]))
+    (pkgs.python3.withPackages (ps: [ ps.freetype-py ps.pillow ps.cairosvg ps.capstone ps.pyelftools ps.pynacl ]))
 
     # Storage image creation (build-time FAT32 ramdisk image for VFS tests)
     pkgs.mtools
@@ -59,6 +59,7 @@ pkgs.mkShellNoCC {
     pkgs.e2fsprogs.fuse2fs # fuse2fs for mounting ext2 images without sudo
     pkgs.fuse             # fusermount for fuse2fs
     pkgs.cacert           # standard root trust bundle in the guest initrd
+    (pkgs.lib.getBin pkgs.openssl) # sign and verify closure stage plans
   ];
 
   shellHook = ''

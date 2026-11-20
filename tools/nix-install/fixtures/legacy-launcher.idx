@@ -1,0 +1,32 @@
+App Gallery	--uid 1000 /nix/profile/bin/hardware-brook-gallery	brook-gallery.rgba	System;PackageManager;	brook-gallery
+Chromium	/nix/profile/bin/brook-chromium	chromium.rgba	Network;WebBrowser;	brook-hardware-chromium
+Files	--uid 1000 /nix/profile/bin/brook-nautilus --new-window	org.gnome.nautilus.rgba	GNOME;GTK;Utility;Core;FileManager;	org.gnome.Nautilus
+Firefox	/nix/profile/bin/brook-firefox	firefox.rgba	Network;WebBrowser;	brook-hardware-firefox
+Settings	--uid 1000 /nix/profile/bin/hardware-brook-settings	brook-settings.rgba	Settings;DesktopSettings;	brook-settings
+Mousepad	--uid 1000 /nix/profile/bin/hardware-mousepad	orgxfcemousepad.rgba	Utility;TextEditor;GTK;	org.xfce.mousepad
+OpenTTD	--uid 1000 /nix/profile/bin/brook-run openttd		Game;Simulation;	openttd
+Quake II	/nix/profile/bin/brook-quake2	brook-quake2.rgba	Game;ActionGame;	brook-quake2
+GNU Image Manipulation Program	--uid 1000 /nix/profile/bin/brook-run gimp-3.0		Graphics;2DGraphics;RasterGraphics;GTK;	gimp
+VLC media player	/nix/store/sanx6w55ygvckdwqi84r63q8i7vsxv1v-vlc-3.0.23-2/bin/vlc --started-from-file		AudioVideo;Player;Recorder;	vlc
+SuperTuxKart	supertuxkart		Game;ArcadeGame;	supertuxkart
+LibreOffice Base	libreoffice --base		Office;Database;X-Red-Hat-Base;	base
+LibreOffice Calc	libreoffice --calc		Office;Spreadsheet;X-Red-Hat-Base;	calc
+LibreOffice Draw	libreoffice --draw		Office;FlowChart;Graphics;2DGraphics;VectorGraphics;X-Red-Hat-Base;	draw
+LibreOffice Impress	libreoffice --impress		Office;Presentation;X-Red-Hat-Base;	impress
+LibreOffice Math	libreoffice --math		Office;Education;Science;Math;X-Red-Hat-Base;	math
+LibreOffice	libreoffice		Office;X-Red-Hat-Base;X-SuSE-Core-Office;	startcenter
+LibreOffice Writer	libreoffice --writer		Office;WordProcessor;X-Red-Hat-Base;	writer
+VSCodium	--uid 1000 /nix/profile/bin/brook-codium		Utility;TextEditor;Development;IDE	codium
+Qalculate!	--uid 1000 /nix/profile/bin/brook-run qalculate-gtk		GTK;Utility;Calculator;Education;Science;Math;	qalculate-gtk
+Ladybird	Ladybird --force-new-process		Network;WebBrowser;	org.ladybird.Ladybird
+Thunar File Manager	--uid 1000 /nix/profile/bin/brook-run thunar		System;Core;GTK;FileTools;FileManager;	thunar
+Blender	blender		Graphics;3DGraphics;	blender
+Bulk Rename	--uid 1000 /nix/profile/bin/brook-run thunar --bulk-rename		Utility;Core;GTK;Filesystem;	thunar-bulk-rename
+Thunar Preferences	thunar-settings		XFCE;GTK;Settings;DesktopSettings;X-XFCE-SettingsDialog;X-XFCE-PersonalSettings;	thunar-settings
+Desktop Preferences	pcmanfm --desktop-pref		Settings;GTK;DesktopSettings;X-LXDE-Settings;	pcmanfm-desktop-pref
+PCMan File Manager	pcmanfm		GTK;System;Core;FileTools;FileManager;	pcmanfm
+Double Commander	doublecmd		Utility;FileTools;FileManager;	doublecmd
+GNOME Commander	--uid 1000 /nix/profile/bin/brook-run gnome-commander		GNOME;GTK;Utility;FileManager;System;FileTools;	org.gnome.gnome-commander
+Nuclear	nuclear --no-sandbox		Audio;AudioVideo;Network;Player;Music;	nuclear
+DeaDBeeF	deadbeef		Audio;AudioVideo;Player;GTK;	deadbeef
+Steam	/nix/profile/bin/brook-run /data/home/.local/share/brook/steam/brook-steam		Game;	brook-steam

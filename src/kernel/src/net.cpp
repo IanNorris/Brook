@@ -599,7 +599,8 @@ static TcpTxSnapshot CaptureTcpTxLocked(Socket& s)
 }
 static int TcpSendSnapshot(Socket& s, const TcpTxSnapshot& snapshot, uint32_t seq,
                             uint8_t flags, const void* data, uint32_t dataLen,
-                            const char* why,bool asyncNeighbor=false,bool localOnly=false);
+                            const char* why,bool asyncNeighbor=false,bool localOnly=false,
+                            uint64_t submissionDeadline=0);
 
 // The caller retains a SocketBorrow across submission and retry scheduling.
 // Preserve any newer pending ACK and its earlier timer.
@@ -732,7 +733,8 @@ void ArpCacheInsert(uint32_t ip, const MacAddr& mac)
 
 // Use the caller's selected interface and report local enqueue failure. The
 // legacy resolver below still selects its interface and ignores this result.
-static int ArpSendRequestFrom(NetIf* nif, const MacAddr& mac,uint32_t sourceIp,uint32_t targetIp,bool tryOnly=false)
+static int ArpSendRequestFrom(NetIf* nif, const MacAddr& mac,uint32_t sourceIp,uint32_t targetIp,
+                              bool tryOnly=false,uint64_t submissionDeadline=0)
 {
     if (!nif) return -1;
 
@@ -755,6 +757,7 @@ static int ArpSendRequestFrom(NetIf* nif, const MacAddr& mac,uint32_t sourceIp,u
     memset(arp->tha.b, 0, 6);
     arp->tpa   = targetIp;
 
+    if (submissionDeadline && ApicTickCount() >= submissionDeadline) return -110;
     NetCount(g_netCounters.arpRequestsSent);
     if(tryOnly)return nif->tryTransmit ? nif->tryTransmit(nif,frame,42) : -95;
     return nif->transmit(nif, frame, 42);
@@ -1107,13 +1110,15 @@ static uint32_t NetBuildIpv4Frame(NetIf* nif, uint8_t* frame, uint32_t source, u
 
 static int NetSendIpv4Resolved(NetIf* nif, const MacAddr& dstMac,
                                uint32_t source, uint32_t dstIp, uint8_t proto,
-                               const void* payload, uint32_t payloadLen,bool tryOnly=false)
+                               const void* payload, uint32_t payloadLen,bool tryOnly=false,
+                               uint64_t submissionDeadline=0)
 {
     if (!NetIpv4PayloadFits(payloadLen)) return -3;
     if (tryOnly && !nif->tryTransmit) return -95;
     alignas(16) uint8_t frame[ETH_FRAME_MAX];
     const uint32_t frameLen = NetBuildIpv4Frame(nif, frame, source, dstIp, proto, payload, payloadLen);
     reinterpret_cast<EthHeader*>(frame)->dst = dstMac;
+    if (submissionDeadline && ApicTickCount() >= submissionDeadline) return -110;
     return tryOnly ? nif->tryTransmit(nif,frame,frameLen) : nif->transmit(nif,frame,frameLen);
 }
 static NetIf* NetFindOwnInterface(uint32_t ip)
@@ -1159,20 +1164,42 @@ static Ipv4AddressAdmission NetIpv4AddressAdmission(uint32_t source, uint32_t de
     return forUs ? Ipv4AddressAdmission::ForUs : Ipv4AddressAdmission::OtherDestination;
 }
 
+// One attempt on the ordinary route. Leave unresolved TCP payload with the
+// caller so it cannot be transmitted from the ARP queue after the deadline.
+static int NetTrySendIpv4(NetIf* nif, uint32_t nextHop, uint32_t source, uint32_t dstIp,
+                         uint8_t proto, const void* payload, uint32_t len, uint64_t deadline)
+{
+    if (!nif->tryTransmit) return -95;
+    if (ApicTickCount() >= deadline) return -110;
+    SpinLockAcquire(&g_arpLock);
+    const auto neighbor = g_arpTable.Resolve(nextHop, ApicTickCount(), true);
+    SpinLockRelease(&g_arpLock);
+    if (neighbor.sendRequest)
+        (void)ArpSendRequestFrom(nif, nif->mac, nif->ipAddr, nextHop, true, deadline);
+    if (neighbor.result == ArpTable::Result::Failed) return -113;
+    if (neighbor.result != ArpTable::Result::Found) return -11;
+
+    MacAddr mac;
+    memcpy(mac.b, neighbor.mac, sizeof(mac.b));
+    return NetSendIpv4Resolved(nif, mac, source, dstIp, proto, payload, len, true, deadline);
+}
+
 static int NetSendIpv4From(uint32_t source, uint32_t dstIp, uint8_t proto,
                           const void* payload, uint32_t payloadLen,uint64_t scope=0,
-                          bool localOnly=false)
+                          bool localOnly=false,uint64_t submissionDeadline=0)
 {
     if(scope && (!Ipv4IsLoopback(dstIp) || (source && !Ipv4IsLoopback(source))))return -101;
     const bool loopback = Ipv4IsLoopback(dstIp);
     NetIf* own = scope || loopback ? nullptr : NetFindOwnInterface(dstIp);
     if (localOnly && !loopback && !own) return -101;
+    if (submissionDeadline && ApicTickCount() >= submissionDeadline) return -110;
 #ifdef BROOK_SOCKET_LIFETIME_TEST
     extern int SocketLifetimeTestTransmit(uint32_t, uint32_t, uint8_t, const void*, uint32_t);
     // Exercise the real assigned-interface loopback path in the host fixture.
-    if (!own) return SocketLifetimeTestTransmit(source, dstIp, proto, payload, payloadLen);
+    if (!own && (!submissionDeadline || loopback))
+        return SocketLifetimeTestTransmit(source, dstIp, proto, payload, payloadLen);
 #else
-    NetSendStackWatermark(dstIp, proto, payloadLen);
+    if (!submissionDeadline) NetSendStackWatermark(dstIp, proto, payloadLen);
 #endif
 
     const bool local = loopback || own;
@@ -1215,6 +1242,7 @@ static int NetSendIpv4From(uint32_t source, uint32_t dstIp, uint8_t proto,
         // re-enter NetSendIpv4 -> HandleIpv4 and recurse until the kernel
         // stack overflows. LoopbackSubmit drains the queue iteratively so at
         // most one HandleIpv4 frame is ever live per drainer.
+        if (submissionDeadline && ApicTickCount() >= submissionDeadline) return -110;
         LoopbackSubmitScoped(
             g_loopbackQueue, g_loopbackDraining, frame, frameLen, scope,
             []() { SpinLockAcquire(&g_loopbackLock); },
@@ -1229,6 +1257,9 @@ static int NetSendIpv4From(uint32_t source, uint32_t dstIp, uint8_t proto,
         nextHop = nif->gateway;
         if (!nextHop) return -1; // no gateway configured
     }
+
+    if (submissionDeadline)
+        return NetTrySendIpv4(nif, nextHop, source, dstIp, proto, payload, payloadLen, submissionDeadline);
 
     if (!NetIpv4PayloadFits(payloadLen)) return -3;
     alignas(16) uint8_t frame[ETH_FRAME_MAX];
@@ -2829,7 +2860,7 @@ int SockRecvFrom(int sockIdx, void* buf, uint32_t len,
     return static_cast<int>(copyLen);
 }
 
-static void SockFinalize(int sockIdx, uint64_t localDeadline)
+static void SockFinalize(int sockIdx, uint64_t closeDeadline, bool remoteBounded)
 {
     if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return;
     if (!g_sockUsed[sockIdx]) return;
@@ -2885,7 +2916,7 @@ static void SockFinalize(int sockIdx, uint64_t localDeadline)
         const auto snapshot = CaptureTcpTxLocked(s);
         SpinLockRelease(&s.lock);
         TcpSendSnapshot(s, snapshot, seq, TCP_FIN | TCP_ACK, nullptr, 0, "close", false,
-                        localDeadline != 0);
+                        closeDeadline && !remoteBounded, remoteBounded ? closeDeadline : 0);
 
         // Wait up to 500ms for the peer to acknowledge our FIN.
         // We must use SchedulerBlock (not SchedulerYield) because SchedulerYield
@@ -2895,7 +2926,7 @@ static void SockFinalize(int sockIdx, uint64_t localDeadline)
         Process* self = ProcessCurrent();
         if (self) {
             uint64_t deadline = ApicTickCount() + 500;
-            if (localDeadline && localDeadline < deadline) deadline = localDeadline;
+            if (closeDeadline && closeDeadline < deadline) deadline = closeDeadline;
             for (;;) {
                 SpinLockAcquire(&s.lock);
                 const bool waiting = s.tcpState == TcpState::FinWait1 ||
@@ -2961,7 +2992,7 @@ void SockRef(int sockIdx)
     (void)SockTryRef(sockIdx);
 }
 
-void SockUnrefUntil(int sockIdx, uint64_t localDeadline)
+static void SockDropReference(int sockIdx, uint64_t closeDeadline, bool remoteBounded)
 {
     if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return;
     const uint64_t flags = IrqSpinLockAcquire(&g_socketRegistryLock);
@@ -2973,10 +3004,12 @@ void SockUnrefUntil(int sockIdx, uint64_t localDeadline)
         }
     }
     IrqSpinLockRelease(&g_socketRegistryLock, flags);
-    if (finalize) SockFinalize(sockIdx, localDeadline);
+    if (finalize) SockFinalize(sockIdx, closeDeadline, remoteBounded);
 }
 
-void SockUnref(int sockIdx) { SockUnrefUntil(sockIdx, 0); }
+void SockUnrefUntil(int sockIdx, uint64_t deadline) { SockDropReference(sockIdx, deadline, false); }
+void SockUnrefBefore(int sockIdx, uint64_t deadline) { SockDropReference(sockIdx, deadline, true); }
+void SockUnref(int sockIdx) { SockDropReference(sockIdx, 0, false); }
 
 // Direct close callers own exactly one reference, just like FD/queue teardown.
 void SockClose(int sockIdx) { SockUnref(sockIdx); }
@@ -3425,7 +3458,7 @@ static bool TcpDrainOoo(Socket& s)
 
 static int TcpSendSnapshot(Socket& s, const TcpTxSnapshot& snapshot, uint32_t seq, uint8_t flags,
                                 const void* data, uint32_t dataLen,
-                                const char* why,bool asyncNeighbor,bool localOnly)
+                                const char* why,bool asyncNeighbor,bool localOnly,uint64_t submissionDeadline)
 {
     uint8_t options[8];
     uint32_t optLen = TcpWriteSynOptions(flags, snapshot.windowScale, options);
@@ -3452,9 +3485,13 @@ static int TcpSendSnapshot(Socket& s, const TcpTxSnapshot& snapshot, uint32_t se
     tcp->checksum = TcpChecksum(snapshot.localIp, snapshot.remoteIp, buf, tcpLen);
 
     int sendResult = asyncNeighbor ? NetSendIpv4AsyncNeighbor(snapshot.localIp,snapshot.remoteIp,IP_PROTO_TCP,buf,tcpLen,s.networkScope)
-                                   : NetSendIpv4From(snapshot.localIp,snapshot.remoteIp,IP_PROTO_TCP,buf,tcpLen,s.networkScope,localOnly);
+                                   : NetSendIpv4From(snapshot.localIp,snapshot.remoteIp,IP_PROTO_TCP,buf,tcpLen,s.networkScope,
+                                                     localOnly,submissionDeadline);
     if (sendResult != 0) {
-        if(!asyncNeighbor || sendResult!=-11){TcpTotalAdd(g_tcpTotals.sendFailures,1);SerialPrintf("tcp: send failed flags=0x%02x err=%d\n", flags, sendResult);}
+        if (sendResult != -11 || (!asyncNeighbor && !submissionDeadline)) {
+            TcpTotalAdd(g_tcpTotals.sendFailures,1);
+            if (!submissionDeadline) SerialPrintf("tcp: send failed flags=0x%02x err=%d\n", flags, sendResult);
+        }
     } else {
         SpinLockAcquire(&s.lock);
         const uint32_t packetCount = ++s.txPktCount;
@@ -3560,8 +3597,32 @@ static int EvictStaleSynRecvLocked(Socket& listener, uint64_t now)
 // received from a NIC. Test both before allocating a child and at publish.
 static bool AcceptQueueHasRoom(const Socket& listener, bool localIngress)
 {
-    const int remoteReserve = localIngress && BridgeCommandListener(listener) ? 1 : 0;
-    return listener.listening && listener.acceptQueueCount < listener.listenBacklog - remoteReserve;
+    if (!listener.listening || listener.acceptQueueCount >= listener.listenBacklog) return false;
+    if (!localIngress || !BridgeCommandListener(listener)) return true;
+    return listener.listenBacklog > 1 && listener.acceptQueueCount == 0;
+}
+
+// Only a peer that completed the TCP handshake can use its address quota.
+// Incomplete handshakes still use the bounded queue and ordinary stale eviction.
+// Caller holds g_acceptQueueLock and no child lock.
+static bool AcceptQueuePeerAllowed(const Socket& listener, uint32_t peer, bool localIngress)
+{
+#if defined(BROOK_BRIDGE_V3) || defined(BROOK_SOCKET_LIFETIME_TEST)
+    if (localIngress || !BridgeCommandListener(listener)) return true;
+    unsigned established = 0;
+    for (int qi = 0; qi < listener.acceptQueueCount; ++qi) {
+        const int childIdx = listener.acceptQueue[qi];
+        if (childIdx < 0 || childIdx >= static_cast<int>(MAX_SOCKETS) || !g_sockUsed[childIdx])
+            continue;
+        Socket& child = g_sockets[childIdx];
+        if (child.peerLocalIngress || child.remoteIp != peer) continue;
+        SpinLockAcquire(&child.lock);
+        const bool ready = TcpCanAccept(child);
+        SpinLockRelease(&child.lock);
+        if (ready && ++established == 2) return false;
+    }
+#endif
+    return true;
 }
 
 static void PruneAcceptQueue(Socket& listener)
@@ -3809,10 +3870,11 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len,uint64_t 
             // closing its active FD; dead queue entries must not refuse a SYN.
             PruneAcceptQueue(s);
             uint64_t queueFlags = IrqSpinLockAcquire(&g_acceptQueueLock);
-            bool full = !AcceptQueueHasRoom(s, localIngress);
+            const bool peerAllowed = AcceptQueuePeerAllowed(s, ip->srcIp, localIngress);
+            bool full = !peerAllowed || !AcceptQueueHasRoom(s, localIngress);
             // A local SYN cannot evict a pending remote handshake to make
             // room for itself. Normal listeners retain stale-child eviction.
-            const bool canEvict = !(localIngress && BridgeCommandListener(s));
+            const bool canEvict = peerAllowed && !(localIngress && BridgeCommandListener(s));
             const int evicted = full && s.listening && canEvict
                               ? EvictStaleSynRecvLocked(s, ApicTickCount()) : -1;
             if (evicted >= 0) full = !AcceptQueueHasRoom(s, localIngress);
@@ -3889,9 +3951,10 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len,uint64_t 
             // Once published, accept/listener close may immediately retire it;
             // successful publication must be our last access to this child.
             queueFlags = IrqSpinLockAcquire(&g_acceptQueueLock);
+            const bool allowed = AcceptQueueHasRoom(s, localIngress)
+                              && AcceptQueuePeerAllowed(s, ip->srcIp, localIngress);
             SpinLockAcquire(&child.lock);
-            bool publish = AcceptQueueHasRoom(s, child.peerLocalIngress)
-                           && !RetireAbandonedQueuedChild(child, ApicTickCount())
+            bool publish = allowed && !RetireAbandonedQueuedChild(child, ApicTickCount())
                            && (child.tcpState == TcpState::SynRecv
                                || child.tcpState == TcpState::Established
                                || child.tcpState == TcpState::CloseWait);
@@ -4168,11 +4231,13 @@ class TcpSendOwnership {
     Process* self_;
     KMutex* gate_;
     bool referenced_ = false, locked_ = false, region_ = false;
+    uint64_t finalizationDeadline_ = 0;
 public:
     TcpSendOwnership(int index, Process* self, KMutex* gate=nullptr)
         : index_(index), self_(self), gate_(gate ? gate :
             (index>=0 && index<static_cast<int>(MAX_SOCKETS) ? &g_tcpSendGates[index] : nullptr)) {}
-    int Acquire(uint64_t deadline) {
+    int Acquire(uint64_t deadline, bool boundedFinalize = false) {
+        if (boundedFinalize) finalizationDeadline_ = deadline;
         if (!self_) return -11; // KMutex is unavailable outside process context
         SchedulerKernelRegionEnter(self_); region_ = true;
         if (!SockTryRef(index_)) return -1;
@@ -4196,7 +4261,10 @@ public:
     }
     ~TcpSendOwnership() {
         if (locked_) KMutexUnlock(gate_);
-        if (referenced_) SockUnref(index_);
+        if (referenced_) {
+            if (finalizationDeadline_) SockUnrefBefore(index_, finalizationDeadline_);
+            else SockUnref(index_);
+        }
         if (region_) SchedulerKernelRegionLeave(self_);
     }
     TcpSendOwnership(const TcpSendOwnership&) = delete;
@@ -4287,7 +4355,7 @@ struct TcpFlightPump {
     TcpSendFlightState& state;
     const uint32_t base,len,mss,probeIndex;
     const unsigned initialLimit;
-    const bool adaptive;
+    const bool adaptive, boundedSubmit = false;
     int Finish(int error) {
         auto& reserved=state.reserved;auto& submitted=state.submitted;
         auto& acknowledged=state.acknowledged;auto& count=state.count;
@@ -4392,7 +4460,8 @@ struct TcpFlightPump {
             } else if (g_tcpSendProbe) slot.firstSendAt=now;
             SpinLockRelease(&s.lock);
             const int result = TcpSendSnapshot(s, snapshot, seq, TCP_ACK | TCP_PSH,
-                                               slot.bytes + offset, bytes, retry ? "flight-retry" : "flight-submit",g_tcpAsyncNeighbor);
+                                               slot.bytes + offset, bytes, retry ? "flight-retry" : "flight-submit",
+                                               !boundedSubmit && g_tcpAsyncNeighbor,false,boundedSubmit ? deadline : 0);
             const uint64_t after = ApicTickCount();
             if (!result) {
                 if (!retry) submitted += slot.len;
@@ -4453,11 +4522,11 @@ struct TcpFlightPump {
 // Every exit retires reservations or closes the stream before call-local state is destroyed.
 static int TcpSendPacketFlight(Socket& s, Process* self, const TcpSendSource& source,
                                   uint32_t len, uint32_t mss,
-                                  uint64_t deadline, unsigned initialLimit, bool adaptive)
+                                  uint64_t deadline, unsigned initialLimit, bool adaptive, bool boundedSubmit=false)
 {
     TcpSendFlightState state(initialLimit);
     if (!state.Allocate()) return -12;
-    if (g_tcpQueueStage && !state.AllocateQueue()) return -12;
+    if (!boundedSubmit && g_tcpQueueStage && !state.AllocateQueue()) return -12;
     using Slot = TcpSendFlightState::Slot;
     Slot* const slots=state.slots;
     const unsigned capacity=state.capacity;
@@ -4478,7 +4547,7 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const TcpSendSource& so
     SpinLockRelease(&s.lock);
     SocketWaitRegistration registration(s, self,workerSeparate);
 
-    TcpFlightPump pump{s,state,base,len,mss,probeIndex,initialLimit,adaptive};
+    TcpFlightPump pump{s,state,base,len,mss,probeIndex,initialLimit,adaptive,boundedSubmit};
     for (;;) {
         if (TcpSendInterrupted(self)) return pump.Finish(-4);
         const FlightStep outcome=pump.Step(ApicTickCount(),deadline);
@@ -4542,13 +4611,13 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const TcpSendSource& so
 }
 
 static int SockSendImpl(int sockIdx, const TcpSendSource& source, uint32_t len,
-                        uint64_t localDeadline = 0)
+                        uint64_t operationDeadline=0, bool boundedSubmit=false)
 {
     if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return -1;
     Process* self = SchedulerCurrentProcess();
-    const uint64_t deadline = localDeadline ? localDeadline : ApicTickCount() + 30000;
+    const uint64_t deadline = operationDeadline ? operationDeadline : ApicTickCount() + 30000;
     TcpSendOwnership ownership(sockIdx, self);
-    const int acquire = ownership.Acquire(deadline);
+    const int acquire = ownership.Acquire(deadline, boundedSubmit);
     if (acquire) return acquire;
 
     Socket& s = g_sockets[sockIdx];
@@ -4568,13 +4637,16 @@ static int SockSendImpl(int sockIdx, const TcpSendSource& source, uint32_t len,
     uint32_t sent = 0;
     uint8_t staged[ETH_MTU];
     if (!mss || mss > sizeof(staged)) return -22;
-    if (!localDeadline && (g_tcpTwoPacketFlight || g_tcpFourPacketFlight || g_tcpAdaptiveFlight) && len)
+    if (boundedSubmit && len)
+        return TcpSendPacketFlight(s, self, source, len, mss, deadline, 1, false, true);
+    if (!operationDeadline && (g_tcpTwoPacketFlight || g_tcpFourPacketFlight || g_tcpAdaptiveFlight) && len)
         return TcpSendPacketFlight(s, self, source, len, mss, deadline,
                                    g_tcpAdaptiveFlight ? (g_tcpAdaptiveFlight16?16:8) : g_tcpFourPacketFlight ? 4 : 2,
                                    g_tcpAdaptiveFlight);
 
     // Snapshot the negotiated MSS; never hold the socket lock across network
     // submission or an ACK wait. The optional ceiling is boot-time immutable.
+    const bool localOnly = operationDeadline != 0;
     while (sent < len) {
         if (TcpSendInterrupted(self)) return sent ? static_cast<int>(sent) : -4;
         if (ApicTickCount() >= deadline) return sent ? static_cast<int>(sent) : -110;
@@ -4597,10 +4669,9 @@ static int SockSendImpl(int sockIdx, const TcpSendSource& source, uint32_t len,
         s.tcpSndNxt += chunk;
         SpinLockRelease(&s.lock);
         TcpSendSegmentAtSeq(s, seq, TCP_ACK | TCP_PSH, staged, chunk, "data",
-                            localDeadline != 0);
+                            localOnly);
 
-        int ackStatus = TcpWaitForDataAck(s, sockIdx, seq, staged, chunk, deadline,
-                                         localDeadline != 0);
+        int ackStatus = TcpWaitForDataAck(s, sockIdx, seq, staged, chunk, deadline, localOnly);
         if (ackStatus != 0)
             return sent ? static_cast<int>(sent) : ackStatus;
 
@@ -4633,6 +4704,13 @@ int SockSendUntil(int sockIdx, const void* buf, uint32_t len, uint64_t deadline)
     if (!deadline) return -22;
     const TcpSendSource source{static_cast<const uint8_t*>(buf), false, nullptr, 0};
     return SockSendImpl(sockIdx, source, len, deadline);
+}
+
+int SockSendBefore(int sockIdx, const void* buf, uint32_t len, uint64_t deadline)
+{
+    if (!deadline) return -22;
+    const TcpSendSource source{static_cast<const uint8_t*>(buf), false, nullptr, 0};
+    return SockSendImpl(sockIdx, source, len, deadline, true);
 }
 
 int SockSendUser(int sockIdx, uint64_t address, uint32_t len)
@@ -5012,6 +5090,7 @@ static int UintToStr(char* buf, uint32_t val)
 
 void DebugHandleCommand(const char* cmd, uint32_t len);
 
+#if defined(BROOK_QEMU_LEGACY_OUTBOUND_DEBUG)
 // Kernel thread: attempts to connect the debug channel without blocking boot.
 // Tries once with a short timeout; if no server is listening, exits quietly.
 static void DebugChannelThreadFn(void* /*arg*/)
@@ -5080,9 +5159,11 @@ static void DebugChannelThreadFn(void* /*arg*/)
     s.tcpState = TcpState::Closed;
     SockClose(idx);
 }
+#endif
 
 void DebugChannelInit()
 {
+#if defined(BROOK_QEMU_LEGACY_OUTBOUND_DEBUG)
     if (!g_netIf) return;
     Process* thread = KernelThreadCreate("debug_ch", DebugChannelThreadFn, nullptr, 3);
     if (!thread) {
@@ -5091,12 +5172,46 @@ void DebugChannelInit()
     }
     SchedulerAddProcess(thread);
     SerialPrintf("debug: channel thread created pid=%u\n", thread->pid);
+#endif
 }
 
 // Thread-local override for routing DebugChannelSend responses to
 // whichever socket initiated the command (port 1234 or outbound 9999).
 static uint16_t g_debugReplySockets[65536] = {}; // socket+1, scoped by kernel-thread PID
 static uint64_t g_debugReplyDeadlines[MAX_SOCKETS]; // live reply socket, read by its owner only
+#if defined(BROOK_BRIDGE_V3)
+static Process* g_debugWriterOwner;
+static DebugReplyWriter g_debugReplyWriter;
+static void* g_debugWriterContext;
+static bool g_debugWriterAuthenticated;
+
+bool DebugChannelSetReplyWriter(DebugReplyWriter writer, void* context, bool authenticated)
+{
+    auto* self = ProcessCurrent();
+    if (!self || !writer || __atomic_load_n(&g_debugWriterOwner, __ATOMIC_ACQUIRE)) return false;
+    g_debugReplyWriter = writer;
+    g_debugWriterContext = context;
+    g_debugWriterAuthenticated = authenticated;
+    __atomic_store_n(&g_debugWriterOwner, self, __ATOMIC_RELEASE);
+    return true;
+}
+
+void DebugChannelClearReplyWriter()
+{
+    if (__atomic_load_n(&g_debugWriterOwner, __ATOMIC_ACQUIRE) != ProcessCurrent()) return;
+    __atomic_store_n(&g_debugWriterOwner, nullptr, __ATOMIC_RELEASE);
+    g_debugWriterContext = nullptr;
+    g_debugReplyWriter = nullptr;
+    g_debugWriterAuthenticated = false;
+}
+
+bool DebugChannelReplyAuthenticated()
+{
+    auto* self = ProcessCurrent();
+    return self && __atomic_load_n(&g_debugWriterOwner, __ATOMIC_ACQUIRE) == self &&
+           g_debugWriterAuthenticated;
+}
+#endif
 
 static uint16_t DebugReplyOverride()
 {
@@ -5143,13 +5258,22 @@ static int DebugSendAll(int sock, const char* data, uint32_t length)
     return static_cast<int>(sent);
 }
 
+static int DebugReplySend(const char* data, uint32_t length)
+{
+#if defined(BROOK_BRIDGE_V3)
+    auto* self = ProcessCurrent();
+    if (self && __atomic_load_n(&g_debugWriterOwner, __ATOMIC_ACQUIRE) == self)
+        return g_debugReplyWriter(g_debugWriterContext, data, length);
+#endif
+    const int sock = DebugReplySocket();
+    return sock >= 0 ? DebugSendAll(sock, data, length) : -1;
+}
+
 void DebugChannelSend(const char* msg)
 {
-    int sock = DebugReplySocket();
-    if (sock < 0) return;
     uint32_t len = 0;
     while (msg[len]) len++;
-    (void)DebugSendAll(sock, msg, len);
+    (void)DebugReplySend(msg, len);
 }
 
 bool DebugChannelConnected()
@@ -5267,12 +5391,6 @@ static bool MatchLogLevel(const char* name, LogLevel* out)
         }
     }
     return false;
-}
-
-static int DebugReplySend(const char* data, uint32_t length)
-{
-    int sock = DebugReplySocket();
-    return sock >= 0 ? DebugSendAll(sock, data, length) : -1;
 }
 
 // Fixed-buffer replies: no dependency on a userspace printf implementation.

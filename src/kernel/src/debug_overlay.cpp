@@ -18,6 +18,7 @@
 #include "debug_presence.h"
 #include "bridge_reply.h"
 #include "debug_local_policy.h"
+#include "debug_bridge_v3.h"
 #include "klog.h"
 #include "kprintf.h"
 #include "string.h"
@@ -430,16 +431,22 @@ void KernelConsoleSpawn()
 // --- TCP debug server thread -----------------------------------------------
 
 static constexpr uint16_t DEBUG_TCP_PORT = 1234;
+#if defined(BROOK_BRIDGE_V3)
+// An unproved peer may hold the single listener only for this interval.
+static constexpr uint64_t TCP_REMOTE_HELLO_TIMEOUT_MS = 2000;
+#else
 static constexpr uint32_t TCP_LINE_LEN   = 160;
 static constexpr uint32_t TCP_BATCH      = 32; // lines per send batch
 // A partial framed command must not monopolize the single debug listener.
 // Legacy passive log viewers and idle framed clients are unaffected.
 static constexpr uint64_t TCP_PARTIAL_FRAME_TIMEOUT_MS = 10000;
+#endif
 static constexpr uint64_t TCP_LOCAL_REQUEST_TIMEOUT_MS = 250;
 // Recovery starts this before desktop handoff; the desktop script may request
 // it again. Keep one listener, including during concurrent spawn attempts.
 static uint32_t g_debugTcpSpawned = 0;
 
+#if !defined(BROOK_BRIDGE_V3)
 static bool DebugTcpSendAll(int socket, const char* bytes, uint32_t length, uint64_t deadline=0)
 {
     uint32_t sent = 0;
@@ -451,6 +458,7 @@ static bool DebugTcpSendAll(int socket, const char* bytes, uint32_t length, uint
     }
     return true;
 }
+#endif
 
 static bool DebugTcpLocalPeer(uint32_t address, bool localIngress)
 {
@@ -462,6 +470,7 @@ static bool DebugTcpLocalPeer(uint32_t address, bool localIngress)
     return false;
 }
 
+#if !defined(BROOK_BRIDGE_V3)
 static void DebugTcpRejectLocal(const char* command, uint32_t tokenBytes)
 {
     BridgeReplyBuffer<DebugChannelSend> reply;
@@ -475,6 +484,7 @@ static void DebugTcpRejectLocal(const char* command, uint32_t tokenBytes)
     if (tokenBytes) marker("BRIDGE_END ");
     reply.send();
 }
+#endif
 
 static void DebugTcpThread(void* /*arg*/)
 {
@@ -500,7 +510,13 @@ static void DebugTcpThread(void* /*arg*/)
         return;
     }
 
-    if (SockListen(listenSock, 2) < 0)
+#if defined(BROOK_BRIDGE_V3)
+    // Two ready requests from one host can queue while another peer has room.
+    constexpr int PendingConnections = 3;
+#else
+    constexpr int PendingConnections = 2;
+#endif
+    if (SockListen(listenSock, PendingConnections) < 0)
     {
         SerialPuts("DEBUG_TCP: listen failed\n");
         SockClose(listenSock);
@@ -526,6 +542,15 @@ static void DebugTcpThread(void* /*arg*/)
         }
 
         const bool local = DebugTcpLocalPeer(peer.sin_addr, localIngress);
+#if defined(BROOK_BRIDGE_V3)
+        const auto deadline = ApicTickCount() +
+            (local ? TCP_LOCAL_REQUEST_TIMEOUT_MS : TCP_REMOTE_HELLO_TIMEOUT_MS);
+        NetCountDebugClient(true);
+        DebugBridgeV3Serve(clientSock, peer.sin_addr, local, deadline);
+        NetCountDebugClient(false);
+        if (local) SockUnrefUntil(clientSock, deadline);
+        else SockUnrefBefore(clientSock, ApicTickCount() + TCP_LOCAL_REQUEST_TIMEOUT_MS);
+#else
         const uint64_t localDeadline = local ? ApicTickCount() + TCP_LOCAL_REQUEST_TIMEOUT_MS : 0;
         NetCountDebugClient(true);
         // Per-connection traces are `log level tcp debug`; `tcp stats`
@@ -648,6 +673,7 @@ static void DebugTcpThread(void* /*arg*/)
             SerialPuts("DEBUG_TCP: client disconnected\n");
         if (local) SockUnrefUntil(clientSock, localDeadline);
         else SockUnref(clientSock);
+#endif
     }
 }
 

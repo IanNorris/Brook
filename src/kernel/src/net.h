@@ -439,6 +439,9 @@ int  SockRecvFrom(int sockIdx, void* buf, uint32_t len,
 int  SockSend(int sockIdx, const void* buf, uint32_t len);
 // Synchronous local-only sends share the caller's absolute monotonic deadline.
 int  SockSendUntil(int sockIdx, const void* buf, uint32_t len, uint64_t deadline);
+// Returns bytes ACKed by the given absolute monotonic deadline, or a negative
+// errno. Remote submission requires a driver's nonblocking transmit callback.
+int  SockSendBefore(int sockIdx, const void* buf, uint32_t len, uint64_t deadline);
 int  SockSendUser(int sockIdx, uint64_t address, uint32_t len);
 struct TcpSendVector { uint64_t base, length; };
 // Descriptors are a stable kernel snapshot; payload pointers address user memory.
@@ -476,6 +479,7 @@ void SockClose(int sockIdx);
 void SockRef(int sockIdx);    // increment refcount (fork/dup)
 void SockUnref(int sockIdx);  // decrement refcount, destroy at 0
 void SockUnrefUntil(int sockIdx, uint64_t deadline); // bounded local-only graceful close
+void SockUnrefBefore(int sockIdx, uint64_t deadline); // bounded remote-capable graceful close
 
 // Deliver a UDP datagram to the matching socket (called by stack).
 void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
@@ -511,6 +515,12 @@ void DebugChannelSendf(const char* fmt, ...);
 // Route DebugChannelSend responses to a specific socket (for port 1234 server).
 void DebugChannelSetReplySock(int sock, uint64_t deadline=0);
 void DebugChannelClearReplySock();
+#if defined(BROOK_BRIDGE_V3)
+using DebugReplyWriter = int (*)(void*, const char*, uint32_t);
+bool DebugChannelSetReplyWriter(DebugReplyWriter writer, void* context, bool authenticated);
+void DebugChannelClearReplyWriter();
+bool DebugChannelReplyAuthenticated();
+#endif
 
 // Dispatch a debug command string (used by both outbound and listener channels).
 void DebugHandleCommand(const char* cmd, uint32_t len);

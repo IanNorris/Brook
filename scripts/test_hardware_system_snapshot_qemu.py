@@ -196,7 +196,7 @@ def main():
                 time.sleep(.2)
             else:
                 raise TimeoutError('maintenance boot did not reach debug interface')
-            h = Hardware(out / 'registry'); attached = h.attach('127.0.0.1', ports[0]); s = attached['session']
+            h = Hardware(out / 'registry'); attached = h.attach('127.0.0.1',ports[0],auth_mode='legacy'); s = attached['session']
             if a.expected_payload_id or a.forbidden_payload_id:
                 ident = uuid.uuid4().hex
                 h.guest_run(s, ident, ['/boot/HWSTATUS.ELF'], cwd='/tmp', uid=0, wait_s=2)

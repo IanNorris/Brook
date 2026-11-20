@@ -26,11 +26,11 @@ in {
     desktop="$out/share/applications/org.gnome.Nautilus.desktop"
     cp "${nautilus}/share/applications/org.gnome.Nautilus.desktop" "$desktop"
     chmod u+w "$desktop"
-    sed -i -e 's|^Exec=.*nautilus|Exec=brook-nautilus|' \
-           -e 's|^TryExec=.*|TryExec=brook-nautilus|' \
+    sed -i -e 's|^Exec=.*nautilus|Exec=/nix/profile/bin/brook-nautilus|' \
+           -e 's|^TryExec=.*|TryExec=/nix/profile/bin/brook-nautilus|' \
            -e 's|^DBusActivatable=.*|DBusActivatable=false|' "$desktop"
     grep -qx 'Name=Files' "$desktop"
-    grep -q '^Exec=brook-nautilus' "$desktop"
+    grep -qx 'Exec=/nix/profile/bin/brook-nautilus --new-window %U' "$desktop"
 
     cat > "$out/etc/xdg/mimeapps.list" <<'MIME'
     [Default Applications]

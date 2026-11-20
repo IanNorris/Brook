@@ -2,6 +2,7 @@
 import hashlib,json,stat,uuid
 from pathlib import Path
 from hardware_update_workflow import UpdateRun
+from binary_bridge import receiver_key
 from hardware_bulk_protocol import identifier,upload,download,disk_download,frame_png,validate_pacing,LIMIT
 
 # Debug-frame provenance (src/shared/brook_debug_frame.h) in bridge terms.
@@ -55,8 +56,8 @@ class BulkRun(UpdateRun):
         if (frame_options is not None or crop is not None) and action not in ('frame','framez'):raise ValueError('Frame options are only for frame capture')
         option_argument=frame_option_argument(frame_options)
         tx=identifier(request_id) if request_id is not None else uuid.uuid4().hex
-        with Path(key_file).open() as key_stream:key=identifier(key_stream.read(33))
         data=self.bridge.load_session(session);boot=data['guest_boot_id']
+        key=receiver_key(data,key_file)
         doctor=self.bridge.doctor(session)
         if doctor.get('probe_stage')!='verified' or not doctor.get('reachable') or not doctor.get('identity_matches'):raise RuntimeError('Pinned guest boot probe is incomplete or not reachable/matching')
         if doctor.get('guest',{}).get('bulk_helper_api')!=1:raise RuntimeError('Guest has no opted-in binary helper; update its image first')

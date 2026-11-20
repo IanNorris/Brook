@@ -83,7 +83,7 @@ def main():
                 if 'HARDWARE_NETWORK_READY' in serial and 'DEBUG_TCP: listening' in serial:break
                 time.sleep(.2)
             else:raise TimeoutError(serial[-4000:])
-            h=Hardware(out/'registry');attached=h.attach('127.0.0.1',port);s=attached['session']
+            h=Hardware(out/'registry');attached=h.attach('127.0.0.1',port,auth_mode='legacy');s=attached['session']
             if a.check_watchdog_refusal:
                 watchdog=h.command(s,'bridge hardware pch-watchdog-status')
                 if watchdog.get('pch_watchdog_error')!='status admission failed':

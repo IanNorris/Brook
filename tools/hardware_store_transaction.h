@@ -3,11 +3,11 @@
 #include <stdint.h>
 #include "../src/shared/update/payload.h"
 /* Caller authenticates and retains the directory FD and shared hardware-update
- * lock through destruction. Never removes an incomplete image or overwrites a
- * previously published file. Publication may be uncertain after an error. */
+ * lock through destruction. Never overwrites a published file. A v3 request
+ * stages in a separate temporary file until authenticated finalization. */
 class HardwareStoreTransaction {
 public:
-    HardwareStoreTransaction() = default;
+    explicit HardwareStoreTransaction(bool temporary = false) : temporary_(temporary) {}
     ~HardwareStoreTransaction();
     HardwareStoreTransaction(const HardwareStoreTransaction&) = delete;
     HardwareStoreTransaction& operator=(const HardwareStoreTransaction&) = delete;
@@ -15,6 +15,7 @@ public:
     int append(const void *data, size_t length);
     int stage();
     int finalize();
+    int discard_staging();
     bool marker_published() const { return published_; }
     bool marker_durable() const { return durable_; }
     bool image_created() const { return created_; }
@@ -28,4 +29,7 @@ private:
     BrookSha256 stream_{};
     bool begun_ = false, staged_ = false, attempted_ = false, failed_ = false;
     bool published_ = false, durable_ = false, created_ = false;
+    const bool temporary_;
+    bool image_published_ = false;
+    const char* image_name() const { return temporary_ ? "STORE.TMP" : "STORE.IMG"; }
 };

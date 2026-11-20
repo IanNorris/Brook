@@ -8,6 +8,7 @@ writable by the helper. Normal desktop recovery remains intrinsically RO.
 """
 import argparse,hashlib,json,os,shutil,subprocess,sys,uuid
 from pathlib import Path
+from bridge_keyless_image import require_keyless_image
 ROOT=Path(__file__).resolve().parents[1];sys.path.insert(0,str(ROOT/'tools'))
 from hardware_update_protocol import record,KERNEL_MAX,INITRD_MAX
 p=argparse.ArgumentParser(description=__doc__)
@@ -27,6 +28,8 @@ for probe,m in [(recovery,meta),(scratch,sm)]:
 if (meta['files']['KERNEL/BROOK.ELF']['sha256']!=sm['files']['KERNEL/BROOK.ELF']['sha256'] or
     sha(build/'kernel/BROOK.elf')!=meta['files']['KERNEL/BROOK.ELF']['sha256']):
     p.error('Recovery kernel and maintenance module profile must match')
+for probe in (recovery, scratch):
+    require_keyless_image(probe/'payload/INITRD.IMG')
 out.mkdir(parents=True,exist_ok=False)
 run('cp','--reflink=auto','-a',recovery/'payload',out/'payload')
 run('cp','--reflink=auto',recovery/'probe.raw',out/'probe.raw')
@@ -41,11 +44,10 @@ run('mcopy','-o','-i',maintenance,build/'kernel/drivers/xhci.mod','::DRIVERS/XHC
 for source,dest in [('tools/hardware_update.c','HWUPDATE.ELF'),('tools/hardware_status.c','HWSTATUS.ELF')]:
     binary=out/dest;run(os.environ['MUSL_CC'],'-static','-O2','-Wall','-Wextra','-Werror',ROOT/source,'-o',binary)
     run('mcopy','-o','-i',maintenance,binary,'::BOOT/'+dest)
-key=out/'hardware-update-key';key.write_text(uuid.uuid4().hex);key.chmod(0o600)
 marker=out/'hardware-maintenance';marker.write_text('Opt-in RAM maintenance; no USB application image mount\n')
 payload_id='maintenance-bootstrap-'+uuid.uuid4().hex
 identity=out/'hardware-payload-id';identity.write_text(payload_id+'\n')
-for file in [key,marker,identity]:run('mcopy','-o','-i',maintenance,file,'::ETC/'+file.name)
+for file in (marker,identity):run('mcopy','-o','-i',maintenance,file,'::ETC/'+file.name)
 kernel=(out/'payload/KERNEL/BROOK.ELF').read_bytes();initrd=maintenance.read_bytes()
 selection=record(1,0,kernel,initrd)
 for slot in 'AB':
@@ -66,7 +68,7 @@ for path in sorted((out/'payload').rglob('*')):
 mutable=[name for name in files if name.startswith(('UPDATES/','BROOK-TEST/'))]
 meta.update(files=files,test_disk=str(out/'probe.raw'),usb_read_only=False,scope='RAM maintenance A/B bootstrap; root recovery pair unchanged',
     mutable_files=mutable,scratch_nonce=sm['scratch_nonce'],scratch_path=sm['scratch_path'],maintenance_payload_id=payload_id,
-    update_key_file=str(key),physical_status='Prepared only; QEMU and physical write/flush gates required',
+    physical_status='Prepared only; QEMU and physical write/flush gates required',
     remote_update_scope=['kernel ELF','initrd FAT disk image'],remote_update_excludes=['EFI executable','partition table','APPS.BRK'])
 (out/'manifest.json').write_text(json.dumps(meta,indent=2)+'\n')
 print('HARDWARE_UPDATE_PROFILE_PREPARED',out)
