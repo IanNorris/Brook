@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 from stage_nar import (STORE, STORE_NAME, check_legacy_links, ensure_path, layout_digest,
                        nar_hash, profile_layout, rename_no_replace)
 from collect_desktop_entries import collect
+from stage_launchers import merge_indexes
 
 MAX_PLAN = 16 * 1024 * 1024
 DESKTOP_UID = 1000
@@ -224,6 +225,9 @@ def prepare(nix, plan, previous, destination, legacy_paths):
         # Use relative store links in fake roots too, without confusing them
         # with the Gallery-installed relative links tracked above.
         link.symlink_to(target if nix == Path("/nix") else store_path)
+    launcher = destination / LAUNCHER
+    (destination / "share/applications").mkdir(parents=True, exist_ok=True)
+    collect(nix / "store", launcher, profile=destination, hardware=True, profile_only=True)
     for name, target in overlay.items():
         export = destination / name
         export.parent.mkdir(parents=True, exist_ok=True)
@@ -231,9 +235,7 @@ def prepare(nix, plan, previous, destination, legacy_paths):
         export.symlink_to(target)
     durable_text(destination / "manifest.tsv", "".join(
         "\t".join(row) + "\n" for row in sorted(manifest.values())))
-    launcher = destination / LAUNCHER
-    (destination / "share/applications").mkdir(parents=True, exist_ok=True)
-    collect(nix / "store", launcher, profile=destination, hardware=True)
+    merge_indexes(nix, destination, old / LAUNCHER, launcher)
     os.sync()
 
 

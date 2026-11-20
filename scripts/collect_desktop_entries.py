@@ -187,7 +187,7 @@ def main():
     collect(Path(sys.argv[1]), Path(sys.argv[2]))
 
 
-def collect(store_dir, output_dir, *, profile=None, hardware=False):
+def collect(store_dir, output_dir, *, profile=None, hardware=False, profile_only=False):
     if not store_dir.is_dir():
         raise ValueError(f"Store directory not found: {store_dir}")
     nix_dir = store_dir.parent
@@ -215,22 +215,24 @@ def collect(store_dir, output_dir, *, profile=None, hardware=False):
 
     # Scan for .desktop files
     profile_apps = profile/'share/applications'
-    desktop_files = (glob.glob(str(profile_apps/'*.desktop')) if profile_apps.is_dir()
+    desktop_files = (glob.glob(str(profile_apps/'*.desktop')) if profile_only or profile_apps.is_dir()
                      else glob.glob(os.path.join(store_dir, '*/share/applications/*.desktop')))
     print(f"Found {len(desktop_files)} .desktop files")
 
     entries = []
     seen_names = set()
 
-    for df in sorted(desktop_files):
+    # Files reserves its display name for Brook's default directory handler.
+    for df in sorted(desktop_files, key=lambda path: (Path(path).name != "org.gnome.Nautilus.desktop", path)):
         result = parse_desktop_file(df)
         if result is None:
             continue
 
         name, exec_cmd, icon_name, categories = result
 
-        # Deduplicate by name
-        if name in seen_names:
+        # Managed launchers use case-insensitive title ownership.
+        title_key = name.casefold() if profile_only else name
+        if title_key in seen_names:
             continue
 
         # Validate: check that the binary actually exists in the store.
@@ -254,7 +256,7 @@ def collect(store_dir, output_dir, *, profile=None, hardware=False):
             print(f"  Skip: {name} [{binary}] — binary not found in store")
             continue
 
-        seen_names.add(name)
+        seen_names.add(title_key)
 
         # Try to find and convert the icon
         icon_file = ""
@@ -262,7 +264,8 @@ def collect(store_dir, output_dir, *, profile=None, hardware=False):
             icon_path = find_icon(store_dir, icon_name)
             if icon_path:
                 safe_name = ''.join(c for c in icon_name.replace('/', '_').replace(' ', '_') if c.isascii() and (c.isalnum() or c in '-_'))
-                rgba_filename = f"{safe_name}.rgba"
+                rgba_filename = ("org.gnome.nautilus.rgba" if Path(df).stem == "org.gnome.Nautilus"
+                                 else f"{safe_name}.rgba")
                 rgba_path = os.path.join(icons_dir, rgba_filename)
                 if convert_icon_to_rgba(icon_path, rgba_path):
                     icon_file = rgba_filename
@@ -296,14 +299,14 @@ def collect(store_dir, output_dir, *, profile=None, hardware=False):
                 if guest_path(wrapper).is_file():
                     exec_cmd = wrapper
 
-        if binary_name == 'brook-nautilus':
+        if binary_name in ('brook-nautilus', 'brook-quake2'):
             exec_cmd = '--uid 1000 ' + exec_cmd
 
         entries.append((name, exec_cmd, icon_file, categories, Path(df).stem))
         print(f"  App: {name} [{exec_cmd}]")
 
     # Synthetic entries for games with a Brook play wrapper but no .desktop file.
-    for name, wrapper_exec, icon_file, categories, probe in EXTRA_ENTRIES:
+    for name, wrapper_exec, icon_file, categories, probe in (() if profile_only else EXTRA_ENTRIES):
         if name in seen_names:
             continue
         found = any(os.path.isfile(sp)
