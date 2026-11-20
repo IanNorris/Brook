@@ -52,11 +52,11 @@ int main()
     CHECK(Group(16).flags == 0 && Group(4).flags == 0 && Group(20).flags == 0);
     CHECK(Group(20).incarnation == 45 && Group(20).threads == 1 && Group(20).cpu_ms == 5);
 
-    CHECK(DesktopTaskMayEnd(1000, 16, 17, 1000, 1000, false));
-    CHECK(!DesktopTaskMayEnd(1000, 16, 1, 1000, 1000, false));
-    CHECK(!DesktopTaskMayEnd(1000, 16, 16, 1000, 1000, false));
-    CHECK(!DesktopTaskMayEnd(1000, 16, 17, 2000, 2000, false));
-    CHECK(!DesktopTaskMayEnd(1000, 16, 17, 1000, 0, false));
-    CHECK(!DesktopTaskMayEnd(1000, 16, 17, 1000, 1000, true));
+    CHECK(brook::DesktopTaskMayEnd(1000, 16, 17, 1000, 1000, false));
+    CHECK(!brook::DesktopTaskMayEnd(1000, 16, 1, 1000, 1000, false));
+    CHECK(!brook::DesktopTaskMayEnd(1000, 16, 16, 1000, 1000, false));
+    CHECK(!brook::DesktopTaskMayEnd(1000, 16, 17, 2000, 2000, false));
+    CHECK(!brook::DesktopTaskMayEnd(1000, 16, 17, 1000, 0, false));
+    CHECK(!brook::DesktopTaskMayEnd(1000, 16, 17, 1000, 1000, true));
     return failures != 0;
 }
