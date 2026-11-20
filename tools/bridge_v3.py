@@ -28,6 +28,7 @@ COMMAND, UPDATE, BULK, STORE = range(1, 5)
 READY, DATA, END = range(1, 4)
 CLIENT_MAGIC = b"BRKAUTH3"
 SERVER_MAGIC = b"BRKSRV3\0"
+SERVER_REFUSAL = b"BRKREFU3"
 VERSION = 3
 OPERATOR_SUITE = 1
 DEVICE_IDENTITY_SUITE = 2
@@ -50,6 +51,10 @@ class BridgeV3Error(ConnectionError):
 
 class BridgeV3NoChallenge(BridgeV3Error):
     """A connected peer failed to send any server challenge."""
+
+
+class BridgeV3Refused(BridgeV3Error):
+    """The device explicitly refused the pre-challenge handshake."""
 
 
 class BridgeV3BootMismatch(BridgeV3Error):
@@ -250,7 +255,15 @@ def open_bridge_v3(sock: socket.socket, key: SigningKey, protocol: int, operatio
                            secrets.token_bytes(32), crypto_scalarmult_base(private))
     sock.settimeout(_remaining(deadline))
     sock.sendall(client)
-    server = _receive(sock, SERVER.size, deadline, challenge=True)
+    prefix = _receive(sock, len(SERVER_MAGIC), deadline, challenge=True)
+    if prefix == SERVER_REFUSAL:
+        raise BridgeV3Refused("v3 operator admission refused")
+    if prefix != SERVER_MAGIC:
+        raise BridgeV3Error("unexpected v3 server challenge preface")
+    try:
+        server = prefix + _receive(sock, SERVER.size - len(prefix), deadline)
+    except (TimeoutError, BridgeV3Error) as exc:
+        raise BridgeV3Error("incomplete v3 server challenge") from exc
     actual_boot, peer_ephemeral = _server_hello(server, boot_id)
     try:
         shared = crypto_scalarmult(private, peer_ephemeral)

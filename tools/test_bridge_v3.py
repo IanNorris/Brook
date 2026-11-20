@@ -186,6 +186,17 @@ class BridgeV3(unittest.TestCase):
             self.assertEqual(errors, [])
             self.assertFalse(thread.is_alive())
 
+    def test_prechallenge_refusal_is_not_silence(self):
+        client, server = socket.socketpair()
+        with client, server:
+            server.sendall(wire.SERVER_REFUSAL)
+            with self.assertRaises(wire.BridgeV3Refused):
+                wire.open_bridge_v3(client, self.operator, wire.UPDATE, 1, self.boot, self.transaction)
+            self.assertEqual(len(read_bytes(server, wire.CLIENT.size)), wire.CLIENT.size)
+            server.setblocking(False)
+            with self.assertRaises(BlockingIOError):
+                server.recv(64)
+
     def test_partial_challenge_is_a_handshake_failure(self):
         client, server = socket.socketpair()
         with client, server:
