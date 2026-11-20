@@ -1268,16 +1268,22 @@ static const LauncherItem* TaskbarWindowItem(const Window& window, const Launche
     return ambiguous ? nullptr : byAppId;
 }
 
-static DesktopRect TaskbarPinMenuRect(uint32_t sw, uint32_t sh)
+bool WmTaskbarStatsContains(int32_t x, int32_t y, uint32_t sw, uint32_t sh)
 {
-    return ChromeWindowMenuRect(WmChromeStyle(), g_taskbarPinMenu.x, g_taskbarPinMenu.y, 1,
+    return !WmTaskbarHidden() && ChromeTaskbarStatsContains(GetTaskbarLayout(sw, sh), x, y);
+}
+
+static DesktopRect TaskbarContextMenuRect(uint32_t sw, uint32_t sh)
+{
+    return ChromeWindowMenuRect(WmChromeStyle(), g_taskbarContextMenu.x, g_taskbarContextMenu.y, 1,
                                 int(sw), int(WmDesktopHeight(sh)));
 }
 
-static bool TaskbarPinMenuValid(const LauncherSnapshot& catalog)
+static bool TaskbarContextMenuValid(const LauncherSnapshot& catalog)
 {
-    const auto& menu = g_taskbarPinMenu;
+    const auto& menu = g_taskbarContextMenu;
     if (!menu.open || WmTaskbarHidden()) return false;
+    if (menu.taskManager) return true;
     if ((g_launcherModel.DesktopPins().Find(menu.key) >= 0) != menu.pinned) return false;
     const auto* item = TaskbarCatalogItem(catalog, menu.key);
     if (!item) return false;
@@ -1287,45 +1293,55 @@ static bool TaskbarPinMenuValid(const LauncherSnapshot& catalog)
     return w.proc && w.visible && w.creationIdentity == menu.identity && TaskbarWindowItem(w, catalog) == item;
 }
 
-static bool TaskbarPinMenuPointer(uint32_t sw, uint32_t sh, int32_t x, int32_t y, bool pressed, int button)
+static bool TaskbarContextMenuPointer(uint32_t sw, uint32_t sh, int32_t x, int32_t y, bool pressed, int button)
 {
-    if (g_taskbarPinMenu.open) {
-        LauncherReadGuard reader;
-        VfbGuard guard;
-        if (!TaskbarPinMenuValid(reader.get())) { TaskbarPinMenuCloseLocked(); return false; }
-        if (!pressed) return true;
-        auto& menu = g_taskbarPinMenu;
-        const auto rect = TaskbarPinMenuRect(sw, sh);
-        if (!button && ChromeTrayMenuRowRect(WmChromeStyle(), rect, 0).contains(x, y)) {
-            if (g_launcherModel.DesktopPins().Toggle(menu.key)) TaskbarNotePins();
+    if (g_taskbarContextMenu.open) {
+        bool openTaskManager = false;
+        {
+            LauncherReadGuard reader;
+            VfbGuard guard;
+            if (!TaskbarContextMenuValid(reader.get())) { TaskbarContextMenuCloseLocked(); return false; }
+            if (!pressed) return true;
+            auto& menu = g_taskbarContextMenu;
+            const auto rect = TaskbarContextMenuRect(sw, sh);
+            if (!button && ChromeTrayMenuRowRect(WmChromeStyle(), rect, 0).contains(x, y)) {
+                if (menu.taskManager) openTaskManager = true;
+                else if (g_launcherModel.DesktopPins().Toggle(menu.key)) TaskbarNotePins();
+            }
+            TaskbarContextMenuCloseLocked();
         }
-        TaskbarPinMenuCloseLocked();
+        if (openTaskManager) WmOpenTaskManager();
         return true;
     }
     if (!pressed || button != 1 || WmWindowMenuOpen() || WmLauncherVisible() || WmTaskbarHidden() ||
         y < int32_t(WmTaskbarTop(sh))) return false;
-    const int target = WmTaskbarHitTest(x, y, sw, sh);
-    const int pin = TaskbarPinIndex(target);
-    if (pin < 0 && (target < 0 || target >= int(WM_MAX_WINDOWS))) return false;
-    if (GetTaskbarLayout(sw, sh).next.contains(x, y)) return false;
-    LauncherReadGuard reader;
-    const auto& catalog = reader.get();
+    const auto layout = GetTaskbarLayout(sw, sh);
+    const bool taskManager = ChromeTaskbarStatsContains(layout, x, y);
     {
+        LauncherReadGuard reader;
         VfbGuard guard;
-        const Window* w = pin >= 0 ? nullptr : &g_windows[target];
-        if (w && (!w->proc || !w->visible)) return false;
-        const auto* item = w ? TaskbarWindowItem(*w, catalog) : TaskbarPinItem(catalog, unsigned(pin));
-        const char* key = item ? TaskbarKeyForItem(catalog, item) : nullptr;
-        if (!key) return false;
-        g_taskbarPinMenu = {};
-        auto& menu = g_taskbarPinMenu;
-        WmStrCopy(menu.key, key, sizeof(menu.key));
-        menu.window = w ? target : -1;
-        menu.identity = w ? w->creationIdentity : 0;
+        TaskbarContextMenuState menu{};
+        menu.taskManager = taskManager;
+        if (!taskManager) {
+            const int target = WmTaskbarHitTest(x, y, sw, sh);
+            const int pin = TaskbarPinIndex(target);
+            if (pin < 0 && (target < 0 || target >= int(WM_MAX_WINDOWS))) return false;
+            if (layout.next.contains(x, y)) return false;
+            const auto& catalog = reader.get();
+            const Window* w = pin >= 0 ? nullptr : &g_windows[target];
+            if (w && (!w->proc || !w->visible)) return false;
+            const auto* item = w ? TaskbarWindowItem(*w, catalog) : TaskbarPinItem(catalog, unsigned(pin));
+            const char* key = item ? TaskbarKeyForItem(catalog, item) : nullptr;
+            if (!key) return false;
+            WmStrCopy(menu.key, key, sizeof(menu.key));
+            menu.window = w ? target : -1;
+            menu.identity = w ? w->creationIdentity : 0;
+            menu.pinned = g_launcherModel.DesktopPins().Find(key) >= 0;
+        }
         menu.x = x;
         menu.y = y;
-        menu.pinned = g_launcherModel.DesktopPins().Find(key) >= 0;
         menu.open = true;
+        g_taskbarContextMenu = menu;
     }
     const auto& tray = ShellServiceTrayState();
     if (tray.menuOwner && !WmTaskbarPopupPinned())
@@ -1364,15 +1380,15 @@ void WmGetShellTrayGeometry(uint32_t sw, uint32_t sh, int32_t x, int32_t y, WmSh
         out.menu = out.windowMenu = out.popup.w > 0;
         return;
     }
-    if (g_taskbarPinMenu.open) {
+    if (g_taskbarContextMenu.open) {
         LauncherReadGuard reader;
         VfbGuard guard;
-        if (TaskbarPinMenuValid(reader.get())) {
-            out.popup = TaskbarPinMenuRect(sw, sh);
+        if (TaskbarContextMenuValid(reader.get())) {
+            out.popup = TaskbarContextMenuRect(sw, sh);
             out.menu = out.windowMenu = out.popup.w > 0;
             return;
         }
-        TaskbarPinMenuCloseLocked();
+        TaskbarContextMenuCloseLocked();
     }
     if (!tray.itemCount || WmTaskbarHidden() || WmLauncherVisible() ||
         WmVolumePopupVisible() || WmTrayFlyoutVisible()) return;
@@ -1410,7 +1426,7 @@ bool WmShellTrayPointer(uint32_t sw, uint32_t sh, int32_t x, int32_t y,
                        bool pressed, int button, int scroll)
 {
     if (WindowMenuPointer(sw, sh, x, y, pressed, button) ||
-        TaskbarPinMenuPointer(sw, sh, x, y, pressed, button)) return true;
+        TaskbarContextMenuPointer(sw, sh, x, y, pressed, button)) return true;
     const auto& tray = ShellServiceTrayState();
     if (!tray.itemCount && !tray.notice.id) return false;
     WmShellTrayGeometry geometry{};
@@ -1474,15 +1490,16 @@ static void WmCaptureAppTray(const WmShellSurface& surface, uint32_t sw, uint32_
             for (uint32_t i = 0; i < g_windowMenu.count; ++i) model.tray.menu[i] = g_windowMenu.rows[i];
             return;
         }
-        if (g_taskbarPinMenu.open) {
+        if (g_taskbarContextMenu.open) {
             LauncherReadGuard reader;
             VfbGuard guard;
-            if (!TaskbarPinMenuValid(reader.get())) { model.kind = ChromeShellKind::None; return; }
+            if (!TaskbarContextMenuValid(reader.get())) { model.kind = ChromeShellKind::None; return; }
             model.tray.menuCount = 1;
             auto& row = model.tray.menu[0];
+            if (g_taskbarContextMenu.taskManager) { row = ChromeTaskManagerMenuRow; return; }
             row.id = 1;
-            row.enabled = g_taskbarPinMenu.pinned || g_launcherModel.DesktopPins().Count() < TaskbarPins::Capacity;
-            WmStrCopy(row.label, g_taskbarPinMenu.pinned ? "Unpin from taskbar" : "Pin to taskbar", sizeof(row.label));
+            row.enabled = g_taskbarContextMenu.pinned || g_launcherModel.DesktopPins().Count() < TaskbarPins::Capacity;
+            WmStrCopy(row.label, g_taskbarContextMenu.pinned ? "Unpin from taskbar" : "Pin to taskbar", sizeof(row.label));
             return;
         }
         model.popupPinnable = true;

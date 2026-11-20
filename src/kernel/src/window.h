@@ -513,6 +513,7 @@ bool WmTaskbarSystemPopupModal();
 bool WmTaskbarPopupDismissible();
 void WmTaskbarPopupDismiss();
 void WmTaskbarPopupForgetMenu();
+bool WmTaskbarStatsContains(int32_t mx, int32_t my, uint32_t width, uint32_t height);
 bool WmTaskbarPopupPointerOwned(int32_t mx, int32_t my, uint32_t width, uint32_t height);
 bool WmPerformanceHudPress(int32_t mx, int32_t my, uint32_t width, uint32_t height);
 enum class DesktopStatsPanel : uint8_t;
@@ -609,6 +610,7 @@ int WmCycleFocus();
 // Spawn a new terminal window (Super+Enter handler).
 int WmSpawnTerminal();
 void WmOpenFiles();
+void WmOpenTaskManager();
 
 // ---------------------------------------------------------------------------
 // Per-window VFB API (Phase A of wayland↔WM unification).

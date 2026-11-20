@@ -1152,7 +1152,7 @@ int main() {
         auto pin = button(TaskbarPinBase);
         CHECK(pin.w > 0 && WmTaskbarHitTest(pin.x, pin.y, sw, sh) == TaskbarPinBase);
         CHECK(WmShellTrayPointer(sw, sh, pin.x + 2, pin.y + 2, true, 1, 0));
-        CHECK(g_taskbarPinMenu.open && g_taskbarPinMenu.pinned && g_taskbarPinMenu.window < 0);
+        CHECK(g_taskbarContextMenu.open && g_taskbarContextMenu.pinned && g_taskbarContextMenu.window < 0);
         WmWindowMenuClose();
 
         auto* clients = static_cast<Process*>(std::calloc(3, sizeof(Process)));
@@ -1183,13 +1183,13 @@ int main() {
 
         const auto edit = button(ids[2]);
         CHECK(WmShellTrayPointer(sw, sh, edit.x + 2, edit.y + 2, true, 1, 0));
-        CHECK(g_taskbarPinMenu.open && g_taskbarPinMenu.window == ids[2] && !g_taskbarPinMenu.pinned);
-        const auto menu = TaskbarPinMenuRect(sw, sh);
+        CHECK(g_taskbarContextMenu.open && g_taskbarContextMenu.window == ids[2] && !g_taskbarContextMenu.pinned);
+        const auto menu = TaskbarContextMenuRect(sw, sh);
         const auto row = ChromeTrayMenuRowRect(WmChromeStyle(), menu, 0);
         const auto original = g_windows[ids[2]].creationIdentity;
         ++g_windows[ids[2]].creationIdentity;
         CHECK(!WmShellTrayPointer(sw, sh, row.x + 4, row.y + 4, true, 0, 0));
-        CHECK(!g_taskbarPinMenu.open && g_launcherModel.DesktopPins().Count() == 1);
+        CHECK(!g_taskbarContextMenu.open && g_launcherModel.DesktopPins().Count() == 1);
         g_windows[ids[2]].creationIdentity = original;
         CHECK(WmShellTrayPointer(sw, sh, edit.x + 2, edit.y + 2, true, 1, 0));
         CHECK(WmShellTrayPointer(sw, sh, row.x + 4, row.y + 4, true, 0, 0));
@@ -1796,6 +1796,90 @@ int main() {
         WmOpenFiles();
         CHECK(g_focusedIdx == idx && w.focused && !w.minimized);
         WmDestroyWindowById(&files, w.wmId);
+    }
+    // Task Manager shares the tray menu surface and the ordinary launch queue.
+    {
+        constexpr uint32_t sw = 1600, sh = 900;
+        const uint32_t saved = WmGetTaskbarMetrics();
+        CHECK(WmSetTaskbarMetrics(127));
+        SetWmActiveLocked(true);
+        g_launcherWorkerStarted = true;
+        const auto layout = GetTaskbarLayout(sw, sh);
+        for (unsigned metric : {0, 1, 4, 5}) {
+            const auto anchor = layout.metrics[metric];
+            CHECK(anchor.w > 0 && WmTaskbarStatsContains(anchor.x, anchor.y, sw, sh));
+            CHECK(!WmShellTrayPointer(sw, sh, anchor.x, anchor.y, true, 0, 0));
+            CHECK(!WmWindowMenuOpen());
+            CHECK(WmShellTrayPointer(sw, sh, anchor.x, anchor.y, true, 1, 0));
+            CHECK(WmWindowMenuOpen());
+            WmShellTrayGeometry geometry{};
+            WmGetShellTrayGeometry(sw, sh, anchor.x, anchor.y, geometry);
+            CHECK(geometry.menu && geometry.windowMenu && geometry.popup.w > 0);
+            WmShellSurface surface{};
+            surface.kind = WmShellSurfaceKind::AppTrayMenu;
+            surface.x = geometry.popup.x;
+            surface.y = geometry.popup.y;
+            surface.w = geometry.popup.w;
+            surface.h = geometry.popup.h;
+            static ChromeShellModel snapshot{};
+            CHECK(WmCaptureShellModel(surface, sw, sh, 0, -1, -1, snapshot));
+            CHECK(snapshot.tray.menuCount == 1 && snapshot.tray.menu[0].enabled &&
+                  !strcmp(snapshot.tray.menu[0].label, "Task Manager"));
+            if (metric == 4) WmWindowMenuClose();
+            else if (metric == 5) {
+                const auto row = ChromeTrayMenuRowRect(WmChromeStyle(), geometry.popup, 0);
+                CHECK(WmShellTrayPointer(sw, sh, row.x + 2, row.y + 2, true, 0, 0));
+            } else CHECK(WmShellTrayPointer(sw, sh, 0, 0, true, 0, 0));
+            CHECK(!WmWindowMenuOpen());
+        }
+        const auto disk = layout.metrics[2];
+        CHECK(!ChromeTaskbarStatsContains(layout, disk.x, disk.y));
+        const auto cpu = layout.metrics[0];
+        CHECK(WmTrayFlyoutPress(cpu.x, cpu.y, sw, sh));
+        const auto cpuPopup = WmStatsPopupLayout(sw, sh, DesktopStatsPanel::CpuMemory);
+        CHECK(WmTrayFlyoutPress(cpuPopup.pin.x, cpuPopup.pin.y, sw, sh));
+        CHECK(WmTaskbarPopupPinned());
+        CHECK(WmShellTrayPointer(sw, sh, cpu.x, cpu.y, true, 1, 0));
+        WmWindowMenuClose();
+        CHECK(WmTaskbarPopupPinned() && WmTrayFlyoutVisible());
+        CHECK(WmTrayFlyoutPress(cpuPopup.pin.x, cpuPopup.pin.y, sw, sh));
+        WmTrayFlyoutClose();
+
+        unsigned admitted = 0;
+        uint64_t launchToken = 0;
+        CHECK(g_launcherActive == &g_emptyLauncher);
+        WmOpenTaskManager();
+        for (unsigned i = 0; i < LaunchFeedbackTable::Capacity; ++i) {
+            const auto& entry = g_launches.entries[i];
+            if (entry.phase != LaunchPhase::Queued) continue;
+            ++admitted;
+            launchToken = entry.token;
+            CHECK(!strcmp(entry.appId, TaskManagerAppId));
+            CHECK(g_launchRequests[i].desktop && !g_launchRequests[i].userDesktop);
+            CHECK(!strcmp(g_launchRequests[i].command,
+                          "--uid 1000 /nix/profile/bin/brook-run /nix/profile/bin/brook-task-manager"));
+        }
+        CHECK(admitted == 1 && launchToken != 0);
+        static Process manager{};
+        manager.pid = manager.tgid = 100;
+        manager.incarnation = 100;
+        const int idx = WmCreateWindow(&manager, 10, 10, 300, 200, "CPU and memory");
+        CHECK(idx >= 0);
+        auto& window = g_windows[idx];
+        WmStrCopy(window.appId, TaskManagerAppId, sizeof(window.appId));
+        WmMinimizeWindow(idx);
+        CHECK(window.minimized);
+        WmOpenTaskManager();
+        CHECK(g_focusedIdx == idx && window.focused && !window.minimized);
+        CHECK(WmDockWindow(idx) && WmDockDismiss() && !WmDockOpen());
+        WmOpenTaskManager();
+        CHECK(WmDockOpen() && g_focusedIdx == idx && window.focused && window.docked);
+        WmDestroyWindowById(&manager, window.wmId);
+        for (auto& entry : g_launches.entries)
+            if (entry.token == launchToken) entry = {};
+        g_launcherWorkerStarted = g_launchBusy = false;
+        g_taskbarPageTarget = -1;
+        CHECK(WmSetTaskbarMetrics(saved));
     }
     std::puts("WINDOW_SURFACES PASS: stale slot, GL/SHM transition, destruction, reuse, owned geometry, chrome and fullscreen");
 }

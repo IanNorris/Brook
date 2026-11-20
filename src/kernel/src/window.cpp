@@ -2730,13 +2730,21 @@ bool WmCaptureShellModel(const WmShellSurface& s, uint32_t screenW, uint32_t scr
     return model.kind != ChromeShellKind::None;
 }
 
+static int AdmitLauncherRequest(const LauncherItem&, uint32_t, bool, uint64_t*, bool*);
+
 static int AdmitLauncherItem(const LauncherSnapshot& catalog,int itemIdx,bool tracked,
                              uint64_t* token,bool* coalesced)
 {
     if(itemIdx<0||itemIdx>=static_cast<int>(catalog.count)||!catalog.items[itemIdx].valid)return -2;
+    return AdmitLauncherRequest(catalog.items[itemIdx], catalog.generation, tracked, token, coalesced);
+}
+
+static int AdmitLauncherRequest(const LauncherItem& item, uint32_t generation, bool tracked,
+                                uint64_t* token, bool* coalesced)
+{
     LauncherStartWorker();
     if(!__atomic_load_n(&g_launcherWorkerStarted,__ATOMIC_ACQUIRE))return -12;
-    const auto& item=catalog.items[itemIdx];int slot;
+    int slot;
     SpinLockAcquire(&g_launchLock);
     if(g_launchInhibited){SpinLockRelease(&g_launchLock);return -108;}
     uint64_t pending=0;
@@ -2745,7 +2753,7 @@ static int AdmitLauncherItem(const LauncherSnapshot& catalog,int itemIdx,bool tr
     if(tracked&&!g_launchHistory.CanTrack(pending)){SpinLockRelease(&g_launchLock);return -28;}
     bool created=false;
     slot=g_launches.Begin(ApicTickCount(),__atomic_load_n(&g_windowIdentity,__ATOMIC_ACQUIRE),
-        item.title,item.appId,item.executable,item.catalogId,item.specification,&created,catalog.generation);
+        item.title,item.appId,item.executable,item.catalogId,item.specification,&created,generation);
     if(slot>=0) {
         const auto& entry=g_launches.entries[slot];*token=entry.token;*coalesced=!created;
         if(created) {
@@ -2816,26 +2824,29 @@ void WmLauncherExec(int itemIdx)
     AdmitLauncherItem(guard.get(),itemIdx,false,&token,&coalesced);
 }
 
+static bool FocusDesktopApp(const char* appId)
+{
+    VfbGuard guard;
+    int best = -1;
+    for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i) {
+        const auto& window = g_windows[i];
+        if (window.proc && window.visible && window.focusable && !strcmp(window.appId, appId) &&
+            (best < 0 || window.zOrder > g_windows[best].zOrder))
+            best = static_cast<int>(i);
+    }
+    if (best < 0) return false;
+    if (g_windows[best].docked && DockActivateWindowLocked(best)) return true;
+    if (g_windows[best].minimized) RestoreWindowLocked(best);
+    else FocusWindowLocked(best);
+    CompositorMarkDirty();
+    return true;
+}
+
 void WmOpenFiles()
 {
     if (!WmIsActive() || !ShutdownLaunchAllowed()) return;
     WmLauncherClose();
-    {
-        VfbGuard guard;
-        int best = -1;
-        for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i) {
-            const auto& w = g_windows[i];
-            if (w.proc && w.visible && w.focusable && !strcmp(w.appId, LauncherFilesAppId) &&
-                (best < 0 || w.zOrder > g_windows[best].zOrder))
-                best = static_cast<int>(i);
-        }
-        if (best >= 0) {
-            if (g_windows[best].minimized) RestoreWindowLocked(best);
-            else FocusWindowLocked(best);
-            CompositorMarkDirty();
-            return;
-        }
-    }
+    if (FocusDesktopApp(LauncherFilesAppId)) return;
     LauncherReadGuard guard;
     const auto& catalog = guard.get();
     for (uint32_t i = 0; i < catalog.count; ++i) {
@@ -2846,6 +2857,39 @@ void WmOpenFiles()
         return;
     }
     CompositorMarkDirty();
+}
+
+static constexpr char TaskManagerAppId[] = "org.brook.TaskManager";
+static constexpr char TaskManagerCommand[] =
+    "--uid 1000 /nix/profile/bin/brook-run /nix/profile/bin/brook-task-manager";
+
+void WmOpenTaskManager()
+{
+    if (!WmIsActive() || !ShutdownLaunchAllowed()) return;
+    WmLauncherClose();
+    WmWindowMenuClose();
+    WmTaskbarPopupDismiss();
+    if (FocusDesktopApp(TaskManagerAppId)) return;
+    LauncherReadGuard reader;
+    const auto& catalog = reader.get();
+    uint64_t token = 0;
+    bool coalesced = false;
+    for (uint32_t i = 0; i < catalog.count; ++i) {
+        const auto& item = catalog.items[i];
+        if (!item.valid || !item.isDesktopEntry || item.isUserDesktopEntry || strcmp(item.appId, TaskManagerAppId))
+            continue;
+        AdmitLauncherItem(catalog, int(i), false, &token, &coalesced);
+        return;
+    }
+    // The system-wide shortcut also works before the profile index is refreshed.
+    LauncherItem item{};
+    item.valid = item.isDesktopEntry = true;
+    WmStrCopy(item.title, ChromeTaskManagerMenuRow.label, sizeof(item.title));
+    WmStrCopy(item.appId, TaskManagerAppId, sizeof(item.appId));
+    WmStrCopy(item.executable, "brook-task-manager", sizeof(item.executable));
+    WmStrCopy(item.scriptPath, TaskManagerCommand, sizeof(item.scriptPath));
+    IdentifyLauncherItem(catalog, 0, item);
+    AdmitLauncherRequest(item, catalog.generation, false, &token, &coalesced);
 }
 
 int WmLauncherActivate(const char* appId,uint32_t generation,uint64_t* token,bool* coalesced)

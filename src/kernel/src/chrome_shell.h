@@ -64,6 +64,14 @@ struct ChromeTaskbarLayout {
     char clockText[32], clockDate[24], buildText[32];
 };
 
+inline bool ChromeTaskbarStatsContains(const ChromeTaskbarLayout& layout, int x, int y)
+{
+    return layout.metrics[0].contains(x, y) || layout.metrics[1].contains(x, y) ||
+           layout.metrics[4].contains(x, y) || layout.metrics[5].contains(x, y);
+}
+
+inline constexpr ChromeTrayMenuRow ChromeTaskManagerMenuRow{1, "Task Manager", true, false, false};
+
 // ids: the taskbar entries in order (WM window indices, or -10 - launch
 // slot); focused selects the page. agent: the agent indicator is shown.
 // labels (optional, total entries): each entry's label; buttons are sized to
