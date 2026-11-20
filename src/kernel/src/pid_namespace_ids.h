@@ -21,6 +21,7 @@ struct PidNamespaceIds {
 
     Entry entries[MaxDepth]{};
     unsigned count = 0;
+    bool published = false;
 
     const PidNamespace* Active() const {
         return count ? entries[count - 1].ns : nullptr;

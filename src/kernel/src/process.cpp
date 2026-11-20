@@ -196,7 +196,6 @@ static inline void FreeProcessStruct(Process* p)
         }
 
         SeccompRelease(SeccompLoad(p));
-        ProcessPidRelease(p);
         ProcessFsClear(p);
         ProcessNamespacesRelease(p);
         ProcessGroupsRelease(p->groups); p->groups = nullptr;
@@ -204,6 +203,7 @@ static inline void FreeProcessStruct(Process* p)
         MappingBackingUnref(p->fbBacking);p->fbBacking=nullptr;
         AddressSpaceUnref(p->addressSpace);
         p->addressSpace = nullptr;
+        ProcessPidRelease(p);
         p->magic = 0;
     }
     kfree(p);

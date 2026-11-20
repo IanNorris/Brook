@@ -50,6 +50,31 @@ where shared user data contains its visible TID, and apply explicit
 ownership checks before following that number. An unsupported interface
 must fail explicitly if a namespace-safe interpretation is unavailable.
 
+## Implementation boundaries
+
+Brook accepts fork-style PID namespace creation through clone and clone3,
+with SIGCHLD and compatible namespace flags. Standalone unshare(CLONE_NEWPID)
+selects the namespace for future children. Joining arbitrary PID namespaces
+through setns and PID file descriptors remains unsupported.
+
+The active PID namespace must have a live init group before another member
+can start. When the last init thread exits, it closes admission and the
+scheduler kills descendants. The ancestor's wait remains pending until
+descendant task records have retired their resources. An in-namespace
+subreaper or init adopts orphans while that namespace is still running.
+
+Fresh proc mounts require authority over the PID namespace's user owner
+and an existing complete, reachable proc mount with a compatible view.
+The new mount inherits the source's restrictions. This permits an inherited
+ancestor view to authorize a narrower mount and preserves existing masks
+and read-only attachments.
+
+Robust futex owner words use the task's local TID. Shared PI futex waiters
+must use the same active PID namespace because the owner word has one
+numeric representation. Exec from a nonleader thread inside a private PID
+namespace currently returns EOPNOTSUPP. It requires preserving Linux's
+thread-group leader identity across exec.
+
 ## Validation
 
 - Compare parent, nested and sibling namespaces for self, parent, thread,

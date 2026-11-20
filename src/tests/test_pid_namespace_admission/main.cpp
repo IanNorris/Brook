@@ -45,6 +45,7 @@ int main()
     const auto* nested = ProcessPidView(&sibling);
     assert(ProcessVisibleTgid(&sibling, view) == 3 && ProcessVisibleTgid(&sibling, nested) == 1);
     assert(ProcessVisibleTgid(&init, nested) == 0);
+    assert(PidNamespaceTaskCount(view) == 3 && PidNamespaceTaskCount(nested) == 1);
     assert(PidNamespaceContains(nullptr, nested) && PidNamespaceContains(view, nested));
     assert(PidNamespaceContains(nested, nested) && !PidNamespaceContains(nested, view));
 
@@ -54,6 +55,7 @@ int main()
     assert(!PidNamespaceStopBirths(view));
     assert(!ProcessPidPublish(&child));
     ProcessPidRelease(&child);
+    assert(PidNamespaceTaskCount(view) == 3 && PidNamespaceTaskCount(nested) == 1);
     Process childAfterExit{};
     assert(ProcessPidPrepareChild(&childAfterExit, &sibling, false) == -12);
 
@@ -70,6 +72,7 @@ int main()
     // A retained proc view pins both namespaces independently of the tasks.
     PidNamespaceRetain(nested);
     ProcessPidRelease(&sibling);
+    assert(PidNamespaceTaskCount(view) == 2 && PidNamespaceTaskCount(nested) == 0);
     ProcessPidRelease(&worker);
     ProcessPidRelease(&init);
     ProcessPidRelease(&outer);

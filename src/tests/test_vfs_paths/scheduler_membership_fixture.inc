@@ -36,7 +36,7 @@ Process* current=nullptr;
 Process* SchedulerCurrentProcess() {return current;}
 void SchedulerMarkTerminated(Process*,int);
 void InheritSeccompForBirth(Process*, Process*) {assert(g_allProcLock.held);}
-bool ProcessPidPublish(Process*) {assert(g_allProcLock.held);return true;}
+bool ProcessPidPublish(Process*, bool) {assert(g_allProcLock.held);return true;}
 #include "../../kernel/src/scheduler_process_birth.inc"
 #include "../../kernel/src/scheduler_process_terminal.inc"
 

@@ -22,7 +22,7 @@ void PidNamespaceRelease(const PidNamespace* view);
 // An unpublished birth owns both its active view and the initial view for its
 // future children. Publish with the scheduler registry locked.
 int ProcessPidPrepareChild(Process* child, const Process* parent, bool newNamespace);
-bool ProcessPidPublish(Process* process);
+bool ProcessPidPublish(Process* process, bool runnable = true);
 void ProcessPidRelease(Process* process);
 
 // Delayed reports (e.g. queued SCM_CREDENTIALS) may outlive the task and
@@ -44,5 +44,6 @@ int ProcessPidUnshare(Process* process);
 bool ProcessPidIsNamespaceInit(const Process* process);
 bool PidNamespaceStopBirths(const PidNamespace* view);
 bool PidNamespaceDraining(const PidNamespace* view);
+uint32_t PidNamespaceTaskCount(const PidNamespace* view);
 void PidNamespaceFinishDrain(const PidNamespace* view);
 }

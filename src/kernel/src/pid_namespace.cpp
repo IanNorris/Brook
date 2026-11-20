@@ -12,6 +12,7 @@ struct PidNamespace {
     mutable uint32_t references;
     unsigned depth;
     uint32_t next;
+    mutable uint32_t tasks;
     bool initPublished;
     bool dying;
     bool draining;
@@ -30,7 +31,7 @@ PidNamespace* Create(const PidNamespace* parent, Process* ownerTask)
     const uint64_t tag = __atomic_fetch_add(&nextViewTag, 1, __ATOMIC_RELAXED);
     if (!tag) __builtin_trap();
     *ns = {parent, ProcessUserNamespaceAcquire(ownerTask), tag, 1,
-           parent ? parent->depth + 1 : 1, 1, false, false, false};
+           parent ? parent->depth + 1 : 1, 1, 0, false, false, false};
     return ns;
 }
 
@@ -159,7 +160,7 @@ int ProcessPidPrepareChild(Process* child, const Process* parent, bool newNamesp
     return 0;
 }
 
-bool ProcessPidPublish(Process* process)
+bool ProcessPidPublish(Process* process, bool runnable)
 {
     const auto* active = ProcessPidView(process);
     if (!active) return true;
@@ -167,8 +168,14 @@ bool ProcessPidPublish(Process* process)
     bool live = true;
     for (const auto* view = active; view; view = view->parent)
         if (view->dying) live = false;
-    if (live && ProcessVisibleTid(process, active) == 1)
-        const_cast<PidNamespace*>(active)->initPublished = true;
+    if (live) {
+        if (process->pidNamespaceIds.published) __builtin_trap();
+        process->pidNamespaceIds.published = true;
+        for (const auto* view = active; view; view = view->parent)
+            __atomic_add_fetch(&view->tasks, 1, __ATOMIC_RELAXED);
+        if (runnable && ProcessVisibleTid(process, active) == 1)
+            const_cast<PidNamespace*>(active)->initPublished = true;
+    }
     IrqSpinLockRelease(&pidViewLock, flags);
     return live;
 }
@@ -181,6 +188,10 @@ void ProcessPidRelease(Process* process)
         if (!active->initPublished && !active->dying)
             const_cast<PidNamespace*>(active)->next = 1;
         IrqSpinLockRelease(&pidViewLock, flags);
+    }
+    if (process->pidNamespaceIds.published) {
+        for (const auto* view = active; view; view = view->parent)
+            __atomic_sub_fetch(&view->tasks, 1, __ATOMIC_RELEASE);
     }
     PidNamespaceRelease(process->pidNamespaceForChildren);
     PidNamespaceRelease(active);
@@ -227,6 +238,11 @@ bool PidNamespaceStopBirths(const PidNamespace* view)
 bool PidNamespaceDraining(const PidNamespace* view)
 {
     return view && __atomic_load_n(&view->draining, __ATOMIC_ACQUIRE);
+}
+
+uint32_t PidNamespaceTaskCount(const PidNamespace* view)
+{
+    return __atomic_load_n(&view->tasks, __ATOMIC_ACQUIRE);
 }
 
 void PidNamespaceFinishDrain(const PidNamespace* view)

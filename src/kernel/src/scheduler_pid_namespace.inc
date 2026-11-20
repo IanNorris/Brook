@@ -37,7 +37,9 @@ static void DrainPidNamespaces()
                 break;
             }
         }
-        if (!hasDescendants) {
+        // The reaper unlinks a task before the cleanup worker releases its
+        // descriptors. Keep PID 1 un-waitable until those leases are retired.
+        if (!hasDescendants && PidNamespaceTaskCount(view) == 1) {
             PidNamespaceFinishDrain(view);
             __atomic_sub_fetch(&g_pidNamespaceDrains, 1, __ATOMIC_RELEASE);
             NotifyExitedParentLocked(init);
