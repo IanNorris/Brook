@@ -1,4 +1,4 @@
-"""Exercise the packaged v3 command and bulk receivers in a disposable guest."""
+"""Exercise the four packaged v3 receivers in a disposable guest."""
 
 import hashlib
 import json
@@ -64,6 +64,19 @@ def refuse_plaintext(port):
         connection.sendall(b"@42 bridge hardware logs 0 1\n")
         if connection.recv(1):
             raise RuntimeError("Guarded v3 listener replied to a plaintext non-caps command")
+
+
+def check_operator_refusal(port):
+    from nacl.signing import SigningKey
+    from bridge_v3 import BridgeV3Refused, COMMAND, ZERO_ID, open_bridge_v3
+
+    with socket.create_connection(("127.0.0.1", port), timeout=3) as connection:
+        try:
+            open_bridge_v3(connection, SigningKey.generate(), COMMAND, 0, ZERO_ID,
+                           uuid.uuid4().bytes)
+        except BridgeV3Refused:
+            return
+    raise RuntimeError("Guarded v3 listener admitted an unknown operator")
 
 
 def check_maintenance_receiver(bridge, output, session, boot_id, port, seed, store):
@@ -144,6 +157,7 @@ def run(output, registry, ports, seed, expected):
             public.get("auth_version") != 3 or protected_fields & public.keys()):
         raise RuntimeError("Public boot caps leaked protected evidence or described another boot")
     refuse_plaintext(command_port)
+    check_operator_refusal(command_port)
 
     session = attachment["session"]
     logs = bridge.command(session, "bridge hardware logs 0 1")
@@ -187,6 +201,7 @@ def run(output, registry, ports, seed, expected):
         "protected_command": "bridge hardware logs 0 1",
         "public_caps_protected_fields_absent": True,
         "plaintext_non_caps_refused": True,
+        "unknown_operator_refused_before_challenge": True,
         "bytes": expected_bytes,
         "sha256": expected_sha,
         "compressed_chunks": decoder.call_count,
