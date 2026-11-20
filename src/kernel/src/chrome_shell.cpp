@@ -626,10 +626,10 @@ static void DockReturnGlyph(ChromeDisplayList& dl, const ChromeStyle& s, int x0,
     };
     box(2, 3, 2, 10);  // the edge being left
     box(6, 7, 8, 2);   // shaft
-    box(10, 4, 2, 2);  // head
-    box(12, 6, 2, 1);
-    box(12, 9, 2, 1);
-    box(10, 10, 2, 2);
+    for (int k = 0; k < 4; ++k) { // head: two diagonals meeting at the tip
+        box(9 + k, 3 + k, 2, 1);
+        box(9 + k, 12 - k, 2, 1);
+    }
     (void)s;
 }
 

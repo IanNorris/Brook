@@ -2295,28 +2295,37 @@ static void CaptureDesktopOverlay(const ShellFrame& frame,uint64_t now,int32_t m
             }
         }
     }
-    if (rectCount > WM_SHELL_SURFACE_LIMIT) {
-        // The legacy cursor-in-overlay capture has a fixed band budget.
-        // Merge the cursor with its nearest rectangle, carrying along the
-        // transparent space between them.
-        const auto cursor = rects[--rectCount];
-        DesktopOverlayRect best{};
+    // The legacy overlay capture has a fixed band budget: at most four
+    // rectangles (seven bands). Merge the pair whose bounding box adds the
+    // least area (the cursor with its nearest surface, or the dock with a
+    // neighbour while five shell surfaces show), carrying along the
+    // transparent space between them. Merged rectangles are unkeyed.
+    constexpr uint32_t bandRects = 4;
+    while (rectCount > bandRects) {
         uint64_t bestCost = ~uint64_t(0);
-        unsigned bestIndex = 0;
-        for (unsigned i = 0; i < rectCount; ++i) {
-            const auto r = rects[i];
-            const int x = r.x < cursor.x ? r.x : cursor.x;
-            const int y = r.y < cursor.y ? r.y : cursor.y;
-            const int right = r.x + int(r.width), cursorRight = cursor.x + int(cursor.width);
-            const int bottom = r.y + int(r.height), cursorBottom = cursor.y + int(cursor.height);
-            const uint32_t w = (right > cursorRight ? right : cursorRight) - x;
-            const uint32_t h = (bottom > cursorBottom ? bottom : cursorBottom) - y;
-            const uint64_t cost = uint64_t(w) * h - uint64_t(r.width) * r.height;
-            if (cost < bestCost) { bestCost = cost; best = {x, y, w, h}; bestIndex = i; }
-        }
-        rects[bestIndex] = best;
-        keys[bestIndex] = 0;
-        opaqueRects &= ~(1u << bestIndex);
+        unsigned bestI = 0, bestJ = 1;
+        DesktopOverlayRect best{};
+        for (unsigned a = 0; a < rectCount; ++a)
+            for (unsigned b = a + 1; b < rectCount; ++b) {
+                const auto r = rects[a], q = rects[b];
+                const int x = r.x < q.x ? r.x : q.x, y = r.y < q.y ? r.y : q.y;
+                const int right = r.x + int(r.width) > q.x + int(q.width) ? r.x + int(r.width) : q.x + int(q.width);
+                const int bottom = r.y + int(r.height) > q.y + int(q.height) ? r.y + int(r.height) : q.y + int(q.height);
+                const uint64_t area = uint64_t(uint32_t(right - x)) * uint32_t(bottom - y);
+                const uint64_t parts = uint64_t(r.width) * r.height + uint64_t(q.width) * q.height;
+                const uint64_t cost = area > parts ? area - parts : 0;
+                if (cost < bestCost) {
+                    bestCost = cost; bestI = a; bestJ = b;
+                    best = {x, y, uint32_t(right - x), uint32_t(bottom - y)};
+                }
+            }
+        rects[bestI] = best;
+        keys[bestI] = 0;
+        opaqueRects &= ~(1u << bestI);
+        for (unsigned k = bestJ; k + 1 < rectCount; ++k) { rects[k] = rects[k + 1]; keys[k] = keys[k + 1]; }
+        const uint32_t low = opaqueRects & ((1u << bestJ) - 1u), high = opaqueRects >> (bestJ + 1);
+        opaqueRects = low | (high << bestJ);
+        --rectCount;
     }
     if(!DesktopOverlayMakeBands(width,height,rects,rectCount,g_debugOverlayBands,opaqueRects))return;
     DesktopOverlayKeyBandsFromRects(pixels,width,height,g_debugOverlayBands,rects,keys,rectCount);

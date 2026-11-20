@@ -72,6 +72,10 @@ bool WmVolumePopupVisible(){return volumeVisible;}
 void WmVolumePopupGetRect(uint32_t,uint32_t,int32_t* x,int32_t* y,uint32_t* w,uint32_t* h){*x=4;*y=1;*w=2;*h=2;}
 bool WmPointerCaptureActive(){return false;}
 bool WmTrayFlyoutRect(uint32_t,uint32_t,int32_t*,int32_t*,uint32_t*,uint32_t*){return false;}
+bool dockVisible=false;
+bool WmDockSurfaceRect(uint32_t,uint32_t,int32_t* x,int32_t* y,uint32_t* w,uint32_t* h,bool* material){
+    *x=0;*y=3;*w=1;*h=1;*material=true;return dockVisible;
+}
 bool summaryAndHudVisible = false;
 bool WmPerformanceHudRect(uint32_t,uint32_t,int32_t* x,int32_t* y,uint32_t* w,uint32_t* h) {
     *x = 3; *y = 3; *w = 1; *h = 1;
@@ -112,6 +116,7 @@ void ShellServiceDraw(const WmShellSurface& s,uint32_t* p,uint32_t stride,uint32
     case WmShellSurfaceKind::VolumePopup: color = 0x00777777; break;
     case WmShellSurfaceKind::PerformanceHud: color = 0x00112233; break;
     case WmShellSurfaceKind::BootSummary: color = 0x00445566; break;
+    case WmShellSurfaceKind::Dock: color = 0x00998877; break;
     default: std::abort();
     }
     for (uint32_t y = 0; y < s.h; ++y)
@@ -516,6 +521,32 @@ int main() {
         CaptureOverlayAt(704, 6, 4, true);
         CHECK(overlayPixels[38] == 0 && overlayPixels[7] == 0xff445566 && overlayPixels[27] == 0xff112233);
         CHECK(CompositorReleaseDebugFrame(overlay.token, 77));
+        // Five shell surfaces (the side dock too) and a cursor: six
+        // rectangles merge pairwise into the four the seven bands allow.
+        dockVisible = true;
+        overlay = CompositorRequestDebugFrame(77, true, true);
+        CaptureOverlayAt(705, 6, 4, true);
+        CHECK(CompositorDebugFrameStatus(overlay.token, 77).state == DebugFrameState::Ready);
+        {
+            BrookDesktopOverlaySurfaces five{};
+            CHECK(!CompositorOverlaySurfaces(overlay.token, 77, five) && five.count == 5);
+            bool dockRecord = false;
+            for (unsigned i = 0; i < five.count; ++i) dockRecord |= five.surfaces[i].kind == uint32_t(WmShellSurfaceKind::Dock) + 3;
+            CHECK(dockRecord);
+            DesktopOverlayBands bands{};
+            CHECK(!CompositorOverlayBands(overlay.token, 77, bands) && bands.count && bands.count <= 7);
+            CHECK(overlayPixels[24] == 0xff998877 && overlayPixels[7] == 0xff445566 && overlayPixels[27] == 0xff112233);
+            auto covered = [&](uint32_t x, uint32_t y) {
+                for (unsigned i = 0; i < bands.count; ++i) {
+                    const auto& r = bands.bands[i];
+                    if (x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height) return true;
+                }
+                return false;
+            };
+            CHECK(covered(0, 3) && covered(7, 0) && covered(3, 3) && covered(6, 4) && covered(1, 1) && covered(0, 5));
+        }
+        CHECK(CompositorReleaseDebugFrame(overlay.token, 77));
+        dockVisible = false;
         summaryAndHudVisible = false;
         g_debugFrameCleanAddress=0;
     }

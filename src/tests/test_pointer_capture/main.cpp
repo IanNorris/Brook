@@ -21,6 +21,9 @@ void KMutexLock(KMutex*) { CHECK(lockDepth++==0); }
 void KMutexUnlock(KMutex*) { CHECK(lockDepth--==1); }
 extern "C" void CompositorWake() {}
 void CompositorMarkDirty() {}
+// The dock's work-area reflow is reachable from window destruction.
+extern "C" void CompositorGetPhysDims(uint32_t* w,uint32_t* h) { if(w)*w=1024;if(h)*h=768; }
+TerminalResizeResult TerminalResizeForProcess(uint16_t,uint64_t,uint32_t,uint32_t) { return TerminalResizeResult::NotOwned; }
 extern "C" void MouseGetPosition(int32_t* x,int32_t* y) { *x=mouseX;*y=mouseY; }
 extern "C" void MouseSetPosition(int32_t x,int32_t y) { mouseX=x;mouseY=y; }
 extern "C" uint8_t MouseGetButtons() { return mouseButtons; }

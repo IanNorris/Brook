@@ -471,16 +471,9 @@ static void WmCaptureDock(uint32_t screenW, uint32_t screenH, int32_t mouseX, in
 // Persistence: "[Dock]\npinned=0|1\n". Residents join it in a later slice.
 // ---------------------------------------------------------------------------
 
-// Shell context (WmLauncherLoad), before the desktop draws.
-static void DockLoadState()
+// The [Dock] section's settings; unknown keys and sections are ignored.
+static void DockParseState(char* text)
 {
-    char text[256];
-    const auto result = ConfigReadText(DockStatePath, text, sizeof(text));
-    if (result.error) {
-        if (strcmp(result.stage, "missing"))
-            KLogCatConsole(LogCat::Wm, LogLevel::Warn, "dock: load failed stage=%s errno=%d", result.stage, -result.error);
-        return;
-    }
     bool section = false;
     for (char* line = text; *line;) {
         char* end = line;
@@ -493,6 +486,19 @@ static void DockLoadState()
         *end = saved;
         line = *end ? end + 1 : end;
     }
+}
+
+// Shell context (WmLauncherLoad), before the desktop draws.
+static void DockLoadState()
+{
+    char text[256];
+    const auto result = ConfigReadText(DockStatePath, text, sizeof(text));
+    if (result.error) {
+        if (strcmp(result.stage, "missing"))
+            KLogCatConsole(LogCat::Wm, LogLevel::Warn, "dock: load failed stage=%s errno=%d", result.stage, -result.error);
+        return;
+    }
+    DockParseState(text);
     g_dockSavedEpoch = g_dockSaveEpoch;
     KLOG_INFO(Wm, "dock: state restored pinned=%d", int(g_dock.pinned));
 }

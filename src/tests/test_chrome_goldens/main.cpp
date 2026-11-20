@@ -529,6 +529,48 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
     Check(prefix + "hud", list, s, hud.x, hud.y, hud.w, hud.h);
 }
 
+// Side dock: the strip open on a page, the same strip pinned with an icon
+// hovered, the return button hovered, and the closed edge tab.
+void Dock(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
+    const bool glass = theme == BROOK_THEME_GLASS;
+    const ChromeStyle s = StyleFor(theme, m, glass);
+    const uint32_t screenW = 1600 * m.percent / 100, desktopH = 852 * m.percent / 100;
+    static ChromeShellStorage storage;
+    static ChromeShellModel model;
+    struct Scene { const char* name; int selected; bool pinned; int hover; }; // hover: -1, entry, or 100 return
+    const Scene scenes[] = {
+        {"dock-open", 0, false, -1},
+        {"dock-selected", 2, false, 100},
+        {"dock-pinned", 1, true, 3},
+    };
+    for (const Scene& scene : scenes) {
+        model = {};
+        model.kind = ChromeShellKind::Dock;
+        model.dock = ChromeDockLayoutFor(m, screenW, desktopH, 4, scene.selected, true);
+        model.dockPinned = scene.pinned;
+        for (int i = 0; i < 4; ++i) if (i != 3) SetTestIcon(model.icons[i]); // entry 3: missing icon
+        std::strcpy(model.text, "Terminal - brook@clearwater: ~/src/brook");
+        model.mouseX = model.mouseY = -1;
+        if (scene.hover == 100) { model.mouseX = model.dock.back.x + 2; model.mouseY = model.dock.back.y + 2; }
+        else if (scene.hover >= 0) {
+            model.mouseX = model.dock.cells[scene.hover].x + 2;
+            model.mouseY = model.dock.cells[scene.hover].y + 2;
+        }
+        ChromeDisplayList list = ChromeListOn(storage);
+        RenderSnapshot(model, s, list);
+        const DesktopRect& r = model.dock.strip;
+        Check(prefix + scene.name, list, s, r.x, r.y, r.w, r.h);
+    }
+    model = {};
+    model.kind = ChromeShellKind::Dock;
+    model.dock = ChromeDockLayoutFor(m, screenW, desktopH, 2, -1, false);
+    model.mouseX = model.mouseY = -1;
+    ChromeDisplayList list = ChromeListOn(storage);
+    RenderSnapshot(model, s, list);
+    const DesktopRect& t = model.dock.tab;
+    Check(prefix + "dock-tab", list, s, 0, t.y - m.pixels(8), m.pixels(24), t.h + m.pixels(16));
+}
+
 void WebAppTitles(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
     const ChromeStyle s = StyleFor(theme, m, theme == BROOK_THEME_GLASS);
     char title[64];
@@ -626,6 +668,11 @@ int main(int argc, char** argv) {
             Shell(prefix, theme.material, *m);
             if (m->percent == 100 && theme.hue == BROOK_HUE_BLUE && theme.mode == BROOK_MODE_MIXED)
                 WebAppTitles(prefix, theme.material, *m);
+            // The side dock in Glass (mixed, at 100% and 200%) and Opaque Dark.
+            if (theme.hue == BROOK_HUE_BLUE && m->percent != 150 &&
+                ((theme.material == BROOK_THEME_GLASS && theme.mode == BROOK_MODE_MIXED) ||
+                 (theme.material == BROOK_THEME_OPAQUE && theme.mode == BROOK_MODE_DARK && m->percent == 100)))
+                Dock(prefix, theme.material, *m);
         }
     }
     if (update) {

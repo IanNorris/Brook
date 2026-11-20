@@ -28,6 +28,10 @@ amber-glass-100-temperature-flyout 0f66619a53e7898a
 amber-glass-100-tooltip 38846f3554215082
 amber-glass-100-volume-popup 486fa5ecb55977ce
 glass-100-boot-summary 0657a14d812bf63e
+glass-100-dock-open df091a9e5c939619
+glass-100-dock-pinned 36f2ea1f5a262f49
+glass-100-dock-selected a46eda25df28e281
+glass-100-dock-tab 49dbdff5b6c83db3
 glass-100-frame-active ab09db2a6bc1a8c6
 glass-100-frame-active-glass 79f4c41f48b2deb0
 glass-100-frame-csd f1df741fbdd6406e
@@ -87,6 +91,10 @@ glass-150-temperature-flyout c90474d403a8f3e1
 glass-150-tooltip e93383b7e8e2b996
 glass-150-volume-popup f934f17e6117a2d3
 glass-200-boot-summary a6e1a6599b86b1c0
+glass-200-dock-open 2a9d42c9f2f3a394
+glass-200-dock-pinned 25de36a6042b8cf7
+glass-200-dock-selected e99990b9fd59bbb4
+glass-200-dock-tab 46b05e68bcf701c3
 glass-200-frame-active dfad8058208d418e
 glass-200-frame-active-glass 6c41c25db3c38a9c
 glass-200-frame-csd 862f2cba6b12cfb6
@@ -451,6 +459,10 @@ magenta-opaque-mixed-100-temperature-flyout 1c25a6891a12d6b3
 magenta-opaque-mixed-100-tooltip 3c96dd4d9ff1266a
 magenta-opaque-mixed-100-volume-popup 7cd0e9ac2db78d09
 opaque-dark-100-boot-summary 0d46d90fb3fe3d65
+opaque-dark-100-dock-open dd7016ed29cf8daf
+opaque-dark-100-dock-pinned 784d45e382b9f0a6
+opaque-dark-100-dock-selected 919245caacaefb3f
+opaque-dark-100-dock-tab 8169dc479579deb3
 opaque-dark-100-frame-active 52c08f39446d876e
 opaque-dark-100-frame-active-glass 671ae2efc3f5e2ca
 opaque-dark-100-frame-csd e6c7675f787e7437
