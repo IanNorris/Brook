@@ -81,6 +81,7 @@ EXPORT_SYMBOL(VmmFreeKernelStack);
 EXPORT_SYMBOL(VmmVirtToPhys);
 EXPORT_SYMBOL(KsymPhysToVirt);
 EXPORT_SYMBOL(VmmMapPage);
+EXPORT_SYMBOL(VmmDetachPage);
 
 // Device registry
 EXPORT_SYMBOL(DeviceRegister);
@@ -197,6 +198,7 @@ EXPORT_SYMBOL(IdtInstallHandler);
 EXPORT_SYMBOL(ApicGetId);
 EXPORT_SYMBOL(IoApicUnmaskIrq);
 EXPORT_SYMBOL(IoApicRegisterHandler);
+EXPORT_SYMBOL(IoApicSelectBootLevelPin);
 EXPORT_SYMBOL(IoApicUnregisterHandler);
 EXPORT_SYMBOL(ApicSendEoi);
 
