@@ -279,6 +279,45 @@ void Launcher(const std::string& prefix, const ChromeStyle& s, uint32_t screenW,
         {"launcher-category", [](LauncherModel& m, const ChromeLauncherFrame&, ChromeLauncherChrome&) {
             for (const char* key : {LauncherFilesAppId, "terminal", "brook-settings", "firefox", "quake"}) m.TogglePin(m.FindApp(key));
             m.Press({LauncherTargetKind::Rail, 0}, false, 0, 0); m.ScrollTicks(-5); }},
+        {"launcher-organise", [](LauncherModel& m, const ChromeLauncherFrame&, ChromeLauncherChrome&) {
+            using TK = LauncherTargetKind;
+            m.Press({TK::Organise, 0}, false, 0, 0);
+            m.Press({TK::Row, uint16_t(m.FindApp("ladybird"))}, false, 0, 0);
+            m.Press({TK::Row, uint16_t(m.FindApp("firefox"))}, false, 0, 0);
+            m.ScrollBy(160); }},
+        {"launcher-drag", [](LauncherModel& m, const ChromeLauncherFrame& f, ChromeLauncherChrome& c) {
+            using TK = LauncherTargetKind;
+            for (uint32_t i = 0; i < f.targetCount; ++i) {
+                const auto& h = f.targets[i];
+                if (h.target.kind != TK::Row || h.target.index != m.FindApp("ladybird")) continue;
+                m.BeginPointer(h.target, h.rect.x + 20, h.rect.y + 20);
+                c.mouseX = f.rail.x + f.rail.w / 3;
+                c.mouseY = f.rail.y + f.rail.h * 9 / 10;
+                m.MovePointer({TK::NewCategory, 0}, c.mouseX, c.mouseY, 6, false);
+                break;
+            } }},
+        {"launcher-new-category", [](LauncherModel& m, const ChromeLauncherFrame&, ChromeLauncherChrome&) {
+            using TK = LauncherTargetKind;
+            m.BeginPointer({TK::Row, uint16_t(m.FindApp("quake2"))}, 20, 20);
+            m.MovePointer({TK::NewCategory, 0}, 100, 100, 6, false);
+            m.ReleasePointer({TK::NewCategory, 0}, false);
+            for (const char* title = "Id Software"; *title; ++title) m.Key(LauncherKey::Char, *title);
+            m.Press({TK::EditorColor, uint16_t(LauncherColor::Coral)}, false, 0, 0); }},
+        {"launcher-rename-app", [](LauncherModel& m, const ChromeLauncherFrame&, ChromeLauncherChrome&) {
+            using TK = LauncherTargetKind;
+            m.Press({TK::Organise, 0}, false, 0, 0);
+            m.Press({TK::Row, uint16_t(m.FindApp("quake2"))}, false, 0, 0);
+            m.Press({TK::RenameApp, 0}, false, 0, 0);
+            for (const char* name = "Evening Quake"; *name; ++name) m.Key(LauncherKey::Char, *name); }},
+        {"launcher-unsorted", [](LauncherModel& m, const ChromeLauncherFrame&, ChromeLauncherChrome&) {
+            using TK = LauncherTargetKind;
+            LauncherApp installed[launcherAppCount + 1];
+            for (uint32_t i = 0; i < launcherAppCount; ++i) installed[i] = launcherApps[i];
+            installed[launcherAppCount] = {"inkscape", "Inkscape", "Vector drawing", "graphics", false};
+            m.SetCatalog(installed, launcherAppCount + 1);
+            m.MoveMarked(uint32_t(m.FindApp("quake2")), LauncherViewUnsorted);
+            m.Press({TK::Rail, uint16_t(m.RailRowFor(LauncherViewUnsorted))}, false, 0, 0);
+            m.SetUndoVisible(true); }},
         // The restart confirmation in the footer.
         {"launcher-prompt", [](LauncherModel&, const ChromeLauncherFrame&, ChromeLauncherChrome& c) {
             c.prompt = c.promptRestart = c.confirmFocused = true; }},
@@ -373,11 +412,11 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
     model = {};
     model.kind = ChromeShellKind::Taskbar;
     model.taskbar = layout;
-    model.entries[0] = {"Terminal", true, false, false, false};
-    model.entries[1] = {"Files", false, true, false, false};
-    model.entries[2] = {"Settings", false, false, false, false};
-    model.entries[3] = {"", false, false, true, true};
-    model.entries[4] = {"", false, false, true, false};
+    model.entries[0] = {"Terminal", true, false, false, false, 0, LauncherColor::Slate};
+    model.entries[1] = {"Files", false, true, false, false, 'F', LauncherColor::Blue};
+    model.entries[2] = {"Settings", false, false, false, false, 0, LauncherColor::Slate};
+    model.entries[3] = {"", false, false, true, true, 0, LauncherColor::Slate};
+    model.entries[4] = {"", false, false, true, false, 'Q', LauncherColor::Coral};
     for (uint32_t i : {0u, 2u, 3u, ChromeShellModel::AppsIcon}) SetTestIcon(model.icons[i]);
     model.networkConnected = true;
     model.volumeControl = 60;

@@ -813,6 +813,7 @@ void WmLauncherScroll(int delta120, uint32_t screenW, uint32_t screenH);
 int WmLauncherHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH);
 // Pointer press (secondary: right button) while the launcher is open; false
 // when outside the panel. Keys while it is open (scan, translated ASCII, mods).
+bool WmLauncherGesture(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH, bool released);
 bool WmLauncherPress(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH, bool secondary);
 void WmLauncherKey(uint8_t scan, char ascii, uint8_t modifiers);
 

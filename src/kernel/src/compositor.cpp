@@ -3236,6 +3236,10 @@ static void CompositorHandleMouseWM()
         g_wmBtnReleaseLatch = false;
     }
 
+    if (WmLauncherGesture(mx, my, g_physFbWidth, g_physFbHeight, releaseLatched || !btnDown)) {
+        if (releaseLatched || !btnDown) g_wmPrimaryDown = g_wmLastBtnDown = false;
+        return;
+    }
     if (btnDown && !g_wmLastBtnDown)
     {
         const auto captionHit=WmHitTest(mx,my);
@@ -3269,7 +3273,10 @@ static void CompositorHandleMouseWM()
             // the same pass; consume it here too, or the next tap (such as
             // Cancel on the power prompt) reads as a held button and is lost.
             const auto launcherPressDone=[&] {
-                if(releaseLatched&&!polledDown){g_wmPrimaryDown=false;g_wmLastBtnDown=false;}
+                if(releaseLatched&&!polledDown){
+                    WmLauncherGesture(mx,my,g_physFbWidth,g_physFbHeight,true);
+                    g_wmPrimaryDown=false;g_wmLastBtnDown=false;
+                }
                 else g_wmLastBtnDown=btnDown;
             };
             if (WmLauncherPress(mx, my, g_physFbWidth, g_physFbHeight, false))
@@ -4041,7 +4048,7 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
 
     // 4. Compose into the scanout RT.
     framePhase.Change(FramePhase::QuadRecord);
-    if(CompositorGlassActive())EnsureShadowTexture(gpu);
+    if (CompositorGlassActive() || WmLauncherVisible()) EnsureShadowTexture(gpu);
     gpu->BeginFrame(0);
 
     // Base: desktop = wallpaper (chrome and taskbar/launcher are separate alpha

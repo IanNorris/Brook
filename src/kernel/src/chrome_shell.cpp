@@ -4,6 +4,7 @@
 // Everything here is drawn once into a cached surface when its content key
 // changes; nothing runs per frame. Freestanding.
 #include "chrome_shell.h"
+#include "chrome_launcher.h"
 
 namespace brook {
 
@@ -471,8 +472,15 @@ void ChromeBuildTaskbar(const ChromeTaskbarModel& m, const ChromeStyle& s, Chrom
         const DesktopRect& r = l.buttons[i];
         const ChromeTaskbarButton& b = m.buttons[i];
         const bool hovered = target(r, b.active);
+        const auto appIcon = [&](int x, unsigned opacity) {
+            const int y = r.y + (r.h - icon) / 2;
+            if (!b.icon && b.initial) {
+                const char initial[] = {b.initial, 0};
+                ChromeLauncherInitial(dl, s, x, y, icon, b.color, initial);
+            } else IconAt(dl, s, x, y, icon, b.icon, opacity);
+        };
         if (b.launch) {
-            centeredIcon(r, b.icon, icon);
+            if (r.w >= icon && r.h >= icon) appIcon(r.x + (r.w - icon) / 2, 255);
             const DesktopRect pr = pill(r);
             if (b.busy) {
                 static const int dx[8] = {0, 3, 4, 3, 0, -3, -4, -3};
@@ -490,12 +498,12 @@ void ChromeBuildTaskbar(const ChromeTaskbarModel& m, const ChromeStyle& s, Chrom
         const unsigned opacity = b.minimized ? 153 : 255;
         if (r.w >= Px(s, SM::TaskbarLabelMin) && r.h >= icon && b.hoverTitle && b.hoverTitle[0]) {
             const int ix = r.x + Px(s, SM::TaskbarButtonPad), tx = ix + icon + Px(s, SM::TaskbarLabelGap);
-            IconAt(dl, s, ix, r.y + (r.h - icon) / 2, icon, b.icon, opacity);
+            appIcon(ix, opacity);
             ChromeElidedText(dl, s, CF::Label, tx, labelY, b.hoverTitle,
                              b.active || hovered ? p.text : b.minimized ? p.mutedText : p.secondaryText,
                              r.x + r.w - tx - Px(s, SM::TaskbarButtonPad));
         } else if (r.w >= icon && r.h >= icon)
-            IconAt(dl, s, r.x + (r.w - icon) / 2, r.y + (r.h - icon) / 2, icon, b.icon, opacity);
+            appIcon(r.x + (r.w - icon) / 2, opacity);
     }
     if (l.next.w > 0) {
         target(l.next, false);

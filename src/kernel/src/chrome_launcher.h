@@ -48,13 +48,13 @@ struct ChromeLauncherHit {
 
 struct ChromeLauncherFrame {
     static constexpr uint32_t TargetLimit = 160, LineLimit = 32;
-    DesktopRect panel, search, top, mid, rail, list, footer, menu;
+    DesktopRect panel, search, top, mid, rail, list, footer, menu, editor, editorInput, selection, notice;
     LauncherViewport viewport;    // for LauncherModel::SetViewport
     // Visible list lines (whole rects; partly visible ones extend past list),
     // from the model's scroll position in pixels.
     LauncherLine lines[LineLimit];
     DesktopRect lineRects[LineLimit];
-    uint32_t lineCount, firstLine, totalLines, scroll;
+    uint32_t lineCount, firstLine, totalLines, scroll, railScroll;
     uint16_t tiles[LauncherLimits::Pins];
     uint32_t tileCount;
     ChromeLauncherHit targets[TargetLimit]; // menu first, then panel contents; the last is the panel
@@ -68,14 +68,18 @@ void ChromeLauncherFrameFor(const LauncherModel& model, const ChromeLauncherChro
 // Where the scrolled list shows: the list's columns, from the divider under
 // the top row to the footer (rows scroll through the list's padding).
 inline DesktopRect ChromeLauncherListClip(const ChromeLauncherFrame& f) {
-    return {f.list.x, f.mid.y + 1, f.list.w, f.mid.h > 1 ? f.mid.h - 1 : 0};
+    const int top = f.selection.h > 0 ? f.selection.y + f.selection.h : f.mid.y + 1;
+    const int bottom = f.notice.h > 0 ? f.notice.y : f.mid.y + f.mid.h;
+    return {f.list.x, top, f.list.w, bottom > top ? bottom - top : 0};
 }
 // The target under (x, y): None outside the panel.
-LauncherTarget ChromeLauncherHitTest(const ChromeLauncherFrame& frame, int32_t x, int32_t y);
+LauncherTarget ChromeLauncherHitTest(const ChromeLauncherFrame& frame, int32_t x, int32_t y, bool* after = nullptr);
 void ChromeBuildLauncher(const LauncherModel& model, const ChromeLauncherChrome& chrome, const ChromeLauncherFrame& frame,
                          const ChromeStyle& s, ChromeDisplayList& dl);
 
 // The category colours (DESIGN.md "Token sheet": the same in every theme).
 uint32_t ChromeLauncherCategoryColor(LauncherColor color);
+void ChromeLauncherInitial(ChromeDisplayList& dl, const ChromeStyle& style,
+                           int x, int y, int size, LauncherColor color, const char* name);
 
 } // namespace brook

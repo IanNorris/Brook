@@ -691,6 +691,7 @@ static LauncherModel g_launcherModel;
 static void LauncherLoadLayout();
 static void LauncherSyncModel(const LauncherSnapshot& catalog);
 static void LauncherSaveLayout();
+static void LauncherItemKey(const LauncherItem&, char (&key)[LauncherLimits::KeyLength]);
 static void LauncherPowerRun(LauncherPowerCommand command);
 
 // Requests own all metadata/icon pixels, never launcher snapshot pointers.
@@ -947,23 +948,28 @@ static bool WmTitleHasAppName(const char* title, const char* name)
     return false;
 }
 
-static const uint32_t* WindowIcon(const Window& w, const LauncherSnapshot& launcher)
+static const uint32_t* WindowIcon(const Window& w, const LauncherSnapshot& launcher,
+                                  const LauncherItem** matched = nullptr)
 {
     if (WmEqualI(w.appId, "terminal")) return launcher.terminalIcon ? launcher.terminalIcon : launcher.applicationIcon;
+    const auto use = [&](const LauncherItem& item) {
+        if (matched) *matched = &item;
+        return item.iconPixels;
+    };
     // Explicit desktop identity takes precedence over executable/name guesses.
     for (uint32_t i = 0; i < launcher.count; ++i)
     {
         const LauncherItem& item = launcher.items[i];
-        if (item.valid && item.iconPixels && w.appId[0] && item.appId[0] && WmEqualI(w.appId, item.appId))
-            return item.iconPixels;
+        if (item.valid && (matched || item.iconPixels) && w.appId[0] && item.appId[0] && WmEqualI(w.appId, item.appId))
+            return use(item);
     }
     const char* executable = w.proc ? WmBaseName(w.proc->exePath) : "";
     for (uint32_t i = 0; i < launcher.count; ++i)
     {
         const LauncherItem& item = launcher.items[i];
-        if (!item.valid || item.isUserDesktopEntry || !item.iconPixels || !item.executable[0]) continue;
+        if (!item.valid || item.isUserDesktopEntry || (!matched && !item.iconPixels) || !item.executable[0]) continue;
         if ((w.appId[0] && WmEqualI(w.appId, item.executable)) ||
-            (executable[0] && WmEqualI(executable, item.executable))) return item.iconPixels;
+            (executable[0] && WmEqualI(executable, item.executable))) return use(item);
     }
     // Legacy native windows have no app_id. Their title is only a last resort;
     // an unknown explicit ID must not acquire another app's icon by title.
@@ -972,9 +978,9 @@ static const uint32_t* WindowIcon(const Window& w, const LauncherSnapshot& launc
         if (w.proc && TerminalFindByProcess(w.proc)) return launcher.terminalIcon ? launcher.terminalIcon : launcher.applicationIcon;
         for (uint32_t i = 0; i < launcher.count; ++i)
             if (launcher.items[i].valid && !launcher.items[i].isUserDesktopEntry &&
-                launcher.items[i].iconPixels && WmTitleHasAppName(w.title, launcher.items[i].title)) return launcher.items[i].iconPixels;
+                (matched || launcher.items[i].iconPixels) && WmTitleHasAppName(w.title, launcher.items[i].title)) return use(launcher.items[i]);
     }
-    return launcher.applicationIcon;
+    return matched ? nullptr : launcher.applicationIcon;
 }
 
 // ---------------------------------------------------------------------------
@@ -2357,9 +2363,9 @@ static bool LauncherLoadDesktopEntries(LauncherSnapshot& launcher)
         *end = 0;
         if (end > line && end[-1] == '\r') end[-1] = 0;
         if (!*line) { if (!more) break; line = end + 1; continue; }
-        char* fields[5] = {line, nullptr, nullptr, nullptr, nullptr};
+        char* fields[6] = {line, nullptr, nullptr, nullptr, nullptr, nullptr};
         uint32_t count = 1;
-        for (char* p = line; *p && count < 5; ++p)
+        for (char* p = line; *p && count < 6; ++p)
             if (*p == '\t') { *p = 0; fields[count++] = p + 1; }
         if (count < 2 || !fields[0][0] || strlen(fields[1]) >= sizeof(LauncherItem{}.scriptPath) ||
             (count >= 5 && strlen(fields[4]) >= sizeof(LauncherItem{}.appId))) { ok = false; break; }
@@ -2382,6 +2388,7 @@ static bool LauncherLoadDesktopEntries(LauncherSnapshot& launcher)
             WmStrCopy(item->scriptPath, fields[1], sizeof(item->scriptPath));
             WmStrCopy(item->executable, executable, sizeof(item->executable));
             WmStrCopy(item->appId, count >= 5 ? fields[4] : "", sizeof(item->appId));
+            if (count == 6 && fields[5][0]) WmStrCopy(item->description, fields[5], sizeof(item->description));
             // A desktop file's Categories= replaces a same-title shortcut's
             // declared category only when it maps to one.
             if (count >= 4 && *LauncherModel::HintFromDesktopCategories(fields[3]))
@@ -2628,13 +2635,14 @@ void WmLauncherLoad()
     g_launcherLoaded = true;
 }
 
-void WmLauncherClose() { g_launcherOpen = false; g_launcherPower.Reset(); }
+void WmLauncherClose() { g_launcherOpen = false; g_launcherModel.CancelPointer(); g_launcherPower.Reset(); }
 
 void WmLauncherToggle()
 {
     // Loading belongs to WmSetActive (shell context), never the input/render thread.
     if (!g_launcherLoaded) return;
     g_launcherOpen = !g_launcherOpen;
+    g_launcherModel.CancelPointer();
     g_launcherPower.Reset();
     if (g_launcherOpen) {
         PointerActivationCancel();
