@@ -8,6 +8,7 @@ import unittest
 from unittest import mock
 
 import verify_guarded_desktop_candidate as verifier
+from bridge_keyless_image import rebuild_keyless_image
 from prepare_hardware_kernel_pair import CHROMIUM_POLICY_DIRS
 from stage_clearwater_shell import CLEARWATER_START
 
@@ -82,6 +83,32 @@ class VerifyGuardedDesktop(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'shortcut mismatch'):self.check()
     def test_valid_pair(self):
         self.assertEqual(self.check()['modules']['xhci.mod'],verifier.sha(self.module))
+    def test_rejects_key_and_local_provisioning_paths(self):
+        for path in ('ETC/Hardware-Update-Key', 'BOOT/BRIDGE0.BIN', 'ETC/bridge1.bin'):
+            with self.subTest(path=path):
+                shutil.copyfile(self.source, self.image)
+                self.copy(path, b'Synthetic bridge fixture credential')
+                with self.assertRaisesRegex(ValueError, 'contains a bridge credential path'):
+                    self.check()
+        shutil.copyfile(self.source, self.image)
+        self.copy('ETC/bridge-key-provision', b'1\n')
+        with self.assertRaisesRegex(ValueError, 'requests local credential provisioning'):
+            self.check()
+
+    def test_rebuilding_omits_live_and_deleted_credentials(self):
+        live = b'Brook synthetic live key fixture with unique bytes'
+        deleted = b'Brook synthetic deleted key fixture with unique bytes'
+        self.copy('ETC/hardware-update-key', live)
+        self.copy('BOOT/BRIDGE0.BIN', deleted)
+        subprocess.run(['mdel', '-i', str(self.image), '::/BOOT/BRIDGE0.BIN'], check=True)
+        self.assertIn(deleted, self.image.read_bytes())
+        keyless = self.root / 'keyless.img'
+        rebuild_keyless_image(self.image, keyless)
+        self.assertNotIn(live, keyless.read_bytes())
+        self.assertNotIn(deleted, keyless.read_bytes())
+        shutil.copyfile(keyless, self.image)
+        self.assertEqual(self.check()['module_abi'], 65)
+
     def test_update_helper_requires_exact_binary(self):
         helpers = {'HWUPDATE.ELF': b'\x7fELF-usb', 'HWUPSYS.ELF': b'\x7fELF-system'}
         expected = {name: verifier.sha(data) for name, data in helpers.items()}

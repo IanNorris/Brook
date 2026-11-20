@@ -13,6 +13,7 @@ import shlex
 import subprocess
 import tempfile
 
+from bridge_keyless_image import require_keyless_image
 from stage_clearwater_shell import CLEARWATER_EXECUTABLES
 from prepare_guard_check_pair import CHECKER_SHA, E2FSCK_SHA, REQUIRED, selector
 from prepare_hardware_kernel_pair import (INITRD_MAX, KERNEL_MAX, module_version, regular, desktop_startup, add_vulkan_desktop_start,
@@ -99,6 +100,7 @@ def verify(candidate, source, reference, build, expected_kernel, expected_source
         for name,contents in (('candidate',image),('source',original),('reference',guard)):
             p=work/(name+'.img');p.write_bytes(contents);paths.append(p)
         live,base,ref=paths
+        require_keyless_image(live)
         subprocess.run(['fsck.fat','-n',str(live)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         def read(path,name):return subprocess.check_output(['mtype','-i',str(path),'::/'+name],stderr=subprocess.DEVNULL)
         for name,enabled in (('dell-acpi-monitor',allow_dell_acpi_monitor),
