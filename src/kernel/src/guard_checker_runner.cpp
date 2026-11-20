@@ -690,8 +690,8 @@ void Worker(void* arg) {
     const int complete=FatFsPrivateRecoveryTestComplete(mount,identity,records[0],completeFail);
 #if defined(BROOK_SSD_AUTO_RECOVERY)
     if(complete==2 && profileValid) {
-        const int status=FatFsPrivateRecoveryRetryRepairedProfile(mount,rejectedProfile);
-        KPrintf("GUARD_SLOT_PROFILE_RETRY status=%d\n",status);
+        const int retryStatus=FatFsPrivateRecoveryRetryRepairedProfile(mount,rejectedProfile);
+        KPrintf("GUARD_SLOT_PROFILE_RETRY status=%d\n",retryStatus);
     }
 #endif
     AhciSystemGuardTestFinish(adapter);

@@ -275,6 +275,8 @@ def run_matrix(a, base_disk, normal, work, guards, metadata, panic_journal):
         ('profile-both-repaired', (normal, normal), False, [
             (1, 1, 'profile', [blank, failed_b_profile]), (*repair, [blank, failed_b_profile]),
             (0, 1, 'profile', [failed_a_profile, failed_b_profile]),
+            (None, None, 'repair-malformed-profile', [failed_a_profile, failed_b_profile]),
+            (*recovery, [failed_a_profile, failed_b_profile]),
             (None, None, 'repair-profile', [a1, b2]), (0, 2, 'success', [a0, b2])]),
         ('early-restart', (normal, normal), False, [(1, 1, 'early-restart', [blank, b1])]),
         ('post-init-panic', (normal, normal), False, [(1, 1, 'panic', [blank, b1]), (*repair, [blank, b1])]),
@@ -337,12 +339,19 @@ def run_matrix(a, base_disk, normal, work, guards, metadata, panic_journal):
             step.mkdir()
             if (name == 'profile-repaired' and result == 'success') or result == 'repair-profile':
                 edit_profile_index(disk, scenario, restore=work / 'placeholder')
+            if result == 'repair-profile':
+                # The operator restored the missing file offline. Force the
+                # next boot through guarded repair before it can retry a slot.
+                with disk.open('r+b') as volume:
+                    volume.seek(DATA_OFFSET + 1024 + 58)
+                    volume.write(b'\0\0')
             before_health = read_fat(media, 'RECOVERY/BOOTSTAT.BIN')
             key = f'generation={GENERATIONS[slot]} slot={slot}' if slot is not None else ''
             start = f'GUARD_SLOT_START status=0 {key} starts={count}' if count is not None else None
             health_wait = f'GUARD_SLOT_HEALTH_WAIT {key} window_ms={HEALTH_WINDOW_MS}'
-            reset = result in ('failure', 'repair', 'repair-profile', 'early-restart', 'panic')
-            evidence = 'GUARD_COMPLETE_RESTART' if result in ('repair', 'repair-profile') else CLEAN_RESET
+            repairing = result in ('repair', 'repair-profile', 'repair-malformed-profile')
+            reset = repairing or result in ('failure', 'early-restart', 'panic')
+            evidence = 'GUARD_COMPLETE_RESTART' if repairing else CLEAN_RESET
             failure_marker = '*** KERNEL PANIC ***'
             gdb_script = on_marker = intermediate = port = None
             prefix = a.output / f'{name}-{i}'
@@ -372,7 +381,7 @@ def run_matrix(a, base_disk, normal, work, guards, metadata, panic_journal):
             elif result == 'profile':
                 marker = 'GUARD_DESKTOP_HANDOFF_FAILED status=-5 shared_profile_rejected=1'
                 sequence += 2
-            elif result in ('repair', 'repair-profile'):
+            elif repairing:
                 marker = 'GUARD_COMPLETE_RESTART'
                 if result == 'repair-profile':
                     sequence += 1
@@ -418,7 +427,7 @@ def run_matrix(a, base_disk, normal, work, guards, metadata, panic_journal):
             if result == 'profile' and (f'GUARD_SLOT_PROFILE_REJECTED status=0 {key}' not in serial or
                                         'GUARD_SLOT_RESTART' in serial or 'GUARD_DESKTOP_HANDOFF_SCRIPT' in serial):
                 raise RuntimeError(f'{name}-{i}: shared profile rejection entered a slot-specific retry')
-            if result in ('recovery', 'repair') and ('Brook SSD recovery payload verified' not in serial or
+            if result in ('recovery', 'repair', 'repair-malformed-profile') and ('Brook SSD recovery payload verified' not in serial or
                                                       'GUARD_SLOT_CONFIRMED' in serial or
                                                       read_fat(media, 'RECOVERY/BOOTSTAT.BIN') != before_health):
                 raise RuntimeError(f'{name}-{i}: recovery-only boot changed the slot journal')
@@ -434,7 +443,7 @@ def run_matrix(a, base_disk, normal, work, guards, metadata, panic_journal):
                     read_fat(media, 'RECOVERY/BOOTSTAT.BIN') != before_health or CLEAN_RESET not in serial):
                 raise RuntimeError(f'{name}-{i}: untracked desktop charged a slot or failed checked sync')
             guarded_records = [read_fat(media, f'RECOVERY/GUARD{j}.BIN') for j in range(2)]
-            if result in ('repair', 'repair-profile'):
+            if repairing:
                 if ('GUARD_AUTO_NEEDS_CHECK' not in serial or 'GUARD_COMPLETE_RESULT outcome=2' not in serial or
                         guarded_records[0] != guarded_records[1]):
                     raise RuntimeError('shared profile recovery did not complete the guarded data repair')
@@ -446,6 +455,9 @@ def run_matrix(a, base_disk, normal, work, guards, metadata, panic_journal):
                 if result == 'repair-profile' and ('GUARD_SLOT_PROFILE_RECHECK accepted=1' not in serial or
                                                     'GUARD_SLOT_PROFILE_RETRY status=0' not in serial):
                     raise RuntimeError('checked repair did not reopen the verified older slot')
+                if result == 'repair-malformed-profile' and ('GUARD_SLOT_PROFILE_RECHECK accepted=0' not in serial or
+                                                              'GUARD_SLOT_PROFILE_RETRY' in serial):
+                    raise RuntimeError('checked repair unexpectedly reopened a slot with a malformed profile')
             if expected is None:
                 report = dict(sequence=None, slots=[])
             else:
