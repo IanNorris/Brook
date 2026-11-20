@@ -3,7 +3,7 @@
 
 namespace {
 unsigned failures = 0;
-Workspace sample{};
+brook::Workspace sample{};
 
 #define CHECK(expr) do { \
     if (!(expr)) { std::fprintf(stderr, "task manager line %d: %s\n", __LINE__, #expr); ++failures; } \
@@ -38,7 +38,7 @@ int main()
     Add(4, 15, 15, 39, 39, 6, 1000, true);
     Add(5, 4, 4, 11, 11, 13, 2000);
     Add(6, 18, 18, 43, 43, 7);
-    sample.tasks[6].state = ProcessState::Terminated;
+    sample.tasks[6].state = brook::ProcessState::Terminated;
     Add(7, 24, 20, 48, 45, 4); // live thread after its leader exited
 
     CHECK(CollectGroups(sample, 8, 16, 1000) == 6);
