@@ -8,6 +8,7 @@ boot epoch and the expected payload ID from a new boot-pinned guest job.
 import hashlib,json,os,re,time,uuid
 from pathlib import Path
 from hardware_update_protocol import upload,read_payload,KERNEL_MAX,INITRD_MAX
+from hardware_update_bootstat import inspect_bootstat
 from hardware_bulk_protocol import validate_pacing
 
 def power_blocker_summary(status):
@@ -78,7 +79,7 @@ class UpdateRun:
                     store.get('source_pinned') is True):
                 return 'first_install'
             raise RuntimeError('The booted system receiver lacks running-slot support. '
-                               'Only a verified pre-slot guarded boot with an explicit first-install attestation is eligible.')
+                               'First install requires an explicit boot ID and a verified absent or empty BOOTSTAT.')
         raise RuntimeError('The running system receiver did not advertise a supported capability')
 
     def reserve_first_install(self,boot):
@@ -133,7 +134,10 @@ class UpdateRun:
             if helper=='system':
                 receiver_mode=self.system_receiver_mode(session,boot,doctor.get('guest',{}),
                     first_slot_aware_install is not None)
-            if receiver_mode=='first_install':self.reserve_first_install(boot)
+            if receiver_mode=='first_install':
+                bootstat=inspect_bootstat(self.bridge,session,boot)
+                self.save(first_install_bootstat=bootstat)
+                self.reserve_first_install(boot)
             self.save(state='receiver_launch_dispatched',receiver_mode=receiver_mode)
             argv=[helpers[helper],boot,tx]
             if receiver_mode=='slot_aware':argv.append('--require-slot-aware')
@@ -146,6 +150,17 @@ class UpdateRun:
                     raise RuntimeError('The booted system receiver refused its negotiated launch arguments') from error
                 raise
             self.save(state='receiver_listening',job=listening)
+            if receiver_mode=='first_install':
+                # The old receiver owns the provisioner's shared guest lock by
+                # the time it prints LISTENING. Re-read on that same boot before
+                # sending any upload bytes and refuse if the evidence changed.
+                if (listening.get('session')!=session or listening.get('guest_boot_id')!=boot or
+                        listening.get('operation_id')!=tx or listening.get('state')!='running'):
+                    raise RuntimeError('First-install listener identity or lock cannot be verified')
+                locked_bootstat=inspect_bootstat(self.bridge,session,boot)
+                if locked_bootstat!=bootstat:
+                    raise RuntimeError('First-install BOOTSTAT evidence changed before upload')
+                self.save(first_install_bootstat_locked=locked_bootstat)
             upload_start=self.clock()
             if pace_bytes_per_second is None:result=self.uploader(data['host'],port,key,boot,tx,kernel,initrd,activate)
             else:result=self.uploader(data['host'],port,key,boot,tx,kernel,initrd,activate,pace_bytes_per_second=pace_bytes_per_second)

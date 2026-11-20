@@ -25,7 +25,7 @@ def main():
     p.add_argument('--boot-timeout-s',type=int,default=120,help='Observe the same restart for 1..900s; a timeout never retries it')
     p.add_argument('--helper',choices=['usb','system'],default='usb',help='System checks the running receiver before launching it.')
     p.add_argument('--first-slot-aware-install',metavar='BOOT_ID',
-        help='Attest this verified pre-slot boot has no RECOVERY/BOOTSTAT.BIN. Install the first '
+        help='Verify RECOVERY/BOOTSTAT.BIN is absent or empty on this boot. Install the first '
              'slot-aware pair on the old loader, then install the new loader and verify both slots before provisioning slot health.')
     p.add_argument('--pace-bytes-per-second',type=int,help='Optional Linux TCP pacing cap for the upload')
     a=p.parse_args()

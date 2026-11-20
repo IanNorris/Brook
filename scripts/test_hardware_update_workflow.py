@@ -49,7 +49,8 @@ class Bridge:
             return result
         if self.launch_code is not None:return {'state':'completed','exit':{'code':self.launch_code}}
         self.job_polls+=1
-        if self.job_polls==1:return {'state':'running','stdout':{'text':'HWUPDATE_LISTENING port=1235'}}
+        if self.job_polls==1:return {'state':'running','session':session,'operation_id':ident,'guest_boot_id':'a'*32,
+                                      'stdout':{'text':'HWUPDATE_LISTENING port=1235'}}
         code=0 if self.activated else 22
         generation=9 if self.mismatch else 2
         return {'state':'completed','exit':{'code':code},'stdout':{'text':
@@ -73,6 +74,10 @@ class Tests(unittest.TestCase):
         self.initrd=self.root/'initrd';self.initrd.write_bytes(bytes(512))
         self.bridge=Bridge();self.clock=Clock();self.output=self.root/'run';self.lose_upload=False
         self.bridge.registry=self.root/'registry';self.bridge.registry.mkdir()
+        bootstat={'state':'absent','esp_guid':'fixture','esp_first_lba':2048}
+        probe=patch('hardware_update_workflow.inspect_bootstat',return_value=bootstat)
+        self.bootstat=probe.start()
+        self.addCleanup(probe.stop)
     def tearDown(self):self.tmp.cleanup()
     def uploader(self,host,port,key,boot,tx,kernel,initrd,activate):
         self.assertEqual((boot,tx,key),('a'*32,self.bridge.tx,'1'*32));self.bridge.activated=activate
@@ -123,6 +128,28 @@ class Tests(unittest.TestCase):
         self.assertEqual(caps,['/boot/HWUPSYS.ELF','--caps'])
         self.assertEqual(launch,['/boot/HWUPSYS.ELF','a'*32,self.bridge.tx])
         self.assertEqual(result['receiver_mode'],'first_install')
+        self.assertEqual(self.bootstat.call_count,2)
+        self.assertEqual(result['first_install_bootstat'],result['first_install_bootstat_locked'])
+    def test_old_first_install_refuses_unverified_journal_before_any_claim(self):
+        self.bridge.cap_legacy=True
+        self.bootstat.side_effect=RuntimeError('Cannot verify first-install BOOTSTAT')
+        with self.assertRaisesRegex(RuntimeError,'Cannot verify first-install BOOTSTAT'):
+            self.first_install()
+        self.assertFalse(self.bridge.activated)
+        self.assertFalse(list(self.bridge.registry.iterdir()))
+        self.assertEqual(sum(call[0]=='run' for call in self.bridge.calls),1)
+    def test_old_first_install_refuses_journal_identity_change_after_lock(self):
+        self.bridge.cap_legacy=True
+        self.bootstat.side_effect=[{'state':'absent'},{'state':'empty'}]
+        with self.assertRaisesRegex(RuntimeError,'BOOTSTAT evidence changed'):
+            self.first_install()
+        self.assertFalse(self.bridge.activated)
+        self.assertEqual(self.receipt()['last_stage'],'receiver_listening')
+    def test_old_first_install_accepts_an_empty_journal_in_both_checks(self):
+        self.bridge.cap_legacy=True
+        self.bootstat.return_value={'state':'empty'}
+        result=self.first_install()
+        self.assertEqual(result['first_install_bootstat_locked']['state'],'empty')
     def test_first_install_claim_prevents_second_attempt_on_same_boot(self):
         self.bridge.cap_legacy=True
         result=self.first_install()
@@ -152,7 +179,7 @@ class Tests(unittest.TestCase):
         self.bridge.cap_fault=None
         self.bridge.guard_caps={}
         self.output=self.root/'old-unguarded'
-        with self.assertRaisesRegex(RuntimeError,'explicit first-install attestation'):
+        with self.assertRaisesRegex(RuntimeError,'requires an explicit boot ID'):
             self.first_install(boot='a'*32)
     def test_modern_launch_failure_never_downgrades(self):
         self.bridge.launch_code=2
