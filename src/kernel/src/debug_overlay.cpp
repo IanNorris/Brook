@@ -541,7 +541,8 @@ static void DebugTcpThread(void* /*arg*/)
         NetCountDebugClient(true);
         DebugBridgeV3Serve(clientSock, peer.sin_addr, local, deadline);
         NetCountDebugClient(false);
-        SockUnrefUntil(clientSock, ApicTickCount() + TCP_LOCAL_REQUEST_TIMEOUT_MS);
+        if (local) SockUnrefUntil(clientSock, deadline);
+        else SockUnrefBefore(clientSock, ApicTickCount() + TCP_LOCAL_REQUEST_TIMEOUT_MS);
 #else
         const uint64_t localDeadline = local ? ApicTickCount() + TCP_LOCAL_REQUEST_TIMEOUT_MS : 0;
         NetCountDebugClient(true);
