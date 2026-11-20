@@ -13,9 +13,14 @@
 #include "../../kernel/src/socket_identity.h"
 #include "../../kernel/src/netlink_route.h"
 namespace brook {
-struct Process {uint32_t tgid=101,refs=1;uint64_t wakeupTick=0;std::mutex mutex;std::condition_variable changed;bool wake=false;std::atomic<bool> signal{false};};
+struct Process {uint32_t tgid=101,refs=1;uint64_t network=0;bool netAdmin=false;uint64_t wakeupTick=0;std::mutex mutex;std::condition_variable changed;bool wake=false;std::atomic<bool> signal{false};};
 thread_local Process* current;
 Process* ProcessCurrent(){assert(current);return current;}
+struct UserNamespace {};
+uint64_t ProcessNetworkScope(Process* p){return p->network;}
+UserNamespace* ProcessUserNamespaceAcquire(Process*){return nullptr;}
+void UserNamespaceRelease(UserNamespace*){}
+bool ProcessCapable(Process* p,UserNamespace*,unsigned capability){return p->netAdmin && capability==12;}
 void ProcessRef(Process* p){__atomic_add_fetch(&p->refs,1,__ATOMIC_RELAXED);}
 void ProcessUnref(Process* p){assert(__atomic_fetch_sub(&p->refs,1,__ATOMIC_RELAXED)>1);}
 void WakeProcess(Process* p){std::lock_guard<std::mutex> held(p->mutex);p->wake=true;p->changed.notify_all();}
@@ -31,7 +36,7 @@ void checkUserCopy(){if(watchedLock){assert(SpinLockTryAcquire(watchedLock));Spi
 bool CopyFromUser(void* dst,uint64_t src,uint64_t n){checkUserCopy();if(n && !src)return false;memcpy(dst,reinterpret_cast<void*>(src),n);return true;}
 bool CopyToUser(uint64_t dst,const void* src,uint64_t n){checkUserCopy();if(n && !dst)return false;memcpy(reinterpret_cast<void*>(dst),src,n);return true;}
 bool UserBufferWritable(uint64_t p,uint64_t n){checkUserCopy();return !n || p;}
-uint32_t NetInterfaceViews(InterfaceView* out,uint32_t capacity){assert(capacity);out[0]={1,0x49,65536,0x0100007f,0xff,772,{},"lo"};return 1;}
+uint32_t NetInterfaceViews(InterfaceView* out,uint32_t capacity,uint64_t){assert(capacity);out[0]={1,0x49,65536,0x0100007f,0xff,772,{},"lo"};return 1;}
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-function"
 #include "../../kernel/src/syscall_netlink.inc"
@@ -71,6 +76,21 @@ int main(){using namespace brook;Process process;current=&process;
  std::thread interrupt([&]{std::this_thread::sleep_for(std::chrono::milliseconds(20));process.signal=true;WakeProcess(&process);});
  assert(NetlinkReceive(socket,bytes,sizeof(bytes),0,full)==-EINTR);interrupt.join();process.signal=false;assert(!socket->waiters && process.refs==1);
  assert(NetlinkSend(socket,reinterpret_cast<uint64_t>(&request),16,0)==-EINVAL);
+ // Only the same private network's administrator can confirm lo setup.
+ auto* scoped=make();scoped->networkScope=17;assert(!NetlinkBind(scoped,500));
+ struct LoopbackLink {RouteMessage h;uint32_t family,index,flags,change;};
+ LoopbackLink up{{32,16,5,99,500},0,1,1,1};
+ auto setup=[&](NetlinkSocket* endpoint,int expected) {
+     assert(NetlinkSend(endpoint,reinterpret_cast<uint64_t>(&up),sizeof(up),0)==sizeof(up));
+     assert(NetlinkReceive(endpoint,bytes,sizeof(bytes),0,full)==36);
+     int error;memcpy(&error,bytes+16,sizeof(error));assert(error==expected);
+ };
+ setup(socket,-95);
+ process.network=17;setup(scoped,-95);
+ process.netAdmin=true;setup(scoped,0);
+ up.index=2;setup(scoped,-22);
+ process.network=18;setup(scoped,-95);
+ NetlinkUnref(scoped);
  NetlinkUnref(socket);auto* replacement=make();assert(!NetlinkBind(replacement,500) && replacement->port==500);NetlinkUnref(replacement);NetlinkUnref(other);assert(!g_netlinkSockets && allocated.empty());
  puts("netlink endpoint ownership, queue pressure, readiness, signal and alias checks passed");
 }

@@ -564,6 +564,7 @@ struct Process
     UserNamespace* userNamespace; // owned immutable identity after publication; null is initial
     UtsNamespace* utsNamespace; // owned, synchronized by process_namespaces.h
     IpcNamespace* ipcNamespace;
+    uint64_t networkScope;
 
     // Wait diagnostics (proc_wait_info.h), written by the task itself in
     // SchedulerBlock: ApicTickCount() when the latest wait began and the

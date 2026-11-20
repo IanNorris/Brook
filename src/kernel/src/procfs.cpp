@@ -15,6 +15,7 @@
 #include "proc_inode.h"
 #include "vfs.h"
 #include "process.h"
+#include "process_namespaces.h"
 #include "scheduler.h"
 #include "smp.h"
 #include "memory/physical_memory.h"
@@ -1112,7 +1113,8 @@ static Vnode* GenNetDev()
     p = AppendStr(p, " face |bytes    packets errs drop fifo frame "
                      "|bytes    packets errs drop fifo colls carrier\n");
 
-    uint32_t count = NetIfCount();
+    p = AppendStr(p, "    lo: 0 0 0 0 0 0 0 0  0 0 0 0 0 0 0 0\n");
+    uint32_t count = ProcessNetworkScope(ProcessCurrent()) ? 0 : NetIfCount();
     for (uint32_t i = 0; i < count; ++i)
     {
         NetIf* nif = NetIfAt(i);
@@ -1170,6 +1172,7 @@ static char* AppendHex16(char* p, uint16_t v)
 
 static Vnode* GenNetTcp()
 {
+    const auto scope=ProcessNetworkScope(ProcessCurrent());
     // Linux /proc/net/tcp format (one line per socket):
     //  sl  local_address rem_address   st tx_queue rx_queue
     uint32_t maxSock = NetMaxSockets();
@@ -1184,7 +1187,7 @@ static Vnode* GenNetTcp()
     for (uint32_t i = 0; i < maxSock; ++i)
     {
         SocketSnapshot snap = NetSnapshotSocket(i);
-        if (!snap.used) continue;
+        if (!snap.used || snap.networkScope!=scope) continue;
         if (snap.type != 1 /* SOCK_STREAM */) continue;
 
         if (static_cast<uint32_t>(p - buf) + 192 >= bufSize) break;
@@ -1234,6 +1237,7 @@ static Vnode* GenNetTcp()
 
 static Vnode* GenNetUdp()
 {
+    const auto scope=ProcessNetworkScope(ProcessCurrent());
     uint32_t maxSock = NetMaxSockets();
     uint32_t bufSize = 256 + maxSock * 192;
     auto* buf = static_cast<char*>(kmalloc(bufSize));
@@ -1246,7 +1250,7 @@ static Vnode* GenNetUdp()
     for (uint32_t i = 0; i < maxSock; ++i)
     {
         SocketSnapshot snap = NetSnapshotSocket(i);
-        if (!snap.used) continue;
+        if (!snap.used || snap.networkScope!=scope) continue;
         if (snap.type != 2 /* SOCK_DGRAM */) continue;
 
         if (static_cast<uint32_t>(p - buf) + 192 >= bufSize) break;
@@ -1288,12 +1292,13 @@ static Vnode* GenNetUdp()
 
 static Vnode* GenNetSockstat()
 {
+    const auto scope=ProcessNetworkScope(ProcessCurrent());
     uint32_t maxSock = NetMaxSockets();
     uint32_t tcpInUse = 0, udpInUse = 0, rawInUse = 0;
     for (uint32_t i = 0; i < maxSock; ++i)
     {
         SocketSnapshot snap = NetSnapshotSocket(i);
-        if (!snap.used) continue;
+        if (!snap.used || snap.networkScope!=scope) continue;
         if (snap.type == 1)      ++tcpInUse;  // SOCK_STREAM
         else if (snap.type == 2) ++udpInUse;  // SOCK_DGRAM
         else                     ++rawInUse;

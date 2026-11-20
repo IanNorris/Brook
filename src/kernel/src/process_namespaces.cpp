@@ -20,6 +20,7 @@ struct IpcNamespace {
 };
 namespace {
 IrqSpinLock namespaceLock;
+uint64_t nextNetworkScope=1;
 UtsNamespace initial{0,nullptr,"brook","(none)"};
 
 UtsNamespace* Instance(Process* process)
@@ -49,6 +50,7 @@ void ProcessNamespacesInherit(Process* target,Process* source)
     if(target->utsNamespace)++target->utsNamespace->references;
     target->ipcNamespace=source->ipcNamespace;
     if(target->ipcNamespace)++target->ipcNamespace->references;
+    target->networkScope=source->networkScope;
     IrqSpinLockRelease(&namespaceLock,flags);
 }
 
@@ -75,6 +77,13 @@ void ProcessNamespacesRelease(Process* process)
 int ProcessNamespacesIsolate(Process* process,uint64_t flags)
 {
     if(!process || flags&~CloneNewRuntimeNamespaces)return -22;
+    uint64_t network=0;
+    if(flags&CloneNewNet) {
+        const auto irq=IrqSpinLockAcquire(&namespaceLock);
+        if(nextNetworkScope!=~uint64_t{0})network=nextNetworkScope++;
+        IrqSpinLockRelease(&namespaceLock,irq);
+        if(!network)return -28;
+    }
     UtsNamespace* uts=nullptr;
     IpcNamespace* ipc=nullptr;
     if(flags&CloneNewUts) {
@@ -105,6 +114,7 @@ int ProcessNamespacesIsolate(Process* process,uint64_t flags)
         oldIpc=Drop(process->ipcNamespace);
         process->ipcNamespace=ipc;
     }
+    if(network)process->networkScope=network;
     IrqSpinLockRelease(&namespaceLock,irq);
     Destroy(oldUts);
     DestroyIpc(oldIpc);
@@ -122,6 +132,14 @@ const IpcNamespace* ProcessIpcScope(Process* process)
 UserNamespace* ProcessIpcOwner(const IpcNamespace* scope)
 {
     return scope ? scope->owner : nullptr;
+}
+
+uint64_t ProcessNetworkScope(Process* process)
+{
+    const auto irq=IrqSpinLockAcquire(&namespaceLock);
+    const uint64_t scope=process ? process->networkScope : 0;
+    IrqSpinLockRelease(&namespaceLock,irq);
+    return scope;
 }
 
 void ProcessUtsRead(Process* process,char* hostname,char* domain)

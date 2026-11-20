@@ -210,7 +210,7 @@ int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAddr,
     static constexpr uint64_t CLONE_NEWNS           = 0x00020000ULL;
 
     // Other isolation domains must not fall through to an ordinary fork.
-    constexpr uint64_t unsupportedNamespaces=0x02000000ULL|0x20000000ULL|0x40000000ULL;
+    constexpr uint64_t unsupportedNamespaces=0x02000000ULL|0x20000000ULL;
     constexpr uint64_t CLONE_NEWUSER=0x10000000ULL;
     if(flags&unsupportedNamespaces)return -EINVAL;
     Process* parent = ProcessCurrent();

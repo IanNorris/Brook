@@ -221,7 +221,7 @@ uint32_t NetIfCount();
 NetIf* NetIfAt(uint32_t idx);
 // Coherent, bounded read-only interface view, including the working loopback.
 // Names/indices remain stable for the lifetime of the registered interface.
-uint32_t NetInterfaceViews(InterfaceView* out,uint32_t capacity);
+uint32_t NetInterfaceViews(InterfaceView* out,uint32_t capacity,uint64_t scope=0);
 SocketIdentity NetAllocateSocketIdentity(uint32_t uid,uint32_t gid);
 // Caller protects the handle with an FD reference/lock; identity is immutable.
 bool NetlinkGetIdentity(void* handle,SocketIdentity* out);
@@ -229,6 +229,7 @@ bool NetlinkGetIdentity(void* handle,SocketIdentity* out);
 // Socket table accessors for procfs.
 struct SocketSnapshot {
     SocketIdentity identity;
+    uint64_t networkScope;
     bool     used;
     int      type;        // SOCK_STREAM, SOCK_DGRAM
     uint32_t localIp;
@@ -317,6 +318,7 @@ struct __attribute__((packed)) SockAddrIn {
 };
 
 struct Socket {
+    uint64_t  networkScope; // immutable after socket publication
     int       domain;      // AF_INET
     int       type;        // SOCK_DGRAM, SOCK_STREAM
     int       protocol;
@@ -412,7 +414,8 @@ struct Socket {
 };
 
 // Create a kernel socket. Returns socket index or negative error.
-int  SockCreate(int domain, int type, int protocol);
+int  SockCreate(int domain, int type, int protocol,uint64_t networkScope=0);
+uint64_t SockNetworkScope(int sockIdx);
 // Caller owns a socket reference (including a protected live FD). No locks or callbacks.
 bool SockGetIdentity(int sockIdx, SocketIdentity* out);
 // Dequeued child only, before publishing any FD or descriptor alias.
@@ -466,10 +469,10 @@ void SockUnref(int sockIdx);  // decrement refcount, destroy at 0
 // Deliver a UDP datagram to the matching socket (called by stack).
 void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
                     uint32_t dstIp, uint16_t dstPort,
-                    const void* data, uint32_t len);
+                    const void* data, uint32_t len,uint64_t scope=0);
 
 // Handle an incoming TCP segment (called by IP handler).
-void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len);
+void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len,uint64_t scope=0);
 
 // ---------------------------------------------------------------------------
 // DNS resolver
