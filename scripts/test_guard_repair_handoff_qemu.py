@@ -23,7 +23,7 @@ from test_recovery_menu_boot import boot
 from test_recovery_data_dispatch import metadata_hash,outside_esp_hash
 from test_panic_fat_qemu import verify_record
 from test_ext2_idle_flush_sata_qemu import DIRS,FILES
-from test_guard_slot_fallback_qemu import run_matrix
+from test_guard_slot_fallback_qemu import SLOT_CASES,run_matrix
 
 
 def check_pair(path,identity,automatic):
@@ -39,9 +39,16 @@ def check_pair(path,identity,automatic):
             raise ValueError('pair manifest mismatch: '+name)
 
 
-def compact(source,dest,tree,size=8*1024*1024):
+def compact(source,dest,tree,size=8*1024*1024,scrub_deployment=False):
     tree.mkdir()
     subprocess.run(['mcopy','-s','-i',str(source),'::*',str(tree)],check=True)
+    if scrub_deployment:
+        # The local power test needs no deployment credentials or maintenance
+        # grants. Remove them before formatting to avoid stale guest clusters.
+        etc = next(item for item in tree.iterdir() if item.name.lower() == 'etc')
+        for item in etc.iterdir():
+            if item.name.lower() in ('hardware-update-key', 'hardware-maintenance', 'hardware-bulk'):
+                item.unlink()
     with dest.open('wb') as f:f.truncate(size)
     subprocess.run(['mformat','-i',str(dest),'::'],check=True)
     subprocess.run(['mcopy','-s','-i',str(dest),*[str(p) for p in tree.iterdir()],'::/'],check=True)
@@ -55,6 +62,8 @@ def main():
     parser.add_argument('--inject-panic',action='store_true',help='Interrupt the first repair attempt after pending state using GDB')
     parser.add_argument('--auto-desktop',action='store_true',help='Use an automatic guard kernel with checked desktop handoff')
     parser.add_argument('--auto-desktop-slot-fallback',action='store_true',help='Test automatic A/B fallback and profile rejection on disposable copies')
+    parser.add_argument('--slot-fallback-case',choices=SLOT_CASES,action='append',
+                        help='Run only this guarded slot case (repeatable, default: all)')
     parser.add_argument('--auto-desktop-panic',action='store_true',help='Inject a panic after the guarded desktop is mounted')
     parser.add_argument('--auto-desktop-reset',action='store_true',help='Require a QEMU-only timed reset after the desktop panic')
     parser.add_argument('--auto-desktop-production-reset',action='store_true',help='Use guarded desktop reset without the QEMU-only test selector')
@@ -96,9 +105,11 @@ def main():
     if a.auto_desktop_slot_fallback:
         other_modes = set(vars(a)) - {'image', 'efi', 'firmware', 'desktop_pair', 'recovery_pair', 'output',
                                       'identity', 'auto_desktop', 'auto_desktop_slot_fallback', 'managed_profile',
-                                      'auto_desktop_network_module'}
+                                      'auto_desktop_network_module', 'slot_fallback_case'}
         if not a.auto_desktop or not a.auto_desktop_network_module or any(vars(a)[mode] for mode in other_modes):
             parser.error('slot fallback requires --auto-desktop and --auto-desktop-network-module, with optional --managed-profile')
+    elif a.slot_fallback_case:
+        parser.error('--slot-fallback-case requires --auto-desktop-slot-fallback')
     if a.proc_autodump_qa and not a.proc_dump_qa:
         parser.error('automatic core QA requires the live core fixture')
     if a.proc_dump_qa and not a.auto_desktop_dell_initrd:
@@ -183,7 +194,9 @@ def main():
     with tempfile.TemporaryDirectory(prefix='brk-auto-handoff-') as tmp:
         work=Path(tmp);disk=work/'disk.raw';shutil.copyfile(a.image,disk);media=str(disk)+'@@1048576'
         normal=work/'normal.img';recovery=work/'recovery.img'
-        compact(a.desktop_pair/'INITRD.IMG',normal,work/'normal-tree',16*1024*1024 if a.auto_desktop_dell_initrd or a.auto_desktop_slot_fallback else 8*1024*1024)
+        compact(a.desktop_pair/'INITRD.IMG',normal,work/'normal-tree',
+                16*1024*1024 if a.auto_desktop_dell_initrd or a.auto_desktop_slot_fallback else 8*1024*1024,
+                scrub_deployment=a.auto_desktop_slot_fallback)
         compact(a.recovery_pair/'INITRD.IMG',recovery,work/'recovery-tree')
         if a.auto_desktop_dell_initrd or a.auto_desktop_slot_fallback:
             # Bind the candidate boot image to the disposable SATA fixture.
@@ -200,10 +213,6 @@ def main():
             # NIC; the synthetic virtio NIC uses the ordinary TCP path.
             for name in ('arp-async-probe','tcp-async-neighbor','tcp-try-transmit','tcp-async-send',
                          'tcp-producer-wake','tcp-async-retry-1ms','tcp-worker-waiter','tcp-adaptive-flight16'):
-                subprocess.run(['mdel','-i',str(normal),'::/ETC/'+name],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-        if a.auto_desktop_slot_fallback:
-            # The localhost power fixture does not need deployment credentials or maintenance permissions.
-            for name in ('hardware-update-key', 'hardware-maintenance', 'hardware-bulk'):
                 subprocess.run(['mdel','-i',str(normal),'::/ETC/'+name],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         if a.auto_desktop:
             for directory in ('MEDIA','MEDIA/SYSTEM','DATA','NIX'):
