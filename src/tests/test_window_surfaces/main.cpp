@@ -331,11 +331,6 @@ int main() {
     window.state=WindowState::Normal;
     CHECK(WmPushWmEvent(&window,WM_EVT_RESIZED,640,360,WM_RESIZE_RESIZING));
     CHECK(WmInputPop(&window,&event,1)==1 && event.reserved==WM_RESIZE_RESIZING);
-    // Floating drag motion is local. The actual release sends one settled size.
-    CHECK(WmResizeWindow(slot,800,600));
-    CHECK(WmInputPop(&window,&event,1)==1 && event.type==WM_EVT_RESIZED);
-    CHECK(event.x==800 && event.y==600 && !event.reserved);
-    CHECK(WmInputPop(&window,&event,1)==0);
     // Quiet windows have no client dirty pixels. Focus/z-order changes still
     // require a new chrome composition, without waiting for periodic repaint.
     WmAcknowledgeContent(slot,WmSnapshotContent(slot));
@@ -1279,6 +1274,12 @@ int main() {
         WmSetClientSideDecoration(game,true);WmMoveWindow(game,0,0);
         CHECK(WmResizeWindow(game,uint16_t(sw),uint16_t(sh)) && !g.fullscreen && !taskbarShown());
         CHECK(WmResizeWindow(game,uint16_t(sw),uint16_t(sh-1)) && taskbarShown());
+        WmInputPop(&g,drain,256);
+        // The resize release of an API-backed floating window queues a final size.
+        CHECK(WmResizeWindow(game,800,600));
+        CHECK(WmInputPop(&g,&event,1)==1 && event.type==WM_EVT_RESIZED);
+        CHECK(event.x==800 && event.y==600 && !event.reserved);
+        CHECK(WmInputPop(&g,&event,1)==0);
         g.vfb=nullptr;WmDestroyWindowById(gamer,g_windows[editor].wmId);WmDestroyWindowById(gamer,g.wmId);
         CHECK(taskbarShown() && !lockDepth);
         std::free(gamer);
