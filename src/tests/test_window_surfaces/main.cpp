@@ -783,6 +783,21 @@ int main() {
         CHECK(restored.PinCount() == state.pinCount);
         CHECK(!strcmp(restored.PinKey(restored.PinCount() - 1), "snapshot-fixture"));
 
+        const auto historyCount = g_launcherHistoryCount;
+        const auto historyNext = g_launcherHistoryNext;
+        CHECK(historyCount > 0);
+        char* history = g_launcherHistory[(historyNext + LauncherUndoLimit - 1) % LauncherUndoLimit];
+        const char first = history[0];
+        history[0] = 0;
+        testTick = 9000;
+        LauncherFrame(sw, sh, -1, -1);
+        CHECK(!g_launcherModel.UndoVisible()); // Ctrl+Z remains available after the notice expires
+        WmLauncherKey(0x2c, 0, INPUT_MOD_CTRL);
+        CHECK(g_launcherModel.Pinned(1) && g_launcherHistoryCount == historyCount && g_launcherHistoryNext == historyNext);
+        history[0] = first;
+        WmLauncherKey(0x2c, 0, INPUT_MOD_CTRL);
+        CHECK(!g_launcherModel.Pinned(1) && g_launcherHistoryCount == historyCount - 1);
+
         // The newly published snapshot has the same visible apps, but its
         // raw item indices changed. Release must queue the app under the
         // pointer using the current guarded snapshot's item mapping.
