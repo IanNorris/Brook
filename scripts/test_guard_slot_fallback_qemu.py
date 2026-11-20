@@ -27,7 +27,7 @@ CLEAN_RESET = 'AHCI_DIRECT_SESSION_CLEAN'
 HEALTH_WINDOW_MS = 60000
 RECOVERY_USB = 'Recovery payload invalid or missing; use a recovery USB.'
 SLOT_CASES = ('fallback', 'confirmed', 'exhausted', 'profile-rejected', 'profile-repaired',
-              'early-restart', 'post-init-panic', 'zero-journal', 'emergency')
+              'early-restart', 'post-init-panic', 'zero-journal', 'emergency', 'legacy-loader')
 
 
 def read_fat(media, name):
@@ -245,9 +245,14 @@ def run_matrix(a, base_disk, normal, work, guards, metadata, panic_journal):
         ('post-init-panic', (normal, normal), False, [(1, 1, 'panic', [blank, b1]), (*repair, [blank, b1])]),
         ('zero-journal', (normal, normal), False, [(1, None, 'empty-journal', None)]),
         ('emergency', (normal, normal), False, [(1, None, 'emergency', None)]),
+        ('legacy-loader', (normal, normal), True, [(1, None, 'legacy-loader', [blank, b1])]),
     )
     for name, images, seed, starts in scenarios:
-        if a.slot_fallback_case and name not in a.slot_fallback_case:
+        if a.slot_fallback_case:
+            if name not in a.slot_fallback_case:
+                continue
+        elif name == 'legacy-loader':
+            # This case requires the explicitly selected, pinned older EFI.
             continue
         scenario = work / name
         scenario.mkdir()
@@ -275,7 +280,7 @@ def run_matrix(a, base_disk, normal, work, guards, metadata, panic_journal):
         write_fat(media, 'BROOK.CFG', cfg)
         health = scenario / 'BOOTSTAT.BIN'
         raw_health = seed_health(a.identity, selectors, seed)
-        if seed:
+        if name == 'confirmed':
             # Simulate a completely torn write-target sector beside the valid strike.
             raw_health = raw_health[:512] + bytes([0xa5])*512
         if name == 'zero-journal':
@@ -306,7 +311,7 @@ def run_matrix(a, base_disk, normal, work, guards, metadata, panic_journal):
             failure_marker = '*** KERNEL PANIC ***'
             gdb_script = on_marker = intermediate = port = None
             prefix = a.output / f'{name}-{i}'
-            if result in ('success', 'early-restart', 'empty-journal', 'emergency'):
+            if result in ('success', 'early-restart', 'empty-journal', 'emergency', 'legacy-loader'):
                 with socket.socket() as probe:
                     probe.bind(('127.0.0.1', 0))
                     port = probe.getsockname()[1]
@@ -384,6 +389,12 @@ def run_matrix(a, base_disk, normal, work, guards, metadata, panic_journal):
             if result == 'emergency' and ('Brook guard emergency generation 42 slot 1 verified' not in serial or
                                           'GUARD_SLOT_UNTRACKED reason=emergency-loader' not in serial):
                 raise RuntimeError('verified slot did not run untracked in the emergency path')
+            if result == 'legacy-loader' and ('Brook update generation 42 verified' not in serial or
+                                               'GUARD_SLOT_UNTRACKED reason=no-loader-key' not in serial):
+                raise RuntimeError('previous loader could not start the verified slot untracked')
+            if result in ('empty-journal', 'emergency', 'legacy-loader') and (
+                    read_fat(media, 'RECOVERY/BOOTSTAT.BIN') != before_health or CLEAN_RESET not in serial):
+                raise RuntimeError(f'{name}-{i}: untracked desktop charged a slot or failed checked sync')
             guarded_records = [read_fat(media, f'RECOVERY/GUARD{j}.BIN') for j in range(2)]
             if result == 'repair':
                 if ('GUARD_AUTO_NEEDS_CHECK' not in serial or 'GUARD_COMPLETE_RESULT outcome=2' not in serial or
@@ -395,8 +406,6 @@ def run_matrix(a, base_disk, normal, work, guards, metadata, panic_journal):
                     raise RuntimeError('guarded profile recovery did not publish a clean guard')
                 expected_guards = guarded_records
             if expected is None:
-                if read_fat(media, 'RECOVERY/BOOTSTAT.BIN') != before_health or CLEAN_RESET not in serial:
-                    raise RuntimeError(f'{name}-{i}: untracked desktop charged a slot or failed checked sync')
                 report = dict(sequence=None, slots=[])
             else:
                 report = read_health(media, a.identity, selectors, sequence, expected)

@@ -63,7 +63,7 @@ def main():
     parser.add_argument('--auto-desktop',action='store_true',help='Use an automatic guard kernel with checked desktop handoff')
     parser.add_argument('--auto-desktop-slot-fallback',action='store_true',help='Test automatic A/B fallback and profile rejection on disposable copies')
     parser.add_argument('--slot-fallback-case',choices=SLOT_CASES,action='append',
-                        help='Run only this guarded slot case (repeatable, default: all)')
+                        help='Run a guarded slot case (repeatable; legacy-loader requires a separately selected old EFI)')
     parser.add_argument('--auto-desktop-panic',action='store_true',help='Inject a panic after the guarded desktop is mounted')
     parser.add_argument('--auto-desktop-reset',action='store_true',help='Require a QEMU-only timed reset after the desktop panic')
     parser.add_argument('--auto-desktop-production-reset',action='store_true',help='Use guarded desktop reset without the QEMU-only test selector')
