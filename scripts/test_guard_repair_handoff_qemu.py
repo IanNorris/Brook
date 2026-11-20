@@ -23,7 +23,7 @@ from test_recovery_menu_boot import boot
 from test_recovery_data_dispatch import metadata_hash,outside_esp_hash
 from test_panic_fat_qemu import verify_record
 from test_ext2_idle_flush_sata_qemu import DIRS,FILES
-from test_guard_slot_fallback_qemu import SLOT_CASES,run_matrix
+from test_guard_slot_fallback_qemu import SLOT_CASES,boot_matrix_step,run_matrix
 
 
 def check_pair(path,identity,automatic):
@@ -423,11 +423,18 @@ def main():
                 report=bridge.recovery_panic(session,destination,previous=previous)
                 if destination.read_bytes()!=packet or report['sequence']!=(1 if previous else 2):
                     raise RuntimeError('wrong recovery panic record')
-        boot(disk,a.firmware,first,False,'GUARD_COMPLETE_RESTART',120,True,sata_snapshot=False,
-             sata_serial='BROOK-RECOVERY-QA',expect_reset=True,reset_evidence_marker='GUARD_COMPLETE_RESTART',
-             failure_marker='GUARD_EXT2_INCOMPLETE',extra_fw_cfg=['name=opt/brook/power,string=q35-reset'],
-             network_port=recovery_port,intermediate_marker='GUARD_PANIC_RETRIEVAL_WINDOW 10s' if a.two_panic_records else None,
-             on_intermediate=retrieve_during_repair if a.two_panic_records else None)
+        repair_marker = 'GUARD_COMPLETE_RESTART'
+        repair_options = dict(sata_snapshot=False, sata_serial='BROOK-RECOVERY-QA',
+                              expect_reset=True, reset_evidence_marker=repair_marker,
+                              failure_marker='GUARD_EXT2_INCOMPLETE',
+                              extra_fw_cfg=['name=opt/brook/power,string=q35-reset'],
+                              network_port=recovery_port,
+                              intermediate_marker='GUARD_PANIC_RETRIEVAL_WINDOW 10s' if a.two_panic_records else None,
+                              on_intermediate=retrieve_during_repair if a.two_panic_records else None)
+        if a.auto_desktop_slot_fallback:
+            boot_matrix_step(disk, a.firmware, first, repair_marker, a.output / 'initial-repair', **repair_options)
+        else:
+            boot(disk, a.firmware, first, False, repair_marker, 120, True, **repair_options)
         shutil.copyfile(first/'serial.log',a.output/'repair-serial.log')
         serial=(first/'serial.log').read_text(errors='replace')
         if a.inject_panic:
