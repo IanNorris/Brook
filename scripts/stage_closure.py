@@ -56,7 +56,7 @@ def upstream_has(name, entry):
         fields.get("StorePath") == str(STORE / name)
         and nar_hash(fields["NarHash"]) == entry["narHash"]
         and int(fields["NarSize"]) == entry["narSize"]
-        and sorted(fields["References"].split()) == entry["references"]
+        and sorted(fields.get("References", "").split()) == entry["references"]
     )
 
 
