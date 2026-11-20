@@ -158,6 +158,7 @@ def make_initrds(work, build, payload, policy, profile, commit, name):
     shell = Path(output('nix-build', '--no-out-link', ROOT / 'tools/clearwater-shell-pkg/default.nix'))
     embed_clearwater_executables(desktop, supervisor / 'bin/CWSUP.ELF', shell / 'bin/CWSHELL.ELF')
     embed_terminal_shortcut(desktop)
+    fat_write(desktop, 'ETC/hardware-bulk', b'1\n')
     fat_write(desktop, 'BOOT/INIT.RC', add_clearwater_start(DESKTOP_RC))
     fat_write(recovery, 'BOOT/INIT.RC', RECOVERY_RC)
     fat_write(desktop, 'BOOT/BIN/BASH', (profile / 'bin/bash').read_bytes())
