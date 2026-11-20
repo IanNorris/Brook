@@ -132,6 +132,8 @@ def main():
     parser.add_argument('--expression', type=Path, default=ROOT/'nix/hardware-network-packages.nix')
     parser.add_argument('--index', type=Path, default=ROOT/'tools/nix-index/packages.idx')
     parser.add_argument('--size-mib', type=int, default=3840)
+    parser.add_argument('--direct-ahci', action='store_true',
+                        help='Allow a larger image for a direct partition, outside a FAT32 file')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     profile = args.profile.resolve(strict=True)
@@ -147,8 +149,9 @@ def main():
     size = args.size_mib*1024*1024
     if profile.parent != Path('/nix/store') or not profile.is_dir():
         parser.error('Profile must resolve to a built Nix store directory')
-    if not 512*1024*1024 <= size <= FAT_FILE_MAX:
-        parser.error('Image must be 512 MiB..FAT32 file limit')
+    limit = 32 * 1024 * 1024 * 1024 if args.direct_ahci else FAT_FILE_MAX
+    if not 512 * 1024 * 1024 <= size <= limit:
+        parser.error('Image size is out of range for the selected disk layout')
     compiler = os.environ.get('MUSL_CC')
     if not compiler:
         parser.error('Run inside nix-shell with MUSL_CC')
@@ -224,8 +227,9 @@ def main():
     image = output/'STORE.IMG'
     with image.open('xb') as stream:
         stream.truncate(size)
+    inodes = max(131072, size // 32768) if args.direct_ahci else 131072
     run('mke2fs', '-q', '-t', 'ext2', '-b', '4096', '-I', '128', '-m', '0',
-        '-N', '131072', '-O', 'none,filetype,sparse_super,large_file',
+        '-N', str(inodes), '-O', 'none,filetype,sparse_super,large_file',
         '-U', identifier, '-L', 'BRKDESKTOP', '-d', seed, image)
     inventory = normalize_owners(image, output)
     with image.open('rb') as stream:
