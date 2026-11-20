@@ -41,7 +41,7 @@ glass-100-app-notification 52e6c96a89c9b1e9
 glass-100-app-tray 1ceebbe4b0ffecb2
 glass-100-app-tray-menu 341617944d94d15e
 glass-100-boot-summary 0657a14d812bf63e
-glass-100-disk-popup 77b42b85f27a89d3
+glass-100-disk-popup d687b7c42448d37f
 glass-100-dock-drop-chip 481f2df443fbe0e3
 glass-100-dock-drop-chip-right 3c24a7dd336b516b
 glass-100-dock-drop-open f21ced6a996cd9f1
@@ -721,7 +721,7 @@ opaque-dark-200-app-notification 049602cff51c9ee6
 opaque-dark-200-app-tray 5bc4c78bb439eb69
 opaque-dark-200-app-tray-menu d88767b607525051
 opaque-dark-200-boot-summary 8803b811dd2e81e8
-opaque-dark-200-disk-popup 4e45805ed9b9d3b1
+opaque-dark-200-disk-popup f000698c7acef1e1
 opaque-dark-200-frame-active f69e1d0cb8e7695e
 opaque-dark-200-frame-active-glass 53e6389c4363301b
 opaque-dark-200-frame-csd 66f50a3e2967ad48
@@ -798,7 +798,7 @@ opaque-light-150-app-notification 91501b4e7e6cdb37
 opaque-light-150-app-tray e525bd85ca30fc03
 opaque-light-150-app-tray-menu 703c1693e2e30609
 opaque-light-150-boot-summary 6469599399781e5c
-opaque-light-150-disk-popup ba60dec0cb866b21
+opaque-light-150-disk-popup 5d1079ef38402255
 opaque-light-150-frame-active 0df3643c6fe10dfe
 opaque-light-150-frame-active-glass 5a93f855464d46bb
 opaque-light-150-frame-csd fe642fbb599d59ab

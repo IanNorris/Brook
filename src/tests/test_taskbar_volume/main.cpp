@@ -115,6 +115,14 @@ static void checkDiskVolumes() {
     CHECK(!DesktopDiskCapacity(4096, 0, 1, total, free));
     CHECK(!DesktopDiskCapacity(0, 1, 0, total, free));
     CHECK(DesktopDiskCapacity(1, 1, 0, total, free) && free == 0);
+    CHECK(DesktopDiskUsagePercent(0, 0) == 0);
+    CHECK(DesktopDiskUsagePercent(1000, 1001) == 0);
+    CHECK(DesktopDiskUsagePercent(1000, 201) == 79);
+    CHECK(DesktopDiskUsagePercent(1000, 200) == 80);
+    CHECK(DesktopDiskUsagePercent(1000, 100) == 90);
+    CHECK(DesktopDiskUsagePercent(1000, 0) == 100);
+    CHECK(DesktopDiskUsagePercent(~uint64_t{0}, 1) == 99);
+    CHECK(DesktopDiskUsagePercent(~uint64_t{0}, 0) == 100);
     CHECK(DesktopDiskVolumeVisible("/nix", "ext2", false));
     CHECK(DesktopDiskVolumeVisible("/media/usb", "fatfs", false));
     CHECK(DesktopDiskVolumeVisible("/media/unknown", "ext4", false));

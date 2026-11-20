@@ -1225,6 +1225,18 @@ void ChromeBuildDiskPopup(const ChromeDiskPopupLayout& l, const DesktopDiskPage&
         const int valueW = s.TextWidth(value, CF::Small);
         const int top = l.rows.y + int(i) * l.rowHeight;
         const int nameWidth = w - valueW - Px(s, 8);
+        if (row.available && row.totalBytes && row.freeBytes <= row.totalBytes) {
+            const uint32_t percent = DesktopDiskUsagePercent(row.totalBytes, row.freeBytes);
+            const uint64_t warningFree = row.totalBytes / 10 + (row.totalBytes % 10 != 0);
+            const uint32_t color = row.freeBytes < warningFree ? p.hot :
+                                   percent < 80 ? p.accent : p.secondaryText;
+            const int barY = top + l.rowHeight - Px(s, 3);
+            const int height = Px(s, 2);
+            const uint32_t track = ChromeBlendColor(p.launcher, p.mutedText, 66);
+            dl.Fill(x, barY, w, height, 0xff000000u | track);
+            const int filled = w * int(percent) / 100;
+            if (filled > 0) dl.Fill(x, barY, filled, height, 0xff000000u | color);
+        }
         ChromeElidedText(dl, s, CF::Label, x, top + (l.rowHeight - s.Line(CF::Label)) / 2,
                          row.path, p.text, nameWidth);
         if (valueW <= w) TextRight(dl, s, CF::Small, x + w, top + (l.rowHeight - s.Line(CF::Small)) / 2,
