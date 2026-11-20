@@ -5,6 +5,16 @@ Current state and immediate goal. Keep this short and current: replace stale lin
 _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review follow-up)._
 
 
+## xdg-shell window controls (20 November 2026)
+
+- `work/xdg-wm-capabilities` advertises v5 with logical configure bounds and
+  Maximise, Minimise and Fullscreen capabilities. GTK4 enabled both formerly
+  insensitive controls on a private Wayland display. GTK3 and Chromium
+  retained the initial configure handshake.
+- Headless Release, 386 non-stress host tests and the standard and Vulkan
+  waylandd package fixtures passed. Logs and matched client traces are in
+  `build/xdg-evidence`. The Dell still needs to exercise the buttons.
+
 ## Session environment and executable cache (19 November 2026)
 
 - `work/session-env` uses an app-owned `/tmp/brook-$UID` directory with mode
