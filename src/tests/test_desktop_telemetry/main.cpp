@@ -23,6 +23,20 @@ int main(){
     assert(brook_taskbar_metrics_setting(3,"taskbar_metrics=127")==127);
     for(const char* invalid:{"taskbar_metrics=128","taskbar_metrics=-1","taskbar_metrics=1000","taskbar_metrics=","taskbar_metrics=3junk","theme=1"})
         assert(brook_taskbar_metrics_setting(BROOK_TASKBAR_DEFAULT,invalid)==BROOK_TASKBAR_DEFAULT);
+    assert(BROOK_TASKBAR_ADVANCED_DETAILS_DEFAULT==0);
+    assert(BROOK_TASKBAR_OP_GET_METRICS==0 && BROOK_TASKBAR_OP_SET_METRICS==1);
+    assert(brook_taskbar_advanced_details_valid(0) && brook_taskbar_advanced_details_valid(1));
+    assert(!brook_taskbar_advanced_details_valid(2) && !brook_taskbar_advanced_details_valid(UINT64_MAX));
+    int advanced=BROOK_TASKBAR_ADVANCED_DETAILS_DEFAULT;
+    advanced=brook_taskbar_advanced_details_setting(advanced,"taskbar_metrics=7");
+    assert(advanced==0);
+    advanced=brook_taskbar_advanced_details_setting(advanced,"show_advanced_details=1 \r");
+    assert(advanced==1);
+    for(const char* invalid:{"show_advanced_details=", "show_advanced_details=true",
+                             "show_advanced_details=2", "show_advanced_details=-1",
+                             "show_advanced_details=0junk","show_advanced_details=00"})
+        assert(brook_taskbar_advanced_details_setting(advanced,invalid)==1);
+    assert(brook_taskbar_advanced_details_setting(advanced,"show_advanced_details=0")==0);
     {
         // GPU-source client frames: each new commit of the focused window
         // counts once; retained re-samples, other windows and stale or zero

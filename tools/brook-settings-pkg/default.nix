@@ -17,6 +17,13 @@ pkgs.stdenv.mkDerivation {
   buildPhase = ''
     $CC -O2 -Wall -Wextra -Werror settings.c $(pkg-config --cflags --libs gtk+-3.0) -o brook-settings
   '';
+  doCheck = true;
+  checkPhase = ''
+    runHook preCheck
+    $CC -O2 -Wall -Wextra -Werror settings-persistence-test.c $(pkg-config --cflags --libs gtk+-3.0) -o settings-persistence-test
+    ./settings-persistence-test
+    runHook postCheck
+  '';
   installPhase = ''
     mkdir -p $out/bin $out/share/applications $out/share/icons/hicolor/scalable/apps
     install -m755 brook-settings $out/bin/

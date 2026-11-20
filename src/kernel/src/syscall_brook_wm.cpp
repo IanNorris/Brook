@@ -268,7 +268,6 @@ int64_t sys_brook_wm_appearance(uint64_t op,uint64_t value,uint64_t,uint64_t,uin
     return WmSetAppearance(static_cast<uint32_t>(value))?0:-EINVAL;
 }
 
-// 0xB0C: independently selectable taskbar telemetry widgets.
 int64_t sys_brook_pointer_speed(uint64_t op,uint64_t value,uint64_t,uint64_t,uint64_t,uint64_t){
     if(!ProcessCurrent())return -ESRCH;
     if(op==0)return MouseTouchpadSpeed();
@@ -283,11 +282,23 @@ int64_t sys_brook_touchpad_tap(uint64_t op,uint64_t value,uint64_t,uint64_t,uint
     MouseTouchpadSetTap(value!=0);
     return 0;
 }
+// 0xB0C: taskbar telemetry widgets and popup-opening preference.
 int64_t sys_brook_wm_taskbar_metrics(uint64_t op,uint64_t value,uint64_t,uint64_t,uint64_t,uint64_t){
     if(!ProcessCurrent())return -ESRCH;
-    if(op==0)return WmGetTaskbarMetrics();
-    if(op!=1||value>0xffffffffULL)return -EINVAL;
-    return WmSetTaskbarMetrics(static_cast<uint32_t>(value))?0:-EINVAL;
+    switch(op){
+    case BROOK_TASKBAR_OP_GET_METRICS:
+        return WmGetTaskbarMetrics();
+    case BROOK_TASKBAR_OP_SET_METRICS:
+        return value<=0xffffffffULL && WmSetTaskbarMetrics(static_cast<uint32_t>(value))?0:-EINVAL;
+    case BROOK_TASKBAR_OP_GET_ADVANCED_DETAILS:
+        return WmGetShowAdvancedDetails()?1:0;
+    case BROOK_TASKBAR_OP_SET_ADVANCED_DETAILS:
+        if(!brook_taskbar_advanced_details_valid(value))return -EINVAL;
+        WmSetShowAdvancedDetails(value!=0);
+        return 0;
+    default:
+        return -EINVAL;
+    }
 }
 
 // 0xB04: native desktop scale. Query requested (0), request (1), query applied (2).
