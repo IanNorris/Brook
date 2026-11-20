@@ -4,13 +4,21 @@ bool IoApicSelectBootLevelPin(uint8_t pin)
     return g_ioApicVirt && pin<g_ioApicEntries && g_ioApicRoutePolicy.SelectBootLevel(pin);
 }
 
-bool IoApicSelectBootLevelGsi(uint32_t gsi,bool activeLow,uint8_t& pin)
+bool IoApicResolvePin(uint32_t gsi,uint8_t& pin)
 {
     if(!g_ioApicVirt || gsi<g_ioApicGsiBase)return false;
     const uint32_t index=gsi-g_ioApicGsiBase;
-    if(index>=g_ioApicEntries || index>=32 ||
-       !g_ioApicRoutePolicy.SelectBootLevelAndPolarity(uint8_t(index),activeLow))return false;
+    if(index>=g_ioApicEntries || index>=32)return false;
     pin=uint8_t(index);
+    return true;
+}
+
+bool IoApicSelectBootLevelGsi(uint32_t gsi,bool activeLow,uint8_t& pin)
+{
+    uint8_t resolved;
+    if(!IoApicResolvePin(gsi,resolved) ||
+       !g_ioApicRoutePolicy.SelectBootLevelAndPolarity(resolved,activeLow))return false;
+    pin=resolved;
     return true;
 }
 

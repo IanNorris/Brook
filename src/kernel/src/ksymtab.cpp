@@ -198,7 +198,7 @@ EXPORT_SYMBOL(IdtInstallHandler);
 EXPORT_SYMBOL(ApicGetId);
 EXPORT_SYMBOL(IoApicUnmaskIrq);
 EXPORT_SYMBOL(IoApicRegisterHandler);
-EXPORT_SYMBOL(IoApicSelectBootLevelPin);
+EXPORT_SYMBOL(IoApicResolvePin);
 EXPORT_SYMBOL(IoApicUnregisterHandler);
 EXPORT_SYMBOL(ApicSendEoi);
 

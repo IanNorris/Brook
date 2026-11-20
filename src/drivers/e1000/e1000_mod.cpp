@@ -2,6 +2,7 @@
 // Intel 82574 GbE Controller Family Datasheet, chapters 7, 8 and 10.
 // One legacy RX/TX queue, standard Ethernet MTU and shared PCI INTx.
 #include "e1000_ring.h"
+#include "e1000_pci_path.h"
 
 #include "apic.h"
 #include "idt.h"
@@ -13,6 +14,7 @@
 #include "pci.h"
 #include "serial.h"
 #include "spinlock.h"
+#include "vfs.h"
 #ifdef BROOK_HOST_TEST
 #include <string.h>
 #else
@@ -21,7 +23,7 @@
 
 MODULE_IMPORT_SYMBOL(ApicTickCount);
 MODULE_IMPORT_SYMBOL(IoApicRegisterHandler);
-MODULE_IMPORT_SYMBOL(IoApicSelectBootLevelPin);
+MODULE_IMPORT_SYMBOL(IoApicResolvePin);
 MODULE_IMPORT_SYMBOL(IoApicUnregisterHandler);
 MODULE_IMPORT_SYMBOL(KPrintf);
 MODULE_IMPORT_SYMBOL(NetReceive);
@@ -29,10 +31,13 @@ MODULE_IMPORT_SYMBOL(NetRegisterIf);
 MODULE_IMPORT_SYMBOL(NetWakePollThread);
 MODULE_IMPORT_SYMBOL(PciConfigRead8);
 MODULE_IMPORT_SYMBOL(PciConfigRead16);
+MODULE_IMPORT_SYMBOL(PciConfigRead32);
 MODULE_IMPORT_SYMBOL(PciConfigWrite16);
 MODULE_IMPORT_SYMBOL(PciFindDevice);
 MODULE_IMPORT_SYMBOL(PmmFreePage);
 MODULE_IMPORT_SYMBOL(SerialPrintf);
+MODULE_IMPORT_SYMBOL(VfsClose);
+MODULE_IMPORT_SYMBOL(VfsOpen);
 MODULE_IMPORT_SYMBOL(VmmAllocPages);
 MODULE_IMPORT_SYMBOL(VmmAllocPagesAccounted);
 MODULE_IMPORT_SYMBOL(VmmDetachPage);
@@ -55,7 +60,8 @@ enum Register : uint32_t {
 };
 
 constexpr uint32_t CtrlReset = 1u << 26, CtrlSetLinkUp = 1u << 6;
-constexpr uint32_t StatusLinkUp = 1u << 1;
+constexpr uint32_t CtrlPcieMasterDisable = 1u << 2;
+constexpr uint32_t StatusLinkUp = 1u << 1, StatusPcieMasterEnabled = 1u << 19;
 constexpr uint32_t EecdAutoloadDone = 1u << 9, RxExtendedStatus = 1u << 15;
 constexpr uint32_t RxEnable = 1u << 1, RxBroadcast = 1u << 15, RxStripFcs = 1u << 26;
 constexpr uint32_t TxEnable = 1u << 1, TxPadShort = 1u << 3;
@@ -75,6 +81,8 @@ struct DmaRing {
 };
 
 PciDevice g_device{};
+const Device* g_model = nullptr;
+bool g_dmaEnabled = false;
 uint16_t g_pciCommand = 0;
 volatile uint32_t* g_regs = nullptr;
 uint32_t g_mappedPages = 0;
@@ -85,6 +93,7 @@ RxRing g_rx{};
 TxRing g_tx{};
 SpinLock g_rxLock{}, g_txLock{};
 bool g_linkUp = false;
+uint64_t g_nextLinkSample = 0;
 
 uint32_t Read(Register reg) { return g_regs[reg / 4]; }
 void Write(Register reg, uint32_t value) { g_regs[reg / 4] = value; }
@@ -92,6 +101,25 @@ void Write(Register reg, uint32_t value) { g_regs[reg / 4] = value; }
 void SetPciCommand(uint16_t command)
 {
     PciConfigWrite16(g_device.bus, g_device.dev, g_device.fn, 0x04, command);
+}
+
+bool EnableUpstream()
+{
+    Bridge path[32];
+    unsigned count;
+    if (!FindBridgePath(g_device.bus, PciConfigRead32, path, count)) return false;
+    for (unsigned i = 0; i < count; ++i) {
+        const auto& b = path[i];
+        const uint16_t before = PciConfigRead16(b.bus, b.device, b.function, 0x04);
+        constexpr uint16_t required = PciMemory | PciMaster;
+        if ((before & required) != required)
+            PciConfigWrite16(b.bus, b.device, b.function, 0x04, before | required);
+        const uint16_t after = PciConfigRead16(b.bus, b.device, b.function, 0x04);
+        SerialPrintf("e1000: bridge %02x:%02x.%u secondary=%u command=%04x->%04x\n",
+                     b.bus, b.device, b.function, b.secondary, before, after);
+        if ((after & required) != required) return false;
+    }
+    return true;
 }
 
 void FreeMmio()
@@ -168,7 +196,6 @@ bool Reset(const Device& model)
     Write(Tctl, 0);
     (void)Read(Status); // flush posted disabling writes before reset
     Write(Ctrl, Read(Ctrl) | CtrlReset);
-    (void)Read(Status);
     const uint64_t start = ApicTickCount();
     // Older parts need time for their EEPROM autoload. Give it at least 10 ms
     // after reset, and retain a hard bound if the boot clock stalls.
@@ -232,10 +259,14 @@ void Poll(NetIf* nif)
     // NetReceive can reenter polling via the stack. One poller owns the
     // completed buffers until delivery ends, while TX uses its own lock.
     if (!SpinLockTryAcquire(&g_rxLock)) return;
-    const bool linkUp = Read(Status) & StatusLinkUp;
-    if (linkUp != g_linkUp) {
-        g_linkUp = linkUp;
-        SerialPrintf("e1000: link %s\n", linkUp ? "up" : "down");
+    const uint64_t now = ApicTickCount();
+    if (now >= g_nextLinkSample) {
+        g_nextLinkSample = now + 100;
+        const bool linkUp = Read(Status) & StatusLinkUp;
+        if (linkUp != g_linkUp) {
+            g_linkUp = linkUp;
+            SerialPrintf("e1000: link %s\n", linkUp ? "up" : "down");
+        }
     }
 
     auto* descriptors = reinterpret_cast<RxDescriptor*>(g_rxDma.descriptors.raw());
@@ -266,21 +297,44 @@ void Interrupt()
     if (Read(Icr) & (InterruptRx | InterruptLink)) NetWakePollThread();
 }
 
+bool DisablePcieMaster()
+{
+    Write(Ctrl, Read(Ctrl) | CtrlPcieMasterDisable);
+    const uint64_t start = ApicTickCount();
+    for (uint32_t spin = 0; spin < 100000; ++spin) {
+        if (!(Read(Status) & StatusPcieMasterEnabled)) return true;
+        if (ApicTickCount() - start >= 100) break;
+        __asm__ volatile("pause");
+    }
+    return false;
+}
+
 void Stop()
 {
+    bool drained = true;
     if (g_regs && g_mappedPages == MmioPages) {
         Write(Imc, ~0u);
         Write(Rctl, 0);
         Write(Tctl, 0);
         (void)Read(Icr);
+        if (g_dmaEnabled && g_model->pcie) drained = DisablePcieMaster();
     }
-    SetPciCommand((g_pciCommand | PciIntDisable) & ~PciMaster);
+    SetPciCommand((g_pciCommand | PciMemory | PciIntDisable) & ~PciMaster);
+    if (g_dmaEnabled) {
+        const bool reset = Reset(*g_model);
+        drained = drained && reset;
+    }
+    g_dmaEnabled = false;
     if (g_irq != 0xff) {
         IoApicUnregisterHandler(g_irq, reinterpret_cast<void*>(Interrupt));
         g_irq = 0xff;
     }
-    FreeDma(g_rxDma);
-    FreeDma(g_txDma);
+    if (drained) {
+        FreeDma(g_rxDma);
+        FreeDma(g_txDma);
+    } else {
+        SerialPrintf("e1000: DMA quiescence unconfirmed, keeping rings pinned\n");
+    }
     FreeMmio();
     SetPciCommand(g_pciCommand & ~PciMaster);
 }
@@ -303,6 +357,11 @@ int ModuleInit()
     if (!physical || physical % PageSize || physical > MaxPhysicalPage - (MmioPages - 1) * PageSize)
         return -1;
 
+    if (!EnableUpstream()) {
+        SerialPrintf("e1000: no enabled bridge path to bus %u\n", g_device.bus);
+        return -1;
+    }
+    g_model = model;
     g_pciCommand = PciConfigRead16(g_device.bus, g_device.dev, g_device.fn, 0x04);
     SetPciCommand((g_pciCommand | PciMemory | PciIntDisable) & ~PciMaster);
     if (!MapMmio(physical) || !Reset(*model) || !ReadMac(g_interface.mac) ||
@@ -320,33 +379,46 @@ int ModuleInit()
     Write(Radv, 0);
     WriteRing(Rdbal, Rdbah, Rdlen, Rdh, Rdt, g_rxDma.descriptors);
     WriteRing(Tdbal, Tdbah, Tdlen, Tdh, Tdt, g_txDma.descriptors);
-    // 82574 has six internal MAC clocks of delay, versus two on 8254x.
-    const uint32_t interPacketGap = model->pcie ? 6u : 10u;
-    Write(Tipg, interPacketGap | (8u << 10) | (6u << 20));
+    Write(Tipg, 8u | (8u << 10) | (6u << 20)); // copper
 
-    const uint8_t pin = PciConfigRead8(g_device.bus, g_device.dev, g_device.fn, 0x3c);
-    if (pin >= 3 && IoApicSelectBootLevelPin(pin)) {
-        IoApicRegisterHandler(pin, 47, reinterpret_cast<void*>(Interrupt));
-        g_irq = pin;
-    }
-    uint16_t command = g_pciCommand | PciMemory | PciMaster | PciIntDisable;
-    if (g_irq != 0xff) command &= ~PciIntDisable;
+    const uint8_t firmwareLine = PciConfigRead8(g_device.bus, g_device.dev, g_device.fn, 0x3c);
+    const uint16_t command = g_pciCommand | PciMemory | PciMaster | PciIntDisable;
     SetPciCommand(command);
+    g_dmaEnabled = true;
     Write(Tctl, TxEnable | TxPadShort | (0x0fu << 4) | (0x40u << 12));
     Write(Rctl, RxEnable | RxBroadcast | RxStripFcs); // 2048-byte legacy buffers
     __asm__ volatile("sfence" ::: "memory");
     Write(Rdt, RingSize - 1);
     (void)Read(Icr);
-    if (g_irq != 0xff) Write(Ims, InterruptRx | InterruptLink);
 
     g_interface.transmit = Transmit;
     g_interface.tryTransmit = TryTransmit;
     g_interface.poll = Poll;
-    g_linkUp = Read(Status) & StatusLinkUp;
-    NetRegisterIf(&g_interface);
+    const bool linkUp = Read(Status) & StatusLinkUp;
+    g_linkUp = linkUp;
+    if (!NetRegisterIf(&g_interface)) {
+        Stop();
+        return -1;
+    }
+
+    // The firmware Interrupt Line is advisory. Only a fixture/operator
+    // with a verified route should enable it. Never change the IOAPIC's
+    // trigger or polarity based on that byte at module load time.
+    if (auto* option = VfsOpen("/etc/e1000-intx")) {
+        VfsClose(option);
+        uint8_t pin;
+        if (firmwareLine >= 3 && firmwareLine < 16 && IoApicResolvePin(firmwareLine, pin)) {
+            IoApicRegisterHandler(pin, 47, reinterpret_cast<void*>(Interrupt));
+            g_irq = pin;
+            SetPciCommand(command & ~PciIntDisable);
+            Write(Ims, InterruptRx | InterruptLink);
+        }
+    }
+    SerialPrintf("e1000: PCI interrupt line=%u selected_gsi=%d mode=%s\n", firmwareLine,
+                 g_irq == 0xff ? -1 : int(firmwareLine), g_irq == 0xff ? "poll" : "intx");
     const auto& mac = g_interface.mac.b;
     KPrintf("e1000: %s ready, MAC=%02x:%02x:%02x:%02x:%02x:%02x link=%s irq=%u\n",
-            model->name, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], g_linkUp ? "up" : "down", g_irq);
+            model->name, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], linkUp ? "up" : "down", g_irq);
     return 0;
 }
 
