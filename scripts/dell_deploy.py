@@ -19,33 +19,20 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 KEY = Path('/data/Programming/Brook/shared/dell/hardware-update-key')
 
-p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-p.add_argument('--session', required=True); p.add_argument('--pair', type=Path, required=True)
-p.add_argument('--output', type=Path, required=True); p.add_argument('--allow-dirty', action='store_true')
-p.add_argument('--boot-timeout-s', type=int, default=240)
-p.add_argument('--operator-key-file', type=Path, help='Host private key admitted by the new v3 image')
-p.add_argument('--profile-timeout-s', type=int, default=3600)
-profile = p.add_mutually_exclusive_group()
-profile.add_argument('--profile-plan', type=Path, metavar='DIRECTORY')
-profile.add_argument('--rollback-profile', type=Path, metavar='PROFILE_RECEIPT')
-p.add_argument('--push-profile-cache', action='store_true',
-               help='also push the local cache/ for a signed plan with a host URL')
-a = p.parse_args()
-if a.push_profile_cache and not a.profile_plan:
-    p.error('--push-profile-cache requires --profile-plan')
-
 def sha(path):
     with path.open('rb') as stream:
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
-def stage_profile():
+def stage_profile(args, *, bridge=None, bulk_port=1236):
+    a = args
     sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools/vm_bridge')]
     from hardware import Hardware
     from hardware_bulk_workflow import BulkRun
     from hardware_update_workflow import UpdateRun
 
-    bridge = Hardware()
+    if bridge is None:
+        bridge = Hardware()
     journal = UpdateRun(bridge, a.output / 'profile')
     journal.output.mkdir(mode=0o700, parents=True)
     tx = uuid.uuid4().hex
@@ -96,7 +83,7 @@ def stage_profile():
                 is_bundle = source in bundles
                 digest = sha(source) if is_bundle else journal.receipt['profile_files'][source.name]
                 bulk = BulkRun(bridge, journal.output / (source.stem if is_bundle else source.name))
-                receipt = bulk.execute(a.session, KEY, 'put', source=source)
+                receipt = bulk.execute(a.session, KEY, 'put', source=source, port=bulk_port)
                 transfer = receipt['transfer']
                 if transfer['sha256'] != digest:
                     raise ValueError(f'{source.name} changed during transfer')
@@ -118,73 +105,95 @@ def stage_profile():
         journal.save(state='needs_inspection', error=str(error))
         raise
     return journal
-manifest = json.loads((a.pair / 'build-manifest.json').read_text())
-verdict_path = a.pair / 'qemu-check' / 'verdict.json'
-if not verdict_path.exists(): sys.exit(f'refusing: no QEMU verdict at {verdict_path}')
-verdict = json.loads(verdict_path.read_text())
-kernel, initrd = a.pair / 'kernel.elf', a.pair / 'INITRD.IMG'
-if verdict.get('passed') is not True: sys.exit('refusing: QEMU check did not pass (rerun scripts/check_dell_image_qemu.py --force)')
-for name, path in (('kernel_sha256', kernel), ('initrd_sha256', initrd)):
-    if verdict.get(name) not in (None, sha(path)) or manifest.get(name) != sha(path):
-        sys.exit(f'refusing: {name} does not match the checked/manifest pair')
-if manifest.get('dirty') and not a.allow_dirty: sys.exit('refusing: built from a dirty tree')
-next_v3 = []
-if manifest.get('bridge_v3') is not None:
-    sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools/vm_bridge')]
-    from bridge_v3 import read_operator_key
-    from bridge_operator_policy import validate_operator_policy
-    from hardware import Hardware
 
-    if (verdict.get('kernel_sha256'), verdict.get('initrd_sha256')) != (sha(kernel), sha(initrd)):
-        sys.exit('refusing: v3 requires the exact checked kernel and initrd')
-    policy_metadata = manifest['bridge_v3']
-    if (policy_metadata.get('version'), policy_metadata.get('suite')) != (3, 1):
-        sys.exit('refusing: unexpected protocol version or suite in the new image')
-    try:
-        session = Hardware().load_session(a.session)
-        key_path = a.operator_key_file or session.get('operator_key_file')
-        if not key_path:
-            raise ValueError('The v3 image needs --operator-key-file for the first legacy cutover')
-        path = Path(key_path).absolute()
-        key = read_operator_key(path)
-        policy = subprocess.check_output(['mtype', '-i', str(initrd), '::/ETC/bridge-v3-operators'])
-        digest = hashlib.sha256(policy).hexdigest()
-        verified = json.loads((a.pair / 'verify.json').read_text())
-        if (digest != policy_metadata.get('policy_sha256') or
-                digest != verified.get('bridge_policy_sha256') or
-                verified.get('initrd_sha256') != sha(initrd) or
-                bytes(key.verify_key) not in validate_operator_policy(policy)):
-            raise ValueError('The checked image policy does not admit the selected operator key')
-        build_id = manifest['build_id']
-    except (KeyError, OSError, ValueError, subprocess.SubprocessError) as error:
-        sys.exit(f'refusing v3 cutover: {error}')
-    next_v3 = ['--next-operator-key-file', str(path), '--next-operator-policy', digest,
-               '--next-build-id', build_id]
-elif a.operator_key_file:
-    p.error('--operator-key-file only applies to a v3 image')
-stage = None
-kernel_output = a.output
-if a.profile_plan or a.rollback_profile:
-    try:
-        stage = stage_profile()
-    except (OSError, RuntimeError, ValueError) as error:
-        sys.exit(f'profile step failed: {error} (see {a.output / "profile/receipt.json"})')
-    kernel_output = a.output / 'kernel'
-cmd = [sys.executable, str(ROOT / 'scripts/hardware_update_device.py'), '--session', a.session, '--key-file', str(KEY),
-       '--kernel', str(kernel), '--initrd', str(initrd), '--output', str(kernel_output), '--activate', '--restart',
-       '--expected-payload-id', manifest['payload_id'], '--helper', 'system', '--boot-timeout-s', str(a.boot_timeout_s)]
-code = subprocess.call(cmd + next_v3)
-receipt_path = kernel_output / 'receipt.json'
-if stage:
-    stage.save(kernel_receipt=str(receipt_path.resolve()),
-               combined_state='needs_inspection' if code else 'boot_verified')
-if code and receipt_path.exists():
-    # Name the stage and the guest processes still blocking a restart rather
-    # than leaving a bare needs_inspection for the caller to dig out.
-    sys.path.insert(0, str(ROOT / 'tools'))
-    from hardware_update_workflow import power_blocker_summary
-    receipt = json.loads(receipt_path.read_text())
-    print(f"deploy: {receipt.get('state')} at {receipt.get('last_stage')}: {receipt.get('error')}", file=sys.stderr)
-    if 'power' in receipt:
-        print(f"deploy: restart request {receipt.get('power_request_id')}: {power_blocker_summary(receipt['power'])}", file=sys.stderr)
-sys.exit(code)
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument('--session', required=True); p.add_argument('--pair', type=Path, required=True)
+    p.add_argument('--output', type=Path, required=True); p.add_argument('--allow-dirty', action='store_true')
+    p.add_argument('--boot-timeout-s', type=int, default=240)
+    p.add_argument('--operator-key-file', type=Path, help='Host private key admitted by the new v3 image')
+    p.add_argument('--profile-timeout-s', type=int, default=3600)
+    profile = p.add_mutually_exclusive_group()
+    profile.add_argument('--profile-plan', type=Path, metavar='DIRECTORY')
+    profile.add_argument('--rollback-profile', type=Path, metavar='PROFILE_RECEIPT')
+    p.add_argument('--push-profile-cache', action='store_true',
+                   help='also push the local cache/ for a signed plan with a host URL')
+    a = p.parse_args()
+    if a.push_profile_cache and not a.profile_plan:
+        p.error('--push-profile-cache requires --profile-plan')
+
+    manifest = json.loads((a.pair / 'build-manifest.json').read_text())
+    verdict_path = a.pair / 'qemu-check' / 'verdict.json'
+    if not verdict_path.exists(): sys.exit(f'refusing: no QEMU verdict at {verdict_path}')
+    verdict = json.loads(verdict_path.read_text())
+    kernel, initrd = a.pair / 'kernel.elf', a.pair / 'INITRD.IMG'
+    if verdict.get('passed') is not True: sys.exit('refusing: QEMU check did not pass (rerun scripts/check_dell_image_qemu.py --force)')
+    for name, path in (('kernel_sha256', kernel), ('initrd_sha256', initrd)):
+        if verdict.get(name) not in (None, sha(path)) or manifest.get(name) != sha(path):
+            sys.exit(f'refusing: {name} does not match the checked/manifest pair')
+    if manifest.get('dirty') and not a.allow_dirty: sys.exit('refusing: built from a dirty tree')
+    next_v3 = []
+    if manifest.get('bridge_v3') is not None:
+        sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools/vm_bridge')]
+        from bridge_v3 import read_operator_key
+        from bridge_operator_policy import validate_operator_policy
+        from hardware import Hardware
+
+        if (verdict.get('kernel_sha256'), verdict.get('initrd_sha256')) != (sha(kernel), sha(initrd)):
+            sys.exit('refusing: v3 requires the exact checked kernel and initrd')
+        policy_metadata = manifest['bridge_v3']
+        if (policy_metadata.get('version'), policy_metadata.get('suite')) != (3, 1):
+            sys.exit('refusing: unexpected protocol version or suite in the new image')
+        try:
+            session = Hardware().load_session(a.session)
+            key_path = a.operator_key_file or session.get('operator_key_file')
+            if not key_path:
+                raise ValueError('The v3 image needs --operator-key-file for the first legacy cutover')
+            path = Path(key_path).absolute()
+            key = read_operator_key(path)
+            policy = subprocess.check_output(['mtype', '-i', str(initrd), '::/ETC/bridge-v3-operators'])
+            digest = hashlib.sha256(policy).hexdigest()
+            verified = json.loads((a.pair / 'verify.json').read_text())
+            if (digest != policy_metadata.get('policy_sha256') or
+                    digest != verified.get('bridge_policy_sha256') or
+                    verified.get('initrd_sha256') != sha(initrd) or
+                    bytes(key.verify_key) not in validate_operator_policy(policy)):
+                raise ValueError('The checked image policy does not admit the selected operator key')
+            build_id = manifest['build_id']
+        except (KeyError, OSError, ValueError, subprocess.SubprocessError) as error:
+            sys.exit(f'refusing v3 cutover: {error}')
+        next_v3 = ['--next-operator-key-file', str(path), '--next-operator-policy', digest,
+                   '--next-build-id', build_id]
+    elif a.operator_key_file:
+        p.error('--operator-key-file only applies to a v3 image')
+    stage = None
+    kernel_output = a.output
+    if a.profile_plan or a.rollback_profile:
+        try:
+            stage = stage_profile(a)
+        except (OSError, RuntimeError, ValueError) as error:
+            sys.exit(f'profile step failed: {error} (see {a.output / "profile/receipt.json"})')
+        kernel_output = a.output / 'kernel'
+    cmd = [sys.executable, str(ROOT / 'scripts/hardware_update_device.py'), '--session', a.session, '--key-file', str(KEY),
+           '--kernel', str(kernel), '--initrd', str(initrd), '--output', str(kernel_output), '--activate', '--restart',
+           '--expected-payload-id', manifest['payload_id'], '--helper', 'system', '--boot-timeout-s', str(a.boot_timeout_s)]
+    code = subprocess.call(cmd + next_v3)
+    receipt_path = kernel_output / 'receipt.json'
+    if stage:
+        stage.save(kernel_receipt=str(receipt_path.resolve()),
+                   combined_state='needs_inspection' if code else 'boot_verified')
+    if code and receipt_path.exists():
+        # Name the stage and the guest processes still blocking a restart rather
+        # than leaving a bare needs_inspection for the caller to dig out.
+        sys.path.insert(0, str(ROOT / 'tools'))
+        from hardware_update_workflow import power_blocker_summary
+        receipt = json.loads(receipt_path.read_text())
+        print(f"deploy: {receipt.get('state')} at {receipt.get('last_stage')}: {receipt.get('error')}", file=sys.stderr)
+        if 'power' in receipt:
+            print(f"deploy: restart request {receipt.get('power_request_id')}: {power_blocker_summary(receipt['power'])}", file=sys.stderr)
+    return code
+
+
+if __name__ == '__main__':
+    sys.exit(main())
