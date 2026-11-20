@@ -103,7 +103,9 @@ struct SlotHealthIo {
     uint8_t sectors[brook::GuardSlotCount][brook::GuardSlotSectorBytes]{};
     bool failWrite=false;
     bool failFlush=false;
+    bool failRead[brook::GuardSlotCount]{};
     bool read(unsigned slot,uint8_t* data) const {
+        if(failRead[slot])return false;
         memcpy(data,sectors[slot],sizeof(sectors[slot]));
         return true;
     }
@@ -222,6 +224,15 @@ static void SlotHealthPersistence() {
     assert(GuardSlotFinish(journal.health,selected,false));
     assert(GuardSlotWrite(garbage,disk,journal.health));
     assert(GuardSlotRead(garbage,disk,journal) && journal.newest==0 && journal.health.sequence==3);
+
+    SlotHealthIo unreadable=io;
+    unreadable.failRead[0]=true;
+    assert(GuardSlotRead(unreadable,disk,journal) && journal.newest==1 && journal.health.sequence==2);
+    unreadable.failRead[1]=true;
+    assert(!GuardSlotRead(unreadable,disk,journal));
+    SlotHealthIo blankSibling;
+    blankSibling.failRead[0]=true;
+    assert(!GuardSlotRead(blankSibling,disk,journal));
 
     SlotHealthIo badStructure=io;
     auto* damaged=badStructure.sectors[0];

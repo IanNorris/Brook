@@ -141,14 +141,17 @@ template<class Io>
 bool GuardSlotRead(Io& io, const uint8_t (&disk)[32], GuardSlotJournal& journal)
 {
     journal = {};
-    bool torn = false;
+    bool damaged = false;
     for (unsigned index = 0; index < GuardSlotCount; ++index) {
         uint8_t sector[GuardSlotSectorBytes];
-        if (!io.read(index,sector)) return false;
+        if (!io.read(index,sector)) {
+            damaged = true;
+            continue;
+        }
         GuardSlotHealth health{};
         const auto kind = GuardSlotDecode(sector,disk,health);
         if (kind == GuardSlotRecordKind::Foreign) return false;
-        torn |= kind == GuardSlotRecordKind::Torn;
+        damaged |= kind == GuardSlotRecordKind::Torn;
         if (kind != GuardSlotRecordKind::Valid) continue;
         if (health.sequence == journal.health.sequence) return false;
         if (health.sequence > journal.health.sequence) {
@@ -156,7 +159,7 @@ bool GuardSlotRead(Io& io, const uint8_t (&disk)[32], GuardSlotJournal& journal)
             journal.newest = int(index);
         }
     }
-    return journal.newest >= 0 || !torn;
+    return journal.newest >= 0 || !damaged;
 }
 
 template<class Io>
