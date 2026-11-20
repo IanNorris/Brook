@@ -55,8 +55,13 @@ static_assert(offsetof(Process,mountNamespaceMember)+sizeof(Process::mountNamesp
               "fork/thread snapshot must exclude both filesystem ownership fields");
 static_assert(offsetof(Process,fsContext)+sizeof(Process::fsContext)==offsetof(Process,oomEpisode),
               "recovery marker follows independently synchronized filesystem state");
-static_assert(sizeof(Process)-(offsetof(Process,oomEpisode)+sizeof(Process::oomEpisode))<alignof(Process),
-              "explicitly inherited recovery marker must remain last, allowing alignment padding");
+// Tail order: oomEpisode, then the seccomp state, which the fork/thread
+// snapshot excludes and inherits explicitly. Nothing may follow seccompTrap
+// except alignment padding.
+static_assert(offsetof(Process,oomEpisode)+sizeof(Process::oomEpisode)==offsetof(Process,seccompFilter),
+              "seccomp state directly follows the explicitly inherited recovery marker");
+static_assert(sizeof(Process)-(offsetof(Process,seccompTrap)+sizeof(Process::seccompTrap))<alignof(Process),
+              "seccomp state must remain last, allowing alignment padding");
 
 namespace {
 IrqSpinLock signalActionLock;
