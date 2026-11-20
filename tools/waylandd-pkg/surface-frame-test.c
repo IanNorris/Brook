@@ -253,6 +253,21 @@ int main(void) {
         char expect[96];
         snprintf(expect,sizeof(expect),"\"configure\":{\"sent\":%u,\"acked\":%u,",surface.next_configure_serial,finalResize);
         assert(strstr(json,expect));assert(strstr(json,"\"size_pending\":0,"));
+        const char *history=strstr(json,"\"configure_history\":[");
+        assert(history);
+        const char *ack=strstr(history,"\"event\":\"ack\"");
+        const char *commit=ack ? strstr(ack,"\"event\":\"commit\"") : NULL;
+        assert(commit && strstr(commit,"\"event\":\"configure\""));
+        free(json);
+    }
+    {   /* The status history drops older entries and prints in event order. */
+        for (unsigned i=1; i<=CONFIGURE_HISTORY_LIMIT+2; ++i)
+            configure_history_add(&surface, CONFIGURE_ACK, i, 1000+i, 0, 0);
+        char *json=NULL;size_t length=0;FILE *f=open_memstream(&json,&length);assert(f);
+        configure_history_json(f,&surface,CONFIGURE_HISTORY_LIMIT+3);fclose(f);
+        assert(!strstr(json,"\"serial\":1002,"));
+        const char *oldest=strstr(json,"\"ms_ago\":16,\"serial\":1003,");
+        assert(oldest && strstr(oldest,"\"ms_ago\":1,\"serial\":1018,"));
         free(json);
     }
     wl_display_flush_clients(display);keysBytes=recv(sockets[1],keysWire,sizeof(keysWire),MSG_DONTWAIT);assert(keysBytes>0);

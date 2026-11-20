@@ -381,6 +381,17 @@ struct brook_frame_callback {
     uint64_t commit;
 };
 
+enum configure_event_kind { CONFIGURE_SENT, CONFIGURE_ACK, CONFIGURE_COMMIT };
+enum { CONFIGURE_HISTORY_LIMIT = 16 };
+struct configure_event {
+    uint32_t ms, serial;
+    int32_t width, height;
+    enum configure_event_kind kind;
+    unsigned resizing : 1;
+    unsigned attached : 1;
+    unsigned acked : 1;
+};
+
 struct brook_scene_owner;
 struct brook_xwindow;
 struct brook_surface {
@@ -512,6 +523,8 @@ struct brook_surface {
      * the client acknowledged, and when it acked, was last configured and
      * last committed (with and without a buffer), in g_now_ms(). */
     uint32_t last_ack_serial,last_ack_ms,configure_ms,commit_ms,buffer_commit_ms;
+    struct configure_event configure_history[CONFIGURE_HISTORY_LIMIT];
+    unsigned configure_history_next, configure_history_count;
 };
 
 static struct brook_surface *g_surfaces = NULL;
@@ -934,6 +947,35 @@ static void buffer_size(const struct brook_buffer *buffer,int32_t *w,int32_t *h)
 }
 /* One "surfaces" entry: frame callbacks, configure handshake, buffers and
  * what the callbacks wait for (Chromium freeze diagnosis, gen 442). */
+static void configure_history_add(struct brook_surface *s, enum configure_event_kind kind,
+                                  uint32_t ms, uint32_t serial, int32_t width, int32_t height) {
+    s->configure_history[s->configure_history_next] = (struct configure_event) {
+        .ms = ms, .serial = serial, .width = width, .height = height, .kind = kind,
+        .resizing = !!s->toplevel_resizing,
+        .attached = kind == CONFIGURE_COMMIT && s->pending_attach && s->pending_buffer,
+        .acked = !!s->configure_size_acked,
+    };
+    s->configure_history_next = (s->configure_history_next + 1) % CONFIGURE_HISTORY_LIMIT;
+    if (s->configure_history_count < CONFIGURE_HISTORY_LIMIT) ++s->configure_history_count;
+}
+
+static void configure_history_json(FILE *f, const struct brook_surface *s, uint32_t now) {
+    static const char *const kinds[] = { "configure", "ack", "commit" };
+    fprintf(f, "\"configure_history\":[");
+    unsigned index = (s->configure_history_next + CONFIGURE_HISTORY_LIMIT -
+                      s->configure_history_count) % CONFIGURE_HISTORY_LIMIT;
+    for (unsigned n = 0; n < s->configure_history_count; ++n) {
+        const struct configure_event *event = &s->configure_history[index];
+        fprintf(f, "%s{\"event\":\"%s\",\"ms_ago\":%u,\"serial\":%u,\"size\":[%d,%d],"
+                   "\"resizing\":%u,\"attached\":%u,\"size_acked\":%u}",
+                n ? "," : "", kinds[event->kind], now - event->ms, event->serial,
+                event->width, event->height, (unsigned)event->resizing,
+                (unsigned)event->attached, (unsigned)event->acked);
+        index = (index + 1) % CONFIGURE_HISTORY_LIMIT;
+    }
+    fprintf(f, "],");
+}
+
 static void surface_status_json(FILE *f,struct brook_surface *s,uint32_t now){
     struct brook_surface *root=s;while(root->subsurface_parent)root=root->subsurface_parent;
     const int pending=wl_list_length(&s->pending_frames),waiting=wl_list_length(&s->waiting_frames),
@@ -951,6 +993,7 @@ static void surface_status_json(FILE *f,struct brook_surface *s,uint32_t now){
         s->next_configure_serial,s->last_ack_serial,s->configure_ms?now-s->configure_ms:0,s->last_ack_ms?now-s->last_ack_ms:0,
         s->configure_width,s->configure_height,s->configure_size_pending,s->configure_size_serial,s->configure_size_acked,
         s->toplevel_maximized,s->toplevel_fullscreen,s->toplevel_resizing);
+    if (s->xdg_toplevel) configure_history_json(f, s, now);
     int32_t pw=0,ph=0;if(s->pending_attach)buffer_size(s->pending_buffer,&pw,&ph);
     fprintf(f,"\"pending_buffer\":[%d,%d],\"commit_ms_ago\":%u,\"buffer_commit_ms_ago\":%u,",pw,ph,
         s->commit_ms?now-s->commit_ms:0,s->buffer_commit_ms?now-s->buffer_commit_ms:0);
@@ -1085,7 +1128,9 @@ static int toplevel_send_state(struct brook_surface *s,int32_t width,int32_t hei
     xdg_toplevel_send_configure(s->xdg_toplevel,width,height,&states);wl_array_release(&states);
     s->next_configure_serial=next_serial();s->configure_ms=g_now_ms();
     if(s->configure_size_pending) {s->configure_size_serial=s->next_configure_serial;s->configure_size_acked=0;}
-    xdg_surface_send_configure(s->xdg_surface,s->next_configure_serial);return 1;
+    xdg_surface_send_configure(s->xdg_surface,s->next_configure_serial);
+    configure_history_add(s, CONFIGURE_SENT, s->configure_ms, s->next_configure_serial, width, height);
+    return 1;
 }
 static void surface_commit(struct wl_client *c,struct wl_resource *r) {
     struct brook_surface *s=wl_resource_get_user_data(r);
@@ -1118,6 +1163,11 @@ static void surface_commit(struct wl_client *c,struct wl_resource *r) {
         s->size_hints=hints;s->size_hints_pending=0;
     }
     const int configure_committed=s->configure_size_pending && s->configure_size_acked;
+    if (s->xdg_toplevel && s->configure_size_pending) {
+        int32_t width = 0, height = 0;
+        if (s->pending_attach) buffer_size(s->pending_buffer, &width, &height);
+        configure_history_add(s, CONFIGURE_COMMIT, s->commit_ms, s->last_ack_serial, width, height);
+    }
     /* xdg-shell role: the very first commit must have NO buffer; we
      * respond with a configure. The client acks, then commits with a
      * buffer for real. */
@@ -1139,6 +1189,7 @@ static void surface_commit(struct wl_client *c,struct wl_resource *r) {
         wl_array_release(&states);
         uint32_t serial = s->next_configure_serial = next_serial();s->configure_ms=g_now_ms();
         xdg_surface_send_configure(s->xdg_surface, serial);
+        configure_history_add(s, CONFIGURE_SENT, s->configure_ms, serial, width, height);
         fprintf(stderr, "[waylandd] xdg initial configure sent serial=%u (%dx%d)\n", serial,width,height);
         return;
     }
@@ -1650,6 +1701,7 @@ static void xdg_surface_ack_configure(struct wl_client *c, struct wl_resource *r
     s->xdg_acked = 1;
     s->last_ack_serial=serial;s->last_ack_ms=g_now_ms();
     if (s->configure_size_pending && serial==s->configure_size_serial) s->configure_size_acked=1;
+    if (s->xdg_toplevel) configure_history_add(s, CONFIGURE_ACK, s->last_ack_ms, serial, 0, 0);
     fprintf(stderr, "[waylandd] xdg_surface.ack_configure serial=%u\n", serial);
 }
 
@@ -4575,10 +4627,21 @@ static void waylandd_status_write(const char *display){
         (unsigned long long)g_gpu_group_skip_buffer,(unsigned long long)g_gpu_group_skip_upload,(unsigned long long)g_gpu_group_uploads,
         (unsigned long long)g_gpu_opaque_offers,(unsigned long long)g_gpu_scaled_offers);
     fprintf(f,"\"intel\":{\"queued\":%llu,\"ready\":%llu,\"discarded\":%llu,\"busy\":%llu,\"failed\":%llu,\"fences\":%llu,"
-        "\"fence_pending\":%llu,\"pending\":%u,\"direct\":%llu},\"readback_bytes\":%llu,\"paths\":{",
+        "\"fence_pending\":%llu,\"pending\":%u,\"direct\":%llu,\"retry_fires\":%llu,\"pending_images\":[",
         (unsigned long long)g_intel_queued,(unsigned long long)g_intel_ready,(unsigned long long)g_intel_discarded,
         (unsigned long long)g_intel_busy,(unsigned long long)g_intel_failed,(unsigned long long)g_intel_fences,
-        (unsigned long long)g_intel_fence_pending,g_intel_pending_count,(unsigned long long)g_intel_direct,g_layer_readback_bytes);
+        (unsigned long long)g_intel_fence_pending,g_intel_pending_count,(unsigned long long)g_intel_direct,
+        (unsigned long long)g_intel_retry_fires);
+    unsigned queued = 0;
+    for (const struct brook_image *image = g_intel_pending_head;
+         image && queued < INTEL_PENDING_LIMIT; image = image->pending_next, ++queued) {
+        fprintf(f, "%s{\"size\":[%u,%u],\"queued_ms_ago\":%u,\"offer_state\":%d,"
+                   "\"fence_created\":%d,\"group_refs\":%u,\"buffer_uses\":%u,\"refs\":%u,\"offer_window\":%u}",
+                queued ? "," : "", image->width, image->height, image->queued_ms ? now - image->queued_ms : 0,
+                image->offer_state, image->producer_fence >= 0, image->group_refs,
+                image->source ? image->source->uses : 0, image->refs, image->offer_identity.window);
+    }
+    fprintf(f, "]},\"readback_bytes\":%llu,\"paths\":{",g_layer_readback_bytes);
     for(unsigned i=0;i<LAYER_PATHS;++i)fprintf(f,"%s\"%s\":%llu",i?",":"",g_layer_path_names[i],g_layer_paths[i]);
     fprintf(f,"},\"windows\":[");
     int first=1;
