@@ -39,6 +39,12 @@ struct VfsFreshMountVisibility {
 int VfsMountNamespaceMountFresh(MountNamespace* ns,const VfsPath& target,
     const char* fsName,const VfsFsOps* ops,void* privateData,uint8_t pdrv=0,uint64_t attributes=0,
     uint64_t* publication=nullptr);
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+// Private attachment used only by the guard after the repaired data disk
+// passes its independent read-only checker. No syscall uses this path.
+int VfsMountNamespaceMountGuardProfile(MountNamespace* ns,const VfsPath& target,
+    const VfsFsOps* ops,void* privateData,uint8_t pdrv);
+#endif
 int VfsMountNamespaceMountVisible(MountNamespace* ns,const VfsPath& target,
     const char* fsName,const VfsFsOps* ops,void* privateData,uint64_t attributes,
     const VfsFreshMountVisibility& visibility);

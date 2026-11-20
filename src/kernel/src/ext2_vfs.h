@@ -7,6 +7,11 @@
 namespace brook {
 
 struct Device;
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+struct MountNamespace;
+struct VfsPath;
+bool Ext2MountGuardProfile(MountNamespace* ns,const VfsPath& target,Device* device,uint8_t& drive);
+#endif
 
 // Cumulative mount-lifetime diagnostics, snapshotted under the filesystem lock.
 struct Ext2SyncProbe {

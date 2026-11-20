@@ -2185,6 +2185,32 @@ int FatFsPrivateRecoverySlotStatus(FatPrivateMount* session,GuardRecoverySlotSta
     return ReadSlotStateLocked(session,io,records,journal,out);
 }
 
+int FatFsPrivateRecoveryRetryRepairedProfile(FatPrivateMount* session,const GuardRecoverySlotState& observed)
+{
+    auto* device=session?FatFsImageLeaseDevice(session->slotHealthLease):nullptr;
+    if(!device)return -11;
+    GuardFatLock lock;
+    SlotHealthSectorIo io{device,session->slotHealthSectors};
+    SlotSelectors records{};
+    GuardRecoverySlotState current{};
+    GuardSlotJournal journal;
+    if(const int error=ReadSlotStateLocked(session,io,records,journal,current))return error;
+    if(current.sequence!=observed.sequence ||
+       current.newestGeneration!=observed.newestGeneration ||
+       memcmp(current.generations,observed.generations,sizeof(current.generations)) ||
+       memcmp(current.selectorDigests,observed.selectorDigests,sizeof(current.selectorDigests)))return -116;
+    const unsigned newest=current.generations[0]==current.newestGeneration?0:1;
+    const unsigned previous=1-newest;
+    BootGuardSlot a{current.generations[newest],newest,0,{}};
+    BootGuardSlot b{current.generations[previous],previous,0,{}};
+    memcpy(a.selectorDigest,current.selectorDigests[newest],sizeof(a.selectorDigest));
+    memcpy(b.selectorDigest,current.selectorDigests[previous],sizeof(b.selectorDigest));
+    if(!GuardSlotRetryRepairedProfile(journal.health,a,b))return -116;
+    if(GuardSlotWrite(io,session->slotHealthDisk,journal.health))return 0;
+    session->slotHealthReady=false;
+    return -5;
+}
+
 #if defined(BROOK_SSD_GUARDED_DESKTOP)
 int FatFsPrivateRecoveryCheckPinnedSlotHealth(FatPrivateMount* session,const uint8_t (&digest)[32])
 {

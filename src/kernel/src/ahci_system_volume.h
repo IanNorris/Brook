@@ -61,6 +61,9 @@ void AhciSystemGuardTestFinish(Device* adapter);
 Device* AhciSystemGuardTestDataArm(Device* adapter,int pendingOutcome);
 bool AhciSystemGuardTestDataVerify(Device* adapter);
 bool AhciSystemGuardTestDataIdentityValid(Device* adapter);
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+bool AhciSystemGuardTestDataProfileValid(Device* adapter);
+#endif
 void AhciSystemGuardTestDataFinish(Device* adapter);
 #if defined(BROOK_SSD_GUARD_COMPLETION)
 bool AhciSystemGuardTestBeginCompletion(Device* adapter,bool verified);

@@ -355,7 +355,7 @@ static int VfsFreshMountRestrictionsLocked(MountNamespace* ns, const VfsFsOps* o
 
 static int MountFreshWithVisibility(MountNamespace* ns,const VfsPath& inputTarget,
     const char* fsName,const VfsFsOps* ops,void* privateData,uint8_t pdrv,uint64_t attributes,
-    uint64_t* publication,const VfsFreshMountVisibility* visibility)
+    uint64_t* publication,const VfsFreshMountVisibility* visibility,bool guardProfile=false)
 {
     if(publication)*publication=0;
     if(!ns || !inputTarget.object || !inputTarget.attachment || !fsName || !ops || !privateData)return -22;
@@ -368,7 +368,9 @@ static int MountFreshWithVisibility(MountNamespace* ns,const VfsPath& inputTarge
     const bool devpts=StrEq(fsName,"devpts");
     const bool mqueue=StrEq(fsName,"mqueue");
     if((proc || devpts || mqueue) && ns->initial)return -95;
-    if(attributes && ((attributes&~MountRestrictionMask) ||
+    if(guardProfile && (ns->initial || !StrEq(fsName,"ext2") ||
+                       attributes!=MountRestrictionMask))return -95;
+    if(!guardProfile && attributes && ((attributes&~MountRestrictionMask) ||
        (!proc && !devpts && !mqueue && ((attributes!=6 && attributes!=2) || !StrEq(fsName,"tmpfs")))))return -95;
     // Registered tables/callbacks are permanently provider-pinned. Unregistered
     // or mismatched tables cannot become a backing through this entry point.
@@ -406,6 +408,7 @@ static int MountFreshWithVisibility(MountNamespace* ns,const VfsPath& inputTarge
     mount->rootDevice=stat.dev;mount->attributes=attributes;
     if(proc || mqueue)mount->lockedAttributes=MountNoSuid|MountNoDev|MountNoExec;
     if(devpts)mount->lockedAttributes=MountReadOnly|MountNoSuid|MountNoExec;
+    if(guardProfile)mount->lockedAttributes=MountRestrictionMask;
     mount->lockedAttributes |= inheritedRestrictions;
     StrCopy(mount->physicalRoot,"/",sizeof(mount->physicalRoot));
     mount->covered=target;VfsPathRetain(target);mount->used=true;mount->linked=true;
@@ -420,6 +423,14 @@ int VfsMountNamespaceMountFresh(MountNamespace* ns,const VfsPath& target,
     return MountFreshWithVisibility(ns,target,fsName,ops,privateData,pdrv,attributes,publication,nullptr);
 }
 
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+int VfsMountNamespaceMountGuardProfile(MountNamespace* ns,const VfsPath& target,
+    const VfsFsOps* ops,void* privateData,uint8_t pdrv)
+{
+    return MountFreshWithVisibility(ns,target,"ext2",ops,privateData,pdrv,MountRestrictionMask,
+                                    nullptr,nullptr,true);
+}
+#endif
 int VfsMountNamespaceMountVisible(MountNamespace* ns,const VfsPath& target,
     const char* fsName,const VfsFsOps* ops,void* privateData,uint64_t attributes,
     const VfsFreshMountVisibility& visibility)

@@ -87,6 +87,22 @@ inline bool GuardSlotWithdrawStart(GuardSlotHealth& health, const BootGuardSlot&
     return true;
 }
 
+// Only the guarded repair path calls this after rechecking the shared profile.
+inline bool GuardSlotRetryRepairedProfile(GuardSlotHealth& health,const BootGuardSlot& newest,
+                                         const BootGuardSlot& previous)
+{
+    if(newest.slot==previous.slot || newest.generation<=previous.generation ||
+       !GuardSlotMatches(health,newest) || !GuardSlotMatches(health,previous))return false;
+    auto& current=health.slots[newest.slot];
+    auto& older=health.slots[previous.slot];
+    if(!current.profileRejected || !older.profileRejected)return false;
+    current.profileRejected=false;
+    older.profileRejected=false;
+    current.starts=GuardSlotFailureLimit;
+    older.starts=GuardSlotFailureLimit-1;
+    return true;
+}
+
 enum class GuardSlotChoice { Newest, Previous, Recovery };
 
 inline GuardSlotChoice GuardChooseSlot(const GuardSlotHealth& health, const BootGuardSlot& newest,

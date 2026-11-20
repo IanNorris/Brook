@@ -648,6 +648,14 @@ void Worker(void* arg) {
     // to capture diagnostics must not by itself prevent filesystem repair.
     const int journalArm=journalPin?journalPin:FatFsPrivateRecoveryArmJournal(mount);
     KPrintf("GUARD_PANIC_JOURNAL pin=%d arm=%d\n",journalPin,journalArm);
+    // The ESP adapter is available here. It is closed while the separately
+    // authorized data repair runs, so carry only the observed journal state.
+    GuardRecoverySlotState rejectedProfile{};
+    int slotStatus=FatFsPrivateRecoveryPinSlotHealth(mount,identity);
+    if(!slotStatus)slotStatus=FatFsPrivateRecoverySlotStatus(mount,rejectedProfile);
+    const bool bothRejected=!slotStatus &&
+        rejectedProfile.profileRejected[0] && rejectedProfile.profileRejected[1];
+    if(slotStatus<0)KPrintf("GUARD_SLOT_PROFILE_JOURNAL status=%d\n",slotStatus);
 #endif
     uint32_t failAt=0;
 #if defined(BROOK_SSD_GUARD_PENDING_TEST)
@@ -690,6 +698,10 @@ void Worker(void* arg) {
     }
     const int verification=RunExt2Checker(data,false);
     const bool identityOk=verification==0 && AhciSystemGuardTestDataIdentityValid(data);
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+    const bool profileValid=identityOk && bothRejected && AhciSystemGuardTestDataProfileValid(data);
+    if(identityOk && bothRejected)KPrintf("GUARD_SLOT_PROFILE_RECHECK accepted=%u\n",profileValid?1u:0u);
+#endif
     if(verification!=-115)AhciSystemGuardTestDataFinish(data);
     if(verification!=0 || !identityOk) {KPrintf("GUARD_EXT2_INCOMPLETE verify=%d identity=%u\n",verification,identityOk?1u:0u);return;}
     KPuts("GUARD_EXT2_VERIFIED_PENDING\n");
@@ -718,6 +730,12 @@ void Worker(void* arg) {
         KPuts("GUARD_COMPLETE_INCOMPLETE authorization\n");return;
     }
     const int complete=FatFsPrivateRecoveryTestComplete(mount,identity,records[0],completeFail);
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+    if(complete==2 && profileValid) {
+        const int retryStatus=FatFsPrivateRecoveryRetryRepairedProfile(mount,rejectedProfile);
+        KPrintf("GUARD_SLOT_PROFILE_RETRY status=%d\n",retryStatus);
+    }
+#endif
     AhciSystemGuardTestFinish(adapter);
     if(FatFsPrivateRecoveryTestComplete(mount,identity,records[0],completeFail)!=0) {
         KPuts("GUARD_COMPLETE_INCOMPLETE repeated\n");return;

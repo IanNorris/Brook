@@ -134,6 +134,7 @@ def prepare(build,kernel_hash,checker,validator,controller,disk,esp,data,profile
         subprocess.run(['mformat','-i',str(image),'::'],check=True)
         for name in ('BOOT','ETC','DEV','DEV/DRI','TMP','SYS','SYS/DEV','SYS/DEV/CHAR','USR','PROC'):
             subprocess.run(['mmd','-i',str(image),'::'+name],check=True)
+        if automatic:subprocess.run(['mmd','-i',str(image),'::NIX'],check=True)
         if recovery_network:subprocess.run(['mmd','-i',str(image),'::DRIVERS'],check=True)
         payload={'ETC/ahci-observe':b'1\n','ETC/ahci-read-only':b'1\n','ETC/ahci-write-target':target,
                  'ETC/ahci-boot-volume':sources['esp'],'ETC/ahci-data-volume':sources['data'],
