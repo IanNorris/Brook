@@ -3,6 +3,7 @@
 #include <cstring>
 #include <initializer_list>
 #include "taskbar_volume.h"
+#include "desktop_calendar.h"
 #include "desktop_disk_popup.h"
 #include "desktop_stats_popup.h"
 using namespace brook;
@@ -153,6 +154,14 @@ static void checkDetailedStats() {
     CHECK(DesktopStatsScrollOffset(24, 48) == 24);
     CHECK(DesktopStatsScrollOffset(0x7fffffffffffffffLL, 48) == 48);
     CHECK(DesktopStatsScrollOffset(42, 0) == 0);
+    DesktopDetailedStats tasks{};
+    CHECK(DesktopStatsTaskRows(tasks) == 1);
+    tasks.tasks[0].ticks = 40;
+    tasks.tasks[1].ticks = 20;
+    CHECK(DesktopStatsTaskRows(tasks) == 1);
+    tasks.tasksMeasured = true;
+    CHECK(DesktopStatsTaskRows(tasks) == 2);
+
     DesktopDetailedStats memory{};
     memory.total = 1000;
     memory.used = 700;
@@ -183,7 +192,37 @@ static void checkDetailedStats() {
     CHECK(top[0].tid == 6 && top[1].tid == 7 && top[2].tid == 3 && top[3].tid == 11);
 }
 
+static void checkCalendar() {
+    CHECK(CalendarWeekday({{1, 1}, 1}) == 0);
+    CHECK(CalendarWeekday({{2026, 11}, 20}) == 4); // Friday
+    CHECK(CalendarWeekday({{2000, 2}, 29}) == 1); // Century leap year
+    CHECK(CalendarDaysInMonth({2100, 2}) == 28);
+    CHECK(CalendarWeekday({{2100, 3}, 1}) == 0);
+    CHECK(CalendarWeekday({{2100, 2}, 29}) == 7);
+    CHECK(!CalendarDateValid({{2024, 13}, 1}));
+    CHECK(!CalendarMonthValid({0, 12}));
+    CHECK((CalendarStepMonth({2025, 1}, -1) == CalendarMonth{2024, 12}));
+    CHECK((CalendarStepMonth({2025, 12}, +1) == CalendarMonth{2026, 1}));
+    CHECK((CalendarStepMonth({1, 1}, -1) == CalendarMonth{1, 1}));
+    CHECK((CalendarStepMonth({9999, 12}, +1) == CalendarMonth{9999, 12}));
+    auto grid = CalendarMonthGrid({2021, 8}, {{2021, 8}, 31});
+    CHECK(grid.first == 6 && grid.days == 31 && grid.highlighted == 31 && (grid.first + grid.days - 1) / 7 == 5);
+    grid = CalendarMonthGrid({2024, 2}, {{2024, 3}, 1});
+    CHECK(grid.first == 3 && grid.days == 29 && grid.highlighted == 0);
+    grid = CalendarMonthGrid({}, {{2024, 3}, 1});
+    CHECK(grid.days == 0);
+    // Timezones carry date and weekday in both directions across midnight.
+    auto time = CalendarLocalClock(1709251200, -3600); // Mar 1 UTC
+    CHECK((time.date.month == CalendarMonth{2024, 2}) && time.date.day == 29 && time.hour == 23);
+    time = CalendarLocalClock(1735689600 - 1800, 3600); // Dec 31, 23:30 UTC
+    CHECK((time.date.month == CalendarMonth{2025, 1}) && time.date.day == 1 && time.hour == 0 && time.minute == 30);
+    time = CalendarLocalClock(0, -1);
+    CHECK((time.date.month == CalendarMonth{1969, 12}) && time.date.day == 31 && time.hour == 23 && time.minute == 59);
+    CHECK(!CalendarDateValid(CalendarLocalClock(~uint64_t{0}, 3600).date));
+}
+
 int main() {
+    checkCalendar();
     checkDiskVolumes();
     checkDetailedStats();
     checkGlyph();checkWheel();checkSlider();checkPopup();checkTooltipBox();checkTooltip();

@@ -8,6 +8,7 @@
 #include "desktop_telemetry.h"
 #include "thermal_sampler.h"
 #include "taskbar_volume.h"
+#include "desktop_calendar.h"
 #include "desktop_disk_popup.h"
 #include "desktop_stats_popup.h"
 
@@ -67,7 +68,7 @@ struct ChromeTaskbarLayout {
 // labels (optional, total entries): each entry's label; buttons are sized to
 // them while every one fits, and share the space equally otherwise.
 ChromeTaskbarLayout ChromeTaskbarLayoutFor(const ChromeStyle& s, uint32_t screenW, uint32_t screenH,
-                                           const char* clockText, bool agent, uint32_t enabledMetrics,
+                                           const CalendarClock& clock, bool agent, uint32_t enabledMetrics,
                                            const int* ids, int total, int focused, const char* buildText = nullptr,
                                            bool compactHud = false, const char* const* labels = nullptr,
                                            uint32_t trayAppCount = 0);
@@ -258,15 +259,26 @@ void ChromeBuildDiskPopup(const ChromeDiskPopupLayout&, const DesktopDiskPage&, 
 
 struct ChromeStatsPopupLayout {
     DesktopRect panel, pin, body, previous, next, scrollUp, scrollDown;
-    uint32_t coreRows;
+    uint32_t coreRows, taskRows, scrollCount, scrollIndex;
     int rowHeight, cpuHeight, contentOffset, scrollLimit;
+    int scrollStops[24];
 };
 ChromeStatsPopupLayout ChromeStatsPopupLayoutFor(const ChromeStyle&, DesktopRect anchor, int screenW,
                                                  int taskbarY, DesktopStatsPanel, uint32_t cores,
-                                                 bool keepPinReachable = false, int contentOffset = 0);
+                                                 bool keepPinReachable = false, int contentOffset = 0,
+                                                 uint32_t taskRows = DetailedTopTasks);
 void ChromeBuildStatsPopup(const ChromeStatsPopupLayout&, DesktopStatsPanel, const DesktopDetailedStats&,
                            uint32_t firstCoreRow, const DesktopIntervals<>*, uint64_t tick, bool pinned,
                            int32_t mouseX, int32_t mouseY, const ChromeStyle&, ChromeDisplayList&);
+
+struct ChromeCalendarLayout {
+    DesktopRect panel, pin, monthTitle, previous, next, grid, unavailable;
+    int rowHeight;
+};
+ChromeCalendarLayout ChromeCalendarLayoutFor(const ChromeStyle&, DesktopRect anchor, int screenW,
+                                             int taskbarY, bool valid, bool keepPinReachable = false);
+void ChromeBuildCalendar(const ChromeCalendarLayout&, CalendarMonth shown, CalendarDate today, bool pinned,
+                         int32_t mouseX, int32_t mouseY, const ChromeStyle&, ChromeDisplayList&);
 
 struct ChromePerformanceHudModel {
     DesktopRect rect;

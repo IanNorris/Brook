@@ -23,6 +23,10 @@ uint64_t RtcNow();
 // Get current wall-clock time adjusted by timezone offset.
 uint64_t RtcNowLocal();
 
+// Broken-down local time from the same wall clock and timezone.
+struct CalendarClock;
+CalendarClock RtcReadTaskbarClock();
+
 // Set timezone offset in seconds east of UTC (e.g. +3600 for UTC+1).
 void RtcSetTimezoneOffset(int32_t offsetSec);
 

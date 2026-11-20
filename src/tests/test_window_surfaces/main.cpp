@@ -135,7 +135,8 @@ void CompositorRetireVfb(CompositorVfbAllocation*) { std::abort(); }
 // Shell-surface layout reads the clock, thermal state and boot summary age.
 uint64_t CompositorDesktopReadyTick() { return 0; }
 uint64_t RtcNow() { return 0; }
-char* RtcFormatTaskbar(char* buf,uint64_t,bool) { buf[0]='0';buf[1]=0;return buf; }
+static CalendarClock fixtureClock{{{2026, 11}, 20}, 5, 57};
+CalendarClock RtcReadTaskbarClock() { return fixtureClock; }
 static ChromeTrayState fixtureTray{};
 static TrayInput fixtureLastTrayInput{};
 static unsigned fixtureTrayEvents{};
@@ -149,9 +150,10 @@ bool ThermalReadSnapshot(ThermalSnapshot&) { return false; }
 static uint32_t fixtureDiskVolumes;
 void DesktopDiskWorkerStart() {}
 static uint32_t fixtureCpuCount = 4;
+static DesktopDetailedStats fixtureDetailedStats{};
 void DesktopStatsWorkerStart() {}
 uint32_t DesktopStatsCoreCount() { return fixtureCpuCount; }
-void DesktopStatsRead(DesktopStatsPanel, DesktopDetailedStats&) {}
+void DesktopStatsRead(DesktopStatsPanel, DesktopDetailedStats& out) { out = fixtureDetailedStats; }
 uint32_t DesktopDiskVolumeCount() { return fixtureDiskVolumes; }
 uint32_t DesktopDiskReadPage(uint32_t first, uint32_t capacity, DesktopDiskPage& out) {
     out.total = fixtureDiskVolumes;
@@ -808,6 +810,9 @@ int main() {
             DesktopStatsPanel::Compositor, DesktopStatsPanel::App};
         const uint32_t detailMask = BROOK_TASKBAR_CPU | BROOK_TASKBAR_MEMORY | BROOK_TASKBAR_COMPOSITOR | BROOK_TASKBAR_APP;
         CHECK(WmSetTaskbarMetrics(detailMask));
+        fixtureDetailedStats.tasksMeasured = true;
+        fixtureDetailedStats.tasks[0].ticks = 40;
+        fixtureDetailedStats.tasks[1].ticks = 2;
         for (unsigned i = 0; i < 4; ++i) {
             fixtureCpuCount = DetailedCoreLimit;
             const auto anchor = GetTaskbarLayout(sw, sh).metrics[statMetrics[i]];
@@ -820,6 +825,11 @@ int main() {
             CHECK(!WmTrayFlyoutPress(10, 10, sw, sh));
             if (statPanels[i] == DesktopStatsPanel::CpuMemory) {
                 CHECK(popup.coreRows > 0 && popup.next.w > 0 && popup.scrollLimit == 0);
+                CHECK(popup.taskRows == 2);
+                fixtureDetailedStats.tasks[1].ticks = 0;
+                const auto shorter = WmStatsPopupLayout(sw, sh, DesktopStatsPanel::CpuMemory);
+                CHECK(shorter.taskRows == 1 && shorter.panel.h + popup.rowHeight == popup.panel.h);
+                fixtureDetailedStats.tasks[1].ticks = 2;
                 const auto otherAnchor = GetTaskbarLayout(sw, sh).metrics[statMetrics[1 - i]];
                 CHECK(WmTrayFlyoutPress(otherAnchor.x, otherAnchor.y, sw, sh));
                 CHECK(WmDetailedStatsSelected() == DesktopStatsPanel::CpuMemory && WmTaskbarPopupPinned());
@@ -833,7 +843,7 @@ int main() {
                 CHECK(shortPopup.coreRows == 1 && shortPopup.scrollLimit > 0);
                 CHECK(shortPopup.panel.y >= 0 && shortPopup.panel.y + shortPopup.panel.h <= int(shortHeight));
                 CHECK(WmTrayFlyoutPress(shortPopup.scrollDown.x, shortPopup.scrollDown.y, sw, shortHeight));
-                CHECK(g_statsContentOffset > 0);
+                CHECK(shortPopup.scrollCount > 3 && g_statsContentOffset == shortPopup.scrollStops[3]);
                 CHECK(WmStatsFlyoutScroll(shortPopup.body.x, shortPopup.body.y, -12000, sw, shortHeight));
                 CHECK(g_statsContentOffset == shortPopup.scrollLimit);
                 fixtureCpuCount = 4;
@@ -861,9 +871,59 @@ int main() {
             CHECK(layout.panel.y >= 0 && layout.panel.y + layout.panel.h <= bottom);
             CHECK(layout.body.y + layout.body.h <= layout.scrollDown.y);
             CHECK(layout.body.y - layout.contentOffset + layout.cpuHeight < layout.body.y + layout.body.h);
+            CHECK(layout.scrollCount > 3 && layout.scrollStops[0] == 0);
+            for (uint32_t i = 1; i < layout.scrollCount; ++i)
+                CHECK(layout.scrollStops[i] > layout.scrollStops[i - 1]);
+            const auto insideRow = ChromeStatsPopupLayoutFor(WmChromeStyle(), {400, bottom, 30, 20}, sw, bottom,
+                                                             DesktopStatsPanel::CpuMemory, 64, true,
+                                                             layout.scrollStops[2] + 1);
+            CHECK(insideRow.scrollIndex == 2 && insideRow.contentOffset == layout.scrollStops[2]);
         }
         g_desktopMetrics = originalMetrics;
+        fixtureDetailedStats = {};
         CHECK(WmSetTaskbarMetrics(metrics));
+
+        const CalendarClock clockAtStart = fixtureClock;
+        const auto barClock = GetTaskbarLayout(sw, sh);
+        CHECK(strcmp(barClock.clockText, "Fri 05:57") == 0 && strcmp(barClock.clockDate, "20 Nov") == 0);
+        fixtureClock = {{{2026, 12}, 1}, 23, 59};
+        const auto nextClock = GetTaskbarLayout(sw, sh);
+        CHECK(strcmp(nextClock.clockText, "Tue 23:59") == 0 && strcmp(nextClock.clockDate, "01 Dec") == 0);
+        CHECK(nextClock.clock.x == barClock.clock.x && nextClock.clock.w == barClock.clock.w);
+        const auto clock = nextClock.clock;
+        CHECK(WmTrayFlyoutPress(clock.x + 2, clock.y + 2, sw, sh) && WmTrayFlyoutVisible());
+        auto cal = WmCalendarPopupLayout(sw, sh, fixtureClock.date);
+        CHECK(cal.pin.w > 0 && cal.next.w > 0 && cal.grid.w > 0);
+        CHECK(WmTrayFlyoutPress(cal.next.x, cal.next.y, sw, sh));
+        CHECK(kinds(s) >= 2 && WmCaptureShellModel(s[1], sw, sh, 0, -1, -1, pinSnapshot));
+        CHECK(pinSnapshot.calendar && (pinSnapshot.calendarMonth == CalendarMonth{2027, 1}));
+        CHECK(WmTrayFlyoutPress(cal.previous.x, cal.previous.y, sw, sh));
+        CHECK(!CalendarMonthValid(g_calendarMonth)); // returning to today follows midnight rollover
+        fixtureClock = {{{2027, 1}, 1}, 0, 0};
+        CHECK(kinds(s) >= 2 && WmCaptureShellModel(s[1], sw, sh, 0, -1, -1, pinSnapshot));
+        CHECK((pinSnapshot.calendarMonth == CalendarMonth{2027, 1}) && pinSnapshot.calendarToday.day == 1);
+        CHECK(WmTrayFlyoutPress(cal.pin.x, cal.pin.y, sw, sh) && WmTaskbarPopupPinned());
+        CHECK(!WmTrayFlyoutPress(10, 10, sw, sh) && WmTrayFlyoutVisible());
+        g_launcherLoaded = true;
+        WmLauncherToggle();
+        CHECK(WmLauncherVisible() && kinds(s) >= 2 && s[1].kind == WmShellSurfaceKind::Launcher);
+        CHECK(!WmTrayFlyoutPress(cal.pin.x, cal.pin.y, sw, sh) && WmTaskbarPopupPinned());
+        WmLauncherToggle();
+        g_launcherLoaded = false;
+        CHECK(!WmLauncherVisible() && kinds(s) >= 2 && s[1].kind == WmShellSurfaceKind::TrayFlyout);
+        const auto tiny = WmCalendarPopupLayout(sw, 144, fixtureClock.date);
+        CHECK(tiny.pin.w > 0 && !tiny.grid.w);
+        CHECK(WmTrayFlyoutPress(tiny.pin.x, tiny.pin.y, sw, 144) && !WmTaskbarPopupPinned());
+        CHECK(WmTrayFlyoutPress(10, 10, sw, sh) && !WmTrayFlyoutVisible());
+        fixtureClock = {};
+        const auto invalidClock = GetTaskbarLayout(sw, sh);
+        CHECK(invalidClock.clock.w == barClock.clock.w && strcmp(invalidClock.clockText, "--:--") == 0);
+        CHECK(!invalidClock.clockDate[0]);
+        CHECK(WmTrayFlyoutPress(clock.x, clock.y, sw, sh) && WmTrayFlyoutVisible());
+        cal = WmCalendarPopupLayout(sw, sh, fixtureClock.date);
+        CHECK(cal.unavailable.w > 0 && !cal.next.w && !cal.grid.w);
+        CHECK(WmTrayFlyoutPress(10, 10, sw, sh) && !WmTrayFlyoutVisible());
+        fixtureClock = clockAtStart;
 
         fixtureTray.itemCount = fixtureTray.menuCount = 1;
         fixtureTray.menuOwner = fixtureTray.items[0].id = 11;
@@ -1334,6 +1394,22 @@ int main() {
             WmSetFocus(floating);
             const int tx=f.x+20,ty=f.y+border+4;
             CHECK(WmHitTest(tx,ty).windowIndex==floating && WmHitTest(tx,ty).zone==WmHitZone::TitleBar);
+            const auto clock=GetTaskbarLayout(sw,sh).clock;
+            CHECK(WmTrayFlyoutPress(clock.x,clock.y,sw,sh));
+            const auto calendar=WmCalendarPopupLayout(sw,sh,fixtureClock.date);
+            CHECK(WmTrayFlyoutPress(calendar.pin.x,calendar.pin.y,sw,sh) && WmTaskbarPopupPinned());
+            CHECK(WmShowWindowMenu(floating,tx,ty));
+            WmShellTrayGeometry pinnedGeometry{};
+            WmGetShellTrayGeometry(sw,sh,tx,ty,pinnedGeometry);
+            CHECK(pinnedGeometry.windowMenu && WmTaskbarPopupPinned());
+            WmShellSurface layers[WM_SHELL_SURFACE_LIMIT]{};
+            const auto layerCount=WmShellSurfaces(sw,sh,tx,ty,layers,pinnedGeometry.popup,
+                                                  pinnedGeometry.menu,pinnedGeometry.notice,pinnedGeometry.windowMenu);
+            for (unsigned i=0;i<layerCount;++i) CHECK(layers[i].kind!=WmShellSurfaceKind::TrayFlyout);
+            WmWindowMenuClose();
+            CHECK(WmTrayFlyoutVisible() && WmTaskbarPopupPinned());
+            CHECK(WmTrayFlyoutPress(calendar.pin.x,calendar.pin.y,sw,sh) && !WmTaskbarPopupPinned());
+            WmTrayFlyoutClose();
             CHECK(!WmShellTrayPointer(sw,sh,tx,ty,true,0,0) && !WmWindowMenuOpen()); // primary: not ours
             CHECK(WmShellTrayPointer(sw,sh,tx,ty,true,1,0) && WmWindowMenuOpen());
             WmShellTrayGeometry geometry{};

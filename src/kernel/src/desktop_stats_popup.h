@@ -51,6 +51,14 @@ struct DesktopDetailedStats {
     uint64_t total, used, available, cached, kernel, gpu;
 };
 
+inline uint32_t DesktopStatsTaskRows(const DesktopDetailedStats& stats) {
+    uint32_t count = 0;
+    if (stats.tasksMeasured) {
+        while (count < DetailedTopTasks && stats.tasks[count].ticks) ++count;
+    }
+    return count ? count : 1;
+}
+
 inline int DesktopStatsScrollOffset(int64_t offset, int limit) {
     if (offset <= 0 || limit <= 0) return 0;
     return offset > limit ? limit : int(offset);

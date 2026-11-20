@@ -319,6 +319,12 @@ int main() {
     CHECK(RtcNowNs()==epoch+1000000000);
     cmosSeconds=17;
     RtcSetTimezoneOffset(3600);CHECK(RtcNowLocal()==RtcNow()+3600);
+    auto local=RtcReadTaskbarClock();
+    CHECK((local.date.month==CalendarMonth{2026,10}) && local.date.day==18 && local.hour==9 && local.minute==12);
+    RtcSetTimezoneOffset(-9*3600);
+    local=RtcReadTaskbarClock();
+    CHECK((local.date.month==CalendarMonth{2026,10}) && local.date.day==17 && local.hour==23 && local.minute==12);
+    CHECK(CalendarWeekday(local.date)==5);
     CHECK(RtcNowNs()==epoch+1000000000);
 
     // Non-KVM realtime uses the selected millisecond elapsed source.
@@ -342,6 +348,9 @@ int main() {
     g_lapicTickCount=1;testTscNs+=2000000000ULL; // delivered ticks no longer matter
     CHECK(RtcNowNs()==fallbackEpoch+3000000123ULL);
     testTscClock=false;g_lapicTickCount=1700;
+
+    cmosSeconds=61;RtcInit();CHECK(!CalendarDateValid(RtcReadTaskbarClock().date));
+    cmosSeconds=17;
 
     // RTC frequency discipline must not rewrite the elapsed deadline domain.
     // A backwards step postpones already-armed wakeups; a forwards step can

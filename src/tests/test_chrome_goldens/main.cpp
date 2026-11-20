@@ -466,7 +466,17 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
     const int ids[] = {0, 1, 2, -10, -11};
     const uint32_t metrics = 1u << 0 | 1u << 1 | 1u << 2 | 1u << 4;
     const char* const labels[] = {"Terminal", "Files", "Settings", nullptr, nullptr};
-    const ChromeTaskbarLayout layout = ChromeTaskbarLayoutFor(s, screenW, screenH, "14:05 19 Nov 2026", true, metrics, ids, 5, 0,
+    bool narrowClock = false;
+    for (unsigned w = 180; w <= 420; ++w) {
+        const auto narrow = ChromeTaskbarLayoutFor(s, s.M(w), screenH, {{{2026, 11}, 20}, 5, 57},
+                                                   false, 0, nullptr, 0, 0);
+        if (!narrow.clock.w || std::strcmp(narrow.clockText, "05:57") != 0) continue;
+        if (std::strcmp(narrow.clockDate, "20 Nov") != 0) std::abort();
+        narrowClock = true;
+        break;
+    }
+    if (!narrowClock) std::abort();
+    const ChromeTaskbarLayout layout = ChromeTaskbarLayoutFor(s, screenW, screenH, {{{2026, 11}, 19}, 14, 5}, true, metrics, ids, 5, 0,
                                                               "dev  6785ca29  debug", false, labels);
     static ChromeShellModel model;
     model = {};
@@ -501,7 +511,7 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
     for (const bool all : {true, false}) {
         const uint32_t wideW = 1600 * m.percent / 100;
         const uint32_t set = all ? 127u : (1u << 0 | 1u << 1 | 1u << 6);
-        const ChromeTaskbarLayout wide = ChromeTaskbarLayoutFor(s, wideW, screenH, "14:05 19 Nov 2026", false, set, ids, 3, 0,
+        const ChromeTaskbarLayout wide = ChromeTaskbarLayoutFor(s, wideW, screenH, {{{2026, 11}, 19}, 14, 5}, false, set, ids, 3, 0,
                                                                 "dell-int51-20261119", false, labels);
         static ChromeShellModel wm;
         wm = model;
@@ -519,7 +529,7 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
         Check(prefix + (all ? "taskbar-diagnostics" : "taskbar-default"), list, s, 0, wide.y, wideW, screenH - wide.y);
     }
     // The compact HUD and the temperature target, without the diagnostics.
-    const ChromeTaskbarLayout hudLayout = ChromeTaskbarLayoutFor(s, screenW, screenH, "09:41 15 Nov 2026", false,
+    const ChromeTaskbarLayout hudLayout = ChromeTaskbarLayoutFor(s, screenW, screenH, {{{2026, 11}, 15}, 9, 41}, false,
                                                                   1u << 6, ids, 3, 2, "Brook 3a4b909e", true, labels);
     {
         model.taskbar = hudLayout;
@@ -546,7 +556,7 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
         model.tray.items[1].id = 2;
         model.tray.items[1].attention = true;
         std::strcpy(model.tray.items[1].title, "Updater");
-        model.taskbar = ChromeTaskbarLayoutFor(s, screenW, screenH, "14:05 19 Nov 2026", false,
+        model.taskbar = ChromeTaskbarLayoutFor(s, screenW, screenH, {{{2026, 11}, 19}, 14, 5}, false,
                                               metrics, ids, 3, 0, nullptr, false, labels, 2);
         const auto anchor = model.taskbar.trayApps[0];
         model.mouseX = anchor.x + 5; model.mouseY = anchor.y + 5;
@@ -702,8 +712,6 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
         for (const auto panel : {DesktopStatsPanel::CpuMemory,
                                  DesktopStatsPanel::Compositor, DesktopStatsPanel::App}) {
             model.statsPanel = panel;
-            model.statsLayout = ChromeStatsPopupLayoutFor(s, layout.volume, screenW, screenH - m.taskbar(), panel, 64);
-            model.rect = model.statsLayout.panel;
             auto& stats = model.detailedStats;
             stats.cpuMeasured = stats.tasksMeasured = stats.memoryMeasured = true;
             stats.gpuMeasured = prefix != "opaque-dark-200-";
@@ -721,6 +729,10 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
             stats.kernel = 510ull << 20;
             stats.gpu = 228ull << 20;
             telemetry.hasApp = prefix != "opaque-dark-200-";
+            const uint32_t taskRows = DesktopStatsTaskRows(stats);
+            model.statsLayout = ChromeStatsPopupLayoutFor(s, layout.volume, screenW, screenH - m.taskbar(),
+                                                           panel, 64, false, 0, taskRows);
+            model.rect = model.statsLayout.panel;
             const char* name = panel == DesktopStatsPanel::CpuMemory ? "cpu-memory" :
                                panel == DesktopStatsPanel::Compositor ? "compositor" : "app";
             auto statsList = ChromeListOn(storage);
@@ -729,7 +741,7 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
             if (panel == DesktopStatsPanel::CpuMemory && prefix == "opaque-dark-200-") {
                 const int desktop = 600 - m.taskbar();
                 model.statsLayout = ChromeStatsPopupLayoutFor(s, {360, desktop, 80, 60}, 800, desktop,
-                                                               panel, 64, true, 10000);
+                                                               panel, 64, true, 10000, taskRows);
                 model.rect = model.statsLayout.panel;
                 auto scrolledList = ChromeListOn(storage);
                 RenderSnapshot(model, s, scrolledList);
@@ -739,6 +751,32 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
         }
         model.popupPinned = false;
         telemetry.hasApp = true;
+    }
+    if (prefix == "glass-100-" || prefix == "opaque-light-150-" || prefix == "opaque-dark-200-") {
+        const CalendarDate today{{2024, 2}, 29};
+        model.calendar = true;
+        model.popupPinned = prefix != "glass-100-";
+        model.calendarToday = today;
+        model.calendarMonth = today.month;
+        model.calendarLayout = ChromeCalendarLayoutFor(s, layout.clock, screenW, screenH - m.taskbar(), true);
+        model.rect = model.calendarLayout.panel;
+        auto cal = ChromeListOn(storage);
+        RenderSnapshot(model, s, cal);
+        Check(prefix + "calendar", cal, s, model.rect.x, model.rect.y, model.rect.w, model.rect.h);
+        if (prefix == "glass-100-") {
+            model.calendarMonth = {2021, 8}; // six weeks; no today highlight
+            auto six = ChromeListOn(storage);
+            RenderSnapshot(model, s, six);
+            Check(prefix + "calendar-six-weeks", six, s, model.rect.x, model.rect.y, model.rect.w, model.rect.h);
+            model.calendarToday = {};
+            model.calendarMonth = {};
+            model.calendarLayout = ChromeCalendarLayoutFor(s, layout.clock, screenW, screenH - m.taskbar(), false);
+            model.rect = model.calendarLayout.panel;
+            auto invalid = ChromeListOn(storage);
+            RenderSnapshot(model, s, invalid);
+            Check(prefix + "calendar-unavailable", invalid, s, model.rect.x, model.rect.y, model.rect.w, model.rect.h);
+        }
+        model.popupPinned = false;
     }
     model.kind = ChromeShellKind::PerformanceHud;
     const DesktopRect hud{0, 0, int(s.M(348)), ChromePerformanceHudHeight(s, true)};
@@ -848,7 +886,7 @@ void WebAppTitles(const std::string& prefix, uint32_t theme, const DesktopMetric
     constexpr uint32_t sw = 800, sh = 600;
     const int ids[] = {0};
     const char* labels[] = {title};
-    const auto taskbar = ChromeTaskbarLayoutFor(s, sw, sh, "14:05 19 Nov 2026", false, 0, ids, 1, 0,
+    const auto taskbar = ChromeTaskbarLayoutFor(s, sw, sh, {{{2026, 11}, 19}, 14, 5}, false, 0, ids, 1, 0,
                                                "", false, labels);
     static ChromeShellModel model;
     static ChromeShellStorage storage;
