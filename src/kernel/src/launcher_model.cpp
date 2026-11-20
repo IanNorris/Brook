@@ -366,7 +366,10 @@ bool LauncherModel::Parse(const char* text, bool* migrated) {
             uint32_t len = uint32_t(comma - v) < LL::KeyLength - 1 ? uint32_t(comma - v) : LL::KeyLength - 1;
             for (uint32_t i = 0; i < len; ++i) key[i] = v[i];
             key[len] = 0;
-            const bool oldFiles = Equal(key, "brook-files");
+            // The file browser had a desktop ID in the hardware profile and
+            // a shortcut basename before native shortcuts carried app IDs.
+            const bool oldFiles = Equal(key, "brook-files") || Equal(key, "brook-hardware-files") ||
+                                  Equal(key, "files") || Equal(key, "Files");
             remapFiles |= oldFiles;
             const int k = len ? self.Intern(oldFiles ? LauncherFilesAppId : key) : -1;
             bool dup = false;

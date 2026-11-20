@@ -298,9 +298,9 @@ void Persistence() {
     old->Init();
     const uint32_t before = old->LayoutEpoch();
     bool migrated = false;
-    CHECK(old->Parse("[Launcher]\nversion=1\npinned=terminal,brook-files,org.gnome.Nautilus,firefox\n"
-                     "recent=brook-files,calc,org.gnome.Nautilus\ncategories=system\n"
-                     "category.system=System|blue|sliders|brook-files,terminal\n", &migrated));
+    CHECK(old->Parse("[Launcher]\nversion=1\npinned=terminal,brook-hardware-files,brook-files,org.gnome.Nautilus,firefox\n"
+                     "recent=brook-hardware-files,calc,files,org.gnome.Nautilus\ncategories=system\n"
+                     "category.system=System|blue|sliders|Files,terminal\n", &migrated));
     CHECK(migrated && old->LayoutEpoch() != before);
     old->SetCatalog(Catalog, CatalogCount);
     CHECK(old->Pinned(Idx(*old, LauncherFilesAppId)));
@@ -308,7 +308,8 @@ void Persistence() {
     CHECK(old->Serialize(again, sizeof(again)) > 0);
     CHECK(std::strstr(again, "pinned=terminal,org.gnome.Nautilus,firefox\n"));
     CHECK(std::strstr(again, "recent=org.gnome.Nautilus,calc\n"));
-    CHECK(!std::strstr(again, "brook-files"));
+    CHECK(std::strstr(again, "category.system=System|blue|sliders|org.gnome.Nautilus,terminal\n"));
+    CHECK(!std::strstr(again, "brook-files") && !std::strstr(again, "brook-hardware-files"));
     CHECK(old->Parse(again, &migrated) && !migrated);
 
     // A bad or missing section falls back to the defaults.
