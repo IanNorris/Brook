@@ -538,27 +538,40 @@ void AhciSystemDataInspect() {
 }
 bool AhciSystemDirectDesktopMount(uint8_t* nextDrive,bool* sharedProfileRejected) {
     if(sharedProfileRejected)*sharedProfileRejected=false;
-    if(!directPrepared || directReady || !nextDrive || !Ext2DriveAvailable(*nextDrive))return false;
+    const auto fail=[](const char* step,const WritableDesktopFailure& details,int cleanup=0) {
+        KPrintf("ahci direct: handoff failed step=%s status=%d path=%s check=%s cleanup_status=%d\n",
+                step,details.status,details.path,details.check,cleanup);
+        return false;
+    };
+    if(!directPrepared || directReady)return fail("admission",{"/nix","direct-state",-16});
+    if(!nextDrive)return fail("admission",{"/nix","drive-slot",-22});
+    if(!Ext2DriveAvailable(*nextDrive))return fail("admission",{"/nix","drive-slot",-16});
     directPrepared=false; // failed admission is not replayed during this boot
-    if(!WritableDesktopPrepareDirect())return false;
-    VnodeStat st{};if(VfsLstatPath("/nix",&st) || !st.isDir || st.isSymlink)return false;
+    WritableDesktopFailure details{};
+    if(!WritableDesktopPrepareDirect(&details))return fail("prepare",details);
+    VnodeStat st{};
+    if(const int status=VfsLstatPath("/nix",&st))return fail("mount-target",{"/nix","lstat",status});
+    if(!st.isDir || st.isSymlink)return fail("mount-target",{"/nix","real-directory",-20});
     constexpr uint32_t GdtCapacity=4096*32;
-    auto* gdt=static_cast<uint8_t*>(kmalloc(GdtCapacity));if(!gdt)return false;
+    auto* gdt=static_cast<uint8_t*>(kmalloc(GdtCapacity));
+    if(!gdt)return fail("ext2-admission",{"/nix","group-descriptor-buffer",-12});
     const int begin=largeSession.Begin(LargeIo(),largeRange.bytes,largeUuid,gdt,GdtCapacity);
     kfree(gdt);
-    if(begin) {KPrintf("ahci direct: filesystem admission failed error=%d; maintenance only\n",begin);return false;}
-    if(!Ext2BindDevice(*nextDrive,&largePartition))return false;
+    if(begin)return fail("ext2-admission",{"/nix","session-begin",begin});
+    if(!Ext2BindDevice(*nextDrive,&largePartition))return fail("ext2-bind",{"/nix","drive-bind",-16});
     const uint8_t drive=(*nextDrive)++;
     if(!VfsMountConfigured("/nix","ext2",drive,6)) {
         VfsDrainMountCleanup();
-        if(VfsSync(nullptr) || VfsMountCleanupPending())KPrintf("ahci direct: backing cleanup pending; maintenance only\n");
-        return false;
+        const int sync=VfsSync(nullptr);
+        const int cleanup=sync?sync:VfsMountCleanupPending()?-16:0;
+        return fail("mount",{"/nix","ext2-mount",-5},cleanup);
     }
-    const auto publication=WritableDesktopPublishDirect();
+    const auto publication=WritableDesktopPublishDirect(&details);
     if(publication!=WritableDesktopPublish::Ready) {
-        if(sharedProfileRejected)*sharedProfileRejected=publication==WritableDesktopPublish::SharedProfileRejected;
-        if(!VfsUnmount("/nix"))KPrintf("ahci direct: unmount failed; maintenance only\n");
-        return false;
+        const bool rejected=publication==WritableDesktopPublish::SharedProfileRejected;
+        if(sharedProfileRejected)*sharedProfileRejected=rejected;
+        const int cleanup=VfsUnmount("/nix")?0:-16;
+        return fail(rejected?"profile-admission":"home-bind",details,cleanup);
     }
     if(!largeSession.Arm())__builtin_trap();
     directReady=true;WritableDesktopMarkDirectReady(drive,largeRange.bytes);

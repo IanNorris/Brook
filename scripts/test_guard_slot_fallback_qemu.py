@@ -503,6 +503,12 @@ def run_matrix(a, base_disk, normal, work, guards, metadata, panic_journal):
             if result == 'profile' and (f'GUARD_SLOT_PROFILE_REJECTED status=0 {key}' not in serial or
                                         'GUARD_SLOT_RESTART' in serial or 'GUARD_DESKTOP_HANDOFF_SCRIPT' in serial):
                 raise RuntimeError(f'{name}-{i}: shared profile rejection entered a slot-specific retry')
+            if result == 'profile':
+                diagnostics = re.findall(r'^ahci direct: handoff failed [^\r\n]+', serial, re.M)
+                expected = ('ahci direct: handoff failed step=profile-admission status=-2 '
+                            'path=/nix/index/packages.idx check=stat cleanup_status=0')
+                if diagnostics != [expected]:
+                    raise RuntimeError(f'{name}-{i}: missing or incorrect admission diagnostic: {diagnostics}')
             if result in ('recovery', 'repair', 'repair-malformed-profile', 'resume-profile') and (
                     'Brook SSD recovery payload verified' not in serial or
                                                       'GUARD_SLOT_CONFIRMED' in serial or

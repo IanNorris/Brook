@@ -8,9 +8,14 @@ struct Device;
 bool WritableDesktopVerifyRepairedProfile(Device* device);
 #endif
 // Direct stores use the same namespace and payload checks as image stores.
-bool WritableDesktopPrepareDirect();
+struct WritableDesktopFailure {
+    const char* path=nullptr; // Fixed diagnostic label, never contents from disk.
+    const char* check=nullptr;
+    int status=0;
+};
+bool WritableDesktopPrepareDirect(WritableDesktopFailure* failure=nullptr);
 enum class WritableDesktopPublish { Ready, SharedProfileRejected, HomeBindFailed };
-WritableDesktopPublish WritableDesktopPublishDirect();
+WritableDesktopPublish WritableDesktopPublishDirect(WritableDesktopFailure* failure=nullptr);
 void WritableDesktopMarkDirectReady(uint8_t drive,uint64_t bytes);
 void WritableDesktopDirectFinalResult(int error,bool attempted);
 struct WritableDesktopInfo {
