@@ -188,6 +188,32 @@ def copy_boot_logs(work, prefix):
             shutil.copyfile(artifact, prefix.with_name(prefix.name + f'-{kind}.log'))
 
 
+def boot_matrix_step(disk, firmware, step, marker, prefix, **kwargs):
+    def disk_digest():
+        with disk.open('rb') as stream:
+            return hashlib.file_digest(stream, 'sha256').digest()
+
+    before = disk_digest()
+    for attempt in range(1, 4):
+        try:
+            boot(disk, firmware, step, False, marker, 110, True, **kwargs)
+            return
+        except RuntimeError as error:
+            serial_path = step / 'serial.log'
+            serial = serial_path.read_bytes() if serial_path.exists() else b''
+            # OVMF occasionally stops with only ANSI screen controls before
+            # boot selection. Retry only when the disk is still byte-identical.
+            firmware_stall = (
+                str(error).startswith('timed out waiting for ') and serial and
+                re.fullmatch(rb'(?:\x1b\[[0-9;=]*[A-Za-z]|\s)+', serial) and
+                disk_digest() == before
+            )
+            if not firmware_stall or attempt == 3:
+                raise
+            copy_boot_logs(step, prefix.with_name(f'{prefix.name}-firmware-stall-{attempt}'))
+            print(f'{prefix.name}: OVMF stalled before boot selection, retrying', flush=True)
+
+
 def verify_emergency_gate(a, disk, work, guards):
     for name in ('f5', 'dirty-disk'):
         check = work / name
@@ -344,12 +370,13 @@ def run_matrix(a, base_disk, normal, work, guards, metadata, panic_journal):
             else:
                 marker = 'GUARD_DESKTOP_HANDOFF_SCRIPT status=0'
             try:
-                boot(disk, a.firmware, step, False, marker, 110, True, sata_snapshot=False,
-                     sata_serial='BROOK-RECOVERY-QA', extra_fw_cfg=[RESET_OPTION], expect_reset=reset,
-                     reset_evidence_marker=evidence, on_marker=on_marker, network_port=port,
-                     failure_marker=failure_marker, hold_after_marker=1 if not reset else 0,
-                     intermediate_marker=intermediate, on_intermediate=lambda: poke_desktop(step),
-                     gdb_script=gdb_script)
+                boot_matrix_step(
+                    disk, a.firmware, step, marker, prefix, sata_snapshot=False,
+                    sata_serial='BROOK-RECOVERY-QA', extra_fw_cfg=[RESET_OPTION], expect_reset=reset,
+                    reset_evidence_marker=evidence, on_marker=on_marker, network_port=port,
+                    failure_marker=failure_marker, hold_after_marker=1 if not reset else 0,
+                    intermediate_marker=intermediate, on_intermediate=lambda: poke_desktop(step),
+                    gdb_script=gdb_script)
             finally:
                 copy_boot_logs(step, prefix)
             serial = (step/'serial.log').read_text(errors='replace')
