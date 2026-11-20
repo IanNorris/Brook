@@ -151,6 +151,11 @@ def main():
     configure = ['cmake', '-S', ROOT / 'src/kernel', '-B', build, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON',
                  f'-DCMAKE_TOOLCHAIN_FILE={ROOT}/cmake/toolchains/kernel-x86_64-clang.cmake']
     configure += [f'-D{k}:BOOL={v}' for k, v in sorted(options.items())]
+    # The panic scanner's address is local, private configuration.
+    panic_url = os.environ.get('BROOK_PANIC_INGEST_URL') or \
+        ((a.shared / 'panic-ingest-url').read_text().strip() if (a.shared / 'panic-ingest-url').exists() else '')
+    if panic_url:
+        configure.append(f'-DBROOK_PANIC_INGEST_URL={panic_url}')
     archive = a.shared / 'uacpi-6.1.0.tar.gz'
     if archive.exists():
         configure.append(f'-DBROOK_UACPI_ARCHIVE={archive}')

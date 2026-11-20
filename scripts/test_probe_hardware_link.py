@@ -14,7 +14,7 @@ class ProbeTests(unittest.TestCase):
         def partial(host,port,commands,timeout,progress):
             progress('connected',0);progress('request_sent',0);progress('frame_started',0)
             raise TimeoutError('partial reply')
-        with patch.object(probe,'exchange',partial):result=probe.probe('192.168.85.106')
+        with patch.object(probe,'exchange',partial):result=probe.probe('192.0.2.10')
         self.assertEqual(result['bridge']['stage'],'frame_started')
         self.assertIn('partial reply',result['bridge']['error'])
         self.assertNotIn('boot_id',result['bridge'])
@@ -23,7 +23,7 @@ class ProbeTests(unittest.TestCase):
         def fail(host,port,commands,timeout,progress):
             progress('connecting',0)
             raise OSError(errno.EHOSTUNREACH,'No route to host')
-        with patch.object(probe,'exchange',fail):result=probe.probe('192.168.85.106')
+        with patch.object(probe,'exchange',fail):result=probe.probe('192.0.2.10')
         self.assertEqual(result['bridge']['stage'],'connecting')
         self.assertEqual(result['bridge']['errno'],errno.EHOSTUNREACH)
 
@@ -32,7 +32,7 @@ class ProbeTests(unittest.TestCase):
             self.assertEqual(commands,['bridge hardware caps'])
             progress('frame_complete',1)
             return [{'hardware_api':1,'boot_guard':True,'boot_id':'a'*32}]
-        with patch.object(probe,'exchange',healthy):result=probe.probe('192.168.85.106')
+        with patch.object(probe,'exchange',healthy):result=probe.probe('192.0.2.10')
         self.assertEqual(result['bridge']['stage'],'capabilities_received')
         self.assertEqual(result['bridge']['boot_id'],'a'*32)
         self.assertEqual(self.host.call_count,3)

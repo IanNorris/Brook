@@ -77,7 +77,8 @@ readme.write_text("Brook Dell XPS 13 9343 offline hardware desktop\n\n"
     "Kernel Console shows USB_IO_PROBE_OK after six checked reads, plus HARDWARE_NETWORK_READY with the IP if Ethernet succeeds.\n"
     "Share the IP for the boot-pinned debug bridge on TCP1234. Physical Tecknet ECM networking still needs validation.\n"
     "Audio starts muted; the Dell internal SST/RT286 codec and native Intel GPU acceleration are not implemented.\n"
-    "Recovery: the prior known-good payload is preserved on the build host; panic scanner https://192.168.85.8:9001/.\n")
+    "Recovery: the prior known-good payload is preserved on the build host; panic scanner "
+    + os.environ.get("BROOK_PANIC_INGEST_URL", "on the build host") + ".\n")
 # Keep this payload's metadata and its disposable QEMU disk identical.
 import hashlib
 meta=json.loads((probe/'manifest.json').read_text())

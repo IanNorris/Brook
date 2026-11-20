@@ -681,7 +681,7 @@ Done today, on main up to `f388d5ac`:
   - Evidence: `display-perf/build/dell/occl-{alone,idle}-{1,2}`.
   - Next for 60 fps: present blit 7.8 ms and submit→fence 29.7 ms on direct frames; honour fullscreen plus zero-copy/scanout (design note in the occlusion report).
 - **Alt+Tab pointer re-engage:** confirmed by Ian, merged (`5f9d13cd`).
-- **Network-dead-but-desktop-alive (16 Nov, Chromium video):** the lastlog record shows ARP replies from 192.168.85.8 arriving while "ARP resolve failed" loops; also DNS sockets full and dropping, the debug listener's accept queue full, and VKRENDER hitting dma-buf EXPORT_SYNC_FILE ENOSYS 9,887 times. Evidence: `display-perf/build/dell/hang-1116-lastlog/`. Fix in progress on `work/net-arp`.
+- **Network-dead-but-desktop-alive (16 Nov, Chromium video):** the lastlog record shows ARP replies from <build-host-ip> arriving while "ARP resolve failed" loops; also DNS sockets full and dropping, the debug listener's accept queue full, and VKRENDER hitting dma-buf EXPORT_SYNC_FILE ENOSYS 9,887 times. Evidence: `display-perf/build/dell/hang-1116-lastlog/`. Fix in progress on `work/net-arp`.
 - **Ready to integrate:**
   - `work/restart-harden` `4ace7567` (TERM/KILL escalation for windowless processes, blockers in status, tcp traces behind `log level tcp debug`);
   - `work/brook-value` `1671e404` (revised with Ian's direction).
@@ -1102,7 +1102,7 @@ Two independent code reviews (compositor and driver), Dell measurements on the g
 
 - **Current (supersedes the gen 355 line below):** generation 356, slot 1, payload `dell-vmm-move-20261114`, built from `2831dbbd` by `build_dell_image.py`; bridge session `79b1dcaaaffc4d2a80f9589683d65802`. Baseline measurements: 68.6 swaps/s with 8 buffers and 39.5 with 2 (`display-perf/build/dell/measure-vmm-move/`). Slot 0 holds gen 355 for rollback.
 
-- **Target:** Dell XPS 13 9343 at `192.168.85.106:1234`. Generation 355, slot 0: boot `7f78aa2b8ea24c17816b5b80eff04a26`, session `bccc100914d547f095a4d01834494c93`.
+- **Target:** Dell XPS 13 9343 at `<dell-ip>:1234`. Generation 355, slot 0: boot `7f78aa2b8ea24c17816b5b80eff04a26`, session `bccc100914d547f095a4d01834494c93`.
 - **Boot payload:** the restored gen 338 baseline `dell-short-lock-serial-20261113` (receipt `build/hardware/dell-baseline-restore-20261114/receipt.json`). It was built with BROOK_GPU_SUBMISSION_TIMING, the coherent LLC render path and the 500 MHz on-AC clock trial. Pair: `build/hardware/dell-present-ownership-20261113/pair-short-lock-serial/`.
 - **Previous payload:** `dell-scanout-fair-counts-20261113`, the boot Ian started after the previous agent's last image.
 - **Build recipe gap:** the exact recipe for building a Dell pair from source isn't recorded (it was assembled in a private checkout). The gen 338 kernel came from a guard-timing CMake configuration (cache SHA `34df12a0…`) with source initrd `build/hardware/dell-packed-overlay-candidate-20261111/INITRD.IMG`. A scripted, reproducible "Dell image from main" build is the first code task.

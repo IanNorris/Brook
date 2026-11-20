@@ -30,7 +30,7 @@ For phone diagnostics, start `tools/panic_receiver.py --port 9001 --elf
 <frozen-payload-kernel>`; keep that exact ELF unchanged while testing. The receiver
 saves reports and local inbox notifications under `crash_reports/` rather than
 the removed Enclave workspace. The panic URL QR currently targets
-`https://khione:9001/`; use the host's LAN address manually if name resolution
+`https://<build-host>:9001/`; use the host's LAN address manually if name resolution
 is unavailable. The receiver uses its local certificate. The QR payload carries
 registers, stack and process/system state, not a complete serial boot transcript.
 

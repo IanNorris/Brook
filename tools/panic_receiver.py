@@ -385,7 +385,7 @@ def generate_self_signed_cert(cert_dir: Path) -> tuple[str, str]:
         "-keyout", str(key_file), "-out", str(cert_file),
         "-days", "365", "-nodes",
         "-subj", "/CN=Brook Panic Receiver",
-        "-addext", "subjectAltName=DNS:khione,DNS:localhost,IP:127.0.0.1",
+        "-addext", f"subjectAltName=DNS:{socket.gethostname()},DNS:localhost,IP:127.0.0.1",
     ], capture_output=True, check=True)
 
     print(f"  Generated self-signed certificate: {cert_file}")

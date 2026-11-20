@@ -51,7 +51,7 @@ Run every command from the repo root with `BROOK_ROOT=/data/Programming/Brook/di
    tools/vm_bridge/server.py --call hw_power --arguments '{"session":S,"request_id":<new>,"operation":"restart"}'
    ```
    Then `commit` when asked. Ian presses F12 at the Dell logo and picks the USB maintenance stick, which is not the default.
-3. **Attach.** Use `hw_attach` with the Dell IP (192.168.85.106 at last use) to get a new session. Run `hw_doctor`; it must be `verified` with `identity_matches`.
+3. **Attach.** Use `hw_attach` with the Dell IP (<dell-ip> at last use) to get a new session. Run `hw_doctor`; it must be `verified` with `identity_matches`.
 4. **Dry run, read-only** (safe to repeat):
    ```sh
    python3 scripts/dell_loader_promotion.py inventory --session <S> --output build/dell/promo-<n>-inventory

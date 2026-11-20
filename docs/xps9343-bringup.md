@@ -705,7 +705,7 @@ existing receipt and invalid key. Actual end-to-end live reset passed in
 `build/hardware/update-workflow-vm-20261030/result.json`; QEMU stayed alive while
 the guest's validated ACPI register reset it and the new payload was confirmed.
 
-The first physical maintenance boot was confirmed at 192.168.85.106 with payload
+The first physical maintenance boot was confirmed at <dell-ip> with payload
 `maintenance-bootstrap-5501ac9ce3064efc92a4718e7ad76d71`. Wrong-nonce refusal and
 initial zero-data verification passed. The 1 MiB scratch write reached fsync,
 which returned EIO. The USB driver logged CSW command failure status1/residue0;
