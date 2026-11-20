@@ -578,6 +578,8 @@ static int VfsMountNamespaceBindLocked(MountNamespace* ns,const VfsPath& source,
     if(!ns->life.Published())return -3;
     VfsMountTargetLease lease;if(int error=lease.Follow(inputTarget))return error;
     const auto& target=lease.value;
+    if(VfsSystemMountDenied(static_cast<MountEntry*>(source.attachment)) ||
+       VfsSystemMountDenied(static_cast<MountEntry*>(target.attachment)))return -13;
     if(VfsVirtual(source))return -95; // synthetic source roots need explicit legacy reporting support
     if(ns->initial && !source.object->ops->directory_path)return -95;
     auto* parent=static_cast<MountEntry*>(target.attachment);

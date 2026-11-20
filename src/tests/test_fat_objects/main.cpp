@@ -60,6 +60,7 @@ std::unordered_set<void*> allocations,pages;
 thread_local long failAllocation=-1;
 }
 namespace brook {
+bool VfsCanAccessSystemFiles(){return true;}
 Device* registeredImage=nullptr;
 bool AhciSystemGuardIsReservedDevice(Device* device){return device && device==reservedRecoveryDevice;}
 extern "C" bool DeviceIsRegistered(Device* device){return device==registeredImage;}

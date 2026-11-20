@@ -100,6 +100,7 @@ int64_t MaintenanceBlockTransfer(MaintenanceBlockFd* file,uint64_t address,
                                  uint64_t count,uint64_t* position,
                                  bool write,bool userBuffer) {
     if(!file || !position)return -EBADF;
+    if(!VfsCanAccessSystemFiles())return -EPERM;
     if(*position>=file->bytes)return write && count ? -28 : 0;
     if(count>file->bytes-*position)count=file->bytes-*position;
     if(count>VnodeWriteLimit)count=VnodeWriteLimit;

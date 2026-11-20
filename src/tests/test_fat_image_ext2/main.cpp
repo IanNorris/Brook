@@ -169,6 +169,45 @@ int main(int argc,char** argv){
     process.uid=process.euid=process.suid=0;process.gid=process.egid=process.sgid=0;
     VfsInit();FatFsVfsRegister();Ext2VfsRegister();g_ext2WritebackMiB=0;
     assert(VfsMount("/","fatfs",0));assert(!VfsMkdir("/nix",0755));
+    assert(!FatFsProtectBootKey()); // A clean image may omit the key.
+    assert(!VfsMkdir("/ETC",0755));
+    constexpr const char* keyPath="/etc/hardware-update-key";
+    constexpr const char* shortAlias="/EtC/HARDWA~1";
+    auto* key=VfsOpen(keyPath,VFS_O_CREATE|VFS_O_WRITE|VFS_O_READWRITE);assert(key);
+    static constexpr char witness[]="synthetic fixture";
+    uint64_t keyOffset=0;
+    assert(VfsWrite(key,witness,sizeof(witness),&keyOffset)==sizeof(witness));
+    assert(!VfsFsync(key));
+    VnodeStat keyStat{},aliasStat{};
+    assert(!VfsStat(key,&keyStat) && !VfsLstatPath(shortAlias,&aliasStat) && keyStat.ino==aliasStat.ino);
+    assert(!FatFsProtectBootKey());
+    VfsRelease(key);
+    key=VfsOpen(shortAlias,VFS_O_WRITE|VFS_O_READWRITE);assert(key);
+    assert(!VfsStat(key,&keyStat) && keyStat.mode==0100600);
+    assert(VfsFileMapPin(key)==-95);
+    VfsPath root{};
+    assert(!VfsPathRoot(&root));
+    process.euid=1000;
+    for (const auto* name : {keyPath,shortAlias,"/ETC/HARDWARE-UPDATE-KEY"}) {
+        int error=0;
+        assert(!VfsOpenModeChecked(name,VFS_O_READ,0,&error) && error==-13);
+        assert(!VfsOpenAt(root,root,name,VFS_O_METADATA,0,0,&error) && error==-13);
+        assert(!VfsOpenAt(root,root,name,VFS_O_WRITE|VFS_O_TRUNC,0,0,&error) && error==-13);
+    }
+    char withheld[sizeof(witness)]{};
+    keyOffset=0;
+    assert(VfsRead(key,withheld,sizeof(withheld),&keyOffset)==-13 && keyOffset==0 && !withheld[0]);
+    assert(VfsWrite(key,witness,sizeof(witness),&keyOffset)==-13 && keyOffset==0);
+    assert(VfsFileMapPin(key)==-95);
+    assert(VfsRenameAt(root,root,"/etc",root,"/etc-renamed")==-16);
+    UserNamespace childNamespace{};
+    process.euid=0;process.userNamespace=&childNamespace;process.capabilities.effective=UserCapabilities;
+    assert(VfsLstatPath(shortAlias,&aliasStat)==-13);
+    assert(VfsRead(key,withheld,sizeof(withheld),&keyOffset)==-13);
+    process.userNamespace=nullptr;process.capabilities={};
+    assert(VfsRead(key,withheld,sizeof(withheld),&keyOffset)==sizeof(witness));
+    assert(!std::memcmp(withheld,witness,sizeof(witness)));
+    VfsPathRelease(root);VfsRelease(key);
     auto* source=VfsOpen("/STORE.IMG",VFS_O_WRITE|VFS_O_READWRITE);assert(source);
     VnodeStat sourceStat{};assert(!VfsStat(source,&sourceStat));int error=0;
     auto* device=FatImageDeviceCreate(source,sourceStat.size,"usb-nix-image",&error);assert(device&&!error);
