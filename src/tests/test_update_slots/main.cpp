@@ -238,21 +238,6 @@ static void GuardedSlotSelection() {
     journal.health.slots[0].starts=0;
     save();
     load(Result::RecoveryRequired,0); // A shared profile is not repaired by fallback.
-
-    // An explicit choice pins only this generation and clears only that slot.
-    assert(GuardSlotPrefer(journal.health,prior,recent.generation));
-    save();
-    load(Result::Previous,1);
-    assert(journal.health.slots[1].profileRejected);
-    assert(GuardSlotStart(journal.health,prior));
-    assert(GuardSlotFinish(journal.health,prior,false));
-    save();
-    load(Result::Previous,1);
-    const BootGuardSlot later{3,0,0,{42}};
-    assert(GuardChooseSlot(journal.health,later,recent)==GuardSlotChoice::Newest);
-    assert(GuardSlotStart(journal.health,later));
-    assert(!journal.health.preferredAtGeneration);
-    save();
     files.clear();
 }
 

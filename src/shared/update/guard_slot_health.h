@@ -21,8 +21,6 @@ struct GuardSlotHealthEntry {
 struct GuardSlotHealth {
     uint64_t sequence = 0;
     GuardSlotHealthEntry slots[GuardSlotCount]{};
-    uint64_t preferredAtGeneration = 0;
-    uint32_t preferredSlot = 0;
 };
 
 inline bool GuardSlotHasDigest(const uint8_t (&digest)[32])
@@ -46,8 +44,9 @@ inline bool GuardSlotMatches(const GuardSlotHealth& health, const BootGuardSlot&
            BrookUpdateEqual(entry.selectorDigest, key.selectorDigest, sizeof(entry.selectorDigest));
 }
 
-inline GuardSlotHealthEntry& GuardSlotRemember(GuardSlotHealth& health, const BootGuardSlot& key)
+inline bool GuardSlotStart(GuardSlotHealth& health, const BootGuardSlot& key)
 {
+    if (!GuardSlotKeyValid(key)) return false;
     auto& entry = health.slots[key.slot];
     if (!GuardSlotMatches(health,key)) {
         entry = {};
@@ -55,32 +54,8 @@ inline GuardSlotHealthEntry& GuardSlotRemember(GuardSlotHealth& health, const Bo
         for (unsigned i = 0; i < sizeof(entry.selectorDigest); ++i)
             entry.selectorDigest[i] = key.selectorDigest[i];
     }
-    return entry;
-}
-
-inline bool GuardSlotStart(GuardSlotHealth& health, const BootGuardSlot& key)
-{
-    if (!GuardSlotKeyValid(key)) return false;
-    auto& entry = GuardSlotRemember(health,key);
     if (entry.profileRejected || entry.starts >= GuardSlotFailureLimit) return false;
-    if (key.generation > health.preferredAtGeneration) {
-        health.preferredAtGeneration = 0;
-        health.preferredSlot = 0;
-    }
     ++entry.starts;
-    return true;
-}
-
-// Only a verified recovery request may clear the selected slot's count.
-// The preference expires as soon as a new selector generation is published.
-inline bool GuardSlotPrefer(GuardSlotHealth& health, const BootGuardSlot& key, uint64_t newestGeneration)
-{
-    if (!GuardSlotKeyValid(key) || key.generation > newestGeneration) return false;
-    auto& entry = GuardSlotRemember(health,key);
-    entry.starts = 0;
-    entry.profileRejected = false;
-    health.preferredAtGeneration = newestGeneration;
-    health.preferredSlot = key.slot;
     return true;
 }
 
@@ -99,17 +74,6 @@ enum class GuardSlotChoice { Newest, Previous, Recovery };
 inline GuardSlotChoice GuardChooseSlot(const GuardSlotHealth& health, const BootGuardSlot& newest,
                                        const BootGuardSlot& previous)
 {
-    if (health.preferredAtGeneration && health.preferredAtGeneration == newest.generation) {
-        const bool useNewest = health.preferredSlot == newest.slot;
-        const auto& selected = useNewest ? newest : previous;
-        if (selected.slot != health.preferredSlot || !GuardSlotMatches(health,selected) ||
-            (!useNewest && selected.generation >= newest.generation))
-            return GuardSlotChoice::Recovery;
-        const auto& entry = health.slots[selected.slot];
-        if (entry.profileRejected || entry.starts >= GuardSlotFailureLimit)
-            return GuardSlotChoice::Recovery;
-        return useNewest ? GuardSlotChoice::Newest : GuardSlotChoice::Previous;
-    }
     if (!GuardSlotMatches(health,newest)) return GuardSlotChoice::Newest;
     const auto& active = health.slots[newest.slot];
     if (active.profileRejected) return GuardSlotChoice::Recovery;
@@ -153,15 +117,7 @@ inline GuardSlotRecordKind GuardSlotDecode(const uint8_t* sector, const uint8_t 
             (!entry.generation && entry.starts)) return GuardSlotRecordKind::Foreign;
         entry.profileRejected = rejected != 0;
     }
-    constexpr unsigned offset = 48+GuardSlotCount*48;
-    health.preferredAtGeneration = BrookUpdateGet64(sector+offset);
-    health.preferredSlot = BrookUpdateGet32(sector+offset+8);
-    if (health.preferredSlot >= GuardSlotCount ||
-        (!health.preferredAtGeneration && health.preferredSlot) ||
-        (health.preferredAtGeneration && (!health.slots[health.preferredSlot].generation ||
-            health.slots[health.preferredSlot].generation > health.preferredAtGeneration)))
-        return GuardSlotRecordKind::Foreign;
-    for (unsigned i = offset+12; i < GuardSlotCrcOffset; ++i)
+    for (unsigned i = 48+GuardSlotCount*48; i < GuardSlotCrcOffset; ++i)
         if (sector[i]) return GuardSlotRecordKind::Foreign;
     result = health;
     return GuardSlotRecordKind::Valid;
@@ -213,9 +169,6 @@ bool GuardSlotWrite(Io& io, const uint8_t (&disk)[32], const GuardSlotHealth& ne
         BrookUpdatePut32(bytes+40,entry.starts);
         BrookUpdatePut32(bytes+44,entry.profileRejected ? 1 : 0);
     }
-    constexpr unsigned offset = 48+GuardSlotCount*48;
-    BrookUpdatePut64(sector+offset,next.preferredAtGeneration);
-    BrookUpdatePut32(sector+offset+8,next.preferredSlot);
     BrookUpdatePut32(sector+GuardSlotCrcOffset,BrookUpdateCrc(sector,GuardSlotCrcOffset));
     GuardSlotHealth verified{};
     if (GuardSlotDecode(sector,disk,verified) != GuardSlotRecordKind::Valid) return false;

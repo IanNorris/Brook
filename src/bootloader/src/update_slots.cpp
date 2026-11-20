@@ -105,10 +105,7 @@ UpdatePairResult LoadUpdatePair(EFI_HANDLE image,EFI_BOOT_SERVICES* bs,
     // A fallback selected by retry policy must never fall through to the
     // exhausted slot when the older pair's contents no longer verify.
     const unsigned start=choice==GuardSlotChoice::Previous?1:0;
-    const bool manual=health.preferredAtGeneration &&
-        health.preferredAtGeneration==keys[newest].generation;
-    const unsigned limit=manual && start==0?1:2;
-    for(unsigned attempt=start;attempt<limit;++attempt) {
+    for(unsigned attempt=start;attempt<2;++attempt) {
         const unsigned index=attempt?previous:newest;
         if(!GuardSlotKeyValid(keys[index]))continue;
         if(attempt && GuardChooseSlot(health,keys[index],{})==GuardSlotChoice::Recovery)
