@@ -133,6 +133,27 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
         timing.waitEndTsc = ReadTsc();
         timing.flags |= brook::BootTimingWaitRan;
     }
+    bool updatePair = false;
+    brook::BootGuardSlot selectedSlot{};
+    if (!recoveryRequested && g_bootConfig.updateSlots) {
+        const char* identity = nullptr;
+#if defined(BROOK_RECOVERY_GUARD_REQUIRED)
+        identity = BROOK_GUARD_IDENTITY;
+#endif
+        const auto selected = LoadUpdatePair(imageHandle, systemTable->BootServices,
+            kernelData, kernelFileSize, initrdData, initrdFileSize, selectedSlot, identity);
+        updatePair = selected == UpdatePairResult::Loaded || selected == UpdatePairResult::Previous;
+        recoveryRequested = selected == UpdatePairResult::RecoveryRequired;
+        if (selected == UpdatePairResult::Previous) {
+            ConsoleSetQuiet(false);
+            ConsolePrint(u"Brook guard fallback generation ");
+            ConsolePrintDec(selectedSlot.generation);
+            ConsolePrint(u" slot ");
+            ConsolePrintDec(selectedSlot.slot);
+            ConsolePrintLine(u" verified");
+            ConsoleSetQuiet(!g_bootConfig.debugText);
+        }
+    }
     if (recoveryRequested) {
         timing.flags |= brook::BootTimingRecovery;
         ConsoleSetQuiet(false);
@@ -142,15 +163,13 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
         ConsolePrintLine(u"Recovery selected; verifying payload.");
         ConsoleSetQuiet(!g_bootConfig.debugText);
     }
-    bool updatePair = false;
-    brook::BootGuardSlot selectedSlot{};
 #if defined(BROOK_GUARD_ALTERNATE_RECOVERY)
     if (recoveryRequested) updatePair = LoadAlternateRecoveryPair(imageHandle,
         systemTable->BootServices, kernelData, kernelFileSize, initrdData, initrdFileSize);
 #endif
     if (recoveryRequested && !updatePair) updatePair = LoadRecoveryPair(imageHandle,
         systemTable->BootServices, kernelData, kernelFileSize, initrdData, initrdFileSize);
-    if (updatePair) {
+    if (recoveryRequested && updatePair) {
         ConsoleSetQuiet(false);
         ConsolePrintLine(u"Brook SSD recovery payload verified");
         ConsoleSetQuiet(!g_bootConfig.debugText);
@@ -162,8 +181,6 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
 #endif
         Halt(EFI_NOT_FOUND, u"Recovery payload invalid or missing; restart to boot normally.");
     }
-    if (!updatePair) updatePair = g_bootConfig.updateSlots && LoadUpdatePair(imageHandle,
-        systemTable->BootServices, kernelData, kernelFileSize, initrdData, initrdFileSize, &selectedSlot);
     if (!updatePair) kernelData = ReadFile(imageHandle, systemTable->BootServices,
         g_bootConfig.target, &kernelFileSize);
     if (kernelData == nullptr)

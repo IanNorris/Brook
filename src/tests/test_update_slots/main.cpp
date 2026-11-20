@@ -12,6 +12,7 @@
 #include "elf.h"
 #include "../../shared/update/payload.h"
 #include "../../shared/update/recovery_guard.h"
+#include "../../shared/update/guard_slot_health.h"
 #include "../../shared/boot_protocol/boot_protocol.h"
 using Bytes=std::vector<uint8_t>;
 static std::map<std::u16string,Bytes> files;
@@ -53,7 +54,9 @@ static void expect(bool success,uint64_t generation=0) {
     boot.extensions=brook::BootExtensionTimingMagic;
     assert(!brook::BootHasGuardSlot(&boot));
     boot.guardSlot.generation=100; // Failed selection must clear stale metadata.
-    assert(brook::bootloader::LoadUpdatePair(nullptr,nullptr,k,kb,i,ib,&boot.guardSlot)==success);
+    using Result=brook::bootloader::UpdatePairResult;
+    assert(brook::bootloader::LoadUpdatePair(nullptr,nullptr,k,kb,i,ib,boot.guardSlot)==
+           (success?Result::Loaded:Result::Unavailable));
     boot.timing.flags|=brook::BootTimingGuardSlot;
     assert(brook::BootHasGuardSlot(&boot)==success);
     if(success) {
@@ -83,7 +86,165 @@ static void expectAlternate(bool success) {
     else assert(!k&&!i);
     assert(allocations.empty());
 }
+struct SlotHealthIo {
+    uint8_t sectors[brook::GuardSlotCount][brook::GuardSlotSectorBytes]{};
+    bool failWrite=false;
+    bool failFlush=false;
+    bool read(unsigned slot,uint8_t* data) const {
+        memcpy(data,sectors[slot],sizeof(sectors[slot]));
+        return true;
+    }
+    bool write(unsigned slot,const uint8_t* data) {
+        memcpy(sectors[slot],data,failWrite?32:sizeof(sectors[slot]));
+        return !failWrite;
+    }
+    bool flush() const { return !failFlush; }
+};
+
+static void SlotHealthPolicy() {
+    using namespace brook;
+    const BootGuardSlot previous{1,0,0,{10}};
+    const BootGuardSlot newest{2,1,0,{20}};
+    const BootGuardSlot otherPair{2,1,0,{21}};
+    const BootGuardSlot replacement{3,1,0,{30}};
+    GuardSlotHealth health{};
+    assert(GuardChooseSlot(health,newest,previous)==GuardSlotChoice::Newest);
+
+    // One failure does not switch slots. Confirmed handoff forgives it.
+    assert(GuardSlotStart(health,newest));
+    assert(GuardChooseSlot(health,newest,previous)==GuardSlotChoice::Newest);
+    assert(!GuardSlotFinish(health,otherPair,false));
+    assert(GuardSlotFinish(health,newest,false));
+    assert(!GuardSlotFinish(health,newest,false));
+    assert(GuardSlotStart(health,newest));
+    assert(GuardSlotStart(health,newest));
+    assert(!GuardSlotStart(health,newest));
+    assert(GuardChooseSlot(health,newest,previous)==GuardSlotChoice::Previous);
+
+    // A replacement or different exact selector must never inherit a strike.
+    assert(GuardChooseSlot(health,replacement,previous)==GuardSlotChoice::Newest);
+    assert(GuardChooseSlot(health,otherPair,previous)==GuardSlotChoice::Newest);
+    assert(GuardChooseSlot(health,newest,{})==GuardSlotChoice::Recovery);
+    assert(GuardChooseSlot(health,newest,{1,1,0,{10}})==GuardSlotChoice::Recovery);
+
+    assert(GuardSlotStart(health,previous));
+    assert(GuardSlotStart(health,previous));
+    assert(GuardChooseSlot(health,newest,previous)==GuardSlotChoice::Recovery);
+    assert(GuardSlotStart(health,replacement));
+    assert(GuardSlotFinish(health,replacement,true));
+    assert(GuardChooseSlot(health,replacement,newest)==GuardSlotChoice::Recovery);
+    assert(!GuardSlotStart(health,replacement));
+}
+
+static void SlotHealthPersistence() {
+    using namespace brook;
+    const uint8_t disk[32]={1}, foreign[32]={2};
+    const BootGuardSlot selected{8,1,0,{7}};
+    SlotHealthIo io;
+    GuardSlotJournal journal;
+    assert(GuardSlotRead(io,disk,journal) && journal.newest==-1);
+    assert(GuardSlotStart(journal.health,selected));
+    assert(GuardSlotWrite(io,disk,journal.health));
+    assert(!GuardSlotWrite(io,disk,journal.health)); // stale snapshot
+    assert(GuardSlotRead(io,disk,journal) && journal.newest==0);
+    assert(journal.health.sequence==1 && journal.health.slots[1].starts==1);
+
+    assert(GuardSlotStart(journal.health,selected));
+    io.failWrite=true;
+    assert(!GuardSlotWrite(io,disk,journal.health));
+    assert(GuardSlotRead(io,disk,journal) && journal.newest==0);
+    assert(journal.health.sequence==1 && journal.health.slots[1].starts==1);
+    assert(GuardSlotStart(journal.health,selected));
+    io.failWrite=false;
+    assert(GuardSlotWrite(io,disk,journal.health));
+    assert(GuardSlotRead(io,disk,journal) && journal.newest==1);
+    assert(journal.health.sequence==2 && journal.health.slots[1].starts==2);
+    SlotHealthIo uncertain=io;
+    uncertain.failFlush=true;
+    assert(GuardSlotFinish(journal.health,selected,false));
+    assert(!GuardSlotWrite(uncertain,disk,journal.health));
+    assert(!GuardSlotRead(io,foreign,journal));
+
+    // Even byte-identical records with the same sequence are ambiguous.
+    memcpy(io.sectors[0],io.sectors[1],sizeof(io.sectors[0]));
+    assert(!GuardSlotRead(io,disk,journal));
+    SlotHealthIo truncated;
+    memcpy(truncated.sectors[0],io.sectors[0],32);
+    assert(!GuardSlotRead(truncated,disk,journal));
+}
+
+static void GuardedSlotSelection() {
+    using namespace brook;
+    using Result=bootloader::UpdatePairResult;
+    const char identity[]="01000000000000000000000000000000"
+                          "02000000000000000000000000000000"
+                          "03000000000000000000000000000000";
+    uint8_t disk[32]{};
+    BrookUpdateHash(reinterpret_cast<const uint8_t*>(identity),sizeof(identity)-1,disk);
+    provision(0,1);
+    provision(1,2);
+    const auto& newest=files.at(u"UPDATES\\SELECT1.BIN");
+    const auto& previous=files.at(u"UPDATES\\SELECT0.BIN");
+    BootGuardSlot recent{2,1,0,{}}, prior{1,0,0,{}};
+    BrookUpdateHash(newest.data(),newest.size(),recent.selectorDigest);
+    BrookUpdateHash(previous.data(),previous.size(),prior.selectorDigest);
+    SlotHealthIo io;
+    GuardSlotJournal journal;
+    const auto save=[&] {
+        assert(GuardSlotWrite(io,disk,journal.health));
+        assert(GuardSlotRead(io,disk,journal));
+        auto& bytes=files[u"RECOVERY\\BOOTSTAT.BIN"];
+        bytes.resize(sizeof(io.sectors));
+        memcpy(bytes.data(),io.sectors,bytes.size());
+    };
+    const auto load=[&](Result expected,uint64_t generation) {
+        uint8_t *kernel=nullptr,*initrd=nullptr;UINTN kb=0,ib=0;
+        BootGuardSlot selected{};
+        assert(bootloader::LoadUpdatePair(nullptr,nullptr,kernel,kb,initrd,ib,selected,identity)==expected);
+        assert(selected.generation==generation);
+        if(generation) {
+            assert(kernel&&initrd);
+            bootloader::FreePages(nullptr,(EFI_PHYSICAL_ADDRESS)kernel,kb);
+            bootloader::FreePages(nullptr,(EFI_PHYSICAL_ADDRESS)initrd,ib);
+        } else assert(!kernel&&!initrd);
+        assert(allocations.empty());
+    };
+
+    load(Result::Loaded,2); // No journal on an existing installation.
+    assert(GuardSlotStart(journal.health,recent));
+    save();
+    load(Result::Loaded,2);
+    auto& recentInitrd=files.at(u"UPDATES\\B\\INITRD.IMG");
+    auto& priorInitrd=files.at(u"UPDATES\\A\\INITRD.IMG");
+    recentInitrd[0]^=1;
+    priorInitrd[0]^=1;
+    load(Result::RecoveryRequired,0);
+    recentInitrd[0]^=1;
+    priorInitrd[0]^=1;
+    assert(GuardSlotStart(journal.health,recent));
+    save();
+    load(Result::Previous,1);
+
+    priorInitrd[0]^=1;
+    load(Result::RecoveryRequired,0);
+    priorInitrd[0]^=1;
+    assert(GuardSlotStart(journal.health,prior));
+    assert(GuardSlotStart(journal.health,prior));
+    save();
+    load(Result::RecoveryRequired,0); // Both verified slots exhausted.
+
+    journal.health.slots[1].starts=1;
+    assert(GuardSlotFinish(journal.health,recent,true));
+    journal.health.slots[0].starts=0;
+    save();
+    load(Result::RecoveryRequired,0); // A shared profile is not repaired by fallback.
+    files.clear();
+}
+
 int main() {
+    SlotHealthPolicy();
+    SlotHealthPersistence();
+    GuardedSlotSelection();
     const char* identity="01000000000000000000000000000000"
                          "02000000000000000000000000000000"
                          "03000000000000000000000000000000";
