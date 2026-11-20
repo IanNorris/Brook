@@ -6,6 +6,7 @@ import socket
 import stat
 import struct
 from pathlib import Path
+from binary_bridge import binary_stream, finish_request, require_response_end
 from hardware_bulk_protocol import identifier, line
 
 
@@ -30,7 +31,7 @@ def prepare_source(image, record, expected_sha256):
         return {'path':str(image),'identity':identity(before),'sha256':expected_sha256,'record':record}
 
 def provision(host, port, key, boot, transaction, image, record, expected_sha256, prepared=None):
-    for value in (key, boot, transaction): identifier(value)
+    for value in (boot, transaction): identifier(value)
     prepared=prepared or prepare_source(image,record,expected_sha256)
     image=Path(image).resolve(strict=True)
     if prepared['path']!=str(image) or prepared['record']!=record or prepared['sha256']!=expected_sha256:raise ValueError('Source preparation does not match request')
@@ -41,7 +42,8 @@ def provision(host, port, key, boot, transaction, image, record, expected_sha256
         source.seek(0)
         with socket.create_connection((host, port), timeout=30) as connection:
             connection.settimeout(1800)  # the receiver hashes the full USB image before staging
-            connection.sendall(b'BRSTORE1'+key.encode()+boot.encode()+transaction.encode())
+            connection,key_field=binary_stream(connection,key,4,1,boot,transaction)
+            connection.sendall(b'BRSTORE1'+key_field+boot.encode()+transaction.encode())
             if line(connection) != {'state':'ready','store_api':1}:
                 raise ValueError('Unsupported store receiver')
             connection.sendall(struct.pack('<I', len(record))+digest+record+b'BEGIN001')
@@ -57,8 +59,8 @@ def provision(host, port, key, boot, transaction, image, record, expected_sha256
                 raise OSError('Source changed during transfer; inspect the original job before retrying')
             if line(connection) != {'state':'staged','published':False}:
                 raise ValueError('Store receiver did not verify the image')
-            connection.sendall(b'FINALIZE')
-            result=line(connection)
+            connection.sendall(b'FINALIZE');finish_request(connection)
+            result=line(connection);require_response_end(connection)
             if result != {'state':'completed','published':True,'durable':True}:
                 raise ValueError('Store publication was not confirmed; inspect the original job')
             return {'transaction_id':transaction,'bytes':before.st_size,'sha256':expected_sha256,**result}

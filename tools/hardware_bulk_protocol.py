@@ -6,6 +6,7 @@ and final receipt always describe the uncompressed payload.
 """
 import hashlib,json,os,platform,socket,stat,struct,sys,time,zlib
 from pathlib import Path
+from binary_bridge import BULK_OPERATIONS, binary_stream, finish_request, require_response_end
 
 LIMIT=1024**3
 def validate_pacing(rate):
@@ -39,10 +40,15 @@ def line(connection):
         data+=byte
     raise ValueError('Oversized bulk response')
 
-def authenticate(connection,key,boot,transaction):
-    connection.sendall(b'BRBULK01'+b''.join(identifier(v).encode() for v in (key,boot,transaction)))
+def authenticate(connection,key,boot,transaction,action='get'):
+    ids=b''.join(identifier(v).encode() for v in (boot,transaction))
+    connection,key_field=binary_stream(connection,key,3,BULK_OPERATIONS[action],boot,transaction)
+    connection.sendall(b'BRBULK01'+key_field+ids)
+    if action not in ('put','disk'):
+        finish_request(connection)
     ready=line(connection)
     if ready!={'state':'ready','bulk_api':1}:raise ValueError('Unsupported bulk receiver')
+    return connection
 
 def upload(host,port,key,boot,transaction,path,finalize=True,*,max_bytes=LIMIT,timeout=60,pace_bytes_per_second=None):
     validate_pacing(pace_bytes_per_second)
@@ -56,7 +62,7 @@ def upload(host,port,key,boot,transaction,path,finalize=True,*,max_bytes=LIMIT,t
                 # Linux SO_MAX_PACING_RATE is bytes/second. Never silently
                 # ignore an unsupported option: this is a controlled test knob.
                 apply_pacing(connection,pace_bytes_per_second)
-            connection.settimeout(timeout);authenticate(connection,key,boot,transaction)
+            connection.settimeout(timeout);connection=authenticate(connection,key,boot,transaction,'put')
             connection.sendall(struct.pack('<Q',before.st_size)+digest)
             sent=0
             while sent<before.st_size:
@@ -67,8 +73,11 @@ def upload(host,port,key,boot,transaction,path,finalize=True,*,max_bytes=LIMIT,t
             if (before.st_size,before.st_mtime_ns,before.st_ctime_ns)!=(after.st_size,after.st_mtime_ns,after.st_ctime_ns):raise OSError('Source changed during transfer')
             staged=line(connection)
             if staged!={'state':'staged','published':False}:raise ValueError('Receiver did not verify staging')
-            if not finalize:return staged
-            connection.sendall(b'FINALIZE');completed=line(connection)
+            if not finalize:
+                finish_request(connection);require_response_end(connection)
+                return staged
+            connection.sendall(b'FINALIZE');finish_request(connection)
+            completed=line(connection);require_response_end(connection)
             if (completed.get('state'),completed.get('transaction_id'),completed.get('action'),completed.get('bytes'),completed.get('sha256'))!=('completed',transaction,'put',sent,digest.hex()):raise ValueError('Final receipt mismatch')
             return completed
 
@@ -80,7 +89,7 @@ def download(host,port,key,boot,transaction,path,action='get',*,max_bytes=LIMIT,
     fd=os.open(partial,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
     try:
         with os.fdopen(fd,'wb') as output,socket.create_connection((host,port),timeout=30) as connection:
-            connection.settimeout(timeout);authenticate(connection,key,boot,transaction);meta=line(connection)
+            connection.settimeout(timeout);connection=authenticate(connection,key,boot,transaction,action);meta=line(connection)
             count=meta.get('bytes')
             if meta.get('state')!='payload' or isinstance(count,bool) or not isinstance(count,int) or not 0<=count<=max_bytes:raise ValueError('Invalid binary extent')
             digest=meta.get('sha256')
@@ -116,7 +125,7 @@ def download(host,port,key,boot,transaction,path,action='get',*,max_bytes=LIMIT,
                     if not data:raise ConnectionError('Truncated binary payload')
                 output.write(data);hasher.update(data);remaining-=len(data)
             if hasher.hexdigest()!=digest:raise ValueError('Payload SHA256 mismatch')
-            completed=line(connection)
+            completed=line(connection);require_response_end(connection)
             if (completed.get('state'),completed.get('transaction_id'),completed.get('action'),completed.get('bytes'),completed.get('sha256'))!=('completed',transaction,action,count,digest):raise ValueError('Final receipt mismatch')
             output.flush();os.fsync(output.fileno())
         os.link(partial,path)
@@ -154,7 +163,7 @@ def disk_download(host,port,key,boot,transaction,path,expected,max_bytes,on_even
     fd=os.open(partial,os.O_RDWR|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
     try:
         with os.fdopen(fd,'w+b') as output,socket.create_connection((host,port),timeout=30) as connection:
-            connection.settimeout(120);authenticate(connection,key,boot,transaction)
+            connection.settimeout(120);connection=authenticate(connection,key,boot,transaction,'disk')
             offer=exact(connection,154);magic,sectors,logical,physical,portnum,model,serial,offer_boot,offer_tx=struct.unpack('<8sQIII41s21s32s32s',offer)
             actual={'sectors':sectors,'logical_sector_bytes':logical,'physical_sector_bytes':physical,'port':portnum,'model':text_field(model),'serial':text_field(serial)}
             if magic!=b'BRDISK01' or offer_boot.decode('ascii')!=identifier(boot) or offer_tx.decode('ascii')!=identifier(transaction) or actual!=expected:
@@ -167,7 +176,7 @@ def disk_download(host,port,key,boot,transaction,path,expected,max_bytes,on_even
             if count>space.f_bavail*space.f_frsize:raise OSError('Insufficient destination space')
             on_event('offer_validated',{'identity':actual,'bytes':count})
             on_event('transferring',{'bytes_completed':0,'total_bytes':count})
-            connection.sendall(b'READONLY');remaining=count;hasher=hashlib.sha256();last_progress=time.monotonic()
+            connection.sendall(b'READONLY');finish_request(connection);remaining=count;hasher=hashlib.sha256();last_progress=time.monotonic()
             while remaining:
                 data=connection.recv(min(65536,remaining))
                 if not data:raise ConnectionError('Truncated disk stream')
@@ -175,7 +184,7 @@ def disk_download(host,port,key,boot,transaction,path,expected,max_bytes,on_even
                 now=time.monotonic()
                 if now-last_progress>=10 or not remaining:
                     on_event('transferring',{'bytes_completed':count-remaining,'total_bytes':count});last_progress=now
-            completed=line(connection);digest=hasher.hexdigest()
+            completed=line(connection);require_response_end(connection);digest=hasher.hexdigest()
             if (completed.get('state'),completed.get('transaction_id'),completed.get('action'),completed.get('bytes'),completed.get('sha256'))!=('completed',transaction,'disk',count,digest):
                 raise ValueError('Disk receipt or streaming checksum mismatch')
             connection.close() # The guest does not wait for the independent host reread.

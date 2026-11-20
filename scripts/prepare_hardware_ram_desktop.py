@@ -6,8 +6,9 @@ APPS.BRK is snapshotted and SHA-256 verified at boot; no mutable USB application
 source remains open. Root recovery files are not modified. Home/settings stay
 volatile. Build the kernel/xHCI/EEVDF modules before running inside nix-shell.
 """
-import argparse,hashlib,json,os,re,shutil,subprocess,uuid
+import argparse,hashlib,json,os,shutil,subprocess,uuid
 from pathlib import Path
+from bridge_keyless_image import require_keyless_image
 ROOT=Path(__file__).resolve().parents[1]
 p=argparse.ArgumentParser(description=__doc__)
 p.add_argument('--recovery-probe',type=Path,required=True);p.add_argument('--maintenance-probe',type=Path,required=True)
@@ -26,8 +27,7 @@ if meta.get('usb_read_only') is not True or mm.get('usb_read_only') is not False
 for name in ['APPS.BRK','INITRD.IMG']:
     path=recovery/'payload'/name;row=meta['files'][name]
     if not path.is_file() or path.is_symlink() or path.stat().st_size!=row['bytes'] or sha(path)!=row['sha256']:p.error('Invalid recovery input: '+name)
-key=Path(mm['update_key_file']).read_text()
-if not re.fullmatch('[0-9a-f]{32}',key):p.error('Invalid provisioned maintenance key')
+require_keyless_image(recovery/'payload/INITRD.IMG')
 for path in [build/'kernel/BROOK.elf',build/'kernel/drivers/xhci.mod',build/'kernel/drivers/sched_eevdf.mod',build/'kernel/drivers/virtio_input.mod']:
     if not path.is_file():p.error('Build dependency missing: '+str(path))
 out.mkdir(parents=True,exist_ok=False)
@@ -60,12 +60,11 @@ run('mcopy','-o','-i',initrd,out/'HWSTORE.ELF','::BOOT/HWSTORE.ELF')
 apps=meta['files']['APPS.BRK'];payload_id='desktop-ram-apps-'+uuid.uuid4().hex
 markers={'hardware-maintenance':'RAM-resident updater enabled; application snapshot must remain immutable\n',
     'hardware-bulk':'1\n',
-    'hardware-update-key':key,'hardware-payload-id':payload_id+'\n',
+    'hardware-payload-id':payload_id+'\n',
     'boot-app-snapshot':f"/media/usb/APPS.BRK /nix {apps['bytes']} {apps['sha256']}\n"}
 if a.display_idle_seconds is not None:markers['display-idle-seconds']=str(a.display_idle_seconds)+'\n'
 for name,text in markers.items():
     path=out/name;path.write_text(text)
-    if name=='hardware-update-key':path.chmod(0o600)
     run('mcopy','-o','-i',initrd,path,'::ETC/'+name)
 provider='/nix/profile/bin/waylandd';provider_meta=None
 if a.waylandd:
@@ -85,7 +84,7 @@ if files['kernel.elf']['bytes']>8*1024**2 or files['INITRD.IMG']['bytes']>64*102
 manifest={'scope':'Opt-in RAM application desktop; kernel/initrd upload only','payload_id':payload_id,'files':files,
     'panic_journal_exporter_sha256':sha(out/'PANICLOG.ELF'),
     'application_source':'/media/usb/APPS.BRK','application_image':apps,'application_snapshot_limit_bytes':512*1024**2,
-    'initial_headroom_bytes':256*1024**2,'update_key_file':str(out/'hardware-update-key'),'recovery_probe':str(recovery),
+    'initial_headroom_bytes':256*1024**2,'recovery_probe':str(recovery),
     'maintenance_probe':str(maintenance),'physical_status':'Prepared; QEMU and physical acceptance required',
     'ephemeral_home':True,'usb_read_only':False,'mutable_usb_application_mount':False,
     'display_idle_seconds':a.display_idle_seconds or 0}

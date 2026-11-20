@@ -20,7 +20,7 @@ enum {
     BrookBridgeV3HeaderBytes = 16,
     BrookBridgeV3TagBytes = 16,
     BrookBridgeV3MaxRecord = 65536,
-    BrookBridgeV3MaxRecords = 1 << 24,
+    BrookBridgeV3MaxRecords = 1 << 28,
     BrookBridgeV3Ready = 1,
     BrookBridgeV3Data = 2,
     BrookBridgeV3End = 3,
