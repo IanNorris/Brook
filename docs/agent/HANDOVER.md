@@ -95,6 +95,8 @@ _Last updated: 19 November 2026 (early), by a Claude Code session; see "19 Nov e
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**20 Nov: Dell on gen 464 = int61 built WITH `--clearwater-shell`** (payload dell-int61cw-20261120, session `0d26834bde974d3982c3a95349743326`). Stage 3 is live: CWSUP.ELF supervises CWSHELL.ELF. **Always pass `--clearwater-shell` to build_dell_image.py from int61 on.** Without it there is no taskbar or launcher (gen 463 was blank). Bug: launcher pins never persist (launcher.ini has never existed on the Dell, even after re-pinning on gen 464); sent to Codex as work/launcher-persist with a `launcher status` debug command, ahead of Task F.
+
 **Correction, 20 Nov:** the Dell's Wayland server is `/boot/INTLWL.ELF` (the Vulkan-provider waylandd built into the image), not /nix/profile/bin/waylandd, so waylandd fixes need an image deploy and the `wl5` staging had no effect. **int61 = `work/integration61` 9eac2b0a** (int60 + work/clearwater-s3-reconcile e769515e + work/settings-schemas 505ab256 + work/xdg-wm-capabilities c2079740) is building; deploy it next (stage 3 live, Min/Max buttons).
 
 **20 Nov early, Dell gen 462 plus staged packages:** schema fix (tx `schema1119`, brook-desktop-settings r6lz8…, Codex work/settings-schemas 505ab256) and xdg-shell v5 wm_capabilities (tx `wl5`, waylandd vylh7…, Codex work/xdg-wm-capabilities c2079740), both needing a reboot for waylandd. Neither branch is merged into an integration branch yet: fold them into the next int with stage 3.
