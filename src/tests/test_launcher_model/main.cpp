@@ -351,6 +351,11 @@ void Organisation() {
     CHECK(m->IsNew(1));
     click({TK::MoveSuggested, 1});
     CHECK(!m->IsNew(1) && m->CategoryOf(1) == Cat(*m, "Office"));
+    click(rail(Cat(*m, "Office")));
+    m->Key(LauncherKey::BackTab); // focus the rail on the current category
+    CHECK(m->Section() == LauncherSection::Rail);
+    CHECK(m->Key(LauncherKey::Delete).command == LauncherCommand::Changed);
+    CHECK(m->CategoryOf(1) == -1 && m->View() == LauncherViewUnsorted);
 }
 
 void Persistence() {

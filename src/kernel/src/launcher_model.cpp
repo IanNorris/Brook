@@ -1294,9 +1294,10 @@ LauncherResult LauncherModel::Key(LauncherKey key, char ch, uint8_t mods) {
         if (section_ == LauncherSection::Rail) {
             const int rows = int(RailRows());
             const uint32_t next = uint32_t(((rail_ + d) % rows + rows) % rows);
-            if (alt && RailView(uint32_t(rail_)) >= 0 && RailView(next) >= 0) {
-                MoveCategory(uint32_t(RailView(uint32_t(rail_))), uint32_t(RailView(next)), d > 0);
-                return changed;
+            if (alt) {
+                const int source = RailView(uint32_t(rail_)), target = RailView(next);
+                return source >= 0 && target >= 0 && MoveCategory(uint32_t(source), uint32_t(target), d > 0)
+                    ? changed : LauncherResult{};
             }
             return setView(next);
         }
@@ -1353,11 +1354,8 @@ LauncherResult LauncherModel::Key(LauncherKey key, char ch, uint8_t mods) {
     case LauncherKey::Rename: return {};
     case LauncherKey::Delete: {
         const int category = RailView(uint32_t(rail_));
-        if (organising_ && section_ == LauncherSection::Rail && category >= 0) {
-            BeginEditor(uint32_t(category), false);
-            return changed;
-        }
-        return {};
+        return organising_ && section_ == LauncherSection::Rail && category >= 0 && DeleteCategory(uint32_t(category))
+            ? changed : LauncherResult{};
     }
     case LauncherKey::Menu:
         if (section_ == LauncherSection::Tiles && tileCount) { OpenMenu(tiles[tile_ % tileCount], -1, -1, true); return changed; }

@@ -16,7 +16,7 @@ amber-glass-100-launcher-drag 4eb2b3fe92a81543
 amber-glass-100-launcher-hover ed5aeb83da4f8ca8
 amber-glass-100-launcher-keyboard 998abb7f64e488e0
 amber-glass-100-launcher-menu 4defc5d71bb1c76a
-amber-glass-100-launcher-new-category 2dec24c78e2e6c04
+amber-glass-100-launcher-new-category 37723beffbc4b430
 amber-glass-100-launcher-nomatch f81755824efba3d2
 amber-glass-100-launcher-organise ace4e10ca39f926a
 amber-glass-100-launcher-prompt af47da965e215f45
@@ -49,7 +49,7 @@ glass-100-launcher-drag 868922a6bde4f114
 glass-100-launcher-hover 598455af105faa6f
 glass-100-launcher-keyboard a47eb668425dd02a
 glass-100-launcher-menu ad9821ccba3c163a
-glass-100-launcher-new-category c9ebd1bf3c38ff14
+glass-100-launcher-new-category d98ecfc8db1d0134
 glass-100-launcher-nomatch e3ba0efb9339ba25
 glass-100-launcher-organise 935eb83270ef0ee4
 glass-100-launcher-prompt 1b37a1d4f49828fd
@@ -85,7 +85,7 @@ glass-150-launcher-drag dc00975132958bb7
 glass-150-launcher-hover e2bf4a1aa7642a85
 glass-150-launcher-keyboard cf28c79478ac2f10
 glass-150-launcher-menu e0bc2ef0a67e490a
-glass-150-launcher-new-category 3da660e8d288ef29
+glass-150-launcher-new-category a37c036dec1f8e27
 glass-150-launcher-nomatch 75eea0196a56a783
 glass-150-launcher-organise bfe52f5031156699
 glass-150-launcher-prompt e0ac435ebf73d2c9
@@ -118,7 +118,7 @@ glass-200-launcher-drag 883a1e1eef30cabd
 glass-200-launcher-hover 98e760c12fb6184d
 glass-200-launcher-keyboard c338b53ccc7956e3
 glass-200-launcher-menu b84a7f3a4e19f412
-glass-200-launcher-new-category dd2455da0881e1d9
+glass-200-launcher-new-category c4ff86583a394f04
 glass-200-launcher-nomatch 668d2affc2eda478
 glass-200-launcher-organise 085304b01e01de70
 glass-200-launcher-prompt 89244732f896b315
@@ -151,7 +151,7 @@ glass-dark-100-launcher-drag 868922a6bde4f114
 glass-dark-100-launcher-hover 598455af105faa6f
 glass-dark-100-launcher-keyboard a47eb668425dd02a
 glass-dark-100-launcher-menu ad9821ccba3c163a
-glass-dark-100-launcher-new-category c9ebd1bf3c38ff14
+glass-dark-100-launcher-new-category d98ecfc8db1d0134
 glass-dark-100-launcher-nomatch e3ba0efb9339ba25
 glass-dark-100-launcher-organise 935eb83270ef0ee4
 glass-dark-100-launcher-prompt 1b37a1d4f49828fd
@@ -184,7 +184,7 @@ glass-dark-150-launcher-drag dc00975132958bb7
 glass-dark-150-launcher-hover e2bf4a1aa7642a85
 glass-dark-150-launcher-keyboard cf28c79478ac2f10
 glass-dark-150-launcher-menu e0bc2ef0a67e490a
-glass-dark-150-launcher-new-category 3da660e8d288ef29
+glass-dark-150-launcher-new-category a37c036dec1f8e27
 glass-dark-150-launcher-nomatch 75eea0196a56a783
 glass-dark-150-launcher-organise bfe52f5031156699
 glass-dark-150-launcher-prompt e0ac435ebf73d2c9
@@ -217,7 +217,7 @@ glass-dark-200-launcher-drag 883a1e1eef30cabd
 glass-dark-200-launcher-hover 98e760c12fb6184d
 glass-dark-200-launcher-keyboard c338b53ccc7956e3
 glass-dark-200-launcher-menu b84a7f3a4e19f412
-glass-dark-200-launcher-new-category dd2455da0881e1d9
+glass-dark-200-launcher-new-category c4ff86583a394f04
 glass-dark-200-launcher-nomatch 668d2affc2eda478
 glass-dark-200-launcher-organise 085304b01e01de70
 glass-dark-200-launcher-prompt 89244732f896b315
@@ -250,7 +250,7 @@ glass-light-100-launcher-drag a9b0896c6b7e9619
 glass-light-100-launcher-hover 329ebcde174608ec
 glass-light-100-launcher-keyboard 5917aaf65313da5c
 glass-light-100-launcher-menu 01ae2f99ac6805df
-glass-light-100-launcher-new-category 61685ddfc1ada543
+glass-light-100-launcher-new-category 960be1a85e1cc13f
 glass-light-100-launcher-nomatch 24e9a3959186c488
 glass-light-100-launcher-organise c6c65751acc4f246
 glass-light-100-launcher-prompt bfbecc3997df8fe0
@@ -283,7 +283,7 @@ glass-light-150-launcher-drag ae9267769be2c6e9
 glass-light-150-launcher-hover ac98a9439c980174
 glass-light-150-launcher-keyboard e0bccba23072a93f
 glass-light-150-launcher-menu e4ccba96bcbf088f
-glass-light-150-launcher-new-category 02723b5f40e462e4
+glass-light-150-launcher-new-category 3450de6b761966ca
 glass-light-150-launcher-nomatch 7d26ec7c36a32639
 glass-light-150-launcher-organise 5f76d07c17fc96d8
 glass-light-150-launcher-prompt afcfec51e96dc661
@@ -316,7 +316,7 @@ glass-light-200-launcher-drag 37fdc9e4c48dad81
 glass-light-200-launcher-hover c0fa6695d9ef1ebe
 glass-light-200-launcher-keyboard 028172ba4b5f7b7b
 glass-light-200-launcher-menu 572a731875b0e02e
-glass-light-200-launcher-new-category fccb46a185012a1b
+glass-light-200-launcher-new-category 858056279f38ebf6
 glass-light-200-launcher-nomatch 817d6ddc2dd0d968
 glass-light-200-launcher-organise 30898b2723e7d49d
 glass-light-200-launcher-prompt 8a3194ede63cb11b
@@ -349,7 +349,7 @@ magenta-glass-dark-100-launcher-drag 0799a5d1ae101caa
 magenta-glass-dark-100-launcher-hover f2888f7138d7de77
 magenta-glass-dark-100-launcher-keyboard 17b3add72f03e58a
 magenta-glass-dark-100-launcher-menu 93d37842afc7f0f0
-magenta-glass-dark-100-launcher-new-category 0a5f3d0921a5516f
+magenta-glass-dark-100-launcher-new-category 62c4ec90349e821a
 magenta-glass-dark-100-launcher-nomatch 90cd8ee54706009d
 magenta-glass-dark-100-launcher-organise 382cbabd36e13a20
 magenta-glass-dark-100-launcher-prompt 2c1884dc717bc8a7
@@ -382,7 +382,7 @@ magenta-glass-light-100-launcher-drag 89d03a91176ce1ab
 magenta-glass-light-100-launcher-hover c84aa8d49f72247e
 magenta-glass-light-100-launcher-keyboard 5fd506bb05cc32ba
 magenta-glass-light-100-launcher-menu 5e34ac5fd199e9a0
-magenta-glass-light-100-launcher-new-category d68c52b606f62e0e
+magenta-glass-light-100-launcher-new-category 13422d6d0089b048
 magenta-glass-light-100-launcher-nomatch 2f71c8c0441bfe24
 magenta-glass-light-100-launcher-organise 26b726dd55f10c24
 magenta-glass-light-100-launcher-prompt abef2a325eb119b9
@@ -415,7 +415,7 @@ magenta-glass-mixed-100-launcher-drag 0799a5d1ae101caa
 magenta-glass-mixed-100-launcher-hover f2888f7138d7de77
 magenta-glass-mixed-100-launcher-keyboard 17b3add72f03e58a
 magenta-glass-mixed-100-launcher-menu 93d37842afc7f0f0
-magenta-glass-mixed-100-launcher-new-category 0a5f3d0921a5516f
+magenta-glass-mixed-100-launcher-new-category 62c4ec90349e821a
 magenta-glass-mixed-100-launcher-nomatch 90cd8ee54706009d
 magenta-glass-mixed-100-launcher-organise 382cbabd36e13a20
 magenta-glass-mixed-100-launcher-prompt 2c1884dc717bc8a7
@@ -448,7 +448,7 @@ magenta-opaque-dark-100-launcher-drag 6418d7c5707f819c
 magenta-opaque-dark-100-launcher-hover d1df4fbe1770b3a7
 magenta-opaque-dark-100-launcher-keyboard 854d331f38a72eb0
 magenta-opaque-dark-100-launcher-menu 8b8e221afc02bad5
-magenta-opaque-dark-100-launcher-new-category c9d3e96893657769
+magenta-opaque-dark-100-launcher-new-category 4d020792133bdb1f
 magenta-opaque-dark-100-launcher-nomatch 809748a2199d4179
 magenta-opaque-dark-100-launcher-organise f0270be108b941aa
 magenta-opaque-dark-100-launcher-prompt 471759de763d141d
@@ -481,7 +481,7 @@ magenta-opaque-light-100-launcher-drag 84b23cbaa6554cf5
 magenta-opaque-light-100-launcher-hover abc9217735b50061
 magenta-opaque-light-100-launcher-keyboard 081202a6cb714f2d
 magenta-opaque-light-100-launcher-menu 0aa2bc82679ec68b
-magenta-opaque-light-100-launcher-new-category cd8e80a203af3a88
+magenta-opaque-light-100-launcher-new-category 8cbe365e1b267257
 magenta-opaque-light-100-launcher-nomatch a4d200a909ed227c
 magenta-opaque-light-100-launcher-organise 91b48dedb10da962
 magenta-opaque-light-100-launcher-prompt 39df89f23eec94ad
@@ -514,7 +514,7 @@ magenta-opaque-mixed-100-launcher-drag 6418d7c5707f819c
 magenta-opaque-mixed-100-launcher-hover d1df4fbe1770b3a7
 magenta-opaque-mixed-100-launcher-keyboard 854d331f38a72eb0
 magenta-opaque-mixed-100-launcher-menu 8b8e221afc02bad5
-magenta-opaque-mixed-100-launcher-new-category c9d3e96893657769
+magenta-opaque-mixed-100-launcher-new-category 4d020792133bdb1f
 magenta-opaque-mixed-100-launcher-nomatch 809748a2199d4179
 magenta-opaque-mixed-100-launcher-organise f0270be108b941aa
 magenta-opaque-mixed-100-launcher-prompt 471759de763d141d
@@ -547,7 +547,7 @@ opaque-dark-100-launcher-drag d5e52aff6cb07d0c
 opaque-dark-100-launcher-hover 0ffec574e51a4027
 opaque-dark-100-launcher-keyboard 616f8f51a97a23ef
 opaque-dark-100-launcher-menu b808ccd7df31d8a5
-opaque-dark-100-launcher-new-category 02c84c3a7e8d0775
+opaque-dark-100-launcher-new-category ec23f7b55f020854
 opaque-dark-100-launcher-nomatch c1c603e4ba8fac45
 opaque-dark-100-launcher-organise 61a4735304edcc94
 opaque-dark-100-launcher-prompt 9dcda003de589702
@@ -580,7 +580,7 @@ opaque-dark-150-launcher-drag 3f8b482fa7da2af9
 opaque-dark-150-launcher-hover 4036d8f16fd36dbe
 opaque-dark-150-launcher-keyboard 5f0441b539e58033
 opaque-dark-150-launcher-menu 8ed0e5a68e5e0c41
-opaque-dark-150-launcher-new-category 5b2d0925cff4dc8f
+opaque-dark-150-launcher-new-category 9f502b03c7504d5c
 opaque-dark-150-launcher-nomatch ff47aac2a3194a5d
 opaque-dark-150-launcher-organise 7ec2a64472aea60e
 opaque-dark-150-launcher-prompt 9fe988bbe6820e60
@@ -613,7 +613,7 @@ opaque-dark-200-launcher-drag c6a2c7bb313287ce
 opaque-dark-200-launcher-hover 48f1dad3707f2279
 opaque-dark-200-launcher-keyboard 835d300c3fabb90b
 opaque-dark-200-launcher-menu 7dc4e0aa5ff1d594
-opaque-dark-200-launcher-new-category 3a73565d29d5e220
+opaque-dark-200-launcher-new-category 20af025dd19636ac
 opaque-dark-200-launcher-nomatch eef3b78089bf5db1
 opaque-dark-200-launcher-organise c65cd6f44dd5024d
 opaque-dark-200-launcher-prompt 9f3a42fb1d7be864
@@ -646,7 +646,7 @@ opaque-light-100-launcher-drag acf9cae442bb9906
 opaque-light-100-launcher-hover d8fbc51bc198149b
 opaque-light-100-launcher-keyboard 83e6284060c6abc2
 opaque-light-100-launcher-menu d07a4712471d290e
-opaque-light-100-launcher-new-category 608cd00c25ffd5ab
+opaque-light-100-launcher-new-category d6c6fecbec0fb730
 opaque-light-100-launcher-nomatch 2a261969d6113073
 opaque-light-100-launcher-organise 2eb85739c82748dd
 opaque-light-100-launcher-prompt 5fc25df727bec9f0
@@ -679,7 +679,7 @@ opaque-light-150-launcher-drag 48446bf13068d62f
 opaque-light-150-launcher-hover ae812e7ded5f7f6a
 opaque-light-150-launcher-keyboard 9899c410650bfa8c
 opaque-light-150-launcher-menu 8ef834e7f90e1052
-opaque-light-150-launcher-new-category f80ede436db9df09
+opaque-light-150-launcher-new-category 4718f9a74058585b
 opaque-light-150-launcher-nomatch fbf407402448268e
 opaque-light-150-launcher-organise 6153ac5dbef0aa98
 opaque-light-150-launcher-prompt 2cf8c8c149eaaeb5
@@ -712,7 +712,7 @@ opaque-light-200-launcher-drag 7e51f5154c4518f5
 opaque-light-200-launcher-hover eb24a5a19154fa6b
 opaque-light-200-launcher-keyboard 691005d3f6969618
 opaque-light-200-launcher-menu b510b840806b4655
-opaque-light-200-launcher-new-category b9165733cd3ab10a
+opaque-light-200-launcher-new-category 06616c01257f3b76
 opaque-light-200-launcher-nomatch b666f1b9b2eebc15
 opaque-light-200-launcher-organise a3e7faf8be3d859f
 opaque-light-200-launcher-prompt 0827555c2080be84
@@ -745,7 +745,7 @@ opaque-mixed-100-launcher-drag d5e52aff6cb07d0c
 opaque-mixed-100-launcher-hover 0ffec574e51a4027
 opaque-mixed-100-launcher-keyboard 616f8f51a97a23ef
 opaque-mixed-100-launcher-menu b808ccd7df31d8a5
-opaque-mixed-100-launcher-new-category 02c84c3a7e8d0775
+opaque-mixed-100-launcher-new-category ec23f7b55f020854
 opaque-mixed-100-launcher-nomatch c1c603e4ba8fac45
 opaque-mixed-100-launcher-organise 61a4735304edcc94
 opaque-mixed-100-launcher-prompt 9dcda003de589702
@@ -781,7 +781,7 @@ opaque-mixed-150-launcher-drag 3f8b482fa7da2af9
 opaque-mixed-150-launcher-hover 4036d8f16fd36dbe
 opaque-mixed-150-launcher-keyboard 5f0441b539e58033
 opaque-mixed-150-launcher-menu 8ed0e5a68e5e0c41
-opaque-mixed-150-launcher-new-category 5b2d0925cff4dc8f
+opaque-mixed-150-launcher-new-category 9f502b03c7504d5c
 opaque-mixed-150-launcher-nomatch ff47aac2a3194a5d
 opaque-mixed-150-launcher-organise 7ec2a64472aea60e
 opaque-mixed-150-launcher-prompt 9fe988bbe6820e60
@@ -814,7 +814,7 @@ opaque-mixed-200-launcher-drag c6a2c7bb313287ce
 opaque-mixed-200-launcher-hover 48f1dad3707f2279
 opaque-mixed-200-launcher-keyboard 835d300c3fabb90b
 opaque-mixed-200-launcher-menu 7dc4e0aa5ff1d594
-opaque-mixed-200-launcher-new-category 3a73565d29d5e220
+opaque-mixed-200-launcher-new-category 20af025dd19636ac
 opaque-mixed-200-launcher-nomatch eef3b78089bf5db1
 opaque-mixed-200-launcher-organise c65cd6f44dd5024d
 opaque-mixed-200-launcher-prompt 9f3a42fb1d7be864
@@ -847,7 +847,7 @@ teal-opaque-light-100-launcher-drag 22d8ea478768ec37
 teal-opaque-light-100-launcher-hover 5dbace20805a009e
 teal-opaque-light-100-launcher-keyboard a4238d7464efb59d
 teal-opaque-light-100-launcher-menu 1e57d442ee1c4cce
-teal-opaque-light-100-launcher-new-category b2b872853650a540
+teal-opaque-light-100-launcher-new-category 648398fe4740f02c
 teal-opaque-light-100-launcher-nomatch 49fad40902c1b7f5
 teal-opaque-light-100-launcher-organise 442a74a392c2815c
 teal-opaque-light-100-launcher-prompt 0acf1bbfd2e9daf7

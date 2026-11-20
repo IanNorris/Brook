@@ -905,7 +905,7 @@ void ChromeLauncherFrameFor(const LauncherModel& m, const ChromeLauncherChrome& 
     if (m.EditorOpen()) {
         const int limit = f.list.w > LPx(s, 270) ? f.list.w : p.w - 2 * inner;
         const int ew = limit < LPx(s, 380) ? limit : LPx(s, 380);
-        const int eh = LPx(s, m.EditingApp() ? 142 : 285);
+        const int eh = LPx(s, m.EditingApp() ? 142 : 291);
         const int ex = f.list.w >= ew ? f.list.x : p.x + (p.w - ew) / 2;
         const int ey = p.h > eh + 2 * inner ? Bottom(p) - eh - inner : p.y + (p.h - eh) / 2;
         f.editor = {ex, ey, ew, eh};
