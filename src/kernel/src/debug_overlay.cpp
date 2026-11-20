@@ -435,15 +435,17 @@ static constexpr uint32_t TCP_BATCH      = 32; // lines per send batch
 // A partial framed command must not monopolize the single debug listener.
 // Legacy passive log viewers and idle framed clients are unaffected.
 static constexpr uint64_t TCP_PARTIAL_FRAME_TIMEOUT_MS = 10000;
+static constexpr uint64_t TCP_LOCAL_REQUEST_TIMEOUT_MS = 250;
 // Recovery starts this before desktop handoff; the desktop script may request
 // it again. Keep one listener, including during concurrent spawn attempts.
 static uint32_t g_debugTcpSpawned = 0;
 
-static bool DebugTcpSendAll(int socket, const char* bytes, uint32_t length)
+static bool DebugTcpSendAll(int socket, const char* bytes, uint32_t length, uint64_t deadline=0)
 {
     uint32_t sent = 0;
     while (sent < length) {
-        int result = SockSend(socket, bytes + sent, length - sent);
+        const int result = deadline ? SockSendUntil(socket, bytes + sent, length - sent, deadline)
+                                    : SockSend(socket, bytes + sent, length - sent);
         if (result <= 0 || static_cast<uint32_t>(result) > length - sent) return false;
         sent += static_cast<uint32_t>(result);
     }
@@ -524,7 +526,7 @@ static void DebugTcpThread(void* /*arg*/)
         }
 
         const bool local = DebugTcpLocalPeer(peer.sin_addr, localIngress);
-        const uint64_t localDeadline = local ? ApicTickCount() + 4000 : 0;
+        const uint64_t localDeadline = local ? ApicTickCount() + TCP_LOCAL_REQUEST_TIMEOUT_MS : 0;
         NetCountDebugClient(true);
         // Per-connection traces are `log level tcp debug`; `tcp stats`
         // keeps the totals. A polling bridge connects several times a second.
@@ -533,8 +535,10 @@ static void DebugTcpThread(void* /*arg*/)
 
         // Send banner
         const char* banner = "=== Brook OS Debug Console ===\r\n";
-        if (!DebugTcpSendAll(clientSock, banner, strlen(banner))) {
-            SockUnref(clientSock);
+        if (!DebugTcpSendAll(clientSock, banner, strlen(banner), localDeadline)) {
+            NetCountDebugClient(false);
+            if (local) SockUnrefUntil(clientSock, localDeadline);
+            else SockUnref(clientSock);
             continue;
         }
 
@@ -574,7 +578,7 @@ static void DebugTcpThread(void* /*arg*/)
                             // Framed requests come only from bridge clients;
                             // they refresh (never create) agent presence.
                             if(framed && !local)DebugPresenceRequestBegin(peer.sin_addr);
-                            DebugChannelSetReplySock(clientSock);
+                            DebugChannelSetReplySock(clientSock, localDeadline);
                             if (local) {
                                 const auto request = DebugLocalRequestPolicy(cmdBuf, static_cast<uint32_t>(cmdLen));
                                 if (request.allowed)
@@ -642,7 +646,8 @@ static void DebugTcpThread(void* /*arg*/)
         NetCountDebugClient(false);
         if (KLogEnabled(LogCat::Tcp, LogLevel::Debug))
             SerialPuts("DEBUG_TCP: client disconnected\n");
-        SockUnref(clientSock);
+        if (local) SockUnrefUntil(clientSock, localDeadline);
+        else SockUnref(clientSock);
     }
 }
 
