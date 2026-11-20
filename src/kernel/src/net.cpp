@@ -996,7 +996,7 @@ static int NetNeighborTransmit(NetIf* nif, uint32_t nextHop, uint8_t* frame, uin
 // IPv4 send/receive
 // ---------------------------------------------------------------------------
 
-static void HandleIpv4(const uint8_t* frame, uint32_t len, bool local=false,uint64_t scope=0);
+static void HandleIpv4(const uint8_t* frame, uint32_t len, bool local=false,uint64_t scope=0, NetIf* receiving=nullptr);
 static void TcpStatsMaybeFlush();
 
 // BRO-163 instrument: detect dangerous kernel-stack depth on the egress path.
@@ -1137,10 +1137,13 @@ static bool Ipv4DirectedBroadcast(uint32_t ip, const NetIf& network)
            (ip & network.netmask) == (network.ipAddr & network.netmask);
 }
 
-static bool NetIpv4AcceptAddresses(uint32_t source, uint32_t destination, bool local)
+enum class Ipv4AddressAdmission { Rejected, ForUs, OtherDestination };
+
+static Ipv4AddressAdmission NetIpv4AddressAdmission(uint32_t source, uint32_t destination, bool local)
 {
     if (!local && (!source || source == 0xffffffffu || Ipv4IsLoopback(source) ||
-                   (ntohl(source) >> 28) == 0xe || Ipv4IsLoopback(destination))) return false;
+                   (ntohl(source) >> 28) == 0xe || Ipv4IsLoopback(destination)))
+        return Ipv4AddressAdmission::Rejected;
     bool forUs = destination == 0xffffffffu || (local && Ipv4IsLoopback(destination));
     bool invalidSource = false;
     const auto flags = IrqSpinLockAcquire(&g_interfaceViewLock);
@@ -1152,7 +1155,8 @@ static bool NetIpv4AcceptAddresses(uint32_t source, uint32_t destination, bool l
             invalidSource |= source == interface->ipAddr || Ipv4DirectedBroadcast(source, *interface);
     }
     IrqSpinLockRelease(&g_interfaceViewLock, flags);
-    return forUs && !invalidSource;
+    if (invalidSource) return Ipv4AddressAdmission::Rejected;
+    return forUs ? Ipv4AddressAdmission::ForUs : Ipv4AddressAdmission::OtherDestination;
 }
 
 static int NetSendIpv4From(uint32_t source, uint32_t dstIp, uint8_t proto,
@@ -1300,12 +1304,14 @@ static void HandleIcmp(const Ipv4Header* ip, const uint8_t* payload, uint32_t pa
 static void HandleUdpWithDhcp(const Ipv4Header* ip,
                                const uint8_t* payload, uint32_t payloadLen,uint64_t scope);
 static bool IsDnsReply(uint16_t dstPort, const void* data, uint32_t len);
+static void HandleDhcpAcquisitionUnicast(NetIf* receiving, const Ipv4Header& ip,
+                                         const uint8_t* payload, uint32_t payloadLen);
 
 // ---------------------------------------------------------------------------
 // IPv4 receive
 // ---------------------------------------------------------------------------
 
-static void HandleIpv4(const uint8_t* frame, uint32_t len, bool local,uint64_t scope)
+static void HandleIpv4(const uint8_t* frame, uint32_t len, bool local,uint64_t scope, NetIf* receiving)
 {
     if (len < sizeof(EthHeader) + sizeof(Ipv4Header)) return;
 
@@ -1315,10 +1321,18 @@ static void HandleIpv4(const uint8_t* frame, uint32_t len, bool local,uint64_t s
 
     if ((ip->verIhl >> 4) != 4 || ihl < sizeof(Ipv4Header) || totalLen < ihl ||
         sizeof(EthHeader) + totalLen > len) return;
-    if (!NetIpv4AcceptAddresses(ip->srcIp, ip->dstIp, local)) return;
+    const auto admission = NetIpv4AddressAdmission(ip->srcIp, ip->dstIp, local);
+    if (admission == Ipv4AddressAdmission::Rejected) return;
 
     const uint8_t* payload = frame + sizeof(EthHeader) + ihl;
     uint32_t payloadLen = totalLen - ihl;
+    if (admission == Ipv4AddressAdmission::OtherDestination) {
+        // Pre-address DHCP is an exception to destination admission only.
+        // Never pass such packets to socket demultiplexing.
+        if (receiving && !local && !scope && ip->protocol == IP_PROTO_UDP)
+            HandleDhcpAcquisitionUnicast(receiving,*ip,payload,payloadLen);
+        return;
+    }
 
     switch (ip->protocol) {
     case IP_PROTO_ICMP:
@@ -1353,7 +1367,7 @@ void NetReceive(NetIf* nif, const void* frame, uint32_t len)
         HandleArp(nif, static_cast<const uint8_t*>(frame), len);
         break;
     case ETH_TYPE_IPV4:
-        HandleIpv4(static_cast<const uint8_t*>(frame), len);
+        HandleIpv4(static_cast<const uint8_t*>(frame),len,false,0,nif);
         break;
     }
 }
@@ -1758,7 +1772,7 @@ NetIf* NetGetIf()
 }
 
 // ---------------------------------------------------------------------------
-// DHCP (minimal — enough for QEMU user-mode networking)
+// DHCP boot-time address acquisition
 // ---------------------------------------------------------------------------
 
 // DHCP message types
@@ -1787,6 +1801,9 @@ struct __attribute__((packed)) DhcpPacket {
 };
 
 static constexpr uint32_t DHCP_MAGIC = 0x63538263; // little-endian of 0x63825363
+static constexpr uint32_t DHCP_FIXED_BYTES = __builtin_offsetof(DhcpPacket, options);
+static constexpr uint16_t DHCP_SERVER_PORT = 67;
+static constexpr uint16_t DHCP_CLIENT_PORT = 68;
 
 static uint32_t g_dhcpXid = 0x42524F4B; // "BROK"
 static volatile bool g_dhcpDone = false;
@@ -1822,8 +1839,8 @@ static void DhcpSend(uint8_t msgType, uint32_t serverIp, uint32_t requestedIp)
     ip->checksum  = InetChecksum(ip, sizeof(Ipv4Header));
 
     auto* udp = reinterpret_cast<UdpHeader*>(frame + sizeof(EthHeader) + sizeof(Ipv4Header));
-    udp->srcPort  = htons(68);  // DHCP client
-    udp->dstPort  = htons(67);  // DHCP server
+    udp->srcPort  = htons(DHCP_CLIENT_PORT);
+    udp->dstPort  = htons(DHCP_SERVER_PORT);
     udp->length   = htons(static_cast<uint16_t>(udpLen));
     udp->checksum = 0;
 
@@ -1863,18 +1880,23 @@ static void DhcpSend(uint8_t msgType, uint32_t serverIp, uint32_t requestedIp)
     g_netIf->transmit(g_netIf, frame, frameLen);
 }
 
-// Process a DHCP reply (called from UDP receive path)
-static void HandleDhcpReply(const uint8_t* data, uint32_t len)
+static bool DhcpAcquiring()
 {
-    // Minimum: op(1)+htype(1)+hlen(1)+hops(1)+xid(4)+secs(2)+flags(2)+
-    //   ciaddr(4)+yiaddr(4)+siaddr(4)+giaddr(4)+chaddr(16)+sname(64)+file(128)+magic(4) = 240
-    if (len < 240) return;
+    return g_dhcpState == 1 || g_dhcpState == 2;
+}
 
-    auto* dhcp = reinterpret_cast<const DhcpPacket*>(data);
-    if (dhcp->op != 2) return; // not a reply
-    if (dhcp->xid != g_dhcpXid) return;
-    if (dhcp->magic != DHCP_MAGIC) return;
+static const DhcpPacket* DhcpReplyHeader(const uint8_t* data, uint32_t len)
+{
+    if (len < DHCP_FIXED_BYTES) return nullptr;
+    const auto* dhcp = reinterpret_cast<const DhcpPacket*>(data);
+    return dhcp->op == 2 && dhcp->xid == g_dhcpXid && dhcp->magic == DHCP_MAGIC
+        ? dhcp : nullptr;
+}
 
+static void HandleDhcpReply(const DhcpPacket& reply, uint32_t len)
+{
+    const auto* dhcp = &reply;
+    const auto* data = reinterpret_cast<const uint8_t*>(dhcp);
     // Parse options
     uint8_t msgType = 0;
     uint32_t subnetMask = 0;
@@ -1931,6 +1953,27 @@ static void HandleDhcpReply(const uint8_t* data, uint32_t len)
         g_dhcpState = 3;
         g_dhcpDone = true;
     }
+}
+
+static void HandleDhcpAcquisitionUnicast(NetIf* receiving, const Ipv4Header& ip,
+                                         const uint8_t* payload, uint32_t payloadLen)
+{
+    // Only an unconfigured primary interface receiving a physical BOOTP
+    // response may claim an otherwise unassigned destination address.
+    const uint32_t destination = ntohl(ip.dstIp);
+    if (receiving != g_netIf || receiving->ipAddr || !DhcpAcquiring() ||
+        !destination || (destination >> 28) >= 0xe || (ntohs(ip.flagsFrag) & 0x3fff) ||
+        payloadLen < sizeof(UdpHeader)) return;
+    const auto* udp = reinterpret_cast<const UdpHeader*>(payload);
+    const uint32_t bytes = ntohs(udp->length);
+    if (udp->srcPort != htons(DHCP_SERVER_PORT) || udp->dstPort != htons(DHCP_CLIENT_PORT) ||
+        bytes < sizeof(UdpHeader) || bytes > payloadLen) return;
+
+    const auto* reply = DhcpReplyHeader(payload + sizeof(UdpHeader),bytes - sizeof(UdpHeader));
+    if (!reply || reply->htype != 1 || reply->hlen != sizeof(receiving->mac.b) ||
+        memcmp(reply->chaddr,receiving->mac.b,sizeof(receiving->mac.b)) ||
+        reply->yiaddr != ip.dstIp) return;
+    HandleDhcpReply(*reply,bytes - sizeof(UdpHeader));
 }
 
 // ---- Static interface config via /boot/BROOK.CFG -------------------------
@@ -2082,6 +2125,7 @@ bool DhcpDiscover(NetIf* nif)
         }
     }
 
+    g_dhcpState = 0;
     SerialPuts("net: DHCP failed\n");
     return false;
 }
@@ -2089,8 +2133,9 @@ bool DhcpDiscover(NetIf* nif)
 // Override: check if incoming UDP is DHCP before delivering to sockets
 static bool IsDhcpReply(uint16_t dstPort, const void* data, uint32_t len)
 {
-    if (dstPort == 68 && g_dhcpState > 0 && g_dhcpState < 3) {
-        HandleDhcpReply(static_cast<const uint8_t*>(data), len);
+    if (dstPort == DHCP_CLIENT_PORT && DhcpAcquiring()) {
+        if (const auto* reply = DhcpReplyHeader(static_cast<const uint8_t*>(data),len))
+            HandleDhcpReply(*reply,len);
         return true;
     }
     return false;
