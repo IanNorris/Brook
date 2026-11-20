@@ -48,24 +48,34 @@ int PrepareTarget() {
     VfsPathRelease(root);return result;
 }
 struct ProfileView {
+#if defined(BROOK_SSD_AUTO_RECOVERY)
     VfsPath root{};
     const void* attachment=nullptr;
+#endif
 
     int Stat(const char* path,VnodeStat* out,bool follow=true) const {
-        if(!attachment)return follow?VfsStatPath(path,out):VfsLstatPath(path,out);
-        VfsPath object{};
-        int error=VfsPathResolve(root,root,path,&object,follow);
-        if(!error)error=object.attachment==attachment?VfsPathStat(object,out):-18;
-        VfsPathRelease(object);
-        return error;
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+        if(attachment) {
+            VfsPath object{};
+            int error=VfsPathResolve(root,root,path,&object,follow);
+            if(!error)error=object.attachment==attachment?VfsPathStat(object,out):-18;
+            VfsPathRelease(object);
+            return error;
+        }
+#endif
+        return follow?VfsStatPath(path,out):VfsLstatPath(path,out);
     }
     int Readlink(const char* path,char* out,uint32_t capacity) const {
-        if(!attachment)return VfsReadlink(path,out,capacity);
-        VfsPath object{};
-        int error=VfsPathResolve(root,root,path,&object,false);
-        if(!error)error=object.attachment==attachment?VfsPathReadlink(object,out,capacity):-18;
-        VfsPathRelease(object);
-        return error;
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+        if(attachment) {
+            VfsPath object{};
+            int error=VfsPathResolve(root,root,path,&object,false);
+            if(!error)error=object.attachment==attachment?VfsPathReadlink(object,out,capacity):-18;
+            VfsPathRelease(object);
+            return error;
+        }
+#endif
+        return VfsReadlink(path,out,capacity);
     }
 };
 
