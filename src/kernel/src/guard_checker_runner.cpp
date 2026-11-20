@@ -20,6 +20,11 @@
 #include "shell.h"
 #endif
 #if defined(BROOK_SSD_GUARDED_DESKTOP)
+#include "apic.h"
+#include "boot_timing_runtime.h"
+#include "compositor.h"
+#include "guard_desktop_health.h"
+#include "panic.h"
 #include "shutdown.h"
 #if defined(BROOK_SSD_AUTO_RECOVERY)
 #include "ac_shutdown_record.h"
@@ -47,10 +52,6 @@ namespace brook {
 #if defined(BROOK_SSD_GUARDED_DESKTOP)
 namespace {
 bool guardedDesktopBridge=false;
-BootGuardSlot guardedBootSlot{};
-}
-void GuardCheckerCaptureBootSlot(const BootProtocol* boot) {
-    if(BootHasGuardSlot(boot))guardedBootSlot=boot->guardSlot;
 }
 bool GuardedDesktopBridgeEnabled() {return __atomic_load_n(&guardedDesktopBridge,__ATOMIC_ACQUIRE);}
 #if defined(BROOK_SSD_AUTO_RECOVERY)
@@ -108,11 +109,11 @@ void PublishRecoverySlotStatus(FatPrivateMount* mount,const char* mode) {
 }
 #endif
 #if defined(BROOK_SSD_GUARDED_DESKTOP)
-bool RequestGuardedSlotRestart(const char* stage,int error) {
+bool RequestGuardedScriptRestart(const BootGuardSlot& slot, int error) {
     const auto power=ShutdownGetPowerCapabilities();
     const bool restart=power.gracefulQuiescence && power.reset && ShutdownLaunchAllowed();
-    KPrintf("GUARD_SLOT_RESTART requested=%u generation=%lu slot=%u stage=%s status=%d\n",
-            restart?1u:0u,guardedBootSlot.generation,guardedBootSlot.slot,stage,error);
+    KPrintf("GUARD_SLOT_RESTART requested=%u generation=%lu slot=%u stage=script status=%d\n",
+            restart?1u:0u,slot.generation,slot.slot,error);
     if(restart)ShutdownDesktopRequest(true);
     return restart;
 }
@@ -305,12 +306,18 @@ void Worker(void* arg) {
         int handoff=journalPin;
         AcShutdownRecord prior{};
         const bool haveShutdownRecord=!handoff && !FatFsPrivateRecoveryPinAcShutdown(mount,prior);
-        const int health=FatFsPrivateRecoveryPinSlotHealth(mount,identity);
-        KPrintf("GUARD_SLOT_JOURNAL status=%d generation=%lu slot=%u\n",
-                health,guardedBootSlot.generation,guardedBootSlot.slot);
-        const bool trackSlot=health==0;
-        if(!handoff && health<0)handoff=health;
-        if(!handoff && trackSlot && !GuardSlotKeyValid(guardedBootSlot))handoff=-22;
+        bool trackSlot=false;
+        const auto guardedBootSlot=BootTimingHandoffSlot();
+        const bool emergency=BootTimingHandoffFlags()&BootTimingGuardEmergency;
+        if (!GuardSlotKeyValid(guardedBootSlot) || emergency) {
+            KPrintf("GUARD_SLOT_UNTRACKED reason=%s\n",emergency?"emergency-loader":"no-loader-key");
+        } else if (!handoff) {
+            const int health=FatFsPrivateRecoveryPinSlotHealth(mount,identity);
+            KPrintf("GUARD_SLOT_JOURNAL status=%d generation=%lu slot=%u\n",
+                    health,guardedBootSlot.generation,guardedBootSlot.slot);
+            trackSlot=health==0;
+            if(health<0)handoff=health;
+        }
         if(!handoff)handoff=FatFsPrivateRecoveryPublishJournalTest(mount,false,&publication);
         const bool espWritable=!handoff && AhciSystemGuardTestBeginWrites(adapter);
         if(!handoff && !espWritable)handoff=-13;
@@ -318,39 +325,31 @@ void Worker(void* arg) {
         if(!handoff)handoff=FatFsPrivateRecoveryArmJournal(mount);
         uint8_t drive=2;
         bool sharedProfileRejected=false;
-        bool slotStarted=false;
-        if(!handoff && trackSlot) {
-            uint32_t starts=0;
-            handoff=FatFsPrivateRecoveryStartSlot(mount,guardedBootSlot,starts);
-            slotStarted=!handoff;
-            KPrintf("GUARD_SLOT_START status=%d generation=%lu slot=%u starts=%u\n",
-                    handoff,guardedBootSlot.generation,guardedBootSlot.slot,starts);
-        }
         if(!handoff && !AhciSystemGuardTestMountDesktop(adapter,&drive,&sharedProfileRejected))handoff=-5;
+        // Failure before data-volume admission cannot establish that a slot
+        // was at fault. The common profile is an exception: record this slot's
+        // observation so the other verified kernel can independently try it.
+        bool slotStarted=false;
+        if(trackSlot && (!handoff || sharedProfileRejected)) {
+            uint32_t starts=0;
+            const int recorded=FatFsPrivateRecoveryStartSlot(mount,guardedBootSlot,starts);
+            slotStarted=!recorded;
+            KPrintf("GUARD_SLOT_START status=%d generation=%lu slot=%u starts=%u\n",
+                    recorded,guardedBootSlot.generation,guardedBootSlot.slot,starts);
+        }
         if(handoff) {
-            bool journalCertain=trackSlot;
             if(slotStarted && sharedProfileRejected) {
                 const int recorded=FatFsPrivateRecoveryFinishSlot(mount,true);
-                journalCertain=recorded==0;
                 KPrintf("GUARD_SLOT_PROFILE_REJECTED status=%d generation=%lu slot=%u\n",
                         recorded,guardedBootSlot.generation,guardedBootSlot.slot);
             }
             KPrintf("GUARD_DESKTOP_HANDOFF_FAILED status=%d shared_profile_rejected=%u\n",
                     handoff,sharedProfileRejected?1u:0u);
-            bool restarting=false;
-            if(slotStarted && !sharedProfileRejected) {
-                // Failed admission may have tried to mark the data volume dirty.
-                // The shutdown path can seal it only after a successful mount.
-                // Retry failed admission only when a fresh read after flush
-                // proves the data volume never entered a writable session.
-                if(!VfsMountCleanupPending() && !DeviceFlush(adapter) &&
-                   AhciSystemGuardDataState(device)==AhciGuardDataState::Clean)
-                    restarting=RequestGuardedSlotRestart("mount",handoff);
-                else KPuts("GUARD_SLOT_RESTART_DEFERRED data-volume-uncertain\n");
-            }
-            if(journalCertain && !restarting)PublishRecoverySlotStatus(mount,"desktop-failure");
+            if(trackSlot)PublishRecoverySlotStatus(mount,"desktop-failure");
             return;
         }
+        const auto startedAt=ApicTickCount();
+        const auto firstPresent=CompositorDesktopPresentCount();
         if(haveShutdownRecord) {
             previousAcShutdown=prior;
             __atomic_store_n(&acShutdownMount,mount,__ATOMIC_RELEASE);
@@ -380,18 +379,31 @@ void Worker(void* arg) {
         const int script=ShellExecScript("/boot/INIT.RC");
         KPrintf("GUARD_DESKTOP_HANDOFF_SCRIPT status=%d\n",script);
         if(script) {
-            if(slotStarted && !RequestGuardedSlotRestart("script",script))
+            if(slotStarted && !RequestGuardedScriptRestart(guardedBootSlot,script))
                 PublishRecoverySlotStatus(mount,"desktop-failure");
             return;
         }
         if(!ShutdownLaunchAllowed())return;
-        if(trackSlot) {
-            const int confirmed=FatFsPrivateRecoveryFinishSlot(mount,false);
-            KPrintf("GUARD_SLOT_CONFIRMED status=%d generation=%lu slot=%u\n",
-                    confirmed,guardedBootSlot.generation,guardedBootSlot.slot);
-            if(confirmed || !ShutdownLaunchAllowed())return;
-        }
         __atomic_store_n(&guardedDesktopBridge,true,__ATOMIC_RELEASE);
+        if(trackSlot)PublishRecoverySlotStatus(mount,"desktop");
+        if(slotStarted) {
+            KPrintf("GUARD_SLOT_HEALTH_WAIT generation=%lu slot=%u window_ms=%lu\n",
+                    guardedBootSlot.generation,guardedBootSlot.slot,GuardDesktopHealthWindowMs);
+            // Keep this independent of the userspace service-launch receipt.
+            // An early reboot or panic leaves the persisted start outstanding.
+            while(ShutdownLaunchAllowed() && !KernelPanicActive()) {
+                const auto now=ApicTickCount();
+                const auto presents=CompositorDesktopPresentCount();
+                if(GuardDesktopHealthReady(startedAt,now,firstPresent,presents)) {
+                    const int confirmed=FatFsPrivateRecoveryFinishSlot(mount,false);
+                    KPrintf("GUARD_SLOT_CONFIRMED status=%d generation=%lu slot=%u healthy_ms=%lu presents=%lu\n",
+                            confirmed,guardedBootSlot.generation,guardedBootSlot.slot,
+                            now-startedAt,presents-firstPresent);
+                    break;
+                }
+                SchedulerSleepMs(250);
+            }
+        }
         return;
 #else
 #if defined(BROOK_SSD_AUTO_RECOVERY)

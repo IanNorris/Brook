@@ -61,6 +61,16 @@
 
 namespace brook {
 
+#if defined(BROOK_SSD_GUARDED_DESKTOP)
+static uint64_t g_desktopPresents = 0;
+uint64_t CompositorDesktopPresentCount() {
+    return __atomic_load_n(&g_desktopPresents, __ATOMIC_ACQUIRE);
+}
+void CompositorRecordDesktopPresent() {
+    __atomic_add_fetch(&g_desktopPresents, uint64_t{1}, __ATOMIC_RELEASE);
+}
+#endif
+
 static KMutex g_scanoutMappingLock{};
 static CompositorPresentLease g_presentLease{};
 // Compositor progress and guest time when the most recent leased image was
@@ -4263,7 +4273,10 @@ static void CompositorFlipSoftware()
     // The GOP now holds the complete software frame; arm it (latched at vblank).
     if(full && minY==0 && maxY==g_physFbHeight)brook::BdwScanoutFlipReturnToGop();
 #endif
-    if(flushMin<flushMax)brook::DisplayFlush(flushMin,flushMax);
+    if (flushMin < flushMax) {
+        brook::DisplayFlush(flushMin, flushMax);
+        CompositorRecordDesktopPresent();
+    }
     if(g_scanoutContainsLeasedFrame){
         ++g_softwareTakeover.count;
         g_softwareTakeover.lastAgeMs=tick-g_leasedFrameTick;
@@ -4753,6 +4766,7 @@ int CompositorFinishGopWrite(const CompositorGopWrite& write,int result,bool tou
             else if(!g_presentLease.Acquire(write.owner,tick,COMPOSITOR_PRESENT_LEASE_MS))result=-75;
             else {
                 DisplayFlush(write.minY,write.maxY);
+                CompositorRecordDesktopPresent();
                 g_leasedFrameEpoch=__atomic_load_n(&g_compositorEpoch,__ATOMIC_ACQUIRE);
                 g_leasedFrameTick=tick;
                 g_leasedFrameDisplay=write.display;g_leasedFrameBackdrop=write.backdrop;
@@ -4819,7 +4833,8 @@ int CompositorPresentProbe(uint32_t x,uint32_t y,uint32_t width,uint32_t height,
                 else {g_leasedFrameEpoch=__atomic_load_n(&g_compositorEpoch,__ATOMIC_ACQUIRE);g_leasedFrameTick=tick;
                     g_leasedFrameDisplay=expectedDisplay;g_leasedFrameBackdrop=expectedBackdrop;
                     g_leasedFrameMode=region?BROOK_DEBUG_FRAME_PRESENT_PARTIAL:BROOK_DEBUG_FRAME_PRESENT_FULL;
-                    g_scanoutContainsLeasedFrame=true;g_scanoutNeedsRepair=false;}
+                    g_scanoutContainsLeasedFrame=true;g_scanoutNeedsRepair=false;
+                    CompositorRecordDesktopPresent();}
             }
         }
         if(touched && (result || !leaseOwner))g_scanoutNeedsRepair=true;
@@ -4873,7 +4888,8 @@ int CompositorPresentRegions(const CompositorPresentRegion* regions,uint32_t cou
             if(!g_presentLease.Active(tick) || g_presentLease.owner!=owner)result=-116;
             else if(!g_presentLease.Acquire(owner,tick,COMPOSITOR_PRESENT_LEASE_MS))result=-75;
             else {DisplayFlush(minY,maxY);g_leasedFrameEpoch=__atomic_load_n(&g_compositorEpoch,__ATOMIC_ACQUIRE);g_leasedFrameTick=tick;
-                g_leasedFrameMode=BROOK_DEBUG_FRAME_PRESENT_PARTIAL;}
+                g_leasedFrameMode=BROOK_DEBUG_FRAME_PRESENT_PARTIAL;
+                CompositorRecordDesktopPresent();}
         }
         if(result && touched){g_scanoutNeedsRepair=true;g_presentLease.Release(owner);}
     }

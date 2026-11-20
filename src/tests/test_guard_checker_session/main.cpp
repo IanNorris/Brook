@@ -1,4 +1,5 @@
 #include <cassert>
+#include "../../kernel/src/guard_desktop_health.h"
 #include <atomic>
 #include <condition_variable>
 #include <cstdlib>
@@ -72,6 +73,11 @@ static Process process(uint16_t pid,uint16_t tgid,uint64_t incarnation,uint64_t 
 }
 static void childDone(pid_t pid) {int status=0;assert(waitpid(pid,&status,0)==pid && WIFEXITED(status) && !WEXITSTATUS(status));}
 int main() {
+    assert(!brook::GuardDesktopHealthReady(1000,60999,2,200));
+    assert(!brook::GuardDesktopHealthReady(1000,61000,25,26));
+    assert(!brook::GuardDesktopHealthReady(1000,1000,25,27));
+    assert(brook::GuardDesktopHealthReady(1000,61000,25,27));
+
     BlockDeviceOps block{Read,Write,Ioctl,nullptr,Blocks,BlockSize};
     Device device{reinterpret_cast<const DeviceOps*>(&block),"guard",DeviceType::Block,nullptr};reserved=&device;
     Process owner=process(5,5,77,0),sibling=process(6,5,78,77),other=process(8,8,88,0),reused=process(5,5,99,0);

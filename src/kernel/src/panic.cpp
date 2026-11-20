@@ -299,6 +299,11 @@ uint32_t brook::PanicCaptureCpuList(brook::PanicCpuList* out)
 // A peer entering panic must not reset while the owner is capturing evidence.
 static uint32_t g_panicOwner = 0;
 
+bool KernelPanicActive()
+{
+    return __atomic_load_n(&g_panicOwner, __ATOMIC_ACQUIRE) != 0;
+}
+
 __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
 {
     __asm__ volatile("cli");

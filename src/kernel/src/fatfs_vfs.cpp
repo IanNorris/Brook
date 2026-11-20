@@ -2047,7 +2047,9 @@ int FatFsPrivateRecoveryPinSlotHealth(FatPrivateMount* session, const char (&ide
     // metadata. No mount has been published, so nobody can race our open.
     if (stat == FR_NO_FILE) return 1;
     if (stat != FR_OK) return FrToErrno(stat);
-    if ((info.fattrib & AM_DIR) || info.fsize != GuardSlotCount * GuardSlotSectorBytes) return -22;
+    if (info.fattrib & AM_DIR) return -22;
+    if (!info.fsize) return 1; // An older interrupted provision may predate atomic publication.
+    if (info.fsize != GuardSlotCount * GuardSlotSectorBytes) return -22;
 
     auto* node = FatFsOpen(session->mount, session->mount->pdrv, path, VFS_O_WRITE | VFS_O_READWRITE);
     if (!node) return -5;

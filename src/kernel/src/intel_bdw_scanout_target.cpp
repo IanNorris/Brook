@@ -242,6 +242,7 @@ void PollLocked(){
         BdwFlipLatch latch{};
         switch(chain.Poll(frame,live,Rdtsc(),latch)){
         case BdwFlipPoll::Latched:
+            CompositorRecordDesktopPresent();
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
             BdwWorkerStatsFlipLatched(latch.frames,latch.ticks);
 #endif
@@ -516,7 +517,10 @@ void ClientPollLocked(){
             zcActive=false;zcRing=BdwZeroCopyRing{};zcRepairOwed=true;
         }
         clientGopRestore=clientLeaving=false;
-    }else ++clientLatched;
+    }else {
+        ++clientLatched;
+        CompositorRecordDesktopPresent();
+    }
     for(auto& mapping:clientMappings){
         if(mapping.held && !clientFlip.Contains(mapping.Base())){
             // Do not tell the renderer to send SAFE before permitting writes.
@@ -610,7 +614,9 @@ void ZcPollLocked(){
         const uint32_t frame=Read(BdwFlipRegs::FrameCountA),live=Read(BdwFlipRegs::SurfaceLive);
         BdwFlipLatch latch{};
         switch(zcRing.Poll(frame,live,Rdtsc(),latch)){
-        case BdwFlipPoll::Latched:zcStats.Latch(latch.frames,tscKhz?latch.ticks*1000/tscKhz:0);
+        case BdwFlipPoll::Latched:
+            zcStats.Latch(latch.frames,tscKhz?latch.ticks*1000/tscKhz:0);
+            CompositorRecordDesktopPresent();
             if(auto* e=ZcTimelineFor(latch.slot)){e->latchTsc=Rdtsc();e->frames=latch.frames;}
             break;
         case BdwFlipPoll::Uncertain:ZcFallback(BdwZeroCopyFallback::Uncertain);ZcDisableLocked("latch-uncertain");return;

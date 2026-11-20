@@ -13,6 +13,7 @@
 // KERNEL_ASSERT(cond, msg) panics with file/line info if cond is false.
 
 __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...);
+bool KernelPanicActive();
 
 #define KERNEL_ASSERT(cond, msg) \
     do { \

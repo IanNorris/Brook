@@ -41,6 +41,8 @@
 #include "process.h"
 #include "scheduler.h"
 #include "apic.h"
+#include "boot_timing_runtime.h"
+#include "../../shared/boot_protocol/boot_protocol.h"
 #endif
 #if defined(BROOK_SSD_GUARDED_DESKTOP)
 #include "ac_shutdown_record.h"
@@ -106,6 +108,15 @@ void RecoverySlotsReply()
     reply.field("sequence", state.sequence);
     reply.append(',');
     reply.field("newest_generation", state.newestGeneration);
+    const auto running=BootTimingHandoffSlot();
+    if(running.generation) {
+        reply.append(',');
+        reply.field("running_generation",running.generation);
+        reply.append(',');
+        reply.field("running_slot",running.slot);
+        reply.text(",\"running_previous\":");
+        reply.text(running.generation < state.newestGeneration ? "true" : "false");
+    }
     reply.text(",\"slots\":[");
     constexpr char hex[] = "0123456789abcdef";
     for (unsigned slot = 0; slot < 2; ++slot) {

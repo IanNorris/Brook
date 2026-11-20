@@ -25,6 +25,12 @@ void CompositorRetireVfb(CompositorVfbAllocation* item);
 // Initialise the compositor (caches physical FB info).
 // Must be called after TtyInit().
 void CompositorInit();
+#if defined(BROOK_SSD_GUARDED_DESKTOP)
+uint64_t CompositorDesktopPresentCount();
+void CompositorRecordDesktopPresent();
+#else
+inline void CompositorRecordDesktopPresent() {}
+#endif
 void CompositorBootAssetsPending(bool pending);
 uint64_t CompositorDesktopReadyTick();
 uint64_t CompositorBootDurationMs();

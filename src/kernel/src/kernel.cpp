@@ -422,9 +422,6 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
                     static_cast<unsigned long>(brook::BootProtocolMagic));
     }
     brook::BootTimingCaptureHandoff(bootProtocol);
-#if defined(BROOK_SSD_GUARDED_DESKTOP)
-    brook::GuardCheckerCaptureBootSlot(bootProtocol);
-#endif
 
     GdtInit();
     CpuInitFpu();
