@@ -1022,6 +1022,7 @@ static void WmCaptureTaskbar(uint32_t screenW, uint32_t screenH, uint64_t uptime
             if (const auto* item = TaskbarPinItem(icons.get(), unsigned(pin))) {
                 const int window = TaskbarPrimaryWindow(icons.get(), *item);
                 if (window >= 0) {
+                    entry.hasWindow = true;
                     entry.active = g_windows[window].focused && !g_windows[window].minimized;
                     entry.minimized = g_windows[window].minimized;
                 } else {
@@ -1058,6 +1059,7 @@ static void WmCaptureTaskbar(uint32_t screenW, uint32_t screenH, uint64_t uptime
             continue;
         }
         const Window& window = g_windows[index];
+        entry.hasWindow = true;
         entry.active = window.focused && !window.minimized;
         entry.minimized = window.minimized;
         if (layout.buttons[i].w >= int(WmMetric(ChromeShellMetrics::TaskbarLabelMin)))

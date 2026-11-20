@@ -533,7 +533,7 @@ void ChromeBuildTaskbar(const ChromeTaskbarModel& m, const ChromeStyle& s, Chrom
             }
             continue;
         }
-        indicator(r, b.active, b.minimized);
+        if (b.hasWindow) indicator(r, b.active, b.minimized);
         const unsigned opacity = b.minimized ? 153 : 255;
         if (r.w >= Px(s, SM::TaskbarLabelMin) && r.h >= icon && b.hoverTitle && b.hoverTitle[0]) {
             const int ix = r.x + Px(s, SM::TaskbarButtonPad), tx = ix + icon + Px(s, SM::TaskbarLabelGap);

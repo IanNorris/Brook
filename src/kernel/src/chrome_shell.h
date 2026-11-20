@@ -89,6 +89,7 @@ struct ChromeTaskbarButton {
     bool launch, busy;      // launch feedback entries: progress ring, or "!"
     char initial = 0;
     LauncherColor color = LauncherColor::Slate;
+    bool hasWindow = false;
 };
 
 struct ChromeTelemetryModel {

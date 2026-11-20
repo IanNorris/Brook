@@ -483,11 +483,11 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
     model = {};
     model.kind = ChromeShellKind::Taskbar;
     model.taskbar = layout;
-    model.entries[0] = {"Terminal", true, false, false, false, 0, LauncherColor::Slate};
-    model.entries[1] = {"Files", false, true, false, false, 'F', LauncherColor::Blue};
-    model.entries[2] = {"Settings", false, false, false, false, 0, LauncherColor::Slate};
-    model.entries[3] = {"", false, false, true, true, 0, LauncherColor::Slate};
-    model.entries[4] = {"", false, false, true, false, 'Q', LauncherColor::Coral};
+    model.entries[0] = {"Terminal", true, false, false, false, 0, LauncherColor::Slate, true};
+    model.entries[1] = {"Files", false, true, false, false, 'F', LauncherColor::Blue, true};
+    model.entries[2] = {"Settings", false, false, false, false, 0, LauncherColor::Slate, true};
+    model.entries[3] = {"", false, false, true, true, 0, LauncherColor::Slate, false};
+    model.entries[4] = {"", false, false, true, false, 'Q', LauncherColor::Coral, false};
     for (uint32_t i : {0u, 2u, 3u, ChromeShellModel::AppsIcon}) SetTestIcon(model.icons[i]);
     model.networkConnected = true;
     model.volumeControl = 60;
@@ -528,7 +528,7 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
         pinned.entries[0].initial = 'T';
         pinned.entries[1].initial = 'E';
         pinned.entries[1].color = LauncherColor::Blue;
-        pinned.entries[1].active = true;
+        pinned.entries[1].active = pinned.entries[1].hasWindow = true;
         pinned.entries[2].initial = 'B';
         pinned.entries[2].color = LauncherColor::Violet;
         pinned.entries[2].launch = pinned.entries[2].busy = true;
@@ -1011,7 +1011,7 @@ void WebAppTitles(const std::string& prefix, uint32_t theme, const DesktopMetric
     model = {};
     model.kind = ChromeShellKind::Taskbar;
     model.taskbar = taskbar;
-    model.entries[0].active = true;
+    model.entries[0].active = model.entries[0].hasWindow = true;
     std::strcpy(model.entries[0].label, title);
     SetTestIcon(model.icons[0]);
     ChromeDisplayList taskbarList = ChromeListOn(storage);

@@ -49,6 +49,7 @@ struct ChromeShellEntry {
     bool active, minimized, launch, busy;
     char initial;
     LauncherColor color;
+    bool hasWindow;
 };
 
 struct ChromeShellBoot {
@@ -129,7 +130,7 @@ inline void BuildShellModel(const ChromeShellModel& model, const ChromeStyle& st
         ChromeTaskbarButton buttons[ChromeTaskbarButtonLimit];
         for (int i = 0; i < model.taskbar.count; ++i) {
             const auto& entry = model.entries[i];
-            buttons[i] = {model.icons[i].View(), entry.label, entry.active, entry.minimized, entry.launch, entry.busy, entry.initial, entry.color};
+            buttons[i] = {model.icons[i].View(), entry.label, entry.active, entry.minimized, entry.launch, entry.busy, entry.initial, entry.color, entry.hasWindow};
         }
         ChromeBuildTaskbar({&model.taskbar, buttons, model.launcherOpen, model.icons[ChromeShellModel::AppsIcon].View(),
                            model.networkConnected,

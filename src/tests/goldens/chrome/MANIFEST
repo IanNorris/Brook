@@ -95,7 +95,7 @@ glass-100-taskbar-diagnostics 02ca9dc820d1176a
 glass-100-taskbar-hover d174734cd5c1aa5e
 glass-100-taskbar-hud b35015d85d39ab34
 glass-100-taskbar-pin-menu 47c106b88580c4aa
-glass-100-taskbar-pins 12b70874c0ebdf2e
+glass-100-taskbar-pins 23399ee02b62841e
 glass-100-taskbar-task-manager cdfefc9d354b9836
 glass-100-temperature-flyout 626fcbdc2b64f918
 glass-100-tooltip 3228e779ea27b7b8
@@ -775,7 +775,7 @@ opaque-dark-200-taskbar-diagnostics fa8b7fe53f61818e
 opaque-dark-200-taskbar-hover f8f177f96640fe9f
 opaque-dark-200-taskbar-hud f0c416e6701a4437
 opaque-dark-200-taskbar-pin-menu 8210753d6377af31
-opaque-dark-200-taskbar-pins d5a8b60ae73e281e
+opaque-dark-200-taskbar-pins 0eda32db7a74f836
 opaque-dark-200-taskbar-task-manager 1445563bb5b11eb9
 opaque-dark-200-temperature-flyout 39a25448cf20ac2c
 opaque-dark-200-tooltip 9500febdbd7d5d0f
@@ -861,7 +861,7 @@ opaque-light-150-taskbar-diagnostics 9bf0af68d1e6366a
 opaque-light-150-taskbar-hover deac45ff2de15325
 opaque-light-150-taskbar-hud 5cdc3e00fea44279
 opaque-light-150-taskbar-pin-menu 0bc200da6874b357
-opaque-light-150-taskbar-pins a18b43337b50247d
+opaque-light-150-taskbar-pins bec0a056ebc8d6d4
 opaque-light-150-taskbar-task-manager 100a158ad9c11c05
 opaque-light-150-temperature-flyout 054593b0bb5821fa
 opaque-light-150-tooltip c5d15451dac927a8

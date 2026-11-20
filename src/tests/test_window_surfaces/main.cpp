@@ -1149,8 +1149,19 @@ int main() {
                 if (layout.indices[i] == target) return layout.buttons[i];
             return DesktopRect{};
         };
+        static ChromeShellModel taskbarModel{};
+        const auto captureEntry = [&](int target) {
+            const auto layout = GetTaskbarLayout(sw, sh);
+            taskbarModel = {};
+            WmCaptureTaskbar(sw, sh, 0, -1, -1, taskbarModel);
+            CHECK(taskbarModel.taskbar.count == layout.count);
+            for (int i = 0; i < layout.count; ++i)
+                if (layout.indices[i] == target) return taskbarModel.entries[i];
+            std::abort();
+        };
         auto pin = button(TaskbarPinBase);
         CHECK(pin.w > 0 && WmTaskbarHitTest(pin.x, pin.y, sw, sh) == TaskbarPinBase);
+        CHECK(!captureEntry(TaskbarPinBase).hasWindow);
         CHECK(WmShellTrayPointer(sw, sh, pin.x + 2, pin.y + 2, true, 1, 0));
         CHECK(g_taskbarContextMenu.open && g_taskbarContextMenu.pinned && g_taskbarContextMenu.window < 0);
         WmWindowMenuClose();
@@ -1167,6 +1178,10 @@ int main() {
         }
         WmSetFocus(ids[1]);
         CHECK(button(ids[0]).w && !button(ids[1]).w && button(ids[2]).w);
+        const auto pinnedRunning = captureEntry(TaskbarPinBase);
+        const auto unpinnedRunning = captureEntry(ids[2]);
+        CHECK(pinnedRunning.hasWindow && pinnedRunning.active);
+        CHECK(unpinnedRunning.hasWindow && !unpinnedRunning.active);
         WmTaskbarPendingClick(TaskbarPinBase);
         CHECK(g_windows[ids[1]].minimized);
         WmSetFocus(ids[2]); // focus another app, then restore the newest Terminal
