@@ -25,8 +25,9 @@ struct DockState {
     int width;     // logical width; 0: ChromeDockMetrics::Width
     bool resizing; // the grip is being dragged
     int dragX, dragWidth; // pointer x and sidebar pixels when the drag began
+    bool drop;     // a window being moved is over the drop target
 };
-static DockState g_dock = {{}, 0, -1, false, false, false, false, 0, false, 0, 0};
+static DockState g_dock = {{}, 0, -1, false, false, false, false, 0, false, 0, 0, false};
 
 static ChromeDockPlacement DockPlacement() { return {g_dock.width, g_dock.right}; }
 
@@ -67,8 +68,29 @@ WmRect WmWorkArea(uint32_t screenW, uint32_t screenH) { return WorkAreaFor(WmDes
 static ChromeDockLayout DockLayoutFor(const DesktopMetrics& m, uint32_t screenW, uint32_t screenH)
 {
     const bool shown = DockShown();
-    return ChromeDockLayoutFor(m, screenW, DockDesktopHeight(m, screenH), static_cast<int>(g_dock.count),
-                               shown ? g_dock.selected : -1, shown, DockPlacement());
+    ChromeDockLayout l = ChromeDockLayoutFor(m, screenW, DockDesktopHeight(m, screenH), static_cast<int>(g_dock.count),
+                                             shown ? g_dock.selected : -1, shown, DockPlacement());
+    if (g_dock.drop) {
+        l.drop = true;
+        if (!l.open) {
+            // Shut (or empty): the tab grows into the "Send to dock" chip.
+            const int w = m.pixels(ChromeDockMetrics::DropChipW), h = m.pixels(ChromeDockMetrics::DropChipH);
+            if (w <= l.sidebar.w && h <= l.sidebar.h)
+                l.tab = {g_dock.right ? l.sidebar.x + l.sidebar.w - w : l.sidebar.x,
+                         l.sidebar.y + (l.sidebar.h - h) / 2, w, h};
+        }
+    }
+    return l;
+}
+
+// Drag to dock: the pointer of a window move is over the open sidebar, or
+// the shut dock's screen edge.
+static bool DockDropZoneLocked(const DesktopMetrics& m, int32_t mx, int32_t my, uint32_t sw, uint32_t sh)
+{
+    if (my < 0 || my >= static_cast<int32_t>(DockDesktopHeight(m, sh))) return false;
+    if (DockShown()) return ChromeDockSidebar(m, sw, DockDesktopHeight(m, sh), DockPlacement()).contains(mx, my);
+    const int edge = m.pixels(ChromeDockMetrics::DropEdge);
+    return g_dock.right ? mx >= static_cast<int32_t>(sw) - edge : mx >= 0 && mx < edge;
 }
 
 // Floating windows cannot sit under a pinned sidebar: move the edge that
@@ -216,6 +238,13 @@ static void DockRemoveEntryLocked(int entry, bool keepOpen)
     }
 }
 
+static bool DockDropEligible(int idx)
+{
+    if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return false;
+    const Window& w = g_windows[idx];
+    return w.proc && w.visible && w.focusable && !w.docked && !w.fullscreen && g_dock.count < ChromeDockEntryLimit;
+}
+
 static bool DockWindowLocked(int idx)
 {
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return false;
@@ -246,12 +275,12 @@ static bool DockWindowLocked(int idx)
     }
     w.proc->fbDestX = w.clientX(); w.proc->fbDestY = w.clientY();
     g_dock.entries[g_dock.count++] = idx;
-    // Docking does not open the dock. A shown (pinned) dock with no page
-    // takes the new entry as its page.
+    // Docking opens the dock on the new entry, focused, so the window stays
+    // in view: it moves into the sidebar rather than disappearing.
     w.minimized = true;
-    DockUnfocusLocked(idx);
-    if (g_dock.selected < 0) g_dock.selected = static_cast<int>(g_dock.count) - 1;
-    DockApplyLocked(false);
+    g_dock.selected = static_cast<int>(g_dock.count) - 1;
+    g_dock.open = true;
+    DockApplyLocked(true);
     SerialPrintf("WM: docked window %d '%s' (%u entries)\n", idx, w.title, g_dock.count);
     return true;
 }
@@ -414,6 +443,43 @@ int WmDockWidth() { return g_dock.width; }
 void WmDockSetRight(bool right) { VfbGuard guard; DockSetSideLocked(right); }
 void WmDockSetWidth(int width) { VfbGuard guard; DockSetWidthLocked(width); }
 bool WmDockDragActive() { return g_dock.resizing; }
+
+void WmDockWindowDrag(int idx, int32_t mx, int32_t my)
+{
+    VfbGuard guard;
+    uint32_t sw = 0, sh = 0;
+    CompositorGetPhysDims(&sw, &sh);
+    const bool drop = g_wmActive && !WmTaskbarHidden() && DockDropEligible(idx) &&
+                      DockDropZoneLocked(WmDesktopMetrics(), mx, my, sw, sh);
+    if (drop == g_dock.drop) return;
+    g_dock.drop = drop;
+    CompositorMarkDirty();
+    CompositorWake();
+}
+
+void WmDockWindowDragCancel()
+{
+    VfbGuard guard;
+    if (!g_dock.drop) return;
+    g_dock.drop = false;
+    CompositorMarkDirty();
+}
+
+bool WmDockWindowDrop(int idx, int32_t mx, int32_t my, int16_t startX, int16_t startY)
+{
+    VfbGuard guard;
+    uint32_t sw = 0, sh = 0;
+    CompositorGetPhysDims(&sw, &sh);
+    const bool drop = g_dock.drop && DockDropEligible(idx) && DockDropZoneLocked(WmDesktopMetrics(), mx, my, sw, sh);
+    g_dock.drop = false;
+    CompositorMarkDirty();
+    if (!drop || !DockWindowLocked(idx)) return false;
+    // Returning puts it back where the drag began, not at the screen edge.
+    Window& w = g_windows[idx];
+    w.dkX = startX;
+    w.dkY = startY;
+    return true;
+}
 void WmDockDrag(int32_t mx, bool down) { VfbGuard guard; DockDragLocked(mx, down); }
 
 bool WmDockSelect(int entry)
@@ -467,12 +533,12 @@ void WmDockFocusedWindow()
 bool WmDockSurfaceRect(uint32_t screenW, uint32_t screenH, int32_t* x, int32_t* y, uint32_t* w, uint32_t* h,
                        bool* material)
 {
-    if (!g_wmActive || !g_dock.count) return false;
+    if (!g_wmActive || (!g_dock.count && !g_dock.drop)) return false;
     const ChromeDockLayout l = DockLayoutFor(WmDesktopMetrics(), screenW, screenH);
     const DesktopRect& r = l.open ? l.strip : l.tab;
     if (r.w <= 0 || r.h <= 0) return false;
     *x = r.x; *y = r.y; *w = static_cast<uint32_t>(r.w); *h = static_cast<uint32_t>(r.h);
-    *material = l.open; // the tab is a flat quad: no glass at rest
+    *material = l.open || l.drop; // the tab is a flat quad: no glass at rest
     return true;
 }
 
@@ -480,6 +546,8 @@ bool WmDockPointerOwned(int32_t mx, int32_t my, uint32_t screenW, uint32_t scree
 {
     if (!g_wmActive || !g_dock.count || WmTaskbarHidden()) return false;
     if (g_dock.resizing) return true;
+    // The drop chip is feedback for a window move, not a pointer target.
+    if (g_dock.drop && !DockShown()) return false;
     const ChromeDockLayout l = DockLayoutFor(WmDesktopMetrics(), screenW, screenH);
     return (l.open ? l.strip : l.tab).contains(mx, my) || l.grip.contains(mx, my);
 }
@@ -568,7 +636,7 @@ int WmCycleFocus()
 
 static void WmCaptureDock(uint32_t screenW, uint32_t screenH, int32_t mouseX, int32_t mouseY, ChromeShellModel& snapshot)
 {
-    if (!g_wmActive || !g_dock.count) return;
+    if (!g_wmActive || (!g_dock.count && !g_dock.drop)) return;
     LauncherReadGuard icons;
     snapshot.kind = ChromeShellKind::Dock;
     snapshot.dock = DockLayoutFor(WmDesktopMetrics(), screenW, screenH);

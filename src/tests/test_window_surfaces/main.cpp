@@ -942,14 +942,17 @@ int main() {
         for(Window* w:{&a,&b,&c})WmInputPop(w,drain,256);
         CHECK(!dockSurface(dock) && WmWorkArea(sw,sh).x==0); // nothing at rest without entries
 
-        // Super+Shift+S on the focused Chat docks it; docking does not open.
+        // Super+Shift+S on the focused Chat docks it; docking opens the dock
+        // on it, focused, so the window stays in view.
         WmSetFocus(chat);WmDockFocusedWindow();
-        CHECK(a.docked && a.minimized && a.noChrome && a.state==WindowState::Maximized && !a.focused);
-        CHECK(WmDockEntryCount()==1 && WmDockEntryWindow(0)==chat && !WmDockOpen());
+        CHECK(a.docked && !a.minimized && a.noChrome && a.state==WindowState::Maximized && a.focused);
+        CHECK(WmDockEntryCount()==1 && WmDockEntryWindow(0)==chat && WmDockOpen());
         CHECK(a.x==0 && a.y==stripH && a.clientW==sideW && a.clientH==desktopH-stripH);
         {const auto e=lastResize(a);CHECK(e.type==WM_EVT_RESIZED && e.reserved==WM_RESIZE_MAXIMIZED && e.x==sideW);}
-        CHECK(WmGetFocusedWindow()!=chat && WmGetFocusedWindow()>=0);
         CHECK(!inTaskbar(chat) && inTaskbar(notes) && inTaskbar(big));
+        // Hidden (Escape), the page leaves focus and the z-order.
+        CHECK(WmDockDismiss() && !WmDockOpen() && a.minimized && !a.focused);
+        CHECK(WmGetFocusedWindow()!=chat && WmGetFocusedWindow()>=0);
         {int z[WM_MAX_WINDOWS];const uint32_t n=WmGetZOrder(z,WM_MAX_WINDOWS);for(uint32_t i=0;i<n;++i)CHECK(z[i]!=chat);}
         // Requests from the client cannot move, restore or minimise the page.
         WmMoveWindow(chat,300,300);WmSetMaximized(chat,false);WmRestoreWindow(chat);
@@ -989,7 +992,11 @@ int main() {
 
         // A second guest; icons select pages; the selected tile hides it.
         WmSetFocus(notes);WmDockFocusedWindow();
-        CHECK(b.docked && b.minimized && WmDockEntryCount()==2 && WmDockOpen() && !a.minimized);
+        CHECK(b.docked && !b.minimized && a.minimized && b.focused && WmDockEntryCount()==2 && WmDockOpen());
+        {
+            const auto n=ChromeDockLayoutFor(WmDesktopMetrics(),sw,uint32_t(desktopH),2,1,true);
+            CHECK(WmDockPress(n.cells[0].x+4,n.cells[0].y+4,sw,sh) && !a.minimized && b.minimized && a.focused);
+        }
         {
             const auto l=ChromeDockLayoutFor(WmDesktopMetrics(),sw,uint32_t(desktopH),2,0,true);
             CHECK(l.count==2 && l.selected==0 && l.tile.w>l.cells[1].w && l.cells[1].w==int(WmMetric(ChromeDockMetrics::Cell)));
@@ -1185,6 +1192,49 @@ int main() {
             CHECK(!WmShellTrayPointer(sw,sh,tx,ty,false,0,0) && !WmWindowMenuOpen());
             f.creationIdentity=identity;
         }
+        // Drag to dock: a window move over the shut dock's edge shows the
+        // "Send to dock" chip (even with no entries) and releasing docks it,
+        // opening the dock; returning restores where the move began.
+        {
+            CHECK(WmDockEntryCount()==0 && !WmDockOpen() && !dockSurface(dock));
+            const int edge=int(WmMetric(ChromeDockMetrics::DropEdge));
+            WmDockWindowDrag(floating,edge+10,300);CHECK(!dockSurface(dock));
+            WmDockWindowDrag(floating,edge-1,300);
+            CHECK(dockSurface(dock) && dock.x==0 && dock.material && int(dock.w)==int(WmMetric(ChromeDockMetrics::DropChipW)));
+            CHECK(!WmDockPointerOwned(dock.x+4,dock.y+4,sw,sh)); // feedback, not a target
+            {
+                static ChromeShellModel model{};
+                CHECK(WmCaptureShellModel(dock,sw,sh,0,-1,-1,model) && model.dock.drop && !model.dock.open);
+            }
+            // Below the desktop (over the taskbar) is not the target.
+            WmDockWindowDrag(floating,2,desktopH+2);CHECK(!dockSurface(dock));
+            CHECK(!WmDockWindowDrop(floating,2,desktopH+2,33,44) && !f.docked);
+            WmDockWindowDrag(floating,2,300);
+            CHECK(WmDockWindowDrop(floating,2,300,33,44) && f.docked && WmDockOpen() && f.focused && !f.minimized);
+            CHECK(dockSurface(dock) && int(dock.h)==stripH); // the strip, the chip gone
+            // With the dock open, the whole sidebar is the target.
+            WmDockWindowDrag(chat,sideW-10,400);
+            {
+                static ChromeShellModel model{};
+                CHECK(dockSurface(dock) && WmCaptureShellModel(dock,sw,sh,0,-1,-1,model) && model.dock.drop && model.dock.open);
+            }
+            WmDockWindowDrag(chat,sideW+10,400);
+            {
+                static ChromeShellModel model{};
+                CHECK(WmCaptureShellModel(dock,sw,sh,0,-1,-1,model) && !model.dock.drop);
+            }
+            WmDockWindowDrag(chat,sideW-10,400);
+            CHECK(WmDockWindowDrop(chat,sideW-10,400,500,100) && a.docked && WmDockEntryCount()==2 && a.focused);
+            CHECK(WmDockReturnWindow(chat) && a.x==500 && a.y==100);
+            CHECK(WmDockReturnWindow(floating) && !f.docked && f.x==33 && f.y==44);
+            // On the right, the right edge is the target; a cancel clears it.
+            WmDockSetRight(true);
+            WmDockWindowDrag(floating,2,300);CHECK(!dockSurface(dock));
+            WmDockWindowDrag(floating,int(sw)-2,300);CHECK(dockSurface(dock) && dock.x+int32_t(dock.w)==int32_t(sw));
+            WmDockWindowDragCancel();CHECK(!dockSurface(dock));
+            CHECK(!WmDockWindowDrop(floating,int(sw)-2,300,33,44) && !f.docked); // no drag in progress
+            WmDockSetRight(false);
+        }
         for(Window* w:{&a,&c,&f}){w->vfb=nullptr;WmDestroyWindowById(owner,w->wmId);}
         CHECK(!lockDepth);
         std::free(owner);
@@ -1197,7 +1247,7 @@ int main() {
         CHECK(l.open && l.count==4 && l.selected==2 && l.strip.w==420 && l.strip.h==48 && l.page.y==48 && l.page.h==804);
         CHECK(l.cells[0].x==0 && l.cells[0].w==42 && l.cells[1].x==42 && l.tile.x==84);
         CHECK(l.pin.x==382 && l.pin.w==38 && l.side.x==344 && l.tile.w==420-2*38-3*42 && l.cells[3].x==l.tile.x+l.tile.w);
-        CHECK(l.grip.x==416 && l.grip.w==8 && l.grip.h==852 && !l.right);
+        CHECK(l.grip.x==414 && l.grip.w==12 && l.grip.h==852 && !l.right);
         CHECK(l.close.x+l.close.w==l.tile.x+l.tile.w && l.back.x+l.back.w==l.close.x && l.title.x==l.tile.x+42);
         auto hit=[&](int x,int y){return ChromeDockHitTest(l,x,y);};
         CHECK(hit(5,5).target==ChromeDockTarget::Entry && hit(5,5).index==0);
@@ -1206,11 +1256,11 @@ int main() {
         CHECK(hit(l.back.x+1,1).target==ChromeDockTarget::Return && hit(l.close.x+1,47).target==ChromeDockTarget::Close);
         CHECK(hit(l.pin.x+2,47).target==ChromeDockTarget::Pin && hit(5,48).target==ChromeDockTarget::None);
         CHECK(hit(l.side.x+2,4).target==ChromeDockTarget::Side);
-        CHECK(hit(419,47).target==ChromeDockTarget::Grip && hit(423,400).target==ChromeDockTarget::Grip);
-        CHECK(hit(424,400).target==ChromeDockTarget::None);
+        CHECK(hit(419,47).target==ChromeDockTarget::Grip && hit(425,400).target==ChromeDockTarget::Grip);
+        CHECK(hit(426,400).target==ChromeDockTarget::None);
         // The right edge mirrors the sidebar, the grip and the tab.
         const auto r=ChromeDockLayoutFor(m,1600,852,4,2,true,{0,true});
-        CHECK(r.right && r.sidebar.x==1180 && r.strip.x==1180 && r.page.x==1180 && r.grip.x==1176);
+        CHECK(r.right && r.sidebar.x==1180 && r.strip.x==1180 && r.page.x==1180 && r.grip.x==1174);
         CHECK(r.pin.x==1600-38 && r.cells[0].x==1180);
         const auto rc=ChromeDockLayoutFor(m,1600,852,3,1,false,{0,true});
         CHECK(rc.tab.x==1595 && rc.grip.w==0);
@@ -1222,7 +1272,7 @@ int main() {
         CHECK(ChromeDockWidthFor(DesktopMetric150,2400,540)==360 && ChromeDockWidthFor(m,1600,10)==360);
         // At 200% everything scales; the sidebar never exceeds half the screen.
         const auto big=ChromeDockLayoutFor(DesktopMetric200,3200,1704,1,0,true);
-        CHECK(big.strip.w==840 && big.strip.h==96 && big.tile.w==840-2*76 && big.grip.w==16);
+        CHECK(big.strip.w==840 && big.strip.h==96 && big.tile.w==840-2*76 && big.grip.w==24);
         CHECK(ChromeDockSidebar(m,600,500).w==300);
         // Many entries: the tile keeps an icon cell and both buttons.
         const auto many=ChromeDockLayoutFor(m,1600,852,20,15,true);
