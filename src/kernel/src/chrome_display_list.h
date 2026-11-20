@@ -38,7 +38,7 @@ enum class ChromeGlyph : uint8_t {
     Minimise = 'A', Maximise, Restore, Close, Network, NetworkOff, VolumeHigh, VolumeLow, VolumeMuted,
     Temperature, Power, Restart, Bolt, ChevronRight, ChevronUp, ChevronDown,
     Search, Grid, Inbox, Pin, Trash, Folder, Sliders, Globe, Play, Doc, Brush, Pad, Spark,
-    DockLeft, DockRight, Swap,
+    DockLeft, DockRight, Swap, Disk,
 };
 
 // Text fonts carry degree, middle dot and en dash after ASCII.

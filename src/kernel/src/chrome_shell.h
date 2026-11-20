@@ -8,6 +8,7 @@
 #include "desktop_telemetry.h"
 #include "thermal_sampler.h"
 #include "taskbar_volume.h"
+#include "desktop_disk_popup.h"
 
 #include "launcher_model.h"
 #include "chrome_tray.h"
@@ -241,6 +242,18 @@ DesktopRect ChromeTrayFlyoutPinRect(const ChromeStyle&, DesktopRect);
 // live: the network is connected, or a package temperature is available.
 int ChromeTrayFlyoutHeight(const ChromeStyle& style, bool network, bool live);
 void ChromeBuildTrayFlyout(const ChromeTrayFlyoutModel&, const ChromeStyle&, ChromeDisplayList&);
+
+struct ChromeDiskPopupLayout {
+    DesktopRect panel, pin, rows, previous, next;
+    uint32_t pageRows;
+    int rowHeight;
+};
+
+ChromeDiskPopupLayout ChromeDiskPopupLayoutFor(const ChromeStyle&, DesktopRect anchor, int screenW,
+                                              int taskbarY, uint32_t total);
+void ChromeBuildDiskPopup(const ChromeDiskPopupLayout&, const DesktopDiskPage&, uint64_t readRate,
+                          uint64_t writeRate, bool pinned, int32_t mouseX, int32_t mouseY,
+                          const ChromeStyle&, ChromeDisplayList&);
 
 struct ChromePerformanceHudModel {
     DesktopRect rect;

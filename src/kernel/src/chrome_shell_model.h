@@ -88,6 +88,8 @@ struct ChromeShellModel {
     ChromeLauncherFrame launcherFrame;
     char launcherBuild[64];
     ChromeVolumePopupModel volume;
+    ChromeDiskPopupLayout diskLayout;
+    DesktopDiskPage disk;
     ChromeShellKind kind;
     DesktopRect rect;
     int32_t mouseX, mouseY;
@@ -95,7 +97,7 @@ struct ChromeShellModel {
     uint32_t volumeControl;
     bool launcherOpen, networkConnected, volumeAvailable, agentShown, agentStale;
     bool shutdownActive, prompt, promptRestart, confirmFocused;
-    bool network;
+    bool network, diskPopup;
     bool dockPinned, dockResizing;
     bool popupPinnable, popupPinned;
     char text[128], detail[64]; // launcher header, tooltip or flyout address
@@ -146,8 +148,13 @@ inline void BuildShellModel(const ChromeShellModel& model, const ChromeStyle& st
         ChromeBuildBootSummary(model.boot.View(model.rect), style, list);
         break;
     case ChromeShellKind::TrayFlyout:
-        ChromeBuildTrayFlyout({model.rect, model.network, model.networkConnected, model.text, model.telemetry.View(),
-                               model.popupPinned, model.mouseX, model.mouseY}, style, list);
+        if (model.diskPopup) {
+            const auto& stats = model.telemetry.stats;
+            ChromeBuildDiskPopup(model.diskLayout, model.disk, stats.readBytesPerSecond, stats.writeBytesPerSecond,
+                                 model.popupPinned, model.mouseX, model.mouseY, style, list);
+        } else
+            ChromeBuildTrayFlyout({model.rect, model.network, model.networkConnected, model.text, model.telemetry.View(),
+                                   model.popupPinned, model.mouseX, model.mouseY}, style, list);
         break;
     case ChromeShellKind::AppTrayMenu:
         ChromeBuildAppTrayMenu(model.tray, model.rect, model.mouseX, model.mouseY, style, list,

@@ -103,6 +103,7 @@ struct Vnode {
 int VfsDirectoryPath(Vnode* vn, char* out, uint32_t capacity);
 // Check the retained vnode is the root of this still-published initial mount.
 bool VfsVnodeIsPublishedRoot(Vnode* vn,uint64_t publication,uint8_t pdrv);
+bool VfsVnodeIsPublishedUserVolume(Vnode* vn,uint64_t publication,uint8_t pdrv);
 bool VfsVnodeIsPublishedMember(Vnode* vn,uint64_t publication,uint8_t pdrv);
 extern "C" bool VfsMountReadOnly(const Vnode* vn);
 bool VfsMountNoExec(const Vnode* vn);
@@ -293,10 +294,14 @@ struct VfsMountSnapshot {
     char mountPoint[512];
     char fsType[16];
     bool used, systemInternal;
+    uint64_t publication;
+    uint8_t drive;
 };
 // Current published record count, not a fixed slot/capacity limit.
 uint32_t VfsMountMaxSlots();
 VfsMountSnapshot VfsMountSnapshotAt(uint32_t idx);
+// True only for the currently visible, unprotected attachment at the snapshot's path.
+bool VfsUserVolumeStillPublished(const VfsMountSnapshot&);
 
 // Filesystem driver registry snapshot for /proc/filesystems
 struct VfsFsSnapshot { bool used; char name[16]; };

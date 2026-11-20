@@ -339,12 +339,45 @@ static void WmCaptureVolumePopup(uint32_t screenW, uint32_t screenH, int32_t mou
     snapshot.volume.mouseY = hover.h ? hover.y : -1;
 }
 
-enum class WmTrayFlyout : uint8_t { None, Network, Temperature };
+enum class WmTrayFlyout : uint8_t { None, Network, Temperature, Disk };
 static WmTrayFlyout g_trayFlyout;
+static uint32_t g_diskPopupFirst;
+static int32_t g_diskScrollRemainder;
+
+bool WmDiskFlyoutSelected() { return g_trayFlyout == WmTrayFlyout::Disk; }
+
+static ChromeDiskPopupLayout WmDiskPopupLayout(uint32_t sw, uint32_t sh)
+{
+    const auto bar = GetTaskbarLayout(sw, sh);
+    DesktopRect anchor = bar.metrics[2];
+    if (!anchor.w) {
+        if (!g_taskbarPopupPin.Is(TaskbarPopup::Disk)) return {};
+        // A resize or a hidden tray icon must not leave an inaccessible pin.
+        anchor = {int(sw) - int(WmMetric(16)), bar.y, int(WmMetric(16)), 1};
+    }
+    return ChromeDiskPopupLayoutFor(WmChromeStyle(), anchor, int(sw), bar.y, DesktopDiskVolumeCount());
+}
+
+static void WmStepDiskPopup(const ChromeDiskPopupLayout& layout, int64_t step)
+{
+    g_diskPopupFirst = DesktopDiskPageStep(g_diskPopupFirst, DesktopDiskVolumeCount(), layout.pageRows, step);
+}
+
+bool WmDiskFlyoutScroll(int32_t x, int32_t y, int delta120, uint32_t sw, uint32_t sh)
+{
+    if (!WmDiskFlyoutSelected() || WmTaskbarHidden() || WmLauncherVisible() || WmWindowMenuOpen()) return false;
+    const auto layout = WmDiskPopupLayout(sw, sh);
+    if (!layout.panel.contains(x, y)) return false;
+    const int64_t movement = g_diskScrollRemainder + int64_t(delta120);
+    g_diskScrollRemainder = int32_t(movement % 120);
+    WmStepDiskPopup(layout, -(movement / 120));
+    return true;
+}
 
 static TaskbarPopup WmTrayPopupKind()
 {
     if (g_trayFlyout == WmTrayFlyout::Network) return TaskbarPopup::Network;
+    if (WmDiskFlyoutSelected()) return TaskbarPopup::Disk;
     return g_trayFlyout == WmTrayFlyout::Temperature ? TaskbarPopup::Temperature : TaskbarPopup::None;
 }
 
@@ -394,6 +427,11 @@ bool WmTrayFlyoutPress(int32_t mx, int32_t my, uint32_t sw, uint32_t sh)
     if (panel.contains(mx, my)) {
         if (ChromeTrayFlyoutPinRect(WmChromeStyle(), panel).contains(mx, my))
             g_taskbarPopupPin.Toggle(WmTrayPopupKind());
+        else if (WmDiskFlyoutSelected()) {
+            const auto layout = WmDiskPopupLayout(sw, sh);
+            if (layout.previous.contains(mx, my)) WmStepDiskPopup(layout, -int64_t(layout.pageRows));
+            if (layout.next.contains(mx, my)) WmStepDiskPopup(layout, layout.pageRows);
+        }
         return true;
     }
     const auto l = GetTaskbarLayout(sw, sh);
@@ -404,11 +442,13 @@ bool WmTrayFlyoutPress(int32_t mx, int32_t my, uint32_t sw, uint32_t sh)
         return true;
     }
     const auto next = l.network.contains(mx, my) ? WmTrayFlyout::Network :
-                      l.metrics[6].contains(mx, my) ? WmTrayFlyout::Temperature : WmTrayFlyout::None;
+                      l.metrics[6].contains(mx, my) ? WmTrayFlyout::Temperature :
+                      l.metrics[2].contains(mx, my) ? WmTrayFlyout::Disk : WmTrayFlyout::None;
     if (WmTaskbarPopupPinned()) return next != WmTrayFlyout::None;
     if (!WmTrayFlyoutVisible() && next == WmTrayFlyout::None) return false;
     g_trayFlyout = next == g_trayFlyout ? WmTrayFlyout::None : next;
     if (WmTrayFlyoutVisible()) {
+        if (WmDiskFlyoutSelected()) g_diskPopupFirst = g_diskScrollRemainder = 0;
         if (WmTrayFlyoutLayout(sw, sh).w <= 0) {
             WmTrayFlyoutClose();
             return true;
@@ -432,6 +472,7 @@ static bool WmTrayFlyoutLive()
 static DesktopRect WmTrayFlyoutLayout(uint32_t sw, uint32_t sh)
 {
     if (!WmTrayFlyoutVisible() || WmTaskbarHidden()) return {};
+    if (WmDiskFlyoutSelected()) return WmDiskPopupLayout(sw, sh).panel;
     const auto l = GetTaskbarLayout(sw, sh);
     const auto anchor = g_trayFlyout == WmTrayFlyout::Network ? l.network : l.metrics[6];
     const int gap = WmMetric(ChromeShellMetrics::PanelMargin);
@@ -547,8 +588,31 @@ static void WmCapturePopupPin(DesktopRect pin, int32_t mx, int32_t my, bool pinn
     snapshot.popupPinned = pinned;
 }
 
-static void WmCaptureTrayFlyout(uint32_t sw, uint32_t sh, int32_t mx, int32_t my, ChromeShellModel& snapshot)
+static void WmCaptureTrayFlyout(const WmShellSurface& surface, uint32_t sw, uint32_t sh,
+                               int32_t mx, int32_t my, ChromeShellModel& snapshot)
 {
+    if (WmDiskFlyoutSelected()) {
+        const auto layout = WmDiskPopupLayout(sw, sh);
+        // The worker can adopt a new volume count between choosing the
+        // surface and building its model. Let the next frame use its geometry.
+        if (!layout.pageRows || layout.panel.x != surface.x || layout.panel.y != surface.y ||
+            uint32_t(layout.panel.w) != surface.w || uint32_t(layout.panel.h) != surface.h) return;
+        snapshot.kind = ChromeShellKind::TrayFlyout;
+        snapshot.rect = layout.panel;
+        snapshot.diskLayout = layout;
+        snapshot.diskPopup = true;
+        g_diskPopupFirst = DesktopDiskReadPage(g_diskPopupFirst, layout.pageRows, snapshot.disk);
+        snapshot.popupPinned = g_taskbarPopupPin.Is(TaskbarPopup::Disk);
+        const auto hover = layout.pin.contains(mx, my) ? layout.pin :
+                           layout.previous.contains(mx, my) ? layout.previous :
+                           layout.next.contains(mx, my) ? layout.next : DesktopRect{};
+        snapshot.mouseX = hover.w ? hover.x : -1;
+        snapshot.mouseY = hover.h ? hover.y : -1;
+        const auto stats = WmDesktopTelemetryRead();
+        snapshot.telemetry.stats.readBytesPerSecond = WmShellRate(stats.readBytesPerSecond);
+        snapshot.telemetry.stats.writeBytesPerSecond = WmShellRate(stats.writeBytesPerSecond);
+        return;
+    }
     const auto rect = WmTrayFlyoutLayout(sw, sh);
     if (rect.w <= 0) return;
     const bool network = g_trayFlyout == WmTrayFlyout::Network;
@@ -670,10 +734,6 @@ static void WmCaptureTaskbar(uint32_t screenW, uint32_t screenH, uint64_t uptime
     auto& telemetry = snapshot.telemetry;
     if (layout.metrics[0].w > 0) telemetry.stats.cpuPercent = source.stats.cpuPercent;
     if (layout.metrics[1].w > 0) telemetry.stats.memoryPercent = source.stats.memoryPercent;
-    if (layout.metrics[2].w > 0) {
-        telemetry.stats.readBytesPerSecond = WmShellRate(source.stats.readBytesPerSecond);
-        telemetry.stats.writeBytesPerSecond = WmShellRate(source.stats.writeBytesPerSecond);
-    }
     if (layout.metrics[3].w > 0) {
         telemetry.stats.downBytesPerSecond = WmShellRate(source.stats.downBytesPerSecond);
         telemetry.stats.upBytesPerSecond = WmShellRate(source.stats.upBytesPerSecond);
@@ -702,7 +762,10 @@ static bool WmTrayTooltip(uint32_t screenW, uint32_t screenH, int32_t mx, int32_
         WmInteractiveHudLayout(screenW, screenH).w > 0) return false;
     const TaskbarLayout l = GetTaskbarLayout(screenW, screenH);
     const WmRect* anchor = nullptr;
-    if (l.volume.contains(mx, my)) {
+    if (l.metrics[2].contains(mx, my)) {
+        anchor = &l.metrics[2];
+        WmStrCopy(text, "Disk", sizeof(text));
+    } else if (l.volume.contains(mx, my)) {
         anchor = &l.volume;
         TaskbarVolumeTooltip(text, g_volumeControl, g_volumeAvailable);
     } else if (l.metrics[6].w && l.metrics[6].contains(mx, my)) {

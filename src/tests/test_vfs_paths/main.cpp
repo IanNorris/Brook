@@ -1081,6 +1081,10 @@ int main(){
     mounts[0].root.children={{"dir",&directory},{"file",&file},{"namespace-target",&namespaceTarget}};directory.children={{"marker",&marker},{"absolute",&link}};
     auto* rootNode=VfsOpen("/");auto* childNode=VfsOpen("/dir");
     assert(rootNode && childNode && VfsVnodeIsPublishedRoot(rootNode,publication,0));
+    assert(VfsVnodeIsPublishedUserVolume(rootNode,publication,0));
+    const auto diskRoot = VfsMountSnapshotAt(0);
+    assert(diskRoot.publication == publication && diskRoot.drive == 0 && !diskRoot.systemInternal);
+    assert(VfsUserVolumeStillPublished(diskRoot));
     assert(!VfsVnodeIsPublishedRoot(childNode,publication,0));
     assert(!VfsVnodeIsPublishedRoot(rootNode,publication+1,0));
     assert(!VfsVnodeIsPublishedRoot(rootNode,publication,1));
@@ -1091,9 +1095,13 @@ int main(){
         assert(VfsMountConfiguredWithPublication("/dir","objects",0,0,&childPublication));
         auto* mountedNode=VfsOpen("/dir");assert(mountedNode);
         assert(VfsVnodeIsPublishedRoot(mountedNode,childPublication,0));
+        const auto liveDisk = VfsMountSnapshotAt(0);
+        assert(liveDisk.publication==childPublication && VfsUserVolumeStillPublished(liveDisk));
         auto mountedPath=resolve(root,root,"/dir");
         assert(!VfsMountNamespaceDetach(&g_initialNamespace,mountedPath));
         assert(!VfsVnodeIsPublishedRoot(mountedNode,childPublication,0));
+        assert(!VfsVnodeIsPublishedUserVolume(mountedNode,childPublication,0));
+        assert(!VfsUserVolumeStillPublished(liveDisk));
         VfsPathRelease(mountedPath);VfsClose(mountedNode);VfsDrainMountCleanup();
     }
     testProcessContexts(root,held);
@@ -1496,6 +1504,15 @@ int main(){
     // including across a bind, without granting data through an old handle.
     uint64_t bootPublication=0;
     assert(VfsMountConfiguredWithPublication("/ns-target","objects",2,MountSystemInternal,&bootPublication));
+    Vnode* protectedRoot = VfsOpen("/ns-target", VFS_O_METADATA);
+    assert(protectedRoot && VfsVnodeIsPublishedRoot(protectedRoot,bootPublication,2));
+    assert(!VfsVnodeIsPublishedUserVolume(protectedRoot,bootPublication,2));
+    auto protectedDisk = VfsMountSnapshotAt(0);
+    assert(protectedDisk.publication == bootPublication && protectedDisk.systemInternal);
+    assert(!VfsUserVolumeStillPublished(protectedDisk));
+    protectedDisk.systemInternal = false; // A stale cached view cannot hide the current mount classification.
+    assert(!VfsUserVolumeStillPublished(protectedDisk));
+    VfsClose(protectedRoot);
     assert(bootPublication);
     auto system=resolve(stableRoot,stableRoot,"/ns-target");
     auto rows=infoRows(&g_initialNamespace,stableRoot);
