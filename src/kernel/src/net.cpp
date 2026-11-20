@@ -1521,22 +1521,24 @@ void NetInit()
     SerialPuts("net: initialised\n");
 }
 
-void NetRegisterIf(NetIf* nif)
+bool NetRegisterIf(NetIf* nif)
 {
-    if(!nif || !nif->transmit)return;
+    if(!nif || !nif->transmit)return false;
     uintptr_t callbacks[4];uint32_t callbackCount=0;
     callbacks[callbackCount++]=reinterpret_cast<uintptr_t>(nif->transmit);
     if(nif->poll)callbacks[callbackCount++]=reinterpret_cast<uintptr_t>(nif->poll);
     if(nif->snapshot)callbacks[callbackCount++]=reinterpret_cast<uintptr_t>(nif->snapshot);
     if(nif->tryTransmit)callbacks[callbackCount++]=reinterpret_cast<uintptr_t>(nif->tryTransmit);
-    if(!ModuleRetainAddresses(callbacks,callbackCount)){
-        SerialPuts("net: interface callback provider unavailable\n");return;
-    }
     const uint64_t viewFlags=IrqSpinLockAcquire(&g_interfaceViewLock);
     if (g_netIfCount >= NET_MAX_IFS) {
         IrqSpinLockRelease(&g_interfaceViewLock,viewFlags);
         SerialPrintf("net: too many interfaces (max %u), ignoring\n", NET_MAX_IFS);
-        return;
+        return false;
+    }
+    if(!ModuleRetainAddresses(callbacks,callbackCount)){
+        IrqSpinLockRelease(&g_interfaceViewLock,viewFlags);
+        SerialPuts("net: interface callback provider unavailable\n");
+        return false;
     }
     uint32_t idx = g_netIfCount;
     g_netIfs[idx] = nif;
@@ -1548,6 +1550,7 @@ void NetRegisterIf(NetIf* nif)
                  idx,
                  nif->mac.b[0], nif->mac.b[1], nif->mac.b[2],
                  nif->mac.b[3], nif->mac.b[4], nif->mac.b[5]);
+    return true;
 }
 
 uint32_t NetIfCount() { return __atomic_load_n(&g_netIfCount,__ATOMIC_ACQUIRE); }

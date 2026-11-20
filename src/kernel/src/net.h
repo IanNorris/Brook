@@ -208,7 +208,7 @@ void NetInit();
 void NetConfigureBoot();
 
 // Register a network interface. Up to NET_MAX_IFS (4) may be registered.
-void NetRegisterIf(NetIf* nif);
+bool NetRegisterIf(NetIf* nif);
 
 // Called by the NIC driver when a frame arrives.
 void NetReceive(NetIf* nif, const void* frame, uint32_t len);

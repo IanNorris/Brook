@@ -40,6 +40,11 @@ add_driver_module(virtio_net
     EXTRA_FLAGS "-mgeneral-regs-only" "-mno-sse" "-mno-sse2" "-mfpmath="
 )
 
+add_driver_module(e1000
+    "${BROOK_ROOT}/src/drivers/e1000/e1000_mod.cpp"
+    EXTRA_FLAGS "-mgeneral-regs-only" "-mno-sse" "-mno-sse2" "-mfpmath="
+)
+
 add_driver_module(virtio_rng
     "${BROOK_ROOT}/src/drivers/virtio_rng/virtio_rng_mod.cpp"
 )

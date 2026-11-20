@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import socket
 import struct
 import subprocess
@@ -20,11 +21,62 @@ ROOT = Path(__file__).resolve().parents[1]
 HELPERS = ("HWBULK.ELF", "HWBULKZ.ELF", "HWUPDATE.ELF", "HWUPSYS.ELF", "HWSTORE.ELF", "HWSTAGE.ELF")
 CHUNK_BYTES = 65536
 PASS_MARKER = "GUARDED_BRIDGE_V3_RECEIVERS_PASS"
+INTEL_NIC_DEVICE_IDS = {"e1000": 0x100E, "e1000-82545em": 0x100F, "e1000e": 0x10D3}
+NIC_PASS_MARKER = "GUARDED_BRIDGE_V3_NIC_PASS"
 
 
 def digest(path):
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def make_nic_disk(output, recovery, manifest):
+    """Start with an empty GPT and use only volumes named by the QEMU fixture."""
+    require_keyless_image(recovery)
+    identity = bytes.fromhex(manifest["guard_identity"])
+    if len(identity) != 48 or (manifest["data_first"], manifest["data_sectors"]) != (133120, 126976):
+        raise ValueError("Unexpected guarded QEMU disk identity")
+    volume = subprocess.check_output(
+        ["mtype", "-i", recovery, "::/ETC/ahci-boot-volume"], text=True
+    ).splitlines()
+    if (len(volume) != 4 or volume[:2] != ["BRKESP1", identity[:16].hex()] or
+            volume[3] != "2048,131072"):
+        raise ValueError("Unexpected guarded QEMU boot volume")
+    disk_guid = uuid.UUID(bytes_le=identity[:16])
+    esp_guid = uuid.UUID(bytes_le=bytes.fromhex(volume[2]))
+    ext2_guid = uuid.UUID(bytes_le=identity[16:32])
+    ext2_uuid = uuid.UUID(bytes=identity[32:])
+    esp = output.with_suffix(".fat")
+    data = output.with_suffix(".ext2")
+    for path, sectors in ((output, 262144), (esp, 131072), (data, 126976)):
+        with path.open("xb") as stream:
+            stream.truncate(sectors * 512)
+    layout = f"""label: gpt
+label-id: {disk_guid}
+unit: sectors
+first-lba: 2048
+last-lba: 262110
+
+start=2048,size=131072,type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B,uuid={esp_guid}
+start=133120,size=126976,type=0FC63DAF-8483-4772-8E79-3D69D8477DE4,uuid={ext2_guid}
+"""
+    subprocess.run(["sfdisk", output], input=layout, text=True, check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(["mkfs.fat", "-F", "32", "-s", "1", esp], check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(["mke2fs", "-q", "-F", "-t", "ext2", "-b", "4096", "-I", "128", "-N", "1024",
+                    "-m", "0", "-O", "none,filetype,sparse_super,large_file",
+                    "-U", str(ext2_uuid), data], check=True)
+    for directory in ("EFI", "EFI/BOOT", "KERNEL", "RECOVERY"):
+        subprocess.run(["mmd", "-i", esp, "::/" + directory], check=True)
+    subprocess.run(["mcopy", "-i", esp, "-", "::/BROOK.CFG"], check=True,
+                   input=b"TARGET=KERNEL\\BROOK.ELF\nRECOVERY_MENU=1\nDISPLAY_WIDTH=1024\nDISPLAY_HEIGHT=768\n")
+    require_keyless_image(esp)
+    with output.open("r+b") as disk:
+        for start, partition in ((2048, esp), (133120, data)):
+            disk.seek(start * 512)
+            with partition.open("rb") as source:
+                shutil.copyfileobj(source, disk)
+            partition.unlink()
+    return digest(output)
 
 
 def prepare(original, fixture, expected, seed):
@@ -121,7 +173,87 @@ def check_maintenance_receiver(bridge, output, session, boot_id, port, seed, sto
     return {"helper": helper, "authenticated_end": True, "safe_destination_refusal": reply["code"]}
 
 
-def run(output, registry, ports, seed, expected):
+def run_nic_smoke(bridge, output, session, boot_id, bulk_port, model, module_sha256):
+    """Verify the attached NIC, a separate guest job and a nonblank frame."""
+    from hardware_bulk_workflow import BulkRun
+    from hardware_update_workflow import UpdateRun
+
+    doctor = bridge.doctor(session)
+    if (doctor.get("probe_stage") != "verified" or doctor.get("reachable") is not True or
+            doctor.get("identity_matches") is not True or doctor["guest_boot_id"] != boot_id or
+            not doctor["capabilities"]["command_jobs"] or not doctor["capabilities"]["frame_capture"]):
+        raise RuntimeError("Intel NIC did not support a verified v3 doctor, jobs and frame capture")
+    (output / "intel-nic-doctor.json").write_text(json.dumps(doctor, indent=2) + "\n")
+    cursor = 0
+    network = []
+    root_bridges = []
+    while True:
+        page = bridge.command(session, f"bridge hardware pci {cursor} 8")
+        if page.get("pci_inventory_api") != 1 or page.get("truncated") is not False:
+            raise RuntimeError("Intel NIC PCI inventory is unavailable")
+        network.extend(device for device in page["devices"] if device["class"] == 2)
+        root_bridges.extend(device for device in page["devices"]
+                            if device["class"] == 6 and device["subclass"] == 4 and device["bus"] == 0)
+        new_cursor = page["next_cursor"]
+        if new_cursor == page["total"]:
+            break
+        if not cursor < new_cursor < page["total"] or page["total"] > 256:
+            raise RuntimeError("Invalid QEMU PCI inventory pagination")
+        cursor = new_cursor
+    matching = [device for device in network if device["vendor_id"] == 0x8086 and
+                device["device_id"] == INTEL_NIC_DEVICE_IDS[model]]
+    if len(network) != 1 or len(matching) != 1:
+        raise RuntimeError(f"Expected only PCI NIC {model}; got {network!r}")
+    nic = matching[0]
+    if not nic["bus"] or len(root_bridges) != 1:
+        raise RuntimeError(f"Expected {model} behind a PCI bridge; got bus {nic['bus']} and {root_bridges!r}")
+    print(f"INTEL_NIC_PCI {model} {nic['bus']:02x}:{nic['device']:02x}.{nic['function']} secondary_bus={nic['bus']}",
+          flush=True)
+
+    # This is distinct from the transfer worker and runs under the desktop uid.
+    transaction = uuid.uuid4().hex
+    bridge.guest_run(session, transaction, ["/boot/HWSTATUS.ELF"], cwd="/tmp", uid=1000, wait_s=2)
+    job = UpdateRun(bridge, output).wait_job(session, transaction,
+                                            lambda result: result.get("state") == "completed")
+    payload = doctor.get("guest", {}).get("payload_id")
+    job_lines = job.get("stdout", {}).get("text", "").splitlines()
+    if (not payload or job.get("session") != session or job.get("guest_boot_id") != boot_id or
+            job.get("operation_id") != transaction or job.get("exit", {}).get("code") != 0 or
+            f"HARDWARE_PAYLOAD_ID {payload}" not in job_lines or
+            not any(line.startswith("HARDWARE_NETWORK_READY ") for line in job_lines)):
+        raise RuntimeError("Authenticated Intel NIC guest job did not complete with the expected output")
+    (output / "intel-nic-guest-job.json").write_text(json.dumps(job, indent=2) + "\n")
+
+    frame = BulkRun(bridge, output / "intel-nic-frame").execute(
+        session, None, "framez", port=bulk_port, keep_raw=True
+    )
+    transfer = frame["transfer"]
+    raw = Path(transfer["raw_artifact_path"])
+    pixels = raw.read_bytes()
+    pixel_count = frame["frame"]["width"] * frame["frame"]["height"]
+    if (frame["state"] != "completed" or frame["guest_boot_id"] != boot_id or
+            len(pixels) != pixel_count * 4 or raw.stat().st_size != transfer["bytes"] or
+            digest(raw) != transfer["sha256"] or digest(Path(frame["artifact_path"])) != frame["artifact_sha256"]):
+        raise RuntimeError("Intel NIC frame data differs from its authenticated capture receipt")
+    sample_step = max(1, pixel_count // 4096)
+    colours = len({pixels[i*4:i*4+3] for i in range(0, pixel_count, sample_step)})
+    if colours < 2:
+        raise RuntimeError("Intel NIC frame contains only a single colour")
+    return {
+        "qemu_nic_model": model, "pci": nic, "pci_bridge": root_bridges[0],
+        "module_sha256": module_sha256,
+        "auth_mode": "v3", "boot_id": boot_id, "doctor_verified": True,
+        "doctor_receipt": "intel-nic-doctor.json",
+        "guest_job": "intel-nic-guest-job.json",
+        "frame_receipt": "intel-nic-frame/receipt.json",
+        "frame_png": "intel-nic-frame/screenshot.png",
+        "frame_png_sha256": frame["artifact_sha256"], "frame_bytes": len(pixels),
+        "frame_raw_sha256": transfer["sha256"], "frame_sample_colours": colours,
+        "frame": frame["frame"],
+    }
+
+
+def run(output, registry, ports, seed, expected, nic_model=None, module_sha256=None):
     command_port, bulk_port, update_port, store_port = ports
     sys.path.insert(0, str(ROOT / "tools/vm_bridge"))
     from guest_transport import exchange, exchange_v3
@@ -218,5 +350,9 @@ def run(output, registry, ports, seed, expected):
         "getz_receipt": "bulk-getz/receipt.json",
         "job_receipts_match_binary": True,
     }
+    if nic_model:
+        evidence["intel_nic"] = run_nic_smoke(bridge, output, session, attachment["guest_boot_id"],
+                                              bulk_port, nic_model, module_sha256)
+        print(NIC_PASS_MARKER, nic_model, flush=True)
     (output / "bridge-v3-qa.json").write_text(json.dumps(evidence, indent=2) + "\n")
     print(PASS_MARKER, flush=True)
