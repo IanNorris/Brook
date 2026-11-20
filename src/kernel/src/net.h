@@ -439,6 +439,9 @@ int  SockRecvFrom(int sockIdx, void* buf, uint32_t len,
 int  SockSend(int sockIdx, const void* buf, uint32_t len);
 // Synchronous local-only sends share the caller's absolute monotonic deadline.
 int  SockSendUntil(int sockIdx, const void* buf, uint32_t len, uint64_t deadline);
+// Returns bytes ACKed by the given absolute monotonic deadline, or a negative
+// errno. Remote submission requires a driver's nonblocking transmit callback.
+int  SockSendBefore(int sockIdx, const void* buf, uint32_t len, uint64_t deadline);
 int  SockSendUser(int sockIdx, uint64_t address, uint32_t len);
 struct TcpSendVector { uint64_t base, length; };
 // Descriptors are a stable kernel snapshot; payload pointers address user memory.

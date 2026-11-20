@@ -2585,6 +2585,75 @@ int main() {
         currentProcess = nullptr;
         delete sender;
     }
+    {
+        NetIf primary{}, receiving{};
+        primary.ipAddr = Ipv4Addr(192, 0, 2, 2);
+        receiving.ipAddr = Ipv4Addr(198, 51, 100, 2);
+        primary.netmask = receiving.netmask = Ipv4Addr(255, 255, 255, 0);
+        primary.transmit = receiving.transmit = captureFrame;
+        receiving.tryTransmit = tryCaptureFrame;
+        const uint32_t peer = Ipv4Addr(198, 51, 100, 3);
+        const MacAddr peerMac{{8, 9, 10, 11, 12, 13}};
+        g_netIf = g_netIfs[0] = &primary;
+        g_netIfs[1] = &receiving;
+        g_netIfCount = 2;
+
+        auto* sender = new Process{};
+        sender->refCount = 1;
+        currentProcess = sender;
+        enum class SendCase { ResolvedAfterBusy, ResolveThenSend, ArpTimeout, AckTimeout, ZeroWindow, MissingCallback };
+        for (auto scenario : {SendCase::ResolvedAfterBusy, SendCase::ResolveThenSend, SendCase::ArpTimeout,
+                              SendCase::AckTimeout, SendCase::ZeroWindow, SendCase::MissingCallback}) {
+            const int socket = create();
+            setupTcp(socket);
+            auto& stream = g_sockets[socket];
+            stream.localIp = receiving.ipAddr;
+            stream.remoteIp = peer;
+            stream.tcpSndWnd = scenario == SendCase::ZeroWindow ? 0 : 65535;
+            ticks = 100;
+            g_arpTable.Flush();
+            if (scenario != SendCase::ResolveThenSend && scenario != SendCase::ArpTimeout)
+                ArpCacheInsert(peer, peerMac);
+            const bool shouldSend = scenario == SendCase::ResolvedAfterBusy || scenario == SendCase::ResolveThenSend;
+            injectTcpAck = shouldSend;
+            acknowledgeDataCount = shouldSend ? 1 : 0;
+            injectReplyDuringTransmit = scenario == SendCase::ResolveThenSend;
+            tryTransmitBusy = scenario == SendCase::ResolvedAfterBusy ? 1 : 0;
+            tryTransmitCalls = frameTransmitCalls = 0;
+            if (scenario == SendCase::MissingCallback) receiving.tryTransmit = nullptr;
+
+            const char banner[] = "test";
+            const uint64_t deadline = ticks + 41;
+            const int result = SockSendBefore(socket, banner, sizeof(banner), deadline);
+            if (shouldSend) {
+                assert(result == sizeof(banner) && ticks < deadline && tryTransmitCalls == 2);
+                assert(frameTransmitCalls == (scenario == SendCase::ResolveThenSend ? 2u : 1u));
+                assert(stream.tcpSndUna == stream.tcpSndNxt);
+                const auto* ethernet = reinterpret_cast<const EthHeader*>(capturedFrame);
+                const auto* packet = reinterpret_cast<const Ipv4Header*>(capturedFrame + sizeof(EthHeader));
+                assert(!memcmp(ethernet->dst.b, peerMac.b, sizeof(peerMac.b)));
+                assert(packet->srcIp == receiving.ipAddr && packet->dstIp == peer);
+            } else if (scenario == SendCase::MissingCallback) {
+                assert(result == -95 && !frameTransmitCalls && !tryTransmitCalls && ticks < deadline);
+            } else {
+                assert(result == -110 && ticks == deadline);
+                const unsigned expected = scenario == SendCase::ZeroWindow ? 0 : 1;
+                assert(tryTransmitCalls == expected && frameTransmitCalls == expected);
+                if (scenario == SendCase::ZeroWindow)
+                    assert(stream.tcpSndNxt == 10 && stream.tcpState == TcpState::Established);
+                else
+                    assert(stream.tcpState == TcpState::Closed);
+            }
+            assert(g_arpTable.QueuedFrames() == 0);
+            SockUnrefUntil(socket, ticks);
+        }
+        injectTcpAck = false;
+        g_arpTable.Flush();
+        currentProcess = nullptr;
+        delete sender;
+        g_netIf = g_netIfs[0] = g_netIfs[1] = nullptr;
+        g_netIfCount = 0;
+    }
     assert(allocations == frees && g_socketRxBytes == 0);
     std::puts("socket lifetime: PASS");
 }

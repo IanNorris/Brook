@@ -12,6 +12,8 @@
 #include "user_copy.h"
 #include "syscall_internal.h"
 #include "syscall_handlers.h"
+#include "strong_random.h"
+#include "../../shared/brook_random.h"
 
 namespace brook {
 
@@ -139,11 +141,17 @@ int64_t sys_prlimit64(uint64_t pid, uint64_t resource, uint64_t newlimitAddr,
 // sys_getrandom (318) — RDRAND-backed random number generation
 // ---------------------------------------------------------------------------
 
-int64_t sys_getrandom(uint64_t bufAddr, uint64_t count, uint64_t,
+int64_t sys_getrandom(uint64_t bufAddr, uint64_t count, uint64_t flags,
                         uint64_t, uint64_t, uint64_t)
 {
     if (count > 256) count = 256; // cap per-call to avoid long stalls
     uint8_t buf[256];
+    if (flags & BROOK_GRND_STRONG_ONLY) {
+        if (flags != BROOK_GRND_STRONG_ONLY) return -EINVAL;
+        if (!StrongRandomBytes(buf, static_cast<uint32_t>(count))) return -EAGAIN;
+        if (!count) return 0;
+        return CopyToUser(bufAddr, buf, count) ? static_cast<int64_t>(count) : -EFAULT;
+    }
 
     uint64_t filled = 0;
     while (filled < count)
