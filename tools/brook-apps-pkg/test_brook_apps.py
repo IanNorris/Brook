@@ -78,7 +78,8 @@ class Index(Env):
 
     def test_build_and_write(self):
         self.desktop('chat.desktop', 'Name=Chat\tApp\nExec=brook-chromium --app=https://chat.example/\n'
-                     'Icon=chat\nCategories=Network;Chat;\nStartupWMClass=chrome-chat.example__-Default\n')
+                     'Icon=chat\nCategories=Network;Chat;\nStartupWMClass=chrome-chat.example__-Default\n'
+                     'X-Brook-WebApp=https://chat.example/\n')
         self.desktop('hidden.desktop', 'Name=H\nExec=gimp\nNoDisplay=true\n')
         self.desktop('bad.desktop', 'Name=Bad\nExec=rm -rf /\n')
         self.desktop('link.desktop', 'Type=Link\nName=L\nExec=gimp\n')
@@ -86,7 +87,7 @@ class Index(Env):
         self.png(self.root / 'share/icons/hicolor/256x256/apps/chat.png', 256)
         lines, icons, skipped = brook_apps.build_index(profile_bin=self.bin)
         self.assertEqual(lines, [f'Chat App\t{self.bin}/brook-chromium --app=https://chat.example/\t'
-                                 'chrome-chat.example__-default.rgba\tNetwork;Chat;\tchrome-chat.example__-Default'])
+                                 'chrome-chat.example__-default.rgba\tNetwork;Chat;X-Brook-WebApp;\tchrome-chat.example__-Default'])
         self.assertEqual([Path(p).name for p, _ in skipped], ['bad.desktop'])
         data = icons['chrome-chat.example__-default.rgba']
         self.assertEqual(len(data), 24 * 24 * 4)

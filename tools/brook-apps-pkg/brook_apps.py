@@ -87,6 +87,7 @@ def parse_desktop(path):
     return {'name': name, 'exec': exec_line, 'icon': e.get('Icon', '').strip(),
             'categories': e.get('Categories', '').strip(),
             'wmclass': e.get('StartupWMClass', '').strip(),
+            'webapp': e.get('X-Brook-WebApp', '').strip(),
             'id': Path(path).stem}
 
 
@@ -200,8 +201,12 @@ def build_index(dirs=None, profile_bin=PROFILE_BIN):
                 if data:
                     icon_file = safe_name(app_id) + '.rgba'
                     icons[icon_file] = data
-            lines.append('\t'.join([clean_field(entry['name']), command, icon_file,
-                                    clean_field(entry['categories']), app_id]))
+            categories = clean_field(entry['categories'])
+            if entry['webapp']:
+                # The desktop titles web-app windows with the app's name:
+                # Chromium titles --app windows with the bare host.
+                categories = (categories + ';' if categories and not categories.endswith(';') else categories) + 'X-Brook-WebApp;'
+            lines.append('\t'.join([clean_field(entry['name']), command, icon_file, categories, app_id]))
     return lines, icons, skipped
 
 
