@@ -20,6 +20,7 @@ This prepares private files only. Deployment is separate (scripts/hardware_updat
 the target to already contain the runtime store paths listed in the manifest.
 """
 import argparse, hashlib, json, os, re, subprocess, sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from bridge_operator_policy import validate_operator_policy
@@ -85,6 +86,26 @@ def bridge_compression():
                  cwd=ROOT, stdout=subprocess.PIPE, text=True)
     headers, archive = map(Path, result.stdout.splitlines())
     return ['-DBROOK_BULK_ZLIB', '-I', headers / 'include'], archive / 'lib/libz.a'
+
+
+def build_provenance(commit, dirty, source_date_epoch):
+    if not re.fullmatch(r'(?:[0-9a-f]{40}|[0-9a-f]{64})', commit):
+        raise ValueError('expected a full Git commit for initrd assembly')
+    source = 'clock'
+    if source_date_epoch is None:
+        stamp = datetime.now(timezone.utc)
+    else:
+        if not re.fullmatch(r'[0-9]+', source_date_epoch):
+            raise ValueError('SOURCE_DATE_EPOCH must be a non-negative integer')
+        try:
+            stamp = datetime.fromtimestamp(int(source_date_epoch), timezone.utc)
+        except (ValueError, OverflowError, OSError) as error:
+            raise ValueError('SOURCE_DATE_EPOCH is outside the supported date range') from error
+        source = 'source-date-epoch'
+    timestamp = stamp.replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+    marker = f"BROOK_BUILD_V1\n{commit}\n{timestamp}\n{source}\n{'dirty' if dirty else 'clean'}\n"
+    fields = {'assembly_commit': commit, 'assembled_utc': timestamp, 'time_source': source, 'dirty': dirty}
+    return marker.encode('ascii'), fields
 
 
 def build_boot_services():
@@ -279,6 +300,14 @@ def main():
                ['tools/hardware_store_receiver.cpp', 'tools/hardware_store_transaction.cpp',
                 'tools/hardware_store_validate.cpp'])
 
+    # Record assembly provenance inside the initrd and check the exact bytes
+    # before hashing the completed image. These fields describe the builder.
+    provenance, assembly = build_provenance(commit, dirty, os.environ.get('SOURCE_DATE_EPOCH'))
+    image = a.output / 'INITRD.IMG'
+    run(['mcopy', '-o', '-i', image, '-', '::/ETC/build-provenance'], input=provenance)
+    if subprocess.check_output(['mtype', '-i', str(image), '::/ETC/build-provenance']) != provenance:
+        sys.exit('initrd build provenance readback mismatch')
+
     # 4. Independent verification
     verify = [sys.executable, ROOT / 'scripts/verify_guarded_desktop_candidate.py', '--candidate', a.output,
               '--source', source, '--reference', source, '--build', build, '--expected-kernel', sha(kernel),
@@ -304,7 +333,7 @@ def main():
         'payload_id': a.payload_id, 'commit': commit, 'dirty': dirty, 'module_abi': abi,
         'kernel_options': options, 'kernel_console_hidden': not a.show_kernel_console, 'kernel_sha256': sha(a.output / 'kernel.elf'),
         'initrd_sha256': sha(a.output / 'INITRD.IMG'), 'source_initrd_sha256': SOURCE_INITRD_SHA,
-        'packages': packages,
+        'initrd_assembly': assembly, 'packages': packages,
         'bulk_helper': {'source': 'tools/hardware_bulk.c', 'sha256': compiled_helpers['HWBULK.ELF']},
         'update_helpers': {name: {'source': 'tools/hardware_update.c', 'sha256': compiled_helpers[name]}
                            for name in ('HWUPDATE.ELF', 'HWUPSYS.ELF')},

@@ -331,7 +331,8 @@ bool WmSetTheme(uint32_t legacyPalette)
 
 // Hardware payload name for the desktop build label, read once at activation
 // (empty on QEMU and other images without /etc/hardware-payload-id).
-static char g_buildPayloadId[64];
+static char g_buildPayloadId[BuildIdCapacity];
+static DesktopBuildProvenance g_buildProvenance;
 
 // Startup I/O runs in the shell's activation path, never during rendering.
 // Accept only a complete bounded file and an exact supported numeric ID.
@@ -342,6 +343,7 @@ static void WmRestoreTheme()
     if (HardwarePayloadIdRead(g_buildPayloadId, sizeof(g_buildPayloadId)))
         SerialPrintf("WM: build label payload %s\n", g_buildPayloadId);
     else g_buildPayloadId[0] = 0;
+    HardwareBuildProvenanceRead(g_buildProvenance);
     BrookThemeSettings themeSettings=brook_theme_settings_init();
     uint32_t selectedScale = 100;
     uint32_t appearance=WmGetAppearance();

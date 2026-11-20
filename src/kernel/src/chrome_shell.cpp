@@ -187,10 +187,10 @@ ChromeTaskbarLayout ChromeTaskbarLayoutFor(const ChromeStyle& s, uint32_t screen
         // the full detail.
         unsigned length = 0;
         while (buildText[length] && length + 1 < sizeof(l.buildText)) ++length;
-        auto reserveBuild = [&](unsigned count) {
+        auto reserveBuild = [&](const char* value, unsigned count) {
             if (!count) return false;
             char text[sizeof(l.buildText)];
-            for (unsigned i = 0; i < count; ++i) text[i] = buildText[i];
+            for (unsigned i = 0; i < count; ++i) text[i] = value[i];
             text[count] = 0;
             const int width = s.TextWidth(text, CF::Mono) + 2 * pad;
             if (width > Px(s, 188) || !reserve(l.build, width, gap)) return false;
@@ -204,7 +204,9 @@ ChromeTaskbarLayout ChromeTaskbarLayoutFor(const ChromeStyle& s, uint32_t screen
             if (digits) dated = length - 9;
         }
         for (unsigned i = 0; i < length && !plus; ++i) if (buildText[i] == '+') plus = i;
-        if (!reserveBuild(length) && !(dated != length && reserveBuild(dated))) reserveBuild(plus);
+        if (!reserveBuild(buildText, length) && !(dated != length && reserveBuild(buildText, dated)) &&
+            !reserveBuild(buildText, plus))
+            reserveBuild("Build", 5);
     }
     if (compactHud) reserve(l.hud, CompactHudWidth(s));
     // Diagnostics, right to left: APP and COMP (label and graph over p95),
@@ -549,9 +551,11 @@ void ChromeBuildTaskbar(const ChromeTaskbarModel& m, const ChromeStyle& s, Chrom
         if (size <= l.next.w)
             dl.Glyph(ChromeGlyph::ChevronRight, l.next.x + (l.next.w - size) / 2, l.next.y + (l.next.h - size) / 2, p.taskText);
     }
-    if (l.build.w > 0)
+    if (l.build.w > 0) {
+        target(l.build, false);
         dl.Text(CF::Mono, l.build.x + Px(s, ChromeTaskbarSpacing::Pad), l.build.y + (l.build.h - s.Line(CF::Mono)) / 2,
                 l.buildText, p.badgeText, l.build.w - Px(s, ChromeTaskbarSpacing::Pad));
+    }
     if (l.clock.w > 0) {
         target(l.clock, false);
         // Time over date, right-aligned a pad from the target's edge.
@@ -1915,6 +1919,135 @@ void ChromeBuildCalendar(const ChromeCalendarLayout& l, CalendarMonth shown, Cal
         char number[11];
         DesktopNumber(number, day);
         centered(cell, highlight ? CF::Strong : CF::Label, number, highlight ? p.onAccent : p.text);
+    }
+}
+
+static char* BuildInfoNumber(char* out, uint64_t value)
+{
+    char reversed[20];
+    unsigned digits = 0;
+    do {
+        reversed[digits++] = char('0' + value % 10);
+        value /= 10;
+    } while (value);
+    while (digits) *out++ = reversed[--digits];
+    *out = 0;
+    return out;
+}
+
+template<class Field> static void BuildInfoFields(const DesktopBuildInfo& info, Field emit)
+{
+    char generation[21]{}, uptime[32]{};
+    if (info.generation) BuildInfoNumber(generation, info.generation);
+    char* clock = uptime;
+    const uint64_t seconds = info.uptimeSeconds, days = seconds / 86400;
+    if (days) {
+        clock = BuildInfoNumber(clock, days);
+        *clock++ = 'd';
+        *clock++ = ' ';
+    }
+    TwoDigits(clock, unsigned(seconds / 3600 % 24));
+    clock[2] = ':';
+    TwoDigits(clock + 3, unsigned(seconds / 60 % 60));
+    clock[5] = ':';
+    TwoDigits(clock + 6, unsigned(seconds % 60));
+    clock[8] = 0;
+    const auto unknown = [](const char* value) { return value[0] ? value : "Unknown"; };
+    emit("Payload / build ID", unknown(info.id));
+    emit(info.kernelDirty ? "Kernel Git commit (dirty)" : "Kernel Git commit", unknown(info.kernelCommit));
+    emit(info.initrd.dirty ? "Initrd assembly (dirty)" : "Initrd assembly commit", unknown(info.initrd.assemblyCommit));
+    char assembled[32]{};
+    CopyText(assembled, info.initrd.assembledUtc, sizeof(assembled));
+    if (assembled[0] && info.initrd.timestampSource == BuildTimestampSource::SourceDateEpoch) {
+        unsigned n = 0;
+        while (assembled[n]) ++n;
+        CopyText(assembled + n, " (supplied)", sizeof(assembled) - n);
+    }
+    emit("Assembly time (UTC)", unknown(assembled));
+    emit("Boot generation", unknown(generation));
+    emit("Uptime", uptime);
+}
+
+ChromeBuildPopupLayout ChromeBuildPopupLayoutFor(const ChromeStyle& s, DesktopRect anchor, int screenW,
+                                                 int taskbarY, const DesktopBuildInfo& info, bool keepPinReachable)
+{
+    ChromeBuildPopupLayout out{};
+    const int pad = Px(s, FlyoutPad), margin = Px(s, 8), footer = Px(s, 28);
+    const int w = screenW - 2 * margin < Px(s, 408) ? screenW - 2 * margin : Px(s, 408);
+    const int header = 2 * pad + PanelHeaderHeight(s) + Px(s, FlyoutGap);
+    const int available = taskbarY - 2 * margin - header;
+    if (!anchor.w || w < Px(s, 156)) return out;
+    // The shell's mono atlas uses one advance for every printable ASCII glyph.
+    const int mono = s.TextWidth("0", CF::Mono);
+    out.columns = uint32_t((w - 2 * pad) / (mono > 0 ? mono : 1));
+    if (!out.columns) return {};
+    const int caption = s.Line(CF::Small), valueLine = s.Line(CF::Mono);
+    out.rowHeight = (caption > valueLine ? caption : valueLine) + Px(s, 4);
+    BuildInfoFields(info, [&](const char*, const char* value) {
+        unsigned count = 0;
+        while (value[count]) ++count;
+        out.totalRows += 1 + (count + out.columns - 1) / out.columns;
+    });
+    const bool paged = available < int(out.totalRows) * out.rowHeight;
+    const int fit = (available - (paged ? footer : 0)) / out.rowHeight;
+    if (fit < 1) {
+        if (keepPinReachable && available >= 0) {
+            out.panel = TaskbarTooltipBox(anchor, w, header, taskbarY, margin, screenW, margin);
+            out.pin = ChromeTrayFlyoutPinRect(s, out.panel);
+        }
+        return out;
+    }
+    out.pageRows = unsigned(fit) < out.totalRows ? unsigned(fit) : out.totalRows;
+    const int h = header + int(out.pageRows) * out.rowHeight + (paged ? footer : 0);
+    out.panel = TaskbarTooltipBox(anchor, w, h, taskbarY, margin, screenW, margin);
+    const auto& p = out.panel;
+    out.pin = ChromeTrayFlyoutPinRect(s, p);
+    out.body = {p.x + pad, p.y + header - pad, p.w - 2 * pad, int(out.pageRows) * out.rowHeight};
+    if (paged) {
+        const int button = Px(s, 24), top = out.body.y + out.body.h + Px(s, 2);
+        out.next = {p.x + p.w - pad - button, top, button, button};
+        out.previous = {out.next.x - button - Px(s, 4), top, button, button};
+    }
+    return out;
+}
+
+void ChromeBuildBuildPopup(const ChromeBuildPopupLayout& l, const DesktopBuildInfo& info, uint32_t first,
+                           bool pinned, int32_t mx, int32_t my, const ChromeStyle& s, ChromeDisplayList& dl)
+{
+    if (l.panel.w <= 0) return;
+    const int pad = Px(s, FlyoutPad), x = l.panel.x + pad;
+    const auto& p = s.P();
+    PanelFrame(dl, s, l.panel);
+    PanelHeader(dl, s, x, l.panel.y + pad, l.pin.x - x - Px(s, 8), ChromeGlyph::Doc, "Build", nullptr, 0);
+    PopupPin(dl, s, l.pin, pinned, mx, my);
+    if (!l.pageRows) return;
+    first = DesktopDiskPageFirst(first, l.totalRows, l.pageRows);
+    uint32_t row = 0;
+    const auto line = [&](const char* text, CF font, uint32_t color) {
+        const uint32_t at = row++;
+        if (at < first || at - first >= l.pageRows) return;
+        const int y = l.body.y + int(at - first) * l.rowHeight;
+        ChromeElidedText(dl, s, font, x, y, text, color, l.body.w);
+    };
+    BuildInfoFields(info, [&](const char* label, const char* value) {
+        line(label, CF::Small, p.mutedText);
+        while (*value) {
+            char text[BuildIdCapacity];
+            unsigned n = 0;
+            while (n < l.columns && value[n] && n + 1 < sizeof(text)) { text[n] = value[n]; ++n; }
+            text[n] = 0;
+            line(text, CF::Mono, p.text);
+            value += n;
+        }
+    });
+    if (l.next.w) {
+        const auto button = [&](DesktopRect r, ChromeGlyph glyph, bool enabled) {
+            if (enabled && r.contains(mx, my)) ChromeMaterialRect(dl, s, r, p.taskHover);
+            const int size = Px(s, 16);
+            dl.Glyph(glyph, r.x + (r.w - size) / 2, r.y + (r.h - size) / 2, enabled ? p.text : p.mutedText);
+        };
+        button(l.previous, ChromeGlyph::ChevronUp, first != 0);
+        button(l.next, ChromeGlyph::ChevronDown, first + l.pageRows < l.totalRows);
     }
 }
 

@@ -98,6 +98,10 @@ struct ChromeShellModel {
     CalendarMonth calendarMonth;
     CalendarDate calendarToday;
     bool calendar;
+    ChromeBuildPopupLayout buildLayout;
+    DesktopBuildInfo buildInfo;
+    uint32_t buildFirstRow;
+    bool buildPopup;
     ChromeShellKind kind;
     DesktopRect rect;
     int32_t mouseX, mouseY;
@@ -156,7 +160,10 @@ inline void BuildShellModel(const ChromeShellModel& model, const ChromeStyle& st
         ChromeBuildBootSummary(model.boot.View(model.rect), style, list);
         break;
     case ChromeShellKind::TrayFlyout:
-        if (model.calendar) {
+        if (model.buildPopup) {
+            ChromeBuildBuildPopup(model.buildLayout, model.buildInfo, model.buildFirstRow, model.popupPinned,
+                                  model.mouseX, model.mouseY, style, list);
+        } else if (model.calendar) {
             ChromeBuildCalendar(model.calendarLayout, model.calendarMonth, model.calendarToday, model.popupPinned,
                                 model.mouseX, model.mouseY, style, list);
         } else if (model.diskPopup) {

@@ -4,6 +4,7 @@
 #include "debug_overlay.h"
 #include "bridge_reply.h"
 #include "build_info.h"
+#include "desktop_build_info.h"
 #include "audio.h"
 #include "smp.h"
 #include "shutdown.h"
@@ -60,33 +61,49 @@ namespace brook {
 uint16_t PchWatchdogTestRead16(uint16_t port);
 uint32_t PchWatchdogTestRead32(uint16_t port);
 #endif
-// Same newline-terminated initrd marker used by HWSTATUS.ELF. A missing or
-// malformed marker reads as false (unknown) rather than a build identity.
-bool HardwarePayloadIdRead(char* id,uint32_t capacity) {
-    if(!id || capacity<2)return false;
-    id[0]=0;
-    bool valid=false;
-    if(auto* file=VfsOpen("/etc/hardware-payload-id",VFS_O_STREAM)) {
-        VnodeStat stat{};
-        uint64_t offset=0;
-        if(!VfsStat(file,&stat) && !stat.isDir && !stat.isSymlink &&
-           stat.size>=2 && stat.size<=capacity &&
-           VfsRead(file,id,stat.size,&offset)==static_cast<int>(stat.size) &&
-           id[stat.size-1]=='\n') {
-            valid=true;
-            for(uint64_t i=0;i+1<stat.size;++i) {
-                const char c=id[i];
-                if((c>='a' && c<='z') || (c>='A' && c<='Z') ||
-                   (c>='0' && c<='9') || c=='-' || c=='_' || c=='.')continue;
-                valid=false;
-                break;
-            }
-            id[stat.size-1]=0;
+// Read a small complete marker from the boot initrd without caching file data.
+static unsigned ReadBootMetadata(const char* path, char* bytes, unsigned capacity)
+{
+    auto* file = VfsOpen(path, VFS_O_STREAM);
+    if (!file) return 0;
+    VnodeStat stat{};
+    uint64_t offset = 0;
+    const bool complete = !VfsStat(file, &stat) && !stat.isDir && !stat.isSymlink &&
+                          stat.size >= 2 && stat.size <= capacity &&
+                          VfsRead(file, bytes, stat.size, &offset) == static_cast<int>(stat.size) &&
+                          bytes[stat.size - 1] == '\n';
+    VfsRelease(file);
+    return complete ? unsigned(stat.size) : 0;
+}
+
+// Same newline-terminated initrd marker used by HWSTATUS.ELF.
+bool HardwarePayloadIdRead(char* id, uint32_t capacity)
+{
+    if (!id || capacity < 2) return false;
+    const unsigned length = ReadBootMetadata("/etc/hardware-payload-id", id, capacity);
+    if (length) {
+        bool valid = true;
+        for (unsigned i = 0; i + 1 < length; ++i) {
+            const char c = id[i];
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.') continue;
+            valid = false;
+            break;
         }
-        VfsRelease(file);
+        if (valid) {
+            id[length - 1] = 0;
+            return true;
+        }
     }
-    if(!valid)id[0]=0;
-    return valid;
+    id[0] = 0;
+    return false;
+}
+
+bool HardwareBuildProvenanceRead(DesktopBuildProvenance& provenance)
+{
+    char bytes[BuildProvenanceLimit];
+    const unsigned length = ReadBootMetadata("/etc/build-provenance", bytes, sizeof(bytes));
+    return ParseDesktopBuildProvenance(bytes, length, provenance);
 }
 namespace {
 using Reply=BridgeReplyBuffer<DebugChannelSend>;

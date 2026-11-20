@@ -793,6 +793,53 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
         }
         model.popupPinned = false;
     }
+    if (prefix == "glass-100-" || prefix == "opaque-light-150-" || prefix == "opaque-dark-200-") {
+        model.buildPopup = true;
+        model.popupPinned = prefix != "glass-100-";
+        auto& info = model.buildInfo;
+        std::strcpy(info.id, "dell-taskbar-build-popup-20261120");
+        std::strcpy(info.kernelCommit, "ba19bef203a254f167d92bc64de415b10ba19bef");
+        std::strcpy(info.initrd.assemblyCommit, "409bdd20f1f496eee7b9272d77a84743409bdd20");
+        std::strcpy(info.initrd.assembledUtc, "2026-11-20T05:57:00Z");
+        info.initrd.timestampSource = BuildTimestampSource::SourceDateEpoch;
+        info.generation = 467;
+        info.uptimeSeconds = 183561;
+        model.buildLayout = ChromeBuildPopupLayoutFor(s, layout.build, screenW, screenH - m.taskbar(), info);
+        model.rect = model.buildLayout.panel;
+        auto build = ChromeListOn(storage);
+        RenderSnapshot(model, s, build);
+        Check(prefix + "build-popup", build, s, model.rect.x, model.rect.y, model.rect.w, model.rect.h);
+        if (prefix == "glass-100-") {
+            std::memset(info.id, 'p', sizeof(info.id) - 1);
+            std::strcpy(info.kernelCommit, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+            const DesktopRect anchor{144, 352, 42, 32};
+            model.buildLayout = ChromeBuildPopupLayoutFor(s, anchor, 192, 552, info);
+            model.rect = model.buildLayout.panel;
+            auto wrap = ChromeListOn(storage);
+            RenderSnapshot(model, s, wrap);
+            std::string rebuilt;
+            for (unsigned j = 0; j < wrap.Count(); ++j) {
+                const auto& c = wrap.At(j);
+                if (c.op != ChromeOp::Text) continue;
+                const char* chunk = wrap.TextAt(c.arg);
+                if (rebuilt.empty() && std::strncmp(info.kernelCommit, chunk, std::strlen(chunk)) != 0) continue;
+                rebuilt += chunk;
+                if (rebuilt.size() >= std::strlen(info.kernelCommit)) break;
+            }
+            if (rebuilt != info.kernelCommit || model.buildLayout.columns >= std::strlen(info.kernelCommit))
+                std::abort();
+            Check(prefix + "build-popup-narrow", wrap, s, model.rect.x, model.rect.y, model.rect.w, model.rect.h);
+            model.buildLayout = ChromeBuildPopupLayoutFor(s, anchor, 192, 250, info);
+            if (!model.buildLayout.next.w || model.buildLayout.pageRows >= model.buildLayout.totalRows) std::abort();
+            info = {};
+            model.buildLayout = ChromeBuildPopupLayoutFor(s, layout.build, screenW, screenH - m.taskbar(), info);
+            model.rect = model.buildLayout.panel;
+            auto unknown = ChromeListOn(storage);
+            RenderSnapshot(model, s, unknown);
+            Check(prefix + "build-popup-unknown", unknown, s, model.rect.x, model.rect.y, model.rect.w, model.rect.h);
+        }
+        model.popupPinned = false;
+    }
     model.kind = ChromeShellKind::PerformanceHud;
     const DesktopRect hud{0, 0, int(s.M(348)), ChromePerformanceHudHeight(s, true)};
     model.rect = hud;

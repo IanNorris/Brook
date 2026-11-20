@@ -338,7 +338,7 @@ static void WmCaptureVolumePopup(uint32_t screenW, uint32_t screenH, int32_t mou
     snapshot.volume.mouseY = hover.h ? hover.y : -1;
 }
 
-enum class WmTrayFlyout : uint8_t { None, Network, Temperature, Disk, CpuMemory, Compositor, App, Calendar };
+enum class WmTrayFlyout : uint8_t { None, Network, Temperature, Disk, CpuMemory, Compositor, App, Calendar, Build };
 static WmTrayFlyout g_trayFlyout;
 static uint32_t g_diskPopupFirst;
 static int32_t g_diskScrollRemainder;
@@ -390,6 +390,7 @@ static TaskbarPopup WmTrayPopupKind()
     case WmTrayFlyout::Compositor: return TaskbarPopup::Compositor;
     case WmTrayFlyout::App: return TaskbarPopup::App;
     case WmTrayFlyout::Calendar: return TaskbarPopup::Calendar;
+    case WmTrayFlyout::Build: return TaskbarPopup::Build;
     default: break;
     }
     if (g_trayFlyout == WmTrayFlyout::Network) return TaskbarPopup::Network;
@@ -506,6 +507,42 @@ static void WmCalendarNavigate(int32_t x, int32_t y, uint32_t sw, uint32_t sh)
     g_calendarMonth = target == today.month ? CalendarMonth{} : target;
 }
 
+static uint32_t g_buildPopupFirst;
+
+static DesktopBuildInfo WmBuildInformation(uint64_t uptimeMs)
+{
+    DesktopBuildInfo info{};
+    info.initrd = g_buildProvenance;
+    info.generation = BootTimingHandoffSlot().generation;
+    info.uptimeSeconds = uptimeMs / 1000;
+    const char* commit = BuildGitCommit();
+    const char* id = BuildGitHash();
+    const bool kernelKnown = DesktopBuildCommitValid(commit, strlen(commit));
+    if (kernelKnown) WmStrCopy(info.kernelCommit, commit, sizeof(info.kernelCommit));
+    if (g_buildPayloadId[0]) WmStrCopy(info.id, g_buildPayloadId, sizeof(info.id));
+    else if (kernelKnown) WmStrCopy(info.id, id, sizeof(info.id));
+    for (; *id; ++id) if (*id == '+') info.kernelDirty = true;
+    return info;
+}
+
+static ChromeBuildPopupLayout WmBuildPopupLayout(uint32_t sw, uint32_t sh, const DesktopBuildInfo& info)
+{
+    const auto bar = GetTaskbarLayout(sw, sh);
+    auto anchor = bar.build;
+    const bool pinned = g_taskbarPopupPin.Is(TaskbarPopup::Build);
+    if (!anchor.w && pinned) anchor = {int(sw) - int(WmMetric(16)), bar.y, int(WmMetric(16)), 1};
+    return ChromeBuildPopupLayoutFor(WmChromeStyle(), anchor, int(sw), bar.y, info, pinned);
+}
+
+static void WmBuildPopupNavigate(int32_t x, int32_t y, uint32_t sw, uint32_t sh)
+{
+    const auto layout = WmBuildPopupLayout(sw, sh, WmBuildInformation(ApicTickCount()));
+    const int64_t step = layout.previous.contains(x, y) ? -int64_t(layout.pageRows) :
+                         layout.next.contains(x, y) ? int64_t(layout.pageRows) : 0;
+    if (step)
+        g_buildPopupFirst = DesktopDiskPageStep(g_buildPopupFirst, layout.totalRows, layout.pageRows, step);
+}
+
 static DesktopRect WmTrayFlyoutLayout(uint32_t sw, uint32_t sh);
 
 bool WmTrayFlyoutPress(int32_t mx, int32_t my, uint32_t sw, uint32_t sh)
@@ -532,6 +569,8 @@ bool WmTrayFlyoutPress(int32_t mx, int32_t my, uint32_t sw, uint32_t sh)
             }
         } else if (g_trayFlyout == WmTrayFlyout::Calendar) {
             WmCalendarNavigate(mx, my, sw, sh);
+        } else if (g_trayFlyout == WmTrayFlyout::Build) {
+            WmBuildPopupNavigate(mx, my, sw, sh);
         }
         return true;
     }
@@ -548,12 +587,14 @@ bool WmTrayFlyoutPress(int32_t mx, int32_t my, uint32_t sw, uint32_t sh)
                       l.metrics[0].contains(mx, my) || l.metrics[1].contains(mx, my) ? WmTrayFlyout::CpuMemory :
                       l.metrics[4].contains(mx, my) ? WmTrayFlyout::Compositor :
                       l.metrics[5].contains(mx, my) ? WmTrayFlyout::App :
-                      l.clock.contains(mx, my) ? WmTrayFlyout::Calendar : WmTrayFlyout::None;
+                      l.clock.contains(mx, my) ? WmTrayFlyout::Calendar :
+                      l.build.contains(mx, my) ? WmTrayFlyout::Build : WmTrayFlyout::None;
     if (WmTaskbarPopupPinned()) return next != WmTrayFlyout::None;
     if (!WmTrayFlyoutVisible() && next == WmTrayFlyout::None) return false;
     g_trayFlyout = next == g_trayFlyout ? WmTrayFlyout::None : next;
     if (WmTrayFlyoutVisible()) {
         if (g_trayFlyout == WmTrayFlyout::Calendar) g_calendarMonth = {};
+        if (g_trayFlyout == WmTrayFlyout::Build) g_buildPopupFirst = 0;
         if (WmDiskFlyoutSelected()) g_diskPopupFirst = g_diskScrollRemainder = 0;
         if (WmDetailedStatsSelected() == DesktopStatsPanel::CpuMemory) {
             g_cpuFirstRow = g_cpuScrollRemainder = g_statsContentOffset = 0;
@@ -584,6 +625,7 @@ static DesktopRect WmTrayFlyoutLayout(uint32_t sw, uint32_t sh)
     if (!WmTrayFlyoutVisible() || WmTaskbarHidden()) return {};
     if (WmDiskFlyoutSelected()) return WmDiskPopupLayout(sw, sh).panel;
     if (g_trayFlyout == WmTrayFlyout::Calendar) return WmCalendarPopupLayout(sw, sh, RtcReadTaskbarClock().date).panel;
+    if (g_trayFlyout == WmTrayFlyout::Build) return WmBuildPopupLayout(sw, sh, WmBuildInformation(ApicTickCount())).panel;
     const auto stats = WmDetailedStatsSelected();
     if (stats != DesktopStatsPanel::None) return WmStatsPopupLayout(sw, sh, stats).panel;
     const auto l = GetTaskbarLayout(sw, sh);
@@ -704,6 +746,26 @@ static void WmCapturePopupPin(DesktopRect pin, int32_t mx, int32_t my, bool pinn
 static void WmCaptureTrayFlyout(const WmShellSurface& surface, uint32_t sw, uint32_t sh,
                                uint64_t uptimeMs, int32_t mx, int32_t my, ChromeShellModel& snapshot)
 {
+    if (g_trayFlyout == WmTrayFlyout::Build) {
+        const auto info = WmBuildInformation(uptimeMs);
+        const auto layout = WmBuildPopupLayout(sw, sh, info);
+        const auto rect = layout.panel;
+        if (rect.w <= 0 || rect.x != surface.x || rect.y != surface.y ||
+            uint32_t(rect.w) != surface.w || uint32_t(rect.h) != surface.h) return;
+        snapshot.kind = ChromeShellKind::TrayFlyout;
+        snapshot.rect = rect;
+        snapshot.buildPopup = true;
+        snapshot.buildLayout = layout;
+        snapshot.buildInfo = info;
+        if (layout.pageRows)
+            g_buildPopupFirst = DesktopDiskPageFirst(g_buildPopupFirst, layout.totalRows, layout.pageRows);
+        snapshot.buildFirstRow = g_buildPopupFirst;
+        const auto hover = layout.pin.contains(mx, my) ? layout.pin :
+                           layout.previous.contains(mx, my) ? layout.previous :
+                           layout.next.contains(mx, my) ? layout.next : DesktopRect{};
+        WmCapturePopupPin(hover, mx, my, g_taskbarPopupPin.Is(TaskbarPopup::Build), snapshot);
+        return;
+    }
     if (g_trayFlyout == WmTrayFlyout::Calendar) {
         const auto today = RtcReadTaskbarClock().date;
         const auto layout = WmCalendarPopupLayout(sw, sh, today);
@@ -1008,6 +1070,7 @@ static bool WmTrayTooltip(uint32_t screenW, uint32_t screenH, int32_t mx, int32_
         WmStrCopy(buildDetail, BuildGitHash(), sizeof(buildDetail));
         const size_t used = strlen(buildDetail);
         WmStrCopy(buildDetail + used, "  built ", sizeof(buildDetail) - used);
+        WmStrCopy(buildDetail + strlen(buildDetail), "commit ", sizeof(buildDetail) - strlen(buildDetail));
         WmStrCopy(buildDetail + strlen(buildDetail), BuildDate(), sizeof(buildDetail) - strlen(buildDetail));
         detail = buildDetail;
     }

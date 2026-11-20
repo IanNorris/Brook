@@ -7,9 +7,31 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from build_dell_image import build_provenance
 import prepare_hardware_kernel_pair as pair
 from test_hardware_recovery_fsck import elf
 from stage_clearwater_shell import CLEARWATER_START, stage
+
+
+class BuildProvenance(unittest.TestCase):
+    def test_reproducible_metadata(self):
+        commit = 'ab' * 20
+        marker, fields = build_provenance(commit, True, '1709164800')
+        expected = f'BROOK_BUILD_V1\n{commit}\n2024-02-29T00:00:00Z\nsource-date-epoch\ndirty\n'.encode()
+        self.assertEqual(marker, expected)
+        self.assertEqual(build_provenance(commit, True, '1709164800'), (marker, fields))
+        self.assertEqual(fields, {'assembly_commit': commit, 'assembled_utc': '2024-02-29T00:00:00Z',
+                                  'time_source': 'source-date-epoch', 'dirty': True})
+
+    def test_explicit_epoch_and_commit_are_validated(self):
+        for value in ('', '-1', 'NaN', '253402300800'):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                build_provenance('ab' * 20, False, value)
+        with self.assertRaises(ValueError):
+            build_provenance('ab', False, None)
+        marker, fields = build_provenance('ab' * 32, False, None)
+        self.assertIn(b'\nclock\nclean\n', marker)
+        self.assertEqual(fields['time_source'], 'clock')
 
 
 @unittest.skipUnless(all(shutil.which(x) for x in ('mkfs.fat', 'mmd', 'mcopy', 'mtype', 'mdir', 'mattrib')),

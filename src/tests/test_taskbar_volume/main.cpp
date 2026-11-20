@@ -3,6 +3,7 @@
 #include <cstring>
 #include <initializer_list>
 #include "taskbar_volume.h"
+#include "desktop_build_info.h"
 #include "desktop_calendar.h"
 #include "desktop_disk_popup.h"
 #include "desktop_stats_popup.h"
@@ -227,7 +228,30 @@ static void checkCalendar() {
     CHECK(!CalendarDateValid(CalendarLocalClock(~uint64_t{0}, 3600).date));
 }
 
+static void checkBuildProvenance() {
+    constexpr char marker[] = "BROOK_BUILD_V1\n"
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n"
+        "2024-02-29T05:57:01Z\nsource-date-epoch\ndirty\n";
+    DesktopBuildProvenance parsed{};
+    CHECK(ParseDesktopBuildProvenance(marker, sizeof(marker) - 1, parsed));
+    CHECK(parsed.timestampSource == BuildTimestampSource::SourceDateEpoch && parsed.dirty);
+    CHECK(parsed.assemblyCommit[63] == 'f' && parsed.assemblyCommit[64] == 0);
+    CHECK(parsed.assembledUtc[19] == 'Z' && parsed.assembledUtc[20] == 0);
+    CHECK(!ParseDesktopBuildProvenance(marker, sizeof(marker) - 2, parsed));
+    CHECK(!parsed.assemblyCommit[0] && parsed.timestampSource == BuildTimestampSource::Unknown);
+    CHECK(!ParseDesktopBuildProvenance(marker, sizeof(marker), parsed)); // trailing data
+    CHECK(!ParseDesktopBuildProvenance(nullptr, 2, parsed));
+    CHECK(!DesktopBuildCommitValid("0123456789ABCDEF0123456789ABCDEF01234567", 40));
+    CHECK(DesktopBuildTimestampValid("2000-02-29T23:59:59Z", 20));
+    CHECK(!DesktopBuildTimestampValid("2100-02-29T23:59:59Z", 20));
+    CHECK(!DesktopBuildTimestampValid("2026-13-20T05:57:00Z", 20));
+    CHECK(!DesktopBuildTimestampValid("2026-11-20T24:57:00Z", 20));
+    CHECK(!DesktopBuildTimestampValid("2026-11-20T05:57:60Z", 20));
+    CHECK(!DesktopBuildTimestampValid("2026-11-20 05:57:00Z", 20));
+}
+
 int main() {
+    checkBuildProvenance();
     checkCalendar();
     checkDiskVolumes();
     checkDetailedStats();

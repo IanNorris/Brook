@@ -41,6 +41,9 @@ glass-100-app-notification 52e6c96a89c9b1e9
 glass-100-app-tray 3a7d7ff48de34a92
 glass-100-app-tray-menu 341617944d94d15e
 glass-100-boot-summary 0657a14d812bf63e
+glass-100-build-popup 8906d82d9348914f
+glass-100-build-popup-narrow 70dd0d81de5e51e0
+glass-100-build-popup-unknown 0a244dbfd929204c
 glass-100-calendar 04d70653d0191cd1
 glass-100-calendar-six-weeks 04534d5124367499
 glass-100-calendar-unavailable d4e56d8148c238c0
@@ -728,6 +731,7 @@ opaque-dark-200-app-notification 049602cff51c9ee6
 opaque-dark-200-app-tray d98839f849c191b8
 opaque-dark-200-app-tray-menu d88767b607525051
 opaque-dark-200-boot-summary 8803b811dd2e81e8
+opaque-dark-200-build-popup 8f3b9816bc8b5abd
 opaque-dark-200-calendar 69a5ad3d90302e5f
 opaque-dark-200-disk-popup d113c7389088fb97
 opaque-dark-200-frame-active f69e1d0cb8e7695e
@@ -811,6 +815,7 @@ opaque-light-150-app-notification 91501b4e7e6cdb37
 opaque-light-150-app-tray 1757fa1dfffba63a
 opaque-light-150-app-tray-menu 703c1693e2e30609
 opaque-light-150-boot-summary 6469599399781e5c
+opaque-light-150-build-popup 84a175fe555a1f4c
 opaque-light-150-calendar 13491c4d46ac0eb3
 opaque-light-150-disk-popup d9a3b5c7fc902cee
 opaque-light-150-frame-active 0df3643c6fe10dfe

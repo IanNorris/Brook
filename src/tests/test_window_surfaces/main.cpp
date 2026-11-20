@@ -31,6 +31,10 @@ extern const ChromeFontSet g_chromeFonts100 TEST_FONT_SET;
 extern const ChromeFontSet g_chromeFonts150 TEST_FONT_SET;
 extern const ChromeFontSet g_chromeFonts200 TEST_FONT_SET;
 const char* BuildGitHash(){return "test";}
+const char* BuildGitCommit(){return "0123456789abcdef0123456789abcdef01234567";}
+static BootGuardSlot fixtureSlot{};
+BootGuardSlot BootTimingHandoffSlot() { return fixtureSlot; }
+bool HardwareBuildProvenanceRead(DesktopBuildProvenance& info) { info={};return false; }
 const char* BuildDate(){return "2026-11-19";}
 bool CompositorGlassActive() { return false; }
 uint32_t CompositorMaterialOpacity() { return 255; }
@@ -948,6 +952,31 @@ int main() {
         CHECK(cal.unavailable.w > 0 && !cal.next.w && !cal.grid.w);
         CHECK(WmTrayFlyoutPress(10, 10, sw, sh) && !WmTrayFlyoutVisible());
         fixtureClock = clockAtStart;
+
+        WmStrCopy(g_buildPayloadId, "test-full-build-payload", sizeof(g_buildPayloadId));
+        const char buildMarker[] = "BROOK_BUILD_V1\n"
+            "0123456789abcdef0123456789abcdef01234567\n2024-02-29T05:57:01Z\nclock\nclean\n";
+        CHECK(ParseDesktopBuildProvenance(buildMarker, sizeof(buildMarker) - 1, g_buildProvenance));
+        fixtureSlot.generation = 467;
+        auto build = GetTaskbarLayout(sw, sh).build;
+        CHECK(build.w > 0 && WmTrayFlyoutPress(build.x, build.y, sw, sh));
+        CHECK(kinds(s) >= 2 && WmCaptureShellModel(s[1], sw, sh, 183561000, -1, -1, pinSnapshot));
+        CHECK(pinSnapshot.buildPopup && pinSnapshot.buildInfo.generation == 467 &&
+              pinSnapshot.buildInfo.uptimeSeconds == 183561 && !strcmp(pinSnapshot.buildInfo.id, g_buildPayloadId));
+        CHECK(!strcmp(pinSnapshot.buildInfo.initrd.assembledUtc, "2024-02-29T05:57:01Z"));
+        CHECK(!strcmp(pinSnapshot.buildInfo.kernelCommit, BuildGitCommit()));
+        const auto buildPopup = pinSnapshot.buildLayout;
+        CHECK(WmTrayFlyoutPress(buildPopup.pin.x, buildPopup.pin.y, sw, sh) && WmTaskbarPopupPinned());
+        CHECK(!WmTrayFlyoutPress(10, 10, sw, sh) && !WmTaskbarPopupPointerOwned(10, 10, sw, sh));
+        const auto shortBuild = WmBuildPopupLayout(sw, 180, WmBuildInformation(0));
+        CHECK(shortBuild.next.w > 0 && shortBuild.pageRows < shortBuild.totalRows);
+        CHECK(WmTrayFlyoutPress(shortBuild.next.x, shortBuild.next.y, sw, 180) && g_buildPopupFirst > 0);
+        CHECK(WmTrayFlyoutPress(shortBuild.previous.x, shortBuild.previous.y, sw, 180) && !g_buildPopupFirst);
+        CHECK(WmTrayFlyoutPress(buildPopup.pin.x, buildPopup.pin.y, sw, sh) && !WmTaskbarPopupPinned());
+        CHECK(WmTrayFlyoutPress(10, 10, sw, sh) && !WmTrayFlyoutVisible());
+        g_buildPayloadId[0] = 0;
+        g_buildProvenance = {};
+        fixtureSlot = {};
 
         fixtureTray.itemCount = fixtureTray.menuCount = 1;
         fixtureTray.menuOwner = fixtureTray.items[0].id = 11;

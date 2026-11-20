@@ -9,6 +9,7 @@
 #include "thermal_sampler.h"
 #include "taskbar_volume.h"
 #include "desktop_calendar.h"
+#include "desktop_build_info.h"
 #include "desktop_disk_popup.h"
 #include "desktop_stats_popup.h"
 
@@ -280,6 +281,16 @@ ChromeCalendarLayout ChromeCalendarLayoutFor(const ChromeStyle&, DesktopRect anc
                                              int taskbarY, bool valid, bool keepPinReachable = false);
 void ChromeBuildCalendar(const ChromeCalendarLayout&, CalendarMonth shown, CalendarDate today, bool pinned,
                          int32_t mouseX, int32_t mouseY, const ChromeStyle&, ChromeDisplayList&);
+
+struct ChromeBuildPopupLayout {
+    DesktopRect panel, pin, body, previous, next;
+    uint32_t columns, totalRows, pageRows;
+    int rowHeight;
+};
+ChromeBuildPopupLayout ChromeBuildPopupLayoutFor(const ChromeStyle&, DesktopRect anchor, int screenW,
+                                                 int taskbarY, const DesktopBuildInfo&, bool keepPinReachable = false);
+void ChromeBuildBuildPopup(const ChromeBuildPopupLayout&, const DesktopBuildInfo&, uint32_t first,
+                           bool pinned, int32_t mouseX, int32_t mouseY, const ChromeStyle&, ChromeDisplayList&);
 
 struct ChromePerformanceHudModel {
     DesktopRect rect;

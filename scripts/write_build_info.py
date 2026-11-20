@@ -10,6 +10,7 @@ def write_build_info(root, output):
     def git(*args):
         return subprocess.check_output(['git', '-C', str(root), *args], stderr=subprocess.DEVNULL)
     try:
+        commit = git('rev-parse', 'HEAD').decode().strip()
         head = git('rev-parse', '--short', 'HEAD').decode().strip()
         branch = git('rev-parse', '--abbrev-ref', 'HEAD').decode().strip()
         date = git('log', '-1', '--format=%cs').decode().strip()
@@ -26,9 +27,9 @@ def write_build_info(root, output):
         if dirty:
             head += '+' + digest.hexdigest()[:8]
     except (OSError, subprocess.CalledProcessError):
-        head, branch, date = 'unknown', 'unknown', 'unknown'
+        head, branch, date, commit = 'unknown', 'unknown', 'unknown', ''
     content = '#include "build_info.h"\nnamespace brook {\n'
-    for name, value in [('BuildGitHash', head), ('BuildGitBranch', branch), ('BuildDate', date)]:
+    for name, value in [('BuildGitHash', head), ('BuildGitCommit', commit), ('BuildGitBranch', branch), ('BuildDate', date)]:
         content += f'const char* {name}() {{ return {json.dumps(value)}; }}\n'
     content += '}\n'
     if not output.exists() or output.read_text() != content:
