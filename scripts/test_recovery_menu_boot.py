@@ -8,6 +8,7 @@ normal marker that uniquely identifies the normal payload when available.
 The source image is never written.
 """
 import argparse
+import json
 import shutil
 import socket
 import subprocess
@@ -19,13 +20,20 @@ from pathlib import Path
 def boot(image, firmware, work, recovery, marker, timeout, sata, forbidden=None, sata_snapshot=True,
          hold_after_marker=0, sata_serial=None, failure_marker=None, extra_fw_cfg=None, expect_reset=False,
          network_port=None,on_marker=None,network_usb=False,intermediate_marker=None,on_intermediate=None,
-         reset_evidence_marker='PANIC_TEST_RESET_WAIT',gdb_script=None,smp=2,bulk_port=None,update_port=None,store_port=None):
+         reset_evidence_marker='PANIC_TEST_RESET_WAIT',gdb_script=None,smp=2,bulk_port=None,update_port=None,store_port=None,
+         network_model='virtio-net-pci',accelerator='kvm'):
+    if accelerator not in ('kvm','tcg'):
+        raise ValueError('Unsupported QEMU accelerator')
+    if network_model not in ('virtio-net-pci','e1000','e1000-82545em','e1000e') or (
+            network_usb and network_model!='virtio-net-pci'):
+        raise ValueError('Unsupported QEMU network model')
     variables = work / 'vars.fd'
     serial = work / 'serial.log'
     monitor = work / 'monitor.sock'
     shutil.copyfile(firmware / 'OVMF_VARS.fd', variables)
     command = [
-        'qemu-system-x86_64', '-machine', 'q35', '-accel', 'kvm', '-cpu', 'host',
+        'qemu-system-x86_64', '-machine', 'q35', '-accel', accelerator,
+        '-cpu', 'host' if accelerator=='kvm' else 'max,+rdrand',
         '-smp', str(smp), '-m', '1024', '-nodefaults',
         '-drive', f'if=pflash,format=raw,readonly=on,file={firmware / "OVMF_CODE.fd"}',
         '-drive', f'if=pflash,format=raw,file={variables}', '-device', 'VGA',
@@ -53,11 +61,13 @@ def boot(image, firmware, work, recovery, marker, timeout, sata, forbidden=None,
         command += ['-netdev',f'user,id=recovery-net,hostfwd=tcp:127.0.0.1:{network_port}-:1234'+forward]
         command += (['-device','qemu-xhci,id=recovery-xhci',
                      '-device','usb-net,bus=recovery-xhci.0,port=2,netdev=recovery-net'] if network_usb else
-                    ['-device','virtio-net-pci,netdev=recovery-net'])
+                    ['-device',f'{network_model},netdev=recovery-net'])
     for item in extra_fw_cfg or ():
         command += ['-fw_cfg',item]
     if gdb_script is not None:
         command += ['-S','-gdb',f'unix:{work / "gdb.sock"},server=on,wait=off']
+    if network_model!='virtio-net-pci':
+        (work/'qemu-argv.json').write_text(json.dumps(command,indent=2)+'\n')
     with (work / 'qemu.log').open('wb') as errors:
         process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=errors)
         debugger=None

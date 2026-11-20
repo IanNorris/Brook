@@ -84,7 +84,7 @@ def main():
     parser.add_argument('--torn-journal-before-repair',action='store_true',help='Seed an interrupted initial journal header before recovery')
     parser.add_argument('--auto-desktop-contention-panic',action='store_true',help='Hold a QEMU SATA writer until startup panic reserves its gate')
     parser.add_argument('--auto-desktop-shutdown-panic',action='store_true',help='Inject during final shutdown sync and require reset inhibition')
-    parser.add_argument('--auto-desktop-network-module',type=Path,help='Test the bridge transition using this matching virtio-net module')
+    parser.add_argument('--auto-desktop-network-module',type=Path,help='Test the bridge transition using this matching network module')
     parser.add_argument('--two-panic-records',action='store_true',help='Seed two validated records and retrieve both after desktop handoff')
     parser.add_argument('--auto-desktop-script-fail',action='store_true',help='Require the bridge to stay restricted after a startup-script failure')
     parser.add_argument('--auto-desktop-shutdown',action='store_true',help='Perform checked shutdown through the desktop bridge')
@@ -105,7 +105,19 @@ def main():
     parser.add_argument('--bridge-local-policy-qa',type=Path,help='Use this static guest probe for bridge and reserved-port policy')
     parser.add_argument('--bridge-v3-qa',type=Path,metavar='OPERATOR.SEED',
                         help='Test the packaged v3 receivers in the guarded desktop with a synthetic operator')
+    from guarded_bridge_v3_qa import INTEL_NIC_DEVICE_IDS
+    parser.add_argument('--bridge-v3-nic',choices=INTEL_NIC_DEVICE_IDS,
+                        help='Exercise guarded v3 over the selected QEMU Intel NIC')
+    parser.add_argument('--bridge-v3-nic-accel',choices=('kvm','tcg'),
+                        help='Accelerator for the disposable Intel NIC QA boots')
     a=parser.parse_args()
+    if (a.bridge_v3_nic or a.bridge_v3_nic_accel) and not a.bridge_v3_qa:
+        parser.error('Intel NIC QA requires --bridge-v3-qa')
+    if a.bridge_v3_nic_accel and not a.bridge_v3_nic:
+        parser.error('Intel NIC accelerator selection requires --bridge-v3-nic')
+    if a.bridge_v3_nic and (not a.auto_desktop_network_module or
+                           a.auto_desktop_network_module.name!='e1000.mod'):
+        parser.error('Intel NIC QA requires the matching e1000.mod')
     if a.auto_desktop_slot_fallback:
         other_modes = set(vars(a)) - {'image', 'efi', 'firmware', 'desktop_pair', 'recovery_pair', 'output',
                                       'identity', 'auto_desktop', 'auto_desktop_slot_fallback', 'managed_profile',
@@ -119,10 +131,10 @@ def main():
         allowed = {'image', 'efi', 'firmware', 'desktop_pair', 'recovery_pair', 'output', 'identity',
                    'auto_desktop', 'auto_desktop_dell_initrd', 'auto_desktop_intel_provider',
                    'auto_desktop_vulkan_service', 'managed_profile', 'auto_desktop_network_module',
-                   fixture}
+                   fixture, 'bridge_v3_nic', 'bridge_v3_nic_accel'}
         if (not a.auto_desktop_dell_initrd or not a.auto_desktop_network_module or
                 any(value for name, value in vars(a).items() if name not in allowed)):
-            parser.error('bridge QA requires the standard guarded Dell startup fixture and matching virtio module')
+            parser.error('bridge QA requires the standard guarded Dell startup fixture and matching network module')
     if a.proc_autodump_qa and not a.proc_dump_qa:
         parser.error('automatic core QA requires the live core fixture')
     if a.proc_dump_qa and not a.auto_desktop_dell_initrd:
@@ -293,13 +305,22 @@ def main():
         if a.normal_kernel or a.auto_desktop_network_module or a.auto_desktop_dell_shutdown_module or a.proc_dump_qa:
             if subprocess.run(['mdir','-i',str(normal),'::/DRIVERS'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode:
                 subprocess.run(['mmd','-i',str(normal),'::/DRIVERS'],check=True)
-            subprocess.run(['mcopy','-o','-i',str(normal),str(a.normal_network_module or a.auto_desktop_network_module or a.auto_desktop_dell_shutdown_module or a.proc_dump_qa),'::/DRIVERS/virtio_net.mod'],check=True)
+            network_module=(a.normal_network_module or a.auto_desktop_network_module or
+                            a.auto_desktop_dell_shutdown_module or a.proc_dump_qa)
+            destination='e1000.mod' if a.bridge_v3_nic else 'virtio_net.mod'
+            subprocess.run(['mcopy','-o','-i',str(normal),str(network_module),'::/DRIVERS/'+destination],check=True)
+            if a.bridge_v3_nic:
+                packed_module=subprocess.check_output(['mtype','-i',str(normal),'::/DRIVERS/'+destination])
+                network_module_sha=hashlib.sha256(packed_module).hexdigest()
         if a.bridge_v3_qa:
             from guarded_bridge_v3_qa import prepare as prepare_bridge_qa
             candidate=json.loads((a.desktop_pair/'manifest.json').read_text())
             if candidate['kernel_build_flags'].get('BROOK_BRIDGE_V3')!='ON' or not candidate.get('bridge_v3_qa'):
                 raise ValueError('v3 QA requires the checked v3 pair and exact build metadata')
             bridge_expected=prepare_bridge_qa(a.desktop_pair/'INITRD.IMG',normal,candidate['bridge_v3_qa'],a.bridge_v3_qa)
+            if a.bridge_v3_nic and (bridge_expected.get('intel_nic')!=a.bridge_v3_nic or
+                                   bridge_expected.get('intel_nic_module_sha256')!=network_module_sha):
+                raise ValueError('Intel NIC module or model differs from the checked build manifest')
         selection=work/'select.bin';selection.write_bytes(record(1,0,(a.recovery_pair/'KERNEL.ELF').read_bytes(),recovery.read_bytes()))
         boot_payloads = ((a.efi,'::/EFI/BOOT/BOOTX64.EFI'),(a.recovery_pair/'KERNEL.ELF','::/RECOVERY/KERNEL.ELF'),
                          (recovery,'::/RECOVERY/INITRD.IMG'),(selection,'::/RECOVERY/SELECT.BIN'))
@@ -449,6 +470,8 @@ def main():
                               network_port=recovery_port,
                               intermediate_marker='GUARD_PANIC_RETRIEVAL_WINDOW 10s' if a.two_panic_records else None,
                               on_intermediate=retrieve_during_repair if a.two_panic_records else None)
+        if a.bridge_v3_nic_accel:
+            repair_options['accelerator']=a.bridge_v3_nic_accel
         if a.auto_desktop_slot_fallback:
             boot_matrix_step(disk, a.firmware, first, repair_marker, a.output / 'initial-repair', **repair_options)
         else:
@@ -720,10 +743,13 @@ def main():
                 boot(disk,a.firmware,second,False,'GUARD_DESKTOP_HANDOFF_SCRIPT status=0',120,True,
                      sata_snapshot=False,sata_serial='BROOK-RECOVERY-QA',failure_marker='GUARD_DESKTOP_HANDOFF_FAILED',
                      network_port=network_port,bulk_port=bulk_port,update_port=update_port,store_port=store_port,
+                     network_model=a.bridge_v3_nic or 'virtio-net-pci',
+                     accelerator=a.bridge_v3_nic_accel or 'kvm',
                      on_marker=lambda:run_bridge_qa(a.output,work/'v3-registry',ports,
-                                                    a.bridge_v3_qa,bridge_expected))
+                                                    a.bridge_v3_qa,bridge_expected,a.bridge_v3_nic,
+                                                    network_module_sha if a.bridge_v3_nic else None))
             finally:
-                for name in ('serial.log','qemu.log'):
+                for name in ('serial.log','qemu.log','qemu-argv.json'):
                     if (second/name).exists():shutil.copyfile(second/name,a.output/('desktop-attempt-'+name))
         elif a.auto_desktop_network_module:
             with socket.socket() as probe:
