@@ -2072,6 +2072,7 @@ void WmRenderChromeForWindow(uint32_t* backBuffer, uint32_t stride,
     RenderWindowChrome(backBuffer, stride, screenW, screenH, w, mouseX, mouseY);
 }
 
+#include "wm_window_menu.inc"
 #include "wm_shell_taskbar.inc"
 
 uint32_t WmDesktopHeight(uint32_t screenH)

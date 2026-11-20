@@ -815,6 +815,11 @@ struct WmShellTrayGeometry;
 void WmGetShellTrayGeometry(uint32_t sw, uint32_t sh, int32_t x, int32_t y, WmShellTrayGeometry&);
 bool WmShellTrayPointer(uint32_t sw, uint32_t sh, int32_t x, int32_t y,
                        bool pressed, int button, int scroll);
+// The window menu (title bar right-click, xdg show_window_menu). x/y: the
+// anchor in screen pixels. Routed through WmShellTrayPointer while open.
+bool WmShowWindowMenu(int idx, int32_t x, int32_t y);
+bool WmWindowMenuOpen();
+void WmWindowMenuClose();
 bool WmLauncherVisible();
 
 // Scroll the launcher by delta (negative = up, positive = down).

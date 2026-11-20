@@ -701,6 +701,12 @@ void WmGetShellTrayGeometry(uint32_t sw, uint32_t sh, int32_t x, int32_t y, WmSh
     const auto& tray = ShellServiceTrayState();
     const auto style = WmChromeStyle();
     if (tray.notice.id) out.notice = ChromeNoticeRect(style, sw, WmDesktopHeight(sh), tray.notice.actionCount);
+    // The window menu borrows the tray menu's surface (wm_window_menu.inc).
+    if (g_windowMenu.open) {
+        out.popup = WindowMenuRectLocked(sw, sh);
+        out.menu = out.popup.w > 0;
+        return;
+    }
     if (!tray.itemCount || WmTaskbarHidden() || WmLauncherVisible() ||
         WmVolumePopupVisible() || WmTrayFlyoutVisible()) return;
     if (y < static_cast<int32_t>(WmTaskbarTop(sh)) && !tray.menuOwner) return;
@@ -735,6 +741,7 @@ void WmGetShellTrayGeometry(uint32_t sw, uint32_t sh, int32_t x, int32_t y, WmSh
 bool WmShellTrayPointer(uint32_t sw, uint32_t sh, int32_t x, int32_t y,
                        bool pressed, int button, int scroll)
 {
+    if (WindowMenuPointer(sw, sh, x, y, pressed, button)) return true;
     const auto& tray = ShellServiceTrayState();
     if (!tray.itemCount && !tray.notice.id) return false;
     WmShellTrayGeometry geometry{};
@@ -786,6 +793,11 @@ static void WmCaptureAppTray(const WmShellSurface& surface, uint32_t sw, uint32_
         model.tray.notice = tray.notice;
     } else if (surface.kind == WmShellSurfaceKind::AppTrayMenu) {
         model.kind = ChromeShellKind::AppTrayMenu;
+        if (g_windowMenu.open) {
+            model.tray.menuCount = g_windowMenu.count;
+            for (uint32_t i = 0; i < g_windowMenu.count; ++i) model.tray.menu[i] = g_windowMenu.rows[i];
+            return;
+        }
         model.tray.menuCount = tray.menuCount;
         for (uint32_t i = 0; i < tray.menuCount; ++i) model.tray.menu[i] = tray.menu[i];
     } else {

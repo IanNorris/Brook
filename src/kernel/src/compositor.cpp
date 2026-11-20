@@ -2777,6 +2777,7 @@ static void CompositorRunShortcut(const GlobalShortcutResult& r)
         break;
     case GlobalShortcutAction::DockFocusedWindow:WmDockFocusedWindow();break;
     case GlobalShortcutAction::CloseDock:WmDockDismiss();break;
+    case GlobalShortcutAction::CloseWindowMenu:WmWindowMenuClose();break;
     case GlobalShortcutAction::SpawnTerminal:WmSpawnTerminal();break;
     case GlobalShortcutAction::OpenFiles:WmOpenFiles();break;
     case GlobalShortcutAction::ToggleGlass:WmToggleFocusedWindowGlass();break;
@@ -2809,6 +2810,7 @@ static void CompositorInputWM()
             context.volumePopupVisible=WmVolumePopupVisible() || WmTrayFlyoutVisible();
             context.launcherPrompt=WmLauncherPowerPrompt();
             context.dockDismissible=WmDockDismissible();
+            context.windowMenuOpen=WmWindowMenuOpen();
             GlobalShortcutResult shortcut=g_globalShortcuts.Key(
                 ev.type==InputEventType::KeyPress,ev.scanCode,ev.modifiers,context);
             shortcut.ascii=ev.ascii;shortcut.modifiers=ev.modifiers;

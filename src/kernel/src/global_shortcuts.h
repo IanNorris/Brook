@@ -32,6 +32,7 @@ enum class GlobalShortcutAction : uint8_t {
     ToggleDock,        // Super+S: open or close the side dock
     DockFocusedWindow, // Super+Shift+S: dock the focused window, or return the page
     CloseDock,         // Escape while the dock is open and unpinned
+    CloseWindowMenu,   // Escape while a window menu is open
 };
 
 struct GlobalShortcutResult {
@@ -48,6 +49,7 @@ struct GlobalShortcutContext {
     bool volumePopupVisible = false;
     bool launcherPrompt = false;  // launcher power confirmation showing
     bool dockDismissible = false; // side dock open and unpinned: Escape hides it
+    bool windowMenuOpen = false;  // a title bar's window menu: Escape closes it
 };
 
 class GlobalShortcuts {
@@ -93,6 +95,8 @@ public:
             r.action = GlobalShortcutAction::LauncherPromptKey;
             r.key = scan;
         }
+        else if (scan == ScEscape && context.windowMenuOpen && !super && !alt)
+            r.action = GlobalShortcutAction::CloseWindowMenu;
         else if (scan == ScEscape && context.volumePopupVisible) r.action = GlobalShortcutAction::CloseVolumePopup;
         else if (alt && scan == ScP) r.action = GlobalShortcutAction::CyclePerformanceHud;
         else if (context.launcherVisible && !super && !(alt && (scan == ScTab || scan == ScF4)) && !IsModifier(scan)) {

@@ -1128,6 +1128,48 @@ int main() {
             CHECK(WmDockRight() && WmDockWidth()==360);
             g_dock.right=false;g_dock.width=0;
         }
+        // The window menu: a secondary press on a native title bar opens it at
+        // the pointer, in the app tray menu's surface; rows act on the press.
+        {
+            WmSetFocus(floating);
+            const int tx=f.x+20,ty=f.y+border+4;
+            CHECK(WmHitTest(tx,ty).windowIndex==floating && WmHitTest(tx,ty).zone==WmHitZone::TitleBar);
+            CHECK(!WmShellTrayPointer(sw,sh,tx,ty,true,0,0) && !WmWindowMenuOpen()); // primary: not ours
+            CHECK(WmShellTrayPointer(sw,sh,tx,ty,true,1,0) && WmWindowMenuOpen());
+            WmShellTrayGeometry geometry{};
+            WmGetShellTrayGeometry(sw,sh,tx,ty,geometry);
+            CHECK(geometry.menu && geometry.popup.x==tx && geometry.popup.y==ty);
+            WmShellSurface menu{};menu.kind=WmShellSurfaceKind::AppTrayMenu;
+            menu.x=geometry.popup.x;menu.y=geometry.popup.y;menu.w=uint32_t(geometry.popup.w);menu.h=uint32_t(geometry.popup.h);
+            static ChromeShellModel model{};
+            CHECK(WmCaptureShellModel(menu,sw,sh,0,-1,-1,model) && model.kind==ChromeShellKind::AppTrayMenu);
+            CHECK(model.tray.menuCount==4 && !strcmp(model.tray.menu[0].label,"Move to side dock"));
+            CHECK(!strcmp(model.tray.menu[2].label,"Maximise") && !strcmp(model.tray.menu[3].label,"Close"));
+            // Motion is the menu's; a press outside closes it and goes no further.
+            CHECK(WmShellTrayPointer(sw,sh,5,5,false,0,0) && WmWindowMenuOpen());
+            CHECK(WmShellTrayPointer(sw,sh,5,5,true,0,0) && !WmWindowMenuOpen());
+            // Escape closes it (global shortcut), and the window's going does too.
+            CHECK(WmShowWindowMenu(floating,tx,ty) && WmWindowMenuOpen());
+            WmWindowMenuClose();CHECK(!WmWindowMenuOpen());
+            // "Move to side dock" docks it; for the page the menu offers the return.
+            CHECK(WmShowWindowMenu(floating,tx,ty));
+            WmGetShellTrayGeometry(sw,sh,tx,ty,geometry);
+            const DesktopRect row=ChromeTrayMenuRowRect(WmChromeStyle(),geometry.popup,0);
+            CHECK(WmShellTrayPointer(sw,sh,row.x+4,row.y+4,true,0,0) && !WmWindowMenuOpen() && f.docked);
+            CHECK(WmShowWindowMenu(floating,10,10));
+            CHECK(WmCaptureShellModel(menu,sw,sh,0,-1,-1,model) && !strcmp(model.tray.menu[0].label,"Return to desktop"));
+            CHECK(!model.tray.menu[1].enabled && !model.tray.menu[2].enabled && model.tray.menu[3].enabled);
+            WmWindowMenuClose();
+            CHECK(WmDockReturnWindow(floating) && !f.docked);
+            // Near the screen's corner it flips to stay on the desktop.
+            const DesktopRect flipped=ChromeWindowMenuRect(WmChromeStyle(),int(sw)-4,desktopH-4,4,int(sw),desktopH);
+            CHECK(flipped.x+flipped.w<=int(sw) && flipped.y+flipped.h<=desktopH && flipped.w>0);
+            // A dead window's menu closes on the next event.
+            CHECK(WmShowWindowMenu(floating,tx,ty));
+            const uint64_t identity=f.creationIdentity;f.creationIdentity=identity+1;
+            CHECK(!WmShellTrayPointer(sw,sh,tx,ty,false,0,0) && !WmWindowMenuOpen());
+            f.creationIdentity=identity;
+        }
         for(Window* w:{&a,&c,&f}){w->vfb=nullptr;WmDestroyWindowById(owner,w->wmId);}
         CHECK(!lockDepth);
         std::free(owner);

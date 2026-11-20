@@ -511,6 +511,23 @@ int64_t sys_brook_wm_begin_move(uint64_t wmId, uint64_t,
     return brook::CompositorBeginWindowMove(idx) ? 0 : -EINVAL;
 }
 
+// 0xB25: WM_SHOW_WINDOW_MENU(wmId, x, y)
+//   xdg_toplevel.show_window_menu: open the window menu at (x, y), physical
+//   pixels relative to the caller's window surface (client origin).
+int64_t sys_brook_wm_show_window_menu(uint64_t wmId, uint64_t x, uint64_t y,
+                                      uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    if (wmId == 0 || wmId > 0xFFFFu) return -EINVAL;
+    const int32_t rx = static_cast<int32_t>(x), ry = static_cast<int32_t>(y);
+    if (rx < -0x8000 || rx > 0x7fff || ry < -0x8000 || ry > 0x7fff) return -EINVAL;
+    brook::Window* w = brook::WmFindWindowById(proc, static_cast<uint32_t>(wmId));
+    if (!w) return -EINVAL;
+    const int idx = static_cast<int>(wmId) - 1;
+    return brook::WmShowWindowMenu(idx, w->clientX() + rx, w->clientY() + ry) ? 0 : -EINVAL;
+}
+
 // 514: WM_MOVE_RELATIVE(wmId, parentWmId, relX, relY)
 //   Position a waylandd-hosted popup relative to the parent window's client
 //   area. xdg_popup positioners use parent-surface coordinates, while the
