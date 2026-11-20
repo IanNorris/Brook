@@ -95,6 +95,8 @@ _Last updated: 19 November 2026 (early), by a Claude Code session; see "19 Nov e
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**Dell on gen 466 = `work/integration62` f0ba5b0a** (files-nautilus 14b3a0df incl. the Files alias migration + user-app-manifest 0290803e + webapps 8ba0b670; --clearwater-shell; session `fd9129aee94f4997b9bcc04a450f3489`). Pins migrated (org.gnome.Nautilus); user manifest loaded (WhatsApp: name "WhatsApp", icon from the site's touch icon). brook-apps staged by hand (tx apps1120d, store 3wnvdi0h…). Still pending from Codex: xdg-resize-fix (Nautilus maximise/restore).
+
 **Flatpak (Claude owns), 20 Nov.** The bubblewrap probe on gen 465 (bwrap 0.11.1 is already in the store at dk9qhjgg…) shows unmodified bwrap can't run:
 - every variant fails at "remount /newroot/proc: Operation not supported" (only RDONLY bind-remounts are supported);
 - NEWIPC/UTS/NET/PID → clone EINVAL;
