@@ -479,6 +479,7 @@ void SockClose(int sockIdx);
 void SockRef(int sockIdx);    // increment refcount (fork/dup)
 void SockUnref(int sockIdx);  // decrement refcount, destroy at 0
 void SockUnrefUntil(int sockIdx, uint64_t deadline); // bounded local-only graceful close
+void SockUnrefBefore(int sockIdx, uint64_t deadline); // bounded remote-capable graceful close
 
 // Deliver a UDP datagram to the matching socket (called by stack).
 void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,

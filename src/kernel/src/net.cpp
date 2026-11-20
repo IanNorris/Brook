@@ -2860,7 +2860,7 @@ int SockRecvFrom(int sockIdx, void* buf, uint32_t len,
     return static_cast<int>(copyLen);
 }
 
-static void SockFinalize(int sockIdx, uint64_t localDeadline)
+static void SockFinalize(int sockIdx, uint64_t closeDeadline, bool remoteBounded)
 {
     if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return;
     if (!g_sockUsed[sockIdx]) return;
@@ -2916,7 +2916,7 @@ static void SockFinalize(int sockIdx, uint64_t localDeadline)
         const auto snapshot = CaptureTcpTxLocked(s);
         SpinLockRelease(&s.lock);
         TcpSendSnapshot(s, snapshot, seq, TCP_FIN | TCP_ACK, nullptr, 0, "close", false,
-                        localDeadline != 0);
+                        closeDeadline && !remoteBounded, remoteBounded ? closeDeadline : 0);
 
         // Wait up to 500ms for the peer to acknowledge our FIN.
         // We must use SchedulerBlock (not SchedulerYield) because SchedulerYield
@@ -2926,7 +2926,7 @@ static void SockFinalize(int sockIdx, uint64_t localDeadline)
         Process* self = ProcessCurrent();
         if (self) {
             uint64_t deadline = ApicTickCount() + 500;
-            if (localDeadline && localDeadline < deadline) deadline = localDeadline;
+            if (closeDeadline && closeDeadline < deadline) deadline = closeDeadline;
             for (;;) {
                 SpinLockAcquire(&s.lock);
                 const bool waiting = s.tcpState == TcpState::FinWait1 ||
@@ -2992,7 +2992,7 @@ void SockRef(int sockIdx)
     (void)SockTryRef(sockIdx);
 }
 
-void SockUnrefUntil(int sockIdx, uint64_t localDeadline)
+static void SockDropReference(int sockIdx, uint64_t closeDeadline, bool remoteBounded)
 {
     if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return;
     const uint64_t flags = IrqSpinLockAcquire(&g_socketRegistryLock);
@@ -3004,10 +3004,12 @@ void SockUnrefUntil(int sockIdx, uint64_t localDeadline)
         }
     }
     IrqSpinLockRelease(&g_socketRegistryLock, flags);
-    if (finalize) SockFinalize(sockIdx, localDeadline);
+    if (finalize) SockFinalize(sockIdx, closeDeadline, remoteBounded);
 }
 
-void SockUnref(int sockIdx) { SockUnrefUntil(sockIdx, 0); }
+void SockUnrefUntil(int sockIdx, uint64_t deadline) { SockDropReference(sockIdx, deadline, false); }
+void SockUnrefBefore(int sockIdx, uint64_t deadline) { SockDropReference(sockIdx, deadline, true); }
+void SockUnref(int sockIdx) { SockDropReference(sockIdx, 0, false); }
 
 // Direct close callers own exactly one reference, just like FD/queue teardown.
 void SockClose(int sockIdx) { SockUnref(sockIdx); }
@@ -4234,7 +4236,7 @@ public:
     ~TcpSendOwnership() {
         if (locked_) KMutexUnlock(gate_);
         if (referenced_) {
-            if (finalizationDeadline_) SockUnrefUntil(index_, finalizationDeadline_);
+            if (finalizationDeadline_) SockUnrefBefore(index_, finalizationDeadline_);
             else SockUnref(index_);
         }
         if (region_) SchedulerKernelRegionLeave(self_);

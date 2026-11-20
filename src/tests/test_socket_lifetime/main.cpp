@@ -2648,6 +2648,26 @@ int main() {
             SockUnrefUntil(socket, ticks);
         }
         injectTcpAck = false;
+        receiving.tryTransmit = tryCaptureFrame;
+        for (bool beforeDeadline : {true, false}) {
+            const int socket = create();
+            setupTcp(socket);
+            auto& stream = g_sockets[socket];
+            stream.localIp = receiving.ipAddr;
+            stream.remoteIp = peer;
+            g_arpTable.Flush();
+            ArpCacheInsert(peer, peerMac);
+            tryTransmitCalls = frameTransmitCalls = 0;
+            const uint64_t closeBy = ticks + (beforeDeadline ? 11 : 0);
+            SockUnrefBefore(socket, closeBy);
+            assert(!published(socket) && ticks == closeBy);
+            assert(tryTransmitCalls == (beforeDeadline ? 1u : 0u));
+            if (beforeDeadline) {
+                const auto* tcp = reinterpret_cast<const TcpHeader*>(
+                    capturedFrame + sizeof(EthHeader) + sizeof(Ipv4Header));
+                assert(frameTransmitCalls == 1 && tcp->flags == (TCP_FIN | TCP_ACK));
+            }
+        }
         g_arpTable.Flush();
         currentProcess = nullptr;
         delete sender;
