@@ -20,6 +20,8 @@ void SchedulerMarkTerminated(Process* process,int status) {
 void ReleaseSchedulerReference(Process* process,bool){ProcessUnref(process);}
 static bool RequestFatalSignalImpl(Process*,int,AddressSpaceState*,uint64_t);
 void ProcessSignalInfoToUser(Process*,SignalInfo*) {}
+static const PidNamespace* ProcessPidView(const Process*) { return nullptr; }
+static uint32_t ProcessVisibleTgid(const Process* p, const PidNamespace*) { return p->tgid; }
 uint64_t PosixTimerPending(Process*){return 0;}
 bool PosixTimerDequeue(Process*,uint64_t,SignalInfo*){return false;}
 void IntervalTimerAlarmConsumed(Process*){}

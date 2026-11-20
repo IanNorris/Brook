@@ -3,6 +3,7 @@
 // Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
+#include "pid_namespace.h"
 #include "process_user_namespace.h"
 
 #include "posix_timer.h"
@@ -421,24 +422,34 @@ int64_t sys_rt_sigreturn(uint64_t, uint64_t, uint64_t,
 
 // Thread-directed signals retain their Linux sender metadata. In particular,
 // NPTL validates SI_TKILL and the sender TGID before applying setxid requests.
+static bool DeliverToNamespaceInit(const Process* sender, const Process* target, int signal)
+{
+    if (!ProcessPidIsNamespaceInit(target)) return true;
+    // An ancestor can force SIGKILL or SIGSTOP. From within the namespace,
+    // only a signal with a user handler is deliverable to PID 1.
+    if ((signal == 9 || signal == 19) && ProcessPidView(sender) != ProcessPidView(target))
+        return true;
+    return ReadSignalAction(target->tgid, signal - 1).handler > 1;
+}
+
 static int64_t SendThreadSignal(uint64_t tgid, uint64_t tid, uint64_t sig, bool checkGroup)
 {
     int32_t group = static_cast<int32_t>(tgid), thread = static_cast<int32_t>(tid);
     int32_t signal = static_cast<int32_t>(sig);
     if (thread <= 0 || (checkGroup && group <= 0) || signal < 0 || signal > 64)
         return -EINVAL;
-    if (thread > 0xffff || (checkGroup && group > 0xffff)) return -ESRCH;
     Process* self = ProcessCurrent();
+    const auto* view = ProcessPidView(self);
     SchedulerKernelRegionEnter(self);
-    Process* target = SchedulerFindProcessReference(static_cast<uint16_t>(thread));
+    Process* target = SchedulerFindVisibleProcessReference(view, thread);
     int result = -ESRCH;
-    if (target && (!checkGroup || target->tgid == group)) {
+    if (target && !target->isKernelThread && (!checkGroup || ProcessVisibleTgid(target, view) == static_cast<uint32_t>(group))) {
         result = ProcessCanSignal(self,target) || (signal==18 && self && self->sid==target->sid)?0:-EPERM;
-        if (!result && signal) {
+        if (!result && signal && DeliverToNamespaceInit(self, target, signal)) {
             SignalInfo info{};
             info.si_signo = signal;
             info.si_code = -6; // SI_TKILL
-            int32_t sender = self ? self->tgid : 0;
+            int32_t sender = ProcessVisibleTgid(self, ProcessPidView(target));
             uint32_t uid = self ? ProcessReadIds(self, false).real : 0;
             memcpy(info._data, &sender, sizeof(sender));
             memcpy(info._data + 4, &uid, sizeof(uid));
@@ -468,32 +479,48 @@ int64_t sys_tkill(uint64_t tid, uint64_t sig, uint64_t,
 // sys_kill (62)
 // ---------------------------------------------------------------------------
 
-int64_t sys_kill(uint64_t pid, uint64_t sig, uint64_t,
-                  uint64_t, uint64_t, uint64_t)
+static int SendProcessSignal(Process* self, Process* target, int signal)
 {
-    // Linux pid_t is a signed 32-bit syscall argument. Do not alias a large
-    // positive PID onto an unrelated 16-bit Brook process identity.
-    int32_t requested = static_cast<int32_t>(pid);
-    if (requested <= 0) return -ENOSYS; // process-group selectors not implemented
-    if (requested > 0xffff) return -ESRCH;
-    int32_t signal = static_cast<int32_t>(sig);
+    if (target->isKernelThread) return -ESRCH;
+    if (!ProcessCanSignal(self, target) && !(signal == 18 && self->sid == target->sid)) return -EPERM;
+    if (!signal || !DeliverToNamespaceInit(self, target, signal)) return 0;
+    SignalInfo info{};
+    info.si_signo = signal;
+    info.si_code = 0; // SI_USER
+    const int32_t sender = ProcessVisibleTgid(self, ProcessPidView(target));
+    const uint32_t senderUid = ProcessReadIds(self, false).real;
+    memcpy(info._data, &sender, sizeof(sender));
+    memcpy(info._data + 4, &senderUid, sizeof(senderUid));
+    return ProcessSendSignal(target, signal, &info);
+}
+
+int64_t sys_kill(uint64_t pid, uint64_t sig, uint64_t,
+                 uint64_t, uint64_t, uint64_t)
+{
+    const int32_t requested = static_cast<int32_t>(pid);
+    const int32_t signal = static_cast<int32_t>(sig);
     if (signal < 0 || signal > 64) return -EINVAL;
-    Process* self = ProcessCurrent();
-    SchedulerKernelRegionEnter(self);
-    Process* target = SchedulerFindProcessReference(static_cast<uint16_t>(requested));
-    if (!target) {
-        SchedulerKernelRegionLeave(self);
-        return -ESRCH;
+    if (requested == static_cast<int32_t>(0x80000000U)) return -ESRCH;
+    auto* self = ProcessCurrent();
+    if (!self) return -ESRCH;
+    KernelOperationGuard operation(self);
+    if (requested > 0) {
+        auto* target = SchedulerFindVisibleProcessReference(ProcessPidView(self), requested);
+        if (!target) return -ESRCH;
+        const int result = SendProcessSignal(self, target, signal);
+        ProcessUnref(target);
+        return result;
     }
-    if(!ProcessCanSignal(self,target) && !(signal==18 && self && self->sid==target->sid)) {ProcessUnref(target);SchedulerKernelRegionLeave(self);return -EPERM;}
-    SignalInfo info{};info.si_signo=signal;info.si_code=0; // SI_USER
-    const int32_t sender=self?self->tgid:0;
-    const uint32_t senderUid=self?ProcessReadIds(self,false).real:0;
-    memcpy(info._data,&sender,4);memcpy(info._data+4,&senderUid,4);
-    int result = signal ? ProcessSendSignal(target, signal, &info) : 0;
-    ProcessUnref(target);
-    SchedulerKernelRegionLeave(self);
-    return result;
+
+    Process* targets[MAX_PROCESSES];
+    const uint32_t count = SchedulerCollectVisibleSignalTargets(self, requested, targets, MAX_PROCESSES);
+    int outcome = -ESRCH;
+    for (uint32_t i = 0; i < count; ++i) {
+        const int result = SendProcessSignal(self, targets[i], signal);
+        ProcessUnref(targets[i]);
+        if (result == 0 || (outcome == -ESRCH && result != -ESRCH)) outcome = result;
+    }
+    return outcome;
 }
 
 } // namespace brook

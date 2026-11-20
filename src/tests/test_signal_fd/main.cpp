@@ -27,6 +27,8 @@ struct Process {
     std::atomic<unsigned> regions{0};std::mutex mutex;std::condition_variable cv;bool wake=false;
     explicit Process(unsigned id):pid(id),tgid(id){}
 };
+static const void* ProcessPidView(const Process*) {return nullptr;}
+static uint32_t ProcessVisibleTgid(const Process* p,const void*) {return p->tgid;}
 static void ProcessSignalInfoToUser(Process*,SignalInfo*) {} // identity namespace fixture
 static std::atomic<int> allocations{0};static bool failAllocation=false,failCopy=false;
 static void* kmalloc(uint64_t n){if(failAllocation)return nullptr;void* p=std::malloc(n);if(p)++allocations;return p;}

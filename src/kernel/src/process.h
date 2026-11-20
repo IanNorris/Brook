@@ -562,7 +562,6 @@ struct Process
     ProcessLifecycleRole lifecycleRole;
 
     UserCapabilityState capabilities; // credential lock; meaningful in private user namespaces
-    PidNamespaceIds pidNamespaceIds;
     UserNamespace* userNamespace; // owned immutable identity after publication; null is initial
     UtsNamespace* utsNamespace; // owned, synchronized by process_namespaces.h
     IpcNamespace* ipcNamespace;
@@ -586,6 +585,8 @@ struct Process
     uint64_t oomEpisode;
     struct SeccompFilter* seccompFilter; // owned immutable stack, replaced under the task registry lock
     uint32_t seccompTrap;               // synchronous SIGSYS for this syscall's return path
+    PidNamespaceIds pidNamespaceIds;    // immutable after birth, owns the active view
+    const PidNamespace* pidNamespaceForChildren; // owned by this task, independent of the active view
 };
 
 // A completed producer update invalidates any copied desktop-layer snapshot.

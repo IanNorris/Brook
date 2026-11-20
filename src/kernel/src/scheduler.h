@@ -110,6 +110,13 @@ void SchedulerMarkStopped(Process* proc, int signal = 19);
 void SchedulerReleaseWaitReference(Process* proc);
 // Registry-pinned lookup; caller must ProcessUnref the returned identity.
 Process* SchedulerFindProcessReference(uint16_t pid);
+Process* SchedulerFindVisibleProcessReference(const PidNamespace* view, uint32_t tid);
+uint32_t SchedulerVisibleParentTid(const Process* process, const PidNamespace* view);
+uint32_t SchedulerCollectVisibleSignalTargets(Process* caller, int32_t selector,
+                                               Process** targets, uint32_t capacity);
+int SchedulerGetProcessGroup(Process* caller, uint32_t tid, bool session);
+int SchedulerSetProcessGroup(Process* caller, uint32_t tid, uint32_t destination);
+int SchedulerCreateSession(Process* caller);
 // True only after every task, including terminated but not-yet-reaped tasks,
 // of this exact non-reused group has left the scheduler registry.
 bool SchedulerThreadGroupGone(uint16_t tgid,uint64_t incarnation);

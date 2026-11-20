@@ -80,6 +80,7 @@ static void AddProcessForBirth(Process* proc, Process* parent)
     // the existing stillborn resource cleanup for every user task.
     if(!proc->isKernelThread && (__atomic_load_n(&proc->oomEpisode,__ATOMIC_ACQUIRE) ||
        (proc->addressSpace && __atomic_load_n(&proc->addressSpace->oomTerminating,__ATOMIC_ACQUIRE))))stillborn=true;
+    if (!stillborn && !proc->isKernelThread && !ProcessPidPublish(proc)) stillborn = true;
     if (stillborn)
     {
         proc->state = ProcessState::Terminated;

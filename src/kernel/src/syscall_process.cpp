@@ -16,6 +16,7 @@
 #include "syscall_internal.h"
 #include "syscall_handlers.h"
 #include "seccomp.h"
+#include "pid_namespace.h"
 
 namespace brook {
 
@@ -141,8 +142,7 @@ int64_t sys_getpid(uint64_t, uint64_t, uint64_t,
     Process* proc = ProcessCurrent();
     if (!proc) return 1;
     // For threads, getpid returns the thread group leader's PID (tgid)
-    const uint32_t group = proc->tgid ? proc->tgid : proc->pid;
-    return proc->pidNamespaceIds.VisibleTgid(proc->pidNamespaceIds.Active(), group);
+    return ProcessVisibleTgid(proc, ProcessPidView(proc));
 }
 
 // ---------------------------------------------------------------------------
@@ -153,7 +153,7 @@ int64_t sys_getppid(uint64_t, uint64_t, uint64_t,
                      uint64_t, uint64_t, uint64_t)
 {
     Process* proc = ProcessCurrent();
-    return proc ? proc->parentPid : 0;
+    return proc ? SchedulerVisibleParentTid(proc, ProcessPidView(proc)) : 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -173,6 +173,10 @@ int64_t sys_fork(uint64_t, uint64_t, uint64_t,
                                  parent->syscallUserRsp,
                                  parent->syscallUserRflags);
     if (!child) return -ENOMEM;
+    if (const int error = ProcessPidPrepareChild(child, parent, false)) {
+        ProcessDiscardUnpublished(child);
+        return error;
+    }
 
     // Write captured register values into the child process struct.
     child->forkRbx = parent->syscallUserRbx;
@@ -188,11 +192,13 @@ int64_t sys_fork(uint64_t, uint64_t, uint64_t,
     child->forkR9  = parent->syscallUserR9;
     child->forkR10 = parent->syscallUserR10;
 
+    const uint32_t visibleTid = ProcessVisibleTid(child, ProcessPidView(parent));
+    [[maybe_unused]] const uint16_t globalPid = child->pid, globalTgid = child->tgid;
     SchedulerAddProcessWithSeccomp(child, parent);
 
     DbgPrintf("FORK: parent pid=%u tgid=%u -> child pid=%u tgid=%u\n",
-              parent->pid, parent->tgid, child->pid, child->tgid);
-    return static_cast<int64_t>(child->pid);
+              parent->pid, parent->tgid, globalPid, globalTgid);
+    return visibleTid;
 }
 
 int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAddr,
@@ -277,6 +283,11 @@ int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAddr,
     if(const auto domains=flags&CloneNewRuntimeNamespaces) {
         if(int error=ProcessNamespacesIsolate(child,domains)) {ProcessDiscardUnpublished(child);return error;}
     }
+    if (const int error = ProcessPidPrepareChild(child, parent, false)) {
+        ProcessDiscardUnpublished(child);
+        return error;
+    }
+    const uint32_t visibleTid = ProcessVisibleTid(child, ProcessPidView(parent));
     if (int error=SysvSemClone(parent,child,(flags & 0x00040000)!=0)) {
         SysvSemExit(child);
         ProcessDiscardUnpublished(child);
@@ -285,7 +296,7 @@ int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAddr,
     if (flags & CLONE_PARENT_SETTID) {
         // Threads checked the address above. For a fork, Linux stores into
         // the parent only and ignores a failed store.
-        const int32_t tid = static_cast<int32_t>(child->pid);
+        const int32_t tid = static_cast<int32_t>(visibleTid);
         const bool stored = CopyToUser(parentTidAddr, &tid, sizeof(tid));
         if (!stored && (flags & CLONE_THREAD)) {
             SysvSemExit(child);
@@ -319,16 +330,18 @@ int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAddr,
         __atomic_store_n(&child->vforkParent, parent, __ATOMIC_RELEASE);
     }
 
+    const uint16_t globalPid = child->pid;
+    [[maybe_unused]] const uint16_t globalTgid = child->tgid;
     SchedulerAddProcessWithSeccomp(child, parent);
 
     {
         if (!(flags & CLONE_THREAD))
             SerialPrintf("[PROFILE] fork t=%lums parent_pid=%u child_pid=%u\n",
-                         ApicTickCount(), parent->pid, child->pid);
+                         ApicTickCount(), parent->pid, globalPid);
     }
 
     DbgPrintf("CLONE: parent '%s' pid=%u tgid=%u -> child pid=%u tgid=%u flags=0x%lx %s\n",
-              parent->name, parent->pid, parent->tgid, child->pid, child->tgid, flags,
+              parent->name, parent->pid, parent->tgid, globalPid, globalTgid, flags,
               (flags & CLONE_THREAD) ? "THREAD" : "FORK");
 
     // CLONE_VFORK: parent blocks until child calls exec or exit.
@@ -342,7 +355,7 @@ int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAddr,
             SchedulerBlock(parent);
     }
 
-    return static_cast<int64_t>(child->pid);
+    return visibleTid;
 }
 
 int64_t sys_vfork(uint64_t, uint64_t, uint64_t,
@@ -519,8 +532,8 @@ int64_t sys_wait4(uint64_t pidArg, uint64_t statusAddr, uint64_t rawOptions,
     if (usageAddr && !UserBufferWritable(usageAddr, 144)) return -EFAULT;
     int32_t pid = static_cast<int32_t>(pidArg);
     if (pid == static_cast<int32_t>(0x80000000U)) return -ESRCH;
-    int selector = pid == -1 ? 0 : pid > 0 ? 1 : 2;
-    uint32_t id = pid == 0 ? parent->pgid : pid < -1 ? static_cast<uint32_t>(-pid) : static_cast<uint32_t>(pid);
+    int selector = pid == -1 ? 0 : pid > 0 ? 1 : pid < -1 ? 2 : 3;
+    uint32_t id = pid < -1 ? static_cast<uint32_t>(-pid) : static_cast<uint32_t>(pid);
     ChildWaitSnapshot event{};
     int result = WaitChildEvent(parent, selector, id, options | WEXITED, &event);
     if (result <= 0) return result;
@@ -544,7 +557,7 @@ int64_t sys_waitid(uint64_t rawSelector, uint64_t rawId, uint64_t infoAddr,
         !(options & (WUNTRACED | WEXITED | WCONTINUED))) return -EINVAL;
     if (infoAddr && !UserBufferWritable(infoAddr, sizeof(WaitSiginfo))) return -EFAULT;
     if (usageAddr && !UserBufferWritable(usageAddr, 144)) return -EFAULT;
-    if (selector == 2 && !id) id = parent->pgid;
+    if (selector == 2 && !id) selector = 3; // P_PGID with zero selects the caller’s group.
     ChildWaitSnapshot event{};
     int result = WaitChildEvent(parent, static_cast<int>(selector), id, options, &event);
     if (result < 0) return result;
@@ -575,73 +588,43 @@ int64_t sys_set_tid_address(uint64_t tidptr, uint64_t, uint64_t,
     Process* proc = ProcessCurrent();
     if (proc)
         proc->clearChildTid = tidptr;
-    return proc ? static_cast<int64_t>(proc->pid) : 1;
+    return proc ? ProcessVisibleTid(proc, ProcessPidView(proc)) : 1;
 }
 
 // ---------------------------------------------------------------------------
 // sys_getpgrp (111) / sys_getpgid (121) / sys_setpgid (109) / sys_getsid (124)
 // ---------------------------------------------------------------------------
 
-int64_t sys_getpgrp(uint64_t, uint64_t, uint64_t,
-                     uint64_t, uint64_t, uint64_t)
+int64_t sys_getpgrp(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t)
 {
     Process* proc = ProcessCurrent();
-    return proc ? proc->pgid : 1;
+    return proc ? SchedulerGetProcessGroup(proc, 0, false) : 1;
 }
 
-int64_t sys_getpgid(uint64_t pid, uint64_t, uint64_t,
-                     uint64_t, uint64_t, uint64_t)
+int64_t sys_getpgid(uint64_t pid, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t)
 {
-    if (pid == 0)
-    {
-        Process* proc = ProcessCurrent();
-        return proc ? proc->pgid : 1;
-    }
-    // Look up by pid
-    Process* target = ProcessFindByPid(static_cast<uint16_t>(pid));
-    if (!target) return -ESRCH;
-    return target->pgid;
+    Process* proc = ProcessCurrent();
+    return proc ? SchedulerGetProcessGroup(proc, static_cast<uint32_t>(pid), false) : pid ? -ESRCH : 1;
 }
 
-int64_t sys_setpgid(uint64_t pid, uint64_t pgid, uint64_t,
-                     uint64_t, uint64_t, uint64_t)
+int64_t sys_setpgid(uint64_t pid, uint64_t pgid, uint64_t, uint64_t, uint64_t, uint64_t)
 {
     Process* proc = ProcessCurrent();
     if (!proc) return -ESRCH;
-
-    Process* target = (pid == 0) ? proc : ProcessFindByPid(static_cast<uint16_t>(pid));
-    if (!target) return -ESRCH;
-
-    // pgid=0 means set pgid to the target's pid
-    uint16_t newPgid = (pgid == 0) ? target->pid : static_cast<uint16_t>(pgid);
-    target->pgid = newPgid;
-    return 0;
+    if (static_cast<int32_t>(pgid) < 0) return -EINVAL;
+    return SchedulerSetProcessGroup(proc, static_cast<uint32_t>(pid), static_cast<uint32_t>(pgid));
 }
 
-int64_t sys_getsid(uint64_t pid, uint64_t, uint64_t,
-                    uint64_t, uint64_t, uint64_t)
-{
-    if (pid == 0)
-    {
-        Process* proc = ProcessCurrent();
-        return proc ? proc->sid : 1;
-    }
-    Process* target = ProcessFindByPid(static_cast<uint16_t>(pid));
-    if (!target) return -ESRCH;
-    return target->sid;
-}
-
-// sys_setsid (112) — create a new session
-int64_t sys_setsid(uint64_t, uint64_t, uint64_t,
-                    uint64_t, uint64_t, uint64_t)
+int64_t sys_getsid(uint64_t pid, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t)
 {
     Process* proc = ProcessCurrent();
-    if (!proc) return -EPERM;
+    return proc ? SchedulerGetProcessGroup(proc, static_cast<uint32_t>(pid), true) : pid ? -ESRCH : 1;
+}
 
-    // Process becomes session leader and process group leader
-    proc->sid = proc->pid;
-    proc->pgid = proc->pid;
-    return proc->pid;
+int64_t sys_setsid(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    return proc ? SchedulerCreateSession(proc) : -EPERM;
 }
 
 // ---------------------------------------------------------------------------
@@ -652,7 +635,7 @@ int64_t sys_gettid(uint64_t, uint64_t, uint64_t,
                     uint64_t, uint64_t, uint64_t)
 {
     Process* proc = ProcessCurrent();
-    return proc ? proc->pidNamespaceIds.VisibleTid(proc->pidNamespaceIds.Active(), proc->pid) : 1;
+    return proc ? ProcessVisibleTid(proc, ProcessPidView(proc)) : 1;
 }
 
 // ---------------------------------------------------------------------------

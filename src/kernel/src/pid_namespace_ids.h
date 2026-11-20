@@ -6,8 +6,8 @@ namespace brook {
 
 struct PidNamespace;
 
-// Global scheduler IDs remain in Process. These entries are immutable after
-// publication and bind a local number to the exact namespace that allocated it.
+// Global scheduler IDs remain in Process. The view, TID and TGID are
+// immutable after publication. Group and session IDs use the registry lock.
 struct PidNamespaceIds {
     static constexpr unsigned MaxDepth = 8;
 
@@ -15,6 +15,8 @@ struct PidNamespaceIds {
         const PidNamespace* ns;
         uint32_t tid;
         uint32_t tgid;
+        uint32_t group;
+        uint32_t session;
     };
 
     Entry entries[MaxDepth]{};
@@ -26,7 +28,7 @@ struct PidNamespaceIds {
 
     bool Add(const PidNamespace* ns, uint32_t tid, uint32_t tgid) {
         if (!ns || !tid || !tgid || count >= MaxDepth || Find(ns)) return false;
-        entries[count++] = {ns, tid, tgid};
+        entries[count++] = {ns, tid, tgid, 0, 0};
         return true;
     }
 
@@ -40,6 +42,12 @@ struct PidNamespaceIds {
         if (!view) return globalTgid;
         const auto* entry = Find(view);
         return entry ? entry->tgid : 0;
+    }
+
+    uint32_t VisibleRelation(const PidNamespace* view, uint32_t globalId, bool session) const {
+        if (!view) return globalId;
+        const auto* entry = Find(view);
+        return entry ? (session ? entry->session : entry->group) : 0;
     }
 
 private:

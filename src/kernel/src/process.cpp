@@ -9,6 +9,7 @@
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "process.h"
+#include "pid_namespace.h"
 #include "seccomp.h"
 #include "robust_futex.h"
 #include "process_fs.h"
@@ -55,8 +56,8 @@ static_assert(offsetof(Process,mountNamespaceMember)+sizeof(Process::mountNamesp
               "fork/thread snapshot must exclude both filesystem ownership fields");
 static_assert(offsetof(Process,fsContext)+sizeof(Process::fsContext)==offsetof(Process,oomEpisode),
               "recovery marker follows independently synchronized filesystem state");
-static_assert(sizeof(Process)-(offsetof(Process,oomEpisode)+sizeof(Process::oomEpisode))<alignof(Process),
-              "explicitly inherited recovery marker must remain last, allowing alignment padding");
+static_assert(offsetof(Process,pidNamespaceIds)>offsetof(Process,oomEpisode),
+              "raw fork/thread snapshot excludes all PID namespace ownership");
 
 namespace {
 IrqSpinLock signalActionLock;
@@ -187,6 +188,7 @@ static inline void FreeProcessStruct(Process* p)
         }
 
         SeccompRelease(SeccompLoad(p));
+        ProcessPidRelease(p);
         ProcessFsClear(p);
         ProcessNamespacesRelease(p);
         ProcessGroupsRelease(p->groups); p->groups = nullptr;
