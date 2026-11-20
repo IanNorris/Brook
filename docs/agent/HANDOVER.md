@@ -95,6 +95,12 @@ _Last updated: 19 November 2026 (early), by a Claude Code session; see "19 Nov e
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**20 Nov: Dell on gen 465 = Codex `work/files-nautilus` 1c6aefce pair (session `1037e3355b2f4f4aa28c5b27cb3182a7`)** plus profile changes staged by hand:
+- tx `files1120` (store paths through install.py, then 228 link swaps and a Files line in applications.idx by a guest script with an install.py-format rollback record);
+- `apps1120`/`apps1120b` (brook-apps: brook-apps-index, brook-webapp).
+Pins persist across reboots (last_load restored). The Files pin key brook-hardware-files wasn't migrated (sent to Codex as F-fix). WhatsApp web app installed via `brook-webapp add web.whatsapp.com --category chat` (user manifest written; the kernel reads it only after Codex U). Chromium titles --app windows with the host, so Codex U adds titling by Name for X-Brook-WebApp entries.
+**Ian, 20 Nov:** stop hand-built staging. Codex TASK S (work/closure-stage): a host stage plan plus a signed Brook binary cache; on device, nix-install/nix-fetch reuses or fetches paths, switches profile generations atomically and regenerates applications.idx; dell_deploy ships the kernel and profile together. My branch work/webapps: 509a8e1f, 927a460b brook-apps, and the install.py fix for non-exec bin files.
+
 **20 Nov: Dell on Codex `work/launcher-persist` 7ff49197 pair (dell-launcherpersist-20261120, --clearwater-shell; session `fda1ea22568d46008b679330661f988e`).** `launcher status` works; first-run pins were saved (saved_epoch 2). Codex queue: F files-nautilus (started), G shell-tray, H launcher-organise (organise mode, polish, icon tiles, descriptions), I system-small (SYSTEM volume, restart kills hung windows, capture cursor/buffer, umask test). Codex runs the queue itself.
 **Claude now owns web apps and Flatpak (Ian, 20 Nov).** Plan:
 - a user app index (scan ~/.local/share/applications and the Flatpak export dirs, then write a user manifest and icons the kernel launcher also reads, and notify via 0xB03);
