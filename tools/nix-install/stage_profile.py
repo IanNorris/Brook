@@ -8,13 +8,14 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from stage_nar import STORE, STORE_NAME, ensure_path, nar_hash, rename_no_replace
+from stage_nar import STORE, STORE_NAME, ensure_path, layout_digest, nar_hash, profile_layout, rename_no_replace
 from collect_desktop_entries import collect
 
 MAX_PLAN = 16 * 1024 * 1024
@@ -43,7 +44,7 @@ def relative_path(value):
 
 
 def validate_plan(plan):
-    if plan["format"] != 1:
+    if plan["format"] not in (1, 2):
         raise ValueError("Unknown closure plan version")
     cache = urlsplit(plan["cache"]["brook"])
     if (cache.scheme not in ("http", "https") or not cache.hostname
@@ -69,7 +70,20 @@ def validate_plan(plan):
             reachable.add(name)
     if not reachable or reachable != closure.keys():
         raise ValueError("Plan contains paths outside the requested closure")
-    layout = plan["profile"]
+    for package in plan["packages"]:
+        if package["store"] not in closure:
+            raise ValueError("Package row outside the closure")
+        checked_row(package["name"], package["version"], package["store"])
+    if plan["format"] == 1:
+        validate_layout(plan["profile"], closure)
+    else:
+        recipe = plan["profile"]
+        if (recipe["root"] != plan["roots"][0]
+                or not re.fullmatch(r"[a-f0-9]{64}", recipe["layoutSha256"])):
+            raise ValueError("Invalid signed profile layout recipe")
+
+
+def validate_layout(layout, closure):
     directories = {relative_path(item) for item in layout["directories"]}
     links = {relative_path(item) for item in layout["links"]}
     if links & directories or any(p.parent != Path() and p.parent not in directories
@@ -82,10 +96,7 @@ def validate_plan(plan):
             raise ValueError(f"Profile target outside the closure: {target}")
         if separator:
             relative_path(remainder)
-    for package in plan["packages"]:
-        if package["store"] not in closure:
-            raise ValueError("Package row outside the closure")
-        checked_row(package["name"], package["version"], package["store"])
+
 
 
 def checked_row(name, version, store):
@@ -194,9 +205,16 @@ def prepare(nix, plan, previous, destination):
     manifest = {p["name"].casefold(): (p["name"], p["version"], p["store"])
                 for p in plan["packages"]}
     manifest.update({row[0].casefold(): row for row in rows})
-    for path in sorted(plan["profile"]["directories"], key=lambda item: (item.count("/"), item)):
+    layout = plan["profile"]
+    if plan["format"] == 2:
+        store = nix / "store"
+        layout = profile_layout(store / layout["root"], plan["closure"], store=store)
+        if layout_digest(layout) != plan["profile"]["layoutSha256"]:
+            raise ValueError("Reconstructed profile differs from the signed layout")
+        validate_layout(layout, plan["closure"])
+    for path in sorted(layout["directories"], key=lambda item: (item.count("/"), item)):
         (destination / path).mkdir()
-    for name, target in plan["profile"]["links"].items():
+    for name, target in layout["links"].items():
         store_path = nix / target.removeprefix("/nix/")
         if not store_path.is_file():
             raise ValueError(f"Profile target is missing: {target}")
@@ -288,6 +306,25 @@ def rollback(nix, transaction):
     notify(nix)
 
 
+def copy_legacy_launcher(source, destination, owner):
+    """Copy launcher entries without relying on xattrs or timestamp syscalls."""
+    mode = source.lstat().st_mode
+    if stat.S_ISLNK(mode):
+        destination.symlink_to(os.readlink(source))
+    elif stat.S_ISDIR(mode):
+        destination.mkdir(mode=stat.S_IMODE(mode))
+        for child in source.iterdir():
+            copy_legacy_launcher(child, destination / child.name, owner)
+    elif stat.S_ISREG(mode):
+        with source.open("rb") as incoming, destination.open("xb") as outgoing:
+            shutil.copyfileobj(incoming, outgoing)
+        destination.chmod(stat.S_IMODE(mode))
+    else:
+        raise ValueError(f"Unexpected legacy launcher entry {source}")
+    if owner is not None:
+        os.chown(destination, owner, owner, follow_symlinks=False)
+
+
 def initialize(nix):
     """Migrate a quiescent legacy image. Re-entry resumes an interrupted migration."""
     with mutation_lock(nix):
@@ -313,13 +350,7 @@ def initialize(nix):
             if not launcher.exists():
                 with tempfile.TemporaryDirectory(prefix=".brook-app-copy-", dir=profile) as scratch:
                     copy = Path(scratch) / "launcher"
-                    shutil.copytree(apps, copy, symlinks=True)
-                    if nix == Path("/nix"):
-                        for directory, _, files in os.walk(copy, followlinks=False):
-                            os.chown(directory, DESKTOP_UID, DESKTOP_UID)
-                            for file in files:
-                                os.chown(Path(directory) / file, DESKTOP_UID, DESKTOP_UID,
-                                         follow_symlinks=False)
+                    copy_legacy_launcher(apps, copy, DESKTOP_UID if nix == Path("/nix") else None)
                     os.sync()
                     rename_no_replace(copy, launcher)
                     flush_directory(profile)

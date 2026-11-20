@@ -22,7 +22,7 @@ NIX = ["nix", "--extra-experimental-features", "nix-command"]
 
 
 class PlanIntegration(unittest.TestCase):
-    @unittest.skipUnless(all(shutil.which(tool) for tool in ("nix", "openssl", "curl", "xz", "cc")),
+    @unittest.skipUnless(all(shutil.which(tool) for tool in ("nix", "openssl", "curl", "zstd", "cc")),
                          "requires the host cache tools and OpenSSL")
     def test_signed_cache_and_profile_generation(self):
         with tempfile.TemporaryDirectory(prefix="brook-closure-fixture-") as scratch:
@@ -119,7 +119,7 @@ class PlanIntegration(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         apply(root, signed_plan, digest, "2" * 32, tools)
                     self.assertEqual(os.readlink(root / PROFILE_ALIAS), ".brook-profile-legacy")
-                    plan["profile"]["links"]["../bad"] = str(built)
+                    plan["profile"]["root"] = "../bad"
                     with self.assertRaises(ValueError):
                         validate_plan(plan)
                 finally:

@@ -13,7 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools/nix-install"))
-from stage_nar import STORE, UPSTREAM, nar_hash, store_name
+from stage_nar import STORE, UPSTREAM, layout_digest, nar_hash, profile_layout, store_name
 
 EXPRESSION = ROOT / "nix/hardware-network-packages.nix"
 NIX = ["nix", "--extra-experimental-features", "nix-command"]
@@ -60,29 +60,6 @@ def upstream_has(name, entry):
     )
 
 
-def profile_layout(profile, closure):
-    links = {}
-    directories = []
-
-    def walk(source, relative, ancestors):
-        resolved = source.resolve(strict=True)
-        suffix = resolved.relative_to(STORE)
-        if suffix.parts[0] not in closure or resolved in ancestors or len(ancestors) >= 128:
-            raise ValueError(f"Invalid profile entry {source} -> {resolved}")
-        if resolved.is_dir():
-            if relative.parts:
-                directories.append(relative.as_posix())
-            for child in sorted(resolved.iterdir()):
-                walk(child, relative / child.name, (*ancestors, resolved))
-        elif resolved.is_file() and relative.parts:
-            links[relative.as_posix()] = str(resolved)
-        else:
-            raise ValueError(f"Unsupported profile entry {source}")
-
-    walk(profile, Path(), ())
-    return {"directories": directories, "links": links}
-
-
 def generate_plan(profile, extras, cache_url, mirror_upstream, packages=()):
     roots = list(dict.fromkeys(
         [str(profile), *map(str, extras), *(str(STORE / row["store"]) for row in packages)]
@@ -93,10 +70,13 @@ def generate_plan(profile, extras, cache_url, mirror_upstream, packages=()):
         for name, upstream in zip(sorted(closure), checks):
             closure[name]["source"] = "upstream" if upstream else "brook"
     return {
-        "format": 1,
+        "format": 2,
         "roots": [store_name(path) for path in roots],
         "closure": closure,
-        "profile": profile_layout(profile, closure),
+        "profile": {
+            "root": store_name(str(profile)),
+            "layoutSha256": layout_digest(profile_layout(profile, closure)),
+        },
         "packages": list(packages),
         "cache": {"brook": cache_url, "mirrorUpstream": mirror_upstream},
     }
@@ -107,19 +87,31 @@ def publish_cache(info, directory, key, mirror_upstream):
              if mirror_upstream or entry["source"] == "brook"]
     directory.mkdir()
     if names:
-        url = directory.as_uri() + "?secret-key=" + quote(str(key))
-        # Copy explicit paths only. Nix copy otherwise copies their entire
-        # closure, including upstream dependencies already served by NixOS.
+        url = directory.as_uri() + "?compression=zstd&secret-key=" + quote(str(key))
+        # Standard Nix caches admit a path only after its references. Populate
+        # those dependencies first, then retain the signed archives selected
+        # by the plan. A cache served to a host-only target keeps its mirror.
         for start in range(0, len(names), 128):
             batch = [str(STORE / name) for name in names[start:start + 128]]
-            run([*NIX, "copy", "--no-check-sigs", "--no-recursive",
-                 "--to", url, *batch])
+            run([*NIX, "copy", "--no-check-sigs", "--to", url, *batch])
     else:
         (directory / "nix-cache-info").write_text("StoreDir: /nix/store\nWantMassQuery: 0\n")
+    retained = set()
+    archives = set()
     for name in names:
         narinfo = directory / f"{name[:32]}.narinfo"
-        if not any(line.startswith("Sig: ") for line in narinfo.read_text().splitlines()):
+        fields = narinfo.read_text().splitlines()
+        if not any(line.startswith("Sig: ") for line in fields):
             raise ValueError(f"Cache path was not signed: {name}")
+        retained.add(narinfo)
+        archives.add(directory / next(line.removeprefix("URL: ") for line in fields
+                                      if line.startswith("URL: ")))
+    for narinfo in directory.glob("*.narinfo"):
+        if narinfo not in retained:
+            narinfo.unlink()
+    for archive in (directory / "nar").glob("*"):
+        if archive.is_file() and archive not in archives:
+            archive.unlink()
 
 
 def verify_private_key(path):
@@ -131,7 +123,7 @@ def profile_metadata(expression):
     query = (
         "let e = import (builtins.toPath " + json.dumps(str(expression))
         + ") {}; in { profile = toString e.profile; packages = map (p: "
-        "{name = p.pname or p.name; version = p.version or ""; "
+        '{name = p.pname or p.name; version = p.version or ""; '
         "store = builtins.baseNameOf (toString p);}) e.packages; }"
     )
     metadata = run(["nix-instantiate", "--eval", "--strict", "--json", "-E", query],

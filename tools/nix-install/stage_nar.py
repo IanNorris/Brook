@@ -1,9 +1,9 @@
 """Hash and import the exact Nix archive named in a trusted stage plan."""
 
 import base64
-import ctypes
 import errno
 import hashlib
+import json
 import os
 import re
 import stat
@@ -25,6 +25,38 @@ def store_name(value):
     if str(path.parent) != str(STORE) or not STORE_NAME.fullmatch(path.name):
         raise ValueError(f"Invalid Nix store path {value!r}")
     return path.name
+
+
+def profile_layout(profile, closure, *, store=STORE):
+    """Expand a verified profile root without changing its store references."""
+    links = {}
+    directories = []
+
+    def walk(source, relative, ancestors):
+        resolved = source.resolve(strict=True)
+        if resolved.is_relative_to(store):
+            suffix = resolved.relative_to(store)
+        else:
+            suffix = resolved.relative_to(STORE)
+        if not suffix.parts or suffix.parts[0] not in closure or resolved in ancestors or len(ancestors) >= 128:
+            raise ValueError(f"Invalid profile entry {source} -> {resolved}")
+        if resolved.is_dir():
+            if relative.parts:
+                directories.append(relative.as_posix())
+            for child in sorted(resolved.iterdir()):
+                walk(child, relative / child.name, (*ancestors, resolved))
+        elif resolved.is_file() and relative.parts:
+            links[relative.as_posix()] = str(STORE / suffix)
+        else:
+            raise ValueError(f"Unsupported profile entry {source}")
+
+    walk(profile, Path(), ())
+    return {"directories": directories, "links": links}
+
+
+def layout_digest(layout):
+    canonical = json.dumps(layout, sort_keys=True, separators=(",", ":")).encode("ascii")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def nar_hash(value):
@@ -189,6 +221,8 @@ def verified_archive(url, compression, archive, entry, tools):
 
 
 def rename_no_replace(source, target):
+    import ctypes
+
     libc = ctypes.CDLL(None, use_errno=True)
     if libc.renameat2(-100, os.fsencode(source), -100, os.fsencode(target), 1):
         error = ctypes.get_errno()

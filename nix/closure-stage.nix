@@ -11,5 +11,5 @@ let
   '';
 in pkgs.writeShellScriptBin "brook-stage-profile" ''
   export BROOK_STAGE_OPENSSL=${pkgs.lib.getBin pkgs.openssl}/bin/openssl
-  exec ${python}/bin/python3 -E -s ${support}/scripts/stage_profile.py "$@"
+  exec ${python}/bin/python3 -B -E -s ${support}/scripts/stage_profile.py "$@"
 ''
