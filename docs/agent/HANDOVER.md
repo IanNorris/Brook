@@ -95,6 +95,12 @@ _Last updated: 19 November 2026 (early), by a Claude Code session; see "19 Nov e
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**Flatpak (Claude owns), 20 Nov.** The bubblewrap probe on gen 465 (bwrap 0.11.1 is already in the store at dk9qhjgg…) shows unmodified bwrap can't run:
+- every variant fails at "remount /newroot/proc: Operation not supported" (only RDONLY bind-remounts are supported);
+- NEWIPC/UTS/NET/PID → clone EINVAL;
+- there's no proc/devpts/mqueue mount, no unshare/setns and no seccomp.
+Kernel container work went to Codex: K1 containers-mounts (remount flags, proc/devpts/mqueue, IPC/UTS/empty NET namespaces, unshare), K3 seccomp (cBPF filters), K2 pid-namespaces (design first). Codex order: xdg-resize-fix → S → K1 → K3 → G finish (paused at 8a04faae) → K2 → H → I. Userland after K1/K3: flatpak, ostree (bare-user-only, --user installs), xdg-dbus-proxy, portals; Signal is Electron using zypak, which needs flatpak-spawn/portal support.
+
 **20 Nov: Dell on gen 465 = Codex `work/files-nautilus` 1c6aefce pair (session `1037e3355b2f4f4aa28c5b27cb3182a7`)** plus profile changes staged by hand:
 - tx `files1120` (store paths through install.py, then 228 link swaps and a Files line in applications.idx by a guest script with an install.py-format rollback record);
 - `apps1120`/`apps1120b` (brook-apps: brook-apps-index, brook-webapp).
