@@ -757,6 +757,35 @@ int main() {
         CHECK(restored.Parse(layoutText));
         CHECK(restored.PinCount() == state.pinCount);
         CHECK(!strcmp(restored.PinKey(restored.PinCount() - 1), "snapshot-fixture"));
+
+        // The newly published snapshot has the same visible apps, but its
+        // raw item indices changed. Release must queue the app under the
+        // pointer using the current guarded snapshot's item mapping.
+        DesktopRect appRow{};
+        const auto& frame = LauncherFrame(sw, sh, -1, -1);
+        for (uint32_t i = 0; i < frame.targetCount; ++i) {
+            const auto& target = frame.targets[i];
+            if (target.target.kind == LauncherTargetKind::Row && target.target.index == 1) appRow = target.rect;
+        }
+        CHECK(appRow.w > 0);
+        const int mx = appRow.x + appRow.w / 2, my = appRow.y + appRow.h / 2;
+        CHECK(WmLauncherPress(mx, my, sw, sh, false) && g_launcherModel.PointerHeld());
+        static LauncherSnapshot refreshed{};
+        refreshed.generation = 2;
+        refreshed.count = 3;
+        refreshed.items[1] = catalog.items[0];
+        refreshed.items[2] = catalog.items[1];
+        WmStrCopy(refreshed.items[1].scriptPath, "/boot/WRONG.ELF", sizeof(refreshed.items[1].scriptPath));
+        WmStrCopy(refreshed.items[2].scriptPath, "/boot/EXPECTED.ELF", sizeof(refreshed.items[2].scriptPath));
+        g_launcherActive = &refreshed;
+        g_launcherWorkerStarted = true; // the host fixture observes the launch queue instead of running it
+        CHECK(WmLauncherGesture(mx, my, sw, sh, true));
+        CHECK(!g_launcherModel.PointerHeld() && !g_launcherOpen);
+        CHECK(g_launches.entries[0].phase == LaunchPhase::Queued);
+        CHECK(!strcmp(g_launchRequests[0].command, "/boot/EXPECTED.ELF"));
+        g_launcherWorkerStarted = g_launchBusy = false;
+        g_launches.entries[0] = {};
+        g_taskbarPageTarget = -1;
         g_launcherOpen = g_launcherLoaded = false;
         g_launcherActive = &g_emptyLauncher;
     }

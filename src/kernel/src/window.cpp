@@ -2609,6 +2609,9 @@ bool WmLauncherVisible()
     return g_launcherOpen;
 }
 
+static int AdmitLauncherItem(const LauncherSnapshot& catalog, int itemIdx, bool tracked,
+                             uint64_t* token, bool* coalesced);
+
 #include "wm_shell_launcher.inc"
 
 bool WmCaptureShellModel(const WmShellSurface& s, uint32_t screenW, uint32_t screenH,
