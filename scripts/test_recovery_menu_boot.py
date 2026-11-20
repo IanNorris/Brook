@@ -19,7 +19,7 @@ from pathlib import Path
 def boot(image, firmware, work, recovery, marker, timeout, sata, forbidden=None, sata_snapshot=True,
          hold_after_marker=0, sata_serial=None, failure_marker=None, extra_fw_cfg=None, expect_reset=False,
          network_port=None,on_marker=None,network_usb=False,intermediate_marker=None,on_intermediate=None,
-         reset_evidence_marker='PANIC_TEST_RESET_WAIT',gdb_script=None,smp=2,bulk_port=None):
+         reset_evidence_marker='PANIC_TEST_RESET_WAIT',gdb_script=None,smp=2,bulk_port=None,update_port=None):
     variables = work / 'vars.fd'
     serial = work / 'serial.log'
     monitor = work / 'monitor.sock'
@@ -48,6 +48,7 @@ def boot(image, firmware, work, recovery, marker, timeout, sata, forbidden=None,
     ]
     if network_port is not None:
         forward=f',hostfwd=tcp:127.0.0.1:{bulk_port}-:1236' if bulk_port else ''
+        if update_port is not None:forward+=f',hostfwd=tcp:127.0.0.1:{update_port}-:1235'
         command += ['-netdev',f'user,id=recovery-net,hostfwd=tcp:127.0.0.1:{network_port}-:1234'+forward]
         command += (['-device','qemu-xhci,id=recovery-xhci',
                      '-device','usb-net,bus=recovery-xhci.0,port=2,netdev=recovery-net'] if network_usb else
