@@ -6,6 +6,7 @@
 #include "pid_namespace.h"
 #include "ahci_system_volume.h"
 #include "boot_timing_runtime.h"
+#include "guard_checker_runner.h"
 #include "process_user_namespace.h"
 #include "../../shared/brook_system_esp.h"
 #include "../../shared/update/guard_slot_health.h"
@@ -203,6 +204,21 @@ int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
             result.mode = BROOK_ESP_BOOT_SLOT_RECOVERY;
         }
         return CopyToUser(arg, &result, sizeof(result)) ? 0 : -EFAULT;
+    }
+
+    if (cmd == BROOK_IOCTL_CHECK_SYSTEM_ESP_GUARD_IDENTITY) {
+        if (!ProcessCapable(proc, nullptr, CapSysAdmin)) return -EPERM;
+        if (fde->type != FdType::Vnode || !fde->handle) return -25; // ENOTTY
+        auto* node = static_cast<Vnode*>(fde->handle);
+        if (node->type != VnodeType::Dir) return -25;
+        if (!AhciSystemVolumeOwnsRoot(node)) return -ENODEV;
+#if defined(BROOK_SSD_GUARDED_DESKTOP) || defined(BROOK_HOST_TEST)
+        uint8_t digest[32];
+        if (!CopyFromUser(digest, arg, sizeof(digest))) return -EFAULT;
+        return GuardedDesktopCheckGuardIdentity(digest);
+#else
+        return -25; // The verified ESP has no guarded desktop admission context.
+#endif
     }
 
     if(cmd==BROOK_IOCTL_VERIFY_SYSTEM_ESP_ROOT || cmd==BROOK_IOCTL_VERIFY_SYSTEM_ESP_MEMBER) {

@@ -16,6 +16,9 @@ struct GuardRecoverySlotState {
 int GuardRecoverySlotStatus(GuardRecoverySlotState& out);
 
 #endif
+#if defined(BROOK_SSD_GUARDED_DESKTOP) || defined(BROOK_HOST_TEST)
+int GuardedDesktopCheckGuardIdentity(const uint8_t (&digest)[32]);
+#endif
 #if defined(BROOK_SSD_GUARDED_DESKTOP)
 bool GuardedDesktopBridgeEnabled();
 #if defined(BROOK_SSD_AUTO_RECOVERY)

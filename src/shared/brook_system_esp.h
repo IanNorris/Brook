@@ -4,7 +4,13 @@
  * root of the boot-admitted SSD ESP. Grants no additional write authority. */
 enum { BROOK_IOCTL_VERIFY_SYSTEM_ESP_ROOT = 0xb2e0,
        BROOK_IOCTL_VERIFY_SYSTEM_ESP_MEMBER = 0xb2e1,
-       BROOK_IOCTL_GET_SYSTEM_ESP_BOOT_SLOT = 0xb2e2 };
+       BROOK_IOCTL_GET_SYSTEM_ESP_BOOT_SLOT = 0xb2e2,
+       BROOK_IOCTL_CHECK_SYSTEM_ESP_GUARD_IDENTITY = 0xb2e3 };
+
+/* BROOK_IOCTL_CHECK_SYSTEM_ESP_GUARD_IDENTITY takes a 32-byte SHA-256
+ * digest of the 96 lowercase ASCII identity characters. Success matches
+ * the clean guard pair verified and retained at guarded desktop admission.
+ * The comparison grants no file access and does not change the media. */
 
 enum { BROOK_ESP_BOOT_SLOT_VERSION = 1,
        BROOK_ESP_BOOT_SLOT_UNTRACKED = 0,

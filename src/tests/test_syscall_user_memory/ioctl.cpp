@@ -14,6 +14,9 @@ bool g_capsetSawUserPointer;
 brook::Vnode* g_espRoot;
 brook::BootGuardSlot g_bootSlot{};
 uint32_t g_bootFlags;
+bool g_guardIdentityReady;
+unsigned g_guardDigestCalls;
+uint8_t g_guardIdentityDigest[32];
 int32_t FakeGetCapset(uint32_t,uint32_t,void* out,uint32_t bytes) {
     if(InArena(reinterpret_cast<uint64_t>(out),1,Access::Read))g_capsetSawUserPointer=true;
     __builtin_memset(out,0x77,bytes<8?bytes:8);
@@ -36,6 +39,11 @@ namespace brook {
 bool AhciSystemVolumeOwnsRoot(Vnode* node) { return node==g_espRoot; }
 BootGuardSlot BootTimingHandoffSlot() { return g_bootSlot; }
 uint32_t BootTimingHandoffFlags() { return g_bootFlags; }
+int GuardedDesktopCheckGuardIdentity(const uint8_t (&digest)[32]) {
+    ++g_guardDigestCalls;
+    if(!g_guardIdentityReady)return -11;
+    return BrookUpdateEqual(digest,g_guardIdentityDigest,sizeof(digest))?0:-116;
+}
 }
 
 static void SystemEspBootSlot() {
@@ -138,9 +146,40 @@ static void VirtioGetCaps() {
     free(context);
 }
 
+static void SystemEspGuardIdentity() {
+    Reset();ResetProcess();
+    brook::Vnode root{};
+    root.type=brook::VnodeType::Dir;
+    auto& fd=CurrentProcess()->fds[3];
+    fd.type=brook::FdType::Vnode;
+    fd.handle=&root;
+    const auto input=Patterned(0,sizeof(g_guardIdentityDigest));
+    const auto query=[](uint64_t address) {
+        return brook::sys_ioctl(3,BROOK_IOCTL_CHECK_SYSTEM_ESP_GUARD_IDENTITY,address,0,0,0);
+    };
+    SetNamespaceAdmin(false);
+    g_espRoot=&root;
+    CHECK(query(input)==-brook::EPERM && !g_guardDigestCalls);
+    SetNamespaceAdmin(true);
+    g_espRoot=nullptr;
+    CHECK(query(input)==-brook::ENODEV && !g_guardDigestCalls);
+    g_espRoot=&root;
+    CHECK(query(g_kernel.Address())==-brook::EFAULT && !g_guardDigestCalls && g_kernel.Intact());
+    CHECK(query(input)==-brook::EAGAIN && g_guardDigestCalls==1);
+    g_guardIdentityReady=true;
+    CHECK(query(input)==-116 && g_guardDigestCalls==2);
+    __builtin_memset(g_guardIdentityDigest,0x5a,sizeof(g_guardIdentityDigest));
+    CHECK(query(input)==0 && g_guardDigestCalls==3);
+    CHECK(Untouched(input,sizeof(g_guardIdentityDigest)));
+    g_guardIdentityReady=false;
+    g_guardDigestCalls=0;
+    g_espRoot=nullptr;
+}
+
 void RunIoctlTests() {
     Termios();
     Fionread();
     VirtioGetCaps();
     SystemEspBootSlot();
+    SystemEspGuardIdentity();
 }

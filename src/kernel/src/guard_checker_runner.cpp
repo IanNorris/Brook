@@ -52,8 +52,13 @@ namespace brook {
 #if defined(BROOK_SSD_GUARDED_DESKTOP)
 namespace {
 bool guardedDesktopBridge=false;
+uint8_t guardedDesktopIdentityDigest[32]{};
 }
 bool GuardedDesktopBridgeEnabled() {return __atomic_load_n(&guardedDesktopBridge,__ATOMIC_ACQUIRE);}
+int GuardedDesktopCheckGuardIdentity(const uint8_t (&digest)[32]) {
+    if(!GuardedDesktopBridgeEnabled())return -11;
+    return BrookUpdateEqual(digest,guardedDesktopIdentityDigest,sizeof(digest))?0:-116;
+}
 #if defined(BROOK_SSD_AUTO_RECOVERY)
 namespace {
 FatPrivateMount* acShutdownMount=nullptr;
@@ -384,6 +389,9 @@ void Worker(void* arg) {
             return;
         }
         if(!ShutdownLaunchAllowed())return;
+        // Both clean guard records were verified together and their canonical
+        // files remain exclusively leased for the lifetime of this mount.
+        BrookUpdateHash(reinterpret_cast<const uint8_t*>(identity),96,guardedDesktopIdentityDigest);
         __atomic_store_n(&guardedDesktopBridge,true,__ATOMIC_RELEASE);
         if(trackSlot)PublishRecoverySlotStatus(mount,"desktop");
         if(slotStarted) {

@@ -7,10 +7,18 @@ import tempfile
 ROOT=Path(__file__).resolve().parents[1]
 HARNESS=r'''
 #include <errno.h>
+#include <stdarg.h>
+#include <initializer_list>
+#include <stdint.h>
+#include <sys/ioctl.h>
 #include <sys/statfs.h>
 #include <unistd.h>
 static unsigned fail_sync=0;
 static bool low_space=false;
+static int guard_ioctl_result=-1, guard_ioctl_error=ENOTTY;
+static int expected_root=-1;
+static uint8_t expected_digest[32]{};
+static int test_ioctl(int fd,unsigned long request,...);
 static int test_sync(int fd) {
     if(fail_sync && --fail_sync==0){errno=EIO;return -1;}
     return fsync(fd);
@@ -21,13 +29,31 @@ static int test_space(int fd, struct statfs* space) {
     }
     return fstatfs(fd,space);
 }
+#define ioctl test_ioctl
 #define fsync test_sync
 #define fstatfs test_space
 #define main guard_provision_main
 #include "hardware_guard_provision.cpp"
 #undef main
+#undef ioctl
 #undef fsync
 #undef fstatfs
+static int test_ioctl(int fd,unsigned long request,...) {
+    if(fd!=expected_root || request!=BROOK_IOCTL_CHECK_SYSTEM_ESP_GUARD_IDENTITY){
+        errno=EINVAL;
+        return -1;
+    }
+    va_list args;
+    va_start(args,request);
+    const auto* digest=va_arg(args,uint8_t*);
+    va_end(args);
+    if(!BrookUpdateEqual(digest,expected_digest,sizeof(expected_digest))){
+        errno=ESTALE;
+        return -1;
+    }
+    errno=guard_ioctl_error;
+    return guard_ioctl_result;
+}
 int main(int argc,char **argv) {
     if(argc!=2)return 1;
     int dir=open(argv[1],O_RDONLY|O_DIRECTORY);struct stat st;
@@ -48,44 +74,62 @@ int main(int argc,char **argv) {
         identity[i*2]=hex[saved[24+i]>>4];
         identity[i*2+1]=hex[saved[24+i]&15];
     }
+    // Exercise the separate root descriptor and exact expected digest.
+    const int root=dup(dir);
+    if(root<0)return 27;
+    expected_root=root;
+    BrookUpdateHash(reinterpret_cast<const uint8_t*>(identity),96,expected_digest);
     int mutated=0;
-    if(!provision_slot_health(dir,st.st_dev,identity,mutated)||mutated)return 7;
+    if(!provision_slot_health(root,dir,st.st_dev,identity,mutated)||mutated)return 7;
+    guard_ioctl_result=0;
+    if(verify_clean_guards(root,dir,st.st_dev,identity))return 28; // Leased records need no reopen.
+    char mismatch[97];memcpy(mismatch,identity,sizeof(mismatch));mismatch[0]='f';
+    if(!verify_clean_guards(root,dir,st.st_dev,mismatch)||errno!=ESTALE)return 29;
+    guard_ioctl_result=-1;
     if(create_record(dir,"GUARD1.BIN",saved,sizeof(saved),st.st_dev))return 8;
+    for(const int denial : {EPERM, ENODEV, EAGAIN, EIO, ESTALE, EBUSY}) {
+        guard_ioctl_error=denial;
+        if(!provision_slot_health(root,dir,st.st_dev,identity,mutated)||mutated||errno!=denial)return 30;
+    }
+    guard_ioctl_error=ENOTTY;
+    guard_ioctl_result=1; // Unexpected successful return must not fall back.
+    if(!provision_slot_health(root,dir,st.st_dev,identity,mutated)||mutated)return 31;
+    guard_ioctl_result=-1;
     low_space=true;
-    if(!provision_slot_health(dir,st.st_dev,identity,mutated)||mutated||errno!=ENOSPC)return 16;
+    if(!provision_slot_health(root,dir,st.st_dev,identity,mutated)||mutated||errno!=ENOSPC)return 16;
     low_space=false;
     struct stat entry{};
     if(fstatat(dir,"BOOTSTAT.BIN",&entry,AT_SYMLINK_NOFOLLOW)==0||
        fstatat(dir,"BOOTSTAT.TMP",&entry,AT_SYMLINK_NOFOLLOW)==0)return 17;
     fail_sync=1; // Fail the staged file fsync, then verify cleanup and retry.
-    if(!provision_slot_health(dir,st.st_dev,identity,mutated)||mutated)return 18;
+    if(!provision_slot_health(root,dir,st.st_dev,identity,mutated)||mutated)return 18;
     if(fstatat(dir,"BOOTSTAT.BIN",&entry,AT_SYMLINK_NOFOLLOW)==0||
        fstatat(dir,"BOOTSTAT.TMP",&entry,AT_SYMLINK_NOFOLLOW)==0)return 19;
     uint8_t blank[SlotHealthBytes]{};
     if(create_record(dir,"BOOTSTAT.TMP",blank,17,st.st_dev)||
        create_record(dir,"BOOTSTAT.BIN",blank,0,st.st_dev))return 20;
-    if(provision_slot_health(dir,st.st_dev,identity,mutated)||!mutated)return 9;
+    if(provision_slot_health(root,dir,st.st_dev,identity,mutated)||!mutated)return 9;
     if(fstatat(dir,"BOOTSTAT.TMP",&entry,AT_SYMLINK_NOFOLLOW)==0 || errno!=ENOENT)return 21;
     uint8_t slot[SlotHealthBytes];
     if(read_record(dir,"BOOTSTAT.BIN",slot,sizeof(slot),st.st_dev))return 10;
     for(auto byte:slot)if(byte)return 11;
     mutated=0;
-    if(provision_slot_health(dir,st.st_dev,identity,mutated)||mutated)return 12;
+    if(provision_slot_health(root,dir,st.st_dev,identity,mutated)||mutated)return 12;
 
     fd=openat(dir,"BOOTSTAT.BIN",O_WRONLY);
     const uint8_t bad=1;
     if(fd<0||pwrite(fd,&bad,1,0)!=1||close(fd))return 13;
-    if(!provision_slot_health(dir,st.st_dev,identity,mutated)||mutated)return 14;
+    if(!provision_slot_health(root,dir,st.st_dev,identity,mutated)||mutated)return 14;
     if(read_record(dir,"BOOTSTAT.BIN",slot,sizeof(slot),st.st_dev)||slot[0]!=bad)return 15;
     if(unlinkat(dir,"BOOTSTAT.BIN",0)||create_record(dir,"BOOTSTAT.BIN",&bad,1,st.st_dev))return 22;
-    if(!provision_slot_health(dir,st.st_dev,identity,mutated)||mutated||
+    if(!provision_slot_health(root,dir,st.st_dev,identity,mutated)||mutated||
        read_record(dir,"BOOTSTAT.BIN",slot,1,st.st_dev)||slot[0]!=bad)return 23;
     if(unlinkat(dir,"BOOTSTAT.BIN",0))return 24;
     fail_sync=2; // Directory flush must be acknowledged before success.
-    if(!provision_slot_health(dir,st.st_dev,identity,mutated)||!mutated)return 25;
+    if(!provision_slot_health(root,dir,st.st_dev,identity,mutated)||!mutated)return 25;
     mutated=0;
-    if(provision_slot_health(dir,st.st_dev,identity,mutated)||mutated)return 26;
-    close(dir);
+    if(provision_slot_health(root,dir,st.st_dev,identity,mutated)||mutated)return 26;
+    close(root);close(dir);
     if(!hex32("0123456789abcdef0123456789abcdef") || hex32("bad") ||
        !range("2048,4096") || range("2048,") || range("1,2,3"))return 6;
     return 0;

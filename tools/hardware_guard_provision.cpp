@@ -71,13 +71,26 @@ static int slot_capacity(int directory) {
     return 0;
 }
 
-static int provision_slot_health(int directory,dev_t device,const char (&identity)[97],int& mutated) {
+static int verify_clean_guards(int root,int directory,dev_t device,const char (&identity)[97]) {
+    uint8_t digest[32];
+    BrookUpdateHash(reinterpret_cast<const uint8_t*>(identity),96,digest);
+    const int result=ioctl(root,BROOK_IOCTL_CHECK_SYSTEM_ESP_GUARD_IDENTITY,digest);
+    if(!result)return 0;
+    if(result!=-1 || errno!=ENOTTY)return -1;
+
+    // Old or non-guarded kernels retain ordinary access to the guard files.
+    // Any other ioctl failure means that admission could not be established.
     uint8_t guards[2][BROOK_RECOVERY_GUARD_SIZE];
     if(read_record(directory,"GUARD0.BIN",guards[0],sizeof(guards[0]),device) ||
-       read_record(directory,"GUARD1.BIN",guards[1],sizeof(guards[1]),device) ||
-       !BrookRecoveryGuardAllowsNormal(guards[0],sizeof(guards[0]),guards[1],sizeof(guards[1]),identity))
-        return -1;
+       read_record(directory,"GUARD1.BIN",guards[1],sizeof(guards[1]),device))return -1;
+    if(BrookRecoveryGuardAllowsNormal(guards[0],sizeof(guards[0]),guards[1],sizeof(guards[1]),identity))
+        return 0;
+    errno=ESTALE;
+    return -1;
+}
 
+static int provision_slot_health(int root,int directory,dev_t device,const char (&identity)[97],int& mutated) {
+    if(verify_clean_guards(root,directory,device,identity))return -1;
     struct SlotFile {
         uint8_t bytes[SlotHealthBytes]{};
         bool read(unsigned index,uint8_t* out) const {
@@ -162,7 +175,7 @@ int main(int argc,char **argv) {
     dir=openat(root,"RECOVERY",O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
     if(dir<0||ioctl(dir,BROOK_IOCTL_VERIFY_SYSTEM_ESP_MEMBER,0)||fstat(dir,&dst)||dst.st_dev!=rst.st_dev)goto done;
     if(slotOnly) {
-        if(provision_slot_health(dir,rst.st_dev,identity,mutated)||fsync(dir)||fsync(root))goto done;
+        if(provision_slot_health(root,dir,rst.st_dev,identity,mutated)||fsync(dir)||fsync(root))goto done;
     } else {
         if(fstatat(dir,"GUARD0.BIN",&check,AT_SYMLINK_NOFOLLOW)==0 || errno!=ENOENT)goto done;
         if(fstatat(dir,"GUARD1.BIN",&check,AT_SYMLINK_NOFOLLOW)==0 || errno!=ENOENT)goto done;
