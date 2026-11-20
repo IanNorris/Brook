@@ -7,11 +7,16 @@
 #include "ahci_byte_write.h"
 #include "ahci_panic_gate.h"
 #include "ahci_write_target.h"
+#if defined(BROOK_VM_PERSISTENT_AHCI)
+#include "ahci_vm_write_target.h"
+#include "memory/heap.h"
+#endif
 #include "ahci_completion.h"
 #include "storage_io_stats.h"
 #include "ata_identify.h"
 #include "pci.h"
 #include "vfs.h"
+#include "vfs_path.h"
 #include "device.h"
 #include "sync/kmutex.h"
 #include "memory/physical_memory.h"
@@ -348,12 +353,9 @@ bool ReadBlocks(uint64_t lba,uint32_t count) {
     return status.ready && AhciPlanRead(plan,lba,count,status.sectors,dmaPhys+dataOffset,dma64) && Run(plan,count*512);
 }
 
-int Read(Device*,uint64_t offset,void* output,uint64_t length) {
-    if(!output && length)return -22;
-    if(length>0x7fffffffu)return -22;
-    if(!__atomic_load_n(&published,__ATOMIC_ACQUIRE))return -5;
-    NormalIoGuard guard;
-    if(!guard.admitted || !status.ready)return -5;
+// Caller owns the DMA buffer. Boot proof runs before publication; all
+// subsequent readers take the normal I/O gate before using this routine.
+int ReadBytes(uint64_t offset,void* output,uint64_t length) {
     const uint64_t capacity=status.sectors*512;
     if(offset>=capacity)return 0;
     if(length>capacity-offset)length=capacity-offset;
@@ -367,6 +369,14 @@ int Read(Device*,uint64_t offset,void* output,uint64_t length) {
         memcpy(dst+done,dma+dataOffset+in,bytes);done+=bytes;
     }
     return done?int(done):(length?-5:0);
+}
+int Read(Device*,uint64_t offset,void* output,uint64_t length) {
+    if(!output && length)return -22;
+    if(length>0x7fffffffu)return -22;
+    if(!__atomic_load_n(&published,__ATOMIC_ACQUIRE))return -5;
+    NormalIoGuard guard;
+    if(!guard.admitted || !status.ready)return -5;
+    return ReadBytes(offset,output,length);
 }
 struct AhciByteIo {
     bool read(uint64_t lba,uint32_t count,uint8_t*) { return ReadBlocks(lba,count); }
@@ -438,6 +448,75 @@ bool ReadWriteTarget(AhciWriteTarget& target,bool& present) {
         AhciWriteTargetParse(record,uint32_t(st.size),target);
     VfsRelease(node);return ok;
 }
+
+#if defined(BROOK_VM_PERSISTENT_AHCI)
+int ReadVmPolicy(const char* path, char* record, uint32_t capacity) {
+    VnodeStat st{};
+    const int error = VfsLstatPath(path, &st);
+    if (error) return error;
+    if ((st.mode & 0170000) != 0100000 || st.isDir || st.isSymlink || !st.size || st.size > capacity) return -22;
+    auto* node = VfsOpen(path, VFS_O_STREAM);
+    if (!node) return -5;
+    uint64_t offset = 0;
+    const int count = VfsRead(node, record, st.size, &offset);
+    VfsRelease(node);
+    return count == int(st.size) ? count : -5;
+}
+
+bool ProveVmLayout(uint64_t sectors) {
+    char bootRecord[128]{}, dataRecord[160]{};
+    const int bootBytes = ReadVmPolicy("/etc/ahci-boot-volume", bootRecord, sizeof(bootRecord));
+    const int dataBytes = ReadVmPolicy("/etc/ahci-data-volume", dataRecord, sizeof(dataRecord));
+    AhciBootSelector boot{};
+    AhciDataSelector data{};
+    if (bootBytes < 0 || dataBytes < 0 || !AhciBootSelectorParse(bootRecord, bootBytes, boot) ||
+        !AhciDataSelectorParse(dataRecord, dataBytes, data)) return false;
+
+    constexpr uint32_t entriesBytes = 1024 * 1024, gdtBytes = 4096 * 32;
+    auto* entries = static_cast<uint8_t*>(kmalloc(entriesBytes));
+    auto* mirror = static_cast<uint8_t*>(kmalloc(entriesBytes));
+    auto* gdt = static_cast<uint8_t*>(kmalloc(gdtBytes));
+    const AhciDataReadIo diskRead{nullptr, [](void*, uint64_t offset, void* buffer, uint32_t bytes) {
+        return ReadBytes(offset, buffer, bytes);
+    }};
+    const bool valid = entries && mirror && gdt &&
+        AhciVmWriteLayout(diskRead, boot, data, sectors, entries, mirror, entriesBytes, gdt, gdtBytes);
+    if (entries) kfree(entries);
+    if (mirror) kfree(mirror);
+    if (gdt) kfree(gdt);
+    return valid;
+}
+
+void AdmitVmTarget(const AtaIdentifyInfo& info, bool flushExt) {
+    char marker[32]{};
+    const int count = ReadVmPolicy("/etc/ahci-vm-write-target", marker, sizeof(marker));
+    if (count == -2) return;
+
+    // A present VM policy takes the entire boot through this decision,
+    // including malformed markers and devices with both policy files.
+    writeEnabled = false;
+    VnodeStat physical{};
+    uint64_t sectors = 0;
+    const char* reason = nullptr;
+    if (VfsLstatPath("/etc/ahci-write-target", &physical) != -2)
+        reason = "conflicting physical and VM AHCI write targets";
+    else if (count < 0 || !AhciVmWriteSectorCount(marker, count, sectors))
+        reason = "invalid VM AHCI write target";
+    else if (!AhciVmWritePlatform([](uint32_t leaf, uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) {
+                 __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(leaf), "c"(0));
+             }))
+        reason = "VM AHCI hypervisor not admitted";
+    else if (!AhciVmWriteGeometry(sectors, info, flushExt))
+        reason = "VM AHCI geometry or flush unsupported";
+    else if (!ProveVmLayout(sectors))
+        reason = "VM AHCI GPT or ext2 identity proof failed";
+
+    if (status.quarantined) return; // retain the real transport failure
+    writeEnabled = reason == nullptr;
+    status.reason = reason ? reason : "identity-checked VM ATA device writable";
+    SerialPrintf("ahci: %s\n", status.reason);
+}
+#endif
 }
 } // namespace brook
 
@@ -583,8 +662,9 @@ void AhciReadOnlyInit() {
     memcpy(status.serial,info.serial,sizeof(status.serial));
     AhciWriteTarget target{};bool targetPresent=false;
     const bool parsed=ReadWriteTarget(target,targetPresent);
+    const bool flushExt=AtaSupportsFlushExt(dma+dataOffset,512);
     writeEnabled=parsed && AhciWriteTargetMatches(target,pci.vendorId,pci.deviceId,pci.bus,pci.dev,pci.fn,
-        selected,info,AtaSupportsFlushExt(dma+dataOffset,512));
+        selected,info,flushExt);
 #if defined(BROOK_AHCI_PANIC_TEST)
     // This special build has no production write admission. It requires an
     // explicit QEMU fw_cfg marker and a separate exact-identity scratch disk.
@@ -668,6 +748,11 @@ void AhciReadOnlyInit() {
     if(testWritable)testInstallMode=installPresent;
 #endif
     KMutexInit(&ioLock);
+    // An image declaring the VM policy cannot fall through to the physical
+    // policy or a test write path. This also covers builds without the feature.
+    VnodeStat vmMarker{};
+    const bool vmPolicyRequested = VfsLstatPath("/etc/ahci-vm-write-target", &vmMarker) != -2;
+    if (vmPolicyRequested) writeEnabled = false;
 #if defined(BROOK_SSD_INSTALLER)
     if(!physicalInstallMode && !physicalBlockToolsMode && !DeviceRegister(&device)){Quarantine("AHCI block registration failed");return;}
 #else
@@ -709,6 +794,13 @@ void AhciReadOnlyInit() {
     if(testWritable)status.reason="disposable QEMU test ATA device writable";
     if(largeDataTestWritable)status.reason="disposable QEMU large data test ATA device writable";
 #endif
+    if (vmPolicyRequested) {
+#if defined(BROOK_VM_PERSISTENT_AHCI)
+        AdmitVmTarget(info, flushExt);
+#else
+        status.reason = "VM AHCI write policy disabled";
+#endif
+    }
     if(!writeEnabled) {
         auto* exportMarker=VfsOpen("/etc/ahci-export",VFS_O_STREAM);
         if(exportMarker) {
