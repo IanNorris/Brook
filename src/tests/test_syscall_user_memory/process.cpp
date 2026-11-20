@@ -17,6 +17,7 @@ brook::Process* NewChild() {
     return child;
 }
 }
+void harness::SetNamespaceAdmin(bool capable) { g_namespaceAdmin=capable; }
 namespace brook {
 Process* ProcessFork(Process*,uint64_t,uint64_t,uint64_t,bool) { ++g_forks;return g_child=NewChild(); }
 Process* ProcessCreateThread(Process*,uint64_t,uint64_t,uint64_t,uint64_t,bool) { ++g_threads;return g_child=NewChild(); }

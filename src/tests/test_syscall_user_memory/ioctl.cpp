@@ -8,6 +8,9 @@
 using namespace harness;
 namespace {
 bool g_capsetSawUserPointer;
+brook::Vnode* g_espRoot;
+brook::BootGuardSlot g_bootSlot{};
+uint32_t g_bootFlags;
 int32_t FakeGetCapset(uint32_t,uint32_t,void* out,uint32_t bytes) {
     if(InArena(reinterpret_cast<uint64_t>(out),1,Access::Read))g_capsetSawUserPointer=true;
     __builtin_memset(out,0x77,bytes<8?bytes:8);
@@ -24,6 +27,45 @@ bool Untouched(uint64_t address,uint64_t length) {
 bool RaceSafe(int64_t result,uint64_t address,uint64_t length) {
     return !g_racedUnmaps || (result==-brook::EFAULT && Untouched(address,length));
 }
+}
+
+namespace brook {
+bool AhciSystemVolumeOwnsRoot(Vnode* node) { return node==g_espRoot; }
+BootGuardSlot BootTimingHandoffSlot() { return g_bootSlot; }
+uint32_t BootTimingHandoffFlags() { return g_bootFlags; }
+}
+
+static void SystemEspBootSlot() {
+    Reset();ResetProcess();
+    brook::Vnode root{};
+    root.type=brook::VnodeType::Dir;
+    auto& fd=CurrentProcess()->fds[3];
+    fd.type=brook::FdType::Vnode;
+    fd.handle=&root;
+    const auto output=Patterned(0,sizeof(BrookSystemEspBootSlot));
+    const auto query=[](uint64_t address) {
+        return brook::sys_ioctl(3,BROOK_IOCTL_GET_SYSTEM_ESP_BOOT_SLOT,address,0,0,0);
+    };
+    SetNamespaceAdmin(false);
+    CHECK(query(output)==-brook::EPERM && Untouched(output,sizeof(BrookSystemEspBootSlot)));
+    SetNamespaceAdmin(true);
+    CHECK(query(output)==-brook::ENODEV && Untouched(output,sizeof(BrookSystemEspBootSlot)));
+    g_espRoot=&root;
+    g_bootSlot.generation=41;
+    g_bootSlot.slot=1;
+    g_bootSlot.selectorDigest[0]=0xa4;
+    CHECK(query(g_kernel.Address())==-brook::EFAULT && g_kernel.Intact());
+    CHECK(query(output)==0);
+    const auto& slot=*reinterpret_cast<const BrookSystemEspBootSlot*>(output);
+    CHECK(slot.version==BROOK_ESP_BOOT_SLOT_VERSION && slot.mode==BROOK_ESP_BOOT_SLOT_VERIFIED);
+    CHECK(slot.generation==41 && slot.slot==1 && slot.selector_digest[0]==0xa4 && !slot.reserved);
+    g_bootSlot={};
+    g_bootFlags=brook::BootTimingRecovery;
+    CHECK(query(output)==0 && slot.mode==BROOK_ESP_BOOT_SLOT_RECOVERY && !slot.generation);
+    g_bootFlags=0;
+    CHECK(query(output)==0 && slot.mode==BROOK_ESP_BOOT_SLOT_UNTRACKED && !slot.slot);
+    g_espRoot=nullptr;
+    SetNamespaceAdmin(false);
 }
 
 static void Termios() {
@@ -97,4 +139,5 @@ void RunIoctlTests() {
     Termios();
     Fionread();
     VirtioGetCaps();
+    SystemEspBootSlot();
 }

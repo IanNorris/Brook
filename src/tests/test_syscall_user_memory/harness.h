@@ -45,6 +45,7 @@ extern KernelCanary g_kernel;
 
 brook::Process* CurrentProcess();   // zeroed, PROCESS_MAGIC, pid 7
 void ResetProcess();
+void SetNamespaceAdmin(bool capable);
 // Give a hand-built slot its own open file description (H-20) with the given
 // O_* status flags; returns it. Tests may share it between slots to model dup.
 brook::OpenFile* Describe(brook::FdEntry& entry,uint32_t status);

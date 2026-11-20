@@ -174,7 +174,6 @@ void SchedulerGetProcessCounts(uint32_t& total,uint32_t& running) { total=runnin
 void SchedulerGetReapedTicks(uint64_t& user,uint64_t& system) { user=system=0; }
 
 // ioctl/DRM neighbours: devices, audio, windows and memory not under test.
-bool AhciSystemVolumeOwnsRoot(Vnode*) { return false; }
 bool AhciSystemVolumeOwnsMember(Vnode*) { return false; }
 uint32_t AudioGetPosition() { return 0; }
 bool AudioMixerHorizonEnabled() { return false; }
