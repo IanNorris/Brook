@@ -117,10 +117,16 @@ def main():
     p.add_argument('--proc-autodump-qa', action='store_true', help='Run the live core fixture and verify an automatic fault core')
     p.add_argument('--managed-profile', action='store_true',
                    help='Seed the data volume with the signed-staging profile layout (aliases into a generation)')
+    p.add_argument('--managed-profile-absolute-current', action='store_true',
+                   help='Negative check: with --managed-profile, an absolute current alias must fail handoff')
     a = p.parse_args()
     mode_flags = list(MODE_FLAGS)
     if a.managed_profile:
         mode_flags.append('--managed-profile')
+    if a.managed_profile_absolute_current:
+        if not a.managed_profile:
+            p.error('--managed-profile-absolute-current requires --managed-profile')
+        mode_flags.append('--managed-profile-absolute-current')
     if a.proc_dump_qa or a.proc_autodump_qa:
         mode_flags += ['--proc-dump-qa', str(a.kernel_build.resolve() / 'drivers/virtio_net.mod')]
     if a.proc_autodump_qa:

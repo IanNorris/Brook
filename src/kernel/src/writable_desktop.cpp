@@ -77,8 +77,16 @@ bool ProfileValid() {
     }
     // Managed layout: generations are replaced, never edited, so only
     // structure is required inside them.
+    // current must name a sibling generation exactly, and that generation
+    // must be a real directory: no absolute, traversing or chained targets.
     VnodeStat current{};
-    if(VfsLstatPath("/nix/var/.brook-profiles/current",&current) || !current.isSymlink ||
+    if(VfsLstatPath("/nix/var/.brook-profiles/current",&current) || !current.isSymlink)return false;
+    char name[64]{};
+    const int nameLength=VfsReadlink("/nix/var/.brook-profiles/current",name,sizeof(name)-1);
+    if(nameLength<0 || !WritableDesktopGenerationName(name,nameLength))return false;
+    char generation[96]="/nix/var/.brook-profiles/";
+    memcpy(generation+strlen(generation),name,size_t(nameLength)+1);
+    if(!Directory(generation,false) ||
        !ManagedAlias("/nix/profile","var/.brook-profiles/current") ||
        !ManagedAlias("/nix/share/applications","../profile/.brook-launcher"))return false;
     for(const char* path:inner)if(!ResolvedDirectory(path))return false;

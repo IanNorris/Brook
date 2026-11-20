@@ -85,6 +85,7 @@ def main():
     parser.add_argument('--auto-desktop-dell-usb-network',action='store_true',help='Use the Dell initrd xHCI module and emulated USB Ethernet for checked shutdown')
     parser.add_argument('--auto-desktop-dell-async-network',action='store_true',help='Retain Dell asynchronous TCP settings with the emulated NIC')
     parser.add_argument('--managed-profile',action='store_true',help='Lay out /nix as a signed staging generation behind relative aliases')
+    parser.add_argument('--managed-profile-absolute-current',action='store_true',help='Negative fixture: point current at the complete generation by absolute path, which admission must refuse')
     parser.add_argument('--normal-kernel',type=Path,help='Use this normal kernel for the final boot')
     parser.add_argument('--normal-network-module',type=Path,help='Matching virtio-net module for normal boot')
     parser.add_argument('--proc-dump-qa',type=Path,help='Run the live core fixture with this matching virtio NIC module')
@@ -278,7 +279,8 @@ def main():
             if logical.startswith(('bin/','profile/bin/')):
                 subprocess.run(['debugfs','-w','-R',f'set_inode_field /{name} mode 0100755',str(partition)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         if a.managed_profile:
-            for link,target in (('/var/.brook-profiles/current','.brook-profile-legacy'),
+            current='/nix/'+generation if a.managed_profile_absolute_current else '.brook-profile-legacy'
+            for link,target in (('/var/.brook-profiles/current',current),
                                 ('/profile','var/.brook-profiles/current'),
                                 ('/share/applications','../profile/.brook-launcher')):
                 subprocess.run(['debugfs','-w','-R',f'symlink {link} {target}',str(partition)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
