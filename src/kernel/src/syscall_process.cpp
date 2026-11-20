@@ -654,10 +654,9 @@ int64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
         if(arg3 || arg4 || arg5)return -EINVAL;
         auto* process=ProcessCurrent();return process?ProcessCapabilityControl(process,unsigned(option),arg2):-ESRCH;
     }
-    if (option == 21 || option == 22) { // PR_GET/SET_SECCOMP
-        if (arg4 || arg5 || (option == 21 && (arg2 || arg3))) return -EINVAL;
-        return SeccompPrctl(option, arg2, arg3);
-    }
+    // Linux ignores unused PR_GET/SET_SECCOMP arguments. Bubblewrap passes
+    // only the arguments it needs through the variadic prctl wrapper.
+    if (option == 21 || option == 22) return SeccompPrctl(option, arg2, arg3);
     // Remaining capability/secure-exec operations are explicit errors.
     switch (option) {
         case 7: case 8:   // GET/SET_KEEPCAPS
