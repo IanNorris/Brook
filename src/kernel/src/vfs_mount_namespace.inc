@@ -310,9 +310,10 @@ int VfsMountNamespaceMountFresh(MountNamespace* ns,const VfsPath& inputTarget,
     // tmpfs: NODEV|NOSUID, or NOSUID alone for the boot device directory.
     const bool proc=StrEq(fsName,"procfs");
     const bool devpts=StrEq(fsName,"devpts");
-    if((proc || devpts) && ns->initial)return -95;
+    const bool mqueue=StrEq(fsName,"mqueue");
+    if((proc || devpts || mqueue) && ns->initial)return -95;
     if(attributes && ((attributes&~MountRestrictionMask) ||
-       (!proc && !devpts && ((attributes!=6 && attributes!=2) || !StrEq(fsName,"tmpfs")))))return -95;
+       (!proc && !devpts && !mqueue && ((attributes!=6 && attributes!=2) || !StrEq(fsName,"tmpfs")))))return -95;
     // Registered tables/callbacks are permanently provider-pinned. Unregistered
     // or mismatched tables cannot become a backing through this entry point.
     if(FindFsDriver(fsName)!=ops || !ops->root_object || !ops->unmount)return -95;
@@ -341,7 +342,7 @@ int VfsMountNamespaceMountFresh(MountNamespace* ns,const VfsPath& inputTarget,
     mount->owner=ns;mount->referenceState=1;mount->backing=backing;
     mount->rootObject=root;mount->rootIdentity=root->identity;mount->rootObjectOps=root->ops;mount->rootIdentityKnown=true;
     mount->rootDevice=stat.dev;mount->attributes=attributes;
-    if(proc)mount->lockedAttributes=MountNoSuid|MountNoDev|MountNoExec;
+    if(proc || mqueue)mount->lockedAttributes=MountNoSuid|MountNoDev|MountNoExec;
     if(devpts)mount->lockedAttributes=MountReadOnly|MountNoSuid|MountNoExec;
     StrCopy(mount->physicalRoot,"/",sizeof(mount->physicalRoot));
     mount->covered=target;VfsPathRetain(target);mount->used=true;mount->linked=true;

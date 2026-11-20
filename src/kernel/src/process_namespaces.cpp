@@ -2,6 +2,7 @@
 
 #include "memory/heap.h"
 #include "process.h"
+#include "posix_mqueue.h"
 #include "process_user_namespace.h"
 #include "spinlock.h"
 #include "string.h"
@@ -17,6 +18,7 @@ struct UtsNamespace {
 struct IpcNamespace {
     uint32_t references;
     UserNamespace* owner;
+    MqueueDomain* queues;
 };
 namespace {
 IrqSpinLock namespaceLock;
@@ -58,6 +60,7 @@ static void DestroyIpc(IpcNamespace* state)
 {
     if(!state)return;
     SysvSemRetireNamespace(state);
+    MqueueDomainRetire(state->queues);
     UserNamespaceRelease(state->owner);
     kfree(state);
 }
@@ -95,6 +98,13 @@ int ProcessNamespacesIsolate(Process* process,uint64_t flags)
         if(!ipc) {kfree(uts);return -12;}
         ipc->references=1;
         ipc->owner=ProcessUserNamespaceAcquire(process);
+        ipc->queues=MqueueDomainCreate(ipc->owner);
+        if(!ipc->queues) {
+            UserNamespaceRelease(ipc->owner);
+            kfree(ipc);
+            kfree(uts);
+            return -12;
+        }
         // Finish this task's SEM_UNDO membership in the old domain before
         // publishing the replacement. No allocation or failure follows.
         SysvSemExit(process);
@@ -132,6 +142,12 @@ const IpcNamespace* ProcessIpcScope(Process* process)
 UserNamespace* ProcessIpcOwner(const IpcNamespace* scope)
 {
     return scope ? scope->owner : nullptr;
+}
+
+MqueueDomain* ProcessMqueueDomain(Process* process)
+{
+    const auto* scope=ProcessIpcScope(process);
+    return scope ? scope->queues : MqueueInitialDomain();
 }
 
 uint64_t ProcessNetworkScope(Process* process)

@@ -450,6 +450,11 @@ void SyscallTableInit()
     g_syscallTable[SYS_FUTEX]           = sys_futex;
     g_syscallTable[SYS_SIGNALFD]        = sys_signalfd;
     g_syscallTable[SYS_SIGNALFD4]       = sys_signalfd4;
+    g_syscallTable[240] = sys_mq_open;
+    g_syscallTable[241] = sys_mq_unlink;
+    g_syscallTable[242] = sys_mq_timedsend;
+    g_syscallTable[243] = sys_mq_timedreceive;
+    g_syscallTable[245] = sys_mq_getsetattr;
     g_syscallTable[SYS_SEMGET]          = sys_semget;
     g_syscallTable[SYS_SEMOP]           = sys_semop;
     g_syscallTable[SYS_SEMTIMEDOP]      = sys_semtimedop;

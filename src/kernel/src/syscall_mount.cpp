@@ -6,6 +6,7 @@
 #include "mount_namespace.h"
 #include "procfs_vfs.h"
 #include "tmpfs_mount_options.h"
+#include "posix_mqueue.h"
 #include "process_user_namespace.h"
 
 #include "user_copy.h"

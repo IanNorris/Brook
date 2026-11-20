@@ -439,6 +439,11 @@ int64_t sys_getrlimit(uint64_t resource, uint64_t rlimAddr, uint64_t,
                        uint64_t, uint64_t, uint64_t);
 
 // syscall_sysv_ipc.cpp
+int64_t sys_mq_open(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+int64_t sys_mq_unlink(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+int64_t sys_mq_timedsend(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+int64_t sys_mq_timedreceive(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+int64_t sys_mq_getsetattr(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
 int64_t sys_semget(uint64_t key,uint64_t count,uint64_t flags,uint64_t,uint64_t,uint64_t);
 int64_t sys_semop(uint64_t id,uint64_t address,uint64_t count,uint64_t,uint64_t,uint64_t);
 int64_t sys_semtimedop(uint64_t id,uint64_t address,uint64_t count,uint64_t timeout,uint64_t,uint64_t);

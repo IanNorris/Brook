@@ -27,6 +27,10 @@ int ProcessFsIsolateMounts(Process*) { return 0; }
 int SysvSemClone(Process*,Process*,bool) { return 0; }
 void SysvSemExit(Process*) {}
 void SysvSemRetireNamespace(const IpcNamespace*) {}
+struct MqueueDomain {};
+MqueueDomain* MqueueInitialDomain() { static MqueueDomain domain; return &domain; }
+MqueueDomain* MqueueDomainCreate(UserNamespace*) { return MqueueInitialDomain(); }
+void MqueueDomainRetire(MqueueDomain*) {}
 void ProcessDiscardUnpublished(Process*) {}
 void ResetSignalActions(uint16_t,bool) {}
 void SchedulerAddProcess(Process* child) {

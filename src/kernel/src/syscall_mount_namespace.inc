@@ -16,6 +16,7 @@ int64_t sys_mount(uint64_t sourceAddr,uint64_t targetAddr,uint64_t fsAddr,
     bool procMount=false;
     bool memoryMount=false;
     bool ptyMount=false;
+    bool queueMount=false;
     uint16_t ptmxMode=0;
     TmpfsMountOptions memoryOptions{};
     if(newMount) {
@@ -25,7 +26,8 @@ int64_t sys_mount(uint64_t sourceAddr,uint64_t targetAddr,uint64_t fsAddr,
         procMount=StrEq(fsType,"proc");
         memoryMount=StrEq(fsType,"tmpfs");
         ptyMount=StrEq(fsType,"devpts");
-        if(procMount && data[0])return -EINVAL;
+        queueMount=StrEq(fsType,"mqueue");
+        if((procMount || queueMount) && data[0])return -EINVAL;
         if(memoryMount) {
             if((flags&~Silent)!=(MountNoDev|MountNoSuid))return -EINVAL;
             if(int error=ParseTmpfsMountOptions(data,&memoryOptions))return error;
@@ -33,7 +35,7 @@ int64_t sys_mount(uint64_t sourceAddr,uint64_t targetAddr,uint64_t fsAddr,
         if(ptyMount) {
             if(int error=ParseDevptsOptions(data,&ptmxMode))return error;
         }
-        if(!procMount && !memoryMount && !ptyMount)return -ENODEV;
+        if(!procMount && !memoryMount && !ptyMount && !queueMount)return -ENODEV;
     }
     auto* process=ProcessCurrent();if(!process)return -EPERM;
     char source[512],target[512];
@@ -53,6 +55,11 @@ int64_t sys_mount(uint64_t sourceAddr,uint64_t targetAddr,uint64_t fsAddr,
     if(procMount) {
         VfsPath targetPath{};int error=VfsPathResolve(lookup.fs.root,lookup.fs.cwd,target,&targetPath);
         if(!error)error=ProcFsMountPrivate(lookup.fs.mountNamespace,targetPath,flags&MountRestrictionMask);
+        VfsPathRelease(targetPath);return error;
+    }
+    if(queueMount) {
+        VfsPath targetPath{};int error=VfsPathResolve(lookup.fs.root,lookup.fs.cwd,target,&targetPath);
+        if(!error)error=MqueueMount(process,lookup.fs.mountNamespace,targetPath,flags&MountRestrictionMask);
         VfsPathRelease(targetPath);return error;
     }
     if(memoryMount || ptyMount) {

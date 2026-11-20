@@ -47,6 +47,7 @@ namespace brook { void LifecycleChannelConfigure(); void LifecycleChannelStart()
 #include "vfs.h"
 #include "vfs_path.h"
 #include "tmpfs.h"
+#include "posix_mqueue.h"
 #include "mount_namespace.h"
 #include "compat_paths.h"
 #include "virtio_blk.h"
@@ -631,6 +632,8 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         KernelPanic("tmpfs registration failed");
     if(!brook::VfsRegisterFs("devpts",brook::TmpfsOperations()))
         brook::SerialPuts("VFS: devpts registration failed\n");
+    if(!brook::MqueueRegisterFilesystem())
+        brook::SerialPuts("VFS: mqueue registration failed\n");
     brook::FatFsVfsRegister();   // register "fatfs" filesystem driver
     brook::Ext2VfsRegister();    // register "ext2" filesystem driver
     brook::CompressedVfsRegister();
