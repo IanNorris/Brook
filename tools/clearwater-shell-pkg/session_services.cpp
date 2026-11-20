@@ -29,6 +29,15 @@ constexpr unsigned ItemStorage = 32, NoticeStorage = 3;
 
 using Message = std::unique_ptr<DBusMessage, decltype(&dbus_message_unref)>;
 Message Hold(DBusMessage* m) { return Message(m, dbus_message_unref); }
+struct CancelPending {
+    void operator()(DBusPendingCall* call) const
+    {
+        dbus_pending_call_cancel(call);
+        dbus_pending_call_unref(call);
+    }
+};
+using PendingCall = std::unique_ptr<DBusPendingCall, CancelPending>;
+
 bool Same(const char* a, const char* b) { return a && b && std::strcmp(a, b) == 0; }
 
 template<size_t N> void CopyText(char (&out)[N], const char* from)
@@ -143,6 +152,7 @@ bool IconName(const std::string& name, uint32_t (&out)[TrayIconWords])
 
 struct Item {
     std::string bus, owner, path, menu;
+    PendingCall refresh;
     ChromeTrayItem view{};
     bool visible = false;
     bool dirty = true;
@@ -307,15 +317,34 @@ struct Session {
         return true;
     }
 
-    void Refresh(Item& item)
+    void RefreshItems()
     {
-        item.dirty = false;
-        auto msg = Hold(dbus_message_new_method_call(item.owner.c_str(), item.path.c_str(), DBUS_INTERFACE_PROPERTIES, "GetAll"));
-        const char* interface = ItemInterface;
-        if (msg) dbus_message_append_args(msg.get(), DBUS_TYPE_STRING, &interface, DBUS_TYPE_INVALID);
-        auto reply = Request(std::move(msg));
+        for (auto& item : items) {
+            if (item.refresh && dbus_pending_call_get_completed(item.refresh.get())) {
+                auto reply = Hold(dbus_pending_call_steal_reply(item.refresh.get()));
+                item.refresh.reset();
+                UpdateItem(item, std::move(reply));
+            }
+            if (!item.dirty || item.refresh) continue;
+            item.dirty = false;
+            auto request = Hold(dbus_message_new_method_call(item.owner.c_str(), item.path.c_str(),
+                                                            DBUS_INTERFACE_PROPERTIES, "GetAll"));
+            const char* interface = ItemInterface;
+            DBusPendingCall* pending = nullptr;
+            // An app can synchronously ask the bus for another service
+            // immediately after registering its item. Keep dispatching
+            // those calls while its own GetAll request is outstanding.
+            if (request && dbus_message_append_args(request.get(), DBUS_TYPE_STRING, &interface, DBUS_TYPE_INVALID)
+                && dbus_connection_send_with_reply(bus, request.get(), &pending, 2000))
+                item.refresh.reset(pending);
+        }
+    }
+
+    void UpdateItem(Item& item, Message reply)
+    {
         DBusMessageIter dict{};
-        if (!reply || !dbus_message_iter_init(reply.get(), &dict)) return;
+        if (!reply || !dbus_message_has_signature(reply.get(), "a{sv}")
+            || !dbus_message_iter_init(reply.get(), &dict)) return;
 
         ChromeTrayItem view{};
         view.id = item.view.id;
@@ -682,8 +711,7 @@ int RunSessionServices(TrayPublish publish, TrayReadInput readInput, int parent)
         bool stopping = false;
         while (dbus_connection_read_write_dispatch(connection, 50)) {
             if (parent && getppid() != parent) { stopping = true; break; }
-            const auto dirty = std::find_if(service.items.begin(), service.items.end(), [](const auto& i) { return i.dirty; });
-            if (dirty != service.items.end()) service.Refresh(*dirty);
+            service.RefreshItems();
             for (unsigned i = 0; i < 32; ++i) {
                 TrayInput input{};
                 const int status = readInput(input);

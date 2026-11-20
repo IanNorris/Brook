@@ -52,6 +52,28 @@ void StringProperty(DBusMessageIter& dictionary, const char* key, const char* va
     dbus_message_iter_close_container(&pair, &variant);
     dbus_message_iter_close_container(&dictionary, &pair);
 }
+void IconPixmapProperty(DBusMessageIter& dictionary)
+{
+    DBusMessageIter pair, variant, images, image, pixels;
+    const char* key = "IconPixmap";
+    const int32_t size = 1;
+    const unsigned char argb[] = {0xff, 0x12, 0x34, 0x56};
+    const unsigned char* data = argb;
+    assert(dbus_message_iter_open_container(&dictionary, DBUS_TYPE_DICT_ENTRY, nullptr, &pair));
+    assert(dbus_message_iter_append_basic(&pair, DBUS_TYPE_STRING, &key));
+    assert(dbus_message_iter_open_container(&pair, DBUS_TYPE_VARIANT, "a(iiay)", &variant));
+    assert(dbus_message_iter_open_container(&variant, DBUS_TYPE_ARRAY, "(iiay)", &images));
+    assert(dbus_message_iter_open_container(&images, DBUS_TYPE_STRUCT, nullptr, &image));
+    assert(dbus_message_iter_append_basic(&image, DBUS_TYPE_INT32, &size));
+    assert(dbus_message_iter_append_basic(&image, DBUS_TYPE_INT32, &size));
+    assert(dbus_message_iter_open_container(&image, DBUS_TYPE_ARRAY, "y", &pixels));
+    assert(dbus_message_iter_append_fixed_array(&pixels, DBUS_TYPE_BYTE, &data, sizeof(argb)));
+    assert(dbus_message_iter_close_container(&image, &pixels));
+    assert(dbus_message_iter_close_container(&images, &image));
+    assert(dbus_message_iter_close_container(&variant, &images));
+    assert(dbus_message_iter_close_container(&pair, &variant));
+    assert(dbus_message_iter_close_container(&dictionary, &pair));
+}
 void MenuNode(DBusMessageIter& iter, int32_t id)
 {
     DBusMessageIter node, properties, children;
@@ -85,6 +107,7 @@ DBusHandlerResult Fake(DBusConnection* bus, DBusMessage* msg, void*)
         dbus_message_iter_open_container(&out, DBUS_TYPE_ARRAY, "{sv}", &properties);
         StringProperty(properties, "Title", "Steam fixture");
         StringProperty(properties, "Status", status);
+        IconPixmapProperty(properties);
         const char* key = "Menu", *value = "/Menu";
         dbus_message_iter_open_container(&properties, DBUS_TYPE_DICT_ENTRY, nullptr, &pair);
         dbus_message_iter_append_basic(&pair, DBUS_TYPE_STRING, &key);
@@ -208,8 +231,14 @@ int main()
     const char* path = "/StatusNotifierItem";
     dbus_message_append_args(registerItem, DBUS_TYPE_STRING, &path, DBUS_TYPE_INVALID);
     dbus_message_unref(Ask(registerItem));
+    // Properties.GetAll and a synchronous client request can cross on
+    // the bus before the client begins dispatching incoming methods.
+    auto* capabilities = Ask(dbus_message_new_method_call(Notes, NotesPath, Notes, "GetCapabilities"));
+    assert(dbus_message_has_signature(capabilities, "as"));
+    dbus_message_unref(capabilities);
     Wait([] { return state.itemCount == 1; });
     assert(std::strcmp(state.items[0].title, "Steam fixture") == 0);
+    assert(state.items[0].hasIcon && state.items[0].icon[0] == 0xff123456u);
     const uint32_t id = state.items[0].id;
     Action(TrayInputKind::Activate, id);
     Action(TrayInputKind::Scroll, id, 120);
@@ -229,9 +258,6 @@ int main()
         else Wait([] { return state.items[0].attention != 0; });
     }
 
-    auto* capabilities = Ask(dbus_message_new_method_call(Notes, NotesPath, Notes, "GetCapabilities"));
-    assert(dbus_message_has_signature(capabilities, "as"));
-    dbus_message_unref(capabilities);
     const uint32_t note = Notify(2000);
     assert(Notify(2000, note) == note);
     Wait([] { return state.notice.id && state.notice.actionCount == 1; });
