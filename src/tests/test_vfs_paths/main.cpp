@@ -1495,9 +1495,8 @@ int main(){
     // A protected boot volume keeps its filesystem and initial-root access,
     // including across a bind, without granting data through an old handle.
     uint64_t bootPublication=0;
-    assert(VfsMountConfiguredWithPublication("/ns-target","objects",2,0,&bootPublication));
-    assert(!VfsProtectBootMount(bootPublication+1));
-    assert(VfsProtectBootMount(bootPublication));
+    assert(VfsMountConfiguredWithPublication("/ns-target","objects",2,MountSystemInternal,&bootPublication));
+    assert(bootPublication);
     auto system=resolve(stableRoot,stableRoot,"/ns-target");
     auto rows=infoRows(&g_initialNamespace,stableRoot);
     std::string report(rows.size()*4600+1,'\0');uint32_t written=0;

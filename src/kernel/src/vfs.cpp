@@ -634,6 +634,8 @@ bool VfsMountConfigured(const char* mountPoint,const char* fsName,uint8_t pdrv,u
 bool VfsMountConfiguredWithPublication(const char* mountPoint,const char* fsName,uint8_t pdrv,uint64_t attributes,uint64_t* publication)
 {
     if(publication)*publication=0;
+    const bool systemInternal=(attributes&MountSystemInternal)!=0;
+    attributes&=~MountSystemInternal;
     if(attributes&~MountRestrictionMask)return false;
     FileMutationGuard mutation;
     if (!mountPoint || mountPoint[0]!='/' || !fsName ||
@@ -661,12 +663,13 @@ bool VfsMountConfiguredWithPublication(const char* mountPoint,const char* fsName
     if(backing) {
         // FAT's drive slots are global to its driver. Do not remount over a
         // failed retirement: its later unmount could unregister the new mount.
-        if(!backing->references) { kfree(slot);return false; }
+        if(!backing->references || (systemInternal && !backing->systemInternal)) { kfree(slot);return false; }
         backing->RetainLocked();
     } else {
         backing=static_cast<MountBacking*>(kmalloc(sizeof(MountBacking)));
         if(!backing) { kfree(slot);return false; }
         *backing={};backing->fsOps=ops;backing->pdrv=pdrv;backing->references=1;
+        backing->systemInternal=systemInternal;
         void* privateData=nullptr;
         if(!ops->mount(pdrv,&privateData)) {
             SerialPrintf("VFS: mount failed for '%s' at '%s'\n",fsName,mountPoint);
@@ -707,20 +710,6 @@ bool VfsMountConfiguredWithPublication(const char* mountPoint,const char* fsName
 
     DbgPrintf("VFS: mounted '%s' at '%s' (pdrv=%u)\n", fsName, mountPoint, pdrv);
     return true;
-}
-
-bool VfsProtectBootMount(uint64_t publication)
-{
-    if (!publication) return false;
-    FileMutationGuard mutation;
-    MountViewGuard view;
-    for (auto& mount : g_mounts) {
-        if (mount.owner != &g_initialNamespace || mount.publication != publication ||
-            !VfsMountPublished(mount)) continue;
-        __atomic_store_n(&mount.backing->systemInternal,true,__ATOMIC_RELEASE);
-        return true;
-    }
-    return false;
 }
 
 bool VfsUnmount(const char* mountPoint)

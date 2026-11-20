@@ -277,9 +277,6 @@ bool VfsMountConfigured(const char* mountPoint,const char* fsName,uint8_t pdrv,u
 // On failure the output is zero; success returns the newly published identity.
 bool VfsMountConfiguredWithPublication(const char* mountPoint,const char* fsName,uint8_t pdrv,uint64_t attributes,uint64_t* publication);
 
-// Protect the backing of a verified boot mount and report it as internal.
-bool VfsProtectBootMount(uint64_t publication);
-
 // Unmount the filesystem at mountPoint. Returns true after successful detach;
 // a busy mount or failed filesystem/device flush leaves the mount attached.
 extern "C" bool VfsUnmount(const char* mountPoint);

@@ -87,7 +87,7 @@ Device* FatFsBoundDevice(uint8_t pdrv)
     return result;
 }
 
-static bool BindDrive(uint8_t pdrv, Device* dev, bool exclusive)
+static bool BindDrive(uint8_t pdrv, Device* dev, bool exclusive, bool bootReadOnly=false)
 {
     bool registered = DeviceIsRegistered(dev);
     const BlockDeviceOps* ops = (registered && KernelPtrLooksCanonical(dev->ops))
@@ -102,11 +102,12 @@ static bool BindDrive(uint8_t pdrv, Device* dev, bool exclusive)
     }
     const int roResult=dev->ops->ioctl ? dev->ops->ioctl(dev,DEVICE_IOCTL_READ_ONLY,nullptr) : -95;
     if(exclusive && roResult!=0 && roResult!=1)return false;
-    const bool readOnly=roResult==1;
+    const bool readOnly=bootReadOnly || roResult==1;
     const auto flags = IrqSpinLockAcquire(&g_driveLock);
     if (g_fatfsDrives[pdrv] == dev && !exclusive && !g_driveExclusive[pdrv]) {
+        const bool compatible=readOnly==g_driveReadOnly[pdrv];
         IrqSpinLockRelease(&g_driveLock, flags);
-        return true; // Never erase a live drive's error latch.
+        return compatible; // Never erase a live drive's error latch or policy.
     }
     if (g_driveMounted[pdrv] || g_driveExclusive[pdrv] ||
         (exclusive && g_fatfsDrives[pdrv])) {
@@ -114,7 +115,7 @@ static bool BindDrive(uint8_t pdrv, Device* dev, bool exclusive)
         return false;
     }
     for(uint8_t i=0;i<FATFS_MAX_DRIVES;++i) {
-        if(g_fatfsDrives[i]==dev && (exclusive || g_driveExclusive[i])) {
+        if(g_fatfsDrives[i]==dev && (exclusive || g_driveExclusive[i] || g_driveReadOnly[i]!=readOnly)) {
             IrqSpinLockRelease(&g_driveLock,flags);return false;
         }
     }
@@ -127,6 +128,7 @@ static bool BindDrive(uint8_t pdrv, Device* dev, bool exclusive)
     return true;
 }
 bool FatFsBindDrive(uint8_t pdrv, Device* dev) {return BindDrive(pdrv,dev,false);}
+bool FatFsBindBootReadOnlyDrive(uint8_t pdrv, Device* dev) {return BindDrive(pdrv,dev,false,true);}
 bool FatFsBindExclusiveDrive(uint8_t pdrv, Device* dev) {return BindDrive(pdrv,dev,true);}
 
 bool FatFsAcquireDrive(uint8_t pdrv, bool* readOnly)

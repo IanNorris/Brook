@@ -269,7 +269,14 @@ namespace brook { void GuardTestPrepareDesktopHome() { PrepareDesktopHome(); } }
 [[maybe_unused]] static bool ProbeAndMountDevice(const char* label, brook::Device* dev, uint8_t pdrv,
                                 bool allowDefer = true)
 {
-    const bool fatBound = brook::FatFsBindDrive(pdrv, dev);
+    uint32_t mountFlags=0;
+    if(dev->name && dev->name[0]=='u' && dev->name[1]=='s' && dev->name[2]=='b') {
+        if(auto* marker=brook::VfsOpen("/etc/usb-read-only")) {
+            mountFlags=brook::MountReadOnly;brook::VfsClose(marker);
+        }
+    }
+    const bool fatBound=mountFlags ?
+        brook::FatFsBindBootReadOnlyDrive(pdrv,dev) : brook::FatFsBindDrive(pdrv,dev);
     bool mounted = fatBound && brook::VfsMount("/mnt/probe", "fatfs", pdrv);
     const char* fsType = "fatfs";
 
@@ -339,12 +346,6 @@ namespace brook { void GuardTestPrepareDesktopHome() { PrepareDesktopHome(); } }
     // before the ext4 module was loaded and re-probed the device).
     brook::VfsUnmount(mntPath);
 
-    uint32_t mountFlags=0;
-    if(dev->name && dev->name[0]=='u' && dev->name[1]=='s' && dev->name[2]=='b') {
-        if(auto* marker=brook::VfsOpen("/etc/usb-read-only")) {
-            mountFlags=1;brook::VfsClose(marker);
-        }
-    }
     if (brook::VfsMountConfigured(mntPath, fsType, pdrv,mountFlags)) {
         brook::KPrintf("%s mounted at %s\n", label, mntPath);
 

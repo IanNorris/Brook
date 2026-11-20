@@ -35,6 +35,13 @@ int main(){
     readOnly=false;assert(FatFsBindDrive(0,&b) && FatFsAcquireDrive(0,&ro) && !ro);
     assert(!disk_status(0) && disk_write(0,reinterpret_cast<BYTE*>(data),0,1)==RES_OK && writes==1);
     FatFsReleaseDrive(0);
+    Device diagnostic{reinterpret_cast<DeviceOps*>(&ops),"diagnostic",DeviceType::Block,&ops};
+    assert(!FatFsBindBootReadOnlyDrive(4,&b)); // No conflicting writable FAT attachment.
+    assert(FatFsBindBootReadOnlyDrive(4,&diagnostic) && FatFsAcquireDrive(4,&ro) && ro);
+    assert(!FatFsBindDrive(4,&diagnostic) && !FatFsBindDrive(5,&diagnostic));
+    assert(FatFsBindBootReadOnlyDrive(5,&diagnostic) && FatFsAcquireDrive(5,&ro) && ro);
+    assert(disk_write(5,reinterpret_cast<BYTE*>(data),0,1)==RES_WRPRT && writes==1);
+    FatFsReleaseDrive(5);FatFsReleaseDrive(4);
     // Aliases stay disqualifying even after a normal mount is released.
     assert(!FatFsBindExclusiveDrive(2,&a));assert(!FatFsBindExclusiveDrive(0,&c));
     roError=true;assert(!FatFsBindExclusiveDrive(2,&c));roError=false;
