@@ -266,7 +266,7 @@ def verify_emergency_gate(a, disk, work, guards):
 def run_matrix(a, base_disk, normal, work, guards, metadata, panic_journal):
     client = work / 'GDFRAME.ELF'
     source = Path(__file__).with_name('workloads') / 'guard_present_frames.c'
-    subprocess.run(['cc', '-nostdlib', '-static', '-fno-stack-protector', '-no-pie',
+    subprocess.run(['cc', '-nostdlib', '-static', '-fno-stack-protector',
                     '-Wall', '-Wextra', '-Werror', '-O2', str(source), '-o', str(client)], check=True)
     framed = work / 'framed.img'
     shutil.copyfile(normal, framed)
