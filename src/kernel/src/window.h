@@ -196,7 +196,8 @@ struct Window
     uint16_t    captionHeight;  // client's title-strip height (physical px); 0 = native title height
     uint32_t    captionStyle;   // DesktopCaptionStyle* packing; 0 = native title style
     bool        focusable;      // popups/tooltips stay above but don't take keyboard focus
-    char        title[64];
+    char        title[64];      // original title from the client
+    char        webAppTitle[64]; // display override from the active launcher catalog
     char        appId[128];     // explicit xdg app_id, independent of document title
 
     // Per-window VFB (Phase A of wayland↔WM unification).  When non-null
@@ -393,7 +394,7 @@ struct WmDebugWindow {
     int32_t x,y;uint32_t width,height,outerWidth,outerHeight,bufferWidth,bufferHeight;
     bool visible,minimized,maximized,focused,focusable,apiWindow,providerKernel;
     bool fullscreen;
-    char title[64],appId[128];
+    char title[64],rawTitle[64],appId[128];
 };
 enum class WmDebugAction : uint32_t { Focus,Minimize,Maximize,Restore,Close };
 // Registry-backed owner reference; caller must ProcessUnref after cleanup.
@@ -700,6 +701,7 @@ struct LauncherItem {
     bool valid;
     bool isDesktopEntry;   // launch a program instead of a shortcut script
     bool isUserDesktopEntry;
+    bool isWebApp;
 };
 
 struct WmDebugApp {

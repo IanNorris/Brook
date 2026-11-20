@@ -81,6 +81,7 @@ static const char* LauncherAddUserEntry(LauncherSnapshot& catalog, const VfsPath
     WmStrCopy(item.scriptPath, entry.command, sizeof(item.scriptPath));
     WmStrCopy(item.category, LauncherModel::HintFromDesktopCategories(entry.categories), sizeof(item.category));
     item.valid = item.isDesktopEntry = item.isUserDesktopEntry = true;
+    item.isWebApp = HasWebAppCategory(entry.categories);
     if (!IdentifyLauncherItem(catalog, catalog.count, item)) return "catalog identity conflict";
     item.iconPixels = LauncherLoadUserIcon(root, icons, entry.icon);
     catalog.items[catalog.count++] = item;

@@ -28,6 +28,7 @@
 #include "shutdown.h"
 #include "launcher_command.h"
 #include "launcher_user_manifest.h"
+#include "web_app_title.h"
 #include "launch_feedback.h"
 #include "launcher_power.h"
 #include "shell.h"
@@ -815,6 +816,8 @@ LauncherUserManifestStatus WmLauncherUserManifestStatus()
     return status;
 }
 
+static void RefreshWebAppTitles(const LauncherSnapshot& catalog);
+
 bool WmLauncherApplyPending()
 {
     VfbGuard windows;
@@ -831,6 +834,7 @@ bool WmLauncherApplyPending()
     const uint32_t count = g_launcherActive->count;
     const uint32_t generation = g_launcherActive->generation;
     SpinLockRelease(&g_launcherLock);
+    RefreshWebAppTitles(*g_launcherActive);
     SerialPrintf("WM: launcher published generation=%u items=%u\n", generation, count);
     return true;
 }
@@ -887,6 +891,30 @@ static const char* WmBaseName(const char* path)
     const char* name = path;
     for (; *path; ++path) if (*path == '/') name = path + 1;
     return name;
+}
+
+static const char* WindowDisplayTitle(const Window& window)
+{
+    return window.webAppTitle[0] ? window.webAppTitle : window.title;
+}
+
+static void RefreshWebAppTitle(Window& window, const LauncherSnapshot& catalog)
+{
+    window.webAppTitle[0] = 0;
+    if (!window.appId[0]) return;
+    for (uint32_t i = 0; i < catalog.count; ++i) {
+        const auto& item = catalog.items[i];
+        if (item.valid && item.isWebApp && WmEqualI(window.appId, item.appId)) {
+            FormatWebAppTitle(window.webAppTitle, item.title, window.title);
+            return;
+        }
+    }
+}
+
+static void RefreshWebAppTitles(const LauncherSnapshot& catalog)
+{
+    for (auto& window : g_windows)
+        if (window.proc) RefreshWebAppTitle(window, catalog);
 }
 
 static bool WmTitleHasAppName(const char* title, const char* name)
@@ -1010,7 +1038,7 @@ static int CreateWindowLocked(Process* proc, int16_t x, int16_t y,
     w.clientIncarnation=proc?(proc->isThread?proc->leaderIncarnation:proc->incarnation):0;
     w.clientLaunchId=proc?proc->launchId:0;
     w.clientOrigin=proc?WmClientOrigin::NativeProcess:WmClientOrigin::Unknown;
-    w.appId[0] = 0;
+    w.appId[0] = w.webAppTitle[0] = 0;
     w.x = x;
     w.y = y;
     w.clientW = clientW;
@@ -1768,7 +1796,9 @@ static void SnapshotDebugWindowLocked(const Window& w,WmDebugWindow* out)
     out->visible=w.visible;out->minimized=w.minimized;out->maximized=w.state==WindowState::Maximized && !w.fullscreen;out->fullscreen=w.fullscreen;
     out->focused=w.focused;out->focusable=w.focusable;out->apiWindow=w.vfb!=nullptr;
     out->providerKernel=w.proc->isKernelThread;
-    WmStrCopy(out->title,w.title,sizeof(out->title));WmStrCopy(out->appId,w.appId,sizeof(out->appId));
+    WmStrCopy(out->title, WindowDisplayTitle(w), sizeof(out->title));
+    WmStrCopy(out->rawTitle, w.title, sizeof(out->rawTitle));
+    WmStrCopy(out->appId, w.appId, sizeof(out->appId));
 }
 
 Process* WmReferenceTerminatedOwner()
@@ -1942,7 +1972,7 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
     if (w.noChrome && !w.captionOverlay) return;
     LauncherReadGuard icons;
     const ChromeFrameModel model{WindowChromeLayout(w), w.clientW, w.focused, w.state == WindowState::Maximized,
-                                 w.noChrome, w.captionStyle, w.title, WindowIcon(w, icons.get()), mouseX, mouseY};
+                                 w.noChrome, w.captionStyle, WindowDisplayTitle(w), WindowIcon(w, icons.get()), mouseX, mouseY};
     ChromeFrameStorage storage;
     ChromeDisplayList list = ChromeListOn(storage);
     ChromeBuildFrame(model, WmChromeStyle(), list);
@@ -2530,6 +2560,7 @@ void WmLauncherLoad()
           g_launcherActive = snapshot;
           if(g_launcherSnapshotEpoch)++g_launcherSnapshotEpoch;
           SpinLockRelease(&g_launcherLock);
+          RefreshWebAppTitles(*snapshot);
         }
         LauncherSyncModel(*snapshot);
         SerialPrintf("WM: launcher initial generation=%u items=%u\n", generation, snapshot->count);
@@ -3006,7 +3037,8 @@ static bool DesktopLayerLocked(const Window& w,WmDesktopLayer& out,bool retain) 
          w.clientX(),w.clientY(),w.upscale,uint8_t(legacy),0,0,0,0,0,{}, {},0,0,0,0,0,0};
     out.focused=w.focused;out.noChrome=w.noChrome?(w.captionOverlay?2:1):0;out.state=uint8_t(w.state);
     out.opacity=w.opacity;out.blurRadius=w.blurRadius;
-    __builtin_memcpy(out.title,w.title,sizeof(out.title));__builtin_memcpy(out.appId,w.appId,sizeof(out.appId));
+    WmStrCopy(out.title, WindowDisplayTitle(w), sizeof(out.title));
+    __builtin_memcpy(out.appId, w.appId, sizeof(out.appId));
     out.ownerPid=w.proc->pid;out.ownerIncarnation=w.proc->incarnation;
     return true;
 }
@@ -3119,7 +3151,8 @@ static uint64_t DesktopChromeKeyLocked(const DesktopChromeEpochs& layers,const W
         if(part && part->hit.contains(mouseX,mouseY))hover=button;
     }
     WmChromeKeyInput in{};
-    in.title=origin0.title;in.titleCapacity=sizeof(origin0.title);
+    in.title = WindowDisplayTitle(origin0);
+    in.titleCapacity = sizeof(origin0.title);
     in.appId=origin0.appId;in.appIdCapacity=sizeof(origin0.appId);
     in.windowIdentity=origin0.creationIdentity;in.metricsIdentity=reinterpret_cast<uintptr_t>(origin0.metrics);
     in.outerWidth=origin0.outerWidth();in.outerHeight=origin0.outerHeight();
@@ -3430,6 +3463,8 @@ bool WmSetAppIdById(Process* proc, uint32_t wmId, const char* appId)
     Window* w = WmFindWindowById(proc, wmId);
     if (!w || !appId) return false;
     WmStrCopy(w->appId, appId, sizeof(w->appId));
+    LauncherReadGuard catalog;
+    RefreshWebAppTitle(*w, catalog.get());
     CompositorMarkDirty();
     CompositorWake();
     return true;
@@ -3455,6 +3490,8 @@ void WmSetTitleById(Process* proc, uint32_t wmId, const char* title)
     Window* w = WmFindWindowById(proc, wmId);
     if (!w || !title) return;
     WmStrCopy(w->title, title, sizeof(w->title));
+    LauncherReadGuard catalog;
+    RefreshWebAppTitle(*w, catalog.get());
     CompositorMarkDirty();
     CompositorWake();
 }

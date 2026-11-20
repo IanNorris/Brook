@@ -6,6 +6,7 @@
 #include <vector>
 #include "../../kernel/src/launcher_command.h"
 #include "../../kernel/src/launcher_user_manifest.h"
+#include "../../kernel/src/web_app_title.h"
 
 int main()
 {
@@ -121,4 +122,21 @@ int main()
     assert(!reload.Take(999));
     assert(reload.Take(1000));
     assert(!reload.Take(2000));
+    assert(HasWebAppCategory("Network;X-Brook-WebApp;"));
+    assert(HasWebAppCategory("X-Brook-WebApp"));
+    assert(!HasWebAppCategory("X-Brook-WebApp-Other;"));
+    assert(!HasWebAppCategory("WebBrowser;Network;"));
+    char title[64];
+    for (const char* raw : {"", "Brook Mail", "mail.example", "mail.local.", "LOCALHOST", "localhost.", "192.0.2.1"}) {
+        FormatWebAppTitle(title, "Brook Mail", raw);
+        assert(std::strcmp(title, "Brook Mail") == 0);
+    }
+    for (const char* raw : {"Inbox", "mail.example:8000", "https://mail.example", "mail-.example",
+                            "mail..example", "mail.example/", "Inbox – unread"}) {
+        FormatWebAppTitle(title, "Brook Mail", raw);
+        assert(title == std::string("Brook Mail") + WebAppTitleSeparator + raw);
+    }
+    FormatWebAppTitle(title, "12345678901234567890123456789012345678901234567",
+                      "1234567890é");
+    assert(std::strlen(title) == 62 && title[61] == '0');
 }

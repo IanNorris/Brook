@@ -55,6 +55,9 @@ glass-100-taskbar-hud 9fe5ffb06f1aa93b
 glass-100-temperature-flyout b651ad3d0338a9e0
 glass-100-tooltip 3228e779ea27b7b8
 glass-100-volume-popup a18c5753b421e7ec
+glass-100-web-app-frame 4a36933b8096855c
+glass-100-web-app-taskbar 6295788d5690a3b3
+glass-100-web-app-tooltip 05b297fc72899944
 glass-150-boot-summary 2f19d227b2a6f2ac
 glass-150-frame-active 45075958b9ed5dee
 glass-150-frame-active-glass 341f15554b34f5e1
@@ -643,6 +646,9 @@ opaque-mixed-100-taskbar-hud 3ea8efd671fed957
 opaque-mixed-100-temperature-flyout a74aebd03b125c7a
 opaque-mixed-100-tooltip fc95a69ea60c32aa
 opaque-mixed-100-volume-popup 6a9f2db8168bf788
+opaque-mixed-100-web-app-frame b17a4f8dbe2a4117
+opaque-mixed-100-web-app-taskbar 6fcde7fad411b61b
+opaque-mixed-100-web-app-tooltip 787c9d2d61254458
 opaque-mixed-150-boot-summary 91994c1cc2063531
 opaque-mixed-150-frame-active ff6bcf4127ed43af
 opaque-mixed-150-frame-active-glass 5b0fc2d9e8864538
