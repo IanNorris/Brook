@@ -3,7 +3,7 @@
 
 namespace brook {
 
-enum class TaskbarPopup : uint8_t { None, Volume, Network, Temperature, Performance, AppMenu, Disk, Cpu, Memory, Compositor, App };
+enum class TaskbarPopup : uint8_t { None, Volume, Network, Temperature, Performance, AppMenu, Disk, Cpu, Memory, Compositor, App, Calendar };
 
 // The shared popup slot keeps at most one pin. App menus use the tray
 // service's stable owner ID, so a replacement item never inherits a pin.

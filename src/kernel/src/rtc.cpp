@@ -4,6 +4,7 @@
 // then advances one epoch anchor using a single elapsed-time source.
 
 #include "rtc.h"
+#include "desktop_calendar.h"
 #include "portio.h"
 #include "serial.h"
 #include "apic.h"
@@ -24,6 +25,7 @@ static uint64_t g_wallStarted = 0;
 // g_wallStarted is in the ElapsedClockNs() domain. That domain may switch from
 // delivered ticks (ms*1e6) to the invariant TSC after RtcInit, but the TSC
 // clock is anchored at the tick count at the switch, so the anchor stays valid.
+static bool g_calendarClockValid = false;
 
 // Timezone offset in seconds east of UTC.
 static int32_t g_tzOffsetSec = 0;
@@ -63,16 +65,6 @@ static uint8_t BcdToBin(uint8_t bcd)
     return (bcd >> 4) * 10 + (bcd & 0x0F);
 }
 
-// Days in each month (non-leap).
-static const uint16_t g_daysBeforeMonth[12] = {
-    0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334
-};
-
-static bool IsLeapYear(uint32_t y)
-{
-    return (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
-}
-
 // Convert date/time to Unix epoch.
 static uint64_t DateToEpoch(uint32_t year, uint32_t month, uint32_t day,
                             uint32_t hour, uint32_t minute, uint32_t second)
@@ -81,13 +73,13 @@ static uint64_t DateToEpoch(uint32_t year, uint32_t month, uint32_t day,
     uint64_t days = 0;
     for (uint32_t y = 1970; y < year; y++)
     {
-        days += IsLeapYear(y) ? 366 : 365;
+        days += CalendarLeapYear(y) ? 366 : 365;
     }
     // Days in current year up to start of 'month'
     if (month >= 1 && month <= 12)
-        days += g_daysBeforeMonth[month - 1];
+        days += CalendarDaysBeforeMonth[month - 1];
     // Leap day adjustment
-    if (month > 2 && IsLeapYear(year))
+    if (month > 2 && CalendarLeapYear(year))
         days += 1;
     // Day of month (1-based)
     days += day - 1;
@@ -107,7 +99,7 @@ static void EpochToDate(uint64_t epoch, uint32_t& year, uint32_t& month,
     year = 1970;
     while (true)
     {
-        uint32_t daysInYear = IsLeapYear(year) ? 366 : 365;
+        uint32_t daysInYear = CalendarLeapYear(year) ? 366 : 365;
         if (totalDays < daysInYear) break;
         totalDays -= daysInYear;
         year++;
@@ -116,9 +108,8 @@ static void EpochToDate(uint64_t epoch, uint32_t& year, uint32_t& month,
     month = 1;
     for (uint32_t m = 1; m <= 12; m++)
     {
-        uint32_t dim = (m < 12) ? (g_daysBeforeMonth[m] - g_daysBeforeMonth[m - 1])
-                                : (IsLeapYear(year) ? 31 : 31); // December always 31
-        if (m == 2 && IsLeapYear(year)) dim = 29;
+        uint32_t dim = CalendarDaysBeforeMonth[m] - CalendarDaysBeforeMonth[m - 1];
+        if (m == 2 && CalendarLeapYear(year)) dim = 29;
         if (totalDays < dim) { month = m; break; }
         totalDays -= dim;
     }
@@ -172,6 +163,8 @@ void RtcInit()
     // Century: CMOS year is 00-99, assume 2000+ for values < 70, 1900+ otherwise
     uint32_t fullYear = (yr < 70) ? 2000 + yr : 1900 + yr;
 
+    g_calendarClockValid = yr <= 99 && mon >= 1 && mon <= 12 && day >= 1 &&
+        day <= CalendarDaysInMonth({uint16_t(fullYear), uint8_t(mon)}) && hr < 24 && min < 60 && sec < 60;
     g_bootEpochSec = DateToEpoch(fullYear, mon, day, hr, min, sec);
     g_wallStarted = ElapsedClockNs();
     g_wallEpochNs = g_bootEpochSec * 1000000000ULL;
@@ -281,6 +274,12 @@ uint64_t RtcNowLocal()
 {
     int64_t local = static_cast<int64_t>(RtcNow()) + g_tzOffsetSec;
     return (local > 0) ? static_cast<uint64_t>(local) : 0;
+}
+
+CalendarClock RtcReadTaskbarClock()
+{
+    if (!g_calendarClockValid) return {};
+    return CalendarLocalClock(RtcNow(), RtcGetTimezoneOffset());
 }
 
 void RtcSetTimezoneOffset(int32_t offsetSec)

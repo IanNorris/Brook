@@ -4,7 +4,7 @@ let
     "chrome_display_list.h" "chrome_fonts.cpp" "chrome_material.h" "chrome_raster.cpp"
     "chrome_raster.h" "chrome_tray.h" "chrome_shell.cpp" "chrome_shell.h" "chrome_shell_model.h"
     "chrome_launcher.cpp" "chrome_launcher.h" "launcher_model.cpp" "launcher_model.h"
-    "chrome_shell_wire.h" "chrome_style.h" "desktop_disk_popup.h" "desktop_stats_popup.h" "desktop_metrics.h" "desktop_telemetry.h"
+    "chrome_shell_wire.h" "chrome_style.h" "desktop_calendar.h" "desktop_disk_popup.h" "desktop_stats_popup.h" "desktop_metrics.h" "desktop_telemetry.h"
     "font_atlas.h" "launcher_power.h" "taskbar_popup_pin.h" "taskbar_volume.h" "thermal_stats.h" "thermal_sampler.h"
   ];
   kernel = builtins.path {

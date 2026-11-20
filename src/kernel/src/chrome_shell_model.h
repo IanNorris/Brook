@@ -94,6 +94,10 @@ struct ChromeShellModel {
     DesktopDetailedStats detailedStats;
     DesktopStatsPanel statsPanel;
     uint32_t firstCoreRow;
+    ChromeCalendarLayout calendarLayout;
+    CalendarMonth calendarMonth;
+    CalendarDate calendarToday;
+    bool calendar;
     ChromeShellKind kind;
     DesktopRect rect;
     int32_t mouseX, mouseY;
@@ -152,7 +156,10 @@ inline void BuildShellModel(const ChromeShellModel& model, const ChromeStyle& st
         ChromeBuildBootSummary(model.boot.View(model.rect), style, list);
         break;
     case ChromeShellKind::TrayFlyout:
-        if (model.diskPopup) {
+        if (model.calendar) {
+            ChromeBuildCalendar(model.calendarLayout, model.calendarMonth, model.calendarToday, model.popupPinned,
+                                model.mouseX, model.mouseY, style, list);
+        } else if (model.diskPopup) {
             const auto& stats = model.telemetry.stats;
             ChromeBuildDiskPopup(model.diskLayout, model.disk, stats.readBytesPerSecond, stats.writeBytesPerSecond,
                                  model.popupPinned, model.mouseX, model.mouseY, style, list);

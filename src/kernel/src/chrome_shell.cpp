@@ -67,8 +67,46 @@ static int ChromeLoadBarWidth(const ChromeStyle& s)
     return s.TextWidth("100%", CF::Small) + 2 * Px(s, ChromeTaskbarSpacing::Pad);
 }
 
+static void TwoDigits(char* out, unsigned value)
+{
+    out[0] = char('0' + value / 10);
+    out[1] = char('0' + value % 10);
+}
+
+static void TaskbarClockText(ChromeTaskbarLayout& l, const CalendarClock& clock, bool weekday)
+{
+    if (!CalendarDateValid(clock.date) || clock.hour > 23 || clock.minute > 59) {
+        CopyText(l.clockText, "--:--", sizeof(l.clockText));
+        return;
+    }
+    char* time = l.clockText;
+    if (weekday) {
+        CopyText(time, CalendarWeekdays[CalendarWeekday(clock.date)], 4);
+        time[3] = ' ';
+        time += 4;
+    }
+    TwoDigits(time, clock.hour);
+    time[2] = ':';
+    TwoDigits(time + 3, clock.minute);
+    time[5] = 0;
+    TwoDigits(l.clockDate, clock.date.day);
+    l.clockDate[2] = ' ';
+    CopyText(l.clockDate + 3, CalendarMonths[clock.date.month.month - 1], 4);
+}
+
+static int ClockMaxAdvance(const ChromeStyle& s, const char* set, CF font)
+{
+    int width = 0;
+    for (; *set; ++set) {
+        const char glyph[] = {*set, 0};
+        const int candidate = s.TextWidth(glyph, font);
+        if (width < candidate) width = candidate;
+    }
+    return width;
+}
+
 ChromeTaskbarLayout ChromeTaskbarLayoutFor(const ChromeStyle& s, uint32_t screenW, uint32_t screenH,
-                                           const char* clockText, bool agent, uint32_t enabledMetrics,
+                                           const CalendarClock& clock, bool agent, uint32_t enabledMetrics,
                                            const int* ids, int total, int focused, const char* buildText,
                                            bool compactHud, const char* const* labels, uint32_t trayAppCount)
 {
@@ -92,19 +130,6 @@ ChromeTaskbarLayout ChromeTaskbarLayoutFor(const ChromeStyle& s, uint32_t screen
     x += 2 * sepGap + 1;
     l.terminal = {x, by, static_cast<int>(s.M(SM::TaskbarButtonWidth)), bh};
     x += s.M(SM::TaskbarButtonWidth) + s.M(SM::TaskbarPadding);
-    CopyText(l.clockText, clockText, sizeof(l.clockText));
-    for (unsigned i = 0; l.clockText[i] && l.clockText[i + 1]; ++i) {
-        if (l.clockText[i] != ' ') continue;
-        const char* date = l.clockText + i + 1;
-        while (*date == ' ') ++date;
-        CopyText(l.clockDate, date, sizeof(l.clockDate));
-        // The tray keeps the day and abbreviated month on the second line.
-        for (unsigned j = 0, spaces = 0; l.clockDate[j]; ++j) {
-            if (l.clockDate[j] == ' ' && ++spaces == 2) { l.clockDate[j] = 0; break; }
-        }
-        l.clockText[i] = 0;
-        break;
-    }
     int right = sw - Px(s, 4);
     // Reserve measured widgets from right to left. Keep one useful window
     // button on small displays; diagnostics yield before the clock does.
@@ -117,13 +142,26 @@ ChromeTaskbarLayout ChromeTaskbarLayoutFor(const ChromeStyle& s, uint32_t screen
     };
     using SP = ChromeTaskbarSpacing;
     const int gap = Px(s, SP::Gap), pad = Px(s, SP::Pad), trayTarget = Px(s, 44);
-    // Clock: the wider of its two lines with the pad either side (a 44 px
-    // target at least).
-    if (l.clockText[0]) {
-        const int time = s.TextWidth(l.clockText, CF::Label), date = s.TextWidth(l.clockDate, CF::Small);
-        const int width = 2 * pad + (time > date ? time : date);
-        reserve(l.clock, width > trayTarget ? width : trayTarget);
+    // Reserve the same width across all displayed dates and times.
+    int dayWidth = 0, monthWidth = 0;
+    for (const auto& day : CalendarWeekdays) {
+        const int width = s.TextWidth(day, CF::Label);
+        if (dayWidth < width) dayWidth = width;
     }
+    for (const auto& month : CalendarMonths) {
+        const char abbreviation[] = {month[0], month[1], month[2], 0};
+        const int width = s.TextWidth(abbreviation, CF::Small);
+        if (monthWidth < width) monthWidth = width;
+    }
+    const int time = 4 * ClockMaxAdvance(s, "0123456789-", CF::Label) + s.TextWidth(":", CF::Label);
+    const int date = 2 * ClockMaxAdvance(s, "0123456789", CF::Small) + s.TextWidth(" ", CF::Small) + monthWidth;
+    const auto clockWidth = [&](int firstLine) {
+        const int content = firstLine > date ? firstLine : date;
+        return 2 * pad + content > trayTarget ? 2 * pad + content : trayTarget;
+    };
+    const bool weekday = reserve(l.clock, clockWidth(time + dayWidth + s.TextWidth(" ", CF::Label)));
+    if (!weekday) reserve(l.clock, clockWidth(time));
+    TaskbarClockText(l, clock, weekday);
     // Tray, as the prototype orders it: network, volume, temperature.
     if (enabledMetrics & (1u << 6)) {
         const int width = 2 * pad + Px(s, 16) + Px(s, 4) + s.TextWidth("100" BROOK_CHROME_DEGREE, CF::Label);
@@ -515,6 +553,7 @@ void ChromeBuildTaskbar(const ChromeTaskbarModel& m, const ChromeStyle& s, Chrom
         dl.Text(CF::Mono, l.build.x + Px(s, ChromeTaskbarSpacing::Pad), l.build.y + (l.build.h - s.Line(CF::Mono)) / 2,
                 l.buildText, p.badgeText, l.build.w - Px(s, ChromeTaskbarSpacing::Pad));
     if (l.clock.w > 0) {
+        target(l.clock, false);
         // Time over date, right-aligned a pad from the target's edge.
         const int timeH = s.Line(CF::Label), dateH = s.Line(CF::Small);
         const int right = l.clock.x + l.clock.w - Px(s, ChromeTaskbarSpacing::Pad);
@@ -1597,6 +1636,102 @@ void ChromeBuildStatsPopup(const ChromeStatsPopupLayout& l, DesktopStatsPanel pa
     if (cpu) DetailedCpu(l, stats, first, mx, my, s, dl);
     else if (memory) DetailedMemory(l, stats, s, dl);
     else DetailedCadence(l, app, history, tick, s, dl);
+}
+
+ChromeCalendarLayout ChromeCalendarLayoutFor(const ChromeStyle& s, DesktopRect anchor, int screenW,
+                                             int taskbarY, bool valid, bool keepPinReachable)
+{
+    ChromeCalendarLayout out{};
+    const int pad = Px(s, FlyoutPad), gap = Px(s, FlyoutGap), margin = Px(s, 8);
+    const int maxW = screenW - 2 * margin, maxH = taskbarY - 2 * margin;
+    const int w = maxW < Px(s, 304) ? maxW : Px(s, 304);
+    const int headerH = PanelHeaderHeight(s);
+    if (!anchor.w || w < Px(s, 124) || maxH < 2 * pad + headerH) return out;
+    const int bodyWidth = w - 2 * pad;
+    const int caption = s.Line(CF::Small), nav = Px(s, 26);
+    const int top = 2 * pad + headerH + gap;
+    const int fixed = top + nav + gap + caption;
+    int row = (maxH - fixed) / 6;
+    if (row > Px(s, 30)) row = Px(s, 30);
+    const bool grid = valid && w >= Px(s, 180) && row >= s.Line(CF::Label) + Px(s, 3);
+    const bool noClock = !valid && maxH >= top + s.Line(CF::Label);
+    if (!grid && !noClock && !keepPinReachable) return out;
+    const int h = grid ? fixed + 6 * row : noClock ? top + s.Line(CF::Label) : 2 * pad + headerH;
+    out.panel = TaskbarTooltipBox(anchor, w, h, taskbarY, margin, screenW, margin);
+    const auto& p = out.panel;
+    out.pin = ChromeTrayFlyoutPinRect(s, p);
+    const int x = p.x + pad, bodyY = p.y + pad + headerH + gap;
+    if (noClock) out.unavailable = {x, bodyY, bodyWidth, s.Line(CF::Label)};
+    if (!grid) return out;
+    out.next = {p.x + p.w - pad - nav, bodyY, nav, nav};
+    out.previous = {out.next.x - nav - Px(s, 4), bodyY, nav, nav};
+    out.monthTitle = {x, bodyY, out.previous.x - x - Px(s, 4), nav};
+    out.grid = {x, bodyY + nav + gap, bodyWidth, caption + 6 * row};
+    out.rowHeight = row;
+    return out;
+}
+
+void ChromeBuildCalendar(const ChromeCalendarLayout& l, CalendarMonth shown, CalendarDate today, bool pinned,
+                         int32_t mx, int32_t my, const ChromeStyle& s, ChromeDisplayList& dl)
+{
+    if (l.panel.w <= 0) return;
+    const auto& p = s.P();
+    const int pad = Px(s, FlyoutPad), x = l.panel.x + pad;
+    PanelFrame(dl, s, l.panel);
+    PanelHeader(dl, s, x, l.panel.y + pad, l.pin.x - x - Px(s, 4), ChromeGlyph::Grid, "Calendar", nullptr, 0);
+    PopupPin(dl, s, l.pin, pinned, mx, my);
+    if (l.unavailable.w > 0)
+        ChromeElidedText(dl, s, CF::Label, l.unavailable.x, l.unavailable.y,
+                         "Date and time unknown", p.secondaryText, l.unavailable.w);
+    const auto month = CalendarMonthGrid(shown, today);
+    if (!l.rowHeight || !month.days) return;
+
+    char heading[24]{};
+    const char* name = CalendarMonths[shown.month - 1];
+    unsigned end = 0;
+    for (; name[end]; ++end) heading[end] = name[end];
+    heading[end++] = ' ';
+    DesktopNumber(heading + end, shown.year);
+    ChromeElidedText(dl, s, CF::Strong, l.monthTitle.x,
+                     l.monthTitle.y + (l.monthTitle.h - s.Line(CF::Strong)) / 2, heading, p.text, l.monthTitle.w);
+    const auto centered = [&](DesktopRect r, CF font, const char* str, uint32_t ink) {
+        dl.Text(font, r.x + (r.w - s.TextWidth(str, font)) / 2, r.y + (r.h - s.Line(font)) / 2, str, ink, r.w);
+    };
+    const auto arrow = [&](DesktopRect r, int direction, const char* label) {
+        const bool enabled = !(CalendarStepMonth(shown, direction) == shown);
+        dl.MaterialRect(r, enabled && r.contains(mx, my) ? s.MaterialColor(p.taskHover) : WellColor(s, p.launcher),
+                        Px(s, 6));
+        centered(r, CF::Strong, label, enabled ? p.text : p.mutedText);
+    };
+    arrow(l.previous, -1, "<");
+    arrow(l.next, 1, ">");
+
+    const auto column = [&](unsigned col, int y, int h) {
+        const int offset = l.grid.w * int(col) / 7;
+        return DesktopRect{l.grid.x + offset, y, l.grid.w * int(col + 1) / 7 - offset, h};
+    };
+    const int caption = s.Line(CF::Small);
+    for (unsigned i = 0; i < 7; ++i) {
+        const auto cell = column(i, l.grid.y, caption);
+        const auto* day = CalendarWeekdays[i];
+        const char narrow[] = {day[0], day[1], 0};
+        centered(cell, CF::Small, s.TextWidth(day, CF::Small) + Px(s, 3) <= cell.w ? day : narrow, p.mutedText);
+    }
+    for (unsigned day = 1; day <= month.days; ++day) {
+        const unsigned pos = month.first + day - 1;
+        const int top = l.grid.y + caption + int(pos / 7) * l.rowHeight;
+        const auto cell = column(pos % 7, top, l.rowHeight);
+        const bool highlight = day == month.highlighted;
+        if (highlight) {
+            const int size = cell.w < cell.h ? cell.w : cell.h;
+            const int inset = Px(s, 2), dot = size - 2 * inset;
+            dl.MaterialRect({cell.x + (cell.w - dot) / 2, cell.y + (cell.h - dot) / 2, dot, dot},
+                            0xff000000u | p.accent, dot / 2);
+        }
+        char number[11];
+        DesktopNumber(number, day);
+        centered(cell, highlight ? CF::Strong : CF::Label, number, highlight ? p.onAccent : p.text);
+    }
 }
 
 } // namespace brook
