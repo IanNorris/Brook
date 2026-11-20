@@ -23,7 +23,10 @@ def main():
     p.add_argument('--activate',action='store_true');p.add_argument('--restart',action='store_true')
     p.add_argument('--expected-payload-id')
     p.add_argument('--boot-timeout-s',type=int,default=120,help='Observe the same restart for 1..900s; a timeout never retries it')
-    p.add_argument('--helper',choices=['usb','system'],default='usb',help='System requires the running-slot-aware receiver. Update an older receiver from checked USB maintenance.')
+    p.add_argument('--helper',choices=['usb','system'],default='usb',help='System checks the running receiver before launching it.')
+    p.add_argument('--first-slot-aware-install',metavar='BOOT_ID',
+        help='Attest this verified pre-slot boot has no RECOVERY/BOOTSTAT.BIN. Install the first '
+             'slot-aware pair on the old loader, then install the new loader and verify both slots before provisioning slot health.')
     p.add_argument('--pace-bytes-per-second',type=int,help='Optional Linux TCP pacing cap for the upload')
     a=p.parse_args()
     bridge = Hardware()
@@ -32,7 +35,8 @@ def main():
     try:
         with inhibit_recovery(target['host'], target['port']):
             result=run.execute(a.session,a.key_file,a.kernel,a.initrd,
-                a.activate,a.restart,a.expected_payload_id,a.port,a.boot_timeout_s,a.helper,a.pace_bytes_per_second)
+                a.activate,a.restart,a.expected_payload_id,a.port,a.boot_timeout_s,a.helper,a.pace_bytes_per_second,
+                first_slot_aware_install=a.first_slot_aware_install)
     except Exception as error:
         receipt=run.receipt
         summary={'state':receipt.get('state','not_started'),'last_stage':receipt.get('last_stage'),'error':str(error),

@@ -48,9 +48,64 @@ class UpdateRun:
             self.sleep(.1)
         raise TimeoutError('Inspect original guest job '+ident)
 
-    def execute(self,session,key_file,kernel_path,initrd_path,activate=False,restart=False,expected_payload_id=None,port=1235,boot_timeout_s=120,helper='usb',pace_bytes_per_second=None):
+    def system_receiver_mode(self,session,boot,guest,first_install):
+        # Both receivers answer before reading the key or taking the update
+        # lock. This probe is a different immutable structured job from the
+        # upload, so a lost negotiation can never downgrade that upload.
+        ident=uuid.uuid4().hex
+        self.save(state='receiver_caps_dispatched',receiver_caps_job_id=ident)
+        self.bridge.guest_run(session,ident,['/boot/HWUPSYS.ELF','--caps'],cwd='/tmp',uid=0,wait_s=2)
+        job=self.wait_job(session,ident,lambda r:r.get('state')=='completed')
+        self.save(receiver_caps_job=job)
+        stdout,stderr=(job.get(name,{}) for name in ('stdout','stderr'))
+        if (job.get('session')!=session or job.get('guest_boot_id')!=boot or
+                job.get('operation_id')!=ident or
+                any(not stream.get('eof') or stream.get('gaps') or stream.get('read_error')
+                    for stream in (stdout,stderr))):
+            raise RuntimeError('The system receiver capability reply is incomplete or from a different boot')
+        reply=(job.get('exit',{}).get('code'),stdout.get('text'),stderr.get('text'))
+        advertised=(0,'HWUPDATE_CAPS slot_aware=1\n','')
+        # The first reviewed slot-aware binary advertised its argument
+        # in the exact usage response before it gained --caps.
+        advertised_usage=(2,'','usage: HWUPDATE.ELF BOOT_ID32 TRANSACTION_ID32 [--require-slot-aware]\n')
+        if reply in (advertised,advertised_usage):
+            if first_install:raise RuntimeError('This boot already has a slot-aware system receiver')
+            return 'slot_aware'
+        if reply==(2,'','usage: HWUPDATE.ELF BOOT_ID32 TRANSACTION_ID32\n'):
+            store=guest.get('writable_desktop',{})
+            if (first_install and guest.get('boot_id')==boot and 'ac_shutdown_record' in guest and
+                    guest.get('recovery_only',False) is False and store.get('ready') is True and
+                    store.get('source_pinned') is True):
+                return 'first_install'
+            raise RuntimeError('The booted system receiver lacks running-slot support. '
+                               'Only a verified pre-slot guarded boot with an explicit first-install attestation is eligible.')
+        raise RuntimeError('The running system receiver did not advertise a supported capability')
+
+    def reserve_first_install(self,boot):
+        # A repeated legacy activation before reboot can select the running
+        # slot. Preserve this claim across host retries and session reattaches.
+        registry=Path(self.bridge.registry)
+        claim=registry/f'.slot-aware-first-install-{boot}.json'
+        try:
+            fd=os.open(claim,os.O_CREAT|os.O_EXCL|os.O_WRONLY|os.O_NOFOLLOW,0o600)
+        except FileExistsError as error:
+            raise RuntimeError('A first-install attempt already exists for this boot; inspect '+str(claim)) from error
+        with os.fdopen(fd,'w') as stream:
+            json.dump({'boot_id':boot,'transaction_id':self.receipt['transaction_id'],
+                       'receipt':str(self.output.resolve()/'receipt.json')},stream)
+            stream.write('\n');stream.flush();os.fsync(stream.fileno())
+        directory=os.open(registry,os.O_RDONLY|os.O_DIRECTORY)
+        try:os.fsync(directory)
+        finally:os.close(directory)
+        self.save(first_install_claim=str(claim))
+
+    def execute(self,session,key_file,kernel_path,initrd_path,activate=False,restart=False,expected_payload_id=None,port=1235,boot_timeout_s=120,helper='usb',pace_bytes_per_second=None,*,first_slot_aware_install=None):
         helpers={'usb':'/boot/HWUPDATE.ELF','system':'/boot/HWUPSYS.ELF'}
         if helper not in helpers:raise ValueError('Expected usb or system update helper')
+        if first_slot_aware_install is not None and (helper!='system' or not activate or
+                not isinstance(first_slot_aware_install,str) or
+                not re.fullmatch(r'[0-9a-f]{32}',first_slot_aware_install)):
+            raise ValueError('First slot-aware installation requires explicit system activation and a boot ID')
         validate_pacing(pace_bytes_per_second)
         if isinstance(boot_timeout_s,bool) or not isinstance(boot_timeout_s,int) or not 1<=boot_timeout_s<=900:raise ValueError('Boot observation timeout must be 1..900 seconds')
         if restart and (not activate or not expected_payload_id):raise ValueError('Restart requires activation and an expected payload ID')
@@ -63,6 +118,8 @@ class UpdateRun:
         data=self.bridge.load_session(session);boot=data['guest_boot_id']
         doctor=self.bridge.doctor(session)
         if doctor.get('probe_stage')!='verified' or not doctor.get('reachable') or not doctor.get('identity_matches'):raise RuntimeError('Original guest boot probe is incomplete or not reachable/matching')
+        if first_slot_aware_install is not None and first_slot_aware_install!=boot:
+            raise RuntimeError('First-install attestation does not match the verified boot')
         if restart and not doctor.get('capabilities',{}).get('power',{}).get('reset'):raise RuntimeError('Guest does not advertise a supported restart')
         # An existing output directory is never reused, even after lost replies.
         self.output.mkdir(parents=True,exist_ok=False,mode=0o700)
@@ -72,17 +129,21 @@ class UpdateRun:
             kernel={'path':str(Path(kernel_path).resolve()),'bytes':len(kernel),'sha256':hashlib.sha256(kernel).hexdigest()},
             initrd={'path':str(Path(initrd_path).resolve()),'bytes':len(initrd),'sha256':hashlib.sha256(initrd).hexdigest()})
         try:
-            self.save(state='receiver_launch_dispatched')
+            receiver_mode='usb'
+            if helper=='system':
+                receiver_mode=self.system_receiver_mode(session,boot,doctor.get('guest',{}),
+                    first_slot_aware_install is not None)
+            if receiver_mode=='first_install':self.reserve_first_install(boot)
+            self.save(state='receiver_launch_dispatched',receiver_mode=receiver_mode)
             argv=[helpers[helper],boot,tx]
-            if helper=='system':argv.append('--require-slot-aware')
+            if receiver_mode=='slot_aware':argv.append('--require-slot-aware')
             self.bridge.guest_run(session,tx,argv,cwd='/tmp',uid=0,wait_s=2)
             try:
                 listening=self.wait_job(session,tx,lambda r:'HWUPDATE_LISTENING' in r.get('stdout',{}).get('text',''))
             except RuntimeError as error:
                 job=error.args[0] if error.args else None
                 if helper=='system' and isinstance(job,dict) and job.get('exit',{}).get('code')==2:
-                    raise RuntimeError('The booted system receiver lacks running-slot support. '
-                                       'Boot the checked maintenance USB and install a matching kernel/initrd pair before enabling slot health.') from error
+                    raise RuntimeError('The booted system receiver refused its negotiated launch arguments') from error
                 raise
             self.save(state='receiver_listening',job=listening)
             upload_start=self.clock()

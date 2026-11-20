@@ -267,6 +267,11 @@ done:
     free(kernel);free(initrd);return result;
 }
 int main(int argc,char** argv) {
+#if defined(BROOK_UPDATE_SYSTEM)
+    if(argc==2 && !strcmp(argv[1],"--caps")) {
+        return puts("HWUPDATE_CAPS slot_aware=1") < 0 ? 3 : 0;
+    }
+#endif
     int arguments=argc==3;
 #if defined(BROOK_UPDATE_SYSTEM) || defined(BROOK_UPDATE_TEST)
     // Host workflows pass this last argument for system updates. An older

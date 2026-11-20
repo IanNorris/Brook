@@ -17,16 +17,37 @@ class Bridge:
         self.calls=[];self.tx=None;self.newboot=False;self.activated=False;self.job_polls=0
         self.reset=True;self.stale=False;self.boot_changes=True;self.payload='candidate';self.mismatch=False;self.missing_commit=False
         self.blocked=None
+        self.cap_job=None;self.cap_legacy=False;self.cap_fault=None;self.launch_code=None
+        self.guard_caps={'boot_id':'a'*32,'ac_shutdown_record':None,
+                         'writable_desktop':{'ready':True,'source_pinned':True}}
     def load_session(self,session):return {'guest_boot_id':'a'*32,'host':'192.0.2.1','port':1234}
     def doctor(self,session):return {'probe_stage':'verified','reachable':True,'identity_matches':not (self.stale or self.newboot),
-        'capabilities':{'power':{'reset':self.reset}}}
+        'capabilities':{'power':{'reset':self.reset}},'guest':self.guard_caps}
     def guest_run(self,session,ident,argv,**kwargs):
         self.calls.append(('run',session,ident,argv))
-        if session=='original':self.tx=ident
+        if argv==['/boot/HWUPSYS.ELF','--caps']:self.cap_job=ident
+        elif session=='original':self.tx=ident
         return {'state':'queued'}
     def job(self,session,ident,**kwargs):
         self.calls.append(('job',session,ident))
         if session=='fresh':return {'state':'completed','exit':{'code':0},'stdout':{'text':'HARDWARE_PAYLOAD_ID '+self.payload+'\n'}}
+        if ident==self.cap_job:
+            stream=lambda text:{'text':text,'eof':True,'gaps':[],'read_error':None}
+            result={'session':session,'guest_boot_id':'a'*32,'operation_id':ident,'state':'completed',
+                    'exit':{'code':2 if self.cap_legacy else 0},
+                    'stdout':stream('' if self.cap_legacy else 'HWUPDATE_CAPS slot_aware=1\n'),
+                    'stderr':stream('usage: HWUPDATE.ELF BOOT_ID32 TRANSACTION_ID32\n' if self.cap_legacy else '')}
+            if self.cap_fault=='stale':result['guest_boot_id']='b'*32
+            if self.cap_fault=='operation':result['operation_id']='c'*32
+            if self.cap_fault=='unsupported':result['stdout']['text']='HWUPDATE_CAPS slot_aware=2\n'
+            if self.cap_fault=='partial':result['stderr']['eof']=False
+            if self.cap_fault=='slot_usage':
+                result['exit']['code']=2
+                result['stdout']['text']=''
+                result['stderr']['text']='usage: HWUPDATE.ELF BOOT_ID32 TRANSACTION_ID32 [--require-slot-aware]\n'
+            if self.cap_fault=='unknown_old':result['stderr']['text']='usage: unknown receiver\n'
+            return result
+        if self.launch_code is not None:return {'state':'completed','exit':{'code':self.launch_code}}
         self.job_polls+=1
         if self.job_polls==1:return {'state':'running','stdout':{'text':'HWUPDATE_LISTENING port=1235'}}
         code=0 if self.activated else 22
@@ -51,6 +72,7 @@ class Tests(unittest.TestCase):
         self.kernel=self.root/'kernel';self.kernel.write_bytes(bytes(64))
         self.initrd=self.root/'initrd';self.initrd.write_bytes(bytes(512))
         self.bridge=Bridge();self.clock=Clock();self.output=self.root/'run';self.lose_upload=False
+        self.bridge.registry=self.root/'registry';self.bridge.registry.mkdir()
     def tearDown(self):self.tmp.cleanup()
     def uploader(self,host,port,key,boot,tx,kernel,initrd,activate):
         self.assertEqual((boot,tx,key),('a'*32,self.bridge.tx,'1'*32));self.bridge.activated=activate
@@ -71,16 +93,74 @@ class Tests(unittest.TestCase):
         result=UpdateRun(self.bridge,self.output,self.uploader,self.clock.time,self.clock.sleep).execute(
             'original',self.key,self.kernel,self.initrd,True,helper='system')
         self.assertEqual(result['helper'],'system')
-        argv=[x for x in self.bridge.calls if x[0]=='run'][0][3]
-        self.assertEqual(argv[0],'/boot/HWUPSYS.ELF')
-        self.assertEqual(argv[-1],'--require-slot-aware')
-    def test_system_refuses_old_helper(self):
-        with patch.object(self.bridge,'job',return_value={'state':'completed','exit':{'code':2}}):
-            with self.assertRaisesRegex(RuntimeError,'lacks running-slot support'):
-                UpdateRun(self.bridge,self.output,self.uploader,self.clock.time,self.clock.sleep).execute(
-                    'original',self.key,self.kernel,self.initrd,True,helper='system')
+        caps,launch=[x[3] for x in self.bridge.calls if x[0]=='run']
+        self.assertEqual(caps,['/boot/HWUPSYS.ELF','--caps'])
+        self.assertEqual(launch[0],'/boot/HWUPSYS.ELF')
+        self.assertEqual(launch[-1],'--require-slot-aware')
+        self.assertEqual(result['receiver_mode'],'slot_aware')
+    def test_original_slot_aware_usage_advertises_strict_argument(self):
+        self.bridge.cap_fault='slot_usage'
+        result=UpdateRun(self.bridge,self.output,self.uploader,self.clock.time,self.clock.sleep).execute(
+            'original',self.key,self.kernel,self.initrd,True,helper='system')
+        self.assertEqual(result['receiver_mode'],'slot_aware')
+        self.assertEqual([x[3][-1] for x in self.bridge.calls if x[0]=='run'],
+                         ['--caps','--require-slot-aware'])
+    def first_install(self,boot='a'*32):
+        return UpdateRun(self.bridge,self.output,self.uploader,self.clock.time,self.clock.sleep).execute(
+            'original',self.key,self.kernel,self.initrd,True,helper='system',first_slot_aware_install=boot)
+    def test_system_refuses_old_helper_without_first_install(self):
+        self.bridge.cap_legacy=True
+        with self.assertRaisesRegex(RuntimeError,'lacks running-slot support'):
+            UpdateRun(self.bridge,self.output,self.uploader,self.clock.time,self.clock.sleep).execute(
+                'original',self.key,self.kernel,self.initrd,True,helper='system')
         self.assertFalse(self.bridge.activated)
-        self.assertEqual(self.receipt()['last_stage'],'receiver_launch_dispatched')
+        self.assertEqual(self.receipt()['last_stage'],'receiver_caps_dispatched')
+        self.assertEqual(sum(call[0]=='run' for call in self.bridge.calls),1)
+    def test_explicit_old_first_install_uses_plain_receiver_once(self):
+        self.bridge.cap_legacy=True
+        result=self.first_install()
+        caps,launch=[x[3] for x in self.bridge.calls if x[0]=='run']
+        self.assertEqual(caps,['/boot/HWUPSYS.ELF','--caps'])
+        self.assertEqual(launch,['/boot/HWUPSYS.ELF','a'*32,self.bridge.tx])
+        self.assertEqual(result['receiver_mode'],'first_install')
+    def test_first_install_claim_prevents_second_attempt_on_same_boot(self):
+        self.bridge.cap_legacy=True
+        result=self.first_install()
+        self.assertTrue(Path(result['first_install_claim']).is_file())
+        self.output=self.root/'another-output'
+        with self.assertRaisesRegex(RuntimeError,'first-install attempt already exists'):
+            self.first_install()
+        launches=[x for x in self.bridge.calls if x[0]=='run' and x[3][-1]!='--caps']
+        self.assertEqual(len(launches),1)
+    def test_first_install_refuses_stale_attestation_before_any_job(self):
+        with self.assertRaisesRegex(RuntimeError,'does not match the verified boot'):
+            self.first_install('b'*32)
+        self.assertEqual(self.bridge.calls,[])
+    def test_first_install_refuses_the_modern_receiver(self):
+        with self.assertRaisesRegex(RuntimeError,'already has a slot-aware'):
+            self.first_install()
+        self.assertFalse(self.bridge.activated)
+        self.assertEqual(sum(call[0]=='run' for call in self.bridge.calls),1)
+    def test_first_install_refuses_unknown_old_layout_and_incomplete_caps(self):
+        self.bridge.cap_legacy=True
+        for fault in ('stale','operation','partial','unknown_old'):
+            self.output=self.root/fault
+            self.bridge.cap_fault=fault
+            with self.subTest(fault=fault),self.assertRaises(RuntimeError):
+                self.first_install()
+            self.assertFalse(self.bridge.activated)
+        self.bridge.cap_fault=None
+        self.bridge.guard_caps={}
+        self.output=self.root/'old-unguarded'
+        with self.assertRaisesRegex(RuntimeError,'explicit first-install attestation'):
+            self.first_install(boot='a'*32)
+    def test_modern_launch_failure_never_downgrades(self):
+        self.bridge.launch_code=2
+        with self.assertRaisesRegex(RuntimeError,'refused its negotiated launch'):
+            UpdateRun(self.bridge,self.output,self.uploader,self.clock.time,self.clock.sleep).execute(
+                'original',self.key,self.kernel,self.initrd,True,helper='system')
+        self.assertEqual(len([x for x in self.bridge.calls if x[0]=='run']),2)
+        self.assertFalse(self.bridge.activated)
     def test_invalid_pacing_prevents_launch(self):
         for rate in (0,-1,True,1<<31):
             with self.subTest(rate=rate),self.assertRaises(ValueError):
