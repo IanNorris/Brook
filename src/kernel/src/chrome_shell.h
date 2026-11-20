@@ -117,35 +117,49 @@ void ChromeBuildVolumeGlyph(ChromeDisplayList& dl, const ChromeStyle& s, int x0,
 // Side dock (DESIGN.md "Side dock")
 // ---------------------------------------------------------------------------
 
-// Logical sizes at 100%. The sidebar is one column on the left edge, from the
-// top of the screen to the taskbar: the strip of entries across its top, the
-// selected entry's window (the page) below it. Closed, a dock with entries
-// shows only the edge tab.
+// Logical sizes at 100%. The sidebar is one column on the left or right edge
+// (one dock at a time), from the top of the screen to the taskbar: the strip
+// of entries across its top, the selected entry's window (the page) below it.
+// Closed, a dock with entries shows only the edge tab. The inner edge is a
+// resize grip, Grip wide, centred on the edge.
 struct ChromeDockMetrics {
-    static constexpr int Width = 420, Strip = 48, Cell = 42, Pin = 38, TileButton = 32;
-    static constexpr int Icon = 24, Tab = 5, TabHeight = 120;
+    static constexpr int Width = 420, MinWidth = 360, MaxWidth = 720, Strip = 48, Cell = 42, Pin = 38, TileButton = 32;
+    static constexpr int Icon = 24, Tab = 5, TabHeight = 120, Grip = 8;
+};
+// Where the sidebar sits: the edge, and its width in logical pixels (0: the
+// default Width). The width is clamped to [MinWidth, MaxWidth] and to half
+// the screen.
+struct ChromeDockPlacement {
+    int width = 0;
+    bool right = false;
 };
 static constexpr uint32_t ChromeDockEntryLimit = 32; // WM_MAX_WINDOWS
 
 struct ChromeDockLayout {
     DesktopRect sidebar, strip, page, tab;
-    DesktopRect pin, tile, title, back, close; // tile: the selected entry's cell
+    DesktopRect pin, side, grip;               // side: move to the other edge; grip: the inner edge
+    DesktopRect tile, title, back, close;      // tile: the selected entry's cell
     DesktopRect cells[ChromeDockEntryLimit];   // one per laid-out entry; cells[selected] == tile
     int count;    // entries laid out; any beyond the strip's room are not shown
     int selected; // -1: none
     bool open;    // strip shown (open or pinned); else the tab, when there are entries
+    bool right;   // the sidebar is on the right edge
 };
 
-enum class ChromeDockTarget : uint8_t { None, Entry, Tile, Return, Close, Pin, Strip, Tab };
+enum class ChromeDockTarget : uint8_t { None, Entry, Tile, Return, Close, Pin, Strip, Tab, Side, Grip };
 struct ChromeDockHit {
     ChromeDockTarget target;
     int index; // Entry, Tile: the entry
 };
 
-// The sidebar rectangle: 420 px (scaled), at most half the screen.
-DesktopRect ChromeDockSidebar(const DesktopMetrics& m, uint32_t screenW, uint32_t desktopH);
+// The sidebar rectangle: the placement's width (scaled), clamped to
+// [MinWidth, MaxWidth] and at most half the screen, on its edge.
+DesktopRect ChromeDockSidebar(const DesktopMetrics& m, uint32_t screenW, uint32_t desktopH,
+                              const ChromeDockPlacement& place = {});
+// The logical width for a sidebar dragged to px physical pixels (clamped).
+int ChromeDockWidthFor(const DesktopMetrics& m, uint32_t screenW, int px);
 ChromeDockLayout ChromeDockLayoutFor(const DesktopMetrics& m, uint32_t screenW, uint32_t desktopH,
-                                     int entries, int selected, bool open);
+                                     int entries, int selected, bool open, const ChromeDockPlacement& place = {});
 ChromeDockHit ChromeDockHitTest(const ChromeDockLayout& layout, int32_t x, int32_t y);
 
 struct ChromeDockModel {
@@ -153,6 +167,7 @@ struct ChromeDockModel {
     const uint32_t* const* icons; // layout->count entries (borrowed; null: missing glyph)
     const char* title;            // the selected entry's window title
     bool pinned;
+    bool resizing; // the grip is being dragged
     int32_t mouseX, mouseY;
 };
 void ChromeBuildDock(const ChromeDockModel& model, const ChromeStyle& style, ChromeDisplayList& out);

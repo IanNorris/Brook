@@ -4,6 +4,9 @@
 // window state, the work-area inset and persistence. Include only from
 // window.cpp, after the launcher (it shares the config writer).
 //
+// D2 adds the caption button on native frames, either screen edge (one dock
+// at a time) and a resizable width, both persisted.
+//
 // D1 scope: guests only (no residents or [Dock] resident list), the icon
 // strip at the top of a left-edge sidebar, Super+S / Super+Shift+S, the pin,
 // the edge tab. A docked window keeps running; while it is not the shown
@@ -18,8 +21,14 @@ struct DockState {
     bool open;     // shown on request; a pinned dock is shown regardless
     bool pinned;
     bool reserved; // the work area last applied excludes the sidebar
+    bool right;    // the sidebar is on the right edge
+    int width;     // logical width; 0: ChromeDockMetrics::Width
+    bool resizing; // the grip is being dragged
+    int dragX, dragWidth; // pointer x and sidebar pixels when the drag began
 };
-static DockState g_dock = {{}, 0, -1, false, false, false};
+static DockState g_dock = {{}, 0, -1, false, false, false, false, 0, false, 0, 0};
+
+static ChromeDockPlacement DockPlacement() { return {g_dock.width, g_dock.right}; }
 
 // Persistence: a kernel-owned [Dock] file beside launcher.ini (which belongs
 // to the launcher model's serializer). Compositor writes queue a save; the
@@ -43,9 +52,12 @@ static WmRect WorkAreaFor(const DesktopMetrics& m, uint32_t screenW, uint32_t sc
     const uint32_t desktopH = DockDesktopHeight(m, screenH);
     WmRect area{0, 0, static_cast<int>(screenW), static_cast<int>(desktopH)};
     if (DockReserves()) {
-        const DesktopRect side = ChromeDockSidebar(m, screenW, desktopH);
-        area.x = side.x + side.w;
-        area.w = static_cast<int>(screenW) - area.x;
+        const DesktopRect side = ChromeDockSidebar(m, screenW, desktopH, DockPlacement());
+        if (g_dock.right) area.w = side.x;
+        else {
+            area.x = side.x + side.w;
+            area.w = static_cast<int>(screenW) - area.x;
+        }
     }
     return area;
 }
@@ -56,26 +68,43 @@ static ChromeDockLayout DockLayoutFor(const DesktopMetrics& m, uint32_t screenW,
 {
     const bool shown = DockShown();
     return ChromeDockLayoutFor(m, screenW, DockDesktopHeight(m, screenH), static_cast<int>(g_dock.count),
-                               shown ? g_dock.selected : -1, shown);
+                               shown ? g_dock.selected : -1, shown, DockPlacement());
 }
 
-// Floating windows cannot sit under a pinned sidebar: move a left edge out.
+// Floating windows cannot sit under a pinned sidebar: move the edge that
+// overlaps it out (a window wider than the work area keeps its left edge).
 static bool DockKeepOutLocked(Window& w)
 {
     if (!DockReserves() || w.docked || !w.focusable || w.fullscreen || w.state != WindowState::Normal) return false;
     uint32_t sw = 0, sh = 0;
     CompositorGetPhysDims(&sw, &sh);
     const WmRect area = WorkAreaFor(w.desktopMetrics(), sw, sh);
+    if (g_dock.right) {
+        const int right = area.x + area.w, outer = static_cast<int>(w.outerWidth());
+        if (w.x + outer <= right) return false;
+        const int x = right - outer > area.x ? right - outer : area.x;
+        if (x == w.x) return false;
+        w.x = static_cast<int16_t>(x);
+        return true;
+    }
     if (w.x >= area.x) return false;
     w.x = static_cast<int16_t>(area.x);
     return true;
+}
+
+// The caption button (CaptionGeometry): native frames of windows the dock
+// would take, showing the edge it docks into.
+static uint8_t WindowDockButton(const Window& w)
+{
+    if (!w.proc || w.noChrome || w.docked || w.fullscreen || !w.focusable) return 0;
+    return g_dock.right ? 2 : 1;
 }
 
 // Place a docked window as the page: the sidebar below the strip.
 static bool DockPlaceLocked(int idx, const DesktopMetrics& m, uint32_t screenW, uint32_t screenH)
 {
     Window& w = g_windows[idx];
-    const ChromeDockLayout l = ChromeDockLayoutFor(m, screenW, DockDesktopHeight(m, screenH), 1, 0, true);
+    const ChromeDockLayout l = ChromeDockLayoutFor(m, screenW, DockDesktopHeight(m, screenH), 1, 0, true, DockPlacement());
     if (l.page.w < static_cast<int>(WM_MIN_WIDTH) || l.page.h < static_cast<int>(WM_MIN_HEIGHT)) return false;
     const int16_t x = w.x, y = w.y;
     w.x = static_cast<int16_t>(l.page.x);
@@ -284,6 +313,79 @@ static void DockForgetLocked(int idx)
 
 static void DockQueueSave() { ++g_dockSaveEpoch; }
 
+// The placement changed (edge or width): every entry moves to the new page,
+// the work area and the windows that follow it reflow, and the change is saved.
+static void DockRelayoutLocked()
+{
+    uint32_t sw = 0, sh = 0;
+    CompositorGetPhysDims(&sw, &sh);
+    if (!sw || !sh) return;
+    for (uint32_t i = 0; i < g_dock.count; ++i) {
+        const int idx = g_dock.entries[i];
+        Window& w = g_windows[idx];
+        const ChromeDockLayout l = ChromeDockLayoutFor(w.desktopMetrics(), sw, DockDesktopHeight(w.desktopMetrics(), sh),
+                                                       1, 0, true, DockPlacement());
+        w.x = static_cast<int16_t>(l.page.x);
+        w.y = static_cast<int16_t>(l.page.y);
+        // Always configure: it also ends an interactive (grip) resize.
+        if (l.page.w >= static_cast<int>(WM_MIN_WIDTH) && l.page.h >= static_cast<int>(WM_MIN_HEIGHT))
+            ResizeWindowLocked(idx, static_cast<uint16_t>(l.page.w), static_cast<uint16_t>(l.page.h));
+        if (w.proc) { w.proc->fbDestX = w.clientX(); w.proc->fbDestY = w.clientY(); }
+    }
+    if (DockReserves()) DockReflowLocked();
+    DockQueueSave();
+    CompositorMarkDirty();
+    CompositorWake();
+}
+
+static void DockSetSideLocked(bool right)
+{
+    if (g_dock.right == right) return;
+    g_dock.right = right;
+    DockRelayoutLocked();
+    SerialPrintf("WM: dock moved to the %s edge\n", right ? "right" : "left");
+}
+
+static void DockSetWidthLocked(int width)
+{
+    if (width < 0) width = 0;
+    if (g_dock.width == width) return;
+    g_dock.width = width;
+    DockRelayoutLocked();
+}
+
+// Grip drag (compositor thread, under the guard): the page follows the
+// pointer with interactive configures; the release settles the placement.
+static void DockDragLocked(int32_t mx, bool down)
+{
+    if (!g_dock.resizing) return;
+    uint32_t sw = 0, sh = 0;
+    CompositorGetPhysDims(&sw, &sh);
+    const DesktopMetrics m = WmDesktopMetrics();
+    const int px = g_dock.dragWidth + (g_dock.right ? g_dock.dragX - mx : mx - g_dock.dragX);
+    const int width = ChromeDockWidthFor(m, sw, px);
+    if (width != g_dock.width) {
+        g_dock.width = width;
+        const int entry = g_dock.selected;
+        if (DockShown() && entry >= 0 && entry < static_cast<int>(g_dock.count)) {
+            const int idx = g_dock.entries[entry];
+            Window& w = g_windows[idx];
+            const ChromeDockLayout l = ChromeDockLayoutFor(m, sw, DockDesktopHeight(m, sh), 1, 0, true, DockPlacement());
+            w.x = static_cast<int16_t>(l.page.x);
+            w.y = static_cast<int16_t>(l.page.y);
+            if (l.page.w >= static_cast<int>(WM_MIN_WIDTH))
+                ResizeWindowLocked(idx, static_cast<uint16_t>(l.page.w), static_cast<uint16_t>(l.page.h), true);
+            if (w.proc) { w.proc->fbDestX = w.clientX(); w.proc->fbDestY = w.clientY(); }
+        }
+        CompositorMarkDirty();
+    }
+    if (!down) {
+        g_dock.resizing = false;
+        DockRelayoutLocked();
+        KLOG_INFO(Wm, "dock: width %d", g_dock.width);
+    }
+}
+
 static void DockSetPinnedLocked(bool pinned)
 {
     if (g_dock.pinned == pinned) return;
@@ -307,6 +409,12 @@ uint32_t WmDockEntryCount() { return g_dock.count; }
 int WmDockEntryWindow(uint32_t entry) { return entry < g_dock.count ? g_dock.entries[entry] : -1; }
 void WmDockSetPinned(bool pinned) { VfbGuard guard; DockSetPinnedLocked(pinned); }
 bool WmDockDismissible() { return g_dock.count && g_dock.open && !g_dock.pinned; }
+bool WmDockRight() { return g_dock.right; }
+int WmDockWidth() { return g_dock.width; }
+void WmDockSetRight(bool right) { VfbGuard guard; DockSetSideLocked(right); }
+void WmDockSetWidth(int width) { VfbGuard guard; DockSetWidthLocked(width); }
+bool WmDockDragActive() { return g_dock.resizing; }
+void WmDockDrag(int32_t mx, bool down) { VfbGuard guard; DockDragLocked(mx, down); }
 
 bool WmDockSelect(int entry)
 {
@@ -371,8 +479,9 @@ bool WmDockSurfaceRect(uint32_t screenW, uint32_t screenH, int32_t* x, int32_t* 
 bool WmDockPointerOwned(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)
 {
     if (!g_wmActive || !g_dock.count || WmTaskbarHidden()) return false;
+    if (g_dock.resizing) return true;
     const ChromeDockLayout l = DockLayoutFor(WmDesktopMetrics(), screenW, screenH);
-    return (l.open ? l.strip : l.tab).contains(mx, my);
+    return (l.open ? l.strip : l.tab).contains(mx, my) || l.grip.contains(mx, my);
 }
 
 bool WmDockPress(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)
@@ -407,6 +516,14 @@ bool WmDockPress(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)
         }
         case ChromeDockTarget::Pin:
             DockSetPinnedLocked(!g_dock.pinned);
+            break;
+        case ChromeDockTarget::Side:
+            DockSetSideLocked(!g_dock.right);
+            break;
+        case ChromeDockTarget::Grip:
+            g_dock.resizing = true;
+            g_dock.dragX = mx;
+            g_dock.dragWidth = l.sidebar.w;
             break;
         case ChromeDockTarget::Strip:
             break;
@@ -456,19 +573,21 @@ static void WmCaptureDock(uint32_t screenW, uint32_t screenH, int32_t mouseX, in
     snapshot.kind = ChromeShellKind::Dock;
     snapshot.dock = DockLayoutFor(WmDesktopMetrics(), screenW, screenH);
     snapshot.dockPinned = g_dock.pinned;
+    snapshot.dockResizing = g_dock.resizing;
     const auto& l = snapshot.dock;
     for (int i = 0; i < l.count; ++i) {
         const int idx = g_dock.entries[i];
         WmCaptureShellIcon(snapshot.icons[i], WindowIcon(g_windows[idx], icons.get()));
     }
     if (l.selected >= 0) WmStrCopy(snapshot.text, WindowDisplayTitle(g_windows[g_dock.entries[l.selected]]), sizeof(snapshot.text));
-    const bool hovered = l.open && l.strip.contains(mouseX, mouseY);
+    const bool hovered = l.open && (l.strip.contains(mouseX, mouseY) || l.grip.contains(mouseX, mouseY));
     snapshot.mouseX = hovered ? mouseX : -1;
     snapshot.mouseY = hovered ? mouseY : -1;
 }
 
 // ---------------------------------------------------------------------------
-// Persistence: "[Dock]\npinned=0|1\n". Residents join it in a later slice.
+// Persistence: "[Dock]\npinned=0|1\nside=left|right\nwidth=N\n" (width in
+// logical pixels, 0 the default). Residents join it in a later slice.
 // ---------------------------------------------------------------------------
 
 // The [Dock] section's settings; unknown keys and sections are ignored.
@@ -483,6 +602,12 @@ static void DockParseState(char* text)
         if (end > line && end[-1] == '\r') end[-1] = 0;
         if (line[0] == '[') section = !strcmp(line, "[Dock]");
         else if (section && !strncmp(line, "pinned=", 7)) g_dock.pinned = line[7] == '1';
+        else if (section && !strncmp(line, "side=", 5)) g_dock.right = !strcmp(line + 5, "right");
+        else if (section && !strncmp(line, "width=", 6)) {
+            int width = 0;
+            for (const char* d = line + 6; *d >= '0' && *d <= '9' && width < 100000; ++d) width = width * 10 + (*d - '0');
+            g_dock.width = width <= 4096 ? width : 0;
+        }
         *end = saved;
         line = *end ? end + 1 : end;
     }
@@ -500,7 +625,8 @@ static void DockLoadState()
     }
     DockParseState(text);
     g_dockSavedEpoch = g_dockSaveEpoch;
-    KLOG_INFO(Wm, "dock: state restored pinned=%d", int(g_dock.pinned));
+    KLOG_INFO(Wm, "dock: state restored pinned=%d side=%s width=%d", int(g_dock.pinned),
+              g_dock.right ? "right" : "left", g_dock.width);
 }
 
 // Launcher worker: write a queued change (a failure retries in 5 s).
@@ -508,9 +634,17 @@ static void DockSaveState()
 {
     const uint32_t epoch = __atomic_load_n(&g_dockSaveEpoch, __ATOMIC_ACQUIRE);
     if (epoch == g_dockSavedEpoch || ApicTickCount() < g_dockSaveRetry) return;
-    char text[64];
+    char text[96];
     WmStrCopy(text, g_dock.pinned ? "[Dock]\npinned=1\n" : "[Dock]\npinned=0\n", sizeof(text));
-    const uint32_t bytes = static_cast<uint32_t>(strlen(text));
+    uint32_t bytes = static_cast<uint32_t>(strlen(text));
+    WmStrCopy(text + bytes, g_dock.right ? "side=right\nwidth=" : "side=left\nwidth=", sizeof(text) - bytes);
+    bytes = static_cast<uint32_t>(strlen(text));
+    char digits[12];
+    int n = 0;
+    for (uint32_t v = static_cast<uint32_t>(g_dock.width > 0 ? g_dock.width : 0); n == 0 || v; v /= 10) digits[n++] = char('0' + v % 10);
+    while (n && bytes + 2 < sizeof(text)) text[bytes++] = digits[--n];
+    text[bytes++] = '\n';
+    text[bytes] = 0;
     VfsPath root{}, directory{};
     LauncherPersistenceResult result;
     if (const int error = VfsPathRoot(&root)) result = {"root", error};

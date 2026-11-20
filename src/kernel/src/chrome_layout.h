@@ -17,7 +17,7 @@
 
 namespace brook {
 
-enum class ChromePartRole : uint8_t { Resize, Close, Maximise, Minimise, Drag, Client, Border };
+enum class ChromePartRole : uint8_t { Resize, Close, Maximise, Minimise, Drag, Client, Border, Dock };
 enum : uint8_t { ChromeEdgeLeft = 1, ChromeEdgeTop = 2, ChromeEdgeRight = 4, ChromeEdgeBottom = 8 };
 
 struct ChromePart {
@@ -49,6 +49,7 @@ struct ChromeLayout {
     DesktopRect outer;  // the visible frame (CSD: the client surface)
     DesktopRect bounds; // union of every hit rect: outer plus the margin
     uint32_t count;
+    bool dockRight; // the dock button docks into a right-edge sidebar
     ChromePart parts[ChromePartLimit];
 
     // First part whose hit rect contains the point (test order), or null.
@@ -69,13 +70,15 @@ struct ChromeLayout {
 };
 
 // Caption button roles in DesktopCaptionRect index order (0 close, 1
-// maximise, 2 minimise).
+// maximise, 2 minimise, 3 dock).
+static constexpr int ChromeCaptionLimit = 4;
 inline constexpr ChromePartRole ChromeCaptionRole(int index) {
-    return index == 0 ? ChromePartRole::Close : index == 1 ? ChromePartRole::Maximise : ChromePartRole::Minimise;
+    return index == 0 ? ChromePartRole::Close : index == 1 ? ChromePartRole::Maximise :
+           index == 2 ? ChromePartRole::Minimise : ChromePartRole::Dock;
 }
 inline constexpr int ChromeCaptionIndex(ChromePartRole role) {
     return role == ChromePartRole::Close ? 0 : role == ChromePartRole::Maximise ? 1 :
-           role == ChromePartRole::Minimise ? 2 : -1;
+           role == ChromePartRole::Minimise ? 2 : role == ChromePartRole::Dock ? 3 : -1;
 }
 inline constexpr bool ChromePartIsButton(ChromePartRole role) { return ChromeCaptionIndex(role) >= 0; }
 
@@ -99,6 +102,7 @@ inline ChromeLayout ChromeFrameLayout(const ChromeFrameState& s, const DesktopMe
     const int ow = g.clientW + 2 * border, oh = g.clientH + m.title() + 2 * border;
     const int x = g.x, y = g.y, right = x + ow, bottom = y + oh;
     l.outer = l.bounds = {x, y, ow, oh};
+    l.dockRight = g.dockButton == 2;
     uint8_t lost = s.maximised ? uint8_t(ChromeEdgeLeft | ChromeEdgeTop | ChromeEdgeRight | ChromeEdgeBottom) : 0;
     if (s.screen.w > 0 && s.screen.h > 0) {
         if (x <= s.screen.x) lost |= ChromeEdgeLeft;
@@ -142,7 +146,7 @@ inline ChromeLayout ChromeFrameLayout(const ChromeFrameState& s, const DesktopMe
     // is hit from the outer top edge to the titlebar's bottom; Close also to
     // the outer right edge, so the top-right corner pixel is Close.
     int runLeft = right;
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < ChromeCaptionLimit; ++i) {
         const DesktopRect r = DesktopCaptionRect(g, m, i);
         if (r.w <= 0 || r.h <= 0) continue;
         const int hitRight = i == 0 ? right : r.x + r.w;

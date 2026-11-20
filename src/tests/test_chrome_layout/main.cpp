@@ -13,10 +13,10 @@ namespace {
 int failures = 0;
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "CHROME_LAYOUT line %d: %s\n", __LINE__, #x); std::abort(); } } while (0)
 
-enum class Z { None, Close, Max, Min, Drag, Client, Border, L, T, R, B, TL, TR, BL, BR };
+enum class Z { None, Close, Max, Min, Drag, Client, Border, L, T, R, B, TL, TR, BL, BR, Dock };
 const char* Name(Z z) {
     static const char* names[] = {"none", "close", "max", "min", "drag", "client", "border",
-                                  "L", "T", "R", "B", "TL", "TR", "BL", "BR"};
+                                  "L", "T", "R", "B", "TL", "TR", "BL", "BR", "dock"};
     return names[static_cast<int>(z)];
 }
 Z Classify(const ChromePart* p) {
@@ -28,6 +28,7 @@ Z Classify(const ChromePart* p) {
     case ChromePartRole::Drag: return Z::Drag;
     case ChromePartRole::Client: return Z::Client;
     case ChromePartRole::Border: return Z::Border;
+    case ChromePartRole::Dock: return Z::Dock;
     case ChromePartRole::Resize: break;
     }
     switch (p->edges) {
@@ -163,6 +164,33 @@ int main() {
                 const Probe p{x, 0, want, "y = 0 sweep"};
                 Run("normal", m, l, &p, 1);
             }
+            CHECK(!l.Find(ChromePartRole::Dock));
+        }
+        // --- The side-dock button: a fourth cell left of minimise, the same
+        // run rules; the title drag and top band stop at it.
+        {
+            ChromeFrameState s{{100, 100, clientW, clientH, false}, false, screen};
+            s.geometry.dockButton = 2;
+            const ChromeLayout l = ChromeFrameLayout(s, m);
+            CheckButtons("dock", s, m, l, true);
+            const ChromePart* dock = l.Find(ChromePartRole::Dock);
+            CHECK(dock && l.dockRight);
+            const int dockX = minX - k.button;
+            CHECK(dock->visual.x == 100 + dockX && dock->visual.w == k.button);
+            CHECK(dock->hit.x + dock->hit.w == l.Find(ChromePartRole::Minimise)->hit.x);
+            const Probe probes[] = {
+                {minX - 1, midY, Z::Dock, "dock right edge"},
+                {dockX, midY, Z::Dock, "dock left edge"},
+                {dockX - 1, midY, Z::Drag, "titlebar beside dock"},
+                {dockX, 0, Z::Dock, "dock reaches the outer top"},
+                {dockX - 1, 0, Z::T, "top band beside dock"},
+            };
+            Run("dock", m, l, probes, sizeof(probes) / sizeof(probes[0]));
+            // Client-decorated windows never carry it, overlaid or not.
+            DesktopWindowGeometry csd{0, 0, clientW, clientH, true, true};
+            csd.dockButton = 1;
+            CHECK(DesktopCaptionRect(csd, m, 3).w == 0);
+            CHECK(!ChromeFrameLayout({csd, false, screen}, m).Find(ChromePartRole::Dock));
         }
 
         // --- Maximised: no resize zones; the buttons own y = 0 and the

@@ -8459,6 +8459,9 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         else if (StrStartsWith(arg, "select ")) { ParseUint(arg + 7, &n); ok = WmDockSelect(static_cast<int>(n)); }
         else if (StrStartsWith(arg, "return ")) { ParseUint(arg + 7, &n); ok = WmDockReturnWindow(static_cast<int>(n)); }
         else if (StrStartsWith(arg, "window ")) { ParseUint(arg + 7, &n); ok = WmDockWindow(static_cast<int>(n)); }
+        else if (NetStrEq(arg, "side left")) WmDockSetRight(false);
+        else if (NetStrEq(arg, "side right")) WmDockSetRight(true);
+        else if (StrStartsWith(arg, "width ")) { ParseUint(arg + 6, &n); WmDockSetWidth(static_cast<int>(n)); }
         else if (*arg && !NetStrEq(arg, "status")) ok = false;
         CompositorMarkDirty();
         char buf[160];
@@ -8470,6 +8473,9 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         for (int j = 0; o[j]; j++) buf[p++] = o[j];
         const char* pin = WmDockPinned() ? " pinned" : " unpinned";
         for (int j = 0; pin[j]; j++) buf[p++] = pin[j];
+        const char* side = WmDockRight() ? " right width=" : " left width=";
+        for (int j = 0; side[j]; j++) buf[p++] = side[j];
+        p += UintToStr(buf + p, static_cast<uint32_t>(WmDockWidth()));
         for (uint32_t e = 0; e < WmDockEntryCount() && p < 140; e++) {
             buf[p++] = ' '; buf[p++] = 'w';
             p += IntToStr(buf + p, WmDockEntryWindow(e));

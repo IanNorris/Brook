@@ -1279,6 +1279,8 @@ meant, the top dock in Lab is most of it already.
 | Selected page's tile | The one entry with a name. It takes the width the icons leave, and carries the window's title, Return to desktop and Close. It is the page's title bar. |
 | Selection mark | The tile's lighter fill. No accent bar, no marker. |
 | Pin | A 38×48 button at the end of the strip. |
+| Side | A 38×48 button before the pin: moves the sidebar to the other screen edge. One dock at a time; saved as `side=left\|right`. |
+| Grip | The inner edge, 8 px centred on it, the full height: drag to resize (360 to 720, at most half the screen). The strip's inner hairline turns accent while it is hovered or dragged. |
 | Page | The rest of the column: 420×804. The app's window with no title bar of its own. |
 
 **Icons at the top** (the default): the selected tile sits where a title bar
@@ -1339,6 +1341,10 @@ taskbar button moves to the bottom-right corner and toasts move inboard.
   “Send to dock”.
 - **Key.** Super+Shift+S docks the focused window, or returns the page to the
   desktop.
+- **Button.** Title bars that Brook draws carry a fourth caption button, left
+  of minimise: a window with a sidebar panel on the edge the dock is on. Apps
+  that draw their own title bar (Chromium's overlaid captions, GTK header
+  bars) do not have it yet; for them the menu, the drag and the key remain.
 - **Drag out.** Drag any tile out of the sidebar, the selected one included,
   since it is that window's title bar. An outline shows the window at the size
   it had before it was docked, under the pointer and inside the work area.
@@ -1425,8 +1431,10 @@ that. Attention counts are unknown until a protocol is chosen.
 
 - **Overflow.** Ten entries leave the selected tile no room for its name. The
   prototype lets the name shrink. Natively the strip needs an overflow button.
-- Should the sidebar be resized by dragging its inner edge? If so, apply it on
-  release, with a guide, so each maximised client is configured once.
+- ~~Should the sidebar be resized by dragging its inner edge?~~ Yes (native
+  D2): the inner edge is an 8 px grip. The page follows the drag; maximised
+  windows beside a pinned sidebar are configured once, on release. The width
+  is saved as `width=` (logical px) in `dock.ini`.
 - Should each page keep its own width, or the sidebar one width for all? The
   prototype uses one.
 - Should Minimise on a resident dock it, so the dock is simply where those

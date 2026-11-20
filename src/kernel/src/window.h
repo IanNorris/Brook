@@ -309,6 +309,7 @@ enum class WmHitZone : uint8_t
     ResizeTopLeft,
     ResizeTopRight,
     ResizeBottomLeft,
+    DockButton,     // native caption: move the window into the side dock
 };
 // Resize zones as edge masks (bit 0 left, 1 top, 2 right, 3 bottom; the
 // chrome_layout.h ChromeEdge* values). Zero for any other zone.
@@ -568,6 +569,15 @@ bool WmDockPinned();
 bool WmDockOpen();
 uint32_t WmDockEntryCount();
 int WmDockEntryWindow(uint32_t entry);
+// Placement: the right edge (else the left) and the logical width (0 default).
+bool WmDockRight();
+int WmDockWidth();
+void WmDockSetRight(bool right);
+void WmDockSetWidth(int width);
+// The sidebar's inner-edge grip, pressed in WmDockPress: motion while the
+// button is held resizes the page; the release settles and saves the width.
+bool WmDockDragActive();
+void WmDockDrag(int32_t mx, bool down);
 // Alt+Tab: send the frontmost desktop window back and focus the next one.
 // Docked windows take no part; an open, unpinned dock closes first. Returns
 // the newly focused window, or -1.

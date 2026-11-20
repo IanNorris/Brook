@@ -2446,7 +2446,8 @@ static void CompositorLoopWM()
         WmHitResult hh = WmHitTest(hmx, hmy);
         bool overButton = (hh.zone == WmHitZone::CloseButton ||
                            hh.zone == WmHitZone::MaximizeButton ||
-                           hh.zone == WmHitZone::MinimizeButton);
+                           hh.zone == WmHitZone::MinimizeButton ||
+                           hh.zone == WmHitZone::DockButton);
         // Signature: window index + zone when over a button, else a sentinel.
         uint32_t sig = overButton
             ? ((static_cast<uint32_t>(hh.windowIndex) << 8) | static_cast<uint32_t>(hh.zone))
@@ -3272,7 +3273,10 @@ static void CompositorHandleMouseWM()
         if (WmDockPress(mx, my, g_physFbWidth, g_physFbHeight))
         {
             if (WmLauncherVisible()) WmLauncherClose();
-            if (releaseLatched && !polledDown) { g_wmPrimaryDown = false; g_wmLastBtnDown = false; }
+            if (releaseLatched && !polledDown) {
+                g_wmPrimaryDown = false; g_wmLastBtnDown = false;
+                if (WmDockDragActive()) WmDockDrag(mx, false);
+            }
             else g_wmLastBtnDown = btnDown;
             return;
         }
@@ -3401,6 +3405,9 @@ static void CompositorHandleMouseWM()
             case WmHitZone::MinimizeButton:
                 WmMinimizeWindow(hit.windowIndex);
                 break;
+            case WmHitZone::DockButton:
+                WmDockWindow(hit.windowIndex);
+                break;
             case WmHitZone::TitleBar:
             {
                 Window* w=WmGetWindow(hit.windowIndex);
@@ -3426,6 +3433,12 @@ static void CompositorHandleMouseWM()
     else if (WmVolumeDragActive())
     {
         WmVolumeDrag(mx, btnDown, g_physFbWidth, g_physFbHeight);
+    }
+    else if (WmDockDragActive())
+    {
+        // A latched release ends the drag in this pass (the bottom of the
+        // function clears the held state the same way).
+        WmDockDrag(mx, btnDown && !(releaseLatched && !polledDown));
     }
     else if (btnDown && g_wmDragging)
     {

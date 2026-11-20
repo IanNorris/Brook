@@ -1025,6 +1025,57 @@ int main() {
         CHECK(WmWorkArea(sw,sh).x==0 && c.x==0 && c.clientW==sw-2*border);
         WmDockSetPinned(true);CHECK(c.x==sideW);
 
+        // Native frames carry the dock button, showing the edge it docks to;
+        // docked pages and client-decorated windows do not.
+        CHECK(CaptionGeometry(f).dockButton==1 && CaptionGeometry(b).dockButton==0);
+        // The other edge: the page, the strip, the work area and the
+        // maximised window follow; the floating window clear of it stays.
+        WmDockSetRight(true);
+        CHECK(WmDockRight() && b.x==int(sw)-sideW && b.clientW==sideW);
+        CHECK(dockSurface(dock) && dock.x==int32_t(sw)-sideW && int(dock.w)==sideW);
+        CHECK(WmWorkArea(sw,sh).x==0 && WmWorkArea(sw,sh).w==int(sw)-sideW);
+        CHECK(c.x==0 && c.clientW==sw-sideW-2*border && f.x==sideW);
+        CHECK(CaptionGeometry(f).dockButton==2);
+        // A floating window moved under the right sidebar is pushed back out.
+        WmMoveWindow(floating,int16_t(sw-100),90);CHECK(f.x+int(f.outerWidth())==int(sw)-sideW);
+        WmMoveWindow(floating,int16_t(sideW),80);
+        {
+            const auto l=ChromeDockLayoutFor(WmDesktopMetrics(),sw,uint32_t(desktopH),2,1,true,{0,true});
+            CHECK(l.right && l.sidebar.x==int(sw)-sideW && l.grip.x==l.sidebar.x-l.grip.w/2);
+            // The strip's side button moves it back.
+            CHECK(WmDockPress(l.side.x+2,l.side.y+2,sw,sh) && !WmDockRight());
+        }
+        CHECK(b.x==0 && dockSurface(dock) && dock.x==0 && WmWorkArea(sw,sh).x==sideW && c.x==sideW);
+        // A set width (logical pixels) moves the inner edge.
+        const int wide=int(WmMetric(500));
+        WmDockSetWidth(500);
+        CHECK(WmDockWidth()==500 && b.clientW==wide && WmWorkArea(sw,sh).x==wide && c.x==wide);
+        // The grip: pressing the inner edge starts a drag; motion resizes the
+        // page interactively; the release settles the work area and saves.
+        {
+            const auto l=ChromeDockLayoutFor(WmDesktopMetrics(),sw,uint32_t(desktopH),2,1,true,{500,false});
+            CHECK(l.grip.x<wide && l.grip.x+l.grip.w>wide);
+            CHECK(WmDockPointerOwned(wide+1,400,sw,sh));
+            const uint32_t before=g_dockSaveEpoch;
+            CHECK(WmDockPress(wide-1,400,sw,sh) && WmDockDragActive());
+            WmDockDrag(wide-61,true);
+            // Maximised windows reflow once, on the release.
+            CHECK(b.clientW==wide-60 && c.x==wide);
+            {const auto e=lastResize(b);CHECK(e.type==WM_EVT_RESIZED && e.x==wide-60 && e.reserved==WM_RESIZE_MAXIMIZED);}
+            WmDockDrag(wide-61,false);
+            CHECK(!WmDockDragActive() && WmDockWidth()==440 && WmWorkArea(sw,sh).x==int(WmMetric(440)));
+            CHECK(c.x==int(WmMetric(440)) && g_dockSaveEpoch!=before);
+            {const auto e=lastResize(b);CHECK(e.type==WM_EVT_RESIZED && e.x==int(WmMetric(440)));}
+            // Clamped to the minimum and to half the screen.
+            CHECK(WmDockPress(int(WmMetric(440))-1,400,sw,sh) && WmDockDragActive());
+            WmDockDrag(10,false);CHECK(WmDockWidth()==ChromeDockMetrics::MinWidth);
+            CHECK(WmDockPress(int(WmMetric(ChromeDockMetrics::MinWidth)),400,sw,sh));
+            WmDockDrag(int(sw)-5,false);CHECK(b.clientW==sw/2); // 640 < MaxWidth
+        }
+        WmDockSetWidth(0);CHECK(b.clientW==sideW && c.x==sideW);
+        CHECK(f.x==int(sw)/2); // pushed out by the widest sidebar, and left there
+        WmMoveWindow(floating,int16_t(sideW),80);
+
         // Return Chat (floating when docked): back on the taskbar, focused,
         // with its geometry, state and chrome. Pinned, the dock keeps Notes.
         WmInputPop(&a,drain,256);
@@ -1061,14 +1112,21 @@ int main() {
         // launcher worker after each change, and parses back.
         layoutWritable=true;layoutRenamed=false;layoutSyncs=0;
         DockSaveState();
-        CHECK(layoutRenamed && !strcmp(layoutText,"[Dock]\npinned=1\n"));
+        CHECK(layoutRenamed && !strcmp(layoutText,"[Dock]\npinned=1\nside=left\nwidth=0\n"));
         layoutRenamed=false;layoutSyncs=0;DockSaveState();CHECK(!layoutRenamed); // nothing new to write
         WmDockSetPinned(false);
-        DockSaveState();CHECK(layoutRenamed && !strcmp(layoutText,"[Dock]\npinned=0\n"));
+        DockSaveState();CHECK(layoutRenamed && !strcmp(layoutText,"[Dock]\npinned=0\nside=left\nwidth=0\n"));
+        g_dock.right=true;g_dock.width=512;DockQueueSave();layoutRenamed=false;layoutSyncs=0;
+        DockSaveState();CHECK(!strcmp(layoutText,"[Dock]\npinned=0\nside=right\nwidth=512\n"));
         {
             char text[]="[Launcher]\npinned=1\n[Dock]\r\nwidth=420\r\npinned=1\r\n";
             DockParseState(text);CHECK(WmDockPinned());
-            char off[]="[Dock]\npinned=0";DockParseState(off);CHECK(!WmDockPinned());
+            CHECK(WmDockWidth()==420);
+            char off[]="[Dock]\npinned=0\nside=left\nwidth=99999";DockParseState(off);
+            CHECK(!WmDockPinned() && !WmDockRight() && WmDockWidth()==0);
+            char right[]="[Dock]\nside=right\nwidth=360\n";DockParseState(right);
+            CHECK(WmDockRight() && WmDockWidth()==360);
+            g_dock.right=false;g_dock.width=0;
         }
         for(Window* w:{&a,&c,&f}){w->vfb=nullptr;WmDestroyWindowById(owner,w->wmId);}
         CHECK(!lockDepth);
@@ -1081,21 +1139,37 @@ int main() {
         const auto l=ChromeDockLayoutFor(m,1600,852,4,2,true);
         CHECK(l.open && l.count==4 && l.selected==2 && l.strip.w==420 && l.strip.h==48 && l.page.y==48 && l.page.h==804);
         CHECK(l.cells[0].x==0 && l.cells[0].w==42 && l.cells[1].x==42 && l.tile.x==84);
-        CHECK(l.pin.x==382 && l.pin.w==38 && l.tile.w==420-38-3*42 && l.cells[3].x==l.tile.x+l.tile.w);
+        CHECK(l.pin.x==382 && l.pin.w==38 && l.side.x==344 && l.tile.w==420-2*38-3*42 && l.cells[3].x==l.tile.x+l.tile.w);
+        CHECK(l.grip.x==416 && l.grip.w==8 && l.grip.h==852 && !l.right);
         CHECK(l.close.x+l.close.w==l.tile.x+l.tile.w && l.back.x+l.back.w==l.close.x && l.title.x==l.tile.x+42);
         auto hit=[&](int x,int y){return ChromeDockHitTest(l,x,y);};
         CHECK(hit(5,5).target==ChromeDockTarget::Entry && hit(5,5).index==0);
         CHECK(hit(l.cells[3].x+1,1).target==ChromeDockTarget::Entry && hit(l.cells[3].x+1,1).index==3);
         CHECK(hit(l.title.x+1,1).target==ChromeDockTarget::Tile && hit(l.title.x+1,1).index==2);
         CHECK(hit(l.back.x+1,1).target==ChromeDockTarget::Return && hit(l.close.x+1,47).target==ChromeDockTarget::Close);
-        CHECK(hit(419,47).target==ChromeDockTarget::Pin && hit(5,48).target==ChromeDockTarget::None);
+        CHECK(hit(l.pin.x+2,47).target==ChromeDockTarget::Pin && hit(5,48).target==ChromeDockTarget::None);
+        CHECK(hit(l.side.x+2,4).target==ChromeDockTarget::Side);
+        CHECK(hit(419,47).target==ChromeDockTarget::Grip && hit(423,400).target==ChromeDockTarget::Grip);
+        CHECK(hit(424,400).target==ChromeDockTarget::None);
+        // The right edge mirrors the sidebar, the grip and the tab.
+        const auto r=ChromeDockLayoutFor(m,1600,852,4,2,true,{0,true});
+        CHECK(r.right && r.sidebar.x==1180 && r.strip.x==1180 && r.page.x==1180 && r.grip.x==1176);
+        CHECK(r.pin.x==1600-38 && r.cells[0].x==1180);
+        const auto rc=ChromeDockLayoutFor(m,1600,852,3,1,false,{0,true});
+        CHECK(rc.tab.x==1595 && rc.grip.w==0);
+        // Width: logical, scaled, clamped to [MinWidth, half the screen].
+        CHECK(ChromeDockSidebar(m,1600,852,{360,false}).w==360 && ChromeDockSidebar(m,1600,852,{100,false}).w==360);
+        CHECK(ChromeDockSidebar(DesktopMetric150,2400,1200,{360,false}).w==540);
+        CHECK(ChromeDockSidebar(m,1600,852,{1000,true}).w==720 && ChromeDockSidebar(m,1600,852,{1000,true}).x==880);
+        CHECK(ChromeDockSidebar(m,1000,852,{700,false}).w==500); // half the screen
+        CHECK(ChromeDockWidthFor(DesktopMetric150,2400,540)==360 && ChromeDockWidthFor(m,1600,10)==360);
         // At 200% everything scales; the sidebar never exceeds half the screen.
         const auto big=ChromeDockLayoutFor(DesktopMetric200,3200,1704,1,0,true);
-        CHECK(big.strip.w==840 && big.strip.h==96 && big.tile.w==840-76);
+        CHECK(big.strip.w==840 && big.strip.h==96 && big.tile.w==840-2*76 && big.grip.w==16);
         CHECK(ChromeDockSidebar(m,600,500).w==300);
         // Many entries: the tile keeps an icon cell and both buttons.
         const auto many=ChromeDockLayoutFor(m,1600,852,20,15,true);
-        CHECK(many.count==1+(420-38-42-64)/42 && many.selected==many.count-1 && many.tile.w>=42+64);
+        CHECK(many.count==1+(420-76-42-64)/42 && many.selected==many.count-1 && many.tile.w>=42+64);
         // Closed: the tab only, and the strip is not hit.
         const auto closed=ChromeDockLayoutFor(m,1600,852,3,1,false);
         CHECK(!closed.open && closed.tab.x==0 && closed.tab.w==5 && closed.tab.h==120 && closed.tab.y==(852-120)/2);

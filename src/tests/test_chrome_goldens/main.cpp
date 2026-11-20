@@ -140,8 +140,9 @@ ChromeStyle StyleFor(uint32_t, const DesktopMetrics& m, bool glass) {
 
 void Frames(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
     const int clientW = m.pixels(360), clientH = m.pixels(80);
-    struct Case { const char* name; bool focused, maximised, glass; const uint32_t* icon; int hover; };
-    // hover: -1 none; 0..2 a caption button by its outer top-right corner of
+    struct Case { const char* name; bool focused, maximised, glass; const uint32_t* icon; int hover; uint8_t dock = 0; };
+    // dock: the side-dock caption button (0 none, 1 left, 2 right).
+    // hover: -1 none; 0..3 a caption button by its outer top-right corner of
     // its hit rect (the bleed area, not the visual cell).
     const Case cases[] = {
         {"frame-active", true, false, false, testIcon, -1},
@@ -151,11 +152,15 @@ void Frames(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) 
         {"frame-hover-min", false, false, false, testIcon, 2},
         {"frame-maximised", true, true, false, testIcon, -1},
         {"frame-active-glass", true, false, true, testIcon, -1},
+        {"frame-dock-hover", true, false, false, testIcon, 3, 1},
+        {"frame-dock-right-glass", true, false, true, testIcon, -1, 2},
     };
     for (const Case& c : cases) {
         const ChromeStyle s = StyleFor(theme, m, c.glass);
         ChromeFrameModel model{};
-        model.layout = ChromeFrameLayout({{0, 0, clientW, clientH, false}, c.maximised, {}}, m);
+        DesktopWindowGeometry g{0, 0, clientW, clientH, false};
+        g.dockButton = c.dock;
+        model.layout = ChromeFrameLayout({g, c.maximised, {}}, m);
         model.clientW = clientW;
         model.focused = c.focused;
         model.maximised = c.maximised;
@@ -618,21 +623,27 @@ void Dock(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
     const uint32_t screenW = 1600 * m.percent / 100, desktopH = 852 * m.percent / 100;
     static ChromeShellStorage storage;
     static ChromeShellModel model;
-    struct Scene { const char* name; int selected; bool pinned; int hover; }; // hover: -1, entry, or 100 return
+    // hover: -1, entry, 100 return, 200 the side button; resizing: the grip is dragged.
+    struct Scene { const char* name; int selected; bool pinned; int hover; bool right = false; int width = 0;
+                   bool resizing = false; };
     const Scene scenes[] = {
         {"dock-open", 0, false, -1},
         {"dock-selected", 2, false, 100},
         {"dock-pinned", 1, true, 3},
+        {"dock-right", 1, false, 200, true, 520},
+        {"dock-resizing", 0, true, -1, false, 360, true},
     };
     for (const Scene& scene : scenes) {
         model = {};
         model.kind = ChromeShellKind::Dock;
-        model.dock = ChromeDockLayoutFor(m, screenW, desktopH, 4, scene.selected, true);
+        model.dock = ChromeDockLayoutFor(m, screenW, desktopH, 4, scene.selected, true, {scene.width, scene.right});
         model.dockPinned = scene.pinned;
+        model.dockResizing = scene.resizing;
         for (int i = 0; i < 4; ++i) if (i != 3) SetTestIcon(model.icons[i]); // entry 3: missing icon
         std::strcpy(model.text, "Terminal - brook@clearwater: ~/src/brook");
         model.mouseX = model.mouseY = -1;
         if (scene.hover == 100) { model.mouseX = model.dock.back.x + 2; model.mouseY = model.dock.back.y + 2; }
+        else if (scene.hover == 200) { model.mouseX = model.dock.side.x + 2; model.mouseY = model.dock.side.y + 2; }
         else if (scene.hover >= 0) {
             model.mouseX = model.dock.cells[scene.hover].x + 2;
             model.mouseY = model.dock.cells[scene.hover].y + 2;

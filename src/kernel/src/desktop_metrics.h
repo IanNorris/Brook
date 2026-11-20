@@ -51,11 +51,17 @@ struct DesktopWindowGeometry {
     bool captionOverlay=false;
     int captionInsetRight=0,captionInsetTop=0;
     int captionHeight=0; // client's title-strip height in physical pixels; 0: native title()
+    // Native frames of windows that can join the side dock carry a fourth
+    // caption button, left of minimise: 0 none, 1 dock on the left, 2 right.
+    uint8_t dockButton=0;
     int clientX(const DesktopMetrics& m) const { return x+(clientDecorated?0:m.border()); }
     int clientY(const DesktopMetrics& m) const { return y+(clientDecorated?0:m.border()+m.title()); }
 };
+// Caption cells: 0 close, 1 maximise/restore, 2 minimise, 3 dock (native
+// frames with dockButton only).
 inline DesktopRect DesktopCaptionRect(const DesktopWindowGeometry& g,const DesktopMetrics& m,int button) {
-    if(button<0 || button>=3) return {};
+    if(button<0 || button>=4) return {};
+    if(button==3 && (g.clientDecorated || !g.dockButton)) return {};
     if(g.clientDecorated) {
         if(!g.captionOverlay) return {};
         const int right=g.captionInsetRight>0?g.captionInsetRight:0,top=g.captionInsetTop>0?g.captionInsetTop:0;
@@ -67,8 +73,9 @@ inline DesktopRect DesktopCaptionRect(const DesktopWindowGeometry& g,const Deskt
         const int height=want<g.clientH-top?want:g.clientH-top;
         return {g.x+span-(button+1)*width,g.y+top,width,height};
     }
+    const int count=g.dockButton?4:3;
     int width=m.captionButton();
-    if(width*3>g.clientW) width=g.clientW/3;
+    if(width*count>g.clientW) width=g.clientW/count;
     return {g.x+g.clientW+m.border()-(button+1)*width,g.y+m.border(),width,m.title()};
 }
 // Overlaid captions matched to the client's own title strip. The Wayland

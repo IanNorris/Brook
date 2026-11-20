@@ -15,7 +15,7 @@ struct FakeWin {
     uint64_t identity=7,metrics=0x1000,incarnation=42;
     uint32_t clientW=1280,clientH=720,border=2,titleH=32,state=0;
     bool focused=true,visible=true,noChrome=false;uint64_t overlay=0;uint32_t style=0;
-    int32_t hover=-1;uint32_t theme=1,appearance=0,scale=100;uint64_t settings=3,launcher=5;
+    int32_t hover=-1;uint32_t dock=0;uint32_t theme=1,appearance=0,scale=100;uint64_t settings=3,launcher=5;
     int32_t x=100,y=80; // position: never part of the key
     uint32_t outerW()const{return clientW+2*border;}
     uint32_t outerH()const{return clientH+titleH+2*border;}
@@ -27,7 +27,7 @@ static uint64_t Key(const FakeWin& w){
     in.windowIdentity=w.identity;in.metricsIdentity=w.metrics;
     in.outerWidth=w.outerW();in.outerHeight=w.outerH();in.clientWidth=w.clientW;in.clientHeight=w.clientH;
     in.clientOffsetX=int32_t(w.border);in.clientOffsetY=int32_t(w.titleH+w.border);in.state=w.state;
-    in.focused=w.focused;in.visible=w.visible;in.noChrome=w.noChrome;in.captionOverlay=w.overlay;in.captionStyle=w.style;in.hoverButton=w.hover;
+    in.focused=w.focused;in.visible=w.visible;in.noChrome=w.noChrome;in.captionOverlay=w.overlay;in.captionStyle=w.style;in.hoverButton=w.hover;in.dockButton=w.dock;
     in.theme=w.theme;in.appearance=w.appearance;in.scale=w.scale;in.settingsEpoch=w.settings;in.launcherEpoch=w.launcher;
     return WmChromeKey(in);
 }
@@ -43,6 +43,7 @@ static void KeyChanges(){
     { FakeWin w=base;w.clientH=721;assert(Key(w)!=k); }                      // resize height
     { FakeWin w=base;w.hover=0;assert(Key(w)!=k);FakeWin v=base;v.hover=2;assert(Key(v)!=Key(w)); } // hover close vs minimise
     { FakeWin w=base;w.state=1;assert(Key(w)!=k); }                          // maximised icon
+    { FakeWin w=base;w.dock=1;assert(Key(w)!=k);FakeWin v=base;v.dock=2;assert(Key(v)!=Key(w)); } // dock button, side
     { FakeWin w=base;w.theme=2;assert(Key(w)!=k); }                          // theme
     { FakeWin w=base;w.scale=150;assert(Key(w)!=k); }                        // scale
     { FakeWin w=base;w.launcher=6;assert(Key(w)!=k); }                       // icon snapshot
