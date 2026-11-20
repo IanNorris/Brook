@@ -95,6 +95,12 @@ _Last updated: 19 November 2026 (early), by a Claude Code session; see "19 Nov e
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**Blender 5.1.1 (20 Nov):**
+- **llvmpipe (brook-run default):** segfault in driCreateContextAttribs. Blender's LLVM 19 (libclang-cpp) and Mesa's LLVM 21 interpose symbols in one process (backtrace mixes libLLVM.so.19 and .21). Any app that brings its own LLVM is at risk under LIBGL_ALWAYS_SOFTWARE.
+- **iris (brook-iris-run):** GL 4.6 Core comes up ("Intel HD 5500 BDW GT2 Mesa 26.0.6"), then SIGABRT (exit 134) with no message or crash file. Suspect GHOST Wayland window/decoration; needs a backtrace.
+- **X11 via Xwayland:** no GLX_ARB_create_context (no hardware GLX), so "needs OpenGL 4.3".
+- Making iris the default GL (GPU pass) fixes the LLVM clash; the Wayland abort is a separate item.
+
 **20 Nov: Dell on gen 464 = int61 built WITH `--clearwater-shell`** (payload dell-int61cw-20261120, session `0d26834bde974d3982c3a95349743326`). Stage 3 is live: CWSUP.ELF supervises CWSHELL.ELF. **Always pass `--clearwater-shell` to build_dell_image.py from int61 on.** Without it there is no taskbar or launcher (gen 463 was blank). Bug: launcher pins never persist (launcher.ini has never existed on the Dell, even after re-pinning on gen 464); sent to Codex as work/launcher-persist with a `launcher status` debug command, ahead of Task F.
 
 **Correction, 20 Nov:** the Dell's Wayland server is `/boot/INTLWL.ELF` (the Vulkan-provider waylandd built into the image), not /nix/profile/bin/waylandd, so waylandd fixes need an image deploy and the `wl5` staging had no effect. **int61 = `work/integration61` 9eac2b0a** (int60 + work/clearwater-s3-reconcile e769515e + work/settings-schemas 505ab256 + work/xdg-wm-capabilities c2079740) is building; deploy it next (stage 3 live, Min/Max buttons).
