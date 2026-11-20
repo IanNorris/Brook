@@ -131,9 +131,10 @@ static void check_local_bridge(uint32_t ip)
     request(ip, "bridge stats", "{\"bridge_error\":\"local connections are read-only\"}");
 }
 
-static void check_idle_local_deadline(void)
+static int64_t check_idle_local_deadline(void)
 {
-    int64_t deadline = milliseconds() + 8000;
+    const int64_t started = milliseconds();
+    const int64_t deadline = started + 2000;
     int fd = connect_debug(htonl(INADDR_LOOPBACK), deadline);
     static const char banner[] = "=== Brook OS Debug Console ===\r\n";
     char received[sizeof(banner)];
@@ -149,6 +150,9 @@ static void check_idle_local_deadline(void)
     }
     CHECK(used == sizeof(banner) - 1 && !memcmp(received, banner, used));
     CHECK(close(fd) == 0);
+    const int64_t elapsed = milliseconds() - started;
+    CHECK(elapsed >= 0 && elapsed <= 2000);
+    return elapsed;
 }
 
 static int bind_socket(int fd, uint32_t ip, unsigned port)
@@ -242,8 +246,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "BRIDGE_LOCAL_LOOPBACK_PASS\n");
         check_local_bridge(local);
         fprintf(stderr, "BRIDGE_LOCAL_INTERFACE_PASS\n");
-        check_idle_local_deadline();
-        fprintf(stderr, "BRIDGE_LOCAL_IDLE_DEADLINE_PASS\n");
+        const int64_t idle = check_idle_local_deadline();
+        fprintf(stderr, "BRIDGE_LOCAL_IDLE_DEADLINE_PASS elapsed_ms=%lld\n", (long long)idle);
         check_bind_addresses(local);
         fprintf(stderr, "BRIDGE_LOCAL_BIND_ADDRESS_POLICY_PASS\n");
         check_reserved_tcp_denials(local);
