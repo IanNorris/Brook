@@ -997,12 +997,41 @@ static void testRecursiveBinds(brook::MountNamespace* initial,const brook::VfsPa
     assert(VfsMountNamespaceCount(ns)==nestedCount);
     assert(!VfsMountNamespaceBind(ns,b,b,true));
     graft=resolve(root,root,"/ns-b");assert(!VfsMountNamespaceDetach(ns,graft));VfsPathRelease(graft);
+    // A retained source may come from the old mount namespace after a
+    // narrower user namespace takes ownership of a copy.
+    auto oldSource=resolve(root,root,"/ns-a/sub");
+    auto oldChild=resolve(root,oldSource,"sub");
+    constexpr uint32_t sourceFlags=MountReadOnly|MountNoExec;
+    constexpr uint32_t childFlags=MountReadOnly|MountNoDev|MountNoSuid;
+    assert(!VfsMountNamespaceRemount(ns,oldSource,sourceFlags));
+    assert(!VfsMountNamespaceRemount(ns,oldChild,childFlags));
+
+    // Binds within the same user owner keep its authority over these flags.
+    assert(!VfsMountNamespaceBind(ns,oldSource,target,true));
+    auto sameOwner=resolve(root,root,"/ns-target");
+    assert(!VfsMountNamespaceRemount(ns,sameOwner,0,true));
+    assert(!VfsMountNamespaceDetach(ns,sameOwner));VfsPathRelease(sameOwner);
     // A less-privileged namespace copy locks inherited descendant mounts.
     auto* owner=static_cast<UserNamespace*>(kmalloc(sizeof(UserNamespace)));*owner={};owner->owner=1000;
     MountNamespace* locked=nullptr;VfsPath lockedRoot{},lockedCwd{};
     assert(!VfsMountNamespaceCopy(ns,root,root,&locked,&lockedRoot,&lockedCwd));
     assert(!VfsMountNamespaceSetUserOwnerPrepared(locked,owner));assert(VfsMountNamespaceActivate(locked));
     auto lockedA=resolve(lockedRoot,lockedRoot,"/ns-a"),lockedTarget=resolve(lockedRoot,lockedRoot,"/ns-target");
+    for(bool recursive:{false,true}) {
+        assert(!VfsMountNamespaceBind(locked,oldSource,lockedTarget,recursive));
+        auto imported=resolve(lockedRoot,lockedRoot,"/ns-target");
+        assert(VfsMountNamespaceRemount(locked,imported,MountReadOnly)==-1);
+        assert(!VfsMountNamespaceRemount(locked,imported,sourceFlags));
+        if(recursive) {
+            auto importedChild=resolve(lockedRoot,imported,"sub");
+            assert(VfsMountNamespaceRemount(locked,importedChild,MountReadOnly)==-1);
+            assert(!VfsMountNamespaceRemount(locked,importedChild,childFlags));
+            assert(VfsMountNamespaceRemount(locked,imported,sourceFlags,true)==-1);
+            VfsPathRelease(importedChild);
+        }
+        assert(!VfsMountNamespaceDetach(locked,imported));VfsPathRelease(imported);
+    }
+    VfsPathRelease(oldChild);VfsPathRelease(oldSource);
     assert(!VfsMountNamespaceBind(locked,lockedA,lockedTarget,true));
     auto lockedSub=resolve(lockedRoot,lockedRoot,"/ns-target/sub");
     assert(VfsMountNamespaceDetach(locked,lockedSub)==-22);VfsPathRelease(lockedSub);
