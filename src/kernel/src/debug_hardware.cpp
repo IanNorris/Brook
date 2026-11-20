@@ -1,5 +1,6 @@
 #include "debug_hardware.h"
 #include "debug_epoch.h"
+#include "debug_bridge_v3.h"
 #include "debug_overlay.h"
 #include "bridge_reply.h"
 #include "build_info.h"
@@ -344,6 +345,19 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
     if(!strcmp(command,"bridge hardware caps")){
         char boot[33];DebugEpochCopy(boot);
         Reply r;r.text("{\"hardware_api\":1,\"boot_guard\":true,\"logs_api\":1,\"boot_id\":");r.quoted(boot);
+#if defined(BROOK_BRIDGE_V3)
+        r.text(",\"auth_version\":3,\"auth_suite\":1,\"auth_ready\":");
+        r.text(DebugBridgeV3Available()?"true":"false");
+        r.text(",");r.field("operator_keys",DebugBridgeV3OperatorKeyCount());
+        if(DebugChannelReplyAuthenticated()) {
+            r.text(",\"operator_policy_sha256\":");r.quoted(DebugBridgeV3PolicySha256());
+            const char* initrd=DebugBridgeV3InitrdSha256();
+            r.text(",\"initrd_sha256\":");if(*initrd)r.quoted(initrd);else r.text("null");
+            r.text(",\"initrd_sha256_source\":");
+            r.quoted(*initrd?"bootloader_ram_image":"unavailable_no_bootloader_initrd");
+            r.text(",\"kernel_sha256\":null,\"kernel_sha256_source\":\"unavailable_loader_elf_digest\"");
+        }
+#endif
         r.text(",\"backlight_api\":1,\"pci_inventory_api\":1,\"build_id\":");r.quoted(BuildGitHash());r.text(",\"build_date\":");r.quoted(BuildDate());
         HardwarePayloadId(r);
         r.text(",");r.field("logical_cpus",SmpGetCpuCount());

@@ -5062,6 +5062,7 @@ static int UintToStr(char* buf, uint32_t val)
 
 void DebugHandleCommand(const char* cmd, uint32_t len);
 
+#if defined(BROOK_QEMU_LEGACY_OUTBOUND_DEBUG)
 // Kernel thread: attempts to connect the debug channel without blocking boot.
 // Tries once with a short timeout; if no server is listening, exits quietly.
 static void DebugChannelThreadFn(void* /*arg*/)
@@ -5130,9 +5131,11 @@ static void DebugChannelThreadFn(void* /*arg*/)
     s.tcpState = TcpState::Closed;
     SockClose(idx);
 }
+#endif
 
 void DebugChannelInit()
 {
+#if defined(BROOK_QEMU_LEGACY_OUTBOUND_DEBUG)
     if (!g_netIf) return;
     Process* thread = KernelThreadCreate("debug_ch", DebugChannelThreadFn, nullptr, 3);
     if (!thread) {
@@ -5141,12 +5144,46 @@ void DebugChannelInit()
     }
     SchedulerAddProcess(thread);
     SerialPrintf("debug: channel thread created pid=%u\n", thread->pid);
+#endif
 }
 
 // Thread-local override for routing DebugChannelSend responses to
 // whichever socket initiated the command (port 1234 or outbound 9999).
 static uint16_t g_debugReplySockets[65536] = {}; // socket+1, scoped by kernel-thread PID
 static uint64_t g_debugReplyDeadlines[MAX_SOCKETS]; // live reply socket, read by its owner only
+#if defined(BROOK_BRIDGE_V3)
+static Process* g_debugWriterOwner;
+static DebugReplyWriter g_debugReplyWriter;
+static void* g_debugWriterContext;
+static bool g_debugWriterAuthenticated;
+
+bool DebugChannelSetReplyWriter(DebugReplyWriter writer, void* context, bool authenticated)
+{
+    auto* self = ProcessCurrent();
+    if (!self || !writer || __atomic_load_n(&g_debugWriterOwner, __ATOMIC_ACQUIRE)) return false;
+    g_debugReplyWriter = writer;
+    g_debugWriterContext = context;
+    g_debugWriterAuthenticated = authenticated;
+    __atomic_store_n(&g_debugWriterOwner, self, __ATOMIC_RELEASE);
+    return true;
+}
+
+void DebugChannelClearReplyWriter()
+{
+    if (__atomic_load_n(&g_debugWriterOwner, __ATOMIC_ACQUIRE) != ProcessCurrent()) return;
+    __atomic_store_n(&g_debugWriterOwner, nullptr, __ATOMIC_RELEASE);
+    g_debugWriterContext = nullptr;
+    g_debugReplyWriter = nullptr;
+    g_debugWriterAuthenticated = false;
+}
+
+bool DebugChannelReplyAuthenticated()
+{
+    auto* self = ProcessCurrent();
+    return self && __atomic_load_n(&g_debugWriterOwner, __ATOMIC_ACQUIRE) == self &&
+           g_debugWriterAuthenticated;
+}
+#endif
 
 static uint16_t DebugReplyOverride()
 {
@@ -5193,13 +5230,22 @@ static int DebugSendAll(int sock, const char* data, uint32_t length)
     return static_cast<int>(sent);
 }
 
+static int DebugReplySend(const char* data, uint32_t length)
+{
+#if defined(BROOK_BRIDGE_V3)
+    auto* self = ProcessCurrent();
+    if (self && __atomic_load_n(&g_debugWriterOwner, __ATOMIC_ACQUIRE) == self)
+        return g_debugReplyWriter(g_debugWriterContext, data, length);
+#endif
+    const int sock = DebugReplySocket();
+    return sock >= 0 ? DebugSendAll(sock, data, length) : -1;
+}
+
 void DebugChannelSend(const char* msg)
 {
-    int sock = DebugReplySocket();
-    if (sock < 0) return;
     uint32_t len = 0;
     while (msg[len]) len++;
-    (void)DebugSendAll(sock, msg, len);
+    (void)DebugReplySend(msg, len);
 }
 
 bool DebugChannelConnected()
@@ -5317,12 +5363,6 @@ static bool MatchLogLevel(const char* name, LogLevel* out)
         }
     }
     return false;
-}
-
-static int DebugReplySend(const char* data, uint32_t length)
-{
-    int sock = DebugReplySocket();
-    return sock >= 0 ? DebugSendAll(sock, data, length) : -1;
 }
 
 // Fixed-buffer replies: no dependency on a userspace printf implementation.

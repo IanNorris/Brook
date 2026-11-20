@@ -1,0 +1,3 @@
+#pragma once
+
+static constexpr char BrookBridgeV3OperatorKeys[] = "@operator_keys_literal@";

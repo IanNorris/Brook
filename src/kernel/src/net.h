@@ -514,6 +514,12 @@ void DebugChannelSendf(const char* fmt, ...);
 // Route DebugChannelSend responses to a specific socket (for port 1234 server).
 void DebugChannelSetReplySock(int sock, uint64_t deadline=0);
 void DebugChannelClearReplySock();
+#if defined(BROOK_BRIDGE_V3)
+using DebugReplyWriter = int (*)(void*, const char*, uint32_t);
+bool DebugChannelSetReplyWriter(DebugReplyWriter writer, void* context, bool authenticated);
+void DebugChannelClearReplyWriter();
+bool DebugChannelReplyAuthenticated();
+#endif
 
 // Dispatch a debug command string (used by both outbound and listener channels).
 void DebugHandleCommand(const char* cmd, uint32_t len);

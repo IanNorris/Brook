@@ -89,6 +89,7 @@ namespace brook { void LifecycleChannelConfigure(); void LifecycleChannelStart()
 #include "watchdog.h"
 #if defined(BROOK_SSD_AUTO_RECOVERY)
 #include "debug_overlay.h"
+#include "debug_bridge_v3.h"
 #endif
 #include "boot_timing_runtime.h"
 #include "string.h"
@@ -640,6 +641,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     brook::ProcFsInit();
     brook::ProcFsVfsRegister();  // register "procfs" filesystem driver
     brook::NetInit();
+#if defined(BROOK_BRIDGE_V3)
+    brook::DebugBridgeV3Initialize();
+#endif
 
     // Mount initrd from bootloader (or fall back to embedded image).
     if (bootProtocol->initrdPhysBase && bootProtocol->initrdSize > 0)
@@ -659,6 +663,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
                 brook::PhysToVirt(brook::PhysicalAddress(bootProtocol->initrdPhysBase)).raw());
             auto* dst = reinterpret_cast<uint8_t*>(rdBuf.raw());
             memcpy(dst, src, bootProtocol->initrdSize);
+#if defined(BROOK_BRIDGE_V3)
+            brook::DebugBridgeV3MeasureInitrd(dst, bootProtocol->initrdSize);
+#endif
 
             brook::Device* rd = brook::RamdiskCreate(dst,
                 bootProtocol->initrdSize, 512, "ramdisk0");
