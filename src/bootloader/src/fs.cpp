@@ -17,8 +17,10 @@ uint8_t* ReadFile(
     const char16_t*    path,
     UINTN*             outSize,
     UINTN              maximumSize,
-    UINTN              prefixSize)
+    UINTN              prefixSize,
+    bool*              absent)
 {
+    if (absent) *absent = false;
     EFI_GUID loadedImageGuid        = EFI_LOADED_IMAGE_PROTOCOL_GUID;
     EFI_GUID simpleFileSystemGuid   = EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID;
     EFI_GUID fileInfoGuid           = EFI_FILE_INFO_ID;
@@ -46,8 +48,9 @@ uint8_t* ReadFile(
     status = root->Open(root, &file, (CHAR16*)path, EFI_FILE_MODE_READ, 0);
     if (EFI_ERROR(status))
     {
+        if (absent) *absent = status == EFI_NOT_FOUND;
         root->Close(root);
-        return nullptr;  // file not found - caller handles this
+        return nullptr;
     }
 
     // Get file size via EFI_FILE_INFO

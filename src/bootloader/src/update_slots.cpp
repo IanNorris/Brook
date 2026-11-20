@@ -63,8 +63,9 @@ static bool ReadSlotHealth(EFI_HANDLE image,EFI_BOOT_SERVICES* bs,const char* id
     if(!identity)return true;
     UINTN bytes=0;
     constexpr unsigned length=GuardSlotCount*GuardSlotSectorBytes;
-    auto* data=ReadFile(image,bs,u"RECOVERY\\BOOTSTAT.BIN",&bytes,length);
-    if(!data)return true; // Older installations do not have the optional journal.
+    bool absent=false;
+    auto* data=ReadFile(image,bs,u"RECOVERY\\BOOTSTAT.BIN",&bytes,length,0,&absent);
+    if(!data)return absent; // Only an older installation without a journal can continue.
 
     struct SlotFile {
         const uint8_t* data;
