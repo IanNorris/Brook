@@ -1672,6 +1672,10 @@ uint16_t CreateRemoteThread(Process* target, uint64_t entry,
     // even if the target later execs. Stack construction uses that exact AS.
     Process* thread=ProcessCreateThread(target,entry,0,0x202,target->fsBase);
     if (!thread) return 0;
+    if (ProcessPidPrepareChild(thread, target, false)) {
+        ProcessDiscardUnpublished(thread);
+        return 0;
+    }
     uint64_t argVA=0;
     int64_t mapped=UserMappingStack(actor,thread->addressSpace,stackSize,argBytes,argLen,&argVA);
     if (mapped<0) {
@@ -1717,8 +1721,12 @@ uint16_t CreateRemoteThread(Process* target, uint64_t entry,
                  thread->pid, target->tgid, entry, userRsp, argVA, argLen,
                  stackBase, stackBase + stackSize);
 
-    SchedulerAddProcessWithSeccomp(thread, target);
-    return thread->pid;
+    const uint16_t tid = thread->pid;
+    if (!SchedulerAddProcessWithSeccomp(thread, target)) {
+        ProcessDiscardUnpublished(thread);
+        return 0;
+    }
+    return tid;
 }
 
 // ---------------------------------------------------------------------------

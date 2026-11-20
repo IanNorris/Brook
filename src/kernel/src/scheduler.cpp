@@ -1133,11 +1133,14 @@ static void NotifyParentGroupLocked(Process* child)
     if (recipient) ProcessQueueChildSignal(recipient,child);
 }
 
+static void BeginPidNamespaceDrainLocked(const Process* last);
+static bool PidNamespaceInitAwaitingDrain(const Process* process);
+
 static void NotifyExitedParentLocked(Process* child)
 {
     const uint32_t robust=__atomic_load_n(&child->robustExitState,__ATOMIC_ACQUIRE);
     if(robust==1 || robust==2 || __atomic_load_n(&child->robustListHead,__ATOMIC_ACQUIRE))return;
-    if (child->state == ProcessState::Terminated) NotifyParentGroupLocked(child);
+    if (child->state == ProcessState::Terminated && !PidNamespaceInitAwaitingDrain(child)) NotifyParentGroupLocked(child);
 }
 
 #include "scheduler_subreaper.inc"
@@ -1147,10 +1150,16 @@ static void NotifyExitedParentLocked(Process* child)
 // exits, including a nonleader; an exited leader alone does not orphan children.
 static void ReparentDeadGroupLocked(uint16_t tgid)
 {
-    for (uint32_t i = 0; i < g_processCount; ++i)
-        if (g_allProcesses[i]->tgid == tgid &&
-            g_allProcesses[i]->state != ProcessState::Terminated) return;
-    const uint16_t adopter=FindChildSubreaperLocked(tgid);
+    Process* representative = nullptr;
+    for (uint32_t i = 0; i < g_processCount; ++i) {
+        Process* task = g_allProcesses[i];
+        if (task->tgid != tgid) continue;
+        if (task->state != ProcessState::Terminated) return;
+        if (!task->isThread) representative = task;
+    }
+    const auto* view = ProcessPidView(representative);
+    if (representative) BeginPidNamespaceDrainLocked(representative);
+    const uint16_t adopter = FindChildSubreaperLocked(tgid, view);
     for (uint32_t i = 0; i < g_processCount; ++i)
         if (g_allProcesses[i]->parentPid == tgid) {
             g_allProcesses[i]->parentPid = adopter;
@@ -1193,6 +1202,8 @@ static void ReleaseSchedulerReference(Process* proc, bool retired)
     // No proc dereference here: a waiting parent may now destroy it.
     if (flags & 0x200) __asm__ volatile("sti" ::: "memory");
 }
+
+#include "scheduler_pid_namespace.inc"
 
 void SchedulerReleaseWaitReference(Process* proc)
 {
@@ -1509,9 +1520,9 @@ static void InheritSeccompForBirth(Process* proc, Process* parent)
 
 #include "scheduler_process_birth.inc"
 
-void SchedulerAddProcessWithSeccomp(Process* proc, Process* parent)
+bool SchedulerAddProcessWithSeccomp(Process* proc, Process* parent)
 {
-    AddProcessForBirth(proc, parent);
+    return AddProcessForBirth(proc, parent);
 }
 
 void SchedulerRemoveProcess(Process* proc)
@@ -1788,7 +1799,7 @@ static void ReapTerminated()
             && __atomic_load_n(&p->refCount, __ATOMIC_ACQUIRE) == 0
             && p != g_perCpu[cpu].currentProcess)
         {
-            if (!p->isThread && ThreadGroupHasLivePeerLocked(p))
+            if (!p->isThread && (ThreadGroupHasLivePeerLocked(p) || PidNamespaceInitAwaitingDrain(p)))
             {
                 ++i;
                 continue;
@@ -2258,6 +2269,8 @@ void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool
                 ReleaseSchedulerReference(fatal[i], false);
             }
         }
+
+        DrainPidNamespaces();
 
         // Destruction closes filesystem handles and may sleep. Never run it
         // atop an interrupted kernel operation (which might own the same lock),
@@ -3598,7 +3611,7 @@ int SchedulerWaitChild(Process* caller, int selector, uint32_t id,
         outcome = 0; // A matching child exists, even if not yet waitable.
         int code = 0, status = 0;
         bool exiting = p->state == ProcessState::Terminated;
-        if (exiting && (options & 4) &&
+        if (exiting && (options & 4) && !PidNamespaceInitAwaitingDrain(p) &&
             __atomic_load_n(&p->reapable, __ATOMIC_ACQUIRE) &&
             __atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE) == -1 &&
             __atomic_load_n(&p->refCount, __ATOMIC_ACQUIRE) == 0 &&

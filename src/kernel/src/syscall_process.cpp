@@ -194,7 +194,10 @@ int64_t sys_fork(uint64_t, uint64_t, uint64_t,
 
     const uint32_t visibleTid = ProcessVisibleTid(child, ProcessPidView(parent));
     [[maybe_unused]] const uint16_t globalPid = child->pid, globalTgid = child->tgid;
-    SchedulerAddProcessWithSeccomp(child, parent);
+    if (!SchedulerAddProcessWithSeccomp(child, parent)) {
+        ProcessDiscardUnpublished(child);
+        return -ENOMEM;
+    }
 
     DbgPrintf("FORK: parent pid=%u tgid=%u -> child pid=%u tgid=%u\n",
               parent->pid, parent->tgid, globalPid, globalTgid);
@@ -218,12 +221,12 @@ int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAddr,
     static constexpr uint64_t CLONE_NEWNS           = 0x00020000ULL;
 
     // Other isolation domains must not fall through to an ordinary fork.
-    constexpr uint64_t unsupportedNamespaces=0x02000000ULL|0x20000000ULL;
+    constexpr uint64_t unsupportedNamespaces = 0x02000000ULL;
     constexpr uint64_t CLONE_NEWUSER=0x10000000ULL;
     if(flags&unsupportedNamespaces)return -EINVAL;
     Process* parent = ProcessCurrent();
     if (!parent) return -ENOSYS;
-    constexpr uint64_t supportedNamespaces=CLONE_NEWNS|CLONE_NEWUSER|CloneNewRuntimeNamespaces;
+    constexpr uint64_t supportedNamespaces=CLONE_NEWNS|CLONE_NEWUSER|CloneNewRuntimeNamespaces|CloneNewPid;
     if(flags&supportedNamespaces) {
         // Bounded fork-style namespace creation. Do not silently ignore shared
         // VM/FS/thread, tid, pidfd, TLS, vfork or unknown requested semantics.
@@ -283,7 +286,7 @@ int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAddr,
     if(const auto domains=flags&CloneNewRuntimeNamespaces) {
         if(int error=ProcessNamespacesIsolate(child,domains)) {ProcessDiscardUnpublished(child);return error;}
     }
-    if (const int error = ProcessPidPrepareChild(child, parent, false)) {
+    if (const int error = ProcessPidPrepareChild(child, parent, (flags & CloneNewPid) != 0)) {
         ProcessDiscardUnpublished(child);
         return error;
     }
@@ -332,7 +335,11 @@ int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAddr,
 
     const uint16_t globalPid = child->pid;
     [[maybe_unused]] const uint16_t globalTgid = child->tgid;
-    SchedulerAddProcessWithSeccomp(child, parent);
+    if (!SchedulerAddProcessWithSeccomp(child, parent)) {
+        if (vfork) ProcessVforkRelease(child);
+        ProcessDiscardUnpublished(child);
+        return -ENOMEM;
+    }
 
     {
         if (!(flags & CLONE_THREAD))
@@ -379,7 +386,7 @@ int64_t sys_unshare(uint64_t flags,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t)
 {
     if(!flags)return 0;
     constexpr uint64_t CloneNewUser=0x10000000;
-    if(flags!=CloneNewUser && (flags&~CloneNewRuntimeNamespaces))return -EINVAL;
+    if (flags != CloneNewUser && flags != CloneNewPid && (flags & ~CloneNewRuntimeNamespaces)) return -EINVAL;
     auto* process=ProcessCurrent();
     if(!process)return -ESRCH;
     if(flags==CloneNewUser) {
@@ -398,7 +405,12 @@ int64_t sys_unshare(uint64_t flags,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t)
     auto* owner=ProcessUserNamespaceAcquire(process);
     const bool allowed=ProcessCapable(process,owner,CapSysAdmin);
     UserNamespaceRelease(owner);
-    return allowed ? ProcessNamespacesIsolate(process,flags) : -EPERM;
+    if (!allowed) return -EPERM;
+    if (flags == CloneNewPid) {
+        if (process->isThread || __atomic_load_n(&process->asLiveThreads,__ATOMIC_ACQUIRE)) return -EINVAL;
+        return ProcessPidUnshare(process);
+    }
+    return ProcessNamespacesIsolate(process, flags);
 }
 
 struct CloneArgs {
@@ -439,7 +451,7 @@ int64_t sys_clone3(uint64_t argsPtr, uint64_t size, uint64_t,
 
     // Delegate to sys_clone with the same argument layout:
     //   flags, newStack, parentTidAddr, childTidAddr, tlsAddr
-    if(cloneFlags&(0x00020000|0x10000000|CloneNewRuntimeNamespaces)) {
+    if(cloneFlags&(0x00020000|0x10000000|CloneNewRuntimeNamespaces|CloneNewPid)) {
         for(uint64_t i=sizeof(CloneArgs);i<size;++i) {
             uint8_t byte=0;
             if(!CopyFromUser(&byte,argsPtr+i,1))return -EFAULT;

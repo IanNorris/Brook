@@ -3,6 +3,7 @@
 // Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
+#include "pid_namespace.h"
 #include "syscall.h"
 #include "busybox_applets.h"
 #include "cpu.h"
@@ -63,6 +64,9 @@ int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAddr,
 {
     Process* proc = ProcessCurrent();
     if (!proc) return -ESRCH;
+    // Brook's initial-namespace nonleader exec detaches its old thread
+    // identity. PID namespaces need Linux's leader identity transfer first.
+    if (proc->isThread && ProcessPidView(proc)) return -95; // EOPNOTSUPP
 
     const char* userPath = reinterpret_cast<const char*>(pathAddr);
     if (!userPath) return -EFAULT;

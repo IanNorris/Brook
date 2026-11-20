@@ -5,6 +5,7 @@
 namespace brook {
 struct Process;
 struct UserNamespace;
+inline constexpr uint64_t CloneNewPid = 0x20000000;
 
 const PidNamespace* ProcessPidView(const Process* process);
 uint32_t ProcessVisibleTid(const Process* process, const PidNamespace* view);
