@@ -103,7 +103,7 @@ bool WmSetScale(uint32_t percent) {
     __atomic_store_n(&g_requestedScale,percent,__ATOMIC_RELEASE);
     CompositorWake();return true;
 }
-static bool ResizeWindowLocked(int idx,uint16_t newClientW,uint16_t newClientH);
+static bool ResizeWindowLocked(int idx, uint16_t newClientW, uint16_t newClientH, bool interactive = false);
 static void FocusWindowLocked(int idx);
 
 // Clearwater (refactor stages 2.2 and 2.3): the saved selection (theme,
@@ -1353,14 +1353,19 @@ uint32_t WmWindowCount()
     return n;
 }
 
-static void SetMaximizedLocked(int idx, bool enable)
+static void SetMaximizedLocked(int idx, bool enable, bool acknowledge = false)
 {
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
     Window& w = g_windows[idx];
     if (!w.proc) return;
     // Fullscreen owns the geometry; leaving it restores the earlier state.
-    if (w.fullscreen) return;
-    if ((w.state == WindowState::Maximized) == enable) return;
+    if (w.fullscreen || (w.state == WindowState::Maximized) == enable) {
+        // xdg-shell requires a configure in response to each request, even
+        // when the compositor keeps the current state.
+        if (acknowledge && w.vfb)
+            WmPushWmEvent(&w, WM_EVT_RESIZED, int16_t(w.clientW), int16_t(w.clientH));
+        return;
+    }
 
     uint32_t screenW, screenH;
     CompositorGetPhysDims(&screenW, &screenH);
@@ -1415,7 +1420,11 @@ static void SetMaximizedLocked(int idx, bool enable)
     w.proc->fbDestX=w.clientX();w.proc->fbDestY=w.clientY();
 }
 
-void WmSetMaximized(int idx,bool enable) { VfbGuard guard;SetMaximizedLocked(idx,enable); }
+void WmSetMaximized(int idx, bool enable, bool acknowledge)
+{
+    VfbGuard guard;
+    SetMaximizedLocked(idx, enable, acknowledge);
+}
 
 void WmToggleMaximize(int idx)
 {
@@ -1560,7 +1569,7 @@ int WmPlaceOwnedWindow(Process* proc, uint32_t wmId, uint64_t incarnation,
     return 0;
 }
 
-static bool ResizeWindowLocked(int idx, uint16_t newClientW, uint16_t newClientH)
+static bool ResizeWindowLocked(int idx, uint16_t newClientW, uint16_t newClientH, bool interactive)
 {
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return false;
     Window& w = g_windows[idx];
@@ -1600,7 +1609,8 @@ static bool ResizeWindowLocked(int idx, uint16_t newClientW, uint16_t newClientH
         WmPushWmEvent(&w,
                       WM_EVT_RESIZED,
                       static_cast<int16_t>(newClientW),
-                      static_cast<int16_t>(newClientH));
+                      static_cast<int16_t>(newClientH),
+                      interactive ? WM_RESIZE_RESIZING : 0);
     }
     else
     {
@@ -1615,7 +1625,7 @@ static bool ResizeWindowLocked(int idx, uint16_t newClientW, uint16_t newClientH
 bool WmResizeWindow(int idx,uint16_t newClientW,uint16_t newClientH)
 {
     VfbGuard guard;
-    return ResizeWindowLocked(idx,newClientW,newClientH);
+    return ResizeWindowLocked(idx,newClientW,newClientH,true);
 }
 
 bool WmApplyScalePending()
@@ -3524,7 +3534,7 @@ int WmInputPopById(Process* proc, uint32_t wmId, Window::WmInputEvent* out, uint
     return static_cast<int>(WmInputPop(win,out,max));
 }
 
-bool WmPushWmEvent(Window* win, uint8_t type, int16_t x, int16_t y)
+bool WmPushWmEvent(Window* win, uint8_t type, int16_t x, int16_t y, uint32_t resizeFlags)
 {
     if (!win) return false;
     uint32_t head = __atomic_load_n(&win->inputHead, __ATOMIC_ACQUIRE);
@@ -3539,7 +3549,7 @@ bool WmPushWmEvent(Window* win, uint8_t type, int16_t x, int16_t y)
     slot.x         = x;
     slot.y         = y;
     slot.reserved  = type!=WM_EVT_RESIZED ? 0 : win->fullscreen ? WM_RESIZE_FULLSCREEN :
-                     win->state==WindowState::Maximized ? WM_RESIZE_MAXIMIZED : WM_RESIZE_RESIZING;
+                     win->state==WindowState::Maximized ? WM_RESIZE_MAXIMIZED : resizeFlags;
     __atomic_store_n(&win->inputHead, next, __ATOMIC_RELEASE);
     return true;
 }

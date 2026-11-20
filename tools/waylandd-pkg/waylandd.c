@@ -2552,13 +2552,30 @@ static void dispatch_surface_event(struct brook_surface *s,
          * the new size — the client will allocate a fresh buffer at
          * those dimensions, ack_configure, and commit. */
         if (s->xdg_toplevel && s->xdg_surface) {
-            int32_t neww = e->x/(int32_t)surface_output_scale(s);
-            int32_t newh = e->y/(int32_t)surface_output_scale(s);
-            s->toplevel_fullscreen=(e->reserved&WM_RESIZE_FULLSCREEN)!=0;
-            s->toplevel_maximized=!s->toplevel_fullscreen && (e->reserved&WM_RESIZE_MAXIMIZED)!=0;
-            s->toplevel_resizing=!s->toplevel_maximized && !s->toplevel_fullscreen && (e->reserved&WM_RESIZE_RESIZING)!=0;
-            s->configure_width=neww;s->configure_height=newh;s->configure_size_pending=1;
-            toplevel_send_state(s,neww,newh);
+            const int32_t scale = (int32_t)surface_output_scale(s);
+            int32_t neww = e->x / scale, newh = e->y / scale;
+            const int was_managed = s->toplevel_maximized || s->toplevel_fullscreen;
+            s->toplevel_fullscreen = (e->reserved & WM_RESIZE_FULLSCREEN) != 0;
+            s->toplevel_maximized = !s->toplevel_fullscreen && (e->reserved & WM_RESIZE_MAXIMIZED) != 0;
+            const int managed = s->toplevel_maximized || s->toplevel_fullscreen;
+            s->toplevel_resizing = !managed && !was_managed && (e->reserved & WM_RESIZE_RESIZING) != 0;
+            if (!managed && was_managed) {
+                // The WM saved a buffer rectangle, including any CSD
+                // shadows. A 0x0 restore asks the client to restore its
+                // previous logical window geometry and decoration together.
+                neww = newh = 0;
+            } else if (!managed && s->deco_sent_mode > 0) {
+                // xdg_toplevel.configure uses window geometry. The VFB and
+                // the WM's outer client rectangle include client shadows.
+                const int32_t shadow_w = (int32_t)(s->vfb_w / scale) - s->window_geometry_w;
+                const int32_t shadow_h = (int32_t)(s->vfb_h / scale) - s->window_geometry_h;
+                if (s->window_geometry_w > 0 && shadow_w > 0 && neww > shadow_w) neww -= shadow_w;
+                if (s->window_geometry_h > 0 && shadow_h > 0 && newh > shadow_h) newh -= shadow_h;
+            }
+            s->configure_width = neww;
+            s->configure_height = newh;
+            s->configure_size_pending = 1;
+            toplevel_send_state(s, neww, newh);
             fprintf(stderr,"[waylandd] WM_EVT_RESIZED wm=%u configure %dx%d max=%d full=%d resizing=%d serial=%u\n",
                 s->wm_id,neww,newh,s->toplevel_maximized,s->toplevel_fullscreen,s->toplevel_resizing,s->next_configure_serial);
         }

@@ -820,6 +820,9 @@ int main() {
         CHECK(WmInputPop(&g,&event,1)==1 && event.reserved==WM_RESIZE_MAXIMIZED);
         WmSetMaximized(game,false);
         CHECK(g.state==WindowState::Normal && g.x==40 && g.y==50 && g.clientW==640 && g.clientH==480);
+        CHECK(WmInputPop(&g,&event,1)==1 && event.type==WM_EVT_RESIZED && event.reserved==0);
+        WmSetMaximized(game,false,true);
+        CHECK(WmInputPop(&g,&event,1)==1 && event.type==WM_EVT_RESIZED && event.reserved==0);
         // Legacy Xwayland WM: chrome-less, placed at the origin, output-sized.
         WmSetClientSideDecoration(game,true);WmMoveWindow(game,0,0);
         CHECK(WmResizeWindow(game,uint16_t(sw),uint16_t(sh)) && !g.fullscreen && !taskbarShown());

@@ -376,7 +376,7 @@ bool WmTaskbarHidden();
 uint32_t WmTaskbarTop(uint32_t screenH);
 
 // Set maximise state idempotently.
-void WmSetMaximized(int idx, bool enable);
+void WmSetMaximized(int idx, bool enable, bool acknowledge = false);
 
 // Minimize a window (hide from desktop, show in taskbar).
 void WmMinimizeWindow(int idx);
@@ -673,7 +673,7 @@ static constexpr uint32_t WM_RESIZE_RESIZING = 2;
 static constexpr uint32_t WM_RESIZE_FULLSCREEN = 4; // never with MAXIMIZED
 
 // Push a synthetic WM event into the per-window queue.  Drops on overflow.
-bool WmPushWmEvent(Window* win, uint8_t type, int16_t x = 0, int16_t y = 0);
+bool WmPushWmEvent(Window* win, uint8_t type, int16_t x = 0, int16_t y = 0, uint32_t resizeFlags = 0);
 // Kernel-authenticated socket origin, associated by the provider. Immutable
 // after the first registration, and only for a window owned by that provider.
 bool WmRegisterClientOrigin(Process* provider,uint32_t wmId,uint16_t clientPid,
