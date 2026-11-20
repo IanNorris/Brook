@@ -148,6 +148,7 @@ const char* ShutdownRequestStatus(const char*){return "Safe to power off manuall
 void ShutdownRequestBlockers(const char*,ShutdownBlockerReport* out){
     *out={};std::strcpy(out->stage,"sigterm");std::strcpy(out->status,"Closing apps - no window: pulse\"audio pid 51; SIGKILL in 4 s, or Cancel");
     out->count=2;out->listed=1;out->nextSignalMs=3500;out->entries[0].pid=51;std::strcpy(out->entries[0].name,"pulse\"audio");}
+bool ShutdownCanForceApps(const char*){return powerVerb=="shutdown";}
 void ShutdownCommand(const char*,const char* verb,char state[24],int* error){++powerCalls;powerVerb=verb;std::strcpy(state,"ready");*error=std::strcmp(verb,"commit")?0:-95;}
 uint32_t SmpGetCpuCount(){return 4;}
 uint32_t PciBootInventoryCount(){return 2;}
@@ -372,9 +373,12 @@ int main(){
     assert(handle("bridge hardware power "+request+" shutdown "+boot) && powerCalls==1 && powerVerb=="shutdown");
     assert(reply.find("\"stage\":\"sigterm\",\"blocker_count\":2,\"next_signal_ms\":3500,\"blockers\":[{\"pid\":51,\"name\":\"pulse\\\"audio\",\"window\":false,\"service\":false}]}")!=std::string::npos);
     assert(reply.find("\"status\":\"Closing apps - no window: pulse\\\"audio pid 51; SIGKILL in 4 s, or Cancel\"")!=std::string::npos);
-    assert(handle("bridge hardware power "+request+" commit "+boot) && powerCalls==2 && reply.find("\"error\":-95")!=std::string::npos);
+    assert(reply.find("\"force_apps_available\":true")!=std::string::npos);
+    assert(handle("bridge hardware power "+request+" force_apps "+boot) && powerCalls==2 && powerVerb=="force_apps");
+    assert(reply.find("\"force_apps_available\":false")!=std::string::npos);
+    assert(handle("bridge hardware power "+request+" commit "+boot) && powerCalls==3 && reply.find("\"error\":-95")!=std::string::npos);
     for(const auto& bad : {"bridge hardware power short shutdown "+boot,"bridge hardware power "+request+" exec "+boot,"bridge hardware power "+request+" restart "+std::string(32,'b'),"bridge hardware power "+request+" restart "+boot+" more"}){
-        assert(handle(bad) && powerCalls==2);
+        assert(handle(bad) && powerCalls==3);
     }
     assert(handle("bridge guard "+std::string(32,'a')+" mem") && dispatched=="mem");
     for(const auto& command:{std::string("bridge guard short"),"bridge guard "+std::string(32,'b')+" mem","bridge guard "+std::string(32,'a')+" @1 mem","bridge guard "+std::string(32,'a')+" bridge guard "+std::string(32,'a')+" mem"}){
