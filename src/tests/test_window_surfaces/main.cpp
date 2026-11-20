@@ -650,15 +650,6 @@ int main() {
     caretPid=0;
     owner->fbPublicationGeneration=~uint64_t{0};CHECK(!WmAcquireDesktopLayers(&layers));
     CHECK(!layers.count && backingA.references==1 && backingB.references==1);
-    // Files focus uses the Wayland app ID even when the title is a folder.
-    SetWmActiveLocked(true);
-    WmStrCopy(window.appId, LauncherFilesAppId, sizeof(window.appId));
-    WmStrCopy(window.title, "Downloads", sizeof(window.title));
-    window.visible = window.focusable = true;
-    window.minimized = true;
-    WmOpenFiles();
-    CHECK(g_focusedIdx == slot && window.focused && !window.minimized);
-    SetWmActiveLocked(false);
     owner->fbBacking=nullptr;owner->fbVirtual=nullptr;window.vfbBacking=nullptr;
     std::free(owner);std::free(stranger);
     // One shell-surface list for every compositor path: the taskbar first,
@@ -886,6 +877,22 @@ int main() {
               WmContentColour(BROOK_CONTENT_ACCENT)==0x44ff11);
         CHECK(WmSetTheme(BROOK_LEGACY_PALETTE_SMOKED) && brook_selection_hue(WmGetThemeSelection())==BROOK_HUE_SLATE);
         CHECK(WmSetThemeSelection(BROOK_THEME_SELECTION_DEFAULT));WmSetBackendBlur(false);
+    }
+    // Files focus uses the Wayland app ID even when the title is a folder.
+    {
+        static Process files{};
+        files.pid = files.tgid = 99;
+        files.incarnation = 99;
+        SetWmActiveLocked(true);
+        const int idx = WmCreateWindow(&files, 10, 10, 300, 200, "Downloads");
+        CHECK(idx >= 0);
+        auto& w = g_windows[idx];
+        WmStrCopy(w.appId, LauncherFilesAppId, sizeof(w.appId));
+        WmMinimizeWindow(idx);
+        CHECK(w.minimized);
+        WmOpenFiles();
+        CHECK(g_focusedIdx == idx && w.focused && !w.minimized);
+        WmDestroyWindowById(&files, w.wmId);
     }
     std::puts("WINDOW_SURFACES PASS: stale slot, GL/SHM transition, destruction, reuse, owned geometry, chrome and fullscreen");
 }

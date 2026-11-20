@@ -5,6 +5,28 @@ Current state and immediate goal. Keep this short and current: replace stale lin
 _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review follow-up)._
 
 
+## Brook Files (20 November 2026)
+
+- `work/files-nautilus` packages pinned Nautilus 49.4 as Files
+  (`org.gnome.Nautilus.desktop`). Directory opens use this ID, and Super+E
+  starts Files or restores and focuses an existing window. The launcher
+  rewrites the old Files key in pins, Recent and category membership.
+- User-session D-Bus activation loads GVfs for Trash. Local volumes use the
+  GIO Unix volume monitor. All three desktop profile expressions include
+  the new Files integration, and the boot-only tools refresh no longer
+  stages the old browser. The Files icon remains used by design previews.
+- Implementation `c04f5132`. Release, 386 non-stress tests, all 728
+  chrome goldens and the desktop-index regression passed. The hardware
+  profile is `/nix/store/m4ixhjswaq8wzws1ychyfb9g4w1wfv3a-brook-offline-hardware-desktop`.
+  Exact profile link and closure changes are in
+  `build/files-evidence/profile-delta.json`.
+- Clearwater-enabled pair `build/dell/pair-files` passed guarded QEMU
+  on attempt 1. A separate headless QEMU boot opened the real Files
+  window with Super+E and persisted the migrated pins and Recent entries.
+  A private host session verified the default directory handler and a
+  Trash round trip. Evidence is in `build/files-evidence`. Dell validation
+  is pending.
+
 ## Clearwater Stage 3 reconciliation (19 November 2026)
 
 - `work/clearwater-s3-reconcile` merges Stage 3 into integration60 `a3f6685e`.
