@@ -371,22 +371,25 @@ static void PowerText(char* out, uint32_t milliwatts)
     CopyText(out, " W", 4);
 }
 
-// Bars of a cadence history, newest at the right: `pitch` apart, one per
-// sample from the last 10 s, scaled to `fullMs`; over-budget frames are hot.
+// Each column covers a fixed share of the last ten seconds. Keep the
+// longest observed interval for that slice and leave periods without frames blank.
 static void CadenceBars(ChromeDisplayList& dl, const ChromeStyle& s, const DesktopRect& r,
                         const DesktopIntervals<>& history, uint64_t tick, unsigned fullMs, uint32_t ink, int pitchPx = 3)
 {
-    const int pitch = Px(s, pitchPx), bar = pitch > 1 ? pitch - Px(s, 1) : 1;
+    const int pitch = Px(s, pitchPx);
     if (r.w < pitch || r.h <= 0) return;
     const unsigned capacity = static_cast<unsigned>(r.w / pitch);
-    const unsigned shown = history.count < capacity ? history.count : capacity;
-    for (unsigned i = 0; i < shown; ++i) {
-        const auto& v = history.samples[(history.next + 128 - shown + i) % 128];
-        if (tick < v.tick || tick - v.tick > 10000) continue;
-        const unsigned ms = v.ms < fullMs ? v.ms : fullMs;
+    const unsigned columns = capacity < DesktopFrameBins::SlotCount ? capacity : DesktopFrameBins::SlotCount;
+    for (unsigned i = 0; i < columns; ++i) {
+        const uint32_t interval = history.bins.ColumnPeak(tick, i, columns);
+        if (!interval) continue;
+        const unsigned ms = interval < fullMs ? interval : fullMs;
         const int height = 1 + int(uint64_t(r.h - 1) * ms / fullMs);
-        dl.Fill(r.x + r.w - static_cast<int>(shown - i) * pitch, r.y + r.h - height, bar, height,
-                0xff000000u | (v.ms >= 17 ? s.P().hot : ink));
+        const int x = int(i * r.w / columns);
+        const int next = int((i + 1) * r.w / columns);
+        const int width = next - x - Px(s, 1);
+        dl.Fill(r.x + x, r.y + r.h - height, width > 0 ? width : 1, height,
+                0xff000000u | (interval >= 17 ? s.P().hot : ink));
     }
 }
 // The newest sample's interval in ms, or false when none is recent.
@@ -1762,7 +1765,17 @@ static void DetailedCadence(const ChromeStatsPopupLayout& l, bool app, const Des
                 plot.w - Px(s, 12));
     }
     const int foot = b.y + caption + gap + chartH;
-    dl.Text(CF::Small, b.x, foot, "Last 10 s " BROOK_CHROME_DOT " 16.7 ms budget", p.mutedText, b.w);
+    constexpr char oldest[] = "10 s ago", newest[] = "Now", legend[] = "16.7 ms budget";
+    const int leftW = s.TextWidth(oldest, CF::Small), rightW = s.TextWidth(newest, CF::Small);
+    const int legendW = s.TextWidth(legend, CF::Small);
+    const int legendX = b.x + (b.w - legendW) / 2;
+    if (legendX >= b.x + leftW + gap && legendX + legendW + gap <= b.x + b.w - rightW) {
+        dl.Text(CF::Small, b.x, foot, oldest, p.mutedText);
+        dl.Text(CF::Small, legendX, foot, legend, p.mutedText);
+        dl.Text(CF::Small, b.x + b.w - rightW, foot, newest, p.mutedText);
+    } else {
+        dl.Text(CF::Small, b.x, foot, "Last 10 s " BROOK_CHROME_DOT " 16.7 ms budget", p.mutedText, b.w);
+    }
     int y = foot + caption + gap;
     const auto value = [&](const char* label, uint32_t ms) {
         char text[24] = "Unknown";
