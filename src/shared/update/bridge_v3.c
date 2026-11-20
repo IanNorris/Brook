@@ -9,7 +9,7 @@ static const uint8_t ServerMagic[] = {'B','R','K','S','R','V','3',0};
 static const uint8_t OperatorLabel[] = "Brook bridge v3 operator proof";
 static const uint8_t ClientKeyLabel[] = "Brook bridge v3 client to server";
 static const uint8_t ServerKeyLabel[] = "Brook bridge v3 server to client";
-static const uint64_t MaxTraffic = UINT64_C(16) * 1024 * 1024 * 1024 * 1024;
+static const uint64_t MaxTraffic = 16ull * 1024 * 1024 * 1024 * 1024;
 
 static void Copy(uint8_t *out, const uint8_t *bytes, size_t length) {
     for (size_t i = 0; i < length; ++i) out[i] = bytes[i];
