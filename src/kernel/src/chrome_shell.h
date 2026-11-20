@@ -105,6 +105,50 @@ void ChromeBuildVolumeGlyph(ChromeDisplayList& dl, const ChromeStyle& s, int x0,
                             uint32_t control, bool available, uint32_t bg);
 
 // ---------------------------------------------------------------------------
+// Side dock (DESIGN.md "Side dock")
+// ---------------------------------------------------------------------------
+
+// Logical sizes at 100%. The sidebar is one column on the left edge, from the
+// top of the screen to the taskbar: the strip of entries across its top, the
+// selected entry's window (the page) below it. Closed, a dock with entries
+// shows only the edge tab.
+struct ChromeDockMetrics {
+    static constexpr int Width = 420, Strip = 48, Cell = 42, Pin = 38, TileButton = 32;
+    static constexpr int Icon = 24, Tab = 5, TabHeight = 120;
+};
+static constexpr uint32_t ChromeDockEntryLimit = 32; // WM_MAX_WINDOWS
+
+struct ChromeDockLayout {
+    DesktopRect sidebar, strip, page, tab;
+    DesktopRect pin, tile, title, back, close; // tile: the selected entry's cell
+    DesktopRect cells[ChromeDockEntryLimit];   // one per laid-out entry; cells[selected] == tile
+    int count;    // entries laid out; any beyond the strip's room are not shown
+    int selected; // -1: none
+    bool open;    // strip shown (open or pinned); else the tab, when there are entries
+};
+
+enum class ChromeDockTarget : uint8_t { None, Entry, Tile, Return, Close, Pin, Strip, Tab };
+struct ChromeDockHit {
+    ChromeDockTarget target;
+    int index; // Entry, Tile: the entry
+};
+
+// The sidebar rectangle: 420 px (scaled), at most half the screen.
+DesktopRect ChromeDockSidebar(const DesktopMetrics& m, uint32_t screenW, uint32_t desktopH);
+ChromeDockLayout ChromeDockLayoutFor(const DesktopMetrics& m, uint32_t screenW, uint32_t desktopH,
+                                     int entries, int selected, bool open);
+ChromeDockHit ChromeDockHitTest(const ChromeDockLayout& layout, int32_t x, int32_t y);
+
+struct ChromeDockModel {
+    const ChromeDockLayout* layout;
+    const uint32_t* const* icons; // layout->count entries (borrowed; null: missing glyph)
+    const char* title;            // the selected entry's window title
+    bool pinned;
+    int32_t mouseX, mouseY;
+};
+void ChromeBuildDock(const ChromeDockModel& model, const ChromeStyle& style, ChromeDisplayList& out);
+
+// ---------------------------------------------------------------------------
 // Volume popup and tray tooltip
 // ---------------------------------------------------------------------------
 

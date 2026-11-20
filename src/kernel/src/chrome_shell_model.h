@@ -7,7 +7,7 @@
 namespace brook {
 
 enum class ChromeShellKind : uint8_t {
-    Taskbar, Launcher, VolumePopup, Tooltip, BootSummary, TrayFlyout, PerformanceHud, None = 0xff,
+    Taskbar, Launcher, VolumePopup, Tooltip, BootSummary, TrayFlyout, PerformanceHud, Dock, None = 0xff,
 };
 
 struct ChromeShellConfig {
@@ -80,6 +80,7 @@ struct ChromeShellModel {
     ChromeShellTelemetry telemetry, compactTelemetry;
     ChromeShellBoot boot;
     ChromeTaskbarLayout taskbar;
+    ChromeDockLayout dock; // dock entries use icons[0..dock.count)
     LauncherModel launcherModel;
     ChromeLauncherFrame launcherFrame;
     char launcherBuild[64];
@@ -92,10 +93,12 @@ struct ChromeShellModel {
     bool launcherOpen, networkConnected, volumeAvailable, agentShown, agentStale;
     bool shutdownActive, prompt, promptRestart, confirmFocused;
     bool network;
+    bool dockPinned;
     char text[128], detail[64]; // launcher header, tooltip or flyout address
 };
 
 static_assert(__is_trivially_copyable(ChromeShellModel));
+static_assert(ChromeShellModel::IconLimit >= ChromeDockEntryLimit, "dock entries use the icon slots");
 static_assert(__is_trivially_copyable(ChromeShellConfig));
 
 // Borrowed display-list assets remain valid while the model and style
@@ -144,6 +147,13 @@ inline void BuildShellModel(const ChromeShellModel& model, const ChromeStyle& st
     case ChromeShellKind::PerformanceHud:
         ChromeBuildPerformanceHud({model.rect, model.telemetry.View(), model.hudTick}, style, list);
         break;
+    case ChromeShellKind::Dock: {
+        const uint32_t* icons[ChromeDockEntryLimit];
+        const int count = model.dock.count < int(ChromeDockEntryLimit) ? model.dock.count : int(ChromeDockEntryLimit);
+        for (int i = 0; i < count; ++i) icons[i] = model.icons[i].View();
+        ChromeBuildDock({&model.dock, icons, model.text, model.dockPinned, model.mouseX, model.mouseY}, style, list);
+        break;
+    }
     }
 }
 

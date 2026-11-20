@@ -39,7 +39,7 @@ static TaskbarLayout GetTaskbarLayout(uint32_t screenW, uint32_t screenH)
     for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
     {
         const Window& w = g_windows[i];
-        if (!w.proc || !w.visible || !w.focusable) continue;
+        if (!w.proc || !w.visible || !w.focusable || w.docked) continue; // docked: the dock's
         if (w.focused) focused = total;
         labels[total] = WindowDisplayTitle(w);
         ids[total++] = static_cast<int>(i);

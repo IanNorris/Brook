@@ -2751,17 +2751,19 @@ static void CompositorRunShortcut(const GlobalShortcutResult& r)
         break;
     }
     case GlobalShortcutAction::CycleFocus: {
-        // Send the frontmost window back and focus the next one.
-        int zOrder[WM_MAX_WINDOWS];
-        const uint32_t zCount=WmGetZOrder(zOrder,WM_MAX_WINDOWS);
-        if(zCount>1) {
-            WmSendToBack(zOrder[zCount-1]);
-            WmSetFocus(zOrder[zCount-2]);
-            // A deliberate switch: the target's pointer lock may take over.
-            WmPointerActivate(zOrder[zCount-2]);
-        }
+        // Send the frontmost desktop window back and focus the next one
+        // (docked windows take no part).
+        const int target=WmCycleFocus();
+        // A deliberate switch: the target's pointer lock may take over.
+        if(target>=0)WmPointerActivate(target);
         break;
     }
+    case GlobalShortcutAction::ToggleDock:
+        WmDockToggle();
+        SerialPrintf("WM: shortcut Super+S dock %s\n",WmDockOpen()?"shown":"hidden");
+        break;
+    case GlobalShortcutAction::DockFocusedWindow:WmDockFocusedWindow();break;
+    case GlobalShortcutAction::CloseDock:WmDockDismiss();break;
     case GlobalShortcutAction::SpawnTerminal:WmSpawnTerminal();break;
     case GlobalShortcutAction::OpenFiles:WmOpenFiles();break;
     case GlobalShortcutAction::ToggleGlass:WmToggleFocusedWindowGlass();break;
@@ -2793,6 +2795,7 @@ static void CompositorInputWM()
             context.launcherVisible=WmLauncherVisible();
             context.volumePopupVisible=WmVolumePopupVisible() || WmTrayFlyoutVisible();
             context.launcherPrompt=WmLauncherPowerPrompt();
+            context.dockDismissible=WmDockDismissible();
             GlobalShortcutResult shortcut=g_globalShortcuts.Key(
                 ev.type==InputEventType::KeyPress,ev.scanCode,ev.modifiers,context);
             shortcut.ascii=ev.ascii;shortcut.modifiers=ev.modifiers;
@@ -2817,7 +2820,8 @@ static void CompositorInputWM()
             int32_t mx=0,my=0;MouseGetPosition(&mx,&my);
             const bool launcher=WmLauncherVisible();
             overlay=launcher || WmVolumePopupVisible() || WmTrayFlyoutVisible() ||
-                    my>=static_cast<int32_t>(WmTaskbarTop(g_physFbHeight));
+                    my>=static_cast<int32_t>(WmTaskbarTop(g_physFbHeight)) ||
+                    WmDockPointerOwned(mx,my,g_physFbWidth,g_physFbHeight);
             // Shell surfaces own the pointer: no window may acquire a lock
             // while it is over the taskbar, launcher or volume popup.
             if(overlay)WmPointerSetHover(-1);
@@ -3242,6 +3246,15 @@ static void CompositorHandleMouseWM()
             } else g_wmLastBtnDown = btnDown;
             return;
         }
+        // The dock's strip and edge tab. A press outside an open, unpinned
+        // sidebar hides the dock and carries on to what lies beneath.
+        if (WmDockPress(mx, my, g_physFbWidth, g_physFbHeight))
+        {
+            if (WmLauncherVisible()) WmLauncherClose();
+            if (releaseLatched && !polledDown) { g_wmPrimaryDown = false; g_wmLastBtnDown = false; }
+            else g_wmLastBtnDown = btnDown;
+            return;
+        }
         // If launcher is open, check launcher panel first
         if (WmLauncherVisible())
         {
@@ -3326,7 +3339,8 @@ static void CompositorHandleMouseWM()
             Window* hitWindow = WmGetWindow(hit.windowIndex);
             // Overlaid captions mean the client implements xdg_toplevel.move
             // from its own title area (Chromium tab strip): never steal it.
-            if (hitWindow && hitWindow->noChrome && !hitWindow->captionOverlay)
+            // The dock's page is fixed in place: its clicks are the client's.
+            if (hitWindow && hitWindow->noChrome && !hitWindow->captionOverlay && !hitWindow->docked)
             {
                 int32_t localX = mx - hitWindow->x;
                 int32_t localY = my - hitWindow->y;

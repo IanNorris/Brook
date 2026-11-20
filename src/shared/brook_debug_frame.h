@@ -112,7 +112,7 @@ struct BrookDesktopOverlayBandsV2 {
  * (layers ABI v2, struct BrookDesktopSurface in desktop_layers_abi.h) of the
  * same capture lease, back to front: kind, rectangle, material, opacity,
  * radii, shadow and content key. The pointer is not a surface. */
-enum { BROOK_DESKTOP_OVERLAY_SURFACES=10, BROOK_DESKTOP_OVERLAY_MAX_SURFACES=4 };
+enum { BROOK_DESKTOP_OVERLAY_SURFACES=10, BROOK_DESKTOP_OVERLAY_MAX_SURFACES=5 };
 struct BrookDesktopOverlayInfo {
     struct BrookDebugFrameInfo frame;
     uint64_t generation;

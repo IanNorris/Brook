@@ -262,6 +262,21 @@ struct Window
     uint16_t    fsCaptionInsetRight, fsCaptionInsetTop, fsCaptionHeight;
     uint32_t    fsCaptionStyle;
 
+    // Side dock (wm_shell_dock.inc). A docked window keeps running but leaves
+    // the taskbar, Alt+Tab and automatic focus. While docked it is placed as
+    // the dock's page: the sidebar rectangle below the strip, no server-side
+    // chrome, state Maximized (so the client is configured tiled and moves
+    // are refused). It is drawn only while it is the selected page of a shown
+    // dock; otherwise it is hidden through `minimized`, which every draw and
+    // hit path already skips. The dk* fields hold what returning restores.
+    bool        docked;
+    WindowState dkState;
+    int16_t     dkX, dkY;
+    uint16_t    dkW, dkH;
+    bool        dkNoChrome, dkCaptionOverlay;
+    uint16_t    dkCaptionInsetRight, dkCaptionInsetTop, dkCaptionHeight;
+    uint32_t    dkCaptionStyle;
+
     // Outer dimensions including chrome.  CSD (noChrome) windows have
     // no kernel chrome, so outer == client.
     const DesktopMetrics& desktopMetrics() const { return metrics ? *metrics : DesktopMetric100; }
@@ -522,6 +537,41 @@ int WmTaskbarHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)
 
 // Get the usable desktop height (screen height minus taskbar).
 uint32_t WmDesktopHeight(uint32_t screenH);
+// The work area: the desktop above the taskbar, less the side dock's width
+// while it is pinned with entries. Maximise and tiling use it.
+WmRect WmWorkArea(uint32_t screenW, uint32_t screenH);
+
+// Side dock (wm_shell_dock.inc). Compositor thread.
+// The dock's shell surface: the strip while shown, the edge tab while closed
+// with entries. False when nothing of the dock is drawn.
+bool WmDockSurfaceRect(uint32_t screenW, uint32_t screenH, int32_t* x, int32_t* y, uint32_t* w, uint32_t* h,
+                       bool* material);
+// The pointer is over the strip or the tab: shell input, not a window's.
+bool WmDockPointerOwned(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH);
+// A primary press. True when the strip or tab consumed it. A press outside a
+// shown, unpinned sidebar closes the dock and returns false (it still reaches
+// what lies beneath).
+bool WmDockPress(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH);
+// Super+S: open on the last page (or the first entry), or close.
+void WmDockToggle();
+// Super+Shift+S: dock the focused window, or return the focused page.
+void WmDockFocusedWindow();
+// Escape and the launcher: hide an open, unpinned dock. True if it closed.
+bool WmDockDismiss();
+// Open and unpinned: Escape belongs to the dock.
+bool WmDockDismissible();
+bool WmDockWindow(int idx);
+bool WmDockReturnWindow(int idx);
+bool WmDockSelect(int entry);
+void WmDockSetPinned(bool pinned);
+bool WmDockPinned();
+bool WmDockOpen();
+uint32_t WmDockEntryCount();
+int WmDockEntryWindow(uint32_t entry);
+// Alt+Tab: send the frontmost desktop window back and focus the next one.
+// Docked windows take no part; an open, unpinned dock closes first. Returns
+// the newly focused window, or -1.
+int WmCycleFocus();
 
 // Spawn a new terminal window (Super+Enter handler).
 void WmSpawnTerminal();

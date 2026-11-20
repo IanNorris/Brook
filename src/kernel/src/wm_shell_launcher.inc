@@ -81,13 +81,15 @@ static void LauncherSyncModel(const LauncherSnapshot& catalog)
     LauncherNoteLayout(firstCatalog);
 }
 
-static LauncherPersistenceResult LauncherReadLayout()
+// Read a regular config file of under `limit` bytes into text (terminated).
+// Shell context: the VFS may sleep.
+static LauncherPersistenceResult ConfigReadText(const char* configPath, char* text, uint32_t limit)
 {
     VfsPath root{};
     int error = VfsPathRoot(&root);
     if (error) return {"root", error};
     VfsPath path{};
-    error = VfsPathResolve(root, root, LauncherLayoutPath, &path, false);
+    error = VfsPathResolve(root, root, configPath, &path, false);
     VfsPathRelease(root);
     if (error) return {error == -2 ? "missing" : "lookup", error};
     VnodeStat stat{};
@@ -99,21 +101,26 @@ static LauncherPersistenceResult LauncherReadLayout()
     auto* file = VfsPathOpen(path, VFS_O_READ, &error);
     VfsPathRelease(path);
     if (!file) return {"open", error};
-    auto* text = static_cast<char*>(kmalloc(LauncherLayoutLimit));
     uint32_t done = 0;
-    if (!text) error = -12;
     uint64_t offset = 0;
-    while (!error && done < LauncherLayoutLimit) {
-        const int rd = VfsRead(file, text + done, LauncherLayoutLimit - done, &offset);
+    while (!error && done < limit) {
+        const int rd = VfsRead(file, text + done, limit - done, &offset);
         if (rd <= 0) { error = rd; break; }
         done += static_cast<uint32_t>(rd);
     }
     VfsClose(file);
-    LauncherPersistenceResult result{"restored", 0};
-    if (error) result = {"read", error};
-    else if (done == LauncherLayoutLimit) result = {"size", -7};
-    else {
-        text[done] = 0;
+    if (error) return {"read", error};
+    if (done == limit) return {"size", -7};
+    text[done] = 0;
+    return {"restored", 0};
+}
+
+static LauncherPersistenceResult LauncherReadLayout()
+{
+    auto* text = static_cast<char*>(kmalloc(LauncherLayoutLimit));
+    if (!text) return {"read", -12};
+    LauncherPersistenceResult result = ConfigReadText(LauncherLayoutPath, text, LauncherLayoutLimit);
+    if (!result.error) {
         bool migrated = false;
         if (!g_launcherModel.Parse(text, &migrated)) result = {"parse", -22};
         else if (migrated) result = {"migrated", 0};
@@ -199,13 +206,15 @@ static int LauncherConfigDir(const VfsPath& root, VfsPath* out)
 }
 
 static LauncherPersistenceResult LauncherWriteLayout(const VfsPath& root, const VfsPath& directory,
-                                                     const char* text, uint32_t bytes)
+                                                     const char* text, uint32_t bytes,
+                                                     const char* temp = LauncherLayoutTemp,
+                                                     const char* name = LauncherLayoutName)
 {
     // A power cut can leave our temporary entry behind. Unlink the entry
     // itself, then create exclusively so we never truncate an existing inode.
-    int error = VfsRemoveAt(root, directory, LauncherLayoutTemp, false);
+    int error = VfsRemoveAt(root, directory, temp, false);
     if (error && error != -2) return {"remove-temp", error};
-    auto* file = VfsOpenAt(root, directory, LauncherLayoutTemp,
+    auto* file = VfsOpenAt(root, directory, temp,
                            VFS_O_WRITE | VFS_O_CREATE | VFS_O_EXCL, 0600, 0, &error, false);
     if (!file) return {"create", error};
 
@@ -218,10 +227,10 @@ static LauncherPersistenceResult LauncherWriteLayout(const VfsPath& root, const 
     if (!result.error && (error = VfsChown(file, DesktopUid, DesktopGid))) result = {"chown", error};
     if (!result.error && (error = VfsFsync(file))) result = {"sync-file", error};
     VfsClose(file);
-    if (!result.error && (error = VfsRenameAt(root, directory, LauncherLayoutTemp, directory, LauncherLayoutName)))
+    if (!result.error && (error = VfsRenameAt(root, directory, temp, directory, name)))
         result = {"rename", error};
     if (result.error) {
-        VfsRemoveAt(root, directory, LauncherLayoutTemp, false);
+        VfsRemoveAt(root, directory, temp, false);
         return result;
     }
     auto* dir = VfsPathOpen(directory, VFS_O_READ, &error);
