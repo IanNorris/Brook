@@ -1756,7 +1756,9 @@ static bool ResizeWindowLocked(int idx, uint16_t newClientW, uint16_t newClientH
 bool WmResizeWindow(int idx,uint16_t newClientW,uint16_t newClientH)
 {
     VfbGuard guard;
-    return ResizeWindowLocked(idx,newClientW,newClientH,true);
+    // The floating drag previews geometry locally. This notification runs
+    // after release, so clients receive the final size with no active resize.
+    return ResizeWindowLocked(idx,newClientW,newClientH);
 }
 
 bool WmApplyScalePending()

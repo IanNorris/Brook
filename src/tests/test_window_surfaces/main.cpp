@@ -331,6 +331,11 @@ int main() {
     window.state=WindowState::Normal;
     CHECK(WmPushWmEvent(&window,WM_EVT_RESIZED,640,360,WM_RESIZE_RESIZING));
     CHECK(WmInputPop(&window,&event,1)==1 && event.reserved==WM_RESIZE_RESIZING);
+    // Floating drag motion is local. The actual release sends one settled size.
+    CHECK(WmResizeWindow(slot,800,600));
+    CHECK(WmInputPop(&window,&event,1)==1 && event.type==WM_EVT_RESIZED);
+    CHECK(event.x==800 && event.y==600 && !event.reserved);
+    CHECK(WmInputPop(&window,&event,1)==0);
     // Quiet windows have no client dirty pixels. Focus/z-order changes still
     // require a new chrome composition, without waiting for periodic repaint.
     WmAcknowledgeContent(slot,WmSnapshotContent(slot));
