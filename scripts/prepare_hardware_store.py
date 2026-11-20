@@ -20,6 +20,8 @@ import uuid
 
 from ext2_image_export import Source
 
+from collect_desktop_entries import collect
+
 ROOT = Path(__file__).resolve().parents[1]
 FAT_FILE_MAX = 0xfffffe00
 INTEL_VULKAN_DIR = 'system/graphics/intel-vulkan-26.0.6-brook1'
@@ -53,7 +55,7 @@ def profile_tree(source, target, closure, ancestors=()):
 
 def mutable(path):
     return path == 'store' or any(path == root or path.startswith(root+'/')
-        for root in ('profile', 'var', 'home/brook', 'share/applications'))
+        for root in ('profile', '.brook-profile-legacy', 'var', 'home/brook', 'share/applications'))
 
 
 def seed_intel_vulkan(seed, driver, closure):
@@ -170,7 +172,11 @@ def main():
         run('cp', '-a', '--reflink=auto', '--', item, seed/'store'/Path(item).name)
     intel_vulkan = (seed_intel_vulkan(seed, metadata['intelVulkanDriver'], closure)
                     if metadata['intelVulkanDriver'] else None)
-    profile_tree(profile, seed/'profile', {Path(p).name for p in closure})
+    profile_tree(profile, seed/'.brook-profile-legacy', {Path(p).name for p in closure})
+    (seed/'profile').symlink_to('.brook-profile-legacy')
+    (seed/'share').mkdir()
+    (seed/'share/applications').symlink_to('../profile/.brook-launcher')
+    (seed/'profile/.brook-launcher').mkdir()
     for directory in ('bin', 'index', 'etc/ssl/certs', 'var/cache/narinfo',
                       'home/brook/.config/brook', 'home/brook/.cache',
                       'home/brook/.local/share', 'share/applications'):
@@ -181,6 +187,9 @@ def main():
         run(compiler, '-static', '-O2', '-Wall', '-Wextra', source, '-o', seed/'bin'/name)
         tools[name] = {'source_sha256': digest(source), 'binary_sha256': digest(seed/'bin'/name)}
     (seed/'bin/nix').symlink_to('nix-install')
+    stage_profile = profile/'bin/brook-stage-profile'
+    if stage_profile.is_file():
+        (seed/'bin/brook-stage-profile').symlink_to(stage_profile.resolve())
     for name in ('curl', 'xz', 'zstd'):
         if not (profile/'bin'/name).is_file():
             raise ValueError('Required runtime helper missing: '+name)
@@ -200,16 +209,7 @@ def main():
     (seed/'profile/manifest.tsv').write_text('\n'.join(sorted(set(rows)))+'\n')
     # collect_desktop_entries resolves guest /nix paths against the seed and
     # uses only the profile exports, avoiding uninstalled closure-only entries.
-    run('python3', ROOT/'scripts/collect_desktop_entries.py', seed/'store', seed/'share/applications')
-    manifest = seed/'share/applications/applications.idx'
-    records = []
-    for line in manifest.read_text().splitlines():
-        fields = line.split('\t')
-        for name in ('mousepad', 'brook-settings', 'wayland-calc', 'brook-gallery'):
-            if fields[1].split(' ', 1)[0] in (name, '/nix/profile/bin/'+name):
-                fields[1] = '/nix/profile/bin/hardware-'+name
-        records.append('\t'.join(fields))
-    manifest.write_text('\n'.join(records)+'\n')
+    collect(seed/'store', seed/'share/applications', hardware=True)
     (seed/'BROOK.MNT').write_text('/nix\n')
     identity = {'profile': str(profile), 'closure': sorted(closure),
                 'index_sha256': digest(index), 'index_metadata': index_metadata, 'tools': tools,

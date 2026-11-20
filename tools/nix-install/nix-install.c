@@ -44,6 +44,12 @@
 #endif
 #ifndef PROFILE_DIR
 #define PROFILE_DIR     "/nix/profile"
+#define PROFILE_LOCK_DIR "/nix/var/.brook-profile-lock"
+#else
+#define PROFILE_LOCK_DIR PROFILE_DIR "/.mutation-lock"
+#endif
+#ifndef PROFILE_STAGE_PATH
+#define PROFILE_STAGE_PATH "/nix/bin/brook-stage-profile"
 #endif
 #ifndef MANIFEST_PATH
 #define MANIFEST_PATH   "/nix/profile/manifest.tsv"
@@ -358,19 +364,19 @@ static int remove_from_manifest(const char *name) {
 static int profile_lock_owned;
 static void release_profile_lock(void) {
     if (!profile_lock_owned) return;
-    unlink(PROFILE_DIR "/.mutation-lock/owner");
-    rmdir(PROFILE_DIR "/.mutation-lock");
+    unlink(PROFILE_LOCK_DIR "/owner");
+    rmdir(PROFILE_LOCK_DIR);
     profile_lock_owned=0;
 }
 static int acquire_profile_lock(void) {
     if (profile_lock_owned) return 0;
     if (mkdir_p(PROFILE_DIR)<0 && errno!=EEXIST) return -1;
-    if (mkdir(PROFILE_DIR "/.mutation-lock",0700)<0) {
-        fprintf(stderr,"Profile busy: %s/.mutation-lock (%s). Do not remove a live writer's lock.\n",PROFILE_DIR,strerror(errno));
+    if (mkdir(PROFILE_LOCK_DIR,0700)<0) {
+        fprintf(stderr,"Profile busy: %s (%s). Do not remove a live writer's lock.\n",PROFILE_LOCK_DIR,strerror(errno));
         return -1;
     }
     profile_lock_owned=1;atexit(release_profile_lock);
-    FILE *owner=fopen(PROFILE_DIR "/.mutation-lock/owner","w");
+    FILE *owner=fopen(PROFILE_LOCK_DIR "/owner","w");
     if (owner) {fprintf(owner,"pid=%ld uid=%ld\n",(long)getpid(),(long)geteuid());fclose(owner);}
     return 0;
 }
@@ -1356,6 +1362,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  %s list                List installed packages\n", prog);
     fprintf(stderr, "  %s search <query>      Search for packages\n", prog);
     fprintf(stderr, "  %s shell <pkg...>      Start a temporary shell with the packages on PATH\n", prog);
+    fprintf(stderr, "  %s stage-profile ...    Apply or roll back a signed closure plan\n", prog);
 }
 
 int main(int argc, char *argv[]) {
@@ -1374,6 +1381,12 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         const char *cmd = argv[1];
+        if (strcmp(cmd, "stage-profile") == 0) {
+            argv[1] = (char *)PROFILE_STAGE_PATH;
+            execv(PROFILE_STAGE_PATH, argv + 1);
+            perror(PROFILE_STAGE_PATH);
+            return 1;
+        }
         if (strcmp(cmd, "install") == 0 || strcmp(cmd, "i") == 0) {
             if (argc < 3) {
                 fprintf(stderr, "Usage: %s install <package>\n", prog);

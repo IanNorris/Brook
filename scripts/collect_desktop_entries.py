@@ -184,12 +184,21 @@ def main():
         print("  output_dir:    Output directory for applications.idx and icons/")
         sys.exit(1)
 
-    store_dir = sys.argv[1]
-    output_dir = sys.argv[2]
+    collect(Path(sys.argv[1]), Path(sys.argv[2]))
 
-    if not os.path.isdir(store_dir):
-        print(f"ERROR: Store directory not found: {store_dir}")
-        sys.exit(1)
+
+def collect(store_dir, output_dir, *, profile=None, hardware=False):
+    if not store_dir.is_dir():
+        raise ValueError(f"Store directory not found: {store_dir}")
+    nix_dir = store_dir.parent
+    profile = profile or nix_dir / 'profile'
+
+    def guest_path(path):
+        if path.startswith('/nix/profile/'):
+            return profile / path.removeprefix('/nix/profile/')
+        if path.startswith('/nix/'):
+            return nix_dir / path.removeprefix('/nix/')
+        return Path(path)
 
     os.makedirs(output_dir, exist_ok=True)
     icons_dir = os.path.join(output_dir, 'icons')
@@ -205,7 +214,7 @@ def main():
             raise RuntimeError(f'Cannot convert built-in icon {asset}')
 
     # Scan for .desktop files
-    profile_apps = Path(store_dir).parent/'profile/share/applications'
+    profile_apps = profile/'share/applications'
     desktop_files = (glob.glob(str(profile_apps/'*.desktop')) if profile_apps.is_dir()
                      else glob.glob(os.path.join(store_dir, '*/share/applications/*.desktop')))
     print(f"Found {len(desktop_files)} .desktop files")
@@ -232,9 +241,7 @@ def main():
         if binary.startswith('/'):
             # Absolute path — check directly (relative to store root parent)
             # e.g. /nix/store/xxx/bin/vlc -> store_dir/../xxx/bin/vlc
-            store_parent = os.path.dirname(store_dir)  # parent of "store/"
-            abs_check = os.path.join(store_parent, binary.lstrip('/').replace('nix/', '', 1))
-            if os.path.isfile(abs_check):
+            if guest_path(binary).is_file():
                 binary_found = True
         else:
             # Bare command name — search all store packages' bin/ directories
@@ -272,8 +279,8 @@ def main():
         binary_name = Path(binary).name
         if binary_name in ('chromium', 'firefox', 'codium', 'vscodium', 'vlc'):
             wrapper = 'brook-' + ('codium' if binary_name == 'vscodium' else binary_name)
-            candidates = [(Path(store_dir).parent/'bin'/wrapper, '/nix/bin/'),
-                          (Path(store_dir).parent/'profile/bin'/wrapper, '/nix/profile/bin/')]
+            candidates = [(nix_dir/'bin'/wrapper, '/nix/bin/'),
+                          (profile/'bin'/wrapper, '/nix/profile/bin/')]
             deployed = next((prefix for path, prefix in candidates
                              if path.is_file() and os.access(path, os.X_OK)), None)
             if deployed:
@@ -281,6 +288,13 @@ def main():
                 exec_cmd = shlex.join([deployed + wrapper, *arguments])
                 if binary_name in ('firefox', 'codium', 'vscodium', 'vlc'):
                     exec_cmd = '--uid 1000 ' + exec_cmd
+
+        if hardware and binary in (binary_name, '/nix/profile/bin/' + binary_name):
+            hardware_names = ('mousepad', 'brook-settings', 'wayland-calc', 'brook-gallery')
+            if binary_name in hardware_names:
+                wrapper = '/nix/profile/bin/hardware-' + binary_name
+                if guest_path(wrapper).is_file():
+                    exec_cmd = wrapper
 
         if binary_name == 'brook-nautilus':
             exec_cmd = '--uid 1000 ' + exec_cmd

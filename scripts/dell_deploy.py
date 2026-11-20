@@ -4,11 +4,15 @@
 Refuses unless <pair>/qemu-check/verdict.json says passed=true for this exact kernel/initrd, and the
 build manifest is from a clean tree (override with --allow-dirty). Then runs
 hardware_update_device.py --activate --restart with the payload ID taken from the manifest.
+Use --profile-plan DIRECTORY for a matching signed stage plan and signature.
+For a combined rollback, provide the previous checked --pair and the original
+deployment's --rollback-profile receipt. Cache serving and on-device trust are
+provisioned independently of deployment.
 
 Usage (repo root, BROOK_ROOT set to the checkout holding the bridge session):
   python3 scripts/dell_deploy.py --session S --pair build/dell/pair-X --output build/dell/deploy-X
 """
-import argparse, hashlib, json, subprocess, sys
+import argparse, hashlib, json, subprocess, sys, uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,9 +22,63 @@ p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDes
 p.add_argument('--session', required=True); p.add_argument('--pair', type=Path, required=True)
 p.add_argument('--output', type=Path, required=True); p.add_argument('--allow-dirty', action='store_true')
 p.add_argument('--boot-timeout-s', type=int, default=240)
+p.add_argument('--profile-timeout-s', type=int, default=3600)
+profile = p.add_mutually_exclusive_group()
+profile.add_argument('--profile-plan', type=Path, metavar='DIRECTORY')
+profile.add_argument('--rollback-profile', type=Path, metavar='PROFILE_RECEIPT')
 a = p.parse_args()
 
-def sha(path): return hashlib.sha256(path.read_bytes()).hexdigest()
+def sha(path):
+    with path.open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
+def stage_profile():
+    sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools/vm_bridge')]
+    from hardware import Hardware
+    from hardware_bulk_workflow import BulkRun
+    from hardware_update_workflow import UpdateRun
+
+    bridge = Hardware()
+    journal = UpdateRun(bridge, a.output / 'profile')
+    journal.output.mkdir(mode=0o700, parents=True)
+    tx = uuid.uuid4().hex
+    guest = bridge.load_session(a.session)
+    action = 'apply' if a.profile_plan else 'rollback'
+    if a.rollback_profile:
+        original = json.loads(a.rollback_profile.read_text())
+        if original.get('action') != 'apply' or original.get('state') != 'profile_verified':
+            raise ValueError('Expected the verified apply receipt from the original deployment')
+        if original.get('endpoint') != [guest['host'], guest['port']]:
+            raise ValueError('Rollback receipt belongs to a different device endpoint')
+        tx = original['profile_transaction_id']
+    files = ([a.profile_plan / name for name in ('stage-plan.json', 'stage-plan.sig')]
+             if a.profile_plan else [])
+    job = uuid.uuid4().hex
+    journal.save(state='prepared', action=action, profile_transaction_id=tx,
+                 profile_job_id=job, session=a.session, guest_boot_id=guest['guest_boot_id'],
+                 endpoint=[guest['host'], guest['port']],
+                 pair_manifest_sha256=sha(a.pair / 'build-manifest.json'),
+                 profile_files={path.name: sha(path) for path in files})
+    arguments = ['/nix/bin/nix', 'stage-profile', action, tx]
+    try:
+        for source in files:
+            bulk = BulkRun(bridge, journal.output / source.name)
+            receipt = bulk.execute(a.session, KEY, 'put', source=source)
+            if receipt['transfer']['sha256'] != journal.receipt['profile_files'][source.name]:
+                raise ValueError(f'{source.name} changed during transfer')
+            arguments.append(receipt['transfer']['guest_path'])
+        journal.save(state='profile_job_dispatched')
+        bridge.guest_run(a.session, job, arguments, cwd='/tmp', uid=0, wait_s=2)
+        result = journal.wait_job(a.session, job, lambda status: status.get('state') == 'completed',
+                                  timeout=a.profile_timeout_s)
+        if result.get('exit', {}).get('code') != 0:
+            raise RuntimeError(f'Profile job failed: {result}')
+        journal.save(state='profile_verified', profile_job=result)
+    except Exception as error:
+        journal.save(state='needs_inspection', error=str(error))
+        raise
+    return journal
 manifest = json.loads((a.pair / 'build-manifest.json').read_text())
 verdict_path = a.pair / 'qemu-check' / 'verdict.json'
 if not verdict_path.exists(): sys.exit(f'refusing: no QEMU verdict at {verdict_path}')
@@ -31,11 +89,22 @@ for name, path in (('kernel_sha256', kernel), ('initrd_sha256', initrd)):
     if verdict.get(name) not in (None, sha(path)) or manifest.get(name) != sha(path):
         sys.exit(f'refusing: {name} does not match the checked/manifest pair')
 if manifest.get('dirty') and not a.allow_dirty: sys.exit('refusing: built from a dirty tree')
+stage = None
+kernel_output = a.output
+if a.profile_plan or a.rollback_profile:
+    try:
+        stage = stage_profile()
+    except (OSError, RuntimeError, ValueError) as error:
+        sys.exit(f'profile step failed: {error} (see {a.output / "profile/receipt.json"})')
+    kernel_output = a.output / 'kernel'
 cmd = [sys.executable, str(ROOT / 'scripts/hardware_update_device.py'), '--session', a.session, '--key-file', str(KEY),
-       '--kernel', str(kernel), '--initrd', str(initrd), '--output', str(a.output), '--activate', '--restart',
+       '--kernel', str(kernel), '--initrd', str(initrd), '--output', str(kernel_output), '--activate', '--restart',
        '--expected-payload-id', manifest['payload_id'], '--helper', 'system', '--boot-timeout-s', str(a.boot_timeout_s)]
 code = subprocess.call(cmd)
-receipt_path = a.output / 'receipt.json'
+receipt_path = kernel_output / 'receipt.json'
+if stage:
+    stage.save(kernel_receipt=str(receipt_path.resolve()),
+               combined_state='needs_inspection' if code else 'boot_verified')
 if code and receipt_path.exists():
     # Name the stage and the guest processes still blocking a restart rather
     # than leaving a bare needs_inspection for the caller to dig out.
