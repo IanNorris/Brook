@@ -83,7 +83,7 @@ def hash_tree(path, expected_size):
         nonlocal size
         size += len(data)
         if size > expected_size:
-            raise ValueError(f"NAR size exceeds the plan for {path}")
+            raise ValueError(f"canonical NAR exceeds the signed {expected_size}-byte size for {path}")
         digest.update(data)
 
     def length(n):
@@ -172,7 +172,7 @@ def read_narinfo(tool, cache, name, entry):
         fields.get("StorePath") != str(STORE / name)
         or nar_hash(fields["NarHash"]) != entry["narHash"]
         or int(fields["NarSize"]) != entry["narSize"]
-        or sorted(fields["References"].split()) != entry["references"]
+        or sorted(fields.get("References", "").split()) != entry["references"]
     ):
         raise ValueError(f"NAR metadata disagrees with the signed plan for {name}")
     url = fields["URL"]
@@ -229,10 +229,17 @@ def rename_no_replace(source, target):
         raise OSError(error, os.strerror(error), str(target))
 
 
+def verify_installed(path, entry):
+    try:
+        verify_tree(path, entry)
+    except (OSError, ValueError) as error:
+        raise ValueError(f"Existing store path failed verification: {error}") from error
+
+
 def ensure_path(store, name, entry, cache, tools):
     target = store / name
     if os.path.lexists(target):
-        verify_tree(target, entry)
+        verify_installed(target, entry)
         return "present"
     sources = [cache["brook"]]
     if entry["source"] == "upstream":
@@ -252,12 +259,15 @@ def ensure_path(store, name, entry, cache, tools):
         unpacked = scratch / "path"
         with archive.open("rb") as stream:
             subprocess.run([tools["nar-unpack"], unpacked], check=True, stdin=stream)
-        verify_tree(unpacked, entry)
+        try:
+            verify_tree(unpacked, entry)
+        except (OSError, ValueError) as error:
+            raise ValueError(f"Extracted store path failed verification for {name}: {error}") from error
         try:
             rename_no_replace(unpacked, target)
         except OSError as error:
             if error.errno != errno.EEXIST:
                 raise
-            verify_tree(target, entry)
+            verify_installed(target, entry)
             return "present"
         return "upstream" if source == UPSTREAM else "brook"
