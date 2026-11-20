@@ -2001,10 +2001,10 @@ static int slide_step(slide_ctx *ctx, int width, int i, const u8 scalar[32])
 static int ge_canonical_neg(const ge *point, const u8 encoding[32])
 {
 	u8 canonical[32];
-	static const fe zero = {0};
+	static const fe zero_field = {0};
 	ge_tobytes(canonical, point);
 	// The decoder deliberately negates X for the verification equation.
-	if (!fe_isequal(point->X, zero)) {
+	if (!fe_isequal(point->X, zero_field)) {
 		canonical[31] ^= 128;
 	}
 	return crypto_verify32(canonical, encoding) == 0;
