@@ -240,6 +240,9 @@ void crypto_eddsa_scalarbase(uint8_t point[32], const uint8_t scalar[32]);
 int crypto_eddsa_check_equation(const uint8_t signature[64],
                                 const uint8_t public_key[32],
                                 const uint8_t h_ram[32]);
+int crypto_eddsa_check_equation_strict(const uint8_t signature[64],
+                                      const uint8_t public_key[32],
+                                      const uint8_t h[32]);
 
 
 // Chacha20

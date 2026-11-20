@@ -80,7 +80,7 @@ class BridgeV3(unittest.TestCase):
         sig = bytes.fromhex("e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155"
                             "5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b")
         self.assertEqual(SigningKey(seed).sign(b"").signature, sig)
-        self.assertEqual(NATIVE.crypto_ed25519_check(sig, public, b"", 0), 0)
+        self.assertEqual(NATIVE.crypto_ed25519_check_strict(sig, public, b"", 0), 0)
         priv = bytes.fromhex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
         peer = bytes.fromhex("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f")
         expected = bytes.fromhex("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742")
@@ -88,6 +88,15 @@ class BridgeV3(unittest.TestCase):
         NATIVE.crypto_x25519(out, priv, peer)
         self.assertEqual(out.raw, expected)
         self.assertEqual(crypto_scalarmult(priv, peer), expected)
+
+        # RFC 5869 appendix A.1, compared through the 36-byte key/prefix extent.
+        key, prefix = wire._kdf(
+            bytes.fromhex("0b" * 22), bytes.fromhex("000102030405060708090a0b0c"),
+            bytes.fromhex("f0f1f2f3f4f5f6f7f8f9"),
+        )
+        expected = bytes.fromhex("3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208")
+        self.assertEqual(key + prefix, expected)
+
 
     def test_canonical_hello_and_transcript(self):
         client = self.client_hello()
@@ -176,6 +185,14 @@ class BridgeV3(unittest.TestCase):
                 thread.join(3)
             self.assertEqual(errors, [])
             self.assertFalse(thread.is_alive())
+
+    def test_partial_challenge_is_a_handshake_failure(self):
+        client, server = socket.socketpair()
+        with client, server:
+            server.sendall(wire.SERVER_MAGIC)
+            with self.assertRaisesRegex(wire.BridgeV3Error, "incomplete v3 server challenge"):
+                wire.open_bridge_v3(client, self.operator, wire.UPDATE, 1, self.boot, self.transaction,
+                                    deadline=time.monotonic() + 0.1)
 
     def test_private_file(self):
         with tempfile.TemporaryDirectory() as directory:

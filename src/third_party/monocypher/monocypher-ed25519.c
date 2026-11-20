@@ -480,6 +480,14 @@ int crypto_ed25519_check(const u8 signature[64], const u8 public_key[32],
 	return crypto_eddsa_check_equation(signature, public_key, h_ram);
 }
 
+int crypto_ed25519_check_strict(const u8 signature[64], const u8 public_key[32],
+                         const u8 *msg, size_t msg_size)
+{
+	u8 h_ram[32];
+	hash_reduce(h_ram, signature, 32, public_key, 32, msg, msg_size, 0, 0);
+	return crypto_eddsa_check_equation_strict(signature, public_key, h_ram);
+}
+
 static const u8 domain[34] = "SigEd25519 no Ed25519 collisions\1";
 
 void crypto_ed25519_ph_sign(uint8_t signature[64], const uint8_t secret_key[64],

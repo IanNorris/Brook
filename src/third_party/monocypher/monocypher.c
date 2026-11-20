@@ -1997,8 +1997,45 @@ static int slide_step(slide_ctx *ctx, int width, int i, const u8 scalar[32])
 #define B_W_WIDTH 5 // Affects the size of the binary
 #define P_W_SIZE  (1<<(P_W_WIDTH-2))
 
-int crypto_eddsa_check_equation(const u8 signature[64], const u8 public_key[32],
-                                const u8 h[32])
+// Brook requires canonical point encodings and prime-order operator keys.
+static int ge_canonical_neg(const ge *point, const u8 encoding[32])
+{
+	u8 canonical[32];
+	static const fe zero = {0};
+	ge_tobytes(canonical, point);
+	// The decoder deliberately negates X for the verification equation.
+	if (!fe_isequal(point->X, zero)) {
+		canonical[31] ^= 128;
+	}
+	return crypto_verify32(canonical, encoding) == 0;
+}
+
+static int ge_nonzero_prime_order(const ge *point)
+{
+	static const u8 identity[32] = {1};
+	u8 compressed[32];
+	ge_tobytes(compressed, point);
+	if (crypto_verify32(compressed, identity) == 0) {
+		return 0;
+	}
+	// All operands are public. [L]P must be the identity, so P has
+	// no component outside the prime-order subgroup.
+	ge_cached cached;
+	ge sum, tmp;
+	ge_cache(&cached, point);
+	ge_zero(&sum);
+	for (int bit = 252; bit >= 0; --bit) {
+		ge_double(&sum, &sum, &tmp);
+		if ((L[bit / 32] >> (bit % 32)) & 1) {
+			ge_add(&sum, &sum, &cached);
+		}
+	}
+	ge_tobytes(compressed, &sum);
+	return crypto_verify32(compressed, identity) == 0;
+}
+
+static int eddsa_check_equation(const u8 signature[64], const u8 public_key[32],
+                                const u8 h[32], int strict)
 {
 	ge minus_A; // -public_key
 	ge minus_R; // -first_half_of_signature
@@ -2015,6 +2052,12 @@ int crypto_eddsa_check_equation(const u8 signature[64], const u8 public_key[32],
 		    is_above_l(s32)) {
 			return -1;
 		}
+	}
+
+	if (strict && (!ge_canonical_neg(&minus_A, public_key) ||
+	               !ge_canonical_neg(&minus_R, signature) ||
+	               !ge_nonzero_prime_order(&minus_A))) {
+		return -1;
 	}
 
 	// look-up table for minus_A
@@ -2057,11 +2100,25 @@ int crypto_eddsa_check_equation(const u8 signature[64], const u8 public_key[32],
 	static const u8 zero_point[32] = {1}; // Point of order 1
 	ge_cache(&cached, &minus_R);
 	ge_add(sum, sum, &cached);
-	ge_double(sum, sum, &minus_R); // reuse minus_R as temporary
-	ge_double(sum, sum, &minus_R); // reuse minus_R as temporary
-	ge_double(sum, sum, &minus_R); // reuse minus_R as temporary
+	if (!strict) {
+		ge_double(sum, sum, &minus_R); // reuse minus_R as temporary
+		ge_double(sum, sum, &minus_R);
+		ge_double(sum, sum, &minus_R);
+	}
 	ge_tobytes(check, sum);
 	return crypto_verify32(check, zero_point);
+}
+
+int crypto_eddsa_check_equation(const u8 signature[64], const u8 public_key[32],
+                                const u8 h[32])
+{
+	return eddsa_check_equation(signature, public_key, h, 0);
+}
+
+int crypto_eddsa_check_equation_strict(const u8 signature[64], const u8 public_key[32],
+                                      const u8 h[32])
+{
+	return eddsa_check_equation(signature, public_key, h, 1);
 }
 
 // 5-bit signed comb in cached format (Niels coordinates, Z=1)

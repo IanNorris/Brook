@@ -127,7 +127,7 @@ int BrookBridgeV3Verify(const uint8_t proof[64], const uint8_t public_key[32],
     BrookBridgeV3OperatorId(operator_id, public_key);
     if (!BrookUpdateEqual(operator_id, client + 48, 32)) return 0;
     ProofInput(input, client, server);
-    return crypto_ed25519_check(proof, public_key, input, sizeof input) == 0;
+    return crypto_ed25519_check_strict(proof, public_key, input, sizeof input) == 0;
 }
 
 // RFC 2104 over Brook's existing SHA-256. HKDF uses fixed 32-byte keys.

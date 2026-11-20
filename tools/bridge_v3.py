@@ -191,12 +191,14 @@ def _remaining(deadline: float) -> float:
 def _receive(sock: socket.socket, count: int, deadline: float, *, challenge: bool = False) -> bytes:
     data = bytearray()
     while len(data) < count:
-        sock.settimeout(_remaining(deadline))
         try:
+            sock.settimeout(_remaining(deadline))
             fragment = sock.recv(count - len(data))
         except TimeoutError as exc:
-            if challenge and not data:
-                raise BridgeV3NoChallenge("v3 server challenge timed out") from exc
+            if challenge:
+                if not data:
+                    raise BridgeV3NoChallenge("v3 server challenge timed out") from exc
+                raise BridgeV3Error("incomplete v3 server challenge") from exc
             raise
         if not fragment:
             if challenge and not data:
