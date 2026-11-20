@@ -121,10 +121,13 @@ void ChromeBuildVolumeGlyph(ChromeDisplayList& dl, const ChromeStyle& s, int x0,
 // (one dock at a time), from the top of the screen to the taskbar: the strip
 // of entries across its top, the selected entry's window (the page) below it.
 // Closed, a dock with entries shows only the edge tab. The inner edge is a
-// resize grip, Grip wide, centred on the edge.
+// resize grip (GripInside + GripOutside wide).
 struct ChromeDockMetrics {
     static constexpr int Width = 420, MinWidth = 360, MaxWidth = 720, Strip = 48, Cell = 42, Pin = 38, TileButton = 32;
-    static constexpr int Icon = 24, Tab = 5, TabHeight = 120, Grip = 12;
+    // The grip straddles the inner edge unevenly: GripInside px over the
+    // page (whose own edge, often a scrollbar, keeps the rest), GripOutside
+    // px over the desktop.
+    static constexpr int Icon = 24, Tab = 5, TabHeight = 120, GripInside = 6, GripOutside = 12;
     // Drag to dock: with the dock shut, the last DropEdge px of its screen
     // edge is the target, shown as a DropChipW x DropChipH chip on the edge.
     static constexpr int DropEdge = 28, DropChipW = 168, DropChipH = 44;

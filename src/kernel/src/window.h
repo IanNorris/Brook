@@ -577,6 +577,8 @@ void WmDockSetWidth(int width);
 // The sidebar's inner-edge grip, pressed in WmDockPress: motion while the
 // button is held resizes the page; the release settles and saves the width.
 bool WmDockDragActive();
+// The open sidebar's resize grip is under the point (the resize cursor).
+bool WmDockGripAt(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH);
 // Drag to dock, from the compositor's window move: each motion updates the
 // drop target (feedback in the dock surface); the release docks the window
 // if it is over the target, its return position being where the move began.

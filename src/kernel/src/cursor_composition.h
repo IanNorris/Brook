@@ -1,6 +1,7 @@
 #pragma once
 #include <stdint.h>
 #include "../../shared/brook_theme.h"
+#include "cursor_shapes.h"
 
 namespace brook {
 constexpr uint32_t CursorCapacity = 64;
@@ -17,6 +18,38 @@ inline bool CursorPixelsHaveAlpha(const uint32_t* pixels, uint32_t width, uint32
             if (pixels[row * CursorCapacity + col] >> 24)
                 return true;
     return false;
+}
+
+// Built-in shapes the compositor shows away from client areas: the arrow,
+// and the resize arrows over WM frame edges and the side dock's grip.
+enum class CursorShape : uint8_t { Arrow, ResizeH, ResizeV, ResizeNwse, ResizeNesw };
+
+// The shape for resize edges (chrome_layout.h ChromeEdge* bits: 1 left,
+// 2 top, 4 right, 8 bottom).
+inline constexpr CursorShape CursorShapeForEdges(uint8_t edges)
+{
+    const bool l = edges & 1, t = edges & 2, r = edges & 4, b = edges & 8;
+    if ((l || r) && (t || b)) return (l && t) || (r && b) ? CursorShape::ResizeNwse : CursorShape::ResizeNesw;
+    if (l || r) return CursorShape::ResizeH;
+    if (t || b) return CursorShape::ResizeV;
+    return CursorShape::Arrow;
+}
+
+// Fill a resize shape (not the arrow, which has its own bitmap). False for Arrow.
+inline bool CursorFillShape(CursorShape shape, CursorImage& image)
+{
+    const char* const* rows = shape == CursorShape::ResizeH ? CursorBitmapResizeH :
+                              shape == CursorShape::ResizeV ? CursorBitmapResizeV :
+                              shape == CursorShape::ResizeNwse ? CursorBitmapResizeNwse :
+                              shape == CursorShape::ResizeNesw ? CursorBitmapResizeNesw : nullptr;
+    if (!rows) return false;
+    image.width = image.height = CursorShapeSize;
+    image.hotX = image.hotY = static_cast<int32_t>(CursorShapeSize / 2);
+    for (uint32_t i = 0; i < CursorCapacity * CursorCapacity; ++i) image.pixels[i] = 0;
+    for (uint32_t y = 0; y < CursorShapeSize; ++y)
+        for (uint32_t x = 0; x < CursorShapeSize; ++x)
+            image.pixels[y * CursorCapacity + x] = rows[y][x] == 'o' ? 0xffffffffu : rows[y][x] == '#' ? 0xff000000u : 0;
+    return true;
 }
 
 // Whether a client cursor image is shown. It belongs to the window it was

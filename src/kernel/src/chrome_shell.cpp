@@ -615,9 +615,11 @@ ChromeDockLayout ChromeDockLayoutFor(const DesktopMetrics& m, uint32_t screenW, 
     l.open = true;
     l.strip = {l.sidebar.x, l.sidebar.y, l.sidebar.w, stripH};
     l.page = {l.sidebar.x, l.sidebar.y + stripH, l.sidebar.w, l.sidebar.h - stripH};
-    // The resize grip straddles the inner edge, the full height of the sidebar.
-    const int grip = m.pixels(DM::Grip), inner = place.right ? l.sidebar.x : l.sidebar.x + l.sidebar.w;
-    l.grip = {inner - grip / 2, l.sidebar.y, grip, l.sidebar.h};
+    // The resize grip straddles the inner edge, the full height of the
+    // sidebar, mostly outside it.
+    const int gin = m.pixels(DM::GripInside), gout = m.pixels(DM::GripOutside);
+    const int inner = place.right ? l.sidebar.x : l.sidebar.x + l.sidebar.w;
+    l.grip = {place.right ? inner - gout : inner - gin, l.sidebar.y, gin + gout, l.sidebar.h};
     const int pinW = m.pixels(DM::Pin), cell = m.pixels(DM::Cell), button = m.pixels(DM::TileButton);
     l.pin = {l.strip.x + l.strip.w - pinW, l.strip.y, pinW, stripH};
     l.side = {l.pin.x - pinW, l.strip.y, pinW, stripH};

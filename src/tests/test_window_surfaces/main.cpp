@@ -1048,7 +1048,7 @@ int main() {
         WmMoveWindow(floating,int16_t(sideW),80);
         {
             const auto l=ChromeDockLayoutFor(WmDesktopMetrics(),sw,uint32_t(desktopH),2,1,true,{0,true});
-            CHECK(l.right && l.sidebar.x==int(sw)-sideW && l.grip.x==l.sidebar.x-l.grip.w/2);
+            CHECK(l.right && l.sidebar.x==int(sw)-sideW && l.grip.x==l.sidebar.x-int(WmMetric(ChromeDockMetrics::GripOutside)));
             // The strip's side button moves it back.
             CHECK(WmDockPress(l.side.x+2,l.side.y+2,sw,sh) && !WmDockRight());
         }
@@ -1232,7 +1232,7 @@ int main() {
         CHECK(l.open && l.count==4 && l.selected==2 && l.strip.w==420 && l.strip.h==48 && l.page.y==48 && l.page.h==804);
         CHECK(l.cells[0].x==0 && l.cells[0].w==42 && l.cells[1].x==42 && l.tile.x==84);
         CHECK(l.pin.x==382 && l.pin.w==38 && l.side.x==344 && l.tile.w==420-2*38-3*42 && l.cells[3].x==l.tile.x+l.tile.w);
-        CHECK(l.grip.x==414 && l.grip.w==12 && l.grip.h==852 && !l.right);
+        CHECK(l.grip.x==414 && l.grip.w==18 && l.grip.h==852 && !l.right);
         CHECK(l.close.x+l.close.w==l.tile.x+l.tile.w && l.back.x+l.back.w==l.close.x && l.title.x==l.tile.x+42);
         auto hit=[&](int x,int y){return ChromeDockHitTest(l,x,y);};
         CHECK(hit(5,5).target==ChromeDockTarget::Entry && hit(5,5).index==0);
@@ -1241,11 +1241,11 @@ int main() {
         CHECK(hit(l.back.x+1,1).target==ChromeDockTarget::Return && hit(l.close.x+1,47).target==ChromeDockTarget::Close);
         CHECK(hit(l.pin.x+2,47).target==ChromeDockTarget::Pin && hit(5,48).target==ChromeDockTarget::None);
         CHECK(hit(l.side.x+2,4).target==ChromeDockTarget::Side);
-        CHECK(hit(419,47).target==ChromeDockTarget::Grip && hit(425,400).target==ChromeDockTarget::Grip);
-        CHECK(hit(426,400).target==ChromeDockTarget::None);
+        CHECK(hit(419,47).target==ChromeDockTarget::Grip && hit(431,400).target==ChromeDockTarget::Grip);
+        CHECK(hit(432,400).target==ChromeDockTarget::None && hit(413,400).target==ChromeDockTarget::None);
         // The right edge mirrors the sidebar, the grip and the tab.
         const auto r=ChromeDockLayoutFor(m,1600,852,4,2,true,{0,true});
-        CHECK(r.right && r.sidebar.x==1180 && r.strip.x==1180 && r.page.x==1180 && r.grip.x==1174);
+        CHECK(r.right && r.sidebar.x==1180 && r.strip.x==1180 && r.page.x==1180 && r.grip.x==1168 && r.grip.w==18);
         CHECK(r.pin.x==1600-38 && r.cells[0].x==1180);
         const auto rc=ChromeDockLayoutFor(m,1600,852,3,1,false,{0,true});
         CHECK(rc.tab.x==1595 && rc.grip.w==0);
@@ -1257,7 +1257,7 @@ int main() {
         CHECK(ChromeDockWidthFor(DesktopMetric150,2400,540)==360 && ChromeDockWidthFor(m,1600,10)==360);
         // At 200% everything scales; the sidebar never exceeds half the screen.
         const auto big=ChromeDockLayoutFor(DesktopMetric200,3200,1704,1,0,true);
-        CHECK(big.strip.w==840 && big.strip.h==96 && big.tile.w==840-2*76 && big.grip.w==24);
+        CHECK(big.strip.w==840 && big.strip.h==96 && big.tile.w==840-2*76 && big.grip.w==36);
         CHECK(ChromeDockSidebar(m,600,500).w==300);
         // Many entries: the tile keeps an icon cell and both buttons.
         const auto many=ChromeDockLayoutFor(m,1600,852,20,15,true);
