@@ -162,7 +162,7 @@ def verify(candidate, source, reference, build, expected_kernel, expected_source
                 raise ValueError('Unexpected Clearwater executable ' + name)
         update_files = {}
         for name, digest in expected_update_helpers:
-            if name not in ('HWUPDATE.ELF', 'HWUPSYS.ELF', 'HWBULK.ELF', 'HWBULKZ.ELF', 'HWSTORE.ELF') or name in update_files:
+            if name not in ('HWUPDATE.ELF', 'HWUPSYS.ELF', 'HWBULK.ELF', 'HWBULKZ.ELF', 'HWSTORE.ELF', 'HWSTAGE.ELF') or name in update_files:
                 raise ValueError('Unexpected or duplicate update helper ' + name)
             content = optional(live, 'BOOT/' + name)
             if (content is None or not re.fullmatch('[0-9a-f]{64}', digest)
@@ -174,7 +174,7 @@ def verify(candidate, source, reference, build, expected_kernel, expected_source
             if bridge_policy is None or sha(bridge_policy) != expected_bridge_policy:
                 raise ValueError('Bridge operator policy mismatch')
             validate_operator_policy(bridge_policy)
-            if set(update_files) != {'HWUPDATE.ELF', 'HWUPSYS.ELF', 'HWBULK.ELF', 'HWBULKZ.ELF', 'HWSTORE.ELF'}:
+            if set(update_files) != {'HWUPDATE.ELF', 'HWUPSYS.ELF', 'HWBULK.ELF', 'HWBULKZ.ELF', 'HWSTORE.ELF', 'HWSTAGE.ELF'}:
                 raise ValueError('Bridge v3 requires hashes for all shipped receivers')
         elif bridge_policy is not None:
             raise ValueError('Unexpected bridge operator policy')

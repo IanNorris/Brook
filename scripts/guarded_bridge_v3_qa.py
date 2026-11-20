@@ -4,19 +4,21 @@ import hashlib
 import json
 from pathlib import Path
 import socket
+import struct
 import subprocess
 import sys
 import time
 from unittest.mock import patch
+import uuid
 import zlib
 
 from bridge_keyless_image import require_keyless_image
 from bridge_operator_policy import validate_operator_policy
 
 ROOT = Path(__file__).resolve().parents[1]
-HELPERS = ("HWBULK.ELF", "HWBULKZ.ELF")
+HELPERS = ("HWBULK.ELF", "HWBULKZ.ELF", "HWUPDATE.ELF", "HWUPSYS.ELF", "HWSTORE.ELF", "HWSTAGE.ELF")
 CHUNK_BYTES = 65536
-PASS_MARKER = "GUARDED_BRIDGE_V3_COMMAND_BULK_PASS"
+PASS_MARKER = "GUARDED_BRIDGE_V3_RECEIVERS_PASS"
 
 
 def digest(path):
@@ -64,12 +66,55 @@ def refuse_plaintext(port):
             raise RuntimeError("Guarded v3 listener replied to a plaintext non-caps command")
 
 
-def run(output, registry, command_port, bulk_port, seed, expected):
+def check_maintenance_receiver(bridge, output, session, boot_id, port, seed, store):
+    from binary_bridge import binary_stream, finish_request, require_response_end
+    from bridge_v3 import STORE, UPDATE, read_operator_key
+    from hardware_update_protocol import line
+    from hardware_update_workflow import UpdateRun
+
+    # The ordinary 128 MiB guarded disk has no preallocated A/B payload slots
+    # or mounted USB. Prove that the packaged production receiver authenticates,
+    # processes the request and returns the exact encrypted destination refusal.
+    role = "store" if store else "update"
+    helper = "/boot/HWSTORE.ELF" if store else "/boot/HWUPSYS.ELF"
+    tx = uuid.uuid4().hex
+    args = [helper, boot_id, tx]
+    if not store:
+        args.append("--require-slot-aware")
+    bridge.guest_run(session, tx, args, cwd="/tmp", uid=0, wait_s=2)
+    run = UpdateRun(bridge, output)
+    marker = "HWSTORE_LISTENING" if store else "HWUPDATE_LISTENING"
+    run.wait_job(session, tx, lambda row: marker in row.get("stdout", {}).get("text", ""))
+    with socket.create_connection(("127.0.0.1", port), timeout=20) as sock:
+        stream, reserved = binary_stream(sock, read_operator_key(seed), STORE if store else UPDATE,
+                                         1, boot_id, tx)
+        magic = b"BRSTORE1" if store else b"BRUPLOAD"
+        stream.sendall(magic + reserved + boot_id.encode() + tx.encode())
+        expected = {"state": "failed", "code": 23, "published": False} if store else {"state": "failed", "code": 11}
+        if store:
+            if line(stream) != {"state": "ready", "store_api": 1}:
+                raise RuntimeError("Unexpected v3 store readiness")
+            plan = b"BRKSTORE1 16777216 01234567-89ab-cdef-0123-456789abcdef"
+            stream.sendall(struct.pack("<I", len(plan)) + bytes(32) + plan + b"BEGIN001")
+        finish_request(stream)
+        reply = line(stream)
+        require_response_end(stream)
+    job = run.wait_job(session, tx, lambda row: row.get("state") == "completed")
+    unchanged = "image_created=0" if store else "storage_modified=0"
+    if (reply != expected or job.get("exit", {}).get("code") != expected["code"] or
+            unchanged not in job.get("stderr", {}).get("text", "")):
+        raise RuntimeError(f"Unexpected v3 {role} destination result: {reply}")
+    return {"helper": helper, "authenticated_end": True, "safe_destination_refusal": reply["code"]}
+
+
+def run(output, registry, ports, seed, expected):
+    command_port, bulk_port, update_port, store_port = ports
     sys.path.insert(0, str(ROOT / "tools/vm_bridge"))
     from guest_transport import exchange
     from hardware import Hardware
     from hardware_bulk_workflow import BulkRun
     from hardware_update_workflow import verify_v3_boot
+    from bridge_v3 import read_operator_key
 
     bridge = Hardware(registry)
     deadline = time.monotonic() + 15
@@ -126,7 +171,14 @@ def run(output, registry, command_port, bulk_port, seed, expected):
     if digest(Path(download["artifact_path"])) != expected_sha:
         raise RuntimeError("The bulk round-trip changed the bytes")
 
+    update = check_maintenance_receiver(bridge, output, session, attachment["guest_boot_id"],
+                                        update_port, seed, False)
+    store = check_maintenance_receiver(bridge, output, session, attachment["guest_boot_id"],
+                                       store_port, seed, True)
     evidence = {
+        "operator_public_key": bytes(read_operator_key(seed).verify_key).hex(),
+        "policy_sha256": expected["policy_sha256"],
+        "receivers": {"command": True, "bulk": True, "update": update, "store": store},
         "boot_id": attachment["guest_boot_id"],
         "measurements": measurements,
         "package_kernel_sha256": expected["kernel_sha256"],

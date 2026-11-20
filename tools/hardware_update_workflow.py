@@ -34,9 +34,10 @@ def verify_v3_boot(caps, expected, kernel_sha, initrd_sha):
     kernel_digest=caps.get('kernel_sha256')
     if kernel_digest is not None and kernel_digest!=kernel_sha:
         raise RuntimeError('v3 running kernel digest differs from the checked pair')
-    return {name:caps.get(name) for name in
-            ('build_id','operator_policy_sha256','kernel_sha256','kernel_sha256_source',
-             'initrd_sha256','initrd_sha256_source')}
+    measurements = {name:caps.get(name) for name in
+                    ('build_id','operator_policy_sha256','kernel_sha256','kernel_sha256_source',
+                     'initrd_sha256','initrd_sha256_source')}
+    return {**measurements, 'evidence_origin':'unauthenticated_device_self_report'}
 
 
 class UpdateRun:

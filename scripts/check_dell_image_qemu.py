@@ -44,7 +44,7 @@ What it does not exercise: the Intel GPU, Vulkan supervisor, renderer and Waylan
 replaced by a synthetic static service, so the real boot-service binaries are never run), the Dell
 USB network, real ACPI/EC, firmware reset behaviour, the physical SSD and the physical-identity loader.
 It checks the guarded boot, recovery, reset and startup-script path for this kernel and initrd.
-With --bridge-v3-qa, the guarded desktop also runs an authenticated command and
+With --bridge-v3-qa, the guarded desktop also runs authenticated commands and
 the packaged bulk helpers on loopback-only QEMU forwards, using a synthetic operator.
 """
 import argparse, gzip, hashlib, json, os, re, shutil, subprocess, sys, time
@@ -252,7 +252,7 @@ def main():
             passed = result.returncode == 0 and PASS_MARKER in lines
             bridge_checked = a.bridge_v3_qa and BRIDGE_V3_PASS_MARKER in lines and (run_dir / 'bridge-v3-qa.json').is_file()
             if a.bridge_v3_qa and passed and not bridge_checked:
-                lines.append('Guarded v3 boot did not verify the packaged command and bulk receivers')
+                lines.append('Guarded v3 boot did not verify all four packaged receiver protocols')
                 passed = False
             clearwater_ready = False
             if expect_clearwater and passed:
@@ -273,6 +273,7 @@ def main():
                 entry['clearwater_shell_ready'] = clearwater_ready
             if bridge_checked:
                 entry['bridge_v3_evidence'] = 'bridge-v3-qa.json'
+                entry['bridge_v3_evidence_sha256'] = sha(run_dir / 'bridge-v3-qa.json')
             if not passed:
                 entry['log_tail'] = [x[:4000] for x in lines[-12:]]
                 entry['firmware_stall'] = firmware_stall

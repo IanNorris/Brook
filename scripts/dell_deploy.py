@@ -137,7 +137,7 @@ def main():
     if manifest.get('bridge_v3') is not None:
         sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools/vm_bridge')]
         from bridge_v3 import read_operator_key
-        from bridge_operator_policy import validate_operator_policy
+        from bridge_operator_policy import validate_operator_policy, verify_receiver_evidence
         from hardware import Hardware
 
         if (verdict.get('kernel_sha256'), verdict.get('initrd_sha256')) != (sha(kernel), sha(initrd)):
@@ -160,6 +160,7 @@ def main():
                     verified.get('initrd_sha256') != sha(initrd) or
                     bytes(key.verify_key) not in validate_operator_policy(policy)):
                 raise ValueError('The checked image policy does not admit the selected operator key')
+            verify_receiver_evidence(verdict_path, verdict, manifest, bytes(key.verify_key))
             build_id = manifest['build_id']
         except (KeyError, OSError, ValueError, subprocess.SubprocessError) as error:
             sys.exit(f'refusing v3 cutover: {error}')

@@ -273,6 +273,7 @@ def main():
     helper('HWUPSYS.ELF', cc, ['-DBROOK_UPDATE_SYSTEM'], ['tools/hardware_update.c'])
     if operator_input is not None:
         zlib_flags, zlib_archive = bridge_compression()
+        helper('HWSTAGE.ELF', cc, ['-DBROOK_BULK_INSTALL_MEDIA'], ['tools/hardware_bulk.c'])
         helper('HWBULKZ.ELF', cc, zlib_flags, ['tools/hardware_bulk.c'], [zlib_archive])
         helper('HWSTORE.ELF', cxx, ['-std=c++17', '-Wno-misleading-indentation'],
                ['tools/hardware_store_receiver.cpp', 'tools/hardware_store_transaction.cpp',

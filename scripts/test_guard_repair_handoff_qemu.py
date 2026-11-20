@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Exercise automatic repair, reset and guarded desktop on a disposable QEMU disk."""
+from contextlib import ExitStack
 import argparse
 import hashlib
 import os
@@ -305,6 +306,8 @@ def main():
                               (normal,'::/INITRD.IMG'))
         for src,target in boot_payloads:
             subprocess.run(['mcopy','-o','-i',media,str(src),target],check=True)
+        if a.bridge_v3_qa:
+            subprocess.run(['mmd','-i',media,'::/UPDATES'],check=True)
         partition=work/'data.img'
         with disk.open('rb') as f:f.seek(133120*512+1024+104);fs_uuid=uuid.UUID(bytes=f.read(16))
         with partition.open('wb') as f:f.truncate(126976*512)
@@ -700,14 +703,18 @@ def main():
                     if (second/name).exists():shutil.copyfile(second/name,a.output/('bridge-local-'+name))
         elif a.bridge_v3_qa:
             from guarded_bridge_v3_qa import run as run_bridge_qa
-            with socket.socket() as debug_listener, socket.socket() as bulk_listener:
-                debug_listener.bind(('127.0.0.1',0));network_port=debug_listener.getsockname()[1]
-                bulk_listener.bind(('127.0.0.1',0));bulk_port=bulk_listener.getsockname()[1]
+            with ExitStack() as stack:
+                ports=[]
+                for _ in range(4):
+                    listener=stack.enter_context(socket.socket())
+                    listener.bind(('127.0.0.1',0))
+                    ports.append(listener.getsockname()[1])
+            network_port,bulk_port,update_port,store_port=ports
             try:
                 boot(disk,a.firmware,second,False,'GUARD_DESKTOP_HANDOFF_SCRIPT status=0',120,True,
                      sata_snapshot=False,sata_serial='BROOK-RECOVERY-QA',failure_marker='GUARD_DESKTOP_HANDOFF_FAILED',
-                     network_port=network_port,bulk_port=bulk_port,
-                     on_marker=lambda:run_bridge_qa(a.output,work/'v3-registry',network_port,bulk_port,
+                     network_port=network_port,bulk_port=bulk_port,update_port=update_port,store_port=store_port,
+                     on_marker=lambda:run_bridge_qa(a.output,work/'v3-registry',ports,
                                                     a.bridge_v3_qa,bridge_expected))
             finally:
                 for name in ('serial.log','qemu.log'):
