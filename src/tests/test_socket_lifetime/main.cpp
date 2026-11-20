@@ -2211,7 +2211,7 @@ int main() {
          const auto corrupt=g_netCounters.udpRxCorrupt;uint8_t out[16];
          assert(SockRecvFrom(u,out,sizeof(out),nullptr)==-11 && q.rxCount==0 && g_netCounters.udpRxCorrupt==corrupt+1);}
         int l=create();listenPort(l, 1234, 2);
-        auto syn=[&](uint16_t port){Ipv4Header ip{};ip.srcIp=2;ip.dstIp=1;TcpHeader t{};
+        auto syn=[&](uint16_t port){Ipv4Header ip{};ip.srcIp=2+(port-40000);ip.dstIp=1;TcpHeader t{};
             t.srcPort=htons(port);t.dstPort=htons(1234);t.seqNum=htonl(70);t.flags=TCP_SYN;
             t.window=htons(1000);t.dataOff=5<<4;HandleTcp(&ip,&t,sizeof(t));};
         syn(40000);syn(40001);assert(g_sockets[l].acceptQueueCount==2);
