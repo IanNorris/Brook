@@ -2983,10 +2983,11 @@ int SchedulerAttachSeccomp(Process* process, SeccompFilter* filter, bool synchro
     filter->pathInstructions = cost;
     filter->previous = previous;
     SeccompRetain(previous);
+    const bool inheritNoNewPrivs = ProcessGetNoNewPrivs(process);
     auto publish = [&](Process* peer) {
         // The replaced head is now pinned as an ancestor of the new stack.
         // This is also why dropping it here never reclaims under the lock.
-        ProcessSetNoNewPrivs(peer);
+        if (inheritNoNewPrivs) ProcessSetNoNewPrivs(peer);
         SeccompRetain(filter);
         auto* replaced = __atomic_exchange_n(&peer->seccompFilter, filter, __ATOMIC_ACQ_REL);
         SeccompRelease(replaced);

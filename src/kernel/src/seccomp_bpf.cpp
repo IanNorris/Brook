@@ -132,17 +132,24 @@ bool SeccompSupportedAction(uint32_t action)
 {
     switch (action) {
     case SeccompKillProcess: case SeccompKillThread: case SeccompTrap:
-    case SeccompErrno: case SeccompAllow: return true;
+    case SeccompErrno: case SeccompTrace: case SeccompLog: case SeccompAllow: return true;
     default: return false;
     }
 }
 
 uint32_t SeccompSelectAction(uint32_t previous, uint32_t candidate)
 {
-    if (!SeccompSupportedAction(candidate & SeccompActionMask)) return SeccompKillProcess;
     // Linux action ordering is signed, so KILL_PROCESS compares lowest. The
     // newest filter wins the data when the actions have equal precedence.
     return static_cast<int32_t>(candidate & SeccompActionMask) <
         static_cast<int32_t>(previous & SeccompActionMask) ? candidate : previous;
 }
+uint32_t SeccompEnforceAction(uint32_t verdict)
+{
+    const uint32_t action = verdict & SeccompActionMask;
+    // A notifying filter gets Linux's no-listener result. Availability probes
+    // still reject USER_NOTIF until Brook can create a listener.
+    return SeccompSupportedAction(action) || action == SeccompUserNotify ? verdict : SeccompKillProcess;
+}
+
 }

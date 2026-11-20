@@ -89,6 +89,28 @@ static void synchronized(void)
     fprintf(stderr, "SECCOMP_TSYNC_PASS\n");
 }
 
+static void privileged_tsync(void)
+{
+    CHECK(geteuid() == 0);
+    CHECK(prctl(PR_GET_NO_NEW_PRIVS, 0L, 0L, 0L, 0L) == 0);
+    pthread_t thread;
+    CHECK(pthread_create(&thread, NULL, worker, NULL) == 0);
+    while (atomic_load(&state) != 1) sched_yield();
+    struct sock_filter policy[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_getppid, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOTTY),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    CHECK(install(policy, 4, SECCOMP_FILTER_FLAG_TSYNC) == 0);
+    CHECK(prctl(PR_GET_NO_NEW_PRIVS, 0L, 0L, 0L, 0L) == 0);
+    CHECK(blocked(SYS_getppid, 0, ENOTTY));
+    atomic_store(&state, 2);
+    CHECK(pthread_join(thread, NULL) == 0);
+    CHECK(atomic_load(&workerResult) == 1 && atomic_load(&workerNnp) == 0);
+    fprintf(stderr, "SECCOMP_PRIVILEGED_TSYNC_PASS\n");
+}
+
 static void conflicting(void)
 {
     pthread_t thread;
@@ -131,6 +153,45 @@ static void expect_kill(uint32_t action)
     CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGSYS);
 }
 
+static void reviewed_actions(void)
+{
+    uint32_t action = SECCOMP_RET_LOG;
+    CHECK(syscall(SYS_seccomp, SECCOMP_GET_ACTION_AVAIL, 0, &action) == 0);
+    action = SECCOMP_RET_TRACE;
+    CHECK(syscall(SYS_seccomp, SECCOMP_GET_ACTION_AVAIL, 0, &action) == 0);
+    action = SECCOMP_RET_USER_NOTIF;
+    CHECK(syscall(SYS_seccomp, SECCOMP_GET_ACTION_AVAIL, 0, &action) == -1 &&
+          errno == EOPNOTSUPP);
+    struct sock_filter policy[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_gettid, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_LOG),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_getppid, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE | 12),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_getsid, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    CHECK(install(policy, 8, 1u << 31) == -1 && errno == EINVAL);
+    CHECK(install(policy, 8, SECCOMP_FILTER_FLAG_NEW_LISTENER) == -1 && errno == EINVAL);
+    CHECK(install(policy, 8, SECCOMP_FILTER_FLAG_SPEC_ALLOW | SECCOMP_FILTER_FLAG_LOG) == 0);
+    CHECK(syscall(SYS_gettid) > 0);
+    usleep(150000);
+    CHECK(blocked(SYS_getppid, 0, ENOSYS));
+    CHECK(blocked(SYS_getsid, 0, ENOSYS));
+
+    struct sock_filter unknown[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_getppid, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, 0x7ffe0000),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    CHECK(install(unknown, 4, 0) == 0);
+    CHECK(blocked(SYS_getppid, 0, ENOSYS)); // The older TRACE outranks the unknown value.
+    expect_kill(0x7ffe0000);                // The same unknown value kills when it wins.
+    fprintf(stderr, "SECCOMP_REVIEW_ACTIONS_PASS\n");
+}
+
 static scmp_filter_ctx fixture_policy(void)
 {
     scmp_filter_ctx policy = seccomp_init(SCMP_ACT_ALLOW);
@@ -169,6 +230,15 @@ int main(int argc, char **argv)
     }
     if (argc == 2 && strcmp(argv[1], "--tsync") == 0) {
         synchronized();
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--privileged") == 0) {
+        privileged_tsync();
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--review-actions") == 0) {
+        CHECK(prctl(PR_SET_NO_NEW_PRIVS, 1L, 0L, 0L, 0L) == 0);
+        reviewed_actions();
         return 0;
     }
     if (argc == 2 && strcmp(argv[1], "--conflict") == 0) {

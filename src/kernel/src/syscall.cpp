@@ -673,8 +673,11 @@ static int64_t SyscallDispatchBody(uint64_t num, uint64_t a0, uint64_t a1,
         if (const auto* filter = SeccompLoad(proc)) {
             const SeccompData data{static_cast<uint32_t>(num), SeccompX86_64,
                                    proc->syscallUserRip, {a0, a1, a2, a3, a4, a5}};
-            const uint32_t verdict = SeccompEvaluate(filter, data);
-            if ((verdict & SeccompActionMask) != SeccompAllow)
+            bool audit = false;
+            const uint32_t verdict = SeccompEvaluate(filter, data, &audit);
+            if (audit) SeccompAudit(proc, num, verdict);
+            const uint32_t action = verdict & SeccompActionMask;
+            if (action != SeccompAllow && action != SeccompLog)
                 return timing.Result(SeccompDenied(proc, num, verdict));
         }
     }

@@ -1,4 +1,7 @@
 #include "seccomp.h"
+#include "apic.h"
+#include "klog.h"
+#include "process_user_namespace.h"
 #include "syscall_internal.h"
 #include "user_copy.h"
 
@@ -7,6 +10,10 @@ namespace {
 constexpr uint64_t SetModeFilter = 1;
 constexpr uint64_t GetActionAvailable = 2;
 constexpr uint64_t ThreadSync = 1;
+constexpr uint64_t FilterLog = 2;
+// There is no seccomp-specific speculation toggle on Brook. Allow programs
+// to request the same opt-out accepted on Linux with a no-op arch hook.
+constexpr uint64_t SpecAllow = 4;
 constexpr uint64_t ThreadSyncEsrch = 16;
 constexpr uint64_t ModeFilter = 2;
 constexpr int AccessDenied = 13;
@@ -21,14 +28,19 @@ static_assert(sizeof(FilterProgram) == 16);
 
 int64_t InstallFilter(uint64_t flags, uint64_t program)
 {
-    if (flags & ~(ThreadSync | ThreadSyncEsrch)) return -EINVAL;
+    if (flags & ~(ThreadSync | FilterLog | SpecAllow | ThreadSyncEsrch)) return -EINVAL;
     Process* process = ProcessCurrent();
     if (!process || process->isKernelThread) return -ESRCH;
     KernelOperationGuard operation(process);
     FilterProgram input{};
     if (!CopyFromUser(&input, program, sizeof(input))) return -EFAULT;
     if (!input.length || input.length > SeccompMaxFilterInstructions) return -EINVAL;
-    if (!ProcessGetNoNewPrivs(process)) return -AccessDenied;
+    if (!ProcessGetNoNewPrivs(process)) {
+        auto* userNamespace = ProcessUserNamespaceAcquire(process);
+        const bool privileged = ProcessCapable(process, userNamespace, CapSysAdmin);
+        UserNamespaceRelease(userNamespace);
+        if (!privileged) return -AccessDenied;
+    }
 
     const auto bytes = input.length * sizeof(SeccompInstruction);
     auto* filter = static_cast<SeccompFilter*>(kmalloc(sizeof(SeccompFilter) + bytes));
@@ -37,6 +49,7 @@ int64_t InstallFilter(uint64_t flags, uint64_t program)
     filter->references = 1;
     filter->count = input.length;
     filter->pathInstructions = 0;
+    filter->logRequested = (flags & FilterLog) != 0;
     int64_t result;
     if (!CopyFromUser(filter->code, input.instructions, bytes)) result = -EFAULT;
     else if (!SeccompVerify(filter->code, input.length)) result = -EINVAL;
@@ -63,18 +76,41 @@ void SeccompRelease(SeccompFilter* filter)
     }
 }
 
-uint32_t SeccompEvaluate(const SeccompFilter* filter, const SeccompData& data)
+uint32_t SeccompEvaluate(const SeccompFilter* filter, const SeccompData& data, bool* audit)
 {
     uint32_t verdict = SeccompAllow;
-    for (; filter; filter = filter->previous)
-        verdict = SeccompSelectAction(verdict, SeccompExecute(filter->code, filter->count, data));
+    bool logRequested = false;
+    for (; filter; filter = filter->previous) {
+        const auto selected = SeccompSelectAction(verdict, SeccompExecute(filter->code, filter->count, data));
+        if (selected != verdict) logRequested = filter->logRequested;
+        verdict = selected;
+    }
+    verdict = SeccompEnforceAction(verdict);
+    const uint32_t action = verdict & SeccompActionMask;
+    *audit = action == SeccompLog || action == SeccompKillProcess || action == SeccompKillThread ||
+        (logRequested && action != SeccompAllow);
     return verdict;
+}
+
+void SeccompAudit(const Process* process, uint64_t syscall, uint32_t verdict)
+{
+    // Installing filters is unprivileged. Allow useful audit samples without
+    // letting a default-LOG policy tie disk/console work to every syscall.
+    static uint64_t nextAuditMs;
+    const uint64_t now = ApicTickCount();
+    uint64_t deadline = __atomic_load_n(&nextAuditMs, __ATOMIC_RELAXED);
+    if (now < deadline || !__atomic_compare_exchange_n(&nextAuditMs, &deadline, now + 100,
+            false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return;
+    KLogCat(LogCat::Syscall, LogLevel::Info, "seccomp: pid=%u syscall=%u action=0x%x",
+            process->pid, static_cast<uint32_t>(syscall), verdict & SeccompActionMask);
 }
 
 int64_t SeccompDenied(Process* process, uint64_t syscall, uint32_t verdict)
 {
     const auto data = static_cast<uint16_t>(verdict);
     switch (verdict & SeccompActionMask) {
+    case SeccompTrace:
+    case SeccompUserNotify: return -ENOSYS; // no tracer or notification listener
     case SeccompErrno: return -int64_t(data > 4095 ? 4095 : data);
     case SeccompTrap:
         process->seccompTrap = SeccompTrap | data;
