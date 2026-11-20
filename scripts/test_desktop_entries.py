@@ -19,7 +19,7 @@ class DesktopEntriesTest(unittest.TestCase):
             icons=package/'share/icons/hicolor/scalable/apps';icons.mkdir(parents=True)
             svg=icons/'example.svg'
             svg.write_text('<svg xmlns="http://www.w3.org/2000/svg" width="48" height="24"><rect x="8" y="4" width="32" height="16" fill="red"/></svg>')
-            (apps/'org.example.App.desktop').write_text('[Desktop Entry]\nName=Example\nExec=example %F\nIcon=example\nType=Application\n')
+            (apps/'org.example.App.desktop').write_text('[Desktop Entry]\nName=Example\nExec=example %F\nComment=Open\tand print files\nIcon=example\nType=Application\n')
             (apps/'missing.desktop').write_text('[Desktop Entry]\nName=Missing\nExec=missing\n')
             (apps/'hidden.desktop').write_text('[Desktop Entry]\nName=Hidden\nExec=example\nNoDisplay=true\n')
             (apps/'cached.desktop').write_text('[Desktop Entry]\nName=Cached but removed\nExec=example\n')
@@ -30,7 +30,7 @@ class DesktopEntriesTest(unittest.TestCase):
             self.assertEqual(collect.find_icon(str(store),'/nix/store/example/share/icons/hicolor/scalable/apps/example.svg'),str(svg))
             with patch('sys.argv',['collect',str(store),str(output)]),contextlib.redirect_stdout(io.StringIO()):collect.main()
             manifest=(output/'applications.idx').read_text().splitlines()
-            self.assertEqual(manifest,['Example\texample\texample.rgba\t\torg.example.App'])
+            self.assertEqual(manifest,['Example\texample\texample.rgba\t\torg.example.App\tOpen and print files'])
             pixels=(output/'icons/example.rgba').read_bytes()
             self.assertEqual(len(pixels),24*24*4)
             self.assertEqual(struct.unpack_from('<I',pixels,0)[0],0)

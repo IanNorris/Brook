@@ -29,11 +29,12 @@ class DesktopTests(unittest.TestCase):
             app = root/'profile/bin/vlc'
             app.write_text('#!/bin/sh\n'); app.chmod(0o755)
             (root/'profile/share/applications/vlc.desktop').write_text(
-                '[Desktop Entry]\nType=Application\nName=VLC\nExec=vlc --started-from-file %U\n')
+                '[Desktop Entry]\nType=Application\nName=VLC\nExec=vlc --started-from-file %U\nComment=Play\tmusic and videos\n')
             def collect():
                 subprocess.run([str(binary)], check=True, capture_output=True)
                 return (root/'apps/applications.idx').read_text()
             self.assertIn('VLC\tvlc --started-from-file\t', collect())
+            self.assertEqual(collect().strip().split('\t')[4:], ['vlc', 'Play music and videos'])
             wrapper = root/'bin/brook-vlc'
             wrapper.write_text('#!/bin/sh\n'); wrapper.chmod(0o644)
             self.assertIn('VLC\tvlc --started-from-file\t', collect())
