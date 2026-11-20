@@ -5,6 +5,21 @@ Current state and immediate goal. Keep this short and current: replace stale lin
 _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review follow-up)._
 
 
+## Nautilus maximize and restore (20 November 2026)
+
+- In the 200% GTK4 fixture, Brook sent restored buffer dimensions as xdg
+  window geometry and marked the configure as an interactive resize. GTK
+  added client-side shadow margins again on the restored window.
+- `work/xdg-resize-fix` sends a normal-state 0×0 configure after leaving a
+  managed state, preserving it across a pending focus configure. True
+  interactive resize uses logical geometry without client shadow margins.
+- Implementation `e9ee4efb`. Release, 386 non-stress tests and the Wayland
+  package protocol checks passed. The headless Nautilus button sequence
+  restored the original 800×540 logical geometry and 1700×1180 buffer.
+  The VM did not reproduce the Dell's persistent crop or two-second delay.
+- Clearwater pair `build/dell/pair-xdg-resize` passed guarded QEMU on
+  attempt 1. Traces and comparison are in `build/xdg-resize-evidence`.
+
 ## Brook Files (20 November 2026)
 
 - `work/files-nautilus` packages pinned Nautilus 49.4 as Files

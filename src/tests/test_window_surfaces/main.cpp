@@ -287,7 +287,7 @@ int main() {
     CHECK(WmInputPop(&window,&event,1)==1 && event.reserved==WM_RESIZE_MAXIMIZED);
     CHECK(event.type==WM_EVT_RESIZED && event.x==1280 && event.y==720);
     window.state=WindowState::Normal;
-    CHECK(WmPushWmEvent(&window,WM_EVT_RESIZED,640,360));
+    CHECK(WmPushWmEvent(&window,WM_EVT_RESIZED,640,360,WM_RESIZE_RESIZING));
     CHECK(WmInputPop(&window,&event,1)==1 && event.reserved==WM_RESIZE_RESIZING);
     // Quiet windows have no client dirty pixels. Focus/z-order changes still
     // require a new chrome composition, without waiting for periodic repaint.
