@@ -4289,7 +4289,7 @@ static bool GopShadowEnsure()
     g_gopShadowWidth=g_physFbWidth;g_gopShadowHeight=g_physFbHeight;
     return true;
 }
-static void CompositorFlipSoftware(bool clientFrame)
+static void CompositorFlipSoftware(bool clientFrame = false)
 {
     CompositorMutexGuard geometry(&g_scanoutMappingLock);
 #if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
