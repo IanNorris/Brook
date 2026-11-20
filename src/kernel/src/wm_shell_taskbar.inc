@@ -14,6 +14,24 @@ using TaskbarLayout = ChromeTaskbarLayout;
 
 enum class WmHudMode : uint8_t { Off, Compact, Panel };
 static WmHudMode g_hudMode;
+static TaskbarPopupPin g_taskbarPopupPin;
+
+static uint32_t WmVisibleTrayMenuOwner()
+{
+    const auto& tray = ShellServiceTrayState();
+    if (!tray.menuOwner || !tray.menuCount) return 0;
+    for (uint32_t i = 0; i < tray.itemCount; ++i)
+        if (tray.items[i].id == tray.menuOwner) return tray.menuOwner;
+    return 0;
+}
+
+void WmTaskbarPopupForgetMenu() { g_taskbarPopupPin.RetainAppMenu(0); }
+
+bool WmTaskbarPopupPinned()
+{
+    g_taskbarPopupPin.RetainAppMenu(WmVisibleTrayMenuOwner());
+    return g_taskbarPopupPin.Any();
+}
 
 // Debug-bridge agent indicator cache (see WmAgentIndicatorRefresh).
 static uint8_t g_agentIndicatorState = 0; // BridgePresenceState
@@ -230,6 +248,7 @@ bool WmVolumePopupVisible() { return g_volumePopupOpen; }
 
 void WmVolumePopupClose()
 {
+    if (g_taskbarPopupPin.Is(TaskbarPopup::Volume)) return;
     g_volumePopupOpen = false;
     g_volumeDragging = false;
 }
@@ -245,8 +264,10 @@ void WmVolumePopupGetRect(uint32_t screenW, uint32_t screenH,
 
 bool WmVolumeLeftPress(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)
 {
+    if (WmTaskbarHidden() || (WmLauncherVisible() && WmTaskbarPopupPinned())) return false;
     if (!g_volumePopupOpen) {
         if (!WmVolumeIconContains(mx, my, screenW, screenH)) return false;
+        if (WmTaskbarPopupPinned()) return true;
         WmLauncherClose();
         WmTrayFlyoutClose();
         g_volumePopupOpen = true;
@@ -260,8 +281,12 @@ bool WmVolumeLeftPress(int32_t mx, int32_t my, uint32_t screenW, uint32_t screen
         g_volumeDragging = true;
         WmVolumeApply(TaskbarVolumeSliderValue(l.track, mx));
         break;
+    case TaskbarVolumeHit::Pin: g_taskbarPopupPin.Toggle(TaskbarPopup::Volume); break;
     case TaskbarVolumeHit::Panel: break;
-    case TaskbarVolumeHit::Outside: WmVolumePopupClose(); break; // includes the icon itself
+    case TaskbarVolumeHit::Outside:
+        if (g_taskbarPopupPin.Is(TaskbarPopup::Volume)) return WmVolumeIconContains(mx, my, screenW, screenH);
+        WmVolumePopupClose();
+        break;
     }
     return true;
 }
@@ -277,8 +302,10 @@ void WmVolumeDrag(int32_t mx, bool held, uint32_t screenW, uint32_t screenH)
 
 bool WmVolumeScroll(int32_t mx, int32_t my, int delta, uint32_t screenW, uint32_t screenH)
 {
-    if (!delta) return false;
-    const bool overPopup = g_volumePopupOpen && WmVolumePopupLayout(screenW, screenH).panel.contains(mx, my);
+    if (!delta || WmTaskbarHidden()) return false;
+    const auto popup = WmVolumePopupLayout(screenW, screenH);
+    if (g_volumePopupOpen && popup.pin.contains(mx, my)) return false;
+    const bool overPopup = g_volumePopupOpen && popup.panel.contains(mx, my);
     if (!overPopup && !WmVolumeIconContains(mx, my, screenW, screenH)) return false;
     WmVolumeApply(TaskbarVolumeWheel(g_volumeControl, delta));
     return true;
@@ -286,7 +313,10 @@ bool WmVolumeScroll(int32_t mx, int32_t my, int delta, uint32_t screenW, uint32_
 
 bool WmVolumeToggleMuteAt(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)
 {
-    const bool overPopup = g_volumePopupOpen && WmVolumePopupLayout(screenW, screenH).panel.contains(mx, my);
+    if (WmTaskbarHidden()) return false;
+    const auto popup = WmVolumePopupLayout(screenW, screenH);
+    if (g_volumePopupOpen && popup.pin.contains(mx, my)) return false;
+    const bool overPopup = g_volumePopupOpen && popup.panel.contains(mx, my);
     if (!overPopup && !WmVolumeIconContains(mx, my, screenW, screenH)) return false;
     WmVolumeApply(TaskbarVolumeToggleMute(g_volumeControl));
     return true;
@@ -301,19 +331,56 @@ static void WmCaptureVolumePopup(uint32_t screenW, uint32_t screenH, int32_t mou
     snapshot.volume.control = g_volumeControl;
     snapshot.volume.available = g_volumeAvailable;
     snapshot.volume.dragging = g_volumeDragging;
-    const auto& mute = snapshot.volume.layout.mute;
-    const bool hovered = mute.contains(mouseX, mouseY);
-    snapshot.volume.mouseX = hovered ? mute.x : -1;
-    snapshot.volume.mouseY = hovered ? mute.y : -1;
+    snapshot.volume.pinned = g_taskbarPopupPin.Is(TaskbarPopup::Volume);
+    const auto& layout = snapshot.volume.layout;
+    const auto hover = layout.pin.contains(mouseX, mouseY) ? layout.pin :
+                       layout.mute.contains(mouseX, mouseY) ? layout.mute : DesktopRect{};
+    snapshot.volume.mouseX = hover.w ? hover.x : -1;
+    snapshot.volume.mouseY = hover.h ? hover.y : -1;
 }
 
 enum class WmTrayFlyout : uint8_t { None, Network, Temperature };
 static WmTrayFlyout g_trayFlyout;
 
+static TaskbarPopup WmTrayPopupKind()
+{
+    if (g_trayFlyout == WmTrayFlyout::Network) return TaskbarPopup::Network;
+    return g_trayFlyout == WmTrayFlyout::Temperature ? TaskbarPopup::Temperature : TaskbarPopup::None;
+}
+
 bool WmTrayFlyoutVisible() { return g_trayFlyout != WmTrayFlyout::None; }
-void WmTrayFlyoutClose() { g_trayFlyout = WmTrayFlyout::None; }
+
+void WmTrayFlyoutClose()
+{
+    if (!g_taskbarPopupPin.Is(WmTrayPopupKind())) g_trayFlyout = WmTrayFlyout::None;
+}
+
+bool WmTaskbarSystemPopupModal()
+{
+    return (g_volumePopupOpen && !g_taskbarPopupPin.Is(TaskbarPopup::Volume)) ||
+           (WmTrayFlyoutVisible() && !g_taskbarPopupPin.Is(WmTrayPopupKind()));
+}
+
+bool WmTaskbarPopupDismissible()
+{
+    if (WmLauncherVisible() || WmWindowMenuOpen()) return false;
+    const uint32_t owner = WmVisibleTrayMenuOwner();
+    return WmTaskbarSystemPopupModal() ||
+           (owner && !g_taskbarPopupPin.Is(TaskbarPopup::AppMenu, owner) && !WmTaskbarHidden());
+}
+
+void WmTaskbarPopupDismiss()
+{
+    WmVolumePopupClose();
+    WmTrayFlyoutClose();
+    const uint32_t owner = WmVisibleTrayMenuOwner();
+    if (owner && !g_taskbarPopupPin.Is(TaskbarPopup::AppMenu, owner))
+        ShellServiceQueueTrayInput({TrayInputKind::DismissMenu, owner, 0, 0, 0});
+}
+
 void WmCyclePerformanceHud()
 {
+    if (WmTaskbarPopupPinned()) return;
     g_hudMode = g_hudMode == WmHudMode::Off ? WmHudMode::Compact :
                 g_hudMode == WmHudMode::Compact ? WmHudMode::Panel : WmHudMode::Off;
 }
@@ -322,16 +389,23 @@ static DesktopRect WmTrayFlyoutLayout(uint32_t sw, uint32_t sh);
 
 bool WmTrayFlyoutPress(int32_t mx, int32_t my, uint32_t sw, uint32_t sh)
 {
-    if (WmTrayFlyoutLayout(sw, sh).contains(mx, my)) return true;
+    if (WmTaskbarHidden() || (WmLauncherVisible() && WmTaskbarPopupPinned())) return false;
+    const auto panel = WmTrayFlyoutLayout(sw, sh);
+    if (panel.contains(mx, my)) {
+        if (ChromeTrayFlyoutPinRect(WmChromeStyle(), panel).contains(mx, my))
+            g_taskbarPopupPin.Toggle(WmTrayPopupKind());
+        return true;
+    }
     const auto l = GetTaskbarLayout(sw, sh);
     if (l.hud.contains(mx, my)) {
+        if (WmTaskbarPopupPinned()) return true;
         g_hudMode = WmHudMode::Panel;
         WmTrayFlyoutClose();
         return true;
     }
-    const auto next = WmTaskbarHidden() ? WmTrayFlyout::None :
-                      l.network.contains(mx, my) ? WmTrayFlyout::Network :
+    const auto next = l.network.contains(mx, my) ? WmTrayFlyout::Network :
                       l.metrics[6].contains(mx, my) ? WmTrayFlyout::Temperature : WmTrayFlyout::None;
+    if (WmTaskbarPopupPinned()) return next != WmTrayFlyout::None;
     if (!WmTrayFlyoutVisible() && next == WmTrayFlyout::None) return false;
     g_trayFlyout = next == g_trayFlyout ? WmTrayFlyout::None : next;
     if (WmTrayFlyoutVisible()) {
@@ -384,7 +458,18 @@ static DesktopRect WmPerformanceHudLayout(uint32_t sw, uint32_t sh)
     const int h = ChromePerformanceHudHeight(WmChromeStyle(), WmHudThermal());
     const int w = WmMetric(348);
     if (int(sw) < w + 2 * margin || deskH < h + 2 * margin) return {};
-    return {int(sw) - w - margin, deskH - h - margin, w, h};
+    DesktopRect panel{int(sw) - w - margin, deskH - h - margin, w, h};
+    int32_t dx = 0, dy = 0;
+    uint32_t dw = 0, dh = 0;
+    bool material = false;
+    if (WmDockSurfaceRect(sw, sh, &dx, &dy, &dw, &dh, &material) &&
+        panel.x < dx + int(dw) && dx < panel.x + panel.w &&
+        panel.y < dy + int(dh) && dy < panel.y + panel.h) {
+        if (dx > int(sw / 2)) panel.x = dx - margin - w;
+        else panel.x = dx + int(dw) + margin;
+        if (panel.x < margin || panel.x + w > int(sw) - margin) return {};
+    }
+    return panel;
 }
 
 static bool WmPanelRect(DesktopRect r, int32_t* x, int32_t* y, uint32_t* w, uint32_t* h)
@@ -399,9 +484,37 @@ bool WmTrayFlyoutRect(uint32_t sw, uint32_t sh, int32_t* x, int32_t* y, uint32_t
     return WmPanelRect(WmTrayFlyoutLayout(sw, sh), x, y, w, h);
 }
 
+static DesktopRect WmInteractiveHudLayout(uint32_t sw, uint32_t sh)
+{
+    // This optional panel yields to the shared popup slot. Once pinned no
+    // competing popup can replace it.
+    if (WmLauncherVisible() || g_volumePopupOpen || WmTrayFlyoutVisible() || WmWindowMenuOpen() ||
+        WmVisibleTrayMenuOwner()) return {};
+    return WmPerformanceHudLayout(sw, sh);
+}
+
 bool WmPerformanceHudRect(uint32_t sw, uint32_t sh, int32_t* x, int32_t* y, uint32_t* w, uint32_t* h)
 {
-    return WmPanelRect(WmPerformanceHudLayout(sw, sh), x, y, w, h);
+    return WmPanelRect(WmInteractiveHudLayout(sw, sh), x, y, w, h);
+}
+
+bool WmTaskbarPopupPointerOwned(int32_t x, int32_t y, uint32_t sw, uint32_t sh)
+{
+    if (WmTaskbarHidden() || WmLauncherVisible() || WmWindowMenuOpen()) return false;
+    return (g_volumePopupOpen && TaskbarPopupOwnsPointer(WmVolumePopupLayout(sw, sh).panel,
+                g_taskbarPopupPin.Is(TaskbarPopup::Volume), x, y)) ||
+           TaskbarPopupOwnsPointer(WmTrayFlyoutLayout(sw, sh),
+                g_taskbarPopupPin.Is(WmTrayPopupKind()), x, y) ||
+           WmInteractiveHudLayout(sw, sh).contains(x, y);
+}
+
+bool WmPerformanceHudPress(int32_t x, int32_t y, uint32_t sw, uint32_t sh)
+{
+    const auto panel = WmInteractiveHudLayout(sw, sh);
+    if (!panel.contains(x, y)) return false;
+    if (ChromePerformanceHudPinRect(WmChromeStyle(), panel).contains(x, y))
+        g_taskbarPopupPin.Toggle(TaskbarPopup::Performance);
+    return true;
 }
 
 static ChromePerformanceHudModel WmHudModel(DesktopRect rect)
@@ -426,7 +539,15 @@ static ChromePerformanceHudModel WmHudModel(DesktopRect rect)
     return model;
 }
 
-static void WmCaptureTrayFlyout(uint32_t sw, uint32_t sh, ChromeShellModel& snapshot)
+static void WmCapturePopupPin(DesktopRect pin, int32_t mx, int32_t my, bool pinned, ChromeShellModel& snapshot)
+{
+    const bool hovered = pin.contains(mx, my);
+    snapshot.mouseX = hovered ? pin.x : -1;
+    snapshot.mouseY = hovered ? pin.y : -1;
+    snapshot.popupPinned = pinned;
+}
+
+static void WmCaptureTrayFlyout(uint32_t sw, uint32_t sh, int32_t mx, int32_t my, ChromeShellModel& snapshot)
 {
     const auto rect = WmTrayFlyoutLayout(sw, sh);
     if (rect.w <= 0) return;
@@ -442,6 +563,8 @@ static void WmCaptureTrayFlyout(uint32_t sw, uint32_t sh, ChromeShellModel& snap
     }
     snapshot.kind = ChromeShellKind::TrayFlyout;
     snapshot.rect = rect;
+    WmCapturePopupPin(ChromeTrayFlyoutPinRect(WmChromeStyle(), rect), mx, my,
+                      g_taskbarPopupPin.Is(WmTrayPopupKind()), snapshot);
     snapshot.network = network;
     snapshot.networkConnected = address != 0;
     const auto source = WmTelemetryModel(false, !network);
@@ -452,13 +575,15 @@ static void WmCaptureTrayFlyout(uint32_t sw, uint32_t sh, ChromeShellModel& snap
     }
 }
 
-static void WmCapturePerformanceHud(uint32_t sw, uint32_t sh, ChromeShellModel& snapshot)
+static void WmCapturePerformanceHud(uint32_t sw, uint32_t sh, int32_t mx, int32_t my, ChromeShellModel& snapshot)
 {
     const auto rect = WmPerformanceHudLayout(sw, sh);
     if (rect.w <= 0) return;
     const auto model = WmHudModel(rect);
     snapshot.kind = ChromeShellKind::PerformanceHud;
     snapshot.rect = model.rect;
+    WmCapturePopupPin(ChromePerformanceHudPinRect(WmChromeStyle(), rect), mx, my,
+                      g_taskbarPopupPin.Is(TaskbarPopup::Performance), snapshot);
     snapshot.hudTick = ShellCadenceTick;
     WmCaptureHudCadence(snapshot.telemetry, model);
     WmCaptureThermal(snapshot.telemetry, model.telemetry, true);
@@ -573,7 +698,8 @@ static void WmCaptureTaskbar(uint32_t screenW, uint32_t screenH, uint64_t uptime
 static bool WmTrayTooltip(uint32_t screenW, uint32_t screenH, int32_t mx, int32_t my,
                           char (&text)[48], const char*& detail, DesktopRect& box)
 {
-    if (!g_wmActive || g_launcherOpen || g_volumePopupOpen || WmTrayFlyoutVisible() || WmTaskbarHidden()) return false;
+    if (!g_wmActive || g_launcherOpen || g_volumePopupOpen || WmTrayFlyoutVisible() || WmTaskbarHidden() ||
+        WmInteractiveHudLayout(screenW, screenH).w > 0) return false;
     const TaskbarLayout l = GetTaskbarLayout(screenW, screenH);
     const WmRect* anchor = nullptr;
     if (l.volume.contains(mx, my)) {
@@ -699,27 +825,36 @@ void WmGetShellTrayGeometry(uint32_t sw, uint32_t sh, int32_t x, int32_t y, WmSh
 {
     out = {};
     const auto& tray = ShellServiceTrayState();
+    const uint32_t owner = WmVisibleTrayMenuOwner();
+    g_taskbarPopupPin.RetainAppMenu(owner);
     const auto style = WmChromeStyle();
-    if (tray.notice.id) out.notice = ChromeNoticeRect(style, sw, WmDesktopHeight(sh), tray.notice.actionCount);
+    const auto hud = WmInteractiveHudLayout(sw, sh);
+    if (tray.notice.id) {
+        const auto notice = ChromeNoticeRect(style, sw, WmDesktopHeight(sh), tray.notice.actionCount);
+        if (hud.w <= 0 || notice.x >= hud.x + hud.w || hud.x >= notice.x + notice.w ||
+            notice.y >= hud.y + hud.h || hud.y >= notice.y + notice.h)
+            out.notice = notice;
+    }
     // The window menu borrows the tray menu's surface (wm_window_menu.inc).
     if (g_windowMenu.open) {
         out.popup = WindowMenuRectLocked(sw, sh);
-        out.menu = out.popup.w > 0;
+        out.menu = out.windowMenu = out.popup.w > 0;
         return;
     }
     if (!tray.itemCount || WmTaskbarHidden() || WmLauncherVisible() ||
         WmVolumePopupVisible() || WmTrayFlyoutVisible()) return;
-    if (y < static_cast<int32_t>(WmTaskbarTop(sh)) && !tray.menuOwner) return;
+    if (y < static_cast<int32_t>(WmTaskbarTop(sh)) && !owner) return;
     const auto bar = GetTaskbarLayout(sw, sh);
-    if (tray.menuOwner) {
+    if (owner) {
         for (uint32_t i = 0; i < bar.trayAppCount; ++i) {
-            if (tray.items[i].id != tray.menuOwner) continue;
+            if (tray.items[i].id != owner) continue;
             out.popup = ChromeTrayMenuRect(style, bar.trayApps[i], tray.menuCount, sw);
             out.menu = out.popup.w > 0;
             return;
         }
         return;
     }
+    if (hud.w > 0) return;
     const int hover = ShellTrayAt(bar, x, y);
     if (hover < 0) return;
     const auto& item = tray.items[hover];
@@ -750,13 +885,16 @@ bool WmShellTrayPointer(uint32_t sw, uint32_t sh, int32_t x, int32_t y,
     auto send = [&](TrayInputKind kind, uint32_t id, int32_t argument) {
         ShellServiceQueueTrayInput({kind, id, argument, x, y});
     };
-    if (geometry.menu) {
+    const bool pinned = g_taskbarPopupPin.Is(TaskbarPopup::AppMenu, tray.menuOwner);
+    if (geometry.menu && TaskbarPopupOwnsPointer(geometry.popup, pinned, x, y)) {
         if (pressed) {
             if (!geometry.popup.contains(x, y)) send(TrayInputKind::DismissMenu, tray.menuOwner, 0);
+            else if (!button && ChromeTrayMenuPinRect(style, geometry.popup).contains(x, y))
+                g_taskbarPopupPin.Toggle(TaskbarPopup::AppMenu, tray.menuOwner);
             else if (!button) for (uint32_t i = 0; i < tray.menuCount; ++i) {
                 const auto& row = tray.menu[i];
-                if (row.enabled && !row.separator && ChromeTrayMenuRowRect(style, geometry.popup, i).contains(x, y))
-                    send(TrayInputKind::MenuSelect, tray.menuOwner, row.id);
+                if (row.enabled && !row.separator && ChromeTrayMenuRowRect(style, geometry.popup, i, true).contains(x, y))
+                    send(pinned ? TrayInputKind::MenuSelectPinned : TrayInputKind::MenuSelect, tray.menuOwner, row.id);
             }
         }
         return true;
@@ -772,11 +910,15 @@ bool WmShellTrayPointer(uint32_t sw, uint32_t sh, int32_t x, int32_t y,
         return true;
     }
     if (!tray.itemCount || WmTaskbarHidden() || WmLauncherVisible() ||
-        WmVolumePopupVisible() || WmTrayFlyoutVisible() || y < static_cast<int32_t>(WmTaskbarTop(sh))) return false;
+        WmTaskbarSystemPopupModal() || y < static_cast<int32_t>(WmTaskbarTop(sh))) return false;
     const int hover = ShellTrayAt(GetTaskbarLayout(sw, sh), x, y);
     if (hover < 0) return false;
-    if (pressed && button <= 1)
-        send(button ? TrayInputKind::Context : TrayInputKind::Activate, tray.items[hover].id, 0);
+    if (pressed && button <= 1) {
+        const bool popupPinned = WmTaskbarPopupPinned();
+        if (!button) send(popupPinned ? TrayInputKind::ActivateWithoutMenu : TrayInputKind::Activate,
+                          tray.items[hover].id, 0);
+        else if (!popupPinned) send(TrayInputKind::Context, tray.items[hover].id, 0);
+    }
     if (scroll) send(TrayInputKind::Scroll, tray.items[hover].id, scroll);
     return true;
 }
@@ -798,6 +940,8 @@ static void WmCaptureAppTray(const WmShellSurface& surface, uint32_t sw, uint32_
             for (uint32_t i = 0; i < g_windowMenu.count; ++i) model.tray.menu[i] = g_windowMenu.rows[i];
             return;
         }
+        model.popupPinnable = true;
+        model.popupPinned = g_taskbarPopupPin.Is(TaskbarPopup::AppMenu, tray.menuOwner);
         model.tray.menuCount = tray.menuCount;
         for (uint32_t i = 0; i < tray.menuCount; ++i) model.tray.menu[i] = tray.menu[i];
     } else {

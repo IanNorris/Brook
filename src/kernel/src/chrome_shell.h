@@ -188,6 +188,7 @@ struct ChromeVolumePopupModel {
     uint32_t control;
     bool available, dragging;
     int32_t mouseX, mouseY;
+    bool pinned = false;
 };
 void ChromeBuildVolumePopup(const ChromeVolumePopupModel& model, const ChromeStyle& style, ChromeDisplayList& out);
 
@@ -233,7 +234,10 @@ struct ChromeTrayFlyoutModel {
     bool network, connected; // connected: the network has an address
     const char* readout;     // network: the address
     ChromeTelemetryModel telemetry;
+    bool pinned = false;
+    int32_t mouseX = -1, mouseY = -1;
 };
+DesktopRect ChromeTrayFlyoutPinRect(const ChromeStyle&, DesktopRect);
 // live: the network is connected, or a package temperature is available.
 int ChromeTrayFlyoutHeight(const ChromeStyle& style, bool network, bool live);
 void ChromeBuildTrayFlyout(const ChromeTrayFlyoutModel&, const ChromeStyle&, ChromeDisplayList&);
@@ -242,7 +246,10 @@ struct ChromePerformanceHudModel {
     DesktopRect rect;
     ChromeTelemetryModel telemetry;
     uint64_t tick;
+    bool pinned = false;
+    int32_t mouseX = -1, mouseY = -1;
 };
+DesktopRect ChromePerformanceHudPinRect(const ChromeStyle&, DesktopRect);
 int ChromePerformanceHudHeight(const ChromeStyle& style, bool thermal);
 void ChromeBuildCompactHud(const ChromePerformanceHudModel&, const ChromeStyle&, ChromeDisplayList&);
 void ChromeBuildPerformanceHud(const ChromePerformanceHudModel&, const ChromeStyle&, ChromeDisplayList&);

@@ -804,6 +804,20 @@ static void PanelFrame(ChromeDisplayList& dl, const ChromeStyle& s, const Deskto
     dl.Fill(p.x + p.w - 1, p.y, 1, p.h, pal.launcherBorder);
 }
 
+static void PopupPin(ChromeDisplayList& dl, const ChromeStyle& s, DesktopRect rect,
+                     bool pinned, int32_t mx, int32_t my)
+{
+    if (rect.w <= 0) return;
+    const auto& p = s.P();
+    const bool hover = rect.contains(mx, my);
+    dl.MaterialRect(rect, pinned || hover ? s.MaterialColor(pinned ? p.taskActive : p.taskHover)
+                                          : WellColor(s, p.launcher), Px(s, 6));
+    const int glyph = Px(s, 16), left = rect.x + Px(s, 6);
+    dl.Glyph(ChromeGlyph::Pin, left, rect.y + (rect.h - glyph) / 2, p.text);
+    dl.Text(CF::Label, left + glyph + Px(s, 4), rect.y + (rect.h - s.Line(CF::Label)) / 2,
+            pinned ? "Unpin" : "Pin", p.text, rect.w - glyph - Px(s, 16));
+}
+
 static int PanelHeaderHeight(const ChromeStyle& s)
 {
     const int line = s.Line(CF::Lead), pill = Px(s, 20);
@@ -817,10 +831,13 @@ static void PanelHeader(ChromeDisplayList& dl, const ChromeStyle& s, int x, int 
     const auto& pal = s.P();
     const int h = PanelHeaderHeight(s), glyph = Px(s, 16);
     dl.Glyph(icon, x, y + (h - glyph) / 2, pal.text);
-    dl.Text(CF::Lead, x + glyph + Px(s, 8), y + (h - s.Line(CF::Lead)) / 2, title, pal.text, w - glyph - Px(s, 8));
-    if (!status) return;
     const int pillH = Px(s, 20), dotSize = Px(s, 6), pad = Px(s, 8);
-    const int pillW = 2 * pad + dotSize + Px(s, 6) + s.TextWidth(status, CF::Small);
+    const int titleX = x + glyph + Px(s, 8), titleRoom = w - glyph - Px(s, 8);
+    const int pillW = status ? 2 * pad + dotSize + Px(s, 6) + s.TextWidth(status, CF::Small) : 0;
+    const bool showStatus = status && titleRoom >= s.TextWidth(title, CF::Lead) + pillW + pad;
+    ChromeElidedText(dl, s, CF::Lead, titleX, y + (h - s.Line(CF::Lead)) / 2, title, pal.text,
+                     titleRoom - (showStatus ? pillW + pad : 0));
+    if (!showStatus) return;
     const DesktopRect pill{x + w - pillW, y + (h - pillH) / 2, pillW, pillH};
     dl.MaterialRect(pill, WellColor(s, pal.launcher), pillH / 2);
     dl.MaterialRect({pill.x + pad, pill.y + (pillH - dotSize) / 2, dotSize, dotSize}, 0xff000000u | dot, dotSize / 2);
@@ -876,6 +893,7 @@ void ChromeBuildVolumePopup(const ChromeVolumePopupModel& m, const ChromeStyle& 
                            pal.launcher);
     ChromeMaterialString(dl, s, l.title.x + glyph + Px(s, 8), l.title.y + (l.title.h - s.Line(CF::Lead)) / 2,
                          "Volume", pal.text, l.title.w - glyph - Px(s, 8), CF::Lead);
+    PopupPin(dl, s, l.pin, m.pinned, m.mouseX, m.mouseY);
     // Mute: a 36 px icon button, filled only under the pointer.
     const bool muteHover = l.mute.contains(m.mouseX, m.mouseY);
     if (muteHover) ChromeMaterialRect(dl, s, l.mute, pal.taskHover);
@@ -921,12 +939,13 @@ void ChromeBuildTooltip(const ChromeTooltipModel& m, const ChromeStyle& s, Chrom
 }
 
 void ChromeBuildAppTrayMenu(const ChromeTrayState& state, DesktopRect rect, int32_t mx, int32_t my,
-                            const ChromeStyle& s, ChromeDisplayList& dl)
+                            const ChromeStyle& s, ChromeDisplayList& dl, bool pinnable, bool pinned)
 {
     PanelFrame(dl, s, rect);
+    if (pinnable) PopupPin(dl, s, ChromeTrayMenuPinRect(s, rect), pinned, mx, my);
     for (uint32_t i = 0; i < state.menuCount; ++i) {
         const auto& row = state.menu[i];
-        const auto r = ChromeTrayMenuRowRect(s, rect, i);
+        const auto r = ChromeTrayMenuRowRect(s, rect, i, pinnable);
         const int pad = Px(s, 8);
         if (row.separator) {
             dl.Fill(r.x + pad, r.y + r.h / 2, r.w - 2 * pad, 1, HairlineColor(s, s.P().launcher));
@@ -1051,6 +1070,11 @@ void ChromeBuildBootSummary(const ChromeBootSummaryModel& m, const ChromeStyle& 
 
 static constexpr int FlyoutPad = 16, FlyoutGap = 12, FlyoutGraph = 48;
 
+DesktopRect ChromeTrayFlyoutPinRect(const ChromeStyle& s, DesktopRect panel)
+{
+    return TaskbarPopupPinRect(*s.metrics, panel, Px(s, FlyoutPad), PanelHeaderHeight(s));
+}
+
 int ChromeTrayFlyoutHeight(const ChromeStyle& s, bool network, bool live)
 {
     const int row = s.Line(CF::Label), rowGap = Px(s, 5);
@@ -1068,9 +1092,12 @@ void ChromeBuildTrayFlyout(const ChromeTrayFlyoutModel& m, const ChromeStyle& s,
     PanelFrame(dl, s, p);
     const int pad = Px(s, FlyoutPad), x = p.x + pad, w = p.w - 2 * pad;
     int y = p.y + pad;
+    const auto pin = ChromeTrayFlyoutPinRect(s, p);
+    const int headerW = pin.x - x - Px(s, 8);
+    PopupPin(dl, s, pin, m.pinned, m.mouseX, m.mouseY);
     const auto& t = m.telemetry;
     if (m.network) {
-        PanelHeader(dl, s, x, y, w, m.connected ? ChromeGlyph::Network : ChromeGlyph::NetworkOff, "Network",
+        PanelHeader(dl, s, x, y, headerW, m.connected ? ChromeGlyph::Network : ChromeGlyph::NetworkOff, "Network",
                     m.connected ? "Connected" : "Disconnected", m.connected ? pal.ok : pal.mutedText);
         y += PanelHeaderHeight(s) + Px(s, FlyoutGap);
         if (!m.connected) { dl.Text(CF::Label, x, y, "No network connection.", pal.secondaryText, w); return; }
@@ -1086,7 +1113,7 @@ void ChromeBuildTrayFlyout(const ChromeTrayFlyoutModel& m, const ChromeStyle& s,
     }
     const bool live = t.thermal && t.latest.pkgC >= 0;
     const ThermalSample& now = t.pointCount && t.points ? t.points[t.pointCount - 1] : t.latest;
-    PanelHeader(dl, s, x, y, w, ChromeGlyph::Temperature, "Temperature",
+    PanelHeader(dl, s, x, y, headerW, ChromeGlyph::Temperature, "Temperature",
                 live ? ThermalWord(now.pkgC, t.tjmax) : "Unavailable",
                 live ? ThermalInk(s, now.pkgC, t.tjmax, pal.ok) : pal.mutedText);
     y += PanelHeaderHeight(s) + Px(s, FlyoutGap);
@@ -1139,6 +1166,11 @@ void ChromeBuildCompactHud(const ChromePerformanceHudModel& m, const ChromeStyle
         x += valueW + (series ? Px(s, 4) : Px(s, 12));
     }
     dl.Text(CF::Small, x, labelY, "ms", p.mutedText);
+}
+
+DesktopRect ChromePerformanceHudPinRect(const ChromeStyle& s, DesktopRect panel)
+{
+    return TaskbarPopupPinRect(*s.metrics, panel, Px(s, HudPad), s.Line(CF::Strong));
 }
 
 int ChromePerformanceHudHeight(const ChromeStyle& s, bool thermal)
@@ -1197,7 +1229,9 @@ void ChromeBuildPerformanceHud(const ChromePerformanceHudModel& m, const ChromeS
     int y = m.rect.y + pad;
     PanelFrame(dl, s, m.rect);
     dl.Text(CF::Strong, x + Px(s, 4), y, "Performance", p.text, w);
-    TextRight(dl, s, CF::Small, x + w - Px(s, 2), y + s.Font(CF::Strong).ascent - s.Font(CF::Small).ascent,
+    const auto pin = ChromePerformanceHudPinRect(s, m.rect);
+    PopupPin(dl, s, pin, m.pinned, m.mouseX, m.mouseY);
+    TextRight(dl, s, CF::Small, pin.x - Px(s, 8), y + s.Font(CF::Strong).ascent - s.Font(CF::Small).ascent,
               "16.7 ms budget", p.mutedText);
     y += s.Line(CF::Strong) + Px(s, HudGap);
     const auto& t = m.telemetry;

@@ -1,6 +1,6 @@
 #pragma once
 #include <stdint.h>
-#include "desktop_metrics.h"
+#include "taskbar_popup_pin.h"
 #include "../../shared/brook_audio_control.h"
 
 // Pure taskbar volume logic shared by the kernel window manager and host
@@ -55,7 +55,7 @@ inline int TaskbarVolumeSliderX(const DesktopRect& track, uint32_t percent) {
 }
 
 struct TaskbarVolumePopupLayout {
-    DesktopRect panel, title, mute, track, value;
+    DesktopRect panel, title, mute, track, value, pin;
     int thumbSize;
 };
 
@@ -83,7 +83,8 @@ inline TaskbarVolumePopupLayout TaskbarVolumePopup(const DesktopMetrics& m, cons
         y = avoid->y - h - margin;
     if (y < 0) y = 0;
     l.panel = {x, y, w, h};
-    l.title = {x + pad, y + pad, w - 2 * pad, header};
+    l.pin = TaskbarPopupPinRect(m, l.panel, pad, header);
+    l.title = {x + pad, y + pad, l.pin.x - x - pad - m.pixels(8), header};
     const int controlsY = y + pad + header;
     l.mute = {x + pad, controlsY, button, button};
     const int valueW = valueTextW > 0 ? valueTextW : m.pixels(36);
@@ -107,12 +108,13 @@ inline DesktopRect TaskbarTooltipBox(const DesktopRect& icon, int w, int h, int 
     return {x, y, w, h};
 }
 
-enum class TaskbarVolumeHit : uint8_t { Outside, Panel, Mute, Slider };
+enum class TaskbarVolumeHit : uint8_t { Outside, Panel, Mute, Slider, Pin };
 
 // The slider accepts the whole row height, plus the knob overhang at the ends.
 inline TaskbarVolumeHit TaskbarVolumePopupHit(const DesktopMetrics&, const TaskbarVolumePopupLayout& l,
                                               int x, int y) {
     if (!l.panel.contains(x, y)) return TaskbarVolumeHit::Outside;
+    if (l.pin.contains(x, y)) return TaskbarVolumeHit::Pin;
     if (l.mute.contains(x, y)) return TaskbarVolumeHit::Mute;
     const int slop = l.thumbSize / 2;
     const DesktopRect grab{l.track.x - slop, l.track.y, l.track.w + 2 * slop, l.track.h};

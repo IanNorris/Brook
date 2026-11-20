@@ -2094,7 +2094,7 @@ static ShellFrame CaptureShellFrame(uint32_t width, uint32_t height, uint64_t no
     WmShellSurface surfaces[WM_SHELL_SURFACE_LIMIT];
     WmShellTrayGeometry tray{};
     WmGetShellTrayGeometry(width, height, mx, my, tray);
-    const uint32_t count = WmShellSurfaces(width, height, mx, my, surfaces, tray.popup, tray.menu, tray.notice);
+    const uint32_t count = WmShellSurfaces(width, height, mx, my, surfaces, tray.popup, tray.menu, tray.notice, tray.windowMenu);
     uint32_t kindMask = 0;
     for (uint32_t i = 0; i < count; ++i) {
         auto surface = surfaces[i];
@@ -2779,7 +2779,7 @@ static void CompositorRunShortcut(const GlobalShortcutResult& r)
         if(WmLauncherVisible())WmLauncherToggle();
         SerialPuts("WM: shortcut Escape launcher closed\n");
         break;
-    case GlobalShortcutAction::CloseVolumePopup:WmVolumePopupClose();WmTrayFlyoutClose();break;
+    case GlobalShortcutAction::CloseVolumePopup:WmTaskbarPopupDismiss();break;
     case GlobalShortcutAction::CyclePerformanceHud:WmCyclePerformanceHud();break;
     case GlobalShortcutAction::LauncherPromptKey:WmLauncherPowerKey(r.key);break;
     case GlobalShortcutAction::LauncherKey:WmLauncherKey(r.key,r.ascii,r.modifiers);break;
@@ -2838,7 +2838,7 @@ static void CompositorInputWM()
                         ev.type==InputEventType::KeyPress?"down":"up",ev.scanCode,ev.modifiers);
             GlobalShortcutContext context{};
             context.launcherVisible=WmLauncherVisible();
-            context.volumePopupVisible=WmVolumePopupVisible() || WmTrayFlyoutVisible();
+            context.volumePopupVisible=WmTaskbarPopupDismissible();
             context.launcherPrompt=WmLauncherPowerPrompt();
             context.dockDismissible=WmDockDismissible();
             context.windowMenuOpen=WmWindowMenuOpen();
@@ -2865,8 +2865,8 @@ static void CompositorInputWM()
         if(pointer) {
             int32_t mx=0,my=0;MouseGetPosition(&mx,&my);
             const bool launcher=WmLauncherVisible();
-            overlay=launcher || WmVolumePopupVisible() || WmTrayFlyoutVisible() ||
-                    my>=static_cast<int32_t>(WmTaskbarTop(g_physFbHeight)) ||
+            const bool taskbarPanel = WmTaskbarPopupPointerOwned(mx, my, g_physFbWidth, g_physFbHeight);
+            overlay=launcher || taskbarPanel || my>=static_cast<int32_t>(WmTaskbarTop(g_physFbHeight)) ||
                     WmDockPointerOwned(mx,my,g_physFbWidth,g_physFbHeight);
             // Shell surfaces own the pointer: no window may acquire a lock
             // while it is over the taskbar, launcher or volume popup.
@@ -2874,7 +2874,7 @@ static void CompositorInputWM()
             const auto kind=ev.type==InputEventType::MouseButtonDown?DesktopPointerEvent::Down:
                             ev.type==InputEventType::MouseButtonUp?DesktopPointerEvent::Up:
                             ev.type==InputEventType::MouseScroll?DesktopPointerEvent::Scroll:DesktopPointerEvent::Move;
-            const bool trayEvent = WmShellTrayPointer(g_physFbWidth, g_physFbHeight, mx, my,
+            const bool trayEvent = !taskbarPanel && WmShellTrayPointer(g_physFbWidth, g_physFbHeight, mx, my,
                     kind == DesktopPointerEvent::Down, ev.scanCode,
                     kind == DesktopPointerEvent::Scroll ? LauncherScroll120(ev) : 0);
             overlay |= trayEvent;
@@ -3214,7 +3214,7 @@ static CursorShape CompositorCursorShape()
     int32_t mx = 0, my = 0;
     MouseGetPosition(&mx, &my);
     if (WmDockGripAt(mx, my, g_physFbWidth, g_physFbHeight)) return CursorShape::ResizeH;
-    if (WmLauncherVisible() || WmVolumePopupVisible() || WmTrayFlyoutVisible() || WmWindowMenuOpen() ||
+    if (WmLauncherVisible() || WmTaskbarPopupPointerOwned(mx, my, g_physFbWidth, g_physFbHeight) || WmWindowMenuOpen() ||
         my >= static_cast<int32_t>(WmTaskbarTop(g_physFbHeight)) ||
         WmDockPointerOwned(mx, my, g_physFbWidth, g_physFbHeight))
         return CursorShape::Arrow;
@@ -3313,9 +3313,11 @@ static void CompositorHandleMouseWM()
         if(WmLauncherVisible()||my>=static_cast<int32_t>(WmTaskbarTop(g_physFbHeight))||
            captionHit.zone!=WmHitZone::TitleBar)g_titleClicks.Reset();
         DbgPrintf("WM: click at (%d,%d)\n", mx, my);
-        // The volume popup owns every press while open (outside closes it).
+        // Transient flyouts consume their dismissing clicks. Pinned panels
+        // handle only their own controls and let desktop clicks through.
         if (WmVolumeLeftPress(mx, my, g_physFbWidth, g_physFbHeight) ||
-            WmTrayFlyoutPress(mx, my, g_physFbWidth, g_physFbHeight))
+            WmTrayFlyoutPress(mx, my, g_physFbWidth, g_physFbHeight) ||
+            WmPerformanceHudPress(mx, my, g_physFbWidth, g_physFbHeight))
         {
             if (releaseLatched && !polledDown) {
                 g_wmPrimaryDown = false;

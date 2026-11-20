@@ -599,8 +599,8 @@ struct Session {
 
     void ItemAction(Item& item, const char* member, const TrayInput& event)
     {
-        if (event.kind == TrayInputKind::Activate && item.isMenu) {
-            FetchMenu(item, 0);
+        if (item.isMenu && (event.kind == TrayInputKind::Activate || event.kind == TrayInputKind::ActivateWithoutMenu)) {
+            if (event.kind == TrayInputKind::Activate) FetchMenu(item, 0);
             return;
         }
         auto m = Hold(dbus_message_new_method_call(item.owner.c_str(), item.path.c_str(), ItemInterface, member));
@@ -632,13 +632,13 @@ struct Session {
         }
     }
 
-    void MenuSelect(const Item& item, int32_t id)
+    void MenuSelect(const Item& item, int32_t id, bool pinned)
     {
         const auto it = std::find_if(menu.begin(), menu.end(), [id](const auto& row) { return row.id == id; });
         if (menuOwner != item.view.id || it == menu.end() || !it->enabled || it->separator ||
             (layout.pending && layoutNode != menuNode)) return;
         if (it->submenu || id == MenuBack) {
-            if (!FetchMenu(item, id == MenuBack ? 0 : id)) CloseMenu();
+            if (!FetchMenu(item, id == MenuBack ? 0 : id) && !pinned) CloseMenu();
             return;
         }
         auto msg = Hold(dbus_message_new_method_call(item.owner.c_str(), item.menu.c_str(), MenuInterface, "Event"));
@@ -657,7 +657,7 @@ struct Session {
             dbus_message_set_no_reply(msg.get(), true);
             Send(std::move(msg));
         }
-        CloseMenu();
+        if (!pinned) CloseMenu();
     }
 
     void Closed(const Notice& notice, uint32_t reason)
@@ -784,13 +784,17 @@ struct Session {
         const auto item = std::find_if(items.begin(), items.end(), [&](const auto& i) { return i.view.id == e.owner && i.visible; });
         if (item == items.end()) return;
         switch (e.kind) {
-        case TrayInputKind::Activate: ItemAction(*item, "Activate", e); break;
+        case TrayInputKind::Activate:
+        case TrayInputKind::ActivateWithoutMenu: ItemAction(*item, "Activate", e); break;
         case TrayInputKind::Context:
             item->activation.reset();
             if (!FetchMenu(*item, 0, MenuFetch::Open, &e)) ItemAction(*item, "ContextMenu", e);
             break;
         case TrayInputKind::Scroll: ItemAction(*item, "Scroll", e); break;
-        case TrayInputKind::MenuSelect: MenuSelect(*item, e.argument); break;
+        case TrayInputKind::MenuSelect:
+        case TrayInputKind::MenuSelectPinned:
+            MenuSelect(*item, e.argument, e.kind == TrayInputKind::MenuSelectPinned);
+            break;
         case TrayInputKind::DismissMenu:
             if (menuOwner == e.owner || layoutOwner == e.owner) CloseMenu();
             break;

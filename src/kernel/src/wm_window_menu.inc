@@ -98,7 +98,7 @@ bool WmShowWindowMenu(int idx, int32_t x, int32_t y)
     {
         VfbGuard guard;
         if (!WindowMenuOpenLocked(idx, x, y)) return false;
-        closeTray = ShellServiceTrayState().menuOwner != 0;
+        closeTray = ShellServiceTrayState().menuOwner != 0 && !WmTaskbarPopupPinned();
     }
     // Exclusive with the other popups; the tray's menu shares the surface.
     if (closeTray) ShellServiceQueueTrayInput({TrayInputKind::DismissMenu, ShellServiceTrayState().menuOwner, 0, x, y});

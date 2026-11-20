@@ -136,12 +136,18 @@ void CompositorRetireVfb(CompositorVfbAllocation*) { std::abort(); }
 uint64_t CompositorDesktopReadyTick() { return 0; }
 uint64_t RtcNow() { return 0; }
 char* RtcFormatTaskbar(char* buf,uint64_t,bool) { buf[0]='0';buf[1]=0;return buf; }
-const ChromeTrayState& ShellServiceTrayState() {
-    static const ChromeTrayState empty{};
-    return empty;
+static ChromeTrayState fixtureTray{};
+static TrayInput fixtureLastTrayInput{};
+static unsigned fixtureTrayEvents{};
+const ChromeTrayState& ShellServiceTrayState() { return fixtureTray; }
+void ShellServiceQueueTrayInput(const TrayInput& event) {
+    CHECK(fixtureTray.itemCount);
+    ++fixtureTrayEvents;
+    fixtureLastTrayInput = event;
 }
-void ShellServiceQueueTrayInput(const TrayInput&) { std::abort(); }
 bool ThermalReadSnapshot(ThermalSnapshot&) { return false; }
+uint32_t AudioOutputControl() { return BROOK_AUDIO_DEFAULT; }
+bool AudioSetUserOutputControl(uint32_t, bool) { std::abort(); }
 uint32_t testScreenW=1024,testScreenH=768;
 extern "C" void CompositorGetPhysDims(uint32_t* w,uint32_t* h) { if(w)*w=testScreenW;if(h)*h=testScreenH; }
 }
@@ -706,6 +712,74 @@ int main() {
         CHECK(hud.x + hud.w + WmMetric(8) == sw && hud.y + hud.h + WmMetric(8) == WmDesktopHeight(sh));
         WmCyclePerformanceHud();
         CHECK(GetTaskbarLayout(sw, sh).hud.w == 0);
+
+        const auto volume = GetTaskbarLayout(sw, sh).volume;
+        CHECK(WmVolumeLeftPress(volume.x, volume.y, sw, sh));
+        const auto volumePin = WmVolumePopupLayout(sw, sh).pin;
+        CHECK(WmVolumeLeftPress(volumePin.x, volumePin.y, sw, sh));
+        CHECK(WmTaskbarPopupPinned() && !WmTaskbarPopupDismissible());
+        CHECK(WmTaskbarPopupPointerOwned(volumePin.x, volumePin.y, sw, sh));
+        CHECK(!WmTaskbarPopupPointerOwned(10, 10, sw, sh));
+        CHECK(!WmVolumeLeftPress(10, 10, sw, sh) && WmVolumePopupVisible());
+        CHECK(WmTrayFlyoutPress(tray.x, tray.y, sw, sh) && !WmTrayFlyoutVisible());
+        WmTaskbarPopupDismiss();
+        CHECK(WmVolumePopupVisible());
+        g_launcherLoaded = true;
+        WmLauncherToggle();
+        CHECK(WmLauncherVisible() && WmTaskbarPopupPinned());
+        CHECK(kinds(s) >= 2 && s[1].kind == WmShellSurfaceKind::Launcher);
+        CHECK(!WmVolumeLeftPress(volumePin.x, volumePin.y, sw, sh));
+        WmLauncherToggle();
+        g_launcherLoaded = false;
+        CHECK(!WmLauncherVisible() && kinds(s) >= 2 && s[1].kind == WmShellSurfaceKind::VolumePopup);
+        static ChromeShellModel pinSnapshot{};
+        CHECK(WmCaptureShellModel(s[1], sw, sh, 0, -1, -1, pinSnapshot) && pinSnapshot.volume.pinned);
+        CHECK(WmVolumeLeftPress(volumePin.x, volumePin.y, sw, sh) && !WmTaskbarPopupPinned());
+        CHECK(WmTaskbarPopupDismissible());
+        CHECK(WmVolumeLeftPress(10, 10, sw, sh) && !WmVolumePopupVisible());
+
+        for (const auto anchor : {tray, GetTaskbarLayout(sw, sh).metrics[6]}) {
+            if (anchor.w == 0) continue; // the synthetic host has no thermal sensor
+            CHECK(WmTrayFlyoutPress(anchor.x, anchor.y, sw, sh));
+            const auto panel = WmTrayFlyoutLayout(sw, sh);
+            const auto pin = ChromeTrayFlyoutPinRect(WmChromeStyle(), panel);
+            CHECK(WmTrayFlyoutPress(pin.x, pin.y, sw, sh));
+            CHECK(WmTaskbarPopupPinned() && !WmTrayFlyoutPress(10, 10, sw, sh));
+            CHECK(!WmTaskbarPopupPointerOwned(10, 10, sw, sh));
+            CHECK(kinds(s) >= 2 && WmCaptureShellModel(s[1], sw, sh, 0, -1, -1, pinSnapshot));
+            CHECK(pinSnapshot.kind == ChromeShellKind::TrayFlyout && pinSnapshot.popupPinned);
+            CHECK(WmTrayFlyoutPress(pin.x, pin.y, sw, sh) && !WmTaskbarPopupPinned());
+            CHECK(WmTrayFlyoutPress(10, 10, sw, sh) && !WmTrayFlyoutVisible());
+        }
+        WmCyclePerformanceHud();
+        WmCyclePerformanceHud();
+        const auto hudPin = ChromePerformanceHudPinRect(WmChromeStyle(), WmPerformanceHudLayout(sw, sh));
+        CHECK(WmPerformanceHudPress(hudPin.x, hudPin.y, sw, sh));
+        CHECK(WmTaskbarPopupPinned() && !WmPerformanceHudPress(10, 10, sw, sh));
+        WmCyclePerformanceHud();
+        CHECK(g_hudMode == WmHudMode::Panel);
+        CHECK(WmPerformanceHudPress(hudPin.x, hudPin.y, sw, sh) && !WmTaskbarPopupPinned());
+        WmCyclePerformanceHud();
+
+        fixtureTray.itemCount = fixtureTray.menuCount = 1;
+        fixtureTray.menuOwner = fixtureTray.items[0].id = 11;
+        fixtureTray.menu[0] = {4, "Open", true, false, false};
+        WmShellTrayGeometry geometry{};
+        WmGetShellTrayGeometry(sw, sh, 10, 10, geometry);
+        CHECK(geometry.menu && !geometry.windowMenu);
+        const auto menuPin = ChromeTrayMenuPinRect(WmChromeStyle(), geometry.popup);
+        const auto row = ChromeTrayMenuRowRect(WmChromeStyle(), geometry.popup, 0, true);
+        CHECK(menuPin.y + menuPin.h <= row.y);
+        CHECK(WmShellTrayPointer(sw, sh, menuPin.x, menuPin.y, true, 0, 0));
+        CHECK(WmTaskbarPopupPinned() && !WmTaskbarPopupDismissible());
+        CHECK(!WmShellTrayPointer(sw, sh, 10, 10, true, 0, 0) && fixtureTrayEvents == 0);
+        CHECK(WmShellTrayPointer(sw, sh, row.x, row.y, true, 0, 0));
+        CHECK(fixtureLastTrayInput.kind == TrayInputKind::MenuSelectPinned && fixtureLastTrayInput.owner == 11);
+        fixtureTray.items[0].id = 12; // service owner gone without a matching replacement
+        WmGetShellTrayGeometry(sw, sh, 10, 10, geometry);
+        CHECK(!geometry.menu && !WmTaskbarPopupPinned());
+        CHECK(!WmShellTrayPointer(sw, sh, 10, 10, true, 0, 0) && fixtureTrayEvents == 1);
+        fixtureTray = {};
     }
     // In stage 3 the shell renders from this kernel model, and pointer presses
     // still enter through the WM hit targets. A pin should immediately appear

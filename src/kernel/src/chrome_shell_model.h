@@ -97,6 +97,7 @@ struct ChromeShellModel {
     bool shutdownActive, prompt, promptRestart, confirmFocused;
     bool network;
     bool dockPinned, dockResizing;
+    bool popupPinnable, popupPinned;
     char text[128], detail[64]; // launcher header, tooltip or flyout address
     bool forceApps;
 };
@@ -145,17 +146,19 @@ inline void BuildShellModel(const ChromeShellModel& model, const ChromeStyle& st
         ChromeBuildBootSummary(model.boot.View(model.rect), style, list);
         break;
     case ChromeShellKind::TrayFlyout:
-        ChromeBuildTrayFlyout({model.rect, model.network, model.networkConnected, model.text, model.telemetry.View()},
-                              style, list);
+        ChromeBuildTrayFlyout({model.rect, model.network, model.networkConnected, model.text, model.telemetry.View(),
+                               model.popupPinned, model.mouseX, model.mouseY}, style, list);
         break;
     case ChromeShellKind::AppTrayMenu:
-        ChromeBuildAppTrayMenu(model.tray, model.rect, model.mouseX, model.mouseY, style, list);
+        ChromeBuildAppTrayMenu(model.tray, model.rect, model.mouseX, model.mouseY, style, list,
+                               model.popupPinnable, model.popupPinned);
         break;
     case ChromeShellKind::Notification:
         ChromeBuildNotice(model.tray.notice, model.rect, model.mouseX, model.mouseY, style, list);
         break;
     case ChromeShellKind::PerformanceHud:
-        ChromeBuildPerformanceHud({model.rect, model.telemetry.View(), model.hudTick}, style, list);
+        ChromeBuildPerformanceHud({model.rect, model.telemetry.View(), model.hudTick, model.popupPinned,
+                                   model.mouseX, model.mouseY}, style, list);
         break;
     case ChromeShellKind::Dock: {
         const uint32_t* icons[ChromeDockEntryLimit];
