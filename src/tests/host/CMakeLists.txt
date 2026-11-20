@@ -371,6 +371,15 @@ target_compile_options(test_module_sections PRIVATE
 )
 target_link_options(test_module_sections PRIVATE -Wl,--gc-sections)
 set_tests_properties(test_module_sections PROPERTIES TIMEOUT 15)
+add_host_test(test_desktop_task_manager)
+target_compile_options(test_desktop_task_manager PRIVATE
+    -DBROOK_HOST_TEST -ffunction-sections -fdata-sections
+    "-iquote${BROOK_ROOT}/src/kernel/src"
+    "-iquote${BROOK_ROOT}/src/shared"
+    "-iquote${BROOK_ROOT}/src/shared/inc_km"
+)
+target_link_options(test_desktop_task_manager PRIVATE -Wl,--gc-sections)
+set_tests_properties(test_desktop_task_manager PROPERTIES TIMEOUT 15)
 add_host_test(test_virtio_net_tx)
 target_compile_options(test_virtio_net_tx PRIVATE
     -Wno-unused-parameter -DBROOK_HOST_TEST -ffunction-sections -fdata-sections

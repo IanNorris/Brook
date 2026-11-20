@@ -343,6 +343,8 @@ add_executable(kernel
     src/window.cpp
     src/desktop_disk_popup.cpp
     src/desktop_stats_popup.cpp
+    src/desktop_task_manager.cpp
+    src/process_resident.cpp
     src/chrome_raster.cpp
     src/chrome_frame.cpp
     src/chrome_shell.cpp

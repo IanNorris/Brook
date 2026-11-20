@@ -22,7 +22,7 @@
 #include "memory/physical_memory.h"
 #include "memory/heap.h"
 #include "memory/user_mapping.h"
-#include "memory/resident_pages.h"
+#include "process_resident.h"
 #include "exec_limits.h"
 #include "user_copy.h"
 #include "serial.h"
@@ -205,26 +205,7 @@ static int ProcAppendResidentStatus(ProcPriv& status)
     if (!__atomic_load_n(&status.residentStatusPending, __ATOMIC_ACQUIRE)) return 0;
 
     ResidentPages resident;
-    bool exists = false;
-    auto* space = SchedulerReferenceProcessAddressSpace(status.pid, status.incarnation, &exists);
-    if (!exists) return -3;
-    if (space) {
-        bool valid = true;
-        KMutexLock(&space->mutation);
-        for (auto* node = space->ranges.head; node; node = node->next) {
-            const auto& range = node->range;
-            VmmRangeStats pages{};
-            if (ResidentPages::ChargesRss(range) &&
-                !VmmMeasureRange(space->pageTable, range.begin, range.end, false, &pages)) {
-                valid = false;
-                break;
-            }
-            resident.Add(range, pages.backedPages);
-        }
-        KMutexUnlock(&space->mutation);
-        AddressSpaceUnref(space);
-        if (!valid) return -5;
-    }
+    if (const int error = ProcessMeasureResident(status.pid, status.incarnation, resident)) return error;
 
     const uint32_t prefix = __atomic_load_n(&status.size, __ATOMIC_RELAXED);
     const uint32_t suffix = ProcFmt(status.data + prefix, ProcStatusCapacity - prefix,
