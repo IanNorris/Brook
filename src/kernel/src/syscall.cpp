@@ -346,6 +346,9 @@ void SyscallTableInit()
     g_syscallTable[SYS_WAIT4]           = sys_wait4;
     g_syscallTable[SYS_WAITID]          = sys_waitid;
     g_syscallTable[SYS_UNAME]           = sys_uname;
+    g_syscallTable[170]                 = sys_sethostname;
+    g_syscallTable[171]                 = sys_setdomainname;
+    g_syscallTable[272]                 = sys_unshare;
     g_syscallTable[SYS_FCNTL]           = sys_fcntl;
     g_syscallTable[SYS_FSYNC]           = sys_fsync;
     g_syscallTable[SYS_FDATASYNC]       = sys_fsync;

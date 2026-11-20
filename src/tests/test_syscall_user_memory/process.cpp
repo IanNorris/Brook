@@ -6,6 +6,7 @@
 using namespace harness;
 namespace {
 unsigned g_forks,g_threads,g_adds,g_blocks;
+bool g_namespaceAdmin;
 brook::Process* g_child;
 brook::Process* g_vforkParentWhenRunnable;
 // What the child does as soon as it is runnable, before the parent blocks.
@@ -21,7 +22,7 @@ Process* ProcessFork(Process*,uint64_t,uint64_t,uint64_t,bool) { ++g_forks;retur
 Process* ProcessCreateThread(Process*,uint64_t,uint64_t,uint64_t,uint64_t,bool) { ++g_threads;return g_child=NewChild(); }
 int ProcessUserNamespaceCreate(Process*) { return 0; }
 UserNamespace* ProcessUserNamespaceAcquire(Process*) { return nullptr; }
-bool ProcessCapable(Process*,UserNamespace*,unsigned) { return false; }
+bool ProcessCapable(Process*,UserNamespace*,unsigned) { return g_namespaceAdmin; }
 int ProcessFsIsolateMounts(Process*) { return 0; }
 int SysvSemClone(Process*,Process*,bool) { return 0; }
 void SysvSemExit(Process*) {}
@@ -40,7 +41,7 @@ static void BlockedParent(brook::Process* parent) {
 }
 
 static void Begin() {
-    Reset();ResetProcess();
+    Reset();ResetProcess();g_namespaceAdmin=false;
     g_forks=g_threads=g_adds=g_blocks=0;g_child=nullptr;g_vforkParentWhenRunnable=nullptr;g_childRunsFirst=nullptr;
     extern void (*g_schedulerBlockHook)(brook::Process*);
     g_schedulerBlockHook=BlockedParent;
@@ -114,11 +115,39 @@ static void ChildTid() {
     CHECK(g_kernel.Intact());
 }
 
+static void UtsNamespaceIsolation() {
+    using namespace brook;
+    Begin();
+    auto* parent=ProcessCurrent();
+    CHECK(sys_clone(CloneNewUts|17,0,0,0,0,0)==-EPERM);
+    CHECK(sys_unshare(CloneNewUts,0,0,0,0,0)==-EPERM);
+    CHECK(!g_forks);
+    g_namespaceAdmin=true;
+    CHECK(sys_clone(CloneNewUts|17,0,0,0,0,0)==8);
+    auto* child=g_child;
+    CHECK(!ProcessUtsWrite(child,false,"isolated",8));
+    char host[UtsNameBytes],domain[UtsNameBytes];
+    ProcessUtsRead(parent,host,domain);
+    CHECK(!strcmp(host,"brook")&&!strcmp(domain,"(none)"));
+    ProcessUtsRead(child,host,domain);
+    CHECK(!strcmp(host,"isolated")&&!strcmp(domain,"(none)"));
+    ProcessUtsRelease(child);
+    free(child);
+    g_child=nullptr;
+    CHECK(!sys_unshare(CloneNewUts,0,0,0,0,0));
+    CHECK(!ProcessUtsWrite(parent,true,"test-domain",11));
+    ProcessUtsRead(parent,host,domain);
+    CHECK(!strcmp(host,"brook")&&!strcmp(domain,"test-domain"));
+    ProcessUtsRelease(parent);
+    g_namespaceAdmin=false;
+}
+
 void RunProcessTests() {
     SetTls();
     VforkChildFirst();
     VforkParentWaitsForRelease();
     ChildTid();
+    UtsNamespaceIsolation();
     extern void (*g_schedulerBlockHook)(brook::Process*);
     g_schedulerBlockHook=nullptr;
 }

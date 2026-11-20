@@ -388,6 +388,7 @@ add_executable(kernel
     src/tmpfs.cpp
     src/compat_paths.cpp
     src/process_fs.cpp
+    src/process_uts.cpp
     src/fs_context.cpp
     src/fatfs_vfs.cpp
     src/guard_readonly_view.cpp

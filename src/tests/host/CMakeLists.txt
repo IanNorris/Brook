@@ -439,6 +439,7 @@ target_compile_options(test_tcp PRIVATE
 # Real syscall handlers against a fake user address space. Handlers must reach
 # user memory only through the checked copies; see harness.h.
 add_host_test(test_syscall_user_memory
+    "${BROOK_ROOT}/src/kernel/src/process_uts.cpp"
     "${BROOK_ROOT}/src/tests/test_syscall_user_memory/input_wm.cpp"
     "${BROOK_ROOT}/src/tests/test_syscall_user_memory/dir_open.cpp"
     "${BROOK_ROOT}/src/tests/test_syscall_user_memory/rw.cpp"

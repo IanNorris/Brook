@@ -47,6 +47,7 @@
 #include "signal_fp_user.h"
 #include "vdso.h"
 #include "process_user_namespace.h"
+#include "process_uts.h"
 
 namespace brook {
 static_assert(offsetof(Process,mountNamespaceMember)+sizeof(Process::mountNamespaceMember)==offsetof(Process,fsContext),
@@ -114,6 +115,7 @@ static void CopyParentProcess(Process* child, Process* parent) {
            offsetof(Process,cwdDisplay)-nnpEnd);
     memcpy(reinterpret_cast<char*>(child)+displayEnd,reinterpret_cast<const char*>(parent)+displayEnd,
            offsetof(Process,capabilities)-displayEnd);
+    ProcessUtsInherit(child,parent);
     ProcessFsReadDisplay(parent,child->cwdDisplay,sizeof(child->cwdDisplay));
     child->oomEpisode=__atomic_load_n(&parent->oomEpisode,__ATOMIC_ACQUIRE);
     child->userAccessScope=nullptr; // never inherit a pointer into a parent's kernel stack
@@ -184,6 +186,7 @@ static inline void FreeProcessStruct(Process* p)
         }
 
         ProcessFsClear(p);
+        ProcessUtsRelease(p);
         ProcessGroupsRelease(p->groups); p->groups = nullptr;
         UserNamespaceRelease(p->userNamespace);p->userNamespace=nullptr;
         MappingBackingUnref(p->fbBacking);p->fbBacking=nullptr;
