@@ -154,6 +154,12 @@ static void checkDetailedStats() {
     CHECK(DesktopStatsScrollOffset(24, 48) == 24);
     CHECK(DesktopStatsScrollOffset(0x7fffffffffffffffLL, 48) == 48);
     CHECK(DesktopStatsScrollOffset(42, 0) == 0);
+    CHECK(DesktopTaskTotalCpuPercent(82, 4) == 20);
+    CHECK(DesktopTaskTotalCpuPercent(82, 1) == 82);
+    CHECK(DesktopTaskTotalCpuPercent(2, 4) == 0);
+    CHECK(DesktopTaskTotalCpuPercent(82, 0) == DetailedNoPercent);
+    CHECK(DesktopTaskTotalCpuPercent(DetailedNoPercent, 4) == DetailedNoPercent);
+
     DesktopDetailedStats tasks{};
     CHECK(DesktopStatsTaskRows(tasks) == 1);
     tasks.tasks[0].ticks = 40;

@@ -740,6 +740,7 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
             RenderSnapshot(model, s, statsList);
             Check(prefix + "stats-" + name, statsList, s, model.rect.x, model.rect.y, model.rect.w, model.rect.h);
             if (panel == DesktopStatsPanel::CpuMemory) {
+                stats.coreCount = 4;
                 stats.tasks[2] = {"frame publisher", 24, 65, 2};
                 stats.tasks[3] = {"background task", 10, 66, 1};
                 model.statsLayout = ChromeStatsPopupLayoutFor(s, layout.volume, screenW, screenH - m.taskbar(),
@@ -749,6 +750,7 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
                 RenderSnapshot(model, s, compactList);
                 Check(prefix + "stats-cpu-memory-compact", compactList, s,
                       model.rect.x, model.rect.y, model.rect.w, model.rect.h);
+                stats.coreCount = 64;
                 stats.tasks[2] = stats.tasks[3] = {};
             }
             if (panel == DesktopStatsPanel::CpuMemory && prefix == "opaque-dark-200-") {

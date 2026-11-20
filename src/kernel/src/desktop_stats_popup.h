@@ -51,6 +51,10 @@ struct DesktopDetailedStats {
     uint64_t total, used, available, cached, kernel, gpu;
 };
 
+inline uint8_t DesktopTaskTotalCpuPercent(uint8_t oneCpuPercent, uint32_t onlineCores) {
+    return onlineCores && oneCpuPercent <= 100 ? uint8_t(oneCpuPercent / onlineCores) : DetailedNoPercent;
+}
+
 inline uint32_t DesktopStatsTaskRows(const DesktopDetailedStats& stats) {
     uint32_t count = 0;
     if (stats.tasksMeasured) {

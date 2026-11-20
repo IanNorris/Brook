@@ -1584,11 +1584,11 @@ static void DetailedUsageBar(ChromeDisplayList& dl, const ChromeStyle& s, Deskto
 }
 
 static void DetailedTasks(ChromeDisplayList& dl, const ChromeStyle& s, DesktopRect b, int y, int row,
-                          const DesktopDetailedStats& stats, uint32_t taskRows)
+                          const DesktopDetailedStats& stats, uint32_t taskRows, bool compact)
 {
     const auto& p = s.P();
     const int caption = s.Line(CF::Small);
-    const char* basis = "% of one CPU";
+    const char* basis = compact ? "% of CPU" : "% of one CPU";
     dl.Text(CF::Small, b.x, y, "Top tasks", p.mutedText, b.w - s.TextWidth(basis, CF::Small) - Px(s, 4));
     TextRight(dl, s, CF::Small, b.x + b.w, y, basis, p.mutedText);
     y += caption;
@@ -1600,11 +1600,15 @@ static void DetailedTasks(ChromeDisplayList& dl, const ChromeStyle& s, DesktopRe
     for (uint32_t i = 0; i < taskRows; ++i) {
         const auto& task = stats.tasks[i];
         if (!task.ticks) break;
-        char value[8]{}, info[16] = "#";
-        DetailedPercent(value, task.percent);
-        DesktopNumber(info + 1, task.tid);
-        const int infoWidth = s.TextWidth(info, CF::Small) + Px(s, 6);
-        dl.Text(CF::Small, b.x, y + s.Font(CF::Label).ascent - s.Font(CF::Small).ascent, info, p.mutedText);
+        char value[8]{};
+        DetailedPercent(value, compact ? DesktopTaskTotalCpuPercent(task.percent, stats.coreCount) : task.percent);
+        int infoWidth = 0;
+        if (!compact) {
+            char info[16] = "#";
+            DesktopNumber(info + 1, task.tid);
+            infoWidth = s.TextWidth(info, CF::Small) + Px(s, 6);
+            dl.Text(CF::Small, b.x, y + s.Font(CF::Label).ascent - s.Font(CF::Small).ascent, info, p.mutedText);
+        }
         DetailedValue(dl, s, b.x + infoWidth, y, b.w - infoWidth, task.name[0] ? task.name : "(unnamed)", value);
         y += row;
     }
@@ -1647,7 +1651,7 @@ static void DetailedCpu(const ChromeStatsPopupLayout& l, DesktopRect b,
         y += Px(s, 28);
     }
     y += Px(s, FlyoutGap);
-    DetailedTasks(dl, s, b, y, row, stats, l.taskRows);
+    DetailedTasks(dl, s, b, y, row, stats, l.taskRows, false);
 }
 
 static void DetailedMemoryBar(ChromeDisplayList& dl, const ChromeStyle& s, DesktopRect bounds,
@@ -1735,7 +1739,7 @@ static void CompactCpuMemory(const ChromeStatsPopupLayout& l, DesktopRect b, con
                          percent, stats.total - used < warningFree);
     }
     DetailedValue(dl, s, b.x, b.y + row, b.w, "Memory in use", ramText);
-    DetailedTasks(dl, s, b, b.y + 2 * row + Px(s, FlyoutGap), row, stats, l.taskRows);
+    DetailedTasks(dl, s, b, b.y + 2 * row + Px(s, FlyoutGap), row, stats, l.taskRows, true);
 }
 
 static void DetailedCadence(const ChromeStatsPopupLayout& l, bool app, const DesktopIntervals<>* history,
