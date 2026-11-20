@@ -11,6 +11,7 @@ extern "C" uint64_t g_kernelEntryTsc;
 namespace brook {
 namespace {
 BootTimingInputs g_inputs{};
+BootGuardSlot g_selectedSlot{};
 BootTimingSummary g_summary{};
 bool g_ready = false;
 
@@ -31,7 +32,11 @@ void BootTimingCaptureHandoff(const BootProtocol* protocol)
     // zero; never read past the version-5 fields unless the marker says so.
     g_inputs.loaderTimingPresent = BootHasTiming(protocol);
     if (g_inputs.loaderTimingPresent) g_inputs.loader = protocol->timing;
+    if (BootHasGuardSlot(protocol)) g_selectedSlot = protocol->guardSlot;
 }
+
+uint32_t BootTimingHandoffFlags() { return g_inputs.loader.flags; }
+BootGuardSlot BootTimingHandoffSlot() { return g_selectedSlot; }
 
 void BootTimingCaptureFirmware()
 {

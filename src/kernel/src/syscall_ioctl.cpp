@@ -4,7 +4,10 @@
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "ahci_system_volume.h"
+#include "boot_timing_runtime.h"
+#include "process_user_namespace.h"
 #include "../../shared/brook_system_esp.h"
+#include "../../shared/update/guard_slot_health.h"
 
 #include "syscall.h"
 #include "timeout_value.h"
@@ -170,6 +173,27 @@ int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
     FdRef ref(proc, static_cast<int>(fd));
     FdEntry* fde = ref.get();
     if (!fde || fde->type==FdType::Path) return -EBADF;
+
+    if (cmd == BROOK_IOCTL_GET_SYSTEM_ESP_BOOT_SLOT) {
+        static_assert(sizeof(BrookSystemEspBootSlot) == 56);
+        if (!ProcessCapable(proc, nullptr, CapSysAdmin)) return -EPERM;
+        if (fde->type != FdType::Vnode || !fde->handle) return -25;
+        auto* node = static_cast<Vnode*>(fde->handle);
+        if (node->type != VnodeType::Dir) return -25;
+        if (!AhciSystemVolumeOwnsRoot(node)) return -ENODEV;
+        BrookSystemEspBootSlot result{};
+        result.version = BROOK_ESP_BOOT_SLOT_VERSION;
+        const auto slot = BootTimingHandoffSlot();
+        if (GuardSlotKeyValid(slot)) {
+            result.mode = BROOK_ESP_BOOT_SLOT_VERIFIED;
+            result.generation = slot.generation;
+            result.slot = slot.slot;
+            __builtin_memcpy(result.selector_digest, slot.selectorDigest, sizeof(result.selector_digest));
+        } else if (BootTimingHandoffFlags() & BootTimingRecovery) {
+            result.mode = BROOK_ESP_BOOT_SLOT_RECOVERY;
+        }
+        return CopyToUser(arg, &result, sizeof(result)) ? 0 : -EFAULT;
+    }
 
     if(cmd==BROOK_IOCTL_VERIFY_SYSTEM_ESP_ROOT || cmd==BROOK_IOCTL_VERIFY_SYSTEM_ESP_MEMBER) {
         if(fde->type!=FdType::Vnode || !fde->handle)return -25; // ENOTTY
