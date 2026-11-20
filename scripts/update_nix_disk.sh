@@ -210,30 +210,6 @@ if [ "${UPDATE_TOOLS}" -eq 1 ]; then
                 break
             done
         fi
-        # Copy brook-files (file browser) — build fresh or find in store
-        BROOK_FILES_OUT=""
-        if command -v nix-build &>/dev/null; then
-            BROOK_FILES_OUT=$(nix-build "${ROOT_DIR}/tools/brook-files-pkg" --no-out-link)
-        fi
-        if [ -n "$BROOK_FILES_OUT" ] && [ -x "${BROOK_FILES_OUT}/bin/brook-files" ]; then
-            while IFS= read -r p; do
-                [ -n "$p" ] || continue
-                base=$(basename "$p")
-                dst="${MNTDIR}/store/${base}"
-                if [ ! -e "$dst" ]; then
-                    cp -a --no-preserve=links "$p" "$dst"
-                fi
-            done < <(nix-store -qR "$BROOK_FILES_OUT")
-            cp "${BROOK_FILES_OUT}/bin/brook-files" "${MNTDIR}/bin/brook-files"
-            echo "  brook-files -> /nix/bin/brook-files"
-        else
-            for d in "${MNTDIR}"/store/*-brook-files-brook-*; do
-                [ -x "$d/bin/brook-files" ] || continue
-                cp "$d/bin/brook-files" "${MNTDIR}/bin/brook-files"
-                echo "  brook-files -> /nix/bin/brook-files"
-                break
-            done
-        fi
         # App Gallery runs as the desktop user and invokes the existing installer.
         if command -v nix-build &>/dev/null; then
             BROOK_GALLERY_OUT=$(nix-build "${ROOT_DIR}/tools/brook-gallery-pkg" --no-out-link)

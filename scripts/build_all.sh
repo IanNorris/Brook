@@ -71,7 +71,7 @@ echo "--- Ext2 Disk Image ---"
 "${SCRIPT_DIR}/update_ext2_disk.sh" --create
 echo ""
 
-# 7. Update Nix tools disk (waylandd, brook-player, brook-files, etc.)
+# 7. Update Nix tools disk (waylandd and Brook desktop tools)
 if [ "${BROOK_SKIP_NIX_TOOLS:-0}" = "1" ]; then
     echo "--- Nix Tools Disk (skipped via BROOK_SKIP_NIX_TOOLS=1) ---"
 else

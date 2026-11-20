@@ -1,6 +1,7 @@
 # Defaults shared by Brook desktop profiles.
-{ pkgs ? import ./nixpkgs.nix {} }:
+{ pkgs ? import ./nixpkgs.nix {}, nautilus ? pkgs.nautilus }:
 let
+  filesSchemas = "${nautilus}/share/gsettings-schemas/${nautilus.name}/glib-2.0/schemas";
   buttons = "minimize,maximize,close";
   gtkLayout = "icon:${buttons}";
   # GDK translates the GNOME menu token to the GTK icon token.
@@ -25,6 +26,7 @@ pkgs.runCommand "brook-desktop-settings" {
   cp ${schemaDir gnome}/*.xml \
     ${schemaDir pkgs.gtk3}/*.xml \
     ${schemaDir pkgs.gtk4}/*.xml schema-source/
+  cp ${filesSchemas}/*.gschema.xml schema-source/
   cat >schema-source/99-brook.gschema.override <<'SETTINGS'
   [org.gnome.desktop.wm.preferences]
   button-layout='${gnomeLayout}'
@@ -39,6 +41,8 @@ pkgs.runCommand "brook-desktop-settings" {
     grep -Fx "$required" installed-schemas
   done
   test "$(gsettings get "$schema" button-layout)" = "'${gnomeLayout}'"
+
+  gsettings list-schemas | grep -qx org.gnome.nautilus.preferences
 
   export XDG_CONFIG_HOME="$PWD/user-config" GSETTINGS_BACKEND=keyfile
   keyfile="$XDG_CONFIG_HOME/glib-2.0/settings/keyfile"

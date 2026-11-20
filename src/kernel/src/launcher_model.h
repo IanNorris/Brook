@@ -90,6 +90,8 @@ struct LauncherViewport {
     int step; // pixels a wheel tick scrolls
 };
 
+inline constexpr char LauncherFilesAppId[] = "org.gnome.Nautilus";
+
 // Trivially constructible (it lives in kernel static storage, which runs no
 // constructors): call Init() once before anything else.
 class LauncherModel {
@@ -107,7 +109,7 @@ public:
 
     // --- layout ------------------------------------------------------------
     void ResetLayout();                // the seven default categories, default pins
-    bool Parse(const char* text);      // [Launcher] section; false: defaults kept
+    bool Parse(const char* text, bool* migrated = nullptr);      // [Launcher] section; false: defaults kept
     uint32_t Serialize(char* out, uint32_t capacity) const; // 0: did not fit
     uint32_t LayoutEpoch() const { return layoutEpoch_; }   // changes on every saved-state change
 

@@ -810,7 +810,7 @@ static void refresh_desktop_entries(void)
             /* Small hardware images provide dedicated environment wrappers.
              * Preserve them when rebuilding the initially host-made manifest. */
             int hardware_wrapped = 0;
-            const char *hardware_programs[]={"mousepad", "brook-files", "brook-settings", "wayland-calc", "brook-gallery"};
+            const char *hardware_programs[]={"mousepad", "brook-settings", "wayland-calc", "brook-gallery"};
             for(size_t hi=0;hi<sizeof(hardware_programs)/sizeof(hardware_programs[0]);++hi) {
                 if(strcmp(base,hardware_programs[hi]))continue;
                 char wrapper[1200],arguments[sizeof(exec_cmd)];
@@ -841,7 +841,7 @@ static void refresh_desktop_entries(void)
             }
 
             /* Brook wrappers that refuse root (yquake2 will not run as root). */
-            const char *user_wrappers[]={"brook-quake2"};
+            const char *user_wrappers[]={"brook-quake2", "brook-nautilus"};
             for(size_t ui=0;ui<sizeof(user_wrappers)/sizeof(user_wrappers[0]);++ui) {
                 if(strcmp(base,user_wrappers[ui]))continue;
                 char original[sizeof(exec_cmd)];snprintf(original,sizeof(original),"%s",exec_cmd);

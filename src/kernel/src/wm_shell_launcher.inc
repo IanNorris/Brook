@@ -114,7 +114,9 @@ static LauncherPersistenceResult LauncherReadLayout()
     else if (done == LauncherLayoutLimit) result = {"size", -7};
     else {
         text[done] = 0;
-        if (!g_launcherModel.Parse(text)) result = {"parse", -22};
+        bool migrated = false;
+        if (!g_launcherModel.Parse(text, &migrated)) result = {"parse", -22};
+        else if (migrated) result = {"migrated", 0};
     }
     kfree(text);
     return result;
@@ -126,9 +128,9 @@ static void LauncherLoadLayout()
     const auto result = LauncherReadLayout();
     SpinLockAcquire(&g_launcherSaveLock);
     g_launcherPersistence.load = result;
-    if (!result.error) g_launcherPersistence.savedEpoch = g_launcherModel.LayoutEpoch();
+    if (!result.error && !strcmp(result.stage, "restored")) g_launcherPersistence.savedEpoch = g_launcherModel.LayoutEpoch();
     SpinLockRelease(&g_launcherSaveLock);
-    if (!result.error) KLOG_INFO(Wm, "launcher: layout restored");
+    if (!result.error) KLOG_INFO(Wm, "launcher: layout %s", result.stage);
     else if (strcmp(result.stage, "missing"))
         KLogCatConsole(LogCat::Wm, LogLevel::Warn, "launcher: load failed stage=%s errno=%d", result.stage, -result.error);
 }
@@ -150,9 +152,9 @@ static void LauncherNoteLayout(bool firstCatalog)
     for (uint32_t i = 0; i < state.pinCount; ++i)
         WmStrCopy(state.pins[i], g_launcherModel.PinKey(i), sizeof(state.pins[i]));
 
-    // Seed missing layouts at first boot. Preserve an unreadable or invalid
+    // Write defaults or the upgraded layout at first boot. Preserve an unreadable or invalid
     // existing file until the user actually changes the layout.
-    const bool seed = !strcmp(state.load.stage, "missing");
+    const bool seed = !strcmp(state.load.stage, "missing") || !strcmp(state.load.stage, "migrated");
     if (firstCatalog && !seed) {
         SpinLockRelease(&g_launcherSaveLock);
         return;

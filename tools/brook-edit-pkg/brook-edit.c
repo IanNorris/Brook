@@ -79,7 +79,7 @@ static int memfd_create_shim(const char *name, unsigned int flags) {
 
 /* ========================= Bitmap Font (6x10) ========================= */
 
-/* Same font as brook-files — minimal ASCII 32-126 */
+/* Minimal ASCII 32-126 */
 static const uint8_t g_font6x10[][10] = {
     /* 32 ' ' */ {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
     /* 33 '!' */ {0x00,0x20,0x20,0x20,0x20,0x20,0x00,0x20,0x00,0x00},

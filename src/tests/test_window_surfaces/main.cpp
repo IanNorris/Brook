@@ -650,6 +650,15 @@ int main() {
     caretPid=0;
     owner->fbPublicationGeneration=~uint64_t{0};CHECK(!WmAcquireDesktopLayers(&layers));
     CHECK(!layers.count && backingA.references==1 && backingB.references==1);
+    // Files focus uses the Wayland app ID even when the title is a folder.
+    SetWmActiveLocked(true);
+    WmStrCopy(window.appId, LauncherFilesAppId, sizeof(window.appId));
+    WmStrCopy(window.title, "Downloads", sizeof(window.title));
+    window.visible = window.focusable = true;
+    window.minimized = true;
+    WmOpenFiles();
+    CHECK(g_focusedIdx == slot && window.focused && !window.minimized);
+    SetWmActiveLocked(false);
     owner->fbBacking=nullptr;owner->fbVirtual=nullptr;window.vfbBacking=nullptr;
     std::free(owner);std::free(stranger);
     // One shell-surface list for every compositor path: the taskbar first,

@@ -23,7 +23,7 @@ LauncherApp App(const char* key, const char* name, const char* desc, const char*
 }
 
 const LauncherApp Catalog[] = {
-    App("brook-files", "Files", "Browse files and directories", "system", true),
+    App(LauncherFilesAppId, "Files", "Browse files and directories", "system", true),
     App("terminal", "Terminal", "Command line shell", "system", true),
     App("brook-settings", "Settings", "Appearance and taskbar", "system", true),
     App("firefox", "Firefox", "Web browser", "internet"),
@@ -66,7 +66,7 @@ void Defaults() {
     auto m = Fresh();
     CHECK(m->CategoryCount() == 7);
     CHECK(m->CategoryOf(Idx(*m, "quake")) == Cat(*m, "Games"));
-    CHECK(m->CategoryOf(Idx(*m, "brook-files")) == Cat(*m, "System"));
+    CHECK(m->CategoryOf(Idx(*m, LauncherFilesAppId)) == Cat(*m, "System"));
     CHECK(m->CategoryOf(Idx(*m, "mystery")) == -1);
     CHECK(m->UnsortedCount() == 1);
     // Members are alphabetical among the defaults.
@@ -147,7 +147,7 @@ void Navigation() {
     (void)order;
     // Down from nothing selects the first app; Up wraps to the last.
     CHECK(m->Key(LauncherKey::Down).command == LauncherCommand::Changed);
-    CHECK(m->Selected() == Idx(*m, "brook-files"));
+    CHECK(m->Selected() == Idx(*m, LauncherFilesAppId));
     m->Key(LauncherKey::Down);
     CHECK(m->Selected() == Idx(*m, "brook-settings"));
     m->Key(LauncherKey::Up); m->Key(LauncherKey::Up);
@@ -155,10 +155,10 @@ void Navigation() {
     // The last item is scrolled into view.
     CHECK(m->Scroll() > 0 && m->Scroll() <= m->MaxScroll());
     m->Key(LauncherKey::Home);
-    CHECK(m->Selected() == Idx(*m, "brook-files") && m->Scroll() == 0);
+    CHECK(m->Selected() == Idx(*m, LauncherFilesAppId) && m->Scroll() == 0);
     // Enter launches and records Recent.
     auto r = m->Key(LauncherKey::Enter);
-    CHECK(r.command == LauncherCommand::Launch && r.app == Idx(*m, "brook-files"));
+    CHECK(r.command == LauncherCommand::Launch && r.app == Idx(*m, LauncherFilesAppId));
     // Tab: list -> tiles -> rail -> list.
     m->Key(LauncherKey::Tab);
     CHECK(m->Section() == LauncherSection::Tiles && m->SelectedTile() == 0);
@@ -211,10 +211,10 @@ void PinsAndRecent() {
     // Keyboard: Alt+Enter opens the menu on the selection, Enter unpins.
     m->Key(LauncherKey::Home);
     m->Key(LauncherKey::Enter, 0, LauncherModAlt);
-    CHECK(m->MenuOpen() && m->MenuApp() == Idx(*m, "brook-files"));
+    CHECK(m->MenuOpen() && m->MenuApp() == Idx(*m, LauncherFilesAppId));
     CHECK(m->Key(LauncherKey::Char, 'x').command == LauncherCommand::None); // the menu is modal
     m->Key(LauncherKey::Enter);
-    CHECK(!m->Pinned(Idx(*m, "brook-files")));
+    CHECK(!m->Pinned(Idx(*m, LauncherFilesAppId)));
     // A press elsewhere only closes the menu.
     m->Press({LauncherTargetKind::Tile, 0}, true, 5, 5);
     CHECK(m->MenuOpen());
@@ -252,7 +252,7 @@ void Reorder() {
     m->Press({LauncherTargetKind::Rail, 0}, false, 0, 0);
     m->Key(LauncherKey::Down);
     m->Key(LauncherKey::Down, 0, LauncherModAlt);
-    CHECK(m->CategoryOf(Idx(*m, "brook-files")) == Cat(*m, "System"));
+    CHECK(m->CategoryOf(Idx(*m, LauncherFilesAppId)) == Cat(*m, "System"));
 }
 
 void Persistence() {
@@ -266,7 +266,7 @@ void Persistence() {
     const uint32_t n = m->Serialize(text, sizeof(text));
     CHECK(n > 0 && n < sizeof(text));
     CHECK(std::strstr(text, "[Launcher]\nversion=1\ntop_row=recent\n"));
-    CHECK(std::strstr(text, "pinned=brook-files,terminal,brook-settings,firefox,quake,doom\n"));
+    CHECK(std::strstr(text, "pinned=org.gnome.Nautilus,terminal,brook-settings,firefox,quake,doom\n"));
     CHECK(std::strstr(text, "recent=quake2,calc\n"));
     CHECK(std::strstr(text, "category.office=Office|amber|doc|calc,edit\n"));
     CHECK(std::strstr(text, "category.graphics=Graphics|pink|brush|doom\n"));
@@ -291,6 +291,25 @@ void Persistence() {
     loaded->SetCatalog(more, CatalogCount + 1);
     CHECK(loaded->CategoryOf(Idx(*loaded, "fbtest")) == Cat(*loaded, "Demos"));
     CHECK(loaded->CategoryOf(Idx(*loaded, "inkscape")) == -1);
+
+    // Existing layout keys follow Files across the package change, including
+    // recent and category membership. Preserve order and collapse aliases.
+    auto old = std::make_unique<LauncherModel>();
+    old->Init();
+    const uint32_t before = old->LayoutEpoch();
+    bool migrated = false;
+    CHECK(old->Parse("[Launcher]\nversion=1\npinned=terminal,brook-files,org.gnome.Nautilus,firefox\n"
+                     "recent=brook-files,calc,org.gnome.Nautilus\ncategories=system\n"
+                     "category.system=System|blue|sliders|brook-files,terminal\n", &migrated));
+    CHECK(migrated && old->LayoutEpoch() != before);
+    old->SetCatalog(Catalog, CatalogCount);
+    CHECK(old->Pinned(Idx(*old, LauncherFilesAppId)));
+    CHECK(old->CategoryOf(Idx(*old, LauncherFilesAppId)) == Cat(*old, "System"));
+    CHECK(old->Serialize(again, sizeof(again)) > 0);
+    CHECK(std::strstr(again, "pinned=terminal,org.gnome.Nautilus,firefox\n"));
+    CHECK(std::strstr(again, "recent=org.gnome.Nautilus,calc\n"));
+    CHECK(!std::strstr(again, "brook-files"));
+    CHECK(old->Parse(again, &migrated) && !migrated);
 
     // A bad or missing section falls back to the defaults.
     auto bad = std::make_unique<LauncherModel>();

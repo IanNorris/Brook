@@ -207,7 +207,7 @@ LauncherApp LauncherSample(const char* key, const char* name, const char* desc, 
     return a;
 }
 const LauncherApp launcherApps[] = {
-    LauncherSample("brook-files", "Files", "Browse files and directories", "system"),
+    LauncherSample(LauncherFilesAppId, "Files", "Browse files and directories", "system"),
     LauncherSample("terminal", "Terminal", "Command line shell", "system"),
     LauncherSample("brook-settings", "Settings", "Appearance and taskbar", "system"),
     LauncherSample("kconsole", "Kernel Console", "Read-only kernel log", "system"),
@@ -276,7 +276,7 @@ void Launcher(const std::string& prefix, const ChromeStyle& s, uint32_t screenW,
         // A category view, scrolled part way into a row (the list clips it),
         // with nothing pinned.
         {"launcher-category", [](LauncherModel& m, const ChromeLauncherFrame&, ChromeLauncherChrome&) {
-            for (const char* key : {"brook-files", "terminal", "brook-settings", "firefox", "quake"}) m.TogglePin(m.FindApp(key));
+            for (const char* key : {LauncherFilesAppId, "terminal", "brook-settings", "firefox", "quake"}) m.TogglePin(m.FindApp(key));
             m.Press({LauncherTargetKind::Rail, 0}, false, 0, 0); m.ScrollTicks(-5); }},
         // The restart confirmation in the footer.
         {"launcher-prompt", [](LauncherModel&, const ChromeLauncherFrame&, ChromeLauncherChrome& c) {

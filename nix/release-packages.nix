@@ -1,6 +1,7 @@
 # Public candidate: explicit open-source payload, never an existing review disk.
 { pkgs ? import ./nixpkgs.nix { config.allowUnfree = false; } }:
 let
+  files = import ./desktop-files.nix { inherit pkgs; };
   fonts = import ../tools/brook-fonts-pkg {};
   cursors = import ../tools/brook-cursor-theme {};
   chromium = import ../tools/chromium-brook-pkg { inherit pkgs; downstreamStaging = true; };
@@ -8,7 +9,7 @@ let
   graphics = import ./runtime-graphics.nix { inherit pkgs; };
   native = map (name: let f = import (../tools + "/${name}"); in
     f (if builtins.hasAttr "pkgs" (builtins.functionArgs f) then { inherit pkgs; } else {})) [
-    "waylandd-pkg" "wayland-calc-pkg" "brook-player-pkg" "brook-files-pkg"
+    "waylandd-pkg" "wayland-calc-pkg" "brook-player-pkg"
     "brook-gallery-pkg" "brook-settings-pkg" "brook-message-pkg" "brook-session-pkg" "locale-brook-pkg"
   ];
   launchers = pkgs.runCommand "brook-release-launchers" { meta.license = pkgs.lib.licenses.mit; } ''
@@ -48,7 +49,7 @@ let
     pkgs.ffmpeg.bin pkgs.wayland pkgs.xwayland graphics.mesaRuntime pkgs.tzdata
     pkgs.hicolor-icon-theme pkgs.adwaita-icon-theme pkgs.kdePackages.breeze-icons pkgs.shared-mime-info
     pkgs.gimp pkgs.qalculate-gtk pkgs.xfce.mousepad pkgs.openttd pkgs.gnome-commander
-    chromium vlc fonts cursors launchers (import ./desktop-settings.nix { inherit pkgs; })
+    chromium vlc fonts cursors launchers files.integration files.gvfs (import ./desktop-settings.nix { inherit pkgs; inherit (files) nautilus; })
   ] ++ native;
 in {
   inherit packages;

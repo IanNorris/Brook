@@ -34,6 +34,9 @@ static void superChord() {
     CHECK(!down(s,SC_LSUPER,INPUT_MOD_SUPER).deliver);
     r=down(s,GlobalShortcuts::ScEnter,INPUT_MOD_SUPER);CHECK(!r.deliver && r.action==Action::SpawnTerminal);
     r=up(s,GlobalShortcuts::ScEnter,INPUT_MOD_SUPER);CHECK(!r.deliver && r.action==Action::None);
+    r=down(s,GlobalShortcuts::ScE,INPUT_MOD_SUPER);CHECK(!r.deliver && r.action==Action::OpenFiles);
+    r=down(s,GlobalShortcuts::ScE,INPUT_MOD_SUPER);CHECK(!r.deliver && r.action==Action::None);
+    CHECK(!up(s,GlobalShortcuts::ScE).deliver);
     r=down(s,GlobalShortcuts::ScQ,INPUT_MOD_SUPER);CHECK(!r.deliver && r.action==Action::CloseFocusedWindow);
     r=up(s,GlobalShortcuts::ScQ,INPUT_MOD_SUPER);CHECK(!r.deliver);
     r=down(s,GlobalShortcuts::ScG,INPUT_MOD_SUPER);CHECK(!r.deliver && r.action==Action::ToggleGlass);

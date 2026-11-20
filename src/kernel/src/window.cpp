@@ -2610,6 +2610,38 @@ void WmLauncherExec(int itemIdx)
     AdmitLauncherItem(guard.get(),itemIdx,false,&token,&coalesced);
 }
 
+void WmOpenFiles()
+{
+    if (!WmIsActive() || !ShutdownLaunchAllowed()) return;
+    WmLauncherClose();
+    {
+        VfbGuard guard;
+        int best = -1;
+        for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i) {
+            const auto& w = g_windows[i];
+            if (w.proc && w.visible && w.focusable && !strcmp(w.appId, LauncherFilesAppId) &&
+                (best < 0 || w.zOrder > g_windows[best].zOrder))
+                best = static_cast<int>(i);
+        }
+        if (best >= 0) {
+            if (g_windows[best].minimized) RestoreWindowLocked(best);
+            else FocusWindowLocked(best);
+            CompositorMarkDirty();
+            return;
+        }
+    }
+    LauncherReadGuard guard;
+    const auto& catalog = guard.get();
+    for (uint32_t i = 0; i < catalog.count; ++i) {
+        if (!catalog.items[i].valid || strcmp(catalog.items[i].appId, LauncherFilesAppId)) continue;
+        uint64_t token = 0;
+        bool coalesced = false;
+        AdmitLauncherItem(catalog, static_cast<int>(i), false, &token, &coalesced);
+        return;
+    }
+    CompositorMarkDirty();
+}
+
 int WmLauncherActivate(const char* appId,uint32_t generation,uint64_t* token,bool* coalesced)
 {
     LauncherReadGuard guard;const auto& catalog=guard.get();

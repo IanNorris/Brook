@@ -656,9 +656,9 @@ declare:
 [Launcher]
 version=1
 top_row=pinned
-pinned=brook-files,terminal,settings,firefox,quake
+pinned=org.gnome.Nautilus,terminal,settings,firefox,quake
 categories=system,internet,media,office,graphics,games,demos,c1
-category.system=System|blue|sliders|brook-files,terminal,settings,kconsole,gallery
+category.system=System|blue|sliders|org.gnome.Nautilus,terminal,settings,kconsole,gallery
 category.c1=Writing|green|folder|brook-edit,mousepad
 new=inkscape
 ```

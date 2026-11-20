@@ -1,7 +1,0 @@
-# title: Files
-# app_id: brook-files
-# executable: brook-files
-# Requires: /nix/profile/bin/brook-files
-# desc: Browse files and directories
-# category: system
-source /boot/SCRIPTS/wayland_files.rc

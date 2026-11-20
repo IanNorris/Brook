@@ -2,11 +2,12 @@
 # Deliberately excludes browsers, games, Mesa/LLVM and account/private data.
 { pkgs ? import ./nixpkgs.nix { config.allowUnfree = false; } }:
 let
+  files = import ./desktop-files.nix { inherit pkgs; };
   fonts = import ../tools/brook-fonts-pkg {};
   cursors = import ../tools/brook-cursor-theme {};
   native = map (name: let f = import (../tools + "/${name}"); in
     f (if builtins.hasAttr "pkgs" (builtins.functionArgs f) then { inherit pkgs; } else {})) [
-    "waylandd-pkg" "wayland-calc-pkg" "brook-files-pkg"
+    "waylandd-pkg" "wayland-calc-pkg"
     "brook-settings-pkg" "brook-message-pkg" "brook-session-pkg"
   ];
   launchers = pkgs.runCommand "brook-hardware-launchers" {} ''
@@ -25,20 +26,12 @@ let
     mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME"
     exec "$@"
     SCRIPT
-    for app in mousepad brook-files brook-settings wayland-calc; do
+    for app in mousepad brook-settings wayland-calc; do
       cat > $out/bin/hardware-$app <<SCRIPT
     #!${pkgs.bash}/bin/bash
     exec /nix/profile/bin/brook-run /nix/profile/bin/$app "\$@"
     SCRIPT
     done
-    cat > $out/share/applications/brook-hardware-files.desktop <<'DESKTOP'
-    [Desktop Entry]
-    Type=Application
-    Name=Files
-    Exec=/nix/profile/bin/hardware-brook-files
-    Icon=system-file-manager
-    Categories=System;FileManager;
-    DESKTOP
     cat > $out/bin/hardware-dbus <<'SCRIPT'
     #!${pkgs.bash}/bin/bash
     export PATH=/nix/profile/bin:/boot/BIN
@@ -65,7 +58,7 @@ let
     # its container; ship it in the profile rather than relying on /usr/bin.
     (pkgs.lib.getBin pkgs.util-linuxMinimal)
     pkgs.hicolor-icon-theme pkgs.adwaita-icon-theme pkgs.kdePackages.breeze-icons pkgs.shared-mime-info
-    fonts cursors launchers (import ./desktop-settings.nix { inherit pkgs; })
+    fonts cursors launchers files.integration files.gvfs (import ./desktop-settings.nix { inherit pkgs; inherit (files) nautilus; })
   ] ++ native;
 in {
   inherit packages;

@@ -24,6 +24,7 @@ enum class GlobalShortcutAction : uint8_t {
     CloseFocusedWindow,
     CycleFocus,
     SpawnTerminal,
+    OpenFiles,
     ToggleGlass,
     CyclePerformanceHud,
     LauncherPromptKey, // Enter/Escape/Tab/Left/Right for the launcher power prompt
@@ -47,7 +48,7 @@ struct GlobalShortcutContext {
 
 class GlobalShortcuts {
 public:
-    static constexpr uint8_t ScEscape = 0x01, ScTab = 0x0F, ScQ = 0x10,
+    static constexpr uint8_t ScEscape = 0x01, ScTab = 0x0F, ScQ = 0x10, ScE = 0x12,
         ScP = 0x19, ScEnter = 0x1C, ScG = 0x22, ScF4 = 0x3E;
 
     static bool IsSuper(uint8_t scan) { return scan == SC_LSUPER || scan == SC_RSUPER; }
@@ -103,6 +104,7 @@ public:
         else if (alt && scan == ScF4) r.action = GlobalShortcutAction::CloseFocusedWindow;
         else if (alt && scan == ScTab) r.action = GlobalShortcutAction::CycleFocus;
         else if (super && scan == ScEnter) r.action = GlobalShortcutAction::SpawnTerminal;
+        else if (super && scan == ScE) r.action = GlobalShortcutAction::OpenFiles;
         else if (super && scan == ScQ) r.action = GlobalShortcutAction::CloseFocusedWindow;
         else if (super && scan == ScG) r.action = GlobalShortcutAction::ToggleGlass;
         if (r.action != GlobalShortcutAction::None || Swallowed(scan)) {

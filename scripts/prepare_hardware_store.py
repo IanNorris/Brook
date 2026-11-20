@@ -205,7 +205,7 @@ def main():
     records = []
     for line in manifest.read_text().splitlines():
         fields = line.split('\t')
-        for name in ('mousepad', 'brook-files', 'brook-settings', 'wayland-calc', 'brook-gallery'):
+        for name in ('mousepad', 'brook-settings', 'wayland-calc', 'brook-gallery'):
             if fields[1].split(' ', 1)[0] in (name, '/nix/profile/bin/'+name):
                 fields[1] = '/nix/profile/bin/hardware-'+name
         records.append('\t'.join(fields))

@@ -524,6 +524,7 @@ uint32_t WmDesktopHeight(uint32_t screenH);
 
 // Spawn a new terminal window (Super+Enter handler).
 void WmSpawnTerminal();
+void WmOpenFiles();
 
 // ---------------------------------------------------------------------------
 // Per-window VFB API (Phase A of wayland↔WM unification).
