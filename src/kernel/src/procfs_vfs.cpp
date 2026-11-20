@@ -82,8 +82,8 @@ int ProcFsMountPrivate(MountNamespace* ns,const VfsPath& root,const VfsPath& tar
     instance->pid = pidView;
     PidNamespaceRetain(instance->pid);
     const VfsFreshMountVisibility visibility{root, ProcMountCovers};
-    const int error = VfsMountNamespaceMountFresh(ns,target,"procfs",&g_procFsOps,instance,0,
-        attributes|MountNoSuid|MountNoDev|MountNoExec,nullptr,&visibility);
+    const int error = VfsMountNamespaceMountVisible(ns,target,"procfs",&g_procFsOps,instance,
+        attributes|MountNoSuid|MountNoDev|MountNoExec,visibility);
     if (error) ProcFsUnmountCb(instance);
     return error;
 }

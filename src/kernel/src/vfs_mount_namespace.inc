@@ -353,7 +353,7 @@ static int VfsFreshMountRestrictionsLocked(MountNamespace* ns, const VfsFsOps* o
     return -1;
 }
 
-int VfsMountNamespaceMountFresh(MountNamespace* ns,const VfsPath& inputTarget,
+static int MountFreshWithVisibility(MountNamespace* ns,const VfsPath& inputTarget,
     const char* fsName,const VfsFsOps* ops,void* privateData,uint8_t pdrv,uint64_t attributes,
     uint64_t* publication,const VfsFreshMountVisibility* visibility)
 {
@@ -414,6 +414,19 @@ int VfsMountNamespaceMountFresh(MountNamespace* ns,const VfsPath& inputTarget,
     if(publication)*publication=mount->publication;
     return 0;
 }
+int VfsMountNamespaceMountFresh(MountNamespace* ns,const VfsPath& target,
+    const char* fsName,const VfsFsOps* ops,void* privateData,uint8_t pdrv,uint64_t attributes,uint64_t* publication)
+{
+    return MountFreshWithVisibility(ns,target,fsName,ops,privateData,pdrv,attributes,publication,nullptr);
+}
+
+int VfsMountNamespaceMountVisible(MountNamespace* ns,const VfsPath& target,
+    const char* fsName,const VfsFsOps* ops,void* privateData,uint64_t attributes,
+    const VfsFreshMountVisibility& visibility)
+{
+    return MountFreshWithVisibility(ns,target,fsName,ops,privateData,0,attributes,nullptr,&visibility);
+}
+
 // Test exact retained ancestry, never reporting-label prefixes. The first edge
 // on the source attachment determines whether the entire child mount belongs
 // to a recursive bind of a partial directory on that attachment.

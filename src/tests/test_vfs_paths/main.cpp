@@ -222,7 +222,7 @@ static void testFreshMounts(brook::MountNamespace* ns,const brook::VfsPath& root
     }
     assert(published && freshUnmounts==1);
     const VfsFreshMountVisibility visibility{root, [](const void*, const void*) { return true; }};
-    assert(VfsMountNamespaceMountFresh(ns,second,"fresh",&freshOps,&other,0,0,nullptr,&visibility)==-1);
+    assert(VfsMountNamespaceMountVisible(ns,second,"fresh",&freshOps,&other,0,visibility)==-1);
     assert(!VfsMountNamespaceMountFresh(ns,target,"fresh",&freshOps,&first,0,0,&publication) && publication);
     auto source = resolve(root,root,"/ns-target");
     {
@@ -235,12 +235,12 @@ static void testFreshMounts(brook::MountNamespace* ns,const brook::VfsPath& root
     auto base = resolve(root,source,"masked");
     assert(!VfsMountNamespaceBind(ns,second,base));
     auto covering = resolve(root,source,"masked");
-    assert(VfsMountNamespaceMountFresh(ns,second,"fresh",&freshOps,&other,0,0,nullptr,&visibility)==-1);
+    assert(VfsMountNamespaceMountVisible(ns,second,"fresh",&freshOps,&other,0,visibility)==-1);
     assert(!VfsMountNamespaceDetach(ns,covering));
     VfsPathRelease(covering);VfsPathRelease(base);VfsPathRelease(source);
     VfsDrainMountCleanup();
     first.root.children.erase("masked");
-    assert(!VfsMountNamespaceMountFresh(ns,second,"fresh",&freshOps,&other,0,0,nullptr,&visibility));
+    assert(!VfsMountNamespaceMountVisible(ns,second,"fresh",&freshOps,&other,0,visibility));
     // ASCII-folded reporting labels must not introduce aliases when the
     // covering filesystem's own lookup remains case-sensitive.
     assert(FindMount("/ns-target",nullptr)!=FindMount("/NS-TARGET",nullptr));

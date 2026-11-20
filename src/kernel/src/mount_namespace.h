@@ -38,7 +38,10 @@ struct VfsFreshMountVisibility {
 };
 int VfsMountNamespaceMountFresh(MountNamespace* ns,const VfsPath& target,
     const char* fsName,const VfsFsOps* ops,void* privateData,uint8_t pdrv=0,uint64_t attributes=0,
-    uint64_t* publication=nullptr,const VfsFreshMountVisibility* visibility=nullptr);
+    uint64_t* publication=nullptr);
+int VfsMountNamespaceMountVisible(MountNamespace* ns,const VfsPath& target,
+    const char* fsName,const VfsFsOps* ops,void* privateData,uint64_t attributes,
+    const VfsFreshMountVisibility& visibility);
 // Owned copied metadata; no backend callbacks or nested VFS lock acquisition.
 // Caller holds namespace/root leases. Rows are ordered parent before child.
 struct VfsMountInfo {
