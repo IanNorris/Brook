@@ -139,7 +139,8 @@ int64_t sys_getpid(uint64_t, uint64_t, uint64_t,
     Process* proc = ProcessCurrent();
     if (!proc) return 1;
     // For threads, getpid returns the thread group leader's PID (tgid)
-    return proc->tgid ? proc->tgid : proc->pid;
+    const uint32_t group = proc->tgid ? proc->tgid : proc->pid;
+    return proc->pidNamespaceIds.VisibleTgid(proc->pidNamespaceIds.Active(), group);
 }
 
 // ---------------------------------------------------------------------------
@@ -620,7 +621,7 @@ int64_t sys_gettid(uint64_t, uint64_t, uint64_t,
                     uint64_t, uint64_t, uint64_t)
 {
     Process* proc = ProcessCurrent();
-    return proc ? proc->pid : 1;
+    return proc ? proc->pidNamespaceIds.VisibleTid(proc->pidNamespaceIds.Active(), proc->pid) : 1;
 }
 
 // ---------------------------------------------------------------------------

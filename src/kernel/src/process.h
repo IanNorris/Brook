@@ -11,6 +11,7 @@
 #include "fd_table.h"
 #include "credential_ids.h"
 #include "user_namespace.h"
+#include "pid_namespace_ids.h"
 #include "signal_return.h"
 #include "task_capacity.h"
 
@@ -559,6 +560,7 @@ struct Process
     ProcessLifecycleRole lifecycleRole;
 
     UserCapabilityState capabilities; // credential lock; meaningful in private user namespaces
+    PidNamespaceIds pidNamespaceIds;
     UserNamespace* userNamespace; // owned immutable identity after publication; null is initial
 
     // Wait diagnostics (proc_wait_info.h), written by the task itself in
