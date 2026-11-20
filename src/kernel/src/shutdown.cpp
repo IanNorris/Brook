@@ -32,7 +32,11 @@
 namespace brook {
 namespace {
 enum class Phase { Empty,Closing,Services,Cleanup,Syncing,Ready,Committing,Failed,Cancelled };
-struct Operation {char id[33];Phase phase;bool restart,automatic,cancel,commit,acLoss;int error;};
+struct Operation {
+    char id[33];Phase phase;bool restart,automatic,cancel,commit,acLoss;
+    bool forceRequested,forceDispatched;
+    int error;
+};
 Operation operations[64]{};int current=-1;SpinLock lock{};
 bool workerStarted=false,powerOff=false,powerRestart=false,irreversible=false;
 UsbBootRecoveryPolicy usbBootRecovery{};
@@ -47,7 +51,10 @@ struct AcRecovery {
 const char* desktopNotice=nullptr;
 uint64_t desktopSequence=0;bool closeCaptured=false,admissionReady=false,closePolling=false;
 struct CloseTarget {uint32_t id;uint64_t incarnation;bool sent;};
-struct ClientIdentity {uint32_t pid;uint64_t incarnation;};
+struct ClientIdentity {uint32_t pid;uint64_t incarnation;uint64_t seenAt;};
+constexpr uint64_t ForceAppsGraceMs=10000;
+ClientIdentity forceCandidates[WM_MAX_WINDOWS]{},approvedApps[WM_MAX_WINDOWS]{};
+uint32_t forceCandidateCount=0,approvedAppCount=0;
 ClientIdentity closeClients[MAX_PROCESSES]{};uint32_t closeClientCount=0;
 CloseTarget closeTargets[WM_MAX_WINDOWS]{};uint32_t closeCount=0,guiRemaining=0;
 DebugTaskSnapshot tasks[MAX_PROCESSES];uint32_t taskCount=0;
@@ -70,6 +77,30 @@ const char* Name(Phase phase) {
     case Phase::Committing:return "committing";case Phase::Failed:return "failed";
     case Phase::Cancelled:return "cancelled";
     }return "failed";
+}
+ClientIdentity WindowClient(const WmDebugWindow& window) {
+    if(window.clientPid && window.clientIncarnation)
+        return {window.clientPid,window.clientIncarnation,0};
+    // Native VFB apps own their windows. Do not fall back to a Wayland
+    // provider for a missing client identity.
+    if(window.apiWindow && window.clientOrigin==WmClientOrigin::Unknown)
+        return {window.providerPid,window.providerIncarnation,0};
+    return {};
+}
+bool SameClient(const ClientIdentity& a,const ClientIdentity& b) {
+    return a.pid==b.pid && a.incarnation==b.incarnation;
+}
+Process* ReferenceForceApp(const ClientIdentity& identity) {
+    auto* process=SchedulerFindProcessReference(uint16_t(identity.pid));
+    if(!process)return nullptr;
+    if(process->incarnation==identity.incarnation && !process->isKernelThread &&
+       process->lifecycleRole!=ProcessLifecycleRole::Service &&
+       process->state!=ProcessState::Terminated)return process;
+    ProcessUnref(process);
+    return nullptr;
+}
+bool CanForceAppsLocked(const Operation& op) {
+    return op.phase==Phase::Closing && !op.cancel && !op.forceRequested && forceCandidateCount;
 }
 bool Active(Phase phase) {return phase!=Phase::Empty&&phase!=Phase::Failed&&phase!=Phase::Cancelled;}
 void SetPhase(int index,Phase phase,int error=0) {
@@ -177,6 +208,34 @@ uint32_t SignalGroups(bool services,int signal,const uint32_t* owners,uint32_t o
     }
     return sent;
 }
+void ForceApprovedApps(int selected) {
+    SpinLockAcquire(&lock);
+    auto& op=operations[selected];
+    const bool dispatch=current==selected && op.phase==Phase::Closing &&
+        op.forceRequested && !op.forceDispatched && !op.cancel;
+    if(dispatch)op.forceDispatched=true;
+    SpinLockRelease(&lock);
+    if(!dispatch)return;
+
+    uint64_t tick=0;
+    const uint32_t count=WmSnapshotDebugWindows(workerWindows,WM_MAX_WINDOWS,&tick);
+    for(uint32_t i=0;i<approvedAppCount;++i) {
+        const auto& approved=approvedApps[i];
+        bool stillOpen=false;
+        for(uint32_t j=0;j<count;++j) {
+            const auto& window=workerWindows[j];
+            if(!window.providerKernel && window.focusable && SameClient(WindowClient(window),approved)) {
+                stillOpen=true;break;
+            }
+        }
+        if(!stillOpen)continue;
+        if(auto* process=ReferenceForceApp(approved)) {
+            KLog("shutdown: confirmed force close of app pid %u",approved.pid);
+            ProcessSendSignal(process,9);
+            ProcessUnref(process);
+        }
+    }
+}
 void StopServices(int signal=15) {SignalGroups(true,signal,nullptr,0,true);}
 // Closing phase: bounded escalation for processes that have no window to
 // answer the advisory close, and the status naming what still blocks.
@@ -210,9 +269,16 @@ void UpdateClosing(int selected,bool captured,uint32_t windows,uint32_t apps,uin
     Text t{r.status,sizeof(r.status)};const char* stage="waiting";
     t.put("Closing apps - ");
     if(windows) {
-        stage="windows";t.num(windows);t.put(windows==1?" window open":" windows open");
+        stage="windows";
+        SpinLockAcquire(&lock);
+        const auto& op=operations[selected];
+        const bool forceAvailable=CanForceAppsLocked(op),forceRequested=op.forceRequested;
+        SpinLockRelease(&lock);
+        if(forceAvailable)t.put("force close loses unsaved work; ");
+        t.num(windows);t.put(windows==1?" window open":" windows open");
         if(r.listed){t.put("; waiting for ");PutBlockers(t,r,3);}
-        t.put("; resolve save dialogs, or Cancel");
+        if(forceRequested)t.put("; waiting for force close");
+        else if(!forceAvailable)t.put("; resolve save dialogs, or Cancel");
     }else if(r.count) {
         t.put("no window: ");PutBlockers(t,r,3);t.put("; ");
         r.nextSignalMs=windowless.MsUntilNext(now);stage=windowless.StageName();
@@ -262,6 +328,7 @@ void Worker(void*) {
                 SchedulerSetUserBirthClosed(false);WmSetLaunchInhibited(false);DebugJobsSetLaunchInhibited(false);
                 SetPhase(selected,Phase::Cancelled);continue;
             }
+            ForceApprovedApps(selected);
             uint32_t apps=0;Census(&apps);
             if(!op.cancel){UpdateClosing(selected,captured,windows,apps,ApicTickCount());Census(&apps);}
             if(!op.cancel&&captured&&!windows&&!apps&&!WmLauncherDispatching()&&!DebugJobsActive()) {
@@ -419,6 +486,7 @@ void HandleShutdownCommand(const char* id,const char* verb,char state[24],int* e
     *error=0;bool admitted=false;SpinLockAcquire(&lock);int found=-1,empty=-1;
     for(int i=0;i<64;++i){if(operations[i].id[0]&&!strcmp(operations[i].id,id))found=i;else if(!operations[i].id[0]&&empty<0)empty=i;}
     const bool start=!strcmp(verb,"shutdown")||!strcmp(verb,"restart");const bool restart=!strcmp(verb,"restart");
+    const bool forceApps=!strcmp(verb,"force_apps");
     const char* result=nullptr;
     if(start&&found>=0&&operations[found].restart!=restart){result="conflict";*error=-22;}
     else if(start&&found<0) {
@@ -431,12 +499,21 @@ void HandleShutdownCommand(const char* id,const char* verb,char state[24],int* e
             // Admission closes under the launch/job locks before the worker can
             // observe this operation. Already dispatched work is awaited.
             current=found;closeCaptured=false;guiRemaining=0;windowOwnerCount=0;admissionReady=false;admitted=true;
+            forceCandidateCount=approvedAppCount=0;
             windowless.Reset();memset(&blockerReport,0,sizeof(blockerReport));
         }
-    }else if(!start&&strcmp(verb,"power_status")&&strcmp(verb,"cancel")&&strcmp(verb,"commit")){result="unsupported";*error=-95;}
+    }else if(!start&&!forceApps&&strcmp(verb,"power_status")&&strcmp(verb,"cancel")&&strcmp(verb,"commit")){result="unsupported";*error=-95;}
     if(!result&&found<0){result="missing";*error=-2;}
     if(!result) {
         auto& op=operations[found];
+        if(forceApps && !op.forceRequested) {
+            if(current!=found || !CanForceAppsLocked(op)){result="not_ready";*error=-16;}
+            else {
+                approvedAppCount=forceCandidateCount;
+                memcpy(approvedApps,forceCandidates,approvedAppCount*sizeof(approvedApps[0]));
+                op.forceRequested=true;
+            }
+        }
         if(!strcmp(verb,"cancel")) {if(op.phase==Phase::Closing)op.cancel=true;else if(op.phase!=Phase::Cancelled){result="too_late";*error=-16;}}
         if(!strcmp(verb,"commit")) {if(op.phase==Phase::Ready||op.phase==Phase::Committing) {
                 if(op.restart?powerRestart:powerOff)op.commit=true;
@@ -466,6 +543,17 @@ void ShutdownDesktopRequest(bool restart) {RequestDesktopPower(restart,false);}
 void ShutdownDesktopCancel() {
     char id[33]{};SpinLockAcquire(&lock);if(current>=0)memcpy(id,operations[current].id,33);SpinLockRelease(&lock);
     if(id[0]){char state[24];int error;ShutdownCommand(id,"cancel",state,&error);if(!error)__atomic_store_n(&desktopNotice,static_cast<const char*>(nullptr),__ATOMIC_RELEASE);}
+}
+void ShutdownDesktopForceApps() {
+    char id[33]{};SpinLockAcquire(&lock);if(current>=0)memcpy(id,operations[current].id,33);SpinLockRelease(&lock);
+    if(id[0]){char state[24];int error;ShutdownCommand(id,"force_apps",state,&error);}
+}
+bool ShutdownCanForceApps(const char* id) {
+    SpinLockAcquire(&lock);
+    const bool result=current>=0 && (!id || !strcmp(operations[current].id,id)) &&
+        CanForceAppsLocked(operations[current]);
+    SpinLockRelease(&lock);
+    return result;
 }
 static const char* DescribePhase(Phase phase,bool restart,bool live=false,bool cancelling=false) {
     // live: this is the current request, so the worker's detailed status applies.
@@ -525,12 +613,13 @@ void ShutdownCompositorPoll() {
     const uint32_t seenBefore=closeClientCount;
     for(uint32_t i=0;i<count;++i) {
         const auto& w=windows[i];if(w.providerKernel||!w.focusable)continue;
-        bool known=false;for(uint32_t j=0;j<seenBefore;++j)if(closeClients[j].pid==w.clientPid&&closeClients[j].incarnation==w.clientIncarnation)known=true;
-        if(known||(!capture&&(!w.clientPid||!w.clientIncarnation)))continue;
+        auto identity=WindowClient(w);
+        bool known=false;for(uint32_t j=0;j<seenBefore;++j)if(SameClient(closeClients[j],identity))known=true;
+        if(known||(!capture&&(!identity.pid||!identity.incarnation)))continue;
         if(closeCount==WM_MAX_WINDOWS||closeClientCount==MAX_PROCESSES)continue; // fail closed on finite tracking capacity
         closeTargets[closeCount++]={w.id,w.incarnation,false};
-        bool added=false;for(uint32_t j=seenBefore;j<closeClientCount;++j)if(closeClients[j].pid==w.clientPid&&closeClients[j].incarnation==w.clientIncarnation)added=true;
-        if(!added)closeClients[closeClientCount++]={w.clientPid,w.clientIncarnation};
+        bool added=false;for(uint32_t j=seenBefore;j<closeClientCount;++j)if(SameClient(closeClients[j],identity))added=true;
+        if(!added){identity.seenAt=ApicTickCount();closeClients[closeClientCount++]=identity;}
     }
     for(uint32_t i=0;i<closeCount;++i)if(!closeTargets[i].sent) {
         WmDebugWindow result{};uint32_t method=0;auto& target=closeTargets[i];
@@ -538,12 +627,28 @@ void ShutdownCompositorPoll() {
         if(error!=-11)target.sent=true;
     }
     uint32_t remaining=0,owners[WM_MAX_WINDOWS*2];uint32_t ownerCount=0;
+    ClientIdentity candidates[WM_MAX_WINDOWS];uint32_t candidateCount=0;
+    const uint64_t now=ApicTickCount();
     for(uint32_t i=0;i<count;++i)if(!windows[i].providerKernel&&windows[i].focusable) {
         ++remaining;
+        const auto identity=WindowClient(windows[i]);
+        if(identity.pid && identity.pid<MAX_PROCESSES && identity.incarnation) {
+            bool mature=false;
+            for(uint32_t j=0;j<closeClientCount;++j)
+                if(SameClient(closeClients[j],identity) && now-closeClients[j].seenAt>=ForceAppsGraceMs)
+                    mature=true;
+            bool duplicate=false;
+            for(uint32_t j=0;j<candidateCount;++j)if(SameClient(candidates[j],identity))duplicate=true;
+            if(mature && !duplicate)if(auto* process=ReferenceForceApp(identity)) {
+                candidates[candidateCount++]=identity;
+                ProcessUnref(process);
+            }
+        }
         const uint32_t ids[2]={windows[i].clientPid,windows[i].providerPid};
         for(const uint32_t pid:ids){if(!pid)continue;bool seen=false;for(uint32_t j=0;j<ownerCount;++j)if(owners[j]==pid)seen=true;if(!seen&&ownerCount<WM_MAX_WINDOWS*2)owners[ownerCount++]=pid;}
     }
     SpinLockAcquire(&lock);closePolling=false;if(current==selected&&operations[selected].phase==Phase::Closing){closeCaptured=true;guiRemaining=remaining;
-        memcpy(windowOwners,owners,ownerCount*sizeof(owners[0]));windowOwnerCount=ownerCount;}SpinLockRelease(&lock);
+        memcpy(windowOwners,owners,ownerCount*sizeof(owners[0]));windowOwnerCount=ownerCount;
+        memcpy(forceCandidates,candidates,candidateCount*sizeof(candidates[0]));forceCandidateCount=candidateCount;}SpinLockRelease(&lock);
 }
 }

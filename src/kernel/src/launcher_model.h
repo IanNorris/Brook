@@ -77,7 +77,7 @@ struct LauncherResult {
 // What a pointer press landed on (from the builder's layout).
 enum class LauncherTargetKind : uint8_t {
     None, Panel, Search, TopTab, Tile, Rail, Row, Chip, MenuItem, Menu,
-    Settings, Restart, Shutdown, Confirm, Dismiss, CancelShutdown, Footer,
+    Settings, Restart, Shutdown, Confirm, Dismiss, CancelShutdown, Footer, ForceApps,
 };
 struct LauncherTarget {
     LauncherTargetKind kind;
