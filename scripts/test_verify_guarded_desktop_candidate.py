@@ -151,6 +151,7 @@ class VerifyGuardedDesktop(unittest.TestCase):
         self.copy('BOOT/INIT.RC', b'set wm\n' + CLEARWATER_START + b'\n')
         with self.assertRaisesRegex(ValueError, 'Terminal shortcut mismatch'):
             self.check(**hashes)
+        subprocess.run(['mmd', '-i', str(self.image), '::/BOOT/SHORTCUTS'], check=True)
         self.copy(verifier.TERMINAL_SHORTCUT_PATH, verifier.TERMINAL_SHORTCUT)
         self.assertEqual(self.check(**hashes)['clearwater_executables_sha256']['CWSHELL.ELF'],
                          hashes['expected_clearwater_shell'])
