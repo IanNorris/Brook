@@ -40,6 +40,6 @@ int main(int argc,char** argv){
     check(pread(fd,data,sizeof(data),0)==(ssize_t)sizeof(data)&&!memcmp(data,expected,sizeof(data)),"private mapping did not alter file");
     check(!close(fd),"close persistence file");
     errno=0;fd=open(argc==4?"/media/system/STORE.IMG":"/media/usb/STORE.IMG",O_RDONLY);
-    check(fd<0 && errno==(argc==4?EACCES:EBUSY),"exclusive backing alias refused");
+    check(fd<0 && (errno==EACCES || (argc!=4 && errno==EBUSY)),"exclusive backing alias refused");
     puts(create?"WRITABLE_DESKTOP_CREATE_PASS":"WRITABLE_DESKTOP_REBOOT_PASS");return 0;
 }

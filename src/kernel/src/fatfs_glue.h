@@ -18,6 +18,8 @@ namespace brook {
 // Bind a block Device to a FatFS physical drive number (0-3).
 // Must be called before f_mount() for that drive.
 bool FatFsBindDrive(uint8_t pdrv, Device* dev);
+// Boot's explicit USB read-only policy follows every FAT attachment.
+bool FatFsBindBootReadOnlyDrive(uint8_t pdrv, Device* dev);
 // Boot-only reservation for a pinned device. The slot cannot be rebound and
 // the same Device cannot be bound elsewhere for the remainder of this boot.
 // Ordinary FatFsAcquireDrive cannot acquire this slot. Exclusive acquisition

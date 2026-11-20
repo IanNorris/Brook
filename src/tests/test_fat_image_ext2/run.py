@@ -9,11 +9,15 @@ with tempfile.TemporaryDirectory(prefix='brook-fat-ext2-') as temporary:
     witness.write_bytes(b'APPS synthetic QA')
     with media.open('xb') as f:f.truncate(16*1024*1024)
     subprocess.run(['mkfs.fat','-F','16',str(media)],check=True)
-    for directory in ('KERNEL','RECOVERY','RECOV2','UPDATES','UPDATES/A','UPDATES/B','ETC'):
+    for directory in ('KERNEL','RECOVERY','RECOV2','RECOVNEW','UPDATES','UPDATES/A','UPDATES/B','ETC'):
         subprocess.run(['mmd','-i',str(media),'::'+directory],check=True)
-    for name in ('BROOK.MNT','INITRD.IMG','KERNEL/INITRD.IMG','RECOVERY/INITRD.IMG','RECOV2/INITRD.IMG',
-                 'UPDATES/A/INITRD.IMG','UPDATES/B/INITRD.IMG','ETC/hardware-update-key','APPS.BRK'):
+    for name in ('BROOK.MNT','BROOK.CFG','INITRD.IMG','KERNEL/INITRD.IMG','RECOVERY/INITRD.IMG','RECOV2/INITRD.IMG',
+                 'UPDATES/A/INITRD.IMG','UPDATES/B/INITRD.IMG','ETC/hardware-update-key','APPS.BRK',
+                 'UPDATES/A/APPS.BRK','UPDATES/B/APPS.BRK','INITRD.OLD','INST0001.IMG','RECOVNEW/BACKUP.BIN'):
         subprocess.run(['mcopy','-i',str(media),str(witness),'::'+name],check=True)
+    read_test=root/'READTEST.BIN'
+    with read_test.open('xb') as f:f.truncate(8*1024*1024)
+    subprocess.run(['mcopy','-i',str(media),str(read_test),'::READTEST.BIN'],check=True)
     unrelated=root/'unrelated-fat.img'
     with unrelated.open('xb') as f:f.truncate(16*1024*1024)
     subprocess.run(['mkfs.fat','-F','16',str(unrelated)],check=True)
