@@ -260,6 +260,8 @@ def main():
             digest=hashlib.sha256(candidate.read_bytes()).hexdigest()
             init.write_text('set wm\nset vfb none\nsched eevdf\nrun --console --uid 0 /boot/EFISTAGE.ELF /boot/INV.efi ' + digest + '\n')
         elif args.guard_provision_test:
+            media = f'{sata}@@{esp_part["start"]*512}'
+            subprocess.run(['mattrib','+a','-i',media,'::/RECOVERY'],check=True)
             init.write_text('set wm\nset vfb none\nsched eevdf\nrun --console --uid 0 /boot/GUARDP.ELF ' + identity + '\n')
         else:
             init.write_text('set wm\nset vfb none\nsched eevdf\nrun --console --uid 0 /boot/IDLEQA.ELF /data/home/IDLE.TXT\n')
@@ -567,6 +569,9 @@ quit
             return
         if args.guard_provision_test:
             media = f'{sata}@@{esp_part["start"]*512}'
+            attributes = subprocess.check_output(['mattrib','-i',media,'::/RECOVERY'],text=True)
+            if attributes.split()!=['A','::/RECOVERY']:
+                raise RuntimeError('guard provisioning lost the archived RECOVERY directory')
             a = subprocess.check_output(['mtype','-i',media,'::/RECOVERY/GUARD0.BIN'])
             b = subprocess.check_output(['mtype','-i',media,'::/RECOVERY/GUARD1.BIN'])
             if len(a)!=128 or a!=b or a[:8]!=b'BRKRCV01' or a[24:72]!=bytes.fromhex(identity) or struct.unpack_from('<I',a,124)[0]!=zlib.crc32(a[:124]):
