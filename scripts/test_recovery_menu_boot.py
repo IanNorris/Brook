@@ -59,9 +59,17 @@ def boot(image, firmware, work, recovery, marker, timeout, sata, forbidden=None,
         if update_port is not None:forward+=f',hostfwd=tcp:127.0.0.1:{update_port}-:1235'
         if store_port is not None:forward+=f',hostfwd=tcp:127.0.0.1:{store_port}-:1237'
         command += ['-netdev',f'user,id=recovery-net,hostfwd=tcp:127.0.0.1:{network_port}-:1234'+forward]
-        command += (['-device','qemu-xhci,id=recovery-xhci',
-                     '-device','usb-net,bus=recovery-xhci.0,port=2,netdev=recovery-net'] if network_usb else
-                    ['-device',f'{network_model},netdev=recovery-net'])
+        if network_usb:
+            command += ['-device','qemu-xhci,id=recovery-xhci',
+                        '-device','usb-net,bus=recovery-xhci.0,port=2,netdev=recovery-net']
+        elif network_model=='virtio-net-pci':
+            command += ['-device','virtio-net-pci,netdev=recovery-net']
+        else:
+            # Exercise secondary-bus discovery like a VMware guest. Legacy PCI
+            # NICs need a conventional PCI bridge; the 82574L is a PCIe endpoint.
+            bridge = 'pcie-root-port,chassis=1,slot=1' if network_model=='e1000e' else 'pcie-pci-bridge'
+            command += ['-device',f'{bridge},bus=pcie.0,id=recovery-pci',
+                        '-device',f'{network_model},bus=recovery-pci,netdev=recovery-net']
     for item in extra_fw_cfg or ():
         command += ['-fw_cfg',item]
     if gdb_script is not None:

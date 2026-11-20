@@ -186,11 +186,14 @@ def run_nic_smoke(bridge, output, session, boot_id, bulk_port, model, module_sha
     (output / "intel-nic-doctor.json").write_text(json.dumps(doctor, indent=2) + "\n")
     cursor = 0
     network = []
+    root_bridges = []
     while True:
         page = bridge.command(session, f"bridge hardware pci {cursor} 8")
         if page.get("pci_inventory_api") != 1 or page.get("truncated") is not False:
             raise RuntimeError("Intel NIC PCI inventory is unavailable")
         network.extend(device for device in page["devices"] if device["class"] == 2)
+        root_bridges.extend(device for device in page["devices"]
+                            if device["class"] == 6 and device["subclass"] == 4 and device["bus"] == 0)
         new_cursor = page["next_cursor"]
         if new_cursor == page["total"]:
             break
@@ -201,6 +204,11 @@ def run_nic_smoke(bridge, output, session, boot_id, bulk_port, model, module_sha
                 device["device_id"] == INTEL_NIC_DEVICE_IDS[model]]
     if len(network) != 1 or len(matching) != 1:
         raise RuntimeError(f"Expected only PCI NIC {model}; got {network!r}")
+    nic = matching[0]
+    if not nic["bus"] or len(root_bridges) != 1:
+        raise RuntimeError(f"Expected {model} behind a PCI bridge; got bus {nic['bus']} and {root_bridges!r}")
+    print(f"INTEL_NIC_PCI {model} {nic['bus']:02x}:{nic['device']:02x}.{nic['function']} secondary_bus={nic['bus']}",
+          flush=True)
 
     # This is distinct from the transfer worker and runs under the desktop uid.
     transaction = uuid.uuid4().hex
@@ -232,7 +240,8 @@ def run_nic_smoke(bridge, output, session, boot_id, bulk_port, model, module_sha
     if colours < 2:
         raise RuntimeError("Intel NIC frame contains only a single colour")
     return {
-        "qemu_nic_model": model, "pci": matching[0], "module_sha256": module_sha256,
+        "qemu_nic_model": model, "pci": nic, "pci_bridge": root_bridges[0],
+        "module_sha256": module_sha256,
         "auth_mode": "v3", "boot_id": boot_id, "doctor_verified": True,
         "doctor_receipt": "intel-nic-doctor.json",
         "guest_job": "intel-nic-guest-job.json",
