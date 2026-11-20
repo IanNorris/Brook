@@ -18,9 +18,9 @@ uint8_t* ReadFile(
     UINTN*             outSize,
     UINTN              maximumSize,
     UINTN              prefixSize,
-    bool*              absent)
+    FileReadState*     state)
 {
-    if (absent) *absent = false;
+    if (state) *state = FileReadState::Failed;
     EFI_GUID loadedImageGuid        = EFI_LOADED_IMAGE_PROTOCOL_GUID;
     EFI_GUID simpleFileSystemGuid   = EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID;
     EFI_GUID fileInfoGuid           = EFI_FILE_INFO_ID;
@@ -48,7 +48,7 @@ uint8_t* ReadFile(
     status = root->Open(root, &file, (CHAR16*)path, EFI_FILE_MODE_READ, 0);
     if (EFI_ERROR(status))
     {
-        if (absent) *absent = status == EFI_NOT_FOUND;
+        if (state && status == EFI_NOT_FOUND) *state = FileReadState::Missing;
         root->Close(root);
         return nullptr;
     }
@@ -57,7 +57,7 @@ uint8_t* ReadFile(
     UINT8 infoBuffer[256];
     UINTN infoSize = sizeof(infoBuffer);
     status = file->GetInfo(file, &fileInfoGuid, &infoSize, infoBuffer);
-    if (EFI_ERROR(status))
+    if (EFI_ERROR(status) || infoSize < SIZE_OF_EFI_FILE_INFO)
     {
         file->Close(file);
         root->Close(root);
@@ -66,7 +66,11 @@ uint8_t* ReadFile(
 
     EFI_FILE_INFO* info = (EFI_FILE_INFO*)infoBuffer;
     UINTN fileSize = (UINTN)info->FileSize;
-    if (!fileSize || info->FileSize > maximumSize || prefixSize > fileSize) {
+    if ((info->Attribute & EFI_FILE_DIRECTORY) || info->FileSize > maximumSize || prefixSize > fileSize) {
+        file->Close(file);root->Close(root);return nullptr;
+    }
+    if (!fileSize) {
+        if (state) *state = FileReadState::Empty;
         file->Close(file);root->Close(root);return nullptr;
     }
     if (prefixSize) fileSize = prefixSize;
@@ -88,6 +92,7 @@ uint8_t* ReadFile(
         return nullptr;
     }
 
+    if (state) *state = FileReadState::Read;
     *outSize = fileSize;
     return buffer;
 }

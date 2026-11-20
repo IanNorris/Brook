@@ -17,11 +17,22 @@
 using Bytes=std::vector<uint8_t>;
 static std::map<std::u16string,Bytes> files;
 static std::map<void*,UINTN> allocations;
+static std::u16string unreadableFile;
 namespace brook { namespace bootloader {
-uint8_t* ReadFile(EFI_HANDLE,EFI_BOOT_SERVICES*,const char16_t* name,UINTN* size,UINTN maximum,UINTN prefix,bool* absent) {
+uint8_t* ReadFile(EFI_HANDLE,EFI_BOOT_SERVICES*,const char16_t* name,UINTN* size,UINTN maximum,UINTN prefix,FileReadState* state) {
+    if(state)*state=FileReadState::Failed;
+    if(unreadableFile==name)return nullptr;
     auto i=files.find(name);
-    if(absent)*absent=i==files.end();
-    if(i==files.end()||i->second.empty()||i->second.size()>maximum||prefix>i->second.size())return nullptr;
+    if(i==files.end()) {
+        if(state)*state=FileReadState::Missing;
+        return nullptr;
+    }
+    if(i->second.size()>maximum||prefix>i->second.size())return nullptr;
+    if(i->second.empty()) {
+        if(state)*state=FileReadState::Empty;
+        return nullptr;
+    }
+    if(state)*state=FileReadState::Read;
     *size=prefix?prefix:i->second.size();auto* result=(uint8_t*)malloc(*size);assert(result);
     memcpy(result,i->second.data(),*size);allocations[result]=*size;return result;
 }
@@ -273,7 +284,12 @@ static void GuardedSlotSelection() {
 
     load(Result::Loaded,2); // No journal on an existing installation.
     auto& corruptJournal=files[u"RECOVERY\\BOOTSTAT.BIN"];
-    load(Result::RecoveryRequired,0); // Present and empty is malformed.
+    load(Result::Loaded,2); // Empty placeholder from legacy provisioning.
+    unreadableFile=u"RECOVERY\\BOOTSTAT.BIN";
+    load(Result::RecoveryRequired,0); // Cannot establish the file is absent or empty.
+    unreadableFile.clear();
+    corruptJournal.resize(1);
+    load(Result::RecoveryRequired,0); // Nonempty but too short.
     corruptJournal.resize(GuardSlotCount*GuardSlotSectorBytes+1);
     load(Result::RecoveryRequired,0); // Present but too large to read.
 

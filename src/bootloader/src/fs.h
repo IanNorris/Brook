@@ -7,12 +7,14 @@ namespace brook
 namespace bootloader
 {
 
+enum class FileReadState { Failed, Missing, Empty, Read };
+
 // Read the entire contents of a file from the EFI System Partition into a
 // freshly allocated EfiLoaderData buffer. Sets *outSize to the file size.
 // Returns a pointer to the buffer on success, nullptr on failure.
 // maximumSize bounds the on-disk file before allocating; prefixSize reads only
 // that many bytes of a preallocated slot (and must not exceed its file size).
-// If absent is supplied, it reports only an explicit EFI file-not-found result.
+// If provided, state distinguishes missing or empty files from an I/O failure.
 // The caller is responsible for freeing the buffer via FreePages.
 uint8_t* ReadFile(
     EFI_HANDLE          imageHandle,
@@ -21,7 +23,7 @@ uint8_t* ReadFile(
     UINTN*              outSize,
     UINTN               maximumSize = 512u * 1024u * 1024u,
     UINTN               prefixSize = 0,
-    bool*               absent = nullptr);
+    FileReadState*      state = nullptr);
 
 } // namespace bootloader
 } // namespace brook

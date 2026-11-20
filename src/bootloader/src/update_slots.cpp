@@ -63,9 +63,10 @@ static bool ReadSlotHealth(EFI_HANDLE image,EFI_BOOT_SERVICES* bs,const char* id
     if(!identity)return true;
     UINTN bytes=0;
     constexpr unsigned length=GuardSlotCount*GuardSlotSectorBytes;
-    bool absent=false;
-    auto* data=ReadFile(image,bs,u"RECOVERY\\BOOTSTAT.BIN",&bytes,length,0,&absent);
-    if(!data)return absent; // Only an older installation without a journal can continue.
+    FileReadState state{};
+    auto* data=ReadFile(image,bs,u"RECOVERY\\BOOTSTAT.BIN",&bytes,length,0,&state);
+    // An older provisioning attempt could leave a zero-length placeholder.
+    if(!data)return state == FileReadState::Missing || state == FileReadState::Empty;
 
     struct SlotFile {
         const uint8_t* data;
