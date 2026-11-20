@@ -5,6 +5,17 @@ namespace brook {
 struct Device;
 // Check-only boot: never grants mount or write authority.
 bool GuardCheckerStart(Device* device);
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+struct GuardRecoverySlotState {
+    uint64_t sequence, newestGeneration, generations[2];
+    uint32_t starts[2];
+    bool profileRejected[2];
+    uint8_t selectorDigests[2][32];
+};
+// Read-only snapshot of the independently admitted recovery ESP.
+int GuardRecoverySlotStatus(GuardRecoverySlotState& out);
+
+#endif
 #if defined(BROOK_SSD_GUARDED_DESKTOP)
 bool GuardedDesktopBridgeEnabled();
 struct BootProtocol;

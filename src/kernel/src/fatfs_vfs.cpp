@@ -14,6 +14,9 @@
 #endif
 #if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_SSD_GUARDED_DESKTOP)
 #include "ac_shutdown_record.h"
+#endif
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+#include "guard_checker_runner.h"
 #include "../../shared/update/guard_slot_health.h"
 #endif
 #include "fatfs_object.h"
@@ -116,12 +119,15 @@ struct FatPrivateMount {
     FatImageLease* acShutdownLease;
     uint64_t acShutdownSectors[AcShutdownSlots];
     bool acShutdownReady;
+    BootGuardSlot slotHealthKey;
+    uint64_t slotStartSequence;
+#endif
+#if defined(BROOK_SSD_AUTO_RECOVERY)
     bool slotHealthInspected;
+    bool slotHealthReady;
     FatImageLease* slotHealthLease;
     uint64_t slotHealthSectors[GuardSlotCount];
     uint8_t slotHealthDisk[32];
-    BootGuardSlot slotHealthKey;
-    uint64_t slotStartSequence;
 #endif
 #if defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_AUTO_RECOVERY)
     Vnode* journalNode;
@@ -1934,33 +1940,100 @@ int FatFsPrivateRecoveryArmJournal(FatPrivateMount* session)
     if(!device || FatFsJournalSectorMap(session->journalLease,sectors,PanicJournalSectors))return -5;
     return AhciSystemGuardPanicRecoveryArm(device,sectors,PanicJournalSectors)?0:-13;
 }
-#if defined(BROOK_SSD_GUARDED_DESKTOP)
 namespace {
 template <unsigned Count>
 struct FixedRecoverySectorIo {
     static constexpr unsigned SectorBytes = 512;
     Device* device;
     const uint64_t (&sectors)[Count];
-    bool read(unsigned slot,uint8_t* out) {
+    bool read(unsigned slot,uint8_t* out) const {
         return slot<Count && device->ops->read(device,sectors[slot]*SectorBytes,
                      out,SectorBytes)==int(SectorBytes);
     }
-    bool write(unsigned slot,const uint8_t* in) {
+    bool write(unsigned slot,const uint8_t* in) const {
         return slot<Count && DeviceWrite(device,sectors[slot]*SectorBytes,
                      in,SectorBytes)==int(SectorBytes);
     }
-    bool flush(){return DeviceFlush(device)==0;}
+    bool flush() const {return DeviceFlush(device)==0;}
 };
-using AcShutdownSectorIo = FixedRecoverySectorIo<AcShutdownSlots>;
 using SlotHealthSectorIo = FixedRecoverySectorIo<GuardSlotCount>;
-static_assert(AcShutdownSectorIo::SectorBytes == AcShutdownSectorBytes);
 static_assert(SlotHealthSectorIo::SectorBytes == GuardSlotSectorBytes);
-}
-int FatFsPrivateRecoveryPinSlotHealth(FatPrivateMount* session, const char (&identity)[97],
-                                     const BootGuardSlot& slot)
+
+struct GuardFatLock {
+    GuardFatLock() { KMutexLock(&g_fatLock); }
+    ~GuardFatLock() { KMutexUnlock(&g_fatLock); }
+};
+
+using SlotSelectors = uint8_t[GuardSlotCount][BROOK_UPDATE_RECORD_BYTES];
+
+int OpenSlotFileLocked(FatPrivateMount* session,const char* path,FIL& file)
 {
-    if (!session || !session->inspectionSucceeded || !session->journalReady ||
-        session->slotHealthInspected) return -22;
+    char fatPath[256];
+    BuildFatPath(fatPath,sizeof(fatPath),session->mount->pdrv,path);
+    const auto opened=f_open(&file,fatPath,FA_READ);
+    if(opened!=FR_OK)return FrToErrno(opened);
+    // Private recovery has no VFS clients. A failed desktop handoff may have
+    // published /media/system. A live writer could otherwise retain a cached
+    // sector even with every pathname operation locked.
+    for(auto* handle=session->mount->writableFiles;handle;handle=handle->next) {
+        if(!SameFatFile(&file,&handle->fil))continue;
+        f_close(&file);
+        return -16;
+    }
+    return 0;
+}
+
+int ReadSlotSelectorsLocked(FatPrivateMount* session,SlotSelectors& records)
+{
+    constexpr const char* paths[]={"/UPDATES/SELECT0.BIN","/UPDATES/SELECT1.BIN"};
+    for(unsigned i=0;i<GuardSlotCount;++i) {
+        FIL file{};
+        const int opened=OpenSlotFileLocked(session,paths[i],file);
+        if(opened==-FVFS_ENOENT)continue; // Loader ignores an absent selector.
+        if(opened)return opened;
+        const bool exact=f_size(&file)==sizeof(records[i]);
+        UINT bytes=0;
+        const auto read=exact?f_read(&file,records[i],sizeof(records[i]),&bytes):FR_OK;
+        const auto closed=f_close(&file);
+        if(read!=FR_OK)return FrToErrno(read);
+        if(exact && bytes!=sizeof(records[i]))return -5;
+        if(closed!=FR_OK)return FrToErrno(closed);
+    }
+    return 0;
+}
+
+int ReadSlotStateLocked(FatPrivateMount* session,const SlotHealthSectorIo& io,
+                         SlotSelectors& records,GuardSlotJournal& journal,GuardRecoverySlotState& out)
+{
+    if(!session->slotHealthReady || session->slotHealthLease->error ||
+       session->mount->deferredCloseError)return -5;
+    if(!GuardSlotRead(io,session->slotHealthDisk,journal))return -117;
+    if(const int error=ReadSlotSelectorsLocked(session,records))return error;
+    const int newest=BrookUpdateNewest(records[0],records[1]);
+    if(newest<0)return newest==-2?-117:-FVFS_ENOENT;
+    out.sequence=journal.health.sequence;
+    out.newestGeneration=BrookUpdateGet64(records[newest]+8);
+    for(unsigned i=0;i<GuardSlotCount;++i) {
+        const auto& record=records[i?1-newest:newest];
+        if(!BrookUpdateRecordValid(record))continue;
+        BootGuardSlot key{};
+        key.slot=BrookUpdateGet32(record+16);
+        if(out.generations[key.slot])continue; // Newest owns this physical slot.
+        key.generation=BrookUpdateGet64(record+8);
+        BrookUpdateHash(record,sizeof(record),key.selectorDigest);
+        out.generations[key.slot]=key.generation;
+        memcpy(out.selectorDigests[key.slot],key.selectorDigest,sizeof(key.selectorDigest));
+        if(GuardSlotMatches(journal.health,key)) {
+            out.starts[key.slot]=journal.health.slots[key.slot].starts;
+            out.profileRejected[key.slot]=journal.health.slots[key.slot].profileRejected;
+        }
+    }
+    return 0;
+}
+}
+int FatFsPrivateRecoveryPinSlotHealth(FatPrivateMount* session, const char (&identity)[97])
+{
+    if (!session || !session->inspectionSucceeded || session->slotHealthInspected) return -22;
     session->slotHealthInspected = true;
     constexpr auto path = "/RECOVERY/BOOTSTAT.BIN";
     char fatPath[256];
@@ -1974,8 +2047,7 @@ int FatFsPrivateRecoveryPinSlotHealth(FatPrivateMount* session, const char (&ide
     // metadata. No mount has been published, so nobody can race our open.
     if (stat == FR_NO_FILE) return 1;
     if (stat != FR_OK) return FrToErrno(stat);
-    if ((info.fattrib & AM_DIR) || info.fsize != GuardSlotCount * GuardSlotSectorBytes ||
-        !GuardSlotKeyValid(slot)) return -22;
+    if ((info.fattrib & AM_DIR) || info.fsize != GuardSlotCount * GuardSlotSectorBytes) return -22;
 
     auto* node = FatFsOpen(session->mount, session->mount->pdrv, path, VFS_O_WRITE | VFS_O_READWRITE);
     if (!node) return -5;
@@ -1985,7 +2057,7 @@ int FatFsPrivateRecoveryPinSlotHealth(FatPrivateMount* session, const char (&ide
     if (pinned) return pinned;
     auto* device = FatFsImageLeaseDevice(session->slotHealthLease);
     auto& sectors = session->slotHealthSectors;
-    if (!device || device != FatFsImageLeaseDevice(session->journalLease) ||
+    if (!device || device != FatFsImageLeaseDevice(session->leases[0]) ||
         !device->ops->read || DeviceBlockSize(device) != GuardSlotSectorBytes ||
         FatFsImageSectorMap(session->slotHealthLease, sectors, GuardSlotCount)) return -5;
     const auto blocks = DeviceBlockCount(device);
@@ -1994,52 +2066,85 @@ int FatFsPrivateRecoveryPinSlotHealth(FatPrivateMount* session, const char (&ide
 
     // The independent FAT checker has excluded cross-links across the
     // volume. Recheck the extents of the other direct writers as well.
-    uint64_t panicSectors[PanicJournalSectors]{};
-    if (FatFsJournalSectorMap(session->journalLease, panicSectors, PanicJournalSectors)) return -5;
-    for (const auto sector : sectors) {
-        for (const auto panic : panicSectors) if (sector == panic) return -22;
-        if (session->acShutdownReady)
-            for (const auto power : session->acShutdownSectors) if (sector == power) return -22;
+    if (session->journalReady) {
+        uint64_t panicSectors[PanicJournalSectors]{};
+        if (FatFsJournalSectorMap(session->journalLease, panicSectors, PanicJournalSectors)) return -5;
+        for (const auto sector : sectors)
+            for (const auto panic : panicSectors) if (sector == panic) return -22;
     }
+#if defined(BROOK_SSD_GUARDED_DESKTOP)
+    if (session->acShutdownReady)
+        for (const auto sector : sectors)
+            for (const auto power : session->acShutdownSectors) if (sector == power) return -22;
+#endif
 
     BrookUpdateHash(reinterpret_cast<const uint8_t*>(identity), 96, session->slotHealthDisk);
     SlotHealthSectorIo io{device, sectors};
     GuardSlotJournal journal;
     if (!GuardSlotRead(io, session->slotHealthDisk, journal)) return -117;
-    session->slotHealthKey = slot;
+    session->slotHealthReady = true;
     return 0;
 }
 
-int FatFsPrivateRecoveryStartSlot(FatPrivateMount* session, uint32_t& starts)
+int FatFsPrivateRecoverySlotStatus(FatPrivateMount* session,GuardRecoverySlotState& out)
+{
+    out={};
+    auto* device=session?FatFsImageLeaseDevice(session->slotHealthLease):nullptr;
+    if(!device)return -11;
+    GuardFatLock lock;
+    SlotHealthSectorIo io{device,session->slotHealthSectors};
+    SlotSelectors records{};
+    GuardSlotJournal journal;
+    return ReadSlotStateLocked(session,io,records,journal,out);
+}
+
+#if defined(BROOK_SSD_GUARDED_DESKTOP)
+int FatFsPrivateRecoveryStartSlot(FatPrivateMount* session, const BootGuardSlot& slot, uint32_t& starts)
 {
     starts = 0;
-    if (!session || !GuardSlotKeyValid(session->slotHealthKey) ||
-        !session->slotHealthLease || session->slotStartSequence) return -22;
+    if (!session || !GuardSlotKeyValid(slot)) return -22;
     auto* device = FatFsImageLeaseDevice(session->slotHealthLease);
     if (!device) return -5;
+    GuardFatLock lock;
+    if (!session->slotHealthReady || session->slotHealthLease->error ||
+        session->slotStartSequence) return -22;
     SlotHealthSectorIo io{device, session->slotHealthSectors};
     GuardSlotJournal journal;
-    if (!GuardSlotRead(io, session->slotHealthDisk, journal)) return -117;
-    if (!GuardSlotStart(journal.health, session->slotHealthKey)) return -13;
-    if (!GuardSlotWrite(io, session->slotHealthDisk, journal.health)) return -5;
+    if (!GuardSlotRead(io, session->slotHealthDisk, journal)) {
+        session->slotHealthReady = false;return -117;
+    }
+    if (!GuardSlotStart(journal.health, slot)) return -13;
+    if (!GuardSlotWrite(io, session->slotHealthDisk, journal.health)) {
+        session->slotHealthReady = false;return -5;
+    }
+    session->slotHealthKey = slot;
     session->slotStartSequence = journal.health.sequence + 1;
-    starts = journal.health.slots[session->slotHealthKey.slot].starts;
+    starts = journal.health.slots[slot.slot].starts;
     return 0;
 }
 
 int FatFsPrivateRecoveryFinishSlot(FatPrivateMount* session, bool profileRejected)
 {
-    if (!session || !session->slotHealthLease || !session->slotStartSequence) return -22;
+    if (!session) return -22;
     auto* device = FatFsImageLeaseDevice(session->slotHealthLease);
     if (!device) return -5;
+    GuardFatLock lock;
+    if (!session->slotHealthReady || session->slotHealthLease->error ||
+        !session->slotStartSequence) return -22;
     SlotHealthSectorIo io{device, session->slotHealthSectors};
     GuardSlotJournal journal;
     if (!GuardSlotRead(io, session->slotHealthDisk, journal)) return -117;
     if (journal.health.sequence != session->slotStartSequence) return -116;
     if (!GuardSlotFinish(journal.health, session->slotHealthKey, profileRejected)) return -13;
-    return GuardSlotWrite(io, session->slotHealthDisk, journal.health) ? 0 : -5;
+    if (GuardSlotWrite(io, session->slotHealthDisk, journal.health)) return 0;
+    session->slotHealthReady = false;
+    return -5;
 }
 
+namespace {
+using AcShutdownSectorIo = FixedRecoverySectorIo<AcShutdownSlots>;
+static_assert(AcShutdownSectorIo::SectorBytes == AcShutdownSectorBytes);
+}
 int FatFsPrivateRecoveryPinAcShutdown(FatPrivateMount* session,AcShutdownRecord& previous)
 {
     previous={};

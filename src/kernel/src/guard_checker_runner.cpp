@@ -78,6 +78,11 @@ GuardPanicSnapshot g_recoveryPanic{};
 GuardPanicSnapshot g_recoveryPanicPrevious{};
 bool g_recoveryPanicReady=false;
 bool g_recoveryPanicPreviousReady=false;
+FatPrivateMount* g_recoverySlotMount=nullptr;
+}
+int GuardRecoverySlotStatus(GuardRecoverySlotState& out) {
+    auto* mount=__atomic_load_n(&g_recoverySlotMount,__ATOMIC_ACQUIRE);
+    return FatFsPrivateRecoverySlotStatus(mount,out);
 }
 bool GuardRecoveryPanicSnapshot(GuardPanicSnapshot& out) {
     out={};if(!__atomic_load_n(&g_recoveryPanicReady,__ATOMIC_ACQUIRE))return false;
@@ -96,13 +101,20 @@ constexpr uint8_t checkerHash[32]={
     0x4a,0xad,0x4c,0x64,0xbf,0xdc,0x43,0xea,0x83,0xa0,0x16,0xc8,0xfe,0xe9,0xd5,0xe3};
 constexpr const char* checkerPath="/boot/FATFSCK.ELF";
 constexpr uint64_t checkerMax=4*1024*1024;
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+void PublishRecoverySlotStatus(FatPrivateMount* mount,const char* mode) {
+    __atomic_store_n(&g_recoverySlotMount,mount,__ATOMIC_RELEASE);
+    KPrintf("GUARD_SLOT_STATUS_READY mode=%s\n",mode);
+}
+#endif
 #if defined(BROOK_SSD_GUARDED_DESKTOP)
-void RequestGuardedSlotRestart(const char* stage,int error) {
+bool RequestGuardedSlotRestart(const char* stage,int error) {
     const auto power=ShutdownGetPowerCapabilities();
     const bool restart=power.gracefulQuiescence && power.reset && ShutdownLaunchAllowed();
     KPrintf("GUARD_SLOT_RESTART requested=%u generation=%lu slot=%u stage=%s status=%d\n",
             restart?1u:0u,guardedBootSlot.generation,guardedBootSlot.slot,stage,error);
     if(restart)ShutdownDesktopRequest(true);
+    return restart;
 }
 #endif
 #if defined(BROOK_SSD_GUARD_REPAIR)
@@ -293,16 +305,15 @@ void Worker(void* arg) {
         int handoff=journalPin;
         AcShutdownRecord prior{};
         const bool haveShutdownRecord=!handoff && !FatFsPrivateRecoveryPinAcShutdown(mount,prior);
-        bool trackSlot=false;
-        if(!handoff) {
-            const int health=FatFsPrivateRecoveryPinSlotHealth(mount,identity,guardedBootSlot);
-            KPrintf("GUARD_SLOT_JOURNAL status=%d generation=%lu slot=%u\n",
-                    health,guardedBootSlot.generation,guardedBootSlot.slot);
-            trackSlot=health==0;
-            if(health<0)handoff=health;
-        }
+        const int health=FatFsPrivateRecoveryPinSlotHealth(mount,identity);
+        KPrintf("GUARD_SLOT_JOURNAL status=%d generation=%lu slot=%u\n",
+                health,guardedBootSlot.generation,guardedBootSlot.slot);
+        const bool trackSlot=health==0;
+        if(!handoff && health<0)handoff=health;
+        if(!handoff && trackSlot && !GuardSlotKeyValid(guardedBootSlot))handoff=-22;
         if(!handoff)handoff=FatFsPrivateRecoveryPublishJournalTest(mount,false,&publication);
-        if(!handoff && !AhciSystemGuardTestBeginWrites(adapter))handoff=-13;
+        const bool espWritable=!handoff && AhciSystemGuardTestBeginWrites(adapter);
+        if(!handoff && !espWritable)handoff=-13;
         if(!handoff && !AhciSystemGuardTestAdoptSystemMount(adapter,1,publication))handoff=-13;
         if(!handoff)handoff=FatFsPrivateRecoveryArmJournal(mount);
         uint8_t drive=2;
@@ -310,20 +321,23 @@ void Worker(void* arg) {
         bool slotStarted=false;
         if(!handoff && trackSlot) {
             uint32_t starts=0;
-            handoff=FatFsPrivateRecoveryStartSlot(mount,starts);
+            handoff=FatFsPrivateRecoveryStartSlot(mount,guardedBootSlot,starts);
             slotStarted=!handoff;
             KPrintf("GUARD_SLOT_START status=%d generation=%lu slot=%u starts=%u\n",
                     handoff,guardedBootSlot.generation,guardedBootSlot.slot,starts);
         }
         if(!handoff && !AhciSystemGuardTestMountDesktop(adapter,&drive,&sharedProfileRejected))handoff=-5;
         if(handoff) {
+            bool journalCertain=trackSlot;
             if(slotStarted && sharedProfileRejected) {
                 const int recorded=FatFsPrivateRecoveryFinishSlot(mount,true);
+                journalCertain=recorded==0;
                 KPrintf("GUARD_SLOT_PROFILE_REJECTED status=%d generation=%lu slot=%u\n",
                         recorded,guardedBootSlot.generation,guardedBootSlot.slot);
             }
             KPrintf("GUARD_DESKTOP_HANDOFF_FAILED status=%d shared_profile_rejected=%u\n",
                     handoff,sharedProfileRejected?1u:0u);
+            bool restarting=false;
             if(slotStarted && !sharedProfileRejected) {
                 // Failed admission may have tried to mark the data volume dirty.
                 // The shutdown path can seal it only after a successful mount.
@@ -331,9 +345,10 @@ void Worker(void* arg) {
                 // proves the data volume never entered a writable session.
                 if(!VfsMountCleanupPending() && !DeviceFlush(adapter) &&
                    AhciSystemGuardDataState(device)==AhciGuardDataState::Clean)
-                    RequestGuardedSlotRestart("mount",handoff);
+                    restarting=RequestGuardedSlotRestart("mount",handoff);
                 else KPuts("GUARD_SLOT_RESTART_DEFERRED data-volume-uncertain\n");
             }
+            if(journalCertain && !restarting)PublishRecoverySlotStatus(mount,"desktop-failure");
             return;
         }
         if(haveShutdownRecord) {
@@ -365,7 +380,8 @@ void Worker(void* arg) {
         const int script=ShellExecScript("/boot/INIT.RC");
         KPrintf("GUARD_DESKTOP_HANDOFF_SCRIPT status=%d\n",script);
         if(script) {
-            if(slotStarted)RequestGuardedSlotRestart("script",script);
+            if(slotStarted && !RequestGuardedSlotRestart("script",script))
+                PublishRecoverySlotStatus(mount,"desktop-failure");
             return;
         }
         if(!ShutdownLaunchAllowed())return;
@@ -378,7 +394,16 @@ void Worker(void* arg) {
         __atomic_store_n(&guardedDesktopBridge,true,__ATOMIC_RELEASE);
         return;
 #else
-        AhciSystemGuardTestFinish(adapter);KPuts("GUARD_AUTO_NO_REPAIR\n");return;
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+        // Keep the checked ESP adapter in its read-only preparation phase.
+        // Recovery status has no public mount, write or lifecycle authority.
+        const int health=FatFsPrivateRecoveryPinSlotHealth(mount,identity);
+        KPrintf("GUARD_SLOT_JOURNAL status=%d generation=0 slot=0\n",health);
+        if(!health)PublishRecoverySlotStatus(mount,"private-recovery");
+        else
+#endif
+            AhciSystemGuardTestFinish(adapter);
+        KPuts("GUARD_AUTO_NO_REPAIR\n");return;
 #endif
     }
 #if defined(BROOK_SSD_AUTO_RECOVERY)
