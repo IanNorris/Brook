@@ -13,36 +13,79 @@
 #include <unistd.h>
 #include "../src/shared/brook_system_esp.h"
 #include "../src/shared/update/recovery_guard.h"
+#include "../src/shared/update/guard_slot_health.h"
 
 #include "hardware_provision_identity.h"
 
-static int create_guard(int directory,const char *name,const uint8_t record[128],dev_t device) {
-    int fd=openat(directory,name,O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0644);
+constexpr unsigned SlotHealthBytes=brook::GuardSlotCount*brook::GuardSlotSectorBytes;
+
+static int read_record(int directory,const char* name,uint8_t* record,size_t size,dev_t device) {
+    int fd=openat(directory,name,O_RDONLY|O_NOFOLLOW|O_CLOEXEC);
     if(fd<0)return -1;
-    size_t done=0;int error=0;
-    while(done<128) {
-        ssize_t n=write(fd,record+done,128-done);
+    struct stat st;
+    size_t done=0;
+    int error=fstat(fd,&st)||!S_ISREG(st.st_mode)||st.st_dev!=device||st.st_size!=off_t(size);
+    while(!error && done<size) {
+        const ssize_t n=read(fd,record+done,size-done);
         if(n<0&&errno==EINTR)continue;
-        if(n<=0){error=1;break;}done+=(size_t)n;
+        if(n<=0){error=1;break;}
+        done+=size_t(n);
     }
-    if(!error && fsync(fd))error=1;
-    if(close(fd))error=1;
-    if(error)return -1;
-    fd=openat(directory,name,O_RDONLY|O_NOFOLLOW|O_CLOEXEC);struct stat st;uint8_t check[128];done=0;
-    if(fd<0)return -1;
-    if(fstat(fd,&st)||!S_ISREG(st.st_mode)||st.st_dev!=device||st.st_size!=128)error=1;
-    while(!error && done<128) {
-        ssize_t n=read(fd,check+done,128-done);
-        if(n<0&&errno==EINTR)continue;
-        if(n<=0){error=1;break;}done+=(size_t)n;
-    }
-    if(!error && memcmp(record,check,128))error=1;
     if(close(fd))error=1;
     return error?-1:0;
 }
+
+static int create_record(int directory,const char* name,const uint8_t* record,size_t size,dev_t device) {
+    uint8_t check[SlotHealthBytes];
+    if(size>sizeof(check))return -1;
+    int fd=openat(directory,name,O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0644);
+    if(fd<0)return -1;
+    size_t done=0;
+    int error=0;
+    while(done<size) {
+        const ssize_t n=write(fd,record+done,size-done);
+        if(n<0&&errno==EINTR)continue;
+        if(n<=0){error=1;break;}
+        done+=size_t(n);
+    }
+    if(!error && fsync(fd))error=1;
+    if(close(fd))error=1;
+    if(error || read_record(directory,name,check,size,device))return -1;
+    return memcmp(record,check,size)?-1:0;
+}
+
+static int provision_slot_health(int directory,dev_t device,const char (&identity)[97],int& mutated) {
+    uint8_t guards[2][BROOK_RECOVERY_GUARD_SIZE];
+    if(read_record(directory,"GUARD0.BIN",guards[0],sizeof(guards[0]),device) ||
+       read_record(directory,"GUARD1.BIN",guards[1],sizeof(guards[1]),device) ||
+       !BrookRecoveryGuardAllowsNormal(guards[0],sizeof(guards[0]),guards[1],sizeof(guards[1]),identity))
+        return -1;
+
+    struct SlotFile {
+        uint8_t bytes[SlotHealthBytes]{};
+        bool read(unsigned index,uint8_t* out) const {
+            memcpy(out,bytes+index*brook::GuardSlotSectorBytes,brook::GuardSlotSectorBytes);
+            return true;
+        }
+    } file;
+    constexpr char name[]="BOOTSTAT.BIN";
+    struct stat st;
+    if(fstatat(directory,name,&st,AT_SYMLINK_NOFOLLOW)==0) {
+        if(read_record(directory,name,file.bytes,sizeof(file.bytes),device))return -1;
+        uint8_t digest[32];
+        BrookUpdateHash(reinterpret_cast<const uint8_t*>(identity),96,digest);
+        brook::GuardSlotJournal journal;
+        return brook::GuardSlotRead(file,digest,journal)?0:-1;
+    }
+    if(errno!=ENOENT)return -1;
+    mutated=1;
+    return create_record(directory,name,file.bytes,sizeof(file.bytes),device);
+}
+
 int main(int argc,char **argv) {
-    if(argc!=2||geteuid()!=0||strlen(argv[1])!=96) {
-        fprintf(stderr,"usage: guard-provision expected-identity\n");return 2;
+    const bool slotOnly=argc==3&&!strcmp(argv[2],"--slot-health-only");
+    if((argc!=2&&!slotOnly)||geteuid()!=0||strlen(argv[1])!=96) {
+        fprintf(stderr,"usage: guard-provision expected-identity [--slot-health-only]\n");return 2;
     }
     char identity[97];uint8_t record[128]={0};
     if(load_identity(identity)||strcmp(identity,argv[1])) {fprintf(stderr,"GUARD_PROVISION_IDENTITY_MISMATCH\n");return 1;}
@@ -61,11 +104,15 @@ int main(int argc,char **argv) {
     if(lock<0)goto done;
     dir=openat(root,"RECOVERY",O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
     if(dir<0||ioctl(dir,BROOK_IOCTL_VERIFY_SYSTEM_ESP_MEMBER,0)||fstat(dir,&dst)||dst.st_dev!=rst.st_dev)goto done;
-    if(fstatat(dir,"GUARD0.BIN",&check,AT_SYMLINK_NOFOLLOW)==0 || errno!=ENOENT)goto done;
-    if(fstatat(dir,"GUARD1.BIN",&check,AT_SYMLINK_NOFOLLOW)==0 || errno!=ENOENT)goto done;
-    mutated=1;
-    if(create_guard(dir,"GUARD0.BIN",record,rst.st_dev)||fsync(dir)||fsync(root))goto done;
-    if(create_guard(dir,"GUARD1.BIN",record,rst.st_dev)||fsync(dir)||fsync(root))goto done;
+    if(slotOnly) {
+        if(provision_slot_health(dir,rst.st_dev,identity,mutated)||fsync(dir)||fsync(root))goto done;
+    } else {
+        if(fstatat(dir,"GUARD0.BIN",&check,AT_SYMLINK_NOFOLLOW)==0 || errno!=ENOENT)goto done;
+        if(fstatat(dir,"GUARD1.BIN",&check,AT_SYMLINK_NOFOLLOW)==0 || errno!=ENOENT)goto done;
+        mutated=1;
+        if(create_record(dir,"GUARD0.BIN",record,sizeof(record),rst.st_dev)||fsync(dir)||fsync(root))goto done;
+        if(create_record(dir,"GUARD1.BIN",record,sizeof(record),rst.st_dev)||fsync(dir)||fsync(root))goto done;
+    }
     {
         int fresh=openat(root,"RECOVERY",O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
         if(fresh<0)goto done;
@@ -80,6 +127,6 @@ done:
     if(root>=0)close(root);
     if(lock>=0) {close(lock);if((!result||!mutated)&&unlink("/tmp/hardware-update.lock"))result=1;}
     if(result)fprintf(stderr,"GUARD_PROVISION_FAILED mutated=%d; inspect before retry\n",mutated);
-    else puts("GUARD_PROVISION_OK loader unchanged");
+    else puts(slotOnly?"GUARD_SLOT_HEALTH_PROVISION_OK":"GUARD_PROVISION_OK loader unchanged");
     return result;
 }
