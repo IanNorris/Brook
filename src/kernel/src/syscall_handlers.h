@@ -1,8 +1,7 @@
 #pragma once
 
 // syscall_handlers.h -- syscall handler entry points registered in the dispatch table (syscall.cpp).
-// Internal to the syscall layer; split from syscall.cpp
-// (see docs/agent/syscall-split-plan.md).
+// Internal to the syscall layer; split from syscall.cpp.
 
 #include <stdint.h>
 

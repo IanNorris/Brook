@@ -1,8 +1,7 @@
 #pragma once
 
 // syscall_drm.h -- internal declarations shared from syscall_drm.cpp.
-// Internal to the syscall layer; split from syscall.cpp
-// (see docs/agent/syscall-split-plan.md).
+// Internal to the syscall layer; split from syscall.cpp.
 
 #include "sync_file.h"
 #include "gpu_reservation.h"

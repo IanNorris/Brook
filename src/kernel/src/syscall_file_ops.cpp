@@ -1,6 +1,6 @@
 // syscall_file_ops.cpp -- per-file operations: truncate, fallocate, flock, chmod/chown, utimensat, sync/fsync.
 //
-// Split from syscall.cpp (see docs/agent/syscall-split-plan.md).
+// Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "process_user_namespace.h"

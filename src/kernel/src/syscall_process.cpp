@@ -1,6 +1,6 @@
 // syscall_process.cpp -- process lifecycle syscalls: fork/clone/exit/wait, ids, process groups, arch_prctl, prctl.
 //
-// Split from syscall.cpp (see docs/agent/syscall-split-plan.md).
+// Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "process_fs.h"

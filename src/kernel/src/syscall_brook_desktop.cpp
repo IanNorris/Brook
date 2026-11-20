@@ -1,7 +1,7 @@
 #include "intel_bdw_scanout_target.h"
 // syscall_brook_desktop.cpp -- Brook desktop syscalls: layer capture, scene graph, debug frame, overlay.
 //
-// Split from syscall.cpp (see docs/agent/syscall-split-plan.md).
+// Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "mouse.h"

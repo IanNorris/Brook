@@ -1,6 +1,6 @@
 // syscall_path.cpp -- path namespace syscalls: cwd, mkdir, unlink, rename, link, symlink, readlink, umask.
 //
-// Split from syscall.cpp (see docs/agent/syscall-split-plan.md).
+// Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "process_user_namespace.h"

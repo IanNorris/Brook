@@ -1,6 +1,6 @@
 // syscall_common.cpp -- shared syscall helpers: errno values, signal-pending checks, wakeups, fd pin guard, random.
 //
-// Split from syscall.cpp (see docs/agent/syscall-split-plan.md).
+// Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "posix_timer.h"

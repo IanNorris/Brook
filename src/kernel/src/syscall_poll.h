@@ -1,8 +1,7 @@
 #pragma once
 
 // syscall_poll.h -- internal declarations shared from syscall_poll.cpp.
-// Internal to the syscall layer; split from syscall.cpp
-// (see docs/agent/syscall-split-plan.md).
+// Internal to the syscall layer; split from syscall.cpp.
 
 #include <stdint.h>
 #include "sync_file.h"

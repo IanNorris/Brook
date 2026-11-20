@@ -1,6 +1,6 @@
 // syscall_poll.cpp -- poll/ppoll/select/pselect6 and shared wait-deadline helpers.
 //
-// Split from syscall.cpp (see docs/agent/syscall-split-plan.md).
+// Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "signal_fd.h"

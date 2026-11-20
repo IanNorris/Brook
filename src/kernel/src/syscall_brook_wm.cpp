@@ -1,6 +1,6 @@
 // syscall_brook_wm.cpp -- Brook window-manager syscalls.
 //
-// Split from syscall.cpp (see docs/agent/syscall-split-plan.md).
+// Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "mouse.h"

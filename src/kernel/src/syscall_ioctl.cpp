@@ -1,6 +1,6 @@
 // syscall_ioctl.cpp -- ioctl dispatch for terminals, framebuffer, OSS, DRM and sockets.
 //
-// Split from syscall.cpp (see docs/agent/syscall-split-plan.md).
+// Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "ahci_system_volume.h"

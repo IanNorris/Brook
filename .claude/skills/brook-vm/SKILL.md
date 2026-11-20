@@ -38,4 +38,4 @@ Keep the session generation and guest boot ID with operation records. Fetch fres
 
 ## Source and installation
 
-The bridge server is `tools/vm_bridge/server.py` with `BROOK_ROOT` set to the checkout. The VM registry is `build/vm-bridge` and the physical registry is `build/hardware-bridge`. Machine-specific endpoints, credentials, keys and current boot state belong in `docs/agent/HANDOVER.md` and private config, never in this skill.
+The bridge server is `tools/vm_bridge/server.py` with `BROOK_ROOT` set to the checkout. The VM registry is `build/vm-bridge` and the physical registry is `build/hardware-bridge`. Machine-specific endpoints, credentials, keys and current boot state belong in the private agent notes (HANDOVER.md) and private config, never in this skill.

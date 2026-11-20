@@ -1,6 +1,6 @@
 // syscall_mount.cpp -- mount namespace syscalls: mount/umount2/pivot_root.
 //
-// Split from syscall.cpp (see docs/agent/syscall-split-plan.md).
+// Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "mount_namespace.h"

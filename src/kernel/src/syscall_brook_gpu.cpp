@@ -1,6 +1,6 @@
 // syscall_brook_gpu.cpp -- Brook GPU syscalls: output buffers, handoff control, window validation, per-process virgl.
 //
-// Split from syscall.cpp (see docs/agent/syscall-split-plan.md).
+// Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "kprintf.h"

@@ -1,6 +1,6 @@
 // syscall_drm.cpp -- DRM render-node emulation: sysfs shim, GEM/PRIME objects, virtio-gpu and i915 ioctls, sync files.
 //
-// Split from syscall.cpp (see docs/agent/syscall-split-plan.md).
+// Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "kprintf.h"

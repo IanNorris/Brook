@@ -1,8 +1,7 @@
 #pragma once
 
 // syscall_epoll.h -- internal declarations shared from syscall_epoll.cpp.
-// Internal to the syscall layer; split from syscall.cpp
-// (see docs/agent/syscall-split-plan.md).
+// Internal to the syscall layer; split from syscall.cpp.
 
 #include "process.h"
 #include "sync/kmutex.h"

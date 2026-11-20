@@ -1,6 +1,6 @@
 // syscall_time.cpp -- clock, sleep and POSIX timer syscalls.
 //
-// Split from syscall.cpp (see docs/agent/syscall-split-plan.md).
+// Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "posix_timer.h"
