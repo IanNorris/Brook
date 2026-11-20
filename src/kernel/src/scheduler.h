@@ -24,7 +24,7 @@ void SchedulerSetCpuEnv(uint32_t cpuIndex, KernelCpuEnv* env);
 
 // Add a process to the ready queue.
 void SchedulerAddProcess(Process* proc);
-void SchedulerAddProcessWithSeccomp(Process* proc, Process* parent);
+bool SchedulerAddProcessWithSeccomp(Process* proc, Process* parent);
 struct SeccompFilter;
 int SchedulerAttachSeccomp(Process* process, SeccompFilter* filter, bool synchronize);
 
@@ -110,6 +110,14 @@ void SchedulerMarkStopped(Process* proc, int signal = 19);
 void SchedulerReleaseWaitReference(Process* proc);
 // Registry-pinned lookup; caller must ProcessUnref the returned identity.
 Process* SchedulerFindProcessReference(uint16_t pid);
+Process* SchedulerFindVisibleProcessReference(const PidNamespace* view, uint32_t tid);
+uint32_t SchedulerVisibleParentTid(const Process* process, const PidNamespace* view);
+uint32_t SchedulerTranslateProcessGroup(const Process* process, uint32_t group, bool toGlobal);
+uint32_t SchedulerCollectVisibleSignalTargets(Process* caller, int32_t selector,
+                                               Process** targets, uint32_t capacity);
+int SchedulerGetProcessGroup(Process* caller, uint32_t tid, bool session);
+int SchedulerSetProcessGroup(Process* caller, uint32_t tid, uint32_t destination);
+int SchedulerCreateSession(Process* caller);
 // True only after every task, including terminated but not-yet-reaped tasks,
 // of this exact non-reused group has left the scheduler registry.
 bool SchedulerThreadGroupGone(uint16_t tgid,uint64_t incarnation);
@@ -130,7 +138,7 @@ AddressSpaceState* SchedulerReferenceProcessAddressSpace(uint16_t pid, uint64_t 
 void SchedulerReplaceProcessAddressSpace(Process* process, AddressSpaceState* replacement);
 
 // Resolve a timer target under the process registry lock; returns only a token.
-bool SchedulerTimerTargetIncarnation(Process* owner, int32_t tid, uint64_t* incarnation);
+bool SchedulerTimerTargetIncarnation(Process* owner, int32_t tid, uint16_t* globalTid, uint64_t* incarnation);
 
 // Get the current process running on this CPU (nullptr if none).
 Process* SchedulerCurrentProcess();
@@ -213,7 +221,15 @@ struct ProcessSnapshot {
     uint64_t blockedSinceMs;
     uint64_t wakeupTick;
     uint64_t blockSites[ProcWaitSiteDepth];
+    // Filled for a retained PID namespace view. Internal identity stays above.
+    uint32_t viewTid, viewTgid, viewParent, viewGroup, viewSession;
 };
+
+// Retained proc mounts enumerate and look up only this PID view. Numeric
+// cursors select the lowest remaining local ID, independently of registry order.
+bool SchedulerSnapshotProcView(const PidNamespace* view, uint32_t tid, uint32_t minTid,
+                               uint16_t tgid, uint64_t group, bool leadersOnly,
+                               ProcessSnapshot* out);
 
 // Take a snapshot of all processes.  Fills `out` with up to `maxCount` entries.
 // Returns the number of entries written.

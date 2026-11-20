@@ -221,14 +221,34 @@ static void testFreshMounts(brook::MountNamespace* ns,const brook::VfsPath& root
         if(published)break;
     }
     assert(published && freshUnmounts==1);
+    const VfsFreshMountVisibility visibility{root, [](const void*, const void*) { return true; }};
+    assert(VfsMountNamespaceMountVisible(ns,second,"fresh",&freshOps,&other,0,visibility)==-1);
     assert(!VfsMountNamespaceMountFresh(ns,target,"fresh",&freshOps,&first,0,0,&publication) && publication);
-    assert(!VfsMountNamespaceMountFresh(ns,second,"fresh",&freshOps,&other,0));
+    auto source = resolve(root,root,"/ns-target");
+    {
+        FileMutationGuard transaction;
+        MountViewGuard view;
+        static_cast<MountEntry*>(source.attachment)->attributes = MountReadOnly;
+    }
+    Node masked{&first,1001,true,&first.root,{},{}};
+    first.root.children["masked"]=&masked;
+    auto base = resolve(root,source,"masked");
+    assert(!VfsMountNamespaceBind(ns,second,base));
+    auto covering = resolve(root,source,"masked");
+    assert(VfsMountNamespaceMountVisible(ns,second,"fresh",&freshOps,&other,0,visibility)==-1);
+    assert(!VfsMountNamespaceDetach(ns,covering));
+    VfsPathRelease(covering);VfsPathRelease(base);VfsPathRelease(source);
+    VfsDrainMountCleanup();
+    first.root.children.erase("masked");
+    assert(!VfsMountNamespaceMountVisible(ns,second,"fresh",&freshOps,&other,0,visibility));
     // ASCII-folded reporting labels must not introduce aliases when the
     // covering filesystem's own lookup remains case-sensitive.
     assert(FindMount("/ns-target",nullptr)!=FindMount("/NS-TARGET",nullptr));
     assert(!VfsUnmount("/ns-target")); // retained fresh root requires namespace detach
     auto held=resolve(root,root,"/ns-target"),otherHeld=resolve(root,root,"/ns-a");
     VnodeStat a{},b{};assert(!VfsPathStat(held,&a) && !VfsPathStat(otherHeld,&b));
+    auto* restricted=static_cast<MountEntry*>(otherHeld.attachment);
+    assert((restricted->lockedAttributes&MountReadOnly) && VfsReadOnly(restricted));
     assert(a.dev==1001 && b.dev==1002 && a.ino==b.ino);
     // The old driver/device API must not discover/coalesce a fresh instance.
     auto oldMountCalls=mountCalls[0];

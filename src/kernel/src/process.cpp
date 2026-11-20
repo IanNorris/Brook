@@ -9,6 +9,7 @@
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "process.h"
+#include "pid_namespace.h"
 #include "seccomp.h"
 #include "robust_futex.h"
 #include "process_fs.h"
@@ -55,13 +56,16 @@ static_assert(offsetof(Process,mountNamespaceMember)+sizeof(Process::mountNamesp
               "fork/thread snapshot must exclude both filesystem ownership fields");
 static_assert(offsetof(Process,fsContext)+sizeof(Process::fsContext)==offsetof(Process,oomEpisode),
               "recovery marker follows independently synchronized filesystem state");
-// Tail order: oomEpisode, then the seccomp state, which the fork/thread
-// snapshot excludes and inherits explicitly. Nothing may follow seccompTrap
-// except alignment padding.
+// Fork/thread copy stops before this tail. Recovery, seccomp and PID
+// namespace ownership are initialized or retained explicitly.
 static_assert(offsetof(Process,oomEpisode)+sizeof(Process::oomEpisode)==offsetof(Process,seccompFilter),
-              "seccomp state directly follows the explicitly inherited recovery marker");
-static_assert(sizeof(Process)-(offsetof(Process,seccompTrap)+sizeof(Process::seccompTrap))<alignof(Process),
-              "seccomp state must remain last, allowing alignment padding");
+              "seccomp state directly follows the recovery marker");
+static_assert(offsetof(Process,pidNamespaceIds)>=offsetof(Process,seccompTrap)+sizeof(Process::seccompTrap),
+              "PID namespace identities follow seccomp state");
+static_assert(offsetof(Process,pidNamespaceForChildren)>=offsetof(Process,pidNamespaceIds)+sizeof(Process::pidNamespaceIds),
+              "the future child PID namespace follows the active identities");
+static_assert(sizeof(Process)-(offsetof(Process,pidNamespaceForChildren)+sizeof(Process::pidNamespaceForChildren))<alignof(Process),
+              "PID namespace ownership ends the process tail");
 
 namespace {
 IrqSpinLock signalActionLock;
@@ -199,6 +203,7 @@ static inline void FreeProcessStruct(Process* p)
         MappingBackingUnref(p->fbBacking);p->fbBacking=nullptr;
         AddressSpaceUnref(p->addressSpace);
         p->addressSpace = nullptr;
+        ProcessPidRelease(p);
         p->magic = 0;
     }
     kfree(p);
@@ -1667,6 +1672,10 @@ uint16_t CreateRemoteThread(Process* target, uint64_t entry,
     // even if the target later execs. Stack construction uses that exact AS.
     Process* thread=ProcessCreateThread(target,entry,0,0x202,target->fsBase);
     if (!thread) return 0;
+    if (ProcessPidPrepareInjectedThread(thread, target)) {
+        ProcessDiscardUnpublished(thread);
+        return 0;
+    }
     uint64_t argVA=0;
     int64_t mapped=UserMappingStack(actor,thread->addressSpace,stackSize,argBytes,argLen,&argVA);
     if (mapped<0) {
@@ -1712,8 +1721,12 @@ uint16_t CreateRemoteThread(Process* target, uint64_t entry,
                  thread->pid, target->tgid, entry, userRsp, argVA, argLen,
                  stackBase, stackBase + stackSize);
 
-    SchedulerAddProcessWithSeccomp(thread, target);
-    return thread->pid;
+    const uint16_t tid = thread->pid;
+    if (!SchedulerAddProcessWithSeccomp(thread, target)) {
+        ProcessDiscardUnpublished(thread);
+        return 0;
+    }
+    return tid;
 }
 
 // ---------------------------------------------------------------------------

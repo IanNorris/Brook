@@ -1,5 +1,5 @@
 // Production scheduler lifecycle paths, included within namespace brook.
-static void AddProcessForBirth(Process* proc, Process* parent)
+static bool AddProcessForBirth(Process* proc, Process* parent)
 {
     proc->state = ProcessState::Ready;
 
@@ -51,17 +51,6 @@ static void AddProcessForBirth(Process* proc, Process* parent)
     // runnable thread from dispatching before its leader lifetime is counted.
     uint64_t birthFlags = SchedLockAcquire(g_readyLock);
     uint64_t alf1 = SchedLockAcquire(g_allProcLock);
-    // Inherit at publication, with the same lock as TSYNC. A newborn cannot
-    // run with a snapshot taken before a concurrent thread-group update.
-    if (parent) InheritSeccompForBirth(proc, parent);
-    // A policy switch must see either the whole published birth or none of it.
-    // Initializing before this lock allowed replacement to erase the newborn's
-    // policy entry before it reached g_allProcesses and the ready queue.
-    if (proc->pid < SCHED_MAX_PIDS)
-        g_pidToProcess[proc->pid] = proc;
-    g_schedOps->InitProcess(g_schedState, proc->pid, proc->schedPriority);
-    g_runtime.Register(proc->pid, proc->incarnation, proc->tgid ? proc->tgid : proc->pid,
-                       proc->isThread ? proc->leaderIncarnation : proc->incarnation);
     if (proc->isThread && !proc->isKernelThread)
     {
         Process* ldr = proc->threadLeader;
@@ -80,6 +69,22 @@ static void AddProcessForBirth(Process* proc, Process* parent)
     // the existing stillborn resource cleanup for every user task.
     if(!proc->isKernelThread && (__atomic_load_n(&proc->oomEpisode,__ATOMIC_ACQUIRE) ||
        (proc->addressSpace && __atomic_load_n(&proc->addressSpace->oomTerminating,__ATOMIC_ACQUIRE))))stillborn=true;
+    if (!proc->isKernelThread && !ProcessPidPublish(proc, !stillborn)) {
+        SchedLockRelease(g_allProcLock, alf1);
+        SchedLockRelease(g_readyLock, birthFlags);
+        return false;
+    }
+    // Inherit at publication, with the same lock as TSYNC. A newborn cannot
+    // run with a snapshot taken before a concurrent thread-group update.
+    if (parent) InheritSeccompForBirth(proc, parent);
+    // A policy switch must see either the whole published birth or none of it.
+    // Initializing before this lock allowed replacement to erase the newborn's
+    // policy entry before it reached g_allProcesses and the ready queue.
+    if (proc->pid < SCHED_MAX_PIDS)
+        g_pidToProcess[proc->pid] = proc;
+    g_schedOps->InitProcess(g_schedState, proc->pid, proc->schedPriority);
+    g_runtime.Register(proc->pid, proc->incarnation, proc->tgid ? proc->tgid : proc->pid,
+                       proc->isThread ? proc->leaderIncarnation : proc->incarnation);
     if (stillborn)
     {
         proc->state = ProcessState::Terminated;
@@ -127,17 +132,25 @@ static void AddProcessForBirth(Process* proc, Process* parent)
     // ready -> registry -> PID; allocation/release never takes another lock
     // while holding PID. A shutdown fence must wait for these leases before
     // checking the registry for remaining userspace tasks.
+    [[maybe_unused]] const uint16_t pid = proc->pid;
+    [[maybe_unused]] char name[sizeof(proc->name)];
+    for (unsigned i = 0; i < sizeof(name); ++i) name[i] = proc->name[i];
+    if (stillborn) ProcessRef(proc);
     uint64_t pidFlags=SchedLockAcquire(g_pidLock);
-    g_processIds.Publish(proc->pid);
+    g_processIds.Publish(pid);
     SchedLockRelease(g_pidLock,pidFlags);
     SchedLockRelease(g_allProcLock, alf1);
     SchedLockRelease(g_readyLock, birthFlags);
     ProcessFsFinishMountRetirement(retiredMounts);
+    if (stillborn) {
+        ProcessVforkRelease(proc);
+        ProcessUnref(proc);
+    }
 
-    DbgPrintf("SCHED: added '%s' (pid %u) to ready queue\n",
-                 proc->name, proc->pid);
+    DbgPrintf("SCHED: added '%s' (pid %u) to ready queue\n", name, pid);
 
     KickIdleCpu();
+    return true;
 }
 
 

@@ -6,6 +6,7 @@
 #include "unix_lifetime_trace.h"
 
 #include "unix_credentials.h"
+#include "pid_namespace.h"
 #include "syscall_internal.h"
 
 namespace brook {
@@ -28,7 +29,17 @@ struct UnixFdSnap {
     void*     handle;
 };
 
-UnixCredentials UnixCurrentCredentials(Process* process);
+struct UnixSenderCredentials {
+    UnixCredentials raw; // global PID for exact in-kernel peer checks
+    PidGroupIdentity identity;
+    uint64_t incarnation;
+
+    UnixCredentials Report(const PidNamespace* view) const {
+        return {static_cast<int32_t>(identity.Visible(PidNamespaceTag(view))), raw.uid, raw.gid};
+    }
+};
+UnixSenderCredentials UnixCurrentCredentials(Process* process);
+UnixSenderCredentials UnixCaptureCredentials(Process* process, uint32_t uid, uint32_t gid);
 uint64_t UnixCurrentIncarnation(Process* process);
 
 // FIFO of in-flight fds for one direction of a connected AF_UNIX pair.
@@ -39,7 +50,7 @@ struct UnixFdQueue {
     uint32_t records[UNIX_FD_QUEUE_CAP]; // credential-span slot for sequenced records
     // Sender identity belongs to bytes, not the socket's connection-time peer.
     // Forked children can send through an inherited endpoint.
-    struct CredentialSpan { uint64_t end; UnixCredentials sender; } credentials[UNIX_FD_QUEUE_CAP];
+    struct CredentialSpan { uint64_t end; UnixSenderCredentials sender; } credentials[UNIX_FD_QUEUE_CAP];
     uint32_t credentialHead, credentialTail;
     uint64_t written, read;
     volatile int head;
@@ -48,7 +59,7 @@ struct UnixFdQueue {
 };
 
 struct UnixPendingConn {
-    UnixCredentials clientCredentials;
+    UnixSenderCredentials clientCredentials;
     uint64_t clientIncarnation,clientLaunchId;
     uint8_t clientAddress[110];
     uint32_t clientAddressLength;
@@ -70,7 +81,7 @@ struct UnixSocketData {
     volatile uint32_t refCount; // +1 per fd pointing at this struct
     uint64_t networkScope; // network namespace for abstract addresses
     uint32_t socketType;       // creation type (without NONBLOCK/CLOEXEC flags)
-    UnixCredentials peerCredentials; // connection/listen snapshot; registry lock protects copies
+    UnixSenderCredentials peerCredentials; // connection/listen snapshot; registry lock protects copies
     uint64_t peerIncarnation,peerLaunchId;
     bool acceptedEndpoint; // Only accept(), never connect() or socketpair().
     bool gpuPeerAuthorized; // exact connected renderer was checked while attached
@@ -159,10 +170,10 @@ static inline void UnixListenWakeEpoll(UnixSocketData* usd)
 int64_t UnixSocketWriteSome(UnixSocketData* socket,bool nonblock,
                             const char* bytes,uint64_t length,
                             const UnixFdSnap* descriptors=nullptr,int count=0,bool noSignal=false,
-                            const UnixCredentials* explicitCredentials=nullptr);
+                            const UnixSenderCredentials* explicitCredentials=nullptr);
 
 int64_t UnixSocketReadSome(UnixSocketData* socket,bool nonblock,
                            char* bytes,uint64_t length,UnixFdSnap* descriptors,int& count,
-                           UnixCredentials* sender=nullptr,uint64_t* recordLength=nullptr,bool* consumed=nullptr);
+                           UnixSenderCredentials* sender=nullptr,uint64_t* recordLength=nullptr,bool* consumed=nullptr);
 
 } // namespace brook

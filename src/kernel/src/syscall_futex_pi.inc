@@ -84,6 +84,8 @@ static int64_t PiFutexOperation(uint64_t address,uint64_t operation,int op,uint6
         const unsigned clock=op==FUTEX_LOCK_PI || (operation&FUTEX_CLOCK_REALTIME)?0:1;
         if(!FutexMakeDeadline(false,value,ClockNowNs(clock),clock,&deadline))return -EINVAL;
     }
+    const auto* view = ProcessPidView(proc);
+    const uint32_t callerTid = ProcessVisibleTid(proc, view);
     PiKey key{};
     Process* wake=nullptr;
     int64_t result=0;
@@ -104,10 +106,10 @@ static int64_t PiFutexOperation(uint64_t address,uint64_t operation,int op,uint6
             uint32_t observed=__atomic_load_n(word,__ATOMIC_ACQUIRE);
             if(PiOrdinaryQueued(key))result=-EINVAL;
             else if(op==FUTEX_UNLOCK_PI) {
-                if((observed&PiTidMask)!=proc->pid)result=-EPERM;
+                if((observed&PiTidMask)!=callerTid)result=-EPERM;
                 else {
                     const auto* next=g_piGraph.Next(key,PiId(proc));
-                    const uint32_t replacement=next?(PiWaiters|next->waiter.pid):0;
+                    const uint32_t replacement=next?(PiWaiters|ProcessVisibleTid(g_piPins[next->waiter.pid], view)):0;
                     if(!next && g_piGraph.HasKey(key))result=-EINVAL;
                     else if(!__atomic_compare_exchange_n(word,&observed,replacement,false,
                                 __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))result=-EAGAIN;
@@ -118,11 +120,11 @@ static int64_t PiFutexOperation(uint64_t address,uint64_t operation,int op,uint6
                         PiSyncPins();
                     }
                 }
-            } else if((observed&PiTidMask)==proc->pid)result=-35;
+            } else if((observed&PiTidMask)==callerTid)result=-35;
             else if(!(observed&PiTidMask)) {
                 if(g_piGraph.HasKey(key))result=(observed&PiDied)?-EAGAIN:-EINVAL;
                 else {
-                    const uint32_t replacement=(observed&PiDied)|proc->pid;
+                    const uint32_t replacement=(observed&PiDied)|callerTid;
                     result=__atomic_compare_exchange_n(word,&observed,replacement,false,
                         __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)?0:-EAGAIN;
                 }
@@ -132,9 +134,12 @@ static int64_t PiFutexOperation(uint64_t address,uint64_t operation,int op,uint6
                 const uint32_t tid=observed&PiTidMask;
                 // The registry pin precedes publishing this identity into the
                 // graph. A terminating owner is retried after its exit cleanup.
-                auto* owner=tid<MAX_PROCESSES?SchedulerFindProcessReference(static_cast<uint16_t>(tid)):nullptr;
+                auto* owner=SchedulerFindVisibleProcessReference(view,tid);
                 if(!owner)result=-ESRCH;
                 else if(owner->isKernelThread)result=-EPERM;
+                // A shared PI word has one owner number. Only attach waiters
+                // whose active view encodes that number the same way.
+                else if(ProcessPidView(owner)!=view)result=-18; // EXDEV
                 else if(__atomic_load_n(&owner->robustExitState,__ATOMIC_ACQUIRE)>=3)result=-ESRCH;
                 else if(owner->state==ProcessState::Terminated ||
                         __atomic_load_n(&owner->robustExitState,__ATOMIC_ACQUIRE)>=2)result=-EAGAIN;
@@ -233,12 +238,12 @@ static void PiFutexOwnerExit(Process* target)
             const auto* next=g_piGraph.Next(key,PiId(target));
             if(next && next->waiter==PiId(waiter)) {
                 uint32_t observed=readable?__atomic_load_n(word,__ATOMIC_ACQUIRE):0;
-                const bool owned=(observed&PiTidMask)==target->pid;
+                const bool owned=(observed&PiTidMask)==ProcessVisibleTid(target, ProcessPidView(target));
                 const bool robustDied=!(observed&PiTidMask) && (observed&PiDied);
                 if(!readable || (!owned && !robustDied)) {
                     wake=g_piGraph.Cancel(PiId(waiter),readable?-EINVAL:-EFAULT);
                 } else {
-                    const uint32_t replacement=PiDied|PiWaiters|waiter->pid;
+                    const uint32_t replacement=PiDied|PiWaiters|ProcessVisibleTid(waiter, ProcessPidView(waiter));
                     if(__atomic_compare_exchange_n(word,&observed,replacement,false,
                         __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) {
                         wake=g_piGraph.Handoff(key,PiId(target),PiId(waiter))==PiGraphResult::Ok;

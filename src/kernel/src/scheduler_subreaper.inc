@@ -21,7 +21,7 @@ int SchedulerChildSubreaperControl(Process* proc,bool set,bool enabled) {
     SchedLockRelease(g_allProcLock,flags);
     return result;
 }
-static uint16_t FindChildSubreaperLocked(uint16_t dyingGroup) {
+static uint16_t FindChildSubreaperLocked(uint16_t dyingGroup, const PidNamespace* view) {
     uint16_t group=dyingGroup;
     // Walk while the dying group's retained registry identity still exists.
     // No escaping pointers, allocations or cached ancestry invalidation needed.
@@ -31,6 +31,7 @@ static uint16_t FindChildSubreaperLocked(uint16_t dyingGroup) {
             Process* p=g_allProcesses[i];
             if(p->pid==group && p->tgid==group && !p->isThread)representative=p;
         }
+        if (representative && ProcessPidView(representative) != view) break;
         bool live=false;
         if(representative)for(uint32_t i=0;i<g_processCount;++i) {
             Process* p=g_allProcesses[i];
@@ -40,10 +41,17 @@ static uint16_t FindChildSubreaperLocked(uint16_t dyingGroup) {
         // tgidExiting is also an exec-time thread-birth latch. It must not
         // hide the surviving subreaper while exec quiesces its siblings.
         if(group!=dyingGroup && live && ChildSubreaperEnabledLocked(representative))return group;
-        if(!representative || representative->parentPid==group)return 0;
+        if(!representative || representative->parentPid==group)break;
         group=representative->parentPid;
     }
-    return 0; // Brook's existing kernel-init/reap fallback
+    if (view && !PidNamespaceDraining(view)) {
+        for (uint32_t i = 0; i < g_processCount; ++i) {
+            Process* task = g_allProcesses[i];
+            if (task->tgid != dyingGroup && task->state != ProcessState::Terminated &&
+                ProcessPidView(task) == view && ProcessPidIsNamespaceInit(task)) return task->tgid;
+        }
+    }
+    return 0; // Kernel orphan reaper, including after namespace shutdown.
 }
 // Called under ready -> registry locks, before a nonleader changes its TGID.
 static void TransferChildSubreaperExecLocked(Process* proc) {

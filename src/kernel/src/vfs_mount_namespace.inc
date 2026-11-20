@@ -299,8 +299,63 @@ int VfsMountNamespacePublishContext(MountNamespace* ns,const VfsPath& root,void 
     if(root.attachment!=ns->root || root.object->identity!=ns->root->rootIdentity || root.object->ops!=ns->root->rootObjectOps)return -11;
     publish(argument);return 0;
 }
-int VfsMountNamespaceMountFresh(MountNamespace* ns,const VfsPath& inputTarget,
-    const char* fsName,const VfsFsOps* ops,void* privateData,uint8_t pdrv,uint64_t attributes,uint64_t* publication)
+// A fresh instance of a restricted provider cannot uncover a masked subtree
+// or replace a read-only view with a writable one. Find an entire compatible
+// instance reachable from this caller's retained root and inherit its flags.
+static int VfsFreshMountRestrictionsLocked(MountNamespace* ns, const VfsFsOps* ops, const void* requested,
+                                          const VfsFreshMountVisibility& policy, uint64_t& restrictions)
+{
+    const auto& root = policy.root;
+    if (!policy.covers || !root.object || !root.attachment ||
+        static_cast<MountEntry*>(root.attachment)->owner != ns) return -1;
+    char rootPath[512];
+    if (int error = VfsGlobalDirectoryLocked(root, rootPath, sizeof(rootPath))) return error;
+    const bool top = StrEq(rootPath, "/");
+    for (auto& mount : g_mounts) {
+        if (mount.owner != ns || !VfsMountPublished(mount) ||
+            mount.backing->fsOps != ops || !policy.covers(mount.backing->mountPriv, requested) ||
+            (!top && !VfsComponentPrefix(rootPath, mount.mountPoint))) continue;
+
+        VfsObject* superRoot = nullptr;
+        const int rootError = ops->root_object(mount.backing->mountPriv, mount.backing->pdrv, &superRoot);
+        const bool whole = !rootError && superRoot && mount.rootIdentityKnown &&
+            superRoot->ops == mount.rootObjectOps && superRoot->identity == mount.rootIdentity;
+        VfsObjectRelease(superRoot);
+        if (rootError == -12) return rootError;
+        if (!whole) continue;
+
+        bool covered = false;
+        for (const auto& child : g_mounts) {
+            if (child.owner == ns && VfsMountPublished(child) && child.covered.attachment == &mount) {
+                covered = true;
+                break;
+            }
+        }
+        if (covered) continue;
+
+        const char* path = mount.mountPoint + (top ? 0 : StrLen(rootPath));
+        VfsRetainedProvider provider{};
+        RetainedWalkResult<VfsPath> resolved{};
+        const int err = WalkRetainedPath(root, root, *path ? path : "/", &resolved, provider);
+        // The reported path is only a lookup hint. Authorization uses the
+        // exact live attachment and filesystem root resolved by the walk.
+        const bool visible = !err && resolved.object.attachment == &mount &&
+            resolved.object.object->identity == mount.rootIdentity &&
+            resolved.object.object->ops == mount.rootObjectOps;
+        VfsPathRelease(resolved.parent);
+        VfsPathRelease(resolved.object);
+        if (err == -12) return err;
+        if (visible) {
+            restrictions = (mount.lockedAttributes | VfsMountAttributes(&mount)) & MountRestrictionMask;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int MountFreshWithVisibility(MountNamespace* ns,const VfsPath& inputTarget,
+    const char* fsName,const VfsFsOps* ops,void* privateData,uint8_t pdrv,uint64_t attributes,
+    uint64_t* publication,const VfsFreshMountVisibility* visibility)
 {
     if(publication)*publication=0;
     if(!ns || !inputTarget.object || !inputTarget.attachment || !fsName || !ops || !privateData)return -22;
@@ -318,6 +373,12 @@ int VfsMountNamespaceMountFresh(MountNamespace* ns,const VfsPath& inputTarget,
     // Registered tables/callbacks are permanently provider-pinned. Unregistered
     // or mismatched tables cannot become a backing through this entry point.
     if(FindFsDriver(fsName)!=ops || !ops->root_object || !ops->unmount)return -95;
+    uint64_t inheritedRestrictions = 0;
+    if (visibility) {
+        int error = VfsFreshMountRestrictionsLocked(ns, ops, privateData, *visibility, inheritedRestrictions);
+        if (error) return error;
+        attributes |= inheritedRestrictions;
+    } else if (proc) return -1;
     if(StrLen(fsName)>=sizeof(MountEntry::fsType))return -36;
     auto* parent=static_cast<MountEntry*>(target.attachment);
     if(parent->owner!=ns || !VfsMountPublished(*parent))return -22;
@@ -345,6 +406,7 @@ int VfsMountNamespaceMountFresh(MountNamespace* ns,const VfsPath& inputTarget,
     mount->rootDevice=stat.dev;mount->attributes=attributes;
     if(proc || mqueue)mount->lockedAttributes=MountNoSuid|MountNoDev|MountNoExec;
     if(devpts)mount->lockedAttributes=MountReadOnly|MountNoSuid|MountNoExec;
+    mount->lockedAttributes |= inheritedRestrictions;
     StrCopy(mount->physicalRoot,"/",sizeof(mount->physicalRoot));
     mount->covered=target;VfsPathRetain(target);mount->used=true;mount->linked=true;
     mount->publication=++g_mountPublication;StrCopy(mount->fsType,fsName,sizeof(mount->fsType));
@@ -352,6 +414,19 @@ int VfsMountNamespaceMountFresh(MountNamespace* ns,const VfsPath& inputTarget,
     if(publication)*publication=mount->publication;
     return 0;
 }
+int VfsMountNamespaceMountFresh(MountNamespace* ns,const VfsPath& target,
+    const char* fsName,const VfsFsOps* ops,void* privateData,uint8_t pdrv,uint64_t attributes,uint64_t* publication)
+{
+    return MountFreshWithVisibility(ns,target,fsName,ops,privateData,pdrv,attributes,publication,nullptr);
+}
+
+int VfsMountNamespaceMountVisible(MountNamespace* ns,const VfsPath& target,
+    const char* fsName,const VfsFsOps* ops,void* privateData,uint64_t attributes,
+    const VfsFreshMountVisibility& visibility)
+{
+    return MountFreshWithVisibility(ns,target,fsName,ops,privateData,0,attributes,nullptr,&visibility);
+}
+
 // Test exact retained ancestry, never reporting-label prefixes. The first edge
 // on the source attachment determines whether the entire child mount belongs
 // to a recursive bind of a partial directory on that attachment.

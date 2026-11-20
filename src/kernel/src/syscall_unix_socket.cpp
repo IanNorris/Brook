@@ -21,9 +21,15 @@ static constexpr int UNIX_MAX_SERVERS   = 32;
 
 void UnixFdSnapRelease(const UnixFdSnap* snap);
 
-UnixCredentials UnixCurrentCredentials(Process* process)
+UnixSenderCredentials UnixCaptureCredentials(Process* process, uint32_t uid, uint32_t gid)
 {
-    return {static_cast<int32_t>((process->tgid ? process->tgid : process->pid)), process->euid, process->egid};
+    const auto identity = ProcessPidGroupIdentity(process);
+    return {{static_cast<int32_t>(identity.global), uid, gid}, identity, UnixCurrentIncarnation(process)};
+}
+
+UnixSenderCredentials UnixCurrentCredentials(Process* process)
+{
+    return UnixCaptureCredentials(process, process->euid, process->egid);
 }
 uint64_t UnixCurrentIncarnation(Process* process)
 {
@@ -36,16 +42,17 @@ uint64_t UnixCurrentIncarnation(Process* process)
 static int64_t UnixStreamTryWrite(PipeBuffer* pipe, UnixFdQueue* queue,
                                   const char* bytes, uint64_t length,
                                   const UnixFdSnap* descriptors=nullptr, int count=0,
-                                  const UnixCredentials* explicitCredentials=nullptr,bool record=false) {
+                                  const UnixSenderCredentials* explicitCredentials=nullptr,bool record=false) {
     auto* process = ProcessCurrent();
-    const UnixCredentials sender=explicitCredentials?*explicitCredentials:UnixCredentials{
-        static_cast<int32_t>(process->tgid ? process->tgid : process->pid),
-        ProcessReadIds(process,false).real,ProcessReadIds(process,true).real};
+    const auto sender = explicitCredentials ? *explicitCredentials :
+        UnixCaptureCredentials(process, ProcessReadIds(process,false).real, ProcessReadIds(process,true).real);
     SpinLockAcquire(&pipe->lock);
     bool merge = false;
     if (!record && queue && queue->credentialHead != queue->credentialTail) {
         auto& previous = queue->credentials[(queue->credentialHead + UNIX_FD_QUEUE_CAP - 1) % UNIX_FD_QUEUE_CAP];
-        merge = previous.sender.pid == sender.pid && previous.sender.uid == sender.uid && previous.sender.gid == sender.gid;
+        merge = previous.sender.incarnation == sender.incarnation &&
+            previous.sender.raw.pid == sender.raw.pid &&
+            previous.sender.raw.uid == sender.raw.uid && previous.sender.raw.gid == sender.raw.gid;
     }
     const bool credentialRoom = !queue || merge ||
         (queue->credentialHead + 1) % UNIX_FD_QUEUE_CAP != queue->credentialTail;
@@ -82,7 +89,7 @@ static int64_t UnixStreamTryWrite(PipeBuffer* pipe, UnixFdQueue* queue,
 }
 static uint32_t UnixStreamTryRead(PipeBuffer* pipe, UnixFdQueue* queue,
                                   char* bytes, uint64_t length,
-                                  UnixFdSnap* descriptors, int& count, UnixCredentials* sender,
+                                  UnixFdSnap* descriptors, int& count, UnixSenderCredentials* sender,
                                   bool record=false,bool* consumed=nullptr,uint64_t* recordLength=nullptr) {
     count=0;SpinLockAcquire(&pipe->lock);
     if(consumed)*consumed=false;
@@ -444,7 +451,7 @@ static bool UnixUserPointer(const void* bytes)
 int64_t UnixSocketWriteSome(UnixSocketData* socket,bool nonblock,
                             const char* bytes,uint64_t length,
                             const UnixFdSnap* descriptors,int count,bool noSignal,
-                            const UnixCredentials* explicitCredentials) {
+                            const UnixSenderCredentials* explicitCredentials) {
     if(socket->state!=UnixSocketData::State::Connected || !socket->txPipe)return -ENOTCONN;
     auto* pipe=socket->txPipe;
     UnixSocketStage staged;
@@ -478,7 +485,7 @@ int64_t UnixSocketWriteSome(UnixSocketData* socket,bool nonblock,
 }
 int64_t UnixSocketReadSome(UnixSocketData* socket,bool nonblock,
                            char* bytes,uint64_t length,UnixFdSnap* descriptors,int& count,
-                           UnixCredentials* sender,uint64_t* recordLength,bool* consumed) {
+                           UnixSenderCredentials* sender,uint64_t* recordLength,bool* consumed) {
     count=0;
     if(consumed)*consumed=false;
     if(recordLength)*recordLength=0;

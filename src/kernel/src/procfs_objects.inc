@@ -13,6 +13,8 @@ struct ProcObject {
     uint64_t incarnation,group;
     bool taskMember;
     uint32_t index;
+    uint32_t viewTid;
+    const PidNamespace* pidView;
     UserNamespace* userNamespace;
 };
 static SpinLock g_procObjectLock;
@@ -27,20 +29,25 @@ static int ProcObjectSnapshot(const ProcObject* object,ProcessSnapshot* snapshot
 {
     if(object->kind==ProcObjectKind::UserMap) {*snapshot={};return 0;}
     if(!object->pid) { *snapshot={};return 0; }
-    if(!SchedulerSnapshotProcess(object->pid,snapshot) || snapshot->incarnation!=object->incarnation ||
+    const bool found = object->pidView
+        ? SchedulerSnapshotProcView(object->pidView, object->viewTid, 0, 0, 0, false, snapshot)
+        : SchedulerSnapshotProcess(object->pid, snapshot);
+    if(!found || snapshot->pid!=object->pid || snapshot->incarnation!=object->incarnation ||
        snapshot->tgid!=object->tgid || snapshot->groupIncarnation!=object->group ||
        (object->taskMember && snapshot->state==ProcessState::Terminated))return -2;
     return 0;
 }
 static int ProcObjectMake(ProcObjectKind kind,VfsObject* parent,const ProcessSnapshot* snapshot,
-                           uint32_t index,bool taskMember,VfsObject** out)
+                           uint32_t index,bool taskMember,VfsObject** out,const PidNamespace* rootView=nullptr)
 {
     *out=nullptr;auto* value=static_cast<ProcObject*>(kmalloc(sizeof(ProcObject)));
     if(!value)return -12;
     *value={};value->kind=kind;value->parent=parent;VfsObjectRetain(parent);
     value->index=index;value->taskMember=taskMember;
+    value->pidView = parent ? static_cast<ProcObject*>(parent->priv)->pidView : rootView;
+    if (!parent) PidNamespaceRetain(value->pidView);
     if(snapshot) {
-        value->pid=snapshot->pid;value->tgid=snapshot->tgid;
+        value->pid=snapshot->pid;value->tgid=snapshot->tgid;value->viewTid=snapshot->viewTid;
         value->incarnation=snapshot->incarnation;value->group=snapshot->groupIncarnation;
     }
     if(kind==ProcObjectKind::UserMap) {
@@ -54,18 +61,20 @@ static int ProcObjectMake(ProcObjectKind kind,VfsObject* parent,const ProcessSna
     for(auto* entry=g_procObjects;entry;entry=entry->next) {
         if(entry->kind==kind && entry->pid==value->pid && entry->incarnation==value->incarnation &&
            entry->tgid==value->tgid && entry->group==value->group && entry->index==index &&
-           entry->taskMember==taskMember &&
+           entry->taskMember==taskMember && entry->pidView==value->pidView &&
            ((!entry->parent && !parent) || (entry->parent && parent && entry->parent->ops==parent->ops && entry->parent->identity==parent->identity)) &&
            VfsObjectTryRetain(&entry->object)) {
             *out=&entry->object;SpinLockRelease(&g_procObjectLock);
-            UserNamespaceRelease(value->userNamespace);VfsObjectRelease(value->parent);kfree(value);return 0;
+            UserNamespaceRelease(value->userNamespace);
+            if (!parent) PidNamespaceRelease(value->pidView);
+            VfsObjectRelease(value->parent);kfree(value);return 0;
         }
     }
     // Only root has a fixed identity across zero-reference intervals. Other
     // live keys are interned, using non-reused checked IDs rather than a lossy
     // hash of PID/incarnation/file index.
     if(g_procObjectIdentity>=(uint64_t{1}<<62))__builtin_trap();
-    uint64_t identity=kind==ProcObjectKind::Root?1:g_procObjectIdentity++;
+    uint64_t identity=kind==ProcObjectKind::Root && !rootView ? 1 : g_procObjectIdentity++;
     value->object={ProcObjectOperations(),value,identity,1};
     value->next=g_procObjects;g_procObjects=value;*out=&value->object;
     SpinLockRelease(&g_procObjectLock);return 0;
@@ -77,7 +86,9 @@ static void ProcObjectDestroy(VfsObject* object)
     ProcObject** entry=&g_procObjects;while(*entry && *entry!=value)entry=&(*entry)->next;
     if(*entry!=value)__builtin_trap();
     *entry=value->next;SpinLockRelease(&g_procObjectLock);
-    UserNamespaceRelease(value->userNamespace);kfree(value);VfsObjectRelease(parent);
+    UserNamespaceRelease(value->userNamespace);
+    if (!parent) PidNamespaceRelease(value->pidView);
+    kfree(value);VfsObjectRelease(parent);
 }
 static int ProcReportedInode(VfsObject* object,uint64_t* out)
 {
@@ -156,8 +167,12 @@ static int ProcObjectLookup(VfsObject* object,const char* name,VfsObject** out,b
         if(StrEqProc(name,"net"))return ProcObjectMake(ProcObjectKind::Net,object,nullptr,0,false,out);
         for(uint32_t i=0;i<NUM_GLOBAL;++i)
             if(StrEqProc(name,g_globalEntries[i].name))return ProcObjectMake(ProcObjectKind::GlobalFile,object,nullptr,i,false,out);
-        const char* end=nullptr;uint32_t pid=ParseUint(name,&end);
-        if(!IsDigit(name[0]) || !end || *end || !pid || pid>65535 || !FindProcess(pid,&snapshot))return -2;
+        const uint32_t limit = value->pidView ? 0x3fffffu : 65535u;
+        const char* end=nullptr;uint32_t pid=ParseUint(name,&end,limit);
+        if(!IsDigit(name[0]) || !end || *end || !pid || pid>limit)return -2;
+        if (value->pidView) {
+            if (!SchedulerSnapshotProcView(value->pidView, pid, 0, 0, 0, false, &snapshot)) return -2;
+        } else if (!FindProcess(pid, &snapshot)) return -2;
         return ProcObjectMake(ProcObjectKind::Pid,object,&snapshot,0,false,out);
     }
     if(value->kind==ProcObjectKind::Sys) {
@@ -186,10 +201,15 @@ static int ProcObjectLookup(VfsObject* object,const char* name,VfsObject** out,b
             if(StrEqProc(name,g_pidEntries[i].name))return ProcObjectMake(ProcObjectKind::PidFile,object,&snapshot,i,value->taskMember,out);
         return -2;
     }
-    const char* end=nullptr;uint32_t number=ParseUint(name,&end);
-    if(!IsDigit(name[0]) || !end || *end)return -2;
+    const uint32_t limit = value->pidView && value->kind==ProcObjectKind::Task ? 0x3fffffu : 65535u;
+    const char* end=nullptr;uint32_t number=ParseUint(name,&end,limit);
+    if(!IsDigit(name[0]) || !end || *end || number>limit)return -2;
     if(value->kind==ProcObjectKind::Task) {
-        if(!number || number>65535 || !SchedulerSnapshotTask(value->tgid,value->group,number,0,&snapshot))return -2;
+        if (!number) return -2;
+        if (value->pidView) {
+            if (!SchedulerSnapshotProcView(value->pidView, number, 0, value->tgid, value->group,
+                                          false, &snapshot)) return -2;
+        } else if (!SchedulerSnapshotTask(value->tgid, value->group, number, 0, &snapshot)) return -2;
         return ProcObjectMake(ProcObjectKind::Pid,object,&snapshot,0,true,out);
     }
     if(value->kind==ProcObjectKind::Fds) {
@@ -256,8 +276,12 @@ static int ProcObjectReadlink(VfsObject* object,char* out,uint32_t capacity)
     char target[512]{};
     if(value->kind==ProcObjectKind::Self || value->kind==ProcObjectKind::ThreadSelf) {
         Process* current=ProcessCurrent();if(!current)return -2;
-        char* end=U64ToDec(target,current->tgid?current->tgid:current->pid);
-        if(value->kind==ProcObjectKind::ThreadSelf) {end=AppendStr(end,"/task/");end=U64ToDec(end,current->pid);}
+        const uint32_t tgid = ProcessVisibleTgid(current, value->pidView);
+        if (!tgid) return -2;
+        char* end=U64ToDec(target,tgid);
+        if(value->kind==ProcObjectKind::ThreadSelf) {
+            end=AppendStr(end,"/task/");end=U64ToDec(end,ProcessVisibleTid(current,value->pidView));
+        }
         *end=0;
     } else if(value->kind==ProcObjectKind::FdLink) {
         VfsPath path{};int error=ProcAcquireVnodeFdPath(value,&path,target,sizeof(target),true);
@@ -329,8 +353,8 @@ static int ProcObjectDirectoryPath(VfsObject* object,char* out,uint32_t capacity
     else if(value->kind==ProcObjectKind::SysKernel)end=AppendStr(end,"sys/kernel");
     else {
         if(!ProcObjectDirectory(value->kind))return -20;
-        if(value->taskMember) {end=U64ToDec(end,value->tgid);end=AppendStr(end,"/task/");}
-        end=U64ToDec(end,value->pid);
+        if(value->taskMember) {end=U64ToDec(end,snapshot.viewTid ? snapshot.viewTgid : value->tgid);end=AppendStr(end,"/task/");}
+        end=U64ToDec(end,value->viewTid ? value->viewTid : value->pid);
         if(value->kind==ProcObjectKind::Task)end=AppendStr(end,"/task");
         if(value->kind==ProcObjectKind::Fds)end=AppendStr(end,"/fd");
         if(value->kind==ProcObjectKind::NsDirectory)end=AppendStr(end,"/ns");
@@ -463,9 +487,15 @@ static const VfsObjectOps g_procObjectOps={
     .directory_path=ProcObjectDirectoryPath,.follow_link=ProcObjectFollow,
 };
 static const VfsObjectOps* ProcObjectOperations() {return &g_procObjectOps;}
-int ProcFsRootObject(void*,uint8_t,VfsObject** out)
+static const PidNamespace* ProcOpenedPidView(const Vnode* vnode)
 {
-    return ProcObjectMake(ProcObjectKind::Root,nullptr,nullptr,0,false,out);
+    const auto* object = vnode->backendObject;
+    return object && object->ops == &g_procObjectOps ? static_cast<const ProcObject*>(object->priv)->pidView : nullptr;
+}
+int ProcFsRootObject(void* mountPriv,uint8_t,VfsObject** out)
+{
+    const auto* view = static_cast<const ProcMountView*>(mountPriv);
+    return ProcObjectMake(ProcObjectKind::Root,nullptr,nullptr,0,false,out,view ? view->pid : nullptr);
 }
 int ProcFsVnodeObject(Vnode* node,VfsObject** out)
 {

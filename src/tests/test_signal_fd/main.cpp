@@ -19,14 +19,21 @@ struct KernelSigaction {uint64_t handler,flags,restorer,mask;};
 static std::atomic<uint64_t> caughtHandler{0};
 static std::function<void()> actionReadHook;
 static KernelSigaction ReadSignalAction(uint16_t,uint32_t){if(actionReadHook)actionReadHook();return {caughtHandler.load(),0,0,0};}
+struct PidNamespace { bool draining = false; };
 struct Process {
     uint32_t pid,tgid,uid=1000;uint16_t parentPid=0;bool isThread=false;uint64_t leaderIncarnation=1;uint64_t incarnation=1,sigPending=0,sigMask=0,wakeupTick=0;
     bool terminalPending=false,continuedPending=false,tgidExiting=false;int waitStatus=0,stopSignal=0;
     ProcessState state=ProcessState::Running;Process* threadLeader=nullptr;
     struct Sender{int32_t pid;uint32_t uid;int32_t code;} sigSenders[64]{};
     std::atomic<unsigned> regions{0};std::mutex mutex;std::condition_variable cv;bool wake=false;
+    const PidNamespace* view = nullptr;
+    bool namespaceInit = false;
     explicit Process(unsigned id):pid(id),tgid(id){}
 };
+static const PidNamespace* ProcessPidView(const Process* p) { return p->view; }
+static uint32_t ProcessVisibleTgid(const Process* p,const PidNamespace*) { return p->tgid; }
+static bool ProcessPidIsNamespaceInit(const Process* p) { return p->namespaceInit; }
+static bool PidNamespaceDraining(const PidNamespace* view) { return view->draining; }
 static void ProcessSignalInfoToUser(Process*,SignalInfo*) {} // identity namespace fixture
 static std::atomic<int> allocations{0};static bool failAllocation=false,failCopy=false;
 static void* kmalloc(uint64_t n){if(failAllocation)return nullptr;void* p=std::malloc(n);if(p)++allocations;return p;}
@@ -72,12 +79,20 @@ int main(){
         thread.parentPid=999; // a stale member cannot supply canonical ancestry
         g_allProcesses[0]=&reaper;g_allProcesses[1]=&dying;g_allProcesses[2]=&thread;g_processCount=3;
         CHECK(!SchedulerChildSubreaperControl(&reaper,true,true));
-        CHECK(FindChildSubreaperLocked(102)==101);
+        CHECK(FindChildSubreaperLocked(102, nullptr)==101);
         reaper.state=ProcessState::Terminated;thread.leaderIncarnation=500;
-        CHECK(FindChildSubreaperLocked(102)==101); // surviving sibling is enough
+        CHECK(FindChildSubreaperLocked(102, nullptr)==101); // surviving sibling is enough
         thread.state=ProcessState::Terminated;
-        CHECK(FindChildSubreaperLocked(102)==0);
+        CHECK(FindChildSubreaperLocked(102, nullptr)==0);
         reaper.state=ProcessState::Running;
+        PidNamespace view{};
+        Process init(108);
+        init.view = dying.view = &view;
+        init.namespaceInit = true;
+        g_allProcesses[3]=&init;g_processCount=4;
+        CHECK(FindChildSubreaperLocked(102, &view)==108);
+        view.draining = true;
+        CHECK(FindChildSubreaperLocked(102, &view)==0);
         child.parentPid=101;
         execing.tgid=101;execing.isThread=true;execing.leaderIncarnation=500;
         g_allProcesses[3]=&child;g_allProcesses[4]=&execing;g_processCount=5;

@@ -54,7 +54,7 @@ int64_t sys_mount(uint64_t sourceAddr,uint64_t targetAddr,uint64_t fsAddr,
     }
     if(procMount) {
         VfsPath targetPath{};int error=VfsPathResolve(lookup.fs.root,lookup.fs.cwd,target,&targetPath);
-        if(!error)error=ProcFsMountPrivate(lookup.fs.mountNamespace,targetPath,flags&MountRestrictionMask);
+        if(!error)error=ProcFsMountPrivate(lookup.fs.mountNamespace,lookup.fs.root,targetPath,flags&MountRestrictionMask);
         VfsPathRelease(targetPath);return error;
     }
     if(queueMount) {

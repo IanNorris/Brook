@@ -23,6 +23,8 @@ Vnode* ProcFsOpenDir(const char* relPath);
 // What a task is waiting for, derived from a scheduler snapshot (shared by
 // /proc/<pid>/wchan and the `proc blocked` debug command).
 struct ProcessSnapshot;
+struct PidNamespace;
+struct ProcMountView { const PidNamespace* pid; };
 struct ProcWaitDescription {
     const char* kind;          // "running", "futex", "poll", "pipe", "gpu-wait", ...
     int fd;                    // fd argument of the current syscall, or -1

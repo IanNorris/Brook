@@ -8,7 +8,8 @@
 namespace brook {
 enum class ProcessState{Running,Ready,Blocked,Stopped,Terminated};
 constexpr uint64_t PROCESS_MAGIC=0x12345;
-struct Process{uint64_t magic=PROCESS_MAGIC;uint16_t pid=1,tgid=1;ProcessState state=ProcessState::Running;bool wakeAfterSwitch=false;bool interruptibleWait=false,terminalPending=false,resumePending=false,continuedPending=false,stopReported=false;int runningOnCpu=-1;uint32_t pendingWakeup=0;uint64_t sigPending=0,sigMask=0,wakeupTick=0,incarnation=1;unsigned depth=0;};
+struct PidNamespace { const PidNamespace* parent; };
+struct Process{const PidNamespace* view=nullptr;bool pidNamespaceInit=false;uint64_t magic=PROCESS_MAGIC;uint16_t pid=1,tgid=1;ProcessState state=ProcessState::Running;bool wakeAfterSwitch=false;bool interruptibleWait=false,terminalPending=false,resumePending=false,continuedPending=false,stopReported=false;int runningOnCpu=-1;uint32_t pendingWakeup=0;uint64_t sigPending=0,sigMask=0,wakeupTick=0,incarnation=1;unsigned depth=0;};
 struct SchedLock{};static SchedLock g_readyLock,g_allProcLock;static std::mutex ready,allProc;
 static std::function<void()> afterReadyRelease;
 static bool irq=true;static unsigned removes=0,voluntary=0,yields=0;
@@ -52,7 +53,16 @@ static KernelSigaction ReadSignalAction(uint16_t,int){return action;}
 static void QueueSignal(Process* p,int sig,const SignalInfo*){++queued;__atomic_or_fetch(&p->sigPending,uint64_t(1)<<(sig-1),__ATOMIC_RELEASE);}
 static void DbgPrintf(const char*,...){}
 static constexpr int SIGKILL=9,SIGSTOP=19;
-static void SchedulerRequestFatalSignal(Process*,int){}
+static unsigned fatalSignals = 0;
+static void SchedulerRequestFatalSignal(Process*,int){++fatalSignals;}
+static bool ProcessPidIsNamespaceInit(const Process* proc) { return proc->pidNamespaceInit; }
+static const PidNamespace* ProcessPidView(const Process* proc) { return proc->view; }
+static bool PidNamespaceContains(const PidNamespace* ancestor, const PidNamespace* view) {
+    if (!ancestor) return true;
+    for (; view; view = view->parent) if (ancestor == view) return true;
+    return false;
+}
+int ProcessSendSignal(Process*, int, const SignalInfo*, const Process* sender=nullptr);
 static void SchedulerStop(Process* p,int){p->state=ProcessState::Stopped;}
 #include "../../kernel/src/process_signal_send.inc"
 }
@@ -142,6 +152,22 @@ int main(){using namespace brook;
     };
     CHECK(ProcessSendSignal(&restopped,18,nullptr)==0);
     CHECK(restopped.state==ProcessState::Stopped && !restopped.resumePending && !inserts && notifications==1);
+    // The production send path also carries terminal-originated signals.
+    PidNamespace view{}, unrelated{};
+    Process init, sameView, ancestor, sibling;
+    init.view = sameView.view = &view;
+    init.pidNamespaceInit = true;
+    sibling.view = &unrelated;
+    action.handler = 0;
+    CHECK(ProcessSendSignal(&init, 2, nullptr) == 0 && !fatalSignals);
+    CHECK(ProcessSendSignal(&init, 20, nullptr, &ancestor) == 0 && init.state == ProcessState::Running);
+    CHECK(ProcessSendSignal(&init, SIGKILL, nullptr, &sameView) == 0 && !fatalSignals);
+    CHECK(ProcessSendSignal(&init, SIGKILL, nullptr, &sibling) == 0 && !fatalSignals);
+    CHECK(ProcessSendSignal(&init, SIGSTOP, nullptr, &ancestor) == 0 && init.state == ProcessState::Stopped);
+    CHECK(ProcessSendSignal(&init, 18, nullptr, &ancestor) == 0 && init.state == ProcessState::Ready);
+    CHECK(ProcessSendSignal(&init, SIGKILL, nullptr, &ancestor) == 0 && fatalSignals == 1);
+    action.handler = 42;
+    CHECK(ProcessSendSignal(&init, 2, nullptr) == 0 && (init.sigPending & (1u << 1)));
     Process handoff;
     handoff.state=ProcessState::Blocked;
     handoff.runningOnCpu=2;

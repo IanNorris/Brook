@@ -134,7 +134,7 @@ uint32_t NetInterfaceViews(InterfaceView*,uint32_t,uint64_t) { return 0; }
 FileActorSnapshot ProcessFileActorAcquire(Process*,UserNamespace*,bool) { return {}; }
 void ProcessGroupsRelease(SupplementaryGroups*) {}
 CredentialIds ProcessReadIds(Process*,bool) { return {}; }
-int ProcessSendSignal(Process*,int,const SignalInfo*) { return 0; }
+int ProcessSendSignal(Process*,int,const SignalInfo*,const Process*) { return 0; }
 int VfsAccess(Vnode*,uint8_t,bool) { return -13; }
 uint32_t ProcessReportId(Process*,bool,uint32_t canonical) { return canonical; }
 

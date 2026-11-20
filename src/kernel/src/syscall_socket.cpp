@@ -79,7 +79,7 @@ int64_t sys_socket(uint64_t domain, uint64_t type, uint64_t protocol,
         usd->refCount = 1;
         usd->networkScope = ProcessNetworkScope(proc);
         usd->socketType = static_cast<uint32_t>(type) & 0xfu;
-        usd->peerCredentials = {0, ~uint32_t{0}, ~uint32_t{0}};
+        usd->peerCredentials.raw = {0, ~uint32_t{0}, ~uint32_t{0}};
 
         int fd = UnixInstallSocket(proc, usd, static_cast<uint32_t>(type), "socket");
         if (fd < 0) { UnixSocketHandleUnref(usd); return fd; }
@@ -580,7 +580,7 @@ int64_t sys_getsockopt(uint64_t fdVal, uint64_t levelVal, uint64_t optnameVal,
             break;
         case 17: // SO_PEERCRED (struct ucred), immutable connection identity.
             SpinLockAcquire(&g_unixRegistryLock);
-            credentials = socket->peerCredentials;
+            credentials = socket->peerCredentials.Report(ProcessPidView(proc));
             SpinLockRelease(&g_unixRegistryLock);
             break;
         case 3: // SO_TYPE: type selected at socket/socketpair creation.
@@ -1173,7 +1173,7 @@ int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
     // rather than send orphaned payload — matches Linux kernel behaviour.
     UnixFdSnap pendingSnaps[UNIX_FD_QUEUE_CAP];
     int pendingCount = 0;
-    UnixCredentials explicitCredentials{};bool hasExplicitCredentials=false;
+    UnixSenderCredentials explicitCredentials{};bool hasExplicitCredentials=false;
     auto failControl=[&](int error)->int64_t {
         for(int j=0;j<pendingCount;++j)UnixFdSnapRelease(&pendingSnaps[j]);
         return error;
@@ -1195,9 +1195,9 @@ int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
                 if(!CopyFromUser(&requested,ctlAddr+off+sizeof(cm),sizeof(requested)))return failControl(-EFAULT);
                 requested.uid=ProcessResolveId(proc,false,requested.uid);requested.gid=ProcessResolveId(proc,true,requested.gid);
                 const auto users=ProcessReadIds(proc,false),groups=ProcessReadIds(proc,true);
-                const int32_t sender=proc->tgid?proc->tgid:proc->pid;
+                const int32_t sender=ProcessVisibleTgid(proc, ProcessPidView(proc));
                 if(int error=UnixCredentialsCheck(requested,sender,users,groups))return failControl(error);
-                explicitCredentials=requested;hasExplicitCredentials=true;
+                explicitCredentials=UnixCaptureCredentials(proc, requested.uid, requested.gid);hasExplicitCredentials=true;
             }
             if (cm.cmsg_level == SOL_SOCKET && cm.cmsg_type == SCM_RIGHTS) {
                 uint64_t dataLen = cm.cmsg_len - sizeof(CmsgHdr);
@@ -1361,7 +1361,7 @@ int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
         int64_t total=0;
         uint64_t messageLength=0;bool consumed=false;
         const bool passCredentials = __atomic_load_n(&usd->passCredentials, __ATOMIC_ACQUIRE);
-        UnixCredentials sender{};
+        UnixSenderCredentials sender{};
         if(record) {
             UnixRecordVector stage;
             if(int error=stage.Init(reinterpret_cast<uint64_t>(msg->msg_iov),msg->msg_iovlen,false))return error;
@@ -1390,14 +1390,15 @@ int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
         msg->msg_controllen=0;msg->msg_namelen=0;
         uint64_t controlUsed = 0;
         if (passCredentials && (total > 0 || consumed)) {
-            sender.uid=ProcessReportId(proc,false,sender.uid);sender.gid=ProcessReportId(proc,true,sender.gid);
-            const uint64_t required = sizeof(CmsgHdr) + sizeof(sender);
+            auto reported = sender.Report(ProcessPidView(proc));
+            reported.uid=ProcessReportId(proc,false,reported.uid);reported.gid=ProcessReportId(proc,true,reported.gid);
+            const uint64_t required = sizeof(CmsgHdr) + sizeof(reported);
             if (capacity >= sizeof(CmsgHdr)) {
                 auto* header = static_cast<CmsgHdr*>(msg->msg_control);
                 uint64_t copied = capacity < required ? capacity : required;
                 header->cmsg_len = copied;
                 header->cmsg_level = SOL_SOCKET; header->cmsg_type = 2; // SCM_CREDENTIALS
-                if (copied > sizeof(CmsgHdr)) memcpy(header + 1, &sender, copied - sizeof(CmsgHdr));
+                if (copied > sizeof(CmsgHdr)) memcpy(header + 1, &reported, copied - sizeof(CmsgHdr));
                 controlUsed = CmsgAlign(copied); if (controlUsed > capacity) controlUsed = capacity;
                 msg->msg_controllen = controlUsed;
             }

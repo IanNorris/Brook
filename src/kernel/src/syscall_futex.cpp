@@ -4,6 +4,7 @@
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "futex_timeout.h"
+#include "pid_namespace.h"
 #include "sync/futex_waiter_pool.h"
 #include "sync/pi_wait_graph.h"
 #include "signal_restart.h"
@@ -33,13 +34,14 @@ int64_t sys_set_robust_list(uint64_t head,uint64_t length,uint64_t,uint64_t,uint
 int64_t sys_get_robust_list(uint64_t pid,uint64_t headOut,uint64_t lengthOut,uint64_t,uint64_t,uint64_t)
 {
     auto* proc=ProcessCurrent();if(!proc)return -ESRCH;
-    if(pid>65535)return -ESRCH;
-    auto* target=pid?SchedulerFindProcessReference(static_cast<uint16_t>(pid)):proc;
+    const int32_t tid = static_cast<int32_t>(pid);
+    if (tid < 0) return -ESRCH;
+    auto* target=tid?SchedulerFindVisibleProcessReference(ProcessPidView(proc),tid):proc;
     if(!target)return -ESRCH;
-    const bool held=pid!=0;
+    const bool held=tid!=0;
     // Conservative bounded access policy: only the calling thread group.
     // Cross-process ptrace credential/dumpability policy is not implemented.
-    if(target->tgid!=proc->tgid) {if(held)SchedulerReleaseWaitReference(target);return -EPERM;}
+    if (ProcessVisibleTgid(target, ProcessPidView(proc)) != ProcessVisibleTgid(proc, ProcessPidView(proc))) {if(held)SchedulerReleaseWaitReference(target);return -EPERM;}
     const uint64_t head=__atomic_load_n(&target->robustListHead,__ATOMIC_ACQUIRE),length=24;
     if(held)SchedulerReleaseWaitReference(target);
     if(!UserBufferWritable(headOut,8) || !UserBufferWritable(lengthOut,8))return -EFAULT;
@@ -368,10 +370,11 @@ static bool RobustRead(Process* actor,AddressSpaceState* space,uint64_t address,
 static bool RobustWord(Process* actor,Process* target,AddressSpaceState* space,uint64_t address,bool pending)
 {
     constexpr uint32_t OwnerMask=0x3fffffff,Waiters=0x80000000,Died=0x40000000;
+    const uint32_t targetTid = ProcessVisibleTid(target, ProcessPidView(target));
     if(address&3)return false;
     uint32_t observed=0;
     if(!RobustRead(actor,space,address,&observed,4))return false;
-    if((observed&OwnerMask)!=target->pid && !(pending && !(observed&OwnerMask)))return true;
+    if((observed&OwnerMask)!=targetTid && !(pending && !(observed&OwnerMask)))return true;
     for(unsigned retry=0;retry<16;++retry) {
         const bool released=pending && !(observed&OwnerMask);
         const uint32_t access=released?1u:2u;
@@ -391,7 +394,7 @@ static bool RobustWord(Process* actor,Process* target,AddressSpaceState* space,u
             const uint64_t flags=IrqSpinLockAcquire(&g_futexLock);
             observed=__atomic_load_n(word,__ATOMIC_ACQUIRE);
             if(pending && !(observed&OwnerMask)) {wake=true;done=true;}
-            else if((observed&OwnerMask)!=target->pid)done=true;
+            else if((observed&OwnerMask)!=targetTid)done=true;
             else if(access&2) {
                 const uint32_t replacement=(observed&Waiters)|Died;
                 wake=(observed&Waiters)!=0;
