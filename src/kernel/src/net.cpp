@@ -1110,7 +1110,7 @@ static void HandleIpv4(const uint8_t* frame, uint32_t len, bool local,uint64_t s
         HandleUdpWithDhcp(ip,payload,payloadLen,scope);
         break;
     case IP_PROTO_TCP:
-        HandleTcp(ip,payload,payloadLen,scope);
+        HandleTcp(ip,payload,payloadLen,scope,local);
         break;
     }
 }
@@ -3289,7 +3289,7 @@ static void PruneAcceptQueue(Socket& listener)
     for (int i = 0; i < retiredCount; ++i) SockUnref(retired[i]);
 }
 
-void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len,uint64_t scope)
+void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len,uint64_t scope,bool localIngress)
 {
     if (len < sizeof(TcpHeader)) return;
 
@@ -3548,6 +3548,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len,uint64_t 
             child.localPort  = dstPort;
             child.remoteIp   = ip->srcIp;
             child.remotePort = srcPort;
+            child.peerLocalIngress = localIngress;
             child.bound      = true;
             child.tcpState   = TcpState::SynRecv;
             child.tcpLastRxTick = ApicTickCount(); // passive-open deadline origin
@@ -4574,7 +4575,7 @@ int SockListen(int sockIdx, int backlog)
     return 0;
 }
 
-int SockAccept(int sockIdx, SockAddrIn* addr)
+int SockAccept(int sockIdx, SockAddrIn* addr, bool* peerLocalIngress)
 {
     if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return -1;
     if (!g_sockUsed[sockIdx]) return -1;
@@ -4616,6 +4617,7 @@ int SockAccept(int sockIdx, SockAddrIn* addr)
                         addr->sin_port = child.remotePort;
                         addr->sin_addr = child.remoteIp;
                     }
+                    if (accept && peerLocalIngress) *peerLocalIngress = child.peerLocalIngress;
                 }
                 SpinLockRelease(&child.lock);
             }

@@ -235,7 +235,7 @@ int SockRecvFrom(int,void* buffer,uint32_t length,SockAddrIn* source) {
 int SockRecv(int,void*,uint32_t,bool) { return -EAGAIN; }
 void SockGetLocal(int,uint32_t* ip,uint16_t* port) { *ip=g_net.localIp;*port=g_net.localPort; }
 void SockGetRemote(int,uint32_t* ip,uint16_t* port) { *ip=g_net.remoteIp;*port=g_net.remotePort; }
-int SockAccept(int,SockAddrIn* address) {
+int SockAccept(int,SockAddrIn* address,bool*) {
     if(!g_net.acceptReady)return -EAGAIN;
     ++g_net.accepts;g_net.acceptReady=false;*address=g_net.peer;return 5;
 }

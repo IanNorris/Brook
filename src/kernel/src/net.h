@@ -384,6 +384,7 @@ struct Socket {
     // Listen/accept queue (server-side)
     static constexpr int ACCEPT_QUEUE_MAX = 16;
     bool      listening;               // true if listen() was called
+    bool      peerLocalIngress;        // passive open from the kernel's local delivery path
     int       listenBacklog;           // max pending connections
     int       acceptQueue[ACCEPT_QUEUE_MAX]; // socket indices of accepted connections
     volatile int acceptQueueCount;     // number in queue
@@ -445,7 +446,7 @@ int  SockGetProtocol(int sockIdx); // immutable creation protocol, or -1 for inv
 void SockGetLocal(int sockIdx, uint32_t* ip, uint16_t* port);
 void SockGetRemote(int sockIdx, uint32_t* ip, uint16_t* port);
 int  SockListen(int sockIdx, int backlog);
-int  SockAccept(int sockIdx, SockAddrIn* addr);
+int  SockAccept(int sockIdx, SockAddrIn* addr, bool* peerLocalIngress=nullptr);
 bool SockPollReady(int sockIdx, bool checkRead, bool checkWrite);
 // Optional async-send worker-pool notification for a poll/epoll invocation.
 // A zero token means disabled/full; callers retain their timed fallback.
@@ -472,7 +473,7 @@ void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
                     const void* data, uint32_t len,uint64_t scope=0);
 
 // Handle an incoming TCP segment (called by IP handler).
-void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len,uint64_t scope=0);
+void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len,uint64_t scope=0,bool localIngress=false);
 
 // ---------------------------------------------------------------------------
 // DNS resolver

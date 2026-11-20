@@ -16,6 +16,8 @@
 #include "serial.h"
 #include "net.h"
 #include "debug_presence.h"
+#include "bridge_reply.h"
+#include "debug_local_policy.h"
 #include "klog.h"
 #include "kprintf.h"
 #include "string.h"
@@ -448,6 +450,30 @@ static bool DebugTcpSendAll(int socket, const char* bytes, uint32_t length)
     return true;
 }
 
+static bool DebugTcpLocalPeer(uint32_t address, bool localIngress)
+{
+    if (localIngress || !address || Ipv4IsLoopback(address)) return true;
+    InterfaceView interfaces[NET_MAX_IFS + 1];
+    const auto count = NetInterfaceViews(interfaces, NET_MAX_IFS + 1);
+    for (uint32_t i = 0; i < count; ++i)
+        if (interfaces[i].address == address) return true;
+    return false;
+}
+
+static void DebugTcpRejectLocal(const char* command, uint32_t tokenBytes)
+{
+    BridgeReplyBuffer<DebugChannelSend> reply;
+    auto marker = [&](const char* prefix) {
+        reply.text(prefix);
+        for (uint32_t i = 0; i < tokenBytes; ++i) reply.append(command[i + 1]);
+        reply.append('\n');
+    };
+    if (tokenBytes) marker("BRIDGE_BEGIN ");
+    reply.text("{\"bridge_error\":\"local connections are read-only\"}\n");
+    if (tokenBytes) marker("BRIDGE_END ");
+    reply.send();
+}
+
 static void DebugTcpThread(void* /*arg*/)
 {
     // Create listen socket
@@ -485,8 +511,9 @@ static void DebugTcpThread(void* /*arg*/)
     // Accept loop — handle one client at a time
     for (;;)
     {
-        SockAddrIn peer;
-        int clientSock = SockAccept(listenSock, &peer);
+        SockAddrIn peer{};
+        bool localIngress = false;
+        int clientSock = SockAccept(listenSock, &peer, &localIngress);
         if (clientSock < 0)
         {
             // Brief pause then retry
@@ -496,6 +523,8 @@ static void DebugTcpThread(void* /*arg*/)
             continue;
         }
 
+        const bool local = DebugTcpLocalPeer(peer.sin_addr, localIngress);
+        const uint64_t localDeadline = local ? ApicTickCount() + 4000 : 0;
         NetCountDebugClient(true);
         // Per-connection traces are `log level tcp debug`; `tcp stats`
         // keeps the totals. A polling bridge connects several times a second.
@@ -520,6 +549,7 @@ static void DebugTcpThread(void* /*arg*/)
 
         for (;;)
         {
+            if (local && ApicTickCount() >= localDeadline) goto client_done;
             // --- Check for incoming commands (non-blocking) ---
             if (SockPollReady(clientSock, true, false)) {
                 char tmp[128];
@@ -543,10 +573,19 @@ static void DebugTcpThread(void* /*arg*/)
                             if(framed)framedClient=true;
                             // Framed requests come only from bridge clients;
                             // they refresh (never create) agent presence.
-                            if(framed)DebugPresenceRequestBegin(peer.sin_addr);
+                            if(framed && !local)DebugPresenceRequestBegin(peer.sin_addr);
                             DebugChannelSetReplySock(clientSock);
-                            DebugHandleCommand(cmdBuf, static_cast<uint32_t>(cmdLen));
+                            if (local) {
+                                const auto request = DebugLocalRequestPolicy(cmdBuf, static_cast<uint32_t>(cmdLen));
+                                if (request.allowed)
+                                    DebugHandleCommand(cmdBuf, static_cast<uint32_t>(cmdLen));
+                                else
+                                    DebugTcpRejectLocal(cmdBuf, request.tokenBytes);
+                            } else {
+                                DebugHandleCommand(cmdBuf, static_cast<uint32_t>(cmdLen));
+                            }
                             DebugChannelClearReplySock();
+                            if (local) goto client_done;
                             if(framed)DebugPresenceRequestEnd();
                             cmdLen = 0;
                             partialDeadline = 0;
@@ -567,7 +606,7 @@ static void DebugTcpThread(void* /*arg*/)
             // Framed bridge RPCs carry their own replies and read serial logs
             // separately. Replaying the entire log ring after each short RPC
             // delays FIN handling/accept and can fill the pending TCP queue.
-            if(framedClient || (!classifiedClient && ApicTickCount()<classifyDeadline)) {
+            if(local || framedClient || (!classifiedClient && ApicTickCount()<classifyDeadline)) {
                 SchedulerSleepMs(2);
                 continue;
             }
