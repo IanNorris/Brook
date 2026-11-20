@@ -28,6 +28,12 @@ int Control(brook::Device*,uint32_t,void*){return 0;}
 brook::BlockDeviceOps ops{Read,Write,Control,nullptr,nullptr,nullptr};
 brook::Device image{reinterpret_cast<const brook::DeviceOps*>(&ops),"desktop-image",brook::DeviceType::Block,nullptr};
 bool Is(const char* value){return scenario==value;}
+bool Managed(){return scenario.rfind("managed-",0)==0;}
+void ExpectFailure(const brook::WritableDesktopFailure& failure,const char* path,const char* check,int status){
+    assert(failure.path && !std::strcmp(failure.path,path));
+    assert(failure.check && !std::strcmp(failure.check,check));
+    assert(failure.status==status);
+}
 }
 namespace brook {
 extern "C" Vnode* VfsOpen(const char* path,int flags){
@@ -83,11 +89,36 @@ bool VfsMountConfigured(const char* path,const char* type,uint8_t drive,uint64_t
     mounted=true;return true;
 }
 extern "C" bool VfsUnmount(const char* path){assert(mounted&&!homeBound&&!std::strcmp(path,"/nix"));++unmounts;if(Is("unmount"))return false;mounted=false;return true;}
-extern "C" int VfsLstatPath(const char*,VnodeStat* out){assert(mounted);*out={};out->isDir=true;out->uid=out->gid=1000;out->mode=0040755;
+extern "C" int VfsLstatPath(const char* path,VnodeStat* out){assert(mounted);*out={};out->isDir=true;out->uid=out->gid=1000;out->mode=0040755;
+    if(Managed() && (!std::strcmp(path,"/nix/profile") || !std::strcmp(path,"/nix/share/applications") ||
+                    !std::strcmp(path,"/nix/var/.brook-profiles/current"))){
+        out->isDir=false;out->isSymlink=true;
+    }
+    if(Is("legacy-profile-mode") && !std::strcmp(path,"/nix/profile"))out->uid=0;
+    if(Is("legacy-profile-mode") && !std::strcmp(path,"/nix/var/.brook-profiles/current"))return -2;
+    if(Is("managed-missing-generation") && !std::strcmp(path,"/nix/var/.brook-profiles/.brook-profile-legacy"))return -2;
     return Is("payload")||Is("unmount")?-2:0;
 }
-extern "C" int VfsStatPath(const char*,VnodeStat* out){assert(mounted);*out={};out->size=1;out->mode=0100755;return 0;}
-int VfsReadlink(const char*,char*,uint64_t){return -22;}
+extern "C" int VfsStatPath(const char* path,VnodeStat* out){assert(mounted);*out={};out->size=1;out->mode=0100755;
+    if(Is("missing-index") && !std::strcmp(path,"/nix/index/packages.idx"))return -2;
+    if(Is("exec-mode") && !std::strcmp(path,"/nix/bin/nix-fetch"))out->mode=0100644;
+    if(Managed() && (!std::strcmp(path,"/nix/profile") || !std::strcmp(path,"/nix/share/applications") ||
+                    !std::strcmp(path,"/nix/profile/bin") || !std::strcmp(path,"/nix/profile/lib") ||
+                    !std::strcmp(path,"/nix/profile/share/applications")))out->isDir=true;
+    return 0;
+}
+int VfsReadlink(const char* path,char* target,uint64_t capacity){
+    if(!Managed())return -22;
+    const char* value=nullptr;
+    if(!std::strcmp(path,"/nix/var/.brook-profiles/current"))
+        value=Is("managed-current")?"/operator-controlled-target":".brook-profile-legacy";
+    else if(!std::strcmp(path,"/nix/profile"))value=Is("managed-alias")?"other-target":"var/.brook-profiles/current";
+    else if(!std::strcmp(path,"/nix/share/applications"))value="../profile/.brook-launcher";
+    if(!value)return -22;
+    const auto length=std::strlen(value);
+    assert(length<capacity);std::memcpy(target,value,length);
+    return static_cast<int>(length);
+}
 int VfsMountNamespaceBindAt(MountNamespace*,const VfsPath&,const VfsPath&,const char* from,const char* to,bool){
     assert(roots&&mounted&&target&&!std::strcmp(from,"/nix/home/brook")&&!std::strcmp(to,"/data/home"));
     if(Is("home"))return -12;homeBound=true;return 0;
@@ -105,14 +136,37 @@ int main(int argc,char** argv){
     if(Is("unclean")||Is("system-unclean"))disk[1082]=0;
     if(scenario.rfind("direct-",0)==0) {
         scenario.erase(0,7);
-        assert(brook::WritableDesktopPrepareDirect());
+        brook::WritableDesktopFailure details{};
+        if(Is("target") || Is("occupied")) {
+            assert(!brook::WritableDesktopPrepareDirect(&details));
+            if(Is("target"))ExpectFailure(details,"/data/home","home-target",-13);
+            else ExpectFailure(details,"/nix","namespace-occupied",-16);
+            assert(!roots);
+            return 0;
+        }
+        assert(brook::WritableDesktopPrepareDirect(&details)&&!details.status);
         mounted=true;
-        const auto result=brook::WritableDesktopPublishDirect();
+        const auto result=brook::WritableDesktopPublishDirect(&details);
         using Publish=brook::WritableDesktopPublish;
-        if(Is("payload"))assert(result==Publish::SharedProfileRejected);
-        else if(Is("home"))assert(result==Publish::HomeBindFailed);
-        else assert(Is("ready")&&result==Publish::Ready);
-        assert(homeBound==Is("ready")&&!roots);
+        const bool ready=Is("ready") || Is("managed-ready");
+        if(ready)assert(result==Publish::Ready && !details.status && !details.path);
+        else if(Is("home")) {
+            assert(result==Publish::HomeBindFailed);
+            ExpectFailure(details,"/data/home","home-bind",-12);
+        } else {
+            assert(result==Publish::SharedProfileRejected);
+            if(Is("payload"))ExpectFailure(details,"/nix/store","lstat",-2);
+            else if(Is("missing-index"))ExpectFailure(details,"/nix/index/packages.idx","stat",-2);
+            else if(Is("exec-mode"))ExpectFailure(details,"/nix/bin/nix-fetch","executable-mode",-13);
+            else if(Is("legacy-profile-mode"))ExpectFailure(details,"/nix/profile","desktop-owner-mode",-13);
+            else if(Is("managed-current"))ExpectFailure(details,"/nix/var/.brook-profiles/current","generation-name",-22);
+            else if(Is("managed-alias"))ExpectFailure(details,"/nix/profile","alias-target",-22);
+            else {
+                assert(Is("managed-missing-generation"));
+                ExpectFailure(details,"/nix/var/.brook-profiles/<generation>","lstat",-2);
+            }
+        }
+        assert(homeBound==ready&&!roots);
         return 0;
     }
     uint8_t drive=3;const auto sourceVolume=scenario.rfind("system-",0)==0?brook::WritableDesktopSource::System:brook::WritableDesktopSource::Usb;
