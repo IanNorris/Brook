@@ -10,6 +10,7 @@
 #include "fs/write_behind_queue.h"
 #include "vfs.h"
 #include "vfs_object.h"
+#include "mount_namespace.h"
 #include "memory/file_object.h"
 #include "memory/file_page_cache.h"
 #include "device.h"
@@ -4783,6 +4784,24 @@ void Ext2SetSkipPermChecks(uint8_t pdrv, bool skip)
     if (pdrv >= EXT2_MAX_MOUNTS || !g_ext2Mounts[pdrv]) return;
     g_ext2Mounts[pdrv]->skipPermChecks = skip;
 }
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+bool Ext2MountGuardProfile(MountNamespace* ns,const VfsPath& target,Device* device,uint8_t& drive)
+{
+    for(uint8_t slot=1;slot<EXT2_MAX_MOUNTS;++slot) {
+        if(!Ext2DriveAvailable(slot) || !Ext2BindDevice(slot,device))continue;
+        void* instance=nullptr;
+        if(!Ext2FsMount(slot,&instance))return false;
+        if(VfsMountNamespaceMountGuardProfile(ns,target,&g_ext2FsOps,instance,slot)) {
+            Ext2FsUnmount(instance);
+            return false;
+        }
+        drive=slot;
+        return true;
+    }
+    return false;
+}
+#endif
+
 bool Ext2DriveAvailable(uint8_t pdrv)
 {
     return pdrv<EXT2_MAX_MOUNTS && !__atomic_load_n(&g_ext2Devices[pdrv],__ATOMIC_ACQUIRE);

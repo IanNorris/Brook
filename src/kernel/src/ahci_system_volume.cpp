@@ -361,6 +361,15 @@ bool AhciSystemGuardTestDataIdentityValid(Device* adapter) {
     return adapter->ops->read(adapter,1024,superblock,sizeof(superblock))==int(sizeof(superblock)) &&
         superblock[56]==0x53 && superblock[57]==0xef && !memcmp(superblock+104,largeUuid,16);
 }
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+bool AhciSystemGuardTestDataProfileValid(Device* adapter)
+{
+    return AhciSystemGuardTestDataIdentityValid(adapter) &&
+        AhciSystemGuardDataState(&guardPartition)==AhciGuardDataState::Clean &&
+        WritableDesktopVerifyRepairedProfile(adapter);
+}
+#endif
+
 void AhciSystemGuardTestDataFinish(Device* adapter) {
     if(adapter==&guardDataPartition && guardDataPhase!=GuardDataPhase::Failed)guardDataPhase=GuardDataPhase::Finished;
 }

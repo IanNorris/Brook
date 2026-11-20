@@ -3,6 +3,10 @@
 namespace brook {
 enum class WritableDesktopBoot { Absent,Fallback,Ready,Maintenance };
 enum class WritableDesktopSource { Usb,System };
+struct Device;
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+bool WritableDesktopVerifyRepairedProfile(Device* device);
+#endif
 // Direct stores use the same namespace and payload checks as image stores.
 bool WritableDesktopPrepareDirect();
 enum class WritableDesktopPublish { Ready, SharedProfileRejected, HomeBindFailed };

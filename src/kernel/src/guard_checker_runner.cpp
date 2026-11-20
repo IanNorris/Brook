@@ -652,6 +652,14 @@ void Worker(void* arg) {
     }
     const int verification=RunExt2Checker(data,false);
     const bool identityOk=verification==0 && AhciSystemGuardTestDataIdentityValid(data);
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+    GuardRecoverySlotState rejectedProfile{};
+    const bool bothRejected=identityOk && !FatFsPrivateRecoveryPinSlotHealth(mount,identity) &&
+        !FatFsPrivateRecoverySlotStatus(mount,rejectedProfile) &&
+        rejectedProfile.profileRejected[0] && rejectedProfile.profileRejected[1];
+    const bool profileValid=bothRejected && AhciSystemGuardTestDataProfileValid(data);
+    if(bothRejected)KPrintf("GUARD_SLOT_PROFILE_RECHECK accepted=%u\n",profileValid?1u:0u);
+#endif
     if(verification!=-115)AhciSystemGuardTestDataFinish(data);
     if(verification!=0 || !identityOk) {KPrintf("GUARD_EXT2_INCOMPLETE verify=%d identity=%u\n",verification,identityOk?1u:0u);return;}
     KPuts("GUARD_EXT2_VERIFIED_PENDING\n");
@@ -680,6 +688,12 @@ void Worker(void* arg) {
         KPuts("GUARD_COMPLETE_INCOMPLETE authorization\n");return;
     }
     const int complete=FatFsPrivateRecoveryTestComplete(mount,identity,records[0],completeFail);
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+    if(complete==2 && profileValid) {
+        const int status=FatFsPrivateRecoveryRetryRepairedProfile(mount,rejectedProfile);
+        KPrintf("GUARD_SLOT_PROFILE_RETRY status=%d\n",status);
+    }
+#endif
     AhciSystemGuardTestFinish(adapter);
     if(FatFsPrivateRecoveryTestComplete(mount,identity,records[0],completeFail)!=0) {
         KPuts("GUARD_COMPLETE_INCOMPLETE repeated\n");return;

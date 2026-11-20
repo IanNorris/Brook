@@ -64,6 +64,9 @@ struct GuardRecoverySlotState;
 // malformed contents or discovery failure.
 int FatFsPrivateRecoveryPinSlotHealth(FatPrivateMount* mount, const char (&identity)[97]);
 int FatFsPrivateRecoverySlotStatus(FatPrivateMount* mount, GuardRecoverySlotState& out);
+// Restore one attempt for the previous slot following checked repair and
+// profile admission. Refuse if the retained journal or selectors changed.
+int FatFsPrivateRecoveryRetryRepairedProfile(FatPrivateMount* mount,const GuardRecoverySlotState& observed);
 #if defined(BROOK_SSD_GUARDED_DESKTOP)
 struct AcShutdownRecord;
 struct BootGuardSlot;

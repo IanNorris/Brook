@@ -180,6 +180,23 @@ static void SlotProfileRejectionPolicy()
     assert(GuardSlotFinish(rejected,previous,true));
     assert(rejected.slots[0].starts==1 && rejected.slots[0].profileRejected);
     assert(GuardChooseSlot(rejected,newest,previous)==GuardSlotChoice::Recovery);
+
+    GuardSlotHealth retry=rejected;
+    assert(!GuardSlotRetryRepairedProfile(retry,replacement,previous));
+    assert(!GuardSlotRetryRepairedProfile(retry,previous,newest));
+    assert(!GuardSlotRetryRepairedProfile(retry,newest,{1,0,0,{11}}));
+    assert(GuardChooseSlot(retry,newest,previous)==GuardSlotChoice::Recovery);
+    assert(GuardSlotRetryRepairedProfile(retry,newest,previous));
+    assert(!retry.slots[0].profileRejected && !retry.slots[1].profileRejected);
+    assert(retry.slots[0].starts==GuardSlotFailureLimit-1);
+    assert(retry.slots[1].starts==GuardSlotFailureLimit);
+    assert(GuardSlotMatches(retry,newest) && GuardSlotMatches(retry,previous));
+    assert(!GuardSlotRetryRepairedProfile(retry,newest,previous));
+    assert(GuardChooseSlot(retry,newest,previous)==GuardSlotChoice::Previous);
+    assert(GuardSlotStart(retry,previous));
+    assert(GuardSlotFinish(retry,previous,true));
+    assert(GuardChooseSlot(retry,newest,previous)==GuardSlotChoice::Recovery);
+    assert(!GuardSlotRetryRepairedProfile(retry,newest,previous)); // No repeated revival.
     assert(GuardChooseSlot(rejected,replacement,previous)==GuardSlotChoice::Newest);
     assert(GuardSlotStart(rejected,replacement));
     assert(GuardSlotFinish(rejected,replacement,false));

@@ -47,32 +47,54 @@ int PrepareTarget() {
     else if(!result && (!st.isDir || st.isSymlink))result=-20;
     VfsPathRelease(root);return result;
 }
-bool Directory(const char* path,bool writable) {
+struct ProfileView {
+    VfsPath root{};
+    const void* attachment=nullptr;
+
+    int Stat(const char* path,VnodeStat* out,bool follow=true) const {
+        if(!attachment)return follow?VfsStatPath(path,out):VfsLstatPath(path,out);
+        VfsPath object{};
+        int error=VfsPathResolve(root,root,path,&object,follow);
+        if(!error)error=object.attachment==attachment?VfsPathStat(object,out):-18;
+        VfsPathRelease(object);
+        return error;
+    }
+    int Readlink(const char* path,char* out,uint32_t capacity) const {
+        if(!attachment)return VfsReadlink(path,out,capacity);
+        VfsPath object{};
+        int error=VfsPathResolve(root,root,path,&object,false);
+        if(!error)error=object.attachment==attachment?VfsPathReadlink(object,out,capacity):-18;
+        VfsPathRelease(object);
+        return error;
+    }
+};
+
+bool Directory(const ProfileView& view,const char* path,bool writable) {
     VnodeStat st{};
-    return !VfsLstatPath(path,&st) && st.isDir && !st.isSymlink &&
+    return !view.Stat(path,&st,false) && st.isDir && !st.isSymlink &&
         (!writable || (st.uid==1000 && st.gid==1000 && (st.mode&0300)==0300));
 }
 // Signed profile staging publishes immutable generations through two fixed
 // relative aliases. Only these exact spellings are admitted; anything else
 // (an absolute target, a different generation root) stays in maintenance.
-bool ManagedAlias(const char* path,const char* expected) {
+bool ManagedAlias(const ProfileView& view,const char* path,const char* expected) {
     VnodeStat st{};
-    if(VfsLstatPath(path,&st) || !st.isSymlink)return false;
+    if(view.Stat(path,&st,false) || !st.isSymlink)return false;
     char target[64]{};
-    const int length=VfsReadlink(path,target,sizeof(target)-1);
+    const int length=view.Readlink(path,target,sizeof(target)-1);
     const int want=int(strlen(expected));
     if(length!=want || memcmp(target,expected,want)!=0)return false;
     VnodeStat resolved{};
-    return !VfsStatPath(path,&resolved) && resolved.isDir;
+    return !view.Stat(path,&resolved) && resolved.isDir;
 }
-bool ResolvedDirectory(const char* path) {
-    VnodeStat st{};return !VfsStatPath(path,&st) && st.isDir;
+bool ResolvedDirectory(const ProfileView& view,const char* path) {
+    VnodeStat st{};return !view.Stat(path,&st) && st.isDir;
 }
-bool ProfileValid() {
+bool ProfileValid(const ProfileView& view) {
     const char* inner[]={"/nix/profile/bin","/nix/profile/lib","/nix/profile/share/applications"};
     // Legacy layout: the installer mutates the profile in place.
-    if(Directory("/nix/profile",true) && Directory("/nix/share/applications",true)) {
-        for(const char* path:inner)if(!Directory(path,true))return false;
+    if(Directory(view,"/nix/profile",true) && Directory(view,"/nix/share/applications",true)) {
+        for(const char* path:inner)if(!Directory(view,path,true))return false;
         return true;
     }
     // Managed layout: generations are replaced, never edited, so only
@@ -80,27 +102,27 @@ bool ProfileValid() {
     // current must name a sibling generation exactly, and that generation
     // must be a real directory: no absolute, traversing or chained targets.
     VnodeStat current{};
-    if(VfsLstatPath("/nix/var/.brook-profiles/current",&current) || !current.isSymlink)return false;
+    if(view.Stat("/nix/var/.brook-profiles/current",&current,false) || !current.isSymlink)return false;
     char name[64]{};
-    const int nameLength=VfsReadlink("/nix/var/.brook-profiles/current",name,sizeof(name)-1);
+    const int nameLength=view.Readlink("/nix/var/.brook-profiles/current",name,sizeof(name)-1);
     if(nameLength<0 || !WritableDesktopGenerationName(name,nameLength))return false;
     char generation[96]="/nix/var/.brook-profiles/";
     memcpy(generation+strlen(generation),name,size_t(nameLength)+1);
-    if(!Directory(generation,false) ||
-       !ManagedAlias("/nix/profile","var/.brook-profiles/current") ||
-       !ManagedAlias("/nix/share/applications","../profile/.brook-launcher"))return false;
-    for(const char* path:inner)if(!ResolvedDirectory(path))return false;
+    if(!Directory(view,generation,false) ||
+       !ManagedAlias(view,"/nix/profile","var/.brook-profiles/current") ||
+       !ManagedAlias(view,"/nix/share/applications","../profile/.brook-launcher"))return false;
+    for(const char* path:inner)if(!ResolvedDirectory(view,path))return false;
     return true;
 }
-bool PayloadValid() {
+bool PayloadValid(const ProfileView& view={}) {
     const char* directories[]={"/nix/store","/nix/home/brook","/nix/var/cache/narinfo"};
-    for(const char* path:directories)if(!Directory(path,true))return false;
-    if(!ProfileValid())return false;
+    for(const char* path:directories)if(!Directory(view,path,true))return false;
+    if(!ProfileValid(view))return false;
     const char* files[]={"/nix/profile/manifest.tsv","/nix/index/packages.idx","/nix/share/applications/applications.idx"};
-    for(const char* path:files){VnodeStat st{};if(VfsStatPath(path,&st)||st.isDir||!st.size)return false;}
+    for(const char* path:files){VnodeStat st{};if(view.Stat(path,&st)||st.isDir||!st.size)return false;}
     const char* executables[]={"/nix/bin/nix","/nix/bin/nix-fetch","/nix/bin/nar-unpack",
         "/nix/profile/bin/brook-firefox","/nix/profile/bin/brook-chromium","/nix/profile/bin/brook-gallery"};
-    for(const char* path:executables){VnodeStat st{};if(VfsStatPath(path,&st)||st.isDir||!(st.mode&0111))return false;}
+    for(const char* path:executables){VnodeStat st{};if(view.Stat(path,&st)||st.isDir||!(st.mode&0111))return false;}
     return true;
 }
 WritableDesktopBoot Fail(int error,bool mounted=false,bool publishFailed=false) {
@@ -127,6 +149,36 @@ void DestroyPrivate() {
     if(image && !FatImageDeviceDestroyUnregistered(image)){image=nullptr;info.pinned=false;}
 }
 }
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+bool WritableDesktopVerifyRepairedProfile(Device* device)
+{
+    VfsPath initial{},root{},cwd{},target{},mounted{};
+    MountNamespace* ns=nullptr;
+    int error=VfsPathRoot(&initial);
+    if(!error)error=VfsMountNamespaceCopy(VfsMountNamespaceInitial(),initial,initial,&ns,&root,&cwd);
+    VfsPathRelease(initial);
+    VfsPathRelease(cwd);
+    if(error)return false;
+
+    const bool active=VfsMountNamespaceActivate(ns);
+    uint8_t drive=0;
+    bool valid=false;
+    if(active && !VfsPathResolve(root,root,"/nix",&target,false) && target.attachment==root.attachment &&
+       Ext2MountGuardProfile(ns,target,device,drive) &&
+       !VfsPathResolve(root,root,"/nix",&mounted) && mounted.attachment!=target.attachment)
+        valid=PayloadValid({root,mounted.attachment});
+
+    VfsPathRelease(mounted);
+    VfsPathRelease(target);
+    VfsPathRelease(root);
+    if(active)VfsMountNamespaceLeave(ns,false);
+    else VfsMountNamespaceAbandon(ns,false);
+    VfsMountNamespaceRelease(ns);
+    VfsDrainMountCleanup();
+    Ext2SyncProbe probe{};
+    return valid && !Ext2GetSyncProbe(drive,probe);
+}
+#endif
 bool WritableDesktopPrepareDirect() {return NamespaceClear() && !PrepareTarget();}
 WritableDesktopPublish WritableDesktopPublishDirect() {
     if(!PayloadValid())return WritableDesktopPublish::SharedProfileRejected;
