@@ -67,7 +67,7 @@ int main(){
             if(!csd && maximised)CHECK(!g.radii[0] && !g.radii[1] && !g.radii[2] && !g.radii[3]);
         }
         // Shell surfaces: opaque outside glass; material ones translucent under it.
-        for(uint32_t kind=BROOK_DESKTOP_SURFACE_TASKBAR;kind<=BROOK_DESKTOP_SURFACE_PERFORMANCE_HUD;++kind){
+        for(uint32_t kind=BROOK_DESKTOP_SURFACE_TASKBAR;kind<=BROOK_DESKTOP_SURFACE_DOCK;++kind){
             const bool material = true;
             const auto o=ChromeShellSurfaceRecord(kind,{0,1000,1920,80},material,77,180,opaque);
             const auto g=ChromeShellSurfaceRecord(kind,{0,1000,1920,80},material,77,180,glass);
@@ -75,7 +75,8 @@ int main(){
             CHECK(o.shadow == (kind == BROOK_DESKTOP_SURFACE_LAUNCHER ? BROOK_DESKTOP_SHADOW_PANEL : BROOK_DESKTOP_SHADOW_NONE));
             CHECK(g.material==(material?BROOK_DESKTOP_MATERIAL_GLASS:BROOK_DESKTOP_MATERIAL_OPAQUE));
             CHECK(g.opacity==180 && !(g.flags&BROOK_DESKTOP_SURFACE_OPAQUE));
-            const bool panel = kind != BROOK_DESKTOP_SURFACE_TASKBAR;
+            // The taskbar and the dock strip sit flush on screen edges: no radius, no shadow.
+            const bool panel = kind != BROOK_DESKTOP_SURFACE_TASKBAR && kind != BROOK_DESKTOP_SURFACE_DOCK;
             const bool shadow = panel && kind != BROOK_DESKTOP_SURFACE_TOOLTIP;
             // Panels round at 12; a tooltip at the small radius, 6.
             for (auto radius : g.radii)
