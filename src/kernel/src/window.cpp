@@ -2661,6 +2661,9 @@ bool WmLauncherVisible()
     return g_launcherOpen;
 }
 
+static int AdmitLauncherItem(const LauncherSnapshot& catalog, int itemIdx, bool tracked,
+                             uint64_t* token, bool* coalesced);
+
 #include "wm_shell_launcher.inc"
 #include "wm_shell_dock.inc"
 

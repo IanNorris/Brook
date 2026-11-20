@@ -320,13 +320,16 @@ static const ChromeLauncherFrame& LauncherFrame(uint32_t screenW, uint32_t scree
     return g_launcherFrame;
 }
 
-static void LauncherLaunch(int app)
+static void LauncherLaunch(int app, const LauncherSnapshot& catalog)
 {
     if (app < 0 || app >= static_cast<int>(g_launcherModel.AppCount())) return;
-    WmLauncherExec(g_launcherModelItem[app]);
+    g_launcherPower.Reset();
+    uint64_t token = 0;
+    bool coalesced = false;
+    AdmitLauncherItem(catalog, g_launcherModelItem[app], false, &token, &coalesced);
 }
 
-static void LauncherRun(const LauncherResult& r)
+static void LauncherRun(const LauncherResult& r, const LauncherSnapshot& catalog)
 {
     switch (r.command) {
     case LauncherCommand::None: return;
@@ -338,13 +341,13 @@ static void LauncherRun(const LauncherResult& r)
         if (!g_launcherModel.RestoreLayout(g_launcherHistory[g_launcherHistoryNext])) return;
         g_launcherUndoSince = ApicTickCount();
         break;
-    case LauncherCommand::Launch: LauncherLaunch(r.app); break;
+    case LauncherCommand::Launch: LauncherLaunch(r.app, catalog); break;
     case LauncherCommand::Close: if (g_launcherOpen) WmLauncherToggle(); break;
     case LauncherCommand::OpenSettings: {
         int settings = -1;
         for (uint32_t i = 0; i < g_launcherModel.AppCount() && settings < 0; ++i)
             if (WmEqualI(g_launcherModel.App(i).name, "Settings")) settings = static_cast<int>(i);
-        if (settings >= 0) { g_launcherModel.NoteLaunch(uint32_t(settings)); LauncherLaunch(settings); }
+        if (settings >= 0) { g_launcherModel.NoteLaunch(uint32_t(settings)); LauncherLaunch(settings, catalog); }
         break;
     }
     }
@@ -435,13 +438,20 @@ int WmLauncherHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH
 bool WmLauncherGesture(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH, bool released)
 {
     if (!g_launcherOpen || !g_launcherModel.PointerHeld()) return false;
+    LauncherReadGuard guard;
+    const auto& catalog = guard.get();
+    if (catalog.generation != g_launcherModelGeneration) LauncherSyncModel(catalog);
+    if (!g_launcherModel.PointerHeld()) {
+        CompositorMarkDirty();
+        return true;
+    }
     bool after = false;
     const auto target = ChromeLauncherHitTest(LauncherFrame(screenW, screenH, mx, my), mx, my, &after);
     const bool changed = g_launcherModel.MovePointer(target, mx, my, WmMetric(6), after, ApicTickCount());
     if (released) {
         // Moving for the first time on release may have exposed new targets.
         const auto drop = ChromeLauncherHitTest(LauncherFrame(screenW, screenH, mx, my), mx, my, &after);
-        LauncherRun(g_launcherModel.ReleasePointer(drop, after));
+        LauncherRun(g_launcherModel.ReleasePointer(drop, after), catalog);
     } else if (changed) CompositorMarkDirty();
     return true;
 }
@@ -454,7 +464,7 @@ bool WmLauncherPress(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH,
     const ChromeLauncherFrame& frame = LauncherFrame(screenW, screenH, mx, my);
     const LauncherTarget target = ChromeLauncherHitTest(frame, mx, my);
     if (g_launcherModel.EditorOpen()) {
-        LauncherRun(g_launcherModel.Press(target, secondary, mx, my));
+        LauncherRun(g_launcherModel.Press(target, secondary, mx, my), guard.get());
         return true;
     }
     if (target.kind == LauncherTargetKind::None) return false;
@@ -477,7 +487,7 @@ bool WmLauncherPress(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH,
     }
     g_launcherPower.Reset(); // any other launcher press dismisses the prompt
     if (secondary || !g_launcherModel.BeginPointer(target, mx, my))
-        LauncherRun(g_launcherModel.Press(target, secondary, mx, my));
+        LauncherRun(g_launcherModel.Press(target, secondary, mx, my), guard.get());
     CompositorMarkDirty();
     return true;
 }
@@ -518,5 +528,5 @@ void WmLauncherKey(uint8_t scan, char ascii, uint8_t modifiers)
     LauncherReadGuard guard;
     if (guard.get().generation != g_launcherModelGeneration) LauncherSyncModel(guard.get());
     if (g_launcherPower.prompt() && key != LauncherKey::Escape) g_launcherPower.Reset();
-    LauncherRun(g_launcherModel.Key(key, ascii, mods));
+    LauncherRun(g_launcherModel.Key(key, ascii, mods), guard.get());
 }

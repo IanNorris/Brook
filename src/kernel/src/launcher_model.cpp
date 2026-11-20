@@ -170,11 +170,21 @@ void LauncherModel::FileDefault(uint32_t app) {
 }
 
 void LauncherModel::SetCatalog(const LauncherApp* apps, uint32_t count) {
-    CancelPointer();
-    CloseMenu();
-    editorIndex_ = -1;
-    for (bool& mark : marked_) mark = false;
     if (count > LL::Apps) count = LL::Apps;
+    bool sameKeys = count == appCount_;
+    for (uint32_t i = 0; sameKeys && i < count; ++i) {
+        char key[LL::KeyLength];
+        Copy(key, apps[i].key, sizeof(key));
+        sameKeys = Equal(apps_[i].key, key);
+    }
+    // A routine refresh replaces metadata without moving any app indices.
+    // A different key order invalidates the open view's indexed actions.
+    if (!sameKeys) {
+        CancelPointer();
+        CloseMenu();
+        editorIndex_ = selected_ = -1;
+        for (bool& mark : marked_) mark = false;
+    }
     bool wasNew[LL::Keys]{};
     for (uint32_t app = 0; app < appCount_; ++app)
         if (appKey_[app] != 0xffff) wasNew[appKey_[app]] = newApp_[app];
@@ -1169,6 +1179,11 @@ LauncherResult LauncherModel::Activate(int app) {
 
 LauncherResult LauncherModel::Key(LauncherKey key, char ch, uint8_t mods) {
     const LauncherResult changed{LauncherCommand::Changed, -1};
+    if (PointerHeld()) {
+        if (key != LauncherKey::Escape) return {};
+        CancelPointer();
+        return changed;
+    }
     const bool alt = mods & LauncherModAlt;
     if (EditorOpen()) {
         if (key == LauncherKey::Escape) return EditorPress({LauncherTargetKind::EditorCancel, 0});
@@ -1192,7 +1207,6 @@ LauncherResult LauncherModel::Key(LauncherKey key, char ch, uint8_t mods) {
     }
     if (key == LauncherKey::Char && (ch == 'z' || ch == 'Z') && (mods & LauncherModCtrl))
         return {LauncherCommand::Undo, -1};
-    if (key == LauncherKey::Escape && PointerHeld()) { CancelPointer(); return changed; }
     if (key == LauncherKey::Char && ch == ' ' && (mods & LauncherModCtrl) && organising_ && selected_ >= 0) {
         ToggleMarked(uint32_t(selected_));
         return changed;
