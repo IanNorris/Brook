@@ -38,7 +38,8 @@ uint32_t BdwGpuContextLoss(const BdwGpuContext* context);
 BdwGpuFile* BdwGpuFileCreate();
 void BdwGpuFileRef(BdwGpuFile* file);
 void BdwGpuFileUnref(BdwGpuFile* file);
-uint32_t BdwGpuFileCreateBuffer(BdwGpuFile* file,uint64_t requested,uint64_t& rounded);
+uint32_t BdwGpuFileCreateBuffer(BdwGpuFile* file,uint64_t requested,uint64_t& rounded,
+                                uint16_t pid=0,uint64_t incarnation=0);
 // Import a retained buffer into this file, returning an existing handle when
 // already present. The slot acquires its own reference on first import.
 uint32_t BdwGpuFileImportBuffer(BdwGpuFile* file,BdwGpuBuffer* buffer);

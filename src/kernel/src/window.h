@@ -1,4 +1,5 @@
 #pragma once
+#include "launcher_model.h"
 
 #include <stdint.h>
 #include "launch_history.h"
@@ -105,14 +106,30 @@ static constexpr uint32_t WM_BTN_ICON_SIZE     = 10;  // size of max/min button 
 static constexpr uint32_t WM_BTN_ICON_PAD_BOT  = 6;   // minimize icon bottom offset
 
 using WmPalette = BrookThemePalette;
-const WmPalette& WmCurrentPalette();
-bool WmSetTheme(uint32_t theme);
+// The painters' palette for the theme in use (selection resolved against the
+// backend), and the hue's full token set (app content colours and more).
+WmPalette WmCurrentPalette();
+// 0xB02 op 1: a legacy palette id (0..2) chooses its hue.
+bool WmSetTheme(uint32_t legacyPalette);
+// A key that changes with the selection and with what it resolves to.
 uint32_t WmGetTheme();
+// Clearwater selection word (brook_theme.h: theme, mode, hue) and the theme
+// in use (Glass, or its Opaque stand-in without backdrop blur).
+uint64_t WmGetThemeSelection();
+bool WmSetThemeSelection(uint64_t selection);
+uint32_t WmResolvedTheme();
+// One app content colour (BROOK_CONTENT_*) of the theme in use.
+uint32_t WmContentColour(unsigned index);
 uint32_t WmGetAppearance();
 bool WmSetAppearance(uint32_t value);
 uint32_t WmGetTaskbarMetrics();
 bool WmSetTaskbarMetrics(uint32_t value);
 void WmSetPerformanceMode(bool enabled);
+// Stage 1.5: the compositor reports the active backend's backdrop-blur
+// capability at each frame boundary; the theme resolves against it.
+void WmSetBackendBlur(bool blur);
+bool WmBackendBlur();
+uint32_t WmResolvedAppearance();
 void WmObserveDesktopTick(uint64_t now);
 // Latest taskbar sample (CPU, memory, disk and network rates), for diagnostics.
 struct DesktopTelemetry;
@@ -125,19 +142,16 @@ struct ChromeSurfaceEffects;
 ChromeSurfaceEffects WmChromeSurfaceEffects();
 uint32_t WmDesktopSurfaceRecords(BrookDesktopSurface* out,uint32_t max);
 using WmRect = DesktopRect;
-void WmDrawBuildId(uint32_t*,uint32_t,uint32_t,uint32_t,const WmRect* clip=nullptr);
-void WmDrawBuildIdSpan(uint32_t*,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);
 // Even nonzero values identify a stable badge style; odd means an update is in progress.
 uint64_t WmBackdropStyleVersion();
 bool WmBootSummaryRect(uint32_t,uint32_t,int32_t*,int32_t*,uint32_t*,uint32_t*);
-void WmRenderBootSummary(uint32_t*,uint32_t,uint32_t,uint32_t);
 static constexpr uint8_t WM_CHROME_TITLE_ALPHA = 255;
 static constexpr int WM_BTN_RIGHT_PAD = 0;
 
 // Taskbar layout constants
-static constexpr uint32_t WM_TASKBAR_BTN_WIDTH  = 44; // icon button width
-static constexpr uint32_t WM_TASKBAR_BTN_HEIGHT = 32;
-static constexpr uint32_t WM_TASKBAR_PADDING    = 4;
+static constexpr uint32_t WM_TASKBAR_BTN_WIDTH  = 48; // icon button target width
+static constexpr uint32_t WM_TASKBAR_BTN_HEIGHT = 48; // targets are the taskbar's full height
+static constexpr uint32_t WM_TASKBAR_PADDING    = 0;  // targets abut; the pills are inset
 static constexpr uint32_t WM_TASKBAR_TEXT_PAD_X = 6;   // text offset within button
 
 enum class WindowState : uint8_t
@@ -182,7 +196,8 @@ struct Window
     uint16_t    captionHeight;  // client's title-strip height (physical px); 0 = native title height
     uint32_t    captionStyle;   // DesktopCaptionStyle* packing; 0 = native title style
     bool        focusable;      // popups/tooltips stay above but don't take keyboard focus
-    char        title[64];
+    char        title[64];      // original title from the client
+    char        webAppTitle[64]; // display override from the active launcher catalog
     char        appId[128];     // explicit xdg app_id, independent of document title
 
     // Per-window VFB (Phase A of wayland↔WM unification).  When non-null
@@ -202,6 +217,7 @@ struct Window
 
     // Only compositor-owned copies are published for hardware GL. No raw
     // source resource is retained here after WM_PRESENT_GRES returns.
+    bool fineScroll;
     bool externalCaptured;
     uint32_t externalW,externalH;
     uint64_t publicationGeneration,publishedGeneration;
@@ -219,9 +235,9 @@ struct Window
         uint8_t  scanCode;
         uint8_t  ascii;
         uint8_t  modifiers;
-        int16_t  x;          // client-local pixel (mouse events)
-        int16_t  y;
-        uint32_t reserved;
+        int16_t  x;          // client-local pixel, or vertical v120 for fine scroll
+        int16_t  y;          // client-local pixel, or horizontal v120 for fine scroll
+        uint32_t reserved;   // fine scroll pointer position, capture token or WM event flags
     };
     WmInputEvent inputQueue[WM_INPUT_QUEUE];
     volatile uint32_t inputHead;
@@ -378,13 +394,19 @@ struct WmDebugWindow {
     int32_t x,y;uint32_t width,height,outerWidth,outerHeight,bufferWidth,bufferHeight;
     bool visible,minimized,maximized,focused,focusable,apiWindow,providerKernel;
     bool fullscreen;
-    char title[64],appId[128];
+    char title[64],rawTitle[64],appId[128];
 };
 enum class WmDebugAction : uint32_t { Focus,Minimize,Maximize,Restore,Close };
 // Registry-backed owner reference; caller must ProcessUnref after cleanup.
 Process* WmReferenceTerminatedOwner();
 // Value-only snapshots; no raw Window/Process pointers escape this API.
 uint32_t WmSnapshotDebugWindows(WmDebugWindow* out,uint32_t capacity,uint64_t* tick);
+// Debug capture: copy one window's current CPU client buffer (packed rows of
+// *width pixels; *scale is its on-screen upscale). out=nullptr only reports
+// the size. -2 unknown window, -95 no CPU buffer (GPU-published or none),
+// -11 the buffer outgrew capacityPixels since it was sized.
+int WmCopyDebugWindowBuffer(uint32_t id,uint64_t incarnation,uint32_t* out,uint64_t capacityPixels,
+                            uint32_t* width,uint32_t* height,uint32_t* scale);
 // Compositor context only. restoreTarget: 0 previous, 1 normal, 2 maximized.
 int WmApplyDebugAction(uint32_t id,uint64_t incarnation,WmDebugAction action,
                       uint32_t restoreTarget,WmDebugWindow* result,uint32_t* closeMethod);
@@ -467,12 +489,17 @@ bool WmAgentIndicatorRefresh(uint64_t now);
 bool WmVolumeIndicatorRefresh();
 // Plays the volume-change pop when a user change is observed (compositor loop).
 void WmVolumeFeedbackTick(uint64_t nowMs);
+bool WmTrayFlyoutVisible();
+bool WmTrayFlyoutPress(int32_t mx, int32_t my, uint32_t width, uint32_t height);
+void WmTrayFlyoutClose();
+bool WmTrayFlyoutRect(uint32_t width, uint32_t height, int32_t*, int32_t*, uint32_t*, uint32_t*);
+void WmCyclePerformanceHud();
+bool WmPerformanceHudRect(uint32_t width, uint32_t height, int32_t*, int32_t*, uint32_t*, uint32_t*);
+
 bool WmVolumePopupVisible();
 void WmVolumePopupClose();
 void WmVolumePopupGetRect(uint32_t screenW, uint32_t screenH,
                           int32_t* outX, int32_t* outY, uint32_t* outW, uint32_t* outH);
-void WmVolumePopupRender(uint32_t* pixels, uint32_t stride, uint32_t screenW, uint32_t screenH,
-                         int32_t mouseX, int32_t mouseY);
 bool WmVolumeLeftPress(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH);
 bool WmVolumeDragActive();
 void WmVolumeDrag(int32_t mx, bool held, uint32_t screenW, uint32_t screenH);
@@ -483,13 +510,8 @@ void WmLauncherClose();
 // false when none is shown. Occupies the launcher/popup overlay slot.
 bool WmTrayTooltipGetRect(uint32_t screenW, uint32_t screenH, int32_t mx, int32_t my,
                           int32_t* outX, int32_t* outY, uint32_t* outW, uint32_t* outH);
-void WmTrayTooltipRender(uint32_t* pixels, uint32_t stride, uint32_t screenW, uint32_t screenH,
-                         int32_t mx, int32_t my);
 
 // Render the taskbar (bottom of screen) with window buttons and clock.
-void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
-                     uint32_t screenW, uint32_t screenH,
-                     uint64_t uptimeMs, int32_t mouseX, int32_t mouseY);
 
 // Hit-test the taskbar. Returns the window index if a button was clicked, -1 otherwise.
 void WmLaunchFeedbackPoll();
@@ -503,6 +525,7 @@ uint32_t WmDesktopHeight(uint32_t screenH);
 
 // Spawn a new terminal window (Super+Enter handler).
 void WmSpawnTerminal();
+void WmOpenFiles();
 
 // ---------------------------------------------------------------------------
 // Per-window VFB API (Phase A of wayland↔WM unification).
@@ -526,7 +549,8 @@ WmCreateWindowResult WmCreateWindowForProcess(Process* proc,
                                                uint16_t clientH,
                                                const char* title,
                                                bool focusable = true,
-                                               bool nativeClient = false);
+                                               bool nativeClient = false,
+                                               bool fineScroll = false);
 
 void WmDestroyWindowById(Process* proc, uint32_t wmId);
 void WmSignalDirtyById(Process* proc, uint32_t wmId);
@@ -613,6 +637,8 @@ void WmPointerSetHover(int idx);
 // Creation identity of the window currently hovered (as published by
 // WmPointerSetHover), or 0 over shell surfaces, chrome and the desktop.
 uint64_t WmPointerHoverIdentity();
+// The hovered identity only when `proc` owns the hovered window, else 0.
+uint64_t WmPointerHoverIdentityOf(Process* proc);
 // Creation identity of `proc`'s window `wmId`, or 0 when it owns no such window.
 uint64_t WmWindowCreationIdentity(Process* proc, uint32_t wmId);
 // A physical primary press was delivered to window `idx`'s client area.
@@ -669,21 +695,53 @@ struct LauncherItem {
     char appId[128];       // desktop basename without .desktop (optional manifest field)
     char executable[64];  // executable basename for native/older manifest matching
     char scriptPath[128];  // e.g. "/boot/SHORTCUTS/QUAKE.RC" or exec command
+    char description[64];  // shortcut "# desc:" (launcher row subtitle); may be empty
+    char category[16];     // declared default launcher category ID ("# category:", or from Categories=)
     uint32_t iconColor;    // Icon background color (0 = auto from title)
     uint32_t* iconPixels;  // Raw ARGB icon data (24x24), or nullptr for generic application icon
     bool valid;
-    bool isDesktopEntry;   // true if sourced from .desktop file (exec directly)
+    bool isDesktopEntry;   // launch a program instead of a shortcut script
+    bool isUserDesktopEntry;
+    bool isWebApp;
 };
 
 struct WmDebugApp {
     char id[33],title[48],desktopAppId[128],executable[64];
-    bool desktop,eligible;
+    bool desktop,userDesktop,eligible;
 };
 uint32_t WmSnapshotDebugApps(WmDebugApp* out,uint32_t capacity,
                              uint32_t* generation,uint64_t* builtTick);
 
 // Load shortcut files from /boot/SHORTCUTS/ directory.
 void WmLauncherLoad();
+
+struct LauncherPersistenceResult {
+    const char* stage = "unattempted";
+    int error = 0;
+};
+
+struct LauncherPersistenceStatus {
+    LauncherPersistenceResult load, save;
+    uint32_t layoutEpoch = 0;
+    uint32_t savedEpoch = 0;
+    bool pending = false;
+    bool saving = false;
+    const char* worker = nullptr;
+    const char* path = nullptr;
+    uint32_t pinCount = 0;
+    char pins[LauncherLimits::Pins][LauncherLimits::KeyLength]{};
+};
+
+void WmLauncherPersistenceStatus(LauncherPersistenceStatus& out);
+
+struct LauncherUserManifestStatus {
+    LauncherPersistenceResult load;
+    uint32_t entries = 0;
+    uint32_t rejected = 0;
+};
+LauncherUserManifestStatus WmLauncherUserManifestStatus();
+void WmRequestUserLauncherRefresh();
+
 // Notification is nonblocking; a worker rebuilds and the compositor publishes.
 void WmRequestLauncherRefresh();
 // Compositor-only: apply after input, before geometry/render for this frame.
@@ -696,15 +754,17 @@ void WmLauncherToggle();
 bool WmLauncherVisible();
 
 // Scroll the launcher by delta (negative = up, positive = down).
-void WmLauncherScroll(int delta, uint32_t screenW, uint32_t screenH);
+// delta120: 1/120 wheel ticks, up positive.
+void WmLauncherScroll(int delta120, uint32_t screenW, uint32_t screenH);
 
 // Render the launcher popup over the desktop.
-void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
-                      uint32_t screenW, uint32_t screenH,
-                      int32_t mouseX, int32_t mouseY);
 
 // Hit-test the launcher popup. Returns item index (0..N) or -1 if miss.
 int WmLauncherHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH);
+// Pointer press (secondary: right button) while the launcher is open; false
+// when outside the panel. Keys while it is open (scan, translated ASCII, mods).
+bool WmLauncherPress(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH, bool secondary);
+void WmLauncherKey(uint8_t scan, char ascii, uint8_t modifiers);
 
 // Get the launcher popup panel geometry (screen-space rect). Lets the GPU
 // compositor mark its pixels opaque / compose it as a translucent overlay.

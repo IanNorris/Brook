@@ -66,6 +66,11 @@ class DesktopTests(unittest.TestCase):
             (root/'profile/share/applications/brook-quake2.desktop').write_text(
                 f'[Desktop Entry]\nType=Application\nName=Quake II\nExec={quake}\nIcon=brook-quake2\n')
             self.assertIn(f'Quake II\t--uid 1000 {quake}\t',collect())
+            files=root/'profile/bin/brook-nautilus'
+            files.write_text('#!/bin/sh\n');files.chmod(0o755)
+            (root/'profile/share/applications/org.gnome.Nautilus.desktop').write_text(
+                '[Desktop Entry]\nType=Application\nName=Files\nExec=brook-nautilus %U\n')
+            self.assertIn('Files\t--uid 1000 brook-nautilus\t', collect())
             runtime=root/'profile/bin/brook-run'
             runtime.write_text('#!/bin/sh\n');runtime.chmod(0o755)
             for program in ('gimp-3.0','mousepad','openttd','gnome-commander','thunar','galculator'):
@@ -76,7 +81,7 @@ class DesktopTests(unittest.TestCase):
                 self.assertIn(f'{program}\t--uid 1000 {runtime} {program} --argument\t',collect())
                 desktop.write_text(desktop.read_text()+'Terminal=true\n')
                 self.assertNotIn(f'{program}\t',collect())
-            for program in ('mousepad','brook-files','brook-settings','wayland-calc','brook-gallery'):
+            for program in ('mousepad','brook-settings','wayland-calc','brook-gallery'):
                 executable=root/'profile/bin'/program
                 executable.write_text('#!/bin/sh\n');executable.chmod(0o755)
                 desktop=root/'profile/share/applications'/f'{program}.desktop'

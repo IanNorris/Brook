@@ -10,25 +10,38 @@ struct CursorImage {
     uint32_t pixels[CursorCapacity * CursorCapacity]{};
 };
 
+inline bool CursorPixelsHaveAlpha(const uint32_t* pixels, uint32_t width, uint32_t height)
+{
+    for (uint32_t row = 0; row < height; ++row)
+        for (uint32_t col = 0; col < width; ++col)
+            if (pixels[row * CursorCapacity + col] >> 24)
+                return true;
+    return false;
+}
+
 // Whether a client cursor image is shown. It belongs to the window it was
-// set for (its creation identity, 0 = everywhere) and is shown only while
+// set for (its creation identity) and is shown only while
 // pointer input goes to that window's client area (`hover`, 0 over shell
 // surfaces, WM chrome and the desktop); elsewhere the built-in arrow is
 // shown. While a button is held the choice is kept, so a drag (a selection,
 // a WM resize from the client's edge) keeps the cursor it started with.
+// Owner 0 (no window: an image set while the pointer was over the desktop,
+// the shell or a window of another process) is never shown. It used to mean
+// "everywhere", which put Xwayland's root "X" cursor, set after
+// wl_pointer.leave, over the taskbar, the desktop and kernel windows.
 struct CursorOwnership {
     uint64_t owner = 0;
-    bool showClient = true;
+    bool showClient = false;
     // A new image from the same owner during a drag keeps the current choice.
     void Set(uint64_t window, uint64_t hover, bool buttonsHeld)
     {
         const bool same = owner == window;
         owner = window;
-        if (!buttonsHeld || !same) showClient = !owner || owner == hover;
+        if (!buttonsHeld || !same) showClient = owner && owner == hover;
     }
     bool Update(uint64_t hover, bool buttonsHeld)
     {
-        if (!buttonsHeld) showClient = !owner || owner == hover;
+        if (!buttonsHeld) showClient = owner && owner == hover;
         return showClient;
     }
 };

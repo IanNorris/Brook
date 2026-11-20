@@ -282,6 +282,9 @@ def main():
                 if binary_name in ('firefox', 'codium', 'vscodium', 'vlc'):
                     exec_cmd = '--uid 1000 ' + exec_cmd
 
+        if binary_name == 'brook-nautilus':
+            exec_cmd = '--uid 1000 ' + exec_cmd
+
         entries.append((name, exec_cmd, icon_file, categories, Path(df).stem))
         print(f"  App: {name} [{exec_cmd}]")
 

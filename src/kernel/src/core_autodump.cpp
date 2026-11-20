@@ -273,7 +273,7 @@ void Worker(void*)
         if(status){
             const auto error=uint32_t(-status);
             SpinLockAcquire(&g_errorLock);
-            g_lastError={snapshot.result.stage,pid,error};
+            g_lastError={snapshot.result.stage,pid,error,snapshot.result.discarded};
             SpinLockRelease(&g_errorLock);
             if(status==-110)Increment(g_timedOut);
             else Increment(g_failed);
@@ -281,6 +281,14 @@ void Worker(void*)
                        comm,pid,snapshot.result.stage,error);
         }else{
             Increment(g_completed);
+            const auto discarded=snapshot.result.discarded;
+            if(discarded.any()){
+                SpinLockAcquire(&g_errorLock);
+                g_lastError={"truncated",pid,0,discarded};
+                SpinLockRelease(&g_errorLock);
+                KLOG_INFO(General,"core-dump: %s pid=%u truncated discarded pages=%lu/%lu/%lu file_notes=%u",
+                           comm,pid,discarded.filePages,discarded.dataPages,discarded.stackHeapPages,discarded.fileNotes);
+            }
             KLOG_INFO(General,"core-dump: %s pid=%u sig=%d -> %s/%s (%lu)",
                       comm,pid,g_job.signal,directory,name,snapshot.result.bytes);
         }

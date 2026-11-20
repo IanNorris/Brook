@@ -36,14 +36,47 @@ void BdwCursorDisable(Io& io)
     (void)io.read32(BdwCursorRegs::Control);
 }
 
-inline bool BdwCursorHasAlpha(const uint32_t* pixels, uint32_t width, uint32_t height)
+// Hash only pixels that affect the fixed-size ARGB plane. Hotspots are
+// position changes, and RGB values under zero alpha are never displayed.
+inline uint64_t BdwCursorImageKey(const uint32_t* pixels, uint32_t width, uint32_t height)
 {
-    for (uint32_t row = 0; row < height; ++row)
-        for (uint32_t col = 0; col < width; ++col)
-            if (pixels[row * BdwCursorRegs::Side + col] >> 24)
-                return true;
-    return false;
+    uint64_t key = 14695981039346656037ull;
+    bool hasAlpha = false;
+    for (uint32_t row = 0; row < height; ++row) {
+        for (uint32_t col = 0; col < width; ++col) {
+            const uint32_t index = row * BdwCursorRegs::Side + col;
+            const uint32_t pixel = pixels[index];
+            if (!(pixel >> 24))
+                continue;
+            hasAlpha = true;
+            key ^= (uint64_t(index) << 32) | pixel;
+            key *= 1099511628211ull;
+        }
+    }
+    return hasAlpha ? (key ? key : 1) : 0;
 }
+
+class BdwCursorImages {
+    struct Slot {
+        uint64_t key = 0;
+        bool valid = false;
+    };
+    Slot slots_[2];
+    uint32_t current_ = 0;
+
+public:
+    uint32_t select(uint64_t key, bool switchBase) const {
+        return switchBase || needsUpload(current_, key) ? current_ ^ 1u : current_;
+    }
+    bool needsUpload(uint32_t slot, uint64_t key) const {
+        return !slots_[slot].valid || slots_[slot].key != key;
+    }
+    void selectProgrammed(uint32_t slot, uint64_t key) {
+        slots_[slot] = {key, true};
+        current_ = slot;
+    }
+    bool transparent() const { return slots_[current_].valid && !slots_[current_].key; }
+};
 
 // Prove the plane can latch a transparent image while software still draws
 // the cursor. Only then request a cursor-free primary frame. Make the real

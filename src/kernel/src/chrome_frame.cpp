@@ -1,13 +1,11 @@
-// Window-frame display list builder (compositor refactor stage 1.2). The
-// primitives are the ones RenderWindowChrome used to draw directly, in the
-// same order, so the CPU executor reproduces its pixels. Freestanding.
+// Window-frame display lists with explicit material and foreground alpha.
+// Freestanding.
 #include "chrome_frame.h"
 
 namespace brook {
 
 static void CaptionButtons(ChromeDisplayList& dl, const ChromeStyle& s, const ChromeFrameModel& m,
-                           uint32_t bg, uint32_t fg, bool material, uint32_t hoverBg, uint32_t hoverInk,
-                           const DesktopRect& clip = DesktopRect{}, unsigned radius = 0)
+                           uint32_t fg, uint32_t hoverBg, uint32_t hoverInk)
 {
     for (int button = 0; button < 3; ++button)
     {
@@ -15,41 +13,26 @@ static void CaptionButtons(ChromeDisplayList& dl, const ChromeStyle& s, const Ch
         if (!part) continue;
         const DesktopRect r = part->visual;
         const bool hover = part->hit.contains(m.mouseX, m.mouseY);
-        if (material) dl.Fill(r.x, r.y, 1, r.h, ChromeMix(bg, 0xffffff, 20));
-        if (hover) dl.CornerFill(r.x, r.y, r.w, r.h, button == 0 ? s.P().closeHover : hoverBg, clip, radius);
-        if (r.w < static_cast<int>(s.M(14))) continue;
+        if (hover) {
+            const int width = r.w < static_cast<int>(s.M(36)) ? r.w : s.M(36);
+            const int height = r.h < static_cast<int>(s.M(26)) ? r.h : s.M(26);
+            dl.MaterialRect({r.x + (r.w - width) / 2, r.y + (r.h - height) / 2, width, height},
+                            button == 0 ? 0xff000000u | s.P().closeHover : hoverBg, s.M(6));
+        }
+        const int glyph = s.M(16);
+        if (r.w < glyph || r.h < glyph) continue;
         const uint32_t ink = hover && button == 0 ? s.P().closeText : hover ? hoverInk : fg;
-        const int cx = r.x + r.w / 2, cy = r.y + r.h / 2;
-        if (button == 0)
-        {
-            const int k = static_cast<int>(s.M(4));
-            dl.Squares(cx - k, cy - k, s.M(1), s.M(1), 1, 1, 2 * k + 1, ink);
-            dl.Squares(cx - k, cy + k, s.M(1), s.M(1), 1, -1, 2 * k + 1, ink);
-        }
-        else if (button == 1)
-        {
-            auto box = [&](int x, int y, int width, int height) {
-                dl.Fill(x, y, width, s.M(1), ink);
-                dl.Fill(x, y + height - 1, width, s.M(1), ink);
-                dl.Fill(x, y, s.M(1), height, ink);
-                dl.Fill(x + width - 1, y, s.M(1), height, ink);
-            };
-            if (m.maximised)
-            {
-                box(cx - s.M(2), cy - s.M(5), s.M(8), s.M(8));
-                dl.Fill(cx - s.M(5), cy - s.M(2), s.M(8), s.M(8), hover ? hoverBg : bg);
-                box(cx - s.M(5), cy - s.M(2), s.M(8), s.M(8));
-            }
-            else box(cx - s.M(5), cy - s.M(4), s.M(11), s.M(9));
-        }
-        else dl.Fill(cx - s.M(5), cy + s.M(3), s.M(11), s.M(1), ink);
+        // The 16 px line icons (DESIGN.md "Type and icons"), centred in the cell.
+        const ChromeGlyph icon = button == 0 ? ChromeGlyph::Close : button == 2 ? ChromeGlyph::Minimise :
+                                 m.maximised ? ChromeGlyph::Restore : ChromeGlyph::Maximise;
+        dl.Glyph(icon, r.x + (r.w - glyph) / 2, r.y + (r.h - glyph) / 2, ink);
     }
 }
 
 void ChromeBuildFrame(const ChromeFrameModel& m, const ChromeStyle& s, ChromeDisplayList& dl)
 {
     const BrookThemePalette& p = s.P();
-    const uint32_t edge = m.focused ? p.borderActive : p.titleInactive;
+    const uint32_t edge = 0xff000000u | (m.focused ? p.borderActive : p.borderInactive);
     const uint32_t bg = s.MaterialColor(m.focused ? p.titleActive : p.titleInactive);
     const uint32_t fg = m.focused ? p.text : p.mutedText;
     if (m.clientDecorated)
@@ -75,54 +58,64 @@ void ChromeBuildFrame(const ChromeFrameModel& m, const ChromeStyle& s, ChromeDis
             const uint32_t hoverBg = 0xff000000u | ChromeMix(strip, ink, 28);
             const unsigned radius = m.maximised ? 0 : DesktopCaptionStyleRadius(m.captionStyle);
             dl.CornerFill(block.x, block.y, block.w, block.h, strip, block, radius);
-            CaptionButtons(dl, s, m, strip, idle | 0xff000000u, false, hoverBg, ink | 0xff000000u, block, radius);
+            CaptionButtons(dl, s, m, idle, hoverBg, ink);
             return;
         }
-        dl.Fill(block.x, block.y, block.w, block.h, bg);
-        CaptionButtons(dl, s, m, bg, fg, false, p.captionHover, p.text);
+        dl.Fill(block.x, block.y, block.w, block.h, 0xff000000u | bg);
+        CaptionButtons(dl, s, m, fg, 0xff000000u | p.captionHover, p.text);
         return;
     }
     const int border = s.M(DesktopMetrics::BorderBase);
     const int x = m.layout.outer.x, y = m.layout.outer.y, ow = m.layout.outer.w, oh = m.layout.outer.h;
-    dl.Fill(x, y, ow, border, edge);
-    dl.Fill(x, y, border, oh, edge);
-    dl.Fill(x + ow - border, y, border, oh, edge);
-    dl.Fill(x, y + oh - border, ow, border, edge);
-    const int tx = x + border, ty = y + border;
     const ChromeMaterialCache* cached = s.glass ? s.material : nullptr;
-    const bool material = cached != nullptr;
+    const int tx = x + border, ty = y + border;
     const int titleH = s.M(DesktopMetrics::TitleBase);
-    if (material) dl.Rows(tx, ty, m.clientW, titleH, cached->rows[m.focused]);
-    else dl.Fill(tx, ty, m.clientW, titleH, bg);
-    // A restrained one-pixel edge replaces the old heavy double outline.
-    if (border > 1) {
-        dl.Fill(x + 1, y + 1, ow - 2, border - 1, bg);
-        dl.Fill(x + 1, y + border, border - 1, oh - 2 * border, bg);
-        dl.Fill(x + ow - border, y + border, border - 1, oh - 2 * border, bg);
-        dl.Fill(x + 1, y + oh - border, ow - 2, border - 1, bg);
+    const uint32_t flat = 0xff000000u | p.titleInactive;
+    const uint32_t title = cached ? cached->rows[m.focused][0] : bg;
+    const uint32_t top = cached ? cached->rims[m.focused][0] : edge;
+    const uint32_t divider = cached ? (title & 0xff000000u) | p.titleDivider : 0xff000000u | p.titleDivider;
+    dl.Fill(x, y, ow, border, title);
+    dl.Fill(x, y + border, border, oh - border, flat);
+    dl.Fill(x + ow - border, y + border, border, oh - border, flat);
+    dl.Fill(x, y + oh - border, ow, border, flat);
+    if (cached && cached->height >= static_cast<unsigned>(titleH))
+        dl.Rows(x, ty, ow, titleH, cached->rows[m.focused]);
+    else dl.Fill(x, ty, ow, titleH, bg);
+    dl.Fill(x, y, ow, 1, top);
+    dl.Fill(x, y + 1, 1, oh - 2, edge);
+    dl.Fill(x + ow - 1, y + 1, 1, oh - 2, edge);
+    dl.Fill(x, y + oh - 1, ow, 1, edge);
+    if (cached) {
+        const uint32_t highlight = (title & 0xff000000u) | ChromeMix(title, 0xffffff, p.innerHighlight);
+        dl.Fill(x + 1, y + 1, ow - 2, 1, highlight);
     }
-    if (material) {
-        dl.Fill(x, y, ow, 1, cached->rims[m.focused][0]);
-        dl.Fill(x, y + 1, 1, oh - 2, cached->rims[m.focused][1]);
-        dl.Fill(x + ow - 1, y + 1, 1, oh - 2, cached->rims[m.focused][1]);
-        dl.Fill(x, y + oh - 1, ow, 1, cached->rims[m.focused][2]);
+    dl.Fill(tx, ty + titleH - 1, m.clientW, 1, divider);
+    if (m.focused) {
+        // A 2 px light on the top rim: solid for 45% of 176 px, then fading.
+        const int start = x + (m.maximised ? 0 : static_cast<int>(s.M(10)));
+        const int limit = x + ow - (m.maximised ? 0 : static_cast<int>(s.M(10))) - start;
+        const int width = limit < static_cast<int>(s.M(176)) ? limit : static_cast<int>(s.M(176));
+        if (width > 0) {
+            const int solid = width * 45 / 100;
+            dl.Fill(start, y, solid, s.M(2), 0xff000000u | p.accent);
+            dl.FadeX(start + solid, y, width - solid, s.M(2), 0xff000000u | p.accent);
+        }
     }
-    dl.Fill(tx, ty + titleH - 1, m.clientW, 1, material ? cached->rims[m.focused][2] : ChromeMix(bg, 0xffffff, 32));
-    // Active identity stroke: keep the hit-test geometry and client opacity.
-    if (m.focused) dl.Fill(tx + s.M(12), ty, m.clientW > static_cast<int>(s.M(184)) ? s.M(160) : m.clientW / 2,
-                           s.M(4), p.accent);
     const ChromePart* minimise = m.layout.Find(ChromePartRole::Minimise);
     const int runLeft = minimise ? minimise->visual.x : x + ow;
     const int iconX = tx + s.M(10);
-    const int textX = iconX + s.M(20) + s.M(8);
-    if (runLeft - iconX >= static_cast<int>(s.M(24)))
-        ChromeIcon(dl, s, iconX, ty + (static_cast<int>(s.M(DesktopMetrics::TitleBase)) - static_cast<int>(s.M(20))) / 2,
-                   s.M(20), m.icon);
+    const int icon = s.M(16);
+    const int textX = iconX + icon + s.M(8);
+    if (runLeft - iconX >= icon + static_cast<int>(s.M(4))) {
+        const int iconY = ty + (titleH - icon) / 2;
+        if (!m.focused && m.icon)
+            dl.Icon(iconX, iconY, icon, m.icon, 176);
+        else ChromeIcon(dl, s, iconX, iconY, icon, m.icon);
+    }
     const int textW = runLeft - textX - s.M(8);
     if (textW > 0)
-        dl.Text(textX, ty + (static_cast<int>(s.M(DesktopMetrics::TitleBase)) - s.Font().lineHeight) / 2,
-                m.title, fg, textW);
-    CaptionButtons(dl, s, m, bg, fg, material, p.captionHover, p.text);
+        ChromeElidedText(dl, s, ChromeFont::Body, textX, ty + (titleH - s.Line()) / 2, m.title, fg, textW);
+    CaptionButtons(dl, s, m, fg, s.MaterialColor(p.captionHover), p.text);
 }
 
 } // namespace brook

@@ -37,12 +37,14 @@ struct DesktopTrackWindow {
     int32_t chromeX,chromeY;uint32_t chromeWidth,chromeHeight;
     /* Shadow drawn beneath the window (surface record): its alpha and the
      * output rectangle it can touch; shadowWidth 0 = none. */
-    uint32_t shadowAlpha;int32_t shadowX,shadowY;uint32_t shadowWidth,shadowHeight;
+    uint32_t shadowAlpha,shadowTile,shadowCorner;int32_t shadowX,shadowY;uint32_t shadowWidth,shadowHeight;
     struct DesktopTrackBands content,chrome;
 };
 struct DesktopTrackState {
     uint32_t valid,width,height,count;
     uint64_t display,backdrop;
+    uint64_t glassKey,shellShadowKey;
+    struct DesktopDamageSet glassDamage,shellShadowDamage;
     struct DesktopTrackWindow windows[BROOK_DESKTOP_LAYER_LIMIT];
 };
 
@@ -141,7 +143,8 @@ static inline int desktop_track_same_geometry(const struct DesktopTrackWindow *a
     if(memcmp(a->layer+first,b->layer+first,(BROOK_VK_LAYER_WORDS-first)*sizeof(uint32_t)))return 0;
     if(a->hasChrome && (a->chromeX!=b->chromeX || a->chromeY!=b->chromeY || a->chromeWidth!=b->chromeWidth ||
        a->chromeHeight!=b->chromeHeight || a->chromeOpacity!=b->chromeOpacity))return 0;
-    if(a->shadowAlpha!=b->shadowAlpha || a->shadowX!=b->shadowX || a->shadowY!=b->shadowY ||
+    if(a->shadowAlpha!=b->shadowAlpha || a->shadowTile!=b->shadowTile || a->shadowCorner!=b->shadowCorner ||
+       a->shadowX!=b->shadowX || a->shadowY!=b->shadowY ||
        a->shadowWidth!=b->shadowWidth || a->shadowHeight!=b->shadowHeight)return 0;
     return 1;
 }

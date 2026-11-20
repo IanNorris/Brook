@@ -1,4 +1,8 @@
 #include "toplevel-size.h"
+#include "latency-stats.h"
+#include "wm-input-abi.h"
+
+#include <stddef.h>
 /*
  * waylandd.c — Brook OS Wayland server (Phase D rewrite).
  *
@@ -108,6 +112,11 @@ struct brook_wm_event {
     int16_t  y;
     uint32_t reserved;
 };
+_Static_assert(sizeof(struct brook_wm_event) == 12 &&
+               offsetof(struct brook_wm_event, x) == 4 &&
+               offsetof(struct brook_wm_event, y) == 6 &&
+               offsetof(struct brook_wm_event, reserved) == 8,
+               "WM_POP_INPUT event layout");
 
 #define EVT_KEY_PRESS        0
 #define EVT_KEY_RELEASE      1
@@ -172,8 +181,14 @@ static uint32_t g_now_ms(void) {
 
 static long wm_create_window(uint32_t w, uint32_t h, const char* title,
                              uint32_t flags, struct brook_wm_create_out* out) {
-    return syscall(BROOK_SYS_WM_CREATE_WINDOW, (long)w, (long)h,
-                   (long)title, (long)out, (long)flags);
+    long result = syscall(BROOK_SYS_WM_CREATE_WINDOW, (long)w, (long)h,
+                          (long)title, (long)out, (long)(flags | BROOK_WM_CREATE_FLAG_FINE_SCROLL));
+    if (result == -1 && errno == EINVAL) {
+        /* Older kernels reject the fine scroll opt-in bit. */
+        result = syscall(BROOK_SYS_WM_CREATE_WINDOW, (long)w, (long)h,
+                         (long)title, (long)out, (long)flags);
+    }
+    return result;
 }
 static long wm_destroy_window(uint32_t id) {
     return syscall(BROOK_SYS_WM_DESTROY_WINDOW, (long)id);
@@ -342,11 +357,25 @@ static void buffer_release(struct brook_buffer *buffer) {
     if (!--buffer->uses && !buffer->uncertain && buffer->resource) wl_buffer_send_release(buffer->resource);
 }
 
+struct frame_latency_event {
+    uint64_t done_us, commit, current_commit;
+    uint32_t surface_object, root_wm;
+    int pending, waiting, committed;
+    const char *frames_state;
+    int offer_state, renderer_presented; /* -1: no matching evidence */
+};
+
+struct frame_latency {
+    struct latency_hist hist;
+    struct frame_latency_event worst;
+};
+
 struct brook_frame_callback {
     struct wl_resource *resource;
     struct wl_list link;
     struct brook_surface *surface;
     uint32_t requested_ms, committed_ms;
+    uint64_t latency_commit_us, latency_epoch;
     int done;
     uint64_t commit;
 };
@@ -399,6 +428,7 @@ struct brook_surface {
      * applied once the kernel window exists. */
     int  toplevel_fullscreen,want_fullscreen;
     int32_t configure_width,configure_height;
+    int32_t bounds_width,bounds_height;
     int configure_size_pending,configure_size_acked;
     uint32_t configure_size_serial;
     int32_t window_geometry_w, window_geometry_h;
@@ -476,6 +506,7 @@ struct brook_surface {
     /* Frame pacing (status "pacing"): last buffer commit and last frame
      * callback sent, in microseconds. */
     uint64_t pace_commit_us,pace_callback_us;
+    struct frame_latency latency;
     /* Status diagnostics ("surfaces" in the status file): the newest serial
      * the client acknowledged, and when it acked, was last configured and
      * last committed (with and without a buffer), in g_now_ms(). */
@@ -483,6 +514,88 @@ struct brook_surface {
 };
 
 static struct brook_surface *g_surfaces = NULL;
+
+enum latency_input_kind { LATENCY_MOTION, LATENCY_AXIS, LATENCY_BUTTON, LATENCY_KEY, LATENCY_INPUT_KINDS };
+struct client_latency_data {
+    struct frame_latency commit_to_done;
+    struct latency_hist done_to_commit;
+    struct latency_hist input[LATENCY_INPUT_KINDS];
+    uint64_t last_done_us, last_axis_us, axis_burst_max_gap_us;
+};
+
+struct client_latency {
+    struct wl_listener destroy;
+    struct wl_list link;
+    pid_t pid;
+    uint64_t connection;
+    struct client_latency_data data;
+};
+
+static struct wl_list g_latency_clients = {&g_latency_clients, &g_latency_clients};
+static uint64_t g_stats_epoch = 1, g_latency_connection_id;
+static uint64_t g_input_batch_us;
+static int g_input_recorded;
+
+static void latency_client_destroy(struct wl_listener *listener, void *data) {
+    (void)data;
+    struct client_latency *client = wl_container_of(listener, client, destroy);
+    wl_list_remove(&client->link);
+    wl_list_remove(&client->destroy.link);
+    free(client);
+}
+
+static struct client_latency *latency_client(struct wl_client *client) {
+    struct wl_listener *listener = wl_client_get_destroy_listener(client, latency_client_destroy);
+    if (listener) {
+        struct client_latency *stats = wl_container_of(listener, stats, destroy);
+        return stats;
+    }
+    struct client_latency *stats = calloc(1, sizeof(*stats));
+    if (!stats) return NULL;
+    wl_client_get_credentials(client, &stats->pid, NULL, NULL);
+    stats->connection = ++g_latency_connection_id;
+    stats->destroy.notify = latency_client_destroy;
+    wl_client_add_destroy_listener(client, &stats->destroy);
+    wl_list_insert(g_latency_clients.prev, &stats->link);
+    return stats;
+}
+
+static struct brook_surface *latency_toplevel(struct brook_surface *s) {
+    if (s->is_cursor) return NULL;
+    while (s->subsurface_parent) s = s->subsurface_parent;
+    /* Popup frame callbacks are their own pacing stream. */
+    return !s->xdg_popup && (s->xdg_toplevel || s->role == 4 || s->wm_id) ? s : NULL;
+}
+
+static void latency_input_sent(struct wl_client *client, enum latency_input_kind kind) {
+    /* One kernel event can be sent on more than one seat binding. Count it
+     * once for the owning connection, after its first protocol delivery. */
+    if (!g_input_batch_us || g_input_recorded) return;
+    const uint64_t sent = g_now_us();
+    if (sent < g_input_batch_us) return;
+    g_input_recorded = 1;
+    struct client_latency *stats = latency_client(client);
+    if (!stats) return;
+    latency_record(&stats->data.input[kind], g_input_batch_us, sent);
+    if (kind == LATENCY_AXIS)
+        latency_axis_sent(sent, &stats->data.last_axis_us, &stats->data.axis_burst_max_gap_us);
+}
+
+static void latency_commit(struct brook_surface *s, struct wl_client *client) {
+    struct client_latency *stats = latency_client(client);
+    if (wl_list_empty(&s->pending_frames) && (!stats || !stats->data.last_done_us)) return;
+    const uint64_t now = g_now_us();
+    if (stats && stats->data.last_done_us && now) {
+        latency_record(&stats->data.done_to_commit, stats->data.last_done_us, now);
+        stats->data.last_done_us = 0;
+    }
+    struct brook_frame_callback *frame;
+    wl_list_for_each(frame, &s->pending_frames, link) {
+        frame->latency_commit_us = now;
+        frame->latency_epoch = g_stats_epoch;
+    }
+}
+
 static int g_drm_fd = -1;
 static int g_drm_intel;
 static void popup_apply_position(struct brook_surface *);
@@ -674,8 +787,45 @@ static void surface_frame(struct wl_client *c, struct wl_resource *r, uint32_t i
     wl_list_insert(surface->pending_frames.prev, &callback->link);
     wl_resource_set_implementation(callback->resource, NULL, callback, frame_callback_destroy);
 }
+static const char *surface_callback_state(struct brook_surface *, uint32_t now);
+
+static void latency_frame_done(struct brook_surface *s, const struct brook_frame_callback *frame,
+                               uint32_t now, const struct brook_image *presented) {
+    if (!frame->latency_commit_us || frame->latency_epoch != g_stats_epoch) return;
+    struct brook_surface *root = latency_toplevel(s);
+    const uint64_t done = g_now_us();
+    if (done < frame->latency_commit_us) return;
+    struct client_latency *client = latency_client(wl_resource_get_client(frame->resource));
+    if (!client) return;
+    client->data.last_done_us = done;
+    struct frame_latency *aggregate = &client->data.commit_to_done;
+    const int client_worst = latency_record(&aggregate->hist, frame->latency_commit_us, done);
+    const int surface_worst = root && latency_record(&root->latency.hist, frame->latency_commit_us, done);
+    if (!client_worst && !surface_worst) return;
+
+    const struct bt_state *current = s->tree.current;
+    const struct brook_image *image = NULL;
+    if (presented && presented->offer_tree_commit == frame->commit) image = presented;
+    else if (current && current->commit == frame->commit && current->value) {
+        const struct brook_view *view = current->value;
+        image = view->image;
+    }
+    const struct frame_latency_event event = {
+        .done_us = done, .commit = frame->commit, .current_commit = current ? current->commit : 0,
+        .surface_object = wl_resource_get_id(s->resource), .root_wm = root ? root->wm_id : 0,
+        .pending = wl_list_length(&s->pending_frames), .waiting = wl_list_length(&s->waiting_frames),
+        .committed = wl_list_length(&s->committed_frames), .frames_state = surface_callback_state(s, now),
+        .offer_state = image ? image->offer_state : -1,
+        .renderer_presented = image && (image->offer_state || image->pending_cpu ||
+                                      image->group_refs || image->gpu_presented) ? image->gpu_presented : -1,
+    };
+    if (client_worst) aggregate->worst = event;
+    if (surface_worst) root->latency.worst = event;
+}
+
 /* Send eligible callbacks whose commit is at most limit. */
-static void surface_send_frame_callbacks_upto(struct brook_surface *surface, uint32_t now, uint64_t limit) {
+static void surface_send_frame_callbacks_upto(struct brook_surface *surface, uint32_t now, uint64_t limit,
+                                             const struct brook_image *presented) {
     struct brook_frame_callback *callback, *next;
     wl_list_for_each_safe(callback, next, &surface->committed_frames, link) {
         if (callback->commit > limit) continue;
@@ -690,13 +840,14 @@ static void surface_send_frame_callbacks_upto(struct brook_surface *surface, uin
             if (committed > surface->trace_committed_max_ms) surface->trace_committed_max_ms = committed;
             ++surface->trace_done;
         }
+        latency_frame_done(surface, callback, now, presented);
         callback->done = 1;
         wl_callback_send_done(callback->resource, now);
         wl_resource_destroy(callback->resource);
     }
 }
 static void surface_send_frame_callbacks(struct brook_surface *surface, uint32_t now) {
-    surface_send_frame_callbacks_upto(surface, now, UINT64_MAX);
+    surface_send_frame_callbacks_upto(surface, now, UINT64_MAX, NULL);
 }
 /* Frame callbacks of a surface whose content is an offered GPU source are
  * paced by the renderer's PRESENTED notification (gpu_window_presented).
@@ -863,6 +1014,9 @@ static void surface_set_input_region(struct wl_client *c, struct wl_resource *r,
 static void surface_cursor_commit(struct brook_surface *s) {
     struct brook_view *view=s->tree.current?s->tree.current->value:NULL;
     if (!view || !view->image->pixels) return;
+    /* No owning window: set without pointer focus (see pointer_set_cursor).
+     * Uploading it unowned would show it over other windows and the shell. */
+    if (!s->cursor_owner_wm) return;
     const struct brook_geometry *g=&view->geometry;
     const struct brook_image *image=view->image;
     uint32_t scale=surface_output_scale(s);
@@ -876,6 +1030,37 @@ static void surface_cursor_commit(struct brook_surface *s) {
     }
     wm_set_cursor_image_for(pixels,dw,dh,(int64_t)s->cursor_hot_x*dw/g->w,(int64_t)s->cursor_hot_y*dh/g->h,s->cursor_owner_wm);
 }
+static void toplevel_output_size(const struct brook_surface *s, uint32_t *width, uint32_t *height)
+{
+    *width = *height = 0;
+    wm_get_screen_info(width, height);
+    const uint32_t scale = surface_output_scale(s);
+    *width /= scale;
+    *height /= scale;
+}
+
+static void toplevel_send_bounds(struct brook_surface *s, uint32_t width, uint32_t height)
+{
+    if (wl_resource_get_version(s->xdg_toplevel) < XDG_TOPLEVEL_CONFIGURE_BOUNDS_SINCE_VERSION) return;
+    if (!width || !height || width > INT32_MAX || height > INT32_MAX) width = height = 0;
+
+    if (s->bounds_width == (int32_t)width && s->bounds_height == (int32_t)height) return;
+    s->bounds_width = (int32_t)width;
+    s->bounds_height = (int32_t)height;
+    xdg_toplevel_send_configure_bounds(s->xdg_toplevel, s->bounds_width, s->bounds_height);
+}
+
+static void toplevel_send_wm_capabilities(struct wl_resource *toplevel)
+{
+    if (wl_resource_get_version(toplevel) < XDG_TOPLEVEL_WM_CAPABILITIES_SINCE_VERSION) return;
+    // All three requests have WM implementations. show_window_menu is a stub.
+    uint32_t supported[] = { XDG_TOPLEVEL_WM_CAPABILITIES_MAXIMIZE,
+                             XDG_TOPLEVEL_WM_CAPABILITIES_MINIMIZE,
+                             XDG_TOPLEVEL_WM_CAPABILITIES_FULLSCREEN };
+    struct wl_array capabilities = { .size = sizeof(supported), .data = supported };
+    xdg_toplevel_send_wm_capabilities(toplevel, &capabilities);
+}
+
 /* Configure size and state form one transaction. Focus changes may supersede
  * its serial, but must preserve both dimensions and management state. */
 static int toplevel_send_state(struct brook_surface *s,int32_t width,int32_t height) {
@@ -889,6 +1074,11 @@ static int toplevel_send_state(struct brook_surface *s,int32_t width,int32_t hei
         if(!state) { wl_array_release(&states);wl_client_post_no_memory(wl_resource_get_client(s->resource));return 0; }
         *state=values[i];
     }
+    if (wl_resource_get_version(s->xdg_toplevel) >= XDG_TOPLEVEL_CONFIGURE_BOUNDS_SINCE_VERSION) {
+        uint32_t screen_w, screen_h;
+        toplevel_output_size(s, &screen_w, &screen_h);
+        toplevel_send_bounds(s, screen_w, screen_h);
+    }
     xdg_toplevel_send_configure(s->xdg_toplevel,width,height,&states);wl_array_release(&states);
     s->next_configure_serial=next_serial();s->configure_ms=g_now_ms();
     if(s->configure_size_pending) {s->configure_size_serial=s->next_configure_serial;s->configure_size_acked=0;}
@@ -896,6 +1086,7 @@ static int toplevel_send_state(struct brook_surface *s,int32_t width,int32_t hei
 }
 static void surface_commit(struct wl_client *c,struct wl_resource *r) {
     struct brook_surface *s=wl_resource_get_user_data(r);
+    latency_commit(s, c);
     if(s->opaque_pending){
         s->opaque_set=s->pending_opaque_set;s->opaque_x=s->pending_opaque_x;s->opaque_y=s->pending_opaque_y;
         s->opaque_w=s->pending_opaque_w;s->opaque_h=s->pending_opaque_h;s->opaque_pending=0;
@@ -933,8 +1124,10 @@ static void surface_commit(struct wl_client *c,struct wl_resource *r) {
         wl_array_init(&states);
         /* Keep the bounded GTK fallback, honoring committed client constraints.
          * Hints are advisory: never turn an absurd minimum into a huge SHM pool. */
-        uint32_t screen_w=0,screen_h=0;wm_get_screen_info(&screen_w,&screen_h);
-        screen_w/=surface_output_scale(s);screen_h/=surface_output_scale(s);
+        uint32_t screen_w, screen_h;
+        toplevel_output_size(s, &screen_w, &screen_h);
+        s->bounds_width = s->bounds_height = 0;
+        toplevel_send_bounds(s, screen_w, screen_h);
         const int32_t cap_w=screen_w && screen_w<4096?(int32_t)screen_w:4096;
         const int32_t cap_h=screen_h && screen_h<2160?(int32_t)screen_h:2160;
         const int32_t width=toplevel_initial_axis(800,s->size_hints.min_w,s->size_hints.max_w,cap_w);
@@ -1143,6 +1336,7 @@ static void compositor_create_surface(struct wl_client *client,
     surface_tree_init(s);
     s->input_region.infinite=1;
     s->resource = sr;
+    (void)latency_client(client);
     s->next = g_surfaces;
     g_surfaces = s;
     wl_resource_set_implementation(sr, &surface_impl, s, surface_destroy_userdata);
@@ -1346,6 +1540,7 @@ static void xdg_surface_get_toplevel(struct wl_client *c, struct wl_resource *r,
     if (!tr) { wl_client_post_no_memory(c); return; }
     wl_resource_set_implementation(tr, &xdg_toplevel_impl, s, xdg_toplevel_resource_destroy);
     s->xdg_toplevel = tr;
+    toplevel_send_wm_capabilities(tr);
     /* KDE decoration belongs to wl_surface and may precede its shell role. */
     if (!s->deco_negotiated) {
         s->deco_csd = 0;
@@ -1372,6 +1567,12 @@ static void xdg_popup_reposition(struct wl_client *c, struct wl_resource *r,
     struct brook_surface *s = wl_resource_get_user_data(r);
     struct brook_positioner *p = positioner ?
         wl_resource_get_user_data(positioner) : NULL;
+    /* xdg-shell: repositioned is sent first in the configuration sequence,
+     * then xdg_popup.configure, then xdg_surface.configure. GTK4 reuses its
+     * tooltip popup via reposition and ignores a configure that arrives before
+     * repositioned, then blocks in gdk_wayland_surface_present_popup waiting
+     * for one (Nautilus froze on the first tooltip after a move). */
+    xdg_popup_send_repositioned(r, token);
     if (s) {
         positioner_compute_geometry(p, &s->popup_x, &s->popup_y,
                                     &s->popup_w, &s->popup_h);
@@ -1383,7 +1584,6 @@ static void xdg_popup_reposition(struct wl_client *c, struct wl_resource *r,
         }
         popup_apply_position(s);
     }
-    xdg_popup_send_repositioned(r, token);
 }
 static const struct xdg_popup_interface xdg_popup_impl = {
     .destroy    = xdg_popup_destroy_req,
@@ -1525,6 +1725,9 @@ static const struct xdg_positioner_interface positioner_impl = {
 
 /* xdg_wm_base */
 
+/* Version 6 adds repaint suspension, which the WM does not report. */
+#define BROOK_XDG_WM_BASE_VERSION 5
+
 static void wm_base_destroy(struct wl_client *c, struct wl_resource *r) {
     (void)c; wl_resource_destroy(r);
 }
@@ -1621,6 +1824,7 @@ struct brook_seat_client {
     unsigned refs;
     int32_t pointer_x,pointer_y;
     uint32_t buttons;                       /* held buttons: implicit grab */
+    unsigned finger_axes;                   /* axes moved on the entered surface */
     uint32_t kb_mods_depressed;
     uint32_t kb_mods_locked;
     int keymap_fd;                          /* kept alive until client receives it */
@@ -1633,12 +1837,27 @@ static uint32_t next_serial(void) { return g_serial++; }
 
 #include "text-input-v3.h"
 
+static void pointer_stop_finger_scroll(struct brook_seat_client *sc, uint32_t now) {
+    const unsigned axes = sc->finger_axes;
+    sc->finger_axes = 0;
+    if (!axes || !sc->pointer || wl_resource_get_version(sc->pointer) < WL_POINTER_AXIS_STOP_SINCE_VERSION)
+        return;
+
+    wl_pointer_send_axis_source(sc->pointer, WL_POINTER_AXIS_SOURCE_FINGER);
+    if (axes & (1u << WL_POINTER_AXIS_VERTICAL_SCROLL))
+        wl_pointer_send_axis_stop(sc->pointer, now, WL_POINTER_AXIS_VERTICAL_SCROLL);
+    if (axes & (1u << WL_POINTER_AXIS_HORIZONTAL_SCROLL))
+        wl_pointer_send_axis_stop(sc->pointer, now, WL_POINTER_AXIS_HORIZONTAL_SCROLL);
+    wl_pointer_send_frame(sc->pointer);
+}
+
 static void seat_clients_scrub_surface(struct brook_surface *s) {
     for (struct brook_seat_client *sc = g_seat_clients; sc; sc = sc->next) {
         if (sc->entered_surface == s) {
             if (!sc->cursor_visible)
                 wm_set_cursor_visible(1);
             sc->entered_surface = NULL;
+            sc->finger_axes = 0;
         }
         if (sc->kb_focus == s) {
             text_input_focus(sc, NULL);
@@ -1655,6 +1874,7 @@ static void seat_clients_unmap_surface(struct brook_surface *s) {
     for(struct brook_seat_client *sc=g_seat_clients;sc;sc=sc->next) {
         if(sc->entered_surface==s && sc->pointer && s->resource &&
            wl_resource_get_client(s->resource)==sc->client) {
+            if (sc->finger_axes) pointer_stop_finger_scroll(sc, g_now_ms());
             wl_pointer_send_leave(sc->pointer,next_serial(),s->resource);
             if(wl_resource_get_version(sc->pointer)>=5)wl_pointer_send_frame(sc->pointer);
         }
@@ -1701,6 +1921,23 @@ static void pointer_set_cursor(struct wl_client *c, struct wl_resource *r,
     (void)c; (void)serial;
     struct brook_seat_client *sc = seat_for_resource(r);
     if (!sc) return;
+    /* Only the client with pointer focus may set the cursor. Xwayland moves
+     * its sprite to the root window on wl_pointer.leave (sent on the kernel's
+     * POINTER_LEFT since a243a68c) and sets the root "X" cursor; uploaded
+     * without an owner it showed over the desktop, taskbar and kernel
+     * windows. The surface still takes the cursor role, but uploads nothing
+     * until a set_cursor with focus gives it an owner. */
+    if (!sc->entered_surface) {
+        struct brook_surface *cs = surface ? wl_resource_get_user_data(surface) : NULL;
+        if (cs) {
+            if (cs->role && cs->role!=3) {
+                wl_resource_post_error(r,WL_POINTER_ERROR_ROLE,"surface already has a role");return;
+            }
+            cs->role=3;cs->is_cursor=1;cs->cursor_owner_wm=0;
+            cs->cursor_hot_x=hx;cs->cursor_hot_y=hy;
+        }
+        return;
+    }
     sc->cursor_visible = surface != NULL;
     seat_apply_cursor_visibility(sc);
 
@@ -1753,7 +1990,10 @@ static const struct wl_pointer_interface pointer_impl = {
 static void pointer_resource_destroy(struct wl_resource *r) {
     struct brook_seat_client *sc = seat_for_resource(r);
     pointer_objects_remove_pointer(r);
-    if (sc && sc->pointer == r) sc->pointer = NULL;
+    if (sc && sc->pointer == r) {
+        sc->pointer = NULL;
+        sc->finger_axes = 0;
+    }
     seat_unref(sc);
 }
 static void keyboard_release(struct wl_client *c, struct wl_resource *r) {
@@ -1830,7 +2070,7 @@ static void seat_get_pointer(struct wl_client *c, struct wl_resource *r, uint32_
                                                 wl_resource_get_version(r), id);
     if (!p) { wl_client_post_no_memory(c); return; }
     wl_resource_set_implementation(p, &pointer_impl, sc, pointer_resource_destroy);
-    if (sc) {sc->pointer = p;++sc->refs;}
+    if (sc) {sc->pointer = p;sc->finger_axes = 0;++sc->refs;}
 }
 static void seat_get_keyboard(struct wl_client *c, struct wl_resource *r, uint32_t id) {
     struct brook_seat_client *sc = seat_for_resource(r);
@@ -2031,10 +2271,12 @@ static void pointer_enter_if_needed(struct brook_seat_client *sc,
          * a different client.  Drop silently in that case. */
         struct wl_resource *prev = sc->entered_surface->resource;
         if (prev && wl_resource_get_client(prev) == sc->client) {
+            if (sc->finger_axes) pointer_stop_finger_scroll(sc, g_now_ms());
             wl_pointer_send_leave(sc->pointer, next_serial(), prev);
             if (wl_resource_get_version(sc->pointer) >= 5)
                 wl_pointer_send_frame(sc->pointer);
         }
+        sc->finger_axes = 0;
     }
     if (s) {
         wl_pointer_send_enter(sc->pointer, next_serial(), s->resource, lx, ly);
@@ -2092,6 +2334,22 @@ static struct brook_surface *pointer_target(struct brook_surface *root,struct br
     return target;
 }
 
+static void pointer_send_scroll_axis(struct wl_resource *pointer, uint32_t now,
+                                     uint32_t axis, int32_t v120, int32_t ticks, int finger) {
+    if (!v120) return;
+
+    const int version = wl_resource_get_version(pointer);
+    if (!finger) {
+        if (version >= WL_POINTER_AXIS_VALUE120_SINCE_VERSION)
+            wl_pointer_send_axis_value120(pointer, axis, v120);
+        else if (version >= WL_POINTER_AXIS_DISCRETE_SINCE_VERSION && ticks)
+            wl_pointer_send_axis_discrete(pointer, axis, ticks);
+    }
+    /* Round to the nearest 24.8 fixed-point value at ten pixels per tick. */
+    const int32_t scaled = v120 * 10 * 256;
+    wl_pointer_send_axis(pointer, now, axis, (scaled + (scaled < 0 ? -60 : 60)) / 120);
+}
+
 static void dispatch_surface_event(struct brook_surface *s,
                                    struct brook_seat_client *sc,
                                    struct brook_wm_event *e, uint32_t now) {
@@ -2107,6 +2365,7 @@ static void dispatch_surface_event(struct brook_surface *s,
         wl_pointer_send_motion(sc->pointer, now, lx, ly);
         if (wl_resource_get_version(sc->pointer) >= 5)
             wl_pointer_send_frame(sc->pointer);
+        latency_input_sent(sc->client, LATENCY_MOTION);
         pointer_constraints_refresh();
         break;
     }
@@ -2134,6 +2393,7 @@ static void dispatch_surface_event(struct brook_surface *s,
         wl_pointer_send_button(sc->pointer, next_serial(), now, btn, st);
         if (wl_resource_get_version(sc->pointer) >= 5)
             wl_pointer_send_frame(sc->pointer);
+        latency_input_sent(sc->client, LATENCY_BUTTON);
         fprintf(stderr, "[waylandd] btn wm=%u 0x%x %s at (%d,%d)\n",
                 s->wm_id, btn,
                 st == WL_POINTER_BUTTON_STATE_PRESSED ? "down" : "up",
@@ -2141,30 +2401,48 @@ static void dispatch_surface_event(struct brook_surface *s,
         break;
     }
     case EVT_MOUSE_SCROLL: {
-        if (!sc || !sc->pointer || (e->reserved && !pointer_event_token(s,e->reserved))) break;
-        if (!sc->buttons && sc->entered_surface && !pointer_surface_locked(s)) {
-            /* Scroll goes to the surface under the last pointer position. */
-            wl_fixed_t lx,ly;
-            struct brook_surface *target=pointer_target(s,sc,(int32_t)((int64_t)sc->pointer_x*surface_output_scale(s)),
-                                                       (int32_t)((int64_t)sc->pointer_y*surface_output_scale(s)),&lx,&ly);
+        if (!sc || !sc->pointer) break;
+        const int fine = e->mods & BROOK_WM_SCROLL_FINE;
+        if (!fine && e->reserved && !pointer_event_token(s, e->reserved)) break;
+        const int locked = pointer_surface_locked(s);
+        if (fine && locked) break;
+        if (fine && (e->mods & BROOK_WM_SCROLL_END)) {
+            struct brook_surface *root = sc->entered_surface;
+            while (root && root->subsurface_parent) root = root->subsurface_parent;
+            if (root == s) pointer_stop_finger_scroll(sc, now);
+            break;
+        }
+
+        /* Brook vertical is up positive. Wayland vertical is down positive. */
+        const int32_t dy_ticks = -(int8_t)e->scan;
+        const int32_t dx_ticks = (int8_t)e->ascii;
+        const int32_t dy_v120 = fine ? -(int32_t)e->x : dy_ticks * 120;
+        const int32_t dx_v120 = fine ? e->y : dx_ticks * 120;
+        if (!dx_v120 && !dy_v120) break;
+
+        if (!locked) {
+            const int16_t px = fine ? (int16_t)e->reserved : e->x;
+            const int16_t py = fine ? (int16_t)(e->reserved >> 16) : e->y;
+            sc->pointer_x = pointer_fixed_floor(surface_pointer_fixed(s, px));
+            sc->pointer_y = pointer_fixed_floor(surface_pointer_fixed(s, py));
+            wl_fixed_t lx, ly;
+            struct brook_surface *target = pointer_target(s, sc, px, py, &lx, &ly);
             pointer_enter_if_needed(sc, target, lx, ly);
         }
-            int32_t dy = (int8_t)e->scan;
-            /* Horizontal ticks travel in the ascii byte, positive right, which
-             * matches Wayland's horizontal axis (positive = right). */
-            int32_t dx = (int8_t)e->ascii;
-            /* Brook wheel ticks are positive upward; Wayland axis values
-             * are positive downward. */
-            if (dy)
-                wl_pointer_send_axis(sc->pointer, now,
-                                     WL_POINTER_AXIS_VERTICAL_SCROLL,
-                                     wl_fixed_from_int(-dy * 10));
-            if (dx)
-                wl_pointer_send_axis(sc->pointer, now,
-                                     WL_POINTER_AXIS_HORIZONTAL_SCROLL,
-                                     wl_fixed_from_int(dx * 10));
-        if (wl_resource_get_version(sc->pointer) >= 5)
-            wl_pointer_send_frame(sc->pointer);
+        const int finger = fine && (e->mods & BROOK_WM_SCROLL_FINGER);
+        if (finger) {
+            if (dy_v120) sc->finger_axes |= 1u << WL_POINTER_AXIS_VERTICAL_SCROLL;
+            if (dx_v120) sc->finger_axes |= 1u << WL_POINTER_AXIS_HORIZONTAL_SCROLL;
+        } else {
+            pointer_stop_finger_scroll(sc, now);
+        }
+        const int version = wl_resource_get_version(sc->pointer);
+        if (version >= WL_POINTER_AXIS_SOURCE_SINCE_VERSION)
+            wl_pointer_send_axis_source(sc->pointer, finger ? WL_POINTER_AXIS_SOURCE_FINGER : WL_POINTER_AXIS_SOURCE_WHEEL);
+        pointer_send_scroll_axis(sc->pointer, now, WL_POINTER_AXIS_VERTICAL_SCROLL, dy_v120, dy_ticks, finger);
+        pointer_send_scroll_axis(sc->pointer, now, WL_POINTER_AXIS_HORIZONTAL_SCROLL, dx_v120, dx_ticks, finger);
+        if (version >= WL_POINTER_FRAME_SINCE_VERSION) wl_pointer_send_frame(sc->pointer);
+        latency_input_sent(sc->client, LATENCY_AXIS);
         break;
     }
     case EVT_KEY_PRESS:
@@ -2190,6 +2468,7 @@ static void dispatch_surface_event(struct brook_surface *s,
         uint32_t xkb_code = scancode_to_xkb(e->scan);
         wl_keyboard_send_key(sc->keyboard, next_serial(), now,
                              xkb_code, st);
+        latency_input_sent(sc->client, LATENCY_KEY);
 
         /* Send modifiers only when they changed — avoids double-toggle
          * where xkb_state_update_key already updated the modifier
@@ -2223,6 +2502,7 @@ static void dispatch_surface_event(struct brook_surface *s,
         struct brook_surface *root = sc->entered_surface;
         while (root->subsurface_parent) root = root->subsurface_parent;
         if (root != s) break;
+        pointer_stop_finger_scroll(sc, now);
         struct wl_resource *prev = sc->entered_surface->resource;
         if (prev && wl_resource_get_client(prev) == sc->client) {
             wl_pointer_send_leave(sc->pointer, next_serial(), prev);
@@ -2327,8 +2607,13 @@ static void pump_input_for_surface(struct brook_surface *surface) {
     if(!surface->wm_id)return;
     struct brook_wm_event events[16];
     long count=wm_pop_input(surface->wm_id,events,16);
+    g_input_batch_us = count > 0 ? g_now_us() : 0;
     uint32_t now=g_now_ms();
-    for(long i=0;i<count;++i)dispatch_window_event(surface,&events[i],now);
+    for(long i=0;i<count;++i) {
+        g_input_recorded = 0;
+        dispatch_window_event(surface,&events[i],now);
+    }
+    g_input_batch_us = 0;
 }
 
 static void pump_input_once(void) {
@@ -3318,7 +3603,7 @@ static void gpu_window_presented(const struct BrookGpuWindowIdentity *identity){
     for(struct brook_surface *s=g_surfaces;s;s=s->next){
         if(s->tree.parent || s->wm_id!=identity->window)continue;
         const struct brook_view *view=s->tree.current?s->tree.current->value:NULL;
-        surface_send_frame_callbacks_upto(s,now,view && view->image==match?UINT64_MAX:match->offer_tree_commit);
+        surface_send_frame_callbacks_upto(s,now,view && view->image==match?UINT64_MAX:match->offer_tree_commit,match);
     }
 }
 static void gpu_window_channel_drain(void){
@@ -4113,13 +4398,121 @@ static void dmabuf_bind(struct wl_client *client, void *data, uint32_t version,
 
 /* ---------------- main ---------------- */
 
-/* Live diagnostics: every 2 s, write $XDG_RUNTIME_DIR (or /tmp)/brook-waylandd-<display>.json
+static void latency_stats_reset(void) {
+    ++g_stats_epoch;
+    struct client_latency *client;
+    wl_list_for_each(client, &g_latency_clients, link)
+        client->data = (struct client_latency_data){0};
+    for (struct brook_surface *s = g_surfaces; s; s = s->next)
+        s->latency = (struct frame_latency){0};
+}
+
+static void latency_stats_check_reset(const char *path) {
+    static struct stat consumed;
+    static int retained_marker;
+    struct stat marker;
+    if (lstat(path, &marker) != 0) {
+        if (errno == ENOENT) retained_marker = 0;
+        return;
+    }
+    if (!S_ISREG(marker.st_mode) || (marker.st_uid != 0 && marker.st_uid != geteuid())) return;
+
+    /* A non-root provider cannot unlink root's marker from sticky /tmp.
+     * Acknowledge that version once and treat a later touch as a new request. */
+    if (retained_marker && marker.st_dev == consumed.st_dev && marker.st_ino == consumed.st_ino &&
+        marker.st_mtim.tv_sec == consumed.st_mtim.tv_sec && marker.st_mtim.tv_nsec == consumed.st_mtim.tv_nsec &&
+        marker.st_ctim.tv_sec == consumed.st_ctim.tv_sec && marker.st_ctim.tv_nsec == consumed.st_ctim.tv_nsec)
+        return;
+    if (unlink(path) == 0) {
+        retained_marker = 0;
+    } else {
+        if (errno == ENOENT) return;
+        consumed = marker;
+        retained_marker = 1;
+    }
+    latency_stats_reset();
+}
+
+static void latency_hist_json(FILE *f, const struct latency_hist *hist) {
+    fprintf(f, "{\"count\":%llu,\"max_us\":%llu,\"buckets\":[",
+            (unsigned long long)hist->count, (unsigned long long)hist->max_us);
+    for (unsigned i = 0; i < LATENCY_BUCKETS; ++i)
+        fprintf(f, "%s%llu", i ? "," : "", (unsigned long long)hist->buckets[i]);
+    fputs("]", f);
+}
+
+static void latency_frame_json(FILE *f, const struct frame_latency *frame) {
+    latency_hist_json(f, &frame->hist);
+    const struct frame_latency_event *e = &frame->worst;
+    if (!frame->hist.count) {
+        fputs(",\"worst\":null}", f);
+        return;
+    }
+    fprintf(f, ",\"worst\":{\"done_us\":%llu,\"commit\":%llu,\"current_commit\":%llu,"
+               "\"surface_object\":%u,\"root_wm\":%u,\"frames\":{\"state\":\"%s\","
+               "\"pending\":%d,\"waiting\":%d,\"committed\":%d},\"offer_state\":",
+            (unsigned long long)e->done_us, (unsigned long long)e->commit, (unsigned long long)e->current_commit,
+            e->surface_object, e->root_wm, e->frames_state, e->pending, e->waiting, e->committed);
+    if (e->offer_state < 0) fputs("null", f);
+    else fprintf(f, "%d", e->offer_state);
+    fprintf(f, ",\"renderer_presented\":%s}}",
+            e->renderer_presented < 0 ? "null" : e->renderer_presented ? "true" : "false");
+}
+
+static void latency_stats_json(FILE *f) {
+    fprintf(f, "\"latency\":{\"stats_epoch\":%llu,\"bucket_upper_ms\":[",
+            (unsigned long long)g_stats_epoch);
+    for (unsigned i = 0; i + 1 < LATENCY_BUCKETS; ++i)
+        fprintf(f, "%u,", latency_bounds_ms[i]);
+    fprintf(f, "null],\"axis_burst_break_us\":%u,\"kernel_input_timestamp_available\":false,\"clients\":[",
+            LATENCY_AXIS_BURST_US);
+    int first = 1;
+    struct client_latency *client;
+    wl_list_for_each(client, &g_latency_clients, link) {
+        fprintf(f, "%s{\"pid\":%d,\"connection\":%llu,\"commit_to_callback_done\":",
+                first ? "" : ",", (int)client->pid, (unsigned long long)client->connection);
+        first = 0;
+        latency_frame_json(f, &client->data.commit_to_done);
+        fputs(",\"callback_done_to_next_commit\":", f);
+        latency_hist_json(f, &client->data.done_to_commit);
+        fputs("},\"input_receive_to_queue\":{", f);
+        static const char *kinds[] = {"motion", "axis", "button", "key"};
+        for (unsigned i = 0; i < LATENCY_INPUT_KINDS; ++i) {
+            fprintf(f, "%s\"%s\":", i ? "," : "", kinds[i]);
+            latency_hist_json(f, &client->data.input[i]);
+            fputc('}', f);
+        }
+        fprintf(f, "},\"axis_burst_max_gap_us\":%llu}", (unsigned long long)client->data.axis_burst_max_gap_us);
+    }
+    fputs("],\"toplevels\":[", f);
+    first = 1;
+    for (struct brook_surface *s = g_surfaces; s; s = s->next) {
+        if (!s->resource || latency_toplevel(s) != s) continue;
+        struct wl_listener *listener = wl_client_get_destroy_listener(wl_resource_get_client(s->resource), latency_client_destroy);
+        if (!listener) continue;
+        client = wl_container_of(listener, client, destroy);
+        fprintf(f, "%s{\"pid\":%d,\"connection\":%llu,\"object\":%u,\"wm\":%u,\"role\":%d,"
+                   "\"commit_to_callback_done\":",
+                first ? "" : ",", (int)client->pid, (unsigned long long)client->connection,
+                wl_resource_get_id(s->resource), s->wm_id, s->role);
+        first = 0;
+        latency_frame_json(f, &s->latency);
+        fputc('}', f);
+    }
+    fputs("]}", f);
+}
+
+/* Live diagnostics: write $XDG_RUNTIME_DIR (or /tmp)/brook-waylandd-<display>.json
  * atomically, so the bridge can read why windows are composed on the CPU
  * without restarting the provider. */
 static void waylandd_status_write(const char *display){
     static uint32_t last;const uint32_t now=g_now_ms();
-    if(last && now-last<2000)return;
+    /* Leave slack for the normal 16 ms dispatch tick. Idle providers keep
+     * the old 2 s publication cadence. Open clients include stalled ones. */
+    const uint32_t interval_ms = wl_list_empty(&g_latency_clients) ? 2000 : 200;
+    if(last && now-last<interval_ms)return;
     last=now?now:1;
+    latency_stats_check_reset("/tmp/brook-waylandd-stats-reset");
     const char *dir=getenv("XDG_RUNTIME_DIR");if(!dir || !*dir)dir="/tmp";
     char path[256],tmp[272];
     if(snprintf(path,sizeof(path),"%s/brook-waylandd-%s.json",dir,display)>=(int)sizeof(path))return;
@@ -4182,7 +4575,9 @@ static void waylandd_status_write(const char *display){
         if(!x->wm_id && !x->xdg_toplevel && !x->subsurface_parent && x->role!=4)continue;
         if(!first)fputc(',',f);
         first=0;++listed;surface_status_json(f,x,now);}
-    fprintf(f,"]}\n");
+    fprintf(f,"],\"stats_epoch\":%llu,", (unsigned long long)g_stats_epoch);
+    latency_stats_json(f);
+    fprintf(f,"}\n");
     if(fclose(f)==0)rename(tmp,path);else unlink(tmp);
 }
 /* 1 when a server accepts connections on dir/name (a stale file refuses). */
@@ -4290,8 +4685,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "[waylandd] WARN: wl_display_init_shm failed\n");
 
     if (!wl_global_create(g_display, &wl_compositor_interface, 4, NULL, compositor_bind)) return 1;
-    if (!wl_global_create(g_display, &xdg_wm_base_interface, 3, NULL, wm_base_bind)) return 1;
-    if (!wl_global_create(g_display, &wl_seat_interface, 5, NULL, seat_bind)) return 1;
+    if (!wl_global_create(g_display, &xdg_wm_base_interface, BROOK_XDG_WM_BASE_VERSION, NULL, wm_base_bind)) return 1;
+    if (!wl_global_create(g_display, &wl_seat_interface, WL_POINTER_AXIS_VALUE120_SINCE_VERSION,
+                          NULL, seat_bind)) return 1;
     if (!wl_global_create(g_display,&zwp_relative_pointer_manager_v1_interface,1,NULL,relative_manager_bind)) return 1;
     if (!wl_global_create(g_display,&zwp_pointer_constraints_v1_interface,1,NULL,pointer_constraints_bind)) return 1;
     if (!wl_global_create(g_display, &zwp_text_input_manager_v3_interface, 1, NULL, text_input_manager_bind)) return 1;

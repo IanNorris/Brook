@@ -11,10 +11,27 @@
  * frames) is dropped, so a replaced buffer is not pinned for long while the
  * wallpaper survives long runs of game-only frames that never sample it. */
 enum { QUAD_CACHE_SLOTS=48, QUAD_CACHE_MAX_AGE=120, QUAD_FRAME_SLOTS=BROOK_VK_MAX_LAYERS+1 };
-enum { QUAD_MODE_STRAIGHT=1, QUAD_MODE_OPAQUE=2, QUAD_MODE_OVER_ZERO=4, QUAD_MODE_SAMPLER=8, QUAD_MODE_DIVIDE=16, QUAD_MODE_READ=32 };
-enum { QUAD_PIPELINE_STRAIGHT=0, QUAD_PIPELINE_PREMULTIPLIED=1, QUAD_PIPELINE_NONE=2, QUAD_PIPELINES=3 };
+enum { QUAD_MODE_STRAIGHT=1, QUAD_MODE_OPAQUE=2, QUAD_MODE_OVER_ZERO=4, QUAD_MODE_SAMPLER=8, QUAD_MODE_DIVIDE=16, QUAD_MODE_READ=32,
+       QUAD_MODE_UP=256, QUAD_MODE_BOX=512 };
+enum { QUAD_PIPELINE_STRAIGHT=0, QUAD_PIPELINE_PREMULTIPLIED=1, QUAD_PIPELINE_NONE=2, QUAD_PIPELINE_GLASS=3,
+       QUAD_PIPELINE_CAPTURE=4, QUAD_PIPELINE_FILTER=5, QUAD_PIPELINES=6 };
 struct QuadPush {int32_t rect[4];float invHalf[2];int32_t dst[2];uint32_t dstSize[2],src[2],srcSize[2];float scale[2];uint32_t opacity,mode;};
 _Static_assert(sizeof(struct QuadPush)==72,"quad push constant layout");
+struct QuadGlassPush {
+    struct QuadPush quad;
+    uint32_t padding[2];
+    struct QuadRect screen,atlas;
+    uint32_t radius;
+};
+_Static_assert(offsetof(struct QuadGlassPush,screen)==80 && sizeof(struct QuadGlassPush)==116,"glass push layout");
+/* quad_backdrop.frag's push block (within the guaranteed 128 bytes). */
+struct QuadBackdropPush {
+    struct QuadPush quad;
+    int32_t origin[2],limit[2],clip0[2],clip1[2],hole0[2],hole1[2];
+    uint32_t block;
+};
+_Static_assert(offsetof(struct QuadBackdropPush,origin)==72 && sizeof(struct QuadBackdropPush)==124,"backdrop push layout");
+enum { QUAD_TIMESTAMP_COUNT=4+QUAD_BACKDROP_TILES*8 };
 
 /* One imported linear BGRA8 image. live: slot holds an import. set: the sampled
  * source descriptor, or for an output its input-attachment descriptor. */
@@ -23,17 +40,34 @@ struct QuadImage {
     uint32_t width,height,offsetWords,strideWords;VkImageUsageFlags usage;
     int pin,live;uint64_t modifier;
     VkImage image;VkDeviceMemory memory;VkImageView view;VkDescriptorSet set;VkFramebuffer framebuffer;
+    VkDescriptorSet linear; /* sampled with linearSampler (backdrop capture), made on first use */
 };
 struct BrookVkQuadPass {
     VkPhysicalDevice physical;VkDevice device;VkQueue queue;uint32_t family;
     VkDescriptorSetLayout setLayout,inputLayout;VkDescriptorPool pool;int fixedBlend;VkPipelineLayout layout;VkRenderPass renderPass;
-    VkShaderModule vertex,fragment;VkSampler sampler;VkPipeline pipeline[QUAD_PIPELINES];
+    VkShaderModule vertex,fragment,glassFragment,captureFragment,filterFragment;VkSampler sampler,atlasSampler,linearSampler;VkPipeline pipeline[QUAD_PIPELINES];
+    int linearSources; /* linear-tiled BGRA8 supports filtering: the capture may box 2x2 with one tap */
     VkCommandPool commandPool;VkCommandBuffer command;VkFence fence;
     VkQueryPool timestamps;uint32_t timestampBits;float timestampPeriod;uint64_t gpuNs;int gpuValid;
     PFN_vkGetMemoryFdPropertiesKHR getFdProperties;PFN_vkImportSemaphoreFdKHR importSemaphore;int modifiers;
     uint64_t sourceModifiers[BROOK_VK_MAX_LAYERS];
     struct QuadImage cache[QUAD_CACHE_SLOTS],frame[QUAD_FRAME_SLOTS];unsigned frameCount;
     VkSemaphore wait[BROOK_VK_MAX_LAYERS];unsigned waitCount;
+    /* The backdrop atlas: atlas holds mip 0's view, input-attachment set and
+     * framebuffer; atlasLevel and atlasFramebuffer the other mips';
+     * atlasSample[m] samples mip m alone (linear). atlasBuilt lists the keys
+     * of the tiles whose texels are current (the last glass frame's). */
+    struct QuadImage atlas;
+    VkImageView atlasLevel[QUAD_BACKDROP_MIPS];VkFramebuffer atlasFramebuffer[QUAD_BACKDROP_MIPS];
+    VkDescriptorSet atlasSample[QUAD_BACKDROP_MIPS];
+    uint64_t atlasBuilt[QUAD_BACKDROP_TILES];unsigned atlasBuiltCount;int atlasInitialized;
+    /* Timestamps for the blur only (BROOK_RENDER_BLUR without
+     * BROOK_RENDER_GPU_TIMESTAMPS): no per-chrome-draw pairs. */
+    int timingBlurOnly;
+    unsigned timestampNext;
+    uint8_t timestampClass[QUAD_TIMESTAMP_COUNT/2];
+    int atlasTimed,chromeTimed,timingOverflow;
+    struct BrookVkBackdropStats backdropStats;
     uint64_t clock;int pending,uncertain;VkResult lastResult;
     struct BrookVkQuadStats stats;
 };
@@ -41,6 +75,7 @@ struct BrookVkQuadPass {
 static void image_destroy(BrookVkQuadPass *p,struct QuadImage *m){
     if(m->framebuffer)vkDestroyFramebuffer(p->device,m->framebuffer,NULL);
     if(m->set)vkFreeDescriptorSets(p->device,p->pool,1,&m->set);
+    if(m->linear)vkFreeDescriptorSets(p->device,p->pool,1,&m->linear);
     if(m->view)vkDestroyImageView(p->device,m->view,NULL);
     if(m->image)vkDestroyImage(p->device,m->image,NULL);
     if(m->memory)vkFreeMemory(p->device,m->memory,NULL);
@@ -54,10 +89,27 @@ static void frame_cleanup(BrookVkQuadPass *p){
     p->waitCount=0;
 }
 
+static void atlas_destroy(BrookVkQuadPass *p){
+    for(unsigned m=0;m<QUAD_BACKDROP_MIPS;++m){
+        if(p->atlasSample[m])vkFreeDescriptorSets(p->device,p->pool,1,&p->atlasSample[m]);
+        if(m && p->atlasFramebuffer[m])vkDestroyFramebuffer(p->device,p->atlasFramebuffer[m],NULL);
+        if(m && p->atlasLevel[m])vkDestroyImageView(p->device,p->atlasLevel[m],NULL);
+        p->atlasSample[m]=VK_NULL_HANDLE;p->atlasFramebuffer[m]=VK_NULL_HANDLE;p->atlasLevel[m]=VK_NULL_HANDLE;
+    }
+    image_destroy(p,&p->atlas);
+    if(p->atlasSampler)vkDestroySampler(p->device,p->atlasSampler,NULL);
+    if(p->linearSampler)vkDestroySampler(p->device,p->linearSampler,NULL);
+    p->atlasSampler=p->linearSampler=VK_NULL_HANDLE;p->atlasBuiltCount=0;p->atlasInitialized=0;
+}
+
 int brook_vk_quad_pass_destroy(BrookVkQuadPass *p){
     if(!p)return 1;
     if(p->pending || p->uncertain)return 0;
     frame_cleanup(p);
+    atlas_destroy(p);
+    if(p->glassFragment)vkDestroyShaderModule(p->device,p->glassFragment,NULL);
+    if(p->captureFragment)vkDestroyShaderModule(p->device,p->captureFragment,NULL);
+    if(p->filterFragment)vkDestroyShaderModule(p->device,p->filterFragment,NULL);
     for(unsigned i=0;i<QUAD_CACHE_SLOTS;++i)image_destroy(p,&p->cache[i]);
     if(p->fence)vkDestroyFence(p->device,p->fence,NULL);
     if(p->timestamps)vkDestroyQueryPool(p->device,p->timestamps,NULL);
@@ -81,6 +133,7 @@ BrookVkQuadPass *brook_vk_quad_pass_create(VkPhysicalDevice physical,VkDevice de
         VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;
     if((format.linearTilingFeatures&needed)!=needed)return NULL;
     BrookVkQuadPass *p=calloc(1,sizeof(*p));if(!p)return NULL;
+    p->atlas.pin=-1;
     p->physical=physical;p->device=device;p->queue=queue;p->family=family;
     for(unsigned i=0;i<QUAD_CACHE_SLOTS;++i)p->cache[i].pin=-1;
     for(unsigned i=0;i<QUAD_FRAME_SLOTS;++i)p->frame[i].pin=-1;
@@ -89,14 +142,16 @@ BrookVkQuadPass *brook_vk_quad_pass_create(VkPhysicalDevice physical,VkDevice de
     p->importSemaphore=(PFN_vkImportSemaphoreFdKHR)vkGetDeviceProcAddr(device,"vkImportSemaphoreFdKHR");
     if(!p->getFdProperties)goto fail;
     VkPhysicalDeviceProperties props;vkGetPhysicalDeviceProperties(physical,&props);
-    if(props.limits.maxPushConstantsSize<sizeof(struct QuadPush))goto fail;
-    if(getenv("BROOK_RENDER_GPU_TIMESTAMPS")){
+    if(props.limits.maxPushConstantsSize<sizeof(struct QuadGlassPush))goto fail;
+    const char *blur=getenv("BROOK_RENDER_BLUR"),*blurTiming=getenv("BROOK_RENDER_BLUR_TIMING");
+    p->timingBlurOnly=!getenv("BROOK_RENDER_GPU_TIMESTAMPS") && blur && !strcmp(blur,"1") && !(blurTiming && blurTiming[0]=='0');
+    if(getenv("BROOK_RENDER_GPU_TIMESTAMPS") || p->timingBlurOnly){
         uint32_t n=0;vkGetPhysicalDeviceQueueFamilyProperties(physical,&n,NULL);
         if(!n || n>64 || family>=n)goto fail;
         VkQueueFamilyProperties q[64];vkGetPhysicalDeviceQueueFamilyProperties(physical,&n,q);
         p->timestampBits=q[family].timestampValidBits;p->timestampPeriod=props.limits.timestampPeriod;
         if(p->timestampBits && p->timestampBits<=64 && p->timestampPeriod>0){
-            VkQueryPoolCreateInfo query={.sType=VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,.queryType=VK_QUERY_TYPE_TIMESTAMP,.queryCount=2};
+            VkQueryPoolCreateInfo query={.sType=VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,.queryType=VK_QUERY_TYPE_TIMESTAMP,.queryCount=QUAD_TIMESTAMP_COUNT};
             OK(vkCreateQueryPool(device,&query,NULL,&p->timestamps));
         }
     }
@@ -106,15 +161,16 @@ BrookVkQuadPass *brook_vk_quad_pass_create(VkPhysicalDevice physical,VkDevice de
     OK(vkCreateDescriptorSetLayout(device,&dl,NULL,&p->setLayout));
     binding.descriptorType=VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
     OK(vkCreateDescriptorSetLayout(device,&dl,NULL,&p->inputLayout));
-    VkDescriptorPoolSize sizes[2]={{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,QUAD_CACHE_SLOTS+QUAD_FRAME_SLOTS},
-                                   {VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,QUAD_CACHE_SLOTS+QUAD_FRAME_SLOTS}};
+    /* Each image: a sampled or input set, and a linear set for the backdrop. */
+    VkDescriptorPoolSize sizes[2]={{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,2*(QUAD_CACHE_SLOTS+QUAD_FRAME_SLOTS)+1+QUAD_BACKDROP_MIPS},
+                                   {VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,QUAD_CACHE_SLOTS+QUAD_FRAME_SLOTS+2}};
     VkDescriptorPoolCreateInfo dp={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,.flags=VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-        .maxSets=QUAD_CACHE_SLOTS+QUAD_FRAME_SLOTS,.poolSizeCount=2,.pPoolSizes=sizes};
+        .maxSets=2*(QUAD_CACHE_SLOTS+QUAD_FRAME_SLOTS)+2+QUAD_BACKDROP_MIPS,.poolSizeCount=2,.pPoolSizes=sizes};
     OK(vkCreateDescriptorPool(device,&dp,NULL,&p->pool));
     p->fixedBlend=getenv("BROOK_RENDER_QUAD_FIXED_BLEND")!=NULL;
-    VkPushConstantRange push={.stageFlags=VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,.offset=0,.size=sizeof(struct QuadPush)};
-    const VkDescriptorSetLayout setLayouts[2]={p->setLayout,p->inputLayout};
-    VkPipelineLayoutCreateInfo pl={.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,.setLayoutCount=2,.pSetLayouts=setLayouts,
+    VkPushConstantRange push={.stageFlags=VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,.offset=0,.size=sizeof(struct QuadGlassPush)};
+    const VkDescriptorSetLayout setLayouts[3]={p->setLayout,p->inputLayout,p->setLayout};
+    VkPipelineLayoutCreateInfo pl={.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,.setLayoutCount=3,.pSetLayouts=setLayouts,
         .pushConstantRangeCount=1,.pPushConstantRanges=&push};
     OK(vkCreatePipelineLayout(device,&pl,NULL,&p->layout));
     /* Unnormalized nearest sampling: texel floor(coordinate) on each axis. */
@@ -149,6 +205,12 @@ BrookVkQuadPass *brook_vk_quad_pass_create(VkPhysicalDevice physical,VkDevice de
     OK(vkCreateShaderModule(device,&sm,NULL,&p->vertex));
     sm.codeSize=sizeof(quadFragmentCode);sm.pCode=quadFragmentCode;
     OK(vkCreateShaderModule(device,&sm,NULL,&p->fragment));
+    sm.codeSize=sizeof(quadBlurCode);sm.pCode=quadBlurCode;
+    OK(vkCreateShaderModule(device,&sm,NULL,&p->glassFragment));
+    sm.codeSize=sizeof(quadBackdropCaptureCode);sm.pCode=quadBackdropCaptureCode;
+    OK(vkCreateShaderModule(device,&sm,NULL,&p->captureFragment));
+    sm.codeSize=sizeof(quadBackdropFilterCode);sm.pCode=quadBackdropFilterCode;
+    OK(vkCreateShaderModule(device,&sm,NULL,&p->filterFragment));
     VkPipelineShaderStageCreateInfo stages[2]={
         {.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_VERTEX_BIT,.module=p->vertex,.pName="main"},
         {.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_FRAGMENT_BIT,.module=p->fragment,.pName="main"}};
@@ -169,10 +231,15 @@ BrookVkQuadPass *brook_vk_quad_pass_create(VkPhysicalDevice physical,VkDevice de
         {.blendEnable=VK_TRUE,.srcColorBlendFactor=VK_BLEND_FACTOR_ONE,.dstColorBlendFactor=VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
          .colorBlendOp=VK_BLEND_OP_ADD,.srcAlphaBlendFactor=VK_BLEND_FACTOR_ONE,.dstAlphaBlendFactor=VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
          .alphaBlendOp=VK_BLEND_OP_ADD,.colorWriteMask=15},
+        {.blendEnable=VK_FALSE,.colorWriteMask=15},
+        {.blendEnable=VK_FALSE,.colorWriteMask=15},
+        {.blendEnable=VK_FALSE,.colorWriteMask=15},
         {.blendEnable=VK_FALSE,.colorWriteMask=15}};
     VkDynamicState dynamicStates[]={VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo dynamic={.sType=VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,.dynamicStateCount=2,.pDynamicStates=dynamicStates};
     for(unsigned i=0;i<QUAD_PIPELINES;++i){
+        stages[1].module=i==QUAD_PIPELINE_GLASS?p->glassFragment:i==QUAD_PIPELINE_CAPTURE?p->captureFragment:
+            i==QUAD_PIPELINE_FILTER?p->filterFragment:p->fragment;
         VkPipelineColorBlendStateCreateInfo cb={.sType=VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,.attachmentCount=1,.pAttachments=&blends[i]};
         VkGraphicsPipelineCreateInfo pipeline={.sType=VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,.stageCount=2,.pStages=stages,
             .pVertexInputState=&vin,.pInputAssemblyState=&ia,.pViewportState=&vp,.pRasterizationState=&raster,
@@ -347,19 +414,293 @@ static uint32_t fetch_mode(const uint32_t *l){
     return x && y?QUAD_MODE_SAMPLER:QUAD_MODE_DIVIDE;
 }
 
-static BrookVkResult quad_pass_submit(BrookVkQuadPass *p,const uint32_t *scene,size_t words,
+static VkRect2D quad_vk_rect(struct QuadRect r){
+    return (VkRect2D){{r.x0,r.y0},{(uint32_t)(r.x1-r.x0),(uint32_t)(r.y1-r.y0)}};
+}
+
+int brook_vk_quad_pass_enable_backdrop(BrookVkQuadPass *p)
+{
+    if(!p)return 0;
+    if(p->atlas.framebuffer)return 1;
+    struct QuadImage *a=&p->atlas;
+    VkFormatProperties properties;
+    vkGetPhysicalDeviceFormatProperties(p->physical,VK_FORMAT_B8G8R8A8_UNORM,&properties);
+    if(!(properties.optimalTilingFeatures&VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT))return 0;
+    const VkImageCreateInfo info={.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,.imageType=VK_IMAGE_TYPE_2D,
+        .format=VK_FORMAT_B8G8R8A8_UNORM,.extent={QUAD_BACKDROP_WIDTH,QUAD_BACKDROP_HEIGHT,1},.mipLevels=QUAD_BACKDROP_MIPS,
+        .arrayLayers=1,.samples=VK_SAMPLE_COUNT_1_BIT,.tiling=VK_IMAGE_TILING_OPTIMAL,
+        .usage=VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT|VK_IMAGE_USAGE_SAMPLED_BIT,
+        .sharingMode=VK_SHARING_MODE_EXCLUSIVE,.initialLayout=VK_IMAGE_LAYOUT_UNDEFINED};
+    if(vkCreateImage(p->device,&info,NULL,&a->image)!=VK_SUCCESS){a->image=VK_NULL_HANDLE;goto fail;}
+    VkMemoryRequirements requirements;vkGetImageMemoryRequirements(p->device,a->image,&requirements);
+    VkPhysicalDeviceMemoryProperties props;vkGetPhysicalDeviceMemoryProperties(p->physical,&props);
+    uint32_t type=0;
+    while(type<props.memoryTypeCount && (!(requirements.memoryTypeBits&(1u<<type)) ||
+          !(props.memoryTypes[type].propertyFlags&VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)))++type;
+    if(type==props.memoryTypeCount)goto fail;
+    const VkMemoryAllocateInfo allocate={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize=requirements.size,.memoryTypeIndex=type};
+    if(vkAllocateMemory(p->device,&allocate,NULL,&a->memory)!=VK_SUCCESS){a->memory=VK_NULL_HANDLE;goto fail;}
+    if(vkBindImageMemory(p->device,a->image,a->memory,0)!=VK_SUCCESS)goto fail;
+    const VkSamplerCreateInfo sampler={.sType=VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,.magFilter=VK_FILTER_LINEAR,
+        .minFilter=VK_FILTER_LINEAR,.mipmapMode=VK_SAMPLER_MIPMAP_MODE_NEAREST,
+        .addressModeU=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,.addressModeV=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeW=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE};
+    if(vkCreateSampler(p->device,&sampler,NULL,&p->atlasSampler)!=VK_SUCCESS){p->atlasSampler=VK_NULL_HANDLE;goto fail;}
+    /* Unnormalized bilinear taps of scene layers at 2x2 corners. */
+    p->linearSources=(properties.linearTilingFeatures&VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)!=0;
+    const VkSamplerCreateInfo linear={.sType=VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,.magFilter=VK_FILTER_LINEAR,.minFilter=VK_FILTER_LINEAR,
+        .mipmapMode=VK_SAMPLER_MIPMAP_MODE_NEAREST,.addressModeU=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeV=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,.addressModeW=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .unnormalizedCoordinates=VK_TRUE};
+    if(vkCreateSampler(p->device,&linear,NULL,&p->linearSampler)!=VK_SUCCESS){p->linearSampler=VK_NULL_HANDLE;goto fail;}
+    /* One single-level view per mip: a pass draws one level while sampling
+     * its neighbour, so no view spans the attachment. */
+    for(unsigned m=0;m<QUAD_BACKDROP_MIPS;++m){
+        const VkImageViewCreateInfo view={.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,.image=a->image,
+            .viewType=VK_IMAGE_VIEW_TYPE_2D,.format=info.format,
+            .subresourceRange={.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT,.baseMipLevel=m,.levelCount=1,.layerCount=1}};
+        VkImageView *v=m?&p->atlasLevel[m]:&a->view;
+        if(vkCreateImageView(p->device,&view,NULL,v)!=VK_SUCCESS){*v=VK_NULL_HANDLE;goto fail;}
+        p->atlasLevel[m]=*v;
+        const VkFramebufferCreateInfo fb={.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,.renderPass=p->renderPass,
+            .attachmentCount=1,.pAttachments=v,.width=QUAD_BACKDROP_WIDTH>>m,.height=QUAD_BACKDROP_HEIGHT>>m,.layers=1};
+        VkFramebuffer *f=m?&p->atlasFramebuffer[m]:&a->framebuffer;
+        if(vkCreateFramebuffer(p->device,&fb,NULL,f)!=VK_SUCCESS){*f=VK_NULL_HANDLE;goto fail;}
+        p->atlasFramebuffer[m]=*f;
+        const VkDescriptorSetAllocateInfo ds={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,.descriptorPool=p->pool,
+            .descriptorSetCount=1,.pSetLayouts=&p->setLayout};
+        if(vkAllocateDescriptorSets(p->device,&ds,&p->atlasSample[m])!=VK_SUCCESS){p->atlasSample[m]=VK_NULL_HANDLE;goto fail;}
+        const VkDescriptorImageInfo sample={.sampler=p->atlasSampler,.imageView=*v,.imageLayout=VK_IMAGE_LAYOUT_GENERAL};
+        const VkWriteDescriptorSet write={.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=p->atlasSample[m],.descriptorCount=1,
+            .descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.pImageInfo=&sample};
+        vkUpdateDescriptorSets(p->device,1,&write,0,NULL);
+    }
+    const VkDescriptorSetAllocateInfo ds={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,.descriptorPool=p->pool,
+        .descriptorSetCount=1,.pSetLayouts=&p->inputLayout};
+    if(vkAllocateDescriptorSets(p->device,&ds,&a->set)!=VK_SUCCESS){a->set=VK_NULL_HANDLE;goto fail;}
+    const VkDescriptorImageInfo read={.imageView=a->view,.imageLayout=VK_IMAGE_LAYOUT_GENERAL};
+    const VkWriteDescriptorSet write={.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=a->set,.descriptorCount=1,
+        .descriptorType=VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,.pImageInfo=&read};
+    vkUpdateDescriptorSets(p->device,1,&write,0,NULL);
+    return 1;
+fail:
+    atlas_destroy(p);
+    return 0;
+}
+
+static void quad_blend_barrier(BrookVkQuadPass *p)
+{
+    const VkMemoryBarrier self={.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask=VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,.dstAccessMask=VK_ACCESS_INPUT_ATTACHMENT_READ_BIT};
+    vkCmdPipelineBarrier(p->command,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        VK_DEPENDENCY_BY_REGION_BIT,1,&self,0,NULL,0,NULL);
+}
+
+static int quad_chrome_begin(BrookVkQuadPass *p,unsigned category)
+{
+    if(!p->timestamps)return 0;
+    p->chromeTimed=1;
+    if(p->timestampNext+1>=QUAD_TIMESTAMP_COUNT){p->timingOverflow=1;return 0;}
+    p->timestampClass[p->timestampNext/2]=(uint8_t)category;
+    vkCmdWriteTimestamp(p->command,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,p->timestamps,p->timestampNext++);
+    return 1;
+}
+static void quad_chrome_end(BrookVkQuadPass *p,int recorded)
+{
+    if(recorded)vkCmdWriteTimestamp(p->command,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,p->timestamps,p->timestampNext++);
+}
+/* A tile's texels at mip m. */
+static struct QuadRect atlas_level_rect(const struct QuadBackdropTile *t,unsigned m)
+{
+    const int32_t x=t->atlas.x0>>m,y=t->atlas.y0>>m,s=1<<m;
+    return (struct QuadRect){x,y,x+(t->atlas.x1-t->atlas.x0+s-1)/s,y+(t->atlas.y1-t->atlas.y0+s-1)/s};
+}
+static struct QuadPush quad_layer_push(const uint32_t *scene,const uint32_t *l,struct QuadRect rect,uint32_t mode)
+{
+    return (struct QuadPush){
+        {rect.x0,rect.y0,rect.x1,rect.y1},{2.0f/(float)scene[0],2.0f/(float)scene[1]},
+        {(int32_t)l[8],(int32_t)l[9]},{l[10],l[11]},{l[4],l[5]},{l[6],l[7]},
+        {(float)l[6]/(float)l[10],(float)l[7]/(float)l[11]},l[16]&255u,
+        ((l[16]&BROOK_VK_STRAIGHT_ALPHA)?QUAD_MODE_STRAIGHT:0u)|
+        ((l[16]&BROOK_VK_OPAQUE_SOURCE)?QUAD_MODE_OPAQUE:0u)|mode|fetch_mode(l)};
+}
+static void quad_draw_rect(BrookVkQuadPass *p,const uint32_t *scene,const uint32_t *l,struct QuadRect rect,
+                           unsigned kind,const struct QuadBackdropTile *glass)
+{
+    const int blending=kind==QUAD_KIND_STRAIGHT || kind==QUAD_KIND_PREMULTIPLIED;
+    const int exact=glass || !p->fixedBlend;
+    const struct QuadGlassPush push={.quad=quad_layer_push(scene,l,rect,
+        (kind==QUAD_KIND_OVER_ZERO?QUAD_MODE_OVER_ZERO:0u)|((blending && exact) || glass?QUAD_MODE_READ:0u)),
+        .screen=glass?glass->capture:(struct QuadRect){0},
+        .atlas=glass?atlas_level_rect(glass,QUAD_BACKDROP_FINAL):(struct QuadRect){0},
+        .radius=glass?1u<<(glass->base+QUAD_BACKDROP_FINAL):0u};
+    vkCmdPushConstants(p->command,p->layout,VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,
+        0,sizeof(push),&push);
+    vkCmdDraw(p->command,4,1,0,0);
+}
+
+static void atlas_barrier(BrookVkQuadPass *p)
+{
+    const VkImageMemoryBarrier b={.sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask=VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        .dstAccessMask=VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        .oldLayout=VK_IMAGE_LAYOUT_GENERAL,.newLayout=VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,
+        .image=p->atlas.image,.subresourceRange={.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT,.levelCount=QUAD_BACKDROP_MIPS,.layerCount=1}};
+    vkCmdPipelineBarrier(p->command,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT|VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,0,0,NULL,0,NULL,1,&b);
+}
+/* A pass over mip m; area bounds the texels it draws. */
+static void atlas_begin(BrookVkQuadPass *p,unsigned m,unsigned pipeline,struct QuadRect area)
+{
+    const uint32_t w=QUAD_BACKDROP_WIDTH>>m,h=QUAD_BACKDROP_HEIGHT>>m;
+    const VkRenderPassBeginInfo pass={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,.renderPass=p->renderPass,
+        .framebuffer=p->atlasFramebuffer[m],.renderArea=quad_vk_rect(area)};
+    vkCmdBeginRenderPass(p->command,&pass,VK_SUBPASS_CONTENTS_INLINE);
+    const VkViewport view={0,0,(float)w,(float)h,0,1};
+    vkCmdSetViewport(p->command,0,1,&view);
+    vkCmdBindPipeline(p->command,VK_PIPELINE_BIND_POINT_GRAPHICS,p->pipeline[pipeline]);
+}
+
+/* The image's linear set, or VK_NULL_HANDLE (the capture then uses the
+ * exact per-pixel path). */
+static VkDescriptorSet image_linear(BrookVkQuadPass *p,struct QuadImage *m)
+{
+    if(m->linear || !p->linearSources || m->modifier)return m->linear;
+    const VkDescriptorSetAllocateInfo ds={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,.descriptorPool=p->pool,
+        .descriptorSetCount=1,.pSetLayouts=&p->setLayout};
+    if(vkAllocateDescriptorSets(p->device,&ds,&m->linear)!=VK_SUCCESS)return m->linear=VK_NULL_HANDLE;
+    const VkDescriptorImageInfo image={.sampler=p->linearSampler,.imageView=m->view,.imageLayout=VK_IMAGE_LAYOUT_GENERAL};
+    const VkWriteDescriptorSet write={.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=m->linear,.descriptorCount=1,
+        .descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.pImageInfo=&image};
+    vkUpdateDescriptorSets(p->device,1,&write,0,NULL);
+    return m->linear;
+}
+
+/* Capture, downsample and upsample the tiles marked in rebuild (see
+ * quad_backdrop.h). Tiles never overlap in the atlas, so the others keep
+ * their texels. */
+static void quad_capture_backdrop(BrookVkQuadPass *p,const uint32_t *scene,
+        struct QuadImage *const *images,const struct QuadBackdrop *backdrop,const struct QuadRect *holes,
+        const uint8_t *rebuild)
+{
+    unsigned deepest=0;
+    struct QuadRect area[QUAD_BACKDROP_MIPS];
+    for(unsigned m=0;m<QUAD_BACKDROP_MIPS;++m)area[m]=(struct QuadRect){INT32_MAX,INT32_MAX,0,0};
+    VkClearRect clears[QUAD_BACKDROP_TILES];unsigned n=0;
+    for(unsigned t=0;t<backdrop->count;++t)if(rebuild[t]){
+        const struct QuadBackdropTile *tile=&backdrop->tiles[t];
+        clears[n++]=(VkClearRect){quad_vk_rect(tile->atlas),0,1};
+        if(tile->mips>deepest)deepest=tile->mips;
+        for(unsigned m=0;m<=tile->mips;++m){
+            const struct QuadRect r=atlas_level_rect(tile,m);struct QuadRect *u=&area[m];
+            if(r.x0<u->x0)u->x0=r.x0;
+            if(r.y0<u->y0)u->y0=r.y0;
+            if(r.x1>u->x1)u->x1=r.x1;
+            if(r.y1>u->y1)u->y1=r.y1;
+        }
+    }
+    atlas_begin(p,0,QUAD_PIPELINE_CAPTURE,area[0]);
+    {
+        const VkClearAttachment clear={.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT,.clearValue={.color={{0,0,0,0}}}};
+        vkCmdClearAttachments(p->command,1,&clear,n,clears);
+    }
+    vkCmdBindDescriptorSets(p->command,VK_PIPELINE_BIND_POINT_GRAPHICS,p->layout,1,1,&p->atlas.set,0,NULL);
+    const float half[2]={2.0f/QUAD_BACKDROP_WIDTH,2.0f/QUAD_BACKDROP_HEIGHT};
+    for(unsigned t=0;t<backdrop->count;++t){
+        if(!rebuild[t])continue;
+        const struct QuadBackdropTile *tile=&backdrop->tiles[t];
+        const struct QuadRect c=tile->capture,a=tile->atlas;
+        const int32_t block=1<<tile->base;
+        const VkRect2D scissor=quad_vk_rect(a);
+        vkCmdSetScissor(p->command,0,1,&scissor);
+        for(unsigned i=quad_backdrop_bottom(scene,holes,tile);i<tile->below;++i){
+            const uint32_t *l=quad_backdrop_layer(scene,i);
+            const struct QuadRect r=quad_rect_intersect(quad_layer_bounds(l,scene[0],scene[1]),c);
+            if(!images[i] || quad_rect_empty(r) || (holes && quad_rect_contains(holes[i],r)))continue;
+            const struct QuadRect hole=holes?quad_rect_intersect(holes[i],r):(struct QuadRect){0};
+            /* Every texel whose block touches the piece. */
+            const struct QuadRect texels={a.x0+(r.x0-c.x0)/block,a.y0+(r.y0-c.y0)/block,
+                a.x0+(r.x1-c.x0+block-1)/block,a.y0+(r.y1-c.y0+block-1)/block};
+            struct QuadBackdropPush push={.quad=quad_layer_push(scene,l,texels,0),
+                .origin={c.x0-a.x0*block,c.y0-a.y0*block},.limit={c.x1-1,c.y1-1},
+                .clip0={r.x0,r.y0},.clip1={r.x1,r.y1},.block=(uint32_t)block};
+            if(!quad_rect_empty(hole)){push.hole0[0]=hole.x0;push.hole0[1]=hole.y0;push.hole1[0]=hole.x1;push.hole1[1]=hole.y1;}
+            push.quad.invHalf[0]=half[0];push.quad.invHalf[1]=half[1];
+            /* Unscaled opaque or premultiplied layers: covered 2x2 blocks take
+             * one bilinear tap (straight alpha would weight colour wrongly). */
+            const VkDescriptorSet linear=block==2 && !fetch_mode(l) &&
+                (!(l[16]&BROOK_VK_STRAIGHT_ALPHA) || (l[16]&BROOK_VK_OPAQUE_SOURCE))?image_linear(p,images[i]):VK_NULL_HANDLE;
+            if(linear)push.quad.mode|=QUAD_MODE_BOX;
+            quad_blend_barrier(p);
+            const VkDescriptorSet sets[3]={images[i]->set,p->atlas.set,linear?linear:images[i]->set};
+            vkCmdBindDescriptorSets(p->command,VK_PIPELINE_BIND_POINT_GRAPHICS,p->layout,0,3,sets,0,NULL);
+            vkCmdPushConstants(p->command,p->layout,VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,0,sizeof(push),&push);
+            vkCmdDraw(p->command,4,1,0,0);
+        }
+    }
+    vkCmdEndRenderPass(p->command);
+    /* Down to each tile's depth, then back up to the mip the glass samples. */
+    for(unsigned pass=0;pass+QUAD_BACKDROP_FINAL<2*deepest;++pass){
+        const int up=pass>=deepest;
+        const unsigned m=up?2*deepest-1-pass:pass+1,from=up?m+1:m-1;
+        atlas_barrier(p);
+        atlas_begin(p,m,QUAD_PIPELINE_FILTER,area[m]);
+        vkCmdBindDescriptorSets(p->command,VK_PIPELINE_BIND_POINT_GRAPHICS,p->layout,0,1,&p->atlasSample[from],0,NULL);
+        for(unsigned t=0;t<backdrop->count;++t){
+            const struct QuadBackdropTile *tile=&backdrop->tiles[t];
+            if(!rebuild[t] || (up?tile->mips<=m:tile->mips<m))continue;
+            const struct QuadRect dst=atlas_level_rect(tile,m),src=atlas_level_rect(tile,from);
+            const struct QuadBackdropPush push={.quad={.rect={dst.x0,dst.y0,dst.x1,dst.y1},
+                    .invHalf={2.0f/(float)(QUAD_BACKDROP_WIDTH>>m),2.0f/(float)(QUAD_BACKDROP_HEIGHT>>m)},
+                    .mode=up?QUAD_MODE_UP:0u},
+                .origin={src.x0,src.y0},.limit={src.x1,src.y1},.clip0={dst.x0,dst.y0},
+                .clip1={QUAD_BACKDROP_WIDTH>>from,QUAD_BACKDROP_HEIGHT>>from}};
+            const VkRect2D scissor=quad_vk_rect(dst);
+            vkCmdSetScissor(p->command,0,1,&scissor);
+            vkCmdPushConstants(p->command,p->layout,VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,0,sizeof(push),&push);
+            vkCmdDraw(p->command,4,1,0,0);
+        }
+        vkCmdEndRenderPass(p->command);
+    }
+    const VkImageMemoryBarrier ready={.sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask=VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,.dstAccessMask=VK_ACCESS_SHADER_READ_BIT,
+        .oldLayout=VK_IMAGE_LAYOUT_GENERAL,.newLayout=VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,
+        .image=p->atlas.image,.subresourceRange={.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT,.levelCount=QUAD_BACKDROP_MIPS,.layerCount=1}};
+    vkCmdPipelineBarrier(p->command,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        0,0,NULL,0,NULL,1,&ready);
+}
+
+static int atlas_built(const BrookVkQuadPass *p,uint64_t key)
+{
+    for(unsigned i=0;i<p->atlasBuiltCount;++i)if(p->atlasBuilt[i]==key)return 1;
+    return 0;
+}
+
+static BrookVkResult quad_pass_submit(BrookVkQuadPass *,const uint32_t *,size_t,
+        const struct BrookVkQuadSource *,size_t,const struct BrookVkQuadSource *,const struct QuadPlan *,
+        const struct QuadBackdrop *,const struct QuadRect *);
+
+BrookVkResult brook_vk_quad_pass_submit_backdrop(BrookVkQuadPass *p,const uint32_t *scene,size_t words,
         const struct BrookVkQuadSource *sources,size_t count,const struct BrookVkQuadSource *output,
-        const struct QuadPlan *plan);
-BrookVkResult brook_vk_quad_pass_submit(BrookVkQuadPass *p,const uint32_t *scene,size_t words,
-        const struct BrookVkQuadSource *sources,size_t count,const struct BrookVkQuadSource *output,
-        const struct QuadPlan *plan){
-    const BrookVkResult result=quad_pass_submit(p,scene,words,sources,count,output,plan);
-    if(p)memset(p->sourceModifiers,0,sizeof(p->sourceModifiers)); /* one submit only */
+        const struct QuadPlan *plan,const struct QuadBackdrop *backdrop,const struct QuadRect *holes)
+{
+    const BrookVkResult result=quad_pass_submit(p,scene,words,sources,count,output,plan,backdrop,holes);
+    if(p)memset(p->sourceModifiers,0,sizeof(p->sourceModifiers));
     return result;
 }
+BrookVkResult brook_vk_quad_pass_submit(BrookVkQuadPass *p,const uint32_t *scene,size_t words,
+        const struct BrookVkQuadSource *sources,size_t count,const struct BrookVkQuadSource *output,const struct QuadPlan *plan)
+{
+    return brook_vk_quad_pass_submit_backdrop(p,scene,words,sources,count,output,plan,NULL,NULL);
+}
+
 static BrookVkResult quad_pass_submit(BrookVkQuadPass *p,const uint32_t *scene,size_t words,
         const struct BrookVkQuadSource *sources,size_t count,const struct BrookVkQuadSource *output,
-        const struct QuadPlan *plan){
+        const struct QuadPlan *plan,const struct QuadBackdrop *backdrop,const struct QuadRect *holes)
+{
     if(!p || p->pending || p->uncertain || !scene || !sources || !output || !plan || !count || count>BROOK_VK_MAX_LAYERS ||
        words<BROOK_VK_SCENE_HEADER+count*BROOK_VK_LAYER_WORDS || scene[2]!=count || plan->width!=scene[0] || plan->height!=scene[1] ||
        !buffer_valid(&output->buffer) || output->buffer.syncFd!=-1 || output->buffer.offsetWords ||
@@ -386,6 +727,15 @@ static BrookVkResult quad_pass_submit(BrookVkQuadPass *p,const uint32_t *scene,s
         !quad_rect_contains(plan->bounds,plan->clears[i]))return BROOK_VK_REJECTED;
     uint8_t used[BROOK_VK_MAX_LAYERS]={0};
     for(uint32_t i=0;i<plan->drawCount;++i)used[plan->draws[i].layer]=1;
+    if(backdrop && backdrop->count && (!backdrop->key || backdrop->count>QUAD_BACKDROP_TILES))return BROOK_VK_REJECTED;
+    const int glass=backdrop && backdrop->count;
+    if(glass && !brook_vk_quad_pass_enable_backdrop(p))return BROOK_VK_REJECTED;
+    /* Recapture only tiles whose texels are not already current. */
+    uint8_t rebuildTile[QUAD_BACKDROP_TILES]={0};unsigned rebuildCount=0;
+    for(unsigned t=0;glass && t<backdrop->count;++t)
+        if(!atlas_built(p,backdrop->tiles[t].key)){rebuildTile[t]=1;++rebuildCount;}
+    const int rebuild=rebuildCount!=0;
+    if(rebuild)for(size_t i=0;i<count;++i)used[i]|=backdrop->used[i];
     struct stat ids[BROOK_VK_MAX_LAYERS],outputId;
     if(fstat(output->buffer.fd,&outputId) || !outputId.st_ino)return BROOK_VK_REJECTED;
     for(size_t i=0;i<count;++i)if(used[i]){
@@ -421,14 +771,14 @@ static BrookVkResult quad_pass_submit(BrookVkQuadPass *p,const uint32_t *scene,s
     if(vkResetCommandBuffer(p->command,0)!=VK_SUCCESS || vkResetFences(p->device,1,&p->fence)!=VK_SUCCESS)goto reject;
     VkCommandBufferBeginInfo begin={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     if(vkBeginCommandBuffer(p->command,&begin)!=VK_SUCCESS)goto reject;
-    p->gpuValid=0;
-    if(p->timestamps){vkCmdResetQueryPool(p->command,p->timestamps,0,2);
+    p->gpuValid=0;p->atlasTimed=p->chromeTimed=p->timingOverflow=0;p->timestampNext=4;
+    if(p->timestamps){vkCmdResetQueryPool(p->command,p->timestamps,0,QUAD_TIMESTAMP_COUNT);
         vkCmdWriteTimestamp(p->command,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,p->timestamps,0);}
     /* Acquire every image from its external owner (the producer, the CPU
      * or the presenter). External memory images are created UNDEFINED; like
      * other dma-buf compositors, treat the external contents as GENERAL so
      * the acquire preserves them. */
-    VkImageMemoryBarrier barriers[BROOK_VK_MAX_LAYERS+1];uint32_t barrierCount=0;
+    VkImageMemoryBarrier barriers[BROOK_VK_MAX_LAYERS+2];uint32_t barrierCount=0;
     struct QuadImage *distinct[BROOK_VK_MAX_LAYERS+1];uint32_t distinctCount=0;
     distinct[distinctCount++]=target;
     for(size_t i=0;i<count;++i)if(images[i]){int seen=0;
@@ -442,10 +792,22 @@ static BrookVkResult quad_pass_submit(BrookVkQuadPass *p,const uint32_t *scene,s
             .srcQueueFamilyIndex=VK_QUEUE_FAMILY_EXTERNAL,.dstQueueFamilyIndex=p->family,.image=m->image,
             .subresourceRange={.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT,.levelCount=1,.layerCount=1}};
     }
+    if(rebuild && !p->atlasInitialized)barriers[barrierCount++]=(VkImageMemoryBarrier){
+        .sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .dstAccessMask=VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT|VK_ACCESS_INPUT_ATTACHMENT_READ_BIT,
+        .oldLayout=VK_IMAGE_LAYOUT_UNDEFINED,.newLayout=VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,
+        .image=p->atlas.image,.subresourceRange={.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT,.levelCount=QUAD_BACKDROP_MIPS,.layerCount=1}};
     VkMemoryBarrier host={.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER,.srcAccessMask=VK_ACCESS_HOST_WRITE_BIT,
         .dstAccessMask=VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_COLOR_ATTACHMENT_READ_BIT};
     vkCmdPipelineBarrier(p->command,VK_PIPELINE_STAGE_HOST_BIT|VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT|VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,0,1,&host,0,NULL,barrierCount,barriers);
+    if(rebuild){
+        if(p->timestamps)vkCmdWriteTimestamp(p->command,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,p->timestamps,2);
+        quad_capture_backdrop(p,scene,images,backdrop,holes,rebuildTile);
+        if(p->timestamps)vkCmdWriteTimestamp(p->command,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,p->timestamps,3);
+        p->atlasTimed=1;
+    }
     const struct QuadRect bounds=plan->bounds;
     VkRenderPassBeginInfo render={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,.renderPass=p->renderPass,.framebuffer=target->framebuffer,
         .renderArea={{bounds.x0,bounds.y0},{(uint32_t)(bounds.x1-bounds.x0),(uint32_t)(bounds.y1-bounds.y0)}}};
@@ -460,33 +822,46 @@ static BrookVkResult quad_pass_submit(BrookVkQuadPass *p,const uint32_t *scene,s
         vkCmdClearAttachments(p->command,1,&clear,plan->clearCount,rects);
     }
     vkCmdBindDescriptorSets(p->command,VK_PIPELINE_BIND_POINT_GRAPHICS,p->layout,1,1,&target->set,0,NULL);
+    if(glass)vkCmdBindDescriptorSets(p->command,VK_PIPELINE_BIND_POINT_GRAPHICS,p->layout,2,1,&p->atlasSample[QUAD_BACKDROP_FINAL],0,NULL);
     int boundPipeline=-1,boundLayer=-1,written=plan->clearCount!=0;
-    for(uint32_t i=0;i<plan->drawCount;++i){const struct QuadDraw *d=&plan->draws[i];
-        const uint32_t *l=scene+BROOK_VK_SCENE_HEADER+d->layer*BROOK_VK_LAYER_WORDS;
+    for(uint32_t i=0;i<plan->drawCount;++i){
+        const struct QuadDraw *d=&plan->draws[i];
+        const uint32_t *l=quad_backdrop_layer(scene,d->layer);
         const int blend=d->kind==QUAD_KIND_STRAIGHT || d->kind==QUAD_KIND_PREMULTIPLIED;
-        const int pipeline=!p->fixedBlend || !blend?QUAD_PIPELINE_NONE:d->kind==QUAD_KIND_STRAIGHT?
-            QUAD_PIPELINE_STRAIGHT:QUAD_PIPELINE_PREMULTIPLIED;
-        if((int)d->layer!=boundLayer && blend && !p->fixedBlend && written){
-            /* This layer reads pixels earlier layers (or clears) wrote. A
-             * layer's own rectangles are disjoint, so one barrier suffices. */
-            VkMemoryBarrier self={.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER,.srcAccessMask=VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-                .dstAccessMask=VK_ACCESS_INPUT_ATTACHMENT_READ_BIT};
-            vkCmdPipelineBarrier(p->command,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                VK_DEPENDENCY_BY_REGION_BIT,1,&self,0,NULL,0,NULL);
+        struct QuadRect ordinary[QUAD_PLAN_MAX_PIECES]={d->rect};
+        struct QuadRect effects[QUAD_BACKDROP_TILES];
+        const struct QuadBackdropTile *tiles[QUAD_BACKDROP_TILES];
+        unsigned n=1,effectCount=0;
+        for(unsigned t=0;glass && t<backdrop->count;++t){
+            const struct QuadBackdropTile *tile=&backdrop->tiles[t];
+            if(tile->layer!=d->layer)continue;
+            const struct QuadRect overlap=quad_rect_intersect(tile->screen,d->rect);
+            if(quad_rect_empty(overlap))continue;
+            if(!quad_subtract(ordinary,&n,overlap)){ordinary[0]=d->rect;n=1;effectCount=0;break;}
+            effects[effectCount]=overlap;tiles[effectCount++]=tile;
         }
-        written=1;
-        if(pipeline!=boundPipeline){vkCmdBindPipeline(p->command,VK_PIPELINE_BIND_POINT_GRAPHICS,p->pipeline[pipeline]);boundPipeline=pipeline;}
         if((int)d->layer!=boundLayer){
+            if(written && (effectCount || (blend && (!p->fixedBlend || glass))))quad_blend_barrier(p);
             vkCmdBindDescriptorSets(p->command,VK_PIPELINE_BIND_POINT_GRAPHICS,p->layout,0,1,&images[d->layer]->set,0,NULL);
             boundLayer=d->layer;
         }
-        const struct QuadPush push={{d->rect.x0,d->rect.y0,d->rect.x1,d->rect.y1},{2.0f/(float)scene[0],2.0f/(float)scene[1]},
-            {(int32_t)l[8],(int32_t)l[9]},{l[10],l[11]},{l[4],l[5]},{l[6],l[7]},
-            {(float)l[6]/(float)l[10],(float)l[7]/(float)l[11]},l[16]&255u,
-            ((l[16]&BROOK_VK_STRAIGHT_ALPHA)?QUAD_MODE_STRAIGHT:0u)|((l[16]&BROOK_VK_OPAQUE_SOURCE)?QUAD_MODE_OPAQUE:0u)|
-            (d->kind==QUAD_KIND_OVER_ZERO?QUAD_MODE_OVER_ZERO:0u)|(blend && !p->fixedBlend?QUAD_MODE_READ:0u)|fetch_mode(l)};
-        vkCmdPushConstants(p->command,p->layout,VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,0,sizeof(push),&push);
-        vkCmdDraw(p->command,4,1,0,0);
+        if(effectCount){
+            if(boundPipeline!=QUAD_PIPELINE_GLASS)vkCmdBindPipeline(p->command,VK_PIPELINE_BIND_POINT_GRAPHICS,p->pipeline[QUAD_PIPELINE_GLASS]);
+            boundPipeline=QUAD_PIPELINE_GLASS;
+            const int timing=quad_chrome_begin(p,QUAD_GPU_GLASS);
+            for(unsigned t=0;t<effectCount;++t)quad_draw_rect(p,scene,l,effects[t],d->kind,tiles[t]);
+            quad_chrome_end(p,timing);
+        }
+        if(n){
+            const int pipeline=!p->fixedBlend || !blend?QUAD_PIPELINE_NONE:d->kind==QUAD_KIND_STRAIGHT?
+                QUAD_PIPELINE_STRAIGHT:QUAD_PIPELINE_PREMULTIPLIED;
+            if(pipeline!=boundPipeline){vkCmdBindPipeline(p->command,VK_PIPELINE_BIND_POINT_GRAPHICS,p->pipeline[pipeline]);boundPipeline=pipeline;}
+            const unsigned category=backdrop?backdrop->chromeClass[d->layer]:0;
+            const int timing=category && !p->timingBlurOnly?quad_chrome_begin(p,category):0;
+            for(unsigned k=0;k<n;++k)quad_draw_rect(p,scene,l,ordinary[k],d->kind,NULL);
+            quad_chrome_end(p,timing);
+        }
+        written=1;
     }
     vkCmdEndRenderPass(p->command);
     for(uint32_t i=0;i<distinctCount;++i){const int out=distinct[i]==target;
@@ -501,6 +876,13 @@ static BrookVkResult quad_pass_submit(BrookVkQuadPass *p,const uint32_t *scene,s
         .pWaitDstStageMask=stages,.commandBufferCount=1,.pCommandBuffers=&p->command};
     {const VkResult submitted=vkQueueSubmit(p->queue,1,&submit,p->fence);
      if(submitted!=VK_SUCCESS){p->lastResult=submitted;p->uncertain=1;return BROOK_VK_UNCERTAIN;}}
+    if(glass){
+        if(rebuild)++p->backdropStats.rebuilds;else ++p->backdropStats.reuses;
+        p->backdropStats.tileRebuilds+=rebuildCount;p->backdropStats.tileReuses+=backdrop->count-rebuildCount;
+        p->atlasInitialized|=rebuild;
+        p->atlasBuiltCount=backdrop->count;
+        for(unsigned t=0;t<backdrop->count;++t)p->atlasBuilt[t]=backdrop->tiles[t].key;
+    }
     ++p->stats.submits;p->pending=1;return BROOK_VK_PENDING;
 reject:
     /* Cached imports stay valid for the next submission. */
@@ -517,6 +899,28 @@ static BrookVkResult retire(BrookVkQuadPass *p,VkResult status){
             const uint64_t mask=p->timestampBits==64?UINT64_MAX:(UINT64_C(1)<<p->timestampBits)-1;
             const double ns=(double)((ticks[1]-ticks[0])&mask)*p->timestampPeriod;
             if(ns>=0 && ns<(double)UINT64_MAX){p->gpuNs=(uint64_t)ns;p->gpuValid=1;}
+        }
+    }
+    if(p->timestamps && (p->chromeTimed || p->atlasTimed) && !p->timingOverflow){
+        uint64_t ticks[QUAD_TIMESTAMP_COUNT]={0};
+        const uint64_t mask=p->timestampBits==64?UINT64_MAX:(UINT64_C(1)<<p->timestampBits)-1;
+        const int atlasValid=!p->atlasTimed || vkGetQueryPoolResults(p->device,p->timestamps,2,2,2*sizeof(uint64_t),
+            ticks+2,sizeof(uint64_t),VK_QUERY_RESULT_64_BIT)==VK_SUCCESS;
+        const unsigned draws=p->timestampNext-4;
+        const int glassValid=!draws || vkGetQueryPoolResults(p->device,p->timestamps,4,draws,draws*sizeof(uint64_t),
+            ticks+4,sizeof(uint64_t),VK_QUERY_RESULT_64_BIT)==VK_SUCCESS;
+        if(atlasValid && glassValid){
+            uint64_t sums[QUAD_GPU_CLASSES]={0};
+            sums[QUAD_GPU_ATLAS]=(uint64_t)((double)((ticks[3]-ticks[2])&mask)*p->timestampPeriod);
+            for(unsigned i=4;i<p->timestampNext;i+=2){
+                const unsigned category=p->timestampClass[i/2];
+                if(category && category<QUAD_GPU_CLASSES)
+                    sums[category]+=(uint64_t)((double)((ticks[i+1]-ticks[i])&mask)*p->timestampPeriod);
+            }
+            p->backdropStats.atlasNs+=sums[QUAD_GPU_ATLAS];p->backdropStats.glassNs+=sums[QUAD_GPU_GLASS];
+            p->backdropStats.atlasTimedFrames+=p->atlasTimed;
+            p->backdropStats.frameNs+=sums[QUAD_GPU_FRAME];p->backdropStats.shellNs+=sums[QUAD_GPU_SHELL];
+            ++p->backdropStats.timedFrames;
         }
     }
     frame_cleanup(p);return BROOK_VK_COMPLETE;
@@ -546,4 +950,8 @@ int brook_vk_quad_pass_gpu_timestamp_ns(const BrookVkQuadPass *p,uint64_t *ns){
 }
 struct BrookVkQuadStats brook_vk_quad_pass_stats(const BrookVkQuadPass *p){
     return p?p->stats:(struct BrookVkQuadStats){0};
+}
+
+struct BrookVkBackdropStats brook_vk_quad_pass_backdrop_stats(const BrookVkQuadPass *p){
+    return p?p->backdropStats:(struct BrookVkBackdropStats){0};
 }

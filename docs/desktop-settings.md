@@ -78,8 +78,7 @@ A validated installed desktop entry now replaces a same-title legacy shortcut's
 command and icon identity. Previously refresh kept its stale script path even
 when the active profile exposed the correct package. Missing executable targets
 remain filtered before publication. Native shortcuts can declare `# app_id:`
-and `# executable:` alongside their title, so Files (`brook-files`), Calculator
-(`brook.calc`) and Player (`brook-player`) match their windows without title
+and `# executable:` alongside their title, so Calculator (`brook.calc`) and Player (`brook-player`) match their windows without title
 heuristics. Header metadata is read once into the unpublished launcher snapshot.
 
 The custom GIMP shortcut now requires the installed profile's `gimp-3.0` and

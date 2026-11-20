@@ -23,6 +23,7 @@
 #include "renderer.h"
 #include "graphics_pass.h"
 #include "quad_plan.h"
+#include "quad_backdrop.h"
 #include <vulkan/vulkan.h>
 
 typedef struct BrookVkQuadPass BrookVkQuadPass;
@@ -53,6 +54,21 @@ int brook_vk_quad_pass_set_source_modifiers(BrookVkQuadPass *,const uint64_t *mo
 BrookVkResult brook_vk_quad_pass_submit(BrookVkQuadPass *,const uint32_t *scene,size_t words,
         const struct BrookVkQuadSource *sources,size_t count,const struct BrookVkQuadSource *output,
         const struct QuadPlan *plan);
+/* Optional atlas for glass draws; uses the same submission and fences. */
+BrookVkResult brook_vk_quad_pass_submit_backdrop(BrookVkQuadPass *,const uint32_t *scene,size_t words,
+        const struct BrookVkQuadSource *sources,size_t count,const struct BrookVkQuadSource *output,
+        const struct QuadPlan *plan,const struct QuadBackdrop *,const struct QuadRect *holes);
+int brook_vk_quad_pass_enable_backdrop(BrookVkQuadPass *);
+/* rebuilds/reuses count glass frames that did or did not recapture any
+ * tile; tileRebuilds/tileReuses count tiles. With GPU timestamps (always
+ * with BROOK_RENDER_BLUR=1 unless BROOK_RENDER_BLUR_TIMING=0): atlasNs sums
+ * capture plus filter passes over atlasTimedFrames frames, glassNs the glass
+ * draws over timedFrames. */
+struct BrookVkBackdropStats {
+    uint64_t rebuilds,reuses,atlasNs,glassNs,frameNs,shellNs,tileRebuilds,tileReuses;
+    uint32_t timedFrames,atlasTimedFrames;
+};
+struct BrookVkBackdropStats brook_vk_quad_pass_backdrop_stats(const BrookVkQuadPass *);
 BrookVkResult brook_vk_quad_pass_poll(BrookVkQuadPass *);
 /* Blocks up to timeoutNs; returns PENDING on timeout. */
 BrookVkResult brook_vk_quad_pass_wait(BrookVkQuadPass *,uint64_t timeoutNs);

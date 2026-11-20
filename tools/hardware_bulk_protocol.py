@@ -204,16 +204,23 @@ def disk_download(host,port,key,boot,transaction,path,expected,max_bytes,on_even
     finally:
         if not published:partial.unlink(missing_ok=True)
 
-def frame_png(raw,output,metadata):
-    """Convert verified packed BGRA bytes on the host; no image JSON/base64."""
+def frame_png(raw,output,metadata,crop=None):
+    """Convert verified packed BGRA bytes on the host; no image JSON/base64.
+    crop: optional {x,y,width,height} inside the frame (native pixels)."""
     w,h=metadata['width'],metadata['height']
     if metadata.get('format')!=1 or not 0<w<=4096 or not 0<h<=2160 or Path(raw).stat().st_size!=w*h*4:raise ValueError('Invalid frame artifact')
+    x0,y0,cw,ch=0,0,w,h
+    if crop is not None:
+        x0,y0,cw,ch=(crop[k] for k in ('x','y','width','height'))
+        if any(isinstance(v,bool) or not isinstance(v,int) for v in (x0,y0,cw,ch)) or x0<0 or y0<0 or cw<=0 or ch<=0 or x0+cw>w or y0+ch>h:
+            raise ValueError('Crop is outside the frame')
     def chunk(stream,kind,data):
         stream.write(struct.pack('>I',len(data))+kind+data+struct.pack('>I',zlib.crc32(kind+data)&0xffffffff))
     with open(raw,'rb') as source,open(output,'xb') as target:
-        target.write(b'\x89PNG\r\n\x1a\n');chunk(target,b'IHDR',struct.pack('>IIBBBBB',w,h,8,2,0,0,0));compressor=zlib.compressobj()
-        for _ in range(h):
-            bgra=source.read(w*4);rgb=bytearray(w*3)
+        target.write(b'\x89PNG\r\n\x1a\n');chunk(target,b'IHDR',struct.pack('>IIBBBBB',cw,ch,8,2,0,0,0));compressor=zlib.compressobj()
+        for row in range(y0,y0+ch):
+            source.seek((row*w+x0)*4)
+            bgra=source.read(cw*4);rgb=bytearray(cw*3)
             rgb[0::3]=bgra[2::4];rgb[1::3]=bgra[1::4];rgb[2::3]=bgra[0::4]
             data=compressor.compress(b'\0'+rgb)
             if data:chunk(target,b'IDAT',data)

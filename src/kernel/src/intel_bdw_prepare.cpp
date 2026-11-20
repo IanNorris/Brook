@@ -336,6 +336,7 @@ bool BdwPrivatePageAlloc(BdwOwnedPage& out,bool zero){
     BdwOwnedPage page{};if(!retainedAllocator.alloc(page))return false;
     if(!page.cpu || !page.dma || (page.dma&4095) || page.dma>=(uint64_t{1}<<39) ||
        (page.dma<0xdf800000ull && page.dma+4096>0xdd000000ull)){retainedAllocator.free(page);return false;}
+    PmmReassignOwner(PhysicalAddress(page.dma), PmmOwner::Other, PmmOwner::Scanout);
     if(zero)for(unsigned i=0;i<4096;++i)page.cpu[i]=0;
     out=page;return true;
 }

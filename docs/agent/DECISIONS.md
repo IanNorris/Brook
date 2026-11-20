@@ -1,5 +1,17 @@
 # Brook decisions and investigation memory draft
 
+## 2026-11-19 Clearwater theme selection
+
+- Material is Glass or Opaque. Mode is Light, Mixed or Dark in either
+  material. Mixed gives the entire system chrome dark colours and app
+  content light colours. The Glass fallback changes only the material.
+- Read legacy numeric and named Opaque selections as their fixed modes.
+  Keep the mode for existing Glass selections. Persist the material, mode
+  and either a preset key or an exact sRGB custom accent.
+- Offer all thirteen presets and an HSV custom picker. Use the same tint
+  derivation for both. Preserve the chosen custom accent and derive legible
+  ink for its fills and for chrome. The preview uses the resolved tint.
+
 These entries preserve accepted direction and the scope of prior evidence. Current source and a final cutover snapshot determine implementation state. The reason to reopen a decision should be a changed requirement, relevant code/environment change, contradictory evidence or an unresolved prerequisite needed by the immediate milestone.
 
 | Subject | Retained decision or result | Revisit when | Main reference |

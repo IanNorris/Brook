@@ -30,7 +30,7 @@ manifest=source/'share/applications/applications.idx'
 records=[]
 for record in manifest.read_text().splitlines():
  fields=record.split('\t');command=fields[1]
- for name in ['mousepad','brook-files','brook-settings','wayland-calc']:
+ for name in ['mousepad','brook-settings','wayland-calc']:
   if command.split(' ',1)[0] in [name,'/nix/profile/bin/'+name]:fields[1]='/nix/profile/bin/hardware-'+name
  records.append('\t'.join(fields))
 manifest.write_text('\n'.join(records)+'\n')

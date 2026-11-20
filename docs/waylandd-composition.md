@@ -200,7 +200,7 @@ Dell gen 419: yquake2 GL3 (a 640×480 drawable shown 2× in a 1280×960 window) 
 **What Chromium does:**
 - **No `zxdg_decoration_manager_v1`, or the compositor answers `CLIENT_SIDE`:** Chromium draws its custom frame: tab strip at the top, its own caption buttons, rounded corners and a translucent shadow margin. It reports the visible frame with `xdg_surface.set_window_geometry` (on Brook: 16 px right, 10 px top inset in QEMU while restored, none while maximised). This was already Brook's default.
 - **`SERVER_SIDE`:** Chromium keeps drawing its custom frame inside Brook's frame (gen 405 double frame). Only the *Use system title bar and borders* preference drops it.
-- **Its caption buttons** follow GTK's `gtk-decoration-layout`, which GTK on Wayland takes from GSettings `org.gnome.desktop.wm.preferences button-layout`. Brook has no dconf, so GTK reads the schema default `appmenu:close`: that is why Chromium showed only a close button. With `GSETTINGS_BACKEND=keyfile` and a keyfile in `$XDG_CONFIG_HOME/glib-2.0/settings/keyfile`, Chromium honours any layout. `:` draws no buttons; `:minimize,maximize,close` draws all three. Window Controls Overlay is for installed web apps only, and no command-line switch hides the buttons.
+- **Its caption buttons** follow GTK's `gtk-decoration-layout`. The pinned Chromium 148.0.7778.96 reads this property through `SettingsProviderGtk`. GTK on Wayland reads GNOME's `org.gnome.desktop.wm.preferences button-layout` from the Settings portal when GTK uses it and otherwise uses GSettings. [Chromium settings provider](https://raw.githubusercontent.com/chromium/chromium/148.0.7778.96/ui/gtk/settings_provider_gtk.cc) [GTK 3 Wayland settings](https://raw.githubusercontent.com/GNOME/gtk/3.24.52/gdk/wayland/gdkscreen-wayland.c) [GTK 4 Wayland settings](https://raw.githubusercontent.com/GNOME/gtk/4.20.3/gdk/wayland/gdksettings-wayland.c)
 - **Chromium's own buttons** call `xdg_toplevel.set_minimized`/`set_maximized`/`unset_maximized` and close itself; waylandd already forwards these to the WM. Empty tab-strip space calls `xdg_toplevel.move` (and a double-click toggles maximise).
 
 **What Brook does now:**
@@ -209,11 +209,11 @@ Dell gen 419: yquake2 GL3 (a 640×480 drawable shown 2× in a 1280×960 window) 
   - The chrome key includes the overlay and its insets.
 - **Syscall 512** `WM_SET_DECORATION_MODE(wmId, mode, insets, height)`: mode 2 is CSD with the overlay; `insets` packs right | top << 16; `height` is the client's title-strip height in VFB pixels (0 uses Brook's title height). It returns 2 when the overlay is in effect. Older kernels return 0 and treat mode 2 as plain CSD, and waylandd then stops asking.
 - **waylandd:** when an xdg-decoration client asks for `CLIENT_SIDE` and its app_id starts with an entry in `BROOK_WAYLAND_CAPTION_APPS` (default `chromium:40,google-chrome:40`; empty disables it), it uses mode 2. The optional `:height` is the client's title-strip height in surface units; waylandd multiplies it by the output scale. Chromium's strip is 40 restored and maximised: 40 px in QEMU, and 80 px on the Dell at scale 2. The block therefore spans the whole strip. It also re-sends the insets when the window geometry or size changes (shadow added or dropped on restore and maximise). Popups, GTK/KDE-decorated clients and other apps are unchanged.
-- **Launcher (`data/nix-wrappers/brook-chromium`, on this branch only, not installed):** exports `GSETTINGS_BACKEND=keyfile` and sets only `button-layout` to `:minimize,maximize,close` in `$XDG_CONFIG_HOME/glib-2.0/settings/keyfile`, keeping any other keys and leaving the file untouched once it is correct. `BROOK_CHROMIUM_BUTTON_LAYOUT` overrides the layout; empty leaves GSettings alone. Without this launcher change, Chromium keeps its close-only default: its X is hidden under the block, but its tabs can run under the minimise and maximise buttons.
+- **Desktop defaults** configure `icon:minimize,maximize,close` in the profile's GTK 3 and GTK 4 settings. The GNOME schema uses `menu:minimize,maximize,close` because GDK translates `menu` to `icon`. Normal GTK and GSettings overrides keep their precedence. Chromium retains access to existing GLib keyfile settings and creates no layout preference in the user file. The experimental `BROOK_CHROMIUM_BUTTON_LAYOUT` launcher variable has been replaced by normal settings, where `:` still hides the caption buttons. [GDK button translation](https://raw.githubusercontent.com/GNOME/gtk/3.24.52/gdk/wayland/wm-button-layout-translation.c)
 
 **Results (QEMU, software Chromium 148, private profile under `/tmp`):**
 - **Layout `:`** (Chromium draws no buttons): tab strip at the top, Brook's block at the top-right, insets 16,10 restored and 0 maximised. With 15 tabs, though, the tabs and the new-tab button run under the block, because Chromium reserves no space.
-- **Layout `:minimize,maximize,close`** (the launcher default on this branch): the same look, but Chromium keeps its tabs and new-tab button left of the block. Its own buttons (about 100 px wide) sit entirely under Brook's 138 px block; a transient frame during maximise, before Chromium redrew, showed them in the old buffer.
+- **Layout `:minimize,maximize,close`** (the legacy launcher test): the same look, but Chromium keeps its tabs and new-tab button left of the block. Its own buttons (about 100 px wide) sit entirely under Brook's 138 px block; a transient frame during maximise, before Chromium redrew, showed them in the old buffer.
 - **Behaviour:**
   - Dragging empty tab-strip space moves the window (Chromium's `xdg_toplevel.move`).
   - A double-click there maximises (Chromium's `set_maximized`, honoured).
@@ -278,3 +278,32 @@ Guest steps go through the bridge, as root:
 - **Until a sample exists,** or for apps with no `:height`, the block keeps Brook's title colours.
 
 **Fallback (Chromium draws everything):** take the app out of `BROOK_WAYLAND_CAPTION_APPS`, or set it empty for all apps. waylandd then answers plain client-side, and Chromium shows its own three buttons (with the launcher's layout).
+
+## GTK4 window actions and xdg-shell v5 (20 November 2026)
+
+GTK 4.20.3 constructs titlebar controls from the layout, modality, transience
+and resizability. Libadwaita 1.8.5.1 uses those GtkWindowControls in
+`src/adw-header-bar.c` around lines 293 and 331. Once a Wayland surface exists,
+`update_window_actions` requires the GDK capabilities for Minimise and
+Maximise. The action gate has no tiled-state condition. A visible Maximise
+button already satisfies the resizable check. GDK populates the two flags
+from `xdg_toplevel.wm_capabilities`, which Brook's v3 global could never
+send. [GTK controls](https://raw.githubusercontent.com/GNOME/gtk/4.20.3/gtk/gtkwindowcontrols.c)
+[GTK actions](https://raw.githubusercontent.com/GNOME/gtk/4.20.3/gtk/gtkwindow.c)
+[GDK Wayland capabilities](https://raw.githubusercontent.com/GNOME/gtk/4.20.3/gdk/wayland/gdktoplevel-wayland.c)
+
+Brook advertises v5. Each toplevel gets the implemented Maximise, Minimise
+and Fullscreen capabilities before its first configure. The window menu
+request remains a stub. v4 and later get advisory bounds in logical output
+coordinates when known and updates when the reported dimensions change.
+The provider stays at v5 until the WM can report repaint suspension for v6.
+
+The wire fixture checks v3, v4 and v5, exact capability values and their
+order before the configure. Pinned GTK4 enabled both controls against the
+new provider on a private Wayland socket. GTK3 and Chromium both received
+and acknowledged the initial configure. They hit the same retained-scene
+failure after buffer attach in the v3 and v5 host probes because the host
+lacks Brook's window syscalls. Their pinned listeners accept both new
+events. Full rendering and button actions on the Dell remain unverified.
+[GTK3 Wayland listener](https://raw.githubusercontent.com/GNOME/gtk/3.24.52/gdk/wayland/gdkwindow-wayland.c)
+[Chromium Wayland listener](https://raw.githubusercontent.com/chromium/chromium/148.0.7778.96/ui/ozone/platform/wayland/host/xdg_toplevel.cc)

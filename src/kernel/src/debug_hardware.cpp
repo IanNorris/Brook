@@ -85,6 +85,42 @@ bool HardwarePayloadIdRead(char* id,uint32_t capacity) {
 }
 namespace {
 using Reply=BridgeReplyBuffer<DebugChannelSend>;
+// Dell HDA fault record JSON (read-only copies taken under the bridge lock).
+void HdaRegistersJson(Reply& r,const char* name,const HdaDellStreamRegisters& g){
+    r.text("\"");r.text(name);r.text("\":{\"valid\":");r.text(g.valid?"true":"false");
+    r.text(",");r.field("pci_command",g.command);r.text(",");r.field("sdctl",g.control);r.text(",");r.field("sdsts",g.status);
+    r.text(",\"run\":");r.text(g.control&2?"true":"false");r.text(",\"fifoe\":");r.text(g.status&8?"true":"false");
+    r.text(",\"dese\":");r.text(g.status&0x10?"true":"false");r.text(",\"bcis\":");r.text(g.status&4?"true":"false");
+    r.text(",");r.field("lpib",g.lpib);r.text(",");r.field("cbl",g.cbl);r.text(",");r.field("lvi",g.lvi);
+    r.text(",");r.field("fifos",g.fifos);r.text(",");r.field("format",g.format);r.text(",");r.field("bdpl",g.bdpl);
+    r.text(",");r.field("bdpu",g.bdpu);r.text(",");r.field("intctl",g.intctl);r.text(",");r.field("intsts",g.intsts);
+    r.text(",");r.field("wallclock",g.wallclock);r.text(",");r.field("dplbase",g.dplbase);r.text("}");
+}
+void HdaFaultJson(Reply& r,const char* name,const HdaDellQueueFault& f){
+    r.text("\"");r.text(name);r.text("\":");if(!f.recorded){r.text("null");return;}
+    r.text("{");r.field("ordinal",f.ordinal);r.text(",\"stage\":");r.quoted(HdaDellFaultStageName(f.stage));
+    r.text(",\"reason\":");r.quoted(HdaDellFaultReasonName(f.reason));
+    r.text(",\"sample_reason\":");r.quoted(HdaDellFaultReasonName(f.sampleReason));
+    r.text(",");r.field("epoch",f.epoch);r.text(",");r.field("at_ns",f.atNs);
+    r.text(",");r.field("sample_before_ns",f.sampleBeforeNs);r.text(",");r.field("sample_after_ns",f.sampleAfterNs);
+    r.text(",");r.field("previous_sample_ns",f.previousSampleNs);r.text(",");r.field("last_movement_ns",f.lastMovementNs);
+    r.text(",");r.field("position",f.position);r.text(",");r.field("previous_position",f.previousPosition);
+    r.text(",");r.field("delta",f.delta);r.text(",");r.field("allowed",f.allowed);
+    r.text(",\"sampled_running\":");r.text(f.sampledRunning?"true":"false");
+    r.text(",\"sampled_error\":");r.text(f.sampledError?"true":"false");
+    r.text(",");r.field("raw_completed",f.rawCompleted);r.text(",");r.field("submitted",f.submitted);
+    r.text(",");r.field("completed",f.completed);r.text(",");r.field("cleared",f.cleared);
+    r.text(",\"muted\":");r.text(f.muted?"true":"false");r.text(",\"stopped\":");r.text(f.stopped?"true":"false");
+    r.text(",\"recoverable\":");r.text(f.recoverable?"true":"false");r.text(",");
+    HdaRegistersJson(r,"at_fault",f.atFault);r.text(",");HdaRegistersJson(r,"after_stop",f.afterStop);r.text("}");
+}
+void HdaRecoveryJson(Reply& r,const HdaRuntimeFaultSnapshot& s){
+    const auto& v=s.recovery;r.text("\"recovery\":{\"enabled\":");r.text(v.enabled?"true":"false");
+    r.text(",\"pending\":");r.text(v.pending?"true":"false");r.text(",\"permanent\":");r.text(v.permanent?"true":"false");
+    r.text(",");r.field("budget",v.budget);r.text(",");r.field("attempts",v.attempts);r.text(",");r.field("successes",v.successes);
+    r.text(",");r.field("failed_step",uint8_t(v.lastFailure));r.text(",");r.field("last_recovery_ns",v.lastRecoveryNs);
+    r.text(",");r.field("min_spacing_ns",v.minSpacingNs);r.text("}");
+}
 
 void HardwarePayloadId(Reply& reply) {
     char id[96]{};
@@ -392,6 +428,8 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",");r.field("empty_before_bytes",q.emptyBeforeBytes);r.text(",");r.field("empty_after_bytes",q.emptyAfterBytes);
         r.text(",");r.field("published_bytes",q.publishedBytes);r.text(",");r.field("backpressure",q.backpressure);
         r.text(",");r.field("publication_failures",q.publicationFailures);
+        const auto faults=HdaRuntimeFaults();r.text(",");r.field("fault_count",faults.count);
+        r.text(",");HdaFaultJson(r,"first_fault",faults.first);r.text(",");HdaFaultJson(r,"last_fault",faults.last);
         r.text(",\"scope\":\"boot-opt-in queue observations under the driver lock; reserved gaps include future guard space and overlap empty-tail advances; neither proves source starvation or audible loss; counters persist across epochs\"}\n");r.send();return true;
     }
     if(!strcmp(command,"bridge hardware dell-hda-runtime")) {
@@ -405,6 +443,18 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",");r.field("stop_failures",__atomic_load_n(&o.runtimeStopFailures,__ATOMIC_RELAXED));
         r.text(",");r.field("restarts",__atomic_load_n(&o.runtimeRestarts,__ATOMIC_RELAXED));
         r.text(",");r.field("restart_failures",__atomic_load_n(&o.runtimeRestartFailures,__ATOMIC_RELAXED));
+        r.text(",");r.field("restart_refused",__atomic_load_n(&o.runtimeRestartRefused,__ATOMIC_RELAXED));
+        {const auto faults=HdaRuntimeFaults();const auto& f=faults.last;
+            r.text(",");r.field("fault_count",faults.count);
+            r.text(",\"fault_stage\":");r.quoted(HdaDellFaultStageName(f.stage));
+            r.text(",\"fault_reason\":");r.quoted(HdaDellFaultReasonName(f.reason));
+            r.text(",\"fault_sample_reason\":");r.quoted(HdaDellFaultReasonName(f.sampleReason));
+            r.text(",");r.field("fault_sdsts",f.atFault.status);r.text(",");r.field("fault_sdctl",f.atFault.control);
+            r.text(",\"clock\":{\"failed\":");r.text(faults.clockFailed?"true":"false");
+            r.text(",");r.field("fail_reason",faults.clockFailReason);r.text(",");r.field("fail_cpu",faults.clockFailCpu);
+            r.text(",");r.field("last_cpu",faults.clockLastCpu);r.text(",");r.field("fail_tsc",faults.clockFailTsc);
+            r.text(",");r.field("fail_last_tsc",faults.clockFailLast);r.text(",");r.field("khz",faults.clockKhz);r.text("}");
+            r.text(",");HdaRecoveryJson(r,faults);}
         r.text(",");r.field("failure_stage",HdaRuntimeFailureStage());
         r.text(",");r.field("stream_failure_stage",HdaRuntimeStreamFailureStage());
         r.text(",");r.field("stream_failure_detail",HdaRuntimeStreamFailureDetail());

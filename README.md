@@ -281,7 +281,7 @@ the table distinguishes tested behavior from remaining limitations.
 - **Web browsers** — Firefox (software and hardware Wayland, experimental) and Chromium (software Wayland, experimental), Ladybird (Wayland, experimental), NetSurf (custom framebuffer surface)
 - **GTK apps** — Qalculate! (calculator), Mousepad (text editor), GIMP (experimental)
 - **Shells / tools** — bash, busybox, TCC
-- **Brook-native apps** — file browser (`brook-files`), calculator, Wayland smoke tests
+- **Desktop apps** — Files (Nautilus), Brook Settings, Calculator and Wayland smoke tests
 - **Smoke tests** — fork/exec, pipe, signals, SCM_RIGHTS fd passing, symlink, epoll, TCP, Wayland client stub
 
 ### Drivers (loadable modules)
@@ -615,7 +615,6 @@ src/
     inc_um/         Usermode shared headers
     src_um/         Usermode shared sources
 tools/
-  brook-files-pkg/  Native Wayland file browser
   brook-edit-pkg/   Native Wayland text editor (Ctrl+S/F/D)
   brook-console-pkg/ Native Wayland kernel log viewer (Ctrl+F filter)
   wayland-calc-pkg/ Native Wayland interactive calculator

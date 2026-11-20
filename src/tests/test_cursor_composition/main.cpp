@@ -7,6 +7,11 @@ using namespace brook;
 int main()
 {
     CursorImage source, first, next, restored;
+    source.pixels[0]=0x00abcdef;
+    source.pixels[1]=0x01000000;
+    CHECK(!CursorPixelsHaveAlpha(source.pixels,1,1));
+    CHECK(CursorPixelsHaveAlpha(source.pixels,2,1));
+    source={};
     source.width=24;source.height=32;source.hotX=7;source.hotY=9;
     source.pixels[0]=0x80776655;source.pixels[8*CursorCapacity+7]=0xff112233;
     CursorImage original=source;
@@ -41,9 +46,15 @@ int main()
     CHECK(bounds.before==0x12345678 && bounds.after==0x87654321);
     // Ownership: a window's cursor shows only over that window, the arrow
     // elsewhere (desktop/chrome = 0, another window), back on return; a held
-    // button keeps the current choice; unowned images show everywhere.
+    // button keeps the current choice; unowned images never show.
     CursorOwnership own;
-    own.Set(0,0,false);CHECK(own.Update(0,false) && own.Update(5,false));
+    CHECK(!own.Update(0,false));
+    // Gen 460: Xwayland's root "X" cursor, set after wl_pointer.leave while
+    // the pointer was over the taskbar (hover 0), came in with no owner and
+    // showed over the taskbar, the desktop and the kernel Terminal (5).
+    own.Set(0,0,false);CHECK(!own.showClient);
+    CHECK(!own.Update(0,false) && !own.Update(5,false) && !own.Update(0,true));
+    own.Set(0,5,false);CHECK(!own.showClient && !own.Update(5,false));
     own.Set(7,7,false);CHECK(own.showClient);
     CHECK(!own.Update(0,false));CHECK(!own.Update(9,false));CHECK(own.Update(7,false));
     CHECK(own.Update(0,true));CHECK(!own.Update(0,false));CHECK(!own.Update(7,true));CHECK(own.Update(7,false));

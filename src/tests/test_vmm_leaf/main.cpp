@@ -165,6 +165,7 @@ void RobustFutexCleanup(Process* process) {
     process->robustListHead=0;process->robustExitState=3;++robustCleanups;
 }
 void SchedulerReleaseWaitReference(Process* process) {CHECK(process->robustExitState==3);ProcessUnref(process);}
+void SchedulerReleaseDeadGroupFiles(Process*) {}
 extern "C" void SchedulerSleepMs(uint32_t) {++robustDelays;}
 void ProcessDestroyNow(Process* process) {
     CHECK(process==expectedDestroy);
@@ -183,6 +184,9 @@ void TlbShootdownFull(uint64_t,uint64_t) {
 void MemFdHandleUnref(void* handle) { ++droppedMemfds;PmmFreePage(static_cast<BorrowedBacking*>(handle)->page); }
 void VfsFileMapUnpin(Vnode*) { ++unpinnedVnodes; }
 extern "C" void VfsClose(Vnode* vn) { CHECK(!vn->refCount);++closedVnodes; }
+PhysicalAddress PmmAllocPageAccounted(MemTag tag,uint16_t pid,PmmOwner) {
+    return PmmAllocPage(tag,pid);
+}
 PhysicalAddress PmmAllocPage(MemTag,uint16_t pid) {
     CHECK(pid<PMM_MAX_PIDS);
     if(failAllocation.exchange(false))return {};
@@ -204,6 +208,7 @@ bool PmmRefPageIfAlive(PhysicalAddress p) {
 }
 void PmmUnrefPage(PhysicalAddress p) { std::lock_guard<std::mutex> lock(frameLock);dropLocked(indexOf(p)); }
 void PmmFreePage(PhysicalAddress p) { std::lock_guard<std::mutex> lock(frameLock);CHECK(records[indexOf(p)].refs==1);dropLocked(indexOf(p)); }
+void PmmReassignOwner(PhysicalAddress, PmmOwner, PmmOwner) {}
 bool PmmHasSingleReference(PhysicalAddress p) { return PmmGetRefCount(p)==1; }
 uint32_t PmmGetRefCount(PhysicalAddress p) { std::lock_guard<std::mutex> lock(frameLock);return records[indexOf(p)].refs; }
 uint32_t PmmGetMapCount(PhysicalAddress p) { std::lock_guard<std::mutex> lock(frameLock);return records[indexOf(p)].maps; }

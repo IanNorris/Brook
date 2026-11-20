@@ -57,6 +57,7 @@ void clean(AddressSpaceState& space) {
 }
 }
 namespace brook {
+void PmmReassignOwner(PhysicalAddress,PmmOwner,PmmOwner) {}
 bool ElfValidateMainImage(const uint8_t*,uint64_t);
 bool ElfLoad(const uint8_t*,uint64_t,ElfBinary*,AddressSpaceState*,uint16_t);
 uint64_t ElfLoadAt(const uint8_t*,uint64_t,uint64_t,AddressSpaceState*,uint16_t);

@@ -34,6 +34,9 @@ static void superChord() {
     CHECK(!down(s,SC_LSUPER,INPUT_MOD_SUPER).deliver);
     r=down(s,GlobalShortcuts::ScEnter,INPUT_MOD_SUPER);CHECK(!r.deliver && r.action==Action::SpawnTerminal);
     r=up(s,GlobalShortcuts::ScEnter,INPUT_MOD_SUPER);CHECK(!r.deliver && r.action==Action::None);
+    r=down(s,GlobalShortcuts::ScE,INPUT_MOD_SUPER);CHECK(!r.deliver && r.action==Action::OpenFiles);
+    r=down(s,GlobalShortcuts::ScE,INPUT_MOD_SUPER);CHECK(!r.deliver && r.action==Action::None);
+    CHECK(!up(s,GlobalShortcuts::ScE).deliver);
     r=down(s,GlobalShortcuts::ScQ,INPUT_MOD_SUPER);CHECK(!r.deliver && r.action==Action::CloseFocusedWindow);
     r=up(s,GlobalShortcuts::ScQ,INPUT_MOD_SUPER);CHECK(!r.deliver);
     r=down(s,GlobalShortcuts::ScG,INPUT_MOD_SUPER);CHECK(!r.deliver && r.action==Action::ToggleGlass);
@@ -72,6 +75,12 @@ static void altF4() {
     r=up(s,GlobalShortcuts::ScF4);CHECK(!r.deliver); // swallowed after Alt released
     r=down(s,GlobalShortcuts::ScF4);CHECK(r.deliver && r.action==Action::None); // plain F4
     CHECK(up(s,GlobalShortcuts::ScF4).deliver);
+    r = down(s, GlobalShortcuts::ScP, INPUT_MOD_ALT);
+    CHECK(!r.deliver && r.action == Action::CyclePerformanceHud);
+    r = down(s, GlobalShortcuts::ScP, INPUT_MOD_ALT);
+    CHECK(!r.deliver && r.action == Action::None);
+    CHECK(!up(s, GlobalShortcuts::ScP).deliver);
+    CHECK(down(s, GlobalShortcuts::ScP).deliver && up(s, GlobalShortcuts::ScP).deliver);
     // Alt+Tab repeats cycle focus, and its release is swallowed.
     r=down(s,GlobalShortcuts::ScTab,INPUT_MOD_ALT);CHECK(!r.deliver && r.action==Action::CycleFocus);
     r=down(s,GlobalShortcuts::ScTab,INPUT_MOD_ALT);CHECK(!r.deliver && r.action==Action::CycleFocus);
@@ -81,7 +90,8 @@ static void altF4() {
 
 static void escape() {
     GlobalShortcuts s;GlobalShortcutContext launcher{};launcher.launcherVisible=true;
-    auto r=down(s,GlobalShortcuts::ScEscape,0,launcher);CHECK(!r.deliver && r.action==Action::CloseLauncher);
+    // The open launcher owns Escape (it unwinds menu, query, then closes).
+    auto r=down(s,GlobalShortcuts::ScEscape,0,launcher);CHECK(!r.deliver && r.action==Action::LauncherKey && r.key==GlobalShortcuts::ScEscape);
     r=up(s,GlobalShortcuts::ScEscape);CHECK(!r.deliver);
     GlobalShortcutContext volume{};volume.volumePopupVisible=true;volume.launcherVisible=true;
     r=down(s,GlobalShortcuts::ScEscape,0,volume);CHECK(!r.deliver && r.action==Action::CloseVolumePopup);
@@ -100,18 +110,41 @@ static void launcherPrompt() {
         r=down(s,sc,0,prompt);CHECK(!r.deliver && r.action==Action::None); // auto-repeat does not re-fire
         CHECK(!up(s,sc,0,prompt).deliver);
     }
-    // Other keys, and Alt+Tab, keep their meaning.
-    CHECK(down(s,0x10,0,prompt).deliver && up(s,0x10,0,prompt).deliver);
+    // Other keys go to the open launcher; Alt+Tab keeps its meaning.
+    {auto r=down(s,0x10,0,prompt);CHECK(!r.deliver && r.action==Action::LauncherKey);CHECK(!up(s,0x10,0,prompt).deliver);}
     CHECK(down(s,GlobalShortcuts::ScTab,INPUT_MOD_ALT,prompt).action==Action::CycleFocus);
     CHECK(!up(s,GlobalShortcuts::ScTab,INPUT_MOD_ALT,prompt).deliver);
-    // Without the prompt, Enter reaches the client: there is no keyboard path to power.
+    // Without the prompt, Enter is the launcher's (open the selected app),
+    // never a power action.
     GlobalShortcutContext launcher{};launcher.launcherVisible=true;
-    auto r=down(s,GlobalShortcuts::ScEnter,0,launcher);CHECK(r.deliver && r.action==Action::None);
-    CHECK(up(s,GlobalShortcuts::ScEnter,0,launcher).deliver);
+    auto r=down(s,GlobalShortcuts::ScEnter,0,launcher);CHECK(!r.deliver && r.action==Action::LauncherKey);
+    CHECK(!up(s,GlobalShortcuts::ScEnter,0,launcher).deliver);
+}
+
+static void launcherTyping() {
+    GlobalShortcuts s;GlobalShortcutContext launcher{};launcher.launcherVisible=true;
+    // Type-anywhere: letters, Backspace and arrows reach the launcher, repeats included.
+    for(uint8_t sc:{uint8_t(0x10),uint8_t(0x0E),SC_EXT_DOWN}) {
+        auto r=down(s,sc,0,launcher);CHECK(!r.deliver && r.action==Action::LauncherKey && r.key==sc);
+        r=down(s,sc,0,launcher);CHECK(!r.deliver && r.action==Action::LauncherKey);
+        CHECK(!up(s,sc,0,launcher).deliver);
+    }
+    // Modifiers are state: Shift reaches the client untouched.
+    CHECK(down(s,0x2A,0,launcher).deliver && up(s,0x2A,0,launcher).deliver);
+    // Alt+Enter (the app menu) is the launcher's; Alt+Tab, Alt+F4, Alt+P and Super are not.
+    CHECK(down(s,GlobalShortcuts::ScEnter,INPUT_MOD_ALT,launcher).action==Action::LauncherKey);
+    CHECK(!up(s,GlobalShortcuts::ScEnter,INPUT_MOD_ALT,launcher).deliver);
+    CHECK(down(s,GlobalShortcuts::ScTab,INPUT_MOD_ALT,launcher).action==Action::CycleFocus);
+    CHECK(!up(s,GlobalShortcuts::ScTab,INPUT_MOD_ALT,launcher).deliver);
+    CHECK(down(s,GlobalShortcuts::ScP,INPUT_MOD_ALT,launcher).action==Action::CyclePerformanceHud);
+    CHECK(!up(s,GlobalShortcuts::ScP,INPUT_MOD_ALT,launcher).deliver);
+    // A key held from before the launcher opened releases to its client.
+    GlobalShortcutContext closed{};
+    CHECK(down(s,0x11,0,closed).deliver && up(s,0x11,0,launcher).deliver);
 }
 
 int main() {
-    superTap();superChord();altF4();escape();launcherPrompt();
+    superTap();superChord();altF4();escape();launcherPrompt();launcherTyping();
     std::puts("global shortcuts: ok");
     return 0;
 }

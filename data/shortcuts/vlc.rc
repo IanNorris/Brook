@@ -2,4 +2,5 @@
 # Requires: /nix/profile/bin/brook-vlc
 # Requires: /nix/profile/bin/vlc
 # desc: VLC media player
+# category: media
 source /boot/SCRIPTS/wayland_vlc.rc

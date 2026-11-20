@@ -1,4 +1,4 @@
-#include "core_dump_elf.h"
+#include "core_dump_layout.h"
 
 #include "apic.h"
 #include "memory/heap.h"
@@ -60,7 +60,8 @@ bool CoreDumpReadRegisters(const Process* process,uint64_t addressSpace,CoreRegi
 }
 
 namespace {
-constexpr uint32_t MaxPrograms=4096,MaxFileNotes=2048;
+constexpr uint32_t ScanBatchPages=4096;
+constexpr uint32_t MaxFileNoteBytes=4*1024*1024,MaxFilePath=1024;
 
 template<class T> struct Allocation {
     T* ptr;
@@ -68,10 +69,49 @@ template<class T> struct Allocation {
     ~Allocation(){kfree(ptr);}
 };
 
-struct CoreFileName {
-    uint64_t begin,end,pageOffset;
-    char name[1024];
+template<class T> struct CoreList {
+    T* data=nullptr;
+    uint32_t size=0,capacity=0;
+    ~CoreList(){kfree(data);}
+
+    bool reserve(uint32_t required,uint32_t limit){
+        if(required<=capacity)return true;
+        if(required>limit)return false;
+        uint32_t next=capacity?capacity:256;
+        while(next<required && next<limit/2)next*=2;
+        if(next>limit || next<required)next=limit;
+        auto* storage=static_cast<T*>(kmalloc(uint64_t(next)*sizeof(T)));
+        if(!storage)return false;
+        if(size)memcpy(storage,data,uint64_t(size)*sizeof(T));
+        kfree(data);data=storage;capacity=next;
+        return true;
+    }
 };
+struct CoreFileEntry {
+    uint64_t begin,end,pageOffset;
+};
+
+// The page-table walker checks capacity before copying. Split oversized
+// ranges by address without scanning every page of sparse reservations.
+template<class Visit,class Expired>
+bool VisitCorePages(PageTable table,uint64_t begin,uint64_t end,uint64_t* scratch,
+                    uint64_t& resident,Visit&& visit,const Expired& expired)
+{
+    if(expired())return false;
+    uint64_t count=0;
+    if(VmmCollectRangeAddresses(table,begin,end,scratch,ScanBatchPages,&count)){
+        resident+=count;
+        for(uint64_t i=0;i<count;++i){
+            if((i&255)==0 && expired())return false;
+            visit(scratch[i]);
+        }
+        return true;
+    }
+    if(end-begin<=CorePageSize)return false;
+    const uint64_t middle=begin+((end-begin)/2 & ~(CorePageSize-1));
+    return VisitCorePages(table,begin,middle,scratch,resident,visit,expired) &&
+           VisitCorePages(table,middle,end,scratch,resident,visit,expired);
+}
 struct Writer {
     Vnode* node;
     const CoreDumpDestination& destination;
@@ -123,86 +163,132 @@ int CoreDumpWriteSnapshot(CoreDumpSnapshot& snapshot,const char* path,bool full,
     const auto expired=[&]{return destination.expired && destination.expired(destination.context);};
     if(expired())return -110;
     result.stage="allocate";
-    const uint64_t maxResidentPages=byteLimit/CorePageSize;
-    Allocation<CoreProgramHeader> programs(MaxPrograms);
-    Allocation<uint64_t> identities(MaxPrograms),addresses(maxResidentPages);
-    Allocation<CoreFileName> files(MaxFileNotes);
+    Allocation<uint64_t> addresses(ScanBatchPages);
     Allocation<uint8_t> page(CorePageSize);
-    if(!programs.ptr || !identities.ptr || !addresses.ptr || !files.ptr || !page.ptr)return -12;
+    CoreList<CorePageRef> selected;
+    CorePageRange runs[CorePagePriorities]{};
+    CoreList<CoreFileEntry> files;
+    CoreList<char> fileNames;
+    if(!addresses.ptr || !page.ptr)return -12;
 
     const uint32_t argBytes=UserMappingReadArguments(space,0,info.args,sizeof(info.args)-1);
     for(uint32_t i=0;i<argBytes;++i)if(!info.args[i])info.args[i]=' ';
     if(!argBytes)CopyName(info.args,sizeof(info.args),info.name);
 
-    uint32_t programCount=1,fileCount=0,auxWords=0;
-    uint64_t aux[AddressSpaceState::SavedAuxvWords]{}, fileNameBytes=0, loadBytes=0;
-    int layoutError=0;
+    uint32_t auxWords=0;
+    uint64_t aux[AddressSpaceState::SavedAuxvWords]{};
+    uint64_t notes=CoreNoteSize(sizeof(info))+uint64_t(result.threads)*CoreNoteSize(sizeof(CoreThreadNote));
+    uint64_t fileNoteBytes=0;
     {
         KMutexLock(&space->mutation);
         struct Unlock { KMutex* lock;~Unlock(){KMutexUnlock(lock);} } unlock{&space->mutation};
         auxWords=space->savedAuxvWords;
         if(auxWords>AddressSpaceState::SavedAuxvWords){result.stage="auxv";return -5;}
-        result.stage="layout";
         memcpy(aux,space->savedAuxv,uint64_t(auxWords)*sizeof(*aux));
+        if(auxWords)notes+=CoreNoteSize(uint64_t(auxWords)*8);
+        result.stage="layout";
+        const auto eligible=[&](const MappingRange& range){
+            return range.kind!=MappingKind::Device && (range.protection&1) &&
+                   (full || range.sharing!=MappingSharing::Shared || range.kind==MappingKind::File);
+        };
+        const auto filePath=[](const MappingRange& range)->const char*{
+            const auto* file=range.kind==MappingKind::File && range.backing?range.backing->fileVnode:nullptr;
+            const char* name=file?file->directoryPath:nullptr;
+            return name && name[0]=='/' && NameLength(name)<MaxFilePath?name:nullptr;
+        };
+        // Bound NT_FILE by bytes so a large set of short file mappings
+        // needs little memory. Register notes have priority over file names.
+        const uint32_t fileBudget=byteLimit/16<MaxFileNoteBytes?uint32_t(byteLimit/16):MaxFileNoteBytes;
         for(const auto* node=space->ranges.head;node;node=node->next){
             if(expired())return -110;
             const auto& range=node->range;
-            if(range.kind==MappingKind::Device || !(range.protection&1))continue;
-            if(range.sharing==MappingSharing::Shared && range.kind!=MappingKind::File && !full)continue;
-            const auto* file=range.kind==MappingKind::File && range.backing?range.backing->fileVnode:nullptr;
-            const char* name=file?file->directoryPath:nullptr;
-            const bool named=name && name[0]=='/' && NameLength(name)<sizeof(CoreFileName::name);
-            if(named){
-                if(fileCount==MaxFileNotes){result.stage="file-notes";return -7;}
-                auto& entry=files.ptr[fileCount++];
-                entry.begin=range.begin;entry.end=range.end;entry.pageOffset=range.offset/CorePageSize;
-                CopyName(entry.name,sizeof(entry.name),name);
-                fileNameBytes+=NameLength(entry.name)+1;
-            }
+            if(!eligible(range))continue;
             ++result.mappings;
-            uint64_t pages=0;
-            if(!VmmCollectRangeAddresses(space->pageTable,range.begin,range.end,addresses.ptr,
-                                         maxResidentPages,&pages)){result.stage="resident-pages";return -7;}
-            const uint32_t flags=ElfProtection(range.protection);
-            if(!named || full)result.holes+=(range.end-range.begin)/CorePageSize-pages;
-            uint32_t active=0;
-            for(uint64_t i=0;i<pages;++i){
-                if((i&255)==0 && expired())return -110;
-                const uint64_t va=addresses.ptr[i];
-                const uint64_t leaf=VmmReadLeaf(space->pageTable,VirtualAddress(va));
-                if((leaf&(VMM_PRESENT|VMM_USER))!=(VMM_PRESENT|VMM_USER)){
-                    if(!named || full)++result.holes;
-                    continue;
-                }
-                // Writable private file pages can contain modifications even
-                // if a concurrent protection change cleared their dirty bit.
-                if(!full && named && !(leaf&VMM_DIRTY) &&
-                   !(range.sharing==MappingSharing::Private && (range.protection&2)))continue;
-                if(loadBytes>byteLimit-CorePageSize){result.stage="byte-budget";layoutError=-27;break;}
-                if(active && programs.ptr[active].address+programs.ptr[active].memorySize==va){
-                    programs.ptr[active].memorySize+=CorePageSize;
-                    programs.ptr[active].fileSize+=CorePageSize;
-                }else{
-                    if(programCount==MaxPrograms){result.stage="load-segments";layoutError=-7;break;}
-                    active=programCount++;
-                    programs.ptr[active]={1,flags,0,va,0,CorePageSize,CorePageSize,CorePageSize};
-                    identities.ptr[active]=range.identity;
-                }
-                loadBytes+=CorePageSize;
+            const char* name=filePath(range);
+            if(!name)continue;
+            const uint32_t nameBytes=NameLength(name)+1;
+            const uint32_t wanted=fileNames.size+nameBytes;
+            if(16+uint64_t(files.size+1)*24+wanted>fileBudget ||
+               !files.reserve(files.size+1,fileBudget/24) || !fileNames.reserve(wanted,fileBudget)){
+                ++result.discarded.fileNotes;
+                continue;
             }
-            if(layoutError)break;
+            files.data[files.size++]={range.begin,range.end,range.offset/CorePageSize};
+            memcpy(fileNames.data+fileNames.size,name,nameBytes);
+            fileNames.size=wanted;
+        }
+        if(files.size){
+            fileNoteBytes=16+uint64_t(files.size)*24+fileNames.size;
+            notes+=CoreNoteSize(fileNoteBytes);
+        }
+        if(CorePageAlign(CoreHeaderBytes(1)+notes)>byteLimit){
+            result.stage="byte-budget";
+            return -27;
+        }
+        const auto stackOrHeap=[&](const MappingRange& range){
+            if(range.kind==MappingKind::Stack || range.kind==MappingKind::Heap)return true;
+            // pthread stacks can be anonymous mmap ranges rather than
+            // MappingKind::Stack. Prioritize the mappings with a saved RSP.
+            if(range.kind==MappingKind::Anonymous && (range.protection&2))
+                for(uint32_t i=0;i<result.threads;++i){
+                    const uint64_t rsp=threads[i].registers.rsp;
+                    if(rsp && rsp>=range.begin && rsp<range.end)return true;
+                }
+            return false;
+        };
+        uint32_t maxPages=CoreLoadPageBudget(byteLimit,notes);
+        // Reserve working memory before reading pages. Failure to grow later
+        // truncates lower-priority pages while leaving a valid prefix.
+        if(maxPages && !selected.reserve(maxPages<256?maxPages:256,maxPages))return -12;
+        for(unsigned pass=0;pass<CorePagePriorities;++pass){
+            runs[pass].begin=selected.size;
+            for(const auto* node=space->ranges.head;node;node=node->next){
+                if(expired())return -110;
+                const auto& range=node->range;
+                if(!eligible(range))continue;
+                const bool named=filePath(range)!=nullptr;
+                const unsigned priority=stackOrHeap(range)?CoreStackHeap:
+                    named && !(range.protection&2)?CoreReadOnlyFile:CoreOtherData;
+                if(priority!=pass)continue;
+                uint64_t resident=0;
+                const uint32_t flags=ElfProtection(range.protection);
+                const auto visitor=[&](uint64_t va){
+                    const uint64_t leaf=VmmReadLeaf(space->pageTable,VirtualAddress(va));
+                    if((leaf&(VMM_PRESENT|VMM_USER))!=(VMM_PRESENT|VMM_USER)){
+                        if(!named || full)++result.holes;
+                        return;
+                    }
+                    if(!full && named && !(leaf&VMM_DIRTY) &&
+                       !(range.sharing==MappingSharing::Private && (range.protection&2)))return;
+                    if(!selected.reserve(selected.size+1,maxPages)){
+                        maxPages=selected.size;
+                        if(priority==CoreReadOnlyFile)++result.discarded.filePages;
+                        else if(priority==CoreStackHeap)++result.discarded.stackHeapPages;
+                        else ++result.discarded.dataPages;
+                    }else selected.data[selected.size++]={va,range.identity,flags};
+                };
+                if(!VisitCorePages(space->pageTable,range.begin,range.end,addresses.ptr,resident,visitor,expired)){
+                    result.stage="resident-pages";
+                    return expired()?-110:-5;
+                }
+                if(!named || full)result.holes+=(range.end-range.begin)/CorePageSize-resident;
+            }
+            runs[pass].end=selected.size;
         }
     }
-    if(layoutError)return layoutError;
 
-    const uint64_t fileNoteBytes=16+uint64_t(fileCount)*24+fileNameBytes;
-    uint64_t notes=CoreNoteSize(sizeof(info))+uint64_t(result.threads)*CoreNoteSize(sizeof(CoreThreadNote));
-    if(auxWords)notes+=CoreNoteSize(uint64_t(auxWords)*8);
-    if(fileCount)notes+=CoreNoteSize(fileNoteBytes);
-    const uint64_t noteOffset=sizeof(CoreElfHeader)+uint64_t(programCount)*sizeof(CoreProgramHeader);
+    const CorePageCursor loads(selected.data,runs);
+    const uint32_t programCount=CoreBuildLoads(loads,nullptr);
+    Allocation<CoreProgramHeader> programs(programCount);
+    if(!programs.ptr){result.stage="allocate";return -12;}
+    (void)CoreBuildLoads(loads,programs.ptr);
+    const uint64_t noteOffset=CoreHeaderBytes(programCount);
     programs.ptr[0]={4,0,noteOffset,0,0,notes,0,4};
     uint64_t finalBytes=CorePageAlign(noteOffset+notes);
-    if(finalBytes>byteLimit || loadBytes>byteLimit-finalBytes){result.stage="byte-budget";return -27;}
+    if(finalBytes>byteLimit || uint64_t(selected.size)*CorePageSize>byteLimit-finalBytes){
+        result.stage="byte-budget";
+        return -27;
+    }
     for(uint32_t i=1;i<programCount;++i){
         programs.ptr[i].offset=finalBytes;
         finalBytes+=programs.ptr[i].fileSize;
@@ -239,27 +325,29 @@ int CoreDumpWriteSnapshot(CoreDumpSnapshot& snapshot,const char* path,bool full,
         for(uint32_t i=0;i<result.threads;++i)
             if(!CoreWriteNote(out,CoreNtStatus,&threads[i],sizeof(CoreThreadNote)))return false;
         if(auxWords && !CoreWriteNote(out,CoreNtAuxv,aux,auxWords*8))return false;
-        if(fileCount){
+        if(files.size){
             const CoreNoteHeader header{5,uint32_t(fileNoteBytes),CoreNtFile};
             const char owner[8]="CORE";
-            const uint64_t counts[]={fileCount,CorePageSize};
+            const uint64_t counts[]={files.size,CorePageSize};
             if(!out.write(&header,sizeof(header)) || !out.write(owner,sizeof(owner)) ||
                !out.write(counts,sizeof(counts)))return false;
-            for(uint32_t i=0;i<fileCount;++i){
-                const auto& entry=files.ptr[i];
+            for(uint32_t i=0;i<files.size;++i){
+                const auto& entry=files.data[i];
                 const uint64_t mapping[]={entry.begin,entry.end,entry.pageOffset};
                 if(!out.write(mapping,sizeof(mapping)))return false;
             }
-            for(uint32_t i=0;i<fileCount;++i)
-                if(!out.write(files.ptr[i].name,NameLength(files.ptr[i].name)+1))return false;
+            if(!out.write(fileNames.data,fileNames.size))return false;
             const uint32_t zero=0;
             if(!out.write(&zero,(-fileNoteBytes)&3))return false;
         }
+        CorePageCursor pages=loads;
         for(uint32_t i=1;i<programCount;++i){
             const auto& load=programs.ptr[i];
             for(uint64_t offset=0;offset<load.fileSize;offset+=CorePageSize){
                 if(expired()){out.error=-110;return false;}
-                if(!UserMappingReadResidentPage(space,load.address+offset,identities.ptr[i],page.ptr)){
+                CorePageRef ref{};
+                if(!pages.next(ref) || ref.address!=load.address+offset){out.error=-5;return false;}
+                if(!UserMappingReadResidentPage(space,ref.address,ref.identity,page.ptr)){
                     ++result.holes;
                     continue;
                 }

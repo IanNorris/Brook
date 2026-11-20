@@ -30,6 +30,7 @@ stdenv.mkDerivation {
   postUnpack = ''
     cp ${../../src/shared/surface_geometry.h} "$sourceRoot/surface-geometry.h"
     cp ${../../src/shared/dmabuf_layout.h} "$sourceRoot/dmabuf-layout.h"
+    cp ${../../src/shared/wm_input_abi.h} "$sourceRoot/wm-input-abi.h"
     cp ${../../src/shared/wm_window_state.h} "$sourceRoot/wm-window-state.h"
     cp ${../../src/kernel/src/gpu_scene_abi.h} "$sourceRoot/gpu-scene-abi.h"
     cp ${../../src/shared/gpu_buffer_abi.h} "$sourceRoot/gpu_buffer_abi.h"
@@ -53,6 +54,8 @@ stdenv.mkDerivation {
   doCheck = true;
 
   checkPhase = ''
+    $CC -O2 -UNDEBUG -Wall -Wextra -Werror latency-stats-test.c -o latency-stats-test
+    ./latency-stats-test
     $CC -O2 -UNDEBUG -Wall -Wextra -I. surface-blit-test.c -o surface-blit-test
     ./surface-blit-test
     $CC -O2 -UNDEBUG -Wall -Wextra intel-pending-drain-test.c -o intel-pending-drain-test
@@ -122,6 +125,11 @@ stdenv.mkDerivation {
         linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c relative-pointer-v1-protocol.c pointer-constraints-v1-protocol.c \
         -L${wayland}/lib -lwayland-server -o pointer-hit-test
     ./pointer-hit-test
+    $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
+        pointer-scroll-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
+        linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c relative-pointer-v1-protocol.c pointer-constraints-v1-protocol.c \
+        -L${wayland}/lib -lwayland-server -o pointer-scroll-test
+    ./pointer-scroll-test
     $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
         capture-release-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
         linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c relative-pointer-v1-protocol.c pointer-constraints-v1-protocol.c \

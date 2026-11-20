@@ -123,15 +123,21 @@ struct BrookDesktopFocus {
 #define BROOK_DESKTOP_SURFACE_VOLUME_POPUP 5
 #define BROOK_DESKTOP_SURFACE_TOOLTIP 6
 #define BROOK_DESKTOP_SURFACE_BOOT_SUMMARY 7
+#define BROOK_DESKTOP_SURFACE_TRAY_FLYOUT 8
+#define BROOK_DESKTOP_SURFACE_PERFORMANCE_HUD 9
 #define BROOK_DESKTOP_MATERIAL_OPAQUE 0
 #define BROOK_DESKTOP_MATERIAL_GLASS 1         // needs backdrop blur; level = blur radius
 // The 64 px nine-slice of brook_chrome_shadow.h, spread past each outer edge
 // and drawn beneath the surface at shadowAlpha.
 #define BROOK_DESKTOP_SHADOW_NONE 0
-#define BROOK_DESKTOP_SHADOW_WINDOW 1
+#define BROOK_DESKTOP_SHADOW_WINDOW 1          // legacy tile
+#define BROOK_DESKTOP_SHADOW_WINDOW_ACTIVE 2
+#define BROOK_DESKTOP_SHADOW_WINDOW_INACTIVE 3
+#define BROOK_DESKTOP_SHADOW_PANEL 4
 // Every pixel of the surface outside its client rectangle has alpha 255 (at
 // opacity 255 it may replace what lies beneath).
 #define BROOK_DESKTOP_SURFACE_OPAQUE 1u
+#define BROOK_DESKTOP_SURFACE_LIGHT_SHADOW 2u
 struct BrookDesktopSurface {
     uint32_t kind,window;           // window: the layer's window id (0: a shell surface)
     uint64_t incarnation;           // the layer's incarnation (0: a shell surface)
@@ -153,6 +159,32 @@ struct BrookDesktopOverlaySurfaces {
     uint32_t count,reserved;
     struct BrookDesktopSurface surfaces[4];
 };
+// Renderer capabilities (compositor refactor stage 1.5). Op 18: address =
+// size = 0, a = BROOK_DESKTOP_CAPS_VERSION, b = the renderer's
+// BROOK_DESKTOP_CAP_* bits, c = 0. Returns (>= 0) the bits this kernel knows
+// and recorded; unknown bits are dropped, never an error. The record belongs
+// to the calling process (its leader incarnation, the present-lease owner)
+// and counts only while that owner holds the present lease. Detach and exit
+// drop it, so report after every attach; a new report replaces the old one
+// and b = 0 withdraws it. Older kernels return EINVAL: no capability is ever
+// used for this renderer (Glass resolves to its Opaque stand-in), as before.
+//
+// BROOK_DESKTOP_CAP_BACKDROP_BLUR: the renderer blurs what lies beneath a
+// surface record whose material is BROOK_DESKTOP_MATERIAL_GLASS (level: the
+// blur radius in output pixels, 2/8/16 for Light/Moderate/Heavy, as virgl)
+// and composites the surface over that blurred backdrop at its alpha. While
+// the owner holds the lease and Glass is the selected theme, the kernel then
+// resolves Glass instead of its Opaque stand-in: frame and shell records
+// carry MATERIAL_GLASS with the level, glass radii and window shadows; chrome
+// captures (ops 7/8/11/12/17) carry the glass alpha (title-bar material
+// alpha, opaque text and accent stroke, rounded corners, exactly virgl's
+// chrome layer); overlay captures give glass shell surfaces the material
+// alpha, and their op 9 bands are not opaque. Without the bit, or with an
+// older kernel, every record is opaque and nothing is translucent.
+#define BROOK_DESKTOP_RENDERER_CAPS 18
+#define BROOK_DESKTOP_CAPS_VERSION 1
+#define BROOK_DESKTOP_CAP_BACKDROP_BLUR 1u
+#define BROOK_DESKTOP_CAP_KNOWN BROOK_DESKTOP_CAP_BACKDROP_BLUR
 #define BROOK_DESKTOP_LAYER_LEGACY_OPAQUE 1u
 // Omitted means 255; older renderers reject these new flag bits safely.
 #define BROOK_DESKTOP_LAYER_HAS_OPACITY 2u

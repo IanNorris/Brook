@@ -12,6 +12,9 @@
 
 using TaskbarLayout = ChromeTaskbarLayout;
 
+enum class WmHudMode : uint8_t { Off, Compact, Panel };
+static WmHudMode g_hudMode;
+
 // Debug-bridge agent indicator cache (see WmAgentIndicatorRefresh).
 static uint8_t g_agentIndicatorState = 0; // BridgePresenceState
 static uint32_t g_agentIndicatorPeer = 0;
@@ -21,24 +24,38 @@ static TaskbarLayout GetTaskbarLayout(uint32_t screenW, uint32_t screenH)
 {
     char clockText[32];
     RtcFormatTaskbar(clockText, RtcNow(), false);
+    // Build label: the payload name (e.g. "dell-int51-20261119") when the
+    // boot has one, else the short commit. The tooltip has the detail.
+    char buildText[48]{};
+    if (g_buildChip) {
+        if (g_buildPayloadId[0]) WmStrCopy(buildText, g_buildPayloadId, sizeof(buildText));
+        else {
+            WmStrCopy(buildText, BuildGitHash(), sizeof(buildText));
+            for (char* p = buildText; *p; ++p) if (*p == '+') { *p = 0; break; }
+        }
+    }
     int ids[WM_MAX_WINDOWS + LaunchFeedbackTable::Capacity], total = 0, focused = 0;
+    const char* labels[WM_MAX_WINDOWS + LaunchFeedbackTable::Capacity];
     for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
     {
         const Window& w = g_windows[i];
         if (!w.proc || !w.visible || !w.focusable) continue;
         if (w.focused) focused = total;
+        labels[total] = WindowDisplayTitle(w);
         ids[total++] = static_cast<int>(i);
     }
     SpinLockAcquire(&g_launchLock);
     for (unsigned i = 0; i < LaunchFeedbackTable::Capacity; ++i) {
         if (!g_launches.entries[i].present()) continue;
         if (g_taskbarPageTarget == -10 - static_cast<int>(i)) focused = total;
+        labels[total] = nullptr; // launch feedback: icon only
         ids[total++] = -10 - static_cast<int>(i);
     }
     SpinLockRelease(&g_launchLock);
     return ChromeTaskbarLayoutFor(WmChromeStyle(), screenW, screenH, clockText,
                                   __atomic_load_n(&g_agentIndicatorState, __ATOMIC_ACQUIRE) != 0,
-                                  WmGetTaskbarMetrics(), ids, total, focused);
+                                  WmGetTaskbarMetrics(), ids, total, focused, buildText, g_hudMode == WmHudMode::Compact,
+                                  labels);
 }
 
 // Network indicator. The compositor thread refreshes this cache at most once
@@ -201,11 +218,7 @@ static void WmVolumeApply(uint32_t control)
 static TaskbarVolumePopupLayout WmVolumePopupLayout(uint32_t screenW, uint32_t screenH)
 {
     const TaskbarLayout t = GetTaskbarLayout(screenW, screenH);
-    WmBuildIdText label{};
-    WmRect badge{};
-    const bool hasBadge = WmBuildIdLayout(screenW, screenH, label, badge);
-    return TaskbarVolumePopup(WmDesktopMetrics(), t.volume, t.y, static_cast<int>(screenW), WmTextWidth("100%"),
-                              hasBadge ? &badge : nullptr);
+    return TaskbarVolumePopup(WmDesktopMetrics(), t.volume, t.y, static_cast<int>(screenW), ChromeVolumeValueWidth(WmChromeStyle()));
 }
 
 static bool WmVolumeIconContains(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)
@@ -235,6 +248,7 @@ bool WmVolumeLeftPress(int32_t mx, int32_t my, uint32_t screenW, uint32_t screen
     if (!g_volumePopupOpen) {
         if (!WmVolumeIconContains(mx, my, screenW, screenH)) return false;
         WmLauncherClose();
+        WmTrayFlyoutClose();
         g_volumePopupOpen = true;
         PointerActivationCancel();
         return true;
@@ -278,106 +292,264 @@ bool WmVolumeToggleMuteAt(int32_t mx, int32_t my, uint32_t screenW, uint32_t scr
     return true;
 }
 
-// Shell painters build their list, then either execute it (key == nullptr)
-// or return its content key seeded with keySeed (WmShellSurfaceKey).
-static void WmVolumePopupSurface(uint32_t* pixels, uint32_t stride, uint32_t screenW, uint32_t screenH,
-                                 int32_t mouseX, int32_t mouseY, uint64_t keySeed, uint64_t* key)
+static void WmCaptureVolumePopup(uint32_t screenW, uint32_t screenH, int32_t mouseX, int32_t mouseY,
+                                 ChromeShellModel& snapshot)
 {
-    if (!g_volumePopupOpen || (!pixels && !key)) return;
-    const ChromeVolumePopupModel model{WmVolumePopupLayout(screenW, screenH), g_volumeControl, g_volumeAvailable,
-                                       g_volumeDragging, mouseX, mouseY};
-    ChromeDisplayList list = ChromeListOn(g_shellListStorage);
-    ChromeBuildVolumePopup(model, WmChromeStyle(), list);
-    if (key) *key = ChromeListKey(list, keySeed);
-    else ChromeExecute(list, {pixels, stride, screenW, screenH}, WmDesktopFont());
-}
-void WmVolumePopupRender(uint32_t* pixels, uint32_t stride, uint32_t screenW, uint32_t screenH,
-                         int32_t mouseX, int32_t mouseY)
-{
-    WmVolumePopupSurface(pixels, stride, screenW, screenH, mouseX, mouseY, 0, nullptr);
+    if (!g_volumePopupOpen) return;
+    snapshot.kind = ChromeShellKind::VolumePopup;
+    snapshot.volume.layout = WmVolumePopupLayout(screenW, screenH);
+    snapshot.volume.control = g_volumeControl;
+    snapshot.volume.available = g_volumeAvailable;
+    snapshot.volume.dragging = g_volumeDragging;
+    const auto& mute = snapshot.volume.layout.mute;
+    const bool hovered = mute.contains(mouseX, mouseY);
+    snapshot.volume.mouseX = hovered ? mute.x : -1;
+    snapshot.volume.mouseY = hovered ? mute.y : -1;
 }
 
-// Taskbar model: per-button icons and hover labels, tray state and the
-// telemetry snapshot. Launch entries copy their icon (owned by the launch
-// table under g_launchLock) into launchIcons.
-static uint32_t g_taskbarLaunchIcons[LaunchFeedbackTable::Capacity][LAUNCHER_ICON_PX * LAUNCHER_ICON_PX];
-static char g_taskbarLaunchLabels[LaunchFeedbackTable::Capacity][80];
-static ChromeTaskbarButton g_taskbarButtons[ChromeTaskbarButtonLimit];
-static TaskbarLayout g_taskbarLayout;
+enum class WmTrayFlyout : uint8_t { None, Network, Temperature };
+static WmTrayFlyout g_trayFlyout;
 
-static void WmTaskbarSurface(uint32_t* backBuffer, uint32_t stride,
-                             uint32_t screenW, uint32_t screenH,
-                             uint64_t uptimeMs, int32_t mouseX, int32_t mouseY, uint64_t keySeed, uint64_t* key)
+bool WmTrayFlyoutVisible() { return g_trayFlyout != WmTrayFlyout::None; }
+void WmTrayFlyoutClose() { g_trayFlyout = WmTrayFlyout::None; }
+void WmCyclePerformanceHud()
 {
-    if (!g_wmActive || (!backBuffer && !key)) return;
+    g_hudMode = g_hudMode == WmHudMode::Off ? WmHudMode::Compact :
+                g_hudMode == WmHudMode::Compact ? WmHudMode::Panel : WmHudMode::Off;
+}
+
+static DesktopRect WmTrayFlyoutLayout(uint32_t sw, uint32_t sh);
+
+bool WmTrayFlyoutPress(int32_t mx, int32_t my, uint32_t sw, uint32_t sh)
+{
+    if (WmTrayFlyoutLayout(sw, sh).contains(mx, my)) return true;
+    const auto l = GetTaskbarLayout(sw, sh);
+    if (l.hud.contains(mx, my)) {
+        g_hudMode = WmHudMode::Panel;
+        WmTrayFlyoutClose();
+        return true;
+    }
+    const auto next = WmTaskbarHidden() ? WmTrayFlyout::None :
+                      l.network.contains(mx, my) ? WmTrayFlyout::Network :
+                      l.metrics[6].contains(mx, my) ? WmTrayFlyout::Temperature : WmTrayFlyout::None;
+    if (!WmTrayFlyoutVisible() && next == WmTrayFlyout::None) return false;
+    g_trayFlyout = next == g_trayFlyout ? WmTrayFlyout::None : next;
+    if (WmTrayFlyoutVisible()) {
+        if (WmTrayFlyoutLayout(sw, sh).w <= 0) {
+            WmTrayFlyoutClose();
+            return true;
+        }
+        WmLauncherClose();
+        WmVolumePopupClose();
+        PointerActivationCancel();
+    }
+    return true;
+}
+
+// Whether the open flyout has live content: the network has an address, or a
+// package temperature is available. It sizes the panel to its content.
+static bool WmTrayFlyoutLive()
+{
+    if (g_trayFlyout == WmTrayFlyout::Network) return __atomic_load_n(&g_netIndicatorAddress, __ATOMIC_ACQUIRE) != 0;
+    ThermalSnapshot snap{};
+    return ThermalReadSnapshot(snap) && snap.latest.pkgC >= 0;
+}
+
+static DesktopRect WmTrayFlyoutLayout(uint32_t sw, uint32_t sh)
+{
+    if (!WmTrayFlyoutVisible() || WmTaskbarHidden()) return {};
+    const auto l = GetTaskbarLayout(sw, sh);
+    const auto anchor = g_trayFlyout == WmTrayFlyout::Network ? l.network : l.metrics[6];
+    const int gap = WmMetric(ChromeShellMetrics::PanelMargin);
+    const int h = ChromeTrayFlyoutHeight(WmChromeStyle(), g_trayFlyout == WmTrayFlyout::Network, WmTrayFlyoutLive());
+    if (!anchor.w || l.y < h + 2 * gap || sw < WmMetric(180)) return {};
+    // 304 wide, centred on its tray target and kept 8 px from the screen
+    // edge and the taskbar (as the prototype's fly()).
+    const int available = int(sw) - 2 * gap;
+    const int preferred = WmMetric(304);
+    return TaskbarTooltipBox(anchor, preferred < available ? preferred : available, h, l.y, gap, sw, gap);
+}
+
+static bool WmHudThermal()
+{
+    ThermalSnapshot snap{};
+    return ThermalReadSnapshot(snap) && snap.latest.pkgC >= 0;
+}
+
+static DesktopRect WmPerformanceHudLayout(uint32_t sw, uint32_t sh)
+{
+    if (WmTaskbarHidden() || g_hudMode != WmHudMode::Panel) return {};
+    const int margin = WmMetric(ChromeShellMetrics::PanelMargin);
+    const int deskH = WmDesktopHeight(sh);
+    const int h = ChromePerformanceHudHeight(WmChromeStyle(), WmHudThermal());
+    const int w = WmMetric(348);
+    if (int(sw) < w + 2 * margin || deskH < h + 2 * margin) return {};
+    return {int(sw) - w - margin, deskH - h - margin, w, h};
+}
+
+static bool WmPanelRect(DesktopRect r, int32_t* x, int32_t* y, uint32_t* w, uint32_t* h)
+{
+    if (r.w <= 0 || r.h <= 0) return false;
+    *x = r.x; *y = r.y; *w = r.w; *h = r.h;
+    return true;
+}
+
+bool WmTrayFlyoutRect(uint32_t sw, uint32_t sh, int32_t* x, int32_t* y, uint32_t* w, uint32_t* h)
+{
+    return WmPanelRect(WmTrayFlyoutLayout(sw, sh), x, y, w, h);
+}
+
+bool WmPerformanceHudRect(uint32_t sw, uint32_t sh, int32_t* x, int32_t* y, uint32_t* w, uint32_t* h)
+{
+    return WmPanelRect(WmPerformanceHudLayout(sw, sh), x, y, w, h);
+}
+
+static ChromePerformanceHudModel WmHudModel(DesktopRect rect)
+{
+    // Snapshot the histories together. Polling keys and rasterising the
+    // result use the same data even when a client reports a new frame.
+    static ChromePerformanceHudModel model{};
+    static DesktopIntervals<> app, comp;
+    static ThermalSample temp[ThermalGraphHistory];
+    const uint64_t now = ApicTickCount();
+    if (!model.telemetry.app || now - model.tick >= 500) {
+        model.tick = now;
+        model.telemetry = WmTelemetryModel(true, true);
+        app = *model.telemetry.app;
+        comp = *model.telemetry.compositor;
+        model.telemetry.app = &app;
+        model.telemetry.compositor = &comp;
+        for (unsigned i = 0; i < model.telemetry.pointCount; ++i) temp[i] = model.telemetry.points[i];
+        model.telemetry.points = temp;
+    }
+    model.rect = rect;
+    return model;
+}
+
+static void WmCaptureTrayFlyout(uint32_t sw, uint32_t sh, ChromeShellModel& snapshot)
+{
+    const auto rect = WmTrayFlyoutLayout(sw, sh);
+    if (rect.w <= 0) return;
+    const bool network = g_trayFlyout == WmTrayFlyout::Network;
+    const uint32_t address = __atomic_load_n(&g_netIndicatorAddress, __ATOMIC_ACQUIRE);
+    if (network && address) {
+        BootText label(snapshot.text, sizeof(snapshot.text));
+        const auto* bytes = reinterpret_cast<const uint8_t*>(&address);
+        for (unsigned i = 0; i < 4; ++i) {
+            if (i) label.Add(".");
+            label.Number(bytes[i]);
+        }
+    }
+    snapshot.kind = ChromeShellKind::TrayFlyout;
+    snapshot.rect = rect;
+    snapshot.network = network;
+    snapshot.networkConnected = address != 0;
+    const auto source = WmTelemetryModel(false, !network);
+    if (!network) WmCaptureThermal(snapshot.telemetry, source, true);
+    else if (snapshot.networkConnected) {
+        snapshot.telemetry.stats.downBytesPerSecond = WmShellRate(source.stats.downBytesPerSecond);
+        snapshot.telemetry.stats.upBytesPerSecond = WmShellRate(source.stats.upBytesPerSecond);
+    }
+}
+
+static void WmCapturePerformanceHud(uint32_t sw, uint32_t sh, ChromeShellModel& snapshot)
+{
+    const auto rect = WmPerformanceHudLayout(sw, sh);
+    if (rect.w <= 0) return;
+    const auto model = WmHudModel(rect);
+    snapshot.kind = ChromeShellKind::PerformanceHud;
+    snapshot.rect = model.rect;
+    snapshot.hudTick = ShellCadenceTick;
+    WmCaptureHudCadence(snapshot.telemetry, model);
+    WmCaptureThermal(snapshot.telemetry, model.telemetry, true);
+}
+
+static void WmCaptureTaskbar(uint32_t screenW, uint32_t screenH, uint64_t uptimeMs,
+                             int32_t mouseX, int32_t mouseY, ChromeShellModel& snapshot)
+{
+    if (!g_wmActive) return;
     LauncherReadGuard icons;
-    TaskbarLayout& l = g_taskbarLayout;
-    l = GetTaskbarLayout(screenW, screenH);
-    for (int i = 0; i < l.count; ++i)
-    {
-        ChromeTaskbarButton& b = g_taskbarButtons[i];
-        b = {};
-        if (l.indices[i] <= -10) {
-            const unsigned slot = static_cast<unsigned>(-10 - l.indices[i]);
-            LaunchFeedback e;
-            bool hasIcon;
+    snapshot.kind = ChromeShellKind::Taskbar;
+    snapshot.taskbar = GetTaskbarLayout(screenW, screenH);
+    auto& layout = snapshot.taskbar;
+    bool busy = false;
+    for (int i = 0; i < layout.count; ++i) {
+        const int index = layout.indices[i];
+        layout.indices[i] = 0; // only the WM hit test needs these identities
+        auto& entry = snapshot.entries[i];
+        auto& icon = snapshot.icons[i];
+        if (index <= -10) {
+            const auto slot = static_cast<unsigned>(-10 - index);
             SpinLockAcquire(&g_launchLock);
-            e = g_launches.entries[slot];
-            hasIcon = g_launchRequests[slot].hasIcon;
-            if (hasIcon) memcpy(g_taskbarLaunchIcons[slot], g_launchRequests[slot].icon, sizeof(g_taskbarLaunchIcons[slot]));
+            entry.busy = g_launches.entries[slot].busy();
+            if (g_launchRequests[slot].hasIcon) WmCaptureShellIcon(icon, g_launchRequests[slot].icon);
             SpinLockRelease(&g_launchLock);
-            char* label = g_taskbarLaunchLabels[slot];
-            WmStrCopy(label, e.busy() ? "Starting: " :
-                e.phase == LaunchPhase::TimedOut ? "Still waiting: " :
-                e.phase == LaunchPhase::Exited ? "Exited without a window: " : "Launch failed: ", sizeof(g_taskbarLaunchLabels[slot]));
-            const size_t n = strlen(label);
-            WmStrCopy(label + n, e.title, sizeof(g_taskbarLaunchLabels[slot]) - n);
-            b.launch = true;
-            b.busy = e.busy();
-            b.icon = hasIcon ? g_taskbarLaunchIcons[slot] : icons.get().applicationIcon;
-            b.hoverTitle = label;
+            entry.launch = true;
+            busy |= entry.busy;
+            if (!icon.present) WmCaptureShellIcon(icon, icons.get().applicationIcon);
             continue;
         }
-        const Window& w = g_windows[l.indices[i]];
-        b.active = w.focused && !w.minimized;
-        b.minimized = w.minimized;
-        b.icon = WindowIcon(w, icons.get());
-        b.hoverTitle = w.title;
+        const Window& window = g_windows[index];
+        entry.active = window.focused && !window.minimized;
+        entry.minimized = window.minimized;
+        if (layout.buttons[i].w >= int(WmMetric(ChromeShellMetrics::TaskbarLabelMin)))
+            WmStrCopy(entry.label, WindowDisplayTitle(window), sizeof(entry.label));
+        WmCaptureShellIcon(icon, WindowIcon(window, icons.get()));
     }
-    ChromeTaskbarModel model{};
-    model.layout = &l;
-    model.buttons = g_taskbarButtons;
-    model.launcherOpen = g_launcherOpen;
-    model.appsIcon = icons.get().appsIcon;
-    model.terminalIcon = icons.get().terminalIcon;
-    model.networkConnected = __atomic_load_n(&g_netIndicatorAddress, __ATOMIC_ACQUIRE) != 0;
-    model.volumeControl = g_volumeControl;
-    model.volumeAvailable = g_volumeAvailable;
-    const uint8_t agent = __atomic_load_n(&g_agentIndicatorState, __ATOMIC_ACQUIRE);
-    model.agentShown = agent != 0;
-    model.agentStale = agent == static_cast<uint8_t>(BridgePresenceState::Stale);
-    model.telemetry = WmTelemetryModel(l);
-    model.uptimeMs = uptimeMs;
-    model.mouseX = mouseX; model.mouseY = mouseY;
-    ChromeDisplayList list = ChromeListOn(g_shellListStorage);
-    ChromeBuildTaskbar(model, WmChromeStyle(), list);
-    if (key) *key = ChromeListKey(list, keySeed);
-    else ChromeExecute(list, {backBuffer, stride, screenW, screenH}, WmDesktopFont());
-}
-void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
-                     uint32_t screenW, uint32_t screenH,
-                     uint64_t uptimeMs, int32_t mouseX, int32_t mouseY)
-{
-    WmTaskbarSurface(backBuffer, stride, screenW, screenH, uptimeMs, mouseX, mouseY, 0, nullptr);
+    layout.nextIndex = 0;
+    snapshot.launcherOpen = g_launcherOpen;
+    if (layout.network.w > 0)
+        snapshot.networkConnected = __atomic_load_n(&g_netIndicatorAddress, __ATOMIC_ACQUIRE) != 0;
+    if (layout.volume.w > 0) {
+        snapshot.volumeControl = g_volumeControl;
+        snapshot.volumeAvailable = g_volumeAvailable;
+    }
+    if (layout.agent.w > 0) {
+        const uint8_t agent = __atomic_load_n(&g_agentIndicatorState, __ATOMIC_ACQUIRE);
+        snapshot.agentShown = agent != 0;
+        snapshot.agentStale = agent == static_cast<uint8_t>(BridgePresenceState::Stale);
+    }
+    snapshot.uptimeMs = ShellCadenceTick + (busy ? (uptimeMs / 100 % 8) * 100 : 0);
+    const DesktopRect bounds{0, layout.y, layout.screenW, layout.screenH - layout.y};
+    const bool hovered = bounds.contains(mouseX, mouseY);
+    snapshot.mouseX = hovered ? mouseX : -1;
+    snapshot.mouseY = hovered ? mouseY : -1;
+    WmCaptureShellIcon(snapshot.icons[ChromeShellModel::AppsIcon], icons.get().appsIcon);
+    WmCaptureShellIcon(snapshot.icons[ChromeShellModel::TerminalIcon], icons.get().terminalIcon);
+    const bool comp = layout.metrics[4].w != 0, app = layout.metrics[5].w != 0;
+    const auto source = WmTelemetryModel(app, layout.metrics[6].w != 0, false);
+    auto& telemetry = snapshot.telemetry;
+    if (layout.metrics[0].w > 0) telemetry.stats.cpuPercent = source.stats.cpuPercent;
+    if (layout.metrics[1].w > 0) telemetry.stats.memoryPercent = source.stats.memoryPercent;
+    if (layout.metrics[2].w > 0) {
+        telemetry.stats.readBytesPerSecond = WmShellRate(source.stats.readBytesPerSecond);
+        telemetry.stats.writeBytesPerSecond = WmShellRate(source.stats.writeBytesPerSecond);
+    }
+    if (layout.metrics[3].w > 0) {
+        telemetry.stats.downBytesPerSecond = WmShellRate(source.stats.downBytesPerSecond);
+        telemetry.stats.upBytesPerSecond = WmShellRate(source.stats.upBytesPerSecond);
+    }
+    if (comp) {
+        telemetry.hasCompositor = true;
+        WmCaptureCadence(telemetry.compositor, *source.compositor, uptimeMs);
+    }
+    if (app) {
+        telemetry.hasApp = true;
+        WmCaptureCadence(telemetry.app, *source.app, uptimeMs, true);
+    }
+    WmCaptureThermal(telemetry, source, false);
+    if (layout.hud.w > 0) {
+        snapshot.hudTick = ShellCadenceTick;
+        WmCaptureHudCadence(snapshot.compactTelemetry, WmHudModel(layout.hud));
+    }
 }
 
-// Volume and network tooltips float in a small panel just above the
-// taskbar, centred on the hovered icon. They share the desktop overlay slot
-// with the launcher and the volume popup, so none shows while either is open.
+// Tooltips float above the taskbar, centred on the hovered control. The
+// launcher, volume popup and tray flyout take precedence.
 static bool WmTrayTooltip(uint32_t screenW, uint32_t screenH, int32_t mx, int32_t my,
-                          char (&text)[48], DesktopRect& box)
+                          char (&text)[48], const char*& detail, DesktopRect& box)
 {
-    if (!g_wmActive || g_launcherOpen || g_volumePopupOpen || WmTaskbarHidden()) return false;
+    if (!g_wmActive || g_launcherOpen || g_volumePopupOpen || WmTrayFlyoutVisible() || WmTaskbarHidden()) return false;
     const TaskbarLayout l = GetTaskbarLayout(screenW, screenH);
     const WmRect* anchor = nullptr;
     if (l.volume.contains(mx, my)) {
@@ -404,11 +576,53 @@ static bool WmTrayTooltip(uint32_t screenW, uint32_t screenH, int32_t mx, int32_
             *out = 0;
         } else WmStrCopy(text, "Network: disconnected", sizeof(text));
     }
+    if (!anchor) {
+        const WmRect* controls[] = {&l.apps, &l.terminal, &l.next};
+        const char* labels[] = {"Applications", "New terminal", "More windows"};
+        for (unsigned i = 0; i < sizeof(controls) / sizeof(*controls); ++i) {
+            if (!controls[i]->contains(mx, my)) continue;
+            anchor = controls[i];
+            WmStrCopy(text, labels[i], sizeof(text));
+            break;
+        }
+    }
+    if (!anchor) {
+        for (int i = 0; i < l.count; ++i) {
+            if (!l.buttons[i].contains(mx, my)) continue;
+            const int index = l.indices[i];
+            if (index <= -10) {
+                SpinLockAcquire(&g_launchLock);
+                const LaunchFeedback entry = g_launches.entries[-10 - index];
+                SpinLockRelease(&g_launchLock);
+                WmStrCopy(text, entry.busy() ? "Starting: " :
+                    entry.phase == LaunchPhase::TimedOut ? "Still waiting: " :
+                    entry.phase == LaunchPhase::Exited ? "Exited without a window: " : "Launch failed: ", sizeof(text));
+                const size_t length = strlen(text);
+                WmStrCopy(text + length, entry.title, sizeof(text) - length);
+            } else WmStrCopy(text, WindowDisplayTitle(g_windows[index]), sizeof(text));
+            if (!text[0]) break;
+            anchor = &l.buttons[i];
+            break;
+        }
+    }
+    if (!anchor && l.build.contains(mx, my)) {
+        anchor = &l.build;
+        // Payload (or "Brook build"), then commit with any dirty suffix and the build date.
+        static char buildDetail[64];
+        WmStrCopy(text, g_buildPayloadId[0] ? g_buildPayloadId : "Brook build", sizeof(text));
+        WmStrCopy(buildDetail, BuildGitHash(), sizeof(buildDetail));
+        const size_t used = strlen(buildDetail);
+        WmStrCopy(buildDetail + used, "  built ", sizeof(buildDetail) - used);
+        WmStrCopy(buildDetail + strlen(buildDetail), BuildDate(), sizeof(buildDetail) - strlen(buildDetail));
+        detail = buildDetail;
+    }
     if (!anchor) return false;
-    const int pad = ChromeTooltipPadding(WmChromeStyle());
-    box = TaskbarTooltipBox(*anchor, WmTextWidth(text) + 2 * pad,
-                            WmDesktopFont().lineHeight + static_cast<int>(WmMetric(10)), l.y,
-                            static_cast<int>(WmMetric(4)), static_cast<int>(screenW), static_cast<int>(WmMetric(4)));
+    const ChromeStyle style = WmChromeStyle();
+    const int margin = WmMetric(4);
+    int width = ChromeTooltipWidth(style, text, detail);
+    if (width > int(screenW) - 2 * margin) width = int(screenW) - 2 * margin;
+    box = TaskbarTooltipBox(*anchor, width, ChromeTooltipHeight(style, detail != nullptr), l.y,
+                            WmMetric(ChromeShellMetrics::PanelMargin), static_cast<int>(screenW), margin);
     return box.w > 0 && box.h > 0;
 }
 
@@ -416,27 +630,24 @@ bool WmTrayTooltipGetRect(uint32_t screenW, uint32_t screenH, int32_t mx, int32_
                           int32_t* outX, int32_t* outY, uint32_t* outW, uint32_t* outH)
 {
     char text[48]{};
+    const char* detail = nullptr;
     DesktopRect box{};
-    if (!WmTrayTooltip(screenW, screenH, mx, my, text, box)) return false;
+    if (!WmTrayTooltip(screenW, screenH, mx, my, text, detail, box)) return false;
     *outX = box.x; *outY = box.y; *outW = static_cast<uint32_t>(box.w); *outH = static_cast<uint32_t>(box.h);
     return true;
 }
 
-static void WmTrayTooltipSurface(uint32_t* pixels, uint32_t stride, uint32_t screenW, uint32_t screenH,
-                                 int32_t mx, int32_t my, uint64_t keySeed, uint64_t* key)
+static void WmCaptureTooltip(uint32_t screenW, uint32_t screenH, int32_t mx, int32_t my,
+                             ChromeShellModel& snapshot)
 {
     char text[48]{};
-    DesktopRect p{};
-    if ((!pixels && !key) || !WmTrayTooltip(screenW, screenH, mx, my, text, p)) return;
-    ChromeDisplayList list = ChromeListOn(g_shellListStorage);
-    ChromeBuildTooltip({p, text}, WmChromeStyle(), list);
-    if (key) *key = ChromeListKey(list, keySeed);
-    else ChromeExecute(list, {pixels, stride, screenW, screenH}, WmDesktopFont());
-}
-void WmTrayTooltipRender(uint32_t* pixels, uint32_t stride, uint32_t screenW, uint32_t screenH,
-                         int32_t mx, int32_t my)
-{
-    WmTrayTooltipSurface(pixels, stride, screenW, screenH, mx, my, 0, nullptr);
+    const char* detail = nullptr;
+    DesktopRect box{};
+    if (!WmTrayTooltip(screenW, screenH, mx, my, text, detail, box)) return;
+    snapshot.kind = ChromeShellKind::Tooltip;
+    snapshot.rect = box;
+    WmStrCopy(snapshot.text, text, sizeof(snapshot.text));
+    if (detail) WmStrCopy(snapshot.detail, detail, sizeof(snapshot.detail));
 }
 
 int WmTaskbarHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)

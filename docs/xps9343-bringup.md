@@ -3144,6 +3144,33 @@ successful queue shutdowns as stops, and combine unsafe and uncertain
 publication failures. A failed first publication may still have reserved its
 startup gap.
 
+Queue faults are always recorded (independent of the probe marker). Each one
+writes a single `HDA_RUNTIME fault N stage=... reason=... sample=...` KLog line
+and is retained as `first_fault`/`last_fault` in `bridge hardware
+dell-hda-queue`: stage and reason, the failing DMA position sample (before/after
+ns, LPIB, delta and allowance), read-only SDnCTL/SDnSTS/LPIB/CBL/BDL and
+INTSTS/WALCLK/DPLBASE snapshots before and after the bounded mute/stop, and
+whether mute and RUN-clear were verified. `dell-hda-runtime` adds the fault
+summary, the native audio clock's first-failure record (`clock.fail_reason` 3
+is a backwards TSC read, e.g. cross-CPU skew; the clock then stays failed for
+the boot) and `restart_refused`. A quarantined runtime refuses restart without
+counting an attempt, and the mixer retries a refused epoch with exponential
+backoff (up to about 10 s) instead of every 10 ms refresh.
+
+`/etc/dell-hda-fault-recovery` (opt-in, default off) admits a bounded recovery
+for software timing faults only: service-late, position-stalled,
+position-jump, clock-backwards, FIFOE-only device errors and publication
+overruns, and only when mute, RUN clear and BME off were verified and no DESE
+is latched. The restart then runs the clean-stop path once: verified mute,
+converter disconnect, stream reset (SRST) with descriptor clear, identity,
+decode and page revalidation, controller-idle check and a muted reprepare. At
+most three recoveries per boot, and a fault within 10 s of the last recovery,
+any failed step, an unavailable clock, or stop/shutdown while pending leaves
+the runtime quarantined with pages retained. Controller reset (CRST) is not
+attempted: it resets the codec link and every widget, invalidating the boot
+snapshot that mute/restore verification depends on, and the verified init path
+only runs at boot from decode-off with no owned DMA pages.
+
 On an opt-in muted Dell boot, an eight-second ALSA probe drained normally. Its
 active snapshots had no later reservations or empty-tail advances; after it
 closed, empty-tail counts rose during deliberate idle. A subsequent local

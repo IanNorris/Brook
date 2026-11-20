@@ -70,107 +70,131 @@ void WmNoteClientFrame(uint64_t identity,uint64_t commit) {
 // Telemetry for the taskbar builder: the sampled rates and loads, both
 // cadence histories and, when the TEMP metric is shown, the thermal graph.
 // Compositor thread only (the copies are static).
-static ChromeTelemetryModel WmTelemetryModel(const ChromeTaskbarLayout& l) {
+static ChromeTelemetryModel WmTelemetryModel(bool app, bool temp, bool graph = true) {
     ChromeTelemetryModel t{};
     t.stats=g_desktopStats;
     t.compositor=&g_desktopCadence;
     static DesktopIntervals<> appCopy;
-    if(l.metrics[5].w){SpinLockAcquire(&g_appCadenceLock);appCopy=g_appCadence;SpinLockRelease(&g_appCadenceLock);}
+    if(app){SpinLockAcquire(&g_appCadenceLock);appCopy=g_appCadence;SpinLockRelease(&g_appCadenceLock);}
     t.app=&appCopy;
-    if(l.metrics[6].w){
+    if(temp){
         static ThermalSample points[ThermalGraphHistory];
         ThermalSnapshot snap{};
         t.thermal=ThermalReadSnapshot(snap) && snap.latest.pkgC>=0;
         t.rapl=snap.rapl;t.tjmax=snap.tjmax;t.latest=snap.latest;
-        if(t.thermal){t.pointCount=ThermalReadGraph(points,ThermalGraphHistory);t.points=points;}
+        if(t.thermal && graph){t.pointCount=ThermalReadGraph(points,ThermalGraphHistory);t.points=points;}
     }
     return t;
 }
-// "Brook <build>" plus, on hardware payloads, a drawn middle dot and the
-// payload name (the desktop font is ASCII-only).
-struct WmBuildIdText { char main[48]; const char* suffix; int mainWidth, dotGap, dot; };
-static bool WmBuildIdLayout(uint32_t sw,uint32_t sh,WmBuildIdText& text,WmRect& rect) {
-    if(!WmIsActive())return false;
-    WmStrCopy(text.main,"Brook ",sizeof(text.main));WmStrCopy(text.main+6,BuildGitHash(),sizeof(text.main)-6);
-    text.suffix=g_buildPayloadId[0]?g_buildPayloadId:nullptr;
-    text.mainWidth=WmTextWidth(text.main);text.dotGap=WmMetric(6);text.dot=WmMetric(2)>1?WmMetric(2):1;
-    int width=text.mainWidth+WmMetric(14);
-    if(text.suffix)width+=2*text.dotGap+text.dot+WmTextWidth(text.suffix);
-    const int height=WmDesktopFont().lineHeight+WmMetric(6);
-    if(sw<static_cast<uint32_t>(width)+WmMetric(10)||sh<WmMetric(WM_TASKBAR_HEIGHT)+height+WmMetric(6))return false;
-    rect={int(sw)-width-int(WmMetric(8)),int(sh)-int(WmMetric(WM_TASKBAR_HEIGHT))-height-int(WmMetric(6)),width,height};
-    return true;
+// Builders use cadence timestamps only to test age. Translate the current
+// live window to a fixed render clock so inactive chrome stays unchanged.
+// This clock starts on a full launch-ring cycle and leaves room for all
+// eight animation steps without moving the live/expired boundaries.
+static constexpr uint64_t ShellCadenceTick = 10400;
+static constexpr uint64_t ShellRecentSample = 1200;
+
+static void WmCaptureCadence(DesktopIntervals<>& out, const DesktopIntervals<>& source,
+                            uint64_t observed, bool taskbarApp = false) {
+    out.next = source.next;
+    out.count = source.count;
+    if (taskbarApp && source.last && observed >= source.last && observed - source.last <= 2000)
+        out.last = ShellCadenceTick;
+    for (unsigned i = 0; i < source.count; ++i) {
+        const auto& sample = source.samples[i];
+        if (observed < sample.tick || observed - sample.tick > 10000) continue;
+        out.samples[i].tick = ShellRecentSample;
+        out.samples[i].ms = sample.ms;
+    }
 }
-// Draws the label text with its top-left glyph origin at (x,y) in a buffer
-// of sw x sh pixels (a full frame, or one row for the span path).
-static void WmDrawBuildIdText(uint32_t* pixels,uint32_t stride,uint32_t sw,uint32_t sh,int x,int y,
-                          const WmBuildIdText& text,const WmRect* clip) {
-    const ChromeTarget target{pixels,stride,sw,sh};
-    ChromeRenderString(target,WmDesktopFont(),x,y,text.main,WmCurrentPalette().badgeText,0,clip);
-    if(!text.suffix)return;
-    const int dotX=x+text.mainWidth+text.dotGap,dotY=y+(WmDesktopFont().lineHeight-text.dot)/2;
-    int l=dotX,t=dotY,r=dotX+text.dot,b=dotY+text.dot;
-    if(clip){if(l<clip->x)l=clip->x;if(t<clip->y)t=clip->y;
-        if(r>clip->x+clip->w)r=clip->x+clip->w;if(b>clip->y+clip->h)b=clip->y+clip->h;}
-    if(r>l && b>t)ChromeFillRect(target,l,t,r-l,b-t,WmCurrentPalette().badgeText);
-    ChromeRenderString(target,WmDesktopFont(),dotX+text.dot+text.dotGap,y,text.suffix,WmCurrentPalette().badgeText,0,clip);
+
+static uint64_t WmShellRate(uint64_t bytes) {
+    const uint64_t tenths = bytes / 100000;
+    return (tenths > 99999 ? 99999 : tenths) * 100000;
 }
-void WmDrawBuildId(uint32_t* pixels,uint32_t stride,uint32_t sw,uint32_t sh,const WmRect* clip) {
-    WmBuildIdText text{};WmRect rect{};if(!WmBuildIdLayout(sw,sh,text,rect))return;
-    const int x=rect.x,y=rect.y,width=rect.w,height=rect.h;
-    const int left=clip && clip->x>x?clip->x:x,top=clip && clip->y>y?clip->y:y;
-    const int right=clip && clip->x+clip->w<x+width?clip->x+clip->w:x+width;
-    const int bottom=clip && clip->y+clip->h<y+height?clip->y+clip->h:y+height;
-    if(right<=left||bottom<=top)return;
-    ChromeFillRect({pixels,stride,sw,sh},left,top,right-left,bottom-top,WmCurrentPalette().badgeFill);
-    WmDrawBuildIdText(pixels,stride,sw,sh,x+WmMetric(7),y+WmMetric(3),text,clip);
+
+static void WmCaptureThermal(ChromeShellTelemetry& out, const ChromeTelemetryModel& source, bool graph) {
+    if (!source.thermal || source.latest.pkgC < 0) return;
+    out.thermal = true;
+    out.tjmax = source.tjmax;
+    out.latest.pkgC = source.latest.pkgC;
+    if (!graph) return;
+    out.rapl = source.rapl;
+    if (source.points && source.pointCount) {
+        out.latest.pkgC = 0; // the readout uses the newest graph point
+        out.pointCount = source.pointCount;
+        for (unsigned i = 0; i < out.pointCount; ++i)
+            out.points[i].pkgC = source.points[i].pkgC;
+        if (out.rapl)
+            out.points[out.pointCount - 1].pkgMw = source.points[out.pointCount - 1].pkgMw / 100 * 100;
+    } else if (out.rapl) out.latest.pkgMw = source.latest.pkgMw / 100 * 100;
 }
-// Draw into one already-populated screen span, using the same glyph renderer
-// and coordinates as the normal full-frame path.
-void WmDrawBuildIdSpan(uint32_t* pixels,uint32_t left,uint32_t count,uint32_t row,uint32_t sw,uint32_t sh) {
-    if(!pixels || !count || left>=sw || count>sw-left || row>=sh)return;
-    WmBuildIdText text{};WmRect rect{};if(!WmBuildIdLayout(sw,sh,text,rect) ||
-        int64_t(row)<rect.y || int64_t(row)>=int64_t(rect.y)+rect.h)return;
-    ChromeFillRect({pixels,count,count,1},rect.x-int(left),0,rect.w,1,WmCurrentPalette().badgeFill);
-    WmDrawBuildIdText(pixels,count,count,1,rect.x+int(WmMetric(7))-int(left),
-                      rect.y+int(WmMetric(3))-int(row),text,nullptr);
+
+static void WmCaptureHudCadence(ChromeShellTelemetry& out, const ChromePerformanceHudModel& hud) {
+    out.hasCompositor = out.hasApp = true;
+    WmCaptureCadence(out.compositor, *hud.telemetry.compositor, hud.tick);
+    WmCaptureCadence(out.app, *hud.telemetry.app, hud.tick);
 }
+
+// The boot toast: 360 wide, 16 px from the top-right corner, as tall as its
+// content (ChromeBootSummaryHeight). Shown for 7 s after the desktop is ready.
+static unsigned WmBootSummaryMetaLines() { return 3; }
 bool WmBootSummaryRect(uint32_t sw,uint32_t sh,int32_t* x,int32_t* y,uint32_t* width,uint32_t* height) {
     const uint64_t ready=CompositorDesktopReadyTick(),now=ApicTickCount();
     if(!ready||now<ready||now-ready>7000)return false;
-    const uint32_t margin=WmMetric(16),w=WmMetric(480),h=WmDesktopFont().lineHeight*5+WmMetric(28);
+    const BootTimingSummary* timing=BootTimingRead();
+    const uint32_t margin=WmMetric(16),w=WmMetric(360);
+    const uint32_t h=static_cast<uint32_t>(ChromeBootSummaryHeight(WmChromeStyle(),true,timing!=nullptr,WmBootSummaryMetaLines()));
     if(sw<margin*2+WmMetric(100)||sh<h+margin+WmMetric(WM_TASKBAR_HEIGHT))return false;
     *width=w<sw-margin*2?w:sw-margin*2;*height=h;*x=sw-*width-margin;*y=margin;return true;
 }
-static void WmBootSummarySurface(uint32_t* pixels,uint32_t stride,uint32_t sw,uint32_t sh,uint64_t keySeed,uint64_t* key) {
-    int32_t x,y;uint32_t w,h;if((!pixels && !key) || !WmBootSummaryRect(sw,sh,&x,&y,&w,&h))return;
-    char number[16],headline[96],timing[96],machine[96],build[96];
-    if(const BootTimingSummary* timing0=BootTimingRead()) {
-        // Firmware | boot menu | loader | kernel; fold the loader into the
-        // kernel bucket when the full row would be clipped.
-        BootTimingHeadline(headline,sizeof(headline),*timing0);
-        BootTimingRow(timing,sizeof(timing),*timing0,false);
-        if(WmTextWidth(timing)>int(w)-int(WmMetric(24)))BootTimingRow(timing,sizeof(timing),*timing0,true);
+static void WmCaptureBootSummary(uint32_t sw, uint32_t sh, ChromeShellModel& snapshot) {
+    int32_t x, y;
+    uint32_t w, h;
+    if (!WmBootSummaryRect(sw, sh, &x, &y, &w, &h)) return;
+    snapshot.kind = ChromeShellKind::BootSummary;
+    snapshot.rect = {x, y, int(w), int(h)};
+    auto& boot = snapshot.boot;
+    const BootTimingSummary* timing = BootTimingRead();
+    BootText total(boot.total, sizeof(boot.total));
+    const char* note;
+    if (timing && (timing->total.valid || timing->kernel.valid)) {
+        total.Seconds(timing->total.valid ? timing->total.ms : timing->kernel.ms, 2);
+        note = timing->total.valid ? "from power-on" : "in the kernel";
     } else {
-        const uint64_t duration=CompositorBootDurationMs();
-        char* row=headline;
-        WmStrCopy(row,"Desktop ready in ",sizeof(headline));DesktopNumber(number,duration/1000);
-        size_t n=strlen(row);WmStrCopy(row+n,number,sizeof(headline)-n);n=strlen(row);row[n++]='.';row[n++]='0'+(duration/100)%10;row[n++]='0'+(duration/10)%10;row[n]=0;
-        WmStrCopy(row+n,KvmClockStableAvailable()?" s (VM start)":" s (kernel clock)",sizeof(headline)-n);
-        WmStrCopy(timing,"Boot timing n/a",sizeof(timing));
+        total.Seconds(CompositorBootDurationMs(), 2);
+        note = KvmClockStableAvailable() ? "from VM start" : "on the kernel clock";
     }
-    size_t n=0;char* row=machine;
-    DesktopNumber(row,SmpGetCpuCount());n=strlen(row);WmStrCopy(row+n," cores | ",sizeof(machine)-n);n=strlen(row);DesktopNumber(number,PmmGetFreePageCount()*4096/1048576);WmStrCopy(row+n,number,sizeof(machine)-n);n=strlen(row);WmStrCopy(row+n," MiB available",sizeof(machine)-n);
-    WmStrCopy(build,"Build ",sizeof(build));WmStrCopy(build+6,BuildGitHash(),sizeof(build)-6);
-    const ChromeBootSummaryModel model{{x,y,int(w),int(h)},{headline,timing,machine,
-        CompositorGlassActive()?"GPU composition | glass":CompositorGpuActive()?"GPU composition | flat":"Software composition | flat",build}};
-    ChromeDisplayList list=ChromeListOn(g_shellListStorage);
-    ChromeBuildBootSummary(model,WmChromeStyle(),list);
-    if(key)*key=ChromeListKey(list,keySeed);
-    else ChromeExecute(list,{pixels,stride,sw,sh},WmDesktopFont());
-}
-void WmRenderBootSummary(uint32_t* pixels,uint32_t stride,uint32_t sw,uint32_t sh) {
-    WmBootSummarySurface(pixels,stride,sw,sh,0,nullptr);
+    total.Add(" s");
+    WmStrCopy(boot.totalNote, note, sizeof(boot.totalNote));
+    static bool sampledMemory = false;
+    static uint64_t freeAtReadyMiB;
+    if (!sampledMemory) {
+        freeAtReadyMiB = PmmGetFreePageCount() * 4096 / 1048576;
+        sampledMemory = true;
+    }
+    BootText machine(boot.meta[0], sizeof(boot.meta[0]));
+    machine.Number(SmpGetCpuCount());
+    machine.Add(" cores " BROOK_CHROME_DOT " ");
+    machine.Number(freeAtReadyMiB);
+    machine.Add(" MiB available");
+    WmStrCopy(boot.meta[1], CompositorGlassActive() ? "GPU composition " BROOK_CHROME_DOT " Glass" :
+        CompositorGpuActive() ? "GPU composition " BROOK_CHROME_DOT " Opaque" :
+                                "Software composition " BROOK_CHROME_DOT " Opaque", sizeof(boot.meta[1]));
+    BootText build(boot.meta[2], sizeof(boot.meta[2]));
+    build.Add("Brook ");
+    build.Add(BuildGitHash());
+    if (!timing) return;
+    const BootTimingValue phases[] = {timing->firmware, timing->wait, timing->loader, timing->kernel};
+    static const char* const names[] = {"Firmware", "Menu", "Loader", "Kernel"};
+    for (unsigned i = 0; i < 4; ++i) {
+        WmStrCopy(boot.phaseNames[i], names[i], sizeof(boot.phaseNames[i]));
+        BootText value(boot.phaseValues[i], sizeof(boot.phaseValues[i]));
+        if (phases[i].valid) {
+            boot.phaseMs[i] = phases[i].ms;
+            value.Seconds(phases[i].ms, 2);
+            value.Add(" s");
+        } else value.Add("n/a");
+    }
 }
 
 // Tray tooltip for the TEMP metric (fits the 48-byte tooltip buffer).

@@ -79,7 +79,7 @@ PhysicalAddress MemFdGetOrAllocPage(MemFdData* mfd, uint64_t pageIdx, uint16_t p
     if (pageIdx >= mfd->pageMapCount) { MfdUnlock(mfd); return PhysicalAddress(0); }
     uint64_t raw = mfd->pageMap[pageIdx];
     if (raw == 0) {
-        PhysicalAddress phys = PmmAllocPage(MemTag::User, 0);
+        PhysicalAddress phys = PmmAllocPageAccounted(MemTag::User, KernelPid, PmmOwner::Shmem);
         if (!phys) { MfdUnlock(mfd); return PhysicalAddress(0); }
         auto* va = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
         memset(va, 0, 4096);
@@ -186,7 +186,7 @@ int64_t MemFdWriteAt(MemFdData* mfd, uint64_t source, uint64_t count,
             (!MemFdGrowLocked(mfd, pos + n) && (error = -ENOMEM))) { MfdUnlock(mfd); break; }
         uint64_t raw = mfd->pageMap[index];
         if (!raw) {
-            PhysicalAddress page = PmmAllocPage(MemTag::User, 0);
+            PhysicalAddress page = PmmAllocPageAccounted(MemTag::User, KernelPid, PmmOwner::Shmem);
             if (!page) { MfdUnlock(mfd); error = -ENOMEM; break; }
             raw = page.raw();
             memset(reinterpret_cast<void*>(PhysToVirt(page).raw()), 0, 4096);

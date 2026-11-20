@@ -17,14 +17,44 @@
 
 namespace brook {
 
+// Type roles (DESIGN.md "Type"): every text command names one. The executor
+// is given one baked atlas per role at the desktop scale (ChromeFontSet,
+// chrome_raster.h). Icons is the 16 px line-icon set as coverage masks,
+// tinted like text (ChromeGlyph).
+enum class ChromeFont : uint8_t {
+    Body,   // 13: window titles, list rows, values
+    Label,  // 12: task labels, clock, secondary text, tooltips
+    Small,  // 11: captions, chips, HUD labels, legends
+    Strong, // 13 bold: toast and HUD titles
+    Lead,   // 15 bold: flyout titles
+    Hero,   // 20: toast and flyout readouts
+    Mono,   // 11 monospace: build label
+    Icons,  // 16 px icon masks
+    Count
+};
+// Icons, as character codes in the Icons atlas (scripts/bake_icons.py keeps
+// the same order).
+enum class ChromeGlyph : uint8_t {
+    Minimise = 'A', Maximise, Restore, Close, Network, NetworkOff, VolumeHigh, VolumeLow, VolumeMuted,
+    Temperature, Power, Restart, Bolt, ChevronRight, ChevronUp, ChevronDown,
+    Search, Grid, Inbox, Pin, Trash, Folder, Sliders, Globe, Play, Doc, Brush, Pad, Spark,
+};
+
+// Text fonts carry degree, middle dot and en dash after ASCII.
+#define BROOK_CHROME_DEGREE "\x7f"
+#define BROOK_CHROME_DOT "\x80"
+
 enum class ChromeOp : uint8_t {
+    FadeX,        // source-over horizontal stroke, from solid to clear
     Fill,         // solid rect, replaces the destination
     Rows,         // one colour per row (title material gradient)
     CornerFill,   // solid rect clipped to a rounded top-right corner of clip
+    MaterialOutline, // one-pixel stroke with rounded corners
     MaterialRect, // solid rect with rounded corners, top and bottom
     Text,         // glyph run, source-over by coverage
     Icon,         // straight-alpha ARGB icon, source-over, scaled
     Squares,      // a run of equal rects stepping by (dx, dy): drawn strokes
+    Clip,         // later commands draw only inside (x, y, w, h); w or h 0: no clip
 };
 
 struct ChromeCmd {
@@ -32,15 +62,16 @@ struct ChromeCmd {
     int32_t x, y, w, h; // Text: pen origin, w = maximum width (0: none); Icon: w = size
     uint32_t color;
     uint32_t arg;       // Text: arena offset; CornerFill/MaterialRect: radius; Squares: count
-    int32_t dx, dy;     // Squares: step
+    int32_t dx, dy;     // Squares: step; Text: dx = clip given, dy = ChromeFont
     DesktopRect clip;   // Text: glyph clip when dx != 0; CornerFill: rounded block
     const void* data;   // Rows: uint32_t[h] colours; Icon: pixels
 };
 
 class ChromeDisplayList {
 public:
-    ChromeDisplayList(ChromeCmd* cmds, uint32_t capacity, char* text, uint32_t textCapacity)
-        : cmds_(cmds), capacity_(capacity), text_(text), textCapacity_(textCapacity) {}
+    ChromeDisplayList(ChromeCmd* cmds, uint32_t capacity, char* text, uint32_t textCapacity,
+                      uint32_t count = 0, uint32_t textUsed = 0)
+        : cmds_(cmds), capacity_(capacity), count_(count), text_(text), textCapacity_(textCapacity), textUsed_(textUsed) {}
     ChromeDisplayList(const ChromeDisplayList&) = delete;
     ChromeDisplayList& operator=(const ChromeDisplayList&) = delete;
 
@@ -51,10 +82,16 @@ public:
     bool Overflowed() const { return overflow_; }
     void Clear() { count_ = textUsed_ = 0; overflow_ = false; }
 
+    void FadeX(int x, int y, int w, int h, uint32_t color) {
+        Push({ChromeOp::FadeX, x, y, w, h, color, 0, 0, 0, {}, nullptr});
+    }
     void Fill(int x, int y, int w, int h, uint32_t color) { Push({ChromeOp::Fill, x, y, w, h, color, 0, 0, 0, {}, nullptr}); }
     void Rows(int x, int y, int w, int h, const uint32_t* colors) { Push({ChromeOp::Rows, x, y, w, h, 0, 0, 0, 0, {}, colors}); }
     void CornerFill(int x, int y, int w, int h, uint32_t color, const DesktopRect& block, unsigned radius) {
         Push({ChromeOp::CornerFill, x, y, w, h, color, radius, 0, 0, block, nullptr});
+    }
+    void MaterialOutline(const DesktopRect& r, uint32_t color, unsigned radius) {
+        Push({ChromeOp::MaterialOutline, r.x, r.y, r.w, r.h, color, radius, 0, 0, {}, nullptr});
     }
     void MaterialRect(const DesktopRect& r, uint32_t color, unsigned radius) {
         Push({ChromeOp::MaterialRect, r.x, r.y, r.w, r.h, color, radius, 0, 0, {}, nullptr});
@@ -62,11 +99,16 @@ public:
     void Squares(int x, int y, int w, int h, int dx, int dy, int count, uint32_t color) {
         if (count > 0) Push({ChromeOp::Squares, x, y, w, h, color, static_cast<uint32_t>(count), dx, dy, {}, nullptr});
     }
-    void Icon(int x, int y, int size, const uint32_t* pixels) {
-        Push({ChromeOp::Icon, x, y, size, size, 0, 0, 0, 0, {}, pixels});
+    // Scissor for the commands that follow (until Unclip): a scrolled list
+    // draws its partly visible lines whole and lets the clip cut them.
+    void Clip(const DesktopRect& r) { Push({ChromeOp::Clip, r.x, r.y, r.w > 0 ? r.w : 0, r.h > 0 ? r.h : 0, 0, 0, 0, 0, {}, nullptr}); }
+    void Unclip() { Push({ChromeOp::Clip, 0, 0, 0, 0, 0, 0, 0, 0, {}, nullptr}); }
+    void Icon(int x, int y, int size, const uint32_t* pixels, unsigned opacity = 255) {
+        Push({ChromeOp::Icon, x, y, size, size, 0, opacity, 0, 0, {}, pixels});
     }
     // maxWidth <= 0: unbounded. clip: glyph pixels outside it are skipped.
-    void Text(int x, int y, const char* text, uint32_t fg, int maxWidth = 0, const DesktopRect* clip = nullptr) {
+    void Text(int x, int y, const char* text, uint32_t fg, int maxWidth = 0, const DesktopRect* clip = nullptr,
+              ChromeFont font = ChromeFont::Body) {
         uint32_t length = 0;
         while (text[length]) ++length;
         if (!length) return;
@@ -75,7 +117,16 @@ public:
         for (uint32_t i = 0; i < length; ++i) text_[offset + i] = text[i];
         text_[offset + length] = 0;
         textUsed_ += length + 1;
-        Push({ChromeOp::Text, x, y, maxWidth, 0, fg, offset, clip ? 1 : 0, 0, clip ? *clip : DesktopRect{}, nullptr});
+        Push({ChromeOp::Text, x, y, maxWidth, 0, fg, offset, clip ? 1 : 0, static_cast<int32_t>(font),
+              clip ? *clip : DesktopRect{}, nullptr});
+    }
+    void Text(ChromeFont font, int x, int y, const char* text, uint32_t fg, int maxWidth = 0) {
+        Text(x, y, text, fg, maxWidth, nullptr, font);
+    }
+    // One icon mask, its top-left at (x, y), tinted fg.
+    void Glyph(ChromeGlyph glyph, int x, int y, uint32_t fg) {
+        const char text[2] = {static_cast<char>(glyph), 0};
+        Text(x, y, text, fg, 0, nullptr, ChromeFont::Icons);
     }
 
 private:

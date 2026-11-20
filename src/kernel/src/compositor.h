@@ -29,8 +29,41 @@ void CompositorBootAssetsPending(bool pending);
 uint64_t CompositorDesktopReadyTick();
 uint64_t CompositorBootDurationMs();
 bool CompositorGpuActive();
+// The resolved theme is Glass (latched at the frame boundary): the Glass
+// theme is selected and the active backend can blur its backdrop.
 bool CompositorGlassActive();
 bool CompositorGlassRequested();
+// Layers op 18: record the calling renderer's BROOK_DESKTOP_CAP_* bits
+// (owner: the present-lease owner identity). Returns the bits recorded.
+uint32_t CompositorSetRendererCapabilities(uint64_t owner,uint32_t caps);
+// The active backend can blur (latched at the last frame boundary).
+bool CompositorBackendBlurActive();
+uint64_t CompositorBackendBlurChanges();
+// Which branch of the backend-blur decision produced a latch transition.
+enum class CompositorBlurReason : uint32_t {
+    Renderer,           // lease holder reported blur (on)
+    Gpu,                // kernel GPU compositor can blur (on), or cannot
+    WriterUnleased,     // a GOP write with no active lease
+    WriterRevoked,      // the writer's lease was released mid-write
+    ForeignWriter,      // a GOP writer that is not the lease holder
+    CapsOwnerMismatch,  // lease held by a process that did not report caps
+    CapsBitClear,       // the lease holder reported no blur
+    LeaseLapsed,        // caps registered, but the lease expired
+    NoRenderer,         // no lease and no renderer caps
+    Count
+};
+static constexpr uint32_t COMPOSITOR_BLUR_CHANGE_RING=16;
+struct CompositorBlurChange {uint64_t tick,leasedFrameAgeMs;uint32_t reason;bool blur;};
+struct CompositorBlurDiagnostics {
+    uint64_t changes,reasons[uint32_t(CompositorBlurReason::Count)];
+    CompositorBlurChange ring[COMPOSITOR_BLUR_CHANGE_RING];
+    uint64_t cpuFramesOverRenderer;   // software flips while renderer caps were registered
+    uint64_t leaseLiveRenewals;       // leases extended by a refused-but-reserving renderer
+};
+CompositorBlurDiagnostics CompositorReadBlurDiagnostics();
+// Extend the lease of a renderer that is still reserving frames while its
+// presents are refused (bounded by COMPOSITOR_PRESENT_LEASE_STALL_MS).
+bool CompositorRenewLiveRendererLease(uint64_t owner);
 uint32_t CompositorMaterialOpacity();
 uint32_t CompositorMaterialBlur();
 // Opacity of material shell surfaces (taskbar, launcher, popups) under glass.
@@ -64,9 +97,16 @@ struct DebugFrameSnapshot {
     DebugFrameState state;
     uint32_t source,presentationMode;
     uint64_t overlayGeneration; // overlay captures: content generation (pointer excluded)
+    // BROOK_DEBUG_FRAME_PLANE_* and INFO_* (brook_debug_frame.h).
+    uint32_t plane,planeSurface,planeControl,planeStride,infoFlags,windowId,windowScale,copyUs;
 };
 // An overlay request with overlayCursor=false omits the pointer image.
 DebugFrameSnapshot CompositorRequestDebugFrame(uint64_t owner=0,bool overlay=false,bool overlayCursor=true);
+// Root debug capture with options (BROOK_DEBUG_FRAME_FLAG_*). A window-buffer
+// request is filled immediately from the window's CPU buffer. On failure the
+// state is Failed (or Busy) and *error is a negative errno.
+DebugFrameSnapshot CompositorRequestDebugFrameOptions(uint64_t owner,uint32_t flags,uint32_t windowId,
+                                                      uint64_t windowIncarnation,int* error);
 // Block (no locks held) while the owner's capture is pending, at most
 // timeoutMs. Returns -116 for an unknown/expired token, else 0 with status.
 int CompositorWaitDebugFrame(uint32_t token,uint64_t owner,uint32_t timeoutMs,DebugFrameSnapshot& out);

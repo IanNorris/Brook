@@ -22,7 +22,79 @@ struct Owner {
     bool retireRetained(){++retained;return true;}
     bool prepareRetained(){++reprepares;if(failReprepare)return false;pos=0;return true;}
 };
+// Recovery owner: verified register evidence, and retire/reprepare outcomes.
+struct RecoveryOwner:Owner {
+    bool failRetire=false,clockDead=false;uint8_t status=0;
+    uint64_t nowNs(){if(clockDead)return 0;return Owner::nowNs();}
+    void faultRegisters(HdaDellStreamRegisters& r){r={};r.valid=true;r.command=running?6:2;r.control=running?2:0;r.status=status;}
+    bool retireRetained(){++retained;return !failRetire;}
+};
+static void Recovery(){
+    uint8_t samples[128];std::memset(samples,0x5a,sizeof(samples));AudioDeviceProgress p{};
+    // Default: an admitted-type fault is still quarantined and restart is
+    // permanently refused without touching the owner.
+    {RecoveryOwner o;Lock l;HdaDellAudioBridge<RecoveryOwner,Lock,true> b(o,l,64,4096);
+        assert(b.submit(samples,sizeof(samples)).accepted && !b.restartPermanentlyRefused());o.ns+=AudioDmaClock::MaxSampleNs;
+        assert(b.progress(&p) && p.discontinuity && o.quarantines==1 && b.faultCount()==1 && !b.recovery().enabled);
+        assert(b.restartPermanentlyRefused() && !b.restart(p.epoch) && !o.retained && !o.reprepares);
+        assert(b.lastFault().reason==HdaDellFaultReason::ServiceLate && !b.lastFault().recoverable);}
+    // Enabled: one verified retire/reprepare per fault, then a new epoch.
+    {RecoveryOwner o;Lock l;HdaDellAudioBridge<RecoveryOwner,Lock,true> b(o,l,64,4096);assert(b.enableFaultRecovery(2,10000000000ULL));
+        auto r=b.submit(samples,sizeof(samples));assert(r.accepted);o.ns+=AudioDmaClock::MaxSampleNs;
+        assert(b.progress(&p) && p.discontinuity && !o.quarantines && !o.running && b.recovery().pending && !b.restartPermanentlyRefused());
+        auto submitted=b.submit(samples,sizeof(samples));assert(submitted.error && !submitted.accepted); // no data while faulted
+        assert(!b.restart(p.epoch+1) && !o.retained && b.recovery().pending); // stale epoch consumes nothing
+        assert(b.restart(p.epoch) && o.retained==1 && o.reprepares==1 && !o.quarantines);
+        auto st=b.recovery();assert(st.successes==1 && st.attempts==1 && !st.pending && !st.permanent && st.lastRecoveryNs);
+        assert(b.progress(&p) && !p.discontinuity && p.epoch==r.epoch+1);
+        r=b.submit(samples,sizeof(samples));assert(r.accepted && r.epoch==p.epoch && o.starts==2 && o.running);
+        // A second fault within the spacing window is terminal.
+        o.ns+=AudioDmaClock::MaxSampleNs;assert(b.progress(&p) && p.discontinuity && b.recovery().pending);
+        assert(!b.restart(p.epoch) && o.quarantines==1 && o.retained==1);
+        st=b.recovery();assert(st.permanent && st.lastFailure==HdaDellRecoveryStep::Admission && st.attempts==2);
+        assert(b.restartPermanentlyRefused() && !b.restart(p.epoch) && b.recovery().attempts==2);
+        assert(b.firstFault().ordinal==1 && b.lastFault().ordinal==2 && b.faultCount()==2);}
+    // Budget: after the last allowed recovery, the next fault quarantines at once.
+    {RecoveryOwner o;Lock l;HdaDellAudioBridge<RecoveryOwner,Lock,true> b(o,l,64,4096);assert(b.enableFaultRecovery(1,1000000));
+        assert(b.submit(samples,sizeof(samples)).accepted);o.ns+=AudioDmaClock::MaxSampleNs;assert(b.progress(&p) && b.restart(p.epoch));
+        assert(b.submit(samples,sizeof(samples)).accepted);o.ns+=AudioDmaClock::MaxSampleNs;
+        assert(b.progress(&p) && p.discontinuity && o.quarantines==1 && !b.recovery().pending && b.restartPermanentlyRefused());}
+    // Spacing satisfied: a later fault recovers again.
+    {RecoveryOwner o;Lock l;HdaDellAudioBridge<RecoveryOwner,Lock,true> b(o,l,64,4096);assert(b.enableFaultRecovery(3,1000000000ULL));
+        for(unsigned i=0;i<3;++i){assert(b.submit(samples,sizeof(samples)).accepted);
+            for(unsigned k=0;k<1200;++k)assert(b.progress(&p) && !p.discontinuity); // >1 s of healthy service
+            o.ns+=AudioDmaClock::MaxSampleNs;assert(b.progress(&p) && p.discontinuity && b.restart(p.epoch));}
+        assert(b.recovery().successes==3 && !o.quarantines);}
+    // Each verification failure is terminal and quarantines.
+    {RecoveryOwner o;Lock l;HdaDellAudioBridge<RecoveryOwner,Lock,true> b(o,l,64,4096);assert(b.enableFaultRecovery(2,0));o.failRetire=true;
+        assert(b.submit(samples,sizeof(samples)).accepted);o.ns+=AudioDmaClock::MaxSampleNs;assert(b.progress(&p));
+        assert(!b.restart(p.epoch) && o.quarantines==1 && !o.reprepares && b.recovery().lastFailure==HdaDellRecoveryStep::Retire);
+        assert(b.restartPermanentlyRefused() && !b.restart(p.epoch) && o.retained==1);}
+    {RecoveryOwner o;Lock l;HdaDellAudioBridge<RecoveryOwner,Lock,true> b(o,l,64,4096);assert(b.enableFaultRecovery(2,0));o.failReprepare=true;
+        assert(b.submit(samples,sizeof(samples)).accepted);o.ns+=AudioDmaClock::MaxSampleNs;assert(b.progress(&p));
+        assert(!b.restart(p.epoch) && o.quarantines==1 && b.recovery().lastFailure==HdaDellRecoveryStep::Reprepare);
+        o.failReprepare=false;assert(!b.restart(p.epoch) && o.reprepares==1);}
+    {RecoveryOwner o;Lock l;HdaDellAudioBridge<RecoveryOwner,Lock,true> b(o,l,64,4096);assert(b.enableFaultRecovery(2,0));
+        assert(b.submit(samples,sizeof(samples)).accepted);o.ns+=AudioDmaClock::MaxSampleNs;assert(b.progress(&p));o.clockDead=true;
+        assert(!b.restart(p.epoch) && o.quarantines==1 && !o.retained && b.recovery().lastFailure==HdaDellRecoveryStep::Admission);}
+    // Hardware-reported faults are never admitted: DESE latched.
+    {RecoveryOwner o;Lock l;HdaDellAudioBridge<RecoveryOwner,Lock,true> b(o,l,64,4096);assert(b.enableFaultRecovery(2,0));
+        assert(b.submit(samples,sizeof(samples)).accepted);o.status=0x10;o.ns+=AudioDmaClock::MaxSampleNs;
+        assert(b.progress(&p) && o.quarantines==1 && b.restartPermanentlyRefused() && !b.restart(p.epoch) && !o.retained);}
+    // stop() or shutdown() while a recovery is pending quarantines instead.
+    {RecoveryOwner o;Lock l;HdaDellAudioBridge<RecoveryOwner,Lock,true> b(o,l,64,4096);assert(b.enableFaultRecovery(2,0));
+        assert(b.submit(samples,sizeof(samples)).accepted);o.ns+=AudioDmaClock::MaxSampleNs;assert(b.progress(&p) && b.recovery().pending);
+        assert(!b.stop() && o.quarantines==1 && !b.restart(p.epoch) && !o.retained);}
+    {RecoveryOwner o;Lock l;HdaDellAudioBridge<RecoveryOwner,Lock,true> b(o,l,64,4096);assert(b.enableFaultRecovery(2,0));
+        assert(b.submit(samples,sizeof(samples)).accepted);o.ns+=AudioDmaClock::MaxSampleNs;assert(b.progress(&p));
+        assert(!b.shutdown() && o.quarantines==1 && !b.restart(p.epoch) && !o.retires);}
+    // Recovery cannot be enabled on a started or closed bridge, nor without clean restart.
+    {RecoveryOwner o;Lock l;HdaDellAudioBridge<RecoveryOwner,Lock,true> b(o,l,64,4096);assert(b.submit(samples,sizeof(samples)).accepted);
+        assert(!b.enableFaultRecovery(2,0));}
+    {RecoveryOwner o;Lock l;HdaDellAudioBridge<RecoveryOwner,Lock> b(o,l,64,4096);assert(!b.enableFaultRecovery(2,0));}
+}
 int main(){
+    Recovery();
     Owner owner;Lock lock;HdaDellAudioBridge<Owner,Lock> b(owner,lock,64,4096);AudioDeviceProgress p{};
     assert(b.progress(&p) && p.epoch==1 && p.capacity==65536 && !p.running && !p.discontinuity && !owner.starts);
     uint8_t samples[128];std::memset(samples,0x2d,sizeof(samples));

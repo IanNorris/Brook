@@ -90,6 +90,7 @@ static void pointer_constraints_refresh(void) {
                     sc->pointer_x=cx;sc->pointer_y=cy;
                     pointer_enter_if_needed(sc,s,wl_fixed_from_int(cx),wl_fixed_from_int(cy));
                 }
+                if (sc->finger_axes) pointer_stop_finger_scroll(sc, g_now_ms());
                 p->token=token;zwp_locked_pointer_v1_send_locked(p->resource);
             }
         }
@@ -122,6 +123,7 @@ static void pointer_relative_dispatch(struct brook_surface *s,struct brook_seat_
         // SDL batches its pending motion until wl_pointer.frame. A relative
         // event without this boundary can be overwritten by the next packet.
         if(wl_resource_get_version(p->pointer)>=5)wl_pointer_send_frame(p->pointer);
+        latency_input_sent(sc->client, LATENCY_MOTION);
     }
 }
 static void pointer_object_destroy_req(struct wl_client *c,struct wl_resource *r) { (void)c;wl_resource_destroy(r); }

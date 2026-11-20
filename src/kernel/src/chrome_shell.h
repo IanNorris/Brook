@@ -1,7 +1,6 @@
 #pragma once
 // Shell-surface layouts and display list builders (compositor refactor stage
-// 1.2): taskbar with tray and telemetry, launcher, volume popup, tray tooltip
-// and boot summary. The WM snapshots its state into the models below
+// 1.2): taskbar, launcher, tray flyouts, boot toast and performance HUD. The WM snapshots its state into the models below
 // (wm_shell_*.inc); the builders read only the model and the style. These
 // are the pieces a user-mode shell takes over at stage 3. Freestanding.
 #include <stdint.h>
@@ -9,16 +8,21 @@
 #include "desktop_telemetry.h"
 #include "thermal_sampler.h"
 #include "taskbar_volume.h"
-#include "launcher_power.h"
 
 namespace brook {
 
 // Logical sizes at 100% (window.h's WM_TASKBAR_* and the launcher's
-// LAUNCHER_* are these values).
+// LAUNCHER_* are these values). Taskbar targets (stage 2.1, DESIGN.md
+// "Sizes"): the full 48 px height and abutting, the launcher button 56 wide,
+// window buttons 48 to 188 (sized to their label); each draws a visual pill
+// inset 5 top and bottom and 2 each side (38 high), so a click anywhere in
+// the column hits it. Task icons are 20, labels 12 px with 12 px padding.
 struct ChromeShellMetrics {
-    static constexpr uint32_t TaskbarButtonWidth = 44, TaskbarButtonHeight = 32, TaskbarPadding = 4;
-    static constexpr uint32_t LauncherIconSize = 24, LauncherIconMargin = 8, LauncherItemHeight = 40;
-    static constexpr uint32_t LauncherItemWidth = 230, LauncherPadding = 6, LauncherMaxRows = 14, LauncherMaxCols = 3;
+    static constexpr uint32_t TaskbarButtonWidth = 48, TaskbarButtonHeight = 48, TaskbarPadding = 0;
+    static constexpr uint32_t TaskbarMaxButtonWidth = 188, TaskbarLauncherWidth = 56, TaskbarPillInsetX = 2, TaskbarPillInsetY = 5;
+    static constexpr uint32_t TaskbarIcon = 20, TaskbarButtonPad = 12, TaskbarLabelGap = 8, TaskbarLabelMin = 72;
+    static constexpr uint32_t PanelMargin = 8; // shell panels: from the screen edge and the taskbar
+    static constexpr uint32_t LauncherIconSize = 24; // icon sources (24x24 ARGB); the launcher is chrome_launcher.h
 };
 
 inline void DesktopNumber(char* out, unsigned value) {
@@ -42,23 +46,27 @@ static constexpr uint32_t ChromeTaskbarButtonLimit = 40; // windows + launch fee
 
 struct ChromeTaskbarLayout {
     int y, textY, screenW, screenH;
-    DesktopRect apps, terminal, next, clock, network, volume, agent;
+    DesktopRect apps, terminal, next, clock, network, volume, agent, build, hud;
+    DesktopRect separators[2]; // after the launcher button; before the tray
     DesktopRect metrics[7];
     DesktopRect buttons[ChromeTaskbarButtonLimit];
     int indices[ChromeTaskbarButtonLimit];
     int count, nextIndex;
-    char clockText[32];
+    char clockText[32], clockDate[24], buildText[32];
 };
 
 // ids: the taskbar entries in order (WM window indices, or -10 - launch
 // slot); focused selects the page. agent: the agent indicator is shown.
+// labels (optional, total entries): each entry's label; buttons are sized to
+// them while every one fits, and share the space equally otherwise.
 ChromeTaskbarLayout ChromeTaskbarLayoutFor(const ChromeStyle& s, uint32_t screenW, uint32_t screenH,
                                            const char* clockText, bool agent, uint32_t enabledMetrics,
-                                           const int* ids, int total, int focused);
+                                           const int* ids, int total, int focused, const char* buildText = nullptr,
+                                           bool compactHud = false, const char* const* labels = nullptr);
 
 struct ChromeTaskbarButton {
     const uint32_t* icon;   // borrowed; null: missing glyph
-    const char* hoverTitle; // shown in the tray while hovered
+    const char* hoverTitle; // window label; launch state is held by the WM
     bool active, minimized; // window entries
     bool launch, busy;      // launch feedback entries: progress ring, or "!"
 };
@@ -111,42 +119,22 @@ void ChromeBuildVolumePopup(const ChromeVolumePopupModel& model, const ChromeSty
 struct ChromeTooltipModel {
     DesktopRect box;
     const char* text;
+    const char* detail = nullptr;
 };
-// The tooltip's padded box for its text.
+// The tooltip's padded box for its text (12 px labels).
 inline int ChromeTooltipPadding(const ChromeStyle& s) { return static_cast<int>(s.M(8)); }
+inline int ChromeTooltipWidth(const ChromeStyle& s, const char* text, const char* detail) {
+    const int a = s.TextWidth(text, ChromeFont::Label), b = detail ? s.TextWidth(detail, ChromeFont::Label) : 0;
+    return (a > b ? a : b) + 2 * ChromeTooltipPadding(s);
+}
+inline int ChromeTooltipHeight(const ChromeStyle& s, bool detail) {
+    return s.Line(ChromeFont::Label) * (detail ? 2 : 1) + static_cast<int>(s.M(10));
+}
+// Width of the volume popup's "100%" readout.
+inline int ChromeVolumeValueWidth(const ChromeStyle& s) { return s.TextWidth("100%", ChromeFont::Label); }
 void ChromeBuildTooltip(const ChromeTooltipModel& model, const ChromeStyle& style, ChromeDisplayList& out);
 
-// ---------------------------------------------------------------------------
-// Launcher
-// ---------------------------------------------------------------------------
-
-struct ChromeLauncherLayout {
-    int x, y;
-    uint32_t w, h, cols, rows, itemW, capacity;
-};
-// total: valid launcher items.
-ChromeLauncherLayout ChromeLauncherLayoutFor(const ChromeStyle& s, uint32_t screenW, uint32_t screenH, uint32_t total);
-DesktopRect ChromeLauncherItemRect(const ChromeStyle& s, const ChromeLauncherLayout& l, uint32_t slot);
-LauncherPowerMetrics ChromeLauncherPowerMetrics(const ChromeStyle& s);
-inline LauncherPowerLayout ChromeLauncherPowerLayout(const ChromeStyle& s, const ChromeLauncherLayout& l) {
-    return LauncherPowerFooter({l.x, l.y, static_cast<int>(l.w), static_cast<int>(l.h)}, ChromeLauncherPowerMetrics(s));
-}
-
-struct ChromeLauncherItem {
-    const char* title;
-    const uint32_t* icon; // borrowed; null: missing glyph
-};
-struct ChromeLauncherModel {
-    ChromeLauncherLayout layout;
-    const char* header;
-    const ChromeLauncherItem* items; // the visible items, in slot order
-    uint32_t count;
-    bool scrollUp, scrollDown;       // hints: items above / below the page
-    bool shutdownActive;             // the footer offers only "Cancel shutdown"
-    bool prompt, promptRestart, confirmFocused;
-    int32_t mouseX, mouseY;
-};
-void ChromeBuildLauncher(const ChromeLauncherModel& model, const ChromeStyle& style, ChromeDisplayList& out);
+// The launcher is chrome_launcher.h.
 
 // ---------------------------------------------------------------------------
 // Boot summary
@@ -154,8 +142,34 @@ void ChromeBuildLauncher(const ChromeLauncherModel& model, const ChromeStyle& st
 
 struct ChromeBootSummaryModel {
     DesktopRect rect;
-    const char* rows[5]; // headline, timing, machine, composition, build
+    const char* total;       // hero readout, e.g. "8.12 s"; null: unknown
+    const char* totalNote;   // e.g. "from power-on"
+    const char* meta[3];     // machine and composition lines, then the build label (monospace); null: skipped
+    uint64_t phaseMs[4]{};   // firmware, menu, loader, kernel
+    const char* phaseNames[4]{};  // null: no phase bar or legend
+    const char* phaseValues[4]{};
 };
+// The toast's height for its content (it is 360 wide, DESIGN.md "Geometry").
+int ChromeBootSummaryHeight(const ChromeStyle& style, bool total, bool phases, unsigned metaLines);
 void ChromeBuildBootSummary(const ChromeBootSummaryModel& model, const ChromeStyle& style, ChromeDisplayList& out);
+
+struct ChromeTrayFlyoutModel {
+    DesktopRect rect;
+    bool network, connected; // connected: the network has an address
+    const char* readout;     // network: the address
+    ChromeTelemetryModel telemetry;
+};
+// live: the network is connected, or a package temperature is available.
+int ChromeTrayFlyoutHeight(const ChromeStyle& style, bool network, bool live);
+void ChromeBuildTrayFlyout(const ChromeTrayFlyoutModel&, const ChromeStyle&, ChromeDisplayList&);
+
+struct ChromePerformanceHudModel {
+    DesktopRect rect;
+    ChromeTelemetryModel telemetry;
+    uint64_t tick;
+};
+int ChromePerformanceHudHeight(const ChromeStyle& style, bool thermal);
+void ChromeBuildCompactHud(const ChromePerformanceHudModel&, const ChromeStyle&, ChromeDisplayList&);
+void ChromeBuildPerformanceHud(const ChromePerformanceHudModel&, const ChromeStyle&, ChromeDisplayList&);
 
 } // namespace brook

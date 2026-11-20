@@ -188,6 +188,13 @@ int64_t sys_brook_desktop_layers(uint64_t op,uint64_t address,uint64_t size,uint
         }
         return CopyToUser(address,&focus,size)?0:-EFAULT;
     }
+    if(op==BROOK_DESKTOP_RENDERER_CAPS){
+        // Stage 1.5: the renderer's backdrop-blur capability, used while it
+        // holds the present lease (owner as in the capture ops).
+        if(address || size || a!=BROOK_DESKTOP_CAPS_VERSION || b>0xffffffffULL || c)return -EINVAL;
+        return CompositorSetRendererCapabilities(proc->leaderIncarnation?proc->leaderIncarnation:proc->incarnation,
+                                                 static_cast<uint32_t>(b));
+    }
     if(op==BROOK_DESKTOP_CLIENT_FRAME){
         if(address || size || !a || a>BROOK_DESKTOP_LAYER_LIMIT || !b || !c)return -EINVAL;
         brook::WmNoteClientFrame(b,c);return 0;
@@ -438,6 +445,30 @@ int64_t sys_brook_debug_frame(uint64_t op,uint64_t token,uint64_t destination,ui
         if(frame.state==DebugFrameState::Expired)return -116;
         BrookDebugFrameInfoV3 info{{{frame.token,uint32_t(frame.state),frame.width,frame.height,frame.stride,
             BROOK_DEBUG_FRAME_BGRA8,uint64_t(frame.width)*frame.height*4,frame.tick,frame.epoch},frame.source,0},frame.presentationMode,0};
+        return CopyToUser(destination,&info,sizeof(info))?0:-EFAULT;
+    }
+    if(op==BROOK_DEBUG_FRAME_REQUEST){
+        if(token||offset||length!=sizeof(BrookDebugFrameRequest))return -EINVAL;
+        BrookDebugFrameRequest request{};
+        if(!CopyFromUser(&request,destination,sizeof(request)))return -EFAULT;
+        constexpr uint32_t known=BROOK_DEBUG_FRAME_FLAG_CURSOR|BROOK_DEBUG_FRAME_FLAG_WINDOW_BUFFER;
+        const bool window=(request.flags&BROOK_DEBUG_FRAME_FLAG_WINDOW_BUFFER)!=0;
+        if((request.flags&~known) || (window?(!request.window_id || !request.window_incarnation):
+           (request.window_id || request.window_incarnation)))return -EINVAL;
+        int error=0;
+        const auto frame=CompositorRequestDebugFrameOptions(owner,request.flags,request.window_id,request.window_incarnation,&error);
+        if(frame.state==DebugFrameState::Busy)return -16; // EBUSY
+        if(error)return error;
+        return frame.token?int64_t(frame.token):-EIO;
+    }
+    if(op==BROOK_DEBUG_FRAME_INFO_V4){
+        if(offset || length!=sizeof(BrookDebugFrameInfoV4))return -EINVAL;
+        const auto frame=CompositorDebugFrameStatus(uint32_t(token),owner);
+        if(frame.state==DebugFrameState::Expired)return -116;
+        BrookDebugFrameInfoV4 info{{{{frame.token,uint32_t(frame.state),frame.width,frame.height,frame.stride,
+            BROOK_DEBUG_FRAME_BGRA8,uint64_t(frame.width)*frame.height*4,frame.tick,frame.epoch},frame.source,0},frame.presentationMode,0},
+            frame.plane,frame.planeSurface,frame.planeControl,frame.planeStride,frame.infoFlags,frame.windowId,
+            frame.windowScale?frame.windowScale:1,frame.copyUs};
         return CopyToUser(destination,&info,sizeof(info))?0:-EFAULT;
     }
     if(op==2){

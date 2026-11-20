@@ -77,6 +77,7 @@ void ProcessReference(Json& json,uint32_t pid,uint64_t incarnation) {
 void SerializeWindow(Json& json,const WmDebugWindow& window) {
     json.text("{\"window_id\":");json.number(window.id);
     json.text(",\"incarnation\":\"");json.number(window.incarnation);json.text("\",\"title\":");json.string(window.title);
+    json.text(",\"raw_title\":");json.string(window.rawTitle);
     json.text(",\"app_id\":");json.string(window.appId);
     json.text(",\"provider\":");ProcessReference(json,window.providerPid,window.providerIncarnation);
     json.boolean("provider_kernel",window.providerKernel);
@@ -278,7 +279,8 @@ bool DebugUiHandleCommand(const char* command) {
             json.text("{\"app_id\":");json.string(app.id);json.text(",\"title\":");json.string(app.title);
             json.text(",\"desktop_app_id\":");json.string(app.desktopAppId);
             json.text(",\"executable\":");json.string(app.executable);
-            json.text(",\"source\":");json.string(app.desktop?"installed_desktop_entry":"validated_shortcut");
+            json.text(",\"source\":");json.string(app.userDesktop ? "user_desktop_entry" :
+                app.desktop ? "installed_desktop_entry" : "validated_shortcut");
             json.boolean("launch_eligible",app.eligible);
             json.text(",\"availability\":");json.string(app.desktop?"executable_validated_at_build":"requirements_validated_at_build");
             json.text("}");

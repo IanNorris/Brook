@@ -197,6 +197,8 @@ static constexpr const char* g_defaultEnvp[] = {
     "VK_DRIVER_FILES=/nix/store/b793hmy0383vxaax7hiaslzmizzd3pmg-mesa-26.0.6/share/vulkan/icd.d/virtio_icd.x86_64.json",
     "XDG_CACHE_HOME=/data/home/.cache",
     "XDG_CONFIG_HOME=/data/home/.config",
+    "XDG_CONFIG_DIRS=/nix/profile/etc/xdg:/etc/xdg",
+    "GSETTINGS_SCHEMA_DIR=/nix/profile/share/brook/gsettings",
     "XDG_DATA_HOME=/data/home/.local/share",
     "XDG_DATA_DIRS=/nix/store/jmp6v1wk4cwrm0m9ba8ri9ah8y4745g7-brook-fonts-0.1/share:/usr/share",
     // Python: avoid write attempts to read-only nix store, skip user site

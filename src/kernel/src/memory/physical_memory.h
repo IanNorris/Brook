@@ -7,6 +7,8 @@
 #include "../task_capacity.h"
 #include "pmm_drain_policy.h"
 
+#include "pmm_accounting.h"
+
 namespace brook {
 
 // Physical Memory Manager — bitmap allocator for 4KB page frames.
@@ -32,6 +34,7 @@ struct PageDescriptor
     uint32_t prev;   // prev page index in PID's list (PMM_NULL_PAGE = head)
     uint16_t pid;    // owning PID
     uint8_t  tag;    // MemTag value
+    PmmOwner owner;  // diagnostic class, lives in the former padding byte
     uint32_t refCount; // COW reference count (0=untracked, 1=exclusive, 2+=shared)
     uint32_t mapCount; // BRO-176: # of present USER PTEs mapping this frame.
                        // Maintained O(1) at PTE install/remove. Invariant: when a
@@ -70,6 +73,9 @@ PhysicalAddress PmmAllocPages(uint64_t count,
                               MemTag tag = MemTag::KernelData,
                               uint16_t pid = KernelPid);
 
+PhysicalAddress PmmAllocPageAccounted(MemTag tag, uint16_t pid, PmmOwner owner);
+PhysicalAddress PmmAllocPagesAccounted(uint64_t count, MemTag tag, uint16_t pid, PmmOwner owner);
+
 // Free a previously allocated page frame. No-op if null.
 void PmmFreePage(PhysicalAddress physAddr);
 
@@ -103,6 +109,7 @@ uint32_t PmmGetMapCount(PhysicalAddress physAddr);
 // Caller owns the sole reference to a detached frame. Atomically transfer
 // User/KernelData accounting only when live, ref==1 and map==0. This is NOT an
 // eviction exclusion primitive and never grants ownership from a raw address.
+void PmmReassignOwner(PhysicalAddress frame, PmmOwner expected, PmmOwner replacement);
 bool PmmReclassifyPrivateFrame(PhysicalAddress frame,MemTag expected,MemTag replacement,uint16_t pid);
 
 // BRO-176 stale-mapping detector: track the number of present USER PTEs that

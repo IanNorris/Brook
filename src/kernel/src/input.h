@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include "../../shared/wm_input_abi.h"
 
 // Generic input device interface.
 //
@@ -25,7 +26,10 @@ enum class InputEventType : uint8_t {
     MouseMove       = 2,
     MouseButtonDown = 3,
     MouseButtonUp   = 4,
-    MouseScroll     = 5,   // scanCode=int8 dy (up positive), ascii=int8 dx (right positive)
+    MouseScroll     = 5,   // scanCode=int8 dy (up positive), ascii=int8 dx (right positive);
+                           // deltaY/deltaX = the same in 1/120 ticks (up/right positive),
+                           // finer than a tick for a touchpad: an event may carry
+                           // fine motion with no whole tick (scanCode = ascii = 0)
     MouseRelativeMove = 6, // raw signed motion, independent of cursor clamping
 };
 
@@ -36,8 +40,15 @@ struct InputEvent {
     char     ascii;      // Translated ASCII character (0 if non-printable)
     uint8_t  modifiers;  // Bitmask of active modifiers at event time
     int32_t  deltaX, deltaY; // screen convention: right/down positive
+    uint8_t scrollFlags; // MouseScroll only: BROOK_WM_SCROLL_FINGER / BROOK_WM_SCROLL_END
     uint64_t sequence; // assigned when published to the device queue
 };
+
+// Whole ticks remain available to legacy clients and captured games.
+inline bool InputHasScrollTicks(const InputEvent& event)
+{
+    return event.scanCode || event.ascii;
+}
 
 // Modifier bits.
 static constexpr uint8_t INPUT_MOD_LSHIFT   = (1 << 0);

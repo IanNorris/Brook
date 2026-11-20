@@ -82,6 +82,14 @@ int main() {
     CHECK(ticks == 3 && moved == 0);          // 300 units up / 100 per tick
     for (int i = 1; i <= 5; ++i) ticks += s.Feed(P(3000 + 40 * i, 2300, 70, 0)).scrollY;
     CHECK(ticks == 3);
+    CHECK(s.Feed(P(3200, 2300, 70, 6)).scrollEnded); // one finger lifts
+    CHECK(!s.Feed(P(0, 0, 0, 0)).scrollEnded);
+    for (int i = 0; i < 3; ++i) s.Feed(P(3000, 2000, 70, 0));
+    CHECK(s.Feed(P(3000, 2005, 70, 0)).scrollY120 == 6);
+    CHECK(s.Reset());                               // packet desync ends a live scroll
+    CHECK(!s.Reset());
+    CHECK(!s.Feed(P(3000, 2000, 70, 0)).scrollEnded);
+    CHECK(!s.Feed(P(0, 0, 0, 0)).scrollEnded);      // contact alone had no scroll
     // Natural scrolling flips the direction.
     SynapticsGestureConfig nc; nc.naturalScroll = true; SynapticsGesture n(nc);
     for (int i = 0; i < 3; ++i) n.Feed(P(3000, 2000, 70, 0)); int nt = 0;

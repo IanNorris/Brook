@@ -81,6 +81,9 @@ extern "C" void* kmalloc(uint64_t size){
     void* p=std::malloc(size);if(p){std::lock_guard<std::mutex> lock(trackingLock);allocations.insert(p);std::memset(p,0xcc,size);}return p;
 }
 extern "C" void kfree(void* p){if(p){std::lock_guard<std::mutex> lock(trackingLock);assert(allocations.erase(p)==1);std::free(p);}}
+PhysicalAddress PmmAllocPageAccounted(MemTag tag,uint16_t pid,PmmOwner) {
+    return PmmAllocPage(tag,pid);
+}
 PhysicalAddress PmmAllocPage(MemTag,uint16_t){
     void* p=nullptr;assert(posix_memalign(&p,4096,4096)==0);{std::lock_guard<std::mutex> lock(trackingLock);frames.insert(p);}return PhysicalAddress(reinterpret_cast<uint64_t>(p));
 }
@@ -121,6 +124,9 @@ extern "C" bool DeviceIsRegistered(Device* device){return device==imageRegistere
 void KMutexInit(KMutex* mutex){*mutex={};fatLocks[mutex]=std::make_unique<std::mutex>();}
 void KMutexLock(KMutex* mutex){fatLocks.at(mutex)->lock();}
 void KMutexUnlock(KMutex* mutex){fatLocks.at(mutex)->unlock();}
+VirtualAddress VmmAllocPagesAccounted(uint64_t n,uint64_t flags,MemTag tag,uint16_t pid,PmmOwner) {
+    return VmmAllocPages(n,flags,tag,pid);
+}
 VirtualAddress VmmAllocPages(uint64_t count,uint64_t,MemTag,uint16_t){
     void* p=nullptr;if(posix_memalign(&p,4096,count*4096))return VirtualAddress{};
     {std::lock_guard<std::mutex> lock(trackingLock);frames.insert(p);}return VirtualAddress(reinterpret_cast<uint64_t>(p));

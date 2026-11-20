@@ -3,4 +3,5 @@
 # Requires: /nix/profile/bin/env
 # Requires: /nix/bin/waylandd
 # desc: GNU Image Manipulation Program
+# category: graphics
 source /boot/SCRIPTS/wayland_gimp.rc

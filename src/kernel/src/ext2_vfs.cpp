@@ -743,7 +743,7 @@ static void Ext2BlockCachePut(Ext2Mount* mnt, uint32_t blockNum, const void* buf
     uint8_t* candidate = nullptr;
     {
         if (mnt->blockSize <= 4096) {
-            PhysicalAddress page = PmmAllocPage(MemTag::KernelData);
+            PhysicalAddress page = PmmAllocPageAccounted(MemTag::KernelData,KernelPid,PmmOwner::FsBuffers);
             if (page) candidate = reinterpret_cast<uint8_t*>(PhysToVirt(page).raw());
         } else {
             candidate = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
@@ -1266,7 +1266,7 @@ struct Ext2AppendBatch {
                 return reinterpret_cast<uint32_t*>(PhysToVirt(pages[i].phys).raw());
         if (count == 3) return nullptr;
         auto& page = pages[count];
-        if (!page.phys) page.phys = PmmAllocPage(MemTag::KernelData);
+        if (!page.phys) page.phys = PmmAllocPageAccounted(MemTag::KernelData,KernelPid,PmmOwner::FsBuffers);
         if (!page.phys) { error = -12; return nullptr; }
         auto* data = reinterpret_cast<uint32_t*>(PhysToVirt(page.phys).raw());
         if (fresh) memset(data, 0, mnt->blockSize);
@@ -1281,7 +1281,7 @@ struct Ext2AppendBatch {
             if (pages[i].block == block) pages[i].dirty = true;
     }
     uint8_t* Tail() {
-        if (!tailPage) tailPage = PmmAllocPage(MemTag::KernelData);
+        if (!tailPage) tailPage = PmmAllocPageAccounted(MemTag::KernelData,KernelPid,PmmOwner::FsBuffers);
         if (!tailPage) { error = -12; return nullptr; }
         return reinterpret_cast<uint8_t*>(PhysToVirt(tailPage).raw());
     }

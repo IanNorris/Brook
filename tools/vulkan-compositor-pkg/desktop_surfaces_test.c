@@ -45,7 +45,14 @@ static int direct_shadow(const struct BrookDesktopSurface *s,int32_t x,int32_t y
     *out=shadow[sy*64+sx];return 1;
 }
 int main(void){
-    desktop_shadow_source(shadow);
+    const struct BrookDesktopSurface legacy={.shadow=BROOK_DESKTOP_SHADOW_WINDOW};
+    memcpy(shadow,desktop_shadow_tile(&legacy),sizeof(shadow));
+    const struct BrookDesktopSurface active={.shadow=BROOK_DESKTOP_SHADOW_WINDOW_ACTIVE};
+    const struct BrookDesktopSurface inactive={.shadow=BROOK_DESKTOP_SHADOW_WINDOW_INACTIVE};
+    const struct BrookDesktopSurface panel={.shadow=BROOK_DESKTOP_SHADOW_PANEL};
+    const struct BrookDesktopSurface panelLight={.shadow=BROOK_DESKTOP_SHADOW_PANEL,.flags=BROOK_DESKTOP_SURFACE_LIGHT_SHADOW};
+    CHECK(memcmp(desktop_shadow_tile(&active),desktop_shadow_tile(&inactive),sizeof(shadow)));
+    CHECK(memcmp(desktop_shadow_tile(&panel),desktop_shadow_tile(&panelLight),sizeof(shadow)));
     for(unsigned i=0;i<W*H;++i)background[i]=0xff000000u|(i*2654435761u>>8);
     for(unsigned i=0;i<60*40;++i)client[i]=0xff000000u|(i*40503u);
     /* Validation and lookup. */

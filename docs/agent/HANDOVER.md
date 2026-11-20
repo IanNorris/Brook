@@ -4,6 +4,175 @@ Current state and immediate goal. Keep this short and current: replace stale lin
 
 _Last updated: 19 November 2026 (early), by a Claude Code session; see "19 Nov early: resume here"._
 
+
+## Brook Files (20 November 2026)
+
+- `work/files-nautilus` packages pinned Nautilus 49.4 as Files
+  (`org.gnome.Nautilus.desktop`). Directory opens use this ID, and Super+E
+  starts Files or restores and focuses an existing window. The launcher
+  rewrites the old Files key in pins, Recent and category membership.
+- User-session D-Bus activation loads GVfs for Trash. Local volumes use the
+  GIO Unix volume monitor. All three desktop profile expressions include
+  the new Files integration, and the boot-only tools refresh no longer
+  stages the old browser. The Files icon remains used by design previews.
+- Implementation `c04f5132`. Release, 386 non-stress tests, all 728
+  chrome goldens and the desktop-index regression passed. The hardware
+  profile is `/nix/store/m4ixhjswaq8wzws1ychyfb9g4w1wfv3a-brook-offline-hardware-desktop`.
+  Exact profile link and closure changes are in
+  `build/files-evidence/profile-delta.json`.
+- Clearwater-enabled pair `build/dell/pair-files` passed guarded QEMU
+  on attempt 1. A separate headless QEMU boot opened the real Files
+  window with Super+E and persisted the migrated pins and Recent entries.
+  A private host session verified the default directory handler and a
+  Trash round trip. Evidence is in `build/files-evidence`. Dell validation
+  is pending.
+## Per-user launcher manifest and web-app titles (20 November 2026)
+
+- `work/user-app-manifest` accepts regular `user-apps.idx` files under
+  `/data/home/.local/share/brook` owned by uid 1000, with mode 0600 or 0644.
+  Profile executables are validated at load and dispatch. The kernel adds
+  uid 1000 and preserves trusted catalog precedence. `launcher status`
+  reports counts and errors, and the kernel console shows rejected lines.
+- Writers can atomically rename the new index into place and notify syscall
+  `0xB03`. Desktop-user requests coalesce at up to one per second. Opening
+  the launcher also refreshes the catalog.
+- The `X-Brook-WebApp` category token enables display names for matching
+  window app IDs in native chrome, taskbar and tooltips. Empty, matching
+  and hostname titles use the name alone. Other client titles follow the
+  name and an en dash. `hw_windows` exposes `raw_title` for diagnostics.
+- Implementation `edd5f871` and `eee62b61`. Release, 386 non-stress tests
+  and 734 chrome goldens passed. Guarded QEMU passed on attempt 2 after a
+  pre-selection firmware stall. A separate fixture verified catalog
+  rejections, two launches as uid 1000, manifest refresh with the launcher
+  closed, and a live web-app title update.
+- Pair `build/dell/pair-user-app-manifest-final`
+  (`dell-userapp-title-20261120`) includes Clearwater and the four Broadwell
+  options. The shell's en-dash glyph updates its boot package. No profile
+  changes. Evidence is under `build/launcher-user-manifest-evidence`.
+
+## Launcher persistence (20 November 2026)
+
+- `work/launcher-persist` fixes the legacy temporary-file creation failure on
+  the guarded home mount. The worker now uses retained VFS paths, creates
+  missing config directories, and advances the saved epoch after file and
+  directory sync. First-run defaults are queued and failed writes retry.
+- `launcher status` exposes worker state, epochs, load/save stages and errno,
+  and pin keys. Failures reach the kernel console log read by `hw_logs`.
+- Implementation `c7c82b31`. Headless Release and 386 non-stress tests passed.
+  Guarded QEMU passed on attempt 1 with Clearwater ready. A separate guarded
+  fixture persisted the default Firefox pin, added Chromium through the
+  context menu, verified uid 1000 and mode 0600 directly on ext2, and restored
+  those bytes on a subsequent boot. Evidence is in
+  `build/launcher-persist-evidence`.
+- Pair `build/dell/pair-launcherpersist` (`dell-launcherpersist-20261120`) was
+  built with Clearwater and the four Broadwell options. Dell validation is
+  pending.
+
+## Clearwater Stage 3 reconciliation (19 November 2026)
+
+- `work/clearwater-s3-reconcile` merges Stage 3 into integration60 `a3f6685e`.
+  Tested implementation `c11c9043`. The restartable shell builds the launcher
+  from the current owned model and frame. Hit testing, layout persistence,
+  fine-scroll remainder and `focus.shell` stay in the WM.
+- Headless Release, 386 non-stress host tests, all 728 unchanged chrome goldens
+  and 25 staging/verification tests passed. The shell, waylandd, compositor
+  and Settings packages built.
+- Baseline against candidate QEMU captures cover 12 material, mode and
+  scale combinations and 48 scenes. Launcher pixels match except for the
+  build label. The stable left taskbar regions match. Live timing and boot
+  overlays vary by boot. Killing the shell showed the fallback and restored
+  the open launcher and terminal. Captures, comparisons and logs are under
+  `build/s3r-evidence`.
+- The pair `build/dell/pair-s3r` (`dell-s3r-20261119`) was built from
+  `c11c9043` with Clearwater enabled and the four Broadwell options.
+  Guarded QEMU passed on attempt 1. Dell deployment is pending.
+## Desktop chooser schemas (19 November 2026)
+
+- `work/settings-schemas` compiles GTK3, GTK4 and GNOME GSettings schemas
+  into the existing Brook profile lookup directory. The build checks both
+  chooser schemas for both GTK versions and preserves existing keyfile
+  layout values.
+- The pinned GTK3 color button opened its chooser on a private virtual
+  display with the new schema directory as its only source.
+  Package `/nix/store/r6lz8cqz7hyk4l9j7lyymdzfhsgxgv49-brook-desktop-settings`.
+  Logs are in `build/schema-evidence`. Dell validation is pending.
+## xdg-shell window controls (20 November 2026)
+
+- `work/xdg-wm-capabilities` advertises v5 with logical configure bounds and
+  Maximise, Minimise and Fullscreen capabilities. GTK4 enabled both formerly
+  insensitive controls on a private Wayland display. GTK3 and Chromium
+  retained the initial configure handshake.
+- Headless Release, 386 non-stress host tests and the standard and Vulkan
+  waylandd package fixtures passed. Logs and matched client traces are in
+  `build/xdg-evidence`. The Dell still needs to exercise the buttons.
+
+## Session environment and executable cache (19 November 2026)
+
+- `work/session-env` uses an app-owned `/tmp/brook-$UID` directory with mode
+  `0700` and connects clients to the existing `/tmp/wayland-0` socket.
+  Qt's built-in KDE theme discovers Breeze from the profile and respects
+  existing Qt theme overrides and `kdeglobals`. A host headless Wayland
+  probe rendered a Breeze Dark icon with the pinned Qt 6.11.0 edition.
+- `mem breakdown` reports `classes.exec_cache` and the cache-only subset
+  as `reclaimable_exec_cache_pages`. `Cached` includes the full executable
+  cache. `MemAvailable` includes only its reclaimable subset alongside free
+  pages.
+- The desktop profiles ship GTK 3 and GTK 4 settings and a GSettings schema
+  default for `icon:minimize,maximize,close`. Chromium 148 reads the GTK
+  property. Its launcher carries forward existing keyfile preferences and
+  replaces `BROOK_CHROMIUM_BUTTON_LAYOUT` with normal GTK/GSettings overrides.
+- Release, both kernel audits and all 386 non-stress host tests passed after
+  the follow-up. Both pinned GTK versions respected the packaged defaults and
+  existing overrides on headless displays. Evidence is in
+  `build/session-env-followup-{release,ctest}.log` and
+  `build/session-env-{gtk-probe,desktop-settings,waylandd}.log`.
+## Wayland fine scrolling (19 November 2026)
+
+- `work/wayland-fine-scroll` at `241826c1` adds fractional two-finger scroll
+  and gesture-end events to opted-in WM windows. The 12-byte event carries
+  signed vertical/horizontal v120 in bytes 4–7 and the local pointer position
+  in bytes 8–11. The raw input ABI, launcher, kernel Terminal and captured
+  scroll retain their existing paths. Older kernels use whole ticks with the
+  new waylandd.
+- waylandd sends finger axes and stops only axes that moved. Wheels retain
+  discrete events on pointer v5–7 and get v120 events from v8. Brook Files
+  carries fractional motion into row scrolling. Pinned Xwayland 24.1.11
+  source confirms its scroll valuator and legacy button emulation paths.
+- Release, entry and scheduler audits, all 385 non-stress host tests and both
+  Nix packages passed. The waylandd fixture checked v4/v5/v7/v8 wire events.
+  Logs are in `/data/Programming/Brook/wayland-fine-scroll/build/fine-scroll-*.log`.
+  Hardware feel and a live X11 app remain unverified.
+## Clearwater material and mode (19 November 2026)
+
+- `work/theme-redesign` on integration57, feature commits `a6ac48fa` and
+  `93f6ccb6`. Glass and Opaque each offer Light, Mixed and Dark. Settings
+  supports thirteen presets and an exact custom sRGB accent. Older selections
+  migrate on load and Glass fallback preserves the mode and accent.
+- Headless Release, the Settings package, 385 non-stress tests and 728 chrome
+  goldens passed. Astra checked the Blue scale matrix, preset tint palette
+  and custom magenta. Sheets and logs are in `build/theme-redesign-evidence`.
+  The updated tint and final Glass composition await Dell validation.
+- Stage 3 at `8e1e31ed` passed its original integration49 validation. A
+  read-only integration57 merge check found conflicts in the launcher glue,
+  chrome golden driver, image builder, kernel build configuration and
+  handover. Resolve those before rerunning the pixel and shell restart checks.
+
+## Wayland latency diagnostics (19 November 2026)
+
+- `work/wayland-latency` at `ee769aec` adds per-connection and per-toplevel
+  callback timings, client turnaround and input delivery to the existing
+  waylandd status JSON. WM_POP_INPUT supplies no timestamp.
+- The reset follow-up accepts a regular `/tmp/brook-waylandd-stats-reset`
+  owned by root or the provider. A marker that the provider cannot remove
+  stays on disk and is acknowledged once per touch. The epoch appears in
+  `latency.stats_epoch` as well as at the top level. Both Wayland provider
+  packages passed host checks, including the unprivileged reset fixture.
+- The pair is `/data/Programming/Brook/wayland-latency/build/dell/pair-wlstats`
+  (`dell-wlstats-20261119`). Guarded QEMU passed on attempt 1. The Dell has
+  yet to run this diagnostic. Release and all non-stress host tests passed
+  after two parallel timeouts passed on an isolated rerun.
+- Host status publication and reset evidence is in `build/wlstats-evidence`.
+
 ## Workspace
 
 - **Root:** `/data/Programming/Brook/`. `main/` is a fresh GitHub clone kept on `main`. Each agent or task gets its own worktree, `git worktree add ../<task> -b <branch>`, with its own `build/`. Never share a build directory or drive the Dell from two agents at once.

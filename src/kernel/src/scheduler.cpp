@@ -2603,24 +2603,26 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
     }
 
     bool hasLiveThreadPeer = false;
-    if (!proc->isThread)
     {
         uint64_t alf = SchedLockAcquire(g_allProcLock);
         hasLiveThreadPeer = ThreadGroupHasLivePeerLocked(proc);
         SchedLockRelease(g_allProcLock, alf);
     }
 
-    // Only do full process cleanup for non-thread (group leader) processes
-    // after all sibling threads are gone. A plain sys_exit from the leader does
-    // not terminate the thread group, and shared fds/address-space state must
-    // remain valid for still-running pthreads.
+    // The last task of a thread group closes the shared descriptor table now,
+    // so pipe and socket peers see EOF/hang-up before any reap. That task may
+    // be a thread: a worker's fatal fault or exit_group kills the leader
+    // remotely, and Chromium reaps a dead child only after its channel hangs
+    // up. A plain sys_exit from the leader does not terminate the group, and
+    // shared fds/address-space state must remain valid for running pthreads.
+    if (!hasLiveThreadPeer)
+    {
+        // Close all FDs immediately so pipe readers/writers get unblocked.
+        ProcessCloseAllFds(proc);
+    }
+
     if (!proc->isThread)
     {
-        if (!hasLiveThreadPeer)
-        {
-            // Close all FDs immediately so pipe readers/writers get unblocked.
-            ProcessCloseAllFds(proc);
-        }
 
         // Signal the compositor
         if (proc->fbVfbWidth > 0)
@@ -3110,6 +3112,34 @@ static Process* CoreGroupLeaderLocked(const Process*);
 // reaped without running.  Called by sys_exit_group before the calling thread
 // calls SchedulerExitCurrentProcess.  Threads that are currently running on
 // another CPU will be caught by the scheduler at the next timer tick.
+// Forced exits (remote SIGKILL, a sibling's fatal fault, OOM) never run
+// SchedulerExitCurrentProcess, so without this their descriptors survived
+// until the parent reaped them. The cleanup worker calls this for each victim
+// once it is off-CPU; the last one finds the whole generation terminated and
+// quiesced and releases the shared table. Its robust-exit hold keeps the
+// victim, and through asLiveThreads its leader, from being reaped meanwhile.
+void SchedulerReleaseDeadGroupFiles(Process* member)
+{
+    if (!member || member->isKernelThread) return;
+    const uint16_t tgid = member->tgid;
+    const uint64_t generation = member->isThread ? member->leaderIncarnation : member->incarnation;
+    Process* leader = nullptr;
+    bool quiesced = true;
+    uint64_t alf = SchedLockAcquire(g_allProcLock);
+    for (uint32_t i = 0; i < g_processCount && quiesced; ++i) {
+        Process* p = g_allProcesses[i];
+        if (!p || p->tgid != tgid) continue;
+        if ((p->isThread ? p->leaderIncarnation : p->incarnation) != generation) continue;
+        if (p->state != ProcessState::Terminated ||
+            __atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE) >= 0)
+            quiesced = false;
+        else if (!p->isThread)
+            leader = p;
+    }
+    SchedLockRelease(g_allProcLock, alf);
+    if (quiesced && leader && leader->fds) ProcessCloseAllFds(leader);
+}
+
 void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus,
                               int terminationSignal)
 {

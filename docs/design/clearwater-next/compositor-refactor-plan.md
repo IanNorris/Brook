@@ -5,7 +5,10 @@
 implemented on `work/compositor-refactor`; stages 1.1 and 1.2 on
 `work/clearwater-s1` (see [Stage 1.1/1.2 evidence](#stage-11-and-12-evidence));
 stages 1.3 and 1.4 on `work/clearwater-s1b` (see [Stage 1.3/1.4
-evidence](#stage-13-and-14-evidence)). It covers the [Clearwater Next design](DESIGN.md)
+evidence](#stage-13-and-14-evidence)); stage 1.5 and stage 2 steps 2.1–2.3
+on `work/clearwater-s2` (see [Stage 1.5 and 2.1–2.3
+evidence](#stage-15-and-21-23-evidence), which also specifies the
+capability ABI). It covers the [Clearwater Next design](DESIGN.md)
 and the [compositor direction](../../compositor-direction.md).
 
 Line numbers refer to `main` at `0ae38b0d`, before stage 0.1.
@@ -104,7 +107,7 @@ Window-frame and shell code lives in `window.cpp` unless a file is named.
   `0xB0C`. Settings reads the same `brook_theme.h` table for its preview.
 - App surfaces use a second palette (`brook_surface_palette` in
   `brook_appearance.h`). It is pushed to GTK as CSS and also copied as
-  literals in brook-files.c and gallery.c.
+  literals in gallery.c.
 - Painters call `WmCurrentPalette()` per draw. The chrome cache key folds in
   `theme | appearance | scale | settingsEpoch`.
 
@@ -304,17 +307,17 @@ Steps 0.3 and 0.4 landed after `work/chrome-csd` merged into main.
 | **1.2 (done)** | Display lists: frame and shell painters become *build list* plus *CPU execute*:<br>• `chrome_display_list.h` (7 primitives: fill, title rows, corner-clipped fill, material rect, text, icon, square runs), `chrome_style.h` (palette, metrics, font, resolved material);<br>• `chrome_raster` is the freestanding executor; `chrome_frame` and `chrome_shell` are freestanding builders with the taskbar and launcher layouts;<br>• the WM snapshots state into models (`wm_shell_*.inc`) and keeps hit tests and the build-badge spans. | `test_chrome_goldens`: 144 goldens (16 elements × 3 themes × 3 scales); QEMU CPU screenshots identical |
 | **1.3 (done)** | Surface records (material, radii, shadow class, content key):<br>• `chrome_surface.h` builds one record per frame and shell surface, resolved against the backend (shadow and glass radii only under glass);<br>• virgl takes its shadow quads, title-blur radius and shell blur from them; the shadow nine-slice is shared (`brook_chrome_shadow.h`);<br>• layers ABI v2: op 16 (frame records), overlay op 10 (shell records); VKRENDER draws the shadow nine-slice. | Virgl screenshot identical; VKRENDER host quad test against the CPU reference (see Stage 1.3/1.4 evidence) |
 | **1.4 (done)** | • Per-surface overlay keys (display-list hash): the 100 ms check builds lists only, a capture rasterises only changed surfaces, band keys come from surface keys;<br>• no CPU raster of wallpaper, windows or chrome under a lease (one full repaint after);<br>• span-only chrome (op 17) drawn as in-place spans;<br>• opaque frames (spans, caption blocks) occlude in the quad plan, with `work/shell-opaque`'s bands. | Host tests and QEMU screenshots; Dell measurement plan below (not yet run) |
-| 1.5 | Backend `backdrop-blur` capability and theme resolution, replacing `CompositorGlassActive()` | QEMU: software → Opaque, gl → Glass; renderer kill → Opaque stand-in |
+| **1.5 (done)** | Backend `backdrop-blur` capability and theme resolution, replacing `CompositorGlassActive()`:<br>• layers op 18 `BROOK_DESKTOP_RENDERER_CAPS` (bit `BROOK_DESKTOP_CAP_BACKDROP_BLUR`); virgl `BlurSupported`; CPU never;<br>• resolved at every frame boundary, re-resolved on lease loss, renderer exit or a GOP writer;<br>• the VKRENDER yield is removed (glass alpha in chrome and overlay captures for a renderer that reports blur). | QEMU: software → Opaque stand-in, gl → Glass; renderer-kill path by host test (no VKRENDER in QEMU). See [evidence](#stage-15-and-21-23-evidence). |
 
 ### Stage 2: Clearwater visuals, implemented once
 
 This follows DESIGN.md's implementation order. Each step changes the
 builder and theme only, and every backend picks it up.
 
-1. Metrics: title bar 40, taskbar 48 with full-height targets.
-2. Themes: `theme=glass|opaque-light|opaque-dark`, Mixed mode, aliases from
+1. **(done)** Metrics: title bar 40, taskbar 48 with full-height targets.
+2. **(done)** Themes: `theme=glass|opaque-light|opaque-dark`, Mixed mode, aliases from
    the old palette and Performance settings.
-3. Hue derivation in `BrookTheme` with the DESIGN.md tables as test
+3. **(done)** Hue derivation in `BrookTheme` with the DESIGN.md tables as test
    vectors, plus content colours for GTK and native apps.
 4. **VKRENDER backdrop blur** under the glass budget above. Until it lands,
    the Dell resolves Glass to its Opaque stand-in. Once it exists, run the
@@ -336,6 +339,48 @@ submits surfaces through the stage 1.3 ABI. Launcher organisation
 (DESIGN.md steps 6–7) waits for this process (Ian, decision 3); it is not
 built in the kernel painter first. The kernel keeps a minimal
 taskbar and frame for when the shell is down (DESIGN.md T3).
+
+#### Stage 3 implementation and validation
+
+`work/clearwater-s3` is based on integration49 (`095ae70e`). The kernel
+takes bounded, pointer-free snapshots of the active shell surfaces and
+keeps input routing, hit testing, window identity, focus and popup geometry.
+`CWSHELL.ELF` builds display lists with the same fonts and shared builders.
+The kernel validates the submitted commands and replays them through the
+existing surface records and overlay cache. A replacement shell receives
+fresh snapshots without taking ownership of any window. The compositor
+uses a themed fallback bar if the shell exits, and `CWSUP.ELF` restarts it.
+
+The frame paths keep their existing GPU passes and reuse unchanged shell
+rasters. A changed surface sends a model of about 115 KiB plus its bounded
+list and used assets. Idle sampling runs at the 100 ms overlay cadence.
+The shell prepares a default launcher list while it is closed. Opening
+uses that list only when the current snapshot matches. A stale page or
+confirmation is never shown while a fresh list is pending.
+
+Build the guarded image with `scripts/build_dell_image.py --clearwater-shell`
+and the four Broadwell options. The final code is `70c0e720` and the pair is
+`build/dell/pair-cws3-warm` (`dell-cws3-20261119`). Guarded QEMU passed on
+attempt 1 and recorded the shell's first taskbar publication. The fresh
+kernel build fit the existing 8 MiB loader limit. The incremental build
+that included the expanded symbol table exceeded that limit.
+
+The evidence is under `build/cws3-evidence`. Release, 383 non-stress tests,
+both stress tests and 25 image-staging tests passed. All 220 golden PNGs
+are unchanged. The nine final launcher regions match pixel for pixel.
+The broader theme and scale matrix also matches static chrome, with live
+telemetry, build labels, boot timings and the terminal caret varying
+between boots. The shell-kill fixture caught the fallback bar and saw PID
+19 replaced by PID 22. The launcher reopened in its previous state and
+the terminal survived.
+
+For Opaque Dark at 100% in software QEMU, two runs per revision sampled
+the guest's framebuffer directly. Launcher open was 11.94 to 12.84 ms at
+the median and 19.99 to 18.99 ms at p95 (110 samples per revision). Taskbar
+minimize/restore was 11.16 to 12.04 ms at the median and 19.00 to 19.25 ms
+at p95 (160 samples per revision). Idle host QEMU CPU was 0.080–0.083 core
+before and 0.083–0.086 core after. These are VM observations. Intel GPU and
+physical input costs remain unmeasured.
 
 ## Tests
 
@@ -827,3 +872,524 @@ Accept if 1–4 hold and 5 shows a complete desktop. Rollback without a
 rebuild: `BROOK_RENDER_SURFACES=0` and `BROOK_RENDER_CHROME_SPANS=0` in the
 renderer environment; the kernel changes have no switch (the previous pair
 is the rollback).
+
+## Stage 1.5 and 2.1–2.3 evidence
+
+Branch `work/clearwater-s2`, based on `work/integration42` (`335de89e`).
+Commits: `97414567` (1.5), `14e5536d` (2.1), `816273d8` (2.2/2.3 themes,
+hue tokens, kernel), `c40a47d1` (2.2/2.3 Settings and app colours).
+
+### Stage 1.5: backdrop-blur capability (renderer ABI)
+
+The material is resolved before any backend sees it. At every frame
+boundary the compositor asks which backend shows the desktop and whether it
+can blur (`CompositorBackendBlur`), and the WM resolves the theme against
+it (`WmSetBackendBlur`); a change bumps the chrome epoch (every chrome key
+changes, one full repaint). `CompositorGlassActive()` now just reads the
+frame-latched result. The saved selection is never rewritten.
+
+| Backend showing the desktop | backdrop-blur |
+| --- | --- |
+| A renderer holding the present lease | what that process reported with op 18 (below) |
+| virgl (kernel GPU path) | `GpuCompositorOps::BlurSupported()` |
+| CPU path, including lease expiry and a GOP writer | never |
+
+**Layers ABI: op 18, `BROOK_DESKTOP_RENDERER_CAPS`** (syscall `0xB19`,
+`src/shared/desktop_layers_abi.h`):
+
+- Call: `syscall(BROOK_SYS_DESKTOP_LAYERS, 18, address = 0, size = 0,
+  a = BROOK_DESKTOP_CAPS_VERSION (1), b = capability bits, c = 0)`.
+- Bits: `BROOK_DESKTOP_CAP_BACKDROP_BLUR = 1u` (bit 0). All other bits are
+  reserved: unknown bits are dropped, not rejected
+  (`BROOK_DESKTOP_CAP_KNOWN`).
+- Returns (≥ 0) the bits this kernel recorded. Any other argument shape
+  returns `EINVAL`.
+- Owner: the calling process's leader incarnation, the same identity as the
+  present lease and the capture ops. The record counts **only while that
+  owner holds the present lease**. Lease expiry (500 ms without a
+  present), lease release, `GPU_HANDOFF_DETACH` and owner exit all end it;
+  detach and exit also delete the record, so a renderer reports after every
+  attach. A new report replaces the old; `b = 0` withdraws.
+- **Older kernels** return `EINVAL`: a renderer must then assume nothing it
+  reports is used (the kernel keeps Glass at its Opaque stand-in).
+- **Older renderers** never call op 18, so the kernel never resolves Glass
+  for them: every record they receive is opaque, exactly as before.
+- **What the bit promises:** the renderer blurs the desktop beneath every
+  surface record whose `material` is `BROOK_DESKTOP_MATERIAL_GLASS`, with
+  radius `level` (the virgl radius: 2, 8 or 16 output pixels for
+  Light/Moderate/Heavy, `brook_appearance_blur_strength`), and composites
+  the surface over that blurred backdrop at its alpha and `opacity`.
+- **What the kernel then sends,** while the owner holds the lease and the
+  Glass theme is selected:
+  - op 16 frame records and overlay op 10 shell records carry
+    `MATERIAL_GLASS` with the level, glass corner radii and window shadows,
+    and are not marked `BROOK_DESKTOP_SURFACE_OPAQUE`;
+  - chrome captures (ops 7, 8, 11, 12, 17) carry the glass alpha of virgl's
+    chrome layer (`ChromeMarkFrameGlass`, chrome_alpha.h): borders 255,
+    the title bar at the material alpha, title text and the accent stroke
+    255, rounded corners from the material masks. Spans-only captures (op
+    17) write it within the strips. The capture no longer returns `-95`
+    under glass;
+  - overlay captures give glass shell surfaces (taskbar, launcher, volume
+    popup, tooltip) the material alpha where the painters left none, and
+    their op 9 bands are not opaque; the boot summary stays opaque.
+- The renderer (`desktop_renderer.c`, `renderer_capabilities()`) reports 0
+  today and logs `DESKTOP_RENDERER_CAPS requested=… accepted=…`. The blur
+  pass (2.4) sets the bit there. Until then the Dell resolves Glass to its
+  stand-in and nothing changes on screen.
+
+Settings reads the same fact: `0xB02` op 4 returns
+`BROOK_THEME_STATUS_GLASS_AVAILABLE` (1) and `…_GLASS_ACTIVE` (2). The
+debug command `gpu glass status` adds `backend_blur`.
+
+### Stage 2.1: metrics
+
+Title bar 40 (was 36), caption targets 48×40 (was 46), taskbar 48 (was 44).
+Taskbar targets span its full height and abut: launcher button 56 wide,
+terminal and window buttons 48; each pill is drawn inset 5 top and bottom
+and 2 each side (38 high), hover follows the target, so the screen's bottom
+edge and bottom-left corner hit. The caption hover fill, title icon size
+and the repaint stay for 2.5. `test_chrome_layout` checks the spec at
+40/48.
+
+### Stages 2.2 and 2.3: themes and hue
+
+- `brook_theme.h` holds the model: Glass (Light, Mixed or Dark), Opaque
+  Light, Opaque Dark; thirteen hues. The selection word (theme bits 0–3,
+  mode 4–7, hue 8–12; default Glass, Mixed, Blue) is `0xB02` ops 2/3.
+  Without backdrop blur Glass resolves to Opaque Light (Light mode) or
+  Opaque Dark (Mixed and Dark).
+- settings.ini `[Desktop]`: `theme=glass|opaque-light|opaque-dark`,
+  `mode=light|mixed|dark`, `accent=<hue>`. Aliases: `theme=0|1|2` (Blue,
+  Pine green, Slate), `palette=tinted|clearwater|smoked|opal`, `dark=` (the
+  mode when `mode=` is absent), `performance=1` (the Opaque theme for that
+  mode). Named keys win in any order. `opt/glass` on QEMU picks Glass or the
+  Opaque theme for the mode.
+- The appearance word (`0xB0B`) keeps opacity and blur; its dark bit is now
+  "the app content in use is dark" and its performance bit "an Opaque
+  theme is selected". An older Settings that writes disagreeing bits is
+  read through the same aliases. `0xB02` ops 0/1 keep the legacy palette
+  id, mapped to its hue.
+- `brook_hue_derive` (no libm) rotates the Blue reference in OKLCH,
+  applies the Amber/Orange/Red/Navy shaping, clips to sRGB and runs the
+  contrast loop. `brook_theme_build_palette` maps tokens to the painters'
+  palette (Glass: glass tint and title top; Opaque: flat fill everywhere;
+  rim from the accent; red Close hover `#c8414f`).
+- App content colours: `0xB02` op 5 returns one colour of the content set
+  in use (`BROOK_CONTENT_*`, brook_appearance.h). `brook_gtk_appearance.h`
+  writes them as `@define-color brook_*` lines plus rules and follows
+  changes (Settings, Message, and the Gallery when rebuilt); Files reads the
+  same set. Older kernels give the Blue set.
+- Settings: three theme cards, Mode (Light/Mixed/Dark), thirteen hue
+  swatches, Glass opacity and blur. Glass locked: its card, mode, opacity
+  and blur greyed, with "Glass needs GPU acceleration, which this display
+  does not have. Opaque Dark is in use until it does." The Performance
+  switch is gone. Checked headless (Xvfb, syscall shim): glass available,
+  locked, Amber Opaque Light, Slate Opaque Dark locked.
+- Not done here: the re-spaced blur ramp and panels 10 points more solid
+  (both glass visuals, 2.4/2.5), wallpaper sampling (the Wallpaper hue uses
+  `brook-dawn.png`'s value), Files' and the Gallery's other literals.
+
+### Tests
+
+- `test_brook_theme` (new): all thirteen hues against DESIGN.md "Derived
+  tokens", "Values per hue", "Computed contrast" and index.html's generated
+  rows: 327 of 338 colours exact, 11 within one 8-bit level (gamut-clip
+  rounding), every ink alpha, accent token and HUD colour exact, every
+  contrast figure within 0.1 and every target met; Blue reproduces the
+  reference exactly; resolution, selection word and settings aliases.
+- `test_gpu_capture_queue`: the backend capability table (CPU, virgl with
+  and without `BlurSupported`, lease holder with and without the report,
+  another process's report, lease lapse, GOP writer, release drops the
+  report, withdrawal); glass and opaque overlay alpha and opaque masks.
+- `test_window_surfaces`: re-resolution on backend change stales captures;
+  default Glass Mixed Blue resolves to Opaque Dark without blur and Glass
+  with it; appearance-bit aliases; content colours per resolved mode.
+- `test_chrome_alpha`: `ChromeMarkFrameGlass` exact against the old virgl
+  loop (3000 random frames, layer and capture).
+- Goldens, regenerated only for intended changes: 2.1 changed the 99 frame
+  and taskbar images (launcher, popup, tooltip, boot summary unchanged);
+  2.2/2.3 renamed the themes to `glass`, `opaque-light`, `opaque-dark`
+  (Blue, three scales) and added `amber-glass` and `teal-opaque-light` at
+  100%: 176 images.
+- Host suite: 383 run; `test_sched_lock_owner`, `test_audio_delivery` and
+  `test_exec_page_cache` timed out under load 27–40 and pass alone.
+- Compositor package: built with its tests;
+  `brook-desktop-renderer-host-test` (headless, host i915): `HOST_E2E_PASS`,
+  one op 18 report of 0; with `HOST_E2E_OLD_KERNEL_NO_SURFACES=1` (op 18
+  refused): `HOST_E2E_PASS`.
+
+### QEMU (headless, QMP input, no NIC or bridge)
+
+Evidence in `build/cw2-evidence/` (not committed): `cand-cpu/`,
+`cand-gl/`, `detail.png`, `sheet-qemu.png`.
+
+- `gpu=software`: Glass, Mixed, Blue resolves to **Opaque Dark**: flat
+  fill title bar and taskbar, no translucency.
+- `gpu=gl` (virgl): serial `WM: backend backdrop blur available`; **Glass**:
+  translucent blurred taskbar and launcher, the Blue title top.
+- 48 px taskbar with inset pills; a pointer on the screen's bottom row
+  hovers the button above it.
+- Renderer kill → stand-in cannot run in QEMU (no VKRENDER); covered by the
+  host tests above. Two QEMUs sharing the worktree's disk image make one
+  fail to spawn bash; run one at a time.
+
+### Dell pair
+
+`build/dell/pair-cw2` (payload `dell-cw2-20261119`; scanout flip,
+persistent scanout map, zero-copy scanout and video engine on; clean tree
+at `c40a47d1`; kernel `ea51ec3f…`). `check_dell_image_qemu.py --attempts
+4`: PASS. Nothing has run on the Dell. Settings is a store app and needs
+staging separately (and Files, Message for the hue's app colours).
+
+**Check by hand on the Dell (200%):** the desktop comes up Opaque Dark
+(Glass, Mixed saved; the renderer reports no blur yet) or Opaque Light if
+the saved mode was light (an old `dark=0`); title bars 80 px, taskbar 96 px,
+and the bottom screen row and bottom-left corner hit taskbar buttons; in
+Settings the Glass card is greyed with the stand-in named, mode/opacity/blur
+greyed, a hue (e.g. Amber) and Opaque Light apply live to chrome and GTK
+apps and survive a reboot; renderer kill: the CPU desktop returns complete
+and in the same Opaque theme; `DESKTOP_RENDERER_CAPS requested=0 accepted=0`
+in the renderer log.
+
+## Stage 2 visual review
+
+Branch `work/clearwater-review`, from `work/clearwater-s2b` (`1d528e94`).
+A review of stage 2.5/2.6 against the prototype and DESIGN.md's token
+sheet, for layout, proportion, hierarchy, shape and legibility. Exact
+colours and blend values were not in scope. The fixes are in the builders,
+the executor and the baked fonts: every backend picks them up, and nothing
+new runs per frame.
+
+### Differences found, by priority
+
+| # | Difference in `1d528e94` | Now |
+| --- | --- | --- |
+| **P1** | One 16 px face for every string: task labels, titles, clock and panel text a third larger than the reference, and no hierarchy in panels. | Type roles (DESIGN.md "Type"): Body 13, Label 12, Small 11, Strong 13 bold, Lead 15 bold, Hero 20, Mono 11. Fixed. |
+| **P1** | CPU and MEM tray meters drew their fill bar under the first digit of the value. | One-line chips: caption label, 6 px meter, value. Fixed. |
+| **P1** | Build label drawn one proportional glyph per fixed cell ("Br ook"). | Hack 11, as the prototype's monospace label. Fixed. |
+| **P2** | Every taskbar target carried an idle pill; the focused indicator spanned half the button and was 2 px high; buttons were always 188 wide with 24 px icons; no separators. | Pill only when focused, open or hovered; 20 × 3 (focused), 6 × 3 (running) and outlined (minimised) state pills 7 px above the edge; 20 px icons, buttons sized to their label (48 to 188); separators after the launcher and before the tray. Fixed. |
+| **P2** | Caption glyphs were 1 px rectangles (a non-square maximise); tray icons were built from blocks. | The prototype's 16 px, 1.5 px-stroke icons as coverage masks tinted at draw time (DESIGN.md: "Native: A8 masks"). Fixed. |
+| **P2** | Tray order and content: volume, network, a bare "n/a"; clock in the large face. | Network, volume, thermometer with the value; time 12 over date 11, right-aligned. Fixed. |
+| **P2** | Network and Temperature flyouts had a fixed height (empty space), repeated their title as text and had no status. | Icon, 15 px bold title and a status pill; key and value rows; the temperature readout as the 20 px hero with its graph in a well; sized to their content. Fixed. |
+| **P2** | HUD panel: label, graph and percentiles stacked in one face, no wells. Compact HUD: labels above graphs. | Label, value and percentiles on one row above a graph in a well; compact HUD on one row as label, graph, value. Fixed. |
+| **P2** | Boot toast: six equal lines. | Bold title, the total as the hero number, a 6 px phase bar in the design's four segment colours, a four-column legend, then the machine, composition and build lines. Fixed. |
+| **P2** | Launcher 4 px from the screen edge and 2 px above the taskbar; square hover rows; text-only power buttons. | 8 px from both; 6 px-radius hover rows; Restart and Shut down lead with their icons. Fixed. |
+| **P2** | Rounded pills were stair-stepped; icons were point-sampled (blocky at 150% and 200%); long titles were cut mid-glyph. | Anti-aliased rounded rectangles; bilinear icon sampling; titles and task labels end in "...". Fixed. |
+| **P3** | Tooltips were full pills (radius = half their height). | Radius 6. Fixed. |
+| **P3** | Launcher content: search, pinned row, categories. | Deferred to stage 3 (decision 3). |
+| **P3** | Icon sources are 24 px, so task and launcher icons are upscaled at 150% and 200%. | Smoothed, not solved: larger sources need the launcher icon pipeline. Deferred. |
+| **P3** | Volume flyout has no Output row; only the boot toast exists; the HUD has no close or collapse buttons, fps readout or footer. | Deferred: content, not geometry. |
+| **P3** | virgl: small sharper patches at rounded corners; integer shadow falloff. | Left alone (Ian, 19 November: do not polish these). |
+| **P3** | Opaque themes are square-cornered where the prototype keeps its radii. | Kept square (Ian, 19 November: corners are optional outside Glass). |
+
+### Rounded corners and cost
+
+- **VKRENDER (the Dell).** A surface record's radii are not drawn by the
+  renderer at all. The kernel writes the corner coverage into the chrome and
+  overlay captures' alpha once, when a surface's content key changes, and the
+  quad shader blends that alpha as it does every glass pixel. Corners add no
+  draw, mask or per-frame work, and block no occlusion that glass does not
+  already block (a glass surface is never marked opaque).
+- **Opaque themes.** Frame and shell records carry radii only under glass;
+  an Opaque surface is square, marked `BROOK_DESKTOP_SURFACE_OPAQUE` and
+  occludes fully. No change was needed.
+- **virgl (QEMU only).** A rounded glass window splits its backdrop into up
+  to six bands, which is extra quads there.
+- The rounded pills and rows inside a surface are CPU-drawn into its cached
+  raster, in every theme, and cost nothing per frame.
+
+### Cost of the review changes
+
+- Kernel image: read-only data grows by 679 KB (4.62 MB to 5.30 MB of
+  text and rodata) for 21 text atlases and 3 icon atlases (seven roles at
+  three scales).
+- Raster work happens only when a surface's key changes, as before. The
+  taskbar key changes at the same events (clock minute, 1 Hz telemetry, HUD
+  at 2 Hz, pointer); a re-raster blends more anti-aliased pixels but fills
+  fewer pills.
+- The taskbar layout measures each window title (hit tests included), and
+  an open flyout or HUD panel reads the thermal snapshot when its rectangle
+  is asked for. Both are a few hundred instructions.
+
+### Evidence
+
+Not committed. Scenes as stage 2b: headless QEMU, QMP input, no NIC or
+audio (so the tray shows the disconnected, no-device and no-sensor states;
+the connected states are in the goldens).
+
+- Before: `/data/Programming/Brook/clearwater-s2b/build/cw2b-evidence/`
+  (`compare-*.png` and the scene folders).
+- After: `build/cwreview-evidence/final/{glass,opaque-light,opaque-dark}-{100,150,200}/`.
+- Sheets, prototype | before | after, in `build/cwreview-evidence/final/compare/`:
+  - `compare-{glass,opaque-light,opaque-dark}.png`: the whole desktop at each scale;
+  - `detail-taskbar-{glass,opaque-light,opaque-dark}.png`: both taskbar ends at 100% and 200%, native pixels;
+  - `detail-titlebar.png`: title and caption buttons, Close hovered;
+  - `detail-panels-glass-100.png`: launcher, flyouts, HUD and boot toast.
+
+### Tests
+
+- Goldens (`test_chrome_goldens --update`): all 209 existing images
+  change, for the reasons in the table, and 11 are new (`taskbar-hud`: the
+  compact HUD with the temperature target). 220 images.
+- `test_chrome_surface`: a tooltip's glass radius is 6.
+- Host suite: 383 pass. `test_intel_bdw_buffer` crashed once in one
+  parallel run and passes alone and in the two runs either side; this
+  branch does not touch it.
+- Compositor package: builds with its tests (its sources are unchanged).
+
+### Dell pair
+
+`build/dell/pair-cwreview` (payload `dell-cwreview-20261119`; scanout flip,
+persistent scanout map, zero-copy scanout and video engine on; clean tree
+at `72d40bbe`, after which only this section changed; kernel
+`6850a292…`). `check_dell_image_qemu.py --attempts 4`: PASS on the first
+attempt. Nothing has run on the Dell.
+
+**Check by hand on the Dell (200%):**
+
+- Text is smaller than before (titles 26 px, task labels 24, captions 22
+  device pixels). Check it is comfortable at the panel's density; the sizes
+  are one table in `cmake/ChromeFonts.cmake`.
+- Caption, tray and power icons are crisp 32 px line icons; application
+  icons are smooth, not blocky (they are still 24 px sources).
+- Taskbar: no pill on idle buttons, a pill and a 40 px accent mark on the
+  focused window, a 12 px mark on the others; buttons as wide as their
+  label; the bottom screen row and the bottom-left corner still hit.
+- Tray reads network, volume, thermometer with the temperature (coloured
+  only when warm or hot), then the clock. Each flyout opens centred on its
+  target, 16 px above the taskbar and at least 16 px from the right edge:
+  Network (address, download, upload), Temperature (large readout, graph),
+  Volume (white thumb with an accent ring).
+- Alt+P: the compact HUD is one row (APP graph value, COMP graph value ms);
+  the panel has graphs in wells with the newest value and percentiles.
+- Boot toast: bold title, large total, four-colour phase bar, legend.
+- Launcher: 16 px from the left edge and the taskbar; rounded hover rows;
+  Restart and Shut down with icons; the confirm prompt still fits.
+- Glass keeps rounded windows and panels; Opaque Light and Dark are square
+  outside and rounded inside (pills, rows, wells).
+
+
+## Launcher
+
+Branch `work/launcher`, from `work/integration51` (`6c18bafd`). DESIGN.md
+"Launcher organisation" (implementation steps 6 and 7, in part), built as
+freestanding units so that the stage 3 shell process runs the same code the
+kernel runs today. Decision 3 (organisation waits for the shell process) is
+kept in spirit: nothing here is kernel painter code; the kernel side is a
+thin, temporary host for the model until the shell owns it.
+
+### Design
+
+```
+ catalog (LauncherSnapshot) ─► LauncherModel ◄── keys, presses, scroll
+   applications.idx,            (launcher_model.{h,cpp}: data + logic,
+   /boot/SHORTCUTS               trivially copyable, no kernel headers)
+                                     │  Serialize / Parse ([Launcher] text)
+                                     ▼
+            ChromeLauncherFrameFor(model, chrome, style)  ── targets ──► hit test
+                  (chrome_launcher.{h,cpp}: layout)                      (same rects)
+                                     │
+            ChromeBuildLauncher(model, chrome, frame, style) ─► display list
+                                     │                          (keyed by its hash)
+                                     ▼
+                     CPU executor / capture, as every shell surface
+```
+
+- **Model** (`launcher_model.h`): the catalog (stable key, name,
+  description, declared category), the user's layout (categories with one
+  home per app, the seven defaults, pins and recent apps as references,
+  the Pinned/Recent top-row choice, unknown IDs kept), ranked search (name
+  prefix, word start, name substring, the user's category names,
+  descriptions), the list as lines (headings, one- or two-column app rows,
+  category chips, empty states), keyboard state (type-anywhere query,
+  ↑ ↓ with wrap, Tab between list, tiles and rail, ← → between rail and
+  list, Home/End/PgUp/PgDn, Enter, Esc unwinds menu then query then closes,
+  Alt+Enter menu, Alt+↑ ↓ reorder across categories), line-based scroll,
+  and the two-item context menu. `LayoutEpoch()` changes on every saved
+  change. Host test: `test_launcher_model`.
+- **Builder** (`chrome_launcher.h`): one layout function produces the
+  panel rects and a target list (menu first); the builder draws from it and
+  the WM hit-tests it, so what is drawn is what is hit. Tokens beyond the
+  palette (pressed, hairline, well, category colours, on-accent) are
+  derived in one place. Only existing display-list ops are used, so stage
+  3's wire format (`chrome_shell_wire.h`) carries the list unchanged.
+- **Glue** (`wm_shell_launcher.inc`): snapshots the active catalog into the
+  model when its generation changes (icons stay borrowed from the
+  snapshot, under the read guard), maps keys and presses, launches through
+  the existing queue, and persists. Keys reach it through a new
+  `GlobalShortcutAction::LauncherKey`: while the launcher is open it takes
+  every key except Super, Alt+Tab, Alt+F4 and Alt+P (repeats act; the
+  release is swallowed). Right click in the panel opens the menu.
+- **Persistence:** `/data/home/.config/brook/launcher.ini`, DESIGN.md's
+  `[Launcher]` format (`version`, `top_row`, `pinned`, `recent`,
+  `categories`, `category.<id>=Name|colour|icon|keys`). The compositor
+  serialises on a change; the launcher worker writes at most once a second
+  as a temporary file and a rename. A bad or missing file keeps the
+  defaults. It is a separate file because `settings.ini` is limited to
+  2 KiB and rewritten by Settings.
+- **Categories of apps:** shortcuts gain `# category:` (all of
+  `data/shortcuts` have one); desktop entries map their `Categories=`
+  (`HintFromDesktopCategories`). At first run each installed app is filed
+  in its declared category; later installs land in Unsorted.
+- **Cost:** the launcher surface re-rasterises only when its list key
+  changes (a model change, or the pointer crossing into another target);
+  nothing per frame. Host benchmark at 200% (3200x1800): layout, build and
+  raster of a state change 2.2 ms for the 1360x1296 panel, against 3.4 ms
+  for the old 968x1140 one (the fill fix in `chrome_raster` pays for the
+  larger panel).
+
+### How stage 3 picks it up
+
+`work/clearwater-s3` snapshots a `ChromeShellModel` (trivially copyable)
+for each shell surface and the shell process calls the builders. For the
+launcher:
+
+1. The shell process owns a `LauncherModel` itself (it is trivially
+   copyable and needs no kernel), loads the catalog and icons from
+   `/nix/share/applications` and `/boot/SHORTCUTS` in user mode, and reads
+   and writes `launcher.ini` directly.
+2. Keys and presses for the open launcher are forwarded to the shell (the
+   `LauncherKey` action marks exactly which keys); the shell runs
+   `Key()`/`Press()` and asks the WM to launch by catalog ID
+   (`WmLauncherActivate`).
+3. The shell calls `ChromeLauncherFrameFor` and `ChromeBuildLauncher`
+   and submits the list; the WM keeps only the panel rectangle
+   (`ChromeLauncherRect`) and the power guard. Until then the kernel glue
+   does both. `ChromeShellModel`'s launcher fields (layout, entries, icons)
+   are replaced by the model; `chrome_shell.h` no longer has the old
+   launcher layout.
+
+### Deviations from DESIGN.md
+
+- Not built yet (step 7's remainder): drag and drop (and with it the "New
+  category" target), Organise mode and multi-select, the category editor,
+  Undo, suggestions and "Sort all". Moving an app is Alt+↑ ↓ for now (an
+  Unsorted app moves into the last category), so empty states say that
+  instead of "Drag apps here".
+- Uninstall is shown in the menu, disabled: there is no deferred package
+  removal yet.
+- The footer hides the keyboard hints and the Organise button (Ian, 19
+  November).
+- The search field uses the 13 px body face (there is no 15 px regular
+  role); the caret does not blink (a blink would re-raster twice a second).
+- Rail rows are 40 and menu items 36, DESIGN.md's pointer sizes; app rows,
+  tiles and footer buttons are 44 or more.
+- Members within a default category are alphabetical (the prototype uses
+  its catalogue order).
+
+### Taskbar condensing (Ian, 19 November)
+
+Same branch, same builder file (`chrome_shell.cpp`), so done here:
+
+- Spacing tokens `ChromeTaskbarSpacing` (`chrome_style.h`): Gap 8 between
+  diagnostics and tray widgets, Pad 4 inside chips and around the clock and
+  build label, RowGap 2 between stacked rows, 12-bar compact graphs.
+- CPU over MEM in one two-row chip: label, then a bar with the percentage
+  inside it (wide enough for "100%" at every scale). The digits are drawn
+  twice, clipped to the fill (in an ink chosen by the fill's lightness) and
+  to the well (tray ink), so they read in Glass and both Opaque themes.
+- Network rates are no longer drawn on the taskbar; the network flyout
+  already has live Download and Upload rows (its key changes with the 1 Hz
+  sample). No activity hint on the icon. Disk R/W stays, as two short
+  rates ("R 12.3M").
+- COMP and APP: label and graph on the first row, p95 on the second; the
+  other percentiles stay in the HUD panel.
+- Build label: the payload name (`HardwarePayloadIdRead`, as HWSTATUS
+  prints it), without its trailing `-YYYYMMDD` when space is tight, else
+  the short commit; no "Brook". Its tooltip: the payload (or "Brook
+  build"), then the commit with any dirty suffix and the build date.
+- Width of everything right of the window buttons at the Dell's 1600
+  logical px: every diagnostic on, 1175 to 644 logical px; the default set
+  (CPU, MEM, temperature), 607 to 420. Targets stay 48 high; clock and
+  temperature are at least 44 wide.
+
+### Evidence
+
+Not committed; under `build/launcher-evidence/` in the worktree.
+
+- Headless QEMU, QMP input, no NIC or audio; `gpu=gl` (virgl, blur
+  available) for Glass, `gpu=software` for the Opaque themes; 1920x1080 at
+  100, 150 and 200% (at 200% the panel is clamped to the 476 logical px
+  above the taskbar). The QEMU boot disk has no app store, so the scenes
+  use evidence-only copies of `data/shortcuts` (real titles, descriptions
+  and categories, `Requires: builtin`).
+- Scenes per run (`final/<theme>-<scale>/`): open, search "qu", no match,
+  keyboard selection, Tab to the tiles, rail, hover, right-click menu, Pin
+  or Unpin from it, the Restart prompt, and reopen after the save;
+  `launcher.ini` is read back from the data disk after each run.
+- Sheets in `compare/`: `launcher-compare.png` (prototype | Glass | Opaque
+  Light | Opaque Dark: open, search, menu), `launcher-<theme>.png`,
+  `launcher-scales-<theme>.png`, `launcher-scenes-glass-100.png`,
+  `taskbar-diagnostics.png` and `taskbar-default.png` (goldens before and
+  after, every theme and scale).
+- Latency (QMP event to changed pixels, screendump polling, Opaque Dark
+  100%): opening 56-58 ms against 55-57 ms for the old launcher; one typed
+  key to the query on screen 52-54 ms. Glass runs grab over VNC (1.5-2 s
+  a frame), so their numbers measure the grab, and match the old
+  launcher's.
+
+### Tests
+
+- `test_launcher_model` (new): defaults, ranking, navigation, pin and
+  unpin, recent ordering, reorder, persistence round trip and bad files.
+- `test_global_shortcuts`: the open launcher takes keys (repeats act,
+  modifiers pass, Alt+Tab/Alt+P stay global).
+- Goldens: 308 images (was 220 at the review, 242 with the two new taskbar
+  scenes). New: `launcher-search`, `-nomatch`, `-hover`, `-keyboard`,
+  `-menu`, `-category` (66), `taskbar-diagnostics` and `taskbar-default`
+  (22). Changed on purpose: `launcher` and `launcher-prompt` (22), and
+  `taskbar`, `taskbar-hover`, `taskbar-hud` (33) with the condensing.
+- Host suite: 384 pass (`-LE stress`). Compositor package builds.
+
+### Dell pair
+
+`build/dell/pair-launcher` (payload `dell-launcher-20261119`; scanout flip,
+persistent scanout map, zero-copy scanout and video engine on; clean tree
+at `584dc701`, after which only this document changed; kernel
+`0030240f…`). `check_dell_image_qemu.py --attempts 4`: PASS on the first
+attempt. Nothing has run on the Dell.
+
+**Check by hand on the Dell (200%):**
+
+- Super (or the B) opens the launcher; type at once ("te", "games"): the
+  query shows in the field, results are ranked with category chips, Enter
+  opens the first. Backspace and Esc (clears, then closes) behave.
+- ↑ ↓ through the list (the selection scrolls into view), Tab to the
+  Pinned tiles (← →) and the rail (↑ ↓ switches the view), Alt+↑ ↓ moves an
+  app between categories.
+- Right-click an app or tile: Pin or Unpin; Uninstall is greyed. Pins and
+  Recent survive a reboot (`~/.config/brook/launcher.ini`).
+- Restart and Shut down still ask first; Cancel and Esc dismiss.
+- Glass: blurred, rounded panel; Opaque Light and Dark: solid and square.
+- Taskbar with every diagnostic on: CPU over MEM with the value inside the
+  bar, short disk rates, COMP and APP with p95, the payload name as the
+  build label (hover for commit and date), and the network rates in the
+  network flyout.
+
+
+### Stage 3 reconciliation on integration60
+
+The merge uses integration60 `a3f6685e` and Stage 3 `8e1e31ed`.
+The kernel retains launcher state, hit testing and the fractional scroll
+remainder. It snapshots the current launcher model, viewport and frame.
+The shell calls the same launcher builder and submits its clip commands
+with the version 2 wire format. The WM continues reporting `focus.shell`
+through the existing renderer ABI. Palette changes invalidate submitted
+lists, including changes to custom RGB. The buffers live in zero-initialized
+kernel memory and the kernel file stays below the 8 MiB guarded limit.
+
+`build/s3r-evidence/pixel-verdict.json` records 48 comparisons across 12
+matched QEMU configurations, with Glass using virgl. It covers the initial
+desktop, first launcher open, scroll and search. The launcher comparisons
+exclude the footer build hash. The taskbar comparisons cover its stable
+left 280 logical pixels. The 728 integration60 goldens also cover complete
+taskbar fixtures, all six material and mode combinations and custom accents.
+The Opaque captures used `85176b32`. The final `c11c9043` checks ownership
+before accessing storage and retains the same rendering path. Glass and
+the rerun of the shell-kill fixture used the final revision.
+
+The shell supervisor replaced pid 19 with pid 22 after SIGKILL. The
+fallback taskbar appeared and the open launcher and terminal returned.
+The guarded pair `build/dell/pair-s3r` at `c11c9043` passed QEMU on its
+first attempt. Physical touchpad and Intel scanout checks remain pending.

@@ -27,6 +27,8 @@
 #include "kvmclock.h"
 #include "shutdown.h"
 #include "launcher_command.h"
+#include "launcher_user_manifest.h"
+#include "web_app_title.h"
 #include "launch_feedback.h"
 #include "launcher_power.h"
 #include "shell.h"
@@ -42,11 +44,16 @@
 #include "chrome_layout.h"
 #include "chrome_frame.h"
 #include "chrome_shell.h"
+#include "chrome_launcher.h"
+#include "launcher_model.h"
+#include "desktop_identity.h"
 #include "chrome_surface.h"
 #include "desktop_shell_surfaces.h"
+#include "chrome_shell_model.h"
 #include "input.h"
 #include "mouse.h"
 #include "serial.h"
+#include "klog.h"
 #include "panic.h"
 #include "rtc.h"
 #include "terminal.h"
@@ -89,6 +96,10 @@ const FontAtlas& WmDesktopFont() {
     uint32_t scale=WmGetAppliedScale();
     return scale==200 ? g_desktopFont200 : scale==150 ? g_desktopFont150 : g_desktopFont100;
 }
+const ChromeFontSet& WmChromeFonts() {
+    uint32_t scale=WmGetAppliedScale();
+    return scale==200 ? g_chromeFonts200 : scale==150 ? g_chromeFonts150 : g_chromeFonts100;
+}
 bool WmSetScale(uint32_t percent) {
     if (!DesktopMetricsFor(percent)) return false;
     __atomic_store_n(&g_requestedScale,percent,__ATOMIC_RELEASE);
@@ -97,7 +108,9 @@ bool WmSetScale(uint32_t percent) {
 static bool ResizeWindowLocked(int idx,uint16_t newClientW,uint16_t newClientH);
 static void FocusWindowLocked(int idx);
 
-static uint32_t g_themeId = BROOK_THEME_BROOK;
+// Clearwater (refactor stages 2.2 and 2.3): the saved selection (theme,
+// mode, hue). Writers hold g_vfbLock and bump the chrome epoch.
+static uint64_t g_themeSelection = BROOK_THEME_SELECTION_DEFAULT;
 // Protected by g_vfbLock. Never reuse an epoch after counter exhaustion.
 static uint64_t g_chromeSettingsEpoch=1;
 // Writers hold g_vfbLock; lock-free readers use this as a sequence counter.
@@ -115,38 +128,190 @@ static void EndBackdropStyleChange(){
 static bool g_themeSettingsLoaded = false;
 static uint32_t g_appearance = BROOK_APPEARANCE_DEFAULT;
 static uint32_t g_taskbarMetrics = BROOK_TASKBAR_DEFAULT;
+static bool g_buildChip = true;
 uint32_t WmGetTaskbarMetrics(){return __atomic_load_n(&g_taskbarMetrics,__ATOMIC_ACQUIRE);}
 bool WmSetTaskbarMetrics(uint32_t value){
     if(!brook_taskbar_metrics_valid(value))return false;
     __atomic_store_n(&g_taskbarMetrics,value,__ATOMIC_RELEASE);
     CompositorMarkDirty();CompositorWake();return true;
 }
-uint32_t WmGetAppearance(){return __atomic_load_n(&g_appearance,__ATOMIC_ACQUIRE);}
+static bool g_backendBlur=false;
+static SpinLock g_customThemeLock;
+static BrookHueTokens g_customThemeTokens;
+static WmPalette g_customThemePalettes[2][2];  // [dark chrome][glass]
+
+uint64_t WmGetThemeSelection(){return __atomic_load_n(&g_themeSelection,__ATOMIC_ACQUIRE);}
+bool WmBackendBlur(){return __atomic_load_n(&g_backendBlur,__ATOMIC_ACQUIRE);}
+// The theme in use: the selection resolved against the backend's backdrop
+// blur (Glass, or its Opaque stand-in).
+uint32_t WmResolvedTheme(){
+    const uint64_t s=WmGetThemeSelection();
+    return brook_theme_resolve(brook_selection_theme(s),WmBackendBlur());
+}
+// The appearance word keeps opacity and blur; its dark and performance bits
+// are views of the selection, for older Settings and GTK apps: dark = the app
+// content in use is dark (Mixed is light), performance = an Opaque theme is
+// selected.
+static uint32_t AppearanceViewBits(uint64_t selection){
+    const unsigned theme=brook_selection_theme(selection),mode=brook_selection_mode(selection);
+    return (brook_theme_content_dark(mode)?BROOK_APPEARANCE_DARK:0u)|
+           (theme!=BROOK_THEME_GLASS?BROOK_APPEARANCE_PERFORMANCE:0u);
+}
+uint32_t WmGetAppearance(){
+    const uint32_t stored=__atomic_load_n(&g_appearance,__ATOMIC_ACQUIRE)&~uint32_t(BROOK_APPEARANCE_DARK|BROOK_APPEARANCE_PERFORMANCE);
+    return stored|AppearanceViewBits(WmGetThemeSelection());
+}
+static void PublishThemeSelectionLocked(uint64_t selection){
+    if(g_chromeSettingsEpoch)++g_chromeSettingsEpoch;
+    __atomic_store_n(&g_themeSelection,selection,__ATOMIC_RELEASE);
+}
 bool WmSetAppearance(uint32_t value){
     if(!brook_appearance_valid(value))return false;
-    VfbGuard guard;
-    if(g_chromeSettingsEpoch)++g_chromeSettingsEpoch;
-    __atomic_store_n(&g_appearance,value,__ATOMIC_RELEASE);
+    {
+        VfbGuard guard;
+        if(g_chromeSettingsEpoch)++g_chromeSettingsEpoch;
+        // Dark and performance bits that disagree with the selection are an
+        // older Settings speaking: read them as aliases, as settings.ini's.
+        const uint64_t selection=WmGetThemeSelection();
+        const uint32_t view=AppearanceViewBits(selection);
+        const uint32_t asked=value&(BROOK_APPEARANCE_DARK|BROOK_APPEARANCE_PERFORMANCE);
+        if(asked!=view){
+            const bool dark=value&BROOK_APPEARANCE_DARK;
+            const unsigned theme=value&BROOK_APPEARANCE_PERFORMANCE?BROOK_THEME_OPAQUE:BROOK_THEME_GLASS;
+            unsigned mode=brook_selection_mode(selection);
+            if(brook_theme_content_dark(mode)!=dark)mode=dark?BROOK_MODE_DARK:BROOK_MODE_LIGHT;
+            PublishThemeSelectionLocked(brook_selection_make(theme,mode,brook_selection_hue(selection),
+                                                             brook_selection_rgb(selection)));
+        }
+        __atomic_store_n(&g_appearance,value&~uint32_t(BROOK_APPEARANCE_DARK|BROOK_APPEARANCE_PERFORMANCE),__ATOMIC_RELEASE);
+    }
     CompositorMarkDirty();CompositorWake();return true;
 }
-void WmSetPerformanceMode(bool enabled){
-    VfbGuard guard;
-    if(g_chromeSettingsEpoch)++g_chromeSettingsEpoch;
-    if(enabled)__atomic_fetch_or(&g_appearance,uint32_t(BROOK_APPEARANCE_PERFORMANCE),__ATOMIC_ACQ_REL);
-    else __atomic_fetch_and(&g_appearance,~uint32_t(BROOK_APPEARANCE_PERFORMANCE),__ATOMIC_ACQ_REL);
-    CompositorMarkDirty();CompositorWake();
+static void BuildThemePalettes(const BrookHueTokens& tokens,WmPalette (&palettes)[2][2]){
+    for(unsigned dark=0;dark<2;++dark)for(unsigned glass=0;glass<2;++glass)
+        brook_theme_build_palette(&tokens,glass?BROOK_THEME_GLASS:BROOK_THEME_OPAQUE,
+                                  int(dark),&palettes[dark][glass]);
 }
-uint32_t WmGetTheme() { return __atomic_load_n(&g_themeId, __ATOMIC_ACQUIRE); }
-const WmPalette& WmCurrentPalette() { return *brook_theme_palette(WmGetTheme()); }
-bool WmSetTheme(uint32_t theme)
-{
-    if (!brook_theme_palette(theme)) return false;
-    VfbGuard guard;
-    if(g_chromeSettingsEpoch)++g_chromeSettingsEpoch;
-    __atomic_store_n(&g_themeId, theme, __ATOMIC_RELEASE);
+bool WmSetThemeSelection(uint64_t selection){
+    if(!brook_selection_valid(selection))return false;
+    if(brook_selection_hue(selection)==BROOK_HUE_CUSTOM){
+        BrookHueTokens tokens;
+        WmPalette palettes[2][2];
+        brook_hue_derive_selection(selection,&tokens);
+        BuildThemePalettes(tokens,palettes);
+        VfbGuard guard;
+        SpinLockAcquire(&g_customThemeLock);
+        g_customThemeTokens=tokens;
+        for(unsigned dark=0;dark<2;++dark)for(unsigned glass=0;glass<2;++glass)
+            g_customThemePalettes[dark][glass]=palettes[dark][glass];
+        PublishThemeSelectionLocked(selection);
+        SpinLockRelease(&g_customThemeLock);
+    }else{
+        VfbGuard guard;
+        PublishThemeSelectionLocked(selection);
+    }
+    CompositorMarkDirty();CompositorWake();return true;
+}
+// Debug "gpu glass on|off" changes the material and preserves the mode.
+void WmSetPerformanceMode(bool enabled){
+    const uint64_t s=WmGetThemeSelection();
+    WmSetThemeSelection(brook_selection_make(enabled?BROOK_THEME_OPAQUE:BROOK_THEME_GLASS,
+                                              brook_selection_mode(s),brook_selection_hue(s),brook_selection_rgb(s)));
+}
+// Stage 1.5: the backend's backdrop-blur capability, set by the compositor at
+// each frame boundary. A change re-resolves the theme (Glass or its Opaque
+// stand-in): every chrome key changes and everything is repainted once.
+void WmSetBackendBlur(bool blur){
+    if(WmBackendBlur()==blur)return;
+    {
+        VfbGuard guard;
+        if(g_chromeSettingsEpoch)++g_chromeSettingsEpoch;
+        __atomic_store_n(&g_backendBlur,blur,__ATOMIC_RELEASE);
+    }
+    SerialPrintf("WM: backend backdrop blur %s\n",blur?"available":"unavailable");
     CompositorMarkDirty();
-    CompositorWake();
-    return true;
+}
+// The appearance as resolved against the backend: the opaque material
+// (BROOK_APPEARANCE_PERFORMANCE) unless the theme in use is Glass. The saved
+// selection is never rewritten.
+uint32_t WmResolvedAppearance(){
+    const uint32_t value=WmGetAppearance();
+    return WmResolvedTheme()==BROOK_THEME_GLASS?value&~uint32_t(BROOK_APPEARANCE_PERFORMANCE):
+                                                value|BROOK_APPEARANCE_PERFORMANCE;
+}
+// Every hue's token set and painter palettes, derived once (about thirty
+// tokens of floating-point maths per hue) and immutable afterwards, so the
+// painters read them lock-free on any thread.
+static BrookHueTokens g_hueTokens[BROOK_HUE_COUNT];
+static BrookThemePalette g_themePalettes[BROOK_HUE_COUNT][2][2]; // [hue][dark chrome][glass]
+static bool g_themeTablesReady=false;
+static SpinLock g_themeTablesLock;
+static void EnsureThemeTables(){
+    if(__atomic_load_n(&g_themeTablesReady,__ATOMIC_ACQUIRE))return;
+    SpinLockAcquire(&g_themeTablesLock);
+    if(!g_themeTablesReady){
+        for(unsigned hue=0;hue<BROOK_HUE_COUNT;++hue){
+            brook_hue_derive(hue,&g_hueTokens[hue]);
+            BuildThemePalettes(g_hueTokens[hue],g_themePalettes[hue]);
+        }
+        __atomic_store_n(&g_themeTablesReady,true,__ATOMIC_RELEASE);
+    }
+    SpinLockRelease(&g_themeTablesLock);
+}
+// The chrome epoch covers changes in the custom RGB bits.
+uint32_t WmGetTheme() {
+    const uint64_t selection=WmGetThemeSelection();
+    return uint32_t(selection & 0x1fffu) | brook_theme_resolve(brook_selection_theme(selection),WmBackendBlur()) << 16;
+}
+
+WmPalette WmCurrentPalette() {
+    EnsureThemeTables();
+    const uint64_t initial=WmGetThemeSelection();
+    const bool custom=brook_selection_hue(initial)==BROOK_HUE_CUSTOM;
+    if(custom)SpinLockAcquire(&g_customThemeLock);
+    const uint64_t s=custom?WmGetThemeSelection():initial;
+    const unsigned mode=brook_selection_mode(s),hue=brook_selection_hue(s);
+    const unsigned resolved=brook_theme_resolve(brook_selection_theme(s),WmBackendBlur());
+    const unsigned dark=brook_theme_chrome_dark(mode)?1:0,glass=resolved==BROOK_THEME_GLASS?1:0;
+    const WmPalette result=hue==BROOK_HUE_CUSTOM?g_customThemePalettes[dark][glass]:g_themePalettes[hue][dark][glass];
+    if(custom)SpinLockRelease(&g_customThemeLock);
+    return result;
+}
+static BrookContentTokens CurrentContent(){
+    EnsureThemeTables();
+    const uint64_t initial=WmGetThemeSelection();
+    const bool custom=brook_selection_hue(initial)==BROOK_HUE_CUSTOM;
+    if(custom)SpinLockAcquire(&g_customThemeLock);
+    const uint64_t s=custom?WmGetThemeSelection():initial;
+    const unsigned mode=brook_selection_mode(s),hue=brook_selection_hue(s);
+    const unsigned dark=brook_theme_content_dark(mode)?1:0;
+    const BrookContentTokens result=(hue==BROOK_HUE_CUSTOM?g_customThemeTokens:g_hueTokens[hue]).content[dark];
+    if(custom)SpinLockRelease(&g_customThemeLock);
+    return result;
+}
+uint32_t WmContentColour(unsigned index){
+    const BrookContentTokens c=CurrentContent();
+    switch(index){
+    case BROOK_CONTENT_BACKGROUND: return c.background;
+    case BROOK_CONTENT_INK: return c.ink;
+    case BROOK_CONTENT_DIM: return c.dim;
+    case BROOK_CONTENT_LINE: return c.line;
+    case BROOK_CONTENT_RAISED: return c.raised;
+    case BROOK_CONTENT_SELECTION: return brook_tint_over(c.selection,c.background);
+    case BROOK_CONTENT_SUNKEN: return c.sunken;
+    case BROOK_CONTENT_ACCENT: return c.accent;
+    case BROOK_CONTENT_ACCENT_HOVER: return c.accentHover;
+    case BROOK_CONTENT_ON_ACCENT: return c.onAccent;
+    default: return 0;
+    }
+}
+// 0xB02 op 1 (older Settings): a legacy palette id chooses its hue.
+bool WmSetTheme(uint32_t legacyPalette)
+{
+    if (legacyPalette >= BROOK_LEGACY_PALETTE_COUNT) return false;
+    const uint64_t s=WmGetThemeSelection();
+    return WmSetThemeSelection(BROOK_THEME_SELECTION(brook_selection_theme(s),brook_selection_mode(s),
+                                                     brook_legacy_palette_hue(legacyPalette)));
 }
 
 // Hardware payload name for the desktop build label, read once at activation
@@ -162,7 +327,7 @@ static void WmRestoreTheme()
     if (HardwarePayloadIdRead(g_buildPayloadId, sizeof(g_buildPayloadId)))
         SerialPrintf("WM: build label payload %s\n", g_buildPayloadId);
     else g_buildPayloadId[0] = 0;
-    uint32_t selected = BROOK_THEME_BROOK;
+    BrookThemeSettings themeSettings=brook_theme_settings_init();
     uint32_t selectedScale = 100;
     uint32_t appearance=WmGetAppearance();
     uint32_t taskbarMetrics=BROOK_TASKBAR_DEFAULT;
@@ -207,17 +372,8 @@ static void WmRestoreTheme()
                     }
                 }
                 else if(audioSection) audioControl=brook_audio_control_setting(audioControl,p);
-                else if (desktopSection && strncmp(p, "theme=", 6) == 0)
-                {
-                    p += 6;
-                    if (*p >= '0' && *p < '0' + BROOK_THEME_COUNT)
-                    {
-                        uint32_t value = *p++ - '0';
-                        while (*p == ' ' || *p == '\t' || *p == '\r') ++p;
-                        selected = !*p ? value : BROOK_THEME_BROOK;
-                    }
-                    else selected = BROOK_THEME_BROOK;
-                }
+                else if (desktopSection && brook_theme_settings_line(&themeSettings, p) &&
+                         strncmp(p,"dark=",5)!=0 && strncmp(p,"performance=",12)!=0) {}
                 else if (desktopSection && strncmp(p,"scale=",6)==0) {
                     p+=6;uint32_t value=0,digits=0;
                     while (*p>='0' && *p<='9' && digits<4) {value=value*10+(*p++-'0');++digits;}
@@ -225,6 +381,11 @@ static void WmRestoreTheme()
                     selectedScale=!*p && digits==3 && DesktopMetrics::Supported(value) ? value : 100;
                 }
                 else if(desktopSection){
+                    if(strncmp(p,"build_chip=",11)==0 && (p[11]=='0' || p[11]=='1')){
+                        const char* tail=p+12;
+                        while(*tail==' ' || *tail=='\t' || *tail=='\r')++tail;
+                        if(!*tail)g_buildChip=p[11]=='1';
+                    }
                     appearance=brook_appearance_setting(appearance,p);
                     taskbarMetrics=brook_taskbar_metrics_setting(taskbarMetrics,p);
                     pointerSpeed=brook_pointer_speed_setting(pointerSpeed,p);
@@ -235,17 +396,27 @@ static void WmRestoreTheme()
             }
         }
     }
+    uint64_t selection=brook_theme_settings_selection(&themeSettings);
     char glass[8]{};
     if(FwCfgReadFile("opt/glass",glass,sizeof(glass)-1)) {
-        if(glass[0]=='0'||(glass[0]=='o'&&glass[1]=='f'))appearance|=BROOK_APPEARANCE_PERFORMANCE;
-        else if(glass[0]=='1'||(glass[0]=='o'&&glass[1]=='n'))appearance&=~BROOK_APPEARANCE_PERFORMANCE;
+        // QEMU's Glass switch leaves mode and accent intact.
+        const unsigned mode=brook_selection_mode(selection),hue=brook_selection_hue(selection);
+        if(glass[0]=='0'||(glass[0]=='o'&&glass[1]=='f'))
+            selection=brook_selection_make(BROOK_THEME_OPAQUE,mode,hue,brook_selection_rgb(selection));
+        else if(glass[0]=='1'||(glass[0]=='o'&&glass[1]=='n'))
+            selection=brook_selection_make(BROOK_THEME_GLASS,mode,hue,brook_selection_rgb(selection));
     }
-    WmSetAppearance(appearance);
+    WmSetThemeSelection(selection);
+    SerialPrintf("WM: theme %s mode %s accent %s\n",brook_theme_key(brook_selection_theme(selection)),
+                 brook_mode_key(brook_selection_mode(selection)),brook_hue_key(brook_selection_hue(selection)));
+    // Opacity and blur; the dark and performance bits are views of the
+    // selection just set (their saved values were read as aliases above).
+    WmSetAppearance((appearance&~uint32_t(BROOK_APPEARANCE_DARK|BROOK_APPEARANCE_PERFORMANCE))|
+                    (WmGetAppearance()&(BROOK_APPEARANCE_DARK|BROOK_APPEARANCE_PERFORMANCE)));
     WmSetTaskbarMetrics(taskbarMetrics);
     MouseTouchpadSetSpeed(pointerSpeed);
     MouseTouchpadSetTap(touchpadTap!=0);
     WmSetScale(selectedScale);
-    WmSetTheme(selected);
     AudioSetOutputControl(audioControl|(forceMuted?BROOK_AUDIO_MUTED:0));
 }
 
@@ -306,7 +477,7 @@ static void PointerCaptureValidateLocked() {
     if(!g_wmActive || !w.proc || !w.vfb || !w.visible || w.minimized ||
        !w.focused || g_focusedIdx!=g_pointerCaptureIndex ||
        w.creationIdentity!=g_pointerCaptureIdentity ||
-       InputDroppedEvents()!=g_pointerCaptureDrops || WmLauncherVisible() || WmVolumePopupVisible())
+       InputDroppedEvents()!=g_pointerCaptureDrops || WmLauncherVisible() || WmVolumePopupVisible() || WmTrayFlyoutVisible())
         PointerCaptureReleaseLocked();
 }
 bool WmPointerCaptureActive() {
@@ -389,13 +560,13 @@ int64_t WmPointerCapture(Process* provider,uint32_t wmId,uint32_t operation,uint
     if(operation!=1 || token)return -22;
     if(owned)return g_pointerCaptureToken;
     if(g_pointerCaptureIndex>=0)return -16;
-    if(WmLauncherVisible() || WmVolumePopupVisible())PointerActivationCancel();
+    if(WmLauncherVisible() || WmVolumePopupVisible() || WmTrayFlyoutVisible())PointerActivationCancel();
     const bool hovered=__atomic_load_n(&g_pointerHoverIdentity,__ATOMIC_ACQUIRE)==w->creationIdentity;
     // An activation waiver never inherits the activating click: the taskbar
     // press/release pair must finish in the shell before the game is granted.
     const bool waived=!hovered && activated && !MouseGetButtons();
     if(!g_wmActive || !w->vfb || !w->visible || w->minimized || !w->focused ||
-       g_focusedIdx!=static_cast<int>(wmId)-1 || WmLauncherVisible() || WmVolumePopupVisible() ||
+       g_focusedIdx!=static_cast<int>(wmId)-1 || WmLauncherVisible() || WmVolumePopupVisible() || WmTrayFlyoutVisible() ||
        WmPointerSuppressedButtons() || w->pointerDisengaged || (!hovered && !waived))return -11;
     if(g_nextPointerCaptureToken==0xffffffffu)return -75;
     PointerActivationCancel();
@@ -466,6 +637,7 @@ bool WmRouteCapturedPointer(const InputEvent& event) {
     if(event.sequence<=g_pointerCaptureSequence)return true;
     Window* w=&g_windows[g_pointerCaptureIndex];
     if(event.type==InputEventType::MouseMove)return true; // absolute tablet has no raw motion
+    if(event.type==InputEventType::MouseScroll && !InputHasScrollTicks(event))return true;
     const bool queued=event.type==InputEventType::MouseRelativeMove
         ?PushRelativeLocked(w,event,g_pointerCaptureToken)
         :WmInputPush(w,event,g_pointerLocalX,g_pointerLocalY,g_pointerCaptureToken);
@@ -494,19 +666,28 @@ static SpinLock g_launcherLock;
 // Zero means exhausted; it is never reused for a later icon catalog.
 static uint64_t g_launcherSnapshotEpoch=1;
 static uint32_t g_launcherRequested = 1;
+static UserLauncherReload g_userLauncherReload;
+static LauncherUserManifestStatus g_userLauncherManifest;
 static bool g_launcherWorkerStarted = false;
+static bool g_launcherWorkerRunning = false;
 static bool g_launcherLoaded = false;
 static bool g_launcherOpen = false;
 static int g_launcherError = 0;
-static uint32_t g_launcherScroll = 0;
 // Power buttons arm a confirmation; only the separate confirm button acts.
 static LauncherPowerGuard g_launcherPower;
 static void LauncherStartWorker();
+// The Clearwater launcher's model (wm_shell_launcher.inc): catalog, layout
+// and the open launcher's state. Init() runs in WmLauncherLoad.
+static LauncherModel g_launcherModel;
+static void LauncherLoadLayout();
+static void LauncherSyncModel(const LauncherSnapshot& catalog);
+static void LauncherSaveLayout();
+static void LauncherPowerRun(LauncherPowerCommand command);
 
 // Requests own all metadata/icon pixels, never launcher snapshot pointers.
 struct LauncherRequest {
     char command[128];
-    bool desktop, hasIcon;
+    bool desktop, userDesktop, hasIcon;
     uint32_t icon[LAUNCHER_ICON_PX * LAUNCHER_ICON_PX];
 };
 static SpinLock g_launchLock;
@@ -610,7 +791,9 @@ uint32_t WmSnapshotDebugApps(WmDebugApp* out,uint32_t capacity,
         memcpy(app.id,item.catalogId,sizeof(app.id));memcpy(app.title,item.title,sizeof(app.title));
         memcpy(app.desktopAppId,item.appId,sizeof(app.desktopAppId));
         memcpy(app.executable,item.executable,sizeof(app.executable));
-        app.desktop=item.isDesktopEntry;app.eligible=item.valid;
+        app.desktop = item.isDesktopEntry;
+        app.userDesktop = item.isUserDesktopEntry;
+        app.eligible = item.valid;
     }
     return count;
 }
@@ -619,6 +802,21 @@ void WmRequestLauncherRefresh()
 {
     __atomic_fetch_add(&g_launcherRequested, 1u, __ATOMIC_RELEASE);
 }
+
+void WmRequestUserLauncherRefresh()
+{
+    g_userLauncherReload.Request();
+}
+
+LauncherUserManifestStatus WmLauncherUserManifestStatus()
+{
+    SpinLockAcquire(&g_launcherLock);
+    const auto status = g_userLauncherManifest;
+    SpinLockRelease(&g_launcherLock);
+    return status;
+}
+
+static void RefreshWebAppTitles(const LauncherSnapshot& catalog);
 
 bool WmLauncherApplyPending()
 {
@@ -636,7 +834,7 @@ bool WmLauncherApplyPending()
     const uint32_t count = g_launcherActive->count;
     const uint32_t generation = g_launcherActive->generation;
     SpinLockRelease(&g_launcherLock);
-    g_launcherScroll = 0;
+    RefreshWebAppTitles(*g_launcherActive);
     SerialPrintf("WM: launcher published generation=%u items=%u\n", generation, count);
     return true;
 }
@@ -695,6 +893,30 @@ static const char* WmBaseName(const char* path)
     return name;
 }
 
+static const char* WindowDisplayTitle(const Window& window)
+{
+    return window.webAppTitle[0] ? window.webAppTitle : window.title;
+}
+
+static void RefreshWebAppTitle(Window& window, const LauncherSnapshot& catalog)
+{
+    window.webAppTitle[0] = 0;
+    if (!window.appId[0]) return;
+    for (uint32_t i = 0; i < catalog.count; ++i) {
+        const auto& item = catalog.items[i];
+        if (item.valid && item.isWebApp && WmEqualI(window.appId, item.appId)) {
+            FormatWebAppTitle(window.webAppTitle, item.title, window.title);
+            return;
+        }
+    }
+}
+
+static void RefreshWebAppTitles(const LauncherSnapshot& catalog)
+{
+    for (auto& window : g_windows)
+        if (window.proc) RefreshWebAppTitle(window, catalog);
+}
+
 static bool WmTitleHasAppName(const char* title, const char* name)
 {
     if (!name[0]) return false;
@@ -729,7 +951,7 @@ static const uint32_t* WindowIcon(const Window& w, const LauncherSnapshot& launc
     for (uint32_t i = 0; i < launcher.count; ++i)
     {
         const LauncherItem& item = launcher.items[i];
-        if (!item.valid || !item.iconPixels || !item.executable[0]) continue;
+        if (!item.valid || item.isUserDesktopEntry || !item.iconPixels || !item.executable[0]) continue;
         if ((w.appId[0] && WmEqualI(w.appId, item.executable)) ||
             (executable[0] && WmEqualI(executable, item.executable))) return item.iconPixels;
     }
@@ -739,8 +961,8 @@ static const uint32_t* WindowIcon(const Window& w, const LauncherSnapshot& launc
     {
         if (w.proc && TerminalFindByProcess(w.proc)) return launcher.terminalIcon ? launcher.terminalIcon : launcher.applicationIcon;
         for (uint32_t i = 0; i < launcher.count; ++i)
-            if (launcher.items[i].valid && launcher.items[i].iconPixels &&
-                WmTitleHasAppName(w.title, launcher.items[i].title)) return launcher.items[i].iconPixels;
+            if (launcher.items[i].valid && !launcher.items[i].isUserDesktopEntry &&
+                launcher.items[i].iconPixels && WmTitleHasAppName(w.title, launcher.items[i].title)) return launcher.items[i].iconPixels;
     }
     return launcher.applicationIcon;
 }
@@ -810,12 +1032,13 @@ static int CreateWindowLocked(Process* proc, int16_t x, int16_t y,
     w.creationIdentity = __atomic_add_fetch(&g_windowIdentity, 1, __ATOMIC_ACQ_REL);
     w.pointerEngageSerial = 0;
     w.pointerDisengaged = false;
+    w.fineScroll = false;
     w.publicationGeneration=w.publishedGeneration=1;
     w.clientPid=proc?(proc->tgid?proc->tgid:proc->pid):0;
     w.clientIncarnation=proc?(proc->isThread?proc->leaderIncarnation:proc->incarnation):0;
     w.clientLaunchId=proc?proc->launchId:0;
     w.clientOrigin=proc?WmClientOrigin::NativeProcess:WmClientOrigin::Unknown;
-    w.appId[0] = 0;
+    w.appId[0] = w.webAppTitle[0] = 0;
     w.x = x;
     w.y = y;
     w.clientW = clientW;
@@ -1303,7 +1526,7 @@ bool WmSetFullscreen(int idx, bool enable) { VfbGuard guard; return SetFullscree
 
 bool WmTaskbarHidden()
 {
-    if (!g_wmActive || WmLauncherVisible() || WmVolumePopupVisible()) return false;
+    if (!g_wmActive || WmLauncherVisible() || WmVolumePopupVisible() || WmTrayFlyoutVisible()) return false;
     const int idx = __atomic_load_n(&g_focusedIdx, __ATOMIC_ACQUIRE);
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return false;
     const Window& w = g_windows[idx];
@@ -1480,7 +1703,7 @@ bool WmApplyScalePending()
     __atomic_store_n(&g_desktopMetrics,next,__ATOMIC_RELEASE);
     EndBackdropStyleChange();
     if(g_chromeSettingsEpoch)++g_chromeSettingsEpoch;
-    g_launcherScroll=0;
+
     CompositorMarkDirty();
     SerialPrintf("WM: desktop scale applied %u%%\n",next->percent);
     return true;
@@ -1573,7 +1796,9 @@ static void SnapshotDebugWindowLocked(const Window& w,WmDebugWindow* out)
     out->visible=w.visible;out->minimized=w.minimized;out->maximized=w.state==WindowState::Maximized && !w.fullscreen;out->fullscreen=w.fullscreen;
     out->focused=w.focused;out->focusable=w.focusable;out->apiWindow=w.vfb!=nullptr;
     out->providerKernel=w.proc->isKernelThread;
-    WmStrCopy(out->title,w.title,sizeof(out->title));WmStrCopy(out->appId,w.appId,sizeof(out->appId));
+    WmStrCopy(out->title, WindowDisplayTitle(w), sizeof(out->title));
+    WmStrCopy(out->rawTitle, w.title, sizeof(out->rawTitle));
+    WmStrCopy(out->appId, w.appId, sizeof(out->appId));
 }
 
 Process* WmReferenceTerminatedOwner()
@@ -1593,6 +1818,24 @@ uint32_t WmSnapshotDebugWindows(WmDebugWindow* out,uint32_t capacity,uint64_t* t
     VfbGuard guard;uint32_t count=0;
     for (const auto& w:g_windows) if(w.proc && count<capacity) SnapshotDebugWindowLocked(w,&out[count++]);
     *tick=ApicTickCount();return count;
+}
+
+int WmCopyDebugWindowBuffer(uint32_t id,uint64_t incarnation,uint32_t* out,uint64_t capacityPixels,
+                            uint32_t* width,uint32_t* height,uint32_t* scale)
+{
+    VfbGuard guard;
+    if (!id || id>WM_MAX_WINDOWS) return -2;
+    const auto& w=g_windows[id-1];
+    if (!w.proc || w.creationIdentity!=incarnation) return -2;
+    // GPU-published windows have no current CPU pixels to copy.
+    if (!w.vfb || w.externalCaptured || !w.vfbWidth || !w.vfbHeight || w.vfbStride<w.vfbWidth ||
+        uint64_t(w.vfbStride)*w.vfbHeight*4>w.vfbBytes) return -95;
+    *width=w.vfbWidth;*height=w.vfbHeight;*scale=w.upscale?w.upscale:1;
+    if (!out) return 0;
+    if (uint64_t(w.vfbWidth)*w.vfbHeight>capacityPixels) return -11; // resized since sized: retry
+    for (uint32_t y=0;y<w.vfbHeight;++y)
+        memcpy(out+uint64_t(y)*w.vfbWidth,w.vfb+uint64_t(y)*w.vfbStride,uint64_t(w.vfbWidth)*4);
+    return 0;
 }
 
 int WmApplyDebugAction(uint32_t id,uint64_t incarnation,WmDebugAction action,
@@ -1681,26 +1924,42 @@ uint32_t WmGetZOrder(int* outIndices, uint32_t maxOut)
 
 static ChromeMaterialCache g_chromeMaterial;
 static uint64_t g_materialRebuilds=0;
-const ChromeMaterialCache& WmChromeMaterial(){
-    const auto& p=WmCurrentPalette();
+// The compositor thread and, under glass, chrome captures for a renderer
+// both use it: rebuilds are serialised. A rebuild follows a theme, opacity or
+// scale change, which also changes every chrome key, so a capture that read
+// it mid-rebuild is discarded as stale.
+static SpinLock g_chromeMaterialLock;
+static const ChromeMaterialCache& WmChromeMaterial(const WmPalette& p){
+    SpinLockAcquire(&g_chromeMaterialLock);
     if(g_chromeMaterial.Ensure(p.titleActive,p.titleInactive,CompositorMaterialOpacity(),
-                              WmMetric(WM_TITLE_BAR_HEIGHT),WmMetric(7),WmMetric(WM_BORDER_WIDTH)))
+                              WmMetric(WM_TITLE_BAR_HEIGHT),WmMetric(8),WmMetric(WM_BORDER_WIDTH),
+                              &p,WmMetric(WM_TASKBAR_HEIGHT)))
         __atomic_add_fetch(&g_materialRebuilds,1,__ATOMIC_RELAXED);
+    SpinLockRelease(&g_chromeMaterialLock);
     return g_chromeMaterial;
 }
+const ChromeMaterialCache& WmChromeMaterial(){return WmChromeMaterial(WmCurrentPalette());}
 uint64_t WmMaterialCacheRebuilds(){return __atomic_load_n(&g_materialRebuilds,__ATOMIC_RELAXED);}
 
 // The builders' view of the WM's theme, scale, font and material state.
 ChromeStyle WmChromeStyle()
 {
     const bool glass = CompositorGlassActive();
-    return {&WmCurrentPalette(), &WmDesktopMetrics(), &WmDesktopFont(), glass, CompositorMaterialOpacity(),
-            glass ? &WmChromeMaterial() : nullptr};
+    const WmPalette palette=WmCurrentPalette();
+    return {palette, &WmDesktopMetrics(), &WmChromeFonts(), glass, CompositorMaterialOpacity(),
+            glass ? &WmChromeMaterial(palette) : nullptr};
 }
-static int WmTextWidth(const char* text) { return ChromeTextWidth(WmDesktopFont(), text); }
-// Shell surfaces are built and executed on the compositor thread only; they
-// share this list storage (too large for the stack).
-static ChromeShellStorage g_shellListStorage;
+ChromeShellConfig WmCaptureShellConfig()
+{
+    return {WmCurrentPalette(), WmDesktopMetrics(), CompositorMaterialOpacity(), CompositorGlassActive()};
+}
+
+static void WmCaptureShellIcon(ChromeShellIcon& out, const uint32_t* icon)
+{
+    if (!icon) return;
+    memcpy(out.pixels, icon, sizeof(out.pixels));
+    out.present = true;
+}
 
 // The frame is the window's part table drawn through its display list
 // (chrome_frame.cpp); the executor writes the same pixels the painter did.
@@ -1713,11 +1972,11 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
     if (w.noChrome && !w.captionOverlay) return;
     LauncherReadGuard icons;
     const ChromeFrameModel model{WindowChromeLayout(w), w.clientW, w.focused, w.state == WindowState::Maximized,
-                                 w.noChrome, w.captionStyle, w.title, WindowIcon(w, icons.get()), mouseX, mouseY};
+                                 w.noChrome, w.captionStyle, WindowDisplayTitle(w), WindowIcon(w, icons.get()), mouseX, mouseY};
     ChromeFrameStorage storage;
     ChromeDisplayList list = ChromeListOn(storage);
     ChromeBuildFrame(model, WmChromeStyle(), list);
-    ChromeExecute(list, {buf, stride, screenW, screenH}, WmDesktopFont());
+    ChromeExecute(list, {buf, stride, screenW, screenH}, WmChromeFonts());
 }
 
 void WmRenderChrome(uint32_t* backBuffer, uint32_t stride,
@@ -1814,6 +2073,8 @@ static bool ParseShortcutMetadata(const char* path, LauncherItem& item)
         {"title:", item.title, sizeof(item.title)},
         {"app_id:", item.appId, sizeof(item.appId)},
         {"executable:", item.executable, sizeof(item.executable)},
+        {"desc:", item.description, sizeof(item.description)},
+        {"category:", item.category, sizeof(item.category)},
     };
     for (char* line = buf; *line;)
     {
@@ -1945,6 +2206,19 @@ static bool LauncherExecutable(const char* command, char* executable, uint32_t c
     return false;
 }
 
+// User items carry a validated absolute profile pathname. Recheck the
+// executable before dispatch because the profile can change after publication.
+static bool LauncherUserExecutable(const char* command, char (&executable)[64])
+{
+    if (!LauncherExecutable(command, executable, sizeof(executable))) return false;
+    char path[sizeof(UserLauncherProfileBin) + sizeof(executable)];
+    constexpr uint32_t prefixLength = sizeof(UserLauncherProfileBin) - 1;
+    WmStrCopy(path, UserLauncherProfileBin, sizeof(path));
+    WmStrCopy(path + prefixLength, executable, sizeof(path) - prefixLength);
+    VnodeStat st{};
+    return !VfsStatPath(path, &st) && (st.mode & 0170000) == 0100000 && (st.mode & 0111);
+}
+
 static bool ShortcutRequirementsMet(const char* path)
 {
     Vnode* vn = VfsOpen(path, 0);
@@ -2050,6 +2324,10 @@ static bool LauncherLoadDesktopEntries(LauncherSnapshot& launcher)
             WmStrCopy(item->scriptPath, fields[1], sizeof(item->scriptPath));
             WmStrCopy(item->executable, executable, sizeof(item->executable));
             WmStrCopy(item->appId, count >= 5 ? fields[4] : "", sizeof(item->appId));
+            // A desktop file's Categories= replaces a same-title shortcut's
+            // declared category only when it maps to one.
+            if (count >= 4 && *LauncherModel::HintFromDesktopCategories(fields[3]))
+                WmStrCopy(item->category, LauncherModel::HintFromDesktopCategories(fields[3]), sizeof(item->category));
             kfree(item->iconPixels);item->iconPixels = nullptr;
             if (count >= 3) item->iconPixels = LoadIconFile(fields[2]);
             if (!item->iconPixels) LauncherLoadIcon(item);
@@ -2070,28 +2348,46 @@ static void FreeLauncherSnapshot(LauncherSnapshot* snapshot)
     kfree(snapshot);
 }
 
+static bool IdentifyLauncherItem(const LauncherSnapshot& catalog, uint32_t index, LauncherItem& item)
+{
+    LauncherIdentity identity;
+    identity.field(item.isUserDesktopEntry ? "user-desktop" : item.isDesktopEntry ? "desktop" : "shortcut");
+    // New manifests carry the exact desktop-file basename. For legacy
+    // manifests without it, use the command and label as an explicit fallback.
+    if (item.isDesktopEntry && item.appId[0]) identity.field(item.appId);
+    else {
+        identity.field(item.scriptPath);
+        if (item.isDesktopEntry) identity.field(item.title);
+    }
+    identity.finish(item.catalogId);
+    for (uint32_t i = 0; i < index; ++i)
+        if (!strcmp(item.catalogId, catalog.items[i].catalogId)) return false;
+
+    const char* hex = "0123456789abcdef";
+    char generation[9];
+    for (unsigned i = 0; i < 8; ++i) generation[i] = hex[(catalog.generation >> ((7-i)*4)) & 15];
+    generation[8] = 0;
+    LauncherIdentity spec;
+    spec.field(item.catalogId);
+    spec.field(item.scriptPath);
+    spec.field(item.isUserDesktopEntry ? "user-desktop" : item.isDesktopEntry ? "desktop" : "shortcut");
+    spec.field(generation);
+    spec.finish(item.specification);
+    return true;
+}
+
 static bool IdentifyLauncherItems(LauncherSnapshot& catalog)
 {
-    const char* hex="0123456789abcdef";char generation[9];
-    for(unsigned i=0;i<8;++i)generation[i]=hex[(catalog.generation>>((7-i)*4))&15];
-    generation[8]=0;
-    for(uint32_t i=0;i<catalog.count;++i) {
-        auto& item=catalog.items[i];LauncherIdentity identity;
-        identity.field(item.isDesktopEntry?"desktop":"shortcut");
-        // New manifests carry the exact desktop-file basename. For legacy
-        // manifests without it, use the command and label as an explicit fallback.
-        if(item.isDesktopEntry&&item.appId[0])identity.field(item.appId);
-        else {identity.field(item.scriptPath);if(item.isDesktopEntry)identity.field(item.title);}
-        identity.finish(item.catalogId);
-        for(uint32_t j=0;j<i;++j)if(!strcmp(item.catalogId,catalog.items[j].catalogId)) {
-            SerialPuts("WM: duplicate/colliding launcher identity; retaining previous catalog\n");return false;
+    for (uint32_t i = 0; i < catalog.count; ++i) {
+        if (!IdentifyLauncherItem(catalog, i, catalog.items[i])) {
+            SerialPuts("WM: duplicate/colliding launcher identity; retaining previous catalog\n");
+            return false;
         }
-        LauncherIdentity spec;spec.field(item.catalogId);spec.field(item.scriptPath);
-        spec.field(item.isDesktopEntry?"desktop":"shortcut");spec.field(generation);
-        spec.finish(item.specification);
     }
     return true;
 }
+
+#include "wm_launcher_user_manifest.inc"
 
 static LauncherSnapshot* BuildLauncherSnapshot(uint32_t generation)
 {
@@ -2143,6 +2439,7 @@ static LauncherSnapshot* BuildLauncherSnapshot(uint32_t generation)
         FreeLauncherSnapshot(snapshot);
         return nullptr;
     }
+    LauncherLoadUserManifest(*snapshot);
     snapshot->builtTick=ApicTickCount();
     return snapshot;
 }
@@ -2150,6 +2447,7 @@ static LauncherSnapshot* BuildLauncherSnapshot(uint32_t generation)
 static bool g_launchInhibited=false;
 static void LauncherWorker(void*)
 {
+    __atomic_store_n(&g_launcherWorkerRunning, true, __ATOMIC_RELEASE);
     uint32_t attempted = 0;
     { LauncherReadGuard guard; attempted = guard.get().generation; }
     for (;;)
@@ -2163,6 +2461,7 @@ static void LauncherWorker(void*)
         const bool occupied = g_launcherPending || g_launcherRetired;
         SpinLockRelease(&g_launcherLock);
         FreeLauncherSnapshot(disposable);
+        if (!occupied && g_userLauncherReload.Take(ApicTickCount())) WmRequestLauncherRefresh();
         const uint32_t requested = __atomic_load_n(&g_launcherRequested, __ATOMIC_ACQUIRE);
         if (!occupied && requested != attempted)
         {
@@ -2177,7 +2476,7 @@ static void LauncherWorker(void*)
             }
         }
         char command[128];
-        bool desktop = false;
+        bool desktop = false, userDesktop = false;
         uint64_t token = 0;
         SpinLockAcquire(&g_launchLock);
         int launch = g_launchInhibited?-1:g_launches.Take(ApicTickCount());
@@ -2186,6 +2485,7 @@ static void LauncherWorker(void*)
             g_launchHistory.Start(token,ApicTickCount());
             WmStrCopy(command, g_launchRequests[launch].command, sizeof(command));
             desktop = g_launchRequests[launch].desktop;
+            userDesktop = g_launchRequests[launch].userDesktop;
         }
         SpinLockRelease(&g_launchLock);
         if (token) {
@@ -2194,7 +2494,8 @@ static void LauncherWorker(void*)
             self->launchId = token;
             int result;
             char executable[64];
-            const bool available=desktop?LauncherExecutable(command,executable,sizeof(executable)):ShortcutRequirementsMet(command);
+            const bool available = userDesktop ? LauncherUserExecutable(command, executable) :
+                desktop ? LauncherExecutable(command, executable, sizeof(executable)) : ShortcutRequirementsMet(command);
             if(!available)result=-2;
             else if (desktop) {
                 char script[512];
@@ -2225,6 +2526,7 @@ static void LauncherWorker(void*)
         }
         // One worker, coalesced requests, no busy waiting or retained rebuild
         // list. A slow reader delays reclamation and subsequent builds.
+        LauncherSaveLayout();
         SchedulerSleepMs(250);
     }
 }
@@ -2237,7 +2539,7 @@ static void LauncherStartWorker()
     Process* worker = KernelThreadCreate("launcher", LauncherWorker, nullptr, 3);
     if (!worker) {
         __atomic_store_n(&g_launcherWorkerStarted, false, __ATOMIC_RELEASE);
-        SerialPuts("WM: launcher worker allocation failed\n");
+        KLogCatConsole(LogCat::Wm, LogLevel::Warn, "launcher: worker allocation failed errno=12");
         return;
     }
     SchedulerAddProcess(worker);
@@ -2246,6 +2548,7 @@ static void LauncherStartWorker()
 void WmLauncherLoad()
 {
     if (g_launcherLoaded) return;
+    LauncherLoadLayout();
     const uint32_t generation = __atomic_load_n(&g_launcherRequested, __ATOMIC_ACQUIRE);
     LauncherSnapshot* snapshot = BuildLauncherSnapshot(generation);
     if (snapshot)
@@ -2257,7 +2560,9 @@ void WmLauncherLoad()
           g_launcherActive = snapshot;
           if(g_launcherSnapshotEpoch)++g_launcherSnapshotEpoch;
           SpinLockRelease(&g_launcherLock);
+          RefreshWebAppTitles(*snapshot);
         }
+        LauncherSyncModel(*snapshot);
         SerialPrintf("WM: launcher initial generation=%u items=%u\n", generation, snapshot->count);
     }
     g_launcherLoaded = true;
@@ -2273,9 +2578,10 @@ void WmLauncherToggle()
     g_launcherPower.Reset();
     if (g_launcherOpen) {
         PointerActivationCancel();
-        WmVolumePopupClose(); // the two popups share one overlay slot
+        WmVolumePopupClose();
+        WmTrayFlyoutClose();
         g_launcherError = 0;
-        g_launcherScroll = 0;
+        g_launcherModel.Open();
         WmRequestLauncherRefresh(); // also catches installs/removals outside the installer
     }
 }
@@ -2287,32 +2593,22 @@ bool WmLauncherVisible()
 
 #include "wm_shell_launcher.inc"
 
-// Content key of one shell surface as it would render now (stage 1.4): its
-// display list hashed with what the list does not carry. Compositor thread
-// only (shares the shell list storage). 0: the surface draws nothing.
-uint64_t WmShellSurfaceKey(const WmShellSurface& s, uint32_t screenW, uint32_t screenH,
-                           uint64_t uptimeMs, int32_t mx, int32_t my)
+bool WmCaptureShellModel(const WmShellSurface& s, uint32_t screenW, uint32_t screenH,
+                         uint64_t uptimeMs, int32_t mx, int32_t my, ChromeShellModel& model)
 {
-    const FontAtlas& font = WmDesktopFont();
-    constexpr uint64_t prime = 0x100000001b3ull;
-    uint64_t seed = 0x6b65792d7368656cull;
-    auto word = [&](uint64_t v) { seed = (seed ^ v) * prime; };
-    word(uint64_t(s.kind) << 32 | uint32_t(s.material));
-    word(uint64_t(uint32_t(s.x)) << 32 | uint32_t(s.y));
-    word(uint64_t(s.w) << 32 | s.h);
-    word(uint64_t(screenW) << 32 | screenH);
-    word(reinterpret_cast<uintptr_t>(&font));
-    word(uint64_t(uint32_t(font.lineHeight)) << 32 | uint32_t(font.glyphCount));
-    word(uint64_t(CompositorGlassActive()) << 32 | CompositorMaterialOpacity());
-    uint64_t key = 0;
+    // Initialize all bytes, including padding and unused icon slots.
+    memset(static_cast<void*>(&model), 0, sizeof(model));
+    model.kind = ChromeShellKind::None;
     switch (s.kind) {
-    case WmShellSurfaceKind::Taskbar: WmTaskbarSurface(nullptr, 0, screenW, screenH, uptimeMs, mx, my, seed, &key); break;
-    case WmShellSurfaceKind::Launcher: WmLauncherSurface(nullptr, 0, screenW, screenH, mx, my, seed, &key); break;
-    case WmShellSurfaceKind::VolumePopup: WmVolumePopupSurface(nullptr, 0, screenW, screenH, mx, my, seed, &key); break;
-    case WmShellSurfaceKind::TrayTooltip: WmTrayTooltipSurface(nullptr, 0, screenW, screenH, mx, my, seed, &key); break;
-    case WmShellSurfaceKind::BootSummary: WmBootSummarySurface(nullptr, 0, screenW, screenH, seed, &key); break;
+    case WmShellSurfaceKind::Taskbar: WmCaptureTaskbar(screenW, screenH, uptimeMs, mx, my, model); break;
+    case WmShellSurfaceKind::Launcher: WmCaptureLauncher(screenW, screenH, mx, my, model); break;
+    case WmShellSurfaceKind::VolumePopup: WmCaptureVolumePopup(screenW, screenH, mx, my, model); break;
+    case WmShellSurfaceKind::TrayTooltip: WmCaptureTooltip(screenW, screenH, mx, my, model); break;
+    case WmShellSurfaceKind::TrayFlyout: WmCaptureTrayFlyout(screenW, screenH, model); break;
+    case WmShellSurfaceKind::PerformanceHud: WmCapturePerformanceHud(screenW, screenH, model); break;
+    case WmShellSurfaceKind::BootSummary: WmCaptureBootSummary(screenW, screenH, model); break;
     }
-    return key;
+    return model.kind != ChromeShellKind::None;
 }
 
 static int AdmitLauncherItem(const LauncherSnapshot& catalog,int itemIdx,bool tracked,
@@ -2336,7 +2632,9 @@ static int AdmitLauncherItem(const LauncherSnapshot& catalog,int itemIdx,bool tr
         if(created) {
             auto& request=g_launchRequests[slot];
             WmStrCopy(request.command,item.scriptPath,sizeof(request.command));
-            request.desktop=item.isDesktopEntry;request.hasIcon=item.iconPixels!=nullptr;
+            request.desktop = item.isDesktopEntry;
+            request.userDesktop = item.isUserDesktopEntry;
+            request.hasIcon = item.iconPixels != nullptr;
             if(request.hasIcon)memcpy(request.icon,item.iconPixels,sizeof(request.icon));
         }
         if(tracked)g_launchHistory.Track(entry,created);
@@ -2398,6 +2696,38 @@ void WmLauncherExec(int itemIdx)
     AdmitLauncherItem(guard.get(),itemIdx,false,&token,&coalesced);
 }
 
+void WmOpenFiles()
+{
+    if (!WmIsActive() || !ShutdownLaunchAllowed()) return;
+    WmLauncherClose();
+    {
+        VfbGuard guard;
+        int best = -1;
+        for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i) {
+            const auto& w = g_windows[i];
+            if (w.proc && w.visible && w.focusable && !strcmp(w.appId, LauncherFilesAppId) &&
+                (best < 0 || w.zOrder > g_windows[best].zOrder))
+                best = static_cast<int>(i);
+        }
+        if (best >= 0) {
+            if (g_windows[best].minimized) RestoreWindowLocked(best);
+            else FocusWindowLocked(best);
+            CompositorMarkDirty();
+            return;
+        }
+    }
+    LauncherReadGuard guard;
+    const auto& catalog = guard.get();
+    for (uint32_t i = 0; i < catalog.count; ++i) {
+        if (!catalog.items[i].valid || strcmp(catalog.items[i].appId, LauncherFilesAppId)) continue;
+        uint64_t token = 0;
+        bool coalesced = false;
+        AdmitLauncherItem(catalog, static_cast<int>(i), false, &token, &coalesced);
+        return;
+    }
+    CompositorMarkDirty();
+}
+
 int WmLauncherActivate(const char* appId,uint32_t generation,uint64_t* token,bool* coalesced)
 {
     LauncherReadGuard guard;const auto& catalog=guard.get();
@@ -2447,6 +2777,17 @@ Window* WmFindWindowById(Process* proc, uint32_t wmId)
     Window& w = g_windows[idx];
     if (w.proc != proc || w.wmId != wmId) return nullptr;
     return &w;
+}
+
+uint64_t WmPointerHoverIdentityOf(Process* proc)
+{
+    const uint64_t hover = WmPointerHoverIdentity();
+    if (!proc || !hover) return 0;
+    VfbGuard guard;
+    for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
+        if (g_windows[i].proc && g_windows[i].creationIdentity == hover)
+            return g_windows[i].proc == proc ? hover : 0;
+    return 0;
 }
 
 uint64_t WmWindowCreationIdentity(Process* proc, uint32_t wmId)
@@ -2525,7 +2866,8 @@ WmCreateWindowResult WmCreateWindowForProcess(Process* proc,
                                                uint16_t clientH,
                                                const char* title,
                                                bool focusable,
-                                               bool nativeClient)
+                                               bool nativeClient,
+                                               bool fineScroll)
 {
     WmCreateWindowResult res = {};
     VfbGuard guard;
@@ -2545,6 +2887,8 @@ WmCreateWindowResult WmCreateWindowForProcess(Process* proc,
     if (idx < 0) return res;
 
     Window& w = g_windows[idx];
+
+    w.fineScroll = fineScroll;
 
     // Allocate the VFB pages kernel-side.
     // Shared display-server windows must prove their client separately.
@@ -2725,7 +3069,8 @@ static bool DesktopLayerLocked(const Window& w,WmDesktopLayer& out,bool retain) 
          w.clientX(),w.clientY(),w.upscale,uint8_t(legacy),0,0,0,0,0,{}, {},0,0,0,0,0,0};
     out.focused=w.focused;out.noChrome=w.noChrome?(w.captionOverlay?2:1):0;out.state=uint8_t(w.state);
     out.opacity=w.opacity;out.blurRadius=w.blurRadius;
-    __builtin_memcpy(out.title,w.title,sizeof(out.title));__builtin_memcpy(out.appId,w.appId,sizeof(out.appId));
+    WmStrCopy(out.title, WindowDisplayTitle(w), sizeof(out.title));
+    __builtin_memcpy(out.appId, w.appId, sizeof(out.appId));
     out.ownerPid=w.proc->pid;out.ownerIncarnation=w.proc->incarnation;
     return true;
 }
@@ -2838,7 +3183,8 @@ static uint64_t DesktopChromeKeyLocked(const DesktopChromeEpochs& layers,const W
         if(part && part->hit.contains(mouseX,mouseY))hover=button;
     }
     WmChromeKeyInput in{};
-    in.title=origin0.title;in.titleCapacity=sizeof(origin0.title);
+    in.title = WindowDisplayTitle(origin0);
+    in.titleCapacity = sizeof(origin0.title);
     in.appId=origin0.appId;in.appIdCapacity=sizeof(origin0.appId);
     in.windowIdentity=origin0.creationIdentity;in.metricsIdentity=reinterpret_cast<uintptr_t>(origin0.metrics);
     in.outerWidth=origin0.outerWidth();in.outerHeight=origin0.outerHeight();
@@ -2858,7 +3204,8 @@ static uint64_t DesktopChromeKeyLocked(const DesktopChromeEpochs& layers,const W
 ChromeSurfaceEffects WmChromeSurfaceEffects() {
     ChromeSurfaceEffects e{};
     e.glass=CompositorGlassActive();e.blur=CompositorMaterialBlur();
-    e.shadowSpread=WmMetric(16);e.shadowCorner=WmMetric(24);e.shellRadius=e.glass?WmMetric(4):0;
+    e.lightShadow=!WmCurrentPalette().chromeDark;
+    e.shadowSpread=WmMetric(16);e.shadowCorner=WmMetric(28);e.shellRadius=e.glass?WmMetric(12):0;
     if(e.glass){const auto& material=WmChromeMaterial();e.topRadius=material.top.radius;e.bottomRadius=material.bottom.radius;}
     return e;
 }
@@ -2881,7 +3228,7 @@ static bool WindowSurfaceLocked(const Window& w,const DesktopChromeEpochs& epoch
     m.clientDecorated=w.noChrome;m.maximised=w.state==WindowState::Maximized;m.focused=w.focused;
     m.outer=block;m.client={w.clientX(),w.clientY(),int(w.clientW),int(w.clientH)};
     m.captionRadius=(w.captionStyle&DesktopCaptionStyleValid)?DesktopCaptionStyleRadius(w.captionStyle):0;
-    m.opacity=w.opacity;
+    m.opacity=w.opacity;m.fullWindowBlur=w.blurRadius!=0;
     out=ChromeFrameSurface(m,effects);return true;
 }
 uint32_t WmDesktopSurfaceRecords(BrookDesktopSurface* out,uint32_t max) {
@@ -2909,6 +3256,8 @@ BrookDesktopSurface WmShellSurfaceRecord(const WmShellSurface& surface,uint64_t 
     case WmShellSurfaceKind::Launcher: kind=BROOK_DESKTOP_SURFACE_LAUNCHER;break;
     case WmShellSurfaceKind::VolumePopup: kind=BROOK_DESKTOP_SURFACE_VOLUME_POPUP;break;
     case WmShellSurfaceKind::TrayTooltip: kind=BROOK_DESKTOP_SURFACE_TOOLTIP;break;
+    case WmShellSurfaceKind::TrayFlyout: kind=BROOK_DESKTOP_SURFACE_TRAY_FLYOUT;break;
+    case WmShellSurfaceKind::PerformanceHud: kind=BROOK_DESKTOP_SURFACE_PERFORMANCE_HUD;break;
     case WmShellSurfaceKind::BootSummary: kind=BROOK_DESKTOP_SURFACE_BOOT_SUMMARY;break;
     }
     return ChromeShellSurfaceRecord(kind,{surface.x,surface.y,int(surface.w),int(surface.h)},surface.material,key,
@@ -2922,7 +3271,7 @@ int64_t WmDesktopChromeCapture(const WmDesktopLayers& layers,uint32_t index,
     {
         VfbGuard guard;
         if(!DesktopLayersCurrentLocked(layers,!tolerateVisualChanges))return -116;
-        if(!g_wmActive || CompositorGlassActive())return -95;
+        if(!g_wmActive)return -95;
         int sorted[WM_MAX_WINDOWS];if(WmGetZOrder(sorted,WM_MAX_WINDOWS)!=layers.count)return -116;
         const Window& source=g_windows[sorted[index]];
         if(source.noChrome && !source.captionOverlay){*info={source.x,source.y,0,0,0,0,0,0,0};return 0;}
@@ -2987,9 +3336,8 @@ int64_t WmDesktopChromeCapture(const WmDesktopLayers& layers,uint32_t index,
     };
     const bool noMouse=mouseX==-1 && mouseY==-1;
     RenderWindowChrome(pixels,width,width,height,local,noMouse?-1:relative(mouseX,originX),noMouse?-1:relative(mouseY,originY));
-    // The client interior remains transparent; only the frame is marked.
-    ChromeMarkFrameOpaque(pixels,width,width,height,{0,0,width,height},
-                          {local.clientX(),local.clientY(),local.clientW,local.clientH});
+    if(CompositorGlassActive() && local.state!=WindowState::Maximized && !local.blurRadius)
+        ChromeMaskFrameCorners(pixels,width,width,height,{0,0,width,height},WmChromeMaterial(),local.focused);
     ProcessUnref(local.proc);
     return (tolerateVisualChanges?WmDesktopLayersCaptureCurrent(layers):WmDesktopLayersCurrent(layers))?0:-116;
 }
@@ -3147,6 +3495,8 @@ bool WmSetAppIdById(Process* proc, uint32_t wmId, const char* appId)
     Window* w = WmFindWindowById(proc, wmId);
     if (!w || !appId) return false;
     WmStrCopy(w->appId, appId, sizeof(w->appId));
+    LauncherReadGuard catalog;
+    RefreshWebAppTitle(*w, catalog.get());
     CompositorMarkDirty();
     CompositorWake();
     return true;
@@ -3172,6 +3522,8 @@ void WmSetTitleById(Process* proc, uint32_t wmId, const char* title)
     Window* w = WmFindWindowById(proc, wmId);
     if (!w || !title) return;
     WmStrCopy(w->title, title, sizeof(w->title));
+    LauncherReadGuard catalog;
+    RefreshWebAppTitle(*w, catalog.get());
     CompositorMarkDirty();
     CompositorWake();
 }
@@ -3213,6 +3565,16 @@ bool WmInputPush(Window* win, const InputEvent& ev, int16_t localX, int16_t loca
     slot.x         = localX;
     slot.y         = localY;
     slot.reserved  = captureToken;
+    if (ev.type == InputEventType::MouseScroll && win->fineScroll && !captureToken) {
+        const auto clampV120 = [](int32_t value) {
+            return static_cast<int16_t>(value < (-32768) ? (-32768) :
+                                        value > 32767 ? 32767 : value);
+        };
+        slot.modifiers |= BROOK_WM_SCROLL_FINE | ev.scrollFlags;
+        slot.x = clampV120(ev.deltaY ? ev.deltaY : int32_t(static_cast<int8_t>(ev.scanCode)) * 120);
+        slot.y = clampV120(ev.deltaX ? ev.deltaX : int32_t(static_cast<int8_t>(ev.ascii)) * 120);
+        slot.reserved = uint32_t(uint16_t(localX)) | (uint32_t(uint16_t(localY)) << 16);
+    }
     __atomic_store_n(&win->inputHead, next, __ATOMIC_RELEASE);
     return true;
 }

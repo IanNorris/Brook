@@ -52,6 +52,24 @@ static void oracleBlockCapture(uint32_t* pixels,uint32_t width,uint32_t height,u
             pixels[uint64_t(row)*width+x]=0;
 }
 
+// Compare against a screen traversal that applies only the four corner
+// masks. It must preserve painted alpha across every other pixel, including
+// title ink and the client hole.
+static void oracleGlassCorners(uint32_t* buf,uint32_t stride,uint32_t fbW,uint32_t fbH,
+                               int ox,int oy,int ow,int oh,const ChromeMaterialCache& material,bool focused){
+    if(ow<int(material.top.radius*2) || oh<int(material.top.radius*2))return;
+    for(int y=0;y<int(fbH);++y)for(int x=0;x<int(fbW);++x){
+        const unsigned row=y-oy<oh/2 ? y-oy : oy+oh-1-y;
+        const unsigned col=x-ox<ow/2 ? x-ox : ox+ow-1-x;
+        const bool top=y-oy<oh/2;
+        const auto& mask=top?material.top:material.bottom;
+        if(row>=mask.radius || col>=mask.radius)continue;
+        const uint32_t rim=material.rims[focused][top?(row<mask.radius/2?0:1):2];
+        auto& pixel=buf[uint64_t(y)*stride+x];
+        pixel=ChromeMaskedRim(pixel,mask.coverage[row][col],mask.inner[row][col],rim);
+    }
+}
+
 int main(){
     uint32_t rng=0x2545F491u;
     auto next=[&](uint32_t n){rng^=rng<<13;rng^=rng>>17;rng^=rng<<5;return n?rng%n:0u;};
@@ -101,6 +119,22 @@ int main(){
             ChromeMarkCaptionBlockOpaque(b.data(),w,w,h,{0,0,w,h},radius);
             CHECK(a==b);
         }
+    }
+    for(int iter=0;iter<3000;++iter){
+        ChromeMaterialCache material;
+        const int border=1+next(3),title=4+next(20),cw=1+next(60),ch=1+next(40);
+        material.Ensure(0x0028466fu,0x00253851u,40+next(200),title,next(8),border);
+        const bool capture=next(2),focused=next(2);
+        const int ow=cw+2*border,oh=border+title+ch+border;
+        const uint32_t fbW=capture?uint32_t(ow):8+next(90),fbH=capture?uint32_t(oh):8+next(70);
+        const uint32_t stride=capture?fbW:fbW+next(5);
+        const int ox=capture?0:int(next(fbW+20))-10,oy=capture?0:int(next(fbH+20))-10;
+        std::vector<uint32_t> a(stride*fbH),b;
+        for(auto& p:a)p=((1+next(255))<<24)|next(0x01000000u);
+        b=a;
+        oracleGlassCorners(a.data(),stride,fbW,fbH,ox,oy,ow,oh,material,focused);
+        ChromeMaskFrameCorners(b.data(),stride,fbW,fbH,{ox,oy,ow,oh},material,focused);
+        CHECK(a==b);
     }
     // A block (overlaid captions) is opaque as a whole, clipped.
     std::vector<uint32_t> px(10*6,0x00123456u);

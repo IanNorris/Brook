@@ -87,7 +87,9 @@ static struct {
     uint64_t lastPresented;unsigned outstanding,maxOutstanding,overlapReserves,fullOnlyReserves,dependentReserves,staleReserves;
     unsigned fulls,rejected;
     unsigned chromeKeeps,chromeKeepMisses,chromeCaptures,chromeSpanCaptures,surfaceQueries;
-    int oldSurfaces; /* HOST_E2E_OLD_KERNEL_NO_SURFACES: layers ops 16/17 refused */
+    unsigned panelShadow, panelStep;
+    int oldSurfaces; /* HOST_E2E_OLD_KERNEL_NO_SURFACES: layers ops 16/17/18 refused */
+    unsigned capsReports;long capsRequested; /* layers op 18 (stage 1.5) */
     unsigned clientKeeps,clientKeepMisses,clientCaptures,noClientKeep;unsigned long long clientBytes;
     struct {long ticket;int state,full;struct BrookGpuPresentRegions regions;struct BrookGpuPresentFrame frame;uint64_t readyNs;long result;} queue;
     unsigned queued;uint64_t presentDelayNs;
@@ -135,19 +137,25 @@ static struct BrookDesktopSurface fake_surface(const struct FakeWindow *w){
     s.x=w->x-2;s.y=w->y-10;s.width=w->chromeW;s.height=w->chromeH;
     s.clientX=w->x;s.clientY=w->y;s.clientWidth=w->w;s.clientHeight=w->h;
     s.material=BROOK_DESKTOP_MATERIAL_OPAQUE;s.opacity=w->opacity;s.flags=BROOK_DESKTOP_SURFACE_OPAQUE;
-    s.shadow=BROOK_DESKTOP_SHADOW_WINDOW;s.shadowAlpha=(w->window&1)?255:180;s.shadowSpread=6;s.shadowCorner=10;
+    s.shadow=w->window==1?BROOK_DESKTOP_SHADOW_WINDOW:w->window&1?
+        BROOK_DESKTOP_SHADOW_WINDOW_ACTIVE:BROOK_DESKTOP_SHADOW_WINDOW_INACTIVE;
+    if(!(w->window&1))s.flags|=BROOK_DESKTOP_SURFACE_LIGHT_SHADOW;
+    s.shadowAlpha=(w->window&1)?255:180;s.shadowSpread=6;s.shadowCorner=10;
     return s;
 }
-static uint32_t g_shadowSource[64*64];
+static struct BrookDesktopSurface fake_panel(void){
+    return (struct BrookDesktopSurface){.kind=BROOK_DESKTOP_SURFACE_VOLUME_POPUP,.material=BROOK_DESKTOP_MATERIAL_GLASS,
+        .x=(int32_t)(FW-180-K.panelStep*32),.y=FH-BAND,.width=160,.height=32,.opacity=220,
+        .shadow=BROOK_DESKTOP_SHADOW_PANEL,.shadowAlpha=255,.shadowSpread=12,.shadowCorner=18};
+}
 static void reference(void){
     uint32_t scene[BROOK_VK_SCENE_HEADER+64*BROOK_VK_LAYER_WORDS]={FW,FH,0,0};const uint32_t *src[64];unsigned n=0;
-    desktop_shadow_source(g_shadowSource);
 #define LAYER(p,...) do{const struct BrookVkSceneLayer l={__VA_ARGS__};memcpy(scene+BROOK_VK_SCENE_HEADER+n*BROOK_VK_LAYER_WORDS,&l,sizeof(l));src[n++]=(p);}while(0)
     LAYER(K.backdrop,0,FW,FW,FH,0,0,FW,FH,0,0,FW,FH,0,0,FW,FH,255);
     for(unsigned i=0;i<K.count;++i){const struct FakeWindow *w=&K.win[K.order[i]];
         if(!K.oldSurfaces){const struct BrookDesktopSurface record=fake_surface(w);struct BrookVkSceneLayer pieces[8];
             const unsigned count=desktop_surface_shadow_layers(&record,FW,FH,pieces);
-            for(unsigned k=0;k<count;++k){memcpy(scene+BROOK_VK_SCENE_HEADER+n*BROOK_VK_LAYER_WORDS,&pieces[k],sizeof(pieces[k]));src[n++]=g_shadowSource;}}
+            for(unsigned k=0;k<count;++k){memcpy(scene+BROOK_VK_SCENE_HEADER+n*BROOK_VK_LAYER_WORDS,&pieces[k],sizeof(pieces[k]));src[n++]=desktop_shadow_tile(&record);}}
         if(w->window<=MAXW && K.offer[w->window].visible && K.gameScaled && w->window==2){
             /* HOST_E2E_GAME_SCALED: a half-size buffer drawn 2x (one-layer
              * version 3 offer), clipped to the client rectangle. */
@@ -174,6 +182,15 @@ static void reference(void){
         else LAYER(w->pixels,0,w->stride,w->w,w->h,0,0,w->w,w->h,w->x,w->y,w->w,w->h,0,0,FW,FH,w->opacity|BROOK_VK_STRAIGHT_ALPHA);
         LAYER(w->chrome,0,w->chromeW,w->chromeW,w->chromeH,0,0,w->chromeW,w->chromeH,w->x-2,w->y-10,w->chromeW,w->chromeH,0,0,FW,FH,
               w->opacity|BROOK_VK_STRAIGHT_ALPHA);}
+    if(K.panelStep){
+        const struct BrookDesktopSurface panel=fake_panel();
+        struct BrookVkSceneLayer pieces[DESKTOP_SHADOW_PIECES];
+        const unsigned count=desktop_surface_shadow_layers(&panel,FW,FH,pieces);
+        for(unsigned k=0;k<count;++k){
+            memcpy(scene+BROOK_VK_SCENE_HEADER+n*BROOK_VK_LAYER_WORDS,&pieces[k],sizeof(pieces[k]));
+            src[n++]=desktop_shadow_tile(&panel);
+        }
+    }
     LAYER(K.band,0,FW,FW,BAND,0,0,FW,BAND,0,FH-BAND,FW,BAND,0,0,FW,FH,255|BROOK_VK_STRAIGHT_ALPHA);
     if(K.cursorVisible)LAYER(K.cursor,0,64,CURSOR,CURSOR,0,0,CURSOR,CURSOR,K.cursorX,K.cursorY,CURSOR,CURSOR,0,0,FW,FH,255|BROOK_VK_STRAIGHT_ALPHA);
 #undef LAYER
@@ -305,6 +322,10 @@ static void advance(void){
         if(w && K.offer[id].over[0]){memcpy(K.offer[id].over[1],K.offer[id].over[0],(size_t)(w->w/4)*(w->h/4)*4);
             K.offer[id].hasOver[1]=K.offer[id].hasOver[0];}
         K.offer[id].visible=K.offer[id].sent;}
+    if(K.panelShadow && (s==1 || s==5 || s==10)){
+        K.panelStep=s==10?0:s==5?2:1;
+        ++K.overlayGeneration;
+    }
     struct FakeWindow *a=window_by_id(1),*b=window_by_id(2);
     if(K.game){
         /* HOST_E2E_GAME: an idle, larger CPU window (translucent pixels, as
@@ -387,6 +408,10 @@ static void dma_sync(int fd,uint64_t flags){struct dma_buf_sync_wire s={flags};(
 static struct FakeTicket *ticket_find(long ticket){for(unsigned i=0;i<TICKETS;++i)if(ticket>0 && K.tickets[i].ticket==ticket)return &K.tickets[i];return NULL;}
 
 static long layers_call(long op,struct BrookDesktopLayers *L,long a,long b){
+    if(op==BROOK_DESKTOP_RENDERER_CAPS){
+        if(K.oldSurfaces || L || a!=BROOK_DESKTOP_CAPS_VERSION)return errno=EINVAL,-1;
+        ++K.capsReports;K.capsRequested=b;return b&BROOK_DESKTOP_CAP_KNOWN;
+    }
     if(op==BROOK_DESKTOP_SURFACES_QUERY){
         if(K.oldSurfaces)return errno=EINVAL,-1;
         struct BrookDesktopSurfaces *S=(struct BrookDesktopSurfaces*)(void*)L;
@@ -485,6 +510,12 @@ static long overlay_call(long op,long token,void *p,long size,long a){
     if(op==BROOK_DESKTOP_OVERLAY_WAIT){struct BrookDesktopOverlayInfo *info=p;
         *info=(struct BrookDesktopOverlayInfo){{1,2,FW,FH,FW,1,(uint64_t)FW*FH*4,0,0},K.overlayGeneration};return 0;}
     if(op==4){struct BrookDesktopOverlayBands *b=p;memset(b,0,sizeof(*b));b->count=1;b->bands[0]=(struct BrookDesktopOverlayBand){0,FH-BAND,FW,BAND};return 0;}
+    if(op==BROOK_DESKTOP_OVERLAY_SURFACES && K.panelShadow){
+        struct BrookDesktopOverlaySurfaces *reply=p;
+        *reply=(struct BrookDesktopOverlaySurfaces){0};
+        if(K.panelStep){reply->count=1;reply->surfaces[0]=fake_panel();}
+        return 0;
+    }
     if(op==BROOK_DESKTOP_OVERLAY_READ_BAND){if(a!=0 || size!=(long)sizeof(K.band))return errno=EINVAL,-1;memcpy(p,K.band,sizeof(K.band));return size;}
     if(op==BROOK_DESKTOP_OVERLAY_CURSOR){struct BrookDesktopOverlayCursor *c=p;
         c->visible=K.cursorVisible;c->width=CURSOR;c->height=CURSOR;c->stride=64;c->x=K.cursorX;c->y=K.cursorY;c->serial=K.cursorSerial+1;
@@ -781,6 +812,7 @@ int main(int argc,char **argv){
     K.gameScaled=K.game && getenv("HOST_E2E_GAME_SCALED")!=NULL;
     K.noClientKeep=getenv("HOST_E2E_OLD_KERNEL_NO_CLIENT_KEEP")!=NULL;
     K.oldSurfaces=getenv("HOST_E2E_OLD_KERNEL_NO_SURFACES")!=NULL;
+    K.panelShadow=!K.oldSurfaces && !K.game && getenv("HOST_E2E_PANEL_SHADOW")!=NULL;
     K.peer=-1;K.direct=getenv("HOST_E2E_DIRECT") && strcmp(getenv("HOST_E2E_DIRECT"),"0");
     K.layers=K.direct && getenv("HOST_E2E_LAYERS") && strcmp(getenv("HOST_E2E_LAYERS"),"0");
     if(K.direct){snprintf(K.socketPath,sizeof(K.socketPath),"/tmp/brook-host-e2e-%d.sock",(int)getpid());
@@ -831,6 +863,7 @@ int main(int argc,char **argv){
         K.chromeKeeps,K.chromeKeepMisses,K.chromeCaptures,K.chromeSpanCaptures,K.surfaceQueries,g_surfaceStats.shadows,g_surfaceStats.opaqueSpans);
     /* Records on: shadows drawn, spans captured and opaque; refused (old kernel): none of it. */
     if(!K.oldSurfaces && (!K.chromeSpanCaptures || !g_surfaceStats.shadows || (g_quadSubmitted && g_chromeSpans && !g_surfaceStats.opaqueSpans)))++bad;
+    if(K.panelShadow && !g_overlayRecordCaptures)++bad;
     if(K.oldSurfaces && (K.chromeSpanCaptures || g_surfaceStats.shadows || g_surfaceStats.opaqueSpans || g_surfaceRecords))++bad;
     printf("HOST_E2E_CLIENT keeps=%u keep_misses=%u captures=%u bytes_copied=%llu\n",K.clientKeeps,K.clientKeepMisses,K.clientCaptures,K.clientBytes);
     /* Unchanged CPU windows are kept; published changes (steps 3 and the
@@ -841,6 +874,12 @@ int main(int argc,char **argv){
     if(getenv("HOST_E2E_EXPECT_CHROME_KEEP") && (K.chromeKeeps<=K.chromeCaptures || !K.chromeKeepMisses))++bad;
     if(getenv("HOST_E2E_MIN_IDLE") && g_stats.idleSkips<strtoull(getenv("HOST_E2E_MIN_IDLE"),NULL,10))++bad;
     if(getenv("HOST_E2E_MAX_FAILURES") && g_stats.presentFailures>strtoull(getenv("HOST_E2E_MAX_FAILURES"),NULL,10))++bad;
+    /* The experimental path reports blur only once the atlas is ready. */
+    printf("HOST_E2E_CAPS reports=%u requested=%#lx\n",K.capsReports,(unsigned long)K.capsRequested);
+    if(!K.oldSurfaces){
+        const unsigned blur=g_backdropBlur && g_quadSubmitted?BROOK_DESKTOP_CAP_BACKDROP_BLUR:0;
+        if(K.capsReports!=(blur?2u:1u) || K.capsRequested!=(long)blur)++bad;
+    }
     if(bad)printf("HOST_E2E_EXPECTATION_FAILED\n");
     else if(!K.failures && !result)printf("HOST_E2E_PASS\n");
     if(K.direct)unlink(K.socketPath);

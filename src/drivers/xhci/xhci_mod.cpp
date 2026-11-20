@@ -67,7 +67,7 @@ MODULE_IMPORT_SYMBOL(KPuts);
 MODULE_IMPORT_SYMBOL(VmmAllocPages);
 MODULE_IMPORT_SYMBOL(VmmVirtToPhys);
 MODULE_IMPORT_SYMBOL(VmmMapPage);
-MODULE_IMPORT_SYMBOL(PmmAllocPages);
+MODULE_IMPORT_SYMBOL(PmmAllocPagesAccounted);
 MODULE_IMPORT_SYMBOL(IoApicRegisterHandler);
 MODULE_IMPORT_SYMBOL(IoApicUnregisterHandler);
 MODULE_IMPORT_SYMBOL(ApicGetId);
@@ -462,10 +462,10 @@ static volatile bool  g_irqActive = false;  // true once ISR is registered
 
 // Allocates 'pages' physically contiguous pages, returns both virtual and
 // physical addresses. Memory is zeroed. Returns nullptr on failure.
-static void* AllocDmaBuffer(uint32_t pages, uint64_t& outPhys)
+static void* AllocDmaBuffer(uint32_t pages, uint64_t& outPhys, PmmOwner owner = PmmOwner::XhciDma)
 {
     if(!pages || pages>16384) return nullptr;
-    auto phys=PmmAllocPages(pages,MemTag::Device,KernelPid);
+    auto phys=PmmAllocPagesAccounted(pages,MemTag::Device,KernelPid,owner);
     if(!phys)return nullptr;
     const uint64_t bytes=uint64_t(pages)*4096;
     if(phys.raw()>=(16ull<<30) || bytes>(16ull<<30)-phys.raw()) {
@@ -2508,9 +2508,9 @@ static bool XhciInitEcm(XhciController& ctrl,XhciDevice& dev){
     if(Vnode* marker=VfsOpen("/etc/usb-net-rx8",0)){VfsClose(marker);net->rxDepth=ECM_RX_SLOTS;}
     net->txDepth=8;
     if(Vnode* marker=VfsOpen("/etc/usb-net-tx16",0)){VfsClose(marker);net->txDepth=ECM_TX_SLOTS;}
-    net->rx=static_cast<uint8_t*>(AllocDmaBuffer((net->rxDepth*ECM_RX_BYTES+4095)/4096,net->rxPhysical));
-    net->tx=static_cast<uint8_t*>(AllocDmaBuffer((net->txDepth+1)/2,net->txPhysical));
-    net->notification=static_cast<uint8_t*>(AllocDmaBuffer(1,net->notificationPhysical));
+    net->rx=static_cast<uint8_t*>(AllocDmaBuffer((net->rxDepth*ECM_RX_BYTES+4095)/4096,net->rxPhysical,PmmOwner::NetworkDma));
+    net->tx=static_cast<uint8_t*>(AllocDmaBuffer((net->txDepth+1)/2,net->txPhysical,PmmOwner::NetworkDma));
+    net->notification=static_cast<uint8_t*>(AllocDmaBuffer(1,net->notificationPhysical,PmmOwner::NetworkDma));
     uint64_t physical=0;auto* scratch=static_cast<uint8_t*>(AllocDmaBuffer(1,physical));
     if(!net->rx || !net->tx || !net->notification || !scratch)return false;
     // String 0 gives the supported language. Read exact descriptor lengths,

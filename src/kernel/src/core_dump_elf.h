@@ -18,6 +18,18 @@ struct CoreProgramHeader {
     uint32_t type,flags;
     uint64_t offset,address,physical,fileSize,memorySize,align;
 };
+struct CoreSectionHeader {
+    uint32_t name=0,type=0;
+    uint64_t flags=0,address=0,offset=0,size=0;
+    uint32_t link=0,info=0;
+    uint64_t align=0,entrySize=0;
+};
+static_assert(sizeof(CoreSectionHeader)==64);
+constexpr uint32_t CorePnXnum=0xffff;
+constexpr uint64_t CoreHeaderBytes(uint32_t count) {
+    return sizeof(CoreElfHeader)+uint64_t(count)*sizeof(CoreProgramHeader)+
+           (count>=CorePnXnum?sizeof(CoreSectionHeader):0);
+}
 static_assert(sizeof(CoreElfHeader)==64 && sizeof(CoreProgramHeader)==56);
 struct CoreNoteHeader {uint32_t nameSize,descSize,type;};
 constexpr uint32_t CoreNtStatus=1,CoreNtInfo=3,CoreNtAuxv=6,CoreNtFile=0x46494c45;
@@ -34,9 +46,18 @@ bool CoreWriteNote(Output& output,uint32_t type,const void* desc,uint32_t bytes)
 }
 
 template<class Output>
-bool CoreWriteHeader(Output& output,const CoreProgramHeader* programs,uint16_t count) {
+bool CoreWriteHeader(Output& output,const CoreProgramHeader* programs,uint32_t count) {
+    if(!count)return false;
     CoreElfHeader header;
-    header.programCount=count;
-    return output.write(&header,sizeof(header)) && output.write(programs,uint64_t(count)*sizeof(*programs));
+    CoreSectionHeader section{};
+    if(count>=CorePnXnum){
+        header.programCount=CorePnXnum;
+        header.sectionOffset=CoreHeaderBytes(count)-sizeof(section);
+        header.sectionSize=sizeof(section);
+        header.sectionCount=1;
+        section.info=count;
+    }else header.programCount=static_cast<uint16_t>(count);
+    return output.write(&header,sizeof(header)) && output.write(programs,uint64_t(count)*sizeof(*programs)) &&
+        (count<CorePnXnum || output.write(&section,sizeof(section)));
 }
 }

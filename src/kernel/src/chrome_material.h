@@ -26,12 +26,6 @@ inline uint32_t ChromePixelOver(uint32_t dst,uint32_t src){
         out|=((n+weight/2)/weight)<<shift;
     }return out;
 }
-inline uint32_t ChromeTitleColor(uint32_t base,unsigned row,unsigned height) {
-    if(!height)return base;
-    if(row>=height)row=height-1;
-    const unsigned t=height>1?255*(height-1-row)/(height-1):255;
-    return ChromeMix(ChromeMix(base,0x071526,18*(255-t)/255),0xffffff,72*t*t/(255*255));
-}
 // Small theme/scale-dependent tables, rebuilt only when their key changes.
 // Corner coverage uses 4x4 subpixels; no floating point in the renderer.
 struct ChromeCornerMask {
@@ -66,22 +60,47 @@ struct ChromeMaterialCache {
     unsigned height=0,opacity=0;
     uint32_t bases[2]{},rows[2][MaxRows]{},rims[2][3]{};
     ChromeCornerMask top,bottom;
-    bool Ensure(uint32_t active,uint32_t inactive,unsigned alpha,unsigned titleHeight,unsigned topRadius,unsigned bottomRadius) {
+    uint32_t taskbarRows[MaxRows]{};
+    unsigned taskbarHeight=0;
+    uint32_t paints[4]{};
+    bool Ensure(uint32_t active,uint32_t inactive,unsigned alpha,unsigned titleHeight,unsigned topRadius,
+                unsigned bottomRadius,const BrookThemePalette* palette=nullptr,unsigned barHeight=0) {
         active&=0xffffff;inactive&=0xffffff;
         if(titleHeight>MaxRows)titleHeight=MaxRows;
+        if(barHeight>MaxRows)barHeight=MaxRows;
         if(topRadius>ChromeCornerMask::MaxRadius)topRadius=ChromeCornerMask::MaxRadius;
         if(bottomRadius>ChromeCornerMask::MaxRadius)bottomRadius=ChromeCornerMask::MaxRadius;
-        if(valid&&bases[1]==active&&bases[0]==inactive&&opacity==alpha&&height==titleHeight&&
-           top.radius==topRadius&&bottom.radius==bottomRadius)return false;
-        valid=true;bases[1]=active;bases[0]=inactive;opacity=alpha;height=titleHeight;
+        const uint32_t colors[]={palette?palette->borderActive:active,palette?palette->borderInactive:inactive,
+                                 palette?palette->sheen:23,
+                                 palette?palette->innerHighlight:51};
+        bool same=valid&&bases[1]==active&&bases[0]==inactive&&opacity==alpha&&height==titleHeight&&
+                  taskbarHeight==barHeight&&top.radius==topRadius&&bottom.radius==bottomRadius;
+        for(unsigned i=0;i<4;++i)same=same&&paints[i]==colors[i];
+        if(same)return false;
+        valid=true;bases[1]=active;bases[0]=inactive;opacity=alpha;height=titleHeight;taskbarHeight=barHeight;
+        for(unsigned i=0;i<4;++i)paints[i]=colors[i];
         top.Build(topRadius);bottom.Build(bottomRadius);
+        auto sheen=[&](uint32_t base,unsigned y,unsigned h){
+            const unsigned length=h*3/5;
+            const unsigned amount=y<length?colors[2]*(length-y)/length:0;
+            return ChromeMix(base,0xffffff,amount);
+        };
         for(unsigned focused=0;focused<2;++focused){
-            const uint32_t base=bases[focused],rimAlpha=focused?(alpha+255)/2:alpha;
-            rims[focused][0]=(rimAlpha<<24)|ChromeMix(base,0xffffff,focused?184:0);
-            rims[focused][1]=(rimAlpha<<24)|ChromeMix(base,0xffffff,focused?88:0);
-            rims[focused][2]=(alpha<<24)|ChromeMix(base,BROOK_CHROME_SHADE,focused?64:20);
-            for(unsigned y=0;y<height;++y)
-                rows[focused][y]=(alpha<<24)|ChromeMix(base,ChromeTitleColor(base,y,height),focused?255:104);
+            const unsigned boosted=focused&&palette?alpha+20:alpha;
+            const unsigned titleAlpha=boosted>255?255:boosted;
+            const uint32_t rim=colors[focused?0:1];
+            rims[focused][0]=(titleAlpha<<24)|rim;
+            rims[focused][1]=0xff000000u|rim;
+            rims[focused][2]=0xff000000u|rim;
+            for(unsigned y=0;y<height;++y){
+                const unsigned t=focused&&height>1?255*(height-1-y)/(height-1):0;
+                const uint32_t base=ChromeMix(inactive,active,t);
+                rows[focused][y]=(titleAlpha<<24)|sheen(base,y,height);
+            }
+        }
+        for(unsigned y=0;y<taskbarHeight;++y){
+            const uint32_t rgb=y?sheen(inactive,y,taskbarHeight):ChromeMix(inactive,0xffffff,colors[3]);
+            taskbarRows[y]=(alpha<<24)|rgb;
         }
         return true;
     }
@@ -104,9 +123,10 @@ inline uint32_t ChromeMaskedRim(uint32_t fill,unsigned coverage,unsigned inner,u
 inline uint32_t ChromeShadowPixel(unsigned x,unsigned y) {
     return brook_chrome_shadow_pixel(x,y);
 }
-static constexpr unsigned ChromeGlassWindowLimit=8,ChromeShadowWindowLimit=4;
+static constexpr unsigned ChromeGlassWindowLimit=6,ChromeShadowWindowLimit=3,ChromeShadowShellLimit=2;
 // 32 clients+four decoration strips; up to six rounded backdrop bands/window;
-// eight shadow patches per eligible window; desktop/shell/cursor/boot popup.
-static_assert(32*5+ChromeGlassWindowLimit*6+ChromeShadowWindowLimit*8+9<=256,
+// Eight patches per shadow, up to ten shell blur bands (one taskbar and
+// three rounded panels), four shell surfaces, wallpaper and cursor.
+static_assert(32*5+ChromeGlassWindowLimit*6+(ChromeShadowWindowLimit+ChromeShadowShellLimit)*8+16<=256,
               "Material effects must fit the driver's frame quad budget");
 }

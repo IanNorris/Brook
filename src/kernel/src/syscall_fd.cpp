@@ -155,7 +155,11 @@ void FinalizeClosedFd(const FdClaimResult& c)
         kfree(dctx);
     }
     if(c.type==FdType::DevIntelDri && c.handle)brook::BdwGpuFileUnref(static_cast<brook::BdwGpuFile*>(c.handle));
-    if(c.type==FdType::IntelPrime && c.handle)brook::BdwGpuBufferUnref(static_cast<brook::BdwGpuBuffer*>(c.handle));
+    if(c.type==FdType::IntelPrime && c.handle){
+        auto* buffer=static_cast<brook::BdwGpuBuffer*>(c.handle);
+        brook::BdwGpuBufferTrackUserRef(buffer,brook::BdwBufferUserRef::Prime,false);
+        brook::BdwGpuBufferUnref(buffer);
+    }
     if(c.type==FdType::IntelSyncObj && c.handle)brook::BdwGpuSyncUnref(static_cast<brook::BdwGpuSync*>(c.handle));
 
     if (c.type == FdType::DevTty && c.handle)
@@ -309,8 +313,12 @@ void FdBumpRefcount(const FdEntry* fde)
         break;
     case FdType::DevIntelDri:
         brook::BdwGpuFileRef(static_cast<brook::BdwGpuFile*>(fde->handle));break;
-    case FdType::IntelPrime:
-        brook::BdwGpuBufferRef(static_cast<brook::BdwGpuBuffer*>(fde->handle));break;
+    case FdType::IntelPrime: {
+        auto* buffer=static_cast<brook::BdwGpuBuffer*>(fde->handle);
+        brook::BdwGpuBufferRef(buffer);
+        brook::BdwGpuBufferTrackUserRef(buffer,brook::BdwBufferUserRef::Prime,true);
+        break;
+    }
     case FdType::IntelSyncObj:
         brook::BdwGpuSyncRef(static_cast<brook::BdwGpuSync*>(fde->handle));break;
     case FdType::DrmPrime:

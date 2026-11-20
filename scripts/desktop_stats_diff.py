@@ -105,7 +105,7 @@ def main():
 
     p_after, p_before = after['presents'], (before or {}).get('presents')
     print('\nglobal rates (per second)')
-    for key in ('completed', 'full', 'partial', 'graphics', 'compute', 'quad', 'failed', 'stale', 'busy_retries',
+    for key in ('completed', 'full', 'partial', 'graphics', 'compute', 'quad', 'failed', 'stale', 'stale_sources', 'lease_gaps', 'busy_retries',
                 'prepare_failures', 'direct_layers'):
         value = delta(p_after, p_before, key)
         print(f'  presents.{key:<17} {value / seconds:>9.2f}/s  ({value})')

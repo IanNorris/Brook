@@ -69,6 +69,7 @@
 #include "user_copy.h"
 #include "memory/heap.h"
 #include "memory/physical_memory.h"
+#include "intel_bdw_buffer.h"
 #include "memory/oom_recovery.h"
 #include "memory/exec_page_cache.h"
 #include "memory/address_space.h"
@@ -86,6 +87,7 @@ inline void* operator new(__SIZE_TYPE__,void* storage) noexcept { return storage
 #include "loopback_queue.h"
 #include "ksym_addrs.h"
 #include "window.h"
+#include "launcher_user_manifest.h"
 #include "desktop_telemetry.h"
 #include "storage_io_stats.h"
 #include "smp.h"
@@ -5277,8 +5279,116 @@ static void DebugAudioDiagnostics()
     DebugChannelSend("]}\n");
 }
 
+static void DebugLauncherStatus()
+{
+    LauncherPersistenceStatus state;
+    WmLauncherPersistenceStatus(state);
+    BridgeReply r;
+    r.text("{\"worker\":"); r.quoted(state.worker);
+    r.text(",\"path\":"); r.quoted(state.path); r.text(",");
+    r.field("layout_epoch", state.layoutEpoch); r.text(",");
+    r.field("saved_epoch", state.savedEpoch);
+    r.text(state.pending ? ",\"pending\":true" : ",\"pending\":false");
+    r.text(state.saving ? ",\"saving\":true" : ",\"saving\":false");
+    r.text(",\"last_load\":{\"stage\":"); r.quoted(state.load.stage); r.text(",");
+    r.field("errno", -state.load.error);
+    r.text("},\"last_save\":{\"stage\":"); r.quoted(state.save.stage); r.text(",");
+    r.field("errno", -state.save.error);
+    r.text("},\"pins\":[");
+    for (uint32_t i = 0; i < state.pinCount; ++i) {
+        if (i) r.text(",");
+        r.quoted(state.pins[i]);
+    }
+    const auto user = WmLauncherUserManifestStatus();
+    r.text("],\"user_manifest\":{\"path\":"); r.quoted(UserLauncherManifestPath);
+    r.text(",\"last_load\":{\"stage\":"); r.quoted(user.load.stage); r.text(",");
+    r.field("errno", -user.load.error);
+    r.text("},"); r.field("entries", user.entries);
+    r.text(","); r.field("rejected", user.rejected);
+    r.text("}}\n");
+    r.send();
+}
+
 // Process-context only: pin completed AS identities without following a raw
 // proc->addressSpace pointer that a concurrent exec could retire.
+static void DebugMemoryBreakdown()
+{
+    constexpr unsigned ownerCapacity = 2048, topOwners = 16;
+    auto* owners = static_cast<BdwBufferOwnerUsage*>(kmalloc(sizeof(BdwBufferOwnerUsage) * ownerCapacity));
+    auto* tasks = static_cast<DebugTaskSnapshot*>(kmalloc(sizeof(DebugTaskSnapshot) * MAX_PROCESSES));
+    auto* live = static_cast<uint64_t*>(kmalloc(sizeof(uint64_t) * MAX_PROCESSES));
+    if (!owners || !tasks || !live) {
+        kfree(owners); kfree(tasks); kfree(live);
+        DebugChannelSend("{\"error\":\"memory_breakdown_allocation_failed\"}\n");
+        return;
+    }
+    memset(owners, 0, sizeof(BdwBufferOwnerUsage) * ownerCapacity);
+    memset(live, 0, sizeof(uint64_t) * MAX_PROCESSES);
+    uint32_t total = 0;
+    uint64_t begin = 0, end = 0;
+    const unsigned count = SchedulerSnapshotDebugTasks(tasks, MAX_PROCESSES, &total, &begin, &end);
+    for (unsigned i = 0; i < count; ++i) {
+        const auto& task = tasks[i];
+        if (task.tgid < MAX_PROCESSES && task.state != ProcessState::Terminated)
+            live[task.tgid] = task.groupIncarnation;
+    }
+    kfree(tasks);
+    auto* actor = ProcessCurrent();
+    if (actor) SchedulerKernelRegionEnter(actor);
+    const auto gpu = BdwGpuBufferMemorySnapshot(owners, ownerCapacity, live, MAX_PROCESSES);
+    if (actor) SchedulerKernelRegionLeave(actor);
+    kfree(live);
+    BdwBufferOwnerUsage top[topOwners]{};
+    for (unsigned i = 0; i < ownerCapacity; ++i) {
+        auto candidate = owners[i];
+        for (auto& row : top) {
+            if (candidate.bytes <= row.bytes) continue;
+            const auto previous = row;
+            row = candidate;
+            candidate = previous;
+        }
+    }
+    kfree(owners);
+    const auto memory = PmmReadOwnerStats();
+    BridgeReply r;
+    r.text("{\"version\":1,");
+    r.field("ram_pages", memory.ramPages); r.text(",");
+    r.field("free_pages", memory.freePages); r.text(",");
+    r.field("quarantined_pages", memory.quarantinedPages); r.text(",");
+    r.field("cached_pages", memory.CachedPages()); r.text(",");
+    r.field("available_pages", memory.AvailablePages()); r.text(",");
+    r.field("reclaimable_exec_cache_pages", memory.idleExecCachePages);
+    r.text(",\"classes\":{");
+    for (unsigned i = 1; i < PmmOwnerCount; ++i) {
+        if (i > 1) r.text(",");
+        r.quoted(PmmOwnerNames[i]); r.text(":{");
+        r.field("pages", memory.pages[i]); r.text(",");
+        r.field("bytes", memory.pages[i] * 4096); r.text("}");
+    }
+    r.text("},\"gpu\":{");
+    r.field("buffers", gpu.buffers); r.text(",");
+    r.field("bytes", gpu.bytes); r.text(",");
+    r.field("mapped_buffers", gpu.mappedBuffers); r.text(",");
+    r.field("mapped_bytes", gpu.mappedBytes); r.text(",");
+    r.field("unreferenced_buffers", gpu.unusedBuffers); r.text(",");
+    r.field("unreferenced_bytes", gpu.unusedBytes); r.text(",");
+    r.field("imported_buffers", gpu.importedBuffers); r.text(",");
+    r.field("imported_bytes", gpu.importedBytes); r.text(",");
+    r.field("exited_creator_buffers", gpu.exitedBuffers); r.text(",");
+    r.field("exited_creator_bytes", gpu.exitedBytes); r.text(",");
+    r.field("owner_table_overflow_buffers", gpu.unlistedOwnersBuffers);
+    r.text(",\"top_owners\":[");
+    for (unsigned i = 0; i < topOwners && top[i].buffers; ++i) {
+        if (i) r.text(",");
+        r.text("{"); r.field("pid", top[i].pid); r.text(",");
+        r.field("incarnation", top[i].incarnation); r.text(",");
+        r.text(top[i].exited ? "\"exited\":true," : "\"exited\":false,");
+        r.field("buffers", top[i].buffers); r.text(",");
+        r.field("bytes", top[i].bytes); r.text("}");
+    }
+    r.text("]}}\n"); r.send();
+}
+
 static void DebugMemoryCensus()
 {
     Process* actor=ProcessCurrent();
@@ -5790,6 +5900,8 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  sched idle-skip on|off|status - idle ticks skip the ready lock while nothing is queued (default on)\n"
             "  mem cleanup status - exec-cache release trims and PMM drain TLB barriers (rates: diff two reads)\n"
             "  mem exec-cache  - executable page sharing counters\n"
+            "  mem breakdown   - physical RAM classes and live Broadwell buffer owners\n"
+            "  launcher status - launcher layout persistence and pins\n"
             "  mem census      - rolling per-address-space mapping/RAM attribution\n"
             "  lastlog status|on|off|flush | lastlog previous OFFSET COUNT - on-disk kernel log tail + census (/nix/var/log/brook), previous boot's record\n"
             "  compat census [N (default 128, max 512)] | compat census reset - ENOSYS and unsupported ioctl/fcntl/prctl/sockopt/socket/clone/mmap/path hits, sorted by count\n"
@@ -5894,6 +6006,13 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             reply.text("{\"stage\":");reply.quoted(s.lastError.stage);
             reply.text(",");reply.field("pid",s.lastError.pid);
             reply.text(",");reply.field("errno",s.lastError.error);
+            if(s.lastError.discarded.any()){
+                const auto& losses=s.lastError.discarded;
+                reply.text(",");reply.field("dropped_file_pages",losses.filePages);
+                reply.text(",");reply.field("dropped_data_pages",losses.dataPages);
+                reply.text(",");reply.field("dropped_stack_heap_pages",losses.stackHeapPages);
+                reply.text(",");reply.field("dropped_file_notes",losses.fileNotes);
+            }
             reply.text("}");
         }else reply.text("null");
         reply.text("}\n");reply.send();
@@ -5927,6 +6046,12 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             reply.text(",");reply.field("mappings",dump.mappings);
             reply.text(",");reply.field("bytes",dump.bytes);
             reply.text(",");reply.field("holes",dump.holes);
+            if(dump.discarded.any()){
+                reply.text(",");reply.field("dropped_file_pages",dump.discarded.filePages);
+                reply.text(",");reply.field("dropped_data_pages",dump.discarded.dataPages);
+                reply.text(",");reply.field("dropped_stack_heap_pages",dump.discarded.stackHeapPages);
+                reply.text(",");reply.field("dropped_file_notes",dump.discarded.fileNotes);
+            }
             reply.text(",\"exe\":");reply.quoted(dump.executable);
         }
         reply.text(",");reply.field("duration_ms",dump.durationMs);reply.text("}\n");reply.send();
@@ -7153,7 +7278,10 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             r.text(",\"requested\":");r.text(cursor.requested?"true":"false");
             r.text(",\"bound\":");r.text(cursor.bound?"true":"false");
             r.text(",\"active\":");r.text(cursor.active?"true":"false");
+            r.text(",\"armed\":");r.text(cursor.armed?"true":"false");
+            r.text(",\"transparent_target\":");r.text(cursor.transparentTarget?"true":"false");
             r.text(",");r.field("images",cursor.images);
+            r.text(",");r.field("cached_arms",cursor.cachedArms);
             r.text(",");r.field("positions",cursor.positions);
             r.text(",");r.field("fallbacks",cursor.fallbacks);
             r.text("}\n");r.send();
@@ -7285,6 +7413,24 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         BridgeReply r;r.text("{\"requested\":");r.text(CompositorGlassRequested()?"true":"false");
         r.text(",\"active\":");r.text(CompositorGlassActive()?"true":"false");
         r.text(",\"gpu_composition\":");r.text(CompositorGpuActive()?"true":"false");
+        r.text(",\"backend_blur\":");r.text(CompositorBackendBlurActive()?"true":"false");
+        {const auto d=CompositorReadBlurDiagnostics();
+         static const char* const reasons[]={"renderer","gpu","writer_unleased","writer_revoked","foreign_writer",
+             "caps_owner_mismatch","caps_bit_clear","lease_lapsed","no_renderer"};
+         static_assert(sizeof(reasons)/sizeof(reasons[0])==uint32_t(CompositorBlurReason::Count),"blur reason names");
+         r.text(",");r.field("backend_blur_changes",d.changes);
+         r.text(",\"backend_blur_change_reasons\":{");
+         for(uint32_t i=0;i<uint32_t(CompositorBlurReason::Count);++i){if(i)r.text(",");r.field(reasons[i],d.reasons[i]);}
+         r.text("},\"backend_blur_recent\":[");bool first=true;
+         for(uint32_t k=0;k<COMPOSITOR_BLUR_CHANGE_RING;++k){
+             const auto& c=d.ring[(d.changes+k)%COMPOSITOR_BLUR_CHANGE_RING];
+             if(!c.tick || c.reason>=uint32_t(CompositorBlurReason::Count))continue;
+             if(!first)r.text(",");first=false;
+             r.text("{");r.field("tick_ms",c.tick);r.text(",\"blur\":");r.text(c.blur?"true":"false");
+             r.text(",\"reason\":\"");r.text(reasons[c.reason]);r.text("\",");r.field("leased_frame_age_ms",c.leasedFrameAgeMs);r.text("}");
+         }
+         r.text("],");r.field("cpu_frames_over_renderer",d.cpuFramesOverRenderer);
+         r.text(",");r.field("lease_live_renewals",d.leaseLiveRenewals);}
         r.text(",");r.field("appearance",WmGetAppearance());
         r.text(",");r.field("effective_opacity",CompositorGlassActive()?CompositorMaterialOpacity():255);
         r.text(",");r.field("effective_blur_strength",CompositorGlassActive()?CompositorMaterialBlur():0);
@@ -7719,6 +7865,8 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",");r.field("host_blob_quarantined",blobs.quarantined);
         r.text("}\n");r.send();
     }
+    else if (NetStrEq(cmd, "launcher status")) { DebugLauncherStatus(); }
+    else if (NetStrEq(cmd, "mem breakdown")) { DebugMemoryBreakdown(); }
     else if (NetStrEq(cmd, "mem census")) { DebugMemoryCensus(); }
     else if (NetStrEq(cmd, "mem pids")) {
         PmmDumpPidStats();

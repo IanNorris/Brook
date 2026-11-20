@@ -61,14 +61,15 @@ static void checkPopup() {
         DesktopRect icon{600,taskbarY+4,m->pixels(18),m->pixels(36)};
         auto l=TaskbarVolumePopup(*m,icon,taskbarY,screenW,m->pixels(36));
         CHECK(std::abs((l.panel.x+l.panel.w/2)-(icon.x+icon.w/2))<=1);
-        CHECK(l.panel.y+l.panel.h<=taskbarY);
+        CHECK(l.panel.w==m->pixels(304) && l.panel.y+l.panel.h+m->pixels(8)==taskbarY);
+        CHECK(l.title.y+l.title.h<=l.track.y && l.thumbSize==m->pixels(20));
         icon.x=screenW-m->pixels(20);
         l=TaskbarVolumePopup(*m,icon,taskbarY,screenW,m->pixels(36));
         CHECK(l.panel.x+l.panel.w<=screenW);
         CHECK(l.track.w>0 && l.mute.x+l.mute.w<l.track.x && l.track.x+l.track.w<l.value.x);
         CHECK(TaskbarVolumePopupHit(*m,l,l.mute.x+1,l.mute.y+1)==TaskbarVolumeHit::Mute);
         CHECK(TaskbarVolumePopupHit(*m,l,l.track.x+l.track.w/2,l.track.y+l.track.h/2)==TaskbarVolumeHit::Slider);
-        CHECK(TaskbarVolumePopupHit(*m,l,l.track.x-2,l.track.y+1)==TaskbarVolumeHit::Slider); // knob overhang
+        CHECK(TaskbarVolumePopupHit(*m,l,l.track.x-l.thumbSize/2,l.track.y+1)==TaskbarVolumeHit::Slider); // knob overhang
         CHECK(TaskbarVolumePopupHit(*m,l,l.panel.x+l.panel.w-2,l.panel.y+1)==TaskbarVolumeHit::Panel);
         CHECK(TaskbarVolumePopupHit(*m,l,l.panel.x-1,l.panel.y)==TaskbarVolumeHit::Outside);
         CHECK(TaskbarVolumePopupHit(*m,l,icon.x+1,icon.y+1)==TaskbarVolumeHit::Outside); // icon closes
@@ -81,7 +82,7 @@ static void checkPopup() {
               TaskbarVolumePopup(*m,icon,taskbarY,screenW,m->pixels(36)).panel.y);
         // Narrow screens keep the left margin.
         l=TaskbarVolumePopup(*m,{0,taskbarY,10,10},taskbarY,screenW,m->pixels(36));
-        CHECK(l.panel.x==m->pixels(4));
+        CHECK(l.panel.x==m->pixels(8));
     }
 }
 

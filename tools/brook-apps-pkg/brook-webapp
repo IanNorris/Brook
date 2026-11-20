@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""Install a website as a Brook app: its own window (Chromium --app), a
+launcher entry with the site's icon, and a taskbar identity.
+
+  brook-webapp add URL [--name NAME] [--category CATEGORY]
+  brook-webapp list
+  brook-webapp remove APP_ID
+"""
+import argparse
+import html.parser
+import json
+import os
+import sys
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+import brook_apps
+
+PREFIX = 'brook-webapp-'
+USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) BrookWebApp/1.0'
+CATEGORIES = {'chat': 'Network;Chat;InstantMessaging;', 'internet': 'Network;WebBrowser;',
+              'office': 'Office;', 'media': 'AudioVideo;', 'games': 'Game;',
+              'graphics': 'Graphics;', 'system': 'System;'}
+
+
+def fetch(url, limit=4 << 20):
+    req = urllib.request.Request(url, headers={'User-Agent': USER_AGENT})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return r.geturl(), r.read(limit), r.headers.get_content_type()
+
+
+class Head(html.parser.HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.title, self.manifest, self.icons, self._in_title = '', None, [], False
+
+    def handle_starttag(self, tag, attrs):
+        a = {k.lower(): (v or '') for k, v in attrs}
+        rel = a.get('rel', '').lower().split()
+        if tag == 'link' and 'manifest' in rel and a.get('href'):
+            self.manifest = a['href']
+        elif tag == 'link' and a.get('href') and ({'icon', 'apple-touch-icon'} & set(rel)):
+            self.icons.append({'src': a['href'], 'sizes': a.get('sizes', ''), 'type': a.get('type', '')})
+        elif tag == 'title':
+            self._in_title = True
+
+    def handle_endtag(self, tag):
+        if tag == 'title':
+            self._in_title = False
+
+    def handle_data(self, data):
+        if self._in_title:
+            self.title += data
+
+
+def icon_score(icon):
+    sizes = icon.get('sizes', '').lower()
+    if 'any' in sizes or icon.get('src', '').lower().endswith('.svg'):
+        return 1000
+    best = 0
+    for s in sizes.split():
+        w = s.split('x')[0]
+        if w.isdigit():
+            best = max(best, int(w))
+    if 'maskable' in icon.get('purpose', '') and 'any' not in icon.get('purpose', ''):
+        best //= 2   # maskable art is padded for cropping; prefer "any"
+    return best or 16
+
+
+def chromium_app_id(url):
+    """The Wayland app_id Chromium gives a --app=URL window in the Default
+    profile: chrome-<host>_<path with '/' as '_'>-Default."""
+    u = urllib.parse.urlsplit(url)
+    return ('chrome-' + u.hostname + '_' + (u.path or '/')).replace('/', '_') + '-Default'
+
+
+def discover(url):
+    final, body, ctype = fetch(url)
+    head = Head()
+    if ctype == 'text/html':
+        head.feed(body.decode('utf-8', 'replace'))
+    name, start, icons = head.title.strip(), final, [dict(i, src=urllib.parse.urljoin(final, i['src'])) for i in head.icons]
+    if head.manifest:
+        murl = urllib.parse.urljoin(final, head.manifest)
+        try:
+            _, mbody, _ = fetch(murl)
+            m = json.loads(mbody.decode('utf-8', 'replace'))
+            name = m.get('short_name') or m.get('name') or name
+            if m.get('start_url'):
+                start = urllib.parse.urljoin(murl, m['start_url'])
+            icons = [dict(i, src=urllib.parse.urljoin(murl, i['src'])) for i in m.get('icons', []) if i.get('src')] + icons
+        except Exception as e:
+            print(f'brook-webapp: manifest unavailable ({e}); using the page', file=sys.stderr)
+    if not icons:
+        icons = [{'src': urllib.parse.urljoin(final, '/favicon.ico'), 'sizes': '16x16'}]
+    return name or urllib.parse.urlsplit(final).hostname, start, sorted(icons, key=icon_score, reverse=True)
+
+
+def save_icon(icons, slug):
+    """Store the best decodable icon as a hicolor app icon; its name."""
+    import io
+    from PIL import Image
+    for icon in icons:
+        try:
+            _, data, _ = fetch(icon['src'])
+        except Exception:
+            continue
+        svg = icon['src'].lower().split('?')[0].endswith('.svg') or data.lstrip()[:5] in (b'<svg ', b'<?xml')
+        if svg:
+            target = brook_apps.data_home() / 'icons/hicolor/scalable/apps' / (slug + '.svg')
+        else:
+            try:
+                img = Image.open(io.BytesIO(data)).convert('RGBA')
+            except Exception:
+                continue
+            if img.width > 512:
+                img = img.resize((512, 512), Image.Resampling.LANCZOS)
+            size = f'{img.width}x{img.height}'
+            target = brook_apps.data_home() / 'icons/hicolor' / size / 'apps' / (slug + '.png')
+            buf = io.BytesIO()
+            img.save(buf, 'PNG')
+            data = buf.getvalue()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        return slug
+    return ''
+
+
+def add(url, name=None, category=None):
+    if '://' not in url:
+        url = 'https://' + url
+    if urllib.parse.urlsplit(url).scheme not in ('http', 'https'):
+        raise SystemExit('brook-webapp: only http(s) URLs')
+    title, start, icons = discover(url)
+    name = brook_apps.clean_field(name or title)
+    app_id = chromium_app_id(start)
+    slug = PREFIX + brook_apps.safe_name(urllib.parse.urlsplit(start).hostname or name)
+    icon = save_icon(icons, slug)
+    categories = CATEGORIES.get((category or '').lower(), 'Network;')
+    if any(ch in start for ch in ' "\'\\`') or any(ord(ch) < 0x21 or ord(ch) > 0x7e for ch in start):
+        start = urllib.parse.quote(start, safe=":/?#[]@!$&()*+,;=%-._~")
+    desktop = brook_apps.data_home() / 'applications' / (slug + '.desktop')
+    desktop.parent.mkdir(parents=True, exist_ok=True)
+    desktop.write_text('[Desktop Entry]\nType=Application\n'
+                       f'Name={name}\nExec=brook-chromium --app={start}\n'
+                       f'Icon={icon}\nCategories={categories}\nStartupWMClass={app_id}\n'
+                       f'X-Brook-WebApp={start}\n')
+    lines, icon_data, _ = brook_apps.build_index()
+    if brook_apps.write_index(lines, icon_data):
+        brook_apps.notify()
+    print(f'Installed {name} ({app_id})')
+
+
+def installed():
+    for path in sorted((brook_apps.data_home() / 'applications').glob(PREFIX + '*.desktop')):
+        e = brook_apps.parse_desktop(path)
+        if e:
+            yield path, e
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    p = sub.add_parser('add'); p.add_argument('url'); p.add_argument('--name'); p.add_argument('--category')
+    sub.add_parser('list')
+    p = sub.add_parser('remove'); p.add_argument('app')
+    a = ap.parse_args()
+    if a.cmd == 'add':
+        add(a.url, a.name, a.category)
+    elif a.cmd == 'list':
+        for path, e in installed():
+            print(f"{e['wmclass']}\t{e['name']}\t{e['exec']}")
+    else:
+        hit = [p for p, e in installed() if a.app in (e['wmclass'], e['id'], e['name'])]
+        if not hit:
+            raise SystemExit(f'brook-webapp: no web app {a.app}')
+        for path in hit:
+            path.unlink()
+        lines, icon_data, _ = brook_apps.build_index()
+        if brook_apps.write_index(lines, icon_data):
+            brook_apps.notify()
+        print(f'Removed {a.app}')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

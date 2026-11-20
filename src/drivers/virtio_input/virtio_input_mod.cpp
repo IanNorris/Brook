@@ -316,7 +316,8 @@ static void ProcessEvent(const VirtioInputEvent& ev)
             InputEvent ie{};
             ie.type = InputEventType::MouseScroll;
             ie.scanCode = 0;
-            ie.ascii    = static_cast<uint8_t>(ev.code == 8 ? 1 : -1);
+            ie.ascii    = static_cast<char>(ev.code == 8 ? 1 : -1);
+            ie.deltaX   = ev.code == 8 ? 120 : -120;
             ie.modifiers = MouseGetButtons();
             InputDevicePush(&g_inputDev, ie);
             InputWakeWaiters();
@@ -367,7 +368,9 @@ static void ProcessEvent(const VirtioInputEvent& ev)
         InputEvent ie{};
         ie.type = InputEventType::MouseScroll;
         ie.scanCode = static_cast<uint8_t>(dy);
-        ie.ascii    = static_cast<uint8_t>(dx);
+        ie.ascii    = static_cast<char>(dx);
+        ie.deltaY   = int32_t(dy) * 120;
+        ie.deltaX   = int32_t(dx) * 120;
         ie.modifiers = MouseGetButtons();
         InputDevicePush(&g_inputDev, ie);
         InputWakeWaiters();

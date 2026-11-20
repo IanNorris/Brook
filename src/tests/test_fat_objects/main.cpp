@@ -71,6 +71,9 @@ extern "C" void kfree(void* p){if(p){std::lock_guard<std::mutex> lock(allocation
 void KMutexInit(KMutex* mutex){*mutex={};}
 void KMutexLock(KMutex*){fatMutex.lock();}
 void KMutexUnlock(KMutex*){fatMutex.unlock();}
+VirtualAddress VmmAllocPagesAccounted(uint64_t n,uint64_t flags,MemTag tag,uint16_t pid,PmmOwner) {
+    return VmmAllocPages(n,flags,tag,pid);
+}
 VirtualAddress VmmAllocPages(uint64_t count,uint64_t,MemTag,uint16_t){
     void* p=nullptr;if(posix_memalign(&p,4096,count*4096))return VirtualAddress{};
     {std::lock_guard<std::mutex> lock(allocationMutex);pages.insert(p);}return VirtualAddress(reinterpret_cast<uint64_t>(p));

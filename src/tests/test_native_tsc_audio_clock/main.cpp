@@ -9,6 +9,9 @@ int main(){
     auto o=good();NativeTscAudioClock clock;assert(clock.init(o,4,100));uint64_t ns=0;
     assert(clock.read(0,100,ns) && ns==1);assert(clock.read(3,2400100,ns) && ns==1000001);
     assert(!clock.read(2,2400099,ns) && clock.failed() && !clock.read(0,2500000,ns));
+    // First failure is retained: a one-tick cross-CPU step backwards.
+    assert(clock.failReason()==NativeTscAudioClock::FailBackwards && clock.failCpu()==2 && clock.lastCpu()==3 &&
+           clock.failLast()-clock.failTsc()==1 && clock.khz()==2400000);
     for(unsigned i=0;i<11;++i){auto bad=good();switch(i){case 0:bad.capable=false;break;case 1:bad.consistent=false;break;
         case 2:bad.coreCount=2;break;case 3:bad.cores[1].cpu=1;break;case 4:bad.cores[2].exchanges=4;break;
         case 5:bad.cores[0].result=NativeTscExchangeResult::Timeout;break;case 6:bad.cores[0].interval.lower=-24001;break;
@@ -16,7 +19,7 @@ int main(){
         case 9:bad.measured=false;break;case 10:bad.cores[0].interval.upper=24001;break;}
         NativeTscAudioClock c;assert(!c.init(bad,4,100));}
     auto edge=good();edge.cores[0].interval={-24000,24000,240000};NativeTscAudioClock exact;assert(exact.init(edge,4,100));
-    NativeTscAudioClock badCpu;assert(badCpu.init(o,4,100));assert(!badCpu.read(4,200,ns) && badCpu.failed());
+    NativeTscAudioClock badCpu;assert(badCpu.init(o,4,100));assert(!badCpu.read(4,200,ns) && badCpu.failed() && badCpu.failReason()==NativeTscAudioClock::FailCpu);
     NativeTscObservation single=good();single.coreExpected=single.coreCount=0;NativeTscAudioClock one;
     assert(one.init(single,1,100) && one.read(0,101,ns));
     NativeTscAudioClock overflow;assert(overflow.init(single,1,1));ns=77;

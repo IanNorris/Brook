@@ -1,4 +1,5 @@
 # title: Text Editor
 # Requires: /nix/bin/brook-edit
 # desc: Simple text editor - open, edit, save
+# category: office
 source /boot/SCRIPTS/wayland_edit.rc

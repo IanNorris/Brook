@@ -40,9 +40,16 @@ struct CoreProcessNote {
 };
 static_assert(sizeof(CoreProcessNote)==136);
 
+struct CoreDumpDiscarded {
+    uint64_t filePages=0,dataPages=0,stackHeapPages=0;
+    uint32_t fileNotes=0;
+    bool any() const { return filePages || dataPages || stackHeapPages || fileNotes; }
+};
+
 struct CoreDumpResult {
     uint64_t bytes=0,holes=0,durationMs=0;
     uint32_t threads=0,missingRegisters=0,mappings=0;
+    CoreDumpDiscarded discarded{};
     char executable[256]{};
     const char* stage="snapshot";
 };

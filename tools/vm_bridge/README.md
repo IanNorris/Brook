@@ -816,6 +816,48 @@ it does not require the bulk helper or write to the guest. The recovery image
 must include an appropriate network module, and availability on a particular
 physical machine must be verified separately.
 
+### Hardware screenshots and window capture
+
+`hw_transfer action=frame` returns what the panel actually shows. On Dell
+builds with the Broadwell flip paths the kernel reads primary plane A's live
+surface (`DSPASURFLIVE`) and copies that buffer: a zero-copy renderer image, a
+kernel flip buffer or a direct-scanout client buffer (X-tiled surfaces are
+detiled). Only when the plane is on the firmware GOP does it copy the GOP
+framebuffer, which then holds either the CPU composition or a renderer frame
+the BCS copied there. The copied image is held off the display queue for the
+copy (~10-30 ms for 3200x1800, presents are mailboxed meanwhile), so it cannot
+be rewritten mid-copy; if it leaves the panel anyway the capture retries at
+the next compositor frame. `transfer.payload`/`frame` report:
+
+| Field | Meaning |
+| --- | --- |
+| `source` | `gpu-present` (renderer frame: zero-copy, flip buffer or BCS copy into the GOP), `cpu-backbuffer` (kernel CPU composition in the GOP), `direct-client`, `window-buffer`, `legacy-gpu`; `null` with an older guest helper |
+| `scanout` | buffer the plane was fetching: `zero-copy`, `kernel-flip`, `direct-client`, `gop`, `unknown` (GOP copied instead), `unverified` (no plane readback: QEMU, non-flip builds) |
+| `cursor_composited`, `detiled`, `scanout_surface`, `copy_us` | provenance details |
+
+Options (frame only):
+
+- `cursor: true` composites the hardware cursor plane over the image (off by
+  default; a software cursor is always part of the pixels).
+- `window`: an exact reference from `hw_windows`. `artifact_path` becomes
+  `window.png`, a crop of the screen capture; `screenshot.png` keeps the full
+  frame. The window geometry is a snapshot taken just before the capture (not
+  atomic with it).
+- `window_area`: `frame` (default, outer rectangle including chrome), `client`
+  (on-screen client area, may be occluded) or `buffer` (the window's own
+  current CPU buffer, unoccluded, at buffer resolution; refused for
+  GPU-published windows). `buffer` and `cursor` need the guest helper from a
+  pair built by `scripts/build_dell_image.py` at or after `work/hw-capture`
+  (it embeds `/boot/HWBULK.ELF` from `tools/hardware_bulk.c`).
+
+```json
+{"session":"S","request_id":"<32 hex>","action":"frame","key_file":"K","output":"/tmp/shot"}
+{"session":"S","request_id":"<32 hex>","action":"frame","key_file":"K","output":"/tmp/win","window":{"window_id":3,"incarnation":"41","session_generation":"G","guest_boot_id":"B"}}
+```
+
+`vm_observe` accepts the same `window` and `window_area` (`frame`/`client`)
+for QEMU guests.
+
 `hw_doctor` explicitly reports unavailable QMP, raw input, framebuffer transfer,
 registers, raw memory and post-panic transport. A lost TCP connection is not proof
 of panic. Current hardware panics halt CPUs; retain the optical panic scanner.

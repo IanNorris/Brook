@@ -11,6 +11,7 @@
 #include <set>
 #include <vector>
 #include "memory/mapping_ranges.h"
+#include "memory/resident_pages.h"
 
 using namespace brook;
 namespace {
@@ -308,8 +309,25 @@ static void forkInsertionBenchmark() {
     MappingRangeDestroy(table);assert(!allocations);
     std::printf("MAPPING_FORK_INSERT_BENCH ranges=%u elapsed_ns=%lld\n",Count,(long long)ns);
 }
+static void residentPageBreakdown()
+{
+    auto range = anonymous(0x1000, 0x15000);
+    ResidentPages pages;
+    pages.Add(range, 4); // only faulted-in pages count
+    range.kind = MappingKind::Heap; pages.Add(range, 2);
+    range.kind = MappingKind::Stack; pages.Add(range, 1);
+    range.kind = MappingKind::File; pages.Add(range, 6);
+    range.kind = MappingKind::Image; pages.Add(range, 3);
+    range.kind = MappingKind::MemFd; pages.Add(range, 8);
+    range.kind = MappingKind::Device;
+    assert(!ResidentPages::ChargesRss(range));
+    pages.Add(range, 20);
+    assert(pages.virtualPages == 7 * 20);
+    assert(pages.anonymous == 7 && pages.file == 9 && pages.shared == 8 && pages.Total() == 24);
+}
+
 int main(int argc,char** argv) {
     if(argc==2 && !std::strcmp(argv[1],"--benchmark")){forkInsertionBenchmark();return 0;}
-    rejectedInsertions(); orderedAndDeletion(); mixedEdits(); backingAndExtend(); backedTransplant(); failedEditsAndReuse();
+    residentPageBreakdown(); rejectedInsertions(); orderedAndDeletion(); mixedEdits(); backingAndExtend(); backedTransplant(); failedEditsAndReuse();
     std::puts("MAPPING_RANGE_INDEX_PASS ordered/random rotations, edits, lookup oracle, OOM, backing lifetime");
 }

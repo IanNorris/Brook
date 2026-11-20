@@ -9,6 +9,7 @@
 #include "memory/mapping_transaction.h"
 #include "compositor.h"
 #include "window.h"
+#include "desktop_identity.h"
 #include "gpu_compositor.h"
 #include "user_copy.h"
 #include "syscall_internal.h"
@@ -16,6 +17,7 @@
 #include "syscall_drm.h"
 #include "syscall_memory.h"
 #include "syscall_handlers.h"
+#include "../../shared/wm_input_abi.h"
 
 namespace brook {
 
@@ -36,6 +38,7 @@ namespace brook {
 //          bit 0 requests initial client-side decoration/noChrome
 //          bit 1 creates a raised but non-keyboard-focusable popup/tool window
 //          bit 2 identifies this process itself as the native application client
+//          bit 3 opts into fine scroll in WM_POP_INPUT
 // Returns 0 on success, -errno on failure.
 struct BrookWmCreateOut {
     uint32_t wmId;
@@ -75,7 +78,7 @@ int64_t sys_brook_wm_create_window(uint64_t cW, uint64_t cH,
         if (int64_t error = CopyWindowTitle(titlePtr, titleBuf)) return error;
     }
 
-    if (flags & ~7ull) return -EINVAL;
+    if (flags & ~(7ull | BROOK_WM_CREATE_FLAG_FINE_SCROLL)) return -EINVAL;
     // Check the result buffer before creating anything; a raced unmap after
     // creation is rolled back below.
     if (!UserBufferWritable(outPtr, sizeof(BrookWmCreateOut))) return -EFAULT;
@@ -84,7 +87,8 @@ int64_t sys_brook_wm_create_window(uint64_t cW, uint64_t cH,
                                                  static_cast<uint16_t>(cW),
                                                  static_cast<uint16_t>(cH),
                                                  titlePtr ? titleBuf : nullptr,
-                                                 focusable, (flags & 4u) != 0);
+                                                 focusable, (flags & 4u) != 0,
+                                                 (flags & BROOK_WM_CREATE_FLAG_FINE_SCROLL) != 0);
     if (res.wmId == 0) return -ENOMEM;
     if (flags & 1u) {
         brook::WmSetClientSideDecoration(static_cast<int>(res.wmId) - 1, true);
@@ -217,18 +221,41 @@ int64_t sys_brook_wm_window_state(uint64_t window, uint64_t incarnation,
 int64_t sys_brook_wm_refresh_apps(uint64_t, uint64_t, uint64_t,
                                  uint64_t, uint64_t, uint64_t)
 {
-    if (!ProcessCurrent()) return -ESRCH;
-    brook::WmRequestLauncherRefresh();
+    auto* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    KernelOperationGuard operation(proc);
+    const auto uid = ProcessReadIds(proc, false).effective;
+    if (uid == DesktopUid) WmRequestUserLauncherRefresh();
+    else if (!uid && !proc->userNamespace) WmRequestLauncherRefresh();
+    else return -EPERM;
     return 0;
 }
 
-// 0xB02: desktop theme query (op 0) or select immutable named palette (op 1).
+// 0xB02: desktop theme (brook_theme.h). Ops 0/1: the legacy palette id
+// (query; set chooses its hue). Ops 2/3: the Clearwater selection word
+// (theme, mode, hue). Ops 6/7 support independent material and custom RGB.
 int64_t sys_brook_wm_theme(uint64_t op, uint64_t theme,
                           uint64_t, uint64_t, uint64_t, uint64_t)
 {
     if (!ProcessCurrent()) return -ESRCH;
-    if (op == 0) return brook::WmGetTheme();
-    if (op != 1 || theme > 0xffffffffULL) return -EINVAL;
+    if (op == BROOK_THEME_OP_LEGACY_QUERY) return brook_hue_legacy_palette(brook_selection_hue(brook::WmGetThemeSelection()));
+    if (op == BROOK_THEME_OP_MATERIAL_QUERY) return brook::WmGetThemeSelection();
+    if (op == BROOK_THEME_OP_MATERIAL_SET) return brook::WmSetThemeSelection(theme) ? 0 : -EINVAL;
+    if (op == BROOK_THEME_OP_QUERY) return brook_selection_legacy(brook::WmGetThemeSelection());
+    if (op == BROOK_THEME_OP_SET) {
+        uint64_t selection;
+        return brook_selection_from_legacy(theme,&selection) && brook::WmSetThemeSelection(selection) ? 0 : -EINVAL;
+    }
+    if (op == BROOK_THEME_OP_STATUS)
+        return (brook::WmBackendBlur() ? BROOK_THEME_STATUS_GLASS_AVAILABLE : 0u) |
+               (brook::CompositorGlassActive() ? BROOK_THEME_STATUS_GLASS_ACTIVE : 0u);
+    // Stage 2.3: one app content colour of the theme in use (hue, and the
+    // content mode it resolves to), for GTK and native apps.
+    if (op == BROOK_THEME_OP_CONTENT) {
+        if (theme >= BROOK_CONTENT_COUNT) return -EINVAL;
+        return brook::WmContentColour(static_cast<unsigned>(theme));
+    }
+    if (op != BROOK_THEME_OP_LEGACY_SET || theme > 0xffffffffULL) return -EINVAL;
     return brook::WmSetTheme(static_cast<uint32_t>(theme)) ? 0 : -EINVAL;
 }
 
@@ -592,7 +619,8 @@ int64_t sys_brook_wm_set_cursor_visible(uint64_t visible, uint64_t,
 // `owner` is BROOK_CURSOR_OWNER_TAG | wmId of the caller's window the cursor
 // was set for; the image is then shown only over that window's client area.
 // Without the tag (older providers pass whatever is in the register) the
-// image is owned by the window hovered now.
+// image is owned by the window hovered now, if that window is the caller's;
+// otherwise it has no owner and is never shown.
 static constexpr uint64_t kCursorOwnerTag = 0xC5C50000ull << 32;
 int64_t sys_brook_wm_set_cursor_image(uint64_t pixelsAddr, uint64_t w,
                                        uint64_t h, uint64_t hotX,
@@ -637,7 +665,7 @@ int64_t sys_brook_wm_set_cursor_image(uint64_t pixelsAddr, uint64_t w,
         }
         KMutexUnlock(&proc->addressSpace->mutation);
     }
-    uint64_t owner = brook::WmPointerHoverIdentity();
+    uint64_t owner = brook::WmPointerHoverIdentityOf(proc);
     if ((ownerArg & ~0xFFFFull) == kCursorOwnerTag) {
         // A tagged wmId that is not the caller's (closed meanwhile) keeps the
         // image unowned rather than attaching it to an unrelated window.
