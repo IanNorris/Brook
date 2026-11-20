@@ -729,13 +729,16 @@ void Worker(void* arg) {
     if(!AhciSystemGuardTestBeginCompletion(adapter,identityOk)) {
         KPuts("GUARD_COMPLETE_INCOMPLETE authorization\n");return;
     }
-    const int complete=FatFsPrivateRecoveryTestComplete(mount,identity,records[0],completeFail);
 #if defined(BROOK_SSD_AUTO_RECOVERY)
-    if(complete==2 && profileValid) {
+    if(profileValid) {
+        // Publish the durable retry while a pending guard still blocks desktop
+        // admission. If interrupted, recovery resumes without charging a slot.
         const int retryStatus=FatFsPrivateRecoveryRetryRepairedProfile(mount,rejectedProfile);
         KPrintf("GUARD_SLOT_PROFILE_RETRY status=%d\n",retryStatus);
+        if(retryStatus) {AhciSystemGuardTestFinish(adapter);return;}
     }
 #endif
+    const int complete=FatFsPrivateRecoveryTestComplete(mount,identity,records[0],completeFail);
     AhciSystemGuardTestFinish(adapter);
     if(FatFsPrivateRecoveryTestComplete(mount,identity,records[0],completeFail)!=0) {
         KPuts("GUARD_COMPLETE_INCOMPLETE repeated\n");return;

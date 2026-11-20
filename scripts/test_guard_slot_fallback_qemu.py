@@ -29,7 +29,7 @@ NATIVE_CLIENT = '/boot/GDFRAME.ELF'
 NATIVE_FRAMES = 'GUARD_NATIVE_FRAMES_PASS'
 RECOVERY_USB = 'Recovery payload invalid or missing; use a recovery USB.'
 SLOT_CASES = ('fallback', 'confirmed', 'exhausted', 'profile-rejected', 'profile-repaired',
-              'profile-both-repaired', 'early-restart', 'checked-early-restart', 'post-init-panic',
+              'profile-both-repaired', 'profile-retry-interrupted', 'early-restart', 'checked-early-restart', 'post-init-panic',
               'zero-journal', 'emergency', 'legacy-loader')
 
 
@@ -205,6 +205,22 @@ def post_init_panic(kernel, work):
     return gdb
 
 
+def interrupt_profile_completion(kernel, work):
+    symbols = subprocess.check_output(['nm', '-C', str(kernel)], text=True)
+    pattern = r'^([0-9a-f]+) T brook::FatFsPrivateRecoveryTestComplete\([^\n]*\)$'
+    matches = re.findall(pattern, symbols, re.MULTILINE)
+    if len(matches) != 1:
+        raise RuntimeError('missing guard completion breakpoint')
+    # Exit the disposable QEMU at entry, before any Clean record can be written.
+    gdb = work / 'interrupt-profile-completion.gdb'
+    gdb.write_text('set pagination off\nset confirm off\nset architecture i386:x86-64\n'
+                   f'target remote {work / "gdb.sock"}\nhbreak *0x{matches[0]}\ncontinue\n'
+                   'printf "GUARD_QEMU_CUT_BEFORE_CLEAN\\n"\n'
+                   'python\ntry:\n    gdb.execute("monitor quit")\n'
+                   'except gdb.error:\n    pass\nend\n')
+    return gdb
+
+
 def copy_boot_logs(work, prefix):
     for kind in ('serial', 'qemu'):
         artifact = work / (kind + '.log')
@@ -286,6 +302,12 @@ def run_matrix(a, base_disk, normal, work, guards, metadata, panic_journal):
     bad_b_second = (1, 2, 'failure', [blank, b2])
     recovery = (None, None, 'recovery')
     repair = (None, None, 'repair')
+    both_rejected = [
+        (1, 1, 'profile', [blank, failed_b_profile]), (*repair, [blank, failed_b_profile]),
+        (0, 1, 'profile', [failed_a_profile, failed_b_profile]),
+        (None, None, 'repair-malformed-profile', [failed_a_profile, failed_b_profile]),
+        (*recovery, [failed_a_profile, failed_b_profile]),
+    ]
     scenarios = (
         ('fallback', (framed, bad), False, [bad_b_first, bad_b_second, (0, 1, 'success', [a0, b2])]),
         ('confirmed', (normal, framed), True, [(1, 2, 'success', [blank, b0])]),
@@ -300,11 +322,10 @@ def run_matrix(a, base_disk, normal, work, guards, metadata, panic_journal):
                                                        (*repair, [blank, failed_b_profile]),
                                                        (0, 1, 'success', [a0, b2])]),
         ('profile-both-repaired', (framed, normal), False, [
-            (1, 1, 'profile', [blank, failed_b_profile]), (*repair, [blank, failed_b_profile]),
-            (0, 1, 'profile', [failed_a_profile, failed_b_profile]),
-            (None, None, 'repair-malformed-profile', [failed_a_profile, failed_b_profile]),
-            (*recovery, [failed_a_profile, failed_b_profile]),
-            (None, None, 'repair-profile', [a1, b2]), (0, 2, 'success', [a0, b2])]),
+            *both_rejected, (None, None, 'repair-profile', [a1, b2]), (0, 2, 'success', [a0, b2])]),
+        ('profile-retry-interrupted', (framed, normal), False, [
+            *both_rejected, (None, None, 'cut-profile-retry', [a1, b2]),
+            (None, None, 'resume-profile', [a1, b2]), (0, 2, 'success', [a0, b2])]),
         ('early-restart', (normal, normal), False, [(1, 1, 'early-restart', [blank, b1])]),
         ('checked-early-restart', (normal, framed), True, [(1, 2, 'checked-early-restart', [blank, b1])]),
         ('post-init-panic', (normal, normal), False, [(1, 1, 'panic', [blank, b1]), (*repair, [blank, b1])]),
@@ -316,7 +337,7 @@ def run_matrix(a, base_disk, normal, work, guards, metadata, panic_journal):
         if a.slot_fallback_case:
             if name not in a.slot_fallback_case:
                 continue
-        elif name in ('legacy-loader', 'profile-both-repaired'):
+        elif name in ('legacy-loader', 'profile-both-repaired', 'profile-retry-interrupted'):
             # These cases require an explicitly selected loader or recovery pair.
             continue
         scenario = work / name
@@ -324,7 +345,7 @@ def run_matrix(a, base_disk, normal, work, guards, metadata, panic_journal):
         disk = scenario / 'disk.raw'
         shutil.copyfile(base_disk, disk)
         media = str(disk) + '@@1048576'
-        if name in ('profile-rejected', 'profile-repaired', 'profile-both-repaired'):
+        if name.startswith('profile-'):
             edit_profile_index(disk, scenario)
         for directory in ('UPDATES', 'UPDATES/A', 'UPDATES/B'):
             subprocess.run(['mmd', '-i', media, '::/' + directory], check=True)
@@ -365,9 +386,10 @@ def run_matrix(a, base_disk, normal, work, guards, metadata, panic_journal):
         for i, (slot, count, result, expected) in enumerate(starts, 1):
             step = scenario / f'b{i}'
             step.mkdir()
-            if (name == 'profile-repaired' and result == 'success') or result == 'repair-profile':
+            profile_retry = result in ('repair-profile', 'cut-profile-retry')
+            if (name == 'profile-repaired' and result == 'success') or profile_retry:
                 edit_profile_index(disk, scenario, restore=work / 'placeholder')
-            if result == 'repair-profile':
+            if profile_retry:
                 # The operator restored the missing file offline. Force the
                 # next boot through guarded repair before it can retry a slot.
                 with disk.open('r+b') as volume:
@@ -379,8 +401,8 @@ def run_matrix(a, base_disk, normal, work, guards, metadata, panic_journal):
             health_wait = f'GUARD_SLOT_HEALTH_WAIT {key} window_ms={HEALTH_WINDOW_MS}'
             early_restart = result in ('early-restart', 'checked-early-restart')
             qualifying_frames = result in ('success', 'checked-early-restart')
-            repairing = result in ('repair', 'repair-profile', 'repair-malformed-profile')
-            reset = repairing or result in ('failure', 'panic') or early_restart
+            repairing = result in ('repair', 'repair-profile', 'repair-malformed-profile', 'resume-profile')
+            reset = repairing or result in ('failure', 'panic', 'cut-profile-retry') or early_restart
             evidence = 'GUARD_COMPLETE_RESTART' if repairing else CLEAN_RESET
             failure_marker = '*** KERNEL PANIC ***'
             gdb_script = on_marker = on_intermediate = intermediate = port = None
@@ -420,9 +442,14 @@ def run_matrix(a, base_disk, normal, work, guards, metadata, panic_journal):
             elif result == 'profile':
                 marker = 'GUARD_DESKTOP_HANDOFF_FAILED status=-5 shared_profile_rejected=1'
                 sequence += 2
+            elif result == 'cut-profile-retry':
+                marker = 'GUARD_EXT2_VERIFIED_PENDING'
+                evidence = 'GUARD_SLOT_PROFILE_RETRY status=0'
+                gdb_script = interrupt_profile_completion(a.recovery_pair / 'KERNEL.ELF', step)
+                sequence += 1
             elif repairing:
                 marker = 'GUARD_COMPLETE_RESTART'
-                if result == 'repair-profile':
+                if profile_retry:
                     sequence += 1
             elif result == 'recovery':
                 marker = 'GUARD_AUTO_NO_REPAIR'
@@ -476,7 +503,8 @@ def run_matrix(a, base_disk, normal, work, guards, metadata, panic_journal):
             if result == 'profile' and (f'GUARD_SLOT_PROFILE_REJECTED status=0 {key}' not in serial or
                                         'GUARD_SLOT_RESTART' in serial or 'GUARD_DESKTOP_HANDOFF_SCRIPT' in serial):
                 raise RuntimeError(f'{name}-{i}: shared profile rejection entered a slot-specific retry')
-            if result in ('recovery', 'repair', 'repair-malformed-profile') and ('Brook SSD recovery payload verified' not in serial or
+            if result in ('recovery', 'repair', 'repair-malformed-profile', 'resume-profile') and (
+                    'Brook SSD recovery payload verified' not in serial or
                                                       'GUARD_SLOT_CONFIRMED' in serial or
                                                       read_fat(media, 'RECOVERY/BOOTSTAT.BIN') != before_health):
                 raise RuntimeError(f'{name}-{i}: recovery-only boot changed the slot journal')
@@ -492,8 +520,24 @@ def run_matrix(a, base_disk, normal, work, guards, metadata, panic_journal):
                     read_fat(media, 'RECOVERY/BOOTSTAT.BIN') != before_health or CLEAN_RESET not in serial):
                 raise RuntimeError(f'{name}-{i}: untracked desktop charged a slot or failed checked sync')
             guarded_records = [read_fat(media, f'RECOVERY/GUARD{j}.BIN') for j in range(2)]
+            if result == 'cut-profile-retry':
+                if ('GUARD_QEMU_CUT_BEFORE_CLEAN' not in (step / 'qemu.log').read_text(errors='replace') or
+                        'Brook SSD recovery payload verified' not in serial or
+                        'GUARD_ATTEMPT_NUMBER 1' not in serial or 'GUARD_COMPLETE_RESULT' in serial):
+                    raise RuntimeError('recovery did not stop after requalification and before guard completion')
+                pending = bytearray(expected_guards[0])
+                generation = struct.unpack_from('<Q', pending, 8)[0]
+                struct.pack_into('<QII', pending, 8, generation + 1, 2, 1)
+                struct.pack_into('<I', pending, 124, zlib.crc32(pending[:124]))
+                expected_guards = [pending, pending]
+            if result == 'resume-profile' and (
+                    'Recovery required; normal boot blocked.' not in serial or
+                    'GUARD_PENDING_RESULT outcome=2' not in serial or 'GUARD_ATTEMPT_NUMBER 2' not in serial or
+                    'GUARD_SLOT_PROFILE_RETRY' in serial):
+                raise RuntimeError('recovery failed to finish a pending guard without requalifying the slot again')
             if repairing:
-                if ('GUARD_AUTO_NEEDS_CHECK' not in serial or 'GUARD_COMPLETE_RESULT outcome=2' not in serial or
+                needs_check = 'GUARD_AUTO_NEEDS_CHECK' in serial
+                if (needs_check != (result != 'resume-profile') or 'GUARD_COMPLETE_RESULT outcome=2' not in serial or
                         guarded_records[0] != guarded_records[1]):
                     raise RuntimeError('shared profile recovery did not complete the guarded data repair')
                 clean_guard = guarded_records[0]
@@ -501,8 +545,10 @@ def run_matrix(a, base_disk, normal, work, guards, metadata, panic_journal):
                         zlib.crc32(clean_guard[:124]) != struct.unpack_from('<I', clean_guard, 124)[0]):
                     raise RuntimeError('guarded profile recovery did not publish a clean guard')
                 expected_guards = guarded_records
-                if result == 'repair-profile' and ('GUARD_SLOT_PROFILE_RECHECK accepted=1' not in serial or
-                                                    'GUARD_SLOT_PROFILE_RETRY status=0' not in serial):
+                if result == 'repair-profile' and (
+                        'GUARD_SLOT_PROFILE_RECHECK accepted=1' not in serial or
+                        'GUARD_SLOT_PROFILE_RETRY status=0' not in serial or
+                        serial.index('GUARD_SLOT_PROFILE_RETRY status=0') > serial.index('GUARD_COMPLETE_RESULT')):
                     raise RuntimeError('checked repair did not reopen the verified older slot')
                 if result == 'repair-malformed-profile' and ('GUARD_SLOT_PROFILE_RECHECK accepted=0' not in serial or
                                                               'GUARD_SLOT_PROFILE_RETRY' in serial):
