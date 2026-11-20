@@ -1,4 +1,5 @@
 // Intel 8254x Software Developer's Manual, sections 3 and 13.
+// Intel 82574 GbE Controller Family Datasheet, chapters 7, 8 and 10.
 // One legacy RX/TX queue, standard Ethernet MTU and shared PCI INTx.
 #include "e1000_ring.h"
 
@@ -44,17 +45,18 @@ using namespace brook;
 using namespace brook::e1000;
 
 enum Register : uint32_t {
-    Ctrl = 0x0000, Status = 0x0008,
+    Ctrl = 0x0000, Status = 0x0008, Eecd = 0x0010,
     Icr = 0x00c0, Ims = 0x00d0, Imc = 0x00d8,
     Rctl = 0x0100, Tctl = 0x0400, Tipg = 0x0410,
     Rdbal = 0x2800, Rdbah = 0x2804, Rdlen = 0x2808, Rdh = 0x2810, Rdt = 0x2818,
     Rdtr = 0x2820, Radv = 0x282c,
     Tdbal = 0x3800, Tdbah = 0x3804, Tdlen = 0x3808, Tdh = 0x3810, Tdt = 0x3818,
-    Rxcsum = 0x5000, Mta = 0x5200, Ral = 0x5400, Rah = 0x5404,
+    Rxcsum = 0x5000, Rfctl = 0x5008, Mta = 0x5200, Ral = 0x5400, Rah = 0x5404,
 };
 
 constexpr uint32_t CtrlReset = 1u << 26, CtrlSetLinkUp = 1u << 6;
 constexpr uint32_t StatusLinkUp = 1u << 1;
+constexpr uint32_t EecdAutoloadDone = 1u << 9, RxExtendedStatus = 1u << 15;
 constexpr uint32_t RxEnable = 1u << 1, RxBroadcast = 1u << 15, RxStripFcs = 1u << 26;
 constexpr uint32_t TxEnable = 1u << 1, TxPadShort = 1u << 3;
 constexpr uint32_t InterruptLink = 1u << 2;
@@ -159,7 +161,7 @@ void WriteRing(Register low, Register high, Register length, Register head, Regi
     Write(tail, 0);
 }
 
-bool Reset()
+bool Reset(const Device& model)
 {
     Write(Imc, ~0u);
     Write(Rctl, 0);
@@ -172,7 +174,8 @@ bool Reset()
     // after reset, and retain a hard bound if the boot clock stalls.
     for (uint32_t spin = 0; spin < 4000000; ++spin) {
         const uint64_t elapsed = ApicTickCount() - start;
-        if (elapsed >= 10 && !(Read(Ctrl) & CtrlReset)) {
+        if (elapsed >= 10 && !(Read(Ctrl) & CtrlReset) &&
+            (!model.pcie || (Read(Eecd) & EecdAutoloadDone))) {
             Write(Imc, ~0u);
             (void)Read(Icr);
             return true;
@@ -284,10 +287,13 @@ void Stop()
 
 int ModuleInit()
 {
-    constexpr uint16_t devices[] = {0x100e, 0x100f};
-    for (const auto id : devices)
-        if (PciFindDevice(0x8086, id, g_device)) break;
-    const char* model = DeviceName(g_device.deviceId);
+    const Device* model = nullptr;
+    for (const auto& candidate : Devices) {
+        if (PciFindDevice(0x8086, candidate.id, g_device)) {
+            model = &candidate;
+            break;
+        }
+    }
     if (!model) return -1;
 
     const uint32_t raw = g_device.bar[0];
@@ -299,21 +305,24 @@ int ModuleInit()
 
     g_pciCommand = PciConfigRead16(g_device.bus, g_device.dev, g_device.fn, 0x04);
     SetPciCommand((g_pciCommand | PciMemory | PciIntDisable) & ~PciMaster);
-    if (!MapMmio(physical) || !Reset() || !ReadMac(g_interface.mac) ||
+    if (!MapMmio(physical) || !Reset(*model) || !ReadMac(g_interface.mac) ||
         !AllocateDma<RxDescriptor>(g_rxDma) || !AllocateDma<TxDescriptor>(g_txDma)) {
-        SerialPrintf("e1000: %s setup failed\n", model);
+        SerialPrintf("e1000: %s setup failed\n", model->name);
         Stop();
         return -1;
     }
 
     Write(Ctrl, Read(Ctrl) | CtrlSetLinkUp);
+    if (model->pcie) Write(Rfctl, Read(Rfctl) & ~RxExtendedStatus);
     Write(Rxcsum, 0);
     for (uint32_t i = 0; i < 128; ++i) Write(static_cast<Register>(Mta + i * 4), 0);
     Write(Rdtr, 0);
     Write(Radv, 0);
     WriteRing(Rdbal, Rdbah, Rdlen, Rdh, Rdt, g_rxDma.descriptors);
     WriteRing(Tdbal, Tdbah, Tdlen, Tdh, Tdt, g_txDma.descriptors);
-    Write(Tipg, 10u | (8u << 10) | (6u << 20)); // copper back-to-back/non-back-to-back gaps
+    // 82574 has six internal MAC clocks of delay, versus two on 8254x.
+    const uint32_t interPacketGap = model->pcie ? 6u : 10u;
+    Write(Tipg, interPacketGap | (8u << 10) | (6u << 20));
 
     const uint8_t pin = PciConfigRead8(g_device.bus, g_device.dev, g_device.fn, 0x3c);
     if (pin >= 3 && IoApicSelectBootLevelPin(pin)) {
@@ -337,11 +346,11 @@ int ModuleInit()
     NetRegisterIf(&g_interface);
     const auto& mac = g_interface.mac.b;
     KPrintf("e1000: %s ready, MAC=%02x:%02x:%02x:%02x:%02x:%02x link=%s irq=%u\n",
-            model, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], g_linkUp ? "up" : "down", g_irq);
+            model->name, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], g_linkUp ? "up" : "down", g_irq);
     return 0;
 }
 
 }
 
 // NetRegisterIf retains the module for the interface's lifetime.
-DECLARE_MODULE("e1000", ModuleInit, Stop, "Intel 8254x Ethernet");
+DECLARE_MODULE("e1000", ModuleInit, Stop, "Intel 8254x and 82574 Ethernet");

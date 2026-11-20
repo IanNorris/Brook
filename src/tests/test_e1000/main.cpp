@@ -96,10 +96,17 @@ int main()
     g_txDma.descriptors = VirtualAddress(reinterpret_cast<uint64_t>(tx));
     g_txDma.packets = VirtualAddress(reinterpret_cast<uint64_t>(txBuffers));
 
-    CHECK(DeviceName(0x100e) && DeviceName(0x100f));
-    CHECK(!DeviceName(0xffff));
+    CHECK(Devices[0].id == 0x100e && !Devices[0].pcie);
+    CHECK(Devices[1].id == 0x100f && !Devices[1].pcie);
+    CHECK(Devices[2].id == 0x10d3 && Devices[2].pcie);
     ValidateTransmit();
     ValidateReceive();
+    Write(Status, StatusLinkUp);
+    Poll(&g_interface);
+    CHECK(g_linkUp);
+    Write(Status, 0);
+    Poll(&g_interface);
+    CHECK(!g_linkUp);
     Interrupt(); // unrelated shared line
     Write(Icr, InterruptRx);
     Interrupt();

@@ -71,13 +71,16 @@ struct RxRing {
     }
 };
 
-inline const char* DeviceName(uint16_t device)
-{
-    switch (device) {
-        case 0x100e: return "82540EM";
-        case 0x100f: return "82545EM";
-        default: return nullptr;
-    }
-}
+struct Device {
+    uint16_t id;
+    const char* name;
+    bool pcie;
+};
+
+constexpr Device Devices[] = {
+    {0x100e, "82540EM", false},
+    {0x100f, "82545EM", false},
+    {0x10d3, "82574L", true},
+};
 
 }
