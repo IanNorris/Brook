@@ -1,3 +1,4 @@
+#include "mount_namespace.h"
 #include "ahci_system_volume.h"
 #include "ahci_readonly.h"
 #include "device.h"
@@ -88,8 +89,7 @@ extern "C" int DeviceFlush(Device* d){return d->ops->ioctl(d,DEVICE_IOCTL_FLUSH,
 bool FatFsBindDrive(uint8_t drive,Device* d){assert(drive==1 && d==registered);++binds;return !is("bind");}
 Device* FatFsBoundDevice(uint8_t drive){assert(drive==1);return wrongBinding?&disk:registered;}
 bool VfsVnodeIsPublishedRoot(Vnode* node,uint64_t publication,uint8_t drive){return node==&config && publication==42 && drive==1;}
-bool VfsProtectBootMount(uint64_t publication){assert(publication==42);return true;}
-bool VfsMountConfiguredWithPublication(const char* path,const char* type,uint8_t drive,uint64_t flags,uint64_t* publication){assert(!std::strcmp(path,"/media/system")&&!std::strcmp(type,"fatfs")&&drive==1&&!flags);++mounts;*publication=is("mount")?0:42;return !is("mount");}
+bool VfsMountConfiguredWithPublication(const char* path,const char* type,uint8_t drive,uint64_t flags,uint64_t* publication){assert(!std::strcmp(path,"/media/system")&&!std::strcmp(type,"fatfs")&&drive==1&&flags==MountSystemInternal);++mounts;*publication=is("mount")?0:42;return !is("mount");}
 bool VfsMountConfigured(const char* path,const char* type,uint8_t drive,uint64_t flags){uint64_t unused;return VfsMountConfiguredWithPublication(path,type,drive,flags,&unused);}
 extern "C" void KPrintf(const char* format,...){char buffer[256];va_list args;va_start(args,format);std::vsnprintf(buffer,sizeof(buffer),format,args);va_end(args);lastLog=buffer;}
 }

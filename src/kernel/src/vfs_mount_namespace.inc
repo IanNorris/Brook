@@ -363,6 +363,10 @@ static int MountFreshWithVisibility(MountNamespace* ns,const VfsPath& inputTarge
     if(!ns->life.Published())return -3;
     VfsMountTargetLease lease;if(int error=lease.Follow(inputTarget))return error;
     const auto& target=lease.value;
+    // This policy is set only by a boot publisher in the initial namespace.
+    const bool systemInternal=(attributes&MountSystemInternal)!=0;
+    if(systemInternal && !ns->initial)return -1;
+    attributes&=~MountSystemInternal;
     // tmpfs: NODEV|NOSUID, or NOSUID alone for the boot device directory.
     const bool proc=StrEq(fsName,"procfs");
     const bool devpts=StrEq(fsName,"devpts");
@@ -401,6 +405,7 @@ static int MountFreshWithVisibility(MountNamespace* ns,const VfsPath& inputTarge
         VfsObjectRelease(root);kfree(backing);kfree(mount);return error;
     }
     *backing={};backing->fsOps=ops;backing->mountPriv=privateData;backing->pdrv=pdrv;backing->references=1;backing->independent=true;
+    backing->systemInternal=systemInternal;
     mount->owner=ns;mount->referenceState=1;mount->backing=backing;
     mount->rootObject=root;mount->rootIdentity=root->identity;mount->rootObjectOps=root->ops;mount->rootIdentityKnown=true;
     mount->rootDevice=stat.dev;mount->attributes=attributes;

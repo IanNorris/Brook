@@ -33,7 +33,7 @@
 namespace {
 std::map<brook::KRwLock*,std::unique_ptr<std::shared_mutex>> fsLocks;
 std::map<brook::KMutex*,std::unique_ptr<std::mutex>> fatLocks;
-bool driveAcquired=false,failLowerFlush=false;
+bool driveAcquired[2]{},failLowerFlush=false;
 brook::Device* imageRegistered=nullptr;
 std::unordered_set<void*> allocations,frames;
 std::mutex trackingLock;
@@ -42,7 +42,7 @@ thread_local bool failTriggered=false;
 unsigned requiredAccess=0;
 brook::Process process{};
 uint16_t legacyTestMask=022;
-std::vector<unsigned char> disk;
+std::vector<unsigned char> disk,bootMedia;
 uint64_t failWriteOffset=~uint64_t{0};
 uint64_t nextFailWriteOffset=~uint64_t{0};
 bool writeFailureInjected=false;
@@ -132,39 +132,41 @@ VirtualAddress VmmAllocPages(uint64_t count,uint64_t,MemTag,uint16_t){
     {std::lock_guard<std::mutex> lock(trackingLock);frames.insert(p);}return VirtualAddress(reinterpret_cast<uint64_t>(p));
 }
 void VmmFreePages(VirtualAddress address,uint64_t){void* p=reinterpret_cast<void*>(address.raw());{std::lock_guard<std::mutex> lock(trackingLock);assert(frames.erase(p)==1);}std::free(p);}
-int FatFsFlushDrive(uint8_t drive){return drive||failLowerFlush?-5:0;}
-bool FatFsAcquireDrive(uint8_t drive,bool* ro){if(drive||driveAcquired)return false;driveAcquired=true;*ro=false;return true;}
-void FatFsReleaseDrive(uint8_t){assert(driveAcquired);driveAcquired=false;}
+int FatFsFlushDrive(uint8_t drive){return drive>1||failLowerFlush?-5:0;}
+bool FatFsAcquireDrive(uint8_t drive,bool* ro){if(drive>1||driveAcquired[drive])return false;driveAcquired[drive]=true;*ro=false;return true;}
+void FatFsReleaseDrive(uint8_t drive){assert(drive<2 && driveAcquired[drive]);driveAcquired[drive]=false;}
 bool FatFsDriveReadOnly(uint8_t){return false;}
 extern "C" int DeviceWrite(Device* device,uint64_t offset,const void* bytes,uint64_t size){return device->ops->write(device,offset,bytes,size);}
 extern "C" void SerialPrintf(const char*,...){}
 void SerialPuts(const char*){}
 }
 
-extern "C" DSTATUS disk_initialize(BYTE drive){return drive?STA_NOINIT:0;}
-extern "C" DSTATUS disk_status(BYTE drive){return drive?STA_NOINIT:0;}
+extern "C" DSTATUS disk_initialize(BYTE drive){return drive>1?STA_NOINIT:0;}
+extern "C" DSTATUS disk_status(BYTE drive){return drive>1?STA_NOINIT:0;}
 extern "C" DRESULT disk_read(BYTE drive,BYTE* out,LBA_t sector,UINT count){
-    brook::Device outer{&diskOps,"outer",brook::DeviceType::Block,nullptr};
+    brook::Device outer{&diskOps,"outer",brook::DeviceType::Block,drive==1?&bootMedia:&disk};
     const auto bytes=uint64_t(count)*512;
-    return !drive&&readDisk(&outer,uint64_t(sector)*512,out,bytes)==int(bytes)?RES_OK:RES_ERROR;
+    return drive<2&&readDisk(&outer,uint64_t(sector)*512,out,bytes)==int(bytes)?RES_OK:RES_ERROR;
 }
 extern "C" DRESULT disk_write(BYTE drive,const BYTE* in,LBA_t sector,UINT count){
-    brook::Device outer{&diskOps,"outer",brook::DeviceType::Block,nullptr};
+    brook::Device outer{&diskOps,"outer",brook::DeviceType::Block,drive==1?&bootMedia:&disk};
     const auto bytes=uint64_t(count)*512;
-    return !drive&&writeDisk(&outer,uint64_t(sector)*512,in,bytes)==int(bytes)?RES_OK:RES_ERROR;
+    return drive<2&&writeDisk(&outer,uint64_t(sector)*512,in,bytes)==int(bytes)?RES_OK:RES_ERROR;
 }
 extern "C" DRESULT disk_ioctl(BYTE drive,BYTE command,void* out){
-    if(drive)return RES_PARERR;
+    if(drive>1)return RES_PARERR;
     if(command==CTRL_SYNC)return failLowerFlush?RES_ERROR:RES_OK;
-    if(command==GET_SECTOR_COUNT){*static_cast<LBA_t*>(out)=disk.size()/512;return RES_OK;}
+    if(command==GET_SECTOR_COUNT){*static_cast<LBA_t*>(out)=(drive==1?bootMedia:disk).size()/512;return RES_OK;}
     if(command==GET_SECTOR_SIZE){*static_cast<WORD*>(out)=512;return RES_OK;}
     if(command==GET_BLOCK_SIZE){*static_cast<DWORD*>(out)=1;return RES_OK;}
     return RES_PARERR;
 }
 extern "C" DWORD get_fattime(){return (DWORD(46)<<25)|(DWORD(10)<<21)|(DWORD(30)<<16);}
 int main(int argc,char** argv){
-    assert(argc==2);std::ifstream input(argv[1],std::ios::binary);assert(input);
+    assert(argc==4);std::ifstream input(argv[1],std::ios::binary);assert(input);
     disk.assign(std::istreambuf_iterator<char>(input),{});input.close();
+    std::ifstream media(argv[2],std::ios::binary);assert(media);
+    bootMedia.assign(std::istreambuf_iterator<char>(media),{});
     using namespace brook;
     process.uid=process.euid=process.suid=0;process.gid=process.egid=process.sgid=0;
     VfsInit();FatFsVfsRegister();Ext2VfsRegister();g_ext2WritebackMiB=0;
@@ -208,6 +210,48 @@ int main(int argc,char** argv){
     assert(VfsRead(key,withheld,sizeof(withheld),&keyOffset)==sizeof(witness));
     assert(!std::memcmp(withheld,witness,sizeof(witness)));
     VfsPathRelease(root);VfsRelease(key);
+    assert(!VfsMkdir("/media",0755));
+    assert(!VfsMkdir("/media/usb",0755));
+    assert(VfsMount("/media/usb","fatfs",1));
+    constexpr const char* privateFiles[]={
+        "/media/usb/INITRD.IMG", "/media/usb/KERNEL/INITRD.IMG",
+        "/media/usb/RECOVERY/INITRD.IMG", "/media/usb/RECOV2/INITRD.IMG",
+        "/media/usb/UPDATES/A/INITRD.IMG", "/media/usb/UPDATES/B/INITRD.IMG",
+        "/media/usb/eTc/HARDWA~1", "/media/usb/EtC/hardware-update-key",
+    };
+    assert(!VfsPathRoot(&root));
+    auto* retainedBoot=VfsOpen("/media/usb/UPDATES/A/INITRD.IMG",VFS_O_STREAM);assert(retainedBoot);
+    auto* retainedApps=VfsOpen("/media/usb/APPS.BRK",VFS_O_STREAM);assert(retainedApps);
+    for(const auto* name:privateFiles) {
+        auto* allowed=VfsOpen(name,VFS_O_READ);assert(allowed);VfsRelease(allowed);
+    }
+    for(unsigned credentials=0;credentials<2;++credentials) {
+        process.euid=credentials?0:1000;
+        process.userNamespace=credentials?&childNamespace:nullptr;
+        process.capabilities.effective=credentials?UserCapabilities:0;
+        for(const auto* name:privateFiles) {
+            int denied=0;
+            assert(!VfsOpenAt(root,root,name,VFS_O_READ,0,0,&denied) && denied==-13);
+            assert(!VfsOpenAt(root,root,name,VFS_O_METADATA,0,0,&denied) && denied==-13);
+        }
+        assert(VfsRenameAt(root,root,"/media/usb/UPDATES",root,"/media/usb/OTHER")==-16);
+        uint64_t offset=0;
+        assert(VfsRead(retainedBoot,withheld,sizeof(withheld),&offset)==-13 && offset==0);
+        assert(VfsRead(retainedApps,withheld,4,&offset)==4 && !std::memcmp(withheld,"APPS",4));
+        auto* direct=VfsOpenAt(root,root,"/media/usb/APPS.BRK",VFS_O_READ,0,0,nullptr);
+        assert(direct);VfsRelease(direct);
+    }
+    process.euid=0;process.userNamespace=nullptr;process.capabilities={};
+    VfsRelease(retainedBoot);VfsRelease(retainedApps);VfsPathRelease(root);
+    assert(VfsUnmount("/media/usb"));
+    std::ifstream unrelated(argv[3],std::ios::binary);assert(unrelated);
+    bootMedia.assign(std::istreambuf_iterator<char>(unrelated),{});
+    assert(VfsMount("/media/usb","fatfs",1));
+    process.euid=1000;
+    auto* unrelatedImage=VfsOpen("/media/usb/INITRD.IMG",VFS_O_READ);assert(unrelatedImage);
+    VfsRelease(unrelatedImage);
+    process.euid=0;
+    assert(VfsUnmount("/media/usb"));
     auto* source=VfsOpen("/STORE.IMG",VFS_O_WRITE|VFS_O_READWRITE);assert(source);
     VnodeStat sourceStat{};assert(!VfsStat(source,&sourceStat));int error=0;
     auto* device=FatImageDeviceCreate(source,sourceStat.size,"usb-nix-image",&error);assert(device&&!error);

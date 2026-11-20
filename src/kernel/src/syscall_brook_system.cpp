@@ -9,6 +9,7 @@
 #include "memory/physical_memory.h"
 #include "compositor.h"
 #include "ahci_readonly.h"
+#include "mount_namespace.h"
 #include "audio.h"
 #include "profiler.h"
 #include "string.h"
@@ -238,7 +239,8 @@ int64_t sys_brook_audio_control(uint64_t op,uint64_t value,uint64_t,uint64_t,uin
 int64_t sys_brook_ahci_export(uint64_t op,uint64_t destination,uint64_t length,uint64_t offset,uint64_t r0,uint64_t r1)
 {
     auto* proc=ProcessCurrent();if(!proc)return -ESRCH;
-    if(proc->euid!=0)return -EPERM;
+    if(!VfsCanAccessSystemFiles() ||
+       __atomic_load_n(&proc->mountNamespaceMember,__ATOMIC_ACQUIRE)!=VfsMountNamespaceInitial())return -EPERM;
     KernelOperationGuard operation(proc);
     if(r0 || r1)return -EINVAL;
     if(op==0) {

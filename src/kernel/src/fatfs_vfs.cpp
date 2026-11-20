@@ -103,6 +103,12 @@ struct FatFsMountData {
     bool backgroundDirty;
     uint64_t bootKeyIdentity;
     uint64_t bootKeyDirectory;
+    // Extra on-disk boot files are pinned by FAT directory slot, including
+    // their ancestor directories, so aliases and path renames cannot drop policy.
+    uint64_t bootAssets[6];
+    uint64_t bootAssetParents[6];
+    uint8_t bootAssetCount;
+    uint8_t bootAssetParentCount;
 };
 // Ordinary mounts only. Protected by g_fatLock through removal and sync;
 // private recovery mounts retain their separate boot-time ownership rules.
@@ -192,12 +198,12 @@ static bool SameFatFile(const FIL* a, const FIL* b)
 }
 
 static FRESULT CheckedFatSync(FIL* fil, bool closing);
-static bool FatBootKeyDenied(const FatOpenFile* file);
+static bool FatBootArtifactDenied(const FatOpenFile* file);
 
 // Flush private sector windows before another FIL mutates the same allocation.
 static int PrepareFatMutation(FatOpenFile* file, bool flushSelf = true)
 {
-    if (FatBootKeyDenied(file)) return -FVFS_EACCES;
+    if (FatBootArtifactDenied(file)) return -FVFS_EACCES;
     if (file->mount->intrinsicReadOnly) return -30;
     if (file->imageLease) return -16;
     for (auto* other = file->mount->allFiles; other; other = other->allNext) {
@@ -361,7 +367,7 @@ static int FatFileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
     FIL* fil = static_cast<FIL*>(vn->priv);
     KMutexLock(&g_fatLock);
     const auto* file = reinterpret_cast<FatOpenFile*>(fil);
-    if (FatBootKeyDenied(file)) { KMutexUnlock(&g_fatLock); return -FVFS_EACCES; }
+    if (FatBootArtifactDenied(file)) { KMutexUnlock(&g_fatLock); return -FVFS_EACCES; }
     if (file->imageLease) { KMutexUnlock(&g_fatLock); return -16; }
     if (*offset >= f_size(fil)) { KMutexUnlock(&g_fatLock); return 0; }
     if (f_tell(fil) != *offset) {
@@ -548,30 +554,42 @@ static bool FatFileIdentity(const FIL* fil, VnodeStat* st)
     return true;
 }
 
-static bool FatBootKeyDenied(const FatFsMountData* mount, uint64_t identity)
+static bool FatBootArtifact(const FatFsMountData* mount,uint64_t identity)
 {
-    return mount->bootKeyIdentity && identity == mount->bootKeyIdentity &&
+    if(!identity)return false;
+    if(identity==mount->bootKeyIdentity)return true;
+    for(unsigned i=0;i<mount->bootAssetCount;++i)
+        if(identity==mount->bootAssets[i])return true;
+    return false;
+}
+
+static bool FatBootArtifactDenied(const FatFsMountData* mount,uint64_t identity)
+{
+    return FatBootArtifact(mount,identity) && !VfsCanAccessSystemFiles();
+}
+
+static bool FatBootArtifactDenied(const FatOpenFile* file)
+{
+    if(!file->mount->bootKeyIdentity && !file->mount->bootAssetCount)return false;
+    VnodeStat stat{};
+    return (!FatFileIdentity(&file->fil,&stat) || FatBootArtifact(file->mount,stat.ino)) &&
         !VfsCanAccessSystemFiles();
 }
 
-static bool FatBootKeyDenied(const FatOpenFile* file)
+static bool FatIsBootArtifact(const FatOpenFile* file)
 {
-    if (!file->mount->bootKeyIdentity) return false;
+    if(!file->mount->bootKeyIdentity && !file->mount->bootAssetCount)return false;
     VnodeStat stat{};
-    return (!FatFileIdentity(&file->fil,&stat) || stat.ino == file->mount->bootKeyIdentity) &&
-        !VfsCanAccessSystemFiles();
+    return FatFileIdentity(&file->fil,&stat) && FatBootArtifact(file->mount,stat.ino);
 }
 
-static bool FatIsBootKey(const FatOpenFile* file)
+static bool FatBootArtifactPinned(const FatFsMountData* mount,uint64_t identity)
 {
-    if(!file->mount->bootKeyIdentity)return false;
-    VnodeStat stat{};
-    return FatFileIdentity(&file->fil,&stat) && stat.ino==file->mount->bootKeyIdentity;
-}
-
-static bool FatBootKeyPinned(const FatFsMountData* mount,uint64_t identity)
-{
-    return identity && (identity==mount->bootKeyIdentity || identity==mount->bootKeyDirectory);
+    if(!identity)return false;
+    if(FatBootArtifact(mount,identity) || identity==mount->bootKeyDirectory)return true;
+    for(unsigned i=0;i<mount->bootAssetParentCount;++i)
+        if(identity==mount->bootAssetParents[i])return true;
+    return false;
 }
 
 // Called under g_fatLock. Stable directory-slot identity covers SFN/LFN and
@@ -593,7 +611,7 @@ static int FatImagePathAllowedLocked(FatFsMountData* mount,const char* path)
     if(path && path[0]==char('0'+mount->pdrv) && path[1]==':' && path[2]=='/' && !path[3])return 0;
     bool any=false;
     for(auto* file=mount->allFiles;file;file=file->allNext)if(file->imageLease){any=true;break;}
-    if(!any && (!mount->bootKeyIdentity || VfsCanAccessSystemFiles()))return 0;
+    if(!any && ((!mount->bootKeyIdentity && !mount->bootAssetCount) || VfsCanAccessSystemFiles()))return 0;
     FILINFO stat{};FRESULT result=f_stat(path,&stat);
     if(result==FR_NO_FILE || result==FR_NO_PATH)return 0;
     if(result!=FR_OK)return FrToErrno(result);
@@ -601,7 +619,7 @@ static int FatImagePathAllowedLocked(FatFsMountData* mount,const char* path)
     FIL fil{};result=f_open(&fil,path,FA_READ);
     if(result!=FR_OK)return FrToErrno(result);
     VnodeStat identity{};int error=!FatFileIdentity(&fil,&identity)?-5:
-        FatBootKeyDenied(mount,identity.ino)?-FVFS_EACCES:
+        FatBootArtifactDenied(mount,identity.ino)?-FVFS_EACCES:
         FatImageIdentityLeased(mount,identity.ino)?-16:0;
     const auto closed=f_close(&fil);
     return error?error:closed==FR_OK?0:FrToErrno(closed);
@@ -626,9 +644,9 @@ static int FatStat(Vnode* vn, VnodeStat* st)
         st->size = f_size(fil);
         st->isDir = false;
         const auto* file=reinterpret_cast<const FatOpenFile*>(fil);
-        if(FatBootKeyDenied(file)) { KMutexUnlock(&g_fatLock); return -FVFS_EACCES; }
+        if(FatBootArtifactDenied(file)) { KMutexUnlock(&g_fatLock); return -FVFS_EACCES; }
         valid = FatFileIdentity(fil, st);
-        if(valid && st->ino==file->mount->bootKeyIdentity)st->mode=0100600;
+        if(valid && FatBootArtifact(file->mount,st->ino))st->mode=0100600;
     } else {
         st->size = 0;
         st->isDir = true;
@@ -644,7 +662,7 @@ static int CachedFileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
     auto* cf = static_cast<CachedFile*>(vn->priv);
     KMutexLock(&g_fatLock);
     auto* file = reinterpret_cast<FatOpenFile*>(cf->fil);
-    if (FatBootKeyDenied(file)) { KMutexUnlock(&g_fatLock); return -FVFS_EACCES; }
+    if (FatBootArtifactDenied(file)) { KMutexUnlock(&g_fatLock); return -FVFS_EACCES; }
     if (file->cacheInvalidated) {
         if (*offset >= f_size(cf->fil)) { KMutexUnlock(&g_fatLock); return 0; }
         FRESULT r = f_lseek(cf->fil, static_cast<FSIZE_t>(*offset));
@@ -687,9 +705,9 @@ static int CachedFileStat(Vnode* vn, VnodeStat* st)
     st->isDir = false;
     st->isSymlink = false;
     const auto* file=reinterpret_cast<const FatOpenFile*>(cf->fil);
-    if(FatBootKeyDenied(file)) { KMutexUnlock(&g_fatLock); return -FVFS_EACCES; }
+    if(FatBootArtifactDenied(file)) { KMutexUnlock(&g_fatLock); return -FVFS_EACCES; }
     const bool valid = FatFileIdentity(cf->fil, st);
-    if(valid && st->ino==file->mount->bootKeyIdentity)st->mode=0100600;
+    if(valid && FatBootArtifact(file->mount,st->ino))st->mode=0100600;
     KMutexUnlock(&g_fatLock);
     return valid ? 0 : -FVFS_EIO;
 }
@@ -771,7 +789,7 @@ static constexpr VnodeOps g_fatFileOps = {
     .space = FatSpace,
 };
 
-static constexpr VnodeOps g_fatBootKeyOps = [] {
+static constexpr VnodeOps g_fatBootArtifactOps = [] {
     auto ops=g_fatFileOps;
     ops.deny_mapping=true;
     return ops;
@@ -879,6 +897,7 @@ int FatFsGuardInspectReadOnly(uint8_t pdrv,Device* device,const GuardFatProfile&
 }
 #endif
 
+static FRESULT FatProtectMediaBootArtifactsLocked(FatFsMountData* data);
 static bool FatFsMount(uint8_t pdrv, void** mountPriv)
 {
     EnsureLock();
@@ -894,6 +913,7 @@ static bool FatFsMount(uint8_t pdrv, void** mountPriv)
 
     KMutexLock(&g_fatLock);
     FRESULT res = f_mount(&data->fs, fatPath, 1);
+    if(res==FR_OK && pdrv!=0)res=FatProtectMediaBootArtifactsLocked(data);
     if (res != FR_OK)
         f_mount(nullptr, fatPath, 0);
     else if (pdrv < FF_VOLUMES)
@@ -1016,7 +1036,7 @@ static Vnode* FatFsOpen(void* mountPriv, uint8_t pdrv,
     if (!(flags & (VFS_O_METADATA | VFS_O_STREAM)) && !(mode & (FA_WRITE | FA_CREATE_ALWAYS | FA_OPEN_ALWAYS))) {
         KMutexLock(&g_fatLock);
         CachedFile* existing = FileCacheLookup(fatPath);
-        if (existing && FatBootKeyDenied(reinterpret_cast<FatOpenFile*>(existing->fil))) {
+        if (existing && FatBootArtifactDenied(reinterpret_cast<FatOpenFile*>(existing->fil))) {
             KMutexUnlock(&g_fatLock);kfree(file);return nullptr;
         }
         if (existing) {
@@ -1083,7 +1103,7 @@ static Vnode* FatFsOpen(void* mountPriv, uint8_t pdrv,
 
         static constexpr uint64_t CACHE_THRESHOLD = 64 * 1024;
         uint64_t fileSize = f_size(fil);
-        const bool bootKey=FatIsBootKey(file);
+        const bool bootKey=FatIsBootArtifact(file);
         if (!bootKey && !(flags & (VFS_O_METADATA | VFS_O_STREAM)) &&
             !file->writable && fileSize >= CACHE_THRESHOLD) {
             file->cacheLoading = true;
@@ -1145,7 +1165,7 @@ static Vnode* FatFsOpen(void* mountPriv, uint8_t pdrv,
         vn->directoryPath = nullptr;
         vn->mountOwner = nullptr;
         vn->backendObject = nullptr;
-        vn->ops = bootKey ? &g_fatBootKeyOps : &g_fatFileOps; vn->type = VnodeType::File;
+        vn->ops = bootKey ? &g_fatBootArtifactOps : &g_fatFileOps; vn->type = VnodeType::File;
         vn->priv = fil; vn->refCount = 1; vn->cacheId = 0;
 
         if (flags & VFS_O_APPEND) {
@@ -1249,7 +1269,7 @@ static int FatFsStatPath(void* mountPriv, uint8_t pdrv,
         }
     }
     const auto* mount=static_cast<FatFsMountData*>(mountPriv);
-    const bool key=valid && mount && identity.ino==mount->bootKeyIdentity;
+    const bool key=valid && mount && FatBootArtifact(mount,identity.ino);
     const bool denied=key && !VfsCanAccessSystemFiles();
     KMutexUnlock(&g_fatLock);
     if (res != FR_OK) return FrToErrno(res);
@@ -1287,7 +1307,7 @@ static bool FatPathOpenLocked(FatFsMountData* mount, const char* path,bool renam
         if(f_opendir(&directory,path)!=FR_OK)return true;
         VnodeStat identity{};
         bool busy=!FatDirectoryIdentity(&directory,&identity) ||
-            FatBootKeyPinned(mount,identity.ino) ||
+            FatBootArtifactPinned(mount,identity.ino) ||
             (!renameSource && FatObjectPinnedLocked(mount,identity.ino));
         if(!busy && mount->allFiles)for(;;) {
             FILINFO child{};
@@ -1303,7 +1323,7 @@ static bool FatPathOpenLocked(FatFsMountData* mount, const char* path,bool renam
     FIL lookup{};
     if(f_open(&lookup,path,FA_READ)!=FR_OK)return true;
     VnodeStat identity{};
-    bool busy=!FatFileIdentity(&lookup,&identity) || FatBootKeyPinned(mount,identity.ino) ||
+    bool busy=!FatFileIdentity(&lookup,&identity) || FatBootArtifactPinned(mount,identity.ino) ||
         FatObjectPinnedLocked(mount,identity.ino);
     for(auto* file=mount->allFiles;!busy && file;file=file->allNext)
         if(SameFatFile(&lookup,&file->fil))busy=true;
@@ -1371,6 +1391,64 @@ static uint64_t FatObjectIdentity(const FF_OBJECT& object)
     return (object.object.attr&AM_DIR)?(1ULL<<62)|(uint64_t{object.object.sclust}+1):
         uint64_t{object.entry_sector}*(FF_MAX_SS/32)+object.entry_offset/32+1;
 }
+static FRESULT FatProtectMediaBootArtifactsLocked(FatFsMountData* data)
+{
+    // Standard firmware and legacy recovery/update image locations. APPS.BRK
+    // and STORE.IMG are independent application sources and remain accessible.
+    static constexpr const char* paths[][3]={
+        {"INITRD.IMG",nullptr,nullptr},
+        {"KERNEL","INITRD.IMG",nullptr},
+        {"RECOVERY","INITRD.IMG",nullptr},
+        {"RECOV2","INITRD.IMG",nullptr},
+        {"UPDATES","A","INITRD.IMG"},
+        {"UPDATES","B","INITRD.IMG"},
+        {"ETC","hardware-update-key",nullptr},
+    };
+    FF_OBJECT root{};
+    FRESULT result=f_object_root(&data->fs,&root);
+    if(result!=FR_OK)return result;
+    // ProbeAndMountDevice publishes only volumes carrying BROOK.MNT. An
+    // EFI volume can also identify itself with BROOK.CFG before that probe.
+    bool brookBootMedia=false;
+    static constexpr const char* markers[]={"BROOK.MNT","BROOK.CFG"};
+    for(const auto* marker : markers) {
+        FF_OBJECT object{};
+        result=f_object_lookup(&root,marker,&object);
+        if(result==FR_OK)brookBootMedia|=(object.object.attr&AM_DIR)==0;
+        else if(result!=FR_NO_FILE && result!=FR_NO_PATH)return result;
+    }
+    for(unsigned i=0;i<sizeof(paths)/sizeof(paths[0]);++i) {
+        const bool key=i==sizeof(paths)/sizeof(paths[0])-1;
+        if(!brookBootMedia && !key)continue;
+        FF_OBJECT current=root;
+        uint64_t parents[2]{};
+        unsigned parentCount=0;
+        for(unsigned component=0;component<3 && paths[i][component];++component) {
+            if(!(current.object.attr&AM_DIR)) { result=FR_NO_PATH;break; }
+            FF_OBJECT child{};
+            result=f_object_lookup(&current,paths[i][component],&child);
+            if(result!=FR_OK)break;
+            current=child;
+            if(component<2 && paths[i][component+1])parents[parentCount++]=FatObjectIdentity(child);
+        }
+        if(result==FR_NO_FILE || result==FR_NO_PATH)continue;
+        if(result!=FR_OK)return result;
+        if(current.object.attr&AM_DIR)continue;
+        if(key) {
+            data->bootKeyIdentity=FatObjectIdentity(current);
+            data->bootKeyDirectory=parents[0];
+            continue;
+        }
+        data->bootAssets[data->bootAssetCount++]=FatObjectIdentity(current);
+        for(unsigned j=0;j<parentCount;++j) {
+            bool present=false;
+            for(unsigned k=0;k<data->bootAssetParentCount;++k)
+                if(data->bootAssetParents[k]==parents[j])present=true;
+            if(!present)data->bootAssetParents[data->bootAssetParentCount++]=parents[j];
+        }
+    }
+    return FR_OK;
+}
 int FatFsProtectBootKey()
 {
     KMutexLock(&g_fatLock);
@@ -1437,7 +1515,7 @@ static int FatObjectStat(VfsObject* object,VnodeStat* stat)
 {
     if(!stat)return -22;
     auto* retained=static_cast<FatPathObject*>(object->priv);
-    if(FatBootKeyDenied(retained->mount,object->identity))return -FVFS_EACCES;
+    if(FatBootArtifactDenied(retained->mount,object->identity))return -FVFS_EACCES;
     KMutexLock(&g_fatLock);
     int error=(retained->location.object.attr&AM_DIR)?0:FatFlushWritersLocked(retained->mount);
     FF_OBJECT live{};
@@ -1450,7 +1528,7 @@ static int FatObjectStat(VfsObject* object,VnodeStat* stat)
         stat->isDir=(live.object.attr&AM_DIR)!=0;stat->size=stat->isDir?0:live.object.objsize;
         // Match the legacy Linux-facing 0755 fallback for FAT metadata.
         stat->mode=stat->isDir?0040755:0100755;
-        if(object->identity==retained->mount->bootKeyIdentity)stat->mode=0100600;
+        if(FatBootArtifact(retained->mount,object->identity))stat->mode=0100600;
         if(live.object.attr&AM_RDO)stat->mode&=~0222;
     }
     KMutexUnlock(&g_fatLock);return error;
@@ -1497,7 +1575,7 @@ static Vnode* FatObjectOpen(VfsObject* object,int flags,int* error)
         *error=-22;return nullptr;
     }
     auto* retained=static_cast<FatPathObject*>(object->priv);
-    if(FatBootKeyDenied(retained->mount,object->identity)) { *error=-FVFS_EACCES;return nullptr; }
+    if(FatBootArtifactDenied(retained->mount,object->identity)) { *error=-FVFS_EACCES;return nullptr; }
     if ((flags & VFS_O_STREAM) && (flags & ~VFS_O_STREAM)) { *error=-22; return nullptr; }
     if (retained->mount->intrinsicReadOnly && (flags & (VFS_O_WRITE|VFS_O_READWRITE|VFS_O_APPEND))) { *error=-30; return nullptr; }
     const bool directory=retained->directory;
@@ -1531,7 +1609,7 @@ static Vnode* FatObjectOpen(VfsObject* object,int flags,int* error)
                     file->writable=true;file->next=retained->mount->writableFiles;
                     retained->mount->writableFiles=file;
                 }
-                node->ops=object->identity==retained->mount->bootKeyIdentity?&g_fatBootKeyOps:&g_fatFileOps;
+                node->ops=FatBootArtifact(retained->mount,object->identity)?&g_fatBootArtifactOps:&g_fatFileOps;
                 node->type=VnodeType::File;node->priv=&file->fil;
             }
         }
@@ -1599,7 +1677,7 @@ static int FatObjectMkdir(VfsObject* parent,const char* name,uint16_t)
 // Any other retained reference or FIL must keep the FAT directory slot alive.
 static bool FatMutationBusyLocked(FatFsMountData* mount,uint64_t identity)
 {
-    if(FatBootKeyPinned(mount,identity))return true;
+    if(FatBootArtifactPinned(mount,identity))return true;
     for(auto* object=mount->objects;object;object=object->next) {
         if(object->object.identity!=identity)continue;
         if(__atomic_load_n(&object->object.references,__ATOMIC_ACQUIRE)!=1)return true;
@@ -2179,7 +2257,7 @@ static int FatObjectFromVnode(Vnode* node,VfsObject** out)
     if(!out)return -22;
     *out=nullptr;
     if(!node || (node->ops!=&g_fatDirOps && node->ops!=&g_fatFileOps &&
-                  node->ops!=&g_fatBootKeyOps && node->ops!=&g_cachedFileOps))return -9;
+                  node->ops!=&g_fatBootArtifactOps && node->ops!=&g_cachedFileOps))return -9;
     if(node->backendObject){VfsObjectRetain(node->backendObject);*out=node->backendObject;return 0;}
     // Legacy FILs already prevent entry reuse through allFiles. Directory
     // vnodes acquire their object pin before publication in FatFsOpen.
@@ -2223,7 +2301,7 @@ int FatFsPrivateRecoveryPublishJournalTest(FatPrivateMount* session,bool missing
     VfsPath root{},target{};
     int error=VfsPathRoot(&root);
     if(!error)error=VfsPathResolve(root,root,missingTarget?"/media/brook-missing-test-target":"/media/system",&target);
-    if(!error)error=VfsMountNamespaceMountFresh(VfsMountNamespaceInitial(),target,"fatfs",&g_fatFsOps,data,data->pdrv,0,publication);
+    if(!error)error=VfsMountNamespaceMountFresh(VfsMountNamespaceInitial(),target,"fatfs",&g_fatFsOps,data,data->pdrv,MountSystemInternal,publication);
     VfsPathRelease(target);VfsPathRelease(root);
     if(error)return error;
     KMutexLock(&g_fatLock);
