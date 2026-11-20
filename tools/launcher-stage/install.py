@@ -169,7 +169,11 @@ os.sync()
 for d in ('nix/store', 'nix', ''): os.rmdir(os.path.join(stage, d)) if d else os.rmdir(stage)
 for k, v in links.items():
     assert os.path.isfile(R(v)), ('target', v)
-    if k.startswith('/nix/profile/bin/'): assert os.access(R(v), os.X_OK), ('target not executable', v)
+    # A bin link must stay executable; a non-executable file that already
+    # lives in bin (brook-session.conf beside brook-dbus) may be updated.
+    if k.startswith('/nix/profile/bin/') and not os.access(R(v), os.X_OK):
+        old = R(os.readlink(R(k))) if os.path.islink(R(k)) and os.readlink(R(k)).startswith('/') else R(k)
+        assert os.path.isfile(old) and not os.access(old, os.X_OK), ('target not executable', v)
 previous = {k: (os.readlink(R(k)) if os.path.islink(R(k)) else None) for k in links}
 rb = rollback_record(tx)
 record = {'time': time.time(), 'previous': previous, 'new': links}
