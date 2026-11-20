@@ -27,10 +27,11 @@ enum class LauncherPowerTarget : uint8_t {
     CancelShutdown, // a desktop shutdown is in progress
     Confirm,        // prompt buttons
     Dismiss,
+    ForceApps,
 };
 
 enum class LauncherPowerAction : uint8_t { None, Shutdown, Restart };
-enum class LauncherPowerCommand : uint8_t { None, Shutdown, Restart, CancelShutdown };
+enum class LauncherPowerCommand : uint8_t { None, Shutdown, Restart, CancelShutdown, ForceApps };
 enum class LauncherPowerKey : uint8_t { Enter, Escape, Next, Previous };
 
 struct LauncherPowerMetrics {
@@ -136,6 +137,9 @@ public:
         case LauncherPowerTarget::CancelShutdown:
             Reset();
             return LauncherPowerCommand::CancelShutdown;
+        case LauncherPowerTarget::ForceApps:
+            Reset();
+            return LauncherPowerCommand::ForceApps;
         case LauncherPowerTarget::None:
         case LauncherPowerTarget::Footer:
             break;

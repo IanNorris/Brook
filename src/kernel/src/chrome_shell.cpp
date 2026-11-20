@@ -4,6 +4,7 @@
 // Everything here is drawn once into a cached surface when its content key
 // changes; nothing runs per frame. Freestanding.
 #include "chrome_shell.h"
+#include "chrome_launcher.h"
 
 namespace brook {
 
@@ -471,8 +472,15 @@ void ChromeBuildTaskbar(const ChromeTaskbarModel& m, const ChromeStyle& s, Chrom
         const DesktopRect& r = l.buttons[i];
         const ChromeTaskbarButton& b = m.buttons[i];
         const bool hovered = target(r, b.active);
+        const auto appIcon = [&](int x, unsigned opacity) {
+            const int y = r.y + (r.h - icon) / 2;
+            if (!b.icon && b.initial) {
+                const char initial[] = {b.initial, 0};
+                ChromeLauncherInitial(dl, s, x, y, icon, b.color, initial);
+            } else IconAt(dl, s, x, y, icon, b.icon, opacity);
+        };
         if (b.launch) {
-            centeredIcon(r, b.icon, icon);
+            if (r.w >= icon && r.h >= icon) appIcon(r.x + (r.w - icon) / 2, 255);
             const DesktopRect pr = pill(r);
             if (b.busy) {
                 static const int dx[8] = {0, 3, 4, 3, 0, -3, -4, -3};
@@ -490,12 +498,12 @@ void ChromeBuildTaskbar(const ChromeTaskbarModel& m, const ChromeStyle& s, Chrom
         const unsigned opacity = b.minimized ? 153 : 255;
         if (r.w >= Px(s, SM::TaskbarLabelMin) && r.h >= icon && b.hoverTitle && b.hoverTitle[0]) {
             const int ix = r.x + Px(s, SM::TaskbarButtonPad), tx = ix + icon + Px(s, SM::TaskbarLabelGap);
-            IconAt(dl, s, ix, r.y + (r.h - icon) / 2, icon, b.icon, opacity);
+            appIcon(ix, opacity);
             ChromeElidedText(dl, s, CF::Label, tx, labelY, b.hoverTitle,
                              b.active || hovered ? p.text : b.minimized ? p.mutedText : p.secondaryText,
                              r.x + r.w - tx - Px(s, SM::TaskbarButtonPad));
         } else if (r.w >= icon && r.h >= icon)
-            IconAt(dl, s, r.x + (r.w - icon) / 2, r.y + (r.h - icon) / 2, icon, b.icon, opacity);
+            appIcon(r.x + (r.w - icon) / 2, opacity);
     }
     if (l.next.w > 0) {
         target(l.next, false);
@@ -540,6 +548,170 @@ void ChromeBuildTaskbar(const ChromeTaskbarModel& m, const ChromeStyle& s, Chrom
     }
     AgentIndicator(dl, s, l.agent, m.agentShown, m.agentStale);
     for (unsigned i = 0; i < 6; ++i) DesktopMetric(dl, s, m.telemetry, l.metrics[i], i, m.uptimeMs);
+}
+
+// ---------------------------------------------------------------------------
+// Side dock
+// ---------------------------------------------------------------------------
+
+using DM = ChromeDockMetrics;
+
+DesktopRect ChromeDockSidebar(const DesktopMetrics& m, uint32_t screenW, uint32_t desktopH)
+{
+    int width = m.pixels(DM::Width);
+    if (width > static_cast<int>(screenW / 2)) width = static_cast<int>(screenW / 2);
+    return {0, 0, width, static_cast<int>(desktopH)};
+}
+
+ChromeDockLayout ChromeDockLayoutFor(const DesktopMetrics& m, uint32_t screenW, uint32_t desktopH,
+                                     int entries, int selected, bool open)
+{
+    ChromeDockLayout l{};
+    l.selected = -1;
+    l.sidebar = ChromeDockSidebar(m, screenW, desktopH);
+    if (entries <= 0 || l.sidebar.w <= 0 || l.sidebar.h <= 0) return l;
+    if (entries > static_cast<int>(ChromeDockEntryLimit)) entries = ChromeDockEntryLimit;
+    const int stripH = m.pixels(DM::Strip) < l.sidebar.h ? m.pixels(DM::Strip) : l.sidebar.h;
+    if (!open) {
+        // The 5 px tab, vertically centred on the edge.
+        const int h = m.pixels(DM::TabHeight) < l.sidebar.h ? m.pixels(DM::TabHeight) : l.sidebar.h;
+        l.tab = {l.sidebar.x, l.sidebar.y + (l.sidebar.h - h) / 2, m.pixels(DM::Tab), h};
+        l.count = entries;
+        return l;
+    }
+    l.open = true;
+    l.strip = {l.sidebar.x, l.sidebar.y, l.sidebar.w, stripH};
+    l.page = {l.sidebar.x, l.sidebar.y + stripH, l.sidebar.w, l.sidebar.h - stripH};
+    const int pinW = m.pixels(DM::Pin), cell = m.pixels(DM::Cell), button = m.pixels(DM::TileButton);
+    l.pin = {l.strip.x + l.strip.w - pinW, l.strip.y, pinW, stripH};
+    if (selected < 0 || selected >= entries) selected = -1;
+    // The selected tile keeps an icon cell and both buttons. Entries that
+    // leave it less are not laid out (overflow is a later slice).
+    const int room = l.strip.w - pinW, tileMin = selected >= 0 ? cell + 2 * button : 0;
+    int fit = selected >= 0 ? 1 + (room - tileMin) / cell : room / cell;
+    if (fit < 0) fit = 0;
+    l.count = entries < fit ? entries : fit;
+    if (selected >= l.count) selected = l.count - 1;
+    l.selected = selected;
+    const int tileW = room - (selected >= 0 ? (l.count - 1) * cell : 0);
+    int x = l.strip.x;
+    for (int i = 0; i < l.count; ++i) {
+        const int w = i == selected ? tileW : cell;
+        l.cells[i] = {x, l.strip.y, w, stripH};
+        x += w;
+    }
+    if (selected >= 0) {
+        l.tile = l.cells[selected];
+        l.close = {l.tile.x + l.tile.w - button, l.tile.y, button, stripH};
+        l.back = {l.close.x - button, l.tile.y, button, stripH};
+        const int titleX = l.tile.x + cell;
+        l.title = {titleX, l.tile.y, l.back.x - titleX, stripH};
+    }
+    return l;
+}
+
+ChromeDockHit ChromeDockHitTest(const ChromeDockLayout& l, int32_t x, int32_t y)
+{
+    if (!l.open) return {l.tab.contains(x, y) ? ChromeDockTarget::Tab : ChromeDockTarget::None, -1};
+    if (!l.strip.contains(x, y)) return {ChromeDockTarget::None, -1};
+    if (l.pin.contains(x, y)) return {ChromeDockTarget::Pin, -1};
+    if (l.selected >= 0) {
+        if (l.close.contains(x, y)) return {ChromeDockTarget::Close, l.selected};
+        if (l.back.contains(x, y)) return {ChromeDockTarget::Return, l.selected};
+        if (l.tile.contains(x, y)) return {ChromeDockTarget::Tile, l.selected};
+    }
+    for (int i = 0; i < l.count; ++i)
+        if (l.cells[i].contains(x, y)) return {ChromeDockTarget::Entry, i};
+    return {ChromeDockTarget::Strip, -1};
+}
+
+// "Return to desktop": a bar at the left and an arrow leaving it.
+static void DockReturnGlyph(ChromeDisplayList& dl, const ChromeStyle& s, int x0, int y0, int size, uint32_t ink)
+{
+    auto px = [&](int v) { return v * size / 16; };
+    auto box = [&](int x, int y, int w, int h) {
+        dl.Fill(x0 + px(x), y0 + px(y), px(x + w) - px(x), px(y + h) - px(y), 0xff000000u | ink);
+    };
+    box(2, 3, 2, 10);  // the edge being left
+    box(6, 7, 8, 2);   // shaft
+    for (int k = 0; k < 4; ++k) { // head: two diagonals meeting at the tip
+        box(9 + k, 3 + k, 2, 1);
+        box(9 + k, 12 - k, 2, 1);
+    }
+    (void)s;
+}
+
+void ChromeBuildDock(const ChromeDockModel& m, const ChromeStyle& s, ChromeDisplayList& dl)
+{
+    const ChromeDockLayout& l = *m.layout;
+    const auto& p = s.P();
+    if (!l.open) {
+        // At rest: a flat quad with a short grip, no glass.
+        const DesktopRect& t = l.tab;
+        if (t.w <= 0 || t.h <= 0) return;
+        dl.Fill(t.x, t.y, t.w, t.h, 0xff000000u | p.taskbar);
+        const int grip = Px(s, 2) < t.w ? Px(s, 2) : t.w, gripH = Px(s, 32) < t.h ? Px(s, 32) : t.h;
+        dl.Fill(t.x + (t.w - grip) / 2, t.y + (t.h - gripH) / 2, grip, gripH, 0xff000000u | p.mutedText);
+        return;
+    }
+    const DesktopRect& r = l.strip;
+    if (r.w <= 0 || r.h <= 0) return;
+    // The taskbar's material: the same glass gradient at the same height.
+    if (s.glass && s.material && s.material->taskbarHeight >= static_cast<unsigned>(r.h))
+        dl.Rows(r.x, r.y, r.w, r.h, s.material->taskbarRows);
+    else dl.Fill(r.x, r.y, r.w, r.h, s.MaterialColor(p.taskbar));
+    const uint32_t edge = s.glass ? HairlineColor(s, p.taskbar) : 0xff000000u | p.launcherBorder;
+    dl.Fill(r.x, r.y + r.h - 1, r.w, 1, edge);
+    dl.Fill(r.x + r.w - 1, r.y, 1, r.h - 1, edge);
+    auto pill = [&](const DesktopRect& c) {
+        const int ix = c.w > 4 * Px(s, SM::TaskbarPillInsetX) ? Px(s, SM::TaskbarPillInsetX) : 0;
+        const int iy = c.h > 4 * Px(s, SM::TaskbarPillInsetY) ? Px(s, SM::TaskbarPillInsetY) : 0;
+        return DesktopRect{c.x + ix, c.y + iy, c.w - 2 * ix, c.h - 2 * iy};
+    };
+    auto hovered = [&](const DesktopRect& c) { return c.contains(m.mouseX, m.mouseY); };
+    const int icon = Px(s, DM::Icon), cell = Px(s, DM::Cell), glyph = Px(s, 16);
+    for (int i = 0; i < l.count; ++i) {
+        const DesktopRect& c = l.cells[i];
+        const uint32_t* pixels = m.icons ? m.icons[i] : nullptr;
+        if (i == l.selected) continue;
+        if (hovered(c)) dl.MaterialRect(pill(c), s.MaterialColor(p.taskHover), Px(s, 6));
+        if (c.w >= icon && c.h >= icon)
+            ChromeIcon(dl, s, c.x + (c.w - icon) / 2, c.y + (c.h - icon) / 2, icon, pixels);
+        // Docked and running: a 4x3 dot under the icon.
+        const int dotW = Px(s, 4), dotH = Px(s, 3);
+        dl.MaterialRect({c.x + (c.w - dotW) / 2, c.y + c.h - Px(s, 7) - dotH, dotW, dotH},
+                        0xff000000u | p.mutedText, Px(s, 1));
+    }
+    if (l.selected >= 0) {
+        // The selected tile: the lighter fill is the only selection mark.
+        const DesktopRect& t = l.tile;
+        dl.MaterialRect(pill(t), s.MaterialColor(p.taskActive), Px(s, 6));
+        const uint32_t* pixels = m.icons ? m.icons[l.selected] : nullptr;
+        const int iconCell = cell < t.w ? cell : t.w;
+        if (iconCell >= icon) ChromeIcon(dl, s, t.x + (iconCell - icon) / 2, t.y + (t.h - icon) / 2, icon, pixels);
+        if (m.title && m.title[0] && l.title.w > Px(s, 8))
+            ChromeElidedText(dl, s, CF::Label, l.title.x, t.y + (t.h - s.Line(CF::Label)) / 2, m.title, p.text,
+                             l.title.w - Px(s, 4));
+        const DesktopRect* buttons[2] = {&l.back, &l.close};
+        for (const DesktopRect* b : buttons) {
+            if (b->w <= 0) continue;
+            const bool hover = hovered(*b);
+            if (hover) {
+                const int inset = Px(s, 8);
+                dl.MaterialRect({b->x + Px(s, 2), b->y + inset, b->w - Px(s, 4), b->h - 2 * inset},
+                                s.MaterialColor(p.taskHover), Px(s, 4));
+            }
+            const uint32_t ink = hover ? p.text : p.secondaryText;
+            const int gx = b->x + (b->w - glyph) / 2, gy = b->y + (b->h - glyph) / 2;
+            if (b == &l.close) dl.Glyph(ChromeGlyph::Close, gx, gy, ink);
+            else DockReturnGlyph(dl, s, gx, gy, glyph, ink);
+        }
+    }
+    // Pin: the lighter fill while pinned, a hover pill otherwise.
+    if (m.pinned || hovered(l.pin))
+        dl.MaterialRect(pill(l.pin), s.MaterialColor(m.pinned ? p.taskActive : p.taskHover), Px(s, 6));
+    dl.Glyph(ChromeGlyph::Pin, l.pin.x + (l.pin.w - glyph) / 2, l.pin.y + (l.pin.h - glyph) / 2,
+             m.pinned || hovered(l.pin) ? p.text : p.secondaryText);
 }
 
 // ---------------------------------------------------------------------------

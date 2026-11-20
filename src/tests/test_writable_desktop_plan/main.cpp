@@ -33,6 +33,15 @@ struct Disk {
 };
 }
 int main(int argc,char** argv){
+    for(const char* good:{".brook-profile-legacy",".brook-profile-93c34853ba6b4d2b9c22f1165804d759"})
+        assert(WritableDesktopGenerationName(good,int(std::strlen(good))));
+    for(const char* bad:{"",".brook-profile-",".brook-profile-Legacy",".brook-profile-legacy/",
+                         "/nix/var/.brook-profiles/.brook-profile-legacy","../.brook-profile-legacy",
+                         ".brook-profile-93C34853BA6B4D2B9C22F1165804D759",".brook-profile-93c34853ba6b4d2b9c22f1165804d75",
+                         ".brook-profile-93c34853ba6b4d2b9c22f1165804d7590",".brook-profile-../../escape",
+                         "current",".brook-profile-legacy-extra"})
+        assert(!WritableDesktopGenerationName(bad,int(std::strlen(bad))));
+    assert(!WritableDesktopGenerationName(nullptr,0));
     WritableDesktopPlan plan;assert(WritableDesktopPlanParse(Record,std::strlen(Record),plan));
     assert(plan.bytes==16777216 && plan.uuid[0]==0xcf);
     for(const std::string bad:{"", "BRKSTORE1 4294967296 cf16f1ae-68c5-5fac-89e9-382b8af5cd5c\n",

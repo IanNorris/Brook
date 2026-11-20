@@ -36,6 +36,10 @@ bool CompositorGlassActive() { return false; }
 uint32_t CompositorMaterialOpacity() { return 255; }
 Terminal* TerminalFindByProcess(Process*) { return nullptr; }
 TerminalResizeResult TerminalResizeForProcess(uint16_t,uint64_t,uint32_t,uint32_t) { return TerminalResizeResult::NotOwned; }
+// The dock's Close button reaches the cooperative close path; no test window
+// takes the native-signal branch.
+bool TerminalSnapshotGeometry(Process*,TerminalGeometry*) { std::abort(); }
+int ProcessSendSignal(Process*,int,const SignalInfo*) { std::abort(); }
 bool TerminalSnapshotCaret(uint16_t pid,uint64_t incarnation,TerminalCaret* out) {
     if(!caretPid || pid!=caretPid || incarnation!=caretIncarnation)return false;
     *out={5,1,3,2};return true;
@@ -52,7 +56,11 @@ static Vnode layoutFile{}, layoutDirectory{};
 static char layoutText[LauncherLayoutLimit];
 static unsigned layoutAttempts=0, layoutSyncs=0;
 static bool layoutWritable=false, layoutRenamed=false;
-bool ShutdownLaunchAllowed() { return true; }
+static bool shutdownPending=false,forceAppsOffered=false;
+static unsigned forceCloseCalls=0;
+bool ShutdownLaunchAllowed() { return !shutdownPending; }
+bool ShutdownCanForceApps(const char*) { return forceAppsOffered; }
+void ShutdownDesktopForceApps() { CHECK(forceAppsOffered);++forceCloseCalls; }
 const char* ShutdownDesktopStatus() { return "Applications"; }
 void ShutdownDesktopRequest(bool) { std::abort(); }
 void ShutdownDesktopCancel() { std::abort(); }
@@ -73,12 +81,13 @@ void VfsPathRelease(VfsPath) {}
 int VfsMkdirAt(const VfsPath&, const VfsPath&, const char*, uint16_t, uint16_t) { std::abort(); }
 int VfsChownAt(const VfsPath&, const VfsPath&, const char*, uint32_t, uint32_t, bool) { std::abort(); }
 int VfsRemoveAt(const VfsPath&, const VfsPath&, const char* name, bool directory) {
-    CHECK(!strcmp(name, "launcher.ini.tmp") && !directory);
+    CHECK((!strcmp(name, "launcher.ini.tmp") || !strcmp(name, "dock.ini.tmp")) && !directory);
     return -2;
 }
 Vnode* VfsOpenAt(const VfsPath&, const VfsPath&, const char* name, int flags,
                  uint16_t mode, uint16_t, int*, bool followFinal) {
-    CHECK(!strcmp(name, "launcher.ini.tmp") && !followFinal && flags == (VFS_O_WRITE|VFS_O_CREATE|VFS_O_EXCL));
+    CHECK((!strcmp(name, "launcher.ini.tmp") || !strcmp(name, "dock.ini.tmp")) && !followFinal &&
+          flags == (VFS_O_WRITE|VFS_O_CREATE|VFS_O_EXCL));
     CHECK(mode == 0600);
     return &layoutFile;
 }
@@ -103,7 +112,8 @@ int VfsFsync(Vnode* node) {
     return 0;
 }
 int VfsRenameAt(const VfsPath&, const VfsPath&, const char* source, const VfsPath&, const char* target) {
-    CHECK(!strcmp(source, "launcher.ini.tmp") && !strcmp(target, "launcher.ini") && layoutSyncs == 1);
+    CHECK(((!strcmp(source, "launcher.ini.tmp") && !strcmp(target, "launcher.ini")) ||
+           (!strcmp(source, "dock.ini.tmp") && !strcmp(target, "dock.ini"))) && layoutSyncs == 1);
     layoutRenamed = true;
     return 0;
 }
@@ -287,7 +297,7 @@ int main() {
     CHECK(WmInputPop(&window,&event,1)==1 && event.reserved==WM_RESIZE_MAXIMIZED);
     CHECK(event.type==WM_EVT_RESIZED && event.x==1280 && event.y==720);
     window.state=WindowState::Normal;
-    CHECK(WmPushWmEvent(&window,WM_EVT_RESIZED,640,360));
+    CHECK(WmPushWmEvent(&window,WM_EVT_RESIZED,640,360,WM_RESIZE_RESIZING));
     CHECK(WmInputPop(&window,&event,1)==1 && event.reserved==WM_RESIZE_RESIZING);
     // Quiet windows have no client dirty pixels. Focus/z-order changes still
     // require a new chrome composition, without waiting for periodic repaint.
@@ -736,6 +746,16 @@ int main() {
         static ChromeShellModel snapshot{};
         WmCaptureLauncher(sw, sh, -1, -1, snapshot);
         CHECK(snapshot.launcherModel.Pinned(1));
+
+        shutdownPending=true;
+        CHECK(!press(LauncherTargetKind::ForceApps, 0, false));
+        forceAppsOffered=true;
+        WmCaptureLauncher(sw, sh, -1, -1, snapshot);
+        CHECK(snapshot.shutdownActive && snapshot.forceApps);
+        CHECK(press(LauncherTargetKind::ForceApps, 0, true) && !forceCloseCalls);
+        CHECK(press(LauncherTargetKind::ForceApps, 0, false) && forceCloseCalls==1);
+        shutdownPending=forceAppsOffered=false;
+
         testTick = 1199;
         LauncherSaveLayout();
         CHECK(!layoutAttempts);
@@ -820,6 +840,9 @@ int main() {
         CHECK(WmInputPop(&g,&event,1)==1 && event.reserved==WM_RESIZE_MAXIMIZED);
         WmSetMaximized(game,false);
         CHECK(g.state==WindowState::Normal && g.x==40 && g.y==50 && g.clientW==640 && g.clientH==480);
+        CHECK(WmInputPop(&g,&event,1)==1 && event.type==WM_EVT_RESIZED && event.reserved==0);
+        WmSetMaximized(game,false,true);
+        CHECK(WmInputPop(&g,&event,1)==1 && event.type==WM_EVT_RESIZED && event.reserved==0);
         // Legacy Xwayland WM: chrome-less, placed at the origin, output-sized.
         WmSetClientSideDecoration(game,true);WmMoveWindow(game,0,0);
         CHECK(WmResizeWindow(game,uint16_t(sw),uint16_t(sh)) && !g.fullscreen && !taskbarShown());
@@ -827,6 +850,224 @@ int main() {
         g.vfb=nullptr;WmDestroyWindowById(gamer,g_windows[editor].wmId);WmDestroyWindowById(gamer,g.wmId);
         CHECK(taskbarShown() && !lockDepth);
         std::free(gamer);
+    }
+    // Side dock (slice D1). Docking hides a window from the taskbar, Alt+Tab
+    // and the desktop and places it as the page (sidebar below the strip, no
+    // chrome, maximised configure). The dock opens on Super+S, the tab or an
+    // icon; Escape, an outside click and the selected tile hide it. Pinning
+    // takes the sidebar out of the work area and reflows maximised and
+    // floating windows. Returning restores geometry, state and decoration.
+    {
+        constexpr uint32_t sw=1280,sh=800;testScreenW=sw;testScreenH=sh;
+        const int border=int(WmMetric(WM_BORDER_WIDTH)),title=int(WmMetric(WM_TITLE_BAR_HEIGHT));
+        const int desktopH=int(WmDesktopHeight(sh)),sideW=int(WmMetric(ChromeDockMetrics::Width));
+        const int stripH=int(WmMetric(ChromeDockMetrics::Strip));
+        auto* owner=static_cast<Process*>(std::calloc(1,sizeof(Process)));CHECK(owner);
+        owner->pid=owner->tgid=13;owner->incarnation=131;
+        const int chat=WmCreateWindow(owner,500,100,640,480,"Chat",1,true);
+        const int notes=WmCreateWindow(owner,30,60,400,300,"Notes",1,true);
+        const int big=WmCreateWindow(owner,600,200,500,400,"Big",1,true);
+        CHECK(chat>=0 && notes>=0 && big>=0);
+        Window& a=g_windows[chat];Window& b=g_windows[notes];Window& c=g_windows[big];
+        for(Window* w:{&a,&b,&c})w->vfb=reinterpret_cast<uint32_t*>(0x1000);
+        Window::WmInputEvent drain[256]{};
+        auto lastResize=[&](Window& w){
+            Window::WmInputEvent events[256]{},last{};
+            const uint32_t n=WmInputPop(&w,events,256);
+            for(uint32_t i=0;i<n;++i)if(events[i].type==WM_EVT_RESIZED)last=events[i];
+            return last;
+        };
+        auto inTaskbar=[&](int idx){
+            const auto l=GetTaskbarLayout(sw,sh);
+            for(int i=0;i<l.count;++i)if(l.indices[i]==idx)return true;
+            return false;
+        };
+        auto dockSurface=[&](WmShellSurface& out){
+            WmShellSurface s[WM_SHELL_SURFACE_LIMIT];const uint32_t n=WmShellSurfaces(sw,sh,-1,-1,s);
+            for(uint32_t i=0;i<n;++i)if(s[i].kind==WmShellSurfaceKind::Dock){out=s[i];return true;}
+            return false;
+        };
+        WmShellSurface dock{};
+        WmSetMaximized(big,true);
+        CHECK(c.x==0 && c.clientW==sw-2*border && c.clientH==uint16_t(desktopH-title-2*border));
+        for(Window* w:{&a,&b,&c})WmInputPop(w,drain,256);
+        CHECK(!dockSurface(dock) && WmWorkArea(sw,sh).x==0); // nothing at rest without entries
+
+        // Super+Shift+S on the focused Chat docks it; docking does not open.
+        WmSetFocus(chat);WmDockFocusedWindow();
+        CHECK(a.docked && a.minimized && a.noChrome && a.state==WindowState::Maximized && !a.focused);
+        CHECK(WmDockEntryCount()==1 && WmDockEntryWindow(0)==chat && !WmDockOpen());
+        CHECK(a.x==0 && a.y==stripH && a.clientW==sideW && a.clientH==desktopH-stripH);
+        {const auto e=lastResize(a);CHECK(e.type==WM_EVT_RESIZED && e.reserved==WM_RESIZE_MAXIMIZED && e.x==sideW);}
+        CHECK(WmGetFocusedWindow()!=chat && WmGetFocusedWindow()>=0);
+        CHECK(!inTaskbar(chat) && inTaskbar(notes) && inTaskbar(big));
+        {int z[WM_MAX_WINDOWS];const uint32_t n=WmGetZOrder(z,WM_MAX_WINDOWS);for(uint32_t i=0;i<n;++i)CHECK(z[i]!=chat);}
+        // Requests from the client cannot move, restore or minimise the page.
+        WmMoveWindow(chat,300,300);WmSetMaximized(chat,false);WmRestoreWindow(chat);
+        CHECK(a.x==0 && a.y==stripH && a.state==WindowState::Maximized && a.minimized);
+        // A decoration change while docked is kept for the return.
+        WmSetClientSideDecoration(chat,true);CHECK(a.dkNoChrome && a.noChrome);
+        WmSetClientSideDecoration(chat,false);CHECK(!a.dkNoChrome && a.noChrome);
+
+        // Closed with an entry: the 5 px tab, vertically centred, no glass.
+        CHECK(dockSurface(dock) && dock.x==0 && !dock.material && dock.w==WmMetric(ChromeDockMetrics::Tab));
+        CHECK(dock.h==WmMetric(ChromeDockMetrics::TabHeight) && dock.y==int32_t((desktopH-int(dock.h))/2));
+        CHECK(WmDockPointerOwned(1,dock.y+5,sw,sh) && !WmDockPointerOwned(40,dock.y+5,sw,sh));
+        // The tab opens the dock on the page, focused and drawn.
+        CHECK(WmDockPress(1,dock.y+5,sw,sh) && WmDockOpen() && !a.minimized && a.focused);
+        CHECK(dockSurface(dock) && dock.material && dock.x==0 && dock.y==0 && int(dock.w)==sideW && int(dock.h)==stripH);
+        CHECK(!inTaskbar(chat));
+        {int z[WM_MAX_WINDOWS];const uint32_t n=WmGetZOrder(z,WM_MAX_WINDOWS);CHECK(n && z[n-1]==chat);}
+        // The shell snapshot: one entry, selected, with the window's title.
+        {
+            static ChromeShellModel model{};
+            CHECK(WmCaptureShellModel(dock,sw,sh,0,-1,-1,model) && model.kind==ChromeShellKind::Dock);
+            CHECK(model.dock.open && model.dock.count==1 && model.dock.selected==0 && !strcmp(model.text,"Chat"));
+            CHECK(model.mouseX==-1 && !model.dockPinned);
+        }
+        // Escape hides an open, unpinned dock and focus returns to the desktop.
+        CHECK(WmDockDismissible() && WmDockDismiss() && !WmDockOpen() && a.minimized && !a.focused);
+        CHECK(WmGetFocusedWindow()>=0 && !g_windows[WmGetFocusedWindow()].docked);
+        // Super+S toggles it open on the last page, and closed.
+        WmDockToggle();CHECK(WmDockOpen() && !a.minimized && a.focused);
+        WmDockToggle();CHECK(!WmDockOpen() && a.minimized);
+        // A click outside the open sidebar hides it and is not consumed.
+        WmDockToggle();
+        CHECK(!WmDockPress(sideW+100,400,sw,sh) && !WmDockOpen());
+        // A click inside the page is the client's and keeps it open.
+        WmDockToggle();
+        CHECK(!WmDockPress(10,stripH+10,sw,sh) && WmDockOpen());
+
+        // A second guest; icons select pages; the selected tile hides it.
+        WmSetFocus(notes);WmDockFocusedWindow();
+        CHECK(b.docked && b.minimized && WmDockEntryCount()==2 && WmDockOpen() && !a.minimized);
+        {
+            const auto l=ChromeDockLayoutFor(WmDesktopMetrics(),sw,uint32_t(desktopH),2,0,true);
+            CHECK(l.count==2 && l.selected==0 && l.tile.w>l.cells[1].w && l.cells[1].w==int(WmMetric(ChromeDockMetrics::Cell)));
+            CHECK(WmDockPress(l.cells[1].x+4,l.cells[1].y+4,sw,sh) && !b.minimized && a.minimized && b.focused);
+            const auto m=ChromeDockLayoutFor(WmDesktopMetrics(),sw,uint32_t(desktopH),2,1,true);
+            CHECK(WmDockPress(m.title.x+4,m.title.y+4,sw,sh) && !WmDockOpen() && b.minimized);
+            CHECK(!inTaskbar(notes) && !inTaskbar(chat));
+        }
+        // Alt+Tab never reaches a docked window.
+        {
+            auto* other=static_cast<Process*>(owner);
+            const int extra=WmCreateWindow(other,700,300,300,200,"Extra",1,true);CHECK(extra>=0);
+            for(int i=0;i<6;++i){const int t=WmCycleFocus();CHECK(t!=chat && t!=notes);}
+            CHECK(!g_windows[WmGetFocusedWindow()].docked);
+            // With the dock open (unpinned), Alt+Tab closes it first.
+            WmDockToggle();CHECK(WmDockOpen());
+            const int t=WmCycleFocus();CHECK(t>=0 && !g_windows[t].docked && !WmDockOpen());
+            WmDestroyWindowById(owner,g_windows[extra].wmId);
+        }
+
+        // Pin: the sidebar leaves the work area. The maximised window
+        // reflows beside it, a floating window under it moves out, and new
+        // maximise targets start at its inner edge.
+        const int floating=WmCreateWindow(owner,40,80,300,200,"Floating",1,true);CHECK(floating>=0);
+        Window& f=g_windows[floating];f.vfb=reinterpret_cast<uint32_t*>(0x1000);
+        WmDockSetPinned(true);
+        CHECK(WmDockPinned() && WmDockOpen() && !b.minimized); // shows the last page
+        CHECK(WmWorkArea(sw,sh).x==sideW && WmWorkArea(sw,sh).w==int(sw)-sideW && WmWorkArea(sw,sh).h==desktopH);
+        CHECK(c.state==WindowState::Maximized && c.x==sideW && c.clientW==sw-sideW-2*border);
+        {const auto e=lastResize(c);CHECK(e.type==WM_EVT_RESIZED && e.reserved==WM_RESIZE_MAXIMIZED);}
+        CHECK(f.x==sideW && f.y==80);
+        WmMoveWindow(floating,10,90);CHECK(f.x==sideW && f.y==90); // cannot go under it
+        WmSetMaximized(floating,true);CHECK(f.x==sideW && f.clientW==sw-sideW-2*border);
+        WmSetMaximized(floating,false);CHECK(f.state==WindowState::Normal && f.x==sideW);
+        // Pinned, an outside click, Escape and the tile leave it shown.
+        CHECK(!WmDockDismissible() && !WmDockDismiss());
+        CHECK(!WmDockPress(sideW+100,400,sw,sh) && WmDockOpen());
+        WmDockToggle();CHECK(WmDockOpen() && b.focused);
+        {
+            static ChromeShellModel model{};
+            CHECK(dockSurface(dock) && WmCaptureShellModel(dock,sw,sh,0,-1,-1,model) && model.dockPinned);
+        }
+        // Unpinning reflows back to the full width; the dock stays open.
+        {
+            const auto l=ChromeDockLayoutFor(WmDesktopMetrics(),sw,uint32_t(desktopH),2,1,true);
+            CHECK(WmDockPress(l.pin.x+2,l.pin.y+2,sw,sh) && !WmDockPinned() && WmDockOpen());
+        }
+        CHECK(WmWorkArea(sw,sh).x==0 && c.x==0 && c.clientW==sw-2*border);
+        WmDockSetPinned(true);CHECK(c.x==sideW);
+
+        // Return Chat (floating when docked): back on the taskbar, focused,
+        // with its geometry, state and chrome. Pinned, the dock keeps Notes.
+        WmInputPop(&a,drain,256);
+        CHECK(WmDockReturnWindow(chat));
+        CHECK(!a.docked && !a.minimized && a.focused && !a.noChrome && a.state==WindowState::Normal);
+        CHECK(a.x==500 && a.y==100 && a.clientW==640 && a.clientH==480 && inTaskbar(chat));
+        {const auto e=lastResize(a);CHECK(e.type==WM_EVT_RESIZED && e.reserved==0 && e.x==640 && e.y==480);}
+        CHECK(WmDockEntryCount()==1 && WmDockOpen() && !b.minimized);
+
+        // A maximised window docks and returns maximised at today's work
+        // area, and its restore geometry survives.
+        WmSetFocus(big);WmDockFocusedWindow();
+        CHECK(c.docked && WmDockEntryCount()==2 && c.clientW==sideW);
+        WmSetFocus(big);CHECK(c.focused);
+        WmDockFocusedWindow(); // from the page: back to the desktop
+        CHECK(!c.docked && c.state==WindowState::Maximized && c.x==sideW && c.clientW==sw-sideW-2*border && c.focused);
+        WmSetMaximized(big,false);
+        CHECK(c.state==WindowState::Normal && c.x==600 && c.y==200 && c.clientW==500 && c.clientH==400);
+
+        // A page asking for fullscreen returns to the desktop first; true
+        // fullscreen covers the strip.
+        WmSetFocus(big);WmDockFocusedWindow();CHECK(c.docked);
+        CHECK(WmSetFullscreen(big,true) && !c.docked && c.fullscreen && c.clientW==sw);
+        WmSetFocus(big);CHECK(WmTaskbarHidden() && !dockSurface(dock) && !WmDockPointerOwned(1,10,sw,sh));
+        CHECK(WmSetFullscreen(big,false) && !c.fullscreen);
+
+        // Closing a docked window removes its entry; the last one unpins the
+        // work area (the setting stays) and the dock disappears.
+        CHECK(WmDockEntryCount()==1 && WmDockEntryWindow(0)==notes);
+        b.vfb=nullptr;WmDestroyWindowById(owner,b.wmId);
+        CHECK(WmDockEntryCount()==0 && !WmDockOpen() && !dockSurface(dock) && WmDockPinned());
+        CHECK(WmWorkArea(sw,sh).x==0 && c.x>=0 && f.x==sideW);
+        // The pin persists through the kernel-written dock.ini, saved by the
+        // launcher worker after each change, and parses back.
+        layoutWritable=true;layoutRenamed=false;layoutSyncs=0;
+        DockSaveState();
+        CHECK(layoutRenamed && !strcmp(layoutText,"[Dock]\npinned=1\n"));
+        layoutRenamed=false;layoutSyncs=0;DockSaveState();CHECK(!layoutRenamed); // nothing new to write
+        WmDockSetPinned(false);
+        DockSaveState();CHECK(layoutRenamed && !strcmp(layoutText,"[Dock]\npinned=0\n"));
+        {
+            char text[]="[Launcher]\npinned=1\n[Dock]\r\nwidth=420\r\npinned=1\r\n";
+            DockParseState(text);CHECK(WmDockPinned());
+            char off[]="[Dock]\npinned=0";DockParseState(off);CHECK(!WmDockPinned());
+        }
+        for(Window* w:{&a,&c,&f}){w->vfb=nullptr;WmDestroyWindowById(owner,w->wmId);}
+        CHECK(!lockDepth);
+        std::free(owner);
+    }
+    // Dock strip layout and hit test: icon cells, the wide selected tile
+    // with Return and Close, the pin at the end; the tab when closed.
+    {
+        const DesktopMetrics& m=DesktopMetric100;
+        const auto l=ChromeDockLayoutFor(m,1600,852,4,2,true);
+        CHECK(l.open && l.count==4 && l.selected==2 && l.strip.w==420 && l.strip.h==48 && l.page.y==48 && l.page.h==804);
+        CHECK(l.cells[0].x==0 && l.cells[0].w==42 && l.cells[1].x==42 && l.tile.x==84);
+        CHECK(l.pin.x==382 && l.pin.w==38 && l.tile.w==420-38-3*42 && l.cells[3].x==l.tile.x+l.tile.w);
+        CHECK(l.close.x+l.close.w==l.tile.x+l.tile.w && l.back.x+l.back.w==l.close.x && l.title.x==l.tile.x+42);
+        auto hit=[&](int x,int y){return ChromeDockHitTest(l,x,y);};
+        CHECK(hit(5,5).target==ChromeDockTarget::Entry && hit(5,5).index==0);
+        CHECK(hit(l.cells[3].x+1,1).target==ChromeDockTarget::Entry && hit(l.cells[3].x+1,1).index==3);
+        CHECK(hit(l.title.x+1,1).target==ChromeDockTarget::Tile && hit(l.title.x+1,1).index==2);
+        CHECK(hit(l.back.x+1,1).target==ChromeDockTarget::Return && hit(l.close.x+1,47).target==ChromeDockTarget::Close);
+        CHECK(hit(419,47).target==ChromeDockTarget::Pin && hit(5,48).target==ChromeDockTarget::None);
+        // At 200% everything scales; the sidebar never exceeds half the screen.
+        const auto big=ChromeDockLayoutFor(DesktopMetric200,3200,1704,1,0,true);
+        CHECK(big.strip.w==840 && big.strip.h==96 && big.tile.w==840-76);
+        CHECK(ChromeDockSidebar(m,600,500).w==300);
+        // Many entries: the tile keeps an icon cell and both buttons.
+        const auto many=ChromeDockLayoutFor(m,1600,852,20,15,true);
+        CHECK(many.count==1+(420-38-42-64)/42 && many.selected==many.count-1 && many.tile.w>=42+64);
+        // Closed: the tab only, and the strip is not hit.
+        const auto closed=ChromeDockLayoutFor(m,1600,852,3,1,false);
+        CHECK(!closed.open && closed.tab.x==0 && closed.tab.w==5 && closed.tab.h==120 && closed.tab.y==(852-120)/2);
+        CHECK(ChromeDockHitTest(closed,2,closed.tab.y+1).target==ChromeDockTarget::Tab);
+        CHECK(ChromeDockHitTest(closed,5,5).target==ChromeDockTarget::None);
+        CHECK(ChromeDockLayoutFor(m,1600,852,0,-1,false).tab.w==0);
     }
     // Web-app names are resolved by app ID on metadata changes and catalog
     // publication. The three chrome consumers share the derived title, while

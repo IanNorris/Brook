@@ -83,19 +83,22 @@ inline BrookDesktopSurface ChromeShellSurfaceRecord(uint32_t kind, const Desktop
     s.material = glass ? BROOK_DESKTOP_MATERIAL_GLASS : BROOK_DESKTOP_MATERIAL_OPAQUE;
     s.level = glass ? e.blur : 0;
     s.opacity = glass ? (materialOpacity > 255 ? 255 : materialOpacity) : 255;
-    if (glass && kind != BROOK_DESKTOP_SURFACE_TASKBAR) {
+    // The taskbar and the dock strip are flush with the screen edges: square,
+    // no panel shadow.
+    if (glass && kind != BROOK_DESKTOP_SURFACE_TASKBAR && kind != BROOK_DESKTOP_SURFACE_DOCK) {
         const uint32_t half = (s.width < s.height ? s.width : s.height) / 2;
         // Panels take the shell radius (12); a tooltip the small one (6).
         const uint32_t wanted = kind == BROOK_DESKTOP_SURFACE_TOOLTIP ? e.shellRadius / 2 : e.shellRadius;
         const uint32_t radius = wanted < half ? wanted : half;
         for (auto& corner : s.radii) corner = uint16_t(radius);
-        if (kind != BROOK_DESKTOP_SURFACE_TOOLTIP) {
-            s.shadow = BROOK_DESKTOP_SHADOW_PANEL;
-            s.shadowAlpha = 255;
-            s.shadowSpread = e.shadowSpread;
-            s.shadowCorner = radius + e.shadowSpread;
-            if (e.lightShadow) s.flags |= BROOK_DESKTOP_SURFACE_LIGHT_SHADOW;
-        }
+    }
+    if ((glass && kind != BROOK_DESKTOP_SURFACE_TASKBAR && kind != BROOK_DESKTOP_SURFACE_TOOLTIP) ||
+        kind == BROOK_DESKTOP_SURFACE_LAUNCHER) {
+        s.shadow = BROOK_DESKTOP_SHADOW_PANEL;
+        s.shadowAlpha = 255;
+        s.shadowSpread = e.shadowSpread;
+        s.shadowCorner = s.radii[0] + e.shadowSpread;
+        if (e.lightShadow) s.flags |= BROOK_DESKTOP_SURFACE_LIGHT_SHADOW;
     }
     if (!glass) s.flags |= BROOK_DESKTOP_SURFACE_OPAQUE;
     return s;

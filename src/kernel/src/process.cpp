@@ -56,8 +56,16 @@ static_assert(offsetof(Process,mountNamespaceMember)+sizeof(Process::mountNamesp
               "fork/thread snapshot must exclude both filesystem ownership fields");
 static_assert(offsetof(Process,fsContext)+sizeof(Process::fsContext)==offsetof(Process,oomEpisode),
               "recovery marker follows independently synchronized filesystem state");
-static_assert(offsetof(Process,pidNamespaceIds)>offsetof(Process,oomEpisode),
-              "raw fork/thread snapshot excludes all PID namespace ownership");
+// Fork/thread copy stops before this tail. Recovery, seccomp and PID
+// namespace ownership are initialized or retained explicitly.
+static_assert(offsetof(Process,oomEpisode)+sizeof(Process::oomEpisode)==offsetof(Process,seccompFilter),
+              "seccomp state directly follows the recovery marker");
+static_assert(offsetof(Process,pidNamespaceIds)>=offsetof(Process,seccompTrap)+sizeof(Process::seccompTrap),
+              "PID namespace identities follow seccomp state");
+static_assert(offsetof(Process,pidNamespaceForChildren)>=offsetof(Process,pidNamespaceIds)+sizeof(Process::pidNamespaceIds),
+              "the future child PID namespace follows the active identities");
+static_assert(sizeof(Process)-(offsetof(Process,pidNamespaceForChildren)+sizeof(Process::pidNamespaceForChildren))<alignof(Process),
+              "PID namespace ownership ends the process tail");
 
 namespace {
 IrqSpinLock signalActionLock;

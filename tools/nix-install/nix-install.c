@@ -640,16 +640,17 @@ static int unlink_package_libs(const char *store_name) {
  * .rgba icons from the host build are preserved.
  * ----------------------------------------------------------------------- */
 
-/* Simple .desktop file parser — extract Name, Exec, Icon, Categories */
+/* Simple .desktop file parser — extract Name, Exec, Icon, Categories and Comment */
 static int parse_desktop_entry(const char *path, char *name, size_t name_sz,
                                char *exec_cmd, size_t exec_sz,
                                char *icon, size_t icon_sz,
-                               char *categories, size_t cat_sz)
+                               char *categories, size_t cat_sz,
+                               char *comment, size_t comment_sz)
 {
     FILE *f = fopen(path, "r");
     if (!f) return -1;
 
-    name[0] = exec_cmd[0] = icon[0] = categories[0] = '\0';
+    name[0] = exec_cmd[0] = icon[0] = categories[0] = comment[0] = '\0';
     int in_desktop = 0;
     char line[1024];
 
@@ -671,6 +672,26 @@ static int parse_desktop_entry(const char *path, char *name, size_t name_sz,
             snprintf(icon, icon_sz, "%s", line + 5);
         else if (strncmp(line, "Categories=", 11) == 0)
             snprintf(categories, cat_sz, "%s", line + 11);
+        else if (strncmp(line, "Comment=", 8) == 0) {
+            size_t used = 0;
+            int space = 0;
+            const unsigned char *text = (const unsigned char *)line + 8;
+            while (*text) {
+                const unsigned char c = *text;
+                if (c <= ' ' || c == 127) { space = used != 0; ++text; continue; }
+                size_t width = c < 128 ? 1 : c >= 0xf0 ? 4 : c >= 0xe0 ? 3 : c >= 0xc2 ? 2 : 0;
+                size_t valid = 1;
+                for (; valid < width && (text[valid] & 0xc0) == 0x80; ++valid) {}
+                if (!width || valid < width || c > 0xf4) { ++text; continue; }
+                if (used + space + width >= comment_sz) break;
+                if (space) comment[used++] = ' ';
+                memcpy(comment + used, text, width);
+                used += width;
+                text += width;
+                space = 0;
+            }
+            comment[used] = '\0';
+        }
         else if (strncmp(line, "Hidden=true", 11) == 0) { fclose(f); return -1; }
         else if (strncmp(line, "NoDisplay=true", 14) == 0) { fclose(f); return -1; }
         else if (strcmp(line, "Terminal=true") == 0) { fclose(f); return -1; }
@@ -778,6 +799,7 @@ static void refresh_desktop_entries(void)
         char icon_file[256];
         char categories[256];
         char app_id[256];
+        char comment[64];
     } entries[MAX_PACKAGES];
     int entry_count = 0;
     char seen_names[MAX_PACKAGES][256];
@@ -792,11 +814,11 @@ static void refresh_desktop_entries(void)
             char desktop_path[1536];
             snprintf(desktop_path, sizeof(desktop_path), "%s/%s", PROFILE_APPS, de->d_name);
 
-            char name[256], exec_cmd[512], icon[256], categories[256];
+            char name[256], exec_cmd[512], icon[256], categories[256], comment[64];
             if (parse_desktop_entry(desktop_path, name, sizeof(name),
                                     exec_cmd, sizeof(exec_cmd),
                                     icon, sizeof(icon),
-                                    categories, sizeof(categories)) != 0)
+                                    categories, sizeof(categories), comment, sizeof(comment)) != 0)
                 continue;
 
             if (!desktop_exec_exists(exec_cmd)) continue;
@@ -907,6 +929,7 @@ static void refresh_desktop_entries(void)
             snprintf(entries[entry_count].icon_file, 256, "%s", icon_file);
             snprintf(entries[entry_count].categories, 256, "%s", categories);
             snprintf(entries[entry_count].app_id, 256, "%.*s", (int)(nlen-8), de->d_name);
+            snprintf(entries[entry_count].comment, sizeof(comment), "%s", comment);
             entry_count++;
         }
         closedir(apps);
@@ -918,9 +941,11 @@ static void refresh_desktop_entries(void)
         return;
     }
     for (int i = 0; i < entry_count; i++) {
-        fprintf(idx, "%s\t%s\t%s\t%s\t%s\n",
+        fprintf(idx, "%s\t%s\t%s\t%s\t%s",
                 entries[i].name, entries[i].exec_cmd,
                 entries[i].icon_file, entries[i].categories, entries[i].app_id);
+        if (entries[i].comment[0]) fprintf(idx, "\t%s", entries[i].comment);
+        fputc('\n', idx);
     }
     int published = fflush(idx)==0;
     if (published && fsync(fileno(idx))!=0) published=0;

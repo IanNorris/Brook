@@ -262,6 +262,21 @@ struct Window
     uint16_t    fsCaptionInsetRight, fsCaptionInsetTop, fsCaptionHeight;
     uint32_t    fsCaptionStyle;
 
+    // Side dock (wm_shell_dock.inc). A docked window keeps running but leaves
+    // the taskbar, Alt+Tab and automatic focus. While docked it is placed as
+    // the dock's page: the sidebar rectangle below the strip, no server-side
+    // chrome, state Maximized (so the client is configured tiled and moves
+    // are refused). It is drawn only while it is the selected page of a shown
+    // dock; otherwise it is hidden through `minimized`, which every draw and
+    // hit path already skips. The dk* fields hold what returning restores.
+    bool        docked;
+    WindowState dkState;
+    int16_t     dkX, dkY;
+    uint16_t    dkW, dkH;
+    bool        dkNoChrome, dkCaptionOverlay;
+    uint16_t    dkCaptionInsetRight, dkCaptionInsetTop, dkCaptionHeight;
+    uint32_t    dkCaptionStyle;
+
     // Outer dimensions including chrome.  CSD (noChrome) windows have
     // no kernel chrome, so outer == client.
     const DesktopMetrics& desktopMetrics() const { return metrics ? *metrics : DesktopMetric100; }
@@ -377,7 +392,7 @@ bool WmTaskbarHidden();
 uint32_t WmTaskbarTop(uint32_t screenH);
 
 // Set maximise state idempotently.
-void WmSetMaximized(int idx, bool enable);
+void WmSetMaximized(int idx, bool enable, bool acknowledge = false);
 
 // Minimize a window (hide from desktop, show in taskbar).
 void WmMinimizeWindow(int idx);
@@ -522,6 +537,41 @@ int WmTaskbarHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)
 
 // Get the usable desktop height (screen height minus taskbar).
 uint32_t WmDesktopHeight(uint32_t screenH);
+// The work area: the desktop above the taskbar, less the side dock's width
+// while it is pinned with entries. Maximise and tiling use it.
+WmRect WmWorkArea(uint32_t screenW, uint32_t screenH);
+
+// Side dock (wm_shell_dock.inc). Compositor thread.
+// The dock's shell surface: the strip while shown, the edge tab while closed
+// with entries. False when nothing of the dock is drawn.
+bool WmDockSurfaceRect(uint32_t screenW, uint32_t screenH, int32_t* x, int32_t* y, uint32_t* w, uint32_t* h,
+                       bool* material);
+// The pointer is over the strip or the tab: shell input, not a window's.
+bool WmDockPointerOwned(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH);
+// A primary press. True when the strip or tab consumed it. A press outside a
+// shown, unpinned sidebar closes the dock and returns false (it still reaches
+// what lies beneath).
+bool WmDockPress(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH);
+// Super+S: open on the last page (or the first entry), or close.
+void WmDockToggle();
+// Super+Shift+S: dock the focused window, or return the focused page.
+void WmDockFocusedWindow();
+// Escape and the launcher: hide an open, unpinned dock. True if it closed.
+bool WmDockDismiss();
+// Open and unpinned: Escape belongs to the dock.
+bool WmDockDismissible();
+bool WmDockWindow(int idx);
+bool WmDockReturnWindow(int idx);
+bool WmDockSelect(int entry);
+void WmDockSetPinned(bool pinned);
+bool WmDockPinned();
+bool WmDockOpen();
+uint32_t WmDockEntryCount();
+int WmDockEntryWindow(uint32_t entry);
+// Alt+Tab: send the frontmost desktop window back and focus the next one.
+// Docked windows take no part; an open, unpinned dock closes first. Returns
+// the newly focused window, or -1.
+int WmCycleFocus();
 
 // Spawn a new terminal window (Super+Enter handler).
 void WmSpawnTerminal();
@@ -674,7 +724,7 @@ static constexpr uint32_t WM_RESIZE_RESIZING = 2;
 static constexpr uint32_t WM_RESIZE_FULLSCREEN = 4; // never with MAXIMIZED
 
 // Push a synthetic WM event into the per-window queue.  Drops on overflow.
-bool WmPushWmEvent(Window* win, uint8_t type, int16_t x = 0, int16_t y = 0);
+bool WmPushWmEvent(Window* win, uint8_t type, int16_t x = 0, int16_t y = 0, uint32_t resizeFlags = 0);
 // Kernel-authenticated socket origin, associated by the provider. Immutable
 // after the first registration, and only for a window owned by that provider.
 bool WmRegisterClientOrigin(Process* provider,uint32_t wmId,uint16_t clientPid,
@@ -763,6 +813,7 @@ void WmLauncherScroll(int delta120, uint32_t screenW, uint32_t screenH);
 int WmLauncherHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH);
 // Pointer press (secondary: right button) while the launcher is open; false
 // when outside the panel. Keys while it is open (scan, translated ASCII, mods).
+bool WmLauncherGesture(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH, bool released);
 bool WmLauncherPress(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH, bool secondary);
 void WmLauncherKey(uint8_t scan, char ascii, uint8_t modifiers);
 

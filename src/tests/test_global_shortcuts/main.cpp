@@ -143,8 +143,40 @@ static void launcherTyping() {
     CHECK(down(s,0x11,0,closed).deliver && up(s,0x11,0,launcher).deliver);
 }
 
+// Side dock: Super+S toggles it, Super+Shift+S docks or returns the focused
+// window, Escape hides an open unpinned dock (and is then not delivered).
+static void dockKeys() {
+    GlobalShortcuts s;
+    using G=GlobalShortcuts;
+    CHECK(!down(s,SC_LSUPER,INPUT_MOD_SUPER).deliver);
+    auto r=down(s,G::ScS,INPUT_MOD_SUPER);CHECK(!r.deliver && r.action==Action::ToggleDock);
+    r=down(s,G::ScS,INPUT_MOD_SUPER);CHECK(!r.deliver && r.action==Action::None); // auto-repeat: once
+    CHECK(!up(s,G::ScS,INPUT_MOD_SUPER).deliver);
+    r=down(s,G::ScS,INPUT_MOD_SUPER|INPUT_MOD_LSHIFT);CHECK(!r.deliver && r.action==Action::DockFocusedWindow);
+    CHECK(!up(s,G::ScS,INPUT_MOD_SUPER|INPUT_MOD_LSHIFT).deliver);
+    r=down(s,G::ScS,INPUT_MOD_SUPER|INPUT_MOD_RSHIFT);CHECK(r.action==Action::DockFocusedWindow);
+    up(s,G::ScS);
+    CHECK(up(s,SC_LSUPER).action==Action::None); // a chord, not a launcher tap
+    // Plain S reaches the client.
+    r=down(s,G::ScS);CHECK(r.deliver && r.action==Action::None);CHECK(up(s,G::ScS).deliver);
+    // Escape belongs to an open, unpinned dock; otherwise to the client.
+    GlobalShortcutContext dock{};dock.dockDismissible=true;
+    r=down(s,G::ScEscape,0,dock);CHECK(!r.deliver && r.action==Action::CloseDock);
+    CHECK(!up(s,G::ScEscape,0,dock).deliver);
+    r=down(s,G::ScEscape);CHECK(r.deliver && r.action==Action::None);CHECK(up(s,G::ScEscape).deliver);
+    // The volume popup's Escape comes first; the launcher owns its keys.
+    GlobalShortcutContext both=dock;both.volumePopupVisible=true;
+    CHECK(down(s,G::ScEscape,0,both).action==Action::CloseVolumePopup);up(s,G::ScEscape);
+    GlobalShortcutContext launcher{};launcher.launcherVisible=true;
+    CHECK(down(s,G::ScS,0,launcher).action==Action::LauncherKey);up(s,G::ScS);
+    // Super+S still toggles the dock over the launcher.
+    CHECK(down(s,SC_LSUPER,INPUT_MOD_SUPER,launcher).releasePointer);
+    CHECK(down(s,G::ScS,INPUT_MOD_SUPER,launcher).action==Action::ToggleDock);
+    up(s,G::ScS,INPUT_MOD_SUPER,launcher);up(s,SC_LSUPER,0,launcher);
+}
+
 int main() {
-    superTap();superChord();altF4();escape();launcherPrompt();launcherTyping();
+    superTap();superChord();altF4();escape();launcherPrompt();launcherTyping();dockKeys();
     std::puts("global shortcuts: ok");
     return 0;
 }

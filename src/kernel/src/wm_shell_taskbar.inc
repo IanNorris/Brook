@@ -39,7 +39,7 @@ static TaskbarLayout GetTaskbarLayout(uint32_t screenW, uint32_t screenH)
     for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
     {
         const Window& w = g_windows[i];
-        if (!w.proc || !w.visible || !w.focusable) continue;
+        if (!w.proc || !w.visible || !w.focusable || w.docked) continue; // docked: the dock's
         if (w.focused) focused = total;
         labels[total] = WindowDisplayTitle(w);
         ids[total++] = static_cast<int>(i);
@@ -464,6 +464,19 @@ static void WmCapturePerformanceHud(uint32_t sw, uint32_t sh, ChromeShellModel& 
     WmCaptureThermal(snapshot.telemetry, model.telemetry, true);
 }
 
+static void WmCaptureTaskbarInitial(ChromeShellEntry& entry, const LauncherItem* item, const char* title)
+{
+    int app = -1;
+    if (item) {
+        char key[LauncherLimits::KeyLength];
+        LauncherItemKey(*item, key);
+        app = g_launcherModel.FindApp(key);
+    }
+    const char* name = app >= 0 ? g_launcherModel.Name(uint32_t(app)) : item ? item->title : title;
+    entry.initial = *name ? *name : '?';
+    entry.color = app >= 0 ? g_launcherModel.IconColor(uint32_t(app)) : LauncherColor::Slate;
+}
+
 static void WmCaptureTaskbar(uint32_t screenW, uint32_t screenH, uint64_t uptimeMs,
                              int32_t mouseX, int32_t mouseY, ChromeShellModel& snapshot)
 {
@@ -483,10 +496,16 @@ static void WmCaptureTaskbar(uint32_t screenW, uint32_t screenH, uint64_t uptime
             SpinLockAcquire(&g_launchLock);
             entry.busy = g_launches.entries[slot].busy();
             if (g_launchRequests[slot].hasIcon) WmCaptureShellIcon(icon, g_launchRequests[slot].icon);
+            else {
+                const auto& launch = g_launches.entries[slot];
+                const LauncherItem* matched = nullptr;
+                for (uint32_t item = 0; item < icons.get().count && !matched; ++item)
+                    if (LaunchFeedbackTable::Exact(icons.get().items[item].catalogId, launch.identity)) matched = &icons.get().items[item];
+                WmCaptureTaskbarInitial(entry, matched, launch.title);
+            }
             SpinLockRelease(&g_launchLock);
             entry.launch = true;
             busy |= entry.busy;
-            if (!icon.present) WmCaptureShellIcon(icon, icons.get().applicationIcon);
             continue;
         }
         const Window& window = g_windows[index];
@@ -494,7 +513,9 @@ static void WmCaptureTaskbar(uint32_t screenW, uint32_t screenH, uint64_t uptime
         entry.minimized = window.minimized;
         if (layout.buttons[i].w >= int(WmMetric(ChromeShellMetrics::TaskbarLabelMin)))
             WmStrCopy(entry.label, WindowDisplayTitle(window), sizeof(entry.label));
-        WmCaptureShellIcon(icon, WindowIcon(window, icons.get()));
+        const LauncherItem* matched = nullptr;
+        WmCaptureShellIcon(icon, WindowIcon(window, icons.get(), &matched));
+        if (!icon.present) WmCaptureTaskbarInitial(entry, matched, WindowDisplayTitle(window));
     }
     layout.nextIndex = 0;
     snapshot.launcherOpen = g_launcherOpen;

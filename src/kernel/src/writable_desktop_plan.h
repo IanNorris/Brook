@@ -28,6 +28,19 @@ inline bool WritableDesktopPlanParse(const char* record,uint32_t bytes,WritableD
     if(!any)return false;
     out=plan;return true;
 }
+// A managed profile's current alias must name a sibling generation exactly:
+// ".brook-profile-legacy" or ".brook-profile-" plus 32 lowercase hex digits.
+inline bool WritableDesktopGenerationName(const char* name,int length) {
+    constexpr char prefix[]=".brook-profile-";constexpr int prefixLength=sizeof(prefix)-1;
+    if(!name || length<=prefixLength)return false;
+    for(int i=0;i<prefixLength;++i)if(name[i]!=prefix[i])return false;
+    const char* tail=name+prefixLength;const int tailLength=length-prefixLength;
+    constexpr char legacy[]="legacy";
+    if(tailLength==6){for(int i=0;i<6;++i)if(tail[i]!=legacy[i])return false;return true;}
+    if(tailLength!=32)return false;
+    for(int i=0;i<32;++i){const char c=tail[i];if(!((c>='0'&&c<='9')||(c>='a'&&c<='f')))return false;}
+    return true;
+}
 inline bool WritableDesktopPlanSame(const WritableDesktopPlan& a,const WritableDesktopPlan& b){
     if(a.bytes!=b.bytes)return false;
     for(unsigned i=0;i<16;++i)if(a.uuid[i]!=b.uuid[i])return false;return true;

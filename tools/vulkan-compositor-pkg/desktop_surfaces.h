@@ -32,7 +32,7 @@ struct DesktopSurfaceSet {
 };
 
 static inline int desktop_surface_valid(const struct BrookDesktopSurface *s){
-    if(!s || s->kind<BROOK_DESKTOP_SURFACE_FRAME || s->kind>BROOK_DESKTOP_SURFACE_PERFORMANCE_HUD)return 0;
+    if(!s || s->kind<BROOK_DESKTOP_SURFACE_FRAME || s->kind>BROOK_DESKTOP_SURFACE_DOCK)return 0;
     if(!s->width || !s->height || s->width>BROOK_VK_MAX_DIMENSION || s->height>BROOK_VK_MAX_DIMENSION)return 0;
     if(s->x<-BROOK_VK_MAX_DIMENSION || s->x>BROOK_VK_MAX_DIMENSION || s->y<-BROOK_VK_MAX_DIMENSION || s->y>BROOK_VK_MAX_DIMENSION)return 0;
     if(s->opacity>255 || s->material>BROOK_DESKTOP_MATERIAL_GLASS || s->shadow>BROOK_DESKTOP_SHADOW_PANEL)return 0;

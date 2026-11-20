@@ -37,6 +37,7 @@ struct BrookDebugFrameInfoV3 {
  * WINDOW_BUFFER copies the current client buffer of the named window
  * (unoccluded, buffer pixels, no chrome) instead of the screen; it fails
  * with -ENOENT for an unknown window and -EOPNOTSUPP without a CPU buffer.
+ * CURSOR and WINDOW_BUFFER cannot be combined.
  * Op 7 fills BrookDebugFrameInfoV4 (exact length) for the same token.
  * Sources 4..7 extend the V2 source field: on Dell builds full-screen
  * captures read the surface primary plane A is fetching (DSPASURFLIVE), so
@@ -112,7 +113,7 @@ struct BrookDesktopOverlayBandsV2 {
  * (layers ABI v2, struct BrookDesktopSurface in desktop_layers_abi.h) of the
  * same capture lease, back to front: kind, rectangle, material, opacity,
  * radii, shadow and content key. The pointer is not a surface. */
-enum { BROOK_DESKTOP_OVERLAY_SURFACES=10, BROOK_DESKTOP_OVERLAY_MAX_SURFACES=4 };
+enum { BROOK_DESKTOP_OVERLAY_SURFACES=10, BROOK_DESKTOP_OVERLAY_MAX_SURFACES=5 };
 struct BrookDesktopOverlayInfo {
     struct BrookDebugFrameInfo frame;
     uint64_t generation;

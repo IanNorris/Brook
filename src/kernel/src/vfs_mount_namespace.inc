@@ -240,6 +240,7 @@ int VfsMountNamespaceInfo(MountNamespace* ns,const VfsPath& root,VfsMountInfo** 
                 if(!id || id>0x7ffffffeULL || parentId>0x7ffffffeULL) {error=-75;break;}
                 auto& row=rows[used++];row.id=id;row.parent=parentId;
                 row.device=mount.rootDevice;row.attributes=mount.attributes;
+                row.systemInternal=mount.backing->systemInternal;
                 StrCopy(row.root,mount.physicalRoot,sizeof(row.root));
                 if(mount.rootFileUnlinked) {
                     constexpr const char* suffix=" (deleted)";uint32_t length=StrLen(row.root);
@@ -823,6 +824,16 @@ int VfsMountNamespaceDetach(MountNamespace* ns,const VfsPath& target)
        lease.value.object->identity!=selected->rootIdentity || lease.value.object->ops!=selected->rootObjectOps)return -22;
     if(selected==ns->root)return -95;
     if(selected->lockedInherited)return -22;
+    // Namespaces can detach their own views. Detaching a protected boot
+    // volume, directly or via an ancestor, is forbidden in the initial one.
+    if(ns->initial)for(const auto& mount:g_mounts) {
+        if(mount.owner!=ns || !mount.backing->systemInternal)continue;
+        auto* ancestor=&mount;
+        for(uint32_t depth=0;ancestor && depth<VFS_MAX_MOUNT_DEPTH;++depth) {
+            if(ancestor==selected)return -16;
+            ancestor=static_cast<MountEntry*>(ancestor->covered.attachment);
+        }
+    }
     // Pre-mark the subtree before changing parent edges, so recursive detach
     // cannot lose descendants when a parent is unlinked first.
     for(auto& mount:g_mounts)if(mount.owner==ns) {

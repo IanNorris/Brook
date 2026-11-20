@@ -71,7 +71,8 @@ int main(){
             const bool material = true;
             const auto o=ChromeShellSurfaceRecord(kind,{0,1000,1920,80},material,77,180,opaque);
             const auto g=ChromeShellSurfaceRecord(kind,{0,1000,1920,80},material,77,180,glass);
-            CHECK(o.kind==kind && o.key==77 && o.opacity==255 && (o.flags&BROOK_DESKTOP_SURFACE_OPAQUE) && !o.radii[0] && !o.shadow);
+            CHECK(o.kind==kind && o.key==77 && o.opacity==255 && (o.flags&BROOK_DESKTOP_SURFACE_OPAQUE) && !o.radii[0]);
+            CHECK(o.shadow == (kind == BROOK_DESKTOP_SURFACE_LAUNCHER ? BROOK_DESKTOP_SHADOW_PANEL : BROOK_DESKTOP_SHADOW_NONE));
             CHECK(g.material==(material?BROOK_DESKTOP_MATERIAL_GLASS:BROOK_DESKTOP_MATERIAL_OPAQUE));
             CHECK(g.opacity==180 && !(g.flags&BROOK_DESKTOP_SURFACE_OPAQUE));
             const bool panel = kind != BROOK_DESKTOP_SURFACE_TASKBAR;

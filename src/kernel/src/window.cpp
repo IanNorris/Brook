@@ -105,7 +105,7 @@ bool WmSetScale(uint32_t percent) {
     __atomic_store_n(&g_requestedScale,percent,__ATOMIC_RELEASE);
     CompositorWake();return true;
 }
-static bool ResizeWindowLocked(int idx,uint16_t newClientW,uint16_t newClientH);
+static bool ResizeWindowLocked(int idx, uint16_t newClientW, uint16_t newClientH, bool interactive = false);
 static void FocusWindowLocked(int idx);
 
 // Clearwater (refactor stages 2.2 and 2.3): the saved selection (theme,
@@ -427,6 +427,15 @@ static uint64_t g_windowIdentity = 0;
 static int g_taskbarPageTarget = -1;
 static uint32_t g_nextZOrder = 1;  // 0 = backmost, higher = front
 
+// Side dock (wm_shell_dock.inc, included below the launcher). Under g_vfbLock.
+static void DockForgetLocked(int idx);
+static bool DockReturnLocked(int idx, bool focus);
+static bool DockKeepOutLocked(Window& w);
+static WmRect WorkAreaFor(const DesktopMetrics& m, uint32_t screenW, uint32_t screenH);
+static bool DockPlaceLocked(int idx, const DesktopMetrics& m, uint32_t screenW, uint32_t screenH);
+static void DockLoadState();
+static void DockSaveState();
+
 // Protected by g_vfbLock; only the published active bit is read lock-free by
 // rendering. The lease is bound to the window creation identity, not its slot.
 static int g_pointerCaptureIndex=-1;
@@ -682,6 +691,7 @@ static LauncherModel g_launcherModel;
 static void LauncherLoadLayout();
 static void LauncherSyncModel(const LauncherSnapshot& catalog);
 static void LauncherSaveLayout();
+static void LauncherItemKey(const LauncherItem&, char (&key)[LauncherLimits::KeyLength]);
 static void LauncherPowerRun(LauncherPowerCommand command);
 
 // Requests own all metadata/icon pixels, never launcher snapshot pointers.
@@ -718,7 +728,8 @@ void WmLaunchFeedbackPoll()
     {
         VfbGuard windows;
         for (const auto& w : g_windows) {
-            if (!w.proc || !w.visible || !w.focusable) continue;
+            // A docked window never answers a new launch: it is not shown.
+            if (!w.proc || !w.visible || !w.focusable || w.docked) continue;
             SpinLockAcquire(&g_launchLock);
             g_launchHistory.Observe(w.clientLaunchId,w.clientOrigin==WmClientOrigin::RegisteredUnixPeer,
                 w.creationIdentity,w.appId,w.wmId,w.creationIdentity,now);
@@ -937,23 +948,28 @@ static bool WmTitleHasAppName(const char* title, const char* name)
     return false;
 }
 
-static const uint32_t* WindowIcon(const Window& w, const LauncherSnapshot& launcher)
+static const uint32_t* WindowIcon(const Window& w, const LauncherSnapshot& launcher,
+                                  const LauncherItem** matched = nullptr)
 {
     if (WmEqualI(w.appId, "terminal")) return launcher.terminalIcon ? launcher.terminalIcon : launcher.applicationIcon;
+    const auto use = [&](const LauncherItem& item) {
+        if (matched) *matched = &item;
+        return item.iconPixels;
+    };
     // Explicit desktop identity takes precedence over executable/name guesses.
     for (uint32_t i = 0; i < launcher.count; ++i)
     {
         const LauncherItem& item = launcher.items[i];
-        if (item.valid && item.iconPixels && w.appId[0] && item.appId[0] && WmEqualI(w.appId, item.appId))
-            return item.iconPixels;
+        if (item.valid && (matched || item.iconPixels) && w.appId[0] && item.appId[0] && WmEqualI(w.appId, item.appId))
+            return use(item);
     }
     const char* executable = w.proc ? WmBaseName(w.proc->exePath) : "";
     for (uint32_t i = 0; i < launcher.count; ++i)
     {
         const LauncherItem& item = launcher.items[i];
-        if (!item.valid || item.isUserDesktopEntry || !item.iconPixels || !item.executable[0]) continue;
+        if (!item.valid || item.isUserDesktopEntry || (!matched && !item.iconPixels) || !item.executable[0]) continue;
         if ((w.appId[0] && WmEqualI(w.appId, item.executable)) ||
-            (executable[0] && WmEqualI(executable, item.executable))) return item.iconPixels;
+            (executable[0] && WmEqualI(executable, item.executable))) return use(item);
     }
     // Legacy native windows have no app_id. Their title is only a last resort;
     // an unknown explicit ID must not acquire another app's icon by title.
@@ -962,9 +978,9 @@ static const uint32_t* WindowIcon(const Window& w, const LauncherSnapshot& launc
         if (w.proc && TerminalFindByProcess(w.proc)) return launcher.terminalIcon ? launcher.terminalIcon : launcher.applicationIcon;
         for (uint32_t i = 0; i < launcher.count; ++i)
             if (launcher.items[i].valid && !launcher.items[i].isUserDesktopEntry &&
-                launcher.items[i].iconPixels && WmTitleHasAppName(w.title, launcher.items[i].title)) return launcher.items[i].iconPixels;
+                (matched || launcher.items[i].iconPixels) && WmTitleHasAppName(w.title, launcher.items[i].title)) return use(launcher.items[i]);
     }
-    return launcher.applicationIcon;
+    return matched ? nullptr : launcher.applicationIcon;
 }
 
 // ---------------------------------------------------------------------------
@@ -1053,6 +1069,7 @@ static int CreateWindowLocked(Process* proc, int16_t x, int16_t y,
     w.minimized = false;
     w.noChrome = false;
     w.fullscreen = false;
+    w.docked = false;
     w.captionOverlay = false;
     w.captionInsetRight = w.captionInsetTop = w.captionHeight = 0;
     w.captionStyle = 0;
@@ -1075,6 +1092,7 @@ static int CreateWindowLocked(Process* proc, int16_t x, int16_t y,
     w.externalCaptured = false;
     w.externalW = w.externalH = 0;
     w.wmId      = static_cast<uint16_t>(idx + 1);
+    DockKeepOutLocked(w); // a pinned dock's sidebar is outside the work area
     if (proc) {proc->fbDestX=w.clientX();proc->fbDestY=w.clientY();}
     w.inputHead = 0;
     w.inputTail = 0;
@@ -1138,6 +1156,8 @@ static void DestroyWindowLocked(int idx)
     w.wmId = 0;
     w.proc = nullptr;
     w.visible = false;
+    // A docked window's entry goes with it (the dock may show its neighbour).
+    if (w.docked) DockForgetLocked(idx);
 
     if (g_focusedIdx == idx)
     {
@@ -1148,6 +1168,7 @@ static void DestroyWindowLocked(int idx)
         for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
         {
             if (g_windows[i].proc && g_windows[i].visible && g_windows[i].focusable
+                && !g_windows[i].minimized && !g_windows[i].docked
                 && g_windows[i].zOrder >= bestZ)
             {
                 bestZ = g_windows[i].zOrder;
@@ -1274,9 +1295,15 @@ static void FocusWindowLocked(int idx)
 
 void WmSetFocus(int idx) { VfbGuard guard;FocusWindowLocked(idx); }
 
+static void SendToBackLocked(int idx);
 void WmSendToBack(int idx)
 {
     VfbGuard guard;
+    SendToBackLocked(idx);
+}
+
+static void SendToBackLocked(int idx)
+{
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
     if (!g_windows[idx].proc) return;
 
@@ -1335,6 +1362,13 @@ void WmSetClientSideDecoration(int idx, bool enable, bool captionOverlay,
         w.fsNoChrome = enable; w.fsCaptionOverlay = captionOverlay;
         w.fsCaptionInsetRight = insetRight; w.fsCaptionInsetTop = insetTop;
         w.fsCaptionHeight = captionHeight; w.fsCaptionStyle = captionStyle;
+        return;
+    }
+    if (w.docked) {
+        // The page has no chrome; returning to the desktop applies this.
+        w.dkNoChrome = enable; w.dkCaptionOverlay = captionOverlay;
+        w.dkCaptionInsetRight = insetRight; w.dkCaptionInsetTop = insetTop;
+        w.dkCaptionHeight = captionHeight; w.dkCaptionStyle = captionStyle;
         return;
     }
     if (w.noChrome == enable && w.captionOverlay == captionOverlay &&
@@ -1399,14 +1433,19 @@ uint32_t WmWindowCount()
     return n;
 }
 
-static void SetMaximizedLocked(int idx, bool enable)
+static void SetMaximizedLocked(int idx, bool enable, bool acknowledge = false)
 {
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
     Window& w = g_windows[idx];
     if (!w.proc) return;
-    // Fullscreen owns the geometry; leaving it restores the earlier state.
-    if (w.fullscreen) return;
-    if ((w.state == WindowState::Maximized) == enable) return;
+    // Fullscreen and the dock own the geometry; leaving restores the earlier state.
+    if (w.fullscreen || w.docked || (w.state == WindowState::Maximized) == enable) {
+        // xdg-shell requires a configure in response to each request, even
+        // when the compositor keeps the current state.
+        if (acknowledge && w.vfb)
+            WmPushWmEvent(&w, WM_EVT_RESIZED, int16_t(w.clientW), int16_t(w.clientH));
+        return;
+    }
 
     uint32_t screenW, screenH;
     CompositorGetPhysDims(&screenW, &screenH);
@@ -1418,10 +1457,11 @@ static void SetMaximizedLocked(int idx, bool enable)
     const auto savedX=w.savedX,savedY=w.savedY;
     const auto savedW=w.savedW,savedH=w.savedH;
 
+    const WmRect area = WorkAreaFor(w.desktopMetrics(), screenW, screenH);
     if (w.state == WindowState::Normal)
     {
-        const int64_t width = static_cast<int64_t>(screenW) - (w.noChrome ? 0 : 2 * w.metric(WM_BORDER_WIDTH));
-        const int64_t height = static_cast<int64_t>(WmDesktopHeight(screenH)) -
+        const int64_t width = static_cast<int64_t>(area.w) - (w.noChrome ? 0 : 2 * w.metric(WM_BORDER_WIDTH));
+        const int64_t height = static_cast<int64_t>(area.h) -
             (w.noChrome ? 0 : w.metric(WM_TITLE_BAR_HEIGHT) + 2 * w.metric(WM_BORDER_WIDTH));
         if (width < WM_MIN_WIDTH || height < WM_MIN_HEIGHT || width > 65535 || height > 65535) return;
         // Save current geometry
@@ -1430,10 +1470,11 @@ static void SetMaximizedLocked(int idx, bool enable)
         w.savedW = w.clientW;
         w.savedH = w.clientH;
 
-        // Maximize: fill desktop area (screen minus taskbar) minus chrome.
-        // CSD windows have no chrome, so the client area takes the full space.
-        w.x = 0;
-        w.y = 0;
+        // Maximize: fill the work area (screen minus taskbar and a pinned
+        // dock) minus chrome. CSD windows have no chrome, so the client area
+        // takes the full space.
+        w.x = static_cast<int16_t>(area.x);
+        w.y = static_cast<int16_t>(area.y);
         newW = static_cast<uint16_t>(width);
         newH = static_cast<uint16_t>(height);
         w.state = WindowState::Maximized;
@@ -1450,6 +1491,7 @@ static void SetMaximizedLocked(int idx, bool enable)
         newW = w.savedW;
         newH = w.savedH;
         w.state = WindowState::Normal;
+        DockKeepOutLocked(w);
     }
 
     // Route through WmResizeWindow so terminal VFBs / SIGWINCH paths fire.
@@ -1461,7 +1503,11 @@ static void SetMaximizedLocked(int idx, bool enable)
     w.proc->fbDestX=w.clientX();w.proc->fbDestY=w.clientY();
 }
 
-void WmSetMaximized(int idx,bool enable) { VfbGuard guard;SetMaximizedLocked(idx,enable); }
+void WmSetMaximized(int idx, bool enable, bool acknowledge)
+{
+    VfbGuard guard;
+    SetMaximizedLocked(idx, enable, acknowledge);
+}
 
 void WmToggleMaximize(int idx)
 {
@@ -1477,6 +1523,8 @@ static bool SetFullscreenLocked(int idx, bool enable)
     Window& w = g_windows[idx];
     if (!w.proc) return false;
     if (w.fullscreen == enable) return true;
+    // A page asking for fullscreen goes back to the desktop first.
+    if (enable && w.docked && !DockReturnLocked(idx, false)) return false;
     if (enable) {
         uint32_t screenW = 0, screenH = 0;
         CompositorGetPhysDims(&screenW, &screenH);
@@ -1553,6 +1601,7 @@ static void MoveWindowLocked(int idx, int16_t newX, int16_t newY)
     if (w.state == WindowState::Maximized) return;
     w.x = newX;
     w.y = newY;
+    DockKeepOutLocked(w); // floating windows cannot be placed under a pinned dock
     w.proc->fbDestX=w.clientX();w.proc->fbDestY=w.clientY();
     extern void CompositorMarkDirty();
     CompositorMarkDirty();
@@ -1606,7 +1655,7 @@ int WmPlaceOwnedWindow(Process* proc, uint32_t wmId, uint64_t incarnation,
     return 0;
 }
 
-static bool ResizeWindowLocked(int idx, uint16_t newClientW, uint16_t newClientH)
+static bool ResizeWindowLocked(int idx, uint16_t newClientW, uint16_t newClientH, bool interactive)
 {
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return false;
     Window& w = g_windows[idx];
@@ -1646,7 +1695,8 @@ static bool ResizeWindowLocked(int idx, uint16_t newClientW, uint16_t newClientH
         WmPushWmEvent(&w,
                       WM_EVT_RESIZED,
                       static_cast<int16_t>(newClientW),
-                      static_cast<int16_t>(newClientH));
+                      static_cast<int16_t>(newClientH),
+                      interactive ? WM_RESIZE_RESIZING : 0);
     }
     else
     {
@@ -1661,7 +1711,7 @@ static bool ResizeWindowLocked(int idx, uint16_t newClientW, uint16_t newClientH
 bool WmResizeWindow(int idx,uint16_t newClientW,uint16_t newClientH)
 {
     VfbGuard guard;
-    return ResizeWindowLocked(idx,newClientW,newClientH);
+    return ResizeWindowLocked(idx,newClientW,newClientH,true);
 }
 
 bool WmApplyScalePending()
@@ -1680,6 +1730,18 @@ bool WmApplyScalePending()
             w.fsX=static_cast<int16_t>(saved.x);w.fsY=static_cast<int16_t>(saved.y);
             w.metrics=next;continue;
         }
+        if (w.docked) {
+            // The page follows the sidebar; the floating geometry it returns
+            // to is reframed for its own chrome.
+            auto saved=ReframeDesktopWindow({w.dkX,w.dkY,w.dkW,w.dkH,w.dkNoChrome},before,*next,sw,desktopH,false);
+            auto restore=ReframeDesktopWindow({w.savedX,w.savedY,w.savedW,w.savedH,w.dkNoChrome},before,*next,sw,desktopH,false);
+            w.dkX=static_cast<int16_t>(saved.x);w.dkY=static_cast<int16_t>(saved.y);
+            w.savedX=static_cast<int16_t>(restore.x);w.savedY=static_cast<int16_t>(restore.y);
+            w.metrics=next;
+            DockPlaceLocked(static_cast<int>(&w-g_windows),*next,sw,sh);
+            w.proc->fbDestX=w.clientX();w.proc->fbDestY=w.clientY();
+            continue;
+        }
         auto rect=ReframeDesktopWindow({w.x,w.y,w.clientW,w.clientH,w.noChrome},before,*next,sw,desktopH,!w.noChrome && w.focusable);
         auto saved=ReframeDesktopWindow({w.savedX,w.savedY,w.savedW,w.savedH,w.noChrome},before,*next,sw,desktopH,false);
         w.metrics=next;w.x=static_cast<int16_t>(rect.x);w.y=static_cast<int16_t>(rect.y);
@@ -1687,9 +1749,10 @@ bool WmApplyScalePending()
         if (w.state==WindowState::Maximized) {
             const int border=w.noChrome ? 0 : next->border();
             const int title=w.noChrome ? 0 : next->title();
-            const int width=static_cast<int>(sw)-2*border,height=desktopH-title-2*border;
+            const WmRect area=WorkAreaFor(*next,sw,sh);
+            const int width=area.w-2*border,height=area.h-title-2*border;
             if (width>=static_cast<int>(WM_MIN_WIDTH) && height>=static_cast<int>(WM_MIN_HEIGHT) && width<=65535 && height<=65535 && ResizeWindowLocked(static_cast<int>(&w-g_windows),width,height)) {
-                w.x=w.y=0;
+                w.x=static_cast<int16_t>(area.x);w.y=static_cast<int16_t>(area.y);
             } else {
                 // Keep the existing owned pixels and make the window movable
                 // if memory cannot satisfy a new maximized backing allocation.
@@ -1714,7 +1777,7 @@ static int NextFocusCandidateLocked(int excluded)
     int best=-1;uint8_t bestZ=0;
     for(uint32_t i=0;i<WM_MAX_WINDOWS;++i) {
         const auto& w=g_windows[i];
-        if(static_cast<int>(i)!=excluded && w.proc && w.visible && !w.minimized && w.focusable && w.zOrder>=bestZ) {
+        if(static_cast<int>(i)!=excluded && w.proc && w.visible && !w.minimized && !w.docked && w.focusable && w.zOrder>=bestZ) {
             bestZ=w.zOrder;best=static_cast<int>(i);
         }
     }
@@ -1725,7 +1788,8 @@ static void MinimizeWindowLocked(int idx)
 {
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
     Window& w = g_windows[idx];
-    if (!w.proc || w.minimized) return;
+    // The dock decides whether a docked window is shown.
+    if (!w.proc || w.minimized || w.docked) return;
 
     if(g_pointerCaptureIndex==idx)PointerCaptureReleaseLocked();
     PointerActivationCancel();
@@ -1749,7 +1813,7 @@ static void RestoreWindowLocked(int idx)
 {
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
     Window& w = g_windows[idx];
-    if (!w.proc || !w.minimized) return;
+    if (!w.proc || !w.minimized || w.docked) return;
 
     w.minimized = false;
     SerialPrintf("WM: restored window %d '%s'\n", idx, w.title);
@@ -2299,9 +2363,9 @@ static bool LauncherLoadDesktopEntries(LauncherSnapshot& launcher)
         *end = 0;
         if (end > line && end[-1] == '\r') end[-1] = 0;
         if (!*line) { if (!more) break; line = end + 1; continue; }
-        char* fields[5] = {line, nullptr, nullptr, nullptr, nullptr};
+        char* fields[6] = {line, nullptr, nullptr, nullptr, nullptr, nullptr};
         uint32_t count = 1;
-        for (char* p = line; *p && count < 5; ++p)
+        for (char* p = line; *p && count < 6; ++p)
             if (*p == '\t') { *p = 0; fields[count++] = p + 1; }
         if (count < 2 || !fields[0][0] || strlen(fields[1]) >= sizeof(LauncherItem{}.scriptPath) ||
             (count >= 5 && strlen(fields[4]) >= sizeof(LauncherItem{}.appId))) { ok = false; break; }
@@ -2324,6 +2388,7 @@ static bool LauncherLoadDesktopEntries(LauncherSnapshot& launcher)
             WmStrCopy(item->scriptPath, fields[1], sizeof(item->scriptPath));
             WmStrCopy(item->executable, executable, sizeof(item->executable));
             WmStrCopy(item->appId, count >= 5 ? fields[4] : "", sizeof(item->appId));
+            if (count == 6 && fields[5][0]) WmStrCopy(item->description, fields[5], sizeof(item->description));
             // A desktop file's Categories= replaces a same-title shortcut's
             // declared category only when it maps to one.
             if (count >= 4 && *LauncherModel::HintFromDesktopCategories(fields[3]))
@@ -2527,6 +2592,7 @@ static void LauncherWorker(void*)
         // One worker, coalesced requests, no busy waiting or retained rebuild
         // list. A slow reader delays reclamation and subsequent builds.
         LauncherSaveLayout();
+        DockSaveState();
         SchedulerSleepMs(250);
     }
 }
@@ -2549,6 +2615,7 @@ void WmLauncherLoad()
 {
     if (g_launcherLoaded) return;
     LauncherLoadLayout();
+    DockLoadState();
     const uint32_t generation = __atomic_load_n(&g_launcherRequested, __ATOMIC_ACQUIRE);
     LauncherSnapshot* snapshot = BuildLauncherSnapshot(generation);
     if (snapshot)
@@ -2568,16 +2635,18 @@ void WmLauncherLoad()
     g_launcherLoaded = true;
 }
 
-void WmLauncherClose() { g_launcherOpen = false; g_launcherPower.Reset(); }
+void WmLauncherClose() { g_launcherOpen = false; g_launcherModel.CancelPointer(); g_launcherPower.Reset(); }
 
 void WmLauncherToggle()
 {
     // Loading belongs to WmSetActive (shell context), never the input/render thread.
     if (!g_launcherLoaded) return;
     g_launcherOpen = !g_launcherOpen;
+    g_launcherModel.CancelPointer();
     g_launcherPower.Reset();
     if (g_launcherOpen) {
         PointerActivationCancel();
+        WmDockDismiss(); // exclusive with an unpinned dock
         WmVolumePopupClose();
         WmTrayFlyoutClose();
         g_launcherError = 0;
@@ -2592,6 +2661,7 @@ bool WmLauncherVisible()
 }
 
 #include "wm_shell_launcher.inc"
+#include "wm_shell_dock.inc"
 
 bool WmCaptureShellModel(const WmShellSurface& s, uint32_t screenW, uint32_t screenH,
                          uint64_t uptimeMs, int32_t mx, int32_t my, ChromeShellModel& model)
@@ -2607,6 +2677,7 @@ bool WmCaptureShellModel(const WmShellSurface& s, uint32_t screenW, uint32_t scr
     case WmShellSurfaceKind::TrayFlyout: WmCaptureTrayFlyout(screenW, screenH, model); break;
     case WmShellSurfaceKind::PerformanceHud: WmCapturePerformanceHud(screenW, screenH, model); break;
     case WmShellSurfaceKind::BootSummary: WmCaptureBootSummary(screenW, screenH, model); break;
+    case WmShellSurfaceKind::Dock: WmCaptureDock(screenW, screenH, mx, my, model); break;
     }
     return model.kind != ChromeShellKind::None;
 }
@@ -2670,6 +2741,7 @@ static void LauncherPowerRun(LauncherPowerCommand command)
     case LauncherPowerCommand::Restart:SerialPuts("WM: launcher restart confirmed\n");ShutdownDesktopRequest(true);break;
     case LauncherPowerCommand::Shutdown:SerialPuts("WM: launcher shutdown confirmed\n");ShutdownDesktopRequest(false);break;
     case LauncherPowerCommand::CancelShutdown:ShutdownDesktopCancel();break;
+    case LauncherPowerCommand::ForceApps:ShutdownDesktopForceApps();break;
     }
     CompositorMarkDirty();CompositorWake();
 }
@@ -3259,6 +3331,7 @@ BrookDesktopSurface WmShellSurfaceRecord(const WmShellSurface& surface,uint64_t 
     case WmShellSurfaceKind::TrayFlyout: kind=BROOK_DESKTOP_SURFACE_TRAY_FLYOUT;break;
     case WmShellSurfaceKind::PerformanceHud: kind=BROOK_DESKTOP_SURFACE_PERFORMANCE_HUD;break;
     case WmShellSurfaceKind::BootSummary: kind=BROOK_DESKTOP_SURFACE_BOOT_SUMMARY;break;
+    case WmShellSurfaceKind::Dock: kind=BROOK_DESKTOP_SURFACE_DOCK;break;
     }
     return ChromeShellSurfaceRecord(kind,{surface.x,surface.y,int(surface.w),int(surface.h)},surface.material,key,
                                     CompositorShellMaterialOpacity(),WmChromeSurfaceEffects());
@@ -3616,7 +3689,7 @@ int WmInputPopById(Process* proc, uint32_t wmId, Window::WmInputEvent* out, uint
     return static_cast<int>(WmInputPop(win,out,max));
 }
 
-bool WmPushWmEvent(Window* win, uint8_t type, int16_t x, int16_t y)
+bool WmPushWmEvent(Window* win, uint8_t type, int16_t x, int16_t y, uint32_t resizeFlags)
 {
     if (!win) return false;
     uint32_t head = __atomic_load_n(&win->inputHead, __ATOMIC_ACQUIRE);
@@ -3631,7 +3704,7 @@ bool WmPushWmEvent(Window* win, uint8_t type, int16_t x, int16_t y)
     slot.x         = x;
     slot.y         = y;
     slot.reserved  = type!=WM_EVT_RESIZED ? 0 : win->fullscreen ? WM_RESIZE_FULLSCREEN :
-                     win->state==WindowState::Maximized ? WM_RESIZE_MAXIMIZED : WM_RESIZE_RESIZING;
+                     win->state==WindowState::Maximized ? WM_RESIZE_MAXIMIZED : resizeFlags;
     __atomic_store_n(&win->inputHead, next, __ATOMIC_RELEASE);
     return true;
 }

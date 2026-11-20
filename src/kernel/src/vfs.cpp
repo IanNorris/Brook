@@ -151,6 +151,7 @@ struct MountBacking {
     void* mountPriv;
     uint8_t pdrv;
     uint64_t references;
+    bool systemInternal;
     bool independent; // fresh instances never participate in legacy device coalescing
     MountBacking* next;
     void RetainLocked() {
@@ -678,6 +679,20 @@ bool VfsMountConfiguredWithPublication(const char* mountPoint,const char* fsName
     return true;
 }
 
+bool VfsProtectBootMount(uint64_t publication)
+{
+    if (!publication) return false;
+    FileMutationGuard mutation;
+    MountViewGuard view;
+    for (auto& mount : g_mounts) {
+        if (mount.owner != &g_initialNamespace || mount.publication != publication ||
+            !VfsMountPublished(mount)) continue;
+        mount.backing->systemInternal = true;
+        return true;
+    }
+    return false;
+}
+
 bool VfsUnmount(const char* mountPoint)
 {
     VfsPath covered{};
@@ -694,7 +709,7 @@ bool VfsUnmount(const char* mountPoint)
                 if(child.used && child.covered.attachment==&mount)coveredByChild=true;
             if(!coveredByChild)selected=&mount;
         }
-        if(!selected)return false;
+        if(!selected || selected->backing->systemInternal)return false;
         auto& mount=*selected;
         if(__atomic_load_n(&mount.vnodeHolds,__ATOMIC_ACQUIRE) ||
            __atomic_load_n(&mount.pathHolds,__ATOMIC_ACQUIRE))return false;
@@ -783,6 +798,7 @@ VfsMountSnapshot VfsMountNamespaceSnapshotAt(MountNamespace* ns,uint32_t idx)
     const auto& m = *entry;
     snap.used = m.used;
     if (!m.used) return snap;
+    snap.systemInternal = m.backing->systemInternal;
     StrCopy(snap.mountPoint, m.mountPoint, sizeof(snap.mountPoint));
     StrCopy(snap.fsType, m.fsType, sizeof(snap.fsType));
     return snap;

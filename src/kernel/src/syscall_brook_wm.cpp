@@ -543,7 +543,7 @@ int64_t sys_brook_wm_set_maximized(uint64_t wmId, uint64_t enable,
 
     brook::Window* w = brook::WmFindWindowById(proc, static_cast<uint32_t>(wmId));
     if (!w) return -EINVAL;
-    brook::WmSetMaximized(static_cast<int>(wmId) - 1, enable != 0);
+    brook::WmSetMaximized(static_cast<int>(wmId) - 1, enable != 0, true);
     return 0;
 }
 

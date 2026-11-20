@@ -13,6 +13,7 @@ std::mutex queueMutex,windowMutex,frameMutex,geometryMutex;
 thread_local unsigned locks;
 std::atomic<int> leases{0};
 std::atomic<unsigned> wakeRequests{0};
+int expectedFlagsAtWake=-1;
 std::atomic<bool> workerDone{false};
 std::thread worker;
 int mode=0,created=0,destroyed=0;
@@ -44,6 +45,21 @@ uint64_t WmBackdropStyleVersion(){
 void SerialPrintf(const char*,...) {}
 volatile uint64_t g_lapicTickCount=0;
 uint64_t ApicTickCount() { return g_lapicTickCount; }
+uint64_t captureClockNs=50000;
+bool KvmClockAvailable(){return true;}
+uint64_t KvmClockReadNs(){return captureClockNs;}
+bool TscClockAvailable(){return false;}
+uint64_t TscClockReadNs(){return 0;}
+int WmCopyDebugWindowBuffer(uint32_t id,uint64_t incarnation,uint32_t* out,uint64_t capacity,
+                            uint32_t* width,uint32_t* height,uint32_t* scale) {
+    if(id!=9 || incarnation!=90)return -2;
+    *width=2;*height=1;*scale=2;
+    if(out){
+        CHECK(capacity>=2);out[0]=0x223344;out[1]=0x667788;
+        captureClockNs+=15000;
+    }
+    return 0;
+}
 void KMutexLock(KMutex* m) { (m==&g_debugFrameLock?frameMutex:m==&g_scanoutMappingLock?geometryMutex:queueMutex).lock();++locks; }
 void KMutexUnlock(KMutex* m) { CHECK(locks>0);--locks;(m==&g_debugFrameLock?frameMutex:m==&g_scanoutMappingLock?geometryMutex:queueMutex).unlock(); }
 VirtualAddress VmmAllocPages(uint64_t,uint64_t,MemTag,uint16_t) { return VirtualAddress{}; }
@@ -72,6 +88,10 @@ bool WmVolumePopupVisible(){return volumeVisible;}
 void WmVolumePopupGetRect(uint32_t,uint32_t,int32_t* x,int32_t* y,uint32_t* w,uint32_t* h){*x=4;*y=1;*w=2;*h=2;}
 bool WmPointerCaptureActive(){return false;}
 bool WmTrayFlyoutRect(uint32_t,uint32_t,int32_t*,int32_t*,uint32_t*,uint32_t*){return false;}
+bool dockVisible=false;
+bool WmDockSurfaceRect(uint32_t,uint32_t,int32_t* x,int32_t* y,uint32_t* w,uint32_t* h,bool* material){
+    *x=0;*y=3;*w=1;*h=1;*material=true;return dockVisible;
+}
 bool summaryAndHudVisible = false;
 bool WmPerformanceHudRect(uint32_t,uint32_t,int32_t* x,int32_t* y,uint32_t* w,uint32_t* h) {
     *x = 3; *y = 3; *w = 1; *h = 1;
@@ -112,6 +132,7 @@ void ShellServiceDraw(const WmShellSurface& s,uint32_t* p,uint32_t stride,uint32
     case WmShellSurfaceKind::VolumePopup: color = 0x00777777; break;
     case WmShellSurfaceKind::PerformanceHud: color = 0x00112233; break;
     case WmShellSurfaceKind::BootSummary: color = 0x00445566; break;
+    case WmShellSurfaceKind::Dock: color = 0x00998877; break;
     default: std::abort();
     }
     for (uint32_t y = 0; y < s.h; ++y)
@@ -122,7 +143,12 @@ extern "C" void* kmalloc(uint64_t bytes) { return allocationFails?nullptr:std::c
 extern "C" void kfree(void* p) { std::free(p); }
 void MappingBackingRef(MappingBacking*) { ++leases; }
 void MappingBackingUnref(MappingBacking*) { --leases; }
-void SchedulerUnblock(Process* p) { if(p && p==waiterProc){++waiterWakes;return;} CHECK(p==g_compositorProcess);++wakeRequests; }
+void SchedulerUnblock(Process* p) {
+    if(p && p==waiterProc){++waiterWakes;return;}
+    CHECK(p==g_compositorProcess);
+    if(expectedFlagsAtWake>=0)CHECK(g_debugFrameFlags==unsigned(expectedFlagsAtWake));
+    ++wakeRequests;
+}
 void DisplayFlush(uint32_t first,uint32_t last) { CHECK(first<last); }
 uint64_t DisplayGetFramebufferPhys(){return 0;}
 bool BootLogoActive(){return false;}
@@ -362,7 +388,16 @@ int main() {
     g_lapicTickCount=100;
     CHECK(!CompositorPresentProbe(0,0,8,6,8,fullSource,copy,samples,display,g_backdropGeneration,42));
     uint32_t capturedPixels[48]{};g_debugFrameBuffer=VirtualAddress(reinterpret_cast<uint64_t>(capturedPixels));g_debugFramePages=1;
-    auto frame=CompositorRequestDebugFrame(77);CHECK(frame.state==DebugFrameState::Pending);
+    int requestError=0;
+    auto window=CompositorRequestDebugFrameOptions(77,BROOK_DEBUG_FRAME_FLAG_WINDOW_BUFFER,9,90,&requestError);
+    CHECK(!requestError && window.state==DebugFrameState::Ready && window.copyUs==15 &&
+          window.source==BROOK_DEBUG_FRAME_SOURCE_WINDOW_BUFFER && window.plane==BROOK_DEBUG_FRAME_PLANE_UNREAD &&
+          window.windowId==9 && window.windowScale==2 && capturedPixels[0]==0x223344 && capturedPixels[1]==0x667788);
+    CHECK(CompositorReleaseDebugFrame(window.token,77));
+    expectedFlagsAtWake=BROOK_DEBUG_FRAME_FLAG_CURSOR;
+    auto frame=CompositorRequestDebugFrameOptions(77,BROOK_DEBUG_FRAME_FLAG_CURSOR,0,0,&requestError);
+    expectedFlagsAtWake=-1;
+    CHECK(!requestError && frame.state==DebugFrameState::Pending && g_debugFrameFlags==BROOK_DEBUG_FRAME_FLAG_CURSOR);
     g_compositorEpoch=40;g_lapicTickCount=120;
     CaptureCompletedDebugFrame(40,{g_physFb,8,6,8});
     auto captured=CompositorDebugFrameStatus(frame.token,77);
@@ -516,6 +551,32 @@ int main() {
         CaptureOverlayAt(704, 6, 4, true);
         CHECK(overlayPixels[38] == 0 && overlayPixels[7] == 0xff445566 && overlayPixels[27] == 0xff112233);
         CHECK(CompositorReleaseDebugFrame(overlay.token, 77));
+        // Five shell surfaces (the side dock too) and a cursor: six
+        // rectangles merge pairwise into the four the seven bands allow.
+        dockVisible = true;
+        overlay = CompositorRequestDebugFrame(77, true, true);
+        CaptureOverlayAt(705, 6, 4, true);
+        CHECK(CompositorDebugFrameStatus(overlay.token, 77).state == DebugFrameState::Ready);
+        {
+            BrookDesktopOverlaySurfaces five{};
+            CHECK(!CompositorOverlaySurfaces(overlay.token, 77, five) && five.count == 5);
+            bool dockRecord = false;
+            for (unsigned i = 0; i < five.count; ++i) dockRecord |= five.surfaces[i].kind == uint32_t(WmShellSurfaceKind::Dock) + 3;
+            CHECK(dockRecord);
+            DesktopOverlayBands bands{};
+            CHECK(!CompositorOverlayBands(overlay.token, 77, bands) && bands.count && bands.count <= 7);
+            CHECK(overlayPixels[24] == 0xff998877 && overlayPixels[7] == 0xff445566 && overlayPixels[27] == 0xff112233);
+            auto covered = [&](uint32_t x, uint32_t y) {
+                for (unsigned i = 0; i < bands.count; ++i) {
+                    const auto& r = bands.bands[i];
+                    if (x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height) return true;
+                }
+                return false;
+            };
+            CHECK(covered(0, 3) && covered(7, 0) && covered(3, 3) && covered(6, 4) && covered(1, 1) && covered(0, 5));
+        }
+        CHECK(CompositorReleaseDebugFrame(overlay.token, 77));
+        dockVisible = false;
         summaryAndHudVisible = false;
         g_debugFrameCleanAddress=0;
     }

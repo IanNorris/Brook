@@ -125,6 +125,7 @@ struct BrookDesktopFocus {
 #define BROOK_DESKTOP_SURFACE_BOOT_SUMMARY 7
 #define BROOK_DESKTOP_SURFACE_TRAY_FLYOUT 8
 #define BROOK_DESKTOP_SURFACE_PERFORMANCE_HUD 9
+#define BROOK_DESKTOP_SURFACE_DOCK 10          // side dock strip, or its edge tab
 #define BROOK_DESKTOP_MATERIAL_OPAQUE 0
 #define BROOK_DESKTOP_MATERIAL_GLASS 1         // needs backdrop blur; level = blur radius
 // The 64 px nine-slice of brook_chrome_shadow.h, spread past each outer edge
@@ -157,7 +158,7 @@ struct BrookDesktopSurfaces {
 // Overlay op 10 (BROOK_DESKTOP_OVERLAY_SURFACES, brook_debug_frame.h).
 struct BrookDesktopOverlaySurfaces {
     uint32_t count,reserved;
-    struct BrookDesktopSurface surfaces[4];
+    struct BrookDesktopSurface surfaces[5];
 };
 // Renderer capabilities (compositor refactor stage 1.5). Op 18: address =
 // size = 0, a = BROOK_DESKTOP_CAPS_VERSION, b = the renderer's
@@ -207,10 +208,10 @@ struct BrookDesktopLayers {
 static_assert(sizeof(BrookDesktopLayer)==80 && sizeof(BrookDesktopLayers)==2576,"desktop layer ABI layout");
 static_assert(sizeof(BrookDesktopFocus)==48,"desktop focus ABI layout");
 static_assert(sizeof(BrookDesktopSurface)==96 && sizeof(BrookDesktopSurfaces)==16+96*BROOK_DESKTOP_LAYER_LIMIT &&
-              sizeof(BrookDesktopOverlaySurfaces)==8+96*4,"desktop surface ABI layout");
+              sizeof(BrookDesktopOverlaySurfaces)==8+96*5,"desktop surface ABI layout");
 #else
 _Static_assert(sizeof(struct BrookDesktopLayer)==80 && sizeof(struct BrookDesktopLayers)==2576,"desktop layer ABI layout");
 _Static_assert(sizeof(struct BrookDesktopFocus)==48,"desktop focus ABI layout");
 _Static_assert(sizeof(struct BrookDesktopSurface)==96 && sizeof(struct BrookDesktopSurfaces)==16+96*BROOK_DESKTOP_LAYER_LIMIT &&
-               sizeof(struct BrookDesktopOverlaySurfaces)==8+96*4,"desktop surface ABI layout");
+               sizeof(struct BrookDesktopOverlaySurfaces)==8+96*5,"desktop surface ABI layout");
 #endif

@@ -1379,7 +1379,7 @@ static Vnode* GenMounts()
         if (!snap.used) continue;
         if (static_cast<uint32_t>(p - buf) + PerRow >= bufSize) break;
         // Linux format: device mountpoint type options dump pass
-        p = AppendStr(p, snap.fsType);
+        p = AppendStr(p, snap.systemInternal ? "none" : snap.fsType);
         *p++ = ' ';
         p = AppendStr(p, snap.mountPoint);
         *p++ = ' ';

@@ -19,7 +19,7 @@ inline void* operator new(size_t, void* storage) noexcept { return storage; }
 namespace brook {
 namespace {
 
-constexpr unsigned KindCount = unsigned(WmShellSurfaceKind::PerformanceHud) + 1;
+constexpr unsigned KindCount = unsigned(WmShellSurfaceKind::Dock) + 1;
 
 struct Geometry {
     WmShellSurface surface;

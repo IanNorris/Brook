@@ -134,7 +134,8 @@ void TestWindowlessEscalation() {
     visible=true;window={};window.id=9;window.incarnation=90;window.focusable=true;window.clientPid=40;window.clientIncarnation=1040;
     const unsigned closesBefore=closes;ShutdownCompositorPoll();assert(closes==closesBefore+1);
     for(unsigned i=0;i<20;++i){tick+=5000;ShutdownCompositorPoll();step();}
-    assert(!signalCount);Show(req,"windows","1 window open; waiting for mousepad pid 40 (window), pulseaudio pid 50; resolve save dialogs");
+    assert(!signalCount);Show(req,"windows","force close loses unsaved work; 1 window open");
+    assert(ShutdownCanForceApps(req));
     {ShutdownBlockerReport r{};ShutdownRequestBlockers(req,&r);assert(r.count==2&&r.listed==2&&r.entries[0].pid==40&&r.entries[0].window&&r.entries[1].pid==50&&!r.entries[1].window);}
     // Prompt answered: the editor exits; only the daemon remains.
     visible=false;censusCount=1;App(0,50,"pulseaudio",ProcessState::Stopped);ShutdownCompositorPoll();
@@ -167,6 +168,34 @@ void TestWindowlessEscalation() {
     step();command(cancelled,"power_status","cancelled");assert(launched&&jobsAllowed&&!gate);
     tick+=60000;step();assert(signalCount==1);
     censusCount=0;current=-1;irreversible=false;
+}
+void TestConfirmedForceApps() {
+    const char* request="abababababababababababababababab";
+    current=-1;irreversible=false;visible=true;tick=2000000;signalCount=signals=0;
+    censusCount=2;App(0,40,"editor");App(1,50,"daemon");
+    window={};window.id=9;window.incarnation=90;window.focusable=true;
+    window.clientPid=40;window.clientIncarnation=1040;
+    command(request,"restart","closing");ShutdownCompositorPoll();
+    command(request,"force_apps","not_ready",-16);step();
+    assert(!ShutdownCanForceApps(request) && !signals);
+    tick+=ForceAppsGraceMs;
+    ShutdownCompositorPoll();step();
+    assert(ShutdownCanForceApps(request) && !signals);
+    command(request,"force_apps","closing");
+    step();assert(signalCount==1 && signalLog[0]==9 && signalPids[0]==40);
+    command(request,"force_apps","closing");step();
+    assert(signalCount==1 && !ShutdownCanForceApps(request));
+    assert(!gate && operations[current].phase==Phase::Closing);
+    command(request,"cancel","closing");step();
+
+    const char* later="cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+    command(later,"restart","closing");ShutdownCompositorPoll();
+    tick+=ForceAppsGraceMs;ShutdownCompositorPoll();
+    command(later,"force_apps","closing");
+    ++appTasks[0].incarnation; // same pid was reused before execution
+    step();assert(signalCount==1);
+    command(later,"cancel","closing");step();
+    censusCount=0;current=-1;irreversible=false;visible=false;
 }
 }
 int main(){
@@ -284,6 +313,7 @@ step();assert(!signals&&!syncs&&!gate);
     for(unsigned i=0;i<10;++i)sample(AcPowerSource::Offline);
     step();assert(current<0 && powerWrites==3); // one attempt per boot
     TestWindowlessEscalation();
+    TestConfirmedForceApps();
     // Never execute the host's actual power I/O from this native fixture.
     std::puts("SHUTDOWN_COORDINATOR PASS");
 }

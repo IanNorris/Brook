@@ -5,20 +5,21 @@
 
 namespace brook {
 // Shell surfaces: the one list of desktop overlay surfaces (taskbar, the
-// shared popup slot, the boot toast and performance HUD) that every compositor path draws,
+// shared popup slot, the side dock, the boot toast and performance HUD) that every compositor path draws,
 // composes, blurs and captures: the CPU back buffer, the virgl overlay layer
 // and the VKRENDER overlay capture. Add a new shell surface here, not in the
 // paths. Material surfaces take the translucent shell material when glass is
 // active; the others stay opaque.
-enum class WmShellSurfaceKind : uint8_t { Taskbar, Launcher, VolumePopup, TrayTooltip, BootSummary, TrayFlyout, PerformanceHud };
+enum class WmShellSurfaceKind : uint8_t { Taskbar, Launcher, VolumePopup, TrayTooltip, BootSummary, TrayFlyout, PerformanceHud, Dock };
 struct WmShellSurface {
     WmShellSurfaceKind kind;
     int32_t x, y;
     uint32_t w, h;
     bool material;
 };
-// Taskbar, popup slot, boot toast and optional expanded HUD.
-static constexpr uint32_t WM_SHELL_SURFACE_LIMIT = 4;
+// Taskbar, dock (strip or edge tab), popup slot, boot toast and optional
+// expanded HUD.
+static constexpr uint32_t WM_SHELL_SURFACE_LIMIT = 5;
 
 // Back to front. (mx,my) is the pointer the caller renders hover state with.
 inline uint32_t WmShellSurfaces(uint32_t screenW, uint32_t screenH, int32_t mx, int32_t my,
@@ -29,6 +30,13 @@ inline uint32_t WmShellSurfaces(uint32_t screenW, uint32_t screenH, int32_t mx, 
     if (!WmTaskbarHidden()) {
         const uint32_t tbY = WmDesktopHeight(screenH);
         out[count++] = {WmShellSurfaceKind::Taskbar, 0, static_cast<int32_t>(tbY), screenW, screenH - tbY, true};
+    }
+    // The side dock: its glass strip while shown, else a flat edge tab while
+    // it has entries; nothing otherwise. Fullscreen covers it.
+    {
+        int32_t x = 0, y = 0; uint32_t w = 0, h = 0; bool material = false;
+        if (!WmTaskbarHidden() && WmDockSurfaceRect(screenW, screenH, &x, &y, &w, &h, &material))
+            out[count++] = {WmShellSurfaceKind::Dock, x, y, w, h, material};
     }
     // One popup slot: opening the launcher closes the volume popup and vice
     // versa, and the tray tooltip yields to either of them.

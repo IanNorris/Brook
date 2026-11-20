@@ -14,11 +14,13 @@ def describe_frame(payload):
     version=payload.get('info_version')
     if not version:return {'source':None,'scanout':None,'provenance':'guest helper predates frame provenance'}
     flags=payload.get('info_flags',0)
-    result={'source':FRAME_SOURCES.get(payload.get('source_kind'),'unknown'),
-            'scanout':SCANOUT_BUFFERS.get(payload.get('plane'),'unknown') if version>=4 else 'unverified'}
+    source=FRAME_SOURCES.get(payload.get('source_kind'),'unknown')
+    result={'source':source,'scanout':SCANOUT_BUFFERS.get(payload.get('plane'),'unknown') if version>=4 else 'unverified'}
     if version>=4:
         result.update(cursor_composited=bool(flags&1),detiled=bool(flags&2),
                       scanout_surface=f"{payload.get('plane_surface',0):#x}",copy_us=payload.get('copy_us'))
+    if source=='window-buffer':
+        result.update(scanout='not-applicable',scanout_surface=None)
     return result
 
 def frame_option_argument(options):
@@ -26,7 +28,7 @@ def frame_option_argument(options):
     flags,window_id,incarnation=options.get('flags',0),options.get('window_id',0),options.get('incarnation',0)
     for value in (flags,window_id,incarnation):
         if isinstance(value,bool) or not isinstance(value,int) or value<0:raise ValueError('Invalid frame options')
-    if flags&~(FRAME_CURSOR|FRAME_WINDOW_BUFFER) or window_id>256 or incarnation>2**64-1 or \
+    if flags>FRAME_WINDOW_BUFFER or window_id>256 or incarnation>2**64-1 or \
        (bool(flags&FRAME_WINDOW_BUFFER)!=bool(window_id and incarnation)) or (not flags&FRAME_WINDOW_BUFFER and (window_id or incarnation)):
         raise ValueError('Invalid frame options')
     return f'o:{flags}:{window_id}:{incarnation}'

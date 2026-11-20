@@ -15,7 +15,7 @@ The script scans <nix_disk_mount>/store/*/share/applications/*.desktop
 and <nix_disk_mount>/store/*/share/icons/hicolor/ for matching icons.
 
 Output manifest format (applications.idx):
-    Name<TAB>Exec<TAB>IconFile<TAB>Categories
+    Name<TAB>Exec<TAB>IconFile<TAB>Categories<TAB>AppId[<TAB>Comment]
     Qalculate!<TAB>qalculate-gtk<TAB>qalculate.rgba<TAB>Utility;Calculator;
 """
 
@@ -50,7 +50,7 @@ EXTRA_ENTRIES = [
 
 
 def parse_desktop_file(path):
-    """Parse a .desktop file and return (Name, Exec, Icon, Categories) or None."""
+    """Parse a .desktop file and return (Name, Exec, Icon, Categories, Comment) or None."""
     cp = configparser.ConfigParser(interpolation=None)
     cp.read(path, encoding='utf-8')
 
@@ -72,6 +72,10 @@ def parse_desktop_file(path):
     exec_cmd = entry.get('Exec', '').strip()
     icon = entry.get('Icon', '').strip()
     categories = entry.get('Categories', '').strip()
+    # An index field cannot contain literal tabs, line breaks or other controls.
+    comment = ' '.join(entry.get('Comment', '').split())
+    comment = ''.join(ch for ch in comment if ch.isprintable())
+    comment = comment.encode('utf-8')[:63].decode('utf-8', errors='ignore')
 
     if not name or not exec_cmd:
         return None
@@ -83,7 +87,7 @@ def parse_desktop_file(path):
             exec_parts.append(part)
     exec_cmd = shlex.join(exec_parts)
 
-    return (name, exec_cmd, icon, categories)
+    return (name, exec_cmd, icon, categories, comment)
 
 
 def find_icon(store_root, icon_name, preferred_sizes=None):
@@ -218,7 +222,7 @@ def main():
         if result is None:
             continue
 
-        name, exec_cmd, icon_name, categories = result
+        name, exec_cmd, icon_name, categories, comment = result
 
         # Deduplicate by name
         if name in seen_names:
@@ -285,7 +289,7 @@ def main():
         if binary_name == 'brook-nautilus':
             exec_cmd = '--uid 1000 ' + exec_cmd
 
-        entries.append((name, exec_cmd, icon_file, categories, Path(df).stem))
+        entries.append((name, exec_cmd, icon_file, categories, Path(df).stem, comment))
         print(f"  App: {name} [{exec_cmd}]")
 
     # Synthetic entries for games with a Brook play wrapper but no .desktop file.
@@ -298,14 +302,17 @@ def main():
             print(f"  Skip extra: {name} [{probe}] — binary not found in store")
             continue
         seen_names.add(name)
-        entries.append((name, wrapper_exec, icon_file, categories, probe))
+        entries.append((name, wrapper_exec, icon_file, categories, probe, ""))
         print(f"  App (wrapper): {name} [{wrapper_exec}]")
 
     # Write manifest
     idx_path = os.path.join(output_dir, 'applications.idx')
     with open(idx_path, 'w') as f:
-        for name, exec_cmd, icon_file, categories, app_id in sorted(entries):
-            f.write(f"{name}\t{exec_cmd}\t{icon_file}\t{categories}\t{app_id}\n")
+        for name, exec_cmd, icon_file, categories, app_id, comment in sorted(entries):
+            fields = [name, exec_cmd, icon_file, categories, app_id]
+            if comment:
+                fields.append(comment)
+            f.write('\t'.join(fields) + '\n')
 
     print(f"\nWrote {len(entries)} entries to {idx_path}")
     print(f"Icons directory: {icons_dir}")

@@ -26,7 +26,7 @@ inline int FormatMountInfo(const VfsMountInfo* rows,uint32_t count,char* out,uin
         if(r.attributes&MountNoSuid)literal(",nosuid");
         if(r.attributes&MountNoDev)literal(",nodev");
         if(r.attributes&MountNoExec)literal(",noexec");
-        literal(" - ");escape(r.fsType);character(' ');escape(r.fsType);literal(" rw\n");
+        literal(" - ");escape(r.fsType);character(' ');escape(r.systemInternal ? "none" : r.fsType);literal(" rw\n");
     }
     out[used]=0;*written=error?0:used;return error;
 }
