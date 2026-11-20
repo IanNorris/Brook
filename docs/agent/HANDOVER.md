@@ -23,6 +23,16 @@ _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review 
 - The pair `build/dell/pair-s3r` (`dell-s3r-20261119`) was built from
   `c11c9043` with Clearwater enabled and the four Broadwell options.
   Guarded QEMU passed on attempt 1. Dell deployment is pending.
+## Desktop chooser schemas (19 November 2026)
+
+- `work/settings-schemas` compiles GTK3, GTK4 and GNOME GSettings schemas
+  into the existing Brook profile lookup directory. The build checks both
+  chooser schemas for both GTK versions and preserves existing keyfile
+  layout values.
+- The pinned GTK3 color button opened its chooser on a private virtual
+  display with the new schema directory as its only source.
+  Package `/nix/store/r6lz8cqz7hyk4l9j7lyymdzfhsgxgv49-brook-desktop-settings`.
+  Logs are in `build/schema-evidence`. Dell validation is pending.
 
 ## Session environment and executable cache (19 November 2026)
 
