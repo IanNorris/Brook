@@ -288,6 +288,8 @@ static void activate(GtkApplication *app, gpointer data)
 
 int main(int argc, char **argv)
 {
+    // GTK3 takes the Wayland toplevel ID from GLib's program name.
+    g_set_prgname(APP_ID);
     GtkApplication *app = gtk_application_new(APP_ID, G_APPLICATION_DEFAULT_FLAGS);
     g_signal_connect(app, "activate", G_CALLBACK(activate), NULL);
     const int status = g_application_run(G_APPLICATION(app), argc, argv);
