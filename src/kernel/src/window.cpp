@@ -11,6 +11,7 @@
 
 #include "window.h"
 #include "../../shared/brook_pointer.h"
+#include "../../shared/brook_experience_config.h"
 #include "mouse.h"
 #include "wm_chrome_key.h"
 #include "desktop_telemetry.h"
@@ -129,7 +130,7 @@ static void EndBackdropStyleChange(){
 static bool g_themeSettingsLoaded = false;
 static uint32_t g_appearance = BROOK_APPEARANCE_DEFAULT;
 static uint32_t g_taskbarMetrics = BROOK_TASKBAR_DEFAULT;
-static bool g_showAdvancedDetails = BROOK_TASKBAR_ADVANCED_DETAILS_DEFAULT;
+static bool g_proMode = BROOK_EXPERIENCE_PRO_MODE_DEFAULT;
 static bool g_buildChip = true;
 uint32_t WmGetTaskbarMetrics(){return __atomic_load_n(&g_taskbarMetrics,__ATOMIC_ACQUIRE);}
 bool WmSetTaskbarMetrics(uint32_t value){
@@ -137,15 +138,15 @@ bool WmSetTaskbarMetrics(uint32_t value){
     __atomic_store_n(&g_taskbarMetrics,value,__ATOMIC_RELEASE);
     CompositorMarkDirty();CompositorWake();return true;
 }
-bool WmGetShowAdvancedDetails(){
-    return __atomic_load_n(&g_showAdvancedDetails,__ATOMIC_ACQUIRE);
+bool WmGetProMode(){
+    return __atomic_load_n(&g_proMode,__ATOMIC_ACQUIRE);
 }
-void WmSetShowAdvancedDetails(bool enabled){
+void WmSetProMode(bool enabled){
     {
         VfbGuard guard;
-        if(WmGetShowAdvancedDetails()==enabled)return;
+        if(WmGetProMode()==enabled)return;
         if(g_chromeSettingsEpoch)++g_chromeSettingsEpoch;
-        __atomic_store_n(&g_showAdvancedDetails,enabled,__ATOMIC_RELEASE);
+        __atomic_store_n(&g_proMode,enabled,__ATOMIC_RELEASE);
     }
     CompositorMarkDirty();CompositorWake();
 }
@@ -345,7 +346,7 @@ static void WmRestoreTheme()
     uint32_t selectedScale = 100;
     uint32_t appearance=WmGetAppearance();
     uint32_t taskbarMetrics=BROOK_TASKBAR_DEFAULT;
-    int showAdvancedDetails=BROOK_TASKBAR_ADVANCED_DETAILS_DEFAULT;
+    int proMode=BROOK_EXPERIENCE_PRO_MODE_DEFAULT;
     uint32_t pointerSpeed=BROOK_POINTER_SPEED_DEFAULT;
     uint32_t touchpadTap=BROOK_TOUCHPAD_TAP_DEFAULT;
     uint32_t audioControl=AudioOutputControl();
@@ -370,6 +371,7 @@ static void WmRestoreTheme()
             buf[done] = 0;
             bool desktopSection = false;
             bool audioSection = false;
+            bool experienceSection = false;
             for (char* line = buf; *line;)
             {
                 char* end = line; while (*end && *end != '\n') ++end;
@@ -377,6 +379,7 @@ static void WmRestoreTheme()
                 char* p = line; while (*p == ' ' || *p == '\t') ++p;
                 if (*p == '[')
                 {
+                    experienceSection=brook_experience_ini_section(p);
                     audioSection=strncmp(p,"[Audio]",7)==0;
                     if(audioSection){const char* tail=p+7;while(*tail==' '||*tail=='\t'||*tail=='\r')++tail;audioSection=!*tail;}
                     desktopSection = strncmp(p, "[Desktop]", 9) == 0;
@@ -387,6 +390,7 @@ static void WmRestoreTheme()
                     }
                 }
                 else if(audioSection) audioControl=brook_audio_control_setting(audioControl,p);
+                else if(experienceSection) proMode=brook_experience_pro_mode_setting(proMode,p);
                 else if (desktopSection && brook_theme_settings_line(&themeSettings, p) &&
                          strncmp(p,"dark=",5)!=0 && strncmp(p,"performance=",12)!=0) {}
                 else if (desktopSection && strncmp(p,"scale=",6)==0) {
@@ -403,7 +407,6 @@ static void WmRestoreTheme()
                     }
                     appearance=brook_appearance_setting(appearance,p);
                     taskbarMetrics=brook_taskbar_metrics_setting(taskbarMetrics,p);
-                    showAdvancedDetails=brook_taskbar_advanced_details_setting(showAdvancedDetails,p);
                     pointerSpeed=brook_pointer_speed_setting(pointerSpeed,p);
                     touchpadTap=brook_touchpad_tap_setting(touchpadTap,p);
                 }
@@ -430,7 +433,7 @@ static void WmRestoreTheme()
     WmSetAppearance((appearance&~uint32_t(BROOK_APPEARANCE_DARK|BROOK_APPEARANCE_PERFORMANCE))|
                     (WmGetAppearance()&(BROOK_APPEARANCE_DARK|BROOK_APPEARANCE_PERFORMANCE)));
     WmSetTaskbarMetrics(taskbarMetrics);
-    WmSetShowAdvancedDetails(showAdvancedDetails!=0);
+    WmSetProMode(proMode!=0);
     MouseTouchpadSetSpeed(pointerSpeed);
     MouseTouchpadSetTap(touchpadTap!=0);
     WmSetScale(selectedScale);

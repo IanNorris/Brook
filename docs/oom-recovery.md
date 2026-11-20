@@ -53,10 +53,14 @@ syscall `0xB41` permits ordinary users to read only their own or broadcast event
 Presentation waits until at least 32 MiB is free. A bounded user queue coalesces
 progress for the same victim while retaining unrelated messages.
 
-Settings persists `[Experience] technical_details=true/false` alongside existing
-preferences. Simple messages are the default; technical details are always
-expandable. The preference changes presentation only. Both apps honor
+**Pro mode** in Settings shows technical details where available. It reuses
+`[Experience] technical_details=true/false` and defaults to off. With Pro mode
+on, system messages show their diagnostics and the CPU + Memory popup opens
+with Details expanded. Both still offer their own expand or collapse control.
+Pro mode changes presentation only. Settings and brook-message both honor
 `BROOK_USER_SETTINGS`, otherwise `/data/home/.config/brook/settings.ini`.
+The window manager loads the default file at boot, and Settings applies changes
+to the current desktop when saved.
 Manual examples are `brook-message --code app-closed-memory --app GIMP`,
 `--event-file` for one ABI record, and `--print` for display-free formatting.
 

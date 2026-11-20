@@ -124,8 +124,8 @@ uint32_t WmGetAppearance();
 bool WmSetAppearance(uint32_t value);
 uint32_t WmGetTaskbarMetrics();
 bool WmSetTaskbarMetrics(uint32_t value);
-bool WmGetShowAdvancedDetails();
-void WmSetShowAdvancedDetails(bool enabled);
+bool WmGetProMode();
+void WmSetProMode(bool enabled);
 void WmSetPerformanceMode(bool enabled);
 // Stage 1.5: the compositor reports the active backend's backdrop-blur
 // capability at each frame boundary; the theme resolves against it.

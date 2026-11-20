@@ -8,6 +8,7 @@ pkgs.stdenv.mkDerivation {
   postPatch = ''
     cp ${../../src/shared/brook_system_message.h} brook_system_message.h
     cp ${../../src/shared/brook_user_experience.h} brook_user_experience.h
+    cp ${../../src/shared/brook_experience_config.h} brook_experience_config.h
     cp ${../../src/shared/brook_theme.h} brook_theme.h
     cp ${../../src/shared/brook_appearance.h} brook_appearance.h
     cp ${../../src/shared/brook_gtk_appearance.h} brook_gtk_appearance.h

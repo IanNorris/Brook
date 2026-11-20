@@ -5,9 +5,8 @@ enum {
     BROOK_SYS_WM_TASKBAR_METRICS = 0xB0C,
     BROOK_TASKBAR_OP_GET_METRICS = 0,
     BROOK_TASKBAR_OP_SET_METRICS = 1,
-    BROOK_TASKBAR_OP_GET_ADVANCED_DETAILS = 2,
-    BROOK_TASKBAR_OP_SET_ADVANCED_DETAILS = 3,
-    BROOK_TASKBAR_ADVANCED_DETAILS_DEFAULT = 0,
+    BROOK_TASKBAR_OP_GET_PRO_MODE = 2,
+    BROOK_TASKBAR_OP_SET_PRO_MODE = 3,
     BROOK_TASKBAR_CPU = 1u,
     BROOK_TASKBAR_MEMORY = 2u,
     BROOK_TASKBAR_DISK = 4u,
@@ -30,15 +29,5 @@ static inline uint32_t brook_taskbar_metrics_setting(uint32_t prior, const char 
     }
     while (*line == ' ' || *line == '\t' || *line == '\r') ++line;
     return digits && !*line && brook_taskbar_metrics_valid(value) ? value : prior;
-}
-#define BROOK_TASKBAR_ADVANCED_DETAILS_KEY "show_advanced_details"
-static inline int brook_taskbar_advanced_details_valid(uint64_t value) { return value <= 1; }
-static inline int brook_taskbar_advanced_details_setting(int prior, const char *line) {
-    const char *key = BROOK_TASKBAR_ADVANCED_DETAILS_KEY "=";
-    while (*key && *line == *key) { ++line; ++key; }
-    if (*key || (*line != '0' && *line != '1')) return prior;
-    int value = *line++ - '0';
-    while (*line == ' ' || *line == '\t' || *line == '\r') ++line;
-    return *line ? prior : value;
 }
 #endif

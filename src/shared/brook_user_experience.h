@@ -1,5 +1,6 @@
 #pragma once
 #include <glib.h>
+#include "brook_experience_config.h"
 
 /* Presentation preference only. It must never change recovery policy. */
 static inline const char *brook_user_settings_path(void) {
@@ -11,7 +12,7 @@ static inline gboolean brook_user_technical_details(const char *path) {
     gboolean technical = FALSE;
     if (g_key_file_load_from_file(file, path, G_KEY_FILE_NONE, NULL)) {
         GError *error = NULL;
-        technical = g_key_file_get_boolean(file, "Experience", "technical_details", &error);
+        technical = g_key_file_get_boolean(file, BROOK_EXPERIENCE_GROUP, BROOK_EXPERIENCE_DETAILS_KEY, &error);
         if (error) { technical = FALSE; g_error_free(error); }
     }
     g_key_file_unref(file);

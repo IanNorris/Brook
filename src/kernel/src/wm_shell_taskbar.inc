@@ -557,7 +557,7 @@ bool WmTrayFlyoutPress(int32_t mx, int32_t my, uint32_t sw, uint32_t sh)
         if (WmDiskFlyoutSelected()) g_diskPopupFirst = g_diskScrollRemainder = 0;
         if (WmDetailedStatsSelected() == DesktopStatsPanel::CpuMemory) {
             g_cpuFirstRow = g_cpuScrollRemainder = g_statsContentOffset = 0;
-            g_statsExpanded = WmGetShowAdvancedDetails();
+            g_statsExpanded = WmGetProMode();
         }
         if (WmTrayFlyoutLayout(sw, sh).w <= 0) {
             WmTrayFlyoutClose();

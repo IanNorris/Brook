@@ -19,6 +19,7 @@
 #include "syscall_memory.h"
 #include "syscall_handlers.h"
 #include "../../shared/wm_input_abi.h"
+#include "../../shared/brook_experience_config.h"
 
 namespace brook {
 
@@ -290,11 +291,11 @@ int64_t sys_brook_wm_taskbar_metrics(uint64_t op,uint64_t value,uint64_t,uint64_
         return WmGetTaskbarMetrics();
     case BROOK_TASKBAR_OP_SET_METRICS:
         return value<=0xffffffffULL && WmSetTaskbarMetrics(static_cast<uint32_t>(value))?0:-EINVAL;
-    case BROOK_TASKBAR_OP_GET_ADVANCED_DETAILS:
-        return WmGetShowAdvancedDetails()?1:0;
-    case BROOK_TASKBAR_OP_SET_ADVANCED_DETAILS:
-        if(!brook_taskbar_advanced_details_valid(value))return -EINVAL;
-        WmSetShowAdvancedDetails(value!=0);
+    case BROOK_TASKBAR_OP_GET_PRO_MODE:
+        return WmGetProMode()?1:0;
+    case BROOK_TASKBAR_OP_SET_PRO_MODE:
+        if(!brook_experience_pro_mode_valid(value))return -EINVAL;
+        WmSetProMode(value!=0);
         return 0;
     default:
         return -EINVAL;

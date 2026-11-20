@@ -43,9 +43,10 @@ static BrookHueTokens hue_tokens[BROOK_HUE_COUNT];
 static int hue_derived[BROOK_HUE_COUNT];
 static uint32_t selected_metrics=BROOK_TASKBAR_DEFAULT;
 static GtkWidget *metric_choices[7];
-static GtkWidget *advanced_details_check;
-static int advanced_details_supported;
-static GtkWidget *technical_details;
+static GtkWidget *pro_mode_check;
+static int pro_mode_supported;
+static const char pro_mode_label[]="Pro mode";
+static const char pro_mode_tooltip[]="Show technical details where available, including system message diagnostics and detailed CPU and memory views.";
 static char *settings_path;
 static unsigned selected_scale=100;
 static const unsigned scales[]={100,150,200};
@@ -208,7 +209,7 @@ static gboolean follow_status(gpointer unused){
     return G_SOURCE_CONTINUE;
 }
 static int save_appearance(uint64_t theme,unsigned scale,uint32_t appearance,
-                           int advanced_details,gboolean show_technical_details,GError **error) {
+                           gboolean pro_mode,GError **error) {
     char *directory=g_path_get_dirname(settings_path);
     if(g_mkdir_with_parents(directory,0700)<0) {
         g_set_error(error,G_FILE_ERROR,g_file_error_from_errno(errno),"Cannot create settings directory: %s",strerror(errno));g_free(directory);return 0;
@@ -235,12 +236,10 @@ static int save_appearance(uint64_t theme,unsigned scale,uint32_t appearance,
     g_key_file_set_integer(settings,"Desktop","opacity",brook_appearance_opacity(appearance));
     g_key_file_set_integer(settings,"Desktop","blur",brook_appearance_blur(appearance));
     g_key_file_set_integer(settings,"Desktop","taskbar_metrics",selected_metrics);
-    if(advanced_details>=0)
-        g_key_file_set_integer(settings,"Desktop",BROOK_TASKBAR_ADVANCED_DETAILS_KEY,advanced_details);
     if(pointer_speed>0)g_key_file_set_integer(settings,"Desktop","pointer_speed",(int)pointer_speed);
     if(touchpad_tap>=0)g_key_file_set_integer(settings,"Desktop","touchpad_tap",(int)touchpad_tap);
     if(audio_supported)g_key_file_set_integer(settings,"Audio","output",audio_control);
-    g_key_file_set_boolean(settings,"Experience","technical_details",show_technical_details);
+    g_key_file_set_boolean(settings,BROOK_EXPERIENCE_GROUP,BROOK_EXPERIENCE_DETAILS_KEY,pro_mode);
     gsize length=0;char *contents=g_key_file_to_data(settings,&length,error);
     gboolean ok=contents&&g_file_set_contents_full(settings_path,contents,(gssize)length,
                     G_FILE_SET_CONTENTS_CONSISTENT|G_FILE_SET_CONTENTS_DURABLE,0600,error);
@@ -311,26 +310,21 @@ static gboolean audio_follow(gpointer unused){
     g_signal_handlers_unblock_by_func(volume_slider,G_CALLBACK(audio_changed),NULL);
     return G_SOURCE_CONTINUE;
 }
-static int saved_matches_selection(int advanced_details){
+static int saved_matches_selection(void){
     GKeyFile *file=g_key_file_new();int matches=g_key_file_load_from_file(file,settings_path,0,NULL);
     const char* names[]={"scale","opacity","blur","taskbar_metrics"};
     const int values[]={(int)selected_scale,(int)brook_appearance_opacity(selected_appearance),
         (int)brook_appearance_blur(selected_appearance),(int)selected_metrics};
     for(unsigned i=0;matches && i<4;++i){GError *error=NULL;int value=g_key_file_get_integer(file,"Desktop",names[i],&error);
         matches=!error && value==values[i];g_clear_error(&error);}
-    if(matches && advanced_details>=0){
-        GError *error=NULL;
-        int value=g_key_file_get_integer(file,"Desktop",BROOK_TASKBAR_ADVANCED_DETAILS_KEY,&error);
-        matches=!error && value==advanced_details;g_clear_error(&error);
-    }
     const char* keys[]={"theme","mode","accent"};
     char hex[8];
     const char* words[]={brook_theme_key(sel_theme()),brook_mode_key(sel_mode()),accent_key(selected_theme,hex)};
     for(unsigned i=0;matches && i<3;++i){char *value=g_key_file_get_string(file,"Desktop",keys[i],NULL);
         matches=value && !strcmp(value,words[i]);g_free(value);}
     GError *experience_error=NULL;
-    gboolean experience=g_key_file_get_boolean(file,"Experience","technical_details",&experience_error);
-    matches=matches && !experience_error && experience==gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(technical_details));
+    gboolean experience=g_key_file_get_boolean(file,BROOK_EXPERIENCE_GROUP,BROOK_EXPERIENCE_DETAILS_KEY,&experience_error);
+    matches=matches && !experience_error && experience==gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(pro_mode_check));
     if(audio_supported){GError *audio_error=NULL;int value=g_key_file_get_integer(file,"Audio","output",&audio_error);
         matches=matches && !audio_error && value==(int)audio_control;g_clear_error(&audio_error);}
     g_clear_error(&experience_error);
@@ -341,14 +335,13 @@ static void apply(GtkButton *button,gpointer unused) {
     long previous=syscall(0xB02L,(long)BROOK_THEME_OP_MATERIAL_QUERY,0L),previous_scale=syscall(0xB04L,0L,0L);
     long previous_appearance=syscall(BROOK_SYS_WM_APPEARANCE,0L,0L);
     long previous_metrics=syscall(BROOK_SYS_WM_TASKBAR_METRICS,(long)BROOK_TASKBAR_OP_GET_METRICS,0L);
-    long previous_advanced=advanced_details_supported?
-        syscall(BROOK_SYS_WM_TASKBAR_METRICS,(long)BROOK_TASKBAR_OP_GET_ADVANCED_DETAILS,0L):-1;
-    const int advanced_details=advanced_details_supported?
-        gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(advanced_details_check)):-1;
+    long previous_pro_mode=pro_mode_supported?
+        syscall(BROOK_SYS_WM_TASKBAR_METRICS,(long)BROOK_TASKBAR_OP_GET_PRO_MODE,0L):-1;
+    const gboolean pro_mode=gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(pro_mode_check));
     selected_metrics=0;
     for(unsigned i=0;i<7;++i)if(gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(metric_choices[i])))selected_metrics|=1u<<i;
     if(previous<0||previous_scale<0||previous_appearance<0||previous_metrics<0||
-       (advanced_details_supported && !brook_taskbar_advanced_details_valid((uint64_t)previous_advanced))){gtk_label_set_text(GTK_LABEL(status),"Appearance controls need a matching Brook kernel.");return;}
+       (pro_mode_supported && !brook_experience_pro_mode_valid((uint64_t)previous_pro_mode))){gtk_label_set_text(GTK_LABEL(status),"Appearance controls need a matching Brook kernel.");return;}
     int applied=syscall(0xB02L,(long)BROOK_THEME_OP_MATERIAL_SET,(long)selected_theme)==0 && syscall(0xB04L,1L,(long)selected_scale)==0;
     if(applied){
         /* Opacity and blur; the dark and performance bits as the kernel now
@@ -357,25 +350,24 @@ static void apply(GtkButton *button,gpointer unused) {
         const uint32_t views=now<0?0u:(uint32_t)now&(BROOK_APPEARANCE_DARK|BROOK_APPEARANCE_PERFORMANCE);
         applied=now>=0 && syscall(BROOK_SYS_WM_APPEARANCE,1L,(long)((selected_appearance&~3u)|views))==0 &&
                 syscall(BROOK_SYS_WM_TASKBAR_METRICS,(long)BROOK_TASKBAR_OP_SET_METRICS,(long)selected_metrics)==0;
-        if(applied && advanced_details_supported)
-            applied=syscall(BROOK_SYS_WM_TASKBAR_METRICS,(long)BROOK_TASKBAR_OP_SET_ADVANCED_DETAILS,(long)advanced_details)==0;
+        if(applied && pro_mode_supported)
+            applied=syscall(BROOK_SYS_WM_TASKBAR_METRICS,(long)BROOK_TASKBAR_OP_SET_PRO_MODE,(long)pro_mode)==0;
     }
     GError *error=NULL;
-    if(applied && save_appearance(selected_theme,selected_scale,selected_appearance,advanced_details,
-                                 gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(technical_details)),&error)) {
+    if(applied && save_appearance(selected_theme,selected_scale,selected_appearance,pro_mode,&error)) {
         gtk_label_set_text(GTK_LABEL(status),"Settings applied and saved.");
         printf("BROOK_SETTINGS_SAVED theme=%s mode=%s accent=%s scale=%u appearance=%u\n",brook_theme_key(sel_theme()),
                brook_mode_key(sel_mode()),brook_hue_key(sel_hue()),selected_scale,selected_appearance);fflush(stdout);return;
     }
-    if(applied && saved_matches_selection(advanced_details)) {
+    if(applied && saved_matches_selection()) {
         gtk_label_set_text(GTK_LABEL(status),"Appearance applied; file updated, but save durability is unconfirmed.");g_clear_error(&error);return;
     }
     int restored=syscall(0xB02L,(long)BROOK_THEME_OP_MATERIAL_SET,previous)==0;
     restored=(syscall(0xB04L,1L,previous_scale)==0)&&restored;
     restored=(syscall(BROOK_SYS_WM_APPEARANCE,1L,previous_appearance)==0)&&restored;
     restored=(syscall(BROOK_SYS_WM_TASKBAR_METRICS,(long)BROOK_TASKBAR_OP_SET_METRICS,previous_metrics)==0)&&restored;
-    if(advanced_details_supported)
-        restored=(syscall(BROOK_SYS_WM_TASKBAR_METRICS,(long)BROOK_TASKBAR_OP_SET_ADVANCED_DETAILS,previous_advanced)==0)&&restored;
+    if(pro_mode_supported)
+        restored=(syscall(BROOK_SYS_WM_TASKBAR_METRICS,(long)BROOK_TASKBAR_OP_SET_PRO_MODE,previous_pro_mode)==0)&&restored;
     char *message=g_strdup_printf(restored?"Could not save; previous appearance restored: %s":"Could not save or fully restore appearance: %s",error?error->message:"apply failed");
     gtk_label_set_text(GTK_LABEL(status),message);g_free(message);g_clear_error(&error);
 }
@@ -425,8 +417,8 @@ int main(int argc,char **argv) {
     audio_supported=output>=0 && brook_audio_control_valid((uint32_t)output);
     if(audio_supported)audio_control=(uint32_t)output;
     long metrics=syscall(BROOK_SYS_WM_TASKBAR_METRICS,(long)BROOK_TASKBAR_OP_GET_METRICS,0L);
-    const long advanced_details=syscall(BROOK_SYS_WM_TASKBAR_METRICS,(long)BROOK_TASKBAR_OP_GET_ADVANCED_DETAILS,0L);
-    advanced_details_supported=brook_taskbar_advanced_details_valid((uint64_t)advanced_details);
+    const long runtime_pro_mode=syscall(BROOK_SYS_WM_TASKBAR_METRICS,(long)BROOK_TASKBAR_OP_GET_PRO_MODE,0L);
+    pro_mode_supported=brook_experience_pro_mode_valid((uint64_t)runtime_pro_mode);
     if(metrics>=0 && brook_taskbar_metrics_valid((uint32_t)metrics))selected_metrics=(uint32_t)metrics;
     long scale=syscall(0xB04L,0L,0L);
     int scale_index=0;for(int i=0;i<3;++i)if(scale==(long)scales[i]){selected_scale=scales[i];scale_index=i;}
@@ -585,21 +577,13 @@ int main(int argc,char **argv) {
         gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(metric_choices[i]),(selected_metrics&(1u<<i))!=0);
         gtk_grid_attach(GTK_GRID(metrics_grid),metric_choices[i],i%2,i/2,1,1);
     }
-    GtkWidget *metrics_content=gtk_box_new(GTK_ORIENTATION_VERTICAL,6);
-    gtk_box_pack_start(GTK_BOX(metrics_content),metrics_grid,FALSE,FALSE,0);
-    advanced_details_check=gtk_check_button_new_with_label("Show advanced details");
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(advanced_details_check),advanced_details==1);
-    gtk_widget_set_sensitive(advanced_details_check,advanced_details_supported);
-    gtk_widget_set_tooltip_text(advanced_details_check,advanced_details_supported?
-        "Open CPU and Memory with Details expanded.":"Requires a matching Brook kernel.");
-    gtk_box_pack_start(GTK_BOX(metrics_content),advanced_details_check,FALSE,FALSE,0);
-    gtk_container_add(GTK_CONTAINER(metrics_panel),metrics_content);
+    gtk_container_add(GTK_CONTAINER(metrics_panel),metrics_grid);
     gtk_box_pack_start(GTK_BOX(box),metrics_panel,FALSE,FALSE,0);
 
-    technical_details=gtk_check_button_new_with_label("Show technical details in system messages");
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(technical_details),brook_user_technical_details(settings_path));
-    gtk_widget_set_tooltip_text(technical_details,"Include diagnostic numbers by default. You can always expand details in a message.");
-    gtk_box_pack_start(GTK_BOX(box),technical_details,FALSE,FALSE,8);
+    pro_mode_check=gtk_check_button_new_with_label(pro_mode_label);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(pro_mode_check),brook_user_technical_details(settings_path));
+    gtk_widget_set_tooltip_text(pro_mode_check,pro_mode_tooltip);
+    gtk_box_pack_start(GTK_BOX(box),pro_mode_check,FALSE,FALSE,8);
 
     gtk_box_pack_start(GTK_BOX(outer),gtk_separator_new(GTK_ORIENTATION_HORIZONTAL),FALSE,FALSE,0);
     GtkWidget *footer=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,12);gtk_container_set_border_width(GTK_CONTAINER(footer),20);gtk_box_pack_start(GTK_BOX(outer),footer,FALSE,FALSE,0);

@@ -810,7 +810,7 @@ int main() {
             DesktopStatsPanel::Compositor, DesktopStatsPanel::App};
         const uint32_t detailMask = BROOK_TASKBAR_CPU | BROOK_TASKBAR_MEMORY | BROOK_TASKBAR_COMPOSITOR | BROOK_TASKBAR_APP;
         CHECK(WmSetTaskbarMetrics(detailMask));
-        CHECK(!WmGetShowAdvancedDetails());
+        CHECK(!WmGetProMode());
         fixtureDetailedStats.tasksMeasured = true;
         fixtureDetailedStats.tasks[0].ticks = 40;
         fixtureDetailedStats.tasks[1].ticks = 2;
@@ -866,8 +866,8 @@ int main() {
             CHECK(WmTrayFlyoutPress(resized.pin.x, resized.pin.y, sw, sh) && !WmTaskbarPopupPinned());
             CHECK(WmTrayFlyoutPress(10, 10, sw, sh) && !WmTrayFlyoutVisible());
         }
-        WmSetShowAdvancedDetails(true);
-        CHECK(WmGetShowAdvancedDetails());
+        WmSetProMode(true);
+        CHECK(WmGetProMode());
         const auto cpuAnchor = GetTaskbarLayout(sw, sh).metrics[0];
         CHECK(WmTrayFlyoutPress(cpuAnchor.x, cpuAnchor.y, sw, sh));
         const auto details = WmStatsPopupLayout(sw, sh, DesktopStatsPanel::CpuMemory);
@@ -878,7 +878,7 @@ int main() {
         CHECK(WmTrayFlyoutPress(cpuAnchor.x, cpuAnchor.y, sw, sh));
         CHECK(WmStatsPopupLayout(sw, sh, DesktopStatsPanel::CpuMemory).expanded);
         CHECK(WmTrayFlyoutPress(10, 10, sw, sh) && !WmTrayFlyoutVisible());
-        WmSetShowAdvancedDetails(false);
+        WmSetProMode(false);
 
         const auto collapsed = ChromeStatsPopupLayoutFor(WmChromeStyle(), {400, 100, 30, 20}, sw, 100,
                                                             DesktopStatsPanel::CpuMemory, 4, true);
