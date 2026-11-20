@@ -376,6 +376,14 @@ static int VfsBindContainsLocked(const VfsPath& source,const VfsPath& covered,bo
     }
     VfsPathRelease(current);return error;
 }
+// Retained directory handles can refer to a different user namespace's
+// mounts. A bind must not give the recipient authority to relax their flags.
+static uint64_t VfsBindRestrictionFloor(const MountEntry& source,const MountNamespace& target)
+{
+    if(!source.owner || source.owner->userOwner!=target.userOwner)
+        return source.lockedAttributes | source.attributes;
+    return source.lockedAttributes;
+}
 static int VfsMountNamespaceRecursiveBindLocked(MountNamespace* ns,const VfsPath& source,const VfsPath& target)
 {
     auto* sourceMount=static_cast<MountEntry*>(source.attachment);
@@ -394,7 +402,8 @@ static int VfsMountNamespaceRecursiveBindLocked(MountNamespace* ns,const VfsPath
         mount->lockedInherited=original->lockedInherited;
         mount->rootIdentity=original->rootIdentity;mount->rootObjectOps=original->rootObjectOps;
         mount->rootIdentityKnown=original->rootIdentityKnown;
-        mount->rootDevice=original->rootDevice;mount->attributes=original->attributes;mount->lockedAttributes=original->lockedAttributes;
+        mount->rootDevice=original->rootDevice;mount->attributes=original->attributes;
+        mount->lockedAttributes=VfsBindRestrictionFloor(*original,*ns);
         mount->rootFileUnlinked=original->rootFileUnlinked;
         StrCopy(mount->physicalRoot,original->physicalRoot,sizeof(mount->physicalRoot));
         StrCopy(mount->coveredName,original->coveredName,sizeof(mount->coveredName));
@@ -531,7 +540,8 @@ static int VfsMountNamespaceBindLocked(MountNamespace* ns,const VfsPath& source,
     }
     if(error) {kfree(mount);return error;}
     auto* sourceAttachment=static_cast<MountEntry*>(source.attachment);
-    mount->rootDevice=sourceAttachment->rootDevice;mount->attributes=sourceAttachment->attributes;mount->lockedAttributes=sourceAttachment->lockedAttributes;
+    mount->rootDevice=sourceAttachment->rootDevice;mount->attributes=sourceAttachment->attributes;
+    mount->lockedAttributes=VfsBindRestrictionFloor(*sourceAttachment,*ns);
     mount->owner=ns;mount->referenceState=1;mount->backing=static_cast<MountEntry*>(source.attachment)->backing;
     mount->backing->RetainLocked();mount->rootObject=source.object;VfsObjectRetain(source.object);
     mount->rootIdentity=source.object->identity;mount->rootObjectOps=source.object->ops;mount->rootIdentityKnown=true;
