@@ -25,7 +25,9 @@ constexpr char MenuInterface[] = "com.canonical.dbusmenu";
 constexpr char Notifications[] = "org.freedesktop.Notifications";
 constexpr char NotificationsPath[] = "/org/freedesktop/Notifications";
 constexpr int32_t MenuBack = INT32_MIN;
-constexpr unsigned ItemStorage = 32, NoticeStorage = 3;
+constexpr unsigned ItemStorage = 32, ItemsPerSender = 4, NoticeStorage = 3;
+constexpr auto LayoutTimeout = std::chrono::milliseconds(1500);
+constexpr auto ItemTimeout = std::chrono::seconds(2);
 
 using Message = std::unique_ptr<DBusMessage, decltype(&dbus_message_unref)>;
 Message Hold(DBusMessage* m) { return Message(m, dbus_message_unref); }
@@ -37,6 +39,21 @@ struct CancelPending {
     }
 };
 using PendingCall = std::unique_ptr<DBusPendingCall, CancelPending>;
+
+struct TimedCall {
+    PendingCall pending;
+    Clock::time_point deadline{};
+
+    bool Ready() const {
+        return pending && (dbus_pending_call_get_completed(pending.get()) || Clock::now() >= deadline);
+    }
+    Message TakeReply() {
+        auto reply = Hold(dbus_pending_call_get_completed(pending.get())
+            ? dbus_pending_call_steal_reply(pending.get()) : nullptr);
+        pending.reset();
+        return reply;
+    }
+};
 
 bool Same(const char* a, const char* b) { return a && b && std::strcmp(a, b) == 0; }
 
@@ -152,7 +169,8 @@ bool IconName(const std::string& name, uint32_t (&out)[TrayIconWords])
 
 struct Item {
     std::string bus, owner, path, menu;
-    PendingCall refresh, activation;
+    TimedCall refresh;
+    PendingCall activation;
     ChromeTrayItem view{};
     bool isMenu = false;
     bool visible = false;
@@ -175,6 +193,11 @@ struct Session {
     uint32_t menuOwner = 0;
     int32_t menuNode = 0;
     std::vector<ChromeTrayMenuRow> menu;
+    TimedCall layout;
+    uint32_t layoutOwner = 0;
+    int32_t layoutNode = 0;
+    bool layoutDirty = false;
+    TrayInput contextFallback{};
     ChromeTrayState last{};
 
     uint32_t Id() { if (!nextId) ++nextId; return nextId++; }
@@ -204,13 +227,18 @@ struct Session {
         if (m && dbus_message_append_args(m.get(), DBUS_TYPE_STRING, &p, DBUS_TYPE_INVALID)) Send(std::move(m));
     }
 
+    std::vector<Item>::iterator RemoveItem(std::vector<Item>::iterator item)
+    {
+        if (menuOwner == item->view.id || layoutOwner == item->view.id) CloseMenu();
+        SignalItem("StatusNotifierItemUnregistered", *item);
+        return items.erase(item);
+    }
+
     void Remove(const char* owner)
     {
         for (auto it = items.begin(); it != items.end();) {
-            if (it->owner != owner) { ++it; continue; }
-            if (menuOwner == it->view.id) CloseMenu();
-            SignalItem("StatusNotifierItemUnregistered", *it);
-            it = items.erase(it);
+            if (it->owner == owner) it = RemoveItem(it);
+            else ++it;
         }
     }
 
@@ -241,8 +269,13 @@ struct Session {
                 return true;
             }
         }
-        for (const auto& item : items)
-            if (item.owner == sender && item.path == path) return Empty(m);
+        unsigned owned = 0;
+        for (const auto& item : items) {
+            if (item.owner != sender) continue;
+            if (item.path == path) return Empty(m);
+            ++owned;
+        }
+        if (owned >= ItemsPerSender) { Error(m, "Too many StatusNotifierItems from this sender"); return true; }
         if (items.size() == ItemStorage) { Error(m, "Too many StatusNotifierItems"); return true; }
         Item item;
         item.bus = name;
@@ -318,40 +351,52 @@ struct Session {
         return true;
     }
 
+    bool StartCall(TimedCall& call, const Message& request, std::chrono::milliseconds timeout)
+    {
+        DBusPendingCall* pending = nullptr;
+        if (!request || !dbus_connection_send_with_reply(bus, request.get(), &pending, int(timeout.count())) || !pending)
+            return false;
+        call.pending.reset(pending);
+        // Enforce a deadline even while this connection services other messages.
+        call.deadline = Clock::now() + timeout;
+        return true;
+    }
+
     void RefreshItems()
     {
-        for (auto& item : items) {
-            if (item.refresh && dbus_pending_call_get_completed(item.refresh.get())) {
-                auto reply = Hold(dbus_pending_call_steal_reply(item.refresh.get()));
-                item.refresh.reset();
-                UpdateItem(item, std::move(reply));
+        for (auto it = items.begin(); it != items.end();) {
+            auto& item = *it;
+            if (item.refresh.Ready() && !UpdateItem(item, item.refresh.TakeReply())) {
+                it = RemoveItem(it);
+                continue;
             }
-            if (!item.dirty || item.refresh) continue;
-            item.dirty = false;
-            auto request = Hold(dbus_message_new_method_call(item.owner.c_str(), item.path.c_str(),
-                                                            DBUS_INTERFACE_PROPERTIES, "GetAll"));
-            const char* interface = ItemInterface;
-            DBusPendingCall* pending = nullptr;
-            // An app can synchronously ask the bus for another service
-            // immediately after registering its item. Keep dispatching
-            // those calls while its own GetAll request is outstanding.
-            if (request && dbus_message_append_args(request.get(), DBUS_TYPE_STRING, &interface, DBUS_TYPE_INVALID)
-                && dbus_connection_send_with_reply(bus, request.get(), &pending, 2000))
-                item.refresh.reset(pending);
+            if (item.dirty && !item.refresh.pending) {
+                item.dirty = false;
+                auto request = Hold(dbus_message_new_method_call(item.owner.c_str(), item.path.c_str(),
+                                                                DBUS_INTERFACE_PROPERTIES, "GetAll"));
+                const char* interface = ItemInterface;
+                if (!request || !dbus_message_append_args(request.get(), DBUS_TYPE_STRING, &interface, DBUS_TYPE_INVALID) ||
+                    !StartCall(item.refresh, request, ItemTimeout)) {
+                    it = RemoveItem(it);
+                    continue;
+                }
+            }
+            ++it;
         }
     }
 
-    void UpdateItem(Item& item, Message reply)
+    bool UpdateItem(Item& item, Message reply)
     {
         DBusMessageIter dict{};
-        if (!reply || !dbus_message_has_signature(reply.get(), "a{sv}")
-            || !dbus_message_iter_init(reply.get(), &dict)) return;
+        if (!reply || dbus_message_get_type(reply.get()) != DBUS_MESSAGE_TYPE_METHOD_RETURN ||
+            !dbus_message_has_signature(reply.get(), "a{sv}") || !dbus_message_iter_init(reply.get(), &dict))
+            return false;
 
         ChromeTrayItem view{};
         view.id = item.view.id;
         item.visible = true;
         item.isMenu = false;
-        item.menu.clear();
+        std::string menuPath;
         std::string name, attention;
         uint32_t attentionPixels[TrayIconWords]{};
         bool hasAttention = false;
@@ -366,7 +411,7 @@ struct Session {
             else if (Same(key, "AttentionIconName") && text) attention = text;
             else if (Same(key, "IconPixmap")) view.hasIcon = Pixels(value, view.icon);
             else if (Same(key, "AttentionIconPixmap")) hasAttention = Pixels(value, attentionPixels);
-            else if (Same(key, "Menu") && text && dbus_validate_path(text, nullptr)) item.menu = text;
+            else if (Same(key, "Menu") && text && dbus_validate_path(text, nullptr)) menuPath = text;
             else if (Same(key, "ItemIsMenu")) item.isMenu = Boolean(value, false);
             else if (Same(key, "ToolTip") && dbus_message_iter_get_arg_type(&value) == DBUS_TYPE_STRUCT) {
                 auto fields = Into(value);
@@ -388,31 +433,62 @@ struct Session {
         if (!view.hasIcon) view.hasIcon = IconName(name, view.icon);
         if (!view.title[0]) CopyText(view.title, item.bus.c_str());
         item.view = view;
-        if (!item.visible && menuOwner == view.id) CloseMenu();
+        if ((!item.visible || menuPath != item.menu) && (menuOwner == view.id || layoutOwner == view.id)) CloseMenu();
+        item.menu = std::move(menuPath);
+        return true;
     }
 
-    void CloseMenu() { menu.clear(); menuOwner = 0; menuNode = 0; }
+    void CloseMenu()
+    {
+        layout.pending.reset();
+        layoutOwner = 0;
+        layoutDirty = false;
+        contextFallback = {};
+        menu.clear();
+        menuOwner = 0;
+        menuNode = 0;
+    }
 
-    bool FetchMenu(const Item& item, int32_t node)
+    bool FetchMenu(const Item& item, int32_t node, const TrayInput* context = nullptr)
     {
         if (item.menu.empty() || item.menu == "/") return false;
+        if (layout.pending && layoutOwner == item.view.id && layoutNode == node) {
+            if (context) contextFallback = *context;
+            return true;
+        }
+        if (menuOwner != item.view.id) CloseMenu();
+        else layout.pending.reset();
+        layoutOwner = 0;
+        layoutDirty = false;
+        contextFallback = {};
         auto prepare = Hold(dbus_message_new_method_call(item.owner.c_str(), item.menu.c_str(), MenuInterface, "AboutToShow"));
         if (prepare) {
-            dbus_message_append_args(prepare.get(), DBUS_TYPE_INT32, &node, DBUS_TYPE_INVALID);
-            Send(std::move(prepare));
+            if (dbus_message_append_args(prepare.get(), DBUS_TYPE_INT32, &node, DBUS_TYPE_INVALID)) {
+                dbus_message_set_no_reply(prepare.get(), true);
+                Send(std::move(prepare));
+            }
         }
         auto msg = Hold(dbus_message_new_method_call(item.owner.c_str(), item.menu.c_str(), MenuInterface, "GetLayout"));
         if (!msg) return false;
         DBusMessageIter append, array;
         dbus_message_iter_init_append(msg.get(), &append);
         const int32_t depth = 1;
-        dbus_message_iter_append_basic(&append, DBUS_TYPE_INT32, &node);
-        dbus_message_iter_append_basic(&append, DBUS_TYPE_INT32, &depth);
-        dbus_message_iter_open_container(&append, DBUS_TYPE_ARRAY, "s", &array);
-        dbus_message_iter_close_container(&append, &array);
-        auto reply = Request(std::move(msg));
+        if (!dbus_message_iter_append_basic(&append, DBUS_TYPE_INT32, &node) ||
+            !dbus_message_iter_append_basic(&append, DBUS_TYPE_INT32, &depth) ||
+            !dbus_message_iter_open_container(&append, DBUS_TYPE_ARRAY, "s", &array) ||
+            !dbus_message_iter_close_container(&append, &array) ||
+            !StartCall(layout, msg, LayoutTimeout)) return false;
+        layoutOwner = item.view.id;
+        layoutNode = node;
+        if (context) contextFallback = *context;
+        return true;
+    }
+
+    bool UpdateMenu(const Item& item, int32_t node, const Message& reply)
+    {
         DBusMessageIter output{};
-        if (!reply || !dbus_message_has_signature(reply.get(), "u(ia{sv}av)") ||
+        if (!reply || dbus_message_get_type(reply.get()) != DBUS_MESSAGE_TYPE_METHOD_RETURN ||
+            !dbus_message_has_signature(reply.get(), "u(ia{sv}av)") ||
             !dbus_message_iter_init(reply.get(), &output) || !dbus_message_iter_next(&output)) return false;
         auto root = Into(output);
         dbus_message_iter_next(&root);
@@ -456,6 +532,32 @@ struct Session {
         return true;
     }
 
+    void RefreshMenu()
+    {
+        if (layout.pending && !layout.Ready()) return;
+        if (layout.pending) {
+            auto reply = layout.TakeReply();
+            const auto item = std::find_if(items.begin(), items.end(), [&](const auto& i) {
+                return i.view.id == layoutOwner && i.visible;
+            });
+            const auto fallback = contextFallback;
+            const int32_t node = layoutNode;
+            layoutOwner = 0;
+            contextFallback = {};
+            if (item == items.end() || !UpdateMenu(*item, node, reply)) {
+                CloseMenu();
+                if (item != items.end() && fallback.owner) ItemAction(*item, "ContextMenu", fallback);
+                return;
+            }
+        }
+        if (!layoutDirty) return;
+        layoutDirty = false;
+        const auto item = std::find_if(items.begin(), items.end(), [&](const auto& i) {
+            return i.view.id == menuOwner && i.visible;
+        });
+        if (item == items.end() || !FetchMenu(*item, menuNode)) CloseMenu();
+    }
+
     void ItemAction(Item& item, const char* member, const TrayInput& event)
     {
         if (event.kind == TrayInputKind::Activate && item.isMenu) {
@@ -494,7 +596,8 @@ struct Session {
     void MenuSelect(const Item& item, int32_t id)
     {
         const auto it = std::find_if(menu.begin(), menu.end(), [id](const auto& row) { return row.id == id; });
-        if (menuOwner != item.view.id || it == menu.end() || !it->enabled || it->separator) return;
+        if (menuOwner != item.view.id || it == menu.end() || !it->enabled || it->separator ||
+            (layout.pending && layoutNode != menuNode)) return;
         if (it->submenu || id == MenuBack) {
             if (!FetchMenu(item, id == MenuBack ? 0 : id)) CloseMenu();
             return;
@@ -644,11 +747,13 @@ struct Session {
         case TrayInputKind::Activate: ItemAction(*item, "Activate", e); break;
         case TrayInputKind::Context:
             item->activation.reset();
-            if (!FetchMenu(*item, 0)) ItemAction(*item, "ContextMenu", e);
+            if (!FetchMenu(*item, 0, &e)) ItemAction(*item, "ContextMenu", e);
             break;
         case TrayInputKind::Scroll: ItemAction(*item, "Scroll", e); break;
         case TrayInputKind::MenuSelect: MenuSelect(*item, e.argument); break;
-        case TrayInputKind::DismissMenu: if (menuOwner == e.owner) CloseMenu(); break;
+        case TrayInputKind::DismissMenu:
+            if (menuOwner == e.owner || layoutOwner == e.owner) CloseMenu();
+            break;
         default: break;
         }
     }
@@ -689,11 +794,11 @@ struct Session {
                 for (auto& item : items)
                     if (Same(dbus_message_get_sender(m), item.owner.c_str()) &&
                         Same(dbus_message_get_path(m), item.path.c_str())) item.dirty = true;
-            if (menuOwner && Same(interface, MenuInterface))
+            if (dbus_message_is_signal(m, MenuInterface, "LayoutUpdated"))
                 for (const auto& item : items)
-                    if (item.view.id == menuOwner && Same(dbus_message_get_sender(m), item.owner.c_str()) &&
-                        Same(dbus_message_get_path(m), item.menu.c_str()))
-                        if (!FetchMenu(item, menuNode)) CloseMenu();
+                    if ((item.view.id == menuOwner || item.view.id == layoutOwner) &&
+                        Same(dbus_message_get_sender(m), item.owner.c_str()) &&
+                        Same(dbus_message_get_path(m), item.menu.c_str())) layoutDirty = true;
             return false;
         }
         if (dbus_message_has_path(m, WatcherPath)) {
@@ -747,6 +852,7 @@ int RunSessionServices(TrayPublish publish, TrayReadInput readInput, int parent)
                 if (!status) break;
                 service.Input(input);
             }
+            service.RefreshMenu();
             for (auto it = service.notices.begin(); it != service.notices.end();) {
                 if (it->deadline > Clock::now()) { ++it; continue; }
                 service.Closed(*it, 1);

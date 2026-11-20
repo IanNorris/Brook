@@ -23,7 +23,10 @@ constexpr char NotesPath[] = "/org/freedesktop/Notifications";
 int stateFd, inputFd;
 bool scrolled = false, menuClicked = false, actionInvoked = false, closed = false;
 bool itemIsMenu = false, rejectActivation = false;
-unsigned activateCalls = 0;
+unsigned activateCalls = 0, layoutCalls = 0, contextCalls = 0;
+bool deferLayout = false;
+DBusMessage* heldLayout = nullptr;
+const char* menuLabel = "_Show Library";
 const char* status = "Active";
 const char* title = "Steam fixture";
 DBusConnection* peer;
@@ -83,7 +86,7 @@ void MenuNode(DBusMessageIter& iter, int32_t id)
     dbus_message_iter_open_container(&iter, DBUS_TYPE_STRUCT, nullptr, &node);
     dbus_message_iter_append_basic(&node, DBUS_TYPE_INT32, &id);
     dbus_message_iter_open_container(&node, DBUS_TYPE_ARRAY, "{sv}", &properties);
-    if (id) StringProperty(properties, "label", "_Show Library");
+    if (id) StringProperty(properties, "label", menuLabel);
     dbus_message_iter_close_container(&node, &properties);
     dbus_message_iter_open_container(&node, DBUS_TYPE_ARRAY, "v", &children);
     if (!id) {
@@ -96,6 +99,37 @@ void MenuNode(DBusMessageIter& iter, int32_t id)
     dbus_message_iter_close_container(&iter, &node);
 }
 
+void ReplyLayout(DBusConnection* bus, DBusMessage* msg)
+{
+    auto* reply = dbus_message_new_method_return(msg);
+    assert(reply);
+    DBusMessageIter iter;
+    dbus_message_iter_init_append(reply, &iter);
+    uint32_t revision = layoutCalls;
+    assert(dbus_message_iter_append_basic(&iter, DBUS_TYPE_UINT32, &revision));
+    MenuNode(iter, 0);
+    assert(dbus_connection_send(bus, reply, nullptr));
+    dbus_message_unref(reply);
+}
+
+void ReleaseLayout()
+{
+    assert(heldLayout);
+    ReplyLayout(peer, heldLayout);
+    dbus_message_unref(heldLayout);
+    heldLayout = nullptr;
+}
+
+void LayoutUpdated()
+{
+    auto* msg = dbus_message_new_signal("/Menu", Menu, "LayoutUpdated");
+    const uint32_t revision = layoutCalls + 1;
+    const int32_t root = 0;
+    assert(msg && dbus_message_append_args(msg, DBUS_TYPE_UINT32, &revision, DBUS_TYPE_INT32, &root, DBUS_TYPE_INVALID));
+    assert(dbus_connection_send(peer, msg, nullptr));
+    dbus_message_unref(msg);
+}
+
 DBusHandlerResult Fake(DBusConnection* bus, DBusMessage* msg, void*)
 {
     auto send = [&](DBusMessage* m) {
@@ -104,6 +138,8 @@ DBusHandlerResult Fake(DBusConnection* bus, DBusMessage* msg, void*)
         dbus_message_unref(m);
     };
     if (dbus_message_is_method_call(msg, DBUS_INTERFACE_PROPERTIES, "GetAll")) {
+        if (std::strncmp(dbus_message_get_path(msg), "/Unresponsive", 13) == 0)
+            return DBUS_HANDLER_RESULT_HANDLED; // keep the connection open without answering
         auto* reply = dbus_message_new_method_return(msg);
         DBusMessageIter out, properties, pair, variant;
         dbus_message_iter_init_append(reply, &out);
@@ -129,13 +165,14 @@ DBusHandlerResult Fake(DBusConnection* bus, DBusMessage* msg, void*)
         dbus_message_iter_close_container(&out, &properties);
         send(reply);
     } else if (dbus_message_is_method_call(msg, Menu, "GetLayout")) {
-        auto* reply = dbus_message_new_method_return(msg);
-        DBusMessageIter iter;
-        dbus_message_iter_init_append(reply, &iter);
-        uint32_t revision = 1;
-        dbus_message_iter_append_basic(&iter, DBUS_TYPE_UINT32, &revision);
-        MenuNode(iter, 0);
-        send(reply);
+        ++layoutCalls;
+        if (deferLayout) {
+            assert(!heldLayout);
+            heldLayout = dbus_message_ref(msg);
+        } else ReplyLayout(bus, msg);
+    } else if (dbus_message_is_method_call(msg, Item, "ContextMenu")) {
+        assert(dbus_message_has_signature(msg, "ii"));
+        ++contextCalls;
     } else if (dbus_message_is_method_call(msg, Item, "Activate")) {
         assert(dbus_message_has_signature(msg, "ii"));
         ++activateCalls;
@@ -168,7 +205,7 @@ DBusMessage* Ask(DBusMessage* message)
     return reply;
 }
 
-void Wait(bool (*condition)())
+template<class Predicate> void Wait(Predicate condition)
 {
     using namespace std::chrono;
     const auto timeLimit = steady_clock::now() + seconds(5);
@@ -180,6 +217,37 @@ void Wait(bool (*condition)())
         if (!received && condition()) return;
         assert(steady_clock::now() < timeLimit);
     }
+}
+
+void Register(DBusConnection* sender, const char* path, bool accepted = true)
+{
+    auto* request = dbus_message_new_method_call(Watcher, "/StatusNotifierWatcher", Watcher, "RegisterStatusNotifierItem");
+    assert(request && dbus_message_append_args(request, DBUS_TYPE_STRING, &path, DBUS_TYPE_INVALID));
+    DBusError error = DBUS_ERROR_INIT;
+    auto* reply = dbus_connection_send_with_reply_and_block(sender, request, 3000, &error);
+    dbus_message_unref(request);
+    if (accepted) assert(reply);
+    else assert(!reply && dbus_error_has_name(&error, DBUS_ERROR_INVALID_ARGS));
+    if (reply) dbus_message_unref(reply);
+    dbus_error_free(&error);
+}
+
+unsigned RegisteredCount()
+{
+    auto* request = dbus_message_new_method_call(Watcher, "/StatusNotifierWatcher", DBUS_INTERFACE_PROPERTIES, "Get");
+    const char* iface = Watcher;
+    const char* key = "RegisteredStatusNotifierItems";
+    assert(request && dbus_message_append_args(request, DBUS_TYPE_STRING, &iface, DBUS_TYPE_STRING, &key, DBUS_TYPE_INVALID));
+    auto* reply = Ask(request);
+    DBusMessageIter value, array, items;
+    assert(dbus_message_has_signature(reply, "v") && dbus_message_iter_init(reply, &value));
+    dbus_message_iter_recurse(&value, &array);
+    assert(dbus_message_iter_get_arg_type(&array) == DBUS_TYPE_ARRAY);
+    dbus_message_iter_recurse(&array, &items);
+    unsigned count = 0;
+    for (; dbus_message_iter_get_arg_type(&items) == DBUS_TYPE_STRING; dbus_message_iter_next(&items)) ++count;
+    dbus_message_unref(reply);
+    return count;
 }
 
 uint32_t Notify(int timeout, uint32_t replace = 0)
@@ -240,10 +308,8 @@ int main()
         assert(i < 100);
         usleep(20000);
     }
-    auto* registerItem = dbus_message_new_method_call(Watcher, "/StatusNotifierWatcher", Watcher, "RegisterStatusNotifierItem");
     const char* path = "/StatusNotifierItem";
-    dbus_message_append_args(registerItem, DBUS_TYPE_STRING, &path, DBUS_TYPE_INVALID);
-    dbus_message_unref(Ask(registerItem));
+    Register(peer, path);
     // Properties.GetAll and a synchronous client request can cross on
     // the bus before the client begins dispatching incoming methods.
     auto* capabilities = Ask(dbus_message_new_method_call(Notes, NotesPath, Notes, "GetCapabilities"));
@@ -288,6 +354,50 @@ int main()
     Action(TrayInputKind::DismissMenu, id);
     Wait([] { return state.menuCount == 0; });
 
+    // A peer holding GetLayout must be able to use another service on the
+    // same bus before it replies, including a notification.
+    deferLayout = true;
+    Action(TrayInputKind::Context, id);
+    Wait([] { return heldLayout != nullptr; });
+    const uint32_t menuNotice = Notify(3000);
+    Wait([&] { return state.notice.id == menuNotice; });
+    assert(state.menuCount == 0 && heldLayout);
+    Action(TrayInputKind::CloseNotice, menuNotice);
+    deferLayout = false;
+    ReleaseLayout();
+    Wait([] { return state.menuCount == 1 && !state.notice.id; });
+
+    // Hold a refresh open while its owner floods change signals. The
+    // current menu remains usable, with one follow-up after the reply.
+    deferLayout = true;
+    const unsigned beforeBurst = layoutCalls;
+    LayoutUpdated();
+    Wait([] { return heldLayout != nullptr; });
+    for (unsigned i = 0; i < 48; ++i) LayoutUpdated();
+    dbus_message_unref(Ask(dbus_message_new_method_call(Notes, NotesPath, Notes, "GetCapabilities")));
+    assert(layoutCalls == beforeBurst + 1 && state.menuCount == 1);
+    menuLabel = "_Open updated library";
+    deferLayout = false;
+    ReleaseLayout();
+    Wait([&] { return layoutCalls == beforeBurst + 2 && std::strcmp(state.menu[0].label, "Open updated library") == 0; });
+
+    deferLayout = true;
+    LayoutUpdated();
+    Wait([] { return heldLayout != nullptr; });
+    Action(TrayInputKind::DismissMenu, id);
+    Wait([] { return state.menuCount == 0; });
+    deferLayout = false;
+    ReleaseLayout(); // The superseded reply must never reopen a menu.
+    const unsigned beforeTimeout = layoutCalls;
+    deferLayout = true;
+    Action(TrayInputKind::Context, id);
+    Wait([&] { return layoutCalls == beforeTimeout + 1 && heldLayout; });
+    Wait([] { return contextCalls == 1; }); // Timeout falls back to the item's ContextMenu.
+    assert(state.menuCount == 0);
+    dbus_message_unref(heldLayout);
+    heldLayout = nullptr;
+    deferLayout = false;
+
     for (const char* value : {"NeedsAttention", "Passive"}) {
         status = value;
         auto* signal = dbus_message_new_signal(path, Item, "NewStatus");
@@ -296,6 +406,22 @@ int main()
         if (std::strcmp(value, "Passive") == 0) Wait([] { return state.itemCount == 0; });
         else Wait([] { return state.items[0].attention != 0; });
     }
+
+    // The valid Passive item still counts, but a peer cannot consume
+    // every slot or claim another peer's bus name.
+    assert(RegisteredCount() == 1);
+    for (const char* fixture : {"/Unresponsive1", "/Unresponsive2", "/Unresponsive3"}) Register(peer, fixture);
+    Register(peer, "/Unresponsive4", false);
+    Register(peer, path); // Re-registration is idempotent even at the cap.
+    auto* second = dbus_bus_get_private(DBUS_BUS_SESSION, nullptr);
+    assert(second);
+    Register(second, dbus_bus_get_unique_name(peer), false);
+    Register(second, "/UnresponsivePeer");
+    assert(RegisteredCount() == 5);
+    Wait([] { return RegisteredCount() == 1; });
+    Register(peer, "/Unresponsive4"); // The unanswered registrations freed capacity.
+    dbus_connection_close(second);
+    dbus_connection_unref(second);
 
     const uint32_t note = Notify(2000);
     assert(Notify(2000, note) == note);
