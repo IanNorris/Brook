@@ -44,6 +44,8 @@ What it does not exercise: the Intel GPU, Vulkan supervisor, renderer and Waylan
 replaced by a synthetic static service, so the real boot-service binaries are never run), the Dell
 USB network, real ACPI/EC, firmware reset behaviour, the physical SSD and the physical-identity loader.
 It checks the guarded boot, recovery, reset and startup-script path for this kernel and initrd.
+With --bridge-v3-qa, the guarded desktop also runs an authenticated command and
+the packaged bulk helpers on loopback-only QEMU forwards, using a synthetic operator.
 """
 import argparse, gzip, hashlib, json, os, re, shutil, subprocess, sys, time
 from pathlib import Path
@@ -51,6 +53,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
 from hardware_update_protocol import record
+from guarded_bridge_v3_qa import PASS_MARKER as BRIDGE_V3_PASS_MARKER
 
 DEFAULT_SHARED = Path('/data/Programming/Brook/shared/dell')
 IMAGE = ('qemu-check/guard-efi-fixture-20261103.raw.gz',
@@ -121,6 +124,8 @@ def main():
                    help='Negative check: with --managed-profile, an absolute current alias must fail handoff')
     p.add_argument('--bridge-local-policy-qa', type=Path,
                    help='Run the local bridge and reserved-port guest regression using this static probe')
+    p.add_argument('--bridge-v3-qa', type=Path, metavar='OPERATOR.SEED',
+                   help='Test the exact v3 pair with its synthetic operator seed and matching virtio module')
     a = p.parse_args()
     mode_flags = list(MODE_FLAGS)
     if a.managed_profile:
@@ -137,6 +142,12 @@ def main():
         if a.proc_dump_qa or a.proc_autodump_qa or a.managed_profile_absolute_current:
             p.error('the bridge local policy probe requires an ordinary guarded handoff')
         mode_flags += ['--bridge-local-policy-qa', str(a.bridge_local_policy_qa.resolve()),
+                       '--auto-desktop-network-module', str(a.kernel_build.resolve() / 'drivers/virtio_net.mod')]
+    if a.bridge_v3_qa:
+        if (a.bridge_local_policy_qa or a.proc_dump_qa or a.proc_autodump_qa or
+                a.managed_profile_absolute_current or a.kernel_build_flags):
+            p.error('v3 QA requires the ordinary guarded handoff and the matching kernel build directory')
+        mode_flags += ['--bridge-v3-qa', str(a.bridge_v3_qa.absolute()),
                        '--auto-desktop-network-module', str(a.kernel_build.resolve() / 'drivers/virtio_net.mod')]
     pair, shared = a.pair.resolve(), a.shared.resolve()
     out = (a.output or pair / 'qemu-check').resolve()
@@ -155,6 +166,23 @@ def main():
     kernel, initrd = pair / 'kernel.elf', pair / 'INITRD.IMG'
     kernel_sha, initrd_sha = sha(kernel), sha(initrd)
     flags, cache_sha, flag_source = build_flags(a, kernel_sha)
+    if a.bridge_v3_qa:
+        if flags.get('BROOK_BRIDGE_V3') != 'ON':
+            p.error('v3 QA requires a v3 kernel')
+        build_manifest = json.loads((pair / 'build-manifest.json').read_text())
+        policy = build_manifest.get('bridge_v3') or {}
+        if (build_manifest.get('dirty') is not False or
+                build_manifest.get('kernel_sha256') != kernel_sha or
+                build_manifest.get('initrd_sha256') != initrd_sha or
+                (policy.get('version'), policy.get('suite')) != (3, 1)):
+            p.error('v3 QA requires a clean exact v3 build manifest')
+        bridge_manifest = {
+            'build_id': build_manifest['build_id'],
+            'kernel_sha256': kernel_sha,
+            'source_initrd_sha256': initrd_sha,
+            'policy_sha256': policy['policy_sha256'],
+            'helpers_sha256': policy['helpers_sha256'],
+        }
 
     # Short scratch path: QEMU monitor sockets below the test's temporary directory must fit in
     # sun_path (108 bytes).
@@ -201,6 +229,8 @@ def main():
         }
         if manifest['files']['KERNEL.ELF']['sha256'] != kernel_sha or manifest['files']['INITRD.IMG']['sha256'] != initrd_sha:
             raise SystemExit('pair changed while copying')
+        if a.bridge_v3_qa:
+            manifest['bridge_v3_qa'] = bridge_manifest
         text = json.dumps(manifest, indent=2) + '\n'
         (desktop / 'manifest.json').write_text(text)
         (out / 'qemu-pair-manifest.json').write_text(text)
@@ -220,6 +250,10 @@ def main():
                 result = subprocess.run(argv, cwd=ROOT / 'scripts', env=env, stdout=log, stderr=subprocess.STDOUT)
             lines = log_path.read_text(errors='replace').splitlines()
             passed = result.returncode == 0 and PASS_MARKER in lines
+            bridge_checked = a.bridge_v3_qa and BRIDGE_V3_PASS_MARKER in lines and (run_dir / 'bridge-v3-qa.json').is_file()
+            if a.bridge_v3_qa and passed and not bridge_checked:
+                lines.append('Guarded v3 boot did not verify the packaged command and bulk receivers')
+                passed = False
             clearwater_ready = False
             if expect_clearwater and passed:
                 serial = (run_dir / 'desktop-serial.log').read_text(errors='replace')
@@ -237,6 +271,8 @@ def main():
                      'seconds': round(time.monotonic() - start, 1), 'log': log_path.name, 'output': run_dir.name}
             if expect_clearwater:
                 entry['clearwater_shell_ready'] = clearwater_ready
+            if bridge_checked:
+                entry['bridge_v3_evidence'] = 'bridge-v3-qa.json'
             if not passed:
                 entry['log_tail'] = [x[:4000] for x in lines[-12:]]
                 entry['firmware_stall'] = firmware_stall
