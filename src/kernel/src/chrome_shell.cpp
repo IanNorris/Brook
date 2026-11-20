@@ -1632,7 +1632,8 @@ static void DetailedCpu(const ChromeStatsPopupLayout& l, DesktopRect b,
         char label[20] = "CPU ", value[8]{};
         DesktopNumber(label + 4, core);
         const uint8_t percent = stats.cpuMeasured ? stats.cores[core] : DetailedNoPercent;
-        DetailedPercent(value, percent);
+        if (!stats.cpuMeasured) CopyText(value, "—", sizeof(value));
+        else DetailedPercent(value, percent);
         DetailedValue(dl, s, x, y, column, label, value);
         const int height = Px(s, 2);
         DetailedUsageBar(dl, s, {x, y + row - height, column, height}, percent, percent > 90);

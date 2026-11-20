@@ -797,6 +797,18 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
                 stats.coreCount = 64;
                 stats.tasks[2] = stats.tasks[3] = {};
             }
+            if (panel == DesktopStatsPanel::CpuMemory && prefix == "glass-100-") {
+                stats = {};
+                stats.coreCount = 4;
+                model.firstCoreRow = 0;
+                model.statsLayout = ChromeStatsPopupLayoutFor(s, layout.volume, screenW, screenH - m.taskbar(),
+                                                               panel, 4, false, 0, DesktopStatsTaskRows(stats));
+                model.rect = model.statsLayout.panel;
+                auto samplingList = ChromeListOn(storage);
+                RenderSnapshot(model, s, samplingList);
+                Check(prefix + "stats-cpu-memory-first-sample", samplingList, s,
+                      model.rect.x, model.rect.y, model.rect.w, model.rect.h);
+            }
             if (panel == DesktopStatsPanel::CpuMemory && prefix == "opaque-dark-200-") {
                 const int desktop = 600 - m.taskbar();
                 model.statsLayout = ChromeStatsPopupLayoutFor(s, {360, desktop, 80, 60}, 800, desktop,

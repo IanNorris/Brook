@@ -26,15 +26,16 @@ struct ChromeFontSet {
 // The sets the build bakes (chrome_fonts.cpp, cmake/ChromeFonts.cmake).
 extern const ChromeFontSet g_chromeFonts100, g_chromeFonts150, g_chromeFonts200;
 
-// Map the UTF-8 en dash to the extra glyph slot. Existing text uses
-// literal byte slots for the degree and middle dot.
+// Map UTF-8 en and em dashes to their extra glyph slots. Existing text
+// uses literal byte slots for the degree and middle dot.
 inline uint32_t ChromeReadTextGlyph(const char*& text) {
-    if (text[0] == '\xe2' && text[1] == '\x80' && text[2] == '\x93') {
+    if (text[0] == '\xe2' && text[1] == '\x80' && (text[2] == '\x93' || text[2] == '\x94')) {
+        const auto glyph = text[2] == '\x93' ? 0x81u : 0x82u;
         text += 3;
-        return 0x81;
+        return glyph;
     }
     const auto byte = static_cast<uint8_t>(*text++);
-    return byte == 0x81 ? 0 : byte;
+    return byte == 0x81 || byte == 0x82 ? 0 : byte;
 }
 inline int ChromeGlyphAdvance(const FontAtlas& font, uint32_t code) {
     return code >= font.firstChar && code - font.firstChar < font.glyphCount ?

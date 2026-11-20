@@ -88,6 +88,7 @@ glass-100-stats-app 24e3f1b9bef9610e
 glass-100-stats-compositor dd7e4368dcd53dfc
 glass-100-stats-cpu-memory 51b2c1a3f5ba47c9
 glass-100-stats-cpu-memory-compact 80e425e1d4b743a8
+glass-100-stats-cpu-memory-first-sample a7de6cf042d322b3
 glass-100-taskbar 1a45bc918ce7f0e4
 glass-100-taskbar-default 6177eaec348d1318
 glass-100-taskbar-diagnostics 02ca9dc820d1176a
