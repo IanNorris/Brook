@@ -52,6 +52,7 @@ glass-100-launcher-menu ad9821ccba3c163a
 glass-100-launcher-new-category d98ecfc8db1d0134
 glass-100-launcher-nomatch e3ba0efb9339ba25
 glass-100-launcher-organise 935eb83270ef0ee4
+glass-100-launcher-organise-budget b330a9bcd1af7010
 glass-100-launcher-prompt 1b37a1d4f49828fd
 glass-100-launcher-rename-app 0702440cadd59341
 glass-100-launcher-search 28abedabd840eb5a
@@ -583,6 +584,7 @@ opaque-dark-150-launcher-menu 8ed0e5a68e5e0c41
 opaque-dark-150-launcher-new-category 9f502b03c7504d5c
 opaque-dark-150-launcher-nomatch ff47aac2a3194a5d
 opaque-dark-150-launcher-organise 7ec2a64472aea60e
+opaque-dark-150-launcher-organise-budget 9c0cd6cc5e007633
 opaque-dark-150-launcher-prompt 9fe988bbe6820e60
 opaque-dark-150-launcher-rename-app 4d20469785eb1c0f
 opaque-dark-150-launcher-search 7daec088d2184946
@@ -715,6 +717,7 @@ opaque-light-200-launcher-menu b510b840806b4655
 opaque-light-200-launcher-new-category 06616c01257f3b76
 opaque-light-200-launcher-nomatch b666f1b9b2eebc15
 opaque-light-200-launcher-organise a3e7faf8be3d859f
+opaque-light-200-launcher-organise-budget 5cb0d126ab54c6ee
 opaque-light-200-launcher-prompt 0827555c2080be84
 opaque-light-200-launcher-rename-app 72a478373efb2f46
 opaque-light-200-launcher-search e10910543658d8bd

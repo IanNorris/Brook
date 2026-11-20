@@ -362,10 +362,13 @@ const uint64_t now = 100000;
 
 // Use different storage for the received snapshot so all borrowed list assets
 // must be rebound locally, as in the shell process.
-void CheckShellWire(const ChromeDisplayList& list) {
+void CheckShellWire(const ChromeDisplayList& list, const char* label = nullptr) {
     static ShellWireList wire;
     static ChromeCmd replay[ShellCommandLimit];
     if (!PackShellList(list, wire)) std::abort();
+    if (label)
+        std::printf("%s wire budget: %u/%u commands, %u/%u text bytes, %u/%u asset words\n",
+                    label, wire.count, ShellCommandLimit, wire.textBytes, ShellTextLimit, wire.assetWords, ShellAssetLimit);
     for (uint32_t i = 0; i < wire.count; ++i)
         if (!DecodeShellCommand(wire.commands[i], wire.text, wire.textBytes,
                                 wire.assets, wire.assetWords, replay[i])) std::abort();
@@ -395,10 +398,62 @@ void SetTestIcon(ChromeShellIcon& icon) {
     std::memcpy(icon.pixels, testIcon, sizeof(icon.pixels));
 }
 
+void LauncherWireBudget(const std::string& name, const ChromeStyle& style, uint32_t screenW, uint32_t screenH) {
+    using TK = LauncherTargetKind;
+    static ChromeShellModel snapshot;
+    static ChromeShellStorage storage;
+    static LauncherApp apps[LauncherLimits::Apps];
+    snapshot = {};
+    snapshot.kind = ChromeShellKind::Launcher;
+    snapshot.mouseX = snapshot.mouseY = -1;
+    std::strcpy(snapshot.launcherBuild, "Launcher wire-budget fixture");
+    auto& model = snapshot.launcherModel;
+    model.Init();
+    model.SetCatalog(nullptr, 0); // install the fixture apps after the initial layout is filed
+    while (model.CategoryCount() < LauncherLimits::Categories) {
+        const int category = model.CreateCategory();
+        if (category < 0) std::abort();
+        char nameBuffer[LauncherLimits::CategoryName];
+        std::snprintf(nameBuffer, sizeof(nameBuffer), "Custom category %u", unsigned(category));
+        if (!model.RenameCategory(uint32_t(category), nameBuffer)) std::abort();
+    }
+    for (uint32_t app = 0; app < LauncherLimits::Apps; ++app) {
+        auto& entry = apps[app];
+        std::snprintf(entry.key, sizeof(entry.key), "org.brook.desktop-fixture.%03u", app);
+        std::snprintf(entry.name, sizeof(entry.name), "Application %03u for documents and graphics", app);
+        std::strcpy(entry.desc, "Open and edit documents with this workspace writing application");
+        std::strcpy(entry.hint, app % 2 ? "office" : "graphics");
+        SetTestIcon(snapshot.icons[app]);
+    }
+    model.SetCatalog(apps, LauncherLimits::Apps);
+    for (uint32_t app = 0; app < LauncherLimits::Pins; ++app) model.TogglePin(app);
+    model.Press({TK::Organise, 0}, false, 0, 0);
+    model.Press({TK::Rail, uint16_t(model.RailRowFor(LauncherViewUnsorted))}, false, 0, 0);
+    model.Press({TK::Row, 0}, false, 0, 0);
+    model.SetUndoVisible(true);
+    if (model.CategoryCount() != LauncherLimits::Categories || model.UnsortedCount() != LauncherLimits::Apps ||
+        model.Suggestion(0) < 0 || model.PinCount() != LauncherLimits::Pins) std::abort();
+    const ChromeLauncherChrome chrome{nullptr, 0, "brook", snapshot.launcherBuild, nullptr, false, false, false, false, -1, -1};
+    auto& frame = snapshot.launcherFrame;
+    ChromeLauncherFrameFor(model, chrome, style, screenW, screenH, frame);
+    model.SetViewport(frame.viewport);
+    ChromeLauncherFrameFor(model, chrome, style, screenW, screenH, frame);
+    bool suggestionDrawn = false;
+    for (uint32_t i = 0; i < frame.targetCount; ++i) suggestionDrawn |= frame.targets[i].target.kind == TK::MoveSuggested;
+    if (!suggestionDrawn) std::abort();
+    auto list = ChromeListOn(storage);
+    BuildShellModel(snapshot, style, list);
+    CheckShellWire(list, name.c_str());
+    const auto& rect = frame.panel;
+    Check(name, list, style, rect.x, rect.y, rect.w, rect.h);
+}
+
 void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
     const bool glass = theme == BROOK_THEME_GLASS;
     const ChromeStyle s = StyleFor(theme, m, glass);
     const uint32_t screenW = 1280 * m.percent / 100, screenH = 800 * m.percent / 100;
+    if (prefix == "glass-100-" || prefix == "opaque-dark-150-" || prefix == "opaque-light-200-")
+        LauncherWireBudget(prefix + "launcher-organise-budget", s, screenW, screenH);
     static ChromeShellStorage storage;
 
     // Taskbar: three windows (focused, minimised, plain), a starting app and
