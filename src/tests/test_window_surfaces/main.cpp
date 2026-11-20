@@ -828,6 +828,59 @@ int main() {
         CHECK(taskbarShown() && !lockDepth);
         std::free(gamer);
     }
+    // Web-app names are resolved by app ID on metadata changes and catalog
+    // publication. The three chrome consumers share the derived title, while
+    // the diagnostic snapshot retains the original string.
+    {
+        constexpr uint32_t sw = 1024, sh = 768;
+        auto* client = static_cast<Process*>(std::calloc(1, sizeof(Process)));
+        CHECK(client);
+        client->pid = client->tgid = 7;
+        client->incarnation = 71;
+        static LauncherSnapshot webCatalog{};
+        webCatalog.count = 1;
+        webCatalog.generation = 2;
+        auto& app = webCatalog.items[0];
+        app.valid = app.isDesktopEntry = app.isUserDesktopEntry = app.isWebApp = true;
+        WmStrCopy(app.title, "Brook Mail", sizeof(app.title));
+        WmStrCopy(app.appId, "org.Brook.Mail", sizeof(app.appId));
+        g_launcherActive = &webCatalog;
+
+        const int slot = WmCreateWindow(client, 20, 40, 360, 240, "mail.example");
+        CHECK(slot >= 0);
+        auto& window = g_windows[slot];
+        CHECK(!strcmp(WindowDisplayTitle(window), "mail.example"));
+        CHECK(WmSetAppIdById(client, window.wmId, app.appId));
+        CHECK(!strcmp(WindowDisplayTitle(window), "Brook Mail"));
+        WmSetTitleById(client, window.wmId, "Inbox");
+        const char formatted[] = "Brook Mail \xe2\x80\x93 Inbox";
+        CHECK(!strcmp(WindowDisplayTitle(window), formatted));
+
+        WmDebugWindow info{};
+        SnapshotDebugWindowLocked(window, &info);
+        CHECK(!strcmp(info.title, formatted) && !strcmp(info.rawTitle, "Inbox"));
+        static ChromeShellModel snapshot{};
+        WmSetFocus(slot);
+        const auto layout = GetTaskbarLayout(sw, sh);
+        int row = 0;
+        while (row < layout.count && layout.indices[row] != slot) ++row;
+        CHECK(row < layout.count);
+        WmCaptureTaskbar(sw, sh, 0, -1, -1, snapshot);
+        CHECK(!strcmp(snapshot.entries[row].label, formatted));
+        const auto button = layout.buttons[row];
+        char text[48]{};
+        const char* detail = nullptr;
+        DesktopRect box{};
+        CHECK(WmTrayTooltip(sw, sh, button.x + 2, button.y + 2, text, detail, box));
+        CHECK(!strcmp(text, formatted));
+
+        g_launcherPending = &g_emptyLauncher;
+        CHECK(WmLauncherApplyPending() && !strcmp(WindowDisplayTitle(window), "Inbox"));
+        g_launcherRetired = nullptr;
+        WmDestroyWindowById(client, window.wmId);
+        std::free(client);
+    }
+
     // One metrics source: the WM constants are DesktopMetrics' bases, and the
     // client offset used outside the WM equals the WM's own arithmetic.
     {

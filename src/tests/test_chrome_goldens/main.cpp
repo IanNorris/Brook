@@ -18,6 +18,7 @@
 #include "chrome_frame.h"
 #include "chrome_shell_model.h"
 #include "chrome_shell_wire.h"
+#include "web_app_title.h"
 #include "png.h"
 
 using namespace brook;
@@ -528,6 +529,56 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
     Check(prefix + "hud", list, s, hud.x, hud.y, hud.w, hud.h);
 }
 
+void WebAppTitles(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
+    const ChromeStyle s = StyleFor(theme, m, theme == BROOK_THEME_GLASS);
+    char title[64];
+    FormatWebAppTitle(title, "Brook Mail", "Inbox");
+    if (s.TextWidth("\xe2\x80\x93") <= 0 || s.TextWidth("A\xc3\x81" "B") != s.TextWidth("AB")) {
+        std::fprintf(stderr, "%s dash glyph encoding mismatch\n", prefix.c_str());
+        ++failures;
+    }
+
+    ChromeFrameModel frame{};
+    frame.clientW = m.pixels(360);
+    frame.layout = ChromeFrameLayout({{0, 0, frame.clientW, m.pixels(80), false}, false, {}}, m);
+    frame.focused = true;
+    frame.title = title;
+    frame.icon = testIcon;
+    frame.mouseX = frame.mouseY = -1;
+    ChromeFrameStorage frameStorage;
+    ChromeDisplayList list = ChromeListOn(frameStorage);
+    ChromeBuildFrame(frame, s, list);
+    const DesktopRect outer = frame.layout.outer;
+    Check(prefix + "web-app-frame", list, s, outer.x, outer.y, outer.w, outer.h);
+
+    constexpr uint32_t sw = 800, sh = 600;
+    const int ids[] = {0};
+    const char* labels[] = {title};
+    const auto taskbar = ChromeTaskbarLayoutFor(s, sw, sh, "14:05 19 Nov 2026", false, 0, ids, 1, 0,
+                                               "", false, labels);
+    static ChromeShellModel model;
+    static ChromeShellStorage storage;
+    model = {};
+    model.kind = ChromeShellKind::Taskbar;
+    model.taskbar = taskbar;
+    model.entries[0].active = true;
+    std::strcpy(model.entries[0].label, title);
+    SetTestIcon(model.icons[0]);
+    ChromeDisplayList taskbarList = ChromeListOn(storage);
+    RenderSnapshot(model, s, taskbarList);
+    Check(prefix + "web-app-taskbar", taskbarList, s, 0, taskbar.y, sw, sh - taskbar.y);
+
+    const auto box = TaskbarTooltipBox(taskbar.buttons[0], ChromeTooltipWidth(s, title, nullptr),
+                                      ChromeTooltipHeight(s, false), taskbar.y, 8, sw, 4);
+    model = {};
+    model.kind = ChromeShellKind::Tooltip;
+    model.rect = box;
+    std::strcpy(model.text, title);
+    ChromeDisplayList tooltipList = ChromeListOn(storage);
+    RenderSnapshot(model, s, tooltipList);
+    Check(prefix + "web-app-tooltip", tooltipList, s, box.x, box.y, box.w, box.h);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -573,6 +624,8 @@ int main(int argc, char** argv) {
             const std::string prefix = std::string(theme.name) + "-" + std::to_string(m->percent) + "-";
             Frames(prefix, theme.material, *m);
             Shell(prefix, theme.material, *m);
+            if (m->percent == 100 && theme.hue == BROOK_HUE_BLUE && theme.mode == BROOK_MODE_MIXED)
+                WebAppTitles(prefix, theme.material, *m);
         }
     }
     if (update) {

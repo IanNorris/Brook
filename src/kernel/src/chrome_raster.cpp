@@ -13,12 +13,7 @@ static constexpr int ChromeIconSourcePx = 24; // LAUNCHER_ICON_PX
 int ChromeTextWidth(const FontAtlas& font, const char* text)
 {
     int width = 0;
-    for (; *text; ++text)
-    {
-        uint32_t code = static_cast<uint8_t>(*text);
-        if (code >= font.firstChar && code < font.firstChar + font.glyphCount)
-            width += font.glyphs[code - font.firstChar].advance;
-    }
+    while (*text) width += ChromeGlyphAdvance(font, ChromeReadTextGlyph(text));
     return width;
 }
 
@@ -95,8 +90,7 @@ void ChromeRenderString(const ChromeTarget& t, const FontAtlas& font, int x, int
     while (*str)
     {
         if (maxWidth > 0 && (penX - x) >= maxWidth) break;
-        penX += ChromeRenderGlyph(t, font, penX, y, static_cast<uint8_t>(*str), fg, clipRight, clip);
-        ++str;
+        penX += ChromeRenderGlyph(t, font, penX, y, ChromeReadTextGlyph(str), fg, clipRight, clip);
     }
 }
 

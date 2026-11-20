@@ -72,12 +72,12 @@ inline void ChromeElidedText(ChromeDisplayList& dl, const ChromeStyle& s, Chrome
     const FontAtlas& atlas = s.Font(font);
     const int dots = 3 * ChromeTextWidth(atlas, ".");
     unsigned n = 0;
-    for (int used = 0; text[n] && n + 4 < sizeof(shown); ++n) {
-        const char one[2] = {text[n], 0};
-        const int advance = ChromeTextWidth(atlas, one);
-        if (used + advance + dots > width) break;
+    for (int used = 0; *text;) {
+        const char* glyph = text;
+        const int advance = ChromeGlyphAdvance(atlas, ChromeReadTextGlyph(text));
+        if (n + static_cast<unsigned>(text - glyph) + 3 >= sizeof(shown) || used + advance + dots > width) break;
         used += advance;
-        shown[n] = text[n];
+        while (glyph < text) shown[n++] = *glyph++;
     }
     while (n && shown[n - 1] == ' ') --n;
     shown[n] = shown[n + 1] = shown[n + 2] = '.';

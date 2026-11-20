@@ -30,7 +30,7 @@ function(brook_chrome_fonts OUT_VAR PYTHON3 REGULAR_TTF MONO_TTF OUT_DIR)
             add_custom_command(
                 OUTPUT "${CPP}"
                 COMMAND ${PYTHON3} "${BROOK_ROOT}/scripts/bake_font.py" "${TTF}" "${SIZE}" "${CPP}"
-                        "g_chrome${NAME}${SCALE}" "b0,b7"
+                        "g_chrome${NAME}${SCALE}" "b0,b7,2013"
                 DEPENDS "${BROOK_ROOT}/scripts/bake_font.py" "${TTF}"
                 COMMENT "Baking chrome font ${NAME} (${SCALE}%)"
                 VERBATIM)

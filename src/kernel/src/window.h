@@ -196,7 +196,8 @@ struct Window
     uint16_t    captionHeight;  // client's title-strip height (physical px); 0 = native title height
     uint32_t    captionStyle;   // DesktopCaptionStyle* packing; 0 = native title style
     bool        focusable;      // popups/tooltips stay above but don't take keyboard focus
-    char        title[64];
+    char        title[64];      // original title from the client
+    char        webAppTitle[64]; // display override from the active launcher catalog
     char        appId[128];     // explicit xdg app_id, independent of document title
 
     // Per-window VFB (Phase A of wayland↔WM unification).  When non-null
@@ -393,7 +394,7 @@ struct WmDebugWindow {
     int32_t x,y;uint32_t width,height,outerWidth,outerHeight,bufferWidth,bufferHeight;
     bool visible,minimized,maximized,focused,focusable,apiWindow,providerKernel;
     bool fullscreen;
-    char title[64],appId[128];
+    char title[64],rawTitle[64],appId[128];
 };
 enum class WmDebugAction : uint32_t { Focus,Minimize,Maximize,Restore,Close };
 // Registry-backed owner reference; caller must ProcessUnref after cleanup.
@@ -699,12 +700,14 @@ struct LauncherItem {
     uint32_t iconColor;    // Icon background color (0 = auto from title)
     uint32_t* iconPixels;  // Raw ARGB icon data (24x24), or nullptr for generic application icon
     bool valid;
-    bool isDesktopEntry;   // true if sourced from .desktop file (exec directly)
+    bool isDesktopEntry;   // launch a program instead of a shortcut script
+    bool isUserDesktopEntry;
+    bool isWebApp;
 };
 
 struct WmDebugApp {
     char id[33],title[48],desktopAppId[128],executable[64];
-    bool desktop,eligible;
+    bool desktop,userDesktop,eligible;
 };
 uint32_t WmSnapshotDebugApps(WmDebugApp* out,uint32_t capacity,
                              uint32_t* generation,uint64_t* builtTick);
@@ -730,6 +733,15 @@ struct LauncherPersistenceStatus {
 };
 
 void WmLauncherPersistenceStatus(LauncherPersistenceStatus& out);
+
+struct LauncherUserManifestStatus {
+    LauncherPersistenceResult load;
+    uint32_t entries = 0;
+    uint32_t rejected = 0;
+};
+LauncherUserManifestStatus WmLauncherUserManifestStatus();
+void WmRequestUserLauncherRefresh();
+
 // Notification is nonblocking; a worker rebuilds and the compositor publishes.
 void WmRequestLauncherRefresh();
 // Compositor-only: apply after input, before geometry/render for this frame.

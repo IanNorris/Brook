@@ -40,7 +40,7 @@ enum class ChromeGlyph : uint8_t {
     Search, Grid, Inbox, Pin, Trash, Folder, Sliders, Globe, Play, Doc, Brush, Pad, Spark,
 };
 
-// Text fonts carry two glyphs after ASCII (scripts/bake_font.py "extra").
+// Text fonts carry degree, middle dot and en dash after ASCII.
 #define BROOK_CHROME_DEGREE "\x7f"
 #define BROOK_CHROME_DOT "\x80"
 
