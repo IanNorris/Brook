@@ -1274,6 +1274,12 @@ int main() {
         WmSetClientSideDecoration(game,true);WmMoveWindow(game,0,0);
         CHECK(WmResizeWindow(game,uint16_t(sw),uint16_t(sh)) && !g.fullscreen && !taskbarShown());
         CHECK(WmResizeWindow(game,uint16_t(sw),uint16_t(sh-1)) && taskbarShown());
+        WmInputPop(&g,drain,256);
+        // The resize release of an API-backed floating window queues a final size.
+        CHECK(WmResizeWindow(game,800,600));
+        CHECK(WmInputPop(&g,&event,1)==1 && event.type==WM_EVT_RESIZED);
+        CHECK(event.x==800 && event.y==600 && !event.reserved);
+        CHECK(WmInputPop(&g,&event,1)==0);
         g.vfb=nullptr;WmDestroyWindowById(gamer,g_windows[editor].wmId);WmDestroyWindowById(gamer,g.wmId);
         CHECK(taskbarShown() && !lockDepth);
         std::free(gamer);

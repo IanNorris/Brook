@@ -155,6 +155,14 @@ static void check_managed_resize(struct wl_display *display, struct wl_client *c
     assert(observed_width == 900 && observed_height == 527);
     assert(observed_states == ((1u << XDG_TOPLEVEL_STATE_ACTIVATED) | (1u << XDG_TOPLEVEL_STATE_RESIZING)));
 
+    // Release carries the final size without RESIZING, even when the client
+    // has yet to acknowledge any configure from the active drag.
+    event.reserved = 0;
+    dispatch_window_event(&surface, &event, 0);
+    configure_serial(display, fd, object);
+    assert(observed_width == 900 && observed_height == 527);
+    assert(observed_states == (1u << XDG_TOPLEVEL_STATE_ACTIVATED));
+
     surface.wm_id = 0;
     wl_resource_destroy(surface.xdg_toplevel);
     wl_resource_destroy(surface.xdg_surface);
