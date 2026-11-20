@@ -9,7 +9,7 @@ constexpr unsigned GuardSlotSectorBytes = 512;
 constexpr unsigned GuardSlotCount = 2;
 constexpr unsigned GuardSlotFailureLimit = 2;
 constexpr unsigned GuardSlotCrcOffset = GuardSlotSectorBytes - 4;
-inline constexpr uint8_t GuardSlotMagic[] = {'B','R','K','S','L','T','0','1'};
+constexpr uint8_t GuardSlotMagic[] = {'B','R','K','S','L','T','0','1'};
 
 struct GuardSlotHealthEntry {
     uint64_t generation = 0;
