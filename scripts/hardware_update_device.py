@@ -23,9 +23,7 @@ def main():
     p.add_argument('--activate',action='store_true');p.add_argument('--restart',action='store_true')
     p.add_argument('--expected-payload-id')
     p.add_argument('--boot-timeout-s',type=int,default=120,help='Observe the same restart for 1..900s; a timeout never retries it')
-    p.add_argument('--helper',choices=['usb','system'],default='usb',help='System requires the running-slot-aware receiver packaged with the kernel')
-    p.add_argument('--bootstrap-legacy-system',action='store_true',
-        help='Explicit one-time system activation with the older receiver, only after live verified ESP journal absence (run in nix-shell)')
+    p.add_argument('--helper',choices=['usb','system'],default='usb',help='System requires the running-slot-aware receiver. Update an older receiver from checked USB maintenance.')
     p.add_argument('--pace-bytes-per-second',type=int,help='Optional Linux TCP pacing cap for the upload')
     a=p.parse_args()
     bridge = Hardware()
@@ -34,8 +32,7 @@ def main():
     try:
         with inhibit_recovery(target['host'], target['port']):
             result=run.execute(a.session,a.key_file,a.kernel,a.initrd,
-                a.activate,a.restart,a.expected_payload_id,a.port,a.boot_timeout_s,a.helper,a.pace_bytes_per_second,
-                bootstrap_legacy_system=a.bootstrap_legacy_system)
+                a.activate,a.restart,a.expected_payload_id,a.port,a.boot_timeout_s,a.helper,a.pace_bytes_per_second)
     except Exception as error:
         receipt=run.receipt
         summary={'state':receipt.get('state','not_started'),'last_stage':receipt.get('last_stage'),'error':str(error),
