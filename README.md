@@ -10,7 +10,7 @@
   <a href="docs/images/brook_dell_launcher_openttd_3200.png"><img src="docs/images/brook_dell_launcher_openttd.png" alt="Brook's Clearwater desktop on a Dell XPS 13: the glass app launcher open over OpenTTD, with the taskbar below" width="960"></a>
 </p>
 
-<p align="center"><em>Brook on a Dell XPS 13 (3200×1800 at 200%): the Clearwater glass launcher over OpenTTD.</em></p>
+<p align="center"><em>Brook on a Dell XPS 13: the Clearwater glass launcher over OpenTTD.</em></p>
 
 ## What is Brook?
 
@@ -27,18 +27,18 @@ Intel graphics driver.
 ## Highlights
 
 - **Real hardware.** Brook is installed on a Dell XPS 13 9343's SSD and drives
-  its 3200×1800 panel at 200% scaling, with a native Intel Broadwell (HD 5500)
-  driver supporting page flipping and zero-copy scanout. The keyboard,
-  touchpad, backlight, speakers and USB Ethernet all work.
+  its 3200×1800 display with its own Intel graphics driver. The keyboard,
+  touchpad, Intel HD Audio and USB Ethernet all work.
 - **Games on a 2015 laptop GPU.** Quake II runs at about 56 fps full-screen,
   and Stardew Valley is playable through Steam.
 - **Clearwater, Brook's own desktop.** A GPU compositor with background
   blur ("glass"), Glass or Opaque materials in Light, Mixed and Dark modes, any
   accent colour, and an app launcher, taskbar and notifications that run as a
   restartable user-mode shell.
-- **Linux apps, unmodified.** Wayland apps talk to Brook's own Wayland server,
-  and X11 apps run through rootless Xwayland. Firefox and Chromium play
-  YouTube, and VSCodium, GIMP, LibreOffice, VLC and GNOME Files all run.
+- **Unmodified Linux apps.** Wayland apps talk to Brook's own Wayland server,
+  and X11 apps run through rootless Xwayland. Chromium plays YouTube
+  full-screen at 1080p, and Firefox, VSCodium, GIMP, LibreOffice, VLC and
+  GNOME Files all run.
 - **Steam and Windows games.** The native Linux Steam client runs inside its
   Steam Runtime container. Windows programs run through Wine, with DXVK for
   Direct3D 11, VKD3D-Proton for Direct3D 12, and Proton (tested in QEMU so
@@ -59,7 +59,7 @@ Intel graphics driver.
 
 | | Works | Notes |
 |---|---|---|
-| **Web** | Firefox, Chromium, web apps | YouTube with audio. Video decodes in software, and browsers run without their sandbox. |
+| **Web** | Firefox, Chromium, web apps | YouTube with audio, decoded in software. Browsers currently run without their sandbox (work in progress). |
 | **Desktop** | GNOME Files, Settings, App Gallery, Terminal, VSCodium, Mousepad, Qalculate!, LibreOffice Writer, GIMP, VLC | GTK4 apps currently draw in software, so they're slower than they should be. |
 | **Games** | Quake II, Quake III, DOOM, Stardew Valley, OpenTTD, SuperTuxKart, Factorio, Warzone 2100, Torchlight II | Steam games need Steam running. |
 | **Steam** | Sign-in, library, downloads, launching games | Quits when its window closes (no system tray yet). |

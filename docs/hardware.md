@@ -17,7 +17,7 @@ Brook's real-hardware target, installed on the internal SSD:
 | Component | Status |
 |---|---|
 | Intel HD 5500 (Broadwell) GPU | Native driver: render and blitter engines, page flipping and zero-copy scanout. OpenGL through Mesa Iris, Vulkan through hasvk. |
-| Display | 3200×1800 at 200% scaling, with backlight control. |
+| Display | 3200×1800. |
 | Video engine | Hardware video decoding works but is off by default because it isn't yet faster than software ([details](bdw-video-engine.md)). |
 | Storage | AHCI SSD, with boot generations and automatic rollback. |
 | Keyboard and touchpad | Work. The Synaptics touchpad supports two-finger scrolling, tap to click and clickpad buttons. |
