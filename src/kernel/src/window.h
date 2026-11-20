@@ -1,4 +1,5 @@
 #pragma once
+#include "launcher_model.h"
 
 #include <stdint.h>
 #include "launch_history.h"
@@ -709,6 +710,25 @@ uint32_t WmSnapshotDebugApps(WmDebugApp* out,uint32_t capacity,
 
 // Load shortcut files from /boot/SHORTCUTS/ directory.
 void WmLauncherLoad();
+
+struct LauncherPersistenceResult {
+    const char* stage = "unattempted";
+    int error = 0;
+};
+
+struct LauncherPersistenceStatus {
+    LauncherPersistenceResult load, save;
+    uint32_t layoutEpoch = 0;
+    uint32_t savedEpoch = 0;
+    bool pending = false;
+    bool saving = false;
+    const char* worker = nullptr;
+    const char* path = nullptr;
+    uint32_t pinCount = 0;
+    char pins[LauncherLimits::Pins][LauncherLimits::KeyLength]{};
+};
+
+void WmLauncherPersistenceStatus(LauncherPersistenceStatus& out);
 // Notification is nonblocking; a worker rebuilds and the compositor publishes.
 void WmRequestLauncherRefresh();
 // Compositor-only: apply after input, before geometry/render for this frame.

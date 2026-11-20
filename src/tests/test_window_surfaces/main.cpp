@@ -47,6 +47,66 @@ void KMutexLock(KMutex*) { CHECK(lockDepth++ < 2); }
 void KMutexUnlock(KMutex*) { CHECK(lockDepth-- > 0); }
 extern "C" void CompositorWake() { ++wakes; }
 void CompositorMarkDirty() { ++dirty; }
+// Launcher save runs the real worker step against a minimal owned home.
+static Vnode layoutFile{}, layoutDirectory{};
+static char layoutText[LauncherLayoutLimit];
+static unsigned layoutAttempts=0, layoutSyncs=0;
+static bool layoutWritable=false, layoutRenamed=false;
+bool ShutdownLaunchAllowed() { return true; }
+const char* ShutdownDesktopStatus() { return "Applications"; }
+void ShutdownDesktopRequest(bool) { std::abort(); }
+void ShutdownDesktopCancel() { std::abort(); }
+Process* KernelThreadCreate(const char*, KernelThreadFn, void*, uint8_t) { std::abort(); }
+void SchedulerAddProcess(Process*) { std::abort(); }
+extern "C" void SchedulerSleepMs(uint32_t) { std::abort(); }
+void KLogCat(LogCat, LogLevel, const char*, ...) {}
+void KLogCatConsole(LogCat, LogLevel, const char*, ...) {}
+extern "C" void* kmalloc(uint64_t) { std::abort(); }
+extern "C" void kfree(void*) { std::abort(); }
+extern "C" Vnode* VfsOpen(const char*, int) { std::abort(); }
+extern "C" int VfsRead(Vnode*, void*, uint64_t, uint64_t*) { std::abort(); }
+extern "C" int VfsReaddir(Vnode*, DirEntry*, uint32_t*) { std::abort(); }
+extern "C" int VfsStatPath(const char*, VnodeStat*) { std::abort(); }
+int VfsPathRoot(VfsPath*) { ++layoutAttempts; return layoutWritable ? 0 : -30; }
+int VfsPathResolve(const VfsPath&, const VfsPath&, const char*, VfsPath*, bool, bool) { return 0; }
+void VfsPathRelease(VfsPath) {}
+int VfsMkdirAt(const VfsPath&, const VfsPath&, const char*, uint16_t, uint16_t) { std::abort(); }
+int VfsChownAt(const VfsPath&, const VfsPath&, const char*, uint32_t, uint32_t, bool) { std::abort(); }
+int VfsRemoveAt(const VfsPath&, const VfsPath&, const char* name, bool directory) {
+    CHECK(!strcmp(name, "launcher.ini.tmp") && !directory);
+    return -2;
+}
+Vnode* VfsOpenAt(const VfsPath&, const VfsPath&, const char* name, int flags,
+                 uint16_t mode, uint16_t, int*, bool followFinal) {
+    CHECK(!strcmp(name, "launcher.ini.tmp") && !followFinal && flags == (VFS_O_WRITE|VFS_O_CREATE|VFS_O_EXCL));
+    CHECK(mode == 0600);
+    return &layoutFile;
+}
+Vnode* VfsPathOpen(const VfsPath&, int flags, int*) {
+    CHECK(flags == VFS_O_READ && layoutRenamed);
+    return &layoutDirectory;
+}
+extern "C" int VfsWrite(Vnode* file, const void* text, uint64_t bytes, uint64_t* offset) {
+    CHECK(file == &layoutFile && !*offset && bytes < sizeof(layoutText));
+    memcpy(layoutText, text, bytes); layoutText[bytes] = 0;
+    *offset += bytes;
+    return static_cast<int>(bytes);
+}
+extern "C" void VfsClose(Vnode* node) { CHECK(node == &layoutFile || node == &layoutDirectory); }
+int VfsChown(Vnode* node, uint32_t uid, uint32_t gid) {
+    CHECK(node == &layoutFile && uid == DesktopUid && gid == DesktopGid);
+    return 0;
+}
+int VfsFsync(Vnode* node) {
+    CHECK(node == (layoutRenamed ? &layoutDirectory : &layoutFile));
+    ++layoutSyncs;
+    return 0;
+}
+int VfsRenameAt(const VfsPath&, const VfsPath&, const char* source, const VfsPath&, const char* target) {
+    CHECK(!strcmp(source, "launcher.ini.tmp") && !strcmp(target, "launcher.ini") && layoutSyncs == 1);
+    layoutRenamed = true;
+    return 0;
+}
 extern "C" void MouseSetPosition(int32_t,int32_t) {}
 extern "C" uint8_t MouseGetButtons() { return 0; }
 uint64_t InputLatestSequence() { return 0; }
@@ -632,6 +692,75 @@ int main() {
         WmCyclePerformanceHud();
         CHECK(GetTaskbarLayout(sw, sh).hud.w == 0);
     }
+    // In stage 3 the shell renders from this kernel model, and pointer presses
+    // still enter through the WM hit targets. A pin should immediately appear
+    // in the next shell snapshot and queue exactly one durable save.
+    {
+        constexpr uint32_t sw = 1024, sh = 768;
+        static LauncherSnapshot catalog{};
+        catalog.generation = 1;
+        catalog.count = 2;
+        catalog.items[0].valid = catalog.items[1].valid = true;
+        WmStrCopy(catalog.items[0].title, "Settings", sizeof(catalog.items[0].title));
+        WmStrCopy(catalog.items[0].appId, "settings", sizeof(catalog.items[0].appId));
+        WmStrCopy(catalog.items[1].title, "Snapshot Fixture", sizeof(catalog.items[1].title));
+        WmStrCopy(catalog.items[1].appId, "snapshot-fixture", sizeof(catalog.items[1].appId));
+        g_launcherActive = &catalog;
+        g_launcherModel.Init();
+        g_launcherPersistence.load = {"missing", -2};
+        testTick = 100;
+        LauncherSyncModel(catalog);
+        g_launcherLoaded = g_launcherOpen = true;
+        g_launcherModel.Open();
+        LauncherPersistenceStatus state;
+        WmLauncherPersistenceStatus(state);
+        CHECK(state.pending && !state.savedEpoch && state.layoutEpoch);
+        const uint32_t defaultsEpoch = state.layoutEpoch;
+        auto press = [&](LauncherTargetKind kind, uint16_t index, bool secondary) {
+            const auto& frame = LauncherFrame(sw, sh, -1, -1);
+            for (uint32_t i = 0; i < frame.targetCount; ++i) {
+                const auto hit = frame.targets[i];
+                if (hit.target.kind == kind && hit.target.index == index)
+                    return WmLauncherPress(hit.rect.x + hit.rect.w / 2, hit.rect.y + hit.rect.h / 2,
+                                           sw, sh, secondary);
+            }
+            return false;
+        };
+        testTick = 200;
+        CHECK(press(LauncherTargetKind::Row, 1, true));
+        CHECK(g_launcherPersistence.layoutEpoch == defaultsEpoch && g_launcherSaveSince == 100);
+        CHECK(press(LauncherTargetKind::MenuItem, 0, false));
+        WmLauncherPersistenceStatus(state);
+        CHECK(state.pending && state.savedEpoch == 0 && state.layoutEpoch != defaultsEpoch);
+        CHECK(state.pinCount && !strcmp(state.pins[state.pinCount - 1], "snapshot-fixture"));
+        static ChromeShellModel snapshot{};
+        WmCaptureLauncher(sw, sh, -1, -1, snapshot);
+        CHECK(snapshot.launcherModel.Pinned(1));
+        testTick = 1199;
+        LauncherSaveLayout();
+        CHECK(!layoutAttempts);
+        testTick = 1200;
+        LauncherSaveLayout();
+        WmLauncherPersistenceStatus(state);
+        CHECK(layoutAttempts == 1 && state.save.error == -30 && state.pending && !state.savedEpoch);
+        testTick = 6199;
+        LauncherSaveLayout();
+        CHECK(layoutAttempts == 1);
+        testTick = 6200;
+        layoutWritable = true;
+        LauncherSaveLayout();
+        WmLauncherPersistenceStatus(state);
+        CHECK(layoutAttempts == 2 && layoutSyncs == 2 && !state.save.error && !state.pending);
+        CHECK(state.savedEpoch == state.layoutEpoch);
+        static LauncherModel restored;
+        restored.Init();
+        CHECK(restored.Parse(layoutText));
+        CHECK(restored.PinCount() == state.pinCount);
+        CHECK(!strcmp(restored.PinKey(restored.PinCount() - 1), "snapshot-fixture"));
+        g_launcherOpen = g_launcherLoaded = false;
+        g_launcherActive = &g_emptyLauncher;
+    }
+
     // Fullscreen: the client covers the whole output without chrome, and while
     // it is focused the taskbar is neither drawn nor hit-tested (the launcher
     // and volume popup bring it back). Leaving restores geometry, chrome and

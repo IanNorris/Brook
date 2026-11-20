@@ -87,6 +87,8 @@ void KLog(const char* fmt, ...);
 
 // Categorised + levelled log.
 void KLogCat(LogCat cat, LogLevel level, const char* fmt, ...);
+// Also publish to the in-memory kernel console and hw_logs.
+void KLogCatConsole(LogCat cat, LogLevel level, const char* fmt, ...);
 
 // Flush pending writes to disk.
 void KLogSync();

@@ -195,7 +195,7 @@ static uint32_t FormatLog(char* buf, uint32_t maxLen,
 }
 
 // Internal: write a formatted log entry with optional category/level prefix.
-static void KLogWrite(LogCat cat, LogLevel level, const char* fmt, __builtin_va_list args)
+static void KLogWrite(LogCat cat, LogLevel level, const char* fmt, __builtin_va_list args, bool console = false)
 {
     // Filter check
     int catIdx = static_cast<int>(cat);
@@ -240,6 +240,7 @@ static void KLogWrite(LogCat cat, LogLevel level, const char* fmt, __builtin_va_
 
     // Echo to serial.
     SerialPuts(line);
+    if (console) DebugOverlayPuts(line);
 
     // Stream to debug channel if enabled and connected.
     if (g_remoteStream && DebugChannelConnected()) {
@@ -286,6 +287,14 @@ void KLogCat(LogCat cat, LogLevel level, const char* fmt, ...)
     __builtin_va_list args;
     __builtin_va_start(args, fmt);
     KLogWrite(cat, level, fmt, args);
+    __builtin_va_end(args);
+}
+
+void KLogCatConsole(LogCat cat, LogLevel level, const char* fmt, ...)
+{
+    __builtin_va_list args;
+    __builtin_va_start(args, fmt);
+    KLogWrite(cat, level, fmt, args, true);
     __builtin_va_end(args);
 }
 
