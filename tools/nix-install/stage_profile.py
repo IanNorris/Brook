@@ -15,7 +15,7 @@ import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from stage_nar import (STORE, STORE_NAME, check_legacy_links, ensure_path, layout_digest,
+from stage_nar import (STORE, STORE_NAME, PackedCache, check_legacy_links, ensure_path, layout_digest,
                        nar_hash, profile_layout, rename_no_replace)
 from collect_desktop_entries import collect
 
@@ -47,10 +47,14 @@ def relative_path(value):
 def validate_plan(plan):
     if plan["format"] not in (1, 2):
         raise ValueError("Unknown closure plan version")
-    cache = urlsplit(plan["cache"]["brook"])
-    if (cache.scheme not in ("http", "https") or not cache.hostname
-            or cache.username is not None or cache.query or cache.fragment):
-        raise ValueError("Invalid Brook cache address")
+    address = plan["cache"]["brook"]
+    if address is not None:
+        if type(address) is not str:
+            raise ValueError("Invalid Brook cache address")
+        cache = urlsplit(address)
+        if (cache.scheme not in ("http", "https") or not cache.hostname
+                or cache.username is not None or cache.query or cache.fragment):
+            raise ValueError("Invalid Brook cache address")
     if type(plan["cache"]["mirrorUpstream"]) is not bool:
         raise ValueError("mirrorUpstream must be a boolean")
     closure = plan["closure"]
@@ -254,7 +258,9 @@ def notify(nix):
         ctypes.CDLL(None).syscall(0xB03)
 
 
-def apply(nix, plan, digest, transaction, tools):
+def apply(nix, plan, digest, transaction, tools, *, packed_cache=None):
+    if plan["cache"]["brook"] is None and packed_cache is None:
+        raise ValueError("This signed plan requires a bridge-pushed cache")
     home = nix / PROFILE_HOME
     state = home / ".stage"
     state.mkdir(mode=0o700, exist_ok=True)
@@ -272,10 +278,12 @@ def apply(nix, plan, digest, transaction, tools):
                 raise ValueError("Another profile is active; refusing to overwrite it")
             # A prepared generation and journal are durable before publication.
         counts = {"present": 0, "upstream": 0, "brook": 0}
+        if packed_cache is not None:
+            counts["bridge"] = 0
         legacy_paths = set()
         for name, entry in sorted(plan["closure"].items()):
             result = ensure_path(nix / "store", name, entry, plan["cache"], tools,
-                                 legacy_paths=legacy_paths)
+                                 legacy_paths=legacy_paths, packed_cache=packed_cache)
             counts[result] += 1
         check_legacy_links(nix / "store", plan["closure"], legacy_paths)
         legacy_link_count = sum(path.is_symlink() for path in legacy_paths)
@@ -384,7 +392,10 @@ def main():
     parser.add_argument("transaction", nargs="?")
     parser.add_argument("plan", nargs="?", type=Path)
     parser.add_argument("signature", nargs="?", type=Path)
+    parser.add_argument("--cache-bundle", action="append", type=Path, default=[])
     args = parser.parse_args()
+    if args.cache_bundle and args.action != "apply":
+        parser.error("--cache-bundle requires apply")
     if args.action != "initialize" and (not args.transaction or not TX.fullmatch(args.transaction)):
         parser.error("Expected a 32-digit hexadecimal transaction ID")
     fake = os.environ.get("BROOK_STAGE_ROOT")
@@ -408,7 +419,11 @@ def main():
             tools = {name: str(nix / "bin" / name) for name in ("curl", "xz", "zstd", "nar-unpack")}
             tools["openssl"] = os.environ["BROOK_STAGE_OPENSSL"]
         plan, digest = verified_plan(args.plan, args.signature, key, tools["openssl"])
-        apply(nix, plan, digest, args.transaction, tools)
+        if args.cache_bundle:
+            with PackedCache(args.cache_bundle) as cache:
+                apply(nix, plan, digest, args.transaction, tools, packed_cache=cache)
+        else:
+            apply(nix, plan, digest, args.transaction, tools)
     print("PROFILE_" + args.action.upper() + "_OK " + (args.transaction or ""))
 
 

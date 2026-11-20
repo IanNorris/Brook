@@ -1,6 +1,7 @@
 """Hash and import the exact Nix archive named in a trusted stage plan."""
 
 import base64
+from contextlib import ExitStack
 import errno
 import hashlib
 import json
@@ -8,16 +9,22 @@ import os
 import re
 import stat
 import struct
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 from urllib.parse import quote, urlsplit
+from zipfile import ZIP_STORED, ZipFile, BadZipFile
 
 UPSTREAM = "https://cache.nixos.org"
 STORE = Path("/nix/store")
 STORE_NAME = re.compile(r"[0123456789abcdfghijklmnpqrsvwxyz]{32}-[a-zA-Z0-9+._?=-]+")
 NIX32 = "0123456789abcdfghijklmnpqrsvwxyz"
 CHUNK = 1024 * 1024
+CACHE_BUNDLE_LIMIT = 960 * CHUNK
+CACHE_BUNDLE_COUNT = 16
+CACHE_METADATA_LIMIT = 64 * 1024
+CACHE_MEMBER_NAME = re.compile(r"(?:[0123456789abcdfghijklmnpqrsvwxyz]{32}[.]narinfo|nar/[a-zA-Z0-9_+.-]+)")
 
 
 def store_name(value):
@@ -170,6 +177,13 @@ def read_narinfo(tool, cache, name, entry):
             raise ValueError("NAR metadata exceeded 64 KiB")
         if proc.wait():
             raise OSError(f"NAR metadata unavailable at {cache} for {name}")
+    location, compression = parse_narinfo(metadata, name, entry)
+    return f"{cache}/" + "/".join(quote(part) for part in location.split("/")), compression
+
+
+def parse_narinfo(metadata, name, entry):
+    if len(metadata) > CACHE_METADATA_LIMIT:
+        raise ValueError("NAR metadata exceeded 64 KiB")
     fields = dict(line.split(": ", 1) for line in metadata.decode().splitlines() if ": " in line)
     if (
         fields.get("StorePath") != str(STORE / name)
@@ -185,42 +199,112 @@ def read_narinfo(tool, cache, name, entry):
         for part in components
     ):
         raise ValueError(f"Invalid NAR location for {name}")
-    return f"{cache}/" + "/".join(quote(part) for part in components), fields["Compression"]
+    return url, fields["Compression"]
+
+
+def archive_digest(incoming, compression, archive, entry, tools):
+    if compression not in ("none", "xz", "zstd"):
+        raise ValueError(f"Unsupported NAR compression {compression!r}")
+    decompress = None
+    try:
+        source = incoming
+        if compression != "none":
+            decompress = subprocess.Popen([tools[compression], "-d", "-c"],
+                                          stdin=incoming, stdout=subprocess.PIPE)
+            source = decompress.stdout
+        digest = hashlib.sha256()
+        size = 0
+        with archive.open("xb") as output:
+            while chunk := source.read(CHUNK):
+                size += len(chunk)
+                if size > entry["narSize"]:
+                    raise ValueError("Downloaded NAR exceeds the signed size")
+                digest.update(chunk)
+                output.write(chunk)
+        if decompress is not None and decompress.wait():
+            raise OSError("NAR transfer or decompression failed")
+        return size, "sha256-" + base64.b64encode(digest.digest()).decode("ascii")
+    finally:
+        if decompress is not None:
+            decompress.stdout.close()
+            if decompress.poll() is None:
+                decompress.kill()
+                decompress.wait()
+
+
+def check_archive(result, entry):
+    if result != (entry["narSize"], entry["narHash"]):
+        raise ValueError("Downloaded NAR does not match the signed plan")
 
 
 def verified_archive(url, compression, archive, entry, tools):
-    digest = hashlib.sha256()
-    size = 0
     with subprocess.Popen(curl(tools["curl"], url), stdout=subprocess.PIPE) as download:
-        decompress = None
         try:
-            if compression == "none":
-                source = download.stdout
-            else:
-                if compression not in ("xz", "zstd"):
-                    raise ValueError(f"Unsupported NAR compression {compression!r}")
-                decompress = subprocess.Popen([tools[compression], "-d", "-c"],
-                                              stdin=download.stdout, stdout=subprocess.PIPE)
-                download.stdout.close()
-                source = decompress.stdout
-            with source, archive.open("xb") as output:
-                while chunk := source.read(CHUNK):
-                    size += len(chunk)
-                    if size > entry["narSize"]:
-                        raise ValueError("Downloaded NAR exceeds the signed size")
-                    digest.update(chunk)
-                    output.write(chunk)
-            status = decompress.wait() if decompress is not None else 0
-            if download.wait() or status:
+            result = archive_digest(download.stdout, compression, archive, entry, tools)
+            if download.wait():
                 raise OSError("NAR transfer or decompression failed")
+            check_archive(result, entry)
         finally:
-            for process in (decompress, download):
-                if process is not None and process.poll() is None:
-                    process.kill()
-                    process.wait()
-    actual = "sha256-" + base64.b64encode(digest.digest()).decode("ascii")
-    if size != entry["narSize"] or actual != entry["narHash"]:
-        raise ValueError("Downloaded NAR does not match the signed plan")
+            if download.poll() is None:
+                download.kill()
+                download.wait()
+
+
+class PackedCache(ExitStack):
+    """A bridge-delivered cache. Read named members without extracting paths."""
+
+    def __init__(self, paths):
+        super().__init__()
+        self.paths = paths
+        self.members = {}
+
+    def __enter__(self):
+        if not 1 <= len(self.paths) <= CACHE_BUNDLE_COUNT:
+            raise ValueError("Invalid number of cache bundles")
+        try:
+            for path in self.paths:
+                if not path.is_file() or path.stat().st_size > CACHE_BUNDLE_LIMIT:
+                    raise ValueError(f"Invalid cache bundle size or type: {path}")
+                bundle = self.enter_context(ZipFile(path))
+                for member in bundle.infolist():
+                    name = member.filename
+                    if (member.compress_type != ZIP_STORED or member.flag_bits & 1
+                            or not CACHE_MEMBER_NAME.fullmatch(name)
+                            or member.file_size > CACHE_BUNDLE_LIMIT
+                            or name in self.members or name.rsplit("/", 1)[-1] in (".", "..")
+                            or len(self.members) >= 32768):
+                        raise ValueError(f"Unexpected cache bundle member {name!r}")
+                    self.members[name] = (bundle, member)
+            return self
+        except (BadZipFile, OSError, ValueError) as error:
+            self.close()
+            raise ValueError(f"Invalid bridge cache: {error}") from error
+
+    def contains(self, name):
+        return name[:32] + ".narinfo" in self.members
+
+    def archive(self, name, output, entry, tools):
+        metadata, member = self.members[name[:32] + ".narinfo"]
+        try:
+            with metadata.open(member) as stream:
+                location, compression = parse_narinfo(stream.read(CACHE_METADATA_LIMIT + 1), name, entry)
+            if location not in self.members:
+                raise ValueError(f"Missing packed NAR {location} for {name}")
+            bundle, member = self.members[location]
+            with bundle.open(member) as compressed:
+                if compression == "none":
+                    result = archive_digest(compressed, compression, output, entry, tools)
+                else:
+                    # The subprocess needs an actual input descriptor. Only
+                    # one compressed member is copied, under the same scratch
+                    # directory as the uncompressed NAR.
+                    with tempfile.TemporaryFile(dir=output.parent) as staged:
+                        shutil.copyfileobj(compressed, staged, CHUNK)
+                        staged.seek(0)
+                        result = archive_digest(staged, compression, output, entry, tools)
+            check_archive(result, entry)
+        except BadZipFile as error:
+            raise ValueError(f"Corrupt packed archive for {name}") from error
 
 
 def rename_no_replace(source, target):
@@ -283,26 +367,37 @@ def check_legacy_links(store, closure, legacy_paths):
             raise ValueError(f"Legacy runtime library link does not resolve to a verified file: {link}")
 
 
-def ensure_path(store, name, entry, cache, tools, *, legacy_paths=None):
+def ensure_path(store, name, entry, cache, tools, *, legacy_paths=None, packed_cache=None):
     target = store / name
     if os.path.lexists(target):
         verify_installed(target, entry, legacy_paths)
         return "present"
-    sources = [cache["brook"]]
-    if entry["source"] == "upstream":
-        sources = [UPSTREAM, cache["brook"]] if cache["mirrorUpstream"] else [UPSTREAM]
     with tempfile.TemporaryDirectory(prefix=".brook-nar-", dir=store) as directory:
         scratch = Path(directory)
         archive = scratch / "archive.nar"
-        for index, source in enumerate(sources):
-            try:
-                url, compression = read_narinfo(tools["curl"], source, name, entry)
-                verified_archive(url, compression, archive, entry, tools)
-                break
-            except OSError:
-                if index + 1 == len(sources):
-                    raise
-                archive.unlink(missing_ok=True)
+        upstream = entry["source"] == "upstream"
+        if packed_cache is not None and packed_cache.contains(name):
+            packed_cache.archive(name, archive, entry, tools)
+            origin = "bridge"
+        else:
+            if packed_cache is not None or cache["brook"] is None:
+                if not upstream:
+                    raise ValueError(f"Missing bridge cache entry for {name}")
+                sources = [UPSTREAM]
+            else:
+                sources = [cache["brook"]]
+                if upstream:
+                    sources = [UPSTREAM, cache["brook"]] if cache["mirrorUpstream"] else [UPSTREAM]
+            for index, source in enumerate(sources):
+                try:
+                    url, compression = read_narinfo(tools["curl"], source, name, entry)
+                    verified_archive(url, compression, archive, entry, tools)
+                    break
+                except OSError:
+                    if index + 1 == len(sources):
+                        raise
+                    archive.unlink(missing_ok=True)
+            origin = "upstream" if source == UPSTREAM else "brook"
         unpacked = scratch / "path"
         with archive.open("rb") as stream:
             subprocess.run([tools["nar-unpack"], unpacked], check=True, stdin=stream)
@@ -317,4 +412,4 @@ def ensure_path(store, name, entry, cache, tools, *, legacy_paths=None):
                 raise
             verify_installed(target, entry, legacy_paths)
             return "present"
-        return "upstream" if source == UPSTREAM else "brook"
+        return origin

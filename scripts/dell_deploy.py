@@ -12,7 +12,7 @@ provisioned independently of deployment.
 Usage (repo root, BROOK_ROOT set to the checkout holding the bridge session):
   python3 scripts/dell_deploy.py --session S --pair build/dell/pair-X --output build/dell/deploy-X
 """
-import argparse, hashlib, json, subprocess, sys, uuid
+import argparse, hashlib, json, subprocess, sys, tempfile, uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,7 +26,11 @@ p.add_argument('--profile-timeout-s', type=int, default=3600)
 profile = p.add_mutually_exclusive_group()
 profile.add_argument('--profile-plan', type=Path, metavar='DIRECTORY')
 profile.add_argument('--rollback-profile', type=Path, metavar='PROFILE_RECEIPT')
+p.add_argument('--push-profile-cache', action='store_true',
+               help='also push the local cache/ for a signed plan with a host URL')
 a = p.parse_args()
+if a.push_profile_cache and not a.profile_plan:
+    p.error('--push-profile-cache requires --profile-plan')
 
 def sha(path):
     with path.open('rb') as stream:
@@ -68,6 +72,24 @@ def stage_profile():
             if receipt['transfer']['sha256'] != journal.receipt['profile_files'][source.name]:
                 raise ValueError(f'{source.name} changed during transfer')
             arguments.append(receipt['transfer']['guest_path'])
+        if a.profile_plan:
+            plan = json.loads(files[0].read_text())
+            if a.push_profile_cache or plan['cache']['brook'] is None:
+                from profile_cache_bundle import pack_cache
+                pushed = []
+                with tempfile.TemporaryDirectory(prefix='.cache-bundles-', dir=journal.output) as temp:
+                    for source in pack_cache(a.profile_plan / 'cache', plan, Path(temp)):
+                        digest = sha(source)
+                        bulk = BulkRun(bridge, journal.output / source.stem)
+                        receipt = bulk.execute(a.session, KEY, 'put', source=source)
+                        transfer = receipt['transfer']
+                        if transfer['sha256'] != digest:
+                            raise ValueError(f'{source.name} changed during transfer')
+                        pushed.append({'sha256': digest, 'guest_path': transfer['guest_path'],
+                                       'receipt': str(bulk.output / 'receipt.json')})
+                        journal.save(state='profile_cache_pushed', profile_cache_bundles=pushed)
+                        arguments += ['--cache-bundle', transfer['guest_path']]
+                        source.unlink()
         journal.save(state='profile_job_dispatched')
         bridge.guest_run(a.session, job, arguments, cwd='/tmp', uid=1000, wait_s=2)
         result = journal.wait_job(a.session, job, lambda status: status.get('state') == 'completed',

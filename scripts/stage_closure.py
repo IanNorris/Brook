@@ -138,7 +138,10 @@ def main():
                         help="profile expression providing package names and versions")
     parser.add_argument("extras", nargs="*", type=Path)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--cache-url", required=True, help="URL at which the cache/ output will be served")
+    delivery = parser.add_mutually_exclusive_group(required=True)
+    delivery.add_argument("--cache-url", help="URL at which the cache/ output will be served")
+    delivery.add_argument("--bridge-cache", action="store_true",
+                          help="push the generated cache with dell_deploy.py, without a host HTTP server")
     parser.add_argument("--cache-key", required=True, type=Path, help="Nix binary-cache signing key")
     parser.add_argument("--plan-key", required=True, type=Path, help="Ed25519 private key in PEM format")
     parser.add_argument("--mirror-upstream", action="store_true",
@@ -164,7 +167,8 @@ def main():
     extras = [path.resolve(strict=True) for path in args.extras]
     output = args.output.absolute()
     output.mkdir(mode=0o700, parents=True, exist_ok=False)
-    plan = generate_plan(profile, extras, args.cache_url.rstrip("/"), args.mirror_upstream, packages)
+    cache_url = args.cache_url.rstrip("/") if args.cache_url else None
+    plan = generate_plan(profile, extras, cache_url, args.mirror_upstream, packages)
     publish_cache(plan["closure"], output / "cache", args.cache_key.resolve(), args.mirror_upstream)
     document = output / "stage-plan.json"
     document.write_text(json.dumps(plan, sort_keys=True, separators=(",", ":")) + "\n")

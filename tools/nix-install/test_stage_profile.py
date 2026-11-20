@@ -15,6 +15,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 from stage_closure import generate_plan, publish_cache
+from profile_cache_bundle import pack_cache
 import stage_nar
 from stage_profile import PROFILE_ALIAS, apply, initialize, rollback, validate_plan, verified_plan
 
@@ -112,6 +113,27 @@ class PlanIntegration(unittest.TestCase):
                     rollback(root, tx)
                     self.assertEqual((root / "share/applications/applications.idx").read_text(), "legacy\n")
                     self.assertTrue((root / "profile/bin/old").is_file())
+
+                    # A separate signed push-only plan must work without curl,
+                    # including for mirrored upstream NARs.
+                    plan["cache"]["brook"] = None
+                    document.write_text(json.dumps(plan))
+                    subprocess.run(["openssl", "pkeyutl", "-sign", "-rawin", "-inkey", key,
+                                    "-in", document, "-out", sig], check=True)
+                    offline_plan, offline_digest = verified_plan(document, sig, pub, shutil.which("openssl"))
+                    bundle_dir = folder / "bundles"
+                    bundle_dir.mkdir()
+                    bundles = list(pack_cache(cache, offline_plan, bundle_dir, limit=8192))
+                    shutil.rmtree(root / "store" / built.name)
+                    (root / "store" / dependency.name).unlink()
+                    with self.assertRaisesRegex(ValueError, "requires a bridge-pushed cache"):
+                        apply(root, offline_plan, offline_digest, "3" * 32, tools)
+                    with patch.object(stage_nar, "curl", side_effect=AssertionError("unexpected network")):
+                        with stage_nar.PackedCache(bundles) as bundled:
+                            apply(root, offline_plan, offline_digest, "3" * 32, tools, packed_cache=bundled)
+                    self.assertEqual((root / "profile/bin/session.conf").read_text(), "session settings\n")
+                    self.assertEqual((root / "store" / dependency.name).read_bytes(), extra.read_bytes())
+                    rollback(root, "3" * 32)
 
                     # Keep old store data in place and refuse a new switch when
                     # the bytes at any closure path no longer match the signed plan.
