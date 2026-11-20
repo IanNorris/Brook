@@ -57,6 +57,46 @@ int main(){
         uint64_t t=1000;for(uint64_t commit=1;commit<=20;++commit){for(int repeat=0;repeat<3;++repeat){if(g.Accept(3,3,commit))d.Record(t);}t+=20;}
         auto sum=d.Read(t);assert(sum.count==19 && sum.p80==20 && sum.max==20);
     }
+    {
+        using brook::DesktopFrameBins;
+        DesktopFrameBins bins;
+        bins.Record(5000, 16);
+        bins.Record(5099, 73);
+        bins.Record(5200, 18);
+        assert(bins.At(50) == 73 && bins.At(51) == 0 && bins.At(52) == 18);
+        assert(bins.ColumnPeak(5200, 97, 100) == 73);
+        assert(bins.ColumnPeak(5200, 98, 100) == 0); // preserve an idle gap
+        assert(bins.ColumnPeak(5200, 99, 100) == 18);
+        assert(bins.ColumnPeak(5200, 9, 10) == 73); // aggregate, still show the outlier
+        assert(bins.ColumnPeak(6200, 8, 10) == 73);
+        assert(bins.ColumnPeak(6200, 9, 10) == 0); // clock advances without frames
+
+        for (const uint64_t renderTick : {10400ULL, 11000ULL}) {
+            DesktopFrameBins snapshot;
+            snapshot.Capture(bins, 6200, renderTick);
+            for (unsigned column = 0; column < DesktopFrameBins::SlotCount; ++column)
+                assert(snapshot.ColumnPeak(renderTick, column, 100) == bins.ColumnPeak(6200, column, 100));
+        }
+        DesktopFrameBins early;
+        early.Capture(bins, 5100, 50);
+        assert(early.ColumnPeak(50, 99, 100) == 0);
+        early.Capture(bins, 5000, 50);
+        assert(early.ColumnPeak(50, 99, 100) == 73); // no boot-time underflow
+
+        bins.Record(14999, 23);
+        assert(bins.At(50) == 73); // oldest retained slot
+        bins.Record(15000, 31);
+        assert(bins.At(50) == 0 && bins.At(150) == 31);
+        bins.Record(41000, 12); // clear every skipped slot, even across many wraps
+        assert(bins.At(150) == 0 && bins.At(409) == 0 && bins.At(410) == 12);
+
+        brook::DesktopIntervals<> fast;
+        for (unsigned tick = 10000; tick <= 19000; tick += 10) fast.Record(tick);
+        assert(fast.Read(19000).count == 128 && fast.Read(19000).p95 == 10);
+        assert(fast.bins.At(100) == 10 && fast.bins.At(190) == 10);
+        fast.Reset();
+        assert(!fast.Read(19000).count && fast.bins.At(190) == 0);
+    }
     assert(brook_appearance_valid(BROOK_APPEARANCE_DEFAULT));
     for(unsigned dark:{0u,1u})for(unsigned perf:{0u,1u})for(unsigned opacity:{40u,80u,100u})for(unsigned blur=0;blur<4;++blur){
         auto value=brook_appearance_pack(dark,perf,opacity,blur);assert(brook_appearance_valid(value));

@@ -86,19 +86,20 @@ static ChromeTelemetryModel WmTelemetryModel(bool app, bool temp, bool graph = t
     }
     return t;
 }
-// Builders use cadence timestamps only to test age. Translate the current
-// live window to a fixed render clock so inactive chrome stays unchanged.
-// This clock starts on a full launch-ring cycle and leaves room for all
-// eight animation steps without moving the live/expired boundaries.
+// Rebase graph slot ages and raw-stat expiry onto a fixed render clock so
+// unchanged chrome stays cacheable. Leave room for all eight launch animation
+// steps without changing the graph clock or the live/expired boundaries.
 static constexpr uint64_t ShellCadenceTick = 10400;
 static constexpr uint64_t ShellRecentSample = 1200;
 
 static void WmCaptureCadence(DesktopIntervals<>& out, const DesktopIntervals<>& source,
-                            uint64_t observed, bool taskbarApp = false) {
+                            uint64_t observed, uint64_t displayTick = ShellCadenceTick,
+                            bool taskbarApp = false) {
     out.next = source.next;
     out.count = source.count;
+    out.bins.Capture(source.bins, observed, displayTick);
     if (taskbarApp && source.last && observed >= source.last && observed - source.last <= 2000)
-        out.last = ShellCadenceTick;
+        out.last = displayTick;
     for (unsigned i = 0; i < source.count; ++i) {
         const auto& sample = source.samples[i];
         if (observed < sample.tick || observed - sample.tick > 10000) continue;

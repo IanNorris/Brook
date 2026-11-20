@@ -1096,11 +1096,11 @@ static void WmCaptureTaskbar(uint32_t screenW, uint32_t screenH, uint64_t uptime
     }
     if (comp) {
         telemetry.hasCompositor = true;
-        WmCaptureCadence(telemetry.compositor, *source.compositor, uptimeMs);
+        WmCaptureCadence(telemetry.compositor, *source.compositor, uptimeMs, snapshot.uptimeMs);
     }
     if (app) {
         telemetry.hasApp = true;
-        WmCaptureCadence(telemetry.app, *source.app, uptimeMs, true);
+        WmCaptureCadence(telemetry.app, *source.app, uptimeMs, snapshot.uptimeMs, true);
     }
     WmCaptureThermal(telemetry, source, false);
     if (layout.hud.w > 0) {
