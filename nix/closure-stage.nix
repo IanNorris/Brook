@@ -3,6 +3,7 @@ let
   python = pkgs.python3.withPackages (ps: [ ps.pillow ps.cairosvg ]);
   support = pkgs.runCommand "brook-profile-stage-support" {} ''
     install -Dm644 ${../tools/nix-install/stage_profile.py} "$out/scripts/stage_profile.py"
+    install -Dm644 ${../tools/nix-install/stage_launchers.py} "$out/scripts/stage_launchers.py"
     install -Dm644 ${../tools/nix-install/stage_nar.py} "$out/scripts/stage_nar.py"
     install -Dm644 ${../scripts/collect_desktop_entries.py} "$out/scripts/collect_desktop_entries.py"
     mkdir -p "$out/data/branding"
