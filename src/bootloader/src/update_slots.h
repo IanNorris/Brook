@@ -10,6 +10,11 @@ enum class UpdatePairResult { Unavailable, Loaded, Previous, RecoveryRequired };
 UpdatePairResult LoadUpdatePair(EFI_HANDLE image, EFI_BOOT_SERVICES* services,
     uint8_t*& kernel, UINTN& kernelBytes, uint8_t*& initrd, UINTN& initrdBytes,
     BootGuardSlot& selection, const char* guardIdentity=nullptr);
+// Only after the independent disk guard passes and journal-requested recovery
+// has no verified pair. Keep the real selector key for update protection.
+bool LoadEmergencyUpdatePair(EFI_HANDLE image, EFI_BOOT_SERVICES* services,
+    uint8_t*& kernel, UINTN& kernelBytes, uint8_t*& initrd, UINTN& initrdBytes,
+    BootGuardSlot& selection);
 // Independently verified, explicitly requested SSD-resident recovery pair.
 bool LoadRecoveryPair(EFI_HANDLE image, EFI_BOOT_SERVICES* services,
     uint8_t*& kernel, UINTN& kernelBytes, uint8_t*& initrd, UINTN& initrdBytes);

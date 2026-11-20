@@ -98,6 +98,7 @@ constexpr uint32_t BootTimingWaitRan    = 1u << 1; // the boot-menu wait ran
 constexpr uint32_t BootTimingWaitKey    = 1u << 2; // a recovery key ended the wait
 constexpr uint32_t BootTimingRecovery   = 1u << 3; // recovery pair selected (key or guard)
 constexpr uint32_t BootTimingGuardSlot  = 1u << 4; // verified A/B selector metadata follows timing
+constexpr uint32_t BootTimingGuardEmergency = 1u << 5; // journal required recovery, but no recovery pair verified
 
 struct BootTiming
 {

@@ -65,7 +65,16 @@ inline bool GuardSlotFinish(GuardSlotHealth& health, const BootGuardSlot& key, b
     auto& entry = health.slots[key.slot];
     if (!entry.starts || entry.profileRejected) return false;
     if (rejected) entry.profileRejected = true;
-    else entry.starts = 0;
+    else {
+        entry.starts = 0;
+        // This slot proved the shared profile can boot. Keep the selectors
+        // that rejected it exhausted so they are not selected again.
+        for (auto& other : health.slots) {
+            if (!other.profileRejected) continue;
+            other.profileRejected = false;
+            other.starts = GuardSlotFailureLimit;
+        }
+    }
     return true;
 }
 
@@ -76,8 +85,8 @@ inline GuardSlotChoice GuardChooseSlot(const GuardSlotHealth& health, const Boot
 {
     if (!GuardSlotMatches(health,newest)) return GuardSlotChoice::Newest;
     const auto& active = health.slots[newest.slot];
-    if (active.profileRejected) return GuardSlotChoice::Recovery;
-    if (active.starts < GuardSlotFailureLimit) return GuardSlotChoice::Newest;
+    if (!active.profileRejected && active.starts < GuardSlotFailureLimit)
+        return GuardSlotChoice::Newest;
 
     if (!GuardSlotKeyValid(previous) || previous.slot == newest.slot ||
         previous.generation >= newest.generation) return GuardSlotChoice::Recovery;
@@ -97,14 +106,13 @@ inline GuardSlotRecordKind GuardSlotDecode(const uint8_t* sector, const uint8_t 
     for (unsigned i = 0; i < GuardSlotSectorBytes; ++i) blank &= !sector[i];
     if (blank) return GuardSlotRecordKind::Blank;
     if (!BrookUpdateEqual(sector,GuardSlotMagic,sizeof(GuardSlotMagic)))
-        return GuardSlotRecordKind::Foreign;
+        return GuardSlotRecordKind::Torn;
     if (BrookUpdateGet32(sector+GuardSlotCrcOffset) != BrookUpdateCrc(sector,GuardSlotCrcOffset))
         return GuardSlotRecordKind::Torn;
-    if (!BrookUpdateEqual(sector+16,disk,sizeof(disk))) return GuardSlotRecordKind::Foreign;
 
     GuardSlotHealth health{};
     health.sequence = BrookUpdateGet64(sector+8);
-    if (!health.sequence) return GuardSlotRecordKind::Foreign;
+    if (!health.sequence) return GuardSlotRecordKind::Torn;
     for (unsigned index = 0; index < GuardSlotCount; ++index) {
         const auto* bytes = sector+48+index*48;
         auto& entry = health.slots[index];
@@ -114,11 +122,12 @@ inline GuardSlotRecordKind GuardSlotDecode(const uint8_t* sector, const uint8_t 
         const uint32_t rejected = BrookUpdateGet32(bytes+44);
         if (entry.starts > GuardSlotFailureLimit || rejected > 1 || (rejected && !entry.starts) ||
             (bool(entry.generation) != GuardSlotHasDigest(entry.selectorDigest)) ||
-            (!entry.generation && entry.starts)) return GuardSlotRecordKind::Foreign;
+            (!entry.generation && entry.starts)) return GuardSlotRecordKind::Torn;
         entry.profileRejected = rejected != 0;
     }
     for (unsigned i = 48+GuardSlotCount*48; i < GuardSlotCrcOffset; ++i)
-        if (sector[i]) return GuardSlotRecordKind::Foreign;
+        if (sector[i]) return GuardSlotRecordKind::Torn;
+    if (!BrookUpdateEqual(sector+16,disk,sizeof(disk))) return GuardSlotRecordKind::Foreign;
     result = health;
     return GuardSlotRecordKind::Valid;
 }

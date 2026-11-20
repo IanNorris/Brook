@@ -134,6 +134,7 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
         timing.flags |= brook::BootTimingWaitRan;
     }
     bool updatePair = false;
+    bool slotHealthRecovery = false;
     brook::BootGuardSlot selectedSlot{};
     if (!recoveryRequested && g_bootConfig.updateSlots) {
         const char* identity = nullptr;
@@ -144,6 +145,10 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
             kernelData, kernelFileSize, initrdData, initrdFileSize, selectedSlot, identity);
         updatePair = selected == UpdatePairResult::Loaded || selected == UpdatePairResult::Previous;
         recoveryRequested = selected == UpdatePairResult::RecoveryRequired;
+#if defined(BROOK_RECOVERY_GUARD_REQUIRED)
+        // This path is skipped after a failed disk guard or an F5 request.
+        slotHealthRecovery = recoveryRequested && !guardDenied;
+#endif
         if (selected == UpdatePairResult::Previous) {
             ConsoleSetQuiet(false);
             ConsolePrint(u"Brook guard fallback generation ");
@@ -155,7 +160,6 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
         }
     }
     if (recoveryRequested) {
-        timing.flags |= brook::BootTimingRecovery;
         ConsoleSetQuiet(false);
 #if defined(BROOK_RECOVERY_GUARD_REQUIRED)
         if (guardDenied) ConsolePrintLine(u"Recovery required; normal boot blocked.");
@@ -170,16 +174,26 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
     if (recoveryRequested && !updatePair) updatePair = LoadRecoveryPair(imageHandle,
         systemTable->BootServices, kernelData, kernelFileSize, initrdData, initrdFileSize);
     if (recoveryRequested && updatePair) {
+        timing.flags |= brook::BootTimingRecovery;
         ConsoleSetQuiet(false);
         ConsolePrintLine(u"Brook SSD recovery payload verified");
         ConsoleSetQuiet(!g_bootConfig.debugText);
     }
     if (recoveryRequested && !updatePair) {
         ConsoleSetQuiet(false);
-#if defined(BROOK_RECOVERY_GUARD_REQUIRED)
-        if (guardDenied) Halt(EFI_NOT_FOUND, u"Recovery required but payload invalid or missing.");
-#endif
-        Halt(EFI_NOT_FOUND, u"Recovery payload invalid or missing; restart to boot normally.");
+        if (slotHealthRecovery && LoadEmergencyUpdatePair(imageHandle, systemTable->BootServices,
+                kernelData, kernelFileSize, initrdData, initrdFileSize, selectedSlot)) {
+            updatePair = true;
+            timing.flags |= brook::BootTimingGuardEmergency;
+            ConsolePrint(u"Brook guard emergency generation ");
+            ConsolePrintDec(selectedSlot.generation);
+            ConsolePrint(u" slot ");
+            ConsolePrintDec(selectedSlot.slot);
+            ConsolePrintLine(u" verified; SSD recovery unavailable.");
+            ConsoleSetQuiet(!g_bootConfig.debugText);
+        } else {
+            Halt(EFI_NOT_FOUND, u"Recovery payload invalid or missing; use a recovery USB.");
+        }
     }
     if (!updatePair) kernelData = ReadFile(imageHandle, systemTable->BootServices,
         g_bootConfig.target, &kernelFileSize);

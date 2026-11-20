@@ -138,6 +138,42 @@ static void SlotHealthPolicy() {
     assert(!GuardSlotStart(health,replacement));
 }
 
+static void SlotProfileRejectionPolicy()
+{
+    using namespace brook;
+    const BootGuardSlot previous{1,0,0,{10}};
+    const BootGuardSlot newest{2,1,0,{20}};
+    const BootGuardSlot replacement{3,1,0,{30}};
+    GuardSlotHealth rejected{};
+    assert(GuardSlotStart(rejected,newest));
+    assert(GuardSlotFinish(rejected,newest,true));
+    assert(rejected.slots[1].starts==1 && rejected.slots[1].profileRejected);
+    assert(GuardChooseSlot(rejected,newest,previous)==GuardSlotChoice::Previous);
+    assert(!GuardSlotStart(rejected,newest));
+
+    // A repaired profile is accepted by the previous slot. Confirmation
+    // distinguishes the original rejection from a problem shared by both.
+    GuardSlotHealth repaired=rejected;
+    assert(GuardSlotStart(repaired,previous));
+    assert(GuardSlotFinish(repaired,previous,false));
+    assert(repaired.slots[0].starts==0 && !repaired.slots[0].profileRejected);
+    assert(repaired.slots[1].starts==GuardSlotFailureLimit && !repaired.slots[1].profileRejected);
+    assert(GuardSlotMatches(repaired,newest));
+    assert(GuardChooseSlot(repaired,newest,previous)==GuardSlotChoice::Previous);
+
+    // A second rejection classifies the profile as unusable on either
+    // verified selector; repairing it and staging a new exact key can retry.
+    assert(GuardSlotStart(rejected,previous));
+    assert(GuardSlotFinish(rejected,previous,true));
+    assert(rejected.slots[0].starts==1 && rejected.slots[0].profileRejected);
+    assert(GuardChooseSlot(rejected,newest,previous)==GuardSlotChoice::Recovery);
+    assert(GuardChooseSlot(rejected,replacement,previous)==GuardSlotChoice::Newest);
+    assert(GuardSlotStart(rejected,replacement));
+    assert(GuardSlotFinish(rejected,replacement,false));
+    assert(rejected.slots[1].starts==0 && !rejected.slots[1].profileRejected);
+    assert(rejected.slots[0].starts==GuardSlotFailureLimit && !rejected.slots[0].profileRejected);
+}
+
 static void SlotHealthPersistence() {
     using namespace brook;
     const uint8_t disk[32]={1}, foreign[32]={2};
@@ -167,12 +203,35 @@ static void SlotHealthPersistence() {
     assert(!GuardSlotWrite(uncertain,disk,journal.health));
     assert(!GuardSlotRead(io,foreign,journal));
 
+    // A write can corrupt magic, CRC or payload structure on the target
+    // sector. The other valid copy still defines the state and permits repair.
+    SlotHealthIo garbage=io;
+    memset(garbage.sectors[0],0xa5,sizeof(garbage.sectors[0]));
+    assert(GuardSlotRead(garbage,disk,journal) && journal.newest==1 && journal.health.sequence==2);
+    assert(GuardSlotFinish(journal.health,selected,false));
+    assert(GuardSlotWrite(garbage,disk,journal.health));
+    assert(GuardSlotRead(garbage,disk,journal) && journal.newest==0 && journal.health.sequence==3);
+
+    SlotHealthIo badStructure=io;
+    auto* damaged=badStructure.sectors[0];
+    damaged[256]=1; // Reserved byte, even with a correct CRC.
+    BrookUpdatePut32(damaged+GuardSlotCrcOffset,BrookUpdateCrc(damaged,GuardSlotCrcOffset));
+    assert(GuardSlotRead(badStructure,disk,journal) && journal.newest==1);
+
+    SlotHealthIo foreignSibling=io;
+    damaged=foreignSibling.sectors[0];
+    damaged[16]^=1; // A valid record for a different disk is never trusted.
+    BrookUpdatePut32(damaged+GuardSlotCrcOffset,BrookUpdateCrc(damaged,GuardSlotCrcOffset));
+    assert(!GuardSlotRead(foreignSibling,disk,journal));
+
     // Even byte-identical records with the same sequence are ambiguous.
     memcpy(io.sectors[0],io.sectors[1],sizeof(io.sectors[0]));
     assert(!GuardSlotRead(io,disk,journal));
     SlotHealthIo truncated;
     memcpy(truncated.sectors[0],io.sectors[0],32);
     assert(!GuardSlotRead(truncated,disk,journal));
+    memset(truncated.sectors,0xa5,sizeof(truncated.sectors));
+    assert(!GuardSlotRead(truncated,disk,journal)); // Neither copy decodes.
 }
 
 static void GuardedSlotSelection() {
@@ -244,14 +303,56 @@ static void GuardedSlotSelection() {
     assert(GuardSlotFinish(journal.health,recent,true));
     journal.health.slots[0].starts=0;
     save();
-    load(Result::RecoveryRequired,0); // A shared profile is not repaired by fallback.
+    load(Result::Previous,1); // One rejection could be slot-specific.
+    assert(GuardSlotStart(journal.health,prior));
+    assert(GuardSlotFinish(journal.health,prior,true));
+    save();
+    load(Result::RecoveryRequired,0); // Both verified slots rejected it.
+    files.clear();
+}
+
+static void EmergencySlotSelection()
+{
+    using namespace brook;
+    provision(0,41);
+    provision(1,42);
+    // The caller invokes emergency selection only after recovery itself fails.
+    // The helper does not consult the failed health journal a second time.
+    files[u"RECOVERY\\BOOTSTAT.BIN"]={1,2,3};
+    const auto expectEmergency=[](uint64_t generation) {
+        uint8_t *kernel=nullptr,*initrd=nullptr;UINTN kb=0,ib=0;
+        BootGuardSlot key{};
+        key.generation=99;
+        assert(bootloader::LoadEmergencyUpdatePair(nullptr,nullptr,kernel,kb,initrd,ib,key)==(generation!=0));
+        assert(key.generation==generation);
+        if(generation) {
+            assert(kernel && initrd && kb==4096 && ib==512);
+            const auto& selector=files.at(key.slot ? u"UPDATES\\SELECT1.BIN" : u"UPDATES\\SELECT0.BIN");
+            uint8_t digest[32]{};
+            BrookUpdateHash(selector.data(),selector.size(),digest);
+            assert(BrookUpdateEqual(key.selectorDigest,digest,sizeof(digest)));
+            bootloader::FreePages(nullptr,(EFI_PHYSICAL_ADDRESS)kernel,kb);
+            bootloader::FreePages(nullptr,(EFI_PHYSICAL_ADDRESS)initrd,ib);
+        } else assert(!kernel && !initrd);
+        assert(allocations.empty());
+    };
+    expectEmergency(42);
+    files[u"UPDATES\\B\\INITRD.IMG"][0]^=1;
+    expectEmergency(41); // Prefer the older verified pair to a damaged newest.
+    files[u"UPDATES\\A\\KERNEL.ELF"][200]^=1;
+    expectEmergency(0);
+    provision(0,42);
+    provision(1,42);
+    expectEmergency(0); // Conflicting equal-generation selectors.
     files.clear();
 }
 
 int main() {
     SlotHealthPolicy();
+    SlotProfileRejectionPolicy();
     SlotHealthPersistence();
     GuardedSlotSelection();
+    EmergencySlotSelection();
     const char* identity="01000000000000000000000000000000"
                          "02000000000000000000000000000000"
                          "03000000000000000000000000000000";

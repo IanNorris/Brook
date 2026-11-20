@@ -83,15 +83,25 @@ static bool ReadSlotHealth(EFI_HANDLE image,EFI_BOOT_SERVICES* bs,const char* id
     return valid;
 }
 
+static void ReadUpdateSelectors(EFI_HANDLE image, EFI_BOOT_SERVICES* bs, uint8_t (&records)[2][128])
+{
+    for (unsigned i = 0; i < 2; ++i) {
+        UINTN size = 0;
+        auto* data = ReadFile(image,bs,i?u"UPDATES\\SELECT1.BIN":u"UPDATES\\SELECT0.BIN",&size,128);
+        if (!data) continue;
+        if (size == 128) {
+            for (unsigned j = 0; j < size; ++j) records[i][j] = data[j];
+        }
+        FreePages(bs,reinterpret_cast<EFI_PHYSICAL_ADDRESS>(data),size);
+    }
+}
+
 UpdatePairResult LoadUpdatePair(EFI_HANDLE image,EFI_BOOT_SERVICES* bs,
                     uint8_t*& kernel,UINTN& kb,uint8_t*& initrd,UINTN& ib,
                     BootGuardSlot& selection,const char* guardIdentity) {
     selection={};kernel=nullptr;initrd=nullptr;kb=0;ib=0;
     uint8_t records[2][128]{};
-    for(unsigned i=0;i<2;i++) {
-        UINTN n=0;auto* p=ReadFile(image,bs,i?u"UPDATES\\SELECT1.BIN":u"UPDATES\\SELECT0.BIN",&n,128);
-        if(p){if(n==128)for(unsigned j=0;j<128;j++)records[i][j]=p[j];FreePages(bs,reinterpret_cast<EFI_PHYSICAL_ADDRESS>(p),n);}
-    }
+    ReadUpdateSelectors(image,bs,records);
     GuardSlotHealth health{};
     if(!ReadSlotHealth(image,bs,guardIdentity,health))return UpdatePairResult::RecoveryRequired;
     const auto unavailable=health.sequence?UpdatePairResult::RecoveryRequired:UpdatePairResult::Unavailable;
@@ -120,6 +130,26 @@ UpdatePairResult LoadUpdatePair(EFI_HANDLE image,EFI_BOOT_SERVICES* bs,
         }
     }
     return unavailable;
+}
+
+bool LoadEmergencyUpdatePair(EFI_HANDLE image, EFI_BOOT_SERVICES* bs,
+    uint8_t*& kernel, UINTN& kb, uint8_t*& initrd, UINTN& ib, BootGuardSlot& selection)
+{
+    selection = {};
+    kernel = initrd = nullptr;
+    kb = ib = 0;
+    uint8_t records[2][128]{};
+    ReadUpdateSelectors(image,bs,records);
+    const int newest = BrookUpdateNewest(records[0],records[1]);
+    if (newest < 0) return false;
+    for (unsigned attempt = 0; attempt < 2; ++attempt) {
+        const int index = attempt ? 1-newest : newest;
+        const auto key = SlotKey(records[index]);
+        if (!GuardSlotKeyValid(key) || !Pair(image,bs,records[index],kernel,kb,initrd,ib)) continue;
+        selection = key;
+        return true;
+    }
+    return false;
 }
 
 }}
