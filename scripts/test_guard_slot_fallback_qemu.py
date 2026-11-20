@@ -25,9 +25,12 @@ GENERATIONS = (41, 42)
 RESET_OPTION = 'name=opt/brook/power,string=q35-reset'
 CLEAN_RESET = 'AHCI_DIRECT_SESSION_CLEAN'
 HEALTH_WINDOW_MS = 60000
+NATIVE_CLIENT = '/boot/GDFRAME.ELF'
+NATIVE_FRAMES = 'GUARD_NATIVE_FRAMES_PASS'
 RECOVERY_USB = 'Recovery payload invalid or missing; use a recovery USB.'
 SLOT_CASES = ('fallback', 'confirmed', 'exhausted', 'profile-rejected', 'profile-repaired',
-              'early-restart', 'post-init-panic', 'zero-journal', 'emergency', 'legacy-loader')
+              'early-restart', 'checked-early-restart', 'post-init-panic',
+              'zero-journal', 'emergency', 'legacy-loader')
 
 
 def read_fat(media, name):
@@ -48,7 +51,7 @@ def seed_health(identity, selectors, prior_strike):
     return sector + bytes(512)
 
 
-def read_health(media, identity, selectors, sequence, slots):
+def read_health(media, identity, selectors, sequence, slots, *, prior_slots=None):
     raw = read_fat(media, 'RECOVERY/BOOTSTAT.BIN')
     if len(raw) != 1024:
         raise RuntimeError('incorrect boot journal allocation')
@@ -73,6 +76,8 @@ def read_health(media, identity, selectors, sequence, slots):
             snapshots[seq].append((generation, starts, rejected))
     if max(snapshots, default=0) != sequence or snapshots.get(sequence) != slots:
         raise RuntimeError(f'boot journal mismatch at sequence {sequence}: {snapshots}')
+    if prior_slots is not None and snapshots.get(sequence - 1) != prior_slots:
+        raise RuntimeError(f'prior charged state missing at sequence {sequence - 1}: {snapshots}')
     return dict(sequence=sequence, slots=[dict(slot=i, generation=g, starts=n, profile_rejected=bool(r))
                                           for i, (g, n, r) in enumerate(slots)])
 
@@ -106,13 +111,7 @@ def check_volumes(disk, work, output, expect_clean, *, expect_repair=False):
     return clean, check.returncode
 
 
-def finish_checked_shutdown(work, port, evidence, restart=False):
-    serial = work / 'serial.log'
-    deadline = time.monotonic() + 8
-    while 'GUARD_DESKTOP_SERVICE_PASS' not in serial.read_text(errors='replace'):
-        if time.monotonic() >= deadline:
-            raise RuntimeError('guarded desktop never ran the fixture service')
-        time.sleep(.05)
+def attach_desktop(work, port):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools/vm_bridge'))
     from hardware import Hardware
     bridge = Hardware(work / 'registry')
@@ -125,6 +124,26 @@ def finish_checked_shutdown(work, port, evidence, restart=False):
             if time.monotonic() >= deadline:
                 raise
             time.sleep(.2)
+    return bridge, session
+
+
+def present_native_frames(work, port, output):
+    bridge, session = attach_desktop(work, port)
+    result = bridge.guest_run(session, uuid.uuid4().hex, [NATIVE_CLIENT], cwd='/tmp', uid=1000, wait_s=10)
+    output.write_text(json.dumps(result, indent=2) + '\n')
+    if (result.get('state') != 'completed' or result.get('exit', {}).get('code') != 0 or
+            result.get('stdout', {}).get('text', '').strip() != NATIVE_FRAMES):
+        raise RuntimeError('guarded native window failed to submit distinct frames')
+
+
+def finish_checked_shutdown(work, port, evidence, restart=False):
+    serial = work / 'serial.log'
+    deadline = time.monotonic() + 8
+    while 'GUARD_DESKTOP_SERVICE_PASS' not in serial.read_text(errors='replace'):
+        if time.monotonic() >= deadline:
+            raise RuntimeError('guarded desktop never ran the fixture service')
+        time.sleep(.05)
+    bridge, session = attach_desktop(work, port)
     doctor = bridge.doctor(session)
     if not doctor.get('identity_matches') or not doctor['capabilities'].get('hardware_power'):
         raise RuntimeError('guarded desktop is not ready for checked shutdown')
@@ -156,7 +175,7 @@ def edit_profile_index(disk, work, restore=None):
 
 
 def poke_desktop(work):
-    # Exercise the actual QEMU compositor without a kernel health test hook.
+    # Exercise kernel-only cursor redraws in the negative desktop case.
     with socket.socket(socket.AF_UNIX) as monitor:
         monitor.settimeout(1)
         monitor.connect(str(work / 'monitor.sock'))
@@ -245,6 +264,14 @@ def verify_emergency_gate(a, disk, work, guards):
 
 
 def run_matrix(a, base_disk, normal, work, guards, metadata, panic_journal):
+    client = work / 'GDFRAME.ELF'
+    source = Path(__file__).with_name('workloads') / 'guard_present_frames.c'
+    subprocess.run(['cc', '-nostdlib', '-static', '-fno-stack-protector', '-no-pie',
+                    '-Wall', '-Wextra', '-Werror', '-O2', str(source), '-o', str(client)], check=True)
+    framed = work / 'framed.img'
+    shutil.copyfile(normal, framed)
+    write_fat(str(framed), NATIVE_CLIENT.removeprefix('/'), client)
+
     bad = work / 'bad.img'
     shutil.copyfile(normal, bad)
     subprocess.run(['mdel', '-i', str(bad), '::/BOOT/INIT.RC'], check=True)
@@ -260,8 +287,8 @@ def run_matrix(a, base_disk, normal, work, guards, metadata, panic_journal):
     recovery = (None, None, 'recovery')
     repair = (None, None, 'repair')
     scenarios = (
-        ('fallback', (normal, bad), False, [bad_b_first, bad_b_second, (0, 1, 'success', [a0, b2])]),
-        ('confirmed', (normal, normal), True, [(1, 2, 'success', [blank, b0])]),
+        ('fallback', (framed, bad), False, [bad_b_first, bad_b_second, (0, 1, 'success', [a0, b2])]),
+        ('confirmed', (normal, framed), True, [(1, 2, 'success', [blank, b0])]),
         ('exhausted', (bad, bad), False, [bad_b_first, bad_b_second, (0, 1, 'failure', [a1, b2]),
                                          (0, 2, 'failure', [a2, b2]), (*recovery, [a2, b2])]),
         ('profile-rejected', (normal, normal), False, [(1, 1, 'profile', [blank, failed_b_profile]),
@@ -269,10 +296,11 @@ def run_matrix(a, base_disk, normal, work, guards, metadata, panic_journal):
                                                        (0, 1, 'profile', [failed_a_profile, failed_b_profile]),
                                                        (*repair, [failed_a_profile, failed_b_profile]),
                                                        (*recovery, [failed_a_profile, failed_b_profile])]),
-        ('profile-repaired', (normal, normal), False, [(1, 1, 'profile', [blank, failed_b_profile]),
+        ('profile-repaired', (framed, normal), False, [(1, 1, 'profile', [blank, failed_b_profile]),
                                                        (*repair, [blank, failed_b_profile]),
                                                        (0, 1, 'success', [a0, b2])]),
         ('early-restart', (normal, normal), False, [(1, 1, 'early-restart', [blank, b1])]),
+        ('checked-early-restart', (normal, framed), True, [(1, 2, 'checked-early-restart', [blank, b1])]),
         ('post-init-panic', (normal, normal), False, [(1, 1, 'panic', [blank, b1]), (*repair, [blank, b1])]),
         ('zero-journal', (normal, normal), False, [(1, None, 'empty-journal', None)]),
         ('emergency', (normal, normal), False, [(1, None, 'emergency', None)]),
@@ -337,28 +365,39 @@ def run_matrix(a, base_disk, normal, work, guards, metadata, panic_journal):
             key = f'generation={GENERATIONS[slot]} slot={slot}' if slot is not None else ''
             start = f'GUARD_SLOT_START status=0 {key} starts={count}' if count is not None else None
             health_wait = f'GUARD_SLOT_HEALTH_WAIT {key} window_ms={HEALTH_WINDOW_MS}'
-            reset = result in ('failure', 'repair', 'early-restart', 'panic')
+            early_restart = result in ('early-restart', 'checked-early-restart')
+            qualifying_frames = result in ('success', 'checked-early-restart')
+            reset = result in ('failure', 'repair', 'panic') or early_restart
             evidence = 'GUARD_COMPLETE_RESTART' if result == 'repair' else CLEAN_RESET
             failure_marker = '*** KERNEL PANIC ***'
-            gdb_script = on_marker = intermediate = port = None
+            gdb_script = on_marker = on_intermediate = intermediate = port = None
             prefix = a.output / f'{name}-{i}'
-            if result in ('success', 'early-restart', 'empty-journal', 'emergency', 'legacy-loader'):
+            if qualifying_frames or early_restart or result in ('empty-journal', 'emergency', 'legacy-loader'):
                 with socket.socket() as probe:
                     probe.bind(('127.0.0.1', 0))
                     port = probe.getsockname()[1]
                 shutdown = prefix.with_name(prefix.name + '-shutdown.json')
-                on_marker = lambda: finish_checked_shutdown(step, port, shutdown,
-                                                             restart=result == 'early-restart')
+                frame_evidence = prefix.with_name(prefix.name + '-native-frames.json')
+
+                def finish():
+                    if result == 'checked-early-restart':
+                        present_native_frames(step, port, frame_evidence)
+                    elif result == 'early-restart':
+                        poke_desktop(step)
+                    finish_checked_shutdown(step, port, shutdown, restart=early_restart)
+
+                on_marker = finish
             if result == 'failure':
                 marker = f'GUARD_SLOT_RESTART requested=1 {key} stage=script status=-1'
                 sequence += 1
             elif result == 'success':
                 marker = f'GUARD_SLOT_CONFIRMED status=0 {key}'
                 intermediate = health_wait
+                on_intermediate = lambda: present_native_frames(step, port, frame_evidence)
                 sequence += 2
-            elif result == 'early-restart':
+            elif early_restart:
                 marker = health_wait
-                sequence += 1
+                sequence += 2 if qualifying_frames else 1
             elif result == 'panic':
                 marker = 'PANIC_DISK_CAPTURE_OK'
                 evidence = 'PANIC_RECOVERY_RESET_WAIT'
@@ -380,7 +419,7 @@ def run_matrix(a, base_disk, normal, work, guards, metadata, panic_journal):
                     sata_serial='BROOK-RECOVERY-QA', extra_fw_cfg=[RESET_OPTION], expect_reset=reset,
                     reset_evidence_marker=evidence, on_marker=on_marker, network_port=port,
                     failure_marker=failure_marker, hold_after_marker=1 if not reset else 0,
-                    intermediate_marker=intermediate, on_intermediate=lambda: poke_desktop(step),
+                    intermediate_marker=intermediate, on_intermediate=on_intermediate,
                     gdb_script=gdb_script)
             finally:
                 copy_boot_logs(step, prefix)
@@ -399,10 +438,20 @@ def run_matrix(a, base_disk, normal, work, guards, metadata, panic_journal):
                 if (not measured or int(measured[1]) < HEALTH_WINDOW_MS or int(measured[2]) < 2 or
                         'GUARD_DESKTOP_HANDOFF_SCRIPT status=0' not in serial or CLEAN_RESET not in serial):
                     raise RuntimeError(f'{name}-{i}: confirmation lacked checked sync or positive desktop health')
-            if result in ('early-restart', 'panic'):
+            if early_restart or result == 'panic':
                 if ('GUARD_DESKTOP_HANDOFF_SCRIPT status=0' not in serial or health_wait not in serial or
                         'GUARD_SLOT_CONFIRMED' in serial):
                     raise RuntimeError(f'{name}-{i}: the post-INIT interruption did not retain its strike')
+            withdrawal = re.findall(r'GUARD_SLOT_CHECKED_SHUTDOWN [^\r\n]+', serial)
+            withdrawal_presents = None
+            if result == 'checked-early-restart':
+                pattern = rf'GUARD_SLOT_CHECKED_SHUTDOWN status=0 {key} presents=(\d+)'
+                measured = re.fullmatch(pattern, withdrawal[0]) if len(withdrawal) == 1 else None
+                if not measured or int(measured[1]) < 2:
+                    raise RuntimeError(f'{name}-{i}: checked restart did not withdraw one qualified start: {withdrawal}')
+                withdrawal_presents = int(measured[1])
+            elif early_restart and withdrawal:
+                raise RuntimeError(f'{name}-{i}: kernel-only redraws withdrew a start: {withdrawal}')
             if result == 'panic':
                 packet = next((line[10:] for line in serial.splitlines() if line.startswith('PANIC_HEX:')), None)
                 if not packet or 'GUARD_DESKTOP_PANIC_RESET armed=1' not in serial:
@@ -440,7 +489,8 @@ def run_matrix(a, base_disk, normal, work, guards, metadata, panic_journal):
             if expected is None:
                 report = dict(sequence=None, slots=[])
             else:
-                report = read_health(media, a.identity, selectors, sequence, expected)
+                prior = [blank, b2] if result == 'checked-early-restart' else None
+                report = read_health(media, a.identity, selectors, sequence, expected, prior_slots=prior)
             if (metadata_hash(disk) != metadata or read_fat(media, 'PANIC.BIN') != expected_panic or
                     guarded_records != expected_guards or
                     [read_fat(media, f'UPDATES/SELECT{j}.BIN') for j in range(2)] != selectors):
@@ -450,6 +500,8 @@ def run_matrix(a, base_disk, normal, work, guards, metadata, panic_journal):
                 expect_clean=result not in ('profile', 'panic'), expect_repair=result == 'panic')
             verdict[name].append(dict(result=result, generation=GENERATIONS[slot] if slot is not None else None,
                                       slot=slot, starts=count, fat_clean=True, ext2_clean=clean,
-                                      ext2_fsck_exit=fsck_exit, **report))
+                                      ext2_fsck_exit=fsck_exit,
+                                      checked_shutdown_presents=withdrawal_presents,
+                                      **report))
             (a.output/'slot-matrix.json').write_text(json.dumps(verdict, indent=2) + '\n')
     print('GUARD_SLOT_FALLBACK_MATRIX_PASS', flush=True)
