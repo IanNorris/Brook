@@ -10,6 +10,7 @@ from pathlib import Path
 from hardware_update_protocol import upload,read_payload,KERNEL_MAX,INITRD_MAX
 from hardware_update_bootstat import inspect_bootstat
 from hardware_bulk_protocol import validate_pacing
+from binary_bridge import receiver_key
 
 def power_blocker_summary(status):
     """One line naming the guest's power stage and the processes still blocking it."""
@@ -114,9 +115,8 @@ class UpdateRun:
         if isinstance(port,bool) or not isinstance(port,int) or not 1<=port<=65535:raise ValueError('Invalid upload port')
         kernel=read_payload(kernel_path,KERNEL_MAX);initrd=read_payload(initrd_path,INITRD_MAX)
         if len(kernel)<64 or len(initrd)<512:raise ValueError('Payload is too short')
-        with Path(key_file).open() as source:key=source.read(33)
-        if not re.fullmatch(r'[0-9a-f]{32}',key):raise ValueError('Expected provisioned 32-character key without a newline')
         data=self.bridge.load_session(session);boot=data['guest_boot_id']
+        key=receiver_key(data,key_file)
         doctor=self.bridge.doctor(session)
         if doctor.get('probe_stage')!='verified' or not doctor.get('reachable') or not doctor.get('identity_matches'):raise RuntimeError('Original guest boot probe is incomplete or not reachable/matching')
         if first_slot_aware_install is not None and first_slot_aware_install!=boot:

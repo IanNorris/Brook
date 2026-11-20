@@ -36,8 +36,8 @@ CLIENT_KEY_LABEL = b"Brook bridge v3 client to server"
 SERVER_KEY_LABEL = b"Brook bridge v3 server to client"
 ZERO_ID = bytes(16)
 MAX_RECORD = 65536
-MAX_RECORDS = 1 << 24
-MAX_TRAFFIC = 16 << 30
+MAX_RECORDS = 1 << 28
+MAX_TRAFFIC = 16 << 40
 TAG_BYTES = 16
 HEADER = struct.Struct("<B3xIQ")
 CLIENT = struct.Struct("<8sBBBBI16s16s32s32s32s")
@@ -50,6 +50,10 @@ class BridgeV3Error(ConnectionError):
 
 class BridgeV3NoChallenge(BridgeV3Error):
     """A connected peer failed to send any server challenge."""
+
+
+class BridgeV3BootMismatch(BridgeV3Error):
+    """The peer advertised a different Brook boot."""
 
 
 def read_operator_key(path: Path) -> SigningKey:
@@ -86,7 +90,7 @@ def _client_hello(protocol: int, operation: int, boot: bytes, transaction: bytes
         raise ValueError("boot and transaction IDs must be 16 bytes")
     is_status = protocol == COMMAND and operation == 0
     if (
-        operation not in {COMMAND: (0, 1), UPDATE: (1,), BULK: (1, 2, 3, 4), STORE: (1,)}.get(protocol, ())
+        operation not in {COMMAND: (0, 1), UPDATE: (1, 2), BULK: (1, 2, 3, 4, 5, 6), STORE: (1,)}.get(protocol, ())
         or (not is_status and (boot == ZERO_ID or transaction == ZERO_ID))
         or len(public_key) != 32 or len(nonce) != 32 or len(ephemeral) != 32
         or not any(nonce) or not any(ephemeral)
@@ -106,7 +110,7 @@ def _server_hello(wire: bytes, expected_boot: bytes) -> tuple[bytes, bytes]:
     if magic != SERVER_MAGIC or suite != OPERATOR_SUITE or not all(map(any, (boot, nonce, ephemeral))):
         raise BridgeV3Error("invalid v3 server challenge")
     if expected_boot != ZERO_ID and boot != expected_boot:
-        raise BridgeV3Error("v3 server challenge names a different boot")
+        raise BridgeV3BootMismatch("v3 server challenge names a different boot")
     return boot, ephemeral
 
 
