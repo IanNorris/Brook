@@ -95,6 +95,13 @@ _Last updated: 19 November 2026 (early), by a Claude Code session; see "19 Nov e
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**20 Nov: Dell on Codex `work/launcher-persist` 7ff49197 pair (dell-launcherpersist-20261120, --clearwater-shell; session `fda1ea22568d46008b679330661f988e`).** `launcher status` works; first-run pins were saved (saved_epoch 2). Codex queue: F files-nautilus (started), G shell-tray, H launcher-organise (organise mode, polish, icon tiles, descriptions), I system-small (SYSTEM volume, restart kills hung windows, capture cursor/buffer, umask test). Codex runs the queue itself.
+**Claude now owns web apps and Flatpak (Ian, 20 Nov).** Plan:
+- a user app index (scan ~/.local/share/applications and the Flatpak export dirs, then write a user manifest and icons the kernel launcher also reads, and notify via 0xB03);
+- a `brook-webapp URL` builder (manifest name and icon via curl plus a stdlib PNG decoder; Exec `brook-chromium --app=URL`; app_id matching Chromium's --app window app_id);
+- later, URL paste in launcher search → "Install as app" (Codex, after H);
+- then Flatpak.
+
 **Blender 5.1.1 (20 Nov):**
 - **llvmpipe (brook-run default):** segfault in driCreateContextAttribs. Blender's LLVM 19 (libclang-cpp) and Mesa's LLVM 21 interpose symbols in one process (backtrace mixes libLLVM.so.19 and .21). Any app that brings its own LLVM is at risk under LIBGL_ALWAYS_SOFTWARE.
 - **iris (brook-iris-run):** GL 4.6 Core comes up ("Intel HD 5500 BDW GT2 Mesa 26.0.6"), then SIGABRT (exit 134) with no message or crash file. Suspect GHOST Wayland window/decoration; needs a backtrace.
