@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include "window.h"
 #include "chrome_layout.h"
+#include "taskbar_popup_pin.h"
 #include "../../shared/desktop_layers_abi.h"
 
 namespace brook {
@@ -11,20 +12,38 @@ namespace brook {
 // and the VKRENDER overlay capture. Add a new shell surface here, not in the
 // paths. Material surfaces take the translucent shell material when glass is
 // active; the others stay opaque.
-enum class WmShellSurfaceKind : uint8_t { Taskbar, Launcher, VolumePopup, TrayTooltip, BootSummary, TrayFlyout, PerformanceHud, AppTrayMenu, AppTrayTooltip, Notification, Dock };
+enum class WmShellSurfaceKind : uint8_t {
+    Taskbar, Launcher, VolumePopup, TrayTooltip, BootSummary, TrayFlyout, PerformanceHud,
+    AppTrayMenu, AppTrayTooltip, Notification, Dock,
+    TemperatureFlyout, DiskFlyout, CpuMemoryFlyout, CompositorFlyout, AppFlyout, CalendarFlyout, BuildFlyout,
+    Count
+};
+inline constexpr WmShellSurfaceKind TaskbarPopupSurfaceKinds[] = {
+    WmShellSurfaceKind::Count, WmShellSurfaceKind::VolumePopup, WmShellSurfaceKind::TrayFlyout,
+    WmShellSurfaceKind::TemperatureFlyout, WmShellSurfaceKind::PerformanceHud, WmShellSurfaceKind::AppTrayMenu,
+    WmShellSurfaceKind::DiskFlyout, WmShellSurfaceKind::CpuMemoryFlyout, WmShellSurfaceKind::CompositorFlyout,
+    WmShellSurfaceKind::AppFlyout, WmShellSurfaceKind::CalendarFlyout, WmShellSurfaceKind::BuildFlyout,
+};
+static_assert(sizeof(TaskbarPopupSurfaceKinds) / sizeof(*TaskbarPopupSurfaceKinds) == unsigned(TaskbarPopup::Build) + 1);
+inline TaskbarPopup WmTaskbarPopupForSurface(WmShellSurfaceKind kind) {
+    for (unsigned i = 1; i <= unsigned(TaskbarPopup::Build); ++i)
+        if (TaskbarPopupSurfaceKinds[i] == kind) return TaskbarPopup(i);
+    return TaskbarPopup::None;
+}
 struct WmShellSurface {
     WmShellSurfaceKind kind;
     int32_t x, y;
     uint32_t w, h;
     bool material;
+    int32_t popupShiftX = 0; // placed x minus the coordinates of its model
 };
 struct WmShellTrayGeometry {
     DesktopRect popup, notice;
     bool menu, windowMenu;
 };
-// Taskbar, dock (strip or edge tab), popup slot, notice or boot toast,
-// and optional expanded HUD.
-static constexpr uint32_t WM_SHELL_SURFACE_LIMIT = 5;
+// Taskbar, dock, every independent popup, and a notice/boot toast.
+static constexpr uint32_t WM_SHELL_SURFACE_LIMIT = 3 + unsigned(TaskbarPopup::Build);
+uint32_t WmCollectTaskbarPopupSurfaces(uint32_t sw, uint32_t sh, WmShellSurface* out);
 
 // Back to front. (mx,my) is the pointer the caller renders hover state with.
 inline uint32_t WmShellSurfaces(uint32_t screenW, uint32_t screenH, int32_t mx, int32_t my,
@@ -44,8 +63,7 @@ inline uint32_t WmShellSurfaces(uint32_t screenW, uint32_t screenH, int32_t mx, 
         if (!WmTaskbarHidden() && WmDockSurfaceRect(screenW, screenH, &x, &y, &w, &h, &material))
             out[count++] = {WmShellSurfaceKind::Dock, x, y, w, h, material};
     }
-    // One popup slot: the launcher and the window menu temporarily cover a
-    // pinned taskbar popup. A tooltip yields to an interactive popup.
+    // The launcher and window menu temporarily cover taskbar popups.
     int32_t x = 0, y = 0; uint32_t w = 0, h = 0;
     if (WmLauncherVisible()) {
         WmLauncherGetRect(screenW, screenH, &x, &y, &w, &h);
@@ -53,16 +71,14 @@ inline uint32_t WmShellSurfaces(uint32_t screenW, uint32_t screenH, int32_t mx, 
     } else if (windowMenu) {
         out[count++] = {WmShellSurfaceKind::AppTrayMenu, trayPopup.x, trayPopup.y,
                         uint32_t(trayPopup.w), uint32_t(trayPopup.h), true};
-    } else if (!WmTaskbarHidden() && WmVolumePopupVisible()) {
-        WmVolumePopupGetRect(screenW, screenH, &x, &y, &w, &h);
-        out[count++] = {WmShellSurfaceKind::VolumePopup, x, y, w, h, true};
-    } else if (WmTrayFlyoutRect(screenW, screenH, &x, &y, &w, &h)) {
-        out[count++] = {WmShellSurfaceKind::TrayFlyout, x, y, w, h, true};
-    } else if (trayPopup.w > 0 && trayPopup.h > 0) {
-        out[count++] = {trayMenu ? WmShellSurfaceKind::AppTrayMenu : WmShellSurfaceKind::AppTrayTooltip,
-                        trayPopup.x, trayPopup.y, uint32_t(trayPopup.w), uint32_t(trayPopup.h), true};
-    } else if (WmTrayTooltipGetRect(screenW, screenH, mx, my, &x, &y, &w, &h)) {
-        out[count++] = {WmShellSurfaceKind::TrayTooltip, x, y, w, h, true};
+    } else if (!WmTaskbarHidden()) {
+        const uint32_t popups = WmCollectTaskbarPopupSurfaces(screenW, screenH, out + count);
+        count += popups;
+        if (!popups && !trayMenu && trayPopup.w > 0 && trayPopup.h > 0)
+            out[count++] = {WmShellSurfaceKind::AppTrayTooltip, trayPopup.x, trayPopup.y,
+                            uint32_t(trayPopup.w), uint32_t(trayPopup.h), true};
+        else if (!popups && WmTrayTooltipGetRect(screenW, screenH, mx, my, &x, &y, &w, &h))
+            out[count++] = {WmShellSurfaceKind::TrayTooltip, x, y, w, h, true};
     }
     // One cached pixel layer serves every shell surface. Keep its semantic
     // rectangles disjoint so the GPU never samples the same pixels twice.
@@ -75,8 +91,6 @@ inline uint32_t WmShellSurfaces(uint32_t screenW, uint32_t screenH, int32_t mx, 
         }
         return true;
     };
-    if (WmPerformanceHudRect(screenW, screenH, &x, &y, &w, &h) && freeSpace())
-        out[count++] = {WmShellSurfaceKind::PerformanceHud, x, y, w, h, true};
     if (notice.w > 0 && notice.h > 0) {
         x = notice.x; y = notice.y; w = notice.w; h = notice.h;
         if (freeSpace()) out[count++] = {WmShellSurfaceKind::Notification, x, y, w, h, true};

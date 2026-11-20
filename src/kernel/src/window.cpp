@@ -2708,18 +2708,31 @@ static int AdmitLauncherItem(const LauncherSnapshot& catalog, int itemIdx, bool 
 #include "wm_shell_launcher.inc"
 #include "wm_shell_dock.inc"
 
-bool WmCaptureShellModel(const WmShellSurface& s, uint32_t screenW, uint32_t screenH,
+bool WmCaptureShellModel(const WmShellSurface& placed, uint32_t screenW, uint32_t screenH,
                          uint64_t uptimeMs, int32_t mx, int32_t my, ChromeShellModel& model)
 {
     // Initialize all bytes, including padding and unused icon slots.
     memset(static_cast<void*>(&model), 0, sizeof(model));
     model.kind = ChromeShellKind::None;
+    auto s = placed;
+    s.x -= s.popupShiftX;
+    mx -= s.popupShiftX;
     switch (s.kind) {
     case WmShellSurfaceKind::Taskbar: WmCaptureTaskbar(screenW, screenH, uptimeMs, mx, my, model); break;
     case WmShellSurfaceKind::Launcher: WmCaptureLauncher(screenW, screenH, mx, my, model); break;
     case WmShellSurfaceKind::VolumePopup: WmCaptureVolumePopup(screenW, screenH, mx, my, model); break;
     case WmShellSurfaceKind::TrayTooltip: WmCaptureTooltip(screenW, screenH, mx, my, model); break;
-    case WmShellSurfaceKind::TrayFlyout: WmCaptureTrayFlyout(s, screenW, screenH, uptimeMs, mx, my, model); break;
+    case WmShellSurfaceKind::TrayFlyout:
+    case WmShellSurfaceKind::TemperatureFlyout:
+    case WmShellSurfaceKind::DiskFlyout:
+    case WmShellSurfaceKind::CpuMemoryFlyout:
+    case WmShellSurfaceKind::CompositorFlyout:
+    case WmShellSurfaceKind::AppFlyout:
+    case WmShellSurfaceKind::CalendarFlyout:
+    case WmShellSurfaceKind::BuildFlyout:
+        WmCaptureTrayFlyout(s, screenW, screenH, uptimeMs, mx, my, model);
+        break;
+    case WmShellSurfaceKind::Count: break;
     case WmShellSurfaceKind::PerformanceHud: WmCapturePerformanceHud(screenW, screenH, mx, my, model); break;
     case WmShellSurfaceKind::BootSummary: WmCaptureBootSummary(screenW, screenH, model); break;
     case WmShellSurfaceKind::Dock: WmCaptureDock(screenW, screenH, mx, my, model); break;
@@ -3423,7 +3436,17 @@ BrookDesktopSurface WmShellSurfaceRecord(const WmShellSurface& surface,uint64_t 
     case WmShellSurfaceKind::Launcher: kind=BROOK_DESKTOP_SURFACE_LAUNCHER;break;
     case WmShellSurfaceKind::VolumePopup: kind=BROOK_DESKTOP_SURFACE_VOLUME_POPUP;break;
     case WmShellSurfaceKind::TrayTooltip: kind=BROOK_DESKTOP_SURFACE_TOOLTIP;break;
-    case WmShellSurfaceKind::TrayFlyout: kind=BROOK_DESKTOP_SURFACE_TRAY_FLYOUT;break;
+    case WmShellSurfaceKind::TrayFlyout:
+    case WmShellSurfaceKind::TemperatureFlyout:
+    case WmShellSurfaceKind::DiskFlyout:
+    case WmShellSurfaceKind::CpuMemoryFlyout:
+    case WmShellSurfaceKind::CompositorFlyout:
+    case WmShellSurfaceKind::AppFlyout:
+    case WmShellSurfaceKind::CalendarFlyout:
+    case WmShellSurfaceKind::BuildFlyout:
+        kind=BROOK_DESKTOP_SURFACE_TRAY_FLYOUT;
+        break;
+    case WmShellSurfaceKind::Count: break;
     case WmShellSurfaceKind::PerformanceHud: kind=BROOK_DESKTOP_SURFACE_PERFORMANCE_HUD;break;
     case WmShellSurfaceKind::BootSummary: kind=BROOK_DESKTOP_SURFACE_BOOT_SUMMARY;break;
     case WmShellSurfaceKind::Dock: kind=BROOK_DESKTOP_SURFACE_DOCK;break;

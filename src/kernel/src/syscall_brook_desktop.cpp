@@ -543,10 +543,13 @@ int64_t sys_brook_desktop_overlay(uint64_t op,uint64_t token,uint64_t destinatio
         return CopyToUser(destination,&info,sizeof(info))?0:-EFAULT;
     }
     if(op==BROOK_DESKTOP_OVERLAY_SURFACES){
-        if(offset || length!=sizeof(BrookDesktopOverlaySurfaces))return -EINVAL;
+        if(offset || (length!=sizeof(BrookDesktopOverlaySurfaces) &&
+                      length!=sizeof(BrookDesktopOverlaySurfacesLegacy)))return -EINVAL;
         BrookDesktopOverlaySurfaces info{};const int result=CompositorOverlaySurfaces(uint32_t(token),owner,info);
         if(result)return result;
-        return CopyToUser(destination,&info,sizeof(info))?0:-EFAULT;
+        if(length==sizeof(BrookDesktopOverlaySurfacesLegacy) && info.count>BROOK_DESKTOP_OVERLAY_LEGACY_SURFACES)
+            return -75; // EOVERFLOW: legacy renderer uses the complete raster bands
+        return CopyToUser(destination,&info,length)?0:-EFAULT;
     }
     if(op==BROOK_DESKTOP_OVERLAY_GENERATION){
         if(token || destination || length || offset)return -EINVAL;

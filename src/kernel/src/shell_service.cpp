@@ -20,7 +20,7 @@ inline void* operator new(size_t, void* storage) noexcept { return storage; }
 namespace brook {
 namespace {
 
-constexpr unsigned KindCount = unsigned(WmShellSurfaceKind::Dock) + 1;
+constexpr unsigned KindCount = unsigned(WmShellSurfaceKind::Count);
 
 struct Geometry {
     WmShellSurface surface;
@@ -86,7 +86,8 @@ bool SameGeometry(const Geometry& a, const Geometry& b)
     return a.width == b.width && a.height == b.height && a.style == b.style &&
            a.surface.kind == b.surface.kind && a.surface.material == b.surface.material &&
            a.surface.x == b.surface.x && a.surface.y == b.surface.y &&
-           a.surface.w == b.surface.w && a.surface.h == b.surface.h;
+           a.surface.w == b.surface.w && a.surface.h == b.surface.h &&
+           a.surface.popupShiftX == b.surface.popupShiftX;
 }
 
 const ChromeFontSet& Fonts(uint32_t scale)
@@ -478,7 +479,7 @@ void ShellServiceDraw(const WmShellSurface& surface, uint32_t* pixels, uint32_t 
         uint64_t(surface.y) + surface.h > height) return;
     ChromeDisplayList view(list->cmds, list->count, list->text, list->textBytes, list->count, list->textBytes);
     ChromeExecute(view, {pixels + uint64_t(surface.y) * stride + surface.x, stride, surface.w, surface.h,
-                         surface.x, surface.y}, Fonts(list->scale));
+                         surface.x - surface.popupShiftX, surface.y}, Fonts(list->scale));
 }
 
 int64_t ShellServiceSyscallInvoke(uint64_t op, uint64_t exchange, uint64_t payload,

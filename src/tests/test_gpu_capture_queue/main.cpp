@@ -97,10 +97,23 @@ bool dockVisible=false;
 bool WmDockSurfaceRect(uint32_t,uint32_t,int32_t* x,int32_t* y,uint32_t* w,uint32_t* h,bool* material){
     *x=0;*y=3;*w=1;*h=1;*material=true;return dockVisible;
 }
-bool summaryAndHudVisible = false;
+bool summaryAndHudVisible = false, extraPopupsVisible = false;
 bool WmPerformanceHudRect(uint32_t,uint32_t,int32_t* x,int32_t* y,uint32_t* w,uint32_t* h) {
     *x = 3; *y = 3; *w = 1; *h = 1;
     return summaryAndHudVisible;
+}
+uint32_t WmCollectTaskbarPopupSurfaces(uint32_t,uint32_t,WmShellSurface* out) {
+    uint32_t count = 0;
+    if (volumeVisible) out[count++] = {
+        WmShellSurfaceKind::VolumePopup, summaryAndHudVisible ? 1 : 4, 1, 2, 2, true,
+        summaryAndHudVisible ? -3 : 0
+    };
+    if (extraPopupsVisible) {
+        out[count++] = {WmShellSurfaceKind::TrayFlyout, 3, 1, 1, 1, true};
+        out[count++] = {WmShellSurfaceKind::CalendarFlyout, 5, 1, 1, 1, true};
+    }
+    if (summaryAndHudVisible) out[count++] = {WmShellSurfaceKind::PerformanceHud,3,3,1,1,true};
+    return count;
 }
 bool WmBootSummaryRect(uint32_t,uint32_t,int32_t* x,int32_t* y,uint32_t* w,uint32_t* h) {
     *x = 7; *y = 0; *w = 1; *h = 1;
@@ -138,6 +151,8 @@ void ShellServiceDraw(const WmShellSurface& s,uint32_t* p,uint32_t stride,uint32
     case WmShellSurfaceKind::PerformanceHud: color = 0x00112233; break;
     case WmShellSurfaceKind::BootSummary: color = 0x00445566; break;
     case WmShellSurfaceKind::Dock: color = 0x00998877; break;
+    case WmShellSurfaceKind::TrayFlyout: color = 0x00334455; break;
+    case WmShellSurfaceKind::CalendarFlyout: color = 0x00224466; break;
     default: std::abort();
     }
     for (uint32_t y = 0; y < s.h; ++y)
@@ -536,6 +551,8 @@ int main() {
         // The legacy capture can pack four shell surfaces and a cursor
         // into the same seven-band ABI. A later cursorless capture erases it.
         summaryAndHudVisible = true;
+        launcherVisible = false;
+        volumeVisible = true;
         overlay = CompositorRequestDebugFrame(77, true, true);
         CaptureOverlayAt(703, 6, 4, true);
         CHECK(CompositorDebugFrameStatus(overlay.token, 77).state == DebugFrameState::Ready);
@@ -581,8 +598,19 @@ int main() {
             CHECK(covered(0, 3) && covered(7, 0) && covered(3, 3) && covered(6, 4) && covered(1, 1) && covered(0, 5));
         }
         CHECK(CompositorReleaseDebugFrame(overlay.token, 77));
+        // Seven independent records must survive the old raster band limit.
+        extraPopupsVisible = true;
+        overlay = CompositorRequestDebugFrame(77, true, false);
+        CaptureOverlayAt(706, 6, 4, false);
+        CHECK(!CompositorOverlaySurfaces(overlay.token, 77, records) && records.count == 7);
+        CHECK(overlayPixels[9] == 0xff777777 && overlayPixels[11] == 0xff334455 &&
+              overlayPixels[13] == 0xff224466);
+        DesktopOverlayBands multiple{};
+        CHECK(!CompositorOverlayBands(overlay.token, 77, multiple) && multiple.count <= 7);
+        CHECK(CompositorReleaseDebugFrame(overlay.token, 77));
         dockVisible = false;
-        summaryAndHudVisible = false;
+        summaryAndHudVisible = extraPopupsVisible = volumeVisible = false;
+        launcherVisible = true;
         g_debugFrameCleanAddress=0;
     }
     g_debugFramePages=0;g_debugFrameBuffer=VirtualAddress{};

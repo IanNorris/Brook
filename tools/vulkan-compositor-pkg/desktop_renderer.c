@@ -672,7 +672,7 @@ static uint64_t monotonic_ns(void);
  * generation. Waits in the kernel for completion where supported. */
 /* bands/opaque/keys: in, the held capture whose pixels are in output (an
  * unchanged band is not reread); out, the new capture. */
-static int g_overlayRecords=1;static unsigned long long g_overlayRecordCaptures;
+static int g_overlayRecords=2; /* 2: expanded records, 1: legacy, 0: unsupported */static unsigned long long g_overlayRecordCaptures;
 static int capture_overlay(int drm,struct Source *output,uint32_t width,uint32_t height,
                            struct BrookDesktopOverlayBands *bands,uint32_t *opaque,uint64_t *keys,uint64_t *generation,
                            struct BrookDesktopOverlaySurfaces *records){
@@ -725,10 +725,20 @@ static int capture_overlay(int drm,struct Source *output,uint32_t width,uint32_t
     }
     *opaque=newOpaque;memcpy(keys,newKeys,sizeof(newKeys));
     memset(records,0,sizeof(*records));
-    if(g_overlayRecords){
-        struct BrookDesktopOverlaySurfaces reply;memset(&reply,0,sizeof(reply));
+    if(g_overlayRecords==2){
+        struct BrookDesktopOverlaySurfaces reply={0};
         if(!syscall(BROOK_SYS_DESKTOP_OVERLAY,BROOK_DESKTOP_OVERLAY_SURFACES,token,&reply,sizeof(reply),0,0)){
             if(reply.count<=BROOK_DESKTOP_OVERLAY_MAX_SURFACES){*records=reply;++g_overlayRecordCaptures;}
+        }else if(errno==EINVAL)g_overlayRecords=1;
+    }
+    if(g_overlayRecords==1){
+        struct BrookDesktopOverlaySurfacesLegacy legacy={0};
+        if(!syscall(BROOK_SYS_DESKTOP_OVERLAY,BROOK_DESKTOP_OVERLAY_SURFACES,token,&legacy,sizeof(legacy),0,0)){
+            if(legacy.count<=BROOK_DESKTOP_OVERLAY_LEGACY_SURFACES){
+                records->count=legacy.count;
+                memcpy(records->surfaces,legacy.surfaces,legacy.count*sizeof(legacy.surfaces[0]));
+                ++g_overlayRecordCaptures;
+            }
         }else if(errno==EINVAL)g_overlayRecords=0;
     }
     if(blocking && g_overlayTracked==1)*generation=overlayInfo.generation;

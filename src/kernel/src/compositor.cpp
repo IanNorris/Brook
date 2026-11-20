@@ -2105,10 +2105,9 @@ static ShellFrame CaptureShellFrame(uint32_t width, uint32_t height, uint64_t no
     for (uint32_t i = 0; i < count; ++i) {
         auto surface = surfaces[i];
         kindMask |= 1u << uint32_t(surface.kind);
-        if (surface.kind == WmShellSurfaceKind::TrayFlyout) {
-            diskVisible = WmDiskFlyoutSelected();
-            statsPanel = WmDetailedStatsSelected();
-        }
+        diskVisible |= surface.kind == WmShellSurfaceKind::DiskFlyout;
+        if (surface.kind == WmShellSurfaceKind::CpuMemoryFlyout)
+            statsPanel = DesktopStatsPanel::CpuMemory;
         uint64_t key = ShellServiceCapture(surface, width, height, now, mx, my);
         const bool fallback = !key;
         if (fallback) {

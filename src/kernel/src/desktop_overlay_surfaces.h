@@ -13,7 +13,7 @@
 
 namespace brook {
 
-static constexpr uint32_t DESKTOP_OVERLAY_SURFACE_LIMIT = 5;
+static constexpr uint32_t DESKTOP_OVERLAY_SURFACE_LIMIT = 14;
 // Up to 5 dropped cache slots, 5 redrawn surfaces and 5 foreign rectangles.
 static constexpr uint32_t DESKTOP_OVERLAY_CLEAR_LIMIT = 15;
 

@@ -714,7 +714,7 @@ int main() {
         CHECK(n>=2 && s[1].kind==WmShellSurfaceKind::VolumePopup);
         int32_t x,y;uint32_t w,h;WmVolumePopupGetRect(sw,sh,&x,&y,&w,&h);
         CHECK(s[1].x==x && s[1].y==y && s[1].w==w && s[1].h==h);
-        // The slot holds one popup even if both flags were ever set.
+        // The launcher still temporarily covers the taskbar popups.
         g_launcherOpen=true;n=kinds(s);
         CHECK(n>=2 && s[1].kind==WmShellSurfaceKind::Launcher);
         for(uint32_t i=2;i<n;++i)CHECK(s[i].kind==WmShellSurfaceKind::BootSummary);
@@ -742,8 +742,30 @@ int main() {
         CHECK(WmTaskbarPopupPointerOwned(volumePin.x, volumePin.y, sw, sh));
         CHECK(!WmTaskbarPopupPointerOwned(10, 10, sw, sh));
         CHECK(!WmVolumeLeftPress(10, 10, sw, sh) && WmVolumePopupVisible());
-        CHECK(WmTrayFlyoutPress(tray.x, tray.y, sw, sh) && !WmTrayFlyoutVisible());
+        CHECK(WmTrayFlyoutPress(tray.x, tray.y, sw, sh) && WmTrayFlyoutVisible());
+        const auto net = WmPlacedTaskbarPopup(TaskbarPopup::Network, sw, sh);
+        const auto placedVolume = WmPlacedTaskbarPopup(TaskbarPopup::Volume, sw, sh);
+        CHECK(net.w && placedVolume.w && placedVolume.x + int(placedVolume.w) < net.x);
+        CHECK(placedVolume.popupShiftX);
+        const auto netPin = ChromeTrayFlyoutPinRect(WmChromeStyle(), {net.x, net.y, int(net.w), int(net.h)});
+        CHECK(WmTrayFlyoutPress(netPin.x, netPin.y, sw, sh));
+        CHECK(g_taskbarPopupPin.Is(TaskbarPopup::Network) && g_taskbarPopupPin.Is(TaskbarPopup::Volume));
+        CHECK(!WmTaskbarPopupDismissible());
+        constexpr uint32_t narrow = 800;
+        const auto narrowClock = GetTaskbarLayout(narrow, sh).clock;
+        CHECK(WmTrayFlyoutPress(narrowClock.x, narrowClock.y, narrow, sh) && WmTaskbarPopupDismissible());
+        const auto calendar = WmPlacedTaskbarPopup(TaskbarPopup::Calendar, narrow, sh);
+        CHECK(calendar.w && WmPlacedTaskbarPopup(TaskbarPopup::Network, narrow, sh).w);
+        CHECK(!WmPlacedTaskbarPopup(TaskbarPopup::Volume, narrow, sh).w); // overflow keeps the pin
+        CHECK(g_taskbarPopupPin.Is(TaskbarPopup::Volume));
         WmTaskbarPopupDismiss();
+        CHECK(WmPlacedTaskbarPopup(TaskbarPopup::Volume, sw, sh).w);
+        const auto activeNet = WmPlacedTaskbarPopup(TaskbarPopup::Network, sw, sh);
+        const auto activeNetPin = ChromeTrayFlyoutPinRect(WmChromeStyle(),
+            {activeNet.x, activeNet.y, int(activeNet.w), int(activeNet.h)});
+        CHECK(WmTrayFlyoutPress(activeNetPin.x, activeNetPin.y, sw, sh));
+        WmTaskbarPopupDismiss();
+        CHECK(!WmTrayFlyoutVisible() && g_taskbarPopupPin.Is(TaskbarPopup::Volume));
         CHECK(WmVolumePopupVisible());
         g_launcherLoaded = true;
         WmLauncherToggle();
@@ -762,7 +784,7 @@ int main() {
         for (const auto anchor : {tray, GetTaskbarLayout(sw, sh).metrics[6]}) {
             if (anchor.w == 0) continue; // the synthetic host has no thermal sensor
             CHECK(WmTrayFlyoutPress(anchor.x, anchor.y, sw, sh));
-            const auto panel = WmTrayFlyoutLayout(sw, sh);
+            const auto panel = WmTrayFlyoutLayout(sw, sh, g_trayFlyout);
             const auto pin = ChromeTrayFlyoutPinRect(WmChromeStyle(), panel);
             CHECK(WmTrayFlyoutPress(pin.x, pin.y, sw, sh));
             CHECK(WmTaskbarPopupPinned() && !WmTrayFlyoutPress(10, 10, sw, sh));
@@ -939,7 +961,7 @@ int main() {
         CHECK(!WmTrayFlyoutPress(cal.pin.x, cal.pin.y, sw, sh) && WmTaskbarPopupPinned());
         WmLauncherToggle();
         g_launcherLoaded = false;
-        CHECK(!WmLauncherVisible() && kinds(s) >= 2 && s[1].kind == WmShellSurfaceKind::TrayFlyout);
+        CHECK(!WmLauncherVisible() && kinds(s) >= 2 && s[1].kind == WmShellSurfaceKind::CalendarFlyout);
         const auto tiny = WmCalendarPopupLayout(sw, 144, fixtureClock.date);
         CHECK(tiny.pin.w > 0 && !tiny.grid.w);
         CHECK(WmTrayFlyoutPress(tiny.pin.x, tiny.pin.y, sw, 144) && !WmTaskbarPopupPinned());
