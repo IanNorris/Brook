@@ -23,6 +23,7 @@ from test_recovery_menu_boot import boot
 from test_recovery_data_dispatch import metadata_hash,outside_esp_hash
 from test_panic_fat_qemu import verify_record
 from test_ext2_idle_flush_sata_qemu import DIRS,FILES
+from test_guard_slot_fallback_qemu import run_matrix
 
 
 def check_pair(path,identity,automatic):
@@ -53,6 +54,7 @@ def main():
     parser.add_argument('--identity',required=True)
     parser.add_argument('--inject-panic',action='store_true',help='Interrupt the first repair attempt after pending state using GDB')
     parser.add_argument('--auto-desktop',action='store_true',help='Use an automatic guard kernel with checked desktop handoff')
+    parser.add_argument('--auto-desktop-slot-fallback',action='store_true',help='Test automatic A/B fallback and profile rejection on disposable copies')
     parser.add_argument('--auto-desktop-panic',action='store_true',help='Inject a panic after the guarded desktop is mounted')
     parser.add_argument('--auto-desktop-reset',action='store_true',help='Require a QEMU-only timed reset after the desktop panic')
     parser.add_argument('--auto-desktop-production-reset',action='store_true',help='Use guarded desktop reset without the QEMU-only test selector')
@@ -91,6 +93,12 @@ def main():
     parser.add_argument('--proc-dump-qa',type=Path,help='Run the live core fixture with this matching virtio NIC module')
     parser.add_argument('--proc-autodump-qa',action='store_true',help='Also verify automatic fatal-signal core capture')
     a=parser.parse_args()
+    if a.auto_desktop_slot_fallback:
+        other_modes = set(vars(a)) - {'image', 'efi', 'firmware', 'desktop_pair', 'recovery_pair', 'output',
+                                      'identity', 'auto_desktop', 'auto_desktop_slot_fallback', 'managed_profile',
+                                      'auto_desktop_network_module'}
+        if not a.auto_desktop or not a.auto_desktop_network_module or any(vars(a)[mode] for mode in other_modes):
+            parser.error('slot fallback requires --auto-desktop and --auto-desktop-network-module, with optional --managed-profile')
     if a.proc_autodump_qa and not a.proc_dump_qa:
         parser.error('automatic core QA requires the live core fixture')
     if a.proc_dump_qa and not a.auto_desktop_dell_initrd:
@@ -175,24 +183,28 @@ def main():
     with tempfile.TemporaryDirectory(prefix='brk-auto-handoff-') as tmp:
         work=Path(tmp);disk=work/'disk.raw';shutil.copyfile(a.image,disk);media=str(disk)+'@@1048576'
         normal=work/'normal.img';recovery=work/'recovery.img'
-        compact(a.desktop_pair/'INITRD.IMG',normal,work/'normal-tree',16*1024*1024 if a.auto_desktop_dell_initrd else 8*1024*1024)
+        compact(a.desktop_pair/'INITRD.IMG',normal,work/'normal-tree',16*1024*1024 if a.auto_desktop_dell_initrd or a.auto_desktop_slot_fallback else 8*1024*1024)
         compact(a.recovery_pair/'INITRD.IMG',recovery,work/'recovery-tree')
-        if a.auto_desktop_dell_initrd:
-            # Keep the Dell startup script, but bind the private image to the
-            # QEMU disk identity used by the recovery fixture.
+        if a.auto_desktop_dell_initrd or a.auto_desktop_slot_fallback:
+            # Bind the candidate boot image to the disposable SATA fixture.
             for name in ('ahci-write-target','ahci-boot-volume','ahci-data-volume'):
                 data=subprocess.check_output(['mtype','-i',str(recovery),'::/ETC/'+name])
                 subprocess.run(['mcopy','-o','-i',str(normal),'-','::/ETC/'+name],input=data,check=True)
+        if a.auto_desktop_dell_initrd:
             startup=subprocess.check_output(['mtype','-i',str(normal),'::/BOOT/INIT.RC'])
             if startup!=subprocess.check_output(['mtype','-i',str(a.desktop_pair/'INITRD.IMG'),'::/BOOT/INIT.RC']):
                 raise RuntimeError('Dell startup script changed during compaction')
             (a.output/'dell-startup-script.sha256').write_text(hashlib.sha256(startup).hexdigest()+'\n')
-            if dell_shutdown and not a.auto_desktop_dell_async_network:
-                # Dell's opt-in asynchronous TCP stack is tailored to its USB
-                # NIC; the synthetic virtio NIC uses the ordinary TCP path.
-                for name in ('arp-async-probe','tcp-async-neighbor','tcp-try-transmit','tcp-async-send',
-                             'tcp-producer-wake','tcp-async-retry-1ms','tcp-worker-waiter','tcp-adaptive-flight16'):
-                    subprocess.run(['mdel','-i',str(normal),'::/ETC/'+name],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        if a.auto_desktop_slot_fallback or (dell_shutdown and not a.auto_desktop_dell_async_network):
+            # Dell's opt-in asynchronous TCP stack is tailored to its USB
+            # NIC; the synthetic virtio NIC uses the ordinary TCP path.
+            for name in ('arp-async-probe','tcp-async-neighbor','tcp-try-transmit','tcp-async-send',
+                         'tcp-producer-wake','tcp-async-retry-1ms','tcp-worker-waiter','tcp-adaptive-flight16'):
+                subprocess.run(['mdel','-i',str(normal),'::/ETC/'+name],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        if a.auto_desktop_slot_fallback:
+            # The localhost power fixture does not need deployment credentials or maintenance permissions.
+            for name in ('hardware-update-key', 'hardware-maintenance', 'hardware-bulk'):
+                subprocess.run(['mdel','-i',str(normal),'::/ETC/'+name],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         if a.auto_desktop:
             for directory in ('MEDIA','MEDIA/SYSTEM','DATA','NIX'):
                 if subprocess.run(['mdir','-i',str(normal),'::/'+directory],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode:
@@ -246,9 +258,16 @@ def main():
                 subprocess.run(['mmd','-i',str(normal),'::/DRIVERS'],check=True)
             subprocess.run(['mcopy','-o','-i',str(normal),str(a.normal_network_module or a.auto_desktop_network_module or a.auto_desktop_dell_shutdown_module or a.proc_dump_qa),'::/DRIVERS/virtio_net.mod'],check=True)
         selection=work/'select.bin';selection.write_bytes(record(1,0,(a.recovery_pair/'KERNEL.ELF').read_bytes(),recovery.read_bytes()))
-        for src,target in ((a.efi,'::/EFI/BOOT/BOOTX64.EFI'),(a.normal_kernel or a.desktop_pair/'KERNEL.ELF','::/KERNEL/BROOK.ELF'),
-                           (normal,'::/INITRD.IMG'),(a.recovery_pair/'KERNEL.ELF','::/RECOVERY/KERNEL.ELF'),
-                           (recovery,'::/RECOVERY/INITRD.IMG'),(selection,'::/RECOVERY/SELECT.BIN')):
+        boot_payloads = ((a.efi,'::/EFI/BOOT/BOOTX64.EFI'),(a.recovery_pair/'KERNEL.ELF','::/RECOVERY/KERNEL.ELF'),
+                         (recovery,'::/RECOVERY/INITRD.IMG'),(selection,'::/RECOVERY/SELECT.BIN'))
+        if a.auto_desktop_slot_fallback:
+            # Leave no alternate normal pair outside A/B, even if selection fails.
+            for path in ('::/KERNEL/BROOK.ELF', '::/INITRD.IMG'):
+                subprocess.run(['mdel','-i',media,path],check=True)
+        else:
+            boot_payloads += ((a.normal_kernel or a.desktop_pair/'KERNEL.ELF','::/KERNEL/BROOK.ELF'),
+                              (normal,'::/INITRD.IMG'))
+        for src,target in boot_payloads:
             subprocess.run(['mcopy','-o','-i',media,str(src),target],check=True)
         partition=work/'data.img'
         with disk.open('rb') as f:f.seek(133120*512+1024+104);fs_uuid=uuid.UUID(bytes=f.read(16))
@@ -399,6 +418,9 @@ def main():
             f.seek(1024+58)
             if f.read(2)!=b'\x01\x00':raise RuntimeError('repair did not clean ext2')
         subprocess.run(['e2fsck','-f','-n',str(partition)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        if a.auto_desktop_slot_fallback:
+            run_matrix(a, disk, normal, work, guards, metadata, journal_after)
+            return
         if a.torn_journal_before_desktop:
             journal_bytes[:16]=b'BRKPAN01'+struct.pack('<II',1,123)
             journal.write_bytes(journal_bytes)
