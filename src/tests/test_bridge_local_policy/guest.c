@@ -71,12 +71,11 @@ static void ready(int fd, short event, int64_t deadline)
     }
 }
 
-static void request(uint32_t ip, const char *command, const char *response_field)
+static int connect_debug(uint32_t ip, int64_t deadline)
 {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     CHECK(fd >= 0 && fcntl(fd, F_SETFL, O_NONBLOCK) == 0);
     struct sockaddr_in destination = address(ip, DEBUG_PORT);
-    int64_t deadline = milliseconds() + REQUEST_TIMEOUT_MS;
     int connected = connect(fd, (struct sockaddr *)&destination, sizeof(destination));
     if (connected != 0) {
         CHECK(errno == EINPROGRESS);
@@ -86,7 +85,13 @@ static void request(uint32_t ip, const char *command, const char *response_field
         CHECK(getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &bytes) == 0);
         CHECK(error == 0);
     }
+    return fd;
+}
 
+static void request(uint32_t ip, const char *command, const char *response_field)
+{
+    int64_t deadline = milliseconds() + REQUEST_TIMEOUT_MS;
+    int fd = connect_debug(ip, deadline);
     char message[96];
     int length = snprintf(message, sizeof(message), "@1 %s\n", command);
     CHECK(length > 0 && (size_t)length < sizeof(message));
@@ -126,52 +131,95 @@ static void check_local_bridge(uint32_t ip)
     request(ip, "bridge stats", "{\"bridge_error\":\"local connections are read-only\"}");
 }
 
+static void check_idle_local_deadline(void)
+{
+    int64_t deadline = milliseconds() + 8000;
+    int fd = connect_debug(htonl(INADDR_LOOPBACK), deadline);
+    static const char banner[] = "=== Brook OS Debug Console ===\r\n";
+    char received[sizeof(banner)];
+    size_t used = 0;
+    for (;;) {
+        ready(fd, POLLIN, deadline);
+        ssize_t count = recv(fd, received + used, sizeof(received) - used, 0);
+        if (count < 0 && (errno == EAGAIN || errno == EINTR)) continue;
+        if (count == 0 || (count < 0 && errno == ECONNRESET)) break;
+        CHECK(count > 0);
+        used += (size_t)count;
+        CHECK(used < sizeof(received));
+    }
+    CHECK(used == sizeof(banner) - 1 && !memcmp(received, banner, used));
+    CHECK(close(fd) == 0);
+}
+
 static int bind_socket(int fd, uint32_t ip, unsigned port)
 {
     struct sockaddr_in local = address(ip, port);
     return bind(fd, (struct sockaddr *)&local, sizeof(local));
 }
 
-static void check_reserved_denials(uint32_t local)
+static void check_bind_addresses(uint32_t local)
 {
+    // RFC 5737 documentation address, outside this guest's interfaces.
+    const uint32_t nonlocal = htonl(0xc0000201u);
     const int types[] = {SOCK_STREAM, SOCK_DGRAM};
-    const uint32_t addresses[] = {htonl(INADDR_ANY), htonl(INADDR_LOOPBACK), local};
     for (size_t index = 0; index < sizeof(types) / sizeof(types[0]); ++index) {
-        for (unsigned port = DEBUG_PORT; port <= LAST_RESERVED_PORT; ++port) {
-            for (size_t which = 0; which < sizeof(addresses) / sizeof(addresses[0]); ++which) {
-                int fd = socket(AF_INET, types[index], 0);
-                CHECK(fd >= 0);
-                CHECK(bind_socket(fd, addresses[which], port) == -1 && errno == EACCES);
-                CHECK(close(fd) == 0);
-            }
-        }
-        int control = socket(AF_INET, types[index], 0);
-        CHECK(control >= 0 && bind_socket(control, htonl(INADDR_LOOPBACK), 0) == 0);
-        CHECK(close(control) == 0);
+        int fd = socket(AF_INET, types[index], 0);
+        CHECK(fd >= 0 && bind_socket(fd, nonlocal, 0) == -1 && errno == EADDRNOTAVAIL);
+        CHECK(bind_socket(fd, local, 0) == 0);
+        CHECK(close(fd) == 0);
     }
 }
 
-static void check_root_bind(void)
+static void check_reserved_tcp_denials(uint32_t local)
 {
-    const int types[] = {SOCK_STREAM, SOCK_DGRAM};
-    for (size_t index = 0; index < sizeof(types) / sizeof(types[0]); ++index) {
-        for (unsigned port = DEBUG_PORT; port <= LAST_RESERVED_PORT; ++port) {
-            int fd = socket(AF_INET, types[index], 0);
+    const uint32_t addresses[] = {htonl(INADDR_ANY), htonl(INADDR_LOOPBACK), local};
+    for (unsigned port = DEBUG_PORT; port <= LAST_RESERVED_PORT; ++port) {
+        for (size_t which = 0; which < sizeof(addresses) / sizeof(addresses[0]); ++which) {
+            int fd = socket(AF_INET, SOCK_STREAM, 0);
             CHECK(fd >= 0);
-            if (types[index] == SOCK_STREAM && port == DEBUG_PORT) {
-                // The kernel listener is active, and is subject to the same exclusivity.
-                CHECK(bind_socket(fd, htonl(INADDR_ANY), port) == -1 && errno == EADDRINUSE);
-            } else {
-                CHECK(bind_socket(fd, htonl(INADDR_ANY), port) == 0);
-                if (types[index] == SOCK_STREAM) CHECK(listen(fd, 1) == 0);
-                int conflict = socket(AF_INET, types[index], 0);
-                CHECK(conflict >= 0);
-                CHECK(bind_socket(conflict, htonl(INADDR_LOOPBACK), port) == -1 && errno == EADDRINUSE);
-                CHECK(close(conflict) == 0);
-            }
+            CHECK(bind_socket(fd, addresses[which], port) == -1 && errno == EACCES);
             CHECK(close(fd) == 0);
         }
     }
+    int control = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(control >= 0 && bind_socket(control, htonl(INADDR_LOOPBACK), 0) == 0);
+    CHECK(close(control) == 0);
+}
+
+static void check_free_ports(int type, uint32_t scope_address, unsigned first)
+{
+    for (unsigned port = first; port <= LAST_RESERVED_PORT; ++port) {
+        int fd = socket(AF_INET, type, 0);
+        CHECK(fd >= 0 && bind_socket(fd, scope_address, port) == 0);
+        if (type == SOCK_STREAM) CHECK(listen(fd, 1) == 0);
+        int conflict = socket(AF_INET, type, 0);
+        CHECK(conflict >= 0);
+        CHECK(bind_socket(conflict, htonl(INADDR_LOOPBACK), port) == -1 && errno == EADDRINUSE);
+        CHECK(close(conflict) == 0 && close(fd) == 0);
+    }
+}
+
+static void check_initial_root(void)
+{
+    // The existing kernel TCP listener still owns its initial-namespace port.
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(fd >= 0);
+    CHECK(bind_socket(fd, htonl(INADDR_ANY), DEBUG_PORT) == -1 && errno == EADDRINUSE);
+    CHECK(close(fd) == 0);
+    check_free_ports(SOCK_STREAM, htonl(INADDR_ANY), DEBUG_PORT + 1);
+}
+
+static pid_t clone_private_root(unsigned long scope)
+{
+    pid_t child = syscall(SYS_clone, CLONE_NEWUSER | scope | SIGCHLD, 0UL, 0UL, 0UL, 0UL);
+    CHECK(child >= 0);
+    if (child == 0) {
+        int map = open("/proc/self/uid_map", O_WRONLY);
+        const char uid[] = "0 1000 1\n";
+        CHECK(map >= 0 && write(map, uid, sizeof(uid) - 1) == sizeof(uid) - 1 && close(map) == 0);
+        CHECK(geteuid() == 0);
+    }
+    return child;
 }
 
 static void wait_for_child(pid_t child)
@@ -194,26 +242,36 @@ int main(int argc, char **argv)
         fprintf(stderr, "BRIDGE_LOCAL_LOOPBACK_PASS\n");
         check_local_bridge(local);
         fprintf(stderr, "BRIDGE_LOCAL_INTERFACE_PASS\n");
-        check_reserved_denials(local);
-        fprintf(stderr, "BRIDGE_LOCAL_DESKTOP_BIND_DENIED\n");
+        check_idle_local_deadline();
+        fprintf(stderr, "BRIDGE_LOCAL_IDLE_DEADLINE_PASS\n");
+        check_bind_addresses(local);
+        fprintf(stderr, "BRIDGE_LOCAL_BIND_ADDRESS_POLICY_PASS\n");
+        check_reserved_tcp_denials(local);
+        check_free_ports(SOCK_DGRAM, htonl(INADDR_ANY), DEBUG_PORT);
+        fprintf(stderr, "BRIDGE_LOCAL_DESKTOP_BIND_POLICY_PASS\n");
 
-        pid_t namespaced = syscall(SYS_clone, CLONE_NEWUSER | CLONE_NEWNS | SIGCHLD,
-                                    0UL, 0UL, 0UL, 0UL);
-        CHECK(namespaced >= 0);
+        pid_t namespaced = clone_private_root(CLONE_NEWNS);
         if (!namespaced) {
-            int map = open("/proc/self/uid_map", O_WRONLY);
-            const char uid[] = "0 1000 1\n";
-            CHECK(map >= 0 && write(map, uid, sizeof(uid) - 1) == sizeof(uid) - 1 && close(map) == 0);
-            CHECK(geteuid() == 0);
-            check_reserved_denials(local);
-            fprintf(stderr, "BRIDGE_LOCAL_NAMESPACE_BIND_DENIED\n");
+            check_reserved_tcp_denials(local);
+            check_free_ports(SOCK_DGRAM, htonl(INADDR_ANY), DEBUG_PORT);
+            fprintf(stderr, "BRIDGE_LOCAL_USER_NAMESPACE_BIND_POLICY_PASS\n");
             _exit(0);
         }
         wait_for_child(namespaced);
+
+        pid_t private_net = clone_private_root(CLONE_NEWNET);
+        if (!private_net) {
+            CHECK(own_ipv4() == 0);
+            check_free_ports(SOCK_STREAM, htonl(INADDR_LOOPBACK), DEBUG_PORT);
+            check_free_ports(SOCK_DGRAM, htonl(INADDR_LOOPBACK), DEBUG_PORT);
+            fprintf(stderr, "BRIDGE_LOCAL_NET_NAMESPACE_BIND_POLICY_PASS\n");
+            _exit(0);
+        }
+        wait_for_child(private_net);
         _exit(0);
     }
     wait_for_child(child);
-    check_root_bind();
+    check_initial_root();
     fprintf(stderr, "BRIDGE_LOCAL_ROOT_BIND_PASS\nBRIDGE_LOCAL_POLICY_PASS\n");
     return 0;
 }
