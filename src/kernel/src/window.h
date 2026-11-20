@@ -698,12 +698,13 @@ struct LauncherItem {
     uint32_t iconColor;    // Icon background color (0 = auto from title)
     uint32_t* iconPixels;  // Raw ARGB icon data (24x24), or nullptr for generic application icon
     bool valid;
-    bool isDesktopEntry;   // true if sourced from .desktop file (exec directly)
+    bool isDesktopEntry;   // launch a program instead of a shortcut script
+    bool isUserDesktopEntry;
 };
 
 struct WmDebugApp {
     char id[33],title[48],desktopAppId[128],executable[64];
-    bool desktop,eligible;
+    bool desktop,userDesktop,eligible;
 };
 uint32_t WmSnapshotDebugApps(WmDebugApp* out,uint32_t capacity,
                              uint32_t* generation,uint64_t* builtTick);
@@ -729,6 +730,15 @@ struct LauncherPersistenceStatus {
 };
 
 void WmLauncherPersistenceStatus(LauncherPersistenceStatus& out);
+
+struct LauncherUserManifestStatus {
+    LauncherPersistenceResult load;
+    uint32_t entries = 0;
+    uint32_t rejected = 0;
+};
+LauncherUserManifestStatus WmLauncherUserManifestStatus();
+void WmRequestUserLauncherRefresh();
+
 // Notification is nonblocking; a worker rebuilds and the compositor publishes.
 void WmRequestLauncherRefresh();
 // Compositor-only: apply after input, before geometry/render for this frame.

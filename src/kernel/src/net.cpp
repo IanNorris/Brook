@@ -87,6 +87,7 @@ inline void* operator new(__SIZE_TYPE__,void* storage) noexcept { return storage
 #include "loopback_queue.h"
 #include "ksym_addrs.h"
 #include "window.h"
+#include "launcher_user_manifest.h"
 #include "desktop_telemetry.h"
 #include "storage_io_stats.h"
 #include "smp.h"
@@ -5298,7 +5299,13 @@ static void DebugLauncherStatus()
         if (i) r.text(",");
         r.quoted(state.pins[i]);
     }
-    r.text("]}\n");
+    const auto user = WmLauncherUserManifestStatus();
+    r.text("],\"user_manifest\":{\"path\":"); r.quoted(UserLauncherManifestPath);
+    r.text(",\"last_load\":{\"stage\":"); r.quoted(user.load.stage); r.text(",");
+    r.field("errno", -user.load.error);
+    r.text("},"); r.field("entries", user.entries);
+    r.text(","); r.field("rejected", user.rejected);
+    r.text("}}\n");
     r.send();
 }
 

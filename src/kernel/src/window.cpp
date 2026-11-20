@@ -27,6 +27,7 @@
 #include "kvmclock.h"
 #include "shutdown.h"
 #include "launcher_command.h"
+#include "launcher_user_manifest.h"
 #include "launch_feedback.h"
 #include "launcher_power.h"
 #include "shell.h"
@@ -664,6 +665,8 @@ static SpinLock g_launcherLock;
 // Zero means exhausted; it is never reused for a later icon catalog.
 static uint64_t g_launcherSnapshotEpoch=1;
 static uint32_t g_launcherRequested = 1;
+static UserLauncherReload g_userLauncherReload;
+static LauncherUserManifestStatus g_userLauncherManifest;
 static bool g_launcherWorkerStarted = false;
 static bool g_launcherWorkerRunning = false;
 static bool g_launcherLoaded = false;
@@ -683,7 +686,7 @@ static void LauncherPowerRun(LauncherPowerCommand command);
 // Requests own all metadata/icon pixels, never launcher snapshot pointers.
 struct LauncherRequest {
     char command[128];
-    bool desktop, hasIcon;
+    bool desktop, userDesktop, hasIcon;
     uint32_t icon[LAUNCHER_ICON_PX * LAUNCHER_ICON_PX];
 };
 static SpinLock g_launchLock;
@@ -787,7 +790,9 @@ uint32_t WmSnapshotDebugApps(WmDebugApp* out,uint32_t capacity,
         memcpy(app.id,item.catalogId,sizeof(app.id));memcpy(app.title,item.title,sizeof(app.title));
         memcpy(app.desktopAppId,item.appId,sizeof(app.desktopAppId));
         memcpy(app.executable,item.executable,sizeof(app.executable));
-        app.desktop=item.isDesktopEntry;app.eligible=item.valid;
+        app.desktop = item.isDesktopEntry;
+        app.userDesktop = item.isUserDesktopEntry;
+        app.eligible = item.valid;
     }
     return count;
 }
@@ -795,6 +800,19 @@ uint32_t WmSnapshotDebugApps(WmDebugApp* out,uint32_t capacity,
 void WmRequestLauncherRefresh()
 {
     __atomic_fetch_add(&g_launcherRequested, 1u, __ATOMIC_RELEASE);
+}
+
+void WmRequestUserLauncherRefresh()
+{
+    g_userLauncherReload.Request();
+}
+
+LauncherUserManifestStatus WmLauncherUserManifestStatus()
+{
+    SpinLockAcquire(&g_launcherLock);
+    const auto status = g_userLauncherManifest;
+    SpinLockRelease(&g_launcherLock);
+    return status;
 }
 
 bool WmLauncherApplyPending()
@@ -905,7 +923,7 @@ static const uint32_t* WindowIcon(const Window& w, const LauncherSnapshot& launc
     for (uint32_t i = 0; i < launcher.count; ++i)
     {
         const LauncherItem& item = launcher.items[i];
-        if (!item.valid || !item.iconPixels || !item.executable[0]) continue;
+        if (!item.valid || item.isUserDesktopEntry || !item.iconPixels || !item.executable[0]) continue;
         if ((w.appId[0] && WmEqualI(w.appId, item.executable)) ||
             (executable[0] && WmEqualI(executable, item.executable))) return item.iconPixels;
     }
@@ -915,8 +933,8 @@ static const uint32_t* WindowIcon(const Window& w, const LauncherSnapshot& launc
     {
         if (w.proc && TerminalFindByProcess(w.proc)) return launcher.terminalIcon ? launcher.terminalIcon : launcher.applicationIcon;
         for (uint32_t i = 0; i < launcher.count; ++i)
-            if (launcher.items[i].valid && launcher.items[i].iconPixels &&
-                WmTitleHasAppName(w.title, launcher.items[i].title)) return launcher.items[i].iconPixels;
+            if (launcher.items[i].valid && !launcher.items[i].isUserDesktopEntry &&
+                launcher.items[i].iconPixels && WmTitleHasAppName(w.title, launcher.items[i].title)) return launcher.items[i].iconPixels;
     }
     return launcher.applicationIcon;
 }
@@ -2158,6 +2176,19 @@ static bool LauncherExecutable(const char* command, char* executable, uint32_t c
     return false;
 }
 
+// User items carry a validated absolute profile pathname. Recheck the
+// executable before dispatch because the profile can change after publication.
+static bool LauncherUserExecutable(const char* command, char (&executable)[64])
+{
+    if (!LauncherExecutable(command, executable, sizeof(executable))) return false;
+    char path[sizeof(UserLauncherProfileBin) + sizeof(executable)];
+    constexpr uint32_t prefixLength = sizeof(UserLauncherProfileBin) - 1;
+    WmStrCopy(path, UserLauncherProfileBin, sizeof(path));
+    WmStrCopy(path + prefixLength, executable, sizeof(path) - prefixLength);
+    VnodeStat st{};
+    return !VfsStatPath(path, &st) && (st.mode & 0170000) == 0100000 && (st.mode & 0111);
+}
+
 static bool ShortcutRequirementsMet(const char* path)
 {
     Vnode* vn = VfsOpen(path, 0);
@@ -2287,28 +2318,46 @@ static void FreeLauncherSnapshot(LauncherSnapshot* snapshot)
     kfree(snapshot);
 }
 
+static bool IdentifyLauncherItem(const LauncherSnapshot& catalog, uint32_t index, LauncherItem& item)
+{
+    LauncherIdentity identity;
+    identity.field(item.isUserDesktopEntry ? "user-desktop" : item.isDesktopEntry ? "desktop" : "shortcut");
+    // New manifests carry the exact desktop-file basename. For legacy
+    // manifests without it, use the command and label as an explicit fallback.
+    if (item.isDesktopEntry && item.appId[0]) identity.field(item.appId);
+    else {
+        identity.field(item.scriptPath);
+        if (item.isDesktopEntry) identity.field(item.title);
+    }
+    identity.finish(item.catalogId);
+    for (uint32_t i = 0; i < index; ++i)
+        if (!strcmp(item.catalogId, catalog.items[i].catalogId)) return false;
+
+    const char* hex = "0123456789abcdef";
+    char generation[9];
+    for (unsigned i = 0; i < 8; ++i) generation[i] = hex[(catalog.generation >> ((7-i)*4)) & 15];
+    generation[8] = 0;
+    LauncherIdentity spec;
+    spec.field(item.catalogId);
+    spec.field(item.scriptPath);
+    spec.field(item.isUserDesktopEntry ? "user-desktop" : item.isDesktopEntry ? "desktop" : "shortcut");
+    spec.field(generation);
+    spec.finish(item.specification);
+    return true;
+}
+
 static bool IdentifyLauncherItems(LauncherSnapshot& catalog)
 {
-    const char* hex="0123456789abcdef";char generation[9];
-    for(unsigned i=0;i<8;++i)generation[i]=hex[(catalog.generation>>((7-i)*4))&15];
-    generation[8]=0;
-    for(uint32_t i=0;i<catalog.count;++i) {
-        auto& item=catalog.items[i];LauncherIdentity identity;
-        identity.field(item.isDesktopEntry?"desktop":"shortcut");
-        // New manifests carry the exact desktop-file basename. For legacy
-        // manifests without it, use the command and label as an explicit fallback.
-        if(item.isDesktopEntry&&item.appId[0])identity.field(item.appId);
-        else {identity.field(item.scriptPath);if(item.isDesktopEntry)identity.field(item.title);}
-        identity.finish(item.catalogId);
-        for(uint32_t j=0;j<i;++j)if(!strcmp(item.catalogId,catalog.items[j].catalogId)) {
-            SerialPuts("WM: duplicate/colliding launcher identity; retaining previous catalog\n");return false;
+    for (uint32_t i = 0; i < catalog.count; ++i) {
+        if (!IdentifyLauncherItem(catalog, i, catalog.items[i])) {
+            SerialPuts("WM: duplicate/colliding launcher identity; retaining previous catalog\n");
+            return false;
         }
-        LauncherIdentity spec;spec.field(item.catalogId);spec.field(item.scriptPath);
-        spec.field(item.isDesktopEntry?"desktop":"shortcut");spec.field(generation);
-        spec.finish(item.specification);
     }
     return true;
 }
+
+#include "wm_launcher_user_manifest.inc"
 
 static LauncherSnapshot* BuildLauncherSnapshot(uint32_t generation)
 {
@@ -2360,6 +2409,7 @@ static LauncherSnapshot* BuildLauncherSnapshot(uint32_t generation)
         FreeLauncherSnapshot(snapshot);
         return nullptr;
     }
+    LauncherLoadUserManifest(*snapshot);
     snapshot->builtTick=ApicTickCount();
     return snapshot;
 }
@@ -2381,6 +2431,7 @@ static void LauncherWorker(void*)
         const bool occupied = g_launcherPending || g_launcherRetired;
         SpinLockRelease(&g_launcherLock);
         FreeLauncherSnapshot(disposable);
+        if (!occupied && g_userLauncherReload.Take(ApicTickCount())) WmRequestLauncherRefresh();
         const uint32_t requested = __atomic_load_n(&g_launcherRequested, __ATOMIC_ACQUIRE);
         if (!occupied && requested != attempted)
         {
@@ -2395,7 +2446,7 @@ static void LauncherWorker(void*)
             }
         }
         char command[128];
-        bool desktop = false;
+        bool desktop = false, userDesktop = false;
         uint64_t token = 0;
         SpinLockAcquire(&g_launchLock);
         int launch = g_launchInhibited?-1:g_launches.Take(ApicTickCount());
@@ -2404,6 +2455,7 @@ static void LauncherWorker(void*)
             g_launchHistory.Start(token,ApicTickCount());
             WmStrCopy(command, g_launchRequests[launch].command, sizeof(command));
             desktop = g_launchRequests[launch].desktop;
+            userDesktop = g_launchRequests[launch].userDesktop;
         }
         SpinLockRelease(&g_launchLock);
         if (token) {
@@ -2412,7 +2464,8 @@ static void LauncherWorker(void*)
             self->launchId = token;
             int result;
             char executable[64];
-            const bool available=desktop?LauncherExecutable(command,executable,sizeof(executable)):ShortcutRequirementsMet(command);
+            const bool available = userDesktop ? LauncherUserExecutable(command, executable) :
+                desktop ? LauncherExecutable(command, executable, sizeof(executable)) : ShortcutRequirementsMet(command);
             if(!available)result=-2;
             else if (desktop) {
                 char script[512];
@@ -2548,7 +2601,9 @@ static int AdmitLauncherItem(const LauncherSnapshot& catalog,int itemIdx,bool tr
         if(created) {
             auto& request=g_launchRequests[slot];
             WmStrCopy(request.command,item.scriptPath,sizeof(request.command));
-            request.desktop=item.isDesktopEntry;request.hasIcon=item.iconPixels!=nullptr;
+            request.desktop = item.isDesktopEntry;
+            request.userDesktop = item.isUserDesktopEntry;
+            request.hasIcon = item.iconPixels != nullptr;
             if(request.hasIcon)memcpy(request.icon,item.iconPixels,sizeof(request.icon));
         }
         if(tracked)g_launchHistory.Track(entry,created);

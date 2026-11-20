@@ -278,7 +278,8 @@ bool DebugUiHandleCommand(const char* command) {
             json.text("{\"app_id\":");json.string(app.id);json.text(",\"title\":");json.string(app.title);
             json.text(",\"desktop_app_id\":");json.string(app.desktopAppId);
             json.text(",\"executable\":");json.string(app.executable);
-            json.text(",\"source\":");json.string(app.desktop?"installed_desktop_entry":"validated_shortcut");
+            json.text(",\"source\":");json.string(app.userDesktop ? "user_desktop_entry" :
+                app.desktop ? "installed_desktop_entry" : "validated_shortcut");
             json.boolean("launch_eligible",app.eligible);
             json.text(",\"availability\":");json.string(app.desktop?"executable_validated_at_build":"requirements_validated_at_build");
             json.text("}");
