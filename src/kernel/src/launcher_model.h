@@ -32,7 +32,7 @@ struct LauncherLimits {
 // The eight category colours and the category icons (DESIGN.md "Token
 // sheet": the same in every theme).
 enum class LauncherColor : uint8_t { Blue, Teal, Green, Amber, Coral, Pink, Violet, Slate, Count };
-enum class LauncherCategoryIcon : uint8_t { Folder, Sliders, Globe, Play, Doc, Brush, Pad, Spark, Count };
+enum class LauncherCategoryIcon : uint8_t { Folder, Sliders, Globe, Play, Doc, Brush, Pad, Spark, Bolt, Temperature, Network, Volume, Count };
 
 struct LauncherApp {
     char key[LauncherLimits::KeyLength];    // stable ID: desktop app_id, or shortcut name
@@ -57,18 +57,19 @@ struct LauncherLine {
     uint16_t count;      // Heading: apps in it; Apps: apps on the line; Chips: chips
 };
 
+enum class LauncherEdit : uint8_t { None, MoveApps, MoveCategory, CategorySaved, CategoryDeleted, Name, Sorted, Pinned, Reset };
 enum class LauncherSection : uint8_t { List, Tiles, Rail };
 enum class LauncherTop : uint8_t { Pinned, Recent };
 // A rail view: All apps, a category, or Unsorted.
 static constexpr int LauncherViewAll = -1, LauncherViewUnsorted = -2;
 
 enum class LauncherKey : uint8_t {
-    Char, Backspace, Up, Down, Left, Right, Tab, BackTab, Enter, Escape, Menu, Home, End, PageUp, PageDown,
+    Char, Backspace, Up, Down, Left, Right, Tab, BackTab, Enter, Escape, Menu, Home, End, PageUp, PageDown, Rename, Delete,
 };
 static constexpr uint8_t LauncherModAlt = 1, LauncherModCtrl = 2, LauncherModShift = 4;
 
 // What a press or a key asks the owner to do. Redraw is implied by Changed.
-enum class LauncherCommand : uint8_t { None, Changed, Launch, Close, OpenSettings };
+enum class LauncherCommand : uint8_t { None, Changed, Launch, Close, OpenSettings, Undo };
 struct LauncherResult {
     LauncherCommand command = LauncherCommand::None;
     int app = -1;  // Launch: catalog index
@@ -78,9 +79,12 @@ struct LauncherResult {
 enum class LauncherTargetKind : uint8_t {
     None, Panel, Search, TopTab, Tile, Rail, Row, Chip, MenuItem, Menu,
     Settings, Restart, Shutdown, Confirm, Dismiss, CancelShutdown, Footer,
+    Organise, NewCategory, EditCategory, RenameApp, MoveSuggested, SortSuggested,
+    Editor, EditorSave, EditorCancel, EditorDelete, EditorColor, EditorIcon, Undo, ResetOrganisation, ClearSelection, CategorySection,
 };
 struct LauncherTarget {
     LauncherTargetKind kind;
+    bool operator==(const LauncherTarget& other) const { return kind == other.kind && index == other.index; }
     uint16_t index; // TopTab: LauncherTop; Tile: tile slot; Rail: rail row; Row: catalog index; Chip: category; MenuItem: item
 };
 
@@ -88,6 +92,7 @@ struct LauncherTarget {
 struct LauncherViewport {
     int heading, row, chips, empty, height;
     int step; // pixels a wheel tick scrolls
+    int railRows; // rows visible at once, excluding a drag-only drop target
 };
 
 inline constexpr char LauncherFilesAppId[] = "org.gnome.Nautilus";
@@ -109,6 +114,12 @@ public:
 
     // --- layout ------------------------------------------------------------
     void ResetLayout();                // the seven default categories, default pins
+    bool RestoreLayout(const char* text);
+    LauncherEdit LastEdit() const { return lastEdit_; }
+    const char* EditNotice() const { return editNotice_; }
+    uint32_t EditEpoch() const { return editEpoch_; }
+    void SetUndoVisible(bool visible) { undoVisible_ = visible; }
+    bool UndoVisible() const { return undoVisible_; }
     bool Parse(const char* text, bool* migrated = nullptr);      // [Launcher] section; false: defaults kept
     uint32_t Serialize(char* out, uint32_t capacity) const; // 0: did not fit
     uint32_t LayoutEpoch() const { return layoutEpoch_; }   // changes on every saved-state change
@@ -131,6 +142,41 @@ public:
     // last category.
     bool Step(uint32_t app, int direction);
 
+    // Organisation edits use catalog indices and retain the stable keys on disk.
+    bool Organising() const { return organising_; }
+    bool IsNew(uint32_t app) const { return newApp_[app]; }
+    bool DraggingApp() const { return dragging_ && dragApp_ >= 0; }
+    int DragApp() const { return dragApp_; }
+    bool Marked(uint32_t app) const { return marked_[app]; }
+    uint32_t MarkedCount() const;
+    bool MoveMarked(uint32_t source, int category, int anchor = -1, bool after = false);
+    bool MoveCategory(uint32_t category, uint32_t anchor, bool after);
+    int CreateCategory();
+    bool DeleteCategory(uint32_t category);
+    bool RenameCategory(uint32_t category, const char* name);
+    bool RenameApp(uint32_t app, const char* name);
+    const char* Name(uint32_t app) const;
+    int Suggestion(uint32_t app) const;
+    LauncherColor IconColor(uint32_t app) const;
+    bool SortSuggested();
+    int RailRowFor(int view) const;
+
+    bool EditorOpen() const { return editorIndex_ >= 0; }
+    bool EditingApp() const { return editingApp_; }
+    const char* EditName() const { return editName_; }
+    uint8_t EditColor() const { return editColor_; }
+    uint8_t EditIcon() const { return editIcon_; }
+
+    bool PointerHeld() const { return held_.kind != LauncherTargetKind::None; }
+    bool Dragging() const { return dragging_; }
+    LauncherTarget DragSource() const { return held_; }
+    LauncherTarget DropTarget() const { return drop_; }
+    bool DropAfter() const { return dropAfter_; }
+    bool BeginPointer(LauncherTarget target, int32_t x, int32_t y, bool after = false);
+    bool MovePointer(LauncherTarget target, int32_t x, int32_t y, int threshold, bool after, uint64_t now = 0);
+    LauncherResult ReleasePointer(LauncherTarget target, bool after);
+    void CancelPointer();
+
     // Tiles of the top row (installed apps only).
     uint32_t TopTiles(uint16_t* out, uint32_t capacity) const;
     LauncherTop Top() const { return top_; }
@@ -138,7 +184,7 @@ public:
 
     // --- open launcher -----------------------------------------------------
     void Open();                       // fresh session: empty query, All apps
-    void SetViewport(const LauncherViewport& v) { viewport_ = v; ClampScroll(); }
+    void SetViewport(const LauncherViewport& v);
     const char* Query() const { return query_; }
     int View() const { return view_; }
     LauncherSection Section() const { return section_; }
@@ -148,8 +194,10 @@ public:
     bool KeyboardActive() const { return keyboard_; } // draw the keyboard selection
     uint32_t Scroll() const { return scroll_; } // pixels from the top of the list
     // Rail rows: All apps, each category, then Unsorted while it has apps.
-    uint32_t RailRows() const { return 1 + categoryCount_ + (UnsortedCount() || view_ == LauncherViewUnsorted ? 1 : 0); }
-    int RailView(uint32_t row) const { return row == 0 ? LauncherViewAll : row <= categoryCount_ ? int(row - 1) : LauncherViewUnsorted; }
+    uint32_t RailRows() const;
+    int RailView(uint32_t row) const;
+    uint32_t RailScroll() const { return railScroll_; }
+    bool ScrollRail(int rows);
 
     // The app list for the current query and view.
     uint32_t Lines(LauncherLine* out, uint32_t capacity) const;
@@ -194,6 +242,7 @@ private:
     void Recompute();
     void Changed() { ++layoutEpoch_; }
     void ClampScroll();
+    void EnsureRailVisible();
     void EnsureVisible();
     uint32_t ItemOrder(uint16_t* out, uint32_t capacity) const;
     int SelectedLine() const;
@@ -202,6 +251,16 @@ private:
     void RemoveMember(uint16_t key);
     bool AddCategory(const char* id, const char* name, uint8_t color, uint8_t icon);
     void FileDefault(uint32_t app);
+    bool RailShows(uint32_t category) const;
+    void ToggleMarked(uint32_t app);
+    void SetOrganising(bool enabled);
+    void BeginEditor(uint32_t index, bool app);
+    LauncherResult EditorPress(const LauncherTarget& target);
+    int TargetApp(LauncherTarget target) const;
+    bool MovePin(uint32_t app, int anchor, bool after);
+    void ResetOrganisation();
+    void Edited(LauncherEdit edit) { lastEdit_ = edit; editNotice_[0] = 0; ++editEpoch_; Changed(); }
+    void NoticeMove(const char* name, int category);
 
     LauncherApp apps_[LauncherLimits::Apps];
     uint16_t appKey_[LauncherLimits::Apps];
@@ -209,6 +268,7 @@ private:
     uint32_t appCount_;
 
     char keys_[LauncherLimits::Keys][LauncherLimits::KeyLength];
+    char aliases_[LauncherLimits::Keys][LauncherLimits::NameLength];
     uint32_t keyCount_;
     Category categories_[LauncherLimits::Categories];
     uint32_t categoryCount_;
@@ -218,17 +278,31 @@ private:
     uint32_t recentCount_;
     LauncherTop top_;
     bool layoutLoaded_; // a layout exists (parsed, or filed since first run)
-    uint32_t layoutEpoch_;
+    uint32_t layoutEpoch_, editEpoch_;
+    LauncherEdit lastEdit_;
+    char editNotice_[96];
+    bool undoVisible_;
+    bool newApp_[LauncherLimits::Apps];
 
     char query_[LauncherLimits::Query];
     int view_;
     LauncherSection section_;
     int selected_, tile_, rail_;
     bool keyboard_;
-    uint32_t scroll_;
+    uint32_t scroll_, railScroll_;
     int menuApp_, menuItem_;
     int32_t menuX_, menuY_;
     LauncherViewport viewport_;
+    bool organising_, marked_[LauncherLimits::Apps];
+    bool editingApp_, editReplace_;
+    int editorIndex_;
+    char editName_[LauncherLimits::NameLength];
+    uint8_t editColor_, editIcon_;
+    LauncherTarget held_, drop_;
+    int32_t pressX_, pressY_;
+    int dragApp_, dragCategory_;
+    bool dragging_, dropAfter_;
+    uint64_t dropSince_;
 };
 
 static_assert(__is_trivially_copyable(LauncherModel) && __is_trivially_constructible(LauncherModel),

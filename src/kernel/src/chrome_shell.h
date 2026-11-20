@@ -9,6 +9,8 @@
 #include "thermal_sampler.h"
 #include "taskbar_volume.h"
 
+#include "launcher_model.h"
+
 namespace brook {
 
 // Logical sizes at 100% (window.h's WM_TASKBAR_* and the launcher's
@@ -69,6 +71,8 @@ struct ChromeTaskbarButton {
     const char* hoverTitle; // window label; launch state is held by the WM
     bool active, minimized; // window entries
     bool launch, busy;      // launch feedback entries: progress ring, or "!"
+    char initial = 0;
+    LauncherColor color = LauncherColor::Slate;
 };
 
 struct ChromeTelemetryModel {

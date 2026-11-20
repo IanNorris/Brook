@@ -16,7 +16,7 @@ static ChromeLauncherFrame g_launcherFrame;
 static constexpr const char* LauncherLayoutPath = "/data/home/.config/brook/launcher.ini";
 static constexpr const char* LauncherLayoutName = "launcher.ini";
 static constexpr const char* LauncherLayoutTemp = "launcher.ini.tmp";
-static constexpr uint32_t LauncherLayoutLimit = 16 * 1024;
+static constexpr uint32_t LauncherLayoutLimit = 40 * 1024;
 static SpinLock g_launcherSaveLock;
 static LauncherPersistenceStatus g_launcherPersistence;
 static char g_launcherSaveText[LauncherLayoutLimit];
@@ -25,6 +25,11 @@ static uint32_t g_launcherQueuedEpoch = 0;
 static uint64_t g_launcherSaveSince = 0;
 static uint32_t g_launcherSaveDelay = 0;
 
+static constexpr unsigned LauncherUndoLimit = 20;
+static char g_launcherHistory[LauncherUndoLimit][LauncherLayoutLimit];
+static char g_launcherLastLayout[LauncherLayoutLimit];
+static uint32_t g_launcherHistoryNext = 0, g_launcherHistoryCount = 0, g_launcherLastEdit = 0;
+static uint64_t g_launcherUndoSince = 0;
 static void LauncherNoteLayout(bool firstCatalog = false);
 
 void WmLauncherPersistenceStatus(LauncherPersistenceStatus& out)
@@ -72,7 +77,7 @@ static void LauncherSyncModel(const LauncherSnapshot& catalog)
         WmStrCopy(app.desc, item.description, sizeof(app.desc));
         WmStrCopy(app.hint, item.category, sizeof(app.hint));
         g_launcherModelItem[count] = static_cast<uint16_t>(i);
-        g_launcherModelIcon[count] = item.iconPixels ? item.iconPixels : catalog.applicationIcon;
+        g_launcherModelIcon[count] = item.iconPixels;
         ++count;
     }
     const bool firstCatalog = g_launcherModelGeneration == 0;
@@ -155,12 +160,19 @@ static void LauncherNoteLayout(bool firstCatalog)
     // Write defaults or the upgraded layout at first boot. Preserve an unreadable or invalid
     // existing file until the user actually changes the layout.
     const bool seed = !strcmp(state.load.stage, "missing") || !strcmp(state.load.stage, "migrated");
-    if (firstCatalog && !seed) {
-        SpinLockRelease(&g_launcherSaveLock);
-        return;
-    }
     SpinLockRelease(&g_launcherSaveLock);
     const uint32_t bytes = g_launcherModel.Serialize(text, sizeof(text));
+    const auto edit = g_launcherModel.EditEpoch();
+    if (bytes && g_launcherLastLayout[0] && edit != g_launcherLastEdit) {
+        WmStrCopy(g_launcherHistory[g_launcherHistoryNext], g_launcherLastLayout, LauncherLayoutLimit);
+        g_launcherHistoryNext = (g_launcherHistoryNext + 1) % LauncherUndoLimit;
+        if (g_launcherHistoryCount < LauncherUndoLimit) ++g_launcherHistoryCount;
+        g_launcherUndoSince = ApicTickCount();
+    }
+    g_launcherLastEdit = edit;
+    if (bytes) memcpy(g_launcherLastLayout, text, bytes + 1);
+    else g_launcherLastLayout[0] = 0;
+    if (firstCatalog && !seed) return;
     SpinLockAcquire(&g_launcherSaveLock);
     if (bytes) memcpy(g_launcherSaveText, text, bytes);
     g_launcherSaveBytes = bytes;
@@ -290,10 +302,11 @@ static ChromeLauncherChrome LauncherChrome(int32_t mouseX, int32_t mouseY)
 static const ChromeLauncherFrame& LauncherFrame(uint32_t screenW, uint32_t screenH, int32_t mouseX, int32_t mouseY)
 {
     const ChromeStyle style = WmChromeStyle();
+    g_launcherModel.SetUndoVisible(g_launcherHistoryCount && ApicTickCount() - g_launcherUndoSince < 8000);
     const ChromeLauncherChrome chrome = LauncherChrome(mouseX, mouseY);
     ChromeLauncherFrameFor(g_launcherModel, chrome, style, screenW, screenH, g_launcherFrame);
     g_launcherModel.SetViewport(g_launcherFrame.viewport);
-    if (g_launcherModel.Scroll() != g_launcherFrame.scroll)
+    if (g_launcherModel.Scroll() != g_launcherFrame.scroll || g_launcherModel.RailScroll() != g_launcherFrame.railScroll)
         ChromeLauncherFrameFor(g_launcherModel, chrome, style, screenW, screenH, g_launcherFrame);
     return g_launcherFrame;
 }
@@ -309,6 +322,13 @@ static void LauncherRun(const LauncherResult& r)
     switch (r.command) {
     case LauncherCommand::None: return;
     case LauncherCommand::Changed: break;
+    case LauncherCommand::Undo:
+        if (!g_launcherHistoryCount) return;
+        g_launcherHistoryNext = (g_launcherHistoryNext + LauncherUndoLimit - 1) % LauncherUndoLimit;
+        --g_launcherHistoryCount;
+        if (!g_launcherModel.RestoreLayout(g_launcherHistory[g_launcherHistoryNext])) return;
+        g_launcherUndoSince = ApicTickCount();
+        break;
     case LauncherCommand::Launch: LauncherLaunch(r.app); break;
     case LauncherCommand::Close: if (g_launcherOpen) WmLauncherToggle(); break;
     case LauncherCommand::OpenSettings: {
@@ -325,7 +345,16 @@ static void LauncherRun(const LauncherResult& r)
 
 void WmLauncherScroll(int delta120, uint32_t, uint32_t)
 {
-    if (!g_launcherOpen || !delta120) return;
+    if (!g_launcherOpen || !delta120 || g_launcherModel.EditorOpen()) return;
+    int32_t mx, my;
+    MouseGetPosition(&mx, &my);
+    if (g_launcherFrame.rail.contains(mx, my)) {
+        static int railRemainder = 0;
+        const int total = delta120 + railRemainder;
+        railRemainder = total % 120;
+        if (g_launcherModel.ScrollRail(-(total / 120))) CompositorMarkDirty();
+        return;
+    }
     // Pixel scrolling in proportion to the motion: a viewport step a wheel
     // tick, and touchpad motion finer than a tick (Ian, gen 458/459: whole
     // rows, then whole ticks, were jumpy; it should follow scroll speed).
@@ -393,6 +422,20 @@ int WmLauncherHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH
 }
 
 // A pointer press while the launcher is open. False: outside the panel.
+bool WmLauncherGesture(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH, bool released)
+{
+    if (!g_launcherOpen || !g_launcherModel.PointerHeld()) return false;
+    bool after = false;
+    const auto target = ChromeLauncherHitTest(LauncherFrame(screenW, screenH, mx, my), mx, my, &after);
+    const bool changed = g_launcherModel.MovePointer(target, mx, my, WmMetric(6), after, ApicTickCount());
+    if (released) {
+        // Moving for the first time on release may have exposed new targets.
+        const auto drop = ChromeLauncherHitTest(LauncherFrame(screenW, screenH, mx, my), mx, my, &after);
+        LauncherRun(g_launcherModel.ReleasePointer(drop, after));
+    } else if (changed) CompositorMarkDirty();
+    return true;
+}
+
 bool WmLauncherPress(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH, bool secondary)
 {
     if (!g_launcherOpen) return false;
@@ -400,6 +443,10 @@ bool WmLauncherPress(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH,
     if (guard.get().generation != g_launcherModelGeneration) LauncherSyncModel(guard.get());
     const ChromeLauncherFrame& frame = LauncherFrame(screenW, screenH, mx, my);
     const LauncherTarget target = ChromeLauncherHitTest(frame, mx, my);
+    if (g_launcherModel.EditorOpen()) {
+        LauncherRun(g_launcherModel.Press(target, secondary, mx, my));
+        return true;
+    }
     if (target.kind == LauncherTargetKind::None) return false;
     LauncherPowerTarget power = LauncherPowerTarget::None;
     switch (target.kind) {
@@ -418,7 +465,8 @@ bool WmLauncherPress(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH,
         return true;
     }
     g_launcherPower.Reset(); // any other launcher press dismisses the prompt
-    LauncherRun(g_launcherModel.Press(target, secondary, mx, my));
+    if (secondary || !g_launcherModel.BeginPointer(target, mx, my))
+        LauncherRun(g_launcherModel.Press(target, secondary, mx, my));
     CompositorMarkDirty();
     return true;
 }
@@ -443,12 +491,16 @@ void WmLauncherKey(uint8_t scan, char ascii, uint8_t modifiers)
     case SC_EXT_LEFT: key = LauncherKey::Left; break;
     case SC_EXT_RIGHT: key = LauncherKey::Right; break;
     case SC_EXT_HOME: key = LauncherKey::Home; break;
+    case 0x3C: key = LauncherKey::Rename; break;
+    case SC_EXT_DELETE: key = LauncherKey::Delete; break;
     case SC_EXT_END: key = LauncherKey::End; break;
     case SC_EXT_PGUP: key = LauncherKey::PageUp; break;
     case SC_EXT_PGDN: key = LauncherKey::PageDown; break;
     default:
-        // Ctrl and Alt chords are not text.
-        if (!ascii || (mods & (LauncherModCtrl | LauncherModAlt))) return;
+        // The layout's two Ctrl chords use the scan code, even if ASCII was filtered.
+        if ((mods & LauncherModCtrl) && scan == 0x2c) ascii = 'z';
+        else if ((mods & LauncherModCtrl) && scan == 0x39) ascii = ' ';
+        else if (!ascii || (mods & (LauncherModCtrl | LauncherModAlt))) return;
         key = LauncherKey::Char;
         break;
     }

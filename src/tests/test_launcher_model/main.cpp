@@ -42,7 +42,7 @@ std::unique_ptr<LauncherModel> Fresh() {
     auto m = std::make_unique<LauncherModel>();
     m->Init();
     m->SetCatalog(Catalog, CatalogCount);
-    m->SetViewport({36, 48, 40, 96, 48 * 6 + 36, 20});
+    m->SetViewport({36, 48, 40, 96, 48 * 6 + 36, 20, 0});
     m->Open();
     return m;
 }
@@ -81,9 +81,11 @@ void Defaults() {
     CHECK(lines[n - 1].columns == 1);
     uint16_t tiles[LauncherLimits::Pins];
     CHECK(Names(*m, tiles, m->TopTiles(tiles, LauncherLimits::Pins)) == "Files,Terminal,Settings,Firefox,Quake");
-    CHECK(m->RailRows() == 1 + 7 + 1);
-    // An empty category is hidden in All apps but shown with its message when opened.
-    m->Press({LauncherTargetKind::Rail, uint16_t(1 + Cat(*m, "Media"))}, false, 0, 0);
+    CHECK(m->RailRows() == 1 + 5 + 1);
+    // An empty category is hidden until Organise exposes it for edits.
+    CHECK(m->RailRowFor(Cat(*m, "Media")) == 0);
+    m->Press({LauncherTargetKind::Organise, 0}, false, 0, 0);
+    m->Press({LauncherTargetKind::Rail, uint16_t(m->RailRowFor(Cat(*m, "Media")))}, false, 0, 0);
     CHECK(m->View() == Cat(*m, "Media"));
     CHECK(m->Lines(lines, LauncherLimits::Lines) == 2 && lines[1].kind == LauncherLineKind::Empty);
 }
@@ -241,18 +243,114 @@ void Reorder() {
     CHECK(m->Step(doom, +1) && m->CategoryOf(doom) == games);
     CHECK(m->Step(doom, +1) && m->CategoryOf(doom) == games);
     LauncherLine lines[LauncherLimits::Lines];
-    m->Press({LauncherTargetKind::Rail, uint16_t(1 + games)}, false, 0, 0);
+    m->Press({LauncherTargetKind::Rail, uint16_t(m->RailRowFor(games))}, false, 0, 0);
     m->Lines(lines, LauncherLimits::Lines);
     CHECK(!std::strcmp(m->App(lines[1].apps[0]).name, "Quake") && !std::strcmp(m->App(lines[1].apps[1]).name, "DOOM"));
     // Unsorted apps move into the last category.
     const int mystery = Idx(*m, "mystery");
     CHECK(m->Step(mystery, -1) && m->CategoryOf(mystery) == int(m->CategoryCount()) - 1);
-    CHECK(m->UnsortedCount() == 0 && m->RailRows() == 8);
+    CHECK(m->UnsortedCount() == 0 && m->RailRows() == 6);
     // Alt+Down through the keyboard.
     m->Press({LauncherTargetKind::Rail, 0}, false, 0, 0);
     m->Key(LauncherKey::Down);
     m->Key(LauncherKey::Down, 0, LauncherModAlt);
     CHECK(m->CategoryOf(Idx(*m, LauncherFilesAppId)) == Cat(*m, "System"));
+}
+
+void Organisation() {
+    auto m = Fresh();
+    using TK = LauncherTargetKind;
+    const auto row = [&](const char* key) { return LauncherTarget{TK::Row, uint16_t(Idx(*m, key))}; };
+    const auto rail = [&](int view) { return LauncherTarget{TK::Rail, uint16_t(m->RailRowFor(view))}; };
+    const auto click = [&](LauncherTarget t) { return m->Press(t, false, 12, 12); };
+    char layout[40 * 1024];
+    CHECK(m->Serialize(layout, sizeof(layout)));
+    const int games = Cat(*m, "Games"), office = Cat(*m, "Office");
+    const auto doom = row("doom"), quake = row("quake"), calc = row("calc"), fire = row("firefox");
+    CHECK(m->BeginPointer(doom, 12, 12));
+    CHECK(!m->MovePointer(doom, 14, 13, 6, false));
+    CHECK(m->ReleasePointer(doom, false).command == LauncherCommand::Launch);
+    CHECK(m->BeginPointer(doom, 12, 12));
+    CHECK(m->MovePointer({TK::None, 0}, 34, 34, 6, false));
+    CHECK(m->ReleasePointer({TK::None, 0}, false).command == LauncherCommand::Changed);
+    CHECK(m->CategoryOf(doom.index) == games);
+
+    click({TK::Organise, 0});
+    CHECK(m->Organising() && m->RailRows() == 9);
+    CHECK(click(doom).command == LauncherCommand::Changed && m->Marked(doom.index));
+    click(quake);
+    CHECK(m->MarkedCount() == 2);
+    const auto officeTarget = rail(office);
+    CHECK(m->BeginPointer(doom, 12, 12));
+    CHECK(m->MovePointer(officeTarget, 34, 34, 6, false, 1000));
+    CHECK(!m->MovePointer(officeTarget, 34, 34, 6, false, 1699));
+    CHECK(m->MovePointer(officeTarget, 34, 34, 6, false, 1700));
+    CHECK(m->View() == office);
+    CHECK(m->ReleasePointer(calc, true).command == LauncherCommand::Changed);
+    CHECK(m->CategoryOf(doom.index) == office && m->CategoryOf(quake.index) == office);
+    LauncherLine lines[LauncherLimits::Lines];
+    CHECK(m->Lines(lines, LauncherLimits::Lines) >= 3);
+    CHECK(lines[1].apps[0] == calc.index && lines[1].apps[1] == doom.index && lines[2].apps[0] == quake.index);
+
+    CHECK(m->BeginPointer(doom, 12, 12));
+    CHECK(m->MovePointer({TK::NewCategory, 0}, 34, 34, 6, false));
+    m->ReleasePointer({TK::NewCategory, 0}, false);
+    CHECK(m->EditorOpen() && !m->EditingApp());
+    Type(*m, "Arcade");
+    click({TK::EditorColor, uint16_t(LauncherColor::Pink)});
+    click({TK::EditorIcon, uint16_t(LauncherCategoryIcon::Bolt)});
+    m->Key(LauncherKey::Enter);
+    const int arcade = Cat(*m, "Arcade");
+    CHECK(arcade >= 0 && m->CategoryOf(doom.index) == arcade && m->CategoryOf(quake.index) == arcade);
+    CHECK(m->CategoryColor(arcade) == LauncherColor::Pink && m->CategoryIcon(arcade) == LauncherCategoryIcon::Bolt);
+    const auto before = rail(games), after = rail(arcade);
+    m->BeginPointer(after, 12, 12);
+    m->MovePointer(before, 34, 34, 6, false);
+    m->ReleasePointer(before, false);
+    CHECK(Cat(*m, "Arcade") == games);
+    click({TK::EditCategory, uint16_t(Cat(*m, "Arcade"))});
+    click({TK::EditorDelete, 0});
+    CHECK(m->CategoryOf(doom.index) == -1 && m->CategoryOf(quake.index) == -1);
+    CHECK(m->Pinned(quake.index)); // deletion leaves the pin references alone
+    CHECK(m->Suggestion(doom.index) == Cat(*m, "Games"));
+    click({TK::MoveSuggested, doom.index});
+    CHECK(m->CategoryOf(doom.index) == Cat(*m, "Games") && m->Suggestion(quake.index) >= 0);
+    CHECK(m->SortSuggested() && m->CategoryOf(quake.index) == Cat(*m, "Games"));
+
+    CHECK(m->RenameApp(fire.index, "Internet Browser"));
+    CHECK(!m->RenameApp(fire.index, "Bad|Name"));
+    CHECK(!std::strcmp(m->Name(fire.index), "Internet Browser"));
+    CHECK(!std::strcmp(m->App(fire.index).name, "Firefox"));
+    Type(*m, "internet browser");
+    CHECK(m->Selected() == fire.index);
+    char alias[40 * 1024];
+    CHECK(m->Serialize(alias, sizeof(alias)));
+    auto again = Fresh();
+    CHECK(again->Parse(alias));
+    CHECK(!std::strcmp(again->Name(fire.index), "Internet Browser"));
+    CHECK(again->RenameApp(fire.index, ""));
+    CHECK(!std::strcmp(again->Name(fire.index), "Firefox"));
+    m->SetTop(LauncherTop::Recent);
+    CHECK(m->RestoreLayout(layout));
+    CHECK(m->Top() == LauncherTop::Recent && !std::strcmp(m->Name(fire.index), "Firefox"));
+    CHECK(m->CategoryOf(doom.index) == games && m->Pinned(quake.index));
+
+    m->SetTop(LauncherTop::Pinned);
+    CHECK(m->BeginPointer(doom, 12, 12));
+    m->MovePointer({TK::Tile, 0}, 34, 34, 6, false);
+    m->ReleasePointer({TK::Tile, 0}, false);
+    CHECK(m->Pinned(doom.index) && !std::strcmp(m->PinKey(0), "doom"));
+    CHECK(m->CategoryOf(doom.index) == games);
+    const uint32_t count = m->PinCount();
+    click({TK::ResetOrganisation, 0});
+    CHECK(m->PinCount() == count && m->CategoryCount() == 7);
+    const LauncherApp added[] = {Catalog[0], App("editor", "Editor", "Text tool", "office")};
+    m->SetCatalog(added, 2);
+    CHECK(m->IsNew(1) && m->Suggestion(1) == Cat(*m, "Office"));
+    m->SetCatalog(added, 2);
+    CHECK(m->IsNew(1));
+    click({TK::MoveSuggested, 1});
+    CHECK(!m->IsNew(1) && m->CategoryOf(1) == Cat(*m, "Office"));
 }
 
 void Persistence() {
@@ -339,6 +437,7 @@ int main() {
     Navigation();
     PinsAndRecent();
     Reorder();
+    Organisation();
     Persistence();
     std::printf("LAUNCHER_MODEL_OK\n");
     return 0;
