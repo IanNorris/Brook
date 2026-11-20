@@ -510,7 +510,13 @@ static void DebugTcpThread(void* /*arg*/)
         return;
     }
 
-    if (SockListen(listenSock, 2) < 0)
+#if defined(BROOK_BRIDGE_V3)
+    // Two ready requests from one host can queue while another peer has room.
+    constexpr int PendingConnections = 3;
+#else
+    constexpr int PendingConnections = 2;
+#endif
+    if (SockListen(listenSock, PendingConnections) < 0)
     {
         SerialPuts("DEBUG_TCP: listen failed\n");
         SockClose(listenSock);

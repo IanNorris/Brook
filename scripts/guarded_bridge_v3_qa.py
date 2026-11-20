@@ -1,5 +1,6 @@
 """Exercise the four packaged v3 receivers in a disposable guest."""
 
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 from pathlib import Path
@@ -123,7 +124,7 @@ def check_maintenance_receiver(bridge, output, session, boot_id, port, seed, sto
 def run(output, registry, ports, seed, expected):
     command_port, bulk_port, update_port, store_port = ports
     sys.path.insert(0, str(ROOT / "tools/vm_bridge"))
-    from guest_transport import exchange
+    from guest_transport import exchange, exchange_v3
     from hardware import Hardware
     from hardware_bulk_workflow import BulkRun
     from hardware_update_workflow import verify_v3_boot
@@ -160,6 +161,13 @@ def run(output, registry, ports, seed, expected):
     check_operator_refusal(command_port)
 
     session = attachment["session"]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        concurrent_caps = [
+            pool.submit(exchange_v3, "127.0.0.1", command_port, ["bridge hardware caps"], 6, seed)
+            for _ in range(2)
+        ]
+        if any(request.result()[0].get("boot_id") != attachment["guest_boot_id"] for request in concurrent_caps):
+            raise RuntimeError("Concurrent v3 commands did not report the attached boot")
     logs = bridge.command(session, "bridge hardware logs 0 1")
     if "lines" not in logs:
         raise RuntimeError("Authenticated log command was refused after guarded handoff")
@@ -202,6 +210,7 @@ def run(output, registry, ports, seed, expected):
         "public_caps_protected_fields_absent": True,
         "plaintext_non_caps_refused": True,
         "unknown_operator_refused_before_challenge": True,
+        "concurrent_authenticated_commands": True,
         "bytes": expected_bytes,
         "sha256": expected_sha,
         "compressed_chunks": decoder.call_count,

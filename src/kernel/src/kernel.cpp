@@ -717,6 +717,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         }
     }
 
+#if defined(BROOK_BRIDGE_V3)
+    brook::DebugBridgeV3LogBoot();
+#endif
     if(const int keyPolicy=brook::FatFsProtectBootKey())
         KernelPanic("initrd: hardware update key policy failed (%d)",keyPolicy);
 

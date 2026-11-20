@@ -13,7 +13,7 @@
 namespace {
 std::string incoming, outgoing;
 char bootEpoch[33]{};
-char console[192]{};
+char console[512]{};
 uint64_t now=1;
 bool idle=false, hasEntropy=true;
 
@@ -85,7 +85,8 @@ extern "C" void KPrintf(const char* format,...)
 {
     va_list args;
     va_start(args,format);
-    std::vsnprintf(console,sizeof(console),format,args);
+    const size_t used=std::strlen(console);
+    std::vsnprintf(console+used,sizeof(console)-used,format,args);
     va_end(args);
 }
 }
@@ -94,13 +95,21 @@ int main()
 {
     hasEntropy=false;
     brook::DebugBridgeV3Initialize();
+    brook::DebugBridgeV3LogBoot();
     assert(std::strstr(console,"operators=1 ready=0\n"));
+    assert(std::strstr(console,"initrd_sha256=unavailable\n"));
     assert(Serve(Hello(true))=="BRKREFU3");
     assert(Serve(Hello(true,BrookBridgeV3Bulk)).empty());
     hasEntropy=true;
     brook::DebugBridgeV3Initialize();
-    const std::string expected="BRIDGE_V3_LOCAL build=review-test policy_sha256="+
-        std::string(brook::DebugBridgeV3PolicySha256())+" operators=1 ready=1\n";
+    const uint8_t bootImage[]={'t','e','s','t'};
+    brook::DebugBridgeV3MeasureInitrd(bootImage,sizeof(bootImage));
+    console[0]=0;
+    brook::DebugBridgeV3LogBoot();
+    const std::string expected=
+        "BRIDGE_V3_LOCAL build=review-test boot_id=01010101010101010101010101010101 operators=1 ready=1\n"
+        "BRIDGE_V3_LOCAL policy_sha256="+std::string(brook::DebugBridgeV3PolicySha256())+
+        "\nBRIDGE_V3_LOCAL initrd_sha256=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08\n";
     assert(console==expected);
     assert(Serve(Hello(false))=="BRKREFU3");
     auto invalid=Hello(false);

@@ -3,6 +3,7 @@
 
 No automatic job launch, activation, retry or reboot. A lost activation reply
 requires inspecting the SAME original hw_job transaction before proceeding.
+This helper is for explicitly selected legacy maintenance only.
 The optional --activate writes inactive slots and the final selection record.
 """
 import argparse,json,sys
@@ -10,6 +11,8 @@ from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'tools'))
 from hardware_update_protocol import upload,read_payload,KERNEL_MAX,INITRD_MAX
 p=argparse.ArgumentParser(description=__doc__)
+p.add_argument('--legacy',action='store_true',required=True,
+               help='Explicitly choose the legacy cleartext-key maintenance protocol')
 p.add_argument('--host',required=True);p.add_argument('--port',type=int,default=1235)
 p.add_argument('--key-file',type=Path,required=True);p.add_argument('--boot-id',required=True)
 p.add_argument('--transaction-id',required=True);p.add_argument('--kernel',type=Path,required=True)

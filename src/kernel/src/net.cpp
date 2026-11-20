@@ -3597,23 +3597,29 @@ static int EvictStaleSynRecvLocked(Socket& listener, uint64_t now)
 // received from a NIC. Test both before allocating a child and at publish.
 static bool AcceptQueueHasRoom(const Socket& listener, bool localIngress)
 {
-    const int remoteReserve = localIngress && BridgeCommandListener(listener) ? 1 : 0;
-    return listener.listening && listener.acceptQueueCount < listener.listenBacklog - remoteReserve;
+    if (!listener.listening || listener.acceptQueueCount >= listener.listenBacklog) return false;
+    if (!localIngress || !BridgeCommandListener(listener)) return true;
+    return listener.listenBacklog > 1 && listener.acceptQueueCount == 0;
 }
 
-// One pending command connection per wire peer. The queue owns each child
-// reference, and the peer address/ingress are immutable while it is queued.
-// Caller holds g_acceptQueueLock.
+// Only a peer that completed the TCP handshake can use its address quota.
+// Incomplete handshakes still use the bounded queue and ordinary stale eviction.
+// Caller holds g_acceptQueueLock and no child lock.
 static bool AcceptQueuePeerAllowed(const Socket& listener, uint32_t peer, bool localIngress)
 {
 #if defined(BROOK_BRIDGE_V3) || defined(BROOK_SOCKET_LIFETIME_TEST)
     if (localIngress || !BridgeCommandListener(listener)) return true;
+    unsigned established = 0;
     for (int qi = 0; qi < listener.acceptQueueCount; ++qi) {
         const int childIdx = listener.acceptQueue[qi];
         if (childIdx < 0 || childIdx >= static_cast<int>(MAX_SOCKETS) || !g_sockUsed[childIdx])
             continue;
-        const Socket& child = g_sockets[childIdx];
-        if (!child.peerLocalIngress && child.remoteIp == peer) return false;
+        Socket& child = g_sockets[childIdx];
+        if (child.peerLocalIngress || child.remoteIp != peer) continue;
+        SpinLockAcquire(&child.lock);
+        const bool ready = TcpCanAccept(child);
+        SpinLockRelease(&child.lock);
+        if (ready && ++established == 2) return false;
     }
 #endif
     return true;
@@ -3945,10 +3951,10 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len,uint64_t 
             // Once published, accept/listener close may immediately retire it;
             // successful publication must be our last access to this child.
             queueFlags = IrqSpinLockAcquire(&g_acceptQueueLock);
+            const bool allowed = AcceptQueueHasRoom(s, localIngress)
+                              && AcceptQueuePeerAllowed(s, ip->srcIp, localIngress);
             SpinLockAcquire(&child.lock);
-            bool publish = AcceptQueueHasRoom(s, child.peerLocalIngress)
-                           && AcceptQueuePeerAllowed(s, child.remoteIp, child.peerLocalIngress)
-                           && !RetireAbandonedQueuedChild(child, ApicTickCount())
+            bool publish = allowed && !RetireAbandonedQueuedChild(child, ApicTickCount())
                            && (child.tcpState == TcpState::SynRecv
                                || child.tcpState == TcpState::Established
                                || child.tcpState == TcpState::CloseWait);

@@ -257,8 +257,16 @@ void DebugBridgeV3Initialize()
         EncodeHex(epoch, bootId, sizeof(bootId));
         authAvailable = DebugEpochInitialize(epoch) && DebugEpochMatches(epoch) && OperatorCount;
     }
-    KPrintf("BRIDGE_V3_LOCAL build=%s policy_sha256=%s operators=%u ready=%u\n",
-            BuildGitHash(), policySha, OperatorCount, authAvailable ? 1u : 0u);
+}
+
+void DebugBridgeV3LogBoot()
+{
+    char epoch[33];
+    EncodeHex(epoch, bootId, sizeof(bootId));
+    KPrintf("BRIDGE_V3_LOCAL build=%s boot_id=%s operators=%u ready=%u\n",
+            BuildGitHash(), epoch, OperatorCount, authAvailable ? 1u : 0u);
+    KPrintf("BRIDGE_V3_LOCAL policy_sha256=%s\n", policySha);
+    KPrintf("BRIDGE_V3_LOCAL initrd_sha256=%s\n", initrdSha[0] ? initrdSha : "unavailable");
 }
 
 void DebugBridgeV3MeasureInitrd(const uint8_t* bytes, uint64_t length)

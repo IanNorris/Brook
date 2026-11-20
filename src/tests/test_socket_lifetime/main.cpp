@@ -2523,7 +2523,7 @@ int main() {
     }
     {
         const int listener = create();
-        listenPort(listener, 1234, 2);
+        listenPort(listener, 1234, 3);
         auto syn = [&](uint16_t sourcePort, bool local, uint8_t wirePeer=70) {
             Ipv4Header ip{};
             ip.dstIp = Ipv4Addr(127, 0, 0, 1);
@@ -2554,30 +2554,55 @@ int main() {
         SockClose(remote);
         SockClose(local);
 
-        // A repeated wire peer leaves capacity for an independent operator.
-        // A local connection still cannot take the reserved second slot.
+        // A queued incomplete connection must leave room for two legitimate
+        // requests from that address, even before the pending entry expires.
         syn(44011, false);
-        const int first = g_sockets[listener].acceptQueue[0];
-        assert(g_sockets[listener].acceptQueueCount == 1);
+        const int incomplete = g_sockets[listener].acceptQueue[0];
+        assert(!TcpCanAccept(g_sockets[incomplete]));
         syn(44012, false);
-        assert(g_sockets[listener].acceptQueueCount == 1);
-        syn(44013, true);
-        assert(g_sockets[listener].acceptQueueCount == 1);
-        syn(44014, false, 71);
         assert(g_sockets[listener].acceptQueueCount == 2);
-        const int independent = g_sockets[listener].acceptQueue[1];
+        const int first = g_sockets[listener].acceptQueue[1];
         deliverControl(first, 71, g_sockets[first].tcpSndNxt, TCP_ACK, 1000);
-        deliverControl(independent, 71, g_sockets[independent].tcpSndNxt, TCP_ACK, 1000);
+        syn(44013, false);
+        assert(g_sockets[listener].acceptQueueCount == 3);
+        const int second = g_sockets[listener].acceptQueue[2];
+        deliverControl(second, 71, g_sockets[second].tcpSndNxt, TCP_ACK, 1000);
         assert(SockAccept(listener, nullptr, &localIngress) == first && !localIngress);
-        assert(SockAccept(listener, nullptr, &localIngress) == independent && !localIngress);
-        SockClose(first);
-        SockClose(independent);
-
-        // The cap applies to pending sockets, so sequential requests by the
-        // same approved operator continue to use this listener.
-        syn(44015, false);
+        assert(SockAccept(listener, nullptr, &localIngress) == second && !localIngress);
         assert(g_sockets[listener].acceptQueueCount == 1);
+        assert(g_sockets[listener].acceptQueue[0] == incomplete);
+        SockClose(first);
+        SockClose(second);
         SockClose(listener);
+
+        // Once two completed requests are waiting, a distinct remote peer
+        // can use the remaining slot. The ordinary listener's stale eviction
+        // is exercised separately below.
+        const int nextListener = create();
+        listenPort(nextListener, 1234, 3);
+        auto& queue = g_sockets[nextListener];
+        syn(44014, false);
+        const int pending = queue.acceptQueue[0];
+        deliverControl(pending, 71, g_sockets[pending].tcpSndNxt, TCP_ACK, 1000);
+        syn(44015, false);
+        const int another = queue.acceptQueue[1];
+        deliverControl(another, 71, g_sockets[another].tcpSndNxt, TCP_ACK, 1000);
+        assert(queue.acceptQueueCount == 2);
+        syn(44016, false);
+        assert(queue.acceptQueueCount == 2);
+        syn(44017, true);
+        assert(queue.acceptQueueCount == 2);
+        syn(44018, false, 71);
+        assert(queue.acceptQueueCount == 3);
+        SockClose(nextListener);
+
+        const int singleSlot = create();
+        listenPort(singleSlot, 1234, 1);
+        syn(44019, true);
+        assert(g_sockets[singleSlot].acceptQueueCount == 0);
+        syn(44020, false);
+        assert(g_sockets[singleSlot].acceptQueueCount == 1);
+        SockClose(singleSlot);
     }
     {
         // A stalled peer gets neither the global asynchronous send path nor
