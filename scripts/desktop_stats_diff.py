@@ -174,8 +174,9 @@ def main():
         share = f' ({100 * d("eligible") / evaluated:.0f}% of presented frames)' if evaluated else ''
         print(f'direct scanout: mode={d_after["mode"]} evaluated {evaluated} eligible {d("eligible")}{share} '
               f'scanned_out {d("frames")} enters {d("enters")} exits {d("exits")} last={d_after["last"]}')
-        old = d_before.get('fallback', {})
-        fallback = {k: v - old.get(k, 0) for k, v in d_after['fallback'].items()}
+        key = 'reasons' if 'reasons' in d_after else 'fallback'  # renamed in the stage 2 renderer
+        old = d_before.get(key, {})
+        fallback = {k: v - old.get(k, 0) for k, v in d_after.get(key, {}).items()}
         if any(fallback.values()):
             print('  fallback    ' + '  '.join(f'{k} {v}' for k, v in sorted(fallback.items(), key=lambda kv: -kv[1]) if v))
     evictions = after['window_evictions'] - (before['window_evictions'] if before else 0)

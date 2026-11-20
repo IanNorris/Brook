@@ -1,8 +1,7 @@
 #pragma once
 
 // syscall_maintenance_block.h -- internal declarations shared from syscall_maintenance_block.cpp.
-// Internal to the syscall layer; split from syscall.cpp
-// (see docs/agent/syscall-split-plan.md).
+// Internal to the syscall layer; split from syscall.cpp.
 
 #include "device.h"
 

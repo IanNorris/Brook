@@ -1,8 +1,7 @@
 #pragma once
 
 // syscall_time.h -- internal declarations shared from syscall_time.cpp.
-// Internal to the syscall layer; split from syscall.cpp
-// (see docs/agent/syscall-split-plan.md).
+// Internal to the syscall layer; split from syscall.cpp.
 
 #include <stdint.h>
 

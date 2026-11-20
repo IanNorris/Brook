@@ -1,6 +1,6 @@
 // syscall_cred.cpp -- credential syscalls: uid/gid, groups, capabilities.
 //
-// Split from syscall.cpp (see docs/agent/syscall-split-plan.md).
+// Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "process_user_namespace.h"

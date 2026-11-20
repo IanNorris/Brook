@@ -1,6 +1,6 @@
 // syscall_timerfd.cpp -- timerfd objects and timerfd_create/settime/gettime.
 //
-// Split from syscall.cpp (see docs/agent/syscall-split-plan.md).
+// Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "user_copy.h"

@@ -107,7 +107,7 @@ Window-frame and shell code lives in `window.cpp` unless a file is named.
   `0xB0C`. Settings reads the same `brook_theme.h` table for its preview.
 - App surfaces use a second palette (`brook_surface_palette` in
   `brook_appearance.h`). It is pushed to GTK as CSS and also copied as
-  literals in brook-files.c and gallery.c.
+  literals in gallery.c.
 - Painters call `WmCurrentPalette()` per draw. The chrome cache key folds in
   `theme | appearance | scale | settingsEpoch`.
 

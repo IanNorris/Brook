@@ -1,6 +1,6 @@
 // syscall_dsp.cpp -- OSS /dev/dsp descriptor state and format helpers.
 //
-// Split from syscall.cpp (see docs/agent/syscall-split-plan.md).
+// Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "dsp_write_plan.h"

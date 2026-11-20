@@ -705,7 +705,7 @@ existing receipt and invalid key. Actual end-to-end live reset passed in
 `build/hardware/update-workflow-vm-20261030/result.json`; QEMU stayed alive while
 the guest's validated ACPI register reset it and the new payload was confirmed.
 
-The first physical maintenance boot was confirmed at 192.168.85.106 with payload
+The first physical maintenance boot was confirmed at <dell-ip> with payload
 `maintenance-bootstrap-5501ac9ce3064efc92a4718e7ad76d71`. Wrong-nonce refusal and
 initial zero-data verification passed. The 1 MiB scratch write reached fsync,
 which returned EIO. The USB driver logged CSW command failure status1/residue0;
@@ -3288,3 +3288,34 @@ submission failures; this preparation is not a working GPU driver or a
 physical submission test. Hardware submission remains gated on independently
 establishing GPU ownership, usable DMA mappings, GPU PAT and engine status-page
 handoff, and retaining resources until the engine is safely retired.
+
+## PCI inventory (gen 443, 19 November)
+
+This comes from the boot snapshot (`bridge hardware pci <cursor> <count>`), which is the Brook equivalent of `lspci -nn`. Raw JSON: `display-perf/build/dell/pci-inventory-443.json`. The names were assigned from the IDs by hand.
+
+| BDF | Vendor:device | Class | Subsystem | Device |
+|---|---|---|---|---|
+| 00:00.0 | 8086:1604 | 0600 | 1028:0665 | Broadwell-U host bridge |
+| 00:02.0 | 8086:1616 | 0300 | 1028:0665 | HD Graphics 5500 (GT2) |
+| 00:03.0 | 8086:160c | 0403 | 1028:0665 | Broadwell-U HD audio (display/HDMI) |
+| 00:04.0 | 8086:1603 | 1180 | 1028:0665 | Broadwell-U processor thermal |
+| 00:14.0 | 8086:9cb1 | 0c03 | 1028:0665 | Wildcat Point-LP xHCI (USB 3.0) |
+| 00:16.0 | 8086:9cba | 0780 | 1028:0665 | Wildcat Point-LP MEI #1 |
+| 00:1b.0 | 8086:9ca0 | 0403 | 1028:0665 | Wildcat Point-LP HD audio |
+| 00:1c.0 | 8086:9c90 | 0604 | 0000:0000 | Wildcat Point-LP PCIe root port #1 |
+| 00:1c.3 | 8086:9c96 | 0604 | 0000:0000 | Wildcat Point-LP PCIe root port #4 |
+| 00:1d.0 | 8086:9ca6 | 0c03 | 1028:0665 | Wildcat Point-LP EHCI (USB 2.0) |
+| 00:1f.0 | 8086:9cc3 | 0601 | 1028:0665 | Wildcat Point-LP LPC (QM87-class) |
+| 00:1f.2 | 8086:9c83 | 0106 | 1028:0665 | Wildcat Point-LP SATA AHCI |
+| 00:1f.3 | 8086:9ca2 | 0c05 | 1028:0665 | Wildcat Point-LP SMBus |
+| 00:1f.6 | 8086:9ca4 | 1180 | 1028:0665 | Wildcat Point-LP thermal |
+| 01:00.0 | 10ec:5249 | ff00 | 1028:0665 | Realtek RTS5249 PCIe SD card reader |
+| 02:00.0 | 14e4:43b1 | 0280 | 1028:0019 | Broadcom BCM4352 802.11ac (Dell DW1560) |
+
+**Wi-Fi:** the card at 02:00.0 is a Broadcom BCM4352 SoftMAC (DW1560). Linux supports it only through Broadcom's closed `wl` (broadcom-sta) driver: `brcmfmac` does not cover the 4352, and `brcmsmac` and `b43` predate it. The options are:
+- a USB Wi-Fi adapter with an open driver (MediaTek `mt76`: MT7612U or MT7921AU), on the existing xHCI stack;
+- replacing the M.2 2230 A/E card with an Intel 7265, 8265 or AX200 (`iwlwifi`).
+
+Both need a Brook 802.11 station layer and a `wpa_supplicant` backend. Hosting the `wl` blob is not recommended.
+
+**Decision (Ian, 19 Nov): the BCM4352 is not supported, and no USB Wi-Fi dongle either. The goal was to get off the USB path. Revisit if a different device is chosen (see DECISIONS.md).**

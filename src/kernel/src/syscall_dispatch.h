@@ -1,8 +1,7 @@
 #pragma once
 
 // syscall_dispatch.h -- internal declarations shared from syscall.cpp.
-// Internal to the syscall layer; split from syscall.cpp
-// (see docs/agent/syscall-split-plan.md).
+// Internal to the syscall layer; split from syscall.cpp.
 
 #include "syscall.h"
 

@@ -1,6 +1,6 @@
 // syscall_unix_socket.cpp -- AF_UNIX socket objects: registry, queues, stream I/O and readiness.
 //
-// Split from syscall.cpp (see docs/agent/syscall-split-plan.md).
+// Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "tsc_clock.h"

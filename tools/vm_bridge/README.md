@@ -749,7 +749,7 @@ port scan is involved. Boot a current hardware image with Ethernet and the
 development debug interface enabled, then attach its literal IPv4 address:
 
 ```sh
-python3 tools/vm_bridge/server.py --call hw_attach --arguments '{"host":"192.168.85.106"}'
+python3 tools/vm_bridge/server.py --call hw_attach --arguments '{"host":"<dell-ip>"}'
 python3 tools/vm_bridge/server.py --call hw_doctor --arguments '{"session":"HARDWARE_SESSION_ID"}'
 ```
 
@@ -776,7 +776,7 @@ The kernel closes a connection that leaves a framed command incomplete for
 does not make the listener concurrent or recover it from a blocked command.
 
 For a minimal host-side check before attaching, run
-`python3 scripts/probe_hardware_link.py 192.168.85.106 --count 5`. Substitute
+`python3 scripts/probe_hardware_link.py <dell-ip> --count 5`. Substitute
 the address shown on the target. Each JSON-line sample reports the host route,
 neighbour entry, ping, and the stage and duration of one read-only hardware
 capabilities request. A zero boot ID is possible before the first attach and

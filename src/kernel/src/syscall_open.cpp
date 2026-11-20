@@ -1,6 +1,6 @@
 // syscall_open.cpp -- open/openat/creat path resolution and descriptor creation.
 //
-// Split from syscall.cpp (see docs/agent/syscall-split-plan.md).
+// Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "guard_checker_session.h"

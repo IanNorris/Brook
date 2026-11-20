@@ -1,6 +1,6 @@
 // syscall_memory.cpp -- memory syscalls: mmap/munmap/mprotect/mremap/brk/madvise/mincore and mapping faults.
 //
-// Split from syscall.cpp (see docs/agent/syscall-split-plan.md).
+// Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "cpu.h"

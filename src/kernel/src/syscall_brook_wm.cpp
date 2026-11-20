@@ -1,6 +1,6 @@
 // syscall_brook_wm.cpp -- Brook window-manager syscalls.
 //
-// Split from syscall.cpp (see docs/agent/syscall-split-plan.md).
+// Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "mouse.h"
@@ -9,6 +9,7 @@
 #include "memory/mapping_transaction.h"
 #include "compositor.h"
 #include "window.h"
+#include "desktop_identity.h"
 #include "gpu_compositor.h"
 #include "user_copy.h"
 #include "syscall_internal.h"
@@ -220,8 +221,13 @@ int64_t sys_brook_wm_window_state(uint64_t window, uint64_t incarnation,
 int64_t sys_brook_wm_refresh_apps(uint64_t, uint64_t, uint64_t,
                                  uint64_t, uint64_t, uint64_t)
 {
-    if (!ProcessCurrent()) return -ESRCH;
-    brook::WmRequestLauncherRefresh();
+    auto* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    KernelOperationGuard operation(proc);
+    const auto uid = ProcessReadIds(proc, false).effective;
+    if (uid == DesktopUid) WmRequestUserLauncherRefresh();
+    else if (!uid && !proc->userNamespace) WmRequestLauncherRefresh();
+    else return -EPERM;
     return 0;
 }
 
@@ -537,7 +543,7 @@ int64_t sys_brook_wm_set_maximized(uint64_t wmId, uint64_t enable,
 
     brook::Window* w = brook::WmFindWindowById(proc, static_cast<uint32_t>(wmId));
     if (!w) return -EINVAL;
-    brook::WmSetMaximized(static_cast<int>(wmId) - 1, enable != 0);
+    brook::WmSetMaximized(static_cast<int>(wmId) - 1, enable != 0, true);
     return 0;
 }
 

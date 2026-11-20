@@ -41,7 +41,7 @@ static TaskbarLayout GetTaskbarLayout(uint32_t screenW, uint32_t screenH)
         const Window& w = g_windows[i];
         if (!w.proc || !w.visible || !w.focusable) continue;
         if (w.focused) focused = total;
-        labels[total] = w.title;
+        labels[total] = WindowDisplayTitle(w);
         ids[total++] = static_cast<int>(i);
     }
     SpinLockAcquire(&g_launchLock);
@@ -496,7 +496,7 @@ static void WmCaptureTaskbar(uint32_t screenW, uint32_t screenH, uint64_t uptime
         entry.active = window.focused && !window.minimized;
         entry.minimized = window.minimized;
         if (layout.buttons[i].w >= int(WmMetric(ChromeShellMetrics::TaskbarLabelMin)))
-            WmStrCopy(entry.label, window.title, sizeof(entry.label));
+            WmStrCopy(entry.label, WindowDisplayTitle(window), sizeof(entry.label));
         WmCaptureShellIcon(icon, WindowIcon(window, icons.get()));
     }
     layout.nextIndex = 0;
@@ -602,7 +602,7 @@ static bool WmTrayTooltip(uint32_t screenW, uint32_t screenH, int32_t mx, int32_
                     entry.phase == LaunchPhase::Exited ? "Exited without a window: " : "Launch failed: ", sizeof(text));
                 const size_t length = strlen(text);
                 WmStrCopy(text + length, entry.title, sizeof(text) - length);
-            } else WmStrCopy(text, g_windows[index].title, sizeof(text));
+            } else WmStrCopy(text, WindowDisplayTitle(g_windows[index]), sizeof(text));
             if (!text[0]) break;
             anchor = &l.buttons[i];
             break;

@@ -1,10 +1,10 @@
 # One package pin and a recorded closure for the experiment disks.
 { pkgs ? import ./nixpkgs.nix {} }:
 let
+  files = import ./desktop-files.nix { inherit pkgs; };
   waylandd = import ../tools/waylandd-pkg {};
   calc = import ../tools/wayland-calc-pkg {};
   player = import ../tools/brook-player-pkg {};
-  files = import ../tools/brook-files-pkg {};
   gallery = import ../tools/brook-gallery-pkg { inherit pkgs; };
   settings = import ../tools/brook-settings-pkg { inherit pkgs; };
   message = import ../tools/brook-message-pkg { inherit pkgs; };
@@ -80,9 +80,9 @@ in {
       pkgs.bash pkgs.coreutils pkgs.curl.bin pkgs.xz.bin pkgs.zstd.bin pkgs.cacert
       pkgs.python3 pkgs.ffmpeg.bin pkgs.wayland pkgs.mesa
       pkgs.libreoffice pkgs.gimp pkgs.qalculate-gtk pkgs.xfce.mousepad
-      pkgs.kdePackages.breeze-icons (import ./desktop-settings.nix { inherit pkgs; })
+      pkgs.kdePackages.breeze-icons (import ./desktop-settings.nix { inherit pkgs; inherit (files) nautilus; })
       firefox chromium
-      waylandd calc player files settings message gallery fonts cursors launchers session
+      waylandd calc player files.integration files.gvfs settings message gallery fonts cursors launchers session
     ];
     ignoreCollisions = true;
   };

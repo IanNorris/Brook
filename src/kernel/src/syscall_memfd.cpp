@@ -1,6 +1,6 @@
 // syscall_memfd.cpp -- memfd objects, memfd_create and memfd-backed named shared memory.
 //
-// Split from syscall.cpp (see docs/agent/syscall-split-plan.md).
+// Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "fw_cfg.h"

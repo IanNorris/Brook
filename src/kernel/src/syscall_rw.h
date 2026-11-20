@@ -1,8 +1,7 @@
 #pragma once
 
 // syscall_rw.h -- internal declarations shared from syscall_rw.cpp.
-// Internal to the syscall layer; split from syscall.cpp
-// (see docs/agent/syscall-split-plan.md).
+// Internal to the syscall layer; split from syscall.cpp.
 
 #include "pipe.h"
 #include "user_copy.h"

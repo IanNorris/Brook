@@ -1,8 +1,7 @@
 #pragma once
 
 // syscall_timerfd.h -- internal declarations shared from syscall_timerfd.cpp.
-// Internal to the syscall layer; split from syscall.cpp
-// (see docs/agent/syscall-split-plan.md).
+// Internal to the syscall layer; split from syscall.cpp.
 
 #include "timerfd_state.h"
 #include "sync/kmutex.h"

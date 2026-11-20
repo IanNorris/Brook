@@ -2765,6 +2765,7 @@ static void CompositorRunShortcut(const GlobalShortcutResult& r)
         break;
     }
     case GlobalShortcutAction::SpawnTerminal:WmSpawnTerminal();break;
+    case GlobalShortcutAction::OpenFiles:WmOpenFiles();break;
     case GlobalShortcutAction::ToggleGlass:WmToggleFocusedWindowGlass();break;
     }
     if(r.releasePointer || r.action!=GlobalShortcutAction::None) {

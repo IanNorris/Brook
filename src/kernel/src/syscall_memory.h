@@ -1,8 +1,7 @@
 #pragma once
 
 // syscall_memory.h -- internal declarations shared from syscall_memory.cpp.
-// Internal to the syscall layer; split from syscall.cpp
-// (see docs/agent/syscall-split-plan.md).
+// Internal to the syscall layer; split from syscall.cpp.
 
 #include "process.h"
 #include "memory/mapping_fault.h"

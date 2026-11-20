@@ -1,6 +1,6 @@
 // syscall_rw.cpp -- read/write family: read/write/readv/writev/pread64/pwrite64/sendfile.
 //
-// Split from syscall.cpp (see docs/agent/syscall-split-plan.md).
+// Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "kprintf.h"

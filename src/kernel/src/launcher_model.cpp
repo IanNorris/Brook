@@ -344,7 +344,9 @@ uint32_t LauncherModel::Serialize(char* out, uint32_t capacity) const {
     return w.Finish();
 }
 
-bool LauncherModel::Parse(const char* text) {
+bool LauncherModel::Parse(const char* text, bool* migrated) {
+    if (migrated) *migrated = false;
+    bool remapFiles = false;
     // Parse into a copy; any structural error keeps the defaults (never an error).
     LauncherModel& self = *this;
     const uint32_t savedKeys = keyCount_;
@@ -364,7 +366,12 @@ bool LauncherModel::Parse(const char* text) {
             uint32_t len = uint32_t(comma - v) < LL::KeyLength - 1 ? uint32_t(comma - v) : LL::KeyLength - 1;
             for (uint32_t i = 0; i < len; ++i) key[i] = v[i];
             key[len] = 0;
-            const int k = len ? self.Intern(key) : -1;
+            // The file browser had a desktop ID in the hardware profile and
+            // a shortcut basename before native shortcuts carried app IDs.
+            const bool oldFiles = Equal(key, "brook-files") || Equal(key, "brook-hardware-files") ||
+                                  Equal(key, "files") || Equal(key, "Files");
+            remapFiles |= oldFiles;
+            const int k = len ? self.Intern(oldFiles ? LauncherFilesAppId : key) : -1;
             bool dup = false;
             for (uint32_t i = 0; i < n; ++i) dup |= list[i] == k;
             if (k >= 0 && !dup && n < capacity) list[n++] = uint16_t(k);
@@ -461,6 +468,8 @@ bool LauncherModel::Parse(const char* text) {
     for (uint32_t i = 0; i < recentN; ++i) recent_[i] = recent[i];
     pinCount_ = pinN; recentCount_ = recentN; top_ = top;
     layoutLoaded_ = true;
+    if (remapFiles) Changed();
+    if (migrated) *migrated = remapFiles;
     Recompute();
     return true;
 }

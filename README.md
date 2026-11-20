@@ -14,10 +14,10 @@
 ---
 
 <p align="center">
-  <a href="docs/images/brook_quake3_rounded_glass_1080.png"><img src="docs/images/brook_quake3_rounded_glass_1080.png" alt="Quake III Arena demo running through hardware VirGL on Brook with rounded dark glass chrome" width="960"></a>
+  <a href="docs/images/brook_dell_launcher_openttd_3200.png"><img src="docs/images/brook_dell_launcher_openttd.png" alt="Brook's Clearwater desktop on a Dell XPS 13: the glass app launcher open over OpenTTD, with the taskbar below" width="960"></a>
 </p>
 
-<p align="center"><em>Quake III Arena demo through hardware VirGL, with rounded dark glass chrome on Brook's native 1920×1080 desktop</em></p>
+<p align="center"><em>Clearwater on real hardware (Dell XPS 13, 3200×1800 at 200%): the glass app launcher open over OpenTTD</em></p>
 
 ## What is Brook?
 
@@ -281,7 +281,7 @@ the table distinguishes tested behavior from remaining limitations.
 - **Web browsers** — Firefox (software and hardware Wayland, experimental) and Chromium (software Wayland, experimental), Ladybird (Wayland, experimental), NetSurf (custom framebuffer surface)
 - **GTK apps** — Qalculate! (calculator), Mousepad (text editor), GIMP (experimental)
 - **Shells / tools** — bash, busybox, TCC
-- **Brook-native apps** — file browser (`brook-files`), calculator, Wayland smoke tests
+- **Desktop apps** — Files (Nautilus), Brook Settings, Calculator and Wayland smoke tests
 - **Smoke tests** — fork/exec, pipe, signals, SCM_RIGHTS fd passing, symlink, epoll, TCP, Wayland client stub
 
 ### Drivers (loadable modules)
@@ -305,6 +305,12 @@ than the captured desktop; UI text is clearest in the full-resolution image.
 New captures use native 1920×1080 without upscaling; the game-window crops
 below retain their original pixels for readable UI text. See
 [showcase capture and demo plans](docs/showcase.md).
+
+<p align="center">
+  <a href="docs/images/brook_quake3_rounded_glass_1080.png"><img src="docs/images/brook_quake3_rounded_glass_1080.png" alt="Quake III Arena demo running through hardware VirGL on Brook with rounded dark glass chrome" width="960"></a>
+</p>
+
+<p align="center"><em>Quake III Arena demo through hardware VirGL, with rounded dark glass chrome on Brook's native 1920×1080 desktop</em></p>
 
 <p align="center">
   <a href="docs/images/brook_torchlight2_gameplay.png"><img src="docs/images/brook_torchlight2_gameplay.png" alt="Torchlight II's native Linux build rendering Echo Pass on Brook, with a new test character and pet" width="816"></a>
@@ -609,7 +615,6 @@ src/
     inc_um/         Usermode shared headers
     src_um/         Usermode shared sources
 tools/
-  brook-files-pkg/  Native Wayland file browser
   brook-edit-pkg/   Native Wayland text editor (Ctrl+S/F/D)
   brook-console-pkg/ Native Wayland kernel log viewer (Ctrl+F filter)
   wayland-calc-pkg/ Native Wayland interactive calculator

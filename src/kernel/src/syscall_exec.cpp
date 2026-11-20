@@ -1,6 +1,6 @@
 // syscall_exec.cpp -- execve.
 //
-// Split from syscall.cpp (see docs/agent/syscall-split-plan.md).
+// Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "syscall.h"

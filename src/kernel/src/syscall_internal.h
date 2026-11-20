@@ -1,8 +1,7 @@
 #pragma once
 
 // syscall_internal.h -- internal declarations shared from syscall_common.cpp.
-// Internal to the syscall layer; split from syscall.cpp
-// (see docs/agent/syscall-split-plan.md).
+// Internal to the syscall layer; split from syscall.cpp.
 
 #include "serial.h"
 #include "scheduler.h"

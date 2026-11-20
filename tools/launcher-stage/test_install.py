@@ -1,6 +1,6 @@
 """Host test for install.py: check mode, create-only install, link swaps,
 Apps-manifest edits and --rollback, under a private BROOK_STAGE_ROOT."""
-import hashlib, io, json, os, subprocess, sys, tarfile, tempfile, unittest
+import hashlib, io, json, os, shutil, subprocess, sys, tarfile, tempfile, unittest
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -23,7 +23,8 @@ class InstallTests(unittest.TestCase):
         (self.root/'nix/share/applications/applications.idx').write_text(OLD_IDX)
         files = {'bin/brook-quake2': (b'#!/bin/sh\n', True), 'bin/brook-codium': (b'#!/bin/sh\n', True),
                  'share/applications/brook-quake2.desktop': (b'[Desktop Entry]\n', False),
-                 'share/brook-icons/brook-quake2.rgba': (b'\x01' * 2304, False)}
+                 'share/brook-icons/brook-quake2.rgba': (b'\x01' * 2304, False),
+                 'bin/brook-session.conf': (b'<busconfig/>\n', False)}
         entry = {'files': {}, 'links': {}, 'dirs': ['bin', 'share', 'share/applications', 'share/brook-icons'], 'exec': []}
         with tarfile.open(self.bundle/'store.tar', 'w') as t:
             for d in [''] + entry['dirs']:
@@ -84,6 +85,31 @@ class InstallTests(unittest.TestCase):
         self.assertFalse(os.path.lexists(self.root/'nix/profile/bin/brook-codium'))
         self.assertFalse(os.path.lexists(self.root/'nix/profile/share/applications/brook-quake2.desktop'))
         self.assertFalse((self.root/'nix/share/applications/icons/brook-quake2.rgba').exists())
+
+    def run_links(self, links):
+        (self.bundle/'links.json').write_text(json.dumps(links))
+        b = self.bundle
+        return subprocess.run([sys.executable, str(HERE/'install.py'), str(b/'store.tar'), str(b/'manifest.json'),
+                               str(b/'closure.txt'), str(b/'links.json'), 'TX2'],
+                              env=dict(os.environ, BROOK_STAGE_ROOT=str(self.root)), capture_output=True, text=True)
+
+    def test_bin_config_file_update(self):
+        # A non-executable file already in bin may be updated in place...
+        old = self.root/'nix/store/old-dbus/bin'
+        old.mkdir(parents=True)
+        (old/'brook-session.conf').write_text('<old/>')
+        (self.root/'nix/profile/bin/brook-session.conf').symlink_to('/nix/store/old-dbus/bin/brook-session.conf')
+        r = self.run_links({'/nix/profile/bin/brook-session.conf': STORE + '/bin/brook-session.conf'})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(os.readlink(self.root/'nix/profile/bin/brook-session.conf'), STORE + '/bin/brook-session.conf')
+
+    def test_bin_link_never_loses_exec(self):
+        # ...but an executable or new bin entry never becomes a plain file.
+        for name in ('brook-quake2', 'brook-new'):
+            r = self.run_links({'/nix/profile/bin/' + name: STORE + '/bin/brook-session.conf'})
+            self.assertNotEqual(r.returncode, 0, name)
+            self.assertIn('target not executable', r.stderr)
+            shutil.rmtree(self.root/STORE.lstrip('/'), ignore_errors=True)
 
     def test_missing_closure_blocks(self):
         os.rmdir(self.root/DEP.lstrip('/'))

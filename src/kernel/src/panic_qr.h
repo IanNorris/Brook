@@ -25,7 +25,11 @@ static constexpr uint8_t  QR_VERSION_RAW = 0x01;  // v1: uncompressed binary
 // the dense payload QR(s).  Kept as its own QR (not prefixed onto the payload) so
 // the payload stays in QR alphanumeric mode (Base45) at full density — embedding
 // a lowercase URL would force the whole code into byte mode and cut capacity ~58%.
-#define PANIC_INGEST_URL "https://khione:9001/"
+// The scanner host is a local detail: builds pass BROOK_PANIC_INGEST_URL
+// (CMake), e.g. from a private config; this is a neutral default.
+#ifndef PANIC_INGEST_URL
+#define PANIC_INGEST_URL "https://brook-panic.local:9001/"
+#endif
 static constexpr uint32_t QR_HEADER_PAD  = 0xCAFEF00D;
 static constexpr uint32_t QR_PACKET_TYPE_CPU_REGS       = 0xA3000001;
 static constexpr uint32_t QR_PACKET_TYPE_STACK_TRACE    = 0xA3000002;

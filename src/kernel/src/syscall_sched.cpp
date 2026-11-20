@@ -1,6 +1,6 @@
 // syscall_sched.cpp -- scheduler syscalls: yield, affinity, policy, priority, membarrier.
 //
-// Split from syscall.cpp (see docs/agent/syscall-split-plan.md).
+// Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "apic.h"

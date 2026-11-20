@@ -1,5 +1,0 @@
-# Brook Wayland file browser — two-pane directory viewer.
-set wm
-set vfb none
-run --service --once /nix/bin/waylandd
-run /nix/profile/bin/brook-files /

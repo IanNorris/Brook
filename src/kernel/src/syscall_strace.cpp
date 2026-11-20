@@ -1,6 +1,6 @@
 // syscall_strace.cpp -- syscall tracing (strace) and its controls.
 //
-// Split from syscall.cpp (see docs/agent/syscall-split-plan.md).
+// Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "serial.h"

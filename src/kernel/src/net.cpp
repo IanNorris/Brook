@@ -87,6 +87,7 @@ inline void* operator new(__SIZE_TYPE__,void* storage) noexcept { return storage
 #include "loopback_queue.h"
 #include "ksym_addrs.h"
 #include "window.h"
+#include "launcher_user_manifest.h"
 #include "desktop_telemetry.h"
 #include "storage_io_stats.h"
 #include "smp.h"
@@ -5278,6 +5279,36 @@ static void DebugAudioDiagnostics()
     DebugChannelSend("]}\n");
 }
 
+static void DebugLauncherStatus()
+{
+    LauncherPersistenceStatus state;
+    WmLauncherPersistenceStatus(state);
+    BridgeReply r;
+    r.text("{\"worker\":"); r.quoted(state.worker);
+    r.text(",\"path\":"); r.quoted(state.path); r.text(",");
+    r.field("layout_epoch", state.layoutEpoch); r.text(",");
+    r.field("saved_epoch", state.savedEpoch);
+    r.text(state.pending ? ",\"pending\":true" : ",\"pending\":false");
+    r.text(state.saving ? ",\"saving\":true" : ",\"saving\":false");
+    r.text(",\"last_load\":{\"stage\":"); r.quoted(state.load.stage); r.text(",");
+    r.field("errno", -state.load.error);
+    r.text("},\"last_save\":{\"stage\":"); r.quoted(state.save.stage); r.text(",");
+    r.field("errno", -state.save.error);
+    r.text("},\"pins\":[");
+    for (uint32_t i = 0; i < state.pinCount; ++i) {
+        if (i) r.text(",");
+        r.quoted(state.pins[i]);
+    }
+    const auto user = WmLauncherUserManifestStatus();
+    r.text("],\"user_manifest\":{\"path\":"); r.quoted(UserLauncherManifestPath);
+    r.text(",\"last_load\":{\"stage\":"); r.quoted(user.load.stage); r.text(",");
+    r.field("errno", -user.load.error);
+    r.text("},"); r.field("entries", user.entries);
+    r.text(","); r.field("rejected", user.rejected);
+    r.text("}}\n");
+    r.send();
+}
+
 // Process-context only: pin completed AS identities without following a raw
 // proc->addressSpace pointer that a concurrent exec could retire.
 static void DebugMemoryBreakdown()
@@ -5870,6 +5901,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  mem cleanup status - exec-cache release trims and PMM drain TLB barriers (rates: diff two reads)\n"
             "  mem exec-cache  - executable page sharing counters\n"
             "  mem breakdown   - physical RAM classes and live Broadwell buffer owners\n"
+            "  launcher status - launcher layout persistence and pins\n"
             "  mem census      - rolling per-address-space mapping/RAM attribution\n"
             "  lastlog status|on|off|flush | lastlog previous OFFSET COUNT - on-disk kernel log tail + census (/nix/var/log/brook), previous boot's record\n"
             "  compat census [N (default 128, max 512)] | compat census reset - ENOSYS and unsupported ioctl/fcntl/prctl/sockopt/socket/clone/mmap/path hits, sorted by count\n"
@@ -7833,6 +7865,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",");r.field("host_blob_quarantined",blobs.quarantined);
         r.text("}\n");r.send();
     }
+    else if (NetStrEq(cmd, "launcher status")) { DebugLauncherStatus(); }
     else if (NetStrEq(cmd, "mem breakdown")) { DebugMemoryBreakdown(); }
     else if (NetStrEq(cmd, "mem census")) { DebugMemoryCensus(); }
     else if (NetStrEq(cmd, "mem pids")) {

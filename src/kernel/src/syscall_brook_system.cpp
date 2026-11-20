@@ -1,6 +1,6 @@
 // syscall_brook_system.cpp -- Brook system syscalls: profiler, crash entry, input, system messages, paging, audio, AHCI export.
 //
-// Split from syscall.cpp (see docs/agent/syscall-split-plan.md).
+// Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "system_message.h"

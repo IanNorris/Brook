@@ -1,6 +1,6 @@
 // syscall_socket.cpp -- socket syscalls (inet, AF_UNIX and netlink), SCM_RIGHTS and msghdr I/O.
 //
-// Split from syscall.cpp (see docs/agent/syscall-split-plan.md).
+// Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "tcp_info.h"

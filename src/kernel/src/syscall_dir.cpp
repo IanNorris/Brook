@@ -1,6 +1,6 @@
 // syscall_dir.cpp -- directory listing: getdents64.
 //
-// Split from syscall.cpp (see docs/agent/syscall-split-plan.md).
+// Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "intel_bdw_scanout.h"

@@ -278,3 +278,32 @@ Guest steps go through the bridge, as root:
 - **Until a sample exists,** or for apps with no `:height`, the block keeps Brook's title colours.
 
 **Fallback (Chromium draws everything):** take the app out of `BROOK_WAYLAND_CAPTION_APPS`, or set it empty for all apps. waylandd then answers plain client-side, and Chromium shows its own three buttons (with the launcher's layout).
+
+## GTK4 window actions and xdg-shell v5 (20 November 2026)
+
+GTK 4.20.3 constructs titlebar controls from the layout, modality, transience
+and resizability. Libadwaita 1.8.5.1 uses those GtkWindowControls in
+`src/adw-header-bar.c` around lines 293 and 331. Once a Wayland surface exists,
+`update_window_actions` requires the GDK capabilities for Minimise and
+Maximise. The action gate has no tiled-state condition. A visible Maximise
+button already satisfies the resizable check. GDK populates the two flags
+from `xdg_toplevel.wm_capabilities`, which Brook's v3 global could never
+send. [GTK controls](https://raw.githubusercontent.com/GNOME/gtk/4.20.3/gtk/gtkwindowcontrols.c)
+[GTK actions](https://raw.githubusercontent.com/GNOME/gtk/4.20.3/gtk/gtkwindow.c)
+[GDK Wayland capabilities](https://raw.githubusercontent.com/GNOME/gtk/4.20.3/gdk/wayland/gdktoplevel-wayland.c)
+
+Brook advertises v5. Each toplevel gets the implemented Maximise, Minimise
+and Fullscreen capabilities before its first configure. The window menu
+request remains a stub. v4 and later get advisory bounds in logical output
+coordinates when known and updates when the reported dimensions change.
+The provider stays at v5 until the WM can report repaint suspension for v6.
+
+The wire fixture checks v3, v4 and v5, exact capability values and their
+order before the configure. Pinned GTK4 enabled both controls against the
+new provider on a private Wayland socket. GTK3 and Chromium both received
+and acknowledged the initial configure. They hit the same retained-scene
+failure after buffer attach in the v3 and v5 host probes because the host
+lacks Brook's window syscalls. Their pinned listeners accept both new
+events. Full rendering and button actions on the Dell remain unverified.
+[GTK3 Wayland listener](https://raw.githubusercontent.com/GNOME/gtk/3.24.52/gdk/wayland/gdkwindow-wayland.c)
+[Chromium Wayland listener](https://raw.githubusercontent.com/chromium/chromium/148.0.7778.96/ui/ozone/platform/wayland/host/xdg_toplevel.cc)

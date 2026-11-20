@@ -428,6 +428,7 @@ struct brook_surface {
      * applied once the kernel window exists. */
     int  toplevel_fullscreen,want_fullscreen;
     int32_t configure_width,configure_height;
+    int32_t bounds_width,bounds_height;
     int configure_size_pending,configure_size_acked;
     uint32_t configure_size_serial;
     int32_t window_geometry_w, window_geometry_h;
@@ -1029,6 +1030,37 @@ static void surface_cursor_commit(struct brook_surface *s) {
     }
     wm_set_cursor_image_for(pixels,dw,dh,(int64_t)s->cursor_hot_x*dw/g->w,(int64_t)s->cursor_hot_y*dh/g->h,s->cursor_owner_wm);
 }
+static void toplevel_output_size(const struct brook_surface *s, uint32_t *width, uint32_t *height)
+{
+    *width = *height = 0;
+    wm_get_screen_info(width, height);
+    const uint32_t scale = surface_output_scale(s);
+    *width /= scale;
+    *height /= scale;
+}
+
+static void toplevel_send_bounds(struct brook_surface *s, uint32_t width, uint32_t height)
+{
+    if (wl_resource_get_version(s->xdg_toplevel) < XDG_TOPLEVEL_CONFIGURE_BOUNDS_SINCE_VERSION) return;
+    if (!width || !height || width > INT32_MAX || height > INT32_MAX) width = height = 0;
+
+    if (s->bounds_width == (int32_t)width && s->bounds_height == (int32_t)height) return;
+    s->bounds_width = (int32_t)width;
+    s->bounds_height = (int32_t)height;
+    xdg_toplevel_send_configure_bounds(s->xdg_toplevel, s->bounds_width, s->bounds_height);
+}
+
+static void toplevel_send_wm_capabilities(struct wl_resource *toplevel)
+{
+    if (wl_resource_get_version(toplevel) < XDG_TOPLEVEL_WM_CAPABILITIES_SINCE_VERSION) return;
+    // All three requests have WM implementations. show_window_menu is a stub.
+    uint32_t supported[] = { XDG_TOPLEVEL_WM_CAPABILITIES_MAXIMIZE,
+                             XDG_TOPLEVEL_WM_CAPABILITIES_MINIMIZE,
+                             XDG_TOPLEVEL_WM_CAPABILITIES_FULLSCREEN };
+    struct wl_array capabilities = { .size = sizeof(supported), .data = supported };
+    xdg_toplevel_send_wm_capabilities(toplevel, &capabilities);
+}
+
 /* Configure size and state form one transaction. Focus changes may supersede
  * its serial, but must preserve both dimensions and management state. */
 static int toplevel_send_state(struct brook_surface *s,int32_t width,int32_t height) {
@@ -1041,6 +1073,11 @@ static int toplevel_send_state(struct brook_surface *s,int32_t width,int32_t hei
         uint32_t *state=wl_array_add(&states,sizeof(*state));
         if(!state) { wl_array_release(&states);wl_client_post_no_memory(wl_resource_get_client(s->resource));return 0; }
         *state=values[i];
+    }
+    if (wl_resource_get_version(s->xdg_toplevel) >= XDG_TOPLEVEL_CONFIGURE_BOUNDS_SINCE_VERSION) {
+        uint32_t screen_w, screen_h;
+        toplevel_output_size(s, &screen_w, &screen_h);
+        toplevel_send_bounds(s, screen_w, screen_h);
     }
     xdg_toplevel_send_configure(s->xdg_toplevel,width,height,&states);wl_array_release(&states);
     s->next_configure_serial=next_serial();s->configure_ms=g_now_ms();
@@ -1087,8 +1124,10 @@ static void surface_commit(struct wl_client *c,struct wl_resource *r) {
         wl_array_init(&states);
         /* Keep the bounded GTK fallback, honoring committed client constraints.
          * Hints are advisory: never turn an absurd minimum into a huge SHM pool. */
-        uint32_t screen_w=0,screen_h=0;wm_get_screen_info(&screen_w,&screen_h);
-        screen_w/=surface_output_scale(s);screen_h/=surface_output_scale(s);
+        uint32_t screen_w, screen_h;
+        toplevel_output_size(s, &screen_w, &screen_h);
+        s->bounds_width = s->bounds_height = 0;
+        toplevel_send_bounds(s, screen_w, screen_h);
         const int32_t cap_w=screen_w && screen_w<4096?(int32_t)screen_w:4096;
         const int32_t cap_h=screen_h && screen_h<2160?(int32_t)screen_h:2160;
         const int32_t width=toplevel_initial_axis(800,s->size_hints.min_w,s->size_hints.max_w,cap_w);
@@ -1501,6 +1540,7 @@ static void xdg_surface_get_toplevel(struct wl_client *c, struct wl_resource *r,
     if (!tr) { wl_client_post_no_memory(c); return; }
     wl_resource_set_implementation(tr, &xdg_toplevel_impl, s, xdg_toplevel_resource_destroy);
     s->xdg_toplevel = tr;
+    toplevel_send_wm_capabilities(tr);
     /* KDE decoration belongs to wl_surface and may precede its shell role. */
     if (!s->deco_negotiated) {
         s->deco_csd = 0;
@@ -1684,6 +1724,9 @@ static const struct xdg_positioner_interface positioner_impl = {
 };
 
 /* xdg_wm_base */
+
+/* Version 6 adds repaint suspension, which the WM does not report. */
+#define BROOK_XDG_WM_BASE_VERSION 5
 
 static void wm_base_destroy(struct wl_client *c, struct wl_resource *r) {
     (void)c; wl_resource_destroy(r);
@@ -2509,13 +2552,30 @@ static void dispatch_surface_event(struct brook_surface *s,
          * the new size — the client will allocate a fresh buffer at
          * those dimensions, ack_configure, and commit. */
         if (s->xdg_toplevel && s->xdg_surface) {
-            int32_t neww = e->x/(int32_t)surface_output_scale(s);
-            int32_t newh = e->y/(int32_t)surface_output_scale(s);
-            s->toplevel_fullscreen=(e->reserved&WM_RESIZE_FULLSCREEN)!=0;
-            s->toplevel_maximized=!s->toplevel_fullscreen && (e->reserved&WM_RESIZE_MAXIMIZED)!=0;
-            s->toplevel_resizing=!s->toplevel_maximized && !s->toplevel_fullscreen && (e->reserved&WM_RESIZE_RESIZING)!=0;
-            s->configure_width=neww;s->configure_height=newh;s->configure_size_pending=1;
-            toplevel_send_state(s,neww,newh);
+            const int32_t scale = (int32_t)surface_output_scale(s);
+            int32_t neww = e->x / scale, newh = e->y / scale;
+            const int was_managed = s->toplevel_maximized || s->toplevel_fullscreen;
+            s->toplevel_fullscreen = (e->reserved & WM_RESIZE_FULLSCREEN) != 0;
+            s->toplevel_maximized = !s->toplevel_fullscreen && (e->reserved & WM_RESIZE_MAXIMIZED) != 0;
+            const int managed = s->toplevel_maximized || s->toplevel_fullscreen;
+            s->toplevel_resizing = !managed && !was_managed && (e->reserved & WM_RESIZE_RESIZING) != 0;
+            if (!managed && was_managed) {
+                // The WM saved a buffer rectangle, including any CSD
+                // shadows. A 0x0 restore asks the client to restore its
+                // previous logical window geometry and decoration together.
+                neww = newh = 0;
+            } else if (!managed && s->deco_sent_mode > 0) {
+                // xdg_toplevel.configure uses window geometry. The VFB and
+                // the WM's outer client rectangle include client shadows.
+                const int32_t shadow_w = (int32_t)(s->vfb_w / scale) - s->window_geometry_w;
+                const int32_t shadow_h = (int32_t)(s->vfb_h / scale) - s->window_geometry_h;
+                if (s->window_geometry_w > 0 && shadow_w > 0 && neww > shadow_w) neww -= shadow_w;
+                if (s->window_geometry_h > 0 && shadow_h > 0 && newh > shadow_h) newh -= shadow_h;
+            }
+            s->configure_width = neww;
+            s->configure_height = newh;
+            s->configure_size_pending = 1;
+            toplevel_send_state(s, neww, newh);
             fprintf(stderr,"[waylandd] WM_EVT_RESIZED wm=%u configure %dx%d max=%d full=%d resizing=%d serial=%u\n",
                 s->wm_id,neww,newh,s->toplevel_maximized,s->toplevel_fullscreen,s->toplevel_resizing,s->next_configure_serial);
         }
@@ -4642,7 +4702,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "[waylandd] WARN: wl_display_init_shm failed\n");
 
     if (!wl_global_create(g_display, &wl_compositor_interface, 4, NULL, compositor_bind)) return 1;
-    if (!wl_global_create(g_display, &xdg_wm_base_interface, 3, NULL, wm_base_bind)) return 1;
+    if (!wl_global_create(g_display, &xdg_wm_base_interface, BROOK_XDG_WM_BASE_VERSION, NULL, wm_base_bind)) return 1;
     if (!wl_global_create(g_display, &wl_seat_interface, WL_POINTER_AXIS_VALUE120_SINCE_VERSION,
                           NULL, seat_bind)) return 1;
     if (!wl_global_create(g_display,&zwp_relative_pointer_manager_v1_interface,1,NULL,relative_manager_bind)) return 1;

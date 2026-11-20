@@ -13,5 +13,8 @@ pkgs.runCommand "brook-session-dbus-1" {
   # Brook does not populate Linux's /etc/dbus-1. Ship the upstream session
   # policy beside the stable executable and select it explicitly at startup.
   cp ${pkgs.dbus}/share/dbus-1/session.conf $out/bin/brook-session.conf
+  substituteInPlace "$out/bin/brook-session.conf" \
+    --replace-fail '<standard_session_servicedirs />' \
+      '<standard_session_servicedirs /><servicedir>/nix/profile/share/dbus-1/services</servicedir>'
   $out/bin/brook-dbus --version
 ''

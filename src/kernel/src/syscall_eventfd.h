@@ -1,8 +1,7 @@
 #pragma once
 
 // syscall_eventfd.h -- internal declarations shared from syscall_eventfd.cpp.
-// Internal to the syscall layer; split from syscall.cpp
-// (see docs/agent/syscall-split-plan.md).
+// Internal to the syscall layer; split from syscall.cpp.
 
 #include "sync/kmutex.h"
 #include "memory/heap.h"

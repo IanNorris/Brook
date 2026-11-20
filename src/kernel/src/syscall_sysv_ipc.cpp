@@ -1,6 +1,6 @@
 // syscall_sysv_ipc.cpp -- System V semaphore syscalls.
 //
-// Split from syscall.cpp (see docs/agent/syscall-split-plan.md).
+// Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "process_user_namespace.h"

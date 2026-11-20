@@ -1,4 +1,5 @@
 #pragma once
+#include "launcher_model.h"
 
 #include <stdint.h>
 #include "launch_history.h"
@@ -195,7 +196,8 @@ struct Window
     uint16_t    captionHeight;  // client's title-strip height (physical px); 0 = native title height
     uint32_t    captionStyle;   // DesktopCaptionStyle* packing; 0 = native title style
     bool        focusable;      // popups/tooltips stay above but don't take keyboard focus
-    char        title[64];
+    char        title[64];      // original title from the client
+    char        webAppTitle[64]; // display override from the active launcher catalog
     char        appId[128];     // explicit xdg app_id, independent of document title
 
     // Per-window VFB (Phase A of wayland↔WM unification).  When non-null
@@ -375,7 +377,7 @@ bool WmTaskbarHidden();
 uint32_t WmTaskbarTop(uint32_t screenH);
 
 // Set maximise state idempotently.
-void WmSetMaximized(int idx, bool enable);
+void WmSetMaximized(int idx, bool enable, bool acknowledge = false);
 
 // Minimize a window (hide from desktop, show in taskbar).
 void WmMinimizeWindow(int idx);
@@ -392,7 +394,7 @@ struct WmDebugWindow {
     int32_t x,y;uint32_t width,height,outerWidth,outerHeight,bufferWidth,bufferHeight;
     bool visible,minimized,maximized,focused,focusable,apiWindow,providerKernel;
     bool fullscreen;
-    char title[64],appId[128];
+    char title[64],rawTitle[64],appId[128];
 };
 enum class WmDebugAction : uint32_t { Focus,Minimize,Maximize,Restore,Close };
 // Registry-backed owner reference; caller must ProcessUnref after cleanup.
@@ -523,6 +525,7 @@ uint32_t WmDesktopHeight(uint32_t screenH);
 
 // Spawn a new terminal window (Super+Enter handler).
 void WmSpawnTerminal();
+void WmOpenFiles();
 
 // ---------------------------------------------------------------------------
 // Per-window VFB API (Phase A of wayland↔WM unification).
@@ -671,7 +674,7 @@ static constexpr uint32_t WM_RESIZE_RESIZING = 2;
 static constexpr uint32_t WM_RESIZE_FULLSCREEN = 4; // never with MAXIMIZED
 
 // Push a synthetic WM event into the per-window queue.  Drops on overflow.
-bool WmPushWmEvent(Window* win, uint8_t type, int16_t x = 0, int16_t y = 0);
+bool WmPushWmEvent(Window* win, uint8_t type, int16_t x = 0, int16_t y = 0, uint32_t resizeFlags = 0);
 // Kernel-authenticated socket origin, associated by the provider. Immutable
 // after the first registration, and only for a window owned by that provider.
 bool WmRegisterClientOrigin(Process* provider,uint32_t wmId,uint16_t clientPid,
@@ -697,18 +700,48 @@ struct LauncherItem {
     uint32_t iconColor;    // Icon background color (0 = auto from title)
     uint32_t* iconPixels;  // Raw ARGB icon data (24x24), or nullptr for generic application icon
     bool valid;
-    bool isDesktopEntry;   // true if sourced from .desktop file (exec directly)
+    bool isDesktopEntry;   // launch a program instead of a shortcut script
+    bool isUserDesktopEntry;
+    bool isWebApp;
 };
 
 struct WmDebugApp {
     char id[33],title[48],desktopAppId[128],executable[64];
-    bool desktop,eligible;
+    bool desktop,userDesktop,eligible;
 };
 uint32_t WmSnapshotDebugApps(WmDebugApp* out,uint32_t capacity,
                              uint32_t* generation,uint64_t* builtTick);
 
 // Load shortcut files from /boot/SHORTCUTS/ directory.
 void WmLauncherLoad();
+
+struct LauncherPersistenceResult {
+    const char* stage = "unattempted";
+    int error = 0;
+};
+
+struct LauncherPersistenceStatus {
+    LauncherPersistenceResult load, save;
+    uint32_t layoutEpoch = 0;
+    uint32_t savedEpoch = 0;
+    bool pending = false;
+    bool saving = false;
+    const char* worker = nullptr;
+    const char* path = nullptr;
+    uint32_t pinCount = 0;
+    char pins[LauncherLimits::Pins][LauncherLimits::KeyLength]{};
+};
+
+void WmLauncherPersistenceStatus(LauncherPersistenceStatus& out);
+
+struct LauncherUserManifestStatus {
+    LauncherPersistenceResult load;
+    uint32_t entries = 0;
+    uint32_t rejected = 0;
+};
+LauncherUserManifestStatus WmLauncherUserManifestStatus();
+void WmRequestUserLauncherRefresh();
+
 // Notification is nonblocking; a worker rebuilds and the compositor publishes.
 void WmRequestLauncherRefresh();
 // Compositor-only: apply after input, before geometry/render for this frame.

@@ -98,7 +98,7 @@ def main():
         'A desktop and kernel log window are the expected success screen.\n'
         'Input may be unavailable; that is outside this first boot gate.\n'
         'If it stops, record the last message/progress and scan panic QR pages.\n'
-        'Scanner: https://khione:9001/ or https://192.168.85.8:9001/\n')
+        f'Scanner: {os.environ.get("BROOK_PANIC_INGEST_URL", "the panic scanner on the build host")}\n')
     if args.volatile_desktop:
         with (payload/'README.TXT').open('a') as f:f.write('\nOffline desktop: /tmp and /data are RAM ONLY. Home/settings changes are lost on shutdown.\n')
     if args.input_probe:

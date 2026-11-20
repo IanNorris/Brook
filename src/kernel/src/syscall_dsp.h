@@ -1,8 +1,7 @@
 #pragma once
 
 // syscall_dsp.h -- internal declarations shared from syscall_dsp.cpp.
-// Internal to the syscall layer; split from syscall.cpp
-// (see docs/agent/syscall-split-plan.md).
+// Internal to the syscall layer; split from syscall.cpp.
 
 #include "sync/kmutex.h"
 #include "audio.h"
