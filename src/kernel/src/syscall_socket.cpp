@@ -3,6 +3,7 @@
 // Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
+#include "process_namespaces.h"
 #include "tcp_info.h"
 #include "process_user_namespace.h"
 
@@ -56,6 +57,7 @@ int64_t sys_socket(uint64_t domain, uint64_t type, uint64_t protocol,
         auto* socket=static_cast<NetlinkSocket*>(kmalloc(sizeof(NetlinkSocket)));
         if(!socket)return -ENOMEM;
         *socket=NetlinkSocket{};
+        socket->networkScope=ProcessNetworkScope(proc);
         const auto actor=ProcessFileActorAcquire(proc,nullptr);
         socket->identity=NetAllocateSocketIdentity(actor.uid,actor.gid);ProcessGroupsRelease(actor.groups);
         if(!socket->identity.inode){kfree(socket);return -ENOMEM;}
@@ -75,6 +77,7 @@ int64_t sys_socket(uint64_t domain, uint64_t type, uint64_t protocol,
         usd->state    = UnixSocketData::State::Unbound;
         usd->nonblock = (type & UNIX_SOCK_NONBLOCK) != 0;
         usd->refCount = 1;
+        usd->networkScope = ProcessNetworkScope(proc);
         usd->socketType = static_cast<uint32_t>(type) & 0xfu;
         usd->peerCredentials = {0, ~uint32_t{0}, ~uint32_t{0}};
 
@@ -94,7 +97,7 @@ int64_t sys_socket(uint64_t domain, uint64_t type, uint64_t protocol,
 
     int sockIdx = SockCreate(static_cast<int>(domain),
                               static_cast<int>(type & 0xFF), // mask SOCK_NONBLOCK etc
-                              static_cast<int>(protocol));
+                              static_cast<int>(protocol),ProcessNetworkScope(proc));
     if (sockIdx < 0) return -ENOMEM;
 
     // Record nonblocking flag
@@ -260,7 +263,7 @@ int64_t sys_connect(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
         const auto* addressBytes = reinterpret_cast<const uint8_t*>(&address);
         const bool abstract = UnixAddressIsAbstract(addressBytes, static_cast<uint32_t>(addrLen));
         UnixSocketData* server = UnixFindServer(path, lookup.node ? &identity : nullptr,
-            abstract ? addressBytes : nullptr, abstract ? static_cast<uint32_t>(addrLen) : 0);
+            abstract ? addressBytes : nullptr, abstract ? static_cast<uint32_t>(addrLen) : 0,usd->networkScope);
         if (!server) return -ECONNREFUSED;
         struct ServerReference {
             UnixSocketData* value;
@@ -412,7 +415,7 @@ int64_t sys_sendto(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
     int ret = SockSendTo(sockIdx, payload, static_cast<uint32_t>(lenVal),
                           destVal ? &destination : nullptr);
     kfree(payload);
-    if (ret < 0) return -EIO;
+    if (ret < 0) return ret==-101 ? ret : -EIO;
     return static_cast<int64_t>(lenVal);
 }
 
@@ -834,6 +837,7 @@ static int64_t AcceptSocket(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVa
             if (slot >= 0) {
                 const UnixPendingConn& pending = usd->pending[slot];
                 serverSock->state = UnixSocketData::State::Connected;
+                serverSock->networkScope = usd->networkScope;
                 serverSock->socketType = usd->socketType;
                 serverSock->peerCredentials = pending.clientCredentials;
                 serverSock->peerIncarnation=pending.clientIncarnation;
@@ -1009,6 +1013,7 @@ int64_t sys_socketpair(uint64_t domain, uint64_t type, uint64_t protocol,
     endA->state = UnixSocketData::State::Connected;
     endA->nonblock = nonblock;
     endA->refCount = 1;
+    endA->networkScope = ProcessNetworkScope(proc);
     endA->socketType = static_cast<uint32_t>(type) & 0xfu;
     endA->peerCredentials = UnixCurrentCredentials(proc);
     endA->peerIncarnation=UnixCurrentIncarnation(proc);endA->peerLaunchId=proc->launchId;
@@ -1020,6 +1025,7 @@ int64_t sys_socketpair(uint64_t domain, uint64_t type, uint64_t protocol,
     endB->state = UnixSocketData::State::Connected;
     endB->nonblock = nonblock;
     endB->refCount = 1;
+    endB->networkScope = endA->networkScope;
     endB->socketType = static_cast<uint32_t>(type) & 0xfu;
     endB->peerCredentials = endA->peerCredentials;
     endB->peerIncarnation=endA->peerIncarnation;endB->peerLaunchId=endA->peerLaunchId;

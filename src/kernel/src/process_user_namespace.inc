@@ -36,7 +36,8 @@ int ProcessUserNamespaceCreate(Process* child) {
     if(!child)return -22;
     auto* ns=static_cast<UserNamespace*>(kmalloc(sizeof(UserNamespace)));if(!ns)return -12;
     *ns={};
-    // The child is unpublished. Its inherited identity is a pinned snapshot.
+    // Also used by the current single-threaded task during unshare.
+    ProcessOperationGuard operation(ProcessCurrent());
     SpinLockAcquire(&g_credentialsLock);auto* parent=child->userNamespace;
     if((parent && parent->depth>=8) || UserIdFromCanonical(parent,false,child->euid)==UserIdInvalid ||
        UserIdFromCanonical(parent,true,child->egid)==UserIdInvalid) {

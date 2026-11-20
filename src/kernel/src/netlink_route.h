@@ -36,11 +36,43 @@ class RouteReply {
         for(unsigned i=0;i<4;++i)bytes[start+i]=reinterpret_cast<uint8_t*>(&n)[i];
     }
     static unsigned nameLength(const char* name){unsigned n=0;while(n<15 && name[n])++n;return n+1;}
+    static uint32_t word(const uint8_t* input) {
+        uint32_t result=0;
+        auto* out=reinterpret_cast<uint8_t*>(&result);
+        for(unsigned i=0;i<4;++i)out[i]=input[i];
+        return result;
+    }
+    static int setupLoopback(const RouteMessage& request,const uint8_t* payload,
+                             uint32_t length,bool permitted) {
+        if(!permitted)return -95;
+        if(request.type==16) {
+            // IFF_UP only, for the fixed namespace-local lo interface.
+            if(request.flags!=5 || length!=16 || word(payload)!=0 ||
+               word(payload+4)!=1 || word(payload+8)!=1 || word(payload+12)!=1)return -22;
+            return 0;
+        }
+        // Brook creates a private namespace with 127/8 already attached to
+        // lo. Confirm that exact address setup; reject other changes.
+        if((request.flags&~uint16_t{0x605}) || !(request.flags&4) ||
+           length!=24 || payload[0]!=2 || payload[1]!=8 ||
+           payload[2]!=128 || payload[3]!=254 || word(payload+4)!=1)return -22;
+        unsigned seen=0;
+        for(unsigned i=8;i<24;i+=8) {
+            if(payload[i]!=8 || payload[i+1] || payload[i+3] ||
+               (payload[i+2]!=1 && payload[i+2]!=2))return -22;
+            const unsigned bit=1u<<payload[i+2];
+            if((seen&bit) || payload[i+4]!=127 || payload[i+5] ||
+               payload[i+6] || payload[i+7]!=1)return -22;
+            seen|=bit;
+        }
+        return 0;
+    }
+
 public:
     RouteReply(void* p,uint32_t n):bytes(static_cast<uint8_t*>(p)),capacity(n){}
     uint32_t size()const{return failed?0:used;}
     // Complete framing must validate before any socket queue publication.
-    int build(const void* input,uint32_t length,uint32_t port,const InterfaceView* interfaces,uint32_t count) {
+    int build(const void* input,uint32_t length,uint32_t port,const InterfaceView* interfaces,uint32_t count,bool privateSetup=false) {
         const auto* in=static_cast<const uint8_t*>(input);
         for(uint32_t pos=0;pos<length;) {
             if(length-pos<sizeof(RouteMessage))return -22;
@@ -50,11 +82,13 @@ public:
             if(request.length<sizeof(request) || request.length>length-pos)return -22;
             if(!(request.flags&1))return -22; // NLM_F_REQUEST
             int error=0;
-            if(request.type!=18 && request.type!=22)error=-95; // RTM_GETLINK/GETADDR only
+            const bool setup=request.type==16 || request.type==20; // RTM_NEWLINK/NEWADDR
+            if(setup)error=setupLoopback(request,in+pos+sizeof(request),request.length-sizeof(request),privateSetup);
+            else if(request.type!=18 && request.type!=22)error=-95; // RTM_GETLINK/GETADDR only
             else if((request.flags&0x300)!=0x300)error=-95; // dump, not mutation or individual lookup
             else if(request.length<sizeof(request)+1)error=-22;
             else if(in[pos+16]!=0 && in[pos+16]!=2)error=-97;
-            if(error) {
+            if(error || setup) {
                 RouteMessage header{36,2,0x100,request.sequence,port}; // NLMSG_ERROR, capped
                 append(&header,16);append(&error,4);append(&request,16);
             } else {

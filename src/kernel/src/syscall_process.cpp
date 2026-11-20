@@ -3,6 +3,7 @@
 // Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
+#include "process_namespaces.h"
 #include "process_fs.h"
 #include "process_user_namespace.h"
 
@@ -210,16 +211,16 @@ int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAddr,
     static constexpr uint64_t CLONE_NEWNS           = 0x00020000ULL;
 
     // Other isolation domains must not fall through to an ordinary fork.
-    constexpr uint64_t unsupportedNamespaces=0x02000000ULL|0x04000000ULL|
-                                           0x08000000ULL|0x20000000ULL|0x40000000ULL;
+    constexpr uint64_t unsupportedNamespaces=0x02000000ULL|0x20000000ULL;
     constexpr uint64_t CLONE_NEWUSER=0x10000000ULL;
     if(flags&unsupportedNamespaces)return -EINVAL;
     Process* parent = ProcessCurrent();
     if (!parent) return -ENOSYS;
-    if(flags&(CLONE_NEWNS|CLONE_NEWUSER)) {
+    constexpr uint64_t supportedNamespaces=CLONE_NEWNS|CLONE_NEWUSER|CloneNewRuntimeNamespaces;
+    if(flags&supportedNamespaces) {
         // Bounded fork-style namespace creation. Do not silently ignore shared
         // VM/FS/thread, tid, pidfd, TLS, vfork or unknown requested semantics.
-        if((flags&~(CLONE_NEWNS|CLONE_NEWUSER|uint64_t{0xff})) || (flags&0xff)!=17)return -EINVAL;
+        if((flags&~(supportedNamespaces|uint64_t{0xff})) || (flags&0xff)!=17)return -EINVAL;
         if(!(flags&CLONE_NEWUSER)) {
             auto* owner=ProcessUserNamespaceAcquire(parent);
             bool allowed=ProcessCapable(parent,owner,CapSysAdmin);UserNamespaceRelease(owner);
@@ -271,6 +272,9 @@ int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAddr,
     }
     if(flags&CLONE_NEWNS) {
         if(int error=ProcessFsIsolateMounts(child)) {ProcessDiscardUnpublished(child);return error;}
+    }
+    if(const auto domains=flags&CloneNewRuntimeNamespaces) {
+        if(int error=ProcessNamespacesIsolate(child,domains)) {ProcessDiscardUnpublished(child);return error;}
     }
     if (int error=SysvSemClone(parent,child,(flags & 0x00040000)!=0)) {
         SysvSemExit(child);
@@ -357,6 +361,32 @@ int64_t sys_vfork(uint64_t, uint64_t, uint64_t,
 // glibc and musl try clone3 first and fall back to clone on ENOSYS;
 // implementing it avoids that fallback and silences the UNIMPL noise.
 
+int64_t sys_unshare(uint64_t flags,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t)
+{
+    if(!flags)return 0;
+    constexpr uint64_t CloneNewUser=0x10000000;
+    if(flags!=CloneNewUser && (flags&~CloneNewRuntimeNamespaces))return -EINVAL;
+    auto* process=ProcessCurrent();
+    if(!process)return -ESRCH;
+    if(flags==CloneNewUser) {
+        // Only the running task can create a peer in a single-threaded group.
+        // Copy CLONE_FS state before gaining authority in the child namespace.
+        if(process->isThread || __atomic_load_n(&process->asLiveThreads,__ATOMIC_ACQUIRE))
+            return -EINVAL;
+        int error=0;
+        auto* context=ProcessFsCopy(process,&error);
+        if(!context)return error;
+        error=ProcessUserNamespaceCreate(process);
+        if(error)FsContextRelease(context);
+        else ProcessFsReplaceOwned(process,context);
+        return error;
+    }
+    auto* owner=ProcessUserNamespaceAcquire(process);
+    const bool allowed=ProcessCapable(process,owner,CapSysAdmin);
+    UserNamespaceRelease(owner);
+    return allowed ? ProcessNamespacesIsolate(process,flags) : -EPERM;
+}
+
 struct CloneArgs {
     uint64_t flags;
     uint64_t pidfd;
@@ -395,7 +425,7 @@ int64_t sys_clone3(uint64_t argsPtr, uint64_t size, uint64_t,
 
     // Delegate to sys_clone with the same argument layout:
     //   flags, newStack, parentTidAddr, childTidAddr, tlsAddr
-    if(cloneFlags&(0x00020000|0x10000000)) {
+    if(cloneFlags&(0x00020000|0x10000000|CloneNewRuntimeNamespaces)) {
         for(uint64_t i=sizeof(CloneArgs);i<size;++i) {
             uint8_t byte=0;
             if(!CopyFromUser(&byte,argsPtr+i,1))return -EFAULT;

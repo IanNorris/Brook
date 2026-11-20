@@ -9,44 +9,74 @@ int64_t sys_mount(uint64_t sourceAddr,uint64_t targetAddr,uint64_t fsAddr,
     constexpr uint64_t Private=0x40000,Slave=0x80000;
     const uint64_t type=flags&~(Recursive|Silent);
     const bool privatePropagation=type==Private || type==Slave;
-    const bool memoryMount=(flags&~Silent)==6; // bounded NODEV|NOSUID tmpfs
+    const bool newMount=(flags&~(Silent|MountRestrictionMask))==0;
     const bool bindMount=type==Bind;
-    const bool remount=(flags&~(Silent|uint64_t{7}))==(Bind|Remount) && (flags&2)==2;
-    if(!bindMount && !privatePropagation && !memoryMount && !remount)return -EINVAL;
+    const bool remount=(type&~MountRestrictionMask)==(Bind|Remount);
+    if(!bindMount && !privatePropagation && !newMount && !remount)return -EINVAL;
+    bool procMount=false;
+    bool memoryMount=false;
+    bool ptyMount=false;
+    bool queueMount=false;
+    uint16_t ptmxMode=0;
     TmpfsMountOptions memoryOptions{};
-    if(memoryMount) {
-        char fsType[32],data[256];
+    if(newMount) {
+        char fsType[32],data[256]{};
         if(!CopyUserCString(fsAddr,fsType,sizeof(fsType)))return -EFAULT;
-        if(!StrEq(fsType,"tmpfs"))return -ENODEV;
-        if(dataAddr) {
-            if(!CopyUserCString(dataAddr,data,sizeof(data)))return -EFAULT;
+        if(dataAddr && !CopyUserCString(dataAddr,data,sizeof(data)))return -EFAULT;
+        procMount=StrEq(fsType,"proc");
+        memoryMount=StrEq(fsType,"tmpfs");
+        ptyMount=StrEq(fsType,"devpts");
+        queueMount=StrEq(fsType,"mqueue");
+        if((procMount || queueMount) && data[0])return -EINVAL;
+        if(memoryMount) {
+            if((flags&~Silent)!=(MountNoDev|MountNoSuid))return -EINVAL;
             if(int error=ParseTmpfsMountOptions(data,&memoryOptions))return error;
         }
+        if(ptyMount) {
+            if(int error=ParseDevptsOptions(data,&ptmxMode))return error;
+        }
+        if(!procMount && !memoryMount && !ptyMount && !queueMount)return -ENODEV;
     }
     auto* process=ProcessCurrent();if(!process)return -EPERM;
     char source[512],target[512];
     if(!CopyUserCString(targetAddr,target,sizeof(target)))return -EFAULT;
     // Propagation has no source operand. A non-null source is still a userspace
     // string argument to mount(2), so validate it without resolving its path.
-    if((sourceAddr || (!privatePropagation && !memoryMount && !remount)) && !CopyUserCString(sourceAddr,source,sizeof(source)))return -EFAULT;
+    if((sourceAddr || (!privatePropagation && !newMount && !remount)) && !CopyUserCString(sourceAddr,source,sizeof(source)))return -EFAULT;
     AtLookup lookup;if(int error=lookup.Init(-100,target))return error;
     auto* owner=VfsMountNamespaceUserOwnerAcquire(lookup.fs.mountNamespace);
     bool authorized=ProcessCapable(process,owner,CapSysAdmin);UserNamespaceRelease(owner);
     if(!authorized)return -EPERM;
     if(remount) {
         VfsPath targetPath{};int error=VfsPathResolve(lookup.fs.root,lookup.fs.cwd,target,&targetPath);
-        if(!error)error=VfsMountNamespaceRemount(lookup.fs.mountNamespace,targetPath,flags&7);
+        if(!error)error=VfsMountNamespaceRemount(lookup.fs.mountNamespace,targetPath,flags&MountRestrictionMask,(flags&Recursive)!=0);
         VfsPathRelease(targetPath);return error;
     }
-    if(memoryMount) {
+    if(procMount) {
+        VfsPath targetPath{};int error=VfsPathResolve(lookup.fs.root,lookup.fs.cwd,target,&targetPath);
+        if(!error)error=ProcFsMountPrivate(lookup.fs.mountNamespace,targetPath,flags&MountRestrictionMask);
+        VfsPathRelease(targetPath);return error;
+    }
+    if(queueMount) {
+        VfsPath targetPath{};int error=VfsPathResolve(lookup.fs.root,lookup.fs.cwd,target,&targetPath);
+        if(!error)error=MqueueMount(process,lookup.fs.mountNamespace,targetPath,flags&MountRestrictionMask);
+        VfsPathRelease(targetPath);return error;
+    }
+    if(memoryMount || ptyMount) {
         VfsPath targetPath{};int error=VfsPathResolve(lookup.fs.root,lookup.fs.cwd,target,&targetPath);
         if(!error) {
             auto* fsOwner=ProcessUserNamespaceAcquire(process);
-            auto* instance=TmpfsCreate(ProcessReadIds(process,false).effective,
-                ProcessReadIds(process,true).effective,fsOwner,6,&error,memoryOptions.mode,memoryOptions.bytes);
+            const auto uid=ProcessReadIds(process,false).effective;
+            const auto gid=ProcessReadIds(process,true).effective;
+            const auto attributes=ptyMount ?
+                ((flags&MountRestrictionMask)|MountReadOnly|MountNoSuid|MountNoExec) :
+                MountNoSuid|MountNoDev;
+            auto* instance=ptyMount ? TmpfsCreatePtyDirectory(uid,gid,fsOwner,ptmxMode,&error) :
+                TmpfsCreate(uid,gid,fsOwner,attributes,&error,memoryOptions.mode,memoryOptions.bytes);
             UserNamespaceRelease(fsOwner);
             if(instance) {
-                error=VfsMountNamespaceMountFresh(lookup.fs.mountNamespace,targetPath,"tmpfs",TmpfsOperations(),instance,0,6);
+                error=VfsMountNamespaceMountFresh(lookup.fs.mountNamespace,targetPath,
+                    ptyMount ? "devpts" : "tmpfs",TmpfsOperations(),instance,0,attributes);
                 if(error)TmpfsDestroy(instance);
             }
         }

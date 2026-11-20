@@ -624,6 +624,7 @@ static Vnode* VfsPathOpenLocked(const VfsPath& path,int flags,int* error)
     }
     if(!path.object->ops->open) { *error=-95;return nullptr; }
     auto* mount=static_cast<MountEntry*>(path.attachment);
+    if((flags&VFS_O_EXEC) && VfsNoExec(mount)) { *error=-13;return nullptr; }
     bool fifo=false;
     if((flags&VFS_O_TRUNC) || (VfsReadOnly(mount) && (flags&VFS_O_WRITE))) {
         VnodeStat stat{};*error=path.object->ops->stat?path.object->ops->stat(path.object,&stat):-95;
@@ -636,7 +637,7 @@ static Vnode* VfsPathOpenLocked(const VfsPath& path,int flags,int* error)
         if(*error)return nullptr;
         if((stat.mode&0170000)!=0010000 && (stat.mode&0170000)!=0020000) { *error=-30;return nullptr; }
     }
-    if((mount->attributes&4) && !(flags&VFS_O_METADATA)) {
+    if((VfsMountAttributes(mount)&MountNoDev) && !(flags&VFS_O_METADATA)) {
         VnodeStat stat{};*error=path.object->ops->stat?path.object->ops->stat(path.object,&stat):-95;
         if(*error)return nullptr;
         if(VfsNodevDenied(mount,stat,flags)) {*error=-13;return nullptr;}

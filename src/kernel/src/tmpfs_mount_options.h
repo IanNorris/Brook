@@ -42,4 +42,47 @@ inline int ParseTmpfsMountOptions(const char* text,TmpfsMountOptions* out)
     }
     *out=options;return 0;
 }
+
+// Each devpts mount is an independent instance. Accept the mode fields used
+// by Linux container launchers and refuse an implicit global PTY instance.
+inline int ParseDevptsOptions(const char* data,uint16_t* ptmxMode)
+{
+    if(!data || !ptmxMode)return -22;
+    bool fresh=false,haveMaster=false,haveSlave=false;
+    uint16_t master=0000;
+    const char* p=data;
+    while(*p) {
+        const char* end=p;while(*end && *end!=',')++end;
+        constexpr char instance[]="newinstance",masterKey[]="ptmxmode=",slaveKey[]="mode=";
+        auto match=[&](const char* key,unsigned count) {
+            if(static_cast<unsigned>(end-p)<count)return false;
+            for(unsigned i=0;i<count;++i)if(p[i]!=key[i])return false;
+            return true;
+        };
+        if(static_cast<unsigned>(end-p)==sizeof(instance)-1 && match(instance,sizeof(instance)-1)) {
+            if(fresh)return -22;
+            fresh=true;
+        } else {
+            const bool isMaster=match(masterKey,sizeof(masterKey)-1);
+            if(!isMaster && !match(slaveKey,sizeof(slaveKey)-1))return -22;
+            bool& seen=isMaster ? haveMaster : haveSlave;
+            if(seen)return -22;
+            seen=true;
+            auto* value=p+(isMaster ? sizeof(masterKey) : sizeof(slaveKey))-1;
+            if(value==end)return -22;
+            unsigned mode=0;
+            for(;value!=end;++value) {
+                if(*value<'0' || *value>'7')return -22;
+                mode=(mode<<3)+unsigned(*value-'0');
+                if(mode>0777)return -22;
+            }
+            if(isMaster)master=static_cast<uint16_t>(mode);
+        }
+        p=end;
+        if(*p && !*++p)return -22;
+    }
+    if(!fresh)return -22;
+    *ptmxMode=master;return 0;
+}
+
 }

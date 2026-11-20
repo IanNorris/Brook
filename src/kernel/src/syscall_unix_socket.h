@@ -68,6 +68,7 @@ struct UnixSocketData {
     bool    nonblock;
     bool    passCredentials; // SO_PASSCRED; accessed atomically through shared fds
     volatile uint32_t refCount; // +1 per fd pointing at this struct
+    uint64_t networkScope; // network namespace for abstract addresses
     uint32_t socketType;       // creation type (without NONBLOCK/CLOEXEC flags)
     UnixCredentials peerCredentials; // connection/listen snapshot; registry lock protects copies
     uint64_t peerIncarnation,peerLaunchId;
@@ -125,7 +126,7 @@ inline bool UnixAddressIsAbstract(const uint8_t* address, uint32_t length)
 // address bytes. Pins and returns the listener, or nullptr.
 UnixSocketData* UnixFindServer(const char* path, const VnodeStat* node = nullptr,
                                const uint8_t* abstractAddress = nullptr,
-                               uint32_t abstractLength = 0);
+                               uint32_t abstractLength = 0,uint64_t scope=0);
 // Callers hold g_unixNameLock, so a check followed by bind or listen is
 // atomic with respect to other name operations.
 bool UnixAbstractNameInUse(const uint8_t* address, uint32_t length, const UnixSocketData* except);

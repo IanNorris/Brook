@@ -40,6 +40,7 @@ struct LoopbackQueueT {
 
     struct Slot {
         uint32_t len;
+        uint64_t scope;
         uint8_t  data[SlotSize];
     };
 
@@ -55,21 +56,23 @@ struct LoopbackQueueT {
         dropped = 0;
     }
 
-    bool Enqueue(const uint8_t* frame, uint32_t len) {
+    bool Enqueue(const uint8_t* frame, uint32_t len, uint64_t scope=0) {
         if (len == 0 || len > SlotSize) { dropped++; return false; }
         if (count >= SlotCount)         { dropped++; return false; }
         Slot& s = slots[tail];
         s.len = len;
+        s.scope = scope;
         memcpy(s.data, frame, len);
         tail = (tail + 1) % SlotCount;
         if (++count > highWater) highWater = count;
         return true;
     }
 
-    bool Dequeue(uint8_t* out, uint32_t* outLen) {
+    bool Dequeue(uint8_t* out, uint32_t* outLen, uint64_t* scope=nullptr) {
         if (count == 0) return false;
         Slot& s = slots[head];
         *outLen = s.len;
+        if(scope)*scope=s.scope;
         memcpy(out, s.data, s.len);
         head = (head + 1) % SlotCount;
         count--;
@@ -93,11 +96,11 @@ struct LoopbackQueueT {
 // CRITICAL: 'lock' must not be held while 'deliver' runs; deliver acquires
 // other locks and can block on the remote path.
 template <typename Q, typename LockFn, typename UnlockFn, typename DeliverFn>
-inline void LoopbackSubmit(Q& q, bool& draining,
-                           const uint8_t* frame, uint32_t len,
+inline void LoopbackSubmitScoped(Q& q, bool& draining,
+                           const uint8_t* frame, uint32_t len, uint64_t scope,
                            LockFn lock, UnlockFn unlock, DeliverFn deliver) {
     lock();
-    q.Enqueue(frame, len);
+    q.Enqueue(frame, len, scope);
     if (draining) {
         // A drain loop is already running (this thread, deeper on the stack,
         // or another CPU). It will pick up the frame we just queued.
@@ -111,15 +114,23 @@ inline void LoopbackSubmit(Q& q, bool& draining,
     uint32_t  slen = 0;
     for (;;) {
         lock();
-        bool got = q.Dequeue(scratch, &slen);
+        uint64_t packetScope=0;
+        bool got = q.Dequeue(scratch, &slen, &packetScope);
         if (!got) {
             draining = false;
             unlock();
             return;
         }
         unlock();
-        deliver(scratch, slen);  // may re-enter LoopbackSubmit -> enqueues
+        deliver(scratch, slen, packetScope);  // may re-enter LoopbackSubmit -> enqueues
     }
+}
+
+template <typename Q, typename LockFn, typename UnlockFn, typename DeliverFn>
+inline void LoopbackSubmit(Q& q, bool& draining, const uint8_t* frame, uint32_t len,
+                           LockFn lock, UnlockFn unlock, DeliverFn deliver) {
+    LoopbackSubmitScoped(q,draining,frame,len,0,lock,unlock,
+        [&](const uint8_t* packet,uint32_t size,uint64_t) { deliver(packet,size); });
 }
 
 } // namespace brook

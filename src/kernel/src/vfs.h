@@ -105,6 +105,7 @@ int VfsDirectoryPath(Vnode* vn, char* out, uint32_t capacity);
 bool VfsVnodeIsPublishedRoot(Vnode* vn,uint64_t publication,uint8_t pdrv);
 bool VfsVnodeIsPublishedMember(Vnode* vn,uint64_t publication,uint8_t pdrv);
 extern "C" bool VfsMountReadOnly(const Vnode* vn);
+bool VfsMountNoExec(const Vnode* vn);
 
 // Retention is not safe acquisition from an unprotected raw pointer.
 inline void VfsRetain(Vnode* vn) {

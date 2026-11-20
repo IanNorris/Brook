@@ -418,6 +418,9 @@ int64_t sys_getresuid(uint64_t real, uint64_t effective, uint64_t saved, uint64_
 int64_t sys_getresgid(uint64_t real, uint64_t effective, uint64_t saved, uint64_t, uint64_t, uint64_t);
 
 // syscall_sysinfo.cpp
+int64_t sys_unshare(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+int64_t sys_sethostname(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+int64_t sys_setdomainname(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
 int64_t sys_uname(uint64_t bufAddr, uint64_t, uint64_t,
                    uint64_t, uint64_t, uint64_t);
 int64_t sys_prlimit64(uint64_t pid, uint64_t resource, uint64_t newlimitAddr,
@@ -436,6 +439,11 @@ int64_t sys_getrlimit(uint64_t resource, uint64_t rlimAddr, uint64_t,
                        uint64_t, uint64_t, uint64_t);
 
 // syscall_sysv_ipc.cpp
+int64_t sys_mq_open(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+int64_t sys_mq_unlink(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+int64_t sys_mq_timedsend(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+int64_t sys_mq_timedreceive(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+int64_t sys_mq_getsetattr(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
 int64_t sys_semget(uint64_t key,uint64_t count,uint64_t flags,uint64_t,uint64_t,uint64_t);
 int64_t sys_semop(uint64_t id,uint64_t address,uint64_t count,uint64_t,uint64_t,uint64_t);
 int64_t sys_semtimedop(uint64_t id,uint64_t address,uint64_t count,uint64_t timeout,uint64_t,uint64_t);

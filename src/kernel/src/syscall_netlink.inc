@@ -29,7 +29,7 @@ static int NetlinkBind(NetlinkSocket* s,uint32_t requested,bool automatic=false)
     uint32_t candidate=requested?requested:ProcessCurrent()->tgid;
     if(!candidate)candidate=1;
     for(;;) {
-        bool occupied=false;for(auto* n=g_netlinkSockets;n;n=n->next)if(n!=s && n->port==candidate){occupied=true;break;}
+        bool occupied=false;for(auto* n=g_netlinkSockets;n;n=n->next)if(n!=s && n->networkScope==s->networkScope && n->port==candidate){occupied=true;break;}
         if(!occupied)break;
         if(requested){SpinLockRelease(&g_netlinkRegistryLock);return -98;}
         // Stable full-width local port IDs; never confuse them with task IDs.
@@ -63,9 +63,18 @@ int64_t NetlinkSend(NetlinkSocket* s,uint64_t address,uint64_t length,uint64_t f
     if(!stage.request || !stage.reply)return -ENOMEM;
     if(user){if(!CopyFromUser(stage.request,address,length))return -EFAULT;}
     else memcpy(stage.request,reinterpret_cast<void*>(address),length);
-    InterfaceView views[5]{};uint32_t count=NetInterfaceViews(views,5);
+    InterfaceView views[5]{};uint32_t count=NetInterfaceViews(views,5,s->networkScope);
+    bool privateSetup=false;
+    if(s->networkScope) {
+        auto* process=ProcessCurrent();
+        if(ProcessNetworkScope(process)==s->networkScope) {
+            auto* owner=ProcessUserNamespaceAcquire(process);
+            privateSetup=ProcessCapable(process,owner,12); // CAP_NET_ADMIN
+            UserNamespaceRelease(owner);
+        }
+    }
     RouteReply reply(stage.reply->bytes,sizeof(stage.reply->bytes));
-    if(int e=reply.build(stage.request,static_cast<uint32_t>(length),__atomic_load_n(&s->port,__ATOMIC_ACQUIRE),views,count))return e;
+    if(int e=reply.build(stage.request,static_cast<uint32_t>(length),__atomic_load_n(&s->port,__ATOMIC_ACQUIRE),views,count,privateSetup))return e;
     stage.reply->length=reply.size();stage.reply->next=nullptr;
     SpinLockAcquire(&s->lock);
     if(s->queued>s->receiveLimit || sizeof(NetlinkPacket)>s->receiveLimit-s->queued){SpinLockRelease(&s->lock);return -105;}
@@ -113,11 +122,11 @@ int64_t NetlinkReadUser(NetlinkSocket* s,uint64_t address,uint64_t length,uint64
     if(source){if(int e=NetlinkCopyName(0,source,sourceLength))return e;}
     return (flags&0x20)?size:n;
 }
-int NetlinkInterfaceIoctl(uint64_t command,uint64_t address) {
+int NetlinkInterfaceIoctl(uint64_t command,uint64_t address,uint64_t scope) {
     KernelOperationGuard operation(ProcessCurrent());
     // Native x86-64 struct ifreq: 16-byte name + 24-byte union.
     uint8_t request[40]{};if(!CopyFromUser(request,address,sizeof(request)))return -EFAULT;
-    InterfaceView views[5]{};uint32_t count=NetInterfaceViews(views,5);const InterfaceView* found=nullptr;
+    InterfaceView views[5]{};uint32_t count=NetInterfaceViews(views,5,scope);const InterfaceView* found=nullptr;
     uint32_t index=0;memcpy(&index,request+16,4);
     for(uint32_t i=0;i<count;++i) {
         bool match=command==0x8910?index==views[i].index:!memcmp(request,views[i].name,16);

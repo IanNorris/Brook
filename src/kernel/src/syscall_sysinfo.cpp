@@ -5,6 +5,7 @@
 
 #include "core_autodump.h"
 #include "process_user_namespace.h"
+#include "process_namespaces.h"
 #include "memory/physical_memory.h"
 #include "tsc_clock.h"
 #include "user_copy.h"
@@ -40,12 +41,29 @@ int64_t sys_uname(uint64_t bufAddr, uint64_t, uint64_t,
     // This syscall describes the Linux ABI personality. Unix libraries such
     // as MonoGame select native loaders using an exact "Linux" comparison.
     StrCopyN(buf->sysname,    "Linux",     65);
-    StrCopyN(buf->nodename,   "brook",     65);
+    ProcessUtsRead(ProcessCurrent(),buf->nodename,buf->domainname);
     StrCopyN(buf->release,    "6.0.0",     65);
     StrCopyN(buf->version,    "#1 Brook",  65);
     StrCopyN(buf->machine,    "x86_64",    65);
-    StrCopyN(buf->domainname, "(none)",    65);
     return CopyToUser(bufAddr,&value,sizeof(value))?0:-EFAULT;
+}
+
+static int64_t SetUtsName(uint64_t address,uint64_t length,bool domain)
+{
+    if(length>=UtsNameBytes)return -EINVAL;
+    char name[UtsNameBytes]{};
+    if(length && !CopyFromUser(name,address,length))return -EFAULT;
+    return ProcessUtsWrite(ProcessCurrent(),domain,name,static_cast<unsigned>(length));
+}
+
+int64_t sys_sethostname(uint64_t address,uint64_t length,uint64_t,uint64_t,uint64_t,uint64_t)
+{
+    return SetUtsName(address,length,false);
+}
+
+int64_t sys_setdomainname(uint64_t address,uint64_t length,uint64_t,uint64_t,uint64_t,uint64_t)
+{
+    return SetUtsName(address,length,true);
 }
 
 // ---------------------------------------------------------------------------
