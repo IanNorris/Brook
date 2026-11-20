@@ -1,6 +1,7 @@
 """Offline checks for the guarded A/B start journal in the disposable SATA fixture."""
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -12,6 +13,7 @@ import time
 import uuid
 import zlib
 
+from hardware_update_bootstat import SECTOR, inspect_sectors
 from hardware_update_protocol import record
 from test_panic_fat_qemu import verify_record
 from test_recovery_data_dispatch import metadata_hash
@@ -39,6 +41,16 @@ def read_fat(media, name):
 
 def write_fat(media, name, source):
     subprocess.run(['mcopy', '-o', '-i', media, str(source), '::/' + name], check=True)
+
+
+def expect_legacy_bootstat(disk, state):
+    with disk.open('rb') as raw:
+        def read(lbas):
+            return [os.pread(raw.fileno(), SECTOR, lba * SECTOR) for lba in lbas]
+
+        actual = inspect_sectors(read, disk.stat().st_size // SECTOR)['state']
+    if actual != state:
+        raise RuntimeError(f'archived RECOVERY expected BOOTSTAT {state}, found {actual}')
 
 
 def seed_health(identity, selectors, prior_strike):
@@ -374,8 +386,12 @@ def run_matrix(a, base_disk, normal, work, guards, metadata, panic_journal):
         elif name == 'emergency':
             raw_health = bytes(2048)
             subprocess.run(['mdel', '-i', media, '::/RECOVERY/SELECT.BIN'], check=True)
+        if name == 'zero-journal':
+            expect_legacy_bootstat(disk, 'absent')
         health.write_bytes(raw_health)
         write_fat(media, 'RECOVERY/BOOTSTAT.BIN', health)
+        if name == 'zero-journal':
+            expect_legacy_bootstat(disk, 'empty')
         if name == 'emergency':
             verify_emergency_gate(a, disk, scenario, guards)
 

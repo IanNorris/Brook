@@ -162,7 +162,10 @@ def inspect_sectors(read, sectors):
     start, size, disk_guid, esp_guid = esp_partition(read, sectors)
     geometry = fat_geometry(read, start, size)
     parents, root_chain = named_entries(read, geometry, geometry[-1], 'RECOVERY   ', 'RECOVERY')
-    check(len(parents) == 1 and parents[0][11] & 0xf8 == 0x10, 'RECOVERY directory unproven')
+    # A directory, not a volume label or device; the archive, read-only,
+    # hidden and system bits are ignored (FAT writers set archive on
+    # directories: the Dell's RECOVERY entry is 0x30).
+    check(len(parents) == 1 and parents[0][11] & 0xd8 == 0x10, 'RECOVERY directory unproven')
     entries, _ = named_entries(read, geometry, cluster_of(parents[0]), 'BOOTSTATBIN', 'BOOTSTAT.BIN', root_chain)
     check(len(entries) <= 1, 'ambiguous BOOTSTAT pathname')
     if entries:

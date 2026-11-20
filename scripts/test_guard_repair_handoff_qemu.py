@@ -204,6 +204,12 @@ def main():
     a.output.mkdir(parents=True,exist_ok=False)
     with tempfile.TemporaryDirectory(prefix='brk-auto-handoff-') as tmp:
         work=Path(tmp);disk=work/'disk.raw';shutil.copyfile(a.image,disk);media=str(disk)+'@@1048576'
+        # Match FAT directory entries written by firmware on the Dell.
+        subprocess.run(['mattrib','+a','-i',media,'::/RECOVERY'],check=True)
+        attributes=subprocess.check_output(['mattrib','-i',media,'::/RECOVERY'],text=True)
+        if attributes.split()!=['A','::/RECOVERY']:
+            raise RuntimeError('RECOVERY fixture requires directory and archive bits only')
+        (a.output/'recovery-directory-attributes.txt').write_text(attributes)
         normal=work/'normal.img';recovery=work/'recovery.img'
         compact(a.desktop_pair/'INITRD.IMG',normal,work/'normal-tree',
                 16*1024*1024 if a.auto_desktop_dell_initrd or a.auto_desktop_slot_fallback else 8*1024*1024,
