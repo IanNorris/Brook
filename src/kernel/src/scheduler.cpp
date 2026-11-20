@@ -2,6 +2,7 @@
 #include "process_fs.h"
 #include "user_copy.h"
 #include "scheduler.h"
+#include "seccomp.h"
 #include "cpu_idle.h"
 #include "scheduler_affinity.h"
 #include "robust_futex.h"
@@ -1493,7 +1494,20 @@ void KernelThreadTrampoline()
     SchedulerExitCurrentProcess(0);
 }
 
+static void InheritSeccompForBirth(Process* proc, Process* parent)
+{
+    SeccompFilter* filter = SeccompLoad(parent);
+    SeccompRetain(filter);
+    proc->seccompFilter = filter;
+    if (ProcessGetNoNewPrivs(parent)) ProcessSetNoNewPrivs(proc);
+}
+
 #include "scheduler_process_birth.inc"
+
+void SchedulerAddProcessWithSeccomp(Process* proc, Process* parent)
+{
+    AddProcessForBirth(proc, parent);
+}
 
 void SchedulerRemoveProcess(Process* proc)
 {
@@ -2934,6 +2948,62 @@ Process* SchedulerFindProcessReference(uint16_t pid)
     SchedLockRelease(g_allProcLock, flags);
     return found;
 }
+int SchedulerAttachSeccomp(Process* process, SeccompFilter* filter, bool synchronize)
+{
+    const auto flags = SchedLockAcquire(g_allProcLock);
+    auto* previous = SeccompLoad(process);
+    const unsigned cost = filter->count + (previous ? previous->pathInstructions + 4 : 0);
+    if (cost > SeccompMaxPathInstructions) {
+        SchedLockRelease(g_allProcLock, flags);
+        return -12; // ENOMEM, Linux's combined filter instruction limit
+    }
+
+    const uint64_t group = process->isThread ? process->leaderIncarnation : process->incarnation;
+    auto isPeer = [&](const Process* peer) {
+        return peer != process && !peer->isKernelThread && peer->state != ProcessState::Terminated &&
+            peer->tgid == process->tgid && (peer->isThread ? peer->leaderIncarnation : peer->incarnation) == group;
+    };
+
+    if (synchronize) {
+        for (uint32_t i = 0; i < g_processCount; ++i) {
+            const auto* peer = g_allProcesses[i];
+            if (!isPeer(peer)) continue;
+            const auto* installed = SeccompLoad(peer);
+            if (!installed) continue;
+            auto* ancestor = previous;
+            while (ancestor && ancestor != installed) ancestor = ancestor->previous;
+            if (!ancestor) {
+                const int conflictingTid = peer->pid;
+                SchedLockRelease(g_allProcLock, flags);
+                return conflictingTid;
+            }
+        }
+    }
+
+    filter->pathInstructions = cost;
+    filter->previous = previous;
+    SeccompRetain(previous);
+    const bool inheritNoNewPrivs = ProcessGetNoNewPrivs(process);
+    auto publish = [&](Process* peer) {
+        // The replaced head is now pinned as an ancestor of the new stack.
+        // This is also why dropping it here never reclaims under the lock.
+        if (inheritNoNewPrivs) ProcessSetNoNewPrivs(peer);
+        SeccompRetain(filter);
+        auto* replaced = __atomic_exchange_n(&peer->seccompFilter, filter, __ATOMIC_ACQ_REL);
+        SeccompRelease(replaced);
+    };
+    publish(process);
+    if (synchronize) {
+        for (uint32_t i = 0; i < g_processCount; ++i) {
+            auto* peer = g_allProcesses[i];
+            if (isPeer(peer)) publish(peer);
+        }
+    }
+
+    SchedLockRelease(g_allProcLock, flags);
+    return 0;
+}
+
 bool SchedulerThreadGroupGone(uint16_t tgid,uint64_t incarnation)
 {
     if(!tgid || !incarnation)return false;

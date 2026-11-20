@@ -1,5 +1,5 @@
 // Production scheduler lifecycle paths, included within namespace brook.
-void SchedulerAddProcess(Process* proc)
+static void AddProcessForBirth(Process* proc, Process* parent)
 {
     proc->state = ProcessState::Ready;
 
@@ -51,6 +51,9 @@ void SchedulerAddProcess(Process* proc)
     // runnable thread from dispatching before its leader lifetime is counted.
     uint64_t birthFlags = SchedLockAcquire(g_readyLock);
     uint64_t alf1 = SchedLockAcquire(g_allProcLock);
+    // Inherit at publication, with the same lock as TSYNC. A newborn cannot
+    // run with a snapshot taken before a concurrent thread-group update.
+    if (parent) InheritSeccompForBirth(proc, parent);
     // A policy switch must see either the whole published birth or none of it.
     // Initializing before this lock allowed replacement to erase the newborn's
     // policy entry before it reached g_allProcesses and the ready queue.
@@ -135,4 +138,10 @@ void SchedulerAddProcess(Process* proc)
                  proc->name, proc->pid);
 
     KickIdleCpu();
+}
+
+
+void SchedulerAddProcess(Process* proc)
+{
+    AddProcessForBirth(proc, nullptr);
 }

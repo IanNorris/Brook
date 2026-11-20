@@ -26,6 +26,7 @@
 #include "syscall_strace.h"
 #include "syscall_dispatch.h"
 #include "syscall_handlers.h"
+#include "seccomp.h"
 #include "compat_census.h"
 #include "compat_census_runtime.h"
 
@@ -447,6 +448,7 @@ void SyscallTableInit()
     g_syscallTable[SYS_GETRESUID]       = sys_getresuid;
     g_syscallTable[SYS_GETRESGID]       = sys_getresgid;
     g_syscallTable[SYS_PRCTL]           = sys_prctl;
+    g_syscallTable[317]                  = SysSeccomp; // Linux x86-64 seccomp
     g_syscallTable[SYS_FUTEX]           = sys_futex;
     g_syscallTable[SYS_SIGNALFD]        = sys_signalfd;
     g_syscallTable[SYS_SIGNALFD4]       = sys_signalfd4;
@@ -675,6 +677,18 @@ static int64_t SyscallDispatchBody(uint64_t num, uint64_t a0, uint64_t a1,
 {
     Process* proc = ProcessCurrent();
     SyscallTimingCall timing(proc?proc->pid:0,proc?proc->incarnation:0,num,a0,SyscallTimingPhase::Dispatch,num==SYS_IOCTL?a1:0);
+    if (proc) {
+        if (const auto* filter = SeccompLoad(proc)) {
+            const SeccompData data{static_cast<uint32_t>(num), SeccompX86_64,
+                                   proc->syscallUserRip, {a0, a1, a2, a3, a4, a5}};
+            bool audit = false;
+            const uint32_t verdict = SeccompEvaluate(filter, data, &audit);
+            if (audit) SeccompAudit(proc, num, verdict);
+            const uint32_t action = verdict & SeccompActionMask;
+            if (action != SeccompAllow && action != SeccompLog)
+                return timing.Result(SeccompDenied(proc, num, verdict));
+        }
+    }
     if(proc && proc->addressSpace && proc->addressSpace->pagingAdmission.Exclusive()) {
         KernelOperationGuard guard(proc);
         const int error=PageableMemoryPrepareSyscall(proc,num);

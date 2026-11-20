@@ -34,6 +34,7 @@ void SchedulerUnblock(Process*) {assert(!schedulerLockDepth);}
 Process* current=nullptr;
 Process* SchedulerCurrentProcess() {return current;}
 void SchedulerMarkTerminated(Process*,int);
+void InheritSeccompForBirth(Process*, Process*) {assert(g_allProcLock.held);}
 #include "../../kernel/src/scheduler_process_birth.inc"
 #include "../../kernel/src/scheduler_process_terminal.inc"
 

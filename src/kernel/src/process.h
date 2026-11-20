@@ -293,7 +293,7 @@ struct Process
     SupplementaryGroups* groups; // per-task immutable shared list, owns one ref
     ProcessState state;
     uint8_t  schedPriority;  // Initial scheduler priority (0=RT, 1=High, 2=Normal, 3=Low)
-    uint16_t noNewPrivs;         // Irreversible per-task exec privilege restriction; credential lock
+    uint16_t noNewPrivs;         // Irreversible per-task exec privilege restriction; atomic
     int32_t  runningOnCpu;   // CPU index (-1 = not running, used for double-schedule detection)
     int32_t  cpuAffinity;    // CPU affinity pin (-1 = any CPU, >=0 = pinned to that CPU)
     volatile uint64_t tlbCpuMask;  // Bitmask of CPUs that have this process's CR3 loaded in TLB
@@ -582,6 +582,8 @@ struct Process
     // means unselected. Appended so all prior externally consumed offsets stay
     // stable. Set under the scheduler registry; preserved across exec.
     uint64_t oomEpisode;
+    struct SeccompFilter* seccompFilter; // owned immutable stack, replaced under the task registry lock
+    uint32_t seccompTrap;               // synchronous SIGSYS for this syscall's return path
 };
 
 // A completed producer update invalidates any copied desktop-layer snapshot.
