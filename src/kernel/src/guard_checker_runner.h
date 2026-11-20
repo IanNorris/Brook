@@ -7,6 +7,9 @@ struct Device;
 bool GuardCheckerStart(Device* device);
 #if defined(BROOK_SSD_GUARDED_DESKTOP)
 bool GuardedDesktopBridgeEnabled();
+struct BootProtocol;
+// Copy the verified loader selection while the original handoff is mapped.
+void GuardCheckerCaptureBootSlot(const BootProtocol* boot);
 #if defined(BROOK_SSD_AUTO_RECOVERY)
 struct AcShutdownRecord;
 bool GuardCheckedAcShutdownPrior(AcShutdownRecord& out);

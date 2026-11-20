@@ -14,6 +14,7 @@
 #endif
 #if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_SSD_GUARDED_DESKTOP)
 #include "ac_shutdown_record.h"
+#include "../../shared/update/guard_slot_health.h"
 #endif
 #include "fatfs_object.h"
 #include "process.h"
@@ -115,6 +116,12 @@ struct FatPrivateMount {
     FatImageLease* acShutdownLease;
     uint64_t acShutdownSectors[AcShutdownSlots];
     bool acShutdownReady;
+    bool slotHealthInspected;
+    FatImageLease* slotHealthLease;
+    uint64_t slotHealthSectors[GuardSlotCount];
+    uint8_t slotHealthDisk[32];
+    BootGuardSlot slotHealthKey;
+    uint64_t slotStartSequence;
 #endif
 #if defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_AUTO_RECOVERY)
     Vnode* journalNode;
@@ -1929,20 +1936,110 @@ int FatFsPrivateRecoveryArmJournal(FatPrivateMount* session)
 }
 #if defined(BROOK_SSD_GUARDED_DESKTOP)
 namespace {
-struct AcShutdownSectorIo {
+template <unsigned Count>
+struct FixedRecoverySectorIo {
+    static constexpr unsigned SectorBytes = 512;
     Device* device;
-    const uint64_t (&sectors)[AcShutdownSlots];
+    const uint64_t (&sectors)[Count];
     bool read(unsigned slot,uint8_t* out) {
-        return slot<AcShutdownSlots && device->ops->read(device,sectors[slot]*AcShutdownSectorBytes,
-                     out,AcShutdownSectorBytes)==int(AcShutdownSectorBytes);
+        return slot<Count && device->ops->read(device,sectors[slot]*SectorBytes,
+                     out,SectorBytes)==int(SectorBytes);
     }
     bool write(unsigned slot,const uint8_t* in) {
-        return slot<AcShutdownSlots && DeviceWrite(device,sectors[slot]*AcShutdownSectorBytes,
-                     in,AcShutdownSectorBytes)==int(AcShutdownSectorBytes);
+        return slot<Count && DeviceWrite(device,sectors[slot]*SectorBytes,
+                     in,SectorBytes)==int(SectorBytes);
     }
     bool flush(){return DeviceFlush(device)==0;}
 };
+using AcShutdownSectorIo = FixedRecoverySectorIo<AcShutdownSlots>;
+using SlotHealthSectorIo = FixedRecoverySectorIo<GuardSlotCount>;
+static_assert(AcShutdownSectorIo::SectorBytes == AcShutdownSectorBytes);
+static_assert(SlotHealthSectorIo::SectorBytes == GuardSlotSectorBytes);
 }
+int FatFsPrivateRecoveryPinSlotHealth(FatPrivateMount* session, const char (&identity)[97],
+                                     const BootGuardSlot& slot)
+{
+    if (!session || !session->inspectionSucceeded || !session->journalReady ||
+        session->slotHealthInspected) return -22;
+    session->slotHealthInspected = true;
+    constexpr auto path = "/RECOVERY/BOOTSTAT.BIN";
+    char fatPath[256];
+    BuildFatPath(fatPath, sizeof(fatPath), session->mount->pdrv, path);
+    FILINFO info{};
+    KMutexLock(&g_fatLock);
+    const auto stat = f_stat(fatPath, &info);
+    KMutexUnlock(&g_fatLock);
+    // The existing guard inspection already proved the parent directory.
+    // f_stat distinguishes a missing file from an unreadable directory or
+    // metadata. No mount has been published, so nobody can race our open.
+    if (stat == FR_NO_FILE) return 1;
+    if (stat != FR_OK) return FrToErrno(stat);
+    if ((info.fattrib & AM_DIR) || info.fsize != GuardSlotCount * GuardSlotSectorBytes ||
+        !GuardSlotKeyValid(slot)) return -22;
+
+    auto* node = FatFsOpen(session->mount, session->mount->pdrv, path, VFS_O_WRITE | VFS_O_READWRITE);
+    if (!node) return -5;
+    const int pinned = FatFsAcquireImageLease(node, GuardSlotCount * GuardSlotSectorBytes,
+                                              &session->slotHealthLease);
+    VfsRelease(node);
+    if (pinned) return pinned;
+    auto* device = FatFsImageLeaseDevice(session->slotHealthLease);
+    auto& sectors = session->slotHealthSectors;
+    if (!device || device != FatFsImageLeaseDevice(session->journalLease) ||
+        !device->ops->read || DeviceBlockSize(device) != GuardSlotSectorBytes ||
+        FatFsImageSectorMap(session->slotHealthLease, sectors, GuardSlotCount)) return -5;
+    const auto blocks = DeviceBlockCount(device);
+    if (!sectors[0] || !sectors[1] || sectors[0] >= blocks || sectors[1] >= blocks ||
+        sectors[0] == sectors[1]) return -22;
+
+    // The independent FAT checker has excluded cross-links across the
+    // volume. Recheck the extents of the other direct writers as well.
+    uint64_t panicSectors[PanicJournalSectors]{};
+    if (FatFsJournalSectorMap(session->journalLease, panicSectors, PanicJournalSectors)) return -5;
+    for (const auto sector : sectors) {
+        for (const auto panic : panicSectors) if (sector == panic) return -22;
+        if (session->acShutdownReady)
+            for (const auto power : session->acShutdownSectors) if (sector == power) return -22;
+    }
+
+    BrookUpdateHash(reinterpret_cast<const uint8_t*>(identity), 96, session->slotHealthDisk);
+    SlotHealthSectorIo io{device, sectors};
+    GuardSlotJournal journal;
+    if (!GuardSlotRead(io, session->slotHealthDisk, journal)) return -117;
+    session->slotHealthKey = slot;
+    return 0;
+}
+
+int FatFsPrivateRecoveryStartSlot(FatPrivateMount* session, uint32_t& starts)
+{
+    starts = 0;
+    if (!session || !GuardSlotKeyValid(session->slotHealthKey) ||
+        !session->slotHealthLease || session->slotStartSequence) return -22;
+    auto* device = FatFsImageLeaseDevice(session->slotHealthLease);
+    if (!device) return -5;
+    SlotHealthSectorIo io{device, session->slotHealthSectors};
+    GuardSlotJournal journal;
+    if (!GuardSlotRead(io, session->slotHealthDisk, journal)) return -117;
+    if (!GuardSlotStart(journal.health, session->slotHealthKey)) return -13;
+    if (!GuardSlotWrite(io, session->slotHealthDisk, journal.health)) return -5;
+    session->slotStartSequence = journal.health.sequence + 1;
+    starts = journal.health.slots[session->slotHealthKey.slot].starts;
+    return 0;
+}
+
+int FatFsPrivateRecoveryFinishSlot(FatPrivateMount* session, bool profileRejected)
+{
+    if (!session || !session->slotHealthLease || !session->slotStartSequence) return -22;
+    auto* device = FatFsImageLeaseDevice(session->slotHealthLease);
+    if (!device) return -5;
+    SlotHealthSectorIo io{device, session->slotHealthSectors};
+    GuardSlotJournal journal;
+    if (!GuardSlotRead(io, session->slotHealthDisk, journal)) return -117;
+    if (journal.health.sequence != session->slotStartSequence) return -116;
+    if (!GuardSlotFinish(journal.health, session->slotHealthKey, profileRejected)) return -13;
+    return GuardSlotWrite(io, session->slotHealthDisk, journal.health) ? 0 : -5;
+}
+
 int FatFsPrivateRecoveryPinAcShutdown(FatPrivateMount* session,AcShutdownRecord& previous)
 {
     previous={};

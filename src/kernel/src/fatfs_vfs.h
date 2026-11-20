@@ -58,6 +58,13 @@ int FatFsPrivateRecoveryReadPanic(FatPrivateMount* mount,uint8_t* out,uint32_t c
                                   uint64_t* sequence,uint32_t* bytes,uint32_t* crc,unsigned rank=0);
 #if defined(BROOK_SSD_GUARDED_DESKTOP)
 struct AcShutdownRecord;
+struct BootGuardSlot;
+// 0 pinned and validated, 1 genuinely absent on a legacy ESP, negative on
+// malformed contents, discovery failure or unavailable verified selection.
+int FatFsPrivateRecoveryPinSlotHealth(FatPrivateMount* mount, const char (&identity)[97],
+                                     const BootGuardSlot& slot);
+int FatFsPrivateRecoveryStartSlot(FatPrivateMount* mount, uint32_t& starts);
+int FatFsPrivateRecoveryFinishSlot(FatPrivateMount* mount, bool profileRejected);
 // Call only on the checked, private ESP before publishing the desktop mount.
 int FatFsPrivateRecoveryPinAcShutdown(FatPrivateMount* mount,AcShutdownRecord& previous);
 // Shutdown coordinator only, after checked filesystem sync and clean readback.
