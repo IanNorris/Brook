@@ -90,6 +90,10 @@ struct ChromeShellModel {
     ChromeVolumePopupModel volume;
     ChromeDiskPopupLayout diskLayout;
     DesktopDiskPage disk;
+    ChromeStatsPopupLayout statsLayout;
+    DesktopDetailedStats detailedStats;
+    DesktopStatsPanel statsPanel;
+    uint32_t firstCoreRow;
     ChromeShellKind kind;
     DesktopRect rect;
     int32_t mouseX, mouseY;
@@ -152,6 +156,11 @@ inline void BuildShellModel(const ChromeShellModel& model, const ChromeStyle& st
             const auto& stats = model.telemetry.stats;
             ChromeBuildDiskPopup(model.diskLayout, model.disk, stats.readBytesPerSecond, stats.writeBytesPerSecond,
                                  model.popupPinned, model.mouseX, model.mouseY, style, list);
+        } else if (model.statsPanel != DesktopStatsPanel::None) {
+            const auto t = model.telemetry.View();
+            const auto* history = model.statsPanel == DesktopStatsPanel::App ? t.app : t.compositor;
+            ChromeBuildStatsPopup(model.statsLayout, model.statsPanel, model.detailedStats, model.firstCoreRow,
+                                  history, model.hudTick, model.popupPinned, model.mouseX, model.mouseY, style, list);
         } else
             ChromeBuildTrayFlyout({model.rect, model.network, model.networkConnected, model.text, model.telemetry.View(),
                                    model.popupPinned, model.mouseX, model.mouseY}, style, list);

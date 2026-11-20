@@ -336,9 +336,9 @@ static void PowerText(char* out, uint32_t milliwatts)
 // Bars of a cadence history, newest at the right: `pitch` apart, one per
 // sample from the last 10 s, scaled to `fullMs`; over-budget frames are hot.
 static void CadenceBars(ChromeDisplayList& dl, const ChromeStyle& s, const DesktopRect& r,
-                        const DesktopIntervals<>& history, uint64_t tick, unsigned fullMs, uint32_t ink)
+                        const DesktopIntervals<>& history, uint64_t tick, unsigned fullMs, uint32_t ink, int pitchPx = 3)
 {
-    const int pitch = Px(s, 3), bar = pitch > 1 ? pitch - Px(s, 1) : 1;
+    const int pitch = Px(s, pitchPx), bar = pitch > 1 ? pitch - Px(s, 1) : 1;
     if (r.w < pitch || r.h <= 0) return;
     const unsigned capacity = static_cast<unsigned>(r.w / pitch);
     const unsigned shown = history.count < capacity ? history.count : capacity;
@@ -346,7 +346,7 @@ static void CadenceBars(ChromeDisplayList& dl, const ChromeStyle& s, const Deskt
         const auto& v = history.samples[(history.next + 128 - shown + i) % 128];
         if (tick < v.tick || tick - v.tick > 10000) continue;
         const unsigned ms = v.ms < fullMs ? v.ms : fullMs;
-        const int height = 1 + (r.h - 1) * static_cast<int>(ms) / static_cast<int>(fullMs);
+        const int height = 1 + int(uint64_t(r.h - 1) * ms / fullMs);
         dl.Fill(r.x + r.w - static_cast<int>(shown - i) * pitch, r.y + r.h - height, bar, height,
                 0xff000000u | (v.ms >= 17 ? s.P().hot : ink));
     }
@@ -525,6 +525,10 @@ void ChromeBuildTaskbar(const ChromeTaskbarModel& m, const ChromeStyle& s, Chrom
     }
     target(l.network, false);
     target(l.volume, false);
+    target(l.metrics[0], false);
+    target(l.metrics[1], false);
+    target(l.metrics[4], false);
+    target(l.metrics[5], false);
     if (l.metrics[6].w > 0) {
         // Thermometer and package temperature, coloured only when warm or hot.
         const DesktopRect& r = l.metrics[6];
@@ -1163,7 +1167,7 @@ ChromeDiskPopupLayout ChromeDiskPopupLayoutFor(const ChromeStyle& s, DesktopRect
     return layout;
 }
 
-static void DiskSize(char* out, uint64_t bytes, bool decimal)
+static void StorageSize(char* out, uint64_t bytes, bool decimal)
 {
     static const char* const units[] = {" B", " KiB", " MiB", " GiB", " TiB", " PiB", " EiB"};
     uint64_t unit = 1;
@@ -1180,10 +1184,10 @@ static void DiskSize(char* out, uint64_t bytes, bool decimal)
 
 static void DiskSizes(char (&out)[48], const DesktopDiskVolume& row, bool decimal)
 {
-    DiskSize(out, row.freeBytes, decimal);
+    StorageSize(out, row.freeBytes, decimal);
     unsigned len = 0; while (out[len]) ++len;
     CopyText(out + len, " / ", sizeof(out) - len);
-    DiskSize(out + len + 3, row.totalBytes, decimal);
+    StorageSize(out + len + 3, row.totalBytes, decimal);
 }
 
 void ChromeBuildDiskPopup(const ChromeDiskPopupLayout& l, const DesktopDiskPage& page, uint64_t readRate,
@@ -1364,6 +1368,235 @@ void ChromeBuildPerformanceHud(const ChromePerformanceHudModel& m, const ChromeS
     }
     HudGroup(dl, s, x, y, w, "TEMP", value, power[0] ? power : nullptr, live, &plot);
     if (live) ThermalBars(dl, s, plot, t);
+}
+
+ChromeStatsPopupLayout ChromeStatsPopupLayoutFor(const ChromeStyle& s, DesktopRect anchor, int screenW,
+                                                 int taskbarY, DesktopStatsPanel panel, uint32_t cores,
+                                                 bool keepPinReachable)
+{
+    ChromeStatsPopupLayout layout{};
+    const int pad = Px(s, FlyoutPad), gap = Px(s, FlyoutGap), margin = Px(s, 8);
+    const int maxW = screenW - 2 * margin, preferredW = Px(s, 368);
+    const int w = maxW < preferredW ? maxW : preferredW;
+    const int head = 2 * pad + PanelHeaderHeight(s) + gap;
+    const int budget = taskbarY - 2 * margin - head;
+    const int row = s.Line(CF::Label) + Px(s, 5);
+    const int caption = s.Line(CF::Small);
+    const int footer = Px(s, 28);
+    if (!anchor.w || w < Px(s, 180)) return layout;
+
+    // A pinned panel keeps its header available on a display that no longer
+    // has room for its data. Growing the display restores the same panel.
+    const auto collapse = [&]() {
+        ChromeStatsPopupLayout header{};
+        if (keepPinReachable && budget >= 0) {
+            header.panel = TaskbarTooltipBox(anchor, w, head, taskbarY, margin, screenW, margin);
+            header.pin = ChromeTrayFlyoutPinRect(s, header.panel);
+            header.body.x = header.panel.x + pad;
+        }
+        return header;
+    };
+
+    int bodyH = 0;
+    bool paged = false;
+    switch (panel) {
+    case DesktopStatsPanel::Cpu: {
+        const int fixed = 2 * caption + gap + DetailedTopTasks * row;
+        const uint32_t total = cores ? (cores + 1) / 2 : 1;
+        const int room = (budget - fixed) / row;
+        if (room < 1) return collapse();
+        const unsigned fit = room > 6 ? 6 : unsigned(room);
+        paged = total > fit;
+        const int withFooter = (budget - fixed - footer) / row;
+        if (paged && withFooter < 1) return collapse();
+        layout.coreRows = !paged ? total : unsigned(withFooter) < fit ? unsigned(withFooter) : fit;
+        bodyH = fixed + int(layout.coreRows) * row + (paged ? footer : 0);
+        break;
+    }
+    case DesktopStatsPanel::Memory:
+        bodyH = 7 * row;
+        break;
+    case DesktopStatsPanel::Compositor:
+    case DesktopStatsPanel::App: {
+        const int fixed = 2 * caption + 2 * gap + 3 * row;
+        int plot = budget - fixed;
+        if (plot > Px(s, 108)) plot = Px(s, 108);
+        if (plot < Px(s, 32)) return collapse();
+        bodyH = fixed + plot;
+        break;
+    }
+    case DesktopStatsPanel::None: return layout;
+    }
+    if (bodyH > budget) return collapse();
+    layout.panel = TaskbarTooltipBox(anchor, w, head + bodyH, taskbarY, margin, screenW, margin);
+    const auto& p = layout.panel;
+    layout.pin = ChromeTrayFlyoutPinRect(s, p);
+    layout.body = {p.x + pad, p.y + head - pad, w - 2 * pad, bodyH};
+    layout.rowHeight = row;
+    if (paged) {
+        const int button = Px(s, 24), top = layout.body.y + caption + int(layout.coreRows) * row + Px(s, 2);
+        layout.next = {p.x + w - pad - button, top, button, button};
+        layout.previous = {layout.next.x - button - Px(s, 4), top, button, button};
+    }
+    return layout;
+}
+
+static void DetailedValue(ChromeDisplayList& dl, const ChromeStyle& s, int x, int y, int w,
+                          const char* label, const char* value)
+{
+    const int valueWidth = s.TextWidth(value, CF::Label), gap = Px(s, 8);
+    if (valueWidth > w) return;
+    ChromeElidedText(dl, s, CF::Label, x, y, label, s.P().secondaryText, w - valueWidth - gap);
+    TextRight(dl, s, CF::Label, x + w, y, value, s.P().text);
+}
+
+static void DetailedPercent(char* out, uint8_t percent)
+{
+    if (percent == DetailedNoPercent) { CopyText(out, "-", 2); return; }
+    DesktopNumber(out, percent);
+    while (*out) ++out;
+    CopyText(out, "%", 2);
+}
+
+static void DetailedCpu(const ChromeStatsPopupLayout& l, const DesktopDetailedStats& stats, uint32_t first,
+                        int32_t mx, int32_t my, const ChromeStyle& s, ChromeDisplayList& dl)
+{
+    const auto& b = l.body;
+    const auto& p = s.P();
+    const int caption = s.Line(CF::Small), row = l.rowHeight;
+    dl.Text(CF::Small, b.x, b.y, "Per-core usage", p.mutedText, b.w);
+    const int gutter = Px(s, 16), column = (b.w - gutter) / 2;
+    for (uint32_t i = 0; i < l.coreRows * 2 && 2 * first + i < stats.coreCount; ++i) {
+        const unsigned core = 2 * first + i;
+        const int x = b.x + int(i % 2) * (column + gutter);
+        const int y = b.y + caption + int(i / 2) * row;
+        char label[20] = "CPU ", value[8]{};
+        DesktopNumber(label + 4, core);
+        DetailedPercent(value, stats.cpuMeasured ? stats.cores[core] : DetailedNoPercent);
+        DetailedValue(dl, s, x, y, column, label, value);
+    }
+    int y = b.y + caption + int(l.coreRows) * row;
+    if (!stats.coreCount)
+        dl.Text(CF::Label, b.x, b.y + caption, "Sampling CPU...", p.secondaryText, b.w);
+    if (l.next.w) {
+        char range[24] = "CPU ";
+        DesktopNumber(range + 4, 2 * first);
+        unsigned used = 4; while (range[used]) ++used;
+        range[used++] = '-';
+        const unsigned end = 2 * (first + l.coreRows);
+        DesktopNumber(range + used, (end < stats.coreCount ? end : stats.coreCount) - 1);
+        dl.Text(CF::Small, b.x, l.next.y + (l.next.h - caption) / 2, range, p.secondaryText,
+                l.previous.x - b.x);
+        const auto button = [&](DesktopRect rect, ChromeGlyph glyph, bool enabled) {
+            if (enabled && rect.contains(mx, my)) ChromeMaterialRect(dl, s, rect, p.taskHover);
+            const int g = Px(s, 16);
+            dl.Glyph(glyph, rect.x + (rect.w - g) / 2, rect.y + (rect.h - g) / 2,
+                     enabled ? p.text : p.mutedText);
+        };
+        button(l.previous, ChromeGlyph::ChevronUp, first != 0);
+        button(l.next, ChromeGlyph::ChevronDown, end < stats.coreCount);
+        y += Px(s, 28);
+    }
+    y += Px(s, FlyoutGap);
+    const char* basis = "% of one CPU";
+    dl.Text(CF::Small, b.x, y, "Top tasks", p.mutedText, b.w - s.TextWidth(basis, CF::Small) - Px(s, 4));
+    TextRight(dl, s, CF::Small, b.x + b.w, y, basis, p.mutedText);
+    y += caption;
+    if (!stats.tasksMeasured || !stats.tasks[0].ticks) {
+        dl.Text(CF::Label, b.x, y, stats.tasksMeasured ? "No active tasks" : "Sampling tasks...",
+                p.secondaryText, b.w);
+        return;
+    }
+    for (const auto& task : stats.tasks) {
+        if (!task.ticks) break;
+        char value[8]{}, info[16] = "#";
+        DetailedPercent(value, task.percent);
+        DesktopNumber(info + 1, task.tid);
+        const int infoWidth = s.TextWidth(info, CF::Small) + Px(s, 6);
+        dl.Text(CF::Small, b.x, y + s.Font(CF::Label).ascent - s.Font(CF::Small).ascent, info, p.mutedText);
+        DetailedValue(dl, s, b.x + infoWidth, y, b.w - infoWidth, task.name[0] ? task.name : "(unnamed)", value);
+        y += row;
+    }
+}
+
+static void DetailedMemory(const ChromeStatsPopupLayout& l, const DesktopDetailedStats& stats,
+                           const ChromeStyle& s, ChromeDisplayList& dl)
+{
+    const auto& b = l.body;
+    int y = b.y;
+    const auto value = [&](const char* label, uint64_t bytes) {
+        char text[24] = "Unavailable";
+        if (stats.memoryMeasured) StorageSize(text, bytes, true);
+        DetailedValue(dl, s, b.x, y, b.w, label, text);
+        y += l.rowHeight;
+    };
+    value("Total RAM", stats.total);
+    value("In use", stats.used);
+    value("Available", stats.available);
+    value("Page cache", stats.cached);
+    value("Tracked kernel", stats.kernel);
+    if (stats.gpuMeasured) value("Tracked GPU RAM", stats.gpu);
+    else {
+        DetailedValue(dl, s, b.x, y, b.w, "Tracked GPU RAM", "Unavailable");
+        y += l.rowHeight;
+    }
+    DetailedValue(dl, s, b.x, y, b.w, "Swap", "Not configured");
+}
+
+static void DetailedCadence(const ChromeStatsPopupLayout& l, bool app, const DesktopIntervals<>* history,
+                            uint64_t tick, const ChromeStyle& s, ChromeDisplayList& dl)
+{
+    const auto& b = l.body;
+    const auto& p = s.P();
+    const int caption = s.Line(CF::Small), gap = Px(s, FlyoutGap);
+    dl.Text(CF::Small, b.x, b.y, app ? "Focused app frame intervals" : "Compositor frame intervals", p.mutedText, b.w);
+    const int chartH = b.h - 2 * caption - 2 * gap - 3 * l.rowHeight;
+    const auto plot = GraphBox(dl, s, {b.x, b.y + caption + gap, b.w, chartH});
+    const auto summary = history ? history->Read(tick) : DesktopIntervals<>::Summary{};
+    if (summary.count) {
+        const uint32_t scale = summary.max > 34 ? summary.max : 34;
+        const int budget = int(uint64_t(plot.h) * 167 / (uint64_t(scale) * 10));
+        dl.Fill(plot.x, plot.y + plot.h - (budget ? budget : 1), plot.w, 1, HairlineColor(s, p.launcher));
+        CadenceBars(dl, s, plot, *history, tick, scale, app ? p.accent : p.ok, 2);
+    } else {
+        dl.Text(CF::Label, plot.x + Px(s, 6), plot.y + Px(s, 6), "No recent frames", p.secondaryText,
+                plot.w - Px(s, 12));
+    }
+    const int foot = b.y + caption + gap + chartH;
+    dl.Text(CF::Small, b.x, foot, "Last 10 s " BROOK_CHROME_DOT " 16.7 ms budget", p.mutedText, b.w);
+    int y = foot + caption + gap;
+    const auto value = [&](const char* label, uint32_t ms) {
+        char text[24] = "-";
+        if (summary.count) {
+            DesktopNumber(text, ms);
+            unsigned len = 0; while (text[len]) ++len;
+            CopyText(text + len, " ms", sizeof(text) - len);
+        }
+        DetailedValue(dl, s, b.x, y, b.w, label, text);
+        y += l.rowHeight;
+    };
+    value("p80", summary.p80);
+    value("p95", summary.p95);
+    value("Max", summary.max);
+}
+
+void ChromeBuildStatsPopup(const ChromeStatsPopupLayout& l, DesktopStatsPanel panel, const DesktopDetailedStats& stats,
+                           uint32_t first, const DesktopIntervals<>* history, uint64_t tick, bool pinned,
+                           int32_t mx, int32_t my, const ChromeStyle& s, ChromeDisplayList& dl)
+{
+    if (l.panel.w <= 0 || panel == DesktopStatsPanel::None) return;
+    const bool cpu = panel == DesktopStatsPanel::Cpu, memory = panel == DesktopStatsPanel::Memory;
+    const bool app = panel == DesktopStatsPanel::App;
+    const char* title = cpu ? "CPU" : memory ? "Memory" : app ? "App frames" : "Compositor";
+    const auto glyph = cpu ? ChromeGlyph::Bolt : memory ? ChromeGlyph::Grid : ChromeGlyph::Play;
+    const int x = l.body.x, y = l.panel.y + Px(s, FlyoutPad);
+    PanelFrame(dl, s, l.panel);
+    PanelHeader(dl, s, x, y, l.pin.x - x - Px(s, 8), glyph, title, nullptr, 0);
+    PopupPin(dl, s, l.pin, pinned, mx, my);
+    if (!l.body.h) return;
+    if (cpu) DetailedCpu(l, stats, first, mx, my, s, dl);
+    else if (memory) DetailedMemory(l, stats, s, dl);
+    else DetailedCadence(l, app, history, tick, s, dl);
 }
 
 } // namespace brook

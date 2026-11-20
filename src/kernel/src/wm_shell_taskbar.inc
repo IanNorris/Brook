@@ -339,7 +339,7 @@ static void WmCaptureVolumePopup(uint32_t screenW, uint32_t screenH, int32_t mou
     snapshot.volume.mouseY = hover.h ? hover.y : -1;
 }
 
-enum class WmTrayFlyout : uint8_t { None, Network, Temperature, Disk };
+enum class WmTrayFlyout : uint8_t { None, Network, Temperature, Disk, Cpu, Memory, Compositor, App };
 static WmTrayFlyout g_trayFlyout;
 static uint32_t g_diskPopupFirst;
 static int32_t g_diskScrollRemainder;
@@ -374,8 +374,26 @@ bool WmDiskFlyoutScroll(int32_t x, int32_t y, int delta120, uint32_t sw, uint32_
     return true;
 }
 
+DesktopStatsPanel WmDetailedStatsSelected()
+{
+    switch (g_trayFlyout) {
+    case WmTrayFlyout::Cpu: return DesktopStatsPanel::Cpu;
+    case WmTrayFlyout::Memory: return DesktopStatsPanel::Memory;
+    case WmTrayFlyout::Compositor: return DesktopStatsPanel::Compositor;
+    case WmTrayFlyout::App: return DesktopStatsPanel::App;
+    default: return DesktopStatsPanel::None;
+    }
+}
+
 static TaskbarPopup WmTrayPopupKind()
 {
+    switch (g_trayFlyout) {
+    case WmTrayFlyout::Cpu: return TaskbarPopup::Cpu;
+    case WmTrayFlyout::Memory: return TaskbarPopup::Memory;
+    case WmTrayFlyout::Compositor: return TaskbarPopup::Compositor;
+    case WmTrayFlyout::App: return TaskbarPopup::App;
+    default: break;
+    }
     if (g_trayFlyout == WmTrayFlyout::Network) return TaskbarPopup::Network;
     if (WmDiskFlyoutSelected()) return TaskbarPopup::Disk;
     return g_trayFlyout == WmTrayFlyout::Temperature ? TaskbarPopup::Temperature : TaskbarPopup::None;
@@ -418,6 +436,43 @@ void WmCyclePerformanceHud()
                 g_hudMode == WmHudMode::Compact ? WmHudMode::Panel : WmHudMode::Off;
 }
 
+static uint32_t g_cpuFirstRow;
+static int32_t g_cpuScrollRemainder;
+
+static ChromeStatsPopupLayout WmStatsPopupLayout(uint32_t sw, uint32_t sh, DesktopStatsPanel panel)
+{
+    const auto bar = GetTaskbarLayout(sw, sh);
+    unsigned metric;
+    switch (panel) {
+    case DesktopStatsPanel::Cpu: metric = 0; break;
+    case DesktopStatsPanel::Memory: metric = 1; break;
+    case DesktopStatsPanel::Compositor: metric = 4; break;
+    case DesktopStatsPanel::App: metric = 5; break;
+    default: return {};
+    }
+    auto anchor = bar.metrics[metric];
+    const bool pinned = g_taskbarPopupPin.Is(WmTrayPopupKind());
+    if (!anchor.w && pinned) anchor = {int(sw) - int(WmMetric(16)), bar.y, int(WmMetric(16)), 1};
+    return ChromeStatsPopupLayoutFor(WmChromeStyle(), anchor, int(sw), bar.y, panel, DesktopStatsCoreCount(), pinned);
+}
+
+static void WmStepCpuPopup(const ChromeStatsPopupLayout& layout, int64_t step)
+{
+    g_cpuFirstRow = DesktopDiskPageStep(g_cpuFirstRow, (DesktopStatsCoreCount() + 1) / 2, layout.coreRows, step);
+}
+
+bool WmCpuFlyoutScroll(int32_t x, int32_t y, int delta120, uint32_t sw, uint32_t sh)
+{
+    if (WmDetailedStatsSelected() != DesktopStatsPanel::Cpu ||
+        WmTaskbarHidden() || WmLauncherVisible() || WmWindowMenuOpen()) return false;
+    const auto layout = WmStatsPopupLayout(sw, sh, DesktopStatsPanel::Cpu);
+    if (!layout.coreRows || !layout.panel.contains(x, y)) return false;
+    const int64_t movement = g_cpuScrollRemainder + int64_t(delta120);
+    g_cpuScrollRemainder = int32_t(movement % 120);
+    WmStepCpuPopup(layout, -(movement / 120));
+    return true;
+}
+
 static DesktopRect WmTrayFlyoutLayout(uint32_t sw, uint32_t sh);
 
 bool WmTrayFlyoutPress(int32_t mx, int32_t my, uint32_t sw, uint32_t sh)
@@ -431,6 +486,10 @@ bool WmTrayFlyoutPress(int32_t mx, int32_t my, uint32_t sw, uint32_t sh)
             const auto layout = WmDiskPopupLayout(sw, sh);
             if (layout.previous.contains(mx, my)) WmStepDiskPopup(layout, -int64_t(layout.pageRows));
             if (layout.next.contains(mx, my)) WmStepDiskPopup(layout, layout.pageRows);
+        } else if (WmDetailedStatsSelected() == DesktopStatsPanel::Cpu) {
+            const auto layout = WmStatsPopupLayout(sw, sh, DesktopStatsPanel::Cpu);
+            if (layout.previous.contains(mx, my)) WmStepCpuPopup(layout, -int64_t(layout.coreRows));
+            if (layout.next.contains(mx, my)) WmStepCpuPopup(layout, layout.coreRows);
         }
         return true;
     }
@@ -443,12 +502,17 @@ bool WmTrayFlyoutPress(int32_t mx, int32_t my, uint32_t sw, uint32_t sh)
     }
     const auto next = l.network.contains(mx, my) ? WmTrayFlyout::Network :
                       l.metrics[6].contains(mx, my) ? WmTrayFlyout::Temperature :
-                      l.metrics[2].contains(mx, my) ? WmTrayFlyout::Disk : WmTrayFlyout::None;
+                      l.metrics[2].contains(mx, my) ? WmTrayFlyout::Disk :
+                      l.metrics[0].contains(mx, my) ? WmTrayFlyout::Cpu :
+                      l.metrics[1].contains(mx, my) ? WmTrayFlyout::Memory :
+                      l.metrics[4].contains(mx, my) ? WmTrayFlyout::Compositor :
+                      l.metrics[5].contains(mx, my) ? WmTrayFlyout::App : WmTrayFlyout::None;
     if (WmTaskbarPopupPinned()) return next != WmTrayFlyout::None;
     if (!WmTrayFlyoutVisible() && next == WmTrayFlyout::None) return false;
     g_trayFlyout = next == g_trayFlyout ? WmTrayFlyout::None : next;
     if (WmTrayFlyoutVisible()) {
         if (WmDiskFlyoutSelected()) g_diskPopupFirst = g_diskScrollRemainder = 0;
+        if (WmDetailedStatsSelected() == DesktopStatsPanel::Cpu) g_cpuFirstRow = g_cpuScrollRemainder = 0;
         if (WmTrayFlyoutLayout(sw, sh).w <= 0) {
             WmTrayFlyoutClose();
             return true;
@@ -473,6 +537,8 @@ static DesktopRect WmTrayFlyoutLayout(uint32_t sw, uint32_t sh)
 {
     if (!WmTrayFlyoutVisible() || WmTaskbarHidden()) return {};
     if (WmDiskFlyoutSelected()) return WmDiskPopupLayout(sw, sh).panel;
+    const auto stats = WmDetailedStatsSelected();
+    if (stats != DesktopStatsPanel::None) return WmStatsPopupLayout(sw, sh, stats).panel;
     const auto l = GetTaskbarLayout(sw, sh);
     const auto anchor = g_trayFlyout == WmTrayFlyout::Network ? l.network : l.metrics[6];
     const int gap = WmMetric(ChromeShellMetrics::PanelMargin);
@@ -589,8 +655,44 @@ static void WmCapturePopupPin(DesktopRect pin, int32_t mx, int32_t my, bool pinn
 }
 
 static void WmCaptureTrayFlyout(const WmShellSurface& surface, uint32_t sw, uint32_t sh,
-                               int32_t mx, int32_t my, ChromeShellModel& snapshot)
+                               uint64_t uptimeMs, int32_t mx, int32_t my, ChromeShellModel& snapshot)
 {
+    const auto panel = WmDetailedStatsSelected();
+    if (panel != DesktopStatsPanel::None) {
+        const auto layout = WmStatsPopupLayout(sw, sh, panel);
+        const auto rect = layout.panel;
+        if (rect.w <= 0 || rect.x != surface.x || rect.y != surface.y ||
+            uint32_t(rect.w) != surface.w || uint32_t(rect.h) != surface.h) return;
+        snapshot.kind = ChromeShellKind::TrayFlyout;
+        snapshot.rect = rect;
+        snapshot.statsLayout = layout;
+        snapshot.statsPanel = panel;
+        const auto hover = layout.pin.contains(mx, my) ? layout.pin :
+                           layout.previous.contains(mx, my) ? layout.previous :
+                           layout.next.contains(mx, my) ? layout.next : DesktopRect{};
+        WmCapturePopupPin(hover, mx, my, g_taskbarPopupPin.Is(WmTrayPopupKind()), snapshot);
+        if (panel == DesktopStatsPanel::Cpu || panel == DesktopStatsPanel::Memory) {
+            DesktopStatsRead(panel, snapshot.detailedStats);
+            if (panel == DesktopStatsPanel::Cpu) {
+                const auto cores = DesktopStatsCoreCount();
+                auto& stats = snapshot.detailedStats;
+                for (unsigned i = stats.coreCount; i < cores; ++i) stats.cores[i] = DetailedNoPercent;
+                stats.coreCount = cores;
+                snapshot.firstCoreRow = DesktopDiskPageFirst(g_cpuFirstRow, (cores + 1) / 2, layout.coreRows);
+                g_cpuFirstRow = snapshot.firstCoreRow;
+            }
+        } else {
+            snapshot.hudTick = ShellCadenceTick;
+            const bool app = panel == DesktopStatsPanel::App;
+            const auto source = WmTelemetryModel(app, false, false);
+            auto& telemetry = snapshot.telemetry;
+            telemetry.hasApp = app;
+            telemetry.hasCompositor = !app;
+            if (app) WmCaptureCadence(telemetry.app, *source.app, uptimeMs);
+            else WmCaptureCadence(telemetry.compositor, *source.compositor, uptimeMs);
+        }
+        return;
+    }
     if (WmDiskFlyoutSelected()) {
         const auto layout = WmDiskPopupLayout(sw, sh);
         // The worker can adopt a new volume count between choosing the
@@ -788,6 +890,16 @@ static bool WmTrayTooltip(uint32_t screenW, uint32_t screenH, int32_t mx, int32_
             }
             *out = 0;
         } else WmStrCopy(text, "Network: disconnected", sizeof(text));
+    }
+    if (!anchor) {
+        constexpr unsigned metrics[] = {0, 1, 4, 5};
+        const char* labels[] = {"CPU usage", "Memory usage", "Compositor frame timing", "App frame timing"};
+        for (unsigned i = 0; i < 4; ++i) {
+            if (!l.metrics[metrics[i]].contains(mx, my)) continue;
+            anchor = &l.metrics[metrics[i]];
+            WmStrCopy(text, labels[i], sizeof(text));
+            break;
+        }
     }
     if (!anchor) {
         const WmRect* controls[] = {&l.apps, &l.terminal, &l.next};

@@ -336,6 +336,7 @@ add_executable(kernel
     src/compositor_scene.cpp
     src/window.cpp
     src/desktop_disk_popup.cpp
+    src/desktop_stats_popup.cpp
     src/chrome_raster.cpp
     src/chrome_frame.cpp
     src/chrome_shell.cpp

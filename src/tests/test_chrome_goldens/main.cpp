@@ -695,6 +695,40 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
         Check(prefix + "disk-popup", diskList, s, model.rect.x, model.rect.y, model.rect.w, model.rect.h);
         model.popupPinned = false;
     }
+    if (prefix == "glass-100-" || prefix == "opaque-light-150-" || prefix == "opaque-dark-200-") {
+        model.diskPopup = false;
+        model.popupPinned = true;
+        model.hudTick = now;
+        for (const auto panel : {DesktopStatsPanel::Cpu, DesktopStatsPanel::Memory,
+                                 DesktopStatsPanel::Compositor, DesktopStatsPanel::App}) {
+            model.statsPanel = panel;
+            model.statsLayout = ChromeStatsPopupLayoutFor(s, layout.volume, screenW, screenH - m.taskbar(), panel, 64);
+            model.rect = model.statsLayout.panel;
+            auto& stats = model.detailedStats;
+            stats.cpuMeasured = stats.tasksMeasured = stats.memoryMeasured = true;
+            stats.gpuMeasured = prefix != "opaque-dark-200-";
+            model.firstCoreRow = 4;
+            stats.coreCount = 64;
+            for (unsigned i = 0; i < stats.coreCount; ++i) stats.cores[i] = i * 37 % 101;
+            stats.cores[8] = DetailedNoPercent;
+            stats.tasks[0] = {"clearwater-shell", 820, 49, 82};
+            stats.tasks[1] = {"Worker with a long process name", 145, 651, 14};
+            stats.total = 8ull << 30;
+            stats.used = 2500ull << 20;
+            stats.available = 5600ull << 20;
+            stats.cached = 720ull << 20;
+            stats.kernel = 510ull << 20;
+            stats.gpu = 228ull << 20;
+            telemetry.hasApp = prefix != "opaque-dark-200-";
+            const char* name = panel == DesktopStatsPanel::Cpu ? "cpu" : panel == DesktopStatsPanel::Memory ? "memory" :
+                               panel == DesktopStatsPanel::Compositor ? "compositor" : "app";
+            auto statsList = ChromeListOn(storage);
+            RenderSnapshot(model, s, statsList);
+            Check(prefix + "stats-" + name, statsList, s, model.rect.x, model.rect.y, model.rect.w, model.rect.h);
+        }
+        model.popupPinned = false;
+        telemetry.hasApp = true;
+    }
     model.kind = ChromeShellKind::PerformanceHud;
     const DesktopRect hud{0, 0, int(s.M(348)), ChromePerformanceHudHeight(s, true)};
     model.rect = hud;
