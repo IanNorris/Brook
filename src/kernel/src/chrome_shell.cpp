@@ -1217,7 +1217,7 @@ void ChromeBuildDiskPopup(const ChromeDiskPopupLayout& l, const DesktopDiskPage&
     }
     for (uint32_t i = 0; i < page.count; ++i) {
         const auto& row = page.rows[i];
-        char value[48] = "Unavailable";
+        char value[48] = "Unknown";
         if (row.available) {
             DiskSizes(value, row, true);
             if (s.TextWidth(value, CF::Small) > w - Px(s, 42)) DiskSizes(value, row, false);
