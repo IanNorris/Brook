@@ -51,6 +51,25 @@ struct DesktopDetailedStats {
     uint64_t total, used, available, cached, kernel, gpu;
 };
 
+struct DesktopMemoryRegions { uint64_t other, cache, kernel, available; };
+
+inline DesktopMemoryRegions DesktopMemoryUsageRegions(const DesktopDetailedStats& stats) {
+    const uint64_t used = stats.used < stats.total ? stats.used : stats.total;
+    const uint64_t free = stats.total - used;
+    uint64_t available = stats.available < stats.total ? stats.available : stats.total;
+    if (available < free) available = free;
+
+    // MemAvailable includes reclaimable cache. Give that space to the
+    // available segment only, so the physical RAM segments add up once.
+    const uint64_t reclaimable = available - free;
+    const uint64_t occupied = stats.total - available;
+    uint64_t cache = stats.cached > reclaimable ? stats.cached - reclaimable : 0;
+    if (cache > occupied) cache = occupied;
+    const uint64_t remaining = occupied - cache;
+    const uint64_t kernel = stats.kernel < remaining ? stats.kernel : remaining;
+    return {remaining - kernel, cache, kernel, available};
+}
+
 void DesktopStatsWorkerStart();
 void DesktopStatsSetVisible(DesktopStatsPanel panel);
 uint32_t DesktopStatsCoreCount();

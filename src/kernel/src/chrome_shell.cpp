@@ -1414,7 +1414,7 @@ ChromeStatsPopupLayout ChromeStatsPopupLayoutFor(const ChromeStyle& s, DesktopRe
         break;
     }
     case DesktopStatsPanel::Memory:
-        bodyH = 7 * row;
+        bodyH = 7 * row + Px(s, 8) + 2 * caption;
         break;
     case DesktopStatsPanel::Compositor:
     case DesktopStatsPanel::App: {
@@ -1452,7 +1452,7 @@ static void DetailedValue(ChromeDisplayList& dl, const ChromeStyle& s, int x, in
 
 static void DetailedPercent(char* out, uint8_t percent)
 {
-    if (percent == DetailedNoPercent) { CopyText(out, "-", 2); return; }
+    if (percent == DetailedNoPercent) { CopyText(out, "Unknown", 8); return; }
     DesktopNumber(out, percent);
     while (*out) ++out;
     CopyText(out, "%", 2);
@@ -1472,8 +1472,16 @@ static void DetailedCpu(const ChromeStatsPopupLayout& l, const DesktopDetailedSt
         const int y = b.y + caption + int(i / 2) * row;
         char label[20] = "CPU ", value[8]{};
         DesktopNumber(label + 4, core);
-        DetailedPercent(value, stats.cpuMeasured ? stats.cores[core] : DetailedNoPercent);
+        const uint8_t percent = stats.cpuMeasured ? stats.cores[core] : DetailedNoPercent;
+        DetailedPercent(value, percent);
         DetailedValue(dl, s, x, y, column, label, value);
+        if (percent <= 100) {
+            const int height = Px(s, 2), top = y + row - height;
+            const uint32_t color = percent > 90 ? p.hot : percent < 80 ? p.accent : p.secondaryText;
+            dl.Fill(x, top, column, height, 0xff000000u | ChromeBlendColor(p.launcher, p.mutedText, 66));
+            const int filled = column * percent / 100;
+            if (filled > 0) dl.Fill(x, top, filled, height, 0xff000000u | color);
+        }
     }
     int y = b.y + caption + int(l.coreRows) * row;
     if (!stats.coreCount)
@@ -1519,13 +1527,49 @@ static void DetailedCpu(const ChromeStatsPopupLayout& l, const DesktopDetailedSt
     }
 }
 
+static void DetailedMemoryBar(ChromeDisplayList& dl, const ChromeStyle& s, DesktopRect bounds,
+                              const DesktopDetailedStats& stats)
+{
+    if (!stats.memoryMeasured || stats.total < 4096) return;
+    const auto& p = s.P();
+    const auto regions = DesktopMemoryUsageRegions(stats);
+    const uint64_t warningFree = stats.total / 10 + (stats.total % 10 != 0);
+    const uint64_t accentFree = stats.total / 5;
+    const uint32_t usedColor = regions.available < warningFree ? p.hot :
+                               regions.available > accentFree ? p.accent : p.secondaryText;
+    const struct Segment { const char* name; uint64_t bytes; uint32_t color; } segments[] = {
+        {"Other in use", regions.other, usedColor}, {"Cache retained", regions.cache, p.mutedText},
+        {"Tracked kernel", regions.kernel, p.text}, {"Available", regions.available, p.ok},
+    };
+    // PMM values are page counts converted to bytes. Scaling pages keeps
+    // the multiplication in range even at the maximum physical screen width.
+    const uint64_t pages = stats.total / 4096;
+    uint64_t cumulative = 0;
+    int offset = 0;
+    for (unsigned i = 0; i < 4; ++i) {
+        const auto& segment = segments[i];
+        cumulative += segment.bytes;
+        const int end = int(uint64_t(bounds.w) * (cumulative / 4096) / pages);
+        if (end > offset)
+            dl.Fill(bounds.x + offset, bounds.y, end - offset, Px(s, 3), 0xff000000u | segment.color);
+        offset = end;
+        const int column = bounds.w / 2;
+        const int x = bounds.x + int(i % 2) * column;
+        const int legendY = bounds.y + Px(s, 8) + int(i / 2) * s.Line(CF::Small);
+        const int dot = Px(s, 5);
+        dl.Fill(x, legendY + (s.Line(CF::Small) - dot) / 2, dot, dot, 0xff000000u | segment.color);
+        dl.Text(CF::Small, x + dot + Px(s, 4), legendY, segment.name, p.secondaryText,
+                column - dot - Px(s, 8));
+    }
+}
+
 static void DetailedMemory(const ChromeStatsPopupLayout& l, const DesktopDetailedStats& stats,
                            const ChromeStyle& s, ChromeDisplayList& dl)
 {
     const auto& b = l.body;
     int y = b.y;
     const auto value = [&](const char* label, uint64_t bytes) {
-        char text[24] = "Unavailable";
+        char text[24] = "Unknown";
         if (stats.memoryMeasured) StorageSize(text, bytes, true);
         DetailedValue(dl, s, b.x, y, b.w, label, text);
         y += l.rowHeight;
@@ -1533,11 +1577,13 @@ static void DetailedMemory(const ChromeStatsPopupLayout& l, const DesktopDetaile
     value("Total RAM", stats.total);
     value("In use", stats.used);
     value("Available", stats.available);
+    DetailedMemoryBar(dl, s, {b.x, y, b.w, 0}, stats);
+    y += Px(s, 8) + 2 * s.Line(CF::Small);
     value("Page cache", stats.cached);
     value("Tracked kernel", stats.kernel);
     if (stats.gpuMeasured) value("Tracked GPU RAM", stats.gpu);
     else {
-        DetailedValue(dl, s, b.x, y, b.w, "Tracked GPU RAM", "Unavailable");
+        DetailedValue(dl, s, b.x, y, b.w, "Tracked GPU RAM", "Unknown");
         y += l.rowHeight;
     }
     DetailedValue(dl, s, b.x, y, b.w, "Swap", "Not configured");
@@ -1566,7 +1612,7 @@ static void DetailedCadence(const ChromeStatsPopupLayout& l, bool app, const Des
     dl.Text(CF::Small, b.x, foot, "Last 10 s " BROOK_CHROME_DOT " 16.7 ms budget", p.mutedText, b.w);
     int y = foot + caption + gap;
     const auto value = [&](const char* label, uint32_t ms) {
-        char text[24] = "-";
+        char text[24] = "Unknown";
         if (summary.count) {
             DesktopNumber(text, ms);
             unsigned len = 0; while (text[len]) ++len;

@@ -140,6 +140,23 @@ static void checkDetailedStats() {
     CHECK(DesktopCpuDelta({100, 100}, {100, 120}, usage) == 20 && usage == 0);
     CHECK(DesktopCpuDelta({120, 0}, {100, 0}, usage) == 0 && usage == DetailedNoPercent);
     CHECK(DesktopCpuDelta({100, 100}, {100, 100}, usage) == 0 && usage == DetailedNoPercent);
+
+    DesktopDetailedStats memory{};
+    memory.total = 1000;
+    memory.used = 700;
+    memory.available = 400;
+    memory.cached = 250;
+    memory.kernel = 120;
+    auto regions = DesktopMemoryUsageRegions(memory);
+    CHECK(regions.other == 330 && regions.cache == 150 && regions.kernel == 120 && regions.available == 400);
+    memory.available = 1300;
+    regions = DesktopMemoryUsageRegions(memory);
+    CHECK(regions.other == 0 && regions.cache == 0 && regions.kernel == 0 && regions.available == 1000);
+    memory.available = 0;
+    memory.cached = 500;
+    memory.kernel = 400;
+    regions = DesktopMemoryUsageRegions(memory);
+    CHECK(regions.other == 0 && regions.cache == 500 && regions.kernel == 200 && regions.available == 300);
     CHECK(DesktopTaskDelta({18, 200}, {18, 225}) == 25);
     CHECK(DesktopTaskDelta({18, 200}, {20, 225}) == 0); // reused TID
     CHECK(DesktopTaskDelta({18, 200}, {18, 100}) == 0);

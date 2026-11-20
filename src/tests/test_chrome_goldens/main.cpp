@@ -714,8 +714,9 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
             stats.tasks[0] = {"clearwater-shell", 820, 49, 82};
             stats.tasks[1] = {"Worker with a long process name", 145, 651, 14};
             stats.total = 8ull << 30;
-            stats.used = 2500ull << 20;
-            stats.available = 5600ull << 20;
+            const bool highMemoryUse = prefix == "opaque-dark-200-";
+            stats.used = (highMemoryUse ? 7800ull : 2500ull) << 20;
+            stats.available = (highMemoryUse ? 700ull : 5600ull) << 20;
             stats.cached = 720ull << 20;
             stats.kernel = 510ull << 20;
             stats.gpu = 228ull << 20;
