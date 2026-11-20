@@ -44,6 +44,7 @@ static void requests(struct wl_display *connection, struct wl_event_loop *loop) 
 }
 static uint32_t observed_toplevel;
 static int32_t observed_width,observed_height;
+static uint32_t observed_states;
 static unsigned bounds_events, capability_events;
 static int32_t bounds_width, bounds_height;
 static uint32_t configure_serial(struct wl_display *display, int fd, uint32_t object) {
@@ -61,6 +62,12 @@ static uint32_t configure_serial(struct wl_display *display, int fd, uint32_t ob
         if (id == observed_toplevel && op == XDG_TOPLEVEL_CONFIGURE) {
             observed_width = (int32_t)wire[i+2];
             observed_height = (int32_t)wire[i+3];
+            observed_states = 0;
+            assert(size == 20 + wire[i+4] && !(wire[i+4] % 4));
+            for (unsigned j = 0; j < wire[i+4] / 4; ++j) {
+                assert(wire[i+5+j] < 32);
+                observed_states |= UINT32_C(1) << wire[i+5+j];
+            }
             configured = 1;
         }
         if (id == observed_toplevel && op == XDG_TOPLEVEL_CONFIGURE_BOUNDS) {
@@ -84,6 +91,76 @@ static uint32_t configure_serial(struct wl_display *display, int fd, uint32_t ob
     assert(count == 1);
     return serial;
 }
+static void check_managed_resize(struct wl_display *display, struct wl_client *client, int fd)
+{
+    const unsigned previous_scale = g_output_scale;
+    g_output_scale = 2;
+    screen_width = 3200;
+    screen_height = 1800;
+    struct brook_surface surface = {0};
+    surface_tree_init(&surface);
+    surface.resource = wl_resource_create(client, &wl_surface_interface, 4, 0);
+    surface.xdg_surface = wl_resource_create(client, &xdg_surface_interface, 5, 0);
+    assert(surface.resource && surface.xdg_surface);
+    wl_resource_set_user_data(surface.resource, &surface);
+    wl_resource_set_user_data(surface.xdg_surface, &surface);
+    xdg_surface_get_toplevel(client, surface.xdg_surface, 0);
+    assert(surface.xdg_toplevel);
+    wl_resource_set_user_data(surface.xdg_toplevel, &surface);
+    observed_toplevel = wl_resource_get_id(surface.xdg_toplevel);
+    surface_commit(client, surface.resource);
+    const uint32_t object = wl_resource_get_id(surface.xdg_surface);
+    xdg_surface_ack_configure(client, surface.xdg_surface, configure_serial(display, fd, object));
+
+    // GTK's buffer adds 25 logical shadow pixels to each edge. The client's
+    // window geometry is therefore 800x477 in a 1700x1054 physical VFB.
+    surface.wm_id = 1;
+    surface.deco_sent_mode = 1;
+    surface.vfb_w = 1700; surface.vfb_h = 1054;
+    surface.window_geometry_w = 800; surface.window_geometry_h = 477;
+    xdg_toplevel_set_maximized(client, surface.xdg_toplevel);
+    struct brook_wm_event event = {.type = WM_EVT_RESIZED, .x = 3200, .y = 1704,
+                                   .reserved = WM_RESIZE_MAXIMIZED};
+    dispatch_window_event(&surface, &event, 0);
+    const uint32_t now_maximized = configure_serial(display, fd, object);
+    assert(observed_width == 1600 && observed_height == 852);
+    assert(observed_states == (1u << XDG_TOPLEVEL_STATE_MAXIMIZED));
+    xdg_surface_ack_configure(client, surface.xdg_surface, now_maximized);
+
+    // Restore using GTK's own control. Include the old kernel's resizing bit
+    // to exercise the compatibility path if the provider is updated first.
+    surface.vfb_w = 3200; surface.vfb_h = 1704;
+    surface.window_geometry_w = 1600; surface.window_geometry_h = 852;
+    xdg_toplevel_unset_maximized(client, surface.xdg_toplevel);
+    event.x = 1700; event.y = 1054; event.reserved = WM_RESIZE_RESIZING;
+    dispatch_window_event(&surface, &event, 0);
+    const uint32_t restored = configure_serial(display, fd, object);
+    assert(now_maximized != restored && !observed_width && !observed_height && !observed_states);
+
+    // A focus configure arriving before a new buffer retains the 0x0 restore.
+    toplevel_set_activated(&surface, 1);
+    const uint32_t activated = configure_serial(display, fd, object);
+    assert(activated != restored && !observed_width && !observed_height);
+    assert(observed_states == (1u << XDG_TOPLEVEL_STATE_ACTIVATED));
+    xdg_surface_ack_configure(client, surface.xdg_surface, activated);
+
+    // Resize the now-normal outer rectangle by the WM. Subtract the shadow
+    // once, and keep the independent activated and interactive flags.
+    surface.vfb_w = 1700; surface.vfb_h = 1054;
+    surface.window_geometry_w = 800; surface.window_geometry_h = 477;
+    event.x = 1900; event.y = 1154; event.reserved = WM_RESIZE_RESIZING;
+    dispatch_window_event(&surface, &event, 0);
+    configure_serial(display, fd, object);
+    assert(observed_width == 900 && observed_height == 527);
+    assert(observed_states == ((1u << XDG_TOPLEVEL_STATE_ACTIVATED) | (1u << XDG_TOPLEVEL_STATE_RESIZING)));
+
+    surface.wm_id = 0;
+    wl_resource_destroy(surface.xdg_toplevel);
+    wl_resource_destroy(surface.xdg_surface);
+    wl_resource_destroy(surface.resource);
+    g_output_scale = previous_scale;
+}
+
 static void check_toplevel_versions(struct wl_display *display, struct wl_client *client, int fd)
 {
     const unsigned previous_scale = g_output_scale;
@@ -133,6 +210,7 @@ int main(void) {
     assert(wl_display_init_shm(display) == 0);
     struct wl_event_loop *loop = wl_display_get_event_loop(display);
     struct wl_client *client = wl_client_create(display, sockets[0]); assert(client);
+    check_managed_resize(display, client, sockets[1]);
     check_toplevel_versions(display, client, sockets[1]);
     struct wl_display *connection = wl_display_connect_to_fd(sockets[1]); assert(connection);
     struct wl_registry *registry = wl_display_get_registry(connection); assert(registry);

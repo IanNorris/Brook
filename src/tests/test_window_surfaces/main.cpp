@@ -287,7 +287,7 @@ int main() {
     CHECK(WmInputPop(&window,&event,1)==1 && event.reserved==WM_RESIZE_MAXIMIZED);
     CHECK(event.type==WM_EVT_RESIZED && event.x==1280 && event.y==720);
     window.state=WindowState::Normal;
-    CHECK(WmPushWmEvent(&window,WM_EVT_RESIZED,640,360));
+    CHECK(WmPushWmEvent(&window,WM_EVT_RESIZED,640,360,WM_RESIZE_RESIZING));
     CHECK(WmInputPop(&window,&event,1)==1 && event.reserved==WM_RESIZE_RESIZING);
     // Quiet windows have no client dirty pixels. Focus/z-order changes still
     // require a new chrome composition, without waiting for periodic repaint.
@@ -820,6 +820,9 @@ int main() {
         CHECK(WmInputPop(&g,&event,1)==1 && event.reserved==WM_RESIZE_MAXIMIZED);
         WmSetMaximized(game,false);
         CHECK(g.state==WindowState::Normal && g.x==40 && g.y==50 && g.clientW==640 && g.clientH==480);
+        CHECK(WmInputPop(&g,&event,1)==1 && event.type==WM_EVT_RESIZED && event.reserved==0);
+        WmSetMaximized(game,false,true);
+        CHECK(WmInputPop(&g,&event,1)==1 && event.type==WM_EVT_RESIZED && event.reserved==0);
         // Legacy Xwayland WM: chrome-less, placed at the origin, output-sized.
         WmSetClientSideDecoration(game,true);WmMoveWindow(game,0,0);
         CHECK(WmResizeWindow(game,uint16_t(sw),uint16_t(sh)) && !g.fullscreen && !taskbarShown());
