@@ -25,6 +25,7 @@ enum class GlobalShortcutAction : uint8_t {
     CycleFocus,
     SpawnTerminal,
     OpenFiles,
+    OpenTaskManager,
     ToggleGlass,
     CyclePerformanceHud,
     LauncherPromptKey, // Enter/Escape/Tab/Left/Right for the launcher power prompt
@@ -83,12 +84,26 @@ public:
             return r;
         }
         if (!press) {
+            if (scan == ScEscape) m_escapeHeld = m_taskManagerChord = false;
             if (Swallowed(scan)) { SetSwallowed(scan, false); r.deliver = false; }
             return r;
         }
         if (m_super) m_superChord = true;
         const bool super = m_super || (mods & INPUT_MOD_SUPER);
         const bool alt = (mods & INPUT_MOD_ALT) != 0;
+        if (scan == ScEscape) {
+            if (!m_escapeHeld && !super && !alt && (mods & INPUT_MOD_CTRL) && (mods & INPUT_MOD_SHIFT)) {
+                m_taskManagerChord = true;
+                SetSwallowed(scan, true);
+                r.action = GlobalShortcutAction::OpenTaskManager;
+                r.releasePointer = true;
+            }
+            m_escapeHeld = true;
+            if (m_taskManagerChord) {
+                r.deliver = false;
+                return r;
+            }
+        }
         if (context.launcherPrompt && !super && !alt &&
             (scan == ScEscape || scan == ScEnter || scan == ScTab || scan == SC_EXT_LEFT || scan == SC_EXT_RIGHT)) {
             // The prompt owns its keys; Escape dismisses it before closing the launcher.
@@ -143,6 +158,7 @@ private:
     uint32_t m_swallowed[8] = {};
     uint8_t m_super = 0;
     bool m_superChord = false;
+    bool m_escapeHeld = false, m_taskManagerChord = false;
 };
 
 } // namespace brook

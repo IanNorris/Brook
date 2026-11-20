@@ -4,6 +4,7 @@
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "pid_namespace.h"
+#include "desktop_task_policy.h"
 #include "process_user_namespace.h"
 
 #include "posix_timer.h"
@@ -482,6 +483,26 @@ static int SendProcessSignal(Process* self, Process* target, int signal)
     memcpy(info._data, &sender, sizeof(sender));
     memcpy(info._data + 4, &senderUid, sizeof(senderUid));
     return ProcessSendSignal(target, signal, &info, self);
+}
+
+// Task Manager already admitted its desktop caller. Bind the operation to
+// a retained leader so a recycled PID cannot receive the signal.
+int DesktopEndTask(Process* self, uint32_t pid, uint64_t incarnation)
+{
+    auto* target = SchedulerFindVisibleProcessReference(ProcessPidView(self), pid);
+    if (!target) return -ESRCH;
+    int result = -116; // ESTALE
+    if (!target->isThread && target->incarnation == incarnation) {
+        const auto caller = ProcessReadIds(self, false);
+        const auto victim = ProcessReadIds(target, false);
+        const auto callerPid = ProcessVisibleTgid(self, ProcessPidView(self));
+        const bool protectedTask = target->isKernelThread ||
+            target->lifecycleRole == ProcessLifecycleRole::Service;
+        result = DesktopTaskMayEnd(caller.effective, callerPid, pid, victim.real, victim.effective,
+                                   protectedTask) ? SendProcessSignal(self, target, 9) : -EPERM;
+    }
+    ProcessUnref(target);
+    return result;
 }
 
 int64_t sys_kill(uint64_t pid, uint64_t sig, uint64_t,

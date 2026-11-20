@@ -543,6 +543,12 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
         auto menu = ChromeListOn(storage);
         RenderSnapshot(pinned, s, menu);
         Check(prefix + "taskbar-pin-menu", menu, s, pinned.rect.x, pinned.rect.y, pinned.rect.w, pinned.rect.h);
+        pinned.rect = ChromeWindowMenuRect(s, screenW - int(s.M(90)), pinned.taskbar.y, 1, screenW, pinned.taskbar.y);
+        pinned.tray.menu[0] = ChromeTaskManagerMenuRow;
+        auto taskManagerMenu = ChromeListOn(storage);
+        RenderSnapshot(pinned, s, taskManagerMenu);
+        Check(prefix + "taskbar-task-manager", taskManagerMenu, s,
+              pinned.rect.x, pinned.rect.y, pinned.rect.w, pinned.rect.h);
     }
     // The Dell's logical width (3200 at 200%): every diagnostic on, and the
     // default set (CPU, MEM, temperature), with a payload build label.

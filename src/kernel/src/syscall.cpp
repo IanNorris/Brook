@@ -1,3 +1,4 @@
+#include "brook_task_manager.h"
 #include "brook_core_dump.h"
 #include "gdt.h"
 #include "chrome_shell_wire.h"
@@ -618,6 +619,7 @@ void SyscallTableInit()
     g_syscallTable[BROOK_SYS_POINTER_SPEED] = sys_brook_pointer_speed;
     g_syscallTable[BROOK_SYS_TOUCHPAD_TAP] = sys_brook_touchpad_tap;
     g_syscallTable[BROOK_SYS_AUDIO_CONTROL] = sys_brook_audio_control;
+    g_syscallTable[BROOK_SYS_TASK_MANAGER] = sys_brook_task_manager;
 #ifdef BROOK_MAPPING_TEST_HOOKS
     g_syscallTable[0xB30]                = MappingFaultTestControl;
 #endif

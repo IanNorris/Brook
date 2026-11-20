@@ -466,6 +466,7 @@ int64_t sys_brook_input_pop(uint64_t bufAddr, uint64_t maxCount,
                               uint64_t, uint64_t, uint64_t, uint64_t);
 int64_t sys_brook_input_grab(uint64_t enable, uint64_t, uint64_t,
                               uint64_t, uint64_t, uint64_t);
+int64_t sys_brook_task_manager(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 int64_t sys_brook_audio_control(uint64_t op,uint64_t value,uint64_t,uint64_t,uint64_t,uint64_t);
 int64_t sys_brook_ahci_export(uint64_t op,uint64_t destination,uint64_t length,uint64_t offset,uint64_t r0,uint64_t r1);
 

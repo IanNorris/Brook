@@ -95,6 +95,7 @@ glass-100-taskbar-hover 81d571becebed3de
 glass-100-taskbar-hud 0f03163efdc17b8c
 glass-100-taskbar-pin-menu 47c106b88580c4aa
 glass-100-taskbar-pins 12b70874c0ebdf2e
+glass-100-taskbar-task-manager cdfefc9d354b9836
 glass-100-temperature-flyout 626fcbdc2b64f918
 glass-100-tooltip 3228e779ea27b7b8
 glass-100-volume-popup 90c0386ca1689b4c
@@ -774,6 +775,7 @@ opaque-dark-200-taskbar-hover c19499f357e3be2f
 opaque-dark-200-taskbar-hud e2ca4ab3fd749fc7
 opaque-dark-200-taskbar-pin-menu 8210753d6377af31
 opaque-dark-200-taskbar-pins d5a8b60ae73e281e
+opaque-dark-200-taskbar-task-manager 1445563bb5b11eb9
 opaque-dark-200-temperature-flyout 39a25448cf20ac2c
 opaque-dark-200-tooltip 9500febdbd7d5d0f
 opaque-dark-200-volume-popup eed9e58f8e0be68a
@@ -859,6 +861,7 @@ opaque-light-150-taskbar-hover f7ad3f8dd80f7ef9
 opaque-light-150-taskbar-hud f0eb3b411ed9d269
 opaque-light-150-taskbar-pin-menu 0bc200da6874b357
 opaque-light-150-taskbar-pins a18b43337b50247d
+opaque-light-150-taskbar-task-manager 100a158ad9c11c05
 opaque-light-150-temperature-flyout 054593b0bb5821fa
 opaque-light-150-tooltip c5d15451dac927a8
 opaque-light-150-volume-popup 1ff939297e210e9f

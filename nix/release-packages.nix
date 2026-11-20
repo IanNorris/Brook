@@ -11,6 +11,7 @@ let
     f (if builtins.hasAttr "pkgs" (builtins.functionArgs f) then { inherit pkgs; } else {})) [
     "waylandd-pkg" "wayland-calc-pkg" "brook-player-pkg"
     "brook-gallery-pkg" "brook-settings-pkg" "brook-message-pkg" "brook-session-pkg" "locale-brook-pkg"
+    "brook-task-manager-pkg"
   ];
   launchers = pkgs.runCommand "brook-release-launchers" { meta.license = pkgs.lib.licenses.mit; } ''
     mkdir -p $out/bin
@@ -36,6 +37,10 @@ let
     fi
     mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME"
     exec "$@"
+    SCRIPT
+    cat > $out/bin/hardware-brook-task-manager <<'SCRIPT'
+    #!${pkgs.bash}/bin/bash
+    exec /nix/profile/bin/brook-run /nix/profile/bin/brook-task-manager "$@"
     SCRIPT
     cat > $out/bin/brook-vlc <<'SCRIPT'
     #!${pkgs.bash}/bin/bash

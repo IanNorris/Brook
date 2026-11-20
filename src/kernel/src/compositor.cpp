@@ -2779,7 +2779,9 @@ static void CompositorRunShortcut(const GlobalShortcutResult& r)
             __atomic_store_n(&g_defaultCursorVisible,1u,__ATOMIC_RELEASE);
             CompositorSetCursorImage(nullptr,0,0,0,0);
         }
-        if(released)SerialPuts("WM: shortcut Super released pointer capture\n");
+        if(released)SerialPuts(r.action==GlobalShortcutAction::OpenTaskManager
+            ?"WM: shortcut Task Manager released pointer capture\n"
+            :"WM: shortcut Super released pointer capture\n");
     }
     switch(r.action) {
     case GlobalShortcutAction::None:break;
@@ -2823,6 +2825,7 @@ static void CompositorRunShortcut(const GlobalShortcutResult& r)
     case GlobalShortcutAction::CloseWindowMenu:WmWindowMenuClose();break;
     case GlobalShortcutAction::SpawnTerminal:WmSpawnTerminal();break;
     case GlobalShortcutAction::OpenFiles:WmOpenFiles();break;
+    case GlobalShortcutAction::OpenTaskManager:WmOpenTaskManager();break;
     case GlobalShortcutAction::ToggleGlass:WmToggleFocusedWindowGlass();break;
     }
     if(r.releasePointer || r.action!=GlobalShortcutAction::None) {
@@ -2886,7 +2889,9 @@ static void CompositorInputWM()
             const auto kind=ev.type==InputEventType::MouseButtonDown?DesktopPointerEvent::Down:
                             ev.type==InputEventType::MouseButtonUp?DesktopPointerEvent::Up:
                             ev.type==InputEventType::MouseScroll?DesktopPointerEvent::Scroll:DesktopPointerEvent::Move;
-            const bool trayEvent = !taskbarPanel && WmShellTrayPointer(g_physFbWidth, g_physFbHeight, mx, my,
+            const bool statsContext = taskbarPanel && kind == DesktopPointerEvent::Down && ev.scanCode == 1 &&
+                    WmTaskbarStatsContains(mx, my, g_physFbWidth, g_physFbHeight);
+            const bool trayEvent = (!taskbarPanel || statsContext) && WmShellTrayPointer(g_physFbWidth, g_physFbHeight, mx, my,
                     kind == DesktopPointerEvent::Down, ev.scanCode,
                     kind == DesktopPointerEvent::Scroll ? LauncherScroll120(ev) : 0);
             overlay |= trayEvent;

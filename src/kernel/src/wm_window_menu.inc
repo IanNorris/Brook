@@ -18,19 +18,19 @@ struct WindowMenuState {
 };
 static WindowMenuState g_windowMenu{};
 
-struct TaskbarPinMenuState {
+struct TaskbarContextMenuState {
     char key[LauncherLimits::KeyLength];
     int window; // -1 for an idle pin
     uint64_t identity;
     int32_t x, y;
-    bool pinned, open;
+    bool pinned, open, taskManager;
 };
-static TaskbarPinMenuState g_taskbarPinMenu;
+static TaskbarContextMenuState g_taskbarContextMenu;
 
-static void TaskbarPinMenuCloseLocked()
+static void TaskbarContextMenuCloseLocked()
 {
-    if (!g_taskbarPinMenu.open) return;
-    g_taskbarPinMenu.open = false;
+    if (!g_taskbarContextMenu.open) return;
+    g_taskbarContextMenu.open = false;
     CompositorMarkDirty();
 }
 
@@ -104,12 +104,12 @@ static void WindowMenuRun(int idx, WindowMenuAction action)
     }
 }
 
-bool WmWindowMenuOpen() { return g_windowMenu.open || g_taskbarPinMenu.open; }
+bool WmWindowMenuOpen() { return g_windowMenu.open || g_taskbarContextMenu.open; }
 
 void WmWindowMenuClose() {
     VfbGuard guard;
     WindowMenuCloseLocked();
-    TaskbarPinMenuCloseLocked();
+    TaskbarContextMenuCloseLocked();
 }
 
 bool WmShowWindowMenu(int idx, int32_t x, int32_t y)
@@ -118,7 +118,7 @@ bool WmShowWindowMenu(int idx, int32_t x, int32_t y)
     {
         VfbGuard guard;
         if (!WindowMenuOpenLocked(idx, x, y)) return false;
-        TaskbarPinMenuCloseLocked();
+        TaskbarContextMenuCloseLocked();
         closeTray = ShellServiceTrayState().menuOwner != 0 && !WmTaskbarPopupPinned();
     }
     // Exclusive with the other popups; the tray's menu shares the surface.

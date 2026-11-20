@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Task Manager
+Comment=See process resource use and end tasks
+Exec=brook-task-manager
+Icon=utilities-system-monitor
+Categories=System;Monitor;
+StartupWMClass=org.brook.TaskManager

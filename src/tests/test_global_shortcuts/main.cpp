@@ -179,8 +179,38 @@ static void dockKeys() {
     up(s,G::ScS,INPUT_MOD_SUPER,launcher);up(s,SC_LSUPER,0,launcher);
 }
 
+static void taskManager()
+{
+    GlobalShortcuts shortcuts;
+    GlobalShortcutContext overlays{};
+    overlays.launcherVisible = overlays.launcherPrompt = overlays.volumePopupVisible =
+        overlays.windowMenuOpen = overlays.dockDismissible = true;
+    for (const auto& context : {none, overlays}) {
+        for (uint8_t shift : {INPUT_MOD_LSHIFT, INPUT_MOD_RSHIFT}) {
+            const uint8_t chord = INPUT_MOD_CTRL | shift;
+            auto result = down(shortcuts, GlobalShortcuts::ScEscape, chord, context);
+            CHECK(!result.deliver && result.releasePointer && result.action == Action::OpenTaskManager);
+            result = down(shortcuts, GlobalShortcuts::ScEscape, chord, context);
+            CHECK(!result.deliver && !result.releasePointer && result.action == Action::None);
+            result = down(shortcuts, GlobalShortcuts::ScEscape, 0, context);
+            CHECK(!result.deliver && result.action == Action::None); // modifiers released while Escape repeats
+            CHECK(!up(shortcuts, GlobalShortcuts::ScEscape, 0, context).deliver);
+        }
+    }
+    for (uint8_t mods : {uint8_t(0), INPUT_MOD_CTRL, INPUT_MOD_LSHIFT,
+                         uint8_t(INPUT_MOD_ALT | INPUT_MOD_CTRL | INPUT_MOD_LSHIFT),
+                         uint8_t(INPUT_MOD_SUPER | INPUT_MOD_CTRL | INPUT_MOD_LSHIFT)}) {
+        CHECK(down(shortcuts, GlobalShortcuts::ScEscape, mods).deliver);
+        CHECK(up(shortcuts, GlobalShortcuts::ScEscape).deliver);
+    }
+    CHECK(down(shortcuts, GlobalShortcuts::ScEscape).deliver);
+    CHECK(down(shortcuts, GlobalShortcuts::ScEscape, INPUT_MOD_CTRL | INPUT_MOD_LSHIFT).deliver);
+    CHECK(up(shortcuts, GlobalShortcuts::ScEscape).deliver);
+    CHECK(down(shortcuts, GlobalShortcuts::ScEscape, 0, overlays).action == Action::LauncherPromptKey);
+}
+
 int main() {
-    superTap();superChord();altF4();escape();launcherPrompt();launcherTyping();dockKeys();
+    superTap();superChord();altF4();escape();launcherPrompt();launcherTyping();dockKeys();taskManager();
     std::puts("global shortcuts: ok");
     return 0;
 }
