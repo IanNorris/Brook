@@ -3,7 +3,7 @@
 This is the historical 2D reconnaissance plan. The implemented driver now
 provides 2D scanout, virgl composition and a userspace DRM render path; current
 application checks and remaining defects are in
-[application regressions](../../../docs/application-regressions.md).
+application regressions.
 
 ## DRM transfer byte-offset repair — 18 October 2026
 

@@ -1,6 +1,6 @@
 # quakegeneric
 
-![a low-resolution screenshot of quake](./.github/quakegeneric.png)
+!a low-resolution screenshot of quake
 
 it's like [doomgeneric](https://github.com/ozkl/doomgeneric), but for quake. it's based on the GPL WinQuake source code.
 

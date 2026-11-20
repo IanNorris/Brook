@@ -25,7 +25,7 @@ permission audit are separate from that policy.
 Root and UID 1000 each wrote, fsynced and reopened a 90,112-byte file under HOME
 on an empty data volume, and verified it after a complete reboot. GIMP's generic
 desktop entry also launched and saved settings there on the reboot. See the
-17 October desktop acceptance notes in [workloads.md](workloads.md).
+17 October desktop acceptance notes in workloads.md.
 
 ## GIMP legacy profile migration
 
@@ -373,7 +373,7 @@ repairing registration. The existing Firefox package is indexed as
 `firefox-stock`; its wrapper exists but its desktop registration is missing.
 Neither browser reacceptance nor manifest repair is complete at this checkpoint.
 
-Follow-up: [atomic append and installer acceptance](append-writes.md) records the
+Follow-up: atomic append and installer acceptance records the
 manifest fix, actual Firefox/Chromium registration, Brook-user Firefox HTTPS and
 normal exit, and native Terminal identity verification. The earlier Chromium/
 Codium memory failure and directory authorization gaps remain open.
@@ -401,7 +401,7 @@ prove authorization or identity correctness.
 
 ### Browser/editor acceptance follow-up (17 October)
 
-The [memory and exit report](browser-memory-checkpoint-20261017.md) supersedes
+The memory and exit report supersedes
 the earlier browser/editor memory failure above: bounded immutable ELF sharing
 allows native Chromium browsing and Codium edit/save/reopen together in a 4 GiB
 VM. Fatal-signal group cancellation fixes retained Codium shutdown helpers in
@@ -720,21 +720,21 @@ a later exec. Actual executable leaf checks, pinned CWD/dirfds, nonroot chown,
 parent setgid inheritance, runtime directories, other filesystem policies and
 Nix protection remain open. Both full bootstrap paths subsequently passed at
 this source revision, as recorded in the [40-suite refresh](bootstrap.md#40-suite-bootstrap-refresh-after-permission-checks-2026-10-18).
-The subsequent [application refresh](browser-trio.md#permission-kernel-refresh)
+The subsequent application refresh
 renewed controlled three-app concurrency, synthetic storage/document persistence,
 GIMP/Writer reopen and full-lineage close on this same kernel. It also retained
 the measured audio/presentation and native-input limits; real-site cookies and
 complete identity isolation remain unaccepted. Login/accounts remain deferred.
 
 
-The subsequent [retained-directory follow-up](dirfd-identity.md) fixes silent
+The subsequent retained-directory follow-up fixes silent
 64-byte descriptor-prefix truncation and adds sequential rename/replacement
 lookup through ext2's retained inode. Its ABI-19 layout requires all modules to
 be rebuilt. Atomic namespace-relative operations, retained process CWD and the
 other identity gaps above remain open; this does not complete account isolation.
 
 
-The [executable-permission follow-up](exec-permissions.md) now checks execute
+The executable-permission follow-up now checks execute
 intent on ext2 data files and preflights ELF interpreters before exec commits.
 Its 672-case matrix covers effective IDs, groups, execute-only files and denied
 interpreter calls preserving the old process. The Nix bypass, dispatch-time

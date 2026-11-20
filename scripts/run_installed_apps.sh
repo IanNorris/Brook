@@ -12,7 +12,7 @@ checkpoint="$(realpath -m "$checkpoint")"
 for image in boot data nix; do
     if [ ! -f "${checkpoint}/${image}.img" ]; then
         echo "Missing prepared app checkpoint: ${checkpoint}/${image}.img" >&2
-        echo "See docs/experiments.md for fresh guest installation instructions." >&2
+        echo "Install the experiment packages in the guest first." >&2
         exit 1
     fi
 done

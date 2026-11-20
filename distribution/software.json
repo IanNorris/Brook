@@ -33,7 +33,7 @@
       "name": "Quake 2 / Yamagi",
       "tested_version": "8.60",
       "compatibility": "✅ Gameplay",
-      "tested_scope": "Software and hardware virgl GL3 renderers, startup demo, OSS audio and OGG music; [GPU resource retirement/repeated launches](docs/gpu-resource-lifetime.md), mouse capture and intermittent audio timing remain open",
+      "tested_scope": "Software and hardware virgl GL3 renderers, startup demo, OSS audio and OGG music; GPU resource retirement/repeated launches, mouse capture and intermittent audio timing remain open",
       "distribution_route": "engine-only; proprietary game data excluded",
       "licence_summary": "component-specific; source/notice audit required",
       "evidence": "README.md compatibility table and linked workload reports"
@@ -51,7 +51,7 @@
       "name": "SuperTuxKart",
       "tested_version": "1.5",
       "compatibility": "⚠️ Experimental",
-      "tested_scope": "Guest installation and hardware virgl races verified; current ownership build accepts race input and [reclaims backing after close](docs/gpu-resource-lifetime.md#gpu-workload-transition-acceptance), with clean subsequent Gallery/browser surfaces; launcher sound is disabled, memory pressure and mixed-game acceptance remain open",
+      "tested_scope": "Guest installation and hardware virgl races verified; current ownership build accepts race input and reclaims backing after close, with clean subsequent Gallery/browser surfaces; launcher sound is disabled, memory pressure and mixed-game acceptance remain open",
       "distribution_route": "optional-open-source; component/asset audit required",
       "licence_summary": "GPL code plus separately licensed assets",
       "evidence": "README.md compatibility table and linked workload reports"
@@ -204,7 +204,7 @@
       "name": "Proton GE",
       "tested_version": "11-10 / DXVK 3.1.1",
       "compatibility": "⚠️ Experimental",
-      "tested_scope": "Standalone Helltaker at 720p: first-puzzle input/reset, captured audio and normal exit verified. Later Steam integration results are recorded separately in docs/steam-library-stability.md. [Results](docs/proton.md)",
+      "tested_scope": "Standalone Helltaker at 720p: first-puzzle input/reset, captured audio and normal exit verified. [Results](docs/proton.md)",
       "distribution_route": "optional-open-source; component/asset audit required",
       "licence_summary": "mixed open-source component licences; audit exact build",
       "evidence": "README.md compatibility table and linked workload reports"
@@ -213,7 +213,7 @@
       "name": "Steam",
       "tested_version": "Native64 client",
       "compatibility": "⚠️ Experimental",
-      "tested_scope": "QR sign-in, Library, downloads and verification tested through SteamRT. Native64 Stardew gameplay and save/reload across reboot work; game audio and bounded timing-fault recovery verified. Startup remains slow and variable. [Game results](docs/stardew-native64.md), [client limits](docs/steam-library-stability.md)",
+      "tested_scope": "QR sign-in, Library, downloads and verification tested through SteamRT. Native64 Stardew gameplay and save/reload across reboot work; game audio and bounded timing-fault recovery verified. Startup remains slow and variable. [Game results](docs/stardew-native64.md), client limits",
       "distribution_route": "publisher-download-only",
       "licence_summary": "proprietary client; publisher download and account terms apply",
       "evidence": "README.md compatibility table and linked workload reports"

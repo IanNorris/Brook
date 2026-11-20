@@ -80,7 +80,7 @@ and it is excluded from full-output application acceptance. The final quiet
 normal launch has complete output. These runs reuse the populated checked
 prefix; fresh-prefix installation, optional Wine services and broader Windows
 application compatibility are separate work. Remaining general Linux semantic
-gaps are recorded in [the backlog](backlog.md).
+gaps are recorded in the backlog.
 
 ## Initial smoke test — 18 October
 
@@ -288,7 +288,7 @@ background-task status; it does not satisfy the final command-completion gate.
 The shared-file implementation must preserve
 canonical pages, ordinary-I/O coherence, permissions, mapped resize/EOF,
 writeback and lifetime before enabling the currently rejected operation; see
-[the shared-file foundation](file-shared-mappings.md).
+the shared-file foundation.
 
 The exact candidate passes all 52 host suites and both kernel entry audits.
 Its isolated eight-vCPU/4-GiB run uses software composition and silent host
@@ -301,7 +301,7 @@ windows, audio streams or outstanding GPU backing mappings remain.
 ## Shared-file mappings and first console output — 19 October
 
 The ABI-29 candidate adds coherent shared-file writes, retained writable
-publication, msync and periodic writeback. See [the shared-file implementation](file-shared-mappings.md).
+publication, msync and periodic writeback. See the shared-file implementation.
 All 52 host suites, both kernel entry audits, six Wine-pattern and fourteen
 broader Linux-matched mapping checks pass, alongside the 49 socket/rights cases.
 An owned 8192-byte fixture with synced and initially unsynced mapped pages retains

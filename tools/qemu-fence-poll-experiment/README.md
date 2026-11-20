@@ -25,11 +25,11 @@ jobs, source/frame progress, accounting and clean shutdown/filesystem checks.
 Any presentation gain would implicate observation cadence, not establish that
 a guest fence is redundant. Faster polling can add host wakeups/CPU cost.
 
-See [the timing audit](../../docs/timing-scheduler-audit.md) for unresolved
+See the timing audit for unresolved
 clock, scheduling, audio continuity and default-promotion requirements.
 
 Both variants now pass build, QMP smoke, timestamp and disassembly checks. One
 matched native pair shows a substantial presentation improvement with 1-ms
 polling, with variable additional CPU cost and remaining short audio gaps. See
-[the measured comparison](../../docs/gpu-fence-timing-control.md). This remains
+the measured comparison. This remains
 a private diagnostic override; no launch default changes.

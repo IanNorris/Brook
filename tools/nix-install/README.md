@@ -78,10 +78,10 @@ Both the real executable and an executable compatibility wrapper must exist.
 Absolute-path browser/editor entries use the same mapping. The collector's
 private-filesystem regression is included in `test_desktop.py`; current
 application playback/exit evidence is in
-[application regressions](../../docs/application-regressions.md).
+application regressions.
 
 The recovery design and remaining acceptance matrix are documented in
-[App Gallery recovery](../../docs/app-gallery-recovery.md).
+App Gallery recovery.
 
 Removal reports failed export cleanup, recognizes both absolute and relative
 store links, and flushes changed directories. Registration is still published

@@ -26,5 +26,5 @@ cause of the initial discontinuity.
 The experiment image and `tools/workload-pkg/chromium.nix` select this wrapper.
 The generic public package index continues to list stock Chromium. The existing
 Brook launcher still supplies its experimental Wayland/software-rendering flags;
-Chromium's sandbox remains disabled. See [audio evidence](../../docs/audio-clock.md)
+Chromium's sandbox remains disabled. See audio evidence
 for guest checks and remaining limits.

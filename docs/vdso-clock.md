@@ -49,7 +49,7 @@ registers its own slot before scheduler entry and publishes its CPU index in
 executing `RDTSCP`, selects that CPU's slot and retries if the CPU tag changes
 inside the versioned snapshot. Unsupported CPU features use the syscall path.
 Using one shared BSP record allowed stale extrapolation after VM resume; see
-[per-vCPU clock validation](pvclock-percpu.md).
+per-vCPU clock validation.
 
 The two ranges are installed into an exclusively constructed unpublished
 address space after image, interpreter, stack and TLS reservations, with no

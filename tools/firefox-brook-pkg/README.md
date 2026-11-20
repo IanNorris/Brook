@@ -32,7 +32,7 @@ profile or public index; global ALSA defaults remain unchanged.
 Evidence is retained in ignored
 `build/workloads/epoll-cache-diagnostics-20261018/` and
 `build/workloads/eventfd-edges-candidate-20261018/`. See
-[workload results](../../docs/workloads.md) for the accompanying eventfd
+workload results for the accompanying eventfd
 regressions and checked-shutdown/filesystem gates.
 
 Export for that test with:
@@ -42,7 +42,7 @@ python3 scripts/export_guest_package.py --expression tools/firefox-brook-pkg \
   --name firefox-brook --version 150.0.1 --output build/package-cache
 ```
 
-See [audio evidence](../../docs/audio-clock.md) for the preceding isolated
+See audio evidence for the preceding isolated
 playback checkpoint and its limitations, including short-video loop gaps.
 
 ## YouTube audio checkpoint — 18 October 2026
