@@ -131,6 +131,7 @@ ChromeTaskbarLayout ChromeTaskbarLayoutFor(const ChromeStyle& s, uint32_t screen
     }
     reserve(l.volume, trayTarget);
     reserve(l.network, trayTarget);
+    if (enabledMetrics & (1u << 2)) reserve(l.metrics[2], trayTarget);
     // Leftmost fixed icon, so its appearance never moves the tray targets.
     if (agent) reserve(l.agent, Px(s, 16) + Px(s, 12));
     while (l.trayAppCount < trayAppCount && l.trayAppCount < TrayItemLimit &&
@@ -169,15 +170,13 @@ ChromeTaskbarLayout ChromeTaskbarLayoutFor(const ChromeStyle& s, uint32_t screen
     }
     if (compactHud) reserve(l.hud, CompactHudWidth(s));
     // Diagnostics, right to left: APP and COMP (label and graph over p95),
-    // disk R/W, then CPU over MEM in one chip. Each is sized to its widest
-    // value; network rates live in the network flyout, not here.
+    // then CPU over MEM in one chip. Disk and network rates live in flyouts.
     const int row = s.Line(CF::Small) + Px(s, SP::RowGap), pairTop = by + (bh - 2 * row) / 2;
     const int cadence = [&] {
         const int top = s.TextWidth("COMP", CF::Small) + pad + SP::GraphBars * Px(s, 3);
         const int bottom = s.TextWidth("p95 999 ms", CF::Small);
         return top > bottom ? top : bottom;
     }();
-    const int disk = s.TextWidth("W 999.9M", CF::Small);
     const int load = s.TextWidth("MEM", CF::Small) + pad + ChromeLoadBarWidth(s);
     auto metric = [&](int index, int width) {
         const int before = right;
@@ -189,7 +188,6 @@ ChromeTaskbarLayout ChromeTaskbarLayoutFor(const ChromeStyle& s, uint32_t screen
     };
     if (enabledMetrics & (1u << 5)) metric(5, cadence);
     if (enabledMetrics & (1u << 4)) metric(4, cadence);
-    if (enabledMetrics & (1u << 2)) metric(2, disk);
     const bool cpu = enabledMetrics & 1u, mem = enabledMetrics & 2u;
     if ((cpu || mem) && metric(cpu ? 0 : 1, load) && cpu && mem) {
         // Stacked: CPU's row over MEM's, one chip wide.
@@ -364,9 +362,8 @@ static bool CadenceLatest(const DesktopIntervals<>& history, uint64_t tick, char
 }
 
 // Taskbar diagnostics (Settings > Taskbar), condensed (Ian, 19 November):
-// CPU over MEM as label and a bar with the percentage inside it, disk R/W as
-// two short rates, and the cadence histories as label and graph over p95.
-// Network rates are in the network flyout.
+// CPU over MEM as label and a bar with the percentage inside it, and the
+// cadence histories as label and graph over p95.
 static void DesktopMetric(ChromeDisplayList& dl, const ChromeStyle& s, const ChromeTelemetryModel& t,
                           const DesktopRect& r, unsigned kind, uint64_t now)
 {
@@ -397,18 +394,6 @@ static void DesktopMetric(ChromeDisplayList& dl, const ChromeStyle& s, const Chr
         if (filled.w > 0) dl.Text(vx, barY, value, luma > 128 ? 0x0b1a2bu : 0xffffffu, 0, &filled, CF::Small);
         if (empty.w > 0) dl.Text(vx, barY, value, p.taskText, 0, &empty, CF::Small);
         return;
-    }
-    if (kind == 2) {
-        char first[20], second[20], number[12];
-        CopyText(first, "R ", sizeof(first));
-        DesktopRate(number, t.stats.readBytesPerSecond);
-        CopyText(first + 2, number, sizeof(first) - 2);
-        unsigned n = 0; while (first[n]) ++n; CopyText(first + n, "M", sizeof(first) - n);
-        CopyText(second, "W ", sizeof(second));
-        DesktopRate(number, t.stats.writeBytesPerSecond);
-        CopyText(second + 2, number, sizeof(second) - 2);
-        n = 0; while (second[n]) ++n; CopyText(second + n, "M", sizeof(second) - n);
-        text(r.x, top, first, p.secondaryText); text(r.x, bottom, second, p.secondaryText); return;
     }
     if (kind != 4 && kind != 5) return;
     const DesktopIntervals<>* source = kind == 4 ? t.compositor : t.app;
@@ -553,6 +538,13 @@ void ChromeBuildTaskbar(const ChromeTaskbarModel& m, const ChromeStyle& s, Chrom
         const int x = r.x + (r.w - width) / 2;
         dl.Glyph(ChromeGlyph::Temperature, x, r.y + (r.h - glyph) / 2, ink);
         dl.Text(CF::Label, x + glyph + space, labelY, value, ink, r.x + r.w - x - glyph - space);
+    }
+    const auto& disk = l.metrics[2];
+    if (disk.w > 0) {
+        target(disk, false);
+        const int glyph = Px(s, 16);
+        dl.Glyph(ChromeGlyph::Disk, disk.x + (disk.w - glyph) / 2, disk.y + (disk.h - glyph) / 2,
+                 p.secondaryText);
     }
     NetworkIndicator(dl, s, l.network, m.networkConnected);
     if (l.volume.w > 0) {
@@ -1134,6 +1126,129 @@ void ChromeBuildTrayFlyout(const ChromeTrayFlyoutModel& m, const ChromeStyle& s,
     char limit[24];
     ThermalText(limit, static_cast<int32_t>(t.tjmax ? t.tjmax : 100), true);
     PanelRow(dl, s, x, y, w, "Throttles at", limit);
+}
+
+ChromeDiskPopupLayout ChromeDiskPopupLayoutFor(const ChromeStyle& s, DesktopRect anchor, int screenW,
+                                               int taskbarY, uint32_t total)
+{
+    ChromeDiskPopupLayout layout{};
+    const int pad = Px(s, FlyoutPad), gap = Px(s, FlyoutGap), margin = Px(s, 8);
+    const int w = screenW - 2 * margin < Px(s, 368) ? screenW - 2 * margin : Px(s, 368);
+    const int footer = Px(s, 28);
+    const int header = PanelHeaderHeight(s) + gap + 2 * (s.Line(CF::Label) + Px(s, 5)) + gap + s.Line(CF::Small);
+    const int row = s.Line(CF::Label) + Px(s, 7);
+    const int available = taskbarY - 2 * margin - 2 * pad - header;
+    if (w < Px(s, 180) || available < row) return layout;
+
+    const int room = available / row;
+    const uint32_t fit = room < int(DiskPopupPageRows) ? uint32_t(room) : DiskPopupPageRows;
+    const bool overflow = total > fit;
+    const int scrollRoom = (available - footer) / row;
+    if (overflow && scrollRoom < 1) return layout;
+    const uint32_t rows = overflow ? (scrollRoom < int(fit) ? uint32_t(scrollRoom) : fit)
+                                  : total ? total : 1;
+    const int h = 2 * pad + header + int(rows) * row + (overflow ? footer : 0);
+    layout.panel = TaskbarTooltipBox(anchor, w, h, taskbarY, margin, screenW, margin);
+    const auto& p = layout.panel;
+    layout.pin = ChromeTrayFlyoutPinRect(s, p);
+    layout.rows = {p.x + pad, p.y + pad + header, w - 2 * pad, int(rows) * row};
+    layout.pageRows = rows;
+    layout.rowHeight = row;
+    if (overflow) {
+        const int button = Px(s, 24), right = p.x + p.w - pad;
+        const int top = layout.rows.y + layout.rows.h + Px(s, 2);
+        layout.next = {right - button, top, button, button};
+        layout.previous = {layout.next.x - button - Px(s, 4), top, button, button};
+    }
+    return layout;
+}
+
+static void DiskSize(char* out, uint64_t bytes, bool decimal)
+{
+    static const char* const units[] = {" B", " KiB", " MiB", " GiB", " TiB", " PiB", " EiB"};
+    uint64_t unit = 1;
+    unsigned index = 0;
+    for (; index < 6 && bytes / unit >= 1024; ++index) unit *= 1024;
+    DesktopNumber(out, unsigned(bytes / unit));
+    while (*out) ++out;
+    if (index && decimal) {
+        *out++ = '.';
+        *out++ = char('0' + (bytes % unit) * 10 / unit);
+    }
+    CopyText(out, units[index], 8);
+}
+
+static void DiskSizes(char (&out)[48], const DesktopDiskVolume& row, bool decimal)
+{
+    DiskSize(out, row.freeBytes, decimal);
+    unsigned len = 0; while (out[len]) ++len;
+    CopyText(out + len, " / ", sizeof(out) - len);
+    DiskSize(out + len + 3, row.totalBytes, decimal);
+}
+
+void ChromeBuildDiskPopup(const ChromeDiskPopupLayout& l, const DesktopDiskPage& page, uint64_t readRate,
+                          uint64_t writeRate, bool pinned, int32_t mx, int32_t my,
+                          const ChromeStyle& s, ChromeDisplayList& dl)
+{
+    if (!l.pageRows) return;
+    const auto& p = s.P();
+    const int pad = Px(s, FlyoutPad), x = l.panel.x + pad, w = l.panel.w - 2 * pad;
+    int y = l.panel.y + pad;
+    PanelFrame(dl, s, l.panel);
+    PanelHeader(dl, s, x, y, l.pin.x - x - Px(s, 8), ChromeGlyph::Disk, "Disk", nullptr, 0);
+    PopupPin(dl, s, l.pin, pinned, mx, my);
+    y += PanelHeaderHeight(s) + Px(s, FlyoutGap);
+    const auto rate = [&](const char* label, uint64_t value) {
+        char text[24]{};
+        DesktopRate(text, value);
+        unsigned len = 0; while (text[len]) ++len;
+        CopyText(text + len, " MB/s", sizeof(text) - len);
+        y = PanelRow(dl, s, x, y, w, label, text);
+    };
+    rate("Read", readRate);
+    rate("Write", writeRate);
+
+    const int headingY = l.rows.y - s.Line(CF::Small);
+    dl.Text(CF::Small, x, headingY, "Mounted volumes", p.mutedText);
+    TextRight(dl, s, CF::Small, x + w, headingY, "Free / total", p.mutedText);
+    if (!page.count) {
+        dl.Text(CF::Label, x, l.rows.y + Px(s, 3),
+                page.measured ? "No mounted storage volumes" : "Checking volumes...", p.secondaryText, w);
+    }
+    for (uint32_t i = 0; i < page.count; ++i) {
+        const auto& row = page.rows[i];
+        char value[48] = "Unavailable";
+        if (row.available) {
+            DiskSizes(value, row, true);
+            if (s.TextWidth(value, CF::Small) > w - Px(s, 42)) DiskSizes(value, row, false);
+        }
+        const int valueW = s.TextWidth(value, CF::Small);
+        const int top = l.rows.y + int(i) * l.rowHeight;
+        const int nameWidth = w - valueW - Px(s, 8);
+        ChromeElidedText(dl, s, CF::Label, x, top + (l.rowHeight - s.Line(CF::Label)) / 2,
+                         row.path, p.text, nameWidth);
+        if (valueW <= w) TextRight(dl, s, CF::Small, x + w, top + (l.rowHeight - s.Line(CF::Small)) / 2,
+                                  value, row.available ? p.secondaryText : p.mutedText);
+    }
+    if (l.next.w > 0 && page.total > l.pageRows && page.count) {
+        char pageText[48]{};
+        DesktopNumber(pageText, page.first + 1);
+        unsigned n = 0; while (pageText[n]) ++n;
+        pageText[n++] = '-';
+        DesktopNumber(pageText + n, page.first + page.count);
+        while (pageText[n]) ++n;
+        CopyText(pageText + n, " of ", sizeof(pageText) - n);
+        DesktopNumber(pageText + n + 4, page.total);
+        dl.Text(CF::Small, x, l.next.y + (l.next.h - s.Line(CF::Small)) / 2, pageText, p.secondaryText);
+        const auto button = [&](DesktopRect rect, ChromeGlyph glyph, bool enabled) {
+            if (enabled && rect.contains(mx, my)) ChromeMaterialRect(dl, s, rect, p.taskHover);
+            const int g = Px(s, 16);
+            dl.Glyph(glyph, rect.x + (rect.w - g) / 2, rect.y + (rect.h - g) / 2,
+                     enabled ? p.text : p.mutedText);
+        };
+        button(l.previous, ChromeGlyph::ChevronUp, page.first != 0);
+        button(l.next, ChromeGlyph::ChevronDown, page.first + page.count < page.total);
+    }
 }
 
 // ---------------------------------------------------------------------------

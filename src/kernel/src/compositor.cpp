@@ -34,6 +34,7 @@
 #include "mouse.h"
 #include "window.h"
 #include "desktop_shell_surfaces.h"
+#include "desktop_disk_popup.h"
 #include "shell_service.h"
 #include "desktop_overlay_surfaces.h"
 #include "chrome_surface.h"
@@ -2088,6 +2089,7 @@ static ShellFrame CaptureShellFrame(uint32_t width, uint32_t height, uint64_t no
     frame.height = height;
     ShellServiceBeginFrame(now);
     if (!width || !height) {
+        DesktopDiskSetVisible(false);
         ShellServiceEndCapture(0);
         return frame;
     }
@@ -2096,9 +2098,11 @@ static ShellFrame CaptureShellFrame(uint32_t width, uint32_t height, uint64_t no
     WmGetShellTrayGeometry(width, height, mx, my, tray);
     const uint32_t count = WmShellSurfaces(width, height, mx, my, surfaces, tray.popup, tray.menu, tray.notice, tray.windowMenu);
     uint32_t kindMask = 0;
+    bool diskVisible = false;
     for (uint32_t i = 0; i < count; ++i) {
         auto surface = surfaces[i];
         kindMask |= 1u << uint32_t(surface.kind);
+        diskVisible |= surface.kind == WmShellSurfaceKind::TrayFlyout && WmDiskFlyoutSelected();
         uint64_t key = ShellServiceCapture(surface, width, height, now, mx, my);
         const bool fallback = !key;
         if (fallback) {
@@ -2129,6 +2133,7 @@ static ShellFrame CaptureShellFrame(uint32_t width, uint32_t height, uint64_t no
         !(kindMask & (1u << uint32_t(WmShellSurfaceKind::Launcher))) &&
         ShellServiceWarmLauncher(width, height, now))
         kindMask |= 1u << uint32_t(WmShellSurfaceKind::Launcher);
+    DesktopDiskSetVisible(diskVisible);
     ShellServiceEndCapture(kindMask);
     return frame;
 }
@@ -2885,7 +2890,9 @@ static void CompositorInputWM()
                 if(ev.scanCode==0 && kind==DesktopPointerEvent::Up)g_wmBtnReleaseLatch=true;
                 if(kind==DesktopPointerEvent::Scroll && launcher)
                     WmLauncherScroll(LauncherScroll120(ev),g_physFbWidth,g_physFbHeight);
-                else if(kind==DesktopPointerEvent::Scroll && (ev.scanCode || ev.ascii))
+                else if(kind==DesktopPointerEvent::Scroll &&
+                        !WmDiskFlyoutScroll(mx,my,LauncherScroll120(ev),g_physFbWidth,g_physFbHeight) &&
+                        (ev.scanCode || ev.ascii))
                     WmVolumeScroll(mx,my,static_cast<int8_t>(ev.scanCode),g_physFbWidth,g_physFbHeight);
                 // Right click on the volume icon (or its popup) toggles mute.
                 if(kind==DesktopPointerEvent::Down && ev.scanCode==1 && !launcher)

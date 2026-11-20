@@ -146,6 +146,16 @@ void ShellServiceQueueTrayInput(const TrayInput& event) {
     fixtureLastTrayInput = event;
 }
 bool ThermalReadSnapshot(ThermalSnapshot&) { return false; }
+static uint32_t fixtureDiskVolumes;
+void DesktopDiskWorkerStart() {}
+uint32_t DesktopDiskVolumeCount() { return fixtureDiskVolumes; }
+uint32_t DesktopDiskReadPage(uint32_t first, uint32_t capacity, DesktopDiskPage& out) {
+    out.total = fixtureDiskVolumes;
+    out.first = DesktopDiskPageFirst(first, out.total, capacity);
+    out.count = out.total - out.first < capacity ? out.total - out.first : capacity;
+    out.measured = true;
+    return out.first;
+}
 uint32_t AudioOutputControl() { return BROOK_AUDIO_DEFAULT; }
 bool AudioSetUserOutputControl(uint32_t, bool) { std::abort(); }
 uint32_t testScreenW=1024,testScreenH=768;
@@ -760,6 +770,34 @@ int main() {
         CHECK(g_hudMode == WmHudMode::Panel);
         CHECK(WmPerformanceHudPress(hudPin.x, hudPin.y, sw, sh) && !WmTaskbarPopupPinned());
         WmCyclePerformanceHud();
+
+        // The disk icon keeps the old bit mask, scrolls full lists, and
+        // uses the same click-through and occlusion rules as other pins.
+        const auto metrics = WmGetTaskbarMetrics();
+        CHECK(WmSetTaskbarMetrics(metrics | BROOK_TASKBAR_DISK));
+        const auto disk = GetTaskbarLayout(sw, sh).metrics[2];
+        CHECK(disk.w == WmMetric(44));
+        fixtureDiskVolumes = 23;
+        CHECK(WmTrayFlyoutPress(disk.x + 1, disk.y + 1, sw, sh) && WmDiskFlyoutSelected());
+        const auto diskPopup = WmDiskPopupLayout(sw, sh);
+        CHECK(diskPopup.pageRows > 0 && diskPopup.pageRows < fixtureDiskVolumes);
+        CHECK(WmTrayFlyoutPress(diskPopup.pin.x, diskPopup.pin.y, sw, sh) && WmTaskbarPopupPinned());
+        CHECK(!WmTrayFlyoutPress(10, 10, sw, sh));
+        const auto rowX = diskPopup.rows.x, rowY = diskPopup.rows.y;
+        CHECK(WmDiskFlyoutScroll(rowX, rowY, -60, sw, sh) && g_diskPopupFirst == 0);
+        CHECK(WmDiskFlyoutScroll(rowX, rowY, -60, sw, sh) && g_diskPopupFirst == 1);
+        CHECK(WmTrayFlyoutPress(diskPopup.next.x, diskPopup.next.y, sw, sh));
+        CHECK(g_diskPopupFirst == 1 + diskPopup.pageRows);
+        CHECK(kinds(s) >= 2 && WmCaptureShellModel(s[1], sw, sh, 0, -1, -1, pinSnapshot));
+        CHECK(pinSnapshot.diskPopup && pinSnapshot.disk.total == 23 && pinSnapshot.disk.first == g_diskPopupFirst);
+        fixtureDiskVolumes = 2; // Removal or resize clamps the scroll offset.
+        CHECK(kinds(s) >= 2 && WmCaptureShellModel(s[1], sw, sh, 0, -1, -1, pinSnapshot));
+        CHECK(pinSnapshot.disk.count == 2 && pinSnapshot.disk.first == 0);
+        CHECK(WmSetTaskbarMetrics(metrics)); // The old anchor can disappear.
+        const auto fallback = WmDiskPopupLayout(sw, sh);
+        CHECK(fallback.panel.w > 0 && WmTrayFlyoutPress(fallback.pin.x, fallback.pin.y, sw, sh));
+        CHECK(!WmTaskbarPopupPinned() && WmTrayFlyoutPress(10, 10, sw, sh) && !WmDiskFlyoutSelected());
+        fixtureDiskVolumes = 0;
 
         fixtureTray.itemCount = fixtureTray.menuCount = 1;
         fixtureTray.menuOwner = fixtureTray.items[0].id = 11;

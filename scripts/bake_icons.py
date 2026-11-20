@@ -63,6 +63,8 @@ ICONS = [
     ('dock-left', '<rect x="2.5" y="3.5" width="11" height="9" rx="1.5"/><path d="M6.5 3.5v9"/>'),
     ('dock-right', '<rect x="2.5" y="3.5" width="11" height="9" rx="1.5"/><path d="M9.5 3.5v9"/>'),
     ('swap', '<path d="M3 5.5h10m0 0-2.5-2.5M13 5.5 10.5 8M13 10.5H3m0 0 2.5-2.5M3 10.5 5.5 13"/>'),
+    ('disk', '<rect x="2.5" y="3.5" width="11" height="9" rx="1.5"/>'
+             '<path d="M2.5 9h11m-3.5 1.8h1"/>'),
 ]
 COLUMNS = 8
 PAD = 1

@@ -393,7 +393,8 @@ int VfsPathFromVnode(Vnode* node,VfsPath* out)
 {
     FileMutationGuard lookup(false);return VfsPathFromVnodeLocked(node,out);
 }
-static bool VfsVnodeIsPublished(Vnode* node,uint64_t publication,uint8_t pdrv,bool requireRoot)
+static bool VfsVnodeIsPublished(Vnode* node,uint64_t publication,uint8_t pdrv,bool requireRoot,
+                                    bool userVisible = false)
 {
     if(!node || !publication)return false;
     FileMutationGuard lookup(false);
@@ -403,6 +404,7 @@ static bool VfsVnodeIsPublished(Vnode* node,uint64_t publication,uint8_t pdrv,bo
     const bool matches=mount && mount->used && mount->linked &&
         mount->owner==&g_initialNamespace && mount->publication==publication &&
         mount->backing && mount->backing->pdrv==pdrv && !VfsVirtual(path) &&
+        (!userVisible || !mount->backing->systemInternal) &&
         (!requireRoot || (mount->rootIdentityKnown && path.object->ops==mount->rootObjectOps &&
                           path.object->identity==mount->rootIdentity)) &&
         !(__atomic_load_n(&mount->referenceState,__ATOMIC_ACQUIRE)&MOUNT_DETACHED);
@@ -411,6 +413,8 @@ static bool VfsVnodeIsPublished(Vnode* node,uint64_t publication,uint8_t pdrv,bo
 }
 bool VfsVnodeIsPublishedRoot(Vnode* node,uint64_t publication,uint8_t pdrv)
 { return VfsVnodeIsPublished(node,publication,pdrv,true); }
+bool VfsVnodeIsPublishedUserVolume(Vnode* node,uint64_t publication,uint8_t pdrv)
+{ return VfsVnodeIsPublished(node,publication,pdrv,true,true); }
 bool VfsVnodeIsPublishedMember(Vnode* node,uint64_t publication,uint8_t pdrv)
 { return VfsVnodeIsPublished(node,publication,pdrv,false); }
 int VfsPathResolve(const VfsPath& root,const VfsPath& start,const char* text,VfsPath* out,bool followFinal,bool realIds)

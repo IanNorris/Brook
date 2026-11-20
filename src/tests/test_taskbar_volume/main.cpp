@@ -3,6 +3,7 @@
 #include <cstring>
 #include <initializer_list>
 #include "taskbar_volume.h"
+#include "desktop_disk_popup.h"
 using namespace brook;
 #define CHECK(x) do {if(!(x)){std::fprintf(stderr,"FAIL %d: %s\n",__LINE__,#x);std::abort();}} while(0)
 
@@ -107,7 +108,33 @@ static void checkTooltip() {
     TaskbarVolumeTooltip(text,45,false);CHECK(!std::strcmp(text,"No audio device"));
 }
 
+static void checkDiskVolumes() {
+    uint64_t total = 0, free = 0;
+    CHECK(DesktopDiskCapacity(4096, 15, 3, total, free) && total == 61440 && free == 12288);
+    CHECK(!DesktopDiskCapacity(4096, ~uint64_t{0}, 0, total, free));
+    CHECK(!DesktopDiskCapacity(4096, 0, 1, total, free));
+    CHECK(!DesktopDiskCapacity(0, 1, 0, total, free));
+    CHECK(DesktopDiskCapacity(1, 1, 0, total, free) && free == 0);
+    CHECK(DesktopDiskVolumeVisible("/nix", "ext2", false));
+    CHECK(DesktopDiskVolumeVisible("/media/usb", "fatfs", false));
+    CHECK(DesktopDiskVolumeVisible("/media/unknown", "ext4", false));
+    CHECK(!DesktopDiskVolumeVisible("/media/system", "fatfs", true));
+    CHECK(!DesktopDiskVolumeVisible("/", "fatfs", false));
+    CHECK(!DesktopDiskVolumeVisible("/data", "tmpfs", false));
+    CHECK(!DesktopDiskVolumeVisible("/proc", "procfs", false));
+    CHECK(DesktopDiskSameVolume({1, 72, "ext2", 0}, {1, 72, "ext2", 0})); // bind alias
+    CHECK(!DesktopDiskSameVolume({1, 72, "ext2", 0}, {2, 72, "fatfs", 1}));
+    CHECK(DesktopDiskSameVolume({0, 0, "ext4", 3}, {0, 0, "ext4", 3}));
+    CHECK(!DesktopDiskSameVolume({0, 0, "ext4", 3}, {0, 0, "ext4", 4}));
+    CHECK(DesktopDiskPageFirst(22, 24, 5) == 19);
+    CHECK(DesktopDiskPageFirst(22, 4, 5) == 0);
+    CHECK(DesktopDiskPageStep(1, 24, 5, 0x7fffffffffffffffLL) == 19);
+    CHECK(DesktopDiskPageStep(8, 24, 5, -12) == 0);
+    CHECK(DesktopDiskPageStep(8, 24, 5, 3) == 11);
+}
+
 int main() {
+    checkDiskVolumes();
     checkGlyph();checkWheel();checkSlider();checkPopup();checkTooltipBox();checkTooltip();
     std::puts("test_taskbar_volume: ok");
     return 0;

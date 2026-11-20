@@ -818,9 +818,23 @@ VfsMountSnapshot VfsMountNamespaceSnapshotAt(MountNamespace* ns,uint32_t idx)
     snap.used = m.used;
     if (!m.used) return snap;
     snap.systemInternal = m.backing->systemInternal;
+    snap.publication = m.publication;
+    snap.drive = m.backing->pdrv;
     StrCopy(snap.mountPoint, m.mountPoint, sizeof(snap.mountPoint));
     StrCopy(snap.fsType, m.fsType, sizeof(snap.fsType));
     return snap;
+}
+
+bool VfsUserVolumeStillPublished(const VfsMountSnapshot& expected)
+{
+    if (!expected.used || expected.systemInternal || !expected.publication || expected.mountPoint[0] != '/') return false;
+    FileMutationGuard lookup(false);
+    const char* relative = nullptr;
+    char physical[512];
+    auto* mount = FindMount(expected.mountPoint, &relative, physical);
+    return mount && mount->publication == expected.publication && mount->backing &&
+           !mount->backing->systemInternal && mount->backing->pdrv == expected.drive &&
+           StrEq(mount->mountPoint, expected.mountPoint);
 }
 
 uint32_t VfsFsMaxSlots() { return VFS_MAX_FS_DRIVERS; }

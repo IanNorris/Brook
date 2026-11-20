@@ -670,6 +670,31 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
         RenderSnapshot(model, s, list);
         Check(prefix + (network ? "network-flyout" : "temperature-flyout"), list, s, flyout.x, flyout.y, flyout.w, flyout.h);
     }
+    if (prefix == "glass-100-" || prefix == "opaque-light-150-" || prefix == "opaque-dark-200-") {
+        model.diskPopup = true;
+        model.popupPinned = true;
+        model.diskLayout = ChromeDiskPopupLayoutFor(s, layout.volume, screenW, screenH - m.taskbar(), 16);
+        model.rect = model.diskLayout.panel;
+        model.disk.first = 4;
+        model.disk.count = model.diskLayout.pageRows;
+        model.disk.total = 16;
+        model.disk.measured = true;
+        std::strcpy(model.disk.rows[0].path, "/nix");
+        model.disk.rows[0].available = true;
+        model.disk.rows[0].freeBytes = 48ull << 30;
+        model.disk.rows[0].totalBytes = 120ull << 30;
+        std::strcpy(model.disk.rows[1].path, "/media/Drive with a long name");
+        for (uint32_t i = 2; i < model.disk.count; ++i) {
+            std::snprintf(model.disk.rows[i].path, sizeof(model.disk.rows[i].path), "/mnt/volume%u", i);
+            model.disk.rows[i].available = true;
+            model.disk.rows[i].freeBytes = 1000ull << 20;
+            model.disk.rows[i].totalBytes = 16000ull << 20;
+        }
+        auto diskList = ChromeListOn(storage);
+        RenderSnapshot(model, s, diskList);
+        Check(prefix + "disk-popup", diskList, s, model.rect.x, model.rect.y, model.rect.w, model.rect.h);
+        model.popupPinned = false;
+    }
     model.kind = ChromeShellKind::PerformanceHud;
     const DesktopRect hud{0, 0, int(s.M(348)), ChromePerformanceHudHeight(s, true)};
     model.rect = hud;
