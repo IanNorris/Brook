@@ -161,6 +161,17 @@ class Tests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'invalid AHCI sector reply'):
             self.inspect()
 
+    def test_archived_recovery_directory_is_accepted(self):
+        # FAT writers set the archive bit on directories (the Dell's RECOVERY is 0x30).
+        self.disk.block(ROOT)[11] = 0x30
+        self.assertEqual(self.inspect()['state'], 'absent')
+
+    def test_recovery_volume_label_or_file_is_refused(self):
+        for attr in (0x08, 0x20, 0x18):
+            self.disk.block(ROOT)[11] = attr
+            with self.assertRaisesRegex(RuntimeError, 'RECOVERY directory unproven'):
+                self.inspect()
+
     def test_missing_recovery_directory_is_ambiguous(self):
         self.disk.block(ROOT)[0] = 0xe5
         with self.assertRaisesRegex(RuntimeError, 'RECOVERY directory unproven'):
