@@ -28,6 +28,8 @@ constexpr int32_t MenuBack = INT32_MIN;
 constexpr unsigned ItemStorage = 32, ItemsPerSender = 4, NoticeStorage = 3;
 constexpr auto LayoutTimeout = std::chrono::milliseconds(1500);
 constexpr auto ItemTimeout = std::chrono::seconds(2);
+constexpr unsigned ItemRefreshRetries = 2;
+enum class MenuFetch { Open, Refresh };
 
 using Message = std::unique_ptr<DBusMessage, decltype(&dbus_message_unref)>;
 Message Hold(DBusMessage* m) { return Message(m, dbus_message_unref); }
@@ -172,6 +174,10 @@ struct Item {
     TimedCall refresh;
     PendingCall activation;
     ChromeTrayItem view{};
+    Clock::time_point refreshAfter{};
+    unsigned retries = 0;
+    bool answered = false;
+    bool expired = false;
     bool isMenu = false;
     bool visible = false;
     bool dirty = true;
@@ -242,6 +248,16 @@ struct Session {
         }
     }
 
+    bool ReclaimItem(const char* owner)
+    {
+        const auto expired = std::find_if(items.begin(), items.end(), [&](const auto& item) {
+            return item.expired && !item.answered && (!owner || item.owner == owner);
+        });
+        if (expired == items.end()) return false;
+        RemoveItem(expired);
+        return true;
+    }
+
     bool RegisterItem(DBusMessage* m)
     {
         const char* supplied = nullptr;
@@ -275,8 +291,14 @@ struct Session {
             if (item.path == path) return Empty(m);
             ++owned;
         }
-        if (owned >= ItemsPerSender) { Error(m, "Too many StatusNotifierItems from this sender"); return true; }
-        if (items.size() == ItemStorage) { Error(m, "Too many StatusNotifierItems"); return true; }
+        if (owned >= ItemsPerSender && !ReclaimItem(sender)) {
+            Error(m, "Too many StatusNotifierItems from this sender");
+            return true;
+        }
+        if (items.size() == ItemStorage && !ReclaimItem(nullptr)) {
+            Error(m, "Too many StatusNotifierItems");
+            return true;
+        }
         Item item;
         item.bus = name;
         item.owner = sender;
@@ -362,26 +384,43 @@ struct Session {
         return true;
     }
 
+    void RetryItem(Item& item, bool timedOut, Clock::time_point now)
+    {
+        // A first error can be a client registering before it exports its
+        // object. Retry once. Give expired registrations a chance to send a
+        // later change signal until somebody needs the slot.
+        if (!item.answered && (timedOut || item.retries)) item.expired = true;
+        else if (item.retries < ItemRefreshRetries) {
+            ++item.retries;
+            item.dirty = true;
+        }
+        // Further change signals may request refreshes after automatic
+        // retries run out. Back off even if signals keep arriving.
+        item.refreshAfter = now + std::chrono::milliseconds(250 * std::max(1u, item.retries));
+    }
+
     void RefreshItems()
     {
-        for (auto it = items.begin(); it != items.end();) {
-            auto& item = *it;
-            if (item.refresh.Ready() && !UpdateItem(item, item.refresh.TakeReply())) {
-                it = RemoveItem(it);
-                continue;
+        const auto now = Clock::now();
+        for (auto& item : items) {
+            if (item.refresh.Ready()) {
+                auto reply = item.refresh.TakeReply();
+                const bool timedOut = !reply || (dbus_message_get_type(reply.get()) == DBUS_MESSAGE_TYPE_ERROR &&
+                                                Same(dbus_message_get_error_name(reply.get()), DBUS_ERROR_NO_REPLY));
+                if (UpdateItem(item, std::move(reply))) {
+                    item.answered = true;
+                    item.expired = false;
+                    item.retries = 0;
+                    item.refreshAfter = {};
+                } else RetryItem(item, timedOut, now);
             }
-            if (item.dirty && !item.refresh.pending) {
-                item.dirty = false;
-                auto request = Hold(dbus_message_new_method_call(item.owner.c_str(), item.path.c_str(),
-                                                                DBUS_INTERFACE_PROPERTIES, "GetAll"));
-                const char* interface = ItemInterface;
-                if (!request || !dbus_message_append_args(request.get(), DBUS_TYPE_STRING, &interface, DBUS_TYPE_INVALID) ||
-                    !StartCall(item.refresh, request, ItemTimeout)) {
-                    it = RemoveItem(it);
-                    continue;
-                }
-            }
-            ++it;
+            if (!item.dirty || item.refresh.pending || now < item.refreshAfter) continue;
+            item.dirty = false;
+            auto request = Hold(dbus_message_new_method_call(item.owner.c_str(), item.path.c_str(),
+                                                            DBUS_INTERFACE_PROPERTIES, "GetAll"));
+            const char* interface = ItemInterface;
+            if (!request || !dbus_message_append_args(request.get(), DBUS_TYPE_STRING, &interface, DBUS_TYPE_INVALID) ||
+                !StartCall(item.refresh, request, ItemTimeout)) RetryItem(item, false, now);
         }
     }
 
@@ -449,7 +488,7 @@ struct Session {
         menuNode = 0;
     }
 
-    bool FetchMenu(const Item& item, int32_t node, const TrayInput* context = nullptr)
+    bool FetchMenu(const Item& item, int32_t node, MenuFetch mode = MenuFetch::Open, const TrayInput* context = nullptr)
     {
         if (item.menu.empty() || item.menu == "/") return false;
         if (layout.pending && layoutOwner == item.view.id && layoutNode == node) {
@@ -461,9 +500,9 @@ struct Session {
         layoutOwner = 0;
         layoutDirty = false;
         contextFallback = {};
-        auto prepare = Hold(dbus_message_new_method_call(item.owner.c_str(), item.menu.c_str(), MenuInterface, "AboutToShow"));
-        if (prepare) {
-            if (dbus_message_append_args(prepare.get(), DBUS_TYPE_INT32, &node, DBUS_TYPE_INVALID)) {
+        if (mode == MenuFetch::Open) {
+            auto prepare = Hold(dbus_message_new_method_call(item.owner.c_str(), item.menu.c_str(), MenuInterface, "AboutToShow"));
+            if (prepare && dbus_message_append_args(prepare.get(), DBUS_TYPE_INT32, &node, DBUS_TYPE_INVALID)) {
                 dbus_message_set_no_reply(prepare.get(), true);
                 Send(std::move(prepare));
             }
@@ -555,7 +594,7 @@ struct Session {
         const auto item = std::find_if(items.begin(), items.end(), [&](const auto& i) {
             return i.view.id == menuOwner && i.visible;
         });
-        if (item == items.end() || !FetchMenu(*item, menuNode)) CloseMenu();
+        if (item == items.end() || !FetchMenu(*item, menuNode, MenuFetch::Refresh)) CloseMenu();
     }
 
     void ItemAction(Item& item, const char* member, const TrayInput& event)
@@ -727,6 +766,7 @@ struct Session {
 
     void Input(const TrayInput& e)
     {
+        if (!menuOwner && layoutOwner && e.owner != layoutOwner) CloseMenu();
         if (e.kind == TrayInputKind::NoticeAction || e.kind == TrayInputKind::CloseNotice) {
             if (notices.empty() || notices.front().view.id != e.owner) return;
             if (e.kind == TrayInputKind::NoticeAction) {
@@ -747,7 +787,7 @@ struct Session {
         case TrayInputKind::Activate: ItemAction(*item, "Activate", e); break;
         case TrayInputKind::Context:
             item->activation.reset();
-            if (!FetchMenu(*item, 0, &e)) ItemAction(*item, "ContextMenu", e);
+            if (!FetchMenu(*item, 0, MenuFetch::Open, &e)) ItemAction(*item, "ContextMenu", e);
             break;
         case TrayInputKind::Scroll: ItemAction(*item, "Scroll", e); break;
         case TrayInputKind::MenuSelect: MenuSelect(*item, e.argument); break;
