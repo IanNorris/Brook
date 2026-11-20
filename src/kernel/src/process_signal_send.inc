@@ -1,8 +1,23 @@
 // Production sender body shared with deterministic scheduler/wakeup tests.
-int ProcessSendSignal(Process* proc, int signum, const SignalInfo* info)
+static bool NamespaceInitAcceptsSignal(const Process* target, int signum, const Process* sender)
+{
+    if (!ProcessPidIsNamespaceInit(target)) return true;
+    if (signum == SIGKILL || signum == SIGSTOP) {
+        if (!sender) return true;
+        const auto* targetView = ProcessPidView(target);
+        const auto* senderView = ProcessPidView(sender);
+        return targetView != senderView && PidNamespaceContains(senderView, targetView);
+    }
+    return ReadSignalAction(target->tgid, signum - 1).handler > 1;
+}
+
+int ProcessSendSignal(Process* proc, int signum, const SignalInfo* info, const Process* sender)
 {
     if (!proc) return -3; // ESRCH
     if (signum < 1 || signum > 64) return -22; // EINVAL
+    static constexpr int SIGCONT = 18;
+    const bool deliver = NamespaceInitAcceptsSignal(proc, signum, sender);
+    if (!deliver && signum != SIGCONT) return 0;
 
     // SIGKILL and SIGSTOP cannot be caught/blocked
     if (signum == SIGKILL)
@@ -20,7 +35,6 @@ int ProcessSendSignal(Process* proc, int signum, const SignalInfo* info)
     }
 
     // SIGCONT: resume stopped process (always, even if blocked/ignored)
-    static constexpr int SIGCONT = 18;
     if (signum == SIGCONT)
     {
         const KernelSigaction sa = ReadSignalAction(proc->tgid,signum - 1);
@@ -28,7 +42,7 @@ int ProcessSendSignal(Process* proc, int signum, const SignalInfo* info)
                              (1ULL << (signum - 1))) != 0;
         // Blocked signals remain pending even with an ignored disposition:
         // sigtimedwait can consume them, or the action can change before unmask.
-        const bool notify = masked || (sa.handler != 0 && sa.handler != 1);
+        const bool notify = deliver && (masked || (sa.handler != 0 && sa.handler != 1));
         if (notify) QueueSignal(proc, signum, info);
         // Resume Stopped under the ready lock regardless of mask/disposition.
         // Publish the pending bit first so a resumed target can observe it.

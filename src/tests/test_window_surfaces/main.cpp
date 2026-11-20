@@ -39,7 +39,7 @@ TerminalResizeResult TerminalResizeForProcess(uint16_t,uint64_t,uint32_t,uint32_
 // The dock's Close button reaches the cooperative close path; no test window
 // takes the native-signal branch.
 bool TerminalSnapshotGeometry(Process*,TerminalGeometry*) { std::abort(); }
-int ProcessSendSignal(Process*,int,const SignalInfo*) { std::abort(); }
+int ProcessSendSignal(Process*,int,const SignalInfo*,const Process*) { std::abort(); }
 bool TerminalSnapshotCaret(uint16_t pid,uint64_t incarnation,TerminalCaret* out) {
     if(!caretPid || pid!=caretPid || incarnation!=caretIncarnation)return false;
     *out={5,1,3,2};return true;

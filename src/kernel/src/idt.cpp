@@ -12,6 +12,7 @@
 #include "panic_screen.h"
 #include "panic_qr.h"
 #include "process.h"
+#include "pid_namespace.h"
 #include "scheduler.h"
 #include "vfs.h"
 #include "../../shared/inc_um/crash_dump.h"
@@ -2020,7 +2021,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector,
             ctx.r10 = ef->r10; ctx.r11 = ef->r11;
             ctx.r12 = ef->r12; ctx.r13 = ef->r13;
             ctx.r14 = ef->r14; ctx.r15 = ef->r15;
-            ctx.tid = proc->pid;
+            ctx.tid = brook::ProcessVisibleTid(proc, brook::ProcessPidView(proc));
             for (uint32_t i = 0; i < sizeof(ctx.commName) - 1; ++i) {
                 char ch = leader->name[i];
                 ctx.commName[i] = ch;

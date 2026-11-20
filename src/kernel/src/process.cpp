@@ -1672,7 +1672,7 @@ uint16_t CreateRemoteThread(Process* target, uint64_t entry,
     // even if the target later execs. Stack construction uses that exact AS.
     Process* thread=ProcessCreateThread(target,entry,0,0x202,target->fsBase);
     if (!thread) return 0;
-    if (ProcessPidPrepareChild(thread, target, false)) {
+    if (ProcessPidPrepareInjectedThread(thread, target)) {
         ProcessDiscardUnpublished(thread);
         return 0;
     }

@@ -9,6 +9,7 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include "crash_dump.h"
 
 #define CHECK(condition) do { \
     if (!(condition)) { \
@@ -111,6 +112,59 @@ static void drain_namespace(void)
     fprintf(stderr, "PID_NAMESPACE_DRAIN_PASS\n");
 }
 
+static void init_job_control(void)
+{
+    int ready[2], go[2];
+    CHECK(pipe(ready) == 0 && pipe(go) == 0);
+    pid_t init = new_init();
+    if (!init) {
+        close(ready[0]);
+        close(go[1]);
+        CHECK(setsid() == 1 && write(ready[1], "r", 1) == 1);
+        char mark;
+        CHECK(read(go[0], &mark, 1) == 1 && mark == 'x');
+        _exit(0);
+    }
+    close(ready[1]);
+    close(go[0]);
+    char mark;
+    CHECK(read(ready[0], &mark, 1) == 1 && mark == 'r');
+    CHECK(kill(-init, SIGINT) == 0 && kill(-init, SIGTSTP) == 0);
+    CHECK(write(go[1], "x", 1) == 1);
+    int status;
+    CHECK(waitpid(init, &status, WUNTRACED) == init &&
+          WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    close(ready[0]);
+    close(go[1]);
+    fprintf(stderr, "PID_NAMESPACE_INIT_SIGNALS_PASS\n");
+}
+
+static void crash_writer(const BrookCrashCtx *context)
+{
+    const int valid = context && context->magic == BROOK_CRASH_CTX_MAGIC &&
+        context->version == BROOK_CRASH_CTX_VER && context->tid == 1 &&
+        getpid() == 1 && syscall(SYS_gettid) == 2;
+    if (valid) {
+        const char message[] = "PID_NAMESPACE_CRASH_WRITER_PASS\n";
+        if (write(STDERR_FILENO, message, sizeof(message) - 1) != sizeof(message) - 1)
+            _exit(3);
+    }
+    (void)syscall(503, valid ? 77 : 3);
+    _exit(3);
+}
+
+static void crash_writer_after_unshare(void)
+{
+    pid_t init = new_init();
+    if (!init) {
+        CHECK(unshare(CLONE_NEWPID) == 0);
+        CHECK(syscall(502, (uintptr_t)crash_writer) == 0);
+        // Exercise the registered user exception writer in this guest.
+        __builtin_trap();
+    }
+    wait_exit(init, 77);
+}
+
 static void check_bwrap_proc(void)
 {
     FILE *proc = fopen("/proc/self/stat", "r");
@@ -135,5 +189,7 @@ int main(int argc, char **argv)
     CHECK(argc == 1);
     reparent_orphan();
     drain_namespace();
+    init_job_control();
+    crash_writer_after_unshare();
     return 0;
 }

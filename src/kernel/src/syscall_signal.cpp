@@ -422,16 +422,6 @@ int64_t sys_rt_sigreturn(uint64_t, uint64_t, uint64_t,
 
 // Thread-directed signals retain their Linux sender metadata. In particular,
 // NPTL validates SI_TKILL and the sender TGID before applying setxid requests.
-static bool DeliverToNamespaceInit(const Process* sender, const Process* target, int signal)
-{
-    if (!ProcessPidIsNamespaceInit(target)) return true;
-    // An ancestor can force SIGKILL or SIGSTOP. From within the namespace,
-    // only a signal with a user handler is deliverable to PID 1.
-    if ((signal == 9 || signal == 19) && ProcessPidView(sender) != ProcessPidView(target))
-        return true;
-    return ReadSignalAction(target->tgid, signal - 1).handler > 1;
-}
-
 static int64_t SendThreadSignal(uint64_t tgid, uint64_t tid, uint64_t sig, bool checkGroup)
 {
     int32_t group = static_cast<int32_t>(tgid), thread = static_cast<int32_t>(tid);
@@ -445,7 +435,7 @@ static int64_t SendThreadSignal(uint64_t tgid, uint64_t tid, uint64_t sig, bool 
     int result = -ESRCH;
     if (target && !target->isKernelThread && (!checkGroup || ProcessVisibleTgid(target, view) == static_cast<uint32_t>(group))) {
         result = ProcessCanSignal(self,target) || (signal==18 && self && self->sid==target->sid)?0:-EPERM;
-        if (!result && signal && DeliverToNamespaceInit(self, target, signal)) {
+        if (!result && signal) {
             SignalInfo info{};
             info.si_signo = signal;
             info.si_code = -6; // SI_TKILL
@@ -455,7 +445,7 @@ static int64_t SendThreadSignal(uint64_t tgid, uint64_t tid, uint64_t sig, bool 
             memcpy(info._data + 4, &uid, sizeof(uid));
             // SA_ONSTACK without an enabled alternate stack uses the normal
             // stack. Silently discarding it deadlocks libc's setxid protocol.
-            result = ProcessSendSignal(target, signal, &info);
+            result = ProcessSendSignal(target, signal, &info, self);
         }
     }
     if (target) ProcessUnref(target);
@@ -483,7 +473,7 @@ static int SendProcessSignal(Process* self, Process* target, int signal)
 {
     if (target->isKernelThread) return -ESRCH;
     if (!ProcessCanSignal(self, target) && !(signal == 18 && self->sid == target->sid)) return -EPERM;
-    if (!signal || !DeliverToNamespaceInit(self, target, signal)) return 0;
+    if (!signal) return 0;
     SignalInfo info{};
     info.si_signo = signal;
     info.si_code = 0; // SI_USER
@@ -491,7 +481,7 @@ static int SendProcessSignal(Process* self, Process* target, int signal)
     const uint32_t senderUid = ProcessReadIds(self, false).real;
     memcpy(info._data, &sender, sizeof(sender));
     memcpy(info._data + 4, &senderUid, sizeof(senderUid));
-    return ProcessSendSignal(target, signal, &info);
+    return ProcessSendSignal(target, signal, &info, self);
 }
 
 int64_t sys_kill(uint64_t pid, uint64_t sig, uint64_t,

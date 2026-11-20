@@ -14,7 +14,9 @@ or sibling. The initial namespace continues to expose the current Brook numbers.
   identity. Never feed untrusted local numbers into global lookup.
 - Assign a number in the child's active namespace and each visible ancestor.
   Reserve numbers before publishing the task and retain them through zombie
-  lifetime. Match user-visible TGID, parent and process-group results using
+  lifetime. The local allocator wraps below 2²² and skips IDs still leased
+  as a TID, TGID, process group or session. Match user-visible TGID,
+  parent and process-group results using
   the identity visible from the caller. A parent outside the view has PPID 0.
 - CLONE_NEWPID creates the child's namespace and its first process is PID 1.
   An unshare operation selects a namespace for future children while the
@@ -32,7 +34,12 @@ The first functional slice must cover fork and clone return values, child
 and parent TID writes, getpid/getppid/gettid, process groups and sessions,
 wait4/waitid, kill/tkill/tgkill and signal sender identities. Group operations
 must filter membership by the caller's namespace before permission checks.
-Apply namespace-init signal rules separately from ordinary permissions.
+Apply namespace-init signal rules separately from ordinary permissions,
+including terminal job-control delivery. In the initial namespace,
+`kill(0)`, `kill(-pgrp)` and `kill(-1)` now use Linux-style selection.
+In particular, an initial-namespace broadcast may signal every permitted
+same-UID user process, including desktop services. It excludes the caller's
+thread group, PID 1 and kernel threads.
 
 A proc mount owns the PID view captured at mount time. Enumerated directory
 names and numeric lookups use that view. The same view controls self,
@@ -80,7 +87,8 @@ thread-group leader identity across exec.
 - Compare parent, nested and sibling namespaces for self, parent, thread,
   session and process-group IDs. Check wait/kill permissions, pidfd and
   proc misses for the wrong namespace or a reused number. Exercise fork
-  failures with no leaked process, number or namespace.
+  failures with no leaked process, number or namespace. Cycle through the
+  full numeric range while retaining group numbers.
 - Verify init's signal rules, orphan reparenting, child reaping, group
   teardown and refusal to fork into a dead namespace. Retain a proc mount
   after namespace teardown and verify it cannot resolve another namespace's

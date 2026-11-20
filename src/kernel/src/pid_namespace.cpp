@@ -11,7 +11,7 @@ struct PidNamespace {
     uint64_t tag;
     mutable uint32_t references;
     unsigned depth;
-    uint32_t next;
+    mutable PidIdAllocator ids;
     mutable uint32_t tasks;
     bool initPublished;
     bool dying;
@@ -21,7 +21,6 @@ struct PidNamespace {
 namespace {
 IrqSpinLock pidViewLock;
 uint64_t nextViewTag = 1;
-constexpr uint32_t PidLimit = 1u << 22;
 
 PidNamespace* Create(const PidNamespace* parent, Process* ownerTask)
 {
@@ -31,18 +30,28 @@ PidNamespace* Create(const PidNamespace* parent, Process* ownerTask)
     const uint64_t tag = __atomic_fetch_add(&nextViewTag, 1, __ATOMIC_RELAXED);
     if (!tag) __builtin_trap();
     *ns = {parent, ProcessUserNamespaceAcquire(ownerTask), tag, 1,
-           parent ? parent->depth + 1 : 1, 1, 0, false, false, false};
+           parent ? parent->depth + 1 : 1, {}, 0, false, false, false};
     return ns;
 }
 
 bool MayReserve(const PidNamespace* active)
 {
-    if (!active) return true;
-    // PID 1 is the only birth allowed before the namespace is published.
-    if (!active->initPublished && active->next != 1) return false;
     for (const auto* ns = active; ns; ns = ns->parent)
-        if (ns->dying || ns->next == PidLimit) return false;
+        if (ns->dying || (ns != active && !ns->initPublished)) return false;
     return true;
+}
+
+void ReleaseTaskIds(PidNamespaceIds& identity)
+{
+    while (identity.count) {
+        auto& entry = identity.entries[--identity.count];
+        PidIdAllocator::Release(entry.groupLease);
+        PidIdAllocator::Release(entry.sessionLease);
+        PidIdAllocator::Release(entry.tgidLease);
+        PidIdAllocator::Release(entry.tidLease);
+        entry = {};
+    }
+    identity.published = false;
 }
 }
 
@@ -73,11 +82,20 @@ void ProcessSetGroupView(Process* process, const Process* source, bool session, 
         : (session ? source->sid : source->pgid);
     (session ? process->sid : process->pgid) = id;
     auto& identity = process->pidNamespaceIds;
+    if (!identity.count) return;
+    const auto flags = IrqSpinLockAcquire(&pidViewLock);
     for (unsigned i = 0; i < identity.count; ++i) {
         auto& entry = identity.entries[i];
-        (session ? entry.session : entry.group) = newGroup
-            ? ProcessVisibleTgid(source, entry.ns) : ProcessVisibleGroup(source, entry.ns, session);
+        auto& current = session ? entry.session : entry.group;
+        auto& lease = session ? entry.sessionLease : entry.groupLease;
+        const uint32_t next = newGroup ? ProcessVisibleTgid(source, entry.ns) :
+            ProcessVisibleGroup(source, entry.ns, session);
+        if (current == next) continue;
+        PidIdAllocator::Release(lease);
+        if (next) entry.ns->ids.Retain(lease, next);
+        current = next;
     }
+    IrqSpinLockRelease(&pidViewLock, flags);
 }
 
 UserNamespace* PidNamespaceOwner(const PidNamespace* view)
@@ -126,8 +144,14 @@ void PidNamespaceRelease(const PidNamespace* view)
     }
 }
 
-int ProcessPidPrepareChild(Process* child, const Process* parent, bool newNamespace)
+namespace {
+enum class BirthKind { Child, NamespaceInit, InjectedThread };
+
+int PrepareChild(Process* child, const Process* parent, BirthKind kind)
 {
+    const bool newNamespace = kind == BirthKind::NamespaceInit;
+    const bool injected = kind == BirthKind::InjectedThread;
+    if (injected && !child->isThread) return -22;
     const auto* current = ProcessPidView(parent);
     if (newNamespace && current && current->depth == PidNamespaceIds::MaxDepth) return -28;
     const auto* fresh = newNamespace ? Create(current, child) : nullptr;
@@ -135,29 +159,52 @@ int ProcessPidPrepareChild(Process* child, const Process* parent, bool newNamesp
 
     const auto flags = IrqSpinLockAcquire(&pidViewLock);
     const auto* selected = parent->pidNamespaceForChildren;
-    const auto* active = fresh ? fresh : selected;
+    const auto* active = fresh ? fresh : injected ? current : selected;
     int error = 0;
-    if ((child->isThread || newNamespace) && selected != current) error = -22;
+    if (!injected && (child->isThread || newNamespace) && selected != current) error = -22;
     else if (!MayReserve(active)) error = -12;
     if (error || !active) {
         IrqSpinLockRelease(&pidViewLock, flags);
         PidNamespaceRelease(fresh);
         return error;
     }
-    if (!fresh) PidNamespaceRetain(active);
     const PidNamespace* ancestors[PidNamespaceIds::MaxDepth];
     unsigned count = 0;
     for (auto* ns = active; ns; ns = ns->parent) ancestors[count++] = ns;
     while (count) {
         const auto* view = ancestors[--count];
-        const uint32_t tid = const_cast<PidNamespace*>(view)->next++;
+        auto& ids = child->pidNamespaceIds;
+        auto& entry = ids.entries[ids.count];
+        // Only PID 1 can be reserved before the first task publishes. An
+        // aborted birth returns it without touching the regular cursor.
+        const uint32_t tid = view->ids.Reserve(entry.tidLease, !view->initPublished);
+        if (!tid) {
+            ReleaseTaskIds(ids);
+            IrqSpinLockRelease(&pidViewLock, flags);
+            PidNamespaceRelease(fresh);
+            return -12;
+        }
         const uint32_t tgid = child->isThread ? ProcessVisibleTgid(parent, view) : tid;
-        if (!child->pidNamespaceIds.Add(view, tid, tgid)) __builtin_trap();
+        if (!ids.Add(view, tid, tgid)) __builtin_trap();
+        if (child->isThread) view->ids.Retain(entry.tgidLease, tgid);
     }
+    if (!fresh) PidNamespaceRetain(active);
     PidNamespaceRetain(active);
     child->pidNamespaceForChildren = active;
     IrqSpinLockRelease(&pidViewLock, flags);
     return 0;
+}
+
+}
+
+int ProcessPidPrepareChild(Process* child, const Process* parent, bool newNamespace)
+{
+    return PrepareChild(child, parent, newNamespace ? BirthKind::NamespaceInit : BirthKind::Child);
+}
+
+int ProcessPidPrepareInjectedThread(Process* child, const Process* target)
+{
+    return PrepareChild(child, target, BirthKind::InjectedThread);
 }
 
 bool ProcessPidPublish(Process* process, bool runnable)
@@ -183,17 +230,18 @@ bool ProcessPidPublish(Process* process, bool runnable)
 void ProcessPidRelease(Process* process)
 {
     const auto* active = ProcessPidView(process);
-    if (active && ProcessVisibleTid(process, active) == 1) {
+    if (active) {
         const auto flags = IrqSpinLockAcquire(&pidViewLock);
-        if (!active->initPublished && !active->dying)
-            const_cast<PidNamespace*>(active)->next = 1;
+        if (process->pidNamespaceIds.published) {
+            for (const auto* view = active; view; view = view->parent)
+                __atomic_sub_fetch(&view->tasks, 1, __ATOMIC_RELEASE);
+        }
+        ReleaseTaskIds(process->pidNamespaceIds);
         IrqSpinLockRelease(&pidViewLock, flags);
     }
-    if (process->pidNamespaceIds.published) {
-        for (const auto* view = active; view; view = view->parent)
-            __atomic_sub_fetch(&view->tasks, 1, __ATOMIC_RELEASE);
-    }
-    PidNamespaceRelease(process->pidNamespaceForChildren);
+    const auto* selected = process->pidNamespaceForChildren;
+    process->pidNamespaceForChildren = nullptr;
+    PidNamespaceRelease(selected);
     PidNamespaceRelease(active);
 }
 

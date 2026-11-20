@@ -845,7 +845,10 @@ void ProcessCloseCloexecFds(Process* proc); // close FD_CLOEXEC fds on execve
 
 // Signal delivery: send a signal to a process.
 // Returns 0 on success, -ESRCH if not found, -EINVAL if bad signal.
-int ProcessSendSignal(Process* proc, int signum, const SignalInfo* info = nullptr);
+// A null sender is a kernel-originated signal. User syscalls pass their
+// actual source so namespace PID 1 can distinguish an ancestor.
+int ProcessSendSignal(Process* proc, int signum, const SignalInfo* info = nullptr,
+                      const Process* sender = nullptr);
 bool ProcessDequeueSignal(Process* proc, int signum, SignalInfo* info);
 // Non-allocating queue only; caller may hold scheduler locks. No wake/lock inversion.
 void ProcessQueueChildSignal(Process* parent,Process* child);

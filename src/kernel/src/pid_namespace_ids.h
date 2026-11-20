@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include "pid_id_allocator.h"
 
 namespace brook {
 
@@ -17,6 +18,7 @@ struct PidNamespaceIds {
         uint32_t tgid;
         uint32_t group;
         uint32_t session;
+        PidIdLease tidLease, tgidLease, groupLease, sessionLease;
     };
 
     Entry entries[MaxDepth]{};
@@ -29,7 +31,10 @@ struct PidNamespaceIds {
 
     bool Add(const PidNamespace* ns, uint32_t tid, uint32_t tgid) {
         if (!ns || !tid || !tgid || count >= MaxDepth || Find(ns)) return false;
-        entries[count++] = {ns, tid, tgid, 0, 0};
+        auto& entry = entries[count++];
+        entry.ns = ns;
+        entry.tid = tid;
+        entry.tgid = tgid;
         return true;
     }
 

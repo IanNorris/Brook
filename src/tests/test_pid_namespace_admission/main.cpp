@@ -3,6 +3,7 @@
 
 #include <cassert>
 #include <cstdlib>
+#include <initializer_list>
 
 using namespace brook;
 
@@ -13,8 +14,43 @@ void kfree(void* object) { if (object) --allocated; std::free(object); }
 UserNamespace* ProcessUserNamespaceAcquire(Process*) { return nullptr; }
 }
 
+static void RecyclePidRange()
+{
+    PidIdAllocator ids;
+    PidIdLease first, tid, tgid, group, session, temp;
+    assert(ids.Reserve(first, true) == 1);
+    assert(ids.Reserve(temp, true) == 0);
+    PidIdAllocator::Release(first);
+    assert(ids.Reserve(first, true) == 1);
+    assert(ids.Reserve(tid, false) == 2);
+    ids.Retain(tgid, 2);
+    ids.Retain(group, 2);
+    ids.Retain(session, 2);
+    PidIdAllocator::Release(tid);
+
+    // Exercise the actual production range, including a wrap with each
+    // type of persistent numeric ownership and reuse after the final drop.
+    for (auto* lease : {&tgid, &group, &session}) {
+        for (uint32_t number = 3; number < PidNamespaceIdLimit; ++number) {
+            assert(ids.Reserve(temp, false) == number);
+            PidIdAllocator::Release(temp);
+        }
+        assert(ids.Reserve(temp, false) == 3);
+        PidIdAllocator::Release(temp);
+        PidIdAllocator::Release(*lease);
+        for (uint32_t number = 4; number < PidNamespaceIdLimit; ++number) {
+            assert(ids.Reserve(temp, false) == number);
+            PidIdAllocator::Release(temp);
+        }
+    }
+    assert(ids.Reserve(temp, false) == 2);
+    PidIdAllocator::Release(temp);
+    PidIdAllocator::Release(first);
+}
+
 int main()
 {
+    RecyclePidRange();
     Process outer{}, abandoned{}, init{}, worker{}, sibling{}, child{};
     outer.pid = outer.tgid = 900;
     abandoned.pid = abandoned.tgid = 901;
@@ -48,6 +84,15 @@ int main()
     assert(PidNamespaceTaskCount(view) == 3 && PidNamespaceTaskCount(nested) == 1);
     assert(PidNamespaceContains(nullptr, nested) && PidNamespaceContains(view, nested));
     assert(PidNamespaceContains(nested, nested) && !PidNamespaceContains(nested, view));
+    Process remote{};
+    remote.pid = 906; remote.tgid = init.tgid; remote.isThread = true;
+    assert(ProcessPidUnshare(&init) == 0);
+    assert(ProcessPidPrepareChild(&remote, &init, false) == -22);
+    assert(ProcessPidPrepareInjectedThread(&remote, &init) == 0);
+    assert(ProcessPidView(&remote) == view && ProcessVisibleTgid(&remote, view) == 1);
+    assert(ProcessVisibleTid(&remote, view) == 4 && ProcessPidPublish(&remote));
+    ProcessPidRelease(&remote);
+
 
     assert(ProcessPidPrepareChild(&child, &sibling, false) == 0);
     assert(PidNamespaceStopBirths(view));

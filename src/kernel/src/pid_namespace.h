@@ -22,6 +22,7 @@ void PidNamespaceRelease(const PidNamespace* view);
 // An unpublished birth owns both its active view and the initial view for its
 // future children. Publish with the scheduler registry locked.
 int ProcessPidPrepareChild(Process* child, const Process* parent, bool newNamespace);
+int ProcessPidPrepareInjectedThread(Process* child, const Process* target);
 bool ProcessPidPublish(Process* process, bool runnable = true);
 void ProcessPidRelease(Process* process);
 

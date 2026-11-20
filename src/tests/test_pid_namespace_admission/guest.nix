@@ -4,7 +4,7 @@ let
     name = "brook-pid-namespace-guest";
     src = ./guest.c;
     dontUnpack = true;
-    buildPhase = ''$CC -O2 -Wall -Wextra -Werror "$src" -o pid-namespace-guest'';
+    buildPhase = ''$CC -O2 -Wall -Wextra -Werror -I ${../../shared/inc_um} "$src" -o pid-namespace-guest'';
     installPhase = ''install -Dm755 pid-namespace-guest "$out/bin/pid-namespace-guest"'';
   };
   seccomp = import ../test_seccomp/guest.nix { inherit pkgs; };

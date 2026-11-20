@@ -3020,11 +3020,19 @@ uint32_t SchedulerTranslateProcessGroup(const Process* process, uint32_t group, 
     return result;
 }
 
+static bool SameGroup(const Process* member, const Process* target)
+{
+    const uint64_t group = target->isThread ? target->leaderIncarnation : target->incarnation;
+    return member->tgid == target->tgid &&
+        (member->isThread ? member->leaderIncarnation : member->incarnation) == group;
+}
+
 uint32_t SchedulerCollectVisibleSignalTargets(Process* caller, int32_t selector,
                                                Process** targets, uint32_t capacity)
 {
     const auto flags = SchedLockAcquire(g_allProcLock);
     const auto* view = ProcessPidView(caller);
+    const uint32_t callerGroup = ProcessVisibleGroup(caller, view, false);
     uint32_t count = 0;
     for (uint32_t i = 0; i < g_processCount && count < capacity; ++i) {
         auto* task = g_allProcesses[i];
@@ -3032,8 +3040,23 @@ uint32_t SchedulerCollectVisibleSignalTargets(Process* caller, int32_t selector,
         if (selector == -1) {
             if (task->tgid == caller->tgid || ProcessVisibleTgid(task, view) == 1) continue;
         } else if (selector == 0) {
-            if (task->pgid != caller->pgid) continue;
+            if (ProcessVisibleGroup(task, view, false) != callerGroup ||
+                (!callerGroup && task->pgid != caller->pgid)) continue;
         } else if (ProcessVisibleGroup(task, view, false) != static_cast<uint32_t>(-selector)) continue;
+        if (task->state == ProcessState::Terminated) {
+            // The leader can exit first. Signal one living sibling, if any,
+            // instead of signaling an inert zombie or losing the group.
+            const auto* leader = task;
+            task = nullptr;
+            for (uint32_t j = 0; j < g_processCount; ++j) {
+                auto* peer = g_allProcesses[j];
+                if (peer->state != ProcessState::Terminated && SameGroup(peer, leader)) {
+                    task = peer;
+                    break;
+                }
+            }
+            if (!task) continue;
+        }
         ProcessRef(task);
         targets[count++] = task;
     }
@@ -3051,12 +3074,6 @@ int SchedulerGetProcessGroup(Process* caller, uint32_t tid, bool session)
     return result;
 }
 
-static bool SameGroup(const Process* member, const Process* target)
-{
-    const uint64_t group = target->isThread ? target->leaderIncarnation : target->incarnation;
-    return member->tgid == target->tgid &&
-        (member->isThread ? member->leaderIncarnation : member->incarnation) == group;
-}
 
 int SchedulerSetProcessGroup(Process* caller, uint32_t tid, uint32_t destination)
 {
@@ -3281,12 +3298,12 @@ int ProcessSendSignalToGroup(uint16_t pgid, int signum)
 
     for (uint32_t i = 0; i < count; i++) {
         if (targets[i] == self) signalSelf = true;
-        else ProcessSendSignal(targets[i], signum);
+        else ProcessSendSignal(targets[i], signum, nullptr, self);
         ReleaseSchedulerReference(targets[i], false);
     }
     if (flags & 0x200) __asm__ volatile("sti" ::: "memory");
     SerialPrintf("SIGNAL: SendToGroup pgid=%u sig=%d -> %u procs\n", pgid, signum, count);
-    if (signalSelf) ProcessSendSignal(self, signum);
+    if (signalSelf) ProcessSendSignal(self, signum, nullptr, self);
     return static_cast<int>(count);
 }
 
