@@ -227,7 +227,13 @@ def main():
     image = output/'STORE.IMG'
     with image.open('xb') as stream:
         stream.truncate(size)
-    inodes = max(131072, size // 32768) if args.direct_ahci else 131072
+    inodes = 131072
+    if args.direct_ahci:
+        # The desktop closure can have hundreds of thousands of small files
+        # and symlinks. Leave room for later Gallery installs as well.
+        entries = 1 + sum(len(dirs) + len(files)
+                          for _, dirs, files in os.walk(seed, followlinks=False))
+        inodes = max(size // 32768, entries + max(32768, entries // 8))
     run('mke2fs', '-q', '-t', 'ext2', '-b', '4096', '-I', '128', '-m', '0',
         '-N', str(inodes), '-O', 'none,filetype,sparse_super,large_file',
         '-U', identifier, '-L', 'BRKDESKTOP', '-d', seed, image)
