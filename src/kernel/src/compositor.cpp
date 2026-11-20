@@ -12,6 +12,7 @@
 #include "desktop_pointer_route.h"
 #include "global_shortcuts.h"
 #include "compositor.h"
+#include "pid_namespace.h"
 #include "input_grab_policy.h"
 #include "../../shared/brook_debug_frame.h"
 #include "boot_logo.h"
@@ -5097,6 +5098,7 @@ uint32_t CompositorGetWindows(Process* caller, WmWindowDesc* out, uint32_t maxCo
 {
     if (!caller || !out || maxCount == 0) return 0;
 
+    const auto* view = ProcessPidView(caller);
     uint32_t written = 0;
     for (uint32_t i = 0; i < WM_MAX_WINDOWS && written < maxCount; ++i)
     {
@@ -5118,7 +5120,8 @@ uint32_t CompositorGetWindows(Process* caller, WmWindowDesc* out, uint32_t maxCo
         if (w->focusable) d.flags |= WM_DESC_FOCUSABLE;
         d.vfbStride = w->vfbStride;
         d.vfbBytes  = static_cast<uint32_t>(w->vfbBytes);
-        d.pid       = w->proc->pid;
+        const uint32_t tid = ProcessVisibleTid(w->proc, view);
+        d.pid = tid <= 0xffffu ? static_cast<uint16_t>(tid) : 0;
 
         // Copy title
         for (uint32_t t = 0; t < 63 && w->title[t]; t++)

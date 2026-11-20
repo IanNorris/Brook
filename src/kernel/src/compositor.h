@@ -302,7 +302,7 @@ struct WmWindowDesc {
     uint64_t vfbUserAddr; // user-mapped VFB address (in compositor's address space)
     uint32_t vfbStride;   // pixels per row
     uint32_t vfbBytes;    // total VFB size
-    uint16_t pid;
+    uint16_t pid;       // caller-visible TID, or zero if it cannot fit
     char     title[64];
 };
 

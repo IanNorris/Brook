@@ -106,6 +106,13 @@ bool SameOwner(const Process& proc)
     return g_pid == proc.pid && g_incarnation == proc.incarnation;
 }
 
+bool IsShellExecutable(const Process& proc)
+{
+    // QEMU's boot volume and the guarded initrd use different FAT spellings.
+    return !strcmp(proc.exePath, "/boot/CWSHELL.ELF") ||
+           !strcmp(proc.exePath, "/BOOT/CWSHELL.ELF");
+}
+
 int64_t Register(Process& proc)
 {
     {
@@ -317,6 +324,13 @@ int64_t TrayNextInput(const Process& proc, uint64_t address)
 
 } // namespace
 
+bool ShellServiceAllowsWindowCapture(const Process& proc)
+{
+    if (proc.isThread || proc.euid || proc.userNamespace || !IsShellExecutable(proc)) return false;
+    Lock lock;
+    return g_pid && SameOwner(proc);
+}
+
 const ChromeTrayState& ShellServiceTrayState() { return g_tray; }
 
 void ShellServiceQueueTrayInput(const TrayInput& input)
@@ -474,9 +488,7 @@ int64_t ShellServiceSyscallInvoke(uint64_t op, uint64_t exchange, uint64_t paylo
     const bool tray = op == uint64_t(ShellServiceOp::TrayPublish) ||
                       op == uint64_t(ShellServiceOp::TrayNextInput);
     if (tray ? proc->euid != DesktopUid : proc->euid != 0) return -1;
-    // A mounted QEMU boot volume reports /boot. The guarded initrd keeps
-    // the FAT directory's canonical /BOOT spelling in the executable path.
-    if (strcmp(proc->exePath, "/boot/CWSHELL.ELF") && strcmp(proc->exePath, "/BOOT/CWSHELL.ELF")) {
+    if (!IsShellExecutable(*proc)) {
         if (op == uint64_t(ShellServiceOp::Register))
             SerialPrintf("CLEARWATER_SHELL_REJECT pid=%u executable=%s\n", proc->pid, proc->exePath);
         return -1;

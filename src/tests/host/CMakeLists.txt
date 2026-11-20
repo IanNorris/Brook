@@ -442,6 +442,7 @@ target_compile_options(test_tcp PRIVATE
 add_host_test(test_syscall_user_memory
     "${BROOK_ROOT}/src/kernel/src/process_namespaces.cpp"
     "${BROOK_ROOT}/src/kernel/src/pid_namespace.cpp"
+    "${BROOK_ROOT}/src/kernel/src/shell_service.cpp"
     "${BROOK_ROOT}/src/tests/test_syscall_user_memory/input_wm.cpp"
     "${BROOK_ROOT}/src/tests/test_syscall_user_memory/dir_open.cpp"
     "${BROOK_ROOT}/src/tests/test_syscall_user_memory/rw.cpp"

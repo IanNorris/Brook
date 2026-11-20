@@ -10,6 +10,7 @@
 #include "compositor.h"
 #include "window.h"
 #include "desktop_identity.h"
+#include "shell_service.h"
 #include "gpu_compositor.h"
 #include "user_copy.h"
 #include "syscall_internal.h"
@@ -742,12 +743,14 @@ int64_t sys_brook_wm_scanout_flip(uint64_t minY, uint64_t maxY, uint64_t,
 int64_t sys_brook_wm_get_windows(uint64_t outAddr, uint64_t maxCount, uint64_t,
                                   uint64_t, uint64_t, uint64_t)
 {
-    if (maxCount == 0) return 0;
-    uint64_t bufSize = maxCount * sizeof(brook::WmWindowDesc);
-    if (!UserBufferWritable(outAddr, bufSize)) return -EFAULT;
     Process* proc = ProcessCurrent();
+    if (!proc || !ShellServiceAllowsWindowCapture(*proc)) return -EPERM;
+    if (!maxCount) return 0;
+    KernelOperationGuard operation(proc);
+    const uint32_t limit = maxCount > WM_MAX_WINDOWS ? WM_MAX_WINDOWS : static_cast<uint32_t>(maxCount);
+    if (!UserBufferWritable(outAddr, uint64_t(limit) * sizeof(brook::WmWindowDesc))) return -EFAULT;
     auto* out = reinterpret_cast<brook::WmWindowDesc*>(outAddr);
-    return static_cast<int64_t>(brook::CompositorGetWindows(proc, out, static_cast<uint32_t>(maxCount)));
+    return static_cast<int64_t>(brook::CompositorGetWindows(proc, out, limit));
 }
 
 // ---------------------------------------------------------------------------
@@ -757,6 +760,9 @@ int64_t sys_brook_wm_map_window_vfb(uint64_t wmId, uint64_t, uint64_t,
                                      uint64_t, uint64_t, uint64_t)
 {
     Process* proc = ProcessCurrent();
+    if (!proc || !ShellServiceAllowsWindowCapture(*proc)) return -EPERM;
+    if (!wmId || wmId > 0xffffffffULL) return -ENOENT;
+    KernelOperationGuard operation(proc);
     uint64_t addr = brook::CompositorMapWindowVfb(proc, static_cast<uint32_t>(wmId));
     return addr ? static_cast<int64_t>(addr) : -ENOENT;
 }
