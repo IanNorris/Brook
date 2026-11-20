@@ -17,9 +17,11 @@ class Bridge:
         self.calls=[];self.tx=None;self.newboot=False;self.activated=False;self.job_polls=0
         self.reset=True;self.stale=False;self.boot_changes=True;self.payload='candidate';self.mismatch=False;self.missing_commit=False
         self.blocked=None
+        self.bootstrap_caps={'boot_id':'a'*32,'ac_shutdown_record':None,'bulk_helper_api':1,
+            'writable_desktop':{'ready':True,'source_pinned':True}}
     def load_session(self,session):return {'guest_boot_id':'a'*32,'host':'192.0.2.1','port':1234}
     def doctor(self,session):return {'probe_stage':'verified','reachable':True,'identity_matches':not (self.stale or self.newboot),
-        'capabilities':{'power':{'reset':self.reset}}}
+        'capabilities':{'power':{'reset':self.reset}},'guest':self.bootstrap_caps}
     def guest_run(self,session,ident,argv,**kwargs):
         self.calls.append(('run',session,ident,argv))
         if session=='original':self.tx=ident
@@ -81,6 +83,83 @@ class Tests(unittest.TestCase):
                     'original',self.key,self.kernel,self.initrd,True,helper='system')
         self.assertFalse(self.bridge.activated)
         self.assertEqual(self.receipt()['last_stage'],'receiver_launch_dispatched')
+    def bootstrap(self,*,activate=True,helper='system',probe_failure=None,receiver_failure=None):
+        receiver=[]
+        def job(session,ident,**kwargs):
+            if ident!=self.bridge.tx:
+                raise AssertionError('Unknown registered job')
+            if ident==receiver[0]:
+                if self.bridge.activated:
+                    return {'state':'completed','exit':{'code':0},'stdout':{'text':
+                        f'HWUPDATE_ACTIVATED generation=2 slot=1 transaction={ident} reboot_required=1\n'}}
+                result={'session':session,'guest_boot_id':'a'*32,'operation_id':ident,'state':'running',
+                        'guest':{'pid':30,'incarnation':31,'leader_exited':False},
+                        'stdout':{'text':'HWUPDATE_LISTENING port=1235 maintenance_only=1\n'}}
+                if not kwargs.get('wait_s'):
+                    if receiver_failure=='exited':result['state']='completed'
+                    if receiver_failure=='changed':result['guest']['incarnation']=99
+                return result
+            result={'session':session,'guest_boot_id':'a'*32,'operation_id':ident,
+                    'state':'completed','exit':{'code':0},
+                    'stdout':{'text':'BROOK_SLOT_BOOTSTRAP_JOURNAL_ABSENT\n','eof':True,'gaps':[]}}
+            if probe_failure=='present':result['exit']['code']=4
+            if probe_failure=='unknown':result['exit']['code']=5
+            if probe_failure=='missing_mount':result['exit']['code']=2
+            if probe_failure=='missing_lock':result['exit']['code']=3
+            if probe_failure=='boot_changed':result['guest_boot_id']='b'*32
+            if probe_failure=='status_gap':result['stdout']['gaps']=[{'from':0,'to':5}]
+            if probe_failure=='partial':result['stdout']['eof']=False
+            if probe_failure=='bad_proof':result['stdout']['text']='maybe absent\n'
+            self.bridge.tx=receiver[0]
+            return result
+        original=self.bridge.guest_run
+        def launch(session,ident,argv,**kwargs):
+            if not receiver:receiver.append(ident)
+            self.assertEqual(kwargs['uid'],0)
+            return original(session,ident,argv,**kwargs)
+        run=UpdateRun(self.bridge,self.output,self.uploader,self.clock.time,self.clock.sleep)
+        with patch.object(self.bridge,'guest_run',side_effect=launch),patch.object(self.bridge,'job',side_effect=job), \
+                patch.object(run,'stage_bootstrap_probe',return_value='/data/.brook-transfer/'+'d'*32+'.bin'):
+            return run.execute('original',self.key,self.kernel,self.initrd,activate,helper=helper,bootstrap_legacy_system=True)
+
+    def test_explicit_legacy_bootstrap_requires_live_proof_then_activates(self):
+        result=self.bootstrap()
+        launched=[x for x in self.bridge.calls if x[0]=='run']
+        self.assertEqual(len(launched),2)
+        self.assertEqual(launched[0][3],['/boot/HWUPSYS.ELF','a'*32,launched[0][2]])
+        self.assertEqual(launched[1][3],['/data/.brook-transfer/'+'d'*32+'.bin'])
+        self.assertEqual(result['state'],'activated')
+
+    def test_legacy_bootstrap_never_activates_without_current_boot_absence(self):
+        for fault in ('present','unknown','missing_mount','missing_lock','boot_changed','status_gap','partial','bad_proof'):
+            with self.subTest(fault=fault),self.assertRaisesRegex(RuntimeError,'requires proven absence'):
+                self.output=self.root/fault;self.bootstrap(probe_failure=fault)
+            self.assertFalse(self.bridge.activated)
+            self.assertEqual(self.receipt()['last_stage'],'bootstrap_journal_check')
+
+    def test_legacy_bootstrap_refuses_a_receiver_that_died_or_changed(self):
+        for fault in ('changed','exited'):
+            with self.subTest(fault=fault),self.assertRaisesRegex(RuntimeError,'legacy updater'):
+                self.output=self.root/fault;self.bootstrap(receiver_failure=fault)
+            self.assertFalse(self.bridge.activated)
+
+    def test_legacy_bootstrap_requires_protected_guarded_boot_before_staging(self):
+        original=self.bridge.bootstrap_caps
+        for field,value in (('boot_id','b'*32),('ac_shutdown_record','remove'),
+                            ('bulk_helper_api',0),('recovery_only',True),('writable_desktop',{})):
+            self.bridge.bootstrap_caps=dict(original)
+            if value=='remove':del self.bridge.bootstrap_caps[field]
+            else:self.bridge.bootstrap_caps[field]=value
+            with self.subTest(field=field),self.assertRaisesRegex(RuntimeError,'protected boot RAM'):
+                self.bootstrap()
+            self.assertEqual(self.bridge.calls,[])
+            self.assertFalse(self.output.exists())
+
+    def test_override_does_not_apply_to_usb_or_staging_only(self):
+        for option in ({'activate':False},{'helper':'usb'}):
+            with self.assertRaises(ValueError):self.bootstrap(**option)
+        self.assertEqual(self.bridge.calls,[])
+
     def test_invalid_pacing_prevents_launch(self):
         for rate in (0,-1,True,1<<31):
             with self.subTest(rate=rate),self.assertRaises(ValueError):
