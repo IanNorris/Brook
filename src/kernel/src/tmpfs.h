@@ -35,6 +35,9 @@ int TmpfsDestroy(Tmpfs *);
 // Boot-only device directory (devtmpfs equivalent): root-owned 0755, reports
 // nosuid, and is the only kind of instance that accepts character devices.
 Tmpfs *TmpfsCreateDeviceDirectory(int *error, uint64_t byteLimit = 64 * 1024);
+// Private device tree metadata. PTY endpoint allocation is a separate driver.
+Tmpfs *TmpfsCreatePtyDirectory(uint32_t uid,uint32_t gid,UserNamespace* owner,
+                              uint16_t ptmxMode,int* error);
 // Kernel seeding of one root entry before the instance is mounted: a
 // directory, a character device (mode S_IFCHR|perm, Linux-encoded rdev) or a
 // symlink (target). Userspace mknod remains FIFO-only.

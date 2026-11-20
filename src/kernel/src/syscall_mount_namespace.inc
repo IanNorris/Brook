@@ -15,6 +15,8 @@ int64_t sys_mount(uint64_t sourceAddr,uint64_t targetAddr,uint64_t fsAddr,
     if(!bindMount && !privatePropagation && !newMount && !remount)return -EINVAL;
     bool procMount=false;
     bool memoryMount=false;
+    bool ptyMount=false;
+    uint16_t ptmxMode=0;
     TmpfsMountOptions memoryOptions{};
     if(newMount) {
         char fsType[32],data[256]{};
@@ -22,12 +24,16 @@ int64_t sys_mount(uint64_t sourceAddr,uint64_t targetAddr,uint64_t fsAddr,
         if(dataAddr && !CopyUserCString(dataAddr,data,sizeof(data)))return -EFAULT;
         procMount=StrEq(fsType,"proc");
         memoryMount=StrEq(fsType,"tmpfs");
+        ptyMount=StrEq(fsType,"devpts");
         if(procMount && data[0])return -EINVAL;
         if(memoryMount) {
             if((flags&~Silent)!=(MountNoDev|MountNoSuid))return -EINVAL;
             if(int error=ParseTmpfsMountOptions(data,&memoryOptions))return error;
         }
-        if(!procMount && !memoryMount)return -ENODEV;
+        if(ptyMount) {
+            if(int error=ParseDevptsOptions(data,&ptmxMode))return error;
+        }
+        if(!procMount && !memoryMount && !ptyMount)return -ENODEV;
     }
     auto* process=ProcessCurrent();if(!process)return -EPERM;
     char source[512],target[512];
@@ -49,15 +55,21 @@ int64_t sys_mount(uint64_t sourceAddr,uint64_t targetAddr,uint64_t fsAddr,
         if(!error)error=ProcFsMountPrivate(lookup.fs.mountNamespace,targetPath,flags&MountRestrictionMask);
         VfsPathRelease(targetPath);return error;
     }
-    if(memoryMount) {
+    if(memoryMount || ptyMount) {
         VfsPath targetPath{};int error=VfsPathResolve(lookup.fs.root,lookup.fs.cwd,target,&targetPath);
         if(!error) {
             auto* fsOwner=ProcessUserNamespaceAcquire(process);
-            auto* instance=TmpfsCreate(ProcessReadIds(process,false).effective,
-                ProcessReadIds(process,true).effective,fsOwner,6,&error,memoryOptions.mode,memoryOptions.bytes);
+            const auto uid=ProcessReadIds(process,false).effective;
+            const auto gid=ProcessReadIds(process,true).effective;
+            const auto attributes=ptyMount ?
+                ((flags&MountRestrictionMask)|MountReadOnly|MountNoSuid|MountNoExec) :
+                MountNoSuid|MountNoDev;
+            auto* instance=ptyMount ? TmpfsCreatePtyDirectory(uid,gid,fsOwner,ptmxMode,&error) :
+                TmpfsCreate(uid,gid,fsOwner,attributes,&error,memoryOptions.mode,memoryOptions.bytes);
             UserNamespaceRelease(fsOwner);
             if(instance) {
-                error=VfsMountNamespaceMountFresh(lookup.fs.mountNamespace,targetPath,"tmpfs",TmpfsOperations(),instance,0,6);
+                error=VfsMountNamespaceMountFresh(lookup.fs.mountNamespace,targetPath,
+                    ptyMount ? "devpts" : "tmpfs",TmpfsOperations(),instance,0,attributes);
                 if(error)TmpfsDestroy(instance);
             }
         }

@@ -629,6 +629,8 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     brook::VfsInit();
     if(!brook::VfsRegisterFs("tmpfs",brook::TmpfsOperations()))
         KernelPanic("tmpfs registration failed");
+    if(!brook::VfsRegisterFs("devpts",brook::TmpfsOperations()))
+        brook::SerialPuts("VFS: devpts registration failed\n");
     brook::FatFsVfsRegister();   // register "fatfs" filesystem driver
     brook::Ext2VfsRegister();    // register "ext2" filesystem driver
     brook::CompressedVfsRegister();

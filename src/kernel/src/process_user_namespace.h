@@ -8,7 +8,8 @@ bool ProcessCanSignal(Process* sender,Process* target);
 bool ProcessCanPtraceRead(Process* viewer,Process* target);
 void ProcessSignalInfoToUser(Process* viewer,SignalInfo* info);
 UserNamespace* ProcessUserNamespaceAcquire(Process* process);
-int ProcessUserNamespaceCreate(Process* unpublishedChild);
+// Caller owns the unpublished child or is changing its own single-threaded task.
+int ProcessUserNamespaceCreate(Process* task);
 bool ProcessCapable(Process* process,UserNamespace* target,unsigned capability);
 // Scalar socket metadata only; grants no memory, directory, or FD-open capability.
 struct SocketIdentity;

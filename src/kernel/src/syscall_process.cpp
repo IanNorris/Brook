@@ -363,9 +363,23 @@ int64_t sys_vfork(uint64_t, uint64_t, uint64_t,
 int64_t sys_unshare(uint64_t flags,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t)
 {
     if(!flags)return 0;
-    if(flags&~CloneNewRuntimeNamespaces)return -EINVAL;
+    constexpr uint64_t CloneNewUser=0x10000000;
+    if(flags!=CloneNewUser && (flags&~CloneNewRuntimeNamespaces))return -EINVAL;
     auto* process=ProcessCurrent();
     if(!process)return -ESRCH;
+    if(flags==CloneNewUser) {
+        // Only the running task can create a peer in a single-threaded group.
+        // Copy CLONE_FS state before gaining authority in the child namespace.
+        if(process->isThread || __atomic_load_n(&process->asLiveThreads,__ATOMIC_ACQUIRE))
+            return -EINVAL;
+        int error=0;
+        auto* context=ProcessFsCopy(process,&error);
+        if(!context)return error;
+        error=ProcessUserNamespaceCreate(process);
+        if(error)FsContextRelease(context);
+        else ProcessFsReplaceOwned(process,context);
+        return error;
+    }
     auto* owner=ProcessUserNamespaceAcquire(process);
     const bool allowed=ProcessCapable(process,owner,CapSysAdmin);
     UserNamespaceRelease(owner);

@@ -64,8 +64,9 @@ struct Tmpfs
     Node *root = nullptr;
     uint64_t device = 0, nextInode = 1, bytes = 0, inodes = 0;
     uint64_t flags = 0;
+    uint64_t magic = 0x01021994;
     uint64_t byteLimit = TmpfsDefaultBytes;
-    // Boot device directory only: may hold kernel-seeded character devices.
+    // Device directories may hold kernel-seeded character devices.
     bool devices = false;
 };
 namespace
@@ -752,7 +753,7 @@ int Space(Vnode *vn, VfsSpace *out)
     auto *fs = VnodeNode(vn)->fs;
     auto irq = IrqSpinLockAcquire(&budgetLock);
     *out = {};
-    out->type = 0x01021994;
+    out->type = fs->magic;
     out->blockSize = out->fragmentSize = 4096;
     out->blocks = fs->byteLimit / 4096;
     const uint64_t instanceFree=fs->byteLimit-fs->bytes;
@@ -1402,6 +1403,20 @@ Tmpfs *TmpfsCreateDeviceDirectory(int *error, uint64_t byteLimit)
     }
     return fs;
 }
+Tmpfs *TmpfsCreatePtyDirectory(uint32_t uid,uint32_t gid,UserNamespace* owner,
+                              uint16_t ptmxMode,int* error)
+{
+    auto* fs=TmpfsCreate(uid,gid,owner,6,error,0555,64*1024);
+    if(!fs)return nullptr;
+    fs->devices=true;
+    fs->magic=0x1cd1; // DEVPTS_SUPER_MAGIC
+    fs->flags=1|2|8; // read-only metadata, nosuid, noexec
+    // The node has the Linux device identity and permissions. Opening it
+    // reports ENXIO until a PTY endpoint allocator is registered.
+    *error=TmpfsSeedEntry(fs,"ptmx",0020000|ptmxMode,0x0502);
+    if(!*error)return fs;
+    TmpfsDestroy(fs);return nullptr;
+}
 int TmpfsSeedEntry(Tmpfs *fs, const char *name, uint16_t mode, uint64_t rdev, const char *target)
 {
     if (!fs || !name)
@@ -1420,7 +1435,7 @@ int TmpfsSeedEntry(Tmpfs *fs, const char *name, uint16_t mode, uint64_t rdev, co
     auto *parent = fs->root;
     if (*Find(parent, name))
         return -17;
-    auto *n = NewNode(fs, type == Link ? uint16_t(Link | 0777) : mode, 0, 0);
+    auto *n = NewNode(fs, type == Link ? uint16_t(Link | 0777) : mode, parent->uid, parent->gid);
     if (!n)
         return -28;
     if (type == Link)
