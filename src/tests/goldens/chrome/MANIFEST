@@ -1,6 +1,6 @@
 # name FNV-1a of the ARGB buffer (alpha included); see test_chrome_goldens.
 amber-glass-100-app-notification 2d833a8f3bc8feb2
-amber-glass-100-app-tray c31f5f7cdd36f238
+amber-glass-100-app-tray ca2a03effefdaba0
 amber-glass-100-app-tray-menu 6cac189da0a5f86d
 amber-glass-100-boot-summary efbc34775d0fd6e8
 amber-glass-100-frame-active afc7a343969cb948
@@ -36,7 +36,7 @@ amber-glass-100-temperature-flyout 0f66619a53e7898a
 amber-glass-100-tooltip 38846f3554215082
 amber-glass-100-volume-popup 486fa5ecb55977ce
 glass-100-app-notification 52e6c96a89c9b1e9
-glass-100-app-tray 9d77015d2b660339
+glass-100-app-tray a6f4bebb7dfa8885
 glass-100-app-tray-menu fde7d2ad58a38a92
 glass-100-boot-summary 0657a14d812bf63e
 glass-100-dock-open df091a9e5c939619
@@ -79,7 +79,7 @@ glass-100-web-app-frame 4a36933b8096855c
 glass-100-web-app-taskbar 6295788d5690a3b3
 glass-100-web-app-tooltip 05b297fc72899944
 glass-150-app-notification 37c361f8361fa7f1
-glass-150-app-tray d36faf144ff85254
+glass-150-app-tray a93aee42ae6aa2cb
 glass-150-app-tray-menu b6189cafac829e46
 glass-150-boot-summary 2f19d227b2a6f2ac
 glass-150-frame-active 45075958b9ed5dee
@@ -115,7 +115,7 @@ glass-150-temperature-flyout c90474d403a8f3e1
 glass-150-tooltip e93383b7e8e2b996
 glass-150-volume-popup f934f17e6117a2d3
 glass-200-app-notification 017c3a6ad13d650e
-glass-200-app-tray ba64f70b960adb33
+glass-200-app-tray 9a40919119e52617
 glass-200-app-tray-menu e6aa667e6e72448c
 glass-200-boot-summary a6e1a6599b86b1c0
 glass-200-dock-open 2a9d42c9f2f3a394
@@ -155,7 +155,7 @@ glass-200-temperature-flyout cd8dd1b9367341da
 glass-200-tooltip d617b666175e97bd
 glass-200-volume-popup deb49343c98a3c39
 glass-dark-100-app-notification 52e6c96a89c9b1e9
-glass-dark-100-app-tray 9d77015d2b660339
+glass-dark-100-app-tray a6f4bebb7dfa8885
 glass-dark-100-app-tray-menu fde7d2ad58a38a92
 glass-dark-100-boot-summary 0657a14d812bf63e
 glass-dark-100-frame-active ab09db2a6bc1a8c6
@@ -191,7 +191,7 @@ glass-dark-100-temperature-flyout b651ad3d0338a9e0
 glass-dark-100-tooltip 3228e779ea27b7b8
 glass-dark-100-volume-popup a18c5753b421e7ec
 glass-dark-150-app-notification 37c361f8361fa7f1
-glass-dark-150-app-tray d36faf144ff85254
+glass-dark-150-app-tray a93aee42ae6aa2cb
 glass-dark-150-app-tray-menu b6189cafac829e46
 glass-dark-150-boot-summary 2f19d227b2a6f2ac
 glass-dark-150-frame-active 45075958b9ed5dee
@@ -227,7 +227,7 @@ glass-dark-150-temperature-flyout c90474d403a8f3e1
 glass-dark-150-tooltip e93383b7e8e2b996
 glass-dark-150-volume-popup f934f17e6117a2d3
 glass-dark-200-app-notification 017c3a6ad13d650e
-glass-dark-200-app-tray ba64f70b960adb33
+glass-dark-200-app-tray 9a40919119e52617
 glass-dark-200-app-tray-menu e6aa667e6e72448c
 glass-dark-200-boot-summary a6e1a6599b86b1c0
 glass-dark-200-frame-active dfad8058208d418e
@@ -263,7 +263,7 @@ glass-dark-200-temperature-flyout cd8dd1b9367341da
 glass-dark-200-tooltip d617b666175e97bd
 glass-dark-200-volume-popup deb49343c98a3c39
 glass-light-100-app-notification 63f7ecdd41953532
-glass-light-100-app-tray 3889e73bd3953fce
+glass-light-100-app-tray 2b38cc065876f356
 glass-light-100-app-tray-menu 556963f27fcce92a
 glass-light-100-boot-summary 98556c961289eea3
 glass-light-100-frame-active dd89d7ba3cb95f54
@@ -299,7 +299,7 @@ glass-light-100-temperature-flyout d646402c593e9847
 glass-light-100-tooltip 689874fad5388a3a
 glass-light-100-volume-popup b338025c9cc0eff2
 glass-light-150-app-notification c8f0c485dea4c3db
-glass-light-150-app-tray 0d46b14861a5ed92
+glass-light-150-app-tray 9e0281da42b12b59
 glass-light-150-app-tray-menu 68268c2d15470ea9
 glass-light-150-boot-summary 8b16cd4f7b822a3a
 glass-light-150-frame-active 540d3c2d2222ac9e
@@ -335,7 +335,7 @@ glass-light-150-temperature-flyout 7ba9682d877cdecb
 glass-light-150-tooltip 70d786d3043ff9d5
 glass-light-150-volume-popup c167df2bb7bc6644
 glass-light-200-app-notification 13495f7e724a3e68
-glass-light-200-app-tray f5f8edd5b6498321
+glass-light-200-app-tray a4e6290d557a4ff5
 glass-light-200-app-tray-menu da5d55b761cd164c
 glass-light-200-boot-summary 083b1c274fd0193b
 glass-light-200-frame-active c95213735ebf304a
@@ -371,7 +371,7 @@ glass-light-200-temperature-flyout 558f7e0bca752c28
 glass-light-200-tooltip f8b9a50b422bc11e
 glass-light-200-volume-popup 37d37491fd96eb69
 magenta-glass-dark-100-app-notification 97ec21623a54e847
-magenta-glass-dark-100-app-tray ca51d5592b51bd5e
+magenta-glass-dark-100-app-tray 7f2f1fdc78529bc6
 magenta-glass-dark-100-app-tray-menu 9c8277008080690a
 magenta-glass-dark-100-boot-summary 3461fbc7c3a12356
 magenta-glass-dark-100-frame-active 4164a2088072e9c4
@@ -407,7 +407,7 @@ magenta-glass-dark-100-temperature-flyout 1db33d4fb6347d3d
 magenta-glass-dark-100-tooltip 8c25280c6ff27806
 magenta-glass-dark-100-volume-popup 75ecbf18909b7241
 magenta-glass-light-100-app-notification 4ae9cfb403a4fbed
-magenta-glass-light-100-app-tray b648383cb0a26f55
+magenta-glass-light-100-app-tray fc317b08c7619651
 magenta-glass-light-100-app-tray-menu 081084ca98256223
 magenta-glass-light-100-boot-summary e8f247fd2e6a7020
 magenta-glass-light-100-frame-active 66db990073be8de2
@@ -443,7 +443,7 @@ magenta-glass-light-100-temperature-flyout 545e8be47cff72e5
 magenta-glass-light-100-tooltip 7088cbb2741cb451
 magenta-glass-light-100-volume-popup 6964f35caed01a6c
 magenta-glass-mixed-100-app-notification 97ec21623a54e847
-magenta-glass-mixed-100-app-tray ca51d5592b51bd5e
+magenta-glass-mixed-100-app-tray 7f2f1fdc78529bc6
 magenta-glass-mixed-100-app-tray-menu 9c8277008080690a
 magenta-glass-mixed-100-boot-summary 3461fbc7c3a12356
 magenta-glass-mixed-100-frame-active 4164a2088072e9c4
@@ -479,7 +479,7 @@ magenta-glass-mixed-100-temperature-flyout 1db33d4fb6347d3d
 magenta-glass-mixed-100-tooltip 8c25280c6ff27806
 magenta-glass-mixed-100-volume-popup 75ecbf18909b7241
 magenta-opaque-dark-100-app-notification 3b1cc57556fa98a1
-magenta-opaque-dark-100-app-tray 5364c4f8f19ffeb8
+magenta-opaque-dark-100-app-tray 7f9e9e2fab4ac0cc
 magenta-opaque-dark-100-app-tray-menu 32d6c25ba3740ef6
 magenta-opaque-dark-100-boot-summary d9add830cc6c0399
 magenta-opaque-dark-100-frame-active e72af890079fbde5
@@ -515,7 +515,7 @@ magenta-opaque-dark-100-temperature-flyout 1c25a6891a12d6b3
 magenta-opaque-dark-100-tooltip 3c96dd4d9ff1266a
 magenta-opaque-dark-100-volume-popup 7cd0e9ac2db78d09
 magenta-opaque-light-100-app-notification 544ef427d34545e1
-magenta-opaque-light-100-app-tray d455992197fdb46e
+magenta-opaque-light-100-app-tray 9dac99b84c692602
 magenta-opaque-light-100-app-tray-menu 022d5e5e5f537be5
 magenta-opaque-light-100-boot-summary 745a84adefe136d8
 magenta-opaque-light-100-frame-active 017ef1a629c322d0
@@ -551,7 +551,7 @@ magenta-opaque-light-100-temperature-flyout e7b7b448d6e31e3f
 magenta-opaque-light-100-tooltip cfd58dda421b23c2
 magenta-opaque-light-100-volume-popup b6c28bb38e0e240a
 magenta-opaque-mixed-100-app-notification 3b1cc57556fa98a1
-magenta-opaque-mixed-100-app-tray 5364c4f8f19ffeb8
+magenta-opaque-mixed-100-app-tray 7f9e9e2fab4ac0cc
 magenta-opaque-mixed-100-app-tray-menu 32d6c25ba3740ef6
 magenta-opaque-mixed-100-boot-summary d9add830cc6c0399
 magenta-opaque-mixed-100-frame-active e72af890079fbde5
@@ -587,7 +587,7 @@ magenta-opaque-mixed-100-temperature-flyout 1c25a6891a12d6b3
 magenta-opaque-mixed-100-tooltip 3c96dd4d9ff1266a
 magenta-opaque-mixed-100-volume-popup 7cd0e9ac2db78d09
 opaque-dark-100-app-notification 5737a702b049176f
-opaque-dark-100-app-tray a11fa2c0a673be7b
+opaque-dark-100-app-tray 897ff180c28b10e7
 opaque-dark-100-app-tray-menu 3688915e33d4a533
 opaque-dark-100-boot-summary 0d46d90fb3fe3d65
 opaque-dark-100-dock-open dd7016ed29cf8daf
@@ -627,7 +627,7 @@ opaque-dark-100-temperature-flyout a74aebd03b125c7a
 opaque-dark-100-tooltip fc95a69ea60c32aa
 opaque-dark-100-volume-popup 6a9f2db8168bf788
 opaque-dark-150-app-notification af593fec0fcc6e10
-opaque-dark-150-app-tray f5ba9595e0fb03cf
+opaque-dark-150-app-tray 7fe49b225b6f1b78
 opaque-dark-150-app-tray-menu 9dfdec46e84d2208
 opaque-dark-150-boot-summary 91994c1cc2063531
 opaque-dark-150-frame-active ff6bcf4127ed43af
@@ -663,7 +663,7 @@ opaque-dark-150-temperature-flyout 10b617be72ab289d
 opaque-dark-150-tooltip 57eb44c7f7ba85a0
 opaque-dark-150-volume-popup 5d82d599bd0558ed
 opaque-dark-200-app-notification 049602cff51c9ee6
-opaque-dark-200-app-tray 19cc4d1f638c157c
+opaque-dark-200-app-tray fc5f7525e32535fc
 opaque-dark-200-app-tray-menu 2faa067f6a496911
 opaque-dark-200-boot-summary 8803b811dd2e81e8
 opaque-dark-200-frame-active f69e1d0cb8e7695e
@@ -699,7 +699,7 @@ opaque-dark-200-temperature-flyout 1f206bee9b888ce0
 opaque-dark-200-tooltip 9500febdbd7d5d0f
 opaque-dark-200-volume-popup ad7b9a712db79da2
 opaque-light-100-app-notification 0f09a0c9e7314da7
-opaque-light-100-app-tray 786257637e0f7347
+opaque-light-100-app-tray 8dea24f64bffd11b
 opaque-light-100-app-tray-menu c25bfed574d80854
 opaque-light-100-boot-summary c0f8c8d5e7f0238f
 opaque-light-100-frame-active dc8153b13678ddb8
@@ -735,7 +735,7 @@ opaque-light-100-temperature-flyout 8c8054cc38795d0a
 opaque-light-100-tooltip 9daba30a3c9d40b5
 opaque-light-100-volume-popup 52756c7fbef5a9b4
 opaque-light-150-app-notification 91501b4e7e6cdb37
-opaque-light-150-app-tray 446288af0a713815
+opaque-light-150-app-tray c7c9e3147a26b32a
 opaque-light-150-app-tray-menu 40dd888171ca17df
 opaque-light-150-boot-summary 6469599399781e5c
 opaque-light-150-frame-active 0df3643c6fe10dfe
@@ -771,7 +771,7 @@ opaque-light-150-temperature-flyout c5e6a734683346a5
 opaque-light-150-tooltip c5d15451dac927a8
 opaque-light-150-volume-popup 9b504432a5c9b549
 opaque-light-200-app-notification 61fb5a4ecb25d4e7
-opaque-light-200-app-tray 26a47a491d43e2b3
+opaque-light-200-app-tray c82e9f64671c537b
 opaque-light-200-app-tray-menu ea2de2a23db5bc77
 opaque-light-200-boot-summary afc7323c98aab486
 opaque-light-200-frame-active d83b36a87f302744
@@ -807,7 +807,7 @@ opaque-light-200-temperature-flyout fa39dac0cd75f6f8
 opaque-light-200-tooltip aa64fc12113e675b
 opaque-light-200-volume-popup 2bb05086ccdda5a5
 opaque-mixed-100-app-notification 5737a702b049176f
-opaque-mixed-100-app-tray a11fa2c0a673be7b
+opaque-mixed-100-app-tray 897ff180c28b10e7
 opaque-mixed-100-app-tray-menu 3688915e33d4a533
 opaque-mixed-100-boot-summary 0d46d90fb3fe3d65
 opaque-mixed-100-frame-active 52c08f39446d876e
@@ -846,7 +846,7 @@ opaque-mixed-100-web-app-frame b17a4f8dbe2a4117
 opaque-mixed-100-web-app-taskbar 6fcde7fad411b61b
 opaque-mixed-100-web-app-tooltip 787c9d2d61254458
 opaque-mixed-150-app-notification af593fec0fcc6e10
-opaque-mixed-150-app-tray f5ba9595e0fb03cf
+opaque-mixed-150-app-tray 7fe49b225b6f1b78
 opaque-mixed-150-app-tray-menu 9dfdec46e84d2208
 opaque-mixed-150-boot-summary 91994c1cc2063531
 opaque-mixed-150-frame-active ff6bcf4127ed43af
@@ -882,7 +882,7 @@ opaque-mixed-150-temperature-flyout 10b617be72ab289d
 opaque-mixed-150-tooltip 57eb44c7f7ba85a0
 opaque-mixed-150-volume-popup 5d82d599bd0558ed
 opaque-mixed-200-app-notification 049602cff51c9ee6
-opaque-mixed-200-app-tray 19cc4d1f638c157c
+opaque-mixed-200-app-tray fc5f7525e32535fc
 opaque-mixed-200-app-tray-menu 2faa067f6a496911
 opaque-mixed-200-boot-summary 8803b811dd2e81e8
 opaque-mixed-200-frame-active f69e1d0cb8e7695e
@@ -918,7 +918,7 @@ opaque-mixed-200-temperature-flyout 1f206bee9b888ce0
 opaque-mixed-200-tooltip 9500febdbd7d5d0f
 opaque-mixed-200-volume-popup ad7b9a712db79da2
 teal-opaque-light-100-app-notification ddc9d9b9707eee46
-teal-opaque-light-100-app-tray 689fcd8913a095fb
+teal-opaque-light-100-app-tray cbeb066836d6e593
 teal-opaque-light-100-app-tray-menu f14e95f06b6b3544
 teal-opaque-light-100-boot-summary c49baf981ea1a358
 teal-opaque-light-100-frame-active ea27de099803b8ad
