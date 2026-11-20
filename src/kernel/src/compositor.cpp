@@ -3392,11 +3392,6 @@ static void CompositorHandleMouseWM()
             // "Apps" button — toggle launcher
             WmLauncherToggle();
         }
-        else if (tbIdx == -2)
-        {
-            // "+" button — spawn new terminal
-            WmSpawnTerminal();
-        }
         else if (tbIdx <= -10)
         {
             WmTaskbarPendingClick(tbIdx);

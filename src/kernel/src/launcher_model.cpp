@@ -95,8 +95,89 @@ private:
 
 } // namespace
 
+static bool ValidTaskbarKey(const char* key)
+{
+    if (!key || !*key) return false;
+    unsigned length = 0;
+    for (; *key; ++key, ++length) {
+        const unsigned c = static_cast<unsigned char>(*key);
+        if (length + 1 >= LauncherLimits::KeyLength || c < 32 || c == 127 || c == ',') return false;
+    }
+    return true;
+}
+
+int TaskbarPins::Find(const char* key) const
+{
+    if (key)
+        for (unsigned i = 0; i < count_; ++i)
+            if (Equal(keys_[i], key)) return int(i);
+    return -1;
+}
+
+bool TaskbarPins::Toggle(const char* key)
+{
+    if (!ValidTaskbarKey(key)) return false;
+    const int existing = Find(key);
+    if (existing >= 0) {
+        --count_;
+        for (unsigned i = unsigned(existing); i < count_; ++i)
+            Copy(keys_[i], keys_[i + 1], sizeof(keys_[i]));
+        keys_[count_][0] = 0;
+        return true;
+    }
+    if (count_ == Capacity) return false;
+    Copy(keys_[count_++], key, LauncherLimits::KeyLength);
+    return true;
+}
+
+void TaskbarPins::SetDefault()
+{
+    *this = {};
+    Toggle(TerminalAppKey);
+}
+
+bool TaskbarPins::Parse(const char* text)
+{
+    constexpr char header[] = "[Taskbar]\nversion=1\npinned=";
+    if (!text) return false;
+    for (unsigned i = 0; i + 1 < sizeof(header); ++i)
+        if (!text[i] || text[i] != header[i]) return false;
+    TaskbarPins parsed{};
+    const char* p = text + sizeof(header) - 1;
+    if (*p != '\n') {
+        for (;;) {
+            char key[LauncherLimits::KeyLength];
+            unsigned length = 0;
+            while (*p && *p != '\n' && *p != ',') {
+                if (length + 1 == sizeof(key)) return false;
+                key[length++] = *p++;
+            }
+            key[length] = 0;
+            if (!ValidTaskbarKey(key) || parsed.Find(key) >= 0 || !parsed.Toggle(key)) return false;
+            if (*p != ',') break;
+            ++p;
+        }
+    }
+    if (*p != '\n' || p[1]) return false;
+    *this = parsed;
+    return true;
+}
+
+uint32_t TaskbarPins::Serialize(char* out, uint32_t capacity) const
+{
+    Writer writer(out, capacity);
+    writer.Put("[Taskbar]\nversion=1\npinned=");
+    for (unsigned i = 0; i < count_; ++i) {
+        if (i) writer.Char(',');
+        writer.Put(keys_[i]);
+    }
+    writer.Char('\n');
+    return writer.Finish();
+}
+
 void LauncherModel::Init() {
     appCount_ = keyCount_ = 0;
+    taskbarPins_ = {};
     layoutEpoch_ = editEpoch_ = 0;
     undoVisible_ = false;
     lastEdit_ = LauncherEdit::None;
@@ -175,7 +256,7 @@ void LauncherModel::SetCatalog(const LauncherApp* apps, uint32_t count) {
     for (uint32_t i = 0; sameKeys && i < count; ++i) {
         char key[LL::KeyLength];
         Copy(key, apps[i].key, sizeof(key));
-        sameKeys = Equal(apps_[i].key, key);
+        sameKeys = Equal(apps_[i].key, key) && Equal(apps_[i].taskbarKey, apps[i].taskbarKey);
     }
     // A routine refresh replaces metadata without moving any app indices.
     // A different key order invalidates the open view's indexed actions.
@@ -1158,6 +1239,20 @@ void LauncherModel::Open() {
     CancelPointer();
 }
 
+int LauncherModel::FindTaskbarApp(const char* key) const
+{
+    if (!key || !*key) return -1;
+    for (unsigned i = 0; i < appCount_; ++i)
+        if (Equal(apps_[i].taskbarKey, key)) return int(i);
+    return -1;
+}
+
+bool LauncherModel::CanToggleTaskbarPin(uint32_t app) const
+{
+    return app < appCount_ && ValidTaskbarKey(apps_[app].taskbarKey) &&
+           (taskbarPins_.Find(apps_[app].taskbarKey) >= 0 || taskbarPins_.Count() < TaskbarPins::Capacity);
+}
+
 void LauncherModel::OpenMenu(uint32_t app, int32_t x, int32_t y, bool keyboard) {
     if (app >= appCount_) return;
     menuApp_ = int(app);
@@ -1219,13 +1314,18 @@ LauncherResult LauncherModel::Key(LauncherKey key, char ch, uint8_t mods) {
         return changed;
     }
     if (MenuOpen()) {
-        // The menu is modal: two items, Uninstall disabled.
         switch (key) {
         case LauncherKey::Escape: case LauncherKey::Menu: CloseMenu(); return changed;
+        case LauncherKey::Up: case LauncherKey::Down:
+            menuItem_ = CanToggleTaskbarPin(uint32_t(menuApp_)) ? 1 - menuItem_ : 0;
+            return changed;
         case LauncherKey::Enter: {
-            const int app = menuApp_;
+            const unsigned app = uint32_t(menuApp_);
+            if (menuItem_ == 1 && !CanToggleTaskbarPin(app)) return {};
             CloseMenu();
-            if (menuItem_ == 0) TogglePin(uint32_t(app));
+            if (menuItem_ == 1 && taskbarPins_.Toggle(apps_[app].taskbarKey))
+                return {LauncherCommand::TaskbarChanged, int(app)};
+            if (menuItem_ == 0) TogglePin(app);
             return changed;
         }
         default: return {};
@@ -1391,10 +1491,15 @@ LauncherResult LauncherModel::Press(const LauncherTarget& t, bool secondary, int
     if (MenuOpen()) {
         if (t.kind == LauncherTargetKind::Menu) return {};
         if (t.kind == LauncherTargetKind::MenuItem) {
+            const unsigned app = uint32_t(menuApp_);
+            if (t.index == 1 && CanToggleTaskbarPin(app)) {
+                CloseMenu();
+                if (taskbarPins_.Toggle(apps_[app].taskbarKey)) return {LauncherCommand::TaskbarChanged, int(app)};
+                return changed;
+            }
             if (t.index != 0) return {}; // Uninstall is disabled
-            const int app = menuApp_;
             CloseMenu();
-            TogglePin(uint32_t(app));
+            TogglePin(app);
             return changed;
         }
         CloseMenu();

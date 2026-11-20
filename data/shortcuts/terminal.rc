@@ -1,5 +1,6 @@
 # title: Terminal
 # Requires: builtin
+# app_id: terminal
 # desc: Command line shell
 # category: system
 terminal

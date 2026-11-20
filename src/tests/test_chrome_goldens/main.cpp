@@ -210,6 +210,7 @@ LauncherApp LauncherSample(const char* key, const char* name, const char* desc, 
     std::snprintf(a.name, sizeof(a.name), "%s", name);
     std::snprintf(a.desc, sizeof(a.desc), "%s", desc);
     std::snprintf(a.hint, sizeof(a.hint), "%s", hint);
+    std::snprintf(a.taskbarKey, sizeof(a.taskbarKey), "%s", key);
     return a;
 }
 const LauncherApp launcherApps[] = {
@@ -318,7 +319,7 @@ void Launcher(const std::string& prefix, const ChromeStyle& s, uint32_t screenW,
             using TK = LauncherTargetKind;
             LauncherApp installed[launcherAppCount + 1];
             for (uint32_t i = 0; i < launcherAppCount; ++i) installed[i] = launcherApps[i];
-            installed[launcherAppCount] = {"inkscape", "Inkscape", "Vector drawing", "graphics", false};
+            installed[launcherAppCount] = {"inkscape", "Inkscape", "Vector drawing", "graphics", false, "inkscape"};
             m.SetCatalog(installed, launcherAppCount + 1);
             m.MoveMarked(uint32_t(m.FindApp("quake2")), LauncherViewUnsorted);
             m.Press({TK::Rail, uint16_t(m.RailRowFor(LauncherViewUnsorted))}, false, 0, 0);
@@ -505,6 +506,43 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
         ChromeDisplayList list = ChromeListOn(storage);
         RenderSnapshot(model, s, list);
         Check(prefix + (hover ? "taskbar-hover" : "taskbar"), list, s, 0, layout.y, screenW, screenH - layout.y);
+    }
+    if (prefix == "glass-100-" || prefix == "opaque-light-150-" || prefix == "opaque-dark-200-") {
+        const int pinIds[] = {-1000, -1001, -1002, -1003, -1004, -1005, -1006, -1007};
+        bool seen[8]{};
+        int focused = 0;
+        for (unsigned page = 0; page < 8; ++page) {
+            const auto narrow = ChromeTaskbarLayoutFor(s, s.M(400), screenH, {{{2026, 11}, 19}, 14, 5},
+                                                       false, 0, pinIds, 8, focused);
+            if (!narrow.count || narrow.next.w <= 0) std::abort();
+            for (int i = 0; i < narrow.count; ++i) seen[-1000 - narrow.indices[i]] = true;
+            focused = -1000 - narrow.nextIndex;
+        }
+        for (bool visible : seen) if (!visible) std::abort();
+
+        static ChromeShellModel pinned{};
+        pinned = {};
+        pinned.kind = ChromeShellKind::Taskbar;
+        pinned.taskbar = ChromeTaskbarLayoutFor(s, screenW, screenH, {{{2026, 11}, 19}, 14, 5},
+                                                false, 0, pinIds, 3, 1);
+        pinned.entries[0].initial = 'T';
+        pinned.entries[1].initial = 'E';
+        pinned.entries[1].color = LauncherColor::Blue;
+        pinned.entries[1].active = true;
+        pinned.entries[2].initial = 'B';
+        pinned.entries[2].color = LauncherColor::Violet;
+        pinned.entries[2].launch = pinned.entries[2].busy = true;
+        pinned.mouseX = pinned.mouseY = -1;
+        auto pins = ChromeListOn(storage);
+        RenderSnapshot(pinned, s, pins);
+        Check(prefix + "taskbar-pins", pins, s, 0, pinned.taskbar.y, screenW, screenH - pinned.taskbar.y);
+        pinned.kind = ChromeShellKind::AppTrayMenu;
+        pinned.rect = ChromeWindowMenuRect(s, int(s.M(90)), pinned.taskbar.y, 1, screenW, pinned.taskbar.y);
+        pinned.tray.menuCount = 1;
+        pinned.tray.menu[0] = {1, "Unpin from taskbar", true, false, false};
+        auto menu = ChromeListOn(storage);
+        RenderSnapshot(pinned, s, menu);
+        Check(prefix + "taskbar-pin-menu", menu, s, pinned.rect.x, pinned.rect.y, pinned.rect.w, pinned.rect.h);
     }
     // The Dell's logical width (3200 at 200%): every diagnostic on, and the
     // default set (CPU, MEM, temperature), with a payload build label.

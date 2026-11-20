@@ -86,6 +86,7 @@ def main():
     initrd = stage / 'build/esp/INITRD.IMG'
     run('mmd', '-i', initrd, '::BOOT', '::BOOT/BIN', '::BOOT/SHORTCUTS')
     run('mcopy', '-i', initrd, script, '::BOOT/INIT.RC')
+    run('mcopy', '-i', initrd, ROOT / 'data/shortcuts/terminal.rc', '::BOOT/SHORTCUTS/TERMINAL.RC')
     run('mcopy', '-i', initrd, Path(metadata['profile']) / 'bin/bash', '::BOOT/BIN/BASH')
     run('mcopy', '-i', initrd, ROOT / 'data/wallpaper.raw', '::BOOT/WALLPAPER.RAW')
     cfg = stage / 'BROOK.CFG'

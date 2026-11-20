@@ -15,7 +15,7 @@ import tempfile
 
 from bridge_keyless_image import require_keyless_image
 from bridge_operator_policy import validate_operator_policy
-from stage_clearwater_shell import CLEARWATER_EXECUTABLES
+from stage_clearwater_shell import CLEARWATER_EXECUTABLES, TERMINAL_SHORTCUT, TERMINAL_SHORTCUT_PATH
 from prepare_guard_check_pair import CHECKER_SHA, E2FSCK_SHA, REQUIRED, selector
 from prepare_hardware_kernel_pair import (INITRD_MAX, KERNEL_MAX, module_version, regular, desktop_startup, add_vulkan_desktop_start,
                                           KERNEL_CONSOLE_SHORTCUT, KERNEL_CONSOLE_SHORTCUT_PATH,
@@ -136,6 +136,8 @@ def verify(candidate, source, reference, build, expected_kernel, expected_source
         shortcut=optional(live,KERNEL_CONSOLE_SHORTCUT_PATH)
         expected_shortcut=KERNEL_CONSOLE_SHORTCUT if allow_hidden_kernel_console else optional(base,KERNEL_CONSOLE_SHORTCUT_PATH)
         if shortcut!=expected_shortcut:raise ValueError('Kernel Console shortcut mismatch')
+        if expected_clearwater_shell and optional(live, TERMINAL_SHORTCUT_PATH) != TERMINAL_SHORTCUT:
+            raise ValueError('Terminal shortcut mismatch')
         policy=optional(live,CHROMIUM_POLICY_PATH)
         expected_policy=CHROMIUM_POLICY if allow_vulkan_desktop else optional(base,CHROMIUM_POLICY_PATH)
         if policy!=expected_policy:raise ValueError('Chromium policy mismatch')

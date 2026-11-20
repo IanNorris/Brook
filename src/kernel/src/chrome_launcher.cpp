@@ -75,8 +75,8 @@ constexpr ChromeGlyph CategoryGlyphs[] = {
 constexpr uint32_t CategoryInk = 0x0b1a2b;
 
 const char* TopLabels[] = {"PINNED", "RECENT"};
-const char* MenuPin = "Pin";
-const char* MenuUnpin = "Unpin";
+const char* MenuPin = "Pin in launcher";
+const char* MenuUnpin = "Unpin from launcher";
 const char* MenuUninstall = "Uninstall";
 
 const char* EditNotice(LauncherEdit edit) {
@@ -589,15 +589,20 @@ struct Builder {
         for (uint32_t i = 0; i < f.targetCount; ++i) {
             const auto& h = f.targets[i];
             if (h.target.kind != TK::MenuItem) continue;
-            const bool enabled = h.target.index == 0;
+            const bool enabled = h.target.index == 0 ||
+                                 (h.target.index == 1 && m.CanToggleTaskbarPin(uint32_t(m.MenuApp())));
             const bool hover = enabled && Hover(h.rect);
             const bool kb = enabled && m.KeyboardActive() && m.MenuItem() == int(h.target.index);
             if (hover || kb) dl.MaterialRect(h.rect, (alpha << 24) | t.hover, LPx(s, 6));
             const uint32_t ink = enabled ? t.ink : t.ink3;
             const int g = LPx(s, 16), x = h.rect.x + LPx(s, 10);
-            dl.Glyph(h.target.index == 0 ? ChromeGlyph::Pin : ChromeGlyph::Trash, x, h.rect.y + (h.rect.h - g) / 2, ink);
-            const char* label = h.target.index == 0 ? (m.Pinned(uint32_t(m.MenuApp())) ? MenuUnpin : MenuPin) : MenuUninstall;
-            dl.Text(CF::Body, x + g + LPx(s, 10), Center(h.rect, CF::Body), label, ink);
+            dl.Glyph(h.target.index < 2 ? ChromeGlyph::Pin : ChromeGlyph::Trash, x, h.rect.y + (h.rect.h - g) / 2, ink);
+            const bool desktopPin = m.DesktopPins().Find(a.taskbarKey) >= 0;
+            const char* label = h.target.index == 0 ? (m.Pinned(uint32_t(m.MenuApp())) ? MenuUnpin : MenuPin) :
+                                h.target.index == 1 ? (desktopPin ? "Unpin from taskbar" : "Pin to taskbar") : MenuUninstall;
+            const int textX = x + g + LPx(s, 10);
+            ChromeElidedText(dl, s, CF::Body, textX, Center(h.rect, CF::Body), label, ink,
+                             h.rect.x + h.rect.w - textX - LPx(s, 3));
         }
     }
 
@@ -936,7 +941,7 @@ void ChromeLauncherFrameFor(const LauncherModel& m, const ChromeLauncherChrome& 
         f.targets[total++] = {f.editor, {TK::Editor, 0}};
     } else if (m.MenuOpen()) {
         const int w = LPx(s, LM::Menu), header = LPx(s, 28), item = LPx(s, LM::MenuItem), mp = LPx(s, LM::MenuPad);
-        const int h = 2 * mp + header + 2 * item;
+        const int h = 2 * mp + header + 3 * item;
         int ax = m.MenuX(), ay = m.MenuY();
         if (ax < 0) {
             ax = p.x + p.w / 2; ay = p.y + p.h / 2;
@@ -955,7 +960,7 @@ void ChromeLauncherFrameFor(const LauncherModel& m, const ChromeLauncherChrome& 
         if (mx < p.x + inner) mx = p.x + inner;
         if (my < p.y + inner) my = p.y + inner;
         f.menu = {mx, my, w, h};
-        for (uint32_t i = 0; i < 2; ++i)
+        for (uint32_t i = 0; i < 3; ++i)
             f.targets[total++] = {{mx + mp, my + mp + header + int(i) * item, w - 2 * mp, item}, {TK::MenuItem, uint16_t(i)}};
         f.targets[total++] = {f.menu, {TK::Menu, 0}};
     }

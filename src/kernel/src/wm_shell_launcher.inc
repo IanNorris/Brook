@@ -59,6 +59,21 @@ static void LauncherItemKey(const LauncherItem& item, char (&key)[LauncherLimits
 }
 
 // Shell context (WmLauncherLoad) or compositor thread (publication, render).
+static const LauncherItem* TaskbarCatalogItem(const LauncherSnapshot& catalog, const char* key)
+{
+    if (catalog.generation != g_launcherModelGeneration) return nullptr;
+    const int app = g_launcherModel.FindTaskbarApp(key);
+    return app >= 0 ? &catalog.items[g_launcherModelItem[app]] : nullptr;
+}
+
+static const char* TaskbarKeyForItem(const LauncherSnapshot& catalog, const LauncherItem* item)
+{
+    if (catalog.generation == g_launcherModelGeneration)
+        for (unsigned i = 0; i < g_launcherModel.AppCount(); ++i)
+            if (&catalog.items[g_launcherModelItem[i]] == item) return g_launcherModel.App(i).taskbarKey[0] ? g_launcherModel.App(i).taskbarKey : nullptr;
+    return nullptr;
+}
+
 static void LauncherSyncModel(const LauncherSnapshot& catalog)
 {
     static LauncherApp apps[LauncherLimits::Apps];
@@ -76,6 +91,10 @@ static void LauncherSyncModel(const LauncherSnapshot& catalog)
         WmStrCopy(app.name, item.title, sizeof(app.name));
         WmStrCopy(app.desc, item.description, sizeof(app.desc));
         WmStrCopy(app.hint, item.category, sizeof(app.hint));
+        if (!item.isDesktopEntry && WmEqualI(item.scriptPath, "/boot/SHORTCUTS/TERMINAL.RC"))
+            WmStrCopy(app.taskbarKey, TerminalAppKey, sizeof(app.taskbarKey));
+        else if (!item.isDesktopEntry || item.appId[0])
+            WmStrCopy(app.taskbarKey, item.catalogId, sizeof(app.taskbarKey));
         g_launcherModelItem[count] = static_cast<uint16_t>(i);
         g_launcherModelIcon[count] = item.iconPixels;
         ++count;
@@ -252,6 +271,76 @@ static LauncherPersistenceResult LauncherWriteLayout(const VfsPath& root, const 
     return error ? LauncherPersistenceResult{"sync-directory", error} : result;
 }
 
+static constexpr char TaskbarPinsPath[] = "/data/home/.config/brook/taskbar.ini";
+static constexpr char TaskbarPinsFile[] = "taskbar.ini";
+static constexpr char TaskbarPinsTemp[] = "taskbar.ini.tmp";
+static SpinLock g_taskbarPinsLock;
+static TaskbarPins g_taskbarPinsPending;
+static uint64_t g_taskbarPinsRevision, g_taskbarPinsSaved, g_taskbarPinsDue;
+
+static void TaskbarNotePins()
+{
+    const uint64_t due = ApicTickCount() + 1000;
+    SpinLockAcquire(&g_taskbarPinsLock);
+    g_taskbarPinsPending = g_launcherModel.DesktopPins();
+    ++g_taskbarPinsRevision;
+    g_taskbarPinsDue = due;
+    SpinLockRelease(&g_taskbarPinsLock);
+}
+
+static void TaskbarPinsLoadState()
+{
+    char text[TaskbarPins::TextCapacity];
+    const auto result = ConfigReadText(TaskbarPinsPath, text, sizeof(text));
+    auto& pins = g_launcherModel.DesktopPins();
+    if (!result.error && pins.Parse(text)) return;
+    if (!strcmp(result.stage, "missing")) {
+        pins.SetDefault();
+        TaskbarNotePins();
+    } else {
+        KLogCatConsole(LogCat::Wm, LogLevel::Warn, "taskbar: pins load failed stage=%s errno=%d",
+                       result.error ? result.stage : "parse", result.error ? -result.error : 22);
+    }
+}
+
+static LauncherPersistenceResult StoreDesktopLayout(const char* text, uint32_t bytes,
+                                                     const char* temporary, const char* name)
+{
+    VfsPath root{}, directory{};
+    LauncherPersistenceResult result;
+    if (const int error = VfsPathRoot(&root)) result = {"root", error};
+    else if (const int dirError = LauncherConfigDir(root, &directory)) result = {"directory", dirError};
+    else result = LauncherWriteLayout(root, directory, text, bytes, temporary, name);
+    VfsPathRelease(directory);
+    VfsPathRelease(root);
+    return result;
+}
+
+static void TaskbarPinsSaveState()
+{
+    const uint64_t now = ApicTickCount();
+    SpinLockAcquire(&g_taskbarPinsLock);
+    const uint64_t revision = g_taskbarPinsRevision;
+    if (revision == g_taskbarPinsSaved || now < g_taskbarPinsDue) {
+        SpinLockRelease(&g_taskbarPinsLock);
+        return;
+    }
+    const auto pins = g_taskbarPinsPending;
+    SpinLockRelease(&g_taskbarPinsLock);
+
+    char text[TaskbarPins::TextCapacity];
+    const auto bytes = pins.Serialize(text, sizeof(text));
+    const auto result = bytes ? StoreDesktopLayout(text, bytes, TaskbarPinsTemp, TaskbarPinsFile) :
+                                LauncherPersistenceResult{"serialize", -7};
+    SpinLockAcquire(&g_taskbarPinsLock);
+    if (!result.error) g_taskbarPinsSaved = revision;
+    else if (revision == g_taskbarPinsRevision) g_taskbarPinsDue = ApicTickCount() + 5000;
+    SpinLockRelease(&g_taskbarPinsLock);
+    if (result.error)
+        KLogCatConsole(LogCat::Wm, LogLevel::Warn, "taskbar: pins save failed stage=%s errno=%d",
+                       result.stage, -result.error);
+}
+
 static void LauncherSaveLayout()
 {
     static char text[LauncherLayoutLimit];
@@ -266,13 +355,7 @@ static void LauncherSaveLayout()
     state.saving = true;
     SpinLockRelease(&g_launcherSaveLock);
 
-    VfsPath root{}, directory{};
-    LauncherPersistenceResult result;
-    if (const int error = VfsPathRoot(&root)) result = {"root", error};
-    else if (const int dirError = LauncherConfigDir(root, &directory)) result = {"directory", dirError};
-    else result = LauncherWriteLayout(root, directory, text, bytes);
-    VfsPathRelease(directory);
-    VfsPathRelease(root);
+    const auto result = StoreDesktopLayout(text, bytes, LauncherLayoutTemp, LauncherLayoutName);
 
     SpinLockAcquire(&g_launcherSaveLock);
     const bool newResult = result.error != state.save.error || strcmp(result.stage, state.save.stage);
@@ -334,6 +417,7 @@ static void LauncherRun(const LauncherResult& r, const LauncherSnapshot& catalog
     switch (r.command) {
     case LauncherCommand::None: return;
     case LauncherCommand::Changed: break;
+    case LauncherCommand::TaskbarChanged: TaskbarNotePins(); break;
     case LauncherCommand::Undo: {
         if (!g_launcherHistoryCount) return;
         const uint32_t previous = (g_launcherHistoryNext + LauncherUndoLimit - 1) % LauncherUndoLimit;

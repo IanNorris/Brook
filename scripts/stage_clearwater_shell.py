@@ -13,6 +13,17 @@ from elftools.elf.elffile import ELFFile
 CLEARWATER_START = b'run --service --once --console --uid 0 /boot/CWSUP.ELF /boot/CWSHELL.ELF'
 CLEARWATER_EXECUTABLES = ('CWSUP.ELF', 'CWSHELL.ELF')
 STARTUP = '::/BOOT/INIT.RC'
+TERMINAL_SHORTCUT_PATH = 'BOOT/SHORTCUTS/TERMINAL.RC'
+TERMINAL_SHORTCUT = (Path(__file__).resolve().parents[1] / 'data/shortcuts/terminal.rc').read_bytes()
+
+
+def embed_terminal_shortcut(image):
+    if subprocess.run(['mdir', '-i', image, '::/BOOT/SHORTCUTS'], capture_output=True).returncode:
+        subprocess.run(['mmd', '-i', image, '::/BOOT/SHORTCUTS'], check=True)
+    dest = '::/' + TERMINAL_SHORTCUT_PATH
+    subprocess.run(['mcopy', '-o', '-i', image, '-', dest], input=TERMINAL_SHORTCUT, check=True)
+    if subprocess.check_output(['mtype', '-i', image, dest]) != TERMINAL_SHORTCUT:
+        raise RuntimeError('Terminal shortcut readback mismatch')
 
 
 def add_clearwater_start(script):
@@ -57,6 +68,7 @@ def stage(source, output, supervisor, shell):
         shutil.copyfile(source, image)
         script = add_clearwater_start(subprocess.check_output(['mtype', '-i', image, STARTUP]))
         embed_clearwater_executables(image, supervisor, shell)
+        embed_terminal_shortcut(image)
         subprocess.run(['mcopy', '-o', '-i', image, '-', STARTUP], input=script, check=True)
         if subprocess.check_output(['mtype', '-i', image, STARTUP]) != script:
             raise RuntimeError('Clearwater startup readback mismatch')

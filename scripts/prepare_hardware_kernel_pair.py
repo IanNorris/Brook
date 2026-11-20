@@ -23,7 +23,7 @@ import tempfile
 from elftools.elf.elffile import ELFFile
 from bridge_keyless_image import require_keyless_image
 from hardware_recovery_fsck import validate_checker
-from stage_clearwater_shell import add_clearwater_start, embed_clearwater_executables
+from stage_clearwater_shell import add_clearwater_start, embed_clearwater_executables, embed_terminal_shortcut
 
 MAGIC = 0x4B524F42
 KERNEL_MAX = 8 * 1024 * 1024
@@ -201,6 +201,7 @@ def prepare(source, build, abi, payload_id, output, expected_kernel_sha256, pani
         clearwater_files = {}
         if clearwater_shell:
             clearwater_files = embed_clearwater_executables(image, clearwater_supervisor, clearwater_shell)
+            embed_terminal_shortcut(image)
             enabled.append('clearwater-shell')
         if enable_vulkan_desktop or hide_kernel_console_window or clearwater_shell:
             original=subprocess.check_output(['mtype','-i',str(image),'::/BOOT/INIT.RC'])

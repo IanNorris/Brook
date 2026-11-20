@@ -452,6 +452,7 @@ static uint32_t g_nextZOrder = 1;  // 0 = backmost, higher = front
 // Side dock (wm_shell_dock.inc, included below the launcher). Under g_vfbLock.
 static void DockForgetLocked(int idx);
 static bool DockReturnLocked(int idx, bool focus);
+static bool DockActivateWindowLocked(int idx);
 static bool DockKeepOutLocked(Window& w);
 static WmRect WorkAreaFor(const DesktopMetrics& m, uint32_t screenW, uint32_t screenH);
 static bool DockPlaceLocked(int idx, const DesktopMetrics& m, uint32_t screenW, uint32_t screenH);
@@ -546,9 +547,7 @@ void WmPointerSetHover(int idx) {
         g_pointerEnteredIdx=identity?idx:-1;g_pointerEnteredIdentity=identity;
     }
 }
-void WmPointerActivate(int idx) {
-    if(idx<0 || idx>=static_cast<int>(WM_MAX_WINDOWS))return;
-    VfbGuard guard;
+static void PointerActivateLocked(int idx) {
     Window& w=g_windows[idx];
     if(!w.proc || !w.focused || g_focusedIdx!=idx || w.minimized)return;
     if(g_pointerInteractionSerial<0x7fffffffffffffffull)++g_pointerInteractionSerial;
@@ -556,6 +555,12 @@ void WmPointerActivate(int idx) {
     __atomic_store_n(&g_pointerActivationHover,__atomic_load_n(&g_pointerHoverIdentity,__ATOMIC_ACQUIRE),__ATOMIC_RELEASE);
     __atomic_store_n(&g_pointerActivationIdentity,w.creationIdentity,__ATOMIC_RELEASE);
 }
+void WmPointerActivate(int idx) {
+    if (idx < 0 || idx >= int(WM_MAX_WINDOWS)) return;
+    VfbGuard guard;
+    PointerActivateLocked(idx);
+}
+
 void WmPointerEngage(int idx) {
     if(idx<0 || idx>=static_cast<int>(WM_MAX_WINDOWS))return;
     VfbGuard guard;
@@ -713,6 +718,12 @@ static LauncherModel g_launcherModel;
 static void LauncherLoadLayout();
 static void LauncherSyncModel(const LauncherSnapshot& catalog);
 static void LauncherSaveLayout();
+static void TaskbarPinsLoadState();
+static void TaskbarPinsSaveState();
+static void TaskbarNotePins();
+static const LauncherItem* TaskbarCatalogItem(const LauncherSnapshot&, const char* key);
+static const char* TaskbarKeyForItem(const LauncherSnapshot&, const LauncherItem*);
+static int AdmitLauncherItem(const LauncherSnapshot&, int, bool, uint64_t*, bool*);
 static void LauncherItemKey(const LauncherItem&, char (&key)[LauncherLimits::KeyLength]);
 static void LauncherPowerRun(LauncherPowerCommand command);
 
@@ -749,7 +760,7 @@ void WmLaunchFeedbackPoll()
     }
     {
         VfbGuard windows;
-        for (const auto& w : g_windows) {
+        for (auto& w : g_windows) {
             // A docked window never answers a new launch: it is not shown.
             if (!w.proc || !w.visible || !w.focusable || w.docked) continue;
             SpinLockAcquire(&g_launchLock);
@@ -757,7 +768,10 @@ void WmLaunchFeedbackPoll()
                 w.creationIdentity,w.appId,w.wmId,w.creationIdentity,now);
             uint64_t token=w.clientLaunchId;
             if(w.clientOrigin==WmClientOrigin::RegisteredUnixPeer&&g_launches.Find(token)<0)token=0;
-            g_launches.Window(token, w.creationIdentity, w.appId,nullptr,w.wmId,w.creationIdentity,now);
+            LaunchFeedback observed{};
+            if (g_launches.Window(token, w.creationIdentity, w.appId, &observed, w.wmId, w.creationIdentity, now) &&
+                observed.observedViaToken)
+                LaunchFeedbackTable::Copy(w.taskbarCatalogId, sizeof(w.taskbarCatalogId), observed.identity);
             SpinLockRelease(&g_launchLock);
         }
     }
@@ -782,8 +796,11 @@ void WmLaunchFeedbackPoll()
     if(hadEntries||busyChanged)CompositorMarkDirty(); // Also erase the final expired notice.
 }
 
+static bool WmTaskbarHandlePin(int target);
+
 void WmTaskbarPendingClick(int target)
 {
+    if (WmTaskbarHandlePin(target)) return;
     const bool navigation = target <= -100;
     if (navigation) target += 90;
     if (target > -10 || target <= -10 - static_cast<int>(LaunchFeedbackTable::Capacity)) return;
@@ -1081,7 +1098,7 @@ static int CreateWindowLocked(Process* proc, int16_t x, int16_t y,
     w.clientIncarnation=proc?(proc->isThread?proc->leaderIncarnation:proc->incarnation):0;
     w.clientLaunchId=proc?proc->launchId:0;
     w.clientOrigin=proc?WmClientOrigin::NativeProcess:WmClientOrigin::Unknown;
-    w.appId[0] = w.webAppTitle[0] = 0;
+    w.appId[0] = w.webAppTitle[0] = w.taskbarCatalogId[0] = 0;
     w.x = x;
     w.y = y;
     w.clientW = clientW;
@@ -2105,38 +2122,30 @@ uint32_t WmDesktopHeight(uint32_t screenH)
     return screenH > WmMetric(WM_TASKBAR_HEIGHT) ? screenH - WmMetric(WM_TASKBAR_HEIGHT) : 0;
 }
 
-void WmSpawnTerminal()
+int WmSpawnTerminal()
 {
-    if (!g_wmActive || !ShutdownLaunchAllowed()) return;
+    if (!g_wmActive || !ShutdownLaunchAllowed()) return -1;
+    constexpr uint16_t width = 800, height = 600;
+    const int terminal = TerminalCreate(width, height);
+    if (terminal < 0) return -1;
+    auto* t = TerminalGet(terminal);
+    if (!t || !t->child) return -1;
 
-    uint32_t clientW = 800;
-    uint32_t clientH = 600;
-
-    int termIdx = TerminalCreate(clientW, clientH);
-    if (termIdx < 0)
+    const int16_t x = int16_t(60 + (terminal % 6) * 40), y = int16_t(60 + (terminal % 6) * 40);
+    const auto& metrics = WmDesktopMetrics();
+    t->child->fbDestX = x + metrics.clientOffsetX();
+    t->child->fbDestY = y + metrics.clientOffsetY();
+    t->child->fbScale = 1;
+    ProcessFramebufferMarkDirty(t->child);
+    int window;
     {
-        SerialPuts("WM: failed to spawn new terminal\n");
-        return;
+        VfbGuard guard;
+        window = CreateWindowLocked(t->child, x, y, width, height, "Terminal", 1, true, true);
+        if (window >= 0) WmStrCopy(g_windows[window].appId, TerminalAppKey, sizeof(g_windows[window].appId));
     }
-
-    Terminal* t = TerminalGet(termIdx);
-    if (t && t->child)
-    {
-        // Stagger position based on terminal index
-        int16_t winX = static_cast<int16_t>(60 + (termIdx % 6) * 40);
-        int16_t winY = static_cast<int16_t>(60 + (termIdx % 6) * 40);
-
-        t->child->fbDestX = winX + static_cast<int16_t>(WmMetric(WM_BORDER_WIDTH));
-        t->child->fbDestY = winY + static_cast<int16_t>(WmMetric(WM_TITLE_BAR_HEIGHT) + WmMetric(WM_BORDER_WIDTH));
-        t->child->fbScale = 1;
-        ProcessFramebufferMarkDirty(t->child);
-
-        WmCreateWindow(t->child, winX, winY,
-                       static_cast<uint16_t>(clientW),
-                       static_cast<uint16_t>(clientH), "Terminal");
-
-        SerialPrintf("WM: spawned new terminal (bash pid %u)\n", t->child->pid);
-    }
+    if (window < 0) { TerminalClose(t); return -1; }
+    SerialPrintf("WM: spawned new terminal (bash pid %u)\n", t->child->pid);
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -2148,7 +2157,7 @@ static_assert(LAUNCHER_ICON_PX == ChromeShellMetrics::LauncherIconSize, "launche
 static_assert(WM_TASKBAR_BTN_WIDTH == ChromeShellMetrics::TaskbarButtonWidth &&
               WM_TASKBAR_BTN_HEIGHT == ChromeShellMetrics::TaskbarButtonHeight &&
               WM_TASKBAR_PADDING == ChromeShellMetrics::TaskbarPadding, "taskbar metrics");
-static_assert(WM_MAX_WINDOWS + LaunchFeedbackTable::Capacity <= ChromeTaskbarButtonLimit, "taskbar entries");
+static_assert(WM_MAX_WINDOWS + LaunchFeedbackTable::Capacity + TaskbarPins::Capacity <= ChromeTaskbarButtonLimit, "taskbar entries");
 
 // Read title and explicit window identity from a shortcut's comment header.
 // Identity metadata matches Wayland app_id/executable without guessing by title.
@@ -2622,6 +2631,7 @@ static void LauncherWorker(void*)
         // list. A slow reader delays reclamation and subsequent builds.
         LauncherSaveLayout();
         DockSaveState();
+        TaskbarPinsSaveState();
         SchedulerSleepMs(250);
     }
 }
@@ -2644,6 +2654,7 @@ void WmLauncherLoad()
 {
     if (g_launcherLoaded) return;
     LauncherLoadLayout();
+    TaskbarPinsLoadState();
     DockLoadState();
     const uint32_t generation = __atomic_load_n(&g_launcherRequested, __ATOMIC_ACQUIRE);
     LauncherSnapshot* snapshot = BuildLauncherSnapshot(generation);

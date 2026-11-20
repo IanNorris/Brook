@@ -72,8 +72,7 @@ struct ChromeShellBoot {
 
 struct ChromeShellModel {
     static constexpr uint32_t AppsIcon = ChromeTaskbarButtonLimit;
-    static constexpr uint32_t TerminalIcon = AppsIcon + 1;
-    static constexpr uint32_t EntryLimit = TerminalIcon + 1;
+    static constexpr uint32_t EntryLimit = AppsIcon + 1;
     static constexpr uint32_t IconLimit = LauncherLimits::Apps > EntryLimit ? LauncherLimits::Apps : EntryLimit;
 
     // Taskbar and launcher occupy separate surfaces and reuse these slots.
@@ -133,7 +132,7 @@ inline void BuildShellModel(const ChromeShellModel& model, const ChromeStyle& st
             buttons[i] = {model.icons[i].View(), entry.label, entry.active, entry.minimized, entry.launch, entry.busy, entry.initial, entry.color};
         }
         ChromeBuildTaskbar({&model.taskbar, buttons, model.launcherOpen, model.icons[ChromeShellModel::AppsIcon].View(),
-                           model.icons[ChromeShellModel::TerminalIcon].View(), model.networkConnected,
+                           model.networkConnected,
                            model.volumeControl, model.volumeAvailable, model.agentShown, model.agentStale,
                            model.telemetry.View(), model.uptimeMs, model.mouseX, model.mouseY, &model.tray}, style, list);
         if (model.taskbar.hud.w > 0)

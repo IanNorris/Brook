@@ -29,6 +29,24 @@ struct LauncherLimits {
     static constexpr uint32_t Results = Apps;
 };
 
+inline constexpr char TerminalAppKey[] = "terminal";
+
+struct TaskbarPins {
+    static constexpr uint32_t Capacity = 8;
+    static constexpr uint32_t TextCapacity = 32 + Capacity * LauncherLimits::KeyLength;
+    uint32_t Count() const { return count_; }
+    const char* Key(uint32_t i) const { return i < count_ ? keys_[i] : ""; }
+    int Find(const char* key) const;
+    bool Toggle(const char* key);
+    void SetDefault();
+    bool Parse(const char* text);
+    uint32_t Serialize(char* out, uint32_t capacity) const;
+
+private:
+    char keys_[Capacity][LauncherLimits::KeyLength];
+    uint32_t count_;
+};
+
 // The eight category colours and the category icons (DESIGN.md "Token
 // sheet": the same in every theme).
 enum class LauncherColor : uint8_t { Blue, Teal, Green, Amber, Coral, Pink, Violet, Slate, Count };
@@ -40,6 +58,7 @@ struct LauncherApp {
     char desc[LauncherLimits::DescLength];  // may be empty
     char hint[LauncherLimits::CategoryId];  // declared default category ID, or empty
     bool system;                            // part of Brook: Uninstall is never offered
+    char taskbarKey[LauncherLimits::KeyLength]; // exact catalog identity; empty when unavailable
 };
 
 // Lines of the app list, in display order.
@@ -69,7 +88,7 @@ enum class LauncherKey : uint8_t {
 static constexpr uint8_t LauncherModAlt = 1, LauncherModCtrl = 2, LauncherModShift = 4;
 
 // What a press or a key asks the owner to do. Redraw is implied by Changed.
-enum class LauncherCommand : uint8_t { None, Changed, Launch, Close, OpenSettings, Undo };
+enum class LauncherCommand : uint8_t { None, Changed, Launch, Close, OpenSettings, Undo, TaskbarChanged };
 struct LauncherResult {
     LauncherCommand command = LauncherCommand::None;
     int app = -1;  // Launch: catalog index
@@ -136,6 +155,10 @@ public:
     const char* PinKey(uint32_t index) const { return keys_[pins_[index]]; }
     bool Pinned(uint32_t app) const;
     void TogglePin(uint32_t app);
+    bool CanToggleTaskbarPin(uint32_t app) const;
+    int FindTaskbarApp(const char* key) const;
+    TaskbarPins& DesktopPins() { return taskbarPins_; }
+    const TaskbarPins& DesktopPins() const { return taskbarPins_; }
     void NoteLaunch(uint32_t app);     // front of Recent
     // Alt+Up / Alt+Down: reorder within the category, crossing into the
     // neighbouring category past either end. An Unsorted app moves into the
@@ -272,6 +295,7 @@ private:
     uint32_t keyCount_;
     Category categories_[LauncherLimits::Categories];
     uint32_t categoryCount_;
+    TaskbarPins taskbarPins_;
     uint16_t pins_[LauncherLimits::Pins];
     uint32_t pinCount_;
     uint16_t recent_[LauncherLimits::Recent];

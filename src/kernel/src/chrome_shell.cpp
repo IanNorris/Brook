@@ -128,8 +128,6 @@ ChromeTaskbarLayout ChromeTaskbarLayoutFor(const ChromeStyle& s, uint32_t screen
     l.apps = {x, by, appsW, bh}; x += appsW + s.M(SM::TaskbarPadding);
     l.separators[0] = {x + sepGap, by + (bh - sepH) / 2, 1, sepH};
     x += 2 * sepGap + 1;
-    l.terminal = {x, by, static_cast<int>(s.M(SM::TaskbarButtonWidth)), bh};
-    x += s.M(SM::TaskbarButtonWidth) + s.M(SM::TaskbarPadding);
     int right = sw - Px(s, 4);
     // Reserve measured widgets from right to left. Keep one useful window
     // button on small displays; diagnostics yield before the clock does.
@@ -492,9 +490,7 @@ void ChromeBuildTaskbar(const ChromeTaskbarModel& m, const ChromeStyle& s, Chrom
         if (r.w >= size && r.h >= size) ChromeIcon(dl, s, r.x + (r.w - size) / 2, r.y + (r.h - size) / 2, size, pixels);
     };
     target(l.apps, m.launcherOpen);
-    target(l.terminal, false);
     centeredIcon(l.apps, m.appsIcon, mark);
-    centeredIcon(l.terminal, m.terminalIcon, icon);
     if (m.tray) for (uint32_t i = 0; i < l.trayAppCount; ++i) {
         const auto& item = m.tray->items[i];
         const auto& r = l.trayApps[i];

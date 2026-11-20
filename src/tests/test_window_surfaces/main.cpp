@@ -85,12 +85,12 @@ void VfsPathRelease(VfsPath) {}
 int VfsMkdirAt(const VfsPath&, const VfsPath&, const char*, uint16_t, uint16_t) { std::abort(); }
 int VfsChownAt(const VfsPath&, const VfsPath&, const char*, uint32_t, uint32_t, bool) { std::abort(); }
 int VfsRemoveAt(const VfsPath&, const VfsPath&, const char* name, bool directory) {
-    CHECK((!strcmp(name, "launcher.ini.tmp") || !strcmp(name, "dock.ini.tmp")) && !directory);
+    CHECK((!strcmp(name, "launcher.ini.tmp") || !strcmp(name, "dock.ini.tmp") || !strcmp(name, "taskbar.ini.tmp")) && !directory);
     return -2;
 }
 Vnode* VfsOpenAt(const VfsPath&, const VfsPath&, const char* name, int flags,
                  uint16_t mode, uint16_t, int*, bool followFinal) {
-    CHECK((!strcmp(name, "launcher.ini.tmp") || !strcmp(name, "dock.ini.tmp")) && !followFinal &&
+    CHECK((!strcmp(name, "launcher.ini.tmp") || !strcmp(name, "dock.ini.tmp") || !strcmp(name, "taskbar.ini.tmp")) && !followFinal &&
           flags == (VFS_O_WRITE|VFS_O_CREATE|VFS_O_EXCL));
     CHECK(mode == 0600);
     return &layoutFile;
@@ -117,7 +117,8 @@ int VfsFsync(Vnode* node) {
 }
 int VfsRenameAt(const VfsPath&, const VfsPath&, const char* source, const VfsPath&, const char* target) {
     CHECK(((!strcmp(source, "launcher.ini.tmp") && !strcmp(target, "launcher.ini")) ||
-           (!strcmp(source, "dock.ini.tmp") && !strcmp(target, "dock.ini"))) && layoutSyncs == 1);
+           (!strcmp(source, "dock.ini.tmp") && !strcmp(target, "dock.ini")) ||
+           (!strcmp(source, "taskbar.ini.tmp") && !strcmp(target, "taskbar.ini"))) && layoutSyncs == 1);
     layoutRenamed = true;
     return 0;
 }
@@ -1119,6 +1120,92 @@ int main() {
         g_taskbarPageTarget = -1;
         g_launcherOpen = g_launcherLoaded = false;
         g_launcherActive = &g_emptyLauncher;
+    }
+
+    // Taskbar actions use stable catalog IDs, not the identical window titles
+    // or an old window slot whose incarnation has changed.
+    {
+        constexpr uint32_t sw = 1024, sh = 768;
+        static LauncherSnapshot catalog{};
+        catalog.count = 2;
+        catalog.generation = 12;
+        auto& terminal = catalog.items[0];
+        terminal.valid = true;
+        WmStrCopy(terminal.appId, TerminalAppKey, sizeof(terminal.appId));
+        WmStrCopy(terminal.title, "Terminal", sizeof(terminal.title));
+        WmStrCopy(terminal.scriptPath, "/boot/SHORTCUTS/TERMINAL.RC", sizeof(terminal.scriptPath));
+        auto& other = catalog.items[1];
+        other.valid = other.isDesktopEntry = true;
+        WmStrCopy(other.appId, "org.brook.Editor", sizeof(other.appId));
+        WmStrCopy(other.title, "Editor", sizeof(other.title));
+        CHECK(IdentifyLauncherItems(catalog));
+        g_launcherModel.Init();
+        g_launcherActive = &catalog;
+        g_launcherModel.DesktopPins().SetDefault();
+        LauncherSyncModel(catalog);
+        const auto button = [&](int target) {
+            const auto layout = GetTaskbarLayout(sw, sh);
+            for (int i = 0; i < layout.count; ++i)
+                if (layout.indices[i] == target) return layout.buttons[i];
+            return DesktopRect{};
+        };
+        auto pin = button(TaskbarPinBase);
+        CHECK(pin.w > 0 && WmTaskbarHitTest(pin.x, pin.y, sw, sh) == TaskbarPinBase);
+        CHECK(WmShellTrayPointer(sw, sh, pin.x + 2, pin.y + 2, true, 1, 0));
+        CHECK(g_taskbarPinMenu.open && g_taskbarPinMenu.pinned && g_taskbarPinMenu.window < 0);
+        WmWindowMenuClose();
+
+        auto* clients = static_cast<Process*>(std::calloc(3, sizeof(Process)));
+        CHECK(clients);
+        int ids[3]{};
+        for (int i = 0; i < 3; ++i) {
+            clients[i].pid = uint16_t(50 + i);
+            ids[i] = WmCreateWindow(&clients[i], 90, 90, 600, 400, "Two identical titles");
+            CHECK(ids[i] >= 0);
+            auto& w = g_windows[ids[i]];
+            CHECK(WmSetAppIdById(&clients[i], w.wmId, i < 2 ? TerminalAppKey : other.appId));
+        }
+        WmSetFocus(ids[1]);
+        CHECK(button(ids[0]).w && !button(ids[1]).w && button(ids[2]).w);
+        WmTaskbarPendingClick(TaskbarPinBase);
+        CHECK(g_windows[ids[1]].minimized);
+        WmSetFocus(ids[2]); // focus another app, then restore the newest Terminal
+        WmTaskbarPendingClick(TaskbarPinBase);
+        const int primary = TaskbarPrimaryWindow(catalog, terminal);
+        CHECK(primary >= 0 && !g_windows[primary].minimized);
+
+        // An app_id collision must not alias two pins or obscure a window.
+        WmStrCopy(other.appId, TerminalAppKey, sizeof(other.appId));
+        CHECK(TaskbarPrimaryWindow(catalog, terminal) == -1 && TaskbarPrimaryWindow(catalog, other) == -1);
+        WmStrCopy(g_windows[primary].taskbarCatalogId, terminal.catalogId, sizeof(g_windows[primary].taskbarCatalogId));
+        CHECK(TaskbarPrimaryWindow(catalog, terminal) == primary && TaskbarPrimaryWindow(catalog, other) == -1);
+        WmStrCopy(other.appId, "org.brook.Editor", sizeof(other.appId));
+
+        const auto edit = button(ids[2]);
+        CHECK(WmShellTrayPointer(sw, sh, edit.x + 2, edit.y + 2, true, 1, 0));
+        CHECK(g_taskbarPinMenu.open && g_taskbarPinMenu.window == ids[2] && !g_taskbarPinMenu.pinned);
+        const auto menu = TaskbarPinMenuRect(sw, sh);
+        const auto row = ChromeTrayMenuRowRect(WmChromeStyle(), menu, 0);
+        const auto original = g_windows[ids[2]].creationIdentity;
+        ++g_windows[ids[2]].creationIdentity;
+        CHECK(!WmShellTrayPointer(sw, sh, row.x + 4, row.y + 4, true, 0, 0));
+        CHECK(!g_taskbarPinMenu.open && g_launcherModel.DesktopPins().Count() == 1);
+        g_windows[ids[2]].creationIdentity = original;
+        CHECK(WmShellTrayPointer(sw, sh, edit.x + 2, edit.y + 2, true, 1, 0));
+        CHECK(WmShellTrayPointer(sw, sh, row.x + 4, row.y + 4, true, 0, 0));
+        CHECK(g_launcherModel.DesktopPins().Find(other.catalogId) == 1);
+        testTick += 1001;
+        layoutSyncs = 0; layoutRenamed = false; layoutWritable = true;
+        TaskbarPinsSaveState();
+        CHECK(layoutRenamed && layoutSyncs == 2 && g_taskbarPinsSaved == g_taskbarPinsRevision);
+        TaskbarPins restored{};
+        CHECK(restored.Parse(layoutText) && restored.Find(other.catalogId) == 1);
+
+        for (int id : ids) WmDestroyWindow(id);
+        std::free(clients);
+        g_launcherActive = &g_emptyLauncher;
+        g_launcherModel.Init();
+        g_taskbarPageTarget = -1;
     }
 
     // Fullscreen: the client covers the whole output without chrome, and while

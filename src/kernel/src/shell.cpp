@@ -1085,47 +1085,14 @@ static int ExecCommand(int argc, const char* const* argv)
         return 0;
     }
 
-    // Built-in: terminal — spawn a terminal window (requires WM mode)
+    // Built-in: terminal — also the Terminal launcher's ordinary command.
     if (StrEq(cmd, "terminal"))
     {
-        if (!WmIsActive())
-        {
+        if (!WmIsActive()) {
             KPrintf("terminal: window manager not active (use 'set wm' first)\n");
             return -1;
         }
-
-        // Default terminal size: 800x600 client area
-        uint32_t clientW = 800;
-        uint32_t clientH = 600;
-
-        int termIdx = TerminalCreate(clientW, clientH);
-        if (termIdx < 0)
-        {
-            KPrintf("terminal: failed to create terminal\n");
-            return -1;
-        }
-
-        // Create a WM window for the terminal
-        Terminal* t = TerminalGet(termIdx);
-        if (t && t->child)
-        {
-            int16_t winX = static_cast<int16_t>(60 + (termIdx % 6) * 40);
-            int16_t winY = static_cast<int16_t>(60 + (termIdx % 6) * 40);
-
-            // Set up compositor dest coords — terminal VFB is already set by TerminalCreate.
-            // Do NOT call CompositorSetupProcess (it would allocate a new VFB).
-            t->child->fbDestX = winX + static_cast<uint32_t>(WmDesktopMetrics().clientOffsetX());
-            t->child->fbDestY = winY + static_cast<uint32_t>(WmDesktopMetrics().clientOffsetY());
-            t->child->fbScale = 1;
-            ProcessFramebufferMarkDirty(t->child);
-
-            WmCreateWindow(t->child, winX, winY,
-                          static_cast<uint16_t>(clientW),
-                          static_cast<uint16_t>(clientH), "Terminal");
-
-            KPrintf("terminal: created (bash pid %u)\n", t->child->pid);
-        }
-        return 0;
+        return WmSpawnTerminal();
     }
 
     // Built-in: run [--as <name>] [--uid <uid>] [--gid <gid>] <path> [args...] — explicit run command

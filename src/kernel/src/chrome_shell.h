@@ -49,11 +49,11 @@ inline void DesktopRate(char* out, uint64_t bytes) {
 // Taskbar
 // ---------------------------------------------------------------------------
 
-static constexpr uint32_t ChromeTaskbarButtonLimit = 40; // windows + launch feedback entries
+static constexpr uint32_t ChromeTaskbarButtonLimit = 40 + TaskbarPins::Capacity; // windows, launch feedback and app pins
 
 struct ChromeTaskbarLayout {
     int y, textY, screenW, screenH;
-    DesktopRect apps, terminal, next, clock, network, volume, agent, build, hud;
+    DesktopRect apps, next, clock, network, volume, agent, build, hud;
     DesktopRect separators[2]; // after the launcher button; before the tray
     DesktopRect metrics[7];
     DesktopRect trayApps[TrayItemLimit];
@@ -100,7 +100,6 @@ struct ChromeTaskbarModel {
     const ChromeTaskbarButton* buttons; // layout->count entries
     bool launcherOpen;
     const uint32_t* appsIcon;
-    const uint32_t* terminalIcon;
     bool networkConnected;
     uint32_t volumeControl;
     bool volumeAvailable;

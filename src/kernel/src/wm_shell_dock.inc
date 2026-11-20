@@ -482,15 +482,17 @@ bool WmDockWindowDrop(int idx, int32_t mx, int32_t my, int16_t startX, int16_t s
 }
 void WmDockDrag(int32_t mx, bool down) { VfbGuard guard; DockDragLocked(mx, down); }
 
-bool WmDockSelect(int entry)
+static bool DockSelectLocked(int entry)
 {
-    VfbGuard guard;
     if (entry < 0 || entry >= static_cast<int>(g_dock.count)) return false;
     g_dock.selected = entry;
     g_dock.open = true;
     DockApplyLocked(true);
     return true;
 }
+
+static bool DockActivateWindowLocked(int idx) { return DockSelectLocked(DockEntryOf(idx)); }
+bool WmDockSelect(int entry) { VfbGuard guard; return DockSelectLocked(entry); }
 
 static void DockOpenLocked()
 {

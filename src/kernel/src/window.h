@@ -176,6 +176,7 @@ struct Window
     uint16_t    clientPid;      // Connection-origin TGID; never signal authority.
     uint64_t    clientIncarnation;
     uint64_t    clientLaunchId;
+    char        taskbarCatalogId[33]; // exact catalog identity learned from an owned launch
     WmClientOrigin clientOrigin;
     int16_t     x, y;           // window position (outer top-left, including chrome)
     uint16_t    clientW;        // client area width (= VFB width * upscale)
@@ -606,7 +607,7 @@ void WmDockDrag(int32_t mx, bool down);
 int WmCycleFocus();
 
 // Spawn a new terminal window (Super+Enter handler).
-void WmSpawnTerminal();
+int WmSpawnTerminal();
 void WmOpenFiles();
 
 // ---------------------------------------------------------------------------

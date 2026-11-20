@@ -62,6 +62,43 @@ std::string Results(const LauncherModel& m) {
     return Names(m, r, m.SearchResults(r, LauncherLimits::Apps));
 }
 
+void TaskbarLayout()
+{
+    auto m = Fresh();
+    auto& pins = m->DesktopPins();
+    pins.SetDefault();
+    CHECK(pins.Count() == 1 && !std::strcmp(pins.Key(0), TerminalAppKey));
+    const auto launcherPins = m->PinCount();
+    CHECK(m->Parse("[Launcher]\nversion=1\npinned=terminal,firefox\nrecent=quake2\n"));
+    CHECK(pins.Count() == 1);
+    CHECK(pins.Toggle(TerminalAppKey) && !pins.Count());
+    char text[TaskbarPins::TextCapacity];
+    CHECK(pins.Serialize(text, sizeof(text)));
+    TaskbarPins restored{};
+    restored.SetDefault();
+    CHECK(restored.Parse(text) && !restored.Count()); // explicit empty is not first run
+    CHECK(restored.Parse("[Taskbar]\nversion=1\npinned=missing-app,terminal\n"));
+    CHECK(restored.Count() == 2 && restored.Find("missing-app") == 0);
+    CHECK(!restored.Parse("[Taskbar]\nversion=1\npinned=terminal,terminal\n") && restored.Count() == 2);
+    CHECK(!restored.Parse("[Taskbar]\nversion=1\npinned=terminal"));
+    CHECK(!restored.Toggle("bad,key"));
+    CHECK(m->PinCount() == 2 && launcherPins > m->PinCount());
+
+    LauncherApp a = Catalog[3];
+    std::strcpy(a.taskbarKey, "472c261d9ffb0a1760af73c1b28e2d1a");
+    m->SetCatalog(&a, 1);
+    m->OpenMenu(0, 10, 20, true);
+    m->Key(LauncherKey::Down);
+    CHECK(m->MenuItem() == 1 && m->Key(LauncherKey::Enter).command == LauncherCommand::TaskbarChanged);
+    CHECK(pins.Find(a.taskbarKey) == 0 && m->FindTaskbarApp(a.taskbarKey) == 0);
+    std::strcpy(a.name, "Renamed browser");
+    m->SetCatalog(&a, 1);
+    CHECK(m->FindTaskbarApp(a.taskbarKey) == 0);
+    m->OpenMenu(0, 10, 20, false);
+    CHECK(m->Press({LauncherTargetKind::MenuItem, 1}, false, 10, 20).command == LauncherCommand::TaskbarChanged);
+    CHECK(!pins.Count());
+}
+
 void Defaults() {
     auto m = Fresh();
     CHECK(m->CategoryCount() == 7);
@@ -200,11 +237,11 @@ void PinsAndRecent() {
     auto m = Fresh();
     const int doom = Idx(*m, "doom");
     CHECK(!m->Pinned(doom));
-    // Right-click opens the two-item menu; item 0 pins.
+    // Item 0 pins in the launcher, independently of the taskbar.
     m->Press({LauncherTargetKind::Row, uint16_t(doom)}, true, 100, 200);
     CHECK(m->MenuOpen() && m->MenuApp() == doom && m->MenuX() == 100);
-    // Uninstall (item 1) is disabled: nothing happens, the menu stays.
-    CHECK(m->Press({LauncherTargetKind::MenuItem, 1}, false, 0, 0).command == LauncherCommand::None && m->MenuOpen());
+    // Uninstall (item 2) is disabled: nothing happens, the menu stays.
+    CHECK(m->Press({LauncherTargetKind::MenuItem, 2}, false, 0, 0).command == LauncherCommand::None && m->MenuOpen());
     const uint32_t epoch = m->LayoutEpoch();
     m->Press({LauncherTargetKind::MenuItem, 0}, false, 0, 0);
     CHECK(!m->MenuOpen() && m->Pinned(doom) && m->LayoutEpoch() != epoch);
@@ -479,6 +516,7 @@ void Persistence() {
 } // namespace
 
 int main() {
+    TaskbarLayout();
     Defaults();
     Search();
     Navigation();
