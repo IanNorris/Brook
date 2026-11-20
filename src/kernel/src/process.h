@@ -11,6 +11,7 @@
 #include "fd_table.h"
 #include "credential_ids.h"
 #include "user_namespace.h"
+#include "pid_namespace_ids.h"
 #include "signal_return.h"
 #include "task_capacity.h"
 
@@ -584,6 +585,8 @@ struct Process
     uint64_t oomEpisode;
     struct SeccompFilter* seccompFilter; // owned immutable stack, replaced under the task registry lock
     uint32_t seccompTrap;               // synchronous SIGSYS for this syscall's return path
+    PidNamespaceIds pidNamespaceIds;    // immutable after birth, owns the active view
+    const PidNamespace* pidNamespaceForChildren; // owned by this task, independent of the active view
 };
 
 // A completed producer update invalidates any copied desktop-layer snapshot.
@@ -842,7 +845,10 @@ void ProcessCloseCloexecFds(Process* proc); // close FD_CLOEXEC fds on execve
 
 // Signal delivery: send a signal to a process.
 // Returns 0 on success, -ESRCH if not found, -EINVAL if bad signal.
-int ProcessSendSignal(Process* proc, int signum, const SignalInfo* info = nullptr);
+// A null sender is a kernel-originated signal. User syscalls pass their
+// actual source so namespace PID 1 can distinguish an ancestor.
+int ProcessSendSignal(Process* proc, int signum, const SignalInfo* info = nullptr,
+                      const Process* sender = nullptr);
 bool ProcessDequeueSignal(Process* proc, int signum, SignalInfo* info);
 // Non-allocating queue only; caller may hold scheduler locks. No wake/lock inversion.
 void ProcessQueueChildSignal(Process* parent,Process* child);

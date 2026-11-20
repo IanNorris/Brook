@@ -77,10 +77,11 @@ static uint32_t configure_serial(struct wl_display *display, int fd, uint32_t ob
             bounds_height = (int32_t)wire[i+3];
         }
         if (id == observed_toplevel && op == XDG_TOPLEVEL_WM_CAPABILITIES) {
-            assert(!configured && !count && size == 24 && wire[i+2] == 12);
-            assert(wire[i+3] == XDG_TOPLEVEL_WM_CAPABILITIES_MAXIMIZE);
-            assert(wire[i+4] == XDG_TOPLEVEL_WM_CAPABILITIES_MINIMIZE);
-            assert(wire[i+5] == XDG_TOPLEVEL_WM_CAPABILITIES_FULLSCREEN);
+            assert(!configured && !count && size == 28 && wire[i+2] == 16);
+            assert(wire[i+3] == XDG_TOPLEVEL_WM_CAPABILITIES_WINDOW_MENU);
+            assert(wire[i+4] == XDG_TOPLEVEL_WM_CAPABILITIES_MAXIMIZE);
+            assert(wire[i+5] == XDG_TOPLEVEL_WM_CAPABILITIES_MINIMIZE);
+            assert(wire[i+6] == XDG_TOPLEVEL_WM_CAPABILITIES_FULLSCREEN);
             ++capability_events;
         }
         if (id == object && op == XDG_SURFACE_CONFIGURE) {

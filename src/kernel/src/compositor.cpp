@@ -12,6 +12,7 @@
 #include "desktop_pointer_route.h"
 #include "global_shortcuts.h"
 #include "compositor.h"
+#include "pid_namespace.h"
 #include "input_grab_policy.h"
 #include "../../shared/brook_debug_frame.h"
 #include "boot_logo.h"
@@ -1784,12 +1785,19 @@ static void CursorLoadBuiltinPixels()
     g_cursorBuiltin = true;
 }
 
+static CursorShape CompositorCursorShape();
+static CursorImage g_cursorShapeSource;
+static CursorShape g_cursorShapeLoaded = CursorShape::Arrow;
+
 static void CursorPrepareFrame(bool busy, uint64_t now)
 {
     // Ownership follows the hover except while a button is held, so a drag
     // (selection, WM resize) keeps the cursor it started with.
     const uint64_t hover = WmPointerHoverIdentity();
     const bool buttons = MouseGetButtons() != 0;
+    // Away from client areas the built-in cursor takes the WM's shape: the
+    // resize arrows over frame edges and the dock's grip.
+    const CursorShape shape = CompositorCursorShape();
     SpinLockAcquire(&g_cursorSourceLock);
     if (!g_cursorSourceReady) CursorLoadBuiltinPixels();
     const bool showClient = g_cursorOwnership.Update(hover, buttons);
@@ -1798,7 +1806,12 @@ static void CursorPrepareFrame(bool busy, uint64_t now)
         CursorFillBuiltin(g_cursorBuiltinSource);
         g_cursorBuiltinReady = true;
     }
-    const CursorImage& source = g_cursorBuiltin || showClient ? g_cursorSource : g_cursorBuiltinSource;
+    const CursorImage* chosen = g_cursorBuiltin || showClient ? &g_cursorSource : &g_cursorBuiltinSource;
+    if (builtin && shape != CursorShape::Arrow) {
+        if (g_cursorShapeLoaded != shape && CursorFillShape(shape, g_cursorShapeSource)) g_cursorShapeLoaded = shape;
+        if (g_cursorShapeLoaded == shape) chosen = &g_cursorShapeSource;
+    }
+    const CursorImage& source = *chosen;
     if(builtin && WmGetAppliedScale()!=100) {
         ComposeCursor(source,g_cursorLogicalFrame,busy,now,WmCurrentPalette().borderActive);
         ScaleCursor(g_cursorLogicalFrame,g_cursorFrame,WmGetAppliedScale());
@@ -2456,7 +2469,8 @@ static void CompositorLoopWM()
         WmHitResult hh = WmHitTest(hmx, hmy);
         bool overButton = (hh.zone == WmHitZone::CloseButton ||
                            hh.zone == WmHitZone::MaximizeButton ||
-                           hh.zone == WmHitZone::MinimizeButton);
+                           hh.zone == WmHitZone::MinimizeButton ||
+                           hh.zone == WmHitZone::DockButton);
         // Signature: window index + zone when over a button, else a sentinel.
         uint32_t sig = overButton
             ? ((static_cast<uint32_t>(hh.windowIndex) << 8) | static_cast<uint32_t>(hh.zone))
@@ -2786,6 +2800,7 @@ static void CompositorRunShortcut(const GlobalShortcutResult& r)
         break;
     case GlobalShortcutAction::DockFocusedWindow:WmDockFocusedWindow();break;
     case GlobalShortcutAction::CloseDock:WmDockDismiss();break;
+    case GlobalShortcutAction::CloseWindowMenu:WmWindowMenuClose();break;
     case GlobalShortcutAction::SpawnTerminal:WmSpawnTerminal();break;
     case GlobalShortcutAction::OpenFiles:WmOpenFiles();break;
     case GlobalShortcutAction::ToggleGlass:WmToggleFocusedWindowGlass();break;
@@ -2818,6 +2833,7 @@ static void CompositorInputWM()
             context.volumePopupVisible=WmVolumePopupVisible() || WmTrayFlyoutVisible();
             context.launcherPrompt=WmLauncherPowerPrompt();
             context.dockDismissible=WmDockDismissible();
+            context.windowMenuOpen=WmWindowMenuOpen();
             GlobalShortcutResult shortcut=g_globalShortcuts.Key(
                 ev.type==InputEventType::KeyPress,ev.scanCode,ev.modifiers,context);
             shortcut.ascii=ev.ascii;shortcut.modifiers=ev.modifiers;
@@ -3147,6 +3163,7 @@ static void CompositorInputWM()
 static bool    g_wmDragging      = false;
 static int     g_wmDragWindow    = -1;
 static int16_t g_wmDragOffsetX   = 0;
+static int16_t g_wmDragStartX = 0, g_wmDragStartY = 0; // window origin when the move began (drag to dock)
 static int16_t g_wmDragOffsetY   = 0;
 static bool    g_wmResizing      = false;
 static int     g_wmResizeWindow  = -1;
@@ -3176,6 +3193,26 @@ static void CompositorReconcilePointerCapture() {
     g_wmLastBtnDown=(MouseGetButtons()&~WmPointerSuppressedButtons()&MOUSE_BTN_LEFT)!=0;
 }
 
+// The built-in cursor's shape: what a press here would do (or the drag in
+// progress). Shell surfaces, popups and client areas keep the arrow; a
+// client sets its own cursor over its client area anyway.
+static CursorShape CompositorCursorShape()
+{
+    if (WmDockDragActive()) return CursorShape::ResizeH;
+    if (g_wmResizing)
+        return CursorShapeForEdges(uint8_t((g_wmResizeLeft ? 1 : 0) | (g_wmResizeTop ? 2 : 0) |
+                                           (g_wmResizeRight ? 4 : 0) | (g_wmResizeBottom ? 8 : 0)));
+    if (g_wmDragging || !MouseIsAvailable()) return CursorShape::Arrow;
+    int32_t mx = 0, my = 0;
+    MouseGetPosition(&mx, &my);
+    if (WmDockGripAt(mx, my, g_physFbWidth, g_physFbHeight)) return CursorShape::ResizeH;
+    if (WmLauncherVisible() || WmVolumePopupVisible() || WmTrayFlyoutVisible() || WmWindowMenuOpen() ||
+        my >= static_cast<int32_t>(WmTaskbarTop(g_physFbHeight)) ||
+        WmDockPointerOwned(mx, my, g_physFbWidth, g_physFbHeight))
+        return CursorShape::Arrow;
+    return CursorShapeForEdges(WmHitZoneResizeEdges(WmHitTest(mx, my).zone));
+}
+
 bool CompositorBeginWindowMove(int windowIdx)
 {
     if (!MouseIsAvailable()) return false;
@@ -3188,6 +3225,8 @@ bool CompositorBeginWindowMove(int windowIdx)
     g_wmDragWindow = windowIdx;
     g_wmDragOffsetX = static_cast<int16_t>(mx - w->x);
     g_wmDragOffsetY = static_cast<int16_t>(my - w->y);
+    g_wmDragStartX = w->x;
+    g_wmDragStartY = w->y;
     g_wmLastBtnDown = true;
     WmSetFocus(windowIdx);
     return true;
@@ -3282,7 +3321,10 @@ static void CompositorHandleMouseWM()
         if (WmDockPress(mx, my, g_physFbWidth, g_physFbHeight))
         {
             if (WmLauncherVisible()) WmLauncherClose();
-            if (releaseLatched && !polledDown) { g_wmPrimaryDown = false; g_wmLastBtnDown = false; }
+            if (releaseLatched && !polledDown) {
+                g_wmPrimaryDown = false; g_wmLastBtnDown = false;
+                if (WmDockDragActive()) WmDockDrag(mx, false);
+            }
             else g_wmLastBtnDown = btnDown;
             return;
         }
@@ -3411,6 +3453,9 @@ static void CompositorHandleMouseWM()
             case WmHitZone::MinimizeButton:
                 WmMinimizeWindow(hit.windowIndex);
                 break;
+            case WmHitZone::DockButton:
+                WmDockWindow(hit.windowIndex);
+                break;
             case WmHitZone::TitleBar:
             {
                 Window* w=WmGetWindow(hit.windowIndex);
@@ -3437,14 +3482,24 @@ static void CompositorHandleMouseWM()
     {
         WmVolumeDrag(mx, btnDown, g_physFbWidth, g_physFbHeight);
     }
+    else if (WmDockDragActive())
+    {
+        // A latched release ends the drag in this pass (the bottom of the
+        // function clears the held state the same way).
+        WmDockDrag(mx, btnDown && !(releaseLatched && !polledDown));
+    }
     else if (btnDown && g_wmDragging)
     {
         g_titleClicks.Motion(mx,my);
         const Window* dragged=WmGetWindow(g_wmDragWindow);
-        if(!dragged||dragged->state==WindowState::Maximized){g_wmDragging=false;g_wmDragWindow=-1;}
-        else WmMoveWindow(g_wmDragWindow,
+        if(!dragged||dragged->state==WindowState::Maximized){
+            g_wmDragging=false;g_wmDragWindow=-1;WmDockWindowDragCancel();
+        } else {
+            WmMoveWindow(g_wmDragWindow,
                          static_cast<int16_t>(mx - g_wmDragOffsetX),
                          static_cast<int16_t>(my - g_wmDragOffsetY));
+            WmDockWindowDrag(g_wmDragWindow, mx, my);
+        }
     }
     else if (btnDown && g_wmResizing)
     {
@@ -3500,6 +3555,9 @@ static void CompositorHandleMouseWM()
     }
     else if (!btnDown && !releaseLatched)
     {
+        // A window move released over the dock's drop target docks it.
+        if (g_wmDragging && g_wmDragWindow >= 0)
+            WmDockWindowDrop(g_wmDragWindow, mx, my, g_wmDragStartX, g_wmDragStartY);
         // On release, do the actual VFB resize if we were resizing
         if (g_wmResizing && g_wmResizeWindow >= 0)
         {
@@ -3521,6 +3579,8 @@ static void CompositorHandleMouseWM()
 
     if (releaseLatched && !polledDown)
     {
+        if (g_wmDragging && g_wmDragWindow >= 0)
+            WmDockWindowDrop(g_wmDragWindow, mx, my, g_wmDragStartX, g_wmDragStartY);
         if (g_wmResizing && g_wmResizeWindow >= 0)
         {
             Window* w = WmGetWindow(g_wmResizeWindow);
@@ -5098,6 +5158,7 @@ uint32_t CompositorGetWindows(Process* caller, WmWindowDesc* out, uint32_t maxCo
 {
     if (!caller || !out || maxCount == 0) return 0;
 
+    const auto* view = ProcessPidView(caller);
     uint32_t written = 0;
     for (uint32_t i = 0; i < WM_MAX_WINDOWS && written < maxCount; ++i)
     {
@@ -5119,7 +5180,8 @@ uint32_t CompositorGetWindows(Process* caller, WmWindowDesc* out, uint32_t maxCo
         if (w->focusable) d.flags |= WM_DESC_FOCUSABLE;
         d.vfbStride = w->vfbStride;
         d.vfbBytes  = static_cast<uint32_t>(w->vfbBytes);
-        d.pid       = w->proc->pid;
+        const uint32_t tid = ProcessVisibleTid(w->proc, view);
+        d.pid = tid <= 0xffffu ? static_cast<uint16_t>(tid) : 0;
 
         // Copy title
         for (uint32_t t = 0; t < 63 && w->title[t]; t++)

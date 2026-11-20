@@ -184,20 +184,28 @@ static int VfsEnterMountsLocked(VfsPath* path,const VfsPath* parent=nullptr,cons
 }
 struct VfsRetainedProvider {
     bool realIds=false;
+    // Legacy mount alias matching needs attachment identity before it can
+    // check access. Callers exposing objects leave policy enabled.
+    bool enforceSystemAccess=true;
+    bool Denied(const VfsPath& path) const {
+        return enforceSystemAccess && VfsSystemMountDenied(static_cast<MountEntry*>(path.attachment));
+    }
     void Retain(const VfsPath& path) { VfsPathRetain(path); }
     void Release(const VfsPath& path) { VfsPathRelease(path); }
     bool Same(const VfsPath& a,const VfsPath& b) { return VfsPathSame(a,b); }
     int Stat(const VfsPath& path,RetainedNodeInfo& out) {
         if(!path.object)return -9;
+        if(Denied(path))return -13;
         VnodeStat stat{};
         int error=path.object->ops->stat?path.object->ops->stat(path.object,&stat):-95;
         out={stat.isDir,stat.isSymlink};return error;
     }
     int Search(const VfsPath& path) {
+        if(Denied(path))return -13;
         return path.object->ops->access?path.object->ops->access(path.object,1,realIds):-95;
     }
     int Lookup(const VfsPath& parent,const char* name,VfsPath& out) {
-        out={};
+        out={};if(Denied(parent))return -13;
         if(VfsReservedVirtualLocked(parent,name,&out)) {
             // Reservation conflicts through ordinary VFS mutations are refused.
             // A backend-direct mutation must not silently hide a real child.
@@ -214,12 +222,14 @@ struct VfsRetainedProvider {
             VfsPathHoldMount(mount);
             out={mount,object};
         }
-        const int error=VfsEnterMountsLocked(&out,&parent,name);
+        int error=VfsEnterMountsLocked(&out,&parent,name);
+        if(!error && Denied(out))error=-13;
         if(error) { VfsPathRelease(out);out={}; }
         return error;
     }
     int Parent(const VfsPath& path,const VfsPath& root,VfsPath& out) {
-        out={};VfsPath current=path;VfsPathRetain(current);
+        out={};if(Denied(path))return -13;
+        VfsPath current=path;VfsPathRetain(current);
         for(uint32_t step=0;step<=VFS_MAX_MOUNT_DEPTH;++step) {
             if(Same(current,root)) { out=current;return 0; }
             auto* mount=static_cast<MountEntry*>(current.attachment);
@@ -569,6 +579,7 @@ int VfsPathStat(const VfsPath& path,VnodeStat* out)
 {
     if(!out)return -22;
     *out={};if(!path.object)return -9;
+    if(VfsSystemMountDenied(static_cast<MountEntry*>(path.attachment)))return -13;
     FileMutationGuard lookup(false);
     return path.object->ops->stat?path.object->ops->stat(path.object,out):-95;
 }
@@ -602,6 +613,7 @@ int VfsPathAccess(const VfsPath& path,uint8_t required,bool realIds)
 {
     if(required&~7u)return -22;
     if(!path.object)return -9;
+    if(VfsSystemMountDenied(static_cast<MountEntry*>(path.attachment)))return -13;
     FileMutationGuard lookup(false);
     if((required&2) && VfsReadOnly(static_cast<MountEntry*>(path.attachment))) {
         VnodeStat stat{};int error=path.object->ops->stat?path.object->ops->stat(path.object,&stat):-95;
@@ -624,6 +636,7 @@ static Vnode* VfsPathOpenLocked(const VfsPath& path,int flags,int* error)
     }
     if(!path.object->ops->open) { *error=-95;return nullptr; }
     auto* mount=static_cast<MountEntry*>(path.attachment);
+    if(VfsSystemMountDenied(mount)) { *error=-13;return nullptr; }
     if((flags&VFS_O_EXEC) && VfsNoExec(mount)) { *error=-13;return nullptr; }
     bool fifo=false;
     if((flags&VFS_O_TRUNC) || (VfsReadOnly(mount) && (flags&VFS_O_WRITE))) {

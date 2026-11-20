@@ -4,6 +4,8 @@
 #include "harness.h"
 #include "syscall_brook_system.cpp"
 #include "syscall_brook_wm.cpp"
+#include "pid_namespace.h"
+#include "user_namespace.h"
 
 using namespace harness;
 namespace {
@@ -22,6 +24,14 @@ uint32_t g_inputPopped;
 
 extern "C" void MouseGetPosition(int32_t* x,int32_t* y) { *x=100;*y=50; }
 namespace brook {
+uint32_t CompositorGetWindows(Process*,WmWindowDesc*,uint32_t) {
+    CHECK(false); // An unauthorized call must never reach enumeration.
+    return 0;
+}
+uint64_t CompositorMapWindowVfb(Process*,uint32_t) {
+    CHECK(false); // An unauthorized call must never create an alias.
+    return 0;
+}
 WmCreateWindowResult WmCreateWindowForProcess(Process*,uint16_t,uint16_t,const char* title,bool,bool,bool fineScroll) {
     ++g_wm.creates;g_wm.exists=true;g_wm.fineScroll=fineScroll;
     if(title)for(int i=0;i<64;++i)g_wm.title[i]=title[i];
@@ -158,9 +168,43 @@ static void ResizeVfb() {
     CHECK(reinterpret_cast<const uint32_t*>(UserAddress(0))[1]==8192);
 }
 
+static void RejectWindowCapture() {
+    Reset();ResetProcess();
+    auto* proc=CurrentProcess();
+    const uint64_t out=UserAddress(0);
+    auto* bytes=reinterpret_cast<uint8_t*>(out);
+    __builtin_memset(bytes,0xa5,sizeof(brook::WmWindowDesc));
+    const auto denied=[&] {
+        CHECK(brook::sys_brook_wm_get_windows(out,1,0,0,0,0)==-brook::EPERM);
+        CHECK(brook::sys_brook_wm_get_windows(g_kernel.Address(),1,0,0,0,0)==-brook::EPERM);
+        CHECK(brook::sys_brook_wm_map_window_vfb(3,0,0,0,0,0)==-brook::EPERM);
+        for(unsigned i=0;i<sizeof(brook::WmWindowDesc);++i)CHECK(bytes[i]==0xa5);
+        CHECK(g_kernel.Intact());
+    };
+
+    proc->euid=brook::DesktopUid;
+    denied();
+
+    // The expected executable spelling alone is not ownership of the service.
+    proc->euid=0;
+    __builtin_memcpy(proc->exePath,"/boot/CWSHELL.ELF",sizeof("/boot/CWSHELL.ELF"));
+    denied();
+
+    brook::Process parent{};
+    brook::UserNamespace user{};
+    proc->userNamespace=&user;
+    CHECK(!brook::ProcessPidPrepareChild(proc,&parent,true));
+    CHECK(brook::ProcessPidPublish(proc,true));
+    CHECK(brook::ProcessVisibleTid(proc,brook::ProcessPidView(proc))==1);
+    denied();
+    brook::ProcessPidRelease(proc);
+    proc->userNamespace=nullptr;
+}
+
 void RunInputWmTests() {
     InputPop();
     CreateWindow();
+    RejectWindowCapture();
     SetTitle();
     PopInput();
     ResizeVfb();

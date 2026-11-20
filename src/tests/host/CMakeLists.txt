@@ -441,6 +441,8 @@ target_compile_options(test_tcp PRIVATE
 # user memory only through the checked copies; see harness.h.
 add_host_test(test_syscall_user_memory
     "${BROOK_ROOT}/src/kernel/src/process_namespaces.cpp"
+    "${BROOK_ROOT}/src/kernel/src/pid_namespace.cpp"
+    "${BROOK_ROOT}/src/kernel/src/shell_service.cpp"
     "${BROOK_ROOT}/src/tests/test_syscall_user_memory/input_wm.cpp"
     "${BROOK_ROOT}/src/tests/test_syscall_user_memory/dir_open.cpp"
     "${BROOK_ROOT}/src/tests/test_syscall_user_memory/rw.cpp"
@@ -686,6 +688,11 @@ target_compile_options(test_profiler_stack PRIVATE
 # Saved-ID transitions and all-or-nothing unprivileged credential changes.
 add_host_test(test_credential_ids)
 add_host_test(test_user_namespace)
+add_host_test(test_pid_namespace_ids)
+add_host_test(test_pid_namespace_admission "${BROOK_ROOT}/src/kernel/src/pid_namespace.cpp")
+target_compile_options(test_pid_namespace_admission PRIVATE -UNDEBUG -DBROOK_HOST_TEST
+    "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared"
+    "-iquote${BROOK_ROOT}/src/shared/inc_km")
 add_host_test(test_seccomp "${BROOK_ROOT}/src/kernel/src/seccomp_bpf.cpp")
 target_compile_options(test_seccomp PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_user_credentials)

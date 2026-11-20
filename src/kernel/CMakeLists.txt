@@ -392,6 +392,7 @@ add_executable(kernel
     src/compat_paths.cpp
     src/process_fs.cpp
     src/process_namespaces.cpp
+    src/pid_namespace.cpp
     src/fs_context.cpp
     src/fatfs_vfs.cpp
     src/guard_readonly_view.cpp

@@ -3,6 +3,7 @@
 // Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
+#include "pid_namespace.h"
 #include "core_autodump.h"
 #include "process_user_namespace.h"
 #include "process_namespaces.h"
@@ -85,13 +86,13 @@ static rlimit64 ReportedResourceLimit(uint64_t resource)
 
 static int64_t CoreResourceLimit(uint64_t pid,uint64_t newlimitAddr,uint64_t oldlimitAddr)
 {
-    if(pid>65535)return -ESRCH;
+    if (static_cast<int32_t>(pid) < 0) return -ESRCH;
     CoreResourceLimits requested{},previous{};
     if(newlimitAddr && !CopyFromUser(&requested,newlimitAddr,sizeof(requested)))return -EFAULT;
     auto* caller=ProcessCurrent();
     if(!caller)return -ESRCH;
     const bool privileged=ProcessCapable(caller,nullptr,24); // CAP_SYS_RESOURCE in initial namespace
-    const int result=SchedulerCoreResourceLimit(caller,static_cast<uint16_t>(pid),
+    const int result=SchedulerCoreResourceLimit(caller,static_cast<uint32_t>(pid),
                                                 newlimitAddr?&requested:nullptr,previous,privileged);
     if(result)return result;
     if(oldlimitAddr && !CopyToUser(oldlimitAddr,&previous,sizeof(previous)))return -EFAULT;
@@ -108,7 +109,8 @@ int64_t sys_setrlimit(uint64_t resource,uint64_t newlimitAddr,uint64_t,uint64_t,
 int64_t sys_brook_core_dump(uint64_t pid,uint64_t flags,uint64_t,uint64_t,uint64_t,uint64_t)
 {
     if(!pid || pid>65535 || flags)return -EINVAL;
-    if(!ProcessCapable(ProcessCurrent(),nullptr,19))return -EPERM; // CAP_SYS_PTRACE in initial namespace
+    auto* caller = ProcessCurrent();
+    if (ProcessPidView(caller) || !ProcessCapable(caller,nullptr,19)) return -EPERM; // CAP_SYS_PTRACE in initial namespace
     return SchedulerCoreAutoQueue(static_cast<uint16_t>(pid));
 }
 
@@ -116,7 +118,14 @@ int64_t sys_prlimit64(uint64_t pid, uint64_t resource, uint64_t newlimitAddr,
                         uint64_t oldlimitAddr, uint64_t, uint64_t)
 {
     if(resource==4)return CoreResourceLimit(pid,newlimitAddr,oldlimitAddr);
-    (void)pid; (void)newlimitAddr;
+    (void)newlimitAddr;
+    auto* caller = ProcessCurrent();
+    if (pid && ProcessPidView(caller)) {
+        const int32_t tid = static_cast<int32_t>(pid);
+        auto* target = tid > 0 ? SchedulerFindVisibleProcessReference(ProcessPidView(caller), tid) : nullptr;
+        if (!target) return -ESRCH;
+        ProcessUnref(target);
+    }
 
     if (oldlimitAddr)
     {

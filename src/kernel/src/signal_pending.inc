@@ -113,7 +113,7 @@ bool ProcessDequeueSignal(Process* proc, int signum, SignalInfo* info)
 
 void ProcessQueueChildSignal(Process* parent,Process* child)
 {
-    const uint32_t pid=child->pid,uid=child->uid;
+    const uint32_t pid=ProcessVisibleTgid(child, ProcessPidView(parent)),uid=child->uid;
     int code=1,status=(child->waitStatus>>8)&255;
     if(child->state==ProcessState::Stopped){code=5;status=child->stopSignal;}
     else if(child->state!=ProcessState::Terminated && child->continuedPending){code=6;status=18;}

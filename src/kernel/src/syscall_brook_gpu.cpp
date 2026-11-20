@@ -106,7 +106,7 @@ static int64_t ValidateGpuWindowProvider(Process* proc,uint64_t fdValue,uint64_t
     UnixCredentials peer{};uint64_t peerIncarnation=0;
     SpinLockAcquire(&g_unixRegistryLock);
     const bool accepted=socket->state==UnixSocketData::State::Connected && socket->acceptedEndpoint && socket->socketType==5;
-    if(accepted){peer=socket->peerCredentials;peerIncarnation=socket->peerIncarnation;}
+    if(accepted){peer=socket->peerCredentials.raw;peerIncarnation=socket->peerIncarnation;}
     SpinLockRelease(&g_unixRegistryLock);
     if(!accepted || peer.pid<=0 || !peerIncarnation)return -EPERM;
     return brook::WmGpuSourceProviderMatches(static_cast<uint32_t>(window),incarnation,
@@ -298,13 +298,13 @@ int64_t sys_brook_gpu_window_peer_recovery(uint64_t fdValue,uint64_t op,uint64_t
     UnixCredentials peer{};uint64_t peerIncarnation=0;bool authorized=false;
     SpinLockAcquire(&g_unixRegistryLock);
     const bool connected=socket->state==UnixSocketData::State::Connected && !socket->acceptedEndpoint && socket->socketType==5;
-    if(connected){peer=socket->peerCredentials;peerIncarnation=socket->peerIncarnation;authorized=socket->gpuPeerAuthorized;}
+    if(connected){peer=socket->peerCredentials.raw;peerIncarnation=socket->peerIncarnation;authorized=socket->gpuPeerAuthorized;}
     SpinLockRelease(&g_unixRegistryLock);
     if(!connected || peer.pid<=0 || peer.pid>65535 || !peerIncarnation)return -EPERM;
     if(op==BROOK_GPU_WINDOW_PEER_AUTH){
         if(!brook::BdwOffscreenRendererOwnedBy(peerIncarnation))return -EPERM;
         SpinLockAcquire(&g_unixRegistryLock);
-        const bool same=socket->state==UnixSocketData::State::Connected && socket->peerIncarnation==peerIncarnation && socket->peerCredentials.pid==peer.pid;
+        const bool same=socket->state==UnixSocketData::State::Connected && socket->peerIncarnation==peerIncarnation && socket->peerCredentials.raw.pid==peer.pid;
         if(same)socket->gpuPeerAuthorized=true;
         SpinLockRelease(&g_unixRegistryLock);return same?0:-116; // ESTALE
     }

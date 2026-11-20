@@ -167,6 +167,10 @@ static void dockKeys() {
     // The volume popup's Escape comes first; the launcher owns its keys.
     GlobalShortcutContext both=dock;both.volumePopupVisible=true;
     CHECK(down(s,G::ScEscape,0,both).action==Action::CloseVolumePopup);up(s,G::ScEscape);
+    // A window menu's Escape comes before both.
+    GlobalShortcutContext menu=both;menu.windowMenuOpen=true;
+    r=down(s,G::ScEscape,0,menu);CHECK(!r.deliver && r.action==Action::CloseWindowMenu);
+    CHECK(!up(s,G::ScEscape,0,menu).deliver);
     GlobalShortcutContext launcher{};launcher.launcherVisible=true;
     CHECK(down(s,G::ScS,0,launcher).action==Action::LauncherKey);up(s,G::ScS);
     // Super+S still toggles the dock over the launcher.

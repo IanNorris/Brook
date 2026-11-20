@@ -17,6 +17,7 @@ static int VfsWalkAtLocked(const VfsPath& root,const VfsPath& start,const char* 
 static int VfsMutationLeaf(const VfsPath& parent,const char* name,bool requireWritable=true)
 {
     if(!parent.object)return -16;
+    if(VfsSystemMountDenied(static_cast<MountEntry*>(parent.attachment)))return -13;
     if(requireWritable && VfsReadOnly(static_cast<MountEntry*>(parent.attachment)))return -30;
     if(!name || !name[0] || StrEq(name,".") || StrEq(name,".."))return -22;
     for(uint32_t i=0;name[i];++i)if(name[i]=='/')return -22;

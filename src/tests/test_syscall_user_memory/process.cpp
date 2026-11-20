@@ -39,7 +39,7 @@ void SchedulerAddProcess(Process* child) {
     g_vforkParentWhenRunnable=child->vforkParent;
     if(g_childRunsFirst)g_childRunsFirst(child);
 }
-void SchedulerAddProcessWithSeccomp(Process* child, Process*) { SchedulerAddProcess(child); }
+bool SchedulerAddProcessWithSeccomp(Process* child, Process*) { SchedulerAddProcess(child); return true; }
 
 }
 // Overrides the shared stub for this TU's waits: count blocks and give up

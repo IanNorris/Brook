@@ -7,7 +7,7 @@ namespace brook {
 static void CaptionButtons(ChromeDisplayList& dl, const ChromeStyle& s, const ChromeFrameModel& m,
                            uint32_t fg, uint32_t hoverBg, uint32_t hoverInk)
 {
-    for (int button = 0; button < 3; ++button)
+    for (int button = 0; button < ChromeCaptionLimit; ++button)
     {
         const ChromePart* part = m.layout.Find(ChromeCaptionRole(button));
         if (!part) continue;
@@ -24,6 +24,7 @@ static void CaptionButtons(ChromeDisplayList& dl, const ChromeStyle& s, const Ch
         const uint32_t ink = hover && button == 0 ? s.P().closeText : hover ? hoverInk : fg;
         // The 16 px line icons (DESIGN.md "Type and icons"), centred in the cell.
         const ChromeGlyph icon = button == 0 ? ChromeGlyph::Close : button == 2 ? ChromeGlyph::Minimise :
+                                 button == 3 ? (m.layout.dockRight ? ChromeGlyph::DockRight : ChromeGlyph::DockLeft) :
                                  m.maximised ? ChromeGlyph::Restore : ChromeGlyph::Maximise;
         dl.Glyph(icon, r.x + (r.w - glyph) / 2, r.y + (r.h - glyph) / 2, ink);
     }
@@ -101,7 +102,9 @@ void ChromeBuildFrame(const ChromeFrameModel& m, const ChromeStyle& s, ChromeDis
             dl.FadeX(start + solid, y, width - solid, s.M(2), 0xff000000u | p.accent);
         }
     }
-    const ChromePart* minimise = m.layout.Find(ChromePartRole::Minimise);
+    // The title ends at the leftmost caption button.
+    const ChromePart* dock = m.layout.Find(ChromePartRole::Dock);
+    const ChromePart* minimise = dock ? dock : m.layout.Find(ChromePartRole::Minimise);
     const int runLeft = minimise ? minimise->visual.x : x + ow;
     const int iconX = tx + s.M(10);
     const int icon = s.M(16);

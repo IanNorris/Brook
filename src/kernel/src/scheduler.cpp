@@ -3,6 +3,7 @@
 #include "user_copy.h"
 #include "scheduler.h"
 #include "seccomp.h"
+#include "pid_namespace.h"
 #include "cpu_idle.h"
 #include "scheduler_affinity.h"
 #include "robust_futex.h"
@@ -1132,11 +1133,14 @@ static void NotifyParentGroupLocked(Process* child)
     if (recipient) ProcessQueueChildSignal(recipient,child);
 }
 
+static void BeginPidNamespaceDrainLocked(const Process* last);
+static bool PidNamespaceInitAwaitingDrain(const Process* process);
+
 static void NotifyExitedParentLocked(Process* child)
 {
     const uint32_t robust=__atomic_load_n(&child->robustExitState,__ATOMIC_ACQUIRE);
     if(robust==1 || robust==2 || __atomic_load_n(&child->robustListHead,__ATOMIC_ACQUIRE))return;
-    if (child->state == ProcessState::Terminated) NotifyParentGroupLocked(child);
+    if (child->state == ProcessState::Terminated && !PidNamespaceInitAwaitingDrain(child)) NotifyParentGroupLocked(child);
 }
 
 #include "scheduler_subreaper.inc"
@@ -1146,10 +1150,16 @@ static void NotifyExitedParentLocked(Process* child)
 // exits, including a nonleader; an exited leader alone does not orphan children.
 static void ReparentDeadGroupLocked(uint16_t tgid)
 {
-    for (uint32_t i = 0; i < g_processCount; ++i)
-        if (g_allProcesses[i]->tgid == tgid &&
-            g_allProcesses[i]->state != ProcessState::Terminated) return;
-    const uint16_t adopter=FindChildSubreaperLocked(tgid);
+    Process* representative = nullptr;
+    for (uint32_t i = 0; i < g_processCount; ++i) {
+        Process* task = g_allProcesses[i];
+        if (task->tgid != tgid) continue;
+        if (task->state != ProcessState::Terminated) return;
+        if (!task->isThread) representative = task;
+    }
+    const auto* view = ProcessPidView(representative);
+    if (representative) BeginPidNamespaceDrainLocked(representative);
+    const uint16_t adopter = FindChildSubreaperLocked(tgid, view);
     for (uint32_t i = 0; i < g_processCount; ++i)
         if (g_allProcesses[i]->parentPid == tgid) {
             g_allProcesses[i]->parentPid = adopter;
@@ -1192,6 +1202,8 @@ static void ReleaseSchedulerReference(Process* proc, bool retired)
     // No proc dereference here: a waiting parent may now destroy it.
     if (flags & 0x200) __asm__ volatile("sti" ::: "memory");
 }
+
+#include "scheduler_pid_namespace.inc"
 
 void SchedulerReleaseWaitReference(Process* proc)
 {
@@ -1415,7 +1427,7 @@ static void ForkChildTrampoline()
     // interrupts on, as ProcessTrampoline does before entering user mode.
     if (const uint64_t tidAddress = proc->setChildTid) {
         proc->setChildTid = 0;
-        const int32_t tid = static_cast<int32_t>(proc->pid);
+        const int32_t tid = static_cast<int32_t>(ProcessVisibleTid(proc, ProcessPidView(proc)));
         __asm__ volatile("sti" ::: "memory");
         (void)CopyToUser(tidAddress, &tid, sizeof(tid));
     }
@@ -1500,13 +1512,17 @@ static void InheritSeccompForBirth(Process* proc, Process* parent)
     SeccompRetain(filter);
     proc->seccompFilter = filter;
     if (ProcessGetNoNewPrivs(parent)) ProcessSetNoNewPrivs(proc);
+    if (ProcessPidView(proc)) {
+        ProcessSetGroupView(proc, parent, false, false);
+        ProcessSetGroupView(proc, parent, true, false);
+    }
 }
 
 #include "scheduler_process_birth.inc"
 
-void SchedulerAddProcessWithSeccomp(Process* proc, Process* parent)
+bool SchedulerAddProcessWithSeccomp(Process* proc, Process* parent)
 {
-    AddProcessForBirth(proc, parent);
+    return AddProcessForBirth(proc, parent);
 }
 
 void SchedulerRemoveProcess(Process* proc)
@@ -1783,7 +1799,7 @@ static void ReapTerminated()
             && __atomic_load_n(&p->refCount, __ATOMIC_ACQUIRE) == 0
             && p != g_perCpu[cpu].currentProcess)
         {
-            if (!p->isThread && ThreadGroupHasLivePeerLocked(p))
+            if (!p->isThread && (ThreadGroupHasLivePeerLocked(p) || PidNamespaceInitAwaitingDrain(p)))
             {
                 ++i;
                 continue;
@@ -2253,6 +2269,8 @@ void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool
                 ReleaseSchedulerReference(fatal[i], false);
             }
         }
+
+        DrainPidNamespaces();
 
         // Destruction closes filesystem handles and may sleep. Never run it
         // atop an interrupted kernel operation (which might own the same lock),
@@ -2948,6 +2966,166 @@ Process* SchedulerFindProcessReference(uint16_t pid)
     SchedLockRelease(g_allProcLock, flags);
     return found;
 }
+static Process* FindVisibleTaskLocked(const PidNamespace* view, uint32_t tid)
+{
+    for (uint32_t i = 0; i < g_processCount; ++i)
+        if (ProcessVisibleTid(g_allProcesses[i], view) == tid) return g_allProcesses[i];
+    return nullptr;
+}
+
+Process* SchedulerFindVisibleProcessReference(const PidNamespace* view, uint32_t tid)
+{
+    if (!tid) return nullptr;
+    if (!view) return tid <= 0xffffu ? SchedulerFindProcessReference(tid) : nullptr;
+    const auto flags = SchedLockAcquire(g_allProcLock);
+    Process* found = FindVisibleTaskLocked(view, tid);
+    if (found) ProcessRef(found);
+    SchedLockRelease(g_allProcLock, flags);
+    return found;
+}
+
+uint32_t SchedulerVisibleParentTid(const Process* process, const PidNamespace* view)
+{
+    if (!view) return process->parentPid;
+    const auto flags = SchedLockAcquire(g_allProcLock);
+    uint32_t result = 0;
+    for (uint32_t i = 0; i < g_processCount; ++i) {
+        const auto* parent = g_allProcesses[i];
+        if (!parent->isThread && parent->pid == process->parentPid) {
+            result = ProcessVisibleTgid(parent, view);
+            break;
+        }
+    }
+    SchedLockRelease(g_allProcLock, flags);
+    return result;
+}
+
+uint32_t SchedulerTranslateProcessGroup(const Process* process, uint32_t group, bool toGlobal)
+{
+    const auto* view = ProcessPidView(process);
+    if (!view) return group;
+    const auto flags = SchedLockAcquire(g_allProcLock);
+    uint32_t result = 0;
+    for (uint32_t i = 0; i < g_processCount; ++i) {
+        const Process* member = g_allProcesses[i];
+        if (!member || member->state == ProcessState::Terminated || !ProcessVisibleTid(member, view) ||
+            member->sid != process->sid) continue;
+        const uint32_t visible = ProcessVisibleGroup(member, view, false);
+        if (group == (toGlobal ? visible : member->pgid)) {
+            result = toGlobal ? member->pgid : visible;
+            break;
+        }
+    }
+    SchedLockRelease(g_allProcLock, flags);
+    return result;
+}
+
+static bool SameGroup(const Process* member, const Process* target)
+{
+    const uint64_t group = target->isThread ? target->leaderIncarnation : target->incarnation;
+    return member->tgid == target->tgid &&
+        (member->isThread ? member->leaderIncarnation : member->incarnation) == group;
+}
+
+uint32_t SchedulerCollectVisibleSignalTargets(Process* caller, int32_t selector,
+                                               Process** targets, uint32_t capacity)
+{
+    const auto flags = SchedLockAcquire(g_allProcLock);
+    const auto* view = ProcessPidView(caller);
+    const uint32_t callerGroup = ProcessVisibleGroup(caller, view, false);
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < g_processCount && count < capacity; ++i) {
+        auto* task = g_allProcesses[i];
+        if (task->isKernelThread || task->isThread || !ProcessVisibleTid(task, view)) continue;
+        if (selector == -1) {
+            if (task->tgid == caller->tgid || ProcessVisibleTgid(task, view) == 1) continue;
+        } else if (selector == 0) {
+            if (ProcessVisibleGroup(task, view, false) != callerGroup ||
+                (!callerGroup && task->pgid != caller->pgid)) continue;
+        } else if (ProcessVisibleGroup(task, view, false) != static_cast<uint32_t>(-selector)) continue;
+        if (task->state == ProcessState::Terminated) {
+            // The leader can exit first. Signal one living sibling, if any,
+            // instead of signaling an inert zombie or losing the group.
+            const auto* leader = task;
+            task = nullptr;
+            for (uint32_t j = 0; j < g_processCount; ++j) {
+                auto* peer = g_allProcesses[j];
+                if (peer->state != ProcessState::Terminated && SameGroup(peer, leader)) {
+                    task = peer;
+                    break;
+                }
+            }
+            if (!task) continue;
+        }
+        ProcessRef(task);
+        targets[count++] = task;
+    }
+    SchedLockRelease(g_allProcLock, flags);
+    return count;
+}
+
+int SchedulerGetProcessGroup(Process* caller, uint32_t tid, bool session)
+{
+    const auto flags = SchedLockAcquire(g_allProcLock);
+    const auto* view = ProcessPidView(caller);
+    const auto* target = tid ? FindVisibleTaskLocked(view, tid) : caller;
+    const int result = target ? static_cast<int>(ProcessVisibleGroup(target, view, session)) : -3;
+    SchedLockRelease(g_allProcLock, flags);
+    return result;
+}
+
+
+int SchedulerSetProcessGroup(Process* caller, uint32_t tid, uint32_t destination)
+{
+    const auto flags = SchedLockAcquire(g_allProcLock);
+    const auto* view = ProcessPidView(caller);
+    auto* target = tid ? FindVisibleTaskLocked(view, tid) : caller;
+    int result = 0;
+    if (!target || (!SameGroup(caller, target) && target->parentPid != caller->tgid)) result = -3;
+    else if (target->sid != caller->sid || target->sid == target->tgid) result = -1;
+    else {
+        const bool newGroup = !destination || destination == ProcessVisibleTgid(target, view);
+        const Process* source = newGroup ? target : nullptr;
+        if (!source) {
+            for (uint32_t i = 0; i < g_processCount; ++i) {
+                const auto* peer = g_allProcesses[i];
+                if (peer->sid == target->sid && ProcessVisibleTid(peer, view) &&
+                    ProcessVisibleGroup(peer, view, false) == destination) {
+                    source = peer;
+                    break;
+                }
+            }
+        }
+        if (!source) result = -1;
+        else {
+            for (uint32_t i = 0; i < g_processCount; ++i) {
+                auto* peer = g_allProcesses[i];
+                if (SameGroup(peer, target)) ProcessSetGroupView(peer, source, false, newGroup);
+            }
+        }
+    }
+    SchedLockRelease(g_allProcLock, flags);
+    return result;
+}
+
+int SchedulerCreateSession(Process* caller)
+{
+    const auto flags = SchedLockAcquire(g_allProcLock);
+    int result = ProcessVisibleTgid(caller, ProcessPidView(caller));
+    for (uint32_t i = 0; i < g_processCount; ++i)
+        if (g_allProcesses[i]->pgid == caller->tgid) { result = -1; break; }
+    if (result > 0) {
+        for (uint32_t i = 0; i < g_processCount; ++i) {
+            auto* peer = g_allProcesses[i];
+            if (!SameGroup(peer, caller)) continue;
+            ProcessSetGroupView(peer, caller, false, true);
+            ProcessSetGroupView(peer, caller, true, true);
+        }
+    }
+    SchedLockRelease(g_allProcLock, flags);
+    return result;
+}
+
 int SchedulerAttachSeccomp(Process* process, SeccompFilter* filter, bool synchronize)
 {
     const auto flags = SchedLockAcquire(g_allProcLock);
@@ -2973,7 +3151,7 @@ int SchedulerAttachSeccomp(Process* process, SeccompFilter* filter, bool synchro
             auto* ancestor = previous;
             while (ancestor && ancestor != installed) ancestor = ancestor->previous;
             if (!ancestor) {
-                const int conflictingTid = peer->pid;
+                const int conflictingTid = ProcessVisibleTid(peer, ProcessPidView(process));
                 SchedLockRelease(g_allProcLock, flags);
                 return conflictingTid;
             }
@@ -3072,16 +3250,18 @@ Process* ProcessFindByPid(uint16_t pid)
     return result;
 }
 
-bool SchedulerTimerTargetIncarnation(Process* owner, int32_t tid, uint64_t* incarnation)
+bool SchedulerTimerTargetIncarnation(Process* owner, int32_t tid, uint16_t* globalTid, uint64_t* incarnation)
 {
     bool found = false;
     uint64_t flags = SchedLockAcquire(g_allProcLock);
     for (uint32_t i = 0; i < g_processCount; ++i) {
         Process* p = g_allProcesses[i];
-        if (p->pid == tid && p->tgid == owner->tgid &&
+        if (tid > 0 && ProcessVisibleTid(p, ProcessPidView(owner)) == static_cast<uint32_t>(tid) &&
+            p->tgid == owner->tgid &&
             p->state != ProcessState::Terminated &&
             (p->isThread ? p->leaderIncarnation : p->incarnation) ==
             (owner->isThread ? owner->leaderIncarnation : owner->incarnation)) {
+            *globalTid = p->pid;
             *incarnation = p->incarnation;
             found = true;
             break;
@@ -3118,12 +3298,12 @@ int ProcessSendSignalToGroup(uint16_t pgid, int signum)
 
     for (uint32_t i = 0; i < count; i++) {
         if (targets[i] == self) signalSelf = true;
-        else ProcessSendSignal(targets[i], signum);
+        else ProcessSendSignal(targets[i], signum, nullptr, self);
         ReleaseSchedulerReference(targets[i], false);
     }
     if (flags & 0x200) __asm__ volatile("sti" ::: "memory");
     SerialPrintf("SIGNAL: SendToGroup pgid=%u sig=%d -> %u procs\n", pgid, signum, count);
-    if (signalSelf) ProcessSendSignal(self, signum);
+    if (signalSelf) ProcessSendSignal(self, signum, nullptr, self);
     return static_cast<int>(count);
 }
 
@@ -3440,13 +3620,15 @@ int SchedulerWaitChild(Process* caller, int selector, uint32_t id,
     uint64_t alf = SchedLockAcquire(g_allProcLock);
     for (uint32_t i = 0; i < g_processCount; ++i) {
         Process* p = g_allProcesses[i];
-        if (p->isThread || p->parentPid != caller->tgid ||
-            (selector == 1 && p->pid != id) ||
-            (selector == 2 && p->pgid != id)) continue;
+        if (p->isThread || p->parentPid != caller->tgid) continue;
+        const uint32_t visiblePid = ProcessVisibleTid(p, ProcessPidView(caller));
+        if (!visiblePid || (selector == 1 && visiblePid != id) ||
+            (selector == 2 && ProcessVisibleGroup(p, ProcessPidView(caller), false) != id) ||
+            (selector == 3 && p->pgid != caller->pgid)) continue;
         outcome = 0; // A matching child exists, even if not yet waitable.
         int code = 0, status = 0;
         bool exiting = p->state == ProcessState::Terminated;
-        if (exiting && (options & 4) &&
+        if (exiting && (options & 4) && !PidNamespaceInitAwaitingDrain(p) &&
             __atomic_load_n(&p->reapable, __ATOMIC_ACQUIRE) &&
             __atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE) == -1 &&
             __atomic_load_n(&p->refCount, __ATOMIC_ACQUIRE) == 0 &&
@@ -3461,7 +3643,7 @@ int SchedulerWaitChild(Process* caller, int selector, uint32_t id,
             code = 6;
         }
         if (!code) continue;
-        *result = {p->pid, status, code, p->uid, p->userTicks, p->sysTicks, p->incarnation};
+        *result = {static_cast<int32_t>(visiblePid), status, code, p->uid, p->userTicks, p->sysTicks, p->incarnation};
         if (!(options & 0x01000000)) { // WNOWAIT observes without consuming.
             if (exiting) {
                 g_allProcesses[i] = g_allProcesses[--g_processCount];
@@ -3749,11 +3931,21 @@ int SchedulerCoreAutoQueue(uint16_t pid)
     return result;
 }
 
-int SchedulerCoreResourceLimit(Process* caller,uint16_t pid,const CoreResourceLimits* replace,
+int SchedulerCoreResourceLimit(Process* caller,uint32_t pid,const CoreResourceLimits* replace,
                                CoreResourceLimits& previous,bool privileged)
 {
     const auto lock=SchedLockAcquire(g_allProcLock);
-    const auto* target=pid?FindCoreTaskLocked(pid):caller;
+    const Process* target = !pid ? caller : nullptr;
+    const auto* view = ProcessPidView(caller);
+    if (pid) {
+        for (uint32_t i = 0; i < g_processCount; ++i) {
+            const Process* candidate = g_allProcesses[i];
+            if (candidate && !candidate->isKernelThread && ProcessVisibleTid(candidate, view) == pid) {
+                target = candidate;
+                break;
+            }
+        }
+    }
     Process* leader=target?CoreGroupLeaderLocked(target):nullptr;
     int result=-3;
     if(leader){
@@ -3841,6 +4033,43 @@ uint32_t SchedulerSnapshotDebugTasks(DebugTaskSnapshot* out,uint32_t capacity,
         for(unsigned j=0;j+1<sizeof(r.name)&&p->name[j];++j)r.name[j]=p->name[j];
     }
     SchedLockRelease(g_allProcLock,flags);*endTick=ApicTickCount();return count;
+}
+
+bool SchedulerSnapshotProcView(const PidNamespace* view, uint32_t tid, uint32_t minTid,
+                               uint16_t tgid, uint64_t group, bool leadersOnly,
+                               ProcessSnapshot* out)
+{
+    const uint64_t flags = SchedLockAcquire(g_allProcLock);
+    const Process* selected = nullptr;
+    uint32_t lowest = 0;
+    for (uint32_t i = 0; i < g_processCount; ++i) {
+        const Process* p = g_allProcesses[i];
+        if (!p || (leadersOnly && p->isThread)) continue;
+        if (tgid && (SnapshotTgid(p) != tgid || SnapshotGroup(p) != group ||
+                     p->state == ProcessState::Terminated)) continue;
+        const uint32_t visible = ProcessVisibleTid(p, view);
+        if (!visible || visible < minTid || (tid && tid != visible)) continue;
+        if (!selected || visible < lowest) {
+            selected = p;
+            lowest = visible;
+        }
+    }
+    if (selected) {
+        FillProcessSnapshot(selected, out);
+        out->viewTid = lowest;
+        out->viewTgid = ProcessVisibleTgid(selected, view);
+        out->viewGroup = ProcessVisibleGroup(selected, view, false);
+        out->viewSession = ProcessVisibleGroup(selected, view, true);
+        for (uint32_t i = 0; i < g_processCount; ++i) {
+            const Process* parent = g_allProcesses[i];
+            if (parent && !parent->isThread && parent->pid == selected->parentPid) {
+                out->viewParent = ProcessVisibleTgid(parent, view);
+                break;
+            }
+        }
+    }
+    SchedLockRelease(g_allProcLock, flags);
+    return selected != nullptr;
 }
 
 bool SchedulerSnapshotProcess(uint16_t pid, ProcessSnapshot* out)

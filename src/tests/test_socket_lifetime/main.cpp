@@ -336,6 +336,17 @@ static bool reservedSlot(int i) {
     auto flags=IrqSpinLockAcquire(&g_socketRegistryLock);
     bool result=g_sockReserved[i];IrqSpinLockRelease(&g_socketRegistryLock,flags);return result;
 }
+static SockAddrIn localAddress(uint16_t port, uint32_t ip = 0) {
+    return {AF_INET, htons(port), ip, {}};
+}
+static void bindPort(int socket, uint16_t port) {
+    const auto address = localAddress(port);
+    assert(SockBind(socket, &address) == 0);
+}
+static void listenPort(int socket, uint16_t port, int backlog) {
+    bindPort(socket, port);
+    assert(SockListen(socket, backlog) == 0);
+}
 static void setupTcp(int i) {
     auto& s = g_sockets[i];
     s.localIp = 1; s.remoteIp = 2;
@@ -1194,8 +1205,7 @@ int main() {
     // Listener close during child allocation must reject publication and drop
     // the child's creator reference exactly once, outside the queue guard.
     i = create(); auto& listener = g_sockets[i];
-    listener.listening = true; listener.listenBacklog = 4;
-    listener.localPort = htons(100); listener.tcpState = TcpState::Listen;
+    listenPort(i, 100, 4);
     Ipv4Header ip{}; ip.srcIp = 2; ip.dstIp = 1;
     TcpHeader syn{}; syn.srcPort = htons(200); syn.dstPort = htons(100);
     syn.seqNum = htonl(10); syn.dataOff = 5 << 4; syn.flags = TCP_SYN;
@@ -1216,7 +1226,7 @@ int main() {
     // A deferred UDP wake owns its Process until SchedulerUnblock returns.
     i = create(SOCK_DGRAM);
     Process* waiter = new Process{}; waiter->refCount = 1;
-    g_sockets[i].bound = true; g_sockets[i].localPort = htons(123);
+    bindPort(i, 123);
     SockSetPollWaiter(i, waiter); assert(waiter->refCount == 2);
     const uint8_t byte = 7; unsigned wakeCount = wakes;
     SockDeliverUdp(2, 200, 1, 123, &byte, 1);
@@ -1870,8 +1880,7 @@ int main() {
     SockClose(i);
     // A passive SYN supplies an unscaled initial window and its final ACK
     // initializes ordering without negotiating scale.
-    i=create();g_sockets[i].listening=true;g_sockets[i].listenBacklog=4;
-    g_sockets[i].localPort=htons(100);g_sockets[i].tcpState=TcpState::Listen;
+    i=create();listenPort(i, 100, 4);
     {Ipv4Header packetIp{};packetIp.srcIp=2;packetIp.dstIp=1;TcpHeader packet{};
      packet.srcPort=htons(200);packet.dstPort=htons(100);packet.seqNum=htonl(70);
      packet.flags=TCP_SYN;packet.window=htons(1234);packet.dataOff=5<<4;HandleTcp(&packetIp,&packet,sizeof(packet));}
@@ -2151,7 +2160,7 @@ int main() {
     {
         const int u=create(SOCK_DGRAM);
         auto& s=g_sockets[u];
-        s.bound=true;s.localPort=htons(5353);s.rxTail=s.rxHead=s.rxCapacity-5;
+        bindPort(u, 5353);s.rxTail=s.rxHead=s.rxCapacity-5;
         uint8_t bytes[512]{};
         auto send=[&](uint32_t n) {
             bytes[0]=static_cast<uint8_t>(n);
@@ -2175,7 +2184,7 @@ int main() {
     // An application that stops reading costs one counter per datagram, and
     // stale half-open children cannot lock the debug listener (backlog 2).
     {
-        int u=create(SOCK_DGRAM);g_sockets[u].bound=true;g_sockets[u].localPort=htons(5353);
+        int u=create(SOCK_DGRAM);bindPort(u, 5353);
         static uint8_t dns[512];const auto fullBefore=g_netCounters.udpRxFull;
         for(unsigned n=0;n<2000;++n)SockDeliverUdp(2,53,1,5353,dns,sizeof(dns));
         assert(g_netCounters.udpRxFull-fullBefore==2000-Socket::RX_DEFAULT/(10+sizeof(dns)));
@@ -2201,8 +2210,7 @@ int main() {
          q.rxBuf[q.rxTail]=0xff;q.rxBuf[(q.rxTail+1)%Socket::RX_DEFAULT]=0xff; // length 0xffff+ > rxCount
          const auto corrupt=g_netCounters.udpRxCorrupt;uint8_t out[16];
          assert(SockRecvFrom(u,out,sizeof(out),nullptr)==-11 && q.rxCount==0 && g_netCounters.udpRxCorrupt==corrupt+1);}
-        int l=create();g_sockets[l].listening=true;g_sockets[l].listenBacklog=2;
-        g_sockets[l].localPort=htons(1234);g_sockets[l].tcpState=TcpState::Listen;
+        int l=create();listenPort(l, 1234, 2);
         auto syn=[&](uint16_t port){Ipv4Header ip{};ip.srcIp=2;ip.dstIp=1;TcpHeader t{};
             t.srcPort=htons(port);t.dstPort=htons(1234);t.seqNum=htonl(70);t.flags=TCP_SYN;
             t.window=htons(1000);t.dataOff=5<<4;HandleTcp(&ip,&t,sizeof(t));};
@@ -2242,6 +2250,237 @@ int main() {
         InterfaceView interfaces[5]{};
         assert(NetInterfaceViews(interfaces,5,41)==1&&!std::strcmp(interfaces[0].name,"lo"));
         for(int socket:sockets)SockClose(socket);
+    }
+    {
+        const SocketBindActor desktop{1000, false};
+        const SocketBindActor namespaceRoot{0, false};
+        const SocketBindActor root{0, true};
+        for (uint16_t port = 1234; port <= 1237; ++port) {
+            for (int type : {SOCK_STREAM, SOCK_DGRAM}) {
+                const int service = create(type), app = create(type);
+                const int isolated = SockCreateOwned(AF_INET, type, 0, 3, 1000, 1000, 56);
+                auto address = localAddress(port, Ipv4Addr(127, 0, 0, 1));
+                assert(SockSetReuse(app, SocketReuse::Port, true) == 0);
+                assert(SockBind(isolated, &address, namespaceRoot) == 0);
+                if (type == SOCK_STREAM) {
+                    assert(SockBind(app, &address, desktop) == -13);
+                    assert(SockBind(service, &address, root) == 0);
+                    assert(SockListen(service, 4, desktop) == -13);
+                    assert(SockListen(service, 4, root) == 0);
+                    assert(SockListen(isolated, 4, namespaceRoot) == 0);
+                    assert(SockBind(app, &address, root) == -98);
+                } else {
+                    assert(SockBind(service, &address, desktop) == 0);
+                    assert(SockBind(app, &address, root) == -98);
+                }
+                for (int socket : {service, app, isolated}) SockClose(socket);
+            }
+        }
+        const auto wildcard = localAddress(44401);
+        const auto address = localAddress(44401, Ipv4Addr(127, 0, 0, 1));
+        const auto secondAddress = localAddress(44401, Ipv4Addr(127, 0, 0, 2));
+        int a = create(), b = create(), c = create();
+        assert(SockBind(a, &address, desktop) == 0);
+        assert(SockBind(a, &address, desktop) == -22);
+        assert(SockBind(b, &secondAddress, desktop) == 0);
+        assert(SockBind(c, &wildcard, desktop) == -98);
+        for (int socket : {a, b, c}) SockClose(socket);
+
+        a = create(); b = create(); c = create();
+        assert(SockSetReuse(a, SocketReuse::Address, true) == 0);
+        assert(SockSetReuse(b, SocketReuse::Address, true) == 0);
+        assert(SockSetReuse(c, SocketReuse::Address, true) == 0);
+        assert(SockBind(a, &wildcard, desktop) == 0);
+        assert(SockBind(b, &address, desktop) == 0);
+        assert(SockListen(a, 4, desktop) == 0);
+        assert(SockListen(b, 4, desktop) == -98);
+        assert(SockBind(c, &secondAddress, desktop) == -98);
+        for (int socket : {a, b, c}) SockClose(socket);
+
+        for (int type : {SOCK_STREAM, SOCK_DGRAM}) {
+            a = create(type); b = create(type); c = create(type);
+            for (int socket : {a, b, c}) {
+                assert(SockGetReuse(socket, SocketReuse::Port) == 0);
+                assert(SockSetReuse(socket, SocketReuse::Port, true) == 0);
+                assert(SockGetReuse(socket, SocketReuse::Port) == 1);
+            }
+            assert(SockBind(a, &address, desktop) == 0);
+            assert(SockBind(b, &address, {1001, false}) == -98);
+            assert(SockBind(b, &address, desktop) == 0);
+            assert(SockBind(c, &wildcard, desktop) == 0);
+            if (type == SOCK_STREAM)
+                for (int socket : {a, b, c}) assert(SockListen(socket, 4, desktop) == 0);
+            bool selectedA = false, selectedB = false;
+            for (uint16_t sourcePort = 30000; sourcePort < 30100; ++sourcePort) {
+                const auto socket = SelectInboundSocket(0, type == SOCK_STREAM, address.sin_addr,
+                                                        address.sin_port, 2, htons(sourcePort)).index;
+                selectedA |= socket == static_cast<unsigned>(a);
+                selectedB |= socket == static_cast<unsigned>(b);
+                assert(socket == static_cast<unsigned>(a) || socket == static_cast<unsigned>(b));
+            }
+            assert(selectedA && selectedB);
+            for (int socket : {a, b, c}) SockClose(socket);
+        }
+
+        a = create(); b = create();
+        const auto firstPort = localAddress(FirstEphemeralPort);
+        const auto ephemeral = localAddress(0);
+        assert(SockBind(a, &firstPort, desktop) == 0);
+        g_nextEphemeralPort = FirstEphemeralPort;
+        assert(SockBind(b, &ephemeral, desktop) == 0);
+        assert(ntohs(g_sockets[b].localPort) == FirstEphemeralPort + 1);
+        SockClose(a); SockClose(b);
+
+        a = create(); b = create(); c = create();
+        assert(SockSetReuse(a, SocketReuse::Address, true) == 0);
+        assert(SockBind(a, &address, desktop) == 0);
+        SockSetNonblock(a, true);
+        const auto peer = localAddress(45127, Ipv4Addr(127, 0, 0, 7));
+        assert(SockConnect(a, &peer) == -115);
+        // Change state independently of packet handshaking to exercise final
+        // close's TIME_WAIT lifetime, then verify the public bind/connect paths.
+        g_sockets[a].tcpState = TcpState::TimeWait;
+        SockClose(a);
+        assert(SockBind(b, &wildcard, desktop) == -98);
+        assert(SockSetReuse(c, SocketReuse::Address, true) == 0);
+        assert(SockBind(c, &address, desktop) == 0);
+        assert(SockConnect(c, &peer) == -99);
+        ticks += TcpTimeWaitMs;
+        assert(SockBind(b, &wildcard, desktop) == -98); // c still holds the port
+        SockClose(c);
+        assert(SockBind(b, &wildcard, desktop) == 0);
+        SockClose(b);
+
+        a = create(); b = create();
+        std::atomic<bool> go{false};
+        int first = 0, second = 0;
+        std::thread one([&] { while (!go.load()) std::this_thread::yield();
+                              first = SockBind(a, &wildcard, desktop); });
+        std::thread two([&] { while (!go.load()) std::this_thread::yield();
+                              second = SockBind(b, &address, desktop); });
+        go = true;
+        one.join(); two.join();
+        assert((first == 0 && second == -98) || (first == -98 && second == 0));
+        SockClose(a); SockClose(b);
+    }
+    {
+        // The first route on a shared subnet would choose interface A.
+        // Addresses assigned to either interface must still use local input.
+        NetIf first{}, second{};
+        first.ipAddr = Ipv4Addr(192, 0, 2, 1);
+        second.ipAddr = Ipv4Addr(192, 0, 2, 2);
+        first.netmask = second.netmask = Ipv4Addr(255, 255, 255, 0);
+        assert(!g_netIf && !g_netIfCount);
+        g_netIf = g_netIfs[0] = &first;
+        g_netIfs[1] = &second;
+        g_netIfCount = 2;
+        assert(NetIfForDst(second.ipAddr) == &first && NetFindOwnInterface(second.ipAddr) == &second);
+
+        const SocketBindActor desktop{1000, false};
+        const int socket = create(SOCK_DGRAM);
+        const auto custom = localAddress(44910, Ipv4Addr(192, 0, 2, 100));
+        const auto broadcast = localAddress(44910, Ipv4Addr(192, 0, 2, 255));
+        const auto ours = localAddress(44910, second.ipAddr);
+        assert(SockBind(socket, &custom, desktop) == -99);
+        assert(SockBind(socket, &broadcast, desktop) == -99);
+        assert(SockBind(socket, &ours, desktop) == 0);
+        SockSetNonblock(socket, true);
+
+        uint8_t packet[sizeof(UdpHeader) + 1]{};
+        auto& udp = *reinterpret_cast<UdpHeader*>(packet);
+        udp.length = htons(sizeof(packet));
+        udp.srcPort = htons(42000);
+        udp.dstPort = ours.sin_port;
+        packet[sizeof(UdpHeader)] = 0xa5;
+        assert(NetSendIpv4From(0, second.ipAddr, IP_PROTO_UDP, packet, sizeof(packet)) == 0);
+        uint8_t byte = 0;
+        SockAddrIn source{};
+        assert(SockRecvFrom(socket, &byte, sizeof(byte), &source) == 1 && byte == 0xa5);
+        assert(source.sin_addr == second.ipAddr && source.sin_port == udp.srcPort);
+
+        uint8_t wire[sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(packet)]{};
+        auto& ip = *reinterpret_cast<Ipv4Header*>(wire + sizeof(EthHeader));
+        ip.verIhl = 0x45;
+        ip.totalLen = htons(sizeof(Ipv4Header) + sizeof(packet));
+        ip.protocol = IP_PROTO_UDP;
+        ip.dstIp = second.ipAddr;
+        memcpy(wire + sizeof(EthHeader) + sizeof(Ipv4Header), packet, sizeof(packet));
+        for (uint32_t badSource : {0u, 0xffffffffu, broadcast.sin_addr, first.ipAddr, second.ipAddr,
+                                   Ipv4Addr(224, 0, 0, 1), Ipv4Addr(127, 0, 0, 1)}) {
+            ip.srcIp = badSource;
+            HandleIpv4(wire, sizeof(wire), false, 0);
+            assert(SockRecvFrom(socket, &byte, sizeof(byte), nullptr) == -11);
+        }
+        ip.srcIp = custom.sin_addr;
+        HandleIpv4(wire, sizeof(wire), false, 0);
+        assert(SockRecvFrom(socket, &byte, sizeof(byte), &source) == 1 && source.sin_addr == custom.sin_addr);
+        SockClose(socket);
+        g_netIf = g_netIfs[0] = g_netIfs[1] = nullptr;
+        g_netIfCount = 0;
+    }
+    {
+        const int listener = create();
+        listenPort(listener, 1234, 2);
+        auto syn = [&](uint16_t sourcePort, bool local) {
+            Ipv4Header ip{};
+            ip.dstIp = Ipv4Addr(127, 0, 0, 1);
+            ip.srcIp = local ? Ipv4Addr(127, 0, 0, 2) : Ipv4Addr(192, 0, 2, 70);
+            TcpHeader packet{};
+            packet.srcPort = htons(sourcePort);
+            packet.dstPort = htons(1234);
+            packet.seqNum = htonl(70);
+            packet.flags = TCP_SYN;
+            packet.dataOff = 5 << 4;
+            packet.window = htons(1000);
+            HandleTcp(&ip, &packet, sizeof(packet), 0, local);
+        };
+        syn(44001, true);
+        assert(g_sockets[listener].acceptQueueCount == 1);
+        const int local = g_sockets[listener].acceptQueue[0];
+        deliverControl(local, 71, g_sockets[local].tcpSndNxt, TCP_ACK, 1000);
+        assert(TcpCanAccept(g_sockets[local]));
+        syn(44002, true);
+        assert(g_sockets[listener].acceptQueueCount == 1);
+        syn(44003, false);
+        assert(g_sockets[listener].acceptQueueCount == 2);
+        const int remote = g_sockets[listener].acceptQueue[1];
+        deliverControl(remote, 71, g_sockets[remote].tcpSndNxt, TCP_ACK, 1000);
+        bool localIngress = true;
+        assert(SockAccept(listener, nullptr, &localIngress) == remote && !localIngress);
+        assert(SockAccept(listener, nullptr, &localIngress) == local && localIngress);
+        SockClose(remote);
+        SockClose(local);
+        SockClose(listener);
+    }
+    {
+        // A stalled peer gets neither the global asynchronous send path nor
+        // the ordinary 30-second send and 500-ms close budgets.
+        auto* sender = new Process{};
+        sender->pid = 41;
+        sender->refCount = 1;
+        currentProcess = sender;
+        int local = create();
+        setupTcp(local);
+        g_sockets[local].localIp = Ipv4Addr(127, 0, 0, 1);
+        g_sockets[local].remoteIp = Ipv4Addr(127, 0, 0, 2);
+        const uint64_t deadline = ticks + 17;
+        DebugChannelSetReplySock(local, deadline);
+        assert(DebugReplySocket() == local);
+        assert(DebugSendAll(local, "byte", 4) == -110 && ticks == deadline);
+        DebugChannelClearReplySock();
+        assert(!g_debugReplyDeadlines[local] && !DebugReplyOverride());
+        SockUnrefUntil(local, deadline);
+        assert(!published(local) && ticks == deadline);
+
+        local = create();
+        setupTcp(local);
+        g_sockets[local].localIp = Ipv4Addr(127, 0, 0, 1);
+        g_sockets[local].remoteIp = Ipv4Addr(127, 0, 0, 2);
+        const uint64_t closeBy = ticks + 11;
+        SockUnrefUntil(local, closeBy);
+        assert(!published(local) && ticks == closeBy);
+        currentProcess = nullptr;
+        delete sender;
     }
     assert(allocations == frees && g_socketRxBytes == 0);
     std::puts("socket lifetime: PASS");

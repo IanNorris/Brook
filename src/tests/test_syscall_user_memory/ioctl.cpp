@@ -6,6 +6,9 @@
 #include <stdlib.h>
 
 using namespace harness;
+namespace brook {
+uint32_t SchedulerTranslateProcessGroup(const Process*, uint32_t group, bool) { return group; }
+}
 namespace {
 bool g_capsetSawUserPointer;
 brook::Vnode* g_espRoot;

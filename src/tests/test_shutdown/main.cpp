@@ -72,7 +72,7 @@ uint32_t SchedulerSnapshotDebugTasks(DebugTaskSnapshot* out,uint32_t cap,uint32_
 uint32_t SchedulerSetUserBirthClosed(bool closed){gate=closed;return births;}
 void SchedulerUserBirthStatus(bool* closed,uint32_t* pending){*closed=gate;*pending=births;}
 Process* SchedulerFindProcessReference(uint16_t pid){for(auto& p:serviceTasks)if(p.pid==pid){ProcessRef(&p);return &p;}for(auto& p:appTasks)if(p.pid==pid){ProcessRef(&p);return &p;}return nullptr;}
-int ProcessSendSignal(Process* p,int signal,const SignalInfo*){++signals;signalPid=p->pid;if(signalCount<32){signalLog[signalCount]=signal;signalPids[signalCount++]=p->pid;}return 0;}
+int ProcessSendSignal(Process* p,int signal,const SignalInfo*,const Process*){++signals;signalPid=p->pid;if(signalCount<32){signalLog[signalCount]=signal;signalPids[signalCount++]=p->pid;}return 0;}
 void WmSetLaunchInhibited(bool inhibited){launched=!inhibited;}
 bool WmLauncherDispatching(){return dispatching;}
 void DebugJobsSetLaunchInhibited(bool inhibited){jobsAllowed=!inhibited;}

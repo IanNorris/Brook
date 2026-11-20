@@ -22,6 +22,7 @@ std::mutex allocationLock;
 std::unordered_set<void*> allocations;
 long failAllocation=-1;
 unsigned schedulerLockDepth=0;
+brook::Process* currentCredentials=nullptr;
 struct Mount;
 struct Node { Mount* mount;uint64_t id;bool dir;Node* parent;std::map<std::string,Node*> children;std::string target;uint16_t mode=0;uint32_t nlink=1; };
 struct Mount { uint64_t identity=0;bool alive=false;std::atomic<unsigned> live{0};unsigned closed=0;Node root{}; };
@@ -165,6 +166,10 @@ std::map<std::string,unsigned> directoryEntries(const brook::VfsPath& path) {
 }
 }
 namespace brook {
+Process* ProcessCurrent(){return currentCredentials;}
+bool ProcessCapable(Process* p,UserNamespace* target,unsigned capability) {
+    return p && UserNamespaceCapable({p->userNamespace,p->euid,p->egid,p->capabilities.effective},target,capability);
+}
 bool ModuleRetainAddresses(const uintptr_t* addresses,uint32_t count){assert(addresses&&count);++providerCalls;return !rejectProvider;}
 extern "C" void* kmalloc(uint64_t size){assert(!schedulerLockDepth);if(failAllocation==0){failAllocation=-1;return nullptr;}if(failAllocation>0)--failAllocation;void* p=std::malloc(size);if(p){std::memset(p,0xcc,size);std::lock_guard<std::mutex> lock(allocationLock);allocations.insert(p);}return p;}
 extern "C" void kfree(void* p){assert(!schedulerLockDepth);if(p){std::lock_guard<std::mutex> lock(allocationLock);assert(allocations.erase(p)==1);std::free(p);}}
@@ -176,7 +181,9 @@ void KRwLockWriteLock(KRwLock*){namespaceLock.lock();}
 void KRwLockWriteUnlock(KRwLock*){namespaceLock.unlock();}
 extern "C" void SerialPrintf(const char*,...){}
 void SerialPuts(const char*){}
+extern "C" void KernelPanic(const char*,...){std::abort();}
 int FileObjectWritebackAll(){return 0;}
+int FileObjectRead(FileObject*,Vnode*,void*,uint64_t,uint64_t*){assert(false);return -5;}
 int FileObjectWrite(FileObject*,Vnode*,const void*,uint64_t,uint64_t*){assert(false);return -5;}
 int FileObjectAppend(FileObject*,Vnode*,const void*,uint64_t,uint64_t*){assert(false);return -5;}
 int FileObjectWriteback(FileObject*,Vnode*,uint64_t,uint64_t){assert(false);return -5;}
@@ -221,14 +228,34 @@ static void testFreshMounts(brook::MountNamespace* ns,const brook::VfsPath& root
         if(published)break;
     }
     assert(published && freshUnmounts==1);
+    const VfsFreshMountVisibility visibility{root, [](const void*, const void*) { return true; }};
+    assert(VfsMountNamespaceMountVisible(ns,second,"fresh",&freshOps,&other,0,visibility)==-1);
     assert(!VfsMountNamespaceMountFresh(ns,target,"fresh",&freshOps,&first,0,0,&publication) && publication);
-    assert(!VfsMountNamespaceMountFresh(ns,second,"fresh",&freshOps,&other,0));
+    auto source = resolve(root,root,"/ns-target");
+    {
+        FileMutationGuard transaction;
+        MountViewGuard view;
+        static_cast<MountEntry*>(source.attachment)->attributes = MountReadOnly;
+    }
+    Node masked{&first,1001,true,&first.root,{},{}};
+    first.root.children["masked"]=&masked;
+    auto base = resolve(root,source,"masked");
+    assert(!VfsMountNamespaceBind(ns,second,base));
+    auto covering = resolve(root,source,"masked");
+    assert(VfsMountNamespaceMountVisible(ns,second,"fresh",&freshOps,&other,0,visibility)==-1);
+    assert(!VfsMountNamespaceDetach(ns,covering));
+    VfsPathRelease(covering);VfsPathRelease(base);VfsPathRelease(source);
+    VfsDrainMountCleanup();
+    first.root.children.erase("masked");
+    assert(!VfsMountNamespaceMountVisible(ns,second,"fresh",&freshOps,&other,0,visibility));
     // ASCII-folded reporting labels must not introduce aliases when the
     // covering filesystem's own lookup remains case-sensitive.
     assert(FindMount("/ns-target",nullptr)!=FindMount("/NS-TARGET",nullptr));
     assert(!VfsUnmount("/ns-target")); // retained fresh root requires namespace detach
     auto held=resolve(root,root,"/ns-target"),otherHeld=resolve(root,root,"/ns-a");
     VnodeStat a{},b{};assert(!VfsPathStat(held,&a) && !VfsPathStat(otherHeld,&b));
+    auto* restricted=static_cast<MountEntry*>(otherHeld.attachment);
+    assert((restricted->lockedAttributes&MountReadOnly) && VfsReadOnly(restricted));
     assert(a.dev==1001 && b.dev==1002 && a.ino==b.ino);
     // The old driver/device API must not discover/coalesce a fresh instance.
     auto oldMountCalls=mountCalls[0];
@@ -1465,8 +1492,8 @@ int main(){
     assert(VfsUnmount("/synthetic/deep/mount"));VfsMountNamespaceRelease(initial);
     assert(VfsUnmount("/rename-tree/slot"));
     assert(!g_retiredMounts);
-    // A protected boot volume keeps normal path access and its filesystem
-    // type while advertising an internal source to file-manager monitors.
+    // A protected boot volume keeps its filesystem and initial-root access,
+    // including across a bind, without granting data through an old handle.
     uint64_t bootPublication=0;
     assert(VfsMountConfiguredWithPublication("/ns-target","objects",2,0,&bootPublication));
     assert(!VfsProtectBootMount(bootPublication+1));
@@ -1476,9 +1503,40 @@ int main(){
     std::string report(rows.size()*4600+1,'\0');uint32_t written=0;
     assert(!FormatMountInfo(rows.data(),rows.size(),report.data(),report.size(),&written));
     assert(report.find("/ns-target rw - objects none rw\n")!=std::string::npos);
+    auto* systemFd=VfsPathOpen(system,VFS_O_READ,nullptr);assert(systemFd);
+    auto aliasTarget=resolve(stableRoot,stableRoot,"/ns-a");
+    assert(!VfsMountNamespaceBind(&g_initialNamespace,system,aliasTarget));
+    auto systemAlias=resolve(stableRoot,stableRoot,"/ns-a");
+    Process credentials{};
+    currentCredentials=&credentials;
+    VnodeStat heldStat{};
+    assert(!VfsStat(systemFd,&heldStat));
+    credentials.euid=1000;
+    int denied=0;
+    assert(!VfsOpenModeChecked("/ns-target/value",VFS_O_READ,0,&denied) && denied==-13);
+    assert(VfsStatAt(stableRoot,stableRoot,"/ns-a/value",&heldStat)==-13);
+    assert(!VfsPathOpen(system,VFS_O_METADATA,&denied) && denied==-13);
+    assert(VfsStat(systemFd,&heldStat)==-13);
+    char value[4]{};uint64_t offset=0;DirEntry entry{};uint32_t cookie=0;
+    assert(VfsRead(systemFd,value,sizeof(value),&offset)==-13 && offset==0);
+    assert(VfsReaddir(systemFd,&entry,&cookie)==-13 && cookie==0);
+    assert(VfsFileMapPin(systemFd)==-13);
+    assert(VfsMountNamespaceBind(&g_initialNamespace,system,aliasTarget)==-13);
+    UserNamespace childNamespace{};
+    credentials.euid=0;credentials.userNamespace=&childNamespace;
+    credentials.capabilities.effective=UserCapabilities;
+    assert(VfsPathAccess(systemAlias,4)==-13);
+    assert(!VfsOpenModeChecked("/ns-target/value",VFS_O_READ,0,&denied) && denied==-13);
+    credentials.isKernelThread=true;
+    assert(!VfsStat(systemFd,&heldStat));
+    currentCredentials=nullptr;
+    VfsRelease(systemFd);VfsPathRelease(aliasTarget);
+    assert(VfsMountNamespaceDetach(&g_initialNamespace,systemAlias)==-16);
     assert(VfsMountNamespaceDetach(&g_initialNamespace,system)==-16);
     assert(!VfsUnmount("/ns-target"));
     static_cast<MountEntry*>(system.attachment)->backing->systemInternal=false; // fixture teardown
+    assert(!VfsMountNamespaceDetach(&g_initialNamespace,systemAlias));
+    VfsPathRelease(systemAlias);VfsDrainMountCleanup();
     VfsPathRelease(system);assert(VfsUnmount("/ns-target"));
     VfsPathRelease(stableRoot);
     // Model the final-release window after the diagnostic count is cleared but

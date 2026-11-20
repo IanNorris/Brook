@@ -1,6 +1,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include "cursor_composition.h"
 using namespace brook;
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr,"FAIL %d: %s\n",__LINE__,#x); std::abort(); } } while (0)
@@ -62,5 +63,31 @@ int main()
     // Same owner re-setting during a drag outside its window keeps showing it.
     own.Set(7,7,false);CHECK(own.Update(0,true));own.Set(7,0,true);CHECK(own.showClient);
     own.Set(9,0,true);CHECK(!own.showClient);
-    std::puts("cursor composition: source preservation, animation, hotspot, bounds and ownership PASS");
+    // Resize shapes: edges map to the four arrows; each bitmap is the right
+    // size, opaque at its centre hotspot, symmetric, and scales with its hotspot.
+    CHECK(CursorShapeForEdges(0)==CursorShape::Arrow);
+    CHECK(CursorShapeForEdges(1)==CursorShape::ResizeH && CursorShapeForEdges(4)==CursorShape::ResizeH);
+    CHECK(CursorShapeForEdges(2)==CursorShape::ResizeV && CursorShapeForEdges(8)==CursorShape::ResizeV);
+    CHECK(CursorShapeForEdges(3)==CursorShape::ResizeNwse && CursorShapeForEdges(12)==CursorShape::ResizeNwse);
+    CHECK(CursorShapeForEdges(6)==CursorShape::ResizeNesw && CursorShapeForEdges(9)==CursorShape::ResizeNesw);
+    {
+        static CursorImage shape, scaled;
+        CHECK(!CursorFillShape(CursorShape::Arrow,shape));
+        for (CursorShape k : {CursorShape::ResizeH,CursorShape::ResizeV,CursorShape::ResizeNwse,CursorShape::ResizeNesw}) {
+            CHECK(CursorFillShape(k,shape) && shape.width==CursorShapeSize && shape.height==CursorShapeSize);
+            CHECK(shape.hotX==11 && shape.hotY==11 && shape.pixels[11*CursorCapacity+11]==0xffffffffu);
+            CHECK(!shape.pixels[0] && CursorPixelsHaveAlpha(shape.pixels,shape.width,shape.height));
+            for (uint32_t y=0;y<CursorShapeSize;++y)
+                for (uint32_t x=0;x<CursorShapeSize;++x) // point symmetric about the hotspot
+                    CHECK(shape.pixels[y*CursorCapacity+x]==shape.pixels[(22-y)*CursorCapacity+(22-x)]);
+            ScaleCursor(shape,scaled,200);
+            CHECK(scaled.width==46 && scaled.hotX==22 && scaled.pixels[22*CursorCapacity+22]==0xffffffffu);
+        }
+        // Horizontal reaches the left and right of the cell; vertical the top and bottom.
+        CursorFillShape(CursorShape::ResizeH,shape);
+        CHECK(shape.pixels[11*CursorCapacity+1] && shape.pixels[11*CursorCapacity+21] && !shape.pixels[1*CursorCapacity+11]);
+        CursorFillShape(CursorShape::ResizeV,shape);
+        CHECK(shape.pixels[1*CursorCapacity+11] && shape.pixels[21*CursorCapacity+11] && !shape.pixels[11*CursorCapacity+1]);
+    }
+    std::puts("cursor composition: source preservation, animation, hotspot, bounds, ownership and resize shapes PASS");
 }

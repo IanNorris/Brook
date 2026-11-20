@@ -62,6 +62,7 @@ void SchedulerMarkTerminated(Process* proc, int waitStatus)
     // In a self-fatal path, restoring IF before dropping our temporary hold
     // could retire this CPU forever with the hold still on its dead stack.
     SchedLockReleaseRaw(g_readyLock);
+    ProcessVforkRelease(proc);
     ProcessQueueRobustExit(proc); // queue ref gates successful wait/reap
     ProcessFsFinishMountRetirement(retiredMounts);
     PosixTimersCleanup(proc, false);

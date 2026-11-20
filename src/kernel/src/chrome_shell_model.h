@@ -96,7 +96,7 @@ struct ChromeShellModel {
     bool launcherOpen, networkConnected, volumeAvailable, agentShown, agentStale;
     bool shutdownActive, prompt, promptRestart, confirmFocused;
     bool network;
-    bool dockPinned;
+    bool dockPinned, dockResizing;
     char text[128], detail[64]; // launcher header, tooltip or flyout address
     bool forceApps;
 };
@@ -161,7 +161,8 @@ inline void BuildShellModel(const ChromeShellModel& model, const ChromeStyle& st
         const uint32_t* icons[ChromeDockEntryLimit];
         const int count = model.dock.count < int(ChromeDockEntryLimit) ? model.dock.count : int(ChromeDockEntryLimit);
         for (int i = 0; i < count; ++i) icons[i] = model.icons[i].View();
-        ChromeBuildDock({&model.dock, icons, model.text, model.dockPinned, model.mouseX, model.mouseY}, style, list);
+        ChromeBuildDock({&model.dock, icons, model.text, model.dockPinned, model.dockResizing, model.mouseX, model.mouseY},
+                        style, list);
         break;
     }
     }

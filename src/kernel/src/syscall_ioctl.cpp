@@ -3,6 +3,7 @@
 // Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
+#include "pid_namespace.h"
 #include "ahci_system_volume.h"
 #include "boot_timing_runtime.h"
 #include "process_user_namespace.h"
@@ -136,7 +137,9 @@ static int64_t CopyPgrpOut(uint64_t arg)
     int pgrp = 1;
     if (Process* cur = ProcessCurrent()) {
         Terminal* term = TerminalFindByProcess(cur);
-        pgrp = term ? static_cast<int>(term->foregroundPgid) : static_cast<int>(cur->pgid);
+        const auto* view = ProcessPidView(cur);
+        pgrp = term ? static_cast<int>(SchedulerTranslateProcessGroup(cur, term->foregroundPgid, false))
+                    : static_cast<int>(ProcessVisibleGroup(cur, view, false));
     }
     return CopyToUser(arg, &pgrp, sizeof(pgrp)) ? 0 : -EFAULT;
 }
@@ -147,7 +150,14 @@ static int64_t SetPgrpFrom(uint64_t arg)
     if (!CopyFromUser(&newPgid, arg, sizeof(newPgid))) return -EFAULT;
     if (Process* cur = ProcessCurrent()) {
         if (Terminal* term = TerminalFindByProcess(cur)) {
-            term->foregroundPgid = static_cast<uint16_t>(newPgid);
+            if (ProcessPidView(cur)) {
+                if (newPgid <= 0) return -EINVAL;
+                const uint32_t global = SchedulerTranslateProcessGroup(cur, newPgid, true);
+                if (!global) return -EPERM;
+                term->foregroundPgid = static_cast<uint16_t>(global);
+            } else {
+                term->foregroundPgid = static_cast<uint16_t>(newPgid);
+            }
             DbgPrintf("TIOCSPGRP: pid %u set fg pgid to %d\n", cur->pid, newPgid);
         }
     }

@@ -58,6 +58,11 @@ ICONS = [
     ('brush', '<path d="m10.5 2.5 3 3-7 7H3.5v-3z"/>'),
     ('pad', '<rect x="2" y="5" width="12" height="7" rx="3"/><path d="M5 8.5h2M6 7.5v2m4.8-1h.1"/>'),
     ('spark', '<path d="M8 2.5v3m0 5v3M2.5 8h3m5 0h3"/>'),
+    # Side dock (DESIGN.md "Side dock"): move a window into the sidebar on
+    # either edge, and move the sidebar to the other edge.
+    ('dock-left', '<rect x="2.5" y="3.5" width="11" height="9" rx="1.5"/><path d="M6.5 3.5v9"/>'),
+    ('dock-right', '<rect x="2.5" y="3.5" width="11" height="9" rx="1.5"/><path d="M9.5 3.5v9"/>'),
+    ('swap', '<path d="M3 5.5h10m0 0-2.5-2.5M13 5.5 10.5 8M13 10.5H3m0 0 2.5-2.5M3 10.5 5.5 13"/>'),
 ]
 COLUMNS = 8
 PAD = 1

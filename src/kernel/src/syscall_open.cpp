@@ -199,7 +199,7 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS) || defined(BROOK_SSD_INSTALLER)
     uint32_t blockPartition=0;
     if(MaintenanceBlockPath(syntheticPath,blockPartition)) {
-        if(proc->euid!=0)return -EPERM;
+        if(!VfsCanAccessSystemFiles())return -EPERM;
         // O_CREAT is harmless for this already-existing synthetic block node;
         // standard tools such as dd pass it when opening an output device.
         if((flags&3)==3 || (flags&(0x200|0x10000|0x200000)))return -EINVAL;

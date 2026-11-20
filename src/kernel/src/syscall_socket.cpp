@@ -79,7 +79,7 @@ int64_t sys_socket(uint64_t domain, uint64_t type, uint64_t protocol,
         usd->refCount = 1;
         usd->networkScope = ProcessNetworkScope(proc);
         usd->socketType = static_cast<uint32_t>(type) & 0xfu;
-        usd->peerCredentials = {0, ~uint32_t{0}, ~uint32_t{0}};
+        usd->peerCredentials.raw = {0, ~uint32_t{0}, ~uint32_t{0}};
 
         int fd = UnixInstallSocket(proc, usd, static_cast<uint32_t>(type), "socket");
         if (fd < 0) { UnixSocketHandleUnref(usd); return fd; }
@@ -130,6 +130,14 @@ static int GetSockIdx(Process* proc, int fd)
     FdEntry* e = &proc->fds[fd];
     if (e->type != FdType::Socket) return -1;
     return static_cast<int>(reinterpret_cast<uintptr_t>(e->handle)) - 1;
+}
+
+static SocketBindActor CurrentSocketBindActor(Process* proc)
+{
+    auto authority = ProcessUserAuthorityAcquire(proc);
+    const SocketBindActor actor{authority.uid, !authority.ns && authority.uid == 0};
+    UserNamespaceRelease(authority.ns);
+    return actor;
 }
 
 int64_t sys_bind(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
@@ -201,14 +209,14 @@ int64_t sys_bind(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
         if(address.family!=16)return -EINVAL;if(address.groups)return -95;
         return NetlinkBind(static_cast<NetlinkSocket*>(fde->handle),address.port);
     }
-    int sockIdx = GetSockIdx(proc, fd);
-    if (sockIdx < 0) return -EBADF;
+    if (!fde || fde->type != FdType::Socket || !fde->handle) return -EBADF;
+    const int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
 
     if (!addrVal || addrLen < sizeof(SockAddrIn)) return -EINVAL;
     SockAddrIn addr{};
     if (!CopyFromUser(&addr, addrVal, sizeof(addr))) return -EFAULT;
 
-    return SockBind(sockIdx, &addr);
+    return SockBind(sockIdx, &addr, CurrentSocketBindActor(proc));
 }
 
 int64_t sys_connect(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
@@ -503,12 +511,15 @@ int64_t sys_setsockopt(uint64_t fdVal, uint64_t levelVal, uint64_t optionVal,
         SpinLockAcquire(&socket->lock);socket->receiveLimit=2*limit;SpinLockRelease(&socket->lock);return 0;
     }
     if (descriptor->type != FdType::UnixSocket && descriptor->type != FdType::Socket) return -88;
-    if (descriptor->type == FdType::Socket && levelVal == 1 && optionVal == 8) {
+    if (descriptor->type == FdType::Socket && levelVal == 1 &&
+        (optionVal == 2 || optionVal == 8 || optionVal == 15)) {
         int32_t requested;
         if (length < sizeof(requested)) return -EINVAL;
         if (!CopyFromUser(&requested, valueAddr, sizeof(requested))) return -EFAULT;
         const int index = static_cast<int>(reinterpret_cast<uintptr_t>(descriptor->handle)) - 1;
-        return brook::SockSetReceiveBuffer(index, requested);
+        if (optionVal == 8) return SockSetReceiveBuffer(index, requested);
+        return SockSetReuse(index, optionVal == 2 ? SocketReuse::Address : SocketReuse::Port,
+                           requested != 0);
     }
     if (descriptor->type == FdType::UnixSocket && levelVal == 1 && optionVal == 16) {
         if (length < sizeof(int32_t)) return -EINVAL;
@@ -580,7 +591,7 @@ int64_t sys_getsockopt(uint64_t fdVal, uint64_t levelVal, uint64_t optnameVal,
             break;
         case 17: // SO_PEERCRED (struct ucred), immutable connection identity.
             SpinLockAcquire(&g_unixRegistryLock);
-            credentials = socket->peerCredentials;
+            credentials = socket->peerCredentials.Report(ProcessPidView(proc));
             SpinLockRelease(&g_unixRegistryLock);
             break;
         case 3: // SO_TYPE: type selected at socket/socketpair creation.
@@ -608,6 +619,11 @@ int64_t sys_getsockopt(uint64_t fdVal, uint64_t levelVal, uint64_t optnameVal,
     } else {
         int index = static_cast<int>(reinterpret_cast<uintptr_t>(entry->handle)) - 1;
         switch (option) {
+        case 2: // SO_REUSEADDR
+        case 15: // SO_REUSEPORT
+            value = SockGetReuse(index, option == 2 ? SocketReuse::Address : SocketReuse::Port);
+            if (value < 0) return value;
+            break;
         case 8: // SO_RCVBUF
             value = brook::SockGetReceiveBuffer(index);
             if (value < 0) return value;
@@ -774,12 +790,9 @@ int64_t sys_listen(uint64_t fdVal, uint64_t backlog, uint64_t,
         return 0;
     }
 
-    (void)backlog;
-    int sockIdx = GetSockIdx(proc, fd);
-    if (sockIdx < 0) return -EBADF;
-
-    int ret = brook::SockListen(sockIdx, static_cast<int>(backlog));
-    return ret < 0 ? -EINVAL : 0;
+    if (!fde || fde->type != FdType::Socket || !fde->handle) return -EBADF;
+    const int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
+    return SockListen(sockIdx, static_cast<int>(backlog), CurrentSocketBindActor(proc));
 }
 
 static int64_t AcceptSocket(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVal,
@@ -1173,7 +1186,7 @@ int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
     // rather than send orphaned payload — matches Linux kernel behaviour.
     UnixFdSnap pendingSnaps[UNIX_FD_QUEUE_CAP];
     int pendingCount = 0;
-    UnixCredentials explicitCredentials{};bool hasExplicitCredentials=false;
+    UnixSenderCredentials explicitCredentials{};bool hasExplicitCredentials=false;
     auto failControl=[&](int error)->int64_t {
         for(int j=0;j<pendingCount;++j)UnixFdSnapRelease(&pendingSnaps[j]);
         return error;
@@ -1195,9 +1208,9 @@ int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
                 if(!CopyFromUser(&requested,ctlAddr+off+sizeof(cm),sizeof(requested)))return failControl(-EFAULT);
                 requested.uid=ProcessResolveId(proc,false,requested.uid);requested.gid=ProcessResolveId(proc,true,requested.gid);
                 const auto users=ProcessReadIds(proc,false),groups=ProcessReadIds(proc,true);
-                const int32_t sender=proc->tgid?proc->tgid:proc->pid;
+                const int32_t sender=ProcessVisibleTgid(proc, ProcessPidView(proc));
                 if(int error=UnixCredentialsCheck(requested,sender,users,groups))return failControl(error);
-                explicitCredentials=requested;hasExplicitCredentials=true;
+                explicitCredentials=UnixCaptureCredentials(proc, requested.uid, requested.gid);hasExplicitCredentials=true;
             }
             if (cm.cmsg_level == SOL_SOCKET && cm.cmsg_type == SCM_RIGHTS) {
                 uint64_t dataLen = cm.cmsg_len - sizeof(CmsgHdr);
@@ -1361,7 +1374,7 @@ int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
         int64_t total=0;
         uint64_t messageLength=0;bool consumed=false;
         const bool passCredentials = __atomic_load_n(&usd->passCredentials, __ATOMIC_ACQUIRE);
-        UnixCredentials sender{};
+        UnixSenderCredentials sender{};
         if(record) {
             UnixRecordVector stage;
             if(int error=stage.Init(reinterpret_cast<uint64_t>(msg->msg_iov),msg->msg_iovlen,false))return error;
@@ -1390,14 +1403,15 @@ int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
         msg->msg_controllen=0;msg->msg_namelen=0;
         uint64_t controlUsed = 0;
         if (passCredentials && (total > 0 || consumed)) {
-            sender.uid=ProcessReportId(proc,false,sender.uid);sender.gid=ProcessReportId(proc,true,sender.gid);
-            const uint64_t required = sizeof(CmsgHdr) + sizeof(sender);
+            auto reported = sender.Report(ProcessPidView(proc));
+            reported.uid=ProcessReportId(proc,false,reported.uid);reported.gid=ProcessReportId(proc,true,reported.gid);
+            const uint64_t required = sizeof(CmsgHdr) + sizeof(reported);
             if (capacity >= sizeof(CmsgHdr)) {
                 auto* header = static_cast<CmsgHdr*>(msg->msg_control);
                 uint64_t copied = capacity < required ? capacity : required;
                 header->cmsg_len = copied;
                 header->cmsg_level = SOL_SOCKET; header->cmsg_type = 2; // SCM_CREDENTIALS
-                if (copied > sizeof(CmsgHdr)) memcpy(header + 1, &sender, copied - sizeof(CmsgHdr));
+                if (copied > sizeof(CmsgHdr)) memcpy(header + 1, &reported, copied - sizeof(CmsgHdr));
                 controlUsed = CmsgAlign(copied); if (controlUsed > capacity) controlUsed = capacity;
                 msg->msg_controllen = controlUsed;
             }

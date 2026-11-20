@@ -22,6 +22,7 @@ struct WmChromeKeyInput {
     uint64_t captionOverlay;      // 0, or bit 63 | height << 32 | top inset << 16 | right inset
     uint32_t captionStyle;        // client-matched caption colour/corner, 0 = native
     int32_t hoverButton;          // -1 none, else caption button index
+    uint32_t dockButton;          // 0 none, 1 dock left, 2 dock right
     uint32_t theme,appearance,scale;
     uint64_t settingsEpoch,launcherEpoch;
 };
@@ -50,6 +51,7 @@ inline uint64_t WmChromeKey(const WmChromeKeyInput& in) {
     k.u64(in.captionOverlay);
     k.u64(in.captionStyle);
     k.u64(uint64_t(int64_t(in.hoverButton)));
+    k.u64(in.dockButton);
     k.u64((uint64_t(in.theme)<<32)|in.appearance);k.u64(in.scale);
     k.u64(in.settingsEpoch);k.u64(in.launcherEpoch);
     return k.h|1; // never zero: zero means "no key held"

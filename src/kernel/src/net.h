@@ -384,6 +384,7 @@ struct Socket {
     // Listen/accept queue (server-side)
     static constexpr int ACCEPT_QUEUE_MAX = 16;
     bool      listening;               // true if listen() was called
+    bool      peerLocalIngress;        // passive open from the kernel's local delivery path
     int       listenBacklog;           // max pending connections
     int       acceptQueue[ACCEPT_QUEUE_MAX]; // socket indices of accepted connections
     volatile int acceptQueueCount;     // number in queue
@@ -420,7 +421,14 @@ uint64_t SockNetworkScope(int sockIdx);
 bool SockGetIdentity(int sockIdx, SocketIdentity* out);
 // Dequeued child only, before publishing any FD or descriptor alias.
 void SockSetAcceptedOwner(int sockIdx, uint32_t uid, uint32_t gid);
-int  SockBind(int sockIdx, const SockAddrIn* addr);
+struct SocketBindActor {
+    uint32_t uid = 0;
+    bool initialRoot = true; // Default only for direct kernel callers.
+};
+enum class SocketReuse : uint8_t { Address = 1, Port = 2 };
+int SockSetReuse(int sockIdx, SocketReuse option, bool enabled);
+int SockGetReuse(int sockIdx, SocketReuse option);
+int SockBind(int sockIdx, const SockAddrIn* addr, SocketBindActor actor = {});
 int  SockConnect(int sockIdx, const SockAddrIn* addr);
 int  SockSendTo(int sockIdx, const void* buf, uint32_t len,
                 const SockAddrIn* dest);
@@ -429,6 +437,8 @@ int  SockRecvFrom(int sockIdx, void* buf, uint32_t len,
 // Sleepable process context only; must not be called from an IRQ handler.
 // SockSend accepts a trusted kernel buffer; SockSendUser stages user memory.
 int  SockSend(int sockIdx, const void* buf, uint32_t len);
+// Synchronous local-only sends share the caller's absolute monotonic deadline.
+int  SockSendUntil(int sockIdx, const void* buf, uint32_t len, uint64_t deadline);
 int  SockSendUser(int sockIdx, uint64_t address, uint32_t len);
 struct TcpSendVector { uint64_t base, length; };
 // Descriptors are a stable kernel snapshot; payload pointers address user memory.
@@ -444,8 +454,8 @@ int  SockGetType(int sockIdx);  // returns SOCK_STREAM(1) or SOCK_DGRAM(2)
 int  SockGetProtocol(int sockIdx); // immutable creation protocol, or -1 for invalid slot
 void SockGetLocal(int sockIdx, uint32_t* ip, uint16_t* port);
 void SockGetRemote(int sockIdx, uint32_t* ip, uint16_t* port);
-int  SockListen(int sockIdx, int backlog);
-int  SockAccept(int sockIdx, SockAddrIn* addr);
+int  SockListen(int sockIdx, int backlog, SocketBindActor actor = {});
+int  SockAccept(int sockIdx, SockAddrIn* addr, bool* peerLocalIngress=nullptr);
 bool SockPollReady(int sockIdx, bool checkRead, bool checkWrite);
 // Optional async-send worker-pool notification for a poll/epoll invocation.
 // A zero token means disabled/full; callers retain their timed fallback.
@@ -465,6 +475,7 @@ bool SockGetTcpInfo(int sockIdx, TcpInfoSource* out);
 void SockClose(int sockIdx);
 void SockRef(int sockIdx);    // increment refcount (fork/dup)
 void SockUnref(int sockIdx);  // decrement refcount, destroy at 0
+void SockUnrefUntil(int sockIdx, uint64_t deadline); // bounded local-only graceful close
 
 // Deliver a UDP datagram to the matching socket (called by stack).
 void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
@@ -472,7 +483,7 @@ void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
                     const void* data, uint32_t len,uint64_t scope=0);
 
 // Handle an incoming TCP segment (called by IP handler).
-void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len,uint64_t scope=0);
+void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len,uint64_t scope=0,bool localIngress=false);
 
 // ---------------------------------------------------------------------------
 // DNS resolver
@@ -498,7 +509,7 @@ void DebugChannelSend(const char* msg);
 void DebugChannelSendf(const char* fmt, ...);
 
 // Route DebugChannelSend responses to a specific socket (for port 1234 server).
-void DebugChannelSetReplySock(int sock);
+void DebugChannelSetReplySock(int sock, uint64_t deadline=0);
 void DebugChannelClearReplySock();
 
 // Dispatch a debug command string (used by both outbound and listener channels).

@@ -2,11 +2,13 @@
 #include <stdint.h>
 
 namespace brook {
+struct Process;
 struct WmShellSurface;
 struct ChromeTrayState;
 struct TrayInput;
 const ChromeTrayState& ShellServiceTrayState();
 void ShellServiceQueueTrayInput(const TrayInput&);
+bool ShellServiceAllowsWindowCapture(const Process&);
 
 void ShellServiceBeginFrame(uint64_t now);
 uint64_t ShellServiceCapture(const WmShellSurface&, uint32_t width, uint32_t height,

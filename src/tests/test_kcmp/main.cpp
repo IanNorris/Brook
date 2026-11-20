@@ -17,9 +17,10 @@ uint64_t g_random = 0x1234;
 
 namespace brook {
 Process* ProcessCurrent() { return g_self; }
-Process* SchedulerFindProcessReference(uint16_t pid)
+const PidNamespace* ProcessPidView(const Process* p) { return p->pidNamespaceIds.Active(); }
+Process* SchedulerFindVisibleProcessReference(const PidNamespace* view, uint32_t pid)
 {
-    for (auto* t : g_tasks) if (t && t->pid == pid) { ++g_refs; ++t->refCount; return t; }
+    for (auto* t : g_tasks) if (t && t->pidNamespaceIds.VisibleTid(view, t->pid) == pid) { ++g_refs; ++t->refCount; return t; }
     return nullptr;
 }
 bool ProcessCanPtraceRead(Process*, Process* target)
@@ -97,6 +98,12 @@ int main()
     g_denied[2] = true;
     CHECK(sys_kcmp(10, 12, KcmpTypes, 0, 0, 0) == -EPERM);
     CHECK(sys_kcmp(12, 10, KcmpFile, 99, 99, 0) == -EPERM);
+    const auto* view = reinterpret_cast<const PidNamespace*>(&tasks[0]);
+    CHECK(tasks[0].pidNamespaceIds.Add(view, 1, 1));
+    CHECK(tasks[1].pidNamespaceIds.Add(view, 2, 1));
+    CHECK(sys_kcmp(1, 2, KcmpVm, 0, 0, 0) == 0);
+    CHECK(sys_kcmp(1, 10, KcmpVm, 0, 0, 0) == -ESRCH);
+    CHECK(sys_kcmp(1, 12, KcmpVm, 0, 0, 0) == -ESRCH);
     // Every lookup reference is dropped and the region is balanced.
     unsigned live = 0;
     for (auto& t : tasks) live += t.refCount;

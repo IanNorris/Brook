@@ -857,13 +857,14 @@ bool WmLauncherApplyPending()
 
 
 
-// Caption cells: index 0 is close, 1 maximize/restore, 2 minimize. They are
-// drawn in these cells; input uses the part table's hit rects, which extend
-// them to the outer edges (chrome_layout.h).
+// Caption cells: index 0 is close, 1 maximize/restore, 2 minimize, 3 dock.
+// They are drawn in these cells; input uses the part table's hit rects, which
+// extend them to the outer edges (chrome_layout.h).
+static uint8_t WindowDockButton(const Window& w);
 static DesktopWindowGeometry CaptionGeometry(const Window& w)
 {
     return {w.x,w.y,w.clientW,w.clientH,w.noChrome,w.noChrome && w.captionOverlay,
-            w.captionInsetRight,w.captionInsetTop,w.captionHeight};
+            w.captionInsetRight,w.captionInsetTop,w.captionHeight,WindowDockButton(w)};
 }
 // The window's part table (chrome_layout.h). screenW/H: the output, whose
 // edges remove resize zones; 0 when only the visual parts matter.
@@ -1239,6 +1240,7 @@ WmHitResult WmHitTest(int32_t mx, int32_t my)
         case ChromePartRole::Close: result.zone = WmHitZone::CloseButton; break;
         case ChromePartRole::Maximise: result.zone = WmHitZone::MaximizeButton; break;
         case ChromePartRole::Minimise: result.zone = WmHitZone::MinimizeButton; break;
+        case ChromePartRole::Dock: result.zone = WmHitZone::DockButton; break;
         case ChromePartRole::Drag: result.zone = WmHitZone::TitleBar; break;
         case ChromePartRole::Client: result.zone = WmHitZone::ClientArea; break;
         case ChromePartRole::Border: result.zone = WmHitZone::Border; break;
@@ -2070,6 +2072,7 @@ void WmRenderChromeForWindow(uint32_t* backBuffer, uint32_t stride,
     RenderWindowChrome(backBuffer, stride, screenW, screenH, w, mouseX, mouseY);
 }
 
+#include "wm_window_menu.inc"
 #include "wm_shell_taskbar.inc"
 
 uint32_t WmDesktopHeight(uint32_t screenH)
@@ -3259,7 +3262,7 @@ static uint64_t DesktopChromeKeyLocked(const DesktopChromeEpochs& layers,const W
     // origin0 has x=y=0, exactly as RenderWindowChrome sees it in a capture.
     int32_t hover=-1;
     const ChromeLayout layout=WindowChromeLayout(origin0);
-    for(int button=0;button<3 && hover<0;++button){
+    for(int button=0;button<ChromeCaptionLimit && hover<0;++button){
         const ChromePart* part=layout.Find(ChromeCaptionRole(button));
         if(part && part->hit.contains(mouseX,mouseY))hover=button;
     }
@@ -3277,6 +3280,7 @@ static uint64_t DesktopChromeKeyLocked(const DesktopChromeEpochs& layers,const W
         (1ull<<63)|(uint64_t(origin0.captionHeight)<<32)|(uint64_t(origin0.captionInsetTop)<<16)|origin0.captionInsetRight : 0;
     in.captionStyle=origin0.noChrome && origin0.captionOverlay ? origin0.captionStyle : 0;
     in.hoverButton=hover;
+    in.dockButton=CaptionGeometry(origin0).dockButton;
     in.theme=layers.theme;in.appearance=layers.appearance;in.scale=layers.scale;
     in.settingsEpoch=layers.settings;in.launcherEpoch=layers.launcher;
     return WmChromeKey(in);

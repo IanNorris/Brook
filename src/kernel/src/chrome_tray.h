@@ -54,6 +54,23 @@ inline DesktopRect ChromeTrayMenuRect(const ChromeStyle& s, DesktopRect anchor, 
     return {left, anchor.y - height - margin, w, height};
 }
 
+// The window menu: below and right of the press, flipped to stay on the
+// desktop (above the taskbar), the tray menu's width and rows.
+inline DesktopRect ChromeWindowMenuRect(const ChromeStyle& s, int x, int y, uint32_t count, int sw, int desktopH)
+{
+    if (!count || sw <= 0 || desktopH <= 0) return {};
+    const int margin = s.M(8), width = s.M(228), height = s.M(12) + int(count) * s.M(36);
+    const int w = width < sw - 2 * margin ? width : sw - 2 * margin;
+    if (w <= 0 || height + 2 * margin > desktopH) return {};
+    int left = x + w > sw - margin ? x - w : x;
+    if (left + w > sw - margin) left = sw - margin - w;
+    if (left < margin) left = margin;
+    int top = y + height > desktopH - margin ? y - height : y;
+    if (top + height > desktopH - margin) top = desktopH - margin - height;
+    if (top < margin) top = margin;
+    return {left, top, w, height};
+}
+
 inline DesktopRect ChromeNoticeRect(const ChromeStyle& s, int sw, int desktopH, uint32_t actions)
 {
     const int margin = s.M(16), width = s.M(360);

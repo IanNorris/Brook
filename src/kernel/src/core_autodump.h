@@ -32,6 +32,6 @@ struct CoreAutoStats {
 CoreAutoStats CoreAutoReadStats();
 
 int SchedulerCoreAutoQueue(uint16_t pid);
-int SchedulerCoreResourceLimit(Process* caller,uint16_t pid,const CoreResourceLimits* replace,
+int SchedulerCoreResourceLimit(Process* caller,uint32_t pid,const CoreResourceLimits* replace,
                                CoreResourceLimits& previous,bool privileged);
 }

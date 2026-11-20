@@ -710,6 +710,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         }
     }
 
+    if(const int keyPolicy=brook::FatFsProtectBootKey())
+        KernelPanic("initrd: hardware update key policy failed (%d)",keyPolicy);
+
     // Child attachments require the root identity to exist first.
     brook::VfsMount("/proc", "procfs", 0);
     // Read boot options before creating the first tmpfs instance.

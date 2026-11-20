@@ -3,7 +3,8 @@
 #include "vfs_path.h"
 #include "mount_namespace.h"
 #include "fs_context.h"
-#include "user_namespace.h"
+#include "process.h"
+#include "process_user_namespace.h"
 #include "mount_namespace_state.h"
 #if defined(BROOK_HOST_TEST) && !defined(BROOK_STANDALONE_TEST)
 #include <new>
@@ -24,7 +25,11 @@ inline void* operator new(__SIZE_TYPE__,void* pointer) noexcept { return pointer
 #ifndef BROOK_HOST_TEST
 #include "module.h"
 #else
-namespace brook { bool ModuleRetainAddresses(const uintptr_t*,uint32_t) __attribute__((weak)); }
+namespace brook {
+bool ModuleRetainAddresses(const uintptr_t*,uint32_t) __attribute__((weak));
+Process* ProcessCurrent() __attribute__((weak));
+bool ProcessCapable(Process*,UserNamespace*,unsigned) __attribute__((weak));
+}
 #endif
 
 // Forward-declare SchedulerYield — weak so test builds link without the scheduler.
@@ -215,6 +220,29 @@ static uint64_t VfsMountAttributes(const MountEntry* mount) {
 }
 static bool VfsReadOnly(const MountEntry* mount) { return mount && (VfsMountAttributes(mount)&MountReadOnly); }
 static bool VfsNoExec(const MountEntry* mount) { return mount && (VfsMountAttributes(mount)&MountNoExec); }
+
+bool VfsCanAccessSystemFiles()
+{
+#if defined(BROOK_HOST_TEST)
+    if(!ProcessCurrent)return true;
+#endif
+    auto* caller=ProcessCurrent();
+    if(!caller || caller->isKernelThread)return true;
+#if defined(BROOK_HOST_TEST)
+    if(!ProcessCapable)return false;
+#endif
+    return ProcessCapable(caller,nullptr,CapSysAdmin);
+}
+
+static bool VfsSystemMountDenied(const MountEntry* mount)
+{
+    return mount && __atomic_load_n(&mount->backing->systemInternal,__ATOMIC_ACQUIRE) &&
+        !VfsCanAccessSystemFiles();
+}
+static bool VfsSystemVnodeDenied(const Vnode* node)
+{
+    return node && VfsSystemMountDenied(static_cast<MountEntry*>(node->mountOwner));
+}
 bool VfsMountNoExec(const Vnode* vn) { return vn && VfsNoExec(static_cast<MountEntry*>(vn->mountOwner)); }
 bool VfsMountReadOnly(const Vnode* vn) { return vn && VfsReadOnly(static_cast<MountEntry*>(vn->mountOwner)); }
 static bool VfsNodevDenied(const MountEntry* mount,const VnodeStat& stat,int flags)
@@ -486,6 +514,7 @@ static int VfsLstatPathRaw(const char* path, VnodeStat* st)
     const char* relPath = nullptr;
     MountEntry* mount   = FindMount(path, &relPath,physicalRelative);
     if (!mount || !mount->backing->fsOps) return -2;
+    if(VfsSystemMountDenied(mount))return -13;
 
     int result = -2;
     if (mount->backing->fsOps->lstat_path)
@@ -520,6 +549,7 @@ static int VfsReadlinkRaw(const char* path, char* buf, uint64_t bufsiz)
     const char* relPath = nullptr;
     MountEntry* mount = FindMount(path, &relPath,physicalRelative);
     if (!mount || !mount->backing->fsOps) return -2;
+    if(VfsSystemMountDenied(mount))return -13;
     // A filesystem root is a directory, including when reached through a
     // mountpoint like /data. Backend parent/name lookup cannot represent it.
     if (relPath[0]=='/' && !relPath[1]) return -22;
@@ -572,7 +602,7 @@ static bool VfsLegacyMountAliasMatchesLocked(const char* path,uint32_t length,Mo
     if(!g_rootMount || length>=512)return false;
     char prefix[512];for(uint32_t i=0;i<length;++i)prefix[i]=path[i];prefix[length]=0;
     VfsPath root{};if(VfsMountRootLocked(g_rootMount,&root))return false;
-    VfsRetainedProvider provider;RetainedWalkResult<VfsPath> result{};
+    VfsRetainedProvider provider{false,false};RetainedWalkResult<VfsPath> result{};
     const int error=WalkRetainedPath(root,root,prefix,&result,provider);
     const bool matches=!error && result.object.attachment==mount;
     VfsPathRelease(result.parent);VfsPathRelease(result.object);VfsPathRelease(root);
@@ -687,7 +717,7 @@ bool VfsProtectBootMount(uint64_t publication)
     for (auto& mount : g_mounts) {
         if (mount.owner != &g_initialNamespace || mount.publication != publication ||
             !VfsMountPublished(mount)) continue;
-        mount.backing->systemInternal = true;
+        __atomic_store_n(&mount.backing->systemInternal,true,__ATOMIC_RELEASE);
         return true;
     }
     return false;
@@ -834,6 +864,7 @@ int VfsAccessPath(const char* path,uint8_t required,bool realIds,bool nofollow)
 
 int VfsAccess(Vnode* vn,uint8_t required,bool realIds)
 {
+    if(VfsSystemVnodeDenied(vn))return -13;
     if (!vn) return -9;
     if (required & ~7u) return -22;
     FileMutationGuard lookup(false);
@@ -946,6 +977,7 @@ Vnode* VfsOpenModeChecked(const char* path, int flags, uint16_t mode, int* error
     }
 
     if (!mount->backing->fsOps) return nullptr;
+    if(VfsSystemMountDenied(mount)) {if(error)*error=-13;return nullptr;}
     if(VfsReadOnly(mount)) {
         bool deny=flags&(VFS_O_WRITE|VFS_O_TRUNC);
         if(!deny && (flags&VFS_O_CREATE)) {
@@ -1040,6 +1072,7 @@ int VfsDirectoryPath(Vnode* vn,char* out,uint32_t capacity)
 
 int VfsChmod(Vnode* vn, uint16_t mode)
 {
+    if(VfsSystemVnodeDenied(vn))return -13;
     FileMutationGuard mutation;
     if(VfsMountReadOnly(vn))return -30;
     if (!vn) return -9;
@@ -1065,6 +1098,7 @@ int VfsChmodPath(const char* path, uint16_t mode)
 
 int VfsChown(Vnode* vn, uint32_t uid, uint32_t gid)
 {
+    if(VfsSystemVnodeDenied(vn))return -13;
     FileMutationGuard mutation;
     if(VfsMountReadOnly(vn))return -30;
     if (!vn) return -9;
@@ -1098,6 +1132,7 @@ int VfsRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
                      vn, vn->refCount);
         return -1;
     }
+    if(VfsSystemVnodeDenied(vn))return -13;
     if (!vn->ops->read) return -1;
     if(vn->ops->file_object)
         return FileObjectRead(vn->ops->file_object(vn),vn,buf,len,offset);
@@ -1106,6 +1141,7 @@ int VfsRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
 
 int VfsWrite(Vnode* vn, const void* buf, uint64_t len, uint64_t* offset)
 {
+    if(VfsSystemVnodeDenied(vn))return -13;
     if(VfsMountReadOnly(vn))return -30;
     if (!vn || !vn->ops->write) return -1;
     if(vn->ops->file_object)
@@ -1115,6 +1151,7 @@ int VfsWrite(Vnode* vn, const void* buf, uint64_t len, uint64_t* offset)
 
 int VfsAppend(Vnode* vn, const void* buf, uint64_t len, uint64_t* offset)
 {
+    if(VfsSystemVnodeDenied(vn))return -13;
     if(VfsMountReadOnly(vn))return -30;
     if (!vn || vn->type != VnodeType::File || !vn->ops->write) return -22;
     if (vn->ops->file_object)
@@ -1129,6 +1166,11 @@ static MappingPinRegistry g_mappingPins;
 
 int VfsFileMapPin(Vnode* vn)
 {
+    if(VfsSystemVnodeDenied(vn))return -13;
+    const auto* mount=vn?static_cast<MountEntry*>(vn->mountOwner):nullptr;
+    // Shared address spaces and inherited mappings outlive a credential
+    // change. System storage uses checked descriptor I/O instead.
+    if(mount && __atomic_load_n(&mount->backing->systemInternal,__ATOMIC_ACQUIRE))return -95;
     if(vn && vn->ops && vn->ops->deny_mapping)return -95;
     if (g_mappingPins.RetainIfPinned(vn)) return 0;
     FileMutationGuard mutation;
@@ -1151,6 +1193,7 @@ void VfsFileMapUnpin(Vnode* vn)
 
 static int VfsTruncateLocked(Vnode* vn, uint64_t size)
 {
+    if(VfsSystemVnodeDenied(vn))return -13;
     if(VfsMountReadOnly(vn))return -30;
     if (!vn) return -9;
     if (size > 0x7fffffffffffffffULL) return -22;
@@ -1220,6 +1263,7 @@ static uint32_t VfsSyntheticChildrenLocked(const VfsPath& parent,uint32_t index,
 }
 int VfsReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie)
 {
+    if(VfsSystemVnodeDenied(vn))return -13;
     if(!vn || !out || !cookie || !vn->ops)return -22;
     if(vn->type!=VnodeType::Dir)return -20;
     FileMutationGuard lookup(false);
@@ -1244,6 +1288,7 @@ int VfsReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie)
 
 int VfsStat(Vnode* vn, VnodeStat* st)
 {
+    if(VfsSystemVnodeDenied(vn))return -13;
     if (!vn || !vn->ops->stat || !st) return -1;
     *st = {};
     int ret = vn->ops->stat(vn, st);
@@ -1254,6 +1299,7 @@ int VfsStat(Vnode* vn, VnodeStat* st)
 
 int VfsSpaceInfo(Vnode* vn, VfsSpace* out)
 {
+    if(VfsSystemVnodeDenied(vn))return -13;
     if (!vn || !out) return -22;
     *out = {};
     if (!vn->ops || !vn->ops->space) return -38; // ENOSYS, never fabricated capacity.
@@ -1282,6 +1328,7 @@ int VfsLstatPath(const char* path, VnodeStat* st)
 
 int VfsSetTimes(Vnode* vn, const VnodeTime* times)
 {
+    if(VfsSystemVnodeDenied(vn))return -13;
     FileMutationGuard mutation;
     if(VfsMountReadOnly(vn))return -30;
     if (!vn || !vn->ops || !times) return -22;

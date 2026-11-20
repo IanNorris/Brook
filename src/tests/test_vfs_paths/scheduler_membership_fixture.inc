@@ -1,6 +1,7 @@
 // Compile the actual scheduler birth/terminal paths with inert policy, registry
 // and interrupt adapters. ProcessFs/VFS storage and membership remain real.
 #include "../../kernel/src/kernel_region.h"
+namespace brook { void ProcessVforkRelease(Process*) {} }
 namespace scheduler_membership_fixture {
 using namespace brook;
 struct Lock { bool held=false; };
@@ -35,6 +36,7 @@ Process* current=nullptr;
 Process* SchedulerCurrentProcess() {return current;}
 void SchedulerMarkTerminated(Process*,int);
 void InheritSeccompForBirth(Process*, Process*) {assert(g_allProcLock.held);}
+bool ProcessPidPublish(Process*, bool) {assert(g_allProcLock.held);return true;}
 #include "../../kernel/src/scheduler_process_birth.inc"
 #include "../../kernel/src/scheduler_process_terminal.inc"
 

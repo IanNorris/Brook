@@ -10,6 +10,7 @@
 #include "compositor.h"
 #include "window.h"
 #include "desktop_identity.h"
+#include "shell_service.h"
 #include "gpu_compositor.h"
 #include "user_copy.h"
 #include "syscall_internal.h"
@@ -320,7 +321,7 @@ int64_t sys_brook_wm_set_client_socket(uint64_t wmId,uint64_t fdValue,
     const bool accepted=socket->state==UnixSocketData::State::Connected &&
                         socket->acceptedEndpoint && socket->socketType==1;
     if (accepted) {
-        credentials=socket->peerCredentials;incarnation=socket->peerIncarnation;launchId=socket->peerLaunchId;
+        credentials=socket->peerCredentials.raw;incarnation=socket->peerIncarnation;launchId=socket->peerLaunchId;
     }
     SpinLockRelease(&g_unixRegistryLock);
     if (!accepted) return -95; // EOPNOTSUPP
@@ -509,6 +510,23 @@ int64_t sys_brook_wm_begin_move(uint64_t wmId, uint64_t,
     if (!w) return -EINVAL;
     int idx = static_cast<int>(wmId) - 1;
     return brook::CompositorBeginWindowMove(idx) ? 0 : -EINVAL;
+}
+
+// 0xB25: WM_SHOW_WINDOW_MENU(wmId, x, y)
+//   xdg_toplevel.show_window_menu: open the window menu at (x, y), physical
+//   pixels relative to the caller's window surface (client origin).
+int64_t sys_brook_wm_show_window_menu(uint64_t wmId, uint64_t x, uint64_t y,
+                                      uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    if (wmId == 0 || wmId > 0xFFFFu) return -EINVAL;
+    const int32_t rx = static_cast<int32_t>(x), ry = static_cast<int32_t>(y);
+    if (rx < -0x8000 || rx > 0x7fff || ry < -0x8000 || ry > 0x7fff) return -EINVAL;
+    brook::Window* w = brook::WmFindWindowById(proc, static_cast<uint32_t>(wmId));
+    if (!w) return -EINVAL;
+    const int idx = static_cast<int>(wmId) - 1;
+    return brook::WmShowWindowMenu(idx, w->clientX() + rx, w->clientY() + ry) ? 0 : -EINVAL;
 }
 
 // 514: WM_MOVE_RELATIVE(wmId, parentWmId, relX, relY)
@@ -725,12 +743,14 @@ int64_t sys_brook_wm_scanout_flip(uint64_t minY, uint64_t maxY, uint64_t,
 int64_t sys_brook_wm_get_windows(uint64_t outAddr, uint64_t maxCount, uint64_t,
                                   uint64_t, uint64_t, uint64_t)
 {
-    if (maxCount == 0) return 0;
-    uint64_t bufSize = maxCount * sizeof(brook::WmWindowDesc);
-    if (!UserBufferWritable(outAddr, bufSize)) return -EFAULT;
     Process* proc = ProcessCurrent();
+    if (!proc || !ShellServiceAllowsWindowCapture(*proc)) return -EPERM;
+    if (!maxCount) return 0;
+    KernelOperationGuard operation(proc);
+    const uint32_t limit = maxCount > WM_MAX_WINDOWS ? WM_MAX_WINDOWS : static_cast<uint32_t>(maxCount);
+    if (!UserBufferWritable(outAddr, uint64_t(limit) * sizeof(brook::WmWindowDesc))) return -EFAULT;
     auto* out = reinterpret_cast<brook::WmWindowDesc*>(outAddr);
-    return static_cast<int64_t>(brook::CompositorGetWindows(proc, out, static_cast<uint32_t>(maxCount)));
+    return static_cast<int64_t>(brook::CompositorGetWindows(proc, out, limit));
 }
 
 // ---------------------------------------------------------------------------
@@ -740,6 +760,9 @@ int64_t sys_brook_wm_map_window_vfb(uint64_t wmId, uint64_t, uint64_t,
                                      uint64_t, uint64_t, uint64_t)
 {
     Process* proc = ProcessCurrent();
+    if (!proc || !ShellServiceAllowsWindowCapture(*proc)) return -EPERM;
+    if (!wmId || wmId > 0xffffffffULL) return -ENOENT;
+    KernelOperationGuard operation(proc);
     uint64_t addr = brook::CompositorMapWindowVfb(proc, static_cast<uint32_t>(wmId));
     return addr ? static_cast<int64_t>(addr) : -ENOENT;
 }

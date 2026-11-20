@@ -32,10 +32,10 @@ KernelSigaction ReadSignalAction(uint16_t,uint32_t) {
     if(actionReadHook)actionReadHook();
     KernelSigaction action{}; action.handler=signalHandler; return action;
 }
-bool SchedulerTimerTargetIncarnation(Process* owner,int32_t tid,uint64_t* incarnation) {
+bool SchedulerTimerTargetIncarnation(Process* owner,int32_t tid,uint16_t* globalTid,uint64_t* incarnation) {
     if(!timerTarget || timerTarget->tgid!=owner->tgid || timerTarget->pid!=tid ||
        timerTarget->state==ProcessState::Terminated)return false;
-    *incarnation=timerTarget->incarnation;return true;
+    *globalTid=timerTarget->pid;*incarnation=timerTarget->incarnation;return true;
 }
 
 // Execute real block/unblock bodies with real timer code and Process layout.

@@ -3,6 +3,7 @@
 // Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
+#include "pid_namespace.h"
 #include "process_user_namespace.h"
 
 #include "string.h"
@@ -98,7 +99,7 @@ int64_t sys_capget(uint64_t header, uint64_t data, uint64_t,
     int32_t pid;
     if (!CopyFromUser(&pid, header + sizeof(uint32_t), sizeof(pid))) return -EFAULT;
     if (pid < 0) return -EINVAL;
-    if (pid && pid != proc->pid) return -ENOSYS; // Foreign queries not implemented.
+    if (pid && static_cast<uint32_t>(pid) != ProcessVisibleTid(proc, ProcessPidView(proc))) return -ENOSYS; // Foreign queries not implemented.
     uint32_t values[6]={};
     if(privateCaps)for(unsigned i=0;i<unsigned(words/3);++i) {
         values[i*3]=capabilities.effective>>(i*32);values[i*3+1]=capabilities.permitted>>(i*32);values[i*3+2]=capabilities.inheritable>>(i*32);
@@ -115,7 +116,7 @@ int64_t sys_capset(uint64_t header, uint64_t data, uint64_t,
     if (words < 0) return words;
     int32_t pid;
     if (!CopyFromUser(&pid, header + sizeof(uint32_t), sizeof(pid))) return -EFAULT;
-    if (pid && pid != proc->pid) return -EPERM;
+    if (pid && static_cast<uint32_t>(pid) != ProcessVisibleTid(proc, ProcessPidView(proc))) return -EPERM;
     uint32_t values[6] = {};
     if (!CopyFromUser(values, data, words * sizeof(uint32_t))) return -EFAULT;
     if(privateCaps) {

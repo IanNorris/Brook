@@ -87,6 +87,7 @@
 #define BROOK_SYS_WM_SET_CURSOR_IMAGE  519
 #define BROOK_SYS_WM_GET_SCREEN_INFO  520
 #define BROOK_SYS_WM_PRESENT_GRES     525
+#define BROOK_SYS_WM_SHOW_WINDOW_MENU 0xB25
 #define BROOK_WM_CREATE_FLAG_CSD     1u
 #define BROOK_WM_CREATE_FLAG_NO_FOCUS 2u
 
@@ -1053,8 +1054,10 @@ static void toplevel_send_bounds(struct brook_surface *s, uint32_t width, uint32
 static void toplevel_send_wm_capabilities(struct wl_resource *toplevel)
 {
     if (wl_resource_get_version(toplevel) < XDG_TOPLEVEL_WM_CAPABILITIES_SINCE_VERSION) return;
-    // All three requests have WM implementations. show_window_menu is a stub.
-    uint32_t supported[] = { XDG_TOPLEVEL_WM_CAPABILITIES_MAXIMIZE,
+    // Every request has a WM implementation; the window menu is the kernel's
+    // (Move to side dock, Minimise, Maximise, Close).
+    uint32_t supported[] = { XDG_TOPLEVEL_WM_CAPABILITIES_WINDOW_MENU,
+                             XDG_TOPLEVEL_WM_CAPABILITIES_MAXIMIZE,
                              XDG_TOPLEVEL_WM_CAPABILITIES_MINIMIZE,
                              XDG_TOPLEVEL_WM_CAPABILITIES_FULLSCREEN };
     struct wl_array capabilities = { .size = sizeof(supported), .data = supported };
@@ -1419,10 +1422,17 @@ static void xdg_toplevel_set_app_id(struct wl_client *c, struct wl_resource *r,
         deco_apply_mode(s->deco_resource, 1);
     else if (s->wm_id && s->deco_csd) surface_sync_decoration(s, 0);
 }
+/* The Brook window menu (Move to side dock, Minimise, Maximise, Close) at
+ * the request's surface-local point, which the kernel anchors to the window. */
 static void xdg_toplevel_show_window_menu(struct wl_client *c, struct wl_resource *r,
                                             struct wl_resource *seat, uint32_t serial,
                                             int32_t x, int32_t y) {
-    (void)c; (void)r; (void)seat; (void)serial; (void)x; (void)y;
+    (void)c; (void)seat; (void)serial;
+    struct brook_surface *s = wl_resource_get_user_data(r);
+    if (!s || !s->wm_id) return;
+    const int64_t scale = surface_output_scale(s);
+    long rc = syscall(BROOK_SYS_WM_SHOW_WINDOW_MENU, (long)s->wm_id, (long)(x * scale), (long)(y * scale));
+    fprintf(stderr, "[waylandd] xdg_toplevel.show_window_menu wm=%u at %d,%d rc=%ld\n", s->wm_id, x, y, rc);
 }
 static void xdg_toplevel_move(struct wl_client *c, struct wl_resource *r,
                                struct wl_resource *seat, uint32_t serial) {

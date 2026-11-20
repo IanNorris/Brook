@@ -52,66 +52,8 @@ static int64_t DoReadlink(const char* original,uint64_t bufAddr,uint64_t bufsiz,
         return static_cast<int64_t>(slen);
     }
 
-    // /proc/self/exe → return the process's executable path
-    auto streq = [](const char* a, const char* b) {
-        while (*a && *a == *b) { a++; b++; }
-        return *a == *b;
-    };
-    if (streq(path, "/proc/self/exe"))
-    {
-        const char* exe = "/boot/BIN/UNKNOWN";
-        Process* proc = ProcessCurrent();
-        if (proc && proc->exePath[0])
-        {
-            exe = proc->exePath;
-        }
-        else if (proc && proc->name[0])
-        {
-            // Build "/boot/BIN/<NAME>" from process name
-            char exePath[128];
-            int len = 0;
-            const char* prefix = "/boot/BIN/";
-            for (int i = 0; prefix[i]; i++) exePath[len++] = prefix[i];
-            for (int i = 0; proc->name[i] && len < 120; i++) exePath[len++] = proc->name[i];
-            exePath[len] = '\0';
-            uint64_t slen = 0;
-            while (exePath[slen]) slen++;
-            if (slen > bufsiz) slen = bufsiz;
-            if (!CopyToUser(bufAddr, exePath, slen)) return -EFAULT;
-            return static_cast<int64_t>(slen);
-        }
-        uint64_t slen = 0;
-        while (exe[slen]) slen++;
-        if (slen > bufsiz) slen = bufsiz;
-        if (!CopyToUser(bufAddr, exe, slen)) return -EFAULT;
-        return static_cast<int64_t>(slen);
-    }
-
-    // FD links use retained procfs objects below. The old synthetic shortcut
-    // returned stale opening labels (or "?" for O_PATH) and bypassed FD identity.
-
-    // /proc/PID/exe → return executable path for any process
-    {
-        const char* p = path;
-        if (p[0] == '/' && p[1] == 'p' && p[2] == 'r' && p[3] == 'o' &&
-            p[4] == 'c' && p[5] == '/')
-        {
-            p += 6;
-            uint16_t pid = 0;
-            while (*p >= '0' && *p <= '9') { pid = pid * 10 + (*p - '0'); p++; }
-            if (*p == '/' && p[1] == 'e' && p[2] == 'x' && p[3] == 'e' && p[4] == '\0' && pid > 0) {
-                ProcessSnapshot snap = {};
-                if (SchedulerSnapshotProcess(pid, &snap) && snap.exePath[0]) {
-                    uint64_t slen = 0;
-                    while (snap.exePath[slen]) slen++;
-                    if (slen > bufsiz) slen = bufsiz;
-                    if (!CopyToUser(bufAddr, snap.exePath, slen)) return -EFAULT;
-                    return static_cast<int64_t>(slen);
-                }
-            }
-        }
-    }
-
+    // Proc symlinks resolve through the attached procfs instance. A global
+    // numeric lookup here would bypass the mount's PID view.
     // Try VFS readlink for real symlinks
     char linkTarget[1024];
     uint64_t cap = (bufsiz < sizeof(linkTarget)) ? bufsiz : sizeof(linkTarget);

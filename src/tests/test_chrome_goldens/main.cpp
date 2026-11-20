@@ -140,8 +140,9 @@ ChromeStyle StyleFor(uint32_t, const DesktopMetrics& m, bool glass) {
 
 void Frames(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
     const int clientW = m.pixels(360), clientH = m.pixels(80);
-    struct Case { const char* name; bool focused, maximised, glass; const uint32_t* icon; int hover; };
-    // hover: -1 none; 0..2 a caption button by its outer top-right corner of
+    struct Case { const char* name; bool focused, maximised, glass; const uint32_t* icon; int hover; uint8_t dock = 0; };
+    // dock: the side-dock caption button (0 none, 1 left, 2 right).
+    // hover: -1 none; 0..3 a caption button by its outer top-right corner of
     // its hit rect (the bleed area, not the visual cell).
     const Case cases[] = {
         {"frame-active", true, false, false, testIcon, -1},
@@ -151,11 +152,15 @@ void Frames(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) 
         {"frame-hover-min", false, false, false, testIcon, 2},
         {"frame-maximised", true, true, false, testIcon, -1},
         {"frame-active-glass", true, false, true, testIcon, -1},
+        {"frame-dock-hover", true, false, false, testIcon, 3, 1},
+        {"frame-dock-right-glass", true, false, true, testIcon, -1, 2},
     };
     for (const Case& c : cases) {
         const ChromeStyle s = StyleFor(theme, m, c.glass);
         ChromeFrameModel model{};
-        model.layout = ChromeFrameLayout({{0, 0, clientW, clientH, false}, c.maximised, {}}, m);
+        DesktopWindowGeometry g{0, 0, clientW, clientH, false};
+        g.dockButton = c.dock;
+        model.layout = ChromeFrameLayout({g, c.maximised, {}}, m);
         model.clientW = clientW;
         model.focused = c.focused;
         model.maximised = c.maximised;
@@ -362,10 +367,13 @@ const uint64_t now = 100000;
 
 // Use different storage for the received snapshot so all borrowed list assets
 // must be rebound locally, as in the shell process.
-void CheckShellWire(const ChromeDisplayList& list) {
+void CheckShellWire(const ChromeDisplayList& list, const char* label = nullptr) {
     static ShellWireList wire;
     static ChromeCmd replay[ShellCommandLimit];
     if (!PackShellList(list, wire)) std::abort();
+    if (label)
+        std::printf("%s wire budget: %u/%u commands, %u/%u text bytes, %u/%u asset words\n",
+                    label, wire.count, ShellCommandLimit, wire.textBytes, ShellTextLimit, wire.assetWords, ShellAssetLimit);
     for (uint32_t i = 0; i < wire.count; ++i)
         if (!DecodeShellCommand(wire.commands[i], wire.text, wire.textBytes,
                                 wire.assets, wire.assetWords, replay[i])) std::abort();
@@ -395,10 +403,62 @@ void SetTestIcon(ChromeShellIcon& icon) {
     std::memcpy(icon.pixels, testIcon, sizeof(icon.pixels));
 }
 
+void LauncherWireBudget(const std::string& name, const ChromeStyle& style, uint32_t screenW, uint32_t screenH) {
+    using TK = LauncherTargetKind;
+    static ChromeShellModel snapshot;
+    static ChromeShellStorage storage;
+    static LauncherApp apps[LauncherLimits::Apps];
+    snapshot = {};
+    snapshot.kind = ChromeShellKind::Launcher;
+    snapshot.mouseX = snapshot.mouseY = -1;
+    std::strcpy(snapshot.launcherBuild, "Launcher wire-budget fixture");
+    auto& model = snapshot.launcherModel;
+    model.Init();
+    model.SetCatalog(nullptr, 0); // install the fixture apps after the initial layout is filed
+    while (model.CategoryCount() < LauncherLimits::Categories) {
+        const int category = model.CreateCategory();
+        if (category < 0) std::abort();
+        char nameBuffer[LauncherLimits::CategoryName];
+        std::snprintf(nameBuffer, sizeof(nameBuffer), "Custom category %u", unsigned(category));
+        if (!model.RenameCategory(uint32_t(category), nameBuffer)) std::abort();
+    }
+    for (uint32_t app = 0; app < LauncherLimits::Apps; ++app) {
+        auto& entry = apps[app];
+        std::snprintf(entry.key, sizeof(entry.key), "org.brook.desktop-fixture.%03u", app);
+        std::snprintf(entry.name, sizeof(entry.name), "Application %03u for documents and graphics", app);
+        std::strcpy(entry.desc, "Open and edit documents with this workspace writing application");
+        std::strcpy(entry.hint, app % 2 ? "office" : "graphics");
+        SetTestIcon(snapshot.icons[app]);
+    }
+    model.SetCatalog(apps, LauncherLimits::Apps);
+    for (uint32_t app = 0; app < LauncherLimits::Pins; ++app) model.TogglePin(app);
+    model.Press({TK::Organise, 0}, false, 0, 0);
+    model.Press({TK::Rail, uint16_t(model.RailRowFor(LauncherViewUnsorted))}, false, 0, 0);
+    model.Press({TK::Row, 0}, false, 0, 0);
+    model.SetUndoVisible(true);
+    if (model.CategoryCount() != LauncherLimits::Categories || model.UnsortedCount() != LauncherLimits::Apps ||
+        model.Suggestion(0) < 0 || model.PinCount() != LauncherLimits::Pins) std::abort();
+    const ChromeLauncherChrome chrome{nullptr, 0, "brook", snapshot.launcherBuild, nullptr, false, false, false, false, -1, -1};
+    auto& frame = snapshot.launcherFrame;
+    ChromeLauncherFrameFor(model, chrome, style, screenW, screenH, frame);
+    model.SetViewport(frame.viewport);
+    ChromeLauncherFrameFor(model, chrome, style, screenW, screenH, frame);
+    bool suggestionDrawn = false;
+    for (uint32_t i = 0; i < frame.targetCount; ++i) suggestionDrawn |= frame.targets[i].target.kind == TK::MoveSuggested;
+    if (!suggestionDrawn) std::abort();
+    auto list = ChromeListOn(storage);
+    BuildShellModel(snapshot, style, list);
+    CheckShellWire(list, name.c_str());
+    const auto& rect = frame.panel;
+    Check(name, list, style, rect.x, rect.y, rect.w, rect.h);
+}
+
 void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
     const bool glass = theme == BROOK_THEME_GLASS;
     const ChromeStyle s = StyleFor(theme, m, glass);
     const uint32_t screenW = 1280 * m.percent / 100, screenH = 800 * m.percent / 100;
+    if (prefix == "glass-100-" || prefix == "opaque-dark-150-" || prefix == "opaque-light-200-")
+        LauncherWireBudget(prefix + "launcher-organise-budget", s, screenW, screenH);
     static ChromeShellStorage storage;
 
     // Taskbar: three windows (focused, minimised, plain), a starting app and
@@ -618,21 +678,27 @@ void Dock(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
     const uint32_t screenW = 1600 * m.percent / 100, desktopH = 852 * m.percent / 100;
     static ChromeShellStorage storage;
     static ChromeShellModel model;
-    struct Scene { const char* name; int selected; bool pinned; int hover; }; // hover: -1, entry, or 100 return
+    // hover: -1, entry, 100 return, 200 the side button; resizing: the grip is dragged.
+    struct Scene { const char* name; int selected; bool pinned; int hover; bool right = false; int width = 0;
+                   bool resizing = false; };
     const Scene scenes[] = {
         {"dock-open", 0, false, -1},
         {"dock-selected", 2, false, 100},
         {"dock-pinned", 1, true, 3},
+        {"dock-right", 1, false, 200, true, 520},
+        {"dock-resizing", 0, true, -1, false, 360, true},
     };
     for (const Scene& scene : scenes) {
         model = {};
         model.kind = ChromeShellKind::Dock;
-        model.dock = ChromeDockLayoutFor(m, screenW, desktopH, 4, scene.selected, true);
+        model.dock = ChromeDockLayoutFor(m, screenW, desktopH, 4, scene.selected, true, {scene.width, scene.right});
         model.dockPinned = scene.pinned;
+        model.dockResizing = scene.resizing;
         for (int i = 0; i < 4; ++i) if (i != 3) SetTestIcon(model.icons[i]); // entry 3: missing icon
         std::strcpy(model.text, "Terminal - brook@clearwater: ~/src/brook");
         model.mouseX = model.mouseY = -1;
         if (scene.hover == 100) { model.mouseX = model.dock.back.x + 2; model.mouseY = model.dock.back.y + 2; }
+        else if (scene.hover == 200) { model.mouseX = model.dock.side.x + 2; model.mouseY = model.dock.side.y + 2; }
         else if (scene.hover >= 0) {
             model.mouseX = model.dock.cells[scene.hover].x + 2;
             model.mouseY = model.dock.cells[scene.hover].y + 2;
@@ -650,6 +716,32 @@ void Dock(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
     RenderSnapshot(model, s, list);
     const DesktopRect& t = model.dock.tab;
     Check(prefix + "dock-tab", list, s, 0, t.y - m.pixels(8), m.pixels(24), t.h + m.pixels(16));
+    // Drag to dock: the shut dock's "Send to dock" chip (placed by the WM),
+    // on either edge, and the open strip lit as the target.
+    for (bool right : {false, true}) {
+        model = {};
+        model.kind = ChromeShellKind::Dock;
+        model.dock = ChromeDockLayoutFor(m, screenW, desktopH, 0, -1, false, {0, right});
+        model.dock.drop = true;
+        const int w = m.pixels(ChromeDockMetrics::DropChipW), h = m.pixels(ChromeDockMetrics::DropChipH);
+        model.dock.tab = {right ? int(screenW) - w : 0, (int(desktopH) - h) / 2, w, h};
+        model.mouseX = model.mouseY = -1;
+        ChromeDisplayList chip = ChromeListOn(storage);
+        RenderSnapshot(model, s, chip);
+        const DesktopRect& c = model.dock.tab;
+        Check(prefix + (right ? "dock-drop-chip-right" : "dock-drop-chip"), chip, s, c.x, c.y, c.w, c.h);
+    }
+    model = {};
+    model.kind = ChromeShellKind::Dock;
+    model.dock = ChromeDockLayoutFor(m, screenW, desktopH, 2, 0, true);
+    model.dock.drop = true;
+    SetTestIcon(model.icons[0]);SetTestIcon(model.icons[1]);
+    std::strcpy(model.text, "Files");
+    model.mouseX = model.mouseY = -1;
+    ChromeDisplayList lit = ChromeListOn(storage);
+    RenderSnapshot(model, s, lit);
+    const DesktopRect& r = model.dock.strip;
+    Check(prefix + "dock-drop-open", lit, s, r.x, r.y, r.w, r.h);
 }
 
 void WebAppTitles(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {

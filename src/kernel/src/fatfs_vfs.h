@@ -31,6 +31,9 @@ int FatFsPrivateRecoveryTestComplete(FatPrivateMount* mount,const char* identity
 #endif
 #endif
 void FatFsVfsRegister();
+// Pin the existing initrd hardware-update key by FAT object identity. No
+// key bytes are read. The key is optional on non-maintenance images.
+int FatFsProtectBootKey();
 // Flush dirty ordinary FAT mounts, retaining failures for the next pass.
 int FatFsBackgroundSync();
 // Boot-only, one-shot mount on a pinned exclusive binding. It is not inserted

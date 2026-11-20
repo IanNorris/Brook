@@ -571,38 +571,62 @@ void ChromeBuildTaskbar(const ChromeTaskbarModel& m, const ChromeStyle& s, Chrom
 
 using DM = ChromeDockMetrics;
 
-DesktopRect ChromeDockSidebar(const DesktopMetrics& m, uint32_t screenW, uint32_t desktopH)
+static int DockClampPixels(const DesktopMetrics& m, uint32_t screenW, int width)
 {
-    int width = m.pixels(DM::Width);
-    if (width > static_cast<int>(screenW / 2)) width = static_cast<int>(screenW / 2);
-    return {0, 0, width, static_cast<int>(desktopH)};
+    const int minimum = m.pixels(DM::MinWidth), half = static_cast<int>(screenW / 2);
+    const int maximum = m.pixels(DM::MaxWidth) < half ? m.pixels(DM::MaxWidth) : half;
+    if (width < minimum) width = minimum;
+    if (width > maximum) width = maximum;
+    return width;
+}
+
+DesktopRect ChromeDockSidebar(const DesktopMetrics& m, uint32_t screenW, uint32_t desktopH,
+                              const ChromeDockPlacement& place)
+{
+    const int width = DockClampPixels(m, screenW, m.pixels(place.width > 0 ? place.width : DM::Width));
+    return {place.right ? static_cast<int>(screenW) - width : 0, 0, width, static_cast<int>(desktopH)};
+}
+
+int ChromeDockWidthFor(const DesktopMetrics& m, uint32_t screenW, int px)
+{
+    const int width = DockClampPixels(m, screenW, px);
+    const int percent = m.percent ? static_cast<int>(m.percent) : 100;
+    return (width * 100 + percent / 2) / percent;
 }
 
 ChromeDockLayout ChromeDockLayoutFor(const DesktopMetrics& m, uint32_t screenW, uint32_t desktopH,
-                                     int entries, int selected, bool open)
+                                     int entries, int selected, bool open, const ChromeDockPlacement& place)
 {
     ChromeDockLayout l{};
     l.selected = -1;
-    l.sidebar = ChromeDockSidebar(m, screenW, desktopH);
+    l.right = place.right;
+    l.sidebar = ChromeDockSidebar(m, screenW, desktopH, place);
     if (entries <= 0 || l.sidebar.w <= 0 || l.sidebar.h <= 0) return l;
     if (entries > static_cast<int>(ChromeDockEntryLimit)) entries = ChromeDockEntryLimit;
     const int stripH = m.pixels(DM::Strip) < l.sidebar.h ? m.pixels(DM::Strip) : l.sidebar.h;
     if (!open) {
-        // The 5 px tab, vertically centred on the edge.
+        // The 5 px tab, vertically centred on the sidebar's screen edge.
         const int h = m.pixels(DM::TabHeight) < l.sidebar.h ? m.pixels(DM::TabHeight) : l.sidebar.h;
-        l.tab = {l.sidebar.x, l.sidebar.y + (l.sidebar.h - h) / 2, m.pixels(DM::Tab), h};
+        const int w = m.pixels(DM::Tab);
+        l.tab = {place.right ? l.sidebar.x + l.sidebar.w - w : l.sidebar.x, l.sidebar.y + (l.sidebar.h - h) / 2, w, h};
         l.count = entries;
         return l;
     }
     l.open = true;
     l.strip = {l.sidebar.x, l.sidebar.y, l.sidebar.w, stripH};
     l.page = {l.sidebar.x, l.sidebar.y + stripH, l.sidebar.w, l.sidebar.h - stripH};
+    // The resize grip straddles the inner edge, the full height of the
+    // sidebar, mostly outside it.
+    const int gin = m.pixels(DM::GripInside), gout = m.pixels(DM::GripOutside);
+    const int inner = place.right ? l.sidebar.x : l.sidebar.x + l.sidebar.w;
+    l.grip = {place.right ? inner - gout : inner - gin, l.sidebar.y, gin + gout, l.sidebar.h};
     const int pinW = m.pixels(DM::Pin), cell = m.pixels(DM::Cell), button = m.pixels(DM::TileButton);
     l.pin = {l.strip.x + l.strip.w - pinW, l.strip.y, pinW, stripH};
+    l.side = {l.pin.x - pinW, l.strip.y, pinW, stripH};
     if (selected < 0 || selected >= entries) selected = -1;
     // The selected tile keeps an icon cell and both buttons. Entries that
     // leave it less are not laid out (overflow is a later slice).
-    const int room = l.strip.w - pinW, tileMin = selected >= 0 ? cell + 2 * button : 0;
+    const int room = l.strip.w - 2 * pinW, tileMin = selected >= 0 ? cell + 2 * button : 0;
     int fit = selected >= 0 ? 1 + (room - tileMin) / cell : room / cell;
     if (fit < 0) fit = 0;
     l.count = entries < fit ? entries : fit;
@@ -628,8 +652,10 @@ ChromeDockLayout ChromeDockLayoutFor(const DesktopMetrics& m, uint32_t screenW, 
 ChromeDockHit ChromeDockHitTest(const ChromeDockLayout& l, int32_t x, int32_t y)
 {
     if (!l.open) return {l.tab.contains(x, y) ? ChromeDockTarget::Tab : ChromeDockTarget::None, -1};
+    if (l.grip.contains(x, y)) return {ChromeDockTarget::Grip, -1};
     if (!l.strip.contains(x, y)) return {ChromeDockTarget::None, -1};
     if (l.pin.contains(x, y)) return {ChromeDockTarget::Pin, -1};
+    if (l.side.contains(x, y)) return {ChromeDockTarget::Side, -1};
     if (l.selected >= 0) {
         if (l.close.contains(x, y)) return {ChromeDockTarget::Close, l.selected};
         if (l.back.contains(x, y)) return {ChromeDockTarget::Return, l.selected};
@@ -640,11 +666,14 @@ ChromeDockHit ChromeDockHitTest(const ChromeDockLayout& l, int32_t x, int32_t y)
     return {ChromeDockTarget::Strip, -1};
 }
 
-// "Return to desktop": a bar at the left and an arrow leaving it.
-static void DockReturnGlyph(ChromeDisplayList& dl, const ChromeStyle& s, int x0, int y0, int size, uint32_t ink)
+// "Return to desktop": a bar at the sidebar's edge and an arrow leaving it
+// (mirrored for a right-edge sidebar).
+static void DockReturnGlyph(ChromeDisplayList& dl, const ChromeStyle& s, int x0, int y0, int size, uint32_t ink,
+                            bool mirror)
 {
     auto px = [&](int v) { return v * size / 16; };
     auto box = [&](int x, int y, int w, int h) {
+        if (mirror) x = 16 - x - w;
         dl.Fill(x0 + px(x), y0 + px(y), px(x + w) - px(x), px(y + h) - px(y), 0xff000000u | ink);
     };
     box(2, 3, 2, 10);  // the edge being left
@@ -660,6 +689,20 @@ void ChromeBuildDock(const ChromeDockModel& m, const ChromeStyle& s, ChromeDispl
 {
     const ChromeDockLayout& l = *m.layout;
     const auto& p = s.P();
+    if (!l.open && l.drop) {
+        // Drag to dock, dock shut: a glass chip on the edge, the accent bar
+        // on its screen side, the dock glyph and "Send to dock".
+        const DesktopRect& t = l.tab;
+        if (t.w <= 0 || t.h <= 0) return;
+        dl.MaterialRect(t, s.MaterialColor(p.taskbar), Px(s, 8));
+        const int bar = Px(s, 4);
+        dl.Fill(l.right ? t.x + t.w - bar : t.x, t.y, bar, t.h, 0xff000000u | p.accent);
+        const int glyph = Px(s, 16), gx = t.x + Px(s, 16), gy = t.y + (t.h - glyph) / 2;
+        dl.Glyph(l.right ? ChromeGlyph::DockRight : ChromeGlyph::DockLeft, gx, gy, p.text);
+        const int tx = gx + glyph + Px(s, 10);
+        dl.Text(CF::Label, tx, t.y + (t.h - s.Line(CF::Label)) / 2, "Send to dock", p.text, t.x + t.w - tx - Px(s, 8));
+        return;
+    }
     if (!l.open) {
         // At rest: a flat quad with a short grip, no glass.
         const DesktopRect& t = l.tab;
@@ -677,7 +720,19 @@ void ChromeBuildDock(const ChromeDockModel& m, const ChromeStyle& s, ChromeDispl
     else dl.Fill(r.x, r.y, r.w, r.h, s.MaterialColor(p.taskbar));
     const uint32_t edge = s.glass ? HairlineColor(s, p.taskbar) : 0xff000000u | p.launcherBorder;
     dl.Fill(r.x, r.y + r.h - 1, r.w, 1, edge);
-    dl.Fill(r.x + r.w - 1, r.y, 1, r.h - 1, edge);
+    // The inner edge: a hairline, the accent while the grip is hovered or dragged.
+    const int innerX = l.right ? r.x : r.x + r.w - 1;
+    const bool gripHot = m.resizing || l.grip.contains(m.mouseX, m.mouseY);
+    if (gripHot || l.drop)
+        dl.Fill(l.right ? r.x : r.x + r.w - Px(s, 2), r.y, Px(s, 2), r.h, 0xff000000u | p.accent);
+    else dl.Fill(innerX, r.y, 1, r.h - 1, edge);
+    if (l.drop) dl.Fill(r.x, r.y + r.h - Px(s, 2), r.w, Px(s, 2), 0xff000000u | p.accent);
+    // The resize handle: a short pill on the inner edge, always shown.
+    {
+        const int pw = Px(s, 3), ph = Px(s, 20) < r.h ? Px(s, 20) : r.h;
+        const int px = l.right ? r.x + Px(s, 3) : r.x + r.w - Px(s, 3) - pw;
+        dl.MaterialRect({px, r.y + (r.h - ph) / 2, pw, ph}, 0xff000000u | (gripHot ? p.accent : p.mutedText), Px(s, 1));
+    }
     auto pill = [&](const DesktopRect& c) {
         const int ix = c.w > 4 * Px(s, SM::TaskbarPillInsetX) ? Px(s, SM::TaskbarPillInsetX) : 0;
         const int iy = c.h > 4 * Px(s, SM::TaskbarPillInsetY) ? Px(s, SM::TaskbarPillInsetY) : 0;
@@ -719,7 +774,7 @@ void ChromeBuildDock(const ChromeDockModel& m, const ChromeStyle& s, ChromeDispl
             const uint32_t ink = hover ? p.text : p.secondaryText;
             const int gx = b->x + (b->w - glyph) / 2, gy = b->y + (b->h - glyph) / 2;
             if (b == &l.close) dl.Glyph(ChromeGlyph::Close, gx, gy, ink);
-            else DockReturnGlyph(dl, s, gx, gy, glyph, ink);
+            else DockReturnGlyph(dl, s, gx, gy, glyph, ink, l.right);
         }
     }
     // Pin: the lighter fill while pinned, a hover pill otherwise.
@@ -727,6 +782,12 @@ void ChromeBuildDock(const ChromeDockModel& m, const ChromeStyle& s, ChromeDispl
         dl.MaterialRect(pill(l.pin), s.MaterialColor(m.pinned ? p.taskActive : p.taskHover), Px(s, 6));
     dl.Glyph(ChromeGlyph::Pin, l.pin.x + (l.pin.w - glyph) / 2, l.pin.y + (l.pin.h - glyph) / 2,
              m.pinned || hovered(l.pin) ? p.text : p.secondaryText);
+    // Side: move the sidebar to the other screen edge.
+    if (l.side.w > 0) {
+        if (hovered(l.side)) dl.MaterialRect(pill(l.side), s.MaterialColor(p.taskHover), Px(s, 6));
+        dl.Glyph(ChromeGlyph::Swap, l.side.x + (l.side.w - glyph) / 2, l.side.y + (l.side.h - glyph) / 2,
+                 hovered(l.side) ? p.text : p.secondaryText);
+    }
 }
 
 // ---------------------------------------------------------------------------
