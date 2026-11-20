@@ -82,6 +82,18 @@ class VerifyGuardedDesktop(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'shortcut mismatch'):self.check()
     def test_valid_pair(self):
         self.assertEqual(self.check()['modules']['xhci.mod'],verifier.sha(self.module))
+    def test_update_helper_requires_exact_binary(self):
+        helpers = {'HWUPDATE.ELF': b'\x7fELF-usb', 'HWUPSYS.ELF': b'\x7fELF-system'}
+        expected = {name: verifier.sha(data) for name, data in helpers.items()}
+        with self.assertRaisesRegex(ValueError, 'Update helper mismatch HWUPDATE.ELF'):
+            self.check(expected_update_helpers=expected.items())
+        for name, data in helpers.items():
+            self.copy('BOOT/' + name, data)
+        self.assertEqual(self.check(expected_update_helpers=expected.items())['update_helpers_sha256'], expected)
+        self.copy('BOOT/HWUPSYS.ELF', helpers['HWUPDATE.ELF'])
+        with self.assertRaisesRegex(ValueError, 'Update helper mismatch HWUPSYS.ELF'):
+            self.check(expected_update_helpers=expected.items())
+
     def test_rejects_changed_guard_and_script(self):
         self.copy('ETC/ahci-data-volume',b'bad\n')
         with self.assertRaisesRegex(ValueError,'guard input mismatch'):self.check()

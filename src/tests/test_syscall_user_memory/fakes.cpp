@@ -134,6 +134,7 @@ uint32_t NetInterfaceViews(InterfaceView*,uint32_t,uint64_t) { return 0; }
 FileActorSnapshot ProcessFileActorAcquire(Process*,UserNamespace*,bool) { return {}; }
 void ProcessGroupsRelease(SupplementaryGroups*) {}
 CredentialIds ProcessReadIds(Process*,bool) { return {}; }
+UserAuthority ProcessUserAuthorityAcquire(Process*) { return {}; }
 int ProcessSendSignal(Process*,int,const SignalInfo*,const Process*) { return 0; }
 int VfsAccess(Vnode*,uint8_t,bool) { return -13; }
 uint32_t ProcessReportId(Process*,bool,uint32_t canonical) { return canonical; }
@@ -209,7 +210,7 @@ bool WmResizeWindow(int,uint16_t,uint16_t) { return false; }
 // stack only ever receives kernel buffers.
 bool SockIsNonblock(int) { return true; }
 bool SockIsStream(int) { return false; }
-int SockBind(int,const SockAddrIn* address) { ++g_net.binds;g_net.bound=*address;return 0; }
+int SockBind(int,const SockAddrIn* address,SocketBindActor) { ++g_net.binds;g_net.bound=*address;return 0; }
 int SockSendTo(int,const void* buffer,uint32_t length,const SockAddrIn* destination) {
     ++g_net.sends;g_net.sentLength=length;
     __builtin_memcpy(g_net.sent,buffer,length<sizeof(g_net.sent)?length:sizeof(g_net.sent));
@@ -224,7 +225,9 @@ int SockGetReceiveBuffer(int) { return g_net.receiveBuffer; }
 int SockGetProtocol(int) { return 17; }
 int SockGetConnectError(int) { return 0; }
 uint32_t SmpGetCpuCount() { return 4; }
-int SockListen(int,int) { return -1; }
+int SockListen(int,int,SocketBindActor) { return -1; }
+int SockSetReuse(int,SocketReuse,bool) { return 0; }
+int SockGetReuse(int,SocketReuse) { return 0; }
 int SockRecvFrom(int,void* buffer,uint32_t length,SockAddrIn* source) {
     if(!g_net.datagramReady)return -EAGAIN;
     ++g_net.receives;g_net.datagramReady=false;
@@ -235,7 +238,7 @@ int SockRecvFrom(int,void* buffer,uint32_t length,SockAddrIn* source) {
 int SockRecv(int,void*,uint32_t,bool) { return -EAGAIN; }
 void SockGetLocal(int,uint32_t* ip,uint16_t* port) { *ip=g_net.localIp;*port=g_net.localPort; }
 void SockGetRemote(int,uint32_t* ip,uint16_t* port) { *ip=g_net.remoteIp;*port=g_net.remotePort; }
-int SockAccept(int,SockAddrIn* address) {
+int SockAccept(int,SockAddrIn* address,bool*) {
     if(!g_net.acceptReady)return -EAGAIN;
     ++g_net.accepts;g_net.acceptReady=false;*address=g_net.peer;return 5;
 }

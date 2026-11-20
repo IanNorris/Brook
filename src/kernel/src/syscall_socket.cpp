@@ -132,6 +132,14 @@ static int GetSockIdx(Process* proc, int fd)
     return static_cast<int>(reinterpret_cast<uintptr_t>(e->handle)) - 1;
 }
 
+static SocketBindActor CurrentSocketBindActor(Process* proc)
+{
+    auto authority = ProcessUserAuthorityAcquire(proc);
+    const SocketBindActor actor{authority.uid, !authority.ns && authority.uid == 0};
+    UserNamespaceRelease(authority.ns);
+    return actor;
+}
+
 int64_t sys_bind(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
                   uint64_t, uint64_t, uint64_t)
 {
@@ -201,14 +209,14 @@ int64_t sys_bind(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
         if(address.family!=16)return -EINVAL;if(address.groups)return -95;
         return NetlinkBind(static_cast<NetlinkSocket*>(fde->handle),address.port);
     }
-    int sockIdx = GetSockIdx(proc, fd);
-    if (sockIdx < 0) return -EBADF;
+    if (!fde || fde->type != FdType::Socket || !fde->handle) return -EBADF;
+    const int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
 
     if (!addrVal || addrLen < sizeof(SockAddrIn)) return -EINVAL;
     SockAddrIn addr{};
     if (!CopyFromUser(&addr, addrVal, sizeof(addr))) return -EFAULT;
 
-    return SockBind(sockIdx, &addr);
+    return SockBind(sockIdx, &addr, CurrentSocketBindActor(proc));
 }
 
 int64_t sys_connect(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
@@ -503,12 +511,15 @@ int64_t sys_setsockopt(uint64_t fdVal, uint64_t levelVal, uint64_t optionVal,
         SpinLockAcquire(&socket->lock);socket->receiveLimit=2*limit;SpinLockRelease(&socket->lock);return 0;
     }
     if (descriptor->type != FdType::UnixSocket && descriptor->type != FdType::Socket) return -88;
-    if (descriptor->type == FdType::Socket && levelVal == 1 && optionVal == 8) {
+    if (descriptor->type == FdType::Socket && levelVal == 1 &&
+        (optionVal == 2 || optionVal == 8 || optionVal == 15)) {
         int32_t requested;
         if (length < sizeof(requested)) return -EINVAL;
         if (!CopyFromUser(&requested, valueAddr, sizeof(requested))) return -EFAULT;
         const int index = static_cast<int>(reinterpret_cast<uintptr_t>(descriptor->handle)) - 1;
-        return brook::SockSetReceiveBuffer(index, requested);
+        if (optionVal == 8) return SockSetReceiveBuffer(index, requested);
+        return SockSetReuse(index, optionVal == 2 ? SocketReuse::Address : SocketReuse::Port,
+                           requested != 0);
     }
     if (descriptor->type == FdType::UnixSocket && levelVal == 1 && optionVal == 16) {
         if (length < sizeof(int32_t)) return -EINVAL;
@@ -608,6 +619,11 @@ int64_t sys_getsockopt(uint64_t fdVal, uint64_t levelVal, uint64_t optnameVal,
     } else {
         int index = static_cast<int>(reinterpret_cast<uintptr_t>(entry->handle)) - 1;
         switch (option) {
+        case 2: // SO_REUSEADDR
+        case 15: // SO_REUSEPORT
+            value = SockGetReuse(index, option == 2 ? SocketReuse::Address : SocketReuse::Port);
+            if (value < 0) return value;
+            break;
         case 8: // SO_RCVBUF
             value = brook::SockGetReceiveBuffer(index);
             if (value < 0) return value;
@@ -774,12 +790,9 @@ int64_t sys_listen(uint64_t fdVal, uint64_t backlog, uint64_t,
         return 0;
     }
 
-    (void)backlog;
-    int sockIdx = GetSockIdx(proc, fd);
-    if (sockIdx < 0) return -EBADF;
-
-    int ret = brook::SockListen(sockIdx, static_cast<int>(backlog));
-    return ret < 0 ? -EINVAL : 0;
+    if (!fde || fde->type != FdType::Socket || !fde->handle) return -EBADF;
+    const int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
+    return SockListen(sockIdx, static_cast<int>(backlog), CurrentSocketBindActor(proc));
 }
 
 static int64_t AcceptSocket(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVal,

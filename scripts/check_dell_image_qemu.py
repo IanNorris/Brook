@@ -119,6 +119,8 @@ def main():
                    help='Seed the data volume with the signed-staging profile layout (aliases into a generation)')
     p.add_argument('--managed-profile-absolute-current', action='store_true',
                    help='Negative check: with --managed-profile, an absolute current alias must fail handoff')
+    p.add_argument('--bridge-local-policy-qa', type=Path,
+                   help='Run the local bridge and reserved-port guest regression using this static probe')
     a = p.parse_args()
     mode_flags = list(MODE_FLAGS)
     if a.managed_profile:
@@ -131,6 +133,11 @@ def main():
         mode_flags += ['--proc-dump-qa', str(a.kernel_build.resolve() / 'drivers/virtio_net.mod')]
     if a.proc_autodump_qa:
         mode_flags.append('--proc-autodump-qa')
+    if a.bridge_local_policy_qa:
+        if a.proc_dump_qa or a.proc_autodump_qa or a.managed_profile_absolute_current:
+            p.error('the bridge local policy probe requires an ordinary guarded handoff')
+        mode_flags += ['--bridge-local-policy-qa', str(a.bridge_local_policy_qa.resolve()),
+                       '--auto-desktop-network-module', str(a.kernel_build.resolve() / 'drivers/virtio_net.mod')]
     pair, shared = a.pair.resolve(), a.shared.resolve()
     out = (a.output or pair / 'qemu-check').resolve()
     if 'OVMF_CODE' not in os.environ and not a.firmware:
