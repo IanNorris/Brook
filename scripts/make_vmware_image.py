@@ -192,7 +192,13 @@ def assemble_disk(work, data_image, efi, kernel, desktop, recovery, disk_id, esp
     esp = work / 'esp.img'
     with esp.open('xb') as file:
         file.truncate(ESP_SECTORS * SECTOR)
-    run('mkfs.fat', '-F', '32', '-n', 'BROOK_EFI', esp)
+    # dosfstools rounds the volume down to a whole track. Set a track
+    # size that divides the ESP so the FAT and GPT sector counts agree.
+    run('mkfs.fat', '-F', '32', '-g', '64/32', '-n', 'BROOK_EFI', esp)
+    with esp.open('rb') as file:
+        boot_sector = file.read(SECTOR)
+    if struct.unpack_from('<I', boot_sector, 32)[0] != ESP_SECTORS:
+        raise ValueError('FAT boot sector must cover the exact GPT ESP')
     for name in ('EFI', 'EFI/BOOT', 'RECOVERY', 'RECOV2', 'UPDATES', 'UPDATES/A', 'UPDATES/B'):
         run('mmd', '-i', esp, '::/' + name)
     fat_write(esp, 'EFI/BOOT/BOOTX64.EFI', efi.read_bytes())
