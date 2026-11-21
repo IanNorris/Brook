@@ -68,6 +68,7 @@ target_compile_options(test_guard_checker_session PRIVATE "-iquote${BROOK_ROOT}/
 add_host_test(test_guard_fat_profile "${BROOK_ROOT}/src/kernel/src/guard_fat_profile.cpp")
 add_test(NAME test_analyze_gpu_wait_profile COMMAND python3 "${BROOK_ROOT}/scripts/test_analyze_gpu_wait_profile.py")
 add_test(NAME test_kernel_capabilities COMMAND python3 "${BROOK_ROOT}/scripts/test_kernel_capabilities.py")
+add_test(NAME test_selected_qemu COMMAND python3 "${BROOK_ROOT}/scripts/test_selected_qemu.py")
 add_host_test(test_profiler_write_all)
 target_compile_options(test_profiler_write_all PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 target_compile_options(test_guard_fat_profile PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared/inc_km")
