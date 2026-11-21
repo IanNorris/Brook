@@ -72,8 +72,9 @@ of the persistent image is a separate test.
 
 ## Pointer input
 
-Brook checks for VMMouse on VMware and QEMU with VMPort available. On
-success, the guest reports `MOUSE: VMMouse absolute pointer ready` and maps
+Brook checks for VMMouse automatically on VMware. In QEMU, select
+`BROOK_POINTER_DEVICE=vmmouse` in the Brook launcher, or use
+`-machine q35,vmport=on -fw_cfg name=opt/brook/vmmouse,string=1`. On success, the guest reports `MOUSE: VMMouse absolute pointer ready` and maps
 host pointer positions to the guest display, independent of desktop scaling.
 Mouse buttons and vertical wheel events use the same desktop input path as
 PS/2. When a Brook app captures relative motion, VMMouse switches modes at the

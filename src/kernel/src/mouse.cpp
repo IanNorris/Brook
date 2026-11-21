@@ -7,6 +7,7 @@
 #include "mouse.h"
 #include "spinlock.h"
 #include "desktop_pointer_motion.h"
+#include "fw_cfg.h"
 #include "vmware_platform.h"
 #include "vmmouse.h"
 #include "input.h"
@@ -645,8 +646,15 @@ void MouseInit()
     const auto readCpuid = [](uint32_t leaf, uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) {
         __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(leaf), "c"(0));
     };
-    const bool vmPortPlatform = VmwarePortPlatformPresent(readCpuid);
-    g_vmmouseYUp = vmPortPlatform && VmwarePlatformPresent(readCpuid);
+    g_vmmouseYUp = VmwarePlatformPresent(readCpuid);
+    bool vmPortPlatform = g_vmmouseYUp;
+    if (!vmPortPlatform && VmwarePortPlatformPresent(readCpuid)) {
+        // QEMU also offers a virtio tablet and a plain PS/2 mouse. Keep
+        // its existing input selection unless the VM requests VMMouse.
+        char setting[3]{};
+        const uint32_t size = FwCfgReadFile("opt/brook/vmmouse", setting, sizeof(setting));
+        vmPortPlatform = setting[0] == '1' && (size == 1 || (size == 2 && setting[1] == 0));
+    }
     if (vmPortPlatform && VmMouseCall(vmmouse::GetVersion, 0).b == vmmouse::Magic)
         VmMouseCall(vmmouse::Command, vmmouse::Disable);
 
