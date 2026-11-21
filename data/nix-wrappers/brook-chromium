@@ -1,5 +1,5 @@
 #!/nix/profile/bin/bash
-# Experimental Wayland browser; Chromium's sandbox is unsupported.
+# The Wayland browser uses Chromium's namespace sandbox without a setuid helper.
 set -eu
 if [ "$EUID" -eq 0 ]; then
   echo 'brook-chromium: launch from Applications or use: run --uid 1000 /nix/bin/brook-chromium [URLs...]' >&2
@@ -41,7 +41,7 @@ if [ -n "${BROOK_CHROMIUM_VAAPI:-}" ] && [ -n "${gpu[*]}" ] && [ -d "${BROOK_VAA
          --render-node-override="${BROOK_VAAPI_NODE:-/dev/dri/renderD129}")
 fi
 exec /nix/profile/bin/brook-run "${gpu[@]}" /nix/profile/bin/chromium \
-  --no-sandbox "${flags[@]}" --disable-background-networking \
+  --disable-setuid-sandbox "${flags[@]}" --disable-background-networking \
   --disable-component-update --disable-extensions --renderer-process-limit=2 \
   --disable-crash-reporter --no-first-run --no-default-browser-check \
   --ozone-platform=wayland --user-data-dir="$profile" "$@"
