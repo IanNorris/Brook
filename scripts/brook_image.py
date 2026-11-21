@@ -53,7 +53,7 @@ def release_build(build):
     return ROOT / "build/release"
 
 
-def build_qemu(args):
+def build_portable(args):
     build = release_build(args.build)
     kernel = read_kernel_capabilities(build / "kernel/BROOK.elf")
     output = args.output.resolve()
@@ -71,7 +71,10 @@ def build_qemu(args):
         return
 
     selection = args.selection
-    require_kernel_capabilities(kernel, selection["manifest"]["requiredCapabilities"])
+    requirements = dict(selection["manifest"]["requiredCapabilities"])
+    if args.target == "usb":
+        requirements["usb-partition-desktop"] = 1
+    require_kernel_capabilities(kernel, requirements)
     profile = realize(args.config, selection)
     closure = closure_receipt(profile)
     capacity = data_size_mib(closure["nar_bytes"], args.data_mib, 512, 32768)
@@ -83,7 +86,8 @@ def build_qemu(args):
     script("prepare_hardware_store.py", "--profile", profile, "--profile-selection",
            receipt, "--direct-ahci", "--size-mib", capacity, "--output", seed, *sizing)
     actual = json.loads((seed / "manifest.json").read_text())
-    script("make_public_qemu.py", "--developer", "--seed", seed, "--build", build,
+    mode = "--usb" if args.target == "usb" else "--developer"
+    script("make_public_qemu.py", mode, "--seed", seed, "--build", build,
            "--output", output / "image")
     (output / "brook-image.json").write_text(json.dumps({
         "schema": "brook-image/1",
@@ -171,7 +175,7 @@ def build_dell_pair(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list-apps", action="store_true")
-    parser.add_argument("--target", choices=("qemu", "vmware", "dell-pair"))
+    parser.add_argument("--target", choices=("qemu", "vmware", "dell-pair", "usb"))
     parser.add_argument("--apps", type=csv_list, help="Comma-separated selection; empty selects the base")
     parser.add_argument("--packages", type=csv_list, default=[], help="Additional nixpkgs CLI packages")
     parser.add_argument("--data-mib", type=size, help="Store capacity, in MiB or auto (default)")
@@ -226,6 +230,8 @@ def main():
         parser.error("Run inside the pinned Nix shell")
 
     try:
+        if args.target == "usb" and args.apps is None:
+            args.apps = []
         if args.apps is not None or args.packages:
             args.config = {
                 "apps": args.apps or [],
@@ -235,7 +241,8 @@ def main():
                 "publicRelease": args.public_release,
             }
             args.selection = evaluate(args.config)
-        {"qemu": build_qemu, "vmware": build_vmware, "dell-pair": build_dell_pair}[args.target](args)
+        {"qemu": build_portable, "usb": build_portable, "vmware": build_vmware,
+         "dell-pair": build_dell_pair}[args.target](args)
     except (ValueError, KeyError, OSError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"brook_image: {error}\n")
 
