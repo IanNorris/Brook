@@ -147,9 +147,11 @@ class SelectedQemuTest(unittest.TestCase):
             read.assert_called_with(self.root / 'kernel/BROOK.elf')
 
     def test_public_mode_rejects_selected_seed_and_archive(self):
-        (self.root / 'manifest.json').write_text(
-            '{"public_inputs_only":true,"profile_selection":{}}'
-        )
+        (self.root / 'manifest.json').write_text(json.dumps({
+            'public_inputs_only': True,
+            'profile_expression': str(make_public_qemu.ROOT / 'nix/release-packages.nix'),
+            'profile_selection': self.selection,
+        }))
         output = self.root / 'output'
         with patch('sys.argv', ['make_public_qemu.py', '--seed', str(self.root), '--output', str(output)]):
             with self.assertRaises(SystemExit):
