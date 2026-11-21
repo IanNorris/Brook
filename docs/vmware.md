@@ -70,6 +70,22 @@ interrupted boot followed by automatic ext2 recovery. A disk with a changed
 GPT data partition ID was refused before any writes. Workstation acceptance
 of the persistent image is a separate test.
 
+## Pointer input
+
+Brook checks for VMMouse automatically on VMware. In QEMU, select
+`BROOK_POINTER_DEVICE=vmmouse` in the Brook launcher, or use
+`-machine q35,vmport=on -fw_cfg name=opt/brook/vmmouse,string=1`. On success, the guest reports `MOUSE: VMMouse absolute pointer ready` and maps
+host pointer positions to the guest display, independent of desktop scaling.
+Mouse buttons and vertical wheel events use the same desktop input path as
+PS/2. When a Brook app captures relative motion, VMMouse switches modes at the
+next auxiliary interrupt. Releasing the capture returns to absolute motion.
+If device probing or queue validation fails, Brook uses the PS/2 mouse.
+
+For a Workstation input check, move the pointer into and out of the console
+without clicking to grab it. Check keyboard input, all three mouse buttons,
+wheel scrolling and relative capture in a test application. Use a disposable
+guest and retain its serial log if input fails.
+
 ## Probe timing and portability
 
 Actual VMware boots through UEFI, initializes both CPUs, passes the TLB

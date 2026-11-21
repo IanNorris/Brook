@@ -611,10 +611,15 @@ fi
 # Absolute tablet remains the automation-friendly default. Native game review
 # can select the built-in PS/2 relative mouse so the frontend can grab it.
 POINTER_INPUT_OPTS=()
+MACHINE_POINTER_OPTS=""
 case "${BROOK_POINTER_DEVICE:-tablet}" in
     tablet) POINTER_INPUT_OPTS=(-device virtio-tablet-pci) ;;
     ps2) ;;
-    *) echo "BROOK_POINTER_DEVICE must be tablet or ps2" >&2; exit 2 ;;
+    vmmouse)
+        MACHINE_POINTER_OPTS=",vmport=on"
+        POINTER_INPUT_OPTS=(-fw_cfg name=opt/brook/vmmouse,string=1)
+        ;;
+    *) echo "BROOK_POINTER_DEVICE must be tablet, ps2 or vmmouse" >&2; exit 2 ;;
 esac
 USB_INPUT_OPTS=()
 if [ "${BROOK_USB_KBD:-0}" = "1" ]; then
@@ -653,7 +658,7 @@ case "${BROOK_REBOOT_POLICY:-reset}" in
     *) echo "BROOK_REBOOT_POLICY must be reset or shutdown" >&2; exit 2 ;;
 esac
 "${QEMU_COMMAND[@]}" \
-    -machine q35${MACHINE_MEMBACKEND:-} \
+    -machine q35${MACHINE_MEMBACKEND:-}${MACHINE_POINTER_OPTS} \
     ${KVM_FLAGS} \
     -smp "${BROOK_SMP:-8}" \
     -m "${BROOK_MEMORY:-8G}" \

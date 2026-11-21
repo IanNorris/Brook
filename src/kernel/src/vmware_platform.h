@@ -11,6 +11,20 @@ template<class Cpuid> bool VmwarePlatformPresent(Cpuid cpuid)
     return a>=0x40000000u && b==0x61774d56u && c==0x4d566572u && d==0x65726177u;
 }
 
+// QEMU exposes the legacy VMPort through either of these accelerators.
+// A successful device probe is still required before using any services.
+template<class Cpuid> bool VmwarePortPlatformPresent(Cpuid cpuid)
+{
+    uint32_t a, b, c, d;
+    cpuid(1, a, b, c, d);
+    if (!(c & (1u << 31))) return false;
+    cpuid(0x40000000u, a, b, c, d);
+    if (a < 0x40000000u) return false;
+    return (b == 0x61774d56u && c == 0x4d566572u && d == 0x65726177u) ||
+           (b == 0x4b4d564bu && c == 0x564b4d56u && d == 0x0000004du) ||
+           (b == 0x54474354u && c == 0x43544743u && d == 0x47435447u);
+}
+
 // Only call after exact VMware platform detection. Legacy I/O is supported by
 // VMware alongside its newer hypercall instructions; all operands are 32-bit.
 inline void VmwareBackdoor(uint32_t& a,uint32_t& b,uint32_t& c,uint32_t& d)

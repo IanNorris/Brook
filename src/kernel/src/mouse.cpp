@@ -7,7 +7,9 @@
 #include "mouse.h"
 #include "spinlock.h"
 #include "desktop_pointer_motion.h"
+#include "fw_cfg.h"
 #include "vmware_platform.h"
+#include "vmmouse.h"
 #include "input.h"
 #include "compositor.h"
 #include "idt.h"
@@ -22,6 +24,7 @@
 
 namespace brook {
 uint32_t WmGetAppliedScale();
+bool WmPointerCaptureActive();
 
 // ---------------------------------------------------------------------------
 // Port I/O
@@ -114,6 +117,9 @@ static volatile uint8_t  g_prevButtons = 0;
 static bool              g_mouseInit = false;
 static uint8_t           g_mouseId   = 0;   // 0=3-byte legacy, 3=IntelliMouse wheel, 4=Explorer (5 btn + H wheel)
 static uint8_t           g_packetLen = 3;
+static bool              g_vmmouseActive = false;
+static bool              g_vmmouseRelative = false;
+static bool              g_vmmouseYUp = false;
 
 // Synaptics absolute mode (6-byte packets). g_synWanted is the runtime switch
 // (boot default on); g_synActive is set only after detection and mode set
@@ -157,19 +163,20 @@ static InputDevice    g_mouseInputDev = { &g_mouseOps, {}, 0, 0, nullptr };
 
 // Push motion, scroll and button events for one decoded packet.
 static void EmitPointer(int32_t dx, int32_t dyDown, int8_t wheelY, int8_t wheelX, uint8_t buttons,
-                        int32_t fineY120 = 0, int32_t fineX120 = 0, uint8_t scrollFlags = 0)
+                        int32_t fineY120 = 0, int32_t fineX120 = 0, uint8_t scrollFlags = 0,
+                        bool absoluteMoved = false)
 {
     // A wheel tick is 120; a touchpad reports its finer motion as well.
     if (!fineY120) fineY120 = int32_t(wheelY) * 120;
     if (!fineX120) fineX120 = int32_t(wheelX) * 120;
     // Only the desktop position is scaled; the event below retains raw deltas.
-    MouseMoveRelative(dx, dyDown);
+    if (dx || dyDown) MouseMoveRelative(dx, dyDown);
     g_prevButtons = g_buttons;
     g_buttons = buttons;
-    if (dx != 0 || dyDown != 0)
+    if (dx || dyDown || absoluteMoved)
     {
         InputEvent ev{};
-        ev.type     = InputEventType::MouseRelativeMove;
+        ev.type     = absoluteMoved ? InputEventType::MouseMove : InputEventType::MouseRelativeMove;
         ev.scanCode = g_buttons;
         ev.deltaX = dx;
         ev.deltaY = dyDown;
@@ -205,6 +212,52 @@ static void EmitPointer(int32_t dx, int32_t dyDown, int8_t wheelY, int8_t wheelX
 }
 
 static int8_t ClampTicks(int32_t v) { return static_cast<int8_t>(v > 127 ? 127 : v < -127 ? -127 : v); }
+
+static vmmouse::Reply VmMouseCall(uint32_t command, uint32_t argument)
+{
+    uint32_t a = vmmouse::Magic, b = argument, c = command, d = 0x5658;
+    VmwareBackdoor(a, b, c, d);
+    return {a, b, c, d};
+}
+
+static bool SetNormalizedPosition(uint32_t x, uint32_t y)
+{
+    const auto flags = IrqSpinLockAcquire(&g_pointerPositionLock);
+    const int32_t newX = vmmouse::Pixel(x, g_maxX);
+    const int32_t newY = vmmouse::Pixel(y, g_maxY);
+    const bool changed = newX != g_mouseX || newY != g_mouseY;
+    g_mouseX = newX;
+    g_mouseY = newY;
+    g_fractionX = g_fractionY = 0;
+    IrqSpinLockRelease(&g_pointerPositionLock, flags);
+    return changed;
+}
+
+static void DispatchVmMouse()
+{
+    const bool captured = WmPointerCaptureActive();
+    if (captured != g_vmmouseRelative) {
+        VmMouseCall(vmmouse::Command, captured ? vmmouse::Relative : vmmouse::Absolute);
+        g_vmmouseRelative = captured;
+    }
+    if (vmmouse::Drain(VmMouseCall, [captured](const vmmouse::Packet& packet) {
+        if (packet.relative) {
+            // VMware follows PS/2's upward-positive Y. QEMU's VMMouse
+            // copies its input's downward-positive Y into the relative packet.
+            EmitPointer(vmmouse::RelativeDelta(packet.x), vmmouse::RelativeDelta(packet.y, g_vmmouseYUp),
+                        ClampTicks(packet.wheel), 0, packet.buttons);
+        } else {
+            const bool moved = !captured && SetNormalizedPosition(packet.x, packet.y);
+            EmitPointer(0, 0, ClampTicks(packet.wheel), 0, packet.buttons, 0, 0, 0, moved);
+        }
+    })) return;
+
+    VmMouseCall(vmmouse::Command, vmmouse::Disable);
+    g_packetIdx = 0;
+    EmitPointer(0, 0, 0, 0, 0);
+    __atomic_store_n(&g_vmmouseActive, false, __ATOMIC_RELEASE);
+}
+
 
 // Tap button transitions, each reported as its own state change on top of the
 // physical buttons (g_synLock held).
@@ -306,6 +359,15 @@ extern "C" void MouseIrqHandlerInner(void)
             while ((inb(0x3FD) & 0x20) == 0) {}
             outb(0x3F8, static_cast<uint8_t>(*msg++));
         }
+    }
+
+    if (__atomic_load_n(&g_vmmouseActive, __ATOMIC_ACQUIRE))
+    {
+        // The auxiliary bytes are notifications while VMPort owns the pointer.
+        // On failure, discard this byte and resynchronise the PS/2 parser.
+        DispatchVmMouse();
+        ApicSendEoi();
+        return;
     }
 
     if (g_synActive)
@@ -581,24 +643,20 @@ void MouseInit()
     } guard; // command-byte responses must not be consumed by IRQ1
 
 
-    // VMware firmware/tools may leave the paravirtual pointer enabled. This
-    // driver consumes ordinary relative PS/2 packets, not the backdoor queue.
-    // Disable that queue before resetting the PS/2 mouse (Linux vmmouse reset
-    // performs the same handoff). Do not issue these port commands elsewhere.
-    if (VmwarePlatformPresent([](uint32_t leaf,uint32_t& a,uint32_t& b,uint32_t& c,uint32_t& d){
-        __asm__ volatile("cpuid":"=a"(a),"=b"(b),"=c"(c),"=d"(d):"a"(leaf),"c"(0));
-    })) {
-        uint32_t a=0x564d5868u,b=0,c=40,d=0x5658;
-        VmwareBackdoor(a,b,c,d);
-        const auto before=a;
-        if ((before&0xffff0000u)!=0xffff0000u) {
-            a=0x564d5868u;b=0xf5;c=41;d=0x5658;
-            VmwareBackdoor(a,b,c,d);
-            a=0x564d5868u;b=0;c=40;d=0x5658;
-            VmwareBackdoor(a,b,c,d);
-        }
-        SerialPrintf("MOUSE: VMware pointer queue before=0x%x after=0x%x (relative PS/2 driver)\n",before,a);
+    const auto readCpuid = [](uint32_t leaf, uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) {
+        __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(leaf), "c"(0));
+    };
+    g_vmmouseYUp = VmwarePlatformPresent(readCpuid);
+    bool vmPortPlatform = g_vmmouseYUp;
+    if (!vmPortPlatform && VmwarePortPlatformPresent(readCpuid)) {
+        // QEMU also offers a virtio tablet and a plain PS/2 mouse. Keep
+        // its existing input selection unless the VM requests VMMouse.
+        char setting[3]{};
+        const uint32_t size = FwCfgReadFile("opt/brook/vmmouse", setting, sizeof(setting));
+        vmPortPlatform = setting[0] == '1' && (size == 1 || (size == 2 && setting[1] == 0));
     }
+    if (vmPortPlatform && VmMouseCall(vmmouse::GetVersion, 0).b == vmmouse::Magic)
+        VmMouseCall(vmmouse::Command, vmmouse::Disable);
 
     SerialPuts("MOUSE: initialising PS/2 auxiliary device\n");
 
@@ -671,6 +729,11 @@ void MouseInit()
 
     // Flush any residual data from init
     for (unsigned i=0;i<32 && (inb(0x64)&1);++i) (void)inb(0x60);
+
+    // Keep the negotiated PS/2 parser ready for fallback.
+    g_vmmouseActive = !g_synActive && vmPortPlatform && vmmouse::Start(VmMouseCall);
+    if (vmPortPlatform)
+        KPrintf("MOUSE: %s\n", g_vmmouseActive ? "VMMouse absolute pointer ready" : "relative PS/2 pointer");
 
     // Register with the input subsystem
     InputRegister(&g_mouseInputDev);
@@ -749,7 +812,7 @@ void MouseSetAvailable(bool available)
 // handler consumes command replies from port 0x60.
 bool MouseTouchpadSet(bool synaptics)
 {
-    if (!g_mouseInit) return false;
+    if (!g_mouseInit || __atomic_load_n(&g_vmmouseActive, __ATOMIC_ACQUIRE)) return false;
     uint64_t flags;
     __asm__ volatile("pushfq; pop %0; cli":"=r"(flags)::"memory");
     IoApicMaskIrq(12);
@@ -790,7 +853,7 @@ bool MouseTouchpadSet(bool synaptics)
 // queries and record the raw replies, then resume in the current mode.
 bool MouseTouchpadProbe()
 {
-    if (!g_mouseInit) return false;
+    if (!g_mouseInit || __atomic_load_n(&g_vmmouseActive, __ATOMIC_ACQUIRE)) return false;
     uint64_t flags;
     __asm__ volatile("pushfq; pop %0; cli":"=r"(flags)::"memory");
     IoApicMaskIrq(12);
