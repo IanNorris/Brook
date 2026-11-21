@@ -39,7 +39,9 @@ uint64_t nextFailWriteOffset=~uint64_t{0};
 bool writeFailureInjected=false;
 unsigned injectedWriteFailures=0;
 uint64_t shortWriteOffset=~uint64_t{0};
+uint64_t failReadOffset=~uint64_t{0};
 int readDisk(brook::Device* device,uint64_t offset,void* out,uint64_t bytes){
+    if(offset==failReadOffset)return -5;
     extern brook::SpinLock* indirectCheckLock;
     extern std::atomic<unsigned> indirectReaders;
     extern std::atomic<bool> indirectGate;
@@ -150,6 +152,67 @@ struct BackendProvider {
     int Parent(brook::VfsObject* o,brook::VfsObject*,brook::VfsObject*& out){return o->ops->parent(o,&out,false);}
     int Readlink(brook::VfsObject* o,char* out,uint32_t cap){return o->ops->readlink(o,out,cap);}
 };
+static void TestFailedIndirectReads()
+{
+    using namespace brook;
+    constexpr uint32_t size = 1024;
+    constexpr uint32_t pointers = size / sizeof(uint32_t);
+    std::vector<unsigned char> blocks(8 * size);
+    blocks[2 * size] = 0x5a;
+    uint32_t allocatedBlock = 5;
+    std::memcpy(blocks.data() + size, &allocatedBlock, sizeof(allocatedBlock));
+    blocks[5 * size] = 0x92;
+    uint32_t doubleLeaf = 4;
+    std::memcpy(blocks.data() + 3 * size, &doubleLeaf, sizeof(doubleLeaf));
+    std::memcpy(blocks.data() + 4 * size, &allocatedBlock, sizeof(allocatedBlock));
+
+    Device source{&diskOps,"indirect-io-test",DeviceType::Block,&blocks};
+    Ext2Mount fixture{};
+    fixture.dev = &source;
+    fixture.blockSize = size;
+    fixture.blockShift = 10;
+    fixture.totalBlocks = 8;
+    Ext2Inode inode{};
+    inode.i_size = (12 + pointers + pointers * pointers + 1) * size;
+    inode.i_block[11] = 2;
+    inode.i_block[12] = 1;
+    inode.i_block[13] = 3;
+    inode.i_block[14] = 7;
+    unsigned char out[2 * size];
+
+    failReadOffset = size;
+    std::memset(out, 0xcc, sizeof(out));
+    assert(Ext2ReadInodeData(&fixture, &inode, out, size, 12 * size) == -5);
+    assert(out[0] == 0xcc);
+    // Never allocate a replacement on a failed read of existing pointers.
+    assert(Ext2EnsureBlock(&fixture, &inode, 0, 12) == 0);
+    assert(Ext2ReadInodeData(&fixture, &inode, out, 2 * size, 11 * size) == size);
+    assert(out[0] == 0x5a && out[size] == 0xcc);
+
+    failAllocation = 0;
+    assert(Ext2ReadInodeData(&fixture, &inode, out, size, 12 * size) == -5 && failTriggered);
+    failTriggered = false;
+    failReadOffset = 4 * size;
+    assert(Ext2ReadInodeData(&fixture, &inode, out, size, (12 + pointers) * size) == -5);
+    failReadOffset = 7 * size;
+    assert(Ext2ReadInodeData(&fixture, &inode, out, size,
+                            (12 + pointers + pointers * pointers) * size) == -5);
+    failReadOffset = ~uint64_t{0};
+
+    assert(Ext2ReadInodeData(&fixture, &inode, out, size, 12 * size) == size);
+    assert(out[0] == 0x92);
+    // The next pointer in that same, successfully read block is a true hole.
+    std::memset(out, 0xcc, sizeof(out));
+    assert(Ext2ReadInodeData(&fixture, &inode, out, size, 13 * size) == size);
+    unsigned char zeros[size]{};
+    assert(std::memcmp(out, zeros, size) == 0);
+    failReadOffset = 5 * size;
+    assert(Ext2ReadInodeData(&fixture, &inode, out, size, 12 * size) == -5);
+    assert(Ext2ReadInodeData(&fixture, &inode, out, 32, 12 * size + 8) == -5);
+    failReadOffset = ~uint64_t{0};
+    for (auto* buffer : fixture.indCacheData) kfree(buffer);
+}
+
 int main(int argc,char** argv){
     assert(argc==2);std::ifstream input(argv[1],std::ios::binary);assert(input);
     disk.assign(std::istreambuf_iterator<char>(input),{});input.close();
@@ -168,24 +231,25 @@ int main(int argc,char** argv){
         Ext2Mount fixture{};fixture.dev=&source;fixture.blockSize=4096;
         fixture.blockShift=12;fixture.totalBlocks=8;
         indirectCheckLock=&fixture.indCacheLock;indirectCheckSingle=true;
-        assert(Ext2ReadIndPointer(&fixture,1,1)==1001);
+        assert(Ext2ReadIndPointer(&fixture,1,1).block==1001);
         indirectCheckSingle=false;indirectReaders=0;indirectGate=true;
         uint32_t first=0,second=0;
-        std::thread a([&]{first=Ext2ReadIndPointer(&fixture,2,1);});
-        std::thread b([&]{second=Ext2ReadIndPointer(&fixture,2,1);});
+        std::thread a([&]{first=Ext2ReadIndPointer(&fixture,2,1).block;});
+        std::thread b([&]{second=Ext2ReadIndPointer(&fixture,2,1).block;});
         while(indirectReaders.load()<2)std::this_thread::yield();
         indirectGate.store(false,std::memory_order_release);a.join();b.join();
         assert(first==1002 && second==1002);
         unsigned copies=0;for(auto block:fixture.indCacheBlockNum)copies+=block==2;
         assert(copies==1);
-        indirectFailRead=true;assert(Ext2ReadIndPointer(&fixture,3,1)==0);
-        indirectFailRead=false;assert(Ext2ReadIndPointer(&fixture,2,1)==1002);
-        failAllocation=0;assert(Ext2ReadIndPointer(&fixture,3,1)==1003 && failTriggered);
+        indirectFailRead=true;assert(Ext2ReadIndPointer(&fixture,3,1).failed);
+        indirectFailRead=false;assert(Ext2ReadIndPointer(&fixture,2,1).block==1002);
+        failAllocation=0;assert(Ext2ReadIndPointer(&fixture,3,1).block==1003 && failTriggered);
         failTriggered=false;
-        for(unsigned i=3;i<8;++i)assert(Ext2ReadIndPointer(&fixture,i,1)==1000+i);
+        for(unsigned i=3;i<8;++i)assert(Ext2ReadIndPointer(&fixture,i,1).block==1000+i);
         indirectCheckLock=nullptr;
         for(auto* buffer:fixture.indCacheData)if(buffer)kfree(buffer);
     }
+    TestFailedIndirectReads();
     g_ext2Devices[0]=&device;void* mount=nullptr;assert(Ext2FsMount(0,&mount));
     auto* m=static_cast<Ext2Mount*>(mount);
     assert(m->writeError==0 && m->deferredSyncError==0);
@@ -389,7 +453,7 @@ int main(int argc,char** argv){
         {
             auto* fault=create("fault-source");
             assert(Ext2ReadInode(m,dh->inode,&dd));
-            shortWriteOffset=uint64_t(Ext2BlockMap(m,&dd,0))<<m->blockShift;
+            shortWriteOffset=uint64_t(Ext2BlockMap(m,&dd,0).block)<<m->blockShift;
             assert(directory->ops->link(directory,fault,"fault-alias")==-5);
             assert(shortWriteOffset==~uint64_t{0} && m->writeError==-5);
             VfsObject* alias=nullptr;assert(!Ext2ObjectChild(directory,"fault-alias",&alias));
@@ -459,7 +523,7 @@ int main(int argc,char** argv){
             auto* parentHold=static_cast<Ext2OpenInode*>((failSource?directory:other)->priv);
             Ext2Inode parentData{};
             KRwLockReadLock(&g_ext2Lock);assert(Ext2ReadInode(m,parentHold->inode,&parentData));
-            auto block=Ext2BlockMap(m,&parentData,0);KRwLockReadUnlock(&g_ext2Lock);assert(block);
+            auto block=Ext2BlockMap(m,&parentData,0).block;KRwLockReadUnlock(&g_ext2Lock);assert(block);
             failWriteOffset=inodeOffset(parentHold->inode);
             nextFailWriteOffset=uint64_t(block)<<m->blockShift;
             auto prior=injectedWriteFailures;

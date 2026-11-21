@@ -608,8 +608,12 @@ static void FaultPages() {
     backend.statError=-5;
     backend.failStat=false;failHeap=true;
     CHECK(FileObjectFaultPages(&backend.object,&vnode,0,4,pages)==MappingFaultResult::OutOfMemory);
-    failHeap=false;backend.failRead=true;
-    CHECK(FileObjectFaultPages(&backend.object,&vnode,0,4,pages)==MappingFaultResult::IoError);
+    failHeap=false;backend.failRead=true;loaded=true;
+    // On a backend read failure even the initially zeroed staging page is
+    // unavailable for mapping. A later fault can retry from the source.
+    CHECK(FileObjectFaultPages(&backend.object,&vnode,0,4,pages,&loaded)==MappingFaultResult::IoError);
+    CHECK(!loaded && refs.empty());
+    for(auto page:pages)CHECK(!page);
     backend.readError=-6;
     CHECK(FileObjectFaultPages(&backend.object,&vnode,0,4,pages)==MappingFaultResult::IoError);
     backend.readError=-12;
