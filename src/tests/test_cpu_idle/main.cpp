@@ -14,6 +14,31 @@ static CpuIdleCaps Bdw() {
     return c;
 }
 
+static void TestRatioTrial()
+{
+    using Phase=CpuEpbTrial::Phase;
+    using Outcome=CpuEpbTrial::Outcome;
+    CpuEpbTrial trial;
+    // The EPB default bound still rejects ratio-sized values.
+    assert(!trial.Start(0,2,24,5000));
+    assert(!trial.Start(0,2,256,5000,255));
+    assert(!trial.Start(0,2,24,5000,256));
+    unsigned ratio[]={30,30};
+    auto tick=[&](unsigned cpu,uint64_t now){
+        trial.Tick(cpu,now,true,[&](){return ratio[cpu];},[&](unsigned value){ratio[cpu]=value;return ratio[cpu];});
+    };
+    assert(trial.Start(0,2,24,2000,255));
+    tick(0,1);tick(1,1);              // snapshot both
+    assert(trial.phase==Phase::Apply);
+    tick(0,2);tick(1,2);              // apply both
+    assert(trial.phase==Phase::Hold && ratio[0]==24 && ratio[1]==24);
+    assert(trial.original[0]==30 && trial.original[1]==30);
+    tick(0,2003);                      // duration elapsed: restore
+    assert(trial.phase==Phase::Restore && trial.outcome==Outcome::Complete);
+    tick(0,2004);tick(1,2004);
+    assert(trial.phase==Phase::Off && ratio[0]==30 && ratio[1]==30 && !trial.restoreFailed);
+}
+
 static void TestEpbTrial()
 {
     using Phase=CpuEpbTrial::Phase;
@@ -64,6 +89,7 @@ static void TestEpbTrial()
 
 int main() {
     TestEpbTrial();
+    TestRatioTrial();
     auto c = Bdw();
     assert(CpuIdleSubStates(c, 1) == 2 && CpuIdleSubStates(c, 2) == 1 && CpuIdleSubStates(c, 3) == 2 && CpuIdleSubStates(c, 4) == 4);
     assert(CpuIdleHint(c, CpuIdleState::C1) == 0x00);

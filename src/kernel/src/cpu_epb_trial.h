@@ -12,9 +12,10 @@ public:
     enum class Phase : uint8_t { Off, Snapshot, Apply, Hold, Restore };
     enum class Outcome : uint8_t { None, Complete, Cancelled, Ineligible, Timeout, Readback, Superseded };
 
-    bool Start(uint64_t now, unsigned cpus, unsigned target, uint32_t durationMs)
+    // maxValue bounds the field: 15 for the EPB nibble, 255 for a ratio byte.
+    bool Start(uint64_t now, unsigned cpus, unsigned target, uint32_t durationMs, unsigned maxValue=15)
     {
-        if (phase!=Phase::Off || !cpus || cpus>MaxCpus || target>15 ||
+        if (phase!=Phase::Off || !cpus || cpus>MaxCpus || target>maxValue || maxValue>255 ||
             durationMs<1000 || durationMs>300000) return false;
         *this={};
         cpuCount=cpus;

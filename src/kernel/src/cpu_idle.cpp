@@ -43,6 +43,11 @@ volatile uint32_t g_epbValue = 0;
 IrqSpinLock g_epbLock;
 CpuEpbTrial g_epbTrial;
 bool g_epbTrialActive=false;
+// IA32_PERF_CTL target-ratio cap trial (bits 15:8). Brook never writes
+// PERF_CTL otherwise, so the firmware request is the baseline to restore.
+IrqSpinLock g_ratioLock;
+CpuEpbTrial g_ratioTrial;
+bool g_ratioTrialActive=false;
 volatile int32_t g_epbTarget = -1;
 volatile uint64_t g_sampleGen = 0;
 volatile bool g_auto = false;
@@ -282,6 +287,49 @@ void CpuIdleCancelEpbTrial()
     g_epbTrial.Cancel();
     __atomic_store_n(&g_epbTrialActive,g_epbTrial.phase!=CpuEpbTrial::Phase::Off,__ATOMIC_RELEASE);
     IrqSpinLockRelease(&g_epbLock,flags);
+}
+
+int CpuIdleStartRatioTrial(uint64_t now,unsigned count,unsigned ratio,uint32_t durationMs)
+{
+    if (!count || count>CpuEpbTrial::MaxCpus || !ratio || ratio>255 ||
+        durationMs<1000 || durationMs>300000) return -22;
+    const auto flags=IrqSpinLockAcquire(&g_ratioLock);
+    const bool started=g_ratioTrial.Start(now,count,ratio,durationMs,255);
+    if (started) __atomic_store_n(&g_ratioTrialActive,true,__ATOMIC_RELEASE);
+    IrqSpinLockRelease(&g_ratioLock,flags);
+    return started?0:-16;
+}
+
+bool CpuIdleRatioTrialActive()
+{
+    return __atomic_load_n(&g_ratioTrialActive,__ATOMIC_ACQUIRE);
+}
+
+void CpuIdleTickRatioTrial(unsigned cpu,uint64_t now,bool eligible)
+{
+    const auto flags=IrqSpinLockAcquire(&g_ratioLock);
+    g_ratioTrial.Tick(cpu,now,eligible,[](){return unsigned((ReadMsr(0x199)>>8)&0xffu);},[](unsigned value){
+        WriteMsr(0x199,(ReadMsr(0x199)&~0xff00ull)|(uint64_t(value&0xffu)<<8));
+        return unsigned((ReadMsr(0x199)>>8)&0xffu);
+    });
+    __atomic_store_n(&g_ratioTrialActive,g_ratioTrial.phase!=CpuEpbTrial::Phase::Off,__ATOMIC_RELEASE);
+    IrqSpinLockRelease(&g_ratioLock,flags);
+}
+
+void CpuIdleCancelRatioTrial()
+{
+    const auto flags=IrqSpinLockAcquire(&g_ratioLock);
+    g_ratioTrial.Cancel();
+    __atomic_store_n(&g_ratioTrialActive,g_ratioTrial.phase!=CpuEpbTrial::Phase::Off,__ATOMIC_RELEASE);
+    IrqSpinLockRelease(&g_ratioLock,flags);
+}
+
+CpuEpbTrial CpuIdleReadRatioTrial()
+{
+    const auto flags=IrqSpinLockAcquire(&g_ratioLock);
+    const auto trial=g_ratioTrial;
+    IrqSpinLockRelease(&g_ratioLock,flags);
+    return trial;
 }
 
 CpuEpbTrial CpuIdleReadEpbTrial()

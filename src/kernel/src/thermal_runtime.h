@@ -10,6 +10,8 @@ namespace brook {
 void ThermalSamplerStart();
 // Start an AC-only timed Broadwell-U EPB experiment, off until explicitly armed.
 int ThermalStartEpbTrial(unsigned bias,unsigned seconds);
+// Same admission; caps IA32_PERF_CTL to RATIO (min..max non-turbo) for SECONDS.
+int ThermalStartRatioTrial(unsigned ratio,unsigned seconds);
 
 struct ThermalSnapshot {
     bool available = false, rapl = false, aperf = false;

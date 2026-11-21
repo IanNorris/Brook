@@ -60,6 +60,12 @@ bool CpuIdleEpbTrialActive();
 void CpuIdleTickEpbTrial(unsigned cpu, uint64_t now, bool eligible);
 void CpuIdleCancelEpbTrial();
 CpuEpbTrial CpuIdleReadEpbTrial();
+// Same timed/restore protocol for an IA32_PERF_CTL target-ratio cap.
+int CpuIdleStartRatioTrial(uint64_t now, unsigned count, unsigned ratio, uint32_t durationMs);
+bool CpuIdleRatioTrialActive();
+void CpuIdleTickRatioTrial(unsigned cpu, uint64_t now, bool eligible);
+void CpuIdleCancelRatioTrial();
+CpuEpbTrial CpuIdleReadRatioTrial();
 // Ask idle loops to sample core residency, then read everything.
 void CpuIdleRequestSample();
 void CpuIdleReadStatus(CpuIdleStatus& out);

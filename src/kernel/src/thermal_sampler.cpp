@@ -144,6 +144,7 @@ void Worker(void* arg) {
         if (SmpCurrentCpuIndex() != cpu) { __atomic_add_fetch(&g_misplaced, 1, __ATOMIC_RELAXED); continue; }
         SampleCpu(cpu, prev);
         if (CpuIdleEpbTrialActive()) CpuIdleTickEpbTrial(cpu,ApicTickCount(),EpbTrialEligible());
+        if (CpuIdleRatioTrialActive()) CpuIdleTickRatioTrial(cpu,ApicTickCount(),EpbTrialEligible());
         if (cpu == 0) Publish(pkg);
     }
 }
@@ -168,6 +169,18 @@ int ThermalStartEpbTrial(unsigned bias,unsigned seconds)
     if (bias>15 || !seconds || seconds>300) return -22;
     if (!EpbTrialEligible()) return -95;
     return CpuIdleStartEpbTrial(ApicTickCount(),SmpGetCpuCount(),bias,seconds*1000);
+}
+
+int ThermalStartRatioTrial(unsigned ratio,unsigned seconds)
+{
+    if (!seconds || seconds>300) return -22;
+    if (!EpbTrialEligible()) return -95;
+    // Cap only: between the minimum efficiency ratio and the maximum
+    // non-turbo ratio from MSR_PLATFORM_INFO. Never request turbo.
+    const uint64_t info=ReadMsr(0xce);
+    const unsigned maxNonTurbo=unsigned((info>>8)&0xff),minRatio=unsigned((info>>40)&0xff);
+    if (!maxNonTurbo || !minRatio || ratio<minRatio || ratio>maxNonTurbo) return -22;
+    return CpuIdleStartRatioTrial(ApicTickCount(),SmpGetCpuCount(),ratio,seconds*1000);
 }
 
 bool ThermalReadSnapshot(ThermalSnapshot& out) {
