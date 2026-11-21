@@ -61,6 +61,10 @@ hashes of the disk, boot files and public operator policy. Back up the VMDK
 while the guest is off. A clean guest shutdown flushes pending writes. A dirty
 volume goes through the guarded recovery check before the desktop mounts it.
 
+Framebuffer console text can be incomplete during a mode change or concurrent
+console writes. Use the VM's COM1 `serial.log` as the diagnostic record,
+including for a panic during a display handoff.
+
 ## Persistent image validation
 
 The exact VMDK booted in headless QEMU with e1000e behind a PCIe root

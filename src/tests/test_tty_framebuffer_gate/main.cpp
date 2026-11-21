@@ -81,9 +81,28 @@ static void ClipStaleRegion()
     static_assert(remainder.width == 610 && remainder.height == 420);
 }
 
+static void PreserveConsolePlacementOnResize()
+{
+    constexpr auto smaller = TtyClipRegion(640, 480, 30, 60, 800, 520);
+    constexpr auto larger = TtyClipRegion(1024, 768, 30, 60, 800, 520);
+    static_assert(smaller.x == larger.x && smaller.y == larger.y);
+    static_assert(smaller.width == 610 && smaller.height == 420);
+    static_assert(larger.width == 800 && larger.height == 520);
+
+    constexpr auto preserved = TtyClampCursor(200, 100, smaller.width, smaller.height, 24);
+    static_assert(preserved.x == 200 && preserved.y == 100);
+    constexpr auto clipped = TtyClampCursor(780, 500, smaller.width, smaller.height, 24);
+    static_assert(clipped.x == 610 && clipped.y == 396);
+    constexpr auto tooShort = TtyClampCursor(10, 10, 100, 12, 24);
+    static_assert(tooShort.x == 10 && tooShort.y == 0);
+    constexpr auto outside = TtyClampCursor(10, 10, 0, 0, 24);
+    static_assert(outside.x == 0 && outside.y == 0);
+}
+
 int main()
 {
     DrainPreexistingReaders();
     AbandonedUpdate();
     ClipStaleRegion();
+    PreserveConsolePlacementOnResize();
 }

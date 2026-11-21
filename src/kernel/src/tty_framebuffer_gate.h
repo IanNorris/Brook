@@ -6,6 +6,9 @@ namespace brook {
 
 // One atomic word makes entering and closing mutually exclusive. Writers
 // close admission before draining admitted users in process context.
+// Framebuffer text is best-effort during a close or concurrent draw. Logging
+// can hold the IRQ-disabling serial lock and panic can interrupt a drawer,
+// so admission never waits for another writer. COM1 keeps the diagnostic log.
 class TtyFramebufferGate {
 public:
     enum class Access { Read, Draw, Legacy };
@@ -72,6 +75,15 @@ constexpr TtyClippedRegion TtyClipRegion(uint32_t screenWidth, uint32_t screenHe
     if (!width || width > remainingWidth) width = remainingWidth;
     if (!height || height > remainingHeight) height = remainingHeight;
     return {x, y, width, height};
+}
+
+struct TtyCursorPosition { uint32_t x, y; };
+
+constexpr TtyCursorPosition TtyClampCursor(uint32_t x, uint32_t y, uint32_t width,
+                                           uint32_t height, uint32_t lineHeight)
+{
+    const uint32_t lastLine = height > lineHeight ? height - lineHeight : 0;
+    return {x < width ? x : width, y < lastLine ? y : lastLine};
 }
 
 } // namespace brook

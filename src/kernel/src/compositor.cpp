@@ -111,6 +111,8 @@ void CompositorSetHardwareProbe(bool enabled) {
 static volatile uint32_t* g_physFb       = nullptr;
 static uint32_t           g_physFbWidth  = 0;
 static uint32_t           g_physFbHeight = 0;
+// Geometry-only readers need a coherent pair without waiting for scanout copies.
+static uint64_t           g_publishedPhysDims = 0;
 static uint32_t           g_physFbStride = 0; // in pixels
 
 // Double-buffer: compose into cached RAM, then bulk-copy to MMIO FB.
@@ -1124,6 +1126,12 @@ bool CompositorRenewLiveRendererLease(uint64_t owner){
 }
 uint64_t CompositorBackendBlurChanges(){return __atomic_load_n(&g_backendBlurChanges,__ATOMIC_RELAXED);}
 
+static void PublishPhysDims(uint32_t width, uint32_t height)
+{
+    const uint64_t packed = (uint64_t(height) << 32) | width;
+    __atomic_store_n(&g_publishedPhysDims, packed, __ATOMIC_RELEASE);
+}
+
 void CompositorInit()
 {
     // Get the physical framebuffer address so we can map the real MMIO,
@@ -1141,6 +1149,7 @@ void CompositorInit()
     g_physFbWidth  = w;
     g_physFbHeight = h;
     g_physFbStride = strideBytes / 4; // convert byte stride to pixel stride
+    PublishPhysDims(w, h);
 
     // Allocate a cached-RAM backbuffer for double-buffering.
     g_backBufStride = g_physFbStride;
@@ -1313,8 +1322,9 @@ void CompositorGetPhysDims(uint32_t* w, uint32_t* h)
 
 void CompositorSnapshotPhysDims(uint32_t* w, uint32_t* h)
 {
-    CompositorMutexGuard geometry(&g_scanoutMappingLock);
-    CompositorGetPhysDims(w, h);
+    const uint64_t packed = __atomic_load_n(&g_publishedPhysDims, __ATOMIC_ACQUIRE);
+    if (w) *w = static_cast<uint32_t>(packed);
+    if (h) *h = static_cast<uint32_t>(packed >> 32);
 }
 
 volatile uint32_t* CompositorGetPhysFb(uint32_t* stride)
@@ -5150,6 +5160,7 @@ static bool ReplaceCompositorFramebuffer(uint64_t fbPhys, uint32_t w, uint32_t h
         TtyRedirectToBackbuffer(buffer);
     }
     if(g_displayGeneration)++g_displayGeneration;
+    PublishPhysDims(w, h);
     CompositorUnlockScanoutForDisplayChange();
     if (retiredPages) VmmFreePages(retired, retiredPages);
     MouseSetBounds(w,h);MarkAllDirty();

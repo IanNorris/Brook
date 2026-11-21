@@ -706,9 +706,11 @@ bool TtyPublishManagedFramebuffer(uint64_t physical, volatile uint32_t* mmio,
     g_fbStride = stridePixels;
     g_ttyUsingBackbuffer = true;
     SelectTtyFont(width, height);
-    g_curX = g_curY = 0;
-    g_regionX = g_regionY = g_regionW = g_regionH = 0;
+    // Keep the requested region so space clipped by a shrink returns on grow.
     RecalcRegion();
+    const auto cursor = TtyClampCursor(g_curX, g_curY, g_rw, g_rh, g_ttyFont->lineHeight);
+    g_curX = static_cast<int>(cursor.x);
+    g_curY = static_cast<int>(cursor.y);
     g_ansiState = TTY_NORMAL;
     g_ansiParamCount = 0;
     g_framebufferGate.MakeManaged();
