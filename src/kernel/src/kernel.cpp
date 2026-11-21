@@ -89,6 +89,8 @@ namespace brook { void LifecycleChannelConfigure(); void LifecycleChannelStart()
 #include "watchdog.h"
 #if defined(BROOK_SSD_AUTO_RECOVERY)
 #include "debug_overlay.h"
+#endif
+#if defined(BROOK_BRIDGE_V3)
 #include "debug_bridge_v3.h"
 #endif
 #include "boot_timing_runtime.h"
