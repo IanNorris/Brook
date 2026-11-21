@@ -28,7 +28,6 @@ from hardware_recovery_fsck import validate_checker
 from make_public_qemu import copy_extents
 from prepare_guard_check_pair import CHECKER_SHA, E2FSCK_SHA
 from prepare_hardware_store import digest
-from stage_clearwater_shell import add_clearwater_start, embed_clearwater_executables, embed_terminal_shortcut
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
@@ -133,6 +132,8 @@ def build_kernel(work, policy):
 
 
 def make_initrds(work, build, payload, policy, profile, commit, name, autofit):
+    from stage_clearwater_shell import add_clearwater_start, embed_clearwater_executables, embed_terminal_shortcut
+
     tree = work / 'initrd'
     modules = tree / 'kernel/drivers'
     modules.mkdir(parents=True)
@@ -252,13 +253,14 @@ def vmx(network):
     return '\n'.join(lines) + '\n'
 
 
-def main():
+def argument_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--operator-policy', type=Path, required=True)
     parser.add_argument('--recovery-checkers-from', type=Path, required=True,
                         help='Standalone recovery initrd containing the pinned static FAT and ext2 checkers')
-    parser.add_argument('--network', choices=('hostonly', 'nat'), default='hostonly')
+    parser.add_argument('--network', choices=('hostonly', 'nat'), default='nat',
+                        help='VMware network mode (default: %(default)s)')
     parser.add_argument('--data-mib', type=int,
                         help='store capacity in MiB (default: size it from the selected profile)')
     parser.add_argument('--selection-config', type=Path,
@@ -266,6 +268,11 @@ def main():
     parser.add_argument('--autofit', action='store_true',
                         help='enable VMware Workstation host resize hints for the desktop boot')
     parser.add_argument('--payload-id', default='vmware-persistent')
+    return parser
+
+
+def main():
+    parser = argument_parser()
     args = parser.parse_args()
     if args.data_mib is not None and not 1024 <= args.data_mib <= 32768:
         parser.error('data-mib must be between 1024 and 32768')

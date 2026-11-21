@@ -113,7 +113,9 @@ def build_portable(args):
 
 def build_vmware(args):
     command = ["--output", args.output, "--operator-policy", args.operator_policy,
-               "--recovery-checkers-from", args.recovery_checkers_from, "--network", args.network or "hostonly"]
+               "--recovery-checkers-from", args.recovery_checkers_from]
+    if args.network is not None:
+        command += ["--network", args.network]
     if args.payload_id:
         command += ["--payload-id", args.payload_id]
     if args.data_mib is not None:
@@ -193,7 +195,8 @@ def main():
     parser.add_argument("--public-release", action="store_true", help="Require the fixed public QEMU profile")
     parser.add_argument("--operator-policy", type=Path, help="VMware or Dell operator public keys")
     parser.add_argument("--recovery-checkers-from", type=Path, help="VMware pinned checker initrd")
-    parser.add_argument("--network", choices=("hostonly", "nat"))
+    parser.add_argument("--network", choices=("hostonly", "nat"),
+                        help="VMware network mode (default: nat)")
     parser.add_argument("--payload-id", help="Payload identifier for a guarded build")
     parser.add_argument("--dell-shared", type=Path, help="Private Dell pair source assets")
     parser.add_argument("--kernel-option", action="append", default=[],

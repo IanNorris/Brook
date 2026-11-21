@@ -47,19 +47,21 @@ python3 scripts/make_vmware_image.py \
   --recovery-checkers-from /path/to/recovery/INITRD.IMG.gz
 ```
 
-Use `--network nat` if the guest needs external network access. The default
-is host-only. The private operator seed stays on the host. Attach with the
-bridge's explicit `--auth-mode v3` and the matching operator seed. This bridge
-suite authenticates the operator to the guest.
+The persistent image uses NAT by default so the guest can reach external
+networks. For an isolated Workstation acceptance run, build with
+`--network hostonly`. The private operator seed stays on the host. Attach with
+the bridge's explicit `--auth-mode v3` and the matching operator seed. This
+bridge suite authenticates the operator to the guest.
 
 Open the generated `Brook.vmx` in Workstation. It connects one SATA disk and
 an e1000e adapter through a PCIe root port. The disk has a guarded EFI System
 Partition, two desktop slots, recovery boot files and an ext2 data partition.
 Brook admits writes only after checking the virtual disk's pinned GPT and
-ext2 identities and geometry. The manifest records those identities and the
-hashes of the disk, boot files and public operator policy. Back up the VMDK
-while the guest is off. A clean guest shutdown flushes pending writes. A dirty
-volume goes through the guarded recovery check before the desktop mounts it.
+ext2 identities and geometry. The manifest records those identities, the
+network mode, and hashes of the disk, boot files and public operator policy.
+Back up the VMDK while the guest is off. A clean guest shutdown flushes pending
+writes. A dirty volume goes through the guarded recovery check before the
+desktop mounts it.
 
 Framebuffer console text can be incomplete during a mode change or concurrent
 console writes. Use the VM's COM1 `serial.log` as the diagnostic record,

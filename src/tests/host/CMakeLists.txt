@@ -69,6 +69,7 @@ add_host_test(test_guard_fat_profile "${BROOK_ROOT}/src/kernel/src/guard_fat_pro
 add_test(NAME test_analyze_gpu_wait_profile COMMAND python3 "${BROOK_ROOT}/scripts/test_analyze_gpu_wait_profile.py")
 add_test(NAME test_kernel_capabilities COMMAND python3 "${BROOK_ROOT}/scripts/test_kernel_capabilities.py")
 add_test(NAME test_selected_qemu COMMAND python3 "${BROOK_ROOT}/scripts/test_selected_qemu.py")
+add_test(NAME test_vmware_network COMMAND python3 "${BROOK_ROOT}/scripts/test_vmware_network.py")
 add_test(NAME test_stage_selected_launchers
     COMMAND python3 "${BROOK_ROOT}/tools/nix-install/test_stage_selected_launchers.py")
 add_test(NAME test_stage_selected_profile
