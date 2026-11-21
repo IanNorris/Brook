@@ -30,19 +30,12 @@ bool TtyTryDrawFramebuffer(TtyFramebufferDrawer draw, void* context);
 // publishes the complete tuple before the destructor reopens admission.
 // None of these methods waits. The first transition must also exclude and
 // drain legacy raw-pointer consumers and serialize legacy TTY remaps.
-class TtyFramebufferUpdate {
-public:
-    TtyFramebufferUpdate();
-    ~TtyFramebufferUpdate();
-    TtyFramebufferUpdate(const TtyFramebufferUpdate&) = delete;
-    TtyFramebufferUpdate& operator=(const TtyFramebufferUpdate&) = delete;
-    explicit operator bool() const { return closed_; }
-    bool Drained() const;
-    bool Publish(uint64_t physical, volatile uint32_t* mmio, uint32_t* backbuffer,
-                 uint32_t width, uint32_t height, uint32_t stridePixels);
-private:
-    bool closed_;
-};
+bool TtyCloseFramebufferReaders();
+void TtyOpenFramebufferReaders();
+bool TtyFramebufferReadersDrained();
+bool TtyPublishManagedFramebuffer(uint64_t physical, volatile uint32_t* mmio,
+                                  uint32_t* backbuffer, uint32_t width,
+                                  uint32_t height, uint32_t stridePixels);
 
 // Initialise the TTY: maps the framebuffer into virtual address space,
 // clears it to the default background colour, and resets the cursor.

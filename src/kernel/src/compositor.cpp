@@ -118,6 +118,9 @@ static uint32_t           g_physFbStride = 0; // in pixels
 // via memcpy is much faster than scattered pixel writes.
 static uint32_t* g_backBuffer     = nullptr;
 static uint32_t  g_backBufStride  = 0; // in pixels (matches physFb stride)
+// Kernel-owned page span for the current managed linear backbuffer. No legacy
+// GPU raw texture or unversioned scanout map may take ownership of these pages.
+static uint64_t g_managedBackBufferPages = 0;
 
 // Cached copy of what the software path last wrote to the firmware framebuffer
 // (compositor_row_filter.h). Only trusted after a complete software frame; any
@@ -1143,8 +1146,14 @@ void CompositorInit()
     g_backBufStride = g_physFbStride;
     uint64_t bbSizeBytes = static_cast<uint64_t>(g_backBufStride) * h * 4;
     uint64_t bbPages = (bbSizeBytes + 4095) / 4096;
-    VirtualAddress bbAddr = VmmAllocPages(bbPages, VMM_WRITABLE, MemTag::Device, 0);
-    if (bbAddr)
+    VirtualAddress bbAddr{};
+    if (!g_managedBackBufferPages)
+        bbAddr = VmmAllocPages(bbPages, VMM_WRITABLE, MemTag::Device, 0);
+    if (g_managedBackBufferPages) {
+        SerialPrintf("COMPOSITOR: adopting managed backbuffer at 0x%lx\n",
+                     reinterpret_cast<uint64_t>(g_backBuffer));
+    }
+    else if (bbAddr)
     {
         g_backBuffer = reinterpret_cast<uint32_t*>(bbAddr.raw());
         // Copy current MMIO framebuffer content (boot logo, TTY text) into the
@@ -3976,7 +3985,7 @@ static void EnsureDesktopTex(const GpuCompositorOps* gpu)
 {
     if (g_desktopTex && g_desktopTexPtr == g_backBuffer) return;
     if (g_desktopTex) { gpu->DestroyTexture(g_desktopTex); g_desktopTex = 0; }
-    if (!g_backBuffer) return;
+    if (!g_backBuffer || g_managedBackBufferPages) return;
     g_desktopTex = gpu->CreateTexture(g_backBufStride, g_physFbHeight,
                                       reinterpret_cast<uint64_t>(g_backBuffer), false);
     g_desktopTexPtr = g_backBuffer;
@@ -5113,23 +5122,35 @@ static bool ReplaceCompositorFramebuffer(uint64_t fbPhys, uint32_t w, uint32_t h
         mapping ? mapping : PhysToVirt(PhysicalAddress(fbPhys)).raw());
     auto* buffer=reinterpret_cast<uint32_t*>(replacement.raw());
     CompositorLockScanoutForDisplayChange();
-    if (replaceTty) TtyRemap(fbPhys, w, h, stridePixels);
+    if (replaceTty && !DisplayPublishManagedFramebuffer(fbPhys, physical, buffer, w, h, stridePixels)) {
+        CompositorUnlockScanoutForDisplayChange();
+        VmmFreePages(replacement, pages);
+        return false;
+    }
     for(uint32_t y=0;y<h;++y)
         memcpy(buffer+static_cast<uint64_t>(y)*stridePixels,
                const_cast<uint32_t*>(physical+static_cast<uint64_t>(y)*stridePixels),w*4);
     const bool cancelled=g_presentLease.Clear();
     g_scanoutContainsLeasedFrame=false;g_scanoutNeedsRepair=false;
-    // Previous backbuffers remain allocated for existing scanout aliases.
-    // Commit storage and geometry together only after successful preparation.
+    const VirtualAddress retired(reinterpret_cast<uint64_t>(g_backBuffer));
+    const uint64_t retiredPages = replaceTty ? g_managedBackBufferPages : 0;
+    // Keep legacy buffers: the old GPU API may hold unpinned device aliases.
+    // Managed buffers have only guarded kernel readers; their former owner
+    // mapping can be removed as soon as the new framebuffer is published.
     g_physFb=physical;g_physFbWidth=w;g_physFbHeight=h;g_physFbStride=stridePixels;
     GopShadowInvalidate();
     g_backBuffer=buffer;g_backBufStride=stridePixels;
-    if (replaceTty) g_cursorVisible = false;
+    if (replaceTty) {
+        g_managedBackBufferPages = pages;
+        g_cursorVisible = false;
+    } else {
+        TtyRedirectToBackbuffer(buffer);
+    }
     if(g_displayGeneration)++g_displayGeneration;
-    TtyRedirectToBackbuffer(buffer);
     CompositorUnlockScanoutForDisplayChange();
+    if (retiredPages) VmmFreePages(retired, retiredPages);
     MouseSetBounds(w,h);MarkAllDirty();
-    if(cancelled){CompositorMarkDirty();CompositorWake();}
+    if (replaceTty || cancelled) { CompositorMarkDirty(); CompositorWake(); }
     SerialPrintf("COMPOSITOR: remapped to %ux%u stride=%u\n",w,h,stridePixels);
     return true;
 }
@@ -5139,9 +5160,11 @@ void CompositorRemap(uint64_t fbPhys, uint32_t w, uint32_t h, uint32_t stridePix
     (void)ReplaceCompositorFramebuffer(fbPhys, w, h, stridePixels, false);
 }
 
+void CompositorLockLinearDisplayFrame() { KMutexLock(&g_linearDisplayFrameLock); }
+void CompositorUnlockLinearDisplayFrame() { KMutexUnlock(&g_linearDisplayFrameLock); }
+
 bool CompositorRemapLinearDisplay(uint64_t fbPhys, uint32_t w, uint32_t h, uint32_t stridePixels)
 {
-    CompositorMutexGuard displayFrame(&g_linearDisplayFrameLock);
     return ReplaceCompositorFramebuffer(fbPhys, w, h, stridePixels, true);
 }
 
@@ -5179,7 +5202,7 @@ void CompositorSetWallpaper(uint32_t* pixels, uint32_t w, uint32_t h)
 uint64_t CompositorScanoutMap(Process* proc,ScanoutMapResult* out)
 {
     CompositorMutexGuard snapshot(&g_scanoutMappingLock);
-    if (!proc || !out || !g_backBuffer) return 0;
+    if (!proc || !out || !g_backBuffer || g_managedBackBufferPages) return 0;
     uint64_t bytes=static_cast<uint64_t>(g_backBufStride)*g_physFbHeight*4;
     auto* backing=UserMappingBufferSnapshot(reinterpret_cast<uint64_t>(g_backBuffer),(bytes+4095)&~uint64_t{4095});
     if (!backing) return 0;
@@ -5195,6 +5218,7 @@ int CompositorScanoutFlip(uint32_t minY, uint32_t maxY)
 {
     CompositorMutexGuard geometry(&g_scanoutMappingLock);
     if(g_gopWriter)return -16;
+    if (g_managedBackBufferPages) return -95;
     if (!g_physFb || !g_backBuffer) return -1;
     if (minY >= g_physFbHeight) return -1;
     if (maxY > g_physFbHeight) maxY = g_physFbHeight;

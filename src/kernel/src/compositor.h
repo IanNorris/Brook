@@ -248,7 +248,11 @@ void CompositorReleaseAddressSpaceBuffers(AddressSpaceState* space);
 // stridePixels is the row stride in pixels (not bytes).
 // Prepare storage before changing the shared framebuffer and TTY geometry.
 // Only supports a physical framebuffer with an existing direct mapping.
-extern "C" bool CompositorRemapLinearDisplay(uint64_t fbPhys, uint32_t w, uint32_t h,
+extern "C" void CompositorLockLinearDisplayFrame();
+void CompositorUnlockLinearDisplayFrame();
+// Caller owns the managed display transaction, including the frame lock
+// and the closed TTY reader gate, from device programming through rollback.
+bool CompositorRemapLinearDisplay(uint64_t fbPhys, uint32_t w, uint32_t h,
                                                uint32_t stridePixels);
 extern "C" void CompositorRemap(uint64_t fbPhys, uint32_t w, uint32_t h,
                                 uint32_t stridePixels);

@@ -684,16 +684,17 @@ bool TtyGetFramebufferPhys(uint64_t* outPhysBase, uint32_t* outWidth,
     return true;
 }
 
-TtyFramebufferUpdate::TtyFramebufferUpdate() : closed_(g_framebufferGate.TryClose()) {}
-TtyFramebufferUpdate::~TtyFramebufferUpdate() { if (closed_) g_framebufferGate.Open(); }
-bool TtyFramebufferUpdate::Drained() const { return closed_ && g_framebufferGate.Drained(); }
+bool TtyCloseFramebufferReaders() { return g_framebufferGate.TryClose(); }
+void TtyOpenFramebufferReaders() { g_framebufferGate.Open(); }
+bool TtyFramebufferReadersDrained() { return g_framebufferGate.Drained(); }
 
-bool TtyFramebufferUpdate::Publish(uint64_t physical, volatile uint32_t* mmio, uint32_t* backbuffer,
-                                   uint32_t width, uint32_t height, uint32_t stridePixels)
+bool TtyPublishManagedFramebuffer(uint64_t physical, volatile uint32_t* mmio,
+                                  uint32_t* backbuffer, uint32_t width,
+                                  uint32_t height, uint32_t stridePixels)
 {
     constexpr uint32_t maxDimension = 32767; // Display coordinates also feed signed WM positions.
     constexpr uint32_t maxIndex = ~uint32_t{0};
-    if (!Drained() || !mmio || !backbuffer || !width || !height || stridePixels < width ||
+    if (!TtyFramebufferReadersDrained() || !mmio || !backbuffer || !width || !height || stridePixels < width ||
         width > maxDimension || height > maxDimension || stridePixels > maxIndex / 4 ||
         uint64_t(stridePixels) * height > maxIndex) return false;
 

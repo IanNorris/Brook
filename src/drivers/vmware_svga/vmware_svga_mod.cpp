@@ -283,6 +283,7 @@ void CommitCursor()
         if (!g.cursorVisible && g.fifo[svga::FifoNext] != g.fifo[svga::FifoStop])
             Write(Sync, 1);
         if (g.cursorVisible || (g.firstPending >= g.endPending &&
+                               !__atomic_load_n(&g.fullRefresh, __ATOMIC_ACQUIRE) &&
                                g.fifo[svga::FifoNext] == g.fifo[svga::FifoStop])) {
             if (!g.cursorVisible || g.visibleX != g.cursorX || g.visibleY != g.cursorY)
                 SetCursorPosition(true, g.cursorX, g.cursorY);
@@ -400,6 +401,9 @@ constexpr DisplayCursorOps CursorOps{&Ops, PrepareCursor, CommitCursor};
 
 int Initialize()
 {
+    uint64_t firmware = 0;
+    uint32_t width = 0, height = 0, stride = 0;
+    const bool firmwareMode = TtyGetFramebufferPhys(&firmware, &width, &height, &stride);
     DisplayFramebufferChange change(true);
     if (!change || !PreparePci()) return -1;
     const uint32_t oldId = Read(Id);
@@ -421,10 +425,7 @@ int Initialize()
 
     const uint32_t enable = Read(Enable), configured = Read(ConfigDone);
     const uint32_t oldWidth = Read(Width), oldHeight = Read(Height), oldBits = Read(BitsPerPixel);
-    uint64_t firmware = 0;
-    uint32_t width = 0, height = 0, stride = 0;
-    if (!TtyGetFramebufferPhys(&firmware, &width, &height, &stride) ||
-        !width || !height || width > g.maxWidth || height > g.maxHeight ||
+    if (!firmwareMode || !width || !height || width > g.maxWidth || height > g.maxHeight ||
         uint64_t(width) * height * 4 > g.framebuffer.bytes) {
         width = g.maxWidth < 1024 ? g.maxWidth : 1024;
         height = g.maxHeight < 768 ? g.maxHeight : 768;

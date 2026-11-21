@@ -61,6 +61,9 @@ extern "C" void DisplayRegister(const DisplayOps* ops);
 // display until shutdown. It may retire backing once its readers have drained.
 extern "C" bool DisplayBeginFramebufferChange(bool managed, const DisplayOps* expected);
 extern "C" void DisplayEndFramebufferChange(const DisplayOps* claim);
+bool DisplayPublishManagedFramebuffer(uint64_t physical, volatile uint32_t* mmio,
+                                      uint32_t* backbuffer, uint32_t width,
+                                      uint32_t height, uint32_t stridePixels);
 class DisplayFramebufferChange {
 public:
     explicit DisplayFramebufferChange(bool managed, const DisplayOps* expected = nullptr)
