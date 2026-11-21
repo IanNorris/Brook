@@ -44,6 +44,7 @@
 #include <signal.h>
 #include <errno.h>
 #include <time.h>
+#include <limits.h>
 
 #include <wayland-server.h>
 #include <wayland-server-protocol.h>
@@ -157,6 +158,8 @@ static uint64_t g_now_us(void) {
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
     return (uint64_t)ts.tv_sec*1000000ull+(uint64_t)ts.tv_nsec/1000u;
 }
+#include "buffer-trace.h"
+
 /* Per-frame chain timing, always on (a few adds per frame), reported in the
  * status file for X11 (Xwayland) and native roots separately:
  *  interval     buffer commit to the next buffer commit of the window;
@@ -313,6 +316,7 @@ struct brook_dmabuf_buffer {
     uint64_t modifier;
     uint32_t gres;        /* resolved host virgl resource id (0 = unresolved) */
     uint32_t bo_handle;   /* our DRM GEM alias of the imported resource */
+    uint64_t trace_device, trace_inode;  /* producer storage, never the CPU snapshot */
 };
 static int is_dmabuf_buffer(struct wl_resource *buf);
 
@@ -327,6 +331,8 @@ struct brook_buffer {
     struct brook_dmabuf_buffer *dmabuf;
     unsigned refs,uses;
     int uncertain;
+    uint64_t trace_epoch, trace_cycle;
+    unsigned trace_serial;
 };
 static void buffer_resource_destroyed(struct wl_listener *listener,void *data) {
     (void)data;
@@ -361,7 +367,11 @@ static void buffer_drop(struct brook_buffer *buffer) {
 static void buffer_begin_use(struct brook_buffer *buffer) { ++buffer->uses; }
 static void buffer_release(struct brook_buffer *buffer) {
     if (!buffer || !buffer->uses) return;
-    if (!--buffer->uses && !buffer->uncertain && buffer->resource) wl_buffer_send_release(buffer->resource);
+    if (!--buffer->uses && !buffer->uncertain && buffer->resource) {
+        wl_buffer_send_release(buffer->resource);
+        if (g_buffer_trace.pid && buffer->trace_epoch == g_buffer_trace.epoch && buffer->trace_cycle)
+            buffer_trace_record(BUFFER_RELEASE, buffer->trace_serial, 0, buffer->trace_cycle, 0, 0, NULL);
+    }
 }
 
 struct frame_latency_event {
@@ -413,6 +423,7 @@ struct brook_surface {
     int pointer_lock_inhibited;
     uint64_t pointer_lock_rearm_serial;
     struct brook_buffer *pending_buffer;
+    uint64_t trace_pending_attachment, trace_pending_epoch;
     int pending_attach;
     /* Own committed SHM pixels after releasing the client's buffer. Never use
      * the shared kernel VFB as the backing store for a surface tree. */
@@ -785,6 +796,28 @@ static void surface_attach(struct wl_client *c, struct wl_resource *r,
     buffer_drop(s->pending_buffer);
     s->pending_buffer = next;
     s->pending_attach = 1;
+    s->trace_pending_attachment = 0;
+    if (g_buffer_trace.pid && next) {
+        pid_t pid;
+        wl_client_get_credentials(c, &pid, NULL, NULL);
+        if (pid == g_buffer_trace.pid) {
+            const struct brook_dmabuf_buffer *db = next->dmabuf;
+            next->trace_serial = buffer_trace_resource(buffer, db != NULL,
+                db ? db->trace_device : 0, db ? db->trace_inode : 0,
+                db ? db->width : wl_shm_buffer_get_width(next->shm),
+                db ? db->height : wl_shm_buffer_get_height(next->shm));
+            if (next->trace_epoch != g_buffer_trace.epoch) {
+                next->trace_epoch = g_buffer_trace.epoch;
+                next->trace_cycle = 0;
+            }
+            if (next->trace_serial) {
+                s->trace_pending_attachment = ++g_buffer_trace.next_attachment;
+                s->trace_pending_epoch = g_buffer_trace.epoch;
+                buffer_trace_record(BUFFER_ATTACH, next->trace_serial, s->trace_pending_attachment,
+                                    0, wl_resource_get_id(r), next->uses, NULL);
+            }
+        }
+    }
 }
 static void surface_damage(struct wl_client *c, struct wl_resource *r,
                            int32_t x, int32_t y, int32_t w, int32_t h) {
@@ -1220,6 +1253,14 @@ static void surface_commit(struct wl_client *c,struct wl_resource *r) {
     if (s->pending_attach) {
         image_unref(image);image=NULL;
         struct brook_buffer *buffer=s->pending_buffer;
+        const uint64_t trace_attachment = g_buffer_trace.pid && buffer &&
+            s->trace_pending_epoch == g_buffer_trace.epoch ? s->trace_pending_attachment : 0;
+        const uint32_t trace_surface = trace_attachment ? wl_resource_get_id(r) : 0;
+        if (trace_attachment) {
+            if (!buffer->uses || !buffer->trace_cycle) buffer->trace_cycle = trace_attachment;
+            buffer_trace_record(BUFFER_COMMIT, buffer->trace_serial, trace_attachment,
+                                buffer->trace_cycle, trace_surface, buffer->uses, NULL);
+        }
         if (buffer && buffer->dmabuf) {
             struct brook_dmabuf_buffer *db=buffer->dmabuf;
             if (db->width<=0 || db->height<=0 || db->width>16384 || db->height>16384) {
@@ -1234,6 +1275,9 @@ static void surface_commit(struct wl_client *c,struct wl_resource *r) {
                     buffer_begin_use(buffer);
                     int uncertain=0;image=intel_dmabuf_snapshot(db,&uncertain);
                     if(uncertain)buffer->uncertain=1;
+                    if (trace_attachment && (image || uncertain))
+                        buffer_trace_record(image ? BUFFER_CPU_COPY : BUFFER_UNCERTAIN, buffer->trace_serial,
+                                            trace_attachment, buffer->trace_cycle, trace_surface, buffer->uses, NULL);
                     buffer_release(buffer);
                 }
             } else image=calloc(1,sizeof(*image));
@@ -1246,7 +1290,18 @@ static void surface_commit(struct wl_client *c,struct wl_resource *r) {
             buffer_begin_use(buffer);
             wl_shm_buffer_begin_access(shm);
             image=image_snapshot(wl_shm_buffer_get_data(shm),wl_shm_buffer_get_width(shm),wl_shm_buffer_get_height(shm),wl_shm_buffer_get_stride(shm),wl_shm_buffer_get_format(shm));
-            wl_shm_buffer_end_access(shm);buffer_release(buffer);
+            wl_shm_buffer_end_access(shm);
+            if (trace_attachment && image)
+                buffer_trace_record(BUFFER_CPU_COPY, buffer->trace_serial, trace_attachment,
+                                    buffer->trace_cycle, trace_surface, buffer->uses, NULL);
+            buffer_release(buffer);
+        }
+        if (image && trace_attachment) {
+            image->buffer_trace_epoch = g_buffer_trace.epoch;
+            image->buffer_trace_attachment = trace_attachment;
+            image->buffer_trace_cycle = buffer->trace_cycle;
+            image->buffer_trace_serial = buffer->trace_serial;
+            image->buffer_trace_surface = trace_surface;
         }
         if (image && buffer && !s->subsurface_parent) {
             const uint64_t now_us=g_now_us();const int x11=s->role==4;
@@ -3676,6 +3731,7 @@ static uint32_t gpu_window_timing_p80_bound(const struct GpuWindowTiming *s){
     return UINT32_MAX;
 }
 static void gpu_image_mark_uncertain(struct brook_image *image){
+    if (image->offer_state != 3) image_buffer_trace(image, BUFFER_UNCERTAIN, &image->offer_identity);
     image->offer_identity=(struct BrookGpuWindowIdentity){0};
     image->offer_state=3;
 }
@@ -3762,6 +3818,12 @@ static void gpu_window_presented(const struct BrookGpuWindowIdentity *identity){
     for(struct brook_image *i=g_intel_pending_head;i;i=i->pending_next)
         if(i->offer_state==1 && brook_gpu_window_identity_equal(&i->offer_identity,identity)){match=i;break;}
     if(!match){struct gpu_group *g=gpu_group_find(identity);if(g)gpu_group_presented(g);return;}
+    /* A layered offer can already have paced this image. The acknowledgement
+     * in the trace belongs to this exact standalone offer nevertheless. */
+    if (g_buffer_trace.pid && !match->buffer_trace_offer_ack) {
+        image_buffer_trace(match, BUFFER_ACK, identity);
+        match->buffer_trace_offer_ack = 1;
+    }
     if(match->gpu_presented)return;
     match->gpu_presented=1;++g_gpu_window_presented;
     pace_add(match->pace_x11,PACE_PRESENTED,match->pace_offer_us,g_now_us());
@@ -3779,6 +3841,7 @@ static void gpu_release_if_unheld(struct brook_image *image) {
     if (image->offer_state != 1 || image->pending_fd < 0 || image->group_refs ||
         brook_gpu_window_identity_valid(&image->offer_identity)) return;
     image->offer_state = 2;
+    image_buffer_trace(image, BUFFER_RENDERER_RETIRED, NULL);
 }
 
 static void gpu_window_channel_drain(void){
@@ -3801,6 +3864,7 @@ static void gpu_window_channel_drain(void){
             ++g_gpu_group_safe;gpu_group_release(g);continue;
         }
         ++g_gpu_window_acks;
+        image_buffer_trace(match, BUFFER_SAFE, &packet.identity);
         match->offer_identity=(struct BrookGpuWindowIdentity){0};
         gpu_release_if_unheld(match);
         if(getenv("BROOK_WAYLAND_GPU_TIMING")){match->offer_ack_ms=g_now_ms();
@@ -3899,6 +3963,8 @@ static int gpu_window_offer(struct brook_image *image){
     }
     if(sent==1){++root->publish_commit;image->offer_tree_commit=root->tree.current->commit;
         image->offer_identity=offer.identity;image->offer_state=1;++g_gpu_window_offers;++g_layer_offer_frames;
+        image->buffer_trace_offer_ack = 0;
+        image_buffer_trace(image, BUFFER_OFFER, &offer.identity);
         image->offer_geometry=*g;image->offer_ms=g_now_ms();if(!image->offer_ms)image->offer_ms=1;
         if(getenv("BROOK_WAYLAND_GPU_TIMING"))image->offer_sent_ms=g_now_ms();
         return 1;}
@@ -3916,7 +3982,7 @@ static int gpu_window_offer(struct brook_image *image){
  * unchanged layer appears in consecutive commits); it is released only when
  * every group holding it has been acknowledged (SAFE). */
 struct gpu_group {int live;struct BrookGpuWindowIdentity identity;uint64_t tree_commit;uint32_t sent_ms;int presented;
-    unsigned count;struct brook_image *images[BROOK_GPU_WINDOW_LAYERS_MAX];};
+    unsigned count;struct brook_image *images[BROOK_GPU_WINDOW_LAYERS_MAX];uint32_t producer_layers;};
 enum {GPU_GROUPS=48};
 static struct gpu_group g_gpu_groups[GPU_GROUPS];
 static int gpu_layers_enabled(void){
@@ -3961,7 +4027,11 @@ static void gpu_group_presented(struct gpu_group *g){
     gpu_window_timing_add(&g_presentWait,g->sent_ms,now);
     /* Every layer of the commit is on screen: callbacks of every surface in
      * the window (subsurfaces included) are paced like a single offer. */
-    for(unsigned i=0;i<g->count;++i)g->images[i]->gpu_presented=1;
+    for(unsigned i=0;i<g->count;++i){
+        g->images[i]->gpu_presented=1;
+        if (g->producer_layers & (1u << i))
+            image_buffer_trace(g->images[i], BUFFER_ACK, &g->identity);
+    }
     for(struct brook_surface *s=g_surfaces;s;s=s->next){
         struct brook_surface *root=s;while(root->subsurface_parent)root=root->subsurface_parent;
         if(root->wm_id!=g->identity.window)continue;
@@ -3975,6 +4045,7 @@ static void gpu_group_release(struct gpu_group *g){
         /* Also an image whose pixels were taken while the group held it
          * (pending_cpu 0, fd still open): it waits in the queue at state 1,
          * and only this SAFE can retire it and release the client's buffer. */
+        if (g->producer_layers & (1u << i)) image_buffer_trace(image, BUFFER_SAFE, &g->identity);
         if(image->group_refs) --image->group_refs;
         gpu_release_if_unheld(image);
         image_unref(image);}
@@ -4066,9 +4137,14 @@ static int gpu_window_offer_layers(struct brook_surface *root,const struct brook
     }
     if(!sent)return 2;
     struct gpu_group *group=&g_gpu_groups[slot];
-    *group=(struct gpu_group){1,packet.header.identity,root->tree.current->commit,g_now_ms(),0,count,{0}};
+    *group=(struct gpu_group){.live=1,.identity=packet.header.identity,.tree_commit=root->tree.current->commit,
+                              .sent_ms=g_now_ms(),.count=count};
     for(unsigned i=0;i<count;++i){struct brook_image *image=draws[i].view->image;
         image_ref(image);group->images[i]=image;++image->group_refs;
+        if (image->pending_cpu == 1) {
+            group->producer_layers |= 1u << i;
+            image_buffer_trace(image, BUFFER_OFFER, &group->identity);
+        }
         if(image->pending_cpu==1){image->offer_state=1;image->gpu_presented=0;image->offer_ms=g_now_ms();if(!image->offer_ms)image->offer_ms=1;}}
     ++g_gpu_group_offers;++g_layer_offer_frames;
     return 1;
@@ -4110,6 +4186,7 @@ static int intel_snapshot_retained(struct brook_image *image){
         int ready=intel_producer_fence_ready(image);
         if(!ready)return EAGAIN;
         if(ready<0){image->want_pixels=0;return 0;} /* Release path reports it. */
+        image_trace_producer_ready(image);
     }
     errno=0;long result=syscall(BROOK_SYS_GPU_BUFFER_TRY_CPU_READ,(long)image->pending_fd,0L,0L,0L,0L,0L);
     if(result<0 && (errno==EAGAIN || errno==EINTR)){++g_intel_busy;return EAGAIN;}
@@ -4117,6 +4194,7 @@ static int intel_snapshot_retained(struct brook_image *image){
     if(result)return 0;
     struct brook_image *copy=intel_dmabuf_copy(image->source->dmabuf);if(!copy)return 0;
     image->pixels=copy->pixels;copy->pixels=NULL;image_unref(copy);image->pending_cpu=0;++g_intel_retained_snapshots;
+    image_buffer_trace(image, BUFFER_CPU_COPY, NULL);
     for(struct brook_surface *surface=g_surfaces;surface;surface=surface->next){
         struct brook_view *view=surface->tree.current?surface->tree.current->value:NULL;
         if(!view || view->image!=image)continue;
@@ -4155,6 +4233,7 @@ static void intel_pending_poll(void){
                     else {
                         image->offer_identity=(struct BrookGpuWindowIdentity){0};
                         image->offer_state=2;++g_gpu_window_recovered;
+                        image_buffer_trace(image, BUFFER_DRAIN, NULL);
                     }
                 }
                 else if(image->offer_state==1){
@@ -4197,6 +4276,7 @@ static void intel_pending_poll(void){
             }
         }
         if(fence_error){
+            image_buffer_trace(image, BUFFER_UNCERTAIN, NULL);
             ++g_intel_failed;image->uncertain=1;image->source->uncertain=1;
             fprintf(stderr,"[waylandd] Intel producer fence failed: errno=%d; release withheld\n",fence_error);
             if(image->source->resource)wl_client_post_implementation_error(wl_resource_get_client(image->source->resource),"GPU producer completion could not be verified");
@@ -4204,6 +4284,7 @@ static void intel_pending_poll(void){
             close(image->pending_fd);image->pending_fd=-1;image->pending_cpu=2;image_unref(image);continue;
         }
         if(image->trace_queued_ms && !image->trace_fence_ms)image->trace_fence_ms=g_now_ms();
+        if (image->producer_fence_required) image_trace_producer_ready(image);
         /* A successfully fenced image held only by this queue has no view
          * left to paint. The offer path above has also retired its readers.
          * With retained offers this is the normal release: the renderer gave
@@ -4234,10 +4315,14 @@ static void intel_pending_poll(void){
                 fprintf(stderr,"[waylandd] Intel buffer readiness failed: errno=%d; release withheld\n",error);
             }
             ready=copy!=NULL;
-            if(ready){image->pixels=copy->pixels;copy->pixels=NULL;image_unref(copy);}
+            if(ready){
+                image->pixels=copy->pixels;copy->pixels=NULL;image_unref(copy);
+                image_buffer_trace(image, BUFFER_CPU_COPY, NULL);
+            }
         }
         uint32_t trace_copy_done=image->trace_queued_ms?g_now_ms():0;
         if(!ready){
+            if (uncertain) image_buffer_trace(image, BUFFER_UNCERTAIN, NULL);
             ++g_intel_failed;
             image->uncertain=1;if(uncertain)image->source->uncertain=1;
             if(image->source->resource){struct wl_client *client=wl_resource_get_client(image->source->resource);
@@ -4378,6 +4463,11 @@ params_make_buffer(struct wl_client *c, struct wl_resource *r, uint32_t id,
     db->refs = 1;db->width = width; db->height = height;
     db->stride = p->stride; db->fourcc = format;db->offset=p->offset;db->modifier=p->modifier;
     if (tiled) ++g_dmabuf_tiled_created;
+    struct stat storage;
+    if (fstat(p->fd, &storage) == 0) {
+        db->trace_device = storage.st_dev;
+        db->trace_inode = storage.st_ino;
+    }
     db->gres = dmabuf_resolve_gres(p->fd, &db->bo_handle);
     close(p->fd); p->fd = -1;   /* the import cache now holds the GEM reference */
     if (!db->gres) {
@@ -4706,10 +4796,12 @@ static void waylandd_status_write(const char *display){
     const char *dir=getenv("XDG_RUNTIME_DIR");if(!dir || !*dir)dir="/tmp";
     char path[256],tmp[272];
     if(snprintf(path,sizeof(path),"%s/brook-waylandd-%s.json",dir,display)>=(int)sizeof(path))return;
+    buffer_trace_poll(path);
     snprintf(tmp,sizeof(tmp),"%s.tmp",path);
     FILE *f=fopen(tmp,"w");if(!f)return;
     fprintf(f,"{\"schema\":\"brook-waylandd-status/1\",\"pid\":%ld,\"now_ms\":%u,\"gpu_socket\":%d,",
         (long)getpid(),now,getenv("BROOK_WAYLAND_GPU_SOCKET")!=NULL);
+    fprintf(f,"\"buffer_trace_active_pid\":%ld,",g_buffer_trace.pid);
     fprintf(f,"\"gpu_channel\":{\"connected\":%d,\"draining\":%d,\"connections\":%llu,\"losses\":%llu,"
               "\"drain_retries\":%llu,\"locally_rejected\":%llu,\"last_disconnect\":\"%s\","
               "\"last_refusal\":\"%s\",\"last_nonempty_refusal\":\"%s\",\"restart_requested\":%d,\"restart_errno\":%d},",
