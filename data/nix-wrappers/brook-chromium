@@ -42,6 +42,6 @@ if [ -n "${BROOK_CHROMIUM_VAAPI:-}" ] && [ -n "${gpu[*]}" ] && [ -d "${BROOK_VAA
 fi
 exec /nix/profile/bin/brook-run "${gpu[@]}" /nix/profile/bin/chromium \
   --no-sandbox "${flags[@]}" --disable-background-networking \
-  --disable-component-update --disable-extensions --renderer-process-limit=2 \
+  --disable-component-update --renderer-process-limit=2 \
   --disable-crash-reporter --no-first-run --no-default-browser-check \
   --ozone-platform=wayland --user-data-dir="$profile" "$@"
