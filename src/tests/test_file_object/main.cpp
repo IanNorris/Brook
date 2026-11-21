@@ -619,7 +619,16 @@ static void FaultPages() {
     backend.readError=-12;
     CHECK(FileObjectFaultPages(&backend.object,&vnode,0,4,pages)==MappingFaultResult::OutOfMemory);
     backend.readError=-5;
-    backend.failRead=false;CHECK(refs.empty() && heapBlocks==0);
+    backend.failRead=false;backend.readLimit=1024;
+    backend.errorAtRead=backend.reads+2;loaded=true;
+    CHECK(FileObjectFaultPages(&backend.object,&vnode,0,4,pages,&loaded)==MappingFaultResult::IoError);
+    CHECK(!loaded && refs.empty() && heapBlocks==0);
+    for(auto page:pages)CHECK(!page);
+    backend.errorAtRead=0;backend.zeroAtRead=backend.reads+2;loaded=true;
+    CHECK(FileObjectFaultPages(&backend.object,&vnode,0,4,pages,&loaded)==MappingFaultResult::IoError);
+    CHECK(!loaded && refs.empty() && heapBlocks==0);
+    for(auto page:pages)CHECK(!page);
+    backend.zeroAtRead=0;backend.readLimit=~0u;
     CHECK(FileObjectFaultPages(&backend.object,&vnode,1,4,pages,&loaded)==MappingFaultResult::Resolved);
     CHECK(loaded && pages[0] && !pages[1] && !pages[2] && !pages[3]);
     auto* tail=reinterpret_cast<unsigned char*>(pages[0].raw());
