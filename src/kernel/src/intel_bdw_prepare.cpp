@@ -14,6 +14,9 @@
 #include "intel_bdw_submission_queue.h"
 #include "intel_bdw_submission_worker.h"
 #include "intel_bdw_worker_stats.h"
+#if defined(BROOK_BDW_RPS_TRIAL)
+#include "intel_bdw_render_clock.h"
+#endif
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
 #include "intel_bdw_submission_timing.h"
 #endif
@@ -768,6 +771,13 @@ void BdwWorkerStatsFlipLatched(uint32_t frames,uint64_t ticks){
 }
 bool BdwWorkerStatsRead(BdwWorkerStats& out){return workerStats.Read(out);}
 void BdwWorkerStatsReset(){workerStats.RequestReset();}
+#if defined(BROOK_BDW_RPS_TRIAL)
+BdwClockLoadSample BdwWorkerRenderLoad(){
+    BdwClockLoadSample sample{};
+    if(OnWorkerStatsThread())workerStats.RenderLoad(sample.elapsedTicks,sample.renderTicks,sample.resets);
+    return sample;
+}
+#endif
 #endif
 #if defined(BROOK_SSD_AUTO_RECOVERY)
 // Fixed kernel-authored jobs only. Retain everything for the boot on error.

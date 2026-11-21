@@ -103,6 +103,13 @@ public:
         Charge(current_,now);current_=BdwWorkerOther;Publish();
     }
     BdwWorkerClass Current()const{return current_;}
+    // Worker thread only. Obtain the occupancy input without copying the
+    // diagnostics snapshot published for another thread.
+    void RenderLoad(uint64_t& elapsed,uint64_t& render,uint64_t& resets)const{
+        elapsed=local_.elapsedTicks;
+        render=local_.classes[BdwWorkerApplication].ticks+local_.classes[BdwWorkerCompositor].ticks;
+        resets=local_.resets;
+    }
     // Worker thread, between Begin and End of an RCS job.
     void Render(uint64_t yields,uint64_t breadcrumbYields,uint64_t sleepTicks,
                 uint64_t spins,uint64_t breadcrumbSpins,uint64_t spinTicks,
@@ -168,6 +175,10 @@ void BdwWorkerStatsRender(uint64_t yields,uint64_t breadcrumbYields,uint64_t sle
 void BdwWorkerStatsPresent(bool full,uint64_t pixels,const uint64_t (&ticks)[BdwPresentStageCount],uint64_t yields);
 bool BdwWorkerStatsRead(BdwWorkerStats& out);
 void BdwWorkerStatsReset();
+#if defined(BROOK_BDW_RPS_TRIAL)
+struct BdwClockLoadSample;
+BdwClockLoadSample BdwWorkerRenderLoad();
+#endif
 // Flip and persistent-map counters; ignored off the worker thread.
 enum class BdwWorkerScanoutEvent : uint8_t {TargetLegacy,TargetPersistent,TargetFlip,FlipArmed,FlipQueued,
     FlipUncertain,FlipGopReturn,MapHit,MapFull,MapFailed};
