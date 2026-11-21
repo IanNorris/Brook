@@ -25,6 +25,7 @@ static int test_ioctl(int fd,unsigned long request,...);
 #undef fprintf
 #ifdef BROOK_DIRECT_TEST
 static int resize_calls;static long resize_w,resize_h;static uint32_t resize_vfb[16];
+static unsigned peer_restart_calls;
 static int direct_status=1,direct_calls,window_queries,window_stale,direct_mutate_commit,peer_error,source_begins,source_tags,source_begin_error;
 BrookVkSurface *test_surface_create(int software){(void)software;return (BrookVkSurface *)(uintptr_t)1;}
 const char *test_surface_device(const BrookVkSurface *s){(void)s;return "test";}
@@ -75,7 +76,12 @@ static long test_syscall(long number, ...)
         ++resize_calls;resize_w=w;resize_h=h;
         *out=(struct brook_wm_create_out){(uint32_t)window,(uint32_t)w,(uintptr_t)resize_vfb};return 0;
     }
-    if(number==BROOK_SYS_GPU_WINDOW_PEER_RECOVERY){va_end(args);if(peer_error){errno=peer_error;return -1;}return 0;}
+    if(number==BROOK_SYS_GPU_WINDOW_PEER_RECOVERY){
+        (void)va_arg(args,long);long op=va_arg(args,long);va_end(args);
+        if(op==BROOK_GPU_WINDOW_PEER_RESTART){++peer_restart_calls;return 0;}
+        if(op==BROOK_GPU_WINDOW_PEER_DRAIN && peer_error){errno=peer_error;return -1;}
+        return 0;
+    }
     if(number==BROOK_SYS_WM_WINDOW_STATE){
         long window=va_arg(args,long),expected=va_arg(args,long);BrookWindowState *state=(void *)(uintptr_t)va_arg(args,long);
         (void)va_arg(args,long);va_end(args);++window_queries;
@@ -234,9 +240,27 @@ static void check_gpu_window_offer(int mode)
     assert(offer.type==BROOK_GPU_WINDOW_OFFER && offer.identity.window==1 && offer.identity.incarnation==77 && offer.identity.commit);
     close(fds[0]);close(fds[1]);
     wl_display_flush_clients(display);uint32_t wire[256];assert(recv(clientSockets[1],wire,sizeof(wire),MSG_DONTWAIT)<0 && errno==EAGAIN);
-    if(mode){close(channel[1]);peer_error=mode==1?EIO:EAGAIN;}
+    if(mode==3 || mode==4){
+        // Leave the same peer alive. Its accepted endpoint stops receiving
+        // old offers but remains open while drain is gated.
+        gpu_window_channel_lost("fixture-live-disconnect");
+        char byte;
+        assert(recv(channel[1],&byte,1,MSG_DONTWAIT)==0);
+        peer_error=EAGAIN;
+    }else if(mode){close(channel[1]);peer_error=mode==1?EIO:EAGAIN;}
     else assert(brook_gpu_window_send_safe(channel[1],&offer.identity)==1);
-    if(mode==2){intel_pending_poll();assert(g_intel_pending_count==1 && buffer->uses==1 && !buffer->uncertain);peer_error=0;}
+    if(mode>=2){
+        intel_pending_poll();
+        assert(g_intel_pending_count==1 && buffer->uses==1 && !buffer->uncertain);
+        assert(g_gpu_window_dead>=0 && !gpu_window_channel_connect());
+        if(mode==4){
+            const unsigned before=peer_restart_calls;
+            g_gpu_peer_lost_ms-=INTEL_PEER_DRAIN_MS;
+            intel_pending_poll();intel_pending_poll();
+            assert(peer_restart_calls==before+1 && buffer->uses==1 && g_intel_pending_count==1);
+        }
+        peer_error=0;
+    }
     intel_pending_poll();assert(!g_intel_pending_count);
     if(mode==1)assert(buffer->uncertain && buffer->uses==1 && view->image->pending_cpu==2);
     else assert(!buffer->uncertain && !buffer->uses && !view->image->pending_cpu);
@@ -257,6 +281,26 @@ static void check_gpu_window_offer(int mode)
         i+=size/4;
     }
     assert(releases==(mode!=1) && errors==(mode==1));
+    if(mode==3 || mode==4){
+        assert(g_gpu_window_dead<0);
+        char dir[]="/tmp/brook-live-reattach-XXXXXX";assert(mkdtemp(dir));
+        struct sockaddr_un endpoint={.sun_family=AF_UNIX};
+        assert(snprintf(endpoint.sun_path,sizeof(endpoint.sun_path),"%s/peer",dir)>0);
+        int listener=socket(AF_UNIX,SOCK_SEQPACKET|SOCK_CLOEXEC,0);assert(listener>=0);
+        assert(!bind(listener,(struct sockaddr *)&endpoint,sizeof(endpoint)) && !listen(listener,1));
+        assert(!setenv("BROOK_WAYLAND_GPU_SOCKET",endpoint.sun_path,1));
+        assert(gpu_window_channel_connect());
+        const int reconnected=accept(listener,NULL,NULL);assert(reconnected>=0);
+        surface_attach(client,surface.resource,resource,0,0);surface_commit(client,surface.resource);
+        intel_pending_poll();
+        assert(brook_gpu_window_receive(reconnected,&offer,fds)==1);
+        close(fds[0]);close(fds[1]);
+        assert(brook_gpu_window_send_safe(reconnected,&offer.identity)==1);
+        intel_pending_poll();assert(!g_intel_pending_count && !buffer->uses);
+        close(reconnected);close(listener);close(channel[1]);
+        gpu_window_channel_lost("fixture-close");gpu_window_reap_dead();
+        assert(!unlink(endpoint.sun_path) && !rmdir(dir));
+    }
     bt_state_set(&surface.tree.current,NULL);bt_state_set(&surface.tree.latest,NULL);buffer_drop(buffer);
     free(surface.composite);g_surfaces=NULL;g_drm_intel=0;close(g_drm_fd);g_drm_fd=-1;
     if(!mode){close(channel[1]);gpu_window_channel_lost("fixture-close");gpu_window_reap_dead();}
@@ -925,6 +969,7 @@ int main(void)
     source_begins=source_tags=0;check_gpu_window_offer(0);
     assert(source_begins>0 && source_tags>0);
     check_gpu_window_offer(1);check_gpu_window_offer(2);
+    check_gpu_window_offer(3);check_gpu_window_offer(4);
     check_gpu_window_retained();
     check_gpu_window_layers(0);check_gpu_window_layers(1);
     check_gpu_window_layers_shm();

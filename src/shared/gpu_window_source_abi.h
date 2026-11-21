@@ -4,14 +4,19 @@
  * current owner incarnation of this OS window. Arguments: socket fd, window
  * slot, nonzero window incarnation, 0, 0, 0. No fd or lease is transferred. */
 #define BROOK_SYS_GPU_WINDOW_VALIDATE 0xB1D
-/* On a connecting provider endpoint, AUTH pins the currently attached desktop
- * renderer's peer identity. DRAIN is valid only after AUTH: it returns 0 once
- * that exact renderer group is fully reaped and the retained buffer has no
- * GPU uses; EAGAIN means retry, EIO means uncertain/failed. The renderer must
- * not export producer fds to other processes or retain them after its lifetime. */
+/* AUTH pins the attached renderer on the provider's connecting endpoint.
+ * On the matching accepted endpoint, RETIRE shuts down the old connection
+ * and records that the renderer has stopped selecting its offers and closed
+ * their source descriptors. The renderer must not export them elsewhere.
+ * DRAIN on the authorized provider endpoint requires this receipt or reaping
+ * of the exact renderer group, plus successful per-buffer GPU/scanout
+ * retirement. EAGAIN means retry, EIO means uncertain or failed.
+ * RESTART is a privileged escalation on an abandoned, unretired connection. */
 #define BROOK_SYS_GPU_WINDOW_PEER_RECOVERY 0xB1E
 #define BROOK_GPU_WINDOW_PEER_AUTH 0
 #define BROOK_GPU_WINDOW_PEER_DRAIN 1
+#define BROOK_GPU_WINDOW_PEER_RETIRE 2
+#define BROOK_GPU_WINDOW_PEER_RESTART 3
 /* Provider atomically publishes its completed CPU VFB with the nonzero
  * surface commit it contains; only the owner of the exact window may tag it.
  * A renderer can then query that tag only for an exact window incarnation and

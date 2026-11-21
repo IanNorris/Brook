@@ -15,6 +15,7 @@
 #include <time.h>
 #include <limits.h>
 #include <sys/ioctl.h>
+#include <poll.h>
 #include <string.h>
 #define DESKTOP_GPU_OFFERS 64
 /* Frames that may sample one retained offer concurrently; at least the
@@ -128,10 +129,20 @@ static inline void desktop_gpu_channel_init(struct DesktopGpuChannel *c){
     if(listen(fd,1)){unlink(path);close(fd);return;}
     memcpy(c->path,path,len+1);c->listener=fd;
 }
+#ifndef DESKTOP_GPU_RETIRE_PEER
+#define DESKTOP_GPU_RETIRE_PEER(fd) syscall(BROOK_SYS_GPU_WINDOW_PEER_RECOVERY,(long)(fd), \
+    (long)BROOK_GPU_WINDOW_PEER_RETIRE,0L,0L,0L,0L)
+#endif
 static inline void desktop_gpu_channel_disconnect(struct DesktopGpuChannel *c){
-    if(c->peer>=0){close(c->peer);++c->disconnected;}
+    const int old=c->peer;
     c->peer=-1;
     for(unsigned i=0;i<DESKTOP_GPU_OFFERS;++i)desktop_gpu_offer_free(&c->offers[i]);
+    if(old>=0){
+        // The renderer thread will no longer select this channel's offers.
+        // Already submitted jobs and scanout remain pinned by the kernel.
+        (void)DESKTOP_GPU_RETIRE_PEER(old);
+        close(old);++c->disconnected;
+    }
 }
 static inline void desktop_gpu_channel_close(struct DesktopGpuChannel *c){
     desktop_gpu_channel_disconnect(c);if(c->listener>=0)close(c->listener);c->listener=-1;
@@ -165,7 +176,13 @@ static inline void desktop_gpu_channel_poll(struct DesktopGpuChannel *c){
     if(c->peer<0){if(c->blockAccept)return;int fd=accept4(c->listener,NULL,NULL,SOCK_NONBLOCK|SOCK_CLOEXEC);if(fd<0)return;c->peer=fd;++c->accepted;}
     for(unsigned n=0;n<DESKTOP_GPU_OFFERS;++n){unsigned slot=0;
         while(slot<DESKTOP_GPU_OFFERS && c->offers[slot].state)++slot;
-        if(slot==DESKTOP_GPU_OFFERS)return;
+        if(slot==DESKTOP_GPU_OFFERS){
+            // A full table can still observe a provider shutting down its fd.
+            struct pollfd p={.fd=c->peer,.events=POLLRDHUP};
+            if(poll(&p,1,0)>0 && (p.revents&(POLLERR|POLLHUP|POLLRDHUP|POLLNVAL)))
+                desktop_gpu_channel_disconnect(c);
+            return;
+        }
         struct BrookGpuWindowLayersPacket wire;int fds[2*BROOK_GPU_WINDOW_LAYERS_MAX];unsigned nfds=0;
         int got=brook_gpu_window_receive_layers(c->peer,&wire,fds,&nfds);
         if(!got)return;

@@ -11,12 +11,26 @@ static int failed_buffer=-1;
 #include <fcntl.h>
 #include <stdarg.h>
 static int owner_valid=1,snapshot_tagged=0;static uint64_t snapshot_commit=0;static unsigned snapshot_queries=0;
+static struct DesktopGpuChannel *retirement_check;
+static unsigned retired_channels;
 static long test_syscall(long number,...){
     if(number==BROOK_SYS_WM_QUERY_SOURCE_COMMIT){
         va_list args;va_start(args,number);(void)va_arg(args,long);(void)va_arg(args,long);(void)va_arg(args,long);
         uint64_t *out=(uint64_t *)(uintptr_t)va_arg(args,long);va_end(args);++snapshot_queries;
         if(!snapshot_tagged){errno=ESTALE;return -1;}
         *out=snapshot_commit;return 0;
+    }
+    if(number==BROOK_SYS_GPU_WINDOW_PEER_RECOVERY){
+        va_list args;va_start(args,number);int fd=(int)va_arg(args,long);
+        long op=va_arg(args,long);va_end(args);
+        assert(op==BROOK_GPU_WINDOW_PEER_RETIRE && fcntl(fd,F_GETFD)>=0);
+        if(retirement_check){
+            assert(retirement_check->peer<0);
+            for(unsigned i=0;i<DESKTOP_GPU_OFFERS;++i)
+                assert(!retirement_check->offers[i].state && retirement_check->offers[i].buffer<0);
+            ++retired_channels;
+        }
+        return 0;
     }
     assert(number==BROOK_SYS_GPU_WINDOW_VALIDATE);return owner_valid?0:-1;}
 static void expect_reply(int socket,uint32_t type,uint64_t commit){
@@ -284,8 +298,18 @@ int main(void){check_early_notify();check_failed_fence();check_layers();check_un
     int producer=socket(AF_UNIX,SOCK_SEQPACKET|SOCK_CLOEXEC,0);assert(producer>=0);
     assert(!connect(producer,(struct sockaddr *)&endpoint,sizeof(endpoint)));
     desktop_gpu_channel_poll(&second);assert(second.peer>=0 && second.accepted==1);
-    close(producer);
-    desktop_gpu_channel_poll(&second);assert(second.peer<0 && second.disconnected==1);
+    // Even with a full offer table, the same renderer must observe a lost
+    // connection, retire all its descriptors and accept a fresh provider.
+    for(unsigned i=0;i<DESKTOP_GPU_OFFERS;++i)second.offers[i].state=1;
+    retirement_check=&second;
+    assert(!shutdown(producer,SHUT_RDWR));
+    desktop_gpu_channel_poll(&second);
+    assert(second.peer<0 && second.disconnected==1 && retired_channels==1);
+    int replacement=socket(AF_UNIX,SOCK_SEQPACKET|SOCK_CLOEXEC,0);assert(replacement>=0);
+    assert(!connect(replacement,(struct sockaddr *)&endpoint,sizeof(endpoint)));
+    desktop_gpu_channel_poll(&second);assert(second.peer>=0 && second.accepted==2);
+    close(replacement);close(producer);
+    retirement_check=NULL;
     desktop_gpu_channel_close(&second);assert(!rmdir(dir));unsetenv("BROOK_DESKTOP_GPU_SOCKET");unsetenv("BROOK_DESKTOP_GPU_GID");
     struct DesktopGpuChannel receiver;desktop_gpu_channel_init(&receiver);
     uint64_t frame=desktop_gpu_channel_begin_frame(&receiver);assert(frame);

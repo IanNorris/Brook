@@ -53,6 +53,8 @@ struct UnixFdQueue {
     struct CredentialSpan { uint64_t end; UnixSenderCredentials sender; } credentials[UNIX_FD_QUEUE_CAP];
     uint32_t credentialHead, credentialTail;
     uint64_t written, read;
+    // Renderer output direction. Read and written under g_unixRegistryLock.
+    uint64_t gpuRendererRetiredIncarnation;
     volatile int head;
     volatile int tail;
     volatile uint32_t refCount; // one ref per UnixSocketData pointing at us

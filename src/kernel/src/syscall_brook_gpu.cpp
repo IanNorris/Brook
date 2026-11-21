@@ -23,6 +23,7 @@
 #include "syscall_unix_socket.h"
 #include "syscall_drm.h"
 #include "syscall_handlers.h"
+#include "pipe.h"
 
 namespace brook {
 
@@ -290,15 +291,36 @@ int64_t sys_brook_gpu_window_peer_recovery(uint64_t fdValue,uint64_t op,uint64_t
 #if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
     auto* proc=ProcessCurrent();if(!proc || !proc->fds)return -ESRCH;
     KernelOperationGuard operation(proc);
-    if(fdValue>=MAX_FDS || a || b || c || op>BROOK_GPU_WINDOW_PEER_DRAIN ||
-       (op==BROOK_GPU_WINDOW_PEER_AUTH && bufferFd))return -EINVAL;
+    if(fdValue>=MAX_FDS || a || b || c || op>BROOK_GPU_WINDOW_PEER_RESTART ||
+       (op!=BROOK_GPU_WINDOW_PEER_DRAIN && bufferFd))return -EINVAL;
     FdRef descriptor(proc,static_cast<int>(fdValue));auto* entry=descriptor.get();
     if(!entry || entry->type!=FdType::UnixSocket || !entry->handle)return -EBADF;
     auto* socket=static_cast<UnixSocketData*>(entry->handle);
-    UnixCredentials peer{};uint64_t peerIncarnation=0;bool authorized=false;
+    if(op==BROOK_GPU_WINDOW_PEER_RETIRE){
+        const uint64_t owner=UnixCurrentIncarnation(proc);
+        if(!owner || !brook::BdwOffscreenRendererOwnedBy(owner))return -EPERM;
+        SpinLockAcquire(&g_unixRegistryLock);
+        const bool accepted=socket->state==UnixSocketData::State::Connected && socket->acceptedEndpoint &&
+            socket->socketType==5 && socket->rxPipe && socket->txPipe && socket->peerIncomingFds;
+        SpinLockRelease(&g_unixRegistryLock);
+        if(!accepted)return -EPERM;
+        // FdRef pins both directional queues. Stop additional fd transfers
+        // before publishing the exact accepted renderer's retirement.
+        UnixShutdownDirection(socket->rxPipe,false);
+        UnixShutdownDirection(socket->txPipe,true);
+        SpinLockAcquire(&g_unixRegistryLock);
+        socket->peerIncomingFds->gpuRendererRetiredIncarnation=owner;
+        SpinLockRelease(&g_unixRegistryLock);
+        return 0;
+    }
+    UnixCredentials peer{};uint64_t peerIncarnation=0;bool authorized=false,retired=false;
     SpinLockAcquire(&g_unixRegistryLock);
     const bool connected=socket->state==UnixSocketData::State::Connected && !socket->acceptedEndpoint && socket->socketType==5;
-    if(connected){peer=socket->peerCredentials.raw;peerIncarnation=socket->peerIncarnation;authorized=socket->gpuPeerAuthorized;}
+    if(connected){
+        peer=socket->peerCredentials.raw;peerIncarnation=socket->peerIncarnation;authorized=socket->gpuPeerAuthorized;
+        retired=peerIncarnation && socket->incomingFds &&
+            socket->incomingFds->gpuRendererRetiredIncarnation==peerIncarnation;
+    }
     SpinLockRelease(&g_unixRegistryLock);
     if(!connected || peer.pid<=0 || peer.pid>65535 || !peerIncarnation)return -EPERM;
     if(op==BROOK_GPU_WINDOW_PEER_AUTH){
@@ -309,12 +331,25 @@ int64_t sys_brook_gpu_window_peer_recovery(uint64_t fdValue,uint64_t op,uint64_t
         SpinLockRelease(&g_unixRegistryLock);return same?0:-116; // ESTALE
     }
     if(!authorized)return -EPERM;
+    if(op==BROOK_GPU_WINDOW_PEER_RESTART){
+        if(ProcessReadIds(proc,false).effective!=0 || !ProcessCapable(proc,nullptr,CapSysAdmin))return -EPERM;
+        if(!socket->rxPipe || !socket->txPipe ||
+           !__atomic_load_n(&socket->rxPipe->unixReadShutdown,__ATOMIC_ACQUIRE) ||
+           !__atomic_load_n(&socket->txPipe->unixWriteShutdown,__ATOMIC_ACQUIRE))return -EPERM;
+        if(retired || !brook::BdwOffscreenRendererOwnedBy(peerIncarnation))return 0;
+        auto* target=SchedulerFindProcessReference(static_cast<uint16_t>(peer.pid));
+        if(!target)return -ESRCH;
+        const int result=!target->isThread && !target->isKernelThread && target->incarnation==peerIncarnation
+            ? ProcessSendSignal(target,9,nullptr,proc) : -116; // ESTALE
+        ProcessUnref(target);
+        return result;
+    }
     if(bufferFd>=MAX_FDS)return -EBADF;
     FdRef source(proc,static_cast<int>(bufferFd));auto* bufferEntry=source.get();
     if(!bufferEntry || bufferEntry->type!=FdType::IntelPrime || !bufferEntry->handle)return -EBADF;
     auto* buffer=static_cast<brook::BdwGpuBuffer*>(bufferEntry->handle);
     if(!brook::BdwGpuBufferAllowsUserMapping(buffer))return -13;
-    if(!brook::SchedulerThreadGroupGone(static_cast<uint16_t>(peer.pid),peerIncarnation))return -EAGAIN;
+    if(!retired && !brook::SchedulerThreadGroupGone(static_cast<uint16_t>(peer.pid),peerIncarnation))return -EAGAIN;
     const auto state=brook::BdwGpuBufferTryCpuTransition(buffer);
     return state==brook::BdwCpuTransitionResult::Ready?0:state==brook::BdwCpuTransitionResult::Busy?-EAGAIN:-EIO;
 #else

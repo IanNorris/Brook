@@ -951,6 +951,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     const uint64_t traceStart=traceEnabled?monotonic_ns():0;
     g_gpuChannel.blockAccept=g_directMachine.held!=0;
     desktop_gpu_channel_poll(&g_gpuChannel);
+    if(g_directMachine.held && g_gpuChannel.peer<0)direct_scanout_leave();
     const uint64_t traceChannel=traceEnabled?monotonic_ns():0;
     const uint64_t frame=desktop_gpu_channel_begin_frame(&g_gpuChannel);if(!frame)return -1;
     uint64_t timing[6]={traceEnabled?traceStart:monotonic_ns(),0,0,0,0,0},presentStartNs=0,chromeEndNs=0,traceQuery=0;

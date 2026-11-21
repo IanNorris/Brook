@@ -3527,7 +3527,7 @@ static struct brook_image *intel_dmabuf_snapshot(const struct brook_dmabuf_buffe
  *  - after renderer loss, PEER_DRAIN waits until the old renderer is reaped.
  * An image whose offer awaits the renderer needs no timer: its SAFE or
  * PRESENTED arrives on the channel fd. */
-enum { INTEL_PENDING_LIMIT=64,INTEL_RETRY_MS=2,INTEL_RETRY_DRAIN_MS=10 };
+enum { INTEL_PENDING_LIMIT=64,INTEL_RETRY_MS=2,INTEL_RETRY_DRAIN_MS=10,INTEL_PEER_DRAIN_MS=2000 };
 static struct brook_image *g_intel_pending_head,*g_intel_pending_tail;
 static unsigned g_intel_pending_count;
 static uint64_t g_intel_queued,g_intel_ready,g_intel_busy,g_intel_failed;
@@ -3562,6 +3562,8 @@ static void intel_image_want_pixels(struct brook_image *image){
  * that its previously delivered GPU reads have retired. Event-loop only. */
 static int g_gpu_window_channel=-1;
 static int g_gpu_window_dead=-1;
+static uint32_t g_gpu_peer_lost_ms;
+static int g_gpu_peer_restart_asked, g_gpu_peer_restart_error;
 static const char *g_gpu_disconnect_reason = "none";
 static const char *g_gpu_connect_refusal = "none";
 static uint64_t g_gpu_channel_connections, g_gpu_channel_losses, g_gpu_drain_waits, g_gpu_offer_local_rejected;
@@ -3627,8 +3629,13 @@ static void gpu_window_channel_lost(const char *reason){
     }
     if(g_gpu_window_source){wl_event_source_remove(g_gpu_window_source);g_gpu_window_source=NULL;}
     if(g_gpu_window_channel>=0){
+        (void)shutdown(g_gpu_window_channel,SHUT_RDWR);
         if(g_gpu_window_dead>=0)close(g_gpu_window_channel);
-        else g_gpu_window_dead=g_gpu_window_channel;
+        else {
+            g_gpu_window_dead=g_gpu_window_channel;
+            g_gpu_peer_lost_ms=g_now_ms();
+            g_gpu_peer_restart_asked=g_gpu_peer_restart_error=0;
+        }
     }
     g_gpu_window_channel=-1;
     for(struct brook_image *i=g_intel_pending_head;i;i=i->pending_next)if(i->offer_state==1)i->offer_state=3;
@@ -3638,6 +3645,14 @@ static void gpu_window_reap_dead(void){
     if(g_gpu_window_dead<0)return;
     for(struct brook_image *i=g_intel_pending_head;i;i=i->pending_next)if(i->offer_state==3)return;
     close(g_gpu_window_dead);g_gpu_window_dead=-1;
+}
+static void gpu_window_maybe_restart(void){
+    if(g_gpu_window_dead<0 || g_gpu_peer_restart_asked ||
+       g_now_ms()-g_gpu_peer_lost_ms<INTEL_PEER_DRAIN_MS)return;
+    g_gpu_peer_restart_asked=1;
+    long result=syscall(BROOK_SYS_GPU_WINDOW_PEER_RECOVERY,(long)g_gpu_window_dead,
+                        (long)BROOK_GPU_WINDOW_PEER_RESTART,0L,0L,0L,0L);
+    g_gpu_peer_restart_error=result<0?errno:0;
 }
 static int gpu_window_channel_event(int fd,uint32_t mask,void *unused){
     (void)fd;(void)unused;
@@ -4058,7 +4073,10 @@ static void intel_pending_poll(void){
                     errno=0;long recovered=g_gpu_window_dead<0?-1:
                         syscall(BROOK_SYS_GPU_WINDOW_PEER_RECOVERY,(long)g_gpu_window_dead,(long)BROOK_GPU_WINDOW_PEER_DRAIN,
                                 (long)image->pending_fd,0L,0L,0L);
-                    if(recovered<0 && (errno==EAGAIN || errno==EINTR)){++g_gpu_drain_waits;intel_retry_after(INTEL_RETRY_DRAIN_MS);intel_pending_append(image);continue;}
+                    if(recovered<0 && (errno==EAGAIN || errno==EINTR)){
+                        ++g_gpu_drain_waits;gpu_window_maybe_restart();
+                        intel_retry_after(INTEL_RETRY_DRAIN_MS);intel_pending_append(image);continue;
+                    }
                     if(recovered<0)fence_error=EIO;
                     else {image->offer_state=2;++g_gpu_window_recovered;}
                 }
@@ -4617,10 +4635,11 @@ static void waylandd_status_write(const char *display){
         (long)getpid(),now,getenv("BROOK_WAYLAND_GPU_SOCKET")!=NULL);
     fprintf(f,"\"gpu_channel\":{\"connected\":%d,\"draining\":%d,\"connections\":%llu,\"losses\":%llu,"
               "\"drain_retries\":%llu,\"locally_rejected\":%llu,\"last_disconnect\":\"%s\","
-              "\"last_refusal\":\"%s\"},",
+              "\"last_refusal\":\"%s\",\"restart_requested\":%d,\"restart_errno\":%d},",
         g_gpu_window_channel>=0,g_gpu_window_dead>=0,(unsigned long long)g_gpu_channel_connections,
         (unsigned long long)g_gpu_channel_losses,(unsigned long long)g_gpu_drain_waits,
-        (unsigned long long)g_gpu_offer_local_rejected,g_gpu_disconnect_reason,g_gpu_connect_refusal);
+        (unsigned long long)g_gpu_offer_local_rejected,g_gpu_disconnect_reason,g_gpu_connect_refusal,
+        g_gpu_peer_restart_asked,g_gpu_peer_restart_error);
     fprintf(f,"\"offers\":{\"sent\":%llu,\"safe\":%llu,\"presented\":%llu,\"retained_snapshots\":%llu,\"recovered\":%llu,\"xwayland\":%llu,\"xwayland_enabled\":%d},",
         (unsigned long long)g_gpu_window_offers,(unsigned long long)g_gpu_window_acks,(unsigned long long)g_gpu_window_presented,
         (unsigned long long)g_intel_retained_snapshots,(unsigned long long)g_gpu_window_recovered,
