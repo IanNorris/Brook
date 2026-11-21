@@ -188,6 +188,11 @@ def discard_owned(path, original):
         return
     tombstone = path.with_name(f".brook-abandoned-{uuid.uuid4().hex}")
     rename_no_replace(path, tombstone)
+    if identity(tombstone.lstat()) != identity(original):
+        # A replacement arrived before the rename. Keep it intact even
+        # when its old name has already been taken by another caller.
+        rename_no_replace(tombstone, path)
+        return
     if stat.S_ISDIR(original.st_mode):
         writable_tree(tombstone)
         shutil.rmtree(tombstone)

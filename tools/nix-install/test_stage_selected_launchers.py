@@ -21,6 +21,7 @@ from stage_selected_launchers import read_index, validate_launcher_ids
 from stage_selected_generations import pin_generation, prune_generations
 from stage_selected_space import layout_usage, tree_inodes
 import stage_profile as legacy
+import stage_selected_space
 
 SOURCES = Path(__file__).resolve().parent
 OPENSSL = shutil.which("openssl")
@@ -236,6 +237,25 @@ class SelectedGenerationTest(unittest.TestCase):
                     self.assertEqual(os.readlink(original), ".brook-profile-" + digit * 32)
 
     @unittest.skipUnless(shutil.which("nix-store"), "requires nix-store")
+    def test_cleanup_retains_an_inode_that_replaced_the_import_before_rename(self):
+        imported = self.store / "new-import"
+        imported.write_bytes(b"original import")
+        original = imported.lstat()
+        saved = self.work / "original-inode"
+        rename = stage_selected_space.rename_no_replace
+
+        def replace_then_rename(source, destination):
+            if source == imported:
+                source.rename(saved)
+                source.write_bytes(b"external replacement")
+            rename(source, destination)
+
+        with patch.object(stage_selected_space, "rename_no_replace", side_effect=replace_then_rename):
+            stage_selected_space.discard_owned(imported, original)
+        self.assertEqual(imported.read_bytes(), b"external replacement")
+        self.assertEqual(saved.read_bytes(), b"original import")
+        self.assertFalse(list(self.store.glob(".brook-abandoned-*")))
+
     def test_preflight_checks_guest_under_mutation_lock(self):
         plan = self.plan("7", "brook.calc", "Calculator", "selected-calc")
         capacity = {"block_bytes": 4096, "free_blocks": 16384, "free_bytes": 64 << 20,
