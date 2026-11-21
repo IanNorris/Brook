@@ -9,7 +9,8 @@ struct Mock {
     uint32_t injectIs=0, interruptOnAck=0;
     uint32_t lastCompletionFis=0, receivedFis=0, injectFis=0x00404034u;
     uint32_t taskOnCompletion=0xffffffffu;
-    bool allowStaleTaskBusy=false, postedWithStaleTaskBusy=false;
+    uint32_t taskOnSettle=0, fisOnSettle=0xffffffffu;
+    bool allowStaleTaskBusy=false, postedWithStaleTaskBusy=false, lastDmaCompletedWithStaleTaskBusy=false;
     unsigned fisClears=0;
     uint32_t settleLink=0x133, isOnPause=0, serrOnPause=0, linkOnCompletion=0;
     uint64_t now=0, stepNs=1000000;
@@ -36,7 +37,10 @@ struct Mock {
         now+=stepNs;
         regs[IS/4]|=isOnPause;
         regs[SERR/4]|=serrOnPause;
-        if(polls==settleAfter){regs[SSTS/4]=settleLink;regs[TFD/4]=0;}
+        if(polls==settleAfter){
+            regs[SSTS/4]=settleLink;regs[TFD/4]=taskOnSettle;
+            if(fisOnSettle!=0xffffffffu)receivedFis=fisOnSettle;
+        }
     }
     bool waitClear(uint32_t off,uint32_t mask){
         if((off==CI&&stuckCi)||(mask==CR&&stuckCr)||(mask==FR&&stuckFr))return false;
@@ -119,7 +123,52 @@ int main(){
         assert(Submit(incomplete,512)==Result::ShortTransfer && incomplete.commandIssues==2);
         assert(incomplete.lastCompletionFis==0);
     }
-    Mock lostFis=workstation();lostFis.injectFis=0;
+    // The Workstation restart saw CI/SACT clear, fresh DHRS and exact
+    // PRDBC while TFD still held BSY and the received FIS slot was empty.
+    for(uint32_t bytes:{512u,4096u,65536u}) {
+        Mock lagged;
+        lagged.allowStaleTaskBusy=true;
+        lagged.regs[CMD/4]=0x4c017;
+        lagged.regs[SCTL/4]=0x300;
+        lagged.injectIs=D2H_REGISTER_IRQ;
+        lagged.injectFis=0;
+        lagged.taskOnCompletion=0xc0;
+        lagged.transferredBytes=bytes;
+        lagged.stepNs=1000;
+
+        Mock settles=lagged;settles.settleAfter=2;settles.taskOnSettle=0x40;
+        settles.fisOnSettle=0x00404034;
+        assert(Submit(settles,bytes)==Result::Ok && settles.polls==2);
+        assert(settles.lastCompletionFis==0x00404034 && settles.commandIssues==1);
+
+        Mock signalOnly=lagged;
+        assert(Submit(signalOnly,bytes)==Result::Ok);
+        assert(signalOnly.now==TASK_SETTLE_NS && signalOnly.lastCompletionFis==0);
+
+        // The next submission can use the late clean FIS once it appears.
+        signalOnly.receivedFis=0x00404034;
+        signalOnly.injectFis=0x00404034;
+        assert(Submit(signalOnly,bytes)==Result::Ok && signalOnly.commandIssues==2);
+        assert(signalOnly.postedWithStaleTaskBusy);
+
+        Mock physicalLag=lagged;physicalLag.allowStaleTaskBusy=false;
+        assert(Submit(physicalLag,bytes)==Result::CompletionUnconfirmed && !physicalLag.polls);
+        Mock shortLag=lagged;--shortLag.transferredBytes;
+        assert(Submit(shortLag,bytes)==Result::ShortTransfer);
+        Mock drq=lagged;drq.taskOnCompletion=0xc8;
+        assert(Submit(drq,bytes)==Result::CompletionUnconfirmed);
+        Mock taskError=lagged;taskError.settleAfter=2;taskError.taskOnSettle=0x41;
+        assert(Submit(taskError,bytes)==Result::DeviceError);
+        Mock fisError=lagged;fisError.settleAfter=2;fisError.fisOnSettle=0x04414034;
+        assert(Submit(fisError,bytes)==Result::DeviceError);
+        Mock fatalIrq=lagged;fatalIrq.isOnPause=1u<<30;
+        assert(Submit(fatalIrq,bytes)==Result::DeviceError && fatalIrq.polls==1);
+        Mock exchange=lagged;exchange.serrOnPause=MEDIA_CHANGE_SERR;
+        assert(Submit(exchange,bytes)==Result::MediaChanged && exchange.polls==1);
+        Mock stalled=lagged;stalled.stepNs=0;
+        assert(Submit(stalled,bytes)==Result::Ok && stalled.polls==TASK_SETTLE_POLLS);
+    }
+    Mock lostFis=workstation();lostFis.injectIs=0;lostFis.injectFis=0;
     assert(Submit(lostFis,512)==Result::CompletionUnconfirmed && lostFis.commandIssues==2);
     Mock lostIssue=workstation();lostIssue.ignoredOffset=CI;lostIssue.transferredBytes=0;
     assert(Submit(lostIssue,512)==Result::CompletionUnconfirmed && lostIssue.receivedFis==0);

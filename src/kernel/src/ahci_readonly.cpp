@@ -150,6 +150,7 @@ struct PortIo {
     uint32_t lastCompletionFis=0;
     bool allowStaleTaskBusy=false;
     bool postedWithStaleTaskBusy=false;
+    bool lastDmaCompletedWithStaleTaskBusy=false;
     uint32_t receivedRegisterFis() {
         return *reinterpret_cast<volatile const uint32_t*>(dma+fisOffset+0x40);
     }
@@ -392,7 +393,7 @@ bool Run(const AhciReadPlan& plan, uint32_t expected) {
             Quarantine(result==Result::MediaChanged ? "AHCI SATA media changed" : "AHCI command failed or timed out");
         return false;
     }
-    if(io.postedWithStaleTaskBusy && !staleTaskBusyLogged && !PanicIo()) {
+    if((io.postedWithStaleTaskBusy || io.lastDmaCompletedWithStaleTaskBusy) && !staleTaskBusyLogged && !PanicIo()) {
         staleTaskBusyLogged=true;
         SerialPrintf("ahci: VMware stale task status recovered port=%u op=0x%x bytes=%u\n",
                      status.port,unsigned(plan.fis[2]),expected);

@@ -98,13 +98,18 @@ template<class Io> Result ArmCommand(Io& io) {
             task=io.read(TFD);
             if(CommandError(io,pending,task))return Result::DeviceError;
         }
-        postWithBusyShadow=io.allowStaleTaskBusy &&
-            StaleBusyShadow(task,pending,io.lastCompletionFis) &&
-            io.receivedRegisterFis()==io.lastCompletionFis;
+        if(io.allowStaleTaskBusy) {
+            const uint32_t fis=io.receivedRegisterFis();
+            // A DMA completion accepted before the received FIS appeared
+            // may supply its late, clean FIS during this pre-issue wait.
+            postWithBusyShadow=StaleBusyShadow(task,pending,fis) &&
+                (fis==io.lastCompletionFis || io.lastDmaCompletedWithStaleTaskBusy);
+        }
         if((task&TASK_ACTIVE) && !postWithBusyShadow)return Result::DeviceBusy;
     }
     if(io.read(CI) || io.read(SACT))return Result::Busy;
     io.lastCompletionFis=0;
+    io.lastDmaCompletedWithStaleTaskBusy=false;
     io.clearReceivedRegisterFis();
     // Preserve error and hotplug latches even if one asserts during W1C.
     io.write(IS,~(MEDIA_CHANGE_IRQ|ERROR_MASK));io.fence();
@@ -170,14 +175,38 @@ template<class Io> bool Quiesce(Io& io) {
 // reset PRDBC can prove a new write succeeded. AHCI 1.3.1 §§5.3.8.1–2
 // require the HBA to publish status and PRDBC before clearing the slot.
 template<class Io> Result CompleteCommand(Io& io, uint32_t expectedBytes) {
-    io.fence();
-    uint32_t completed=io.read(IS);
-    if(MediaChanged(io,completed))return Result::MediaChanged;
-    if(io.read(CI) || io.read(SACT))return Result::Busy;
-    const uint32_t task=io.read(TFD), fis=io.receivedRegisterFis();
-    if(CommandError(io,completed,task) || (RegisterFis(fis) && ((fis>>16)&TASK_ERROR)))
-        return Result::DeviceError;
-    if(RegisterFis(fis) && ((fis>>16)&TASK_ACTIVE))return Result::CompletionUnconfirmed;
+    uint32_t completed,task,fis;
+    const auto sample=[&] {
+        io.fence();
+        completed=io.read(IS);
+        if(MediaChanged(io,completed))return Result::MediaChanged;
+        if(io.read(CI) || io.read(SACT))return Result::Busy;
+        task=io.read(TFD);
+        fis=io.receivedRegisterFis();
+        if(CommandError(io,completed,task) || (RegisterFis(fis) && ((fis>>16)&TASK_ERROR)))
+            return Result::DeviceError;
+        return Result::Ok;
+    };
+    const auto activeFis=[&] { return RegisterFis(fis) && ((fis>>16)&TASK_ACTIVE); };
+    const auto activeTask=[&] {
+        return (task&TASK_ACTIVE) && !(io.allowStaleTaskBusy && StaleBusyShadow(task,completed,fis));
+    };
+    auto result=sample();
+    if(result!=Result::Ok)return result;
+    const bool vmwareDma=io.allowStaleTaskBusy && expectedBytes;
+    if(vmwareDma && (activeTask() || activeFis())) {
+        // Workstation can clear CI before publishing the received FIS
+        // and dropping the TFD busy shadow. Recheck for late faults too.
+        const uint64_t start=io.nowNs();
+        for(unsigned poll=0;poll<TASK_SETTLE_POLLS && (activeTask() || activeFis());++poll) {
+            const uint64_t now=io.nowNs();
+            if(now<start || now-start>=TASK_SETTLE_NS)break;
+            io.pause();
+            result=sample();
+            if(result!=Result::Ok)return result;
+        }
+    }
+    if(activeFis())return Result::CompletionUnconfirmed;
     const bool cleanFis=CleanRegisterFis(fis);
     if(!expectedBytes) {
         const uint32_t engine=io.read(CMD);
@@ -185,10 +214,15 @@ template<class Io> Result CompleteCommand(Io& io, uint32_t expectedBytes) {
         // CI alone is insufficient for no-data commands if the issue write was lost.
         if(!(completed&D2H_REGISTER_IRQ) || !cleanFis)return Result::CompletionUnconfirmed;
     }
-    if((task&TASK_ACTIVE) && !(io.allowStaleTaskBusy && StaleBusyShadow(task,completed,fis)))
-        return Result::CompletionUnconfirmed;
+    // ArmCommand cleared the FIS and acknowledged old DHRS before issuing.
+    // On this virtual HBA only, fresh DHRS and the full new byte count
+    // confirm retired DMA even if the receive buffer still reads empty
+    // and PxTFD is exactly the observed BSY|DRDY shadow.
+    const bool delayedFis=vmwareDma && task==0xc0u && !fis && (completed&D2H_REGISTER_IRQ);
+    if(activeTask() && !delayedFis)return Result::CompletionUnconfirmed;
     if(io.transferred()!=expectedBytes)return Result::ShortTransfer;
     if(cleanFis)io.lastCompletionFis=fis;
+    io.lastDmaCompletedWithStaleTaskBusy=delayedFis;
     return Result::Ok;
 }
 
