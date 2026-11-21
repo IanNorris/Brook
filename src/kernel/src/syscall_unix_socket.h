@@ -55,6 +55,7 @@ struct UnixFdQueue {
     uint64_t written, read;
     // Renderer output direction. Read and written under g_unixRegistryLock.
     uint64_t gpuRendererRetiredIncarnation;
+    bool gpuRendererRestartClaimed;
     volatile int head;
     volatile int tail;
     volatile uint32_t refCount; // one ref per UnixSocketData pointing at us

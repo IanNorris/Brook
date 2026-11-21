@@ -309,9 +309,15 @@ int64_t sys_brook_gpu_window_peer_recovery(uint64_t fdValue,uint64_t op,uint64_t
         UnixShutdownDirection(socket->rxPipe,false);
         UnixShutdownDirection(socket->txPipe,true);
         SpinLockAcquire(&g_unixRegistryLock);
-        socket->peerIncomingFds->gpuRendererRetiredIncarnation=owner;
+        auto& direction=*socket->peerIncomingFds;
+        int result=-EPERM;
+        if(direction.gpuRendererRestartClaimed)result=-16; // EBUSY
+        else if(!direction.gpuRendererRetiredIncarnation || direction.gpuRendererRetiredIncarnation==owner){
+            direction.gpuRendererRetiredIncarnation=owner;
+            result=0;
+        }
         SpinLockRelease(&g_unixRegistryLock);
-        return 0;
+        return result;
     }
     UnixCredentials peer{};uint64_t peerIncarnation=0;bool authorized=false,retired=false;
     SpinLockAcquire(&g_unixRegistryLock);
@@ -339,8 +345,19 @@ int64_t sys_brook_gpu_window_peer_recovery(uint64_t fdValue,uint64_t op,uint64_t
         if(retired || !brook::BdwOffscreenRendererOwnedBy(peerIncarnation))return 0;
         auto* target=SchedulerFindProcessReference(static_cast<uint16_t>(peer.pid));
         if(!target)return -ESRCH;
-        const int result=!target->isThread && !target->isKernelThread && target->incarnation==peerIncarnation
-            ? ProcessSendSignal(target,9,nullptr,proc) : -116; // ESTALE
+        if(target->isThread || target->isKernelThread || target->incarnation!=peerIncarnation){
+            ProcessUnref(target);
+            return -116; // ESTALE
+        }
+        // Give receipt and escalation one winning decision on this channel.
+        // Resolve the process first, and signal outside the registry lock.
+        SpinLockAcquire(&g_unixRegistryLock);
+        auto* direction=socket->incomingFds;
+        const bool restart=direction && !direction->gpuRendererRestartClaimed &&
+            direction->gpuRendererRetiredIncarnation!=peerIncarnation;
+        if(restart)direction->gpuRendererRestartClaimed=true;
+        SpinLockRelease(&g_unixRegistryLock);
+        const int result=restart?ProcessSendSignal(target,9,nullptr,proc):0;
         ProcessUnref(target);
         return result;
     }
