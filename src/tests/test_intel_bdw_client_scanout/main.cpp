@@ -115,9 +115,52 @@ static void CheckObserver(){
     assert(!flip.Poll(io) && !flip.CanObserve() && flip.Contains(first.base));
 }
 
+static void CheckRepeatedObserverHandoffs(){
+    constexpr BdwClientScanoutLayout linear{12800,false}, tiled{13312,true};
+    FakeDisplay io;
+    BdwClientScanoutFlip flip;
+    BdwClientLatchObserver observer;
+    for(unsigned cycle=0;cycle<1024;++cycle){
+        const BdwClientScanoutImage first{0x10000000,1+2ull*cycle,linear};
+        const BdwClientScanoutImage next{0x12000000,2+2ull*cycle,tiled};
+        observer.SetEnabled(true);
+        assert(flip.Arm(io,first,0) && observer.QueueWake(flip.CanObserve()));
+        assert(!observer.MayPoll(flip.CanObserve(),true,false));
+        assert(!observer.MayPoll(flip.CanObserve(),false,true));
+        io.Vblank();
+        observer.ConsumeWake();
+        assert(flip.Contains(first.base) && !flip.Front().base);
+        assert(observer.MayPoll(flip.CanObserve(),false,false) && flip.Poll(io));
+
+        assert(flip.Arm(io,next,0) && observer.QueueWake(flip.CanObserve()));
+        observer.SetEnabled(false);
+        assert(!observer.MayPoll(flip.CanObserve(),false,false));
+        observer.SetEnabled(true);
+        assert(!observer.QueueWake(flip.CanObserve()));
+        if(cycle&1){
+            // Exit fullscreen while a replacement is still armed. The AP
+            // no longer owns this decision and both images stay pinned.
+            assert(flip.Restore(io,0));
+            assert(!observer.MayPoll(flip.CanObserve(),false,false));
+            assert(!flip.Poll(io) && flip.Contains(first.base) && flip.Contains(next.base));
+        }else{
+            // Capture or verify can leave the proof to the original poll.
+            assert(!observer.MayPoll(flip.CanObserve(),cycle&2,!(cycle&2)));
+            io.Vblank();
+            assert(flip.Poll(io) && !flip.Contains(first.base) && flip.Contains(next.base));
+            assert(flip.Restore(io,0) && !flip.Poll(io) && flip.Contains(next.base));
+        }
+        observer.ConsumeWake();
+        io.Vblank();
+        assert(flip.Poll(io) && !flip.Contains(first.base) && !flip.Contains(next.base));
+        assert(!flip.Busy() && !observer.QueueWake(flip.CanObserve()));
+    }
+}
+
 int main(){
     CheckTimeline();
     CheckObserver();
+    CheckRepeatedObserverHandoffs();
     constexpr BdwClientScanoutLayout linear{12800,false}, tiled{13312,true};
     assert(linear.Valid() && tiled.Valid() && tiled.Pages()>linear.Pages());
     assert((!BdwClientScanoutLayout{12864,true}.Valid()));
