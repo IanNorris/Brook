@@ -180,27 +180,40 @@ def grow_selected_store(image, size, limit, auto, required_free=MIN_FREE):
     return size
 
 
-def format_store(image, size, seed, identifier, inodes, limit, auto):
+def format_store(image, size, seed, identifier, inodes, limit, auto, *, selected=False):
     args = ['mke2fs', '-q', '-t', 'ext2', '-b', '4096', '-I', '128', '-m', '0',
             '-N', str(inodes), '-O', 'none,filetype,sparse_super,large_file',
             '-U', identifier, '-L', 'BRKDESKTOP', '-d', seed, image]
+    requested = size
     while True:
         with image.open('wb') as stream:
             stream.truncate(size)
-        if not auto:
+        if not auto and not selected:
             run(*args)
             return size
         result = subprocess.run(list(map(str, args)), cwd=ROOT, text=True, capture_output=True,
                                 env=dict(os.environ, LC_ALL='C'))
         if result.returncode == 0:
+            if not auto and size > requested:
+                try:
+                    generation = profile_generation_footprint(image)
+                    recommended = grow_selected_store(image, size, limit, True,
+                                                      MIN_FREE + generation['bytes'])
+                finally:
+                    image.unlink()
+                raise ValueError(f'Selected store needs at least {recommended // MIB} MiB '
+                                 'for the image, staging and package installs')
             if result.stderr:
                 print(result.stderr, end='')
             return size
         # mke2fs can run out of space before writing a complete filesystem.
         # Retry only that condition, on our own private image file.
         grown = min(size + max(size // (4 * MIB), 128) * MIB, limit // MIB * MIB)
-        if 'Could not allocate block' not in result.stderr or grown <= size:
+        exhausted = any(f'Could not allocate {item}' in result.stderr for item in ('block', 'inode'))
+        if not exhausted:
             raise ValueError(f'Could not format selected store at {size // MIB} MiB: {result.stderr.strip()}')
+        if grown <= size:
+            raise ValueError(f'Selected store cannot fit within the {limit // MIB} MiB target limit')
         size = grown
 
 
@@ -336,7 +349,8 @@ def main():
         entries = tree_entries(seed)
         reserve = tree_entries(seed/STAGE_GENERATION.lstrip('/')) if selection else 0
         inodes = max(size // 32768, entries + max(32768, entries // 8) + reserve)
-    size = format_store(image, size, seed, identifier, inodes, limit, args.auto_size)
+    size = format_store(image, size, seed, identifier, inodes, limit, args.auto_size,
+                        selected=selection is not None)
     generation_reserve = None
     if selection:
         # A stage creates a complete generation before replacing the alias.

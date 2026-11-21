@@ -151,6 +151,21 @@ class SelectedQemuTest(unittest.TestCase):
                 prepare_hardware_store.grow_selected_store(
                     image, 1664 * mib, 4096 * mib, False, 512 * mib + reserve['bytes'])
 
+    def test_explicit_store_reports_a_verified_capacity_after_format_exhaustion(self):
+        mib = prepare_hardware_store.MIB
+        image = self.root / 'STORE.IMG'
+        first = subprocess.CompletedProcess([], 1, stderr='Could not allocate block')
+        second = subprocess.CompletedProcess([], 0, stderr='')
+        with patch('prepare_hardware_store.subprocess.run', side_effect=[first, second]):
+            with patch('prepare_hardware_store.profile_generation_footprint', return_value={'bytes': 10 * mib}):
+                with patch('prepare_hardware_store.grow_selected_store', return_value=2420 * mib) as grow:
+                    with self.assertRaisesRegex(ValueError, 'at least 2420 MiB'):
+                        prepare_hardware_store.format_store(
+                            image, 1600 * mib, self.root, 'fixture', 100, 4096 * mib,
+                            False, selected=True)
+                    grow.assert_called_once_with(image, 2000 * mib, 4096 * mib, True, 522 * mib)
+        self.assertFalse(image.exists())
+
     def test_usb_requires_usb_profile_boot_capability_and_xhci(self):
         image = self.root / 'STORE.IMG'
         image.write_bytes(b'image')
