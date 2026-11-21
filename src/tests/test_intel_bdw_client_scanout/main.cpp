@@ -2,6 +2,7 @@
 #include <cassert>
 #include <cstdint>
 #include "intel_bdw_client_scanout.h"
+#include "intel_bdw_client_timeline.h"
 
 using namespace brook;
 
@@ -35,7 +36,44 @@ struct FakeDisplay {
     void Vblank(){++frame;live=base;}
 };
 
+static void CheckTimeline(){
+    BdwClientTimeline timeline;
+    BdwClientTimelineEntry rows[BdwClientTimeline::Capacity];
+    assert(!timeline.Read(rows,BdwClientTimeline::Capacity));
+    const uint64_t first=timeline.Admit(10,41,80,false,1000);
+    timeline.Flushed(first,1001,1008);
+    timeline.Armed(first,1012);
+    timeline.Latched(first,1020);
+    const uint64_t second=timeline.Admit(10,42,81,true,1021);
+    timeline.Flushed(second,1024,1032);
+    timeline.Armed(second,1034);
+    assert(timeline.Read(rows,2)==2 && !rows[0].retiredNs && !rows[1].latchNs);
+    timeline.Latched(second,1040);
+    timeline.Retired(first,1041,BdwClientRetirement::Replacement,second);
+    assert(timeline.Read(rows,2)==2 && rows[0].sequence==first && rows[1].sequence==second);
+    assert(rows[0].owner==10 && rows[0].offer==41 && rows[0].buffer==80 && !rows[0].publishOnAp);
+    assert(rows[0].admittedNs==1000 && rows[0].flushStartNs==1001 && rows[0].flushEndNs==1008);
+    assert(rows[0].armNs==1012 && rows[0].latchNs==1020 && rows[0].retiredNs==1041);
+    assert(rows[0].retiredBy==rows[1].sequence && rows[0].retirement==BdwClientRetirement::Replacement);
+    assert(rows[1].publishOnAp && rows[1].latchNs<rows[0].retiredNs);
+    timeline.Retired(second,1044,BdwClientRetirement::Restore);
+    const uint64_t failed=timeline.Admit(11,42,82,true,1045);
+    timeline.Retired(failed,1046,BdwClientRetirement::Rejected);
+    assert(timeline.Read(rows,2)==2 && rows[0].retirement==BdwClientRetirement::Restore && !rows[0].retiredBy);
+    assert(rows[1].retirement==BdwClientRetirement::Rejected && !rows[1].armNs && !rows[1].flushStartNs);
+
+    for(uint32_t i=0;i<BdwClientTimeline::Capacity;++i)timeline.Admit(12,100+i,83,false,2000+i);
+    timeline.Retired(first,3000,BdwClientRetirement::Restore);
+    timeline.Flushed(second,3001,3002);
+    assert(timeline.Read(rows,BdwClientTimeline::Capacity)==BdwClientTimeline::Capacity);
+    for(uint32_t i=0;i<BdwClientTimeline::Capacity;++i){
+        assert(rows[i].offer==100+i && rows[i].owner==12 && rows[i].buffer==83);
+        assert(!rows[i].flushStartNs && !rows[i].retiredNs);
+    }
+}
+
 int main(){
+    CheckTimeline();
     constexpr BdwClientScanoutLayout linear{12800,false}, tiled{13312,true};
     assert(linear.Valid() && tiled.Valid() && tiled.Pages()>linear.Pages());
     assert((!BdwClientScanoutLayout{12864,true}.Valid()));

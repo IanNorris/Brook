@@ -7708,6 +7708,31 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             r.text(",\"scope\":\"pipe A CRC (primary plane) of the front image, twice before and twice after a CLFLUSH of every line of it; a change means the display was scanning stale memory. Keep the desktop idle.\"}\n");
             r.send();return;
         }
+        if(NetStrEq(cmd,"gpu zerocopy client-timeline")){
+            BdwClientTimelineEntry entries[BdwClientTimeline::Capacity];
+            const uint32_t n=BdwClientScanoutReadTimeline(entries,BdwClientTimeline::Capacity);
+            BridgeReply r;r.text("{");r.field("count",n);
+            r.text(",\"clock\":\"monotonic\",\"columns\":[\"sequence\",\"owner\",\"offer\",\"buffer\",\"worker\",\"admitted_us\",\"flush_start_us\",\"flush_end_us\",\"arm_us\",\"latch_us\",\"retired_us\",\"retired_by\",\"retirement\"],\"rows\":[");
+            for(uint32_t i=0;i<n;++i){
+                const auto& e=entries[i];
+                if(i)r.text(",");
+                r.text("[");r.number(e.sequence);r.text(",");r.number(e.owner);r.text(",");
+                r.number(e.offer);r.text(",");r.number(e.buffer);r.text(",");r.quoted(e.publishOnAp?"ap":"bsp");
+                r.text(",");r.number(e.admittedNs/1000);r.text(",");r.number(e.flushStartNs/1000);
+                r.text(",");r.number(e.flushEndNs/1000);r.text(",");r.number(e.armNs/1000);
+                r.text(",");r.number(e.latchNs/1000);r.text(",");r.number(e.retiredNs/1000);
+                r.text(",");r.number(e.retiredBy);r.text(",");
+                switch(e.retirement){
+                    case BdwClientRetirement::Held:r.quoted("held");break;
+                    case BdwClientRetirement::Replacement:r.quoted("replacement");break;
+                    case BdwClientRetirement::Restore:r.quoted("restore");break;
+                    case BdwClientRetirement::Rejected:r.quoted("rejected");break;
+                }
+                r.text("]");
+            }
+            r.text("],\"scope\":\"client direct scanout, oldest first; offer is renderer frame ID, buffer is DMA-BUF inode, zero time means phase not reached; latch is observed in hardware; retired is release of the kernel buffer hold; retired_by is the replacement sequence, or zero on restore or failure\"}\n");
+            r.send();return;
+        }
         if(NetStrEq(cmd,"gpu zerocopy timeline")){
             static BdwZeroCopyTimelineEntry entries[64];uint64_t khz=0;
             const uint32_t n=BdwZeroCopyReadTimeline(entries,64,khz);
@@ -7738,7 +7763,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             ok=BdwClientScanoutSetApPublication(NetStrEq(cmd,"gpu zerocopy publish ap"));
             note=ok?"client publication worker set for new requests":"client publication worker unavailable";
         }else if(!NetStrEq(cmd,"gpu zerocopy status")){
-            DebugChannelSend("{\"error\":\"usage: gpu zerocopy arm|off|status|verify|timeline|cache flush|cache uc|cache wt|publish bsp|publish ap\"}\n");return;
+            DebugChannelSend("{\"error\":\"usage: gpu zerocopy arm|off|status|verify|timeline|client-timeline|cache flush|cache uc|cache wt|publish bsp|publish ap\"}\n");return;
         }
         BdwZeroCopyStatus z{};BdwZeroCopyReadStatus(z);
         BridgeReply r;r.text("{\"ok\":");r.text(ok?"true":"false");r.text(",\"note\":");r.quoted(note);

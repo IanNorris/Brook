@@ -30,6 +30,7 @@
 #include "memory/physical_memory.h"
 #include "memory/heap.h"
 #include "native_tsc_observe.h"
+#include "tsc_clock.h"
 #include "boot_protocol/boot_protocol.h"
 #include "acpi.h"
 #include "apic.h"
@@ -477,6 +478,9 @@ struct ClientMapping {
     uint64_t* snapshot=nullptr;
     bool held=false;
     bool quarantined=false;
+#if defined(BROOK_GPU_SUBMISSION_TIMING)
+    uint64_t timelineSequence=0;
+#endif
     uint32_t Base() const {return reservation.first*4096;}
 };
 ClientMapping clientMappings[BdwClientScanoutSlots];
@@ -488,7 +492,14 @@ struct ClientRequest {
     bool publishOnAp=false;
     BdwClientPublication publication{};
     uint64_t flushTicks=0;
+#if defined(BROOK_GPU_SUBMISSION_TIMING)
+    uint64_t timelineSequence=0;
+#endif
 } clientRequest;
+#if defined(BROOK_GPU_SUBMISSION_TIMING)
+BdwClientTimeline clientTimeline;
+uint64_t clientArmedSequence=0;
+#endif
 KSemaphore clientPublicationWake{};
 uint32_t clientPublicationStarted=0;
 bool clientPublishOnAp=false;
@@ -517,6 +528,11 @@ void ClientPollLocked(){
         if(clientFlip.Uncertain() && !restoring)ClientRestoreLocked(true);
         return;
     }
+#if defined(BROOK_GPU_SUBMISSION_TIMING)
+    const uint64_t successor=restoring?0:clientArmedSequence;
+    if(successor)clientTimeline.Latched(successor,ElapsedClockNs());
+    clientArmedSequence=0;
+#endif
     if(restoring){
         ++clientRestores;
         if(clientGopRestore){
@@ -531,6 +547,11 @@ void ClientPollLocked(){
         if(mapping.held && !clientFlip.Contains(mapping.Base())){
             // Do not tell the renderer to send SAFE before permitting writes.
             BdwGpuBufferEndCpuTransition(mapping.buffer);
+#if defined(BROOK_GPU_SUBMISSION_TIMING)
+            clientTimeline.Retired(mapping.timelineSequence,ElapsedClockNs(),
+                restoring?BdwClientRetirement::Restore:BdwClientRetirement::Replacement,successor);
+            mapping.timelineSequence=0;
+#endif
             mapping.held=false;
         }
     }
@@ -1425,14 +1446,21 @@ static bool PublishClientRequest(bool onAp,bool canPresent){
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
     const uint64_t start=Rdtsc();
 #endif
-    const bool published=canPresent && !request.publication.Cancelled() &&
-        BdwGpuBufferSyncCpuCachePages(request.buffer,request.layout.Pages());
+    const bool flush=canPresent && !request.publication.Cancelled();
+#if defined(BROOK_GPU_SUBMISSION_TIMING)
+    const uint64_t flushStart=flush?ElapsedClockNs():0;
+#endif
+    const bool published=flush && BdwGpuBufferSyncCpuCachePages(request.buffer,request.layout.Pages());
+#if defined(BROOK_GPU_SUBMISSION_TIMING)
+    const uint64_t flushEnd=flush?ElapsedClockNs():0;
+#endif
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
     const uint64_t ticks=Rdtsc()-start;
 #endif
     f=IrqSpinLockAcquire(&lock);
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
     clientRequest.flushTicks=ticks;
+    clientTimeline.Flushed(request.timelineSequence,flushStart,flushEnd);
 #endif
     clientRequest.publication.Finish(published);
     IrqSpinLockRelease(&lock,f);
@@ -1488,6 +1516,10 @@ int64_t BdwClientScanoutPresent(uint64_t owner,BdwGpuBuffer* buffer,const BdwCli
             (!cursorPlane.enabled() || cursorStatus.active) && BdwGpuBufferBeginCpuTransition(buffer)){
         BdwGpuBufferRef(buffer);
         clientRequest={buffer,layout,owner,offer,publishOnAp};
+#if defined(BROOK_GPU_SUBMISSION_TIMING)
+        clientRequest.timelineSequence=clientTimeline.Admit(owner,offer,BdwGpuBufferIdentity(buffer),
+                                                            publishOnAp,ElapsedClockNs());
+#endif
         ++clientPresents;
         result=0;
     }
@@ -1497,6 +1529,17 @@ int64_t BdwClientScanoutPresent(uint64_t owner,BdwGpuBuffer* buffer,const BdwCli
         else (void)BdwClientScanoutWakeWorker();
     }
     return result;
+}
+uint32_t BdwClientScanoutReadTimeline(BdwClientTimelineEntry* out,uint32_t max){
+#if defined(BROOK_GPU_SUBMISSION_TIMING)
+    const uint64_t f=IrqSpinLockAcquire(&lock);
+    const uint32_t count=clientTimeline.Read(out,max);
+    IrqSpinLockRelease(&lock,f);
+    return count;
+#else
+    (void)out;(void)max;
+    return 0;
+#endif
 }
 int64_t BdwClientScanoutStatus(uint64_t owner,BrookGpuClientScanoutStatus& out){
     const uint64_t f=IrqSpinLockAcquire(&lock);
@@ -1568,9 +1611,17 @@ bool BdwClientScanoutService(bool canPresent){
             accepted=clientFlip.Arm(io,{choice->Base(),BdwGpuBufferIdentity(request.buffer),request.layout},
                                     zcRing.Surface(zcRing.Front()));
         }
-        if(accepted)choice->held=true;
-        else {
+        if(accepted){
+            choice->held=true;
+#if defined(BROOK_GPU_SUBMISSION_TIMING)
+            clientArmedSequence=choice->timelineSequence=request.timelineSequence;
+            clientTimeline.Armed(clientArmedSequence,ElapsedClockNs());
+#endif
+        }else{
             BdwGpuBufferEndCpuTransition(request.buffer);
+#if defined(BROOK_GPU_SUBMISSION_TIMING)
+            clientTimeline.Retired(request.timelineSequence,ElapsedClockNs(),BdwClientRetirement::Rejected);
+#endif
             clientError=bound?-11:-5;clientFailedOffer=request.offer;
             if(!ClientShowing())clientLeaving=false;
         }
@@ -1704,6 +1755,7 @@ bool BdwClientScanoutWorkPending(){return false;}
 bool BdwClientScanoutService(bool){return false;}
 bool BdwClientScanoutSetApPublication(bool){return false;}
 bool BdwClientScanoutApPublication(){return false;}
+uint32_t BdwClientScanoutReadTimeline(BdwClientTimelineEntry*,uint32_t){return 0;}
 bool BdwCursorRequest(bool){return false;}
 BdwCursorStatus BdwCursorReadStatus(){return {};}
 uint64_t BdwCursorRendererQuery(uint64_t,bool,bool& suppress){suppress=false;return 0;}
