@@ -2415,6 +2415,11 @@ int main(int argc,char **argv){
         else if(!strcmp(bufferCount,"3"))depth=BROOK_GPU_HANDOFF_MAX_DEPTH;
         else {fprintf(stderr,"BROOK_RENDER_BUFFER_COUNT must be 2 or 3\n");return 2;}
     }
+    /* Only the kernel's forced termination should report this wait status. */
+    struct sigaction ignore_restart_signal={0};
+    ignore_restart_signal.sa_handler=SIG_IGN;
+    sigemptyset(&ignore_restart_signal.sa_mask);
+    if(sigaction(BROOK_GPU_WINDOW_RESTART_SIGNAL,&ignore_restart_signal,NULL))return 1;
     int drm=open("/dev/dri/renderD129",O_RDWR|O_CLOEXEC);if(drm<0){perror("desktop render node");return 1;}
     const unsigned attachDepth=depth>BROOK_GPU_HANDOFF_DEFAULT_DEPTH?depth:0;
     if(syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_ATTACH,attachDepth,0,0,0,0)){perror("desktop attach");close(drm);return 1;}

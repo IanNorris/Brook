@@ -88,6 +88,7 @@ struct UnixSocketData {
     uint64_t peerIncarnation,peerLaunchId;
     bool acceptedEndpoint; // Only accept(), never connect() or socketpair().
     bool gpuPeerAuthorized; // exact connected renderer was checked while attached
+    uint64_t connectingIncarnation; // captured on connect, never supplied by userspace
     char    path[108];
     Vnode* boundNode; // Owns an inode pin even after unlink; close never unlinks.
     uint64_t boundDev, boundIno;

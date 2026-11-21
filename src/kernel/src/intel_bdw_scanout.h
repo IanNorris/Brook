@@ -13,6 +13,8 @@ struct BdwGpuBuffer;struct BdwFence;
 // producer writes and retains the source through the consumer's completion.
 int64_t BdwAcquireApplicationBufferFence(BdwGpuBuffer*,BdwFence**);
 bool BdwOffscreenRendererOwnedBy(uint64_t owner);
+enum class BdwRendererRecovery { NoOwner, Idle, Pending };
+BdwRendererRecovery BdwOffscreenRendererRecovery(uint64_t owner);
 // Builds and releases private command images only; does not access hardware.
 bool BdwPreparePrivateImages();
 bool BdwPreparePrivateRenderImages(uint32_t (&staging)[20*1024]);

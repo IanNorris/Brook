@@ -3527,7 +3527,8 @@ static struct brook_image *intel_dmabuf_snapshot(const struct brook_dmabuf_buffe
  *  - after renderer loss, PEER_DRAIN waits until the old renderer is reaped.
  * An image whose offer awaits the renderer needs no timer: its SAFE or
  * PRESENTED arrives on the channel fd. */
-enum { INTEL_PENDING_LIMIT=64,INTEL_RETRY_MS=2,INTEL_RETRY_DRAIN_MS=10,INTEL_PEER_DRAIN_MS=2000 };
+enum { INTEL_PENDING_LIMIT=64,INTEL_RETRY_MS=2,INTEL_RETRY_DRAIN_MS=10,
+       INTEL_PEER_DRAIN_MS=5000,INTEL_PEER_RESTART_RETRY_MS=250 };
 static struct brook_image *g_intel_pending_head,*g_intel_pending_tail;
 static unsigned g_intel_pending_count;
 static uint64_t g_intel_queued,g_intel_ready,g_intel_busy,g_intel_failed;
@@ -3564,6 +3565,7 @@ static int g_gpu_window_channel=-1;
 static int g_gpu_window_dead=-1;
 static uint32_t g_gpu_peer_lost_ms;
 static int g_gpu_peer_restart_asked, g_gpu_peer_restart_error;
+static uint32_t g_gpu_peer_restart_attempt_ms;
 static const char *g_gpu_disconnect_reason = "none";
 static const char *g_gpu_connect_refusal = "none";
 static const char *g_gpu_connect_last_nonempty_refusal = "none";
@@ -3640,6 +3642,7 @@ static void gpu_window_channel_lost(const char *reason){
             g_gpu_window_dead=g_gpu_window_channel;
             g_gpu_peer_lost_ms=g_now_ms();
             g_gpu_peer_restart_asked=g_gpu_peer_restart_error=0;
+            g_gpu_peer_restart_attempt_ms=0;
         }
     }
     g_gpu_window_channel=-1;
@@ -3652,12 +3655,16 @@ static void gpu_window_reap_dead(void){
     close(g_gpu_window_dead);g_gpu_window_dead=-1;
 }
 static void gpu_window_maybe_restart(void){
+    const uint32_t now=g_now_ms();
     if(g_gpu_window_dead<0 || g_gpu_peer_restart_asked ||
-       g_now_ms()-g_gpu_peer_lost_ms<INTEL_PEER_DRAIN_MS)return;
-    g_gpu_peer_restart_asked=1;
+       now-g_gpu_peer_lost_ms<INTEL_PEER_DRAIN_MS)return;
+    if(g_gpu_peer_restart_error==EAGAIN &&
+       now-g_gpu_peer_restart_attempt_ms<INTEL_PEER_RESTART_RETRY_MS)return;
+    g_gpu_peer_restart_attempt_ms=now;
     long result=syscall(BROOK_SYS_GPU_WINDOW_PEER_RECOVERY,(long)g_gpu_window_dead,
                         (long)BROOK_GPU_WINDOW_PEER_RESTART,0L,0L,0L,0L);
     g_gpu_peer_restart_error=result<0?errno:0;
+    g_gpu_peer_restart_asked=g_gpu_peer_restart_error!=EAGAIN;
 }
 static int gpu_window_channel_event(int fd,uint32_t mask,void *unused){
     (void)fd;(void)unused;

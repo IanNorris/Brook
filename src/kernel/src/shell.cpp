@@ -11,6 +11,7 @@
 // just enough to launch programs and inspect system state.
 
 #include "shell.h"
+#include "gpu_window_peer_retirement.h"
 #include "shutdown.h"
 #include "memory/oom_recovery.h"
 #include "exec_image.h"
@@ -483,7 +484,7 @@ static int SpawnProcess(const char* path, int argc, const char* const* argv,
                              uint32_t gidOverride = CredentialUnchanged,
                              bool strace = false, bool straceErrors = false,
                              bool quiet = false, bool trackLaunch = true, bool service = false,
-                             bool consoleOutput = false)
+                             bool consoleOutput = false, bool guardedDesktopBoot = false)
 {
     if(!ShutdownLaunchAllowed()) {
         KPrintf("shell: shutdown in progress\n");return -108;
@@ -651,6 +652,12 @@ static int SpawnProcess(const char* path, int argc, const char* const* argv,
     if (straceErrors) KPrintf("[strace-errors enabled for pid %u]\n", proc->pid);
     else if (strace) KPrintf("[strace enabled for pid %u]\n", proc->pid);
     ++g_spawnCount;
+    // Only direct launches from the admitted boot script can mint the provider
+    // pin. A later shell command, fork, or arbitrary executable cannot claim it.
+    if (guardedDesktopBoot && service && uid == DesktopUid &&
+        (StrEq(executablePath, "/boot/INTLWL.ELF") || StrEq(executablePath, "/BOOT/INTLWL.ELF")) &&
+        GpuWindowPinBootProvider(proc->incarnation))
+        KPrintf("gpu-window: pinned boot provider pid=%u incarnation=%lu\n", proc->pid, proc->incarnation);
     SchedulerAddProcess(proc);
     return pid;
 }
@@ -798,7 +805,7 @@ static void WallpaperLoaderThread(void* /*arg*/)
     }
 }
 
-static int ExecCommand(int argc, const char* const* argv)
+static int ExecCommand(int argc, const char* const* argv, bool guardedDesktopBoot = false)
 {
     if (argc == 0) return 0;
 
@@ -1247,7 +1254,8 @@ static int ExecCommand(int argc, const char* const* argv)
                                 strace, straceErrors, quiet, !runOnce, service, consoleOutput);
         }
         return SpawnProcess(shebangPath, effArgc, effArgv, uidOverride, gidOverride,
-                            strace, straceErrors, quiet, !runOnce, service, consoleOutput);
+                            strace, straceErrors, quiet, !runOnce, service, consoleOutput,
+                            guardedDesktopBoot && StrEq(argv[pathIdx], "/boot/INTLWL.ELF"));
     }
 
     // Built-in: wait — block until all user processes finish
@@ -1891,7 +1899,7 @@ Process* ShellCreateDebugJob(int argc, const char* const* argv, const char* cwd,
     return proc;
 }
 
-int ShellExecScript(const char* path)
+static int ExecScript(const char* path, bool guardedDesktopBoot)
 {
     ShellDispatchGuard dispatch;
     Vnode* vn = VfsOpen(path, 0);
@@ -1926,7 +1934,7 @@ int ShellExecScript(const char* path)
         int argc = ParseLine(line, argv, MAX_ARGS);
         if (argc > 0)
         {
-            if (ExecCommand(argc, argv) < 0) result = -1;
+            if (ExecCommand(argc, argv, guardedDesktopBoot) < 0) result = -1;
         }
     }
 
@@ -1935,6 +1943,16 @@ int ShellExecScript(const char* path)
 
     SerialPrintf("SHELL: script '%s' finished\n", path);
     return result;
+}
+
+int ShellExecScript(const char* path)
+{
+    return ExecScript(path, false);
+}
+
+int ShellExecGuardedDesktop()
+{
+    return ExecScript("/boot/INIT.RC", true);
 }
 
 int ShellExecString(const char* script)

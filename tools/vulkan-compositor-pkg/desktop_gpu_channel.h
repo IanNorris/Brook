@@ -140,6 +140,9 @@ static inline void desktop_gpu_channel_disconnect(struct DesktopGpuChannel *c){
     if(old>=0){
         // The renderer thread will no longer select this channel's offers.
         // Already submitted jobs and scanout remain pinned by the kernel.
+        // Imported binary sync-fd waits enter the kernel during vkQueueSubmit.
+        // Deferred driver submission or timeline wait-before-signal would need
+        // a separate submission barrier before publishing this receipt.
         (void)DESKTOP_GPU_RETIRE_PEER(old);
         close(old);++c->disconnected;
     }

@@ -26,6 +26,7 @@ static int test_ioctl(int fd,unsigned long request,...);
 #ifdef BROOK_DIRECT_TEST
 static int resize_calls;static long resize_w,resize_h;static uint32_t resize_vfb[16];
 static unsigned peer_restart_calls;
+static int peer_restart_error;
 static uint64_t window_incarnation=77;
 static int direct_status=1,direct_calls,window_queries,window_stale,direct_mutate_commit,peer_error,source_begins,source_tags,source_begin_error;
 BrookVkSurface *test_surface_create(int software){(void)software;return (BrookVkSurface *)(uintptr_t)1;}
@@ -79,7 +80,11 @@ static long test_syscall(long number, ...)
     }
     if(number==BROOK_SYS_GPU_WINDOW_PEER_RECOVERY){
         (void)va_arg(args,long);long op=va_arg(args,long);va_end(args);
-        if(op==BROOK_GPU_WINDOW_PEER_RESTART){++peer_restart_calls;return 0;}
+        if(op==BROOK_GPU_WINDOW_PEER_RESTART){
+            ++peer_restart_calls;
+            if(peer_restart_error){errno=peer_restart_error;return -1;}
+            return 0;
+        }
         if(op==BROOK_GPU_WINDOW_PEER_DRAIN && peer_error){errno=peer_error;return -1;}
         return 0;
     }
@@ -276,9 +281,20 @@ static void check_gpu_window_offer(enum offer_fixture mode)
             assert(g_gpu_window_dead>=0 && !gpu_window_channel_connect());
             if(mode==OFFER_PEER_TIMEOUT){
                 const unsigned before=peer_restart_calls;
-                g_gpu_peer_lost_ms-=INTEL_PEER_DRAIN_MS;
+                g_gpu_peer_lost_ms-=2000;
+                intel_pending_poll();
+                assert(peer_restart_calls==before);
+                g_gpu_peer_lost_ms-=INTEL_PEER_DRAIN_MS-2000;
+                peer_restart_error=EAGAIN;
                 intel_pending_poll();intel_pending_poll();
-                assert(peer_restart_calls==before+1 && buffer->uses==1 && g_intel_pending_count==1);
+                assert(peer_restart_calls==before+1 && !g_gpu_peer_restart_asked &&
+                       g_gpu_peer_restart_error==EAGAIN && buffer->uses==1);
+                g_gpu_peer_restart_attempt_ms-=INTEL_PEER_RESTART_RETRY_MS;
+                peer_restart_error=ENOTCONN;
+                intel_pending_poll();intel_pending_poll();
+                assert(peer_restart_calls==before+2 && g_gpu_peer_restart_asked &&
+                       g_gpu_peer_restart_error==ENOTCONN && buffer->uses==1 && g_intel_pending_count==1);
+                peer_restart_error=0;
             }
             peer_error=0;
         }

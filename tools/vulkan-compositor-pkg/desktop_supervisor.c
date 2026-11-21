@@ -8,6 +8,7 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include "gpu_window_source_abi.h"
 
 static volatile sig_atomic_t stopping=0;
 static void stop(int signalNumber){
@@ -17,6 +18,13 @@ static void sleep_seconds(unsigned seconds){
     struct timespec remaining={(time_t)seconds,0};
     while(!stopping && nanosleep(&remaining,&remaining) && errno==EINTR){}
 }
+static int prompt_recovery(int status){
+    /* The renderer can deliberately exit 76, or the kernel can force a
+     * generation-pinned recovery exit. This status only affects retry delay. */
+    return (WIFEXITED(status) && WEXITSTATUS(status)==76) ||
+           (WIFSIGNALED(status) && WTERMSIG(status)==BROOK_GPU_WINDOW_RESTART_SIGNAL);
+}
+
 int main(int argc,char **argv){
     int partial=0,asyncPartial=0,traceSource=0,pipeline=0;const char *socketPath=NULL,*renderer=NULL;
     for(int i=1;i<argc;++i){
@@ -104,14 +112,11 @@ int main(int argc,char **argv){
             while(done<0 && errno==EINTR);
             if(done<0){fprintf(stderr,"DESKTOP_SUPERVISOR_WAIT_FAILED errno=%d\n",errno);return 1;}
             if(stopping)break;
-            fprintf(stderr,"DESKTOP_SUPERVISOR_EXIT status=%d retry_s=%u\n",status,WIFEXITED(status) && WEXITSTATUS(status)==76?1u:delay);
+            fprintf(stderr,"DESKTOP_SUPERVISOR_EXIT status=%d retry_s=%u\n",status,prompt_recovery(status)?1u:delay);
         }
         (void)clock_gettime(CLOCK_MONOTONIC,&finished);
         if(finished.tv_sec-started.tv_sec>=30)delay=1;
-        /* Status 76: the renderer exited deliberately after a GPU/handoff
-         * failure it cannot recover in-process (DESKTOP_RENDERER_EXIT_FOR_RESTART);
-         * the kernel has reclaimed its work, so restart promptly. */
-        if(pid>0 && WIFEXITED(status) && WEXITSTATUS(status)==76){if(stopping)break;sleep_seconds(1);delay=1;continue;}
+        if(pid>0 && prompt_recovery(status)){if(stopping)break;sleep_seconds(1);delay=1;continue;}
         sleep_seconds(delay);if(delay<30)delay=delay>15?30:delay*2;
     }
     return 0;

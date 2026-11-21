@@ -411,7 +411,7 @@ void Worker(void* arg) {
         }
 #endif
         GuardTestPrepareDesktopHome();
-        const int script=ShellExecScript("/boot/INIT.RC");
+        const int script=ShellExecGuardedDesktop();
         KPrintf("GUARD_DESKTOP_HANDOFF_SCRIPT status=%d\n",script);
         if(script) {
             if(slotStarted && !RequestGuardedScriptRestart(guardedBootSlot,script))

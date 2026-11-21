@@ -331,6 +331,7 @@ int64_t sys_connect(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
         pending.serverTxFds = fdqSC;
         pending.clientCredentials = UnixCurrentCredentials(proc);
         pending.clientIncarnation=UnixCurrentIncarnation(proc);pending.clientLaunchId=proc->launchId;
+        usd->connectingIncarnation=pending.clientIncarnation;
         pending.clientAddressLength=usd->localAddressLength;
         memcpy(pending.clientAddress,usd->localAddress,sizeof(pending.clientAddress));
         pending.used = true;
