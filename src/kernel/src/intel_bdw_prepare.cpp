@@ -766,6 +766,9 @@ void BdwWorkerStatsFlipLatched(uint32_t frames,uint64_t ticks){
     // Latches are observed by the idle poll, outside any interval: publish now.
     if(OnWorkerStatsThread()){workerStats.FlipLatched(frames,ticks);workerStats.Flush();}
 }
+void BdwWorkerStatsClientScanout(const uint64_t (&ticks)[BdwClientScanoutStageCount],bool accepted){
+    if(OnWorkerStatsThread())workerStats.ClientScanout(ticks,accepted);
+}
 bool BdwWorkerStatsRead(BdwWorkerStats& out){return workerStats.Read(out);}
 void BdwWorkerStatsReset(){workerStats.RequestReset();}
 #endif

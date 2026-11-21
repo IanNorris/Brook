@@ -15,6 +15,9 @@ int main() {
     CHECK(m.Read(s) && s.elapsedTicks==0 && s.classes[BdwWorkerIdle].count==0);
     m.End(5); // no boundary yet: ignored
     m.Begin(BdwWorkerIdle,100);m.End(200);                 // idle 100
+    const uint64_t directA[BdwClientScanoutStageCount]={2,15,3,20};
+    const uint64_t directB[BdwClientScanoutStageCount]={3,4,3,10};
+    m.ClientScanout(directA,true);m.ClientScanout(directB,false);
     m.Begin(BdwWorkerApplication,250);                      // other 50
     m.Render(3,2,40,7,5,21,true,6u<<7,10u<<7);m.End(400);          // app 150
     m.Begin(BdwWorkerCompositor,400);                       // other 0
@@ -30,6 +33,9 @@ int main() {
     CHECK(s.classes[BdwWorkerIdle].ticks==100 && s.classes[BdwWorkerApplication].ticks==150 &&
           s.classes[BdwWorkerCompositor].ticks==50 && s.classes[BdwWorkerPresent].ticks==10 &&
           s.classes[BdwWorkerOther].ticks==60 && s.classes[BdwWorkerOther].count==3);
+    CHECK(s.clientScanout[BdwClientScanoutTotal].count==2 &&
+          s.clientScanout[BdwClientScanoutTotal].ticks==30 &&
+          s.clientScanout[BdwClientScanoutFlush].maxTicks==15 && s.clientScanoutRejected==1);
     CHECK(s.yields[0].jobs==1 && s.yields[0].yields==3 && s.yields[0].breadcrumbYields==2 &&
           s.yields[0].sleepTicks==40 && s.yields[0].buckets[3]==1);
     CHECK(s.yields[0].spins==7 && s.yields[0].breadcrumbSpins==5 && s.yields[0].spinTicks==21 &&
@@ -52,6 +58,7 @@ int main() {
     m.Begin(BdwWorkerIdle,1000);m.End(1300);
     CHECK(m.Read(s) && s.resets==1 && s.elapsedTicks==300 && s.classes[BdwWorkerIdle].ticks==300 &&
           s.classes[BdwWorkerOther].count==0 && s.classes[BdwWorkerApplication].count==0 && s.yields[0].jobs==0);
+    CHECK(s.clientScanout[BdwClientScanoutTotal].count==0 && s.clientScanoutRejected==0);
     // A backwards clock never charges a negative interval.
     m.Begin(BdwWorkerApplication,1200);m.End(1100);
     CHECK(m.Read(s) && s.elapsedTicks==300 && s.classes[BdwWorkerApplication].count==1 &&
