@@ -37,6 +37,8 @@ int64_t BdwClientScanoutLeave(uint64_t owner);
 bool BdwClientScanoutWorkPending();
 bool BdwClientScanoutService(bool canPresent);
 bool BdwClientScanoutWakeWorker();
+bool BdwClientScanoutSetApPublication(bool enabled);
+bool BdwClientScanoutApPublication();
 // Address and layout are published together. Changes are permitted only
 // after the worker proves the mapping is neither programmed nor live.
 constexpr uint32_t BdwClientScanoutSlots=3;

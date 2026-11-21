@@ -344,16 +344,32 @@ checks the buffer size and Intel tiling metadata. Broadwell uses the
 combined DSPOFFSET register and supports linear and X-tiled primary
 surfaces. See [Linux i915 primary plane programming](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/i915/display/i9xx_plane.c).
 
-The BSP submission worker holds an exclusive buffer transition from
-admission through latch-away. The RCS ring flushes render and data caches
-before the completion breadcrumb. The worker flushes the coherent LLC
-before arming the non-snooping display. This first version deliberately
-uses a full buffer flush. Its cost and live panel correctness need Dell
-measurements. Three cached GGTT bindings retain references and have
+The kernel holds an exclusive GPU buffer transition from admission through
+latch-away. The RCS ring flushes render and data caches before the completion
+breadcrumb. `gpu zerocopy publish ap` moves the cache flush to a separate
+CPU worker so the BSP submission worker can run unrelated jobs. `gpu zerocopy
+publish bsp` restores the default. The worker choice applies to new requests.
+Both modes flush every client page mapped for scanout, including pitch and
+tiling padding, because the display does not snoop the coherent CPU/GT LLC.
+The BSP revalidates ownership and binds and arms only after publication
+finishes. Cancellation retains the buffer until publication exits the flush.
+
+Three cached GGTT bindings retain references and have
 guard PTEs. Eviction checks the old mapping, clears the PTEs, and
 invalidates the extent after the buffer has left the display. Uncertain
 bindings stay pinned. The per-job display check admits only the published
 client address and layout or a known kernel surface.
+
+For a same-boot comparison, hold the GPU clock fixed and sample
+`gpu worker stats` in each publication mode after the mode has settled.
+`client_scanout.flush` measures the publication stage on its selected CPU.
+`bind` and `finish` measure the submission worker, and `total` sums the
+three elapsed stages. The totals exclude time between workers. Compare
+client scanout counts and frame cadence with the same fullscreen content.
+Check alternating static patterns and leave/restore with and without the
+hardware cursor. Repeat for linear and X-tiled buffers. The existing
+`gpu zerocopy verify` only takes CRCs for the renderer ring. A CRC sampled
+from a latched client front is a separate hardware verification step.
 
 The capability `BROOK_GPU_PRESENT_CAP_CLIENT_SCANOUT` advertises ABI
 version 1 of the client operations in `src/shared/gpu_output_abi.h`.

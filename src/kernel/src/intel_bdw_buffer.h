@@ -50,6 +50,9 @@ MappingBacking* BdwGpuBufferBacking(BdwGpuBuffer* buffer); // borrowed; caller r
 // excludes concurrent CPU writers/accesses as appropriate, and separately
 // establishes device-side cache, DMA and retirement guarantees.
 bool BdwGpuBufferSyncCpuCache(BdwGpuBuffer* buffer);
+// Same contract, restricted to the first pages of a display mapping. The
+// caller ensures pages outside the prefix are not visible to the device.
+bool BdwGpuBufferSyncCpuCachePages(BdwGpuBuffer* buffer,uint32_t pages);
 // CPU fallback only. The caller retains and serializes the completed ticket
 // through the subsequent read. Never use on a scanout-mapped or failed output.
 bool BdwGpuBufferPrepareHandoffRead(BdwGpuBuffer*,uint64_t token,uint64_t offset,uint64_t bytes);
