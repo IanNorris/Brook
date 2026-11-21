@@ -1098,11 +1098,11 @@ int64_t IntelRenderIoctl(brook::BdwGpuFile* file,uint64_t cmd,uint64_t arg,uint6
 #if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
     const uint64_t number = cmd & 0xff;
     const bool trace = ProfilerFrameTraceWatchesClient();
-    if (trace) ProfilerTraceClientWait(proc, FrameWaitBegin, FrameWaitIntelIoctlBase + number);
+    if (trace) ProfilerTraceCurrentWait(FrameWaitBegin, FrameWaitIntelIoctlBase + number);
 #endif
     const int64_t result=brook::BdwIntelRenderIoctl(file,cmd,arg,user);
 #if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
-    if (trace) ProfilerTraceClientWait(proc, FrameWaitEnd, FrameWaitIntelIoctlBase + number,
+    if (trace) ProfilerTraceCurrentWait(FrameWaitEnd, FrameWaitIntelIoctlBase + number,
                                       static_cast<uint64_t>(result));
 #endif
     // An execbuffer refusal becomes VK_ERROR_DEVICE_LOST in Mesa: name it.
