@@ -6363,6 +6363,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  gpu ppgtt cache on|off|status - reuse exact-match PPGTT table sets across GPU jobs (default off)\n"
             "  gpu clock <MHz>|auto|status - render clock request (fixed 600 at boot, auto opt-in, 90 C fallback)\n"
             "  thermal status|history|graph|power|reset - CPU/GPU temperature, power and frequency sampler\n"
+            "  thermal cpu-first epb BIAS SECONDS | status | off - timed AC-only EPB experiment\n"
             "  gpu scene wake on|off|status - default-off scene completion notification experiment\n"
             "  audio shared-prefix on|off|reset|status - experimental headroom-gated mix batching (default off)\n"
             "  audio horizon on|off|reset|status - experimental guarded output target and prospective OSS geometry (default off)\n"
@@ -7113,12 +7114,12 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         else if(NetStrEq(cmd,"cpu epb default")){
             CpuIdleStatus cur{};CpuIdleRequestSample();CpuIdleReadStatus(cur);
             const int32_t t=CpuEpbBootTarget(cur.cpus[0].epb);
-            note=t<0?"left unchanged":(CpuIdleRequestEpb(uint32_t(t))?"set 6":"unsupported");
+            note=t<0?"left unchanged":(CpuIdleRequestEpb(uint32_t(t))?"set 6":"unsupported or trial restoring");
         }
         else if(StrStartsWith(cmd,"cpu epb ") && !NetStrEq(cmd,"cpu epb status")){
             uint32_t v=0;const char* q=cmd+8;bool digits=*q!=0;
             for(;*q;++q){if(*q<'0'||*q>'9'){digits=false;break;}v=v*10+uint32_t(*q-'0');}
-            if(!digits||v>15)bad=true;else note=CpuIdleRequestEpb(v)?"requested":"unsupported";
+            if(!digits||v>15)bad=true;else note=CpuIdleRequestEpb(v)?"requested":"unsupported or trial restoring";
         }
         else if(!NetStrEq(cmd,"cpu idle status") && !NetStrEq(cmd,"cpu idle") && !NetStrEq(cmd,"cpu epb status"))bad=true;
         if(bad){DebugChannelSend("{\"error\":\"usage: cpu idle mwait on|off | cpu idle state hlt|c1|c1e|c3|c6|auto | cpu idle status|reset | cpu epb <0-15>|default|status\"}\n");}
@@ -7165,6 +7166,47 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             r.text(",\"scope\":\"idle C-state: hlt (default) or MWAIT hint from CPUID.05H; C3/C6 need ARAT; counts per CPU since boot or reset; idle_tsc includes the waking ISR; core/pkg residency MSRs count at TSC rate (core values sampled by each CPU's idle loop at sample_tsc); epb is IA32_ENERGY_PERF_BIAS read back per CPU\"}\n");
             r.send();
         }
+    }
+    else if(NetStrEq(cmd,"thermal cpu-first status") || NetStrEq(cmd,"thermal cpu-first off") ||
+            StrStartsWith(cmd,"thermal cpu-first epb ")) {
+        int result=0;
+        if(NetStrEq(cmd,"thermal cpu-first off"))CpuIdleCancelEpbTrial();
+        else if(StrStartsWith(cmd,"thermal cpu-first epb ")){
+            const char* args=cmd+sizeof("thermal cpu-first epb ")-1;
+            auto decimal=[](const char*& input,unsigned digits,unsigned& value){
+                unsigned read=0;
+                for(;*input>='0' && *input<='9' && read<digits;++input,++read)
+                    value=value*10+unsigned(*input-'0');
+                return read>0;
+            };
+            unsigned bias=0,seconds=0;
+            if(!decimal(args,2,bias) || *args++!=' ' || !decimal(args,3,seconds) || *args)
+                result=-22;
+            else result=ThermalStartEpbTrial(bias,seconds);
+        }
+        const auto trial=CpuIdleReadEpbTrial();
+        static const char* phases[]={"off","snapshot","apply","hold","restore"};
+        static const char* outcomes[]={"none","complete","cancelled","ineligible","timeout","readback","superseded"};
+        const uint64_t now=ApicTickCount();
+        BridgeReply r;
+        r.text("{");r.field("errno",uint64_t(-result));
+        r.text(",\"phase\":");r.quoted(phases[unsigned(trial.phase)]);
+        r.text(",\"outcome\":");r.quoted(outcomes[unsigned(trial.outcome)]);
+        r.text(",");r.field("bias",trial.value);
+        r.text(",");r.field("remaining_ms",trial.deadline>now?trial.deadline-now:0);
+        r.text(",");r.field("sampled_mask",trial.sampled);
+        r.text(",");r.field("attempted_mask",trial.touched);
+        r.text(",");r.field("resolved_restore_mask",trial.restored);
+        r.text(",");r.field("restore_failed_mask",trial.restoreFailed);
+        r.text(",\"cpus\":[");
+        for(unsigned i=0;i<trial.cpuCount;++i){
+            if(i)r.text(",");
+            r.text("{");r.field("cpu",i);
+            r.text(",\"baseline\":");if(trial.sampled&(1u<<i))r.number(trial.original[i]);else r.text("null");
+            r.text(",\"observed\":");if(trial.sampled&(1u<<i))r.number(trial.observed[i]);else r.text("null");
+            r.text("}");
+        }
+        r.text("]}\n");r.send();
     }
     else if(NetStrEq(cmd,"thermal status") || NetStrEq(cmd,"thermal history") || NetStrEq(cmd,"thermal graph") ||
             NetStrEq(cmd,"thermal power") || NetStrEq(cmd,"thermal reset")) {

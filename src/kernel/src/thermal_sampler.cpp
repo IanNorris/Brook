@@ -5,6 +5,8 @@
 // Broadwell client models for RAPL/residency) so VMs never take a #GP.
 #include "thermal_runtime.h"
 #include "cpu.h"
+#include "cpu_idle.h"
+#include "shutdown.h"
 #include "smp.h"
 #include "apic.h"
 #include "process.h"
@@ -123,6 +125,14 @@ void Publish(PkgPrev& prev) {
     IrqSpinLockRelease(&g_lock, flags);
 }
 
+bool EpbTrialEligible()
+{
+    const auto& p=Plat();
+    return p.model==0x3d && p.epb && !p.hwp && p.pkgDts &&
+           ShutdownLaunchAllowed() && ShutdownGetAcStatus().source==AcPowerSource::Online &&
+           ThermalDecodeDts(ReadMsr(0x1b1),p.tjmax)>0;
+}
+
 void Worker(void* arg) {
     const uint32_t cpu = uint32_t(reinterpret_cast<uintptr_t>(arg));
     CpuPrev prev{};
@@ -133,6 +143,7 @@ void Worker(void* arg) {
         // ever ran this pinned thread elsewhere.
         if (SmpCurrentCpuIndex() != cpu) { __atomic_add_fetch(&g_misplaced, 1, __ATOMIC_RELAXED); continue; }
         SampleCpu(cpu, prev);
+        if (CpuIdleEpbTrialActive()) CpuIdleTickEpbTrial(cpu,ApicTickCount(),EpbTrialEligible());
         if (cpu == 0) Publish(pkg);
     }
 }
@@ -150,6 +161,13 @@ void ThermalSamplerStart() {
         SchedulerAddProcess(t);
     }
     KLog("thermal: sampler on %u cpus, TjMax %u C, base %u MHz, rapl %d", n, p.tjmax, p.baseMhz, p.rapl ? 1 : 0);
+}
+
+int ThermalStartEpbTrial(unsigned bias,unsigned seconds)
+{
+    if (bias>15 || !seconds || seconds>300) return -22;
+    if (!EpbTrialEligible()) return -95;
+    return CpuIdleStartEpbTrial(ApicTickCount(),SmpGetCpuCount(),bias,seconds*1000);
 }
 
 bool ThermalReadSnapshot(ThermalSnapshot& out) {

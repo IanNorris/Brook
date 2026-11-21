@@ -1,5 +1,6 @@
 // Host tests for the idle C-state policy (cpu_idle_policy.h).
 #include "cpu_idle_policy.h"
+#include "cpu_epb_trial.h"
 #include <cassert>
 #include <cstdio>
 #include <cstring>
@@ -13,7 +14,56 @@ static CpuIdleCaps Bdw() {
     return c;
 }
 
+static void TestEpbTrial()
+{
+    using Phase=CpuEpbTrial::Phase;
+    using Outcome=CpuEpbTrial::Outcome;
+    CpuEpbTrial trial;
+    unsigned bias[]={6,8},writes=0;
+    bool failWrites=false;
+    auto tick=[&](unsigned cpu,uint64_t now,bool eligible=true) {
+        trial.Tick(cpu,now,eligible,[&](){return bias[cpu];},[&](unsigned value){
+            ++writes;
+            if(!failWrites)bias[cpu]=value;
+            return bias[cpu];
+        });
+    };
+    assert(!trial.Start(0,2,16,1000) && !trial.Start(0,9,10,1000));
+    assert(trial.Start(0,2,10,1000) && !trial.Start(0,2,10,1000));
+    tick(0,250);tick(0,500);
+    assert(trial.phase==Phase::Snapshot && !writes);
+    tick(1,500);
+    assert(trial.phase==Phase::Apply && !writes && trial.original[0]==6 && trial.original[1]==8);
+    tick(0,750);tick(1,1000);
+    assert(trial.phase==Phase::Hold && writes==2 && trial.deadline==2000);
+    tick(0,1999);tick(1,2000);tick(0,2250);
+    assert(trial.phase==Phase::Off && trial.outcome==Outcome::Complete && bias[0]==6 && bias[1]==8 &&
+           trial.restored==3 && !trial.restoreFailed);
+
+    assert(trial.Start(3000,2,10,1000));
+    tick(0,3250);tick(0,6000);
+    assert(trial.phase==Phase::Off && trial.outcome==Outcome::Timeout && writes==4);
+
+    assert(trial.Start(7000,2,10,1000));
+    tick(0,7250);tick(1,7250);tick(0,7500);tick(1,7500,false);tick(0,7750,false);
+    assert(trial.phase==Phase::Off && trial.outcome==Outcome::Ineligible && bias[0]==6 && bias[1]==8);
+
+    assert(trial.Start(8000,2,10,1000));
+    tick(0,8250);tick(1,8250);tick(0,8500);tick(1,8500);
+    bias[1]=12;
+    tick(1,8750);tick(1,9000);tick(0,9000);
+    assert(trial.phase==Phase::Off && trial.outcome==Outcome::Superseded && bias[1]==12 && bias[0]==6 &&
+           trial.restoreFailed==2);
+
+    assert(trial.Start(10000,1,10,1000));tick(0,10250);tick(0,10500);
+    failWrites=true;
+    trial.Cancel();
+    tick(0,10750);tick(0,11000);tick(0,11250);
+    assert(trial.phase==Phase::Off && trial.outcome==Outcome::Cancelled && trial.restoreFailed==1);
+}
+
 int main() {
+    TestEpbTrial();
     auto c = Bdw();
     assert(CpuIdleSubStates(c, 1) == 2 && CpuIdleSubStates(c, 2) == 1 && CpuIdleSubStates(c, 3) == 2 && CpuIdleSubStates(c, 4) == 4);
     assert(CpuIdleHint(c, CpuIdleState::C1) == 0x00);

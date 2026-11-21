@@ -12,6 +12,7 @@
 #include "cpu_idle.h"
 #include "cpu.h"
 #include "smp.h"
+#include "spinlock.h"
 #include "tsc_clock.h"
 
 namespace brook {
@@ -39,6 +40,9 @@ volatile int64_t g_choice = -1;            // (ecx << 32) | (uint32_t)hint, or -
 volatile uint32_t g_requested = 0;          // CpuIdleState
 volatile uint64_t g_epbGen = 0;
 volatile uint32_t g_epbValue = 0;
+IrqSpinLock g_epbLock;
+CpuEpbTrial g_epbTrial;
+bool g_epbTrialActive=false;
 volatile int32_t g_epbTarget = -1;
 volatile uint64_t g_sampleGen = 0;
 volatile bool g_auto = false;
@@ -116,10 +120,15 @@ void CpuIdleEnter(uint32_t cpu) {
     if (pc) {
         pc->seen = true;
         const uint64_t eg = __atomic_load_n(&g_epbGen, __ATOMIC_ACQUIRE);
-        if (plat.epb && eg != pc->epbGen) {
-            WriteMsr(0x1b0, (ReadMsr(0x1b0) & ~0xfull) | (g_epbValue & 0xfu));
-            pc->epb = ReadMsr(0x1b0);
-            pc->epbGen = eg;
+        if (plat.epb && eg != __atomic_load_n(&pc->epbGen,__ATOMIC_RELAXED)) {
+            const auto flags=IrqSpinLockAcquire(&g_epbLock);
+            const auto current=__atomic_load_n(&g_epbGen,__ATOMIC_RELAXED);
+            if (g_epbTrial.phase==CpuEpbTrial::Phase::Off && current!=pc->epbGen) {
+                WriteMsr(0x1b0, (ReadMsr(0x1b0) & ~0xfull) | (g_epbValue & 0xfu));
+                pc->epb=ReadMsr(0x1b0);
+                __atomic_store_n(&pc->epbGen,current,__ATOMIC_RELEASE);
+            }
+            IrqSpinLockRelease(&g_epbLock,flags);
         }
         const uint64_t sg = __atomic_load_n(&g_sampleGen, __ATOMIC_ACQUIRE);
         if (sg != pc->sampleGen) {
@@ -217,11 +226,70 @@ void CpuIdleLatencyHint(uint32_t us) {
 
 bool CpuIdleRequestEpb(uint32_t value) {
     if (!Plat().epb || value > 15) return false;
-    __atomic_store_n(&g_epbValue, value, __ATOMIC_RELAXED);
-    __atomic_store_n(&g_epbTarget, int32_t(value), __ATOMIC_RELAXED);
-    __atomic_add_fetch(&g_epbGen, 1, __ATOMIC_RELEASE);
+    const auto flags=IrqSpinLockAcquire(&g_epbLock);
+    g_epbTrial.Cancel(CpuEpbTrial::Outcome::Superseded);
+    const bool active=g_epbTrial.phase!=CpuEpbTrial::Phase::Off;
+    __atomic_store_n(&g_epbTrialActive,active,__ATOMIC_RELEASE);
+    if (!active) {
+        __atomic_store_n(&g_epbValue,value,__ATOMIC_RELAXED);
+        __atomic_store_n(&g_epbTarget,int32_t(value),__ATOMIC_RELAXED);
+        __atomic_add_fetch(&g_epbGen,1,__ATOMIC_RELEASE);
+    }
+    IrqSpinLockRelease(&g_epbLock,flags);
+    // A manual request ends the trial first. Require an explicit retry if
+    // temporary values still need restoring on their owning CPUs.
+    if (active) return false;
     for (uint32_t i = 0; i < CpuIdleMaxCpus; ++i) __atomic_add_fetch(&g_monitor[i].word, 1, __ATOMIC_RELEASE);
     return true;
+}
+
+int CpuIdleStartEpbTrial(uint64_t now,unsigned count,unsigned bias,uint32_t durationMs)
+{
+    if (!Plat().epb) return -95;
+    if (!count || count>CpuEpbTrial::MaxCpus || bias>15 ||
+        durationMs<1000 || durationMs>300000) return -22;
+
+    const auto flags=IrqSpinLockAcquire(&g_epbLock);
+    const auto generation=__atomic_load_n(&g_epbGen,__ATOMIC_RELAXED);
+    bool unresolved=g_epbTrial.phase!=CpuEpbTrial::Phase::Off;
+    for (unsigned i=0;i<count;++i)
+        unresolved|=__atomic_load_n(&g_cpu[i].epbGen,__ATOMIC_ACQUIRE)!=generation;
+    const bool started=!unresolved && g_epbTrial.Start(now,count,bias,durationMs);
+    if (started) __atomic_store_n(&g_epbTrialActive,true,__ATOMIC_RELEASE);
+    IrqSpinLockRelease(&g_epbLock,flags);
+    return started?0:-16;
+}
+
+bool CpuIdleEpbTrialActive()
+{
+    return __atomic_load_n(&g_epbTrialActive,__ATOMIC_ACQUIRE);
+}
+
+void CpuIdleTickEpbTrial(unsigned cpu,uint64_t now,bool eligible)
+{
+    const auto flags=IrqSpinLockAcquire(&g_epbLock);
+    g_epbTrial.Tick(cpu,now,eligible,[](){return ReadMsr(0x1b0)&0xfu;},[](unsigned value){
+        WriteMsr(0x1b0,(ReadMsr(0x1b0)&~0xfull)|value);
+        return ReadMsr(0x1b0)&0xfu;
+    });
+    __atomic_store_n(&g_epbTrialActive,g_epbTrial.phase!=CpuEpbTrial::Phase::Off,__ATOMIC_RELEASE);
+    IrqSpinLockRelease(&g_epbLock,flags);
+}
+
+void CpuIdleCancelEpbTrial()
+{
+    const auto flags=IrqSpinLockAcquire(&g_epbLock);
+    g_epbTrial.Cancel();
+    __atomic_store_n(&g_epbTrialActive,g_epbTrial.phase!=CpuEpbTrial::Phase::Off,__ATOMIC_RELEASE);
+    IrqSpinLockRelease(&g_epbLock,flags);
+}
+
+CpuEpbTrial CpuIdleReadEpbTrial()
+{
+    const auto flags=IrqSpinLockAcquire(&g_epbLock);
+    const auto trial=g_epbTrial;
+    IrqSpinLockRelease(&g_epbLock,flags);
+    return trial;
 }
 
 void CpuIdleRequestSample() {

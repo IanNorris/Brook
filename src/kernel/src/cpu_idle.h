@@ -4,6 +4,7 @@
 // states; `cpu epb` sets IA32_ENERGY_PERF_BIAS on every CPU.
 #include <stdint.h>
 #include "cpu_idle_policy.h"
+#include "cpu_epb_trial.h"
 
 namespace brook {
 
@@ -53,6 +54,12 @@ void CpuIdleRequestAuto();
 void CpuIdleLatencyHint(uint32_t us);
 // Ask every CPU's idle loop to apply EPB value (0-15); false if unsupported.
 bool CpuIdleRequestEpb(uint32_t value);
+// The thermal sampler owns admission and calls the trial on each pinned CPU.
+int CpuIdleStartEpbTrial(uint64_t now, unsigned count, unsigned bias, uint32_t durationMs);
+bool CpuIdleEpbTrialActive();
+void CpuIdleTickEpbTrial(unsigned cpu, uint64_t now, bool eligible);
+void CpuIdleCancelEpbTrial();
+CpuEpbTrial CpuIdleReadEpbTrial();
 // Ask idle loops to sample core residency, then read everything.
 void CpuIdleRequestSample();
 void CpuIdleReadStatus(CpuIdleStatus& out);

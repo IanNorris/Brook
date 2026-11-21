@@ -8,6 +8,8 @@ namespace brook {
 // Starts one pinned sampling thread per CPU when the platform has the
 // digital thermal sensor MSRs (bare metal Intel family 6). No-op otherwise.
 void ThermalSamplerStart();
+// Start an AC-only timed Broadwell-U EPB experiment, off until explicitly armed.
+int ThermalStartEpbTrial(unsigned bias,unsigned seconds);
 
 struct ThermalSnapshot {
     bool available = false, rapl = false, aperf = false;
