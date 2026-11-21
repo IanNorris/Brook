@@ -113,8 +113,6 @@ static void on_toplevel_configure(void *d, struct xdg_toplevel *t,
 }
 static void on_toplevel_close(void *d, struct xdg_toplevel *t) {
     (void)d; (void)t;
-    /* Exit on the window close button and on a checked desktop shutdown. */
-    g_running = 0;
 }
 static void on_toplevel_configure_bounds(void *d, struct xdg_toplevel *t,
                                             int32_t w, int32_t h) {
