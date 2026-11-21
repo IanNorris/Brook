@@ -459,8 +459,16 @@ retry_poll:
             if (timerWaiters.allocationFailed) safetyMs = 5;
             safetyMs = syncWait.SafetyMs(safetyMs);
             self->wakeupTick = WaitWakeupTick(timerDeadline, safetyMs);
-            if (!HasPendingSignals() && (infinite || ClockNowNs(1) < deadline))
+            if (!HasPendingSignals() && (infinite || ClockNowNs(1) < deadline)) {
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+                if (syncWait.wanted) ProfilerTraceClientWait(self, FrameWaitBegin, FrameWaitSyncFilePoll,
+                                                           static_cast<uint64_t>(syncWait.arm));
+#endif
                 SchedulerBlockInterruptible(self);
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+                if (syncWait.wanted) ProfilerTraceClientWait(self, FrameWaitEnd, FrameWaitSyncFilePoll);
+#endif
+            }
 
         }
 

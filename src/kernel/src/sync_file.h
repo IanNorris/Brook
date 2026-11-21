@@ -25,7 +25,8 @@ static inline uint32_t SyncFileState(const SyncFileData& file) {
     return file.intelFence?BdwFenceState(file.intelFence):1;
 }
 static inline uint32_t SyncFileReady(const SyncFileData& file,uint32_t events) {
-    return SyncFileState(file)?events&1u:0;
+    if (!(events & 1u)) return 0;
+    return BdwFenceObservedState(file.intelFence) || !file.intelFence ? 1u : 0u;
 }
 static inline void SyncFileDescribe(const SyncFileData& fence,SyncFileInfo& info,SyncFenceInfo& detail) {
     info={};detail={};

@@ -127,9 +127,20 @@ static volatile bool     g_profilerFlushReq  = false;
 static volatile bool     g_profilerFlushing  = false; // true while drain/close in progress
 static volatile int      g_profilerLastError = 0;
 static Process*          g_profilerThread    = nullptr;
+static bool              g_profilerStartClaim = false;
+
+// Serialize capture admission across the debug command and the user profiler
+// syscall. The worker owns output until its final flush state is cleared.
+struct ProfileStartClaim {
+    bool acquired = !__atomic_exchange_n(&g_profilerStartClaim, true, __ATOMIC_ACQUIRE);
+    ~ProfileStartClaim() {
+        if (acquired) __atomic_store_n(&g_profilerStartClaim, false, __ATOMIC_RELEASE);
+    }
+};
 
 #ifdef BROOK_GPU_SUBMISSION_TIMING
 static uint16_t g_traceTgid;
+static uint64_t g_traceIncarnation;
 static uint64_t g_traceStartTsc;
 static uint32_t g_traceWriters;
 static uint64_t TraceTime()
@@ -146,9 +157,17 @@ static bool TraceName(const char* name, const char* expected)
     return !*name;
 }
 
+static bool TraceWatchesClient(const Process* process)
+{
+    if (!process || process->tgid != g_traceTgid) return false;
+    const uint64_t incarnation = process->pid == process->tgid
+        ? process->incarnation : process->leaderIncarnation;
+    return incarnation == g_traceIncarnation;
+}
+
 static bool TraceWatches(const Process* process)
 {
-    return process && (process->tgid == g_traceTgid ||
+    return process && (TraceWatchesClient(process) ||
         TraceName(process->name, "compositor") ||
         TraceName(process->name, "gpu-submit") ||
         TraceName(process->name, "INTLWL.ELF") ||
@@ -224,6 +243,35 @@ void ProfilerTraceMutex(const Process* waiter, const Process* holder,
 bool ProfilerFrameTraceActive()
 {
     return __atomic_load_n(&g_profilerEnabled, __ATOMIC_ACQUIRE) && g_traceTgid;
+}
+
+bool ProfilerFrameTraceWatchesClient()
+{
+    return ProfilerFrameTraceActive() && TraceWatchesClient(ProcessCurrent());
+}
+
+void ProfilerTraceClientWait(const Process* task, FrameWaitStage stage,
+                             uint64_t id, uint64_t value)
+{
+    TraceWriter writer;
+    if (writer.enabled && TraceWatchesClient(task)) {
+        const auto* current = ProcessCurrent();
+        TracePoint(stage, task->pid, current ? current->pid : 0, id, value, 0);
+    }
+}
+
+void ProfilerTraceCurrentWait(FrameWaitStage stage, uint64_t id, uint64_t value)
+{
+    if (ProfilerFrameTraceActive()) ProfilerTraceClientWait(ProcessCurrent(), stage, id, value);
+}
+
+void ProfilerTraceFencePublished(uint64_t id, uint32_t state)
+{
+    TraceWriter writer;
+    if (writer.enabled) {
+        const auto* current = ProcessCurrent();
+        TracePoint(FrameFencePublished, current ? current->pid : 0, 0, id, state, 0);
+    }
 }
 
 void ProfilerTraceGpu(uint16_t origin, unsigned stage, uint64_t id,
@@ -532,7 +580,7 @@ static char g_profileDir[kProfDirMax] = "/boot";
 
 bool ProfilerSetOutputDir(const char* dir)
 {
-    if (!dir || dir[0] != '/') return false;
+    if (ProfilerIsRunning() || !dir || dir[0] != '/') return false;
     uint32_t n = 0;
     while (dir[n] && dir[n] != ' ' && dir[n] != '\n') { if (++n >= kProfDirMax) return false; }
     while (n > 1 && dir[n - 1] == '/') --n;
@@ -797,6 +845,7 @@ static void ProfilerThreadFn(void* /*arg*/)
                 buf.readIdx = buf.writeIdx = buf.dropped = 0;
             }
             g_traceTgid = 0;
+            g_traceIncarnation = 0;
             __atomic_store_n(&g_profilerFlushReq, false, __ATOMIC_RELEASE);
             __atomic_store_n(&g_profilerFlushing, false, __ATOMIC_RELEASE);
             continue;
@@ -904,18 +953,8 @@ void ProfilerInit()
     }
 }
 
-void ProfilerStart(uint32_t durationMs)
+static void StartProfile(uint32_t durationMs)
 {
-    if (g_profilerEnabled) {
-        SerialPrintf("PROFILER: already running\n");
-        return;
-    }
-    if (__atomic_load_n(&g_profilerFlushReq, __ATOMIC_ACQUIRE) ||
-        __atomic_load_n(&g_profilerFlushing, __ATOMIC_ACQUIRE)) {
-        SerialPrintf("PROFILER: still flushing previous run, try again shortly\n");
-        return;
-    }
-
     g_profilerStartTick = ApicTickCount();
     __atomic_store_n(&g_profilerLastError,0,__ATOMIC_RELEASE);
     g_profilerEndTick   = durationMs > 0 ? (g_profilerStartTick + durationMs) : 0;
@@ -932,17 +971,39 @@ void ProfilerStart(uint32_t durationMs)
                  durationMs, SmpGetCpuCount());
 }
 
-#ifdef BROOK_GPU_SUBMISSION_TIMING
-int ProfilerStartFrameTrace(uint32_t durationMs, const Process* application)
+void ProfilerStart(uint32_t durationMs)
 {
-    if (!application || !durationMs || durationMs > 4000) return -22;
+    ProfileStartClaim claim;
+    if (!claim.acquired || ProfilerIsRunning()) {
+        SerialPrintf("PROFILER: a capture is running or flushing\n");
+        return;
+    }
+    StartProfile(durationMs);
+}
+
+#ifdef BROOK_GPU_SUBMISSION_TIMING
+int ProfilerStartFrameTrace(uint32_t durationMs, uint16_t group, uint64_t incarnation,
+                            const char* outputDir)
+{
+    if (!group || !incarnation || !durationMs || durationMs > 4000) return -22;
     const auto& tsc = NativeTscObserveRead();
     if (!tsc.capable || !tsc.consistent || !tsc.khz) return -95;
-    if (ProfilerIsRunning()) return -16;
+    ProfileStartClaim claim;
+    if (!claim.acquired || ProfilerIsRunning()) return -16;
+    if (outputDir && !ProfilerSetOutputDir(outputDir)) return -22;
     g_traceStartTsc = TraceTime();
-    g_traceTgid = application->tgid;
-    ProfilerStart(durationMs);
+    g_traceTgid = group;
+    g_traceIncarnation = incarnation;
+    StartProfile(durationMs);
     return 0;
+}
+
+int ProfilerStartFrameTrace(uint32_t durationMs, const Process* application)
+{
+    if (!application) return -22;
+    const uint64_t incarnation = application->pid == application->tgid
+        ? application->incarnation : application->leaderIncarnation;
+    return ProfilerStartFrameTrace(durationMs, application->tgid, incarnation, nullptr);
 }
 #endif
 

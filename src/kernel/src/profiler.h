@@ -33,8 +33,24 @@ enum FrameGpuStage : unsigned {
     FrameRenderFrequencyCaps, FrameRenderFrequencyTrial,
     FrameDesktopBegin, FrameDesktopCadence, FrameDesktopEnd,
 };
+// The text format reserves trace kinds 5–15 for client waits.
+enum FrameWaitStage : unsigned {
+    FrameWaitBegin = 5, FrameWaitEnd = 6, FrameFenceObserved = 7,
+    FrameFutexWake = 8, FrameGpuWake = 9, FrameFencePublished = 10,
+};
+enum FrameWaitSource : uint64_t {
+    FrameWaitSyncFilePoll = 1, FrameWaitSyncFileEpoll = 2,
+    FrameWaitFutex = 3, FrameWaitIntelIoctlBase = 0x100,
+};
 bool ProfilerFrameTraceActive();
 int ProfilerStartFrameTrace(uint32_t durationMs, const Process* application);
+int ProfilerStartFrameTrace(uint32_t durationMs, uint16_t group, uint64_t incarnation,
+                            const char* outputDir);
+bool ProfilerFrameTraceWatchesClient();
+void ProfilerTraceClientWait(const Process* task, FrameWaitStage stage,
+                             uint64_t id, uint64_t value = 0);
+void ProfilerTraceCurrentWait(FrameWaitStage stage, uint64_t id, uint64_t value = 0);
+void ProfilerTraceFencePublished(uint64_t id, uint32_t state);
 void ProfilerTraceReady(const Process* process);
 void ProfilerTraceMutex(const Process* waiter, const Process* holder,
                         const void* mutex, bool granted);

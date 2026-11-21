@@ -5,6 +5,7 @@
 #include "apic.h"
 #include "kvmclock.h"
 #include "tsc_clock.h"
+#include "profiler.h"
 #endif
 #include "sync/kmutex.h"
 #include "intel_bdw_wait_queue.h"
@@ -99,13 +100,37 @@ done:
     if(stack!=local)kfree(stack);
     return result;
 }
+// Preserve the resolved dependency timestamp for waits that userspace
+// actually observes. Signal age is in ns; the event's own time is trace TSC.
+inline uint32_t BdwFenceObservedState(const BdwFence* f)
+{
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+    if (f && ProfilerFrameTraceWatchesClient()) {
+        uint64_t signal = 0;
+        const uint32_t state = BdwFenceState(f, &signal);
+        if (state && signal) {
+            const uint64_t now = BdwFenceClockNs();
+            if (now >= signal) ProfilerTraceCurrentWait(FrameFenceObserved, f->traceId, now - signal);
+        }
+        return state;
+    }
+#endif
+    return BdwFenceState(f);
+}
+
 inline bool BdwFenceComplete(BdwFence* f,bool success,uint64_t signalNs=0){
     if(!f)return false;
     uint32_t expected=0;
     if(!__atomic_compare_exchange_n(&f->state,&expected,3,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED))return false;
     f->signalNs=signalNs?signalNs:BdwFenceClockNs();
     __atomic_store_n(&f->state,success?1u:2u,__ATOMIC_RELEASE);
-    BdwGpuFenceSignalled(); // after publication: woken waiters re-check state
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+    ProfilerTraceFencePublished(f->traceId, success ? 1u : 2u);
+    BdwGpuFenceSignalled(f->traceId);
+#else
+    BdwGpuFenceSignalled();
+#endif
+    // Woken waiters re-check state after publication.
     return true;
 }
 // Prepare a timeline node after an unpublished predecessor from the same
