@@ -158,7 +158,7 @@ with tempfile.TemporaryDirectory(prefix="brook-supervisor-kernel-restart-") as t
             f"DESKTOP_SUPERVISOR_EXIT status={signal.SIGKILL} retry_s=1",
             "DESKTOP_SUPERVISOR_EXIT status=1792 retry_s=2",
             f"DESKTOP_SUPERVISOR_EXIT status={signal.SIGUSR2} retry_s=1",
-            f"DESKTOP_SUPERVISOR_EXIT status={signal.SIGKILL} retry_s=1",
+            f"DESKTOP_SUPERVISOR_EXIT status={signal.SIGKILL} retry_s=4",
         ], exited
     finally:
         if proc.poll() is None:

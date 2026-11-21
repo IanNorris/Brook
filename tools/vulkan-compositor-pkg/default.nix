@@ -114,6 +114,8 @@ pkgs.stdenv.mkDerivation {
     $CC -std=c11 -O2 -Wall -Wextra -Werror -DBROOK_SUPERVISOR_TEST_GPU_SOURCE=1 desktop_supervisor.c -o brook-desktop-supervisor-test-gpu-source
     $CC -std=c11 -O2 -Wall -Wextra -Werror -DBROOK_SUPERVISOR_TEST_SELECTIVE_CAPTURE=1 desktop_supervisor.c -o brook-desktop-supervisor-test-selective-capture
     $CC -std=c11 -O2 -Wall -Wextra -Werror -DBROOK_SUPERVISOR_TEST_SELECTIVE_TIMING=1 desktop_supervisor.c -o brook-desktop-supervisor-test-selective-timing
+    $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_supervisor_restart_test.c -o brook-desktop-supervisor-restart-test
+    ./brook-desktop-supervisor-restart-test
     python3 desktop_supervisor_test.py ./brook-desktop-supervisor ./brook-desktop-supervisor-serial
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_backdrop_test.c -o brook-desktop-backdrop-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_chrome_test.c -o brook-desktop-chrome-test

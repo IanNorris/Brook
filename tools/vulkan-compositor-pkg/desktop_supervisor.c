@@ -8,7 +8,7 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
-#include "gpu_window_source_abi.h"
+#include "desktop_supervisor_restart.h"
 
 static volatile sig_atomic_t stopping=0;
 static void stop(int signalNumber){
@@ -18,11 +18,11 @@ static void sleep_seconds(unsigned seconds){
     struct timespec remaining={(time_t)seconds,0};
     while(!stopping && nanosleep(&remaining,&remaining) && errno==EINTR){}
 }
-static int prompt_recovery(int status){
-    /* The renderer can deliberately exit 76, or the kernel can force a
-     * generation-pinned recovery exit. This status only affects retry delay. */
-    return (WIFEXITED(status) && WEXITSTATUS(status)==76) ||
-           (WIFSIGNALED(status) && WTERMSIG(status)==BROOK_GPU_WINDOW_RESTART_SIGNAL);
+static bool monotonic_ns(uint64_t *ns){
+    struct timespec elapsed;
+    if(clock_gettime(CLOCK_MONOTONIC,&elapsed))return false;
+    *ns=(uint64_t)elapsed.tv_sec*1000000000ull+(uint64_t)elapsed.tv_nsec;
+    return true;
 }
 
 int main(int argc,char **argv){
@@ -87,9 +87,10 @@ int main(int argc,char **argv){
 #endif
     struct sigaction action={0};action.sa_handler=stop;sigemptyset(&action.sa_mask);
     if(sigaction(SIGTERM,&action,NULL) || sigaction(SIGINT,&action,NULL))return 1;
-    unsigned delay=1;
+    struct DesktopRestartPolicy restart={.retry_s=1};
     while(!stopping){
-        struct timespec started={0},finished={0};(void)clock_gettime(CLOCK_MONOTONIC,&started);
+        uint64_t started_ns=0,finished_ns=0;
+        const bool started_ok=monotonic_ns(&started_ns);
         // Block termination across fork and publication, so the parent cannot
         // lose a stop request between creating and recording the child.
         sigset_t blocked,previous;sigemptyset(&blocked);sigaddset(&blocked,SIGTERM);sigaddset(&blocked,SIGINT);
@@ -103,7 +104,7 @@ int main(int argc,char **argv){
             execl(renderer,renderer,"--watch",(char*)NULL);_exit(127);
         }
         (void)sigprocmask(SIG_SETMASK,&previous,NULL);
-        int status=0;
+        int status=-1;
         if(pid<0){fprintf(stderr,"DESKTOP_SUPERVISOR_FORK_FAILED errno=%d\n",forkError);}
         else{
             pid_t done;
@@ -111,13 +112,14 @@ int main(int argc,char **argv){
             do {done=waitpid(pid,&status,0);if(done<0 && errno==EINTR && stopping)(void)kill(pid,SIGTERM);}
             while(done<0 && errno==EINTR);
             if(done<0){fprintf(stderr,"DESKTOP_SUPERVISOR_WAIT_FAILED errno=%d\n",errno);return 1;}
-            if(stopping)break;
-            fprintf(stderr,"DESKTOP_SUPERVISOR_EXIT status=%d retry_s=%u\n",status,prompt_recovery(status)?1u:delay);
         }
-        (void)clock_gettime(CLOCK_MONOTONIC,&finished);
-        if(finished.tv_sec-started.tv_sec>=30)delay=1;
-        if(pid>0 && prompt_recovery(status)){if(stopping)break;sleep_seconds(1);delay=1;continue;}
-        sleep_seconds(delay);if(delay<30)delay=delay>15?30:delay*2;
+        if(stopping)break;
+        const bool finished_ok=monotonic_ns(&finished_ns);
+        const uint64_t runtime_ns=pid>0 && started_ok && finished_ok && finished_ns>=started_ns?
+            finished_ns-started_ns:0;
+        const unsigned delay=desktop_restart_delay(&restart,status,finished_ok,finished_ns,runtime_ns);
+        if(pid>0)fprintf(stderr,"DESKTOP_SUPERVISOR_EXIT status=%d retry_s=%u\n",status,delay);
+        sleep_seconds(delay);
     }
     return 0;
 }
