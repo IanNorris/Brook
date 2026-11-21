@@ -4,6 +4,7 @@
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "pid_namespace.h"
+#include "gpu_window_peer_retirement.h"
 #include "syscall.h"
 #include "busybox_applets.h"
 #include "cpu.h"
@@ -424,6 +425,10 @@ resolve_path:
         if(!__atomic_load_n(&proc->oomEpisode,__ATOMIC_ACQUIRE))
             __atomic_store_n(&proc->tgidExiting, false, __ATOMIC_RELEASE);
     }
+
+    // Crossing the exec commit point never carries boot-service authority
+    // into the next image, even on a re-exec of the original pathname.
+    GpuWindowRevokeBootProvider(proc->incarnation);
 
     // --- Replace the process image ---
     uint64_t newStackPtr = 0;

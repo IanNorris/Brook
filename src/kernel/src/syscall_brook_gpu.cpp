@@ -4,6 +4,8 @@
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "kprintf.h"
+#include "apic.h"
+#include "desktop_identity.h"
 
 #include "syscall.h"
 #include "gpu_output_abi.h"
@@ -27,6 +29,20 @@
 #include "process_user_namespace.h"
 
 namespace brook {
+
+static uint64_t g_gpuBootProviderIncarnation;
+
+bool GpuWindowPinBootProvider(uint64_t incarnation) {
+    uint64_t empty = 0;
+    return incarnation && __atomic_compare_exchange_n(&g_gpuBootProviderIncarnation, &empty, incarnation,
+                                                      false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+}
+
+void GpuWindowRevokeBootProvider(uint64_t incarnation) {
+    if (incarnation)
+        (void)__atomic_compare_exchange_n(&g_gpuBootProviderIncarnation, &incarnation, 0,
+                                          false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+}
 
 static_assert(BROOK_SYS_GPU_OUTPUT_ALLOC!=BROOK_SYS_WM_APPEARANCE &&
               BROOK_SYS_GPU_OUTPUT_ALLOC!=BROOK_SYS_WM_TASKBAR_METRICS &&
@@ -333,11 +349,20 @@ int64_t sys_brook_gpu_window_peer_recovery(uint64_t fdValue,uint64_t op,uint64_t
     }
     if(!authorized)return -EPERM;
     if(op==BROOK_GPU_WINDOW_PEER_RESTART){
-        if(ProcessReadIds(proc,false).effective!=0 || !ProcessCapable(proc,nullptr,CapSysAdmin))return -EPERM;
+        const auto ids = ProcessReadIds(proc, false);
+        const uint64_t caller = UnixCurrentIncarnation(proc);
+        const uint64_t bootProvider = __atomic_load_n(&g_gpuBootProviderIncarnation, __ATOMIC_ACQUIRE);
+        const bool desktop = ids.real == DesktopUid && ids.effective == DesktopUid && ids.saved == DesktopUid &&
+            !proc->userNamespace;
+        const bool admin = ids.effective == 0 && ProcessCapable(proc, nullptr, CapSysAdmin);
+        if (!GpuWindowRestartProvider(caller, socket->connectingIncarnation, bootProvider, desktop, admin))
+            return -EPERM;
         if(!socket->rxPipe || !socket->txPipe ||
            !__atomic_load_n(&socket->rxPipe->unixReadShutdown,__ATOMIC_ACQUIRE) ||
            !__atomic_load_n(&socket->txPipe->unixWriteShutdown,__ATOMIC_ACQUIRE))return -EPERM;
-        if(retired || !brook::BdwOffscreenRendererOwnedBy(peerIncarnation))return 0;
+        const auto recovery = BdwOffscreenRendererRecovery(peerIncarnation);
+        if (recovery == BdwRendererRecovery::NoOwner) return -ENOTCONN;
+        if (retired) return -EALREADY;
         auto* target=SchedulerFindProcessReference(static_cast<uint16_t>(peer.pid));
         if(!target)return -ESRCH;
         if(target->isThread || target->isKernelThread || target->incarnation!=peerIncarnation){
@@ -348,11 +373,19 @@ int64_t sys_brook_gpu_window_peer_recovery(uint64_t fdValue,uint64_t op,uint64_t
         // Resolve the process first, and signal outside the registry lock.
         SpinLockAcquire(&g_unixRegistryLock);
         auto* direction=socket->incomingFds;
-        const bool restart=direction && direction->gpuRendererRetirement.ClaimRestart(peerIncarnation);
+        using Restart = GpuWindowPeerRetirement::Restart;
+        // Pending work gets bounded grace. Neither the deadline, this
+        // snapshot, nor the resulting signal proves any buffer is reusable.
+        const auto decision = direction ? direction->gpuRendererRetirement.CheckRestart(
+            peerIncarnation, recovery != BdwRendererRecovery::NoOwner,
+            recovery == BdwRendererRecovery::Pending, ApicTickCount()) : Restart::NoOwner;
+        const bool restart = decision == Restart::Ready && direction->gpuRendererRetirement.ClaimRestart(peerIncarnation);
         SpinLockRelease(&g_unixRegistryLock);
-        const int result=restart?ProcessSendSignal(target,9,nullptr,proc):0;
+        if (restart) SchedulerRequestFatalSignal(target, BROOK_GPU_WINDOW_RESTART_SIGNAL);
         ProcessUnref(target);
-        return result;
+        if (restart) return 0;
+        if (decision == Restart::Busy) return -EAGAIN;
+        return decision == Restart::NoOwner ? -ENOTCONN : -EALREADY;
     }
     if(bufferFd>=MAX_FDS)return -EBADF;
     FdRef source(proc,static_cast<int>(bufferFd));auto* bufferEntry=source.get();

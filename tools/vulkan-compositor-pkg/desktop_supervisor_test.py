@@ -126,3 +126,43 @@ with tempfile.TemporaryDirectory(prefix="brook-supervisor-source-") as tmp:
 assert subprocess.run([sys.argv[1],"--gpu-source","relative","/bin/true"],capture_output=True).returncode==2
 assert subprocess.run([sys.argv[1],"--trace-gpu-source","/bin/true"],capture_output=True).returncode==2
 print("DESKTOP_SUPERVISOR_SOURCE_PASS")
+
+with tempfile.TemporaryDirectory(prefix="brook-supervisor-kernel-restart-") as tmp:
+    root = Path(tmp)
+    starts = root / "starts"
+    child = root / "renderer"
+    child.write_text('#!/bin/sh\n'
+                     'echo x >> "$BROOK_TEST_STARTS"\n'
+                     'case "$(wc -l < "$BROOK_TEST_STARTS")" in\n'
+                     '  1|4) kill -KILL "$$";;\n'
+                     '  2) exit 7;;\n'
+                     '  3) kill -USR2 "$$";;\n'
+                     'esac\n'
+                     'exec sleep 30\n')
+    child.chmod(0o755)
+    env = dict(os.environ, BROOK_TEST_STARTS=str(starts))
+    proc = subprocess.Popen([sys.argv[1], str(child)], env=env, stderr=subprocess.PIPE)
+    try:
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            if starts.exists() and len(starts.read_text().splitlines()) >= 5:
+                break
+            assert proc.poll() is None
+            time.sleep(0.05)
+        assert starts.read_text().splitlines() == ["x"] * 5
+        proc.send_signal(signal.SIGTERM)
+        _, stderr = proc.communicate(timeout=5)
+        assert proc.returncode == 0
+        exited = [line for line in stderr.decode().splitlines() if "SUPERVISOR_EXIT" in line]
+        assert exited == [
+            f"DESKTOP_SUPERVISOR_EXIT status={signal.SIGKILL} retry_s=1",
+            "DESKTOP_SUPERVISOR_EXIT status=1792 retry_s=2",
+            f"DESKTOP_SUPERVISOR_EXIT status={signal.SIGUSR2} retry_s=1",
+            f"DESKTOP_SUPERVISOR_EXIT status={signal.SIGKILL} retry_s=1",
+        ], exited
+    finally:
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGTERM)
+            proc.wait(timeout=5)
+        proc.stderr.close()
+print("DESKTOP_SUPERVISOR_KERNEL_RESTART_PASS")

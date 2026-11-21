@@ -28,6 +28,8 @@ namespace brook {
 // Execute a boot script from a VFS path.
 // Returns 0 on success, -1 if the file could not be opened or a command failed.
 int ShellExecScript(const char* path);
+// Only the kernel's verified guarded desktop handoff calls this entry point.
+int ShellExecGuardedDesktop();
 
 // Execute an inline script under the same serialized dispatch rules.
 int ShellExecString(const char* script);

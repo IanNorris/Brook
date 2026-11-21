@@ -1026,6 +1026,20 @@ int64_t BdwOffscreenPresentResult(uint64_t owner,uint64_t ticket){
     KMutexUnlock(&presentMutex);
     return result;
 }
+BdwRendererRecovery BdwOffscreenRendererRecovery(uint64_t owner) {
+    if (!owner || !InitOffscreenMutex()) return BdwRendererRecovery::NoOwner;
+    KMutexLock(&offscreenMutex);
+    auto result = BdwRendererRecovery::NoOwner;
+    if (offscreenSession.OwnedBy(owner)) {
+        BdwExecOwnerWork work{};
+        const bool pending = offscreenSession.Recovering(owner) ||
+            (applicationWorker.InspectOwner(owner, work) &&
+             (work.queued || work.active || work.quarantined || work.retiring || work.preparing));
+        result = pending ? BdwRendererRecovery::Pending : BdwRendererRecovery::Idle;
+    }
+    KMutexUnlock(&offscreenMutex);
+    return result;
+}
 void BdwOffscreenPresentCounts(uint64_t& accepted,uint64_t& presented){
     accepted=__atomic_load_n(&asyncPresentAccepted,__ATOMIC_RELAXED);
     presented=__atomic_load_n(&asyncPresentPresented,__ATOMIC_RELAXED);

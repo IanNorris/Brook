@@ -11,7 +11,13 @@
  * DRAIN on the authorized provider endpoint requires this receipt or reaping
  * of the exact renderer group, plus successful per-buffer GPU/scanout
  * retirement. EAGAIN means retry, EIO means uncertain or failed.
- * RESTART is a privileged escalation on an abandoned, unretired connection. */
+ * RESTART requires the current connecting process to be the boot-pinned
+ * provider or an initial administrator. ENOTCONN reports loss of renderer
+ * ownership; EAGAIN defers to the renderer's bounded recovery grace. */
+#define BROOK_GPU_WINDOW_PEER_RECOVERY_GRACE_MS 60000
+/* Linux x86-64 SIGUSR2 wait status, forced by the kernel even if masked or
+ * ignored by the renderer. The supervisor uses it only for retry timing. */
+#define BROOK_GPU_WINDOW_RESTART_SIGNAL 12
 #define BROOK_SYS_GPU_WINDOW_PEER_RECOVERY 0xB1E
 #define BROOK_GPU_WINDOW_PEER_AUTH 0
 #define BROOK_GPU_WINDOW_PEER_DRAIN 1

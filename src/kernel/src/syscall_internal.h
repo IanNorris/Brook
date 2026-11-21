@@ -38,6 +38,7 @@ static constexpr int64_t ENOTDIR = 20;
 static constexpr int64_t EIO     = 5;
 static constexpr int64_t ENOTSOCK = 88;
 static constexpr int64_t ENOTCONN = 107;
+static constexpr int64_t EALREADY = 114;
 static constexpr int64_t EAFNOSUPPORT = 97;
 static constexpr int64_t ECONNREFUSED = 111;
 static constexpr int64_t ETIMEDOUT    = 110;
