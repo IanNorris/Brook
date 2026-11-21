@@ -146,6 +146,14 @@ static_assert(sizeof(Prdt)==16,"AHCI PRDT size");
 
 struct PortIo {
     volatile uint32_t* regs=nullptr;
+    uint32_t lastCompletionFis=0;
+    bool allowStaleTaskBusy=false;
+    uint32_t receivedRegisterFis() {
+        return *reinterpret_cast<volatile const uint32_t*>(dma+fisOffset+0x40);
+    }
+    void clearReceivedRegisterFis() {
+        *reinterpret_cast<volatile uint32_t*>(dma+fisOffset+0x40)=0;
+    }
     uint32_t read(uint32_t offset) { return regs[offset/4]; }
     void write(uint32_t offset,uint32_t value) { regs[offset/4]=value; }
     void fence() { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
@@ -316,9 +324,10 @@ void Quarantine(const char* reason) {
 const char* CommandFailure(Result result) {
     switch (result) {
     case Result::Busy: return "slot-active";
-    case Result::DeviceBusy: return "task-busy";
+    case Result::DeviceBusy: return "preissue-task-busy";
     case Result::Timeout: return "timeout";
     case Result::DeviceError: return "device-error";
+    case Result::CompletionUnconfirmed: return "completion-unconfirmed";
     case Result::ShortTransfer: return "short-transfer";
     case Result::MediaChanged: return "media-change";
     default: return "unexpected-result";
@@ -377,13 +386,8 @@ bool Run(const AhciReadPlan& plan, uint32_t expected) {
     const auto result=isFlush ? SubmitNoData(io) : Submit(io,expected);
     if(result!=Result::Ok) {
         ReportCommandFailure(plan,expected,CommandFailure(result));
-        Quarantine(result==Result::MediaChanged ? "AHCI SATA media changed" : "AHCI command failed or timed out");
-        return false;
-    }
-    const uint8_t* d2h=dma+fisOffset+0x40;
-    if(d2h[0]==0x34 && (d2h[2]&1u)) {
-        ReportCommandFailure(plan,expected,"ata-status");
-        Quarantine("ATA device reported an error");
+        if(NeedsQuarantine(result))
+            Quarantine(result==Result::MediaChanged ? "AHCI SATA media changed" : "AHCI command failed or timed out");
         return false;
     }
     StorageIoAccount(uint32_t(StorageIoSource::Ahci),isFlush?2:plan.fis[2]==0x35?1:0,expected);
@@ -670,6 +674,7 @@ void AhciReadOnlyInit() {
         PciCommand(original);status.reason="AHCI bus mastering could not be disabled";return;
     }
     status.port=selected;portRegs=hba+(0x100+selected*0x80)/4;io.regs=portRegs;dma64=(cap&(1u<<31))!=0;
+    io.allowStaleTaskBusy=pci.vendorId==0x15ad && pci.deviceId==0x07e0;
     const auto phys=PmmAllocPagesAccounted(pages,MemTag::Device,KernelPid,PmmOwner::AhciDma);
     if(!phys){PciCommand(original);status.reason="AHCI DMA allocation failed";return;}
     dmaPhys=phys.raw();

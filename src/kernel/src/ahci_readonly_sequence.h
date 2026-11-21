@@ -13,7 +13,32 @@ static constexpr uint32_t ERROR_MASK=(1u<<30)|(1u<<29)|(1u<<28)|(1u<<27)|(1u<<24
 static constexpr uint32_t MEDIA_CHANGE_IRQ=(1u<<31)|(1u<<6);
 static constexpr uint32_t MEDIA_CHANGE_SERR=(1u<<26);
 static constexpr uint32_t ATA_SIGNATURE=0x00000101u;
-enum class Result : uint8_t { Ok, Busy, InvalidDma, DeviceBusy, Timeout, DeviceError, ShortTransfer, MediaChanged };
+enum class Result : uint8_t {
+    Ok, Busy, InvalidDma, DeviceBusy, Timeout, DeviceError, CompletionUnconfirmed, ShortTransfer, MediaChanged
+};
+static constexpr uint32_t D2H_REGISTER_IRQ=1u, TASK_ACTIVE=0x88u, TASK_ERROR=0x21u;
+// AHCI 1.3.1 §3.3.12: unrecovered and protocol errors. Recovered errors
+// and PhyRdy changes remain independent of the command outcome.
+static constexpr uint32_t SERR_COMMAND_ERROR=0xf00u;
+static constexpr uint64_t TASK_SETTLE_NS=100000;
+static constexpr unsigned TASK_SETTLE_POLLS=4096;
+
+inline bool RegisterFis(uint32_t fis) { return (fis&0xffu)==0x34u; }
+inline bool CleanRegisterFis(uint32_t fis) {
+    const uint32_t status=(fis>>16)&0xffu;
+    return RegisterFis(fis) && (status&(0x40u|TASK_ACTIVE|TASK_ERROR))==0x40u;
+}
+inline bool StaleBusyShadow(uint32_t task, uint32_t interruptStatus, uint32_t fis) {
+    return task==0xc0u && (interruptStatus&D2H_REGISTER_IRQ) &&
+        CleanRegisterFis(fis) && !(fis>>24);
+}
+inline bool NeedsQuarantine(Result result) {
+    // Never reuse a slot that might still DMA, and never proceed after an
+    // explicit controller, device or media error. A retired but unconfirmed
+    // transfer returns I/O failure without taking the port offline.
+    return result==Result::Busy || result==Result::Timeout ||
+        result==Result::DeviceError || result==Result::MediaChanged;
+}
 
 static constexpr uint64_t MEDIA_SETTLE_NS=10000000;
 static constexpr unsigned MEDIA_SETTLE_POLLS=16384;
@@ -45,18 +70,49 @@ template<class Io> bool MediaChanged(Io& io, uint32_t& interruptStatus) {
     return true;
 }
 
-// Preserve hotplug latches even if they assert between the check and the
-// acknowledgement. SERR is cleared only at Prepare, before identification.
+template<class Io> bool CommandError(Io& io, uint32_t interruptStatus, uint32_t task) {
+    return (interruptStatus&ERROR_MASK) || task==0xffffffffu || (task&TASK_ERROR) ||
+        (io.read(SERR)&SERR_COMMAND_ERROR);
+}
+
+// A single owner prepares slot zero. AHCI 1.3.1 §5.5.1 permits posting a
+// command to an empty slot, and the HBA controls when it transmits. On the
+// VMware 15ad:07e0 controller the task-file busy shadow can lag a verified
+// prior command. Let the HBA issue the next command in that narrow case.
+// The prior FIS can justify queueing only. Clear it before any new issue.
 template<class Io> Result ArmCommand(Io& io) {
     uint32_t pending=io.read(IS);
     if(MediaChanged(io,pending))return Result::MediaChanged;
-    const uint32_t task=io.read(TFD);
-    if(task==0xffffffffu)return Result::DeviceError;
-    if(task&0x88u)return Result::DeviceBusy;
-    io.write(IS,~MEDIA_CHANGE_IRQ);io.fence();
+    uint32_t task=io.read(TFD);
+    if(CommandError(io,pending,task))return Result::DeviceError;
+    bool postWithBusyShadow=false;
+    if(task&TASK_ACTIVE) {
+        const uint64_t start=io.nowNs();
+        for(unsigned poll=0;poll<TASK_SETTLE_POLLS && (task&TASK_ACTIVE);++poll) {
+            const uint64_t now=io.nowNs();
+            if(now<start || now-start>=TASK_SETTLE_NS)break;
+            io.pause();
+            pending=io.read(IS);
+            if(MediaChanged(io,pending))return Result::MediaChanged;
+            task=io.read(TFD);
+            if(CommandError(io,pending,task))return Result::DeviceError;
+        }
+        postWithBusyShadow=io.allowStaleTaskBusy &&
+            StaleBusyShadow(task,pending,io.lastCompletionFis) &&
+            io.receivedRegisterFis()==io.lastCompletionFis;
+        if((task&TASK_ACTIVE) && !postWithBusyShadow)return Result::DeviceBusy;
+    }
+    if(io.read(CI) || io.read(SACT))return Result::Busy;
+    io.lastCompletionFis=0;
+    io.clearReceivedRegisterFis();
+    // Preserve error and hotplug latches even if one asserts during W1C.
+    io.write(IS,~(MEDIA_CHANGE_IRQ|ERROR_MASK));io.fence();
     pending=io.read(IS);
     if(MediaChanged(io,pending))return Result::MediaChanged;
-    if(pending&1u)return Result::DeviceError;
+    task=io.read(TFD);
+    if(CommandError(io,pending,task))return Result::DeviceError;
+    if((pending&D2H_REGISTER_IRQ) || ((task&TASK_ACTIVE) && !(postWithBusyShadow && task==0xc0u)))
+        return Result::DeviceBusy;
     io.write(CI,1);
     return Result::Ok;
 }
@@ -108,6 +164,32 @@ template<class Io> bool Quiesce(Io& io) {
     return cmd!=0xffffffffu && !(cmd&(ST|FRE|CR|FR));
 }
 
+// Called after the issue bit cleared. Neither a previous FIS nor a
+// reset PRDBC can prove a new write succeeded. AHCI 1.3.1 §§5.3.8.1–2
+// require the HBA to publish status and PRDBC before clearing the slot.
+template<class Io> Result CompleteCommand(Io& io, uint32_t expectedBytes) {
+    io.fence();
+    uint32_t completed=io.read(IS);
+    if(MediaChanged(io,completed))return Result::MediaChanged;
+    if(io.read(CI) || io.read(SACT))return Result::Busy;
+    const uint32_t task=io.read(TFD), fis=io.receivedRegisterFis();
+    if(CommandError(io,completed,task) || (RegisterFis(fis) && ((fis>>16)&TASK_ERROR)))
+        return Result::DeviceError;
+    if(RegisterFis(fis) && ((fis>>16)&TASK_ACTIVE))return Result::CompletionUnconfirmed;
+    const bool cleanFis=CleanRegisterFis(fis);
+    if(!expectedBytes) {
+        const uint32_t engine=io.read(CMD);
+        if(engine==0xffffffffu || (engine&(ST|FRE))!=(ST|FRE))return Result::DeviceError;
+        // CI alone is insufficient for no-data commands if the issue write was lost.
+        if(!(completed&D2H_REGISTER_IRQ) || !cleanFis)return Result::CompletionUnconfirmed;
+    }
+    if((task&TASK_ACTIVE) && !(io.allowStaleTaskBusy && StaleBusyShadow(task,completed,fis)))
+        return Result::CompletionUnconfirmed;
+    if(io.transferred()!=expectedBytes)return Result::ShortTransfer;
+    if(cleanFis)io.lastCompletionFis=fis;
+    return Result::Ok;
+}
+
 // The caller prepared slot zero and holds its sleepable serialization lock.
 // Io::transferred reads PRDBC after the completion fence.
 template<class Io> Result Submit(Io& io, uint32_t expectedBytes) {
@@ -115,17 +197,11 @@ template<class Io> Result Submit(Io& io, uint32_t expectedBytes) {
     const auto armed=ArmCommand(io);
     if(armed!=Result::Ok)return armed;
     if(!io.waitClear(CI,1))return Result::Timeout;
-    io.fence();
-    uint32_t completed=io.read(IS);
-    if(MediaChanged(io,completed))return Result::MediaChanged;
-    if((completed&ERROR_MASK) || (io.read(TFD)&1u))return Result::DeviceError;
-    if(io.transferred()!=expectedBytes)return Result::ShortTransfer;
-    return Result::Ok;
+    return CompleteCommand(io,expectedBytes);
 }
 
-// For no-data commands only. A flush may take much longer than ordinary
-// sector I/O, so its caller provides a separate bounded completion wait.
-// This helper does not construct or select any ATA command itself.
+// A flush may take much longer than ordinary sector I/O, so its caller
+// provides a separate bounded completion wait.
 template<class Io> Result SubmitNoData(Io& io) {
     const uint32_t cmd=io.read(CMD),ci=io.read(CI),sact=io.read(SACT);
     if(cmd==0xffffffffu || ci==0xffffffffu || sact==0xffffffffu ||
@@ -134,16 +210,7 @@ template<class Io> Result SubmitNoData(Io& io) {
     const auto armed=ArmCommand(io);
     if(armed!=Result::Ok)return armed;
     if(!io.waitClearFlush(CI,1))return Result::Timeout;
-    io.fence();
-    uint32_t completed=io.read(IS);
-    if(MediaChanged(io,completed))return Result::MediaChanged;
-    const uint32_t task=io.read(TFD),engine=io.read(CMD);
-    // A newly received device-to-host register FIS proves that a no-data
-    // command completed; CI alone may already be clear if a write was lost.
-    if(task==0xffffffffu || engine==0xffffffffu ||
-       !(completed&1u) || (completed&ERROR_MASK) || (task&0xa9u) ||
-       (engine&(ST|FRE))!=(ST|FRE))return Result::DeviceError;
-    return io.transferred()==0 ? Result::Ok : Result::ShortTransfer;
+    return CompleteCommand(io,0);
 }
 } // namespace ahci_ro
 } // namespace brook
