@@ -267,8 +267,8 @@ static void KernelConsoleThread(void* /*arg*/)
     // changes its viewport: no allocation per mouse motion, and no stale fixed
     // 800x400 content under a larger frame. Kernel-owned pixels have no client
     // that can acknowledge WM resize events.
-    uint32_t* screen=nullptr;uint32_t backingW=CONSOLE_W,backingH=CONSOLE_H,stride=0;
-    TtyGetFramebuffer(&screen,&backingW,&backingH,&stride);
+    uint32_t backingW=CONSOLE_W,backingH=CONSOLE_H;
+    TtyGetFramebufferDimensions(&backingW,&backingH,nullptr);
     if (!CompositorSetupProcess(self, 20, 60, backingW, backingH, 1))
     {
         SerialPuts("KCONSOLE: failed to set up VFB\n");

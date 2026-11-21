@@ -1191,9 +1191,8 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         {
             constexpr uint32_t STATUS_BAR_LINES = 6;
             uint32_t barH = STATUS_BAR_LINES * brook::TtyLineHeight();
-            uint32_t fbW = 0, fbH = 0, fbStride = 0;
-            uint32_t* fbPtr = nullptr;
-            brook::TtyGetFramebuffer(&fbPtr, &fbW, &fbH, &fbStride);
+            uint32_t fbW = 0, fbH = 0;
+            brook::TtyGetFramebufferDimensions(&fbW, &fbH, nullptr);
             if (fbH > barH)
                 brook::TtySetRegion(0, fbH - barH, fbW, barH);
         }

@@ -1,5 +1,6 @@
 #include "framebuffer_fence.h"
 #include "tty.h"
+#include "tty_framebuffer_gate.h"
 #include "boot_logo.h"
 #include "font_atlas.h"
 #include "memory/virtual_memory.h"
@@ -11,6 +12,27 @@ namespace brook {
 
 // Set when TTY has been redirected to a compositor backbuffer.
 static bool g_ttyUsingBackbuffer = false;
+static bool g_ttyReady = false;
+static TtyFramebufferGate g_framebufferGate;
+
+class TtyFramebufferUser {
+public:
+    explicit TtyFramebufferUser(TtyFramebufferGate::Access access = TtyFramebufferGate::Access::Draw)
+        : access_(access), admitted_(g_framebufferGate.TryEnter(access)) {}
+    ~TtyFramebufferUser() { Release(); }
+    TtyFramebufferUser(const TtyFramebufferUser&) = delete;
+    TtyFramebufferUser& operator=(const TtyFramebufferUser&) = delete;
+    explicit operator bool() const { return admitted_; }
+    void Release()
+    {
+        if (!admitted_) return;
+        g_framebufferGate.Leave(access_);
+        admitted_ = false;
+    }
+private:
+    TtyFramebufferGate::Access access_;
+    bool admitted_;
+};
 
 // ---------------------------------------------------------------------------
 // TTY state
@@ -32,7 +54,11 @@ static void SelectTtyFont(uint32_t width, uint32_t height)
     g_ttyFont = width >= 2560 && height >= 1440 ? &g_desktopFont200 : &g_fontAtlas;
 }
 
-uint32_t TtyLineHeight() { return static_cast<uint32_t>(g_ttyFont->lineHeight); }
+uint32_t TtyLineHeight()
+{
+    TtyFramebufferUser user(TtyFramebufferGate::Access::Read);
+    return static_cast<uint32_t>((user ? g_ttyFont : &g_fontAtlas)->lineHeight);
+}
 
 static int        g_curX              = 0;        // current pen X (pixels)
 static int        g_curY              = 0;        // current line top Y (pixels)
@@ -57,13 +83,11 @@ static uint32_t  g_rh  = 0;  // height
 
 static void RecalcRegion()
 {
-    g_rx = g_regionX;
-    g_ry = g_regionY;
-    g_rw = (g_regionW > 0) ? g_regionW : g_fbWidth;
-    g_rh = (g_regionH > 0) ? g_regionH : g_fbHeight;
-    // Clamp to framebuffer
-    if (g_rx + g_rw > g_fbWidth)  g_rw = g_fbWidth - g_rx;
-    if (g_ry + g_rh > g_fbHeight) g_rh = g_fbHeight - g_ry;
+    const auto region = TtyClipRegion(g_fbWidth, g_fbHeight, g_regionX, g_regionY, g_regionW, g_regionH);
+    g_rx = region.x;
+    g_ry = region.y;
+    g_rw = region.width;
+    g_rh = region.height;
 }
 
 // ---------------------------------------------------------------------------
@@ -103,11 +127,12 @@ static inline void WritePixel(int x, int y, uint8_t coverage)
 
 static void ScrollUp()
 {
-    int lh = g_ttyFont->lineHeight;
+    const uint32_t lineHeight = static_cast<uint32_t>(g_ttyFont->lineHeight);
+    const uint32_t lines = lineHeight < g_rh ? lineHeight : g_rh;
     // Move rows within the region up by one line height.
-    for (uint32_t row = 0; (int)row + lh < (int)g_rh; row++)
+    for (uint32_t row = 0; row < g_rh - lines; row++)
     {
-        uint32_t srcRow = g_ry + row + (uint32_t)lh;
+        uint32_t srcRow = g_ry + row + lines;
         uint32_t dstRow = g_ry + row;
         const volatile uint32_t* src = g_fbPixels + srcRow * g_fbStride + g_rx;
         volatile uint32_t*       dst = g_fbPixels + dstRow * g_fbStride + g_rx;
@@ -115,7 +140,7 @@ static void ScrollUp()
             dst[col] = src[col];
     }
     // Clear the bottom lh rows within the region.
-    for (uint32_t row = g_rh - (uint32_t)lh; row < g_rh; row++)
+    for (uint32_t row = g_rh - lines; row < g_rh; row++)
         for (uint32_t col = 0; col < g_rw; col++)
             g_fbPixels[(g_ry + row) * g_fbStride + (g_rx + col)] = g_bgColor;
 }
@@ -128,7 +153,8 @@ static void Newline()
     if ((uint32_t)(g_curY + g_ttyFont->lineHeight) > g_rh)
     {
         ScrollUp();
-        g_curY = (int)g_rh - g_ttyFont->lineHeight;
+        g_curY = g_rh < static_cast<uint32_t>(g_ttyFont->lineHeight) ? 0 :
+            static_cast<int>(g_rh) - g_ttyFont->lineHeight;
     }
 }
 
@@ -226,6 +252,7 @@ bool TtyInit(const Framebuffer& fb)
             g_fbPixels[y * g_fbStride + x] = g_bgColor;
 
     FramebufferWriteFence();
+    __atomic_store_n(&g_ttyReady, true, __ATOMIC_RELEASE);
     SerialPrintf("TTY: %ux%u framebuffer mapped at virt 0x%p phys 0x%lx, "
                  "font %upx (lineHeight=%u ascent=%u)\n",
                  g_fbWidth, g_fbHeight,
@@ -280,26 +307,22 @@ static void AnsiApplySgr()
     }
 }
 
-void TtyPutChar(char c)
+static bool PutFramebufferChar(char c)
 {
-    if (!g_fbPixels) return;
-    if (TtyDisplaySuppressed()) return;
-    struct Fence { ~Fence() { FramebufferWriteFence(); } } fence;
-
     // ANSI escape sequence state machine
     if (g_ansiState == TTY_ESC) {
-        if (c == '[') { g_ansiState = TTY_CSI; g_ansiParamCount = 0; g_ansiParams[0] = 0; return; }
+        if (c == '[') { g_ansiState = TTY_CSI; g_ansiParamCount = 0; g_ansiParams[0] = 0; return false; }
         g_ansiState = TTY_NORMAL; // not a CSI sequence, fall through
     }
     if (g_ansiState == TTY_CSI) {
         if (c >= '0' && c <= '9') {
             if (g_ansiParamCount == 0) g_ansiParamCount = 1;
             g_ansiParams[g_ansiParamCount - 1] = g_ansiParams[g_ansiParamCount - 1] * 10 + (c - '0');
-            return;
+            return false;
         }
         if (c == ';') {
             if (g_ansiParamCount < 8) { g_ansiParams[g_ansiParamCount] = 0; g_ansiParamCount++; }
-            return;
+            return false;
         }
         // Final byte — apply command
         if (c == 'm') AnsiApplySgr();
@@ -320,9 +343,9 @@ void TtyPutChar(char c)
             g_curY = 0;
         }
         g_ansiState = TTY_NORMAL;
-        return;
+        return false;
     }
-    if (c == '\033') { g_ansiState = TTY_ESC; return; }
+    if (c == '\033') { g_ansiState = TTY_ESC; return false; }
 
     const FontAtlas& fa = *g_ttyFont;
     int code = static_cast<uint8_t>(c);
@@ -343,20 +366,20 @@ void TtyPutChar(char c)
                             g_fbPixels[off + col];
                 }
             }
-            CompositorMarkDirty(); CompositorWake();
+            return true;
         }
-        return;
+        return false;
     }
     case '\r':
         g_curX = 0;
-        return;
+        return false;
     case '\b':
     {
         // Move cursor back one character width
         int spAdv = fa.glyphCount > 0 ? fa.glyphs[0].advance : 8;
         g_curX -= spAdv;
         if (g_curX < 0) g_curX = 0;
-        return;
+        return false;
     }
     case '\t':
     {
@@ -365,7 +388,7 @@ void TtyPutChar(char c)
         int tabStop = spAdv * 8;
         g_curX = ((g_curX / tabStop) + 1) * tabStop;
         if ((uint32_t)g_curX >= g_rw) Newline();
-        return;
+        return false;
     }
     default:
         break;
@@ -406,6 +429,21 @@ void TtyPutChar(char c)
                             g_fbPixels[y * g_fbStride + x];
             }
         }
+        return true;
+    }
+    return false;
+}
+
+void TtyPutChar(char c)
+{
+    bool dirty;
+    {
+        TtyFramebufferUser user;
+        if (!user || !g_fbPixels || TtyDisplaySuppressed()) return;
+        dirty = PutFramebufferChar(c);
+        FramebufferWriteFence();
+    }
+    if (dirty) {
         CompositorMarkDirty();
         CompositorWake();
     }
@@ -539,39 +577,54 @@ void TtyPrintf(const char* fmt, ...)
 
 void TtySetColors(uint32_t fg, uint32_t bg)
 {
+    TtyFramebufferUser user;
+    if (!user) return;
     g_fgColor = fg;
     g_bgColor = bg;
 }
 
-void TtyClear()
+static bool ClearFramebufferRegion()
 {
-    if (!g_fbPixels) return;
+    if (!g_fbPixels) return false;
     for (uint32_t y = 0; y < g_rh; y++)
         for (uint32_t x = 0; x < g_rw; x++)
-            g_fbPixels[(g_ry + y) * g_fbStride + (g_rx + x)] = g_bgColor;
+            g_fbPixels[uint64_t(g_ry + y) * g_fbStride + (g_rx + x)] = g_bgColor;
     g_curX = 0;
     g_curY = 0;
     FramebufferWriteFence();
-    if (g_ttyUsingBackbuffer) CompositorMarkDirty();
+    return g_ttyUsingBackbuffer;
+}
+
+void TtyClear()
+{
+    bool dirty;
+    {
+        TtyFramebufferUser user;
+        if (!user) return;
+        dirty = ClearFramebufferRegion();
+    }
+    if (dirty) CompositorMarkDirty();
 }
 
 bool TtyReady()
 {
-    return g_fbPixels != nullptr;
+    return __atomic_load_n(&g_ttyReady, __ATOMIC_ACQUIRE);
 }
 
 void TtySetRegion(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 {
-    g_regionX = x;
-    g_regionY = y;
-    g_regionW = w;
-    g_regionH = h;
-    RecalcRegion();
-    // Reset cursor to top-left of the new region.
-    g_curX = 0;
-    g_curY = 0;
-    // Clear the region.
-    TtyClear();
+    bool dirty;
+    {
+        TtyFramebufferUser user;
+        if (!user) return;
+        g_regionX = x;
+        g_regionY = y;
+        g_regionW = w;
+        g_regionH = h;
+        RecalcRegion();
+        dirty = ClearFramebufferRegion();
+    }
+    if (dirty) CompositorMarkDirty();
 }
 
 void TtySuppressDisplay(bool suppress)
@@ -581,27 +634,84 @@ void TtySuppressDisplay(bool suppress)
 
 bool TtyDisplaySuppressed(){return __atomic_load_n(&g_displaySuppressed,__ATOMIC_ACQUIRE);}
 
-bool TtyGetFramebuffer(uint32_t** outPixels, uint32_t* outWidth,
-                       uint32_t* outHeight, uint32_t* outStride)
+static void ReadFramebufferDimensions(uint32_t* width, uint32_t* height, uint32_t* strideBytes)
 {
-    if (!g_fbPixels) return false;
-    *outPixels = const_cast<uint32_t*>(const_cast<volatile uint32_t**>(&g_fbPixels)[0]);
-    *outWidth  = g_fbWidth;
-    *outHeight = g_fbHeight;
-    *outStride = g_fbStride * 4; // convert from pixel stride to byte stride
+    if (width) *width = g_fbWidth;
+    if (height) *height = g_fbHeight;
+    if (strideBytes) *strideBytes = g_fbStride * 4;
+}
+
+bool TtyGetFramebufferDimensions(uint32_t* width, uint32_t* height, uint32_t* strideBytes)
+{
+    TtyFramebufferUser user(TtyFramebufferGate::Access::Read);
+    if (!user || !g_fbPixels) return false;
+    ReadFramebufferDimensions(width, height, strideBytes);
     return true;
 }
 
-volatile uint32_t* TtyGetFramebufferMmio() { return g_fbMMIO; }
+bool TtyTryDrawFramebuffer(TtyFramebufferDrawer draw, void* context)
+{
+    TtyFramebufferUser user;
+    if (!user || !draw || !g_fbPixels) return false;
+    draw(const_cast<uint32_t*>(g_fbPixels), g_fbWidth, g_fbHeight, g_fbStride, context);
+    FramebufferWriteFence();
+    return true;
+}
+
+bool TtyGetFramebuffer(uint32_t** outPixels, uint32_t* outWidth,
+                       uint32_t* outHeight, uint32_t* outStride)
+{
+    TtyFramebufferUser user(TtyFramebufferGate::Access::Legacy);
+    if (!user || !g_fbPixels) return false;
+    *outPixels = const_cast<uint32_t*>(g_fbPixels);
+    ReadFramebufferDimensions(outWidth, outHeight, outStride);
+    return true;
+}
+
+volatile uint32_t* TtyGetFramebufferMmio()
+{
+    TtyFramebufferUser user(TtyFramebufferGate::Access::Read);
+    return user ? g_fbMMIO : nullptr;
+}
 
 bool TtyGetFramebufferPhys(uint64_t* outPhysBase, uint32_t* outWidth,
                            uint32_t* outHeight, uint32_t* outStride)
 {
-    if (!g_fbPixels) return false;
+    TtyFramebufferUser user(TtyFramebufferGate::Access::Read);
+    if (!user || !g_fbPixels) return false;
     *outPhysBase = g_fbPhysBase;
-    *outWidth    = g_fbWidth;
-    *outHeight   = g_fbHeight;
-    *outStride   = g_fbStride * 4; // byte stride
+    ReadFramebufferDimensions(outWidth, outHeight, outStride);
+    return true;
+}
+
+TtyFramebufferUpdate::TtyFramebufferUpdate() : closed_(g_framebufferGate.TryClose()) {}
+TtyFramebufferUpdate::~TtyFramebufferUpdate() { if (closed_) g_framebufferGate.Open(); }
+bool TtyFramebufferUpdate::Drained() const { return closed_ && g_framebufferGate.Drained(); }
+
+bool TtyFramebufferUpdate::Publish(uint64_t physical, volatile uint32_t* mmio, uint32_t* backbuffer,
+                                   uint32_t width, uint32_t height, uint32_t stridePixels)
+{
+    constexpr uint32_t maxDimension = 32767; // Display coordinates also feed signed WM positions.
+    constexpr uint32_t maxIndex = ~uint32_t{0};
+    if (!Drained() || !mmio || !backbuffer || !width || !height || stridePixels < width ||
+        width > maxDimension || height > maxDimension || stridePixels > maxIndex / 4 ||
+        uint64_t(stridePixels) * height > maxIndex) return false;
+
+    g_fbPixels = backbuffer;
+    g_fbMMIO = mmio;
+    g_fbPhysBase = physical;
+    g_fbWidth = width;
+    g_fbHeight = height;
+    g_fbStride = stridePixels;
+    g_ttyUsingBackbuffer = true;
+    SelectTtyFont(width, height);
+    g_curX = g_curY = 0;
+    g_regionX = g_regionY = g_regionW = g_regionH = 0;
+    RecalcRegion();
+    g_ansiState = TTY_NORMAL;
+    g_ansiParamCount = 0;
+    g_framebufferGate.MakeManaged();
+    __atomic_store_n(&g_ttyReady, true, __ATOMIC_RELEASE);
     return true;
 }
 
@@ -611,6 +721,8 @@ bool TtyGetFramebufferPhys(uint64_t* outPhysBase, uint32_t* outWidth,
 
 void TtyRemap(uint64_t newPhysBase, uint32_t w, uint32_t h, uint32_t stridePixels)
 {
+    TtyFramebufferUser user(TtyFramebufferGate::Access::Legacy);
+    if (!user) return;
     uint64_t fbBytes = static_cast<uint64_t>(stridePixels) * 4 * h;
     uint64_t fbPages = (fbBytes + 4095u) / 4096u;
 
@@ -618,11 +730,13 @@ void TtyRemap(uint64_t newPhysBase, uint32_t w, uint32_t h, uint32_t stridePixel
     if(!fbVirt) {
         uint64_t cacheFlags=0;
         if(!VmmFramebufferCacheFlags(newPhysBase,fbPages*4096,cacheFlags)) {
+            user.Release();
             SerialPuts("TTY: framebuffer alias would mix cache types\n");return;
         }
         // Allocate virtual address range for the new framebuffer.
         fbVirt = VmmAllocPages(fbPages, VMM_WRITABLE, MemTag::Device, KernelPid).raw();
         if (fbVirt == 0) {
+            user.Release();
             SerialPuts("TTY: TtyRemap VmmAllocPages failed\n");
             return;
         }
@@ -638,6 +752,7 @@ void TtyRemap(uint64_t newPhysBase, uint32_t w, uint32_t h, uint32_t stridePixel
                             VMM_WRITABLE | VMM_NO_EXEC | cacheFlags,
                             MemTag::Device, KernelPid))
             {
+                user.Release();
                 SerialPrintf("TTY: TtyRemap VmmMapPage failed at page %lu\n", i);
                 return;
             }
@@ -645,7 +760,7 @@ void TtyRemap(uint64_t newPhysBase, uint32_t w, uint32_t h, uint32_t stridePixel
 
     }
 
-    // Update TTY state atomically (no lock needed — caller ensures serialisation).
+    // Legacy callers serialize the boot or display takeover.
     g_fbPixels   = reinterpret_cast<volatile uint32_t*>(fbVirt);
     g_fbMMIO     = reinterpret_cast<volatile uint32_t*>(fbVirt);
     g_fbPhysBase = newPhysBase;
@@ -666,6 +781,8 @@ void TtyRemap(uint64_t newPhysBase, uint32_t w, uint32_t h, uint32_t stridePixel
             g_fbPixels[y2 * stridePixels + x2] = g_bgColor;
 
     FramebufferWriteFence();
+    __atomic_store_n(&g_ttyReady, true, __ATOMIC_RELEASE);
+    user.Release();
     if(BootLogoActive())BootLogoProgress(65,"Display");
 
     SerialPrintf("TTY: remapped to %ux%u at phys 0x%lx, virt 0x%lx\n",
@@ -674,10 +791,12 @@ void TtyRemap(uint64_t newPhysBase, uint32_t w, uint32_t h, uint32_t stridePixel
 
 void TtyRedirectToBackbuffer(uint32_t* backbuffer)
 {
-    if (backbuffer)
+    TtyFramebufferUser user(TtyFramebufferGate::Access::Legacy);
+    if (user && backbuffer)
     {
         g_fbPixels = reinterpret_cast<volatile uint32_t*>(backbuffer);
         g_ttyUsingBackbuffer = true;
+        user.Release();
         SerialPrintf("TTY: redirected to backbuffer 0x%lx\n",
                      reinterpret_cast<uint64_t>(backbuffer));
     }

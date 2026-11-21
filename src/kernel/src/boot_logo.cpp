@@ -1,4 +1,3 @@
-#include "framebuffer_fence.h"
 #include "boot_logo.h"
 #include "brook_boot_logo_data.h"
 #include "boot_splash.h"
@@ -13,10 +12,10 @@ void BootLogoProgress(uint8_t percent,const char* text){
     if(percent>100)percent=100;
     if(percent<progress)percent=progress;
     progress=percent;
-    uint32_t* fb=nullptr;uint32_t w=0,h=0,stride=0;
-    if(TtyGetFramebuffer(&fb,&w,&h,&stride))
-        DrawBootSplash(fb,w,h,stride/4,g_bootLogoData,g_bootLogoWidth,g_bootLogoHeight,percent,true);
-    FramebufferWriteFence();
+    TtyTryDrawFramebuffer([](uint32_t* pixels, uint32_t width, uint32_t height, uint32_t stride, void* arg) {
+        DrawBootSplash(pixels,width,height,stride,g_bootLogoData,g_bootLogoWidth,g_bootLogoHeight,
+                       *static_cast<uint8_t*>(arg),true);
+    }, &percent);
     SerialPrintf("BOOT: %u%% %s\n",percent,text?text:"");
 }
 void BootLogoError(uint8_t,const char* text){active=false;TtySuppressDisplay(false);SerialPrintf("BOOT ERROR: %s\n",text?text:"");}

@@ -26,21 +26,15 @@ static bool GopSetMode(uint32_t /*w*/, uint32_t /*h*/)
 
 static void GopGetMode(DisplayMode* mode)
 {
-    uint32_t* fb;
-    uint32_t w, h, stride;
-    TtyGetFramebuffer(&fb, &w, &h, &stride);
-    mode->width  = w;
-    mode->height = h;
-    mode->stride = stride;
+    *mode = {};
+    TtyGetFramebufferDimensions(&mode->width, &mode->height, &mode->stride);
     mode->bpp    = 32;
 }
 
 static volatile uint32_t* GopGetFramebuffer()
 {
-    uint32_t* fb;
-    uint32_t w, h, stride;
-    TtyGetFramebuffer(&fb, &w, &h, &stride);
-    return reinterpret_cast<volatile uint32_t*>(fb);
+    uint32_t* fb = nullptr;
+    return TtyGetFramebuffer(&fb, nullptr, nullptr, nullptr) ? fb : TtyGetFramebufferMmio();
 }
 
 static uint64_t GopGetFramebufferPhys()
