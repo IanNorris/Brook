@@ -71,6 +71,7 @@ class BdwClientScanoutFlip {
 public:
     bool Busy() const {return pending_ || restoring_ || uncertain_;}
     bool Uncertain() const {return uncertain_;}
+    bool CanObserve() const {return pending_ && !restoring_ && !uncertain_;}
     bool Restoring() const {return restoring_;}
     const BdwClientScanoutImage& Front() const {return front_;}
     const BdwClientScanoutImage& Armed() const {return armed_;}
@@ -142,6 +143,28 @@ public:
         if(elapsed>=4)uncertain_=true;
         return false;
     }
+};
+
+// All transitions hold the scanout lock. A single pending wake suffices
+// because any observer poll uses the currently armed flip.
+class BdwClientLatchObserver {
+public:
+    static constexpr uint32_t PollWindowMs=24;
+    static constexpr uint32_t MaxPolls=PollWindowMs; // one poll per 1 ms sleep
+    bool Enabled() const {return enabled_;}
+    void SetEnabled(bool enabled){enabled_=enabled;}
+    bool MayPoll(bool pending,bool captureHold,bool verifyHold) const {
+        return enabled_ && pending && !captureHold && !verifyHold;
+    }
+    bool QueueWake(bool eligible){
+        if(!enabled_ || !eligible || wakeQueued_)return false;
+        wakeQueued_=true;
+        return true;
+    }
+    void ConsumeWake(){wakeQueued_=false;}
+
+private:
+    bool enabled_=false,wakeQueued_=false;
 };
 
 } // namespace brook

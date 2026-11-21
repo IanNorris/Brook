@@ -40,6 +40,8 @@ bool BdwClientScanoutService(bool canPresent);
 bool BdwClientScanoutWakeWorker();
 bool BdwClientScanoutSetApPublication(bool enabled);
 bool BdwClientScanoutApPublication();
+bool BdwClientScanoutSetOffWorkerObservation(bool enabled);
+bool BdwClientScanoutOffWorkerObservation();
 uint32_t BdwClientScanoutReadTimeline(BdwClientTimelineEntry* out,uint32_t max);
 // Address and layout are published together. Changes are permitted only
 // after the worker proves the mapping is neither programmed nor live.

@@ -503,6 +503,9 @@ uint64_t clientArmedSequence=0;
 KSemaphore clientPublicationWake{};
 uint32_t clientPublicationStarted=0;
 bool clientPublishOnAp=false;
+BdwClientLatchObserver clientObserver;
+KSemaphore clientObserverWake{};
+uint32_t clientObserverStarted=0;
 uint64_t clientPresents=0,clientLatched=0,clientRestores=0,clientFailedOffer=0;
 int32_t clientError=0;
 bool clientLeaving=false,clientGopRestore=false;
@@ -518,19 +521,30 @@ void ClientRestoreLocked(bool gopTarget){
     PlaneIo io{displayRegs[2]};
     (void)clientFlip.Restore(io,clientGopRestore?0:zcRing.Surface(zcRing.Front()));
 }
-void ClientPollLocked(){
-    if(!ClientShowing())return;
-    if(!ClientOn() || !zcRequested || zcDisabled || !zcActive)
-        ClientRestoreLocked(!zcRequested || zcDisabled || !zcActive);
+bool ClientObservationPendingLocked(){
+    return ClientOn() && zcRequested && !zcDisabled && zcActive &&
+        !clientLeaving && clientFlip.CanObserve();
+}
+
+void ClientPollLocked(bool offWorker=false){
+    if(offWorker){
+        // Do not change the programmed surface or restore the GOP from
+        // this task. A worker poll still handles recovery and takeover.
+        if(!clientObserver.MayPoll(ClientObservationPendingLocked(),captureHold,zcVerifyHold))return;
+    }else{
+        if(!ClientShowing())return;
+        if(!ClientOn() || !zcRequested || zcDisabled || !zcActive)
+            ClientRestoreLocked(!zcRequested || zcDisabled || !zcActive);
+    }
     PlaneIo io{displayRegs[2]};
     const bool restoring=clientFlip.Restoring();
     if(!clientFlip.Poll(io)){
-        if(clientFlip.Uncertain() && !restoring)ClientRestoreLocked(true);
+        if(!offWorker && clientFlip.Uncertain() && !restoring)ClientRestoreLocked(true);
         return;
     }
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
     const uint64_t successor=restoring?0:clientArmedSequence;
-    if(successor)clientTimeline.Latched(successor,ElapsedClockNs());
+    if(successor)clientTimeline.Latched(successor,ElapsedClockNs(),offWorker);
     clientArmedSequence=0;
 #endif
     if(restoring){
@@ -1467,6 +1481,57 @@ static bool PublishClientRequest(bool onAp,bool canPresent){
     return true;
 }
 
+static void ClientObservationWorker(void*){
+    for(;;){
+        KSemaphoreWait(&clientObserverWake);
+        // Approximately one vblank plus scheduling slack at 60 Hz.
+        // Always leave the worker's original polling path available. A
+        // stalled display or a long capture cannot keep this task awake.
+        const uint64_t start=ApicTickCount();
+        for(uint32_t poll=0;poll<BdwClientLatchObserver::MaxPolls;++poll){
+            if(poll && ApicTickCount()-start>=BdwClientLatchObserver::PollWindowMs)break;
+            const uint64_t f=IrqSpinLockAcquire(&lock);
+            if(!poll)clientObserver.ConsumeWake();
+            ClientPollLocked(true);
+            const bool pending=clientObserver.Enabled() && ClientObservationPendingLocked();
+            IrqSpinLockRelease(&lock,f);
+            if(!pending || poll+1==BdwClientLatchObserver::MaxPolls)break;
+            SchedulerSleepMs(1);
+        }
+    }
+}
+
+static bool InitClientObservationWorker(){
+    uint32_t expected=0;
+    if(!__atomic_compare_exchange_n(&clientObserverStarted,&expected,1,false,
+                                    __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))return expected==2;
+    KSemaphoreInit(&clientObserverWake,0);
+    auto* worker=KernelThreadCreate("gpu-latch",ClientObservationWorker,nullptr);
+    if(worker){
+        worker->cpuAffinity=1;
+        SchedulerAddProcess(worker);
+    }
+    __atomic_store_n(&clientObserverStarted,worker?2u:0u,__ATOMIC_RELEASE);
+    return worker!=nullptr;
+}
+
+bool BdwClientScanoutSetOffWorkerObservation(bool enabled){
+    if(enabled && (SmpGetCpuCount()<2 || !InitClientObservationWorker()))return false;
+    const uint64_t f=IrqSpinLockAcquire(&lock);
+    clientObserver.SetEnabled(enabled);
+    const bool wake=clientObserver.QueueWake(ClientObservationPendingLocked());
+    IrqSpinLockRelease(&lock,f);
+    if(wake)KSemaphoreSignal(&clientObserverWake);
+    return true;
+}
+
+bool BdwClientScanoutOffWorkerObservation(){
+    const uint64_t f=IrqSpinLockAcquire(&lock);
+    const bool enabled=clientObserver.Enabled();
+    IrqSpinLockRelease(&lock,f);
+    return enabled;
+}
+
 static void ClientPublicationWorker(void*){
     for(;;){
         KSemaphoreWait(&clientPublicationWake);
@@ -1598,7 +1663,7 @@ bool BdwClientScanoutService(bool canPresent){
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
     const uint64_t boundAt=Rdtsc();
 #endif
-    bool accepted=false;
+    bool accepted=false,wakeObserver=false;
     {
         const uint64_t f=IrqSpinLockAcquire(&lock);
         if(bound && clientRequest.publication.CanArm() && !clientLeaving && zcActive && zcRequested && !zcDisabled &&
@@ -1617,6 +1682,7 @@ bool BdwClientScanoutService(bool canPresent){
             clientArmedSequence=choice->timelineSequence=request.timelineSequence;
             clientTimeline.Armed(clientArmedSequence,ElapsedClockNs());
 #endif
+            wakeObserver=clientObserver.QueueWake(true);
         }else{
             BdwGpuBufferEndCpuTransition(request.buffer);
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
@@ -1628,6 +1694,7 @@ bool BdwClientScanoutService(bool canPresent){
         clientRequest={};
         IrqSpinLockRelease(&lock,f);
     }
+    if(wakeObserver)KSemaphoreSignal(&clientObserverWake);
     BdwGpuBufferUnref(request.buffer);
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
     const uint64_t end=Rdtsc();
@@ -1755,6 +1822,8 @@ bool BdwClientScanoutWorkPending(){return false;}
 bool BdwClientScanoutService(bool){return false;}
 bool BdwClientScanoutSetApPublication(bool){return false;}
 bool BdwClientScanoutApPublication(){return false;}
+bool BdwClientScanoutSetOffWorkerObservation(bool){return false;}
+bool BdwClientScanoutOffWorkerObservation(){return false;}
 uint32_t BdwClientScanoutReadTimeline(BdwClientTimelineEntry*,uint32_t){return 0;}
 bool BdwCursorRequest(bool){return false;}
 BdwCursorStatus BdwCursorReadStatus(){return {};}

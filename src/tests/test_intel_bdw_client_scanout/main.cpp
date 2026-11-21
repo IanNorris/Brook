@@ -48,14 +48,14 @@ static void CheckTimeline(){
     timeline.Flushed(second,1024,1032);
     timeline.Armed(second,1034);
     assert(timeline.Read(rows,2)==2 && !rows[0].retiredNs && !rows[1].latchNs);
-    timeline.Latched(second,1040);
+    timeline.Latched(second,1040,true);
     timeline.Retired(first,1041,BdwClientRetirement::Replacement,second);
     assert(timeline.Read(rows,2)==2 && rows[0].sequence==first && rows[1].sequence==second);
     assert(rows[0].owner==10 && rows[0].offer==41 && rows[0].buffer==80 && !rows[0].publishOnAp);
     assert(rows[0].admittedNs==1000 && rows[0].flushStartNs==1001 && rows[0].flushEndNs==1008);
     assert(rows[0].armNs==1012 && rows[0].latchNs==1020 && rows[0].retiredNs==1041);
     assert(rows[0].retiredBy==rows[1].sequence && rows[0].retirement==BdwClientRetirement::Replacement);
-    assert(rows[1].publishOnAp && rows[1].latchNs<rows[0].retiredNs);
+    assert(rows[1].publishOnAp && rows[1].latchOffWorker && !rows[0].latchOffWorker && rows[1].latchNs<rows[0].retiredNs);
     timeline.Retired(second,1044,BdwClientRetirement::Restore);
     const uint64_t failed=timeline.Admit(11,42,82,true,1045);
     timeline.Retired(failed,1046,BdwClientRetirement::Rejected);
@@ -72,8 +72,52 @@ static void CheckTimeline(){
     }
 }
 
+static void CheckObserver(){
+    BdwClientLatchObserver observer;
+    assert(!observer.Enabled() && !observer.QueueWake(true) && !observer.MayPoll(true,false,false));
+    observer.SetEnabled(true);
+    assert(observer.MayPoll(true,false,false));
+    assert(!observer.MayPoll(false,false,false));
+    assert(!observer.MayPoll(true,true,false) && !observer.MayPoll(true,false,true));
+    assert(!observer.QueueWake(false) && observer.QueueWake(true) && !observer.QueueWake(true));
+    observer.SetEnabled(false);
+    assert(!observer.QueueWake(true));
+    observer.SetEnabled(true);
+    assert(!observer.QueueWake(true)); // one wake remains pending through the toggle
+    observer.ConsumeWake();
+    assert(observer.QueueWake(true));
+    observer.ConsumeWake();
+
+    const BdwClientScanoutLayout linear{12800,false}, tiled{13312,true};
+    const BdwClientScanoutImage first{0x10000000,1,linear}, next{0x12000000,2,tiled};
+    FakeDisplay io;
+    BdwClientScanoutFlip flip;
+    assert(!flip.CanObserve() && flip.Arm(io,first,0));
+    assert(flip.CanObserve() && !flip.Poll(io)); // no later vblank
+    io.Vblank();
+    assert(flip.Poll(io) && !flip.CanObserve());
+
+    assert(flip.Arm(io,next,0));
+    ++io.frame; // vblank count alone cannot release the previous mapping
+    assert(flip.CanObserve() && !flip.Poll(io) && flip.Contains(first.base));
+    io.live=next.base;io.stride=linear.stride;
+    assert(!flip.Poll(io) && flip.Contains(first.base));
+    io.stride=tiled.stride;
+    assert(flip.Poll(io) && !flip.Contains(first.base) && !flip.CanObserve());
+
+    assert(flip.Arm(io,first,0) && flip.Restore(io,0));
+    assert(!flip.CanObserve() && flip.Contains(next.base) && flip.Contains(first.base));
+    io.Vblank();
+    assert(flip.Poll(io) && !flip.Contains(next.base) && !flip.Contains(first.base));
+
+    assert(flip.Arm(io,first,0));
+    io.frame+=4;
+    assert(!flip.Poll(io) && !flip.CanObserve() && flip.Contains(first.base));
+}
+
 int main(){
     CheckTimeline();
+    CheckObserver();
     constexpr BdwClientScanoutLayout linear{12800,false}, tiled{13312,true};
     assert(linear.Valid() && tiled.Valid() && tiled.Pages()>linear.Pages());
     assert((!BdwClientScanoutLayout{12864,true}.Valid()));

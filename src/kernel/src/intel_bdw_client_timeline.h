@@ -12,7 +12,7 @@ struct BdwClientTimelineEntry {
     uint64_t sequence=0, owner=0, offer=0, buffer=0;
     uint64_t admittedNs=0, flushStartNs=0, flushEndNs=0, armNs=0, latchNs=0, retiredNs=0;
     uint64_t retiredBy=0;
-    bool publishOnAp=false;
+    bool publishOnAp=false,latchOffWorker=false;
     BdwClientRetirement retirement=BdwClientRetirement::Held;
 };
 
@@ -41,8 +41,8 @@ public:
     void Armed(uint64_t sequence,uint64_t now){
         if(auto* entry=Find(sequence))entry->armNs=now;
     }
-    void Latched(uint64_t sequence,uint64_t now){
-        if(auto* entry=Find(sequence))entry->latchNs=now;
+    void Latched(uint64_t sequence,uint64_t now,bool offWorker=false){
+        if(auto* entry=Find(sequence)){entry->latchNs=now;entry->latchOffWorker=offWorker;}
     }
     void Retired(uint64_t sequence,uint64_t now,BdwClientRetirement reason,uint64_t successor=0){
         if(auto* entry=Find(sequence)){

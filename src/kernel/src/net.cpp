@@ -7734,7 +7734,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             BdwClientTimelineEntry entries[BdwClientTimeline::Capacity];
             const uint32_t n=BdwClientScanoutReadTimeline(entries,BdwClientTimeline::Capacity);
             BridgeReply r;r.text("{");r.field("count",n);
-            r.text(",\"clock\":\"monotonic\",\"columns\":[\"sequence\",\"owner\",\"offer\",\"buffer\",\"worker\",\"admitted_us\",\"flush_start_us\",\"flush_end_us\",\"arm_us\",\"latch_us\",\"retired_us\",\"retired_by\",\"retirement\"],\"rows\":[");
+            r.text(",\"clock\":\"monotonic\",\"columns\":[\"sequence\",\"owner\",\"offer\",\"buffer\",\"worker\",\"admitted_us\",\"flush_start_us\",\"flush_end_us\",\"arm_us\",\"latch_us\",\"retired_us\",\"retired_by\",\"retirement\",\"latch_observer\"],\"rows\":[");
             for(uint32_t i=0;i<n;++i){
                 const auto& e=entries[i];
                 if(i)r.text(",");
@@ -7750,9 +7750,10 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
                     case BdwClientRetirement::Restore:r.quoted("restore");break;
                     case BdwClientRetirement::Rejected:r.quoted("rejected");break;
                 }
+                r.text(",");r.quoted(!e.latchNs?"none":e.latchOffWorker?"offworker":"existing");
                 r.text("]");
             }
-            r.text("],\"scope\":\"client direct scanout, oldest first; offer is renderer frame ID, buffer is DMA-BUF inode, zero time means phase not reached; latch is observed in hardware; retired is release of the kernel buffer hold; retired_by is the replacement sequence, or zero on restore or failure\"}\n");
+            r.text("],\"scope\":\"client direct scanout, oldest first; offer is renderer frame ID, buffer is DMA-BUF inode, zero time means phase not reached; latch is the first poll that proved the surface live; existing covers the original polling paths; retired is release of the kernel buffer hold; retired_by is the replacement sequence, or zero on restore or failure\"}\n");
             r.send();return;
         }
         if(NetStrEq(cmd,"gpu zerocopy timeline")){
@@ -7784,8 +7785,11 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         }else if(NetStrEq(cmd,"gpu zerocopy publish bsp") || NetStrEq(cmd,"gpu zerocopy publish ap")){
             ok=BdwClientScanoutSetApPublication(NetStrEq(cmd,"gpu zerocopy publish ap"));
             note=ok?"client publication worker set for new requests":"client publication worker unavailable";
+        }else if(NetStrEq(cmd,"gpu zerocopy client-observe worker") || NetStrEq(cmd,"gpu zerocopy client-observe offworker")){
+            ok=BdwClientScanoutSetOffWorkerObservation(NetStrEq(cmd,"gpu zerocopy client-observe offworker"));
+            note=ok?"client latch observation mode set":"off-worker client latch observer unavailable";
         }else if(!NetStrEq(cmd,"gpu zerocopy status")){
-            DebugChannelSend("{\"error\":\"usage: gpu zerocopy arm|off|status|verify|timeline|client-timeline|cache flush|cache uc|cache wt|publish bsp|publish ap\"}\n");return;
+            DebugChannelSend("{\"error\":\"usage: gpu zerocopy arm|off|status|verify|timeline|client-timeline|cache flush|cache uc|cache wt|publish bsp|publish ap|client-observe worker|client-observe offworker\"}\n");return;
         }
         BdwZeroCopyStatus z{};BdwZeroCopyReadStatus(z);
         BridgeReply r;r.text("{\"ok\":");r.text(ok?"true":"false");r.text(",\"note\":");r.quoted(note);
@@ -7804,6 +7808,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",\"auto_arm\":");r.text(BdwZeroCopyAutoArm()?"true":"false");
         r.text(",\"cache_mode\":");r.quoted(BdwZeroCopyCacheModeName());
         r.text(",\"client_publication_worker\":");r.quoted(BdwClientScanoutApPublication()?"ap":"bsp");
+        r.text(",\"client_latch_observation\":");r.quoted(BdwClientScanoutOffWorkerObservation()?"offworker":"worker");
         r.text(",");r.field("render_jobs_uc",z.renderJobsUc);r.text(",");r.field("render_jobs_wb",z.renderJobsWb);
         r.text(",\"surfaces\":[");for(unsigned i=0;i<BdwZeroCopyMaxImages;++i){if(i)r.text(",");r.number(z.surfaces[i]);}
         r.text("],\"ages\":[");for(unsigned i=0;i<BdwZeroCopyMaxImages;++i){if(i)r.text(",");r.number(z.ages[i]);}
