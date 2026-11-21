@@ -28,13 +28,21 @@ let
     services = [ "dbus" "message" ];
   };
   inherit (selection) selected launcherIds;
+  cliPackageSets = [ "python3Packages" "xfce" "kdePackages" ];
   packageFor = name:
-    let attrPath = lib.splitString "." name;
-        package = lib.attrByPath attrPath null pkgs;
+    let
+      components = lib.splitString "." name;
+      first = lib.head components;
+      allowed = builtins.match "[A-Za-z0-9_+-]+(\\.[A-Za-z0-9_+-]+)*" name != null
+        && (if lib.length components == 1 then
+          !(lib.hasPrefix "pkgs" first || lib.hasPrefix "__" first)
+        else builtins.elem first cliPackageSets && lib.length components == 2);
+      package = if allowed then lib.attrByPath components null pkgs else null;
+      host = package.stdenv.hostPlatform.system or (package.system or null);
     in
-      if builtins.match "[A-Za-z0-9_+-]+(\\.[A-Za-z0-9_+-]+)*" name == null ||
-         !lib.isDerivation package || !(lib.meta.availableOn pkgs.stdenv.hostPlatform package)
-      then throw "Unknown Brook extra package: ${name}"
+      if !allowed || !lib.isDerivation package || host != "x86_64-linux" ||
+         !(lib.meta.availableOn pkgs.stdenv.hostPlatform package)
+      then throw "Unknown or unsupported Brook x86_64 package: ${name}"
       else package;
   cliPackages = map
     (p: if !lib.isDerivation p then throw "Brook extra packages must be Nix derivations"
@@ -148,7 +156,7 @@ assert builtins.elem target [ "dell-pair" "vmware" "qemu" "usb" ] || throw "Unkn
 assert lib.length extraPackageNames == lib.length (lib.unique extraPackageNames) ||
   throw "Repeated Brook extra package name";
 if preset == "network" then
-  assert apps == [ ] && extraPackages == [ ] && extraPackageNames == [ ] ||
+  assert apps == [ ] && extraPackages == [ ] && extraPackageNames == [ ] && !allowUnfree ||
     throw "The Brook compatibility preset cannot be combined with app or package selections";
   compat // {
     manifest = {

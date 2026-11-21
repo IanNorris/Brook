@@ -31,6 +31,7 @@ let
   mismatches = lib.filterAttrs (name: version: (kernelCapabilities.${name} or null) != version)
     requiredCapabilities;
 in
+assert !(publicRelease && allowUnfree) || throw "Public Brook images cannot opt into unfree apps";
 assert rejectDuplicates "app IDs" apps;
 assert rejectDuplicates "launcher IDs" launcherIds;
 assert rejectDuplicates "executables" executables;
@@ -39,5 +40,5 @@ assert kernelCapabilities == null || mismatches == { } ||
   throw "Kernel lacks Brook capability: ${lib.concatStringsSep ", " (builtins.attrNames mismatches)}";
 {
   inherit selected launcherIds requiredServices requiredCapabilities optionalCapabilities;
-  redistributable = !lib.any (app: app.unfree) selected;
+  redistributable = !allowUnfree && !lib.any (app: app.unfree) selected;
 }
