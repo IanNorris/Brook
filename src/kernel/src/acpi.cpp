@@ -240,9 +240,10 @@ AcpiS5Info AcpiGetS5Info()
             SerialPrintf("ACPI: S5 invalid root entry at inventory index %u\n",i+1);
             return refuse("S5: invalid ACPI root entry");
         }
-        const bool ssdt=__builtin_memcmp(table.signature,"SSDT",4)==0;
-        if(dsdtRegionReferences && (ssdt || __builtin_memcmp(table.signature,"PSDT",4)==0 ||
-                                   __builtin_memcmp(table.signature,"DSDT",4)==0))
+        const auto* sig=table.signature;
+        const bool definition=sig[1]=='S' && sig[2]=='D' && sig[3]=='T';
+        const bool ssdt=definition && sig[0]=='S';
+        if(dsdtRegionReferences && definition && (ssdt || sig[0]=='P' || sig[0]=='D'))
             return refuse("S5: DSDT region references with other definition tables");
         if(!ssdt)continue;
         uint8_t a=0,b=0;
