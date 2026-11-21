@@ -10,6 +10,11 @@ struct AhciReadOnlyStatus {
     uint64_t sectors=0;
     char model[41]{}, serial[21]{};
 };
+// Read-only snapshot of the selected port's MMIO registers.
+struct AhciPortRegisters {
+    bool available=false;
+    uint32_t cmd=0, sctl=0, ssts=0, serr=0;
+};
 // Runtime completion-wait statistics (relaxed counters). irqMode reports
 // whether completion interrupts are currently in use.
 struct AhciIoStats {
@@ -26,7 +31,7 @@ AhciIrqStatus AhciReadOnlyIrqStatus();
 // Runtime spin budget before an interrupt sleep, 0..2000 us (diagnostic).
 bool AhciReadOnlySetSpinUs(uint64_t us);
 uint64_t AhciReadOnlySpinUs();
-AhciReadOnlyStatus AhciReadOnlyGetStatus();
+AhciReadOnlyStatus AhciReadOnlyGetStatus(AhciPortRegisters* registers=nullptr);
 // Boot-only, borrowed device pointer: available only for an identity-admitted,
 // ready writable disk. The registered device remains pinned for the boot.
 Device* AhciWriteAdmittedDevice();
