@@ -2,6 +2,7 @@
 """Check selected-profile QEMU inputs before an offline image is assembled."""
 
 import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +10,8 @@ from unittest.mock import patch
 
 import archive_public_qemu
 import make_public_qemu
+import image_profile
+import prepare_hardware_store
 from selected_launchers import collect_selected
 
 
@@ -80,6 +83,42 @@ class SelectedQemuTest(unittest.TestCase):
         metadata['profile'] += '-other'
         with self.assertRaisesRegex(ValueError, 'does not match the requested store root'):
             make_public_qemu.developer_seed(self.root, metadata, self.root)
+
+    def test_embedded_manifest_binds_selection_and_package_metadata(self):
+        embedded = self.root / 'share/brook/profile.json'
+        embedded.parent.mkdir(parents=True)
+        selection = self.selection
+        manifest = selection['manifest']
+        manifest['packages'] = []
+        with patch('image_profile.store_path', return_value=self.root):
+            with self.assertRaisesRegex(ValueError, 'no readable embedded manifest'):
+                image_profile.verify_realized_selection(selection)
+            embedded.write_text(json.dumps(manifest))
+            self.assertEqual(image_profile.verify_realized_selection(selection), self.root)
+            manifest['redistributable'] = True
+            with self.assertRaisesRegex(ValueError, 'differs from its embedded manifest'):
+                image_profile.verify_realized_selection(selection)
+            embedded.write_text(json.dumps(manifest))
+            selection['packages'] = [{'name': 'extra', 'version': '1', 'store': '0' * 32 + '-extra'}]
+            with self.assertRaisesRegex(ValueError, 'package metadata differs'):
+                image_profile.verify_realized_selection(selection)
+
+    def test_measured_store_free_space_changes_only_automatic_capacity(self):
+        mib = prepare_hardware_store.MIB
+        image = self.root / 'STORE.IMG'
+        image.touch()
+        with patch('prepare_hardware_store.free_space', return_value=160 * mib):
+            with self.assertRaisesRegex(ValueError, 'at least 2016 MiB'):
+                prepare_hardware_store.grow_selected_store(image, 1664 * mib, 4096 * mib, False)
+            with self.assertRaisesRegex(ValueError, 'at least 2016 MiB'):
+                prepare_hardware_store.grow_selected_store(image, 1664 * mib, 2000 * mib, True)
+        self.assertEqual(image.stat().st_size, 0)
+        with patch('prepare_hardware_store.free_space', side_effect=[160 * mib, 512 * mib]):
+            with patch('prepare_hardware_store.run') as resize:
+                result = prepare_hardware_store.grow_selected_store(image, 1664 * mib, 4096 * mib, True)
+            resize.assert_called_once_with('resize2fs', image)
+        self.assertEqual(result, 2024 * mib)
+        self.assertEqual(image.stat().st_size, result)
 
     def test_public_mode_rejects_selected_seed_and_archive(self):
         (self.root / 'manifest.json').write_text(

@@ -52,6 +52,24 @@ def load_selection(path, profile=None):
     return validate_selection(selection, profile)
 
 
+def verify_realized_selection(selection):
+    validate_selection(selection)
+    profile = store_path(selection["profile"])
+    if not profile.is_dir() or profile.resolve(strict=True) != profile:
+        raise ValueError("Selected profile must be a realized Nix store directory")
+    manifest = selection["manifest"]
+    if manifest.get("preset") is None:
+        try:
+            embedded = json.loads((profile / "share/brook/profile.json").read_text())
+        except (OSError, ValueError) as error:
+            raise ValueError("Selected profile has no readable embedded manifest") from error
+        if embedded != manifest:
+            raise ValueError("Selected profile differs from its embedded manifest")
+        if selection["packages"] != embedded.get("packages"):
+            raise ValueError("Selected package metadata differs from the embedded manifest")
+    return profile
+
+
 def nix_json(*args):
     return json.loads(subprocess.check_output(
         ["nix-instantiate", "--eval", "--strict", "--json", *map(str, args)],

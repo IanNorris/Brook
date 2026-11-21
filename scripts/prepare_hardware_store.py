@@ -24,7 +24,9 @@ from collect_desktop_entries import collect
 from selected_launchers import collect_selected
 
 ROOT = Path(__file__).resolve().parents[1]
+MIB = 1024 * 1024
 FAT_FILE_MAX = 0xfffffe00
+MIN_FREE = 512 * MIB
 INTEL_VULKAN_DIR = 'system/graphics/intel-vulkan-26.0.6-brook1'
 
 
@@ -127,6 +129,55 @@ def remove_seed(seed):
     shutil.rmtree(seed)
 
 
+def free_space(image):
+    with image.open('rb') as stream:
+        stream.seek(1024)
+        return struct.unpack_from('<I', stream.read(1024), 12)[0] * 4096
+
+
+def grow_selected_store(image, size, limit, auto):
+    free = free_space(image)
+    while free < MIN_FREE:
+        minimum = (size + MIN_FREE - free + MIB - 1) // MIB
+        if not auto or minimum * MIB > limit:
+            raise ValueError(f'Selected store needs at least {minimum} MiB to leave 512 MiB free')
+        # Growth itself allocates more group metadata. Try with a little
+        # additional room before normalizing ownership on the final image.
+        grown = min((minimum + 8) * MIB, limit // MIB * MIB)
+        if grown <= size:
+            raise ValueError(f'Selected store cannot leave 512 MiB free within {limit // MIB} MiB')
+        with image.open('r+b') as stream:
+            stream.truncate(grown)
+        run('resize2fs', image)
+        size = grown
+        free = free_space(image)
+    return size
+
+
+def format_store(image, size, seed, identifier, inodes, limit, auto):
+    args = ['mke2fs', '-q', '-t', 'ext2', '-b', '4096', '-I', '128', '-m', '0',
+            '-N', str(inodes), '-O', 'none,filetype,sparse_super,large_file',
+            '-U', identifier, '-L', 'BRKDESKTOP', '-d', seed, image]
+    while True:
+        with image.open('wb') as stream:
+            stream.truncate(size)
+        if not auto:
+            run(*args)
+            return size
+        result = subprocess.run(list(map(str, args)), cwd=ROOT, text=True, capture_output=True,
+                                env=dict(os.environ, LC_ALL='C'))
+        if result.returncode == 0:
+            if result.stderr:
+                print(result.stderr, end='')
+            return size
+        # mke2fs can run out of space before writing a complete filesystem.
+        # Retry only that condition, on our own private image file.
+        grown = min(size + max(size // (4 * MIB), 128) * MIB, limit // MIB * MIB)
+        if 'Could not allocate block' not in result.stderr or grown <= size:
+            raise ValueError(f'Could not format selected store at {size // MIB} MiB: {result.stderr.strip()}')
+        size = grown
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--profile', type=Path)
@@ -135,15 +186,19 @@ def main():
     source.add_argument('--profile-selection', type=Path, help='Metadata for the realized selected-app profile')
     parser.add_argument('--index', type=Path, default=ROOT/'tools/nix-index/packages.idx')
     parser.add_argument('--size-mib', type=int, default=3840)
+    parser.add_argument('--auto-size', action='store_true',
+                        help='Allow a selected profile to grow beyond its estimated size')
     parser.add_argument('--direct-ahci', action='store_true',
                         help='Allow a larger image for a direct partition, outside a FAT32 file')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
+    if args.auto_size and not args.profile_selection:
+        parser.error('--auto-size requires --profile-selection')
     selection = None
     if args.profile_selection:
-        from image_profile import load_selection
+        from image_profile import load_selection, verify_realized_selection
         selection = load_selection(args.profile_selection, args.profile)
-        profile = Path(selection['profile']).resolve(strict=True)
+        profile = verify_realized_selection(selection)
     elif args.profile:
         profile = args.profile.resolve(strict=True)
     else:
@@ -156,11 +211,11 @@ def main():
         index_metadata.get('system') != 'x86_64-linux' or
         index_metadata.get('allow_unfree') is not False):
         parser.error('Index provenance must match Brook\'s pinned x86_64-linux free package set; regenerate with tools/nix-index/gen-nix-index.py')
-    size = args.size_mib*1024*1024
+    size = args.size_mib * MIB
     if profile.parent != Path('/nix/store') or not profile.is_dir():
         parser.error('Profile must resolve to a built Nix store directory')
     limit = 32 * 1024 * 1024 * 1024 if args.direct_ahci else FAT_FILE_MAX
-    if not 512 * 1024 * 1024 <= size <= limit:
+    if not MIN_FREE <= size <= limit:
         parser.error('Image size is out of range for the selected disk layout')
     compiler = os.environ.get('MUSL_CC')
     if not compiler:
@@ -247,8 +302,7 @@ def main():
     identifier = str(uuid.uuid5(uuid.NAMESPACE_URL, json.dumps(identity, sort_keys=True)))
     (seed/'.brook-store.json').write_text(json.dumps({'format': 1, 'uuid': identifier, **identity}, indent=2)+'\n')
     image = output/'STORE.IMG'
-    with image.open('xb') as stream:
-        stream.truncate(size)
+    image.touch(exist_ok=False)
     inodes = 131072
     if args.direct_ahci:
         # The desktop closure can have hundreds of thousands of small files
@@ -256,14 +310,12 @@ def main():
         entries = 1 + sum(len(dirs) + len(files)
                           for _, dirs, files in os.walk(seed, followlinks=False))
         inodes = max(size // 32768, entries + max(32768, entries // 8))
-    run('mke2fs', '-q', '-t', 'ext2', '-b', '4096', '-I', '128', '-m', '0',
-        '-N', str(inodes), '-O', 'none,filetype,sparse_super,large_file',
-        '-U', identifier, '-L', 'BRKDESKTOP', '-d', seed, image)
+    size = format_store(image, size, seed, identifier, inodes, limit, args.auto_size)
+    if selection:
+        size = grow_selected_store(image, size, limit, args.auto_size)
     inventory = normalize_owners(image, output)
-    with image.open('rb') as stream:
-        stream.seek(1024);sb = stream.read(1024)
-    free_bytes = struct.unpack_from('<I', sb, 12)[0]*4096
-    if free_bytes < 512*1024*1024:
+    free_bytes = free_space(image)
+    if free_bytes < MIN_FREE:
         raise ValueError('Insufficient free space for package installation')
     with (output/'e2fsck.log').open('x') as log:
         run('e2fsck', '-fn', image, stdout=log, stderr=subprocess.STDOUT)
