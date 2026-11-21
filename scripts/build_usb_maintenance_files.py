@@ -44,7 +44,7 @@ def put(image, name, content):
 def build(output, build_root, shared, operators, payload_id, epoch):
     if "HOST_CC" not in os.environ:
         raise ValueError("Run inside the pinned nix-shell")
-    if output.exists() or build_root.exists():
+    if os.path.lexists(output) or os.path.lexists(build_root):
         raise ValueError("Use new output and build directories")
     if not (ROOT / "src/third_party/fatfs/source/ff.c").is_file() or not (
             ROOT / "vendor/uefi-headers/Include/Uefi.h").is_file():
