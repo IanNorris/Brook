@@ -15,7 +15,11 @@ def validate_launcher_ids(ids):
         raise ValueError("Invalid selected profile launcher IDs")
 
 
-def read_index(path):
+def desktop_basename(value):
+    return 0 < len(value.encode("utf-8")) < 128 and value not in (".", "..") and "/" not in value
+
+
+def read_index(path, *, strict=False):
     if not path.is_file():
         return []
     with path.open("rb") as stream:
@@ -23,9 +27,10 @@ def read_index(path):
     if len(raw) > MAX_INDEX or b"\0" in raw:
         raise ValueError(f"Invalid launcher index {path}")
     rows = []
-    for line in raw.decode("utf-8").splitlines():
+    id_valid = APP_ID.fullmatch if strict else desktop_basename
+    for line in raw.decode("utf-8").split("\n"):
         fields = line.split("\t")
-        if len(fields) in (5, 6) and fields[0] and fields[1] and APP_ID.fullmatch(fields[4]):
+        if len(fields) in (5, 6) and fields[0] and fields[1] and id_valid(fields[4]):
             rows.append(fields)
     return rows
 
@@ -39,7 +44,7 @@ def merge_selected_indexes(nix, profile, old, new, launcher_ids, overlay):
     # The signed layout admits the managed entries. Gallery ownership comes
     # from the independently validated relative desktop exports in the old
     # generation, never from an old launcher row's executable alone.
-    planned = read_index(new / INDEX)
+    planned = read_index(new / INDEX, strict=True)
     allowed = set(launcher_ids)
     if len(planned) != len(allowed) or {row[4] for row in planned} != allowed:
         raise ValueError("Managed desktop entries differ from the signed selection")

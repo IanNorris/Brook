@@ -17,7 +17,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 from stage_nar import layout_digest, profile_layout
-from stage_selected_launchers import read_index
+from stage_selected_launchers import read_index, validate_launcher_ids
 import stage_profile as legacy
 
 SOURCES = Path(__file__).resolve().parent
@@ -151,6 +151,29 @@ class SelectedGenerationTest(unittest.TestCase):
         self.assertEqual(self.active_rows()["brook.calc"],
                          ["My Calculator", "--uid 1000 gallery-calc", "", "Utility;",
                           "brook.calc", "Gallery version"])
+
+    @unittest.skipUnless(shutil.which("nix-store"), "requires nix-store")
+    def test_gallery_basename_and_unicode_title_survive(self):
+        app_id = "éditeur+tools @latest"
+        title = "Gallery\u2028Editor"
+        gallery = self.store / self.gallery_name
+        profile = self.nix / "profile"
+        desktop(gallery / "share/applications" / (app_id + ".desktop"), title, "gallery-editor")
+        (profile / "share/applications" / (app_id + ".desktop")).symlink_to(
+            f"../../../store/{self.gallery_name}/share/applications/{app_id}.desktop")
+        self.old_rows.write_text(
+            f"{title}\tgallery-editor\t\tUtility;\t{app_id}\tGallery comment\n"
+            "Unowned title\tgallery-editor\t\tUtility;\tunowned+app\n"
+        )
+        with self.assertRaisesRegex(ValueError, "Invalid selected profile launcher IDs"):
+            validate_launcher_ids([app_id])
+        plan = self.plan("6", "brook.calc", "Calculator", "selected-calc")
+        with patch.object(self.helper.os, "sync"):
+            self.helper.apply(self.nix, plan, "fixture", "6" * 32, {})
+        rows = self.active_rows()
+        self.assertEqual(set(rows), {"brook.calc", app_id})
+        self.assertEqual(rows[app_id][:2], [title, "--uid 1000 gallery-editor"])
+        self.assertEqual(rows[app_id][5], "Gallery comment")
 
     @unittest.skipUnless(shutil.which("nix-store"), "requires nix-store")
     def test_recipe_mismatch_cannot_switch_generation(self):
