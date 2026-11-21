@@ -149,6 +149,8 @@ struct PortIo {
     uint32_t read(uint32_t offset) { return regs[offset/4]; }
     void write(uint32_t offset,uint32_t value) { regs[offset/4]=value; }
     void fence() { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
+    uint64_t nowNs() { return ElapsedClockNs(); }
+    void pause() { __asm__ volatile("pause":::"memory"); }
     uint32_t transferred() {
         auto* hdr=reinterpret_cast<CommandHeader*>(dma);
         return __atomic_load_n(&hdr->transferred,__ATOMIC_ACQUIRE);
@@ -341,7 +343,10 @@ bool Run(const AhciReadPlan& plan, uint32_t expected) {
         prd->low=plan.dmaLow;prd->high=plan.dmaHigh;prd->byteCountMinusOne=plan.byteCountMinusOne;
     }
     const auto result=isFlush ? SubmitNoData(io) : Submit(io,expected);
-    if(result!=Result::Ok) { Quarantine("AHCI command failed or timed out");return false; }
+    if(result!=Result::Ok) {
+        Quarantine(result==Result::MediaChanged ? "AHCI SATA media changed" : "AHCI command failed or timed out");
+        return false;
+    }
     const uint8_t* d2h=dma+fisOffset+0x40;
     if(d2h[0]==0x34 && (d2h[2]&1u)) { Quarantine("ATA device reported an error");return false; }
     StorageIoAccount(uint32_t(StorageIoSource::Ahci),isFlush?2:plan.fis[2]==0x35?1:0,expected);
@@ -653,7 +658,7 @@ void AhciReadOnlyInit() {
     if(!io.waitClear(TFD,0x88u)) {Quarantine("AHCI device did not become ready");return;}
     // Signature may only become available after enabling FIS receive (QEMU
     // behaves this way). Do not send ATA commands to non-ATA devices.
-    if(io.read(0x24)!=0x00000101u) {Quarantine("AHCI port is not an ATA disk");return;}
+    if(io.read(SIG)!=ATA_SIGNATURE) {Quarantine("AHCI port is not an ATA disk");return;}
     AhciReadPlan plan{};
     if(!AhciPlanIdentify(plan,dmaPhys+dataOffset,dma64) || !Run(plan,512))return;
     AtaIdentifyInfo info{};
