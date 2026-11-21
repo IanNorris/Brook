@@ -96,10 +96,29 @@ def build_qemu(args):
     }, indent=2, sort_keys=True) + "\n")
 
 
+def build_vmware(args):
+    command = ["--output", args.output, "--operator-policy", args.operator_policy,
+               "--recovery-checkers-from", args.recovery_checkers_from, "--network", args.network]
+    if args.payload_id:
+        command += ["--payload-id", args.payload_id]
+    if args.data_mib is not None:
+        command += ["--data-mib", args.data_mib]
+    if args.autofit:
+        command.append("--autofit")
+    if args.apps is None and not args.packages:
+        script("make_vmware_image.py", *command)
+        return
+    from tempfile import TemporaryDirectory
+    with TemporaryDirectory(prefix="brook-image-selection-") as temp:
+        config = Path(temp) / "config.json"
+        config.write_text(json.dumps(args.config))
+        script("make_vmware_image.py", *command, "--selection-config", config)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list-apps", action="store_true")
-    parser.add_argument("--target", choices=("qemu",))
+    parser.add_argument("--target", choices=("qemu", "vmware"))
     parser.add_argument("--apps", type=csv_list, help="Comma-separated selection; empty selects the base")
     parser.add_argument("--packages", type=csv_list, default=[], help="Additional nixpkgs CLI packages")
     parser.add_argument("--data-mib", type=size, help="Store capacity, in MiB or auto (default)")
@@ -107,6 +126,11 @@ def main():
     parser.add_argument("--build", type=Path, help="Use this existing build instead of compiling Release")
     parser.add_argument("--allow-unfree", action="store_true", help="Allow approved unfree apps in a private image")
     parser.add_argument("--public-release", action="store_true", help="Require the fixed public QEMU profile")
+    parser.add_argument("--operator-policy", type=Path, help="VMware operator public keys")
+    parser.add_argument("--recovery-checkers-from", type=Path, help="VMware pinned checker initrd")
+    parser.add_argument("--network", choices=("hostonly", "nat"), default="hostonly")
+    parser.add_argument("--autofit", action="store_true", help="Enable VMware host resize hints")
+    parser.add_argument("--payload-id", help="Payload identifier for a guarded build")
     args = parser.parse_args()
     if args.list_apps:
         print(json.dumps(nix_json(ROOT / "nix/app-registry.nix", "-A", "metadata"),
@@ -116,7 +140,11 @@ def main():
         parser.error("--target and --output are required")
     if args.output.exists() or args.output.is_symlink():
         parser.error("--output must be a new directory")
-    if args.public_release and (args.apps is not None or args.packages or args.allow_unfree):
+    if args.target == "vmware" and (not args.operator_policy or not args.recovery_checkers_from):
+        parser.error("VMware requires --operator-policy and --recovery-checkers-from")
+    if args.target == "vmware" and args.build is not None:
+        parser.error("The VMware builder compiles its exact guarded kernel")
+    if args.public_release and (args.target != "qemu" or args.apps is not None or args.packages or args.allow_unfree):
         parser.error("The public release requires its fixed free-package profile")
     if args.allow_unfree and args.apps is None and not args.packages:
         parser.error("--allow-unfree requires a custom selection")
@@ -133,7 +161,7 @@ def main():
                 "publicRelease": args.public_release,
             }
             args.selection = evaluate(args.config)
-        build_qemu(args)
+        {"qemu": build_qemu, "vmware": build_vmware}[args.target](args)
     except (ValueError, KeyError, OSError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"brook_image: {error}\n")
 
