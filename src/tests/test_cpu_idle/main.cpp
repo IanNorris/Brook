@@ -1,6 +1,7 @@
 // Host tests for the idle C-state policy (cpu_idle_policy.h).
 #include "cpu_idle_policy.h"
 #include "cpu_epb_trial.h"
+#include "cpu_power_budget.h"
 #include <cassert>
 #include <cstdio>
 #include <cstring>
@@ -87,7 +88,211 @@ static void TestEpbTrial()
     assert(trial.phase==Phase::Off && trial.outcome==Outcome::Cancelled && trial.restoreFailed==1);
 }
 
+static CpuBudgetSample Power(uint32_t mw, int32_t c = 70)
+{
+    CpuBudgetSample s{};
+    s.powerValid = s.tempValid = true;
+    s.coresMw = mw;
+    s.pkgC = c;
+    return s;
+}
+
+// Pure control law: Dell numbers (min 8, max non-turbo 24, firmware 30).
+static void TestBudgetLaw()
+{
+    using R = CpuBudgetReason;
+    const CpuBudgetLimits lim{8, 23, 30};
+    CpuBudgetConfig cfg{3500, 0};
+    CpuBudgetFilter f{};
+    unsigned cap = 0;
+    // Under budget while released: hold (nothing to raise).
+    assert(CpuBudgetDecide(cfg, lim, f, cap, Power(2000)) == R::Band && cap == 0);
+    // Invalid power sample: no decision.
+    CpuBudgetSample bad = Power(9000); bad.powerValid = false;
+    assert(CpuBudgetDecide(cfg, lim, f, cap, bad) == R::NoSample && cap == 0);
+    // Over budget: needs two filtered samples, then released -> capTop (23).
+    f = {};
+    assert(CpuBudgetDecide(cfg, lim, f, cap, Power(5000)) == R::Wait || cap == 0);
+    assert(cap == 0);
+    assert(CpuBudgetDecide(cfg, lim, f, cap, Power(5000)) == R::OverPower && cap == 23);
+    // The next sample spans the step and is skipped.
+    assert(CpuBudgetDecide(cfg, lim, f, cap, Power(5000)) == R::Settling && cap == 23);
+    // Still over: one bin at a time, rate-limited to every 3 samples.
+    assert(CpuBudgetDecide(cfg, lim, f, cap, Power(4000)) == R::Wait && cap == 23);
+    assert(CpuBudgetDecide(cfg, lim, f, cap, Power(4000)) == R::OverPower && cap == 22);
+    // In the hysteresis band (3.06..3.5 W): hold indefinitely.
+    assert(CpuBudgetDecide(cfg, lim, f, cap, Power(3300)) == R::Settling);
+    for (int i = 0; i < 40; ++i) assert(CpuBudgetDecide(cfg, lim, f, cap, Power(3300)) != R::OverPower);
+    assert(cap == 22 && f.mw == 3300);
+    // Comfortably under: step up only after UpSamples filtered samples.
+    unsigned ups = 0;
+    for (int i = 0; i < 9; ++i) if (CpuBudgetDecide(cfg, lim, f, cap, Power(2500)) == R::StepUp) ++ups;
+    assert(ups == 1 && cap == 23);
+    // Release needs the turbo prediction (x(30/23)^2 ~ 1.7) to fit: 2.5 W -> 4.25 W does not.
+    for (int i = 0; i < 30; ++i) CpuBudgetDecide(cfg, lim, f, cap, Power(2500));
+    assert(cap == 23 && f.mw == 2500);
+    // 1.8 W predicts ~3.06 W: release back to the firmware request.
+    R last = R::None;
+    for (int i = 0; i < 30 && cap; ++i) last = CpuBudgetDecide(cfg, lim, f, cap, Power(1800));
+    assert(cap == 0 && last == R::Release);
+    // Clamp at the floor.
+    cap = 8; f = {};
+    CpuBudgetDecide(cfg, lim, f, cap, Power(9000));
+    assert(CpuBudgetDecide(cfg, lim, f, cap, Power(9000)) == R::AtFloor && cap == 8);
+    // Out-of-range cap is clamped into minRatio..capTop.
+    cap = 40; f = {};
+    CpuBudgetDecide(cfg, lim, f, cap, Power(3300));
+    assert(cap == 23);
+    cap = 3; f = {};
+    CpuBudgetDecide(cfg, lim, f, cap, Power(3300));
+    assert(cap == 8);
+
+    // Temperature target only: filtered temp over target after 8 samples.
+    cfg = {0, 80};
+    cap = 0; f = {};
+    for (int i = 0; i < 7; ++i) assert(CpuBudgetDecide(cfg, lim, f, cap, Power(9000, 81)) == R::Band);
+    assert(CpuBudgetDecide(cfg, lim, f, cap, Power(9000, 81)) == R::OverTemp && cap == 23);
+    // Spike >= target + 5 steps immediately (after the settle sample).
+    CpuBudgetDecide(cfg, lim, f, cap, Power(9000, 86));
+    assert(CpuBudgetDecide(cfg, lim, f, cap, Power(9000, 86)) == R::HotEmergency && cap == 22);
+    // Must be TempBandC under target to raise; power ignored without a power target.
+    CpuBudgetDecide(cfg, lim, f, cap, Power(9000, 77));
+    for (int i = 0; i < 12; ++i) assert(CpuBudgetDecide(cfg, lim, f, cap, Power(9000, 77)) != R::StepUp);
+    assert(cap == 22);
+    for (int i = 0; i < 20 && cap == 22; ++i) CpuBudgetDecide(cfg, lim, f, cap, Power(9000, 70));
+    assert(cap == 23);
+    // Both targets: either over steps down; both under needed to raise.
+    cfg = {3500, 80};
+    cap = 0; f = {};
+    CpuBudgetDecide(cfg, lim, f, cap, Power(3000, 60));
+    assert(CpuBudgetDecide(cfg, lim, f, cap, Power(3000, 60)) == R::Band && cap == 0);
+    CpuBudgetDecide(cfg, lim, f, cap, Power(3000, 90)); // emergency on the instant reading
+    assert(cap == 23);
+    CpuBudgetSample noTemp = Power(3000, 60); noTemp.tempValid = false;
+    assert(CpuBudgetDecide(cfg, lim, f, cap, noTemp) == R::NoSample);
+    // Band never collapses below MinBandMw.
+    assert(CpuBudgetLaw::BandMw(1000) == 200 && CpuBudgetLaw::BandMw(4000) == 500);
+}
+
+struct FakeCtl {
+    unsigned ratio[4] = {30, 30, 30, 30};
+    unsigned writes = 0;
+    bool stuck = false;
+};
+
+static void TestBudgetApply()
+{
+    using Phase = CpuPowerBudget::Phase;
+    using Outcome = CpuPowerBudget::Outcome;
+    CpuPowerBudget b;
+    FakeCtl hw;
+    auto tick = [&](unsigned cpu, uint64_t now, bool eligible = true) {
+        b.Tick(cpu, now, eligible, [&]() { return hw.ratio[cpu]; }, [&](unsigned v) {
+            ++hw.writes;
+            if (!hw.stuck) hw.ratio[cpu] = v;
+            return hw.ratio[cpu];
+        });
+    };
+    auto all = [&](uint64_t now, bool eligible = true) { for (unsigned c = 0; c < 4; ++c) tick(c, now, eligible); };
+    auto over = [&](uint64_t now, int n) { for (int i = 0; i < n; ++i) { b.Control(now, Power(5000)); all(now); } };
+
+    // Validation.
+    assert(!b.Start(0, 4, {0, 0}, 8, 24));
+    assert(!b.Start(0, 4, {500, 0}, 8, 24));
+    assert(!b.Start(0, 4, {3500, 120}, 8, 24));
+    assert(!b.Start(0, 9, {3500, 0}, 8, 24));
+    assert(!b.Start(0, 4, {3500, 0}, 8, 8));
+
+    // Off: Tick and Control never touch the register.
+    all(0); b.Control(0, Power(9000)); all(1);
+    assert(hw.writes == 0 && b.phase == Phase::Off);
+
+    assert(b.Start(0, 4, {3500, 0}, 8, 24) && !b.Start(0, 4, {3500, 0}, 8, 24));
+    tick(0, 1); tick(1, 1);
+    b.Control(1, Power(9000)); // no control before Active
+    assert(b.phase == Phase::Snapshot && b.cap == 0 && hw.writes == 0);
+    tick(2, 2); tick(3, 2);
+    assert(b.phase == Phase::Active && b.limits.capTop == 23 && b.limits.releaseRatio == 30);
+    // Released: nothing to write.
+    all(3);
+    assert(hw.writes == 0);
+    over(250, 2);
+    assert(b.cap == 23 && hw.ratio[0] == 23 && hw.ratio[3] == 23 && b.stepsDown == 1 && hw.writes == 4);
+    // Runtime retarget keeps the snapshot.
+    assert(b.SetConfig({3000, 0}) && !b.SetConfig({100, 0}) && b.config.coresMw == 3000);
+    over(500, 3);
+    assert(b.cap == 22 && hw.ratio[1] == 22 && b.stepsDown == 2);
+    // Disable: restore originals on every CPU, then off.
+    b.Cancel();
+    assert(b.phase == Phase::Restore && b.outcome == Outcome::Disabled);
+    all(1000);
+    assert(b.phase == Phase::Off && hw.ratio[0] == 30 && hw.ratio[3] == 30 && !b.restoreFailed);
+    const unsigned settled = hw.writes;
+    all(1001); b.Control(1001, Power(9000));
+    assert(hw.writes == settled);
+
+    // Never above the per-CPU baseline: a CPU whose firmware asked for 20 stays at 20.
+    hw = {};
+    hw.ratio[2] = 20;
+    assert(b.Start(2000, 4, {3500, 0}, 8, 24));
+    all(2001);
+    assert(b.limits.capTop == 23);
+    over(2002, 2);
+    assert(hw.ratio[0] == 23 && hw.ratio[2] == 20 && b.Desired(2) == 20);
+    // AC loss (ineligible) restores.
+    all(2003, false);
+    assert(b.phase == Phase::Off && b.outcome == Outcome::Ineligible && hw.ratio[0] == 30 && hw.ratio[2] == 20);
+
+    // Firmware below the cap range leaves nothing to control.
+    hw = {};
+    for (auto& r : hw.ratio) r = 8;
+    assert(b.Start(3000, 4, {3500, 0}, 8, 24));
+    all(3001);
+    assert(b.phase == Phase::Off && b.outcome == Outcome::NoRange && hw.writes == 0);
+
+    // Snapshot timeout when a CPU never ticks.
+    hw = {};
+    assert(b.Start(4000, 4, {3500, 0}, 8, 24));
+    tick(0, 4001); tick(0, 7001);
+    assert(b.phase == Phase::Off && b.outcome == Outcome::Timeout && hw.writes == 0);
+
+    // Superseded: someone else's value is never overwritten; others are restored.
+    hw = {};
+    assert(b.Start(8000, 4, {3500, 0}, 8, 24));
+    all(8001); over(8002, 2);
+    assert(hw.ratio[1] == 23);
+    hw.ratio[1] = 27;
+    tick(1, 8003);
+    assert(b.phase == Phase::Restore && b.outcome == Outcome::Superseded);
+    all(8004);
+    assert(b.phase == Phase::Off && hw.ratio[1] == 27 && hw.ratio[0] == 30 && b.restoreFailed == 2);
+
+    // Readback mismatch cancels; a stuck register gives up after bounded attempts.
+    hw = {};
+    assert(b.Start(9000, 4, {3500, 0}, 8, 24));
+    all(9001);
+    hw.stuck = true;
+    over(9002, 2);
+    assert(b.phase == Phase::Restore && b.outcome == Outcome::Readback && b.touched == 1);
+    all(9003); // the failed write left the firmware value: nothing to undo
+    assert(b.phase == Phase::Off && !b.restoreFailed && hw.ratio[0] == 30);
+    hw = {};
+    assert(b.Start(9500, 4, {3500, 0}, 8, 24));
+    all(9501); over(9502, 2);
+    hw.stuck = true;
+    b.Cancel();
+    for (int i = 0; i < 3; ++i) all(9600 + i);
+    assert(b.phase == Phase::Off && b.restoreFailed == 0xf && hw.ratio[0] == 23);
+    // Cancel during snapshot (no writes) goes straight to off.
+    hw = {};
+    assert(b.Start(10000, 4, {3500, 0}, 8, 24));
+    tick(0, 10001); b.Cancel();
+    assert(b.phase == Phase::Off && hw.writes == 0);
+}
+
 int main() {
+    TestBudgetLaw();
+    TestBudgetApply();
     TestEpbTrial();
     TestRatioTrial();
     auto c = Bdw();

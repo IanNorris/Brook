@@ -48,6 +48,14 @@ bool g_epbTrialActive=false;
 IrqSpinLock g_ratioLock;
 CpuEpbTrial g_ratioTrial;
 bool g_ratioTrialActive=false;
+// The power budget is the other PERF_CTL owner, under the same lock.
+CpuPowerBudget g_budget;
+bool g_budgetActive=false;
+unsigned ReadRatio() { return unsigned((ReadMsr(0x199)>>8)&0xffu); }
+unsigned WriteRatio(unsigned value) {
+    WriteMsr(0x199,(ReadMsr(0x199)&~0xff00ull)|(uint64_t(value&0xffu)<<8));
+    return ReadRatio();
+}
 volatile int32_t g_epbTarget = -1;
 volatile uint64_t g_sampleGen = 0;
 volatile bool g_auto = false;
@@ -294,7 +302,8 @@ int CpuIdleStartRatioTrial(uint64_t now,unsigned count,unsigned ratio,uint32_t d
     if (!count || count>CpuEpbTrial::MaxCpus || !ratio || ratio>255 ||
         durationMs<1000 || durationMs>300000) return -22;
     const auto flags=IrqSpinLockAcquire(&g_ratioLock);
-    const bool started=g_ratioTrial.Start(now,count,ratio,durationMs,255);
+    const bool started=g_budget.phase==CpuPowerBudget::Phase::Off &&
+                       g_ratioTrial.Start(now,count,ratio,durationMs,255);
     if (started) __atomic_store_n(&g_ratioTrialActive,true,__ATOMIC_RELEASE);
     IrqSpinLockRelease(&g_ratioLock,flags);
     return started?0:-16;
@@ -308,10 +317,7 @@ bool CpuIdleRatioTrialActive()
 void CpuIdleTickRatioTrial(unsigned cpu,uint64_t now,bool eligible)
 {
     const auto flags=IrqSpinLockAcquire(&g_ratioLock);
-    g_ratioTrial.Tick(cpu,now,eligible,[](){return unsigned((ReadMsr(0x199)>>8)&0xffu);},[](unsigned value){
-        WriteMsr(0x199,(ReadMsr(0x199)&~0xff00ull)|(uint64_t(value&0xffu)<<8));
-        return unsigned((ReadMsr(0x199)>>8)&0xffu);
-    });
+    g_ratioTrial.Tick(cpu,now,eligible,ReadRatio,WriteRatio);
     __atomic_store_n(&g_ratioTrialActive,g_ratioTrial.phase!=CpuEpbTrial::Phase::Off,__ATOMIC_RELEASE);
     IrqSpinLockRelease(&g_ratioLock,flags);
 }
@@ -330,6 +336,56 @@ CpuEpbTrial CpuIdleReadRatioTrial()
     const auto trial=g_ratioTrial;
     IrqSpinLockRelease(&g_ratioLock,flags);
     return trial;
+}
+
+int CpuIdleSetBudget(uint64_t now,unsigned count,const CpuBudgetConfig& config,unsigned minRatio,unsigned maxNonTurbo)
+{
+    if (!CpuPowerBudget::Valid(config) || !count || count>CpuPowerBudget::MaxCpus) return -22;
+    const auto flags=IrqSpinLockAcquire(&g_ratioLock);
+    int result=-16;
+    if (g_budget.phase==CpuPowerBudget::Phase::Snapshot || g_budget.phase==CpuPowerBudget::Phase::Active)
+        result=g_budget.SetConfig(config)?0:-22;
+    else if (g_budget.phase==CpuPowerBudget::Phase::Off && g_ratioTrial.phase==CpuEpbTrial::Phase::Off)
+        result=g_budget.Start(now,count,config,minRatio,maxNonTurbo)?0:-22;
+    __atomic_store_n(&g_budgetActive,g_budget.phase!=CpuPowerBudget::Phase::Off,__ATOMIC_RELEASE);
+    IrqSpinLockRelease(&g_ratioLock,flags);
+    return result;
+}
+
+bool CpuIdleBudgetActive()
+{
+    return __atomic_load_n(&g_budgetActive,__ATOMIC_ACQUIRE);
+}
+
+void CpuIdleTickBudget(unsigned cpu,uint64_t now,bool eligible)
+{
+    const auto flags=IrqSpinLockAcquire(&g_ratioLock);
+    g_budget.Tick(cpu,now,eligible,ReadRatio,WriteRatio);
+    __atomic_store_n(&g_budgetActive,g_budget.phase!=CpuPowerBudget::Phase::Off,__ATOMIC_RELEASE);
+    IrqSpinLockRelease(&g_ratioLock,flags);
+}
+
+void CpuIdleBudgetControl(uint64_t now,const CpuBudgetSample& sample)
+{
+    const auto flags=IrqSpinLockAcquire(&g_ratioLock);
+    g_budget.Control(now,sample);
+    IrqSpinLockRelease(&g_ratioLock,flags);
+}
+
+void CpuIdleCancelBudget()
+{
+    const auto flags=IrqSpinLockAcquire(&g_ratioLock);
+    g_budget.Cancel();
+    __atomic_store_n(&g_budgetActive,g_budget.phase!=CpuPowerBudget::Phase::Off,__ATOMIC_RELEASE);
+    IrqSpinLockRelease(&g_ratioLock,flags);
+}
+
+CpuPowerBudget CpuIdleReadBudget()
+{
+    const auto flags=IrqSpinLockAcquire(&g_ratioLock);
+    const auto budget=g_budget;
+    IrqSpinLockRelease(&g_ratioLock,flags);
+    return budget;
 }
 
 CpuEpbTrial CpuIdleReadEpbTrial()

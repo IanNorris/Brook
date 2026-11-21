@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include "cpu_idle_policy.h"
 #include "cpu_epb_trial.h"
+#include "cpu_power_budget.h"
 
 namespace brook {
 
@@ -66,6 +67,15 @@ bool CpuIdleRatioTrialActive();
 void CpuIdleTickRatioTrial(unsigned cpu, uint64_t now, bool eligible);
 void CpuIdleCancelRatioTrial();
 CpuEpbTrial CpuIdleReadRatioTrial();
+// Closed-loop PERF_CTL power budget; shares ownership of PERF_CTL with the
+// ratio trial (only one runs at a time). Set starts it when off, retargets it
+// when running. -16 busy, -22 invalid.
+int CpuIdleSetBudget(uint64_t now, unsigned count, const CpuBudgetConfig& config, unsigned minRatio, unsigned maxNonTurbo);
+bool CpuIdleBudgetActive();
+void CpuIdleTickBudget(unsigned cpu, uint64_t now, bool eligible);
+void CpuIdleBudgetControl(uint64_t now, const CpuBudgetSample& sample);
+void CpuIdleCancelBudget();
+CpuPowerBudget CpuIdleReadBudget();
 // Ask idle loops to sample core residency, then read everything.
 void CpuIdleRequestSample();
 void CpuIdleReadStatus(CpuIdleStatus& out);

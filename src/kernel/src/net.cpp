@@ -6364,6 +6364,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  gpu clock <MHz>|auto|status - render clock request (fixed 600 at boot, auto opt-in, 90 C fallback)\n"
             "  thermal status|history|graph|power|reset - CPU/GPU temperature, power and frequency sampler\n"
             "  thermal cpu-first epb BIAS SECONDS | ratio RATIO SECONDS | status | off - timed AC-only EPB / PERF_CTL ratio-cap experiments\n"
+            "  thermal cpu-budget WATTS|off|status | temp C|off | power WATTS|off - AC-only closed-loop PERF_CTL cap on cores (PP0) power / package temp (default off)\n"
             "  gpu scene wake on|off|status - default-off scene completion notification experiment\n"
             "  audio shared-prefix on|off|reset|status - experimental headroom-gated mix batching (default off)\n"
             "  audio horizon on|off|reset|status - experimental guarded output target and prospective OSS geometry (default off)\n"
@@ -7230,6 +7231,83 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             r.text("}");
         }
         r.text("]}}\n");r.send();
+    }
+    else if(StrStartsWith(cmd,"thermal cpu-budget")) {
+        // Closed-loop PERF_CTL ratio cap (cpu_power_budget.h). WATTS accepts
+        // up to two decimals ("3.5"); `temp C` adds a package target.
+        int result=0;
+        const auto before=CpuIdleReadBudget();
+        const bool running=before.phase==CpuPowerBudget::Phase::Snapshot || before.phase==CpuPowerBudget::Phase::Active;
+        uint32_t mw=running?before.config.coresMw:0;
+        int32_t tempC=running?before.config.tempC:0;
+        auto watts=[](const char* in,uint32_t& out){
+            uint32_t whole=0,frac=0,digits=0,fd=0;
+            for(;*in>='0' && *in<='9' && digits<3;++in,++digits) whole=whole*10+uint32_t(*in-'0');
+            if(!digits) return false;
+            if(*in=='.'){++in;for(;*in>='0' && *in<='9' && fd<2;++in,++fd) frac=frac*10+uint32_t(*in-'0');if(!fd) return false;}
+            if(*in) return false;
+            out=whole*1000+(fd==1?frac*100:frac*10);
+            return true;
+        };
+        const char* arg=cmd+sizeof("thermal cpu-budget")-1;
+        bool change=true;
+        if(!*arg || NetStrEq(arg," status")) change=false;
+        else if(NetStrEq(arg," off")){mw=0;tempC=0;}
+        else if(NetStrEq(arg," temp off")) tempC=0;
+        else if(NetStrEq(arg," power off")) mw=0;
+        else if(StrStartsWith(arg," temp ")){
+            const char* t=arg+sizeof(" temp ")-1;unsigned c=0,d=0;
+            for(;*t>='0' && *t<='9' && d<3;++t,++d) c=c*10+unsigned(*t-'0');
+            if(!d || *t) result=-22; else tempC=int32_t(c);
+        }
+        else if(StrStartsWith(arg," power ")){if(!watts(arg+sizeof(" power ")-1,mw)) result=-22;}
+        else if(*arg==' '){if(!watts(arg+1,mw)) result=-22;}
+        else result=-22;
+        if(change && !result) result=ThermalSetCpuBudget(mw,tempC);
+        const auto b=CpuIdleReadBudget();
+        static const char* phases[]={"off","snapshot","active","restore"};
+        static const char* outcomes[]={"none","running","disabled","ineligible","timeout","readback","superseded","no_range"};
+        static const char* reasons[]={"none","no_sample","settling","wait","band","over_power","over_temp","hot_emergency","step_up","release","at_floor"};
+        const uint64_t now=ApicTickCount();
+        auto sfield=[](BridgeReply& r,const char* name,int64_t v){r.text("\"");r.text(name);r.text("\":");if(v<0){r.text("-");v=-v;}r.number(uint64_t(v));};
+        BridgeReply r;
+        r.text("{");r.field("errno",uint64_t(-result));
+        r.text(",\"phase\":");r.quoted(phases[unsigned(b.phase)]);
+        r.text(",\"outcome\":");r.quoted(outcomes[unsigned(b.outcome)]);
+        r.text(",");r.field("target_cores_mw",b.config.coresMw);
+        r.text(",");sfield(r,"target_pkg_c",b.config.tempC);
+        r.text(",");r.field("cap_ratio",b.cap);
+        r.text(",\"released\":");r.text(b.cap?"false":"true");
+        r.text(",");r.field("min_ratio",b.limits.minRatio);
+        r.text(",");r.field("cap_top",b.limits.capTop);
+        r.text(",");r.field("release_ratio",b.limits.releaseRatio);
+        r.text(",\"last_reason\":");r.quoted(reasons[unsigned(b.lastReason)]);
+        r.text(",");r.field("filtered_cores_mw",b.filter.mw);
+        r.text(",");sfield(r,"filtered_pkg_c",(b.filter.temp16+8)/16);
+        r.text(",");r.field("last_cores_mw",b.lastSample.coresMw);
+        r.text(",");sfield(r,"last_pkg_c",b.lastSample.pkgC);
+        r.text(",");r.field("controls",b.controls);
+        r.text(",");r.field("steps_down",b.stepsDown);
+        r.text(",");r.field("steps_up",b.stepsUp);
+        r.text(",");r.field("releases",b.releases);
+        r.text(",");r.field("msr_writes",b.writes);
+        r.text(",");r.field("active_ms",b.startedAt && b.phase!=CpuPowerBudget::Phase::Off?now-b.startedAt:0);
+        r.text(",");r.field("since_step_ms",b.lastStepAt?now-b.lastStepAt:0);
+        r.text(",");r.field("sampled_mask",b.sampled);
+        r.text(",");r.field("attempted_mask",b.touched);
+        r.text(",");r.field("resolved_restore_mask",b.restored);
+        r.text(",");r.field("restore_failed_mask",b.restoreFailed);
+        r.text(",\"cpus\":[");
+        for(unsigned i=0;i<b.cpuCount;++i){
+            if(i)r.text(",");
+            const bool seen=b.sampled&(1u<<i);
+            r.text("{");r.field("cpu",i);
+            r.text(",\"baseline\":");if(seen)r.number(b.original[i]);else r.text("null");
+            r.text(",\"desired\":");if(seen && b.phase==CpuPowerBudget::Phase::Active)r.number(b.Desired(i));else r.text("null");
+            r.text(",\"observed\":");if(seen)r.number(b.observed[i]);else r.text("null");
+            r.text("}");
+        }
+        r.text("]}\n");r.send();
     }
     else if(NetStrEq(cmd,"thermal status") || NetStrEq(cmd,"thermal history") || NetStrEq(cmd,"thermal graph") ||
             NetStrEq(cmd,"thermal power") || NetStrEq(cmd,"thermal reset")) {

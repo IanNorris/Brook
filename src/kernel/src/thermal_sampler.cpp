@@ -99,17 +99,27 @@ void Publish(PkgPrev& prev) {
     ThermalCpu cpus[ThermalMaxCpus]{};
     for (uint32_t i = 0; i < n; ++i) cpus[i] = ThermalUnpackCpu(__atomic_load_n(&g_cpuSlot[i], __ATOMIC_ACQUIRE));
     ThermalSummariseCpus(cpus, n, s);
+    bool powerValid = false;
     if (p.rapl) {
         const uint64_t unit = ReadMsr(0x606), tsc = Rdtsc();
         const uint32_t pkg = uint32_t(ReadMsr(0x611)), pp0 = uint32_t(ReadMsr(0x639)), pp1 = uint32_t(ReadMsr(0x641));
         const uint32_t khz = TscClockReadStatus().khz;
         if (prev.primed && khz && tsc > prev.tsc) {
+            powerValid = true;
             const uint64_t us = (tsc - prev.tsc) * 1000 / khz;
             s.pkgMw = ThermalEnergyMw(prev.pkg, pkg, unit, us);
             s.coreMw = ThermalEnergyMw(prev.pp0, pp0, unit, us);
             s.gtMw = ThermalEnergyMw(prev.pp1, pp1, unit, us);
         }
         prev.pkg = pkg; prev.pp0 = pp0; prev.pp1 = pp1; prev.tsc = tsc; prev.unit = unit; prev.primed = true;
+    }
+    if (CpuIdleBudgetActive()) {
+        CpuBudgetSample b{};
+        b.powerValid = powerValid;
+        b.coresMw = s.coreMw;
+        b.tempValid = p.pkgDts && s.pkgC > 0;
+        b.pkgC = s.pkgC;
+        CpuIdleBudgetControl(s.tick, b);
     }
     // Last CAGF a render job sampled, if a job ran in the last 2 s.
     const uint64_t gpuSeq = __atomic_load_n(&BdwGpuMhzSequence(), __ATOMIC_ACQUIRE);
@@ -145,6 +155,7 @@ void Worker(void* arg) {
         SampleCpu(cpu, prev);
         if (CpuIdleEpbTrialActive()) CpuIdleTickEpbTrial(cpu,ApicTickCount(),EpbTrialEligible());
         if (CpuIdleRatioTrialActive()) CpuIdleTickRatioTrial(cpu,ApicTickCount(),EpbTrialEligible());
+        if (CpuIdleBudgetActive()) CpuIdleTickBudget(cpu,ApicTickCount(),EpbTrialEligible());
         if (cpu == 0) Publish(pkg);
     }
 }
@@ -181,6 +192,20 @@ int ThermalStartRatioTrial(unsigned ratio,unsigned seconds)
     const unsigned maxNonTurbo=unsigned((info>>8)&0xff),minRatio=unsigned((info>>40)&0xff);
     if (!maxNonTurbo || !minRatio || ratio<minRatio || ratio>maxNonTurbo) return -22;
     return CpuIdleStartRatioTrial(ApicTickCount(),SmpGetCpuCount(),ratio,seconds*1000);
+}
+
+int ThermalSetCpuBudget(uint32_t coresMw,int32_t tempC)
+{
+    if (!coresMw && !tempC) { CpuIdleCancelBudget(); return 0; }
+    const CpuBudgetConfig config{coresMw,tempC};
+    if (!CpuPowerBudget::Valid(config)) return -22;
+    if (!EpbTrialEligible()) return -95;
+    // Cap range: minimum efficiency ratio .. max non-turbo - 1 (a request at
+    // max non-turbo still allows turbo). Release returns to the firmware value.
+    const uint64_t info=ReadMsr(0xce);
+    const unsigned maxNonTurbo=unsigned((info>>8)&0xff),minRatio=unsigned((info>>40)&0xff);
+    if (!minRatio || maxNonTurbo<=minRatio) return -95;
+    return CpuIdleSetBudget(ApicTickCount(),SmpGetCpuCount(),config,minRatio,maxNonTurbo);
 }
 
 bool ThermalReadSnapshot(ThermalSnapshot& out) {

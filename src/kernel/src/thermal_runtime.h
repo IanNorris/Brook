@@ -12,6 +12,10 @@ void ThermalSamplerStart();
 int ThermalStartEpbTrial(unsigned bias,unsigned seconds);
 // Same admission; caps IA32_PERF_CTL to RATIO (min..max non-turbo) for SECONDS.
 int ThermalStartRatioTrial(unsigned ratio,unsigned seconds);
+// Same admission; closed-loop PERF_CTL cap keeping RAPL PP0 under coresMw
+// and/or the package under tempC (0 = that target off). Starts when off,
+// retargets when running; both zero turns it off. See cpu_power_budget.h.
+int ThermalSetCpuBudget(uint32_t coresMw,int32_t tempC);
 
 struct ThermalSnapshot {
     bool available = false, rapl = false, aperf = false;
