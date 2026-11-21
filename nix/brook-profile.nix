@@ -1,0 +1,157 @@
+# App-selected hardware session profile. The compatibility preset keeps the
+# original package ordering, link priorities, and grouped launcher output.
+{ pkgs ? import ./nixpkgs.nix { config.allowUnfree = false; }
+, preset ? null
+, apps ? [ ]
+, extraPackages ? [ ]
+, extraPackageNames ? [ ]
+, target ? "dell-pair"
+, allowUnfree ? false
+, publicRelease ? false
+, kernelCapabilities ? null
+}:
+let
+  lib = pkgs.lib;
+  base = import ./hardware-packages.nix { inherit pkgs; includeOfflineApps = false; };
+  catalog = import ./app-registry.nix { inherit pkgs; downstreamStaging = target == "dell-pair"; };
+  compat = import ./hardware-network-compat.nix { inherit pkgs; };
+  compatApps = [ "calculator" "chromium" "files" "firefox" "gallery" "mousepad"
+                 "quake2" "steam" "vscodium" ];
+  fonts = import ../tools/brook-fonts-pkg {};
+  cursors = import ../tools/brook-cursor-theme {};
+  baseLaunchers = [ "brook-settings" "org.brook.TaskManager" ];
+  baseExecutables = [ "brook-run" "hardware-dbus" "hardware-message" "hardware-brook-settings"
+                      "hardware-brook-task-manager" "brook-stage-profile" ];
+  selection = import ./resolve-brook-apps.nix {
+    inherit lib apps target allowUnfree publicRelease kernelCapabilities baseLaunchers baseExecutables;
+    registry = catalog.apps;
+    services = [ "dbus" "message" ];
+  };
+  inherit (selection) selected launcherIds;
+  packageFor = name:
+    let attrPath = lib.splitString "." name;
+        package = lib.attrByPath attrPath null pkgs;
+    in
+      if builtins.match "[A-Za-z0-9_+-]+(\\.[A-Za-z0-9_+-]+)*" name == null ||
+         !lib.isDerivation package || !(lib.meta.availableOn pkgs.stdenv.hostPlatform package)
+      then throw "Unknown Brook extra package: ${name}"
+      else package;
+  cliPackages = map
+    (p: if !lib.isDerivation p then throw "Brook extra packages must be Nix derivations"
+        else if p.meta.unfree or false then
+          throw "Unfree extra packages require an approved Brook app descriptor"
+        else p)
+    (extraPackages ++ map packageFor extraPackageNames);
+  cli = pkgs.buildEnv {
+    name = "brook-command-line-extras";
+    paths = cliPackages;
+    pathsToLink = [ "/bin" "/share/man" "/share/info" "/share/bash-completion"
+                    "/share/zsh" "/share/fish" "/share/mime" ];
+  };
+  launchers = pkgs.runCommand "brook-selected-app-launchers" {} ''
+    mkdir -p "$out/bin" "$out/share/applications"
+    cat > "$out/bin/brook-run" <<'SCRIPT'
+    ${import ./network-session-wrapper.nix { inherit pkgs fonts cursors; }}SCRIPT
+    ${lib.concatMapStringsSep "\n" (app:
+      lib.optionalString (app ? wrapperSource) ''
+        install -m 755 ${app.wrapperSource} "$out/bin/${app.executable}"
+      '' + lib.optionalString (app ? wrap) ''
+        cat > "$out/bin/${app.executable}" <<'SCRIPT'
+        #!${pkgs.bash}/bin/bash
+        exec /nix/profile/bin/brook-run /nix/profile/bin/${app.wrap} "$@"
+        SCRIPT
+      '' + lib.optionalString (app ? iconSource) ''
+        install -Dm644 ${app.iconSource} "$out/share/icons/hicolor/scalable/apps/${app.desktop.icon}.svg"
+      '' + lib.optionalString (app.desktop ? name) ''
+        cat > "$out/share/applications/${app.desktop.id}.desktop" <<'DESKTOP'
+        [Desktop Entry]
+        Type=Application
+        Name=${app.desktop.name}
+        Exec=/nix/profile/bin/${app.executable}${lib.optionalString (app.desktop ? arguments) " ${app.desktop.arguments}"}
+        Icon=${app.desktop.icon}
+        Categories=${app.desktop.categories}
+        DESKTOP
+      '') selected}
+    chmod +x "$out/bin/"*
+  '';
+  sessionPackages = [ (import ./closure-stage.nix { inherit pkgs; })
+                      (lib.hiPrio launchers) pkgs.xz.bin pkgs.zstd.bin ]
+    ++ base.packages ++ lib.concatMap (app: app.packages) selected;
+  directPackages = lib.unique (sessionPackages ++ cliPackages);
+  linkedPackages = lib.unique (sessionPackages ++ [ manifestPackage ] ++ lib.optional (cliPackages != [ ]) cli);
+  packageRecord = p: {
+    name = p.pname or p.name;
+    version = p.version or "";
+    store = builtins.baseNameOf (toString p);
+  };
+  manifest = {
+    schema = "brook-profile/1";
+    preset = null;
+    inherit target launcherIds;
+    inherit (selection) requiredCapabilities optionalCapabilities redistributable;
+    requiredServices = lib.unique ([ "dbus" "message" ] ++ selection.requiredServices);
+    apps = map (app: catalog.metadata.${app.id}) selected;
+    extraPackages = map packageRecord cliPackages;
+    packages = map packageRecord directPackages;
+  };
+  manifestPackage = pkgs.writeTextDir "share/brook/profile.json" (builtins.toJSON manifest);
+  profile = pkgs.buildEnv {
+    name = "brook-selected-desktop";
+    paths = linkedPackages;
+    # The runner overlay is intentional. Existing base packages export
+    # non-executable shared files with overlapping names.
+    ignoreCollisions = true;
+    postBuild = ''
+      ${lib.optionalString (cliPackages != [ ]) ''
+        for path in ${cli}/bin/*; do
+          [ -f "$path" ] || continue
+          if [ ! "$out/bin/${"$"}{path##*/}" -ef "$path" ]; then
+            echo "Brook executable collision: ${"$"}{path##*/}" >&2
+            exit 1
+          fi
+        done
+      ''}
+      desktop="$out/share/applications"
+      if [ -L "$desktop" ]; then
+        old=$(readlink -f "$desktop")
+        rm "$desktop"
+        mkdir -p "$desktop"
+        for entry in "$old/"*; do
+          [ -e "$entry" ] && ln -s "$entry" "$desktop/" || :
+        done
+      fi
+      for entry in "$desktop/"*.desktop; do
+        case "${"$"}{entry##*/}" in
+          ${lib.concatMapStringsSep "|" (id: "${id}.desktop") launcherIds}) ;;
+          *) rm -f -- "$entry";;
+        esac
+      done
+      ${lib.concatMapStringsSep "\n" (id: ''
+        test -f "$desktop/${id}.desktop" || { echo "Missing Brook launcher: ${id}" >&2; exit 1; }
+      '') launcherIds}
+      ${lib.concatMapStringsSep "\n" (app: ''
+        test -x "$out/bin/${app.executable}" || { echo "Missing Brook executable: ${app.executable}" >&2; exit 1; }
+      '') selected}
+    '';
+  };
+in
+assert builtins.elem target [ "dell-pair" "vmware" "qemu" "usb" ] || throw "Unknown Brook profile target: ${target}";
+assert lib.length extraPackageNames == lib.length (lib.unique extraPackageNames) ||
+  throw "Repeated Brook extra package name";
+if preset == "network" then
+  assert apps == [ ] && extraPackages == [ ] && extraPackageNames == [ ] ||
+    throw "The Brook compatibility preset cannot be combined with app or package selections";
+  compat // {
+    manifest = {
+      schema = "brook-profile/1";
+      inherit preset target;
+      apps = map (id: catalog.metadata.${id}) compatApps;
+      redistributable = true;
+    };
+  }
+else if preset != null then throw "Unknown Brook profile preset: ${preset}"
+else {
+  inherit profile manifest launchers;
+  packages = directPackages;
+  intelVulkanDriver = null;
+}
