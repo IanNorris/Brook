@@ -5,6 +5,13 @@
 int main()
 {
     using namespace brook::svga;
+    unsigned reads = 0, pauses = 0;
+    assert(WaitForFifoIdle([&] { return ++reads < 4; }, [&] { ++pauses; }));
+    assert(reads == 4 && pauses == 3);
+    reads = pauses = 0;
+    assert(!WaitForFifoIdle([&] { ++reads; return true; }, [&] { ++pauses; }));
+    assert(reads == 256 && pauses == 256);
+
     constexpr uint32_t Bytes = 0x10000;
     constexpr uint32_t Start = 0x1000;
     assert(FifoCanWrite({Start, Bytes, Start, Start}, Bytes, 5));

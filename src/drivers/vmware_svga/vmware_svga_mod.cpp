@@ -54,7 +54,7 @@ enum Register : uint32_t {
     Id = 0, Enable = 1, Width = 2, Height = 3, MaxWidth = 4, MaxHeight = 5,
     BitsPerPixel = 7, RedMask = 9, GreenMask = 10, BlueMask = 11, Stride = 12,
     FbStart = 13, FbOffset = 14, VramSize = 15, FbSize = 16, Capabilities = 17,
-    FifoStart = 18, FifoSize = 19, ConfigDone = 20, Sync = 21,
+    FifoStart = 18, FifoSize = 19, ConfigDone = 20, Sync = 21, Busy = 22,
     CursorId = 24, CursorX = 25, CursorY = 26, CursorOn = 27,
 };
 
@@ -79,7 +79,7 @@ struct Driver {
     volatile uint32_t* fifo = nullptr;
     uint32_t fifoBytes = 0, mappedPages = 0;
     bool lock = false;
-    bool changingMode = false, fullRefresh = false;
+    bool changingMode = false, fullRefresh = false, layoutMatches = true;
     uint32_t firstPending = 0, endPending = 0;
     bool cursorBypass3 = false, alphaCursor = false;
     bool cursorUploaded = false, cursorPending = false, cursorVisible = false;
@@ -203,12 +203,19 @@ void ProgramMode(uint32_t width, uint32_t height)
     Write(Enable, 1);
 }
 
+bool DrainFifo()
+{
+    Write(Sync, 1);
+    return svga::WaitForFifoIdle([] { return Read(Busy); },
+                                [] { asm volatile("pause" ::: "memory"); });
+}
+
 bool PublishWords(const uint32_t* words, uint32_t count)
 {
     svga::FifoWindow window{g.fifo[svga::FifoMin], g.fifo[svga::FifoMax],
                             g.fifo[svga::FifoNext], g.fifo[svga::FifoStop]};
     if (!svga::FifoCanWrite(window, g.fifoBytes, count)) {
-        Write(Sync, 1);
+        if (!DrainFifo()) return false;
         window.stop = g.fifo[svga::FifoStop];
         if (!svga::FifoCanWrite(window, g.fifoBytes, count))
             return false;
@@ -258,7 +265,7 @@ bool PrepareCursor(const CursorImage* image, int32_t x, int32_t y)
 {
     Lock();
     bool handled = false;
-    if (image && !__atomic_load_n(&g.changingMode, __ATOMIC_ACQUIRE)) {
+    if (image && g.layoutMatches && !__atomic_load_n(&g.changingMode, __ATOMIC_ACQUIRE)) {
         uint32_t count = 0;
         if (g.cursorUploaded && svga::CursorImageMatches(*image, g.cursorImage)) {
             handled = true;
@@ -292,11 +299,10 @@ void CommitCursor()
     if (g.cursorPending && !__atomic_load_n(&g.changingMode, __ATOMIC_ACQUIRE)) {
         // On the first show, let the shape and any restored software-cursor
         // rows reach the host before it exposes the overlay.
-        if (!g.cursorVisible && g.fifo[svga::FifoNext] != g.fifo[svga::FifoStop])
-            Write(Sync, 1);
-        if (g.cursorVisible || (g.firstPending >= g.endPending &&
-                               !__atomic_load_n(&g.fullRefresh, __ATOMIC_ACQUIRE) &&
-                               g.fifo[svga::FifoNext] == g.fifo[svga::FifoStop])) {
+        const bool canShow = g.layoutMatches && g.firstPending >= g.endPending &&
+                             !__atomic_load_n(&g.fullRefresh, __ATOMIC_ACQUIRE);
+        if (g.cursorVisible || (canShow && DrainFifo() &&
+                                g.fifo[svga::FifoNext] == g.fifo[svga::FifoStop])) {
             if (!g.cursorVisible || g.visibleX != g.cursorX || g.visibleY != g.cursorY)
                 SetCursorPosition(true, g.cursorX, g.cursorY);
             g.cursorPending = false;
@@ -311,7 +317,7 @@ void Flush(uint32_t first, uint32_t end)
         __atomic_store_n(&g.fullRefresh, true, __ATOMIC_RELEASE);
         return;
     }
-    if (__atomic_load_n(&g.changingMode, __ATOMIC_ACQUIRE)) {
+    if (__atomic_load_n(&g.changingMode, __ATOMIC_ACQUIRE) || !g.layoutMatches) {
         Unlock();
         return;
     }
@@ -332,31 +338,26 @@ void PanicPresent()
 {
     if (!TryLock()) return;
     HideCursor();
-    if (!__atomic_load_n(&g.changingMode, __ATOMIC_ACQUIRE))
+    if (!__atomic_load_n(&g.changingMode, __ATOMIC_ACQUIRE) && g.layoutMatches)
         (void)PublishUpdate(0, g.mode.height);
     Unlock();
 }
 
 extern const DisplayOps Ops;
-bool SetMode(uint32_t width, uint32_t height)
+svga::ResizeApplyResult TrySetMode(uint32_t width, uint32_t height)
 {
-    DisplayFramebufferChange change(true, &Ops);
-    if (!change) return false;
+    using Result = svga::ResizeApplyResult;
     if (!width || !height || width > g.maxWidth || height > g.maxHeight ||
-        uint64_t(width) * height * 4 > g.framebuffer.bytes) return false;
-    if (!TryLock()) return false;
-    if (__atomic_load_n(&g.changingMode, __ATOMIC_ACQUIRE)) {
+        uint64_t(width) * height * 4 > g.framebuffer.bytes) return Result::Invalid;
+    DisplayFramebufferChange change(true, &Ops);
+    if (!change || !TryLock()) return Result::Retry;
+    if (g.layoutMatches && width == g.mode.width && height == g.mode.height) {
         Unlock();
-        return false;
+        return Result::Applied;
     }
-    if (width == g.mode.width && height == g.mode.height) {
+    if (!DrainFifo() || g.fifo[svga::FifoNext] != g.fifo[svga::FifoStop]) {
         Unlock();
-        return true;
-    }
-    Write(Sync, 1);
-    if (g.fifo[svga::FifoNext] != g.fifo[svga::FifoStop]) {
-        Unlock();
-        return false;
+        return Result::Retry;
     }
     __atomic_store_n(&g.changingMode, true, __ATOMIC_RELEASE);
     HideCursor();
@@ -364,9 +365,8 @@ bool SetMode(uint32_t width, uint32_t height)
     const auto previous = g.mode;
     ProgramMode(width, height);
     const auto candidate = ReadGeometry();
-    const uint32_t fbBytes = Read(FbSize);
     const bool hardwareOk = candidate.width == width && candidate.height == height &&
-                            ValidGeometry(candidate, fbBytes);
+                            ValidGeometry(candidate, Read(FbSize));
     Unlock();
 
     const uint64_t physical = uint64_t(g.framebuffer.base) + candidate.offset;
@@ -374,17 +374,45 @@ bool SetMode(uint32_t width, uint32_t height)
         CompositorRemapLinearDisplay(physical, width, height, candidate.stride / 4);
 
     // No ordinary flush reads device state during the handoff.
-    while (!TryLock()) asm volatile("pause" ::: "memory");
-    if (committed) g.mode = candidate;
-    else ProgramMode(previous.width, previous.height);
-    g.firstPending = 0;
-    g.endPending = g.mode.height;
-    if (PublishUpdate(0, g.mode.height)) g.endPending = 0;
+    Lock();
+    auto selected = candidate;
+    bool layoutMatches = committed;
+    if (!committed) {
+        ProgramMode(previous.width, previous.height);
+        selected = ReadGeometry();
+        const bool restored = selected.width == previous.width &&
+            selected.height == previous.height && ValidGeometry(selected, Read(FbSize));
+        if (restored && selected.stride == previous.stride && selected.offset == previous.offset) {
+            layoutMatches = true;
+        } else if (restored) {
+            Unlock();
+            layoutMatches = CompositorRemapLinearDisplay(
+                uint64_t(g.framebuffer.base) + selected.offset, selected.width,
+                selected.height, selected.stride / 4);
+            Lock();
+        }
+        if (!layoutMatches)
+            SerialPrintf("vmware-svga: previous mode layout could not be restored\n");
+    }
+    g.layoutMatches = layoutMatches;
+    if (layoutMatches) {
+        g.mode = selected;
+        g.firstPending = 0;
+        g.endPending = g.mode.height;
+        if (PublishUpdate(0, g.mode.height)) g.endPending = 0;
+    }
     __atomic_store_n(&g.changingMode, false, __ATOMIC_RELEASE);
     Unlock();
-    if (committed) SerialPrintf("vmware-svga: mode %ux%u stride=%u\n",
-                                 width, height, candidate.stride);
-    return committed;
+    if (committed) {
+        SerialPrintf("vmware-svga: mode %ux%u stride=%u\n", width, height, candidate.stride);
+        return Result::Applied;
+    }
+    return hardwareOk || !layoutMatches ? Result::Retry : Result::Invalid;
+}
+
+bool SetMode(uint32_t width, uint32_t height)
+{
+    return TrySetMode(width, height) == svga::ResizeApplyResult::Applied;
 }
 
 void GetMode(DisplayMode* out)
@@ -421,25 +449,32 @@ void PollModeHints()
         return;
     }
 
-    const auto hint = g_resizeRpc.Poll({g.maxWidth, g.maxHeight});
+    const auto hint = g_resizeRpc.Poll({g.maxWidth, g.maxHeight}, now);
     if (hint.result == svga::ResizeRpcResult::TransportError) {
         g_nextModePoll = now + ModeReconnectMs;
         return;
     }
-    if (hint.result == svga::ResizeRpcResult::ModeRequested)
-        (void)g_resizeRpc.CompleteResize(SetMode(hint.mode.width, hint.mode.height));
+    if (hint.result == svga::ResizeRpcResult::ModeRequested ||
+        hint.result == svga::ResizeRpcResult::WaitingForApply) {
+        (void)g_resizeRpc.ApplyPending(now, [](svga::ResizeMode mode) {
+            return TrySetMode(mode.width, mode.height);
+        });
+    }
 }
 
 constexpr DisplayModePollOps ModePollOps{&Ops, PollModeHints};
 
 
-int Initialize()
+int InitializeDisplay()
 {
     uint64_t firmware = 0;
     uint32_t width = 0, height = 0, stride = 0;
     const bool firmwareMode = TtyGetFramebufferPhys(&firmware, &width, &height, &stride);
     DisplayFramebufferChange change(true);
-    if (!change || !PreparePci()) return -1;
+    if (!change) {
+        PciConfigWrite16(g.pci.bus, g.pci.dev, g.pci.fn, 4, g.initialCommand);
+        return -1;
+    }
     const uint32_t oldId = Read(Id);
     Write(Id, Version2);
     auto abandon = [oldId]() {
@@ -459,6 +494,10 @@ int Initialize()
 
     const uint32_t enable = Read(Enable), configured = Read(ConfigDone);
     const uint32_t oldWidth = Read(Width), oldHeight = Read(Height), oldBits = Read(BitsPerPixel);
+    if (configured && !DrainFifo()) {
+        ReleaseFifo();
+        return abandon();
+    }
     if (!firmwareMode || !width || !height || width > g.maxWidth || height > g.maxHeight ||
         uint64_t(width) * height * 4 > g.framebuffer.bytes) {
         width = g.maxWidth < 1024 ? g.maxWidth : 1024;
@@ -479,7 +518,6 @@ int Initialize()
     }
 
     g.mode = candidate;
-    if (configured) Write(Sync, 1);
     Write(ConfigDone, 0);
     // Keep one page for the extended FIFO registers, including the full
     // fixed register range used by Workstation. Legacy QEMU needs four.
@@ -502,6 +540,15 @@ int Initialize()
         SetCursorPosition(false, 0, 0);
         DisplayRegisterCursor(&CursorOps);
     }
+    KPrintf("vmware-svga: %ux%u stride=%u caps=0x%x fifo=%u cursor=%s\n",
+            width, height, candidate.stride, caps, g.fifoBytes,
+            !nativeCursor ? "software" : g.alphaCursor ? "alpha" : "masked");
+    return 0;
+}
+int Initialize()
+{
+    if (!PreparePci()) return -1;
+    if (InitializeDisplay() < 0) return -1;
     if (auto* option = VfsOpen("/etc/vmware-autofit")) {
         VfsClose(option);
         if (g_resizePort.Probe()) {
@@ -509,9 +556,6 @@ int Initialize()
             SerialPrintf("vmware-svga: host Autofit hints enabled\n");
         }
     }
-    KPrintf("vmware-svga: %ux%u stride=%u caps=0x%x fifo=%u cursor=%s\n",
-            width, height, candidate.stride, caps, g.fifoBytes,
-            !nativeCursor ? "software" : g.alphaCursor ? "alpha" : "masked");
     return 0;
 }
 }

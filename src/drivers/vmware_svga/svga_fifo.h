@@ -10,6 +10,18 @@ constexpr uint32_t FifoStop = 3;
 constexpr uint32_t Update = 1;
 constexpr uint32_t MinCommandBytes = 10 * 1024;
 
+// SYNC can kick an asynchronous host. Only sample FIFO_STOP after the
+// device reports idle. The read cap also bounds waits before the clock runs.
+template<class ReadBusy, class Pause>
+bool WaitForFifoIdle(ReadBusy readBusy, Pause pause)
+{
+    for (unsigned read = 0; read < 256; ++read) {
+        if (!readBusy()) return true;
+        pause();
+    }
+    return false;
+}
+
 struct FifoWindow {
     uint32_t min;
     uint32_t max;

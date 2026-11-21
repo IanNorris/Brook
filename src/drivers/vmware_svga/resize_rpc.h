@@ -174,6 +174,8 @@ enum class HostReply { Ok, Declined, TransportError };
 // One serialized TCLO session. The caller owns polling cadence, explicit
 // Close() on shutdown, and mode policy. In particular, no success reply is sent until it confirms that
 // the requested mode was applied (or was already current).
+enum class ResizeApplyResult { Applied, Invalid, Retry };
+
 template<class PortIO>
 class ResizeRpc {
     PortIO& io_;
@@ -181,6 +183,9 @@ class ResizeRpc {
     const char* reply_ = "";
     bool registered_ = false;
     bool awaitingApply_ = false;
+    ResizeMode pendingMode_{};
+    uint64_t applyStarted_ = 0;
+    static constexpr uint64_t ApplyTimeoutMs = 1000;
 
     resize_rpc::HostReply Capability(const char* command, uint32_t size)
     {
@@ -224,7 +229,7 @@ public:
         registered_ = awaitingApply_ = false;
     }
 
-    ResizeRpcPoll Poll(ResizeMode limit)
+    ResizeRpcPoll Poll(ResizeMode limit, uint64_t now = 0)
     {
         using namespace resize_rpc;
         if (!listener_.IsOpen()) return {ResizeRpcResult::Closed};
@@ -265,6 +270,8 @@ public:
                 reply_ = "ERROR Invalid arguments";
             else {
                 awaitingApply_ = true;
+                pendingMode_ = mode;
+                applyStarted_ = now;
                 return {ResizeRpcResult::ModeRequested, mode};
             }
         } else {
@@ -273,11 +280,18 @@ public:
         return {ResizeRpcResult::Handled};
     }
 
-    bool CompleteResize(bool applied)
+    template<class Apply>
+    bool ApplyPending(uint64_t now, Apply apply)
     {
         if (!awaitingApply_) return false;
+        if (now - applyStarted_ >= ApplyTimeoutMs) {
+            reply_ = "ERROR Resize timed out";
+        } else {
+            const auto result = apply(pendingMode_);
+            if (result == ResizeApplyResult::Retry) return false;
+            reply_ = result == ResizeApplyResult::Applied ? "OK " : "ERROR Invalid arguments";
+        }
         awaitingApply_ = false;
-        reply_ = applied ? "OK " : "ERROR Invalid arguments";
         return true;
     }
 };

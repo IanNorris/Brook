@@ -5,6 +5,7 @@
 #include <string_view>
 #include <vector>
 
+using brook::svga::ResizeApplyResult;
 using brook::svga::ResizeMode;
 using brook::svga::ResizeRpc;
 using brook::svga::ResizeRpcResult;
@@ -125,13 +126,30 @@ void ResizeSession() {
     assert(request.mode.width == 1920 && request.mode.height == 1080);
     assert(rpc.Poll(Limits).result == ResizeRpcResult::WaitingForApply);
     io.CheckConsumed();
-    assert(rpc.CompleteResize(true));
-    assert(!rpc.CompleteResize(true));
+    auto retry = [](ResizeMode mode) {
+        assert(mode.width == 1920 && mode.height == 1080);
+        return ResizeApplyResult::Retry;
+    };
+    auto applied = [](ResizeMode) { return ResizeApplyResult::Applied; };
+    assert(!rpc.ApplyPending(1, retry));
+    assert(!rpc.ApplyPending(900, retry));
+    assert(rpc.Poll(Limits, 901).result == ResizeRpcResult::WaitingForApply);
+    assert(rpc.ApplyPending(999, applied));
+    assert(!rpc.ApplyPending(999, applied));
     io.Poll("OK ", "Resolution_Set  800  600");
     request = rpc.Poll(Limits);
     assert(request.result == ResizeRpcResult::ModeRequested);
     assert(request.mode.width == 800 && request.mode.height == 600);
-    assert(rpc.CompleteResize(false));
+    assert(rpc.ApplyPending(0, [](ResizeMode) { return ResizeApplyResult::Invalid; }));
+    io.Poll("ERROR Invalid arguments", "Resolution_Set 800 600");
+    assert(rpc.Poll(Limits, 2500).result == ResizeRpcResult::ModeRequested);
+    assert(!rpc.ApplyPending(3499, [](ResizeMode) { return ResizeApplyResult::Retry; }));
+    assert(rpc.ApplyPending(3500, [](ResizeMode) {
+        assert(false && "expired resize must not run");
+        return ResizeApplyResult::Applied;
+    }));
+    io.EmptyPoll("ERROR Resize timed out");
+    assert(rpc.Poll(Limits, 3501).result == ResizeRpcResult::Idle);
 
     static constexpr std::string_view invalid[] = {
         "Resolution_Set -1 600", "Resolution_Set 42949672960 600",
@@ -139,10 +157,12 @@ void ResizeSession() {
         "Resolution_Set +800 600", "Resolution_Set 800", "Resolution_Set 800 600 garbage",
         "Resolution_Set 800 600\n", std::string_view("Resolution_Set 800\0 600", 23),
     };
+    std::string_view previousReply;
     for (auto cmd : invalid) {
-        io.Poll("ERROR Invalid arguments", cmd);
+        io.Poll(previousReply, cmd);
         assert(rpc.Poll(Limits).result == ResizeRpcResult::Handled);
-        assert(!rpc.CompleteResize(true));
+        assert(!rpc.ApplyPending(0, [](ResizeMode) { return ResizeApplyResult::Applied; }));
+        previousReply = "ERROR Invalid arguments";
     }
     io.Poll("ERROR Invalid arguments", "DisplayTopology_Set 1");
     assert(rpc.Poll(Limits).result == ResizeRpcResult::Handled);
@@ -189,7 +209,7 @@ void FallbackAndErrors() {
     io.Command(Client, Close, 0);
     assert(rpc.Poll(Limits).result == ResizeRpcResult::TransportError);
     io.CheckConsumed();
-    assert(!rpc.CompleteResize(true));
+    assert(!rpc.ApplyPending(0, [](ResizeMode) { return ResizeApplyResult::Applied; }));
 
     io.OpenChannels();
     assert(rpc.Open());
