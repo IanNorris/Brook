@@ -44,9 +44,6 @@ KERNEL_CONSOLE_SHORTCUT_PATH = 'BOOT/SHORTCUTS/KCONSOLE.RC'
 KERNEL_CONSOLE_SHORTCUT = (Path(__file__).resolve().parents[1] / 'data/shortcuts/kernel_console.rc').read_bytes()
 # Chromium managed policy for GPU-desktop images: hides the --no-sandbox infobar
 # (Brook has no seccomp-bpf or full namespace sandbox yet; see docs/chromium-sandbox.md).
-CHROMIUM_POLICY_DIRS = ('ETC/chromium', 'ETC/chromium/policies', 'ETC/chromium/policies/managed')
-CHROMIUM_POLICY_PATH = 'ETC/chromium/policies/managed/brook.json'
-CHROMIUM_POLICY = (Path(__file__).resolve().parents[1] / 'data/chromium/brook-managed-policy.json').read_bytes()
 
 
 def hide_kernel_console(script):
@@ -212,18 +209,6 @@ def prepare(source, build, abi, payload_id, output, expected_kernel_sha256, pani
             subprocess.run(['mcopy','-o','-i',str(image),str(startup_path),'::/BOOT/INIT.RC'],check=True)
             if subprocess.check_output(['mtype','-i',str(image),'::/BOOT/INIT.RC'])!=startup:
                 raise RuntimeError('desktop startup script readback mismatch')
-        if enable_vulkan_desktop:
-            existing=subprocess.run(['mtype','-i',str(image),'::/'+CHROMIUM_POLICY_PATH],capture_output=True)
-            if existing.returncode==0 and existing.stdout!=CHROMIUM_POLICY:
-                raise ValueError('source initrd has a different '+CHROMIUM_POLICY_PATH)
-            for directory in CHROMIUM_POLICY_DIRS:
-                if subprocess.run(['mdir','-i',str(image),'::/'+directory],capture_output=True).returncode:
-                    subprocess.run(['mmd','-i',str(image),'::/'+directory],check=True)
-            policy=output/'brook-chromium-policy.json';policy.write_bytes(CHROMIUM_POLICY)
-            subprocess.run(['mcopy','-o','-i',str(image),str(policy),'::/'+CHROMIUM_POLICY_PATH],check=True)
-            if subprocess.check_output(['mtype','-i',str(image),'::/'+CHROMIUM_POLICY_PATH])!=CHROMIUM_POLICY:
-                raise RuntimeError('Chromium policy readback mismatch')
-            enabled.append('chromium-policy')
         if hide_kernel_console_window:
             existing=subprocess.run(['mtype','-i',str(image),'::/'+KERNEL_CONSOLE_SHORTCUT_PATH],capture_output=True)
             if existing.returncode==0 and existing.stdout!=KERNEL_CONSOLE_SHORTCUT:

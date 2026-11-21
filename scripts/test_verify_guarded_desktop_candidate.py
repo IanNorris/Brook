@@ -9,7 +9,6 @@ from unittest import mock
 
 import verify_guarded_desktop_candidate as verifier
 from bridge_keyless_image import rebuild_keyless_image
-from prepare_hardware_kernel_pair import CHROMIUM_POLICY_DIRS
 from stage_clearwater_shell import CLEARWATER_START
 
 
@@ -42,10 +41,6 @@ class VerifyGuardedDesktop(unittest.TestCase):
         shutil.copyfile(self.image,self.source);shutil.copyfile(self.image,self.ref)
     def copy(self,name,data):
         subprocess.run(['mcopy','-o','-i',str(self.image),'-','::/'+name],input=data,check=True)
-    def stage_chromium_policy(self):
-        for directory in CHROMIUM_POLICY_DIRS:
-            subprocess.run(['mmd', '-i', str(self.image), '::/' + directory], check=True)
-        self.copy(verifier.CHROMIUM_POLICY_PATH, verifier.CHROMIUM_POLICY)
     def check(self, allow_gpu_submission_timing=False, allow_vulkan_desktop=False, allow_vulkan_partial=False, allow_gpu_blocked_recovery_test=False, expected_gpu_provider=None, allow_gpu_source_trace=False, allow_vulkan_async_partial=False, allow_dell_bcs_present=False, allow_irq_signal_probe=False, allow_hidden_kernel_console=False, **kwargs):
         with mock.patch.object(verifier,'CHECKER_SHA',hashlib.sha256(self.fat).hexdigest()), \
              mock.patch.object(verifier,'E2FSCK_SHA',hashlib.sha256(self.ext).hexdigest()), \
@@ -127,7 +122,6 @@ class VerifyGuardedDesktop(unittest.TestCase):
         shutil.copyfile(self.source,self.image);self.copy('BOOT/INIT.RC',b'changed\n')
         with self.assertRaisesRegex(ValueError,'startup script mismatch'):self.check()
     def test_vulkan_start_requires_exact_opt_in(self):
-        self.stage_chromium_policy()
         self.copy('BOOT/INIT.RC',verifier.add_vulkan_desktop_start(b'set wm\n'))
         self.copy('BOOT/VKSUP.ELF',b'\x7fELF-sup');self.copy('BOOT/VKRENDER.ELF',b'\x7fELF-render')
         with self.assertRaisesRegex(ValueError,'startup script mismatch'):self.check()
@@ -160,14 +154,12 @@ class VerifyGuardedDesktop(unittest.TestCase):
             self.check(**hashes)
 
     def test_partial_requires_separate_exact_opt_in(self):
-        self.stage_chromium_policy()
         self.copy('BOOT/INIT.RC',verifier.add_vulkan_desktop_start(b'set wm\n',True))
         self.copy('BOOT/VKSUP.ELF',b'\x7fELF-sup');self.copy('BOOT/VKRENDER.ELF',b'\x7fELF-render')
         with self.assertRaisesRegex(ValueError,'startup script mismatch'):self.check(allow_vulkan_desktop=True)
         with self.assertRaisesRegex(ValueError,'requires Vulkan'):self.check(allow_vulkan_partial=True)
         self.assertTrue(self.check(allow_vulkan_desktop=True,allow_vulkan_partial=True)['vulkan_partial_enabled'])
     def test_async_blitter_requires_exact_opt_ins(self):
-        self.stage_chromium_policy()
         self.copy('BOOT/INIT.RC',verifier.add_vulkan_desktop_start(b'set wm\n',async_partial=True))
         self.copy('BOOT/VKSUP.ELF',b'\x7fELF-sup');self.copy('BOOT/VKRENDER.ELF',b'\x7fELF-render')
         self.copy('ETC/dell-gpu-bcs-present',b'1\n')
@@ -183,7 +175,6 @@ class VerifyGuardedDesktop(unittest.TestCase):
     def test_gpu_source_requires_provider_pin_and_exact_start(self):
         base=b'set wm\nrun --service --once --uid 1000 /boot/INTLWL.ELF\n'
         self.copy('BOOT/INIT.RC',base);shutil.copyfile(self.image,self.source);shutil.copyfile(self.image,self.ref)
-        self.stage_chromium_policy()
         self.copy('BOOT/INIT.RC',verifier.add_vulkan_desktop_start(base,True,True))
         self.copy('BOOT/VKSUP.ELF',b'\x7fELF-sup');self.copy('BOOT/VKRENDER.ELF',b'\x7fELF-render')
         self.copy('BOOT/INTLWL.ELF',b'\x7fELF-provider')
