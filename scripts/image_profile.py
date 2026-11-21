@@ -58,15 +58,16 @@ def verify_realized_selection(selection):
     if not profile.is_dir() or profile.resolve(strict=True) != profile:
         raise ValueError("Selected profile must be a realized Nix store directory")
     manifest = selection["manifest"]
-    if manifest.get("preset") is None:
-        try:
-            embedded = json.loads((profile / "share/brook/profile.json").read_text())
-        except (OSError, ValueError) as error:
-            raise ValueError("Selected profile has no readable embedded manifest") from error
-        if embedded != manifest:
-            raise ValueError("Selected profile differs from its embedded manifest")
-        if selection["packages"] != embedded.get("packages"):
-            raise ValueError("Selected package metadata differs from the embedded manifest")
+    if manifest.get("preset") is not None:
+        raise ValueError("Use the preset's original profile expression for compatibility seeds")
+    try:
+        embedded = json.loads((profile / "share/brook/profile.json").read_text())
+    except (OSError, ValueError) as error:
+        raise ValueError("Selected profile has no readable embedded manifest") from error
+    if embedded != manifest:
+        raise ValueError("Selected profile differs from its embedded manifest")
+    if selection["packages"] != embedded.get("packages"):
+        raise ValueError("Selected package metadata differs from the embedded manifest")
     return profile
 
 

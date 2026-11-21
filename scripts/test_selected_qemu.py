@@ -95,6 +95,10 @@ class SelectedQemuTest(unittest.TestCase):
                 image_profile.verify_realized_selection(selection)
             embedded.write_text(json.dumps(manifest))
             self.assertEqual(image_profile.verify_realized_selection(selection), self.root)
+            manifest['preset'] = 'network'
+            with self.assertRaisesRegex(ValueError, 'original profile expression'):
+                image_profile.verify_realized_selection(selection)
+            del manifest['preset']
             manifest['redistributable'] = True
             with self.assertRaisesRegex(ValueError, 'differs from its embedded manifest'):
                 image_profile.verify_realized_selection(selection)
