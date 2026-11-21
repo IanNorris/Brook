@@ -62,6 +62,9 @@ void HdaTestWrite(uint32_t offset,uint32_t width,uint32_t value) {
         return;
     }
     if(offset==g_outStreamBase+SD_CTL && width==4) {
+        // High byte is status, not part of the 24-bit stream control.
+        const uint32_t status=HdaTestRead(g_outStreamBase+SD_STS,1);
+        value=(value&SD_CTL_MASK)|((status&~(value>>24))<<24);
         // Match QEMU: SRST preserves stale LPIB; RUN's rising edge parses a
         // fresh BDL and resets its position. Clearing on SRST hid restart loss.
         if((value&SD_CTL_SRST) && failSetup)value&=~SD_CTL_SRST;
@@ -71,6 +74,18 @@ void HdaTestWrite(uint32_t offset,uint32_t width,uint32_t value) {
     store(offset,width,value);
 }
 namespace {
+// Model the Workstation trace: the controller advances one descriptor and
+// waits at its boundary until the polled driver acknowledges BCIS.
+void moveVmwareDescriptor() {
+    constexpr uint64_t periodNs=uint64_t(FRAG_SIZE)*1000000000/176400+1000000;
+    const uint32_t status=g_outStreamBase+SD_STS;
+    if (HdaTestRead(status,1)&SD_STS_BCIS) {
+        nowNs+=periodNs;
+        return;
+    }
+    move(FRAG_SIZE,periodNs);
+    store(status,1,HdaTestRead(status,1)|SD_STS_BCIS);
+}
 void prime() {
     if(g_nativeMode && !g_streamRunning && g_nativeClock.Pending()) {
         nowNs+=NATIVE_PRIME_NS;HdaService();VERIFY(g_streamRunning);
@@ -199,6 +214,37 @@ int RunHdaClockTests() {
     VERIFY(HdaPlayPcm(tone.data(),AUDIO_BUF_SIZE,44100,2,16,false)==TARGET_QUEUE_BYTES);
     VERIFY(!g_streamRunning && !g_streamConfigured && g_dmaStalls==1);
     VERIFY(HdaPlayPcm(tone.data(),4,44100,2,16,false)==4);
+    initialize();
+    g_vmwareController=true;
+    VERIFY(HdaTrySubmit(tone.data(),2*FRAG_SIZE).accepted==2*FRAG_SIZE);
+    const auto firstEpoch=g_nativeClock.epoch;
+    moveVmwareDescriptor();
+    moveVmwareDescriptor();
+    VERIFY(HdaTestRead(g_outStreamBase+SD_LPIB,4)==FRAG_SIZE);
+    AudioHdaStatus beforePoll{};
+    VERIFY(HdaReadStatus(beforePoll) && (beforePoll.sdsts&SD_STS_BCIS));
+    VERIFY(HdaTestRead(g_outStreamBase+SD_STS,1)==SD_STS_BCIS);
+    VERIFY(progress().completed==FRAG_SIZE);
+    VERIFY(!(HdaTestRead(g_outStreamBase+SD_STS,1)&SD_STS_BCIS));
+    moveVmwareDescriptor();
+    const auto secondPeriod=progress();
+    VERIFY(secondPeriod.completed==2*FRAG_SIZE && secondPeriod.epoch==firstEpoch &&
+           !secondPeriod.discontinuity && g_dmaStalls==0);
+
+    initialize();
+    g_vmwareController=true;
+    VERIFY(HdaPlayPcm(tone.data(),3*FRAG_SIZE,44100,2,16,true)==3*FRAG_SIZE);
+    moveVmwareDescriptor();
+    store(g_outStreamBase+SD_STS,1,SD_STS_BCIS|SD_STS_FIFOE|SD_STS_DESE);
+    HdaService();
+    VERIFY(g_playedBytes==FRAG_SIZE);
+    VERIFY(HdaTestRead(g_outStreamBase+SD_STS,1)==(SD_STS_FIFOE|SD_STS_DESE));
+    moveVmwareDescriptor();
+    HdaService();
+    VERIFY(g_playedBytes==2*FRAG_SIZE && g_streamRunning);
+    store(g_outStreamBase+SD_STS,1,SD_STS_BCIS|SD_STS_FIFOE|SD_STS_DESE);
+    HdaStop();
+    VERIFY(HdaTestRead(g_outStreamBase+SD_STS,1)==(SD_STS_BCIS|SD_STS_FIFOE|SD_STS_DESE));
     initialize();
     // Consecutive fresh rings must not charge the stale pre-RUN position as a
     // wrap. Verify both native and legacy accounting before any DMA movement.

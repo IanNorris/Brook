@@ -124,6 +124,7 @@ enum SdReg : uint32_t {
 };
 
 // Stream control bits
+static constexpr uint32_t SD_CTL_MASK   = 0x00ffffffu;
 static constexpr uint32_t SD_CTL_SRST   = (1 << 0);   // Stream reset
 static constexpr uint32_t SD_CTL_RUN    = (1 << 1);   // Stream run
 static constexpr uint32_t SD_CTL_IOCE   = (1 << 2);   // Interrupt on completion enable
@@ -581,7 +582,7 @@ static bool SetupOutputStream(uint32_t sampleRate, uint8_t channels, uint8_t bit
     {
         g_bdl[i].addr   = g_fragPhys[i];
         g_bdl[i].length = FRAG_SIZE;
-        g_bdl[i].ioc    = 1;  // interrupt on every fragment completion
+        g_bdl[i].ioc    = 1;  // latch BCIS on each fragment completion
     }
 
     // LVI = last valid index, CBL = total ring size
@@ -621,10 +622,19 @@ static void StartOutputStream()
 static void StopOutputStream()
 {
     uint32_t sdBase = g_outStreamBase;
-    uint32_t ctl = hda_read32(sdBase + SD_CTL);
-    ctl &= ~SD_CTL_RUN;
-    hda_write32(sdBase + SD_CTL, ctl);
+    // The upper byte aliases the write-one-to-clear status register.
+    const uint32_t ctl = hda_read32(sdBase + SD_CTL) & SD_CTL_MASK;
+    hda_write32(sdBase + SD_CTL, ctl & ~SD_CTL_RUN);
     BusyWait(1000);
+}
+
+static void AcknowledgePolledCompletion(uint8_t status)
+{
+    // Workstation can wait at an IOC boundary until BCIS is acknowledged.
+    // In polling mode there is no ISR to clear it. Preserve error bits for
+    // the fault path, and use LPIB, not BCIS, to account completed bytes.
+    if (status & SD_STS_BCIS)
+        hda_write8(g_outStreamBase + SD_STS, SD_STS_BCIS);
 }
 
 static void UpdatePlayedBytesLocked()
@@ -641,6 +651,7 @@ static void UpdatePlayedBytesLocked()
     g_playedBytes += delta;
     if (g_playedBytes > g_submittedBytes)
         g_playedBytes = g_submittedBytes;
+    AcknowledgePolledCompletion(hda_read8(g_outStreamBase + SD_STS));
 }
 
 static uint32_t QueuedBytesLocked()
@@ -786,6 +797,7 @@ static void ObserveNativeLocked()
     if (first > cleared) first = cleared;
     memset(g_audioBuf + offset, 0, first);
     if (cleared > first) memset(g_audioBuf, 0, cleared - first);
+    AcknowledgePolledCompletion(status);
     if (!g_nativeClock.Pending() && g_nativeClock.completed >= g_nativeLastDataEnd &&
         g_nativeClock.completed - g_nativeLastDataEnd >= NATIVE_IDLE_TRAILER) {
         StopNativePhysicalLocked();
@@ -969,8 +981,7 @@ static bool HdaNativeRestart(uint64_t expectedEpoch)
 // Play PCM samples through the HDA output using ring-buffered DMA.
 // 16 BDL entries of 4KB each, all with IOC. DMA cycles through them.
 // We accumulate writes into the current fragment and advance when full.
-// BCIS fires on each fragment completion — we use it to pace writes
-// so we don't overwrite data DMA is still playing.
+// Poll LPIB to pace writes and acknowledge BCIS at fragment completions.
 extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
                            uint32_t sampleRate, uint8_t channels,
                            uint8_t bitsPerSample, bool nonblock)
@@ -1183,7 +1194,7 @@ static void HdaService()
 static bool HdaReadStatus(AudioHdaStatus& status)
 {
     if (!g_initialized || __atomic_exchange_n(&g_playLock,1u,__ATOMIC_ACQUIRE)) return false;
-    status={hda_read32(g_outStreamBase+SD_CTL)&0x00ffffffu,
+    status={hda_read32(g_outStreamBase+SD_CTL)&SD_CTL_MASK,
             hda_read8(g_outStreamBase+SD_STS),hda_read32(g_outStreamBase+SD_LPIB),
             hda_read32(INTSTS),hda_read32(INTCTL),hda_read32(WALCLK),
             hda_read16(g_outStreamBase+SD_FMT),g_curRate,
