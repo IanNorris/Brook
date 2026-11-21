@@ -213,6 +213,44 @@ static void TestFailedIndirectReads()
     for (auto* buffer : fixture.indCacheData) kfree(buffer);
 }
 
+static void TestDirectoryReadFailure(brook::Ext2Mount* mount)
+{
+    using namespace brook;
+    const bool skipPermissions = mount->skipPermChecks;
+    mount->skipPermChecks = true;
+    int error = 0;
+    auto* source = Ext2FsOpenModeChecked(mount, 0, "rename-source", VFS_O_CREATE | VFS_O_WRITE, 0600, &error);
+    assert(source && !error);
+    closeNode(source);
+
+    Ext2Inode root{}, directory{};
+    KRwLockReadLock(&g_ext2Lock);
+    assert(Ext2ReadInode(mount, EXT2_ROOT_INO, &root));
+    const auto inode = Ext2DirLookup(mount, EXT2_ROOT_INO, &root, "dir");
+    assert(inode && Ext2ReadInode(mount, inode, &directory));
+    KRwLockReadUnlock(&g_ext2Lock);
+    assert(directory.i_block[0]);
+    const auto before = disk;
+
+    failReadOffset = uint64_t(directory.i_block[0]) << mount->blockShift;
+    assert(!Ext2FsOpenModeChecked(mount, 0, "dir/marker", 0, 0, &error) && error == -5);
+    assert(!Ext2FsOpenModeChecked(mount, 0, "dir/marker", VFS_O_CREATE | VFS_O_WRITE, 0600, &error) && error == -5);
+    assert(!Ext2FsOpenModeChecked(mount, 0, "dir/marker", VFS_O_CREATE | VFS_O_EXCL, 0600, &error) && error == -5);
+    assert(Ext2FsRename(mount, 0, "rename-source", "dir/marker") == -5);
+    assert(Ext2FsRemoveAt(mount, 0, "dir/marker", false, EXT2_ROOT_INO) == -5);
+    assert(Ext2FsMkdir(mount, 0, "dir/subdir", 0755) == -5);
+    assert(Ext2FsSymlink(mount, 0, "marker", "dir/linked") == -5);
+    assert(!Ext2FsCreateSocket(mount, 0, "dir/socket", 0600, &error) && error == -5);
+    assert(disk == before);
+    failReadOffset = ~uint64_t{0};
+
+    auto* marker = Ext2FsOpenModeChecked(mount, 0, "dir/marker", 0, 0, &error);
+    assert(marker && !error);
+    closeNode(marker);
+    assert(!Ext2FsUnlink(mount, 0, "rename-source"));
+    mount->skipPermChecks = skipPermissions;
+}
+
 int main(int argc,char** argv){
     assert(argc==2);std::ifstream input(argv[1],std::ios::binary);assert(input);
     disk.assign(std::istreambuf_iterator<char>(input),{});input.close();
@@ -253,6 +291,7 @@ int main(int argc,char** argv){
     g_ext2Devices[0]=&device;void* mount=nullptr;assert(Ext2FsMount(0,&mount));
     auto* m=static_cast<Ext2Mount*>(mount);
     assert(m->writeError==0 && m->deferredSyncError==0);
+    TestDirectoryReadFailure(m);
     // A low-volume mutation must not depend on reaching the operation-count
     // threshold. A safety pass flushes it, and idle passes do not flush again.
     assert(!Ext2FsSync(m));m->syncProbe.autoOps=4096;

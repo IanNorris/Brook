@@ -591,7 +591,7 @@ static int Ext2ReadInodeData(Ext2Mount* mnt, const Ext2Inode* ino,
                              void* buf, uint64_t len, uint64_t offset);
 static uint32_t Ext2DirLookup(Ext2Mount* mnt, uint32_t parentIno, const Ext2Inode* dirIno, const char* name, int* error=nullptr);
 static uint32_t Ext2ResolvePath(Ext2Mount* mnt, uint32_t startIno,
-                                const char* path, int symlinkDepth);
+                                const char* path, int symlinkDepth, int* error=nullptr);
 
 // Write exactly `len` bytes to device at `byteOffset`.
 static bool Ext2DevWrite(Ext2Mount* mnt, uint64_t byteOffset, const void* buf, uint64_t len)
@@ -1851,8 +1851,10 @@ static uint32_t Ext2DirRemove(Ext2Mount* mnt, Ext2Inode* dirData,
 // Resolve parent directory and extract final component from a path.
 // Returns parent inode number. Writes component name into `nameOut`.
 static uint32_t Ext2ResolveParent(Ext2Mount* mnt, const char* relPath,
-                                  char* nameOut, uint32_t nameOutSize,uint32_t startInode=EXT2_ROOT_INO)
+                                  char* nameOut, uint32_t nameOutSize,
+                                  uint32_t startInode=EXT2_ROOT_INO,int* error=nullptr)
 {
+    if(error)*error=0;
     if(relPath[0]=='/')startInode=EXT2_ROOT_INO;
     const char* p = relPath;
     while (*p == '/') ++p; // skip leading slashes
@@ -1881,7 +1883,7 @@ static uint32_t Ext2ResolveParent(Ext2Mount* mnt, const char* relPath,
     // Copy parent path (everything before the last slash)
     uint32_t parentLen = static_cast<uint32_t>(lastSlash - p);
     char parentPath[256];
-    if (parentLen >= sizeof(parentPath)) return 0;
+    if (parentLen >= sizeof(parentPath)) { if(error)*error=-36; return 0; }
     for (uint32_t i = 0; i < parentLen; ++i) parentPath[i] = p[i];
     parentPath[parentLen] = '\0';
 
@@ -1892,7 +1894,7 @@ static uint32_t Ext2ResolveParent(Ext2Mount* mnt, const char* relPath,
     while (name + ni < end && name[ni] && ni < nameOutSize - 1) { nameOut[ni] = name[ni]; ++ni; }
     nameOut[ni] = '\0';
 
-    return Ext2ResolvePath(mnt, startInode, parentPath, 0);
+    return Ext2ResolvePath(mnt, startInode, parentPath, 0, error);
 }
 
 // ---------------------------------------------------------------------------
@@ -2203,20 +2205,17 @@ static char* Ext2ReadSymlink(Ext2Mount* mnt, const Ext2Inode* ino)
 
     // Slow symlink: target stored in data blocks
     int r = Ext2ReadInodeData(mnt, ino, target, size, 0);
-    if (r <= 0) { kfree(target); return nullptr; }
-    target[r] = '\0';
+    if (r != static_cast<int>(size)) { kfree(target); return nullptr; }
+    target[size] = '\0';
     return target;
 }
 
 // Resolve a path to an inode number, following symlinks (up to depth limit).
 // path must be relative (no leading slash); resolution starts from startIno.
-static uint32_t Ext2ResolvePath(Ext2Mount* mnt, uint32_t startIno,
-                                const char* path, int symlinkDepth);
-
 static uint32_t Ext2ResolvePathInternal(Ext2Mount* mnt, uint32_t startIno,
-                                        const char* path, int symlinkDepth)
+                                        const char* path, int symlinkDepth, int* error)
 {
-    if (symlinkDepth > 8) return 0; // symlink loop protection
+    if (symlinkDepth > 8) { if(error)*error=-40; return 0; }
 
     uint32_t curIno = startIno;
 
@@ -2235,27 +2234,25 @@ static uint32_t Ext2ResolvePathInternal(Ext2Mount* mnt, uint32_t startIno,
     // Look up component in current directory
     Ext2Inode dirIno;
     if (!Ext2ReadInode(mnt, curIno, &dirIno)) {
+        if(error)*error=-5;
         SerialPrintf("ext2: ReadInode %u FAILED for component '%s'\n", curIno, component);
         return 0;
     }
     if ((dirIno.i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR) {
-        // Normal ENOTDIR — don't spam serial for routine path probes
+        if(error)*error=-20;
         return 0;
     }
 
-    uint32_t childIno = Ext2DirLookup(mnt, curIno, &dirIno, component);
-    if (!childIno) {
-        // SerialPrintf("ext2: DirLookup '%s' in ino %u → MISS\n", component, curIno);
-        return 0;
-    }
+    uint32_t childIno = Ext2DirLookup(mnt, curIno, &dirIno, component, error);
+    if (!childIno) return 0;
 
     // Check if child is a symlink — follow it
     Ext2Inode childData;
-    if (!Ext2ReadInode(mnt, childIno, &childData)) return 0;
+    if (!Ext2ReadInode(mnt, childIno, &childData)) { if(error)*error=-5; return 0; }
 
     if ((childData.i_mode & EXT2_S_IFMT) == EXT2_S_IFLNK) {
         char* target = Ext2ReadSymlink(mnt, &childData);
-        if (!target) return 0;
+        if (!target) { if(error)*error=-5; return 0; }
 
         // Resolve symlink target
         uint32_t base = curIno;
@@ -2270,18 +2267,18 @@ static uint32_t Ext2ResolvePathInternal(Ext2Mount* mnt, uint32_t startIno,
         char* combined = nullptr;
         if (remainLen > 0) {
             combined = static_cast<char*>(kmalloc(targetLen + 1 + remainLen + 1));
-            if (!combined) { kfree(target); return 0; }
+            if (!combined) { kfree(target); if(error)*error=-12; return 0; }
             uint32_t wi = 0;
             for (uint32_t i = 0; i < targetLen; ++i) combined[wi++] = target[i];
             combined[wi++] = '/';
             for (uint32_t i = 0; i < remainLen; ++i) combined[wi++] = path[i];
             combined[wi] = '\0';
             kfree(target);
-            uint32_t result = Ext2ResolvePathInternal(mnt, base, combined, symlinkDepth + 1);
+            uint32_t result = Ext2ResolvePathInternal(mnt, base, combined, symlinkDepth + 1, error);
             kfree(combined);
             return result;
         } else {
-            uint32_t result = Ext2ResolvePathInternal(mnt, base, target, symlinkDepth + 1);
+            uint32_t result = Ext2ResolvePathInternal(mnt, base, target, symlinkDepth + 1, error);
             kfree(target);
             return result;
         }
@@ -2289,15 +2286,16 @@ static uint32_t Ext2ResolvePathInternal(Ext2Mount* mnt, uint32_t startIno,
 
     // Not a symlink — if more path remains, recurse
     if (*path != '\0')
-        return Ext2ResolvePathInternal(mnt, childIno, path, symlinkDepth);
+        return Ext2ResolvePathInternal(mnt, childIno, path, symlinkDepth, error);
 
     return childIno;
 }
 
 static uint32_t Ext2ResolvePath(Ext2Mount* mnt, uint32_t startIno,
-                                const char* path, int symlinkDepth)
+                                const char* path, int symlinkDepth, int* error)
 {
-    return Ext2ResolvePathInternal(mnt, startIno, path, symlinkDepth);
+    if(error)*error=0;
+    return Ext2ResolvePathInternal(mnt, startIno, path, symlinkDepth, error);
 }
 
 // ---------------------------------------------------------------------------
@@ -3319,6 +3317,7 @@ static Vnode* Ext2FsOpenModeAt(void* mountPriv,uint8_t pdrv,const char* relPath,
         KRwLockReadLock(&g_ext2Lock);
     }
 
+    int lookupError=0;
     const bool exclusive=(flags&(VFS_O_CREATE|VFS_O_EXCL))==(VFS_O_CREATE|VFS_O_EXCL);
     if (isRoot) {
         ino = EXT2_ROOT_INO;
@@ -3326,19 +3325,22 @@ static Vnode* Ext2FsOpenModeAt(void* mountPriv,uint8_t pdrv,const char* relPath,
         // Exclusive publication checks the directory entry itself, including
         // dangling symlinks, under the same backend write lock as creation.
         char name[256];Ext2Inode parent{};
-        uint32_t parentIno=Ext2ResolveParent(mnt,relPath,name,sizeof(name),startInode);
-        int lookupError=0;
-        if(!parentIno || !name[0])lookupError=-2;
+        uint32_t parentIno=Ext2ResolveParent(mnt,relPath,name,sizeof(name),startInode,&lookupError);
+        if(!parentIno || !name[0]) { if(!lookupError)lookupError=-2; }
         else if(!Ext2ReadInode(mnt,parentIno,&parent))lookupError=-5;
         else if((lookupError=Ext2CheckParentSearch(mnt,parent))) {}
         else ino=Ext2DirLookup(mnt,parentIno,&parent,name,&lookupError);
-        if(lookupError && lookupError!=-2) {
-            if(error)*error=lookupError;KRwLockWriteUnlock(&g_ext2Lock);return nullptr;
-        }
     } else {
         const char* p = relPath;
         while (*p == '/') ++p;
-        ino = Ext2ResolvePath(mnt, startInode, p, 0);
+        ino = Ext2ResolvePath(mnt, startInode, p, 0, &lookupError);
+    }
+
+    if (!ino && lookupError && lookupError != -2) {
+        if (error) *error = lookupError;
+        if (needsWrite) KRwLockWriteUnlock(&g_ext2Lock);
+        else KRwLockReadUnlock(&g_ext2Lock);
+        return nullptr;
     }
 
     if(ino && exclusive) {
@@ -3355,11 +3357,17 @@ static Vnode* Ext2FsOpenModeAt(void* mountPriv,uint8_t pdrv,const char* relPath,
         if (s_createCount <= 20 || (s_createCount % 100) == 0)
             SerialPrintf("ext2: CREATE file '%s' [#%u]\n", relPath, s_createCount);
         char name[256];
-        uint32_t parentIno = Ext2ResolveParent(mnt, relPath, name, sizeof(name),startInode);
-        if (!parentIno || !name[0]) { KRwLockWriteUnlock(&g_ext2Lock); return nullptr; }
+        uint32_t parentIno = Ext2ResolveParent(mnt, relPath, name, sizeof(name),startInode,&lookupError);
+        if (!parentIno || !name[0]) {
+            if (error) *error = lookupError ? lookupError : -2;
+            KRwLockWriteUnlock(&g_ext2Lock); return nullptr;
+        }
 
         Ext2Inode parentData;
-        if (!Ext2ReadInode(mnt, parentIno, &parentData)) { KRwLockWriteUnlock(&g_ext2Lock); return nullptr; }
+        if (!Ext2ReadInode(mnt, parentIno, &parentData)) {
+            if (error) *error = -5;
+            KRwLockWriteUnlock(&g_ext2Lock); return nullptr;
+        }
         if (int denied = Ext2CheckParentMutation(mnt, parentData)) {
             if (error) *error = denied;
             KRwLockWriteUnlock(&g_ext2Lock); return nullptr;
@@ -3385,6 +3393,7 @@ static Vnode* Ext2FsOpenModeAt(void* mountPriv,uint8_t pdrv,const char* relPath,
         bool entryCommitted;
         if (!Ext2DirAdd(mnt, parentIno, &parentData, ino, name, 1 /*EXT2_FT_REG_FILE*/, &entryCommitted)) {
             if (!entryCommitted) Ext2FreeInode(mnt, ino, false);
+            if (error) *error = -5;
             KRwLockWriteUnlock(&g_ext2Lock);
             return nullptr;
         }
@@ -3402,6 +3411,7 @@ static Vnode* Ext2FsOpenModeAt(void* mountPriv,uint8_t pdrv,const char* relPath,
     }
 
     if (!Ext2ReadInode(mnt, ino, &inodeData)) {
+        if (error) *error = -5;
         if (needsWrite) KRwLockWriteUnlock(&g_ext2Lock);
         else            KRwLockReadUnlock(&g_ext2Lock);
         return nullptr;
@@ -3594,14 +3604,15 @@ static int Ext2FsRemoveAt(void* mountPriv,uint8_t pdrv,const char* relPath,bool 
         return result;
     };
     char name[256];
-    uint32_t parentIno = Ext2ResolveParent(mnt, relPath, name, sizeof(name),startInode);
-    if (!parentIno || !name[0]) return finish(-2);
+    int lookupError=0;
+    uint32_t parentIno = Ext2ResolveParent(mnt, relPath, name, sizeof(name),startInode,&lookupError);
+    if (!parentIno || !name[0]) return finish(lookupError ? lookupError : -2);
     if (!strcmp(name, ".") || !strcmp(name, "..")) return finish(-22);
     Ext2Inode parent, target;
     if (!Ext2ReadInode(mnt, parentIno, &parent)) return finish(-5);
     if (int denied = Ext2CheckParentMutation(mnt, parent)) return finish(denied);
-    uint32_t ino = Ext2DirLookup(mnt, parentIno, &parent, name);
-    if (!ino) return finish(-2);
+    uint32_t ino = Ext2DirLookup(mnt, parentIno, &parent, name, &lookupError);
+    if (!ino) return finish(lookupError);
     if (ino == EXT2_ROOT_INO) return finish(-16);
     if (!Ext2ReadInode(mnt, ino, &target)) return finish(-5);
     if (int denied = Ext2CheckStickyRemoval(mnt, parent, target)) return finish(denied);
@@ -3660,12 +3671,14 @@ static Vnode* Ext2FsCreateSocketAt(void* mountPriv,uint8_t pdrv,const char* path
         return nullptr;
     };
     char name[256];
-    uint32_t parent = Ext2ResolveParent(mnt, path, name, sizeof(name),startInode);
-    if (!parent || !name[0]) return fail(-2);
+    int lookupError=0;
+    uint32_t parent = Ext2ResolveParent(mnt, path, name, sizeof(name),startInode,&lookupError);
+    if (!parent || !name[0]) return fail(lookupError ? lookupError : -2);
     Ext2Inode directory{};
     if (!Ext2ReadInode(mnt, parent, &directory)) return fail(-5);
     if (int denied=Ext2CheckParentSearch(mnt,directory))return fail(denied);
-    if (Ext2DirLookup(mnt, parent, &directory, name)) return fail(-17);
+    if (Ext2DirLookup(mnt, parent, &directory, name, &lookupError)) return fail(-17);
+    if (lookupError != -2) return fail(lookupError);
     if (int denied = Ext2CheckParentMutation(mnt, directory)) return fail(denied);
     ino = Ext2AllocInode(mnt, false);
     if (!ino) return fail(-28);
@@ -3712,8 +3725,11 @@ static int Ext2FsMkdirAt(void* mountPriv,uint8_t pdrv,const char* relPath,uint16
     Ext2DrainOrphans(mnt);
 
     char name[256];
-    uint32_t parentIno = Ext2ResolveParent(mnt, relPath, name, sizeof(name),startInode);
-    if (!parentIno || !name[0]) { KRwLockWriteUnlock(&g_ext2Lock); return -1; }
+    int lookupError=0;
+    uint32_t parentIno = Ext2ResolveParent(mnt, relPath, name, sizeof(name),startInode,&lookupError);
+    if (!parentIno || !name[0]) {
+        KRwLockWriteUnlock(&g_ext2Lock); return lookupError && lookupError != -2 ? lookupError : -1;
+    }
 
     Ext2Inode parentData;
     if (!Ext2ReadInode(mnt, parentIno, &parentData)) { KRwLockWriteUnlock(&g_ext2Lock); return -1; }
@@ -3724,10 +3740,11 @@ static int Ext2FsMkdirAt(void* mountPriv,uint8_t pdrv,const char* relPath,uint16
     // VFS already checked ancestor search permission. Like Linux, report an
     // existing name before requiring write permission to create a new entry.
     // Keep lookup and creation under the same exclusive filesystem lock.
-    if (Ext2DirLookup(mnt, parentIno, &parentData, name)) {
+    if (Ext2DirLookup(mnt, parentIno, &parentData, name, &lookupError)) {
         KRwLockWriteUnlock(&g_ext2Lock);
         return -17; // EEXIST; never claim to have created an existing name.
     }
+    if (lookupError != -2) { KRwLockWriteUnlock(&g_ext2Lock); return lookupError; }
 
     if (int denied = Ext2CheckParentMutation(mnt, parentData)) {
         KRwLockWriteUnlock(&g_ext2Lock); return denied;
@@ -3868,9 +3885,11 @@ static int Ext2FsRenameAt(void* mountPriv,uint8_t pdrv,const char* oldRelPath,co
         return result;
     };
     char oldName[256], newName[256];
-    uint32_t oldParent = Ext2ResolveParent(mnt, oldRelPath, oldName, sizeof(oldName),oldStart);
-    uint32_t newParent = Ext2ResolveParent(mnt, newRelPath, newName, sizeof(newName),newStart);
-    if (!oldParent || !newParent) return finish(-2);
+    int lookupError=0;
+    uint32_t oldParent = Ext2ResolveParent(mnt, oldRelPath, oldName, sizeof(oldName),oldStart,&lookupError);
+    if (!oldParent) return finish(lookupError ? lookupError : -2);
+    uint32_t newParent = Ext2ResolveParent(mnt, newRelPath, newName, sizeof(newName),newStart,&lookupError);
+    if (!newParent) return finish(lookupError ? lookupError : -2);
     if (!oldName[0] || !newName[0]) return finish(-16);
     if (!strcmp(oldName, ".") || !strcmp(oldName, "..") ||
         !strcmp(newName, ".") || !strcmp(newName, "..")) return finish(-22);
@@ -3879,9 +3898,10 @@ static int Ext2FsRenameAt(void* mountPriv,uint8_t pdrv,const char* oldRelPath,co
         return finish(-5);
     if (int denied = Ext2CheckParentMutation(mnt, oldDir)) return finish(denied);
     if (int denied = Ext2CheckParentMutation(mnt, newDir)) return finish(denied);
-    uint32_t ino = Ext2DirLookup(mnt, oldParent, &oldDir, oldName);
-    if (!ino) return finish(-2);
-    uint32_t existing = Ext2DirLookup(mnt, newParent, &newDir, newName);
+    uint32_t ino = Ext2DirLookup(mnt, oldParent, &oldDir, oldName, &lookupError);
+    if (!ino) return finish(lookupError);
+    uint32_t existing = Ext2DirLookup(mnt, newParent, &newDir, newName, &lookupError);
+    if (!existing && lookupError != -2) return finish(lookupError);
     if (existing == ino) return finish(0);
     if (ino == EXT2_ROOT_INO) return finish(-16);
     if (!Ext2ReadInode(mnt, ino, &target)) return finish(-5);
@@ -4014,11 +4034,12 @@ static int Ext2FsSymlinkAt(void* mountPriv,uint8_t pdrv,const char* target,const
     KRwLockWriteLock(&g_ext2Lock);
 
     char name[256];
-    uint32_t parentIno = Ext2ResolveParent(mnt, relPath, name, sizeof(name),startInode);
+    int lookupError=0;
+    uint32_t parentIno = Ext2ResolveParent(mnt, relPath, name, sizeof(name),startInode,&lookupError);
     if (!parentIno || !name[0]) {
         SerialPrintf("ext2 symlink: ResolveParent FAILED for '%s' (target='%s')\n",
                      relPath, target);
-        KRwLockWriteUnlock(&g_ext2Lock); return -2; // -ENOENT
+        KRwLockWriteUnlock(&g_ext2Lock); return lookupError ? lookupError : -2;
     }
 
     Ext2Inode parentData;
@@ -4033,10 +4054,11 @@ static int Ext2FsSymlinkAt(void* mountPriv,uint8_t pdrv,const char* target,const
     }
 
     // Check if already exists
-    if (Ext2DirLookup(mnt, parentIno, &parentData, name)) {
+    if (Ext2DirLookup(mnt, parentIno, &parentData, name, &lookupError)) {
         KRwLockWriteUnlock(&g_ext2Lock);
         return -17; // -EEXIST
     }
+    if (lookupError != -2) { KRwLockWriteUnlock(&g_ext2Lock); return lookupError; }
 
     uint32_t newIno = Ext2AllocInode(mnt, false);
     if (!newIno) {
