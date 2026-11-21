@@ -39,7 +39,12 @@ BrookVkResult test_surface_compose_external(BrookVkSurface *s,uint32_t w,uint32_
  for(size_t i=0;i<(size_t)w*h;++i)out[i]=0xff112233;return (BrookVkResult)direct_status;}
 #endif
 static int test_fprintf(FILE *stream,const char *format,...)
-{ (void)stream;(void)format;errno=ENOSPC;return -1; }
+{
+    if (stream == stderr) { errno=ENOSPC;return -1; }
+    va_list args;va_start(args,format);
+    const int written=vfprintf(stream,format,args);
+    va_end(args);return written;
+}
 static long result;
 static int result_errno, calls;
 static unsigned intel_fail_request;
@@ -171,6 +176,27 @@ static void check_intel_deferred(int final_error,int destroy_early)
     image_unref(image);buffer_drop(buffer);close(g_drm_fd);g_drm_fd=-1;try_error=0;
     wl_client_destroy(client);close(sockets[1]);wl_display_destroy(display);
 }
+static const struct buffer_trace_event *trace_event(enum buffer_trace_kind kind, unsigned buffer)
+{
+    for (uint64_t i = 0; i < g_buffer_trace.events; ++i) {
+        const struct buffer_trace_event *e = &g_buffer_trace.ring[i];
+        if (e->kind == kind && e->buffer == buffer) return e;
+    }
+    return NULL;
+}
+static void check_buffer_trace_capacity(void)
+{
+    buffer_trace_start(getpid());
+    for (uint64_t i=0;i<BUF_TRACE_EVENTS+1;i++)
+        buffer_trace_record(BUFFER_ATTACH,1,i,0,2,0,NULL);
+    assert(g_buffer_trace.events==BUF_TRACE_EVENTS+1 && g_buffer_trace.counts[BUFFER_ATTACH]==BUF_TRACE_EVENTS+1);
+    assert(g_buffer_trace.ring[0].attachment==BUF_TRACE_EVENTS && g_buffer_trace.ring[1].attachment==1);
+    buffer_trace_stop();
+    FILE *capture=tmpfile();assert(capture && buffer_trace_dump(capture,getpid()));rewind(capture);
+    char summary[256];size_t nread=fread(summary,1,sizeof(summary)-1,capture);summary[nread]=0;
+    assert(strstr(summary,"\"overwritten_events\":1"));
+    assert(!fclose(capture));
+}
 static void check_intel_deferred_surface(void)
 {
     int sockets[2];assert(!socketpair(AF_UNIX,SOCK_STREAM,0,sockets));
@@ -187,12 +213,39 @@ static void check_intel_deferred_surface(void)
     surface.vfb_w=surface.vfb_h=surface.vfb_stride=1;surface.scene_disabled=1;g_surfaces=&surface;
     g_drm_fd=open("/dev/zero",O_RDWR);assert(g_drm_fd>=0);g_drm_intel=1;
     assert(!setenv("BROOK_WAYLAND_INTEL_ASYNC","1",1));
+    char directory[]="/tmp/brook-buffer-trace-XXXXXX";
+    assert(mkdtemp(directory));
+    char base[256],request[288],output[288];
+    snprintf(base,sizeof(base),"%s/wayland.json",directory);
+    snprintf(request,sizeof(request),"%s.buffer-trace.request",base);
+    snprintf(output,sizeof(output),"%s.buffer-trace.json",base);
+    FILE *marker=fopen(request,"w");assert(marker);
+    fprintf(marker,"%ld\n",(long)getpid());assert(!fclose(marker));
+    buffer_trace_poll(base);assert(g_buffer_trace.pid==getpid());
     surface_attach(client,surface.resource,resource,0,0);
     surface_commit(client,surface.resource);assert(g_intel_pending_count==1 && vfb==0xff112233);
     try_error=EAGAIN;intel_pending_poll();assert(g_intel_pending_count==1 && vfb==0xff112233);
     try_error=0;intel_pending_poll();assert(!g_intel_pending_count && vfb==0);
     wl_display_flush_clients(display);uint32_t wire[32];ssize_t n=recv(sockets[1],wire,sizeof(wire),MSG_DONTWAIT);
     assert(n>0 && wire[0]==2 && (wire[1]&65535)==WL_BUFFER_RELEASE);
+    const struct buffer_trace_event *attach=trace_event(BUFFER_ATTACH,1), *commit=trace_event(BUFFER_COMMIT,1);
+    const struct buffer_trace_event *copy=trace_event(BUFFER_CPU_COPY,1), *release=trace_event(BUFFER_RELEASE,1);
+    assert(g_buffer_trace.events==4 && attach && commit && copy && release);
+    assert(attach->us<=commit->us && commit->us<=copy->us && copy->us<=release->us);
+    assert(attach->attachment==commit->attachment && commit->cycle==copy->cycle && copy->cycle==release->cycle);
+    assert(!trace_event(BUFFER_OFFER,1) && !trace_event(BUFFER_SAFE,1));
+    /* Reuse the same protocol buffer after its first wrapper was freed. */
+    surface_attach(client,surface.resource,resource,0,0);
+    surface_commit(client,surface.resource);intel_pending_poll();
+    assert(g_buffer_trace.buffers==1 && g_buffer_trace.counts[BUFFER_RELEASE]==2);
+    assert(g_buffer_trace.ring[7].cycle!=release->cycle);
+    assert(!unlink(request));buffer_trace_poll(base);assert(!g_buffer_trace.pid);
+    FILE *capture=fopen(output,"r");assert(capture);
+    char contents[2048];size_t nread=fread(contents,1,sizeof(contents)-1,capture);contents[nread]=0;
+    assert(!fclose(capture) && strstr(contents,"brook-wayland-buffer-trace/1") &&
+           strstr(contents,"\"distinct_buffers\":1") && strstr(contents,"\"release_queued\":2"));
+    assert(!unlink(output) && !rmdir(directory));
+    puts("BUFFER_TRACE_CPU_PASS copy and release order, stable resource and separate use cycles, stop publishes JSON");
     bt_state_set(&surface.tree.current,NULL);bt_state_set(&surface.tree.latest,NULL);
     g_surfaces=NULL;g_drm_intel=0;close(g_drm_fd);g_drm_fd=-1;unsetenv("BROOK_WAYLAND_INTEL_ASYNC");
     wl_client_destroy(client);close(sockets[1]);wl_display_destroy(display);
@@ -388,6 +441,12 @@ static void check_gpu_window_retained(void)
     g_drm_intel=1;g_gpu_window_channel=channel[0];window_stale=0;
     assert(!setenv("BROOK_WAYLAND_INTEL_ASYNC","1",1));assert(!setenv("BROOK_WAYLAND_SNAPSHOT_FENCE","1",1));
     assert(!setenv("BROOK_WAYLAND_GPU_SOCKET","/tmp/fake-consumer",1));
+    /* Separate wl_buffer resources can name the same producer allocation. */
+    for(unsigned i=0;i<2;++i){
+        struct brook_dmabuf_buffer *db=wl_resource_get_user_data(resources[i]);
+        db->trace_device=1;db->trace_inode=20;
+    }
+    buffer_trace_start(getpid());
     struct brook_image *images[2];struct BrookGpuWindowPacket offers[2];
     for(unsigned i=0;i<2;++i){
         surface_frame(client,surface.resource,6+i);
@@ -433,6 +492,24 @@ static void check_gpu_window_retained(void)
     assert(brook_gpu_window_send_reply(channel[1],BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN,BROOK_GPU_WINDOW_SAFE,&offers[1].identity)==1);
     intel_pending_poll();assert(!g_intel_pending_count && !held[1]->uses && vfb==sentinel);
     wl_display_flush_clients(display);assert(count_events(clientSockets[1],5,WL_BUFFER_RELEASE)==1);
+    for(unsigned i=0;i<2;++i){
+        const struct buffer_trace_event *attach=trace_event(BUFFER_ATTACH,i+1), *offer=trace_event(BUFFER_OFFER,i+1);
+        const struct buffer_trace_event *ack=trace_event(BUFFER_ACK,i+1), *safe=trace_event(BUFFER_SAFE,i+1);
+        const struct buffer_trace_event *retired=trace_event(BUFFER_RENDERER_RETIRED,i+1);
+        const struct buffer_trace_event *release=trace_event(BUFFER_RELEASE,i+1);
+        assert(attach && offer && ack && safe && retired && release);
+        assert(attach->us<=offer->us && offer->us<=ack->us && ack->us<=safe->us);
+        assert(safe->us<=retired->us && retired->us<=release->us);
+        assert(offer->offer==offers[i].identity.commit && offer->offer==ack->offer && ack->offer==safe->offer);
+        assert(offer->attachment==attach->attachment && offer->cycle==release->cycle);
+    }
+    assert(!trace_event(BUFFER_CPU_COPY,1) && trace_event(BUFFER_CPU_COPY,2));
+    buffer_trace_stop();
+    FILE *capture=tmpfile();assert(capture && buffer_trace_dump(capture,getpid()));rewind(capture);
+    char summary[640];size_t nread=fread(summary,1,sizeof(summary)-1,capture);summary[nread]=0;
+    assert(strstr(summary,"\"distinct_buffers\":2") && strstr(summary,"\"distinct_known_backings\":1"));
+    assert(!fclose(capture));
+    puts("BUFFER_TRACE_GPU_PASS offer, first renderer acknowledgement, SAFE, retirement, and queued release");
     bt_state_set(&surface.tree.current,NULL);bt_state_set(&surface.tree.latest,NULL);buffer_drop(held[0]);buffer_drop(held[1]);
     free(surface.composite);g_surfaces=NULL;g_drm_intel=0;close(g_drm_fd);g_drm_fd=-1;
     close(channel[1]);gpu_window_channel_lost("fixture-close");gpu_window_reap_dead();
@@ -470,6 +547,7 @@ static void check_gpu_window_layers(enum gpu_layers_case mode)
     assert(!setenv("BROOK_WAYLAND_GPU_SOCKET","/tmp/fake-consumer",1));
     const uint64_t groupsBefore=g_gpu_group_offers,readbackBefore=g_layer_readback_bytes;
     /* 1. Root alone: a version 2 single offer. */
+    if(mode==GROUP_SAFE_FIRST)buffer_trace_start(getpid());
     surface_attach(client,root.resource,rootBuffer,0,0);surface_commit(client,root.resource);
     struct brook_image *rootImage=((struct brook_view *)root.tree.current->value)->image;
     struct brook_buffer *rootHeld=rootImage->source;++rootHeld->refs;
@@ -478,7 +556,8 @@ static void check_gpu_window_layers(enum gpu_layers_case mode)
         intel_pending_poll();assert(rootImage->offer_state==1);
         int fds[2];assert(brook_gpu_window_receive(channel[1],&single,fds)==1);close(fds[0]);close(fds[1]);
         assert(single.version==BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN && single.identity.commit==root.publish_commit);
-        assert(brook_gpu_window_send_reply(channel[1],BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN,BROOK_GPU_WINDOW_PRESENTED,&single.identity)==1);
+        if(mode!=GROUP_SAFE_FIRST)
+            assert(brook_gpu_window_send_reply(channel[1],BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN,BROOK_GPU_WINDOW_PRESENTED,&single.identity)==1);
         intel_pending_poll();
     }
     /* The window's VFB is still an older size (it resized while layered):
@@ -561,6 +640,17 @@ static void check_gpu_window_layers(enum gpu_layers_case mode)
     /* 4. PRESENTED, then SAFE of the layered commit releases its group. */
     assert(brook_gpu_window_send_reply(channel[1],BROOK_GPU_WINDOW_WIRE_VERSION_LAYERS,BROOK_GPU_WINDOW_PRESENTED,&layered.header.identity)==1);
     intel_pending_poll();assert(childImage->gpu_presented && rootImage->gpu_presented && g_gpu_group_presented>=1);
+    if(mode==GROUP_SAFE_FIRST){
+        assert(brook_gpu_window_send_reply(channel[1],BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN,BROOK_GPU_WINDOW_PRESENTED,&single.identity)==1);
+        assert(brook_gpu_window_send_reply(channel[1],BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN,BROOK_GPU_WINDOW_PRESENTED,&single.identity)==1);
+        intel_pending_poll();
+        unsigned acks=0;
+        for(uint64_t i=0;i<g_buffer_trace.events;++i){
+            const struct buffer_trace_event *e=&g_buffer_trace.ring[i];
+            if(e->kind==BUFFER_ACK && e->offer==single.identity.commit)++acks;
+        }
+        assert(acks==1 && g_buffer_trace.counts[BUFFER_ACK]==3);
+    }
     /* 4b. The window can no longer be offered as layers (a transformed
      * subsurface): both layers held by the presented group are read back and
      * composed on the CPU, instead of the renderer showing that group forever. */
@@ -584,6 +674,7 @@ static void check_gpu_window_layers(enum gpu_layers_case mode)
     intel_pending_poll();assert(childImage->pending_fd<0 && rootImage->pending_fd<0);
     for(unsigned i=0;i<GPU_GROUPS;++i)assert(!g_gpu_groups[i].live);
 cleanup:
+    if(mode==GROUP_SAFE_FIRST)buffer_trace_stop();
     bt_state_set(&child->tree.current,NULL);bt_state_set(&child->tree.latest,NULL);
     bt_state_set(&root.tree.current,NULL);bt_state_set(&root.tree.latest,NULL);
     buffer_drop(rootHeld);buffer_drop(childHeld);
@@ -1045,6 +1136,7 @@ int main(void)
     check_intel_deferred(EIO,0);check_intel_deferred(ENOSYS,0);
     check_intel_fence(0);check_intel_fence(1);check_intel_fence(2);
     check_superseded_intel_image();
+    check_buffer_trace_capacity();
     check_intel_deferred_surface();
 #ifdef BROOK_DIRECT_TEST
     source_begins=source_tags=0;check_gpu_window_offer(OFFER_SAFE);

@@ -37,7 +37,24 @@ struct brook_image {
     int gem_fd,gem_fence;uint32_t gem_handle;uint64_t gem_words;
     uint64_t pace_commit_us,pace_offer_us; /* frame pacing (waylandd.c) */
     int pace_x11;
+    uint64_t buffer_trace_epoch, buffer_trace_attachment, buffer_trace_cycle;
+    unsigned buffer_trace_serial, buffer_trace_surface;
+    int buffer_trace_producer_ready, buffer_trace_offer_ack;
 };
+static void image_buffer_trace(const struct brook_image *image, enum buffer_trace_kind kind,
+                               const struct BrookGpuWindowIdentity *offer)
+{
+    if (!g_buffer_trace.pid || image->buffer_trace_epoch != g_buffer_trace.epoch) return;
+    buffer_trace_record(kind, image->buffer_trace_serial, image->buffer_trace_attachment,
+                        image->buffer_trace_cycle, image->buffer_trace_surface,
+                        image->source ? image->source->uses : 0, offer);
+}
+static void image_trace_producer_ready(struct brook_image *image)
+{
+    if (!g_buffer_trace.pid || image->buffer_trace_producer_ready) return;
+    image_buffer_trace(image, BUFFER_PRODUCER_READY, NULL);
+    image->buffer_trace_producer_ready = 1;
+}
 static void image_gem_free(struct brook_image *image);
 static long scene_ctl(int fd,unsigned op,const void *arg,size_t size) {
     errno=0;
