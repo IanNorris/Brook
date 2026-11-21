@@ -7696,12 +7696,20 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         if(NetStrEq(cmd,"gpu zerocopy timeline")){
             static BdwZeroCopyTimelineEntry entries[64];uint64_t khz=0;
             const uint32_t n=BdwZeroCopyReadTimeline(entries,64,khz);
-            auto us=[&](uint64_t tsc){return khz && tsc?tsc*1000/khz:0;};
-            BridgeReply r;r.text("{");r.field("count",n);r.text(",\"columns\":[\"sequence\",\"image\",\"queued\",\"present_us\",\"arm_us\",\"latch_us\",\"vblanks\"],\"rows\":[");
+            const auto clock=TscClockReadStatus();
+            const bool monotonic=clock.kind==ClockSourceKind::Tsc && !KvmClockAvailable();
+            auto us=[&](uint64_t tsc)->uint64_t{
+                if(!tsc)return 0;
+                if(monotonic)return TscClockValue(tsc,clock.originTsc,clock.originNs,clock.scale)/1000;
+                return khz?BdwWorkerTicksToUs(tsc,khz):0;
+            };
+            BridgeReply r;r.text("{");r.field("count",n);
+            r.text(",\"clock\":");r.quoted(monotonic?"monotonic":"raw-tsc");
+            r.text(",\"columns\":[\"sequence\",\"image\",\"queued\",\"present_us\",\"arm_us\",\"latch_us\",\"vblanks\"],\"rows\":[");
             for(uint32_t i=0;i<n;++i){const auto& e=entries[i];if(i)r.text(",");
                 r.text("[");r.number(e.sequence);r.text(",");r.number(e.slot);r.text(",");r.number(e.queued);r.text(",");
                 r.number(us(e.presentTsc));r.text(",");r.number(us(e.armTsc));r.text(",");r.number(us(e.latchTsc));r.text(",");r.number(e.frames);r.text("]");}
-            r.text("],\"scope\":\"zero-copy presents, oldest first; times are TSC microseconds since boot (CLOCK_MONOTONIC on the Dell uses the same TSC); present=worker present call, arm=DSPASURF write (0 if replaced in the mailbox), latch=first poll that saw it live\"}\n");
+            r.text("],\"scope\":\"zero-copy presents, oldest first; times are microseconds in the stated clock domain; present=worker acceptance, arm=DSPASURF write (0 if replaced in the mailbox), latch=first poll that saw it live\"}\n");
             r.send();return;
         }
         if(NetStrEq(cmd,"gpu zerocopy arm"))ok=BdwZeroCopyArm(note);
