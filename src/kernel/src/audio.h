@@ -80,7 +80,6 @@ struct AudioDriver {
     AudioSubmitReceipt (*trySubmit)(const void*, uint32_t) = nullptr;
     bool (*progress)(AudioDeviceProgress*) = nullptr;
     bool (*restart)(uint64_t expectedEpoch) = nullptr;
-    bool (*hdaStatus)(AudioHdaStatus&) = nullptr;
 };
 
 bool AudioReadHdaStatus(AudioHdaStatus& status);
@@ -90,6 +89,7 @@ extern "C" uint64_t AudioClockNowNs();
 
 // Register an audio driver.  Only one can be active at a time.
 extern "C" bool AudioRegister(const AudioDriver* drv);
+extern "C" bool AudioRegisterWithHdaStatus(const AudioDriver* drv, bool (*read)(AudioHdaStatus&));
 
 // Kernel-side convenience wrappers (direct to hardware — prefer mixer API).
 int      AudioPlay(const void* samples, uint32_t byteCount,

@@ -99,6 +99,7 @@ extern "C" void AudioDeliveryTimingRecord(uint64_t token,const AudioDeliveryEven
 }
 
 static const AudioDriver* g_audioDriver = nullptr;
+static bool (*g_hdaStatus)(AudioHdaStatus&) = nullptr;
 static uint32_t g_outputControl = BROOK_AUDIO_DEFAULT;
 uint32_t AudioOutputControlSnapshot(){return __atomic_load_n(&g_outputControl,__ATOMIC_ACQUIRE);}
 static const uint16_t* g_hardwareVolumeResidual=nullptr;
@@ -1022,9 +1023,17 @@ extern "C" bool AudioRegister(const AudioDriver* drv)
     return true;
 }
 
+extern "C" bool AudioRegisterWithHdaStatus(const AudioDriver* drv, bool (*read)(AudioHdaStatus&))
+{
+    if (!AudioRegister(drv)) return false;
+    __atomic_store_n(&g_hdaStatus,read,__ATOMIC_RELEASE);
+    return true;
+}
+
 bool AudioReadHdaStatus(AudioHdaStatus& status)
 {
-    return g_audioDriver && g_audioDriver->hdaStatus && g_audioDriver->hdaStatus(status);
+    const auto read=__atomic_load_n(&g_hdaStatus,__ATOMIC_ACQUIRE);
+    return read && read(status);
 }
 
 bool AudioAvailable()

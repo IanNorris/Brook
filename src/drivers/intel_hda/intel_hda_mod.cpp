@@ -43,7 +43,7 @@ MODULE_IMPORT_SYMBOL(VmmAllocPagesAccounted);
 MODULE_IMPORT_SYMBOL(VmmVirtToPhys);
 MODULE_IMPORT_SYMBOL(VmmMapPage);
 MODULE_IMPORT_SYMBOL(PmmAllocPage);
-MODULE_IMPORT_SYMBOL(AudioRegister);
+MODULE_IMPORT_SYMBOL(AudioRegisterWithHdaStatus);
 MODULE_IMPORT_SYMBOL(AudioClockNowNs);
 MODULE_IMPORT_SYMBOL(AudioDeliveryTimingToken);
 MODULE_IMPORT_SYMBOL(AudioDeliveryTimingRecord);
@@ -1346,9 +1346,8 @@ static int IntelHdaInit()
         HdaTrySubmit,
         HdaNativeProgress,
         HdaNativeRestart,
-        HdaReadStatus,
     };
-    AudioRegister(&hdaAudioDriver);
+    AudioRegisterWithHdaStatus(&hdaAudioDriver,HdaReadStatus);
 
     KPrintf("intel_hda: initialised — DAC=%d PIN=%d\n", g_dacNid, g_pinNid);
     return 0;
