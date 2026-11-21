@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import brook_image
 import make_vmware_image
+import make_vmware_probe
 
 
 REQUIRED = ['--output', 'vm', '--operator-policy', 'operators.pub',
@@ -33,6 +34,11 @@ class VmwareNetworkTest(unittest.TestCase):
                          ['sound.present = "TRUE"'])
         self.assertIn('sound.virtualDev = "hdaudio"', vmx)
         self.assertIn('sound.startConnected = "TRUE"', vmx)
+
+    def test_generated_vmx_disables_floppy(self):
+        for vmx in (make_vmware_image.vmx('nat'), make_vmware_probe.PROBE_VMX):
+            self.assertEqual([line for line in vmx.splitlines() if line.startswith('floppy0.')],
+                             ['floppy0.present = "FALSE"'])
 
     def test_image_command_inherits_default_and_forwards_override(self):
         for apps in (None, ['firefox']):

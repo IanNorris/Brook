@@ -240,7 +240,8 @@ def vmx(network):
     lines = ['.encoding = "UTF-8"', 'config.version = "8"', 'virtualHW.version = "20"',
              'displayName = "Brook"', 'guestOS = "other-64"', 'firmware = "efi"',
              'uefi.secureBoot.enabled = "FALSE"', 'memsize = "4096"', 'numvcpus = "2"',
-             'mks.enable3d = "FALSE"', 'devices.hotplug = "FALSE"', 'pciBridge0.present = "TRUE"']
+             'mks.enable3d = "FALSE"', 'devices.hotplug = "FALSE"', 'floppy0.present = "FALSE"',
+             'pciBridge0.present = "TRUE"']
     for port in range(4, 8):
         lines += [f'pciBridge{port}.present = "TRUE"', f'pciBridge{port}.virtualDev = "pcieRootPort"',
                   f'pciBridge{port}.functions = "8"']
