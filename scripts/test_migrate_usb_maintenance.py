@@ -27,11 +27,12 @@ class MigrationTest(unittest.TestCase):
         (self.mount / "EFI" / "BOOT").mkdir(parents=True)
         (self.mount / "EFI" / "BOOT" / "BOOTX64.EFI").write_bytes(b"MZold")
         (self.mount / "INITRD.IMG").write_bytes(b"recovery")
+        (self.mount / "BROOK.CFG").write_bytes(b"# old boot configuration\n")
         (self.mount / ".dotfile").write_bytes(b"keep this")
         (self.mount / "Recovery files").mkdir()
         (self.mount / "Recovery files" / "a.bin").write_bytes(b"archive")
         self.original = tool.inventory(self.mount)
-        self.payload = dict(zip(tool.NAMES, (b"new kernel", b"new ramdisk", b"new efi"), strict=True))
+        self.payload = dict(zip(tool.NAMES, (b"new kernel", b"new ramdisk", tool.CONFIG, b"new efi"), strict=True))
 
     def check_restored(self):
         tool.restore(self.mount, self.state, self.original, self.payload)
@@ -41,6 +42,7 @@ class MigrationTest(unittest.TestCase):
         tool.migrate(self.mount, self.state, self.original, self.payload)
         self.assertEqual(tool.inventory(self.mount / tool.ARCHIVE), self.original)
         self.assertEqual((self.mount / "EFI/BOOT/BOOTX64.EFI").read_bytes(), b"new efi")
+        self.assertEqual((self.mount / "BROOK.CFG").read_bytes(), tool.CONFIG)
         self.check_restored()
 
     def test_partial_stage_can_restore(self):
@@ -125,6 +127,27 @@ class MigrationTest(unittest.TestCase):
                 tool.receipt(self.mount, Path("/dev/test"), self.state)
         self.assertEqual(tool.inventory(self.mount), before)
 
+    def test_preflight_only_allows_vfat_dirty_bit_after_ro_capture(self):
+        image = self.state / "stick.img"
+        primary = b"before-partition" + bytes(512) + b"other bytes"
+        dirty = len(b"before-partition") + 0x41
+        tool.write_file(image, primary)
+        original = tool.digest_file(image, private=True)
+        record = {"image": original, "source": {"fat_dirty_offset": dirty}}
+        self.assertTrue(tool.matches_captured_bytes(original, record, image))
+        with image.open("rb") as stream:
+            expected = tool.digest_stream(stream, set_dirty_bit_at=dirty)
+        transformed = bytearray(primary)
+        transformed[dirty] = 1
+        self.assertEqual(expected["sha256"], hashlib.sha256(transformed).hexdigest())
+        self.assertTrue(tool.matches_captured_bytes(expected, record, image))
+        for altered, value in ((dirty, 2), (dirty - 1, 1), (len(primary) - 1, 0)):
+            changed = bytearray(transformed)
+            changed[altered] = value
+            actual = {"bytes": len(changed), "sha256": hashlib.sha256(changed).hexdigest()}
+            self.assertFalse(tool.matches_captured_bytes(actual, record, image))
+        self.assertEqual(image.read_bytes(), primary)
+
     def test_built_file_set(self):
         self.check_offline_fat(REVIEWED_FILES)
 
@@ -141,10 +164,13 @@ class MigrationTest(unittest.TestCase):
         self.addCleanup(img.unlink, missing_ok=True)
         for name in ("EFI", "EFI/BOOT", "Recovery files"):
             m("mmd", "::/" + name)
-        for name in ("EFI/BOOT/BOOTX64.EFI", "INITRD.IMG", ".dotfile", "Recovery files/a.bin"):
+        old_files = ("EFI/BOOT/BOOTX64.EFI", "INITRD.IMG", "BROOK.CFG", ".dotfile", "Recovery files/a.bin")
+        for name in old_files:
             m("mcopy", "-", "::/" + name, input=(self.mount / name).read_bytes())
         original = {name: m("mtype", "::/" + name, capture_output=True) for name in
-                    ("EFI/BOOT/BOOTX64.EFI", "INITRD.IMG", ".dotfile", "Recovery files/a.bin")}
+                    old_files}
+        with img.open("rb") as disk:
+            self.assertEqual(tool.vfat_dirty_byte(disk.read(512)), 0x41)
         backup = self.state / "full-backup.img"
         before = tool.digest_file(img)
         with img.open("rb") as source, backup.open("wb") as output:
@@ -163,7 +189,7 @@ class MigrationTest(unittest.TestCase):
                              hashlib.sha256(content).digest())
         subprocess.run(["fsck.fat", "-n", img], check=True, capture_output=True)
         m("mdeltree", "::/EFI", "::/KERNEL")
-        m("mdel", "::/INITRD.IMG")
+        m("mdel", "::/INITRD.IMG", "::/BROOK.CFG")
         for name in tool.entries(self.original):
             m("mmove", "::/OLD/" + name, "::/" + name)
         m("mdeltree", "::/OLD")

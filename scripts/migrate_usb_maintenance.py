@@ -3,10 +3,12 @@
 
 Use a private host directory for the state and keep it: the byte image and
 receipt may contain credentials. Confirm the device with the operator first.
-Mount only the ESP read-write with noatime and a normal vfat mixed/winnt
-short-name policy. Close other applications and keep the stick attached. Capture reads the
+Mount only the ESP with ro,noatime and vfat shortname=mixed or winnt.
+Close other applications and keep the stick attached. Capture reads the
 whole USB disk to a private stick.img and verifies the SHA-256 on readback.
-check verifies the backup and free capacity. apply stages the reviewed files,
+Run check for backup verification and capacity. Remount the same ESP with
+rw,noatime before apply, which rechecks all bytes against the backup, allowing
+only Linux vfat's primary boot-sector dirty bit to change. Apply stages the reviewed files,
 moves all old top-level entries into OLD, then publishes the new EFI loader
 last. Firmware cannot boot the old tree from OLD.
 
@@ -32,8 +34,9 @@ import tempfile
 from bridge_keyless_image import require_keyless_disk, require_keyless_image
 from bridge_operator_policy import validate_operator_policy
 
-NAMES = ("KERNEL/BROOK.ELF", "INITRD.IMG", "EFI/BOOT/BOOTX64.EFI")
-LIMITS = (8 << 20, 64 << 20, 4 << 20)
+NAMES = ("KERNEL/BROOK.ELF", "INITRD.IMG", "BROOK.CFG", "EFI/BOOT/BOOTX64.EFI")
+LIMITS = (8 << 20, 64 << 20, 1024, 4 << 20)
+CONFIG = b"# Brook v3 USB maintenance\nUPDATE_SLOTS=0\nRECOVERY_MENU=0\n"
 FORMAT = "brook-usb-maintenance-v3"
 STAGE = "BRKNEW"
 ARCHIVE = "OLD"
@@ -63,24 +66,27 @@ def read_regular(path, limit):
         return value
 
 
-def digest_stream(stream, output=None):
+def digest_stream(stream, output=None, *, set_dirty_bit_at=None):
     digest = hashlib.sha256()
     size = 0
     while chunk := stream.read(BUFFER):
-        size += len(chunk)
-        digest.update(chunk)
         if output is not None:
             output.write(chunk)
+        if set_dirty_bit_at is not None and size <= set_dirty_bit_at < size + len(chunk):
+            offset = set_dirty_bit_at - size
+            chunk = chunk[:offset] + bytes([chunk[offset] | 1]) + chunk[offset + 1:]
+        size += len(chunk)
+        digest.update(chunk)
     return {"bytes": size, "sha256": digest.hexdigest()}
 
 
-def digest_file(path, *, private=False):
+def digest_file(path, *, private=False, set_dirty_bit_at=None):
     with os.fdopen(safe_open(path), "rb") as stream:
         info = os.fstat(stream.fileno())
         if not stat.S_ISREG(info.st_mode) or (private and (
                 stat.S_IMODE(info.st_mode) & 0o077 or info.st_uid != os.geteuid())):
             raise ValueError(f"{path}: expected a regular {'private ' if private else ''}file")
-        result = digest_stream(stream)
+        result = digest_stream(stream, set_dirty_bit_at=set_dirty_bit_at)
         if result["bytes"] != info.st_size:
             raise ValueError(f"{path}: size changed during read")
         return result
@@ -124,7 +130,19 @@ def unescape_mount(value):
     return re.sub(r"\\([0-7]{3})", lambda group: chr(int(group[1], 8)), value)
 
 
-def usb_mount(mount, disk):
+def vfat_dirty_byte(boot_sector):
+    # Linux fs/fat/inode.c::fat_set_state changes only this FAT_STATE_DIRTY
+    # bit on the primary boot sector when mounting or remounting read-write.
+    if len(boot_sector) != 512 or boot_sector[-2:] != b"\x55\xaa":
+        raise ValueError("The ESP has no valid FAT boot sector")
+    if int.from_bytes(boot_sector[22:24], "little"):
+        return 0x25  # FAT12 or FAT16
+    if int.from_bytes(boot_sector[36:40], "little"):
+        return 0x41  # FAT32
+    raise ValueError("The FAT boot sector has no FAT length")
+
+
+def usb_mount(mount, disk, *, writable=None):
     """Independently bind the mounted FAT partition to the named USB whole disk."""
     mount = mount.absolute()
     if mount.resolve(strict=True) != mount:
@@ -148,8 +166,13 @@ def usb_mount(mount, disk):
         raise ValueError("Mount must expose the whole FAT filesystem using vfat")
     if {"shortname=lower", "shortname=win95"} & set(fs[2].split(",")):
         raise ValueError("Mount with shortname=mixed or shortname=winnt to preserve FAT names")
-    if not {"rw", "noatime"} <= set(info[5].split(",")):
-        raise ValueError("Mount the FAT filesystem with rw,noatime before capturing any backup")
+    mount_flags = set(info[5].split(","))
+    if "noatime" not in mount_flags:
+        raise ValueError("Mount the FAT filesystem with noatime")
+    if writable is not None:
+        flag = "rw" if writable else "ro"
+        if flag not in mount_flags or flag not in fs[2].split(","):
+            raise ValueError(f"Mount the entire FAT filesystem with {flag},noatime")
     number = os.makedev(*map(int, info[2].split(":")))
     if mount.stat().st_dev != number:
         raise ValueError("FAT mount identity changed")
@@ -178,12 +201,16 @@ def usb_mount(mount, disk):
         size = struct.unpack("=Q", fcntl.ioctl(source.fileno(), BLKGETSIZE64, bytes(8)))[0]
         source.seek(part_start)
         boot_sector = source.read(512)
-    if len(boot_sector) != 512 or not (0 < part_start < part_start + part_bytes <= size):
+    if not (0 < part_start < part_start + part_bytes <= size):
         raise ValueError("Invalid USB partition geometry")
+    dirty = vfat_dirty_byte(boot_sector)
+    fingerprint = bytearray(boot_sector)
+    fingerprint[dirty] |= 1
     return {"disk": str(disk), "disk_device": dev.st_rdev,
             "sysfs": str(sys_disk), "disk_bytes": size,
             "fat_device": number, "fat_start": part_start, "fat_bytes": part_bytes,
-            "fat_boot_sector_sha256": hashlib.sha256(boot_sector).hexdigest()}
+            "fat_dirty_offset": part_start + dirty,
+            "fat_boot_sector_sha256": hashlib.sha256(fingerprint).hexdigest()}
 
 
 def raw_disk(identity, output=None):
@@ -254,8 +281,10 @@ def file_set(payload):
         if not value or expected != manifest["files"][name]:
             raise ValueError(f"{name}: maintenance file hash or size mismatch")
         result[name] = value
-    if not result[NAMES[0]].startswith(b"\x7fELF") or not result[NAMES[2]].startswith(b"MZ"):
+    if not result[NAMES[0]].startswith(b"\x7fELF") or not result[NAMES[-1]].startswith(b"MZ"):
         raise ValueError("Expected an ELF kernel and a PE executable")
+    if result["BROOK.CFG"] != CONFIG:
+        raise ValueError("Expected the fixed maintenance boot and FAT protection marker")
     # Check exactly the bytes retained for apply. The input directory may be
     # provisioned by a separate build or copied from another host.
     with tempfile.TemporaryDirectory(prefix="brook-usb-payload-") as directory:
@@ -316,7 +345,7 @@ def ensure_host_state(path, identity):
 
 
 def capture(mount, disk, state):
-    identity = usb_mount(mount, disk)
+    identity = usb_mount(mount, disk, writable=False)
     ensure_host_state(state.parent, identity)
     state.mkdir(mode=0o700)
     sync_volume(mount)
@@ -327,7 +356,7 @@ def capture(mount, disk, state):
         copied = raw_disk(identity, output)
         output.flush()
         os.fsync(output.fileno())
-    if (digest_file(backup, private=True) != copied or usb_mount(mount, disk) != identity or
+    if (digest_file(backup, private=True) != copied or usb_mount(mount, disk, writable=False) != identity or
             inventory(mount) != original):
         raise ValueError("The backup readback or mounted source changed")
     store_record(state / "backup.json", {"source": identity, "image": copied, "original": original})
@@ -335,9 +364,9 @@ def capture(mount, disk, state):
     return {"backup": copied, "old_top_level_count": len(entries(original))}
 
 
-def receipt(mount, disk, state):
+def receipt(mount, disk, state, *, writable=None):
     private_dir(state)
-    identity = usb_mount(mount, disk)
+    identity = usb_mount(mount, disk, writable=writable)
     ensure_host_state(state, identity)
     record = json.loads(read_regular(state / "backup.json", 64 << 20))
     if identity != record["source"]:
@@ -347,16 +376,22 @@ def receipt(mount, disk, state):
     return record
 
 
-def preflight(mount, disk, state, payload):
-    record = receipt(mount, disk, state)
+def matches_captured_bytes(observed, record, backup):
+    return observed == record["image"] or observed == digest_file(
+        backup, private=True, set_dirty_bit_at=record["source"]["fat_dirty_offset"])
+
+
+def preflight(mount, disk, state, payload, *, writable=None):
+    record = receipt(mount, disk, state, writable=writable)
     if (state / "apply.json").exists():
         raise ValueError("There is a pending or completed migration. Use restore first")
     old = inventory(mount)
     reject_reserved(old)
-    if old != record["original"] or raw_disk(record["source"]) != record["image"]:
+    if old != record["original"] or not matches_captured_bytes(
+            raw_disk(record["source"]), record, state / "stick.img"):
         raise ValueError("The current USB bytes or FAT tree differ from the private backup")
     capacity = ensure_capacity(mount, old, payload)
-    if usb_mount(mount, disk) != record["source"]:
+    if usb_mount(mount, disk, writable=writable) != record["source"]:
         raise ValueError("The FAT mount changed during preflight")
     return old, capacity
 
@@ -395,7 +430,7 @@ def migrate(mount, state, old, payload):
     if inventory(archive) != old:
         raise ValueError("Archived FAT tree readback mismatch")
     store_record(state / "archived.json", {"published": True})
-    for name in ("KERNEL", "INITRD.IMG", "EFI"):
+    for name in ("KERNEL", "INITRD.IMG", "BROOK.CFG", "EFI"):
         if (mount / name).exists():
             raise ValueError("Unexpected file at a maintenance boot location")
         (fresh / name).rename(mount / name)
@@ -511,10 +546,11 @@ def main():
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 payload = file_set(args.files)
                 if args.action == "restore":
-                    record = receipt(mount, args.disk, state)
+                    record = receipt(mount, args.disk, state, writable=True)
                     value = restore(mount, state, record["original"], payload)
                 else:
-                    old, capacity = preflight(mount, args.disk, state, payload)
+                    old, capacity = preflight(mount, args.disk, state, payload,
+                                              writable=True if args.action == "apply" else None)
                     value = capacity if args.action == "check" else migrate(mount, state, old, payload)
             finally:
                 os.close(lock)

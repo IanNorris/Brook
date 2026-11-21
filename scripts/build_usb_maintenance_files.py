@@ -16,9 +16,9 @@ from bridge_keyless_image import require_keyless_disk, require_keyless_image
 from bridge_operator_policy import validate_operator_policy
 from build_dell_image import (DEFAULT_SHARED, ROOT, SOURCE_INITRD, SOURCE_INITRD_SHA,
                               build_provenance, embed_update_helpers, module_abi, run, sha)
+from migrate_usb_maintenance import CONFIG, FORMAT, NAMES
 from prepare_hardware_kernel_pair import prepare, regular
 
-PATHS = ("KERNEL/BROOK.ELF", "INITRD.IMG", "EFI/BOOT/BOOTX64.EFI")
 REMOVED = ("ahci-data-volume", "boot-app-image", "boot-app-snapshot",
            "writable-desktop", "usb-boot-poweroff")
 INIT = (b"set wm\nset vfb none\nsched eevdf\nkconsole\n"
@@ -99,22 +99,26 @@ def build(output, build_root, shared, operators, payload_id, epoch):
         if fat_read(image, "ETC/bridge-v3-operators") != policy:
             raise ValueError("Bridge operator policy readback mismatch")
         require_keyless_image(image)
-        sources = (pair / "kernel.elf", image, loader_build / "BOOTX64.efi")
+        # Root BROOK.CFG activates the existing Brook mounted-boot-media
+        # policy for OLD without marking the USB ESP for desktop auto-mount.
+        config = pair / "BROOK.CFG"
+        config.write_bytes(CONFIG)
+        sources = (pair / "kernel.elf", image, config, loader_build / "BOOTX64.efi")
         require_keyless_disk(sources[0])
-        require_keyless_disk(sources[2])
-        if sources[0].read_bytes()[:4] != b"\x7fELF" or sources[2].read_bytes()[:2] != b"MZ":
+        require_keyless_disk(sources[-1])
+        if sources[0].read_bytes()[:4] != b"\x7fELF" or sources[-1].read_bytes()[:2] != b"MZ":
             raise ValueError("Unexpected ELF kernel or UEFI executable")
         output.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=output.parent, prefix=".usb-maintenance-") as staged:
             files = Path(staged) / "files"
             files.mkdir(mode=0o700)
             entries = {}
-            for name, src in zip(PATHS, sources, strict=True):
+            for name, src in zip(NAMES, sources, strict=True):
                 dst = files / name
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(src, dst)
                 entries[name] = {"bytes": dst.stat().st_size, "sha256": sha(dst)}
-            manifest = {"format": "brook-usb-maintenance-v3", "commit": commit,
+            manifest = {"format": FORMAT, "commit": commit,
                         "payload_id": payload_id, "files": entries, "assembly": assembly,
                         "kernel_options": KERNEL_FLAGS, "source_initrd_sha256": SOURCE_INITRD_SHA,
                         "bridge_v3": {"version": 3, "policy_sha256": sha(operator_input),
