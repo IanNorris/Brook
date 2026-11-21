@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Assemble a clean portable candidate from an explicit public-profile seed.
+"""Assemble a clean portable QEMU image from an explicit profile seed.
 
 Run in nix-shell. Existing guest/review disks are never inputs. The generated
 candidate stays private until the exact corresponding-source/notice review is
@@ -52,16 +52,78 @@ def copy_extents(source, destination, offset):
             cursor = stop
 
 
+def developer_seed(seed, metadata, build):
+    from image_profile import validate_selection
+
+    selection = validate_selection(metadata['profile_selection'], metadata['profile'])
+    image = seed / 'STORE.IMG'
+    if (not image.is_file() or image.stat().st_size != metadata['bytes']
+            or digest(image) != metadata['sha256']):
+        raise ValueError('Selected QEMU store image does not match its seed manifest')
+    requirements = selection['manifest']['requiredCapabilities']
+    if requirements:
+        from kernel_capabilities import read_kernel_capabilities, require_kernel_capabilities
+        kernel = read_kernel_capabilities(build / 'kernel/BROOK.elf')
+        require_kernel_capabilities(kernel, requirements)
+    return image
+
+
+def make_developer_data(stage, image):
+    tree = stage / 'data'
+    (tree / 'home').mkdir(parents=True)
+    (tree / 'BROOK.MNT').write_text('/data')
+    with image.open('xb') as stream:
+        stream.truncate(512 * MIB)
+    run('mkfs.ext2', '-F', '-b', '4096', '-d', tree, image)
+    for field, value in [('uid', 1000), ('gid', 100)]:
+        run('debugfs', '-w', '-R', f'set_inode_field /home {field} {value}', image)
+
+
+def prepare_public_data(seed, stage, data_image, nix_image):
+    run('cp', '--sparse=always', '--reflink=auto', seed / 'data.img', data_image)
+    commands = stage / 'data-debugfs.txt'
+    lines = ['mkdir /distribution', 'mkdir /distribution/installers']
+    for source in sorted((ROOT / 'distribution/installers').iterdir()):
+        if source.is_file() and source.suffix in ('.py', '.sh'):
+            lines.append(f'write "{source}" /distribution/installers/{source.name}')
+    commands.write_text('\n'.join(lines) + '\n')
+    run('debugfs', '-w', '-f', commands, data_image)
+    idx = subprocess.check_output(['debugfs', '-R', 'cat /share/applications/applications.idx', str(nix_image)], text=True)
+    # A terminal-only .desktop entry cannot be opened directly by our GUI.
+    entries = [line for line in idx.splitlines() if not line.startswith('Vim\t')]
+    for number, line in enumerate(entries):
+        fields = line.split('\t')
+        if fields[0] == 'VLC media player':
+            fields[1] = '--uid 1000 /nix/profile/bin/brook-vlc'
+            entries[number] = '\t'.join(fields)
+        elif fields[0] in ('GNU Image Manipulation Program', 'Mousepad', 'OpenTTD', 'Qalculate!', 'Gnome Commander', 'GNOME Commander'):
+            # Ensure generic upstream desktop entries get the same profile-
+            # relative software graphics paths as browser/media wrappers.
+            fields[1] = '--uid 1000 /nix/profile/bin/brook-run ' + fields[1]
+            entries[number] = '\t'.join(fields)
+    public_idx = stage / 'applications.idx'
+    public_idx.write_text('\n'.join(entries) + '\n')
+    commands.write_text(f'rm /share/applications/applications.idx\nwrite "{public_idx}" /share/applications/applications.idx\n')
+    run('debugfs', '-w', '-f', commands, nix_image)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--seed', type=Path, required=True)
+    parser.add_argument('--developer', action='store_true',
+                        help='Assemble a private QEMU image from a selected-profile store seed')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--build', type=Path, default=ROOT / 'build/release')
     args = parser.parse_args()
     seed, output, build = args.seed.resolve(), args.output.resolve(), args.build.resolve()
     metadata = json.loads((seed / 'manifest.json').read_text())
-    if metadata.get('public_inputs_only') is not True or metadata.get('profile_expression') != str(ROOT / 'nix/release-packages.nix'):
-        parser.error('Requires fresh --public --profile-expression nix/release-packages.nix seed')
+    if args.developer:
+        store_image = developer_seed(seed, metadata, build)
+    else:
+        if ('profile_selection' in metadata or metadata.get('public_inputs_only') is not True
+                or metadata.get('profile_expression') != str(ROOT / 'nix/release-packages.nix')):
+            parser.error('Requires fresh --public --profile-expression nix/release-packages.nix seed')
+        store_image = seed / 'nix.img'
     output.mkdir(parents=True, exist_ok=False)
     stage = output / 'assembly'
     (stage / 'build/kernel/drivers').mkdir(parents=True)
@@ -69,6 +131,9 @@ def main():
         shutil.copy2(module, stage / 'build/kernel/drivers' / module.name)
     env = dict(os.environ, BROOK_BUILD_DIR=str(stage / 'build'), BROOK_INITRD_KIB='32768')
     env.pop('BROOK_PROVIDER_PAYLOAD', None)
+    if args.developer:
+        env.pop('BROOK_INITRD_MARKERS', None)
+        env.pop('BROOK_HARDWARE_PAYLOAD_ID', None)
     run('bash', ROOT / 'scripts/make_initrd.sh', '--release', env=env)
     # Assemble from an allowlist, not build/esp or any prior boot disk.
     esp = stage / 'esp.img'
@@ -103,32 +168,11 @@ def main():
     # Finalization is offline on fresh private copies; never mount or modify a
     # running VM disk. Include helpers in the guest as well as the host bundle.
     data_image, nix_image = stage / 'data.img', stage / 'nix.img'
-    for source, target in [(seed / 'data.img', data_image), (seed / 'nix.img', nix_image)]:
-        run('cp', '--sparse=always', '--reflink=auto', source, target)
-    commands = stage / 'data-debugfs.txt'
-    lines = ['mkdir /distribution', 'mkdir /distribution/installers']
-    for source in sorted((ROOT / 'distribution/installers').iterdir()):
-        if source.is_file() and source.suffix in ('.py', '.sh'):
-            lines.append(f'write "{source}" /distribution/installers/{source.name}')
-    commands.write_text('\n'.join(lines) + '\n')
-    run('debugfs', '-w', '-f', commands, data_image)
-    idx = subprocess.check_output(['debugfs', '-R', 'cat /share/applications/applications.idx', str(nix_image)], text=True)
-    # A terminal-only .desktop entry cannot be opened directly by our GUI.
-    entries = [line for line in idx.splitlines() if not line.startswith('Vim\t')]
-    for number, line in enumerate(entries):
-        fields = line.split('\t')
-        if fields[0] == 'VLC media player':
-            fields[1] = '--uid 1000 /nix/profile/bin/brook-vlc'
-            entries[number] = '\t'.join(fields)
-        elif fields[0] in ('GNU Image Manipulation Program', 'Mousepad', 'OpenTTD', 'Qalculate!', 'Gnome Commander', 'GNOME Commander'):
-            # Ensure generic upstream desktop entries get the same profile-
-            # relative software graphics paths as browser/media wrappers.
-            fields[1] = '--uid 1000 /nix/profile/bin/brook-run ' + fields[1]
-            entries[number] = '\t'.join(fields)
-    public_idx = stage / 'applications.idx'
-    public_idx.write_text('\n'.join(entries) + '\n')
-    commands.write_text(f'rm /share/applications/applications.idx\nwrite "{public_idx}" /share/applications/applications.idx\n')
-    run('debugfs', '-w', '-f', commands, nix_image)
+    run('cp', '--sparse=always', '--reflink=auto', store_image, nix_image)
+    if args.developer:
+        make_developer_data(stage, data_image)
+    else:
+        prepare_public_data(seed, stage, data_image, nix_image)
     for image in (data_image, nix_image):
         run('e2fsck', '-fn', image)
     # AF_UNIX endpoints require an ext2-backed /tmp; the early FAT RAM disk
@@ -164,12 +208,13 @@ def main():
         shutil.copy2(path, output / name)
     for name in ['launch.py', 'mcp.py', 'run-linux.sh', 'run-macos.command', 'run-windows.cmd', 'README.txt']:
         shutil.copy2(ROOT / 'tools/portable_qemu' / name, output / name)
-    shutil.copy2(ROOT / 'distribution/software.json', output / 'software.json')
     shutil.copy2(ROOT / 'LICENSE', output / 'BROOK-LICENSE.txt')
-    shutil.copytree(ROOT / 'tools/vm_bridge', output / 'linux-development-bridge',
-                    ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
-    shutil.copytree(ROOT / 'distribution/installers', output / 'installers',
-                    ignore=shutil.ignore_patterns('__pycache__', '*.pyc', '.gitignore'))
+    if not args.developer:
+        shutil.copy2(ROOT / 'distribution/software.json', output / 'software.json')
+        shutil.copytree(ROOT / 'tools/vm_bridge', output / 'linux-development-bridge',
+                        ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+        shutil.copytree(ROOT / 'distribution/installers', output / 'installers',
+                        ignore=shutil.ignore_patterns('__pycache__', '*.pyc', '.gitignore'))
     manifest = dict(format=1, status='private-candidate-source-and-notice-review-pending',
                     profile=metadata.get('profile'), seed_manifest=metadata,
                     revision=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
@@ -180,6 +225,9 @@ def main():
                     partitions=[dict(offset=start, size=part.stat().st_size, sha256=digest(part)) for part, start in zip(parts, starts)],
                     files={name: digest(output / name) for name in ['brook.qcow2', 'OVMF_CODE.fd', 'OVMF_VARS.fd']},
                     acceptance=dict(linux='pending', windows='not tested', macos_intel='not tested', macos_arm='not tested; TCG only'))
+    if args.developer:
+        manifest['status'] = 'private-selected-profile'
+        manifest['redistributable'] = metadata['profile_selection']['manifest']['redistributable']
     (output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     print('Candidate:', output, flush=True)
 

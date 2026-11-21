@@ -21,6 +21,7 @@ import uuid
 from ext2_image_export import Source
 
 from collect_desktop_entries import collect
+from selected_launchers import collect_selected
 
 ROOT = Path(__file__).resolve().parents[1]
 FAT_FILE_MAX = 0xfffffe00
@@ -128,16 +129,25 @@ def remove_seed(seed):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--profile', type=Path, required=True)
-    parser.add_argument('--expression', type=Path, default=ROOT/'nix/hardware-network-packages.nix')
+    parser.add_argument('--profile', type=Path)
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument('--expression', type=Path, help='Profile package expression (default: hardware network)')
+    source.add_argument('--profile-selection', type=Path, help='Metadata for the realized selected-app profile')
     parser.add_argument('--index', type=Path, default=ROOT/'tools/nix-index/packages.idx')
     parser.add_argument('--size-mib', type=int, default=3840)
     parser.add_argument('--direct-ahci', action='store_true',
                         help='Allow a larger image for a direct partition, outside a FAT32 file')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
-    profile = args.profile.resolve(strict=True)
-    expression = args.expression.resolve(strict=True)
+    selection = None
+    if args.profile_selection:
+        from image_profile import load_selection
+        selection = load_selection(args.profile_selection, args.profile)
+        profile = Path(selection['profile']).resolve(strict=True)
+    elif args.profile:
+        profile = args.profile.resolve(strict=True)
+    else:
+        parser.error('Specify --profile or --profile-selection')
     index = args.index.resolve(strict=True)
     index_metadata = json.loads(Path(str(index)+'.json').read_text())
     if (index_metadata.get('format') != 1 or
@@ -160,13 +170,19 @@ def main():
     closure = subprocess.check_output(['nix-store', '-qR', str(profile)], text=True).splitlines()
     if not closure or any(Path(p).parent != Path('/nix/store') for p in closure):
         raise ValueError('Invalid Nix closure')
-    nix = ('let e = import (builtins.toPath '+json.dumps(str(expression))+') {}; in '
-           '{ profile = toString e.profile; packages = map (p: { '
-           'name = p.pname or p.name; version = p.version or ""; '
-           'store = builtins.baseNameOf (toString p); }) e.packages; '
-           'intelVulkanDriver = if e ? intelVulkanDriver then toString e.intelVulkanDriver else null; }')
-    metadata = json.loads(subprocess.check_output(
-        ['nix-instantiate', '--eval', '--strict', '--json', '-E', nix], text=True))
+    if selection:
+        metadata = selection
+        if any(str(Path('/nix/store') / row['store']) not in closure for row in metadata['packages']):
+            raise ValueError('Selected package metadata refers outside the profile closure')
+    else:
+        expression = (args.expression or ROOT/'nix/hardware-network-packages.nix').resolve(strict=True)
+        nix = ('let e = import (builtins.toPath '+json.dumps(str(expression))+') {}; in '
+               '{ profile = toString e.profile; packages = map (p: { '
+               'name = p.pname or p.name; version = p.version or ""; '
+               'store = builtins.baseNameOf (toString p); }) e.packages; '
+               'intelVulkanDriver = if e ? intelVulkanDriver then toString e.intelVulkanDriver else null; }')
+        metadata = json.loads(subprocess.check_output(
+            ['nix-instantiate', '--eval', '--strict', '--json', '-E', nix], text=True))
     if metadata['profile'] != str(profile):
         raise ValueError('Expression and profile do not match')
     (output/'closure.txt').write_text('\n'.join(sorted(closure))+'\n')
@@ -216,12 +232,18 @@ def main():
     (seed/'profile/manifest.tsv').write_text('\n'.join(sorted(set(rows)))+'\n')
     # collect_desktop_entries resolves guest /nix paths against the seed and
     # uses only the profile exports, avoiding uninstalled closure-only entries.
-    collect(seed/'store', seed/'share/applications', hardware=True)
+    if selection:
+        collect_selected(seed/'store', seed/'share/applications', profile,
+                         selection['manifest']['launcherIds'], hardware=True)
+    else:
+        collect(seed/'store', seed/'share/applications', hardware=True)
     (seed/'BROOK.MNT').write_text('/nix\n')
     identity = {'profile': str(profile), 'closure': sorted(closure),
                 'index_sha256': digest(index), 'index_metadata': index_metadata, 'tools': tools,
                 'intel_vulkan': intel_vulkan,
                 'builder_sha256': digest(Path(__file__))}
+    if selection:
+        identity['profile_selection'] = selection
     identifier = str(uuid.uuid5(uuid.NAMESPACE_URL, json.dumps(identity, sort_keys=True)))
     (seed/'.brook-store.json').write_text(json.dumps({'format': 1, 'uuid': identifier, **identity}, indent=2)+'\n')
     image = output/'STORE.IMG'

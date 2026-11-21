@@ -28,6 +28,8 @@ def main():
     args = parser.parse_args()
     bundle = args.bundle.resolve()
     manifest = json.loads((bundle / 'manifest.json').read_text())
+    if manifest.get('status') == 'private-selected-profile' or manifest.get('redistributable') is False:
+        parser.error('A selected-profile developer image is outside the public QEMU release preset')
     required = ['brook.qcow2', 'OVMF_CODE.fd', 'OVMF_VARS.fd', 'launch.py',
                 'run-linux.sh', 'run-macos.command', 'run-windows.cmd', 'README.txt',
                 'BROOK-LICENSE.txt']
