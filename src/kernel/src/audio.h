@@ -46,6 +46,12 @@ struct AudioDeviceProgress {
     bool discontinuity = false;
 };
 
+struct AudioHdaStatus {
+    uint32_t sdctl=0,sdsts=0,lpib=0,intsts=0,intctl=0,walclk=0,format=0,rate=0;
+    uint64_t polls=0,completionPolls=0,stalls=0;
+    bool running=false,native=false;
+};
+
 struct AudioDriver {
     const char* name;
 
@@ -74,7 +80,10 @@ struct AudioDriver {
     AudioSubmitReceipt (*trySubmit)(const void*, uint32_t) = nullptr;
     bool (*progress)(AudioDeviceProgress*) = nullptr;
     bool (*restart)(uint64_t expectedEpoch) = nullptr;
+    bool (*hdaStatus)(AudioHdaStatus&) = nullptr;
 };
+
+bool AudioReadHdaStatus(AudioHdaStatus& status);
 
 // Zero means no trustworthy elapsed-time source (legacy playback still works).
 extern "C" uint64_t AudioClockNowNs();

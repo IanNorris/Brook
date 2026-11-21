@@ -1857,6 +1857,17 @@ uint64_t ApicTickCount()
     return __atomic_load_n(&g_lapicTickCount, __ATOMIC_ACQUIRE);
 }
 
+uint64_t ApicReadVmwareElapsedNs()
+{
+    if (__atomic_load_n(&g_tickSource,__ATOMIC_ACQUIRE)!=TickVmwareTsc) return 0;
+    uint64_t ticks=0,ns=0;
+    if (!VmwareClockReadTicks(&ticks) ||
+        !VmwareTscElapsedNs(g_tickOriginTsc,g_tickOriginMs,ticks,VmwareClockTscKhz(),&ns))
+        return 0;
+    static uint64_t floor=0;
+    return TickClockPublishFloor(&floor,ns);
+}
+
 ApicClockSnapshot ApicGetClockSnapshot()
 {
     ApicClockSnapshot snapshot{};

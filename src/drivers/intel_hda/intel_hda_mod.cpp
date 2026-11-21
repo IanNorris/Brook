@@ -244,6 +244,10 @@ static uint32_t  g_lastLpib = 0;       // previous cyclic DMA position
 static bool      g_streamRunning = false;
 static volatile uint32_t g_playLock = 0;
 static AudioDmaClock g_nativeClock;
+static bool g_vmwareController=false;
+static uint64_t g_dmaPolls=0,g_dmaProgressPolls=0,g_dmaStalls=0;
+static uint64_t g_lastNativeProgressNs=0;
+static constexpr uint64_t VMWARE_DMA_STALL_NS=250000000;
 static bool g_nativeMode = false;
 static uint32_t g_legacyActive = 0;
 static uint64_t g_legacyEpoch = 0;
@@ -628,6 +632,8 @@ static void UpdatePlayedBytesLocked()
     if (!g_streamRunning)
         return;
     uint32_t lpib = hda_read32(g_outStreamBase + SD_LPIB) % AUDIO_BUF_SIZE;
+    ++g_dmaPolls;
+    if (lpib != g_lastLpib) ++g_dmaProgressPolls;
     uint32_t delta = (lpib >= g_lastLpib)
         ? (lpib - g_lastLpib)
         : (AUDIO_BUF_SIZE - g_lastLpib + lpib);
@@ -729,6 +735,7 @@ static bool StartNativePrimedLocked()
     if (!g_nativeClock.Start(0, before)) {
         FailNativeLocked("start-clock-or-position", before); return false;
     }
+    g_lastNativeProgressNs=before;
     StartOutputStream(); g_streamRunning = true;
     if (!(hda_read32(g_outStreamBase + SD_CTL) & SD_CTL_RUN)) {
         FailNativeLocked("run-not-set", before); return false;
@@ -751,6 +758,8 @@ static void ObserveNativeLocked()
     const uint8_t status = hda_read8(g_outStreamBase + SD_STS);
     const uint64_t after = AudioClockNowNs();
     const uint64_t oldCompleted = g_nativeClock.completed;
+    const uint32_t previousPosition=g_nativeClock.Position();
+    ++g_dmaPolls;
     if (!g_nativeClock.Observe(raw == AUDIO_BUF_SIZE ? 0 : raw, before, after,
                               (status & (SD_STS_FIFOE | SD_STS_DESE)) != 0)) {
         const char* reason = (status & (SD_STS_FIFOE | SD_STS_DESE)) ? "device-status" :
@@ -759,6 +768,15 @@ static void ObserveNativeLocked()
             after - g_nativeClock.SampleBeforeNs() >= AudioDmaClock::MaxSampleNs ? "sample-gap" :
             "completion-overflow";
         FailNativeLocked(reason, before, after, raw, status);
+        return;
+    }
+    if (g_nativeClock.Position()!=previousPosition) {
+        ++g_dmaProgressPolls;
+        g_lastNativeProgressNs=after;
+    } else if (g_vmwareController && after>=g_lastNativeProgressNs &&
+               after-g_lastNativeProgressNs>=VMWARE_DMA_STALL_NS) {
+        ++g_dmaStalls;
+        FailNativeLocked("dma-position-stalled",before,after,raw,status);
         return;
     }
     // Completed areas become silence before cyclic DMA can visit them again.
@@ -997,6 +1015,8 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
 
     const uint8_t* src = static_cast<const uint8_t*>(samples);
     uint32_t totalWritten = 0;
+    uint64_t lastPlayed = g_playedBytes;
+    unsigned blockedPolls = 0;
 
     while (totalWritten < byteCount)
     {
@@ -1034,6 +1054,19 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
         {
             if (nonblock)
                 break;
+            if (g_vmwareController) {
+                if (lastPlayed != g_playedBytes) {
+                    lastPlayed = g_playedBytes;
+                    blockedPolls = 0;
+                }
+                if (++blockedPolls >= 250) {
+                    ++g_dmaStalls;
+                    ResetPlaybackQueueLocked(false);
+                    g_streamConfigured=false;
+                    PlayUnlock();
+                    return totalWritten ? static_cast<int>(totalWritten) : -5;
+                }
+            }
             PlayUnlock();
             SchedulerSleepMs(1);
             PlayLock();
@@ -1146,6 +1179,18 @@ static void HdaService()
 // ---------------------------------------------------------------------------
 // Module init / exit
 // ---------------------------------------------------------------------------
+
+static bool HdaReadStatus(AudioHdaStatus& status)
+{
+    if (!g_initialized || __atomic_exchange_n(&g_playLock,1u,__ATOMIC_ACQUIRE)) return false;
+    status={hda_read32(g_outStreamBase+SD_CTL)&0x00ffffffu,
+            hda_read8(g_outStreamBase+SD_STS),hda_read32(g_outStreamBase+SD_LPIB),
+            hda_read32(INTSTS),hda_read32(INTCTL),hda_read32(WALCLK),
+            hda_read16(g_outStreamBase+SD_FMT),g_curRate,
+            g_dmaPolls,g_dmaProgressPolls,g_dmaStalls,g_streamRunning,g_nativeMode};
+    PlayUnlock();
+    return true;
+}
 
 enum class HdaVmPlatform { None, Qemu, Vmware };
 
@@ -1287,6 +1332,7 @@ static int IntelHdaInit()
     // guest IRQ handler is installed for the emulated controller's PCI pin.
     hda_write32(INTCTL, 0);
 
+    g_vmwareController = platform == HdaVmPlatform::Vmware;
     g_initialized = true;
 
     // Register with the audio subsystem
@@ -1300,6 +1346,7 @@ static int IntelHdaInit()
         HdaTrySubmit,
         HdaNativeProgress,
         HdaNativeRestart,
+        HdaReadStatus,
     };
     AudioRegister(&hdaAudioDriver);
 

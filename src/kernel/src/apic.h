@@ -104,6 +104,7 @@ void ApicInitTimerOnAp();
 // initialization, the invariant TSC on admitted bare metal (TscClockSelect);
 // otherwise this is an approximate delivered-IRQ clock.
 uint64_t ApicTickCount();
+uint64_t ApicReadVmwareElapsedNs();
 // Diagnostic raw BSP timer interrupt count. Unlike ApicTickCount this never
 // switches to a paravirtual or VMware elapsed clock and can undercount stalls.
 uint64_t ApicRawBspIrqCount();

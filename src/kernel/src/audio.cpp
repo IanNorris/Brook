@@ -39,8 +39,10 @@ extern "C" uint64_t AudioClockNowNs()
     // Bare metal: the invariant TSC is calibrated and cross-CPU consistent
     // (tsc_clock.cpp). Without it, diagnostics/controls report an invalid clock.
     if (TscClockAvailable()) return TscClockReadNs();
-#endif
+    return ApicReadVmwareElapsedNs();
+#else
     return 0;
+#endif
 }
 
 static SpinLock g_dspProducerLock;
@@ -1018,6 +1020,11 @@ extern "C" bool AudioRegister(const AudioDriver* drv)
     g_audioDriver = drv;
     KPrintf("audio: registered driver '%s'\n", drv->name);
     return true;
+}
+
+bool AudioReadHdaStatus(AudioHdaStatus& status)
+{
+    return g_audioDriver && g_audioDriver->hdaStatus && g_audioDriver->hdaStatus(status);
 }
 
 bool AudioAvailable()

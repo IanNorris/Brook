@@ -25,6 +25,7 @@ void initialize() {
     registers.fill(0);dma.fill(0);nowNs=1000000000;clockAvailable=true;failSetup=false;
     g_nativeClock=brook::AudioDmaClock{};g_nativeFaultEvidence={};g_nativeMode=false;g_nativeRingBase=0;
     g_nativeLastDataEnd=g_nativePrimedAt=0;
+    g_vmwareController=false;g_lastNativeProgressNs=g_dmaPolls=g_dmaProgressPolls=g_dmaStalls=0;
     g_streamRunning=g_streamConfigured=false;g_playLock=g_legacyActive=0;g_legacyEpoch=0;legacyWaitHook=afterCopyHook=beforeSubmitHook=nullptr;
     g_submittedBytes=g_playedBytes=0;g_lastLpib=0;
     g_initialized=true;g_dacNid=2;g_outStreamBase=0x80;
@@ -180,6 +181,25 @@ int RunHdaClockTests() {
     VERIFY(!reserved.ReserveGap(reserved.completed+AudioDmaClock::RingBytes));
     reserved.Fault();VERIFY(!reserved.ReserveGap(36));
     initialize();std::array<int16_t,AUDIO_BUF_SIZE/2> tone{};tone.fill(1234);
+    g_vmwareController=true;
+    VERIFY(HdaTrySubmit(tone.data(),START_QUEUE_BYTES).accepted==START_QUEUE_BYTES);
+    VERIFY(g_streamRunning);
+    for(unsigned i=0;i<25;++i) {
+        nowNs+=10000000;
+        HdaService();
+    }
+    auto stalled=progress();
+    VERIFY(stalled.discontinuity && !stalled.running && stalled.completed==0);
+    AudioHdaStatus status{};
+    VERIFY(HdaReadStatus(status) && status.stalls==1 && status.polls>=25 &&
+           status.completionPolls==0 && !status.running && status.native &&
+           status.rate==44100 && status.format==0x4011 && !(status.sdctl&SD_CTL_RUN));
+    initialize();
+    g_vmwareController=true;
+    VERIFY(HdaPlayPcm(tone.data(),AUDIO_BUF_SIZE,44100,2,16,false)==TARGET_QUEUE_BYTES);
+    VERIFY(!g_streamRunning && !g_streamConfigured && g_dmaStalls==1);
+    VERIFY(HdaPlayPcm(tone.data(),4,44100,2,16,false)==4);
+    initialize();
     // Consecutive fresh rings must not charge the stale pre-RUN position as a
     // wrap. Verify both native and legacy accounting before any DMA movement.
     for(unsigned i=0;i<3;++i) {

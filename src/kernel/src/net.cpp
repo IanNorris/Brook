@@ -6340,6 +6340,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  heap check      - validate heap block metadata\n"
             "  epoll diag on|off|status - bounded per-task epoll counters (default off)\n"
             "  audio stats - cached stream queues, completion and guest clock\n"
+            "  audio hda status - virtual HDA register and DMA polling snapshot\n"
             "  audio stop - stop output and invalidate active mixer streams\n"
             "  audio staging on|off|1024|4096|status - prospective native downstream budget (default off)\n"
             "  sched decision watch PID INC | off | reset | status - MLFQ decisions (default off)\n"
@@ -8036,6 +8037,28 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         BridgeReply r;r.text("{\"enabled\":");r.text(AudioMixerStagingEnabled()?"true":"false");
         r.text(",");r.field("frame_limit",AudioMixerStagingFrameLimit());
         r.text(",\"scope\":\"Prospective native capacity negotiations only; independent downstream budget bounded by the configured frame limit (maximum 4096). Existing per-stream limits unchanged on configuration; completion and queued delay remain physical-source accounting.\"}\n");r.send();
+    }
+    else if (NetStrEq(cmd, "audio hda status")) {
+        AudioHdaStatus status{};
+        if (!AudioReadHdaStatus(status)) {
+            DebugChannelSend("{\"available\":false}\n");
+            return;
+        }
+        BridgeReply r;r.text("{\"available\":true,\"irq_count\":0,\"irq_mode\":\"polling\"");
+        r.text(",");r.field("sdctl",status.sdctl);
+        r.text(",");r.field("sdsts",status.sdsts);
+        r.text(",");r.field("lpib",status.lpib);
+        r.text(",");r.field("intsts",status.intsts);
+        r.text(",");r.field("intctl",status.intctl);
+        r.text(",");r.field("walclk",status.walclk);
+        r.text(",");r.field("format",status.format);
+        r.text(",");r.field("rate_hz",status.rate);
+        r.text(",");r.field("polls",status.polls);
+        r.text(",");r.field("progress_polls",status.completionPolls);
+        r.text(",");r.field("stalls",status.stalls);
+        r.text(",");r.field("running",status.running);
+        r.text(",");r.field("native",status.native);
+        r.text("}\n");r.send();
     }
     else if (NetStrEq(cmd, "audio stats")) {
         DebugAudioDiagnostics();
