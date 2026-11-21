@@ -7186,6 +7186,28 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             hex("misc_enable",p.miscEnable);hex("perf_ctl",p.perfCtl);hex("perf_status",p.perfStatus);hex("energy_perf_bias",p.epb);
             hex("platform_info",p.platformInfo);hex("turbo_ratio_limit",p.turboRatioLimit);hex("pkg_cst_config_control",p.pkgCstConfig);
             hex("pkg_power_limit",p.pkgPowerLimit);hex("pkg_power_info",p.pkgPowerInfo);hex("cpuid5_edx",p.mwaitLeaf5Edx);
+            if (p.valid) {
+                hex("rapl_power_unit", p.raplPowerUnit);
+                const auto limits = ThermalDecodeRaplPackageLimits(p.raplPowerUnit, p.pkgPowerLimit);
+                auto limit = [&](const char* name, const ThermalRaplLimit& v) {
+                    r.text(",\""); r.text(name); r.text("\":{");
+                    r.field("power_uw", v.powerUw);
+                    r.text(","); r.field("time_window_us", v.timeWindowUs);
+                    r.text(",\"enabled\":"); r.text(v.enabled ? "true" : "false");
+                    r.text(",\"clamp\":"); r.text(v.clamp ? "true" : "false");
+                    r.text("}");
+                };
+                r.text(",\"pkg_power_limits\":{");
+                r.field("power_unit_exponent", limits.units.powerExponent);
+                r.text(","); r.field("energy_unit_exponent", limits.units.energyExponent);
+                r.text(","); r.field("time_unit_exponent", limits.units.timeExponent);
+                r.text(",\"locked\":"); r.text(limits.locked ? "true" : "false");
+                limit("pl1", limits.pl1);
+                limit("pl2", limits.pl2);
+                r.text("}");
+            } else {
+                r.text(",\"rapl_power_unit\":null,\"pkg_power_limits\":null");
+            }
             r.text(",");r.field("tsc",p.tsc);
             r.text(",\"residency\":{");r.field("pkg_c2",p.pkgC2);r.text(",");r.field("pkg_c3",p.pkgC3);r.text(",");r.field("pkg_c6",p.pkgC6);
             r.text(",");r.field("pkg_c7",p.pkgC7);r.text(",");r.field("pkg_c8",p.pkgC8);r.text(",");r.field("pkg_c9",p.pkgC9);r.text(",");r.field("pkg_c10",p.pkgC10);

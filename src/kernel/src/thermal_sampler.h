@@ -40,6 +40,43 @@ inline uint32_t ThermalEnergyMw(uint32_t before, uint32_t after, uint64_t unitMs
     const uint64_t mw = microjoules * 1000ull / elapsedUs;
     return mw > 0xffffffffull ? 0xffffffffu : uint32_t(mw);
 }
+// Intel SDM Vol. 3B, Package RAPL Domain. The halves of 0x610 have
+// identical limit fields. 0x606 supplies the binary power and time scales.
+struct ThermalRaplUnits {
+    uint32_t powerExponent, energyExponent, timeExponent;
+};
+
+inline ThermalRaplUnits ThermalDecodeRaplUnits(uint64_t unitMsr) {
+    return {uint32_t(unitMsr) & 0xf, uint32_t(unitMsr >> 8) & 0x1f,
+            uint32_t(unitMsr >> 16) & 0xf};
+}
+
+struct ThermalRaplLimit {
+    uint64_t powerUw, timeWindowUs;
+    bool enabled, clamp;
+};
+
+inline ThermalRaplLimit ThermalDecodeRaplLimit(uint32_t limit, ThermalRaplUnits units) {
+    const uint32_t exponent = (limit >> 17) & 0x1f;
+    const uint32_t quarterFraction = (limit >> 22) & 3;
+    // Time window = 2^Y * (1 + Z/4) * 2^-TU seconds.
+    return {((limit & 0x7fffu) * 1000000ull) >> units.powerExponent,
+            ((250000ull * (4 + quarterFraction)) << exponent) >> units.timeExponent,
+            (limit & (1u << 15)) != 0, (limit & (1u << 16)) != 0};
+}
+
+struct ThermalRaplPackageLimits {
+    ThermalRaplUnits units;
+    ThermalRaplLimit pl1, pl2;
+    bool locked;
+};
+
+inline ThermalRaplPackageLimits ThermalDecodeRaplPackageLimits(uint64_t unitMsr, uint64_t limitMsr) {
+    const auto units = ThermalDecodeRaplUnits(unitMsr);
+    return {units, ThermalDecodeRaplLimit(uint32_t(limitMsr), units),
+            ThermalDecodeRaplLimit(uint32_t(limitMsr >> 32), units), (limitMsr >> 63) != 0};
+}
+
 // Average frequency while in C0 = base * dAPERF / dMPERF.
 inline uint32_t ThermalMhz(uint64_t daperf, uint64_t dmperf, uint32_t baseMhz) {
     if (!dmperf || !baseMhz) return 0;
