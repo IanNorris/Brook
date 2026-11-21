@@ -18,6 +18,11 @@ int ProcessReadAnonymousFdMetadata(Process* viewer, Process* target, uint32_t fd
     type = entry.type; flags = entry.flags;
     const bool sameGroup = viewer->tgid == target->tgid && viewerGroup == targetGroup;
     switch (type) {
+        case FdType::Vnode:
+            // Null-handle vnodes are the inherited synthetic console streams.
+            // Expose their fstat metadata without making them reopenable.
+            if (entry.handle) { SpinLockRelease(lock); return 0; }
+            break;
         case FdType::MemFd:
             if (!sameGroup) { SpinLockRelease(lock); return -13; }
             if (!entry.handle) { SpinLockRelease(lock); return -2; }
