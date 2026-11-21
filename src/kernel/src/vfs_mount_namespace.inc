@@ -33,7 +33,7 @@ static void VfsRetireNamespaceLocked(MountNamespace* ns)
         if(mount->owner==ns)VfsDetachMountLocked(mount);
         mount=next;
     }
-    ns->root=nullptr;
+    if(ns->root)__builtin_trap(); // root was cleared with its registry entry
     VfsCollectRetiredMountsLocked();
     VfsMountNamespaceRelease(ns); // registry's storage lease
 }
