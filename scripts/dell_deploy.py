@@ -58,9 +58,13 @@ def stage_profile(args, *, bridge=None, bulk_port=1236):
         with ExitStack() as resources:
             bundles = []
             if a.profile_plan:
-                plan = json.loads(files[0].read_text())
-                if a.push_profile_cache or plan['cache']['brook'] is None:
-                    from profile_cache_bundle import pack_cache, validate_push_capacity
+                document = files[0].read_bytes()
+                if hashlib.sha256(document).hexdigest() != journal.receipt['profile_files'][files[0].name]:
+                    raise ValueError('Stage plan changed before preflight')
+                plan = json.loads(document)
+                push_cache = a.push_profile_cache or plan['cache']['brook'] is None
+                selected = plan['format'] == 3
+                if push_cache or selected:
                     probe = uuid.uuid4().hex
                     journal.save(state='profile_cache_probe_dispatched', cache_probe_job_id=probe)
                     bridge.guest_run(a.session, probe, ['/nix/bin/nix', 'stage-profile', 'cache-capabilities'],
@@ -71,6 +75,16 @@ def stage_profile(args, *, bridge=None, bulk_port=1236):
                     if status.get('exit', {}).get('code') != 0:
                         raise ValueError('Guest stage helper lacks bridge cache capability; refresh it first')
                     capabilities = json.loads(status['stdout']['text'])
+                    if selected:
+                        api = capabilities.get('selected_profile_api')
+                        if type(api) is not int or api != 1:
+                            raise ValueError('Refresh the guest stage helper with '
+                                             'dell_bootstrap_stage_profile.py --refresh-helper --selected-profiles '
+                                             'before applying this plan')
+                        journal.save(state='selected_profile_preflight_verified',
+                                     cache_capabilities=capabilities)
+                if push_cache:
+                    from profile_cache_bundle import pack_cache, validate_push_capacity
                     work = Path(resources.enter_context(tempfile.TemporaryDirectory(
                         prefix='.cache-bundles-', dir=journal.output)))
                     bundles = list(pack_cache(a.profile_plan / 'cache', plan, work))

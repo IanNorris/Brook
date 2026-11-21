@@ -1,0 +1,48 @@
+--- a/stage_profile.py
++++ b/stage_profile.py
+@@ -20,4 +20,5 @@
+ from collect_desktop_entries import collect
+ from stage_launchers import merge_indexes
++from stage_selected_launchers import merge_selected_indexes, validate_launcher_ids
+ 
+ MAX_PLAN = 16 * 1024 * 1024
+@@ -47,5 +48,5 @@
+ 
+ def validate_plan(plan):
+-    if plan["format"] not in (1, 2):
++    if plan["format"] not in (1, 2, 3):
+         raise ValueError("Unknown closure plan version")
+     address = plan["cache"]["brook"]
+@@ -88,4 +89,6 @@
+                 or not re.fullmatch(r"[a-f0-9]{64}", recipe["layoutSha256"])):
+             raise ValueError("Invalid signed profile layout recipe")
++        if plan["format"] == 3:
++            validate_launcher_ids(recipe["launcherIds"])
+ 
+ 
+@@ -213,5 +216,5 @@
+     manifest.update({row[0].casefold(): row for row in rows})
+     layout = plan["profile"]
+-    if plan["format"] == 2:
++    if plan["format"] != 1:
+         store = nix / "store"
+         layout = profile_layout(store / layout["root"], plan["closure"], store=store,
+@@ -240,5 +243,9 @@
+     durable_text(destination / "manifest.tsv", "".join(
+         "\t".join(row) + "\n" for row in sorted(manifest.values())))
+-    merge_indexes(nix, destination, old / LAUNCHER, launcher)
++    if plan["format"] == 3:
++        merge_selected_indexes(nix, destination, old / LAUNCHER, launcher,
++                               plan["profile"]["launcherIds"], overlay)
++    else:
++        merge_indexes(nix, destination, old / LAUNCHER, launcher)
+     os.sync()
+ 
+@@ -393,5 +400,6 @@
+     space = os.statvfs(transfer if transfer.is_dir() else transfer.parent)
+     unit = space.f_frsize or space.f_bsize
+-    return {"bridge_cache_api": 1, "free_bytes": unit * space.f_bavail, "block_bytes": unit}
++    return {"bridge_cache_api": 1, "selected_profile_api": 1,
++            "free_bytes": unit * space.f_bavail, "block_bytes": unit}
+ 
+ 

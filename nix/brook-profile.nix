@@ -74,7 +74,7 @@ let
       '') selected}
     chmod +x "$out/bin/"*
   '';
-  sessionPackages = [ (import ./closure-stage.nix { inherit pkgs; })
+  sessionPackages = [ (import ./closure-stage.nix { inherit pkgs; selectedProfiles = true; })
                       (lib.hiPrio launchers) pkgs.xz.bin pkgs.zstd.bin ]
     ++ base.packages ++ lib.concatMap (app: app.packages) selected;
   directPackages = lib.unique (sessionPackages ++ cliPackages);

@@ -46,10 +46,12 @@ def manifest_for(helper, installer, public_key):
             "installerSha256": sha(installer), "keySha256": sha(public_key)}
 
 
-def build_installer(out):
+def build_installer(out, *, selected_profiles=False):
+    variant = "true" if selected_profiles else "false"
     helper_path = subprocess.check_output([
         "nix-build", "--no-out-link", "-E",
-        'import ./nix/closure-stage.nix { pkgs = import ./nix/nixpkgs.nix {}; }'
+        "import ./nix/closure-stage.nix { pkgs = import ./nix/nixpkgs.nix {}; "
+        f"selectedProfiles = {variant}; }}"
     ], cwd=ROOT, text=True).strip()
     compiler = os.environ.get("MUSL_CC")
     if not compiler:
@@ -115,11 +117,15 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--dry-run", action="store_true", help="check reusable store paths and bootstrap state")
+    parser.add_argument("--selected-profiles", action="store_true",
+                        help="install the helper for signed app selections (use --refresh-helper if already managed)")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--refresh-helper", action="store_true", help="update the helper after a completed bootstrap")
     mode.add_argument("--rollback-receipt", type=Path,
                       help="undo the bootstrap named in this receipt while its legacy generation is active")
     args = parser.parse_args()
+    if args.selected_profiles and args.rollback_receipt:
+        parser.error("--selected-profiles does not apply to rollback")
     if args.dry_run and args.rollback_receipt:
         parser.error("--dry-run does not apply to rollback")
     if not args.guest_python.startswith("/nix/") or not 1 <= args.timeout <= 3600:
@@ -148,7 +154,7 @@ def main():
                 report = guest_action(bridge, journal, args, remote_program, "rollback", identity)
             else:
                 installer = args.output / "nix-install"
-                helper = build_installer(installer)
+                helper = build_installer(installer, selected_profiles=args.selected_profiles)
                 der = subprocess.check_output(["openssl", "pkey", "-pubin", "-in",
                                                public_key, "-outform", "DER"])
                 ed25519_prefix = bytes.fromhex("302a300506032b6570032100")

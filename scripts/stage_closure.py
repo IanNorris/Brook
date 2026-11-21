@@ -16,6 +16,7 @@ from image_profile import load_selection, verify_realized_selection
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools/nix-install"))
 from stage_nar import STORE, UPSTREAM, layout_digest, nar_hash, profile_layout, store_name
+from stage_selected_launchers import validate_launcher_ids
 
 EXPRESSION = ROOT / "nix/hardware-network-packages.nix"
 NIX = ["nix", "--extra-experimental-features", "nix-command"]
@@ -62,7 +63,9 @@ def upstream_has(name, entry):
     )
 
 
-def generate_plan(profile, extras, cache_url, mirror_upstream, packages=()):
+def generate_plan(profile, extras, cache_url, mirror_upstream, packages=(), *, launcher_ids=None):
+    if launcher_ids is not None:
+        validate_launcher_ids(launcher_ids)
     roots = list(dict.fromkeys(
         [str(profile), *map(str, extras), *(str(STORE / row["store"]) for row in packages)]
     ))
@@ -71,7 +74,7 @@ def generate_plan(profile, extras, cache_url, mirror_upstream, packages=()):
         checks = pool.map(lambda name: upstream_has(name, closure[name]), sorted(closure))
         for name, upstream in zip(sorted(closure), checks):
             closure[name]["source"] = "upstream" if upstream else "brook"
-    return {
+    plan = {
         "format": 2,
         "roots": [store_name(path) for path in roots],
         "closure": closure,
@@ -82,6 +85,10 @@ def generate_plan(profile, extras, cache_url, mirror_upstream, packages=()):
         "packages": list(packages),
         "cache": {"brook": cache_url, "mirrorUpstream": mirror_upstream},
     }
+    if launcher_ids is not None:
+        plan["format"] = 3
+        plan["profile"]["launcherIds"] = launcher_ids
+    return plan
 
 
 def publish_cache(info, directory, key, mirror_upstream):
@@ -138,9 +145,11 @@ def selected_profile(receipt, requested=None):
     profile = verify_realized_selection(selection)
     exported = {entry.stem for entry in (profile / "share/applications").glob("*.desktop")
                 if entry.is_file()}
-    if exported != set(selection["manifest"]["launcherIds"]):
+    launcher_ids = selection["manifest"]["launcherIds"]
+    validate_launcher_ids(launcher_ids)
+    if exported != set(launcher_ids):
         raise ValueError("Selected profile's desktop files differ from its launcher manifest")
-    return profile, selection["packages"]
+    return profile, selection["packages"], launcher_ids
 
 
 def main():
@@ -150,7 +159,8 @@ def main():
     source.add_argument("--expression", type=Path,
                         help="profile expression providing package names and versions")
     source.add_argument("--profile-selection", type=Path,
-                        help="profile-selection.json from brook_image.py for a realized selected profile")
+                        help="realized profile-selection.json from brook_image.py "
+                             "(requires a guest helper installed with --selected-profiles)")
     parser.add_argument("extras", nargs="*", type=Path)
     parser.add_argument("--output", required=True, type=Path)
     delivery = parser.add_mutually_exclusive_group(required=True)
@@ -165,9 +175,10 @@ def main():
 
     for key in (args.cache_key, args.plan_key):
         verify_private_key(key)
+    launcher_ids = None
     if args.profile_selection is not None:
         try:
-            profile, packages = selected_profile(args.profile_selection, args.profile)
+            profile, packages, launcher_ids = selected_profile(args.profile_selection, args.profile)
         except (KeyError, OSError, TypeError, ValueError) as error:
             parser.error(f"Invalid profile selection: {error}")
     else:
@@ -189,7 +200,8 @@ def main():
     output = args.output.absolute()
     output.mkdir(mode=0o700, parents=True, exist_ok=False)
     cache_url = args.cache_url.rstrip("/") if args.cache_url else None
-    plan = generate_plan(profile, extras, cache_url, args.mirror_upstream, packages)
+    plan = generate_plan(profile, extras, cache_url, args.mirror_upstream, packages,
+                         launcher_ids=launcher_ids)
     publish_cache(plan["closure"], output / "cache", args.cache_key.resolve(), args.mirror_upstream)
     document = output / "stage-plan.json"
     document.write_text(json.dumps(plan, sort_keys=True, separators=(",", ":")) + "\n")

@@ -4,10 +4,12 @@
 import json
 from pathlib import Path
 import tempfile
+import sys
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+import dell_deploy
 import image_profile
 import stage_closure
 from stage_nar import layout_digest
@@ -65,7 +67,7 @@ class SelectedStageProfileTest(unittest.TestCase):
             return stage_closure.selected_profile(self.receipt, STORE_PROFILE)
 
     def test_verified_receipt_drives_existing_plan_format(self):
-        profile, packages = self.resolve()
+        profile, packages, launchers = self.resolve()
         self.assertEqual(profile, self.profile)
         entries = {
             PROFILE: {"references": sorted([CALCULATOR, EXTRA])},
@@ -82,13 +84,15 @@ class SelectedStageProfileTest(unittest.TestCase):
         with (patch.object(stage_closure, "closure_info", return_value=entries) as info,
               patch.object(stage_closure, "profile_layout", return_value=layout) as layout_from,
               patch.object(stage_closure, "upstream_has", return_value=False)):
-            plan = stage_closure.generate_plan(STORE_PROFILE, [], None, False, packages)
-        self.assertEqual(plan["format"], 2)
+            plan = stage_closure.generate_plan(STORE_PROFILE, [], None, False, packages,
+                                                launcher_ids=launchers)
+        self.assertEqual(plan["format"], 3)
         self.assertEqual(plan["packages"], packages)
         info.assert_called_once_with([str(STORE_PROFILE), "/nix/store/" + CALCULATOR,
                                       "/nix/store/" + EXTRA])
         self.assertEqual(layout_from.call_args.args[0], STORE_PROFILE)
-        self.assertEqual(plan["profile"], {"root": PROFILE, "layoutSha256": layout_digest(layout)})
+        self.assertEqual(plan["profile"], {"root": PROFILE, "layoutSha256": layout_digest(layout),
+                                           "launcherIds": ["brook.calc"]})
 
     def test_default_stage_still_uses_network_expression(self):
         output = self.receipt.parent / "default-stage"
@@ -109,7 +113,7 @@ class SelectedStageProfileTest(unittest.TestCase):
         expression = stage_closure.EXPRESSION.resolve()
         selection.assert_not_called()
         metadata.assert_called_once_with(expression)
-        plan.assert_called_once_with(self.profile, [], None, False, packages)
+        plan.assert_called_once_with(self.profile, [], None, False, packages, launcher_ids=None)
         self.assertEqual(run.call_args_list[0].args[0],
                          ["nix-build", str(expression), "-A", "profile", "--no-out-link"])
 
@@ -135,6 +139,64 @@ class SelectedStageProfileTest(unittest.TestCase):
         self.launcher.with_name("htop.desktop").write_text("[Desktop Entry]\nName=htop\n")
         with self.assertRaisesRegex(ValueError, "desktop files differ"):
             self.resolve()
+
+
+class SelectedDeploymentPreflightTest(unittest.TestCase):
+    def run_stage(self, *, bridge_cache, capabilities):
+        work = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        plan = work / "plan"
+        pair = work / "pair"
+        plan.mkdir()
+        pair.mkdir()
+        document = plan / "stage-plan.json"
+        signature = plan / "stage-plan.sig"
+        document.write_text(json.dumps({"format": 3, "cache": {
+            "brook": None if bridge_cache else "http://example.invalid/",
+        }}))
+        signature.write_bytes(b"fake for preflight test")
+        (pair / "build-manifest.json").write_text("{}")
+        args = SimpleNamespace(output=work / "deployment", session="fixture", pair=pair,
+                               profile_plan=plan, rollback_profile=None, push_profile_cache=False,
+                               profile_timeout_s=10)
+        bridge = Mock()
+        bridge.load_session.return_value = {"host": "test", "port": 1234, "guest_boot_id": "fake"}
+        journal = Mock(output=args.output / "profile")
+        journal.receipt = {"profile_files": {
+            path.name: dell_deploy.sha(path) for path in (document, signature)}}
+        journal.wait_job.side_effect = [
+            {"exit": {"code": 0}, "stdout": {"text": json.dumps(capabilities)}},
+            {"exit": {"code": 0}},
+        ]
+        bulk = Mock()
+        bulk.return_value.execute.side_effect = lambda *_, source, **__: {
+            "transfer": {"sha256": dell_deploy.sha(source), "guest_path": f"/tmp/{source.name}"}}
+        modules = {
+            "hardware": SimpleNamespace(Hardware=Mock()),
+            "hardware_bulk_workflow": SimpleNamespace(BulkRun=bulk),
+            "hardware_update_workflow": SimpleNamespace(UpdateRun=Mock(return_value=journal)),
+        }
+        with patch.dict(sys.modules, modules), patch.object(sys, "path", sys.path.copy()):
+            if capabilities.get("selected_profile_api") == 1:
+                self.assertIs(dell_deploy.stage_profile(args, bridge=bridge), journal)
+            else:
+                with self.assertRaisesRegex(ValueError, "Refresh the guest stage helper"):
+                    dell_deploy.stage_profile(args, bridge=bridge)
+        return bridge, bulk, journal
+
+    def test_old_helper_rejected_before_bulk_for_both_transports(self):
+        for push in (False, True):
+            with self.subTest(bridge_cache=push):
+                bridge, bulk, _ = self.run_stage(bridge_cache=push, capabilities={"bridge_cache_api": 1})
+                bulk.assert_not_called()
+                bridge.guest_run.assert_called_once()
+                self.assertEqual(bridge.guest_run.call_args.args[2][-1], "cache-capabilities")
+
+    def test_http_transport_probes_before_verified_apply(self):
+        bridge, bulk, journal = self.run_stage(bridge_cache=False, capabilities={"selected_profile_api": 1})
+        self.assertEqual(bulk.call_count, 2)
+        self.assertEqual([call.args[2][2] for call in bridge.guest_run.call_args_list],
+                         ["cache-capabilities", "apply"])
+        self.assertEqual(journal.save.call_args.kwargs["state"], "profile_verified")
 
 
 if __name__ == "__main__":
