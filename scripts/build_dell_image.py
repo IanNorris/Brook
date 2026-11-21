@@ -155,6 +155,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--payload-id', required=True)
     p.add_argument('--output', type=Path, required=True, help='new pair directory (must not exist)')
+    p.add_argument('--app-selection-config', type=Path,
+                   help='host-side app selection JSON from brook_image.py')
     p.add_argument('--shared', type=Path, default=DEFAULT_SHARED, help='private Dell asset directory')
     p.add_argument('--kernel-build', type=Path, default=ROOT / 'build/dell/kernel')
     p.add_argument('--kernel-option', action='append', default=[], metavar='NAME=ON|OFF',
@@ -234,6 +236,15 @@ def main():
     run(configure)
     run(['cmake', '--build', build])
     kernel = build / 'BROOK.elf'
+    if a.app_selection_config:
+        from image_profile import evaluate
+        from kernel_capabilities import read_kernel_capabilities, require_kernel_capabilities
+        config = json.loads(a.app_selection_config.read_text())
+        if config.get("target") != "dell-pair":
+            p.error("Selection target does not match the Dell pair")
+        selection = evaluate(config)
+        require_kernel_capabilities(read_kernel_capabilities(kernel),
+                                    selection['manifest']['requiredCapabilities'])
 
     # 2. Userspace boot services
     compositor, waylandd = build_boot_services()

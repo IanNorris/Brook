@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from tempfile import TemporaryDirectory
 
 from image_profile import (
     ROOT, closure_receipt, data_size_mib, evaluate, nix_json, realize,
@@ -108,17 +109,54 @@ def build_vmware(args):
     if args.apps is None and not args.packages:
         script("make_vmware_image.py", *command)
         return
-    from tempfile import TemporaryDirectory
     with TemporaryDirectory(prefix="brook-image-selection-") as temp:
         config = Path(temp) / "config.json"
         config.write_text(json.dumps(args.config))
         script("make_vmware_image.py", *command, "--selection-config", config)
 
 
+def build_dell_pair(args):
+    output = args.output.resolve()
+    output.mkdir(mode=0o700, parents=True, exist_ok=False)
+    pair = output / "pair"
+    command = ["--output", pair, "--clearwater-shell",
+               "--payload-id", args.payload_id or "brook-selected-dell"]
+    if args.dell_shared is not None:
+        command += ["--shared", args.dell_shared]
+    if args.operator_policy is not None:
+        command += ["--bridge-v3-operators", args.operator_policy]
+    for option in args.kernel_option:
+        command += ["--kernel-option", option]
+    if args.apps is None and not args.packages:
+        script("build_dell_image.py", *command)
+        profile = Path(subprocess.check_output(
+            ["nix-build", "--no-out-link", ROOT / "nix/hardware-network-packages.nix",
+             "-A", "profile"], cwd=ROOT, text=True).strip())
+        selection = None
+    else:
+        config_path = output / "selection-config.json"
+        config_path.write_text(json.dumps(args.config, indent=2, sort_keys=True) + "\n")
+        script("build_dell_image.py", *command, "--app-selection-config", config_path)
+        selection = args.selection
+        profile = realize(args.config, selection)
+        (output / "profile-selection.json").write_text(
+            json.dumps(selection, indent=2, sort_keys=True) + "\n")
+    kernel = read_kernel_capabilities(pair / "kernel.elf")
+    (output / "brook-image.json").write_text(json.dumps({
+        "schema": "brook-image/1",
+        "target": args.target,
+        "profile": str(profile),
+        "closure": closure_receipt(profile),
+        "kernel": kernel,
+        "redistributable": bool(selection and selection["manifest"]["redistributable"]),
+        "image_manifest": "pair/build-manifest.json",
+    }, indent=2, sort_keys=True) + "\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list-apps", action="store_true")
-    parser.add_argument("--target", choices=("qemu", "vmware"))
+    parser.add_argument("--target", choices=("qemu", "vmware", "dell-pair"))
     parser.add_argument("--apps", type=csv_list, help="Comma-separated selection; empty selects the base")
     parser.add_argument("--packages", type=csv_list, default=[], help="Additional nixpkgs CLI packages")
     parser.add_argument("--data-mib", type=size, help="Store capacity, in MiB or auto (default)")
@@ -131,6 +169,9 @@ def main():
     parser.add_argument("--network", choices=("hostonly", "nat"), default="hostonly")
     parser.add_argument("--autofit", action="store_true", help="Enable VMware host resize hints")
     parser.add_argument("--payload-id", help="Payload identifier for a guarded build")
+    parser.add_argument("--dell-shared", type=Path, help="Private Dell pair source assets")
+    parser.add_argument("--kernel-option", action="append", default=[],
+                        help="Override a Dell pair kernel option (repeatable)")
     args = parser.parse_args()
     if args.list_apps:
         print(json.dumps(nix_json(ROOT / "nix/app-registry.nix", "-A", "metadata"),
@@ -142,8 +183,12 @@ def main():
         parser.error("--output must be a new directory")
     if args.target == "vmware" and (not args.operator_policy or not args.recovery_checkers_from):
         parser.error("VMware requires --operator-policy and --recovery-checkers-from")
-    if args.target == "vmware" and args.build is not None:
-        parser.error("The VMware builder compiles its exact guarded kernel")
+    if args.target in ("vmware", "dell-pair") and args.build is not None:
+        parser.error("The guarded target compiles its exact kernel")
+    if args.target != "dell-pair" and (args.dell_shared or args.kernel_option):
+        parser.error("Dell kernel settings require --target dell-pair")
+    if args.target == "dell-pair" and args.data_mib is not None:
+        parser.error("The Dell pair uses the existing persistent volume")
     if args.public_release and (args.target != "qemu" or args.apps is not None or args.packages or args.allow_unfree):
         parser.error("The public release requires its fixed free-package profile")
     if args.allow_unfree and args.apps is None and not args.packages:
@@ -161,7 +206,7 @@ def main():
                 "publicRelease": args.public_release,
             }
             args.selection = evaluate(args.config)
-        {"qemu": build_qemu, "vmware": build_vmware}[args.target](args)
+        {"qemu": build_qemu, "vmware": build_vmware, "dell-pair": build_dell_pair}[args.target](args)
     except (ValueError, KeyError, OSError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"brook_image: {error}\n")
 
