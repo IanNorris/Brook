@@ -58,7 +58,10 @@ void ChromeBuildFrame(const ChromeFrameModel& m, const ChromeStyle& s, ChromeDis
             const uint32_t idle = m.focused ? ink : ChromeMix(ink, strip, 100);
             const uint32_t hoverBg = 0xff000000u | ChromeMix(strip, ink, 28);
             const unsigned radius = m.maximised ? 0 : DesktopCaptionStyleRadius(m.captionStyle);
-            dl.CornerFill(block.x, block.y, block.w, block.h, strip, block, radius);
+            if (m.captionStrip && m.captionStrip->count >= static_cast<unsigned>(block.h))
+                dl.CornerRows(block, radius, m.captionStrip->rgb);
+            else
+                dl.CornerFill(block.x, block.y, block.w, block.h, strip, block, radius);
             CaptionButtons(dl, s, m, idle, hoverBg, ink);
             return;
         }

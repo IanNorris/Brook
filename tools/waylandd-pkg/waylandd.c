@@ -1,6 +1,7 @@
 #include "toplevel-size.h"
 #include "latency-stats.h"
 #include "wm-input-abi.h"
+#include "brook-caption-strip.h"
 
 #include <stddef.h>
 /*
@@ -219,8 +220,13 @@ static long wm_resize_vfb(uint32_t id, uint32_t w, uint32_t h,
 }
 /* mode 0 server side, 1 client side, 2 client side with Brook's caption
  * buttons overlaid at the top-right; insets = right | top << 16 (VFB px). */
+static long wm_set_decoration(uint32_t id, int mode, uint32_t insets, uint32_t height,
+                              uint32_t style, const BrookCaptionStrip *strip) {
+    return syscall(BROOK_SYS_WM_SET_DECORATION_MODE, (long)id, (long)mode,
+                   (long)insets, (long)height, (long)style, (long)strip);
+}
 static long wm_set_decoration_mode(uint32_t id, int mode, uint32_t insets, uint32_t height, uint32_t style) {
-    return syscall(BROOK_SYS_WM_SET_DECORATION_MODE, (long)id, (long)mode, (long)insets, (long)height, (long)style);
+    return wm_set_decoration(id, mode, insets, height, style, NULL);
 }
 static long wm_begin_move(uint32_t id) {
     return syscall(BROOK_SYS_WM_BEGIN_MOVE, (long)id);
@@ -492,6 +498,7 @@ struct brook_surface {
      * sampled from the client's buffer (packed for syscall 512), when the
      * next sample is due, and a newest GPU frame still waiting to be read. */
     uint32_t strip_style, strip_last_ms;
+    BrookCaptionStrip strip, deco_sent_strip;
     int strip_due, strip_trailing;
     struct brook_image *strip_retry;
     unsigned strip_retry_count;
@@ -2746,7 +2753,7 @@ static int deco_caption_overlay_app(const struct brook_surface *s) {
     }
     return -1;
 }
-static int g_caption_overlay_unsupported;
+static int g_caption_overlay_unsupported, g_caption_rows_unsupported;
 /* The kernel needs the client's shadow margin to place the buttons on its
  * visible frame: the surface's right/top edges to the window geometry. */
 static uint32_t deco_caption_insets(const struct brook_surface *s) {
@@ -2760,70 +2767,102 @@ static uint32_t deco_caption_insets(const struct brook_surface *s) {
     if (top > 0xFFFF) top = 0xFFFF;
     return (uint32_t)right | ((uint32_t)top << 16);
 }
-/* ---- Caption style sampled from the client's own title strip ----
- * Brook's overlaid caption buttons take the colour of the strip beneath them
- * (Chromium's frame colour: theme, dark mode, incognito, focused or not), as
- * macOS and Windows Controls Overlay draw system controls over app-drawn title
- * areas. A few pixels 3 px inside the strip's right edge are read (the client's
- * own buttons never hover there: Brook owns that pointer area), plus the alpha
- * along the strip's top row, which gives the frame's rounded-corner radius.
- * Samples are taken when due (map, resize, focus change) and at most every
- * 500 ms otherwise. A GPU frame is read only once its producer is idle and its
- * cache is synchronised (TRY_CPU_READ never sleeps); a busy newest frame is
- * retried from a short timer. */
+/* Match each physical row of the client's title strip, including the thin
+ * top highlight and the divider. The client owns the strip and reserves
+ * space for its controls. Sampling beside Brook's block avoids reading its
+ * glyphs; the edge outside the client's controls gives a second sample.
+ * Intel samples share one nonblocking cache sync and mapping per image. */
 enum { STRIP_SAMPLE_MS=500, STRIP_RETRY_MS=20, STRIP_RETRY_LIMIT=25 };
 static struct wl_event_source *g_strip_timer;
-static int strip_read(struct brook_image *im, const uint32_t *xs, uint32_t y, unsigned n, uint32_t *out) {
-    if (!im || y >= im->height) return 0;
-    for (unsigned i=0;i<n;++i) if (xs[i] >= im->width) return 0;
+struct strip_pixels {
+    const uint32_t *base;
+    uint32_t stride, alpha;
+    void *mapping;
+    size_t length;
+};
+static int strip_pixels_open(struct brook_image *im, uint32_t bottom, struct strip_pixels *out) {
     if (im->pixels) {
-        for (unsigned i=0;i<n;++i) out[i]=im->pixels[(size_t)y*im->width+xs[i]];
+        *out=(struct strip_pixels){.base=im->pixels,.stride=im->width};
         return 1;
     }
     const struct brook_dmabuf_buffer *db=im->source?im->source->dmabuf:NULL;
-    if (!g_drm_intel || !db || db->modifier || im->pending_fd<0 || im->uncertain || (db->stride&3)) return 0;
-    errno=0;long ready=syscall(BROOK_SYS_GPU_BUFFER_TRY_CPU_READ,(long)im->pending_fd,0L,0L,0L,0L,0L);
+    if (!g_drm_intel || !db || db->modifier || im->pending_fd<0 || im->uncertain ||
+        (db->stride&3) || (db->offset&3) || db->stride/4<im->width) return 0;
+    errno=0;
+    long ready=syscall(BROOK_SYS_GPU_BUFFER_TRY_CPU_READ,(long)im->pending_fd,0L,0L,0L,0L,0L);
     if (ready<0) return errno==EAGAIN || errno==EINTR ? -1 : 0;
     if (ready) return 0;
     struct { uint32_t handle,pad;uint64_t offset,flags,extensions; } map={db->bo_handle,0,0,2,0};
     /* DRM_IOCTL_I915_GEM_MMAP_OFFSET (write-back), as intel_dmabuf_copy. */
     if (ioctl(g_drm_fd,((3u<<30)|((unsigned)sizeof(map)<<16)|('d'<<8)|0x64u),&map)) return 0;
-    uint64_t bytes=(uint64_t)db->offset+(uint64_t)db->stride*(y+1);
-    size_t length=(size_t)((bytes+4095)&~UINT64_C(4095));
+    const uint64_t bytes=(uint64_t)db->offset+(uint64_t)db->stride*bottom;
+    if (bytes>SIZE_MAX-4095u) return 0;
+    const size_t length=(size_t)((bytes+4095u)&~UINT64_C(4095));
     void *p=mmap(NULL,length,PROT_READ,MAP_SHARED,g_drm_fd,(off_t)map.offset);
     if (p==MAP_FAILED) return 0;
-    const uint32_t *row=(const uint32_t *)((const uint8_t *)p+db->offset+(size_t)db->stride*y);
-    const int opaque=db->fourcc==0x34325258;
-    for (unsigned i=0;i<n;++i) out[i]=row[xs[i]]|(opaque?0xff000000u:0);
-    munmap(p,length);return 1;
+    *out=(struct strip_pixels){.base=(const uint32_t *)((const uint8_t *)p+db->offset),
+        .stride=db->stride/4,.alpha=db->fourcc==0x34325258?0xff000000u:0,
+        .mapping=p,.length=length};
+    return 1;
+}
+static uint32_t strip_pixel(const struct strip_pixels *p, uint32_t x, uint32_t y) {
+    return p->base[(size_t)y*p->stride+x]|p->alpha;
+}
+static uint32_t strip_majority(uint32_t a, uint32_t b, uint32_t c) {
+    if ((a>>24)==255 && (a==b || a==c)) return a;
+    return (b>>24)==255 && b==c ? b : 0;
 }
 /* 1 sampled, 0 not possible, -1 busy (retry later). */
 static int strip_sample(struct brook_surface *s, struct brook_image *im) {
-    struct brook_view *view=s->tree.current?s->tree.current->value:NULL;
+    const struct brook_view *view=s->tree.current?s->tree.current->value:NULL;
     const int strip=deco_caption_overlay_app(s);
     if (!view || !im || !view->geometry.w || s->window_geometry_w<=0 || strip<=0) return 0;
     const uint32_t bs=im->width/view->geometry.w?im->width/view->geometry.w:1;
-    const int64_t right=((int64_t)s->window_geometry_x+s->window_geometry_w)*bs,top=(int64_t)s->window_geometry_y*bs;
-    if (right<8 || top<0 || right>(int64_t)im->width) return 0;
-    uint32_t xs[32],px[32];
-    for (unsigned i=0;i<3;++i) xs[i]=(uint32_t)(right-3-i);
-    int r=strip_read(im,xs,(uint32_t)(top+(int64_t)strip*bs/2),3,px);
+    const int64_t right=((int64_t)s->window_geometry_x+s->window_geometry_w)*bs;
+    const int64_t top=(int64_t)s->window_geometry_y*bs;
+    const int64_t strip_buffer=(int64_t)strip*bs, bottom=top+strip_buffer;
+    if (right<8 || top<0 || right>(int64_t)im->width || bottom>im->height) return 0;
+
+    struct strip_pixels pixels;
+    int r=strip_pixels_open(im,(uint32_t)bottom,&pixels);
     if (r<=0) return r;
-    uint32_t colour=0;int found=0;
-    for (unsigned i=0;i<3 && !found;++i) {
-        unsigned same=0;
-        for (unsigned j=0;j<3;++j) same+=(px[j]&0xffffffu)==(px[i]&0xffffffu) && (px[j]>>24)==255;
-        if ((px[i]>>24)==255 && same>=2) { colour=px[i]&0xffffffu;found=1; }
+    const uint32_t middle=(uint32_t)(top+strip_buffer/2);
+    const uint32_t colour=strip_majority(strip_pixel(&pixels,right-3,middle),
+        strip_pixel(&pixels,right-4,middle),strip_pixel(&pixels,right-5,middle));
+    if (colour) {
+        const uint32_t scale=surface_output_scale(s);
+        unsigned radius=0;
+        const unsigned span=right>=32?32:(unsigned)right;
+        while (radius<span && (strip_pixel(&pixels,right-1-radius,top)>>24)<128) ++radius;
+        unsigned physical=radius*scale/bs;
+        if (physical>127) physical=127;
+        s->strip_style=(colour&0xffffffu)|(1u<<24)|(physical<<25);
+        s->strip.count=0;
+
+        const uint64_t physical_height=(uint64_t)strip*scale;
+        if (physical_height<=BROOK_CAPTION_STRIP_MAX_ROWS) {
+            long desktop_percent=syscall(0xB04,2L,0L,0L,0L,0L,0L);
+            if (desktop_percent<100 || desktop_percent>200) desktop_percent=100;
+            uint32_t width=(BROOK_CAPTION_BUTTON_LOGICAL_WIDTH*desktop_percent+50)/100;
+            const uint32_t available=s->vfb_w-(deco_caption_insets(s)&0xffffu);
+            if (width*3>available) width=available/3;
+            const int64_t edge=right-(int64_t)width*3*bs/scale;
+            for (uint32_t row=0;row<physical_height;++row) {
+                const uint32_t y=(uint32_t)top+row*bs/scale;
+                uint32_t rgb=0;
+                if (edge>=9 && edge<=right-3)
+                    rgb=strip_majority(strip_pixel(&pixels,edge-1,y),
+                        strip_pixel(&pixels,edge-5,y),strip_pixel(&pixels,edge-9,y));
+                if (!rgb)
+                    rgb=strip_majority(strip_pixel(&pixels,right-3,y),
+                        strip_pixel(&pixels,right-4,y),strip_pixel(&pixels,right-5,y));
+                s->strip.rgb[row]=(rgb?rgb:colour)&0xffffffu;
+            }
+            s->strip.count=(uint32_t)physical_height;
+        }
     }
-    if (!found) return 0;
-    unsigned radius=0;const unsigned span=right>=32?32:(unsigned)right;
-    for (unsigned i=0;i<span;++i) xs[i]=(uint32_t)(right-1-i);
-    if (strip_read(im,xs,(uint32_t)top,span,px)==1)
-        while (radius<span && (px[radius]>>24)<128) ++radius;
-    uint64_t physical=(uint64_t)radius*surface_output_scale(s)/bs;
-    if (physical>127) physical=127;
-    s->strip_style=colour|(1u<<24)|((uint32_t)physical<<25);
-    return 1;
+    if (pixels.mapping) munmap(pixels.mapping,pixels.length);
+    return colour!=0;
 }
 static void surface_sync_decoration(struct brook_surface *s, int force);
 static void strip_retry_drop(struct brook_surface *s) {
@@ -2838,9 +2877,8 @@ static int strip_timer_tick(void *data) {
             /* A commit inside the throttle window was skipped: sample the
              * latest frame now, so an idle client's last change is seen. */
             s->strip_trailing=0;s->strip_due=1;
-            const uint32_t before=s->strip_style;
             surface_strip_commit(s,NULL);
-            if (s->strip_style!=before && s->deco_sent_mode==2) surface_sync_decoration(s,0);
+            if (s->deco_sent_mode==2) surface_sync_decoration(s,0);
             if (s->strip_retry) again=1;
             continue;
         }
@@ -2897,10 +2935,20 @@ static void surface_sync_decoration(struct brook_surface *s, int force) {
         height = physical > 0xFFFF ? 0xFFFF : (uint32_t)physical;
         style = s->strip_style;
     }
+    const BrookCaptionStrip *rows =
+        mode == 2 && !g_caption_rows_unsupported && height && s->strip.count == height ? &s->strip : NULL;
+    const uint32_t row_count = rows ? rows->count : 0;
     if (mode != 2) s->strip_due = 1;
     if (!force && mode == s->deco_sent_mode && insets == s->deco_sent_insets &&
-        height == s->deco_sent_height && style == s->deco_sent_style) return;
-    long rc = wm_set_decoration_mode(s->wm_id, mode, insets, height, style);
+        height == s->deco_sent_height && style == s->deco_sent_style &&
+        row_count == s->deco_sent_strip.count &&
+        (!rows || !memcmp(rows->rgb, s->deco_sent_strip.rgb, row_count*sizeof(uint32_t)))) return;
+    long rc = wm_set_decoration(s->wm_id, rows ? 3 : mode, insets, height, style, rows);
+    if (rows && rc != 3) {
+        g_caption_rows_unsupported = 1;
+        rows = NULL;
+        rc = wm_set_decoration_mode(s->wm_id, mode, insets, height, style);
+    }
     if (mode == 2 && rc == 0) {
         /* An older kernel treats mode 2 as plain CSD: stop asking. */
         g_caption_overlay_unsupported = 1;
@@ -2910,13 +2958,15 @@ static void surface_sync_decoration(struct brook_surface *s, int force) {
         fprintf(stderr, "[waylandd] decoration wm=%u mode=%s insets=%u,%u height=%u rc=%ld\n", s->wm_id,
                 mode == 2 ? "client_side+captions" : mode ? "client_side" : "server_side",
                 insets & 0xFFFF, insets >> 16, height, rc);
-    if (style != s->deco_sent_style)
-        fprintf(stderr, "[waylandd] caption style wm=%u strip=#%06x radius=%u\n", s->wm_id,
-                style & 0xFFFFFF, style >> 25);
+    const uint32_t sent_rows = rows ? rows->count : 0;
+    if (style != s->deco_sent_style || sent_rows != s->deco_sent_strip.count)
+        fprintf(stderr, "[waylandd] caption style wm=%u strip=#%06x radius=%u rows=%u\n", s->wm_id,
+                style & 0xFFFFFF, style >> 25, sent_rows);
     s->deco_sent_mode = mode;
     s->deco_sent_insets = insets;
     s->deco_sent_height = height;
     s->deco_sent_style = style;
+    if (rows) s->deco_sent_strip=*rows; else s->deco_sent_strip.count=0;
 }
 static void surface_apply_decoration(struct brook_surface *s, int csd) {
     if (!s) return;

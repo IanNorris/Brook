@@ -4,6 +4,7 @@
 // fills the model from its window (window.cpp); host tests fill it directly.
 // Freestanding.
 #include <stdint.h>
+#include "../../shared/brook_caption_strip.h"
 #include "chrome_layout.h"
 #include "chrome_style.h"
 
@@ -18,6 +19,7 @@ struct ChromeFrameModel {
     const char* title;
     const uint32_t* icon;     // window icon (borrowed); null: missing glyph
     int32_t mouseX, mouseY;   // hover; a button is hovered anywhere in its hit rect
+    const BrookCaptionStrip* captionStrip = nullptr;
 };
 
 void ChromeBuildFrame(const ChromeFrameModel& model, const ChromeStyle& style, ChromeDisplayList& out);

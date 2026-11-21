@@ -1,4 +1,5 @@
 #pragma once
+#include "../../shared/brook_caption_strip.h"
 #include "launcher_model.h"
 
 #include <stdint.h>
@@ -197,6 +198,8 @@ struct Window
     bool        captionOverlay;
     uint16_t    captionInsetRight,captionInsetTop;
     uint16_t    captionHeight;  // client's title-strip height (physical px); 0 = native title height
+    BrookCaptionStrip captionStrip;
+    uint64_t captionStripRevision;
     uint32_t    captionStyle;   // DesktopCaptionStyle* packing; 0 = native title style
     bool        focusable;      // popups/tooltips stay above but don't take keyboard focus
     char        title[64];      // original title from the client
@@ -437,7 +440,8 @@ int WmApplyDebugAction(uint32_t id,uint64_t incarnation,WmDebugAction action,
 // inset from the surface edges by insetRight/insetTop physical pixels.
 void WmSetClientSideDecoration(int idx, bool enable, bool captionOverlay=false,
                                uint16_t insetRight=0, uint16_t insetTop=0,
-                               uint16_t captionHeight=0, uint32_t captionStyle=0);
+                               uint16_t captionHeight=0, uint32_t captionStyle=0,
+                               const BrookCaptionStrip* strip=nullptr);
 // Screen rectangle of a window's overlaid caption buttons (empty if none).
 WmRect WmCaptionOverlayRect(const Window& w);
 

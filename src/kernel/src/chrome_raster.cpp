@@ -212,14 +212,15 @@ void ChromeExecute(const ChromeDisplayList& list, const ChromeTarget& base, cons
                 ChromeFillRect(t, c.x, c.y + row, c.w, 1, static_cast<const uint32_t*>(c.data)[row]);
             break;
         case ChromeOp::CornerFill:
-            if (!c.arg) { ChromeFillRect(t, c.x, c.y, c.w, c.h, c.color); break; }
+            if (!c.arg && !c.data) { ChromeFillRect(t, c.x, c.y, c.w, c.h, c.color); break; }
             for (int row = c.y; row < c.y + c.h; ++row)
             {
                 const int r = row - c.clip.y;
                 const int right = c.clip.x + c.clip.w -
                     (r >= 0 ? static_cast<int>(ChromeCornerInset(c.arg, static_cast<unsigned>(r))) : 0);
                 const int end = c.x + c.w < right ? c.x + c.w : right;
-                if (end > c.x) ChromeFillRect(t, c.x, row, end - c.x, 1, c.color);
+                const uint32_t color = c.data ? 0xff000000u | static_cast<const uint32_t*>(c.data)[row - c.y] : c.color;
+                if (end > c.x) ChromeFillRect(t, c.x, row, end - c.x, 1, color);
             }
             break;
         case ChromeOp::MaterialOutline:

@@ -12,7 +12,8 @@ namespace {
 struct FakeWm {
     bool exists=false;
     bool fineScroll=false;
-    unsigned creates=0,destroys=0,titles=0,resizes=0;
+    unsigned creates=0,destroys=0,titles=0,resizes=0,decorationChanges=0;
+    BrookCaptionStrip captionStrip{};
     char title[64]{};
     brook::Window::WmInputEvent queue[300]{};
     uint32_t head=0,tail=0;
@@ -38,7 +39,10 @@ WmCreateWindowResult WmCreateWindowForProcess(Process*,uint16_t,uint16_t,const c
     WmCreateWindowResult result{};result.wmId=3;result.vfbStride=4096;
     result.vfbUser=reinterpret_cast<void*>(0x40000000);return result;
 }
-void WmSetClientSideDecoration(int,bool,bool,uint16_t,uint16_t,uint16_t,uint32_t) {}
+void WmSetClientSideDecoration(int,bool,bool,uint16_t,uint16_t,uint16_t,uint32_t,const BrookCaptionStrip* strip) {
+    ++g_wm.decorationChanges;
+    g_wm.captionStrip = strip ? *strip : BrookCaptionStrip{};
+}
 void WmDestroyWindowById(Process*,uint32_t) { ++g_wm.destroys;g_wm.exists=false; }
 void WmSetTitleById(Process*,uint32_t,const char* title) { ++g_wm.titles;for(int i=0;i<64;++i)g_wm.title[i]=title[i]; }
 int WmResizeVfbForProcess(Process*,uint32_t wmId,uint16_t,uint16_t,WmCreateWindowResult* out) {
@@ -201,7 +205,25 @@ static void RejectWindowCapture() {
     proc->userNamespace=nullptr;
 }
 
+static void CaptionStripCopy() {
+    Reset(); ResetProcess(); g_wm.Reset(); g_wm.exists = true;
+    constexpr uint32_t style = brook::DesktopCaptionStyleValid | 0xddddu;
+    const uint64_t user = UserAddress(0);
+    auto* strip = reinterpret_cast<BrookCaptionStrip*>(user);
+    strip->count = 2;
+    strip->rgb[0] = 0xf9f8f8;
+    CHECK(brook::sys_brook_wm_set_decoration_mode(3,3,0,2,style,user) == 3);
+    CHECK(g_wm.decorationChanges == 1 && g_wm.captionStrip.rgb[0] == 0xf9f8f8);
+    CHECK(brook::sys_brook_wm_set_decoration_mode(3,3,0,2,style,g_kernel.Address()) == -brook::EFAULT);
+    CHECK(brook::sys_brook_wm_set_decoration_mode(3,3,0,1,style,user) == -brook::EINVAL);
+    CHECK(g_wm.decorationChanges == 1);
+    // Legacy mode ignores the sixth argument, which older callers omitted.
+    CHECK(brook::sys_brook_wm_set_decoration_mode(3,2,0,2,style,g_kernel.Address()) == 2);
+    CHECK(g_wm.decorationChanges == 2 && g_wm.captionStrip.count == 0);
+}
+
 void RunInputWmTests() {
+    CaptionStripCopy();
     InputPop();
     CreateWindow();
     RejectWindowCapture();

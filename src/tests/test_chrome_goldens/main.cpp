@@ -200,6 +200,54 @@ void Frames(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) 
     }
 }
 
+// Light Chromium CSD at 200%. The reference rows come from the client
+// side of the seam, including the two-pixel highlight and divider.
+void ChromiumCaptionStrip(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
+    const BrookCaptionStrip strip{80,{
+        0xf9f8f8u, 0xf9f8f8u, 0xe1dedbu, 0xe1dedbu, 0xe1dedau, 0xe1dddau, 0xe0dddau, 0xe0dddau,
+        0xe0dddau, 0xe0dddau, 0xe0dddau, 0xe0dddau, 0xe0dddau, 0xe0ddd9u, 0xe0ddd9u, 0xe0dcd9u,
+        0xe0dcd9u, 0xdfdcd9u, 0xdfdcd9u, 0xdfdcd9u, 0xdfdcd9u, 0xdfdcd9u, 0xdfdcd8u, 0xdfdcd8u,
+        0xdfdcd8u, 0xdfdbd8u, 0xdfdbd8u, 0xdfdbd8u, 0xdfdbd8u, 0xdedbd8u, 0xdedbd8u, 0xdedbd7u,
+        0xdedbd7u, 0xdedbd7u, 0xdedbd7u, 0xdedad7u, 0xdedad7u, 0xdedad7u, 0xdedad7u, 0xdedad7u,
+        0xdddad6u, 0xdddad6u, 0xdddad6u, 0xdddad6u, 0xdddad6u, 0xddd9d6u, 0xddd9d6u, 0xddd9d6u,
+        0xddd9d6u, 0xddd9d5u, 0xddd9d5u, 0xdcd9d5u, 0xdcd9d5u, 0xdcd9d5u, 0xdcd9d5u, 0xdcd8d5u,
+        0xdcd8d5u, 0xdcd8d5u, 0xdcd8d4u, 0xdcd8d4u, 0xdcd8d4u, 0xdcd8d4u, 0xdcd8d4u, 0xdbd8d4u,
+        0xdbd8d4u, 0xdbd7d4u, 0xdbd7d4u, 0xdbd7d3u, 0xdbd7d3u, 0xdbd7d3u, 0xdbd7d3u, 0xdbd7d3u,
+        0xdbd7d3u, 0xdbd7d3u, 0xdad7d3u, 0xdad6d3u, 0xdad6d2u, 0xdad6d2u, 0xb0afafu, 0xb0afafu
+    }};
+    const int width=m.pixels(220), stripHeight=static_cast<int>(strip.count);
+    const DesktopWindowGeometry geometry{0,0,width,m.pixels(80),true,true,0,0,stripHeight};
+    const ChromeStyle style=StyleFor(theme,m,false);
+    ChromeFrameModel model{};
+    model.layout=ChromeFrameLayout({geometry,false,{}},m);
+    model.clientW=width;
+    model.clientDecorated=true;
+    model.focused=true;
+    model.captionStyle=DesktopCaptionStyleValid|strip.rgb[strip.count/2]|(16u<<25);
+    model.captionStrip=&strip;
+    const auto max=model.layout.Find(ChromePartRole::Maximise)->visual;
+    model.mouseX=max.x+max.w/2;
+    model.mouseY=max.y+max.h/2;
+
+    ChromeFrameStorage storage;
+    ChromeDisplayList list=ChromeListOn(storage);
+    const DesktopRect block=DesktopCaptionOverlayRect(geometry,m);
+    const DesktopRect nativeStrip{0,0,width,stripHeight};
+    list.CornerRows(nativeStrip,16,strip.rgb);
+    ChromeBuildFrame(model,style,list);
+    std::vector<uint32_t> pixels(static_cast<size_t>(width)*strip.count,0);
+    ChromeExecute(list,{pixels.data(),uint32_t(width),uint32_t(width),strip.count},*style.fonts);
+    for (uint32_t row=0;row<strip.count;++row) {
+        const uint32_t expected=0xff000000u|strip.rgb[row];
+        const size_t seam=static_cast<size_t>(row)*width+block.x;
+        if (pixels[seam-1]!=expected || pixels[seam]!=expected) {
+            std::fprintf(stderr,"Chromium caption seam differs at row %u\n",row);
+            ++failures;
+        }
+    }
+    Check(prefix+"chromium-caption-strip",list,style,0,0,width,stripHeight);
+}
+
 // --- Launcher ------------------------------------------------------------------
 
 // The prototype's sample catalog, filed by the default categories; a few
@@ -1073,6 +1121,9 @@ int main(int argc, char** argv) {
             if (theme.hue != BROOK_HUE_BLUE && m->percent != 100) continue;
             const std::string prefix = std::string(theme.name) + "-" + std::to_string(m->percent) + "-";
             Frames(prefix, theme.material, *m);
+            if (theme.material == BROOK_THEME_GLASS && theme.mode == BROOK_MODE_LIGHT &&
+                theme.hue == BROOK_HUE_BLUE && m->percent == 200)
+                ChromiumCaptionStrip(prefix,theme.material,*m);
             Shell(prefix, theme.material, *m);
             if (m->percent == 100 && theme.hue == BROOK_HUE_BLUE && theme.mode == BROOK_MODE_MIXED)
                 WebAppTitles(prefix, theme.material, *m);
