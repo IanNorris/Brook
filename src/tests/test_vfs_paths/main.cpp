@@ -171,6 +171,26 @@ bool ProcessCapable(Process* p,UserNamespace* target,unsigned capability) {
     return p && UserNamespaceCapable({p->userNamespace,p->euid,p->egid,p->capabilities.effective},target,capability);
 }
 bool ModuleRetainAddresses(const uintptr_t* addresses,uint32_t count){assert(addresses&&count);++providerCalls;return !rejectProvider;}
+static unsigned unmountViewChecks;
+static void checkUnmountView(const brook::MountEntry& mount,bool published)
+{
+    using namespace brook;
+    assert(mount.backing && allocations.count(mount.backing) && mount.backing->references);
+    const bool isRoot=!std::strcmp(mount.mountPoint,"/");
+    if(isRoot)assert((g_rootMount==&mount)==published);
+    const auto count=VfsMountNamespaceCount(mount.owner);
+    bool found=false;
+    for(uint32_t i=0;i<count;++i) {
+        const auto snapshot=VfsMountNamespaceSnapshotAt(mount.owner,i);
+        if(!snapshot.used || snapshot.publication!=mount.publication)continue;
+        assert(!found && !std::strcmp(snapshot.mountPoint,mount.mountPoint) &&
+               !std::strcmp(snapshot.fsType,mount.fsType));
+        assert(snapshot.drive==mount.backing->pdrv && snapshot.systemInternal==mount.backing->systemInternal);
+        found=true;
+    }
+    assert(found==published);
+    ++unmountViewChecks;
+}
 extern "C" void* kmalloc(uint64_t size){assert(!schedulerLockDepth);if(failAllocation==0){failAllocation=-1;return nullptr;}if(failAllocation>0)--failAllocation;void* p=std::malloc(size);if(p){std::memset(p,0xcc,size);std::lock_guard<std::mutex> lock(allocationLock);allocations.insert(p);}return p;}
 extern "C" void kfree(void* p){assert(!schedulerLockDepth);if(p){std::lock_guard<std::mutex> lock(allocationLock);assert(allocations.erase(p)==1);std::free(p);}}
 void WakeVfsCleanupWorker(){assert(!schedulerLockDepth);}
@@ -1268,7 +1288,9 @@ int main(){
     auto* sameBacking=g_rootMount->backing;assert(sameBacking->references==2);
     const auto syncBeforeAlias=syncCalls[6];assert(!VfsSync(nullptr));
     assert(syncCalls[6]==syncBeforeAlias+1);
-    assert(VfsUnmount("/same") && sameBacking->references==1);
+    g_vfsUnmountViewTest=checkUnmountView;
+    assert(VfsUnmount("/same") && sameBacking->references==1 && unmountViewChecks==2);
+    g_vfsUnmountViewTest=nullptr;
     VfsPath stableRoot{};assert(!VfsPathRoot(&stableRoot));
     const auto dynamicMountCalls=mountCalls[6];
     for(unsigned i=0;i<64;++i) {
@@ -1576,7 +1598,14 @@ int main(){
     __atomic_fetch_sub(&releasingRoot->pathHolds,uint64_t{1},__ATOMIC_RELEASE);
     assert(!VfsUnmount("/") && g_rootMount==releasingRoot && g_backings);
     VfsMountDrop(releasingRoot);
-    assert(VfsUnmount("/"));
+    g_vfsUnmountViewTest=checkUnmountView;
+    rejectUnmount[6]=true;
+    const auto mountBefore=VfsMountSnapshotAt(0);
+    assert(!VfsUnmount("/") && g_rootMount==releasingRoot && unmountViewChecks==2);
+    assert(VfsMountSnapshotAt(0).publication==mountBefore.publication && releasingRoot->backing->references==1);
+    rejectUnmount[6]=false;
+    assert(VfsUnmount("/") && unmountViewChecks==4);
+    g_vfsUnmountViewTest=nullptr;
     assert(!g_backings && !g_mounts.count);
     assert(allocations.empty());std::puts("VFS_PATHS_PASS rename/overmount/stacked-dotdot/root-clamp/virtual/rollback/unsupported/open-transfer");
 }

@@ -270,10 +270,11 @@ struct MountRegistry {
     MountEntry* At(uint32_t index) const {
         auto* node=head;while(node && index--)node=node->next;return node;
     }
-    void Publish(MountEntry* node) {
+    void Publish(MountEntry* node,bool isRoot=false) {
         VfsNoteMountLookupEdgesLocked(node->covered);
         auto flags=IrqSpinLockAcquire(&g_mountViewLock);
         node->next=head;head=node;++count;
+        if(isRoot)node->owner->root=node;
         IrqSpinLockRelease(&g_mountViewLock,flags);
     }
     void Remove(MountEntry* node) {
@@ -281,6 +282,7 @@ struct MountRegistry {
         auto** entry=&head;while(*entry && *entry!=node)entry=&(*entry)->next;
         if(!*entry || !count)__builtin_trap();
         *entry=node->next;node->next=nullptr;node->used=false;--count;
+        if(node->owner && node->owner->root==node)node->owner->root=nullptr;
         IrqSpinLockRelease(&g_mountViewLock,flags);
     }
 };
@@ -704,14 +706,16 @@ bool VfsMountConfiguredWithPublication(const char* mountPoint,const char* fsName
     slot->linked=isRoot || slot->covered.object;
     slot->publication=++g_mountPublication;
     slot->used=true;
-    g_mounts.Publish(slot);
-    if(isRoot)g_rootMount=slot;
+    g_mounts.Publish(slot,isRoot);
     if(publication)*publication=slot->publication;
 
     DbgPrintf("VFS: mounted '%s' at '%s' (pdrv=%u)\n", fsName, mountPoint, pdrv);
     return true;
 }
 
+#ifdef BROOK_HOST_TEST
+static void (*g_vfsUnmountViewTest)(const MountEntry&,bool);
+#endif
 bool VfsUnmount(const char* mountPoint)
 {
     VfsPath covered{};
@@ -736,11 +740,22 @@ bool VfsUnmount(const char* mountPoint)
         // combined lease. Only the combined count proves backing teardown safe.
         if(__atomic_load_n(&mount.referenceState,__ATOMIC_ACQUIRE)!=1)return false;
         if(mount.rootObject)return false; // arbitrary bind roots use namespace detach
-        if(VfsBackingDropLocked(mount.backing))return false;
-        mount.backing=nullptr;
-        covered=mount.covered;mount.covered={};
-        if(g_rootMount==selected)g_rootMount=nullptr;
-        g_mounts.Remove(selected);kfree(selected);
+        auto* backing=mount.backing;
+        if(!backing->references)__builtin_trap();
+        // Finish the fallible backend operation while the attachment still
+        // owns its backing. The short view readers only inspect metadata;
+        // lookups and backend operations wait on the mutation transaction.
+        if(backing->references==1 && VfsBackingUnmountLocked(backing))return false;
+#ifdef BROOK_HOST_TEST
+        if(g_vfsUnmountViewTest)g_vfsUnmountViewTest(mount,true);
+#endif
+        g_mounts.Remove(selected);
+#ifdef BROOK_HOST_TEST
+        if(g_vfsUnmountViewTest)g_vfsUnmountViewTest(mount,false);
+#endif
+        covered=mount.covered;
+        if(!--backing->references)VfsBackingFreeLocked(backing);
+        kfree(selected);
     }
     // Namespace edge is unpublished before its parent/object holds are dropped.
     VfsPathRelease(covered);
