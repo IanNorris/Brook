@@ -61,6 +61,9 @@ int main()
     assert(Pixel(65536, 1800) == 1799);
     assert(Pixel(32768, 1920) == 959);
     assert(Pixel(42, 1) == 0);
+    assert(RelativeDelta(0xfffffff9u) == -7);
+    assert(RelativeDelta(0xfffffff9u, true) == 7);
+    assert(RelativeDelta(0x80000000u, true) == 32767);
 
     device.packets.push_back({0x20 | 0x10, 0, 65535, 0xff});
     device.packets.push_back({0x10000 | 0x08, 3, 0xfffffffcu, 1});

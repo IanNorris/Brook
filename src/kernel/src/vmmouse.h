@@ -58,6 +58,13 @@ inline int32_t Pixel(uint32_t absolute, uint32_t extent)
     return static_cast<int32_t>(static_cast<uint64_t>(absolute) * (extent - 1) / 0xffffu);
 }
 
+inline int32_t RelativeDelta(uint32_t wireValue, bool invert = false)
+{
+    const int32_t value = static_cast<int32_t>(wireValue);
+    const int32_t bounded = value > 32767 ? 32767 : value < -32767 ? -32767 : value;
+    return invert ? -bounded : bounded;
+}
+
 template<class Call, class Emit>
 bool Drain(Call call, Emit emit)
 {

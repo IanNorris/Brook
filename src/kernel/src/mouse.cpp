@@ -118,6 +118,7 @@ static uint8_t           g_mouseId   = 0;   // 0=3-byte legacy, 3=IntelliMouse w
 static uint8_t           g_packetLen = 3;
 static bool              g_vmmouseActive = false;
 static bool              g_vmmouseRelative = false;
+static bool              g_vmmouseYUp = false;
 
 // Synaptics absolute mode (6-byte packets). g_synWanted is the runtime switch
 // (boot default on); g_synActive is set only after detection and mode set
@@ -240,13 +241,10 @@ static void DispatchVmMouse()
     }
     if (vmmouse::Drain(VmMouseCall, [captured](const vmmouse::Packet& packet) {
         if (packet.relative) {
-            const auto dx = static_cast<int32_t>(packet.x);
-            const auto dy = static_cast<int32_t>(packet.y);
-            // Relative VMMouse packets use PS/2's upward-positive Y.
-            // Keep each hardware event within one client input slot.
-            const int32_t right = dx > 32767 ? 32767 : dx < -32767 ? -32767 : dx;
-            const int32_t down = dy > 32767 ? -32767 : dy < -32767 ? 32767 : -dy;
-            EmitPointer(right, down, ClampTicks(packet.wheel), 0, packet.buttons);
+            // VMware follows PS/2's upward-positive Y. QEMU's VMMouse
+            // copies its input's downward-positive Y into the relative packet.
+            EmitPointer(vmmouse::RelativeDelta(packet.x), vmmouse::RelativeDelta(packet.y, g_vmmouseYUp),
+                        ClampTicks(packet.wheel), 0, packet.buttons);
         } else {
             const bool moved = !captured && SetNormalizedPosition(packet.x, packet.y);
             EmitPointer(0, 0, ClampTicks(packet.wheel), 0, packet.buttons, 0, 0, 0, moved);
@@ -644,10 +642,11 @@ void MouseInit()
     } guard; // command-byte responses must not be consumed by IRQ1
 
 
-    const bool vmPortPlatform = VmwarePortPlatformPresent(
-        [](uint32_t leaf, uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) {
-            __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(leaf), "c"(0));
-        });
+    const auto readCpuid = [](uint32_t leaf, uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) {
+        __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(leaf), "c"(0));
+    };
+    const bool vmPortPlatform = VmwarePortPlatformPresent(readCpuid);
+    g_vmmouseYUp = vmPortPlatform && VmwarePlatformPresent(readCpuid);
     if (vmPortPlatform && VmMouseCall(vmmouse::GetVersion, 0).b == vmmouse::Magic)
         VmMouseCall(vmmouse::Command, vmmouse::Disable);
 
