@@ -158,8 +158,8 @@ def main():
                       'run --service --once --uid 1000 --gid 100 /nix/profile/bin/brook-dbus --config-file=/nix/profile/bin/brook-session.conf --nofork --address=unix:path=/tmp/brook-session-bus --nosyslog\n'
                       'run --service --once --quiet --uid 1000 --gid 100 /nix/profile/bin/brook-message --watch\n'
                       'run --service --once /nix/profile/bin/waylandd\n')
-    # Brook deliberately skips the GPT ESP during kernel filesystem mounting.
-    # Keep the early /boot script and terminal shell in the loaded RAM disk.
+    # Virtio skips the GPT ESP. Leave the USB ESP without a mount marker
+    # so both layouts use the /boot files in the loaded RAM disk.
     initrd = stage / 'build/esp/INITRD.IMG'
     run('mmd', '-i', initrd, '::BOOT', '::BOOT/BIN', '::BOOT/SHORTCUTS')
     run('mcopy', '-i', initrd, script, '::BOOT/INIT.RC')
@@ -173,13 +173,15 @@ def main():
     run('mcopy', '-i', initrd, wallpaper, '::BOOT/WALLPAPER.RAW')
     cfg = stage / 'BROOK.CFG'
     cfg.write_text('TARGET=KERNEL\\BROOK.ELF\nDEBUG_TEXT=0\nLOG_MEMORY=0\nLOG_INTERRUPTS=0\n')
-    marker = stage / 'BROOK.MNT'
-    marker.write_text('/boot')
     exports = [(build / 'bootloader/BOOTX64.efi', '::EFI/BOOT/BOOTX64.EFI'),
                (build / 'kernel/BROOK.elf', '::KERNEL/BROOK.ELF'),
                (stage / 'build/esp/INITRD.IMG', '::INITRD.IMG'),
-               (script, '::INIT.RC'), (cfg, '::BROOK.CFG'), (marker, '::BROOK.MNT'),
-               (Path(metadata['profile']) / 'bin/bash', '::BIN/BASH')]
+               (script, '::INIT.RC'), (cfg, '::BROOK.CFG')]
+    if not args.usb:
+        marker = stage / 'BROOK.MNT'
+        marker.write_text('/boot')
+        exports.append((marker, '::BROOK.MNT'))
+    exports.append((Path(metadata['profile']) / 'bin/bash', '::BIN/BASH'))
     for source, target in exports:
         run('mcopy', '-i', esp, source, target)
     # Finalization is offline on fresh private copies; never mount or modify a
