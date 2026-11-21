@@ -11,6 +11,8 @@ import urllib.request
 from urllib.parse import quote
 from pathlib import Path
 
+from image_profile import load_selection, verify_realized_selection
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools/nix-install"))
 from stage_nar import STORE, UPSTREAM, layout_digest, nar_hash, profile_layout, store_name
@@ -131,11 +133,24 @@ def profile_metadata(expression):
     return json.loads(metadata.stdout)
 
 
+def selected_profile(receipt, requested=None):
+    selection = load_selection(receipt, requested)
+    profile = verify_realized_selection(selection)
+    exported = {entry.stem for entry in (profile / "share/applications").glob("*.desktop")
+                if entry.is_file()}
+    if exported != set(selection["manifest"]["launcherIds"]):
+        raise ValueError("Selected profile's desktop files differ from its launcher manifest")
+    return profile, selection["packages"]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", type=Path, help="defaults to the network hardware profile")
-    parser.add_argument("--expression", type=Path,
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--expression", type=Path,
                         help="profile expression providing package names and versions")
+    source.add_argument("--profile-selection", type=Path,
+                        help="profile-selection.json from brook_image.py for a realized selected profile")
     parser.add_argument("extras", nargs="*", type=Path)
     parser.add_argument("--output", required=True, type=Path)
     delivery = parser.add_mutually_exclusive_group(required=True)
@@ -150,20 +165,26 @@ def main():
 
     for key in (args.cache_key, args.plan_key):
         verify_private_key(key)
-    expression = (args.expression or EXPRESSION).resolve(strict=True)
-    if args.profile is None:
-        built = run(["nix-build", str(expression), "-A", "profile", "--no-out-link"],
-                    stdout=subprocess.PIPE, text=True)
-        profile = Path(built.stdout.strip())
+    if args.profile_selection is not None:
+        try:
+            profile, packages = selected_profile(args.profile_selection, args.profile)
+        except (KeyError, OSError, TypeError, ValueError) as error:
+            parser.error(f"Invalid profile selection: {error}")
     else:
-        profile = args.profile
-    profile = profile.resolve(strict=True)
-    packages = []
-    if args.profile is None or args.expression is not None:
-        metadata = profile_metadata(expression)
-        if str(profile) != metadata["profile"]:
-            parser.error("The profile does not match the expression")
-        packages = metadata["packages"]
+        expression = (args.expression or EXPRESSION).resolve(strict=True)
+        if args.profile is None:
+            built = run(["nix-build", str(expression), "-A", "profile", "--no-out-link"],
+                        stdout=subprocess.PIPE, text=True)
+            profile = Path(built.stdout.strip())
+        else:
+            profile = args.profile
+        profile = profile.resolve(strict=True)
+        packages = []
+        if args.profile is None or args.expression is not None:
+            metadata = profile_metadata(expression)
+            if str(profile) != metadata["profile"]:
+                parser.error("The profile does not match the expression")
+            packages = metadata["packages"]
     extras = [path.resolve(strict=True) for path in args.extras]
     output = args.output.absolute()
     output.mkdir(mode=0o700, parents=True, exist_ok=False)
