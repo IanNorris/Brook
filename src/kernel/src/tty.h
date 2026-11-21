@@ -18,6 +18,31 @@
 
 namespace brook {
 volatile uint32_t* TtyGetFramebufferMmio();
+bool TtyGetFramebufferDimensions(uint32_t* width, uint32_t* height, uint32_t* strideBytes);
+
+// The callback may access pixels only during this call. It must not sleep,
+// log to serial, or acquire display locks. Admission can fail during resize.
+using TtyFramebufferDrawer = void (*)(uint32_t* pixels, uint32_t width, uint32_t height,
+                                      uint32_t stridePixels, void* context);
+bool TtyTryDrawFramebuffer(TtyFramebufferDrawer draw, void* context);
+
+// The display owner closes admission, drains in process context, and
+// publishes the complete tuple before the destructor reopens admission.
+// None of these methods waits. The first transition must also exclude and
+// drain legacy raw-pointer consumers and serialize legacy TTY remaps.
+class TtyFramebufferUpdate {
+public:
+    TtyFramebufferUpdate();
+    ~TtyFramebufferUpdate();
+    TtyFramebufferUpdate(const TtyFramebufferUpdate&) = delete;
+    TtyFramebufferUpdate& operator=(const TtyFramebufferUpdate&) = delete;
+    explicit operator bool() const { return closed_; }
+    bool Drained() const;
+    bool Publish(uint64_t physical, volatile uint32_t* mmio, uint32_t* backbuffer,
+                 uint32_t width, uint32_t height, uint32_t stridePixels);
+private:
+    bool closed_;
+};
 
 // Initialise the TTY: maps the framebuffer into virtual address space,
 // clears it to the default background colour, and resets the cursor.
@@ -56,8 +81,9 @@ bool TtyReady();
 void TtySuppressDisplay(bool suppress);
 bool TtyDisplaySuppressed();
 
-// Retrieve framebuffer info for direct rendering (e.g. QR panic screen).
-// Returns false if TTY is not initialised.
+// Early legacy raw pointer, unavailable after the managed display handoff.
+// Legacy callers require external lifetime serialization. For drawing with
+// runtime replacement, use TtyTryDrawFramebuffer.
 extern "C" bool TtyGetFramebuffer(uint32_t** outPixels, uint32_t* outWidth,
                        uint32_t* outHeight, uint32_t* outStride);
 
