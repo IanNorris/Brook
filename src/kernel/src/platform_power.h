@@ -7,17 +7,19 @@ struct PowerIo {
     bool (*write8)(void*,uint16_t,uint8_t);
     bool (*write16)(void*,uint16_t,uint16_t);
     bool (*efiOff)(void*,uint64_t)=nullptr;
+    bool (*read16)(void*,uint16_t,uint16_t&)=nullptr;
 };
 struct PlatformPowerPlan {
     AcpiResetInfo firmwareReset{};
     bool q35Off=false,q35Reset=false,resetDisabledByLaunch=false;
     uint64_t efiEntry=0;
+    AcpiS5Info acpiS5{};
     bool CanReset() const {return !resetDisabledByLaunch && (firmwareReset.available || q35Reset);}
-    bool CanPowerOff() const {return q35Off || efiEntry;}
+    bool CanPowerOff() const {return q35Off || efiEntry || acpiS5.Available();}
     const char* ResetMethod() const {return resetDisabledByLaunch?"disabled":firmwareReset.available?"acpi-io8":q35Reset?"q35-io8":"unavailable";}
-    const char* PowerOffMethod() const {return efiEntry?"efi-runtime":q35Off?"q35-io16":"manual";}
+    const char* PowerOffMethod() const {return efiEntry?"efi-runtime":q35Off?"q35-io16":acpiS5.Available()?"acpi-s5":"manual";}
     const char* ResetReason() const {return resetDisabledByLaunch?"Reset disabled by stop-only launch policy":CanReset()?ResetMethod():firmwareReset.reason;}
-    const char* PowerOffReason() const {return efiEntry?"Validated firmware runtime opt-in":q35Off?"Explicit Q35 power-off opt-in":"Firmware power-off unavailable";}
+    const char* PowerOffReason() const {return efiEntry?"Validated firmware runtime opt-in":q35Off?"Explicit Q35 power-off opt-in":acpiS5.reason;}
     // Select once. In particular, failure of the advertised register never
     // triggers a speculative alternative reset port or register width.
     bool Issue(bool restart,const PowerIo& io) const {
@@ -28,6 +30,21 @@ struct PlatformPowerPlan {
             if(q35Reset)return io.write8 && io.write8(io.context,0xcf9,6);
         } else if(efiEntry)return io.efiOff && io.efiOff(io.context,efiEntry);
         else if(q35Off)return io.write16 && io.write16(io.context,0x604,0x2000);
+        else if(acpiS5.Available()) {
+            constexpr uint16_t sleepEnable=1u<<13,sleepType=7u<<10;
+            const auto a=acpiS5.controls.pm1a,b=acpiS5.controls.pm1b;
+            uint16_t oldA=0,oldB=0;
+            if(!io.read16 || !io.write16 || acpiS5.typeA>7 || acpiS5.typeB>7 ||
+               !io.read16(io.context,a,oldA) || !(oldA&1) || oldA==0xffff ||
+               (b && (!io.read16(io.context,b,oldB) || oldB==0xffff)))return false;
+            // Preserve unrelated writable fields. Stage both types before
+            // enabling sleep, in case the first enable immediately stops us.
+            const uint16_t typeA=(oldA&~(sleepEnable|sleepType)) | uint16_t(acpiS5.typeA)<<10;
+            const uint16_t typeB=(oldB&~(sleepEnable|sleepType)) | uint16_t(acpiS5.typeB)<<10;
+            if(!io.write16(io.context,a,typeA) || (b && !io.write16(io.context,b,typeB)))return false;
+            return io.write16(io.context,a,typeA|sleepEnable) &&
+                   (!b || io.write16(io.context,b,typeB|sleepEnable));
+        }
         return false;
     }
 };

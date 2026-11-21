@@ -607,7 +607,8 @@ struct DebugFrameGeometry {
     uint32_t width,height,stride;
 };
 struct BdwScanoutCaptureInfoCompat {uint32_t surface,control,stride,copyUs;};
-static void CaptureCompletedDebugFrame(uint64_t epoch,const DebugFrameGeometry& presented)
+static void CaptureCompletedDebugFrame(uint64_t epoch,const DebugFrameGeometry& presented,
+                                       bool softwareFrame = false)
 {
     CompositorMutexGuard guard(&g_debugFrameLock);
     ExpireDebugFrameLocked();
@@ -621,13 +622,14 @@ static void CaptureCompletedDebugFrame(uint64_t epoch,const DebugFrameGeometry& 
         return;
     }
     uint32_t width=presented.width,height=presented.height,stride=presented.stride;
+    const bool gpuFrame = !softwareFrame && CompositorGpuActive();
     const bool cursor=(g_debugFrameFlags&BROOK_DEBUG_FRAME_FLAG_CURSOR)!=0;
     uint32_t plane=BROOK_DEBUG_FRAME_PLANE_UNREAD,infoFlags=0;
     BdwScanoutCaptureInfoCompat planeInfo{};
 #if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
     // Read what the panel shows: zero-copy renderer images, kernel flip
     // buffers and direct client buffers replace the GOP on primary plane A.
-    if (!CompositorGpuActive() && width<=4096 && height<=2160) {
+    if (!gpuFrame && width<=4096 && height<=2160) {
         if (!EnsureDebugFrameBufferLocked(uint64_t(width)*height*4)) {g_debugFrame.state=DebugFrameState::Failed;return;}
         auto* destination=reinterpret_cast<uint32_t*>(g_debugFrameBuffer.raw());
         BdwScanoutCaptureInfo live{};
@@ -662,7 +664,7 @@ static void CaptureCompletedDebugFrame(uint64_t epoch,const DebugFrameGeometry& 
     // can also be written by legacy TTY/scanout aliases outside the renderer).
     const uint32_t* source=const_cast<const uint32_t*>(presented.pixels);
     uint32_t sourceKind=leased?BROOK_DEBUG_FRAME_SOURCE_LEASED:BROOK_DEBUG_FRAME_SOURCE_FRONT;
-    if (CompositorGpuActive()) {
+    if (gpuFrame) {
         const auto* gpu=GpuCompositorGet();
         if (!gpu || !gpu->CaptureFull) return;
         source=gpu->CaptureFull(&width,&height);stride=width;
@@ -3678,9 +3680,8 @@ static char* FormatUptime(char* buf, uint64_t totalSec)
     return buf;
 }
 
-static uint32_t ClockMeasureText(const char* text)
+static uint32_t MeasureConsoleText(const char* text, const FontAtlas& fa)
 {
-    const FontAtlas& fa = g_fontAtlas;
     uint32_t w = 0;
     while (*text)
     {
@@ -3693,12 +3694,10 @@ static uint32_t ClockMeasureText(const char* text)
     return w;
 }
 
-static void ClockDrawText(uint32_t* fb, uint32_t fbStride,
-                           uint32_t fbW, uint32_t fbH,
-                           const char* text, uint32_t px, uint32_t py,
-                           uint32_t colour)
+static void DrawConsoleText(uint32_t* fb, uint32_t fbStride, uint32_t fbW, uint32_t fbH,
+                            const char* text, uint32_t px, uint32_t py,
+                            uint32_t colour, const FontAtlas& fa)
 {
-    const FontAtlas& fa = g_fontAtlas;
     while (*text)
     {
         int code = static_cast<int>(static_cast<uint8_t>(*text));
@@ -3750,7 +3749,7 @@ static void CompositorDrawClock()
     constexpr uint32_t padding = 4;
     constexpr uint32_t colour = 0x00FF00; // green
     uint32_t lineH = static_cast<uint32_t>(g_fontAtlas.lineHeight);
-    uint32_t textW = ClockMeasureText(buf);
+    uint32_t textW = MeasureConsoleText(buf, g_fontAtlas);
     uint32_t x = g_physFbWidth - textW - padding;
     uint32_t y = padding;
 
@@ -3759,7 +3758,7 @@ static void CompositorDrawClock()
         for (uint32_t col = x > 2 ? x - 2 : 0; col < g_physFbWidth; ++col)
             dst[row * stride + col] = 0x000000;
 
-    ClockDrawText(dst, stride, g_physFbWidth, g_physFbHeight, buf, x, y, colour);
+    DrawConsoleText(dst, stride, g_physFbWidth, g_physFbHeight, buf, x, y, colour, g_fontAtlas);
     MarkDirtyRows(y, y + lineH + 2);
 }
 
@@ -4333,7 +4332,7 @@ static bool GopShadowEnsure()
     g_gopShadowWidth=g_physFbWidth;g_gopShadowHeight=g_physFbHeight;
     return true;
 }
-static void CompositorFlipSoftware(bool clientFrame = false, bool hardwareCursor = false)
+static bool CompositorFlipSoftware(bool clientFrame = false, bool hardwareCursor = false)
 {
     CompositorMutexGuard geometry(&g_scanoutMappingLock);
 #if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
@@ -4349,16 +4348,16 @@ static void CompositorFlipSoftware(bool clientFrame = false, bool hardwareCursor
     if(g_gopWriter || g_presentLease.Active(tick)){
         if (hardwareCursor) DisplayPrepareCursor(nullptr, 0, 0);
         if(g_gopShadowValid)GopShadowInvalidate();
-        return;
+        return false;
     }
-    if(!g_physFb || !g_backBuffer)return;
+    if(!g_physFb || !g_backBuffer)return false;
     if (!full && g_dirtyMinY >= g_dirtyMaxY) {
         if (hardwareCursor) DisplayCommitCursor();
-        return;
+        return true;
     }
     // The lease ended during this frame: its back buffer lacks the taskbar.
     // Keep the dirty span; the next frame repaints fully before scanout.
-    if(g_backBufferOverlayOmitted)return;
+    if(g_backBufferOverlayOmitted)return false;
     const bool shadow=GopShadowEnsure();
     if(!shadow)++g_idleStats.shadowUnavailable;
     // An untrusted shadow is refreshed by one complete frame, after which only
@@ -4370,7 +4369,7 @@ static void CompositorFlipSoftware(bool clientFrame = false, bool hardwareCursor
     uint32_t maxY=full?g_physFbHeight:g_dirtyMaxY;
     if(maxY>g_physFbHeight)maxY=g_physFbHeight;
     g_dirtyMinY=0xFFFFFFFFu;g_dirtyMaxY=0;
-    if(minY>=maxY)return;
+    if(minY>=maxY)return false;
     ++g_idleStats.softwareFlips;g_idleStats.rowsDirty+=maxY-minY;
     if(g_rendererCapsOwner)++g_cpuFramesOverRenderer; // a CPU frame while a renderer is registered
     const uint64_t rowBytes=uint64_t(g_physFbWidth)*4;
@@ -4405,7 +4404,53 @@ static void CompositorFlipSoftware(bool clientFrame = false, bool hardwareCursor
     if (hardwareCursor) DisplayCommitCursor();
     g_scanoutContainsLeasedFrame=false;
     if(minY==0 && maxY==g_physFbHeight)g_scanoutNeedsRepair=false;
+    return true;
 }
+
+// Called under the frame lock. Push a complete kernel-owned frame after any
+// renderer writer or lease has drained. The compositor no longer draws the desktop.
+static bool CompositorDrawManualPowerOff()
+{
+    static constexpr char message[] = "It's now safe to turn off this computer";
+    {
+        CompositorMutexGuard geometry(&g_scanoutMappingLock);
+        if (!g_physFb || !g_physFbWidth || !g_physFbHeight ||
+            g_gopWriter || g_presentLease.Active(ApicTickCount())) return false;
+        TtySuppressDisplay(true);
+        DisplayPowerSetIdle(0);
+        DisplayPrepareCursor(nullptr, 0, 0);
+        DisplayCommitCursor();
+#if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
+        BdwCursorUpdate(0, false, 0, 0, nullptr, 0, 0);
+#endif
+        g_cursorVisible = false;
+        auto* pixels = g_backBuffer ? g_backBuffer : const_cast<uint32_t*>(g_physFb);
+        const uint32_t stride = g_backBuffer ? g_backBufStride : g_physFbStride;
+        for (uint32_t y = 0; y < g_physFbHeight; ++y)
+            memset(pixels + y * stride, 0, g_physFbWidth * sizeof(*pixels));
+        const auto& font = MeasureConsoleText(message, g_desktopFont200) <= g_physFbWidth &&
+                           uint32_t(g_desktopFont200.lineHeight) <= g_physFbHeight ? g_desktopFont200 : g_fontAtlas;
+        const uint32_t width = MeasureConsoleText(message, font);
+        const uint32_t height = uint32_t(font.lineHeight);
+        const uint32_t x = g_physFbWidth > width ? (g_physFbWidth - width) / 2 : 0;
+        const uint32_t y = g_physFbHeight > height ? (g_physFbHeight - height) / 2 : 0;
+        DrawConsoleText(pixels, stride, g_physFbWidth, g_physFbHeight, message, x, y, 0xffffff, font);
+        if (!g_backBuffer) {
+#if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
+            BdwScanoutFlipReturnToGop();
+#endif
+            DisplayFlush(0, g_physFbHeight);
+            GopShadowInvalidate();
+            g_scanoutContainsLeasedFrame = false;
+            g_scanoutNeedsRepair = false;
+            return true;
+        }
+        g_backBufferOverlayOmitted = false;
+        MarkDirtyRows(0, g_physFbHeight);
+    }
+    return CompositorFlipSoftware();
+}
+
 CompositorIdleStats CompositorReadIdleStats(bool reset)
 {
     CompositorMutexGuard geometry(&g_scanoutMappingLock);
@@ -4418,6 +4463,16 @@ static void CompositorLoop()
     if (!g_physFb)
         return;
     CompositorExpirePresentLease();
+    if (ShutdownReadyForManualPowerOff()) {
+        static uint64_t presentedDisplay;
+        const uint64_t epoch = __atomic_add_fetch(&g_compositorEpoch, 1, __ATOMIC_ACQ_REL);
+        DrainDeferredPageFrees(epoch);
+        if (presentedDisplay != g_displayGeneration && CompositorDrawManualPowerOff())
+            presentedDisplay = g_displayGeneration;
+        if (presentedDisplay == g_displayGeneration)
+            CaptureCompletedDebugFrame(epoch, {g_physFb, g_physFbWidth, g_physFbHeight, g_physFbStride}, true);
+        return;
+    }
     ++g_idleStats.loops;
     g_backBufferOverlayOmitted=false;
     // Apply material changes at a frame boundary so chrome and GPU backdrops

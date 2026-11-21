@@ -79,6 +79,59 @@ static void TestLegacyPower(Firmware& f) {
     f.reset();
     assert(f.init());
 }
+static void TestSleepControls(Firmware& f)
+{
+    const uint8_t aml[]={0x08,0x5c,'_','S','5','_',0x12,0x06,0x02,0x0a,0x05,0x0a,0x03};
+    const auto addDsdt=[&] {
+        auto* dsdt=f.memory+16384;
+        Firmware::header(dsdt,"DSDT",36+sizeof(aml));
+        std::memcpy(dsdt+36,aml,sizeof(aml));
+        Firmware::checksum(dsdt,36+sizeof(aml),9);
+        Firmware::put64(f.fadt+140,Firmware::address(dsdt));
+        return dsdt;
+    };
+    const auto configure=[&](uint32_t a,uint32_t b) {
+        Firmware::put32(f.fadt+64,a);Firmware::put32(f.fadt+68,b);
+        f.fadt[89]=2;f.fadtCrc();
+    };
+    f.reset();
+    auto* dsdt=addDsdt();
+    configure(0x404,0);
+    assert(f.init());
+    auto s5=AcpiGetS5Info();
+    assert(s5.Available() && s5.controls.pm1a==0x404 && !s5.controls.pm1b &&
+           s5.typeA==5 && s5.typeB==3);
+    configure(0x404,0x504);
+    assert(f.init() && AcpiGetS5Info().controls.pm1b==0x504);
+    configure(0x404,0x404);
+    assert(f.init() && !AcpiGetS5Info().Available());
+    configure(0x405,0);
+    assert(f.init() && !AcpiGetS5Info().Available());
+    configure(0x404,0);
+    f.fadt[172]=0;f.fadt[173]=16;f.fadt[175]=2; // GAS System Memory
+    Firmware::put64(f.fadt+176,0x404);f.fadtCrc();
+    assert(f.init() && !AcpiGetS5Info().Available());
+    f.fadt[172]=1;f.fadtCrc();
+    assert(f.init() && AcpiGetS5Info().Available());
+    Firmware::put32(f.fadt+112,(1u<<10)|(1u<<20));f.fadtCrc();
+    assert(f.init() && !AcpiGetS5Info().Available());
+    Firmware::put32(f.fadt+112,1u<<10);f.fadtCrc();
+    dsdt[9]^=1;
+    assert(f.init() && !AcpiGetS5Info().Available());
+    dsdt[9]^=1;
+    auto* ssdt=f.memory+24576;
+    Firmware::header(ssdt,"SSDT",36+sizeof(aml));
+    std::memcpy(ssdt+36,aml,sizeof(aml));
+    Firmware::checksum(ssdt,36+sizeof(aml),9);
+    Firmware::put32(f.xsdt+4,60);
+    Firmware::put64(f.xsdt+52,Firmware::address(ssdt));
+    Firmware::checksum(f.xsdt,60,9);
+    assert(f.init() && !AcpiGetS5Info().Available()); // duplicate root definition
+    Firmware::put32(dsdt+4,36);Firmware::checksum(dsdt,36,9);
+    assert(f.init() && AcpiGetS5Info().Available()); // SSDT-only definition
+    f.reset();assert(f.init());
+}
+
 static void TestEmbeddedController() {
     struct Io {
         uint8_t trace[3]{};
@@ -138,6 +191,7 @@ int main(){
     TestDellMadtNormalize();
     Firmware f;assert(f.init());auto reset=AcpiGetResetInfo();assert(reset.available && reset.port==0xcf9 && reset.value==6);
     TestLegacyPower(f);
+    TestSleepControls(f);
     TestEmbeddedController();
     assert(!AcpiGetPmTimerInfo().available);
     Firmware::put32(f.fadt+76,0x408);f.fadt[91]=4;f.fadtCrc();assert(f.init());

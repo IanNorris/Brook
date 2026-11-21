@@ -38,6 +38,13 @@ struct AcpiLegacyPowerInfo {
     uint32_t smiCommand=0;
     uint8_t acpiEnable=0;
 };
+struct AcpiSleepControls { uint16_t pm1a=0,pm1b=0; };
+struct AcpiS5Info {
+    AcpiSleepControls controls{};
+    uint8_t typeA=0,typeB=0;
+    const char* reason="No validated ACPI S5 sleep data";
+    bool Available() const {return controls.pm1a!=0;}
+};
 struct AcpiSciRoute {
     bool available=false,activeLow=true;
     uint32_t gsi=0;
@@ -152,6 +159,21 @@ public:
         }
         if(!port || port>65532)return result;
         result.available=true;result.port=uint16_t(port);result.wide=(flags&(1u<<8))!=0;return result;
+    }
+    // Fully advertised 16-bit System I/O PM1 control registers only.
+    AcpiSleepControls SleepControls() const {
+        AcpiSdtHeader fadt{};
+        const uint64_t address=Find("FACP",&fadt);
+        if(!address || fadt.length<116)return {};
+        uint32_t flags=0,legacyA=0,legacyB=0;
+        uint8_t length=0;
+        if(!Copy(address+112,&flags,4) || (flags&(1u<<20)) ||
+           !Copy(address+64,&legacyA,4) || !Copy(address+68,&legacyB,4) ||
+           !Copy(address+89,&length,1) || length!=2)return {};
+        uint16_t a=0,b=0;
+        if(!ControlPort(address,fadt.length,172,legacyA,a) || !a ||
+           !ControlPort(address,fadt.length,184,legacyB,b) || a==b)return {};
+        return {a,b};
     }
     // Discover the fixed-register subset used by a legacy FACS Global Lock
     // owner. Hardware-reduced, MMIO and non-word control blocks are excluded.

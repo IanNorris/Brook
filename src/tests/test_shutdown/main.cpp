@@ -228,6 +228,7 @@ step();assert(!signals&&!syncs&&!gate);
     cleanup.liveUserAddressSpaces=0;cleanup.activeFinalizers=1;step();assert(!freezes&&!syncs&&!writebackStops);
     cleanup.activeFinalizers=0;canFreeze=false;step();assert(freezes==1&&!syncs);
     canFreeze=true;syncError=-5;step();command(second,"power_status","failed",-5);assert(syncs==1 && !finalCalls && !directFinalCalls);
+    assert(!ShutdownReadyForManualPowerOff());
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
     assert(!largeFinalCalls); // failed global sync must not mark the large store clean
 #endif
@@ -240,6 +241,7 @@ step();assert(!signals&&!syncs&&!gate);
     current=-1;irreversible=false;
     command(third,"shutdown","closing");ShutdownCompositorPoll();step();step();syncError=0;step();
     command(third,"power_status","ready");assert(syncs==2&&gate && finalCalls==1);
+    assert(!ShutdownReadyForManualPowerOff());
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
     assert(largeFinalCalls==1);
 #endif
@@ -251,14 +253,17 @@ step();assert(!signals&&!syncs&&!gate);
     current=-1;irreversible=false;powerOff=false;powerRestart=true;
     const char* fourth="44444444444444444444444444444444";
     command(fourth,"shutdown","closing");operations[current].automatic=true;ShutdownCompositorPoll();
+    assert(!ShutdownReadyForManualPowerOff());
     for(unsigned i=0;i<10 && operations[current].phase!=Phase::Ready;++i)step();
     command(fourth,"power_status","ready");assert(!strcmp(ShutdownRequestStatus(id),"Shutdown cancelled"));assert(!strcmp(ShutdownDesktopStatus(),"Safe to power off manually"));
     command(fourth,"commit","ready",-95);step();assert(powerWrites==1 && operations[current].phase==Phase::Ready);
+    assert(ShutdownReadyForManualPowerOff());
     // Firmware reset availability is independent of automatic soft-off.
     current=-1;irreversible=false;
     const char* fifth="55555555555555555555555555555555";
     command(fifth,"restart","closing");ShutdownCompositorPoll();
     for(unsigned i=0;i<10 && operations[current].phase!=Phase::Ready;++i)step();
+    assert(!ShutdownReadyForManualPowerOff());
     command(fifth,"commit","ready");terminalSleeps=true;step();terminalSleeps=false;
     assert(powerWrites==2 && lastRestart);
     current=-1;irreversible=false;powerRestart=false;
