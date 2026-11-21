@@ -18,6 +18,8 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 from stage_nar import layout_digest, profile_layout
 from stage_selected_launchers import read_index, validate_launcher_ids
+from stage_selected_generations import pin_generation, prune_generations
+from stage_selected_space import layout_usage, tree_inodes
 import stage_profile as legacy
 
 SOURCES = Path(__file__).resolve().parent
@@ -38,14 +40,20 @@ def desktop(path, title, command):
 class SelectedGenerationTest(unittest.TestCase):
     def setUp(self):
         self.work = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        module_path = self.work / "stage_profile.py"
-        shutil.copyfile(SOURCES / "stage_profile.py", module_path)
-        with (SOURCES / "stage_selected_profile.patch").open("rb") as changes:
-            subprocess.run(["patch", "--batch", "--fuzz=0", "-p1", "-d", self.work],
-                           stdin=changes, check=True, stdout=subprocess.DEVNULL)
-        spec = importlib.util.spec_from_file_location("test_selected_stage_helper", module_path)
-        self.helper = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(self.helper)
+        def patched_module(name, patch_name):
+            module_path = self.work / (name + ".py")
+            shutil.copyfile(SOURCES / module_path.name, module_path)
+            with (SOURCES / patch_name).open("rb") as changes:
+                subprocess.run(["patch", "--batch", "--fuzz=0", "-p1", "-d", self.work],
+                               stdin=changes, check=True, stdout=subprocess.DEVNULL)
+            spec = importlib.util.spec_from_file_location("test_selected_" + name, module_path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+
+        self.nar = patched_module("stage_nar", "stage_selected_nar.patch")
+        with patch.dict(sys.modules, {"stage_nar": self.nar}):
+            self.helper = patched_module("stage_profile", "stage_selected_profile.patch")
         self.nix = self.work / "nix"
         self.store = self.nix / "store"
         for directory in ("profile/bin", "profile/share/applications",
@@ -84,10 +92,11 @@ class SelectedGenerationTest(unittest.TestCase):
         archive = subprocess.check_output(["nix-store", "--dump", root])
         digest = base64.b64encode(hashlib.sha256(archive).digest()).decode("ascii")
         closure = {root.name: {"narHash": "sha256-" + digest, "narSize": len(archive),
-                               "source": "brook", "references": []}}
+                               "source": "brook", "references": [], "storeInodes": tree_inodes(root)}}
+        layout = profile_layout(root, closure, store=self.store)
         return {"format": 3, "roots": [root.name], "closure": closure, "packages": [],
                 "profile": {"root": root.name, "launcherIds": [app_id],
-                            "layoutSha256": layout_digest(profile_layout(root, closure, store=self.store))},
+                            "layoutSha256": layout_digest(layout), "space": layout_usage(layout)},
                 "cache": {"brook": "http://127.0.0.1:1", "mirrorUpstream": False}}
 
     def active_rows(self):
@@ -174,6 +183,98 @@ class SelectedGenerationTest(unittest.TestCase):
         self.assertEqual(set(rows), {"brook.calc", app_id})
         self.assertEqual(rows[app_id][:2], [title, "--uid 1000 gallery-editor"])
         self.assertEqual(rows[app_id][5], "Gallery comment")
+
+    @unittest.skipUnless(all(shutil.which(tool) for tool in ("nix-store", "cc")), "requires nix-store and cc")
+    def test_only_uncommitted_imports_owned_by_failed_apply_are_removed(self):
+        unpack = self.work / "nar-unpack"
+        subprocess.run(["cc", ROOT / "tools/nar-unpack/nar-unpack.c", "-o", unpack], check=True)
+        tools = {"nar-unpack": str(unpack)}
+
+        class Cache:
+            def __init__(self, archive):
+                self.data = archive
+
+            def contains(self, name):
+                return True
+
+            def archive(self, name, output, entry, tools):
+                output.write_bytes(self.data)
+
+        for digit, action in (("7", "clean"), ("8", "replaced"), ("9", "journaled")):
+            with self.subTest(failure=action):
+                plan = self.plan(digit, "brook.calc", "Calculator", "selected-calc")
+                target = self.store / plan["profile"]["root"]
+                archive = subprocess.check_output(["nix-store", "--dump", target])
+                shutil.rmtree(target)
+                original = self.nix / legacy.PROFILE_ALIAS
+                previous = os.readlink(original)
+
+                def fail_prepare(*args):
+                    self.assertTrue(target.is_dir())
+                    if action == "replaced":
+                        target.rename(self.work / "replaced-original")
+                        target.write_bytes(b"external replacement")
+                    raise ValueError("fixture abort before publication")
+
+                if action == "journaled":
+                    failure = patch.object(self.helper, "switch", side_effect=OSError("fixture after journal"))
+                    expected = OSError
+                else:
+                    failure = patch.object(self.helper, "prepare", side_effect=fail_prepare)
+                    expected = ValueError
+                with failure, patch.object(self.helper.os, "sync"), self.assertRaisesRegex(expected, "fixture"):
+                    self.helper.apply(self.nix, plan, "fixture", digit * 32, tools, packed_cache=Cache(archive))
+                self.assertEqual(os.readlink(original), previous)
+                self.assertTrue((self.store / self.gallery_name).is_dir())
+                if action == "clean":
+                    self.assertFalse(os.path.lexists(target))
+                elif action == "replaced":
+                    self.assertEqual(target.read_bytes(), b"external replacement")
+                else:
+                    self.assertTrue(target.is_dir())
+                    self.helper.apply(self.nix, plan, "fixture", digit * 32, tools, packed_cache=Cache(archive))
+                    self.assertEqual(os.readlink(original), ".brook-profile-" + digit * 32)
+
+    @unittest.skipUnless(shutil.which("nix-store"), "requires nix-store")
+    def test_preflight_checks_guest_under_mutation_lock(self):
+        plan = self.plan("7", "brook.calc", "Calculator", "selected-calc")
+        capacity = {"block_bytes": 4096, "free_blocks": 16384, "free_bytes": 64 << 20,
+                    "free_inodes": 0, "overlay_links": 2}
+
+        def measure(*args):
+            self.assertTrue((self.nix / "var/.brook-profile-lock").is_dir())
+            return capacity
+
+        with (patch.object(self.helper, "selected_capacity", side_effect=measure),
+              patch.object(self.helper, "ensure_path") as import_path,
+              self.assertRaisesRegex(ValueError, "Selected profile needs .* 0 inodes available")):
+            self.helper.apply(self.nix, plan, "fixture", "7" * 32, {})
+        import_path.assert_not_called()
+        self.assertEqual(os.readlink(self.nix / legacy.PROFILE_ALIAS), ".brook-profile-legacy")
+
+    @unittest.skipUnless(shutil.which("nix-store"), "requires nix-store")
+    def test_prune_keeps_one_rollback_and_explicit_pins(self):
+        home = self.nix / legacy.PROFILE_HOME
+        generations = {digit: ".brook-profile-" + digit * 32 for digit in "2345"}
+        for digit in generations:
+            plan = self.plan(digit, "brook.calc", "Calculator", "selected-calc")
+            with patch.object(self.helper.os, "sync"):
+                self.helper.apply(self.nix, plan, "fixture", digit * 32, {})
+        with self.helper.mutation_lock(self.nix):
+            with self.assertRaisesRegex(ValueError, "Invalid profile transaction"):
+                pin_generation(home, "../outside", True, self.helper.flush_directory)
+            pin_generation(home, "3" * 32, True, self.helper.flush_directory)
+            dry = prune_generations(home, generations["5"], self.helper.flush_directory, dry_run=True)
+            self.assertEqual(dry["generations"], [generations["2"]])
+            self.assertTrue((home / generations["2"]).is_dir())
+            done = prune_generations(home, generations["5"], self.helper.flush_directory)
+        self.assertEqual(done["generations"], [generations["2"]])
+        self.assertFalse((home / generations["2"]).exists())
+        for retained in (".brook-profile-legacy", generations["3"], generations["4"], generations["5"]):
+            self.assertTrue((home / retained).is_dir())
+        self.assertTrue((home / ".stage" / ("2" * 32 + ".json")).is_file())
+        self.helper.rollback(self.nix, "5" * 32)
+        self.assertEqual(os.readlink(self.nix / legacy.PROFILE_ALIAS), generations["4"])
 
     @unittest.skipUnless(shutil.which("nix-store"), "requires nix-store")
     def test_recipe_mismatch_cannot_switch_generation(self):

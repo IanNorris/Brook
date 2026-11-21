@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools/nix-install"))
 from stage_nar import STORE, UPSTREAM, layout_digest, nar_hash, profile_layout, store_name
 from stage_selected_launchers import validate_launcher_ids
+from stage_selected_space import layout_usage, tree_inodes
 
 EXPRESSION = ROOT / "nix/hardware-network-packages.nix"
 NIX = ["nix", "--extra-experimental-features", "nix-command"]
@@ -74,13 +75,14 @@ def generate_plan(profile, extras, cache_url, mirror_upstream, packages=(), *, l
         checks = pool.map(lambda name: upstream_has(name, closure[name]), sorted(closure))
         for name, upstream in zip(sorted(closure), checks):
             closure[name]["source"] = "upstream" if upstream else "brook"
+    layout = profile_layout(profile, closure)
     plan = {
         "format": 2,
         "roots": [store_name(path) for path in roots],
         "closure": closure,
         "profile": {
             "root": store_name(str(profile)),
-            "layoutSha256": layout_digest(profile_layout(profile, closure)),
+            "layoutSha256": layout_digest(layout),
         },
         "packages": list(packages),
         "cache": {"brook": cache_url, "mirrorUpstream": mirror_upstream},
@@ -88,6 +90,9 @@ def generate_plan(profile, extras, cache_url, mirror_upstream, packages=(), *, l
     if launcher_ids is not None:
         plan["format"] = 3
         plan["profile"]["launcherIds"] = launcher_ids
+        plan["profile"]["space"] = layout_usage(layout)
+        for name, entry in closure.items():
+            entry["storeInodes"] = tree_inodes(STORE / name)
     return plan
 
 

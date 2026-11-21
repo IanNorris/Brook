@@ -12,7 +12,10 @@ let
     cp ${../data/branding/brook-mark.png} "$out/data/branding/brook-mark.png"
   '' + pkgs.lib.optionalString selectedProfiles ''
     install -Dm644 ${../tools/nix-install/stage_selected_launchers.py} "$out/scripts/stage_selected_launchers.py"
+    install -Dm644 ${../tools/nix-install/stage_selected_space.py} "$out/scripts/stage_selected_space.py"
+    install -Dm644 ${../tools/nix-install/stage_selected_generations.py} "$out/scripts/stage_selected_generations.py"
     ${pkgs.patch}/bin/patch --batch --fuzz=0 -d "$out/scripts" -p1 < ${../tools/nix-install/stage_selected_profile.patch}
+    ${pkgs.patch}/bin/patch --batch --fuzz=0 -d "$out/scripts" -p1 < ${../tools/nix-install/stage_selected_nar.patch}
   '');
 in pkgs.writeShellScriptBin "brook-stage-profile" ''
   export BROOK_STAGE_OPENSSL=${pkgs.lib.getBin pkgs.openssl}/bin/openssl

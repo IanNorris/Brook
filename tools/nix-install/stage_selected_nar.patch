@@ -1,0 +1,27 @@
+--- a/stage_nar.py
++++ b/stage_nar.py
+@@ -367,7 +367,8 @@
+             raise ValueError(f"Legacy runtime library link does not resolve to a verified file: {link}")
+ 
+ 
+-def ensure_path(store, name, entry, cache, tools, *, legacy_paths=None, packed_cache=None):
++def ensure_path(store, name, entry, cache, tools, *, legacy_paths=None, packed_cache=None,
++                published=None):
+     target = store / name
+     if os.path.lexists(target):
+         verify_installed(target, entry, legacy_paths)
+@@ -405,6 +406,7 @@
+             verify_tree(unpacked, entry)
+         except (OSError, ValueError) as error:
+             raise ValueError(f"Extracted store path failed verification for {name}: {error}") from error
++        original = unpacked.lstat() if published else None
+         try:
+             rename_no_replace(unpacked, target)
+         except OSError as error:
+@@ -412,4 +414,6 @@
+                 raise
+             verify_installed(target, entry, legacy_paths)
+             return "present"
++        if published:
++            published(target, original)
+         return origin

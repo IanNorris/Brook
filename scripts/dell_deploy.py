@@ -81,8 +81,6 @@ def stage_profile(args, *, bridge=None, bulk_port=1236):
                             raise ValueError('Refresh the guest stage helper with '
                                              'dell_bootstrap_stage_profile.py --refresh-helper --selected-profiles '
                                              'before applying this plan')
-                        journal.save(state='selected_profile_preflight_verified',
-                                     cache_capabilities=capabilities)
                 if push_cache:
                     from profile_cache_bundle import pack_cache, validate_push_capacity
                     work = Path(resources.enter_context(tempfile.TemporaryDirectory(
@@ -90,6 +88,13 @@ def stage_profile(args, *, bridge=None, bulk_port=1236):
                     bundles = list(pack_cache(a.profile_plan / 'cache', plan, work))
                     required = validate_push_capacity([*files, *bundles], capabilities)
                     journal.save(state='profile_cache_preflight_verified', cache_required_bytes=required,
+                                 cache_capabilities=capabilities)
+                if selected:
+                    sys.path.insert(0, str(ROOT / 'tools/nix-install'))
+                    from stage_selected_space import host_preflight
+                    required = host_preflight(plan, capabilities, [*files, *bundles])
+                    journal.save(state='selected_profile_preflight_verified',
+                                 selected_profile_required=required,
                                  cache_capabilities=capabilities)
 
             pushed = []
