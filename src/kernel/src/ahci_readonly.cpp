@@ -840,9 +840,18 @@ AhciIrqStatus AhciReadOnlyIrqStatus() {
     if(copy.configured && !copy.active)copy.reason="reverted to polling after missed interrupts";
     return copy;
 }
-AhciReadOnlyStatus AhciReadOnlyGetStatus() {
+AhciReadOnlyStatus AhciReadOnlyGetStatus(AhciPortRegisters* registers) {
+    if(registers)*registers={};
     if(!__atomic_load_n(&published,__ATOMIC_ACQUIRE))return status;
-    KMutexLock(&ioLock);const auto copy=status;KMutexUnlock(&ioLock);return copy;
+    KMutexLock(&ioLock);
+    const auto copy=status;
+    if(registers) {
+        const uint32_t cmd=io.read(CMD),sctl=io.read(SCTL),ssts=io.read(SSTS),serr=io.read(SERR);
+        if(cmd!=0xffffffffu && sctl!=0xffffffffu && ssts!=0xffffffffu && serr!=0xffffffffu)
+            *registers={true,cmd,sctl,ssts,serr};
+    }
+    KMutexUnlock(&ioLock);
+    return copy;
 }
 Device* AhciWriteAdmittedDevice() {
     if(!__atomic_load_n(&published,__ATOMIC_ACQUIRE))return nullptr;

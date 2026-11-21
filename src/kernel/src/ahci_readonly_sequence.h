@@ -5,7 +5,7 @@ namespace brook {
 // Port-local AHCI offsets. This sequence never constructs an ATA write.
 namespace ahci_ro {
 static constexpr uint32_t CLB=0x00, CLBU=0x04, FB=0x08, FBU=0x0c, IS=0x10, IE=0x14;
-static constexpr uint32_t CMD=0x18, TFD=0x20, SERR=0x30, SACT=0x34, CI=0x38;
+static constexpr uint32_t CMD=0x18, TFD=0x20, SSTS=0x28, SCTL=0x2c, SERR=0x30, SACT=0x34, CI=0x38;
 static constexpr uint32_t ST=1u, FRE=1u<<4, FR=1u<<14, CR=1u<<15;
 static constexpr uint32_t ERROR_MASK=(1u<<30)|(1u<<29)|(1u<<28)|(1u<<27)|(1u<<24);
 enum class Result : uint8_t { Ok, Busy, InvalidDma, DeviceBusy, Timeout, DeviceError, ShortTransfer };
