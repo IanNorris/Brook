@@ -142,6 +142,20 @@ def build_dell_pair(args):
         (output / "profile-selection.json").write_text(
             json.dumps(selection, indent=2, sort_keys=True) + "\n")
     kernel = read_kernel_capabilities(pair / "kernel.elf")
+    stage_plan = None
+    if args.stage_cache_key is not None:
+        stage_args = ["--output", output / "profile-plan",
+                      "--cache-key", args.stage_cache_key, "--plan-key", args.stage_plan_key]
+        if args.stage_bridge_cache:
+            stage_args += ["--bridge-cache"]
+        else:
+            stage_args += ["--cache-url", args.stage_cache_url]
+        if args.stage_mirror_upstream:
+            stage_args += ["--mirror-upstream"]
+        if selection is not None:
+            stage_args += ["--profile-selection", output / "profile-selection.json"]
+        script("stage_closure.py", *stage_args)
+        stage_plan = "profile-plan/stage-plan.json"
     (output / "brook-image.json").write_text(json.dumps({
         "schema": "brook-image/1",
         "target": args.target,
@@ -150,6 +164,7 @@ def build_dell_pair(args):
         "kernel": kernel,
         "redistributable": bool(selection and selection["manifest"]["redistributable"]),
         "image_manifest": "pair/build-manifest.json",
+        "stage_plan": stage_plan,
     }, indent=2, sort_keys=True) + "\n")
 
 
@@ -172,6 +187,13 @@ def main():
     parser.add_argument("--dell-shared", type=Path, help="Private Dell pair source assets")
     parser.add_argument("--kernel-option", action="append", default=[],
                         help="Override a Dell pair kernel option (repeatable)")
+    parser.add_argument("--stage-cache-key", type=Path, help="Sign a local profile cache")
+    parser.add_argument("--stage-plan-key", type=Path, help="Sign a local profile plan")
+    delivery = parser.add_mutually_exclusive_group()
+    delivery.add_argument("--stage-cache-url", help="URL recorded for the signed profile cache")
+    delivery.add_argument("--stage-bridge-cache", action="store_true",
+                          help="Prepare a local cache for later bridge delivery")
+    parser.add_argument("--stage-mirror-upstream", action="store_true")
     args = parser.parse_args()
     if args.list_apps:
         print(json.dumps(nix_json(ROOT / "nix/app-registry.nix", "-A", "metadata"),
@@ -189,6 +211,13 @@ def main():
         parser.error("Dell kernel settings require --target dell-pair")
     if args.target == "dell-pair" and args.data_mib is not None:
         parser.error("The Dell pair uses the existing persistent volume")
+    delivery_config = args.stage_cache_url or args.stage_bridge_cache
+    signing_config = args.stage_cache_key or args.stage_plan_key
+    if delivery_config or signing_config or args.stage_mirror_upstream:
+        if args.target != "dell-pair":
+            parser.error("Profile stage-plan options require --target dell-pair")
+        if not (delivery_config and args.stage_cache_key and args.stage_plan_key):
+            parser.error("A stage plan requires both signing keys and a delivery method")
     if args.public_release and (args.target != "qemu" or args.apps is not None or args.packages or args.allow_unfree):
         parser.error("The public release requires its fixed free-package profile")
     if args.allow_unfree and args.apps is None and not args.packages:
