@@ -169,7 +169,35 @@ static void PollHoldOutlivesEndpoints() {
     // (host malloc), so only the counters observed above are checked.
 }
 
+static void GpuFdDiagnosticNames() {
+    using brook::FdType;
+    struct Item { FdType type; const char* name; };
+    const Item items[] = {
+        {FdType::SyncFile, "anon_inode:sync_file"},
+        {FdType::IntelSyncObj, "anon_inode:syncobj_file"},
+        {FdType::DrmPrime, "anon_inode:dmabuf"},
+        {FdType::IntelPrime, "anon_inode:dmabuf"},
+        {FdType::DevDri, "/dev/dri/renderD128"},
+        {FdType::DevIntelDri, "/dev/dri/renderD129"},
+        {FdType::EventFd, "eventfd"},
+    };
+    char out[64];
+    brook::FdEntry fd{};
+    for (const auto& item : items) {
+        fd.type = item.type;
+        brook::FdDiagnosticPath(fd, out, sizeof(out));
+        CHECK(brook::StrEq(out, item.name));
+    }
+    fd.type = FdType::SyncFile;
+    brook::FdDiagnosticPath(fd, out, 5);
+    CHECK(brook::StrEq(out, "anon"));
+    __builtin_memcpy(fd.dirPath, "/existing", sizeof("/existing"));
+    brook::FdDiagnosticPath(fd, out, sizeof(out));
+    CHECK(brook::StrEq(out, "/existing"));
+}
+
 void RunWaitTests() {
+    GpuFdDiagnosticNames();
     PipeAtFullTable();
     PollHoldOutlivesEndpoints();
     PollSyncFile();

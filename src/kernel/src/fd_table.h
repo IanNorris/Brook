@@ -96,8 +96,19 @@ inline void FdDiagnosticPath(const FdEntry& fd,char* out,uint32_t capacity)
     static const char* names[]={"none","file","fb","kbd","pipe","/dev/null","/dev/urandom",
         "mem","socket","tty","eventfd","dsp","epoll","timerfd","memfd","unix","klog"};
     const auto type=static_cast<uint8_t>(fd.type);
-    const char* text=fd.dirPath[0]?fd.dirPath:fd.type==FdType::DevZero?"/dev/zero":
-        fd.type==FdType::DevFull?"/dev/full":(type<sizeof(names)/sizeof(names[0])?names[type]:"?");
+    const char* text=fd.dirPath;
+    if (!text[0]) {
+        switch (fd.type) {
+        case FdType::DevZero: text="/dev/zero"; break;
+        case FdType::DevFull: text="/dev/full"; break;
+        case FdType::SyncFile: text="anon_inode:sync_file"; break;
+        case FdType::IntelSyncObj: text="anon_inode:syncobj_file"; break;
+        case FdType::DrmPrime: case FdType::IntelPrime: text="anon_inode:dmabuf"; break;
+        case FdType::DevDri: text="/dev/dri/renderD128"; break;
+        case FdType::DevIntelDri: text="/dev/dri/renderD129"; break;
+        default: text=type<sizeof(names)/sizeof(names[0])?names[type]:"?"; break;
+        }
+    }
     const uint32_t limit=fd.dirPath[0]?sizeof(fd.dirPath)-1:capacity-1;
     uint32_t i=0;for(;i+1<capacity && i<limit && text[i];++i)out[i]=text[i];out[i]=0;
 }
