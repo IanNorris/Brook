@@ -84,18 +84,22 @@ private:
 struct AmlPath {
     uint32_t minDepth=0,maxDepth=0;
     bool rootS5=false;
+    uint32_t lastSegment=0;
 };
 
-inline bool Segment(AmlReader& aml,bool& s5)
+inline bool Segment(AmlReader& aml,bool& s5,uint32_t* packed=nullptr)
 {
     constexpr uint8_t expected[]={'_','S','5','_'};
     s5=true;
+    uint32_t value=0;
     for (unsigned i=0;i<4;++i) {
         uint8_t part=0;
         if (!aml.Byte(part) ||
             !(part=='_' || (part>='A' && part<='Z') || (i && part>='0' && part<='9'))) return false;
         s5&=part==expected[i];
+        value=(value<<8)|part;
     }
+    if (packed) *packed=value;
     return true;
 }
 
@@ -131,12 +135,13 @@ inline bool NamePath(AmlReader& aml,AmlPath scope,AmlPath& path,bool scopeLookup
     default: break;
     }
     bool s5=false;
+    uint32_t lastSegment=0;
     for (unsigned i=0;i<segments;++i)
-        if (!Segment(aml,s5)) return false;
+        if (!Segment(aml,s5,&lastSegment)) return false;
     // Unanchored Scope may resolve in an ancestor. Conservatively retain
     // that range, so parent prefixes cannot hide another root definition.
     const auto least=scopeLookup && !anchored?0:scope.minDepth;
-    path={least+segments,scope.maxDepth+segments,!least && segments==1 && s5};
+    path={least+segments,scope.maxDepth+segments,!least && segments==1 && s5,lastSegment};
     return true;
 }
 
@@ -181,7 +186,63 @@ inline bool S5Package(AmlReader& aml,uint8_t& typeA,uint8_t& typeB)
     return true;
 }
 
-inline bool FieldList(AmlReader& field,AmlPath scope)
+// A NameSeg in a TermArg could instead invoke a method and consume further
+// operands. Rewalk the entire table after collecting region references. Each
+// name must occur as a field and must not be declared as a method, an external
+// or an alias target anywhere in the table. The caller refuses this extension
+// with additional definition tables, which could change the namespace.
+struct RegionReferences {
+    static constexpr unsigned Capacity=16;
+    uint32_t names[Capacity]{};
+    unsigned count=0;
+    uint32_t fields=0;
+    bool checking=false;
+
+    bool Mention(uint32_t name)
+    {
+        for (unsigned i=0;i<count;++i)
+            if (names[i]==name) return true;
+        if (checking || count==Capacity) return false;
+        names[count++]=name;
+        return true;
+    }
+
+    bool MayInvoke(uint32_t name) const
+    {
+        if (!checking) return false;
+        for (unsigned i=0;i<count;++i)
+            if (names[i]==name) return true;
+        return false;
+    }
+
+    void Field(uint32_t name)
+    {
+        if (!checking) return;
+        for (unsigned i=0;i<count;++i)
+            if (names[i]==name) fields|=1u<<i;
+    }
+
+    bool AllFields() const {return fields==((1u<<count)-1);}
+};
+
+inline bool RegionOperand(AmlReader& aml,RegionReferences* refs,unsigned depth=0)
+{
+    if (depth>8) return false;
+    AmlReader literal=aml;
+    uint64_t value=0;
+    if (literal.Integer(value)) {aml=literal;return true;}
+    if (!refs) return false;
+    if (aml.Peek()==0x72) { // Add with a discarded result, no assignment.
+        return aml.Skip(1) && RegionOperand(aml,refs,depth+1) &&
+               RegionOperand(aml,refs,depth+1) && aml.Peek()==0 && aml.Skip(1);
+    }
+    bool isS5=false;
+    uint32_t segment=0;
+    return aml.Peek()>='A' && aml.Peek()<='Z' && Segment(aml,isS5,&segment) &&
+           refs->Mention(segment);
+}
+
+inline bool FieldList(AmlReader& field,AmlPath scope,RegionReferences* refs)
 {
     while (field.Remaining()) {
         uint32_t width=0;
@@ -203,7 +264,9 @@ inline bool FieldList(AmlReader& field,AmlPath scope)
             break;
         default: {
             bool s5=false;
-            if (!Segment(field,s5) || (!scope.minDepth && s5) || !field.PackageLength(width)) return false;
+            uint32_t segment=0;
+            if (!Segment(field,s5,&segment) || (!scope.minDepth && s5) || !field.PackageLength(width)) return false;
+            if (refs) refs->Field(segment);
             break;
         }
         }
@@ -217,7 +280,7 @@ struct S5State {
     uint8_t typeA=0,typeB=0;
 };
 
-inline bool NamespaceTerms(AmlReader aml,AmlPath scope,unsigned level,S5State& s5)
+inline bool NamespaceTerms(AmlReader aml,AmlPath scope,unsigned level,S5State& s5,RegionReferences* refs)
 {
     if (level>24) return false;
     uint8_t op=0;
@@ -229,7 +292,8 @@ inline bool NamespaceTerms(AmlReader aml,AmlPath scope,unsigned level,S5State& s
         uint64_t value=0;
         switch (op) {
         case 0x06: // Alias
-            if (!NamePath(aml,scope,source) || !NamePath(aml,scope,name) || name.rootS5) return false;
+            if (!NamePath(aml,scope,source) || !NamePath(aml,scope,name) || name.rootS5 ||
+                (refs && refs->MayInvoke(name.lastSegment))) return false;
             break;
         case 0x08: // Name
             if (!NamePath(aml,scope,name)) return false;
@@ -241,13 +305,15 @@ inline bool NamespaceTerms(AmlReader aml,AmlPath scope,unsigned level,S5State& s
             break;
         case 0x10: // Scope
             if (!aml.Package(body) || !NamePath(body,scope,name,true) || name.rootS5 ||
-                !NamespaceTerms(body,name,level+1,s5)) return false;
+                !NamespaceTerms(body,name,level+1,s5,refs)) return false;
             break;
         case 0x14: // Method. Its bytecode is never loaded as a TermList.
-            if (!aml.Package(body) || !NamePath(body,scope,name) || name.rootS5 || !body.Skip(1)) return false;
+            if (!aml.Package(body) || !NamePath(body,scope,name) || name.rootS5 || !body.Skip(1) ||
+                (refs && refs->MayInvoke(name.lastSegment))) return false;
             break;
         case 0x15: // External
-            if (!NamePath(aml,scope,name) || !aml.Skip(2)) return false;
+            if (!NamePath(aml,scope,name) || !aml.Skip(2) ||
+                (refs && refs->MayInvoke(name.lastSegment))) return false;
             break;
         case 0x5b: { // Extended named objects
             uint8_t ext=0;
@@ -257,9 +323,9 @@ inline bool NamespaceTerms(AmlReader aml,AmlPath scope,unsigned level,S5State& s
             case 0x02: // Event
                 if (!NamePath(aml,scope,name) || name.rootS5 || (ext==1 && !aml.Skip(1))) return false;
                 break;
-            case 0x80: // OperationRegion with literal base and length
+            case 0x80: // OperationRegion with bounded address operands
                 if (!NamePath(aml,scope,name) || name.rootS5 || !aml.Skip(1) ||
-                    !aml.Integer(value) || !aml.Integer(value)) return false;
+                    !RegionOperand(aml,refs) || !RegionOperand(aml,refs)) return false;
                 break;
             case 0x81: // Field
             case 0x86: // IndexField
@@ -267,7 +333,7 @@ inline bool NamespaceTerms(AmlReader aml,AmlPath scope,unsigned level,S5State& s
                 if (!aml.Package(body) || !NamePath(body,scope,source) ||
                     (ext!=0x81 && !NamePath(body,scope,source)) ||
                     (ext==0x87 && !body.Integer(value)) ||
-                    !body.Skip(1) || !FieldList(body,scope)) return false;
+                    !body.Skip(1) || !FieldList(body,scope,refs)) return false;
                 break;
             case 0x82: // Device
             case 0x83: // Processor
@@ -275,7 +341,7 @@ inline bool NamespaceTerms(AmlReader aml,AmlPath scope,unsigned level,S5State& s
             case 0x85: // ThermalZone
                 if (!aml.Package(body) || !NamePath(body,scope,name) || name.rootS5 ||
                     !body.Skip(ext==0x83?6:ext==0x84?3:0) ||
-                    !NamespaceTerms(body,name,level+1,s5)) return false;
+                    !NamespaceTerms(body,name,level+1,s5,refs)) return false;
                 break;
             default: return false;
             }
@@ -297,14 +363,27 @@ inline bool NamespaceTerms(AmlReader aml,AmlPath scope,unsigned level,S5State& s
 // checksum and supplies only its AML body. Executable definitions, unsupported
 // load-time syntax, malformed namespace terms and duplicate definitions fail closed.
 inline AcpiS5Result AcpiReadStaticS5(const uint8_t* aml,uint32_t size,uint8_t& typeA,uint8_t& typeB,
-                                         uint32_t* failureOffset=nullptr)
+                                         uint32_t* failureOffset=nullptr,
+                                         bool* usedRegionReferences=nullptr)
 {
     if (failureOffset) *failureOffset=0;
+    if (usedRegionReferences) *usedRegionReferences=false;
     if (!aml || size>1024*1024) return AcpiS5Result::Unsupported;
     acpi_s5::S5State s5{};
-    if (!acpi_s5::NamespaceTerms({aml,size},{},0,s5)) {
+    acpi_s5::RegionReferences refs{};
+    const auto read=[&]() {
+        s5={};
+        return acpi_s5::NamespaceTerms({aml,size},{},0,s5,usedRegionReferences?&refs:nullptr);
+    };
+    const auto refuse=[&]() {
         if (failureOffset && s5.term) *failureOffset=uint32_t(s5.term-aml);
         return AcpiS5Result::Unsupported;
+    };
+    if (!read()) return refuse();
+    if (refs.count) {
+        refs.checking=true;
+        if (!read() || !refs.AllFields()) return refuse();
+        *usedRegionReferences=true;
     }
     if (!s5.found) return AcpiS5Result::Absent;
     typeA=s5.typeA;

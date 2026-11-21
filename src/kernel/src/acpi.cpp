@@ -219,16 +219,18 @@ AcpiS5Info AcpiGetS5Info()
     if(!address)return refuse("S5: no valid DSDT from FADT");
     if(g_tables.RootEntryCount()>64)return refuse("S5: too many ACPI root entries");
     uint8_t typeA=0,typeB=0;
-    auto readStatic=[](uint64_t at,const AcpiSdtHeader& header,uint32_t index,uint8_t& a,uint8_t& b){
+    auto readStatic=[](uint64_t at,const AcpiSdtHeader& header,uint32_t index,uint8_t& a,uint8_t& b,
+                       bool* usedRegionReferences=nullptr){
         uint32_t offset=0;
         const auto result=AcpiReadStaticS5(reinterpret_cast<const uint8_t*>(at+sizeof(header)),
-                                          header.length-sizeof(header),a,b,&offset);
+                                          header.length-sizeof(header),a,b,&offset,usedRegionReferences);
         if(result==AcpiS5Result::Unsupported)
             SerialPrintf("ACPI: S5 rejected AML in inventory table %u at table offset 0x%x\n",
                          index,offset+uint32_t(sizeof(header)));
         return result;
     };
-    const auto root=readStatic(address,dsdt,0,typeA,typeB);
+    bool dsdtRegionReferences=false;
+    const auto root=readStatic(address,dsdt,0,typeA,typeB,&dsdtRegionReferences);
     if(root==AcpiS5Result::Unsupported)return refuse("S5: unsupported DSDT AML");
     bool found=root==AcpiS5Result::Found;
     for(uint32_t i=0;i<g_tables.RootEntryCount();++i){
@@ -238,8 +240,11 @@ AcpiS5Info AcpiGetS5Info()
             SerialPrintf("ACPI: S5 invalid root entry at inventory index %u\n",i+1);
             return refuse("S5: invalid ACPI root entry");
         }
-        if(table.signature[0]!='S' || table.signature[1]!='S' ||
-           table.signature[2]!='D' || table.signature[3]!='T')continue;
+        const bool ssdt=memcmp(table.signature,"SSDT",4)==0;
+        if(dsdtRegionReferences && (ssdt || memcmp(table.signature,"PSDT",4)==0 ||
+                                   memcmp(table.signature,"DSDT",4)==0))
+            return refuse("S5: DSDT region references with other definition tables");
+        if(!ssdt)continue;
         uint8_t a=0,b=0;
         const auto result=readStatic(extension,table,i+1,a,b);
         if(result==AcpiS5Result::Unsupported)return refuse("S5: unsupported SSDT AML");

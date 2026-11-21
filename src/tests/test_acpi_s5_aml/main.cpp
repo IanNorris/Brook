@@ -116,5 +116,28 @@ int main()
         nested = WithPackage({0x10}, Append({0x5c, 0}, nested));
     Expect(nested, AcpiS5Result::Unsupported);
 
+    // VMware declares an ECFG field and uses it as a region base, including
+    // in Add(ECFG, literal, NullName). The static resolver never reads it.
+    const Bytes ecfg = {'E', 'C', 'F', 'G'};
+    const Bytes fieldList = WithPackage({0x5b,0x81},
+        Append({'O','E','M','D',0}, Append(ecfg,{32})));
+    const Bytes region = Append({0x5b,0x80,'E','I','C','H',0,0x72},
+                                 Append(ecfg,{0x0b,0,0x40,0,0x0b,0,0x40}));
+    const Bytes vmS5 = WithPackage(s5Package,{2,0,0});
+    const Bytes vm = Append(Append(fieldList,region),vmS5);
+    bool references=false;
+    assert(AcpiReadStaticS5(vm.data(),vm.size(),typeA,typeB,&offset,&references)==AcpiS5Result::Found);
+    assert(references && typeA==0 && typeB==0);
+    Expect(vm,AcpiS5Result::Unsupported);
+    const Bytes unsafe[] = {
+        Append(region,vmS5),
+        Append(vm,WithPackage({0x14},Append(ecfg,{1}))),
+        Append(Append({0x06,'O','E','M','D'},ecfg),vm),
+        Append(Append({0x15},Append(ecfg,{8,1})),vm),
+    };
+    for (const Bytes& aml : unsafe)
+        assert(AcpiReadStaticS5(aml.data(),aml.size(),typeA,typeB,&offset,&references)
+               ==AcpiS5Result::Unsupported);
+
     std::puts("ACPI static _S5 AML tests passed");
 }
