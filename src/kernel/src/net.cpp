@@ -6361,7 +6361,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  gpu hang [status|last|ring [n]|reference arm|reference|marker on|off] - RCS hang breadcrumbs and pre-reset capture\n"
             "  gpu audit batch on|off|status - batched MTRR/PAT observation in GPU critical-section audits (default on)\n"
             "  gpu ppgtt cache on|off|status - reuse exact-match PPGTT table sets across GPU jobs (default off)\n"
-            "  gpu clock <MHz>|status - render clock request (default 500, clamped to fused RPn..RP0; 90 C fallback)\n"
+            "  gpu clock <MHz>|auto|status - render clock request (fixed 600 at boot, auto opt-in, 90 C fallback)\n"
             "  thermal status|history|graph|power|reset - CPU/GPU temperature, power and frequency sampler\n"
             "  gpu scene wake on|off|status - default-off scene completion notification experiment\n"
             "  audio shared-prefix on|off|reset|status - experimental headroom-gated mix batching (default off)\n"
@@ -7222,23 +7222,28 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         // Runtime render-clock request. Only the per-job GEN6_RPNSWREQ ratio
         // changes; it is clamped to the fused caps and falls back to 500 MHz
         // (latched) at the package thermal limit.
-        auto& st=BdwClock();
         const char* arg=cmd+9;while(*arg==' ')++arg;
         bool bad=false;
-        if(*arg && !NetStrEq(arg,"status")){
+        if(NetStrEq(arg,"auto"))BdwClockConfigure(0);
+        else if(*arg && !NetStrEq(arg,"status")){
             uint32_t mhz=0;
             if(ParseUint(arg,&mhz)<=0 || mhz<100 || mhz>2000)bad=true;
-            else BdwClockSetMhz(st,mhz);
+            else BdwClockConfigure(mhz);
         }
-        if(bad){DebugChannelSend("{\"error\":\"usage: gpu clock <MHz>|status\"}\n");}
+        if(bad){DebugChannelSend("{\"error\":\"usage: gpu clock <MHz>|auto|status\"}\n");}
         else {
+            const auto st=BdwClockReadStatus();
             static BdwClockEnergy prev{};
             const auto now=BdwClockReadEnergy();
             const auto caps=BdwClockDecodeCaps(st.lastCaps);
             const int32_t temp=BdwClockReadTempC();
             BridgeReply r;
-            r.text("{");r.field("requested_mhz",st.requestedMhz);
-            r.text(",");r.field("effective_mhz",BdwClockEffectiveBin(st)*BdwClockBinMhz);
+            r.text("{");r.field("requested_mhz",st.automatic?st.policy.requestedMhz:st.requestedMhz);
+            r.text(",\"mode\":");r.quoted(st.automatic?"auto":"fixed");
+            r.text(",\"auto_admitted\":");r.text(st.autoAdmitted?"true":"false");
+            r.text(",");r.field("auto_render_load_permille",st.automatic?st.policy.loadPermille:0);
+            r.text(",");r.field("effective_mhz",
+                st.automatic && !st.autoAdmitted?0:BdwClockEffectiveBin(st)*BdwClockBinMhz);
             r.text(",");r.field("last_job_mhz",st.lastRequestedBin*BdwClockBinMhz);
             r.text(",\"caps_valid\":");r.text(caps.valid?"true":"false");
             r.text(",");r.field("rpn_mhz",caps.rpn*BdwClockBinMhz);
@@ -7263,7 +7268,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
                 }
             }
             if(now.valid)prev=now;
-            r.text(",\"scope\":\"requested=gpu clock setting; effective=bin the next render job requests (clamped to fused RPn..RP0 from caps 0x145998; 500 until caps are seen; 500 while tripped); actual clock = mhz in gpu worker stats (RPSTAT1 CAGF at issue/breadcrumb); temp=package DTS (MSR 0x1b1/0x1a2), sampled by the worker at most every 50 ms; a trip falls back to 500 and recovers after 5 s at or below limit-15 C (or at the next gpu clock command); pkg/gt power = RAPL energy delta since the previous status call (MSR 0x611/0x641)\"}\n");
+            r.text(",\"scope\":\"requested=policy target; effective=fused RPn..RP0 clamped bin, 500 during thermal fallback, zero when auto lacks safe input; auto_render_load_permille=render worker occupancy in the last policy window; actual clock=mhz in gpu worker stats (RPSTAT1 CAGF at issue/breadcrumb); temp=package DTS; a trip recovers after 5 s at or below limit-15 C (or after a manual frequency command); pkg/gt power=RAPL energy delta since the previous status call\"}\n");
             r.send();
         }
 #else

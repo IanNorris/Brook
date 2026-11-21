@@ -3,6 +3,7 @@
 
 namespace brook {
 // Runtime-selectable Broadwell render-clock request (BROOK_BDW_RPS_TRIAL).
+// Auto mode uses recent render-worker occupancy and stays off by default.
 //
 // The render job still writes GEN6_RPNSWREQ (0xa008) only for the duration of
 // the job and restores the saved request afterwards; this header only chooses
@@ -13,8 +14,8 @@ namespace brook {
 //
 // Thermal guard: the worker samples the package digital thermal sensor (at
 // most every 50 ms). At or above the limit (default 90 C) the request falls
-// back to the 500 MHz default and stays there (latched) until the next
-// `gpu clock` command; each trip is counted and logged once.
+// back to the 500 MHz default until the cooldown completes. A manual
+// frequency command can also clear a trip.
 constexpr uint32_t BdwClockBinMhz=50;
 constexpr uint32_t BdwClockDefaultMhz=500;
 // Boot request on AC (Ian, 18 Nov): 600 MHz held 69-75 C at ~10 W in Stardew
@@ -62,6 +63,55 @@ inline uint64_t BdwClockEnergyDeltaUj(uint32_t before,uint32_t after,uint64_t po
     return (ticks*1000000ull)>>esu;
 }
 
+struct BdwClockLoadSample {
+    uint64_t elapsedTicks=0;
+    uint64_t renderTicks=0;
+    uint64_t resets=0;
+};
+
+struct BdwClockAutoPolicy {
+    BdwClockLoadSample baseline{};
+    uint32_t requestedMhz=BdwClockBootMhz;
+    uint32_t loadPermille=0;
+    uint32_t busyWindows=0;
+
+    void Sample(const BdwClockLoadSample& next,uint64_t tscKhz,uint32_t ceilingMhz){
+        constexpr uint64_t WindowMs=200,StaleAfterMs=1000;
+        constexpr uint32_t BusyPermille=800,IdlePermille=500,StepMhz=100;
+        if(!next.elapsedTicks || next.renderTicks>next.elapsedTicks || !tscKhz){
+            *this={};
+            return;
+        }
+
+        if(!baseline.elapsedTicks || next.resets!=baseline.resets ||
+           next.elapsedTicks<baseline.elapsedTicks || next.renderTicks<baseline.renderTicks ||
+           next.elapsedTicks-baseline.elapsedTicks>tscKhz*StaleAfterMs){
+            *this={};
+            baseline=next;
+            return;
+        }
+
+        const uint64_t elapsed=next.elapsedTicks-baseline.elapsedTicks;
+        if(elapsed<tscKhz*WindowMs)return;
+        const uint64_t render=next.renderTicks-baseline.renderTicks;
+        baseline=next;
+        if(render>elapsed){
+            *this={};
+            return;
+        }
+
+        loadPermille=uint32_t(render*1000/elapsed);
+        if(loadPermille>=BusyPermille){
+            if(busyWindows<2)++busyWindows;
+            if(busyWindows==2)requestedMhz+=StepMhz;
+        }else{
+            busyWindows=0;
+            if(loadPermille<=IdlePermille)requestedMhz=BdwClockBootMhz;
+        }
+        if(requestedMhz>ceilingMhz)requestedMhz=ceilingMhz;
+    }
+};
+
 struct BdwClockState {
     uint32_t requestedMhz=BdwClockBootMhz;
     int32_t limitC=BdwClockDefaultLimitC;
@@ -72,15 +122,34 @@ struct BdwClockState {
     uint32_t lastCaps=0;         // last caps register read inside a render job
     uint32_t lastRequestedBin=0; // bin the worker asked for on its last job
     uint64_t lastSampleTsc=0;
+    bool automatic=false;        // changed only by the runtime clock command
+    bool autoAdmitted=false;     // last job had usable power, caps and timing
+    BdwClockAutoPolicy policy{};
 };
-inline BdwClockState& BdwClock(){static BdwClockState s{};return s;}
 
 // Pure decision used by the worker: which bin to request for this job.
 inline uint32_t BdwClockEffectiveBin(const BdwClockState& s){
     const auto caps=BdwClockDecodeCaps(s.lastCaps);
-    const uint32_t mhz=s.tripped?BdwClockDefaultMhz:s.requestedMhz;
+    const uint32_t target=s.automatic?s.policy.requestedMhz:s.requestedMhz;
+    const uint32_t mhz=s.tripped?BdwClockDefaultMhz:target;
     if(!caps.valid)return BdwClockDefaultMhz/BdwClockBinMhz;
     return BdwClockClampBin(mhz,caps);
+}
+// A zero request lets the admitted register transaction discover the fused
+// caps without writing a new ratio.
+inline uint32_t BdwClockSelectRequest(BdwClockState& s,bool deviceAdmitted,
+                                      const BdwClockLoadSample& load,uint64_t tscKhz){
+    if(!s.automatic)return BdwClockEffectiveBin(s);
+
+    const auto caps=BdwClockDecodeCaps(s.lastCaps);
+    s.autoAdmitted=deviceAdmitted && caps.valid && tscKhz &&
+        s.lastTempC>=0 && load.elapsedTicks && load.renderTicks<=load.elapsedTicks;
+    constexpr int32_t BoostThermalHeadroomC=10;
+    if(!s.autoAdmitted || s.tripped || s.lastTempC>=s.limitC-BoostThermalHeadroomC)
+        s.policy={};
+    else
+        s.policy.Sample(load,tscKhz,caps.rp0*BdwClockBinMhz);
+    return s.autoAdmitted?BdwClockEffectiveBin(s):0;
 }
 // Apply a thermal sample taken at nowMs. Returns +1 if it newly tripped the
 // guard, -1 if it ended a trip (cool for BdwClockRecoverMs), 0 otherwise.
@@ -97,7 +166,15 @@ inline int BdwClockNoteTemp(BdwClockState& s,int32_t tempC,uint64_t nowMs){
     s.tripped=0;s.coolSinceMs=0;s.recoveries++;return -1;
 }
 // `gpu clock <MHz>`: set the request (clears a latched thermal trip).
+inline void BdwClockSetAuto(BdwClockState& s){
+    if(s.automatic)return;
+    s.automatic=true;
+    s.autoAdmitted=false;
+    s.policy={};
+}
 inline void BdwClockSetMhz(BdwClockState& s,uint32_t mhz){
+    s.automatic=false;
+    s.autoAdmitted=false;
     s.requestedMhz=mhz<BdwClockBinMhz?BdwClockDefaultMhz:mhz;s.tripped=0;s.coolSinceMs=0;
 }
 }

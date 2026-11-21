@@ -29,6 +29,9 @@ int main() {
     m.PresentFailed();m.End(470);                           // present 10
     CHECK(m.Read(s));
     CHECK(s.elapsedTicks==370);
+    uint64_t elapsed=0,render=0,resets=0;
+    m.RenderLoad(elapsed,render,resets);
+    CHECK(elapsed==370 && render==200 && resets==0);
     uint64_t sum=0;for(const auto& c:s.classes)sum+=c.ticks;CHECK(sum==s.elapsedTicks);
     CHECK(s.classes[BdwWorkerIdle].ticks==100 && s.classes[BdwWorkerApplication].ticks==150 &&
           s.classes[BdwWorkerCompositor].ticks==50 && s.classes[BdwWorkerPresent].ticks==10 &&
@@ -59,6 +62,8 @@ int main() {
     CHECK(m.Read(s) && s.resets==1 && s.elapsedTicks==300 && s.classes[BdwWorkerIdle].ticks==300 &&
           s.classes[BdwWorkerOther].count==0 && s.classes[BdwWorkerApplication].count==0 && s.yields[0].jobs==0);
     CHECK(s.clientScanout[BdwClientScanoutTotal].count==0 && s.clientScanoutRejected==0);
+    m.RenderLoad(elapsed,render,resets);
+    CHECK(elapsed==300 && render==0 && resets==1);
     // A backwards clock never charges a negative interval.
     m.Begin(BdwWorkerApplication,1200);m.End(1100);
     CHECK(m.Read(s) && s.elapsedTicks==300 && s.classes[BdwWorkerApplication].count==1 &&

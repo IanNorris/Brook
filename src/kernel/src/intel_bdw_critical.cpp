@@ -725,7 +725,7 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                     if(!result.tryFrequency || !o.owned())return;
                     DellI2cCriticalEvidence evidence{};
                     if(!o.io.evidence(BdwRenderFrequencyCapsPage,evidence) || !BdwGttEvidenceValid(evidence))return;
-                    if(!o.io.read32(BdwDellBar0+BdwRenderFrequencyCaps,result.trialFrequencyCaps))return;
+                    if(!o.io.read32(BdwDellBar0+BdwRenderFrequencyCaps,result.trialFrequencyCaps) || !trialBin)return;
                     const uint32_t caps=result.trialFrequencyCaps;
                     const uint32_t minBin=(caps>>16)&0xff;
                     const uint32_t maxBin=caps&0xff;

@@ -1370,9 +1370,7 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
 #if defined(BROOK_BDW_RPS_TRIAL)
     run.tryFrequency=ShutdownGetAcStatus().source==AcPowerSource::Online &&
         PageAdmitted(BdwRenderFrequencyCapsPage);
-    BdwClockSampleThermal(tsc.khz);
-    run.trialBin=BdwClockEffectiveBin(BdwClock());
-    BdwClock().lastRequestedBin=run.trialBin;
+    run.trialBin=BdwClockRequestForJob(run.tryFrequency,BdwWorkerRenderLoad(),tsc.khz);
 #endif
     BdwTraceSnapshot(snapshot,FrameDeviceBegin);
 #endif
@@ -1410,7 +1408,7 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
     }
     ohStep(BdwOhRenderRun);
 #if defined(BROOK_GPU_SUBMISSION_TIMING) && defined(BROOK_BDW_RPS_TRIAL) && !defined(BROOK_HOST_TEST)
-    if(run.trialFrequencyCaps && run.trialFrequencyCaps!=0xffffffffu)BdwClock().lastCaps=run.trialFrequencyCaps;
+    BdwClockRecordCaps(run.trialFrequencyCaps);
 #endif
 #if defined(BROOK_BDW_ZERO_COPY_SCANOUT)
     if(scanoutImages)BdwZeroCopyNoteRender(run.uncachedScanout);
