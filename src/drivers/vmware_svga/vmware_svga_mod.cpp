@@ -1,6 +1,7 @@
 // VMware SVGA II, legacy linear framebuffer and two-dimensional update FIFO.
 // Register layout follows vmwgfx device_include/svga_reg.h. QEMU emulates the
 // same indexed I/O and BAR layout in hw/display/vmware_vga.c.
+#include "apic.h"
 #include "compositor.h"
 #include "display.h"
 #include "kprintf.h"
@@ -12,6 +13,8 @@
 #include "tty.h"
 #include "svga_fifo.h"
 #include "svga_cursor.h"
+#include "resize_rpc_port.h"
+#include "vfs.h"
 
 MODULE_IMPORT_SYMBOL(PciFindDevice);
 MODULE_IMPORT_SYMBOL(PciConfigRead16);
@@ -29,6 +32,10 @@ MODULE_IMPORT_SYMBOL(DisplayRegister);
 MODULE_IMPORT_SYMBOL(DisplayBeginFramebufferChange);
 MODULE_IMPORT_SYMBOL(DisplayEndFramebufferChange);
 MODULE_IMPORT_SYMBOL(DisplayRegisterCursor);
+MODULE_IMPORT_SYMBOL(DisplayRegisterModePoll);
+MODULE_IMPORT_SYMBOL(ApicTickCount);
+MODULE_IMPORT_SYMBOL(VfsOpen);
+MODULE_IMPORT_SYMBOL(VfsClose);
 MODULE_IMPORT_SYMBOL(CompositorRemapLinearDisplay);
 MODULE_IMPORT_SYMBOL(TtyGetFramebufferPhys);
 MODULE_IMPORT_SYMBOL(KPrintf);
@@ -82,6 +89,11 @@ struct Driver {
 };
 
 Driver g;
+svga::ResizeRpcPort g_resizePort;
+constexpr uint64_t ModePollMs = 100;
+constexpr uint64_t ModeReconnectMs = 2000;
+svga::ResizeRpc<svga::ResizeRpcPort> g_resizeRpc{g_resizePort};
+uint64_t g_nextModePoll = 0;
 
 void Write(Register index, uint32_t value)
 {
@@ -399,6 +411,28 @@ constexpr DisplayOps Ops{"vmware-svga2", SetMode, GetMode, Framebuffer,
                          FramebufferPhys, Flush, PanicPresent};
 constexpr DisplayCursorOps CursorOps{&Ops, PrepareCursor, CommitCursor};
 
+void PollModeHints()
+{
+    const uint64_t now = ApicTickCount();
+    if (now < g_nextModePoll) return;
+    g_nextModePoll = now + ModePollMs;
+    if (!g_resizeRpc.Open()) {
+        g_nextModePoll = now + ModeReconnectMs;
+        return;
+    }
+
+    const auto hint = g_resizeRpc.Poll({g.maxWidth, g.maxHeight});
+    if (hint.result == svga::ResizeRpcResult::TransportError) {
+        g_nextModePoll = now + ModeReconnectMs;
+        return;
+    }
+    if (hint.result == svga::ResizeRpcResult::ModeRequested)
+        (void)g_resizeRpc.CompleteResize(SetMode(hint.mode.width, hint.mode.height));
+}
+
+constexpr DisplayModePollOps ModePollOps{&Ops, PollModeHints};
+
+
 int Initialize()
 {
     uint64_t firmware = 0;
@@ -467,6 +501,13 @@ int Initialize()
         if (!g.cursorBypass3) Write(CursorId, 0);
         SetCursorPosition(false, 0, 0);
         DisplayRegisterCursor(&CursorOps);
+    }
+    if (auto* option = VfsOpen("/etc/vmware-autofit")) {
+        VfsClose(option);
+        if (g_resizePort.Probe()) {
+            DisplayRegisterModePoll(&ModePollOps);
+            SerialPrintf("vmware-svga: host Autofit hints enabled\n");
+        }
     }
     KPrintf("vmware-svga: %ux%u stride=%u caps=0x%x fifo=%u cursor=%s\n",
             width, height, candidate.stride, caps, g.fifoBytes,

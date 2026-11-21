@@ -203,7 +203,7 @@ class ResizeRpc {
     }
 
 public:
-    explicit ResizeRpc(PortIO& io) : io_(io) {}
+    constexpr explicit ResizeRpc(PortIO& io) : io_(io) {}
     ResizeRpc(const ResizeRpc&) = delete;
     ResizeRpc& operator=(const ResizeRpc&) = delete;
 

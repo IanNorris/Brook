@@ -130,7 +130,7 @@ def build_kernel(work, policy):
     return build
 
 
-def make_initrds(work, build, payload, policy, profile, commit, name):
+def make_initrds(work, build, payload, policy, profile, commit, name, autofit):
     tree = work / 'initrd'
     modules = tree / 'kernel/drivers'
     modules.mkdir(parents=True)
@@ -162,6 +162,8 @@ def make_initrds(work, build, payload, policy, profile, commit, name):
     # The guard binds persistent home under the desktop's initial RAM /data.
     fat_write(desktop, 'ETC/volatile-desktop', b'1\n')
     fat_write(desktop, 'ETC/hardware-bulk', b'1\n')
+    if autofit:
+        fat_write(desktop, 'ETC/vmware-autofit', b'1\n')
     fat_write(desktop, 'BOOT/INIT.RC', add_clearwater_start(DESKTOP_RC))
     fat_write(recovery, 'BOOT/INIT.RC', RECOVERY_RC)
     fat_write(desktop, 'BOOT/BIN/BASH', (profile / 'bin/bash').read_bytes())
@@ -252,6 +254,8 @@ def main():
                         help='Standalone recovery initrd containing the pinned static FAT and ext2 checkers')
     parser.add_argument('--network', choices=('hostonly', 'nat'), default='hostonly')
     parser.add_argument('--data-mib', type=int, default=6144)
+    parser.add_argument('--autofit', action='store_true',
+                        help='enable VMware Workstation host resize hints for the desktop boot')
     parser.add_argument('--payload-id', default='vmware-persistent')
     args = parser.parse_args()
     if not 1024 <= args.data_mib <= 32768:
@@ -294,7 +298,7 @@ def main():
                'ETC/ahci-boot-volume': esp_selector.encode(), 'ETC/ahci-data-volume': data_selector.encode()}
     build = build_kernel(work, policy_path)
     payload = {**get_checkers(checkers, work), **boot_helpers(build, work, policy_path), **records}
-    desktop, recovery = make_initrds(work, build, payload, policy_path, profile, commit, args.payload_id)
+    desktop, recovery = make_initrds(work, build, payload, policy_path, profile, commit, args.payload_id, args.autofit)
     run(sys.executable, ROOT / 'scripts/build_dell_loader.py', '--shared', work,
         '--output', work / 'loader')
     efi, kernel = work / 'loader/BROOKGUARD.efi', build / 'BROOK.elf'
@@ -305,7 +309,7 @@ def main():
 
     (dest / 'Brook.vmx').write_text(vmx(args.network))
     report = {'version': 1, 'commit': commit, 'profile': str(profile), 'payload_id': args.payload_id,
-              'network': args.network, 'disk_guid': str(disk_id), 'esp_guid': str(esp_id),
+              'network': args.network, 'autofit': args.autofit, 'disk_guid': str(disk_id), 'esp_guid': str(esp_id),
               'data_guid': str(data_id), 'ext2_uuid': str(fs_id), 'sectors': total,
               'esp_first': ESP_FIRST, 'esp_sectors': ESP_SECTORS, 'data_first': DATA_FIRST,
               'data_sectors': data_count, 'vmdk_sha256': digest(vmdk),

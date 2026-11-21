@@ -67,6 +67,7 @@ static const DisplayOps g_gopOps = {
 
 static const DisplayOps* g_activeDisplay = &g_gopOps;
 static const DisplayCursorOps* g_cursorOps = nullptr;
+static const DisplayModePollOps* g_modePollOps = nullptr;
 static KMutex g_framebufferChangeLock{};
 static const DisplayOps* g_managedFramebufferOwner = nullptr;
 static bool g_managedChangeActive = false;
@@ -170,6 +171,20 @@ void DisplayCommitCursor()
 {
     const auto* ops = __atomic_load_n(&g_cursorOps, __ATOMIC_ACQUIRE);
     if (ops && ops->display == DisplayGetActive()) ops->Commit();
+}
+
+void DisplayRegisterModePoll(const DisplayModePollOps* ops)
+{
+    if (!ops || !ops->Poll || ops->display != DisplayGetActive()) return;
+    const uintptr_t table = reinterpret_cast<uintptr_t>(ops);
+    if (ModuleRetainAddresses(&table, 1))
+        __atomic_store_n(&g_modePollOps, ops, __ATOMIC_RELEASE);
+}
+
+void DisplayPollModeHints()
+{
+    const auto* ops = __atomic_load_n(&g_modePollOps, __ATOMIC_ACQUIRE);
+    if (ops && ops->display == DisplayGetActive()) ops->Poll();
 }
 
 bool DisplayUsesFirmwareFramebuffer() { return DisplayGetActive()==&g_gopOps; }

@@ -4722,6 +4722,9 @@ static void CompositorThreadFn(void* /*arg*/)
 #endif
         FrameTimingBegin();
         if (!g_compositorHalted) {
+            // A mode hint may lock the compositor frame and replace its
+            // geometry. Poll only between completed frame transactions.
+            DisplayPollModeHints();
             DisplayPowerTick(ApicTickCount(),InputLatestSequence());
             { FrameTimingScope phase(FramePhase::DeferredCaptures);DrainOwnedCaptures(); }
             { FrameTimingScope phase(FramePhase::SceneDrain);CompositorDrainScenes(); }
@@ -5150,6 +5153,7 @@ static bool ReplaceCompositorFramebuffer(uint64_t fbPhys, uint32_t w, uint32_t h
     CompositorUnlockScanoutForDisplayChange();
     if (retiredPages) VmmFreePages(retired, retiredPages);
     MouseSetBounds(w,h);MarkAllDirty();
+    if (replaceTty && WmIsActive()) WmApplyDisplaySize(w,h);
     if (replaceTty || cancelled) { CompositorMarkDirty(); CompositorWake(); }
     SerialPrintf("COMPOSITOR: remapped to %ux%u stride=%u\n",w,h,stridePixels);
     return true;

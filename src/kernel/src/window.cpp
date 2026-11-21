@@ -1761,21 +1761,31 @@ bool WmResizeWindow(int idx,uint16_t newClientW,uint16_t newClientH)
     return ResizeWindowLocked(idx,newClientW,newClientH);
 }
 
-bool WmApplyScalePending()
+static void ReframeDesktopWindowsLocked(const DesktopMetrics* next,
+                                        uint32_t sw,uint32_t sh,bool displayChanged)
 {
-    const auto* next=DesktopMetricsFor(WmGetRequestedScale());
-    if (!next || next==&WmDesktopMetrics()) return false;
-    uint32_t sw,sh;CompositorGetPhysDims(&sw,&sh);
-    VfbGuard guard;
     const int desktopH=sh>static_cast<uint32_t>(next->taskbar()) ? sh-next->taskbar() : 0;
     for (auto& w:g_windows) {
         if (!w.proc) continue;
         const auto& before=w.desktopMetrics();
         if (w.fullscreen) {
-            // Still covers the output; only the geometry it returns to changes.
-            auto saved=ReframeDesktopWindow({w.fsX,w.fsY,w.fsW,w.fsH,w.fsNoChrome},before,*next,sw,desktopH,false);
+            const auto saved=ReframeDesktopWindow({w.fsX,w.fsY,w.fsW,w.fsH,w.fsNoChrome},before,*next,sw,desktopH,false);
             w.fsX=static_cast<int16_t>(saved.x);w.fsY=static_cast<int16_t>(saved.y);
-            w.metrics=next;continue;
+            w.metrics=next;
+            if (displayChanged && sw>=WM_MIN_WIDTH && sh>=WM_MIN_HEIGHT && sw<=32767 && sh<=32767) {
+                if (w.fsState==WindowState::Maximized) {
+                    const auto area=WorkAreaFor(*next,sw,sh);
+                    const int border=w.fsNoChrome ? 0 : next->border();
+                    const int title=w.fsNoChrome ? 0 : next->title();
+                    const int width=area.w-2*border,height=area.h-title-2*border;
+                    if (width>=int(WM_MIN_WIDTH) && height>=int(WM_MIN_HEIGHT)) {
+                        w.fsX=static_cast<int16_t>(area.x);w.fsY=static_cast<int16_t>(area.y);
+                        w.fsW=static_cast<uint16_t>(width);w.fsH=static_cast<uint16_t>(height);
+                    }
+                }
+                (void)ResizeWindowLocked(static_cast<int>(&w-g_windows),uint16_t(sw),uint16_t(sh));
+            }
+            continue;
         }
         if (w.docked) {
             // The page follows the sidebar; the floating geometry it returns
@@ -1804,11 +1814,26 @@ bool WmApplyScalePending()
                 // Keep the existing owned pixels and make the window movable
                 // if memory cannot satisfy a new maximized backing allocation.
                 w.state=WindowState::Normal;
-                SerialPrintf("WM: scale resize failed for window %u; preserving client buffer\n",w.wmId);
+                SerialPrintf("WM: desktop resize failed for window %u; preserving client buffer\n",w.wmId);
             }
         }
         w.proc->fbDestX=w.clientX();w.proc->fbDestY=w.clientY();
     }
+}
+
+void WmApplyDisplaySize(uint32_t width,uint32_t height)
+{
+    VfbGuard guard;
+    ReframeDesktopWindowsLocked(&WmDesktopMetrics(),width,height,true);
+}
+
+bool WmApplyScalePending()
+{
+    const auto* next=DesktopMetricsFor(WmGetRequestedScale());
+    if (!next || next==&WmDesktopMetrics()) return false;
+    uint32_t sw,sh;CompositorGetPhysDims(&sw,&sh);
+    VfbGuard guard;
+    ReframeDesktopWindowsLocked(next,sw,sh,false);
     BeginBackdropStyleChange();
     __atomic_store_n(&g_desktopMetrics,next,__ATOMIC_RELEASE);
     EndBackdropStyleChange();

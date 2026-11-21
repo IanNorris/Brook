@@ -93,6 +93,13 @@ extern "C" void DisplayRegisterCursor(const DisplayCursorOps* ops);
 bool DisplayPrepareCursor(const CursorImage* image, int32_t x, int32_t y);
 void DisplayCommitCursor();
 
+struct DisplayModePollOps {
+    const DisplayOps* display;
+    void (*Poll)();
+};
+extern "C" void DisplayRegisterModePoll(const DisplayModePollOps* ops);
+void DisplayPollModeHints();
+
 // Get the active display. Returns the GOP fallback if no driver registered.
 const DisplayOps* DisplayGetActive();
 bool DisplayUsesFirmwareFramebuffer();

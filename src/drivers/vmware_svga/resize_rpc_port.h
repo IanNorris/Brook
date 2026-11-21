@@ -8,14 +8,18 @@ namespace brook::svga {
 // Low-bandwidth VMware MESSAGE adapter. There is no probe on physical PCs or
 // other hypervisors, no general command interface, and no host buffer address.
 class ResizeRpcPort {
-    bool available_;
+    bool available_ = false;
 
 public:
-    ResizeRpcPort() : available_(VmwarePlatformPresent(
-        [](uint32_t leaf, uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) {
-            __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
-                             : "a"(leaf), "c"(0));
-        })) {}
+    bool Probe()
+    {
+        available_ = VmwarePlatformPresent(
+            [](uint32_t leaf, uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) {
+                __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+                                 : "a"(leaf), "c"(0));
+            });
+        return available_;
+    }
 
     bool operator()(resize_rpc::Registers& r) const
     {

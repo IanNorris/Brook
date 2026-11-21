@@ -1298,6 +1298,16 @@ int main() {
             CHECK(state.client_x==0 && state.client_y==0 && state.width==sw && state.height==sh);
         }
         WmInputPop(&g,drain,256);
+        testScreenW=1366;testScreenH=900;
+        WmApplyDisplaySize(testScreenW,testScreenH);
+        CHECK(g.fullscreen && g.clientW==1366 && g.clientH==900 && g.x==0 && g.y==0);
+        CHECK(WmInputPop(&g,&event,1)==1 && event.type==WM_EVT_RESIZED &&
+              event.reserved==WM_RESIZE_FULLSCREEN && event.x==1366 && event.y==900);
+        CHECK(g.fsW==testScreenW-2*WmMetric(WM_BORDER_WIDTH));
+        testScreenW=sw;testScreenH=sh;
+        WmApplyDisplaySize(sw,sh);
+        CHECK(g.fullscreen && g.clientW==sw && g.clientH==sh);
+        WmInputPop(&g,drain,256);
         CHECK(WmSetFullscreen(game,false) && !g.fullscreen && g.state==WindowState::Maximized);
         // The decoration requested while fullscreen (server-side) applies now.
         CHECK(!g.noChrome && g.clientH<WmDesktopHeight(sh) && taskbarShown());
