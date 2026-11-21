@@ -206,6 +206,17 @@ A CPU read cannot do this alone: the CPU shares the LLC with the GT, so it alway
 - **Timelines added:**
   - Desktop stats `timeline`: the last 32 frames as `[start, submit, fence, present_call, presented (µs), image, partial, draw_pixels, commit]`.
   - `gpu zerocopy timeline`: the last 64 presents as `[sequence, image, queued, present_us, arm_us, latch_us, vblanks]`, on the same TSC-based microsecond clock.
+  - `gpu zerocopy client-timeline`: the last 64 admitted direct-client
+    presents in builds with GPU submission timing. Each row identifies the
+    renderer incarnation, its internal frame ID, the DMA-BUF inode and the
+    publication worker chosen at admission. Monotonic microsecond timestamps
+    mark admission, the cache flush, the display register arm, the first
+    confirmed live-frame observation, and release of the kernel's buffer
+    hold. The older row's `retired_by` names the new row in a normal
+    replacement. Restore and pre-arm failure have no successor. Wayland
+    buffer release is later because the renderer still has to poll and
+    retire any outstanding GPU use before sending SAFE.
+
 
 ### Present path and fallbacks
 

@@ -5,6 +5,7 @@
 #include "intel_bdw_display_flip.h"
 #include "intel_bdw_zero_copy.h"
 #include "intel_bdw_client_scanout.h"
+#include "intel_bdw_client_timeline.h"
 
 struct BrookGpuClientScanoutStatus;
 
@@ -39,6 +40,7 @@ bool BdwClientScanoutService(bool canPresent);
 bool BdwClientScanoutWakeWorker();
 bool BdwClientScanoutSetApPublication(bool enabled);
 bool BdwClientScanoutApPublication();
+uint32_t BdwClientScanoutReadTimeline(BdwClientTimelineEntry* out,uint32_t max);
 // Address and layout are published together. Changes are permitted only
 // after the worker proves the mapping is neither programmed nor live.
 constexpr uint32_t BdwClientScanoutSlots=3;
