@@ -105,6 +105,7 @@ static void TestSleepControls(Firmware& f)
     assert(f.init() && AcpiGetS5Info().controls.pm1b==0x504);
     configure(0x404,0x404);
     assert(f.init() && !AcpiGetS5Info().Available());
+    assert(!std::strcmp(AcpiGetS5Info().reason,"S5: invalid or overlapping FADT PM1b control port"));
     configure(0x405,0);
     assert(f.init() && !AcpiGetS5Info().Available());
     configure(0x404,0);
@@ -118,6 +119,7 @@ static void TestSleepControls(Firmware& f)
     Firmware::put32(f.fadt+112,1u<<10);f.fadtCrc();
     dsdt[9]^=1;
     assert(f.init() && !AcpiGetS5Info().Available());
+    assert(!std::strcmp(AcpiGetS5Info().reason,"S5: no valid DSDT from FADT"));
     dsdt[9]^=1;
     auto* ssdt=f.memory+24576;
     Firmware::header(ssdt,"SSDT",36+sizeof(aml));
@@ -225,7 +227,7 @@ int main(){
         uint8_t copy[8]{};assert(reader.CopyTable(reader.Dsdt(),0,copy,sizeof(copy)) && !std::memcmp(copy,"DSDT",4));
         assert(f.init() && AcpiInventoryCount()==3);
         assert(AcpiInventoryRead(0,0,copy,sizeof(copy),table) && !std::memcmp(copy,"DSDT",4));
-        assert(!AcpiInventoryRead(1,0,copy,0,table)); // FADT is not an AML table
+        assert(AcpiInventoryRead(1,0,copy,4,table) && !std::memcmp(copy,"FACP",4));
         std::memcpy(f.fadt,"MSDM",4);f.fadtCrc();assert(!AcpiInventoryRead(1,0,copy,4,table));
         std::memcpy(f.fadt,"SSDT",4);f.fadtCrc();assert(AcpiInventoryRead(1,0,copy,4,table) && !std::memcmp(copy,"SSDT",4));
         std::memcpy(f.fadt,"DMAR",4);f.fadtCrc();assert(AcpiInventoryRead(1,0,copy,4,table) && !std::memcmp(copy,"DMAR",4));

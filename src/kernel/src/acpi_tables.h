@@ -161,18 +161,27 @@ public:
         result.available=true;result.port=uint16_t(port);result.wide=(flags&(1u<<8))!=0;return result;
     }
     // Fully advertised 16-bit System I/O PM1 control registers only.
-    AcpiSleepControls SleepControls() const {
+    AcpiSleepControls SleepControls(const char** reason=nullptr) const {
+        auto refuse=[&](const char* message) -> AcpiSleepControls {
+            if(reason)*reason=message;
+            return {};
+        };
         AcpiSdtHeader fadt{};
         const uint64_t address=Find("FACP",&fadt);
-        if(!address || fadt.length<116)return {};
+        if(!address)return refuse("S5: no valid FADT");
+        if(fadt.length<116)return refuse("S5: FADT is too short");
         uint32_t flags=0,legacyA=0,legacyB=0;
         uint8_t length=0;
-        if(!Copy(address+112,&flags,4) || (flags&(1u<<20)) ||
-           !Copy(address+64,&legacyA,4) || !Copy(address+68,&legacyB,4) ||
-           !Copy(address+89,&length,1) || length!=2)return {};
+        if(!Copy(address+112,&flags,4) || !Copy(address+64,&legacyA,4) ||
+           !Copy(address+68,&legacyB,4) || !Copy(address+89,&length,1))
+            return refuse("S5: FADT control fields unreadable");
+        if(flags&(1u<<20))return refuse("S5: hardware-reduced FADT");
+        if(length!=2)return refuse("S5: FADT PM1 control length is not two bytes");
         uint16_t a=0,b=0;
-        if(!ControlPort(address,fadt.length,172,legacyA,a) || !a ||
-           !ControlPort(address,fadt.length,184,legacyB,b) || a==b)return {};
+        if(!ControlPort(address,fadt.length,172,legacyA,a) || !a)
+            return refuse("S5: invalid or missing FADT PM1a control port");
+        if(!ControlPort(address,fadt.length,184,legacyB,b) || a==b)
+            return refuse("S5: invalid or overlapping FADT PM1b control port");
         return {a,b};
     }
     // Discover the fixed-register subset used by a legacy FACS Global Lock

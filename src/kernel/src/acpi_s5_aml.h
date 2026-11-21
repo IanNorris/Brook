@@ -11,6 +11,7 @@ class AmlReader {
 public:
     AmlReader(const uint8_t* bytes,uint32_t length) : cursor_(bytes),left_(length) {}
     uint32_t Remaining() const { return left_; }
+    const uint8_t* Cursor() const { return cursor_; }
     uint8_t Peek() const { return left_?*cursor_:0; }
     bool Byte(uint8_t& value)
     {
@@ -211,6 +212,7 @@ inline bool FieldList(AmlReader& field,AmlPath scope)
 }
 
 struct S5State {
+    const uint8_t* term=nullptr;
     bool found=false;
     uint8_t typeA=0,typeB=0;
 };
@@ -219,7 +221,9 @@ inline bool NamespaceTerms(AmlReader aml,AmlPath scope,unsigned level,S5State& s
 {
     if (level>24) return false;
     uint8_t op=0;
-    while (aml.Byte(op)) {
+    while (aml.Remaining()) {
+        s5.term=aml.Cursor();
+        aml.Byte(op);
         AmlPath name{},source{};
         AmlReader body(nullptr,0);
         uint64_t value=0;
@@ -292,11 +296,16 @@ inline bool NamespaceTerms(AmlReader aml,AmlPath scope,unsigned level,S5State& s
 // Resolve only a literal root _S5 package. The caller first validates the SDT
 // checksum and supplies only its AML body. Executable definitions, unsupported
 // load-time syntax, malformed namespace terms and duplicate definitions fail closed.
-inline AcpiS5Result AcpiReadStaticS5(const uint8_t* aml,uint32_t size,uint8_t& typeA,uint8_t& typeB)
+inline AcpiS5Result AcpiReadStaticS5(const uint8_t* aml,uint32_t size,uint8_t& typeA,uint8_t& typeB,
+                                         uint32_t* failureOffset=nullptr)
 {
+    if (failureOffset) *failureOffset=0;
     if (!aml || size>1024*1024) return AcpiS5Result::Unsupported;
     acpi_s5::S5State s5{};
-    if (!acpi_s5::NamespaceTerms({aml,size},{},0,s5)) return AcpiS5Result::Unsupported;
+    if (!acpi_s5::NamespaceTerms({aml,size},{},0,s5)) {
+        if (failureOffset && s5.term) *failureOffset=uint32_t(s5.term-aml);
+        return AcpiS5Result::Unsupported;
+    }
     if (!s5.found) return AcpiS5Result::Absent;
     typeA=s5.typeA;
     typeB=s5.typeB;

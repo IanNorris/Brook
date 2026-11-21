@@ -97,6 +97,11 @@ int main()
     Expect(WithPackage(s5Package, {2, 0, 0xff}), AcpiS5Result::Unsupported);
     Expect(WithPackage(s5Package, {2, 'N', 'A', 'M', 'E', 1}), AcpiS5Result::Unsupported);
     Expect(Append(s5, {0xa0, 2, 1}), AcpiS5Result::Unsupported);
+    const Bytes unsupported = WithPackage({0x10}, Append({0x5c, 0}, Append(s5, {0xa0, 2, 1})));
+    uint8_t typeA=0,typeB=0;
+    uint32_t offset=0;
+    assert(AcpiReadStaticS5(unsupported.data(),unsupported.size(),typeA,typeB,&offset)==AcpiS5Result::Unsupported);
+    assert(offset==unsupported.size()-3 && unsupported[offset]==0xa0);
     Expect(Append(s5Package, {0x53, 0, 2, 0, 0}), AcpiS5Result::Unsupported);
     Expect(Append(s5Package, {0x40, 0}), AcpiS5Result::Unsupported);
     Expect({0x08, '_', 'S', '5', 'a', 0}, AcpiS5Result::Unsupported);
