@@ -1,6 +1,7 @@
 // H-26 / M-18: wakeup sources for sync files, pipe POLLOUT and eventfds,
 // through the real PollWait, read() and write() paths.
 #include "harness.h"
+#include "intel_bdw_prompt_wake.h"
 #include "syscall_poll.cpp"
 #include "syscall_eventfd.cpp"
 // The real pipe endpoints and poll subscriptions (PipePollNotify).
@@ -34,7 +35,7 @@ static void PollSyncFile() {
     g_blockInterruptibleHook=RecordBlock;g_blockTick=0;
     brook::pollfd fds[1]{{3,brook::POLLIN,0}};
     CHECK(brook::PollWait(fds,1,1000)==-brook::EINTR);
-    // Prompt wakes cannot arm on the host, so the wait polls every tick.
+    // With prompt wakes off, the real wait registry falls back to every tick.
     CHECK(g_blockTick==brook::ApicTickCount()+1);
     // A fence that retires before the wait arms is rechecked, not slept on.
     brook::BdwFenceComplete(fence.intelFence,true);
@@ -43,6 +44,7 @@ static void PollSyncFile() {
     CHECK(g_blockTick==0);
     brook::BdwFenceUnref(fence.intelFence);
     // The wait helper: a retirement between snapshot and arm means "recheck".
+    brook::BdwPromptWakeSet(true);
     brook::SyncFileData pending{1,0,2,brook::BdwFenceCreate(false)};
     {
         brook::SyncFileWait wait;wait.Want(pending);
@@ -54,6 +56,41 @@ static void PollSyncFile() {
         CHECK(!wait.Arm() && wait.SafetyMs(50)==50); // nothing pending: unchanged
     }
     brook::BdwFenceUnref(pending.intelFence);
+    brook::BdwPromptWakeSet(false);
+}
+
+static brook::BdwFence* g_fenceOnBlock;
+static void CompleteFenceOnBlock(brook::Process* p) {
+    auto* fence = g_fenceOnBlock;
+    g_fenceOnBlock = nullptr;
+    if (!fence || !brook::BdwFenceComplete(fence, true) || !Woke(p))
+        brook::g_pendingSignals = true;
+}
+
+static void PollArmedSyncFile() {
+    Reset(); ResetProcess();
+    auto* proc = CurrentProcess();
+    auto* producer = brook::BdwFenceCreate(false);
+    // An exported immutable fence may resolve through a dependency.
+    brook::SyncFileData file{1, 0, 3, brook::BdwFenceCreate(true, nullptr, 0, producer)};
+    proc->fds[3].type = brook::FdType::SyncFile;
+    proc->fds[3].handle = &file;
+    brook::pollfd fds[]{{3, brook::POLLIN, 0}};
+    CHECK(brook::PollWait(fds, 1, 0) == 0 && fds[0].revents == 0);
+    brook::BdwPromptWakeSet(true);
+    g_wakes = 0;
+    g_wakeHook = CountWake;
+    g_blockInterruptibleHook = CompleteFenceOnBlock;
+    g_fenceOnBlock = producer;
+    CHECK(brook::PollWait(fds, 1, 1000) == 1 && fds[0].revents == brook::POLLIN);
+    CHECK(!g_fenceOnBlock && g_wakes == 1 && Woke(proc));
+    brook::BdwGpuEventSignal(brook::BdwGpuEvent::Retire);
+    CHECK(g_wakes == 1); // one-shot and no lingering registration
+    g_wakeHook = nullptr;
+    g_blockInterruptibleHook = nullptr;
+    brook::BdwPromptWakeSet(false);
+    brook::BdwFenceUnref(file.intelFence);
+    brook::BdwFenceUnref(producer);
 }
 
 // poll(POLLOUT) on a full pipe write end is woken when a reader drains it.
@@ -136,6 +173,7 @@ void RunWaitTests() {
     PipeAtFullTable();
     PollHoldOutlivesEndpoints();
     PollSyncFile();
+    PollArmedSyncFile();
     PollPipeWriteEnd();
     EventFdWakesEveryWaiter();
 }

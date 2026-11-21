@@ -23,6 +23,7 @@
 #include "pipe.h"
 #undef __BROOK_KERNEL__
 #include "syscall_epoll.cpp"
+#include "intel_bdw_prompt_wake.h"
 
 #include <initializer_list>
 #include <pthread.h>
@@ -152,8 +153,20 @@ static uint64_t NowNs() {
 uint64_t ClockNowNs(uint64_t) { return NowNs(); }
 uint64_t WaitDeadlineNs(uint64_t ms) { return ms == ~0ull ? ~0ull : NowNs() + ms * 1000000ull; }
 uint64_t WaitWakeupTick(uint64_t, uint64_t) { return 0; }
-// A "sleep" is a short host sleep; epoll_wait_impl then rescans.
-void SchedulerBlockInterruptible(Process*) { SleepUs(200); }
+static BdwFence* g_fenceOnBlock;
+static unsigned g_fenceWakes;
+void SchedulerUnblock(Process* task) {
+    if (task == ProcessCurrent()) ++g_fenceWakes;
+}
+// A "sleep" is a short host sleep, unless a deterministic fence test
+// publishes the completion with the production waiter already armed.
+void SchedulerBlockInterruptible(Process*) {
+    if (g_fenceOnBlock) {
+        auto* fence = g_fenceOnBlock;
+        g_fenceOnBlock = nullptr;
+        CHECK(BdwFenceComplete(fence, false));
+    } else SleepUs(200);
+}
 
 EventFdSnapshot EventFdReady(EventFdData* efd, uint32_t events) {
     EventFdSnapshot s{};
@@ -465,6 +478,33 @@ static void TestCloseDuringWait() {
     for (int fd : {ep, childLeaf, wake, s, reused}) TestClose(fd);
 }
 
+static void TestSyncFileWake() {
+    const int ep = Create(), nested = Create();
+    auto* producer = BdwFenceCreate(false);
+    SyncFileData file{1, 0, 77, BdwFenceCreate(true, nullptr, 0, producer)};
+    const int fd = FdAlloc(g_proc, FdType::SyncFile, &file, 0, 0, 0);
+    CHECK(Ctl(nested, EPOLL_CTL_ADD, fd, EPOLLIN | EPOLLONESHOT, 123) == 0);
+    CHECK(Ctl(ep, EPOLL_CTL_ADD, nested, EPOLLIN, 456) == 0);
+    EpollEvent event{};
+    CHECK(Wait(ep, &event, 1, 0) == 0);
+    BdwPromptWakeSet(true);
+    g_fenceWakes = 0;
+    g_fenceOnBlock = producer;
+    CHECK(Wait(ep, &event, 1, 1000) == 1);
+    CHECK(event.events == EPOLLIN && event.data.u64 == 456);
+    CHECK(!g_fenceOnBlock && g_fenceWakes == 1);
+    CHECK(Wait(nested, &event, 1, 0) == 1);
+    CHECK(event.events == EPOLLIN && event.data.u64 == 123);
+    CHECK(SyncFileState(file) == 2); // failed fences are still readable
+    CHECK(Wait(ep, &event, 1, 0) == 0); // nested one-shot was consumed
+    BdwGpuEventSignal(BdwGpuEvent::Retire);
+    CHECK(g_fenceWakes == 1);
+    BdwPromptWakeSet(false);
+    TestClose(ep); TestClose(nested); TestClose(fd);
+    BdwFenceUnref(file.intelFence);
+    BdwFenceUnref(producer);
+}
+
 int main() {
     g_proc = static_cast<Process*>(calloc(1, sizeof(Process)));
     g_proc->pid = 7;
@@ -474,6 +514,7 @@ int main() {
     TestEdgeTriggered();
     TestCtlWaitStress();
     TestCloseDuringWait();
+    TestSyncFileWake();
     if (g_failures) { fprintf(stderr, "%u failure(s)\n", g_failures); return 1; }
     printf("test_epoll_instance_lock: all passed\n");
     return 0;

@@ -185,7 +185,7 @@ void (*g_schedulerBlockHook)(brook::Process*);
 namespace brook {
 void SchedulerBlock(Process* p) { if(g_schedulerBlockHook)g_schedulerBlockHook(p);else g_pendingSignals=true; }
 void SchedulerBlockInterruptible(Process* p) { if(harness::g_blockInterruptibleHook)harness::g_blockInterruptibleHook(p);else g_pendingSignals=true; }
-void SchedulerUnblock(Process*) {}
+void SchedulerUnblock(Process* p) { if(harness::g_wakeHook)harness::g_wakeHook(p); }
 void KMutexInit(KMutex*) {}
 void KMutexLock(KMutex*) {}
 void KMutexUnlock(KMutex*) {}

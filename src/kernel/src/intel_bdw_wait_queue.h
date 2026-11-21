@@ -44,7 +44,7 @@ public:
 // degrades to the previous 1 ms polling rather than hanging.
 enum class BdwGpuEvent : uint32_t { Work=0, Retire=1, Space=2, Count=3 };
 struct BdwGpuWaiter {uint32_t event=0;unsigned slot=~0u;void* process=nullptr;};
-#ifndef BROOK_HOST_TEST
+#if !defined(BROOK_HOST_TEST) || defined(BROOK_HOST_TEST_GPU_WAIT_REGISTRY)
 uint64_t BdwGpuEventGeneration(BdwGpuEvent event);
 // Armed: caller must block (bounded) and then Disarm. Stale: re-check now.
 // Full: no slot; caller falls back to its plain timed sleep.
