@@ -81,6 +81,7 @@ template<class Io> bool CommandError(Io& io, uint32_t interruptStatus, uint32_t 
 // prior command. Let the HBA issue the next command in that narrow case.
 // The prior FIS can justify queueing only. Clear it before any new issue.
 template<class Io> Result ArmCommand(Io& io) {
+    io.postedWithStaleTaskBusy=false;
     uint32_t pending=io.read(IS);
     if(MediaChanged(io,pending))return Result::MediaChanged;
     uint32_t task=io.read(TFD);
@@ -113,6 +114,7 @@ template<class Io> Result ArmCommand(Io& io) {
     if(CommandError(io,pending,task))return Result::DeviceError;
     if((pending&D2H_REGISTER_IRQ) || ((task&TASK_ACTIVE) && !(postWithBusyShadow && task==0xc0u)))
         return Result::DeviceBusy;
+    io.postedWithStaleTaskBusy=(task&TASK_ACTIVE)!=0;
     io.write(CI,1);
     return Result::Ok;
 }

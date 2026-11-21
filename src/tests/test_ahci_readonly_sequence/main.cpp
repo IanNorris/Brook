@@ -9,7 +9,7 @@ struct Mock {
     uint32_t injectIs=0, interruptOnAck=0;
     uint32_t lastCompletionFis=0, receivedFis=0, injectFis=0x00404034u;
     uint32_t taskOnCompletion=0xffffffffu;
-    bool allowStaleTaskBusy=false;
+    bool allowStaleTaskBusy=false, postedWithStaleTaskBusy=false;
     unsigned fisClears=0;
     uint32_t settleLink=0x133, isOnPause=0, serrOnPause=0, linkOnCompletion=0;
     uint64_t now=0, stepNs=1000000;
@@ -100,7 +100,7 @@ int main(){
     };
     Mock stale=workstation();
     assert(Submit(stale,512)==Result::Ok && stale.commandIssues==2 && stale.fisClears==2);
-    assert(stale.regs[CI/4]==0 && stale.regs[TFD/4]==0xc0);
+    assert(stale.postedWithStaleTaskBusy && stale.regs[CI/4]==0 && stale.regs[TFD/4]==0xc0);
 
     Mock physical=workstation();physical.allowStaleTaskBusy=false;
     assert(Submit(physical,512)==Result::DeviceBusy && physical.commandIssues==1);
@@ -110,6 +110,7 @@ int main(){
     assert(Submit(changedFis,512)==Result::DeviceBusy && changedFis.commandIssues==1);
     Mock recovered=workstation();recovered.allowStaleTaskBusy=false;recovered.settleAfter=1;
     assert(Submit(recovered,512)==Result::Ok && recovered.commandIssues==2);
+    assert(!recovered.postedWithStaleTaskBusy);
     Mock stalledClock=workstation();stalledClock.allowStaleTaskBusy=false;stalledClock.stepNs=0;
     assert(Submit(stalledClock,512)==Result::DeviceBusy && stalledClock.polls==TASK_SETTLE_POLLS);
 

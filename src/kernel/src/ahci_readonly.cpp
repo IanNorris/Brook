@@ -65,6 +65,7 @@ struct NormalIoGuard {
 bool published=false;
 bool writeEnabled=false; // immutable after registration, even if quarantined
 bool exportEnabled=false; // immutable boot-only opt-in
+bool staleTaskBusyLogged=false; // serialized by the ordinary or panic owner
 #if defined(BROOK_AHCI_PANIC_TEST) || defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_AUTO_RECOVERY)
 bool panicTestReady=false,panicTestFat=false,panicIoMode=false;
 bool panicReservationRequested=false;
@@ -148,6 +149,7 @@ struct PortIo {
     volatile uint32_t* regs=nullptr;
     uint32_t lastCompletionFis=0;
     bool allowStaleTaskBusy=false;
+    bool postedWithStaleTaskBusy=false;
     uint32_t receivedRegisterFis() {
         return *reinterpret_cast<volatile const uint32_t*>(dma+fisOffset+0x40);
     }
@@ -389,6 +391,11 @@ bool Run(const AhciReadPlan& plan, uint32_t expected) {
         if(NeedsQuarantine(result))
             Quarantine(result==Result::MediaChanged ? "AHCI SATA media changed" : "AHCI command failed or timed out");
         return false;
+    }
+    if(io.postedWithStaleTaskBusy && !staleTaskBusyLogged && !PanicIo()) {
+        staleTaskBusyLogged=true;
+        SerialPrintf("ahci: VMware stale task status recovered port=%u op=0x%x bytes=%u\n",
+                     status.port,unsigned(plan.fis[2]),expected);
     }
     StorageIoAccount(uint32_t(StorageIoSource::Ahci),isFlush?2:plan.fis[2]==0x35?1:0,expected);
     return true;
