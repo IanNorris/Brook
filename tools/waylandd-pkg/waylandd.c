@@ -3566,6 +3566,7 @@ static uint32_t g_gpu_peer_lost_ms;
 static int g_gpu_peer_restart_asked, g_gpu_peer_restart_error;
 static const char *g_gpu_disconnect_reason = "none";
 static const char *g_gpu_connect_refusal = "none";
+static const char *g_gpu_connect_last_nonempty_refusal = "none";
 static uint64_t g_gpu_channel_connections, g_gpu_channel_losses, g_gpu_drain_waits, g_gpu_offer_local_rejected;
 static void gpu_groups_lost(void);
 static int gpu_layers_enabled(void);
@@ -3622,6 +3623,10 @@ static uint32_t gpu_window_timing_p80_bound(const struct GpuWindowTiming *s){
     for(unsigned i=0;i<10;++i){seen+=s->buckets[i];if(seen>=target)return g_gpuTimingBounds[i];}
     return UINT32_MAX;
 }
+static void gpu_image_mark_uncertain(struct brook_image *image){
+    image->offer_identity=(struct BrookGpuWindowIdentity){0};
+    image->offer_state=3;
+}
 static void gpu_window_channel_lost(const char *reason){
     if (g_gpu_window_channel >= 0) {
         ++g_gpu_channel_losses;
@@ -3638,7 +3643,7 @@ static void gpu_window_channel_lost(const char *reason){
         }
     }
     g_gpu_window_channel=-1;
-    for(struct brook_image *i=g_intel_pending_head;i;i=i->pending_next)if(i->offer_state==1)i->offer_state=3;
+    for(struct brook_image *i=g_intel_pending_head;i;i=i->pending_next)if(i->offer_state==1)gpu_image_mark_uncertain(i);
     gpu_groups_lost();
 }
 static void gpu_window_reap_dead(void){
@@ -3662,20 +3667,24 @@ static int gpu_window_channel_event(int fd,uint32_t mask,void *unused){
     if(self && g_gpu_window_source==self && (mask&(WL_EVENT_HANGUP|WL_EVENT_ERROR))){gpu_window_channel_lost("poll-hangup");intel_pending_poll();}
     return 0;
 }
+static int gpu_window_connect_refused(const char *reason){
+    g_gpu_connect_refusal=g_gpu_connect_last_nonempty_refusal=reason;
+    return 0;
+}
 static int gpu_window_channel_connect(void){
     const char *path=getenv("BROOK_WAYLAND_GPU_SOCKET");
-    if(!path || !*path){g_gpu_connect_refusal="no-configured-path";return 0;}
+    if(!path || !*path)return gpu_window_connect_refused("no-configured-path");
     if(g_gpu_window_channel>=0)return 1;
-    if(g_gpu_window_dead>=0){g_gpu_connect_refusal="retiring-old-peer";return 0;}
+    if(g_gpu_window_dead>=0)return gpu_window_connect_refused("retiring-old-peer");
     struct sockaddr_un addr={.sun_family=AF_UNIX};size_t length=strlen(path);
-    if(length>=sizeof(addr.sun_path)){g_gpu_connect_refusal="path-too-long";return 0;}
+    if(length>=sizeof(addr.sun_path))return gpu_window_connect_refused("path-too-long");
     memcpy(addr.sun_path,path,length+1);
-    int fd=socket(AF_UNIX,SOCK_SEQPACKET|SOCK_NONBLOCK|SOCK_CLOEXEC,0);if(fd<0){g_gpu_connect_refusal="socket";return 0;}
+    int fd=socket(AF_UNIX,SOCK_SEQPACKET|SOCK_NONBLOCK|SOCK_CLOEXEC,0);if(fd<0)return gpu_window_connect_refused("socket");
     if(connect(fd,(struct sockaddr *)&addr,sizeof(addr))){
-        ++g_gpu_connect_fail;g_gpu_connect_errno=errno;g_gpu_connect_refusal="connect";close(fd);return 0;
+        ++g_gpu_connect_fail;g_gpu_connect_errno=errno;close(fd);return gpu_window_connect_refused("connect");
     }
     if(syscall(BROOK_SYS_GPU_WINDOW_PEER_RECOVERY,(long)fd,(long)BROOK_GPU_WINDOW_PEER_AUTH,0L,0L,0L,0L)){
-        ++g_gpu_auth_fail;g_gpu_auth_errno=errno;g_gpu_connect_refusal="peer-auth";close(fd);return 0;
+        ++g_gpu_auth_fail;g_gpu_auth_errno=errno;close(fd);return gpu_window_connect_refused("peer-auth");
     }
     g_gpu_window_channel=fd;++g_gpu_channel_connections;g_gpu_connect_refusal="none";
     /* Without the fd source the frame clock still drains the channel. */
@@ -3837,7 +3846,7 @@ static int gpu_window_offer(struct brook_image *image){
         if(getenv("BROOK_WAYLAND_GPU_TIMING"))image->offer_sent_ms=g_now_ms();
         return 1;}
     if(sent==BROOK_GPU_WINDOW_SEND_REJECTED){++g_gpu_offer_local_rejected;return 0;}
-    if(sent<0){image->offer_state=3;gpu_window_channel_lost("send-error");return -1;}
+    if(sent<0){gpu_image_mark_uncertain(image);gpu_window_channel_lost("send-error");return -1;}
     return 0;
 }
 /* ---- Version 3 layered window offers ----------------------------------
@@ -3946,7 +3955,7 @@ static int gpu_window_offer_layers(struct brook_surface *root,const struct brook
             const uint32_t tileFlags=!db?0:db->modifier==BROOK_DRM_MOD_I915_X_TILED?BROOK_GPU_WINDOW_LAYER_TILED_X:
                 db->modifier==BROOK_DRM_MOD_I915_Y_TILED?BROOK_GPU_WINDOW_LAYER_TILED_Y:0;
             if(!db || image->pending_fd<0 || image->uncertain || (db->modifier && !tileFlags) || (db->stride&3) || (db->offset&3) ||
-               image->offer_state==3 || image->offer_state==4){++g_gpu_group_skip_buffer;return 0;}
+               image->offer_state>=2){++g_gpu_group_skip_buffer;return 0;}
             if(image->producer_fence<0){++g_gpu_group_wait;return 2;}
             if(fstat(image->pending_fd,&st) || !st.st_ino || st.st_size<=0 || (st.st_size&3)){++g_gpu_group_skip_buffer;return 0;}
             *l=(struct BrookGpuWindowLayer){.words=(uint64_t)st.st_size/4,.device=(uint64_t)st.st_dev,.inode=(uint64_t)st.st_ino,
@@ -3989,7 +3998,15 @@ static int gpu_window_offer_layers(struct brook_surface *root,const struct brook
     packet.count=count;
     int sent=brook_gpu_window_send_layers(g_gpu_window_channel,&packet,buffers,fences);
     if(sent==BROOK_GPU_WINDOW_SEND_REJECTED){++g_gpu_offer_local_rejected;return 0;}
-    if(sent<0){gpu_window_channel_lost("send-error");return -1;}
+    if(sent<0){
+        // Every producer DMA-BUF in the packet could still be read by the peer.
+        // CPU uploads use their own GEM copies and do not hold producer storage.
+        for(unsigned i=0;i<count;++i){
+            struct brook_image *image=draws[i].view->image;
+            if(image->pending_cpu==1)gpu_image_mark_uncertain(image);
+        }
+        gpu_window_channel_lost("send-error");return -1;
+    }
     if(!sent)return 2;
     struct gpu_group *group=&g_gpu_groups[slot];
     *group=(struct gpu_group){1,packet.header.identity,root->tree.current->commit,g_now_ms(),0,count,{0}};
@@ -4078,7 +4095,10 @@ static void intel_pending_poll(void){
                         intel_retry_after(INTEL_RETRY_DRAIN_MS);intel_pending_append(image);continue;
                     }
                     if(recovered<0)fence_error=EIO;
-                    else {image->offer_state=2;++g_gpu_window_recovered;}
+                    else {
+                        image->offer_identity=(struct BrookGpuWindowIdentity){0};
+                        image->offer_state=2;++g_gpu_window_recovered;
+                    }
                 }
                 else if(image->offer_state==1){
                     /* Held by the renderer: SAFE or PRESENTED arrive on the
@@ -4096,7 +4116,7 @@ static void intel_pending_poll(void){
                         if(now-image->group_wait_ms<50){intel_retry_after(INTEL_RETRY_MS);intel_pending_append(image);continue;}
                         image->offer_state=4;
                     }
-                    else if(offered<0){if(!image->offer_state)image->offer_state=3;intel_pending_append(image);continue;}
+                    else if(offered<0){if(!image->offer_state)gpu_image_mark_uncertain(image);intel_pending_append(image);continue;}
                     else if(offered>0){intel_pending_append(image);continue;}
                     else image->offer_state=4; /* fallback, no fd transferred */
                 }
@@ -4635,11 +4655,11 @@ static void waylandd_status_write(const char *display){
         (long)getpid(),now,getenv("BROOK_WAYLAND_GPU_SOCKET")!=NULL);
     fprintf(f,"\"gpu_channel\":{\"connected\":%d,\"draining\":%d,\"connections\":%llu,\"losses\":%llu,"
               "\"drain_retries\":%llu,\"locally_rejected\":%llu,\"last_disconnect\":\"%s\","
-              "\"last_refusal\":\"%s\",\"restart_requested\":%d,\"restart_errno\":%d},",
+              "\"last_refusal\":\"%s\",\"last_nonempty_refusal\":\"%s\",\"restart_requested\":%d,\"restart_errno\":%d},",
         g_gpu_window_channel>=0,g_gpu_window_dead>=0,(unsigned long long)g_gpu_channel_connections,
         (unsigned long long)g_gpu_channel_losses,(unsigned long long)g_gpu_drain_waits,
         (unsigned long long)g_gpu_offer_local_rejected,g_gpu_disconnect_reason,g_gpu_connect_refusal,
-        g_gpu_peer_restart_asked,g_gpu_peer_restart_error);
+        g_gpu_connect_last_nonempty_refusal,g_gpu_peer_restart_asked,g_gpu_peer_restart_error);
     fprintf(f,"\"offers\":{\"sent\":%llu,\"safe\":%llu,\"presented\":%llu,\"retained_snapshots\":%llu,\"recovered\":%llu,\"xwayland\":%llu,\"xwayland_enabled\":%d},",
         (unsigned long long)g_gpu_window_offers,(unsigned long long)g_gpu_window_acks,(unsigned long long)g_gpu_window_presented,
         (unsigned long long)g_intel_retained_snapshots,(unsigned long long)g_gpu_window_recovered,
