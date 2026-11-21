@@ -68,6 +68,16 @@ def build_portable(args):
                ROOT / "nix/release-packages.nix", "--output", seed)
         script("make_public_qemu.py", "--seed", seed, "--build", build,
                "--output", output / "image")
+        profile = json.loads((seed / "manifest.json").read_text())["profile"]
+        (output / "brook-image.json").write_text(json.dumps({
+            "schema": "brook-image/1",
+            "target": args.target,
+            "profile": profile,
+            "closure": closure_receipt(profile),
+            "kernel": kernel,
+            "redistributable": True,
+            "image_manifest": "image/manifest.json",
+        }, indent=2, sort_keys=True) + "\n")
         return
 
     selection = args.selection
@@ -103,13 +113,11 @@ def build_portable(args):
 
 def build_vmware(args):
     command = ["--output", args.output, "--operator-policy", args.operator_policy,
-               "--recovery-checkers-from", args.recovery_checkers_from, "--network", args.network]
+               "--recovery-checkers-from", args.recovery_checkers_from, "--network", args.network or "hostonly"]
     if args.payload_id:
         command += ["--payload-id", args.payload_id]
     if args.data_mib is not None:
         command += ["--data-mib", args.data_mib]
-    if args.autofit:
-        command.append("--autofit")
     if args.apps is None and not args.packages:
         script("make_vmware_image.py", *command)
         return
@@ -183,10 +191,9 @@ def main():
     parser.add_argument("--build", type=Path, help="Use this existing build instead of compiling Release")
     parser.add_argument("--allow-unfree", action="store_true", help="Allow approved unfree apps in a private image")
     parser.add_argument("--public-release", action="store_true", help="Require the fixed public QEMU profile")
-    parser.add_argument("--operator-policy", type=Path, help="VMware operator public keys")
+    parser.add_argument("--operator-policy", type=Path, help="VMware or Dell operator public keys")
     parser.add_argument("--recovery-checkers-from", type=Path, help="VMware pinned checker initrd")
-    parser.add_argument("--network", choices=("hostonly", "nat"), default="hostonly")
-    parser.add_argument("--autofit", action="store_true", help="Enable VMware host resize hints")
+    parser.add_argument("--network", choices=("hostonly", "nat"))
     parser.add_argument("--payload-id", help="Payload identifier for a guarded build")
     parser.add_argument("--dell-shared", type=Path, help="Private Dell pair source assets")
     parser.add_argument("--kernel-option", action="append", default=[],
@@ -209,6 +216,10 @@ def main():
         parser.error("--output must be a new directory")
     if args.target == "vmware" and (not args.operator_policy or not args.recovery_checkers_from):
         parser.error("VMware requires --operator-policy and --recovery-checkers-from")
+    if args.target != "vmware" and (args.network or args.recovery_checkers_from):
+        parser.error("Network type and checker initrd are VMware options")
+    if args.target in ("qemu", "usb") and (args.operator_policy or args.payload_id):
+        parser.error("Operator policy and payload ID are guarded target options")
     if args.target in ("vmware", "dell-pair") and args.build is not None:
         parser.error("The guarded target compiles its exact kernel")
     if args.target != "dell-pair" and (args.dell_shared or args.kernel_option):
