@@ -7620,6 +7620,15 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
                 r.text(",\"");r.text(stages[i]);r.text("\":[");r.number(us(b.ticks));r.text(",");r.number(us(b.maxTicks));r.text("]");}
             r.text("}");
         }
+        r.text("},\"client_scanout\":{");
+        r.field("count",s.clientScanout[BdwClientScanoutTotal].count);
+        r.text(",");r.field("rejected",s.clientScanoutRejected);
+        const char* clientStages[]={"bind","flush","finish","total"};
+        for(unsigned i=0;i<BdwClientScanoutStageCount;++i){
+            const auto& span=s.clientScanout[i];
+            r.text(",\"");r.text(clientStages[i]);r.text("\":[");
+            r.number(us(span.ticks));r.text(",");r.number(us(span.maxTicks));r.text("]");
+        }
         r.text("},\"yields\":{");
         const char* jobs[]={"app","compositor","present"};
         for(unsigned i=0;i<3;++i){const auto& y=s.yields[i];
@@ -7648,7 +7657,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         for(unsigned i=0;i<4;++i){if(i)r.text(",");r.number(s.flipLatchFrames[i]);}
         r.text("],");r.field("map_hits",s.mapHits);r.text(",");r.field("map_full",s.mapFull);
         r.text(",");r.field("map_failed",s.mapFailed);
-        r.text("},\"scope\":\"gpu-submit worker since reset; scanout targets=[gop per-present map,gop persistent map,flip buffer] presents, latch_us=[avg,max] from DSPASURF write to first observed DSPASURFLIVE (about 1 ms poll), latch_frames=vblanks 1,2,3,>3, missed_vblanks=vblanks beyond the first; class=[count,us,max_us], class us sum to elapsed_us; compositor=RCS job referencing a protected (non-user-mappable) buffer; present stage=[us,max_us], prepare=CPU checks, GOP backing and PPGTT build, device=forcewake critical section incl. resets, blit=run inside it, retire=release; hist buckets 0,1,2,3-4,5-8,>8 yields per job; yields/sleep_us count one-tick sleeps and include unlock, sleep and re-audit; spins/spin_us count interrupts-enabled spin slices near predicted completion, also including unlock and re-audit; hist counts sleeps; BCS completion spins and never yields; mhz=[samples,min,avg,max] RPSTAT1 CAGF at first completion poll and at breadcrumb poll; rising=end above issue; TSC wall time\"}\n");r.send();
+        r.text("},\"scope\":\"gpu-submit worker since reset; scanout targets=[gop per-present map,gop persistent map,flip buffer] presents, latch_us=[avg,max] from DSPASURF write to first observed DSPASURFLIVE (about 1 ms poll), latch_frames=vblanks 1,2,3,>3, missed_vblanks=vblanks beyond the first; class=[count,us,max_us], class us sum to elapsed_us; client_scanout=[total_us,max_us] per stage, subset of other; compositor=RCS job referencing a protected (non-user-mappable) buffer; present stage=[us,max_us], prepare=CPU checks, GOP backing and PPGTT build, device=forcewake critical section incl. resets, blit=run inside it, retire=release; hist buckets 0,1,2,3-4,5-8,>8 yields per job; yields/sleep_us count one-tick sleeps and include unlock, sleep and re-audit; spins/spin_us count interrupts-enabled spin slices near predicted completion, also including unlock and re-audit; hist counts sleeps; BCS completion spins and never yields; mhz=[samples,min,avg,max] RPSTAT1 CAGF at first completion poll and at breadcrumb poll; rising=end above issue; TSC wall time\"}\n");r.send();
 #else
         DebugChannelSend("{\"error\":\"diagnostic kernel required\"}\n");
 #endif
@@ -7696,12 +7705,20 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         if(NetStrEq(cmd,"gpu zerocopy timeline")){
             static BdwZeroCopyTimelineEntry entries[64];uint64_t khz=0;
             const uint32_t n=BdwZeroCopyReadTimeline(entries,64,khz);
-            auto us=[&](uint64_t tsc){return khz && tsc?tsc*1000/khz:0;};
-            BridgeReply r;r.text("{");r.field("count",n);r.text(",\"columns\":[\"sequence\",\"image\",\"queued\",\"present_us\",\"arm_us\",\"latch_us\",\"vblanks\"],\"rows\":[");
+            const auto clock=TscClockReadStatus();
+            const bool monotonic=clock.kind==ClockSourceKind::Tsc && !KvmClockAvailable();
+            auto us=[&](uint64_t tsc)->uint64_t{
+                if(!tsc)return 0;
+                if(monotonic)return TscClockValue(tsc,clock.originTsc,clock.originNs,clock.scale)/1000;
+                return khz?BdwWorkerTicksToUs(tsc,khz):0;
+            };
+            BridgeReply r;r.text("{");r.field("count",n);
+            r.text(",\"clock\":");r.quoted(monotonic?"monotonic":"raw-tsc");
+            r.text(",\"columns\":[\"sequence\",\"image\",\"queued\",\"present_us\",\"arm_us\",\"latch_us\",\"vblanks\"],\"rows\":[");
             for(uint32_t i=0;i<n;++i){const auto& e=entries[i];if(i)r.text(",");
                 r.text("[");r.number(e.sequence);r.text(",");r.number(e.slot);r.text(",");r.number(e.queued);r.text(",");
                 r.number(us(e.presentTsc));r.text(",");r.number(us(e.armTsc));r.text(",");r.number(us(e.latchTsc));r.text(",");r.number(e.frames);r.text("]");}
-            r.text("],\"scope\":\"zero-copy presents, oldest first; times are TSC microseconds since boot (CLOCK_MONOTONIC on the Dell uses the same TSC); present=worker present call, arm=DSPASURF write (0 if replaced in the mailbox), latch=first poll that saw it live\"}\n");
+            r.text("],\"scope\":\"zero-copy presents, oldest first; times are microseconds in the stated clock domain; present=worker acceptance, arm=DSPASURF write (0 if replaced in the mailbox), latch=first poll that saw it live\"}\n");
             r.send();return;
         }
         if(NetStrEq(cmd,"gpu zerocopy arm"))ok=BdwZeroCopyArm(note);

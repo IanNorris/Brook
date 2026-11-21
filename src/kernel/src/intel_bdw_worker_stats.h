@@ -12,6 +12,9 @@ enum BdwWorkerClass : uint32_t {
 enum BdwWorkerPresentStage : uint32_t {
     BdwPresentPrepare=0,BdwPresentDevice,BdwPresentBlit,BdwPresentRetire,BdwPresentTotal,BdwPresentStageCount
 };
+enum BdwClientScanoutStage : uint32_t {
+    BdwClientScanoutBind=0,BdwClientScanoutFlush,BdwClientScanoutFinish,BdwClientScanoutTotal,BdwClientScanoutStageCount
+};
 constexpr unsigned BdwWorkerYieldBuckets=6; // 0, 1, 2, 3-4, 5-8, >8
 inline unsigned BdwWorkerYieldBucket(uint64_t yields){return yields<3?unsigned(yields):yields<=4?3u:yields<=8?4u:5u;}
 // Broadwell RPSTAT1 CAGF (bits 13:7), in 50 MHz units, as i915 decodes it.
@@ -46,6 +49,9 @@ struct BdwWorkerStats {
     // [0]=full-screen present, [1]=partial present.
     BdwWorkerSpan present[2][BdwPresentStageCount];
     uint64_t presentPixels[2],presentFailed;
+    // Client-direct scanout runs between accounted worker jobs.
+    BdwWorkerSpan clientScanout[BdwClientScanoutStageCount];
+    uint64_t clientScanoutRejected;
     // [0]=application RCS, [1]=compositor RCS, [2]=BCS present.
     BdwWorkerYields yields[3];
     // [0]=application RCS, [1]=compositor RCS.
@@ -129,6 +135,11 @@ public:
         local_.presentPixels[k]+=pixels;
         auto& y=local_.yields[2];++y.jobs;y.yields+=yields;++y.buckets[BdwWorkerYieldBucket(yields)];
     }
+    // This is a breakdown of the time already charged to Other.
+    void ClientScanout(const uint64_t (&ticks)[BdwClientScanoutStageCount],bool accepted){
+        for(unsigned i=0;i<BdwClientScanoutStageCount;++i)BdwWorkerSpanAdd(local_.clientScanout[i],ticks[i]);
+        if(!accepted)++local_.clientScanoutRejected;
+    }
     void PresentFailed(){if(current_==BdwWorkerPresent)++local_.presentFailed;}
     // Worker thread, any interval (the flip poll also runs between jobs).
     void PresentTarget(unsigned target){if(target<3)++local_.presentTarget[target];}
@@ -166,6 +177,7 @@ void BdwWorkerStatsRender(uint64_t yields,uint64_t breadcrumbYields,uint64_t sle
                           uint64_t spins,uint64_t breadcrumbSpins,uint64_t spinTicks,
                           bool frequencySampled,uint32_t issueStatus,uint32_t endStatus);
 void BdwWorkerStatsPresent(bool full,uint64_t pixels,const uint64_t (&ticks)[BdwPresentStageCount],uint64_t yields);
+void BdwWorkerStatsClientScanout(const uint64_t (&ticks)[BdwClientScanoutStageCount],bool accepted);
 bool BdwWorkerStatsRead(BdwWorkerStats& out);
 void BdwWorkerStatsReset();
 // Flip and persistent-map counters; ignored off the worker thread.

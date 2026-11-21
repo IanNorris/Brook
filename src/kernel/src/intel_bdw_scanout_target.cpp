@@ -1468,8 +1468,17 @@ bool BdwClientScanoutService(bool canPresent){
     // pushes coherent LLC contents out to the non-snooping display.
     // The BSP worker takes no WM or compositor locks. The syscall checks
     // scene eligibility before admission and software takeover revokes it.
+#if defined(BROOK_GPU_SUBMISSION_TIMING)
+    const uint64_t start=Rdtsc();
+#endif
     const bool bound=choice && ClientBind(*choice,request);
+#if defined(BROOK_GPU_SUBMISSION_TIMING)
+    const uint64_t boundAt=Rdtsc();
+#endif
     const bool flushed=bound && BdwGpuBufferSyncCpuCache(request.buffer);
+#if defined(BROOK_GPU_SUBMISSION_TIMING)
+    const uint64_t flushedAt=Rdtsc();
+#endif
     bool accepted=false;
     {
         const uint64_t f=IrqSpinLockAcquire(&lock);
@@ -1493,6 +1502,11 @@ bool BdwClientScanoutService(bool canPresent){
         IrqSpinLockRelease(&lock,f);
     }
     BdwGpuBufferUnref(request.buffer);
+#if defined(BROOK_GPU_SUBMISSION_TIMING)
+    const uint64_t end=Rdtsc();
+    const uint64_t times[]={boundAt-start,flushedAt-boundAt,end-flushedAt,end-start};
+    BdwWorkerStatsClientScanout(times,accepted);
+#endif
     return true;
 }
 
