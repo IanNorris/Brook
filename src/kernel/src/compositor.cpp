@@ -75,6 +75,9 @@ void CompositorRecordDesktopPresent() {
 #endif
 
 static KMutex g_scanoutMappingLock{};
+// Linear device geometry must change between frames. The scanout lock alone
+// protects copy-out, while scene raster also snapshots dimensions and stride.
+static KMutex g_linearDisplayFrameLock{};
 static CompositorPresentLease g_presentLease{};
 // Compositor progress and guest time when the most recent leased image was
 // published. Protected by the scanout mapping lock, like the image itself.
@@ -4391,6 +4394,7 @@ CompositorIdleStats CompositorReadIdleStats(bool reset)
 }
 static void CompositorLoop()
 {
+    CompositorMutexGuard displayFrame(&g_linearDisplayFrameLock);
     FrameTimingScope framePhase(FramePhase::Preparation);
     if (!g_physFb)
         return;
@@ -5120,6 +5124,7 @@ static bool ReplaceCompositorFramebuffer(uint64_t fbPhys, uint32_t w, uint32_t h
     g_physFb=physical;g_physFbWidth=w;g_physFbHeight=h;g_physFbStride=stridePixels;
     GopShadowInvalidate();
     g_backBuffer=buffer;g_backBufStride=stridePixels;
+    if (replaceTty) g_cursorVisible = false;
     if(g_displayGeneration)++g_displayGeneration;
     TtyRedirectToBackbuffer(buffer);
     CompositorUnlockScanoutForDisplayChange();
@@ -5136,6 +5141,7 @@ void CompositorRemap(uint64_t fbPhys, uint32_t w, uint32_t h, uint32_t stridePix
 
 bool CompositorRemapLinearDisplay(uint64_t fbPhys, uint32_t w, uint32_t h, uint32_t stridePixels)
 {
+    CompositorMutexGuard displayFrame(&g_linearDisplayFrameLock);
     return ReplaceCompositorFramebuffer(fbPhys, w, h, stridePixels, true);
 }
 
