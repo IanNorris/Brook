@@ -67,6 +67,7 @@ int VfsMountNamespaceBindAt(MountNamespace* ns,const VfsPath& root,const VfsPath
 int VfsMountNamespaceBind(MountNamespace* ns,const VfsPath& source,const VfsPath& target,bool recursive=false);
 // Serialize exact namespace-root validation with creation of an FsContext.
 // The callback only registers a fully allocated context; no backend/free work.
+bool VfsMountNamespaceHasRoot(MountNamespace* ns,const VfsPath& root);
 int VfsMountNamespacePublishContext(MountNamespace* ns,const VfsPath& root,void (*publish)(void*),void* argument);
 int VfsMountNamespacePivotRoot(MountNamespace* ns,const VfsPath& oldRoot,const VfsPath& newRoot,const VfsPath& putOld);
 // PRIVATE and SLAVE (+ optional REC) coincide while every mount is private

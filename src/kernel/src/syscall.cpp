@@ -402,6 +402,7 @@ void SyscallTableInit()
     g_syscallTable[SYS_PSELECT6]        = sys_pselect6;
     g_syscallTable[SYS_SENDFILE]        = sys_sendfile;
     g_syscallTable[SYS_KILL]            = sys_kill;
+    g_syscallTable[SYS_CHROOT]          = sys_chroot;
     g_syscallTable[SYS_CHDIR]           = sys_chdir;
     g_syscallTable[SYS_FCHDIR]          = sys_fchdir;
     g_syscallTable[SYS_RENAME]          = sys_rename;

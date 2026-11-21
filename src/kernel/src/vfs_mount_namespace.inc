@@ -291,6 +291,13 @@ struct VfsMountTargetLease {
     ~VfsMountTargetLease() {VfsPathRelease(value);}
     int Follow(const VfsPath& input) {value=input;VfsPathRetain(value);return VfsEnterMountsLocked(&value);}
 };
+bool VfsMountNamespaceHasRoot(MountNamespace* ns,const VfsPath& root)
+{
+    if(!ns || !root.object || !root.attachment)return false;
+    FileMutationGuard lookup(false);
+    return !ns->life.IsRetired() && ns->root && root.attachment==ns->root &&
+        root.object->identity==ns->root->rootIdentity && root.object->ops==ns->root->rootObjectOps;
+}
 int VfsMountNamespacePublishContext(MountNamespace* ns,const VfsPath& root,void (*publish)(void*),void* argument)
 {
     if(!ns || !root.object || !root.attachment || !publish)return -22;

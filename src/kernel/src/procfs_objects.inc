@@ -3,7 +3,7 @@
 // reference is kept (cwd=/proc/self must not create a Process ownership cycle).
 static constexpr uint32_t PROC_PID_EXE=5,PROC_PID_CWD=6,PROC_PID_ROOT=8;
 static_assert(NUM_PID_ENTRIES==13,"Update retained proc PID entry indices when changing the catalog");
-enum class ProcObjectKind : uint8_t { Root,Net,Pid,Task,Fds,GlobalFile,NetFile,PidFile,FdLink,Self,ThreadSelf,UserMap,Sys,SysKernel,OverflowId,NsDirectory,NsLink };
+enum class ProcObjectKind : uint8_t { Root,Net,Pid,Task,Fds,GlobalFile,NetFile,PidFile,FdLink,Self,ThreadSelf,UserMap,Sys,SysKernel,OverflowId,NsDirectory,NsLink,FdInfoDir,FdInfoFile };
 struct ProcObject {
     VfsObject object;
     VfsObject* parent;
@@ -23,7 +23,8 @@ static uint64_t g_procObjectIdentity=2;
 static const VfsObjectOps* ProcObjectOperations();
 static bool ProcObjectDirectory(ProcObjectKind kind)
 {
-    return kind<=ProcObjectKind::Fds || kind==ProcObjectKind::Sys || kind==ProcObjectKind::SysKernel || kind==ProcObjectKind::NsDirectory;
+    return kind<=ProcObjectKind::Fds || kind==ProcObjectKind::Sys || kind==ProcObjectKind::SysKernel ||
+           kind==ProcObjectKind::NsDirectory || kind==ProcObjectKind::FdInfoDir;
 }
 static int ProcObjectSnapshot(const ProcObject* object,ProcessSnapshot* snapshot)
 {
@@ -93,7 +94,7 @@ static void ProcObjectDestroy(VfsObject* object)
 static int ProcReportedInode(VfsObject* object,uint64_t* out)
 {
     static_assert(MAX_FDS<=ProcInodeIndexes,"Expand proc inode index domain with the descriptor limit");
-    static_assert(static_cast<uint32_t>(ProcObjectKind::NsLink)<ProcInodeRoles);
+    static_assert(static_cast<uint32_t>(ProcObjectKind::FdInfoFile)<ProcInodeRoles);
     auto* value=static_cast<ProcObject*>(object->priv);
     return ProcInodeNumber(value->incarnation,static_cast<uint32_t>(value->kind),
                            value->taskMember,value->index,*out)?0:-75; // EOVERFLOW
@@ -102,9 +103,15 @@ static int ProcObjectStat(VfsObject* object,VnodeStat* out)
 {
     if(!out)return -22;
     auto* value=static_cast<ProcObject*>(object->priv);ProcessSnapshot snapshot{};
-    if(value->kind!=ProcObjectKind::NsDirectory && value->kind!=ProcObjectKind::NsLink)
-        if(int error=ProcObjectSnapshot(value,&snapshot))return error;
-    if(value->kind==ProcObjectKind::FdLink) {
+    if(value->kind!=ProcObjectKind::NsDirectory && value->kind!=ProcObjectKind::NsLink) {
+        const int error=ProcObjectSnapshot(value,&snapshot);
+        // A held fdinfo directory may be a chroot. It stays a directory
+        // after the original task exits, but lookups never attach to a
+        // reused PID. The detached directory has no children.
+        if(error && (error!=-2 || value->kind!=ProcObjectKind::FdInfoDir))return error;
+        if(error)snapshot={};
+    }
+    if(value->kind==ProcObjectKind::FdLink || value->kind==ProcObjectKind::FdInfoFile) {
         FdSnapshot fd{};if(!SchedulerGetFdInfo(value->pid,value->index,&fd,value->incarnation))return -2;
     }
     *out={};out->isDir=ProcObjectDirectory(value->kind);
@@ -190,12 +197,16 @@ static int ProcObjectLookup(VfsObject* object,const char* name,VfsObject** out,b
     }
     if(value->kind==ProcObjectKind::NsDirectory) {
         if(snapshot.state==ProcessState::Terminated)return -2;
-        return StrEqProc(name,"mnt")?ProcObjectMake(ProcObjectKind::NsLink,object,&snapshot,0,value->taskMember,out):-2;
+        for(uint32_t i=0;i<sizeof(ProcNamespaceNames)/sizeof(*ProcNamespaceNames);++i)
+            if(StrEqProc(name,ProcNamespaceNames[i]))
+                return ProcObjectMake(ProcObjectKind::NsLink,object,&snapshot,i,value->taskMember,out);
+        return -2;
     }
     if(value->kind==ProcObjectKind::Pid) {
         if(StrEqProc(name,"ns"))return ProcObjectMake(ProcObjectKind::NsDirectory,object,&snapshot,0,value->taskMember,out);
         if(auto kind=ProcMapKind(name))return ProcObjectMake(ProcObjectKind::UserMap,object,&snapshot,kind,value->taskMember,out);
         if(StrEqProc(name,"fd"))return ProcObjectMake(ProcObjectKind::Fds,object,&snapshot,0,value->taskMember,out);
+        if(StrEqProc(name,"fdinfo"))return ProcObjectMake(ProcObjectKind::FdInfoDir,object,&snapshot,0,value->taskMember,out);
         if(!value->taskMember && StrEqProc(name,"task"))return ProcObjectMake(ProcObjectKind::Task,object,&snapshot,0,false,out);
         for(uint32_t i=0;i<NUM_PID_ENTRIES;++i)
             if(StrEqProc(name,g_pidEntries[i].name))return ProcObjectMake(ProcObjectKind::PidFile,object,&snapshot,i,value->taskMember,out);
@@ -212,9 +223,16 @@ static int ProcObjectLookup(VfsObject* object,const char* name,VfsObject** out,b
         } else if (!SchedulerSnapshotTask(value->tgid, value->group, number, 0, &snapshot)) return -2;
         return ProcObjectMake(ProcObjectKind::Pid,object,&snapshot,0,true,out);
     }
-    if(value->kind==ProcObjectKind::Fds) {
+    if(value->kind==ProcObjectKind::Fds || value->kind==ProcObjectKind::FdInfoDir) {
+        if(value->kind==ProcObjectKind::FdInfoDir) {
+            FsSnapshot actor{};
+            const int error=ProcAcquireFsTarget(value->pid,value->incarnation,value->tgid,value->group,&actor);
+            FsSnapshotRelease(&actor);
+            if(error)return error;
+        }
         FdSnapshot fd{};if(number>=MAX_FDS || !SchedulerGetFdInfo(value->pid,number,&fd,value->incarnation))return -2;
-        return ProcObjectMake(ProcObjectKind::FdLink,object,&snapshot,number,value->taskMember,out);
+        const auto kind=value->kind==ProcObjectKind::Fds?ProcObjectKind::FdLink:ProcObjectKind::FdInfoFile;
+        return ProcObjectMake(kind,object,&snapshot,number,value->taskMember,out);
     }
     return -20;
 }
@@ -272,7 +290,8 @@ static int ProcObjectReadlink(VfsObject* object,char* out,uint32_t capacity)
 {
     auto* value=static_cast<ProcObject*>(object->priv);ProcessSnapshot snapshot{};
     if(int error=ProcObjectSnapshot(value,&snapshot))return error;
-    if(value->kind==ProcObjectKind::NsLink)return ProcNamespaceReadlink(value->pid,value->incarnation,value->tgid,value->group,out,capacity);
+    if(value->kind==ProcObjectKind::NsLink)return ProcNamespaceReadlink(value->pid,value->incarnation,value->tgid,value->group,
+        static_cast<ProcNamespaceKind>(value->index),out,capacity);
     char target[512]{};
     if(value->kind==ProcObjectKind::Self || value->kind==ProcObjectKind::ThreadSelf) {
         Process* current=ProcessCurrent();if(!current)return -2;
@@ -305,7 +324,16 @@ static int ProcObjectReadlink(VfsObject* object,char* out,uint32_t capacity)
 static Vnode* ProcObjectOpen(VfsObject* object,int flags,int* error)
 {
     *error=0;auto* value=static_cast<ProcObject*>(object->priv);ProcessSnapshot snapshot{};
-    if(value->kind!=ProcObjectKind::NsLink && (*error=ProcObjectSnapshot(value,&snapshot)))return nullptr;
+    if(value->kind!=ProcObjectKind::NsLink) {
+        *error=ProcObjectSnapshot(value,&snapshot);
+        if(*error && (*error!=-2 || value->kind!=ProcObjectKind::FdInfoDir))return nullptr;
+        if(*error) {
+            snapshot={};
+            snapshot.pid=value->pid;snapshot.incarnation=value->incarnation;
+            snapshot.tgid=value->tgid;snapshot.groupIncarnation=value->group;
+            *error=0;
+        }
+    }
     if(flags&~(VFS_O_METADATA|VFS_O_EXEC|(value->kind==ProcObjectKind::UserMap?(VFS_O_WRITE|VFS_O_READWRITE):0))) { *error=-13;return nullptr; }
     if(flags&VFS_O_EXEC) { *error=-13;return nullptr; }
     if(value->kind==ProcObjectKind::UserMap && !(flags&VFS_O_METADATA)) {
@@ -325,10 +353,20 @@ static Vnode* ProcObjectOpen(VfsObject* object,int flags,int* error)
     else if(value->kind==ProcObjectKind::Net) { *error=-95;return nullptr; }
     else if(value->kind==ProcObjectKind::Sys || value->kind==ProcObjectKind::SysKernel)node=MakeProcSysDirectory(value->kind==ProcObjectKind::SysKernel);
     else if(value->kind==ProcObjectKind::OverflowId)node=GenOverflowId();
+    else if(value->kind==ProcObjectKind::FdInfoFile) {
+        FsSnapshot actor{};
+        *error=ProcAcquireFsTarget(value->pid,value->incarnation,value->tgid,value->group,&actor);
+        FsSnapshotRelease(&actor);
+        if(*error)return nullptr;
+        FdSnapshot fd{};
+        if(!SchedulerGetFdInfo(value->pid,value->index,&fd,value->incarnation)) { *error=-2;return nullptr; }
+        node=GenPidFdInfo(fd);
+    }
     else if(ProcObjectDirectory(value->kind)) {
         ProcLookup path{snapshot,"",value->kind==ProcObjectKind::Task,value->taskMember};
         node=MakePidDirectory(path,value->kind==ProcObjectKind::Task?&g_procTaskDirOps:
-                                  value->kind==ProcObjectKind::Fds?&g_procFdDirOps:&g_procPidDirOps);
+                                  value->kind==ProcObjectKind::Fds?&g_procFdDirOps:
+                                  value->kind==ProcObjectKind::FdInfoDir?&g_procFdInfoDirOps:&g_procPidDirOps);
     } else if(value->kind==ProcObjectKind::GlobalFile)node=g_globalEntries[value->index].gen();
     else if(value->kind==ProcObjectKind::NetFile) {
         Vnode* (*const generators[])()={GenNetDev,GenNetTcp,GenNetUdp,GenNetSockstat};
@@ -357,6 +395,7 @@ static int ProcObjectDirectoryPath(VfsObject* object,char* out,uint32_t capacity
         end=U64ToDec(end,value->viewTid ? value->viewTid : value->pid);
         if(value->kind==ProcObjectKind::Task)end=AppendStr(end,"/task");
         if(value->kind==ProcObjectKind::Fds)end=AppendStr(end,"/fd");
+        if(value->kind==ProcObjectKind::FdInfoDir)end=AppendStr(end,"/fdinfo");
         if(value->kind==ProcObjectKind::NsDirectory)end=AppendStr(end,"/ns");
     }
     *end=0;uint32_t bytes=end-path+1;if(bytes>capacity)return -36;
@@ -445,7 +484,8 @@ static int ProcObjectFollow(const VfsPath& source,VfsPath* out)
     *out={};auto* value=static_cast<ProcObject*>(object->priv);
     if(value->kind==ProcObjectKind::NsLink) {
         VfsObject* target=nullptr;
-        if(int error=ProcNamespaceObject(value->pid,value->incarnation,value->tgid,value->group,&target))return error;
+        if(int error=ProcNamespaceObject(value->pid,value->incarnation,value->tgid,value->group,
+            static_cast<ProcNamespaceKind>(value->index),&target))return error;
         *out={source.attachment,target};VfsPathRetain(*out);VfsObjectRelease(target);return 1;
     }
     if(value->kind==ProcObjectKind::FdLink) {

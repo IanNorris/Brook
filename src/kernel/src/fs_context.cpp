@@ -144,6 +144,35 @@ static int FsSetCwd(FsContext* context,const VfsPath& cwd,const FsSnapshot* expe
 }
 int FsContextSetCwd(FsContext* context,const VfsPath& cwd) {return FsSetCwd(context,cwd,nullptr);}
 int FsContextSetResolvedCwd(FsContext* context,const VfsPath& cwd,const FsSnapshot& expected) {return FsSetCwd(context,cwd,&expected);}
+int FsContextSetResolvedRoot(FsContext* context,const VfsPath& root,const FsSnapshot& expected)
+{
+    if(!context)return -9;
+    VnodeStat stat{};if(int error=VfsPathStat(root,&stat))return error;
+    if(!stat.isDir)return -20;
+    if(int error=VfsPathAccess(root,1))return error;
+
+    VfsPathRetain(root);VfsPath previous{};int error=0;
+    {
+        FsContextGuard held(context);
+        if(context->revision!=expected.revision || context->mountNamespace!=expected.mountNamespace ||
+           !VfsPathSame(context->root,expected.root))error=-11;
+        else if(!VfsPathSame(context->root,root)) {
+            if(context->revision==~uint64_t{0})error=-75;
+            else {previous=context->root;context->root=root;++context->revision;}
+        }
+    }
+    if(previous.object)VfsPathRelease(previous);else VfsPathRelease(root);
+    return error;
+}
+
+bool FsContextHasNamespaceRoot(FsContext* context)
+{
+    FsSnapshot snapshot{};
+    if(FsContextSnapshot(context,&snapshot))return false;
+    const bool same=VfsMountNamespaceHasRoot(snapshot.mountNamespace,snapshot.root);
+    FsSnapshotRelease(&snapshot);
+    return same;
+}
 int FsContextCommitRootMove(const VfsPath& oldRoot,const VfsPath& newRoot,void (*publishGraph)(void*),void* argument)
 {
     if(!oldRoot.object || !newRoot.object || !publishGraph)return -22;

@@ -99,6 +99,7 @@ static constexpr uint64_t SYS_RT_SIGRETURN    = 15;
 static constexpr uint64_t SYS_SELECT          = 23;
 static constexpr uint64_t SYS_SENDFILE        = 40;
 static constexpr uint64_t SYS_KILL            = 62;
+static constexpr uint64_t SYS_CHROOT          = 161;
 static constexpr uint64_t SYS_CHDIR           = 80;
 static constexpr uint64_t SYS_FCHDIR          = 81;
 static constexpr uint64_t SYS_RENAME          = 82;

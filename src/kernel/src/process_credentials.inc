@@ -117,7 +117,7 @@ void ProcessSetNoNewPrivs(Process* proc) {
     if (!proc) return;
     __atomic_store_n(&proc->noNewPrivs, 1, __ATOMIC_RELEASE);
 }
-bool ProcessGetNoNewPrivs(Process* proc) {
+bool ProcessGetNoNewPrivs(const Process* proc) {
     return proc && __atomic_load_n(&proc->noNewPrivs, __ATOMIC_ACQUIRE) != 0;
 }
 

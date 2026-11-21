@@ -1,5 +1,9 @@
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
+#include <linux/nsfs.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <poll.h>
 #include <sched.h>
 #include <signal.h>
@@ -180,8 +184,83 @@ static void check_bwrap_proc(void)
             (long)getpid(), (long)getppid());
 }
 
+static ino_t namespace_inode(const char *name, int type)
+{
+    char path[64], link[80], expected[80];
+    CHECK(snprintf(path, sizeof(path), "/proc/self/ns/%s", name) > 0);
+    struct stat metadata;
+    CHECK(stat(path, &metadata) == 0);
+    const int fd = open(path, O_RDONLY | O_CLOEXEC);
+    CHECK(fd >= 0 && ioctl(fd, NS_GET_NSTYPE) == type);
+    CHECK(close(fd) == 0);
+    ssize_t n = readlink(path, link, sizeof(link));
+    CHECK(n > 0 && n < (ssize_t)sizeof(link));
+    link[n] = 0;
+    CHECK(snprintf(expected, sizeof(expected), "%s:[%llu]", name,
+                   (unsigned long long)metadata.st_ino) == n);
+    CHECK(strcmp(link, expected) == 0);
+    return metadata.st_ino;
+}
+
+static void namespace_descriptors(void)
+{
+    const ino_t user = namespace_inode("user", CLONE_NEWUSER);
+    const ino_t pid = namespace_inode("pid", CLONE_NEWPID);
+    const ino_t net = namespace_inode("net", CLONE_NEWNET);
+    CHECK(user != pid && pid != net && user != net);
+    const long child = syscall(SYS_clone, CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET | SIGCHLD,
+                               0UL, 0UL, 0UL, 0UL);
+    CHECK(child >= 0);
+    if (!child) {
+        CHECK(getpid() == 1);
+        CHECK(namespace_inode("user", CLONE_NEWUSER) != user);
+        CHECK(namespace_inode("pid", CLONE_NEWPID) != pid);
+        CHECK(namespace_inode("net", CLONE_NEWNET) != net);
+        _exit(0);
+    }
+    wait_exit((pid_t)child, 0);
+    fprintf(stderr, "PROC_NAMESPACE_DESCRIPTORS_PASS\n");
+}
+
+static int seal_shared_root(void *unused)
+{
+    (void)unused;
+    CHECK(chroot("/proc/self/fdinfo") == 0);
+    CHECK(chdir("/") == 0);
+    return 0;
+}
+
+static void retained_fdinfo_chroot(void)
+{
+    CHECK(chroot("/proc/self/fdinfo") == -1 && errno == EPERM);
+    pid_t init = new_init();
+    if (!init) {
+        char stack[32768];
+        const int child = clone(seal_shared_root, stack + sizeof(stack), CLONE_FS | SIGCHLD, NULL);
+        CHECK(child > 1);
+        wait_exit(child, 0);
+        char cwd[64];
+        struct stat root, parent;
+        CHECK(getcwd(cwd, sizeof(cwd)) && strcmp(cwd, "/") == 0);
+        CHECK(stat("/", &root) == 0 && S_ISDIR(root.st_mode));
+        CHECK(stat("/..", &parent) == 0 && root.st_ino == parent.st_ino);
+        CHECK(open("/dev/null", O_RDONLY) == -1 && errno == ENOENT);
+        CHECK(mkdir("/new", 0700) == -1);
+        CHECK(unshare(CLONE_NEWUSER) == -1 && errno == EPERM);
+        CHECK(syscall(SYS_clone, CLONE_NEWUSER | SIGCHLD, 0UL, 0UL, 0UL, 0UL) == -1 && errno == EPERM);
+        _exit(0);
+    }
+    wait_exit(init, 0);
+    fprintf(stderr, "PROC_FDINFO_CHROOT_PASS\n");
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--sandbox-primitives") == 0) {
+        namespace_descriptors();
+        retained_fdinfo_chroot();
+        return 0;
+    }
     if (argc == 2 && strcmp(argv[1], "--inside-bwrap") == 0) {
         check_bwrap_proc();
         return 0;
@@ -190,6 +269,8 @@ int main(int argc, char **argv)
     reparent_orphan();
     drain_namespace();
     init_job_control();
+    namespace_descriptors();
+    retained_fdinfo_chroot();
     crash_writer_after_unshare();
     return 0;
 }

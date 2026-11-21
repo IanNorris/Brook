@@ -375,6 +375,28 @@ int VfsPathDirectoryPath(const VfsPath& path,char* out,uint32_t capacity)
 {
     FileMutationGuard lookup(false);return VfsGlobalDirectoryLocked(path,out,capacity);
 }
+// Display names are never used as lookup authority. Convert the resolved
+// cwd and effective-root labels under the same topology read lock.
+int VfsPathDirectoryPathInRoot(const VfsPath& root,const VfsPath& path,char* out,uint32_t capacity)
+{
+    if(!out || capacity<2)return -36;
+    if(VfsPathSame(root,path)) {out[0]='/';out[1]=0;return 0;}
+    FileMutationGuard lookup(false);
+    char rootName[512], pathName[512];
+    int error=VfsGlobalDirectoryLocked(root,rootName,sizeof(rootName));
+    if(!error)error=VfsGlobalDirectoryLocked(path,pathName,sizeof(pathName));
+    if(error)return error;
+    const unsigned prefix=StrLen(rootName);
+    const char* relative=pathName;
+    if(prefix>1) {
+        for(unsigned i=0;i<prefix;++i)
+            if(pathName[i]!=rootName[i])return -2;
+        if(pathName[prefix]!='/')return -2;
+        relative+=prefix;
+    }
+    if(StrLen(relative)>=capacity)return -36;
+    StrCopy(out,relative,capacity);return 0;
+}
 static int VfsPathFromVnodeLocked(Vnode* node,VfsPath* out)
 {
     if(!out)return -22;

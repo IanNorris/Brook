@@ -6,6 +6,8 @@
 namespace brook {
 
 void ProcFsVfsRegister();
+struct Vnode;
+int ProcFsOpenedNamespaceType(const Vnode* node);
 struct MountNamespace;
 struct VfsPath;
 int ProcFsMountPrivate(MountNamespace* ns,const VfsPath& root,const VfsPath& target,uint64_t attributes);

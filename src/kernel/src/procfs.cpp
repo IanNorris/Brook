@@ -299,6 +299,8 @@ static void ProcDirClose(Vnode* vn)
 static int ProcRootReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie);
 static int ProcPidReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie);
 static int ProcFdReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie);
+static int ProcFdInfoReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie);
+static Vnode* GenPidFdInfo(const FdSnapshot& fd);
 static Vnode* GenPidFdLink(uint16_t pid, int fd, uint64_t incarnation = 0);
 static int ProcTaskReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie);
 
@@ -322,6 +324,15 @@ static int ProcDirStat(Vnode* vn, VnodeStat* st)
 
 static VnodeOps g_procFdDirOps = {
     ProcFileOpen, ProcDirRead, ProcFileWrite, ProcFdReaddir, ProcDirClose, ProcDirStat, nullptr
+};
+
+static int ProcFdInfoDirStat(Vnode* node,VnodeStat* out)
+{
+    if(node->backendObject)return node->backendObject->ops->stat(node->backendObject,out);
+    return ProcDirStat(node,out);
+}
+static VnodeOps g_procFdInfoDirOps = {
+    ProcFileOpen, ProcDirRead, ProcFileWrite, ProcFdInfoReaddir, ProcDirClose, ProcFdInfoDirStat, nullptr
 };
 
 static VnodeOps g_procRootDirOps = {
@@ -770,7 +781,9 @@ static Vnode* GenPidStatus(const ProcessSnapshot& proc)
         "Sid:\t%u\n"
         "Uid:\t%u\t%u\t%u\t%u\n"
         "Gid:\t%u\t%u\t%u\t%u\n"
-        "Threads:\t%u\n",
+        "Threads:\t%u\n"
+        "NoNewPrivs:\t%u\n"
+        "Seccomp:\t%u\n",
         proc.name,
         StateStr(proc.state), proc.name,
         proc.viewTid ? proc.viewTgid : proc.tgid,
@@ -782,7 +795,7 @@ static Vnode* GenPidStatus(const ProcessSnapshot& proc)
         ProcessReportId(ProcessCurrent(),false,proc.suid),ProcessReportId(ProcessCurrent(),false,proc.euid),
         ProcessReportId(ProcessCurrent(),true,proc.gid),ProcessReportId(ProcessCurrent(),true,proc.egid),
         ProcessReportId(ProcessCurrent(),true,proc.sgid),ProcessReportId(ProcessCurrent(),true,proc.egid),
-        proc.threadCount);
+        proc.threadCount, unsigned(proc.noNewPrivs), proc.seccompFiltered ? 2u : 0u);
 
     auto* node = MakeProcVnode(buf, n);
     if (node) {
@@ -1835,11 +1848,12 @@ static int ProcPidReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie)
         ProcStrCopy(out->name,names[idx-NUM_PID_ENTRIES],sizeof(out->name));out->size=0;out->isDir=idx==NUM_PID_ENTRIES+3;*cookie=idx+1;return 1;
     }
     idx-=4;
-    // After regular entries, emit "fd" directory
+    // After regular entries, emit descriptor directories and the task view.
     auto* pp = static_cast<ProcPriv*>(vn->priv);
-    if (idx == NUM_PID_ENTRIES || (idx == NUM_PID_ENTRIES + 1 && !pp->taskMember))
+    if (idx <= NUM_PID_ENTRIES + 1 || (idx == NUM_PID_ENTRIES + 2 && !pp->taskMember))
     {
-        ProcStrCopy(out->name, idx == NUM_PID_ENTRIES ? "fd" : "task", sizeof(out->name));
+        const char* names[]={"fd","fdinfo","task"};
+        ProcStrCopy(out->name, names[idx - NUM_PID_ENTRIES], sizeof(out->name));
         out->size = 0;
         out->isDir = true;
         *cookie = idx + 5;
@@ -1866,6 +1880,32 @@ static int ProcFdReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie)
     out->isDir = false;
     *cookie = *cookie + 1;
     return 1;
+}
+
+static int ProcFdInfoReaddir(Vnode* node,DirEntry* out,uint32_t* cookie)
+{
+    auto* info=static_cast<ProcPriv*>(node->priv);
+    ProcessSnapshot active{};
+    if(!SchedulerSnapshotTask(info->tgid,info->groupIncarnation,info->pid,0,&active) ||
+       active.incarnation!=info->incarnation)return 0;
+    FsSnapshot actor{};
+    const int error=ProcAcquireFsTarget(info->pid,info->incarnation,info->tgid,info->groupIncarnation,&actor);
+    FsSnapshotRelease(&actor);
+    if(error==-2)return 0;
+    if(error)return error;
+    return ProcFdReaddir(node,out,cookie);
+}
+
+static Vnode* GenPidFdInfo(const FdSnapshot& fd)
+{
+    auto* text=static_cast<char*>(kmalloc(64));
+    if(!text)return nullptr;
+    // Linux reports status flags in octal. Keep this read-only view scoped to
+    // offset and flags until Brook has provider-independent mount IDs.
+    char octal[12];char* first=octal+sizeof(octal)-1;
+    *first=0;uint32_t flags=fd.flags;
+    do { *--first=char('0'+(flags&7));flags>>=3; } while(flags);
+    return MakeProcVnode(text,ProcFmt(text,64,"pos:\t%lu\nflags:\t0%s\n",fd.seekPos,first));
 }
 
 // A TID cursor avoids skipping stable members when an earlier task exits.

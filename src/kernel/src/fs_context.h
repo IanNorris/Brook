@@ -23,6 +23,8 @@ int FsContextSetCwd(FsContext* context,const VfsPath& cwd);
 // Path-based resolution must retry on EAGAIN if its snapshot changed. A
 // deliberate fchdir through a retained descriptor uses SetCwd instead.
 int FsContextSetResolvedCwd(FsContext* context,const VfsPath& cwd,const FsSnapshot& expected);
+int FsContextSetResolvedRoot(FsContext* context,const VfsPath& root,const FsSnapshot& expected);
+bool FsContextHasNamespaceRoot(FsContext* context);
 // Caller holds the VFS transaction and independent old/new path leases.
 // Callback must be prevalidated stores only: no allocation/backend/free.
 int FsContextCommitRootMove(const VfsPath& oldRoot,const VfsPath& newRoot,

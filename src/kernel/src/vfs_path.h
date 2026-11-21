@@ -44,6 +44,7 @@ int VfsPathResolve(const VfsPath& root,const VfsPath& start,const char* text,
 // those callbacks may use this non-locking reporting variant.
 int VfsPathDirectoryPathFromCallback(const VfsPath& path,char* out,uint32_t capacity);
 int VfsPathDirectoryPath(const VfsPath& path,char* out,uint32_t capacity);
+int VfsPathDirectoryPathInRoot(const VfsPath& root,const VfsPath& path,char* out,uint32_t capacity);
 int VfsPathObjectPathFromCallback(const VfsPath& path,char* out,uint32_t capacity);
 int VfsPathReadlink(const VfsPath& path,char* out,uint32_t capacity);
 int VfsPathStat(const VfsPath& path,VnodeStat* out);

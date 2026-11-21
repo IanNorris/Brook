@@ -7,6 +7,7 @@
 
 using namespace harness;
 namespace brook {
+int ProcFsOpenedNamespaceType(const Vnode*) { return -25; }
 uint32_t SchedulerTranslateProcessGroup(const Process*, uint32_t group, bool) { return group; }
 }
 namespace {

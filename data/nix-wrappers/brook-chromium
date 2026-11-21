@@ -1,9 +1,13 @@
 #!/nix/profile/bin/bash
-# Experimental Wayland browser; Chromium's sandbox is unsupported.
+# The Wayland browser uses Chromium's namespace sandbox without a setuid helper.
 set -eu
 if [ "$EUID" -eq 0 ]; then
   echo 'brook-chromium: launch from Applications or use: run --uid 1000 /nix/bin/brook-chromium [URLs...]' >&2
   exit 64
+fi
+if [[ ! -d /proc/self/fdinfo || ! -e /proc/self/ns/net ]]; then
+  echo 'brook-chromium: the booted Brook kernel lacks the Chromium namespace sandbox. Boot the kernel paired with this profile.' >&2
+  exit 78
 fi
 export HOME=/data/home
 export XDG_CONFIG_HOME=$HOME/.config XDG_CACHE_HOME=$HOME/.cache
@@ -24,8 +28,10 @@ unset DISPLAY
 # compositing and rasterization on the HD 5500). Video decode stays in software:
 # Brook has no VA-API backend. BROOK_BROWSER_SOFTWARE=1, or an image without
 # brook-iris-run, keeps the previous software configuration.
+# Keep the accelerated GPU process on its existing startup policy until the
+# Iris and VA-API paths pass broker-sandbox checks with real render nodes.
 gpu=("${BROOK_IRIS_RUN:-/nix/profile/bin/brook-iris-run}")
-flags=(--use-gl=angle --use-angle=gles --ignore-gpu-blocklist
+flags=(--use-gl=angle --use-angle=gles --ignore-gpu-blocklist --disable-gpu-sandbox
        --disable-features=Vulkan --disable-accelerated-video-decode)
 if [ -n "${BROOK_BROWSER_SOFTWARE:-}" ] || [ ! -x "${gpu[0]}" ]; then gpu=(); flags=(--disable-gpu); fi
 # Opt-in VA-API decode (H.264/VP8/MPEG-2 on the Broadwell VCS). Needs a kernel
@@ -35,13 +41,13 @@ if [ -n "${BROOK_BROWSER_SOFTWARE:-}" ] || [ ! -x "${gpu[0]}" ]; then gpu=(); fl
 # software decode (docs/bdw-video-engine.md, phase 3/4).
 if [ -n "${BROOK_CHROMIUM_VAAPI:-}" ] && [ -n "${gpu[*]}" ] && [ -d "${BROOK_VAAPI_DRIVERS:-}" ]; then
   export LIBVA_DRIVER_NAME=i965 LIBVA_DRIVERS_PATH="$BROOK_VAAPI_DRIVERS"
-  flags=(--use-gl=angle --use-angle=gles --ignore-gpu-blocklist
+  flags=(--use-gl=angle --use-angle=gles --ignore-gpu-blocklist --disable-gpu-sandbox
          --enable-features=VaapiVideoDecoder,VaapiIgnoreDriverChecks,AcceleratedVideoDecodeLinuxGL,AcceleratedVideoDecodeLinuxZeroCopyGL
          --disable-features=Vulkan,UseChromeOSDirectVideoDecoder
          --render-node-override="${BROOK_VAAPI_NODE:-/dev/dri/renderD129}")
 fi
 exec /nix/profile/bin/brook-run "${gpu[@]}" /nix/profile/bin/chromium \
-  --no-sandbox "${flags[@]}" --disable-background-networking \
+  --disable-setuid-sandbox "${flags[@]}" --disable-background-networking \
   --disable-component-update --renderer-process-limit=2 \
   --disable-crash-reporter --no-first-run --no-default-browser-check \
   --ozone-platform=wayland --user-data-dir="$profile" "$@"

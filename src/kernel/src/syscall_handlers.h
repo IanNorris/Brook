@@ -208,6 +208,7 @@ int64_t sys_symlinkat(uint64_t targetAddr, uint64_t newdirfd, uint64_t linkpathA
                        uint64_t, uint64_t, uint64_t);
 int64_t sys_umask(uint64_t newMask, uint64_t, uint64_t,
                    uint64_t, uint64_t, uint64_t);
+int64_t sys_chroot(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
 int64_t sys_chdir(uint64_t pathAddr,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
 int64_t sys_fchdir(uint64_t fd,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
 int64_t sys_rmdir(uint64_t pathAddr, uint64_t, uint64_t,

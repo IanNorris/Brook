@@ -4,6 +4,7 @@
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "pid_namespace.h"
+#include "procfs_vfs.h"
 #include "ahci_system_volume.h"
 #include "boot_timing_runtime.h"
 #include "guard_checker_runner.h"
@@ -261,7 +262,7 @@ int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
         return NetlinkInterfaceIoctl(cmd,arg,scope);
     }
     if(fde->type==FdType::Vnode && fde->handle && static_cast<Vnode*>(fde->handle)->type==VnodeType::Namespace)
-        return cmd==0xb703?0x20000:-25; // NS_GET_NSTYPE; other namespace ioctls unsupported.
+        return cmd==0xb703?ProcFsOpenedNamespaceType(static_cast<Vnode*>(fde->handle)):-25;
     if(fde->type==FdType::SyncFile) {
         if(!fde->handle)return -EBADF;
         if(cmd!=SYNC_FILE_INFO_IOCTL)return -25;

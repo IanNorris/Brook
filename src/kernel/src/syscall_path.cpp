@@ -146,6 +146,27 @@ int64_t sys_chdir(uint64_t pathAddr,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t
     return -EAGAIN;
 }
 
+int64_t sys_chroot(uint64_t pathAddr,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t)
+{
+    auto* process=ProcessCurrent();
+    if(!process)return -EPERM;
+    auto* owner=ProcessUserNamespaceAcquire(process);
+    const bool authorized=ProcessCapable(process,owner,CapSysChroot);
+    UserNamespaceRelease(owner);
+    if(!authorized)return -EPERM;
+
+    char path[512];if(!CopyUserCString(pathAddr,path,sizeof(path)))return -EFAULT;
+    for(unsigned attempt=0;attempt<8;++attempt) {
+        AtLookup lookup;if(int error=lookup.Init(-100,path))return error;
+        VfsPath root{};int error=VfsPathResolve(lookup.fs.root,lookup.start(),path,&root);
+        auto* context=ProcessFsAcquire(process);
+        if(!error)error=FsContextSetResolvedRoot(context,root,lookup.fs);
+        FsContextRelease(context);VfsPathRelease(root);
+        if(error!=-EAGAIN)return error;
+    }
+    return -EAGAIN;
+}
+
 int64_t sys_fchdir(uint64_t fd,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t)
 {
     Process* proc=ProcessCurrent();if(!proc)return -EBADF;
