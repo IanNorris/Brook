@@ -44,6 +44,7 @@ MODULE_IMPORT_SYMBOL(VmmVirtToPhys);
 MODULE_IMPORT_SYMBOL(VmmMapPage);
 MODULE_IMPORT_SYMBOL(PmmAllocPage);
 MODULE_IMPORT_SYMBOL(AudioRegisterWithHdaStatus);
+MODULE_IMPORT_SYMBOL(AudioMixerRequestDefaultStaging);
 MODULE_IMPORT_SYMBOL(AudioClockNowNs);
 MODULE_IMPORT_SYMBOL(AudioDeliveryTimingToken);
 MODULE_IMPORT_SYMBOL(AudioDeliveryTimingRecord);
@@ -261,6 +262,19 @@ static uint64_t g_nativeLastDataEnd = 0, g_nativePrimedAt = 0;
 static constexpr uint32_t NATIVE_IDLE_TRAILER = 8192;
 static constexpr uint32_t NATIVE_WRITE_LEAD = NATIVE_IDLE_TRAILER + FRAG_SIZE;
 static constexpr uint64_t NATIVE_PRIME_NS = 10000000;
+// VMware publishes LPIB in whole 4096-byte descriptors and its mixer wakeups
+// run late, so every receipt lands NATIVE_WRITE_LEAD (3072 frames) ahead of
+// DMA. A client whose ring charges its hardware-resident copy (Chromium's
+// 1920-frame OSS ring) can never cover that lead: each refill reserves fresh
+// silence and the source drains at ~0.45x real time (Workstation trace: 293 of
+// 295 receipts reserved silence, 19.8k frames/s). The downstream allowance
+// lets that copy live in the device queue without consuming client space;
+// delay and drain still follow physical completion (as on the Dell).
+static constexpr uint32_t VMWARE_DOWNSTREAM_FRAMES = 4096;
+static void HdaConfigureDownstreamAllowance()
+{
+    if (g_vmwareController) AudioMixerRequestDefaultStaging(VMWARE_DOWNSTREAM_FRAMES);
+}
 
 
 // Output stream descriptor offset (depends on GCAP)
@@ -1359,6 +1373,7 @@ static int IntelHdaInit()
         HdaNativeRestart,
     };
     AudioRegisterWithHdaStatus(&hdaAudioDriver,HdaReadStatus);
+    HdaConfigureDownstreamAllowance();
 
     KPrintf("intel_hda: initialised — DAC=%d PIN=%d\n", g_dacNid, g_pinNid);
     return 0;

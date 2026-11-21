@@ -1471,6 +1471,112 @@ static void nativeStagingFaults() {
     }
 }
 
+// Live Workstation trace (a85f840e, Chromium YouTube): the 1920-frame stock
+// OSS client keeps at most 1920 frames outstanding, the driver places every
+// receipt NATIVE_WRITE_LEAD (3072 frames) ahead of DMA, so 293 of 295 receipts
+// reserved silence and the client completed ~20k frames/s against a 44.1k
+// device. Model that with the real mixer and native driver: VMware LPIB moves
+// in whole 4096-byte descriptors, the mixer worker wakes late, and Chromium
+// refills every 10 ms. Count delivered client frames and played silence.
+struct VmPacing { double clientRate=0, silence=0; uint64_t reservations=0; bool fault=false; };
+enum class PacingClient { Stock, Downstream };
+static VmPacing vmPacingRun(bool vmware,bool allowance,PacingClient client,unsigned tickMs,unsigned stallMs) {
+    using namespace brook;
+    AudioMixerTestCommitQuantum(0);AudioMixerSharedPrefixEnable(false);
+    AudioMixerCoalesceEnable(false);AudioMixerHorizonEnable(false);
+    AudioMixerStagingEnable(false);AudioMixerStagingSetFrameLimit(1024);
+    AudioStop();initialize();g_vmwareController=vmware;AudioMixerRefresh();
+    if(allowance)HdaConfigureDownstreamAllowance();
+    VERIFY(AudioMixerStagingEnabled()==(allowance && vmware)); // QEMU stays unchanged
+    const auto id=AudioMixerOpen();VERIFY(id);
+    constexpr uint32_t Capacity=1920,Fragment=64,Period=441;
+    VERIFY(AudioMixerSetCapacity(id,Capacity,Fragment));
+    std::vector<int16_t> pcm(2*4096,1000);
+    AudioDeliveryTimingEnable(true);AudioDeliveryTimingReset();
+    constexpr unsigned PrimeMs=1000,RunMs=7000;
+    uint64_t creditMicroBytes=0,played=0,silent=0,completedAtPrime=0,reservationsAtPrime=0;
+    VmPacing result{};
+    for(unsigned ms=1;ms<=RunMs;++ms) {
+        nowNs+=1000000;
+        if(g_streamRunning) {
+            // 176.4 bytes per ms; VMware publishes LPIB one descriptor at a time.
+            creditMicroBytes+=176400;
+            uint32_t advance=uint32_t(creditMicroBytes/1000);
+            advance=vmware?advance/FRAG_SIZE*FRAG_SIZE:advance/4*4;
+            if(advance) {
+                creditMicroBytes-=uint64_t(advance)*1000;
+                const uint32_t pos=HdaTestRead(g_outStreamBase+SD_LPIB,4);
+                if(ms>PrimeMs)for(uint32_t f=0;f<advance;f+=4) {
+                    int16_t pair[2]{};memcpy(pair,dma.data()+(pos+f)%AUDIO_BUF_SIZE,4);
+                    ++played;if(!pair[0])++silent;
+                }
+                store(g_outStreamBase+SD_LPIB,4,(pos+advance)%AUDIO_BUF_SIZE);
+                if(vmware)store(g_outStreamBase+SD_STS,1,HdaTestRead(g_outStreamBase+SD_STS,1)|SD_STS_BCIS);
+            }
+        } else creditMicroBytes=0;
+        if(ms==PrimeMs) {
+            AudioMixerRefresh();AudioStreamProgress p{};VERIFY(AudioMixerGetProgress(id,&p));
+            completedAtPrime=p.completedFrames;reservationsAtPrime=AudioDeliveryTimingRead().reservations;
+        }
+        // Optional lazy-timer episode: the worker misses stallMs once a second
+        // (Workstation trace: max_sleep 105.8 ms for a nominal 10 ms period).
+        const bool stalled=stallMs && ms%1000<stallMs;
+        if(ms%tickMs==0 && !stalled)AudioMixerTick();
+        if(ms%10==0) {
+            AudioMixerRefresh();
+            AudioStreamProgress p{};VERIFY(AudioMixerGetProgress(id,&p));
+            if(p.discontinuity){result.fault=true;break;}
+            // Stock plugin: outstanding source (software + in flight) is bounded
+            // by its own ring. Downstream plugin: BROOK_DSP_GETQUEUE available.
+            uint32_t space=client==PacingClient::Stock?
+                (p.queuedFrames<Capacity?Capacity-p.queuedFrames:0):p.availableFrames;
+            space-=space%Period;
+            if(space)VERIFY(AudioMixerSubmit(pcm.data(),space,id)==space);
+        }
+    }
+    AudioMixerRefresh();AudioStreamProgress p{};VERIFY(AudioMixerGetProgress(id,&p));
+    result.fault=result.fault||p.discontinuity||g_nativeClock.discontinuity;
+    result.clientRate=double(p.completedFrames-completedAtPrime)*1000.0/(RunMs-PrimeMs);
+    result.silence=played?double(silent)/double(played):1.0;
+    result.reservations=AudioDeliveryTimingRead().reservations-reservationsAtPrime;
+    AudioDeliveryTimingEnable(false);
+    VERIFY(AudioMixerClose(id));AudioMixerStagingEnable(false);AudioStop();
+    return result;
+}
+static void vmwareSmallClientPacing() {
+    struct Case { const char* name; bool vmware, allowance; PacingClient client; unsigned tickMs, stallMs; };
+    const Case cases[]={
+        {"vmware stock (before)",true,false,PacingClient::Stock,11,0},
+        {"vmware allowance+stock",true,true,PacingClient::Stock,11,0},
+        {"vmware allowance+downstream",true,true,PacingClient::Downstream,11,0},
+        {"vmware allowance+downstream 20ms",true,true,PacingClient::Downstream,20,0},
+        {"vmware allowance+downstream 50ms stall",true,true,PacingClient::Downstream,11,50},
+        {"vmware allowance+downstream 100ms stall",true,true,PacingClient::Downstream,11,100},
+        {"qemu stock (unchanged)",false,true,PacingClient::Stock,10,0},
+    };
+    VmPacing r[sizeof(cases)/sizeof(cases[0])];
+    for(unsigned i=0;i<sizeof(cases)/sizeof(cases[0]);++i) {
+        const auto& c=cases[i];r[i]=vmPacingRun(c.vmware,c.allowance,c.client,c.tickMs,c.stallMs);
+        std::printf("VM_PACING %-34s client=%.0f frames/s silence=%.1f%% reservations=%lu fault=%d\n",
+            c.name,r[i].clientRate,r[i].silence*100,(unsigned long)r[i].reservations,int(r[i].fault));
+        VERIFY(!r[i].fault);
+    }
+    // Reproduces the live shortfall: ~0.45x real time, most output silence.
+    VERIFY(r[0].clientRate<0.5*44100 && r[0].silence>0.4 && r[0].reservations);
+    // Kernel allowance alone cannot help a client that charges physical delay.
+    VERIFY(r[1].clientRate<0.5*44100);
+    // Allowance + downstream-aware client keeps real time with no silence.
+    for(unsigned i:{2u,3u})VERIFY(r[i].clientRate>0.99*44100 && r[i].silence<0.005 && !r[i].reservations);
+    // A late worker (one 50-ms miss per second, far above the trace's 1.1-ms
+    // mean lateness) costs only a brief refill gap.
+    VERIFY(r[4].clientRate>0.98*44100 && r[4].silence<0.02);
+    // The driver allowance is VMware-only; QEMU keeps its previous behaviour.
+    VERIFY(r[6].clientRate<0.5*44100);
+    // A 100-ms worker stall every second exceeds the 1920+4096-frame budget
+    // (~136 ms) less the 12-KiB lead; it degrades but stays near real time.
+    VERIFY(r[5].clientRate>0.9*44100);
+}
+
 int RunMixerClockTests() {
     using namespace brook;
     mixerClockEnabled=true;AudioStop();initialize();AudioMixerRefresh();
@@ -1598,6 +1704,6 @@ int RunMixerClockTests() {
     burstDmaRefillExperiment();
     steadyCommitExperiment();
     coalesceTests(a,b);
-    VERIFY(AudioMixerClose(a));nativeStagingContracts();nativeStagingFaults();nativeStagingFullBuffer();nativeSmallStagingPartialCopy();mixerClockEnabled=false;AudioStop();
+    VERIFY(AudioMixerClose(a));nativeStagingContracts();nativeStagingFaults();nativeStagingFullBuffer();nativeSmallStagingPartialCopy();vmwareSmallClientPacing();mixerClockEnabled=false;AudioStop();
     std::printf("MIXER_CLOCK %s\n",failures?"FAIL":"PASS");return failures;
 }

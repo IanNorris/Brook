@@ -443,6 +443,21 @@ bool AudioMixerStagingSetFrameLimit(uint32_t frames) {
     SpinLockRelease(&g_mixerLock);return true;
 }
 uint32_t AudioMixerStagingFrameLimit(){return __atomic_load_n(&g_stagingFrameLimit,__ATOMIC_ACQUIRE);}
+extern "C" bool AudioMixerRequestDefaultStaging(uint32_t frames) {
+#ifndef BROOK_HOST_TEST
+    if (Vnode* marker=VfsOpen("/etc/audio-staging-off",0)) {
+        VfsClose(marker);
+        SerialPuts("audio: /etc/audio-staging-off; downstream allowance stays off\n");
+        return AudioMixerStagingEnabled();
+    }
+#endif
+    // A boot option that already enabled staging keeps its own limit.
+    if(AudioMixerStagingEnabled())return true;
+    if(!AudioMixerStagingSetFrameLimit(frames))return false;
+    AudioMixerStagingEnable(true);
+    SerialPrintf("audio: driver default downstream allowance %u frames\n",frames);
+    return true;
+}
 void AudioMixerConfigureBoot() {
 #ifndef BROOK_HOST_TEST
     // Set before driver registration: a hardware bring-up image never starts
