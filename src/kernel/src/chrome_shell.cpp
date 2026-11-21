@@ -371,8 +371,8 @@ static void PowerText(char* out, uint32_t milliwatts)
     CopyText(out, " W", 4);
 }
 
-// Each column covers a fixed share of the last ten seconds. Keep the
-// longest observed interval for that slice and leave periods without frames blank.
+// Solid p80, a lighter cap to the maximum, and a top marker when
+// the scale clips that maximum. Empty time slices stay blank.
 static void CadenceBars(ChromeDisplayList& dl, const ChromeStyle& s, const DesktopRect& r,
                         const DesktopIntervals<>& history, uint64_t tick, unsigned fullMs, uint32_t ink, int pitchPx = 3)
 {
@@ -380,16 +380,29 @@ static void CadenceBars(ChromeDisplayList& dl, const ChromeStyle& s, const Deskt
     if (r.w < pitch || r.h <= 0) return;
     const unsigned capacity = static_cast<unsigned>(r.w / pitch);
     const unsigned columns = capacity < DesktopFrameBins::SlotCount ? capacity : DesktopFrameBins::SlotCount;
-    for (unsigned i = 0; i < columns; ++i) {
-        const uint32_t interval = history.bins.ColumnPeak(tick, i, columns);
-        if (!interval) continue;
+    const auto height = [&](uint32_t interval) {
         const unsigned ms = interval < fullMs ? interval : fullMs;
-        const int height = 1 + int(uint64_t(r.h - 1) * ms / fullMs);
-        const int x = int(i * r.w / columns);
-        const int next = int((i + 1) * r.w / columns);
-        const int width = next - x - Px(s, 1);
-        dl.Fill(r.x + x, r.y + r.h - height, width > 0 ? width : 1, height,
-                0xff000000u | (interval >= 17 ? s.P().hot : ink));
+        return 1 + int(uint64_t(r.h - 1) * ms / fullMs);
+    };
+    for (unsigned i = 0; i < columns; ++i) {
+        const auto sample = history.bins.Column(tick, i, columns);
+        if (!sample.count) continue;
+        const int peak = height(sample.max);
+        int stem = height(sample.p80);
+        if (sample.max > sample.p80 && stem == peak && peak > 1) --stem;
+        const int x = r.x + int(i * r.w / columns);
+        const int next = r.x + int((i + 1) * r.w / columns);
+        const int available = next - x - Px(s, 1);
+        const int width = available > 0 ? available : 1;
+        const int bottom = r.y + r.h;
+        const auto solid = sample.p80 >= 17 ? s.P().hot : ink;
+        dl.Fill(x, bottom - stem, width, stem, 0xff000000u | solid);
+        if (peak > stem) {
+            const auto cap = sample.max >= 17 ? s.P().hot : ink;
+            dl.Fill(x, bottom - peak, width, peak - stem,
+                    0xff000000u | ChromeBlendColor(0xffffffu, cap, 108));
+        }
+        if (sample.max > fullMs) dl.Fill(x, r.y, width, Px(s, 1), 0xff000000u | s.P().text);
     }
 }
 // The newest sample's interval in ms, or false when none is recent.
@@ -440,10 +453,10 @@ static void DesktopMetric(ChromeDisplayList& dl, const ChromeStyle& s, const Chr
     const DesktopIntervals<>* source = kind == 4 ? t.compositor : t.app;
     if (!source) return;
     const auto& history = *source;
-    const auto summary = history.Read(now);
+    const auto summary = history.bins.Read(now);
     text(r.x, top, kind == 4 ? "COMP" : "APP", p.mutedText);
     const int graphW = SP::GraphBars * Px(s, 3), graphX = r.x + r.w - graphW;
-    CadenceBars(dl, s, {graphX, top + Px(s, 1), graphW, line - Px(s, 2)}, history, now, 100, p.accent);
+    CadenceBars(dl, s, {graphX, top + Px(s, 1), graphW, line - Px(s, 2)}, history, now, summary.Scale(), p.accent);
     if (!summary.count || (kind == 5 && (!history.last || now - history.last > 2000))) {
         text(r.x, bottom, "idle", p.mutedText); return;
     }
@@ -1316,7 +1329,7 @@ void ChromeBuildDiskPopup(const ChromeDiskPopupLayout& l, const DesktopDiskPage&
 static constexpr int HudPad = 12, HudGap = 8, HudGraph = 44;
 
 // Compact: APP and COMP in the taskbar, each a caption label, a 16-bar graph
-// whose top edge is the 16.7 ms budget, and the newest interval.
+// and the newest interval.
 void ChromeBuildCompactHud(const ChromePerformanceHudModel& m, const ChromeStyle& s, ChromeDisplayList& dl)
 {
     const auto& p = s.P();
@@ -1330,7 +1343,7 @@ void ChromeBuildCompactHud(const ChromePerformanceHudModel& m, const ChromeStyle
         const auto* h = series ? m.telemetry.compositor : m.telemetry.app;
         dl.Text(CF::Small, x, labelY, name, p.mutedText);
         x += s.TextWidth(name, CF::Small) + Px(s, 6);
-        if (h) CadenceBars(dl, s, {x, m.rect.y + (m.rect.h - graphH) / 2, graphW, graphH}, *h, m.tick, 17,
+        if (h) CadenceBars(dl, s, {x, m.rect.y + (m.rect.h - graphH) / 2, graphW, graphH}, *h, m.tick, h->bins.Read(m.tick).Scale(),
                            series ? p.ok : p.accent);
         x += graphW + Px(s, 6);
         char value[12] = "-";
@@ -1375,10 +1388,10 @@ static void HudCadence(ChromeDisplayList& dl, const ChromeStyle& s, int x, int& 
                        const DesktopIntervals<>* history, uint64_t tick, const char* label, uint32_t ink)
 {
     char value[24] = "-", detail[48]{};
+    const auto summary = history ? history->bins.Read(tick) : DesktopFrameBins::Summary{};
     if (history) {
         char number[12];
         if (CadenceLatest(*history, tick, number)) { CopyText(value, number, sizeof(value)); unsigned n = 0; while (value[n]) ++n; CopyText(value + n, " ms", sizeof(value) - n); }
-        const auto summary = history->Read(tick);
         if (summary.count) {
             unsigned used = 0;
             auto append = [&](const char* v) { while (*v && used + 1 < sizeof(detail)) detail[used++] = *v++; detail[used] = 0; };
@@ -1389,9 +1402,9 @@ static void HudCadence(ChromeDisplayList& dl, const ChromeStyle& s, int x, int& 
     }
     DesktopRect plot{};
     y = HudGroup(dl, s, x, y, w, label, value, detail, true, &plot);
-    // The 16.7 ms budget on a 24 ms scale.
-    dl.Fill(plot.x, plot.y + plot.h - plot.h * 167 / 240, plot.w, 1, HairlineColor(s, s.P().launcher));
-    if (history) CadenceBars(dl, s, plot, *history, tick, 24, ink);
+    const int budget = int(uint64_t(plot.h) * 167 / (uint64_t(summary.Scale()) * 10));
+    dl.Fill(plot.x, plot.y + plot.h - (budget ? budget : 1), plot.w, 1, HairlineColor(s, s.P().launcher));
+    if (history) CadenceBars(dl, s, plot, *history, tick, summary.Scale(), ink);
 }
 
 void ChromeBuildPerformanceHud(const ChromePerformanceHudModel& m, const ChromeStyle& s, ChromeDisplayList& dl)
@@ -1752,12 +1765,12 @@ static void DetailedCadence(const ChromeStatsPopupLayout& l, bool app, const Des
     const auto& b = l.body;
     const auto& p = s.P();
     const int caption = s.Line(CF::Small), gap = Px(s, FlyoutGap);
-    dl.Text(CF::Small, b.x, b.y, app ? "Focused app frame intervals" : "Compositor frame intervals", p.mutedText, b.w);
+    dl.Text(CF::Small, b.x, b.y, "Solid p80 " BROOK_CHROME_DOT " cap max " BROOK_CHROME_DOT " top mark clipped", p.mutedText, b.w);
     const int chartH = b.h - 2 * caption - 2 * gap - 3 * l.rowHeight;
     const auto plot = GraphBox(dl, s, {b.x, b.y + caption + gap, b.w, chartH});
-    const auto summary = history ? history->Read(tick) : DesktopIntervals<>::Summary{};
+    const auto summary = history ? history->bins.Read(tick) : DesktopFrameBins::Summary{};
     if (summary.count) {
-        const uint32_t scale = summary.max > 34 ? summary.max : 34;
+        const uint32_t scale = summary.Scale();
         const int budget = int(uint64_t(plot.h) * 167 / (uint64_t(scale) * 10));
         dl.Fill(plot.x, plot.y + plot.h - (budget ? budget : 1), plot.w, 1, HairlineColor(s, p.launcher));
         CadenceBars(dl, s, plot, *history, tick, scale, app ? p.accent : p.ok, 2);

@@ -61,41 +61,61 @@ int main(){
         using brook::DesktopFrameBins;
         DesktopFrameBins bins;
         bins.Record(5000, 16);
-        bins.Record(5099, 73);
+        bins.Record(5073, 73);
         bins.Record(5200, 18);
-        assert(bins.At(50) == 73 && bins.At(51) == 0 && bins.At(52) == 18);
-        assert(bins.ColumnPeak(5200, 97, 100) == 73);
-        assert(bins.ColumnPeak(5200, 98, 100) == 0); // preserve an idle gap
-        assert(bins.ColumnPeak(5200, 99, 100) == 18);
-        assert(bins.ColumnPeak(5200, 9, 10) == 73); // aggregate, still show the outlier
-        assert(bins.ColumnPeak(6200, 8, 10) == 73);
-        assert(bins.ColumnPeak(6200, 9, 10) == 0); // clock advances without frames
+        assert(bins.Column(5200, 97, 100).max == 73);
+        assert(bins.Column(5200, 98, 100).max == 0); // preserve an idle gap
+        assert(bins.Column(5200, 99, 100).max == 18);
+        assert(bins.Column(5200, 9, 10).max == 73); // aggregate, still show the outlier
+        assert(bins.Column(6200, 8, 10).max == 73);
+        assert(bins.Column(6200, 9, 10).max == 0); // clock advances without frames
 
         for (const uint64_t renderTick : {10400ULL, 11000ULL}) {
             DesktopFrameBins snapshot;
             snapshot.Capture(bins, 6200, renderTick);
             for (unsigned column = 0; column < DesktopFrameBins::SlotCount; ++column)
-                assert(snapshot.ColumnPeak(renderTick, column, 100) == bins.ColumnPeak(6200, column, 100));
+                assert(snapshot.Column(renderTick, column, 100).max == bins.Column(6200, column, 100).max);
         }
         DesktopFrameBins early;
         early.Capture(bins, 5100, 50);
-        assert(early.ColumnPeak(50, 99, 100) == 0);
+        assert(early.Column(50, 99, 100).max == 0);
         early.Capture(bins, 5000, 50);
-        assert(early.ColumnPeak(50, 99, 100) == 73); // no boot-time underflow
+        assert(early.Column(50, 99, 100).max == 73); // no boot-time underflow
 
         bins.Record(14999, 23);
-        assert(bins.At(50) == 73); // oldest retained slot
+        assert(bins.Column(14999, 0, 100).max == 73); // oldest retained slot
         bins.Record(15000, 31);
-        assert(bins.At(50) == 0 && bins.At(150) == 31);
+        assert(bins.Column(15000, 0, 100).max == 0 && bins.Column(15000, 99, 100).max == 31);
         bins.Record(41000, 12); // clear every skipped slot, even across many wraps
-        assert(bins.At(150) == 0 && bins.At(409) == 0 && bins.At(410) == 12);
+        assert(bins.Read(41000).count == 1 && bins.Read(41000).max == 12);
 
         brook::DesktopIntervals<> fast;
         for (unsigned tick = 10000; tick <= 19000; tick += 10) fast.Record(tick);
         assert(fast.Read(19000).count == 128 && fast.Read(19000).p95 == 10);
-        assert(fast.bins.At(100) == 10 && fast.bins.At(190) == 10);
+        assert(fast.bins.Read(19000).count == 900 && fast.bins.Read(19000).p95 == 10);
         fast.Reset();
-        assert(!fast.Read(19000).count && fast.bins.At(190) == 0);
+        assert(!fast.Read(19000).count && !fast.bins.Read(19000).count);
+
+        brook::DesktopIntervals<> spikes;
+        spikes.Record(8200);
+        for (unsigned tick = 9000; tick < 9100; tick += 5) spikes.Record(tick);
+        spikes.Record(9095); // same completion cannot add a second frame
+        spikes.Record(9005); // out-of-order timestamp has no effect
+        const auto bucket = spikes.bins.Column(9200, 97, 100);
+        assert(bucket.count == 20 && bucket.p80 == 5 && bucket.p95 == 5 && bucket.max == 800);
+        assert(bucket.Scale() == DesktopFrameBins::MinimumScaleMs);
+        const auto coarse = spikes.bins.Column(9200, 9, 10);
+        assert(coarse.count == bucket.count && coarse.p80 == bucket.p80 && coarse.max == bucket.max);
+        assert(spikes.bins.Column(18999, 0, 100).max == 800);
+        assert(!spikes.bins.Read(19000).count);
+
+        // A column whose percentile consists only of cross-slot intervals.
+        DesktopFrameBins slow;
+        slow.Record(3200, 300);
+        slow.Record(3400, 200);
+        slow.Record(3800, 400);
+        const auto gaps = slow.Column(3900, 9, 10);
+        assert(gaps.count == 3 && gaps.p80 == 400 && gaps.p95 == 400 && gaps.max == 400);
     }
     assert(brook_appearance_valid(BROOK_APPEARANCE_DEFAULT));
     for(unsigned dark:{0u,1u})for(unsigned perf:{0u,1u})for(unsigned opacity:{40u,80u,100u})for(unsigned blur=0;blur<4;++blur){

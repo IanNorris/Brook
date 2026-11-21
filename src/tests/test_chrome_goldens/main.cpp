@@ -831,6 +831,18 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
             auto statsList = ChromeListOn(storage);
             RenderSnapshot(model, s, statsList);
             Check(prefix + "stats-" + name, statsList, s, model.rect.x, model.rect.y, model.rect.w, model.rect.h);
+            if (panel == DesktopStatsPanel::Compositor && prefix == "glass-100-") {
+                const auto saved = telemetry.compositor;
+                telemetry.compositor.Reset();
+                const uint64_t spike = (now / 100 - 20) * 100;
+                for (uint64_t t = spike - 1200; t <= spike - 400; t += 16) telemetry.compositor.Record(t);
+                for (uint64_t t = spike; t < spike + 750; t += 16) telemetry.compositor.Record(t);
+                auto spikeList = ChromeListOn(storage);
+                RenderSnapshot(model, s, spikeList);
+                Check(prefix + "stats-compositor-spike", spikeList, s,
+                      model.rect.x, model.rect.y, model.rect.w, model.rect.h);
+                telemetry.compositor = saved;
+            }
             if (panel == DesktopStatsPanel::CpuMemory) {
                 stats.coreCount = 4;
                 stats.tasks[2] = {"frame publisher", 24, 65, 2};

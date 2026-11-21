@@ -1851,6 +1851,22 @@ int main() {
         for (unsigned metric : {0, 1, 4, 5}) {
             const auto anchor = layout.metrics[metric];
             CHECK(anchor.w > 0 && WmTaskbarStatsContains(anchor.x, anchor.y, sw, sh));
+            if (metric == 4) {
+                const auto savedHistory = g_desktopCadence;
+                const uint64_t savedTick = testTick;
+                g_desktopCadence.Reset();
+                g_desktopCadence.Record(9400);
+                for (uint64_t t = 9800; t < 9900; t += 5) g_desktopCadence.Record(t);
+                testTick = 10000;
+                char text[48]{};
+                const char* detail = nullptr;
+                DesktopRect box{};
+                CHECK(WmTrayTooltip(sw, sh, anchor.x + anchor.w - 1, anchor.y, text, detail, box));
+                CHECK(!strcmp(text, "Compositor frame timing") && detail &&
+                      !strcmp(detail, "p80 5 ms  max 400 ms"));
+                g_desktopCadence = savedHistory;
+                testTick = savedTick;
+            }
             CHECK(!WmShellTrayPointer(sw, sh, anchor.x, anchor.y, true, 0, 0));
             CHECK(!WmWindowMenuOpen());
             CHECK(WmShellTrayPointer(sw, sh, anchor.x, anchor.y, true, 1, 0));

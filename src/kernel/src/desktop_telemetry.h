@@ -1,59 +1,119 @@
 #pragma once
 #include <stdint.h>
 namespace brook {
-// Fixed-time graph history. Each slot keeps the longest completed interval
-// whose end falls in that 100 ms slot. Zero is a gap with no completion.
+// Exact frame intervals in a ten-second ring. A slot stores completion
+// offsets as bits; only the first interval can predate the slot. Later
+// intervals are the differences between consecutive completion offsets.
 struct DesktopFrameBins {
     static constexpr unsigned SlotMs = 100;
     static constexpr unsigned SlotCount = 100;
     static constexpr unsigned WindowMs = SlotMs * SlotCount;
+    static constexpr uint32_t MinimumScaleMs = 34; // two 16.7 ms frame budgets
 
+    struct Slot {
+        uint64_t completions[2]{};
+        uint32_t firstInterval = 0;
+    };
+    struct Summary {
+        unsigned count = 0;
+        uint32_t p80 = 0, p95 = 0, max = 0;
+        uint32_t Scale() const { return p95 > MinimumScaleMs ? p95 : MinimumScaleMs; }
+    };
     uint64_t newest = 0;
-    uint32_t peaks[SlotCount]{};
+    Slot slots[SlotCount]{};
 
     void Record(uint64_t tick, uint32_t interval) {
         const uint64_t slot = tick / SlotMs;
-        if (slot < newest) return;
+        if (!interval || slot < newest) return;
         const uint64_t skipped = slot - newest;
         if (skipped >= SlotCount) {
-            for (auto& peak : peaks) peak = 0;
+            for (auto& entry : slots) entry = {};
         } else {
-            for (uint64_t i = 1; i <= skipped; ++i) peaks[(newest + i) % SlotCount] = 0;
+            for (uint64_t i = 1; i <= skipped; ++i) slots[(newest + i) % SlotCount] = {};
         }
         newest = slot;
-        auto& peak = peaks[slot % SlotCount];
-        if (interval > peak) peak = interval;
+        auto& entry = slots[slot % SlotCount];
+        if (!entry.firstInterval) entry.firstInterval = interval;
+        const unsigned offset = tick % SlotMs;
+        entry.completions[offset / 64] |= uint64_t{1} << (offset % 64);
     }
 
-    uint32_t At(uint64_t slot) const {
-        return slot <= newest && newest - slot < SlotCount ? peaks[slot % SlotCount] : 0;
-    }
+    Summary Read(uint64_t tick) const { return ReadAges(tick / SlotMs, 0, SlotCount); }
 
-    // Columns are ordered oldest to newest. A narrower view combines
-    // adjacent slots and keeps their peak so an isolated slow frame remains visible.
-    uint32_t ColumnPeak(uint64_t tick, unsigned column, unsigned columns) const {
-        const uint64_t slot = tick / SlotMs;
+    // Columns are ordered oldest to newest. Coarser views pool the actual
+    // intervals of the covered slots before computing the percentile.
+    Summary Column(uint64_t tick, unsigned column, unsigned columns) const {
+        if (column >= columns || columns > SlotCount) return {};
         const unsigned lo = (columns - 1 - column) * SlotCount / columns;
         const unsigned hi = (columns - column) * SlotCount / columns;
-        uint32_t peak = 0;
-        for (unsigned age = lo; age < hi && age <= slot; ++age) {
-            const auto value = At(slot - age);
-            if (value > peak) peak = value;
-        }
-        return peak;
+        return ReadAges(tick / SlotMs, lo, hi);
     }
 
-    // Snapshot presentation data on a fixed render clock. Only the slot ages
-    // matter, so equivalent pictures have identical snapshot bytes.
+    // Rebase whole slots, retaining both gaps and sample offsets.
     void Capture(const DesktopFrameBins& source, uint64_t observed, uint64_t displayTick) {
         const uint64_t slot = observed / SlotMs;
         newest = displayTick / SlotMs;
         for (unsigned age = 0; age < SlotCount; ++age) {
             const auto index = (newest % SlotCount + SlotCount - age) % SlotCount;
-            peaks[index] = age <= newest && age <= slot ? source.At(slot - age) : 0;
+            const auto* entry = age <= newest && age <= slot ? source.At(slot - age) : nullptr;
+            slots[index] = entry ? *entry : Slot{};
         }
     }
+
+private:
+    const Slot* At(uint64_t slot) const {
+        return slot <= newest && newest - slot < SlotCount ? &slots[slot % SlotCount] : nullptr;
+    }
+
+    Summary ReadAges(uint64_t slot, unsigned lo, unsigned hi) const {
+        uint32_t histogram[SlotMs]{}, longIntervals[SlotCount];
+        unsigned longCount = 0;
+        Summary summary{};
+        for (unsigned age = lo; age < hi && age <= slot; ++age) {
+            const auto* entry = At(slot - age);
+            if (!entry || !entry->firstInterval) continue;
+            int previous = -1;
+            for (unsigned word = 0; word < 2; ++word) {
+                uint64_t bits = entry->completions[word];
+                while (bits) {
+                    const int offset = int(word * 64 + __builtin_ctzll(bits));
+                    const uint32_t interval = previous < 0 ? entry->firstInterval : uint32_t(offset - previous);
+                    if (interval >= SlotMs) longIntervals[longCount++] = interval;
+                    else ++histogram[interval];
+                    ++summary.count;
+                    if (interval > summary.max) summary.max = interval;
+                    previous = offset;
+                    bits &= bits - 1;
+                }
+            }
+        }
+        if (!summary.count) return summary;
+        unsigned rank = 0;
+        const unsigned rank80 = (summary.count * 80 + 99) / 100;
+        const unsigned rank95 = (summary.count * 95 + 99) / 100;
+        for (unsigned interval = 1; interval < SlotMs; ++interval) {
+            rank += histogram[interval];
+            if (!summary.p80 && rank >= rank80) summary.p80 = interval;
+            if (rank >= rank95) {
+                summary.p95 = interval;
+                return summary;
+            }
+        }
+        for (unsigned i = 1; i < longCount; ++i) {
+            const auto interval = longIntervals[i];
+            unsigned j = i;
+            while (j && longIntervals[j - 1] > interval) {
+                longIntervals[j] = longIntervals[j - 1];
+                --j;
+            }
+            longIntervals[j] = interval;
+        }
+        if (!summary.p80) summary.p80 = longIntervals[rank80 - rank - 1];
+        summary.p95 = longIntervals[rank95 - rank - 1];
+        return summary;
+    }
 };
+static_assert(sizeof(DesktopFrameBins) <= 2416, "Bound cadence snapshot storage");
 
 // Bounded cadence history. Times are monotonic milliseconds, not render CPU time.
 // Expiry keeps inactive applications from displaying stale 'live' frame rates.
@@ -63,7 +123,8 @@ template<unsigned Capacity=128> struct DesktopIntervals {
     DesktopFrameBins bins;
     void Reset() { next=count=0;last=0;bins={}; }
     void Record(uint64_t now) {
-        if(last && now>last) {
+        if (last && now <= last) return;
+        if(last) {
             uint64_t elapsed=now-last;
             const auto interval = static_cast<uint32_t>(elapsed>(~uint32_t{0})?(~uint32_t{0}):elapsed);
             samples[next]={now,interval};
