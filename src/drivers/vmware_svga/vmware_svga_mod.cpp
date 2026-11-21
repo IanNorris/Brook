@@ -13,7 +13,8 @@
 #include "tty.h"
 #include "svga_fifo.h"
 #include "svga_cursor.h"
-#include "resize_rpc_port.h"
+#include "vmware_rpc.h"
+#include "vmware_tools.h"
 #include "vfs.h"
 
 MODULE_IMPORT_SYMBOL(PciFindDevice);
@@ -33,13 +34,15 @@ MODULE_IMPORT_SYMBOL(DisplayBeginFramebufferChange);
 MODULE_IMPORT_SYMBOL(DisplayEndFramebufferChange);
 MODULE_IMPORT_SYMBOL(DisplayRegisterCursor);
 MODULE_IMPORT_SYMBOL(DisplayRegisterModePoll);
-MODULE_IMPORT_SYMBOL(ApicTickCount);
 MODULE_IMPORT_SYMBOL(VfsOpen);
 MODULE_IMPORT_SYMBOL(VfsClose);
 MODULE_IMPORT_SYMBOL(CompositorRemapLinearDisplay);
 MODULE_IMPORT_SYMBOL(TtyGetFramebufferPhys);
 MODULE_IMPORT_SYMBOL(KPrintf);
 MODULE_IMPORT_SYMBOL(SerialPrintf);
+MODULE_IMPORT_SYMBOL(VmwareToolsRegisterResolution);
+MODULE_IMPORT_SYMBOL(VmwareToolsTakeResolution);
+MODULE_IMPORT_SYMBOL(VmwareToolsFinishResolution);
 
 namespace {
 using namespace brook;
@@ -89,11 +92,6 @@ struct Driver {
 };
 
 Driver g;
-svga::ResizeRpcPort g_resizePort;
-constexpr uint64_t ModePollMs = 100;
-constexpr uint64_t ModeReconnectMs = 2000;
-svga::ResizeRpc<svga::ResizeRpcPort> g_resizeRpc{g_resizePort};
-uint64_t g_nextModePoll = 0;
 
 void Write(Register index, uint32_t value)
 {
@@ -344,9 +342,9 @@ void PanicPresent()
 }
 
 extern const DisplayOps Ops;
-svga::ResizeApplyResult TrySetMode(uint32_t width, uint32_t height)
+vmware::ResizeApplyResult TrySetMode(uint32_t width, uint32_t height)
 {
-    using Result = svga::ResizeApplyResult;
+    using Result = vmware::ResizeApplyResult;
     if (!width || !height || width > g.maxWidth || height > g.maxHeight ||
         uint64_t(width) * height * 4 > g.framebuffer.bytes) return Result::Invalid;
     DisplayFramebufferChange change(true, &Ops);
@@ -412,7 +410,7 @@ svga::ResizeApplyResult TrySetMode(uint32_t width, uint32_t height)
 
 bool SetMode(uint32_t width, uint32_t height)
 {
-    return TrySetMode(width, height) == svga::ResizeApplyResult::Applied;
+    return TrySetMode(width, height) == vmware::ResizeApplyResult::Applied;
 }
 
 void GetMode(DisplayMode* out)
@@ -439,27 +437,15 @@ constexpr DisplayOps Ops{"vmware-svga2", SetMode, GetMode, Framebuffer,
                          FramebufferPhys, Flush, PanicPresent};
 constexpr DisplayCursorOps CursorOps{&Ops, PrepareCursor, CommitCursor};
 
+// The kernel VMware Tools service owns the TCLO session. The display poll
+// context applies its pending host resize hint at a frame boundary.
 void PollModeHints()
 {
-    const uint64_t now = ApicTickCount();
-    if (now < g_nextModePoll) return;
-    g_nextModePoll = now + ModePollMs;
-    if (!g_resizeRpc.Open()) {
-        g_nextModePoll = now + ModeReconnectMs;
-        return;
-    }
-
-    const auto hint = g_resizeRpc.Poll({g.maxWidth, g.maxHeight}, now);
-    if (hint.result == svga::ResizeRpcResult::TransportError) {
-        g_nextModePoll = now + ModeReconnectMs;
-        return;
-    }
-    if (hint.result == svga::ResizeRpcResult::ModeRequested ||
-        hint.result == svga::ResizeRpcResult::WaitingForApply) {
-        (void)g_resizeRpc.ApplyPending(now, [](svga::ResizeMode mode) {
-            return TrySetMode(mode.width, mode.height);
-        });
-    }
+    uint32_t width = 0, height = 0;
+    if (!VmwareToolsTakeResolution(&width, &height)) return;
+    const auto result = TrySetMode(width, height);
+    if (result != vmware::ResizeApplyResult::Retry)
+        VmwareToolsFinishResolution(result == vmware::ResizeApplyResult::Applied);
 }
 
 constexpr DisplayModePollOps ModePollOps{&Ops, PollModeHints};
@@ -551,7 +537,7 @@ int Initialize()
     if (InitializeDisplay() < 0) return -1;
     if (auto* option = VfsOpen("/etc/vmware-autofit")) {
         VfsClose(option);
-        if (g_resizePort.Probe()) {
+        if (VmwareToolsRegisterResolution(g.maxWidth, g.maxHeight)) {
             DisplayRegisterModePoll(&ModePollOps);
             SerialPrintf("vmware-svga: host Autofit hints enabled\n");
         }

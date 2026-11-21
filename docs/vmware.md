@@ -53,6 +53,16 @@ networks. For an isolated Workstation acceptance run, build with
 the bridge's explicit `--auth-mode v3` and the matching operator seed. This
 bridge suite authenticates the operator to the guest.
 
+The generated VM has 4 vCPUs on one socket and 8 GiB of memory. Override
+them with `--cpus` and `--memory-mib` (also accepted by
+`scripts/brook_image.py --target vmware`); `manifest.json` records both.
+
+The default app set is Brook's Calculator, Qalculate!, Chromium, Files, App
+Gallery and Mousepad, plus the Vim command-line package. Settings, Task
+Manager and Terminal are built into every desktop. Firefox is left out of the
+default image to keep the disk smaller; select it with
+`scripts/brook_image.py --target vmware --apps ...` if needed.
+
 Open the generated `Brook.vmx` in Workstation. It connects one SATA disk and
 an e1000e adapter through a PCIe root port. It also enables the virtual HD
 Audio device for stereo playback through the Brook mixer. The virtual driver
@@ -86,6 +96,31 @@ Install Brook system or recovery updates by rebuilding the VMDK. The
 in-place system and recovery tools require the physical-machine write policy
 and refuse the VM profile. Save a powered-off copy and plan to migrate user
 files before replacing the disk.
+
+## VMware Tools integration
+
+When exact VMware CPUID detection succeeds, the kernel runs a small
+`vmware-tools` thread that acts as the guest "toolbox" service over the
+GuestRPC backdoor (TCLO for host commands, RPCI for reports). It registers a
+guest-managed tools version (`tools.set.version 2147483647`, as distribution
+open-vm-tools does) and the `statechange` and `softpowerop_retry`
+capabilities, so Workstation reports Tools as running. It reports the
+DHCP address through `SetGuestInfo` and `guestinfo.ip`, and again whenever
+the address changes or the host sets `broadcastIP`.
+
+**VM > Power > Shut Down Guest** and **Restart Guest** send `OS_Halt` and
+`OS_Reboot`. Brook accepts them only when the checked shutdown path is idle
+and the platform offers ACPI S5 or reset. It then replies, reports
+`tools.os.statechange.status`, and starts the same checked desktop shutdown
+or restart as the launcher power menu. Apps with unsaved changes can still
+hold the shutdown at their save prompts. `OS_PowerOn`, `OS_Resume` and
+`OS_Suspend` are acknowledged without guest scripts.
+
+With `--autofit`, the SVGA driver registers host resize hints through the
+same session. The thread polls every 100 ms, each poll is a bounded number of
+backdoor calls, and a transport error closes the session and retries after
+two seconds. It never blocks boot. On QEMU, other hypervisors and physical
+machines, it performs no backdoor I/O.
 
 ## Persistent image validation
 

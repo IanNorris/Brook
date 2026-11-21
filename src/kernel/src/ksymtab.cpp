@@ -1,4 +1,5 @@
 #include "ksymtab.h"
+#include "vmware_tools.h"
 #include "serial.h"
 
 // The linker script places all .ksymtab entries between these two symbols.
@@ -129,6 +130,9 @@ EXPORT_SYMBOL(DisplayBeginFramebufferChange);
 EXPORT_SYMBOL(DisplayEndFramebufferChange);
 EXPORT_SYMBOL(DisplayRegisterCursor);
 EXPORT_SYMBOL(DisplayRegisterModePoll);
+EXPORT_SYMBOL(VmwareToolsRegisterResolution);
+EXPORT_SYMBOL(VmwareToolsTakeResolution);
+EXPORT_SYMBOL(VmwareToolsFinishResolution);
 EXPORT_SYMBOL(DisplaySet3DActive);
 EXPORT_SYMBOL(GpuCompositorRegister);
 EXPORT_SYMBOL(FrameTimingEnter);

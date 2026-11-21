@@ -1,13 +1,13 @@
 #pragma once
 
-#include "resize_rpc.h"
-#include "../../kernel/src/vmware_platform.h"
+#include "vmware_rpc.h"
+#include "vmware_platform.h"
 
-namespace brook::svga {
+namespace brook::vmware {
 
 // Low-bandwidth VMware MESSAGE adapter. There is no probe on physical PCs or
 // other hypervisors, no general command interface, and no host buffer address.
-class ResizeRpcPort {
+class RpcPort {
     bool available_ = false;
 
 public:
@@ -21,9 +21,9 @@ public:
         return available_;
     }
 
-    bool operator()(resize_rpc::Registers& r) const
+    bool operator()(rpc::Registers& r) const
     {
-        using namespace resize_rpc;
+        using namespace rpc;
         const uint16_t op = High(r.cx);
         if (!available_ || r.ax != Magic || uint16_t(r.dx) != Port ||
             uint16_t(r.cx) != MessageCommand || op > uint16_t(Operation::Close)) return false;

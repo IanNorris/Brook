@@ -2,20 +2,25 @@
 
 #include <stdint.h>
 
-namespace brook::svga {
+namespace brook::vmware {
 
 struct ResizeMode { uint32_t width, height; };
 
-enum class ResizeRpcResult {
-    Closed, Idle, Handled, ModeRequested, WaitingForApply, TransportError
+enum class RpcResult {
+    Closed, Idle, Handled, ModeRequested, WaitingForApply, PowerRequested, TransportError
 };
 
-struct ResizeRpcPoll {
-    ResizeRpcResult result;
+// Soft power operations from Workstation's Shut Down Guest / Restart Guest.
+enum class PowerOp : uint8_t { None, Halt, Reboot };
+
+struct RpcPoll {
+    RpcResult result;
     ResizeMode mode{};
+    PowerOp power = PowerOp::None;     // with PowerRequested: answer before polling again
+    PowerOp committed = PowerOp::None; // reply and success status delivered: start it now
 };
 
-namespace resize_rpc {
+namespace rpc {
 // VMware GuestRPC MESSAGE operations and register layout. See Open VM
 // Tools lib/message/message.c and lib/include/guest_msg_def.h.
 enum class Operation : uint16_t {
@@ -169,27 +174,81 @@ inline bool ModeArguments(const char* data, uint32_t size, uint32_t i, ResizeMod
 }
 
 enum class HostReply { Ok, Declined, TransportError };
+
+// Bounded text builder for the fixed RPCI messages (no libc in the kernel).
+class Text {
+    char data_[MessageLimit];
+    uint32_t size_ = 0;
+    bool overflow_ = false;
+
+public:
+    Text& operator<<(const char* text)
+    {
+        while (*text) {
+            if (size_ == MessageLimit) { overflow_ = true; break; }
+            data_[size_++] = *text++;
+        }
+        return *this;
+    }
+    Text& operator<<(uint32_t value)
+    {
+        char digits[10];
+        uint32_t count = 0;
+        do { digits[count++] = char('0' + value % 10); value /= 10; } while (value);
+        while (count) {
+            if (size_ == MessageLimit) { overflow_ = true; break; }
+            data_[size_++] = digits[--count];
+        }
+        return *this;
+    }
+    Text& Ipv4(uint32_t networkOrder)
+    {
+        for (uint32_t i = 0; i < 4; ++i) {
+            if (i) *this << ".";
+            *this << ((networkOrder >> (i * 8)) & 255);
+        }
+        return *this;
+    }
+    const char* Data() const { return data_; }
+    uint32_t Size() const { return size_; }
+    bool Valid() const { return !overflow_; }
+};
+
+// Values from Open VM Tools lib/include/vmware/guestrpc/powerops.h,
+// lib/include/guestInfo.h and lib/include/vm_version.h.
+enum GuestOsState : uint32_t { StateHalt = 1, StateReboot = 2, StatePowerOn = 3, StateResume = 4, StateSuspend = 5 };
+constexpr uint32_t InfoIpAddress = 2;
+// TOOLS_VERSION_UNMANAGED: a guest-managed (distribution) toolset, so
+// Workstation neither nags about installing VMware Tools nor offers upgrades.
+constexpr uint32_t ToolsVersionUnmanaged = 0x7fffffff;
 }
 
-// One serialized TCLO session. The caller owns polling cadence, explicit
-// Close() on shutdown, and mode policy. In particular, no success reply is sent until it confirms that
-// the requested mode was applied (or was already current).
+// One serialized TCLO session acting as the guest "toolbox" service, plus the
+// RPCI client it reports through. The caller owns polling cadence, explicit
+// Close() on shutdown, and mode and power policy. In particular, no resize
+// success reply is sent until the caller confirms that the requested mode was
+// applied (or was already current), and a power command is not answered
+// until the caller accepts or declines it.
 enum class ResizeApplyResult { Applied, Invalid, Retry };
 
 template<class PortIO>
-class ResizeRpc {
+class ToolsRpc {
     PortIO& io_;
-    resize_rpc::Channel listener_, client_;
+    rpc::Channel listener_, client_;
     const char* reply_ = "";
+    ResizeMode limit_{};
     bool registered_ = false;
     bool awaitingApply_ = false;
+    bool ipRequested_ = false;
     ResizeMode pendingMode_{};
     uint64_t applyStarted_ = 0;
+    PowerOp pendingPower_ = PowerOp::None, statusCommit_ = PowerOp::None;
+    uint32_t statusState_ = 0;
     static constexpr uint64_t ApplyTimeoutMs = 1000;
 
-    resize_rpc::HostReply Capability(const char* command, uint32_t size)
+    rpc::HostReply Call(const char* command, uint32_t size)
     {
-        using namespace resize_rpc;
+        using namespace rpc;
         if (!client_.Send(io_, command, size)) return HostReply::TransportError;
         char reply[MessageLimit];
         uint32_t bytes;
@@ -199,27 +258,36 @@ class ResizeRpc {
         return reply[0] == '1' ? HostReply::Ok : HostReply::Declined;
     }
 
-    ResizeRpcPoll Failed()
+    rpc::HostReply Call(const rpc::Text& text)
+    {
+        return text.Valid() ? Call(text.Data(), text.Size()) : rpc::HostReply::Declined;
+    }
+
+    RpcPoll Failed()
     {
         // Checkpoint/restore and transport errors invalidate this exchange.
         // The caller can reopen on a later tick. Never replay a resize.
         Close();
-        return {ResizeRpcResult::TransportError};
+        return {RpcResult::TransportError};
     }
 
+    bool ResolutionEnabled() const { return limit_.width && limit_.height; }
+
 public:
-    constexpr explicit ResizeRpc(PortIO& io) : io_(io) {}
-    ResizeRpc(const ResizeRpc&) = delete;
-    ResizeRpc& operator=(const ResizeRpc&) = delete;
+    constexpr explicit ToolsRpc(PortIO& io) : io_(io) {}
+    ToolsRpc(const ToolsRpc&) = delete;
+    ToolsRpc& operator=(const ToolsRpc&) = delete;
 
     bool Open()
     {
         if (listener_.IsOpen()) return true;
-        if (!listener_.Open(io_, resize_rpc::Tclo)) return false;
-        if (client_.Open(io_, resize_rpc::Rpci)) return true;
+        if (!listener_.Open(io_, rpc::Tclo)) return false;
+        if (client_.Open(io_, rpc::Rpci)) return true;
         listener_.Close(io_);
         return false;
     }
+
+    bool IsOpen() const { return listener_.IsOpen(); }
 
     void Close()
     {
@@ -227,24 +295,100 @@ public:
         client_.Close(io_);
         reply_ = "";
         registered_ = awaitingApply_ = false;
+        pendingPower_ = statusCommit_ = PowerOp::None;
+        statusState_ = 0;
     }
 
-    ResizeRpcPoll Poll(ResizeMode limit, uint64_t now = 0)
+    // A zero limit leaves host resize hints unregistered.
+    void SetResolutionLimit(ResizeMode limit) { limit_ = limit; }
+
+    // Registers the toolset version and capabilities, as vmtoolsd does at
+    // startup and on Capabilities_Register. Only a transport error fails;
+    // a host that declines an optional capability keeps the session.
+    bool Announce()
     {
-        using namespace resize_rpc;
-        if (!listener_.IsOpen()) return {ResizeRpcResult::Closed};
-        if (awaitingApply_) return {ResizeRpcResult::WaitingForApply};
+        using namespace rpc;
+        if (!client_.IsOpen()) return false;
+        Text version;
+        version << "tools.set.version " << ToolsVersionUnmanaged;
+        static constexpr char stateChange[] = "tools.capability.statechange ";
+        static constexpr char retry[] = "tools.capability.softpowerop_retry ";
+        if (Call(version) == HostReply::TransportError ||
+            Call(stateChange, sizeof(stateChange) - 1) == HostReply::TransportError ||
+            Call(retry, sizeof(retry) - 1) == HostReply::TransportError) return false;
+        registered_ = false;
+        if (!ResolutionEnabled()) return true;
+        static constexpr char server[] = "tools.capability.resolution_server toolbox 1";
+        static constexpr char mode[] = "tools.capability.resolution_set 1";
+        const auto first = Call(server, sizeof(server) - 1);
+        const auto second = first == HostReply::Ok ? Call(mode, sizeof(mode)) : first;
+        if (second == HostReply::TransportError) return false;
+        registered_ = second == HostReply::Ok;
+        return true;
+    }
+
+    // Publishes the primary IPv4 address (network byte order) through the
+    // legacy guest info key and the guestinfo.ip variable.
+    bool SendGuestIp(uint32_t address)
+    {
+        using namespace rpc;
+        if (!client_.IsOpen()) return false;
+        Text info, variable;
+        info << "SetGuestInfo  " << InfoIpAddress << " ";
+        info.Ipv4(address);
+        variable << "info-set guestinfo.ip ";
+        variable.Ipv4(address);
+        return Call(info) != HostReply::TransportError && Call(variable) != HostReply::TransportError;
+    }
+
+    bool Log(const char* message)
+    {
+        rpc::Text text;
+        text << "log " << message;
+        return client_.IsOpen() && Call(text) != rpc::HostReply::TransportError;
+    }
+
+    // True once after the host sets the broadcastIP option.
+    bool TakeIpRequest()
+    {
+        const bool requested = ipRequested_;
+        ipRequested_ = false;
+        return requested;
+    }
+
+    RpcPoll Poll(uint64_t now = 0)
+    {
+        using namespace rpc;
+        if (!listener_.IsOpen()) return {RpcResult::Closed};
+        if (awaitingApply_) return {RpcResult::WaitingForApply};
+        if (pendingPower_ != PowerOp::None) return {RpcResult::PowerRequested, {}, pendingPower_};
         if (!listener_.Send(io_, reply_, Length(reply_))) return Failed();
         reply_ = "";
+        RpcPoll result{RpcResult::Handled};
+        if (statusState_) {
+            // Open VM Tools reports the state change after answering the
+            // command, then starts the operation.
+            Text status;
+            status << "tools.os.statechange.status 1 " << statusState_;
+            statusState_ = 0;
+            if (Call(status) == HostReply::TransportError) return Failed();
+            result.committed = statusCommit_;
+            statusCommit_ = PowerOp::None;
+        }
         char command[MessageLimit];
         uint32_t size;
         switch (listener_.Receive(io_, command, size)) {
-        case ReceiveResult::Empty: return {ResizeRpcResult::Idle};
-        case ReceiveResult::Failed: return Failed();
+        case ReceiveResult::Empty: result.result = RpcResult::Idle; return result;
+        case ReceiveResult::Failed: {
+            const auto committed = result.committed;
+            result = Failed();
+            result.committed = committed;
+            return result;
+        }
         case ReceiveResult::Message: break;
         }
         if (size && command[size - 1] == '\0') --size;
-        if (!size) return {ResizeRpcResult::Idle};
+        if (!size) { result.result = RpcResult::Idle; return result; }
         uint32_t verb = 0;
         while (verb < size && command[verb] != ' ') ++verb;
         uint32_t argument = verb;
@@ -256,43 +400,101 @@ public:
         } else if (noArguments && Matches(command, verb, "ping")) {
             reply_ = "OK ";
         } else if (noArguments && Matches(command, verb, "Capabilities_Register")) {
-            static constexpr char server[] = "tools.capability.resolution_server toolbox 1";
-            static constexpr char mode[] = "tools.capability.resolution_set 1";
-            const auto first = Capability(server, sizeof(server) - 1);
-            const auto second = first == HostReply::Ok ? Capability(mode, sizeof(mode)) : first;
-            if (second == HostReply::TransportError) return Failed();
-            registered_ = second == HostReply::Ok;
-            reply_ = registered_ ? "OK " : "ERROR Capability registration failed";
+            if (!Announce()) {
+                const auto committed = result.committed;
+                result = Failed();
+                result.committed = committed;
+                return result;
+            }
+            reply_ = !ResolutionEnabled() || registered_ ? "OK " : "ERROR Capability registration failed";
+        } else if (Matches(command, verb, "Set_Option")) {
+            uint32_t name = argument;
+            while (name < size && command[name] != ' ') ++name;
+            uint32_t value = name;
+            while (value < size && command[value] == ' ') ++value;
+            if (argument == size || value == size) {
+                reply_ = "ERROR Invalid arguments";
+            } else {
+                if (Matches(command + argument, name - argument, "broadcastIP") &&
+                    Matches(command + value, size - value, "1")) ipRequested_ = true;
+                reply_ = "OK ";
+            }
+        } else if (noArguments && (Matches(command, verb, "OS_Halt") || Matches(command, verb, "OS_Reboot"))) {
+            pendingPower_ = Matches(command, verb, "OS_Halt") ? PowerOp::Halt : PowerOp::Reboot;
+            result.result = RpcResult::PowerRequested;
+            result.power = pendingPower_;
+            return result;
+        } else if (noArguments && (Matches(command, verb, "OS_PowerOn") ||
+                                   Matches(command, verb, "OS_Resume") ||
+                                   Matches(command, verb, "OS_Suspend"))) {
+            // No guest scripts: acknowledge so the host completes the change.
+            statusState_ = Matches(command, verb, "OS_PowerOn") ? StatePowerOn :
+                           Matches(command, verb, "OS_Resume") ? StateResume : StateSuspend;
+            reply_ = "OK ";
         } else if (Matches(command, verb, "Resolution_Set")) {
             ResizeMode mode{};
             if (!registered_) reply_ = "ERROR Invalid guest state";
-            else if (!ModeArguments(command, size, verb, limit, mode))
+            else if (!ModeArguments(command, size, verb, limit_, mode))
                 reply_ = "ERROR Invalid arguments";
             else {
                 awaitingApply_ = true;
                 pendingMode_ = mode;
                 applyStarted_ = now;
-                return {ResizeRpcResult::ModeRequested, mode};
+                result.result = RpcResult::ModeRequested;
+                result.mode = mode;
+                return result;
             }
         } else {
             reply_ = "ERROR Unknown Command";
         }
-        return {ResizeRpcResult::Handled};
+        return result;
+    }
+
+    // Answers a pending OS_Halt/OS_Reboot. An accepted operation is reported
+    // as committed by the poll that delivers the reply and success status.
+    void AnswerPower(bool accept)
+    {
+        if (pendingPower_ == PowerOp::None) return;
+        if (accept) {
+            reply_ = "OK ";
+            statusState_ = pendingPower_ == PowerOp::Halt ? rpc::StateHalt : rpc::StateReboot;
+            statusCommit_ = pendingPower_;
+        } else {
+            reply_ = "ERROR Power operation unavailable";
+        }
+        pendingPower_ = PowerOp::None;
+    }
+
+    // Returns the requested mode while it is still within its deadline.
+    // An expired request is answered with a timeout instead.
+    bool PendingMode(uint64_t now, ResizeMode& mode)
+    {
+        if (!awaitingApply_) return false;
+        if (now - applyStarted_ >= ApplyTimeoutMs) {
+            reply_ = "ERROR Resize timed out";
+            awaitingApply_ = false;
+            return false;
+        }
+        mode = pendingMode_;
+        return true;
+    }
+
+    void CompletePending(ResizeApplyResult result)
+    {
+        if (!awaitingApply_ || result == ResizeApplyResult::Retry) return;
+        reply_ = result == ResizeApplyResult::Applied ? "OK " : "ERROR Invalid arguments";
+        awaitingApply_ = false;
     }
 
     template<class Apply>
     bool ApplyPending(uint64_t now, Apply apply)
     {
         if (!awaitingApply_) return false;
-        if (now - applyStarted_ >= ApplyTimeoutMs) {
-            reply_ = "ERROR Resize timed out";
-        } else {
-            const auto result = apply(pendingMode_);
-            if (result == ResizeApplyResult::Retry) return false;
-            reply_ = result == ResizeApplyResult::Applied ? "OK " : "ERROR Invalid arguments";
-        }
-        awaitingApply_ = false;
-        return true;
+        ResizeMode mode{};
+        if (!PendingMode(now, mode)) return true;
+        const auto result = apply(mode);
+        CompletePending(result);
+        return result != ResizeApplyResult::Retry;
     }
 };
 

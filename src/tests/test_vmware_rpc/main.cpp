@@ -1,15 +1,15 @@
-#include "../../drivers/vmware_svga/resize_rpc_port.h"
+#include "../../kernel/src/vmware_rpc_port.h"
 
 #include <cassert>
 #include <cstdio>
 #include <string_view>
 #include <vector>
 
-using brook::svga::ResizeApplyResult;
-using brook::svga::ResizeMode;
-using brook::svga::ResizeRpc;
-using brook::svga::ResizeRpcResult;
-using brook::svga::resize_rpc::Registers;
+using brook::vmware::ResizeApplyResult;
+using brook::vmware::ResizeMode;
+using brook::vmware::ToolsRpc;
+using brook::vmware::RpcResult;
+using brook::vmware::rpc::Registers;
 
 namespace {
 
@@ -94,7 +94,19 @@ public:
         Command(Client, Close, 0);
     }
 
+    void Call(std::string_view request, std::string_view response = "1 ", uint32_t extra = 0) {
+        Send(Client, request, extra);
+        Receive(Client, response, extra);
+    }
+
+    void Announce(uint32_t extra = 0) {
+        Call("tools.set.version 2147483647", "1 ", extra);
+        Call("tools.capability.statechange ", "1 ", extra);
+        Call("tools.capability.softpowerop_retry ", "1 ", extra);
+    }
+
     void Register(std::string_view response = "1 ", uint32_t extra = 0) {
+        Announce(extra);
         Send(Client, "tools.capability.resolution_server toolbox 1", extra);
         Receive(Client, "1 ", extra);
         constexpr char enable[] = "tools.capability.resolution_set 1";
@@ -108,23 +120,24 @@ constexpr ResizeMode Limits{3840, 2160};
 void ResizeSession() {
     Backdoor io;
     io.OpenChannels();
-    ResizeRpc rpc(io);
-    assert(rpc.Poll(Limits).result == ResizeRpcResult::Closed);
+    ToolsRpc rpc(io);
+    rpc.SetResolutionLimit(Limits);
+    assert(rpc.Poll().result == RpcResult::Closed);
     assert(rpc.Open());
     io.EmptyPoll("");
-    assert(rpc.Poll(Limits).result == ResizeRpcResult::Idle);
+    assert(rpc.Poll().result == RpcResult::Idle);
     io.Poll("", "reset", HighBandwidth);
-    assert(rpc.Poll(Limits).result == ResizeRpcResult::Handled);
+    assert(rpc.Poll().result == RpcResult::Handled);
     io.Poll("OK ATR toolbox", "Capabilities_Register ", HighBandwidth);
     io.Register("1 ", HighBandwidth);
-    assert(rpc.Poll(Limits).result == ResizeRpcResult::Handled);
+    assert(rpc.Poll().result == RpcResult::Handled);
 
     constexpr char hostRequest[] = "Resolution_Set 1920 1080";
     io.Poll("OK ", std::string_view(hostRequest, sizeof(hostRequest)), HighBandwidth);
-    auto request = rpc.Poll(Limits);
-    assert(request.result == ResizeRpcResult::ModeRequested);
+    auto request = rpc.Poll();
+    assert(request.result == RpcResult::ModeRequested);
     assert(request.mode.width == 1920 && request.mode.height == 1080);
-    assert(rpc.Poll(Limits).result == ResizeRpcResult::WaitingForApply);
+    assert(rpc.Poll().result == RpcResult::WaitingForApply);
     io.CheckConsumed();
     auto retry = [](ResizeMode mode) {
         assert(mode.width == 1920 && mode.height == 1080);
@@ -133,23 +146,23 @@ void ResizeSession() {
     auto applied = [](ResizeMode) { return ResizeApplyResult::Applied; };
     assert(!rpc.ApplyPending(1, retry));
     assert(!rpc.ApplyPending(900, retry));
-    assert(rpc.Poll(Limits, 901).result == ResizeRpcResult::WaitingForApply);
+    assert(rpc.Poll(901).result == RpcResult::WaitingForApply);
     assert(rpc.ApplyPending(999, applied));
     assert(!rpc.ApplyPending(999, applied));
     io.Poll("OK ", "Resolution_Set  800  600");
-    request = rpc.Poll(Limits);
-    assert(request.result == ResizeRpcResult::ModeRequested);
+    request = rpc.Poll();
+    assert(request.result == RpcResult::ModeRequested);
     assert(request.mode.width == 800 && request.mode.height == 600);
     assert(rpc.ApplyPending(0, [](ResizeMode) { return ResizeApplyResult::Invalid; }));
     io.Poll("ERROR Invalid arguments", "Resolution_Set 800 600");
-    assert(rpc.Poll(Limits, 2500).result == ResizeRpcResult::ModeRequested);
+    assert(rpc.Poll(2500).result == RpcResult::ModeRequested);
     assert(!rpc.ApplyPending(3499, [](ResizeMode) { return ResizeApplyResult::Retry; }));
     assert(rpc.ApplyPending(3500, [](ResizeMode) {
         assert(false && "expired resize must not run");
         return ResizeApplyResult::Applied;
     }));
     io.EmptyPoll("ERROR Resize timed out");
-    assert(rpc.Poll(Limits, 3501).result == ResizeRpcResult::Idle);
+    assert(rpc.Poll(3501).result == RpcResult::Idle);
 
     static constexpr std::string_view invalid[] = {
         "Resolution_Set -1 600", "Resolution_Set 42949672960 600",
@@ -160,20 +173,20 @@ void ResizeSession() {
     std::string_view previousReply;
     for (auto cmd : invalid) {
         io.Poll(previousReply, cmd);
-        assert(rpc.Poll(Limits).result == ResizeRpcResult::Handled);
+        assert(rpc.Poll().result == RpcResult::Handled);
         assert(!rpc.ApplyPending(0, [](ResizeMode) { return ResizeApplyResult::Applied; }));
         previousReply = "ERROR Invalid arguments";
     }
     io.Poll("ERROR Invalid arguments", "DisplayTopology_Set 1");
-    assert(rpc.Poll(Limits).result == ResizeRpcResult::Handled);
+    assert(rpc.Poll().result == RpcResult::Handled);
     io.Poll("ERROR Unknown Command", "reset");
-    assert(rpc.Poll(Limits).result == ResizeRpcResult::Handled);
+    assert(rpc.Poll().result == RpcResult::Handled);
     io.Poll("OK ATR toolbox", "Resolution_Set 800 600");
-    assert(rpc.Poll(Limits).result == ResizeRpcResult::Handled);
+    assert(rpc.Poll().result == RpcResult::Handled);
     io.Poll("ERROR Invalid guest state", "ping");
-    assert(rpc.Poll(Limits).result == ResizeRpcResult::Handled);
+    assert(rpc.Poll().result == RpcResult::Handled);
     io.EmptyPoll("OK ");
-    assert(rpc.Poll(Limits).result == ResizeRpcResult::Idle);
+    assert(rpc.Poll().result == RpcResult::Idle);
     io.CloseChannels();
     rpc.Close();
     rpc.Close();
@@ -182,12 +195,13 @@ void ResizeSession() {
 
 void FallbackAndErrors() {
     Backdoor io;
-    ResizeRpc rpc(io);
+    ToolsRpc rpc(io);
+    rpc.SetResolutionLimit(Limits);
     io.Negotiate(Tclo, Listener, true, false);
     io.Negotiate(Tclo, Listener, false, false);
     assert(!rpc.Open());
     io.CheckConsumed();
-    assert(rpc.Poll(Limits).result == ResizeRpcResult::Closed);
+    assert(rpc.Poll().result == RpcResult::Closed);
 
     io.Negotiate(Tclo, Listener, true);
     io.Negotiate(Rpci, Client, true, false);
@@ -207,7 +221,7 @@ void FallbackAndErrors() {
     io.Command(LegacyListener, RecvData, 0);
     io.Command(LegacyListener, Close, 0);
     io.Command(Client, Close, 0);
-    assert(rpc.Poll(Limits).result == ResizeRpcResult::TransportError);
+    assert(rpc.Poll().result == RpcResult::TransportError);
     io.CheckConsumed();
     assert(!rpc.ApplyPending(0, [](ResizeMode) { return ResizeApplyResult::Applied; }));
 
@@ -215,9 +229,9 @@ void FallbackAndErrors() {
     assert(rpc.Open());
     io.Poll("", "Capabilities_Register");
     io.Register("0 unavailable");
-    assert(rpc.Poll(Limits).result == ResizeRpcResult::Handled);
+    assert(rpc.Poll().result == RpcResult::Handled);
     io.EmptyPoll("ERROR Capability registration failed");
-    assert(rpc.Poll(Limits).result == ResizeRpcResult::Idle);
+    assert(rpc.Poll().result == RpcResult::Idle);
 
     // A checkpoint interrupts a payload. Reject it and reopen at caller pace.
     io.Send(Listener, "");
@@ -225,9 +239,9 @@ void FallbackAndErrors() {
     io.Command(Listener, RecvData, Ok, Checkpoint);
     io.Command(Listener, RecvData, 0);
     io.CloseChannels();
-    assert(rpc.Poll(Limits).result == ResizeRpcResult::TransportError);
+    assert(rpc.Poll().result == RpcResult::TransportError);
     io.CheckConsumed();
-    assert(rpc.Poll(Limits).result == ResizeRpcResult::Closed);
+    assert(rpc.Poll().result == RpcResult::Closed);
 
     io.OpenChannels();
     assert(rpc.Open());
@@ -237,23 +251,110 @@ void FallbackAndErrors() {
     io.Command(Listener, RecvStatus, Ok, Checkpoint);
     io.Command(Listener, RecvStatus, 0);
     io.CloseChannels();
-    assert(rpc.Poll(Limits).result == ResizeRpcResult::TransportError);
+    assert(rpc.Poll().result == RpcResult::TransportError);
     io.CheckConsumed();
 
     io.OpenChannels();
     assert(rpc.Open());
     io.Poll("", "reset");
-    assert(rpc.Poll(Limits).result == ResizeRpcResult::Handled);
+    assert(rpc.Poll().result == RpcResult::Handled);
     io.EmptyPoll("OK ATR toolbox");
-    assert(rpc.Poll(Limits).result == ResizeRpcResult::Idle);
+    assert(rpc.Poll().result == RpcResult::Idle);
     io.CloseChannels();
     rpc.Close();
     io.CheckConsumed();
 }
 
+void PowerAndGuestInfo() {
+    using brook::vmware::PowerOp;
+    Backdoor io;
+    ToolsRpc rpc(io);
+    io.OpenChannels();
+    assert(rpc.Open());
+    io.Announce();
+    assert(rpc.Announce());
+    io.Call("log brook: tools service started");
+    assert(rpc.Log("brook: tools service started"));
+    io.Call("SetGuestInfo  2 192.168.10.129", "0 deprecated");
+    io.Call("info-set guestinfo.ip 192.168.10.129");
+    assert(rpc.SendGuestIp(0x810aa8c0));
+
+    io.Poll("", "reset");
+    assert(rpc.Poll().result == RpcResult::Handled);
+    // Without a resolution limit only the toolbox capabilities register.
+    io.Poll("OK ATR toolbox", "Capabilities_Register");
+    io.Announce();
+    assert(rpc.Poll().result == RpcResult::Handled);
+    io.Poll("OK ", "Set_Option broadcastIP 1");
+    assert(rpc.Poll().result == RpcResult::Handled);
+    assert(rpc.TakeIpRequest() && !rpc.TakeIpRequest());
+    io.Poll("OK ", "Set_Option enableDnD 0");
+    assert(rpc.Poll().result == RpcResult::Handled && !rpc.TakeIpRequest());
+    io.Poll("OK ", "Set_Option");
+    assert(rpc.Poll().result == RpcResult::Handled);
+    io.Poll("ERROR Invalid arguments", "Resolution_Set 800 600");
+    assert(rpc.Poll().result == RpcResult::Handled);
+
+    io.Poll("ERROR Invalid guest state", std::string_view("OS_Halt\0", 8));
+    auto halt = rpc.Poll();
+    assert(halt.result == RpcResult::PowerRequested && halt.power == PowerOp::Halt &&
+           halt.committed == PowerOp::None);
+    io.CheckConsumed();
+    // Unanswered: no further backdoor traffic and the request is repeated.
+    halt = rpc.Poll();
+    assert(halt.result == RpcResult::PowerRequested && halt.power == PowerOp::Halt);
+    io.CheckConsumed();
+    rpc.AnswerPower(true);
+    rpc.AnswerPower(false);
+    io.Send(Listener, "OK ");
+    io.Call("tools.os.statechange.status 1 1");
+    io.Command(Listener, RecvLength, 0);
+    halt = rpc.Poll();
+    assert(halt.result == RpcResult::Idle && halt.committed == PowerOp::Halt);
+
+    io.EmptyPoll("");
+    assert(rpc.Poll().committed == PowerOp::None);
+    io.Poll("", "OS_Reboot");
+    auto reboot = rpc.Poll();
+    assert(reboot.result == RpcResult::PowerRequested && reboot.power == PowerOp::Reboot);
+    rpc.AnswerPower(false);
+    io.Poll("ERROR Power operation unavailable", "OS_Halt now");
+    assert(rpc.Poll().result == RpcResult::Handled);
+    io.Poll("ERROR Unknown Command", "OS_Suspend");
+    assert(rpc.Poll().result == RpcResult::Handled);
+    io.Send(Listener, "OK ");
+    io.Call("tools.os.statechange.status 1 5");
+    io.Receive(Listener, "OS_Reboot");
+    reboot = rpc.Poll();
+    assert(reboot.result == RpcResult::PowerRequested && reboot.power == PowerOp::Reboot &&
+           reboot.committed == PowerOp::None);
+    rpc.AnswerPower(true);
+    // A transport error after the status was delivered still commits.
+    io.Send(Listener, "OK ");
+    io.Call("tools.os.statechange.status 1 2");
+    io.Command(Listener, RecvLength, 0, 0);
+    io.CloseChannels();
+    reboot = rpc.Poll();
+    assert(reboot.result == RpcResult::TransportError && reboot.committed == PowerOp::Reboot);
+    io.CheckConsumed();
+    assert(rpc.Poll().result == RpcResult::Closed);
+
+    io.OpenChannels();
+    assert(rpc.Open());
+    io.Poll("", "Time_Synchronize 1");
+    assert(rpc.Poll().result == RpcResult::Handled);
+    io.Poll("ERROR Unknown Command", "OS_Halt");
+    assert(rpc.Poll().result == RpcResult::PowerRequested);
+    // Close drops an unanswered request instead of replaying it.
+    io.CloseChannels();
+    rpc.Close();
+    assert(rpc.Poll().result == RpcResult::Closed);
+    io.CheckConsumed();
+}
+
 // Instantiate the six-register production port function for build-time
 // checking. The host fixture executes the scripted backend only.
-[[gnu::used]] bool CompilePortAdapter(brook::svga::ResizeRpcPort& port, Registers& message) {
+[[gnu::used]] bool CompilePortAdapter(brook::vmware::RpcPort& port, Registers& message) {
     return port(message);
 }
 
@@ -262,5 +363,6 @@ void FallbackAndErrors() {
 int main() {
     ResizeSession();
     FallbackAndErrors();
-    puts("VMWARE_RESIZE_RPC_PASS TCLO/RPCI, low bandwidth with HB advertised, validated modes, bounded reset");
+    PowerAndGuestInfo();
+    puts("VMWARE_RPC_PASS TCLO/RPCI, low bandwidth with HB advertised, validated modes, bounded reset, power ops, guest info");
 }
