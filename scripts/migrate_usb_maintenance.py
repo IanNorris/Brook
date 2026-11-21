@@ -3,8 +3,8 @@
 
 Use a private host directory for the state and keep it: the byte image and
 receipt may contain credentials. Confirm the device with the operator first.
-Mount only the ESP read-write with a normal vfat mixed/winnt short-name
-policy. Close other applications and keep the stick attached. Capture reads the
+Mount only the ESP read-write with noatime and a normal vfat mixed/winnt
+short-name policy. Close other applications and keep the stick attached. Capture reads the
 whole USB disk to a private stick.img and verifies the SHA-256 on readback.
 check verifies the backup and free capacity. apply stages the reviewed files,
 moves all old top-level entries into OLD, then publishes the new EFI loader
@@ -148,8 +148,8 @@ def usb_mount(mount, disk):
         raise ValueError("Mount must expose the whole FAT filesystem using vfat")
     if {"shortname=lower", "shortname=win95"} & set(fs[2].split(",")):
         raise ValueError("Mount with shortname=mixed or shortname=winnt to preserve FAT names")
-    if "rw" not in info[5].split(","):
-        raise ValueError("Mount the FAT filesystem read-write for capture, check and migration")
+    if not {"rw", "noatime"} <= set(info[5].split(",")):
+        raise ValueError("Mount the FAT filesystem with rw,noatime before capturing any backup")
     number = os.makedev(*map(int, info[2].split(":")))
     if mount.stat().st_dev != number:
         raise ValueError("FAT mount identity changed")
@@ -355,7 +355,10 @@ def preflight(mount, disk, state, payload):
     reject_reserved(old)
     if old != record["original"] or raw_disk(record["source"]) != record["image"]:
         raise ValueError("The current USB bytes or FAT tree differ from the private backup")
-    return old, ensure_capacity(mount, old, payload)
+    capacity = ensure_capacity(mount, old, payload)
+    if usb_mount(mount, disk) != record["source"]:
+        raise ValueError("The FAT mount changed during preflight")
+    return old, capacity
 
 
 def stage_tree(payload):
