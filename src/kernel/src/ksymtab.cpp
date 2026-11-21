@@ -125,6 +125,10 @@ EXPORT_SYMBOL(PciConfigWrite32);
 
 // Display
 EXPORT_SYMBOL(DisplayRegister);
+EXPORT_SYMBOL(DisplayBeginFramebufferChange);
+EXPORT_SYMBOL(DisplayEndFramebufferChange);
+EXPORT_SYMBOL(DisplayRegisterCursor);
+EXPORT_SYMBOL(DisplayRegisterModePoll);
 EXPORT_SYMBOL(DisplaySet3DActive);
 EXPORT_SYMBOL(GpuCompositorRegister);
 EXPORT_SYMBOL(FrameTimingEnter);
@@ -140,6 +144,7 @@ EXPORT_SYMBOL(TtyRemap);
 
 // Compositor
 EXPORT_SYMBOL(CompositorRemap);
+EXPORT_SYMBOL(CompositorRemapLinearDisplay);
 EXPORT_SYMBOL(CompositorGetPhysDims);
 EXPORT_SYMBOL(CompositorWake);
 

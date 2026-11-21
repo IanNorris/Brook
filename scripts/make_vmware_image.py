@@ -132,11 +132,12 @@ def build_kernel(work, policy):
     return build
 
 
-def make_initrds(work, build, payload, policy, profile, commit, name):
+def make_initrds(work, build, payload, policy, profile, commit, name, autofit):
     tree = work / 'initrd'
     modules = tree / 'kernel/drivers'
     modules.mkdir(parents=True)
-    shutil.copy2(build / 'drivers/e1000.mod', modules / 'e1000.mod')
+    for module in ('e1000.mod', 'vmware_svga.mod'):
+        shutil.copy2(build / 'drivers' / module, modules / module)
     env = dict(os.environ, BROOK_BUILD_DIR=str(tree), BROOK_INITRD_KIB='16384')
     for key in ('BROOK_PROVIDER_PAYLOAD', 'BROOK_INITRD_MARKERS', 'BROOK_HARDWARE_PAYLOAD_ID'):
         env.pop(key, None)
@@ -163,6 +164,8 @@ def make_initrds(work, build, payload, policy, profile, commit, name):
     # The guard binds persistent home under the desktop's initial RAM /data.
     fat_write(desktop, 'ETC/volatile-desktop', b'1\n')
     fat_write(desktop, 'ETC/hardware-bulk', b'1\n')
+    if autofit:
+        fat_write(desktop, 'ETC/vmware-autofit', b'1\n')
     fat_write(desktop, 'BOOT/INIT.RC', add_clearwater_start(DESKTOP_RC))
     fat_write(recovery, 'BOOT/INIT.RC', RECOVERY_RC)
     fat_write(desktop, 'BOOT/BIN/BASH', (profile / 'bin/bash').read_bytes())
@@ -260,6 +263,8 @@ def main():
                         help='store capacity in MiB (default: size it from the selected profile)')
     parser.add_argument('--selection-config', type=Path,
                         help='host-side app selection JSON from brook_image.py')
+    parser.add_argument('--autofit', action='store_true',
+                        help='enable VMware Workstation host resize hints for the desktop boot')
     parser.add_argument('--payload-id', default='vmware-persistent')
     args = parser.parse_args()
     if args.data_mib is not None and not 1024 <= args.data_mib <= 32768:
@@ -323,7 +328,7 @@ def main():
                'ETC/ahci-vm-write-target': f'BRKAHCIVM1\n{total}\n'.encode(),
                'ETC/ahci-boot-volume': esp_selector.encode(), 'ETC/ahci-data-volume': data_selector.encode()}
     payload = {**get_checkers(checkers, work), **boot_helpers(build, work, policy_path), **records}
-    desktop, recovery = make_initrds(work, build, payload, policy_path, profile, commit, args.payload_id)
+    desktop, recovery = make_initrds(work, build, payload, policy_path, profile, commit, args.payload_id, args.autofit)
     run(sys.executable, ROOT / 'scripts/build_dell_loader.py', '--shared', work,
         '--output', work / 'loader')
     efi, kernel = work / 'loader/BROOKGUARD.efi', build / 'BROOK.elf'
@@ -336,7 +341,7 @@ def main():
 
     (dest / 'Brook.vmx').write_text(vmx(args.network))
     report = {'version': 1, 'commit': commit, 'profile': str(profile), 'payload_id': args.payload_id,
-              'network': args.network, 'disk_guid': str(disk_id), 'esp_guid': str(esp_id),
+              'network': args.network, 'autofit': args.autofit, 'disk_guid': str(disk_id), 'esp_guid': str(esp_id),
               'data_guid': str(data_id), 'ext2_uuid': str(fs_id), 'sectors': total,
               'esp_first': ESP_FIRST, 'esp_sectors': ESP_SECTORS, 'data_first': DATA_FIRST,
               'data_sectors': data_count, 'vmdk_sha256': digest(vmdk),

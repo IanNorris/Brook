@@ -170,6 +170,10 @@ void SchedulerUnblock(Process* p) {
     ++wakeRequests;
 }
 void DisplayFlush(uint32_t first,uint32_t last) { CHECK(first<last); }
+bool DisplayPrepareCursor(const CursorImage*, int32_t, int32_t) { return false; }
+void DisplayCommitCursor() {}
+void DisplayPollModeHints() {}
+void WmApplyDisplaySize(uint32_t, uint32_t) {}
 uint64_t DisplayGetFramebufferPhys(){return 0;}
 bool BootLogoActive(){return false;}
 bool TtyDisplaySuppressed(){return false;}

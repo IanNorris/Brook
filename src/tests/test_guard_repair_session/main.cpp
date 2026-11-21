@@ -57,6 +57,10 @@ void VfsRelease(Vnode* n){if(n && __atomic_sub_fetch(&n->refCount,1,__ATOMIC_ACQ
 int main() {
     assert(GuardRepairRejectedOutcome(true)==-5);
     assert(GuardRepairRejectedOutcome(false)==-115);
+    assert(GuardRepairWaitFailureOutcome(0,true)==-110);
+    assert(GuardRepairWaitFailureOutcome(-10,true)==-10);
+    assert(GuardRepairWaitFailureOutcome(0,false)==-115);
+    assert(GuardRepairWaitFailureOutcome(-10,false)==-115);
     BlockDeviceOps ops{read,write,ioctl,nullptr,blocks,blockSize};
     Device dev{reinterpret_cast<const DeviceOps*>(&ops),"test",DeviceType::Block,nullptr};selected=&dev;
     Process owner{},other{};owner.pid=owner.tgid=5;owner.incarnation=42;other.pid=other.tgid=6;other.incarnation=43;

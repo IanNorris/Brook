@@ -65,6 +65,8 @@ MODULE_IMPORT_SYMBOL(FrameTimingEnter);
 MODULE_IMPORT_SYMBOL(FrameTimingLeave);
 MODULE_IMPORT_SYMBOL(FrameTimingCommand);
 MODULE_IMPORT_SYMBOL(DisplayRegister);
+MODULE_IMPORT_SYMBOL(DisplayBeginFramebufferChange);
+MODULE_IMPORT_SYMBOL(DisplayEndFramebufferChange);
 MODULE_IMPORT_SYMBOL(DisplaySet3DActive);
 MODULE_IMPORT_SYMBOL(GpuCompositorRegister);
 MODULE_IMPORT_SYMBOL(GpuAppRegister);
@@ -1115,6 +1117,8 @@ static const brook::DisplayOps g_vgpuDisplayOps = {
 // g_fbBacking and each flip calls VirtioGpuFlush to present the damage rect.
 static bool VirtioGpuTakeOverDisplay()
 {
+    DisplayFramebufferChange change(false);
+    if (!change) return false;
     // Adopt the current boot framebuffer resolution (GOP/VGA set by firmware).
     uint32_t* ttyPix; uint32_t w, h, strideBytes;
     if (!TtyGetFramebuffer(&ttyPix, &w, &h, &strideBytes) || w == 0 || h == 0)

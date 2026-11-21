@@ -61,6 +61,10 @@ hashes of the disk, boot files and public operator policy. Back up the VMDK
 while the guest is off. A clean guest shutdown flushes pending writes. A dirty
 volume goes through the guarded recovery check before the desktop mounts it.
 
+Framebuffer console text can be incomplete during a mode change or concurrent
+console writes. Use the VM's COM1 `serial.log` as the diagnostic record,
+including for a panic during a display handoff.
+
 The image pins one SATA disk at its original capacity with 512-byte logical
 and physical sectors. Keep its geometry and leave other SATA ports unused.
 Use IDE if you add a CD-ROM. A changed disk, additional active SATA device,
@@ -85,6 +89,22 @@ a 1920×1080 frame. The user's saved file survived a clean shutdown and an
 interrupted boot followed by automatic ext2 recovery. A disk with a changed
 GPT data partition ID was refused before any writes. Workstation acceptance
 of the persistent image is a separate test.
+
+## Pointer input
+
+Brook checks for VMMouse automatically on VMware. In QEMU, select
+`BROOK_POINTER_DEVICE=vmmouse` in the Brook launcher, or use
+`-machine q35,vmport=on -fw_cfg name=opt/brook/vmmouse,string=1`. On success, the guest reports `MOUSE: VMMouse absolute pointer ready` and maps
+host pointer positions to the guest display, independent of desktop scaling.
+Mouse buttons and vertical wheel events use the same desktop input path as
+PS/2. When a Brook app captures relative motion, VMMouse switches modes at the
+next auxiliary interrupt. Releasing the capture returns to absolute motion.
+If device probing or queue validation fails, Brook uses the PS/2 mouse.
+
+For a Workstation input check, move the pointer into and out of the console
+without clicking to grab it. Check keyboard input, all three mouse buttons,
+wheel scrolling and relative capture in a test application. Use a disposable
+guest and retain its serial log if input fails.
 
 ## Probe timing and portability
 
