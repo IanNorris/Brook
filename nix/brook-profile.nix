@@ -13,7 +13,9 @@
 let
   lib = pkgs.lib;
   base = import ./hardware-packages.nix { inherit pkgs; includeOfflineApps = false; };
-  catalog = import ./app-registry.nix { inherit pkgs; downstreamStaging = target == "dell-pair"; };
+  # Browsers need the downstream-aware OSS plugin where the kernel enables a
+  # default downstream allowance: the Dell HDA runtime and VMware intel_hda.
+  catalog = import ./app-registry.nix { inherit pkgs; downstreamStaging = builtins.elem target [ "dell-pair" "vmware" ]; };
   compat = import ./hardware-network-compat.nix { inherit pkgs; };
   compatApps = [ "calculator" "chromium" "files" "firefox" "gallery" "mousepad"
                  "quake2" "steam" "vscodium" ];

@@ -154,6 +154,11 @@ bool AudioMixerStagingEnabled();
 bool AudioMixerStagingSetFrameLimit(uint32_t frames);
 uint32_t AudioMixerStagingFrameLimit();
 void AudioMixerConfigureBoot();
+// Driver-requested default downstream allowance (VMware intel_hda). Enables
+// staging at `frames` for future capacity negotiations unless a boot option
+// already enabled it or /etc/audio-staging-off exists. Returns whether staging
+// is enabled afterwards. Exported to modules (C linkage).
+extern "C" bool AudioMixerRequestDefaultStaging(uint32_t frames);
 
 struct AudioStreamProgress {
     uint64_t epoch = 0;
