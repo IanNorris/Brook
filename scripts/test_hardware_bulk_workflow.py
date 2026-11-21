@@ -21,6 +21,8 @@ class CaptureBridge(Bridge):
         super().__init__()
         self.transfer_root = transfer_root
         self.staging = None
+        self.cleanup = None
+        self.replace_before_cleanup = False
         self.observed_complete = False
         self.stale_boot = False
         self.producer_polls = 0
@@ -37,6 +39,20 @@ class CaptureBridge(Bridge):
                 'session': session, 'operation_id': request,
                 'guest_boot_id': ('b' if self.stale_boot else 'a') * 32,
                 'state': 'completed', 'exit': {'code': result.returncode},
+                'stdout': {'text': result.stdout}, 'stderr': {'text': result.stderr}
+            }
+        elif argv[0] == '/nix/profile/bin/python3':
+            assert self.done and kwargs['uid'] == 0
+            assert argv[3] == '/data/.brook-transfer'
+            if self.replace_before_cleanup:
+                artifact = self.transfer_root / argv[4]
+                artifact.rename(artifact.with_suffix('.original'))
+                artifact.write_bytes(b'replacement')
+            result = subprocess.run([sys.executable, *argv[1:3], self.transfer_root, *argv[4:]],
+                                    capture_output=True, text=True, check=False)
+            self.cleanup = {
+                'session': session, 'operation_id': request, 'guest_boot_id': 'a' * 32,
+                'state': 'completed', 'exit': {'code': result.returncode},
                 'stderr': {'text': result.stderr}
             }
         else:
@@ -51,6 +67,8 @@ class CaptureBridge(Bridge):
                 return {**self.staging, 'state': 'running'}
             self.observed_complete = True
             return self.staging
+        if self.cleanup and request == self.cleanup['operation_id']:
+            return self.cleanup
         if self.done:
             return {'state': 'completed', 'exit': {'code': 0},
                     'stdout': {'text': 'HWBULK_COMPLETED ' + json.dumps(self.result) + '\n'}}
@@ -258,6 +276,28 @@ class GuestFileTests(unittest.TestCase):
         self.assertNotEqual(result['producer_job_id'], result['transaction_id'])
         self.assertEqual(Path(result['artifact_path']).read_bytes(), b'capture')
         self.assertEqual(self.capture.read_bytes(), b'capture')
+        self.assertEqual(result['guest_cleanup']['state'], 'completed')
+        self.assertEqual(list(self.transfer_root.iterdir()), [])
+
+    def test_transfer_failure_keeps_named_staging_copy(self):
+        with patch('hardware_bulk_workflow.download', side_effect=ConnectionError('lost reply')):
+            with self.assertRaises(ConnectionError):
+                self.bulk.execute('session', self.key, 'get', guest_file=str(self.capture))
+        receipt = json.loads((self.output / 'receipt.json').read_text())
+        staged = self.transfer_root / Path(receipt['guest_artifact_path']).name
+        self.assertEqual(staged.read_bytes(), b'capture')
+        self.assertIsNone(self.bridge.cleanup)
+
+    def test_cleanup_refuses_replacement_and_preserves_completed_download(self):
+        self.bridge.replace_before_cleanup = True
+        result = self.transfer()
+        self.assertEqual(result['state'], 'completed')
+        self.assertEqual(result['guest_cleanup']['state'], 'needs_inspection')
+        self.assertEqual(result['guest_cleanup']['job_id'], self.bridge.cleanup['operation_id'])
+        self.assertIn('Staged capture was replaced', result['guest_cleanup']['error'])
+        staged = self.transfer_root / Path(result['guest_artifact_path']).name
+        self.assertEqual(staged.read_bytes(), b'replacement')
+        self.assertEqual(Path(result['artifact_path']).read_bytes(), b'capture')
 
     def test_failed_producer_stops_before_receiver_and_reports_stderr(self):
         self.capture.unlink()
