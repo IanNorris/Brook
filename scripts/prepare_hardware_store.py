@@ -28,6 +28,7 @@ MIB = 1024 * 1024
 FAT_FILE_MAX = 0xfffffe00
 MIN_FREE = 512 * MIB
 INTEL_VULKAN_DIR = 'system/graphics/intel-vulkan-26.0.6-brook1'
+STAGE_GENERATION = '/var/.brook-profiles/.brook-profile-legacy'
 
 
 def run(*argv, **kwargs):
@@ -135,17 +136,42 @@ def free_space(image):
         return struct.unpack_from('<I', stream.read(1024), 12)[0] * 4096
 
 
-def grow_selected_store(image, size, limit, auto):
+def tree_entries(root):
+    return 1 + sum(len(dirs) + len(files)
+                   for _, dirs, files in os.walk(root, followlinks=False))
+
+
+def profile_generation_footprint(image):
+    source = Source(image)
+    try:
+        nodes = source.inventory(STAGE_GENERATION)['nodes']
+        inodes = {meta['ino'] for meta in nodes.values()}
+        # ext2 i_blocks counts 512-byte sectors, including indirect blocks.
+        sectors = sum(struct.unpack_from('<I', source.inode(ino)[1], 28)[0] for ino in inodes)
+        return {'inodes': len(inodes), 'bytes': sectors * 512}
+    finally:
+        source.close()
+
+
+def free_inodes(image):
+    with image.open('rb') as stream:
+        stream.seek(1024 + 16)
+        return struct.unpack('<I', stream.read(4))[0]
+
+
+def grow_selected_store(image, size, limit, auto, required_free=MIN_FREE):
     free = free_space(image)
-    while free < MIN_FREE:
-        minimum = (size + MIN_FREE - free + MIB - 1) // MIB
+    required_mib = (required_free + MIB - 1) // MIB
+    while free < required_free:
+        minimum = (size + required_free - free + MIB - 1) // MIB
         if not auto or minimum * MIB > limit:
-            raise ValueError(f'Selected store needs at least {minimum} MiB to leave 512 MiB free')
+            raise ValueError(f'Selected store needs at least {minimum} MiB to leave {required_mib} MiB '
+                             'for staging and package installs')
         # Growth itself allocates more group metadata. Try with a little
         # additional room before normalizing ownership on the final image.
         grown = min((minimum + 8) * MIB, limit // MIB * MIB)
         if grown <= size:
-            raise ValueError(f'Selected store cannot leave 512 MiB free within {limit // MIB} MiB')
+            raise ValueError(f'Selected store cannot leave {required_mib} MiB free within {limit // MIB} MiB')
         with image.open('r+b') as stream:
             stream.truncate(grown)
         run('resize2fs', image)
@@ -304,15 +330,23 @@ def main():
     image = output/'STORE.IMG'
     image.touch(exist_ok=False)
     inodes = 131072
-    if args.direct_ahci:
+    if args.direct_ahci or selection:
         # The desktop closure can have hundreds of thousands of small files
         # and symlinks. Leave room for later Gallery installs as well.
-        entries = 1 + sum(len(dirs) + len(files)
-                          for _, dirs, files in os.walk(seed, followlinks=False))
-        inodes = max(size // 32768, entries + max(32768, entries // 8))
+        entries = tree_entries(seed)
+        reserve = tree_entries(seed/STAGE_GENERATION.lstrip('/')) if selection else 0
+        inodes = max(size // 32768, entries + max(32768, entries // 8) + reserve)
     size = format_store(image, size, seed, identifier, inodes, limit, args.auto_size)
+    generation_reserve = None
     if selection:
-        size = grow_selected_store(image, size, limit, args.auto_size)
+        # A stage creates a complete generation before replacing the alias.
+        # Reserve its observed on-disk allocation as well as package headroom.
+        generation_reserve = profile_generation_footprint(image)
+        size = grow_selected_store(image, size, limit, args.auto_size,
+                                   MIN_FREE + generation_reserve['bytes'])
+        if free_inodes(image) < generation_reserve['inodes']:
+            raise ValueError(f"Selected store needs at least {generation_reserve['inodes']} free inodes "
+                             "to stage another profile generation")
     inventory = normalize_owners(image, output)
     free_bytes = free_space(image)
     if free_bytes < MIN_FREE:
@@ -325,6 +359,9 @@ def main():
               'namespace': inventory['summary'], 'writable_profile_directories': True,
               'home_path': '/nix/home/brook', 'home_uid': 1000,
               'physical_status': 'not provisioned; boot wiring and USB QEMU acceptance required'}
+    if generation_reserve is not None:
+        result['stage_generation_reserve'] = generation_reserve
+        result['free_inodes'] = free_inodes(image)
     (output/'manifest.json').write_text(json.dumps(result, indent=2)+'\n')
     remove_seed(seed)
     print('HARDWARE_WRITABLE_STORE_PREPARED', output, flush=True)

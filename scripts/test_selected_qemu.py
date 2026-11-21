@@ -3,6 +3,8 @@
 
 import hashlib
 import json
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -124,6 +126,30 @@ class SelectedQemuTest(unittest.TestCase):
             resize.assert_called_once_with('resize2fs', image)
         self.assertEqual(result, 2024 * mib)
         self.assertEqual(image.stat().st_size, result)
+
+    @unittest.skipUnless(shutil.which('mke2fs'), 'requires ext2 tools')
+    def test_one_more_generation_reserves_blocks_and_inodes(self):
+        seed = self.root / 'seed'
+        profile = seed / prepare_hardware_store.STAGE_GENERATION.lstrip('/')
+        profile.mkdir(parents=True)
+        (profile / 'inline').symlink_to('short')
+        (profile / 'external').symlink_to('/nix/store/' + 's' * 100)
+        (profile / 'manifest.tsv').write_text('entries\n')
+        image = self.root / 'STORE.IMG'
+        with image.open('wb') as stream:
+            stream.truncate(32 * prepare_hardware_store.MIB)
+        subprocess.run(['mke2fs', '-q', '-F', '-t', 'ext2', '-b', '4096',
+                        '-I', '128', '-O', 'none,filetype,sparse_super,large_file',
+                        '-d', str(seed), str(image)], check=True)
+        reserve = prepare_hardware_store.profile_generation_footprint(image)
+        self.assertEqual(reserve, {'inodes': 4, 'bytes': 3 * 4096})
+        self.assertEqual(prepare_hardware_store.tree_entries(profile), reserve['inodes'])
+        self.assertGreater(prepare_hardware_store.free_inodes(image), reserve['inodes'])
+        mib = prepare_hardware_store.MIB
+        with patch('prepare_hardware_store.free_space', return_value=512 * mib):
+            with self.assertRaisesRegex(ValueError, 'at least 1665 MiB to leave 513 MiB'):
+                prepare_hardware_store.grow_selected_store(
+                    image, 1664 * mib, 4096 * mib, False, 512 * mib + reserve['bytes'])
 
     def test_usb_requires_usb_profile_boot_capability_and_xhci(self):
         image = self.root / 'STORE.IMG'
