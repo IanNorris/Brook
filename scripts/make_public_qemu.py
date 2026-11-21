@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 MIB = 1024 * 1024
@@ -153,7 +154,12 @@ def main():
     run('mcopy', '-i', initrd, script, '::BOOT/INIT.RC')
     run('mcopy', '-i', initrd, ROOT / 'data/shortcuts/terminal.rc', '::BOOT/SHORTCUTS/TERMINAL.RC')
     run('mcopy', '-i', initrd, Path(metadata['profile']) / 'bin/bash', '::BOOT/BIN/BASH')
-    run('mcopy', '-i', initrd, ROOT / 'data/wallpaper.raw', '::BOOT/WALLPAPER.RAW')
+    wallpaper = ROOT / 'data/wallpaper.raw'
+    if args.developer:
+        wallpaper = stage / 'wallpaper.raw'
+        run(sys.executable, ROOT / 'scripts/convert_wallpaper.py',
+            ROOT / 'data/wallpaper/brook-dawn.png', wallpaper)
+    run('mcopy', '-i', initrd, wallpaper, '::BOOT/WALLPAPER.RAW')
     cfg = stage / 'BROOK.CFG'
     cfg.write_text('TARGET=KERNEL\\BROOK.ELF\nDEBUG_TEXT=0\nLOG_MEMORY=0\nLOG_INTERRUPTS=0\n')
     marker = stage / 'BROOK.MNT'
