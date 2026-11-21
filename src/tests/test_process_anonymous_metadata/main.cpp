@@ -1,5 +1,6 @@
 #include <cassert>
 #include <cstdint>
+#include <initializer_list>
 #include "../../kernel/src/fd_table.h"
 
 namespace brook {
@@ -65,5 +66,20 @@ int main() {
     fds[7].flags=0; assert(ProcessReadAnonymousFdMetadata(&actor,&other,7,&st)==1 && st.mode==0010666);
     fds[7].flags=4; assert(ProcessReadAnonymousFdMetadata(&actor,&other,7,&st)==1 && st.mode==0020666 && st.rdev==0x8800);
     fds[7].type=FdType::SyntheticMem; assert(ProcessReadAnonymousFdMetadata(&actor,&other,7,&st)==0);
+    for (uint32_t fd : {1u, 2u, 9u}) {
+        fds[fd].type = FdType::Vnode;
+        assert(ProcessReadAnonymousFdMetadata(&actor, &other, fd, &st) == 1);
+        assert(st.exactDescriptorMetadata && st.mode == 0020666 && st.rdev == 0x0400);
+        assert(st.dev == 0 && st.nlink == 0 && st.ino == 0);
+    }
+    other.incarnation = 2;
+    assert(ProcessReadAnonymousFdMetadata(&actor, &other, 1, &st) == -13);
+    other.incarnation = 1;
+    fds[1].closing = 1;
+    assert(ProcessReadAnonymousFdMetadata(&actor, &other, 1, &st) == -2);
+    fds[1].closing = 0;
+    fds[1].handle = reinterpret_cast<void*>(1);
+    assert(ProcessReadAnonymousFdMetadata(&actor, &other, 1, &st) == 0);
+    assert(SpinLockTryAcquire(&other.replacementLock)); SpinLockRelease(&other.replacementLock);
     return 0;
 }
