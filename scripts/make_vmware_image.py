@@ -40,7 +40,11 @@ ESP_SECTORS = 512 * MIB // SECTOR
 DATA_FIRST = ESP_FIRST + ESP_SECTORS
 ESP_TYPE = 'c12a7328-f81f-11d2-ba4b-00a0c93ec93b'
 DATA_TYPE = '0fc63daf-8483-4772-8e79-3d69d8477de4'
-DEFAULT_APPS = ("chromium", "files", "firefox", "gallery", "mousepad")
+# Firefox is left out of the default image for size; select it explicitly.
+DEFAULT_APPS = ("calculator", "chromium", "files", "gallery", "mousepad", "qalculate")
+DEFAULT_CPUS = 4
+DEFAULT_MEMORY_MIB = 8192
+MAX_CPUS = 32
 KERNEL_FLAGS = (
     'BROOK_SSD_GUARD_CHECK', 'BROOK_SSD_AUTO_RECOVERY', 'BROOK_SSD_GUARDED_DESKTOP',
     'BROOK_SSD_GUARDED_DESKTOP_RESET', 'BROOK_VM_PERSISTENT_AHCI', 'BROOK_BRIDGE_V3',
@@ -236,10 +240,18 @@ def assemble_disk(work, data_image, efi, kernel, desktop, recovery, disk_id, esp
     return raw
 
 
-def vmx(network):
+def cores_per_socket(cpus):
+    """One socket up to eight vCPUs, then the largest even split."""
+    if cpus <= 8:
+        return cpus
+    return next(cores for cores in range(8, 0, -1) if cpus % cores == 0)
+
+
+def vmx(network, cpus=DEFAULT_CPUS, memory_mib=DEFAULT_MEMORY_MIB):
     lines = ['.encoding = "UTF-8"', 'config.version = "8"', 'virtualHW.version = "20"',
              'displayName = "Brook"', 'guestOS = "other-64"', 'firmware = "efi"',
-             'uefi.secureBoot.enabled = "FALSE"', 'memsize = "4096"', 'numvcpus = "2"',
+             'uefi.secureBoot.enabled = "FALSE"', f'memsize = "{memory_mib}"', f'numvcpus = "{cpus}"',
+             f'cpuid.coresPerSocket = "{cores_per_socket(cpus)}"',
              'mks.enable3d = "FALSE"', 'devices.hotplug = "FALSE"', 'floppy0.present = "FALSE"',
              'pciBridge0.present = "TRUE"']
     for port in range(4, 8):
@@ -271,7 +283,18 @@ def argument_parser():
     parser.add_argument('--autofit', action='store_true',
                         help='enable VMware Workstation host resize hints for the desktop boot')
     parser.add_argument('--payload-id', default='vmware-persistent')
+    parser.add_argument('--cpus', type=int, default=DEFAULT_CPUS,
+                        help='VMware vCPU count (default: %(default)s)')
+    parser.add_argument('--memory-mib', type=int, default=DEFAULT_MEMORY_MIB,
+                        help='VMware guest memory in MiB (default: %(default)s)')
     return parser
+
+
+def check_resources(parser, args):
+    if not 1 <= args.cpus <= MAX_CPUS:
+        parser.error(f'cpus must be between 1 and {MAX_CPUS}')
+    if not 1024 <= args.memory_mib <= 65536 or args.memory_mib % 4:
+        parser.error('memory-mib must be a multiple of 4 between 1024 and 65536')
 
 
 def main():
@@ -279,6 +302,7 @@ def main():
     args = parser.parse_args()
     if args.data_mib is not None and not 1024 <= args.data_mib <= 32768:
         parser.error('data-mib must be between 1024 and 32768')
+    check_resources(parser, args)
     if not re.fullmatch(r'[A-Za-z0-9._-]{1,50}', args.payload_id):
         parser.error('Invalid payload ID')
     if 'MUSL_CC' not in os.environ:
@@ -349,9 +373,10 @@ def main():
     run('qemu-img', 'compare', '-f', 'raw', '-F', 'vmdk', raw, vmdk)
     require_keyless_disk(vmdk)
 
-    (dest / 'Brook.vmx').write_text(vmx(args.network))
+    (dest / 'Brook.vmx').write_text(vmx(args.network, args.cpus, args.memory_mib))
     report = {'version': 1, 'commit': commit, 'profile': str(profile), 'payload_id': args.payload_id,
-              'network': args.network, 'autofit': args.autofit, 'disk_guid': str(disk_id), 'esp_guid': str(esp_id),
+              'network': args.network, 'autofit': args.autofit,
+              'cpus': args.cpus, 'memory_mib': args.memory_mib, 'disk_guid': str(disk_id), 'esp_guid': str(esp_id),
               'data_guid': str(data_id), 'ext2_uuid': str(fs_id), 'sectors': total,
               'esp_first': ESP_FIRST, 'esp_sectors': ESP_SECTORS, 'data_first': DATA_FIRST,
               'data_sectors': data_count, 'vmdk_sha256': digest(vmdk),

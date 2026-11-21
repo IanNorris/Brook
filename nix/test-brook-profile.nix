@@ -75,4 +75,7 @@ assert (profile { apps = [ "chromium" ]; kernelCapabilities.chromium-sandbox = 1
   .manifest.requiredCapabilities.chromium-sandbox == 1;
 assert (profile { apps = [ "calculator" ]; extraPackageNames = [ "htop" ]; })
   .manifest.launcherIds == [ "brook-settings" "org.brook.TaskManager" "brook.calc" ];
+assert (profile { target = "vmware"; apps = [ "calculator" "qalculate" ]; })
+  .manifest.launcherIds == [ "brook-settings" "org.brook.TaskManager" "brook.calc" "qalculate-gtk" ];
+assert (profile { target = "vmware"; apps = [ "qalculate" ]; }).manifest.redistributable;
 true

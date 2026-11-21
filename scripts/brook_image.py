@@ -120,6 +120,10 @@ def build_vmware(args):
         command += ["--payload-id", args.payload_id]
     if args.data_mib is not None:
         command += ["--data-mib", args.data_mib]
+    if getattr(args, "cpus", None) is not None:
+        command += ["--cpus", args.cpus]
+    if getattr(args, "memory_mib", None) is not None:
+        command += ["--memory-mib", args.memory_mib]
     if args.apps is None and not args.packages:
         script("make_vmware_image.py", *command)
         return
@@ -198,6 +202,8 @@ def main():
     parser.add_argument("--network", choices=("hostonly", "nat"),
                         help="VMware network mode (default: nat)")
     parser.add_argument("--payload-id", help="Payload identifier for a guarded build")
+    parser.add_argument("--cpus", type=int, help="VMware vCPU count (default: 4)")
+    parser.add_argument("--memory-mib", type=int, help="VMware guest memory in MiB (default: 8192)")
     parser.add_argument("--dell-shared", type=Path, help="Private Dell pair source assets")
     parser.add_argument("--kernel-option", action="append", default=[],
                         help="Override a Dell pair kernel option (repeatable)")
@@ -219,8 +225,9 @@ def main():
         parser.error("--output must be a new directory")
     if args.target == "vmware" and (not args.operator_policy or not args.recovery_checkers_from):
         parser.error("VMware requires --operator-policy and --recovery-checkers-from")
-    if args.target != "vmware" and (args.network or args.recovery_checkers_from):
-        parser.error("Network type and checker initrd are VMware options")
+    if args.target != "vmware" and (args.network or args.recovery_checkers_from or
+                                    args.cpus is not None or args.memory_mib is not None):
+        parser.error("Network type, CPU/memory sizing and checker initrd are VMware options")
     if args.target in ("qemu", "usb") and (args.operator_policy or args.payload_id):
         parser.error("Operator policy and payload ID are guarded target options")
     if args.target in ("vmware", "dell-pair") and args.build is not None:

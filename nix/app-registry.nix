@@ -29,6 +29,7 @@ let
     firefox = import ./apps/firefox.nix { inherit pkgs downstreamStaging; };
     gallery = import ./apps/gallery.nix { inherit pkgs; };
     mousepad = import ./apps/mousepad.nix { inherit pkgs; };
+    qalculate = import ./apps/qalculate.nix { inherit pkgs; };
     quake2 = legacy "Quake II" "Launcher only; the engine and OpenAL come from a separately staged closure.";
     steam = legacy "Steam" "Launcher uses the existing installation in the user's home.";
     vscodium = legacy "VSCodium" "Launcher only; the application comes from a separately staged closure.";
