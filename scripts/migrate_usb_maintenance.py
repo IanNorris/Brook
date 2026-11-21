@@ -17,6 +17,11 @@ and reviewed files. It verifies all original content before moving it back and
 declines to remove unknown contents. Keep stick.img for offline recovery if
 filesystem damage prevents normal restoration. The backup and OLD can contain
 the old shared key, so keep both private.
+
+If the old tree was already archived, use adopt instead of capture. Supply
+the private full-disk backup, its previously recorded SHA-256, and the exact
+OLD-date directory name. Keep that backup at the same host path. Adopt only
+creates a host receipt. Check, apply, and restore then use that receipt.
 """
 import argparse
 import ctypes
@@ -80,12 +85,20 @@ def digest_stream(stream, output=None, *, set_dirty_bit_at=None):
     return {"bytes": size, "sha256": digest.hexdigest()}
 
 
-def digest_file(path, *, private=False, set_dirty_bit_at=None):
+def private_backup(stream, path, *, operator_supplied=False):
+    info = os.fstat(stream.fileno())
+    owned = info.st_uid == os.geteuid() or (operator_supplied and os.geteuid() == 0)
+    if not stat.S_ISREG(info.st_mode) or not owned or info.st_mode & 0o077:
+        raise ValueError(f"{path}: expected a private regular backup file")
+    return info
+
+
+def digest_file(path, *, private=False, operator_supplied=False, set_dirty_bit_at=None):
     with os.fdopen(safe_open(path), "rb") as stream:
-        info = os.fstat(stream.fileno())
-        if not stat.S_ISREG(info.st_mode) or (private and (
-                stat.S_IMODE(info.st_mode) & 0o077 or info.st_uid != os.geteuid())):
-            raise ValueError(f"{path}: expected a regular {'private ' if private else ''}file")
+        info = (private_backup(stream, path, operator_supplied=operator_supplied)
+                if private else os.fstat(stream.fileno()))
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"{path}: expected a regular file")
         result = digest_stream(stream, set_dirty_bit_at=set_dirty_bit_at)
         if result["bytes"] != info.st_size:
             raise ValueError(f"{path}: size changed during read")
@@ -140,6 +153,13 @@ def vfat_dirty_byte(boot_sector):
     if int.from_bytes(boot_sector[36:40], "little"):
         return 0x41  # FAT32
     raise ValueError("The FAT boot sector has no FAT length")
+
+
+def fat_boot_fingerprint(boot_sector):
+    dirty = vfat_dirty_byte(boot_sector)
+    fingerprint = bytearray(boot_sector)
+    fingerprint[dirty] |= 1
+    return hashlib.sha256(fingerprint).hexdigest()
 
 
 def usb_mount(mount, disk, *, writable=None):
@@ -204,13 +224,11 @@ def usb_mount(mount, disk, *, writable=None):
     if not (0 < part_start < part_start + part_bytes <= size):
         raise ValueError("Invalid USB partition geometry")
     dirty = vfat_dirty_byte(boot_sector)
-    fingerprint = bytearray(boot_sector)
-    fingerprint[dirty] |= 1
     return {"disk": str(disk), "disk_device": dev.st_rdev,
             "sysfs": str(sys_disk), "disk_bytes": size,
             "fat_device": number, "fat_start": part_start, "fat_bytes": part_bytes,
             "fat_dirty_offset": part_start + dirty,
-            "fat_boot_sector_sha256": hashlib.sha256(fingerprint).hexdigest()}
+            "fat_boot_sector_sha256": fat_boot_fingerprint(boot_sector)}
 
 
 def raw_disk(identity, output=None):
@@ -252,9 +270,9 @@ def entries(tree):
     return [name for name in tree if "/" not in name]
 
 
-def reject_reserved(tree):
-    if {name.casefold() for name in entries(tree)} & {ARCHIVE.lower(), STAGE.lower()}:
-        raise ValueError("The FAT root already contains OLD or BRKNEW")
+def reject_reserved(tree, archive=ARCHIVE):
+    if {name.casefold() for name in entries(tree)} & {archive.lower(), STAGE.lower()}:
+        raise ValueError(f"The FAT root already contains {archive} or {STAGE}")
 
 
 def file_set(payload):
@@ -364,6 +382,113 @@ def capture(mount, disk, state):
     return {"backup": copied, "old_top_level_count": len(entries(original))}
 
 
+def archive_name(name):
+    if name != ARCHIVE and not re.fullmatch(r"OLD-[A-Za-z0-9][A-Za-z0-9_-]{0,62}", name):
+        raise ValueError("Supply the exact existing OLD-… archive basename")
+    return name
+
+
+def archived_tree(original, archive):
+    return {archive: None, **{f"{archive}/{name}": info for name, info in original.items()}}
+
+
+def disk_envelope(stream, identity):
+    """Hash all disk bytes outside the ESP and verify its primary boot sector."""
+    disk_size, start, length = (identity[key] for key in ("disk_bytes", "fat_start", "fat_bytes"))
+    end = start + length
+    if not (512 <= start < end <= disk_size):
+        raise ValueError("The backup does not describe an admissible ESP range")
+    stream.seek(start)
+    boot = stream.read(512)
+    if fat_boot_fingerprint(boot) != identity["fat_boot_sector_sha256"]:
+        raise ValueError("The backup or disk has a different FAT boot sector")
+    sector_size = int.from_bytes(boot[11:13], "little")
+    sectors = int.from_bytes(boot[19:21], "little") or int.from_bytes(boot[32:36], "little")
+    if sector_size not in (512, 1024, 2048, 4096) or not 0 < sectors * sector_size <= length:
+        raise ValueError("The FAT filesystem exceeds the matched ESP partition")
+    digest = hashlib.sha256()
+    for offset, remaining in ((0, start), (end, disk_size - end)):
+        stream.seek(offset)
+        while remaining:
+            chunk = stream.read(min(BUFFER, remaining))
+            if not chunk:
+                raise ValueError("Short read outside the ESP")
+            digest.update(chunk)
+            remaining -= len(chunk)
+    return digest.hexdigest()
+
+
+def live_envelope(identity):
+    with os.fdopen(safe_open(identity["disk"]), "rb") as stream:
+        if os.fstat(stream.fileno()).st_rdev != identity["disk_device"]:
+            raise ValueError("The USB disk changed")
+        return disk_envelope(stream, identity)
+
+
+def backup_fat_tree(backup, identity, scratch_parent):
+    """Read the original FAT independently of the separately mounted live tree."""
+    fd = backup.fileno()
+    image = f"/proc/self/fd/{fd}@@{identity['fat_start']}"
+    env = dict(os.environ, MTOOLSRC="/dev/null")
+
+    def mtools(command, *arguments):
+        return subprocess.run([command, "-i", image, *arguments], env=env, pass_fds=(fd,),
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True, check=True).stdout
+
+    expected = {}
+    for line in mtools("mdir", "-a", "-b", "-s", "::/").splitlines():
+        name = line[3:].rstrip("/")
+        if (not line.startswith("::/") or name in expected or
+                any(part in ("", ".", "..") for part in name.split("/")) or
+                any(ord(char) < 32 or char in "\\:" for char in name)):
+            raise ValueError("Unsafe or ambiguous name in the backed up FAT directory")
+        expected[name] = line.endswith("/")
+    if not expected:
+        raise ValueError("The backed up FAT has no original boot files")
+    with tempfile.TemporaryDirectory(prefix=".brook-old-fat-inventory-", dir=scratch_parent) as scratch:
+        mtools("mcopy", "-s", "::/*", scratch)
+        actual = inventory(Path(scratch))
+    if {name: info is None for name, info in actual.items()} != expected:
+        raise ValueError("FAT archive extraction did not cover every listed entry")
+    return actual
+
+
+def adopt(mount, disk, state, backup_path, backup_sha256, archive):
+    archive = archive_name(archive)
+    if not re.fullmatch(r"[0-9a-f]{64}", backup_sha256):
+        raise ValueError("Supply the previously recorded full backup SHA-256")
+    if state.exists() or state.is_symlink():
+        raise ValueError("Use a new private host state directory")
+    identity = usb_mount(mount, disk, writable=False)
+    ensure_host_state(state.parent, identity)
+    ensure_host_state(backup_path, identity)
+    with os.fdopen(safe_open(backup_path), "rb") as stream:
+        info = private_backup(stream, backup_path, operator_supplied=True)
+        if info.st_size != identity["disk_bytes"]:
+            raise ValueError("The supplied backup must be the full USB disk image")
+        image = digest_stream(stream)
+        if image != {"bytes": info.st_size, "sha256": backup_sha256}:
+            raise ValueError("Full private backup SHA-256 mismatch")
+        envelope = disk_envelope(stream, identity)
+        if live_envelope(identity) != envelope:
+            raise ValueError("The device differs from the backup outside the ESP")
+        original = backup_fat_tree(stream, identity, state.parent)
+        after = os.fstat(stream.fileno())
+        if (after.st_size, after.st_mtime_ns, after.st_ctime_ns) != (
+                info.st_size, info.st_mtime_ns, info.st_ctime_ns):
+            raise ValueError("The full backup changed while inspecting the original FAT")
+    reject_reserved(original, archive)
+    if (not original or inventory(mount) != archived_tree(original, archive) or
+            usb_mount(mount, disk, writable=False) != identity):
+        raise ValueError("The mounted root must contain only one exact archive of the backed up FAT")
+    state.mkdir(mode=0o700)
+    store_record(state / "backup.json", {"source": identity, "image": image, "original": original,
+                                        "archive": archive, "external_backup": str(backup_path),
+                                        "non_esp_sha256": envelope})
+    sync_directory(state.parent)
+    return {"backup": image, "old_top_level_count": len(entries(original)), "archive": archive}
+
+
 def receipt(mount, disk, state, *, writable=None):
     private_dir(state)
     identity = usb_mount(mount, disk, writable=writable)
@@ -371,8 +496,15 @@ def receipt(mount, disk, state, *, writable=None):
     record = json.loads(read_regular(state / "backup.json", 64 << 20))
     if identity != record["source"]:
         raise ValueError("The mounted USB disk or partition no longer matches the backup")
-    if digest_file(state / "stick.img", private=True) != record["image"]:
+    external = "external_backup" in record
+    backup = Path(record["external_backup"]) if external else state / "stick.img"
+    if external:
+        archive_name(record["archive"])
+        ensure_host_state(backup, identity)
+    if digest_file(backup, private=True, operator_supplied=external) != record["image"]:
         raise ValueError("Full private backup size or SHA-256 mismatch")
+    if external and live_envelope(identity) != record["non_esp_sha256"]:
+        raise ValueError("The device differs from the backup outside the ESP")
     return record
 
 
@@ -385,15 +517,22 @@ def preflight(mount, disk, state, payload, *, writable=None):
     record = receipt(mount, disk, state, writable=writable)
     if (state / "apply.json").exists():
         raise ValueError("There is a pending or completed migration. Use restore first")
-    old = inventory(mount)
-    reject_reserved(old)
-    if old != record["original"] or not matches_captured_bytes(
-            raw_disk(record["source"]), record, state / "stick.img"):
+    old = record["original"]
+    archive = record.get("archive", ARCHIVE)
+    already_archived = "external_backup" in record
+    if already_archived:
+        matches = inventory(mount) == archived_tree(old, archive)
+    else:
+        current = inventory(mount)
+        reject_reserved(current)
+        matches = current == old and matches_captured_bytes(
+            raw_disk(record["source"]), record, state / "stick.img")
+    if not matches:
         raise ValueError("The current USB bytes or FAT tree differ from the private backup")
-    capacity = ensure_capacity(mount, old, payload)
+    capacity = ensure_capacity(mount, {} if already_archived else old, payload)
     if usb_mount(mount, disk, writable=writable) != record["source"]:
         raise ValueError("The FAT mount changed during preflight")
-    return old, capacity
+    return old, capacity, archive, already_archived
 
 
 def stage_tree(payload):
@@ -406,12 +545,17 @@ def stage_tree(payload):
     return tree
 
 
-def migrate(mount, state, old, payload):
+def apply_record(expected, archive):
+    return {"replacement": expected, "archive": archive} if archive != ARCHIVE else {"replacement": expected}
+
+
+def migrate(mount, state, old, payload, *, archive_name=ARCHIVE, already_archived=False):
     expected = stage_tree(payload)
-    if inventory(mount) != old:
+    initial = archived_tree(old, archive_name) if already_archived else old
+    if inventory(mount) != initial:
         raise ValueError("The FAT contents changed since preflight")
-    store_record(state / "apply.json", {"replacement": expected})
-    fresh, archive = mount / STAGE, mount / ARCHIVE
+    store_record(state / "apply.json", apply_record(expected, archive_name))
+    fresh, archive = mount / STAGE, mount / archive_name
     fresh.mkdir()
     for name, value in payload.items():
         target = fresh / name
@@ -420,13 +564,14 @@ def migrate(mount, state, old, payload):
     if inventory(fresh) != expected:
         raise ValueError("Staged maintenance file readback mismatch")
     sync_volume(mount)
-    archive.mkdir()
-    for name in sorted(entries(old), key=lambda item: item.casefold() != "efi"):
-        target = archive / name
-        if target.exists():
-            raise ValueError("Unexpected archived path already exists")
-        (mount / name).rename(target)
-    sync_volume(mount)
+    if not already_archived:
+        archive.mkdir()
+        for name in sorted(entries(old), key=lambda item: item.casefold() != "efi"):
+            target = archive / name
+            if target.exists():
+                raise ValueError("Unexpected archived path already exists")
+            (mount / name).rename(target)
+        sync_volume(mount)
     if inventory(archive) != old:
         raise ValueError("Archived FAT tree readback mismatch")
     store_record(state / "archived.json", {"published": True})
@@ -438,7 +583,7 @@ def migrate(mount, state, old, payload):
     fresh.rmdir()
     sync_volume(mount)
     installed = {name: item for name, item in inventory(mount).items()
-                 if name != ARCHIVE and not name.startswith(ARCHIVE + "/")}
+                 if name != archive_name and not name.startswith(archive_name + "/")}
     if installed != expected or inventory(archive) != old:
         raise ValueError("Final FAT readback mismatch")
     return {"new_files": expected, "old_top_level_count": len(entries(old))}
@@ -467,17 +612,17 @@ def remove_tree(root, tree):
         (root / name).rmdir() if info is None else (root / name).unlink()
 
 
-def restore(mount, state, original, payload):
+def restore(mount, state, original, payload, *, archive_name=ARCHIVE):
     expected = stage_tree(payload)
     transaction = json.loads(read_regular(state / "apply.json", BUFFER))
-    if transaction != {"replacement": expected}:
+    if transaction != apply_record(expected, archive_name):
         raise ValueError("Supply the same reviewed replacement files to restore")
     before = inventory(mount)
-    fresh, archive = mount / STAGE, mount / ARCHIVE
-    if any(name.casefold() in (STAGE.lower(), ARCHIVE.lower()) and
-           (name not in (STAGE, ARCHIVE) or before[name] is not None) for name in entries(before)):
+    fresh, archive = mount / STAGE, mount / archive_name
+    if any(name.casefold() in (STAGE.lower(), archive_name.lower()) and
+           (name not in (STAGE, archive_name) or before[name] is not None) for name in entries(before)):
         raise ValueError("Unexpected transaction path on FAT")
-    stashed = inventory(archive) if ARCHIVE in before else {}
+    stashed = inventory(archive) if archive_name in before else {}
     staging = inventory(fresh) if STAGE in before else {}
     if {name: original.get(name) for name in stashed} != stashed or set(stashed) - set(original):
         raise ValueError("The archived original files changed")
@@ -490,7 +635,7 @@ def restore(mount, state, original, payload):
         if name not in stashed and subtree(before, name) != subtree(original, name):
             raise ValueError(f"Missing or modified original FAT content: {name}")
     remaining = {name: value for name, value in before.items() if
-                 name.split("/", 1)[0] not in (ARCHIVE, STAGE) and
+                 name.split("/", 1)[0] not in (archive_name, STAGE) and
                  (name.split("/", 1)[0] not in old_names or name.split("/", 1)[0] in stashed)}
     archived = (state / "archived.json").exists()
     restoring = (state / "restoring.json").exists()
@@ -512,7 +657,7 @@ def restore(mount, state, original, payload):
     for name in sorted(entries(stashed), key=lambda item: item.casefold() == "efi"):
         (archive / name).rename(mount / name)
         sync_volume(mount)
-    if ARCHIVE in before:
+    if archive_name in before:
         archive.rmdir()
     sync_volume(mount)
     if inventory(mount) != original:
@@ -526,16 +671,26 @@ def restore(mount, state, original, payload):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("capture", "check", "apply", "restore"))
+    parser.add_argument("action", choices=("capture", "adopt", "check", "apply", "restore"))
     parser.add_argument("--mount", type=Path, required=True, help="exact ESP mountpoint")
     parser.add_argument("--disk", type=Path, required=True, help="confirmed whole USB block device")
     parser.add_argument("--state", type=Path, required=True, help="private off-stick backup directory")
-    parser.add_argument("--files", type=Path, help="reviewed file set, required after capture")
+    parser.add_argument("--files", type=Path, help="reviewed file set for check, apply and restore")
+    parser.add_argument("--backup", type=Path, help="private full USB byte image for adopt")
+    parser.add_argument("--backup-sha256", help="previously recorded full image digest for adopt")
+    parser.add_argument("--archive", help="exact existing top-level archive basename for adopt")
     args = parser.parse_args()
     mount, state = args.mount.absolute(), args.state.absolute()
+    adoption = (args.backup, args.backup_sha256, args.archive)
+    if args.action == "adopt" and not all(adoption):
+        parser.error("adopt requires --backup, --backup-sha256 and --archive")
+    if args.action != "adopt" and any(adoption):
+        parser.error("--backup, --backup-sha256 and --archive only apply to adopt")
     try:
         if args.action == "capture":
             value = capture(mount, args.disk, state)
+        elif args.action == "adopt":
+            value = adopt(mount, args.disk, state, args.backup.absolute(), args.backup_sha256, args.archive)
         else:
             if args.files is None:
                 parser.error("--files is required for check, apply and restore")
@@ -547,11 +702,13 @@ def main():
                 payload = file_set(args.files)
                 if args.action == "restore":
                     record = receipt(mount, args.disk, state, writable=True)
-                    value = restore(mount, state, record["original"], payload)
+                    value = restore(mount, state, record["original"], payload,
+                                    archive_name=record.get("archive", ARCHIVE))
                 else:
-                    old, capacity = preflight(mount, args.disk, state, payload,
-                                              writable=True if args.action == "apply" else None)
-                    value = capacity if args.action == "check" else migrate(mount, state, old, payload)
+                    old, capacity, archive, already_archived = preflight(
+                        mount, args.disk, state, payload, writable=True if args.action == "apply" else None)
+                    value = capacity if args.action == "check" else migrate(
+                        mount, state, old, payload, archive_name=archive, already_archived=already_archived)
             finally:
                 os.close(lock)
         print(json.dumps(value, indent=2, sort_keys=True))

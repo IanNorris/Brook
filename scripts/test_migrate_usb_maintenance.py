@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 from types import SimpleNamespace
@@ -147,6 +148,112 @@ class MigrationTest(unittest.TestCase):
             actual = {"bytes": len(changed), "sha256": hashlib.sha256(changed).hexdigest()}
             self.assertFalse(tool.matches_captured_bytes(actual, record, image))
         self.assertEqual(image.read_bytes(), primary)
+
+    def prearchived_fixture(self):
+        name = "OLD-2026-11-21"
+        (self.mount / "hidden.txt").write_bytes(b"hidden, preserved")
+        (self.mount / "Recovery files/[data].bin").write_bytes(b"brackets, preserved")
+        original = tool.inventory(self.mount)
+        fat = self.state / "old.fat"
+        with fat.open("wb") as stream:
+            stream.truncate(24 << 20)
+        subprocess.run(["mformat", "-i", fat, "::"], check=True)
+        for path, content in original.items():
+            if content is None:
+                subprocess.run(["mmd", "-i", fat, "::/" + path], check=True)
+            else:
+                subprocess.run(["mcopy", "-i", fat, self.mount / path, "::/" + path], check=True)
+        subprocess.run(["mattrib", "-i", fat, "+h", "::/hidden.txt"], check=True)
+        backup = self.state / "original.raw"
+        part_start = 65536
+        with backup.open("xb") as target, fat.open("rb") as partition:
+            target.write(b"partition table fixture".ljust(part_start, b"\0"))
+            shutil.copyfileobj(partition, target)
+            target.write(b"unchanged outside the FAT partition" * 16)
+        backup.chmod(0o600)
+        copied = tool.digest_file(backup, private=True)
+        live = self.state / "live.raw"
+        shutil.copyfile(backup, live)
+        with fat.open("rb") as partition:
+            fingerprint = tool.fat_boot_fingerprint(partition.read(512))
+        fake_identity = {"sysfs": "/no/fixture/disk", "fat_device": 0, "disk_device": 0,
+                         "disk": str(live), "disk_bytes": copied["bytes"], "fat_start": part_start,
+                         "fat_bytes": fat.stat().st_size, "fat_boot_sector_sha256": fingerprint}
+        image = f"{live}@@{part_start}"
+        subprocess.run(["mmd", "-i", image, "::/" + name], check=True)
+        (self.mount / name).mkdir()
+        for path in tool.entries(original):
+            subprocess.run(["mmove", "-i", image, "::/" + path, f"::/{name}/{path}"], check=True)
+            (self.mount / path).rename(self.mount / name / path)
+        with live.open("rb") as stream:
+            self.assertEqual(tool.backup_fat_tree(stream, fake_identity, self.state),
+                             tool.archived_tree(original, name))
+        return backup, copied, live, fake_identity, name, original
+
+    def test_prearchived_adopt_apply_restore(self):
+        backup, copied, live, identity, name, original = self.prearchived_fixture()
+        live_before = tool.digest_file(live)
+        host_state = self.state / "adopt-state"
+        fake_disk = Path("/dev/test")
+        with patch.object(tool, "usb_mount", return_value=identity) as mount:
+            result = tool.adopt(self.mount, fake_disk, host_state, backup, copied["sha256"], name)
+            self.assertEqual(result["archive"], name)
+            self.assertTrue(all(not call.kwargs["writable"] for call in mount.call_args_list))
+            self.assertEqual(tool.digest_file(live), live_before)
+            self.assertEqual(tool.inventory(self.mount), tool.archived_tree(original, name))
+            old, _, archive, already = tool.preflight(
+                self.mount, fake_disk, host_state, self.payload, writable=True)
+            self.assertTrue(already)
+            self.assertEqual(old, original)
+            self.assertEqual(archive, name)
+            tool.migrate(self.mount, host_state, old, self.payload,
+                         archive_name=archive, already_archived=already)
+            self.assertEqual(tool.inventory(self.mount / name), original)
+            self.assertFalse((self.mount / "OLD").exists())
+            with self.assertRaisesRegex(ValueError, "same reviewed"):
+                tool.restore(self.mount, host_state, original, self.payload)
+            record = tool.receipt(self.mount, fake_disk, host_state, writable=True)
+            tool.restore(self.mount, host_state, record["original"], self.payload,
+                         archive_name=record["archive"])
+        self.assertEqual(tool.inventory(self.mount), original)
+        self.assertEqual(tool.digest_file(backup, private=True), copied)
+
+    def test_prearchived_rejects_tampering_before_any_mounted_change(self):
+        backup, copied, live, identity, name, original = self.prearchived_fixture()
+        host_state = self.state / "adopt-state"
+        fake_disk = Path("/dev/test")
+
+        def attempt():
+            with patch.object(tool, "usb_mount", return_value=identity):
+                tool.adopt(self.mount, fake_disk, host_state, backup, copied["sha256"], name)
+
+        def broken(path):
+            with path.open("r+b") as stream:
+                stream.seek(-1, 2)
+                old = stream.read(1)
+                stream.seek(-1, 2)
+                stream.write(bytes([old[0] ^ 1]))
+
+        broken(backup)
+        with self.assertRaisesRegex(ValueError, "backup SHA-256"):
+            attempt()
+        broken(backup)
+        broken(live)
+        with self.assertRaisesRegex(ValueError, "outside the ESP"):
+            attempt()
+        broken(live)
+        dotfile = self.mount / name / ".dotfile"
+        content = dotfile.read_bytes()
+        dotfile.write_bytes(b"modified")
+        with self.assertRaisesRegex(ValueError, "one exact archive"):
+            attempt()
+        dotfile.write_bytes(content)
+        (self.mount / "another-root-file").write_bytes(b"unexpected")
+        with self.assertRaisesRegex(ValueError, "one exact archive"):
+            attempt()
+        self.assertEqual((self.mount / "another-root-file").read_bytes(), b"unexpected")
+        self.assertFalse(host_state.exists())
+        self.assertEqual(tool.inventory(self.mount / name), original)
 
     def test_built_file_set(self):
         self.check_offline_fat(REVIEWED_FILES)
