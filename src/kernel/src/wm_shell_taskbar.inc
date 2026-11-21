@@ -1292,6 +1292,24 @@ static bool WmTrayTooltip(uint32_t screenW, uint32_t screenH, int32_t mx, int32_
             if (!l.metrics[metrics[i]].contains(mx, my)) continue;
             anchor = &l.metrics[metrics[i]];
             WmStrCopy(text, labels[i], sizeof(text));
+            if (i >= 2) {
+                const bool app = metrics[i] == 5;
+                const auto telemetry = WmTelemetryModel(app, false, false);
+                const auto& bins = (app ? telemetry.app : telemetry.compositor)->bins;
+                constexpr unsigned columns = ChromeTaskbarSpacing::GraphBars;
+                const int pitch = WmMetric(3);
+                const int fromGraph = mx - (anchor->x + anchor->w - int(columns) * pitch);
+                const uint64_t now = ApicTickCount();
+                const auto sample = fromGraph >= 0 && pitch > 0 ?
+                    bins.Column(now, unsigned(fromGraph / pitch), columns) : bins.Read(now);
+                static char cadenceDetail[64];
+                BootText value(cadenceDetail, sizeof(cadenceDetail));
+                if (sample.count) {
+                    value.Add("p80 "); value.Number(sample.p80); value.Add(" ms");
+                    value.Add("  max "); value.Number(sample.max); value.Add(" ms");
+                } else value.Add("No frames in this interval");
+                detail = cadenceDetail;
+            }
             break;
         }
     }
