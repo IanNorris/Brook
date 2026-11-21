@@ -120,10 +120,11 @@ def closure_receipt(profile):
 
 def data_size_mib(nar_bytes, requested, minimum, maximum):
     # Provision room for ext2 metadata, materialized profile links and user data.
+    if requested is not None:
+        if not minimum <= requested <= maximum:
+            raise ValueError(f"Data size must be between {minimum} and {maximum} MiB")
+        return requested
     required = max(minimum, (5 * nar_bytes + 4 * MIB - 1) // (4 * MIB) + 512)
-    chosen = required if requested is None else requested
     if required > maximum:
         raise ValueError(f"Profile needs at least {required} MiB; target limit is {maximum} MiB")
-    if not required <= chosen <= maximum:
-        raise ValueError(f"Data size must be between {required} and {maximum} MiB for this profile")
-    return chosen
+    return required

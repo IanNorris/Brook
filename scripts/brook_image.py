@@ -78,8 +78,10 @@ def build_qemu(args):
     receipt = output / "profile-selection.json"
     receipt.write_text(json.dumps(selection, indent=2, sort_keys=True) + "\n")
     seed = output / "seed"
+    sizing = ["--auto-size"] if args.data_mib is None else []
     script("prepare_hardware_store.py", "--profile", profile, "--profile-selection",
-           receipt, "--direct-ahci", "--size-mib", capacity, "--output", seed)
+           receipt, "--direct-ahci", "--size-mib", capacity, "--output", seed, *sizing)
+    actual = json.loads((seed / "manifest.json").read_text())
     script("make_public_qemu.py", "--developer", "--seed", seed, "--build", build,
            "--output", output / "image")
     (output / "brook-image.json").write_text(json.dumps({
@@ -87,7 +89,7 @@ def build_qemu(args):
         "target": args.target,
         "profile": str(profile),
         "closure": closure,
-        "data_mib": capacity,
+        "data_mib": actual["bytes"] // (1024 * 1024),
         "kernel": kernel,
         "redistributable": selection["manifest"]["redistributable"],
         "image_manifest": "image/manifest.json",
