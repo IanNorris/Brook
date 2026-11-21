@@ -699,7 +699,14 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
             const uint64_t timerDeadline = timerWaiters.deadline(deadline);
             proc->wakeupTick = WaitWakeupTick(timerDeadline, safetyMs);
             EpollDiagAdd(diag, EpBlocks);
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+            if (syncWait.wanted) ProfilerTraceClientWait(proc, FrameWaitBegin, FrameWaitSyncFileEpoll,
+                                                       static_cast<uint64_t>(syncWait.arm));
+#endif
             SchedulerBlockInterruptible(proc);
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+            if (syncWait.wanted) ProfilerTraceClientWait(proc, FrameWaitEnd, FrameWaitSyncFileEpoll);
+#endif
         }
         unregisterWaiters();
         if (n < 0) return n;

@@ -50,7 +50,7 @@ uint64_t BdwGpuEventGeneration(BdwGpuEvent event);
 // Full: no slot; caller falls back to its plain timed sleep.
 BdwWaitArm BdwGpuEventArm(BdwGpuEvent event,uint64_t seen,BdwGpuWaiter& waiter);
 void BdwGpuEventDisarm(BdwGpuWaiter& waiter);
-void BdwGpuEventSignal(BdwGpuEvent event);
+void BdwGpuEventSignal(BdwGpuEvent event, uint64_t fenceId = 0);
 // Uninterruptible: block the current kernel-context thread for at most one
 // scheduler tick or until the event's generation moves past seen.
 void BdwGpuEventWaitTick(BdwGpuEvent event,uint64_t seen);
@@ -64,9 +64,12 @@ inline BdwWaitArm BdwGpuEventArm(BdwGpuEvent event,uint64_t seen,BdwGpuWaiter&){
     return BdwGpuEventGeneration(event)!=seen?BdwWaitArm::Stale:BdwWaitArm::Full;
 }
 inline void BdwGpuEventDisarm(BdwGpuWaiter&){}
-inline void BdwGpuEventSignal(BdwGpuEvent event){__atomic_fetch_add(&BdwHostGpuEventGeneration(event),uint64_t{1},__ATOMIC_ACQ_REL);}
+inline void BdwGpuEventSignal(BdwGpuEvent event,uint64_t = 0){__atomic_fetch_add(&BdwHostGpuEventGeneration(event),uint64_t{1},__ATOMIC_ACQ_REL);}
 inline void BdwGpuEventWaitTick(BdwGpuEvent,uint64_t){}
 #endif
 // A fence completion can release CPU waiters and queued dependencies.
-inline void BdwGpuFenceSignalled(){BdwGpuEventSignal(BdwGpuEvent::Retire);BdwGpuEventSignal(BdwGpuEvent::Work);}
+inline void BdwGpuFenceSignalled(uint64_t fenceId = 0) {
+    BdwGpuEventSignal(BdwGpuEvent::Retire, fenceId);
+    BdwGpuEventSignal(BdwGpuEvent::Work, fenceId);
+}
 }

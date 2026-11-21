@@ -4,6 +4,7 @@
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "kprintf.h"
+#include "profiler.h"
 #include "drm_resource_layout.h"
 
 #include "syscall.h"
@@ -1094,7 +1095,16 @@ int64_t IntelRenderIoctl(brook::BdwGpuFile* file,uint64_t cmd,uint64_t arg,uint6
         // closes: removing it could revoke a concurrent successful import.
         return CopyToUser(arg,&request,sizeof(request))?0:-EFAULT;
     }
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+    const uint64_t number = cmd & 0xff;
+    const bool trace = ProfilerFrameTraceWatchesClient();
+    if (trace) ProfilerTraceClientWait(proc, FrameWaitBegin, FrameWaitIntelIoctlBase + number);
+#endif
     const int64_t result=brook::BdwIntelRenderIoctl(file,cmd,arg,user);
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+    if (trace) ProfilerTraceClientWait(proc, FrameWaitEnd, FrameWaitIntelIoctlBase + number,
+                                      static_cast<uint64_t>(result));
+#endif
     // An execbuffer refusal becomes VK_ERROR_DEVICE_LOST in Mesa: name it.
     // EINTR is a signal during a queue-space wait, not a refusal: the call
     // restarts (SA_RESTART) or Mesa's drmIoctl retries it.

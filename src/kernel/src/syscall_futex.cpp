@@ -5,6 +5,7 @@
 
 #include "futex_timeout.h"
 #include "pid_namespace.h"
+#include "profiler.h"
 #include "sync/futex_waiter_pool.h"
 #include "sync/pi_wait_graph.h"
 #include "signal_restart.h"
@@ -191,6 +192,9 @@ extern "C" int64_t FutexWake(uint64_t owner, uint64_t uaddr, uint32_t maxWake,
             // until that hold is dropped: a killed caller never resumes.
             IrqSpinLockRelease(&g_futexLock, fxFlags & ~0x200ULL);
 
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+            ProfilerTraceClientWait(waiter, FrameFutexWake, waiter->incarnation);
+#endif
             WakeProcess(waiter);
             // The dequeued node hands its reference to this wake operation,
             // keeping the process alive across the unlocked wakeup window.
@@ -635,7 +639,13 @@ int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
         FutexLog(0, uaddrVal, proc->pid, (int32_t)val);  // WAIT-enqueue
 
         for (;;) {
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+            ProfilerTraceClientWait(proc, FrameWaitBegin, FrameWaitFutex, op);
+#endif
             SchedulerBlockInterruptible(proc);
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+            ProfilerTraceClientWait(proc, FrameWaitEnd, FrameWaitFutex, op);
+#endif
             const bool interrupted = HasPendingSignals();
             const bool expired = deadline.finite && deadline.expired(ClockNowNs(deadline.clockId));
             if (interrupted || expired || !deadline.finite) {

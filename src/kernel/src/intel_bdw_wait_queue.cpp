@@ -2,6 +2,7 @@
 #include "intel_bdw_prompt_wake.h"
 #include "apic.h"
 #include "process.h"
+#include "profiler.h"
 #include "scheduler.h"
 #include "spinlock.h"
 
@@ -47,10 +48,15 @@ void BdwGpuEventDisarm(BdwGpuWaiter& waiter){
 // Wakes are issued under the queue lock: after Disarm returns, this queue
 // can no longer unblock the thread, so it cannot leak a wake into a later,
 // unrelated sleep (for example a KSemaphore wait on gpu-present).
-void BdwGpuEventSignal(BdwGpuEvent event){
+void BdwGpuEventSignal(BdwGpuEvent event, uint64_t fenceId){
     auto* q=Queue(uint32_t(event));if(!q)return;
     SpinLockAcquire(&q->lock);
-    q->slots.Signal([](Process* p){SchedulerUnblock(p);});
+    q->slots.Signal([&](Process* p) {
+#ifdef BROOK_GPU_SUBMISSION_TIMING
+        ProfilerTraceClientWait(p, FrameGpuWake, fenceId, static_cast<uint32_t>(event));
+#endif
+        SchedulerUnblock(p);
+    });
     SpinLockRelease(&q->lock);
 }
 

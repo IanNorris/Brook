@@ -388,7 +388,7 @@ static int64_t RenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const BdwI
             for(uint32_t i=0;i<request.count;++i){
                 if(!fences[i])fences[i]=BdwGpuSyncAcquire(objects[i]);
                 if(!fences[i]){missing=true;all=false;continue;}
-                if((request.flags&4) || BdwFenceState(fences[i])){if(!any)first=i;any=true;}else all=false;
+                if((request.flags&4) || BdwFenceObservedState(fences[i])){if(!any)first=i;any=true;}else all=false;
             }
             if(missing && !(request.flags&6)){result=invalid;break;}
             if((request.flags&1)?all:any){request.first=first;break;}
@@ -428,7 +428,7 @@ static int64_t RenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const BdwI
             for(uint32_t i=0;i<request.count;++i){
                 if(!fences[i])fences[i]=points[i]?BdwGpuSyncFindTimeline(objects[i],points[i]):BdwGpuSyncAcquire(objects[i]);
                 if(!fences[i]){missing=true;all=false;continue;}
-                if((request.flags&4) || BdwFenceState(fences[i])){if(!any)first=i;any=true;}else all=false;
+                if((request.flags&4) || BdwFenceObservedState(fences[i])){if(!any)first=i;any=true;}else all=false;
             }
             if(missing && !(request.flags&6)){result=invalid;break;}
             if((request.flags&1)?all:any){request.first=first;break;}

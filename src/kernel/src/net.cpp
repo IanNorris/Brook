@@ -6415,6 +6415,9 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  proc dump PID /path [--full] - write a live ELF core\n"
             "  proc autodump on|off|status - control managed crash dumps\n"
             "  prof start [ms]  - start profiler (ms=0 or omitted: indefinite)\n"
+#ifdef BROOK_GPU_SUBMISSION_TIMING
+            "  prof frame PID MS [/dir] - targeted frame and wait trace (1–4000 ms)\n"
+#endif
             "  prof stop        - stop profiler + flush\n"
             "  prof status      - profiler status\n"
             "\n"
@@ -8502,6 +8505,36 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             DebugChannelSend("Usage: log stream on|off\n");
         }
     }
+
+#ifdef BROOK_GPU_SUBMISSION_TIMING
+    else if (StrStartsWith(cmd, "prof frame ")) {
+        const char* args = cmd + sizeof("prof frame ") - 1;
+        uint32_t pid = 0, duration = 0;
+        const int pidLength = ParseUint(args, &pid);
+        const char* time = args + pidLength;
+        if (pidLength > 0 && *time == ' ') ++time;
+        const int timeLength = ParseUint(time, &duration);
+        const char* dir = time + timeLength;
+        const bool hasDirectory = *dir == ' ';
+        while (*dir == ' ') ++dir;
+        auto snapshot = ProcessSnapshot{};
+        int error = -22;
+        if (pidLength > 0 && pidLength <= 6 && time > args + pidLength &&
+            timeLength > 0 && timeLength <= 6 && (!*dir || hasDirectory) &&
+            pid && pid < 0xffffu) {
+            error = -3;
+            if (SchedulerSnapshotProcess(static_cast<uint16_t>(pid), &snapshot) && !snapshot.kernelThread)
+                error = ProfilerStartFrameTrace(duration, snapshot.tgid, snapshot.groupIncarnation,
+                                                *dir ? dir : nullptr);
+        }
+        BridgeReply reply;
+        reply.text("{\"started\":");reply.text(error ? "false" : "true");
+        reply.text(",");reply.field("errno", error ? -error : 0);
+        reply.text(",");reply.field("tgid", snapshot.tgid);
+        reply.text(",");reply.field("group_incarnation", snapshot.groupIncarnation);
+        reply.text("}\n");reply.send();
+    }
+#endif
 
     // -----------------------------------------------------------------------
     // prof start [ms] — start profiler
