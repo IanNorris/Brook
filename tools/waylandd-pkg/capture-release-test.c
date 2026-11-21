@@ -259,7 +259,7 @@ static void check_gpu_window_offer(int mode)
     assert(releases==(mode!=1) && errors==(mode==1));
     bt_state_set(&surface.tree.current,NULL);bt_state_set(&surface.tree.latest,NULL);buffer_drop(buffer);
     free(surface.composite);g_surfaces=NULL;g_drm_intel=0;close(g_drm_fd);g_drm_fd=-1;
-    if(!mode){close(channel[1]);gpu_window_channel_lost();gpu_window_reap_dead();}
+    if(!mode){close(channel[1]);gpu_window_channel_lost("fixture-close");gpu_window_reap_dead();}
     peer_error=0;
     unsetenv("BROOK_WAYLAND_INTEL_ASYNC");unsetenv("BROOK_WAYLAND_SNAPSHOT_FENCE");unsetenv("BROOK_WAYLAND_GPU_SOCKET");
     wl_client_destroy(client);close(clientSockets[1]);wl_display_destroy(display);
@@ -353,7 +353,7 @@ static void check_gpu_window_retained(void)
     wl_display_flush_clients(display);assert(count_events(clientSockets[1],5,WL_BUFFER_RELEASE)==1);
     bt_state_set(&surface.tree.current,NULL);bt_state_set(&surface.tree.latest,NULL);buffer_drop(held[0]);buffer_drop(held[1]);
     free(surface.composite);g_surfaces=NULL;g_drm_intel=0;close(g_drm_fd);g_drm_fd=-1;
-    close(channel[1]);gpu_window_channel_lost();gpu_window_reap_dead();
+    close(channel[1]);gpu_window_channel_lost("fixture-close");gpu_window_reap_dead();
     unsetenv("BROOK_WAYLAND_INTEL_ASYNC");unsetenv("BROOK_WAYLAND_SNAPSHOT_FENCE");unsetenv("BROOK_WAYLAND_GPU_SOCKET");
     wl_client_destroy(client);close(clientSockets[1]);wl_display_destroy(display);
 }
@@ -362,7 +362,7 @@ static void check_gpu_window_retained(void)
  * single offer before it; SAFE of the older single offer does not release
  * the root buffer the layered commit still holds; SAFE of the layered commit
  * releases both. */
-static void check_gpu_window_layers(void)
+static void check_gpu_window_layers(int group_first)
 {
     int clientSockets[2],channel[2];assert(!socketpair(AF_UNIX,SOCK_STREAM,0,clientSockets));
     assert(!socketpair(AF_UNIX,SOCK_SEQPACKET,0,channel));
@@ -429,9 +429,11 @@ static void check_gpu_window_layers(void)
             image_callbacks_due(childImage,childImage->queued_ms+GPU_CALLBACK_FALLBACK_MS));childImage->offer_state=saved;}
     {const uint32_t now=g_now_ms();assert(!image_callbacks_due(childImage,now));
      assert(image_callbacks_due(childImage,now+GPU_CALLBACK_FALLBACK_MS) && image_callbacks_due(rootImage,now+GPU_CALLBACK_FALLBACK_MS));}
-    /* 3. SAFE for the superseded single offer keeps the root held by the group. */
-    assert(brook_gpu_window_send_reply(channel[1],BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN,BROOK_GPU_WINDOW_SAFE,&single.identity)==1);
-    intel_pending_poll();assert(rootImage->offer_state==1 && rootHeld->uses==1 && g_gpu_window_channel>=0);
+    /* Either SAFE can arrive first. The source is still owned by the other. */
+    if(!group_first){
+        assert(brook_gpu_window_send_reply(channel[1],BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN,BROOK_GPU_WINDOW_SAFE,&single.identity)==1);
+        intel_pending_poll();assert(rootImage->offer_state==1 && rootHeld->uses==1 && g_gpu_window_channel>=0);
+    }
     /* 4. PRESENTED, then SAFE of the layered commit releases its group. */
     assert(brook_gpu_window_send_reply(channel[1],BROOK_GPU_WINDOW_WIRE_VERSION_LAYERS,BROOK_GPU_WINDOW_PRESENTED,&layered.header.identity)==1);
     intel_pending_poll();assert(childImage->gpu_presented && rootImage->gpu_presented && g_gpu_group_presented>=1);
@@ -447,6 +449,12 @@ static void check_gpu_window_layers(void)
      cv->geometry.transform=0;}
     assert(brook_gpu_window_send_reply(channel[1],BROOK_GPU_WINDOW_WIRE_VERSION_LAYERS,BROOK_GPU_WINDOW_SAFE,&layered.header.identity)==1);
     intel_pending_poll();assert(g_gpu_window_channel>=0 && !rootImage->group_refs && !childImage->group_refs && g_gpu_group_safe>=1);
+    if(group_first){
+        assert(rootImage->offer_state==1 && rootImage->pending_fd>=0 && rootHeld->uses==1);
+        assert(childImage->pending_fd<0 && !childHeld->uses);
+        assert(brook_gpu_window_send_reply(channel[1],BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN,BROOK_GPU_WINDOW_SAFE,&single.identity)==1);
+        intel_pending_poll();assert(g_gpu_window_channel>=0 && !rootHeld->uses);
+    }
     /* The group's SAFE retires the read-back images too: their client
      * buffers are released (fds closed), not left waiting forever. */
     intel_pending_poll();assert(childImage->pending_fd<0 && rootImage->pending_fd<0);
@@ -455,7 +463,7 @@ static void check_gpu_window_layers(void)
     bt_state_set(&root.tree.current,NULL);bt_state_set(&root.tree.latest,NULL);
     buffer_drop(rootHeld);buffer_drop(childHeld);
     free(root.composite);g_surfaces=NULL;g_drm_intel=0;close(g_drm_fd);g_drm_fd=-1;
-    close(channel[1]);gpu_window_channel_lost();gpu_window_reap_dead();
+    close(channel[1]);gpu_window_channel_lost("fixture-close");gpu_window_reap_dead();
     unsetenv("BROOK_WAYLAND_INTEL_ASYNC");unsetenv("BROOK_WAYLAND_SNAPSHOT_FENCE");unsetenv("BROOK_WAYLAND_GPU_SOCKET");
     wl_client_destroy(client);close(clientSockets[1]);wl_display_destroy(display);
 }
@@ -517,7 +525,7 @@ static void check_gpu_window_layers_shm(void)
     assert(gem_closes==2); /* both images and their GEM copies are gone */
     buffer_drop(childHeld);
     free(root.composite);g_surfaces=NULL;g_drm_intel=0;gem_create_ok=0;close(g_drm_fd);g_drm_fd=-1;
-    close(channel[1]);gpu_window_channel_lost();gpu_window_reap_dead();
+    close(channel[1]);gpu_window_channel_lost("fixture-close");gpu_window_reap_dead();
     unsetenv("BROOK_WAYLAND_INTEL_ASYNC");unsetenv("BROOK_WAYLAND_SNAPSHOT_FENCE");unsetenv("BROOK_WAYLAND_GPU_SOCKET");
     wl_client_destroy(client);close(clientSockets[1]);wl_display_destroy(display);
 }
@@ -574,7 +582,7 @@ static void check_gpu_window_opaque(void)
     wl_resource_set_user_data(reg,NULL);
     bt_state_set(&root.tree.current,NULL);bt_state_set(&root.tree.latest,NULL);buffer_drop(held[0]);buffer_drop(held[1]);
     free(root.composite);g_surfaces=NULL;g_drm_intel=0;close(g_drm_fd);g_drm_fd=-1;
-    close(channel[1]);gpu_window_channel_lost();gpu_window_reap_dead();
+    close(channel[1]);gpu_window_channel_lost("fixture-close");gpu_window_reap_dead();
     unsetenv("BROOK_WAYLAND_INTEL_ASYNC");unsetenv("BROOK_WAYLAND_SNAPSHOT_FENCE");unsetenv("BROOK_WAYLAND_GPU_SOCKET");
     wl_client_destroy(client);close(clientSockets[1]);wl_display_destroy(display);
 }
@@ -618,7 +626,7 @@ static void check_gpu_window_scaled(void)
     intel_pending_poll();assert(g_gpu_window_channel>=0);
     bt_state_set(&root.tree.current,NULL);bt_state_set(&root.tree.latest,NULL);buffer_drop(held);
     free(root.composite);g_surfaces=NULL;g_drm_intel=0;close(g_drm_fd);g_drm_fd=-1;
-    close(channel[1]);gpu_window_channel_lost();gpu_window_reap_dead();
+    close(channel[1]);gpu_window_channel_lost("fixture-close");gpu_window_reap_dead();
     unsetenv("BROOK_WAYLAND_INTEL_ASYNC");unsetenv("BROOK_WAYLAND_SNAPSHOT_FENCE");unsetenv("BROOK_WAYLAND_GPU_SOCKET");
     wl_client_destroy(client);close(clientSockets[1]);wl_display_destroy(display);
 }
@@ -689,7 +697,7 @@ static void check_gpu_window_xwayland(void)
     bt_state_set(&root.tree.current,NULL);bt_state_set(&root.tree.latest,NULL);buffer_drop(held);
     root.xwindow=NULL;
     free(root.composite);g_surfaces=NULL;g_drm_intel=0;close(g_drm_fd);g_drm_fd=-1;
-    close(channel[1]);gpu_window_channel_lost();gpu_window_reap_dead();
+    close(channel[1]);gpu_window_channel_lost("fixture-close");gpu_window_reap_dead();
     unsetenv("BROOK_WAYLAND_INTEL_ASYNC");unsetenv("BROOK_WAYLAND_SNAPSHOT_FENCE");unsetenv("BROOK_WAYLAND_GPU_SOCKET");
     wl_client_destroy(client);close(clientSockets[1]);wl_display_destroy(display);
 }
@@ -739,7 +747,7 @@ static void check_gpu_window_tiled(void)
     for(uint32_t y=0;y<40;++y)for(uint32_t x=0;x<40;++x)assert((image->pixels[y*40+x]&0xffffu)==((y<<8)|x));
     image_unref(image);
     g_drm_intel=0;close(g_drm_fd);g_drm_fd=-1;
-    close(channel[1]);gpu_window_channel_lost();gpu_window_reap_dead();
+    close(channel[1]);gpu_window_channel_lost("fixture-close");gpu_window_reap_dead();
     unsetenv("BROOK_WAYLAND_INTEL_ASYNC");unsetenv("BROOK_WAYLAND_SNAPSHOT_FENCE");unsetenv("BROOK_WAYLAND_GPU_SOCKET");
     wl_client_destroy(client);close(clientSockets[1]);wl_display_destroy(display);
 }
@@ -918,7 +926,7 @@ int main(void)
     assert(source_begins>0 && source_tags>0);
     check_gpu_window_offer(1);check_gpu_window_offer(2);
     check_gpu_window_retained();
-    check_gpu_window_layers();
+    check_gpu_window_layers(0);check_gpu_window_layers(1);
     check_gpu_window_layers_shm();
     check_gpu_window_opaque();
     check_gpu_window_scaled();

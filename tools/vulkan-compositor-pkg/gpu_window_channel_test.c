@@ -31,9 +31,9 @@ int main(void){
     assert(brook_gpu_window_send_offer(socket[0],&retained,source,pipefd[0])==1);
     assert(brook_gpu_window_receive(socket[1],&received,fds)==1 && received.version==BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN);
     close(fds[0]);close(fds[1]);
-    struct BrookGpuWindowPacket invalid=offer;invalid.stride=1;assert(brook_gpu_window_send_offer(socket[0],&invalid,source,pipefd[0])==-1);
-    invalid=offer;++invalid.identity.inode;assert(brook_gpu_window_send_offer(socket[0],&invalid,source,pipefd[0])==-1);
-    invalid=offer;invalid.offset=1024;assert(brook_gpu_window_send_offer(socket[0],&invalid,source,pipefd[0])==-1);
+    struct BrookGpuWindowPacket invalid=offer;invalid.stride=1;assert(brook_gpu_window_send_offer(socket[0],&invalid,source,pipefd[0])==BROOK_GPU_WINDOW_SEND_REJECTED);
+    invalid=offer;++invalid.identity.inode;assert(brook_gpu_window_send_offer(socket[0],&invalid,source,pipefd[0])==BROOK_GPU_WINDOW_SEND_REJECTED);
+    invalid=offer;invalid.offset=1024;assert(brook_gpu_window_send_offer(socket[0],&invalid,source,pipefd[0])==BROOK_GPU_WINDOW_SEND_REJECTED);
     union {struct cmsghdr align;char data[CMSG_SPACE(sizeof(int))];} control={0};struct iovec io={&offer,sizeof(offer)};
     struct msghdr msg={.msg_iov=&io,.msg_iovlen=1,.msg_control=control.data,.msg_controllen=sizeof(control.data)};
     struct cmsghdr *c=CMSG_FIRSTHDR(&msg);c->cmsg_level=SOL_SOCKET;c->cmsg_type=SCM_RIGHTS;c->cmsg_len=CMSG_LEN(sizeof(int));memcpy(CMSG_DATA(c),&source,sizeof(source));
@@ -64,11 +64,15 @@ int main(void){
     assert(brook_gpu_window_send_reply(socket[1],BROOK_GPU_WINDOW_WIRE_VERSION_LAYERS,BROOK_GPU_WINDOW_PRESENTED,&offer.identity)==1);
     assert(brook_gpu_window_receive(socket[0],&received,fds)==1 && received.version==BROOK_GPU_WINDOW_WIRE_VERSION_LAYERS);
     /* Invalid layered offers are refused before sending. */
-    struct BrookGpuWindowLayersPacket bad=layered;bad.layers[1].srcX=4;assert(brook_gpu_window_send_layers(socket[0],&bad,buffers,fences)==-1);
-    bad=layered;bad.count=9;assert(brook_gpu_window_send_layers(socket[0],&bad,buffers,fences)==-1);
-    bad=layered;bad.layers[0].stride=32;assert(brook_gpu_window_send_layers(socket[0],&bad,buffers,fences)==-1);
-    bad=layered;bad.layers[1].flags=2;assert(brook_gpu_window_send_layers(socket[0],&bad,buffers,fences)==-1);
-    int swapped[2]={second,source};assert(brook_gpu_window_send_layers(socket[0],&layered,swapped,fences)==-1);
+    struct BrookGpuWindowLayersPacket bad=layered;bad.layers[1].srcX=4;assert(brook_gpu_window_send_layers(socket[0],&bad,buffers,fences)==BROOK_GPU_WINDOW_SEND_REJECTED);
+    bad=layered;bad.count=9;assert(brook_gpu_window_send_layers(socket[0],&bad,buffers,fences)==BROOK_GPU_WINDOW_SEND_REJECTED);
+    bad=layered;bad.layers[0].stride=32;assert(brook_gpu_window_send_layers(socket[0],&bad,buffers,fences)==BROOK_GPU_WINDOW_SEND_REJECTED);
+    bad=layered;bad.layers[1].flags=2;assert(brook_gpu_window_send_layers(socket[0],&bad,buffers,fences)==BROOK_GPU_WINDOW_SEND_REJECTED);
+    int swapped[2]={second,source};assert(brook_gpu_window_send_layers(socket[0],&layered,swapped,fences)==BROOK_GPU_WINDOW_SEND_REJECTED);
+    assert(brook_gpu_window_receive(socket[1],&received,fds)==0);
+    assert(brook_gpu_window_send_offer(socket[0],&retained,source,pipefd[0])==1);
+    assert(brook_gpu_window_receive(socket[1],&received,fds)==1);
+    close(fds[0]);close(fds[1]);
     close(second);
     close(source);close(pipefd[0]);close(pipefd[1]);close(socket[0]);close(socket[1]);puts("GPU_WINDOW_CHANNEL_PASS");return 0;
 }

@@ -86,6 +86,7 @@ static inline int desktop_gpu_offer_in_use(const struct DesktopGpuOffer *o){
 }
 struct DesktopGpuChannel {int listener,peer,blockAccept;char path[sizeof(((struct sockaddr_un *)0)->sun_path)];struct DesktopGpuOffer offers[DESKTOP_GPU_OFFERS];
     struct {uint64_t incarnation,commit;} presented[BROOK_DESKTOP_LAYER_LIMIT];uint64_t nextFrame;
+    uint64_t accepted,disconnected;
     /* Newest tagged CPU snapshot seen for each window (selection time). An
      * offer at or below it can never be shown again, presented or not. */
     struct {uint64_t incarnation,commit;} snapshot[BROOK_DESKTOP_LAYER_LIMIT];};
@@ -128,7 +129,7 @@ static inline void desktop_gpu_channel_init(struct DesktopGpuChannel *c){
     memcpy(c->path,path,len+1);c->listener=fd;
 }
 static inline void desktop_gpu_channel_disconnect(struct DesktopGpuChannel *c){
-    if(c->peer>=0)close(c->peer);
+    if(c->peer>=0){close(c->peer);++c->disconnected;}
     c->peer=-1;
     for(unsigned i=0;i<DESKTOP_GPU_OFFERS;++i)desktop_gpu_offer_free(&c->offers[i]);
 }
@@ -161,7 +162,7 @@ static inline void desktop_gpu_channel_flush(struct DesktopGpuChannel *c){
 static inline void desktop_gpu_channel_poll(struct DesktopGpuChannel *c){
     desktop_gpu_channel_flush(c);
     if(c->listener<0)return;
-    if(c->peer<0){if(c->blockAccept)return;int fd=accept4(c->listener,NULL,NULL,SOCK_NONBLOCK|SOCK_CLOEXEC);if(fd<0)return;c->peer=fd;}
+    if(c->peer<0){if(c->blockAccept)return;int fd=accept4(c->listener,NULL,NULL,SOCK_NONBLOCK|SOCK_CLOEXEC);if(fd<0)return;c->peer=fd;++c->accepted;}
     for(unsigned n=0;n<DESKTOP_GPU_OFFERS;++n){unsigned slot=0;
         while(slot<DESKTOP_GPU_OFFERS && c->offers[slot].state)++slot;
         if(slot==DESKTOP_GPU_OFFERS)return;

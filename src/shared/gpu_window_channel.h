@@ -82,12 +82,17 @@ static inline int brook_gpu_window_fd_matches(const struct BrookGpuWindowPacket 
     struct stat s;return p && fd>=0 && !fstat(fd,&s) && s.st_ino && (uint64_t)s.st_dev==p->identity.device &&
         (uint64_t)s.st_ino==p->identity.inode && s.st_size>=0 && (uint64_t)s.st_size==p->words*4;
 }
+/* A locally rejected offer never reaches sendmsg. The provider can safely
+ * fall back for this buffer while continuing to use the connected channel. */
+enum { BROOK_GPU_WINDOW_SEND_REJECTED = -2 };
+
 /* SOCK_SEQPACKET is required: one offer plus exactly two SCM_RIGHTS fds is
- * atomic. Return 1 sent/received, 0 would block, -1 closed/invalid/error.
+ * atomic. Return 1 sent/received, 0 would block, -1 channel/error. Offer
+ * senders may also return BROOK_GPU_WINDOW_SEND_REJECTED before sending.
  * Sender retains both fds; receiver owns them only on successful receipt. */
 static inline int brook_gpu_window_send_offer(int socket,const struct BrookGpuWindowPacket *p,int buffer,int fence){
     if(!brook_gpu_window_packet_valid(p) || p->type!=BROOK_GPU_WINDOW_OFFER ||
-       !brook_gpu_window_fd_matches(p,buffer) || fence<0){errno=EINVAL;return -1;}
+       !brook_gpu_window_fd_matches(p,buffer) || fence<0){errno=EINVAL;return BROOK_GPU_WINDOW_SEND_REJECTED;}
     union {struct cmsghdr align;char data[CMSG_SPACE(2*sizeof(int))];} control={0};struct iovec io={(void *)p,sizeof(*p)};
     struct msghdr msg={.msg_iov=&io,.msg_iovlen=1,.msg_control=control.data,.msg_controllen=sizeof(control.data)};
     struct cmsghdr *c=CMSG_FIRSTHDR(&msg);c->cmsg_level=SOL_SOCKET;c->cmsg_type=SCM_RIGHTS;c->cmsg_len=CMSG_LEN(2*sizeof(int));
@@ -184,10 +189,10 @@ static inline int brook_gpu_window_layer_fd_matches(const struct BrookGpuWindowL
 }
 /* Sender retains all fds. buffers[i]/fences[i] for i < p->count. */
 static inline int brook_gpu_window_send_layers(int socket,const struct BrookGpuWindowLayersPacket *p,const int *buffers,const int *fences){
-    if(!brook_gpu_window_layers_valid(p) || !buffers || !fences){errno=EINVAL;return -1;}
+    if(!brook_gpu_window_layers_valid(p) || !buffers || !fences){errno=EINVAL;return BROOK_GPU_WINDOW_SEND_REJECTED;}
     int fds[2*BROOK_GPU_WINDOW_LAYERS_MAX];
     for(uint32_t i=0;i<p->count;++i){
-        if(!brook_gpu_window_layer_fd_matches(&p->layers[i],buffers[i]) || fences[i]<0){errno=EINVAL;return -1;}
+        if(!brook_gpu_window_layer_fd_matches(&p->layers[i],buffers[i]) || fences[i]<0){errno=EINVAL;return BROOK_GPU_WINDOW_SEND_REJECTED;}
         fds[2*i]=buffers[i];fds[2*i+1]=fences[i];
     }
     union {struct cmsghdr align;char data[CMSG_SPACE(sizeof(fds))];} control;memset(&control,0,sizeof(control));

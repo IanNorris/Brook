@@ -279,6 +279,13 @@ int main(void){check_early_notify();check_failed_fence();check_layers();check_un
     desktop_gpu_channel_init(&second);assert(second.listener<0);
     close(first.listener);first.listener=-1;first.path[0]=0; /* crash: pathname remains */
     desktop_gpu_channel_init(&second);assert(second.listener>=0);
+    struct sockaddr_un endpoint={.sun_family=AF_UNIX};
+    memcpy(endpoint.sun_path,socketPath,strlen(socketPath)+1);
+    int producer=socket(AF_UNIX,SOCK_SEQPACKET|SOCK_CLOEXEC,0);assert(producer>=0);
+    assert(!connect(producer,(struct sockaddr *)&endpoint,sizeof(endpoint)));
+    desktop_gpu_channel_poll(&second);assert(second.peer>=0 && second.accepted==1);
+    close(producer);
+    desktop_gpu_channel_poll(&second);assert(second.peer<0 && second.disconnected==1);
     desktop_gpu_channel_close(&second);assert(!rmdir(dir));unsetenv("BROOK_DESKTOP_GPU_SOCKET");unsetenv("BROOK_DESKTOP_GPU_GID");
     struct DesktopGpuChannel receiver;desktop_gpu_channel_init(&receiver);
     uint64_t frame=desktop_gpu_channel_begin_frame(&receiver);assert(frame);

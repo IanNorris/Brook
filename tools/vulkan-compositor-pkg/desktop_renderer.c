@@ -2095,7 +2095,7 @@ static void stats_publish(uint64_t now){
      * closing brace. */
     if(length){
         size_t end=length;while(end && g_statsJson[end-1]!='}')--end;
-        if(end){char tail[2560];
+        if(end){char tail[2816];
             const struct BrookVkBackdropStats blur=desktop_backdrop_stats();
             const int n=snprintf(tail,sizeof(tail),",\"scanout\":{\"images\":%u,\"picks\":%llu,\"waits\":%llu,\"starved\":%llu,\"present_defers\":%llu,"
                 "\"full_draws\":%llu,\"partial_draws\":%llu,\"repair_pixels\":%llu},\"overlay_only_skips\":%llu,\"overlay_bands_kept\":%llu,"
@@ -2106,6 +2106,7 @@ static void stats_publish(uint64_t now){
                 "\"blur\":{\"enabled\":%d,\"capable\":%u,\"unavailable\":%d,\"rebuilds\":%llu,\"reuses\":%llu,\"layout_skips\":%llu,"
                 "\"atlas_gpu_ns\":%llu,\"glass_gpu_ns\":%llu,\"frame_gpu_ns\":%llu,\"shell_gpu_ns\":%llu,\"timed_frames\":%u,"
                 "\"atlas_timed_frames\":%u,\"tile_rebuilds\":%llu,\"tile_reuses\":%llu},"
+                "\"gpu_channel\":{\"listening\":%d,\"connected\":%d,\"accept_blocked\":%d,\"accepted\":%llu,\"disconnected\":%llu},"
                 "\"client\":{\"keep\":%d,\"keeps\":%llu,\"keep_misses\":%llu,\"captures\":%llu,\"bytes_copied\":%llu,\"bytes_kept\":%llu,\"band_reuses\":%llu}}\n",g_ring.count,
                 (unsigned long long)g_scanoutPicks,(unsigned long long)g_scanoutWaits,(unsigned long long)g_scanoutStarved,
                 (unsigned long long)g_scanoutPresentDefers,
@@ -2119,9 +2120,11 @@ static void stats_publish(uint64_t now){
                 (unsigned long long)blur.atlasNs,(unsigned long long)blur.glassNs,
                 (unsigned long long)blur.frameNs,(unsigned long long)blur.shellNs,blur.timedFrames,
                 blur.atlasTimedFrames,(unsigned long long)blur.tileRebuilds,(unsigned long long)blur.tileReuses,
+                g_gpuChannel.listener>=0,g_gpuChannel.peer>=0,g_gpuChannel.blockAccept,
+                (unsigned long long)g_gpuChannel.accepted,(unsigned long long)g_gpuChannel.disconnected,
                 g_clientKeep,g_clientStats.keeps,g_clientStats.keepMisses,
                 g_clientStats.captures,g_clientStats.bytesCopied,g_clientStats.bytesKept,g_clientStats.bandReuses);
-            if(n>0 && end-1+(size_t)n<sizeof(g_statsJson)){memcpy(g_statsJson+end-1,tail,(size_t)n);length=end-1+(size_t)n;}
+            if(n>0 && (size_t)n<sizeof(tail) && end-1+(size_t)n<sizeof(g_statsJson)){memcpy(g_statsJson+end-1,tail,(size_t)n);length=end-1+(size_t)n;}
             /* "timeline":[[start,submit,fence,present_call,presented (us), image, partial, draw_pixels, commit],...] */
             char rows[DESKTOP_TIMELINE*120+640+2560];size_t used=0;
             used+=(size_t)snprintf(rows+used,sizeof(rows)-used,",\"timeline\":[");
