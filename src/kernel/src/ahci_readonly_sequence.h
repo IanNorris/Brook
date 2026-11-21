@@ -15,17 +15,46 @@ static constexpr uint32_t MEDIA_CHANGE_SERR=(1u<<26);
 static constexpr uint32_t ATA_SIGNATURE=0x00000101u;
 enum class Result : uint8_t { Ok, Busy, InvalidDma, DeviceBusy, Timeout, DeviceError, ShortTransfer, MediaChanged };
 
-template<class Io> bool MediaChanged(Io& io, uint32_t interruptStatus) {
-    return (interruptStatus&MEDIA_CHANGE_IRQ) || (io.read(SERR)&MEDIA_CHANGE_SERR) ||
-           (io.read(SSTS)&15u)!=3 || io.read(SIG)!=ATA_SIGNATURE;
+static constexpr uint64_t MEDIA_SETTLE_NS=10000000;
+static constexpr unsigned MEDIA_SETTLE_POLLS=16384;
+
+template<class Io> bool MediaChanged(Io& io, uint32_t& interruptStatus) {
+    auto exchange=[&] {
+        return (interruptStatus&MEDIA_CHANGE_IRQ) || (io.read(SERR)&MEDIA_CHANGE_SERR);
+    };
+    if(exchange())return true;
+    uint32_t link=io.read(SSTS);
+    if(link==0xffffffffu)return true;
+    if((link&15u)==3 && (link&0xf00u)!=0x800u)return io.read(SIG)!=ATA_SIGNATURE;
+
+    // An in-progress transition can show DET != 3. Confirm a DevSleep
+    // sample once as well, and accept it if DET still proves an online
+    // link. Exchange or presence evidence overrides the settling window.
+    const uint64_t start=io.nowNs();
+    for(unsigned poll=0;poll<MEDIA_SETTLE_POLLS;++poll) {
+        const uint64_t now=io.nowNs();
+        if(now<start || now-start>=MEDIA_SETTLE_NS)return true;
+        io.pause();
+        interruptStatus=io.read(IS);
+        if(exchange())return true;
+        link=io.read(SSTS);
+        if(link==0xffffffffu)return true;
+        if((link&15u)==3)return io.read(SIG)!=ATA_SIGNATURE;
+    }
+    // The poll cap also handles early boot and panic with a stalled clock.
+    return true;
 }
 
 // Preserve hotplug latches even if they assert between the check and the
 // acknowledgement. SERR is cleared only at Prepare, before identification.
 template<class Io> Result ArmCommand(Io& io) {
-    if(MediaChanged(io,io.read(IS)))return Result::MediaChanged;
+    uint32_t pending=io.read(IS);
+    if(MediaChanged(io,pending))return Result::MediaChanged;
+    const uint32_t task=io.read(TFD);
+    if(task==0xffffffffu)return Result::DeviceError;
+    if(task&0x88u)return Result::DeviceBusy;
     io.write(IS,~MEDIA_CHANGE_IRQ);io.fence();
-    const uint32_t pending=io.read(IS);
+    pending=io.read(IS);
     if(MediaChanged(io,pending))return Result::MediaChanged;
     if(pending&1u)return Result::DeviceError;
     io.write(CI,1);
@@ -83,12 +112,11 @@ template<class Io> bool Quiesce(Io& io) {
 // Io::transferred reads PRDBC after the completion fence.
 template<class Io> Result Submit(Io& io, uint32_t expectedBytes) {
     if(!expectedBytes || io.read(CI) || io.read(SACT))return Result::Busy;
-    if(io.read(TFD)&(0x80u|0x08u))return Result::DeviceBusy;
     const auto armed=ArmCommand(io);
     if(armed!=Result::Ok)return armed;
     if(!io.waitClear(CI,1))return Result::Timeout;
     io.fence();
-    const uint32_t completed=io.read(IS);
+    uint32_t completed=io.read(IS);
     if(MediaChanged(io,completed))return Result::MediaChanged;
     if((completed&ERROR_MASK) || (io.read(TFD)&1u))return Result::DeviceError;
     if(io.transferred()!=expectedBytes)return Result::ShortTransfer;
@@ -99,19 +127,19 @@ template<class Io> Result Submit(Io& io, uint32_t expectedBytes) {
 // sector I/O, so its caller provides a separate bounded completion wait.
 // This helper does not construct or select any ATA command itself.
 template<class Io> Result SubmitNoData(Io& io) {
-    const uint32_t cmd=io.read(CMD),ci=io.read(CI),sact=io.read(SACT),tfd=io.read(TFD);
-    if(cmd==0xffffffffu || ci==0xffffffffu || sact==0xffffffffu || tfd==0xffffffffu ||
+    const uint32_t cmd=io.read(CMD),ci=io.read(CI),sact=io.read(SACT);
+    if(cmd==0xffffffffu || ci==0xffffffffu || sact==0xffffffffu ||
        (cmd&(ST|FRE))!=(ST|FRE))return Result::DeviceError;
     if(ci || sact)return Result::Busy;
-    if(tfd&(0x80u|0x08u))return Result::DeviceBusy;
     const auto armed=ArmCommand(io);
     if(armed!=Result::Ok)return armed;
     if(!io.waitClearFlush(CI,1))return Result::Timeout;
     io.fence();
-    const uint32_t completed=io.read(IS),task=io.read(TFD),engine=io.read(CMD);
+    uint32_t completed=io.read(IS);
+    if(MediaChanged(io,completed))return Result::MediaChanged;
+    const uint32_t task=io.read(TFD),engine=io.read(CMD);
     // A newly received device-to-host register FIS proves that a no-data
     // command completed; CI alone may already be clear if a write was lost.
-    if(MediaChanged(io,completed))return Result::MediaChanged;
     if(task==0xffffffffu || engine==0xffffffffu ||
        !(completed&1u) || (completed&ERROR_MASK) || (task&0xa9u) ||
        (engine&(ST|FRE))!=(ST|FRE))return Result::DeviceError;

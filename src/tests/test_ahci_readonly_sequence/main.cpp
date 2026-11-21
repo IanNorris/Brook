@@ -7,7 +7,9 @@ struct Mock {
     bool stuckCi=false,stuckCr=false,stuckFr=false,ignoreStop=false,ignoreFisStop=false,unavailableAfterWrite=false;
     uint32_t ignoredOffset=0xffffffffu;
     uint32_t injectIs=0, interruptOnAck=0;
-    unsigned commandIssues=0;
+    uint32_t settleLink=0x133, isOnPause=0, serrOnPause=0, linkOnCompletion=0;
+    uint64_t now=0, stepNs=1000000;
+    unsigned commandIssues=0, polls=0, settleAfter=0;
     Mock(){regs[SSTS/4]=0x133;regs[SIG/4]=ATA_SIGNATURE;}
     uint32_t read(uint32_t off){return regs[off/4];}
     void write(uint32_t off,uint32_t value){
@@ -22,7 +24,23 @@ struct Mock {
         if(off==CMD && unavailableAfterWrite)regs[off/4]=0xffffffffu;
     }
     void fence(){++fences;}
-    bool waitClear(uint32_t off,uint32_t mask){if((off==CI&&stuckCi)||(mask==CR&&stuckCr)||(mask==FR&&stuckFr))return false;regs[off/4]&=~mask;if(off==CI)regs[IS/4]|=injectIs;return true;}
+    uint64_t nowNs(){return now;}
+    void pause(){
+        ++polls;
+        now+=stepNs;
+        regs[IS/4]|=isOnPause;
+        regs[SERR/4]|=serrOnPause;
+        if(polls==settleAfter){regs[SSTS/4]=settleLink;regs[TFD/4]=0;}
+    }
+    bool waitClear(uint32_t off,uint32_t mask){
+        if((off==CI&&stuckCi)||(mask==CR&&stuckCr)||(mask==FR&&stuckFr))return false;
+        regs[off/4]&=~mask;
+        if(off==CI){
+            regs[IS/4]|=injectIs;
+            if(linkOnCompletion)regs[SSTS/4]=linkOnCompletion;
+        }
+        return true;
+    }
     bool waitClearFlush(uint32_t off,uint32_t mask){return waitClear(off,mask);}
     uint32_t transferred(){return transferredBytes;}
 };
@@ -66,7 +84,7 @@ int main(){
         for(uint32_t change:{1u<<31,1u<<6}) {
             Mock pending;
             pending.regs[IS/4]=change;
-            assert(submit(pending)==Result::MediaChanged && !pending.writes);
+            assert(submit(pending)==Result::MediaChanged && !pending.writes && !pending.polls);
 
             Mock duringAck;
             duringAck.interruptOnAck=change;
@@ -91,9 +109,48 @@ int main(){
             lpm.regs[SERR/4]|=1u<<26;
             assert(submit(lpm)==Result::MediaChanged && lpm.commandIssues==1);
         }
+        for(uint32_t link:{0x1u,0x801u}) { // Transient DET and DevSleep
+            Mock transient;
+            transient.regs[SSTS/4]=link;
+            transient.regs[TFD/4]=0x80;
+            transient.settleAfter=3;
+            transient.injectIs=1;
+            assert(submit(transient)==Result::Ok && transient.commandIssues==1 && transient.polls==3);
+
+            Mock persistent;
+            persistent.regs[SSTS/4]=link;
+            assert(submit(persistent)==Result::MediaChanged && !persistent.writes);
+            assert(persistent.now==MEDIA_SETTLE_NS);
+
+            Mock exchange;
+            exchange.regs[SSTS/4]=link;
+            exchange.serrOnPause=1u<<26;
+            exchange.settleAfter=1;
+            assert(submit(exchange)==Result::MediaChanged && !exchange.writes && exchange.polls==1);
+
+            Mock coldPort;
+            coldPort.regs[SSTS/4]=link;
+            coldPort.isOnPause=1u<<31;
+            coldPort.settleAfter=1;
+            assert(submit(coldPort)==Result::MediaChanged && !coldPort.writes && coldPort.polls==1);
+        }
+        Mock devSleepOnline;
+        devSleepOnline.regs[SSTS/4]=0x833;
+        devSleepOnline.injectIs=1;
+        assert(submit(devSleepOnline)==Result::Ok && devSleepOnline.commandIssues==1 && devSleepOnline.polls==3);
+
         Mock disconnected;
         disconnected.regs[SSTS/4]=0;
+        disconnected.stepNs=0; // A stalled panic/early boot clock must not hang.
         assert(submit(disconnected)==Result::MediaChanged && !disconnected.writes);
+        assert(disconnected.polls==MEDIA_SETTLE_POLLS);
+
+        Mock completion;
+        completion.linkOnCompletion=0x801;
+        completion.settleAfter=1;
+        completion.injectIs=1;
+        assert(submit(completion)==Result::Ok && completion.commandIssues==1 && completion.polls==1);
+
         Mock wrongDevice;
         wrongDevice.regs[SIG/4]=0xeb140101;
         assert(submit(wrongDevice)==Result::MediaChanged && !wrongDevice.writes);

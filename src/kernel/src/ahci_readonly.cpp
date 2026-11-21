@@ -149,6 +149,8 @@ struct PortIo {
     uint32_t read(uint32_t offset) { return regs[offset/4]; }
     void write(uint32_t offset,uint32_t value) { regs[offset/4]=value; }
     void fence() { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
+    uint64_t nowNs() { return ElapsedClockNs(); }
+    void pause() { __asm__ volatile("pause":::"memory"); }
     uint32_t transferred() {
         auto* hdr=reinterpret_cast<CommandHeader*>(dma);
         return __atomic_load_n(&hdr->transferred,__ATOMIC_ACQUIRE);

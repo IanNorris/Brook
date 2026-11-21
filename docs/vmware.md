@@ -67,7 +67,8 @@ Use IDE if you add a CD-ROM. A changed disk, additional active SATA device,
 expanded disk or different sector geometry causes boot to halt before writable
 mounts. The generated VM configuration disables hot-plug. Brook also
 quarantines the disk until reboot if the controller reports a possible disk
-replacement. Normal SATA link power transitions can continue. The authenticated
+replacement. Brook briefly rechecks the link during a SATA power transition
+before deciding whether the disk is still online. The authenticated
 bridge command `bridge hardware ahci-ro` includes a read-only `port_registers`
 snapshot for the selected port when available.
 
