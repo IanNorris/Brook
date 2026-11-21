@@ -27,6 +27,8 @@ void ShutdownDesktopForceApps();
 // Explicit escalation of already-prompted, still-open app windows.
 bool ShutdownCanForceApps(const char* requestId=nullptr);
 const char* ShutdownDesktopStatus();
+// True after the current shutdown is clean and the machine has no soft-off method.
+bool ShutdownReadyForManualPowerOff();
 const char* ShutdownRequestStatus(const char* requestId);
 // Processes still holding the current request in closing/services, for the
 // bridge reply. A request that is not current reports count 0 and its stage.

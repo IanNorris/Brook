@@ -1,5 +1,6 @@
 #include "acpi.h"
 #include "acpi_tables.h"
+#include "acpi_s5_aml.h"
 #include "boot_timing.h"
 #include "boot_resource_map.h"
 #include "boot_protocol/boot_protocol.h"
@@ -206,6 +207,36 @@ bool AcpiInit(uint64_t rsdp,const MemoryDescriptor* map,uint32_t count)
 }
 const MadtInfo& AcpiGetMadt(){return g_madt;}
 const AcpiResetInfo& AcpiGetResetInfo(){return g_reset;}
+AcpiS5Info AcpiGetS5Info()
+{
+    if(!g_acpiReady)return {};
+    const auto controls=g_tables.SleepControls();
+    if(!controls.pm1a)return {};
+    AcpiSdtHeader dsdt{};
+    const auto address=g_tables.Dsdt(&dsdt);
+    if(!address || g_tables.RootEntryCount()>64)return {};
+    uint8_t typeA=0,typeB=0;
+    auto readStatic=[](uint64_t at,const AcpiSdtHeader& header,uint8_t& a,uint8_t& b){
+        return AcpiReadStaticS5(reinterpret_cast<const uint8_t*>(at+sizeof(header)),
+                                header.length-sizeof(header),a,b);
+    };
+    const auto root=readStatic(address,dsdt,typeA,typeB);
+    if(root==AcpiS5Result::Unsupported)return {};
+    bool found=root==AcpiS5Result::Found;
+    for(uint32_t i=0;i<g_tables.RootEntryCount();++i){
+        AcpiSdtHeader table{};
+        const auto extension=g_tables.RootEntry(i,&table);
+        if(!extension)return {};
+        if(table.signature[0]!='S' || table.signature[1]!='S' ||
+           table.signature[2]!='D' || table.signature[3]!='T')continue;
+        uint8_t a=0,b=0;
+        const auto result=readStatic(extension,table,a,b);
+        if(result==AcpiS5Result::Unsupported || (result==AcpiS5Result::Found && found))return {};
+        if(result==AcpiS5Result::Found){found=true;typeA=a;typeB=b;}
+    }
+    if(!found)return {};
+    return {controls,typeA,typeB,"Validated FADT PM1 and static ACPI S5"};
+}
 const AcpiPmTimerInfo& AcpiGetPmTimerInfo(){return g_pmTimer;}
 const AcpiLegacyPowerInfo& AcpiGetLegacyPowerInfo(){return g_legacyPower;}
 const AcpiSciRoute& AcpiGetSciRoute(){return g_sciRoute;}

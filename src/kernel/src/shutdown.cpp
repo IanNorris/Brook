@@ -603,6 +603,13 @@ const char* ShutdownDesktopStatus() {
     if(phase!=Phase::Empty&&phase!=Phase::Cancelled)return DescribePhase(phase,restart,true,cancelling);
     const auto* notice=__atomic_load_n(&desktopNotice,__ATOMIC_ACQUIRE);return notice?notice:"Applications";
 }
+bool ShutdownReadyForManualPowerOff() {
+    SpinLockAcquire(&lock);
+    const bool ready = current >= 0 && operations[current].phase == Phase::Ready &&
+                       !operations[current].restart && !powerOff;
+    SpinLockRelease(&lock);
+    return ready;
+}
 void ShutdownCompositorPoll() {
     SpinLockAcquire(&lock);const int selected=current;const bool closing=selected>=0&&operations[selected].phase==Phase::Closing&&!operations[selected].cancel&&admissionReady;
     if(closing)closePolling=true;
