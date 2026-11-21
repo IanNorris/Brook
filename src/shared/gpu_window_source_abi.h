@@ -12,7 +12,10 @@
  * of the exact renderer group, plus successful per-buffer GPU/scanout
  * retirement. EAGAIN means retry, EIO means uncertain or failed.
  * RESTART requires the current connecting process to be the boot-pinned
- * provider or an initial administrator. ENOTCONN reports loss of renderer
+ * provider or an initial administrator. Only the verified guarded boot
+ * launch pins INTLWL. Exec revokes the pin. A relaunched INTLWL gets EPERM
+ * in gpu_channel.restart_errno and continues DRAIN under the same receipt
+ * or reaping and per-buffer requirements. ENOTCONN reports loss of renderer
  * ownership; EAGAIN defers to the renderer's bounded recovery grace. */
 #define BROOK_GPU_WINDOW_PEER_RECOVERY_GRACE_MS 60000
 /* Linux x86-64 SIGUSR2 wait status, forced by the kernel even if masked or
