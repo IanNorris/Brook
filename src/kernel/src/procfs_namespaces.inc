@@ -1,8 +1,12 @@
-// Included before retained proc objects. Only actual mount namespaces are
-// exposed. Namespace links/directories pin task identity; followed objects own
-// active topology leases independently of tasks, paths and filesystem snapshots.
-static int ProcAcquireMountNamespace(uint16_t pid,uint64_t incarnation,uint16_t tgid,
-                                      uint64_t group,MountNamespace** out)
+// Included before retained proc objects. A namespace link resolves against the
+// captured task incarnation. A followed mount namespace owns a topology lease;
+// the other descriptors expose immutable namespace identity and type.
+enum class ProcNamespaceKind : uint8_t { Mount, User, Pid, Net };
+static constexpr const char* ProcNamespaceNames[]{"mnt", "user", "pid", "net"};
+static constexpr uint32_t ProcNamespaceTypes[]{0x00020000, 0x10000000, CloneNewPid, CloneNewNet};
+
+static int ProcAcquireNamespaceTask(uint16_t pid,uint64_t incarnation,uint16_t tgid,
+                                    uint64_t group,Process** out)
 {
     *out=nullptr;auto* task=SchedulerFindProcessReference(pid);if(!task)return -2;
     int error=0;
@@ -20,17 +24,48 @@ static int ProcAcquireMountNamespace(uint16_t pid,uint64_t incarnation,uint16_t 
         bool allowed=same || ProcessCapable(self,owner,19); // CAP_SYS_PTRACE
         UserNamespaceRelease(owner);if(!allowed)error=-13;
     }
-    FsSnapshot fs{};
-    if(!error)error=ProcessFsSnapshot(task,&fs);
-    if(!error && !VfsMountNamespaceHandleAcquire(fs.mountNamespace))error=-2;
-    if(!error)*out=fs.mountNamespace; // active lease owns separate storage
-    FsSnapshotRelease(&fs);ProcessUnref(task);return error;
+    if(error)ProcessUnref(task);else *out=task;
+    return error;
 }
-struct ProcMountNamespaceObject { VfsObject object;MountNamespace* ns; };
+struct ProcNamespaceDescriptor {
+    VfsObject object;
+    MountNamespace* mount;
+    ProcNamespaceKind kind;
+};
+static int ProcReadNamespaceIdentity(Process* task, ProcNamespaceKind kind, uint64_t& identity,
+                                     MountNamespace*& mount)
+{
+    switch(kind) {
+        case ProcNamespaceKind::Mount: {
+            FsSnapshot fs{};
+            int error=ProcessFsSnapshot(task,&fs);
+            if(!error && !VfsMountNamespaceHandleAcquire(fs.mountNamespace))error=-2;
+            if(!error) { mount=fs.mountNamespace;identity=VfsMountNamespaceIdentity(mount); }
+            FsSnapshotRelease(&fs);return error;
+        }
+        case ProcNamespaceKind::User: {
+            auto* scope=ProcessUserNamespaceAcquire(task);
+            identity=scope?scope->identity:0;
+            UserNamespaceRelease(scope);
+            break;
+        }
+        case ProcNamespaceKind::Pid:
+            identity=PidNamespaceTag(ProcessPidView(task));
+            break;
+        case ProcNamespaceKind::Net:
+            identity=ProcessNetworkScope(task);
+            break;
+    }
+    // Keep distinct namespace types in separate inode-number ranges even
+    // when their allocation counters have the same value.
+    if(identity >= (uint64_t{1} << 62))return -75;
+    identity |= static_cast<uint64_t>(kind) << 62;
+    return 0;
+}
 static void ProcNamespaceDestroy(VfsObject* object)
 {
-    auto* value=static_cast<ProcMountNamespaceObject*>(object->priv);
-    auto* ns=value->ns;kfree(value);VfsMountNamespaceHandleRelease(ns);
+    auto* value=static_cast<ProcNamespaceDescriptor*>(object->priv);
+    auto* mount=value->mount;kfree(value);VfsMountNamespaceHandleRelease(mount);
 }
 static int ProcNamespaceStat(VfsObject* object,VnodeStat* out)
 {
@@ -53,20 +88,35 @@ static const VfsObjectOps g_procNamespaceOps={
     .destroy=ProcNamespaceDestroy,.stat=ProcNamespaceStat,.access=ProcNamespaceAccess,
     .lookup=nullptr,.parent=nullptr,.readlink=nullptr,.open=ProcNamespaceOpen,
 };
-static int ProcNamespaceObject(uint16_t pid,uint64_t incarnation,uint16_t tgid,uint64_t group,VfsObject** out)
+int ProcFsOpenedNamespaceType(const Vnode* node)
 {
-    *out=nullptr;MountNamespace* ns=nullptr;
-    if(int error=ProcAcquireMountNamespace(pid,incarnation,tgid,group,&ns))return error;
-    auto* value=static_cast<ProcMountNamespaceObject*>(kmalloc(sizeof(ProcMountNamespaceObject)));
-    if(!value) {VfsMountNamespaceHandleRelease(ns);return -12;}
-    value->ns=ns;value->object={&g_procNamespaceOps,value,VfsMountNamespaceIdentity(ns),1};*out=&value->object;return 0;
+    if(!node || !node->backendObject || node->backendObject->ops!=&g_procNamespaceOps)return -25;
+    auto* value=static_cast<const ProcNamespaceDescriptor*>(node->backendObject->priv);
+    return ProcNamespaceTypes[static_cast<unsigned>(value->kind)];
 }
-static int ProcNamespaceReadlink(uint16_t pid,uint64_t incarnation,uint16_t tgid,uint64_t group,char* out,uint32_t capacity)
+
+static int ProcNamespaceObject(uint16_t pid,uint64_t incarnation,uint16_t tgid,uint64_t group,
+                               ProcNamespaceKind kind,VfsObject** out)
 {
-    MountNamespace* ns=nullptr;if(int error=ProcAcquireMountNamespace(pid,incarnation,tgid,group,&ns))return error;
-    char text[32];char* end=AppendStr(text,"mnt:[");end=U64ToDec(end,VfsMountNamespaceIdentity(ns));*end++=']';
+    *out=nullptr;Process* task=nullptr;
+    if(int error=ProcAcquireNamespaceTask(pid,incarnation,tgid,group,&task))return error;
+    MountNamespace* mount=nullptr;uint64_t identity=0;
+    const int error=ProcReadNamespaceIdentity(task,kind,identity,mount);
+    ProcessUnref(task);if(error)return error;
+    auto* value=static_cast<ProcNamespaceDescriptor*>(kmalloc(sizeof(ProcNamespaceDescriptor)));
+    if(!value) {VfsMountNamespaceHandleRelease(mount);return -12;}
+    *value={{&g_procNamespaceOps,value,identity,1},mount,kind};
+    *out=&value->object;return 0;
+}
+static int ProcNamespaceReadlink(uint16_t pid,uint64_t incarnation,uint16_t tgid,uint64_t group,
+                                 ProcNamespaceKind kind,char* out,uint32_t capacity)
+{
+    VfsObject* target=nullptr;
+    if(int error=ProcNamespaceObject(pid,incarnation,tgid,group,kind,&target))return error;
+    char text[32];char* end=AppendStr(text,ProcNamespaceNames[static_cast<unsigned>(kind)]);
+    end=AppendStr(end,":[");end=U64ToDec(end,target->identity);*end++=']';
     uint32_t bytes=end-text;if(bytes>capacity)bytes=capacity;memcpy(out,text,bytes);
-    VfsMountNamespaceHandleRelease(ns);return bytes;
+    VfsObjectRelease(target);return bytes;
 }
 static int ProcNsDirectoryReaddir(Vnode* node,DirEntry* out,uint32_t* cookie)
 {
@@ -74,8 +124,8 @@ static int ProcNsDirectoryReaddir(Vnode* node,DirEntry* out,uint32_t* cookie)
     if(!SchedulerSnapshotProcess(value->pid,&snapshot) || snapshot.incarnation!=value->incarnation ||
        snapshot.tgid!=value->tgid || snapshot.groupIncarnation!=value->groupIncarnation ||
        snapshot.state==ProcessState::Terminated)return -2;
-    if(*cookie)return 0;
-    *out={};ProcStrCopy(out->name,"mnt",sizeof(out->name));++*cookie;return 1;
+    if(*cookie>=sizeof(ProcNamespaceNames)/sizeof(*ProcNamespaceNames))return 0;
+    *out={};ProcStrCopy(out->name,ProcNamespaceNames[*cookie],sizeof(out->name));++*cookie;return 1;
 }
 static int ProcNsDirectoryStat(Vnode* node,VnodeStat* out)
 {

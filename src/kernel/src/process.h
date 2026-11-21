@@ -716,7 +716,7 @@ struct FileActorSnapshot {
 FileActorSnapshot ProcessFileActorAcquire(Process*,UserNamespace* filesystemOwner,bool realIds=false);
 // Per-task, inherited on fork/clone and preserved across exec.
 void ProcessSetNoNewPrivs(Process* proc);
-bool ProcessGetNoNewPrivs(Process* proc);
+bool ProcessGetNoNewPrivs(const Process* proc);
 int ProcessCheckFileAccess(Process* proc, uint32_t owner, uint32_t group, uint16_t mode, uint8_t required, bool realIds = false);
 uint8_t ProcessFilePermissions(Process* proc, uint32_t owner, uint32_t group, uint16_t mode);
 

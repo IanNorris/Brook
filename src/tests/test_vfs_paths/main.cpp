@@ -885,6 +885,20 @@ static void testPivotRoots(brook::MountNamespace* initial,const brook::VfsPath& 
     int error=0;auto* exact=FsContextCreate(root,root,022,&error,ns);assert(exact&&!error);
     auto* descendant=FsContextCreate(root,a,077,&error,ns);assert(descendant&&!error);
     FsContextRetain(exact); // shared CLONE_FS references remain one context
+    auto* narrowed=FsContextCopy(exact,&error);assert(narrowed && !error);
+    FsSnapshot original{};assert(!FsContextSnapshot(narrowed,&original));
+    assert(FsContextHasNamespaceRoot(narrowed));
+    assert(!FsContextSetResolvedRoot(narrowed,a,original));
+    assert(FsContextSetResolvedRoot(narrowed,b,original)==-11);
+    assert(!FsContextHasNamespaceRoot(narrowed) && FsContextHasNamespaceRoot(exact));
+    FsSnapshot changed{};assert(!FsContextSnapshot(narrowed,&changed));
+    assert(VfsPathSame(changed.root,a) && VfsPathSame(changed.cwd,root));
+    expect(changed.root,changed.root,"..",a);
+    char inside[32];
+    assert(VfsPathDirectoryPathInRoot(changed.root,changed.cwd,inside,sizeof(inside))==-2);
+    auto sub=resolve(changed.root,changed.root,"sub");
+    assert(!VfsPathDirectoryPathInRoot(changed.root,sub,inside,sizeof(inside)) && !std::strcmp(inside,"/sub"));
+    VfsPathRelease(sub);FsSnapshotRelease(&changed);FsSnapshotRelease(&original);FsContextRelease(narrowed);
     FsSnapshot stale{};assert(!FsContextSnapshot(exact,&stale));
     bool succeeded=false;
     for(long failure=0;failure<256;++failure) {

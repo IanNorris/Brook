@@ -215,6 +215,8 @@ struct ProcessSnapshot {
     // Syscall/wait diagnostics (/proc/<pid>/syscall, wchan, `proc blocked`).
     bool kernelThread;
     bool blockedOnRwLock;
+    bool noNewPrivs;
+    bool seccompFiltered;
     uint64_t syscallNr;
     uint64_t syscallArgs[6];
     uint64_t syscallSp, syscallPc;

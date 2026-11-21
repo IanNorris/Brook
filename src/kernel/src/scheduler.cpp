@@ -3997,6 +3997,8 @@ static void FillProcessSnapshot(const Process* p, ProcessSnapshot* out)
     ProcessFsReadDisplay(p,out->cwd,sizeof(out->cwd));
     out->kernelThread = p->isKernelThread;
     out->blockedOnRwLock = p->blockedOnRwLock != nullptr;
+    out->noNewPrivs = ProcessGetNoNewPrivs(p);
+    out->seccompFiltered = SeccompLoad(p) != nullptr;
     out->syscallNr = p->currentSyscallNum;
     out->syscallArgs[0] = p->syscallUserRdi; out->syscallArgs[1] = p->syscallUserRsi;
     out->syscallArgs[2] = p->syscallUserRdx; out->syscallArgs[3] = p->syscallUserR10;

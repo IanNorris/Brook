@@ -278,6 +278,10 @@ int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAddr,
         child->setChildTid = childTidAddr;
 
     if(flags&CLONE_NEWUSER) {
+        auto* context=ProcessFsAcquire(child);
+        const bool hasNamespaceRoot=FsContextHasNamespaceRoot(context);
+        FsContextRelease(context);
+        if(!hasNamespaceRoot) {ProcessDiscardUnpublished(child);return -EPERM;}
         if(int error=ProcessUserNamespaceCreate(child)) {ProcessDiscardUnpublished(child);return error;}
     }
     if(flags&CLONE_NEWNS) {
@@ -397,6 +401,9 @@ int64_t sys_unshare(uint64_t flags,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t)
         int error=0;
         auto* context=ProcessFsCopy(process,&error);
         if(!context)return error;
+        // A chroot must not be able to recover capabilities in a new nested
+        // user namespace after applying its filesystem boundary.
+        if(!FsContextHasNamespaceRoot(context)) {FsContextRelease(context);return -EPERM;}
         error=ProcessUserNamespaceCreate(process);
         if(error)FsContextRelease(context);
         else ProcessFsReplaceOwned(process,context);

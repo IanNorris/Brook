@@ -141,7 +141,7 @@ int ProcessFsGetcwdFromVfsCallback(Process* process,char* out,uint32_t capacity)
 int ProcessFsGetcwd(Process* process,char* out,uint32_t capacity)
 {
     FsSnapshot snapshot{};int error=ProcessFsSnapshot(process,&snapshot);
-    if(!error)error=VfsPathDirectoryPath(snapshot.cwd,out,capacity);
+    if(!error)error=VfsPathDirectoryPathInRoot(snapshot.root,snapshot.cwd,out,capacity);
     FsSnapshotRelease(&snapshot);return error;
 }
 int ProcessFsMask(Process* process)
