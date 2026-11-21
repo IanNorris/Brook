@@ -8,7 +8,7 @@ import unittest
 from unittest import mock
 
 import verify_guarded_desktop_candidate as verifier
-from bridge_keyless_image import rebuild_keyless_image
+from bridge_keyless_image import rebuild_keyless_image, require_keyless_disk, require_keyless_image
 from prepare_hardware_kernel_pair import CHROMIUM_POLICY_DIRS
 from stage_clearwater_shell import CLEARWATER_START
 
@@ -108,6 +108,47 @@ class VerifyGuardedDesktop(unittest.TestCase):
         self.assertNotIn(deleted, keyless.read_bytes())
         shutil.copyfile(keyless, self.image)
         self.assertEqual(self.check()['module_abi'], 65)
+
+    def test_keyless_esp_validates_each_embedded_initrd(self):
+        self.copy('ETC/machine-id', b'a' * 32 + b'\n')
+        nested = self.root / 'nested.img'
+        shutil.copyfile(self.image, nested)
+        with self.image.open('wb') as stream:
+            stream.truncate(32 * 1024 * 1024)
+        subprocess.run(['mformat', '-i', self.image, '::'], check=True)
+        self.copy('FIRST.IMG', nested.read_bytes())
+        self.copy('SECOND.IMG', nested.read_bytes())
+        verified = [('FIRST.IMG', nested), ('SECOND.IMG', nested)]
+        require_keyless_image(self.image, embedded_images=verified)
+        with self.assertRaisesRegex(ValueError, 'standalone bridge key material'):
+            require_keyless_image(self.image)
+        with self.assertRaisesRegex(ValueError, 'Unexpected embedded boot image path'):
+            require_keyless_image(self.image, embedded_images=[verified[0], verified[0]])
+
+        self.copy('SECOND.IMG', b'wrong image')
+        with self.assertRaisesRegex(ValueError, 'differs from its checked source'):
+            require_keyless_image(self.image, embedded_images=verified)
+        self.copy('SECOND.IMG', nested.read_bytes())
+        self.copy('JUNK', b'b' * 32 + b'\n')
+        subprocess.run(['mdel', '-i', self.image, '::/JUNK'], check=True)
+        with self.assertRaisesRegex(ValueError, 'standalone bridge key material'):
+            require_keyless_image(self.image, embedded_images=verified)
+
+    def test_keyless_disk_rejects_structured_records_and_exact_credentials(self):
+        disk = self.root / 'disk.img'
+        key = b'c' * 32
+        disk.write_bytes(b'ordinary desktop fixture' + key)
+        require_keyless_disk(disk)
+        with self.assertRaisesRegex(ValueError, 'matching a bridge credential'):
+            require_keyless_disk(disk, forbidden_keys=(key,))
+        record = bytearray(512)
+        record[:8] = b'BRKKEY01'
+        record[8] = 1
+        record[48:80] = key
+        with disk.open('ab') as stream:
+            stream.write(record)
+        with self.assertRaisesRegex(ValueError, 'protected bridge record'):
+            require_keyless_disk(disk)
 
     def test_update_helper_requires_exact_binary(self):
         helpers = {'HWUPDATE.ELF': b'\x7fELF-usb', 'HWUPSYS.ELF': b'\x7fELF-system'}
