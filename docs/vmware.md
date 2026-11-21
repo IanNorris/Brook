@@ -1,8 +1,9 @@
 # VMware bring-up
 
-27 October 2026. Workstation 25H2u1 boots the standalone probe to a
-1920×1080 software desktop with two vCPUs. This is an early portability
-milestone; the full Nix desktop and its applications are not supported yet.
+Brook provides a standalone RAM-backed probe and a persistent desktop image
+for Workstation. The probe can check firmware, graphics and timing with a
+small image. The persistent image adds the network desktop profile, user
+storage and an authenticated debug connection.
 
 ## Prepare the probe
 
@@ -32,7 +33,44 @@ the native desktop and a kernel log window without requiring a runtime disk
 driver. Missing user applications and wallpaper are expected in this small
 probe. Guest changes are not persistent.
 
-## Verified behavior and timing limits
+## Prepare a persistent desktop
+
+The persistent image contains the network desktop profile and an ext2 home
+volume. Build it from a clean checkout with an operator **public** policy and
+a standalone recovery initrd containing Brook's pinned FAT and ext2 checkers.
+
+```sh
+nix-shell
+python3 scripts/make_vmware_image.py \
+  --output build/vmware/persistent \
+  --operator-policy /path/to/operators.pub \
+  --recovery-checkers-from /path/to/recovery/INITRD.IMG.gz
+```
+
+Use `--network nat` if the guest needs external network access. The default
+is host-only. The private operator seed stays on the host. Attach with the
+bridge's explicit `--auth-mode v3` and the matching operator seed. This bridge
+suite authenticates the operator to the guest.
+
+Open the generated `Brook.vmx` in Workstation. It connects one SATA disk and
+an e1000e adapter through a PCIe root port. The disk has a guarded EFI System
+Partition, two desktop slots, recovery boot files and an ext2 data partition.
+Brook admits writes only after checking the virtual disk's pinned GPT and
+ext2 identities and geometry. The manifest records those identities and the
+hashes of the disk, boot files and public operator policy. Back up the VMDK
+while the guest is off. A clean guest shutdown flushes pending writes. A dirty
+volume goes through the guarded recovery check before the desktop mounts it.
+
+## Persistent image validation
+
+The exact VMDK booted in headless QEMU with e1000e behind a PCIe root
+port. A v3-authenticated session ran a job as the desktop user and captured
+a 1920×1080 frame. The user's saved file survived a clean shutdown and an
+interrupted boot followed by automatic ext2 recovery. A disk with a changed
+GPT data partition ID was refused before any writes. Workstation acceptance
+of the persistent image is a separate test.
+
+## Probe timing and portability
 
 Actual VMware boots through UEFI, initializes both CPUs, passes the TLB
 shootdown self-tests and presents the native desktop. The first boot exposed
@@ -93,9 +131,9 @@ input through that transport. The firmware pointer queue was already
 disabled in the tested boot; the defensive PS/2 handoff is not a demonstrated
 fix for this observation.
 
-The next gates are keyboard/wheel/capture acceptance, cold-start clock behavior
-and a persistent-filesystem clean stop/reboot. Brook currently has no AHCI/NVMe,
-e1000/vmxnet3 or VMware SVGA acceleration driver. Persistent disks, networking
-and accelerated graphics therefore require additional work after the probe.
-The QMP-based VM bridge also needs a separate VMware transport before its
-normal control tools can be used here.
+Workstation 25H2u1 accepted the network probe with e1000e behind a PCIe root
+port. Polling was used because the firmware did not assign a legacy
+interrupt. The hardware debug bridge connects over the guest network, so it
+works independently of QEMU's QMP controls. Console keyboard, wheel and
+pointer capture still need acceptance on the persistent image. VMMouse
+absolute input and SVGA II acceleration are separate work.
