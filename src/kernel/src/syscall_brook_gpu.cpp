@@ -24,6 +24,7 @@
 #include "syscall_drm.h"
 #include "syscall_handlers.h"
 #include "pipe.h"
+#include "process_user_namespace.h"
 
 namespace brook {
 
@@ -309,23 +310,17 @@ int64_t sys_brook_gpu_window_peer_recovery(uint64_t fdValue,uint64_t op,uint64_t
         UnixShutdownDirection(socket->rxPipe,false);
         UnixShutdownDirection(socket->txPipe,true);
         SpinLockAcquire(&g_unixRegistryLock);
-        auto& direction=*socket->peerIncomingFds;
-        int result=-EPERM;
-        if(direction.gpuRendererRestartClaimed)result=-16; // EBUSY
-        else if(!direction.gpuRendererRetiredIncarnation || direction.gpuRendererRetiredIncarnation==owner){
-            direction.gpuRendererRetiredIncarnation=owner;
-            result=0;
-        }
+        const auto result=socket->peerIncomingFds->gpuRendererRetirement.Record(owner);
         SpinLockRelease(&g_unixRegistryLock);
-        return result;
+        using Retirement=GpuWindowPeerRetirement::Result;
+        return result==Retirement::Recorded?0:result==Retirement::RestartClaimed?-16:-EPERM;
     }
     UnixCredentials peer{};uint64_t peerIncarnation=0;bool authorized=false,retired=false;
     SpinLockAcquire(&g_unixRegistryLock);
     const bool connected=socket->state==UnixSocketData::State::Connected && !socket->acceptedEndpoint && socket->socketType==5;
     if(connected){
         peer=socket->peerCredentials.raw;peerIncarnation=socket->peerIncarnation;authorized=socket->gpuPeerAuthorized;
-        retired=peerIncarnation && socket->incomingFds &&
-            socket->incomingFds->gpuRendererRetiredIncarnation==peerIncarnation;
+        retired=socket->incomingFds && socket->incomingFds->gpuRendererRetirement.Retired(peerIncarnation);
     }
     SpinLockRelease(&g_unixRegistryLock);
     if(!connected || peer.pid<=0 || peer.pid>65535 || !peerIncarnation)return -EPERM;
@@ -353,9 +348,7 @@ int64_t sys_brook_gpu_window_peer_recovery(uint64_t fdValue,uint64_t op,uint64_t
         // Resolve the process first, and signal outside the registry lock.
         SpinLockAcquire(&g_unixRegistryLock);
         auto* direction=socket->incomingFds;
-        const bool restart=direction && !direction->gpuRendererRestartClaimed &&
-            direction->gpuRendererRetiredIncarnation!=peerIncarnation;
-        if(restart)direction->gpuRendererRestartClaimed=true;
+        const bool restart=direction && direction->gpuRendererRetirement.ClaimRestart(peerIncarnation);
         SpinLockRelease(&g_unixRegistryLock);
         const int result=restart?ProcessSendSignal(target,9,nullptr,proc):0;
         ProcessUnref(target);

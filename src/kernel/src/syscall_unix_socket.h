@@ -4,6 +4,7 @@
 // Internal to the syscall layer; split from syscall.cpp.
 
 #include "unix_lifetime_trace.h"
+#include "gpu_window_peer_retirement.h"
 
 #include "unix_credentials.h"
 #include "pid_namespace.h"
@@ -54,8 +55,7 @@ struct UnixFdQueue {
     uint32_t credentialHead, credentialTail;
     uint64_t written, read;
     // Renderer output direction. Read and written under g_unixRegistryLock.
-    uint64_t gpuRendererRetiredIncarnation;
-    bool gpuRendererRestartClaimed;
+    GpuWindowPeerRetirement gpuRendererRetirement;
     volatile int head;
     volatile int tail;
     volatile uint32_t refCount; // one ref per UnixSocketData pointing at us
