@@ -68,7 +68,8 @@ class SelectedQemuTest(unittest.TestCase):
             'profile': self.profile,
             'packages': [],
             'intelVulkanDriver': None,
-            'manifest': {'requiredCapabilities': {}, 'redistributable': False, 'launcherIds': []},
+            'manifest': {'target': 'qemu', 'requiredCapabilities': {},
+                         'redistributable': False, 'launcherIds': []},
         }
 
     def test_selected_store_must_match_digest_and_realized_profile(self):
@@ -123,6 +124,27 @@ class SelectedQemuTest(unittest.TestCase):
             resize.assert_called_once_with('resize2fs', image)
         self.assertEqual(result, 2024 * mib)
         self.assertEqual(image.stat().st_size, result)
+
+    def test_usb_requires_usb_profile_boot_capability_and_xhci(self):
+        image = self.root / 'STORE.IMG'
+        image.write_bytes(b'image')
+        metadata = {'profile': self.profile, 'profile_selection': self.selection,
+                    'sha256': hashlib.sha256(b'image').hexdigest(), 'bytes': 5}
+        with self.assertRaisesRegex(ValueError, 'not composed for the usb target'):
+            make_public_qemu.developer_seed(self.root, metadata, self.root, usb=True)
+        self.selection['manifest']['target'] = 'usb'
+        with patch('kernel_capabilities.read_kernel_capabilities', return_value={'capabilities': {}}):
+            with self.assertRaisesRegex(ValueError, 'usb-partition-desktop'):
+                make_public_qemu.developer_seed(self.root, metadata, self.root, usb=True)
+        capabilities = {'capabilities': {'usb-partition-desktop': 1}}
+        with patch('kernel_capabilities.read_kernel_capabilities', return_value=capabilities) as read:
+            with self.assertRaisesRegex(ValueError, 'requires the xHCI driver module'):
+                make_public_qemu.developer_seed(self.root, metadata, self.root, usb=True)
+            driver = self.root / 'kernel/drivers/xhci.mod'
+            driver.parent.mkdir(parents=True)
+            driver.touch()
+            self.assertEqual(make_public_qemu.developer_seed(self.root, metadata, self.root, usb=True), image)
+            read.assert_called_with(self.root / 'kernel/BROOK.elf')
 
     def test_public_mode_rejects_selected_seed_and_archive(self):
         (self.root / 'manifest.json').write_text(

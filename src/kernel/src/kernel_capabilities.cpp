@@ -7,6 +7,10 @@ static constexpr char KernelCapabilities[] =
     // Version 1 covers Chromium's user/mount/PID/net namespaces, seccomp-BPF,
     // and procfs fdinfo and namespace paths required by the launcher.
     "\"chromium-sandbox\":1"
+#ifndef BROOK_SSD_GUARD_CHECK
+    // Normal boot probes GPT and MBR USB partitions for mounted filesystems.
+    ",\"usb-partition-desktop\":1"
+#endif
 #ifdef BROOK_BDW_VIDEO_ENGINE
     // Compiled support only. The target's hardware must still be admitted.
     ",\"broadwell-video-engine\":1"

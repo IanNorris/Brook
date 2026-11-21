@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Assemble a clean portable QEMU image from an explicit profile seed.
+"""Assemble a portable QEMU or USB disk image from an explicit profile seed.
 
 Run in nix-shell. Existing guest/review disks are never inputs. The generated
 candidate stays private until the exact corresponding-source/notice review is
@@ -53,19 +53,26 @@ def copy_extents(source, destination, offset):
             cursor = stop
 
 
-def developer_seed(seed, metadata, build):
+def developer_seed(seed, metadata, build, *, usb=False):
     from image_profile import validate_selection
 
     selection = validate_selection(metadata['profile_selection'], metadata['profile'])
+    target = 'usb' if usb else 'qemu'
+    if selection['manifest'].get('target') != target:
+        raise ValueError(f'Selected profile was not composed for the {target} target')
+    requirements = selection['manifest']['requiredCapabilities']
+    if usb or requirements:
+        from kernel_capabilities import read_kernel_capabilities, require_kernel_capabilities
+        kernel = read_kernel_capabilities(build / 'kernel/BROOK.elf')
+        if usb:
+            require_kernel_capabilities(kernel, {'usb-partition-desktop': 1})
+            if not (build / 'kernel/drivers/xhci.mod').is_file():
+                raise ValueError('The USB desktop build requires the xHCI driver module')
+        require_kernel_capabilities(kernel, requirements)
     image = seed / 'STORE.IMG'
     if (not image.is_file() or image.stat().st_size != metadata['bytes']
             or digest(image) != metadata['sha256']):
-        raise ValueError('Selected QEMU store image does not match its seed manifest')
-    requirements = selection['manifest']['requiredCapabilities']
-    if requirements:
-        from kernel_capabilities import read_kernel_capabilities, require_kernel_capabilities
-        kernel = read_kernel_capabilities(build / 'kernel/BROOK.elf')
-        require_kernel_capabilities(kernel, requirements)
+        raise ValueError('Selected store image does not match its seed manifest')
     return image
 
 
@@ -111,15 +118,19 @@ def prepare_public_data(seed, stage, data_image, nix_image):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--seed', type=Path, required=True)
-    parser.add_argument('--developer', action='store_true',
-                        help='Assemble a private QEMU image from a selected-profile store seed')
+    kind = parser.add_mutually_exclusive_group()
+    kind.add_argument('--developer', action='store_true',
+                      help='Assemble a private QEMU image from a selected-profile store seed')
+    kind.add_argument('--usb', action='store_true',
+                      help='Assemble a raw USB disk image file from a selected-profile store seed')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--build', type=Path, default=ROOT / 'build/release')
     args = parser.parse_args()
     seed, output, build = args.seed.resolve(), args.output.resolve(), args.build.resolve()
     metadata = json.loads((seed / 'manifest.json').read_text())
-    if args.developer:
-        store_image = developer_seed(seed, metadata, build)
+    selected = args.developer or args.usb
+    if selected:
+        store_image = developer_seed(seed, metadata, build, usb=args.usb)
     else:
         if ('profile_selection' in metadata or metadata.get('public_inputs_only') is not True
                 or metadata.get('profile_expression') != str(ROOT / 'nix/release-packages.nix')):
@@ -132,7 +143,7 @@ def main():
         shutil.copy2(module, stage / 'build/kernel/drivers' / module.name)
     env = dict(os.environ, BROOK_BUILD_DIR=str(stage / 'build'), BROOK_INITRD_KIB='32768')
     env.pop('BROOK_PROVIDER_PAYLOAD', None)
-    if args.developer:
+    if selected:
         env.pop('BROOK_INITRD_MARKERS', None)
         env.pop('BROOK_HARDWARE_PAYLOAD_ID', None)
     run('bash', ROOT / 'scripts/make_initrd.sh', '--release', env=env)
@@ -155,7 +166,7 @@ def main():
     run('mcopy', '-i', initrd, ROOT / 'data/shortcuts/terminal.rc', '::BOOT/SHORTCUTS/TERMINAL.RC')
     run('mcopy', '-i', initrd, Path(metadata['profile']) / 'bin/bash', '::BOOT/BIN/BASH')
     wallpaper = ROOT / 'data/wallpaper.raw'
-    if args.developer:
+    if selected:
         wallpaper = stage / 'wallpaper.raw'
         run(sys.executable, ROOT / 'scripts/convert_wallpaper.py',
             ROOT / 'data/wallpaper/brook-dawn.png', wallpaper)
@@ -175,7 +186,7 @@ def main():
     # running VM disk. Include helpers in the guest as well as the host bundle.
     data_image, nix_image = stage / 'data.img', stage / 'nix.img'
     run('cp', '--sparse=always', '--reflink=auto', store_image, nix_image)
-    if args.developer:
+    if selected:
         make_developer_data(stage, data_image)
     else:
         prepare_public_data(seed, stage, data_image, nix_image)
@@ -206,21 +217,27 @@ def main():
     run('sfdisk', '--no-reread', '--no-tell-kernel', disk, input=table, text=True)
     for part, start in zip(parts, starts):
         copy_extents(part, disk, start)
-    run('qemu-img', 'convert', '-f', 'raw', '-O', 'qcow2', '-c', disk, output / 'brook.qcow2')
-    run('qemu-img', 'compare', '-f', 'raw', '-F', 'qcow2', disk, output / 'brook.qcow2')
-    run('qemu-img', 'check', output / 'brook.qcow2')
-    for name, variable in [('OVMF_CODE.fd', 'OVMF_CODE'), ('OVMF_VARS.fd', 'OVMF_VARS')]:
-        path = Path(os.environ[variable])
-        shutil.copy2(path, output / name)
-    for name in ['launch.py', 'mcp.py', 'run-linux.sh', 'run-macos.command', 'run-windows.cmd', 'README.txt']:
-        shutil.copy2(ROOT / 'tools/portable_qemu' / name, output / name)
-    shutil.copy2(ROOT / 'LICENSE', output / 'BROOK-LICENSE.txt')
-    if not args.developer:
-        shutil.copy2(ROOT / 'distribution/software.json', output / 'software.json')
-        shutil.copytree(ROOT / 'tools/vm_bridge', output / 'linux-development-bridge',
-                        ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
-        shutil.copytree(ROOT / 'distribution/installers', output / 'installers',
-                        ignore=shutil.ignore_patterns('__pycache__', '*.pyc', '.gitignore'))
+    if args.usb:
+        run('sfdisk', '--verify', disk)
+        files = ('brook-usb.img',)
+        disk.rename(output / files[0])
+    else:
+        files = ('brook.qcow2', 'OVMF_CODE.fd', 'OVMF_VARS.fd')
+        run('qemu-img', 'convert', '-f', 'raw', '-O', 'qcow2', '-c', disk, output / 'brook.qcow2')
+        run('qemu-img', 'compare', '-f', 'raw', '-F', 'qcow2', disk, output / 'brook.qcow2')
+        run('qemu-img', 'check', output / 'brook.qcow2')
+        for name, variable in [('OVMF_CODE.fd', 'OVMF_CODE'), ('OVMF_VARS.fd', 'OVMF_VARS')]:
+            path = Path(os.environ[variable])
+            shutil.copy2(path, output / name)
+        for name in ['launch.py', 'mcp.py', 'run-linux.sh', 'run-macos.command', 'run-windows.cmd', 'README.txt']:
+            shutil.copy2(ROOT / 'tools/portable_qemu' / name, output / name)
+        shutil.copy2(ROOT / 'LICENSE', output / 'BROOK-LICENSE.txt')
+        if not selected:
+            shutil.copy2(ROOT / 'distribution/software.json', output / 'software.json')
+            shutil.copytree(ROOT / 'tools/vm_bridge', output / 'linux-development-bridge',
+                            ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+            shutil.copytree(ROOT / 'distribution/installers', output / 'installers',
+                            ignore=shutil.ignore_patterns('__pycache__', '*.pyc', '.gitignore'))
     manifest = dict(format=1, status='private-candidate-source-and-notice-review-pending',
                     profile=metadata.get('profile'), seed_manifest=metadata,
                     revision=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
@@ -229,11 +246,14 @@ def main():
                     bootloader_sha256=digest(build / 'bootloader/BOOTX64.efi'),
                     module_sha256={p.name: digest(p) for p in sorted((build / 'kernel/drivers').glob('*.mod'))},
                     partitions=[dict(offset=start, size=part.stat().st_size, sha256=digest(part)) for part, start in zip(parts, starts)],
-                    files={name: digest(output / name) for name in ['brook.qcow2', 'OVMF_CODE.fd', 'OVMF_VARS.fd']},
+                    files={name: digest(output / name) for name in files},
                     acceptance=dict(linux='pending', windows='not tested', macos_intel='not tested', macos_arm='not tested; TCG only'))
-    if args.developer:
+    if selected:
         manifest['status'] = 'private-selected-profile'
         manifest['redistributable'] = metadata['profile_selection']['manifest']['redistributable']
+        manifest['target'] = metadata['profile_selection']['manifest']['target']
+    if args.usb:
+        manifest['acceptance'] = {'usb_boot': 'pending'}
     (output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     print('Candidate:', output, flush=True)
 
