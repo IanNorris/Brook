@@ -55,8 +55,11 @@ bridge suite authenticates the operator to the guest.
 
 Open the generated `Brook.vmx` in Workstation. It connects one SATA disk and
 an e1000e adapter through a PCIe root port. It also enables the virtual HD
-Audio device for playback through the Brook mixer. The disk has a guarded EFI
-System Partition, two desktop slots, recovery boot files and an ext2 data partition.
+Audio device for stereo playback through the Brook mixer. The virtual driver
+uses the codec connection lists to find an analog output. The mixer keeps its
+44.1 kHz, 16-bit stereo format, and the controller supports direct 48 kHz,
+16-bit stereo PCM. The disk has a guarded EFI System Partition, two desktop
+slots, recovery boot files and an ext2 data partition.
 Brook admits writes only after checking the virtual disk's pinned GPT and
 ext2 identities and geometry. The manifest records those identities, the
 network mode, and hashes of the disk, boot files and public operator policy.

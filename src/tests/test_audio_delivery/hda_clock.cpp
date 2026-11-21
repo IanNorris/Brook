@@ -89,9 +89,54 @@ void finishPhysical() {
     VERIFY(!g_streamRunning);
 }
 }
+static void TestHdaPlaybackRoutes()
+{
+    using namespace brook;
+    constexpr uint32_t analogPin=(4u<<20)|HdaWidgetConnections;
+    constexpr uint32_t selector=(3u<<20)|HdaWidgetConnections;
+    constexpr uint32_t mixer=(2u<<20)|HdaWidgetConnections|HdaWidgetInputAmp;
+    uint32_t widgets[HdaNodeCount]{};
+    widgets[2]=HdaWidgetStereo;
+    widgets[3]=analogPin; // Reports an output type but has no output capability.
+    widgets[4]=selector;
+    widgets[5]=HdaWidgetStereo;
+    widgets[6]=mixer;
+    widgets[7]=analogPin;
+    auto read=[](uint8_t node,uint16_t verb,uint8_t arg,uint32_t& value) {
+        if (verb==HdaGetPinDefault) {
+            value=0;return true;
+        }
+        if (verb==HdaGetParameter && arg==HdaParamPinCaps) {
+            value=node==7 ? (1u<<4) : 0;return true;
+        }
+        if (verb==HdaGetParameter && arg==HdaParamConnections) {
+            value=node==4 ? 0x83 : node==6 ? 2 : 1;return true;
+        }
+        if (verb!=HdaGetConnections) return false;
+        if (node==7 && arg==0) { value=4;return true; }
+        if (node==6 && arg==0) { value=0x8604;return true; } // 4–6, including a cycle.
+        if (node==4 && arg==0) { value=0x00060001;return true; }
+        if (node==4 && arg==2) { value=8;return true; }
+        return false;
+    };
+    auto route=HdaFindPlaybackRoute(widgets,read);
+    VERIFY(route.count==4 && route.steps[0].node==5 && route.steps[3].node==7);
+    VERIFY(route.steps[1].node==6 && route.steps[1].input==1 && !route.steps[1].selectInput);
+    VERIFY(route.steps[2].node==4 && route.steps[2].input==1 && route.steps[2].selectInput);
+    VERIFY(!route.steps[3].selectInput);
+    widgets[5] |= HdaWidgetDigital;
+    VERIFY(HdaFindPlaybackRoute(widgets,read).count==0);
+    widgets[5] = HdaWidgetStereo;
+    auto malformed=[&](uint8_t node,uint16_t verb,uint8_t arg,uint32_t& value) {
+        if (node==6 && verb==HdaGetConnections) { value=0x0486;return true; }
+        return read(node,verb,arg,value);
+    };
+    VERIFY(HdaFindPlaybackRoute(widgets,malformed).count==0);
+}
 void HdaTestAfterCopy() { if(afterCopyHook) {auto hook=afterCopyHook;afterCopyHook=nullptr;hook();} }
 int RunHdaClockTests() {
     using namespace brook;
+    TestHdaPlaybackRoutes();
     auto platform = [](bool hypervisor, uint32_t ebx, uint32_t ecx, uint32_t edx) {
         return HdaPlaybackPlatform([&](uint32_t leaf, uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) {
             a=b=c=d=0;

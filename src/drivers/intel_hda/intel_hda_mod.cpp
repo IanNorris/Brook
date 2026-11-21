@@ -2,7 +2,7 @@
 //
 // Implements:
 //   - Controller reset and Immediate Command Interface (ICI) for codec verbs
-//   - Codec discovery (STATESTS) and basic widget enumeration
+//   - Codec discovery (STATESTS) and DAC-to-output-pin routing
 //   - Output stream 0 with Buffer Descriptor List (BDL) for PCM playback
 //   - Simple kernel API: HdaPlayPcm(samples, count, rate, channels, bits)
 //
@@ -15,6 +15,7 @@
 #include "kprintf.h"
 #include "audio.h"
 #include "audio_dma_clock.h"
+#include "hda_playback_route.h"
 #include "scheduler.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
@@ -165,34 +166,17 @@ static inline uint32_t HdaVerb4(uint8_t codec, uint8_t nid,
          | payload;
 }
 
-// Common get-parameter verb IDs (12-bit)
-static constexpr uint32_t VERB_GET_PARAM       = 0xF00;
-
-// Common set-parameter verb IDs
-static constexpr uint32_t VERB_SET_AMP_GAIN    = 0x3;  // 4-bit verb
-static constexpr uint32_t VERB_SET_PIN_CTRL    = 0x707;
-static constexpr uint32_t VERB_SET_EAPDBTL     = 0x70C;
+static constexpr uint32_t VERB_SET_CONNECT      = 0x701;
+static constexpr uint32_t VERB_SET_AMP_GAIN     = 0x3;  // 4-bit verb
+static constexpr uint32_t VERB_SET_PIN_CTRL     = 0x707;
+static constexpr uint32_t VERB_SET_EAPDBTL      = 0x70C;
 static constexpr uint32_t VERB_SET_POWER_STATE = 0x705;
 static constexpr uint32_t VERB_SET_CONV_STREAM = 0x706;
 static constexpr uint32_t VERB_SET_CONV_FMT    = 0x2;  // 4-bit verb
 
-// Parameter IDs (for VERB_GET_PARAM)
 static constexpr uint8_t PARAM_VENDOR_ID      = 0x00;
 static constexpr uint8_t PARAM_SUB_NODE_COUNT = 0x04;
 static constexpr uint8_t PARAM_FN_GROUP_TYPE  = 0x05;
-static constexpr uint8_t PARAM_WIDGET_CAPS    = 0x09;
-
-// Widget type from caps (bits 23:20)
-enum WidgetType : uint8_t {
-    WT_AUDIO_OUTPUT = 0,
-    WT_AUDIO_INPUT  = 1,
-    WT_AUDIO_MIXER  = 2,
-    WT_AUDIO_SELECT = 3,
-    WT_PIN_COMPLEX  = 4,
-    WT_POWER        = 5,
-    WT_VOLUME_KNOB  = 6,
-    WT_BEEP_GEN     = 7,
-};
 
 // ---------------------------------------------------------------------------
 // MMIO accessors
@@ -409,168 +393,97 @@ static bool HdaControllerReset()
 // Codec discovery and widget enumeration
 // ---------------------------------------------------------------------------
 
-static bool DiscoverCodec()
+static bool ReadCodec(uint8_t node, uint16_t verb, uint8_t arg, uint32_t& response)
 {
-    uint16_t statests = hda_read16(STATESTS);
-    if (!statests)
-    {
-        SerialPuts("intel_hda: no codecs detected (STATESTS=0)\n");
-        return false;
-    }
-
-    // Find first codec
-    for (int i = 0; i < 15; i++)
-    {
-        if (statests & (1 << i))
-        {
-            g_codecAddr = i;
-            break;
-        }
-    }
-
-    // Clear status
-    hda_write16(STATESTS, statests);
-
-    // Get vendor ID
-    uint32_t vendorId = 0;
-    if (HdaCommand(HdaVerb(g_codecAddr, 0, VERB_GET_PARAM, PARAM_VENDOR_ID), vendorId))
-    {
-        KPrintf("intel_hda: codec %d vendor=%04x device=%04x\n",
-                g_codecAddr, vendorId >> 16, vendorId & 0xFFFF);
-    }
-    else
-    {
-        SerialPrintf("intel_hda: codec %d — vendor ID query failed (CORB/RIRB timeout)\n",
-                     g_codecAddr);
-    }
-
-    return true;
+    return HdaCommand(HdaVerb(g_codecAddr, node, verb, arg), response);
 }
 
-static bool EnumerateWidgets()
+static bool NodeRange(uint8_t node, unsigned& first, unsigned& end)
 {
-    // Get root node's sub-node count
-    uint32_t response;
-    if (!HdaCommand(HdaVerb(g_codecAddr, 0, VERB_GET_PARAM, PARAM_SUB_NODE_COUNT), response))
-        return false;
+    uint32_t value = 0;
+    if (!ReadCodec(node, HdaGetParameter, PARAM_SUB_NODE_COUNT, value)) return false;
+    first = (value >> 16) & 0xff;
+    end = first + (value & 0xff);
+    return first && first < end && end <= HdaNodeCount;
+}
 
-    uint8_t startNid = (response >> 16) & 0xFF;
-    uint8_t count    = response & 0xFF;
+static bool UnmuteAmp(uint8_t afg, uint8_t nid, uint32_t widget, bool input, uint8_t index)
+{
+    const uint8_t parameter = input ? HdaParamInputAmpCaps : HdaParamOutputAmpCaps;
+    const uint8_t owner = (widget & HdaWidgetAmpOverride) ? nid : afg;
+    uint32_t amp = 0;
+    if (!ReadCodec(owner, HdaGetParameter, parameter, amp)) return false;
+    const uint16_t offset = amp & 0x7f;
+    const uint16_t steps = (amp >> 8) & 0x7f;
+    const uint16_t gain = offset < steps ? offset : steps;
+    const uint16_t direction = input ? (0x7000 | uint16_t(index) << 8) : 0xb000;
+    return HdaCommandNoResp(HdaVerb4(g_codecAddr, nid, VERB_SET_AMP_GAIN, direction | gain));
+}
 
-    HDA_VPRINTF("intel_hda: root node: start=%d count=%d\n", startNid, count);
-
-    // Find audio function group (type 1)
-    uint8_t afg = 0;
-    for (uint8_t i = 0; i < count; i++)
-    {
-        uint8_t nid = startNid + i;
-        if (!HdaCommand(HdaVerb(g_codecAddr, nid, VERB_GET_PARAM, PARAM_FN_GROUP_TYPE), response))
-            continue;
-
-        uint8_t groupType = response & 0xFF;
-        if (groupType == 1)
-        {
-            afg = nid;
-            HDA_VPRINTF("intel_hda: audio function group at NID %d\n", afg);
-            break;
-        }
+static bool ConfigureOutputPath(uint8_t afg, const HdaPlaybackRoute& route,
+                                const uint32_t (&widgets)[HdaNodeCount])
+{
+    for (unsigned i = 0; i < route.count; ++i) {
+        const auto& step = route.steps[i];
+        const uint32_t caps = widgets[step.node];
+        if ((caps & HdaWidgetPower) &&
+            !HdaCommandNoResp(HdaVerb(g_codecAddr, step.node, VERB_SET_POWER_STATE, 0))) return false;
+        if (step.selectInput &&
+            !HdaCommandNoResp(HdaVerb(g_codecAddr, step.node, VERB_SET_CONNECT, step.input))) return false;
+        if (i && (caps & HdaWidgetInputAmp) && !UnmuteAmp(afg, step.node, caps, true, step.input)) return false;
+        if ((caps & HdaWidgetOutputAmp) && !UnmuteAmp(afg, step.node, caps, false, 0)) return false;
     }
+    const uint8_t pin = route.steps[route.count - 1].node;
+    const uint8_t pinControl = route.pinCaps & (1u << 3) ? 0xc0 : 0x40;
+    if ((route.pinCaps & (1u << 16)) &&
+        !HdaCommandNoResp(HdaVerb(g_codecAddr, pin, VERB_SET_EAPDBTL, 0x02))) return false;
+    return HdaCommandNoResp(HdaVerb(g_codecAddr, pin, VERB_SET_PIN_CTRL, pinControl));
+}
 
-    if (!afg)
-    {
-        SerialPuts("intel_hda: no audio function group found\n");
-        return false;
-    }
-
-    // Power up the AFG
-    HdaCommandNoResp(HdaVerb(g_codecAddr, afg, VERB_SET_POWER_STATE, 0x00));
+static bool ConfigureAudioFunction(uint8_t afg)
+{
+    HdaCommandNoResp(HdaVerb(g_codecAddr, afg, VERB_SET_POWER_STATE, 0));
     BusyWait(10000);
+    unsigned first = 0, end = 0;
+    if (!NodeRange(afg, first, end)) return false;
 
-    // Get AFG's sub-nodes (widgets)
-    if (!HdaCommand(HdaVerb(g_codecAddr, afg, VERB_GET_PARAM, PARAM_SUB_NODE_COUNT), response))
-        return false;
-
-    startNid = (response >> 16) & 0xFF;
-    count    = response & 0xFF;
-
-    HDA_VPRINTF("intel_hda: AFG widgets: start=%d count=%d\n", startNid, count);
-
-    // Scan widgets for DAC and output pin
-    for (uint8_t i = 0; i < count; i++)
-    {
-        uint8_t nid = startNid + i;
-        if (!HdaCommand(HdaVerb(g_codecAddr, nid, VERB_GET_PARAM, PARAM_WIDGET_CAPS), response))
-            continue;
-
-        uint8_t wtype = (response >> 20) & 0xF;
-
-        if (wtype == WT_AUDIO_OUTPUT && g_dacNid == 0)
-        {
-            g_dacNid = nid;
-            HDA_VPRINTF("intel_hda: DAC at NID %d\n", nid);
-        }
-        else if (wtype == WT_PIN_COMPLEX && g_pinNid == 0)
-        {
-            // Get default pin configuration (verb 0xF1C)
-            uint32_t pinCfg;
-            if (HdaCommand(HdaVerb(g_codecAddr, nid, 0xF1C, 0x00), pinCfg))
-            {
-                // Default association in bits 7:4, sequence in bits 3:0
-                // Check default device type in bits 23:20
-                uint8_t defaultDevice = (pinCfg >> 20) & 0xF;
-                // 0=Line Out, 1=Speaker, 2=HP Out
-                if (defaultDevice <= 2)
-                {
-                    g_pinNid = nid;
-                    HDA_VPRINTF("intel_hda: output pin at NID %d (type=%d)\n",
-                                nid, defaultDevice);
-                }
-            }
-        }
+    uint32_t widgets[HdaNodeCount]{};
+    for (unsigned node = first; node < end; ++node) {
+        uint32_t caps = 0;
+        if (ReadCodec(static_cast<uint8_t>(node), HdaGetParameter, HdaParamWidgetCaps, caps) &&
+            caps != 0xffffffffu) widgets[node] = caps;
     }
-
-    if (!g_dacNid)
-    {
-        SerialPuts("intel_hda: no DAC widget found\n");
-        return false;
-    }
-
+    const auto route = HdaFindPlaybackRoute(widgets, ReadCodec);
+    if (!route.count || !ConfigureOutputPath(afg, route, widgets)) return false;
+    g_dacNid = route.steps[0].node;
+    g_pinNid = route.steps[route.count - 1].node;
+    SerialPrintf("intel_hda: playback route AFG=%u DAC=%u PIN=%u widgets=%u\n",
+                 unsigned(afg), unsigned(g_dacNid), unsigned(g_pinNid), route.count);
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// Configure output path: Pin → [Mixer] → DAC
-// ---------------------------------------------------------------------------
-
-static bool ConfigureOutputPath()
+static bool InitializeCodec()
 {
-    // Power up DAC
-    HdaCommandNoResp(HdaVerb(g_codecAddr, g_dacNid, VERB_SET_POWER_STATE, 0x00));
-
-    // Enable output pin
-    if (g_pinNid)
-    {
-        // Power up pin
-        HdaCommandNoResp(HdaVerb(g_codecAddr, g_pinNid, VERB_SET_POWER_STATE, 0x00));
-        // Set pin control: output enable (bit 6)
-        HdaCommandNoResp(HdaVerb(g_codecAddr, g_pinNid, VERB_SET_PIN_CTRL, 0x40));
-        // Enable EAPD if available
-        HdaCommandNoResp(HdaVerb(g_codecAddr, g_pinNid, VERB_SET_EAPDBTL, 0x02));
+    const uint16_t codecs = hda_read16(STATESTS) & 0x7fff;
+    hda_write16(STATESTS, codecs);
+    for (uint8_t codec = 0; codec < 15; ++codec) {
+        if (!(codecs & (1u << codec))) continue;
+        g_codecAddr = codec;
+        uint32_t id = 0;
+        if (!ReadCodec(0, HdaGetParameter, PARAM_VENDOR_ID, id) || !id || id == 0xffffffffu) continue;
+        SerialPrintf("intel_hda: codec %u vendor=%04x device=%04x\n",
+                     unsigned(codec), id >> 16, id & 0xffff);
+        unsigned first = 0, end = 0;
+        if (!NodeRange(0, first, end)) continue;
+        for (unsigned node = first; node < end; ++node) {
+            const auto afg = static_cast<uint8_t>(node);
+            uint32_t type = 0;
+            if (ReadCodec(afg, HdaGetParameter, PARAM_FN_GROUP_TYPE, type) &&
+                (type & 0xff) == 1 && ConfigureAudioFunction(afg)) return true;
+        }
     }
-
-    // Set DAC output amplifier gain (unmute, 0dB)
-    // Set output amp: left+right, output, gain=0x40 (varies by codec)
-    HdaCommandNoResp(HdaVerb4(g_codecAddr, g_dacNid, VERB_SET_AMP_GAIN,
-                               0xB040)); // output, L+R, gain=0x40
-
-    // Set pin output amp if it has one
-    if (g_pinNid)
-    {
-        HdaCommandNoResp(HdaVerb4(g_codecAddr, g_pinNid, VERB_SET_AMP_GAIN,
-                                   0xB040));
-    }
-
-    return true;
+    SerialPuts("intel_hda: no analog stereo playback route\n");
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -1334,19 +1247,8 @@ static int IntelHdaInit()
     if (!HdaControllerReset())
         return -1;
 
-    // Discover codecs
-    if (!DiscoverCodec())
+    if (!InitializeCodec())
         return -1;
-
-    // Enumerate widgets (uses ICI — no DMA needed)
-    if (!EnumerateWidgets())
-    {
-        SerialPuts("intel_hda: widget enumeration failed\n");
-        return -1;
-    }
-
-    // Configure output path
-    ConfigureOutputPath();
 
     // Allocate BDL (uncacheable for DMA)
     auto bdlPage = VmmAllocPagesAccounted(1, VMM_WRITABLE | VMM_CACHE_DISABLE, MemTag::Device, KernelPid, PmmOwner::HdaDma);
