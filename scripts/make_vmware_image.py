@@ -254,10 +254,13 @@ def main():
     parser.add_argument('--recovery-checkers-from', type=Path, required=True,
                         help='Standalone recovery initrd containing the pinned static FAT and ext2 checkers')
     parser.add_argument('--network', choices=('hostonly', 'nat'), default='hostonly')
-    parser.add_argument('--data-mib', type=int, default=6144)
+    parser.add_argument('--data-mib', type=int,
+                        help='store capacity in MiB (default: 6144 for the compatibility profile)')
+    parser.add_argument('--selection-config', type=Path,
+                        help='host-side app selection JSON from brook_image.py')
     parser.add_argument('--payload-id', default='vmware-persistent')
     args = parser.parse_args()
-    if not 1024 <= args.data_mib <= 32768:
+    if args.data_mib is not None and not 1024 <= args.data_mib <= 32768:
         parser.error('data-mib must be between 1024 and 32768')
     if not re.fullmatch(r'[A-Za-z0-9._-]{1,50}', args.payload_id):
         parser.error('Invalid payload ID')
@@ -269,6 +272,13 @@ def main():
     policy = args.operator_policy.read_bytes()
     validate_operator_policy(policy)
     checkers = args.recovery_checkers_from.resolve(strict=True)
+    selection = None
+    if args.selection_config:
+        from image_profile import evaluate
+        config = json.loads(args.selection_config.read_text())
+        if config.get("target") != "vmware":
+            parser.error("Selection target does not match VMware")
+        selection = evaluate(config)
     dest = args.output.resolve()
     dest.mkdir(parents=True, exist_ok=False, mode=0o700)
     work = dest / 'assembly'
@@ -276,9 +286,31 @@ def main():
     policy_path = work / 'operators.pub'
     policy_path.write_bytes(policy)
 
-    profile = Path(output('nix-build', '--no-out-link', PROFILE_EXPR, '-A', 'profile'))
+    profile_receipt = None
+    build = None
+    seed_args = []
+    if selection is None:
+        profile = Path(output('nix-build', '--no-out-link', PROFILE_EXPR, '-A', 'profile'))
+        data_mib = args.data_mib or 6144
+    else:
+        from image_profile import closure_receipt, data_size_mib, realize
+        from kernel_capabilities import read_kernel_capabilities, require_kernel_capabilities
+        build = build_kernel(work, policy_path)
+        kernel_capabilities = read_kernel_capabilities(build / 'BROOK.elf')
+        require_kernel_capabilities(kernel_capabilities, selection['manifest']['requiredCapabilities'])
+        profile = realize(config, selection)
+        closure = closure_receipt(profile)
+        data_mib = data_size_mib(closure['nar_bytes'], args.data_mib, 1024, 32768)
+        selection_path = dest / 'profile-selection.json'
+        selection_path.write_text(json.dumps(selection, indent=2, sort_keys=True) + '\n')
+        seed_args = ['--profile-selection', selection_path]
+        if args.data_mib is None:
+            seed_args += ['--auto-size']
+        profile_receipt = {'profile': str(profile), 'closure': closure,
+                           'kernel': kernel_capabilities,
+                           'redistributable': selection['manifest']['redistributable']}
     run(sys.executable, ROOT / 'scripts/prepare_hardware_store.py', '--profile', profile,
-        '--direct-ahci', '--size-mib', args.data_mib, '--output', work / 'profile')
+        '--direct-ahci', '--size-mib', data_mib, '--output', work / 'profile', *seed_args)
     data = work / 'profile/STORE.IMG'
     with data.open('rb') as file:
         file.seek(1024 + 104)
@@ -295,7 +327,8 @@ def main():
     records = {'ETC/ahci-observe': b'1\n', 'ETC/ahci-read-only': b'1\n',
                'ETC/ahci-vm-write-target': f'BRKAHCIVM1\n{total}\n'.encode(),
                'ETC/ahci-boot-volume': esp_selector.encode(), 'ETC/ahci-data-volume': data_selector.encode()}
-    build = build_kernel(work, policy_path)
+    if build is None:
+        build = build_kernel(work, policy_path)
     payload = {**get_checkers(checkers, work), **boot_helpers(build, work, policy_path), **records}
     desktop, recovery = make_initrds(work, build, payload, policy_path, profile, commit, args.payload_id)
     run(sys.executable, ROOT / 'scripts/build_dell_loader.py', '--shared', work,
@@ -317,6 +350,8 @@ def main():
               'operator_policy_sha256': digest(policy_path), 'loader_sha256': digest(efi),
               'kernel_sha256': digest(kernel), 'desktop_initrd_sha256': digest(desktop),
               'recovery_initrd_sha256': digest(recovery)}
+    if profile_receipt is not None:
+        report['profile_selection'] = profile_receipt
     (dest / 'manifest.json').write_text(json.dumps(report, indent=2) + '\n')
     for path in (raw, data, work / 'esp.img'):
         path.unlink()

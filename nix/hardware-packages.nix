@@ -1,16 +1,19 @@
 # Offline Dell bring-up payload: native Wayland/GTK apps and a real shell.
 # Deliberately excludes browsers, games, Mesa/LLVM and account/private data.
-{ pkgs ? import ./nixpkgs.nix { config.allowUnfree = false; } }:
+{ pkgs ? import ./nixpkgs.nix { config.allowUnfree = false; }, includeOfflineApps ? true }:
 let
   files = import ./desktop-files.nix { inherit pkgs; };
   fonts = import ../tools/brook-fonts-pkg {};
   cursors = import ../tools/brook-cursor-theme {};
-  native = map (name: let f = import (../tools + "/${name}"); in
-    f (if builtins.hasAttr "pkgs" (builtins.functionArgs f) then { inherit pkgs; } else {})) [
-    "waylandd-pkg" "wayland-calc-pkg"
-    "brook-settings-pkg" "brook-message-pkg" "brook-session-pkg"
-    "brook-apps-pkg" "brook-task-manager-pkg"
-  ];
+  nativePackage = name:
+    let f = import (../tools + "/${name}"); in
+    f (if builtins.hasAttr "pkgs" (builtins.functionArgs f) then { inherit pkgs; } else {});
+  native = [ (nativePackage "waylandd-pkg") ]
+    ++ pkgs.lib.optional includeOfflineApps (nativePackage "wayland-calc-pkg")
+    ++ map nativePackage [
+      "brook-settings-pkg" "brook-message-pkg" "brook-session-pkg"
+      "brook-apps-pkg" "brook-task-manager-pkg"
+    ];
   launchers = pkgs.runCommand "brook-hardware-launchers" {} ''
     mkdir -p $out/bin $out/share/applications
     cat > $out/bin/brook-run <<'SCRIPT'
@@ -27,7 +30,7 @@ let
     mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME"
     exec "$@"
     SCRIPT
-    for app in mousepad brook-settings wayland-calc brook-task-manager; do
+    for app in ${if includeOfflineApps then "mousepad brook-settings wayland-calc brook-task-manager" else "brook-settings brook-task-manager"}; do
       cat > $out/bin/hardware-$app <<SCRIPT
     #!${pkgs.bash}/bin/bash
     exec /nix/profile/bin/brook-run /nix/profile/bin/$app "\$@"
@@ -54,12 +57,16 @@ let
   '';
   packages = [
     pkgs.bashInteractive pkgs.coreutils pkgs.curl.bin pkgs.cacert pkgs.gnutar
-    pkgs.unzip pkgs.vim pkgs.xfce.mousepad pkgs.tzdata pkgs.xwayland
+    pkgs.unzip pkgs.vim
+  ] ++ pkgs.lib.optional includeOfflineApps pkgs.xfce.mousepad ++ [
+    pkgs.tzdata pkgs.xwayland
     # Steam's game-runtime entry point uses util-linux getopt before entering
     # its container; ship it in the profile rather than relying on /usr/bin.
     (pkgs.lib.getBin pkgs.util-linuxMinimal)
     pkgs.hicolor-icon-theme pkgs.adwaita-icon-theme pkgs.kdePackages.breeze-icons pkgs.shared-mime-info
-    fonts cursors launchers files.integration files.gvfs (import ./desktop-settings.nix { inherit pkgs; inherit (files) nautilus; })
+    fonts cursors launchers
+  ] ++ pkgs.lib.optionals includeOfflineApps [ files.integration files.gvfs ] ++ [
+    (import ./desktop-settings.nix { inherit pkgs; inherit (files) nautilus; })
   ] ++ native;
 in {
   inherit packages;

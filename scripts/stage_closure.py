@@ -11,9 +11,13 @@ import urllib.request
 from urllib.parse import quote
 from pathlib import Path
 
+from image_profile import load_selection, verify_realized_selection
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools/nix-install"))
 from stage_nar import STORE, UPSTREAM, layout_digest, nar_hash, profile_layout, store_name
+from stage_selected_launchers import validate_launcher_ids
+from stage_selected_space import layout_usage, tree_inodes
 
 EXPRESSION = ROOT / "nix/hardware-network-packages.nix"
 NIX = ["nix", "--extra-experimental-features", "nix-command"]
@@ -60,7 +64,9 @@ def upstream_has(name, entry):
     )
 
 
-def generate_plan(profile, extras, cache_url, mirror_upstream, packages=()):
+def generate_plan(profile, extras, cache_url, mirror_upstream, packages=(), *, launcher_ids=None):
+    if launcher_ids is not None:
+        validate_launcher_ids(launcher_ids)
     roots = list(dict.fromkeys(
         [str(profile), *map(str, extras), *(str(STORE / row["store"]) for row in packages)]
     ))
@@ -69,17 +75,25 @@ def generate_plan(profile, extras, cache_url, mirror_upstream, packages=()):
         checks = pool.map(lambda name: upstream_has(name, closure[name]), sorted(closure))
         for name, upstream in zip(sorted(closure), checks):
             closure[name]["source"] = "upstream" if upstream else "brook"
-    return {
+    layout = profile_layout(profile, closure)
+    plan = {
         "format": 2,
         "roots": [store_name(path) for path in roots],
         "closure": closure,
         "profile": {
             "root": store_name(str(profile)),
-            "layoutSha256": layout_digest(profile_layout(profile, closure)),
+            "layoutSha256": layout_digest(layout),
         },
         "packages": list(packages),
         "cache": {"brook": cache_url, "mirrorUpstream": mirror_upstream},
     }
+    if launcher_ids is not None:
+        plan["format"] = 3
+        plan["profile"]["launcherIds"] = launcher_ids
+        plan["profile"]["space"] = layout_usage(layout)
+        for name, entry in closure.items():
+            entry["storeInodes"] = tree_inodes(STORE / name)
+    return plan
 
 
 def publish_cache(info, directory, key, mirror_upstream):
@@ -131,11 +145,27 @@ def profile_metadata(expression):
     return json.loads(metadata.stdout)
 
 
+def selected_profile(receipt, requested=None):
+    selection = load_selection(receipt, requested)
+    profile = verify_realized_selection(selection)
+    exported = {entry.stem for entry in (profile / "share/applications").glob("*.desktop")
+                if entry.is_file()}
+    launcher_ids = selection["manifest"]["launcherIds"]
+    validate_launcher_ids(launcher_ids)
+    if exported != set(launcher_ids):
+        raise ValueError("Selected profile's desktop files differ from its launcher manifest")
+    return profile, selection["packages"], launcher_ids
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", type=Path, help="defaults to the network hardware profile")
-    parser.add_argument("--expression", type=Path,
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--expression", type=Path,
                         help="profile expression providing package names and versions")
+    source.add_argument("--profile-selection", type=Path,
+                        help="realized profile-selection.json from brook_image.py "
+                             "(requires a guest helper installed with --selected-profiles)")
     parser.add_argument("extras", nargs="*", type=Path)
     parser.add_argument("--output", required=True, type=Path)
     delivery = parser.add_mutually_exclusive_group(required=True)
@@ -150,25 +180,33 @@ def main():
 
     for key in (args.cache_key, args.plan_key):
         verify_private_key(key)
-    expression = (args.expression or EXPRESSION).resolve(strict=True)
-    if args.profile is None:
-        built = run(["nix-build", str(expression), "-A", "profile", "--no-out-link"],
-                    stdout=subprocess.PIPE, text=True)
-        profile = Path(built.stdout.strip())
+    launcher_ids = None
+    if args.profile_selection is not None:
+        try:
+            profile, packages, launcher_ids = selected_profile(args.profile_selection, args.profile)
+        except (KeyError, OSError, TypeError, ValueError) as error:
+            parser.error(f"Invalid profile selection: {error}")
     else:
-        profile = args.profile
-    profile = profile.resolve(strict=True)
-    packages = []
-    if args.profile is None or args.expression is not None:
-        metadata = profile_metadata(expression)
-        if str(profile) != metadata["profile"]:
-            parser.error("The profile does not match the expression")
-        packages = metadata["packages"]
+        expression = (args.expression or EXPRESSION).resolve(strict=True)
+        if args.profile is None:
+            built = run(["nix-build", str(expression), "-A", "profile", "--no-out-link"],
+                        stdout=subprocess.PIPE, text=True)
+            profile = Path(built.stdout.strip())
+        else:
+            profile = args.profile
+        profile = profile.resolve(strict=True)
+        packages = []
+        if args.profile is None or args.expression is not None:
+            metadata = profile_metadata(expression)
+            if str(profile) != metadata["profile"]:
+                parser.error("The profile does not match the expression")
+            packages = metadata["packages"]
     extras = [path.resolve(strict=True) for path in args.extras]
     output = args.output.absolute()
     output.mkdir(mode=0o700, parents=True, exist_ok=False)
     cache_url = args.cache_url.rstrip("/") if args.cache_url else None
-    plan = generate_plan(profile, extras, cache_url, args.mirror_upstream, packages)
+    plan = generate_plan(profile, extras, cache_url, args.mirror_upstream, packages,
+                         launcher_ids=launcher_ids)
     publish_cache(plan["closure"], output / "cache", args.cache_key.resolve(), args.mirror_upstream)
     document = output / "stage-plan.json"
     document.write_text(json.dumps(plan, sort_keys=True, separators=(",", ":")) + "\n")

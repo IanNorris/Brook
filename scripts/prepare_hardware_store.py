@@ -21,10 +21,14 @@ import uuid
 from ext2_image_export import Source
 
 from collect_desktop_entries import collect
+from selected_launchers import collect_selected
 
 ROOT = Path(__file__).resolve().parents[1]
+MIB = 1024 * 1024
 FAT_FILE_MAX = 0xfffffe00
+MIN_FREE = 512 * MIB
 INTEL_VULKAN_DIR = 'system/graphics/intel-vulkan-26.0.6-brook1'
+STAGE_GENERATION = '/var/.brook-profiles/.brook-profile-legacy'
 
 
 def run(*argv, **kwargs):
@@ -126,18 +130,118 @@ def remove_seed(seed):
     shutil.rmtree(seed)
 
 
+def free_space(image):
+    with image.open('rb') as stream:
+        stream.seek(1024)
+        return struct.unpack_from('<I', stream.read(1024), 12)[0] * 4096
+
+
+def tree_entries(root):
+    return 1 + sum(len(dirs) + len(files)
+                   for _, dirs, files in os.walk(root, followlinks=False))
+
+
+def profile_generation_footprint(image):
+    source = Source(image)
+    try:
+        nodes = source.inventory(STAGE_GENERATION)['nodes']
+        inodes = {meta['ino'] for meta in nodes.values()}
+        # ext2 i_blocks counts 512-byte sectors, including indirect blocks.
+        sectors = sum(struct.unpack_from('<I', source.inode(ino)[1], 28)[0] for ino in inodes)
+        return {'inodes': len(inodes), 'bytes': sectors * 512}
+    finally:
+        source.close()
+
+
+def free_inodes(image):
+    with image.open('rb') as stream:
+        stream.seek(1024 + 16)
+        return struct.unpack('<I', stream.read(4))[0]
+
+
+def grow_selected_store(image, size, limit, auto, required_free=MIN_FREE):
+    free = free_space(image)
+    required_mib = (required_free + MIB - 1) // MIB
+    while free < required_free:
+        minimum = (size + required_free - free + MIB - 1) // MIB
+        if not auto or minimum * MIB > limit:
+            raise ValueError(f'Selected store needs at least {minimum} MiB to leave {required_mib} MiB '
+                             'for staging and package installs')
+        # Growth itself allocates more group metadata. Try with a little
+        # additional room before normalizing ownership on the final image.
+        grown = min((minimum + 8) * MIB, limit // MIB * MIB)
+        if grown <= size:
+            raise ValueError(f'Selected store cannot leave {required_mib} MiB free within {limit // MIB} MiB')
+        with image.open('r+b') as stream:
+            stream.truncate(grown)
+        run('resize2fs', image)
+        size = grown
+        free = free_space(image)
+    return size
+
+
+def format_store(image, size, seed, identifier, inodes, limit, auto, *, selected=False):
+    args = ['mke2fs', '-q', '-t', 'ext2', '-b', '4096', '-I', '128', '-m', '0',
+            '-N', str(inodes), '-O', 'none,filetype,sparse_super,large_file',
+            '-U', identifier, '-L', 'BRKDESKTOP', '-d', seed, image]
+    requested = size
+    while True:
+        with image.open('wb') as stream:
+            stream.truncate(size)
+        if not auto and not selected:
+            run(*args)
+            return size
+        result = subprocess.run(list(map(str, args)), cwd=ROOT, text=True, capture_output=True,
+                                env=dict(os.environ, LC_ALL='C'))
+        if result.returncode == 0:
+            if not auto and size > requested:
+                try:
+                    generation = profile_generation_footprint(image)
+                    recommended = grow_selected_store(image, size, limit, True,
+                                                      MIN_FREE + generation['bytes'])
+                finally:
+                    image.unlink()
+                raise ValueError(f'Selected store needs at least {recommended // MIB} MiB '
+                                 'for the image, staging and package installs')
+            if result.stderr:
+                print(result.stderr, end='')
+            return size
+        # mke2fs can run out of space before writing a complete filesystem.
+        # Retry only that condition, on our own private image file.
+        grown = min(size + max(size // (4 * MIB), 128) * MIB, limit // MIB * MIB)
+        exhausted = any(f'Could not allocate {item}' in result.stderr for item in ('block', 'inode'))
+        if not exhausted:
+            raise ValueError(f'Could not format selected store at {size // MIB} MiB: {result.stderr.strip()}')
+        if grown <= size:
+            raise ValueError(f'Selected store cannot fit within the {limit // MIB} MiB target limit')
+        size = grown
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--profile', type=Path, required=True)
-    parser.add_argument('--expression', type=Path, default=ROOT/'nix/hardware-network-packages.nix')
+    parser.add_argument('--profile', type=Path)
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument('--expression', type=Path, help='Profile package expression (default: hardware network)')
+    source.add_argument('--profile-selection', type=Path, help='Metadata for the realized selected-app profile')
     parser.add_argument('--index', type=Path, default=ROOT/'tools/nix-index/packages.idx')
     parser.add_argument('--size-mib', type=int, default=3840)
+    parser.add_argument('--auto-size', action='store_true',
+                        help='Allow a selected profile to grow beyond its estimated size')
     parser.add_argument('--direct-ahci', action='store_true',
                         help='Allow a larger image for a direct partition, outside a FAT32 file')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
-    profile = args.profile.resolve(strict=True)
-    expression = args.expression.resolve(strict=True)
+    if args.auto_size and not args.profile_selection:
+        parser.error('--auto-size requires --profile-selection')
+    selection = None
+    if args.profile_selection:
+        from image_profile import load_selection, verify_realized_selection
+        selection = load_selection(args.profile_selection, args.profile)
+        profile = verify_realized_selection(selection)
+    elif args.profile:
+        profile = args.profile.resolve(strict=True)
+    else:
+        parser.error('Specify --profile or --profile-selection')
     index = args.index.resolve(strict=True)
     index_metadata = json.loads(Path(str(index)+'.json').read_text())
     if (index_metadata.get('format') != 1 or
@@ -146,11 +250,11 @@ def main():
         index_metadata.get('system') != 'x86_64-linux' or
         index_metadata.get('allow_unfree') is not False):
         parser.error('Index provenance must match Brook\'s pinned x86_64-linux free package set; regenerate with tools/nix-index/gen-nix-index.py')
-    size = args.size_mib*1024*1024
+    size = args.size_mib * MIB
     if profile.parent != Path('/nix/store') or not profile.is_dir():
         parser.error('Profile must resolve to a built Nix store directory')
     limit = 32 * 1024 * 1024 * 1024 if args.direct_ahci else FAT_FILE_MAX
-    if not 512 * 1024 * 1024 <= size <= limit:
+    if not MIN_FREE <= size <= limit:
         parser.error('Image size is out of range for the selected disk layout')
     compiler = os.environ.get('MUSL_CC')
     if not compiler:
@@ -160,13 +264,19 @@ def main():
     closure = subprocess.check_output(['nix-store', '-qR', str(profile)], text=True).splitlines()
     if not closure or any(Path(p).parent != Path('/nix/store') for p in closure):
         raise ValueError('Invalid Nix closure')
-    nix = ('let e = import (builtins.toPath '+json.dumps(str(expression))+') {}; in '
-           '{ profile = toString e.profile; packages = map (p: { '
-           'name = p.pname or p.name; version = p.version or ""; '
-           'store = builtins.baseNameOf (toString p); }) e.packages; '
-           'intelVulkanDriver = if e ? intelVulkanDriver then toString e.intelVulkanDriver else null; }')
-    metadata = json.loads(subprocess.check_output(
-        ['nix-instantiate', '--eval', '--strict', '--json', '-E', nix], text=True))
+    if selection:
+        metadata = selection
+        if any(str(Path('/nix/store') / row['store']) not in closure for row in metadata['packages']):
+            raise ValueError('Selected package metadata refers outside the profile closure')
+    else:
+        expression = (args.expression or ROOT/'nix/hardware-network-packages.nix').resolve(strict=True)
+        nix = ('let e = import (builtins.toPath '+json.dumps(str(expression))+') {}; in '
+               '{ profile = toString e.profile; packages = map (p: { '
+               'name = p.pname or p.name; version = p.version or ""; '
+               'store = builtins.baseNameOf (toString p); }) e.packages; '
+               'intelVulkanDriver = if e ? intelVulkanDriver then toString e.intelVulkanDriver else null; }')
+        metadata = json.loads(subprocess.check_output(
+            ['nix-instantiate', '--eval', '--strict', '--json', '-E', nix], text=True))
     if metadata['profile'] != str(profile):
         raise ValueError('Expression and profile do not match')
     (output/'closure.txt').write_text('\n'.join(sorted(closure))+'\n')
@@ -216,32 +326,44 @@ def main():
     (seed/'profile/manifest.tsv').write_text('\n'.join(sorted(set(rows)))+'\n')
     # collect_desktop_entries resolves guest /nix paths against the seed and
     # uses only the profile exports, avoiding uninstalled closure-only entries.
-    collect(seed/'store', seed/'share/applications', hardware=True)
+    if selection:
+        collect_selected(seed/'store', seed/'share/applications', profile,
+                         selection['manifest']['launcherIds'], hardware=True)
+    else:
+        collect(seed/'store', seed/'share/applications', hardware=True)
     (seed/'BROOK.MNT').write_text('/nix\n')
     identity = {'profile': str(profile), 'closure': sorted(closure),
                 'index_sha256': digest(index), 'index_metadata': index_metadata, 'tools': tools,
                 'intel_vulkan': intel_vulkan,
                 'builder_sha256': digest(Path(__file__))}
+    if selection:
+        identity['profile_selection'] = selection
     identifier = str(uuid.uuid5(uuid.NAMESPACE_URL, json.dumps(identity, sort_keys=True)))
     (seed/'.brook-store.json').write_text(json.dumps({'format': 1, 'uuid': identifier, **identity}, indent=2)+'\n')
     image = output/'STORE.IMG'
-    with image.open('xb') as stream:
-        stream.truncate(size)
+    image.touch(exist_ok=False)
     inodes = 131072
-    if args.direct_ahci:
+    if args.direct_ahci or selection:
         # The desktop closure can have hundreds of thousands of small files
         # and symlinks. Leave room for later Gallery installs as well.
-        entries = 1 + sum(len(dirs) + len(files)
-                          for _, dirs, files in os.walk(seed, followlinks=False))
-        inodes = max(size // 32768, entries + max(32768, entries // 8))
-    run('mke2fs', '-q', '-t', 'ext2', '-b', '4096', '-I', '128', '-m', '0',
-        '-N', str(inodes), '-O', 'none,filetype,sparse_super,large_file',
-        '-U', identifier, '-L', 'BRKDESKTOP', '-d', seed, image)
+        entries = tree_entries(seed)
+        reserve = tree_entries(seed/STAGE_GENERATION.lstrip('/')) if selection else 0
+        inodes = max(size // 32768, entries + max(32768, entries // 8) + reserve)
+    size = format_store(image, size, seed, identifier, inodes, limit, args.auto_size,
+                        selected=selection is not None)
+    generation_reserve = None
+    if selection:
+        # A stage creates a complete generation before replacing the alias.
+        # Reserve its observed on-disk allocation as well as package headroom.
+        generation_reserve = profile_generation_footprint(image)
+        size = grow_selected_store(image, size, limit, args.auto_size,
+                                   MIN_FREE + generation_reserve['bytes'])
+        if free_inodes(image) < generation_reserve['inodes']:
+            raise ValueError(f"Selected store needs at least {generation_reserve['inodes']} free inodes "
+                             "to stage another profile generation")
     inventory = normalize_owners(image, output)
-    with image.open('rb') as stream:
-        stream.seek(1024);sb = stream.read(1024)
-    free_bytes = struct.unpack_from('<I', sb, 12)[0]*4096
-    if free_bytes < 512*1024*1024:
+    free_bytes = free_space(image)
+    if free_bytes < MIN_FREE:
         raise ValueError('Insufficient free space for package installation')
     with (output/'e2fsck.log').open('x') as log:
         run('e2fsck', '-fn', image, stdout=log, stderr=subprocess.STDOUT)
@@ -251,6 +373,9 @@ def main():
               'namespace': inventory['summary'], 'writable_profile_directories': True,
               'home_path': '/nix/home/brook', 'home_uid': 1000,
               'physical_status': 'not provisioned; boot wiring and USB QEMU acceptance required'}
+    if generation_reserve is not None:
+        result['stage_generation_reserve'] = generation_reserve
+        result['free_inodes'] = free_inodes(image)
     (output/'manifest.json').write_text(json.dumps(result, indent=2)+'\n')
     remove_seed(seed)
     print('HARDWARE_WRITABLE_STORE_PREPARED', output, flush=True)

@@ -9,7 +9,8 @@ static bool has(const char* const* env,const char* value) {
 int main() {
     constexpr const char* base[]={"HOME=/home/test","MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu",
         "VK_DRIVER_FILES=/mesa/virtio.json","LIBGL_DRIVERS_PATH=/mesa/dri",
-        "GBM_BACKENDS_PATH=/mesa/gbm","__EGL_VENDOR_LIBRARY_DIRS=/mesa/egl",nullptr};
+        "GBM_BACKENDS_PATH=/mesa/gbm","__EGL_VENDOR_LIBRARY_DIRS=/mesa/egl",
+        "FONTCONFIG_FILE=/store/fonts.conf","FONTCONFIG_PATH=/store/fontconfig",nullptr};
     constexpr DesktopMesaPaths alternate{"LIBGL_DRIVERS_PATH=/other/dri",
         "GBM_BACKENDS_PATH=/other/gbm","__EGL_VENDOR_LIBRARY_DIRS=/other/egl"};
     constexpr auto virtio=DesktopBuildGpuEnvironment(base,true,true);
@@ -47,4 +48,11 @@ int main() {
     assert(!DesktopTrustedGpuPath(0,0755,false,true,false));
     assert(!DesktopTrustedGpuPath(0,0755,false,false,true));
     assert(has(virtioWithAlternate.entries,"LIBGL_DRIVERS_PATH=/mesa/dri"));
+    assert(has(other.forProfile(false),"FONTCONFIG_FILE=/store/fonts.conf"));
+    assert(has(other.forProfile(false),"FONTCONFIG_PATH=/store/fontconfig"));
+    assert(!has(other.forProfile(true),"FONTCONFIG_FILE=/store/fonts.conf"));
+    assert(!has(other.forProfile(true),"FONTCONFIG_PATH=/store/fontconfig"));
+    assert(has(other.forProfile(true),"FONTCONFIG_FILE=/nix/profile/etc/fonts/brook-selected.conf"));
+    assert(has(dell.forProfile(true),"FONTCONFIG_PATH=/nix/profile/etc/fonts"));
+    assert(has(dell.forProfile(true),"LIBGL_DRIVERS_PATH=/other/dri"));
 }
