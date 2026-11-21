@@ -716,7 +716,7 @@ int64_t sys_brook_wm_get_screen_info(uint64_t outAddr, uint64_t, uint64_t,
 {
     if (!UserBufferWritable(outAddr, 8)) return -EFAULT;
     uint32_t w = 0, h = 0;
-    brook::CompositorGetPhysDims(&w, &h);
+    brook::CompositorSnapshotPhysDims(&w, &h);
     uint32_t* out = reinterpret_cast<uint32_t*>(outAddr);
     out[0] = w;
     out[1] = h;

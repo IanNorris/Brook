@@ -80,6 +80,7 @@ CompositorUploadStats CompositorReadUploads();
 
 // Get physical framebuffer dimensions.
 extern "C" void CompositorGetPhysDims(uint32_t* w, uint32_t* h);
+void CompositorSnapshotPhysDims(uint32_t* w, uint32_t* h);
 
 // Get physical framebuffer pointer and stride (for kernel threads that
 // need direct FB access, e.g. clock overlay).

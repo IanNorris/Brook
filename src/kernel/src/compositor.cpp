@@ -1299,6 +1299,12 @@ void CompositorGetPhysDims(uint32_t* w, uint32_t* h)
     if (h) *h = g_physFbHeight;
 }
 
+void CompositorSnapshotPhysDims(uint32_t* w, uint32_t* h)
+{
+    CompositorMutexGuard geometry(&g_scanoutMappingLock);
+    CompositorGetPhysDims(w, h);
+}
+
 volatile uint32_t* CompositorGetPhysFb(uint32_t* stride)
 {
     if (stride) *stride = g_physFbStride;
@@ -4305,7 +4311,7 @@ static bool GopShadowEnsure()
     g_gopShadowWidth=g_physFbWidth;g_gopShadowHeight=g_physFbHeight;
     return true;
 }
-static void CompositorFlipSoftware(bool clientFrame = false)
+static void CompositorFlipSoftware(bool clientFrame = false, bool hardwareCursor = false)
 {
     CompositorMutexGuard geometry(&g_scanoutMappingLock);
 #if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
@@ -4318,8 +4324,16 @@ static void CompositorFlipSoftware(bool clientFrame = false)
 #endif
     const uint64_t tick=ApicTickCount();
     // Another writer owns the framebuffer: what it holds is no longer ours.
-    if(g_gopWriter || g_presentLease.Active(tick)){if(g_gopShadowValid)GopShadowInvalidate();return;}
-    if(!g_physFb || !g_backBuffer || (!full && g_dirtyMinY>=g_dirtyMaxY))return;
+    if(g_gopWriter || g_presentLease.Active(tick)){
+        if (hardwareCursor) DisplayPrepareCursor(nullptr, 0, 0);
+        if(g_gopShadowValid)GopShadowInvalidate();
+        return;
+    }
+    if(!g_physFb || !g_backBuffer)return;
+    if (!full && g_dirtyMinY >= g_dirtyMaxY) {
+        if (hardwareCursor) DisplayCommitCursor();
+        return;
+    }
     // The lease ended during this frame: its back buffer lacks the taskbar.
     // Keep the dirty span; the next frame repaints fully before scanout.
     if(g_backBufferOverlayOmitted)return;
@@ -4366,6 +4380,7 @@ static void CompositorFlipSoftware(bool clientFrame = false)
         ++g_softwareTakeover.count;
         g_softwareTakeover.lastAgeMs=tick-g_leasedFrameTick;
     }
+    if (hardwareCursor) DisplayCommitCursor();
     g_scanoutContainsLeasedFrame=false;
     if(minY==0 && maxY==g_physFbHeight)g_scanoutNeedsRepair=false;
 }
@@ -4538,8 +4553,9 @@ static void CompositorLoop()
     }
     } // end legacy mode
 
-    // Draw mouse cursor on top of everything (CPU path only — GPU mode blits
-    // the cursor as a sprite in CompositorPresentGPU).
+    // Stage a display cursor while the old software cursor is restored. A
+    // newly visible plane is committed after those restored rows reach scanout.
+    bool hardwareCursor = false;
     if (MouseIsAvailable() && cursorVisibleThisFrame && !CompositorGpuActive()
 #if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
         && !brook::BdwCursorBlocksSoftware()
@@ -4548,13 +4564,17 @@ static void CompositorLoop()
     {
         int32_t mx, my;
         MouseGetPosition(&mx, &my);
-        // CursorDraw applies hotspot internally; dirty region needs hotspot-adjusted coords
-        int32_t drawY = my - g_cursorFrame.hotY;
-        uint32_t newMinY = (drawY >= 0) ? static_cast<uint32_t>(drawY) : 0;
-        uint32_t newMaxY = static_cast<uint32_t>(drawY) + g_cursorFrame.height;
-        if (newMaxY > g_physFbHeight) newMaxY = g_physFbHeight;
-        MarkDirtyRows(newMinY, newMaxY);
-        CursorDraw(mx, my);
+        const bool displayOwned = !g_gopWriter && !g_presentLease.Active(ApicTickCount());
+        hardwareCursor = DisplayPrepareCursor(displayOwned ? &g_cursorFrame : nullptr, mx, my);
+        if (!hardwareCursor) {
+            const int32_t drawY = my - g_cursorFrame.hotY;
+            const int32_t endY = drawY + static_cast<int32_t>(g_cursorFrame.height);
+            if (endY > 0) MarkDirtyRows(drawY < 0 ? 0u : static_cast<uint32_t>(drawY),
+                                        static_cast<uint32_t>(endY));
+            CursorDraw(mx, my);
+        }
+    } else {
+        DisplayPrepareCursor(nullptr, 0, 0);
     }
 
     // Draw uptime clock overlay (only in legacy/non-WM mode — WM uses taskbar clock).
@@ -4593,7 +4613,7 @@ static void CompositorLoop()
     // Flip: copy only dirty scanlines from backbuffer → MMIO framebuffer.
     else
     {
-        CompositorFlipSoftware(clientFrame);
+        CompositorFlipSoftware(clientFrame, hardwareCursor);
     }
 
     const uint64_t probePresentEnd=ApicTickCount();

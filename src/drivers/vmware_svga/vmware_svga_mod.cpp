@@ -11,6 +11,7 @@
 #include "serial.h"
 #include "tty.h"
 #include "svga_fifo.h"
+#include "svga_cursor.h"
 
 MODULE_IMPORT_SYMBOL(PciFindDevice);
 MODULE_IMPORT_SYMBOL(PciConfigRead16);
@@ -25,6 +26,7 @@ MODULE_IMPORT_SYMBOL(VmmVirtToPhys);
 MODULE_IMPORT_SYMBOL(PmmFreePage);
 MODULE_IMPORT_SYMBOL(KernelPageTable);
 MODULE_IMPORT_SYMBOL(DisplayRegister);
+MODULE_IMPORT_SYMBOL(DisplayRegisterCursor);
 MODULE_IMPORT_SYMBOL(CompositorRemapLinearDisplay);
 MODULE_IMPORT_SYMBOL(TtyGetFramebufferPhys);
 MODULE_IMPORT_SYMBOL(KPrintf);
@@ -44,7 +46,15 @@ enum Register : uint32_t {
     BitsPerPixel = 7, RedMask = 9, GreenMask = 10, BlueMask = 11, Stride = 12,
     FbStart = 13, FbOffset = 14, VramSize = 15, FbSize = 16, Capabilities = 17,
     FifoStart = 18, FifoSize = 19, ConfigDone = 20, Sync = 21,
+    CursorId = 24, CursorX = 25, CursorY = 26, CursorOn = 27,
 };
+
+constexpr uint32_t CapCursorBypass2 = 1 << 7;
+constexpr uint32_t CapAlphaCursor = 1 << 9;
+constexpr uint32_t CapExtendedFifo = 1 << 15;
+constexpr uint32_t FifoCapabilities = 4;
+constexpr uint32_t FifoCursorOn = 9, FifoCursorX = 10, FifoCursorY = 11, FifoCursorCount = 12;
+constexpr uint32_t FifoCapCursorBypass3 = 1 << 4;
 
 struct Aperture {
     uint32_t base;
@@ -62,6 +72,11 @@ struct Driver {
     bool lock = false;
     bool changingMode = false, fullRefresh = false;
     uint32_t firstPending = 0, endPending = 0;
+    bool cursorBypass3 = false, alphaCursor = false;
+    bool cursorUploaded = false, cursorPending = false, cursorVisible = false;
+    int32_t cursorX = 0, cursorY = 0, visibleX = 0, visibleY = 0;
+    CursorImage cursorImage{};
+    uint32_t cursorWords[svga::CursorCommandWords]{};
 };
 
 Driver g;
@@ -83,6 +98,7 @@ uint32_t Read(Register index)
 }
 
 bool TryLock() { return !__atomic_exchange_n(&g.lock, true, __ATOMIC_ACQUIRE); }
+void Lock() { while (!TryLock()) asm volatile("pause" ::: "memory"); }
 void Unlock() { __atomic_store_n(&g.lock, false, __ATOMIC_RELEASE); }
 
 bool SizedAperture(unsigned bar, Aperture& result)
@@ -173,27 +189,105 @@ void ProgramMode(uint32_t width, uint32_t height)
     Write(Enable, 1);
 }
 
-bool PublishUpdate(uint32_t first, uint32_t end)
+bool PublishWords(const uint32_t* words, uint32_t count)
 {
-    uint32_t words[5];
-    if (!svga::UpdateSpan(g.mode, first, end, words)) return true;
     svga::FifoWindow window{g.fifo[svga::FifoMin], g.fifo[svga::FifoMax],
                             g.fifo[svga::FifoNext], g.fifo[svga::FifoStop]};
-    if (!svga::FifoCanWrite(window, g.fifoBytes, sizeof(words) / sizeof(words[0]))) {
+    if (!svga::FifoCanWrite(window, g.fifoBytes, count)) {
         Write(Sync, 1);
         window.stop = g.fifo[svga::FifoStop];
-        if (!svga::FifoCanWrite(window, g.fifoBytes, sizeof(words) / sizeof(words[0])))
+        if (!svga::FifoCanWrite(window, g.fifoBytes, count))
             return false;
     }
     uint32_t cursor = window.next;
-    for (uint32_t word : words) {
-        g.fifo[cursor / sizeof(uint32_t)] = word;
+    for (uint32_t i = 0; i < count; ++i) {
+        g.fifo[cursor / sizeof(uint32_t)] = words[i];
         cursor = svga::FifoAdvance(window, cursor);
     }
     asm volatile("sfence" ::: "memory");
     g.fifo[svga::FifoNext] = cursor;
     Write(Sync, 1);
     return true;
+}
+
+bool PublishUpdate(uint32_t first, uint32_t end)
+{
+    uint32_t words[5];
+    return !svga::UpdateSpan(g.mode, first, end, words) || PublishWords(words, 5);
+}
+
+void SetCursorPosition(bool visible, int32_t x, int32_t y)
+{
+    if (g.cursorBypass3) {
+        g.fifo[FifoCursorX] = uint32_t(x);
+        g.fifo[FifoCursorY] = uint32_t(y);
+        g.fifo[FifoCursorOn] = visible;
+        asm volatile("sfence" ::: "memory");
+        g.fifo[FifoCursorCount] = g.fifo[FifoCursorCount] + 1;
+    } else {
+        Write(CursorX, uint32_t(x));
+        Write(CursorY, uint32_t(y));
+        Write(CursorOn, visible);
+    }
+    g.visibleX = x;
+    g.visibleY = y;
+    g.cursorVisible = visible;
+}
+
+void HideCursor()
+{
+    g.cursorPending = false;
+    if (g.cursorVisible) SetCursorPosition(false, g.visibleX, g.visibleY);
+}
+
+bool PrepareCursor(const CursorImage* image, int32_t x, int32_t y)
+{
+    Lock();
+    bool handled = false;
+    if (image && !__atomic_load_n(&g.changingMode, __ATOMIC_ACQUIRE)) {
+        uint32_t count = 0;
+        if (g.cursorUploaded && svga::CursorImageMatches(*image, g.cursorImage)) {
+            handled = true;
+        } else {
+            const auto packet = svga::EncodeCursor(*image, g.alphaCursor, g.cursorWords, count);
+            if (packet == svga::CursorPacket::Hidden) {
+                HideCursor();
+                Unlock();
+                return true;
+            }
+            if (packet == svga::CursorPacket::Image && PublishWords(g.cursorWords, count)) {
+                g.cursorImage = *image;
+                g.cursorUploaded = handled = true;
+            }
+        }
+    }
+    if (handled) {
+        g.cursorPending = true;
+        g.cursorX = x;
+        g.cursorY = y;
+    } else {
+        HideCursor();
+    }
+    Unlock();
+    return handled;
+}
+
+void CommitCursor()
+{
+    Lock();
+    if (g.cursorPending && !__atomic_load_n(&g.changingMode, __ATOMIC_ACQUIRE)) {
+        // On the first show, let the shape and any restored software-cursor
+        // rows reach the host before it exposes the overlay.
+        if (!g.cursorVisible && g.fifo[svga::FifoNext] != g.fifo[svga::FifoStop])
+            Write(Sync, 1);
+        if (g.cursorVisible || (g.firstPending >= g.endPending &&
+                               g.fifo[svga::FifoNext] == g.fifo[svga::FifoStop])) {
+            if (!g.cursorVisible || g.visibleX != g.cursorX || g.visibleY != g.cursorY)
+                SetCursorPosition(true, g.cursorX, g.cursorY);
+            g.cursorPending = false;
+        }
+    }
+    Unlock();
 }
 
 void Flush(uint32_t first, uint32_t end)
@@ -222,6 +316,7 @@ void Flush(uint32_t first, uint32_t end)
 void PanicPresent()
 {
     if (!TryLock()) return;
+    HideCursor();
     if (!__atomic_load_n(&g.changingMode, __ATOMIC_ACQUIRE))
         (void)PublishUpdate(0, g.mode.height);
     Unlock();
@@ -246,6 +341,8 @@ bool SetMode(uint32_t width, uint32_t height)
         return false;
     }
     __atomic_store_n(&g.changingMode, true, __ATOMIC_RELEASE);
+    HideCursor();
+    g.cursorUploaded = false;
     const auto previous = g.mode;
     ProgramMode(width, height);
     const auto candidate = ReadGeometry();
@@ -294,6 +391,7 @@ volatile uint32_t* Framebuffer()
 
 constexpr DisplayOps Ops{"vmware-svga2", SetMode, GetMode, Framebuffer,
                          FramebufferPhys, Flush, PanicPresent};
+constexpr DisplayCursorOps CursorOps{&Ops, PrepareCursor, CommitCursor};
 
 int Initialize()
 {
@@ -352,8 +450,19 @@ int Initialize()
     Write(ConfigDone, 1);
     (void)PublishUpdate(0, g.mode.height);
     DisplayRegister(&Ops);
-    KPrintf("vmware-svga: %ux%u stride=%u caps=0x%x fifo=%u\n",
-            width, height, candidate.stride, Read(Capabilities), g.fifoBytes);
+    const uint32_t caps = Read(Capabilities);
+    g.cursorBypass3 = (caps & CapExtendedFifo) &&
+                      (g.fifo[FifoCapabilities] & FifoCapCursorBypass3);
+    g.alphaCursor = caps & CapAlphaCursor;
+    const bool nativeCursor = g.cursorBypass3 || (caps & CapCursorBypass2);
+    if (nativeCursor) {
+        if (!g.cursorBypass3) Write(CursorId, 0);
+        SetCursorPosition(false, 0, 0);
+        DisplayRegisterCursor(&CursorOps);
+    }
+    KPrintf("vmware-svga: %ux%u stride=%u caps=0x%x fifo=%u cursor=%s\n",
+            width, height, candidate.stride, caps, g.fifoBytes,
+            !nativeCursor ? "software" : g.alphaCursor ? "alpha" : "masked");
     return 0;
 }
 }

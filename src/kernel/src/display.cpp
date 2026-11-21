@@ -69,6 +69,7 @@ static const DisplayOps g_gopOps = {
 // ---------------------------------------------------------------------------
 
 static const DisplayOps* g_activeDisplay = &g_gopOps;
+static const DisplayCursorOps* g_cursorOps = nullptr;
 
 void DisplayRegister(const DisplayOps* ops)
 {
@@ -80,6 +81,8 @@ void DisplayRegister(const DisplayOps* ops)
     CompositorLockScanoutForDisplayChange();
     SerialPrintf("DISPLAY: registering '%s' (replacing '%s')\n",
                  ops->name, DisplayGetActive()->name);
+    const auto* cursor = __atomic_load_n(&g_cursorOps, __ATOMIC_ACQUIRE);
+    if (cursor && cursor->display != ops) cursor->Prepare(nullptr, 0, 0);
     __atomic_store_n(&g_activeDisplay, ops, __ATOMIC_RELEASE);
     CompositorUnlockScanoutForDisplayChange();
 }
@@ -87,6 +90,27 @@ void DisplayRegister(const DisplayOps* ops)
 const DisplayOps* DisplayGetActive()
 {
     return __atomic_load_n(&g_activeDisplay, __ATOMIC_ACQUIRE);
+}
+
+void DisplayRegisterCursor(const DisplayCursorOps* ops)
+{
+    if (!ops || !ops->display || !ops->Prepare || !ops->Commit ||
+        ops->display != DisplayGetActive()) return;
+    const uintptr_t table = reinterpret_cast<uintptr_t>(ops);
+    if (ModuleRetainAddresses(&table, 1))
+        __atomic_store_n(&g_cursorOps, ops, __ATOMIC_RELEASE);
+}
+
+bool DisplayPrepareCursor(const CursorImage* image, int32_t x, int32_t y)
+{
+    const auto* ops = __atomic_load_n(&g_cursorOps, __ATOMIC_ACQUIRE);
+    return ops && ops->display == DisplayGetActive() && ops->Prepare(image, x, y);
+}
+
+void DisplayCommitCursor()
+{
+    const auto* ops = __atomic_load_n(&g_cursorOps, __ATOMIC_ACQUIRE);
+    if (ops && ops->display == DisplayGetActive()) ops->Commit();
 }
 
 bool DisplayUsesFirmwareFramebuffer() { return DisplayGetActive()==&g_gopOps; }

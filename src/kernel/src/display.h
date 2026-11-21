@@ -56,6 +56,20 @@ struct DisplayOps {
 // Called by display driver modules during init.
 extern "C" void DisplayRegister(const DisplayOps* ops);
 
+struct CursorImage;
+
+// Optional cursor provider, kept separate from the DisplayOps module ABI.
+// Prepare returns whether the provider owns this frame's cursor. It may stage
+// a new image, but a newly visible cursor appears only after Commit.
+struct DisplayCursorOps {
+    const DisplayOps* display;
+    bool (*Prepare)(const CursorImage* image, int32_t x, int32_t y);
+    void (*Commit)();
+};
+extern "C" void DisplayRegisterCursor(const DisplayCursorOps* ops);
+bool DisplayPrepareCursor(const CursorImage* image, int32_t x, int32_t y);
+void DisplayCommitCursor();
+
 // Get the active display. Returns the GOP fallback if no driver registered.
 const DisplayOps* DisplayGetActive();
 bool DisplayUsesFirmwareFramebuffer();

@@ -1,5 +1,6 @@
 #include <cassert>
 #include "../../drivers/vmware_svga/svga_fifo.h"
+#include "../../drivers/vmware_svga/svga_cursor.h"
 
 int main()
 {
@@ -26,4 +27,32 @@ int main()
     assert(update[0] == Update && update[1] == 0 && update[2] == 700 &&
            update[3] == 1280 && update[4] == 20);
     assert(!UpdateSpan({1280, 720, 5120, 0}, 800, 840, update));
+
+    brook::CursorImage image;
+    image.width = 3;
+    image.height = 2;
+    image.hotX = 1;
+    image.hotY = 1;
+    uint32_t cursor[CursorCommandWords]{};
+    uint32_t count = 0;
+    assert(EncodeCursor(image, false, cursor, count) == CursorPacket::Hidden);
+    image.pixels[0] = 0xff123456;
+    image.pixels[brook::CursorCapacity + 2] = 0xff876543;
+    assert(EncodeCursor(image, false, cursor, count) == CursorPacket::Image);
+    assert(count == 8 + 2 + 64);
+    assert(cursor[0] == 19 && cursor[2] == 1 && cursor[3] == 1 && cursor[4] == 32);
+    assert(cursor[8] == 0xffffff7f && cursor[9] == 0xffffffdf);
+    assert(cursor[10] == 0x123456 && cursor[11] == 0 && cursor[44] == 0x876543);
+    image.pixels[0] = 0x80ff8040;
+    assert(EncodeCursor(image, false, cursor, count) == CursorPacket::Invalid);
+    assert(EncodeCursor(image, true, cursor, count) == CursorPacket::Image);
+    assert(count == 12 && cursor[0] == 22 && cursor[4] == 3 && cursor[6] == 0x80804020);
+
+    auto same = image;
+    same.pixels[3] = 0xff112233;
+    assert(CursorImageMatches(image, same));
+    same.hotX = 2;
+    assert(!CursorImageMatches(image, same));
+    image.hotX = -1;
+    assert(EncodeCursor(image, true, cursor, count) == CursorPacket::Invalid);
 }
