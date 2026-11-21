@@ -5072,19 +5072,24 @@ void CompositorWaitFrame()
     // Timeout (~50ms) — compositor may be halted, proceed anyway
 }
 
-void CompositorRemap(uint64_t fbPhys,uint32_t w,uint32_t h,uint32_t stridePixels)
+static bool ReplaceCompositorFramebuffer(uint64_t fbPhys, uint32_t w, uint32_t h,
+                                         uint32_t stridePixels, bool replaceTty)
 {
-    if (!w || !h || stridePixels<w) return;
+    if (!w || !h || stridePixels<w) return false;
     uint64_t bytes=static_cast<uint64_t>(stridePixels)*h*4;
+    const uint64_t mapping = VmmFramebufferMapping(fbPhys, bytes);
+    if (replaceTty && !mapping) return false;
     uint64_t pages=(bytes+4095)/4096;
     VirtualAddress replacement=VmmAllocPages(pages,VMM_WRITABLE,MemTag::Device,0);
     if (!replacement) {
         SerialPuts("COMPOSITOR: remap backbuffer allocation failed; retaining previous geometry\n");
-        return;
+        return false;
     }
-    auto* physical=reinterpret_cast<volatile uint32_t*>(PhysToVirt(PhysicalAddress(fbPhys)).raw());
+    auto* physical=reinterpret_cast<volatile uint32_t*>(
+        mapping ? mapping : PhysToVirt(PhysicalAddress(fbPhys)).raw());
     auto* buffer=reinterpret_cast<uint32_t*>(replacement.raw());
     CompositorLockScanoutForDisplayChange();
+    if (replaceTty) TtyRemap(fbPhys, w, h, stridePixels);
     for(uint32_t y=0;y<h;++y)
         memcpy(buffer+static_cast<uint64_t>(y)*stridePixels,
                const_cast<uint32_t*>(physical+static_cast<uint64_t>(y)*stridePixels),w*4);
@@ -5101,6 +5106,17 @@ void CompositorRemap(uint64_t fbPhys,uint32_t w,uint32_t h,uint32_t stridePixels
     MouseSetBounds(w,h);MarkAllDirty();
     if(cancelled){CompositorMarkDirty();CompositorWake();}
     SerialPrintf("COMPOSITOR: remapped to %ux%u stride=%u\n",w,h,stridePixels);
+    return true;
+}
+
+void CompositorRemap(uint64_t fbPhys, uint32_t w, uint32_t h, uint32_t stridePixels)
+{
+    (void)ReplaceCompositorFramebuffer(fbPhys, w, h, stridePixels, false);
+}
+
+bool CompositorRemapLinearDisplay(uint64_t fbPhys, uint32_t w, uint32_t h, uint32_t stridePixels)
+{
+    return ReplaceCompositorFramebuffer(fbPhys, w, h, stridePixels, true);
 }
 
 void CompositorLockScanoutForDisplayChange()

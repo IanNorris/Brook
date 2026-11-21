@@ -26,6 +26,11 @@ add_driver_module(bochs_display
     "${BROOK_ROOT}/src/drivers/bochs_display/bochs_display_mod.cpp"
 )
 
+add_driver_module(vmware_svga
+    "${BROOK_ROOT}/src/drivers/vmware_svga/vmware_svga_mod.cpp"
+    EXTRA_FLAGS "-mgeneral-regs-only" "-mno-sse" "-mno-sse2" "-mfpmath="
+)
+
 add_driver_module(ps2_mouse
     "${BROOK_ROOT}/src/drivers/ps2_mouse/mouse_mod.cpp"
 )

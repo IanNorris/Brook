@@ -140,6 +140,7 @@ EXPORT_SYMBOL(TtyRemap);
 
 // Compositor
 EXPORT_SYMBOL(CompositorRemap);
+EXPORT_SYMBOL(CompositorRemapLinearDisplay);
 EXPORT_SYMBOL(CompositorGetPhysDims);
 EXPORT_SYMBOL(CompositorWake);
 

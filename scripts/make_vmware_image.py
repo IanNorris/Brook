@@ -134,7 +134,8 @@ def make_initrds(work, build, payload, policy, profile, commit, name):
     tree = work / 'initrd'
     modules = tree / 'kernel/drivers'
     modules.mkdir(parents=True)
-    shutil.copy2(build / 'drivers/e1000.mod', modules / 'e1000.mod')
+    for name in ('e1000.mod', 'vmware_svga.mod'):
+        shutil.copy2(build / 'drivers' / name, modules / name)
     env = dict(os.environ, BROOK_BUILD_DIR=str(tree), BROOK_INITRD_KIB='16384')
     for key in ('BROOK_PROVIDER_PAYLOAD', 'BROOK_INITRD_MARKERS', 'BROOK_HARDWARE_PAYLOAD_ID'):
         env.pop(key, None)

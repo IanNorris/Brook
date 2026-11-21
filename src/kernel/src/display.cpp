@@ -8,6 +8,7 @@
 #include "display.h"
 #include "compositor.h"
 #include "display_power.h"
+#include "module.h"
 #include "tty.h"
 #include "serial.h"
 
@@ -72,6 +73,10 @@ static const DisplayOps* g_activeDisplay = &g_gopOps;
 void DisplayRegister(const DisplayOps* ops)
 {
     if (!ops || !ops->name) return;
+    // The active table can be invoked by the panic path as well as the
+    // compositor. Its provider must survive until kernel shutdown.
+    const uintptr_t table = reinterpret_cast<uintptr_t>(ops);
+    if (!ModuleRetainAddresses(&table, 1)) return;
     CompositorLockScanoutForDisplayChange();
     SerialPrintf("DISPLAY: registering '%s' (replacing '%s')\n",
                  ops->name, DisplayGetActive()->name);
