@@ -20,6 +20,29 @@ struct BdwClientScanoutLayout {
     }
 };
 
+// Both workers and takeover use the display lock. The request retains the
+// buffer and its exclusive transition until the submission worker consumes a
+// finished publication, including when takeover cancels it during the flush.
+class BdwClientPublication {
+    enum class Phase : uint8_t { Queued, Flushing, Finished };
+    Phase phase_=Phase::Queued;
+    bool cancelled_=false, published_=false;
+public:
+    bool Begin() {
+        if(phase_!=Phase::Queued)return false;
+        phase_=Phase::Flushing;
+        return true;
+    }
+    void Finish(bool published) {
+        published_=published;
+        phase_=Phase::Finished;
+    }
+    void Cancel(){cancelled_=true;}
+    bool Cancelled() const {return cancelled_;}
+    bool Finished() const {return phase_==Phase::Finished;}
+    bool CanArm() const {return Finished() && published_ && !cancelled_;}
+};
+
 struct BdwClientScanoutImage {
     uint32_t base=0;
     uint64_t identity=0;

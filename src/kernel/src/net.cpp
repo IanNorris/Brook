@@ -7626,6 +7626,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             r.text("}");
         }
         r.text("},\"client_scanout\":{");
+        r.text("\"publication_worker\":");r.quoted(BdwClientScanoutApPublication()?"ap":"bsp");r.text(",");
         r.field("count",s.clientScanout[BdwClientScanoutTotal].count);
         r.text(",");r.field("rejected",s.clientScanoutRejected);
         const char* clientStages[]={"bind","flush","finish","total"};
@@ -7662,7 +7663,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         for(unsigned i=0;i<4;++i){if(i)r.text(",");r.number(s.flipLatchFrames[i]);}
         r.text("],");r.field("map_hits",s.mapHits);r.text(",");r.field("map_full",s.mapFull);
         r.text(",");r.field("map_failed",s.mapFailed);
-        r.text("},\"scope\":\"gpu-submit worker since reset; scanout targets=[gop per-present map,gop persistent map,flip buffer] presents, latch_us=[avg,max] from DSPASURF write to first observed DSPASURFLIVE (about 1 ms poll), latch_frames=vblanks 1,2,3,>3, missed_vblanks=vblanks beyond the first; class=[count,us,max_us], class us sum to elapsed_us; client_scanout=[total_us,max_us] per stage, subset of other; compositor=RCS job referencing a protected (non-user-mappable) buffer; present stage=[us,max_us], prepare=CPU checks, GOP backing and PPGTT build, device=forcewake critical section incl. resets, blit=run inside it, retire=release; hist buckets 0,1,2,3-4,5-8,>8 yields per job; yields/sleep_us count one-tick sleeps and include unlock, sleep and re-audit; spins/spin_us count interrupts-enabled spin slices near predicted completion, also including unlock and re-audit; hist counts sleeps; BCS completion spins and never yields; mhz=[samples,min,avg,max] RPSTAT1 CAGF at first completion poll and at breadcrumb poll; rising=end above issue; TSC wall time\"}\n");r.send();
+        r.text("},\"scope\":\"gpu-submit worker since reset; scanout targets=[gop per-present map,gop persistent map,flip buffer] presents, latch_us=[avg,max] from DSPASURF write to first observed DSPASURFLIVE (about 1 ms poll), latch_frames=vblanks 1,2,3,>3, missed_vblanks=vblanks beyond the first; class=[count,us,max_us], class us sum to elapsed_us; client_scanout=[total_us,max_us] per stage, flush on the admitted publication worker, bind and finish on gpu-submit, total sums the three stages; compositor=RCS job referencing a protected (non-user-mappable) buffer; present stage=[us,max_us], prepare=CPU checks, GOP backing and PPGTT build, device=forcewake critical section incl. resets, blit=run inside it, retire=release; hist buckets 0,1,2,3-4,5-8,>8 yields per job; yields/sleep_us count one-tick sleeps and include unlock, sleep and re-audit; spins/spin_us count interrupts-enabled spin slices near predicted completion, also including unlock and re-audit; hist counts sleeps; BCS completion spins and never yields; mhz=[samples,min,avg,max] RPSTAT1 CAGF at first completion poll and at breadcrumb poll; rising=end above issue; TSC wall time\"}\n");r.send();
 #else
         DebugChannelSend("{\"error\":\"diagnostic kernel required\"}\n");
 #endif
@@ -7733,8 +7734,11 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         }else if(NetStrEq(cmd,"gpu zerocopy cache flush") || NetStrEq(cmd,"gpu zerocopy cache uc") || NetStrEq(cmd,"gpu zerocopy cache wt")){
             ok=BdwZeroCopySetCacheMode(NetStrEq(cmd,"gpu zerocopy cache uc")?1u:NetStrEq(cmd,"gpu zerocopy cache wt")?2u:0u);
             note=ok?"cache mode applied; each image is flushed in full at its next present":"not built";
+        }else if(NetStrEq(cmd,"gpu zerocopy publish bsp") || NetStrEq(cmd,"gpu zerocopy publish ap")){
+            ok=BdwClientScanoutSetApPublication(NetStrEq(cmd,"gpu zerocopy publish ap"));
+            note=ok?"client publication worker set for new requests":"client publication worker unavailable";
         }else if(!NetStrEq(cmd,"gpu zerocopy status")){
-            DebugChannelSend("{\"error\":\"usage: gpu zerocopy arm|off|status|verify|timeline|cache flush|cache uc|cache wt\"}\n");return;
+            DebugChannelSend("{\"error\":\"usage: gpu zerocopy arm|off|status|verify|timeline|cache flush|cache uc|cache wt|publish bsp|publish ap\"}\n");return;
         }
         BdwZeroCopyStatus z{};BdwZeroCopyReadStatus(z);
         BridgeReply r;r.text("{\"ok\":");r.text(ok?"true":"false");r.text(",\"note\":");r.quoted(note);
@@ -7752,6 +7756,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",\"uncached_render\":");r.text(z.uncachedRender?"true":"false");
         r.text(",\"auto_arm\":");r.text(BdwZeroCopyAutoArm()?"true":"false");
         r.text(",\"cache_mode\":");r.quoted(BdwZeroCopyCacheModeName());
+        r.text(",\"client_publication_worker\":");r.quoted(BdwClientScanoutApPublication()?"ap":"bsp");
         r.text(",");r.field("render_jobs_uc",z.renderJobsUc);r.text(",");r.field("render_jobs_wb",z.renderJobsWb);
         r.text(",\"surfaces\":[");for(unsigned i=0;i<BdwZeroCopyMaxImages;++i){if(i)r.text(",");r.number(z.surfaces[i]);}
         r.text("],\"ages\":[");for(unsigned i=0;i<BdwZeroCopyMaxImages;++i){if(i)r.text(",");r.number(z.ages[i]);}

@@ -41,6 +41,38 @@ int main(){
     assert((!BdwClientScanoutLayout{12864,true}.Valid()));
     assert((!BdwClientScanoutLayout{16385,false}.Valid()));
     constexpr BdwClientScanoutImage a{0x10000000,1,linear}, b{0x12000000,2,tiled};
+    // Submission cannot arm an unpublished source or retire its lease
+    // while the publisher may still be walking the buffer's pages.
+    BdwClientPublication completed;
+    assert(!completed.Finished() && !completed.CanArm());
+    assert(completed.Begin() && !completed.Begin());
+    assert(!completed.Finished() && !completed.CanArm());
+    completed.Finish(true);
+    assert(completed.Finished() && completed.CanArm() && !completed.Begin());
+
+    BdwClientPublication failed;
+    assert(failed.Begin());
+    failed.Finish(false);
+    assert(failed.Finished() && !failed.CanArm());
+
+    // Takeover can cancel before dispatch, while CLFLUSH runs, or after
+    // publication but before the BSP commits the flip under its lock.
+    BdwClientPublication cancelledBefore;
+    cancelledBefore.Cancel();
+    assert(cancelledBefore.Begin() && cancelledBefore.Cancelled() && !cancelledBefore.Finished());
+    cancelledBefore.Finish(false);
+    assert(cancelledBefore.Finished() && !cancelledBefore.CanArm());
+
+    BdwClientPublication cancelledDuring;
+    assert(cancelledDuring.Begin() && !cancelledDuring.Cancelled());
+    cancelledDuring.Cancel();
+    assert(!cancelledDuring.Finished() && !cancelledDuring.CanArm());
+    cancelledDuring.Finish(true);
+    assert(cancelledDuring.Finished() && !cancelledDuring.CanArm());
+
+    completed.Cancel();
+    assert(completed.Finished() && !completed.CanArm());
+
     FakeDisplay io;
     BdwClientScanoutFlip flip;
     assert(flip.Arm(io,a,0));

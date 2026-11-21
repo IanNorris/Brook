@@ -394,11 +394,11 @@ void BdwGpuBufferGpuStatus(const BdwGpuBuffer* b,uint32_t& uses,bool& failed){
     const uint64_t state=b?__atomic_load_n(&b->gpuState,__ATOMIC_ACQUIRE):0;
     uses=uint32_t(state);failed=(state>>63)!=0;
 }
-bool BdwGpuBufferSyncCpuCache(BdwGpuBuffer* b){
-    if(!b)return false;
+bool BdwGpuBufferSyncCpuCachePages(BdwGpuBuffer* b,uint32_t pageCount){
+    if(!b || !pageCount || pageCount>b->count)return false;
     constexpr uint32_t group=16;
-    for(uint32_t first=0;first<b->count;first+=group){
-        const uint32_t count=b->count-first<group?b->count-first:group;
+    for(uint32_t first=0;first<pageCount;first+=group){
+        const uint32_t count=pageCount-first<group?pageCount-first:group;
         BdwOwnedPage pages[group]{};
         for(uint32_t i=0;i<count;++i)pages[i]={b->pages[first+i],reinterpret_cast<uint8_t*>(BdwGpuBufferPageKernelAddress(b,first+i))};
 #ifndef BROOK_HOST_TEST
@@ -414,6 +414,9 @@ bool BdwGpuBufferSyncCpuCache(BdwGpuBuffer* b){
         if(!ok)return false;
     }
     return true;
+}
+bool BdwGpuBufferSyncCpuCache(BdwGpuBuffer* b){
+    return b && BdwGpuBufferSyncCpuCachePages(b,b->count);
 }
 bool BdwGpuBufferPrepareHandoffRead(BdwGpuBuffer* b,uint64_t token,uint64_t offset,uint64_t bytes) {
     if(!b || b->userMappingAllowed || !bytes || offset>b->bytes || bytes>b->bytes-offset ||

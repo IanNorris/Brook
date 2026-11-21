@@ -330,6 +330,9 @@ int main(){
     badDma=true;assert(!BdwGpuBufferCreate(8192) && frees==1);badDma=false;
     failBacking=true;assert(!BdwGpuBufferCreate(4096) && frees==2);failBacking=false;
     allocated=0;auto* b=BdwGpuBufferCreate(4097);assert(b && BdwGpuBufferBytes(b)==8192);
+    assert(!BdwGpuBufferSyncCpuCachePages(nullptr,1));
+    assert(!BdwGpuBufferSyncCpuCachePages(b,0) && !BdwGpuBufferSyncCpuCachePages(b,3));
+    assert(BdwGpuBufferSyncCpuCachePages(b,1));
     {
         BdwBufferOwnerUsage owners[4]{};
         uint64_t live[8]{};

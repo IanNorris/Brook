@@ -38,6 +38,7 @@
 #include "process.h"
 #include "serial.h"
 #include "smp.h"
+#include "sync/ksemaphore.h"
 
 namespace brook {
 namespace {
@@ -484,8 +485,13 @@ struct ClientRequest {
     BdwGpuBuffer* buffer=nullptr;
     BdwClientScanoutLayout layout{};
     uint64_t owner=0,offer=0;
-    bool cancelled=false;
+    bool publishOnAp=false;
+    BdwClientPublication publication{};
+    uint64_t flushTicks=0;
 } clientRequest;
+KSemaphore clientPublicationWake{};
+uint32_t clientPublicationStarted=0;
+bool clientPublishOnAp=false;
 uint64_t clientPresents=0,clientLatched=0,clientRestores=0,clientFailedOffer=0;
 int32_t clientError=0;
 bool clientLeaving=false,clientGopRestore=false;
@@ -494,7 +500,7 @@ bool ClientOn(){return DesktopPresentPolicy()&BROOK_DESKTOP_POLICY_DIRECT_ON;}
 bool ClientShowing(){return clientFlip.Front().base || clientFlip.Armed().base || clientFlip.Busy();}
 
 void ClientRestoreLocked(bool gopTarget){
-    if(clientRequest.buffer)clientRequest.cancelled=true;
+    if(clientRequest.buffer)clientRequest.publication.Cancel();
     if(!ClientShowing())return;
     clientGopRestore|=gopTarget;
     clientLeaving=true;
@@ -1401,24 +1407,95 @@ int64_t BdwZeroCopyAdopt(uint64_t,BdwGpuBuffer**,uint32_t& count){count=0;return
 #endif
 #if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP) && defined(BROOK_BDW_ZERO_COPY_SCANOUT) && !defined(BROOK_HOST_TEST)
 
+static bool PublishClientRequest(bool onAp,bool canPresent){
+    uint64_t f=IrqSpinLockAcquire(&lock);
+    if(!clientRequest.buffer || clientRequest.publishOnAp!=onAp ||
+       !clientRequest.publication.Begin()){
+        IrqSpinLockRelease(&lock,f);
+        return false;
+    }
+    const ClientRequest request=clientRequest;
+    IrqSpinLockRelease(&lock,f);
+
+    // The request retains the BO and excludes new GPU access. The render
+    // fence follows the render/data cache flush, but the display does not
+    // snoop the coherent CPU/GT LLC. Publish every page mapped to the
+    // display, including tile and pitch padding. GGTT guard PTEs use a
+    // separate zero page. Unrelated GPU jobs may run on the AP path.
+#if defined(BROOK_GPU_SUBMISSION_TIMING)
+    const uint64_t start=Rdtsc();
+#endif
+    const bool published=canPresent && !request.publication.Cancelled() &&
+        BdwGpuBufferSyncCpuCachePages(request.buffer,request.layout.Pages());
+#if defined(BROOK_GPU_SUBMISSION_TIMING)
+    const uint64_t ticks=Rdtsc()-start;
+#endif
+    f=IrqSpinLockAcquire(&lock);
+#if defined(BROOK_GPU_SUBMISSION_TIMING)
+    clientRequest.flushTicks=ticks;
+#endif
+    clientRequest.publication.Finish(published);
+    IrqSpinLockRelease(&lock,f);
+    return true;
+}
+
+static void ClientPublicationWorker(void*){
+    for(;;){
+        KSemaphoreWait(&clientPublicationWake);
+        // Only the BSP worker binds or arms, after rechecking display
+        // ownership, cancellation and the submission queue's health.
+        if(PublishClientRequest(true,true))(void)BdwClientScanoutWakeWorker();
+    }
+}
+
+static bool InitClientPublicationWorker(){
+    uint32_t expected=0;
+    if(!__atomic_compare_exchange_n(&clientPublicationStarted,&expected,1,false,
+                                    __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))return expected==2;
+    KSemaphoreInit(&clientPublicationWake,0);
+    auto* worker=KernelThreadCreate("gpu-publish",ClientPublicationWorker,nullptr);
+    if(worker){
+        const uint32_t cpus=SmpGetCpuCount();
+        if(cpus>1)worker->cpuAffinity=cpus-1;
+        SchedulerAddProcess(worker);
+    }
+    __atomic_store_n(&clientPublicationStarted,worker?2u:0u,__ATOMIC_RELEASE);
+    return worker!=nullptr;
+}
+
+bool BdwClientScanoutSetApPublication(bool enabled){
+    if(enabled && (SmpGetCpuCount()<2 || !InitClientPublicationWorker()))return false;
+    const uint64_t f=IrqSpinLockAcquire(&lock);
+    __atomic_store_n(&clientPublishOnAp,enabled,__ATOMIC_RELEASE);
+    IrqSpinLockRelease(&lock,f);
+    return true;
+}
+bool BdwClientScanoutApPublication(){
+    return __atomic_load_n(&clientPublishOnAp,__ATOMIC_ACQUIRE);
+}
+
 int64_t BdwClientScanoutPresent(uint64_t owner,BdwGpuBuffer* buffer,const BdwClientScanoutLayout& layout,uint64_t offer){
     if(!owner || !buffer || !offer || !layout.Valid() || !BdwGpuBufferAllowsUserMapping(buffer) ||
        BdwGpuBufferBytes(buffer)<uint64_t(layout.stride)*1800)return -22;
     if(!ClientOn())return -95;
     if(!BdwClientScanoutWakeWorker())return -19;
     const uint64_t f=IrqSpinLockAcquire(&lock);
+    const bool publishOnAp=BdwClientScanoutApPublication();
     int64_t result=-11;
     if(zcOwner!=owner)result=-1;
     else if(zcActive && zcRequested && !zcDisabled && !zcVerifyHold && !captureHold && !clientRequest.buffer &&
             !clientLeaving && !clientFlip.Busy() && !zcRing.HasArmed() && !zcRing.HasQueued() &&
             (!cursorPlane.enabled() || cursorStatus.active) && BdwGpuBufferBeginCpuTransition(buffer)){
         BdwGpuBufferRef(buffer);
-        clientRequest={buffer,layout,owner,offer};
+        clientRequest={buffer,layout,owner,offer,publishOnAp};
         ++clientPresents;
         result=0;
     }
     IrqSpinLockRelease(&lock,f);
-    if(!result)(void)BdwClientScanoutWakeWorker();
+    if(!result){
+        if(publishOnAp)KSemaphoreSignal(&clientPublicationWake);
+        else (void)BdwClientScanoutWakeWorker();
+    }
     return result;
 }
 int64_t BdwClientScanoutStatus(uint64_t owner,BrookGpuClientScanoutStatus& out){
@@ -1442,7 +1519,8 @@ int64_t BdwClientScanoutLeave(uint64_t owner){
 }
 bool BdwClientScanoutWorkPending(){
     const uint64_t f=IrqSpinLockAcquire(&lock);
-    const bool pending=clientRequest.buffer;
+    const bool pending=clientRequest.buffer &&
+        (!clientRequest.publishOnAp || clientRequest.publication.Finished());
     IrqSpinLockRelease(&lock,f);
     return pending;
 }
@@ -1450,9 +1528,14 @@ bool BdwClientScanoutService(bool canPresent){
     ClientRequest request{};
     ClientMapping* choice=nullptr;
     {
-        const uint64_t f=IrqSpinLockAcquire(&lock);
-        request=clientRequest;
-        if(request.buffer && !request.cancelled && canPresent && !clientLeaving && zcActive && !zcDisabled && ClientOn()){
+        uint64_t f=IrqSpinLockAcquire(&lock);
+        if(clientRequest.buffer && !clientRequest.publishOnAp && !clientRequest.publication.Finished()){
+            IrqSpinLockRelease(&lock,f);
+            (void)PublishClientRequest(false,canPresent);
+            f=IrqSpinLockAcquire(&lock);
+        }
+        if(clientRequest.publication.Finished())request=clientRequest;
+        if(request.buffer && request.publication.CanArm() && canPresent && !clientLeaving && zcActive && !zcDisabled && ClientOn()){
             for(auto& m:clientMappings){
                 if(m.held || m.quarantined)continue;
                 if(m.buffer==request.buffer){choice=&m;break;}
@@ -1463,9 +1546,6 @@ bool BdwClientScanoutService(bool canPresent){
         IrqSpinLockRelease(&lock,f);
     }
     if(!request.buffer)return false;
-    // RCS emits its render/data cache flush before the completion marker.
-    // The CPU transition excludes new RCS/BCS/VCS access while CLFLUSH
-    // pushes coherent LLC contents out to the non-snooping display.
     // The BSP worker takes no WM or compositor locks. The syscall checks
     // scene eligibility before admission and software takeover revokes it.
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
@@ -1475,14 +1555,10 @@ bool BdwClientScanoutService(bool canPresent){
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
     const uint64_t boundAt=Rdtsc();
 #endif
-    const bool flushed=bound && BdwGpuBufferSyncCpuCache(request.buffer);
-#if defined(BROOK_GPU_SUBMISSION_TIMING)
-    const uint64_t flushedAt=Rdtsc();
-#endif
     bool accepted=false;
     {
         const uint64_t f=IrqSpinLockAcquire(&lock);
-        if(flushed && !clientRequest.cancelled && !clientLeaving && zcActive && zcRequested && !zcDisabled &&
+        if(bound && clientRequest.publication.CanArm() && !clientLeaving && zcActive && zcRequested && !zcDisabled &&
            zcOwner==request.owner && ClientOn() && !zcVerifyHold && !captureHold && !zcRing.HasArmed() && !zcRing.HasQueued()){
             const uint64_t descriptor=uint64_t(choice->Base())|(uint64_t(request.layout.stride)<<32)|
                 (request.layout.tiled?(uint64_t{1}<<63):0);
@@ -1495,7 +1571,7 @@ bool BdwClientScanoutService(bool canPresent){
         if(accepted)choice->held=true;
         else {
             BdwGpuBufferEndCpuTransition(request.buffer);
-            clientError=flushed?-11:-5;clientFailedOffer=request.offer;
+            clientError=bound?-11:-5;clientFailedOffer=request.offer;
             if(!ClientShowing())clientLeaving=false;
         }
         clientRequest={};
@@ -1504,7 +1580,7 @@ bool BdwClientScanoutService(bool canPresent){
     BdwGpuBufferUnref(request.buffer);
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
     const uint64_t end=Rdtsc();
-    const uint64_t times[]={boundAt-start,flushedAt-boundAt,end-flushedAt,end-start};
+    const uint64_t times[]={boundAt-start,request.flushTicks,end-boundAt,end-start+request.flushTicks};
     BdwWorkerStatsClientScanout(times,accepted);
 #endif
     return true;
@@ -1626,6 +1702,8 @@ int64_t BdwClientScanoutStatus(uint64_t,BrookGpuClientScanoutStatus&){return -38
 int64_t BdwClientScanoutLeave(uint64_t){return -38;}
 bool BdwClientScanoutWorkPending(){return false;}
 bool BdwClientScanoutService(bool){return false;}
+bool BdwClientScanoutSetApPublication(bool){return false;}
+bool BdwClientScanoutApPublication(){return false;}
 bool BdwCursorRequest(bool){return false;}
 BdwCursorStatus BdwCursorReadStatus(){return {};}
 uint64_t BdwCursorRendererQuery(uint64_t,bool,bool& suppress){suppress=false;return 0;}
