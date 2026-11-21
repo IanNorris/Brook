@@ -26,6 +26,8 @@ MODULE_IMPORT_SYMBOL(VmmVirtToPhys);
 MODULE_IMPORT_SYMBOL(PmmFreePage);
 MODULE_IMPORT_SYMBOL(KernelPageTable);
 MODULE_IMPORT_SYMBOL(DisplayRegister);
+MODULE_IMPORT_SYMBOL(DisplayBeginFramebufferChange);
+MODULE_IMPORT_SYMBOL(DisplayEndFramebufferChange);
 MODULE_IMPORT_SYMBOL(DisplayRegisterCursor);
 MODULE_IMPORT_SYMBOL(CompositorRemapLinearDisplay);
 MODULE_IMPORT_SYMBOL(TtyGetFramebufferPhys);
@@ -322,8 +324,11 @@ void PanicPresent()
     Unlock();
 }
 
+extern const DisplayOps Ops;
 bool SetMode(uint32_t width, uint32_t height)
 {
+    DisplayFramebufferChange change(true, &Ops);
+    if (!change) return false;
     if (!width || !height || width > g.maxWidth || height > g.maxHeight ||
         uint64_t(width) * height * 4 > g.framebuffer.bytes) return false;
     if (!TryLock()) return false;
@@ -395,7 +400,8 @@ constexpr DisplayCursorOps CursorOps{&Ops, PrepareCursor, CommitCursor};
 
 int Initialize()
 {
-    if (!PreparePci()) return -1;
+    DisplayFramebufferChange change(true);
+    if (!change || !PreparePci()) return -1;
     const uint32_t oldId = Read(Id);
     Write(Id, Version2);
     auto abandon = [oldId]() {
@@ -450,6 +456,7 @@ int Initialize()
     Write(ConfigDone, 1);
     (void)PublishUpdate(0, g.mode.height);
     DisplayRegister(&Ops);
+    change.Claim(&Ops);
     const uint32_t caps = Read(Capabilities);
     g.cursorBypass3 = (caps & CapExtendedFifo) &&
                       (g.fifo[FifoCapabilities] & FifoCapCursorBypass3);

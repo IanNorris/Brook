@@ -56,6 +56,26 @@ struct DisplayOps {
 // Called by display driver modules during init.
 extern "C" void DisplayRegister(const DisplayOps* ops);
 
+// Serialize hardware changes that also replace the TTY/compositor backing.
+// A managed linear driver can take over the initial GOP and then keeps the
+// display until shutdown. It may retire backing once its readers have drained.
+extern "C" bool DisplayBeginFramebufferChange(bool managed, const DisplayOps* expected);
+extern "C" void DisplayEndFramebufferChange(const DisplayOps* claim);
+class DisplayFramebufferChange {
+public:
+    explicit DisplayFramebufferChange(bool managed, const DisplayOps* expected = nullptr)
+        : admitted_(DisplayBeginFramebufferChange(managed, expected)) {}
+    ~DisplayFramebufferChange() { if (admitted_) DisplayEndFramebufferChange(claim_); }
+    explicit operator bool() const { return admitted_; }
+    void Claim(const DisplayOps* owner) { claim_ = owner; }
+    DisplayFramebufferChange(const DisplayFramebufferChange&) = delete;
+    DisplayFramebufferChange& operator=(const DisplayFramebufferChange&) = delete;
+
+private:
+    bool admitted_;
+    const DisplayOps* claim_ = nullptr;
+};
+
 struct CursorImage;
 
 // Optional cursor provider, kept separate from the DisplayOps module ABI.

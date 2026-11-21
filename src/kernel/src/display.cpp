@@ -11,6 +11,7 @@
 #include "module.h"
 #include "tty.h"
 #include "serial.h"
+#include "sync/kmutex.h"
 
 namespace brook {
 
@@ -70,6 +71,28 @@ static const DisplayOps g_gopOps = {
 
 static const DisplayOps* g_activeDisplay = &g_gopOps;
 static const DisplayCursorOps* g_cursorOps = nullptr;
+static KMutex g_framebufferChangeLock{};
+static const DisplayOps* g_managedFramebufferOwner = nullptr;
+
+bool DisplayBeginFramebufferChange(bool managed, const DisplayOps* expected)
+{
+    KMutexLock(&g_framebufferChangeLock);
+    const auto* active = DisplayGetActive();
+    const bool owned = g_managedFramebufferOwner != nullptr;
+    const bool allowed = managed
+        ? (expected ? owned && expected == g_managedFramebufferOwner && active == expected
+                    : !owned && active == &g_gopOps)
+        : !owned;
+    if (!allowed) KMutexUnlock(&g_framebufferChangeLock);
+    return allowed;
+}
+
+void DisplayEndFramebufferChange(const DisplayOps* claim)
+{
+    if (claim && claim == DisplayGetActive()) g_managedFramebufferOwner = claim;
+    KMutexUnlock(&g_framebufferChangeLock);
+}
+
 
 void DisplayRegister(const DisplayOps* ops)
 {

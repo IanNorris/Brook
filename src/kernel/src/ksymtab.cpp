@@ -125,6 +125,8 @@ EXPORT_SYMBOL(PciConfigWrite32);
 
 // Display
 EXPORT_SYMBOL(DisplayRegister);
+EXPORT_SYMBOL(DisplayBeginFramebufferChange);
+EXPORT_SYMBOL(DisplayEndFramebufferChange);
 EXPORT_SYMBOL(DisplayRegisterCursor);
 EXPORT_SYMBOL(DisplaySet3DActive);
 EXPORT_SYMBOL(GpuCompositorRegister);
