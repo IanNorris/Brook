@@ -87,6 +87,20 @@ def make_developer_data(stage, image):
         run('debugfs', '-w', '-R', f'set_inode_field /home {field} {value}', image)
 
 
+def stage_selected_shell(initrd, script):
+    from stage_clearwater_shell import add_clearwater_start, embed_clearwater_executables
+
+    supervisor = Path(run('nix-build', '--no-out-link',
+                          ROOT / 'tools/vulkan-compositor-pkg/clearwater-supervisor.nix',
+                          capture_output=True, text=True).stdout.strip())
+    shell = Path(run('nix-build', '--no-out-link',
+                     ROOT / 'tools/clearwater-shell-pkg/default.nix',
+                     capture_output=True, text=True).stdout.strip())
+    hashes = embed_clearwater_executables(initrd, supervisor / 'bin/CWSUP.ELF', shell / 'bin/CWSHELL.ELF')
+    script.write_bytes(add_clearwater_start(script.read_bytes()))
+    return hashes
+
+
 def prepare_public_data(seed, stage, data_image, nix_image):
     run('cp', '--sparse=always', '--reflink=auto', seed / 'data.img', data_image)
     commands = stage / 'data-debugfs.txt'
@@ -162,6 +176,8 @@ def main():
     # so both layouts use the /boot files in the loaded RAM disk.
     initrd = stage / 'build/esp/INITRD.IMG'
     run('mmd', '-i', initrd, '::BOOT', '::BOOT/BIN', '::BOOT/SHORTCUTS')
+    if selected:
+        shell_hashes = stage_selected_shell(initrd, script)
     run('mcopy', '-i', initrd, script, '::BOOT/INIT.RC')
     run('mcopy', '-i', initrd, ROOT / 'data/shortcuts/terminal.rc', '::BOOT/SHORTCUTS/TERMINAL.RC')
     run('mcopy', '-i', initrd, Path(metadata['profile']) / 'bin/bash', '::BOOT/BIN/BASH')
@@ -251,6 +267,7 @@ def main():
                     files={name: digest(output / name) for name in files},
                     acceptance=dict(linux='pending', windows='not tested', macos_intel='not tested', macos_arm='not tested; TCG only'))
     if selected:
+        manifest['clearwater_shell_sha256'] = shell_hashes
         manifest['status'] = 'private-selected-profile'
         manifest['redistributable'] = metadata['profile_selection']['manifest']['redistributable']
         manifest['target'] = metadata['profile_selection']['manifest']['target']
