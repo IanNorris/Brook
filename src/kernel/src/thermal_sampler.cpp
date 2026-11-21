@@ -208,6 +208,7 @@ ThermalPowerRegs ThermalReadPowerRegs() {
     r.platformInfo = ReadMsr(0xce);
     r.turboRatioLimit = ReadMsr(0x1ad);
     r.pkgCstConfig = ReadMsr(0xe2);
+    r.raplPowerUnit = ReadMsr(0x606);
     r.pkgPowerLimit = ReadMsr(0x610);
     r.pkgPowerInfo = ReadMsr(0x614);
     uint32_t a = 0, b = 0, c = 0, d = 0;

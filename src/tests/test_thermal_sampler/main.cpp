@@ -25,6 +25,26 @@ int main() {
     assert(ThermalEnergyMw(0xffffff00u, 0x00000100u, unit, 1000) == uint32_t((512ull * 1000000 >> 14) * 1000 / 1000));
     assert(ThermalEnergyMw(5, 10, unit, 0) == 0);
 
+    // The captured Dell 0x610 with illustrative 1/8 W and 1/1024 s units.
+    // The actual 0x606 was absent in that capture.
+    constexpr uint64_t pkgLimit = 0x804280c800dd8078ull;
+    const auto limits = ThermalDecodeRaplPackageLimits(0x000a0e03, pkgLimit);
+    assert(limits.units.powerExponent == 3 && limits.units.energyExponent == 14 &&
+           limits.units.timeExponent == 10);
+    assert(limits.pl1.powerUw == 15000000 && limits.pl1.timeWindowUs == 28000000);
+    assert(limits.pl1.enabled && limits.pl1.clamp);
+    assert(limits.pl2.powerUw == 25000000 && limits.pl2.timeWindowUs == 2441);
+    assert(limits.pl2.enabled && !limits.pl2.clamp && limits.locked);
+    const auto rescaled = ThermalDecodeRaplPackageLimits(0x00090e04, pkgLimit);
+    assert(rescaled.pl1.powerUw == 7500000 && rescaled.pl1.timeWindowUs == 56000000);
+    assert(rescaled.pl2.powerUw == 12500000 && rescaled.pl2.timeWindowUs == 4882);
+    const auto disabled = ThermalDecodeRaplPackageLimits(0, 0);
+    assert(!disabled.pl1.enabled && !disabled.pl2.enabled && !disabled.locked);
+    assert(!disabled.pl1.powerUw && !disabled.pl1.clamp && disabled.pl1.timeWindowUs == 1000000);
+    const auto longest = ThermalDecodeRaplPackageLimits(0, 0x00ffffff);
+    assert(longest.pl1.powerUw == 32767000000ull);
+    assert(longest.pl1.timeWindowUs == (1750000ull << 31));
+
     // Frequency and C0 residency.
     assert(ThermalMhz(3000, 2000, 2200) == 3300);
     assert(ThermalMhz(1, 0, 2200) == 0);

@@ -29,7 +29,7 @@ struct ThermalPowerRegs {
     bool valid = false, epbSupported = false, hwpSupported = false, c8910 = false;
     uint32_t model = 0, cpu = 0;
     uint64_t miscEnable = 0, perfCtl = 0, perfStatus = 0, epb = 0, platformInfo = 0,
-             turboRatioLimit = 0, pkgCstConfig = 0, pkgPowerLimit = 0, pkgPowerInfo = 0;
+             turboRatioLimit = 0, pkgCstConfig = 0, pkgPowerLimit = 0, pkgPowerInfo = 0, raplPowerUnit = 0;
     uint32_t mwaitLeaf5Edx = 0; // CPUID.05H:EDX MWAIT sub-states per C-state
     // Residency counters (TSC-rate ticks since reset).
     uint64_t pkgC2 = 0, pkgC3 = 0, pkgC6 = 0, pkgC7 = 0, pkgC8 = 0, pkgC9 = 0, pkgC10 = 0;
