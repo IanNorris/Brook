@@ -53,7 +53,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
 from hardware_update_protocol import record
-from guarded_bridge_v3_qa import PASS_MARKER as BRIDGE_V3_PASS_MARKER
+from guarded_bridge_v3_qa import (
+    INTEL_NIC_DEVICE_IDS, NIC_PASS_MARKER, PASS_MARKER as BRIDGE_V3_PASS_MARKER, make_nic_disk,
+)
 
 DEFAULT_SHARED = Path('/data/Programming/Brook/shared/dell')
 IMAGE = ('qemu-check/guard-efi-fixture-20261103.raw.gz',
@@ -125,8 +127,16 @@ def main():
     p.add_argument('--bridge-local-policy-qa', type=Path,
                    help='Run the local bridge and reserved-port guest regression using this static probe')
     p.add_argument('--bridge-v3-qa', type=Path, metavar='OPERATOR.SEED',
-                   help='Test the exact v3 pair with its synthetic operator seed and matching virtio module')
+                   help='Test the exact v3 pair with its synthetic operator seed and matching network module')
+    p.add_argument('--bridge-v3-nic', choices=INTEL_NIC_DEVICE_IDS,
+                   help='Run v3 QA with one emulated Intel NIC, checked PCI ID, desktop job and real frame')
+    p.add_argument('--bridge-v3-nic-accel', choices=('kvm','tcg'),
+                   help='Intel NIC QA accelerator (default KVM when accessible, otherwise TCG)')
     a = p.parse_args()
+    if a.bridge_v3_nic and not a.bridge_v3_qa:
+        p.error('--bridge-v3-nic requires --bridge-v3-qa')
+    if a.bridge_v3_nic_accel and not a.bridge_v3_nic:
+        p.error('--bridge-v3-nic-accel requires --bridge-v3-nic')
     mode_flags = list(MODE_FLAGS)
     if a.managed_profile:
         mode_flags.append('--managed-profile')
@@ -147,8 +157,12 @@ def main():
         if (a.bridge_local_policy_qa or a.proc_dump_qa or a.proc_autodump_qa or
                 a.managed_profile_absolute_current or a.kernel_build_flags):
             p.error('v3 QA requires the ordinary guarded handoff and the matching kernel build directory')
+        nic_module = a.kernel_build.resolve() / 'drivers' / ('e1000.mod' if a.bridge_v3_nic else 'virtio_net.mod')
         mode_flags += ['--bridge-v3-qa', str(a.bridge_v3_qa.absolute()),
-                       '--auto-desktop-network-module', str(a.kernel_build.resolve() / 'drivers/virtio_net.mod')]
+                       '--auto-desktop-network-module', str(nic_module)]
+        if a.bridge_v3_nic:
+            accelerator = a.bridge_v3_nic_accel or ('kvm' if os.access('/dev/kvm', os.R_OK|os.W_OK) else 'tcg')
+            mode_flags += ['--bridge-v3-nic', a.bridge_v3_nic, '--bridge-v3-nic-accel', accelerator]
     pair, shared = a.pair.resolve(), a.shared.resolve()
     out = (a.output or pair / 'qemu-check').resolve()
     if 'OVMF_CODE' not in os.environ and not a.firmware:
@@ -183,6 +197,8 @@ def main():
             'policy_sha256': policy['policy_sha256'],
             'helpers_sha256': policy['helpers_sha256'],
         }
+        if a.bridge_v3_nic:
+            bridge_manifest.update(intel_nic=a.bridge_v3_nic, intel_nic_module_sha256=sha(nic_module))
 
     # Short scratch path: QEMU monitor sockets below the test's temporary directory must fit in
     # sun_path (108 bytes).
@@ -197,7 +213,8 @@ def main():
                                  'ovmf_code_sha256': sha(firmware / 'OVMF_CODE.fd'), 'ovmf_dir': str(firmware)}}
     try:
         image = scratch / 'fixture.raw'
-        pinned(shared / IMAGE[0], image, IMAGE[1])
+        if not a.bridge_v3_nic:
+            pinned(shared / IMAGE[0], image, IMAGE[1])
         efi = scratch / 'BROOKGUARD.efi'
         if a.efi:
             shutil.copyfile(a.efi, efi)  # caller-supplied loader; its hash is in the verdict
@@ -209,6 +226,11 @@ def main():
             src = shared / 'qemu-check/recovery-v2' / name
             pinned(src.with_name(name + '.gz') if not src.exists() else src, recovery / name, digest)
         rmanifest = json.loads((recovery / 'manifest.json').read_text())
+        if a.bridge_v3_nic:
+            verdict['pinned_inputs'].update(image=make_nic_disk(image, recovery / 'INITRD.IMG', rmanifest),
+                                            image_source='generated_keyless_gpt')
+            verdict['intel_nic'] = {'model': a.bridge_v3_nic, 'accelerator': accelerator,
+                                    'module_sha256': bridge_manifest['intel_nic_module_sha256']}
 
         # 1. QEMU-only desktop pair: exact kernel and initrd, fixture identity.
         desktop = scratch / 'desktop-pair'
@@ -251,6 +273,9 @@ def main():
             lines = log_path.read_text(errors='replace').splitlines()
             passed = result.returncode == 0 and PASS_MARKER in lines
             bridge_checked = a.bridge_v3_qa and BRIDGE_V3_PASS_MARKER in lines and (run_dir / 'bridge-v3-qa.json').is_file()
+            if a.bridge_v3_nic and bridge_checked and f"{NIC_PASS_MARKER} {a.bridge_v3_nic}" not in lines:
+                lines.append('Guarded v3 boot did not prove the selected Intel NIC')
+                passed = False
             if a.bridge_v3_qa and passed and not bridge_checked:
                 lines.append('Guarded v3 boot did not verify all four packaged receiver protocols')
                 passed = False

@@ -132,6 +132,8 @@ def main():
     parser.add_argument('--expression', type=Path, default=ROOT/'nix/hardware-network-packages.nix')
     parser.add_argument('--index', type=Path, default=ROOT/'tools/nix-index/packages.idx')
     parser.add_argument('--size-mib', type=int, default=3840)
+    parser.add_argument('--direct-ahci', action='store_true',
+                        help='Allow a larger image for a direct partition, outside a FAT32 file')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     profile = args.profile.resolve(strict=True)
@@ -147,8 +149,9 @@ def main():
     size = args.size_mib*1024*1024
     if profile.parent != Path('/nix/store') or not profile.is_dir():
         parser.error('Profile must resolve to a built Nix store directory')
-    if not 512*1024*1024 <= size <= FAT_FILE_MAX:
-        parser.error('Image must be 512 MiB..FAT32 file limit')
+    limit = 32 * 1024 * 1024 * 1024 if args.direct_ahci else FAT_FILE_MAX
+    if not 512 * 1024 * 1024 <= size <= limit:
+        parser.error('Image size is out of range for the selected disk layout')
     compiler = os.environ.get('MUSL_CC')
     if not compiler:
         parser.error('Run inside nix-shell with MUSL_CC')
@@ -224,8 +227,15 @@ def main():
     image = output/'STORE.IMG'
     with image.open('xb') as stream:
         stream.truncate(size)
+    inodes = 131072
+    if args.direct_ahci:
+        # The desktop closure can have hundreds of thousands of small files
+        # and symlinks. Leave room for later Gallery installs as well.
+        entries = 1 + sum(len(dirs) + len(files)
+                          for _, dirs, files in os.walk(seed, followlinks=False))
+        inodes = max(size // 32768, entries + max(32768, entries // 8))
     run('mke2fs', '-q', '-t', 'ext2', '-b', '4096', '-I', '128', '-m', '0',
-        '-N', '131072', '-O', 'none,filetype,sparse_super,large_file',
+        '-N', str(inodes), '-O', 'none,filetype,sparse_super,large_file',
         '-U', identifier, '-L', 'BRKDESKTOP', '-d', seed, image)
     inventory = normalize_owners(image, output)
     with image.open('rb') as stream:

@@ -1,4 +1,4 @@
-#include "ahci_data_reader.h"
+#include "ahci_vm_write_target.h"
 #include "ahci_direct_layout.h"
 #include <cassert>
 #include <cstring>
@@ -81,6 +81,31 @@ static int fixture(const char* path,const char* storePath,uint64_t dataCount) {
         auto readInspect=[&](){return AhciReadAndInspectBootData(io,boot,want,sectors,scratchEntries.data(),
             scratchBackup.data(),scratchEntries.size(),scratchGdt.data(),scratchGdt.size(),out);};
         assert(readInspect()==AhciDataInspectionState::Clean && out.data.entry==2 && reader.reads==7);
+        const auto proveVm = [&]() {
+            reader.reads = 0;
+            return AhciVmWriteLayout(io, boot, want, sectors, scratchEntries.data(), scratchBackup.data(),
+                                     scratchEntries.size(), scratchGdt.data(), scratchGdt.size());
+        };
+        assert(proveVm() && reader.reads == 7);
+        reader.dirty = true;
+        assert(proveVm() && reader.reads == 6); // independent recovery must handle this state
+        reader.dirty = false;
+        for (int failure = 1; failure <= 7; ++failure) {
+            reader.failAt = failure;
+            assert(!proveVm());
+        }
+        reader.failAt = 0;
+        for (auto* selector : {boot.diskGuid, boot.partitionGuid, want.diskGuid,
+                               want.partitionGuid, want.filesystemUuid}) {
+            selector[0] ^= 1;
+            assert(!proveVm());
+            selector[0] ^= 1;
+        }
+        for (auto* bound : {&boot.first, &boot.count, &want.first, &want.count}) {
+            ++*bound;
+            assert(!proveVm());
+            --*bound;
+        }
         for(int failure=1;failure<=7;++failure)for(bool shortRead:{false,true}) {
             reader.reads=0;reader.failAt=failure;reader.shortRead=shortRead;out.data.entry=99;
             assert(readInspect()==AhciDataInspectionState::Invalid && !out.data.entry);

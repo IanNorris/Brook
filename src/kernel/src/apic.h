@@ -81,6 +81,8 @@ bool IoApicInit(uint64_t ioApicPhysical, uint32_t gsiBase);
 // Caller starts from IoApicInit's masked table; direct hardware writers are outside this policy.
 // Polarity is unchanged; this is a routed pin, not a PCI nominal IRQ lookup.
 bool IoApicSelectBootLevelPin(uint8_t pin);
+// Resolve a GSI on the boot I/O APIC without changing routing policy.
+bool IoApicResolvePin(uint32_t gsi,uint8_t& pin);
 // Translate an ACPI GSI into this I/O APIC's registration pin and stage its
 // level/polarity before the first handler unmasks it. Performs no MMIO.
 bool IoApicSelectBootLevelGsi(uint32_t gsi,bool activeLow,uint8_t& pin);
