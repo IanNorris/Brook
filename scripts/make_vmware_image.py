@@ -19,7 +19,7 @@ import sys
 import uuid
 import zlib
 
-from bridge_keyless_image import require_keyless_image
+from bridge_keyless_image import require_keyless_disk, require_keyless_image
 from bridge_operator_policy import validate_operator_policy
 from build_dell_image import build_bridge_objects, build_provenance, bridge_compression
 from hardware_recovery_fsck import validate_checker
@@ -215,15 +215,19 @@ def assemble_disk(work, data_image, efi, kernel, desktop, recovery, disk_id, esp
     for copy in (0, 1):
         fat_write(esp, f'RECOVERY/GUARD{copy}.BIN', guard)
     kdata, ndata, rdata = kernel.read_bytes(), desktop.read_bytes(), recovery.read_bytes()
+    embedded_images = []
     for directory in ('RECOV2', 'RECOVERY'):
         fat_write(esp, directory + '/KERNEL.ELF', kdata)
         fat_write(esp, directory + '/INITRD.IMG', rdata)
+        embedded_images.append((directory + '/INITRD.IMG', recovery))
         fat_write(esp, directory + '/SELECT.BIN', record(1, 0, kdata, rdata))
     for slot, label in enumerate(('A', 'B')):
         fat_write(esp, f'UPDATES/{label}/KERNEL.ELF', kdata)
         fat_write(esp, f'UPDATES/{label}/INITRD.IMG', ndata)
+        embedded_images.append((f'UPDATES/{label}/INITRD.IMG', desktop))
         fat_write(esp, f'UPDATES/SELECT{slot}.BIN', record(slot + 1, slot, kdata, ndata))
     run('fsck.fat', '-n', esp)
+    require_keyless_image(esp, embedded_images=embedded_images)
     copy_extents(esp, raw, ESP_FIRST * SECTOR)
     copy_extents(data_image, raw, DATA_FIRST * SECTOR)
     return raw
@@ -233,7 +237,7 @@ def vmx(network):
     lines = ['.encoding = "UTF-8"', 'config.version = "8"', 'virtualHW.version = "20"',
              'displayName = "Brook"', 'guestOS = "other-64"', 'firmware = "efi"',
              'uefi.secureBoot.enabled = "FALSE"', 'memsize = "4096"', 'numvcpus = "2"',
-             'mks.enable3d = "FALSE"', 'pciBridge0.present = "TRUE"']
+             'mks.enable3d = "FALSE"', 'devices.hotplug = "FALSE"', 'pciBridge0.present = "TRUE"']
     for port in range(4, 8):
         lines += [f'pciBridge{port}.present = "TRUE"', f'pciBridge{port}.virtualDev = "pcieRootPort"',
                   f'pciBridge{port}.functions = "8"']
@@ -303,9 +307,11 @@ def main():
         '--output', work / 'loader')
     efi, kernel = work / 'loader/BROOKGUARD.efi', build / 'BROOK.elf'
     raw = assemble_disk(work, data, efi, kernel, desktop, recovery, disk_id, esp_id, data_id, fs_id)
+    require_keyless_disk(raw)
     vmdk = dest / 'brook.vmdk'
     run('qemu-img', 'convert', '-f', 'raw', '-O', 'vmdk', '-o', 'subformat=monolithicSparse', raw, vmdk)
     run('qemu-img', 'compare', '-f', 'raw', '-F', 'vmdk', raw, vmdk)
+    require_keyless_disk(vmdk)
 
     (dest / 'Brook.vmx').write_text(vmx(args.network))
     report = {'version': 1, 'commit': commit, 'profile': str(profile), 'payload_id': args.payload_id,
