@@ -88,6 +88,42 @@ def bridge_compression():
     return ['-DBROOK_BULK_ZLIB', '-I', headers / 'include'], archive / 'lib/libz.a'
 
 
+def embed_update_helpers(output, build, operator_input):
+    """Assemble the same checked bridge helpers for desktop and maintenance boots."""
+    boot_image = output / "INITRD.IMG"
+    compiled_helpers = {}
+    bridge_flags = []
+    bridge_objects = []
+    if operator_input is not None:
+        vendor, bridge_objects = build_bridge_objects(build)
+        bridge_flags = ['-DBROOK_BRIDGE_V3', f'-DBROOK_BRIDGE_V3_POLICY_SHA256="{sha(operator_input)}"', '-I', vendor]
+        run(['mcopy', '-o', '-i', boot_image, operator_input, '::/ETC/bridge-v3-operators'])
+    cc = os.environ['MUSL_CC']
+    cxx = os.environ.get('MUSL_CXX') or cc.removesuffix('gcc') + 'g++'
+    common = ['-static', '-O2', '-Wall', '-Wextra', '-Werror', *bridge_flags]
+
+    def helper(name, compiler, flags, sources, libraries=()):
+        binary = output / name
+        run([compiler, *common, *flags, *[ROOT / source for source in sources],
+             *bridge_objects, *libraries, '-o', binary])
+        run(['mcopy', '-o', '-i', boot_image, binary, '::/BOOT/' + name])
+        if subprocess.check_output(['mtype', '-i', boot_image, '::/BOOT/' + name]) != binary.read_bytes():
+            sys.exit(name + ' readback mismatch')
+        compiled_helpers[name] = sha(binary)
+
+    helper('HWBULK.ELF', cc, [], ['tools/hardware_bulk.c'])
+    helper('HWUPDATE.ELF', cc, [], ['tools/hardware_update.c'])
+    helper('HWUPSYS.ELF', cc, ['-DBROOK_UPDATE_SYSTEM'], ['tools/hardware_update.c'])
+    if operator_input is not None:
+        zlib_flags, zlib_archive = bridge_compression()
+        helper('HWSTAGE.ELF', cc, ['-DBROOK_BULK_INSTALL_MEDIA'], ['tools/hardware_bulk.c'])
+        helper('HWBULKZ.ELF', cc, zlib_flags, ['tools/hardware_bulk.c'], [zlib_archive])
+        helper('HWSTORE.ELF', cxx, ['-std=c++17', '-Wno-misleading-indentation'],
+               ['tools/hardware_store_receiver.cpp', 'tools/hardware_store_transaction.cpp',
+                'tools/hardware_store_validate.cpp'])
+    return compiled_helpers
+
+
 def build_provenance(commit, dirty, source_date_epoch):
     if not re.fullmatch(r'(?:[0-9a-f]{40}|[0-9a-f]{64})', commit):
         raise ValueError('expected a full Git commit for initrd assembly')
@@ -270,37 +306,7 @@ def main():
 
     # 3b. Verify the shipped helpers individually, including v3 compressed
     # bulk and store, which would otherwise come from the source image.
-    boot_image = a.output / 'INITRD.IMG'
-    compiled_helpers = {}
-    bridge_flags = []
-    bridge_objects = []
-    if operator_input is not None:
-        vendor, bridge_objects = build_bridge_objects(build)
-        bridge_flags = ['-DBROOK_BRIDGE_V3', f'-DBROOK_BRIDGE_V3_POLICY_SHA256="{sha(operator_input)}"', '-I', vendor]
-        run(['mcopy', '-o', '-i', boot_image, operator_input, '::/ETC/bridge-v3-operators'])
-    cc = os.environ['MUSL_CC']
-    cxx = os.environ.get('MUSL_CXX') or cc.removesuffix('gcc') + 'g++'
-    common = ['-static', '-O2', '-Wall', '-Wextra', '-Werror', *bridge_flags]
-
-    def helper(name, compiler, flags, sources, libraries=()):
-        binary = a.output / name
-        run([compiler, *common, *flags, *[ROOT / source for source in sources],
-             *bridge_objects, *libraries, '-o', binary])
-        run(['mcopy', '-o', '-i', boot_image, binary, '::/BOOT/' + name])
-        if subprocess.check_output(['mtype', '-i', boot_image, '::/BOOT/' + name]) != binary.read_bytes():
-            sys.exit(name + ' readback mismatch')
-        compiled_helpers[name] = sha(binary)
-
-    helper('HWBULK.ELF', cc, [], ['tools/hardware_bulk.c'])
-    helper('HWUPDATE.ELF', cc, [], ['tools/hardware_update.c'])
-    helper('HWUPSYS.ELF', cc, ['-DBROOK_UPDATE_SYSTEM'], ['tools/hardware_update.c'])
-    if operator_input is not None:
-        zlib_flags, zlib_archive = bridge_compression()
-        helper('HWSTAGE.ELF', cc, ['-DBROOK_BULK_INSTALL_MEDIA'], ['tools/hardware_bulk.c'])
-        helper('HWBULKZ.ELF', cc, zlib_flags, ['tools/hardware_bulk.c'], [zlib_archive])
-        helper('HWSTORE.ELF', cxx, ['-std=c++17', '-Wno-misleading-indentation'],
-               ['tools/hardware_store_receiver.cpp', 'tools/hardware_store_transaction.cpp',
-                'tools/hardware_store_validate.cpp'])
+    compiled_helpers = embed_update_helpers(a.output, build, operator_input)
 
     # Record assembly provenance inside the initrd and check the exact bytes
     # before hashing the completed image. These fields describe the builder.
