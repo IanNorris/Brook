@@ -36,7 +36,7 @@ let
     [Desktop Entry]
     Type=Application
     Name=Chromium
-    Exec=/nix/profile/bin/brook-chromium %U
+    Exec=/nix/profile/bin/brook-chromium --brook-launch-log %U
     Icon=chromium
     Categories=Network;WebBrowser;
     DESKTOP

@@ -5,6 +5,32 @@ if [ "$EUID" -eq 0 ]; then
   echo 'brook-chromium: launch from Applications or use: run --uid 1000 /nix/bin/brook-chromium [URLs...]' >&2
   exit 64
 fi
+capture_launch_stderr() {
+  local runtime=/tmp/brook-$EUID directory candidate log_fd
+  directory=$runtime/launch
+  (umask 077; mkdir -p -m 700 -- "$runtime") || return 1
+  [[ -d "$runtime" && ! -L "$runtime" && -O "$runtime" ]] || return 1
+  (umask 077; mkdir -p -m 700 -- "$directory") || return 1
+  [[ -d "$directory" && ! -L "$directory" && -O "$directory" ]] || return 1
+  chmod 0700 -- "$runtime" "$directory" || return 1
+  candidate=$(mktemp -- "$directory/.chromium.XXXXXX") || return 1
+  if ! exec {log_fd}>"$candidate"; then
+    rm -f -- "$candidate"
+    return 1
+  fi
+  if ! mv -Tf -- "$candidate" "$directory/chromium.stderr"; then
+    exec {log_fd}>&-
+    rm -f -- "$candidate"
+    return 1
+  fi
+  exec 2>&"$log_fd"
+  exec {log_fd}>&-
+}
+
+if [[ ${1-} == --brook-launch-log ]]; then
+  shift
+  capture_launch_stderr || printf 'brook-chromium: could not open the private launcher log\n' >&2
+fi
 if [[ ! -d /proc/self/fdinfo || ! -e /proc/self/ns/net ]]; then
   echo 'brook-chromium: the booted Brook kernel lacks the Chromium namespace sandbox. Boot the kernel paired with this profile.' >&2
   exit 78
