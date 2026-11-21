@@ -61,6 +61,19 @@ hashes of the disk, boot files and public operator policy. Back up the VMDK
 while the guest is off. A clean guest shutdown flushes pending writes. A dirty
 volume goes through the guarded recovery check before the desktop mounts it.
 
+The image pins one SATA disk at its original capacity with 512-byte logical
+and physical sectors. Keep its geometry and leave other SATA ports unused.
+Use IDE if you add a CD-ROM. A changed disk, additional active SATA device,
+expanded disk or different sector geometry causes boot to halt before writable
+mounts. The generated VM configuration disables hot-plug. Brook also
+quarantines the disk until reboot if the controller reports a SATA connection
+change during operation.
+
+Install Brook system or recovery updates by rebuilding the VMDK. The
+in-place system and recovery tools require the physical-machine write policy
+and refuse the VM profile. Save a powered-off copy and plan to migrate user
+files before replacing the disk.
+
 ## Persistent image validation
 
 The exact VMDK booted in headless QEMU with e1000e behind a PCIe root

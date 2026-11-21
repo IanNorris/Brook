@@ -6,9 +6,21 @@ struct Mock {
     uint32_t regs[32]{};unsigned writes=0,fences=0;uint32_t transferredBytes=512;
     bool stuckCi=false,stuckCr=false,stuckFr=false,ignoreStop=false,ignoreFisStop=false,unavailableAfterWrite=false;
     uint32_t ignoredOffset=0xffffffffu;
-    uint32_t injectIs=0;
+    uint32_t injectIs=0, interruptOnAck=0;
+    unsigned commandIssues=0;
+    Mock(){regs[SSTS/4]=0x133;regs[SIG/4]=ATA_SIGNATURE;}
     uint32_t read(uint32_t off){return regs[off/4];}
-    void write(uint32_t off,uint32_t value){++writes;if(off==IS || off==SERR)regs[off/4]&=~value;else if(off==ignoredOffset){}else if(off==CMD && ignoreStop && !(value&ST)){}else if(off==CMD && ignoreFisStop && !(value&FRE)){}else regs[off/4]=value;if(off==CMD && unavailableAfterWrite)regs[off/4]=0xffffffffu;}
+    void write(uint32_t off,uint32_t value){
+        ++writes;
+        if(off==CI && value)++commandIssues;
+        if(off==IS) {
+            regs[off/4]|=interruptOnAck;
+            regs[off/4]&=~value;
+        } else if(off==SERR)regs[off/4]&=~value;
+        else if(off!=ignoredOffset && !(off==CMD && ignoreStop && !(value&ST)) &&
+                !(off==CMD && ignoreFisStop && !(value&FRE)))regs[off/4]=value;
+        if(off==CMD && unavailableAfterWrite)regs[off/4]=0xffffffffu;
+    }
     void fence(){++fences;}
     bool waitClear(uint32_t off,uint32_t mask){if((off==CI&&stuckCi)||(mask==CR&&stuckCr)||(mask==FR&&stuckFr))return false;regs[off/4]&=~mask;if(off==CI)regs[IS/4]|=injectIs;return true;}
     bool waitClearFlush(uint32_t off,uint32_t mask){return waitClear(off,mask);}
@@ -45,5 +57,37 @@ int main(){
     Mock flushMissing;flushMissing.regs[CMD/4]=ST|FRE;flushMissing.transferredBytes=0;assert(SubmitNoData(flushMissing)==Result::DeviceError);
     Mock flushIgnored;flushIgnored.regs[CMD/4]=ST|FRE;flushIgnored.ignoredOffset=CI;flushIgnored.transferredBytes=0;assert(SubmitNoData(flushIgnored)==Result::DeviceError);
     Mock flushFault;flushFault.regs[CMD/4]=ST|FRE;flushFault.regs[TFD/4]=0x20;flushFault.injectIs=1;assert(SubmitNoData(flushFault)==Result::DeviceError);
+    for(bool noData:{false,true}) {
+        const auto submit=[noData](Mock& fault) {
+            fault.regs[CMD/4]=ST|FRE;
+            fault.transferredBytes=noData ? 0 : 512;
+            return noData ? SubmitNoData(fault) : Submit(fault,512);
+        };
+        for(uint32_t change:{1u<<31,1u<<22,1u<<6}) {
+            Mock pending;
+            pending.regs[IS/4]=change;
+            assert(submit(pending)==Result::MediaChanged && !pending.writes);
+
+            Mock duringAck;
+            duringAck.interruptOnAck=change;
+            assert(submit(duringAck)==Result::MediaChanged && !duringAck.commandIssues);
+            assert(duringAck.regs[IS/4]==change);
+
+            Mock inFlight;
+            inFlight.injectIs=change|1;
+            assert(submit(inFlight)==Result::MediaChanged && inFlight.commandIssues==1);
+        }
+        for(uint32_t change:{1u<<26,1u<<16}) {
+            Mock diag;
+            diag.regs[SERR/4]=change;
+            assert(submit(diag)==Result::MediaChanged && !diag.writes);
+        }
+        Mock disconnected;
+        disconnected.regs[SSTS/4]=0;
+        assert(submit(disconnected)==Result::MediaChanged && !disconnected.writes);
+        Mock wrongDevice;
+        wrongDevice.regs[SIG/4]=0xeb140101;
+        assert(submit(wrongDevice)==Result::MediaChanged && !wrongDevice.writes);
+    }
     for(uint32_t bit:{24u,27u,28u,29u,30u}){Mock fatal;fatal.injectIs=1u<<bit;assert(Submit(fatal,512)==Result::DeviceError);}
 }
