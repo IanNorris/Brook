@@ -197,7 +197,8 @@ def assemble_disk(work, data_image, efi, kernel, desktop, recovery, disk_id, esp
         run('mmd', '-i', esp, '::/' + name)
     fat_write(esp, 'EFI/BOOT/BOOTX64.EFI', efi.read_bytes())
     fat_write(esp, 'EFI/BOOT/BRKMODE.ELF', (work / 'BRKMODE.ELF').read_bytes())
-    fat_write(esp, 'BROOK.CFG', b'TARGET=KERNEL\\BROOK.ELF\nDEBUG_TEXT=0\nLOG_MEMORY=0\n')
+    # The normal payload lives in UPDATES/A and UPDATES/B.
+    fat_write(esp, 'BROOK.CFG', b'TARGET=KERNEL\\BROOK.ELF\nDEBUG_TEXT=0\nLOG_MEMORY=0\nUPDATE_SLOTS=1\n')
     fat_write(esp, 'PANIC.BIN', bytes(258 * SECTOR))
     guard = guard_record(disk_id, data_id, fs_id)
     for copy in (0, 1):

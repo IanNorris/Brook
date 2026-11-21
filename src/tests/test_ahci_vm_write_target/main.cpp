@@ -26,6 +26,13 @@ struct VirtualCpu {
 
 int main()
 {
+    assert(AhciVmPolicyFile(0, false, false, 17, 32)); // ordinary FatFs file
+    assert(AhciVmPolicyFile(0100644, false, false, 17, 32));
+    assert(!AhciVmPolicyFile(0, true, false, 17, 32));
+    assert(!AhciVmPolicyFile(0, false, true, 17, 32));
+    assert(!AhciVmPolicyFile(0060644, false, false, 17, 32));
+    assert(!AhciVmPolicyFile(0, false, false, 0, 32));
+    assert(!AhciVmPolicyFile(0100644, false, false, 33, 32));
     uint64_t sectors = 0;
     const auto parse = [&](const char* record) { return AhciVmWriteSectorCount(record, std::strlen(record), sectors); };
     assert(parse("BRKAHCIVM1\n262144\n") && sectors == 262144);

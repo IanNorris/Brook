@@ -454,9 +454,13 @@ int ReadVmPolicy(const char* path, char* record, uint32_t capacity) {
     VnodeStat st{};
     const int error = VfsLstatPath(path, &st);
     if (error) return error;
-    if ((st.mode & 0170000) != 0100000 || st.isDir || st.isSymlink || !st.size || st.size > capacity) return -22;
+    if (!AhciVmPolicyFile(st.mode, st.isDir, st.isSymlink, st.size, capacity)) return -22;
     auto* node = VfsOpen(path, VFS_O_STREAM);
     if (!node) return -5;
+    if (node->type != VnodeType::File) {
+        VfsRelease(node);
+        return -22;
+    }
     uint64_t offset = 0;
     const int count = VfsRead(node, record, st.size, &offset);
     VfsRelease(node);

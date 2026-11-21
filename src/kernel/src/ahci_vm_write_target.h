@@ -4,6 +4,15 @@
 
 namespace brook {
 
+inline bool AhciVmPolicyFile(uint16_t mode, bool isDir, bool isSymlink, uint64_t size, uint32_t capacity)
+{
+    // FatFs reports zero mode for ordinary files. The opened vnode must
+    // also be a file before the caller reads anything.
+    constexpr uint16_t typeMask = 0170000, regular = 0100000;
+    return !isDir && !isSymlink && size && size <= capacity &&
+           (!mode || (mode & typeMask) == regular);
+}
+
 inline bool AhciVmWriteSectorCount(const char* data, uint32_t length, uint64_t& sectors)
 {
     constexpr char version[] = "BRKAHCIVM1\n";
