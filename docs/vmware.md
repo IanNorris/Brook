@@ -54,8 +54,9 @@ the bridge's explicit `--auth-mode v3` and the matching operator seed. This
 bridge suite authenticates the operator to the guest.
 
 Open the generated `Brook.vmx` in Workstation. It connects one SATA disk and
-an e1000e adapter through a PCIe root port. The disk has a guarded EFI System
-Partition, two desktop slots, recovery boot files and an ext2 data partition.
+an e1000e adapter through a PCIe root port. It also enables the virtual HD
+Audio device for playback through the Brook mixer. The disk has a guarded EFI
+System Partition, two desktop slots, recovery boot files and an ext2 data partition.
 Brook admits writes only after checking the virtual disk's pinned GPT and
 ext2 identities and geometry. The manifest records those identities, the
 network mode, and hashes of the disk, boot files and public operator policy.

@@ -137,7 +137,7 @@ def make_initrds(work, build, payload, policy, profile, commit, name, autofit):
     tree = work / 'initrd'
     modules = tree / 'kernel/drivers'
     modules.mkdir(parents=True)
-    for module in ('e1000.mod', 'vmware_svga.mod'):
+    for module in ('e1000.mod', 'vmware_svga.mod', 'intel_hda.mod'):
         shutil.copy2(build / 'drivers' / module, modules / module)
     env = dict(os.environ, BROOK_BUILD_DIR=str(tree), BROOK_INITRD_KIB='16384')
     for key in ('BROOK_PROVIDER_PAYLOAD', 'BROOK_INITRD_MARKERS', 'BROOK_HARDWARE_PAYLOAD_ID'):
@@ -247,7 +247,9 @@ def vmx(network):
     lines += ['sata0.present = "TRUE"', 'sata0:0.present = "TRUE"', 'sata0:0.fileName = "brook.vmdk"',
               'ethernet0.present = "TRUE"', 'ethernet0.virtualDev = "e1000e"',
               f'ethernet0.connectionType = "{network}"', 'ethernet0.startConnected = "TRUE"',
-              'ethernet0.addressType = "generated"', 'sound.present = "FALSE"',
+              'ethernet0.addressType = "generated"', 'sound.present = "TRUE"',
+              'sound.virtualDev = "hdaudio"', 'sound.startConnected = "TRUE"',
+              'sound.autoDetect = "TRUE"', 'sound.fileName = "-1"',
               'serial0.present = "TRUE"', 'serial0.fileType = "file"', 'serial0.fileName = "serial.log"',
               'serial0.startConnected = "TRUE"']
     return '\n'.join(lines) + '\n'

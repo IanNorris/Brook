@@ -1,4 +1,4 @@
-// intel_hda_mod.cpp — Intel High Definition Audio driver for ICH9 (QEMU q35)
+// intel_hda_mod.cpp — Intel High Definition Audio playback for QEMU and VMware
 //
 // Implements:
 //   - Controller reset and Immediate Command Interface (ICI) for codec verbs
@@ -20,6 +20,7 @@
 #include "memory/physical_memory.h"
 #include "memory/address.h"
 #include "mem_tag.h"
+#include "vmware_platform.h"
 #ifdef BROOK_HOST_TEST
 #include <cstring>
 #else
@@ -133,10 +134,6 @@ static constexpr uint8_t SD_STS_DESE  = (1 << 4);  // Descriptor error
 
 // GCTL bits
 static constexpr uint32_t GCTL_CRST = (1 << 0);  // Controller reset
-
-// INTCTL bits
-static constexpr uint32_t INTCTL_GIE = (1u << 31);  // Global interrupt enable
-static constexpr uint32_t INTCTL_CIE = (1u << 30);  // Controller interrupt enable
 
 // ICS (Immediate Command Status) bits
 static constexpr uint16_t ICS_ICB = (1 << 0);  // Immediate Command Busy
@@ -1237,37 +1234,67 @@ static void HdaService()
 // Module init / exit
 // ---------------------------------------------------------------------------
 
+enum class HdaVmPlatform { None, Qemu, Vmware };
+
+template<class Cpuid>
+static HdaVmPlatform HdaPlaybackPlatform(Cpuid cpuid)
+{
+    if (VmwarePlatformPresent(cpuid)) return HdaVmPlatform::Vmware;
+    if (VmwarePortPlatformPresent(cpuid)) return HdaVmPlatform::Qemu;
+    return HdaVmPlatform::None;
+}
+
+static bool HdaVirtualController(HdaVmPlatform platform, const PciDevice& dev)
+{
+    if (dev.classCode != 0x04 || dev.subclass != 0x03 || dev.progIf != 0) return false;
+    if (platform == HdaVmPlatform::Vmware)
+        return dev.vendorId == 0x15ad && dev.deviceId == 0x1977;
+    return platform == HdaVmPlatform::Qemu && dev.vendorId == 0x8086 &&
+           (dev.deviceId == 0x2668 || dev.deviceId == 0x293e);
+}
+
+static uint64_t HdaControllerMmio(const PciDevice& dev)
+{
+    const uint32_t bar = dev.bar[0];
+    if (PciBarIsIo(bar) || (bar & 0x6) == 0x2 || (bar & 0x6) == 0x6) return 0;
+    uint64_t base = PciBarMemBase32(bar);
+    if (PciBarIs64(bar)) base |= uint64_t(dev.bar[1]) << 32;
+    // All global and stream registers we use are within the first 4 KiB.
+    return base && !(base & 4095) ? base : 0;
+}
+
 static int IntelHdaInit()
 {
-    PciDevice dev;
-    // ICH9 HDA: vendor 0x8086, device 0x293E
-    if (!PciFindDevice(0x8086, 0x293E, dev))
-    {
-        // Try ICH10
-        if (!PciFindDevice(0x8086, 0x3A3E, dev))
-        {
-            SerialPuts("intel_hda: PCI device not found\n");
-            return -1;
-        }
+    const auto cpuid = [](uint32_t leaf, uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) {
+        __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(leaf), "c"(0));
+    };
+    const auto platform = HdaPlaybackPlatform(cpuid);
+    PciDevice dev{};
+    bool found = false;
+    if (platform == HdaVmPlatform::Vmware) {
+        // Linux's HDA controller table identifies VMware HDAudio as 15ad:1977.
+        found = PciFindDevice(0x15ad, 0x1977, dev) && HdaVirtualController(platform, dev);
+    } else if (platform == HdaVmPlatform::Qemu) {
+        found = (PciFindDevice(0x8086, 0x293e, dev) && HdaVirtualController(platform, dev)) ||
+                (PciFindDevice(0x8086, 0x2668, dev) && HdaVirtualController(platform, dev));
     }
-
-    KPrintf("intel_hda: found at PCI %02x:%02x.%x\n",
-            dev.bus, dev.dev, dev.fn);
-
+    if (!found) {
+        SerialPuts("intel_hda: no supported virtual HDA controller\n");
+        return -1;
+    }
+    const uint64_t mmioPhys = HdaControllerMmio(dev);
+    if (!mmioPhys) {
+        SerialPuts("intel_hda: invalid MMIO BAR0\n");
+        return -1;
+    }
+    SerialPrintf("intel_hda: %s HDA %04x:%04x at %02x:%02x.%x\n",
+                 platform == HdaVmPlatform::Vmware ? "VMware" : "QEMU",
+                 dev.vendorId, dev.deviceId, dev.bus, dev.dev, dev.fn);
     PciEnableMemSpace(dev);
     PciEnableBusMaster(dev);
 
-    // Get BAR0 (MMIO)
-    uint32_t bar0 = dev.bar[0] & ~0xFu;
-    if (!bar0)
-    {
-        SerialPuts("intel_hda: BAR0 is 0\n");
-        return -1;
-    }
-
     // Map MMIO pages into kernel virtual address space
-    uint64_t mmioPhys = bar0;
-    uint32_t mmioPages = 4; // 16KB
+    constexpr uint32_t mmioPages = 1;
     auto mmioVaddr = VmmAllocPages(mmioPages, VMM_WRITABLE | VMM_CACHE_DISABLE,
                                     MemTag::Device, KernelPid);
     if (!mmioVaddr)
@@ -1294,6 +1321,11 @@ static int IntelHdaInit()
 
     KPrintf("intel_hda: HDA v%d.%d, ISS=%d OSS=%d\n",
             vmaj, vmin, g_numInputStreams, g_numOutputStreams);
+
+    if (gcap == 0xffff || vmaj != 1 || !g_numOutputStreams) {
+        SerialPuts("intel_hda: no HDA 1.x output stream\n");
+        return -1;
+    }
 
     // Output stream 0 descriptor base
     g_outStreamBase = SD_BASE + g_numInputStreams * 0x20;
@@ -1349,9 +1381,9 @@ static int IntelHdaInit()
     HDA_VPRINTF("intel_hda: DMA BDL phys=0x%lx audio frag0=0x%lx frag1=0x%lx (%u pages)\n",
                  g_bdlPhys, g_fragPhys[0], g_fragPhys[1], audioPages);
 
-    // Enable interrupts (global + controller + output stream 0)
-    hda_write32(INTCTL, INTCTL_GIE | INTCTL_CIE |
-                         (1 << (g_numInputStreams)));
+    // The mixer services the virtual stream by polling LPIB and status. No
+    // guest IRQ handler is installed for the emulated controller's PCI pin.
+    hda_write32(INTCTL, 0);
 
     g_initialized = true;
 
@@ -1386,4 +1418,4 @@ static void IntelHdaExit()
 }
 
 DECLARE_MODULE("intel_hda", IntelHdaInit, IntelHdaExit,
-               "Intel HD Audio controller driver (ICH9)");
+               "HD Audio playback for QEMU and VMware");

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify VMware network defaults without building or booting an image."""
+"""Verify VMware VMX configuration without building or booting an image."""
 
 import argparse
 import unittest
@@ -26,6 +26,13 @@ class VmwareNetworkTest(unittest.TestCase):
 
     def test_builder_preserves_explicit_host_only(self):
         self.check_vmx_network([*REQUIRED, '--network', 'hostonly'], 'hostonly')
+
+    def test_generated_vmx_enables_hd_audio(self):
+        vmx = make_vmware_image.vmx('nat').splitlines()
+        self.assertEqual([line for line in vmx if line.startswith('sound.present')],
+                         ['sound.present = "TRUE"'])
+        self.assertIn('sound.virtualDev = "hdaudio"', vmx)
+        self.assertIn('sound.startConnected = "TRUE"', vmx)
 
     def test_image_command_inherits_default_and_forwards_override(self):
         for apps in (None, ['firefox']):

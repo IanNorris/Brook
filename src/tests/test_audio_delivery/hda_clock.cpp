@@ -92,6 +92,40 @@ void finishPhysical() {
 void HdaTestAfterCopy() { if(afterCopyHook) {auto hook=afterCopyHook;afterCopyHook=nullptr;hook();} }
 int RunHdaClockTests() {
     using namespace brook;
+    auto platform = [](bool hypervisor, uint32_t ebx, uint32_t ecx, uint32_t edx) {
+        return HdaPlaybackPlatform([&](uint32_t leaf, uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) {
+            a=b=c=d=0;
+            if (leaf==1) c=hypervisor ? 1u<<31 : 0;
+            if (leaf==0x40000000u) { a=leaf; b=ebx; c=ecx; d=edx; }
+        });
+    };
+    const auto vmware=platform(true,0x61774d56u,0x4d566572u,0x65726177u);
+    const auto qemu=platform(true,0x54474354u,0x43544743u,0x47435447u);
+    const auto kvm=platform(true,0x4b4d564bu,0x564b4d56u,0x0000004du);
+    VERIFY(vmware==HdaVmPlatform::Vmware && qemu==HdaVmPlatform::Qemu && kvm==qemu);
+    VERIFY(platform(false,0x61774d56u,0x4d566572u,0x65726177u)==HdaVmPlatform::None);
+    VERIFY(platform(true,0x12345678u,0u,0u)==HdaVmPlatform::None);
+    PciDevice controller{};
+    controller.classCode=0x04;controller.subclass=0x03;
+    controller.vendorId=0x15ad;controller.deviceId=0x1977;
+    VERIFY(HdaVirtualController(vmware,controller) && !HdaVirtualController(qemu,controller));
+    controller.vendorId=0x8086;controller.deviceId=0x293e;
+    VERIFY(HdaVirtualController(qemu,controller) && !HdaVirtualController(vmware,controller) &&
+           !HdaVirtualController(HdaVmPlatform::None,controller));
+    controller.deviceId=0x2668;
+    VERIFY(HdaVirtualController(qemu,controller));
+    controller.subclass=1;
+    VERIFY(!HdaVirtualController(qemu,controller));
+    controller.subclass=3;controller.deviceId=0x9ca0;
+    VERIFY(!HdaVirtualController(qemu,controller) && !HdaVirtualController(vmware,controller));
+    controller.bar[0]=0xfebf0000;
+    VERIFY(HdaControllerMmio(controller)==0xfebf0000);
+    controller.bar[0]|=4;controller.bar[1]=0x42;
+    VERIFY(HdaControllerMmio(controller)==0x42febf0000);
+    for (uint32_t invalid : {0u, 0xffffffffu, 0xfebf0001u, 0xfebf0040u, 0xfebf0006u}) {
+        controller.bar[0]=invalid;
+        VERIFY(!HdaControllerMmio(controller));
+    }
     AudioDmaClock reserved{};
     VERIFY(reserved.Accept(16) && reserved.Start(0,100));
     VERIFY(reserved.Observe(4,200,201,false) && reserved.completed==4);
