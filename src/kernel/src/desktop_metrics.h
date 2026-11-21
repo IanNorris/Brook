@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include "../../shared/brook_caption_strip.h"
 
 namespace brook {
 // Immutable values shared by physical-pixel layout and input hit testing.
@@ -17,7 +18,7 @@ struct DesktopMetrics {
     // caption targets, taskbar 48 with full-height targets.
     static constexpr int BorderBase = 2;
     static constexpr int TitleBase = 40;
-    static constexpr int CaptionButtonBase = 48;
+    static constexpr int CaptionButtonBase = BROOK_CAPTION_BUTTON_LOGICAL_WIDTH;
     static constexpr int TaskbarBase = 48;
     static constexpr int IconBase = 24;
     static constexpr int FontBase = 16;

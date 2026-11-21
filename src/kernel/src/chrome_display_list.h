@@ -49,7 +49,7 @@ enum class ChromeOp : uint8_t {
     FadeX,        // source-over horizontal stroke, from solid to clear
     Fill,         // solid rect, replaces the destination
     Rows,         // one colour per row (title material gradient)
-    CornerFill,   // solid rect clipped to a rounded top-right corner of clip
+    CornerFill,   // solid or row-coloured rect clipped to the rounded top-right of clip
     MaterialOutline, // one-pixel stroke with rounded corners
     MaterialRect, // solid rect with rounded corners, top and bottom
     Text,         // glyph run, source-over by coverage
@@ -90,6 +90,9 @@ public:
     void Rows(int x, int y, int w, int h, const uint32_t* colors) { Push({ChromeOp::Rows, x, y, w, h, 0, 0, 0, 0, {}, colors}); }
     void CornerFill(int x, int y, int w, int h, uint32_t color, const DesktopRect& block, unsigned radius) {
         Push({ChromeOp::CornerFill, x, y, w, h, color, radius, 0, 0, block, nullptr});
+    }
+    void CornerRows(const DesktopRect& r, unsigned radius, const uint32_t* rgb) {
+        Push({ChromeOp::CornerFill, r.x, r.y, r.w, r.h, 0, radius, 0, 0, r, rgb});
     }
     void MaterialOutline(const DesktopRect& r, uint32_t color, unsigned radius) {
         Push({ChromeOp::MaterialOutline, r.x, r.y, r.w, r.h, color, radius, 0, 0, {}, nullptr});
@@ -178,7 +181,7 @@ inline uint64_t ChromeListKey(const ChromeDisplayList& list, uint64_t seed) {
             for (; text[n]; ++n) word(uint8_t(text[n]));
             word(n);
         } else word(c.arg);
-        if (c.op == ChromeOp::Rows && c.data) {
+        if ((c.op == ChromeOp::Rows || c.op == ChromeOp::CornerFill) && c.data) {
             const uint32_t* rows = static_cast<const uint32_t*>(c.data);
             for (int32_t r = 0; r < c.h; ++r) word(rows[r]);
         } else if (c.op == ChromeOp::Icon) {

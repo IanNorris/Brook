@@ -1117,6 +1117,7 @@ static int CreateWindowLocked(Process* proc, int16_t x, int16_t y,
     w.captionOverlay = false;
     w.captionInsetRight = w.captionInsetTop = w.captionHeight = 0;
     w.captionStyle = 0;
+    w.captionStrip = {}; w.captionStripRevision = 0;
     w.focusable = focusable;
     w.savedX = x;
     w.savedY = y;
@@ -1394,7 +1395,7 @@ Window* WmGetWindow(int idx)
 
 void WmSetClientSideDecoration(int idx, bool enable, bool captionOverlay,
                                uint16_t insetRight, uint16_t insetTop, uint16_t captionHeight,
-                               uint32_t captionStyle)
+                               uint32_t captionStyle, const BrookCaptionStrip* strip)
 {
     VfbGuard guard;
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
@@ -1403,6 +1404,14 @@ void WmSetClientSideDecoration(int idx, bool enable, bool captionOverlay,
     captionOverlay = enable && captionOverlay;
     if (!captionOverlay) insetRight = insetTop = captionHeight = 0;
     if (!captionOverlay || !(captionStyle & DesktopCaptionStyleValid)) captionStyle = 0;
+    const BrookCaptionStrip empty{};
+    if (!captionStyle || !strip || strip->count != captionHeight ||
+        strip->count > BROOK_CAPTION_STRIP_MAX_ROWS) strip = &empty;
+    // Only the overlay is suspended while fullscreen or docked. Keep the
+    // current strip for the decoration restored when the window returns.
+    const bool stripChanged = w.captionStrip.count != strip->count ||
+        memcmp(w.captionStrip.rgb, strip->rgb, strip->count * sizeof(uint32_t)) != 0;
+    if (stripChanged) { w.captionStrip = *strip; ++w.captionStripRevision; }
     if (w.fullscreen) {
         w.fsNoChrome = enable; w.fsCaptionOverlay = captionOverlay;
         w.fsCaptionInsetRight = insetRight; w.fsCaptionInsetTop = insetTop;
@@ -1418,7 +1427,7 @@ void WmSetClientSideDecoration(int idx, bool enable, bool captionOverlay,
     }
     if (w.noChrome == enable && w.captionOverlay == captionOverlay &&
         w.captionInsetRight == insetRight && w.captionInsetTop == insetTop &&
-        w.captionHeight == captionHeight && w.captionStyle == captionStyle) return;
+        w.captionHeight == captionHeight && w.captionStyle == captionStyle && !stripChanged) return;
     const bool modeChanged = w.noChrome != enable || w.captionOverlay != captionOverlay;
     w.noChrome = enable;
     w.captionOverlay = captionOverlay;
@@ -2083,7 +2092,7 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
     if (w.noChrome && !w.captionOverlay) return;
     LauncherReadGuard icons;
     const ChromeFrameModel model{WindowChromeLayout(w), w.clientW, w.focused, w.state == WindowState::Maximized,
-                                 w.noChrome, w.captionStyle, WindowDisplayTitle(w), WindowIcon(w, icons.get()), mouseX, mouseY};
+                                 w.noChrome, w.captionStyle, WindowDisplayTitle(w), WindowIcon(w, icons.get()), mouseX, mouseY, &w.captionStrip};
     ChromeFrameStorage storage;
     ChromeDisplayList list = ChromeListOn(storage);
     ChromeBuildFrame(model, WmChromeStyle(), list);
@@ -3374,6 +3383,7 @@ static uint64_t DesktopChromeKeyLocked(const DesktopChromeEpochs& layers,const W
     in.captionOverlay=origin0.noChrome && origin0.captionOverlay ?
         (1ull<<63)|(uint64_t(origin0.captionHeight)<<32)|(uint64_t(origin0.captionInsetTop)<<16)|origin0.captionInsetRight : 0;
     in.captionStyle=origin0.noChrome && origin0.captionOverlay ? origin0.captionStyle : 0;
+    if (in.captionStyle) in.captionStripRevision = origin0.captionStripRevision;
     in.hoverButton=hover;
     in.dockButton=CaptionGeometry(origin0).dockButton;
     in.theme=layers.theme;in.appearance=layers.appearance;in.scale=layers.scale;

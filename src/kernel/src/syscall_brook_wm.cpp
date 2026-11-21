@@ -460,12 +460,13 @@ int64_t sys_brook_wm_resize_vfb(uint64_t wmId, uint64_t newW,
 //   height is the client's title-strip height in VFB pixels (0: native title
 //   height), so the buttons span the whole strip. style is the client's
 //   sampled strip colour and corner radius (DesktopCaptionStyle* packing in
-//   desktop_metrics.h; 0 keeps Brook's title colours).
-//   Returns 2 when the caption overlay is in effect (older kernels return 0
+//   desktop_metrics.h; 0 keeps Brook's title colours). An optional final
+//   pointer supplies per-output-row colours in mode 3, including the client's rim.
+//   Returns 2 or 3 for the accepted caption mode (older kernels return 0
 //   and treat mode 2 as plain CSD), otherwise 0.
 int64_t sys_brook_wm_set_decoration_mode(uint64_t wmId, uint64_t csd,
                                           uint64_t insets, uint64_t height,
-                                          uint64_t style, uint64_t)
+                                          uint64_t style, uint64_t stripPtr)
 {
     Process* proc = ProcessCurrent();
     if (!proc) return -ESRCH;
@@ -475,13 +476,19 @@ int64_t sys_brook_wm_set_decoration_mode(uint64_t wmId, uint64_t csd,
     brook::Window* w = brook::WmFindWindowById(proc, static_cast<uint32_t>(wmId));
     if (!w) return -EINVAL;
     int idx = static_cast<int>(wmId) - 1;
-    const bool overlay = csd == 2;
+    const bool rows = csd == 3;
+    const bool overlay = csd == 2 || rows;
+    BrookCaptionStrip strip{};
+    if (rows) {
+        if (!CopyFromUser(&strip, stripPtr, sizeof(strip))) return -EFAULT;
+        if (strip.count > BROOK_CAPTION_STRIP_MAX_ROWS || strip.count != height) return -EINVAL;
+    }
     brook::WmSetClientSideDecoration(idx, csd != 0, overlay,
                                      static_cast<uint16_t>(overlay ? insets & 0xFFFFu : 0),
                                      static_cast<uint16_t>(overlay ? insets >> 16 : 0),
                                      static_cast<uint16_t>(overlay ? height : 0),
-                                     static_cast<uint32_t>(overlay ? style : 0));
-    return overlay ? 2 : 0;
+                                     static_cast<uint32_t>(overlay ? style : 0), rows ? &strip : nullptr);
+    return overlay ? static_cast<int64_t>(csd) : 0;
 }
 
 // 0xB00 (2816): WM_SET_WINDOW_PROPERTIES(wmId, mask, opacity, blurRadius)
