@@ -45,4 +45,9 @@ SECTIONS
 
     . = ALIGN(4096);
     __kernel_end = .;
+
+    /* Host build metadata. Keep it outside the loaded kernel image. */
+    .brook_capabilities 0 (INFO) : {
+        KEEP(*(.brook_capabilities))
+    }
 }

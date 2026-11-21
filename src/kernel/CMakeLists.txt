@@ -245,6 +245,7 @@ endif()
 # ---------------------------------------------------------------------------
 
 add_executable(kernel
+    src/kernel_capabilities.cpp
     src/volume_pop.cpp
     "${BOOT_LOGO_HEADER}"
     src/kernel.cpp
@@ -778,7 +779,14 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL "" FORCE)
 # The generated .cpp replaces the stub so the NEXT build links the real table.
 # Two builds are required for a complete symbol table.
 # ---------------------------------------------------------------------------
+set(KERNEL_CAPABILITIES_SCRIPT "${BROOK_ROOT}/scripts/kernel_capabilities.py")
+set(KERNEL_CAPABILITIES_JSON "${CMAKE_CURRENT_BINARY_DIR}/kernel-capabilities.json")
+set_property(TARGET kernel APPEND PROPERTY LINK_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/linker.ld" "${KERNEL_CAPABILITIES_SCRIPT}")
 add_custom_command(TARGET kernel POST_BUILD
+    BYPRODUCTS "${KERNEL_CAPABILITIES_JSON}"
+    COMMAND ${BROOK_PYTHON3} "${KERNEL_CAPABILITIES_SCRIPT}"
+            "$<TARGET_FILE:kernel>" --output "${KERNEL_CAPABILITIES_JSON}"
     COMMAND ${BROOK_PYTHON3} "${BROOK_ROOT}/scripts/gen_ksym_table.py"
             "$<TARGET_FILE:kernel>" "${KSYM_TABLE_CPP}.tmp"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KSYM_TABLE_CPP}.tmp" "${KSYM_TABLE_CPP}"
