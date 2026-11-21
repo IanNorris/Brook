@@ -1110,13 +1110,19 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
     }
 #endif
     if(!strcmp(command,"bridge hardware ahci-ro")) {
-        const auto s=AhciReadOnlyGetStatus();Reply r;
+        AhciPortRegisters registers{};
+        const auto s=AhciReadOnlyGetStatus(&registers);Reply r;
         r.text("{\"ahci_ro_api\":1,\"requested\":");r.text(s.requested?"true":"false");
         r.text(",\"ready\":");r.text(s.ready?"true":"false");r.text(",\"quarantined\":");r.text(s.quarantined?"true":"false");
         r.text(",\"reason\":");r.quoted(s.reason);r.text(",");r.field("port",s.port);
         r.text(",");r.field("sectors",s.sectors);r.text(",");r.field("logical_sector_bytes",s.logicalSectorBytes);
         r.text(",");r.field("physical_sector_bytes",s.physicalSectorBytes);r.text(",\"model\":");r.quoted(s.model);
         r.text(",\"serial\":");r.quoted(s.serial);
+        r.text(",\"port_registers\":");
+        if(registers.available) {
+            r.text("{");r.field("pxcmd",registers.cmd);r.text(",");r.field("pxsctl",registers.sctl);
+            r.text(",");r.field("pxssts",registers.ssts);r.text(",");r.field("pxserr",registers.serr);r.text("}");
+        } else r.text("null");
         const auto irq=AhciReadOnlyIrqStatus();const auto w=AhciReadOnlyIoStats();
         r.text(",\"completion\":{\"irq_configured\":");r.text(irq.configured?"true":"false");
         r.text(",\"irq_active\":");r.text(irq.active?"true":"false");r.text(",\"irq_reason\":");r.quoted(irq.reason);

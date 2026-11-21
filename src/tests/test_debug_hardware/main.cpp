@@ -102,8 +102,12 @@ AppSnapshotBootInfo snapshot;
 WritableDesktopInfo writable;
 WritableDesktopInfo WritableDesktopRead(){return writable;}
 AhciReadOnlyStatus ahciStatus{};
+AhciPortRegisters ahciRegisters{};
 AhciObservation ahciObservation{};
-AhciReadOnlyStatus AhciReadOnlyGetStatus(){return ahciStatus;}
+AhciReadOnlyStatus AhciReadOnlyGetStatus(AhciPortRegisters* registers){
+    if(registers)*registers=ahciRegisters;
+    return ahciStatus;
+}
 AhciIoStats ahciIoStats{};
 AhciIoStats AhciReadOnlyIoStats(){return ahciIoStats;}
 uint64_t ahciSpinUs=100;
@@ -258,11 +262,14 @@ int main(){
     brook::tscObservation.cores[0].interval.lower=-12;brook::tscObservation.cores[0].interval.upper=34;
     assert(handle("bridge hardware native-tsc-observe") && reply.find("\"lower\":-12,\"upper\":34")!=std::string::npos);
     brook::ahciStatus.ready=true;std::strcpy(brook::ahciStatus.serial,"serial-123");
-    assert(handle("bridge hardware ahci-ro") && reply.find("\"serial\":\"serial-123\"")!=std::string::npos);
+    assert(handle("bridge hardware ahci-ro") && reply.find("\"serial\":\"serial-123\"")!=std::string::npos &&
+           reply.find("\"port_registers\":null")!=std::string::npos);
+    brook::ahciRegisters={true,0x4017,0x200,0x633,0x10000};
     brook::ahciIoStats.waits=7;brook::ahciIoStats.irqWakes=5;
     assert(handle("bridge hardware ahci-ro") && reply.find("\"irq_active\":true")!=std::string::npos &&
            reply.find("\"waits\":7")!=std::string::npos && reply.find("\"irq_wakes\":5")!=std::string::npos &&
-           reply.find("\"vector\":64")!=std::string::npos);
+           reply.find("\"vector\":64")!=std::string::npos &&
+           reply.find("\"port_registers\":{\"pxcmd\":16407,\"pxsctl\":512,\"pxssts\":1587,\"pxserr\":65536}")!=std::string::npos);
     assert(handle("bridge hardware ahci-spin-us 20") && reply.find("\"applied\":true")!=std::string::npos &&
            reply.find("\"spin_us\":20")!=std::string::npos);
     assert(handle("bridge hardware ahci-spin-us 5000") && reply.find("\"applied\":false")!=std::string::npos &&

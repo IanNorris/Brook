@@ -63,7 +63,7 @@ int main(){
             fault.transferredBytes=noData ? 0 : 512;
             return noData ? SubmitNoData(fault) : Submit(fault,512);
         };
-        for(uint32_t change:{1u<<31,1u<<22,1u<<6}) {
+        for(uint32_t change:{1u<<31,1u<<6}) {
             Mock pending;
             pending.regs[IS/4]=change;
             assert(submit(pending)==Result::MediaChanged && !pending.writes);
@@ -77,10 +77,19 @@ int main(){
             inFlight.injectIs=change|1;
             assert(submit(inFlight)==Result::MediaChanged && inFlight.commandIssues==1);
         }
-        for(uint32_t change:{1u<<26,1u<<16}) {
-            Mock diag;
-            diag.regs[SERR/4]=change;
-            assert(submit(diag)==Result::MediaChanged && !diag.writes);
+        for(uint32_t link:{0x233u,0x633u}) { // Partial and Slumber, DET=3
+            Mock lpm;
+            lpm.regs[SSTS/4]=link;
+            lpm.regs[IS/4]=1u<<22;   // PRCS
+            lpm.regs[SERR/4]=1u<<16; // DIAG.N
+            lpm.injectIs=1u|(1u<<22);
+            assert(submit(lpm)==Result::Ok && lpm.commandIssues==1);
+            assert(lpm.regs[SERR/4]==(1u<<16));
+
+            // Device exchange while the PhyRdy latch is already set is still
+            // a media change, even when the live link has returned to DET=3.
+            lpm.regs[SERR/4]|=1u<<26;
+            assert(submit(lpm)==Result::MediaChanged && lpm.commandIssues==1);
         }
         Mock disconnected;
         disconnected.regs[SSTS/4]=0;

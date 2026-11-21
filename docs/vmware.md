@@ -66,8 +66,10 @@ and physical sectors. Keep its geometry and leave other SATA ports unused.
 Use IDE if you add a CD-ROM. A changed disk, additional active SATA device,
 expanded disk or different sector geometry causes boot to halt before writable
 mounts. The generated VM configuration disables hot-plug. Brook also
-quarantines the disk until reboot if the controller reports a SATA connection
-change during operation.
+quarantines the disk until reboot if the controller reports a possible disk
+replacement. Normal SATA link power transitions can continue. The authenticated
+bridge command `bridge hardware ahci-ro` includes a read-only `port_registers`
+snapshot for the selected port when available.
 
 Install Brook system or recovery updates by rebuilding the VMDK. The
 in-place system and recovery tools require the physical-machine write policy
