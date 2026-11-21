@@ -3,7 +3,13 @@
 namespace brook {
 // Kernel-owned immutable launch environments. Mesa's virtio-specific driver
 // and ICD overrides must not constrain machines without a virtio GPU backend.
-template<uint32_t N> struct DesktopGpuEnvironment { const char* entries[N+4]{}; };
+template<uint32_t N> struct DesktopGpuEnvironment {
+    const char* entries[N+4]{};
+    const char* profileFontEntries[N+4]{};
+    constexpr const char* const* forProfile(bool profileFonts) const {
+        return profileFonts ? profileFontEntries : entries;
+    }
+};
 struct DesktopMesaPaths { const char* dri; const char* gbm; const char* egl; };
 constexpr bool DesktopTrustedGpuPath(uint32_t uid,uint16_t mode,bool isDir,bool isSymlink,bool expectDir) {
     return uid==0 && !(mode&0022) && !isSymlink && isDir==expectDir;
@@ -28,6 +34,14 @@ template<uint32_t N> constexpr DesktopGpuEnvironment<N> DesktopBuildGpuEnvironme
     if(!virtio && intelIcd){out.entries[count++]=intelIcd;out.entries[count++]="BROOK_I915_PARTIAL_CAPTURE=1";}
     out.entries[count++]=direct?"MESA_VK_WSI_DEBUG=":"MESA_VK_WSI_DEBUG=sw,noshm";
     out.entries[count++]=direct?"BROOK_VULKAN_PRESENTATION=direct":"BROOK_VULKAN_PRESENTATION=staged";
+    for(uint32_t i=0;i<count;++i) {
+        const char* entry=out.entries[i];
+        if(DesktopEnvPrefix(entry,"FONTCONFIG_FILE="))
+            entry="FONTCONFIG_FILE=/nix/profile/etc/fonts/brook-selected.conf";
+        else if(DesktopEnvPrefix(entry,"FONTCONFIG_PATH="))
+            entry="FONTCONFIG_PATH=/nix/profile/etc/fonts";
+        out.profileFontEntries[i]=entry;
+    }
     return out;
 }
 }

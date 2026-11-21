@@ -1,4 +1,4 @@
-{ pkgs, fonts, cursors }:
+{ pkgs, fonts, cursors, selectedProfile ? false }:
 ''
   #!${pkgs.bash}/bin/bash
   export PATH=/nix/bin:/nix/profile/bin:/boot/BIN:/data/bin
@@ -6,7 +6,7 @@
   source ${../data/nix-wrappers/brook-session-env.sh} /tmp || exit 1
   export GDK_BACKEND=wayland SDL_VIDEODRIVER=wayland
   export DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/brook-session-bus
-  export FONTCONFIG_FILE=${fonts}/etc/fonts/fonts.conf FONTCONFIG_PATH=${fonts}/etc/fonts
+  export FONTCONFIG_FILE=${if selectedProfile then "/nix/profile/etc/fonts/brook-selected.conf" else "${fonts}/etc/fonts/fonts.conf"} FONTCONFIG_PATH=${if selectedProfile then "/nix/profile/etc/fonts" else "${fonts}/etc/fonts"}
   export XCURSOR_PATH=${cursors}/share/icons XCURSOR_THEME=default
   export XDG_DATA_DIRS=/nix/profile/share
   export XDG_CONFIG_HOME=$HOME/.config XDG_CACHE_HOME=$HOME/.cache XDG_DATA_HOME=$HOME/.local/share

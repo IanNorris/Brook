@@ -250,14 +250,20 @@ static bool DellMesaAvailable() {
     return true;
 }
 const char* const* ShellGetDefaultEnvp() {
+    // Selected profiles provide their own cache location for direct launches,
+    // including early services, terminal children and Xwayland.
+    VnodeStat fontConfig{};
+    const bool profileFonts=!VfsLstatPath("/nix/profile/etc/fonts/brook-selected.conf",&fontConfig)
+        && !fontConfig.isDir;
     const auto* app=GpuAppGet();
     if(!app){
-        if(!DellMesaAvailable())return g_nonVirtioEnvironment.entries;
-        return BdwAutomaticRenderRequested() && DellVulkanAvailable()?g_dellVulkanEnvironment.entries:g_dellMesaEnvironment.entries;
+        if(!DellMesaAvailable())return g_nonVirtioEnvironment.forProfile(profileFonts);
+        return (BdwAutomaticRenderRequested() && DellVulkanAvailable()?
+            g_dellVulkanEnvironment:g_dellMesaEnvironment).forProfile(profileFonts);
     }
     const auto caps=app && app->Capabilities?app->Capabilities():GpuAppCapabilities{};
-    return GpuVulkanDirectPresentation(CompositorGpuActive(),caps,app && app->PrepareBlobImage)?
-        g_directEnvironment.entries:g_stagedEnvironment.entries;
+    return (GpuVulkanDirectPresentation(CompositorGpuActive(),caps,app && app->PrepareBlobImage)?
+        g_directEnvironment:g_stagedEnvironment).forProfile(profileFonts);
 }
 
 uint32_t ShellGetDefaultEnvpCount()

@@ -48,10 +48,19 @@ let
     pathsToLink = [ "/bin" "/share/man" "/share/info" "/share/bash-completion"
                     "/share/zsh" "/share/fish" "/share/mime" ];
   };
+  # Reuse the pinned font files and aliases. Caches are mutable user data,
+  # so a desktop startup must never write them into a signed store path.
+  fontConfig = pkgs.runCommand "brook-selected-fontconfig" {} ''
+    mkdir -p "$out/etc/fonts"
+    sed -e '\|<cachedir>.*</cachedir>|d' \
+        -e '\|</dir>|a\  <cachedir prefix="xdg">fontconfig</cachedir>' \
+        ${fonts}/etc/fonts/fonts.conf > "$out/etc/fonts/brook-selected.conf"
+    test "$(grep -c '<cachedir' "$out/etc/fonts/brook-selected.conf")" = 1
+  '';
   launchers = pkgs.runCommand "brook-selected-app-launchers" {} ''
     mkdir -p "$out/bin" "$out/share/applications"
     cat > "$out/bin/brook-run" <<'SCRIPT'
-    ${import ./network-session-wrapper.nix { inherit pkgs fonts cursors; }}SCRIPT
+    ${import ./network-session-wrapper.nix { inherit pkgs fonts cursors; selectedProfile = true; }}SCRIPT
     ${lib.concatMapStringsSep "\n" (app:
       lib.optionalString (app ? wrapperSource) ''
         install -m 755 ${app.wrapperSource} "$out/bin/${app.executable}"
@@ -75,7 +84,7 @@ let
     chmod +x "$out/bin/"*
   '';
   sessionPackages = [ (import ./closure-stage.nix { inherit pkgs; selectedProfiles = true; })
-                      (lib.hiPrio launchers) pkgs.xz.bin pkgs.zstd.bin ]
+                      (lib.hiPrio launchers) fontConfig pkgs.xz.bin pkgs.zstd.bin ]
     ++ base.packages ++ lib.concatMap (app: app.packages) selected;
   directPackages = lib.unique (sessionPackages ++ cliPackages);
   linkedPackages = lib.unique (sessionPackages ++ [ manifestPackage ] ++ lib.optional (cliPackages != [ ]) cli);
