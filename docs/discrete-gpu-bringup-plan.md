@@ -49,7 +49,8 @@ space reads only; BARs decoded, never sized, so sizes are alignment bounds):
   02:00.2 a **USB 3.1 xHCI** for VirtualLink (10de:1ad8, BARs 0xd2000000 and
   0xd2040000), and 02:00.3 a USB-C UCSI serial-bus function (10de:1ad9). A bus or
   function reset of the GPU affects all four functions. Brook's xHCI driver
-  claims 02:00.2 like any other xHCI.
+  finds 02:00.2 but leaves it undriven (run 2: `not driven: register
+  bounds`).
 - **VT-d:** a single DRHD at 0xfed90000 with INCLUDE_PCI_ALL (segment 0, host
   address width 39, interrupt remapping supported). Firmware left DMA
   translation and IRQ remapping off (gsts 0). One RMRR at
