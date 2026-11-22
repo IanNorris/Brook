@@ -1110,9 +1110,14 @@ int64_t IntelRenderIoctl(brook::BdwGpuFile* file,uint64_t cmd,uint64_t arg,uint6
     // restarts (SA_RESTART) or Mesa's drmIoctl retries it.
     if(result<0 && result!=-EINTR && (cmd&0xff)==0x69){
         static uint64_t refusals=0;const char* why=brook::BdwTakeRefusal();
-        if(brook::BdwRefusalLogDue(refusals))
-            KPrintf("gpu-exec: execbuffer refused pid=%u errno=%ld reason=%s count=%lu\n",user.submitterPid,-result,
+        if(brook::BdwRefusalLogDue(refusals)){
+            brook::BdwRefusalDetail d{};
+            if(brook::BdwRefusalDetailFor(why,d))
+                KPrintf("gpu-exec: execbuffer refused pid=%u errno=%ld reason=%s value=%lu limit=%lu object=%ld count=%lu\n",
+                    user.submitterPid,-result,why,d.value,d.limit,d.object==brook::BdwRefusalNoObject?-1l:long(d.object),refusals);
+            else KPrintf("gpu-exec: execbuffer refused pid=%u errno=%ld reason=%s count=%lu\n",user.submitterPid,-result,
                 why?why:"unrecorded",refusals);
+        }
     }else if((cmd&0xff)==0x69)(void)brook::BdwTakeRefusal();
     else if((cmd&0xff)==0x72){
         static uint64_t losses=0;

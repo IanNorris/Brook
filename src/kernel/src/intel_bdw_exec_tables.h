@@ -27,7 +27,7 @@ struct BdwPpgttCacheStats {
 // re-inspected and republished for each job.
 class BdwExecTables {
 public:
-    static constexpr uint32_t Max=BdwPpgttMaxTables, ScratchPages=4, CacheSlots=4;
+    static constexpr uint32_t Max=BdwPpgttMaxTables, ScratchPages=4, CacheSlots=4, CachedPages=65536;
     using ListFree=void(*)(BdwPpgttMapping*);
 private:
     struct Entry {BdwOwnedPage pages[Max+ScratchPages];uint32_t count=0,tables=0;BdwPpgttMapping* list=nullptr;
@@ -85,7 +85,10 @@ public:
         allocator_=&a;snapshot_=snapshot;reused_=false;checksum_=0;
         // Inspection, admission and publication accept at most Max pages, so
         // a reusable set (tables plus its own scratch) must fit within Max.
-        const bool enabled=CacheEnabled(),cache=enabled && count+ScratchPages<=Max;
+        // A retained set keeps its 24-byte/page mapping list: only sets of
+        // at most CachedPages are retained, bounding the cache to 6 MiB.
+        const bool enabled=CacheEnabled(),cache=enabled && count+ScratchPages<=Max &&
+            BdwExecSnapshotPageCount(snapshot)<=CachedPages;
         if(!enabled){
             bool any=false;for(auto& e:cache_)if(e.valid){DropEntry(a,e);any=true;}
             if(any)++stats_.dropped;

@@ -178,7 +178,11 @@ BdwGpuBuffer* BdwGpuFileGetBuffer(BdwGpuFile* f,uint32_t handle){
     if(!f || !handle || handle>BdwMaxHandles)return nullptr;
     BdwFileGuard guard(&f->lock);auto* b=f->slots[handle-1].buffer;BdwGpuBufferRef(b);return b;
 }
-bool BdwGpuFileResolveBuffers(BdwGpuFile* f,const uint32_t* handles,uint32_t count,BdwGpuBuffer** out){
+uint32_t BdwGpuFileMaxHandles(){return BdwMaxHandles;}
+bool BdwGpuFileResolveBuffers(BdwGpuFile* f,const uint32_t* handles,uint32_t count,BdwGpuBuffer** out,
+                              uint32_t* failedIndex,bool* duplicate){
+    if(failedIndex)*failedIndex=~uint32_t{0};
+    if(duplicate)*duplicate=false;
     if(!f || !handles || !out || !count || count>BdwMaxHandles)return false;
     const uintptr_t a=reinterpret_cast<uintptr_t>(handles),b=reinterpret_cast<uintptr_t>(out);
     const uint64_t aBytes=uint64_t(count)*sizeof(*handles),bBytes=uint64_t(count)*sizeof(*out);
@@ -186,9 +190,9 @@ bool BdwGpuFileResolveBuffers(BdwGpuFile* f,const uint32_t* handles,uint32_t cou
     uint64_t seen[BdwMaxHandles/64]{};
     BdwFileGuard guard(&f->lock);
     for(uint32_t i=0;i<count;++i){const uint32_t h=handles[i];
-        if(!h || h>BdwMaxHandles || !f->slots[h-1].buffer)return false;
+        if(!h || h>BdwMaxHandles || !f->slots[h-1].buffer){if(failedIndex)*failedIndex=i;return false;}
         const uint32_t index=h-1;const uint64_t bit=uint64_t{1}<<(index%64);
-        if(seen[index/64]&bit)return false;
+        if(seen[index/64]&bit){if(failedIndex)*failedIndex=i;if(duplicate)*duplicate=true;return false;}
         seen[index/64]|=bit;
     }
     for(uint32_t i=0;i<count;++i){out[i]=f->slots[handles[i]-1].buffer;BdwGpuBufferRef(out[i]);}

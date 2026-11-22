@@ -21,7 +21,7 @@ struct BdwExecMemoryObject {
 // The result sizes an allocation; the builder still validates every DMA page.
 inline bool BdwExecAddressSpaceTableCount(const BdwExecMemoryObject* objects,uint32_t count,uint32_t& out) {
     constexpr uint64_t limit=uint64_t{1}<<48;
-    if(!objects || !count || count>65536)return false;
+    if(!objects || !count || count>BdwExecMaxPages)return false;
     uint64_t needed=1,priorEnd=0;bool prior=false;
     for(uint32_t i=0;i<count;++i){
         const auto& o=objects[i];const uint64_t bytes=uint64_t(o.pageCount)*4096;
@@ -44,7 +44,7 @@ inline bool BdwBuildExecAddressSpace(const BdwPpgttPage (&scratch)[4],
                                      const BdwExecMemoryObject* objects,uint32_t objectCount,
                                      BdwPpgttMapping* workspace,uint32_t workspaceCount) {
     constexpr uint64_t limit=uint64_t{1}<<48,dmaLimit=uint64_t{1}<<39;
-    if(!objects || !objectCount || objectCount>65536 || !workspace || !workspaceCount || workspaceCount>65536 ||
+    if(!objects || !objectCount || objectCount>BdwExecMaxPages || !workspace || !workspaceCount || workspaceCount>BdwExecMaxPages ||
        !tables || !tableCount || tableCount>BdwPpgttMaxTables)return false;
     auto overlaps=[](uintptr_t a,uint64_t bytes,uintptr_t b,uint64_t other){
         return bytes>~uintptr_t{0}-a || other>~uintptr_t{0}-b || (a<b+other && b<a+bytes);

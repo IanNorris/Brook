@@ -2,6 +2,7 @@
 #include "core_autodump.h"
 #include "desktop_layers_export.h"
 #include "intel_bdw_worker_overhead.h"
+#include "intel_bdw_refusal.h"
 #include "native_tsc_observe.h"
 #include "irq_accounting.h"
 #include "idle_irq_accounting.h"
@@ -6358,6 +6359,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  cpu idle mwait on|off | cpu idle state hlt|c1|c1e|c3|c6|auto | cpu idle status|reset - idle C-state (default auto = menu governor; hlt = old C1 behaviour)\n"
             "  cpu epb <0-15>|default|status - IA32_ENERGY_PERF_BIAS on every CPU (boot: firmware 0/15 -> 6)\n"
             "  gpu worker overhead [reset] - gpu-submit worker fixed per-job cost breakdown\n"
+            "  gpu exec refusals - execbuffer decode refusals per check since boot, with the last value/limit\n"
             "  gpu hang [status|last|ring [n]|reference arm|reference|marker on|off] - RCS hang breadcrumbs and pre-reset capture\n"
             "  gpu audit batch on|off|status - batched MTRR/PAT observation in GPU critical-section audits (default on)\n"
             "  gpu ppgtt cache on|off|status - reuse exact-match PPGTT table sets across GPU jobs (default off)\n"
@@ -7825,6 +7827,22 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
 #else
         DebugChannelSend("{\"error\":\"diagnostic kernel required\"}\n");
 #endif
+    }
+    else if(NetStrEq(cmd,"gpu exec refusals")) {
+        BridgeReply r;r.text("{\"counts\":[");bool first=true;
+        for(unsigned i=0;i<unsigned(BdwExecReject::Count);++i){
+            const uint64_t n=BdwExecRejectCount(BdwExecReject(i));if(!n)continue;
+            if(!first)r.text(",");first=false;
+            r.text("[");r.quoted(BdwExecRejectName(BdwExecReject(i)));r.text(",");r.number(n);r.text("]");
+        }
+        const BdwRefusalDetail d=g_bdwRefusalDetail;
+        r.text("],\"last\":");
+        if(d.why){r.text("{\"reason\":");r.quoted(d.why);r.text(",");r.field("value",d.value);r.text(",");r.field("limit",d.limit);
+            r.text(",\"object\":");if(d.object==BdwRefusalNoObject)r.text("-1");else r.number(d.object);r.text("}");}
+        else r.text("null");
+        r.text(",");r.field("max_pages",BdwExecMaxPages);r.text(",");r.field("max_tables",BdwPpgttMaxTables);
+        r.text(",\"scope\":\"execbuffer decode refusals per check since boot (nonzero only); last = most recent specific refusal (value/limit per check, object = exec-list index or -1)\"}\n");
+        r.send();
     }
     else if(NetStrEq(cmd,"gpu worker overhead") || NetStrEq(cmd,"gpu worker overhead reset")) {
         if(NetStrEq(cmd,"gpu worker overhead reset")){BdwOverheadRequestReset();
