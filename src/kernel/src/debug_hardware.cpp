@@ -38,6 +38,7 @@
 #include "tsc_clock.h"
 #include "kprintf.h"
 #include "spinlock.h"
+#include "nv_aux_reply.h"
 #include "input.h"
 #include "process.h"
 #include "memory/virtual_memory.h"
@@ -451,7 +452,10 @@ bool NvAuxHandleLocked(const char* command){
                 const uint32_t reply=(st>>16)&0xf;
                 if(reply==0x2||reply==0x8)continue; // DEFER (native/I2C) -> retry
                 if(reply==0x1||reply==0x4)return -6; // NACK
-                if(type&1){size=st&0x1f;for(uint32_t i=0;i<16;i+=4){const uint32_t v=R(0xd940+base+i);for(uint32_t b=0;b<4;++b)data[i+b]=uint8_t(v>>(8*b));}}
+                // Copy only what the caller asked for and the sink returned:
+                // the read window is 16 bytes but callers pass 1-, 4- and
+                // 6-byte buffers (an unbounded copy smashed their stacks).
+                if(type&1)size=NvAuxCopyReply(data,size,st&0x1f,[&](uint32_t o){return R(0xd940+base+o);});
                 return 0;
             }
             return -11;
