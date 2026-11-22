@@ -8,11 +8,13 @@ struct AsyncWindowSource {uint64_t incarnation,generation,commit,snapshotCommit;
 struct AsyncSourceBarrier {uint64_t incarnation,commit;};
 /* Map each window to its content descriptor after tile culling. Validate the
  * entire map before marking anything, so malformed metadata fails closed. */
+/* A window with no scene layer this frame (occluded or dropped). */
+#define ASYNC_SOURCE_NOT_DRAWN 0xffffffffu
 static inline int async_sources_mark_omitted(struct AsyncWindowSource *sources,unsigned count,
                                              const unsigned *indices,const uint8_t *used,unsigned usedCount){
     if(!sources || !indices || !used || count>BROOK_DESKTOP_LAYER_LIMIT)return 0;
-    for(unsigned i=0;i<count;++i)if(indices[i]>=usedCount)return 0;
-    for(unsigned i=0;i<count;++i)sources[i].omitted=!used[indices[i]];
+    for(unsigned i=0;i<count;++i)if(indices[i]>=usedCount && indices[i]!=ASYNC_SOURCE_NOT_DRAWN)return 0;
+    for(unsigned i=0;i<count;++i)sources[i].omitted=indices[i]==ASYNC_SOURCE_NOT_DRAWN || !used[indices[i]];
     return 1;
 }
 static inline int async_sources_presentable(const struct AsyncSourceBarrier *barriers,

@@ -93,6 +93,9 @@ int main(void){
     desktop_retry_failure(&retry,ENOTSUP,0,100);assert(!desktop_retry_waiting(&retry,0));
     desktop_retry_failure(&retry,ENOTSUP,0,100);desktop_retry_success(&retry);assert(!desktop_retry_waiting(&retry,101));
     desktop_retry_failure(&retry,EAGAIN,0,100);assert(!desktop_retry_waiting(&retry,101));
+    /* An unexportable layer (E2BIG) backs off like ENOTSUP, never a tight loop. */
+    desktop_retry_failure(&retry,E2BIG,0,100);assert(desktop_retry_waiting(&retry,101));
+    desktop_retry_success(&retry);assert(desktop_sync_retry_delay_us(E2BIG)==50000u);
     desktop_retry_failure(&retry,EBUSY,1,100);assert(!desktop_retry_waiting(&retry,101));
     desktop_retry_failure(&retry,EBUSY,0,100);assert(desktop_retry_waiting(&retry,101));
     assert(desktop_sync_retry_delay_us(ENOTSUP)==50000);

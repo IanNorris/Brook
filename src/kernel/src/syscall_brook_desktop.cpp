@@ -134,7 +134,8 @@ static int64_t CaptureDesktopBackdrop(uint64_t owner,uint64_t op,uint64_t addres
         brook::CompositorBackdropInfo info{};
         if(wire->version!=BROOK_DESKTOP_LAYERS_VERSION || wire->reserved)result=-EINVAL;
         else if(!brook::CompositorGetBackdropInfo(&info))result=-ENODEV;
-        else if(uint64_t(info.width)*info.height>64ull*1024*1024/4)result=-E2BIG;
+        // The scene rule (gpu_scene.h), as the client-layer export: no fixed byte total.
+        else if(info.width>brook::GPU_SCENE_MAX_DIMENSION || info.height>brook::GPU_SCENE_MAX_DIMENSION)result=-E2BIG;
         else {
             auto& layer=wire->layers[0];const uint64_t bytes=uint64_t(info.width)*info.height*4;
             const bool capture=op==BROOK_DESKTOP_BACKDROP_CAPTURE ||
@@ -224,10 +225,12 @@ int64_t sys_brook_desktop_layers(uint64_t op,uint64_t address,uint64_t size,uint
        size==sizeof(BrookDesktopLayers) && !a && !b && !c && address<=~uint64_t{0}-size)
         return CaptureDesktopBackdrop(proc->leaderIncarnation?proc->leaderIncarnation:proc->incarnation,op,address,size);
     const bool keepOp=op==BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED_KEEP;
+    // c: BROOK_DESKTOP_LAYERS_CULL_OCCLUDED with the keep op only.
+    const bool cull=keepOp && c==BROOK_DESKTOP_LAYERS_CULL_OCCLUDED;
     const bool tracked=op==BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED || op==BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED_SELECTIVE || keepOp;
     if((op!=BROOK_DESKTOP_LAYERS_QUERY && op!=BROOK_DESKTOP_LAYERS_CAPTURE && !tracked) ||
        size!=sizeof(BrookDesktopLayers) || (op!=BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED_SELECTIVE && !keepOp && a) ||
-       a>0xffffffffULL || (!keepOp && b) || b>0xffffffffULL || c || address>~uint64_t{0}-size)return -EINVAL;
+       a>0xffffffffULL || (!keepOp && b) || b>0xffffffffULL || (c && !cull) || address>~uint64_t{0}-size)return -EINVAL;
     const bool capture=op!=BROOK_DESKTOP_LAYERS_QUERY;
     auto* wire=static_cast<BrookDesktopLayers*>(kmalloc(sizeof(BrookDesktopLayers)));
     auto* layers=static_cast<brook::WmDesktopLayers*>(kmalloc(sizeof(brook::WmDesktopLayers)));
@@ -249,16 +252,20 @@ int64_t sys_brook_desktop_layers(uint64_t op,uint64_t address,uint64_t size,uint
                 return CopyToUser(destination,scratch,bytes);
             };
             brook::DesktopCaptureCounters tally{};
+            brook::DesktopLayerExportOptions options{};options.cullOccluded=cull;
+            brook::CompositorBackdropInfo output{};
+            if(brook::CompositorGetBackdropInfo(&output))options.copyLimit=brook::DesktopLayerCopyLimit(output.width,output.height);
             result=brook::ExportDesktopLayers(*layers,*wire,capture,sink,
                 [tracked](const brook::WmDesktopLayers& current){
                     return tracked
                         ?brook::WmDesktopLayersCaptureCurrent(current)
                         :brook::WmDesktopLayersCurrent(current);
-                },scratchBytes,static_cast<uint32_t>(a),static_cast<uint32_t>(b),&tally);
+                },scratchBytes,static_cast<uint32_t>(a),static_cast<uint32_t>(b),&tally,options);
             if(!result && tally.calls){auto& g=brook::g_desktopCaptureStats;
                 __atomic_add_fetch(&g.calls,tally.calls,__ATOMIC_RELAXED);__atomic_add_fetch(&g.keeps,tally.keeps,__ATOMIC_RELAXED);
                 __atomic_add_fetch(&g.keepMisses,tally.keepMisses,__ATOMIC_RELAXED);__atomic_add_fetch(&g.captures,tally.captures,__ATOMIC_RELAXED);
-                __atomic_add_fetch(&g.bytesCopied,tally.bytesCopied,__ATOMIC_RELAXED);__atomic_add_fetch(&g.bytesKept,tally.bytesKept,__ATOMIC_RELAXED);}
+                __atomic_add_fetch(&g.bytesCopied,tally.bytesCopied,__ATOMIC_RELAXED);__atomic_add_fetch(&g.bytesKept,tally.bytesKept,__ATOMIC_RELAXED);
+                __atomic_add_fetch(&g.occluded,tally.occluded,__ATOMIC_RELAXED);__atomic_add_fetch(&g.bytesOccluded,tally.bytesOccluded,__ATOMIC_RELAXED);}
             bool adopted=false;
             if(!result && tracked){
                 const uint64_t owner=proc->leaderIncarnation?proc->leaderIncarnation:proc->incarnation;

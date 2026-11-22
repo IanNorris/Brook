@@ -8232,9 +8232,11 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         auto& g=g_desktopCaptureStats;
         auto take=[&](uint64_t& v){return NetStrEq(cmd,"desktop capture reset")?__atomic_exchange_n(&v,0,__ATOMIC_RELAXED):__atomic_load_n(&v,__ATOMIC_RELAXED);};
         const uint64_t calls=take(g.calls),keeps=take(g.keeps),misses=take(g.keepMisses),captures=take(g.captures),copied=take(g.bytesCopied),kept=take(g.bytesKept);
+        const uint64_t occluded=take(g.occluded),occludedBytes=take(g.bytesOccluded);
         BridgeReply r;r.text("{");r.field("calls",calls);r.text(",");r.field("keeps",keeps);r.text(",");r.field("keep_misses",misses);
         r.text(",");r.field("captures",captures);r.text(",");r.field("bytes_copied",copied);r.text(",");r.field("bytes_kept",kept);
-        r.text(",\"scope\":\"renderer client-layer captures since boot or reset; keeps = CPU window layers whose published content generation was unchanged, so nothing was copied; keep_misses = keeps requested but recopied because the window published; captures = layers copied (GPU-source windows are not counted)\"}\n");r.send();
+        r.text(",");r.field("occluded",occluded);r.text(",");r.field("bytes_occluded",occludedBytes);
+        r.text(",\"scope\":\"renderer client-layer captures since boot or reset; occluded = layers not copied because an opaque legacy window above covers them; keeps = CPU window layers whose published content generation was unchanged, so nothing was copied; keep_misses = keeps requested but recopied because the window published; captures = layers copied (GPU-source windows are not counted)\"}\n");r.send();
     }
     else if(NetStrEq(cmd,"gpu uploads")) {
         const auto s=CompositorReadUploads();BridgeReply r;r.text("{\"layers\":[");
