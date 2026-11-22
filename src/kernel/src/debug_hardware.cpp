@@ -1058,6 +1058,90 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         Reply r;r.text("{\"nic_api\":1,\"text\":");r.quoted(text);r.text("}\n");r.send();return true;
     }
 #if !defined(BROOK_HOST_TEST)
+    // RTX display step 2: DP AUX (nouveau auxgm200/padgm200). Only the AUX
+    // controller (0x00d930-0x00d95b + ch*0x50) and its pad (0x00d970/0x00d97c
+    // + ch*0x50) are written. Subcommands:
+    //   nv-aux read <ch> <dpcd-hex> <len 1..16>    native DPCD read
+    //   nv-aux edid <ch> <block>                   128-byte EDID block via I2C-over-AUX (0x50)
+    //   nv-aux power <ch> d0|d3                     DPCD 0x600 write (sink power state)
+    constexpr char auxPrefix[]="bridge hardware nv-aux ";
+    if(Prefix(command,auxPrefix)) {
+        const char* p=command+sizeof(auxPrefix)-1;
+        auto word=[&](const char* w)->bool{const char* q=p;while(*w){if(*q!=*w)return false;++q;++w;}if(*q&&*q!=' ')return false;p=q;while(*p==' ')++p;return true;};
+        auto hex=[&](uint32_t& v)->bool{unsigned n=0;v=0;while(*p==' ')++p;
+            while((*p>='0'&&*p<='9')||(*p>='a'&&*p<='f')){v=v*16+uint32_t(*p<='9'?*p-'0':*p-'a'+10);++p;if(++n>8)return false;}while(*p==' ')++p;return n>0;};
+        const bool rdMode=word("read"),edMode=!rdMode&&word("edid"),pwMode=!rdMode&&!edMode&&word("power");
+        uint32_t ch=0,addr=0,len=0;
+        if((!rdMode&&!edMode&&!pwMode)||!hex(ch)||ch>7){DebugChannelSend("{\"aux_error\":\"usage: nv-aux read <ch> <addr> <len>|edid <ch> <block>|power <ch> d0|d3\"}\n");return true;}
+        uint8_t powerValue=0;
+        if(rdMode&&(!hex(addr)||!hex(len)||!len||len>16||addr>0xfffff)){DebugChannelSend("{\"aux_error\":\"bad read args\"}\n");return true;}
+        if(edMode&&(!hex(addr)||addr>3)){DebugChannelSend("{\"aux_error\":\"block 0..3\"}\n");return true;}
+        if(pwMode){if(word("d0"))powerValue=1;else if(word("d3"))powerValue=2;else{DebugChannelSend("{\"aux_error\":\"d0|d3\"}\n");return true;}}
+        PciDevice gpu{};bool found=false;
+        for(uint32_t i=0;i<PciBootInventoryCount() && !found;++i){PciBootEntry e{};
+            if(PciBootInventoryRead(i,&e) && e.device.vendorId==0x10de && e.device.classCode==0x03 && e.device.fn==0){gpu=e.device;found=true;}}
+        const uint32_t bar0=found?PciConfigRead32(gpu.bus,gpu.dev,gpu.fn,0x10):0;
+        if(!found||(bar0&1)||!(PciConfigRead16(gpu.bus,gpu.dev,gpu.fn,4)&2)){DebugChannelSend("{\"aux_error\":\"no GPU BAR0\"}\n");return true;}
+        static VirtualAddress auxWin{};
+        if(!auxWin){auxWin=VmmAllocPages(1,VMM_WRITABLE|VMM_NO_EXEC,MemTag::Device,KernelPid);
+            const auto leaf=VmmDetachPage(KernelPageTable,auxWin);if(leaf)PmmFreePage(VmmLeafPhysical(leaf));
+            __asm__ volatile("invlpg (%0)"::"r"(auxWin.raw()):"memory");
+            if(!VmmMapPage(KernelPageTable,auxWin,PhysicalAddress((bar0&~uint64_t(15))+0xd000),
+                VMM_WRITABLE|VMM_NO_EXEC|VMM_CACHE_DISABLE|VMM_WRITE_THRU,MemTag::Device,KernelPid)){auxWin=VirtualAddress{};
+                DebugChannelSend("{\"aux_error\":\"map\"}\n");return true;}}
+        volatile uint32_t* reg=reinterpret_cast<volatile uint32_t*>(auxWin.raw());
+        const uint32_t base=ch*0x50;
+        auto R=[&](uint32_t off)->uint32_t{return reg[(off-0xd000)/4];};
+        auto Wr=[&](uint32_t off,uint32_t v){reg[(off-0xd000)/4]=v;};
+        auto spin=[](uint32_t us){
+            if(!TscClockAvailable()){for(volatile uint32_t i=0;i<us*300;++i)__asm__ volatile("pause");return;}
+            const uint64_t t=TscClockReadNs()+uint64_t(us)*1000;while(TscClockReadNs()<t)__asm__ volatile("pause");};
+        char err[64]="";
+        // pad -> AUX mode, enabled
+        Wr(0xd970+base,(R(0xd970+base)&~0xc003u)|0x2u); Wr(0xd97c+base,R(0xd97c+base)&~1u);
+        // acquire: wait idle, request, wait grant
+        uint32_t ctrl=0;bool ok=true;
+        for(int i=0;i<1000;++i){ctrl=R(0xd954+base);if(!(ctrl&0x07010000))break;spin(1);if(i==999){ok=false;strcpy(err,"begin idle timeout");}}
+        if(ok){Wr(0xd954+base,(R(0xd954+base)&~0x00700000u)|0x00100000u);
+            for(int i=0;i<1000;++i){ctrl=R(0xd954+base);if((ctrl&0x07000000)==0x01000000)break;spin(1);if(i==999){ok=false;strcpy(err,"grant timeout");}}}
+        auto xfer=[&](uint32_t type,uint32_t a,uint8_t* data,uint32_t& size)->int{
+            if(!(R(0xd958+base)&0x10000000))return -6; // sink not detected
+            for(uint32_t retries=0;retries<32;++retries){
+                if(retries)spin(400);
+                if(!(type&1))for(uint32_t i=0;i<16;i+=4){uint32_t v=0;for(uint32_t b=0;b<4&&i+b<size;++b)v|=uint32_t(data[i+b])<<(8*b);Wr(0xd930+base+i,v);}
+                Wr(0xd950+base,a);
+                uint32_t c=R(0xd954+base);c&=~0x0001f1ffu;c|=type<<12;c|=size?(size-1):0x100;
+                Wr(0xd954+base,0x80000000u|c);Wr(0xd954+base,c);Wr(0xd954+base,0x00010000u|c);
+                int t=2000;while((R(0xd954+base)&0x00010000)&&--t)spin(1);
+                if(!t)return -5;
+                const uint32_t st=R(0xd958+base);Wr(0xd958+base,st);
+                if(st&0x00000100)continue;        // timeout -> retry
+                if(st&0x00000e00)return -5;
+                const uint32_t reply=(st>>16)&0xf;
+                if(reply==0x2||reply==0x8)continue; // DEFER (native/I2C) -> retry
+                if(reply==0x1||reply==0x4)return -6; // NACK
+                if(type&1){size=st&0x1f;for(uint32_t i=0;i<16;i+=4){const uint32_t v=R(0xd940+base+i);for(uint32_t b=0;b<4;++b)data[i+b]=uint8_t(v>>(8*b));}}
+                return 0;
+            }
+            return -11;
+        };
+        Reply r;r.text("{\"aux_api\":1,");r.field("ch",ch);
+        uint8_t buf[128]{};int rc=ok?0:-16;uint32_t got=0;
+        if(ok&&rdMode){uint32_t n=len;rc=xfer(0x9,addr,buf,n);got=rc?0:n;}
+        else if(ok&&edMode){
+            uint8_t off=uint8_t(addr*128);uint32_t one=1;rc=xfer(0x4,0x50,&off,one);         // I2C write MOT: offset
+            for(uint32_t i=0;!rc&&i<128;i+=16){uint32_t n=16;rc=xfer(0x5,0x50,buf+i,n);if(!rc&&n!=16)rc=-5;got=i+n;} // I2C read MOT
+            uint32_t z=0;(void)xfer(0x1,0x50,nullptr,z);                                    // stop (no MOT)
+        }
+        else if(ok&&pwMode){uint32_t one=1;rc=xfer(0x8,0x600,&powerValue,one);
+            uint32_t n=1;uint8_t back=0;if(!rc&&!xfer(0x9,0x600,&back,n)){r.field("dpcd600",back);r.text(",");}
+            KPrintf("nv-aux: ch %u DPCD 0x600 <- %u (%s), rc %d\n",ch,powerValue,powerValue==1?"D0":"D3",rc);}
+        // release: drop the request
+        Wr(0xd954+base,R(0xd954+base)&~0x00710000u);
+        r.field("rc",uint32_t(rc<0?-rc:rc));r.text(",\"err\":");r.quoted(err);r.text(",");r.field("bytes",got);r.text(",\"hex\":\"");
+        static const char hx[]="0123456789abcdef";for(uint32_t i=0;i<got;++i){char t[3]={hx[buf[i]>>4],hx[buf[i]&15],0};r.text(t);}
+        r.text("\"}\n");r.send();return true;
+    }
     // GPU link ASPM L1 (runtime, volatile; a reset restores firmware state):
     // the first 10de display function (fn0 only; HDA/USB-C/UCSI functions are
     // left as they are) and the root port above it. L1 only, never L0s; only
@@ -1068,8 +1152,9 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
     constexpr char aspmPrefix[]="bridge hardware gpu-aspm ";
     if(Prefix(command,aspmPrefix)) {
         const char* arg=command+sizeof(aspmPrefix)-1;
-        const bool on=!strcmp(arg,"l1"),off=!strcmp(arg,"off"),status=!strcmp(arg,"status");
-        if(!on && !off && !status){DebugChannelSend("{\"aspm_error\":\"Expected l1|off|status\"}\n");return true;}
+        const bool all=!strcmp(arg,"l1-all");
+        const bool on=!strcmp(arg,"l1")||all,off=!strcmp(arg,"off"),status=!strcmp(arg,"status");
+        if(!on && !off && !status){DebugChannelSend("{\"aspm_error\":\"Expected l1|l1-all|off|status\"}\n");return true;}
         PciDevice gpu{};bool found=false;
         for(uint32_t i=0;i<PciBootInventoryCount() && !found;++i){PciBootEntry e{};
             if(PciBootInventoryRead(i,&e) && e.device.vendorId==0x10de && e.device.classCode==0x03 && e.device.fn==0){gpu=e.device;found=true;}}
@@ -1099,10 +1184,16 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
             else if(!latencyOk)result="refused: L1 exit latency exceeds the endpoint's acceptable latency";
             else{PciConfigWrite16(rb,rd,rf,uint8_t(rc+0x10),uint16_t((rCtl&~3u)|2u));
                  PciConfigWrite16(gpu.bus,gpu.dev,0,uint8_t(ec+0x10),uint16_t((eCtl&~3u)|2u));result="L1 enabled (root port, then GPU fn0)";
+                 if(all)for(uint8_t f=2;f<=3;++f){const uint8_t fc=capOf(gpu.bus,gpu.dev,f);if(!fc)continue;
+                     const uint16_t c=PciConfigRead16(gpu.bus,gpu.dev,f,uint8_t(fc+0x10));
+                     PciConfigWrite16(gpu.bus,gpu.dev,f,uint8_t(fc+0x10),uint16_t((c&~3u)|2u));result="L1 enabled (root port, GPU fn0, fn2, fn3)";}
                  KPrintf("pcie: ASPM L1 enabled on 00:%02x.%u and %02x:%02x.0 (runtime)\n",rd,rf,gpu.bus,gpu.dev);}
         } else if(off){
+            for(uint8_t f=2;f<=3;++f){const uint8_t fc=capOf(gpu.bus,gpu.dev,f);if(!fc)continue;
+                const uint16_t c=PciConfigRead16(gpu.bus,gpu.dev,f,uint8_t(fc+0x10));
+                if((c&3u)==2u)PciConfigWrite16(gpu.bus,gpu.dev,f,uint8_t(fc+0x10),uint16_t(c&~3u));} // firmware left 0
             PciConfigWrite16(gpu.bus,gpu.dev,0,uint8_t(ec+0x10),uint16_t(eCtl&~3u));
-            PciConfigWrite16(rb,rd,rf,uint8_t(rc+0x10),uint16_t(rCtl&~3u));result="ASPM disabled (GPU fn0, then root port)";
+            PciConfigWrite16(rb,rd,rf,uint8_t(rc+0x10),uint16_t(rCtl&~3u));result="ASPM disabled (GPU fn2/fn3/fn0, then root port)";
             KPrintf("pcie: ASPM disabled on %02x:%02x.0 and 00:%02x.%u\n",gpu.bus,gpu.dev,rd,rf);
         }
         eCtl=PciConfigRead16(gpu.bus,gpu.dev,0,uint8_t(ec+0x10));rCtl=PciConfigRead16(rb,rd,rf,uint8_t(rc+0x10));
@@ -1114,7 +1205,10 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",");r.field("root_dev_sta",PciConfigRead16(rb,rd,rf,uint8_t(rc+0x0a)));
         r.text(",");r.field("gpu_dev_sta",PciConfigRead16(gpu.bus,gpu.dev,0,uint8_t(ec+0x0a)));
         r.text(",");r.field("gpu_l1_exit_us",exitUs(eLinkCap));r.text(",");r.field("root_l1_exit_us",exitUs(rLinkCap));
-        r.text(",");r.field("gpu_l1_accept_us",acceptUs(eDevCap));r.text("}\n");r.send();return true;
+        r.text(",");r.field("gpu_l1_accept_us",acceptUs(eDevCap));
+        r.text(",\"fn_link_ctl\":[");for(uint8_t f=0;f<=3;++f){const uint8_t fc=capOf(gpu.bus,gpu.dev,f);if(f)r.text(",");
+            r.number(fc?PciConfigRead16(gpu.bus,gpu.dev,f,uint8_t(fc+0x10)):0);}
+        r.text("]}\n");r.send();return true;
     }
     // NVIDIA display survey: read-only 32-bit reads from BAR0 of the first
     // 10de display function, through a read-only uncached one-page mapping
