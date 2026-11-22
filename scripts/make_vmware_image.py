@@ -306,6 +306,8 @@ def argument_parser():
                         help='VMware network mode (default: %(default)s)')
     parser.add_argument('--data-mib', type=int,
                         help='store capacity in MiB (default: size it from the selected profile)')
+    parser.add_argument('--free-mib', type=int, default=4096,
+                        help='free space to leave on the store for installs when auto-sizing (default: %(default)s)')
     parser.add_argument('--selection-config', type=Path,
                         help='host-side app selection JSON from brook_image.py')
     parser.add_argument('--autofit', action='store_true',
@@ -362,7 +364,7 @@ def main():
     require_kernel_capabilities(kernel_capabilities, selection['manifest']['requiredCapabilities'])
     profile = realize(config, selection)
     closure = closure_receipt(profile)
-    data_mib = data_size_mib(closure['nar_bytes'], args.data_mib, 1024, 32768)
+    data_mib = data_size_mib(closure['nar_bytes'], args.data_mib, 1024, 32768, args.free_mib)
     selection_path = dest / 'profile-selection.json'
     selection_path.write_text(json.dumps(selection, indent=2, sort_keys=True) + '\n')
     seed_args = ['--profile-selection', selection_path]
@@ -407,7 +409,8 @@ def main():
               'cpus': args.cpus, 'memory_mib': args.memory_mib, 'disk_guid': str(disk_id), 'esp_guid': str(esp_id),
               'data_guid': str(data_id), 'ext2_uuid': str(fs_id), 'sectors': total,
               'esp_first': ESP_FIRST, 'esp_sectors': ESP_SECTORS, 'data_first': DATA_FIRST,
-              'data_sectors': data_count, 'vmdk_sha256': digest(vmdk),
+              'data_sectors': data_count, 'store_free_mib': None if args.data_mib is not None else args.free_mib,
+              'vmdk_sha256': digest(vmdk),
               'operator_policy_sha256': digest(policy_path), 'loader_sha256': digest(efi),
               'kernel_sha256': digest(kernel), 'desktop_initrd_sha256': digest(desktop),
               'recovery_initrd_sha256': digest(recovery), 'profile_selection': profile_receipt,

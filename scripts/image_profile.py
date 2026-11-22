@@ -119,13 +119,17 @@ def closure_receipt(profile):
     }
 
 
-def data_size_mib(nar_bytes, requested, minimum, maximum):
+def data_size_mib(nar_bytes, requested, minimum, maximum, free_mib=0):
     # Provision room for ext2 metadata, materialized profile links and user data.
+    # free_mib adds explicit headroom for installs; unused ext2 blocks stay
+    # zero, so sparse disk formats (e.g. monolithicSparse VMDK) don't grow.
     if requested is not None:
         if not minimum <= requested <= maximum:
             raise ValueError(f"Data size must be between {minimum} and {maximum} MiB")
         return requested
-    required = max(minimum, (5 * nar_bytes + 4 * MIB - 1) // (4 * MIB) + 512)
+    if free_mib < 0:
+        raise ValueError("Free space must not be negative")
+    required = max(minimum, (5 * nar_bytes + 4 * MIB - 1) // (4 * MIB) + 512 + free_mib)
     if required > maximum:
         raise ValueError(f"Profile needs at least {required} MiB; target limit is {maximum} MiB")
     return required

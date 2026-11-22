@@ -77,6 +77,23 @@ def vmx_values(text):
     return dict(line.split(' = ', 1) for line in text.splitlines())
 
 
+class VmwareStoreSizeTest(unittest.TestCase):
+    def test_builder_reserves_four_gib_free_by_default(self):
+        args = make_vmware_image.argument_parser().parse_args(
+            ["--output", "o", "--operator-policy", "p", "--recovery-checkers-from", "c"])
+        self.assertEqual(args.free_mib, 4096)
+
+    def test_free_space_is_added_to_auto_size(self):
+        from image_profile import data_size_mib, MIB
+        nar = 2000 * MIB
+        base = data_size_mib(nar, None, 1024, 32768)
+        self.assertEqual(data_size_mib(nar, None, 1024, 32768, 4096), base + 4096)
+        # An explicit size wins and ignores the headroom.
+        self.assertEqual(data_size_mib(nar, 9000, 1024, 32768, 4096), 9000)
+        with self.assertRaises(ValueError):
+            data_size_mib(nar, None, 1024, 32768, -1)
+
+
 class VmwareResourceTest(unittest.TestCase):
     def test_builder_defaults_to_four_cpus_and_eight_gib(self):
         parsed = make_vmware_image.argument_parser().parse_args(REQUIRED)
