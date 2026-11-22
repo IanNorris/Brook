@@ -100,6 +100,7 @@ enum class LauncherTargetKind : uint8_t {
     Settings, Restart, Shutdown, Confirm, Dismiss, CancelShutdown, Footer, ForceApps,
     Organise, NewCategory, EditCategory, RenameApp, MoveSuggested, SortSuggested,
     Editor, EditorSave, EditorCancel, EditorDelete, EditorColor, EditorIcon, Undo, ResetOrganisation, ClearSelection, CategorySection,
+    RetryShutdown, ForcePowerOff,
 };
 struct LauncherTarget {
     LauncherTargetKind kind;

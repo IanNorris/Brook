@@ -65,7 +65,13 @@ static unsigned forceCloseCalls=0;
 bool ShutdownLaunchAllowed() { return !shutdownPending; }
 bool ShutdownCanForceApps(const char*) { return forceAppsOffered; }
 void ShutdownDesktopForceApps() { CHECK(forceAppsOffered);++forceCloseCalls; }
-const char* ShutdownDesktopStatus() { return "Applications"; }
+static bool shutdownFailed=false;
+static unsigned retryCalls=0,forcePowerOffCalls=0;
+static constexpr char failedStatus[]="Shutdown failed: could not save data (I/O error). Retry or force power off.";
+const char* ShutdownDesktopStatus() { return shutdownFailed?failedStatus:"Applications"; }
+ShutdownFailureActions ShutdownDesktopFailureActions() { return {shutdownFailed,shutdownFailed,shutdownFailed}; }
+void ShutdownDesktopRetry() { CHECK(shutdownFailed);++retryCalls; }
+void ShutdownDesktopForcePowerOff() { CHECK(shutdownFailed);++forcePowerOffCalls; }
 void ShutdownDesktopRequest(bool) { std::abort(); }
 void ShutdownDesktopCancel() { std::abort(); }
 Process* KernelThreadCreate(const char*, KernelThreadFn, void*, uint8_t) { std::abort(); }
@@ -1074,6 +1080,26 @@ int main() {
         CHECK(press(LauncherTargetKind::ForceApps, 0, true) && !forceCloseCalls);
         CHECK(press(LauncherTargetKind::ForceApps, 0, false) && forceCloseCalls==1);
         shutdownPending=forceAppsOffered=false;
+
+        // A failed shutdown shows its message and offers Retry and Force
+        // power off instead of an inert Cancel shutdown.
+        shutdownPending=shutdownFailed=true;
+        WmCaptureLauncher(sw, sh, -1, -1, snapshot);
+        CHECK(snapshot.shutdownActive && snapshot.shutdownFailed && snapshot.retryShutdown && snapshot.forcePowerOff);
+        CHECK(!strcmp(snapshot.text, failedStatus));
+        {
+            const auto& frame = LauncherFrame(sw, sh, -1, -1);
+            bool retry=false,force=false,cancel=false;
+            for (uint32_t i = 0; i < frame.targetCount; ++i) {
+                retry |= frame.targets[i].target.kind == LauncherTargetKind::RetryShutdown;
+                force |= frame.targets[i].target.kind == LauncherTargetKind::ForcePowerOff;
+                cancel |= frame.targets[i].target.kind == LauncherTargetKind::CancelShutdown;
+            }
+            CHECK(retry && force && !cancel && frame.notice.h > 0 && frame.notice.w > frame.footer.w / 2);
+        }
+        CHECK(press(LauncherTargetKind::RetryShutdown, 0, false) && retryCalls==1 && !forcePowerOffCalls);
+        CHECK(press(LauncherTargetKind::ForcePowerOff, 0, false) && forcePowerOffCalls==1);
+        shutdownPending=shutdownFailed=false;
 
         testTick = 1199;
         LauncherSaveLayout();

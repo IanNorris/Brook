@@ -4798,6 +4798,17 @@ static void CompositorThreadFn(void* /*arg*/)
         // Shutdown must also drain window state when there is no window
         // manager scene or rendering has been halted.
         ShutdownCompositorPoll();
+        {
+            // A failed checked shutdown must not leave a silent desktop:
+            // open the launcher, which shows the failure and its actions.
+            static uint32_t seenShutdownFailure;
+            const uint32_t failure = ShutdownFailureGeneration();
+            if (failure != seenShutdownFailure) {
+                seenShutdownFailure = failure;
+                if (WmIsActive() && !WmLauncherVisible()) WmLauncherToggle();
+                CompositorMarkDirty();
+            }
+        }
 
         // Poll debug channel for incoming commands
         { FrameTimingScope phase(FramePhase::DebugPoll);brook::DebugChannelPoll(); }

@@ -2847,6 +2847,8 @@ static void LauncherPowerRun(LauncherPowerCommand command)
     case LauncherPowerCommand::Shutdown:SerialPuts("WM: launcher shutdown confirmed\n");ShutdownDesktopRequest(false);break;
     case LauncherPowerCommand::CancelShutdown:ShutdownDesktopCancel();break;
     case LauncherPowerCommand::ForceApps:ShutdownDesktopForceApps();break;
+    case LauncherPowerCommand::RetryShutdown:SerialPuts("WM: launcher shutdown retry\n");ShutdownDesktopRetry();break;
+    case LauncherPowerCommand::ForcePowerOff:SerialPuts("WM: launcher forced power off\n");ShutdownDesktopForcePowerOff();break;
     }
     CompositorMarkDirty();CompositorWake();
 }

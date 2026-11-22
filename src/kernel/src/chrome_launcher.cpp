@@ -417,11 +417,18 @@ struct Builder {
         for (uint32_t i = 0; i < f.targetCount; ++i) {
             const auto& h = f.targets[i];
             if (((h.target.kind >= TK::Settings && h.target.kind <= TK::CancelShutdown) || h.target.kind == TK::Organise || h.target.kind == TK::ForceApps ||
+                 h.target.kind == TK::RetryShutdown || h.target.kind == TK::ForcePowerOff ||
                  h.target.kind == TK::ResetOrganisation) && h.rect.x < right) right = h.rect.x;
         }
         const char* status = c.prompt && !c.shutdownActive ?
             (c.promptRestart ? "Restart? Open apps will be asked to close" : "Shut down? Open apps will be asked to close") :
-            c.status;
+            c.shutdownFailed && f.notice.h > 0 ? "Shutdown failed" : c.status;
+        if (c.shutdownFailed && f.notice.h > 0 && c.status) {
+            Rect(f.notice, t.well, 6);
+            Outline(f.notice, t.hairline, 6);
+            const int x = f.notice.x + LPx(s, 10);
+            ChromeElidedText(dl, s, CF::Label, x, Center(f.notice, CF::Label), c.status, t.ink, Right(f.notice) - x - LPx(s, 10));
+        }
         const int width = right - LPx(s, 8) - left;
         if (status && status[0]) {
             ChromeElidedText(dl, s, CF::Label, left, Center(r, CF::Label), status, c.prompt ? t.ink : t.ink2, width);
@@ -451,6 +458,8 @@ struct Builder {
             case TK::Dismiss: TextButton(h.rect, "Cancel", false, !c.confirmFocused); break;
             case TK::CancelShutdown: TextButton(h.rect, "Cancel shutdown", false, false); break;
             case TK::ForceApps: TextButton(h.rect, "Force close apps", true, false); break;
+            case TK::RetryShutdown: TextButton(h.rect, "Retry", true, false); break;
+            case TK::ForcePowerOff: TextButton(h.rect, "Force power off", false, false); break;
             default: break;
             }
         }
@@ -768,7 +777,12 @@ void ChromeLauncherFrameFor(const LauncherModel& m, const ChromeLauncherChrome& 
 
     f.footer = {p.x, Bottom(p) - LPx(s, LM::Footer), p.w, LPx(s, LM::Footer)};
     if (y > f.footer.y) y = f.footer.y;
-    f.mid = {p.x, y, p.w, f.footer.y - y};
+    // A failed shutdown's message gets a full-width bar above the footer.
+    const int failureBar = LPx(s, 40), failureGap = LPx(s, 8);
+    const bool failureNotice = c.shutdownFailed && c.status && c.status[0] &&
+        f.footer.y - y > 4 * failureBar + failureGap;
+    f.mid = {p.x, y, p.w, f.footer.y - y - (failureNotice ? failureBar + failureGap : 0)};
+    if (failureNotice) f.notice = {p.x + pad, Bottom(f.mid), p.w - 2 * pad, failureBar};
     const int railW = LPx(s, LM::Rail) < p.w / 3 ? LPx(s, LM::Rail) : p.w / 3;
     f.rail = {p.x, f.mid.y, railW, f.mid.h};
     const int inner = LPx(s, 8);
@@ -891,7 +905,10 @@ void ChromeLauncherFrameFor(const LauncherModel& m, const ChromeLauncherChrome& 
         add({right, by, w, button}, kind, 0);
         right -= LPx(s, 8);
     };
-    if (c.shutdownActive) {
+    if (c.shutdownFailed) {
+        if (c.retryShutdown) textButton(TK::RetryShutdown, "Retry");
+        if (c.forcePowerOff) textButton(TK::ForcePowerOff, "Force power off");
+    } else if (c.shutdownActive) {
         textButton(TK::CancelShutdown, "Cancel shutdown");
         if(c.forceApps)textButton(TK::ForceApps, "Force close apps");
     } else if (c.prompt) {

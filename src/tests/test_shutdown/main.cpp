@@ -84,7 +84,7 @@ void FileObjectStopWriteback(){++writebackStops;writebackStopped=true;assert(!cl
 void Ext2StopWriteback(){assert(writebackStopped);}
 void PlatformPowerConfigure(){}
 const PlatformPowerPlan& PlatformPowerGetPlan(){return powerPlan;}
-bool PlatformPowerIssue(bool restart){assert(writebackStopped && gate && syncError==0);++powerWrites;lastRestart=restart;return true;}
+bool PlatformPowerIssue(bool restart){assert(writebackStopped && gate && (syncError==0 || operations[current].forced));++powerWrites;lastRestart=restart;return true;}
 bool DeviceCloseWrites(){assert(writebackStopped);++freezes;return canFreeze;}
 void AudioStop(){}
 void AudioPrepareShutdown(){}
@@ -120,6 +120,64 @@ void Show(const char* request,const char* stage,const char* text) {
     ShutdownBlockerReport r{};ShutdownRequestBlockers(request,&r);
     if(strcmp(r.stage,stage)||!Contains(r.status,text))std::fprintf(stderr,"escalation: expected %s/'%s' got %s/'%s'\n",stage,text,r.stage,r.status);
     assert(!strcmp(r.stage,stage));assert(Contains(r.status,text));assert(!strcmp(ShutdownRequestStatus(request),r.status));
+}
+// Workstation gen quickwins-25f0ea6a: the final sync failed with -5 and the
+// desktop sat silent. The failure is named with its remaining actions; an
+// explicit retry repeats only the final sync, and a forced power off is an
+// explicit, single attempt.
+void TestFailureRecovery() {
+    current=-1;irreversible=false;acRecovery={};powerOff=true;powerRestart=true;
+    cleanup={};births=0;gate=false;jobsBusy=false;dispatching=false;visible=false;censusCount=0;canFreeze=true;
+    finalError=0;directFinalError=0;syncError=-5;
+    const char* req="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const auto generation=ShutdownFailureGeneration();
+    assert(!ShutdownDesktopFailureActions().failed);
+    command(req,"shutdown","closing");ShutdownCompositorPoll();
+    for(unsigned i=0;i<10&&operations[current].phase!=Phase::Failed;++i)step();
+    command(req,"power_status","failed",-5);
+    assert(ShutdownFailureGeneration()==generation+1);
+    const char* ioText="Shutdown failed: could not save data (I/O error). Retry or force power off.";
+    assert(!strcmp(ShutdownDesktopStatus(),ioText)&&!strcmp(ShutdownRequestStatus(req),ioText));
+    {ShutdownBlockerReport r{};ShutdownRequestBlockers(req,&r);assert(!strcmp(r.stage,"failed")&&!strcmp(r.status,ioText));}
+    auto actions=ShutdownDesktopFailureActions();assert(actions.failed&&actions.retry&&actions.forcePowerOff);
+    assert(!ShutdownLaunchAllowed()&&!ShutdownCanForceApps(req));
+    const unsigned syncsBefore=syncs,freezesBefore=freezes,stopsBefore=writebackStops,finalBefore=finalCalls;
+    step();assert(syncs==syncsBefore); // never an implicit retry
+    command("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","retry","missing",-2);
+    command(req,"retry","syncing");command(req,"retry","not_ready",-16);
+    assert(!ShutdownDesktopFailureActions().failed&&!strcmp(ShutdownDesktopStatus(),"Saving filesystem changes"));
+    step();command(req,"power_status","failed",-5);
+    assert(syncs==syncsBefore+1&&freezes==freezesBefore&&writebackStops==stopsBefore&&finalCalls==finalBefore);
+    assert(ShutdownFailureGeneration()==generation+2);
+    // Other errors, restarts and a missing soft-off method change the advice.
+    operations[current].error=-28;
+    assert(!strcmp(ShutdownDesktopStatus(),"Shutdown failed: could not save data. Retry or force power off."));
+    operations[current].error=-5;operations[current].restart=true;
+    assert(!strcmp(ShutdownDesktopStatus(),"Restart failed: could not save data (I/O error). Retry or force power off."));
+    operations[current].restart=false;powerOff=false;
+    assert(!strcmp(ShutdownDesktopStatus(),"Shutdown failed: could not save data (I/O error). Retry or power off manually."));
+    command(req,"force_power_off","not_ready",-16);
+    assert(ShutdownDesktopFailureActions().retry&&!ShutdownDesktopFailureActions().forcePowerOff);
+    powerOff=true;
+    // Forced power off: one explicit attempt, which may itself fail.
+    const unsigned writesBefore=powerWrites;
+    command(req,"force_power_off","committing");
+    terminalSleeps=true;step();terminalSleeps=false;
+    assert(powerWrites==writesBefore+1&&!lastRestart&&operations[current].phase==Phase::Failed);
+    step();assert(powerWrites==writesBefore+1);
+    assert(!strcmp(ShutdownDesktopStatus(),ioText));
+    // A successful explicit retry reaches the normal ready state.
+    syncError=0;command(req,"retry","syncing");step();
+    command(req,"power_status","ready");assert(syncs==syncsBefore+2&&finalCalls==finalBefore+1);
+    assert(!ShutdownDesktopFailureActions().failed);
+    command(req,"retry","not_ready",-16);command(req,"force_power_off","not_ready",-16);
+    // A failed power transition (not a sync failure) offers no retry.
+    command(req,"commit","ready");terminalSleeps=true;step();terminalSleeps=false;
+    command(req,"power_status","failed",-5);
+    actions=ShutdownDesktopFailureActions();assert(actions.failed&&!actions.retry&&actions.forcePowerOff);
+    assert(!strcmp(ShutdownDesktopStatus(),"Power off did not complete. Force power off, or power off manually."));
+    command(req,"retry","not_ready",-16);
+    current=-1;irreversible=false;
 }
 // Windowless user processes (a bridge-started daemon) are escalated
 // SIGTERM -> SIGKILL only while no client window is open; an open window
@@ -319,6 +377,7 @@ step();assert(!signals&&!syncs&&!gate);
     step();assert(current<0 && powerWrites==3); // one attempt per boot
     TestWindowlessEscalation();
     TestConfirmedForceApps();
+    TestFailureRecovery();
     // Never execute the host's actual power I/O from this native fixture.
     std::puts("SHUTDOWN_COORDINATOR PASS");
 }

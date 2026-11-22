@@ -27,6 +27,14 @@ void ShutdownDesktopForceApps();
 // Explicit escalation of already-prompted, still-open app windows.
 bool ShutdownCanForceApps(const char* requestId=nullptr);
 const char* ShutdownDesktopStatus();
+// After a failed checked shutdown: the explicit retry of the final sync and
+// the forced (data-losing) power off the desktop may offer.
+struct ShutdownFailureActions { bool failed, retry, forcePowerOff; };
+ShutdownFailureActions ShutdownDesktopFailureActions();
+void ShutdownDesktopRetry();
+void ShutdownDesktopForcePowerOff();
+// Increments on every transition to Failed (the compositor surfaces it).
+uint32_t ShutdownFailureGeneration();
 // True after the current shutdown is clean and the machine has no soft-off method.
 bool ShutdownReadyForManualPowerOff();
 const char* ShutdownRequestStatus(const char* requestId);
