@@ -1,6 +1,16 @@
 #pragma once
 #include <stdint.h>
 namespace brook {
+// Progress-bar rectangle of DrawBootSplash (same arithmetic), for overlays
+// drawn by the kernel only (the status line under the bar).
+struct BootSplashBar { uint32_t x, y, width; };
+inline BootSplashBar BootSplashBarRect(uint32_t width,uint32_t height,uint32_t logoW,uint32_t logoH) {
+    const uint32_t scale=(logoW+40>width||logoH+100>height)?2:1;
+    const uint32_t lw=logoW/scale,lh=logoH/scale;
+    const uint32_t oy=height>lh?(height-lh)/3:0;
+    uint32_t bw=lw*3/2;if(bw>width)bw=width;
+    return {(width-bw)/2,oy+lh+20,bw};
+}
 // Same pixels and layout in UEFI and the kernel. No services, allocation or TTY.
 inline void DrawBootSplash(uint32_t* fb,uint32_t width,uint32_t height,uint32_t stride,
                            const uint32_t* logo,uint32_t logoW,uint32_t logoH,

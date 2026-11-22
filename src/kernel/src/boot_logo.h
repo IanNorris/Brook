@@ -18,8 +18,13 @@ namespace brook {
 void BootLogoInit();
 
 // Update the progress bar (0–100).
-// Text is a short status label recorded in the serial log.
+// Text is a short stage label recorded in the serial log; known labels also
+// set the user-facing status line under the bar (boot_status_text.h).
 void BootLogoProgress(uint8_t percent, const char* text);
+
+// Set the status line shown under the bar (and advance the bar) without a
+// serial record, e.g. a long copy reporting "Loading system image 512 / 5415 MB".
+void BootLogoStatus(uint8_t percent, const char* status);
 
 // Restore text output and record the boot error.
 void BootLogoError(uint8_t percentAtError, const char* errorText);
