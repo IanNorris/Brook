@@ -18,7 +18,9 @@ int ThermalStartRatioTrial(unsigned ratio,unsigned seconds);
 // retargets when running; both zero turns it off. See cpu_power_budget.h.
 int ThermalSetCpuBudget(uint32_t coresMw,int32_t tempC);
 
-// Combined CPU + GPU balance controller (thermal_balance.h), off by default.
+// Combined CPU + GPU balance controller (thermal_balance.h). On by default in
+// BROOK_BDW_RPS_TRIAL (Dell) kernels unless /etc/dell-thermal-no-balance; the
+// sampler enables it once eligible. `off` disarms that for the boot, `on` re-arms.
 // Enable: same AC-only Broadwell-U admission as the budget (-95 otherwise),
 // takes the PERF_CTL owner in external mode (-16 if the budget or ratio trial
 // holds it). Disable, AC loss or ineligibility restore PERF_CTL on every CPU
@@ -33,6 +35,7 @@ struct ThermalBalanceStatus {
     BalanceSample last{};
     uint32_t appliedCap = 0, appliedGpuMhz = 0, gpuActualMhz = 0;
     uint64_t startedAt = 0, lastSampleAt = 0;
+    BalanceAuto autoState{}; // default-on arming (copied out by ThermalBalanceRead)
 };
 int ThermalBalanceEnable();
 void ThermalBalanceDisable();

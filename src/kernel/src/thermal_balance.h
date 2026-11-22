@@ -27,6 +27,20 @@
 //   raise: CPU up to the floor -> GPU up to RP0 (only while GPU-bound) -> CPU up to capTop
 // so GPU boost is always given up before the CPU goes below its floor, and in a
 // GPU-bound load the cheap CPU bins above the floor are traded first.
+//
+// int89 additions (Dell int88 A/B + 20 min soak):
+// - Spike back-off: an instantaneous spike fast-downs at most once per second,
+//   each spike doubles the post-down up hold, and in light mode a spike caps
+//   turbo at capTop (the int88 soak peaks of 82-87 C were light-mode turbo
+//   bursts the light path ignored).
+// - Damping: a light-mode re-cap within 30 s of a release doubles the release
+//   hold (turbo churn: 20 releases in the soak); a hot GPU down step leaves a
+//   ceiling at the level that overheated for 60 s (600 <-> 950
+//   limit cycles); a slow-filter-only down waits while the fast filter is
+//   already falling from the last step (overshoot below the floor).
+// - Idle floor: after 5 s of near-zero load the CPU is capped at idleRatio
+//   (~800 MHz) and the render clock at gpuIdleMhz (cores ~-0.5 W at idle on
+//   the Dell); any load sample ends it within one 250 ms sample.
 #include <stdint.h>
 
 namespace brook {
@@ -45,8 +59,10 @@ struct BalanceLimits {
     // fps without cooling; the 90 C trip and PROCHOT remain the backstops.
     unsigned lowestRatio = 0;
     unsigned capTop = 0;     // max non-turbo - 1 (from the PERF_CTL owner)
+    unsigned idleRatio = 0;  // light-load idle cap (IdleRatio clamped to minRatio..floorRatio)
     uint32_t gpuBaseMhz = 600; // default request (fixed boot value)
     uint32_t gpuMaxMhz = 600;  // fused RP0; == base disables GPU boost
+    uint32_t gpuIdleMhz = 0;   // idle render request; 0 = leave the default request
 };
 
 struct BalanceSample {
@@ -61,10 +77,10 @@ struct BalanceSample {
 enum class BalanceMode : uint8_t { Light, Heavy };
 enum class BalanceReason : uint8_t {
     None, NoSample, Settling, Wait, Band, LoadHeavy, LoadLight, HoldHot, Spike, Trip,
-    OverTemp, Predicted, OverPower, GpuIdle, Headroom
+    OverTemp, Predicted, OverPower, GpuIdle, Headroom, Idle, Wake, Falling
 };
 enum class BalanceAction : uint8_t {
-    None, Engage, Release, CpuDown, CpuUp, GpuDown, GpuUp, CpuCapHot, AtFloor, AtTop
+    None, Engage, Release, CpuDown, CpuUp, GpuDown, GpuUp, CpuCapHot, AtFloor, AtTop, IdleDown, IdleUp
 };
 
 struct BalanceLaw {
@@ -98,6 +114,23 @@ struct BalanceLaw {
     static constexpr unsigned FloorBins = 3;             // floor = capTop - 3 (20 on the Dell)
     static constexpr int32_t MinTargetC = 50, MaxTargetC = 82; // target + SpikeC stays at or under the 90 C trip
     static constexpr uint32_t MinPkgLimitMw = 5000, MaxPkgLimitMw = 25000;
+    // Spike back-off: fast-down at most once per SpikeSamples (1 s, about the
+    // fast thermal time constant, so the last step can act); trip edges always act.
+    static constexpr unsigned SpikeSamples = 4;
+    // Light-mode release hold after a cap; a re-cap within ReengageMs of a
+    // release doubles it up to MaxReleaseSamples (30 s); halves after CalmMs.
+    static constexpr unsigned ReleaseSamples = UpSamples;
+    static constexpr unsigned MaxReleaseSamples = 120;
+    // A hot GPU down step (temperature, prediction, power, spike or trip)
+    // keeps raises at or under the level that was too hot for CeilingMs.
+    static constexpr uint64_t CeilingMs = 60000;
+    // Idle floor: filtered GPU busy and C0 under these for IdleSamples (5 s)
+    // enters; an instantaneous sample at or over the Wake thresholds leaves.
+    static constexpr unsigned IdleSamples = 20;
+    static constexpr uint32_t IdleBusyPermille = 100, IdleC0Pct = 12;
+    static constexpr uint32_t WakeBusyPermille = 250, WakeC0Pct = 30;
+    static constexpr unsigned IdleRatio = 8;            // ~800 MHz, near Vmin on Broadwell-U
+    static constexpr uint32_t GpuIdleMhz = 450;         // only if the fused RPn allows it
 };
 
 struct BalanceFilter {
@@ -123,8 +156,10 @@ inline bool BalanceConfigValid(const BalanceConfig& c)
            c.pkgLimitMw >= BalanceLaw::MinPkgLimitMw && c.pkgLimitMw <= BalanceLaw::MaxPkgLimitMw;
 }
 
-// Derive limits from the PERF_CTL owner's range and the fused GPU caps.
-inline BalanceLimits BalanceMakeLimits(unsigned minRatio, unsigned capTop, uint32_t gpuBaseMhz, uint32_t gpuRp0Mhz)
+// Derive limits from the PERF_CTL owner's range and the fused GPU caps
+// (gpuRpnMhz 0 = unknown: no idle render clock).
+inline BalanceLimits BalanceMakeLimits(unsigned minRatio, unsigned capTop, uint32_t gpuBaseMhz, uint32_t gpuRp0Mhz,
+                                       uint32_t gpuRpnMhz = 0)
 {
     BalanceLimits l{};
     l.minRatio = minRatio;
@@ -134,6 +169,10 @@ inline BalanceLimits BalanceMakeLimits(unsigned minRatio, unsigned capTop, uint3
     l.gpuBaseMhz = gpuBaseMhz;
     l.gpuMaxMhz = gpuRp0Mhz > gpuBaseMhz ? gpuRp0Mhz - gpuRp0Mhz % BalanceLaw::GpuStepMhz : gpuBaseMhz;
     if (l.gpuMaxMhz < gpuBaseMhz) l.gpuMaxMhz = gpuBaseMhz;
+    l.idleRatio = BalanceLaw::IdleRatio < minRatio ? minRatio
+                : BalanceLaw::IdleRatio > l.floorRatio ? l.floorRatio : BalanceLaw::IdleRatio;
+    l.gpuIdleMhz = gpuRpnMhz && gpuRpnMhz <= BalanceLaw::GpuIdleMhz && BalanceLaw::GpuIdleMhz < gpuBaseMhz
+                 ? BalanceLaw::GpuIdleMhz : 0;
     return l;
 }
 
@@ -169,21 +208,27 @@ struct BalanceState {
     unsigned settle = 0, sinceStep = 0xffff, heavyRun = 0, lightRun = 0, gpuIdleRun = 0;
     int8_t lastDir = 0;        // direction of the last ladder step
     unsigned upBackoff = 1, lightHold = BalanceLaw::LightSamples;
+    unsigned releaseHold = BalanceLaw::ReleaseSamples;
+    unsigned sinceSpike = 0xffff, idleRun = 0;
+    bool idle = false;          // light-load idle floor active
     bool tripSeen = false, tripPending = false;
-    uint64_t lastReleaseMs = 0, lastBackoffMs = 0, lastStepMs = 0;
+    uint32_t gpuCeilingMhz = 0; // 0 = none; raises stay at or under it until lastHotGpuMs + CeilingMs
+    uint64_t lastReleaseMs = 0, lastBackoffMs = 0, lastStepMs = 0, lastHotGpuMs = 0;
     uint64_t samples = 0, engages = 0, releases = 0, reengages = 0;
     uint64_t cpuDown = 0, cpuUp = 0, gpuDown = 0, gpuUp = 0, gpuIdleDown = 0;
     uint64_t spikes = 0, trips = 0, reversals = 0, prematureUps = 0, belowFloor = 0;
+    uint64_t spikeHolds = 0, recaps = 0, ceilingHolds = 0, fallingHolds = 0, idleEntries = 0, wakes = 0;
     unsigned minCapSeen = 0;    // lowest cap since enable (0 = never capped)
     uint32_t maxGpuSeen = 0;
 
     void Reset(const BalanceLimits& l) { *this = {}; gpuMhz = l.gpuBaseMhz; }
 
     // Render-clock overlay for the kernel: 0 = no override (the default
-    // request applies). Only heavy mode boosts.
+    // request applies). Only heavy mode boosts; the idle floor lowers.
     uint32_t GpuOverlay(const BalanceLimits& l) const
     {
-        return mode == BalanceMode::Heavy && gpuMhz > l.gpuBaseMhz ? gpuMhz : 0;
+        if (mode == BalanceMode::Heavy) return gpuMhz > l.gpuBaseMhz ? gpuMhz : 0;
+        return idle && l.gpuIdleMhz ? l.gpuIdleMhz : 0;
     }
 };
 
@@ -220,6 +265,27 @@ inline BalanceAction Lower(BalanceState& st, const BalanceLimits& l, uint32_t gp
     }
     if (st.cap > l.lowestRatio) { --st.cap; ++st.cpuDown; return BalanceAction::CpuDown; }
     return BalanceAction::AtFloor;
+}
+
+// A hot GPU down step from `from` MHz: for CeilingMs raises may return to
+// that level but not past it (the lowest such level wins while it lasts).
+inline void NoteHotGpu(BalanceState& st, uint32_t from, uint64_t now)
+{
+    const uint32_t c = from;
+    st.gpuCeilingMhz = st.gpuCeilingMhz && st.gpuCeilingMhz < c && now - st.lastHotGpuMs < BalanceLaw::CeilingMs
+                     ? st.gpuCeilingMhz : c;
+    st.lastHotGpuMs = now;
+}
+
+// A light-mode cap soon after a release: back off the next release.
+inline void NoteRecap(BalanceState& st, uint64_t now)
+{
+    using L = BalanceLaw;
+    if (!st.lastReleaseMs || now - st.lastReleaseMs >= L::ReengageMs) return;
+    ++st.recaps;
+    if (st.releaseHold < L::MaxReleaseSamples)
+        st.releaseHold = st.releaseHold * 2 < L::MaxReleaseSamples ? st.releaseHold * 2 : L::MaxReleaseSamples;
+    st.lastBackoffMs = now;
 }
 
 } // namespace balance_detail
@@ -260,6 +326,8 @@ inline BalanceReason BalanceDecide(const BalanceConfig& cfg, const BalanceLimits
         f.c0 = uint32_t(int64_t(f.c0) + (int64_t(s.c0Pct) - int64_t(f.c0)) / 4);
     }
     if (st.sinceStep < 0xffff) ++st.sinceStep;
+    if (st.sinceSpike < 0xffff) ++st.sinceSpike;
+    if (st.gpuCeilingMhz && nowMs - st.lastHotGpuMs >= L::CeilingMs) st.gpuCeilingMhz = 0;
     // A trip latches for >= 5 s: react once to its edge, then hold all raises until it clears.
     const bool tripEdge = s.gpuTripped && !st.tripSeen;
     if (tripEdge) { ++st.trips; st.tripPending = true; }
@@ -267,7 +335,9 @@ inline BalanceReason BalanceDecide(const BalanceConfig& cfg, const BalanceLimits
     if (st.lastBackoffMs && nowMs - st.lastBackoffMs >= L::CalmMs) {
         if (st.upBackoff > 1) st.upBackoff /= 2;
         if (st.lightHold > L::LightSamples) st.lightHold = st.lightHold / 2 > L::LightSamples ? st.lightHold / 2 : L::LightSamples;
-        st.lastBackoffMs = st.upBackoff > 1 || st.lightHold > L::LightSamples ? nowMs : 0;
+        if (st.releaseHold > L::ReleaseSamples)
+            st.releaseHold = st.releaseHold / 2 > L::ReleaseSamples ? st.releaseHold / 2 : L::ReleaseSamples;
+        st.lastBackoffMs = st.upBackoff > 1 || st.lightHold > L::LightSamples || st.releaseHold > L::ReleaseSamples ? nowMs : 0;
     }
 
     const int32_t T = cfg.targetC, temp = f.Temp(), pred = f.Predicted();
@@ -278,10 +348,25 @@ inline BalanceReason BalanceDecide(const BalanceConfig& cfg, const BalanceLimits
     if (st.mode == BalanceMode::Light) {
         st.lightRun = 0;
         st.heavyRun = heavyNow ? st.heavyRun + 1 : 0;
+        // Idle floor exit: any instantaneous load sample (one 250 ms sample of latency).
+        if (st.idle && (s.gpuBusyPermille >= L::WakeBusyPermille || s.c0Pct >= L::WakeC0Pct || heavyNow)) {
+            st.idle = false;
+            st.idleRun = 0;
+            ++st.wakes;
+            const bool hot = temp >= T - L::DownBandC;
+            st.cap = hot ? l.capTop : 0;
+            st.sinceStep = 0;
+            st.lastStepMs = nowMs;
+            st.lastStepReason = BalanceReason::Wake;
+            return done(BalanceReason::Wake, BalanceAction::IdleUp);
+        }
         if (st.heavyRun >= L::EnterSamples) {
             st.mode = BalanceMode::Heavy;
             st.heavyRun = 0;
             st.gpuIdleRun = 0;
+            st.idle = false;
+            st.idleRun = 0;
+            st.gpuCeilingMhz = 0;
             ++st.engages;
             if (st.lastReleaseMs && nowMs - st.lastReleaseMs < L::ReengageMs) {
                 ++st.reengages;
@@ -289,21 +374,45 @@ inline BalanceReason BalanceDecide(const BalanceConfig& cfg, const BalanceLimits
                     st.lightHold = st.lightHold * 2 < L::MaxLightSamples ? st.lightHold * 2 : L::MaxLightSamples;
                 st.lastBackoffMs = nowMs;
             }
-            if (!st.cap) st.cap = l.capTop;
+            if (!st.cap || st.cap < l.floorRatio) st.cap = l.capTop;
             st.gpuMhz = l.gpuBaseMhz;
             st.lastDir = 0;
             Note(st, l, nowMs, 0, BalanceReason::LoadHeavy);
             return done(BalanceReason::LoadHeavy, BalanceAction::Engage);
         }
+        if (st.idle) return done(BalanceReason::Idle);
+        // Light-load spike (a turbo burst): cap turbo now instead of waiting for the filter.
+        if (!st.cap && s.pkgC >= T + L::SpikeC) {
+            st.cap = l.capTop;
+            ++st.spikes;
+            st.sinceSpike = 0;
+            NoteRecap(st, nowMs);
+            Note(st, l, nowMs, 0, BalanceReason::Spike);
+            return done(BalanceReason::Spike, BalanceAction::CpuCapHot);
+        }
         // Light load runs at the firmware request (turbo), unless the package
         // is hot: then hold max non-turbo - 1 until it cools.
-        // (Filtered only: brief light-load turbo bursts are the default behaviour.)
         if (!st.cap && temp >= T - L::DownBandC) {
             st.cap = l.capTop;
+            NoteRecap(st, nowMs);
             Note(st, l, nowMs, 0, BalanceReason::HoldHot);
             return done(BalanceReason::HoldHot, BalanceAction::CpuCapHot);
         }
-        if (st.cap && st.sinceStep >= L::UpSamples && temp <= T - L::ReleaseBandC && pred <= T - L::UpPredictBandC) {
+        // Idle floor entry: near-zero filtered and instantaneous load for 5 s.
+        const bool quiet = f.busy < L::IdleBusyPermille && f.c0 < L::IdleC0Pct &&
+                           s.gpuBusyPermille < L::WakeBusyPermille && s.c0Pct < L::WakeC0Pct;
+        st.idleRun = quiet ? st.idleRun + 1 : 0;
+        if (st.idleRun >= L::IdleSamples && l.idleRatio) {
+            st.idle = true;
+            st.idleRun = 0;
+            st.cap = l.idleRatio;
+            ++st.idleEntries;
+            st.sinceStep = 0;
+            st.lastStepMs = nowMs;
+            st.lastStepReason = BalanceReason::Idle;
+            return done(BalanceReason::Idle, BalanceAction::IdleDown);
+        }
+        if (st.cap && st.sinceStep >= st.releaseHold && temp <= T - L::ReleaseBandC && pred <= T - L::UpPredictBandC) {
             st.cap = 0;
             ++st.releases;
             st.lastReleaseMs = nowMs;
@@ -318,6 +427,8 @@ inline BalanceReason BalanceDecide(const BalanceConfig& cfg, const BalanceLimits
     if (st.lightRun >= st.lightHold) {
         st.mode = BalanceMode::Light;
         st.lightRun = 0;
+        st.idleRun = 0;
+        st.gpuCeilingMhz = 0;
         st.gpuMhz = l.gpuBaseMhz;
         st.lastDir = 0;
         const bool cool = temp <= T - L::ReleaseBandC && pred <= T - L::UpPredictBandC;
@@ -332,14 +443,27 @@ inline BalanceReason BalanceDecide(const BalanceConfig& cfg, const BalanceLimits
     }
     if (st.settle) { --st.settle; return done(BalanceReason::Settling); }
 
-    if (st.tripPending || s.pkgC >= T + L::SpikeC) {
+    const bool spikeNow = s.pkgC >= T + L::SpikeC;
+    if (!st.tripPending && spikeNow && st.sinceSpike < L::SpikeSamples) {
+        // Spike back-off: the last fast-down has not had time to act; never raise meanwhile.
+        ++st.spikeHolds;
+        return done(BalanceReason::Wait);
+    }
+    if (st.tripPending || spikeNow) {
         // Fast down: drop the GPU boost two bins and one CPU bin above the
         // floor in the same sample; below the floor only with no boost left.
         const auto why = st.tripPending ? BalanceReason::Trip : BalanceReason::Spike;
         if (!st.tripPending) ++st.spikes;
         st.tripPending = false;
+        st.sinceSpike = 0;
+        // Each fast-down doubles the post-down up hold (halved again after
+        // CalmMs); Note doubles it instead when it follows an up step closely.
+        if (!(st.lastDir > 0 && st.sinceStep < L::PrematureUpSamples) && st.upBackoff < L::MaxUpBackoff)
+            st.upBackoff *= 2;
+        st.lastBackoffMs = nowMs;
         BalanceAction what = BalanceAction::None;
         if (st.gpuMhz > l.gpuBaseMhz) {
+            NoteHotGpu(st, st.gpuMhz, nowMs);
             const uint32_t step = 2 * L::GpuStepMhz;
             st.gpuMhz = st.gpuMhz > l.gpuBaseMhz + step ? st.gpuMhz - step : l.gpuBaseMhz;
             ++st.gpuDown;
@@ -361,10 +485,18 @@ inline BalanceReason BalanceDecide(const BalanceConfig& cfg, const BalanceLimits
     const bool overTemp = f.Slow() >= T - L::DownBandC || temp >= T + L::FastOverC;
     const bool overPred = temp >= T - L::PredictNearC && pred >= T + L::PredictDownC;
     const bool overPower = s.powerValid && f.pkgMw > cfg.pkgLimitMw && st.sinceStep >= L::PowerDownSamples;
+    // Damping: "at the target" on the slow filter alone, while the fast filter
+    // is under the target and already falling (our last down step is acting):
+    // wait instead of stacking another step on the slow filter's lag.
+    const bool slowOnly = overTemp && temp < T - L::DownBandC && !overPred;
+    const bool falling = st.lastDir < 0 && temp < f.Slow() && pred < temp;
+    if (slowOnly && falling && !overPower) { ++st.fallingHolds; return done(BalanceReason::Falling); }
     if (((overTemp || overPred) && st.sinceStep >= L::DownSamples) || overPower) {
         const auto why = overTemp ? BalanceReason::OverTemp : overPred ? BalanceReason::Predicted : BalanceReason::OverPower;
+        const uint32_t gpuBefore = st.gpuMhz;
         const auto what = Lower(st, l);
         if (what == BalanceAction::AtFloor) return done(why, what);
+        if (what == BalanceAction::GpuDown) NoteHotGpu(st, gpuBefore, nowMs);
         Note(st, l, nowMs, -1, why);
         return done(why, what);
     }
@@ -393,7 +525,10 @@ inline BalanceReason BalanceDecide(const BalanceConfig& cfg, const BalanceLimits
         Note(st, l, nowMs, +1, BalanceReason::Headroom);
         return done(BalanceReason::Headroom, BalanceAction::CpuUp);
     }
-    if (st.gpuMhz < l.gpuMaxMhz && f.busy >= L::BusyHeavyPermille) {
+    const uint32_t gpuTop = st.gpuCeilingMhz && st.gpuCeilingMhz < l.gpuMaxMhz
+                          ? (st.gpuCeilingMhz > l.gpuBaseMhz ? st.gpuCeilingMhz : l.gpuBaseMhz) : l.gpuMaxMhz;
+    if (st.gpuMhz >= gpuTop && gpuTop < l.gpuMaxMhz && f.busy >= L::BusyHeavyPermille) ++st.ceilingHolds;
+    if (st.gpuMhz < gpuTop && f.busy >= L::BusyHeavyPermille) {
         const bool far = temp <= T - L::FastUpBandC && hi <= T - L::FastUpBandC + 2;
         // Feed-forward: GT power grows ~f^2.5-f^3 here; charge the increase
         // 5/4 to the package (GT-driven ring/LLC traffic lands in PP0).
@@ -406,7 +541,7 @@ inline BalanceReason BalanceDecide(const BalanceConfig& cfg, const BalanceLimits
         };
         for (uint32_t bins = far ? 2 : 1; bins; --bins) {
             uint32_t next = st.gpuMhz + bins * L::GpuStepMhz;
-            if (next > l.gpuMaxMhz) next = l.gpuMaxMhz;
+            if (next > gpuTop) next = gpuTop;
             if (!ffOk(next)) continue;
             st.gpuMhz = next;
             ++st.gpuUp;
@@ -422,5 +557,28 @@ inline BalanceReason BalanceDecide(const BalanceConfig& cfg, const BalanceLimits
     }
     return done(BalanceReason::Band, BalanceAction::AtTop);
 }
+
+// Boot default (the Dell pair): armed unless the opt-out marker
+// /etc/dell-thermal-no-balance holds "1\n". While armed and off, the sampler
+// tries to enable every RetryMs once the admission (AC online, Broadwell-U,
+// bare metal) holds, so AC loss stops it and AC return restarts it.
+// `thermal balance off` disarms it for the rest of the boot, `on` re-arms;
+// losing the PERF_CTL owner (firmware or another owner superseded it) disarms.
+struct BalanceAuto {
+    static constexpr uint64_t RetryMs = 5000;
+    bool armed = false, optedOut = false, decided = false;
+    uint64_t lastTryMs = 0, enables = 0, failures = 0;
+    int lastResult = 0;
+    bool Due(bool enabled, bool eligible, uint64_t nowMs) const
+    {
+        return armed && !enabled && eligible && (!lastTryMs || nowMs - lastTryMs >= RetryMs);
+    }
+    void Note(int result, uint64_t nowMs)
+    {
+        lastTryMs = nowMs ? nowMs : 1;
+        lastResult = result;
+        if (result) ++failures; else ++enables;
+    }
+};
 
 } // namespace brook

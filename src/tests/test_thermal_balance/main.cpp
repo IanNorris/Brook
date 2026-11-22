@@ -15,7 +15,7 @@ namespace {
 constexpr uint32_t DellCaps = 0x060613; // RPn 300, RP1 300, RP0 950
 constexpr uint64_t PeriodMs = 250;
 
-BalanceLimits Dell() { return BalanceMakeLimits(8, 23, BdwClockBootMhz, 950); }
+BalanceLimits Dell() { return BalanceMakeLimits(8, 23, BdwClockBootMhz, 950, 300); }
 
 // Plant: Dell XPS 13 9343 under the choppy 480p AV1 clip, fitted to the 21 Nov
 // int86/int87 histories. First-order (two time constant) package thermal
@@ -125,7 +125,7 @@ RunStats RunBalance(Plant& p, BalanceState& st, const BalanceConfig& cfg, const 
             // Priority invariant: never below the floor while the GPU is boosted.
             assert(!(st.cap && st.cap < l.floorRatio && st.gpuMhz > l.gpuBaseMhz));
             assert(st.gpuMhz >= l.gpuBaseMhz && st.gpuMhz <= l.gpuMaxMhz);
-            assert(!st.cap || (st.cap >= l.lowestRatio && st.cap <= l.capTop));
+            assert(!st.cap || (st.idle && st.cap == l.idleRatio) || (st.cap >= l.lowestRatio && st.cap <= l.capTop));
         }
         if (double(p.nowMs - start) / 1000 < fromS) { lastCap = st.cap; lastGpu = st.gpuMhz; continue; }
         ++r.n;
@@ -177,11 +177,16 @@ void TestLimitsAndMeter()
     const auto l = Dell();
     assert(l.minRatio == 8 && l.capTop == 23 && l.floorRatio == 20 && l.lowestRatio == 13);
     assert(l.gpuBaseMhz == 600 && l.gpuMaxMhz == 950);
-    // Unknown caps: no GPU boost range.
+    assert(l.idleRatio == 8 && l.gpuIdleMhz == 450);
+    // Unknown caps: no GPU boost range, no idle render clock.
     const auto n = BalanceMakeLimits(8, 23, 600, 600);
-    assert(n.gpuMaxMhz == 600);
+    assert(n.gpuMaxMhz == 600 && n.gpuIdleMhz == 0);
     const auto tight = BalanceMakeLimits(8, 10, 600, 950);
-    assert(tight.floorRatio == 8);
+    assert(tight.floorRatio == 8 && tight.idleRatio == 8);
+    // The real Dell: LFM 5 -> idle cap 8; RPn above 450 -> no idle render clock.
+    assert(BalanceMakeLimits(5, 23, 600, 950, 300).idleRatio == 8);
+    assert(BalanceMakeLimits(12, 23, 600, 950, 500).idleRatio == 12);
+    assert(BalanceMakeLimits(5, 23, 600, 950, 500).gpuIdleMhz == 0);
     assert(BalanceConfigValid(BalanceConfig{}));
     assert(!BalanceConfigValid(BalanceConfig{90, 13000}));  // too close to the 90 C trip
     assert(!BalanceConfigValid(BalanceConfig{75, 30000}));
@@ -387,8 +392,15 @@ void TestSpikeFastDown()
     assert(st.gpuMhz == 850 && st.cap == 22 && st.gpuDown == down + 1 && st.cpuDown == cpu + 1);
     assert(st.spikes == 1);
     assert(BalanceDecide(cfg, l, st, Sample(cfg.targetC + BalanceLaw::SpikeC), now += 250) == BalanceReason::Settling);
+    // Spike back-off: at most one fast-down per second (the step needs time to act).
+    for (unsigned i = 2; i < BalanceLaw::SpikeSamples; ++i) {
+        assert(BalanceDecide(cfg, l, st, Sample(cfg.targetC + BalanceLaw::SpikeC), now += 250) == BalanceReason::Wait);
+        assert(st.gpuMhz == 850 && st.cap == 22);
+    }
+    assert(st.spikeHolds == BalanceLaw::SpikeSamples - 2);
     assert(BalanceDecide(cfg, l, st, Sample(cfg.targetC + BalanceLaw::SpikeC), now += 250) == BalanceReason::Spike);
     assert(st.gpuMhz == 750 && st.cap == 21);
+    assert(st.upBackoff >= 4);                      // each spike backs off the next raise
     // A 90 C trip seen from the render clock acts like a spike and is counted.
     auto trip = Sample(70);
     trip.gpuTripped = true;
@@ -404,7 +416,9 @@ void TestSpikeFastDown()
     for (int i = 0; i < 200; ++i) BalanceDecide(cfg, l, st, trip, now += 250);
     assert(st.gpuMhz == latchedGpu && st.cap == latchedCap); // nothing rises while latched
     trip.gpuTripped = false;
-    for (int i = 0; i < 60; ++i) BalanceDecide(cfg, l, st, trip, now += 250);
+    // Two spikes and a trip back off the next raise (up hold 5 s x backoff,
+    // halved per calm minute): the first raise comes within ~45 s.
+    for (int i = 0; i < 180 && st.gpuMhz <= latchedGpu; ++i) BalanceDecide(cfg, l, st, trip, now += 250);
     assert(st.gpuMhz > latchedGpu);
     // Up is held off after a down step.
     BalanceDecide(cfg, l, st, Sample(cfg.targetC + BalanceLaw::SpikeC), now += 250);
@@ -598,6 +612,168 @@ void TestAdaptsToCooling()
     assert(low.maxFiltered <= 64 + 1);
 }
 
+// Light load: a single turbo-burst spike caps turbo at once; re-capping soon
+// after a release backs off the next release (int88 soak: 20 releases, peaks 82-87 C).
+void TestLightSpikeAndRecap()
+{
+    const auto l = Dell();
+    const BalanceConfig cfg{};
+    BalanceState st{};
+    st.Reset(l);
+    uint64_t now = 0;
+    for (int i = 0; i < 8; ++i) BalanceDecide(cfg, l, st, Sample(62, 300, 7000, 200, 20), now += 250);
+    assert(st.mode == BalanceMode::Light && st.cap == 0);
+    assert(BalanceDecide(cfg, l, st, Sample(cfg.targetC + BalanceLaw::SpikeC, 300, 9000, 200, 30), now += 250) ==
+           BalanceReason::Spike);
+    assert(st.cap == l.capTop && st.spikes == 1 && st.lastAction == BalanceAction::CpuCapHot);
+    unsigned n = 0;
+    while (st.cap && n < 200) { BalanceDecide(cfg, l, st, Sample(62, 300, 7000, 200, 20), now += 250); ++n; }
+    assert(st.cap == 0 && st.releases == 1 && n >= BalanceLaw::ReleaseSamples);
+    // Spike again 5 s after the release: recap, and the next release waits twice as long.
+    for (int i = 0; i < 20; ++i) BalanceDecide(cfg, l, st, Sample(62, 300, 7000, 200, 20), now += 250);
+    BalanceDecide(cfg, l, st, Sample(cfg.targetC + BalanceLaw::SpikeC, 300, 9000, 200, 30), now += 250);
+    assert(st.cap == l.capTop && st.recaps == 1 && st.releaseHold == 2 * BalanceLaw::ReleaseSamples);
+    n = 0;
+    while (st.cap && n < 400) { BalanceDecide(cfg, l, st, Sample(62, 300, 7000, 200, 20), now += 250); ++n; }
+    assert(st.cap == 0 && n >= 2 * BalanceLaw::ReleaseSamples);
+    // Calm for a minute: the release hold halves back.
+    for (int i = 0; i < 300; ++i) BalanceDecide(cfg, l, st, Sample(62, 300, 7000, 200, 20), now += 250);
+    assert(st.releaseHold == BalanceLaw::ReleaseSamples);
+}
+
+// Light-load heat churn (8 s: 2 s hot, 6 s cool): releases are damped.
+void TestLightChurnDamped()
+{
+    const auto l = Dell();
+    const BalanceConfig cfg{};
+    BalanceState st{};
+    st.Reset(l);
+    uint64_t now = 0;
+    for (int cycle = 0; cycle < 20; ++cycle) {
+        for (int i = 0; i < 8; ++i) BalanceDecide(cfg, l, st, Sample(78, 300, 9000, 200, 25), now += 250);
+        for (int i = 0; i < 24; ++i) BalanceDecide(cfg, l, st, Sample(60, 300, 7000, 200, 20), now += 250);
+    }
+    printf("light churn: %llu releases, %llu recaps in 160 s, release hold %u ms\n",
+           (unsigned long long)st.releases, (unsigned long long)st.recaps, st.releaseHold * 250);
+    assert(st.mode == BalanceMode::Light);
+    assert(st.releases <= 8 && st.releaseHold > BalanceLaw::ReleaseSamples); // 20 cycles: one release each undamped
+}
+
+// A hot GPU down step leaves a ceiling: raises return at most to the level
+// that was too hot for a minute (the soak's 600 <-> 950 limit cycles).
+void TestGpuCeiling()
+{
+    const auto l = Dell();
+    const BalanceConfig cfg{};
+    BalanceState st{};
+    st.Reset(l);
+    uint64_t now = 0;
+    for (int i = 0; i < 100; ++i) BalanceDecide(cfg, l, st, Sample(60), now += 250);
+    assert(st.gpuMhz == 950 && st.cap == 23);
+    // Hot: CPU to the floor, then the GPU down a few bins.
+    for (int i = 0; i < 400 && st.gpuMhz > 800; ++i) BalanceDecide(cfg, l, st, Sample(cfg.targetC), now += 250);
+    assert(st.cap == l.floorRatio && st.gpuMhz == 800 && st.gpuCeilingMhz == 850);
+    // Cool again: the GPU climbs back to the ceiling only, while it lasts.
+    const uint64_t hotAt = st.lastHotGpuMs;
+    uint32_t top = 0;
+    while (now - hotAt < BalanceLaw::CeilingMs - 1000) {
+        BalanceDecide(cfg, l, st, Sample(60), now += 250);
+        if (st.gpuMhz > top) top = st.gpuMhz;
+    }
+    assert(top == 850 && st.ceilingHolds > 0);
+    for (int i = 0; i < 400; ++i) BalanceDecide(cfg, l, st, Sample(60), now += 250);
+    assert(st.gpuCeilingMhz == 0 && st.gpuMhz == 950);
+}
+
+// Damping: once a down step is acting (fast filter under the target and
+// falling), the slow filter's lag alone does not stack more steps.
+void TestFallingHold()
+{
+    const auto l = Dell();
+    const BalanceConfig cfg{};
+    BalanceState st{};
+    st.Reset(l);
+    uint64_t now = 0;
+    for (int i = 0; i < 100; ++i) BalanceDecide(cfg, l, st, Sample(60), now += 250);
+    for (int i = 0; i < 200 && st.lastDir >= 0; ++i) BalanceDecide(cfg, l, st, Sample(cfg.targetC + 2), now += 250);
+    for (int i = 0; i < 40; ++i) BalanceDecide(cfg, l, st, Sample(cfg.targetC + 2), now += 250);
+    assert(st.filter.Slow() >= cfg.targetC);
+    const auto downs = st.cpuDown + st.gpuDown;
+    // The step worked: the package drops to 68 C; the slow filter stays >= target - 1 for a while.
+    unsigned laggingSamples = 0;
+    for (int i = 0; i < 16; ++i) {
+        BalanceDecide(cfg, l, st, Sample(68), now += 250);
+        if (st.filter.Slow() >= cfg.targetC - BalanceLaw::DownBandC) ++laggingSamples;
+    }
+    assert(laggingSamples >= 4 && st.fallingHolds > 0);
+    assert(st.cpuDown + st.gpuDown == downs);
+}
+
+// Idle floor: 5 s of near-zero load caps the CPU at idleRatio and the render
+// clock at gpuIdleMhz; one loaded sample restores both.
+void TestIdleFloor()
+{
+    const auto l = Dell();
+    const BalanceConfig cfg{};
+    BalanceState st{};
+    st.Reset(l);
+    uint64_t now = 0;
+    for (int i = 0; i < int(BalanceLaw::IdleSamples) + 8 && !st.idle; ++i)
+        BalanceDecide(cfg, l, st, Sample(55, 20, 3000, 10, 3), now += 250);
+    assert(st.idle && st.cap == l.idleRatio && st.GpuOverlay(l) == l.gpuIdleMhz && st.idleEntries == 1);
+    assert(st.samples >= BalanceLaw::IdleSamples);
+    for (int i = 0; i < 40; ++i) BalanceDecide(cfg, l, st, Sample(55, 20, 3000, 10, 8), now += 250);
+    assert(st.idle && st.releases == 0);           // stays idle; no turbo release churn
+    // A small burst under the wake thresholds keeps it; one at them ends it.
+    BalanceDecide(cfg, l, st, Sample(55, 200, 3000, 10, 20), now += 250);
+    assert(st.idle);
+    assert(BalanceDecide(cfg, l, st, Sample(55, 400, 4000, 50, 10), now += 250) == BalanceReason::Wake);
+    assert(!st.idle && st.cap == 0 && st.GpuOverlay(l) == 0 && st.wakes == 1);
+    // Heavy load straight from idle: wake on the first sample, engage once the
+    // filtered load has been heavy for 1 s (~3 s here).
+    for (int i = 0; i < int(BalanceLaw::IdleSamples) + 8 && !st.idle; ++i)
+        BalanceDecide(cfg, l, st, Sample(55, 20, 3000, 10, 3), now += 250);
+    assert(st.idle);
+    BalanceDecide(cfg, l, st, Sample(60, 950, 9000, 400, 40), now += 250);
+    assert(!st.idle && st.cap == 0);
+    for (int i = 0; i < 16; ++i) BalanceDecide(cfg, l, st, Sample(60, 950, 9000, 400, 40), now += 250);
+    assert(st.mode == BalanceMode::Heavy && st.cap == l.capTop && st.engages == 1);
+    // Hot idle wakes to capTop, not turbo.
+    BalanceState h{};
+    h.Reset(l);
+    now = 0;
+    for (int i = 0; i < 60 && !h.idle; ++i) BalanceDecide(cfg, l, h, Sample(55, 20, 3000, 10, 3), now += 250);
+    for (int i = 0; i < 40; ++i) BalanceDecide(cfg, l, h, Sample(80, 20, 3000, 10, 3), now += 250);
+    assert(h.idle && h.cap == l.idleRatio);
+    BalanceDecide(cfg, l, h, Sample(80, 400, 4000, 50, 40), now += 250);
+    assert(!h.idle && h.cap == l.capTop);
+    // Without an RPn the idle floor leaves the render clock alone.
+    const auto noRpn = BalanceMakeLimits(8, 23, BdwClockBootMhz, 950);
+    BalanceState q{};
+    q.Reset(noRpn);
+    now = 0;
+    for (int i = 0; i < 60 && !q.idle; ++i) BalanceDecide(cfg, noRpn, q, Sample(55, 20, 3000, 10, 3), now += 250);
+    assert(q.idle && q.GpuOverlay(noRpn) == 0);
+}
+
+// Default-on arming: retry while armed and eligible, every RetryMs at most.
+void TestAutoArm()
+{
+    BalanceAuto a{};
+    assert(!a.Due(false, true, 1000));             // not armed (opt-out or `off`)
+    a.armed = true;
+    assert(!a.Due(false, false, 1000));            // battery / ineligible
+    assert(a.Due(false, true, 1000));
+    a.Note(0, 1000);
+    assert(a.enables == 1 && !a.Due(true, true, 9000)); // running
+    assert(!a.Due(false, true, 1000 + BalanceAuto::RetryMs - 1)); // stopped (AC lost): rate-limited
+    assert(a.Due(false, true, 1000 + BalanceAuto::RetryMs));
+    a.Note(-16, 7000);
+    assert(a.failures == 1 && a.lastResult == -16 && !a.Due(false, true, 8000));
+    a.armed = false;
+    assert(!a.Due(false, true, 100000));
+}
+
 } // namespace
 
 int main()
@@ -618,6 +794,12 @@ int main()
     TestPp0CouplingFailureMode();
     TestNoTurboUnderLoad();
     TestAdaptsToCooling();
+    TestLightSpikeAndRecap();
+    TestLightChurnDamped();
+    TestGpuCeiling();
+    TestFallingHold();
+    TestIdleFloor();
+    TestAutoArm();
     puts("test_thermal_balance: ok");
     return 0;
 }

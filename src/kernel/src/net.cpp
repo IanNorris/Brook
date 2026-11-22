@@ -6368,7 +6368,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  thermal status|history|graph|power|reset - CPU/GPU temperature, power and frequency sampler\n"
             "  thermal cpu-first epb BIAS SECONDS | ratio RATIO SECONDS | status | off - timed AC-only EPB / PERF_CTL ratio-cap experiments\n"
             "  thermal cpu-budget WATTS|off|status | temp C|off | power WATTS|off - AC-only closed-loop PERF_CTL cap on cores (PP0) power / package temp (default off)\n"
-            "  thermal balance on|off|status | target C | power WATTS - AC-only combined CPU cap + GPU clock boost under sustained load (default off, target 75 C)\n"
+            "  thermal balance on|off|status | target C | power WATTS - AC-only combined CPU cap + GPU clock boost under sustained load, idle floor at light load (Dell default on unless /etc/dell-thermal-no-balance; off disarms for the boot; target 75 C)\n"
             "  gpu scene wake on|off|status - default-off scene completion notification experiment\n"
             "  audio shared-prefix on|off|reset|status - experimental headroom-gated mix batching (default off)\n"
             "  audio horizon on|off|reset|status - experimental guarded output target and prospective OSS geometry (default off)\n"
@@ -7262,8 +7262,9 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         const auto& st=b.state;
         static const char* outcomes[]={"none","running","disabled","ineligible","owner_lost","unsupported"};
         static const char* reasons[]={"none","no_sample","settling","wait","band","load_heavy","load_light","hold_hot","spike","trip",
-                                      "over_temp","predicted","over_power","gpu_idle","headroom"};
-        static const char* actions[]={"none","engage","release","cpu_down","cpu_up","gpu_down","gpu_up","cpu_cap_hot","at_floor","at_top"};
+                                      "over_temp","predicted","over_power","gpu_idle","headroom","idle","wake","falling"};
+        static const char* actions[]={"none","engage","release","cpu_down","cpu_up","gpu_down","gpu_up","cpu_cap_hot","at_floor","at_top",
+                                      "idle_down","idle_up"};
         auto sfield=[](BridgeReply& r,const char* name,int64_t v){r.text("\"");r.text(name);r.text("\":");if(v<0){r.text("-");v=-v;}r.number(uint64_t(v));};
         const uint64_t now=ApicTickCount();
 #if defined(BROOK_BDW_RPS_TRIAL)
@@ -7280,7 +7281,13 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",\"enabled\":");r.text(b.enabled?"true":"false");
         r.text(",\"outcome\":");r.quoted(outcomes[unsigned(b.outcome)]);
         r.text(",\"owner_active\":");r.text(b.ownerActive?"true":"false");
-        r.text(",\"mode\":");r.quoted(!b.enabled?"off":!b.ownerActive?"starting":st.mode==BalanceMode::Heavy?"heavy":"light");
+        r.text(",\"mode\":");r.quoted(!b.enabled?"off":!b.ownerActive?"starting":st.mode==BalanceMode::Heavy?"heavy":st.idle?"idle":"light");
+        r.text(",\"default_on\":");r.text(b.autoState.decided && !b.autoState.optedOut?"true":"false");
+        r.text(",\"opted_out\":");r.text(b.autoState.optedOut?"true":"false");
+        r.text(",\"auto_armed\":");r.text(b.autoState.armed?"true":"false");
+        r.text(",");r.field("auto_enables",b.autoState.enables);
+        r.text(",");r.field("auto_failures",b.autoState.failures);
+        r.text(",");sfield(r,"auto_last_errno",-b.autoState.lastResult);
         r.text(",");sfield(r,"target_c",b.config.targetC);
         r.text(",");r.field("pkg_limit_mw",b.config.pkgLimitMw);
         r.text(",\"last_reason\":");r.quoted(reasons[unsigned(st.lastReason)]);
@@ -7329,9 +7336,19 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",");r.field("max_gpu_seen_mhz",st.maxGpuSeen);
         r.text(",");r.field("up_backoff",st.upBackoff);
         r.text(",");r.field("light_hold_ms",uint64_t(st.lightHold)*ThermalPeriodMs);
+        r.text(",");r.field("release_hold_ms",uint64_t(st.releaseHold)*ThermalPeriodMs);
+        r.text(",");r.field("gpu_ceiling_mhz",st.gpuCeilingMhz);
+        r.text(",");r.field("cpu_idle_ratio",b.limits.idleRatio);
+        r.text(",");r.field("gpu_idle_mhz",b.limits.gpuIdleMhz);
+        r.text(",");r.field("idle_entries",st.idleEntries);
+        r.text(",");r.field("wakes",st.wakes);
+        r.text(",");r.field("spike_holds",st.spikeHolds);
+        r.text(",");r.field("recaps",st.recaps);
+        r.text(",");r.field("ceiling_holds",st.ceilingHolds);
+        r.text(",");r.field("falling_holds",st.fallingHolds);
         r.text(",");r.field("active_ms",b.enabled && b.startedAt?now-b.startedAt:0);
         r.text(",");r.field("since_step_ms",st.lastStepMs && b.enabled?now-st.lastStepMs:0);
-        r.text(",\"scope\":\"heavy = gpu worker app+compositor busy >= 80% or avg C0 >= 70% for 1 s; light = busy < 50% and C0 < 40% for light_hold_ms. Heavy caps PERF_CTL at cap_top, raises the render clock 50/100 MHz per >= 2 s while filtered pkg <= target-5 and predicted <= target-3, lowers CPU to floor then GPU then CPU below floor at target-1 / predicted target+3 / pkg power over limit, fast-down at instant >= target+8 or a 90 C trip. Off restores PERF_CTL and the default render request; the 90 C trip is unchanged.\"}\n");
+        r.text(",\"scope\":\"heavy = gpu worker app+compositor busy >= 80% or avg C0 >= 70% for 1 s; light = busy < 50% and C0 < 40% for light_hold_ms. Heavy caps PERF_CTL at cap_top, raises the render clock 50/100 MHz per >= 2 s while filtered pkg <= target-5 and predicted <= target-3, lowers CPU to floor then GPU then CPU below floor at target-1 / predicted target+3 / pkg power over limit, fast-down at instant >= target+8 (at most once per s; doubles up_backoff; in light mode caps turbo) or a 90 C trip. Damping: light re-cap within 30 s of a release doubles release_hold_ms; a hot GPU down leaves gpu_ceiling_mhz for 60 s; slow-filter-only downs wait while the fast filter is falling. Idle: busy < 10% and C0 < 12% for 5 s caps the CPU at cpu_idle_ratio and the render clock at gpu_idle_mhz (0 = unchanged) until an instant busy >= 25% or C0 >= 30%. Off restores PERF_CTL and the default render request; the 90 C trip is unchanged.\"}\n");
         r.send();
     }
     else if(StrStartsWith(cmd,"thermal cpu-budget")) {
