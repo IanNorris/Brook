@@ -1,4 +1,5 @@
 #include "hw_inventory.h"
+#include "debug_hardware.h"
 #include "boot_status.h"
 #include "boot_stick.h"
 #include "live_store.h"
@@ -1287,6 +1288,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
         // CPU/GPU temperature and power sampler (bare-metal Intel only).
         brook::ThermalSamplerStart();
+
+        // RTX DP sink idle-off (gated by /etc/dp-idle-seconds or bridge command).
+        brook::DpIdleStart();
 
         // Start debug channel kernel thread (connects asynchronously).
 #if !defined(BROOK_SSD_GUARD_CHECK)

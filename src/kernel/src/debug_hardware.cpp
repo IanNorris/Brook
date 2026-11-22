@@ -37,6 +37,9 @@
 #include "native_tsc_observe.h"
 #include "tsc_clock.h"
 #include "kprintf.h"
+#include "spinlock.h"
+#include "input.h"
+#include "process.h"
 #include "memory/virtual_memory.h"
 #include "cpu.h"
 #include "panic_snapshot.h"
@@ -346,6 +349,301 @@ bool DebugHardwareAutoInitializeIntel(){
     return false;
 #endif
 }
+#if !defined(BROOK_HOST_TEST)
+namespace {
+// nv-aux runs from the debug command thread and from the dp-idle worker; one
+// lock serialises AUX and SOR access. A silent caller gets the JSON reply in
+// its own buffer instead of the debug channel.
+SpinLock g_nvAuxLock;
+char* g_nvAuxOut=nullptr;uint32_t g_nvAuxCap=0,g_nvAuxLen=0;
+void NvAuxSend(const char* t){
+    if(!g_nvAuxOut){DebugChannelSend(t);return;}
+    while(*t&&g_nvAuxLen+1<g_nvAuxCap)g_nvAuxOut[g_nvAuxLen++]=*t++;
+    g_nvAuxOut[g_nvAuxLen]=0;
+}
+using AuxReply=BridgeReplyBuffer<NvAuxSend>;
+bool NvAuxHandleLocked(const char* command){
+    constexpr char auxPrefix[]="bridge hardware nv-aux ";
+    if(Prefix(command,auxPrefix)) {
+        const char* p=command+sizeof(auxPrefix)-1;
+        auto word=[&](const char* w)->bool{const char* q=p;while(*w){if(*q!=*w)return false;++q;++w;}if(*q&&*q!=' ')return false;p=q;while(*p==' ')++p;return true;};
+        auto hex=[&](uint32_t& v)->bool{unsigned n=0;v=0;while(*p==' ')++p;
+            while((*p>='0'&&*p<='9')||(*p>='a'&&*p<='f')){v=v*16+uint32_t(*p<='9'?*p-'0':*p-'a'+10);++p;if(++n>8)return false;}while(*p==' ')++p;return n>0;};
+        const bool rdMode=word("read"),edMode=!rdMode&&word("edid"),pwMode=!rdMode&&!edMode&&word("power");
+        const bool rtMode=!rdMode&&!edMode&&!pwMode&&word("retrain");
+        uint32_t ch=0,addr=0,len=0;
+        if((!rdMode&&!edMode&&!pwMode&&!rtMode)||!hex(ch)||ch>7){NvAuxSend("{\"aux_error\":\"usage: nv-aux read <ch> <addr> <len>|edid <ch> <block>|power <ch> d0|d3\"}\n");return true;}
+        uint8_t powerValue=0;
+        if(rdMode&&(!hex(addr)||!hex(len)||!len||len>16||addr>0xfffff)){NvAuxSend("{\"aux_error\":\"bad read args\"}\n");return true;}
+        if(edMode&&(!hex(addr)||addr>3)){NvAuxSend("{\"aux_error\":\"block 0..3\"}\n");return true;}
+        if(pwMode){if(word("d0"))powerValue=1;else if(word("d3"))powerValue=2;else{NvAuxSend("{\"aux_error\":\"d0|d3\"}\n");return true;}}
+        uint32_t sor=0,link=0;
+        if(rtMode&&(!hex(sor)||sor>3||!hex(link)||(link!=1&&link!=2))){NvAuxSend("{\"aux_error\":\"retrain <ch> <sor 0-3> <link 1|2>\"}\n");return true;}
+        PciDevice gpu{};bool found=false;
+        for(uint32_t i=0;i<PciBootInventoryCount() && !found;++i){PciBootEntry e{};
+            if(PciBootInventoryRead(i,&e) && e.device.vendorId==0x10de && e.device.classCode==0x03 && e.device.fn==0){gpu=e.device;found=true;}}
+        const uint32_t bar0=found?PciConfigRead32(gpu.bus,gpu.dev,gpu.fn,0x10):0;
+        if(!found||(bar0&1)||!(PciConfigRead16(gpu.bus,gpu.dev,gpu.fn,4)&2)){NvAuxSend("{\"aux_error\":\"no GPU BAR0\"}\n");return true;}
+        static VirtualAddress auxWin{};
+        if(!auxWin){auxWin=VmmAllocPages(1,VMM_WRITABLE|VMM_NO_EXEC,MemTag::Device,KernelPid);
+            const auto leaf=VmmDetachPage(KernelPageTable,auxWin);if(leaf)PmmFreePage(VmmLeafPhysical(leaf));
+            __asm__ volatile("invlpg (%0)"::"r"(auxWin.raw()):"memory");
+            if(!VmmMapPage(KernelPageTable,auxWin,PhysicalAddress((bar0&~uint64_t(15))+0xd000),
+                VMM_WRITABLE|VMM_NO_EXEC|VMM_CACHE_DISABLE|VMM_WRITE_THRU,MemTag::Device,KernelPid)){auxWin=VirtualAddress{};
+                NvAuxSend("{\"aux_error\":\"map\"}\n");return true;}}
+        volatile uint32_t* reg=reinterpret_cast<volatile uint32_t*>(auxWin.raw());
+        const uint32_t base=ch*0x50;
+        auto R=[&](uint32_t off)->uint32_t{return reg[(off-0xd000)/4];};
+        auto Wr=[&](uint32_t off,uint32_t v){reg[(off-0xd000)/4]=v;};
+        auto spin=[](uint32_t us){
+            if(!TscClockAvailable()){for(volatile uint32_t i=0;i<us*300;++i)__asm__ volatile("pause");return;}
+            const uint64_t t=TscClockReadNs()+uint64_t(us)*1000;while(TscClockReadNs()<t)__asm__ volatile("pause");};
+        char err[64]="";
+        // pad -> AUX mode, enabled
+        Wr(0xd970+base,(R(0xd970+base)&~0xc003u)|0x2u); Wr(0xd97c+base,R(0xd97c+base)&~1u);
+        // acquire: wait idle, request, wait grant
+        uint32_t ctrl=0;bool ok=true;
+        for(int i=0;i<1000;++i){ctrl=R(0xd954+base);if(!(ctrl&0x07010000))break;spin(1);if(i==999){ok=false;strcpy(err,"begin idle timeout");}}
+        if(ok){Wr(0xd954+base,(R(0xd954+base)&~0x00700000u)|0x00100000u);
+            for(int i=0;i<1000;++i){ctrl=R(0xd954+base);if((ctrl&0x07000000)==0x01000000)break;spin(1);if(i==999){ok=false;strcpy(err,"grant timeout");}}}
+        auto xfer=[&](uint32_t type,uint32_t a,uint8_t* data,uint32_t& size)->int{
+            if(!(R(0xd958+base)&0x10000000))return -6; // sink not detected
+            for(uint32_t retries=0;retries<32;++retries){
+                if(retries)spin(400);
+                if(!(type&1))for(uint32_t i=0;i<16;i+=4){uint32_t v=0;for(uint32_t b=0;b<4&&i+b<size;++b)v|=uint32_t(data[i+b])<<(8*b);Wr(0xd930+base+i,v);}
+                Wr(0xd950+base,a);
+                uint32_t c=R(0xd954+base);c&=~0x0001f1ffu;c|=type<<12;c|=size?(size-1):0x100;
+                Wr(0xd954+base,0x80000000u|c);Wr(0xd954+base,c);Wr(0xd954+base,0x00010000u|c);
+                int t=2000;while((R(0xd954+base)&0x00010000)&&--t)spin(1);
+                if(!t)return -5;
+                const uint32_t st=R(0xd958+base);Wr(0xd958+base,st);
+                if(st&0x00000100)continue;        // timeout -> retry
+                if(st&0x00000e00)return -5;
+                const uint32_t reply=(st>>16)&0xf;
+                if(reply==0x2||reply==0x8)continue; // DEFER (native/I2C) -> retry
+                if(reply==0x1||reply==0x4)return -6; // NACK
+                if(type&1){size=st&0x1f;for(uint32_t i=0;i<16;i+=4){const uint32_t v=R(0xd940+base+i);for(uint32_t b=0;b<4;++b)data[i+b]=uint8_t(v>>(8*b));}}
+                return 0;
+            }
+            return -11;
+        };
+        AuxReply r;r.text("{\"aux_api\":1,");r.field("ch",ch);r.text(",");
+        uint8_t buf[128]{};int rc=ok?0:-16;uint32_t got=0;
+        if(ok&&rdMode){uint32_t n=len;rc=xfer(0x9,addr,buf,n);got=rc?0:n;}
+        else if(ok&&edMode){
+            uint8_t off=uint8_t(addr*128);uint32_t one=1;rc=xfer(0x4,0x50,&off,one);         // I2C write MOT: offset
+            for(uint32_t i=0;!rc&&i<128;i+=16){uint32_t n=16;rc=xfer(0x5,0x50,buf+i,n);if(!rc&&n!=16)rc=-5;got=i+n;} // I2C read MOT
+            uint32_t z=0;(void)xfer(0x1,0x50,nullptr,z);                                    // stop (no MOT)
+        }
+        else if(ok&&rtMode){
+            // Retrain the GOP's own DP link in place (nouveau retrain path):
+            // clock, lane enables, power and drive stay as programmed; only
+            // the SOR training pattern and the sink's DPCD training registers
+            // change. Requires the SOR's ARM state to be DP and on a head.
+            static VirtualAddress sorWin{};
+            const uint64_t barBase=bar0&~uint64_t(15);
+            if(!sorWin){sorWin=VmmAllocPages(1,VMM_WRITABLE|VMM_NO_EXEC,MemTag::Device,KernelPid);
+                const auto leaf=VmmDetachPage(KernelPageTable,sorWin);if(leaf)PmmFreePage(VmmLeafPhysical(leaf));
+                __asm__ volatile("invlpg (%0)"::"r"(sorWin.raw()):"memory");
+                if(!VmmMapPage(KernelPageTable,sorWin,PhysicalAddress(barBase+0x61c000),
+                    VMM_WRITABLE|VMM_NO_EXEC|VMM_CACHE_DISABLE|VMM_WRITE_THRU,MemTag::Device,KernelPid))sorWin=VirtualAddress{};}
+            static VirtualAddress roWin{};
+            if(!roWin){roWin=VmmAllocPages(1,VMM_WRITABLE|VMM_NO_EXEC,MemTag::Device,KernelPid);
+                const auto leaf=VmmDetachPage(KernelPageTable,roWin);if(leaf)PmmFreePage(VmmLeafPhysical(leaf));
+                __asm__ volatile("invlpg (%0)"::"r"(roWin.raw()):"memory");
+                if(!VmmMapPage(KernelPageTable,roWin,PhysicalAddress(barBase+0x688000),
+                    VMM_NO_EXEC|VMM_CACHE_DISABLE|VMM_WRITE_THRU,MemTag::Device,KernelPid))roWin=VirtualAddress{};}
+            if(!sorWin||!roWin){rc=-12;strcpy(err,"map");}
+            else{
+                volatile uint32_t* sr=reinterpret_cast<volatile uint32_t*>(sorWin.raw());
+                const volatile uint32_t* arm=reinterpret_cast<const volatile uint32_t*>(roWin.raw());
+                const uint32_t sorCtl=arm[(0x300+sor*0x20)/4]; // 0x688300 + sor*0x20 (ARM)
+                const uint32_t proto=(sorCtl>>8)&0xf;
+                const uint32_t soff=sor*0x800,loff=soff+(link==2?0x80:0);
+                const uint32_t dpctrl=sr[(0x10c+loff)/4];
+                if(!(sorCtl&0xff)||(proto!=8&&proto!=9)||(link==2)!=(proto==9)||!(dpctrl&0x000f0000)){rc=-22;strcpy(err,"SOR not an active DP link");}
+                else{
+                    const uint32_t patReg=(link&1)?0x110+soff:0x12c+soff; // gm107_sor_dp_pattern
+                    const uint32_t patOrig=sr[patReg/4];
+                    auto pattern=[&](uint32_t pat){static const uint32_t d[]={0x10101010,0x01010101,0x02020202,0x03030303};
+                        sr[patReg/4]=(sr[patReg/4]&~0x1f1f1f1fu)|d[pat];};
+                    const uint32_t lanes=__builtin_popcount((dpctrl>>16)&0xf);
+                    uint8_t caps[16]{};uint32_t n=16;rc=xfer(0x9,0x000,caps,n);
+                    uint8_t conf[4]{};n=4;if(!rc)rc=xfer(0x9,0x103,conf,n);
+                    uint8_t lc[2]={caps[1],uint8_t(lanes|((dpctrl&0x4000)?0x80:0))};n=2;
+                    if(!rc)rc=xfer(0x8,0x100,lc,n);
+                    auto status=[&](uint8_t* st)->int{uint32_t m=6;return xfer(0x9,0x202,st,m);};
+                    auto lanesOk=[&](const uint8_t* st,uint8_t mask)->bool{for(uint32_t i=0;i<lanes;++i)if(((st[i>>1]>>((i&1)*4))&mask)!=mask)return false;return true;};
+                    uint8_t st[6]{};bool cr=false,eq=false;
+                    if(!rc){pattern(1);uint8_t tp=0x21;n=1;rc=xfer(0x8,0x102,&tp,n);n=4;if(!rc)rc=xfer(0x8,0x103,conf,n);}
+                    for(int t=0;!rc&&t<5&&!cr;++t){spin(100);rc=status(st);cr=!rc&&lanesOk(st,0x1);}
+                    const bool tps3=(caps[2]&0x40)!=0;
+                    if(!rc&&cr){pattern(tps3?3:2);uint8_t tp=uint8_t(0x20|(tps3?3:2));n=1;rc=xfer(0x8,0x102,&tp,n);}
+                    for(int t=0;!rc&&cr&&t<6&&!eq;++t){spin(400);rc=status(st);eq=!rc&&lanesOk(st,0x7)&&(st[2]&1);}
+                    sr[patReg/4]=patOrig; uint8_t tp0=0;n=1;(void)xfer(0x8,0x102,&tp0,n);
+                    spin(1000);(void)status(st);
+                    r.field("cr",cr?1u:0u);r.text(",");r.field("eq",eq?1u:0u);r.text(",");
+                    r.field("lane01",st[0]);r.text(",");r.field("lane23",st[1]);r.text(",");r.field("align",st[2]);r.text(",");
+                    KPrintf("nv-aux: retrain SOR%u link %u ch %u cr=%d eq=%d status %02x %02x %02x\n",sor,link,ch,cr,eq,st[0],st[1],st[2]);
+                }
+            }
+        }
+        else if(ok&&pwMode){uint32_t one=1;rc=xfer(0x8,0x600,&powerValue,one);
+            uint32_t n=1;uint8_t back=0;if(!rc&&!xfer(0x9,0x600,&back,n)){r.field("dpcd600",back);r.text(",");}
+            KPrintf("nv-aux: ch %u DPCD 0x600 <- %u (%s), rc %d\n",ch,powerValue,powerValue==1?"D0":"D3",rc);}
+        // release: drop the request
+        Wr(0xd954+base,R(0xd954+base)&~0x00710000u);
+        r.field("rc",uint32_t(rc<0?-rc:rc));r.text(",\"err\":");r.quoted(err);r.text(",");r.field("bytes",got);r.text(",\"hex\":\"");
+        static const char hx[]="0123456789abcdef";for(uint32_t i=0;i<got;++i){char t[3]={hx[buf[i]>>4],hx[buf[i]&15],0};r.text(t);}
+        r.text("\"}\n");r.send();return true;
+    }
+    return false;
+}
+bool NvAuxHandle(const char* command,char* out,uint32_t cap){
+    if(!Prefix(command,"bridge hardware nv-aux "))return false;
+    SpinLockAcquire(&g_nvAuxLock);
+    g_nvAuxOut=out;g_nvAuxCap=cap;g_nvAuxLen=0;if(out&&cap)out[0]=0;
+    const bool handled=NvAuxHandleLocked(command);
+    g_nvAuxOut=nullptr;g_nvAuxCap=0;
+    SpinLockRelease(&g_nvAuxLock);
+    return handled;
+}
+
+// RTX display idle-off (gated: /etc/dp-idle-seconds "<seconds> [ch sor link]"
+// or `bridge hardware dp-idle`). After <seconds> without input, DPCD 0x600 D3
+// on one DP sink; any input wakes it: D0, then an in-place retrain of the
+// GOP's own link. The head keeps scanning throughout. A failed wake is
+// retried once a second until the link trains, so the screen is never left
+// dark without another attempt.
+struct DpIdleState{
+    uint32_t seconds=0,ch=3,sor=1,link=2;
+    bool blanked=false,threadStarted=false,wakeRequested=false;
+    uint64_t seq=0,lastActivityMs=0,lastWakeTryMs=0;
+    uint32_t blanks=0,wakes=0,wakeFails=0;
+    char lastReply[320]{};
+};
+DpIdleState g_dpIdle;
+SpinLock g_dpIdleLock;
+const char* Find(const char* text,const char* key){
+    for(;*text;++text){const char* a=text;const char* b=key;while(*b&&*a==*b){++a;++b;}if(!*b)return text;}
+    return nullptr;
+}
+bool JsonOne(const char* text,const char* key){
+    const char* f=Find(text,key);if(!f)return false;f+=strlen(key);
+    while(*f==' '||*f==':')++f;return *f=='1';
+}
+// "bridge hardware nv-aux <verb> <hex args...>"
+bool DpIdleAux(const char* verb,uint32_t a,int b=-1,int c=-1,const char* tail=nullptr){
+    char cmd[96];uint32_t n=0;
+    auto put=[&](const char* t){while(*t&&n+1<sizeof(cmd))cmd[n++]=*t++;};
+    auto hexv=[&](uint32_t v){char t[10];int i=9;t[i]=0;do{t[--i]="0123456789abcdef"[v&15];v>>=4;}while(v);put(" ");put(t+i);};
+    put("bridge hardware nv-aux ");put(verb);hexv(a);if(b>=0)hexv(uint32_t(b));if(c>=0)hexv(uint32_t(c));
+    if(tail){put(" ");put(tail);}cmd[n]=0;
+    return NvAuxHandle(cmd,g_dpIdle.lastReply,sizeof(g_dpIdle.lastReply));
+}
+// AUX work runs outside g_dpIdleLock (it sleeps); only the worker acts on
+// the sink, the command only changes configuration and requests.
+bool DpIdleBlank(uint32_t ch){
+    if(DpIdleAux("power",ch,-1,-1,"d3")&&Find(g_dpIdle.lastReply,"\"dpcd600\":2")){
+        KPrintf("dp-idle: sink on aux %u -> D3\n",ch);return true;}
+    KPrintf("dp-idle: D3 failed: %s\n",g_dpIdle.lastReply);return false;
+}
+bool DpIdleWake(uint32_t ch,uint32_t sor,uint32_t link){
+    for(int attempt=0;attempt<3;++attempt){
+        (void)DpIdleAux("power",ch,-1,-1,"d0");
+        SchedulerSleepMs(attempt?50:5);
+        if(DpIdleAux("retrain",ch,int(sor),int(link))&&JsonOne(g_dpIdle.lastReply,"\"eq\"")){
+            KPrintf("dp-idle: sink on aux %u woke (attempt %d)\n",ch,attempt+1);return true;}
+    }
+    KPrintf("dp-idle: wake failed: %s\n",g_dpIdle.lastReply);return false;
+}
+void DpIdleWorker(void*){
+    // Marker autostart: wait for the root filesystem, read it once.
+    for(int i=0;i<120&&!g_dpIdle.seconds;++i){
+        if(auto* file=VfsOpen("/etc/dp-idle-seconds",VFS_O_STREAM)){
+            char data[40]{};uint64_t off=0;VnodeStat st{};
+            if(!VfsStat(file,&st)&&!st.isDir&&st.size&&st.size<sizeof(data)&&VfsRead(file,data,st.size,&off)==int(st.size)){
+                const char* q=data;uint32_t secs=0,ch=3,sor=1,link=2;
+                if(Decimal(q,secs)&&secs>=10&&secs<=86400){
+                    while(*q==' ')++q;
+                    if(*q>='0'&&*q<='9'){Decimal(q,ch);while(*q==' ')++q;Decimal(q,sor);while(*q==' ')++q;Decimal(q,link);}
+                    if(ch<=7&&sor<=3&&(link==1||link==2)){
+                        SpinLockAcquire(&g_dpIdleLock);
+                        g_dpIdle.ch=ch;g_dpIdle.sor=sor;g_dpIdle.link=link;g_dpIdle.seconds=secs;
+                        g_dpIdle.seq=InputLatestSequence();g_dpIdle.lastActivityMs=ApicTickCount();
+                        SpinLockRelease(&g_dpIdleLock);
+                        KPrintf("dp-idle: marker: %u s, aux %u SOR%u link %u\n",secs,ch,sor,link);}
+                }
+                if(!g_dpIdle.seconds)KPrintf("dp-idle: invalid /etc/dp-idle-seconds; idle-off disabled\n");
+            }
+            VfsRelease(file);break;
+        }
+        SchedulerSleepMs(1000);
+    }
+    for(;;){
+        SchedulerSleepMs(g_dpIdle.blanked?20:250);
+        SpinLockAcquire(&g_dpIdleLock);
+        const uint64_t now=ApicTickCount(),seq=InputLatestSequence();
+        if(seq!=g_dpIdle.seq){g_dpIdle.seq=seq;g_dpIdle.lastActivityMs=now;if(g_dpIdle.blanked)g_dpIdle.wakeRequested=true;}
+        int action=0;
+        if(g_dpIdle.blanked&&(g_dpIdle.wakeRequested||!g_dpIdle.seconds)){
+            if(!g_dpIdle.wakeFails||now-g_dpIdle.lastWakeTryMs>=1000){action=2;g_dpIdle.lastWakeTryMs=now;}}
+        else if(!g_dpIdle.blanked&&g_dpIdle.seconds&&now-g_dpIdle.lastActivityMs>=uint64_t(g_dpIdle.seconds)*1000)action=1;
+        const uint32_t ch=g_dpIdle.ch,sor=g_dpIdle.sor,link=g_dpIdle.link;
+        SpinLockRelease(&g_dpIdleLock);
+        if(!action)continue;
+        const bool done=action==1?DpIdleBlank(ch):DpIdleWake(ch,sor,link);
+        SpinLockAcquire(&g_dpIdleLock);
+        if(action==1){if(done){g_dpIdle.blanked=true;++g_dpIdle.blanks;}
+            else g_dpIdle.lastActivityMs=ApicTickCount(); // retry after a full timeout
+        }else if(done){g_dpIdle.blanked=false;g_dpIdle.wakeRequested=false;g_dpIdle.wakeFails=0;++g_dpIdle.wakes;
+            g_dpIdle.lastActivityMs=ApicTickCount();}
+        else ++g_dpIdle.wakeFails;
+        SpinLockRelease(&g_dpIdleLock);
+    }
+}
+void DpIdleCommand(const char* p){
+    uint32_t secs=0,ch=0,sor=0,link=0;bool ok=true;
+    SpinLockAcquire(&g_dpIdleLock);
+    if(!strcmp(p,"status")){}
+    else if(!strcmp(p,"off")){g_dpIdle.seconds=0;if(g_dpIdle.blanked)g_dpIdle.wakeRequested=true;}
+    else if(!strcmp(p,"wake")){if(g_dpIdle.blanked)g_dpIdle.wakeRequested=true;}
+    else if(Prefix(p,"set ")){p+=4;
+        ok=Decimal(p,secs)&&secs>=10&&secs<=86400;while(ok&&*p==' ')++p;
+        ok=ok&&Decimal(p,ch)&&ch<=7;while(ok&&*p==' ')++p;
+        ok=ok&&Decimal(p,sor)&&sor<=3;while(ok&&*p==' ')++p;
+        ok=ok&&Decimal(p,link)&&(link==1||link==2)&&!*p;
+        if(ok){if(g_dpIdle.blanked&&ch!=g_dpIdle.ch)ok=false;
+            else{g_dpIdle.seconds=secs;g_dpIdle.ch=ch;g_dpIdle.sor=sor;g_dpIdle.link=link;
+                g_dpIdle.seq=InputLatestSequence();g_dpIdle.lastActivityMs=ApicTickCount();}}
+    }
+    else ok=false;
+    const bool started=g_dpIdle.threadStarted;
+    Reply r;r.text("{\"dp_idle_api\":1,\"ok\":");r.text(ok?"true":"false");
+    r.text(",\"thread\":");r.text(started?"true":"false");
+    r.text(",\"blanked\":");r.text(g_dpIdle.blanked?"true":"false");
+    r.text(",");r.field("seconds",g_dpIdle.seconds);r.text(",");r.field("ch",g_dpIdle.ch);
+    r.text(",");r.field("sor",g_dpIdle.sor);r.text(",");r.field("link",g_dpIdle.link);
+    r.text(",");r.field("idle_ms",ApicTickCount()-g_dpIdle.lastActivityMs);
+    r.text(",");r.field("blanks",g_dpIdle.blanks);r.text(",");r.field("wakes",g_dpIdle.wakes);
+    r.text(",");r.field("wake_fails",g_dpIdle.wakeFails);r.text(",\"last\":");r.quoted(g_dpIdle.lastReply);r.text("}\n");
+    SpinLockRelease(&g_dpIdleLock);
+    r.send();
+}
+}
+void DpIdleStart(){
+    if(g_dpIdle.threadStarted)return;
+    bool nvidia=false;
+    for(uint32_t i=0;i<PciBootInventoryCount()&&!nvidia;++i){PciBootEntry e{};
+        if(PciBootInventoryRead(i,&e)&&e.device.vendorId==0x10de&&e.device.classCode==0x03)nvidia=true;}
+    if(!nvidia)return;
+    Process* t=KernelThreadCreate("dp_idle",DpIdleWorker,nullptr,3);
+    if(!t){KPrintf("dp-idle: thread start failed\n");return;}
+    g_dpIdle.threadStarted=true;SchedulerAddProcess(t);
+}
+#else
+void DpIdleStart(){}
+#endif
 static uint32_t (*volatile g_nicCommand)(const char*,char*,uint32_t)=nullptr;
 static uint32_t (*volatile g_usbCommand)(const char*,char*,uint32_t)=nullptr;
 bool DebugHardwareHandleCommand(const char* command,uint32_t length){
@@ -1064,140 +1362,9 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
     //   nv-aux read <ch> <dpcd-hex> <len 1..16>    native DPCD read
     //   nv-aux edid <ch> <block>                   128-byte EDID block via I2C-over-AUX (0x50)
     //   nv-aux power <ch> d0|d3                     DPCD 0x600 write (sink power state)
-    constexpr char auxPrefix[]="bridge hardware nv-aux ";
-    if(Prefix(command,auxPrefix)) {
-        const char* p=command+sizeof(auxPrefix)-1;
-        auto word=[&](const char* w)->bool{const char* q=p;while(*w){if(*q!=*w)return false;++q;++w;}if(*q&&*q!=' ')return false;p=q;while(*p==' ')++p;return true;};
-        auto hex=[&](uint32_t& v)->bool{unsigned n=0;v=0;while(*p==' ')++p;
-            while((*p>='0'&&*p<='9')||(*p>='a'&&*p<='f')){v=v*16+uint32_t(*p<='9'?*p-'0':*p-'a'+10);++p;if(++n>8)return false;}while(*p==' ')++p;return n>0;};
-        const bool rdMode=word("read"),edMode=!rdMode&&word("edid"),pwMode=!rdMode&&!edMode&&word("power");
-        const bool rtMode=!rdMode&&!edMode&&!pwMode&&word("retrain");
-        uint32_t ch=0,addr=0,len=0;
-        if((!rdMode&&!edMode&&!pwMode&&!rtMode)||!hex(ch)||ch>7){DebugChannelSend("{\"aux_error\":\"usage: nv-aux read <ch> <addr> <len>|edid <ch> <block>|power <ch> d0|d3\"}\n");return true;}
-        uint8_t powerValue=0;
-        if(rdMode&&(!hex(addr)||!hex(len)||!len||len>16||addr>0xfffff)){DebugChannelSend("{\"aux_error\":\"bad read args\"}\n");return true;}
-        if(edMode&&(!hex(addr)||addr>3)){DebugChannelSend("{\"aux_error\":\"block 0..3\"}\n");return true;}
-        if(pwMode){if(word("d0"))powerValue=1;else if(word("d3"))powerValue=2;else{DebugChannelSend("{\"aux_error\":\"d0|d3\"}\n");return true;}}
-        uint32_t sor=0,link=0;
-        if(rtMode&&(!hex(sor)||sor>3||!hex(link)||(link!=1&&link!=2))){DebugChannelSend("{\"aux_error\":\"retrain <ch> <sor 0-3> <link 1|2>\"}\n");return true;}
-        PciDevice gpu{};bool found=false;
-        for(uint32_t i=0;i<PciBootInventoryCount() && !found;++i){PciBootEntry e{};
-            if(PciBootInventoryRead(i,&e) && e.device.vendorId==0x10de && e.device.classCode==0x03 && e.device.fn==0){gpu=e.device;found=true;}}
-        const uint32_t bar0=found?PciConfigRead32(gpu.bus,gpu.dev,gpu.fn,0x10):0;
-        if(!found||(bar0&1)||!(PciConfigRead16(gpu.bus,gpu.dev,gpu.fn,4)&2)){DebugChannelSend("{\"aux_error\":\"no GPU BAR0\"}\n");return true;}
-        static VirtualAddress auxWin{};
-        if(!auxWin){auxWin=VmmAllocPages(1,VMM_WRITABLE|VMM_NO_EXEC,MemTag::Device,KernelPid);
-            const auto leaf=VmmDetachPage(KernelPageTable,auxWin);if(leaf)PmmFreePage(VmmLeafPhysical(leaf));
-            __asm__ volatile("invlpg (%0)"::"r"(auxWin.raw()):"memory");
-            if(!VmmMapPage(KernelPageTable,auxWin,PhysicalAddress((bar0&~uint64_t(15))+0xd000),
-                VMM_WRITABLE|VMM_NO_EXEC|VMM_CACHE_DISABLE|VMM_WRITE_THRU,MemTag::Device,KernelPid)){auxWin=VirtualAddress{};
-                DebugChannelSend("{\"aux_error\":\"map\"}\n");return true;}}
-        volatile uint32_t* reg=reinterpret_cast<volatile uint32_t*>(auxWin.raw());
-        const uint32_t base=ch*0x50;
-        auto R=[&](uint32_t off)->uint32_t{return reg[(off-0xd000)/4];};
-        auto Wr=[&](uint32_t off,uint32_t v){reg[(off-0xd000)/4]=v;};
-        auto spin=[](uint32_t us){
-            if(!TscClockAvailable()){for(volatile uint32_t i=0;i<us*300;++i)__asm__ volatile("pause");return;}
-            const uint64_t t=TscClockReadNs()+uint64_t(us)*1000;while(TscClockReadNs()<t)__asm__ volatile("pause");};
-        char err[64]="";
-        // pad -> AUX mode, enabled
-        Wr(0xd970+base,(R(0xd970+base)&~0xc003u)|0x2u); Wr(0xd97c+base,R(0xd97c+base)&~1u);
-        // acquire: wait idle, request, wait grant
-        uint32_t ctrl=0;bool ok=true;
-        for(int i=0;i<1000;++i){ctrl=R(0xd954+base);if(!(ctrl&0x07010000))break;spin(1);if(i==999){ok=false;strcpy(err,"begin idle timeout");}}
-        if(ok){Wr(0xd954+base,(R(0xd954+base)&~0x00700000u)|0x00100000u);
-            for(int i=0;i<1000;++i){ctrl=R(0xd954+base);if((ctrl&0x07000000)==0x01000000)break;spin(1);if(i==999){ok=false;strcpy(err,"grant timeout");}}}
-        auto xfer=[&](uint32_t type,uint32_t a,uint8_t* data,uint32_t& size)->int{
-            if(!(R(0xd958+base)&0x10000000))return -6; // sink not detected
-            for(uint32_t retries=0;retries<32;++retries){
-                if(retries)spin(400);
-                if(!(type&1))for(uint32_t i=0;i<16;i+=4){uint32_t v=0;for(uint32_t b=0;b<4&&i+b<size;++b)v|=uint32_t(data[i+b])<<(8*b);Wr(0xd930+base+i,v);}
-                Wr(0xd950+base,a);
-                uint32_t c=R(0xd954+base);c&=~0x0001f1ffu;c|=type<<12;c|=size?(size-1):0x100;
-                Wr(0xd954+base,0x80000000u|c);Wr(0xd954+base,c);Wr(0xd954+base,0x00010000u|c);
-                int t=2000;while((R(0xd954+base)&0x00010000)&&--t)spin(1);
-                if(!t)return -5;
-                const uint32_t st=R(0xd958+base);Wr(0xd958+base,st);
-                if(st&0x00000100)continue;        // timeout -> retry
-                if(st&0x00000e00)return -5;
-                const uint32_t reply=(st>>16)&0xf;
-                if(reply==0x2||reply==0x8)continue; // DEFER (native/I2C) -> retry
-                if(reply==0x1||reply==0x4)return -6; // NACK
-                if(type&1){size=st&0x1f;for(uint32_t i=0;i<16;i+=4){const uint32_t v=R(0xd940+base+i);for(uint32_t b=0;b<4;++b)data[i+b]=uint8_t(v>>(8*b));}}
-                return 0;
-            }
-            return -11;
-        };
-        Reply r;r.text("{\"aux_api\":1,");r.field("ch",ch);r.text(",");
-        uint8_t buf[128]{};int rc=ok?0:-16;uint32_t got=0;
-        if(ok&&rdMode){uint32_t n=len;rc=xfer(0x9,addr,buf,n);got=rc?0:n;}
-        else if(ok&&edMode){
-            uint8_t off=uint8_t(addr*128);uint32_t one=1;rc=xfer(0x4,0x50,&off,one);         // I2C write MOT: offset
-            for(uint32_t i=0;!rc&&i<128;i+=16){uint32_t n=16;rc=xfer(0x5,0x50,buf+i,n);if(!rc&&n!=16)rc=-5;got=i+n;} // I2C read MOT
-            uint32_t z=0;(void)xfer(0x1,0x50,nullptr,z);                                    // stop (no MOT)
-        }
-        else if(ok&&rtMode){
-            // Retrain the GOP's own DP link in place (nouveau retrain path):
-            // clock, lane enables, power and drive stay as programmed; only
-            // the SOR training pattern and the sink's DPCD training registers
-            // change. Requires the SOR's ARM state to be DP and on a head.
-            static VirtualAddress sorWin{};
-            const uint64_t barBase=bar0&~uint64_t(15);
-            if(!sorWin){sorWin=VmmAllocPages(1,VMM_WRITABLE|VMM_NO_EXEC,MemTag::Device,KernelPid);
-                const auto leaf=VmmDetachPage(KernelPageTable,sorWin);if(leaf)PmmFreePage(VmmLeafPhysical(leaf));
-                __asm__ volatile("invlpg (%0)"::"r"(sorWin.raw()):"memory");
-                if(!VmmMapPage(KernelPageTable,sorWin,PhysicalAddress(barBase+0x61c000),
-                    VMM_WRITABLE|VMM_NO_EXEC|VMM_CACHE_DISABLE|VMM_WRITE_THRU,MemTag::Device,KernelPid))sorWin=VirtualAddress{};}
-            static VirtualAddress roWin{};
-            if(!roWin){roWin=VmmAllocPages(1,VMM_WRITABLE|VMM_NO_EXEC,MemTag::Device,KernelPid);
-                const auto leaf=VmmDetachPage(KernelPageTable,roWin);if(leaf)PmmFreePage(VmmLeafPhysical(leaf));
-                __asm__ volatile("invlpg (%0)"::"r"(roWin.raw()):"memory");
-                if(!VmmMapPage(KernelPageTable,roWin,PhysicalAddress(barBase+0x688000),
-                    VMM_NO_EXEC|VMM_CACHE_DISABLE|VMM_WRITE_THRU,MemTag::Device,KernelPid))roWin=VirtualAddress{};}
-            if(!sorWin||!roWin){rc=-12;strcpy(err,"map");}
-            else{
-                volatile uint32_t* sr=reinterpret_cast<volatile uint32_t*>(sorWin.raw());
-                const volatile uint32_t* arm=reinterpret_cast<const volatile uint32_t*>(roWin.raw());
-                const uint32_t sorCtl=arm[(0x300+sor*0x20)/4]; // 0x688300 + sor*0x20 (ARM)
-                const uint32_t proto=(sorCtl>>8)&0xf;
-                const uint32_t soff=sor*0x800,loff=soff+(link==2?0x80:0);
-                const uint32_t dpctrl=sr[(0x10c+loff)/4];
-                if(!(sorCtl&0xff)||(proto!=8&&proto!=9)||(link==2)!=(proto==9)||!(dpctrl&0x000f0000)){rc=-22;strcpy(err,"SOR not an active DP link");}
-                else{
-                    const uint32_t patReg=(link&1)?0x110+soff:0x12c+soff; // gm107_sor_dp_pattern
-                    const uint32_t patOrig=sr[patReg/4];
-                    auto pattern=[&](uint32_t pat){static const uint32_t d[]={0x10101010,0x01010101,0x02020202,0x03030303};
-                        sr[patReg/4]=(sr[patReg/4]&~0x1f1f1f1fu)|d[pat];};
-                    const uint32_t lanes=__builtin_popcount((dpctrl>>16)&0xf);
-                    uint8_t caps[16]{};uint32_t n=16;rc=xfer(0x9,0x000,caps,n);
-                    uint8_t conf[4]{};n=4;if(!rc)rc=xfer(0x9,0x103,conf,n);
-                    uint8_t lc[2]={caps[1],uint8_t(lanes|((dpctrl&0x4000)?0x80:0))};n=2;
-                    if(!rc)rc=xfer(0x8,0x100,lc,n);
-                    auto status=[&](uint8_t* st)->int{uint32_t m=6;return xfer(0x9,0x202,st,m);};
-                    auto lanesOk=[&](const uint8_t* st,uint8_t mask)->bool{for(uint32_t i=0;i<lanes;++i)if(((st[i>>1]>>((i&1)*4))&mask)!=mask)return false;return true;};
-                    uint8_t st[6]{};bool cr=false,eq=false;
-                    if(!rc){pattern(1);uint8_t tp=0x21;n=1;rc=xfer(0x8,0x102,&tp,n);n=4;if(!rc)rc=xfer(0x8,0x103,conf,n);}
-                    for(int t=0;!rc&&t<5&&!cr;++t){spin(100);rc=status(st);cr=!rc&&lanesOk(st,0x1);}
-                    const bool tps3=(caps[2]&0x40)!=0;
-                    if(!rc&&cr){pattern(tps3?3:2);uint8_t tp=uint8_t(0x20|(tps3?3:2));n=1;rc=xfer(0x8,0x102,&tp,n);}
-                    for(int t=0;!rc&&cr&&t<6&&!eq;++t){spin(400);rc=status(st);eq=!rc&&lanesOk(st,0x7)&&(st[2]&1);}
-                    sr[patReg/4]=patOrig; uint8_t tp0=0;n=1;(void)xfer(0x8,0x102,&tp0,n);
-                    spin(1000);(void)status(st);
-                    r.field("cr",cr?1u:0u);r.text(",");r.field("eq",eq?1u:0u);r.text(",");
-                    r.field("lane01",st[0]);r.text(",");r.field("lane23",st[1]);r.text(",");r.field("align",st[2]);r.text(",");
-                    KPrintf("nv-aux: retrain SOR%u link %u ch %u cr=%d eq=%d status %02x %02x %02x\n",sor,link,ch,cr,eq,st[0],st[1],st[2]);
-                }
-            }
-        }
-        else if(ok&&pwMode){uint32_t one=1;rc=xfer(0x8,0x600,&powerValue,one);
-            uint32_t n=1;uint8_t back=0;if(!rc&&!xfer(0x9,0x600,&back,n)){r.field("dpcd600",back);r.text(",");}
-            KPrintf("nv-aux: ch %u DPCD 0x600 <- %u (%s), rc %d\n",ch,powerValue,powerValue==1?"D0":"D3",rc);}
-        // release: drop the request
-        Wr(0xd954+base,R(0xd954+base)&~0x00710000u);
-        r.field("rc",uint32_t(rc<0?-rc:rc));r.text(",\"err\":");r.quoted(err);r.text(",");r.field("bytes",got);r.text(",\"hex\":\"");
-        static const char hx[]="0123456789abcdef";for(uint32_t i=0;i<got;++i){char t[3]={hx[buf[i]>>4],hx[buf[i]&15],0};r.text(t);}
-        r.text("\"}\n");r.send();return true;
-    }
+    if(NvAuxHandle(command,nullptr,0))return true;
+    constexpr char dpIdlePrefix[]="bridge hardware dp-idle ";
+    if(Prefix(command,dpIdlePrefix)){DpIdleCommand(command+sizeof(dpIdlePrefix)-1);return true;}
     // GPU link ASPM L1 (runtime, volatile; a reset restores firmware state):
     // the first 10de display function (fn0 only; HDA/USB-C/UCSI functions are
     // left as they are) and the root port above it. L1 only, never L0s; only

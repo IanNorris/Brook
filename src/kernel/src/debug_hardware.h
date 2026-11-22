@@ -10,6 +10,8 @@ bool HardwareBuildProvenanceRead(DesktopBuildProvenance& provenance);
 // Runs the existing one-shot, CPU-0 bootstrap on explicit first-use opt-in.
 // A failed or uncertain attempt is never automatically replayed in this boot.
 bool DebugHardwareAutoInitializeIntel();
+// RTX DP idle-off worker (NVIDIA display only; idle until a marker or command enables it).
+void DpIdleStart();
 }
 
 // A PCI NIC module's diagnostic command: "bridge hardware nic <args>" calls

@@ -74,7 +74,7 @@ MARKERS = ('usb-read-only', 'audio-muted', 'hw-inventory', 'boot-status', 'boot-
 ETC_ALLOWED = {*MARKERS, 'i219-attach', 'i219-reset', 'hardware-payload-id', 'resolv.conf', 'machine-id', 'ssl',
                'bridge-v3-operators', 'rtx-update-signer',
                # --session desktop only
-               'live-store', 'volatile-desktop', 'hardware-bulk', 'usb-audio-mixer', 'chromium-alsa-device'}
+               'live-store', 'volatile-desktop', 'hardware-bulk', 'usb-audio-mixer', 'dp-idle-seconds', 'chromium-alsa-device'}
 # Desktop live stick (--session desktop): the VMware RC session over the RAM
 # store, plus the RTX status helper. If the store does not mount, the services
 # fail to start and the kernel console, bridge and remote update stay usable.
