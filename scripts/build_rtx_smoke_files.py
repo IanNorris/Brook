@@ -246,10 +246,13 @@ def build(args):
     operators = args.build_root / 'operators.pub'
     operators.write_bytes(policy)
     kernel_build = args.build_root / 'kernel'
+    panic_url = os.environ.get('BROOK_PANIC_INGEST_URL') or \
+        (args.panic_ingest_url_file.read_text().strip() if args.panic_ingest_url_file.exists() else '')
     loader_build = args.build_root / 'loader'
     run(['cmake', '-S', ROOT / 'src/kernel', '-B', kernel_build, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release',
          f'-DCMAKE_TOOLCHAIN_FILE={ROOT}/cmake/toolchains/kernel-x86_64-clang.cmake',
          f'-DBROOK_BRIDGE_V3_OPERATOR_KEYS_FILE:FILEPATH={operators}',
+         f'-DBROOK_PANIC_INGEST_URL:STRING={panic_url}',
          *[f'-D{k}:BOOL={v}' for k, v in KERNEL_FLAGS.items()]])
     run(['cmake', '--build', kernel_build])
     run(['cmake', '-S', ROOT / 'src/bootloader', '-B', loader_build, '-G', 'Ninja',
@@ -389,6 +392,10 @@ def main():
     p.add_argument('--display-max', default='1920x1080', metavar='WxH',
                    help='GOP mode cap in BROOK.CFG (kernel supports up to 4096x2160); outside PREV/ fallback')
     p.add_argument('--allow-dirty', action='store_true')
+    p.add_argument('--panic-ingest-url-file', type=Path,
+                   default=Path('/data/Programming/Brook/shared/dell/panic-ingest-url'),
+                   help='file holding the panic scanner URL for the panic QR (same as the Dell build); '
+                        'BROOK_PANIC_INGEST_URL overrides; missing file keeps the built-in default')
     p.add_argument('--session', choices=('kconsole', 'desktop'), default='kconsole',
                    help='desktop: VMware RC desktop over the RAM live store (needs --live-store)')
     p.add_argument('--live-store', type=Path, metavar='STORE_MANIFEST',
