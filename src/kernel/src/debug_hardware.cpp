@@ -1558,7 +1558,10 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
             DebugChannelSend("{\"nv_error\":\"Expected <hex dword offset> <hex count 1..100>\"}\n");return true;}
         struct Allowed{uint32_t begin,end;};
         static constexpr Allowed allowed[]={{0x000000,0x001000},{0x001700,0x001704},{0x021c00,0x021d00},
-            {0x022500,0x022600},{0x00d000,0x00e000},{0x088000,0x088100},{0x08a100,0x08a200},{0x300000,0x400000},{0x610000,0x700000}};
+            {0x022500,0x022600},{0x00d000,0x00e000},{0x088000,0x088100},{0x08a100,0x08a200},{0x300000,0x400000},{0x610000,0x700000},
+            // rtx-disp probes: VRAM size, BAR1/BAR2 block, PRAMIN window contents (reads only;
+            // the 0x1700 window base is never written here).
+            {0x100c00,0x100d00},{0xb80f00,0xb81000},{0x700000,0x800000}};
         const uint32_t end=offset+count*4;bool ok=false;
         for(const auto& a:allowed)if(offset>=a.begin && end<=a.end)ok=true;
         if(!ok){DebugChannelSend("{\"nv_error\":\"Range not in the read-only allow-list\"}\n");return true;}
