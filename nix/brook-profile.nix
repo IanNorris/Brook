@@ -17,7 +17,7 @@ let
   # default downstream allowance: the Dell HDA runtime and VMware intel_hda.
   catalog = import ./app-registry.nix { inherit pkgs; downstreamStaging = builtins.elem target [ "dell-pair" "vmware" ]; };
   compat = import ./hardware-network-compat.nix { inherit pkgs; };
-  compatApps = [ "calculator" "chromium" "files" "firefox" "gallery" "mousepad"
+  compatApps = [ "chromium" "files" "firefox" "gallery" "mousepad"
                  "quake2" "steam" "vscodium" ];
   fonts = import ../tools/brook-fonts-pkg {};
   cursors = import ../tools/brook-cursor-theme {};

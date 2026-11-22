@@ -30,7 +30,7 @@ manifest=source/'share/applications/applications.idx'
 records=[]
 for record in manifest.read_text().splitlines():
  fields=record.split('\t');command=fields[1]
- for name in ['mousepad','brook-settings','wayland-calc']:
+ for name in ['mousepad','brook-settings']:
   if command.split(' ',1)[0] in [name,'/nix/profile/bin/'+name]:fields[1]='/nix/profile/bin/hardware-'+name
  records.append('\t'.join(fields))
 manifest.write_text('\n'.join(records)+'\n')
@@ -73,7 +73,7 @@ readme.write_text("Brook Dell XPS 13 9343 offline hardware desktop\n\n"
     "Boot the UEFI USB entry with Secure Boot disabled. No installation or disk formatting is performed.\n"
     "Applications are read from APPS.BRK on the existing FAT32 stick. USB writes are disabled.\n"
     "Home, settings and temporary files are RAM ONLY and disappear at shutdown.\n"
-    "Installed: Bash/coreutils, Vim, Mousepad, Files, Settings and Calculator. Super+Enter opens a terminal.\n"
+    "Installed: Bash/coreutils, Vim, Mousepad, Files and Settings. Super+Enter opens a terminal.\n"
     "Kernel Console shows USB_IO_PROBE_OK after six checked reads, plus HARDWARE_NETWORK_READY with the IP if Ethernet succeeds.\n"
     "Share the IP for the boot-pinned debug bridge on TCP1234. Physical Tecknet ECM networking still needs validation.\n"
     "Audio starts muted; the Dell internal SST/RT286 codec and native Intel GPU acceleration are not implemented.\n"

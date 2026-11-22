@@ -57,7 +57,7 @@ The generated VM has 4 vCPUs on one socket and 8 GiB of memory. Override
 them with `--cpus` and `--memory-mib` (also accepted by
 `scripts/brook_image.py --target vmware`); `manifest.json` records both.
 
-The default app set is Brook's Calculator, Qalculate!, Chromium, Files, App
+The default app set is Qalculate! (the calculator), Chromium, Files, App
 Gallery and Mousepad, plus the Vim command-line package. Settings, Task
 Manager and Terminal are built into every desktop. Firefox is left out of the
 default image to keep the disk smaller; select it with

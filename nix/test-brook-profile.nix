@@ -36,8 +36,8 @@ let
   profile = overrides: import ./brook-profile.nix ({ inherit pkgs; target = "qemu"; } // overrides);
 in
 # A compatibility preset update needs a deliberate change to both pins.
-assert compat.drvPath == "/nix/store/3ys48v5fqrlhnvapdq9b9syfxbrb9vil-brook-network-hardware-desktop.drv";
-assert compat.outPath == "/nix/store/nxsj5mr4arcwh5vgnngxb6kab0rpsx05-brook-network-hardware-desktop";
+assert compat.drvPath == "/nix/store/jzlrdiq7aq2j1r34sn7f0cynqjb94wl0-brook-network-hardware-desktop.drv";
+assert compat.outPath == "/nix/store/099bkin5cyx4kaci6s74vl4197gan7ni-brook-network-hardware-desktop";
 assert normalizedSelectedWrapper == wrapper false;
 assert (resolve {}).launcherIds == [ "example.Settings" "example.Demo" ];
 assert (resolve { kernelCapabilities.wayland-demo = 1; }).requiredCapabilities.wayland-demo == 1;
@@ -73,9 +73,10 @@ assert rejects ((profile { extraPackageNames = [ "htop" "htop" ]; }).manifest);
 assert rejects ((profile { apps = [ "chromium" ]; kernelCapabilities = { }; }).manifest);
 assert (profile { apps = [ "chromium" ]; kernelCapabilities.chromium-sandbox = 1; })
   .manifest.requiredCapabilities.chromium-sandbox == 1;
-assert (profile { apps = [ "calculator" ]; extraPackageNames = [ "htop" ]; })
-  .manifest.launcherIds == [ "brook-settings" "org.brook.TaskManager" "brook.calc" ];
-assert (profile { target = "vmware"; apps = [ "calculator" "qalculate" ]; })
-  .manifest.launcherIds == [ "brook-settings" "org.brook.TaskManager" "brook.calc" "qalculate-gtk" ];
+assert (profile { apps = [ "mousepad" ]; extraPackageNames = [ "htop" ]; })
+  .manifest.launcherIds == [ "brook-settings" "org.brook.TaskManager" "org.xfce.mousepad" ];
+assert (profile { target = "vmware"; apps = [ "mousepad" "qalculate" ]; })
+  .manifest.launcherIds == [ "brook-settings" "org.brook.TaskManager" "org.xfce.mousepad" "qalculate-gtk" ];
+assert !(builtins.elem "calculator" (lib.attrNames (import ./app-registry.nix { inherit pkgs; }).apps));
 assert (profile { target = "vmware"; apps = [ "qalculate" ]; }).manifest.redistributable;
 true

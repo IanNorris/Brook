@@ -2,4 +2,4 @@
 set wm
 set vfb none
 run --service --once /nix/bin/waylandd
-# Open Terminal with the taskbar + button, or Calculator from Apps when needed.
+# Open Terminal with the taskbar + button, or Qalculate! from Apps when needed.

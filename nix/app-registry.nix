@@ -23,7 +23,6 @@ let
   };
   legacy = name: reason: { inherit name reason; availability = "legacy"; targets = [ ]; };
   entries = {
-    calculator = import ./apps/calculator.nix { inherit pkgs; };
     chromium = import ./apps/chromium.nix { inherit pkgs downstreamStaging; };
     files = import ./apps/files.nix { inherit pkgs; };
     firefox = import ./apps/firefox.nix { inherit pkgs downstreamStaging; };

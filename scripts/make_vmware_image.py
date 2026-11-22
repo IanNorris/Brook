@@ -42,7 +42,7 @@ DATA_FIRST = ESP_FIRST + ESP_SECTORS
 ESP_TYPE = 'c12a7328-f81f-11d2-ba4b-00a0c93ec93b'
 DATA_TYPE = '0fc63daf-8483-4772-8e79-3d69d8477de4'
 # Firefox is left out of the default image for size; select it explicitly.
-DEFAULT_APPS = ("calculator", "chromium", "files", "gallery", "mousepad", "qalculate")
+DEFAULT_APPS = ("chromium", "files", "gallery", "mousepad", "qalculate")
 DEFAULT_CPUS = 4
 DEFAULT_MEMORY_MIB = 8192
 MAX_CPUS = 32

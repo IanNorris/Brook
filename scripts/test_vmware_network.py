@@ -121,10 +121,10 @@ class VmwareResourceTest(unittest.TestCase):
         parsed = make_vmware_image.argument_parser().parse_args(options)
         self.assertEqual((parsed.cpus, parsed.memory_mib), (2, 4096))
 
-    def test_default_apps_drop_firefox_and_add_calculators(self):
+    def test_default_apps_use_qalculate_without_firefox(self):
         apps = make_vmware_image.DEFAULT_APPS
         self.assertNotIn('firefox', apps)
-        self.assertIn('calculator', apps)
+        self.assertNotIn('calculator', apps)
         self.assertIn('qalculate', apps)
 
 
