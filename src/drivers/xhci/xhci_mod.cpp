@@ -4615,6 +4615,13 @@ static uint32_t XhciUacCommand(const char* p, XhciText& t)
         }
         XhciUacStatus(t);
     }
+    else if (XhciArgIs(p, "drain")) {
+        // Wait (<=2 s) until the mixer sink ring is empty, plus the stream lead.
+        uint32_t waited = 0;
+        while (s.active && s.mixerMode && s.mixWrite != s.mixRead && waited < 2000) { SchedulerSleepMs(1); ++waited; }
+        SchedulerSleepMs(40);
+        t.s("drained after "); t.u(waited); t.s(" ms\n");
+    }
     else if (XhciArgIs(p, "override")) {
         while (*p == ' ') ++p;
         if (XhciArgIs(p, "off")) t.s(XhciUacApplyOverride(false, 0) ? "override off\n" : "override off: not applied\n");

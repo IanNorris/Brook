@@ -368,6 +368,7 @@ add_executable(kernel
     src/hw_inventory.cpp
     src/boot_status.cpp
     src/boot_stick.cpp
+    src/live_store.cpp
     src/hda_observe.cpp
     src/native_tsc_observe.cpp
     src/ahci_readonly.cpp

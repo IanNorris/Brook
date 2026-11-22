@@ -91,6 +91,8 @@ add_host_test(test_recovery_firmware_discovery "${BROOK_ROOT}/src/bootloader/src
 target_include_directories(test_recovery_firmware_discovery PRIVATE
     "${BROOK_ROOT}/vendor/uefi-headers/Include" "${BROOK_ROOT}/vendor/uefi-headers/Include/X64"
     "${BROOK_ROOT}/src/bootloader/src")
+add_host_test(test_live_store_record)
+target_compile_options(test_live_store_record PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_usb_uac2)
 target_compile_options(test_usb_uac2 PRIVATE "-iquote${BROOK_ROOT}/src/drivers/xhci")
 add_host_test(test_usb_ecm_descriptors)

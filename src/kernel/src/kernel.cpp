@@ -1,6 +1,7 @@
 #include "hw_inventory.h"
 #include "boot_status.h"
 #include "boot_stick.h"
+#include "live_store.h"
 #include "core_autodump.h"
 #include "lastlog.h"
 #include "desktop_identity.h"
@@ -1048,6 +1049,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
     brook::KLog("BOOT stage: USB filesystem probing complete");
     brook::KLog("BOOT stage: application image mount begin");
+#if !defined(BROOK_SSD_GUARD_CHECK)
+    (void)brook::LiveStoreBoot(&nextPdrv); // desktop live stick; WritableDesktopBootMount then reports Ready
+#endif
     const bool productionDirectRequested=brook::AhciSystemDirectRequested();
     bool productionDirectReady=false;
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)

@@ -259,6 +259,16 @@ void BootStickConfigure()
             SetName(g_stick.set), TrialName(g_stick.trial));
 }
 
+int BootStickDiskIndex()
+{
+    if (!g_stickPresent || !g_stick.volumeValid) return -1;
+    int code = 0;
+    Device* dev = FindPartition(&code);
+    if (!dev || !dev->name || dev->name[0] != 'u' || dev->name[1] != 's' || dev->name[2] != 'b') return -1;
+    const char d = dev->name[3];
+    return d >= '0' && d <= '9' ? d - '0' : -1;
+}
+
 void BootStickStatusLine()
 {
     if (!g_enabled) return;

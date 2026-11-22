@@ -8,6 +8,8 @@
 #include "audio.h"
 #include "../../drivers/xhci/usb_uac2.h"
 #include "scheduler.h"
+#include "boot_stick.h"
+#include "device.h"
 #include "smp.h"
 #include "shutdown.h"
 #include "usb_boot_health.h"
@@ -1054,6 +1056,27 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         Reply r;r.text("{\"nic_api\":1,\"text\":");r.quoted(text);r.text("}\n");r.send();return true;
     }
 #if !defined(BROOK_HOST_TEST)
+    // Read-only sequential read benchmark of the boot stick (whole disk from
+    // LBA 0, 4 MiB requests): sizes the live-store copy. Nothing is written.
+    constexpr char benchPrefix[]="bridge hardware usb-bench ";
+    if(Prefix(command,benchPrefix)) {
+        const char* p=command+sizeof(benchPrefix)-1;uint32_t mib=0;
+        if(!Decimal(p,mib) || *p || !mib || mib>4096){DebugChannelSend("{\"usb_bench_error\":\"Expected MiB 1..4096\"}\n");return true;}
+        const int disk=BootStickDiskIndex();
+        char name[5]={'u','s','b',char('0'+(disk<0?0:disk)),0};
+        Device* dev=disk>=0?DeviceFind(name):nullptr;
+        if(!dev || !dev->ops || !dev->ops->read){DebugChannelSend("{\"usb_bench_error\":\"Boot stick disk not found\"}\n");return true;}
+        constexpr uint64_t chunk=4ull<<20;
+        auto buffer=VmmAllocPages(chunk/4096);
+        if(!buffer){DebugChannelSend("{\"usb_bench_error\":\"No buffer\"}\n");return true;}
+        const uint64_t total=uint64_t(mib)<<20,start=ApicTickCount();uint64_t done=0;int error=0;
+        while(done<total){const int got=dev->ops->read(dev,done,reinterpret_cast<void*>(buffer.raw()),chunk);if(got!=int(chunk)){error=got;break;}done+=chunk;}
+        const uint64_t ms=ApicTickCount()-start;
+        VmmFreePages(buffer,chunk/4096);
+        Reply r;r.text("{\"usb_bench_api\":1,\"device\":");r.quoted(name);r.text(",");r.field("bytes",done);
+        r.text(",");r.field("ms",ms);r.text(",");r.field("kb_per_s",ms?done/ms:0);r.text(",\"error\":");
+        if(error<0){r.text("-");r.number(uint64_t(-error));}else r.number(uint64_t(error));r.text("}\n");r.send();return true;
+    }
     // End-to-end mixer proof on a USB audio sink: an explicit feature-unit
     // level (same gating as "audio usb override"), mixer output unmuted at
     // 100% for the duration, one 1 s 440 Hz -12 dBFS tone submitted as an
@@ -1087,7 +1110,8 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
             }
         }
         const uint64_t submittedTick=ApicTickCount();
-        SchedulerSleepMs(400); // mixer batches, the sink ring and the stream lead drain
+        SchedulerSleepMs(60); // last mixer batch reaches the sink
+        call("audio usb drain","");
         if(stream)(void)AudioMixerClose(stream);
         (void)AudioSetOutputControl(previous);
         KPrintf("audio: mixer-tone %u frames submitted ticks %u..%u, control restored %x\n",submitted,
