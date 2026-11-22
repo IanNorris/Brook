@@ -73,8 +73,14 @@ uint32_t Tick(bool& announced, uint32_t& reportedIp)
         ok = g_rpc.SendGuestIp(ip);
         if (ok) {
             reportedIp = ip;
-            SerialPrintf("vmware-tools: guest IP %u.%u.%u.%u reported\n",
-                         ip & 255, (ip >> 8) & 255, (ip >> 16) & 255, ip >> 24);
+            // The host re-asks (broadcastIP) every few seconds, and a channel
+            // reopen resends too. Always answer; log only a changed address.
+            static uint32_t loggedIp = 0;
+            if (ip != loggedIp) {
+                loggedIp = ip;
+                SerialPrintf("vmware-tools: guest IP %u.%u.%u.%u reported\n",
+                             ip & 255, (ip >> 8) & 255, (ip >> 16) & 255, ip >> 24);
+            }
         }
     }
     vmware::RpcPoll poll{RpcResult::TransportError};
