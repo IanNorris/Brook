@@ -184,7 +184,7 @@ def desktop_payload(args, initrd):
     from make_vmware_image import wallpaper_raw, check_wallpaper
     store = json.loads(args.live_store.read_text())
     if store.get('format') != 'brook-rtx-live-store/1' or not re.fullmatch(
-            r'guid=[0-9a-f]{32} bytes=\d+ sha256=[0-9a-f]{64}\n', store['record']):
+            r'(guid=[0-9a-f]{32}|lba=\d+ sectors=\d+) bytes=\d+ sha256=[0-9a-f]{64}\n', store['record']):
         raise SystemExit('unexpected live store manifest')
     profile = Path(store['profile'])
     for directory in ('::/BOOT/BIN', '::/DATA', '::/NIX'):
@@ -205,7 +205,8 @@ def desktop_payload(args, initrd):
     wallpaper = wallpaper_raw()
     check_wallpaper(wallpaper)
     fat_write(initrd, 'BOOT/WALLPAPER.RAW', wallpaper)
-    live = {k: store[k] for k in ('bytes', 'sha256', 'partition_guid', 'partition_name', 'profile')}
+    live = {k: store[k] for k in ('bytes', 'sha256', 'partition_guid', 'partition_name', 'profile', 'record', 'slot')
+            if k in store}
     return add_clearwater_start(DESKTOP_RC), live
 
 
