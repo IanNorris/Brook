@@ -132,6 +132,17 @@ int main(void) {
     cursor_owner=0;cursor_width=cursor_height=99;cursor_pixels[0]=0xffffffffu;
     pointer_set_cursor(client,seat.pointer,0,NULL,0,0);
     assert(cursor_owner==(BROOK_CURSOR_OWNER_TAG|1) && cursor_width==1 && cursor_height==1 && cursor_pixels[0]==0);
+    /* GTK3's blank cursor (Firefox fullscreen video): set_cursor(surface),
+     * then a NULL buffer attach and commit. An empty cursor surface hides the
+     * pointer over this window; the next buffer shows it again. */
+    pointer_set_cursor(client,seat.pointer,0,cursor->resource,1,1);assert(cursor_width>1 && cursor_pixels[0]==background[0]);
+    cursor_owner=0;cursor_width=cursor_height=99;cursor_pixels[0]=0xffffffffu;
+    surface_attach(client,cursor->resource,NULL,0,0);surface_commit(client,cursor->resource);
+    assert(cursor_owner==(BROOK_CURSOR_OWNER_TAG|1) && cursor_width==1 && cursor_height==1 && cursor_pixels[0]==0);
+    cursor_width=cursor_height=99;pointer_set_cursor(client,seat.pointer,0,cursor->resource,1,1);
+    assert(cursor_width==1 && cursor_height==1 && cursor_pixels[0]==0); /* re-set while empty stays hidden */
+    commit_pixels(cursor,background,8,6);surface_cursor_commit(cursor);
+    assert(cursor_owner==(BROOK_CURSOR_OWNER_TAG|1) && cursor_width>1 && cursor_pixels[0]==background[0]);
     struct brook_surface *entered_before=seat.entered_surface;seat.entered_surface=NULL;
     /* Without pointer focus (after POINTER_LEFT, Xwayland sets its root "X"
      * cursor) set_cursor uploads nothing, so the kernel keeps its arrow over

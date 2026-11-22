@@ -1104,10 +1104,23 @@ static void surface_set_input_region(struct wl_client *c, struct wl_resource *r,
 
 static void surface_cursor_commit(struct brook_surface *s) {
     struct brook_view *view=s->tree.current?s->tree.current->value:NULL;
-    if (!view || !view->image->pixels) return;
     /* No owning window: set without pointer focus (see pointer_set_cursor).
      * Uploading it unowned would show it over other windows and the shell. */
     if (!s->cursor_owner_wm) return;
+    if (!view) {
+        /* A cursor surface without content hides the pointer. GTK3 (Firefox's
+         * blank cursor after inactivity in fullscreen video) keeps its cursor
+         * surface and attaches a NULL buffer instead of set_cursor(NULL);
+         * returning here left the previous arrow showing. Same per-window
+         * 1x1 transparent image as set_cursor(NULL): hidden over this
+         * window only, and replaced by the next committed cursor buffer. */
+        static const uint32_t clear_pixel = 0;
+        long rc = wm_set_cursor_image_for(&clear_pixel, 1, 1, 0, 0, s->cursor_owner_wm);
+        if (rc != 0) fprintf(stderr, "[waylandd] empty cursor surface for wm %u failed rc=%ld\n", s->cursor_owner_wm, rc);
+        return;
+    }
+    /* GPU content not yet read back: the readback path commits again. */
+    if (!view->image->pixels) return;
     const struct brook_geometry *g=&view->geometry;
     const struct brook_image *image=view->image;
     uint32_t scale=surface_output_scale(s);
