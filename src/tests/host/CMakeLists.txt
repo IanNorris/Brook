@@ -76,6 +76,12 @@ add_test(NAME test_stage_selected_profile
     COMMAND python3 "${BROOK_ROOT}/scripts/test_stage_selected_profile.py")
 add_test(NAME test_brook_profile
     COMMAND nix-instantiate --eval --strict --expr "import ./nix/test-brook-profile.nix {}")
+# Gallery/installer compatibility: package classification, launcher export
+# and the package index join (x86_64-linux only).
+add_test(NAME test_nix_classify COMMAND python3 "${BROOK_ROOT}/tools/nix-install/test_classify.py")
+add_test(NAME test_nix_desktop COMMAND python3 "${BROOK_ROOT}/tools/nix-install/test_desktop.py")
+add_test(NAME test_nix_install_links COMMAND python3 "${BROOK_ROOT}/tools/nix-install/test_install_links.py")
+add_test(NAME test_gen_nix_index COMMAND python3 "${BROOK_ROOT}/tools/nix-index/test_gen_nix_index.py")
 set_tests_properties(test_stage_selected_launchers test_stage_selected_profile test_brook_profile
     PROPERTIES LABELS nix WORKING_DIRECTORY "${BROOK_ROOT}")
 set_tests_properties(test_stage_selected_launchers PROPERTIES SKIP_REGULAR_EXPRESSION "OK [()]skipped=")

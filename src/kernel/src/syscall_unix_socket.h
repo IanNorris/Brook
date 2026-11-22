@@ -178,6 +178,7 @@ int64_t UnixSocketWriteSome(UnixSocketData* socket,bool nonblock,
 
 int64_t UnixSocketReadSome(UnixSocketData* socket,bool nonblock,
                            char* bytes,uint64_t length,UnixFdSnap* descriptors,int& count,
-                           UnixSenderCredentials* sender=nullptr,uint64_t* recordLength=nullptr,bool* consumed=nullptr);
+                           UnixSenderCredentials* sender=nullptr,uint64_t* recordLength=nullptr,bool* consumed=nullptr,
+                           bool peek=false);
 
 } // namespace brook

@@ -86,6 +86,7 @@ struct pkg_info {
     char version[128];
     char store_name[512];
     char description[1024];
+    char main_program[256]; /* optional fifth index column (meta.mainProgram) */
 };
 
 static int lookup_package(const char *query, struct pkg_info *out) {
@@ -115,6 +116,10 @@ static int lookup_package(const char *query, struct pkg_info *out) {
         char *description = strchr(store_name, '\t');
         if (!description) continue;
         *description++ = '\0';
+        char *main_program = strchr(description, '\t');
+        static char no_program[] = "";
+        if (main_program) *main_program++ = '\0';
+        else main_program = no_program;
 
         if (strcasecmp(name, query) == 0) {
             /* Exact match - prefer the one with a version */
@@ -123,6 +128,9 @@ static int lookup_package(const char *query, struct pkg_info *out) {
                 strncpy(exact.version, version, sizeof(exact.version) - 1);
                 strncpy(exact.store_name, store_name, sizeof(exact.store_name) - 1);
                 strncpy(exact.description, description, sizeof(exact.description) - 1);
+                exact.main_program[0] = '\0';
+                if (!strchr(main_program, '/') && main_program[0] != '.')
+                    strncpy(exact.main_program, main_program, sizeof(exact.main_program) - 1);
                 found_exact = 1;
             }
         }
@@ -894,6 +902,17 @@ static void refresh_desktop_entries(void)
                 break;
             }
 
+            /* Gallery "Add to launcher" entries: the program has no desktop
+             * entry of its own, so give it the desktop session environment. */
+            if (!hardware_wrapped && !strncmp(de->d_name, "brook-added-", 12)) {
+                const char *runtime=PROFILE_BIN "/brook-run";
+                char original[sizeof(exec_cmd)];snprintf(original,sizeof(original),"%s",exec_cmd);
+                if(access(runtime,X_OK)==0 && strlen(runtime)+strlen(original)+13<sizeof(exec_cmd))
+                    snprintf(exec_cmd,sizeof(exec_cmd),"--uid 1000 %s %s",runtime,original);
+                else if(strlen(original)+12<sizeof(exec_cmd))
+                    snprintf(exec_cmd,sizeof(exec_cmd),"--uid 1000 %s",original);
+            }
+
             /* Use the deployed Brook wrapper without changing the stock closure.
              * Its XDG state lives on ext2, rather than the boot FAT filesystem. */
             if (access("/nix/stk-play.sh", R_OK) == 0 &&
@@ -968,6 +987,21 @@ static void refresh_desktop_entries(void)
         printf("  Updated launcher: %d app(s) in %s\n", entry_count, APPS_IDX);
 }
 
+#include "classify.h"
+
+/* Tell terminal users how to start what they installed. */
+static void print_install_hint(const char *package) {
+    struct package_class result;
+    if (classify_package(package, &result) < 0) return;
+    if (result.desktop) printf("  Open it from the launcher: %s\n", result.desktop_name);
+    else if (result.kind == KIND_GUI || result.kind == KIND_PROBABLY_GUI)
+        printf("  Desktop program without a launcher entry: run %s, or use App Gallery > Add to launcher\n",
+               result.program);
+    else if (result.kind == KIND_CLI) printf("  Run it from Terminal: %s\n", result.program);
+    else if (result.kind == KIND_UNSUPPORTED)
+        printf("  Warning: %s is %s\n", result.program, result.reason);
+}
+
 static int cmd_install(const char *name) {
     install_commit_started=0;
     if(install_cancel_enable()<0)return 1;
@@ -1028,6 +1062,7 @@ static int cmd_install(const char *name) {
         if (rpath_linked > 0)
             printf("  re-linked %d runtime library file(s) beside package binaries\n", rpath_linked);
         refresh_desktop_entries();
+        print_install_hint(name);
         return install_commit_end(&previous,0);
     }
 
@@ -1136,6 +1171,7 @@ static int cmd_install(const char *name) {
         printf("  %d runtime library file(s) linked beside package binaries\n", rpath_linked);
 
     refresh_desktop_entries();
+    print_install_hint(pkg.name);
 
     return install_commit_end(&previous,0);
 }
@@ -1188,6 +1224,7 @@ static int cmd_remove(const char *name) {
         if(unlink_package_desktops(store_name)<0 && !removal_error) removal_error=errno;
         if(unlink_package_libs(store_name)<0 && !removal_error) removal_error=errno;
     }
+    if(remove_added_launcher(name)<0 && !removal_error) removal_error=errno;
     refresh_desktop_entries();
     if(removal_error) {
         fprintf(stderr,"Error: incomplete profile removal: %s. Registration was removed; "
@@ -1386,6 +1423,8 @@ static void usage(const char *prog) {
     fprintf(stderr, "  %s install <package>   Install a package\n", prog);
     fprintf(stderr, "  %s remove <package>    Remove a package\n", prog);
     fprintf(stderr, "  %s list                List installed packages\n", prog);
+    fprintf(stderr, "  %s classify <package>  Show how to start an installed package\n", prog);
+    fprintf(stderr, "  %s launcher-add <pkg>  Add an installed desktop program to the launcher\n", prog);
     fprintf(stderr, "  %s search <query>      Search for packages\n", prog);
     fprintf(stderr, "  %s shell <pkg...>      Start a temporary shell with the packages on PATH\n", prog);
     fprintf(stderr, "  %s stage-profile ...    Apply or roll back a signed closure plan\n", prog);
@@ -1425,6 +1464,18 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
             return install_cancel_status(cmd_remove(argv[2]));
+        } else if (strcmp(cmd, "classify") == 0) {
+            if (argc < 3) {
+                fprintf(stderr, "Usage: %s classify <package>\n", prog);
+                return 1;
+            }
+            return cmd_classify(argv[2]);
+        } else if (strcmp(cmd, "launcher-add") == 0) {
+            if (argc < 3) {
+                fprintf(stderr, "Usage: %s launcher-add <package>\n", prog);
+                return 1;
+            }
+            return cmd_launcher_add(argv[2]);
         } else if (strcmp(cmd, "list") == 0 || strcmp(cmd, "ls") == 0) {
             return cmd_list();
         } else if (strcmp(cmd, "shell") == 0) {

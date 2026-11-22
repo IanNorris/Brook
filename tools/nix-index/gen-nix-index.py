@@ -5,7 +5,14 @@ Two-phase approach:
   1. nix-instantiate to batch-eval store paths for all top-level nixpkgs attrs
   2. nix-env -qaP --json --meta for descriptions and metadata
 
-Output: TSV file with name, version, store_name, description per line.
+Output: TSV file with name, version, store_name, description and an optional
+fifth main_program column (meta.mainProgram) per line. Only derivations whose
+`.system` is the target system (x86_64-linux) are offered: Brook loads only
+x86-64 ELF images, so e.g. zsnes (i686-linux) is recorded in
+<output>.excluded.tsv with a reason instead of being silently dropped. Unfree
+packages (e.g. snes9x) are recorded there too: the pin is evaluated with
+allowUnfree = false and Hydra does not build them, so the binary cache has
+nothing to install.
 
 Usage:
     python3 gen-nix-index.py [--output packages.idx]
@@ -34,14 +41,24 @@ NIX_STORE_PATHS_EXPR = r'''
         path = if hasDrv
           then builtins.tryEval (builtins.toString raw.value.outPath)
           else { success = false; value = ""; };
-      in if path.success then { inherit name; value = path.value; } else null;
+        system = builtins.tryEval (if raw.value ? system then builtins.toString raw.value.system else "");
+        # Unfree packages throw on outPath (allowUnfree = false) and Hydra
+        # does not build them, so the binary cache cannot serve them either.
+        unfree = raw.success && (builtins.tryEval (raw.value.meta.unfree or false)) == { success = true; value = true; };
+      in if path.success then {
+        inherit name;
+        value = { path = path.value; system = if system.success then system.value else ""; };
+      } else if hasDrv && unfree then {
+        inherit name;
+        value = { path = ""; system = if system.success then system.value else ""; unfree = true; };
+      } else null;
     results = builtins.filter (x: x != null) (map getInfo names);
   in builtins.listToAttrs results
 '''
 
 
-def eval_store_paths(package_set: Path) -> dict[str, str]:
-    """Evaluate all top-level nixpkgs store paths. Returns attr -> store_path."""
+def eval_store_paths(package_set: Path) -> dict[str, dict]:
+    """Evaluate all top-level nixpkgs store paths. Returns attr -> {path, system}."""
     print("Phase 1: Evaluating store paths (may take 1-2 min)...", file=sys.stderr)
     result = subprocess.run(
         ["nix-instantiate", "--eval", "--strict", "--json", "-E",
@@ -97,14 +114,31 @@ def main():
         metadata = query_metadata(package_set)
     print(f"  Got {len(metadata)} metadata entries", file=sys.stderr)
 
-    # Build index by joining store paths with metadata
+    entries, excluded = build_entries(store_paths, metadata, args.system)
+    write_index(Path(args.output), entries, excluded, pin, args.system)
+
+
+def clean_field(value) -> str:
+    return " ".join(str(value or "").split())
+
+
+def build_entries(store_paths: dict, metadata: dict, system: str):
+    """Join phase 1 and 2. Returns (entries, excluded) row lists."""
     entries = []
-    for attr, store_path in store_paths.items():
+    excluded = []
+    for attr, info in store_paths.items():
+        if isinstance(info, str):
+            info = {'path': info, 'system': ''}
+        store_path = info.get('path', '')
         store_name = store_name_from_path(store_path)
+        meta_info = metadata.get(attr, {})
+        if info.get('unfree'):
+            excluded.append((meta_info.get('pname', attr), meta_info.get('version', ''), attr,
+                             'unfree license; not built by Hydra, so the binary cache cannot serve it'))
+            continue
         if not store_name:
             continue
 
-        meta_info = metadata.get(attr, {})
         pname = meta_info.get("pname", attr)
         version = meta_info.get("version", "")
         description = meta_info.get("meta", {}).get("description", "")
@@ -122,7 +156,15 @@ def main():
                 if not pname or pname == attr:
                     pname = parts[0]
 
-        entries.append((pname, version, store_name, description))
+        main_program = clean_field(meta_info.get("meta", {}).get("mainProgram", ""))
+        if "/" in main_program or main_program.startswith("."):
+            main_program = ""
+        drv_system = info.get('system') or meta_info.get('system', '')
+        if drv_system != system:
+            reason = f"unsupported system {drv_system or 'unknown'}; Brook runs {system} binaries only"
+            excluded.append((pname, version, attr, reason))
+            continue
+        entries.append((pname, version, store_name, description, main_program))
 
     # Sort by lowercase package name
     entries.sort(key=lambda e: e[0].lower())
@@ -136,22 +178,40 @@ def main():
             seen.add(key)
             unique.append(entry)
     entries = unique
+    # A package name offered for this system is not also "excluded".
+    offered = {e[0] for e in entries}
+    excluded = sorted({e for e in excluded if e[0] not in offered}, key=lambda e: (e[0].lower(), e[2]))
+    return entries, excluded
 
-    # Write TSV: name\tversion\tstore_name\tdescription
-    with open(args.output, "w") as f:
-        for name, version, store_name, desc in entries:
-            f.write(f"{name}\t{version}\t{store_name}\t{desc}\n")
 
-    size_mb = os.path.getsize(args.output) / (1024 * 1024)
-    print(f"Wrote {len(entries)} packages to {args.output} ({size_mb:.1f} MB)",
-          file=sys.stderr)
+def write_index(output: Path, entries, excluded, pin: Path, system: str):
+    # Write TSV: name\tversion\tstore_name\tdescription[\tmain_program]
+    with open(output, "w") as f:
+        for name, version, store_name, desc, main_program in entries:
+            row = f"{name}\t{version}\t{store_name}\t{desc}"
+            if main_program:
+                row += f"\t{main_program}"
+            f.write(row + "\n")
+    excluded_path = Path(str(output) + '.excluded.tsv')
+    with open(excluded_path, "w") as f:
+        f.write("# name\tversion\tattribute\treason (not offered by the Gallery)\n")
+        for row in excluded:
+            f.write("\t".join(clean_field(x) for x in row) + "\n")
+
+    size_mb = os.path.getsize(output) / (1024 * 1024)
+    print(f"Wrote {len(entries)} packages to {output} ({size_mb:.1f} MB); "
+          f"excluded {len(excluded)} (other systems or unfree)", file=sys.stderr)
     try: pin_label = str(pin.relative_to(Path(__file__).resolve().parents[2]))
     except ValueError: pin_label = str(pin)
-    Path(str(args.output)+'.json').write_text(json.dumps({
-        'format': 1, 'nixpkgs_import': pin_label,
+    Path(str(output)+'.json').write_text(json.dumps({
+        'format': 2, 'columns': ['name', 'version', 'store_name', 'description', 'main_program?'],
+        'nixpkgs_import': pin_label,
         'nixpkgs_import_sha256': hashlib.sha256(pin.read_bytes()).hexdigest(),
-        'system': args.system, 'allow_unfree': False, 'entries': len(entries),
-        'index_sha256': hashlib.sha256(Path(args.output).read_bytes()).hexdigest(),
+        'system': system, 'allow_unfree': False, 'entries': len(entries),
+        'excluded': len(excluded),
+        'excluded_other_system': sum(1 for e in excluded if e[3].startswith('unsupported system')),
+        'excluded_unfree': sum(1 for e in excluded if e[3].startswith('unfree')),
+        'index_sha256': hashlib.sha256(output.read_bytes()).hexdigest(),
         'binary_cache_availability_checked': False,
     }, indent=2)+'\n')
 

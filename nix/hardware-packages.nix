@@ -20,7 +20,7 @@ let
     export PATH=/nix/profile/bin:/boot/BIN
     export HOME=/data/home DISPLAY=:0
     source ${../data/nix-wrappers/brook-session-env.sh} /tmp || exit 1
-    export GDK_BACKEND=wayland SDL_VIDEODRIVER=wayland
+    export GDK_BACKEND=wayland,x11 SDL_VIDEODRIVER=wayland
     export FONTCONFIG_FILE=${fonts}/etc/fonts/fonts.conf FONTCONFIG_PATH=${fonts}/etc/fonts
     export XCURSOR_PATH=${cursors}/share/icons XCURSOR_THEME=default
     export XDG_DATA_DIRS=/nix/profile/share

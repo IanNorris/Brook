@@ -91,3 +91,22 @@ the private UID1000 guest fixture also passes. See
 [removal evidence](../../docs/app-gallery.md#removal-error-reporting--18-october-2026).
 Whole-profile transactions, shared-provider restoration and real disk-full
 recovery remain open.
+
+## Starting what was installed (`nix classify`, `nix launcher-add`)
+
+`nix classify <pkg>` is read-only and prints `key=value` lines for App
+Gallery: `kind` (`gui`, `probably-gui`, `cli`, `unsupported`, `none`),
+`launcher` (`package` when the package ships a non-terminal desktop entry,
+`added`, `none`), `program`/`command`, and a `reason`. It prefers the index's
+optional fifth column (`meta.mainProgram`), follows Nix wrappers
+(makeWrapper scripts, makeCWrapper binaries, `.foo-wrapped` siblings) to the
+real ELF and checks its DT_NEEDED for windowing/graphics libraries. Managed
+UI runtimes (Avalonia/SkiaSharp, JavaFX, Electron) mark `probably-gui`.
+Non-x86-64 ELF is `unsupported`. Reads are bounded and nothing is executed.
+
+Launcher icons are never created automatically. A desktop program without
+an entry gets Gallery "Open" and an optional "Add to launcher", which runs
+`nix launcher-add <pkg>`: it writes `brook-added-<pkg>.desktop` into the
+profile's applications directory (launched through `brook-run` as uid 1000)
+and `nix remove` deletes it with the package. Terminal programs get a
+"run `<command>` from Terminal" hint instead.

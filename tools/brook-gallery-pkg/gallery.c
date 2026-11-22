@@ -16,6 +16,7 @@ typedef struct { char *name,*version,*description,*search; gboolean available; }
 static GPtrArray *catalog;
 static GHashTable *installed;
 static GtkWidget *window,*search,*only_installed,*list,*status,*install_button,*remove_button,*cancel_button,*spinner,*log_view;
+static GtkWidget *hint_row,*hint_label,*open_button,*pin_button;
 static GtkListStore *model;
 static GSubprocess *child;
 static gboolean busy,waited,drained,operation_finished,cancel_sent,close_after_operation;
@@ -25,6 +26,111 @@ static guint filter_idle;
 static guint scan_at,matches;
 static char *query;
 static Package *chosen;
+static char *operated_name;  /* package of the last install/remove */
+
+/* How to start an installed package, from `nix classify` key=value lines:
+ * a launcher entry (Terminal=false) → the launcher; a GUI program without
+ * one → Open plus an optional, user-chosen Add to launcher; otherwise the
+ * Terminal command. Launcher icons are never created automatically. */
+typedef struct { char *package,*kind,*launcher,*launcher_name,*program,*command,*reason; } Hint;
+static Hint *hint;
+static gboolean pinning;
+static void hint_free(Hint *h) {
+    if(!h)return;
+    g_free(h->package);g_free(h->kind);g_free(h->launcher);g_free(h->launcher_name);
+    g_free(h->program);g_free(h->command);g_free(h->reason);g_free(h);
+}
+static Hint *hint_parse(const char *text) {
+    Hint *h=g_new0(Hint,1);
+    char **lines=g_strsplit(text?text:"","\n",64);
+    for(char **l=lines;*l;++l) {
+        char *eq=strchr(*l,'=');if(!eq)continue;*eq=0;const char *v=eq+1;
+        char **slot=!strcmp(*l,"package")?&h->package:!strcmp(*l,"kind")?&h->kind:!strcmp(*l,"launcher")?&h->launcher:
+            !strcmp(*l,"launcher_name")?&h->launcher_name:!strcmp(*l,"program")?&h->program:
+            !strcmp(*l,"command")?&h->command:!strcmp(*l,"reason")?&h->reason:NULL;
+        if(slot){g_free(*slot);*slot=g_utf8_make_valid(v,-1);}
+    }
+    g_strfreev(lines);
+    if(!h->package||!h->kind){hint_free(h);return NULL;}
+    return h;
+}
+static gboolean hint_is_gui(const Hint *h) { return h&&(!strcmp(h->kind,"gui")||!strcmp(h->kind,"probably-gui")); }
+static gboolean hint_can_open(const Hint *h) {
+    /* A package with its own launcher entry is opened from the launcher. */
+    return hint_is_gui(h)&&!(h->launcher&&!strcmp(h->launcher,"package"))&&h->command&&g_str_has_prefix(h->command,"/nix/profile/bin/")&&!strchr(h->command+17,'/');
+}
+static gboolean hint_can_pin(const Hint *h) { return hint_can_open(h)&&h->launcher&&!strcmp(h->launcher,"none"); }
+static char *hint_text(const Hint *h) {
+    const char *program=h->program?h->program:h->package;
+    if(!strcmp(h->kind,"unsupported"))
+        return g_strdup_printf("Installed, but %s is not a 64-bit x86 program, so Brook cannot run it. You can remove it.",program);
+    if(h->launcher&&!strcmp(h->launcher,"package"))
+        return g_strdup_printf("%s is installed. Open “%s” from the launcher.",h->package,h->launcher_name?h->launcher_name:program);
+    if(hint_is_gui(h)) {
+        const char *how=!strcmp(h->kind,"probably-gui")?"looks like a desktop program":"is a desktop program";
+        if(h->launcher&&!strcmp(h->launcher,"added"))
+            return g_strdup_printf("%s is installed and in the launcher. You can also open it here.",program);
+        return g_strdup_printf("%s %s without a launcher entry. Open it here, or add it to the launcher.",program,how);
+    }
+    if(!strcmp(h->kind,"cli"))return g_strdup_printf("Installed: run `%s` from Terminal.",program);
+    return g_strdup_printf("Installed. %s has no programs to run (library or data package).",h->package);
+}
+static void hint_show(void) {
+    if(!hint_row)return;
+    if(!hint){gtk_widget_hide(hint_row);return;}
+    char *text=hint_text(hint);gtk_label_set_text(GTK_LABEL(hint_label),text);g_free(text);
+    gtk_widget_set_visible(open_button,hint_can_open(hint));
+    gtk_widget_set_visible(pin_button,hint_can_pin(hint));
+    gtk_widget_set_sensitive(pin_button,!pinning&&!busy);
+    gtk_widget_show(hint_row);
+}
+static void classify_done(GObject *source,GAsyncResult *result,gpointer data) {
+    char *name=data,*out=NULL;GError *error=NULL;
+    if(g_subprocess_communicate_utf8_finish(G_SUBPROCESS(source),result,&out,NULL,&error)&&g_subprocess_get_successful(G_SUBPROCESS(source))) {
+        Hint *h=hint_parse(out);
+        /* Only the package still selected (or just operated on) is shown. */
+        const char *wanted=chosen?chosen->name:operated_name;
+        if(h&&wanted&&!strcmp(h->package,name)&&!g_ascii_strcasecmp(wanted,name)){hint_free(hint);hint=h;hint_show();}
+        else hint_free(h);
+    }
+    g_clear_error(&error);g_free(out);g_free(name);g_object_unref(source);
+}
+static void hint_request(const char *name) {
+    if(!name||!g_hash_table_contains(installed,name)){hint_free(hint);hint=NULL;hint_show();return;}
+    if(hint&&!strcmp(hint->package,name)){hint_show();}
+    GError *error=NULL;
+    GSubprocess *probe=g_subprocess_new(G_SUBPROCESS_FLAGS_STDOUT_PIPE|G_SUBPROCESS_FLAGS_STDERR_SILENCE,&error,"/nix/bin/nix","classify",name,NULL);
+    if(!probe){g_clear_error(&error);return;}
+    g_subprocess_communicate_utf8_async(probe,NULL,NULL,classify_done,g_strdup(name));
+}
+static void open_program(GtkButton *button,gpointer unused) {
+    (void)button;(void)unused;if(!hint_can_open(hint))return;
+    const char *runtime="/nix/profile/bin/brook-run";
+    char *with_runtime[]={(char*)runtime,hint->command,NULL},*direct[]={hint->command,NULL};
+    GError *error=NULL;
+    if(!g_spawn_async(NULL,access(runtime,X_OK)==0?with_runtime:direct,NULL,G_SPAWN_STDOUT_TO_DEV_NULL|G_SPAWN_STDERR_TO_DEV_NULL,NULL,NULL,NULL,&error)) {
+        gtk_label_set_text(GTK_LABEL(status),error->message);g_error_free(error);return;
+    }
+    char *text=g_strdup_printf("Starting %s…",hint->program?hint->program:hint->package);
+    gtk_label_set_text(GTK_LABEL(status),text);g_free(text);
+}
+static void pin_done(GObject *source,GAsyncResult *result,gpointer data) {
+    char *name=data,*out=NULL,*err=NULL;GError *error=NULL;
+    gboolean ok=g_subprocess_communicate_utf8_finish(G_SUBPROCESS(source),result,&out,&err,&error)&&g_subprocess_get_successful(G_SUBPROCESS(source));
+    pinning=FALSE;
+    const char *message=ok?"Added to the launcher.":error?error->message:err&&*err?err:"Could not add it to the launcher.";
+    char *text=g_strstrip(g_strdup(message));gtk_label_set_text(GTK_LABEL(status),text);g_free(text);
+    g_clear_error(&error);g_free(out);g_free(err);g_object_unref(source);
+    hint_request(name);g_free(name);hint_show();
+}
+static void pin_program(GtkButton *button,gpointer unused) {
+    (void)button;(void)unused;if(!hint_can_pin(hint)||pinning||busy||geteuid()!=1000)return;
+    GError *error=NULL;
+    GSubprocess *pin=g_subprocess_new(G_SUBPROCESS_FLAGS_STDOUT_PIPE|G_SUBPROCESS_FLAGS_STDERR_PIPE,&error,"/nix/bin/nix","launcher-add",hint->package,NULL);
+    if(!pin){gtk_label_set_text(GTK_LABEL(status),error->message);g_error_free(error);return;}
+    pinning=TRUE;hint_show();
+    g_subprocess_communicate_utf8_async(pin,NULL,NULL,pin_done,g_strdup(hint->package));
+}
 
 static gboolean valid_name(const char *s) {
     if (!*s || strlen(s)>255 || *s=='-') return FALSE;
@@ -76,6 +182,7 @@ static void load_catalog(GTask *task,gpointer source,gpointer data,GCancellable 
         char *version=strchr(line,'\t'),*store=version?strchr(version+1,'\t'):NULL,*description=store?strchr(store+1,'\t'):NULL;
         if(!description){g_set_error_literal(&error,G_FILE_ERROR,G_FILE_ERROR_INVAL,"Package index is malformed.");break;}
         *version++=0;*store++=0;*description++=0;
+        char *main_program=strchr(description,'\t');if(main_program)*main_program=0; /* optional fifth column */
         if(!valid_name(line)||strchr(store,'/')){g_set_error_literal(&error,G_FILE_ERROR,G_FILE_ERROR_INVAL,"Package index contains an invalid name.");break;}
         if(g_hash_table_contains(seen,line))continue;
         Package *p=package_new(line,version,description,TRUE);g_ptr_array_add(items,p);g_hash_table_add(seen,p->name);
@@ -98,11 +205,13 @@ static void controls(void) {
     gtk_button_set_label(GTK_BUTTON(install_button),present?"Repair":"Install");
     gtk_widget_set_sensitive(remove_button,allowed&&present);
     gtk_widget_set_sensitive(cancel_button,busy&&!waited&&!cancel_sent);
+    if(pin_button)gtk_widget_set_sensitive(pin_button,allowed&&!pinning);
 }
 static void selection_changed(GtkTreeSelection *selection,gpointer unused) {
     (void)unused;GtkTreeModel *m=NULL;GtkTreeIter it;chosen=NULL;
     if(gtk_tree_selection_get_selected(selection,&m,&it))gtk_tree_model_get(m,&it,4,&chosen,-1);
     controls();
+    if(chosen)hint_request(chosen->name);
 }
 static gboolean filter_batch(gpointer unused) {
     (void)unused;
@@ -151,7 +260,9 @@ static void finish_operation(void) {
     /* Keep the result visible even after the result list finishes filtering. */
     char *message=error?g_strdup(error->message):output_error?g_strdup(output_error):child_status==130?g_strdup("Installation cancelled. Completed downloads remain cached."):g_strdup_printf(child_status==0?"Package operation completed. Installed state refreshed.":"Package operation failed (status %d). See details below; you can retry.",child_status);
     gtk_label_set_text(GTK_LABEL(status),message);g_free(message);g_clear_error(&error);controls();
-    if(close_after_operation)gtk_widget_destroy(window);
+    if(close_after_operation){gtk_widget_destroy(window);return;}
+    hint_free(hint);hint=NULL;hint_show();
+    if(child_status==0)hint_request(operated_name);
 }
 static void output_ready(GObject *source,GAsyncResult *result,gpointer unused) {
     (void)unused;GError *error=NULL;GBytes *bytes=g_input_stream_read_bytes_finish(G_INPUT_STREAM(source),result,&error);
@@ -190,6 +301,7 @@ static void operate(GtkButton *button,gpointer unused) {
     (void)unused;if(!chosen||busy||geteuid()!=1000)return;
     gboolean removing=GTK_WIDGET(button)==remove_button;
     g_autofree char *name=g_strdup(chosen->name);
+    g_free(operated_name);operated_name=g_strdup(name);
     GtkWidget *dialog=gtk_message_dialog_new(GTK_WINDOW(window),GTK_DIALOG_MODAL,GTK_MESSAGE_QUESTION,GTK_BUTTONS_OK_CANCEL,"%s %s?",removing?"Remove":"Install or repair",name);
     gtk_window_set_title(GTK_WINDOW(dialog),"App Gallery");
     gtk_message_dialog_format_secondary_text(GTK_MESSAGE_DIALOG(dialog),"%s",removing?"Remove this package from the shared desktop profile? Its downloaded files stay cached on disk.":"Install this package and its dependencies into the shared desktop profile?");
@@ -220,6 +332,17 @@ int main(int argc,char **argv) {
         if(!items){fprintf(stderr,"CATALOGCHECK FAIL %s\n",error->message);g_error_free(error);return 1;}
         unsigned available=0;for(guint i=0;i<items->len;++i)available+=((Package*)g_ptr_array_index(items,i))->available;
         printf("CATALOGCHECK PASS total=%u available=%u local=%u\n",items->len,available,items->len-available);g_ptr_array_unref(items);return 0;
+    }
+
+    if(argc==3&&!strcmp(argv[1],"--check-hint")) {
+        /* Headless: render the post-install guidance for `nix classify` output. */
+        char *text=NULL;GError *error=NULL;
+        if(!g_file_get_contents(argv[2],&text,NULL,&error)){fprintf(stderr,"HINTCHECK FAIL %s\n",error->message);g_error_free(error);return 1;}
+        Hint *h=hint_parse(text);g_free(text);
+        if(!h){fprintf(stderr,"HINTCHECK FAIL malformed classification\n");return 1;}
+        char *message=hint_text(h);
+        printf("HINTCHECK text=%s open=%d add=%d\n",message,hint_can_open(h),hint_can_pin(h));
+        g_free(message);hint_free(h);return 0;
     }
 
     g_set_prgname("brook-gallery");g_set_application_name("App Gallery");gtk_init(&argc,&argv);
@@ -255,10 +378,16 @@ int main(int argc,char **argv) {
     cancel_button=gtk_button_new_with_label("Stop");gtk_box_pack_start(GTK_BOX(row),cancel_button,FALSE,FALSE,0);
     g_signal_connect(cancel_button,"clicked",G_CALLBACK(cancel_operation),NULL);
     g_signal_connect(install_button,"clicked",G_CALLBACK(operate),NULL);g_signal_connect(remove_button,"clicked",G_CALLBACK(operate),NULL);
+    hint_row=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,12);gtk_box_pack_start(GTK_BOX(box),hint_row,FALSE,FALSE,0);
+    hint_label=gtk_label_new("");gtk_label_set_line_wrap(GTK_LABEL(hint_label),TRUE);gtk_label_set_xalign(GTK_LABEL(hint_label),0);gtk_label_set_selectable(GTK_LABEL(hint_label),TRUE);
+    gtk_box_pack_start(GTK_BOX(hint_row),hint_label,TRUE,TRUE,0);
+    open_button=gtk_button_new_with_label("Open");pin_button=gtk_button_new_with_label("Add to launcher");
+    gtk_box_pack_start(GTK_BOX(hint_row),open_button,FALSE,FALSE,0);gtk_box_pack_start(GTK_BOX(hint_row),pin_button,FALSE,FALSE,0);
+    g_signal_connect(open_button,"clicked",G_CALLBACK(open_program),NULL);g_signal_connect(pin_button,"clicked",G_CALLBACK(pin_program),NULL);
     GtkWidget *expander=gtk_expander_new("Installer details");gtk_box_pack_start(GTK_BOX(box),expander,FALSE,FALSE,0);
     scroll=gtk_scrolled_window_new(NULL,NULL);gtk_widget_set_size_request(scroll,-1,140);gtk_container_add(GTK_CONTAINER(expander),scroll);
     log_view=gtk_text_view_new();gtk_text_view_set_editable(GTK_TEXT_VIEW(log_view),FALSE);gtk_text_view_set_monospace(GTK_TEXT_VIEW(log_view),TRUE);gtk_container_add(GTK_CONTAINER(scroll),log_view);
-    controls();gtk_widget_show_all(window);gtk_spinner_start(GTK_SPINNER(spinner));
+    controls();gtk_widget_show_all(window);gtk_widget_hide(hint_row);gtk_spinner_start(GTK_SPINNER(spinner));
     GTask *task=g_task_new(NULL,NULL,catalog_ready,NULL);g_task_run_in_thread(task,load_catalog);g_object_unref(task);
-    gtk_main();brook_gtk_appearance_free(appearance);if(filter_idle)g_source_remove(filter_idle);if(catalog)g_ptr_array_unref(catalog);g_hash_table_unref(installed);g_free(query);g_free(output_error);g_object_unref(model);return 0;
+    gtk_main();brook_gtk_appearance_free(appearance);if(filter_idle)g_source_remove(filter_idle);if(catalog)g_ptr_array_unref(catalog);g_hash_table_unref(installed);g_free(query);g_free(output_error);g_free(operated_name);hint_free(hint);g_object_unref(model);return 0;
 }

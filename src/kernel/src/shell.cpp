@@ -159,7 +159,12 @@ static constexpr const char* g_defaultEnvp[] = {
     // server-side mode via that protocol; this covers every other GTK3
     // toolkit that doesn't speak the decoration protocol.
     "GTK_CSD=0",
-    "GDK_BACKEND=wayland",
+    // Wayland first, X11 (Xwayland) as the fallback. A bare "wayland" breaks
+    // X11-only GTK apps: nixpkgs wrappers do `--prefix GDK_BACKEND : x11`,
+    // producing "x11:wayland", which GTK (comma-separated list) can't match;
+    // e.g. bsnes-hd failed with "cannot open display: :0". With this list
+    // the prefixed value still ends in a valid ",x11" entry.
+    "GDK_BACKEND=wayland,x11",
     "GDK_SCALE=1",
     "GDK_DPI_SCALE=1",
     "GSETTINGS_BACKEND=memory",

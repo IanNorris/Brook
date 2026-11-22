@@ -90,7 +90,8 @@ static int64_t UnixStreamTryWrite(PipeBuffer* pipe, UnixFdQueue* queue,
 static uint32_t UnixStreamTryRead(PipeBuffer* pipe, UnixFdQueue* queue,
                                   char* bytes, uint64_t length,
                                   UnixFdSnap* descriptors, int& count, UnixSenderCredentials* sender,
-                                  bool record=false,bool* consumed=nullptr,uint64_t* recordLength=nullptr) {
+                                  bool record=false,bool* consumed=nullptr,uint64_t* recordLength=nullptr,
+                                  bool peek=false) {
     count=0;SpinLockAcquire(&pipe->lock);
     if(consumed)*consumed=false;
     if(recordLength)*recordLength=0;
@@ -101,6 +102,15 @@ static uint32_t UnixStreamTryRead(PipeBuffer* pipe, UnixFdQueue* queue,
         const uint64_t size=span.end-queue->read;
         uint32_t n=static_cast<uint32_t>(size<length?size:length);
         if(sender)*sender=span.sender;
+        if(peek) {
+            // MSG_PEEK copies the record and leaves it, and its rights, queued.
+            uint32_t first=pipe->capacity-pipe->tail;if(first>n)first=n;
+            if(first)memcpy(bytes,pipe->data+pipe->tail,first);
+            if(n>first)memcpy(bytes+first,pipe->data,n-first);
+            if(consumed)*consumed=true;
+            if(recordLength)*recordLength=size;
+            SpinLockRelease(&pipe->lock);return n;
+        }
         while(queue->tail!=queue->head && queue->records[queue->tail]==slot) {
             descriptors[count++]=queue->msgs[queue->tail];
             queue->tail=(queue->tail+1)%UNIX_FD_QUEUE_CAP;
@@ -117,6 +127,20 @@ static uint32_t UnixStreamTryRead(PipeBuffer* pipe, UnixFdQueue* queue,
         SpinLockRelease(&pipe->lock);return n;
     }
     uint32_t n=pipe->count();if(length<n)n=static_cast<uint32_t>(length);
+    if(peek) {
+        // MSG_PEEK: copy without consuming bytes, rights or credentials.
+        // .NET waits for readability with a one-byte peek, so consuming here
+        // silently drops the first byte of the next message.
+        if(queue && n && sender && queue->credentialTail != queue->credentialHead) {
+            auto& span = queue->credentials[queue->credentialTail];
+            *sender = span.sender;
+            if (span.end - queue->read < n) n = static_cast<uint32_t>(span.end - queue->read);
+        }
+        uint32_t first=pipe->capacity-pipe->tail;if(first>n)first=n;
+        if(n)memcpy(bytes,pipe->data+pipe->tail,first);
+        if(n>first)memcpy(bytes+first,pipe->data,n-first);
+        SpinLockRelease(&pipe->lock);return n;
+    }
     if(queue && n) {
         if (sender && queue->credentialTail != queue->credentialHead) {
             auto& span = queue->credentials[queue->credentialTail];
@@ -485,7 +509,7 @@ int64_t UnixSocketWriteSome(UnixSocketData* socket,bool nonblock,
 }
 int64_t UnixSocketReadSome(UnixSocketData* socket,bool nonblock,
                            char* bytes,uint64_t length,UnixFdSnap* descriptors,int& count,
-                           UnixSenderCredentials* sender,uint64_t* recordLength,bool* consumed) {
+                           UnixSenderCredentials* sender,uint64_t* recordLength,bool* consumed,bool peek) {
     count=0;
     if(consumed)*consumed=false;
     if(recordLength)*recordLength=0;
@@ -503,11 +527,13 @@ int64_t UnixSocketReadSome(UnixSocketData* socket,bool nonblock,
     for(;;) {
         bool received=false;
         auto n=UnixStreamTryRead(pipe,socket->incomingFds,bytes,length,descriptors,count,sender,
-            socket->socketType==5,&received,recordLength);
+            socket->socketType==5,&received,recordLength,peek);
         if(consumed)*consumed=received;
         if(n || received) {
-            if(auto* writer=pipe->writerWaiter) {pipe->writerWaiter=nullptr;WakeProcess(writer);}
-            PipeWakeEpoll(pipe);
+            if(!peek) {
+                if(auto* writer=pipe->writerWaiter) {pipe->writerWaiter=nullptr;WakeProcess(writer);}
+                PipeWakeEpoll(pipe);
+            }
             if(userTarget && n && !CopyToUser(reinterpret_cast<uint64_t>(userTarget),bytes,n)) {
                 // Callers release rights only from successful reads; the
                 // dequeued rights of a faulting read are dropped here.
