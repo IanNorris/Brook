@@ -6,6 +6,7 @@
 #include "kprintf.h"
 #include "ramdisk.h"
 #include "apic.h"
+#include "boot_logo.h"
 #include "vfs.h"
 #include "writable_desktop.h"
 #include "memory/virtual_memory.h"
@@ -78,6 +79,15 @@ bool LiveStoreBoot(uint8_t* nextDrive)
             VmmFreePages(base, pages); return false;
         }
         BrookShaAdd(&hash, memory + at, static_cast<BrookUpdateSize>(len));
+        if (((at + len) & ((64ull << 20) - 1)) == 0 || at + len == record.bytes) {
+            char line[64]; unsigned n = 0;
+            auto put = [&](const char* t) { while (*t && n + 1 < sizeof(line)) line[n++] = *t++; };
+            auto num = [&](uint64_t v) { char d[20]; unsigned k = 0; do { d[k++] = char('0' + v % 10); v /= 10; } while (v);
+                                         while (k && n + 1 < sizeof(line)) line[n++] = d[--k]; };
+            put("Loading system image "); num((at + len) >> 20); put(" / "); num(record.bytes >> 20); put(" MB");
+            line[n] = 0;
+            BootLogoStatus(uint8_t(50 + 14 * (at + len) / record.bytes), line);
+        }
         if (at + len - lastReport >= (512ull << 20) || at + len == record.bytes) {
             lastReport = at + len;
             const uint64_t ms = ApicTickCount() - start;
@@ -89,6 +99,7 @@ bool LiveStoreBoot(uint8_t* nextDrive)
     uint8_t digest[32]; BrookShaFinish(&hash, digest);
     bool match = true; for (unsigned i = 0; i < 32; ++i) match &= digest[i] == record.sha256[i];
     if (!match) { KPuts("live store: SHA-256 mismatch; kconsole session\n"); VmmFreePages(base, pages); return false; }
+    BootLogoStatus(64, "Mounting system image");
     Device* ram = RamdiskCreate(memory, record.bytes, 512, "live-store");
     if (!ram) { VmmFreePages(base, pages); return false; }
     const auto result = WritableDesktopLiveMount(nextDrive, ram, record.bytes);
