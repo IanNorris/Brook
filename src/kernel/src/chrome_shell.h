@@ -101,6 +101,7 @@ struct ChromePowerModel {
     uint8_t capRatio;         // applied CPU ratio cap (x100 MHz, 0 = released)
     uint16_t gpuMhz;          // render clock a recent job saw (0 = idle)
     uint16_t gpuTopMhz;       // the controller's current render ceiling (0 = unknown)
+    uint16_t cpuMaxMhz;       // max non-turbo clock (PLATFORM_INFO ratio x100, 0 = unknown)
 };
 // Rows the flyout adds for `power`; fixed for a boot, so the height is stable.
 inline unsigned ChromePowerRows(const ChromePowerModel& p)

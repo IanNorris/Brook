@@ -144,6 +144,7 @@ static ChromePowerModel WmPowerModel() {
                             st.idle ? M::Idle : M::Light)
                          : b.autoState.optedOut ? M::OptedOut : M::Off;
     out.gpuMhz = snap.latest.gpuMhz;
+    out.cpuMaxMhz = static_cast<uint16_t>(snap.baseMhz > 0xffff ? 0xffff : snap.baseMhz); // MSR 0xCE max non-turbo
     if (!b.enabled) return out;
     out.targetMw = b.config.pkgLimitMw;
     out.capRatio = static_cast<uint8_t>(b.appliedCap > 0xff ? 0xff : b.appliedCap);

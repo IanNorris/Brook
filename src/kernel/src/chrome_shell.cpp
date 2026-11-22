@@ -1159,23 +1159,45 @@ struct FlyoutText {
 };
 } // namespace
 
+// A PanelRow drawing the first value (longest first) that leaves room after the key.
+static int PanelRowFit(ChromeDisplayList& dl, const ChromeStyle& s, int x, int y, int w, const char* key,
+                       const FlyoutText* values, unsigned count)
+{
+    const int room = w - s.TextWidth(key, CF::Label) - Px(s, 12);
+    unsigned pick = 0;
+    while (pick + 1 < count && s.TextWidth(values[pick].text, CF::Label) > room) ++pick;
+    return PanelRow(dl, s, x, y, w, key, values[pick].text);
+}
+
 // Sensor/Throttles-at continuation: RAPL limits, then the balance controller.
 static int PowerRows(ChromeDisplayList& dl, const ChromeStyle& s, int x, int y, int w, const ChromePowerModel& p)
 {
     using M = ChromeBalanceMode;
     if (p.pl1Mw) {
-        FlyoutText t;
-        t.Watts(p.pl1Mw).Add(" sustained");
-        if (p.pl2Mw) t.Add(" " BROOK_CHROME_DOT " ").Watts(p.pl2Mw).Add(" burst");
-        y = PanelRow(dl, s, x, y, w, "Power limit", t.text);
+        FlyoutText t[3];
+        t[0].Watts(p.pl1Mw).Add(" sustained");
+        t[1].Watts(p.pl1Mw);
+        t[2].Watts(p.pl1Mw);
+        if (p.pl2Mw) {
+            t[0].Add(" " BROOK_CHROME_DOT " ").Watts(p.pl2Mw).Add(" burst");
+            t[1].Add(" " BROOK_CHROME_DOT " ").Watts(p.pl2Mw).Add(" burst");
+            t[2].Add(" / ").Watts(p.pl2Mw);
+        }
+        y = PanelRowFit(dl, s, x, y, w, "Power limit", t, 3);
     }
     if (p.mode == M::Unavailable) return y;
     const bool capping = p.mode == M::Light || p.mode == M::Heavy || p.mode == M::Idle;
-    FlyoutText cpu;
-    if (capping && p.capRatio && p.mode == M::Idle) cpu.Add("Idle " BROOK_CHROME_DOT " ").Ghz(p.capRatio);
-    else if (capping && p.capRatio) cpu.Ghz(p.capRatio).Add(" (balance)");
-    else cpu.Add("Turbo");
-    y = PanelRow(dl, s, x, y, w, "CPU limit", cpu.text);
+    // Longest first; the first that leaves room after the key is drawn.
+    // With the max non-turbo clock first, then with "(balance)" alone, then bare.
+    FlyoutText cpu[4];
+    const bool idleCap = capping && p.capRatio && p.mode == M::Idle, balanceCap = capping && p.capRatio && !idleCap;
+    for (unsigned i = 0; i < 4; ++i) {
+        if (idleCap) cpu[i].Add("Idle " BROOK_CHROME_DOT " ").Ghz(p.capRatio);
+        else if (balanceCap) cpu[i].Ghz(p.capRatio).Add(i == 0 || i == 2 ? " (balance)" : "");
+        else cpu[i].Add("Turbo");
+        if (p.cpuMaxMhz && i < 2) cpu[i].Add(" " BROOK_CHROME_DOT " max ").Ghz(p.cpuMaxMhz / 100);
+    }
+    y = PanelRowFit(dl, s, x, y, w, "CPU limit", cpu, 4);
     FlyoutText gpu;
     if (p.gpuMhz) gpu.Number(p.gpuMhz).Add(" MHz");
     else gpu.Add("Idle");
@@ -1187,15 +1209,13 @@ static int PowerRows(ChromeDisplayList& dl, const ChromeStyle& s, int x, int y, 
                         p.mode == M::Light ? "light" : p.mode == M::Starting ? "starting" : nullptr;
     if (phase) ctl.Add("Balance " BROOK_CHROME_DOT " ").Add(phase);
     else ctl.Add(p.mode == M::OptedOut ? "Opted out" : "Off");
+    // The package budget; drop the word, then the budget, when crowded.
+    FlyoutText c[3] = {ctl, ctl, ctl};
     if (phase && p.targetMw) {
-        // The package budget; drop the word when the row would crowd its key.
-        FlyoutText full = ctl;
-        full.Add(" " BROOK_CHROME_DOT " ").Watts(p.targetMw).Add(" target");
-        const int room = w - s.TextWidth("Controller", CF::Label) - Px(s, 12);
-        if (s.TextWidth(full.text, CF::Label) <= room) ctl = full;
-        else ctl.Add(" " BROOK_CHROME_DOT " ").Watts(p.targetMw);
+        c[0].Add(" " BROOK_CHROME_DOT " ").Watts(p.targetMw).Add(" target");
+        c[1].Add(" " BROOK_CHROME_DOT " ").Watts(p.targetMw);
     }
-    return PanelRow(dl, s, x, y, w, "Controller", ctl.text);
+    return PanelRowFit(dl, s, x, y, w, "Controller", c, 3);
 }
 
 void ChromeBuildTrayFlyout(const ChromeTrayFlyoutModel& m, const ChromeStyle& s, ChromeDisplayList& dl)
