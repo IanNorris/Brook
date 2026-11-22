@@ -19,6 +19,7 @@ struct CpuIdlePerCpu {
     uint64_t sampleGen;        // last sample request honoured
     uint64_t epb;              // IA32_ENERGY_PERF_BIAS read back by this CPU
     uint64_t epbGen;           // last EPB request applied
+    uint64_t pkgLimitGen;      // last package C-state limit applied
     bool seen;
     // Governor (auto mode)
     CpuIdleHistory history;
@@ -51,6 +52,10 @@ void CpuIdleEnter(uint32_t cpu);
 CpuIdleChoice CpuIdleRequest(CpuIdleState state);
 // Menu-style governor: per-CPU predicted idle chooses C1E/C3/C6.
 void CpuIdleRequestAuto();
+// MSR_PKG_CST_CONFIG_CONTROL package C-state limit (0 = C0/C1 .. 8 = C10;
+// hardware caps it to what the part supports), applied by every CPU at its
+// next idle entry. Volatile. -95 unsupported model, -22 range, -1 locked.
+int CpuIdleRequestPackageLimit(uint32_t limit);
 // Latency-critical paths: keep the calling CPU at C1E for the next `us`.
 void CpuIdleLatencyHint(uint32_t us);
 // Ask every CPU's idle loop to apply EPB value (0-15); false if unsupported.

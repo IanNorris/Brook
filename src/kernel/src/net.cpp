@@ -7205,6 +7205,11 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             else if(st==CpuIdleState::Count)bad=true;else note=CpuIdleStateName(CpuIdleRequest(st).state);
         }
         else if(NetStrEq(cmd,"cpu idle reset")){CpuIdleResetCounters();note="counters reset";}
+        else if(StrStartsWith(cmd,"cpu idle pkg-limit ")){
+            const char* v=cmd+19;const bool digit=v[0]>='0'&&v[0]<='8'&&!v[1];
+            const int r=digit?CpuIdleRequestPackageLimit(uint32_t(v[0]-'0')):-22;
+            if(r==-22)bad=true;else note=r==0?"package C-state limit requested":r==-1?"refused: MSR 0xe2 locked":"unsupported";
+        }
         else if(NetStrEq(cmd,"cpu epb default")){
             CpuIdleStatus cur{};CpuIdleRequestSample();CpuIdleReadStatus(cur);
             const int32_t t=CpuEpbBootTarget(cur.cpus[0].epb);
