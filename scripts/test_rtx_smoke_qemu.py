@@ -193,6 +193,10 @@ def prove_usb_desktop(qmp, rpc, session, base, wait_for):
     for _ in range(57):  # seven transport checks already ran
         qmp_key(qmp, 'f8')
     wait_for('further key logging suppressed', 30)
+    for _ in range(9):
+        move(1,0)
+        move(-1,0)
+    wait_for('further mouse logging suppressed', 30)
     wait_for('==== BROOK STATUS (boot settled)', 40)
     time.sleep(0.35)
 
