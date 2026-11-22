@@ -208,6 +208,9 @@ def main():
     p.add_argument('--source-date-epoch', help='explicit Unix timestamp for reproducible assembly metadata; '
                    'pass the desired SOURCE_DATE_EPOCH value here')
     p.add_argument('--allow-dirty', action='store_true', help='permit uncommitted changes (recorded)')
+    p.add_argument('--ssd-trim', metavar='MARKER',
+                   help='one-boot maintenance pair: write /etc/ssd-trim with this marker (e.g. "dry-run", '
+                        '"run 1 16"; see docs/ssd-trim.md). Never use it for the default pair')
     p.add_argument('--qemu-check', action='store_true',
                    help='then run scripts/check_dell_image_qemu.py on the pair (results in <output>/qemu-check)')
     a = p.parse_args()
@@ -217,6 +220,8 @@ def main():
         sys.exit('Run inside the pinned dev shell: nix-shell --run "python3 scripts/build_dell_image.py ..."')
     if a.output.exists():
         sys.exit(f'{a.output} already exists; pairs are never overwritten')
+    if a.ssd_trim is not None and not re.fullmatch(r'(dry-run|run)( \d{1,6} \d{1,7})?', a.ssd_trim):
+        sys.exit('--ssd-trim expects "dry-run" or "run", optionally followed by MIN_MiB MAX_MiB')
     commit = subprocess.run(['git', '-C', ROOT, 'rev-parse', 'HEAD'], capture_output=True, text=True, check=True).stdout.strip()
     dirty = bool(subprocess.run(['git', '-C', ROOT, 'status', '--porcelain', '--untracked-files=no'],
                                 capture_output=True, text=True, check=True).stdout.strip())
@@ -328,6 +333,13 @@ def main():
     run(['mcopy', '-o', '-i', image, '-', '::/ETC/build-provenance'], input=provenance)
     if subprocess.check_output(['mtype', '-i', str(image), '::/ETC/build-provenance']) != provenance:
         sys.exit('initrd build provenance readback mismatch')
+    if a.ssd_trim is not None:
+        # Maintenance-only: the guarded pre-mount TRIM pass (docs/ssd-trim.md)
+        # runs only when the boot initrd carries this marker.
+        marker = (a.ssd_trim + '\n').encode()
+        run(['mcopy', '-o', '-i', image, '-', '::/ETC/ssd-trim'], input=marker)
+        if subprocess.check_output(['mtype', '-i', str(image), '::/ETC/ssd-trim']) != marker:
+            sys.exit('initrd ssd-trim marker readback mismatch')
 
     # 4. Independent verification
     verify = [sys.executable, ROOT / 'scripts/verify_guarded_desktop_candidate.py', '--candidate', a.output,
@@ -361,6 +373,8 @@ def main():
         'boot_services': {name: {'source': str(path), 'sha256': sha(path), 'runtime_store_paths': runtime_paths(path)}
                           for name, path in boot_services.items()},
     }
+    if a.ssd_trim is not None:
+        manifest['maintenance'] = {'ssd_trim': a.ssd_trim}
     if operator_input is not None:
         info = (build / 'build_info_generated.cpp').read_text()
         build_id = re.search(r'BuildGitHash\(\) \{ return "([0-9a-f+]+)"; \}', info)

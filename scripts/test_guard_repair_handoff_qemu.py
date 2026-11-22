@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import os
 import json
+import random
 import re
 from pathlib import Path
 import shutil
@@ -53,6 +54,47 @@ def compact(source,dest,tree,size=8*1024*1024,scrub_deployment=False):
     with dest.open('wb') as f:f.truncate(size)
     subprocess.run(['mformat','-i',str(dest),'::'],check=True)
     subprocess.run(['mcopy','-s','-i',str(dest),*[str(p) for p in tree.iterdir()],'::/'],check=True)
+
+
+DATA_FIRST = 133120
+BASE_DATA_SECTORS = 126976
+TRIM_DATA_SECTORS = 512 * 1024 * 1024 // 512
+TRIM_DISK_SECTORS = DATA_FIRST + TRIM_DATA_SECTORS + 2048
+
+
+def grow_trim_fixture(disk, recovery):
+    """Enlarge only the disposable disk's data partition, preserving its identity."""
+    dump = subprocess.check_output(['sfdisk', '--dump', str(disk)], text=True)
+    dump, changed = re.subn(r'size=\s*126976,', f'size={TRIM_DATA_SECTORS},', dump)
+    if changed != 1:
+        raise RuntimeError('unexpected base GPT geometry')
+    dump = re.sub(r'^last-lba:.*\n', '', dump, flags=re.M)
+    with disk.open('r+b') as stream:
+        stream.truncate(TRIM_DISK_SECTORS * 512)
+    subprocess.run(['sfdisk', '--no-reread', '--no-tell-kernel', str(disk)],
+                   input=dump, text=True, check=True, stdout=subprocess.DEVNULL)
+    for name, old, new in (
+        ('ahci-write-target', b',262144,512,', f',{TRIM_DISK_SECTORS},512,'.encode()),
+        ('ahci-data-volume', b'133120,126976\n', f'{DATA_FIRST},{TRIM_DATA_SECTORS}\n'.encode()),
+    ):
+        target = '::/ETC/' + name
+        record = subprocess.check_output(['mtype', '-i', str(recovery), target])
+        if record.count(old) != 1:
+            raise RuntimeError(f'unexpected fixture selector {name}')
+        subprocess.run(['mcopy', '-o', '-i', str(recovery), '-', target],
+                       input=record.replace(old, new), check=True)
+
+
+def extract_data(disk, partition, sectors):
+    with disk.open('rb') as src, partition.open('wb') as dst:
+        src.seek(DATA_FIRST * 512)
+        remaining = sectors * 512
+        while remaining:
+            chunk = src.read(min(remaining, 1024 * 1024))
+            if not chunk:
+                raise RuntimeError('truncated data partition')
+            dst.write(chunk)
+            remaining -= len(chunk)
 
 
 def main():
@@ -110,7 +152,12 @@ def main():
                         help='Exercise guarded v3 over the selected QEMU Intel NIC')
     parser.add_argument('--bridge-v3-nic-accel',choices=('kvm','tcg'),
                         help='Accelerator for the disposable Intel NIC QA boots')
+    parser.add_argument('--ssd-trim', choices=('dry-run', 'run'))
     a=parser.parse_args()
+    if a.ssd_trim and (not a.auto_desktop_dell_initrd or not a.auto_desktop_intel_provider or
+                       not a.auto_desktop_vulkan_service or a.auto_desktop_panic or a.bridge_v3_qa or
+                       a.bridge_local_policy_qa or a.proc_dump_qa or a.auto_desktop_slot_fallback):
+        parser.error('SSD TRIM requires the Dell initrd and synthetic desktop services')
     if (a.bridge_v3_nic or a.bridge_v3_nic_accel) and not a.bridge_v3_qa:
         parser.error('Intel NIC QA requires --bridge-v3-qa')
     if a.bridge_v3_nic_accel and not a.bridge_v3_nic:
@@ -231,6 +278,9 @@ def main():
                 16*1024*1024 if a.auto_desktop_dell_initrd or a.auto_desktop_slot_fallback else 8*1024*1024,
                 scrub_deployment=bool(a.auto_desktop_slot_fallback or a.bridge_local_policy_qa))
         compact(a.recovery_pair/'INITRD.IMG',recovery,work/'recovery-tree')
+        data_sectors = TRIM_DATA_SECTORS if a.ssd_trim else BASE_DATA_SECTORS
+        if a.ssd_trim:
+            grow_trim_fixture(disk, recovery)
         if a.auto_desktop_dell_initrd or a.auto_desktop_slot_fallback:
             # Bind the candidate boot image to the disposable SATA fixture.
             for name in ('ahci-write-target','ahci-boot-volume','ahci-data-volume'):
@@ -248,6 +298,11 @@ def main():
             for name in ('arp-async-probe','tcp-async-neighbor','tcp-try-transmit','tcp-async-send',
                          'tcp-producer-wake','tcp-async-retry-1ms','tcp-worker-waiter','tcp-adaptive-flight16'):
                 subprocess.run(['mdel','-i',str(normal),'::/ETC/'+name],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        if a.ssd_trim:
+            subprocess.run(['mcopy','-o','-i',str(normal),'-','::/ETC/ssd-trim'],
+                           input=(a.ssd_trim+'\n').encode(),check=True)
+            subprocess.run(['mcopy','-o','-i',str(normal),'-','::/BOOT/INIT.RC'],
+                           input=startup.rstrip(b'\r\n')+b'\nshutdown\n',check=True)
         if a.auto_desktop:
             for directory in ('MEDIA','MEDIA/SYSTEM','DATA','NIX'):
                 if subprocess.run(['mdir','-i',str(normal),'::/'+directory],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode:
@@ -336,8 +391,8 @@ def main():
         if a.bridge_v3_qa:
             subprocess.run(['mmd','-i',media,'::/UPDATES'],check=True)
         partition=work/'data.img'
-        with disk.open('rb') as f:f.seek(133120*512+1024+104);fs_uuid=uuid.UUID(bytes=f.read(16))
-        with partition.open('wb') as f:f.truncate(126976*512)
+        with disk.open('rb') as f:f.seek(DATA_FIRST*512+1024+104);fs_uuid=uuid.UUID(bytes=f.read(16))
+        with partition.open('wb') as f:f.truncate(data_sectors*512)
         subprocess.run(['mke2fs','-q','-F','-t','ext2','-b','4096','-I','128','-N','1024','-m','0',
                         '-O','none,filetype,sparse_super,large_file','-U',str(fs_uuid),str(partition)],check=True,stderr=subprocess.DEVNULL)
         witness=work/'placeholder';witness.write_text('synthetic fixture\n')
@@ -399,8 +454,33 @@ def main():
                         subprocess.run(['debugfs','-w','-R',f'set_inode_field {target} mode 0100755',str(partition)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
                         evidence['libraries'][target]=hashlib.sha256(source.read_bytes()).hexdigest()
                 (a.output/'provider-runtime.json').write_text(json.dumps(evidence,indent=2)+'\n')
+        trim_live = {}
+        if a.ssd_trim:
+            rng = random.Random(32768)
+            deleted = work/'deleted'
+            deleted.write_bytes(rng.randbytes(4*1024*1024))
+            live = work/'live'
+            live.write_bytes(rng.randbytes(64*1024))
+            # Separate deleted extents with live data. The 80 allocations
+            # cover 320 MiB and cross multiple 128 MiB ext2 groups.
+            names = [f'TRIMLIVE{index:02}.BIN' for index in range(80)]
+            commands = []
+            for index, name in enumerate(names):
+                commands.extend((f'write {deleted} /TRIMDEAD{index:02}.BIN',
+                                 f'write {live} /{name}'))
+            commands.extend(f'rm /TRIMDEAD{index:02}.BIN' for index in range(80))
+            batch = work/'trim-debugfs.txt'
+            batch.write_text('\n'.join(commands)+'\n')
+            subprocess.run(['debugfs','-w','-f',str(batch),str(partition)],check=True,
+                           stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            for name in (*FILES, *names):
+                content=subprocess.check_output(['debugfs','-R',f'cat /{name}',str(partition)],
+                                                stderr=subprocess.DEVNULL)
+                trim_live[name]=hashlib.sha256(content).hexdigest()
+            if any(trim_live[name] != hashlib.sha256(live.read_bytes()).hexdigest() for name in names):
+                raise RuntimeError('TRIM live fixture was not written')
         with disk.open('r+b') as dst,partition.open('rb') as src:
-            dst.seek(133120*512);shutil.copyfileobj(src,dst);dst.seek(133120*512+1024+58);dst.write(b'\0\0')
+            dst.seek(DATA_FIRST*512);shutil.copyfileobj(src,dst);dst.seek(DATA_FIRST*512+1024+58);dst.write(b'\0\0')
         guard=bytearray(128);guard[:8]=b'BRKRCV01';struct.pack_into('<QI',guard,8,1,1)
         guard[24:72]=bytes.fromhex(a.identity);struct.pack_into('<I',guard,124,zlib.crc32(guard[:124]))
         guard_file=work/'guard.bin';guard_file.write_bytes(guard)
@@ -418,7 +498,7 @@ def main():
                 journal_bytes[offset+512:offset+512+len(packet)]=packet
         journal=work/'PANIC.BIN';journal.write_bytes(journal_bytes)
         subprocess.run(['mcopy','-o','-i',media,str(journal),'::/PANIC.BIN'],check=True)
-        metadata=metadata_hash(disk)
+        metadata=metadata_hash(disk, DATA_FIRST + data_sectors)
         journal_after=journal.read_bytes()
         if a.inject_panic:
             before_data=outside_esp_hash(disk)
@@ -487,8 +567,8 @@ def main():
         guards=[subprocess.check_output(['mtype','-i',media,'::/RECOVERY/'+name]) for name in ('GUARD0.BIN','GUARD1.BIN')]
         if guards[0]!=guards[1] or len(guards[0])!=128 or struct.unpack_from('<I',guards[0],16)[0]!=1 or struct.unpack_from('<I',guards[0],20)[0]!=0 or zlib.crc32(guards[0][:124])!=struct.unpack_from('<I',guards[0],124)[0]:
             raise RuntimeError('repair did not publish matching valid clean guards')
-        if metadata_hash(disk)!=metadata:raise RuntimeError('repair changed GPT or disk metadata')
-        with disk.open('rb') as src,partition.open('wb') as dst:src.seek(133120*512);dst.write(src.read(126976*512))
+        if metadata_hash(disk, DATA_FIRST + data_sectors)!=metadata:raise RuntimeError('repair changed GPT or disk metadata')
+        extract_data(disk, partition, data_sectors)
         with partition.open('rb') as f:
             f.seek(1024+58)
             if f.read(2)!=b'\x01\x00':raise RuntimeError('repair did not clean ext2')
@@ -567,7 +647,7 @@ def main():
             shutil.copyfile(retry/'serial.log',a.output/'desktop-early-nested-recovery.log')
             if 'GUARD_EXT2_VERIFIED_PENDING' not in (retry/'serial.log').read_text(errors='replace'):
                 raise RuntimeError('early nested recovery did not verify ext2')
-            with disk.open('rb') as src,partition.open('wb') as dst:src.seek(133120*512);dst.write(src.read(126976*512))
+            extract_data(disk, partition, data_sectors)
             subprocess.run(['e2fsck','-f','-n',str(partition)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
             print('GUARD_DESKTOP_EARLY_NESTED_RESET_PASS')
             return
@@ -948,6 +1028,47 @@ def main():
             finally:
                 for name in ('serial.log','qemu.log'):
                     if (second/name).exists():shutil.copyfile(second/name,a.output/('desktop-attempt-'+name))
+        elif a.ssd_trim:
+            qcow=work/'trim.qcow2'
+            subprocess.run(['qemu-img','convert','-f','raw','-O','qcow2',str(disk),str(qcow)],check=True)
+            def allocation():
+                return sum(e['length'] for e in json.loads(subprocess.check_output(
+                    ['qemu-img','map','--output=json',str(qcow)])) if e['data'])
+            before=allocation()
+            try:
+                boot(qcow,a.firmware,second,False,'AHCI_DIRECT_SESSION_CLEAN\r\n',120,True,
+                     sata_snapshot=False,sata_discard=True,sata_serial='BROOK-RECOVERY-QA',
+                     expect_reset=True,reset_evidence_marker='efi-runtime: shutdown call',
+                     failure_marker='GUARD_DESKTOP_HANDOFF_FAILED')
+            finally:
+                for name in ('serial.log','qemu.log'):
+                    if (second/name).exists():shutil.copyfile(second/name,a.output/('trim-'+name))
+            after=allocation()
+            trim_serial=(second/'serial.log').read_text(errors='replace')
+            reports=re.findall(r'^SSD_TRIM (\{.*\})',trim_serial,re.M)
+            if len(reports)!=1:
+                raise RuntimeError('expected one SSD TRIM report')
+            report=json.loads(reports[0])
+            if report['error'] or report['mode']!=a.ssd_trim or report['bytes'] < 256*1024*1024 or report['ranges'] < 32:
+                raise RuntimeError(f'unexpected SSD TRIM result {report}')
+            if a.ssd_trim=='run' and (report['dsm_commands'] < 2 or before-after < 256*1024*1024 or
+                                      not 0 < report['command_max_ns'] < report['command_total_ns'] <= report['duration_ns']):
+                raise RuntimeError(f'SSD TRIM did not reclaim expected allocation: {before} -> {after}')
+            if a.ssd_trim=='dry-run' and (report['dsm_commands'] or report['planned_commands'] < 2 or
+                                          report['command_total_ns'] or report['command_max_ns'] or before-after > 0):
+                raise RuntimeError('dry-run issued discard or failed to plan commands')
+            if a.ssd_trim=='dry-run':
+                ranges = [json.loads(line) for line in
+                          re.findall(r'^SSD_TRIM_RANGE (\{.*\})',trim_serial,re.M)]
+                groups = {(row['lba']-DATA_FIRST)//(32768*8) for row in ranges}
+                if len(ranges)!=report['ranges'] or len(groups)<3:
+                    raise RuntimeError('dry-run did not cover at least three ext2 groups')
+                report['groups'] = sorted(groups)
+            if trim_serial.index('SSD_TRIM {') >= trim_serial.index('ahci direct: ready '):
+                raise RuntimeError('allocator was published before TRIM completed')
+            report.update(allocated_before=before,allocated_after=after,live_hashes=trim_live)
+            (a.output/'ssd-trim.json').write_text(json.dumps(report,indent=2)+'\n')
+            subprocess.run(['qemu-img','convert','-f','qcow2','-O','raw',str(qcow),str(disk)],check=True)
         elif a.auto_desktop:
             boot(disk,a.firmware,second,False,'GUARD_DESKTOP_HANDOFF_SCRIPT status=0',120,True,sata_snapshot=False,
                  hold_after_marker=5,sata_serial='BROOK-RECOVERY-QA',failure_marker='GUARD_DESKTOP_HANDOFF_FAILED')
@@ -1062,7 +1183,7 @@ def main():
         for index in range(2):
             if subprocess.check_output(['mtype','-i',media,f'::/RECOVERY/GUARD{index}.BIN'])!=guards[index]:
                 raise RuntimeError('desktop changed verified clean guard records')
-        if metadata_hash(disk)!=metadata:raise RuntimeError('desktop changed GPT or disk metadata')
+        if metadata_hash(disk, DATA_FIRST + data_sectors)!=metadata:raise RuntimeError('desktop changed GPT or disk metadata')
         if a.auto_desktop_panic:
             # boot() observed reset or stopped the halted VM. A fresh boot
             # must select recovery, retain the
@@ -1105,7 +1226,17 @@ def main():
                 raise RuntimeError('fresh desktop panic retrieval did not precede the first repair attempt')
             if subprocess.check_output(['mtype','-i',media,'::/PANIC.BIN'])!=journal_after:
                 raise RuntimeError('desktop panic recovery changed the journal')
-        with disk.open('rb') as src,partition.open('wb') as dst:src.seek(133120*512);dst.write(src.read(126976*512))
+        extract_data(disk, partition, data_sectors)
+        if a.ssd_trim:
+            with partition.open('rb') as data:
+                data.seek(1024+58)
+                if data.read(2)!=b'\x01\x00':
+                    raise RuntimeError('TRIM fixture did not leave a clean ext2 header')
+            for name, digest in trim_live.items():
+                content=subprocess.check_output(['debugfs','-R',f'cat /{name}',str(partition)],
+                                                stderr=subprocess.DEVNULL)
+                if hashlib.sha256(content).hexdigest()!=digest:
+                    raise RuntimeError(f'TRIM fixture changed /{name}')
         if a.auto_desktop_shutdown or dell_shutdown:
             with partition.open('rb') as source:
                 source.seek(1024+58)

@@ -17,6 +17,8 @@
 #if defined(BROOK_SSD_GUARD_TRANSACTION)
 #include "guard_checker_session.h"
 #include "guard_fat_profile.h"
+#include "ext2_trim_plan.h"
+#include "rtc.h"
 #endif
 #if defined(BROOK_AHCI_PANIC_TEST)
 #include "fatfs_vfs.h"
@@ -592,6 +594,98 @@ bool AhciSystemGuardTestAdoptSystemMount(Device* adapter,uint8_t drive,uint64_t 
     guardSystemVolumeDevice=adapter;systemVolumeDrive=drive;systemVolumePublication=publication;
     return true;
 }
+#if defined(BROOK_SSD_GUARD_TRANSACTION)
+// While DSM may be outstanding, a power loss must lead through the same
+// offline check as an interrupted direct filesystem session.
+static bool TrimSetFilesystemState(uint8_t state) {
+    uint8_t bytes[]{state,0};
+    auto* disk=guardDataRange.parent;
+    const uint64_t offset=guardDataRange.start+1082; // ext2 s_state
+    if(DeviceWriteLeased(disk,&guardDataPartition,offset,bytes,sizeof(bytes))!=int(sizeof(bytes)) ||
+       DeviceFlush(disk))
+        return false;
+    uint8_t verified[2]{};
+    return disk->ops->read(disk,offset,verified,sizeof(verified))==int(sizeof(verified)) &&
+        verified[0]==state && verified[1]==0;
+}
+
+static int TrimGuardedDataBeforeMount() {
+    auto* marker=VfsOpen("/etc/ssd-trim",VFS_O_STREAM);
+    if(!marker)return 0;
+    VnodeStat st{};
+    char mode[32]{};
+    uint64_t offset=0;
+    const bool valid=!VfsStat(marker,&st) && !st.isDir && !st.isSymlink &&
+        st.size<=sizeof(mode) && VfsRead(marker,mode,st.size,&offset)==int(st.size);
+    VfsRelease(marker);
+    SsdTrimRequest request{};
+    const bool parsed=valid && SsdTrimParseRequest(mode,uint32_t(st.size),request);
+    const bool run=request.run;
+    const uint64_t maxSectors=uint64_t(request.maximumMiB)*2048;
+    const uint64_t started=RtcNowNs();
+    uint64_t sectors=0;
+    uint32_t rangeCount=0;
+    AhciTrimStats stats{};
+    int error=-22;
+    if(parsed && guardDesktopPhase==GuardDesktopPhase::Preparing &&
+       guardDataPhase==GuardDataPhase::Disabled && !directPrepared && !directReady &&
+       guardDataRange.parent && !(guardDataRange.start%512) && !(guardDataRange.bytes%512)) {
+        const TrimRange trimWindow{guardDataRange.start/512,guardDataRange.bytes/512};
+        error=-95;
+        if(AhciTrimPayloadLimit(guardDataRange.parent)) {
+            auto* scratch=static_cast<Ext2TrimScan*>(kmalloc(sizeof(Ext2TrimScan)));
+            error=-12;
+            if(scratch) {
+                TrimRange batch[16]{};
+                uint32_t used=0;
+                bool markedDirty=false;
+                auto drain=[&] {
+                    if(!used)return true;
+                    if(run && !markedDirty) {
+                        if(!TrimSetFilesystemState(0)) {error=-5;return false;}
+                        markedDirty=true;
+                    }
+                    error=AhciTrimBatch(guardDataRange.parent,trimWindow,batch,used,run,stats);
+                    used=0;
+                    return !error;
+                };
+                const auto result=Ext2TrimScanClean(trimWindow,largeUuid,request.minimumMiB*256,*scratch,
+                    [&](uint64_t at,void* out,uint32_t n) {
+                        if(at>guardDataRange.bytes || n>guardDataRange.bytes-at)return false;
+                        auto* parent=guardDataRange.parent;
+                        return parent->ops->read(parent,guardDataRange.start+at,out,n)==int(n);
+                    },[&](TrimRange rangeToTrim) {
+                        if(maxSectors) {
+                            const uint64_t available=maxSectors-sectors;
+                            if(available<uint64_t(request.minimumMiB)*2048)return true;
+                            if(rangeToTrim.sectors>available)rangeToTrim.sectors=available;
+                        }
+                        sectors+=rangeToTrim.sectors;
+                        ++rangeCount;
+                        if(!run)KPrintf("SSD_TRIM_RANGE {\"lba\":%lu,\"sectors\":%lu}\n",
+                                       rangeToTrim.lba,rangeToTrim.sectors);
+                        batch[used++]=rangeToTrim;
+                        return used<sizeof(batch)/sizeof(batch[0]) || drain();
+                    });
+                if(result==Ext2TrimScanResult::Ok) {
+                    error=0;
+                    if(drain() && markedDirty && !TrimSetFilesystemState(1))error=-5;
+                } else if(result!=Ext2TrimScanResult::Cancelled) {
+                    error=result==Ext2TrimScanResult::IoError ? -5 : -117;
+                }
+                kfree(scratch);
+            }
+        }
+    }
+    KPrintf("SSD_TRIM {\"mode\":\"%s\",\"ranges\":%u,\"bytes\":%lu,\"dsm_commands\":%u,"
+            "\"planned_commands\":%u,\"command_total_ns\":%lu,\"command_max_ns\":%lu,"
+            "\"duration_ns\":%lu,\"error\":%d}\n",run?"run":"dry-run",
+            rangeCount,sectors*512,run?stats.commands:0,run?0:stats.commands,
+            stats.commandTotalNs,stats.commandMaxNs,RtcNowNs()-started,error);
+    return error;
+}
+#endif
+
 bool AhciSystemGuardTestMountDesktop(Device* adapter,uint8_t* nextDrive,bool* sharedProfileRejected) {
     if(sharedProfileRejected)*sharedProfileRejected=false;
     static bool desktopAttempted=false;
@@ -603,7 +697,17 @@ bool AhciSystemGuardTestMountDesktop(Device* adapter,uint8_t* nextDrive,bool* sh
     largePartition.name="ahci-data";
     if(!DeviceRegister(&largePartition))return false;
     largeRange=guardDataRange;guardDesktopLeaseOwner=&guardDataPartition;
-    directLeased=true;directPrepared=true;guardDesktopPhase=GuardDesktopPhase::Preparing;
+    guardDesktopPhase=GuardDesktopPhase::Preparing;
+#if defined(BROOK_SSD_GUARD_TRANSACTION)
+    // The checked guard owns the data lease and ext2 has no allocator yet.
+    // A failed discard retires this handoff and leaves the mount unpublished.
+    // Inert (no scan, no discard) unless the initrd carries /etc/ssd-trim.
+    if(TrimGuardedDataBeforeMount()) {
+        guardDesktopPhase=GuardDesktopPhase::Failed;
+        return false;
+    }
+#endif
+    directLeased=true;directPrepared=true;
     const bool ready=AhciSystemDirectDesktopMount(nextDrive,sharedProfileRejected);
     guardDesktopPhase=ready?GuardDesktopPhase::Ready:GuardDesktopPhase::Failed;
     return ready;

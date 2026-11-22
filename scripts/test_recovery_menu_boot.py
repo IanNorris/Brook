@@ -21,7 +21,7 @@ def boot(image, firmware, work, recovery, marker, timeout, sata, forbidden=None,
          hold_after_marker=0, sata_serial=None, failure_marker=None, extra_fw_cfg=None, expect_reset=False,
          network_port=None,on_marker=None,network_usb=False,intermediate_marker=None,on_intermediate=None,
          reset_evidence_marker='PANIC_TEST_RESET_WAIT',gdb_script=None,smp=2,bulk_port=None,update_port=None,store_port=None,
-         network_model='virtio-net-pci',accelerator='kvm'):
+         network_model='virtio-net-pci',accelerator='kvm',sata_discard=False):
     if accelerator not in ('kvm','tcg'):
         raise ValueError('Unsupported QEMU accelerator')
     if network_model not in ('virtio-net-pci','e1000','e1000-82545em','e1000e') or (
@@ -39,8 +39,9 @@ def boot(image, firmware, work, recovery, marker, timeout, sata, forbidden=None,
         '-drive', f'if=pflash,format=raw,file={variables}', '-device', 'VGA',
     ]
     if sata:
+        disk_format = 'qcow2,discard=unmap' if sata_discard else 'raw'
         command += [
-            '-drive', f'if=none,id=stick,format=raw,snapshot={"on" if sata_snapshot else "off"},file={image}',
+            '-drive', f'if=none,id=stick,format={disk_format},snapshot={"on" if sata_snapshot else "off"},file={image}',
             '-device', 'ide-hd,drive=stick,bus=ide.0,bootindex=1' +
                        (f',serial={sata_serial}' if sata_serial else ''),
         ]
