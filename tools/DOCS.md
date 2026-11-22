@@ -34,7 +34,6 @@ nix-install <pkg>
 | brook-edit | ~1040 | Text editor with Ctrl+S save, Ctrl+F search, Tab, Ctrl+D duplicate |
 | brook-player | 764 | Audio/video player |
 | brook-console | ~730 | Kernel log viewer with Ctrl+F filter |
-| wayland-calc | 816 | Interactive calculator with keyboard and mouse input |
 
 ## Test Programs
 

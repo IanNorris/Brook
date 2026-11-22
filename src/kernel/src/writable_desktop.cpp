@@ -160,8 +160,10 @@ WritableDesktopFailure PayloadFailure(const ProfileView& view={}) {
         if(st.isDir)return {path,"file-type",-21};
         if(!st.size)return {path,"nonempty-file",-22};
     }
+    // Firefox is an optional app (absent from the default VMware selection),
+    // so it is not part of the profile identity check.
     const char* executables[]={"/nix/bin/nix","/nix/bin/nix-fetch","/nix/bin/nar-unpack",
-        "/nix/profile/bin/brook-firefox","/nix/profile/bin/brook-chromium","/nix/profile/bin/brook-gallery"};
+        "/nix/profile/bin/brook-chromium","/nix/profile/bin/brook-gallery"};
     for(const char* path:executables) {
         VnodeStat st{};
         if(const int status=view.Stat(path,&st))return {path,"stat",status};

@@ -85,6 +85,7 @@ namespace brook { void LifecycleChannelConfigure(); void LifecycleChannelStart()
 #include "kvmclock.h"
 #include "tsc_clock.h"
 #include "vmware_clock.h"
+#include "vmware_tools.h"
 #include "vdso.h"
 #include "watchdog.h"
 #if defined(BROOK_SSD_AUTO_RECOVERY)
@@ -1193,9 +1194,8 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         {
             constexpr uint32_t STATUS_BAR_LINES = 6;
             uint32_t barH = STATUS_BAR_LINES * brook::TtyLineHeight();
-            uint32_t fbW = 0, fbH = 0, fbStride = 0;
-            uint32_t* fbPtr = nullptr;
-            brook::TtyGetFramebuffer(&fbPtr, &fbW, &fbH, &fbStride);
+            uint32_t fbW = 0, fbH = 0;
+            brook::TtyGetFramebufferDimensions(&fbW, &fbH, nullptr);
             if (fbH > barH)
                 brook::TtySetRegion(0, fbH - barH, fbW, barH);
         }
@@ -1226,6 +1226,10 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
         // Start the audio mixer drain thread.
         brook::AudioMixerThreadStart();
+
+        // VMware Tools toolbox channel (power ops, guest IP, resize hints).
+        // Returns without any backdoor I/O unless this is VMware.
+        brook::VmwareToolsStart();
 
         // CPU/GPU temperature and power sampler (bare-metal Intel only).
         brook::ThermalSamplerStart();

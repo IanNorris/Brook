@@ -297,7 +297,7 @@ def collect(store_dir, output_dir, *, profile=None, hardware=False, profile_only
                     exec_cmd = '--uid 1000 ' + exec_cmd
 
         if binary in (binary_name, '/nix/profile/bin/' + binary_name):
-            hardware_names = ('mousepad', 'brook-settings', 'wayland-calc', 'brook-gallery')
+            hardware_names = ('mousepad', 'brook-settings', 'brook-gallery')
             if binary_name == 'brook-task-manager' or (hardware and binary_name in hardware_names):
                 wrapper = '/nix/profile/bin/hardware-' + binary_name
                 if guest_path(wrapper).is_file():

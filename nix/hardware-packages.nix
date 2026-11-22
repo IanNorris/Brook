@@ -9,7 +9,6 @@ let
     let f = import (../tools + "/${name}"); in
     f (if builtins.hasAttr "pkgs" (builtins.functionArgs f) then { inherit pkgs; } else {});
   native = [ (nativePackage "waylandd-pkg") ]
-    ++ pkgs.lib.optional includeOfflineApps (nativePackage "wayland-calc-pkg")
     ++ map nativePackage [
       "brook-settings-pkg" "brook-message-pkg" "brook-session-pkg"
       "brook-apps-pkg" "brook-task-manager-pkg"
@@ -30,7 +29,7 @@ let
     mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME"
     exec "$@"
     SCRIPT
-    for app in ${if includeOfflineApps then "mousepad brook-settings wayland-calc brook-task-manager" else "brook-settings brook-task-manager"}; do
+    for app in ${if includeOfflineApps then "mousepad brook-settings brook-task-manager" else "brook-settings brook-task-manager"}; do
       cat > $out/bin/hardware-$app <<SCRIPT
     #!${pkgs.bash}/bin/bash
     exec /nix/profile/bin/brook-run /nix/profile/bin/$app "\$@"

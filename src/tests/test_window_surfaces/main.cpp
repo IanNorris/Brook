@@ -66,7 +66,13 @@ static unsigned forceCloseCalls=0;
 bool ShutdownLaunchAllowed() { return !shutdownPending; }
 bool ShutdownCanForceApps(const char*) { return forceAppsOffered; }
 void ShutdownDesktopForceApps() { CHECK(forceAppsOffered);++forceCloseCalls; }
-const char* ShutdownDesktopStatus() { return "Applications"; }
+static bool shutdownFailed=false;
+static unsigned retryCalls=0,forcePowerOffCalls=0;
+static constexpr char failedStatus[]="Shutdown failed: could not save data (I/O error). Retry or force power off.";
+const char* ShutdownDesktopStatus() { return shutdownFailed?failedStatus:"Applications"; }
+ShutdownFailureActions ShutdownDesktopFailureActions() { return {shutdownFailed,shutdownFailed,shutdownFailed}; }
+void ShutdownDesktopRetry() { CHECK(shutdownFailed);++retryCalls; }
+void ShutdownDesktopForcePowerOff() { CHECK(shutdownFailed);++forcePowerOffCalls; }
 void ShutdownDesktopRequest(bool) { std::abort(); }
 void ShutdownDesktopCancel() { std::abort(); }
 Process* KernelThreadCreate(const char*, KernelThreadFn, void*, uint8_t) { std::abort(); }
@@ -1195,6 +1201,26 @@ int main() {
         CHECK(press(LauncherTargetKind::ForceApps, 0, false) && forceCloseCalls==1);
         shutdownPending=forceAppsOffered=false;
 
+        // A failed shutdown shows its message and offers Retry and Force
+        // power off instead of an inert Cancel shutdown.
+        shutdownPending=shutdownFailed=true;
+        WmCaptureLauncher(sw, sh, -1, -1, snapshot);
+        CHECK(snapshot.shutdownActive && snapshot.shutdownFailed && snapshot.retryShutdown && snapshot.forcePowerOff);
+        CHECK(!strcmp(snapshot.text, failedStatus));
+        {
+            const auto& frame = LauncherFrame(sw, sh, -1, -1);
+            bool retry=false,force=false,cancel=false;
+            for (uint32_t i = 0; i < frame.targetCount; ++i) {
+                retry |= frame.targets[i].target.kind == LauncherTargetKind::RetryShutdown;
+                force |= frame.targets[i].target.kind == LauncherTargetKind::ForcePowerOff;
+                cancel |= frame.targets[i].target.kind == LauncherTargetKind::CancelShutdown;
+            }
+            CHECK(retry && force && !cancel && frame.notice.h > 0 && frame.notice.w > frame.footer.w / 2);
+        }
+        CHECK(press(LauncherTargetKind::RetryShutdown, 0, false) && retryCalls==1 && !forcePowerOffCalls);
+        CHECK(press(LauncherTargetKind::ForcePowerOff, 0, false) && forcePowerOffCalls==1);
+        shutdownPending=shutdownFailed=false;
+
         testTick = 1199;
         LauncherSaveLayout();
         CHECK(!layoutAttempts);
@@ -1417,6 +1443,16 @@ int main() {
             CHECK((state.flags&BROOK_WINDOW_STATE_FULLSCREEN) && !(state.flags&BROOK_WINDOW_STATE_MAXIMIZED));
             CHECK(state.client_x==0 && state.client_y==0 && state.width==sw && state.height==sh);
         }
+        WmInputPop(&g,drain,256);
+        testScreenW=1366;testScreenH=900;
+        WmApplyDisplaySize(testScreenW,testScreenH);
+        CHECK(g.fullscreen && g.clientW==1366 && g.clientH==900 && g.x==0 && g.y==0);
+        CHECK(WmInputPop(&g,&event,1)==1 && event.type==WM_EVT_RESIZED &&
+              event.reserved==WM_RESIZE_FULLSCREEN && event.x==1366 && event.y==900);
+        CHECK(g.fsW==testScreenW-2*WmMetric(WM_BORDER_WIDTH));
+        testScreenW=sw;testScreenH=sh;
+        WmApplyDisplaySize(sw,sh);
+        CHECK(g.fullscreen && g.clientW==sw && g.clientH==sh);
         WmInputPop(&g,drain,256);
         CHECK(WmSetFullscreen(game,false) && !g.fullscreen && g.state==WindowState::Maximized);
         // The decoration requested while fullscreen (server-side) applies now.

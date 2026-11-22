@@ -80,6 +80,7 @@ CompositorUploadStats CompositorReadUploads();
 
 // Get physical framebuffer dimensions.
 extern "C" void CompositorGetPhysDims(uint32_t* w, uint32_t* h);
+void CompositorSnapshotPhysDims(uint32_t* w, uint32_t* h);
 
 // Get physical framebuffer pointer and stride (for kernel threads that
 // need direct FB access, e.g. clock overlay).
@@ -245,6 +246,14 @@ void CompositorReleaseAddressSpaceBuffers(AddressSpaceState* space);
 // Hot-swap the physical framebuffer (called by display driver on mode change).
 // Must be called AFTER TtyRemap (uses TtyGetFramebuffer to get the new mapping).
 // stridePixels is the row stride in pixels (not bytes).
+// Prepare storage before changing the shared framebuffer and TTY geometry.
+// Only supports a physical framebuffer with an existing direct mapping.
+extern "C" void CompositorLockLinearDisplayFrame();
+void CompositorUnlockLinearDisplayFrame();
+// Caller owns the managed display transaction, including the frame lock
+// and the closed TTY reader gate, from device programming through rollback.
+bool CompositorRemapLinearDisplay(uint64_t fbPhys, uint32_t w, uint32_t h,
+                                               uint32_t stridePixels);
 extern "C" void CompositorRemap(uint64_t fbPhys, uint32_t w, uint32_t h,
                                 uint32_t stridePixels);
 

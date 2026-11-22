@@ -385,9 +385,13 @@ static ChromeLauncherChrome LauncherChrome(int32_t mouseX, int32_t mouseY)
     const char* status = g_launcherError == -2 ? "App launch already pending" : g_launcherError ? "Launch queue full" : nullptr;
     const char* desktop = ShutdownDesktopStatus();
     if (!status && desktop && strcmp(desktop, "Applications")) status = desktop;
+    const ShutdownFailureActions failure = ShutdownDesktopFailureActions();
+    // The failure message must win over a stale launch error.
+    if (failure.failed && desktop) status = desktop;
     return {g_launcherModelIcon, g_launcherModel.AppCount(), "brook", build, status,
             g_launcherPower.prompt(), g_launcherPower.pending() == LauncherPowerAction::Restart,
-            g_launcherPower.confirmFocused(), shutdownActive, mouseX, mouseY, ShutdownCanForceApps()};
+            g_launcherPower.confirmFocused(), shutdownActive, mouseX, mouseY, ShutdownCanForceApps(),
+            failure.failed, failure.failed && failure.retry, failure.failed && failure.forcePowerOff};
 }
 
 // The frame for the current model, with the model's viewport in step.
@@ -492,7 +496,7 @@ static void WmCaptureLauncher(uint32_t screenW, uint32_t screenH, int32_t mouseX
     } else {
         // Prime the same default view WmLauncherToggle will open.
         chrome.prompt = chrome.promptRestart = chrome.confirmFocused = false;
-        if (g_launcherError) {
+        if (g_launcherError || chrome.shutdownFailed) {
             const char* desktop = ShutdownDesktopStatus();
             chrome.status = desktop && strcmp(desktop, "Applications") ? desktop : nullptr;
         }
@@ -504,6 +508,9 @@ static void WmCaptureLauncher(uint32_t screenW, uint32_t screenH, int32_t mouseX
     snapshot.mouseY = my;
     snapshot.shutdownActive = chrome.shutdownActive;
     snapshot.forceApps = chrome.forceApps;
+    snapshot.shutdownFailed = chrome.shutdownFailed;
+    snapshot.retryShutdown = chrome.retryShutdown;
+    snapshot.forcePowerOff = chrome.forcePowerOff;
     snapshot.prompt = chrome.prompt;
     snapshot.promptRestart = chrome.promptRestart;
     snapshot.confirmFocused = chrome.confirmFocused;
@@ -562,6 +569,8 @@ bool WmLauncherPress(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH,
     case LauncherTargetKind::Dismiss: power = LauncherPowerTarget::Dismiss; break;
     case LauncherTargetKind::CancelShutdown: power = LauncherPowerTarget::CancelShutdown; break;
     case LauncherTargetKind::ForceApps: power = LauncherPowerTarget::ForceApps; break;
+    case LauncherTargetKind::RetryShutdown: power = LauncherPowerTarget::RetryShutdown; break;
+    case LauncherTargetKind::ForcePowerOff: power = LauncherPowerTarget::ForcePowerOff; break;
     case LauncherTargetKind::Footer: power = LauncherPowerTarget::Footer; break;
     default: break;
     }

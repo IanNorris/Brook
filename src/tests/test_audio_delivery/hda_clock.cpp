@@ -25,6 +25,7 @@ void initialize() {
     registers.fill(0);dma.fill(0);nowNs=1000000000;clockAvailable=true;failSetup=false;
     g_nativeClock=brook::AudioDmaClock{};g_nativeFaultEvidence={};g_nativeMode=false;g_nativeRingBase=0;
     g_nativeLastDataEnd=g_nativePrimedAt=0;
+    g_vmwareController=false;g_lastNativeProgressNs=g_dmaPolls=g_dmaProgressPolls=g_dmaStalls=0;
     g_streamRunning=g_streamConfigured=false;g_playLock=g_legacyActive=0;g_legacyEpoch=0;legacyWaitHook=afterCopyHook=beforeSubmitHook=nullptr;
     g_submittedBytes=g_playedBytes=0;g_lastLpib=0;
     g_initialized=true;g_dacNid=2;g_outStreamBase=0x80;
@@ -61,6 +62,9 @@ void HdaTestWrite(uint32_t offset,uint32_t width,uint32_t value) {
         return;
     }
     if(offset==g_outStreamBase+SD_CTL && width==4) {
+        // High byte is status, not part of the 24-bit stream control.
+        const uint32_t status=HdaTestRead(g_outStreamBase+SD_STS,1);
+        value=(value&SD_CTL_MASK)|((status&~(value>>24))<<24);
         // Match QEMU: SRST preserves stale LPIB; RUN's rising edge parses a
         // fresh BDL and resets its position. Clearing on SRST hid restart loss.
         if((value&SD_CTL_SRST) && failSetup)value&=~SD_CTL_SRST;
@@ -70,6 +74,18 @@ void HdaTestWrite(uint32_t offset,uint32_t width,uint32_t value) {
     store(offset,width,value);
 }
 namespace {
+// Model the Workstation trace: the controller advances one descriptor and
+// waits at its boundary until the polled driver acknowledges BCIS.
+void moveVmwareDescriptor() {
+    constexpr uint64_t periodNs=uint64_t(FRAG_SIZE)*1000000000/176400+1000000;
+    const uint32_t status=g_outStreamBase+SD_STS;
+    if (HdaTestRead(status,1)&SD_STS_BCIS) {
+        nowNs+=periodNs;
+        return;
+    }
+    move(FRAG_SIZE,periodNs);
+    store(status,1,HdaTestRead(status,1)|SD_STS_BCIS);
+}
 void prime() {
     if(g_nativeMode && !g_streamRunning && g_nativeClock.Pending()) {
         nowNs+=NATIVE_PRIME_NS;HdaService();VERIFY(g_streamRunning);
@@ -89,9 +105,88 @@ void finishPhysical() {
     VERIFY(!g_streamRunning);
 }
 }
+static void TestHdaPlaybackRoutes()
+{
+    using namespace brook;
+    constexpr uint32_t analogPin=(4u<<20)|HdaWidgetConnections;
+    constexpr uint32_t selector=(3u<<20)|HdaWidgetConnections;
+    constexpr uint32_t mixer=(2u<<20)|HdaWidgetConnections|HdaWidgetInputAmp;
+    uint32_t widgets[HdaNodeCount]{};
+    widgets[2]=HdaWidgetStereo;
+    widgets[3]=analogPin; // Reports an output type but has no output capability.
+    widgets[4]=selector;
+    widgets[5]=HdaWidgetStereo;
+    widgets[6]=mixer;
+    widgets[7]=analogPin;
+    auto read=[](uint8_t node,uint16_t verb,uint8_t arg,uint32_t& value) {
+        if (verb==HdaGetPinDefault) {
+            value=0;return true;
+        }
+        if (verb==HdaGetParameter && arg==HdaParamPinCaps) {
+            value=node==7 ? (1u<<4) : 0;return true;
+        }
+        if (verb==HdaGetParameter && arg==HdaParamConnections) {
+            value=node==4 ? 0x83 : node==6 ? 2 : 1;return true;
+        }
+        if (verb!=HdaGetConnections) return false;
+        if (node==7 && arg==0) { value=4;return true; }
+        if (node==6 && arg==0) { value=0x8604;return true; } // 4–6, including a cycle.
+        if (node==4 && arg==0) { value=0x00060001;return true; }
+        if (node==4 && arg==2) { value=8;return true; }
+        return false;
+    };
+    auto route=HdaFindPlaybackRoute(widgets,read);
+    VERIFY(route.count==4 && route.steps[0].node==5 && route.steps[3].node==7);
+    VERIFY(route.steps[1].node==6 && route.steps[1].input==1 && !route.steps[1].selectInput);
+    VERIFY(route.steps[2].node==4 && route.steps[2].input==1 && route.steps[2].selectInput);
+    VERIFY(!route.steps[3].selectInput);
+    widgets[5] |= HdaWidgetDigital;
+    VERIFY(HdaFindPlaybackRoute(widgets,read).count==0);
+    widgets[5] = HdaWidgetStereo;
+    auto malformed=[&](uint8_t node,uint16_t verb,uint8_t arg,uint32_t& value) {
+        if (node==6 && verb==HdaGetConnections) { value=0x0486;return true; }
+        return read(node,verb,arg,value);
+    };
+    VERIFY(HdaFindPlaybackRoute(widgets,malformed).count==0);
+}
 void HdaTestAfterCopy() { if(afterCopyHook) {auto hook=afterCopyHook;afterCopyHook=nullptr;hook();} }
 int RunHdaClockTests() {
     using namespace brook;
+    TestHdaPlaybackRoutes();
+    auto platform = [](bool hypervisor, uint32_t ebx, uint32_t ecx, uint32_t edx) {
+        return HdaPlaybackPlatform([&](uint32_t leaf, uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) {
+            a=b=c=d=0;
+            if (leaf==1) c=hypervisor ? 1u<<31 : 0;
+            if (leaf==0x40000000u) { a=leaf; b=ebx; c=ecx; d=edx; }
+        });
+    };
+    const auto vmware=platform(true,0x61774d56u,0x4d566572u,0x65726177u);
+    const auto qemu=platform(true,0x54474354u,0x43544743u,0x47435447u);
+    const auto kvm=platform(true,0x4b4d564bu,0x564b4d56u,0x0000004du);
+    VERIFY(vmware==HdaVmPlatform::Vmware && qemu==HdaVmPlatform::Qemu && kvm==qemu);
+    VERIFY(platform(false,0x61774d56u,0x4d566572u,0x65726177u)==HdaVmPlatform::None);
+    VERIFY(platform(true,0x12345678u,0u,0u)==HdaVmPlatform::None);
+    PciDevice controller{};
+    controller.classCode=0x04;controller.subclass=0x03;
+    controller.vendorId=0x15ad;controller.deviceId=0x1977;
+    VERIFY(HdaVirtualController(vmware,controller) && !HdaVirtualController(qemu,controller));
+    controller.vendorId=0x8086;controller.deviceId=0x293e;
+    VERIFY(HdaVirtualController(qemu,controller) && !HdaVirtualController(vmware,controller) &&
+           !HdaVirtualController(HdaVmPlatform::None,controller));
+    controller.deviceId=0x2668;
+    VERIFY(HdaVirtualController(qemu,controller));
+    controller.subclass=1;
+    VERIFY(!HdaVirtualController(qemu,controller));
+    controller.subclass=3;controller.deviceId=0x9ca0;
+    VERIFY(!HdaVirtualController(qemu,controller) && !HdaVirtualController(vmware,controller));
+    controller.bar[0]=0xfebf0000;
+    VERIFY(HdaControllerMmio(controller)==0xfebf0000);
+    controller.bar[0]|=4;controller.bar[1]=0x42;
+    VERIFY(HdaControllerMmio(controller)==0x42febf0000);
+    for (uint32_t invalid : {0u, 0xffffffffu, 0xfebf0001u, 0xfebf0040u, 0xfebf0006u}) {
+        controller.bar[0]=invalid;
+        VERIFY(!HdaControllerMmio(controller));
+    }
     AudioDmaClock reserved{};
     VERIFY(reserved.Accept(16) && reserved.Start(0,100));
     VERIFY(reserved.Observe(4,200,201,false) && reserved.completed==4);
@@ -101,6 +196,56 @@ int RunHdaClockTests() {
     VERIFY(!reserved.ReserveGap(reserved.completed+AudioDmaClock::RingBytes));
     reserved.Fault();VERIFY(!reserved.ReserveGap(36));
     initialize();std::array<int16_t,AUDIO_BUF_SIZE/2> tone{};tone.fill(1234);
+    g_vmwareController=true;
+    VERIFY(HdaTrySubmit(tone.data(),START_QUEUE_BYTES).accepted==START_QUEUE_BYTES);
+    VERIFY(g_streamRunning);
+    for(unsigned i=0;i<25;++i) {
+        nowNs+=10000000;
+        HdaService();
+    }
+    auto stalled=progress();
+    VERIFY(stalled.discontinuity && !stalled.running && stalled.completed==0);
+    AudioHdaStatus status{};
+    VERIFY(HdaReadStatus(status) && status.stalls==1 && status.polls>=25 &&
+           status.completionPolls==0 && !status.running && status.native &&
+           status.rate==44100 && status.format==0x4011 && !(status.sdctl&SD_CTL_RUN));
+    initialize();
+    g_vmwareController=true;
+    VERIFY(HdaPlayPcm(tone.data(),AUDIO_BUF_SIZE,44100,2,16,false)==TARGET_QUEUE_BYTES);
+    VERIFY(!g_streamRunning && !g_streamConfigured && g_dmaStalls==1);
+    VERIFY(HdaPlayPcm(tone.data(),4,44100,2,16,false)==4);
+    initialize();
+    g_vmwareController=true;
+    VERIFY(HdaTrySubmit(tone.data(),2*FRAG_SIZE).accepted==2*FRAG_SIZE);
+    const auto firstEpoch=g_nativeClock.epoch;
+    moveVmwareDescriptor();
+    moveVmwareDescriptor();
+    VERIFY(HdaTestRead(g_outStreamBase+SD_LPIB,4)==FRAG_SIZE);
+    AudioHdaStatus beforePoll{};
+    VERIFY(HdaReadStatus(beforePoll) && (beforePoll.sdsts&SD_STS_BCIS));
+    VERIFY(HdaTestRead(g_outStreamBase+SD_STS,1)==SD_STS_BCIS);
+    VERIFY(progress().completed==FRAG_SIZE);
+    VERIFY(!(HdaTestRead(g_outStreamBase+SD_STS,1)&SD_STS_BCIS));
+    moveVmwareDescriptor();
+    const auto secondPeriod=progress();
+    VERIFY(secondPeriod.completed==2*FRAG_SIZE && secondPeriod.epoch==firstEpoch &&
+           !secondPeriod.discontinuity && g_dmaStalls==0);
+
+    initialize();
+    g_vmwareController=true;
+    VERIFY(HdaPlayPcm(tone.data(),3*FRAG_SIZE,44100,2,16,true)==3*FRAG_SIZE);
+    moveVmwareDescriptor();
+    store(g_outStreamBase+SD_STS,1,SD_STS_BCIS|SD_STS_FIFOE|SD_STS_DESE);
+    HdaService();
+    VERIFY(g_playedBytes==FRAG_SIZE);
+    VERIFY(HdaTestRead(g_outStreamBase+SD_STS,1)==(SD_STS_FIFOE|SD_STS_DESE));
+    moveVmwareDescriptor();
+    HdaService();
+    VERIFY(g_playedBytes==2*FRAG_SIZE && g_streamRunning);
+    store(g_outStreamBase+SD_STS,1,SD_STS_BCIS|SD_STS_FIFOE|SD_STS_DESE);
+    HdaStop();
+    VERIFY(HdaTestRead(g_outStreamBase+SD_STS,1)==(SD_STS_BCIS|SD_STS_FIFOE|SD_STS_DESE));
+    initialize();
     // Consecutive fresh rings must not charge the stale pre-RUN position as a
     // wrap. Verify both native and legacy accounting before any DMA movement.
     for(unsigned i=0;i<3;++i) {
@@ -1326,6 +1471,112 @@ static void nativeStagingFaults() {
     }
 }
 
+// Live Workstation trace (a85f840e, Chromium YouTube): the 1920-frame stock
+// OSS client keeps at most 1920 frames outstanding, the driver places every
+// receipt NATIVE_WRITE_LEAD (3072 frames) ahead of DMA, so 293 of 295 receipts
+// reserved silence and the client completed ~20k frames/s against a 44.1k
+// device. Model that with the real mixer and native driver: VMware LPIB moves
+// in whole 4096-byte descriptors, the mixer worker wakes late, and Chromium
+// refills every 10 ms. Count delivered client frames and played silence.
+struct VmPacing { double clientRate=0, silence=0; uint64_t reservations=0; bool fault=false; };
+enum class PacingClient { Stock, Downstream };
+static VmPacing vmPacingRun(bool vmware,bool allowance,PacingClient client,unsigned tickMs,unsigned stallMs) {
+    using namespace brook;
+    AudioMixerTestCommitQuantum(0);AudioMixerSharedPrefixEnable(false);
+    AudioMixerCoalesceEnable(false);AudioMixerHorizonEnable(false);
+    AudioMixerStagingEnable(false);AudioMixerStagingSetFrameLimit(1024);
+    AudioStop();initialize();g_vmwareController=vmware;AudioMixerRefresh();
+    if(allowance)HdaConfigureDownstreamAllowance();
+    VERIFY(AudioMixerStagingEnabled()==(allowance && vmware)); // QEMU stays unchanged
+    const auto id=AudioMixerOpen();VERIFY(id);
+    constexpr uint32_t Capacity=1920,Fragment=64,Period=441;
+    VERIFY(AudioMixerSetCapacity(id,Capacity,Fragment));
+    std::vector<int16_t> pcm(2*4096,1000);
+    AudioDeliveryTimingEnable(true);AudioDeliveryTimingReset();
+    constexpr unsigned PrimeMs=1000,RunMs=7000;
+    uint64_t creditMicroBytes=0,played=0,silent=0,completedAtPrime=0,reservationsAtPrime=0;
+    VmPacing result{};
+    for(unsigned ms=1;ms<=RunMs;++ms) {
+        nowNs+=1000000;
+        if(g_streamRunning) {
+            // 176.4 bytes per ms; VMware publishes LPIB one descriptor at a time.
+            creditMicroBytes+=176400;
+            uint32_t advance=uint32_t(creditMicroBytes/1000);
+            advance=vmware?advance/FRAG_SIZE*FRAG_SIZE:advance/4*4;
+            if(advance) {
+                creditMicroBytes-=uint64_t(advance)*1000;
+                const uint32_t pos=HdaTestRead(g_outStreamBase+SD_LPIB,4);
+                if(ms>PrimeMs)for(uint32_t f=0;f<advance;f+=4) {
+                    int16_t pair[2]{};memcpy(pair,dma.data()+(pos+f)%AUDIO_BUF_SIZE,4);
+                    ++played;if(!pair[0])++silent;
+                }
+                store(g_outStreamBase+SD_LPIB,4,(pos+advance)%AUDIO_BUF_SIZE);
+                if(vmware)store(g_outStreamBase+SD_STS,1,HdaTestRead(g_outStreamBase+SD_STS,1)|SD_STS_BCIS);
+            }
+        } else creditMicroBytes=0;
+        if(ms==PrimeMs) {
+            AudioMixerRefresh();AudioStreamProgress p{};VERIFY(AudioMixerGetProgress(id,&p));
+            completedAtPrime=p.completedFrames;reservationsAtPrime=AudioDeliveryTimingRead().reservations;
+        }
+        // Optional lazy-timer episode: the worker misses stallMs once a second
+        // (Workstation trace: max_sleep 105.8 ms for a nominal 10 ms period).
+        const bool stalled=stallMs && ms%1000<stallMs;
+        if(ms%tickMs==0 && !stalled)AudioMixerTick();
+        if(ms%10==0) {
+            AudioMixerRefresh();
+            AudioStreamProgress p{};VERIFY(AudioMixerGetProgress(id,&p));
+            if(p.discontinuity){result.fault=true;break;}
+            // Stock plugin: outstanding source (software + in flight) is bounded
+            // by its own ring. Downstream plugin: BROOK_DSP_GETQUEUE available.
+            uint32_t space=client==PacingClient::Stock?
+                (p.queuedFrames<Capacity?Capacity-p.queuedFrames:0):p.availableFrames;
+            space-=space%Period;
+            if(space)VERIFY(AudioMixerSubmit(pcm.data(),space,id)==space);
+        }
+    }
+    AudioMixerRefresh();AudioStreamProgress p{};VERIFY(AudioMixerGetProgress(id,&p));
+    result.fault=result.fault||p.discontinuity||g_nativeClock.discontinuity;
+    result.clientRate=double(p.completedFrames-completedAtPrime)*1000.0/(RunMs-PrimeMs);
+    result.silence=played?double(silent)/double(played):1.0;
+    result.reservations=AudioDeliveryTimingRead().reservations-reservationsAtPrime;
+    AudioDeliveryTimingEnable(false);
+    VERIFY(AudioMixerClose(id));AudioMixerStagingEnable(false);AudioStop();
+    return result;
+}
+static void vmwareSmallClientPacing() {
+    struct Case { const char* name; bool vmware, allowance; PacingClient client; unsigned tickMs, stallMs; };
+    const Case cases[]={
+        {"vmware stock (before)",true,false,PacingClient::Stock,11,0},
+        {"vmware allowance+stock",true,true,PacingClient::Stock,11,0},
+        {"vmware allowance+downstream",true,true,PacingClient::Downstream,11,0},
+        {"vmware allowance+downstream 20ms",true,true,PacingClient::Downstream,20,0},
+        {"vmware allowance+downstream 50ms stall",true,true,PacingClient::Downstream,11,50},
+        {"vmware allowance+downstream 100ms stall",true,true,PacingClient::Downstream,11,100},
+        {"qemu stock (unchanged)",false,true,PacingClient::Stock,10,0},
+    };
+    VmPacing r[sizeof(cases)/sizeof(cases[0])];
+    for(unsigned i=0;i<sizeof(cases)/sizeof(cases[0]);++i) {
+        const auto& c=cases[i];r[i]=vmPacingRun(c.vmware,c.allowance,c.client,c.tickMs,c.stallMs);
+        std::printf("VM_PACING %-34s client=%.0f frames/s silence=%.1f%% reservations=%lu fault=%d\n",
+            c.name,r[i].clientRate,r[i].silence*100,(unsigned long)r[i].reservations,int(r[i].fault));
+        VERIFY(!r[i].fault);
+    }
+    // Reproduces the live shortfall: ~0.45x real time, most output silence.
+    VERIFY(r[0].clientRate<0.5*44100 && r[0].silence>0.4 && r[0].reservations);
+    // Kernel allowance alone cannot help a client that charges physical delay.
+    VERIFY(r[1].clientRate<0.5*44100);
+    // Allowance + downstream-aware client keeps real time with no silence.
+    for(unsigned i:{2u,3u})VERIFY(r[i].clientRate>0.99*44100 && r[i].silence<0.005 && !r[i].reservations);
+    // A late worker (one 50-ms miss per second, far above the trace's 1.1-ms
+    // mean lateness) costs only a brief refill gap.
+    VERIFY(r[4].clientRate>0.98*44100 && r[4].silence<0.02);
+    // The driver allowance is VMware-only; QEMU keeps its previous behaviour.
+    VERIFY(r[6].clientRate<0.5*44100);
+    // A 100-ms worker stall every second exceeds the 1920+4096-frame budget
+    // (~136 ms) less the 12-KiB lead; it degrades but stays near real time.
+    VERIFY(r[5].clientRate>0.9*44100);
+}
+
 int RunMixerClockTests() {
     using namespace brook;
     mixerClockEnabled=true;AudioStop();initialize();AudioMixerRefresh();
@@ -1453,6 +1704,6 @@ int RunMixerClockTests() {
     burstDmaRefillExperiment();
     steadyCommitExperiment();
     coalesceTests(a,b);
-    VERIFY(AudioMixerClose(a));nativeStagingContracts();nativeStagingFaults();nativeStagingFullBuffer();nativeSmallStagingPartialCopy();mixerClockEnabled=false;AudioStop();
+    VERIFY(AudioMixerClose(a));nativeStagingContracts();nativeStagingFaults();nativeStagingFullBuffer();nativeSmallStagingPartialCopy();vmwareSmallClientPacing();mixerClockEnabled=false;AudioStop();
     std::printf("MIXER_CLOCK %s\n",failures?"FAIL":"PASS");return failures;
 }

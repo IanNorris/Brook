@@ -5,6 +5,7 @@
 namespace {brook::AcpiResetInfo firmware;std::string mode;}
 namespace brook {
 const AcpiResetInfo& AcpiGetResetInfo(){return firmware;}
+AcpiS5Info AcpiGetS5Info(){return {};}
 uint32_t FwCfgReadFile(const char*,void* out,uint32_t capacity){unsigned n=mode.size()<capacity?mode.size():capacity;std::memcpy(out,mode.data(),n);return n;}
 extern "C" void SerialPrintf(const char*,...){}
 }
@@ -15,8 +16,55 @@ struct Trace {
     static bool efi(void* p,uint64_t entry){auto& t=*static_cast<Trace*>(p);++t.count;t.width=64;t.value=entry;return t.accept;}
     brook::PowerIo io(){return {this,byte,word};}
 };
+struct SleepTrace {
+    struct Write {uint16_t port,value;};
+    Write writes[4]{};
+    unsigned count=0;
+    uint16_t oldA=0x0803,oldB=0x0010;
+    bool reads=true;
+    static bool read(void* context,uint16_t port,uint16_t& value) {
+        const auto& t=*static_cast<SleepTrace*>(context);
+        value=port==0x404?t.oldA:t.oldB;
+        return t.reads;
+    }
+    static bool write(void* context,uint16_t port,uint16_t value) {
+        auto& t=*static_cast<SleepTrace*>(context);
+        assert(t.count<4);t.writes[t.count++]={port,value};return true;
+    }
+    brook::PowerIo io(){return {this,nullptr,write,nullptr,read};}
+};
+
+void TestedSleep()
+{
+    using namespace brook;
+    PlatformPowerPlan plan{};
+    plan.acpiS5={{0x404,0x504},5,2,"fixture"};
+    SleepTrace trace;
+    assert(plan.CanPowerOff() && !strcmp(plan.PowerOffMethod(),"acpi-s5"));
+    assert(plan.Issue(false,trace.io()) && trace.count==4);
+    assert(trace.writes[0].port==0x404 && trace.writes[0].value==0x1403);
+    assert(trace.writes[1].port==0x504 && trace.writes[1].value==0x0810);
+    assert(trace.writes[2].port==0x404 && trace.writes[2].value==0x3403);
+    assert(trace.writes[3].port==0x504 && trace.writes[3].value==0x2810);
+    trace={};trace.oldB=0xffff;
+    assert(!plan.Issue(false,trace.io()) && !trace.count);
+    trace={};trace.oldA=0;
+    assert(!plan.Issue(false,trace.io()) && !trace.count);
+    trace={};trace.reads=false;
+    assert(!plan.Issue(false,trace.io()) && !trace.count);
+    trace={};plan.acpiS5.controls.pm1b=0;
+    assert(plan.Issue(false,trace.io()) && trace.count==2 && trace.writes[1].value==0x3403);
+    trace={};plan.acpiS5.typeA=8;
+    assert(!plan.Issue(false,trace.io()) && !trace.count);
+    plan.acpiS5.typeA=5;plan.efiEntry=0x9876;
+    Trace efi;
+    assert(plan.Issue(false,{&efi,Trace::byte,Trace::word,Trace::efi}) &&
+           efi.count==1 && efi.width==64 && efi.value==0x9876);
+}
+
 int main(){
     using namespace brook;Trace trace;
+    TestedSleep();
     PlatformPowerConfigure();auto plan=PlatformPowerGetPlan();assert(!plan.CanReset() && !plan.CanPowerOff());
     assert(!plan.Issue(true,trace.io()) && !plan.Issue(false,trace.io()) && !trace.count);
     firmware={true,0xb2,0xa5,"fixture advertised register"};PlatformPowerConfigure();plan=PlatformPowerGetPlan();

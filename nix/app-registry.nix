@@ -23,12 +23,12 @@ let
   };
   legacy = name: reason: { inherit name reason; availability = "legacy"; targets = [ ]; };
   entries = {
-    calculator = import ./apps/calculator.nix { inherit pkgs; };
     chromium = import ./apps/chromium.nix { inherit pkgs downstreamStaging; };
     files = import ./apps/files.nix { inherit pkgs; };
     firefox = import ./apps/firefox.nix { inherit pkgs downstreamStaging; };
     gallery = import ./apps/gallery.nix { inherit pkgs; };
     mousepad = import ./apps/mousepad.nix { inherit pkgs; };
+    qalculate = import ./apps/qalculate.nix { inherit pkgs; };
     quake2 = legacy "Quake II" "Launcher only; the engine and OpenAL come from a separately staged closure.";
     steam = legacy "Steam" "Launcher uses the existing installation in the user's home.";
     vscodium = legacy "VSCodium" "Launcher only; the application comes from a separately staged closure.";

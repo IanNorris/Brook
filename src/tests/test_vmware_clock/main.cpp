@@ -50,4 +50,9 @@ int main(){
     assert(!brook::VmwareTscElapsedMs(0,0,100,1,nullptr));
     assert(brook::VmwareTscElapsedMs(0,~uint64_t(0)-1,1,1,&out)&&out==~uint64_t(0));
     assert(!brook::VmwareTscElapsedMs(0,~uint64_t(0)-1,2,1,&out)&&out==~uint64_t(0));
+    assert(brook::VmwareTscElapsedNs(100,7,100+1452000,2904000,&out) && out==7500000);
+    assert(brook::VmwareTscElapsedNs(100,7,100+2904000,2904000,&out) && out==8000000);
+    assert(!brook::VmwareTscElapsedNs(100,7,99,2904000,&out) && out==8000000);
+    assert(!brook::VmwareTscElapsedNs(100,7,101,0,&out));
+    assert(!brook::VmwareTscElapsedNs(0,~uint64_t(0)/1000000+1,1,1,&out));
 }

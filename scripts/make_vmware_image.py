@@ -4,10 +4,13 @@
 No devices are opened and no VM is started. Run inside the pinned Nix shell.
 The operator policy contains public Ed25519 keys. The checker source supplies
 only the two static executables already pinned by Brook's recovery kernel.
+Fresh images use the selected-app composer so the launcher reflects the
+installed profile.
 """
 
 import argparse
 import gzip
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -26,7 +29,6 @@ from hardware_recovery_fsck import validate_checker
 from make_public_qemu import copy_extents
 from prepare_guard_check_pair import CHECKER_SHA, E2FSCK_SHA
 from prepare_hardware_store import digest
-from stage_clearwater_shell import add_clearwater_start, embed_clearwater_executables, embed_terminal_shortcut
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
@@ -39,7 +41,11 @@ ESP_SECTORS = 512 * MIB // SECTOR
 DATA_FIRST = ESP_FIRST + ESP_SECTORS
 ESP_TYPE = 'c12a7328-f81f-11d2-ba4b-00a0c93ec93b'
 DATA_TYPE = '0fc63daf-8483-4772-8e79-3d69d8477de4'
-PROFILE_EXPR = ROOT / 'nix/hardware-network-packages.nix'
+# Firefox is left out of the default image for size; select it explicitly.
+DEFAULT_APPS = ("chromium", "files", "gallery", "mousepad", "qalculate")
+DEFAULT_CPUS = 4
+DEFAULT_MEMORY_MIB = 8192
+MAX_CPUS = 32
 KERNEL_FLAGS = (
     'BROOK_SSD_GUARD_CHECK', 'BROOK_SSD_AUTO_RECOVERY', 'BROOK_SSD_GUARDED_DESKTOP',
     'BROOK_SSD_GUARDED_DESKTOP_RESET', 'BROOK_VM_PERSISTENT_AHCI', 'BROOK_BRIDGE_V3',
@@ -52,6 +58,30 @@ run --service --once --console --uid 1000 /nix/profile/bin/hardware-message
 run --service --once --console /nix/profile/bin/waylandd
 run --service --once --console /boot/HWSTATUS.ELF
 '''
+# The Dell desktop's default wallpaper (prepare_hardware_desktop.py): the
+# kernel reads /boot/WALLPAPER.RAW, an <II width,height> header and BGRA
+# pixels, and fits it to the display once at boot.
+WALLPAPER_SOURCE = ROOT / 'data/wallpaper/brook-dawn.png'
+WALLPAPER_SIZE = (1920, 1080)
+
+
+def wallpaper_raw(source=WALLPAPER_SOURCE, size=WALLPAPER_SIZE):
+    from PIL import Image, ImageOps
+    with Image.open(source) as image:
+        fitted = ImageOps.fit(image.convert('RGB'), size)
+    return struct.pack('<II', *size) + fitted.convert('RGBA').tobytes('raw', 'BGRA')
+
+
+def check_wallpaper(data):
+    """Mirror the kernel loader's admission (shell.cpp WallpaperLoaderThread)."""
+    if len(data) <= 8:
+        raise ValueError('wallpaper is empty')
+    width, height = struct.unpack_from('<II', data)
+    if not (0 < width <= 3840 and 0 < height <= 2160) or len(data) != 8 + width * height * 4:
+        raise ValueError(f'wallpaper header {width}x{height} does not match {len(data)} bytes')
+    return width, height
+
+
 RECOVERY_RC = b'set wm\nset vfb none\nkconsole\nrun --service --once --console /boot/HWSTATUS.ELF\n'
 
 
@@ -130,11 +160,14 @@ def build_kernel(work, policy):
     return build
 
 
-def make_initrds(work, build, payload, policy, profile, commit, name):
+def make_initrds(work, build, payload, policy, profile, commit, name, autofit):
+    from stage_clearwater_shell import add_clearwater_start, embed_clearwater_executables, embed_terminal_shortcut
+
     tree = work / 'initrd'
     modules = tree / 'kernel/drivers'
     modules.mkdir(parents=True)
-    shutil.copy2(build / 'drivers/e1000.mod', modules / 'e1000.mod')
+    for module in ('e1000.mod', 'vmware_svga.mod', 'intel_hda.mod'):
+        shutil.copy2(build / 'drivers' / module, modules / module)
     env = dict(os.environ, BROOK_BUILD_DIR=str(tree), BROOK_INITRD_KIB='16384')
     for key in ('BROOK_PROVIDER_PAYLOAD', 'BROOK_INITRD_MARKERS', 'BROOK_HARDWARE_PAYLOAD_ID'):
         env.pop(key, None)
@@ -161,9 +194,14 @@ def make_initrds(work, build, payload, policy, profile, commit, name):
     # The guard binds persistent home under the desktop's initial RAM /data.
     fat_write(desktop, 'ETC/volatile-desktop', b'1\n')
     fat_write(desktop, 'ETC/hardware-bulk', b'1\n')
+    if autofit:
+        fat_write(desktop, 'ETC/vmware-autofit', b'1\n')
     fat_write(desktop, 'BOOT/INIT.RC', add_clearwater_start(DESKTOP_RC))
     fat_write(recovery, 'BOOT/INIT.RC', RECOVERY_RC)
     fat_write(desktop, 'BOOT/BIN/BASH', (profile / 'bin/bash').read_bytes())
+    wallpaper = wallpaper_raw()
+    check_wallpaper(wallpaper)
+    fat_write(desktop, 'BOOT/WALLPAPER.RAW', wallpaper)
     for image, suffix in ((desktop, ''), (recovery, '-recovery')):
         fat_write(image, 'ETC/hardware-payload-id', (name + suffix + '\n').encode())
         require_keyless_image(image)
@@ -230,38 +268,71 @@ def assemble_disk(work, data_image, efi, kernel, desktop, recovery, disk_id, esp
     return raw
 
 
-def vmx(network):
+def cores_per_socket(cpus):
+    """One socket up to eight vCPUs, then the largest even split."""
+    if cpus <= 8:
+        return cpus
+    return next(cores for cores in range(8, 0, -1) if cpus % cores == 0)
+
+
+def vmx(network, cpus=DEFAULT_CPUS, memory_mib=DEFAULT_MEMORY_MIB):
     lines = ['.encoding = "UTF-8"', 'config.version = "8"', 'virtualHW.version = "20"',
              'displayName = "Brook"', 'guestOS = "other-64"', 'firmware = "efi"',
-             'uefi.secureBoot.enabled = "FALSE"', 'memsize = "4096"', 'numvcpus = "2"',
-             'mks.enable3d = "FALSE"', 'devices.hotplug = "FALSE"', 'pciBridge0.present = "TRUE"']
+             'uefi.secureBoot.enabled = "FALSE"', f'memsize = "{memory_mib}"', f'numvcpus = "{cpus}"',
+             f'cpuid.coresPerSocket = "{cores_per_socket(cpus)}"',
+             'mks.enable3d = "FALSE"', 'devices.hotplug = "FALSE"', 'floppy0.present = "FALSE"',
+             'pciBridge0.present = "TRUE"']
     for port in range(4, 8):
         lines += [f'pciBridge{port}.present = "TRUE"', f'pciBridge{port}.virtualDev = "pcieRootPort"',
                   f'pciBridge{port}.functions = "8"']
     lines += ['sata0.present = "TRUE"', 'sata0:0.present = "TRUE"', 'sata0:0.fileName = "brook.vmdk"',
               'ethernet0.present = "TRUE"', 'ethernet0.virtualDev = "e1000e"',
               f'ethernet0.connectionType = "{network}"', 'ethernet0.startConnected = "TRUE"',
-              'ethernet0.addressType = "generated"', 'sound.present = "FALSE"',
+              'ethernet0.addressType = "generated"', 'sound.present = "TRUE"',
+              'sound.virtualDev = "hdaudio"', 'sound.startConnected = "TRUE"',
+              'sound.autoDetect = "TRUE"', 'sound.fileName = "-1"',
               'serial0.present = "TRUE"', 'serial0.fileType = "file"', 'serial0.fileName = "serial.log"',
               'serial0.startConnected = "TRUE"']
     return '\n'.join(lines) + '\n'
 
 
-def main():
+def argument_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--operator-policy', type=Path, required=True)
     parser.add_argument('--recovery-checkers-from', type=Path, required=True,
                         help='Standalone recovery initrd containing the pinned static FAT and ext2 checkers')
-    parser.add_argument('--network', choices=('hostonly', 'nat'), default='hostonly')
+    parser.add_argument('--network', choices=('hostonly', 'nat'), default='nat',
+                        help='VMware network mode (default: %(default)s)')
     parser.add_argument('--data-mib', type=int,
-                        help='store capacity in MiB (default: 6144 for the compatibility profile)')
+                        help='store capacity in MiB (default: size it from the selected profile)')
+    parser.add_argument('--free-mib', type=int, default=4096,
+                        help='free space to leave on the store for installs when auto-sizing (default: %(default)s)')
     parser.add_argument('--selection-config', type=Path,
                         help='host-side app selection JSON from brook_image.py')
+    parser.add_argument('--autofit', action='store_true',
+                        help='enable VMware Workstation host resize hints for the desktop boot')
     parser.add_argument('--payload-id', default='vmware-persistent')
+    parser.add_argument('--cpus', type=int, default=DEFAULT_CPUS,
+                        help='VMware vCPU count (default: %(default)s)')
+    parser.add_argument('--memory-mib', type=int, default=DEFAULT_MEMORY_MIB,
+                        help='VMware guest memory in MiB (default: %(default)s)')
+    return parser
+
+
+def check_resources(parser, args):
+    if not 1 <= args.cpus <= MAX_CPUS:
+        parser.error(f'cpus must be between 1 and {MAX_CPUS}')
+    if not 1024 <= args.memory_mib <= 65536 or args.memory_mib % 4:
+        parser.error('memory-mib must be a multiple of 4 between 1024 and 65536')
+
+
+def main():
+    parser = argument_parser()
     args = parser.parse_args()
     if args.data_mib is not None and not 1024 <= args.data_mib <= 32768:
         parser.error('data-mib must be between 1024 and 32768')
+    check_resources(parser, args)
     if not re.fullmatch(r'[A-Za-z0-9._-]{1,50}', args.payload_id):
         parser.error('Invalid payload ID')
     if 'MUSL_CC' not in os.environ:
@@ -272,13 +343,15 @@ def main():
     policy = args.operator_policy.read_bytes()
     validate_operator_policy(policy)
     checkers = args.recovery_checkers_from.resolve(strict=True)
-    selection = None
+    from image_profile import closure_receipt, data_size_mib, evaluate, realize
+    from kernel_capabilities import read_kernel_capabilities, require_kernel_capabilities
+
+    config = {"target": "vmware", "apps": list(DEFAULT_APPS), "extraPackageNames": ["vim"]}
     if args.selection_config:
-        from image_profile import evaluate
         config = json.loads(args.selection_config.read_text())
         if config.get("target") != "vmware":
             parser.error("Selection target does not match VMware")
-        selection = evaluate(config)
+    selection = evaluate(config)
     dest = args.output.resolve()
     dest.mkdir(parents=True, exist_ok=False, mode=0o700)
     work = dest / 'assembly'
@@ -286,29 +359,20 @@ def main():
     policy_path = work / 'operators.pub'
     policy_path.write_bytes(policy)
 
-    profile_receipt = None
-    build = None
-    seed_args = []
-    if selection is None:
-        profile = Path(output('nix-build', '--no-out-link', PROFILE_EXPR, '-A', 'profile'))
-        data_mib = args.data_mib or 6144
-    else:
-        from image_profile import closure_receipt, data_size_mib, realize
-        from kernel_capabilities import read_kernel_capabilities, require_kernel_capabilities
-        build = build_kernel(work, policy_path)
-        kernel_capabilities = read_kernel_capabilities(build / 'BROOK.elf')
-        require_kernel_capabilities(kernel_capabilities, selection['manifest']['requiredCapabilities'])
-        profile = realize(config, selection)
-        closure = closure_receipt(profile)
-        data_mib = data_size_mib(closure['nar_bytes'], args.data_mib, 1024, 32768)
-        selection_path = dest / 'profile-selection.json'
-        selection_path.write_text(json.dumps(selection, indent=2, sort_keys=True) + '\n')
-        seed_args = ['--profile-selection', selection_path]
-        if args.data_mib is None:
-            seed_args += ['--auto-size']
-        profile_receipt = {'profile': str(profile), 'closure': closure,
-                           'kernel': kernel_capabilities,
-                           'redistributable': selection['manifest']['redistributable']}
+    build = build_kernel(work, policy_path)
+    kernel_capabilities = read_kernel_capabilities(build / 'BROOK.elf')
+    require_kernel_capabilities(kernel_capabilities, selection['manifest']['requiredCapabilities'])
+    profile = realize(config, selection)
+    closure = closure_receipt(profile)
+    data_mib = data_size_mib(closure['nar_bytes'], args.data_mib, 1024, 32768, args.free_mib)
+    selection_path = dest / 'profile-selection.json'
+    selection_path.write_text(json.dumps(selection, indent=2, sort_keys=True) + '\n')
+    seed_args = ['--profile-selection', selection_path]
+    if args.data_mib is None:
+        seed_args += ['--auto-size']
+    profile_receipt = {'profile': str(profile), 'closure': closure,
+                       'kernel': kernel_capabilities,
+                       'redistributable': selection['manifest']['redistributable']}
     run(sys.executable, ROOT / 'scripts/prepare_hardware_store.py', '--profile', profile,
         '--direct-ahci', '--size-mib', data_mib, '--output', work / 'profile', *seed_args)
     data = work / 'profile/STORE.IMG'
@@ -327,10 +391,8 @@ def main():
     records = {'ETC/ahci-observe': b'1\n', 'ETC/ahci-read-only': b'1\n',
                'ETC/ahci-vm-write-target': f'BRKAHCIVM1\n{total}\n'.encode(),
                'ETC/ahci-boot-volume': esp_selector.encode(), 'ETC/ahci-data-volume': data_selector.encode()}
-    if build is None:
-        build = build_kernel(work, policy_path)
     payload = {**get_checkers(checkers, work), **boot_helpers(build, work, policy_path), **records}
-    desktop, recovery = make_initrds(work, build, payload, policy_path, profile, commit, args.payload_id)
+    desktop, recovery = make_initrds(work, build, payload, policy_path, profile, commit, args.payload_id, args.autofit)
     run(sys.executable, ROOT / 'scripts/build_dell_loader.py', '--shared', work,
         '--output', work / 'loader')
     efi, kernel = work / 'loader/BROOKGUARD.efi', build / 'BROOK.elf'
@@ -341,17 +403,20 @@ def main():
     run('qemu-img', 'compare', '-f', 'raw', '-F', 'vmdk', raw, vmdk)
     require_keyless_disk(vmdk)
 
-    (dest / 'Brook.vmx').write_text(vmx(args.network))
+    (dest / 'Brook.vmx').write_text(vmx(args.network, args.cpus, args.memory_mib))
     report = {'version': 1, 'commit': commit, 'profile': str(profile), 'payload_id': args.payload_id,
-              'network': args.network, 'disk_guid': str(disk_id), 'esp_guid': str(esp_id),
+              'network': args.network, 'autofit': args.autofit,
+              'cpus': args.cpus, 'memory_mib': args.memory_mib, 'disk_guid': str(disk_id), 'esp_guid': str(esp_id),
               'data_guid': str(data_id), 'ext2_uuid': str(fs_id), 'sectors': total,
               'esp_first': ESP_FIRST, 'esp_sectors': ESP_SECTORS, 'data_first': DATA_FIRST,
-              'data_sectors': data_count, 'vmdk_sha256': digest(vmdk),
+              'data_sectors': data_count, 'store_free_mib': None if args.data_mib is not None else args.free_mib,
+              'vmdk_sha256': digest(vmdk),
               'operator_policy_sha256': digest(policy_path), 'loader_sha256': digest(efi),
               'kernel_sha256': digest(kernel), 'desktop_initrd_sha256': digest(desktop),
-              'recovery_initrd_sha256': digest(recovery)}
-    if profile_receipt is not None:
-        report['profile_selection'] = profile_receipt
+              'recovery_initrd_sha256': digest(recovery), 'profile_selection': profile_receipt,
+              'wallpaper': {'path': 'BOOT/WALLPAPER.RAW', 'source': str(WALLPAPER_SOURCE.relative_to(ROOT)),
+                            'source_sha256': digest(WALLPAPER_SOURCE),
+                            'sha256': hashlib.sha256(wallpaper_raw()).hexdigest()}}
     (dest / 'manifest.json').write_text(json.dumps(report, indent=2) + '\n')
     for path in (raw, data, work / 'esp.img'):
         path.unlink()

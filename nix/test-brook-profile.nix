@@ -36,8 +36,8 @@ let
   profile = overrides: import ./brook-profile.nix ({ inherit pkgs; target = "qemu"; } // overrides);
 in
 # A compatibility preset update needs a deliberate change to both pins.
-assert compat.drvPath == "/nix/store/4cqi0aizq33d4ph3irp4kviknncfbahp-brook-network-hardware-desktop.drv";
-assert compat.outPath == "/nix/store/bdsl440mbbbd8nkcxx1bb0j8kxa26n46-brook-network-hardware-desktop";
+assert compat.drvPath == "/nix/store/n8jq21kywd19zkdxqv099qrb33d9m7dw-brook-network-hardware-desktop.drv";
+assert compat.outPath == "/nix/store/9lanc9ys0rw0wyac9gbbrgmlkab492vj-brook-network-hardware-desktop";
 assert normalizedSelectedWrapper == wrapper false;
 assert (resolve {}).launcherIds == [ "example.Settings" "example.Demo" ];
 assert (resolve { kernelCapabilities.wayland-demo = 1; }).requiredCapabilities.wayland-demo == 1;
@@ -73,6 +73,10 @@ assert rejects ((profile { extraPackageNames = [ "htop" "htop" ]; }).manifest);
 assert rejects ((profile { apps = [ "chromium" ]; kernelCapabilities = { }; }).manifest);
 assert (profile { apps = [ "chromium" ]; kernelCapabilities.chromium-sandbox = 1; })
   .manifest.requiredCapabilities.chromium-sandbox == 1;
-assert (profile { apps = [ "calculator" ]; extraPackageNames = [ "htop" ]; })
-  .manifest.launcherIds == [ "brook-settings" "org.brook.TaskManager" "brook.calc" ];
+assert (profile { apps = [ "mousepad" ]; extraPackageNames = [ "htop" ]; })
+  .manifest.launcherIds == [ "brook-settings" "org.brook.TaskManager" "org.xfce.mousepad" ];
+assert (profile { target = "vmware"; apps = [ "mousepad" "qalculate" ]; })
+  .manifest.launcherIds == [ "brook-settings" "org.brook.TaskManager" "org.xfce.mousepad" "qalculate-gtk" ];
+assert !(builtins.elem "calculator" (lib.attrNames (import ./app-registry.nix { inherit pkgs; }).apps));
+assert (profile { target = "vmware"; apps = [ "qalculate" ]; }).manifest.redistributable;
 true

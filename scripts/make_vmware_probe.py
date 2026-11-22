@@ -19,6 +19,43 @@ ESP_START = 2048
 ESP_SECTORS = 131072
 
 
+PROBE_VMX = '''.encoding = "UTF-8"
+config.version = "8"
+virtualHW.version = "20"
+displayName = "Brook UEFI bring-up"
+guestOS = "other-64"
+firmware = "efi"
+uefi.secureBoot.enabled = "FALSE"
+memsize = "2048"
+numvcpus = "2"
+cpuid.coresPerSocket = "2"
+mks.enable3d = "FALSE"
+floppy0.present = "FALSE"
+pciBridge0.present = "TRUE"
+pciBridge4.present = "TRUE"
+pciBridge4.virtualDev = "pcieRootPort"
+pciBridge4.functions = "8"
+pciBridge5.present = "TRUE"
+pciBridge5.virtualDev = "pcieRootPort"
+pciBridge5.functions = "8"
+pciBridge6.present = "TRUE"
+pciBridge6.virtualDev = "pcieRootPort"
+pciBridge6.functions = "8"
+pciBridge7.present = "TRUE"
+pciBridge7.virtualDev = "pcieRootPort"
+pciBridge7.functions = "8"
+ide0:0.present = "TRUE"
+ide0:0.fileName = "brook.vmdk"
+ethernet0.present = "FALSE"
+sound.present = "FALSE"
+usb.present = "FALSE"
+serial0.present = "TRUE"
+serial0.fileType = "file"
+serial0.fileName = "serial.log"
+serial0.startConnected = "TRUE"
+'''
+
+
 def run(*args, **kwargs):
     return subprocess.run([str(a) for a in args], check=True, **kwargs)
 
@@ -89,40 +126,7 @@ def main():
     run('qemu-img', 'convert', '-f', 'raw', '-O', 'vmdk', '-o', 'subformat=monolithicSparse', disk, vmdk)
     run('qemu-img', 'compare', '-f', 'raw', '-F', 'vmdk', disk, vmdk)
     vmx = output/'Brook.vmx'
-    vmx.write_text('''.encoding = "UTF-8"
-config.version = "8"
-virtualHW.version = "20"
-displayName = "Brook UEFI bring-up"
-guestOS = "other-64"
-firmware = "efi"
-uefi.secureBoot.enabled = "FALSE"
-memsize = "2048"
-numvcpus = "2"
-cpuid.coresPerSocket = "2"
-mks.enable3d = "FALSE"
-pciBridge0.present = "TRUE"
-pciBridge4.present = "TRUE"
-pciBridge4.virtualDev = "pcieRootPort"
-pciBridge4.functions = "8"
-pciBridge5.present = "TRUE"
-pciBridge5.virtualDev = "pcieRootPort"
-pciBridge5.functions = "8"
-pciBridge6.present = "TRUE"
-pciBridge6.virtualDev = "pcieRootPort"
-pciBridge6.functions = "8"
-pciBridge7.present = "TRUE"
-pciBridge7.virtualDev = "pcieRootPort"
-pciBridge7.functions = "8"
-ide0:0.present = "TRUE"
-ide0:0.fileName = "brook.vmdk"
-ethernet0.present = "FALSE"
-sound.present = "FALSE"
-usb.present = "FALSE"
-serial0.present = "TRUE"
-serial0.fileType = "file"
-serial0.fileName = "serial.log"
-serial0.startConnected = "TRUE"
-''')
+    vmx.write_text(PROBE_VMX)
     report = dict(scope='UEFI + RAM-backed software desktop; this generated image requires runtime acceptance',
                   bootloader_sha256=sha(bootloader), kernel_sha256=sha(kernel),
                   initrd_sha256=sha(initrd), vmdk_sha256=sha(vmdk),

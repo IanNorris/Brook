@@ -56,6 +56,50 @@ struct DisplayOps {
 // Called by display driver modules during init.
 extern "C" void DisplayRegister(const DisplayOps* ops);
 
+// Serialize hardware changes that also replace the TTY/compositor backing.
+// A managed linear driver can take over the initial GOP and then keeps the
+// display until shutdown. It may retire backing once its readers have drained.
+extern "C" bool DisplayBeginFramebufferChange(bool managed, const DisplayOps* expected);
+extern "C" void DisplayEndFramebufferChange(const DisplayOps* claim);
+bool DisplayPublishManagedFramebuffer(uint64_t physical, volatile uint32_t* mmio,
+                                      uint32_t* backbuffer, uint32_t width,
+                                      uint32_t height, uint32_t stridePixels);
+class DisplayFramebufferChange {
+public:
+    explicit DisplayFramebufferChange(bool managed, const DisplayOps* expected = nullptr)
+        : admitted_(DisplayBeginFramebufferChange(managed, expected)) {}
+    ~DisplayFramebufferChange() { if (admitted_) DisplayEndFramebufferChange(claim_); }
+    explicit operator bool() const { return admitted_; }
+    void Claim(const DisplayOps* owner) { claim_ = owner; }
+    DisplayFramebufferChange(const DisplayFramebufferChange&) = delete;
+    DisplayFramebufferChange& operator=(const DisplayFramebufferChange&) = delete;
+
+private:
+    bool admitted_;
+    const DisplayOps* claim_ = nullptr;
+};
+
+struct CursorImage;
+
+// Optional cursor provider, kept separate from the DisplayOps module ABI.
+// Prepare returns whether the provider owns this frame's cursor. It may stage
+// a new image, but a newly visible cursor appears only after Commit.
+struct DisplayCursorOps {
+    const DisplayOps* display;
+    bool (*Prepare)(const CursorImage* image, int32_t x, int32_t y);
+    void (*Commit)();
+};
+extern "C" void DisplayRegisterCursor(const DisplayCursorOps* ops);
+bool DisplayPrepareCursor(const CursorImage* image, int32_t x, int32_t y);
+void DisplayCommitCursor();
+
+struct DisplayModePollOps {
+    const DisplayOps* display;
+    void (*Poll)();
+};
+extern "C" void DisplayRegisterModePoll(const DisplayModePollOps* ops);
+void DisplayPollModeHints();
+
 // Get the active display. Returns the GOP fallback if no driver registered.
 const DisplayOps* DisplayGetActive();
 bool DisplayUsesFirmwareFramebuffer();

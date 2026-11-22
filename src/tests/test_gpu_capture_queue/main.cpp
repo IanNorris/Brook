@@ -20,6 +20,10 @@ int mode=0,created=0,destroyed=0;
 uint64_t backdropStyle=2;unsigned readsUntilStyleChange=0;
 bool allocationFails=false;
 unsigned sourcePixel=0x00ff00,pixels[256]{};
+unsigned displayFlushes=0;
+bool ttySuppressed=false,screenIdleDisabled=false;
+constexpr uint8_t lettering[] = {255};
+constexpr brook::GlyphInfo letters[] = {{0, 0, 1, 1, 0, 1, 1}};
 brook::Process* caller;
 brook::WmContentSnapshot content{true,false,1,1,0,0};
 uint64_t latest=1;
@@ -38,6 +42,8 @@ void CheckOverlayAt(uint64_t now, int32_t mx, int32_t my) {
 }
 }
 namespace brook {
+const FontAtlas g_fontAtlas{lettering, 1, 1, letters, 1, 'I', 1, 0, 1};
+const FontAtlas g_desktopFont200{lettering, 1, 1, letters, 1, 'I', 1, 0, 1};
 uint64_t WmBackdropStyleVersion(){
     if(readsUntilStyleChange && --readsUntilStyleChange==0)backdropStyle+=2;
     return backdropStyle;
@@ -169,10 +175,16 @@ void SchedulerUnblock(Process* p) {
     if(expectedFlagsAtWake>=0)CHECK(g_debugFrameFlags==unsigned(expectedFlagsAtWake));
     ++wakeRequests;
 }
-void DisplayFlush(uint32_t first,uint32_t last) { CHECK(first<last); }
+void DisplayFlush(uint32_t first,uint32_t last) { CHECK(first<last); ++displayFlushes; }
+bool DisplayPrepareCursor(const CursorImage*, int32_t, int32_t) { return false; }
+void DisplayCommitCursor() {}
+void DisplayPollModeHints() {}
+void WmApplyDisplaySize(uint32_t, uint32_t) {}
 uint64_t DisplayGetFramebufferPhys(){return 0;}
 bool BootLogoActive(){return false;}
-bool TtyDisplaySuppressed(){return false;}
+bool TtyDisplaySuppressed(){return ttySuppressed;}
+void TtySuppressDisplay(bool suppress){ttySuppressed=suppress;}
+bool DisplayPowerSetIdle(uint32_t timeout){screenIdleDisabled=!timeout;return true;}
 const GpuCompositorOps* GpuCompositorGet() { return &ops; }
 WmContentSnapshot WmSnapshotContent(uint32_t slot) {
     std::lock_guard<std::mutex> guard(windowMutex);return slot==0?content:WmContentSnapshot{};
@@ -625,6 +637,33 @@ int main() {
           CompositorDebugFrameStatus(frame.token,77).source==BROOK_DEBUG_FRAME_SOURCE_FRONT && capturedPixels[0]==0xdeadbeef);
     CHECK(!g_debugFrameCleanAddress); // full-image copy: next overlay capture clears fully
     CHECK(CompositorReleaseDebugFrame(frame.token,77));g_debugFramePages=0;g_debugFrameBuffer=VirtualAddress{};g_backBuffer=nullptr;
+    // The manual power-off frame must reach scanout even with no renderer
+    // and must never draw over a still-active writer or present lease.
+    g_physFb=framebuffer;g_physFbWidth=8;g_physFbHeight=6;g_physFbStride=8;
+    g_backBuffer=software;g_backBufStride=8;
+    const auto flushes=displayFlushes;
+    g_gopWriter=1;
+    CHECK(!CompositorDrawManualPowerOff() && displayFlushes==flushes && framebuffer[0]==0xdeadbeef);
+    g_gopWriter=0;
+    CHECK(g_presentLease.Acquire(42,ApicTickCount(),COMPOSITOR_PRESENT_LEASE_MS));
+    CHECK(!CompositorDrawManualPowerOff() && displayFlushes==flushes && framebuffer[0]==0xdeadbeef);
+    g_presentLease.Clear();
+    CHECK(CompositorDrawManualPowerOff() && displayFlushes==flushes+1 && ttySuppressed && screenIdleDisabled);
+    for (unsigned i=0;i<48;++i) CHECK(framebuffer[i]==(i==19 ? 0xffffffu : 0u));
+    g_backBuffer=nullptr;
+    framebuffer[0]=0xdeadbeef;
+    CHECK(CompositorDrawManualPowerOff() && displayFlushes==flushes+2 && framebuffer[0]==0 && framebuffer[19]==0xffffff);
+    g_gpuComposite=g_gpuDrawReady=true;
+    g_debugFrameBuffer=VirtualAddress(reinterpret_cast<uint64_t>(capturedPixels));g_debugFramePages=1;
+    frame=CompositorRequestDebugFrame(77);
+    CaptureCompletedDebugFrame(52,{g_physFb,8,6,8},true);
+    captured=CompositorDebugFrameStatus(frame.token,77);
+    CHECK(captured.state==DebugFrameState::Ready && captured.source==BROOK_DEBUG_FRAME_SOURCE_FRONT &&
+          capturedPixels[0]==0 && capturedPixels[19]==0xffffff);
+    CHECK(CompositorReleaseDebugFrame(frame.token,77));
+    g_debugFramePages=0;g_debugFrameBuffer=VirtualAddress{};
+    g_gpuComposite=g_gpuDrawReady=false;
+    ttySuppressed=false;
     g_compositorProcess=nullptr;const auto finalWakes=wakeRequests.load();CompositorWake();CHECK(wakeRequests==finalWakes);
     std::free(compositor);
     {

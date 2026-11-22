@@ -40,13 +40,22 @@ class Rpc:
   try:self.owner.wait(timeout=10)
   except subprocess.TimeoutExpired:self.owner.terminate();self.owner.wait(timeout=10)
   self.log.close();self.select.close()
+def write_duplicate_s5(path):
+ # A second literal root _S5 makes the firmware shutdown data ambiguous
+ # while leaving the rest of ACPI available for boot and restart.
+ aml = bytes.fromhex('085c5f53355f1204020000')
+ header = bytearray.fromhex('5353445400000000020042524f4f4b205335514120202020010000004251412001000000')
+ header[4:8] = (len(header) + len(aml)).to_bytes(4, 'little')
+ header[9] = -(sum(header) + sum(aml)) % 256
+ path.write_bytes(header + aml)
+
 def main():
  ap=argparse.ArgumentParser(description=__doc__)
  ap.add_argument('--probe',type=Path,required=True)
  ap.add_argument('--output',type=Path,required=True)
  args=ap.parse_args();output=args.output.resolve();output.mkdir(parents=True,exist_ok=False)
  results=[]
- for operation in ['shutdown','restart','q35-stop']:
+ for operation in ['shutdown','restart','acpi-s5','q35-stop']:
   base=output/operation;base.mkdir();disk=base/'probe.raw'
   subprocess.run(['cp','--reflink=auto',str(args.probe.resolve()/'probe.raw'),str(disk)],check=True)
   media=str(disk)+'@@1048576'
@@ -61,7 +70,10 @@ def main():
    '-netdev',f'user,id=network,restrict=on,hostfwd=tcp:127.0.0.1:{port}-:1234','-display','none','-serial','file:'+str(base/'serial.log'),
    '-qmp','unix:'+str(base/'qmp.sock')+',server=on,wait=off','-no-reboot']
   if operation=='q35-stop':argv.extend(['-fw_cfg','name=opt/brook/power,string=q35-stop'])
-  # Other cases omit opt/brook/power: reset must come from validated FADT.
+  if operation=='shutdown':
+   duplicate=base/'duplicate-s5.aml';write_duplicate_s5(duplicate)
+   argv.extend(['-acpitable','file='+str(duplicate)])
+  # Native restart and S5 omit opt/brook/power.
   (base/'argv.json').write_text(json.dumps(argv,indent=2)+'\n')
   log=(base/'qemu.log').open('x');owner=subprocess.Popen(argv,stdout=log,stderr=subprocess.STDOUT);q=None;rpc=None
   try:
@@ -79,7 +91,10 @@ def main():
    doctor=rpc.tool('hw_doctor',{'session':session});caps=doctor['capabilities']['power']
    if operation=='q35-stop':
     assert caps['graceful_quiescence'] and not caps['reset'] and caps['power_off'] and caps['reset_method']=='disabled',doctor
-   else:assert caps['graceful_quiescence'] and caps['reset'] and not caps['power_off'] and caps['reset_method']=='acpi-io8',doctor
+   else:
+    assert caps['graceful_quiescence'] and caps['reset'] and caps['reset_method']=='acpi-io8',doctor
+    assert caps['power_off']==(operation!='shutdown'),doctor
+    assert caps['power_off_method']==('manual' if operation=='shutdown' else 'acpi-s5'),doctor
    (base/'doctor.json').write_text(json.dumps(doctor,indent=2)+'\n')
    if operation=='shutdown':
     catalog=rpc.tool('hw_apps',{'session':session})
@@ -95,7 +110,7 @@ def main():
    request=uuid.uuid4().hex;power_args=dict(session=session,request_id=request)
    if operation=='q35-stop':
     refused=rpc.tool('hw_power',{**power_args,'operation':'restart'});assert refused['state']=='unsupported' and refused['error']==-95,refused
-   started=rpc.tool('hw_power',{**power_args,'operation':'shutdown' if operation=='q35-stop' else operation});assert started['state']=='closing',started
+   started=rpc.tool('hw_power',{**power_args,'operation':'restart' if operation=='restart' else 'shutdown'});assert started['state']=='closing',started
    # Same ID is a status observation from here, never replay the mutation.
    states=[];deadline=time.monotonic()+90
    while time.monotonic()<deadline:
@@ -118,7 +133,7 @@ def main():
     events=q.events();(base/'qmp-events.json').write_text(json.dumps(events,indent=2)+'\n')
     expected='guest-reset' if operation=='restart' else 'guest-shutdown'
     assert any(row.get('event')=='SHUTDOWN' and row.get('data',{}).get('reason')==expected for row in events),events
-    result=dict(operation=operation,passed=True,firmware_reset=operation=='restart',q35_power_opt_in=operation=='q35-stop')
+    result=dict(operation=operation,passed=True,firmware_reset=operation=='restart',q35_power_opt_in=operation=='q35-stop',native_acpi_s5=operation=='acpi-s5')
    results.append(result);print('HARDWARE_POWER_CASE_PASS',operation,flush=True)
   finally:
    if rpc:rpc.close()

@@ -39,4 +39,17 @@ inline bool VmwareTscElapsedMs(uint64_t originTsc,uint64_t originMs,
     *output=originMs+elapsed;
     return true;
 }
+
+// The same anchored epoch as VMware's elapsed tick clock, with sub-ms precision.
+inline bool VmwareTscElapsedNs(uint64_t originTsc,uint64_t originMs,
+                               uint64_t nowTsc,uint32_t khz,uint64_t* output)
+{
+    constexpr uint64_t nsPerMs=1000000;
+    uint64_t ms=0;
+    if (!output || !VmwareTscElapsedMs(originTsc,originMs,nowTsc,khz,&ms)) return false;
+    const uint64_t fraction=((nowTsc-originTsc)%khz)*nsPerMs/khz;
+    if (ms>(~uint64_t(0)-fraction)/nsPerMs) return false;
+    *output=ms*nsPerMs+fraction;
+    return true;
+}
 }

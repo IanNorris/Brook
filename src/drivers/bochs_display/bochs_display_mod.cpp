@@ -18,6 +18,8 @@
 MODULE_IMPORT_SYMBOL(PciFindDevice);
 MODULE_IMPORT_SYMBOL(PciEnableMemSpace);
 MODULE_IMPORT_SYMBOL(DisplayRegister);
+MODULE_IMPORT_SYMBOL(DisplayBeginFramebufferChange);
+MODULE_IMPORT_SYMBOL(DisplayEndFramebufferChange);
 MODULE_IMPORT_SYMBOL(SerialPrintf);
 MODULE_IMPORT_SYMBOL(SerialPuts);
 MODULE_IMPORT_SYMBOL(KPrintf);
@@ -114,6 +116,8 @@ static bool SetModeVBE(uint32_t w, uint32_t h)
 
 static bool BochsSetMode(uint32_t w, uint32_t h)
 {
+    DisplayFramebufferChange change(false);
+    if (!change) return false;
     if (!SetModeVBE(w, h)) return false;
 
     // Remap framebuffer at new dimensions (kernel handles VMM mapping)
@@ -173,6 +177,9 @@ static int BochsDisplayModuleInit()
 
     SerialPrintf("bochs_display: found at %02x:%02x.%x\n",
                  g_pciDev.bus, g_pciDev.dev, g_pciDev.fn);
+
+    DisplayFramebufferChange change(false);
+    if (!change) return -1;
 
     // Enable memory space access
     PciEnableMemSpace(g_pciDev);

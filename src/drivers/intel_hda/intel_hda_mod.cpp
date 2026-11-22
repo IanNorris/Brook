@@ -1,8 +1,8 @@
-// intel_hda_mod.cpp — Intel High Definition Audio driver for ICH9 (QEMU q35)
+// intel_hda_mod.cpp — Intel High Definition Audio playback for QEMU and VMware
 //
 // Implements:
 //   - Controller reset and Immediate Command Interface (ICI) for codec verbs
-//   - Codec discovery (STATESTS) and basic widget enumeration
+//   - Codec discovery (STATESTS) and DAC-to-output-pin routing
 //   - Output stream 0 with Buffer Descriptor List (BDL) for PCM playback
 //   - Simple kernel API: HdaPlayPcm(samples, count, rate, channels, bits)
 //
@@ -15,11 +15,13 @@
 #include "kprintf.h"
 #include "audio.h"
 #include "audio_dma_clock.h"
+#include "hda_playback_route.h"
 #include "scheduler.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 #include "memory/address.h"
 #include "mem_tag.h"
+#include "vmware_platform.h"
 #ifdef BROOK_HOST_TEST
 #include <cstring>
 #else
@@ -41,7 +43,8 @@ MODULE_IMPORT_SYMBOL(VmmAllocPagesAccounted);
 MODULE_IMPORT_SYMBOL(VmmVirtToPhys);
 MODULE_IMPORT_SYMBOL(VmmMapPage);
 MODULE_IMPORT_SYMBOL(PmmAllocPage);
-MODULE_IMPORT_SYMBOL(AudioRegister);
+MODULE_IMPORT_SYMBOL(AudioRegisterWithHdaStatus);
+MODULE_IMPORT_SYMBOL(AudioMixerRequestDefaultStaging);
 MODULE_IMPORT_SYMBOL(AudioClockNowNs);
 MODULE_IMPORT_SYMBOL(AudioDeliveryTimingToken);
 MODULE_IMPORT_SYMBOL(AudioDeliveryTimingRecord);
@@ -122,6 +125,7 @@ enum SdReg : uint32_t {
 };
 
 // Stream control bits
+static constexpr uint32_t SD_CTL_MASK   = 0x00ffffffu;
 static constexpr uint32_t SD_CTL_SRST   = (1 << 0);   // Stream reset
 static constexpr uint32_t SD_CTL_RUN    = (1 << 1);   // Stream run
 static constexpr uint32_t SD_CTL_IOCE   = (1 << 2);   // Interrupt on completion enable
@@ -133,10 +137,6 @@ static constexpr uint8_t SD_STS_DESE  = (1 << 4);  // Descriptor error
 
 // GCTL bits
 static constexpr uint32_t GCTL_CRST = (1 << 0);  // Controller reset
-
-// INTCTL bits
-static constexpr uint32_t INTCTL_GIE = (1u << 31);  // Global interrupt enable
-static constexpr uint32_t INTCTL_CIE = (1u << 30);  // Controller interrupt enable
 
 // ICS (Immediate Command Status) bits
 static constexpr uint16_t ICS_ICB = (1 << 0);  // Immediate Command Busy
@@ -168,34 +168,17 @@ static inline uint32_t HdaVerb4(uint8_t codec, uint8_t nid,
          | payload;
 }
 
-// Common get-parameter verb IDs (12-bit)
-static constexpr uint32_t VERB_GET_PARAM       = 0xF00;
-
-// Common set-parameter verb IDs
-static constexpr uint32_t VERB_SET_AMP_GAIN    = 0x3;  // 4-bit verb
-static constexpr uint32_t VERB_SET_PIN_CTRL    = 0x707;
-static constexpr uint32_t VERB_SET_EAPDBTL     = 0x70C;
+static constexpr uint32_t VERB_SET_CONNECT      = 0x701;
+static constexpr uint32_t VERB_SET_AMP_GAIN     = 0x3;  // 4-bit verb
+static constexpr uint32_t VERB_SET_PIN_CTRL     = 0x707;
+static constexpr uint32_t VERB_SET_EAPDBTL      = 0x70C;
 static constexpr uint32_t VERB_SET_POWER_STATE = 0x705;
 static constexpr uint32_t VERB_SET_CONV_STREAM = 0x706;
 static constexpr uint32_t VERB_SET_CONV_FMT    = 0x2;  // 4-bit verb
 
-// Parameter IDs (for VERB_GET_PARAM)
 static constexpr uint8_t PARAM_VENDOR_ID      = 0x00;
 static constexpr uint8_t PARAM_SUB_NODE_COUNT = 0x04;
 static constexpr uint8_t PARAM_FN_GROUP_TYPE  = 0x05;
-static constexpr uint8_t PARAM_WIDGET_CAPS    = 0x09;
-
-// Widget type from caps (bits 23:20)
-enum WidgetType : uint8_t {
-    WT_AUDIO_OUTPUT = 0,
-    WT_AUDIO_INPUT  = 1,
-    WT_AUDIO_MIXER  = 2,
-    WT_AUDIO_SELECT = 3,
-    WT_PIN_COMPLEX  = 4,
-    WT_POWER        = 5,
-    WT_VOLUME_KNOB  = 6,
-    WT_BEEP_GEN     = 7,
-};
 
 // ---------------------------------------------------------------------------
 // MMIO accessors
@@ -263,6 +246,10 @@ static uint32_t  g_lastLpib = 0;       // previous cyclic DMA position
 static bool      g_streamRunning = false;
 static volatile uint32_t g_playLock = 0;
 static AudioDmaClock g_nativeClock;
+static bool g_vmwareController=false;
+static uint64_t g_dmaPolls=0,g_dmaProgressPolls=0,g_dmaStalls=0;
+static uint64_t g_lastNativeProgressNs=0;
+static constexpr uint64_t VMWARE_DMA_STALL_NS=250000000;
 static bool g_nativeMode = false;
 static uint32_t g_legacyActive = 0;
 static uint64_t g_legacyEpoch = 0;
@@ -275,6 +262,19 @@ static uint64_t g_nativeLastDataEnd = 0, g_nativePrimedAt = 0;
 static constexpr uint32_t NATIVE_IDLE_TRAILER = 8192;
 static constexpr uint32_t NATIVE_WRITE_LEAD = NATIVE_IDLE_TRAILER + FRAG_SIZE;
 static constexpr uint64_t NATIVE_PRIME_NS = 10000000;
+// VMware publishes LPIB in whole 4096-byte descriptors and its mixer wakeups
+// run late, so every receipt lands NATIVE_WRITE_LEAD (3072 frames) ahead of
+// DMA. A client whose ring charges its hardware-resident copy (Chromium's
+// 1920-frame OSS ring) can never cover that lead: each refill reserves fresh
+// silence and the source drains at ~0.45x real time (Workstation trace: 293 of
+// 295 receipts reserved silence, 19.8k frames/s). The downstream allowance
+// lets that copy live in the device queue without consuming client space;
+// delay and drain still follow physical completion (as on the Dell).
+static constexpr uint32_t VMWARE_DOWNSTREAM_FRAMES = 4096;
+static void HdaConfigureDownstreamAllowance()
+{
+    if (g_vmwareController) AudioMixerRequestDefaultStaging(VMWARE_DOWNSTREAM_FRAMES);
+}
 
 
 // Output stream descriptor offset (depends on GCAP)
@@ -412,168 +412,97 @@ static bool HdaControllerReset()
 // Codec discovery and widget enumeration
 // ---------------------------------------------------------------------------
 
-static bool DiscoverCodec()
+static bool ReadCodec(uint8_t node, uint16_t verb, uint8_t arg, uint32_t& response)
 {
-    uint16_t statests = hda_read16(STATESTS);
-    if (!statests)
-    {
-        SerialPuts("intel_hda: no codecs detected (STATESTS=0)\n");
-        return false;
-    }
-
-    // Find first codec
-    for (int i = 0; i < 15; i++)
-    {
-        if (statests & (1 << i))
-        {
-            g_codecAddr = i;
-            break;
-        }
-    }
-
-    // Clear status
-    hda_write16(STATESTS, statests);
-
-    // Get vendor ID
-    uint32_t vendorId = 0;
-    if (HdaCommand(HdaVerb(g_codecAddr, 0, VERB_GET_PARAM, PARAM_VENDOR_ID), vendorId))
-    {
-        KPrintf("intel_hda: codec %d vendor=%04x device=%04x\n",
-                g_codecAddr, vendorId >> 16, vendorId & 0xFFFF);
-    }
-    else
-    {
-        SerialPrintf("intel_hda: codec %d — vendor ID query failed (CORB/RIRB timeout)\n",
-                     g_codecAddr);
-    }
-
-    return true;
+    return HdaCommand(HdaVerb(g_codecAddr, node, verb, arg), response);
 }
 
-static bool EnumerateWidgets()
+static bool NodeRange(uint8_t node, unsigned& first, unsigned& end)
 {
-    // Get root node's sub-node count
-    uint32_t response;
-    if (!HdaCommand(HdaVerb(g_codecAddr, 0, VERB_GET_PARAM, PARAM_SUB_NODE_COUNT), response))
-        return false;
+    uint32_t value = 0;
+    if (!ReadCodec(node, HdaGetParameter, PARAM_SUB_NODE_COUNT, value)) return false;
+    first = (value >> 16) & 0xff;
+    end = first + (value & 0xff);
+    return first && first < end && end <= HdaNodeCount;
+}
 
-    uint8_t startNid = (response >> 16) & 0xFF;
-    uint8_t count    = response & 0xFF;
+static bool UnmuteAmp(uint8_t afg, uint8_t nid, uint32_t widget, bool input, uint8_t index)
+{
+    const uint8_t parameter = input ? HdaParamInputAmpCaps : HdaParamOutputAmpCaps;
+    const uint8_t owner = (widget & HdaWidgetAmpOverride) ? nid : afg;
+    uint32_t amp = 0;
+    if (!ReadCodec(owner, HdaGetParameter, parameter, amp)) return false;
+    const uint16_t offset = amp & 0x7f;
+    const uint16_t steps = (amp >> 8) & 0x7f;
+    const uint16_t gain = offset < steps ? offset : steps;
+    const uint16_t direction = input ? (0x7000 | uint16_t(index) << 8) : 0xb000;
+    return HdaCommandNoResp(HdaVerb4(g_codecAddr, nid, VERB_SET_AMP_GAIN, direction | gain));
+}
 
-    HDA_VPRINTF("intel_hda: root node: start=%d count=%d\n", startNid, count);
-
-    // Find audio function group (type 1)
-    uint8_t afg = 0;
-    for (uint8_t i = 0; i < count; i++)
-    {
-        uint8_t nid = startNid + i;
-        if (!HdaCommand(HdaVerb(g_codecAddr, nid, VERB_GET_PARAM, PARAM_FN_GROUP_TYPE), response))
-            continue;
-
-        uint8_t groupType = response & 0xFF;
-        if (groupType == 1)
-        {
-            afg = nid;
-            HDA_VPRINTF("intel_hda: audio function group at NID %d\n", afg);
-            break;
-        }
+static bool ConfigureOutputPath(uint8_t afg, const HdaPlaybackRoute& route,
+                                const uint32_t (&widgets)[HdaNodeCount])
+{
+    for (unsigned i = 0; i < route.count; ++i) {
+        const auto& step = route.steps[i];
+        const uint32_t caps = widgets[step.node];
+        if ((caps & HdaWidgetPower) &&
+            !HdaCommandNoResp(HdaVerb(g_codecAddr, step.node, VERB_SET_POWER_STATE, 0))) return false;
+        if (step.selectInput &&
+            !HdaCommandNoResp(HdaVerb(g_codecAddr, step.node, VERB_SET_CONNECT, step.input))) return false;
+        if (i && (caps & HdaWidgetInputAmp) && !UnmuteAmp(afg, step.node, caps, true, step.input)) return false;
+        if ((caps & HdaWidgetOutputAmp) && !UnmuteAmp(afg, step.node, caps, false, 0)) return false;
     }
+    const uint8_t pin = route.steps[route.count - 1].node;
+    const uint8_t pinControl = route.pinCaps & (1u << 3) ? 0xc0 : 0x40;
+    if ((route.pinCaps & (1u << 16)) &&
+        !HdaCommandNoResp(HdaVerb(g_codecAddr, pin, VERB_SET_EAPDBTL, 0x02))) return false;
+    return HdaCommandNoResp(HdaVerb(g_codecAddr, pin, VERB_SET_PIN_CTRL, pinControl));
+}
 
-    if (!afg)
-    {
-        SerialPuts("intel_hda: no audio function group found\n");
-        return false;
-    }
-
-    // Power up the AFG
-    HdaCommandNoResp(HdaVerb(g_codecAddr, afg, VERB_SET_POWER_STATE, 0x00));
+static bool ConfigureAudioFunction(uint8_t afg)
+{
+    HdaCommandNoResp(HdaVerb(g_codecAddr, afg, VERB_SET_POWER_STATE, 0));
     BusyWait(10000);
+    unsigned first = 0, end = 0;
+    if (!NodeRange(afg, first, end)) return false;
 
-    // Get AFG's sub-nodes (widgets)
-    if (!HdaCommand(HdaVerb(g_codecAddr, afg, VERB_GET_PARAM, PARAM_SUB_NODE_COUNT), response))
-        return false;
-
-    startNid = (response >> 16) & 0xFF;
-    count    = response & 0xFF;
-
-    HDA_VPRINTF("intel_hda: AFG widgets: start=%d count=%d\n", startNid, count);
-
-    // Scan widgets for DAC and output pin
-    for (uint8_t i = 0; i < count; i++)
-    {
-        uint8_t nid = startNid + i;
-        if (!HdaCommand(HdaVerb(g_codecAddr, nid, VERB_GET_PARAM, PARAM_WIDGET_CAPS), response))
-            continue;
-
-        uint8_t wtype = (response >> 20) & 0xF;
-
-        if (wtype == WT_AUDIO_OUTPUT && g_dacNid == 0)
-        {
-            g_dacNid = nid;
-            HDA_VPRINTF("intel_hda: DAC at NID %d\n", nid);
-        }
-        else if (wtype == WT_PIN_COMPLEX && g_pinNid == 0)
-        {
-            // Get default pin configuration (verb 0xF1C)
-            uint32_t pinCfg;
-            if (HdaCommand(HdaVerb(g_codecAddr, nid, 0xF1C, 0x00), pinCfg))
-            {
-                // Default association in bits 7:4, sequence in bits 3:0
-                // Check default device type in bits 23:20
-                uint8_t defaultDevice = (pinCfg >> 20) & 0xF;
-                // 0=Line Out, 1=Speaker, 2=HP Out
-                if (defaultDevice <= 2)
-                {
-                    g_pinNid = nid;
-                    HDA_VPRINTF("intel_hda: output pin at NID %d (type=%d)\n",
-                                nid, defaultDevice);
-                }
-            }
-        }
+    uint32_t widgets[HdaNodeCount]{};
+    for (unsigned node = first; node < end; ++node) {
+        uint32_t caps = 0;
+        if (ReadCodec(static_cast<uint8_t>(node), HdaGetParameter, HdaParamWidgetCaps, caps) &&
+            caps != 0xffffffffu) widgets[node] = caps;
     }
-
-    if (!g_dacNid)
-    {
-        SerialPuts("intel_hda: no DAC widget found\n");
-        return false;
-    }
-
+    const auto route = HdaFindPlaybackRoute(widgets, ReadCodec);
+    if (!route.count || !ConfigureOutputPath(afg, route, widgets)) return false;
+    g_dacNid = route.steps[0].node;
+    g_pinNid = route.steps[route.count - 1].node;
+    SerialPrintf("intel_hda: playback route AFG=%u DAC=%u PIN=%u widgets=%u\n",
+                 unsigned(afg), unsigned(g_dacNid), unsigned(g_pinNid), route.count);
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// Configure output path: Pin → [Mixer] → DAC
-// ---------------------------------------------------------------------------
-
-static bool ConfigureOutputPath()
+static bool InitializeCodec()
 {
-    // Power up DAC
-    HdaCommandNoResp(HdaVerb(g_codecAddr, g_dacNid, VERB_SET_POWER_STATE, 0x00));
-
-    // Enable output pin
-    if (g_pinNid)
-    {
-        // Power up pin
-        HdaCommandNoResp(HdaVerb(g_codecAddr, g_pinNid, VERB_SET_POWER_STATE, 0x00));
-        // Set pin control: output enable (bit 6)
-        HdaCommandNoResp(HdaVerb(g_codecAddr, g_pinNid, VERB_SET_PIN_CTRL, 0x40));
-        // Enable EAPD if available
-        HdaCommandNoResp(HdaVerb(g_codecAddr, g_pinNid, VERB_SET_EAPDBTL, 0x02));
+    const uint16_t codecs = hda_read16(STATESTS) & 0x7fff;
+    hda_write16(STATESTS, codecs);
+    for (uint8_t codec = 0; codec < 15; ++codec) {
+        if (!(codecs & (1u << codec))) continue;
+        g_codecAddr = codec;
+        uint32_t id = 0;
+        if (!ReadCodec(0, HdaGetParameter, PARAM_VENDOR_ID, id) || !id || id == 0xffffffffu) continue;
+        SerialPrintf("intel_hda: codec %u vendor=%04x device=%04x\n",
+                     unsigned(codec), id >> 16, id & 0xffff);
+        unsigned first = 0, end = 0;
+        if (!NodeRange(0, first, end)) continue;
+        for (unsigned node = first; node < end; ++node) {
+            const auto afg = static_cast<uint8_t>(node);
+            uint32_t type = 0;
+            if (ReadCodec(afg, HdaGetParameter, PARAM_FN_GROUP_TYPE, type) &&
+                (type & 0xff) == 1 && ConfigureAudioFunction(afg)) return true;
+        }
     }
-
-    // Set DAC output amplifier gain (unmute, 0dB)
-    // Set output amp: left+right, output, gain=0x40 (varies by codec)
-    HdaCommandNoResp(HdaVerb4(g_codecAddr, g_dacNid, VERB_SET_AMP_GAIN,
-                               0xB040)); // output, L+R, gain=0x40
-
-    // Set pin output amp if it has one
-    if (g_pinNid)
-    {
-        HdaCommandNoResp(HdaVerb4(g_codecAddr, g_pinNid, VERB_SET_AMP_GAIN,
-                                   0xB040));
-    }
-
-    return true;
+    SerialPuts("intel_hda: no analog stereo playback route\n");
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -667,7 +596,7 @@ static bool SetupOutputStream(uint32_t sampleRate, uint8_t channels, uint8_t bit
     {
         g_bdl[i].addr   = g_fragPhys[i];
         g_bdl[i].length = FRAG_SIZE;
-        g_bdl[i].ioc    = 1;  // interrupt on every fragment completion
+        g_bdl[i].ioc    = 1;  // latch BCIS on each fragment completion
     }
 
     // LVI = last valid index, CBL = total ring size
@@ -707,10 +636,19 @@ static void StartOutputStream()
 static void StopOutputStream()
 {
     uint32_t sdBase = g_outStreamBase;
-    uint32_t ctl = hda_read32(sdBase + SD_CTL);
-    ctl &= ~SD_CTL_RUN;
-    hda_write32(sdBase + SD_CTL, ctl);
+    // The upper byte aliases the write-one-to-clear status register.
+    const uint32_t ctl = hda_read32(sdBase + SD_CTL) & SD_CTL_MASK;
+    hda_write32(sdBase + SD_CTL, ctl & ~SD_CTL_RUN);
     BusyWait(1000);
+}
+
+static void AcknowledgePolledCompletion(uint8_t status)
+{
+    // Workstation can wait at an IOC boundary until BCIS is acknowledged.
+    // In polling mode there is no ISR to clear it. Preserve error bits for
+    // the fault path, and use LPIB, not BCIS, to account completed bytes.
+    if (status & SD_STS_BCIS)
+        hda_write8(g_outStreamBase + SD_STS, SD_STS_BCIS);
 }
 
 static void UpdatePlayedBytesLocked()
@@ -718,6 +656,8 @@ static void UpdatePlayedBytesLocked()
     if (!g_streamRunning)
         return;
     uint32_t lpib = hda_read32(g_outStreamBase + SD_LPIB) % AUDIO_BUF_SIZE;
+    ++g_dmaPolls;
+    if (lpib != g_lastLpib) ++g_dmaProgressPolls;
     uint32_t delta = (lpib >= g_lastLpib)
         ? (lpib - g_lastLpib)
         : (AUDIO_BUF_SIZE - g_lastLpib + lpib);
@@ -725,6 +665,7 @@ static void UpdatePlayedBytesLocked()
     g_playedBytes += delta;
     if (g_playedBytes > g_submittedBytes)
         g_playedBytes = g_submittedBytes;
+    AcknowledgePolledCompletion(hda_read8(g_outStreamBase + SD_STS));
 }
 
 static uint32_t QueuedBytesLocked()
@@ -819,6 +760,7 @@ static bool StartNativePrimedLocked()
     if (!g_nativeClock.Start(0, before)) {
         FailNativeLocked("start-clock-or-position", before); return false;
     }
+    g_lastNativeProgressNs=before;
     StartOutputStream(); g_streamRunning = true;
     if (!(hda_read32(g_outStreamBase + SD_CTL) & SD_CTL_RUN)) {
         FailNativeLocked("run-not-set", before); return false;
@@ -841,6 +783,8 @@ static void ObserveNativeLocked()
     const uint8_t status = hda_read8(g_outStreamBase + SD_STS);
     const uint64_t after = AudioClockNowNs();
     const uint64_t oldCompleted = g_nativeClock.completed;
+    const uint32_t previousPosition=g_nativeClock.Position();
+    ++g_dmaPolls;
     if (!g_nativeClock.Observe(raw == AUDIO_BUF_SIZE ? 0 : raw, before, after,
                               (status & (SD_STS_FIFOE | SD_STS_DESE)) != 0)) {
         const char* reason = (status & (SD_STS_FIFOE | SD_STS_DESE)) ? "device-status" :
@@ -851,6 +795,15 @@ static void ObserveNativeLocked()
         FailNativeLocked(reason, before, after, raw, status);
         return;
     }
+    if (g_nativeClock.Position()!=previousPosition) {
+        ++g_dmaProgressPolls;
+        g_lastNativeProgressNs=after;
+    } else if (g_vmwareController && after>=g_lastNativeProgressNs &&
+               after-g_lastNativeProgressNs>=VMWARE_DMA_STALL_NS) {
+        ++g_dmaStalls;
+        FailNativeLocked("dma-position-stalled",before,after,raw,status);
+        return;
+    }
     // Completed areas become silence before cyclic DMA can visit them again.
     uint32_t cleared = static_cast<uint32_t>(g_nativeClock.completed - oldCompleted);
     uint32_t offset = static_cast<uint32_t>((oldCompleted - g_nativeRingBase) % AUDIO_BUF_SIZE);
@@ -858,6 +811,7 @@ static void ObserveNativeLocked()
     if (first > cleared) first = cleared;
     memset(g_audioBuf + offset, 0, first);
     if (cleared > first) memset(g_audioBuf, 0, cleared - first);
+    AcknowledgePolledCompletion(status);
     if (!g_nativeClock.Pending() && g_nativeClock.completed >= g_nativeLastDataEnd &&
         g_nativeClock.completed - g_nativeLastDataEnd >= NATIVE_IDLE_TRAILER) {
         StopNativePhysicalLocked();
@@ -1041,8 +995,7 @@ static bool HdaNativeRestart(uint64_t expectedEpoch)
 // Play PCM samples through the HDA output using ring-buffered DMA.
 // 16 BDL entries of 4KB each, all with IOC. DMA cycles through them.
 // We accumulate writes into the current fragment and advance when full.
-// BCIS fires on each fragment completion — we use it to pace writes
-// so we don't overwrite data DMA is still playing.
+// Poll LPIB to pace writes and acknowledge BCIS at fragment completions.
 extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
                            uint32_t sampleRate, uint8_t channels,
                            uint8_t bitsPerSample, bool nonblock)
@@ -1087,6 +1040,8 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
 
     const uint8_t* src = static_cast<const uint8_t*>(samples);
     uint32_t totalWritten = 0;
+    uint64_t lastPlayed = g_playedBytes;
+    unsigned blockedPolls = 0;
 
     while (totalWritten < byteCount)
     {
@@ -1124,6 +1079,19 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
         {
             if (nonblock)
                 break;
+            if (g_vmwareController) {
+                if (lastPlayed != g_playedBytes) {
+                    lastPlayed = g_playedBytes;
+                    blockedPolls = 0;
+                }
+                if (++blockedPolls >= 250) {
+                    ++g_dmaStalls;
+                    ResetPlaybackQueueLocked(false);
+                    g_streamConfigured=false;
+                    PlayUnlock();
+                    return totalWritten ? static_cast<int>(totalWritten) : -5;
+                }
+            }
             PlayUnlock();
             SchedulerSleepMs(1);
             PlayLock();
@@ -1237,37 +1205,79 @@ static void HdaService()
 // Module init / exit
 // ---------------------------------------------------------------------------
 
+static bool HdaReadStatus(AudioHdaStatus& status)
+{
+    if (!g_initialized || __atomic_exchange_n(&g_playLock,1u,__ATOMIC_ACQUIRE)) return false;
+    status={hda_read32(g_outStreamBase+SD_CTL)&SD_CTL_MASK,
+            hda_read8(g_outStreamBase+SD_STS),hda_read32(g_outStreamBase+SD_LPIB),
+            hda_read32(INTSTS),hda_read32(INTCTL),hda_read32(WALCLK),
+            hda_read16(g_outStreamBase+SD_FMT),g_curRate,
+            g_dmaPolls,g_dmaProgressPolls,g_dmaStalls,g_streamRunning,g_nativeMode};
+    PlayUnlock();
+    return true;
+}
+
+enum class HdaVmPlatform { None, Qemu, Vmware };
+
+template<class Cpuid>
+static HdaVmPlatform HdaPlaybackPlatform(Cpuid cpuid)
+{
+    if (VmwarePlatformPresent(cpuid)) return HdaVmPlatform::Vmware;
+    if (VmwarePortPlatformPresent(cpuid)) return HdaVmPlatform::Qemu;
+    return HdaVmPlatform::None;
+}
+
+static bool HdaVirtualController(HdaVmPlatform platform, const PciDevice& dev)
+{
+    if (dev.classCode != 0x04 || dev.subclass != 0x03 || dev.progIf != 0) return false;
+    if (platform == HdaVmPlatform::Vmware)
+        return dev.vendorId == 0x15ad && dev.deviceId == 0x1977;
+    return platform == HdaVmPlatform::Qemu && dev.vendorId == 0x8086 &&
+           (dev.deviceId == 0x2668 || dev.deviceId == 0x293e);
+}
+
+static uint64_t HdaControllerMmio(const PciDevice& dev)
+{
+    const uint32_t bar = dev.bar[0];
+    if (PciBarIsIo(bar) || (bar & 0x6) == 0x2 || (bar & 0x6) == 0x6) return 0;
+    uint64_t base = PciBarMemBase32(bar);
+    if (PciBarIs64(bar)) base |= uint64_t(dev.bar[1]) << 32;
+    // All global and stream registers we use are within the first 4 KiB.
+    return base && !(base & 4095) ? base : 0;
+}
+
 static int IntelHdaInit()
 {
-    PciDevice dev;
-    // ICH9 HDA: vendor 0x8086, device 0x293E
-    if (!PciFindDevice(0x8086, 0x293E, dev))
-    {
-        // Try ICH10
-        if (!PciFindDevice(0x8086, 0x3A3E, dev))
-        {
-            SerialPuts("intel_hda: PCI device not found\n");
-            return -1;
-        }
+    const auto cpuid = [](uint32_t leaf, uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) {
+        __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(leaf), "c"(0));
+    };
+    const auto platform = HdaPlaybackPlatform(cpuid);
+    PciDevice dev{};
+    bool found = false;
+    if (platform == HdaVmPlatform::Vmware) {
+        // Linux's HDA controller table identifies VMware HDAudio as 15ad:1977.
+        found = PciFindDevice(0x15ad, 0x1977, dev) && HdaVirtualController(platform, dev);
+    } else if (platform == HdaVmPlatform::Qemu) {
+        found = (PciFindDevice(0x8086, 0x293e, dev) && HdaVirtualController(platform, dev)) ||
+                (PciFindDevice(0x8086, 0x2668, dev) && HdaVirtualController(platform, dev));
     }
-
-    KPrintf("intel_hda: found at PCI %02x:%02x.%x\n",
-            dev.bus, dev.dev, dev.fn);
-
+    if (!found) {
+        SerialPuts("intel_hda: no supported virtual HDA controller\n");
+        return -1;
+    }
+    const uint64_t mmioPhys = HdaControllerMmio(dev);
+    if (!mmioPhys) {
+        SerialPuts("intel_hda: invalid MMIO BAR0\n");
+        return -1;
+    }
+    SerialPrintf("intel_hda: %s HDA %04x:%04x at %02x:%02x.%x\n",
+                 platform == HdaVmPlatform::Vmware ? "VMware" : "QEMU",
+                 dev.vendorId, dev.deviceId, dev.bus, dev.dev, dev.fn);
     PciEnableMemSpace(dev);
     PciEnableBusMaster(dev);
 
-    // Get BAR0 (MMIO)
-    uint32_t bar0 = dev.bar[0] & ~0xFu;
-    if (!bar0)
-    {
-        SerialPuts("intel_hda: BAR0 is 0\n");
-        return -1;
-    }
-
     // Map MMIO pages into kernel virtual address space
-    uint64_t mmioPhys = bar0;
-    uint32_t mmioPages = 4; // 16KB
+    constexpr uint32_t mmioPages = 1;
     auto mmioVaddr = VmmAllocPages(mmioPages, VMM_WRITABLE | VMM_CACHE_DISABLE,
                                     MemTag::Device, KernelPid);
     if (!mmioVaddr)
@@ -1295,6 +1305,11 @@ static int IntelHdaInit()
     KPrintf("intel_hda: HDA v%d.%d, ISS=%d OSS=%d\n",
             vmaj, vmin, g_numInputStreams, g_numOutputStreams);
 
+    if (gcap == 0xffff || vmaj != 1 || !g_numOutputStreams) {
+        SerialPuts("intel_hda: no HDA 1.x output stream\n");
+        return -1;
+    }
+
     // Output stream 0 descriptor base
     g_outStreamBase = SD_BASE + g_numInputStreams * 0x20;
 
@@ -1302,19 +1317,8 @@ static int IntelHdaInit()
     if (!HdaControllerReset())
         return -1;
 
-    // Discover codecs
-    if (!DiscoverCodec())
+    if (!InitializeCodec())
         return -1;
-
-    // Enumerate widgets (uses ICI — no DMA needed)
-    if (!EnumerateWidgets())
-    {
-        SerialPuts("intel_hda: widget enumeration failed\n");
-        return -1;
-    }
-
-    // Configure output path
-    ConfigureOutputPath();
 
     // Allocate BDL (uncacheable for DMA)
     auto bdlPage = VmmAllocPagesAccounted(1, VMM_WRITABLE | VMM_CACHE_DISABLE, MemTag::Device, KernelPid, PmmOwner::HdaDma);
@@ -1349,10 +1353,11 @@ static int IntelHdaInit()
     HDA_VPRINTF("intel_hda: DMA BDL phys=0x%lx audio frag0=0x%lx frag1=0x%lx (%u pages)\n",
                  g_bdlPhys, g_fragPhys[0], g_fragPhys[1], audioPages);
 
-    // Enable interrupts (global + controller + output stream 0)
-    hda_write32(INTCTL, INTCTL_GIE | INTCTL_CIE |
-                         (1 << (g_numInputStreams)));
+    // The mixer services the virtual stream by polling LPIB and status. No
+    // guest IRQ handler is installed for the emulated controller's PCI pin.
+    hda_write32(INTCTL, 0);
 
+    g_vmwareController = platform == HdaVmPlatform::Vmware;
     g_initialized = true;
 
     // Register with the audio subsystem
@@ -1367,7 +1372,8 @@ static int IntelHdaInit()
         HdaNativeProgress,
         HdaNativeRestart,
     };
-    AudioRegister(&hdaAudioDriver);
+    AudioRegisterWithHdaStatus(&hdaAudioDriver,HdaReadStatus);
+    HdaConfigureDownstreamAllowance();
 
     KPrintf("intel_hda: initialised — DAC=%d PIN=%d\n", g_dacNid, g_pinNid);
     return 0;
@@ -1386,4 +1392,4 @@ static void IntelHdaExit()
 }
 
 DECLARE_MODULE("intel_hda", IntelHdaInit, IntelHdaExit,
-               "Intel HD Audio controller driver (ICH9)");
+               "HD Audio playback for QEMU and VMware");
