@@ -16,6 +16,7 @@
 #include "pci.h"
 #include "portio.h"
 #include "display_power.h"
+#include "idle_inhibit.h"
 #include "ahci_observe.h"
 #include "ahci_readonly.h"
 #include "writable_desktop.h"
@@ -1194,6 +1195,19 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
             r.text(",");r.field("cpu_duty",v.cpuDuty);r.text(",");r.field("pch_control",v.pchControl);
             r.text(",");r.field("pch_duty",v.pchDuty);r.text("}");};
         r.text(",\"boot_registers\":");registers(status.original);r.text(",\"current_registers\":");registers(status.current);
+        // Active idle inhibitors (Wayland zwp_idle_inhibit_manager_v1 via
+        // waylandd). "inhibited" is the policy's last once-a-second poll.
+        IdleInhibitSnapshot inhibit{};WmIdleInhibitRead(&inhibit);
+        r.text(",\"idle_inhibit\":{\"inhibited\":");r.text(status.inhibited?"true":"false");
+        r.text(",");r.field("checked_ms",status.inhibitCheckedMs);
+        r.text(",");r.field("windows",inhibit.activeWindows);r.text(",");r.field("inhibitors",inhibit.activeInhibitors);
+        r.text(",");r.field("hidden_windows",inhibit.hiddenWindows);r.text(",");r.field("hidden_inhibitors",inhibit.hiddenInhibitors);
+        r.text(",\"clients\":[");
+        for(uint32_t i=0;i<inhibit.reported;++i){const auto& c=inhibit.clients[i];if(i)r.text(",");
+            r.text("{");r.field("wm",c.wmId);r.text(",");r.field("pid",c.pid);r.text(",");r.field("count",c.count);
+            r.text(",\"visible\":");r.text(c.visible?"true":"false");
+            r.text(",\"app_id\":");r.quoted(c.appId);r.text(",\"title\":");r.quoted(c.title);r.text("}");}
+        r.text("]}");
         r.text(",\"scope\":\"backlight PWM only; panel link and system remain running\"}\n");r.send();return true;
     }
     if(!strcmp(command,"bridge hardware pch-watchdog-status")) {

@@ -6,6 +6,7 @@
 #include "vfs.h"
 #include "pci.h"
 #include "display_power.h"
+#include "idle_inhibit.h"
 #include "writable_desktop.h"
 #include "ahci_readonly.h"
 #include "ahci_observe.h"
@@ -144,6 +145,11 @@ const char* BuildGitHash(){return "test+build";}
 const char* BuildDate(){return "now";}
 bool AudioAvailable(){return false;}
 DisplayPowerStatus DisplayPowerRead(){return {};}
+void WmIdleInhibitRead(IdleInhibitSnapshot* out){
+    *out={};out->activeWindows=1;out->activeInhibitors=2;out->hiddenWindows=1;out->hiddenInhibitors=1;out->reported=2;
+    out->clients[0].wmId=3;out->clients[0].pid=77;out->clients[0].count=2;out->clients[0].visible=true;
+    std::strcpy(out->clients[0].appId,"firefox");std::strcpy(out->clients[0].title,"Netflix \"x\"");
+    out->clients[1].wmId=5;out->clients[1].pid=78;out->clients[1].count=1;std::strcpy(out->clients[1].appId,"chromium");}
 bool DisplayPowerSetOn(bool on,uint32_t seconds){++backlightCalls;backlightSeconds=seconds;backlightOn=on;return false;}
 bool DisplayPowerSetIdle(uint32_t seconds){++backlightCalls;backlightSeconds=seconds;return false;}
 ShutdownPowerCapabilities ShutdownGetPowerCapabilities(){return {true,true,false,"acpi-io8","manual","firmware","S5 unavailable"};}
@@ -279,6 +285,7 @@ int main(){
     assert(handle("bridge hardware ahci-sector 4") && reply.find("ahci_ro_error")!=std::string::npos);
     assert(handle("bridge hardware ahci") && reply.find("ahci_observe_api")!=std::string::npos);
     assert(handle("bridge hardware backlight status") && !backlightCalls && reply.find("\"available\":false")!=std::string::npos);
+    assert(reply.find("\"idle_inhibit\":{\"inhibited\":false,\"checked_ms\":0,\"windows\":1,\"inhibitors\":2,\"hidden_windows\":1,\"hidden_inhibitors\":1,\"clients\":[{\"wm\":3,\"pid\":77,\"count\":2,\"visible\":true,\"app_id\":\"firefox\",\"title\":\"Netflix \\\"x\\\"\"},{\"wm\":5,\"pid\":78,\"count\":1,\"visible\":false,\"app_id\":\"chromium\",\"title\":\"\"}]}")!=std::string::npos);
     assert(handle("bridge hardware backlight off 10") && backlightCalls==1 && backlightSeconds==10 && !backlightOn);
     assert(reply.find("\"ok\":false")!=std::string::npos);
     assert(handle("bridge hardware backlight on") && backlightCalls==2 && backlightOn);

@@ -524,6 +524,8 @@ int64_t sys_brook_wm_set_window_properties(uint64_t wmId, uint64_t mask,
                                             uint64_t, uint64_t);
 int64_t sys_brook_wm_show_window_menu(uint64_t wmId, uint64_t x, uint64_t y,
                                       uint64_t, uint64_t, uint64_t);
+int64_t sys_brook_wm_set_idle_inhibit(uint64_t wmId, uint64_t count,
+                                      uint64_t, uint64_t, uint64_t, uint64_t);
 int64_t sys_brook_wm_begin_move(uint64_t wmId, uint64_t,
                                  uint64_t, uint64_t,
                                  uint64_t, uint64_t);

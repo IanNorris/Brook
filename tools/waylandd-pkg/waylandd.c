@@ -57,6 +57,7 @@
 #include "text-input-v3-server-protocol.h"
 #include "relative-pointer-v1-server-protocol.h"
 #include "pointer-constraints-v1-server-protocol.h"
+#include "idle-inhibit-unstable-v1-server-protocol.h"
 #include "pointer-region.h"
 #include "pointer-hit.h"
 #include "surface-tree.h"
@@ -294,6 +295,7 @@ struct brook_surface;
 static void seat_clients_scrub_surface(struct brook_surface *s);
 static void seat_clients_unmap_surface(struct brook_surface *s);
 static void pointer_constraints_unmap(struct brook_surface *s,int destroy);
+static void idle_inhibit_surface_destroyed(struct brook_surface *s);
 static void pointer_constraints_commit(struct brook_surface *s);
 static void pointer_constraints_refresh(void);
 
@@ -541,6 +543,9 @@ struct brook_surface {
      * the client acknowledged, and when it acked, was last configured and
      * last committed (with and without a buffer), in g_now_ms(). */
     uint32_t last_ack_serial,last_ack_ms,configure_ms,commit_ms,buffer_commit_ms;
+    /* idle-inhibit.h: inhibitors resolving to this root, and the count last
+     * sent for its current kernel window (reset when the window goes). */
+    unsigned idle_inhibit_want,idle_inhibit_sent;
     struct configure_event configure_history[CONFIGURE_HISTORY_LIMIT];
     unsigned configure_history_next, configure_history_count;
 };
@@ -1379,6 +1384,7 @@ static const struct wl_surface_interface surface_impl = {
 static void surface_destroy_userdata(struct wl_resource *r) {
     struct brook_surface *s = wl_resource_get_user_data(r);
     if (!s) return;
+    idle_inhibit_surface_destroyed(s);
     pointer_constraints_unmap(s,1);
     pointer_region_clear(&s->input_region);pointer_region_clear(&s->pending_input_region);
     xwayland_surface_detach(s);
@@ -2136,6 +2142,7 @@ static void keyboard_resource_destroy(struct wl_resource *r) {
 
 static void pointer_enter_if_needed(struct brook_seat_client *sc,struct brook_surface *s,wl_fixed_t lx,wl_fixed_t ly);
 #include "pointer-constraints.h"
+#include "idle-inhibit.h"
 
 #include "keyboard-keymap.h"
 
@@ -2786,6 +2793,7 @@ static void pump_input_for_surface(struct brook_surface *surface) {
 
 static void pump_input_once(void) {
     pointer_constraints_refresh();
+    idle_inhibit_sync();
     for (struct brook_surface *s = g_surfaces; s; s = s->next)
         pump_input_for_surface(s);
 }
@@ -4829,6 +4837,15 @@ static void waylandd_status_write(const char *display){
     fprintf(f,"{\"schema\":\"brook-waylandd-status/1\",\"pid\":%ld,\"now_ms\":%u,\"gpu_socket\":%d,",
         (long)getpid(),now,getenv("BROOK_WAYLAND_GPU_SOCKET")!=NULL);
     fprintf(f,"\"buffer_trace_active_pid\":%ld,",g_buffer_trace.pid);
+    {unsigned inert=0,live=idle_inhibit_count(&inert);
+     fprintf(f,"\"idle_inhibit\":{\"inhibitors\":%u,\"inert\":%u,\"created\":%llu,\"destroyed\":%llu,\"failures\":%llu,\"windows\":[",
+         live,inert,(unsigned long long)g_idle_inhibit_created,(unsigned long long)g_idle_inhibit_destroyed,(unsigned long long)g_idle_inhibit_failures);
+     int first=1;
+     for(struct brook_surface *s=g_surfaces;s;s=s->next)if(s->wm_id && s->idle_inhibit_sent){
+         pid_t pid=0;if(s->resource)wl_client_get_credentials(wl_resource_get_client(s->resource),&pid,NULL,NULL);
+         fprintf(f,"%s{\"wm\":%u,\"pid\":%ld,\"count\":%u,\"app_id\":",first?"":",",s->wm_id,(long)pid,s->idle_inhibit_sent);
+         idle_inhibit_json_text(f,s->app_id);fputc('}',f);first=0;}
+     fprintf(f,"]},");}
     fprintf(f,"\"gpu_channel\":{\"connected\":%d,\"draining\":%d,\"connections\":%llu,\"losses\":%llu,"
               "\"drain_retries\":%llu,\"locally_rejected\":%llu,\"last_disconnect\":\"%s\","
               "\"last_refusal\":\"%s\",\"last_nonempty_refusal\":\"%s\",\"restart_requested\":%d,\"restart_errno\":%d},",
@@ -5017,6 +5034,7 @@ int main(int argc, char **argv)
                           NULL, seat_bind)) return 1;
     if (!wl_global_create(g_display,&zwp_relative_pointer_manager_v1_interface,1,NULL,relative_manager_bind)) return 1;
     if (!wl_global_create(g_display,&zwp_pointer_constraints_v1_interface,1,NULL,pointer_constraints_bind)) return 1;
+    if (!wl_global_create(g_display,&zwp_idle_inhibit_manager_v1_interface,1,NULL,idle_manager_bind)) return 1;
     if (!wl_global_create(g_display, &zwp_text_input_manager_v3_interface, 1, NULL, text_input_manager_bind)) return 1;
     if (!wl_global_create(g_display, &wl_output_interface, 4, NULL, output_bind)) return 1;
     if (!wl_global_create(g_display, &zxdg_decoration_manager_v1_interface, 1, NULL, deco_mgr_bind)) return 1;

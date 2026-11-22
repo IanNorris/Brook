@@ -225,6 +225,9 @@ struct Window
     // Only compositor-owned copies are published for hardware GL. No raw
     // source resource is retained here after WM_PRESENT_GRES returns.
     bool fineScroll;
+    // Wayland idle inhibitors on this window's surfaces (syscall 0xB27).
+    // They hold the display idle only while the window is shown (idle_inhibit.h).
+    uint16_t    idleInhibitors;
     bool externalCaptured;
     uint32_t externalW,externalH;
     uint64_t publicationGeneration,publishedGeneration;
@@ -459,6 +462,13 @@ static constexpr uint8_t  WM_GLASS_BLUR    = 4;       // backdrop blur radius
 void WmToggleFocusedWindowGlass();
 bool WmSetOwnedWindowProperties(Process* proc, uint32_t wmId, uint32_t mask,
                                 uint8_t opacity, uint8_t blurRadius);
+
+// Idle inhibition (idle_inhibit.h). waylandd sets the live inhibitor count of
+// an owned window; the display idle policy polls WmIdleInhibitActive().
+struct IdleInhibitSnapshot;
+bool WmSetOwnedIdleInhibit(Process* proc, uint32_t wmId, uint32_t count);
+bool WmIdleInhibitActive();
+void WmIdleInhibitRead(IdleInhibitSnapshot* out);
 
 // Move a window to a new position.
 void WmMoveWindow(int idx, int16_t newX, int16_t newY);

@@ -1,5 +1,7 @@
 #include <cassert>
 #include "intel_backlight.h"
+#include "idle_inhibit.h"
+#include <cstring>
 using namespace brook;
 struct Device {
     BacklightRegisters registers{IntelBacklight::Enable|0x60000000,300,IntelBacklight::Enable,(1000u<<16)|200};
@@ -85,4 +87,37 @@ int main(){
     const auto activity=c.idle.lastActivityMs;
     assert(!c.SetOn(d.io(),true,0,1000000,14));
     assert(!c.SetIdle(d.io(),0,1000000,14) && c.idle.lastActivityMs==activity && d.writes==count);
+    // Idle inhibitors (Firefox/Chromium video over zwp_idle_inhibit_manager_v1):
+    // held activity, never a wake, full timeout after release, input still wakes.
+    c={};d={};assert(c.pwm.Probe(d.io()) && c.SetIdle(d.io(),5,0,1));
+    c.Tick(d.io(),4000,1,true);c.Tick(d.io(),60000,1,true);assert(c.pwm.on && c.idle.lastActivityMs==60000);
+    c.Tick(d.io(),64999,1);assert(c.pwm.on);c.Tick(d.io(),65000,1);assert(!c.pwm.on);
+    c.Tick(d.io(),70000,1,true);assert(!c.pwm.on); // an inhibitor does not wake a blanked panel
+    c.Tick(d.io(),70001,2,true);assert(c.pwm.on);   // input does
+    c.Tick(d.io(),200000,2,true);c.Tick(d.io(),204999,2);assert(c.pwm.on);
+    // Hold never moves activity backwards across a clock reversal.
+    p={};p.Reset(1000,0);p.Hold(500);assert(p.lastActivityMs==1000);p.Hold(2000);assert(p.lastActivityMs==2000);
+    // Timed manual restore still fires while inhibited.
+    assert(c.SetOn(d.io(),false,3,300000,2));c.Tick(d.io(),301000,2,true);assert(!c.pwm.on);
+    c.Tick(d.io(),303000,2,true);assert(c.pwm.on);
+    // Visibility: only live, shown, unminimised windows apply; hidden ones are reported.
+    struct W{void* proc;uint16_t idleInhibitors,wmId,clientPid;bool visible,minimized;char appId[128],title[64];};
+    int owner=0;W ws[5]{};
+    ws[0]={&owner,2,1,40,true,false,"firefox","Netflix"};
+    ws[1]={&owner,1,2,41,true,true,"chromium","YouTube"};    // minimised
+    ws[2]={nullptr,3,3,0,true,false,"stale",""};               // destroyed slot
+    ws[3]={&owner,0,4,42,true,false,"idle",""};
+    ws[4]={&owner,1,5,43,false,false,"hidden",""};
+    assert(IdleInhibitAny(ws,5));
+    IdleInhibitSnapshot snap;IdleInhibitCollect(ws,5,snap);
+    assert(snap.activeWindows==1 && snap.activeInhibitors==2 && snap.hiddenWindows==2 && snap.hiddenInhibitors==2 && snap.reported==3);
+    assert(snap.clients[0].wmId==1 && snap.clients[0].pid==40 && snap.clients[0].visible && !std::strcmp(snap.clients[0].appId,"firefox"));
+    assert(!snap.clients[1].visible && snap.clients[1].wmId==2 && snap.clients[2].wmId==5);
+    ws[0].minimized=true;assert(!IdleInhibitAny(ws,5));ws[0].minimized=false;ws[0].idleInhibitors=0;assert(!IdleInhibitAny(ws,5));
+    // Long text is truncated and terminated; the report is bounded.
+    W many[IdleInhibitReportLimit+2]{};
+    for(auto& w:many){w.proc=&owner;w.idleInhibitors=1;w.visible=true;std::memset(w.appId,'a',127);}
+    IdleInhibitCollect(many,IdleInhibitReportLimit+2,snap);
+    assert(snap.activeWindows==IdleInhibitReportLimit+2 && snap.reported==IdleInhibitReportLimit);
+    assert(std::strlen(snap.clients[0].appId)==IdleInhibitTextSize-1);
 }
