@@ -25,6 +25,8 @@
 #include "writable_desktop.h"
 #include "ssd_install_qemu.h"
 #include "acpi.h"
+#include "boot_resource_map.h"
+#include "memory/physical_memory.h"
 #include "hw_inventory.h"
 #include "dell_audio_probe.h"
 #include "dell_i2c_probe.h"
@@ -1056,6 +1058,57 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         Reply r;r.text("{\"nic_api\":1,\"text\":");r.quoted(text);r.text("}\n");r.send();return true;
     }
 #if !defined(BROOK_HOST_TEST)
+    // NVIDIA display survey: read-only 32-bit reads from BAR0 of the first
+    // 10de display function, through a read-only uncached one-page mapping
+    // (no VMM_WRITABLE), only inside an allow-list (PMC, fuses, PRAMIN window
+    // register, PCI mirror, HDA/SOR caps, PROM, display). Nothing is written.
+    constexpr char nvPrefix[]="bridge hardware nv-read ";
+    if(Prefix(command,nvPrefix)) {
+        const char* p=command+sizeof(nvPrefix)-1;
+        auto hex=[&](uint32_t& v)->bool{unsigned n=0;v=0;while(*p==' ')++p;
+            while((*p>='0'&&*p<='9')||(*p>='a'&&*p<='f')){v=v*16+uint32_t(*p<='9'?*p-'0':*p-'a'+10);++p;if(++n>8)return false;}return n>0;};
+        uint32_t offset=0,count=0;
+        if(!hex(offset) || !hex(count) || *p || (offset&3) || !count || count>0x100){
+            DebugChannelSend("{\"nv_error\":\"Expected <hex dword offset> <hex count 1..100>\"}\n");return true;}
+        struct Allowed{uint32_t begin,end;};
+        static constexpr Allowed allowed[]={{0x000000,0x001000},{0x001700,0x001704},{0x021c00,0x021d00},
+            {0x022500,0x022600},{0x088000,0x088100},{0x08a100,0x08a200},{0x300000,0x400000},{0x610000,0x700000}};
+        const uint32_t end=offset+count*4;bool ok=false;
+        for(const auto& a:allowed)if(offset>=a.begin && end<=a.end)ok=true;
+        if(!ok){DebugChannelSend("{\"nv_error\":\"Range not in the read-only allow-list\"}\n");return true;}
+        PciDevice gpu{};bool found=false;
+        for(uint32_t i=0;i<PciBootInventoryCount() && !found;++i){PciBootEntry e{};
+            if(PciBootInventoryRead(i,&e) && e.device.vendorId==0x10de && e.device.classCode==0x03){gpu=e.device;found=true;}}
+        if(!found){DebugChannelSend("{\"nv_error\":\"No NVIDIA display function\"}\n");return true;}
+        const uint16_t cmd=PciConfigRead16(gpu.bus,gpu.dev,gpu.fn,4);
+        const uint32_t bar0=PciConfigRead32(gpu.bus,gpu.dev,gpu.fn,0x10);
+        const uint64_t base=bar0&~uint64_t(15);
+        if((bar0&1) || !base || !(cmd&2)){DebugChannelSend("{\"nv_error\":\"BAR0 unassigned or memory decode off\"}\n");return true;}
+        BootResourceClassification c{};
+        constexpr uint32_t allowedTypes=(1u<<uint32_t(MemoryType::Reserved))|(1u<<uint32_t(MemoryType::Mmio));
+        if(!AcpiClassifyBootRange(base,16u<<20,c) || (c.types&~allowedTypes)){
+            DebugChannelSend("{\"nv_error\":\"BAR0 overlaps RAM\"}\n");return true;}
+        static VirtualAddress window{};
+        if(!window){window=VmmAllocPages(1,VMM_WRITABLE|VMM_NO_EXEC,MemTag::Device,KernelPid);
+            if(!window){DebugChannelSend("{\"nv_error\":\"No window\"}\n");return true;}
+            const auto leaf=VmmDetachPage(KernelPageTable,window);if(leaf)PmmFreePage(VmmLeafPhysical(leaf));
+            __asm__ volatile("invlpg (%0)"::"r"(window.raw()):"memory");}
+        Reply r;r.text("{\"nv_api\":1,");r.field("bar0",base);r.text(",");r.field("offset",offset);r.text(",\"values\":[");
+        uint32_t mappedPage=~0u;
+        for(uint32_t i=0;i<count;++i){
+            const uint32_t at=offset+i*4,page=at&~0xfffu;
+            if(page!=mappedPage){
+                if(mappedPage!=~0u){(void)VmmDetachPage(KernelPageTable,window);__asm__ volatile("invlpg (%0)"::"r"(window.raw()):"memory");}
+                if(!VmmMapPage(KernelPageTable,window,PhysicalAddress(base+page),VMM_NO_EXEC|VMM_CACHE_DISABLE|VMM_WRITE_THRU,MemTag::Device,KernelPid)){
+                    mappedPage=~0u;break;}
+                mappedPage=page;
+            }
+            const uint32_t v=reinterpret_cast<volatile uint32_t*>(window.raw())[(at&0xfff)/4];
+            if(i)r.text(",");r.number(v);
+        }
+        if(mappedPage!=~0u){(void)VmmDetachPage(KernelPageTable,window);__asm__ volatile("invlpg (%0)"::"r"(window.raw()):"memory");}
+        r.text("]}\n");r.send();return true;
+    }
     // Read-only sequential read benchmark of the boot stick (whole disk from
     // LBA 0, 4 MiB requests): sizes the live-store copy. Nothing is written.
     constexpr char benchPrefix[]="bridge hardware usb-bench ";
