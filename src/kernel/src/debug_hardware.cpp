@@ -1058,6 +1058,64 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         Reply r;r.text("{\"nic_api\":1,\"text\":");r.quoted(text);r.text("}\n");r.send();return true;
     }
 #if !defined(BROOK_HOST_TEST)
+    // GPU link ASPM L1 (runtime, volatile; a reset restores firmware state):
+    // the first 10de display function (fn0 only; HDA/USB-C/UCSI functions are
+    // left as they are) and the root port above it. L1 only, never L0s; only
+    // when both ends advertise L1, Common Clock Configuration is already set
+    // on both (no retrain), and the endpoint's L1 acceptable latency covers
+    // the larger exit latency. Enable: upstream first; disable: downstream
+    // first (as Linux). Status reports link and root-port AER state.
+    constexpr char aspmPrefix[]="bridge hardware gpu-aspm ";
+    if(Prefix(command,aspmPrefix)) {
+        const char* arg=command+sizeof(aspmPrefix)-1;
+        const bool on=!strcmp(arg,"l1"),off=!strcmp(arg,"off"),status=!strcmp(arg,"status");
+        if(!on && !off && !status){DebugChannelSend("{\"aspm_error\":\"Expected l1|off|status\"}\n");return true;}
+        PciDevice gpu{};bool found=false;
+        for(uint32_t i=0;i<PciBootInventoryCount() && !found;++i){PciBootEntry e{};
+            if(PciBootInventoryRead(i,&e) && e.device.vendorId==0x10de && e.device.classCode==0x03 && e.device.fn==0){gpu=e.device;found=true;}}
+        if(!found){DebugChannelSend("{\"aspm_error\":\"No NVIDIA display function 0\"}\n");return true;}
+        auto capOf=[](uint8_t b,uint8_t d,uint8_t f)->uint8_t{
+            if(!(PciConfigRead16(b,d,f,6)&0x10))return 0;uint8_t o=PciConfigRead8(b,d,f,0x34)&0xfc;
+            for(unsigned g=0;o>=0x40 && g<48;++g){if(PciConfigRead8(b,d,f,o)==0x10)return o;o=PciConfigRead8(b,d,f,uint8_t(o+1))&0xfc;}return 0;};
+        uint8_t rb=0,rd=0,rf=0;bool root=false;
+        for(uint32_t d=0;d<32 && !root;++d)for(uint32_t f=0;f<8 && !root;++f){
+            if((PciConfigRead32(0,uint8_t(d),uint8_t(f),0)&0xffff)==0xffff)continue;
+            if((PciConfigRead8(0,uint8_t(d),uint8_t(f),0x0e)&0x7f)==1 && PciConfigRead8(0,uint8_t(d),uint8_t(f),0x19)==gpu.bus){rd=uint8_t(d);rf=uint8_t(f);root=true;}}
+        const uint8_t ec=capOf(gpu.bus,gpu.dev,0),rc=root?capOf(rb,rd,rf):0;
+        if(!ec || !rc){DebugChannelSend("{\"aspm_error\":\"PCIe capability or root port not found\"}\n");return true;}
+        const uint32_t eLinkCap=PciConfigRead32(gpu.bus,gpu.dev,0,uint8_t(ec+0x0c)),rLinkCap=PciConfigRead32(rb,rd,rf,uint8_t(rc+0x0c));
+        const uint32_t eDevCap=PciConfigRead32(gpu.bus,gpu.dev,0,uint8_t(ec+0x04));
+        uint16_t eCtl=PciConfigRead16(gpu.bus,gpu.dev,0,uint8_t(ec+0x10)),rCtl=PciConfigRead16(rb,rd,rf,uint8_t(rc+0x10));
+        auto exitUs=[](uint32_t cap)->uint32_t{const uint32_t v=(cap>>15)&7;return v==7?65:(1u<<v);}; // upper bound
+        auto acceptUs=[](uint32_t devcap)->uint32_t{const uint32_t v=(devcap>>9)&7;return v==7?~0u:(1u<<v);};
+        const bool l1Both=((eLinkCap>>10)&2)&&((rLinkCap>>10)&2);
+        const bool ccc=(eCtl&0x40)&&(rCtl&0x40);
+        const uint32_t worst=exitUs(eLinkCap)>exitUs(rLinkCap)?exitUs(eLinkCap):exitUs(rLinkCap);
+        const bool latencyOk=acceptUs(eDevCap)>=worst;
+        const char* result="status";
+        if(on){
+            if(!l1Both)result="refused: L1 not supported on both ends";
+            else if(!ccc)result="refused: common clock not configured (would need a retrain)";
+            else if(!latencyOk)result="refused: L1 exit latency exceeds the endpoint's acceptable latency";
+            else{PciConfigWrite16(rb,rd,rf,uint8_t(rc+0x10),uint16_t((rCtl&~3u)|2u));
+                 PciConfigWrite16(gpu.bus,gpu.dev,0,uint8_t(ec+0x10),uint16_t((eCtl&~3u)|2u));result="L1 enabled (root port, then GPU fn0)";
+                 KPrintf("pcie: ASPM L1 enabled on 00:%02x.%u and %02x:%02x.0 (runtime)\n",rd,rf,gpu.bus,gpu.dev);}
+        } else if(off){
+            PciConfigWrite16(gpu.bus,gpu.dev,0,uint8_t(ec+0x10),uint16_t(eCtl&~3u));
+            PciConfigWrite16(rb,rd,rf,uint8_t(rc+0x10),uint16_t(rCtl&~3u));result="ASPM disabled (GPU fn0, then root port)";
+            KPrintf("pcie: ASPM disabled on %02x:%02x.0 and 00:%02x.%u\n",gpu.bus,gpu.dev,rd,rf);
+        }
+        eCtl=PciConfigRead16(gpu.bus,gpu.dev,0,uint8_t(ec+0x10));rCtl=PciConfigRead16(rb,rd,rf,uint8_t(rc+0x10));
+        const uint16_t eSta=PciConfigRead16(gpu.bus,gpu.dev,0,uint8_t(ec+0x12)),rSta=PciConfigRead16(rb,rd,rf,uint8_t(rc+0x12));
+        // Error indication: PCIe Device Status (bit 0 correctable, 1 non-fatal, 2 fatal) on both ends.
+        Reply r;r.text("{\"aspm_api\":1,\"result\":");r.quoted(result);
+        r.text(",");r.field("gpu_link_ctl",eCtl);r.text(",");r.field("gpu_link_sta",eSta);
+        r.text(",");r.field("root_link_ctl",rCtl);r.text(",");r.field("root_link_sta",rSta);
+        r.text(",");r.field("root_dev_sta",PciConfigRead16(rb,rd,rf,uint8_t(rc+0x0a)));
+        r.text(",");r.field("gpu_dev_sta",PciConfigRead16(gpu.bus,gpu.dev,0,uint8_t(ec+0x0a)));
+        r.text(",");r.field("gpu_l1_exit_us",exitUs(eLinkCap));r.text(",");r.field("root_l1_exit_us",exitUs(rLinkCap));
+        r.text(",");r.field("gpu_l1_accept_us",acceptUs(eDevCap));r.text("}\n");r.send();return true;
+    }
     // NVIDIA display survey: read-only 32-bit reads from BAR0 of the first
     // 10de display function, through a read-only uncached one-page mapping
     // (no VMM_WRITABLE), only inside an allow-list (PMC, fuses, PRAMIN window
