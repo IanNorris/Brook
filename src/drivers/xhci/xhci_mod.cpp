@@ -414,6 +414,7 @@ static inline void xhci_write64(volatile uint8_t* base, uint32_t off, uint64_t v
 struct XhciController {
     PciDevice    pciDev;
     volatile uint8_t* capBase;     // capability registers
+    uint32_t mapBytes;             // bytes of BAR0 mapped at capBase
     volatile uint8_t* opBase;      // operational registers (capBase + capLength)
     volatile uint8_t* rtBase;      // runtime registers
     volatile uint8_t* dbBase;      // doorbell registers
@@ -610,7 +611,8 @@ static bool XhciPciDetect(XhciController& ctrl, const PciDevice& dev)
     PciEnableMemSpace(dev);
 
     // Map BAR0 (64-bit MMIO) — map a generous region to cover all register spaces
-    ctrl.capBase = MapBar64(dev, 0, 64 * 1024);
+    ctrl.mapBytes = 64 * 1024;
+    ctrl.capBase = MapBar64(dev, 0, ctrl.mapBytes);
     if (!ctrl.capBase) {
         SerialPuts("xhci: failed to map BAR0\n");
         ctrl.failure = "BAR0 map failed";
@@ -638,20 +640,44 @@ static bool XhciPciDetect(XhciController& ctrl, const PciDevice& dev)
         KPrintf("xhci: c%u uses 32-bit DMA (%s)\n",ctrl.index,(hccParams1&HCC_AC64)?"ASMedia quirk":"no AC64");
     }
 
-    // Operational registers are at capBase + capLength
-    ctrl.opBase = ctrl.capBase + ctrl.capLength;
-
     // Doorbell offset
     uint32_t dboff = xhci_read32(ctrl.capBase, XHCI_CAP_DBOFF) & ~0x3;
-    if(ctrl.capLength<0x20 || uint32_t(ctrl.capLength)+XHCI_OP_PORTSC_BASE+ctrl.maxPorts*16>65536 ||
-       dboff>65536-(ctrl.maxSlots+1)*4) {
+    uint32_t rtsoff = xhci_read32(ctrl.capBase, XHCI_CAP_RTSOFF) & ~0x1F;
+    // The register spaces need not fit in 64 KiB (the RTX 20xx USB-C xHCI,
+    // 10de:1ad8, places them higher in its BAR). The capability registers
+    // define the extent; map that much (bounded) instead of assuming 64 KiB.
+    {
+        uint64_t needed = uint64_t(ctrl.capLength) + XHCI_OP_PORTSC_BASE + uint64_t(ctrl.maxPorts) * 16;
+        const uint64_t doorbells = uint64_t(dboff) + (uint64_t(ctrl.maxSlots) + 1) * 4;
+        const uint64_t runtime = uint64_t(rtsoff) + 0x20 + uint64_t(ctrl.maxIntrs ? ctrl.maxIntrs : 1) * 32;
+        const uint64_t extended = uint64_t(hccParams1 >> 16) * 4 + 16;
+        if (doorbells > needed) needed = doorbells;
+        if (runtime > needed) needed = runtime;
+        if (extended > needed) needed = extended;
+        needed = (needed + 4095) & ~uint64_t(4095);
+        if (needed > ctrl.mapBytes && needed <= 4u * 1024 * 1024) {
+            auto* wider = MapBar64(dev, 0, static_cast<uint32_t>(needed));
+            if (wider) {
+                // The first window stays mapped (a few pages of VA); harmless.
+                ctrl.capBase = wider;
+                ctrl.mapBytes = static_cast<uint32_t>(needed);
+                KPrintf("xhci: c%u register window %u KiB (dboff=0x%x rtsoff=0x%x)\n", ctrl.index,
+                        ctrl.mapBytes / 1024, dboff, rtsoff);
+            }
+        }
+    }
+
+    // Operational registers are at capBase + capLength
+    ctrl.opBase = ctrl.capBase + ctrl.capLength;
+    const uint32_t window = ctrl.mapBytes;
+    if(ctrl.capLength<0x20 || uint32_t(ctrl.capLength)+XHCI_OP_PORTSC_BASE+ctrl.maxPorts*16>window ||
+       dboff>window-(ctrl.maxSlots+1)*4) {
         SerialPuts("xhci: invalid operational/doorbell register bounds\n");ctrl.failure="register bounds";return false;
     }
     ctrl.dbBase = ctrl.capBase + dboff;
 
     // Runtime register offset
-    uint32_t rtsoff = xhci_read32(ctrl.capBase, XHCI_CAP_RTSOFF) & ~0x1F;
-    if(rtsoff>65536-0x40 || !ctrl.maxSlots || !ctrl.maxPorts || !ctrl.maxIntrs) {
+    if(rtsoff>window-0x40 || !ctrl.maxSlots || !ctrl.maxPorts || !ctrl.maxIntrs) {
         SerialPuts("xhci: invalid runtime/capability bounds\n");ctrl.failure="capability bounds";return false;
     }
     ctrl.rtBase = ctrl.capBase + rtsoff;
@@ -3688,7 +3714,7 @@ static void XhciParseProtocols(XhciController& ctrl)
 {
     // Supported Protocol capabilities (ID 2) map root ports to USB2/USB3.
     uint32_t offset=(xhci_read32(ctrl.capBase,XHCI_CAP_HCCPARAMS1)>>16)*4;
-    for(unsigned hops=0;offset && offset<=65536-16 && !(offset&3) && hops<256;++hops) {
+    for(unsigned hops=0;offset && offset<=ctrl.mapBytes-16 && !(offset&3) && hops<256;++hops) {
         const uint32_t header=xhci_read32(ctrl.capBase,offset);
         if(header==0xffffffffu)break;
         if((header&255)==2) {
@@ -3720,7 +3746,7 @@ static bool XhciBringUp(XhciController& ctrl)
     } ownership{ctrl,ApicTickCount()+1000};
     uint32_t legacy=0;
     const auto extended=(xhci_read32(ctrl.capBase,XHCI_CAP_HCCPARAMS1)>>16)*4;
-    if(!XhciAcquireFirmwareOwnership(ownership,extended,65536,legacy)) {
+    if(!XhciAcquireFirmwareOwnership(ownership,extended,ctrl.mapBytes,legacy)) {
         KPrintf("xhci: c%u firmware ownership handoff failed; controller untouched\n",ctrl.index);
         ctrl.handoffText="FAIL(BIOS owned)";ctrl.failure="firmware handoff failed; controller untouched";return false;
     }
