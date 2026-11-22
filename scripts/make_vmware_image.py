@@ -10,6 +10,7 @@ installed profile.
 
 import argparse
 import gzip
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -57,6 +58,30 @@ run --service --once --console --uid 1000 /nix/profile/bin/hardware-message
 run --service --once --console /nix/profile/bin/waylandd
 run --service --once --console /boot/HWSTATUS.ELF
 '''
+# The Dell desktop's default wallpaper (prepare_hardware_desktop.py): the
+# kernel reads /boot/WALLPAPER.RAW, an <II width,height> header and BGRA
+# pixels, and fits it to the display once at boot.
+WALLPAPER_SOURCE = ROOT / 'data/wallpaper/brook-dawn.png'
+WALLPAPER_SIZE = (1920, 1080)
+
+
+def wallpaper_raw(source=WALLPAPER_SOURCE, size=WALLPAPER_SIZE):
+    from PIL import Image, ImageOps
+    with Image.open(source) as image:
+        fitted = ImageOps.fit(image.convert('RGB'), size)
+    return struct.pack('<II', *size) + fitted.convert('RGBA').tobytes('raw', 'BGRA')
+
+
+def check_wallpaper(data):
+    """Mirror the kernel loader's admission (shell.cpp WallpaperLoaderThread)."""
+    if len(data) <= 8:
+        raise ValueError('wallpaper is empty')
+    width, height = struct.unpack_from('<II', data)
+    if not (0 < width <= 3840 and 0 < height <= 2160) or len(data) != 8 + width * height * 4:
+        raise ValueError(f'wallpaper header {width}x{height} does not match {len(data)} bytes')
+    return width, height
+
+
 RECOVERY_RC = b'set wm\nset vfb none\nkconsole\nrun --service --once --console /boot/HWSTATUS.ELF\n'
 
 
@@ -174,6 +199,9 @@ def make_initrds(work, build, payload, policy, profile, commit, name, autofit):
     fat_write(desktop, 'BOOT/INIT.RC', add_clearwater_start(DESKTOP_RC))
     fat_write(recovery, 'BOOT/INIT.RC', RECOVERY_RC)
     fat_write(desktop, 'BOOT/BIN/BASH', (profile / 'bin/bash').read_bytes())
+    wallpaper = wallpaper_raw()
+    check_wallpaper(wallpaper)
+    fat_write(desktop, 'BOOT/WALLPAPER.RAW', wallpaper)
     for image, suffix in ((desktop, ''), (recovery, '-recovery')):
         fat_write(image, 'ETC/hardware-payload-id', (name + suffix + '\n').encode())
         require_keyless_image(image)
@@ -382,7 +410,10 @@ def main():
               'data_sectors': data_count, 'vmdk_sha256': digest(vmdk),
               'operator_policy_sha256': digest(policy_path), 'loader_sha256': digest(efi),
               'kernel_sha256': digest(kernel), 'desktop_initrd_sha256': digest(desktop),
-              'recovery_initrd_sha256': digest(recovery), 'profile_selection': profile_receipt}
+              'recovery_initrd_sha256': digest(recovery), 'profile_selection': profile_receipt,
+              'wallpaper': {'path': 'BOOT/WALLPAPER.RAW', 'source': str(WALLPAPER_SOURCE.relative_to(ROOT)),
+                            'source_sha256': digest(WALLPAPER_SOURCE),
+                            'sha256': hashlib.sha256(wallpaper_raw()).hexdigest()}}
     (dest / 'manifest.json').write_text(json.dumps(report, indent=2) + '\n')
     for path in (raw, data, work / 'esp.img'):
         path.unlink()

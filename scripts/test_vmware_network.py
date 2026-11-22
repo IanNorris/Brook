@@ -35,6 +35,22 @@ class VmwareNetworkTest(unittest.TestCase):
         self.assertIn('sound.virtualDev = "hdaudio"', vmx)
         self.assertIn('sound.startConnected = "TRUE"', vmx)
 
+    def test_desktop_wallpaper_matches_kernel_format(self):
+        data = make_vmware_image.wallpaper_raw()
+        self.assertEqual(make_vmware_image.check_wallpaper(data), make_vmware_image.WALLPAPER_SIZE)
+        # Not the flat fallback: the dawn image has a real gradient.
+        pixels = data[8:]
+        samples = {pixels[i:i + 3] for i in range(0, len(pixels), 4 * 9973)}
+        self.assertGreater(len(samples), 100)
+        for bad in (data[:8], data[:-4], b'\0' * 8 + data[8:]):
+            with self.assertRaises(ValueError):
+                make_vmware_image.check_wallpaper(bad)
+
+    def test_desktop_initrd_ships_wallpaper(self):
+        import inspect
+        source = inspect.getsource(make_vmware_image.make_initrds)
+        self.assertIn("fat_write(desktop, 'BOOT/WALLPAPER.RAW', wallpaper)", source)
+
     def test_generated_vmx_disables_floppy(self):
         for vmx in (make_vmware_image.vmx('nat'), make_vmware_probe.PROBE_VMX):
             self.assertEqual([line for line in vmx.splitlines() if line.startswith('floppy0.')],
