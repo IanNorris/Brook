@@ -1125,7 +1125,7 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
             }
             return -11;
         };
-        Reply r;r.text("{\"aux_api\":1,");r.field("ch",ch);
+        Reply r;r.text("{\"aux_api\":1,");r.field("ch",ch);r.text(",");
         uint8_t buf[128]{};int rc=ok?0:-16;uint32_t got=0;
         if(ok&&rdMode){uint32_t n=len;rc=xfer(0x9,addr,buf,n);got=rc?0:n;}
         else if(ok&&edMode){
