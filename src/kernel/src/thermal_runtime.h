@@ -2,6 +2,7 @@
 // Kernel thermal/power sampler API (implementation: thermal_sampler.cpp).
 #include <stdint.h>
 #include "thermal_sampler.h"
+#include "thermal_balance.h"
 
 namespace brook {
 
@@ -16,6 +17,28 @@ int ThermalStartRatioTrial(unsigned ratio,unsigned seconds);
 // and/or the package under tempC (0 = that target off). Starts when off,
 // retargets when running; both zero turns it off. See cpu_power_budget.h.
 int ThermalSetCpuBudget(uint32_t coresMw,int32_t tempC);
+
+// Combined CPU + GPU balance controller (thermal_balance.h), off by default.
+// Enable: same AC-only Broadwell-U admission as the budget (-95 otherwise),
+// takes the PERF_CTL owner in external mode (-16 if the budget or ratio trial
+// holds it). Disable, AC loss or ineligibility restore PERF_CTL on every CPU
+// and remove the render clock overlay (back to the fixed/auto request).
+enum class ThermalBalanceOutcome : uint8_t { None, Running, Disabled, Ineligible, OwnerLost, Unsupported };
+struct ThermalBalanceStatus {
+    bool available = false, enabled = false, ownerActive = false;
+    ThermalBalanceOutcome outcome = ThermalBalanceOutcome::None;
+    BalanceConfig config{};
+    BalanceLimits limits{};
+    BalanceState state{};
+    BalanceSample last{};
+    uint32_t appliedCap = 0, appliedGpuMhz = 0, gpuActualMhz = 0;
+    uint64_t startedAt = 0, lastSampleAt = 0;
+};
+int ThermalBalanceEnable();
+void ThermalBalanceDisable();
+// Retargets live when on; kept for the next enable when off. -22 invalid.
+int ThermalBalanceConfigure(const BalanceConfig& config);
+ThermalBalanceStatus ThermalBalanceRead();
 
 struct ThermalSnapshot {
     bool available = false, rapl = false, aperf = false;

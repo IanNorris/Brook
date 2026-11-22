@@ -16,7 +16,10 @@ namespace brook {
 struct CpuBudgetConfig {
     uint32_t coresMw = 0; // RAPL PP0 target, 0 = no power target
     int32_t tempC = 0;    // package DTS target, 0 = no temperature target
-    bool Any() const { return coresMw || tempC; }
+    // External: no built-in law; another controller (thermal_balance.h)
+    // moves the cap with SetCap. Excludes the two targets above.
+    bool external = false;
+    bool Any() const { return coresMw || tempC || external; }
 };
 
 struct CpuBudgetSample {
@@ -117,6 +120,7 @@ public:
 
     static bool Valid(const CpuBudgetConfig& c)
     {
+        if (c.external) return !c.coresMw && !c.tempC;
         return c.Any() && (!c.coresMw || (c.coresMw >= MinMw && c.coresMw <= MaxMw)) &&
                (!c.tempC || (c.tempC >= MinTempC && c.tempC <= MaxTempC));
     }
@@ -141,7 +145,7 @@ public:
     // Runtime retarget without re-snapshotting.
     bool SetConfig(const CpuBudgetConfig& c)
     {
-        if ((phase != Phase::Snapshot && phase != Phase::Active) || !Valid(c)) return false;
+        if ((phase != Phase::Snapshot && phase != Phase::Active) || !Valid(c) || c.external != config.external) return false;
         config = c;
         return true;
     }
@@ -157,7 +161,7 @@ public:
 
     void Control(uint64_t now, const CpuBudgetSample& s)
     {
-        if (phase != Phase::Active) return;
+        if (phase != Phase::Active || config.external) return;
         const unsigned before = cap;
         lastSample = s;
         lastControlAt = now;
@@ -168,6 +172,23 @@ public:
         if (!cap) ++releases;
         else if (!before || cap < before) ++stepsDown;
         else ++stepsUp;
+    }
+
+    // External mode only: set the cap (0 = released), clamped to the range.
+    bool SetCap(uint64_t now, unsigned next)
+    {
+        if (phase != Phase::Active || !config.external) return false;
+        if (next && next < limits.minRatio) next = limits.minRatio;
+        if (next > limits.capTop) next = limits.capTop;
+        if (next == cap) return true;
+        const unsigned before = cap;
+        cap = next;
+        lastControlAt = lastStepAt = now;
+        ++controls;
+        if (!cap) ++releases;
+        else if (!before || cap < before) ++stepsDown;
+        else ++stepsUp;
+        return true;
     }
 
     unsigned Desired(unsigned cpu) const { return cap && cap < original[cpu] ? cap : original[cpu]; }

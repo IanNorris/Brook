@@ -1178,6 +1178,8 @@ target_compile_options(test_boot_timing PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/s
 add_host_test(test_intel_bdw_node_cache)
 add_host_test(test_cpu_idle)
 target_compile_options(test_cpu_idle PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
+add_host_test(test_thermal_balance)
+target_compile_options(test_thermal_balance PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 
 add_host_test(test_arp_neighbor)
 target_compile_options(test_arp_neighbor PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")

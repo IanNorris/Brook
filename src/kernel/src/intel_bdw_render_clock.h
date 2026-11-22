@@ -123,6 +123,9 @@ struct BdwClockState {
     uint32_t lastRequestedBin=0; // bin the worker asked for on its last job
     uint64_t lastSampleTsc=0;
     bool automatic=false;        // changed only by the runtime clock command
+    // `thermal balance` overlay (thermal_balance.h): when non-zero it replaces
+    // the fixed/auto target. It never clears or bypasses the thermal trip.
+    uint32_t balanceMhz=0;
     bool autoAdmitted=false;     // last job had usable power, caps and timing
     BdwClockAutoPolicy policy{};
 };
@@ -130,7 +133,7 @@ struct BdwClockState {
 // Pure decision used by the worker: which bin to request for this job.
 inline uint32_t BdwClockEffectiveBin(const BdwClockState& s){
     const auto caps=BdwClockDecodeCaps(s.lastCaps);
-    const uint32_t target=s.automatic?s.policy.requestedMhz:s.requestedMhz;
+    const uint32_t target=s.balanceMhz?s.balanceMhz:s.automatic?s.policy.requestedMhz:s.requestedMhz;
     const uint32_t mhz=s.tripped?BdwClockDefaultMhz:target;
     if(!caps.valid)return BdwClockDefaultMhz/BdwClockBinMhz;
     return BdwClockClampBin(mhz,caps);
@@ -139,7 +142,7 @@ inline uint32_t BdwClockEffectiveBin(const BdwClockState& s){
 // caps without writing a new ratio.
 inline uint32_t BdwClockSelectRequest(BdwClockState& s,bool deviceAdmitted,
                                       const BdwClockLoadSample& load,uint64_t tscKhz){
-    if(!s.automatic)return BdwClockEffectiveBin(s);
+    if(!s.automatic || s.balanceMhz)return BdwClockEffectiveBin(s);
 
     const auto caps=BdwClockDecodeCaps(s.lastCaps);
     s.autoAdmitted=deviceAdmitted && caps.valid && tscKhz &&
@@ -165,6 +168,8 @@ inline int BdwClockNoteTemp(BdwClockState& s,int32_t tempC,uint64_t nowMs){
     if(nowMs-s.coolSinceMs<BdwClockRecoverMs)return 0;
     s.tripped=0;s.coolSinceMs=0;s.recoveries++;return -1;
 }
+// Balance overlay: 0 removes it (the fixed/auto request applies again).
+inline void BdwClockSetBalance(BdwClockState& s,uint32_t mhz){s.balanceMhz=mhz;}
 // `gpu clock <MHz>`: set the request (clears a latched thermal trip).
 inline void BdwClockSetAuto(BdwClockState& s){
     if(s.automatic)return;

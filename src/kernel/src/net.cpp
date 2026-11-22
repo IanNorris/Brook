@@ -6365,6 +6365,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  thermal status|history|graph|power|reset - CPU/GPU temperature, power and frequency sampler\n"
             "  thermal cpu-first epb BIAS SECONDS | ratio RATIO SECONDS | status | off - timed AC-only EPB / PERF_CTL ratio-cap experiments\n"
             "  thermal cpu-budget WATTS|off|status | temp C|off | power WATTS|off - AC-only closed-loop PERF_CTL cap on cores (PP0) power / package temp (default off)\n"
+            "  thermal balance on|off|status | target C | power WATTS - AC-only combined CPU cap + GPU clock boost under sustained load (default off, target 75 C)\n"
             "  gpu scene wake on|off|status - default-off scene completion notification experiment\n"
             "  audio shared-prefix on|off|reset|status - experimental headroom-gated mix batching (default off)\n"
             "  audio horizon on|off|reset|status - experimental guarded output target and prospective OSS geometry (default off)\n"
@@ -7232,6 +7233,104 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         }
         r.text("]}}\n");r.send();
     }
+    else if(NetStrEq(cmd,"thermal balance") || StrStartsWith(cmd,"thermal balance ")) {
+        // Combined CPU + GPU controller (thermal_balance.h). target/power set
+        // the config (live when on, kept for the next `on`).
+        const char* arg=cmd+sizeof("thermal balance")-1;
+        int result=0;
+        auto config=ThermalBalanceRead().config;
+        if(!*arg || NetStrEq(arg," status")){}
+        else if(NetStrEq(arg," on")) result=ThermalBalanceEnable();
+        else if(NetStrEq(arg," off")) ThermalBalanceDisable();
+        else if(StrStartsWith(arg," target ")){
+            const char* t=arg+sizeof(" target ")-1;unsigned c=0,d=0;
+            for(;*t>='0' && *t<='9' && d<3;++t,++d) c=c*10+unsigned(*t-'0');
+            if(!d || *t) result=-22; else {config.targetC=int32_t(c);result=ThermalBalanceConfigure(config);}
+        }
+        else if(StrStartsWith(arg," power ")){
+            const char* t=arg+sizeof(" power ")-1;uint32_t whole=0,frac=0,d=0,fd=0;
+            for(;*t>='0' && *t<='9' && d<3;++t,++d) whole=whole*10+uint32_t(*t-'0');
+            if(*t=='.'){++t;for(;*t>='0' && *t<='9' && fd<2;++t,++fd) frac=frac*10+uint32_t(*t-'0');}
+            if(!d || *t) result=-22;
+            else {config.pkgLimitMw=whole*1000+(fd==1?frac*100:frac*10);result=ThermalBalanceConfigure(config);}
+        }
+        else result=-22;
+        const auto b=ThermalBalanceRead();
+        const auto& st=b.state;
+        static const char* outcomes[]={"none","running","disabled","ineligible","owner_lost","unsupported"};
+        static const char* reasons[]={"none","no_sample","settling","wait","band","load_heavy","load_light","hold_hot","spike","trip",
+                                      "over_temp","predicted","over_power","gpu_idle","headroom"};
+        static const char* actions[]={"none","engage","release","cpu_down","cpu_up","gpu_down","gpu_up","cpu_cap_hot","at_floor","at_top"};
+        auto sfield=[](BridgeReply& r,const char* name,int64_t v){r.text("\"");r.text(name);r.text("\":");if(v<0){r.text("-");v=-v;}r.number(uint64_t(v));};
+        const uint64_t now=ApicTickCount();
+#if defined(BROOK_BDW_RPS_TRIAL)
+        const auto clock=BdwClockReadStatus();
+        const uint64_t effectiveMhz=BdwClockEffectiveBin(clock)*BdwClockBinMhz;
+        const uint64_t lastJobMhz=clock.lastRequestedBin*BdwClockBinMhz;
+        const bool tripped=clock.tripped;
+#else
+        const uint64_t effectiveMhz=0,lastJobMhz=0;const bool tripped=false;
+#endif
+        BridgeReply r;
+        r.text("{");r.field("errno",uint64_t(-result));
+        r.text(",\"available\":");r.text(b.available?"true":"false");
+        r.text(",\"enabled\":");r.text(b.enabled?"true":"false");
+        r.text(",\"outcome\":");r.quoted(outcomes[unsigned(b.outcome)]);
+        r.text(",\"owner_active\":");r.text(b.ownerActive?"true":"false");
+        r.text(",\"mode\":");r.quoted(!b.enabled?"off":!b.ownerActive?"starting":st.mode==BalanceMode::Heavy?"heavy":"light");
+        r.text(",");sfield(r,"target_c",b.config.targetC);
+        r.text(",");r.field("pkg_limit_mw",b.config.pkgLimitMw);
+        r.text(",\"last_reason\":");r.quoted(reasons[unsigned(st.lastReason)]);
+        r.text(",\"last_action\":");r.quoted(actions[unsigned(st.lastAction)]);
+        r.text(",\"last_step_reason\":");r.quoted(reasons[unsigned(st.lastStepReason)]);
+        r.text(",");r.field("gpu_busy_permille",st.filter.busy);
+        r.text(",");r.field("c0_pct",st.filter.c0);
+        r.text(",");sfield(r,"filtered_pkg_c",st.filter.Temp());
+        r.text(",");sfield(r,"predicted_pkg_c",st.filter.Predicted());
+        r.text(",");sfield(r,"slow_pkg_c",(st.filter.slow16+8)/16);
+        r.text(",");r.field("filtered_pkg_mw",st.filter.pkgMw);
+        r.text(",");r.field("filtered_gt_mw",st.filter.gtMw);
+        r.text(",");sfield(r,"last_pkg_c",b.last.pkgC);
+        r.text(",");r.field("last_pkg_mw",b.last.pkgMw);
+        r.text(",");r.field("last_gt_mw",b.last.gtMw);
+        r.text(",");r.field("last_gpu_busy_permille",b.last.gpuBusyPermille);
+        r.text(",");r.field("cpu_cap_ratio",st.cap);
+        r.text(",\"cpu_released\":");r.text(st.cap?"false":"true");
+        r.text(",");r.field("cpu_applied_cap",b.appliedCap);
+        r.text(",");r.field("cpu_floor",b.limits.floorRatio);
+        r.text(",");r.field("cpu_cap_top",b.limits.capTop);
+        r.text(",");r.field("cpu_min_ratio",b.limits.minRatio);
+        r.text(",");r.field("gpu_requested_mhz",st.gpuMhz);
+        r.text(",");r.field("gpu_overlay_mhz",b.appliedGpuMhz);
+        r.text(",");r.field("gpu_effective_mhz",effectiveMhz);
+        r.text(",");r.field("gpu_last_job_mhz",lastJobMhz);
+        r.text(",");r.field("gpu_actual_mhz",b.gpuActualMhz);
+        r.text(",");r.field("gpu_base_mhz",b.limits.gpuBaseMhz);
+        r.text(",");r.field("gpu_max_mhz",b.limits.gpuMaxMhz);
+        r.text(",\"gpu_tripped\":");r.text(tripped?"true":"false");
+        r.text(",");r.field("samples",st.samples);
+        r.text(",");r.field("engages",st.engages);
+        r.text(",");r.field("releases",st.releases);
+        r.text(",");r.field("reengages",st.reengages);
+        r.text(",");r.field("cpu_down",st.cpuDown);
+        r.text(",");r.field("cpu_up",st.cpuUp);
+        r.text(",");r.field("gpu_down",st.gpuDown);
+        r.text(",");r.field("gpu_up",st.gpuUp);
+        r.text(",");r.field("gpu_idle_down",st.gpuIdleDown);
+        r.text(",");r.field("spikes",st.spikes);
+        r.text(",");r.field("trips_seen",st.trips);
+        r.text(",");r.field("reversals",st.reversals);
+        r.text(",");r.field("premature_ups",st.prematureUps);
+        r.text(",");r.field("below_floor_steps",st.belowFloor);
+        r.text(",");r.field("min_cap_seen",st.minCapSeen);
+        r.text(",");r.field("max_gpu_seen_mhz",st.maxGpuSeen);
+        r.text(",");r.field("up_backoff",st.upBackoff);
+        r.text(",");r.field("light_hold_ms",uint64_t(st.lightHold)*ThermalPeriodMs);
+        r.text(",");r.field("active_ms",b.enabled && b.startedAt?now-b.startedAt:0);
+        r.text(",");r.field("since_step_ms",st.lastStepMs && b.enabled?now-st.lastStepMs:0);
+        r.text(",\"scope\":\"heavy = gpu worker app+compositor busy >= 80% or avg C0 >= 70% for 1 s; light = busy < 50% and C0 < 40% for light_hold_ms. Heavy caps PERF_CTL at cap_top, raises the render clock 50/100 MHz per >= 2 s while filtered pkg <= target-5 and predicted <= target-3, lowers CPU to floor then GPU then CPU below floor at target-1 / predicted target+3 / pkg power over limit, fast-down at instant >= target+8 or a 90 C trip. Off restores PERF_CTL and the default render request; the 90 C trip is unchanged.\"}\n");
+        r.send();
+    }
     else if(StrStartsWith(cmd,"thermal cpu-budget")) {
         // Closed-loop PERF_CTL ratio cap (cpu_power_budget.h). WATTS accepts
         // up to two decimals ("3.5"); `temp C` adds a package target.
@@ -7276,6 +7375,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",\"outcome\":");r.quoted(outcomes[unsigned(b.outcome)]);
         r.text(",");r.field("target_cores_mw",b.config.coresMw);
         r.text(",");sfield(r,"target_pkg_c",b.config.tempC);
+        r.text(",\"external\":");r.text(b.config.external?"true":"false");
         r.text(",");r.field("cap_ratio",b.cap);
         r.text(",\"released\":");r.text(b.cap?"false":"true");
         r.text(",");r.field("min_ratio",b.limits.minRatio);
@@ -7404,11 +7504,12 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             const int32_t temp=BdwClockReadTempC();
             BridgeReply r;
             r.text("{");r.field("requested_mhz",st.automatic?st.policy.requestedMhz:st.requestedMhz);
-            r.text(",\"mode\":");r.quoted(st.automatic?"auto":"fixed");
+            r.text(",\"mode\":");r.quoted(st.balanceMhz?"balance":st.automatic?"auto":"fixed");
+            r.text(",");r.field("balance_mhz",st.balanceMhz);
             r.text(",\"auto_admitted\":");r.text(st.autoAdmitted?"true":"false");
             r.text(",");r.field("auto_render_load_permille",st.automatic?st.policy.loadPermille:0);
             r.text(",");r.field("effective_mhz",
-                st.automatic && !st.autoAdmitted?0:BdwClockEffectiveBin(st)*BdwClockBinMhz);
+                st.automatic && !st.autoAdmitted && !st.balanceMhz?0:BdwClockEffectiveBin(st)*BdwClockBinMhz);
             r.text(",");r.field("last_job_mhz",st.lastRequestedBin*BdwClockBinMhz);
             r.text(",\"caps_valid\":");r.text(caps.valid?"true":"false");
             r.text(",");r.field("rpn_mhz",caps.rpn*BdwClockBinMhz);
