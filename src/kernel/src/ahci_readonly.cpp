@@ -5,6 +5,7 @@
 #include "ahci_firmware_handoff.h"
 #include "ahci_write_plan.h"
 #include "ssd_trim_plan.h"
+#include "ssd_trim_log.h"
 #include "ahci_byte_write.h"
 #include "ahci_panic_gate.h"
 #include "ahci_write_target.h"
@@ -926,7 +927,7 @@ uint16_t AhciTrimPayloadLimit(Device* parent) {
 }
 
 int AhciTrimBatch(Device* parent, TrimRange partition, const TrimRange* ranges,
-                  uint32_t count, bool submit, AhciTrimStats& stats) {
+                  uint32_t count, bool submit, AhciTrimStats& stats, SsdTrimLog* log) {
     const uint16_t limit=AhciTrimPayloadLimit(parent);
     if(!limit)return -95;
     if(!ranges || !count || !TrimRangeInside(partition,{0,status.sectors}))return -22;
@@ -941,6 +942,7 @@ int AhciTrimBatch(Device* parent, TrimRange partition, const TrimRange* ranges,
                 AhciReadPlan plan{};
                 if(!guard.admitted || !status.ready ||
                    !AhciPlanTrim(plan,blocks,limit,dmaPhys+dataOffset,dma64)) {
+                    if(log)log->AddCommand(blocks,0,false,false);
                     error=-5;
                     return false;
                 }
@@ -950,10 +952,13 @@ int AhciTrimBatch(Device* parent, TrimRange partition, const TrimRange* ranges,
                 const uint64_t elapsed=RtcNowNs()-started;
                 stats.commandTotalNs+=elapsed;
                 if(elapsed>stats.commandMaxNs)stats.commandMaxNs=elapsed;
+                if(log)log->AddCommand(blocks,elapsed,true,completed);
                 if(!completed) {
                     error=-5;
                     return false;
                 }
+            } else if(log) {
+                log->AddCommand(blocks,0,false,true);
             }
             ++stats.commands;
             return true;

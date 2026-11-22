@@ -4,6 +4,7 @@
 namespace brook {
 struct Device;
 struct TrimRange;
+struct SsdTrimLog;
 struct AhciReadOnlyStatus {
     bool requested=false, ready=false, quarantined=false;
     const char* reason="not requested";
@@ -43,8 +44,11 @@ struct AhciTrimStats {
     uint32_t commands = 0;
     uint64_t commandTotalNs = 0, commandMaxNs = 0;
 };
+// log, when given, receives one entry per planned or submitted command
+// (including a failed attempt) tagged with its current batch.
 int AhciTrimBatch(Device* parent, TrimRange partition, const TrimRange* ranges,
-                  uint32_t count, bool submit, AhciTrimStats& stats);
+                  uint32_t count, bool submit, AhciTrimStats& stats,
+                  SsdTrimLog* log = nullptr);
 
 #if defined(BROOK_SSD_INSTALLER)
 Device* AhciPhysicalInstallDevice();

@@ -18,6 +18,7 @@
 #include "guard_checker_session.h"
 #include "guard_fat_profile.h"
 #include "ext2_trim_plan.h"
+#include "ssd_trim_log.h"
 #include "rtc.h"
 #endif
 #if defined(BROOK_AHCI_PANIC_TEST)
@@ -609,6 +610,93 @@ static bool TrimSetFilesystemState(uint8_t state) {
         verified[0]==state && verified[1]==0;
 }
 
+// The discard window forbids volume writes, so the record waits in RAM
+// until the guarded desktop mount is ready, then persists as JSON lines.
+constexpr uint32_t TrimLogRangeCapacity=32768;
+constexpr uint32_t TrimLogCommandCapacity=8192;
+struct TrimPendingLog {
+    bool pending=false;
+    SsdTrimLog log{};
+    SsdTrimLogHeader header{};
+    SsdTrimLogResult result{};
+};
+static TrimPendingLog trimPendingLog;
+
+static void TrimReleaseLog() {
+    kfree(trimPendingLog.log.ranges);
+    kfree(trimPendingLog.log.commands);
+    trimPendingLog=TrimPendingLog{};
+}
+
+// Console context for a failed DSM: the failing command and its batch's
+// ranges (at most 16), since an unmounted volume cannot hold the record.
+static void TrimPrintFailure(const SsdTrimLog& log) {
+    for(uint32_t i=0;i<log.commandCount;++i) {
+        const auto& command=log.commands[i];
+        if(command.ok)continue;
+        KPrintf("SSD_TRIM_FAILED_COMMAND {\"i\":%u,\"batch\":%u,\"payload_blocks\":%u,\"ns\":%lu,\"submitted\":%s}\n",
+                i,command.batch,unsigned(command.payloadBlocks),command.ns,command.submitted?"true":"false");
+        for(uint32_t r=0;r<log.rangeCount;++r)
+            if(log.ranges[r].batch==command.batch)
+                KPrintf("SSD_TRIM_FAILED_RANGE {\"lba\":%lu,\"sectors\":%lu}\n",
+                        log.ranges[r].lba,log.ranges[r].sectors);
+    }
+}
+
+// Called once the guarded mount is published (normal writable session).
+static void TrimWritePendingLog() {
+    if(!trimPendingLog.pending)return;
+    int error=0;
+    static const char* const directories[]={"/nix/var","/nix/var/log","/nix/var/log/brook"};
+    for(const char* dir:directories) {
+        const int r=VfsMkdir(dir,0755);
+        if(r && r!=-17) {error=r;break;}
+    }
+    char path[96]{};
+    {
+        SsdTrimText name{path,sizeof(path)};
+        name.Str("/nix/var/log/brook/ssd-trim-");
+        name.U64(trimPendingLog.header.startedUnixNs/1000000000ull);
+        name.Str(".jsonl");
+    }
+    const auto& log=trimPendingLog.log;
+    const uint64_t lines=SsdTrimLogLineCount(log);
+    uint64_t written=0;
+    Vnode* node=error?nullptr:VfsOpenMode(path,VFS_O_WRITE|VFS_O_READWRITE|VFS_O_CREATE|VFS_O_TRUNC,0644);
+    if(!error && !node)error=-2;
+    auto* chunk=node?static_cast<char*>(kmalloc(8192)):nullptr;
+    if(node && !chunk)error=-12;
+    if(chunk) {
+        uint64_t offset=0;
+        size_t used=0;
+        char line[SsdTrimLogLineMax];
+        auto flush=[&] {
+            if(!used)return true;
+            const int n=VfsWrite(node,chunk,uint32_t(used),&offset);
+            if(n!=int(used)) {error=n<0?n:-5;return false;}
+            written+=used;used=0;
+            return true;
+        };
+        for(uint64_t i=0;i<lines && !error;++i) {
+            if(!SsdTrimLogLine(log,trimPendingLog.header,trimPendingLog.result,uint32_t(i),line,sizeof(line))) {
+                error=-75;break;
+            }
+            const size_t n=strlen(line);
+            if(used+n>8192 && !flush())break;
+            memcpy(chunk+used,line,n);used+=n;
+        }
+        if(!error)flush();
+        const int synced=VfsSync(node);
+        if(!error)error=synced;
+        kfree(chunk);
+    }
+    if(node)VfsRelease(node);
+    KPrintf("SSD_TRIM_LOG {\"path\":\"%s\",\"lines\":%lu,\"bytes\":%lu,\"ranges\":%u,\"commands\":%u,"
+            "\"ranges_dropped\":%lu,\"commands_dropped\":%lu,\"error\":%d}\n",
+            path,lines,written,log.rangeCount,log.commandCount,log.rangesDropped,log.commandsDropped,error);
+    TrimReleaseLog();
+}
+
 static int TrimGuardedDataBeforeMount() {
     auto* marker=VfsOpen("/etc/ssd-trim",VFS_O_STREAM);
     if(!marker)return 0;
@@ -627,6 +715,18 @@ static int TrimGuardedDataBeforeMount() {
     uint32_t rangeCount=0;
     AhciTrimStats stats{};
     int error=-22;
+    TrimReleaseLog();
+    auto& log=trimPendingLog.log;
+    log.ranges=static_cast<SsdTrimLogRange*>(kmalloc(sizeof(SsdTrimLogRange)*TrimLogRangeCapacity));
+    log.commands=static_cast<SsdTrimLogCommand*>(kmalloc(sizeof(SsdTrimLogCommand)*TrimLogCommandCapacity));
+    log.rangeCapacity=log.ranges?TrimLogRangeCapacity:0;
+    log.commandCapacity=log.commands?TrimLogCommandCapacity:0;
+    trimPendingLog.header={run,request.minimumMiB,request.maximumMiB,
+                           guardDataRange.start/512,guardDataRange.bytes/512,started};
+    SsdTrimGroupAccumulator groups(guardDataRange.start/512);
+    auto printGroup=[](const SsdTrimGroupSummary& g) {
+        KPrintf("SSD_TRIM_GROUP {\"group\":%u,\"ranges\":%u,\"bytes\":%lu}\n",g.group,g.ranges,g.sectors*512);
+    };
     if(parsed && guardDesktopPhase==GuardDesktopPhase::Preparing &&
        guardDataPhase==GuardDataPhase::Disabled && !directPrepared && !directReady &&
        guardDataRange.parent && !(guardDataRange.start%512) && !(guardDataRange.bytes%512)) {
@@ -645,7 +745,8 @@ static int TrimGuardedDataBeforeMount() {
                         if(!TrimSetFilesystemState(0)) {error=-5;return false;}
                         markedDirty=true;
                     }
-                    error=AhciTrimBatch(guardDataRange.parent,trimWindow,batch,used,run,stats);
+                    error=AhciTrimBatch(guardDataRange.parent,trimWindow,batch,used,run,stats,&log);
+                    log.EndBatch();
                     used=0;
                     return !error;
                 };
@@ -662,8 +763,8 @@ static int TrimGuardedDataBeforeMount() {
                         }
                         sectors+=rangeToTrim.sectors;
                         ++rangeCount;
-                        if(!run)KPrintf("SSD_TRIM_RANGE {\"lba\":%lu,\"sectors\":%lu}\n",
-                                       rangeToTrim.lba,rangeToTrim.sectors);
+                        log.AddRange(rangeToTrim);
+                        groups.Add(rangeToTrim,printGroup);
                         batch[used++]=rangeToTrim;
                         return used<sizeof(batch)/sizeof(batch[0]) || drain();
                     });
@@ -677,11 +778,22 @@ static int TrimGuardedDataBeforeMount() {
             }
         }
     }
+    groups.Finish(printGroup);
+    KPrintf("SSD_TRIM_GROUPS {\"groups\":%u,\"printed\":%u,\"suppressed_groups\":%u,"
+            "\"suppressed_ranges\":%lu,\"suppressed_bytes\":%lu}\n",groups.groups(),groups.printed(),
+            groups.suppressedGroups(),groups.suppressedRanges(),groups.suppressedSectors()*512);
+    if(error)TrimPrintFailure(log);
+    const uint64_t duration=RtcNowNs()-started;
+    trimPendingLog.result={rangeCount,run?stats.commands:0,run?0:stats.commands,sectors*512,
+                           stats.commandTotalNs,stats.commandMaxNs,duration,error};
+    // Persisted only by a successful mount; a failed pass retires the handoff.
+    trimPendingLog.pending=parsed && !error;
+    if(!trimPendingLog.pending)TrimReleaseLog();
     KPrintf("SSD_TRIM {\"mode\":\"%s\",\"ranges\":%u,\"bytes\":%lu,\"dsm_commands\":%u,"
             "\"planned_commands\":%u,\"command_total_ns\":%lu,\"command_max_ns\":%lu,"
             "\"duration_ns\":%lu,\"error\":%d}\n",run?"run":"dry-run",
             rangeCount,sectors*512,run?stats.commands:0,run?0:stats.commands,
-            stats.commandTotalNs,stats.commandMaxNs,RtcNowNs()-started,error);
+            stats.commandTotalNs,stats.commandMaxNs,duration,error);
     return error;
 }
 #endif
@@ -710,6 +822,10 @@ bool AhciSystemGuardTestMountDesktop(Device* adapter,uint8_t* nextDrive,bool* sh
     directLeased=true;directPrepared=true;
     const bool ready=AhciSystemDirectDesktopMount(nextDrive,sharedProfileRejected);
     guardDesktopPhase=ready?GuardDesktopPhase::Ready:GuardDesktopPhase::Failed;
+#if defined(BROOK_SSD_GUARD_TRANSACTION)
+    if(ready)TrimWritePendingLog();
+    else TrimReleaseLog();
+#endif
     return ready;
 }
 int AhciSystemGuardTestFailedDesktopWrite() {

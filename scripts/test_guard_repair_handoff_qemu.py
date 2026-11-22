@@ -57,6 +57,48 @@ def compact(source,dest,tree,size=8*1024*1024,scrub_deployment=False):
 
 
 DATA_FIRST = 133120
+
+
+def check_trim_log(partition, serial, output):
+    """Validate the persisted TRIM record written after the guarded mount."""
+    report = json.loads(re.findall(r'^SSD_TRIM (\{.*\})', serial, re.M)[-1])
+    logs = [json.loads(line) for line in re.findall(r'^SSD_TRIM_LOG (\{.*\})', serial, re.M)]
+    if len(logs) != 1 or logs[0]['error'] or logs[0]['ranges_dropped'] or logs[0]['commands_dropped']:
+        raise RuntimeError(f'TRIM log was not persisted cleanly: {logs}')
+    if serial.index('SSD_TRIM_LOG ') < serial.index('ahci direct: ready '):
+        raise RuntimeError('TRIM log was written before the guarded mount')
+    path = logs[0]['path']
+    if not path.startswith('/nix/var/log/brook/ssd-trim-') or not path.endswith('.jsonl'):
+        raise RuntimeError(f'unexpected TRIM log path {path}')
+    content = subprocess.check_output(['debugfs', '-R', f'cat {path[len("/nix"):]}', str(partition)],
+                                      stderr=subprocess.DEVNULL)
+    (output/'ssd-trim-log.jsonl').write_bytes(content)
+    if len(content) != logs[0]['bytes']:
+        raise RuntimeError('TRIM log size differs from the console record')
+    rows = [json.loads(line) for line in content.decode().splitlines()]
+    header, summary = rows[0], rows[-1]
+    ranges = [row for row in rows if row['type'] == 'range']
+    commands = [row for row in rows if row['type'] == 'command']
+    if (header['type'] != 'header' or summary['type'] != 'summary' or len(rows) != 2+len(ranges)+len(commands) or
+            header['mode'] != report['mode'] or
+            {k: summary[k] for k in report} != report or len(ranges) != report['ranges'] or
+            sum(row['sectors'] for row in ranges)*512 != report['bytes']):
+        raise RuntimeError('TRIM log does not match the SSD_TRIM summary')
+    end = header['partition_lba'] + header['partition_sectors']
+    previous = 0
+    for row in ranges:
+        if (row['lba'] < max(previous, header['partition_lba']) or row['lba']+row['sectors'] > end or
+                row['lba'] % 8 or row['sectors'] % 8 or
+                row['group'] != (row['lba']-header['partition_lba'])//(32768*8)):
+            raise RuntimeError(f'TRIM log range outside the admitted partition: {row}')
+        previous = row['lba']+row['sectors']
+    submitted = report['mode'] == 'run'
+    expected = report['dsm_commands'] if submitted else report['planned_commands']
+    if (len(commands) != expected or any(row['submitted'] != submitted or not row['ok'] for row in commands) or
+            {row['batch'] for row in commands} != {row['batch'] for row in ranges} or
+            (submitted and sum(row['ns'] for row in commands) != report['command_total_ns'])):
+        raise RuntimeError('TRIM log command records do not reconcile')
+    print(f'SSD_TRIM_LOG_PASS ranges={len(ranges)} commands={len(commands)} path={path}', flush=True)
 BASE_DATA_SECTORS = 126976
 TRIM_DATA_SECTORS = 512 * 1024 * 1024 // 512
 TRIM_DISK_SECTORS = DATA_FIRST + TRIM_DATA_SECTORS + 2048
@@ -1057,13 +1099,23 @@ def main():
             if a.ssd_trim=='dry-run' and (report['dsm_commands'] or report['planned_commands'] < 2 or
                                           report['command_total_ns'] or report['command_max_ns'] or before-after > 0):
                 raise RuntimeError('dry-run issued discard or failed to plan commands')
-            if a.ssd_trim=='dry-run':
-                ranges = [json.loads(line) for line in
-                          re.findall(r'^SSD_TRIM_RANGE (\{.*\})',trim_serial,re.M)]
-                groups = {(row['lba']-DATA_FIRST)//(32768*8) for row in ranges}
-                if len(ranges)!=report['ranges'] or len(groups)<3:
-                    raise RuntimeError('dry-run did not cover at least three ext2 groups')
-                report['groups'] = sorted(groups)
+            # Console carries per-group summaries (capped), never per-range lines.
+            if re.search(r'^SSD_TRIM_RANGE ',trim_serial,re.M):
+                raise RuntimeError('TRIM printed per-range console lines')
+            group_rows = [json.loads(line) for line in
+                          re.findall(r'^SSD_TRIM_GROUP (\{.*\})',trim_serial,re.M)]
+            totals = [json.loads(line) for line in re.findall(r'^SSD_TRIM_GROUPS (\{.*\})',trim_serial,re.M)]
+            if len(totals)!=1:
+                raise RuntimeError('expected one SSD_TRIM_GROUPS summary')
+            totals = totals[0]
+            groups = [row['group'] for row in group_rows]
+            if (groups!=sorted(set(groups)) or len(groups)!=totals['printed'] or
+                    totals['groups']!=totals['printed']+totals['suppressed_groups'] or
+                    sum(row['ranges'] for row in group_rows)+totals['suppressed_ranges']!=report['ranges'] or
+                    sum(row['bytes'] for row in group_rows)+totals['suppressed_bytes']!=report['bytes'] or
+                    len(groups)<3):
+                raise RuntimeError(f'TRIM group summary does not reconcile: {totals}')
+            report['groups'] = groups
             if trim_serial.index('SSD_TRIM {') >= trim_serial.index('ahci direct: ready '):
                 raise RuntimeError('allocator was published before TRIM completed')
             report.update(allocated_before=before,allocated_after=after,live_hashes=trim_live)
@@ -1078,6 +1130,12 @@ def main():
                  extra_fw_cfg=['name=opt/guard-journal-pin,string=test-b','name=opt/guard-panic-capture,string=test-1'])
         shutil.copyfile(second/'serial.log',a.output/'desktop-serial.log')
         serial=(second/'serial.log').read_text(errors='replace')
+        if re.search(r'^SSD_TRIM \{',serial,re.M) and not a.ssd_trim:
+            # Maintenance pair on the ordinary fixture: the record must persist.
+            trim_logs=[json.loads(line) for line in re.findall(r'^SSD_TRIM_LOG (\{.*\})',serial,re.M)]
+            if len(trim_logs)!=1 or trim_logs[0]['error'] or re.search(r'^SSD_TRIM_RANGE ',serial,re.M):
+                raise RuntimeError(f'maintenance TRIM boot did not persist its log: {trim_logs}')
+            print('SSD_TRIM_LOG_PASS '+json.dumps(trim_logs[0]),flush=True)
         if a.bridge_local_policy_qa and 'GUARD_DESKTOP_HANDOFF_SCRIPT status=0' not in serial:
             raise RuntimeError('bridge policy probe passed without successful guarded desktop handoff')
         if a.auto_desktop_contention_panic and not all(marker in serial for marker in
@@ -1228,6 +1286,7 @@ def main():
                 raise RuntimeError('desktop panic recovery changed the journal')
         extract_data(disk, partition, data_sectors)
         if a.ssd_trim:
+            check_trim_log(partition, (second/'serial.log').read_text(errors='replace'), a.output)
             with partition.open('rb') as data:
                 data.seek(1024+58)
                 if data.read(2)!=b'\x01\x00':

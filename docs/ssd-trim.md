@@ -19,9 +19,25 @@ forms, with a trailing newline. An empty marker selects a dry run.
 | `run 1 16` | Submit that bounded sample |
 
 The numbers are the minimum run and maximum total in MiB. A maximum of zero
-selects the whole partition. The console emits `SSD_TRIM_RANGE` JSON records
-during a dry run and an `SSD_TRIM` JSON summary with ranges, candidate bytes,
-planned or completed commands, duration and error. The
+selects the whole partition. In both modes the console emits one
+`SSD_TRIM_GROUP` JSON line per ext2 block group with candidates (group,
+ranges, bytes), capped at 64 lines, then an `SSD_TRIM_GROUPS` total with the
+suppressed groups, ranges and bytes, and an `SSD_TRIM` JSON summary with
+ranges, candidate bytes, planned or completed commands, duration and error.
+No per-range lines are printed, so a full scan cannot flood the 511-line
+bridge log ring.
+
+The complete record stays in RAM while the discard window is open and is
+written only after the guarded mount is ready, to
+`/nix/var/log/brook/ssd-trim-<unix seconds>.jsonl`. Its first line is a
+header (mode, limits, partition), followed by one `range` line per range
+(lba, sectors, group, batch), one `command` line per planned or submitted
+DSM command (batch, payload blocks, ns, submitted, ok) and a `summary` line
+that repeats the `SSD_TRIM` fields plus logged and dropped counts. A batch
+holds up to 16 ranges; its commands share its batch number. The console
+then prints `SSD_TRIM_LOG` with the path, size and write error. A failed
+pass leaves the volume unmounted, so it prints `SSD_TRIM_FAILED_COMMAND`
+and that batch's `SSD_TRIM_FAILED_RANGE` lines instead. The
 `command_total_ns` and `command_max_ns` fields measure AHCI submission
 and completion for attempted commands, including any failed attempt. On failure, candidate
 bytes may include ranges whose commands did not complete. Successful dry
