@@ -523,15 +523,20 @@ static void* AllocDmaBuffer(uint32_t pages, uint64_t& outPhys, PmmOwner owner = 
     if(!pages || pages>16384) return nullptr;
     // Multi-page requests scan from physical zero; a single page uses the
     // next-fit hint and may land high, so ask for two and return the spare.
-    const uint32_t request=g_dma32 && pages==1?2:pages;
-    auto phys=PmmAllocPagesAccounted(request,MemTag::Device,KernelPid,owner);
-    if(!phys)return nullptr;
-    if(request!=pages)PmmFreePage(phys+uint64_t(pages)*4096);
     const uint64_t bytes=uint64_t(pages)*4096;
     const uint64_t limit=g_dma32?(4ull<<30):(16ull<<30);
-    if(phys.raw()>=limit || bytes>limit-phys.raw()) {
+    // A single page uses the next-fit hint and can land above the DMA limit
+    // once a large RAM image (the live-stick store) has been allocated; a
+    // two-page request scans from physical zero, so retry low once.
+    PhysicalAddress phys{};
+    for(uint32_t attempt=0;attempt<2;++attempt) {
+        const uint32_t request=(g_dma32 || attempt) && pages==1?2:pages;
+        phys=PmmAllocPagesAccounted(request,MemTag::Device,KernelPid,owner);
+        if(!phys)return nullptr;
+        if(request!=pages)PmmFreePage(phys+uint64_t(pages)*4096);
+        if(phys.raw()<limit && bytes<=limit-phys.raw())break;
         for(uint32_t i=0;i<pages;++i)PmmFreePage(phys+uint64_t(i)*4096);
-        return nullptr;
+        if(pages!=1 || attempt)return nullptr;
     }
     outPhys=phys.raw();
     auto* ptr=reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
