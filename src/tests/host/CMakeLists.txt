@@ -1205,3 +1205,9 @@ target_compile_options(test_debug_bridge_v3_listener PRIVATE "-iquote${BROOK_ROO
 target_include_directories(test_debug_bridge_v3_listener PRIVATE
     "${BROOK_ROOT}/src/tests/test_debug_bridge_v3_listener" "${BROOK_ROOT}/src/third_party/monocypher")
 target_link_libraries(test_debug_bridge_v3_listener PRIVATE bridge_v3_interop)
+
+# Boot-stick self-update core (tools/rtx_stick_update.h) and loader set choice.
+add_host_test(test_rtx_stick_update
+    "${BROOK_ROOT}/src/third_party/monocypher/monocypher.c"
+    "${BROOK_ROOT}/src/third_party/monocypher/monocypher-ed25519.c")
+target_include_directories(test_rtx_stick_update PRIVATE "${BROOK_ROOT}/src/third_party/monocypher")

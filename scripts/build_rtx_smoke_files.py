@@ -32,16 +32,19 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
+import struct
 import subprocess
 import sys
+import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
 from bridge_keyless_image import require_keyless_disk, require_keyless_image  # noqa: E402
 from bridge_operator_policy import validate_operator_policy  # noqa: E402
 
-FORMAT = 'brook-rtx-smoke-v2'
+FORMAT = 'brook-rtx-smoke-v3'
 FAT_LABEL = 'BROOK_RTX'
 KERNEL_FLAGS = {
     'BROOK_BRIDGE_V3': 'ON', 'BROOK_QEMU_LEGACY_OUTBOUND_DEBUG': 'OFF',
@@ -62,22 +65,28 @@ LOADER_FLAGS = {
     'BROOK_BUILD_RECOVERY_PROBE': 'OFF',
 }
 DRIVERS = ('xhci',)
-MARKERS = ('usb-read-only', 'audio-muted', 'hw-inventory', 'boot-status')
+MARKERS = ('usb-read-only', 'audio-muted', 'hw-inventory', 'boot-status', 'boot-stick-update')
 # Exact /etc contents allowed in the initrd (lower-case FAT names).
-ETC_ALLOWED = {*MARKERS, 'hardware-payload-id', 'resolv.conf', 'machine-id', 'ssl'}
+ETC_ALLOWED = {*MARKERS, 'hardware-payload-id', 'resolv.conf', 'machine-id', 'ssl',
+               'bridge-v3-operators', 'rtx-update-signer'}
+# Guest helpers in /boot: the boot-stick update receiver and the payload-ID reporter.
+HELPERS = {'HWRTXUP.ELF': 'tools/hardware_rtx_update.c', 'HWSTATUS.ELF': 'tools/hardware_status.c'}
 INIT_RC = b'set wm\nset vfb none\nkconsole\n'
 LOADER_CONFIG = (b'TARGET=KERNEL\\BROOK.ELF\nDEBUG_TEXT=1\nLOG_MEMORY=0\nLOG_INTERRUPTS=0\n'
-                 b'UPDATE_SLOTS=0\nRECOVERY_MENU=0\nDISPLAY_WIDTH=1920\nDISPLAY_HEIGHT=1080\n')
+                 b'UPDATE_SLOTS=0\nRECOVERY_MENU=0\nSTICK_SETS=1\nDISPLAY_WIDTH=1920\nDISPLAY_HEIGHT=1080\n')
 README = '''Brook desktop smoke test (RAM only)
 
 Boot once from the firmware boot menu (UEFI entry for this stick).
 Secure Boot must be off for this unsigned development loader.
 Brook runs from RAM: it does not mount, bind or write internal disks,
 does not write EFI variables and does not change firmware settings.
-USB storage is read-only. Remove the stick and reboot to return.
+USB storage is read-only, except this stick's own FAT volume during a
+signed, operator-authenticated remote update (TCP 1235). PREV/ holds the
+previous file set; the loader boots it if a new set was never confirmed.
+Remove the stick and reboot to return.
 Bridge: v3 operator-authenticated TCP 1234 over a CDC-ECM USB NIC.
 '''
-NAMES = ('EFI/BOOT/BOOTX64.EFI', 'KERNEL/BROOK.ELF', 'INITRD.IMG', 'BROOK.CFG', 'README.TXT')
+NAMES = ('EFI/BOOT/BOOTX64.EFI', 'KERNEL/BROOK.ELF', 'INITRD.IMG', 'BROOK.CFG', 'README.TXT', 'SET.BIN')
 
 
 def run(argv, **kw):
@@ -99,6 +108,41 @@ def fat_sha(image, name, offset=None):
     return hashlib.sha256(data).hexdigest()
 
 
+def stick_set(kernel, initrd, payload_id):
+    """SET.BIN (src/shared/update/stick_set.h): the pair the loader may boot."""
+    ident = payload_id.encode()
+    if not 0 < len(ident) < 48:
+        raise SystemExit('payload ID must be 1..47 bytes')
+    raw = struct.pack('<8sQQ', b'BRKSET01', len(kernel), len(initrd))
+    raw += hashlib.sha256(kernel).digest() + hashlib.sha256(initrd).digest() + ident.ljust(48, b'\0')
+    return raw + struct.pack('<I', zlib.crc32(raw))
+
+
+def build_helpers(build_root, initrd, policy_file, signer_hex):
+    """Static musl helpers with the v3 policy digest; the signer public key."""
+    vendor = ROOT / 'src/third_party/monocypher'
+    objects = []
+    for source in (ROOT / 'src/shared/update/bridge_v3.c', vendor / 'monocypher.c', vendor / 'monocypher-ed25519.c'):
+        obj = build_root / ('helper-' + source.stem + '.o')
+        run([os.environ['MUSL_CC'], '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror', '-I', vendor, '-c', source, '-o', obj])
+        objects.append(obj)
+    flags = ['-static', '-O2', '-Wall', '-Wextra', '-Werror', '-DBROOK_BRIDGE_V3',
+             f'-DBROOK_BRIDGE_V3_POLICY_SHA256="{sha(policy_file)}"', '-I', vendor]
+    run(['mcopy', '-o', '-i', initrd, policy_file, '::/ETC/bridge-v3-operators'])
+    signer = build_root / 'rtx-update-signer'
+    signer.write_text(signer_hex + '\n')
+    run(['mcopy', '-o', '-i', initrd, signer, '::/ETC/rtx-update-signer'])
+    digests = {}
+    for name, source in HELPERS.items():
+        binary = build_root / name
+        run([os.environ['MUSL_CC'], *flags, ROOT / source, *objects, '-o', binary])
+        run(['mcopy', '-o', '-i', initrd, binary, '::/BOOT/' + name])
+        if subprocess.check_output(['mtype', '-i', initrd, '::/BOOT/' + name]) != binary.read_bytes():
+            raise SystemExit(name + ' readback mismatch')
+        digests[name] = sha(binary)
+    return digests
+
+
 def etc_listing(image):
     out = subprocess.check_output(['mdir', '-a', '-b', '-i', str(image), '::/ETC'], text=True)
     return sorted(line.rstrip('/').rsplit('/', 1)[-1].lower() for line in out.splitlines() if line.startswith('::/'))
@@ -117,6 +161,11 @@ def build(args):
         raise SystemExit(f'{args.image} must not exist')
     if args.operators.name.endswith('.seed'):
         raise SystemExit('--operators takes the public key file, never a seed')
+    signer_hex = args.update_signer.read_text().strip()
+    if not re.fullmatch('[0-9a-f]{64}', signer_hex):
+        raise SystemExit('--update-signer takes a file with the 64-hex-digit Ed25519 public key')
+    if args.payload_tag and not re.fullmatch('[a-z0-9]{1,8}', args.payload_tag):
+        raise SystemExit('--payload-tag: 1..8 lowercase letters/digits')
     policy = args.operators.read_bytes()
     keys = validate_operator_policy(policy)
     if not keys:
@@ -149,7 +198,7 @@ def build(args):
     for name in DRIVERS:
         shutil.copy2(kernel_build / 'drivers' / f'{name}.mod', stage / 'kernel/drivers' / f'{name}.mod')
     short = commit[:8] + ('-dirty' if dirty else '')
-    payload_id = f'brook-rtx-smoke-{short}'
+    payload_id = f'brook-rtx-smoke-{short}' + (f'-{args.payload_tag}' if args.payload_tag else '')
     env = dict(os.environ, BROOK_BUILD_DIR=str(stage), BROOK_INITRD_MARKERS=','.join(MARKERS),
                BROOK_HARDWARE_PAYLOAD_ID=payload_id)
     env.pop('BROOK_PROVIDER_PAYLOAD', None)
@@ -159,6 +208,7 @@ def build(args):
     init_rc = args.build_root / 'INIT.RC'
     init_rc.write_bytes(INIT_RC)
     run(['mcopy', '-i', initrd, init_rc, '::BOOT/INIT.RC'])
+    helpers = build_helpers(args.build_root, initrd, operators, signer_hex)
     etc = etc_listing(initrd)
     unexpected = sorted(set(etc) - ETC_ALLOWED)
     if unexpected or not set(MARKERS) <= set(etc):
@@ -175,6 +225,8 @@ def build(args):
         shutil.copyfile(src, staged / name)
     (staged / 'BROOK.CFG').write_bytes(LOADER_CONFIG)
     (staged / 'README.TXT').write_text(README)
+    (staged / 'SET.BIN').write_bytes(stick_set((staged / 'KERNEL/BROOK.ELF').read_bytes(),
+                                               (staged / 'INITRD.IMG').read_bytes(), payload_id))
     if (staged / 'KERNEL/BROOK.ELF').read_bytes()[:4] != b'\x7fELF' or \
             (staged / 'EFI/BOOT/BOOTX64.EFI').read_bytes()[:2] != b'MZ':
         raise SystemExit('Unexpected kernel or loader format')
@@ -187,10 +239,13 @@ def build(args):
         'kernel_options': KERNEL_FLAGS, 'loader_options': LOADER_FLAGS,
         'loader_config': LOADER_CONFIG.decode(), 'init_rc': INIT_RC.decode(),
         'initrd': {'drivers': list(DRIVERS), 'etc': etc, 'markers': list(MARKERS)},
+        'helpers': helpers,
+        'update_signer_public': signer_hex,
         'bridge_v3': {'operator_keys': len(keys), 'policy_sha256': hashlib.sha256(policy).hexdigest()},
         'hardware_scope': {
             'root': 'RAM initrd only; no disk is mounted',
-            'storage': 'AHCI unbound (no selectors), no NVMe driver, USB mass storage read-only (EROFS in xhci), '
+            'storage': 'AHCI unbound (no selectors), no NVMe driver, USB mass storage read-only (EROFS in xhci) '
+                       'except a write window over the boot-stick partition during a signed authenticated update, '
                        'built-in virtio-blk only exists in VMs',
             'firmware': 'no EFI variable writes, no firmware/flash access, no AML interpreter (uACPI off)',
             'pci_writes': 'every xHCI controller only (BIOS handoff, controller reset, memory+bus-master enable, '
@@ -247,6 +302,9 @@ def main():
     p.add_argument('--output', type=Path, required=True, help='new file-set directory')
     p.add_argument('--build-root', type=Path, required=True, help='new private build directory')
     p.add_argument('--operators', type=Path, required=True, help='operator public key file (one hex key per line)')
+    p.add_argument('--update-signer', type=Path, required=True,
+                   help='file with the boot-stick update Ed25519 public key (hex); see scripts/rtx_smoke_update.py signer-public')
+    p.add_argument('--payload-tag', help='suffix for the payload ID (a trivially different set for update tests)')
     p.add_argument('--image', type=Path, help='also write a raw GPT/FAT32 disk image here')
     p.add_argument('--allow-dirty', action='store_true')
     args = p.parse_args()

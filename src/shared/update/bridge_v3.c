@@ -33,7 +33,8 @@ static int ClientValid(const BrookBridgeV3ClientHello *hello) {
         if (hello->operation != 1) return 0;
         break;
     case BrookBridgeV3Update:
-        if (hello->operation < 1 || hello->operation > 2) return 0;
+        // UPLOAD, PROMOTE, STICK (boot-stick file-set update).
+        if (hello->operation < 1 || hello->operation > 3) return 0;
         break;
     case BrookBridgeV3Bulk:
         // PUT, GET, GETZ, FRAME, FRAMEZ, DISK.

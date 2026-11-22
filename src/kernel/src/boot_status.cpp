@@ -1,4 +1,5 @@
 #include "boot_status.h"
+#include "boot_stick.h"
 #include "apic.h"
 #include "kprintf.h"
 #include "net.h"
@@ -203,6 +204,7 @@ extern "C" void BootStatusPrint(const char* reason)
 #if defined(BROOK_BRIDGE_V3)
     DebugBridgeV3LogBoot();
 #endif
+    BootStickStatusLine();
     KPrintf("==== END STATUS ====\n");
     SpinLockRelease(&g_printLock);
 }

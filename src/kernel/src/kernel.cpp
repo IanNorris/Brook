@@ -1,5 +1,6 @@
 #include "hw_inventory.h"
 #include "boot_status.h"
+#include "boot_stick.h"
 #include "core_autodump.h"
 #include "lastlog.h"
 #include "desktop_identity.h"
@@ -960,6 +961,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     brook::KsymDump();
     brook::NetConfigureBoot();
     brook::BootStatusConfigure();
+    brook::BootStickConfigure();
     brook::SerialPuts("module: Phase 1 — loading from /drivers (ramdisk)\n");
     brook::KLog("BOOT stage: early modules begin");
     brook::ModuleDiscoverAndLoad("/drivers");

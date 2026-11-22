@@ -2826,6 +2826,8 @@ struct UsbMscState {
     uint8_t* bounce;
     uint64_t bouncePhys;
     char name[16];
+    // Boot-stick update window (DEVICE_IOCTL_WRITE_WINDOW); zero length = closed.
+    uint64_t windowStart, windowLength;
 };
 
 static const BlockDeviceOps g_usbMscOps = {
@@ -2868,19 +2870,38 @@ static int UsbMscRead(Device* dev,uint64_t offset,void* buf,uint64_t len) {
     if(!io.usable())return -5;
     return UsbBlockReadBytes(io,offset,buf,len);
 }
+static bool UsbMscWindowAdmits(const UsbMscState* st,uint64_t offset,uint64_t len) {
+    const uint64_t start=__atomic_load_n(&st->windowStart,__ATOMIC_ACQUIRE);
+    const uint64_t length=__atomic_load_n(&st->windowLength,__ATOMIC_ACQUIRE);
+    return length && len && offset>=start && len<=length && offset-start<=length-len;
+}
 static int UsbMscWrite(Device* dev,uint64_t offset,const void* buf,uint64_t len) {
-    if(g_storageReadOnly)return -30;
+    if(g_storageReadOnly && !UsbMscWindowAdmits(static_cast<UsbMscState*>(dev->priv),offset,len))return -30;
     MscIoGuard guard;
     UsbMscByteTransport io{static_cast<UsbMscState*>(dev->priv)};
     if(!io.usable())return -5;
     return UsbBlockWriteBytes(io,offset,buf,len);
 }
 
-static int UsbMscIoctl(Device* dev, uint32_t cmd, void* /*arg*/)
+static int UsbMscIoctl(Device* dev, uint32_t cmd, void* arg)
 {
     if (cmd == DEVICE_IOCTL_READ_ONLY) return g_storageReadOnly ? 1 : 0;
+    if (cmd == DEVICE_IOCTL_WRITE_WINDOW) {
+        // Only meaningful under the read-only policy; the kernel gate is the
+        // sole caller and has already proven this is the boot stick.
+        auto* st = static_cast<UsbMscState*>(dev->priv);
+        const auto* w = static_cast<const DeviceWriteWindow*>(arg);
+        if (!g_storageReadOnly || !w) return -22;
+        const uint64_t bytes = uint64_t(g_devices[st->devIndex].mscSectorCount) * g_devices[st->devIndex].mscBlockSize;
+        if (w->length && (w->start > bytes || w->length > bytes - w->start)) return -22;
+        __atomic_store_n(&st->windowLength, uint64_t{0}, __ATOMIC_RELEASE);
+        __atomic_store_n(&st->windowStart, w->start, __ATOMIC_RELEASE);
+        __atomic_store_n(&st->windowLength, w->length, __ATOMIC_RELEASE);
+        KPrintf("xhci: %s write window %s\n", st->name, w->length ? "open (boot-stick update)" : "closed");
+        return 0;
+    }
     if (cmd != DEVICE_IOCTL_FLUSH) return -95;
-    if(g_storageReadOnly)return 0;
+    if(g_storageReadOnly && !__atomic_load_n(&static_cast<UsbMscState*>(dev->priv)->windowLength,__ATOMIC_ACQUIRE))return 0;
     MscIoGuard ioGuard;
     MscCommandGuard commandGuard;
     auto* st = static_cast<UsbMscState*>(dev->priv);
@@ -2969,6 +2990,7 @@ static bool XhciInitMassStorage(XhciController& ctrl, XhciDevice& dev,
     if (!state) return false;
     state->ctrl = &ctrl;
     state->devIndex = devIndex;
+    state->windowStart = state->windowLength = 0;
     state->bounce=static_cast<uint8_t*>(AllocDmaBuffer(16,state->bouncePhys));
     if(!state->bounce){kfree(state);return false;}
 

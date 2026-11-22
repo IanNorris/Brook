@@ -20,6 +20,9 @@ namespace brook {
 bool FatFsBindDrive(uint8_t pdrv, Device* dev);
 // Boot's explicit USB read-only policy follows every FAT attachment.
 bool FatFsBindBootReadOnlyDrive(uint8_t pdrv, Device* dev);
+// Boot-stick update gate only: flip an existing, unmounted, non-exclusive
+// binding of `dev` between read-only and writable.
+bool FatFsSetBootStickWritable(uint8_t pdrv, Device* dev, bool writable);
 // Boot-only reservation for a pinned device. The slot cannot be rebound and
 // the same Device cannot be bound elsewhere for the remainder of this boot.
 // Ordinary FatFsAcquireDrive cannot acquire this slot. Exclusive acquisition

@@ -11,6 +11,9 @@ void BootTimingCaptureHandoff(const BootProtocol* protocol);
 // Immutable after early boot, including on maintenance kernels.
 uint32_t BootTimingHandoffFlags();
 BootGuardSlot BootTimingHandoffSlot();
+struct BootStick;
+// Boot volume + file set from a STICK_SETS loader; false when absent.
+bool BootTimingHandoffStick(BootStick* out);
 // Read the ACPI FPDT boot record. Call after AcpiInit().
 void BootTimingCaptureFirmware();
 // Once, when the desktop is first presented: stamp, compute and log
