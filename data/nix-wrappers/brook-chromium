@@ -57,9 +57,14 @@ unset DISPLAY
 # Keep the accelerated GPU process on its existing startup policy until the
 # Iris and VA-API paths pass broker-sandbox checks with real render nodes.
 gpu=("${BROOK_IRIS_RUN:-/nix/profile/bin/brook-iris-run}")
+# Audio: the out-of-process, sandboxed audio service cannot reach Brook's
+# /dev/dsp, so Chromium silently used a fake output (no mixer stream). Keep
+# audio in the browser process and name the ALSA (clocked OSS) device.
+audio_features=AudioServiceOutOfProcess,AudioServiceSandbox
+audio_flags=(--alsa-output-device=default)
 flags=(--use-gl=angle --use-angle=gles --ignore-gpu-blocklist --disable-gpu-sandbox
-       --disable-features=Vulkan --disable-accelerated-video-decode)
-if [ -n "${BROOK_BROWSER_SOFTWARE:-}" ] || [ ! -x "${gpu[0]}" ]; then gpu=(); flags=(--disable-gpu); fi
+       --disable-features=Vulkan,$audio_features --disable-accelerated-video-decode)
+if [ -n "${BROOK_BROWSER_SOFTWARE:-}" ] || [ ! -x "${gpu[0]}" ]; then gpu=(); flags=(--disable-gpu --disable-features=$audio_features); fi
 # Opt-in VA-API decode (H.264/VP8/MPEG-2 on the Broadwell VCS). Needs a kernel
 # with the video engine built, `gpu video on` plus a passing self-test this boot
 # (HAS_BSD=1), and the staged brook-vaapi package (i965 with the static softpin
@@ -69,11 +74,11 @@ if [ -n "${BROOK_CHROMIUM_VAAPI:-}" ] && [ -n "${gpu[*]}" ] && [ -d "${BROOK_VAA
   export LIBVA_DRIVER_NAME=i965 LIBVA_DRIVERS_PATH="$BROOK_VAAPI_DRIVERS"
   flags=(--use-gl=angle --use-angle=gles --ignore-gpu-blocklist --disable-gpu-sandbox
          --enable-features=VaapiVideoDecoder,VaapiIgnoreDriverChecks,AcceleratedVideoDecodeLinuxGL,AcceleratedVideoDecodeLinuxZeroCopyGL
-         --disable-features=Vulkan,UseChromeOSDirectVideoDecoder
+         --disable-features=Vulkan,UseChromeOSDirectVideoDecoder,$audio_features
          --render-node-override="${BROOK_VAAPI_NODE:-/dev/dri/renderD129}")
 fi
 exec /nix/profile/bin/brook-run "${gpu[@]}" /nix/profile/bin/chromium \
-  --disable-setuid-sandbox "${flags[@]}" --disable-background-networking \
+  --disable-setuid-sandbox "${flags[@]}" "${audio_flags[@]}" --disable-background-networking \
   --disable-component-update --renderer-process-limit=2 \
   --disable-crash-reporter --no-first-run --no-default-browser-check \
   --ozone-platform=wayland --user-data-dir="$profile" "$@"
