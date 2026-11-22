@@ -542,7 +542,7 @@ BdwPrepareOutcome BdwPrepareVcsUserJob(BdwExecSnapshot* snapshot,uint32_t nonce,
     // image (uncached PAT slot 3) or a protected buffer is never VCS work.
     if(BdwExecSnapshotHasUncached(snapshot) || BdwExecSnapshotHasProtectedBuffer(snapshot))return refuse("scanout or protected buffer in a video job");
     const uint32_t pages=BdwExecSnapshotPageCount(snapshot);
-    if(!pages || pages>65536)return refuse("more than 65536 pages");
+    if(!pages || pages>BdwExecMaxPages)return refuse("more than 262144 pages (1 GiB)");
     uint32_t tableCount=0;
     if(!BdwExecSnapshotTableCount(snapshot,tableCount) || !tableCount || tableCount>BdwExecTables::Max)
         return refuse("address space needs more than 512 page tables");
@@ -1505,7 +1505,7 @@ BdwPrepareOutcome BdwPrepareRetainedSubmissionChecked(BdwExecSnapshot* snapshot,
     auto refuse=[&](const char* why){reason=why;
         return UnwindRetainedPreparation()?BdwPrepareOutcome::Refused:BdwPrepareOutcome::Uncertain;};
     const uint32_t pages=BdwExecSnapshotPageCount(snapshot);
-    if(!pages || pages>65536)return refuse("more than 65536 pages");
+    if(!pages || pages>BdwExecMaxPages)return refuse("more than 262144 pages (1 GiB)");
     uint32_t tableCount=0;
     if(!BdwExecSnapshotTableCount(snapshot,tableCount) || !tableCount || tableCount>BdwExecTables::Max)
         return refuse("address space needs more than 512 page tables");
@@ -1524,7 +1524,7 @@ BdwPrepareOutcome BdwPrepareRetainedSubmissionChecked(BdwExecSnapshot* snapshot,
             if(reusableWorkspacePages<pages){
                 kfree(reusableWorkspace);reusableWorkspacePages=0;
                 // Round up to limit regrowth as buffer sets vary.
-                const uint32_t want=pages<65536-1024?((pages+1023)&~1023u):65536;
+                const uint32_t want=pages<BdwExecMaxPages-1024?((pages+1023)&~1023u):BdwExecMaxPages;
                 reusableWorkspace=static_cast<BdwPpgttMapping*>(kmalloc(uint64_t(want)*sizeof(BdwPpgttMapping)));
                 if(reusableWorkspace)reusableWorkspacePages=want;
                 BdwOverheadCount(BdwOverhead().counters.workspaceAllocs);

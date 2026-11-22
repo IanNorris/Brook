@@ -25,6 +25,7 @@
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
 #include <vector>
 #include <functional>
 #include <initializer_list>
@@ -32,10 +33,16 @@
 #include <thread>
 #include <chrono>
 #include <sys/wait.h>
+#include <sys/mman.h>
 #include <unistd.h>
 using namespace brook;
 struct Allocation {void* ptr;uint64_t pages,dma;};
-static Allocation allocations[256]{};
+// Large enough for 1 GiB of 256-page buffer chunks (the execbuffer page
+// limit test). In sharedBacking mode every chunk maps the same 1 MiB memfd,
+// so such sets cost address space, not memory.
+static constexpr unsigned MaxAllocations=1100;
+static Allocation allocations[MaxAllocations]{};
+static bool sharedBacking=false;static int sharedBackingFd=-1;static unsigned lastAllocationHit=0;
 static unsigned frees=0,allocated=0,failAt=0;
 static bool failVmm=false,failBacking=false,badDma=false;
 static bool resetArmed=true,translated=false,wrongOwner=false,changingVtd=false;
@@ -128,19 +135,25 @@ VirtualAddress VmmAllocPagesAccounted(uint64_t n,uint64_t flags,MemTag tag,uint1
 }
 VirtualAddress VmmAllocPages(uint64_t n,uint64_t,MemTag,uint16_t){
     if(failVmm || (failAt && allocated+1==failAt))return VirtualAddress{};
-    assert(allocated<256 && n<=256);auto& a=allocations[allocated];
-    assert(!posix_memalign(&a.ptr,4096,n*4096));a.pages=n;a.dma=0x100000+uint64_t(allocated)*0x200000;
-    ++allocated;std::memset(a.ptr,0xaa,n*4096);return VirtualAddress(reinterpret_cast<uint64_t>(a.ptr));
+    assert(allocated<MaxAllocations && n<=256);auto& a=allocations[allocated];
+    if(sharedBacking){
+        if(sharedBackingFd<0){sharedBackingFd=memfd_create("bdw-exec-limit",0);assert(sharedBackingFd>=0 && !ftruncate(sharedBackingFd,256*4096));}
+        a.ptr=mmap(nullptr,n*4096,PROT_READ|PROT_WRITE,MAP_SHARED,sharedBackingFd,0);assert(a.ptr!=MAP_FAILED);
+    } else assert(!posix_memalign(&a.ptr,4096,n*4096));
+    a.pages=n;a.dma=0x100000+uint64_t(allocated)*0x200000;
+    ++allocated;if(!sharedBacking)std::memset(a.ptr,0xaa,n*4096);return VirtualAddress(reinterpret_cast<uint64_t>(a.ptr));
 }
 void PmmReassignOwner(PhysicalAddress,PmmOwner,PmmOwner) {}
 void VmmFreePages(VirtualAddress address,uint64_t n){
     for(unsigned i=0;i<allocated;++i)if(address.raw()==reinterpret_cast<uint64_t>(allocations[i].ptr)){
-        assert(n==allocations[i].pages);std::free(allocations[i].ptr);allocations[i].ptr=nullptr;++frees;return;}
+        assert(n==allocations[i].pages);if(sharedBacking)munmap(allocations[i].ptr,n*4096);else std::free(allocations[i].ptr);
+        allocations[i].ptr=nullptr;++frees;return;}
     assert(false);
 }
 PhysicalAddress VmmVirtToPhys(PageTable,VirtualAddress address){
-    for(unsigned i=0;i<allocated;++i){const auto& a=allocations[i];const uint64_t base=reinterpret_cast<uint64_t>(a.ptr);
-        if(a.ptr && address.raw()>=base && address.raw()-base<a.pages*4096){const uint64_t offset=address.raw()-base;
+    for(unsigned k=0;k<allocated;++k){const unsigned i=(lastAllocationHit+k)%allocated;
+        const auto& a=allocations[i];const uint64_t base=reinterpret_cast<uint64_t>(a.ptr);
+        if(a.ptr && address.raw()>=base && address.raw()-base<a.pages*4096){const uint64_t offset=address.raw()-base;lastAllocationHit=i;
             return PhysicalAddress(badDma && offset==4096 ? (uint64_t{16}<<30) : a.dma+offset);}}
     return PhysicalAddress{};
 }
@@ -2837,4 +2850,83 @@ int main(){
     assert(BdwIntelRenderIoctl(f,ioctlCommand(9,sizeof(close)),reinterpret_cast<uint64_t>(&close),user)==-2);
     assert(BdwGpuBufferBytes(pinMapping)==8192);BdwGpuFileUnref(f);BdwGpuBufferUnref(pinMapping);
     assert(BdwIntelRenderIoctl(nullptr,createCmd,createArg,user)==-9);
+    // Execbuffer decode limits and per-check refusal reasons (STK Cornfield
+    // Crossing, int88: a scene of more than 256 MiB was refused as
+    // "execbuffer decode" EINVAL). Forked: shared backing and allocation
+    // indices stay private to this child.
+    {pid_t child=fork();assert(child>=0);if(!child){
+        sharedBacking=true;allocated=0;
+        struct RawObject {uint32_t handle,relocCount;uint64_t relocs,alignment,offset,flags,reserved1,reserved2;};
+        struct RawExec {uint64_t objects;uint32_t count,start,length,dr1,dr4,clipCount;uint64_t clips,flags,context,fences;};
+        auto* lf=BdwGpuFileCreate();assert(lf);
+        struct Seen {uint32_t pages=0,objects=0;unsigned calls=0;} seen;
+        FakeUser fake2{};BdwI915UserAccess lu{&fake2,ReadUser,WritableUser,WriteUser,UserNow,UserSleep};
+        // Records what decode admitted, then refuses: the ioctl releases it.
+        static Seen* seenPtr=nullptr;seenPtr=&seen;
+        lu.submit=[](void*,BdwExecSnapshot* s)->int64_t{seenPtr->pages=BdwExecSnapshotPageCount(s);
+            seenPtr->objects=BdwExecSnapshotObjectCount(s);++seenPtr->calls;BdwNoteRefusal("test submit");return -16;};
+        uint64_t r=0;const uint64_t big=uint64_t{65536}*4096;
+        uint32_t h[6]{};for(unsigned i=0;i<4;++i){h[i]=BdwGpuFileCreateBuffer(lf,big,r);assert(h[i] && r==big);}
+        h[4]=BdwGpuFileCreateBuffer(lf,4096,r);h[5]=BdwGpuFileCreateBuffer(lf,4096,r);assert(h[4] && h[5]);
+        constexpr uint64_t base=uint64_t{1}<<32,pinned=16|8; // above 4 GiB, PINNED|48B like iris
+        // Object i of a dense set at base; the 1-page batch last.
+        auto exec=[&](std::initializer_list<uint32_t> handles,RawObject* objs,uint64_t flags=(1u<<11)|(1u<<12)){
+            uint32_t n=0;uint64_t at=base;
+            for(uint32_t handle:handles){objs[n]={handle,0,0,0,at,pinned,0,0};
+                at+=(handle==h[4]||handle==h[5])?4096:big;++n;}
+            RawExec e{reinterpret_cast<uint64_t>(objs),n,0,8,0,0,0,0,flags,0,0};return e;};
+        auto run=[&](RawExec& e){return BdwIntelRenderIoctl(lf,ioctlCommand(0x69,sizeof(e)),reinterpret_cast<uint64_t>(&e),lu);};
+        auto expect=[&](int64_t result,BdwExecReject why,uint64_t value,uint64_t limit,uint32_t object){
+            const char* got=BdwTakeRefusal();BdwRefusalDetail d{};
+            if(!got || got!=BdwExecRejectName(why) || !BdwRefusalDetailFor(got,d) || d.value!=value || d.limit!=limit || d.object!=object){
+                fprintf(stderr,"refusal mismatch: got %s value=%lu limit=%lu object=%u, want %s value=%lu limit=%lu object=%u result=%ld\n",
+                    got?got:"(none)",(unsigned long)d.value,(unsigned long)d.limit,d.object,BdwExecRejectName(why),
+                    (unsigned long)value,(unsigned long)limit,object,(long)result);
+                assert(false);}
+            assert(result==-22 || result==-2 || result==-14);};
+        RawObject objs[8]{};
+        // 65537 pages: refused before (the old 65536-page decode limit),
+        // admitted now. The fake submit sees the whole set.
+        {auto e=exec({h[0],h[4]},objs);assert(run(e)==-16 && seen.calls==1 && seen.pages==65537 && seen.objects==2);
+         const char* why=BdwTakeRefusal();assert(why && !std::strcmp(why,"test submit"));}
+        // 3x65536+1 pages (768 MiB): admitted.
+        {auto e=exec({h[0],h[1],h[2],h[4]},objs);assert(run(e)==-16 && seen.calls==2 && seen.pages==196609);(void)BdwTakeRefusal();}
+        // Exactly the page limit, densely: decoded, but 1 GiB needs 515
+        // page tables > 512, so ENOSPC with its own reason.
+        {auto e=exec({h[0],h[1],h[2],h[3]},objs);e.length=8;assert(run(e)==-28 && seen.calls==2);
+         const char* why=BdwTakeRefusal();BdwRefusalDetail d{};
+         assert(why && std::strstr(why,"512 page tables") && BdwRefusalDetailFor(why,d) && d.value==262144 && d.limit==512);}
+        // Limit + 1 page: decode refuses with the page limit and its values.
+        {auto e=exec({h[0],h[1],h[2],h[3],h[4]},objs);const auto before=BdwExecRejectCount(BdwExecReject::PageLimit);
+         expect(run(e),BdwExecReject::PageLimit,262145,BdwExecMaxPages,4);
+         assert(BdwExecRejectCount(BdwExecReject::PageLimit)==before+1 && seen.calls==2);}
+        // Genuinely invalid submissions stay refused, each with its reason.
+        {auto e=exec({h[4],h[4]},objs);objs[1].offset=base+8192;expect(run(e),BdwExecReject::HandleDuplicate,h[4],8192,1);}
+        {auto e=exec({h[5],h[4]},objs);objs[0].handle=4000;expect(run(e),BdwExecReject::HandleInvalid,4000,8192,0);}
+        {auto e=exec({h[5],h[4]},objs);objs[1].offset=base;expect(run(e),BdwExecReject::ObjectOverlap,base,base+4096,BdwRefusalNoObject);}
+        {auto e=exec({h[5],h[4]},objs);objs[0].flags=8;expect(run(e),BdwExecReject::ObjectNotPinned,8,16,0);}
+        {auto e=exec({h[5],h[4]},objs);objs[0].flags|=uint64_t{1}<<9;expect(run(e),BdwExecReject::ObjectFlags,pinned|(1u<<9),4|8|16|64|128,0);}
+        {auto e=exec({h[5],h[4]},objs);objs[0].relocCount=1;expect(run(e),BdwExecReject::Relocations,1,0,0);}
+        {auto e=exec({h[5],h[4]},objs);objs[1].reserved1=5;expect(run(e),BdwExecReject::ObjectReserved,5,0,1);}
+        {auto e=exec({h[5],h[4]},objs);objs[0].offset=base+12;expect(run(e),BdwExecReject::ObjectAddressAlignment,base+12,4096,0);}
+        {auto e=exec({h[5],h[4]},objs);objs[0].alignment=2048;expect(run(e),BdwExecReject::ObjectAlignment,2048,4096,0);}
+        {auto e=exec({h[0],h[4]},objs);objs[0].offset=(uint64_t{1}<<48)-4096;
+         expect(run(e),BdwExecReject::ObjectBeyond48,(uint64_t{1}<<48)-4096+big,uint64_t{1}<<48,0);}
+        {auto e=exec({h[5],h[4]},objs);objs[0].offset=uint64_t{1}<<48;expect(run(e),BdwExecReject::ObjectAddress,uint64_t{1}<<48,uint64_t{1}<<48,0);}
+        {auto e=exec({h[5],h[4]},objs);objs[0].flags=16;objs[0].offset=uint64_t{1}<<32;
+         expect(run(e),BdwExecReject::ObjectBeyond4G,(uint64_t{1}<<32)+4096,uint64_t{1}<<32,0);}
+        {auto e=exec({h[5],h[4]},objs);objs[1].flags|=4;expect(run(e),BdwExecReject::BatchProtected,pinned|4,0,1);}
+        {auto e=exec({h[5],h[4]},objs);e.length=8192;expect(run(e),BdwExecReject::BatchRange,8192,4096,1);}
+        {auto e=exec({h[5],h[4]},objs,1u<<12);expect(run(e),BdwExecReject::NoRelocMissing,1u<<12,1u<<11,BdwRefusalNoObject);}
+        {auto e=exec({h[5],h[4]},objs,(1u<<11)|(1u<<30));expect(run(e),BdwExecReject::Flags,(1u<<11)|(1u<<30),
+            (1u<<11)|(1u<<12)|(1u<<18)|(1u<<19)|(1u<<21)|63,BdwRefusalNoObject);}
+        {auto e=exec({h[5],h[4]},objs);e.count=8193;expect(run(e),BdwExecReject::ObjectCount,8193,8192,BdwRefusalNoObject);}
+        {auto e=exec({h[5],h[4]},objs);e.length=12;expect(run(e),BdwExecReject::BatchAlignment,12,8,BdwRefusalNoObject);}
+        {auto e=exec({h[5],h[4]},objs);e.fences=1;expect(run(e),BdwExecReject::InOutFence,1,0,BdwRefusalNoObject);}
+        {auto e=exec({h[5],h[4]},objs);e.clipCount=1;expect(run(e),BdwExecReject::Cliprects,1,0,BdwRefusalNoObject);}
+        {auto e=exec({h[5],h[4]},objs);e.flags|=1u<<19;expect(run(e),BdwExecReject::FenceArrayShape,0,BdwMaxSubmissionFences,BdwRefusalNoObject);}
+        // A valid small submission still reaches submit.
+        {auto e=exec({h[5],h[4]},objs);assert(run(e)==-16 && seen.calls==3 && seen.pages==2);(void)BdwTakeRefusal();}
+        BdwGpuFileUnref(lf);_exit(0);
+    }int status=0;assert(waitpid(child,&status,0)==child && WIFEXITED(status) && !WEXITSTATUS(status));}
 }

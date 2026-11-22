@@ -124,40 +124,62 @@ static int64_t CopyExecSnapshot(BdwGpuFile* file,uint64_t arg,const BdwI915UserA
     // while the VCS executor is ready (gate on, a self-test passed this boot,
     // not quarantined); otherwise refused with a recorded reason. The worker
     // re-checks readiness for every job it runs.
-    if(engine==2 && !BdwVideoUserSubmissionReady()){BdwNoteRefusal("execbuffer: I915_EXEC_BSD video engine submission not available");return invalid;}
-    if(!request.count || request.count>8192 || !request.objects ||
-       (request.flags&~(noReloc|handleLut|batchFirst|fenceArray|useExtensions|uint64_t{63})) || !(request.flags&noReloc) || engine>2 ||
-       request.dr1 || request.dr4 || request.context>0xffffffffull || request.fences ||
-       ((request.flags&useExtensions)?(!plan || (request.flags&fenceArray) || request.clipCount || !request.clips):
-        (request.flags&fenceArray)?(!plan || !request.clipCount || request.clipCount>BdwMaxSubmissionFences || !request.clips):
-                                  (request.clipCount || request.clips)) ||
-       (request.start&7) || (request.length&7))return invalid;
+    using R=BdwExecReject;
+    // Each check records its own reason, value and limit (see
+    // intel_bdw_refusal.h); the order matches the former combined test.
+    if(engine==2 && !BdwVideoUserSubmissionReady()){BdwNoteExecReject(R::VideoEngine,engine,2);return invalid;}
+    const uint64_t supported=noReloc|handleLut|batchFirst|fenceArray|useExtensions|uint64_t{63};
+    const uint32_t maxObjects=BdwGpuFileMaxHandles();
+    // A file holds at most maxObjects distinct handles and duplicates are
+    // refused (as in Linux), so a longer list can never be valid.
+    if(!request.count || request.count>maxObjects){BdwNoteExecReject(R::ObjectCount,request.count,maxObjects);return invalid;}
+    if(!request.objects){BdwNoteExecReject(R::ObjectsPointer);return invalid;}
+    if(request.flags&~supported){BdwNoteExecReject(R::Flags,request.flags,supported);return invalid;}
+    if(!(request.flags&noReloc)){BdwNoteExecReject(R::NoRelocMissing,request.flags,noReloc);return invalid;}
+    if(engine>2){BdwNoteExecReject(R::Engine,engine,2);return invalid;}
+    if(request.dr1 || request.dr4){BdwNoteExecReject(R::LegacyFields,request.dr1|uint64_t(request.dr4)<<32,0);return invalid;}
+    if(request.context>0xffffffffull){BdwNoteExecReject(R::ContextId,request.context,0xffffffffull);return invalid;}
+    if(request.fences){BdwNoteExecReject(R::InOutFence,request.fences,0);return invalid;}
+    if(request.flags&useExtensions){
+        if(!plan || (request.flags&fenceArray) || request.clipCount || !request.clips){
+            BdwNoteExecReject(R::ExtensionShape,request.clipCount,0);return invalid;}
+    } else if(request.flags&fenceArray){
+        if(!plan || !request.clipCount || request.clipCount>BdwMaxSubmissionFences || !request.clips){
+            BdwNoteExecReject(R::FenceArrayShape,request.clipCount,BdwMaxSubmissionFences);return invalid;}
+    } else if(request.clipCount || request.clips){BdwNoteExecReject(R::Cliprects,request.clipCount,0);return invalid;}
+    if((request.start&7) || (request.length&7)){
+        BdwNoteExecReject(R::BatchAlignment,(request.start&7)?request.start:request.length,8);return invalid;}
     const uint64_t bytes=uint64_t(request.count)*sizeof(ExecObject);
-    if(request.objects>~uint64_t{0}-(bytes-1))return fault;
+    if(request.objects>~uint64_t{0}-(bytes-1)){BdwNoteExecReject(R::ObjectsFault,request.objects,bytes);return fault;}
     auto* raw=static_cast<ExecObject*>(kmalloc(bytes));
-    if(!raw)return nomem;
+    if(!raw){BdwNoteExecReject(R::NoMemory,bytes);return nomem;}
     auto* objects=static_cast<BdwExecObjectInput*>(kmalloc(uint64_t(request.count)*sizeof(BdwExecObjectInput)));
-    if(!objects){kfree(raw);return nomem;}
+    if(!objects){kfree(raw);BdwNoteExecReject(R::NoMemory,uint64_t(request.count)*sizeof(BdwExecObjectInput));return nomem;}
     int64_t result=0;
-    if(!u.read(u.context,raw,request.objects,bytes))result=fault;
+    if(!u.read(u.context,raw,request.objects,bytes)){result=fault;BdwNoteExecReject(R::ObjectsFault,request.objects,bytes);}
     else {
         for(uint32_t i=0;i<request.count;++i){const auto& obj=raw[i];
-            if(obj.relocCount || obj.relocs || obj.reserved1 || obj.reserved2){result=invalid;break;}
+            if(obj.relocCount || obj.relocs){result=invalid;BdwNoteExecReject(R::Relocations,obj.relocCount,0,i);break;}
+            if(obj.reserved1 || obj.reserved2){result=invalid;BdwNoteExecReject(R::ObjectReserved,obj.reserved1|obj.reserved2,0,i);break;}
             objects[i]={obj.handle,obj.offset,obj.alignment,obj.flags};
         }
         if(!result){
             const uint32_t batchIndex=(request.flags&batchFirst)?0:request.count-1;
             *out=BdwExecSnapshotCreate(file,objects,request.count,batchIndex,request.start,request.length);
-            if(!*out)result=invalid;
+            if(!*out){result=invalid;
+                // Create records the specific check; ENOMEM is reported as such.
+                BdwRefusalDetail d{};if(BdwRefusalDetailFor(g_bdwRefusal,d) && d.why==BdwExecRejectName(R::NoMemory))result=nomem;}
             else {
                 BdwExecSnapshotSetOrigin(*out,u.submitterPid,uint32_t(request.context),u.submitterIncarnation);
-                if(engine==2 && !BdwExecSnapshotSetEngine(*out,BdwExecEngineVideo)){BdwExecSnapshotRelease(*out,false);*out=nullptr;result=invalid;}
+                if(engine==2 && !BdwExecSnapshotSetEngine(*out,BdwExecEngineVideo)){BdwExecSnapshotRelease(*out,false);*out=nullptr;result=invalid;
+                    BdwNoteExecReject(R::Engine,engine,2);}
             }
             if(!result && (request.context || u.renderExperiment)){
                 auto* context=request.context?BdwGpuFileGetContext(file,uint32_t(request.context)):
                     BdwGpuFileGetDefaultContext(file);
-                if(!context)result=-2;
-                else {if(!BdwExecSnapshotBindContext(*out,context))result=invalid;BdwGpuContextUnref(context);}
+                if(!context){result=-2;BdwNoteExecReject(R::Context,request.context,0);}
+                else {if(!BdwExecSnapshotBindContext(*out,context)){result=invalid;BdwNoteExecReject(R::Context,request.context,1);}
+                    BdwGpuContextUnref(context);}
                 if(result){BdwExecSnapshotRelease(*out,false);*out=nullptr;}
             }
         }
@@ -166,26 +188,30 @@ static int64_t CopyExecSnapshot(BdwGpuFile* file,uint64_t arg,const BdwI915UserA
         ExecFence fences[BdwMaxSubmissionFences]{};uint64_t points[BdwMaxSubmissionFences]{};uint32_t count=request.clipCount;uint64_t handles=request.clips,values=0;
         if(request.flags&useExtensions){
             TimelineExtension ext{};
-            if(!u.read(u.context,&ext,request.clips,sizeof(ext)))result=fault;
+            if(!u.read(u.context,&ext,request.clips,sizeof(ext))){result=fault;BdwNoteExecReject(R::FenceFault,request.clips,sizeof(ext));}
             else if(ext.next || ext.name || ext.flags || ext.reserved[0] || ext.reserved[1] || ext.reserved[2] || ext.reserved[3] ||
-                    !ext.count || ext.count>BdwMaxSubmissionFences || !ext.handles || !ext.points)result=invalid;
+                    !ext.count || ext.count>BdwMaxSubmissionFences || !ext.handles || !ext.points){
+                result=invalid;BdwNoteExecReject(R::FenceChain,ext.count,BdwMaxSubmissionFences);}
             else {count=uint32_t(ext.count);handles=ext.handles;values=ext.points;}
         }
         const uint64_t fenceBytes=uint64_t(count)*sizeof(ExecFence),pointBytes=uint64_t(count)*sizeof(uint64_t);
-        if(!result && (handles>~uint64_t{0}-(fenceBytes-1) || !u.read(u.context,fences,handles,fenceBytes)))result=fault;
-        if(!result && values && (values>~uint64_t{0}-(pointBytes-1) || !u.read(u.context,points,values,pointBytes)))result=fault;
+        if(!result && (handles>~uint64_t{0}-(fenceBytes-1) || !u.read(u.context,fences,handles,fenceBytes))){
+            result=fault;BdwNoteExecReject(R::FenceFault,handles,fenceBytes);}
+        if(!result && values && (values>~uint64_t{0}-(pointBytes-1) || !u.read(u.context,points,values,pointBytes))){
+            result=fault;BdwNoteExecReject(R::FenceFault,values,pointBytes);}
         if(!result)for(uint32_t i=0;i<count && !result;++i){
             const auto entry=fences[i];
-            if(!entry.handle || !entry.flags || (entry.flags&~3u)){result=invalid;break;}
-            auto* object=BdwGpuFileGetSync(file,entry.handle);if(!object){result=-2;break;}
+            if(!entry.handle || !entry.flags || (entry.flags&~3u)){result=invalid;BdwNoteExecReject(R::FenceEntry,entry.flags,3,i);break;}
+            auto* object=BdwGpuFileGetSync(file,entry.handle);if(!object){result=-2;BdwNoteExecReject(R::FenceSync,entry.handle,0,i);break;}
             auto* previous=plan->previous(object);
             const uint32_t index=plan->count++;plan->objects[index]=object;plan->timeline[index]=points[i]!=0;
             if(entry.flags&1){auto* wait=points[i]?BdwGpuSyncFindTimeline(object,points[i]):BdwGpuSyncAcquire(object);
-                if(!wait)result=invalid;
-                else {if(!BdwExecSnapshotAddWaitFence(*out,wait))result=invalid;BdwFenceUnref(wait);}}
+                if(!wait){result=invalid;BdwNoteExecReject(R::FenceWait,entry.handle,points[i],i);}
+                else {if(!BdwExecSnapshotAddWaitFence(*out,wait)){result=invalid;BdwNoteExecReject(R::FenceWait,entry.handle,BdwMaxSubmissionFences,i);}
+                    BdwFenceUnref(wait);}}
             if(!result && (entry.flags&2)){auto* signal=points[i]?(previous?BdwFencePrepareTimelineAfter(previous,points[i]):BdwGpuSyncPrepareTimeline(object,points[i])):BdwFenceCreate();
-                if(!signal)result=nomem;
-                else {plan->signals[index]=signal;if(!BdwExecSnapshotAddSignalFence(*out,signal))result=invalid;}}
+                if(!signal){result=nomem;BdwNoteExecReject(R::FenceSignal,entry.handle,points[i],i);}
+                else {plan->signals[index]=signal;if(!BdwExecSnapshotAddSignalFence(*out,signal)){result=invalid;BdwNoteExecReject(R::FenceSignal,entry.handle,points[i],i);}}}
         }
         if(result){BdwExecSnapshotRelease(*out,false);*out=nullptr;plan->release();}
     }
@@ -739,19 +765,26 @@ static int64_t RenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const BdwI
         BdwTimingOwnerElapsed(u.submitterIncarnation,BdwTimingAdmissionWait,admissionStarted,admissionAcquired);
  #endif
         BdwExecSnapshot* snapshot=nullptr;FencePlan plan{};
+        (void)BdwTakeRefusal(); // decode reasons below are this call's own
         const int64_t decoded=CopyExecSnapshot(file,arg,u,&snapshot,&plan);
  #if defined(BROOK_GPU_SUBMISSION_TIMING)
         BdwTimingOwnerElapsed(u.submitterIncarnation,BdwTimingSnapshotBuild,admissionAcquired,BdwTimingNow());
  #endif
-        if(decoded){BdwNoteRefusal("execbuffer decode: object, relocation, fence or context validation");return decoded;}
-        // The worker can map at most 65536 pages through 512 page tables. A
-        // larger or sparser buffer set is a normal application request the
-        // kernel cannot serve: refuse it here with ENOSPC instead of failing
-        // later (the worker also refuses it, as a backstop).
+        // Every decode check records its own reason; this generic one is
+        // only a backstop for a path that forgot to.
+        if(decoded){if(!g_bdwRefusal)BdwNoteRefusal("execbuffer decode: object, relocation, fence or context validation");return decoded;}
+        // The worker can map at most BdwExecMaxPages pages (decode refuses
+        // more) through 512 page tables. A sparser buffer set is a normal
+        // application request the kernel cannot serve: refuse it here with
+        // ENOSPC instead of failing later (the worker also refuses it).
         {uint32_t tables=0;
-            if(BdwExecSnapshotPageCount(snapshot)>65536 || !BdwExecSnapshotTableCount(snapshot,tables) || tables>BdwPpgttMaxTables){
+            if(!BdwExecSnapshotTableCount(snapshot,tables) || tables>BdwPpgttMaxTables){
+                const uint32_t pages=BdwExecSnapshotPageCount(snapshot);
                 plan.release();if(!BdwExecSnapshotRelease(snapshot,false))__builtin_trap();
-                BdwNoteRefusal("execbuffer: buffer set needs more than 65536 pages or 512 page tables");return -28;
+                // value: the set's pages; limit: the table count it exceeds.
+                static const char* const why="execbuffer: buffer set needs more than 512 page tables";
+                g_bdwRefusalDetail={why,pages,BdwPpgttMaxTables,BdwRefusalNoObject};
+                BdwNoteRefusal(why);return -28;
             }}
         // A referenced buffer in a CPU-visibility transition (another process's
         // TRY_CPU_READ flushing it, or a handoff retirement) refuses GPU use
