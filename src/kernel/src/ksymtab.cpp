@@ -74,6 +74,7 @@ EXPORT_SYMBOL(BootStatusPrint);
 EXPORT_SYMBOL(KernelWorkerStart);
 EXPORT_SYMBOL(BootStatusAddProvider);
 EXPORT_SYMBOL(DebugNicCommandSetHandler);
+EXPORT_SYMBOL(DebugUsbCommandSetHandler);
 
 // Physical memory
 EXPORT_SYMBOL(PmmAllocPage);

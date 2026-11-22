@@ -341,6 +341,7 @@ bool DebugHardwareAutoInitializeIntel(){
 #endif
 }
 static uint32_t (*volatile g_nicCommand)(const char*,char*,uint32_t)=nullptr;
+static uint32_t (*volatile g_usbCommand)(const char*,char*,uint32_t)=nullptr;
 bool DebugHardwareHandleCommand(const char* command,uint32_t length){
     constexpr const char* guard="bridge guard ";
     if(Prefix(command,guard)){
@@ -1050,6 +1051,18 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         text[n]=0;
         Reply r;r.text("{\"nic_api\":1,\"text\":");r.quoted(text);r.text("}\n");r.send();return true;
     }
+    constexpr char usbPrefix[]="bridge hardware usb";
+    if(Prefix(command,usbPrefix) && (!command[sizeof(usbPrefix)-1] || command[sizeof(usbPrefix)-1]==' ')) {
+        auto* handler=__atomic_load_n(&g_usbCommand,__ATOMIC_ACQUIRE);
+        if(!handler){DebugChannelSend("{\"usb_error\":\"No USB diagnostic handler is loaded\"}\n");return true;}
+        const char* args=command+sizeof(usbPrefix)-1;
+        while(*args==' ')++args;
+        static char text[3073];
+        uint32_t n=handler(args,text,sizeof(text)-1);
+        if(n>=sizeof(text))n=sizeof(text)-1;
+        text[n]=0;
+        Reply r;r.text("{\"usb_api\":1,\"text\":");r.quoted(text);r.text("}\n");r.send();return true;
+    }
     if(!strcmp(command,"bridge hardware inventory-info")) {
         Reply r;r.text("{\"hw_inventory_api\":1,\"captured\":");r.text(HwInventoryCaptured()?"true":"false");
         r.text(",");r.field("bytes",HwInventoryBytes());r.text(",");r.field("lines",HwInventoryLines());
@@ -1383,4 +1396,8 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
 extern "C" void DebugNicCommandSetHandler(uint32_t (*handler)(const char* args, char* out, uint32_t capacity))
 {
     __atomic_store_n(&brook::g_nicCommand, handler, __ATOMIC_RELEASE);
+}
+extern "C" void DebugUsbCommandSetHandler(uint32_t (*handler)(const char* args, char* out, uint32_t capacity))
+{
+    __atomic_store_n(&brook::g_usbCommand, handler, __ATOMIC_RELEASE);
 }

@@ -217,6 +217,67 @@ void PciSection() {
     g_out.str(" ecam_refused ");g_out.dec(g_ecamRefused);g_out.end();
 }
 
+
+// NVIDIA functions: raw configuration space (legacy 256 bytes, then ECAM
+// extended space; rows that read all-zero or all-ones are skipped) for each
+// 10de function and the bridge above it, then the GPU's own boot registers
+// from a read-only uncached map of BAR0's first page. Reads only; no BAR
+// sizing, no command register changes, nothing written to the device.
+void ConfigRows(uint8_t b,uint8_t d,uint8_t f) {
+    uint64_t physical=0;bool extended=false;
+    const uint32_t id=PciConfigRead32(b,d,f,0);
+    if(EcamPhysical(b,d,f,physical)){extended=MapEcam(physical);if(extended && g_window[0]!=id){UnmapEcam();extended=false;}}
+    const uint32_t limit=extended?0x1000:0x100;
+    for(uint32_t row=0;row<limit;row+=16) {
+        uint32_t v[4];bool zero=true,ones=true;
+        for(uint32_t k=0;k<4;++k){
+            const uint32_t o=row+k*4;
+            v[k]=o<0x100?PciConfigRead32(b,d,f,uint8_t(o)):g_window[o/4];
+            zero&=v[k]==0;ones&=v[k]==0xffffffffu;
+        }
+        if(row>=0x40 && (zero || ones))continue;
+        g_out.str("nvcfg ");g_out.hex(b,2);g_out.ch(':');g_out.hex(d,2);g_out.ch('.');g_out.hex(f,1);
+        g_out.ch(' ');g_out.hex(row,3);g_out.ch(':');
+        for(uint32_t k=0;k<4;++k){g_out.ch(' ');g_out.hex(v[k],8);}
+        g_out.end();
+    }
+    if(extended)UnmapEcam();
+    else g_out.str("nvcfg extended space unavailable (no ECAM)\n");
+}
+void NvidiaSection() {
+    for(uint32_t i=0;i<g_blockCount;++i) {
+        const auto& blk=g_blocks[i];
+        if(blk.vendor!=0x10de)continue;
+        if(blk.fn==0) {
+            // Bridge whose secondary bus is the GPU's bus.
+            for(uint32_t dev=0;dev<32;++dev) for(uint32_t fn=0;fn<8;++fn) {
+                const uint32_t id=PciConfigRead32(0,uint8_t(dev),uint8_t(fn),0);
+                if((id&0xffff)==0xffff)continue;
+                if((PciConfigRead8(0,uint8_t(dev),uint8_t(fn),0x0e)&0x7f)!=1)continue;
+                if(PciConfigRead8(0,uint8_t(dev),uint8_t(fn),0x19)!=blk.bus)continue;
+                g_out.str("nvidia upstream bridge 00:");g_out.hex(dev,2);g_out.ch('.');g_out.hex(fn,1);
+                g_out.str(" id ");g_out.hex(id,8);g_out.end();
+                ConfigRows(0,uint8_t(dev),uint8_t(fn));
+            }
+        }
+        ConfigRows(blk.bus,blk.dev,blk.fn);
+        if(blk.cls!=0x03)continue;
+        const uint16_t command=PciConfigRead16(blk.bus,blk.dev,blk.fn,4);
+        const uint32_t bar0=PciConfigRead32(blk.bus,blk.dev,blk.fn,0x10);
+        uint64_t base=bar0&~uint64_t(15);
+        if((bar0&6)==4)base|=uint64_t(PciConfigRead32(blk.bus,blk.dev,blk.fn,0x14))<<32;
+        g_out.str("nvidia bar0 ");g_out.hx(base,8);g_out.str(" command ");g_out.hx(command,4);
+        if((bar0&1) || !base || (base&0xfff) || !(command&2)){g_out.str(" not read (I/O, unassigned or memory decode off)");g_out.end();continue;}
+        if(!MapEcam(base)){g_out.str(" not read (range is RAM or unmappable)");g_out.end();continue;}
+        const uint32_t boot0=g_window[0],boot42=g_window[0xa00/4];
+        UnmapEcam();
+        g_out.str(" PMC_BOOT_0 ");g_out.hx(boot0,8);g_out.str(" PMC_BOOT_42 ");g_out.hx(boot42,8);
+        // Turing: architecture in BOOT_0[28:20] (0x16x = TU10x), implementation [23:20].
+        g_out.str(" arch ");g_out.hx((boot0>>20)&0x1ff,3);g_out.str(" rev ");g_out.hx(boot0&0xff,2);
+        g_out.end();
+    }
+}
+
 void CountLines(){g_lines=0;for(uint32_t i=0;i<g_out.length();++i)if(g_text[i]=='\n')++g_lines;}
 
 // Console lines go through KPrintf's 256-byte overlay buffer; copy one line at a time.
@@ -254,6 +315,7 @@ void HwInventoryCapture(const BootProtocol* boot) {
     AcpiSection();
     DmarUnitSection();
     PciSection();
+    NvidiaSection();
     if(g_out.overflow())g_out.str("\ninventory truncated\n");
     CountLines();
     g_captured=true;

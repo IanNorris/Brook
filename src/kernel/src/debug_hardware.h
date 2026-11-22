@@ -16,3 +16,4 @@ bool DebugHardwareAutoInitializeIntel();
 // handler(args, out, capacity); the returned text goes back JSON-quoted.
 // The handler runs on the debug command thread; nullptr unregisters.
 extern "C" void DebugNicCommandSetHandler(uint32_t (*handler)(const char* args, char* out, uint32_t capacity));
+extern "C" void DebugUsbCommandSetHandler(uint32_t (*handler)(const char* args, char* out, uint32_t capacity));

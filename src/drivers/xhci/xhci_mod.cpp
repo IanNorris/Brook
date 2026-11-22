@@ -30,6 +30,7 @@
 #include "xhci_completion_queue.h"
 #include "usb_hub_logic.h"
 #include "boot_status.h"
+#include "debug_hardware.h"
 #include "scheduler.h"
 #include "usb_scsi_cache.h"
 #include "usb_bot_recovery.h"
@@ -69,6 +70,7 @@ MODULE_IMPORT_SYMBOL(SerialPuts);
 MODULE_IMPORT_SYMBOL(UsbBootReportReset);
 MODULE_IMPORT_SYMBOL(KPrintf);
 MODULE_IMPORT_SYMBOL(KPuts);
+MODULE_IMPORT_SYMBOL(DebugUsbCommandSetHandler);
 MODULE_IMPORT_SYMBOL(VmmAllocPages);
 MODULE_IMPORT_SYMBOL(VmmVirtToPhys);
 MODULE_IMPORT_SYMBOL(VmmMapPage);
@@ -1089,6 +1091,11 @@ struct XhciDevice {
     const char* hubError[XHCI_HUB_MAX_PORTS];
 
     void*    priv;          // driver-private (DMA report buffer for HID)
+
+    // Raw descriptors kept for read-only diagnostics (bridge hardware usb).
+    uint8_t  rawDevice[18];
+    uint8_t* rawConfig;     // kmalloc'd copy of the selected configuration
+    uint16_t rawConfigLen;
 };
 
 static constexpr unsigned ECM_RX_PACKETS=UsbEcmRxCredits::Capacity;
@@ -1496,6 +1503,7 @@ static bool XhciGetDeviceDescriptor(XhciController& ctrl, XhciDevice& dev)
     }
 
     auto* desc = reinterpret_cast<UsbDeviceDescriptor*>(buf);
+    memcpy(dev.rawDevice, buf, sizeof(dev.rawDevice));
     dev.vendorId = desc->idVendor;
     dev.productId = desc->idProduct;
     dev.bcdUsb = desc->bcdUSB;
@@ -1649,6 +1657,8 @@ static bool XhciConfigureDevice(XhciController& ctrl, XhciDevice& dev)
     }
     dev.isKeyboard = dev.kbd.ep != 0;
     dev.isMouse = dev.mouse.ep != 0;
+    if (!dev.rawConfig) dev.rawConfig = static_cast<uint8_t*>(kmalloc(totalLen));
+    if (dev.rawConfig) { memcpy(dev.rawConfig, buf, totalLen); dev.rawConfigLen = totalLen; }
 
     UsbSetupPacket setCfg = {};
     setCfg.bmRequestType = 0x00; // Host-to-Device, Standard, Device
@@ -3963,6 +3973,93 @@ static void XhciSetupInterrupts(XhciController& ctrl)
                  msixConfigured ? "yes" : "no");
 }
 
+
+// ---- Read-only diagnostics: bridge hardware usb ------------------------------
+// "list", "desc <i> [offset]" (raw device + configuration descriptors as hex),
+// "get <i> <bmRequestType> <bRequest> <wValue> <wIndex> <wLength>" (hex fields;
+// device-to-host requests only, and only on devices no Brook function owns).
+static bool XhciArgHex(const char*& p, uint32_t& v)
+{
+    while (*p == ' ') ++p;
+    uint32_t n = 0; v = 0;
+    while (true) {
+        const char ch = *p; uint32_t d;
+        if (ch >= '0' && ch <= '9') d = uint32_t(ch - '0');
+        else if (ch >= 'a' && ch <= 'f') d = uint32_t(ch - 'a' + 10);
+        else if (ch >= 'A' && ch <= 'F') d = uint32_t(ch - 'A' + 10);
+        else break;
+        if (++n > 8) return false;
+        v = (v << 4) | d; ++p;
+    }
+    return n != 0;
+}
+static bool XhciArgIs(const char*& p, const char* word)
+{
+    const char* q = p;
+    while (*word) if (*q++ != *word++) return false;
+    if (*q && *q != ' ') return false;
+    p = q; return true;
+}
+static uint32_t XhciUsbCommand(const char* args, char* out, uint32_t cap)
+{
+    XhciText t{out, cap, 0};
+    const char* p = args;
+    const uint32_t count = __atomic_load_n(&g_deviceCount, __ATOMIC_ACQUIRE);
+    if (!*p || XhciArgIs(p, "list")) {
+        for (uint32_t i = 0; i < count; ++i) {
+            const auto& dev = g_devices[i];
+            char path[24]; XhciPathText(dev, path, sizeof(path));
+            t.u(i); t.s(" c"); t.u(dev.ctrl ? dev.ctrl->index : 0); t.s(" p"); t.s(path);
+            t.c(' '); t.s(UsbSpeedName(dev.portSpeed)); t.c(' ');
+            t.x(dev.vendorId, 4); t.c(':'); t.x(dev.productId, 4); t.c(' '); t.s(XhciDeviceKind(dev));
+            t.s(" slot="); t.u(dev.slotId); t.s(" cfg="); t.u(dev.rawConfigLen);
+            if (dev.gone) t.s(" gone");
+            t.nl();
+        }
+        return t.len;
+    }
+    uint32_t index = 0;
+    if (XhciArgIs(p, "desc")) {
+        uint32_t offset = 0;
+        if (!XhciArgHex(p, index) || index >= count) { t.s("bad device index"); return t.len; }
+        if (*p) (void)XhciArgHex(p, offset);
+        const auto& dev = g_devices[index];
+        t.s("dev "); for (uint8_t b : dev.rawDevice) t.x(b, 2); t.nl();
+        t.s("cfg len="); t.u(dev.rawConfigLen); t.s(" off="); t.x(offset, 4); t.nl();
+        for (uint32_t o = offset; o < dev.rawConfigLen && o < offset + 1024; ++o) {
+            t.x(dev.rawConfig[o], 2);
+            if ((o - offset) % 32 == 31) t.nl();
+        }
+        t.nl();
+        return t.len;
+    }
+    if (XhciArgIs(p, "get")) {
+        uint32_t f[5];
+        if (!XhciArgHex(p, index) || index >= count) { t.s("bad device index"); return t.len; }
+        for (auto& v : f) if (!XhciArgHex(p, v)) { t.s("usage: get <i> <bmRT> <bReq> <wValue> <wIndex> <wLength>"); return t.len; }
+        auto& dev = g_devices[index];
+        if (!(f[0] & 0x80) || f[0] > 0xff || f[1] > 0xff || f[2] > 0xffff || f[3] > 0xffff || !f[4] || f[4] > 512) {
+            t.s("refused: device-to-host requests of 1..512 bytes only"); return t.len;
+        }
+        if (dev.gone || !dev.ctrl || !dev.scratch || dev.isHub || dev.isKeyboard || dev.isMouse ||
+            dev.isMassStorage || dev.ecm.value) { t.s("refused: device gone or owned by a driver"); return t.len; }
+        UsbSetupPacket setup{};
+        setup.bmRequestType = uint8_t(f[0]); setup.bRequest = uint8_t(f[1]);
+        setup.wValue = uint16_t(f[2]); setup.wIndex = uint16_t(f[3]); setup.wLength = uint16_t(f[4]);
+        uint32_t got = 0;
+        memset(dev.scratch, 0, f[4]);
+        if (!XhciControlTransfer(*dev.ctrl, dev, setup, dev.scratch, f[4], dev.scratchPhys, 3, &got)) {
+            t.s("failed cc="); t.u(dev.lastCc); return t.len;
+        }
+        t.s("ok len="); t.u(got); t.nl();
+        for (uint32_t o = 0; o < got; ++o) { t.x(dev.scratch[o], 2); if (o % 32 == 31) t.nl(); }
+        t.nl();
+        return t.len;
+    }
+    t.s("usage: bridge hardware usb [list|desc <i> [off]|get <i> <bmRT> <bReq> <wValue> <wIndex> <wLength>]");
+    return t.len;
+}
+
 static int XhciModuleInit()
 {
     SerialPuts("xhci: initializing USB 3.0 host controller driver\n");
@@ -4025,6 +4122,7 @@ static int XhciModuleInit()
         // (root and hub port polling) is opt-in so existing payloads keep
         // their boot-time-only enumeration.
         UsbStatusSetProvider(XhciStatusText);
+        DebugUsbCommandSetHandler(XhciUsbCommand);
         bool hotplug = false;
         static const char* const markers[] = {"/etc/usb-hotplug", "/etc/boot-status"};
         for (const char* path : markers)
