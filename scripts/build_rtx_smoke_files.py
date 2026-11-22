@@ -199,6 +199,8 @@ def desktop_payload(args, initrd):
     fat_write(initrd, 'ETC/volatile-desktop', b'1\n')
     fat_write(initrd, 'ETC/hardware-bulk', b'1\n')
     fat_write(initrd, 'ETC/usb-audio-mixer', b'1\n')
+    # RTX DP sink idle-off: 5 min, AUX ch 3 / SOR1 link B (the GOP's lit head on this desktop).
+    fat_write(initrd, 'ETC/dp-idle-seconds', b'300 3 1 2\n')
     fat_write(initrd, 'ETC/chromium-alsa-device', b'default\n')  # read by the store's brook-chromium
     fat_write(initrd, 'ETC/live-store', store['record'].encode())
     fat_write(initrd, 'BOOT/BIN/BASH', (profile / 'bin/bash').read_bytes())

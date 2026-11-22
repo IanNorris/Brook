@@ -539,6 +539,7 @@ bool NvAuxHandle(const char* command,char* out,uint32_t cap){
 // GOP's own link. The head keeps scanning throughout. A failed wake is
 // retried once a second until the link trains, so the screen is never left
 // dark without another attempt.
+// TODO: honour idle inhibitors (video playback) once the desktop has them.
 struct DpIdleState{
     uint32_t seconds=0,ch=3,sor=1,link=2;
     bool blanked=false,threadStarted=false,wakeRequested=false,handTest=false;
