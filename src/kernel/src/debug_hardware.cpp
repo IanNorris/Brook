@@ -545,6 +545,12 @@ struct DpIdleState{
     bool blanked=false,threadStarted=false,wakeRequested=false,handTest=false;
     uint64_t seq=0,lastActivityMs=0,lastWakeTryMs=0;
     uint32_t blanks=0,wakes=0,wakeFails=0;
+    // Link watch (part of the wake path): after a hot-plug edge or on input,
+    // retrain the GOP's link if the head is active but the link is down
+    // (KVM switch-back, monitor replug). Rate-limited, capped retries.
+    bool watch=false,sinkPresent=false,linkCheckPending=false;
+    uint64_t lastLinkCheckMs=0;
+    uint32_t linkRetrains=0,linkFails=0,hotplugs=0;
     char lastReply[320]{};
 };
 DpIdleState g_dpIdle;
@@ -586,6 +592,26 @@ bool DpIdleWake(uint32_t ch,uint32_t sor,uint32_t link){
     }
     KPrintf("dp-idle: wake failed: %s\n",g_dpIdle.lastReply);return false;
 }
+// AUX controller sink-detect (stat bit 28, tracks HPD); one read-only MMIO
+// read, no AUX transaction.
+bool DpIdleSinkPresent(uint32_t ch){
+    if(!g_nvMapDone||ch>7)return false;
+    const volatile uint32_t* reg=reinterpret_cast<const volatile uint32_t*>(g_nvAuxWin.raw());
+    return (reg[(0xd958+ch*0x50-0xd000)/4]&0x10000000)!=0;
+}
+uint8_t HexByte(const char* t){
+    auto v=[](char c)->uint8_t{return uint8_t(c>='a'?c-'a'+10:c>='A'?c-'A'+10:c-'0');};
+    return uint8_t(v(t[0])<<4|v(t[1]));
+}
+// True when DPCD 0x202-0x204 show CR, EQ and symbol lock on all four lanes
+// and inter-lane alignment. false also when the read fails.
+bool DpIdleLinkUp(uint32_t ch){
+    if(!DpIdleAux("read",ch,0x202,3))return false;
+    const char* h=Find(g_dpIdle.lastReply,"\"hex\":\"");
+    if(!h)return false;h+=7;
+    for(int i=0;i<6;++i){const char c=h[i];if(!((c>='0'&&c<='9')||(c>='a'&&c<='f')))return false;}
+    return HexByte(h)==0x77&&HexByte(h+2)==0x77&&(HexByte(h+4)&1);
+}
 void DpIdleWorker(void*){
     for(int i=0;i<10&&!NvAuxMapWindows();++i)SchedulerSleepMs(100);
     KPrintf("dp-idle: worker up, windows %s\n",g_nvMapDone?"mapped":"NOT mapped");
@@ -600,7 +626,7 @@ void DpIdleWorker(void*){
                     if(*q>='0'&&*q<='9'){Decimal(q,ch);while(*q==' ')++q;Decimal(q,sor);while(*q==' ')++q;Decimal(q,link);}
                     if(ch<=7&&sor<=3&&(link==1||link==2)){
                         SpinLockAcquire(&g_dpIdleLock);
-                        g_dpIdle.ch=ch;g_dpIdle.sor=sor;g_dpIdle.link=link;g_dpIdle.seconds=secs;
+                        g_dpIdle.ch=ch;g_dpIdle.sor=sor;g_dpIdle.link=link;g_dpIdle.seconds=secs;g_dpIdle.watch=true;
                         g_dpIdle.seq=InputLatestSequence();g_dpIdle.lastActivityMs=ApicTickCount();
                         SpinLockRelease(&g_dpIdleLock);
                         KPrintf("dp-idle: marker: %u s, aux %u SOR%u link %u\n",secs,ch,sor,link);}
@@ -615,15 +641,39 @@ void DpIdleWorker(void*){
         SchedulerSleepMs(g_dpIdle.blanked?20:250);
         SpinLockAcquire(&g_dpIdleLock);
         const uint64_t now=ApicTickCount(),seq=InputLatestSequence();
-        if(seq!=g_dpIdle.seq){g_dpIdle.seq=seq;g_dpIdle.lastActivityMs=now;if(g_dpIdle.blanked)g_dpIdle.wakeRequested=true;}
+        if(seq!=g_dpIdle.seq){g_dpIdle.seq=seq;g_dpIdle.lastActivityMs=now;if(g_dpIdle.blanked)g_dpIdle.wakeRequested=true;
+            else if(g_dpIdle.watch)g_dpIdle.linkCheckPending=true;}
+        if(g_dpIdle.watch){const bool sink=DpIdleSinkPresent(g_dpIdle.ch);
+            if(sink&&!g_dpIdle.sinkPresent){++g_dpIdle.hotplugs;g_dpIdle.linkCheckPending=true;}
+            g_dpIdle.sinkPresent=sink;}
         int action=0;
+        // Link watch: at most every 2 s; after 5 failed retrains in a row, every 30 s.
+        const uint64_t linkGap=g_dpIdle.linkFails>=5?30000:2000;
         if(g_dpIdle.handTest){}
+        else if(!g_dpIdle.blanked&&g_dpIdle.linkCheckPending&&g_dpIdle.sinkPresent&&now-g_dpIdle.lastLinkCheckMs>=linkGap){
+            action=3;g_dpIdle.linkCheckPending=false;g_dpIdle.lastLinkCheckMs=now;}
         else if(g_dpIdle.blanked&&(g_dpIdle.wakeRequested||!g_dpIdle.seconds)){
             if(!g_dpIdle.wakeFails||now-g_dpIdle.lastWakeTryMs>=1000){action=2;g_dpIdle.lastWakeTryMs=now;}}
         else if(!g_dpIdle.blanked&&g_dpIdle.seconds&&now-g_dpIdle.lastActivityMs>=uint64_t(g_dpIdle.seconds)*1000)action=1;
         const uint32_t ch=g_dpIdle.ch,sor=g_dpIdle.sor,link=g_dpIdle.link;
         SpinLockRelease(&g_dpIdleLock);
         if(!action)continue;
+        if(action==3){
+            // Head active is enforced by retrain itself (refuses unless the
+            // SOR's ARM state is an active DP link). D0 first: a replugged
+            // or switched-back sink may come up in any power state.
+            int result=0; // 0 link up, 1 retrained, 2 failed
+            if(!DpIdleLinkUp(ch)){
+                KPrintf("dp-idle: link down on aux %u (%s); retraining\n",ch,g_dpIdle.lastReply);
+                result=DpIdleWake(ch,sor,link)?1:2;
+            }
+            SpinLockAcquire(&g_dpIdleLock);
+            if(result==1){++g_dpIdle.linkRetrains;g_dpIdle.linkFails=0;}
+            else if(result==2){++g_dpIdle.linkFails;g_dpIdle.linkCheckPending=true;}
+            else g_dpIdle.linkFails=0;
+            SpinLockRelease(&g_dpIdleLock);
+            continue;
+        }
         const bool done=action==1?DpIdleBlank(ch):DpIdleWake(ch,sor,link);
         SpinLockAcquire(&g_dpIdleLock);
         if(action==1){if(done){g_dpIdle.blanked=true;++g_dpIdle.blanks;}
@@ -657,7 +707,7 @@ void DpIdleCommand(const char* p){
         ok=ok&&Decimal(p,sor)&&sor<=3;while(ok&&*p==' ')++p;
         ok=ok&&Decimal(p,link)&&(link==1||link==2)&&!*p;
         if(ok){if(g_dpIdle.blanked&&ch!=g_dpIdle.ch)ok=false;
-            else{g_dpIdle.seconds=secs;g_dpIdle.ch=ch;g_dpIdle.sor=sor;g_dpIdle.link=link;
+            else{g_dpIdle.seconds=secs;g_dpIdle.ch=ch;g_dpIdle.sor=sor;g_dpIdle.link=link;g_dpIdle.watch=true;
                 g_dpIdle.seq=InputLatestSequence();g_dpIdle.lastActivityMs=ApicTickCount();}}
     }
     else ok=false;
@@ -669,7 +719,10 @@ void DpIdleCommand(const char* p){
     r.text(",");r.field("sor",g_dpIdle.sor);r.text(",");r.field("link",g_dpIdle.link);
     r.text(",");r.field("idle_ms",ApicTickCount()-g_dpIdle.lastActivityMs);
     r.text(",");r.field("blanks",g_dpIdle.blanks);r.text(",");r.field("wakes",g_dpIdle.wakes);
-    r.text(",");r.field("wake_fails",g_dpIdle.wakeFails);r.text(",\"last\":");r.quoted(g_dpIdle.lastReply);r.text("}\n");
+    r.text(",");r.field("wake_fails",g_dpIdle.wakeFails);
+    r.text(",\"watch\":");r.text(g_dpIdle.watch?"true":"false");r.text(",\"sink\":");r.text(g_dpIdle.sinkPresent?"true":"false");
+    r.text(",");r.field("hotplugs",g_dpIdle.hotplugs);r.text(",");r.field("link_retrains",g_dpIdle.linkRetrains);
+    r.text(",");r.field("link_fails",g_dpIdle.linkFails);r.text(",\"last\":");r.quoted(g_dpIdle.lastReply);r.text("}\n");
     SpinLockRelease(&g_dpIdleLock);
     r.send();
 }
