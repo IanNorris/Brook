@@ -159,6 +159,8 @@ EXPORT_SYMBOL(MouseSetPosition);
 EXPORT_SYMBOL(MouseMoveRelative);
 EXPORT_SYMBOL(MouseSetButtons);
 EXPORT_SYMBOL(MouseSetAvailable);
+EXPORT_SYMBOL(MouseSetUsbAvailable);
+EXPORT_SYMBOL(MouseSetUsbButtons);
 
 // virtio-blk
 EXPORT_SYMBOL(VirtioBlkInitAll);

@@ -46,6 +46,8 @@
 #include "memory/address.h"
 #include "mem_tag.h"
 #include "input.h"
+#include "compositor.h"
+#include "usb_boot_keyboard.h"
 #include "keyboard.h"
 #include "device.h"
 #include "storage_io_stats.h"
@@ -77,6 +79,7 @@ MODULE_IMPORT_SYMBOL(ApicGetId);
 MODULE_IMPORT_SYMBOL(IdtInstallHandler);
 MODULE_IMPORT_SYMBOL(InputRegister);
 MODULE_IMPORT_SYMBOL(InputWakeWaiters);
+MODULE_IMPORT_SYMBOL(CompositorWake);
 MODULE_IMPORT_SYMBOL(InputNextSequence);
 MODULE_IMPORT_SYMBOL(KbdPushChar);
 MODULE_IMPORT_SYMBOL(kmalloc);
@@ -957,7 +960,7 @@ struct XhciHidFn {
     uint8_t* report;
     uint64_t reportPhys;
     uint32_t length;            // bytes requested per report
-    uint8_t  previous[8];       // last keyboard report (key up/down)
+    uint8_t  previous[8];       // per-interface keys or buttons
     bool     active;
     uint8_t  errorCc;
 };
@@ -1091,7 +1094,6 @@ static bool XhciInitEcm(XhciController&,XhciDevice&);
 
 static XhciDevice g_devices[MAX_DEVICES];
 static uint32_t   g_deviceCount = 0;
-static bool        g_mousePresent = false; // set when a mouse is successfully configured
 
 // ---------------------------------------------------------------------------
 // Phase 4: Enable / Disable Slot
@@ -1774,37 +1776,6 @@ static bool XhciQueueInterruptIn(XhciController& ctrl, XhciDevice& dev,
 // Byte 1: reserved
 // Bytes 2-7: up to 6 simultaneous key codes
 
-static constexpr uint8_t MOD_LEFT_CTRL   = 0x01;
-static constexpr uint8_t MOD_LEFT_SHIFT  = 0x02;
-static constexpr uint8_t MOD_LEFT_ALT    = 0x04;
-static constexpr uint8_t MOD_LEFT_GUI    = 0x08;
-static constexpr uint8_t MOD_RIGHT_CTRL  = 0x10;
-static constexpr uint8_t MOD_RIGHT_SHIFT = 0x20;
-static constexpr uint8_t MOD_RIGHT_ALT   = 0x40;
-static constexpr uint8_t MOD_RIGHT_GUI   = 0x80;
-
-// USB HID usage ID → Linux input event code (KEY_* from linux/input-event-codes.h)
-// Only covers the basic alphanumeric + common keys
-// These map to PS/2 scan code set 1 values used by Brook's input subsystem
-static const uint8_t g_hidToScancode[128] = {
-    0,   0,   0,   0,   30,  48,  46,  32,  // 0x00-0x07: None,None,None,None, A,B,C,D
-    18,  33,  34,  35,  23,  36,  37,  38,  // 0x08-0x0F: E,F,G,H, I,J,K,L
-    50,  49,  24,  25,  16,  19,  31,  20,  // 0x10-0x17: M,N,O,P, Q,R,S,T
-    22,  47,  17,  45,  21,  44,  2,   3,   // 0x18-0x1F: U,V,W,X, Y,Z,1,2
-    4,   5,   6,   7,   8,   9,   10,  11,  // 0x20-0x27: 3,4,5,6, 7,8,9,0
-    28,  1,   14,  15,  57,  12,  13,  26,  // 0x28-0x2F: Enter,Esc,Bksp,Tab, Space,-,=,[
-    27,  43,  43,  39,  40,  41,  51,  52,  // 0x30-0x37: ],\,\,;, ',`,,,. 
-    53,  58,  59,  60,  61,  62,  63,  64,  // 0x38-0x3F: /,CapsLk,F1,F2, F3,F4,F5,F6
-    65,  66,  67,  68,  87,  88,  99,  70,  // 0x40-0x47: F7,F8,F9,F10, F11,F12,PrtSc,ScrLk
-    119, 110, 102, 104, 111, 107, 109, 106, // 0x48-0x4F: Pause,Ins,Home,PgUp, Del,End,PgDn,Right
-    105, 108, 103, 69,  98,  55,  74,  78,  // 0x50-0x57: Left,Down,Up,NumLk, KP/,KP*,KP-,KP+
-    96,  79,  80,  81,  75,  76,  77,  71,  // 0x58-0x5F: KPEnt,KP1,KP2,KP3, KP4,KP5,KP6,KP7
-    72,  73,  82,  83,  0,   0,   0,   0,   // 0x60-0x67: KP8,KP9,KP0,KP., unused...
-    0,   0,   0,   0,   0,   0,   0,   0,   // 0x68-0x6F
-    0,   0,   0,   0,   0,   0,   0,   0,   // 0x70-0x77
-    0,   0,   0,   0,   0,   0,   0,   0,   // 0x78-0x7F
-};
-
 // USB keyboard input device
 static InputDevice g_usbKbdDev;
 static InputDeviceOps g_usbKbdOps = { "usb_kbd", nullptr };
@@ -1852,12 +1823,11 @@ static void XhciPushKey(uint8_t scancode, bool pressed, uint8_t modifiers)
     // Translate scancode → ASCII so the compositor/terminal can use it
     ev.ascii = 0;
     if (pressed && scancode < 128) {
-        bool shifted = (modifiers & (INPUT_MOD_LSHIFT | INPUT_MOD_RSHIFT)) != 0;
-        bool capsLock = false; // TODO: track caps lock state
-        char c = shifted ? g_sc1ToAsciiShift[scancode] : g_sc1ToAscii[scancode];
-        // CapsLock inverts letter case
-        if (capsLock && c >= 'A' && c <= 'Z' && !shifted)
-            c = g_sc1ToAscii[scancode]; // already lowercase
+        bool shifted = (modifiers & INPUT_MOD_SHIFT) != 0;
+        const char base = g_sc1ToAscii[scancode];
+        if ((modifiers & INPUT_MOD_CAPSLOCK) && base >= 'a' && base <= 'z')
+            shifted = !shifted;
+        const char c = shifted ? g_sc1ToAsciiShift[scancode] : base;
         ev.ascii = static_cast<uint8_t>(c);
     }
 
@@ -1869,84 +1839,15 @@ static void XhciPushKey(uint8_t scancode, bool pressed, uint8_t modifiers)
         KbdPushChar(static_cast<char>(ev.ascii));
 }
 
-static void XhciProcessKeyboardReport(const uint8_t* report, uint8_t* g_prevReport)
-{
-    uint8_t mods = report[0];
-    uint8_t prevMods = g_prevReport[0];
+static UsbBootKeyboard g_bootKeyboard;
+static uint32_t g_activeUsbMice;
+static volatile uint32_t g_mouseReports;
 
-    // Build Brook modifier bitmask
-    uint8_t brookMods = 0;
-    if (mods & MOD_LEFT_SHIFT)  brookMods |= INPUT_MOD_LSHIFT;
-    if (mods & MOD_RIGHT_SHIFT) brookMods |= INPUT_MOD_RSHIFT;
-    if (mods & (MOD_LEFT_CTRL | MOD_RIGHT_CTRL)) brookMods |= INPUT_MOD_CTRL;
-    if (mods & (MOD_LEFT_ALT | MOD_RIGHT_ALT))   brookMods |= INPUT_MOD_ALT;
-    if (mods & (MOD_LEFT_GUI | MOD_RIGHT_GUI))   brookMods |= INPUT_MOD_SUPER;
-
-    // Check each modifier for press/release
-    struct { uint8_t mask; uint8_t sc; } modMap[] = {
-        { MOD_LEFT_CTRL,   29 },  // KEY_LEFTCTRL
-        { MOD_LEFT_SHIFT,  42 },  // KEY_LEFTSHIFT
-        { MOD_LEFT_ALT,    56 },  // KEY_LEFTALT
-        { MOD_RIGHT_CTRL,  97 },  // KEY_RIGHTCTRL
-        { MOD_RIGHT_SHIFT, 54 },  // KEY_RIGHTSHIFT
-        { MOD_RIGHT_ALT,   100 }, // KEY_RIGHTALT
-        { MOD_LEFT_GUI,    SC_LSUPER }, // KEY_LEFTMETA
-        { MOD_RIGHT_GUI,   SC_RSUPER }, // KEY_RIGHTMETA
-    };
-
-    for (auto& m : modMap) {
-        bool now  = (mods & m.mask) != 0;
-        bool prev = (prevMods & m.mask) != 0;
-        if (now != prev)
-            XhciPushKey(m.sc, now, brookMods);
-    }
-
-    // Regular keys (bytes 2-7): detect releases then presses
-    for (int i = 2; i < 8; i++) {
-        uint8_t key = g_prevReport[i];
-        if (key < 4 || key >= 128) continue;
-        bool found = false;
-        for (int j = 2; j < 8; j++)
-            if (report[j] == key) { found = true; break; }
-        if (!found) {
-            uint8_t sc = g_hidToScancode[key];
-            if (sc) XhciPushKey(sc, false, brookMods);
-        }
-    }
-
-    for (int i = 2; i < 8; i++) {
-        uint8_t key = report[i];
-        if (key < 4 || key >= 128) continue;
-        bool found = false;
-        for (int j = 2; j < 8; j++)
-            if (g_prevReport[j] == key) { found = true; break; }
-        if (!found) {
-            uint8_t sc = g_hidToScancode[key];
-            if (sc) XhciPushKey(sc, true, brookMods);
-        }
-    }
-
-    __builtin_memcpy(g_prevReport, report, 8);
-    InputWakeWaiters();
-}
-
-// ---------------------------------------------------------------------------
-// Keyboard polling state
-// ---------------------------------------------------------------------------
-
-
-// Forward declarations — defined later in this file
+static void XhciProcessMouseReport(const uint8_t* report, XhciHidFn& fn);
+static void XhciEndHid(XhciHidFn& fn, bool keyboard);
 static int XhciMatchTransferEvent(const XhciController& ctrl, const Trb& evt);
-static void XhciProcessMouseReport(const uint8_t* report);
 
-// Poll for USB keyboard events — called by the input subsystem.
-// In interrupt-driven mode (g_irqActive), the ISR handles reports
-// directly, so this is a no-op. In polling mode, it checks for events.
-
-// Unified event drain — processes all pending events on the event ring
-// and routes transfer completions to the correct device. Called from
-// both keyboard and mouse poll paths.
-static void XhciProcessMouseReport(const uint8_t* report);
+// Drain the shared event ring for IRQs and both HID input queues.
 static bool XhciHidRingHit(const XhciHidFn& fn, const Trb& event, uint32_t slot, uint32_t slotId)
 {
     const uint32_t dci=(event.control>>16)&31;
@@ -1960,6 +1861,7 @@ static void XhciDrainController(XhciController& ctrl,bool& wakeNetwork)
 {
     const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
     unsigned processed=0;
+    bool wakeInput=false;
     while(processed<EVT_RING_SIZE) {
         const auto& source=ctrl.evtRing[ctrl.evtDequeue];
         if(bool(source.control&TRB_CYCLE)!=ctrl.evtCycle)break;
@@ -1986,15 +1888,23 @@ static void XhciDrainController(XhciController& ctrl,bool& wakeNetwork)
                     if(!XhciHidRingHit(fn,event,slot,dev.slotId))continue;
                     handled=true;
                     if(!fn.active || dev.gone)break;
-                    if(cc!=TRB_CC_SUCCESS && cc!=TRB_CC_SHORT_PACKET){fn.active=false;fn.errorCc=static_cast<uint8_t>(cc);break;}
+                    if(cc!=TRB_CC_SUCCESS && cc!=TRB_CC_SHORT_PACKET) {
+                        fn.errorCc=static_cast<uint8_t>(cc);
+                        XhciEndHid(fn,!which);
+                        wakeInput=true;
+                        break;
+                    }
                     const uint32_t residue=event.status&0xffffff;
                     const uint32_t bytes=residue<=fn.length?fn.length-residue:0;
                     if(!which && bytes>=3) {
                         for(uint32_t i=bytes;i<8;++i)fn.report[i]=0;
-                        XhciProcessKeyboardReport(fn.report,fn.previous);
+                        g_bootKeyboard.Update(fn.report,fn.previous,XhciPushKey);
+                        wakeInput=true;
                     } else if(which && bytes>=3) {
                         if(bytes<4)fn.report[3]=0;
-                        XhciProcessMouseReport(fn.report);
+                        XhciProcessMouseReport(fn.report,fn);
+                        __atomic_fetch_add(&g_mouseReports,1,__ATOMIC_RELAXED);
+                        wakeInput=true;
                     }
                     XhciQueueHidIn(ctrl,dev,fn);
                 }
@@ -2012,6 +1922,10 @@ static void XhciDrainController(XhciController& ctrl,bool& wakeNetwork)
         xhci_write32(ctrl.rtBase,XHCI_RT_IMAN,iman|1); // ack IP, preserve interrupt enable
     }
     IrqSpinLockRelease(&g_eventRingLock,saved);
+    if(wakeInput) {
+        CompositorWake();
+        InputWakeWaiters();
+    }
 }
 
 static void XhciPollDrainEvents()
@@ -2040,59 +1954,75 @@ static void XhciKeyboardPoll(InputDevice* /*dev*/)
 // Byte 2: Y displacement (signed int8)
 
 MODULE_IMPORT_SYMBOL(MouseMoveRelative);
-MODULE_IMPORT_SYMBOL(MouseSetButtons);
-MODULE_IMPORT_SYMBOL(MouseSetAvailable);
+MODULE_IMPORT_SYMBOL(MouseSetUsbButtons);
+MODULE_IMPORT_SYMBOL(MouseSetUsbAvailable);
 
 extern "C" void MouseMoveRelative(int32_t dx, int32_t dy);
-extern "C" void MouseSetButtons(uint8_t buttons);
-extern "C" void MouseSetAvailable(bool available);
+extern "C" void MouseSetUsbButtons(uint8_t buttons);
+extern "C" void MouseSetUsbAvailable(bool available);
 
 static InputDevice g_usbMouseDev;
 static InputDeviceOps g_usbMouseOps = { "usb_mouse", nullptr };
 
-static volatile uint32_t g_mouseReports = 0;
-static void XhciProcessMouseReport(const uint8_t* report)
+static uint8_t g_usbButtons;
+static uint8_t g_usbButtonHolders[3];
+
+static void XhciProcessMouseReport(const uint8_t* report, XhciHidFn& fn)
 {
-    __atomic_fetch_add(&g_mouseReports, 1, __ATOMIC_RELAXED);
-    uint8_t buttons = report[0] & 0x07;
-    int8_t  dx = static_cast<int8_t>(report[1]);
-    int8_t  dy = static_cast<int8_t>(report[2]);
+    const uint8_t buttons = report[0] & 0x07;
+    const uint8_t previous = g_usbButtons;
+    for (unsigned bit = 0; bit < 3; ++bit) {
+        const uint8_t mask = 1u << bit;
+        if (!((buttons ^ fn.previous[0]) & mask)) continue;
+        if (buttons & mask) ++g_usbButtonHolders[bit];
+        else --g_usbButtonHolders[bit];
+        if (g_usbButtonHolders[bit]) g_usbButtons |= mask;
+        else g_usbButtons &= ~mask;
+    }
+    fn.previous[0] = buttons;
+    MouseSetUsbButtons(g_usbButtons);
 
-    // Update global mouse position via the kernel mouse API
-    if (dx != 0 || dy != 0) {
-        // Physical desktop gain is separate from the raw event payload.
+    const int8_t dx = static_cast<int8_t>(report[1]);
+    const int8_t dy = static_cast<int8_t>(report[2]);
+    const int8_t wheel = static_cast<int8_t>(report[3]);
+    if (dx || dy) {
         MouseMoveRelative(dx, dy);
-
         InputEvent ev{};
-        ev.type     = InputEventType::MouseRelativeMove;
+        ev.type = InputEventType::MouseRelativeMove;
+        ev.scanCode = g_usbButtons;
         ev.deltaX = dx;
         ev.deltaY = dy;
-        ev.scanCode = buttons;
-        ev.ascii    = 0;
-        ev.modifiers = 0;
         InputDevicePush(&g_usbMouseDev, ev);
     }
-
-    // Update buttons through the kernel mouse API
-    MouseSetButtons(buttons);
-
-    // Push button change events
-    static uint8_t prevButtons = 0;
-    for (int btn = 0; btn < 3; btn++) {
-        bool now  = (buttons & (1 << btn)) != 0;
-        bool prev = (prevButtons & (1 << btn)) != 0;
-        if (now != prev) {
-            InputEvent ev{};
-            ev.type = now ? InputEventType::MouseButtonDown : InputEventType::MouseButtonUp;
-            ev.scanCode = static_cast<uint8_t>(btn);
-            ev.ascii = 0;
-            ev.modifiers = 0;
-            InputDevicePush(&g_usbMouseDev, ev);
-        }
+    if (wheel) {
+        InputEvent ev{};
+        ev.type = InputEventType::MouseScroll;
+        ev.scanCode = static_cast<uint8_t>(wheel);
+        ev.modifiers = g_usbButtons;
+        ev.deltaY = int32_t(wheel) * 120;
+        InputDevicePush(&g_usbMouseDev, ev);
     }
-    prevButtons = buttons;
+    for (unsigned bit = 0; bit < 3; ++bit) {
+        const uint8_t mask = 1u << bit;
+        if (!((previous ^ g_usbButtons) & mask)) continue;
+        InputEvent ev{};
+        ev.type = (g_usbButtons & mask) ? InputEventType::MouseButtonDown : InputEventType::MouseButtonUp;
+        ev.scanCode = bit;
+        ev.modifiers = g_usbButtons;
+        InputDevicePush(&g_usbMouseDev, ev);
+    }
+}
 
-    InputWakeWaiters();
+static void XhciEndHid(XhciHidFn& fn, bool keyboard)
+{
+    if (!fn.active) return;
+    fn.active = false;
+    const uint8_t empty[8]{};
+    if (keyboard) g_bootKeyboard.Update(empty,fn.previous,XhciPushKey);
+    else {
+        XhciProcessMouseReport(empty,fn);
+        MouseSetUsbAvailable(--g_activeUsbMice != 0);
+    }
 }
 
 static void XhciMousePoll(InputDevice* /*dev*/)
@@ -3075,9 +3005,15 @@ static void XhciDeviceGone(uint32_t index)
     }
     const auto saved = IrqSpinLockAcquire(&g_eventRingLock);
     dev.gone = true;
-    dev.kbd.active = dev.mouse.active = false;
+    const bool hadHid = dev.kbd.active || dev.mouse.active;
+    XhciEndHid(dev.kbd,true);
+    XhciEndHid(dev.mouse,false);
     if (dev.network) dev.network->failed = true;
     IrqSpinLockRelease(&g_eventRingLock, saved);
+    if (hadHid) {
+        CompositorWake();
+        InputWakeWaiters();
+    }
     char path[24]; XhciPathText(dev, path, sizeof(path));
     KPrintf("xhci: c%u p%s %s %04x:%04x disconnected (slot %u)\n", dev.ctrl->index, path,
             XhciDeviceKind(dev), dev.vendorId, dev.productId, dev.slotId);
@@ -3121,7 +3057,7 @@ static bool XhciStartHid(XhciController& ctrl, XhciDevice& dev, XhciHidFn& fn, b
         g_usbKbdDev.ops = &g_usbKbdOps;
         g_usbKbdDev.head = 0;
         g_usbKbdDev.tail = 0;
-        InputRegister(&g_usbKbdDev);
+        if (!InputRegister(&g_usbKbdDev)) return false;
         g_kbdRegistered = true;
         SerialPuts("xhci: USB keyboard registered as input device\n");
     }
@@ -3130,13 +3066,13 @@ static bool XhciStartHid(XhciController& ctrl, XhciDevice& dev, XhciHidFn& fn, b
         g_usbMouseDev.ops = &g_usbMouseOps;
         g_usbMouseDev.head = 0;
         g_usbMouseDev.tail = 0;
-        InputRegister(&g_usbMouseDev);
+        if (!InputRegister(&g_usbMouseDev)) return false;
         g_mouseRegistered = true;
-        g_mousePresent = true;
         SerialPuts("xhci: USB mouse registered as input device\n");
     }
     const auto saved = IrqSpinLockAcquire(&g_eventRingLock);
     fn.active = true;
+    if (!keyboard && ++g_activeUsbMice == 1) MouseSetUsbAvailable(true);
     XhciQueueHidIn(ctrl, dev, fn);
     IrqSpinLockRelease(&g_eventRingLock, saved);
     return true;

@@ -101,6 +101,8 @@ target_compile_options(test_tcp_send_queue PRIVATE "-iquote${BROOK_ROOT}/src/ker
 add_host_test(test_xhci_completion_queue)
 add_host_test(test_usb_hub_logic)
 target_compile_options(test_usb_hub_logic PRIVATE "-iquote${BROOK_ROOT}/src/drivers/xhci")
+add_host_test(test_usb_boot_keyboard)
+target_compile_options(test_usb_boot_keyboard PRIVATE "-iquote${BROOK_ROOT}/src/drivers/xhci")
 add_host_test(test_partition_bounds)
 add_host_test(test_strict_gpt_inventory)
 add_host_test(test_ahci_observe)
