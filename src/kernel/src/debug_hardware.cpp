@@ -548,8 +548,9 @@ struct DpIdleState{
     // Link watch (part of the wake path): after a hot-plug edge or on input,
     // retrain the GOP's link if the head is active but the link is down
     // (KVM switch-back, monitor replug). Rate-limited, capped retries.
-    bool watch=false,sinkPresent=false,linkCheckPending=false;
-    uint64_t lastLinkCheckMs=0;
+    bool watch=false,sinkPresent=false,linkCheckPending=false,linkCheckLog=false;
+    uint64_t lastLinkCheckMs=0,edgeMs=0;
+    uint8_t recheckStage=3; // after a hotplug edge: re-checks at +1 s, +3 s, +10 s
     uint32_t linkRetrains=0,linkFails=0,hotplugs=0;
     char lastReply[320]{};
 };
@@ -644,14 +645,25 @@ void DpIdleWorker(void*){
         if(seq!=g_dpIdle.seq){g_dpIdle.seq=seq;g_dpIdle.lastActivityMs=now;if(g_dpIdle.blanked)g_dpIdle.wakeRequested=true;
             else if(g_dpIdle.watch)g_dpIdle.linkCheckPending=true;}
         if(g_dpIdle.watch){const bool sink=DpIdleSinkPresent(g_dpIdle.ch);
-            if(sink&&!g_dpIdle.sinkPresent){++g_dpIdle.hotplugs;g_dpIdle.linkCheckPending=true;}
-            g_dpIdle.sinkPresent=sink;}
+            if(sink!=g_dpIdle.sinkPresent)KPrintf("dp-idle: link-watch: sink on aux %u %s\n",g_dpIdle.ch,sink?"present (hotplug)":"gone");
+            if(sink&&!g_dpIdle.sinkPresent){++g_dpIdle.hotplugs;g_dpIdle.linkCheckPending=true;g_dpIdle.linkCheckLog=true;
+                g_dpIdle.edgeMs=now;g_dpIdle.recheckStage=0;}
+            g_dpIdle.sinkPresent=sink;
+            // A sink's lane status can still read "locked" right after the
+            // edge (stale), so re-check after the edge, then every 5 s.
+            static const uint32_t recheck[3]={1000,3000,10000};
+            if(sink&&!g_dpIdle.blanked){
+                if(g_dpIdle.recheckStage<3&&now-g_dpIdle.edgeMs>=recheck[g_dpIdle.recheckStage]){
+                    ++g_dpIdle.recheckStage;g_dpIdle.linkCheckPending=true;g_dpIdle.linkCheckLog=true;}
+                else if(now-g_dpIdle.lastLinkCheckMs>=5000)g_dpIdle.linkCheckPending=true;
+            }}
         int action=0;
         // Link watch: at most every 2 s; after 5 failed retrains in a row, every 30 s.
         const uint64_t linkGap=g_dpIdle.linkFails>=5?30000:2000;
         if(g_dpIdle.handTest){}
         else if(!g_dpIdle.blanked&&g_dpIdle.linkCheckPending&&g_dpIdle.sinkPresent&&now-g_dpIdle.lastLinkCheckMs>=linkGap){
             action=3;g_dpIdle.linkCheckPending=false;g_dpIdle.lastLinkCheckMs=now;}
+        const bool logCheck=action==3&&g_dpIdle.linkCheckLog;if(action==3)g_dpIdle.linkCheckLog=false;
         else if(g_dpIdle.blanked&&(g_dpIdle.wakeRequested||!g_dpIdle.seconds)){
             if(!g_dpIdle.wakeFails||now-g_dpIdle.lastWakeTryMs>=1000){action=2;g_dpIdle.lastWakeTryMs=now;}}
         else if(!g_dpIdle.blanked&&g_dpIdle.seconds&&now-g_dpIdle.lastActivityMs>=uint64_t(g_dpIdle.seconds)*1000)action=1;
@@ -663,11 +675,14 @@ void DpIdleWorker(void*){
             // SOR's ARM state is an active DP link). D0 first: a replugged
             // or switched-back sink may come up in any power state.
             int result=0; // 0 link up, 1 retrained, 2 failed
-            if(!DpIdleLinkUp(ch)){
+            const bool up=DpIdleLinkUp(ch);
+            if(logCheck||!up)KPrintf("dp-idle: link-watch check aux %u: %s (%s)\n",ch,up?"up":"DOWN",g_dpIdle.lastReply);
+            if(!up){
                 KPrintf("dp-idle: link down on aux %u (%s); retraining\n",ch,g_dpIdle.lastReply);
                 result=DpIdleWake(ch,sor,link)?1:2;
             }
             SpinLockAcquire(&g_dpIdleLock);
+            if(result)KPrintf("dp-idle: link-watch retrain %s\n",result==1?"ok":"FAILED");
             if(result==1){++g_dpIdle.linkRetrains;g_dpIdle.linkFails=0;}
             else if(result==2){++g_dpIdle.linkFails;g_dpIdle.linkCheckPending=true;}
             else g_dpIdle.linkFails=0;

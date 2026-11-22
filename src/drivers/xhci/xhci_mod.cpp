@@ -486,6 +486,8 @@ struct XhciController {
         uint8_t tries, waits, cc;
         const char* error;
         uint32_t portsc;
+        uint32_t logged;        // last PORTSC logged (state bits only)
+        uint64_t lastTryMs;     // last enumeration attempt (retry back-off)
     } ports[XHCI_MAX_ROOT_PORTS];
 };
 
@@ -3432,8 +3434,27 @@ static bool XhciRootScan(XhciController& ctrl, bool initial, bool* waiting = nul
         uint32_t v = XhciPortRead(ctrl, port0);
         if (v == 0xffffffffu) { st.error = "registers inaccessible"; continue; }
         const uint32_t changes = v & PORTSC_CHANGES;
+        // Instrumentation: every root-port state transition (CCS, PED, PR,
+        // PLS, PP, speed) and any change bits, once per transition.
+        const uint32_t stateBits = v & (PORTSC_CCS | PORTSC_PED | PORTSC_PR | PORTSC_PLS_MASK | PORTSC_PP | PORTSC_SPEED_MASK);
+        if (!initial && (stateBits != st.logged || changes))
+            KPrintf("xhci: c%u port %u PORTSC %08x -> %08x (CCS=%u PED=%u PP=%u PLS=%s chg=%05x dev=%u tries=%u)\n",
+                    ctrl.index, port0 + 1, st.portsc, v, v & 1u, (v >> 1) & 1u, (v >> 9) & 1u,
+                    XhciLinkStateName((v >> 5) & 15u), changes >> 17, st.device, st.tries);
+        st.logged = stateBits;
         if (changes) XhciPortWrite(ctrl, port0, XhciPortPersistent(v) | changes);
         st.portsc = v;
+        // Port power must stay on: a port that lost PP (over-current, a
+        // firmware hand-back or a controller quirk) can never see a connect,
+        // and a bus-powered hub tree behind it stays dark.
+        if (!initial && !(v & PORTSC_PP)) {
+            XhciPortWrite(ctrl, port0, XhciPortPersistent(v) | PORTSC_PP);
+            KPrintf("xhci: c%u port %u lost port power; PP restored\n", ctrl.index, port0 + 1);
+            st.tries = 0; st.waits = 0; st.error = nullptr;
+            continue; // re-read after the port powers up (next pass)
+        }
+        // A new physical connect always gets a fresh set of tries.
+        if ((changes & PORTSC_CSC) && (v & PORTSC_CCS)) { st.tries = 0; st.waits = 0; st.error = nullptr; }
         const bool usb3 = XhciPortIsUsb3(ctrl, port0, v);
         if (st.device) {
             if ((v & PORTSC_CCS) && !(changes & PORTSC_CSC)) continue;
@@ -3454,8 +3475,15 @@ static bool XhciRootScan(XhciController& ctrl, bool initial, bool* waiting = nul
             action = usb3 ? XhciRootAction::WarmReset : XhciRootAction::Reset;
             st.waits = 0;
         }
-        if (st.tries >= 3) continue;
-        ++st.tries; changed = true;
+        // Three tries, then retry every 5 s while something stays connected
+        // (a KVM switch-back can bounce the connect through several failures).
+        if (st.tries >= 3) {
+            if (initial || ApicTickCount() - st.lastTryMs < 5000) continue;
+            KPrintf("xhci: c%u port %u retrying enumeration after back-off (%s)\n", ctrl.index, port0 + 1,
+                    st.error ? st.error : "?");
+            st.tries = 0;
+        }
+        ++st.tries; changed = true; st.lastTryMs = ApicTickCount();
         if (action == XhciRootAction::Reset) {
             struct PortIo {
                 XhciController& controller;uint32_t offset;
@@ -3627,6 +3655,8 @@ static uint32_t XhciStatusText(char* out, uint32_t cap)
 
 // ---- Hotplug worker ---------------------------------------------------------------
 
+static void XhciUacHotplugTick();
+
 static void XhciHotplugThread(void*)
 {
     g_threadContext = true;
@@ -3648,6 +3678,7 @@ static void XhciHotplugThread(void*)
             }
         }
         if (changed) UsbStatusChanged();
+        XhciUacHotplugTick();
         // Echo the first keyboard input on the console (bounded).
         static uint32_t reported = 0;
         const uint32_t keys = __atomic_load_n(&g_keyPresses, __ATOMIC_RELAXED);
@@ -4738,8 +4769,12 @@ static bool XhciUacPrealloc()
     return true;
 }
 
+// Set once the /etc/usb-audio-mixer autostart ran: the hotplug worker then
+// keeps the EVO4 as the mixer sink across detach/attach (KVM switch).
+static volatile bool g_uacAutoMixer = false;
 static void XhciUacAutoStart(void*)
 {
+    g_uacAutoMixer = true;
     uint32_t index = 0;
     for (uint32_t i = 0; i < 60 && !XhciUacFindDevice(index); ++i) SchedulerSleepMs(500);
     static char text[1024];
@@ -4748,6 +4783,39 @@ static void XhciUacAutoStart(void*)
     text[t.len < sizeof(text) ? t.len : sizeof(text) - 1] = 0;
     char* end = text; while (*end && *end != '\n') ++end; *end = 0;
     KPrintf("uac: autostart (usb-audio-mixer marker): %s\n", text);
+}
+
+// EVO4 detach/attach: the stream thread exits when its device is gone; clear
+// the stream so a re-attached EVO4 (new slot) can be brought up again as the
+// mixer sink. The mixer driver stays registered; the restart is a new epoch
+// (discontinuity), so mixer clients carry on.
+static void XhciUacHotplugTick()
+{
+    static uint64_t nextTryMs = 0;
+    static uint32_t fails = 0;
+    auto& s = g_uac;
+    if (s.active && g_devices[s.device].gone) {
+        s.stopRequested = true;
+        for (uint32_t i = 0; i < 200 && s.running; ++i) SchedulerSleepMs(1);
+        if (s.running) return; // stream thread still unwinding; next tick
+        __atomic_store_n(&s.active, false, __ATOMIC_RELEASE);
+        KPrintf("uac: EVO4 detached; stream cleared (produced %u, underruns %u)\n",
+                unsigned(s.produced), unsigned(s.underruns));
+        nextTryMs = 0; fails = 0;
+    }
+    if (!g_uacAutoMixer || s.active) return;
+    uint32_t index = 0;
+    if (!XhciUacFindDevice(index)) return;
+    const uint64_t now = ApicTickCount();
+    if (now < nextTryMs) return;
+    static char text[256];
+    XhciText t{text, sizeof(text), 0};
+    XhciUacCommand("usb mixer", t); // same path as the boot autostart
+    text[t.len < sizeof(text) ? t.len : sizeof(text) - 1] = 0;
+    char* end = text; while (*end && *end != '\n') ++end; *end = 0;
+    if (s.active) { fails = 0; KPrintf("uac: EVO4 re-attached; mixer stream restarted: %s\n", text); return; }
+    ++fails; nextTryMs = now + (fails >= 5 ? 30000 : 2000);
+    KPrintf("uac: EVO4 re-attach start failed (%u): %s\n", fails, text);
 }
 
 static int XhciModuleInit()
