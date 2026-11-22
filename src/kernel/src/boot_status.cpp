@@ -196,6 +196,25 @@ extern "C" void BootStatusPrint(const char* reason)
             if (!bridgeIp) bridgeIp = nif->ipAddr;
         }
         KPrintf("\n");
+        // Traffic counters: IP stack frames, then the driver's USB view (RX TDs
+        // posted/completed, TX submitted/completed, error completions).
+        KPrintf("NET if%u stack rx=%u tx=%u", i, nif->rxPackets, nif->txPackets);
+        NetDriverSnapshot s{};
+        if (nif->snapshot && nif->snapshot(const_cast<NetIf*>(nif), &s)) {
+            KPrintf(" usb rx posted=%lu done=%lu ok=%lu err=%lu drop=%lu tx sent=%lu done=%lu err=%lu busy=%lu"
+                    " link=%s notify=%lu",
+                    static_cast<unsigned long>(s.rxPosted), static_cast<unsigned long>(s.rxCompletions),
+                    static_cast<unsigned long>(s.received), static_cast<unsigned long>(s.rxErrors),
+                    static_cast<unsigned long>(s.dropped), static_cast<unsigned long>(s.txSubmitted),
+                    static_cast<unsigned long>(s.transmitted), static_cast<unsigned long>(s.txErrors),
+                    static_cast<unsigned long>(s.txBusy),
+                    s.linkKnown ? (s.linkUp ? "up" : "down") : "unknown",
+                    static_cast<unsigned long>(s.notifications));
+            if (s.failed)
+                KPrintf(" FAILED dci=%u cc=%u residue=%u", s.faultDci, s.faultStatus >> 24,
+                        s.faultStatus & 0xffffffu);
+        }
+        KPrintf("\n");
     }
     if (bridgeIp) {
         PrintIp("BRIDGE endpoint tcp ", bridgeIp);

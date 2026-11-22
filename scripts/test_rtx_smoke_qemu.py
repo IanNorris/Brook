@@ -339,7 +339,10 @@ def run_one(args, base, topology):
                     'BRIDGE_V3_LOCAL build=', 'operators=1 ready=1', 'xhci: physical storage probe is read-only',
                     'xhci: CDC-ECM network interface ready', 'HWINV CPU ', 'HWINV pci ',
                     '==== BROOK STATUS (', '==== END STATUS ====', 'USB xhci0 1b36:000d', 'USB xhci0 PORTSC',
-                    'NET if0 MAC ', 'SMP: 3 application processors prepared'] + EXPECT[topology]
+                    'NET if0 MAC ', 'SMP: 3 application processors prepared',
+                    # v3: boot is not held for DHCP; per-NIC traffic counters.
+                    *([] if topology == 'late' else ['net: DHCP continues in the background (boot not held)']),
+                    'NET if0 stack rx=', ' usb rx posted=', 'BOOT step SmpPrepareAPs '] + EXPECT[topology]
         missing = [r for r in required if r not in text]
         assert not missing, f'missing serial lines: {missing}'
         # Per-CPU SMP lines are serial-only now (checked via the summary line);
@@ -425,6 +428,9 @@ def run_one(args, base, topology):
         results['status_block'] = last_status(text)
         assert any('BRIDGE endpoint tcp 10.0.2.15:1234' in l for l in results['status_block']), results['status_block']
         assert any('DHCP bound' in l for l in results['status_block']), results['status_block']
+        counters = [l for l in results['status_block'] if ' usb rx posted=' in l]
+        assert counters and ' FAILED ' not in counters[0], results['status_block']
+        assert not re.search(r' tx sent=0 ', counters[0]) and not re.search(r' rx posted=\d+ done=0 ', counters[0]), counters
         request = uuid.uuid4().hex
         power = rpc.tool('hw_power', {'session': session, 'request_id': request, 'operation': 'restart'})
         results['power_request'] = power.get('state')

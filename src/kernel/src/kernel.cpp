@@ -268,6 +268,14 @@ static void PrepareDesktopHome()
 namespace brook { void GuardTestPrepareDesktopHome() { PrepareDesktopHome(); } }
 #endif
 
+// Serial-only boot step timing: elapsed ms since the previous step.
+[[maybe_unused]] static void BootStepTime(const char* step, uint64_t& since)
+{
+    const uint64_t now = brook::ApicTickCount();
+    brook::SerialPrintf("BOOT step %s %lu ms\n", step, static_cast<unsigned long>(now - since));
+    since = now;
+}
+
 // Probe a block device for a filesystem (FAT, ext4, or ext2), read BROOK.MNT,
 // and mount at the specified path.  Returns true if mounted.
 // When allowDefer is true, devices that fail to mount or find BROOK.MNT are
@@ -1090,7 +1098,12 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         brook::BootLogoProgress(75, "Network");
         brook::NetIf* nif = brook::NetGetIf();
         bool configured = brook::NetApplyStaticConfig(nif);
-        if (!configured) {
+        if (!configured && brook::BootStatusEnabled()) {
+            // The background client (boot_status) retries DHCP forever on
+            // every NIC; do not hold boot for the first lease. The status
+            // block reprints the bridge endpoint once the lease arrives.
+            brook::KPuts("net: DHCP continues in the background (boot not held)\n");
+        } else if (!configured) {
             configured = brook::DhcpDiscover(nif);
         }
         if (configured) {
@@ -1136,8 +1149,11 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     // then run the boot script and enter the interactive shell.
     {
         brook::BootLogoProgress(90, "Scheduler");
+        uint64_t stepStart = brook::ApicTickCount();
         brook::SchedulerInit();
+        BootStepTime("SchedulerInit", stepStart);
         brook::CompositorInit();
+        BootStepTime("CompositorInit", stepStart);
         brook::LifecycleChannelStart();
 #ifdef BROOK_DELL_ACPI_MONITOR
         brook::DellAcpiMonitorConfigure();
@@ -1171,11 +1187,13 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         // poison with the freeing PID + a callstack-ring seq.
         brook::HeapArmForensicPoison();
 
+        BootStepTime("kernel workers", stepStart);
         // If keyboard module wasn't loaded, fall back to direct init.
         if (acpiOk && !brook::KbdIsAvailable())
         {
             brook::KPuts("KBD: ps2_kbd module not loaded — falling back to direct init\n");
             brook::KbdInit();
+            BootStepTime("KbdInit", stepStart);
         }
 
         // If mouse module wasn't loaded, fall back to direct init.
@@ -1183,12 +1201,14 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         {
             brook::KPuts("MOUSE: ps2_mouse module not loaded — falling back to direct init\n");
             brook::MouseInit();
+            BootStepTime("MouseInit", stepStart);
         }
 
         // Prepare APs — allocate per-CPU resources while BSP has no contention.
         // Activation is deferred until just before SchedulerStart so APs don't
         // contend on serial/heap locks while BSP finishes boot.
         brook::SmpPrepareAPs();
+        BootStepTime("SmpPrepareAPs", stepStart);
         brook::KLog("SMP: all APs prepared");
 
         brook::BootLogoProgress(92, "Desktop services");
