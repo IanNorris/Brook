@@ -165,20 +165,24 @@ void SleepMs(uint32_t ms)
 bool AcquireSwFlag()
 {
     // The driver-side lock is bounded too: a sleeping stage may hold it.
+    // Every wait has a spin bound as well as a tick bound, in case the boot
+    // clock does not advance where this runs (module init). An MMIO read of
+    // the PCH takes about a microsecond.
+    if (Read(Status) == 0xffffffffu) return false; // device not answering
     uint64_t start = ApicTickCount();
-    while (!SpinLockTryAcquire(&g_phyLock)) {
-        if (ApicTickCount() - start > 2000) return false;
+    for (uint32_t spin = 0; !SpinLockTryAcquire(&g_phyLock); ++spin) {
+        if (ApicTickCount() - start > 2000 || spin > 100000000u) return false;
         __asm__ volatile("pause");
     }
     start = ApicTickCount();
-    while (Read(ExtcnfCtrl) & ExtcnfSwFlag) {
-        if (ApicTickCount() - start > 100) { SpinLockRelease(&g_phyLock); return false; }
+    for (uint32_t spin = 0; Read(ExtcnfCtrl) & ExtcnfSwFlag; ++spin) {
+        if (ApicTickCount() - start > 100 || spin > 200000u) { SpinLockRelease(&g_phyLock); return false; }
         __asm__ volatile("pause");
     }
     Write(ExtcnfCtrl, Read(ExtcnfCtrl) | ExtcnfSwFlag);
     start = ApicTickCount();
-    while (!(Read(ExtcnfCtrl) & ExtcnfSwFlag)) {
-        if (ApicTickCount() - start > 1000) {
+    for (uint32_t spin = 0; !(Read(ExtcnfCtrl) & ExtcnfSwFlag); ++spin) {
+        if (ApicTickCount() - start > 1000 || spin > 2000000u) {
             Write(ExtcnfCtrl, Read(ExtcnfCtrl) & ~ExtcnfSwFlag);
             SpinLockRelease(&g_phyLock);
             return false;
@@ -464,8 +468,8 @@ bool DisableMaster()
 {
     Write(Ctrl, Read(Ctrl) | CtrlMasterDisable);
     const uint64_t start = ApicTickCount();
-    while (Read(Status) & StatusMasterEnable) {
-        if (ApicTickCount() - start > 100) return false;
+    for (uint32_t spin = 0; Read(Status) & StatusMasterEnable; ++spin) {
+        if (ApicTickCount() - start > 100 || spin > 1000) return false;
         SleepMs(1);
     }
     return true;
@@ -720,6 +724,13 @@ bool Attach()
         if (!id) { g_failure = "PHY inaccessible"; return false; }
     }
     if (!ProgramMac(g_if.mac)) { g_failure = "RAR0 invalid (MAC not loaded)"; return false; }
+    // e1000_power_up_phy_copper: firmware without a network stack may leave
+    // the PHY powered down (BMCR.PDOWN).
+    uint16_t bmcr = 0;
+    if (PhyRead(0, bmcr) && (bmcr & (1u << 11))) {
+        (void)PhyWrite(0, static_cast<uint16_t>(bmcr & ~(1u << 11)));
+        Step("PHY powered up (BMCR.PDOWN cleared)");
+    }
     for (uint32_t i = 0; i < MtaCount; ++i) Write(Mta + i * 4, 0);
     InitHardwareBits();
 
