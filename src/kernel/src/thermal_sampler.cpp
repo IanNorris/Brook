@@ -50,10 +50,14 @@ const Platform& Plat() {
         p.aperf = bare && (c6 & 1u);
         p.epb = bare && (c6 & (1u << 3));
         p.hwp = bare && (a6 & (1u << 7));
-        // RAPL, PLATFORM_INFO and C-state residency MSRs: Broadwell client
-        // (0x3d U/Y, 0x47 H). C8-C10 package residency: 0x3d only (ULT).
-        p.rapl = bare && (p.model == 0x3d || p.model == 0x47);
-        p.c8910 = bare && p.model == 0x3d;
+        // RAPL (0x606/0x611/0x639/0x641), PLATFORM_INFO and C-state
+        // residency MSRs on client cores: Broadwell (0x3d U/Y, 0x47 H),
+        // Skylake (0x4e U/Y, 0x5e S/H), Kaby/Coffee Lake (0x8e U/Y, 0x9e S/H,
+        // e.g. the i7-8086K), Comet Lake (0xa5 S/H, 0xa6 U). C8-C10 package
+        // residency only on the ULT parts (0x3d, 0x4e, 0x8e, 0xa6).
+        p.rapl = bare && (p.model == 0x3d || p.model == 0x47 || p.model == 0x4e || p.model == 0x5e ||
+                          p.model == 0x8e || p.model == 0x9e || p.model == 0xa5 || p.model == 0xa6);
+        p.c8910 = bare && (p.model == 0x3d || p.model == 0x4e || p.model == 0x8e || p.model == 0xa6);
         if (p.dts) p.tjmax = ThermalDecodeTjMax(ReadMsr(0x1a2));
         if (p.rapl) p.baseMhz = uint32_t((ReadMsr(0xce) >> 8) & 0xff) * 100;
     }

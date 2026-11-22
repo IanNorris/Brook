@@ -101,8 +101,11 @@ const Platform& Plat() {
             p.caps.arat = (a6 & (1u << 2)) != 0;
             p.epb = (c6 & (1u << 3)) != 0;
         }
-        // Core/package residency MSRs: Broadwell client (0x3d U/Y, 0x47 H).
-        p.residency = p.bareIntel && (model == 0x3d || model == 0x47);
+        // Core/package residency MSRs (0x3f8-0x3fa, 0x60d, 0x3fc-0x3fe):
+        // Broadwell (0x3d, 0x47), Skylake (0x4e, 0x5e), Kaby/Coffee Lake
+        // (0x8e, 0x9e: the i7-8086K), Comet Lake (0xa5, 0xa6) client parts.
+        p.residency = p.bareIntel && (model == 0x3d || model == 0x47 || model == 0x4e || model == 0x5e ||
+                                      model == 0x8e || model == 0x9e || model == 0xa5 || model == 0xa6);
         if (p.bareIntel && p.epb) {
             p.epbFirmware = int32_t(ReadMsr(0x1b0) & 0xfu);
             // Linux behaviour: firmware 0 (performance) or 15 becomes 6 (normal).
