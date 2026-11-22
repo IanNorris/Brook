@@ -4124,6 +4124,7 @@ struct XhciUacStream {
     Uac2FeedbackPacer pacer{};
     Uac2Tone tone{};
     int16_t volumeMin = 0, volumeMax = 0;
+    bool volumeControl = false;
     uint32_t rate = 0, rateReadback = 0;
 };
 static XhciUacStream g_uac;
@@ -4268,16 +4269,23 @@ static bool XhciUacControl(XhciDevice& dev, uint8_t type, uint8_t request, uint1
     return ok;
 }
 
+// Returns a mask of channels whose SET_CUR failed. Channels 1 and 2 carry the
+// stream (the others stay silent) and must succeed; the rest are best-effort.
+static volatile uint32_t g_uacVolumeFailMask = 0;
+static volatile uint8_t g_uacVolumeFailCc = 0;
 static bool XhciUacSetVolume(XhciDevice& dev, int16_t q8)
 {
     auto& s = g_uac;
-    bool ok = true;
+    uint32_t failed = 0;
     for (uint32_t ch = 0; ch <= s.desc.featureChannels && ch < 32; ++ch) {
         if (!(s.desc.featureVolumeMask & (1u << ch))) continue;
-        ok &= XhciUacControl(dev, 0x21, 1, uint16_t(0x0200 | ch), uint16_t(s.desc.featureId << 8 | s.desc.controlInterface),
-                             &q8, 2);
+        if (!XhciUacControl(dev, 0x21, 1, uint16_t(0x0200 | ch), uint16_t(s.desc.featureId << 8 | s.desc.controlInterface),
+                            &q8, 2)) { failed |= 1u << ch; g_uacVolumeFailCc = dev.lastCc; }
     }
-    return ok;
+    g_uacVolumeFailMask = failed;
+    if (failed) KPrintf("uac: volume %d/256 dB SET_CUR failed on channel mask %x (cc %u)\n", int(q8), failed,
+                        unsigned(g_uacVolumeFailCc));
+    return !(failed & 0x6u);
 }
 
 // Configure Endpoint adding (or dropping) the data and feedback endpoints.
@@ -4336,6 +4344,8 @@ static void XhciUacStatus(XhciText& t)
     t.s(" values="); t.u(s.fbValues); t.s(" raw="); t.x(s.lastFbRaw, 8); t.s(" bytes="); t.u(s.lastFbBytes);
     t.s(" pacer="); t.x(s.pacer.current, 8); t.s(" nominal="); t.x(s.pacer.nominal, 8);
     t.s(" accepted="); t.u(s.pacer.accepted); t.s(" rejected="); t.u(s.pacer.rejected); t.nl();
+    t.s("volume fail_mask="); t.x(g_uacVolumeFailMask, 2); t.s(" fail_cc="); t.u(g_uacVolumeFailCc);
+    t.s(" min="); t.u(uint16_t(s.volumeMin)); t.s(" max="); t.u(uint16_t(s.volumeMax)); t.nl();
     t.s("tone start_tick="); t.u(s.toneStartTick); t.s(" end_tick="); t.u(s.toneEndTick);
     t.s(" now="); t.u(ApicTickCount()); t.nl();
 }
@@ -4383,7 +4393,9 @@ static void XhciUacStart(XhciText& t)
     const uint16_t fuIndex = uint16_t(desc.featureId << 8 | desc.controlInterface);
     if (!XhciUacControl(dev, 0xa1, 2, 0x0201, fuIndex, nullptr, 8, range)) { t.s("volume range read failed\n"); return; }
     s.volumeMin = int16_t(range[2] | range[3] << 8); s.volumeMax = int16_t(range[4] | range[5] << 8);
-    if (!XhciUacSetVolume(dev, s.volumeMin)) { t.s("volume set (minimum) failed\n"); return; }
+    // Silence is streamed either way; a failed minimum is reported and blocks tones.
+    s.volumeControl = XhciUacSetVolume(dev, s.volumeMin);
+    if (!s.volumeControl) t.s("warning: volume SET_CUR (minimum) failed on channel 1/2; tones disabled\n");
     const uint16_t clockIndex = uint16_t(desc.clockId << 8 | desc.controlInterface);
     const uint32_t rate = s.rate; uint32_t readback = 0;
     if (!XhciUacControl(dev, 0x21, 1, 0x0100, clockIndex, &rate, 4)) { t.s("SET_CUR sample rate failed\n"); return; }
@@ -4444,6 +4456,7 @@ static void XhciUacTone(XhciText& t, const char* p)
     if (auto* marker = VfsOpen("/etc/audio-muted")) { VfsClose(marker); muted = true; }
     if (dB > -20 || dB < -90) { t.s("refused: level must be -90..-20 dB\n"); return; }
     if (muted && !audible) { t.s("refused: audio-muted marker present; append 'audible'\n"); return; }
+    if (!s.volumeControl) { t.s("refused: volume control unavailable (minimum could not be set)\n"); return; }
     auto& dev = g_devices[s.device];
     const int16_t level = Uac2VolumeQ8(dB, s.volumeMin, s.volumeMax);
     s.toneStartTick = s.toneEndTick = 0; s.toneDone = false;
