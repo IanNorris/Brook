@@ -13,7 +13,8 @@ Each --topology is a separate boot with its own USB layout:
   late    no NIC at boot; usb-net hotplugged behind a hub after the desktop is
           up (persistent DHCP and hub hotplug)
 Keys are sent to the USB keyboard by QMP input-send-event and must reach the
-xHCI HID path ("xhci: USB keyboard input").
+xHCI HID path ("xhci: USB keyboard input"). The hub boot also verifies a
+relative USB pointer, click focus, and console scrolling with PS/2 disabled.
 Checks: console/serial lines, DHCP, BRIDGE_V3_LOCAL ready=1, v3 attach through
 tools/vm_bridge with the operator key, PCI inventory over the bridge, orderly
 shutdown, and that no attached disk (including the stick) changed. Host-only:
@@ -136,6 +137,112 @@ def keys_event(down, key):
     return {'type': 'key', 'data': {'down': down, 'key': {'type': 'qcode', 'data': key}}}
 
 
+def qmp_key(qmp, key):
+    for down in (True, False):
+        qmp.call('input-send-event', events=[keys_event(down, key)])
+        time.sleep(0.05)
+
+
+def qmp_button(qmp, button):
+    for down in (True, False):
+        qmp.call('input-send-event', events=[{'type': 'btn', 'data': {'button': button, 'down': down}}])
+        time.sleep(0.1)
+
+
+def view_pixels(path, rect):
+    magic, size, limit, pixels = path.read_bytes().split(b'\n', 3)
+    width, height = map(int, size.split())
+    assert magic == b'P6' and limit == b'255' and len(pixels) == width * height * 3
+    x, y, w, h = rect
+    assert 0 <= x < x+w <= width and 0 <= y < y+h <= height, (rect, width, height)
+    return b''.join(pixels[(row*width+x)*3:(row*width+x+w)*3] for row in range(y,y+h))
+
+
+def prove_usb_desktop(qmp, rpc, session, base, wait_for):
+    def command(text):
+        return rpc.tool('hw_command', {'session': session, 'command': text})
+
+    def pointer():
+        reply = command('mouse')
+        match = re.fullmatch(r'mouse: avail=1 x=(\d+) y=(\d+) btn=0x([0-9a-f]+)', reply['reply'])
+        assert match, reply
+        return int(match[1]), int(match[2]), int(match[3], 16)
+
+    def console():
+        windows = rpc.tool('hw_windows', {'session': session})['windows']
+        return next(window for window in windows if window['title'] == 'Kernel Console')
+
+    def screenshot(name):
+        path = base / (name + '.ppm')
+        qmp.call('screendump', filename=str(path))
+        return path
+
+    def move(dx, dy):
+        while dx or dy:
+            sx, sy = max(-100, min(100, dx)), max(-100, min(100, dy))
+            qmp.call('input-send-event', events=[
+                {'type': 'rel', 'data': {'axis': 'x', 'value': sx}},
+                {'type': 'rel', 'data': {'axis': 'y', 'value': sy}},
+            ])
+            time.sleep(0.10)
+            dx -= sx
+            dy -= sy
+
+    # The bounded xHCI key log would otherwise change the console tail in
+    # response to the test keys and invalidate the pixel comparison.
+    for _ in range(57):  # seven transport checks already ran
+        qmp_key(qmp, 'f8')
+    wait_for('further key logging suppressed', 30)
+    wait_for('==== BROOK STATUS (boot settled)', 40)
+    time.sleep(0.35)
+
+    before = console()
+    assert before['visible'] and before['focusable'] and not before['focused'], before
+    x0, y0, buttons = pointer()
+    assert buttons == 0
+    pointer_before = screenshot('usb-pointer-before')
+    x, y = before['x']+48, before['y']+120
+    move(x-x0, y-y0)
+    x1, y1, buttons = pointer()
+    assert (x1,y1) == (x,y) and not buttons, ((x1,y1), (x,y), buttons)
+    pointer_after = screenshot('usb-pointer-after')
+    origin_patch = (x0,y0,16,16)
+    assert view_pixels(pointer_before, origin_patch) != view_pixels(pointer_after, origin_patch), 'cursor did not move in scanout'
+
+    qmp_button(qmp, 'left')
+    deadline = time.monotonic() + 8
+    while True:
+        focused = console()
+        if focused['focused']: break
+        assert time.monotonic() < deadline, 'USB click did not focus Kernel Console'
+        time.sleep(0.15)
+    assert focused['window_id'] == before['window_id'] and pointer()[2] == 0
+
+    # Sample inside the console, to the right of the pointer, excluding
+    # the caption and the taskbar. Test the delivered viewport via pixels.
+    rect = (before['x']+80, before['y']+145, min(before['width']-95,540), min(before['height']-160,420))
+    def settle_frame(name):
+        time.sleep(0.45)
+        return view_pixels(screenshot(name), rect)
+
+    qmp_key(qmp,'end')
+    tail = settle_frame('usb-console-tail')
+    qmp_key(qmp,'pgup')
+    up = settle_frame('usb-console-page-up')
+    assert up != tail, 'USB Page Up did not scroll the focused console'
+    qmp_key(qmp,'pgdn')
+    assert settle_frame('usb-console-page-down') == tail, 'USB Page Down did not restore the console tail'
+    qmp_button(qmp,'wheel-up')
+    assert settle_frame('usb-console-wheel-up') != tail, 'USB wheel did not scroll the console'
+    qmp_key(qmp,'end')
+    assert settle_frame('usb-console-end') == tail, 'USB End did not restore the console tail'
+
+    return {'ps2_disabled': True, 'pointer_before': [x0,y0], 'pointer_after': [x1,y1],
+            'cursor_scanout_changed': True, 'clicked_window': focused['window_id'],
+            'page_up_scrolled': True, 'page_down_restored': True, 'wheel_scrolled': True,
+            'end_restored': True}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--files', type=Path, required=True, help='published file set with manifest.json')
@@ -174,7 +281,7 @@ def run_one(args, base, topology):
         s.bind(('127.0.0.1', 0)); port = s.getsockname()[1]
     # AF_UNIX paths are limited to 108 bytes; keep QMP in a short private directory.
     qmp_dir = Path(tempfile.mkdtemp(prefix='rtxq-')); qmp_path = qmp_dir / 'qmp.sock'
-    qemu = ['qemu-system-x86_64', '-machine', 'q35', '-accel', 'kvm', '-cpu', 'host', '-smp', '4', '-m', '2048', '-nodefaults',
+    qemu = ['qemu-system-x86_64', '-machine', 'q35,i8042=off', '-accel', 'kvm', '-cpu', 'host', '-smp', '4', '-m', '2048', '-nodefaults',
             '-drive', 'if=pflash,format=raw,readonly=on,file=' + os.environ['OVMF_CODE'],
             '-drive', 'if=pflash,format=raw,file=' + str(variables),
             '-device', 'VGA,id=video0', '-device', 'qemu-xhci,id=usbc',
@@ -276,15 +383,11 @@ def run_one(args, base, topology):
         results['legacy_pci_inventory_total'] = pci['total']
         logs = rpc.tool('hw_logs', {'session': session, 'limit': 64})
         assert logs['logs_api'] == 1
-        # USB keyboard (behind the hub where the topology has one) reaches HID.
-        # Unbound input goes to the most recently activated keyboard handler,
-        # the USB keyboard (realized after the i8042); the xHCI line proves it.
+        # q35 has i8042 disabled, so unbound QMP keyboard/pointer events
+        # reach the USB boot devices without a PS/2 fallback.
         qmp = Qmp(qmp_path)
         for key in ('b', 'r', 'o', 'o', 'k', 'pgup', 'pgdn'):
-            qmp.call('input-send-event', events=[keys_event(True, key)])
-            time.sleep(0.05)
-            qmp.call('input-send-event', events=[keys_event(False, key)])
-            time.sleep(0.05)
+            qmp_key(qmp,key)
         line = wait_for('xhci: USB keyboard input: 7 key presses', 30)
         results['keyboard'] = [l for l in line.splitlines() if 'USB keyboard input' in l][-1]
         if topology == 'hub':
@@ -294,6 +397,7 @@ def run_one(args, base, topology):
                                                                     {'type': 'rel', 'data': {'axis': 'y', 'value': -10}}])
             line = wait_for('xhci: USB mouse input: ', 30)
             results['mouse'] = [l for l in line.splitlines() if 'USB mouse input' in l][-1]
+            results['usb_desktop'] = prove_usb_desktop(qmp,rpc,session,base,wait_for)
             # Hotplug a second keyboard onto the hub, then unplug it.
             qmp.call('device_add', driver='usb-kbd', bus='usbc.0', port='2.4', id='kbd1')
             wait_for('xhci: c0 p6.4 FS 0627:0001 kbd', 30)
@@ -362,7 +466,8 @@ def run_one(args, base, topology):
     # reported, not asserted. Brook has no EFI variable write path.
     print(f'RTX_SMOKE_QEMU_PASS {topology}')
     return {'pass': True, 'keyboard': results.get('keyboard'), 'hotplug': results.get('hotplug'),
-            'disks_unchanged': True, 'attach': results['attach']['auth_ready']}
+            'usb_desktop': results.get('usb_desktop'), 'disks_unchanged': True,
+            'attach': results['attach']['auth_ready']}
 
 
 def last_status(text):

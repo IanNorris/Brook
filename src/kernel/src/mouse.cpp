@@ -112,6 +112,8 @@ static volatile uint32_t g_maxY     = 1080;
 static volatile uint8_t  g_buttons  = 0;
 static volatile uint8_t  g_prevButtons = 0;
 static bool              g_mouseInit = false;
+static bool              g_usbMouseAvailable = false;
+static uint8_t           g_usbMouseButtons = 0;
 static uint8_t           g_mouseId   = 0;   // 0=3-byte legacy, 3=IntelliMouse wheel, 4=Explorer (5 btn + H wheel)
 static uint8_t           g_packetLen = 3;
 
@@ -686,7 +688,7 @@ void MouseInit()
 
 bool MouseIsAvailable()
 {
-    return g_mouseInit;
+    return g_mouseInit || __atomic_load_n(&g_usbMouseAvailable, __ATOMIC_ACQUIRE);
 }
 
 void MouseGetPosition(int32_t* x, int32_t* y)
@@ -719,7 +721,7 @@ void MouseMoveRelative(int32_t dx,int32_t dy)
 
 uint8_t MouseGetButtons()
 {
-    return g_buttons;
+    return g_buttons | __atomic_load_n(&g_usbMouseButtons, __ATOMIC_ACQUIRE);
 }
 
 void MouseSetPosition(int32_t x, int32_t y)
@@ -737,6 +739,16 @@ void MouseSetPosition(int32_t x, int32_t y)
 void MouseSetButtons(uint8_t buttons)
 {
     g_buttons = buttons;
+}
+
+void MouseSetUsbButtons(uint8_t buttons)
+{
+    __atomic_store_n(&g_usbMouseButtons, buttons, __ATOMIC_RELEASE);
+}
+
+void MouseSetUsbAvailable(bool available)
+{
+    __atomic_store_n(&g_usbMouseAvailable, available, __ATOMIC_RELEASE);
 }
 
 void MouseSetAvailable(bool available)
