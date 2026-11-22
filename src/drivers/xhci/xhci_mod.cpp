@@ -77,6 +77,7 @@ MODULE_IMPORT_SYMBOL(KPuts);
 MODULE_IMPORT_SYMBOL(DebugUsbCommandSetHandler);
 MODULE_IMPORT_SYMBOL(KernelWorkerStart);
 MODULE_IMPORT_SYMBOL(AudioRegister);
+MODULE_IMPORT_SYMBOL(AudioClockNowNs);
 MODULE_IMPORT_SYMBOL(AudioOutputControlState);
 MODULE_IMPORT_SYMBOL(SchedulerSleepMs);
 MODULE_IMPORT_SYMBOL(PlatformPowerAddQuiesce);
@@ -4146,12 +4147,18 @@ struct XhciUacStream {
     volatile bool fuKnown = false;
     // Mixer mode: the kernel mixer (44.1 kHz stereo S16) feeds channels 1-2.
     volatile bool mixerMode = false, primed = false, flushRequested = false;
+    uint32_t primeWait = 0;
+    // Native clocked contract (AudioDriver trySubmit/progress/restart): byte
+    // watermarks of 44.1 kHz stereo S16 in this epoch; completion is frames
+    // the stream has taken from the ring into isochronous packets.
+    volatile uint64_t nativeEpoch = 1, nativeSubmitted = 0, nativeOutBase = 0;
+    volatile bool nativeDiscontinuity = false;
     volatile uint32_t mixWrite = 0, mixRead = 0; // frame counters (SPSC)
     volatile uint64_t mixFramesIn = 0, mixFramesOut = 0, mixUnderflows = 0, mixDropped = 0;
     uint32_t rate = 0, rateReadback = 0;
 };
 static XhciUacStream g_uac;
-static constexpr uint32_t UAC_MIX_FRAMES = 8192, UAC_MIX_PRIME = 1764; // 186 ms ring, 40 ms prime
+static constexpr uint32_t UAC_MIX_FRAMES = 8192, UAC_MIX_PRIME = 441; // 186 ms ring, 10 ms prime
 static int16_t g_uacMix[UAC_MIX_FRAMES * 2];
 static bool g_uacAudioRegistered = false;
 static bool XhciUacSetVolume(XhciDevice& dev, int16_t q8);
@@ -4229,6 +4236,8 @@ static void XhciUacQueueData()
         int32_t left = 0, right = 0;
         if (s.mixerMode) {
             const uint32_t level = __atomic_load_n(&s.mixWrite, __ATOMIC_ACQUIRE) - s.mixRead;
+            if (!level) s.primeWait = 0;
+            else if (!s.primed && ++s.primeWait >= 160 * 6) s.primed = true; // ~20 ms of frames waiting
             if (!s.primed && level >= UAC_MIX_PRIME) s.primed = true;
             if (s.primed && level) {
                 const uint32_t at = (s.mixRead % UAC_MIX_FRAMES) * 2;
@@ -4281,19 +4290,6 @@ static void XhciUacThread(void*)
         }
         const uint32_t values = __atomic_load_n(&s.fbValues, __ATOMIC_ACQUIRE);
         if (values != seenFb) { seenFb = values; (void)s.pacer.Feed(s.lastFbRaw, s.lastFbBytes); }
-        // Feature-unit level: explicit override, else (mixer mode) the user's
-        // explicit unmute of an unmuted mixer, else the device minimum.
-        const uint32_t control = AudioOutputControlState();
-        const bool userUnmuted = (control & AudioUserUnmuteBit) && !(control & BROOK_AUDIO_MUTED);
-        const int16_t want = s.fuOverride ? s.fuOverrideQ8 : (s.mixerMode && userUnmuted) ? s.unmutedQ8 : s.volumeMin;
-        if (s.volumeControl && (!s.fuKnown || want != s.fuCurrentQ8)) {
-            auto& dev = g_devices[s.device];
-            const bool ok = XhciUacSetVolume(dev, want);
-            s.fuCurrentQ8 = want; s.fuKnown = ok;
-            KPrintf("uac: EVO4 volume %d/256 dB at tick %u (%s%s)\n", int(want), unsigned(ApicTickCount()),
-                    s.fuOverride ? "command" : want != s.volumeMin ? "user unmute" : "minimum", ok ? "" : ", FAILED");
-            if (!ok) SchedulerSleepMs(100); // do not hammer a failing control
-        }
         if (s.toneRequested && !s.tone.Active() && !s.toneStartTick) {
             s.tone.Start(440, s.rate, s.rate, s.rate / 100, 8192); // 1 s, 10 ms fades, -12 dBFS
             s.toneStartTick = ApicTickCount();
@@ -4314,6 +4310,34 @@ static void XhciUacThread(void*)
         SchedulerSleepMs(1);
     }
     s.running = false;
+}
+
+// Feature-unit level, on its own worker so a slow or failing control
+// endpoint can never stall the isochronous refill: explicit override, else
+// (mixer mode) the user's explicit unmute of an unmuted mixer, else minimum.
+// Failures back off from 200 ms to 5 s.
+static volatile bool g_uacControlRunning = false;
+static void XhciUacControlThread(void*)
+{
+    auto& s = g_uac;
+    uint64_t retryAt = 0; uint32_t backoff = 200;
+    while (s.active && !s.stopRequested && !g_devices[s.device].gone) {
+        const uint32_t control = AudioOutputControlState();
+        const bool userUnmuted = (control & AudioUserUnmuteBit) && !(control & BROOK_AUDIO_MUTED);
+        const int16_t want = s.fuOverride ? s.fuOverrideQ8 : (s.mixerMode && userUnmuted) ? s.unmutedQ8 : s.volumeMin;
+        const uint64_t now = ApicTickCount();
+        if (s.volumeControl && (!s.fuKnown || want != s.fuCurrentQ8) && now >= retryAt) {
+            auto& dev = g_devices[s.device];
+            const bool ok = XhciUacSetVolume(dev, want);
+            s.fuCurrentQ8 = want; s.fuKnown = ok;
+            KPrintf("uac: EVO4 volume %d/256 dB at tick %u (%s%s)\n", int(want), unsigned(now),
+                    s.fuOverride ? "command" : want != s.volumeMin ? "user unmute" : "minimum", ok ? "" : ", FAILED");
+            if (ok) backoff = 200;
+            else { retryAt = now + backoff; if (backoff < 5000) backoff *= 2; }
+        }
+        SchedulerSleepMs(20);
+    }
+    g_uacControlRunning = false;
 }
 
 static bool XhciUacControl(XhciDevice& dev, uint8_t type, uint8_t request, uint16_t value, uint16_t index,
@@ -4408,7 +4432,9 @@ static void XhciUacStatus(XhciText& t)
     t.s("mixer mode="); t.u(s.mixerMode); t.s(" primed="); t.u(s.primed); t.s(" level=");
     t.u(s.mixWrite - s.mixRead); t.s(" in="); t.u(s.mixFramesIn); t.s(" out="); t.u(s.mixFramesOut);
     t.s(" underflows="); t.u(s.mixUnderflows); t.s(" dropped="); t.u(s.mixDropped);
-    t.s(" registered="); t.u(g_uacAudioRegistered); t.nl();
+    t.s(" registered="); t.u(g_uacAudioRegistered); t.s(" native epoch="); t.u(s.nativeEpoch);
+    t.s(" submitted="); t.u(s.nativeSubmitted); t.s(" discontinuity="); t.u(s.nativeDiscontinuity);
+    t.s(" clock_ns="); t.u(AudioClockNowNs()); t.nl();
     t.s("fu current="); t.u(uint16_t(s.fuCurrentQ8)); t.s(" known="); t.u(s.fuKnown); t.s(" override=");
     t.u(s.fuOverride); t.s(" unmuted_level="); t.u(uint16_t(s.unmutedQ8)); t.s(" skip="); t.x(s.volumeSkip, 2);
     t.s(" mixer_control="); t.x(AudioOutputControlState(), 5); t.nl();
@@ -4459,6 +4485,10 @@ static void XhciUacStart(XhciText& t, uint32_t rate, bool mixer)
     s.rate = rate;
     s.mixerMode = mixer; s.primed = s.flushRequested = false; s.mixRead = s.mixWrite = 0;
     s.mixFramesIn = s.mixFramesOut = s.mixUnderflows = 0;
+    s.primeWait = 0; s.nativeOutBase = 0; s.nativeSubmitted = 0;
+    // A stream restarted under an already registered mixer driver is a new
+    // epoch (the mixer sees the discontinuity and calls restart()).
+    s.nativeDiscontinuity = g_uacAudioRegistered;
     s.fuOverride = false; s.fuKnown = false; s.volumeSkip = 0;
 
     // Playback volume range (feature unit), then the clock rate.
@@ -4484,6 +4514,10 @@ static void XhciUacStart(XhciText& t, uint32_t rate, bool mixer)
         (void)XhciUacConfigureEndpoints(*dev.ctrl, dev, false); t.s("SET_INTERFACE failed\n"); return;
     }
     __atomic_store_n(&s.active, true, __ATOMIC_RELEASE);
+    if (!g_uacControlRunning) {
+        g_uacControlRunning = true;
+        if (!KernelWorkerStart("uac_control", XhciUacControlThread, nullptr)) g_uacControlRunning = false;
+    }
     if (!KernelWorkerStart("uac_stream", XhciUacThread, nullptr)) {
         s.active = false;
         (void)XhciUacControl(dev, 0x01, 11, 0, desc.streamInterface, nullptr, 0);
@@ -4594,9 +4628,55 @@ static int XhciUacPlay(const void* samples, uint32_t bytes, uint32_t rate, uint8
     return int(frames * 4);
 }
 static void XhciUacAudioStop() { g_uac.flushRequested = true; }
+static bool XhciUacStreaming() { return g_uac.active && g_uac.mixerMode && g_uac.running && !g_devices[g_uac.device].gone; }
+static bool XhciUacProgress(AudioDeviceProgress* result)
+{
+    auto& s = g_uac;
+    if (!result || !AudioClockNowNs()) return false;
+    if (!XhciUacStreaming()) s.nativeDiscontinuity = true;
+    const uint64_t out = (__atomic_load_n(&s.mixFramesOut, __ATOMIC_ACQUIRE) - s.nativeOutBase) * 4;
+    const uint64_t submitted = s.nativeSubmitted;
+    // Capacity is the publication lead the mixer may keep queued (12 KiB, as
+    // intel_hda's native target), well inside the 32 KiB sink ring.
+    *result = {s.nativeEpoch, submitted, out < submitted ? out : submitted, 12288,
+               XhciUacStreaming(), s.nativeDiscontinuity};
+    return true;
+}
+static AudioSubmitReceipt XhciUacTrySubmit(const void* samples, uint32_t bytes)
+{
+    auto& s = g_uac;
+    AudioSubmitReceipt receipt{s.nativeEpoch, s.nativeSubmitted, 0, 0};
+    if (!samples || !bytes || (bytes & 3)) { receipt.error = -22; return receipt; }
+    if (!AudioClockNowNs()) { receipt.error = -95; return receipt; }
+    if (s.nativeDiscontinuity || !XhciUacStreaming()) { s.nativeDiscontinuity = true; receipt.error = -32; return receipt; }
+    const uint32_t used = s.mixWrite - __atomic_load_n(&s.mixRead, __ATOMIC_ACQUIRE);
+    uint32_t frames = bytes / 4, space = UAC_MIX_FRAMES - used;
+    if (frames > space) frames = space;
+    const auto* in = static_cast<const int16_t*>(samples);
+    for (uint32_t i = 0; i < frames; ++i) {
+        const uint32_t at = ((s.mixWrite + i) % UAC_MIX_FRAMES) * 2;
+        g_uacMix[at] = in[i * 2]; g_uacMix[at + 1] = in[i * 2 + 1];
+    }
+    __atomic_store_n(&s.mixWrite, s.mixWrite + frames, __ATOMIC_RELEASE);
+    s.mixFramesIn += frames;
+    s.nativeSubmitted += frames * 4;
+    receipt.accepted = frames * 4;
+    return receipt;
+}
+static bool XhciUacRestart(uint64_t expectedEpoch)
+{
+    auto& s = g_uac;
+    if (!s.nativeDiscontinuity || expectedEpoch != s.nativeEpoch || !XhciUacStreaming()) return false;
+    s.flushRequested = true;
+    for (uint32_t i = 0; i < 50 && s.flushRequested; ++i) SchedulerSleepMs(1);
+    s.nativeOutBase = s.mixFramesOut; s.nativeSubmitted = 0;
+    s.nativeDiscontinuity = false; ++s.nativeEpoch;
+    return true;
+}
 static bool XhciUacAudioPlaying() { return g_uac.active && g_uac.mixerMode && g_uac.mixWrite != g_uac.mixRead; }
 static uint32_t XhciUacAudioPosition() { return uint32_t(g_uac.mixFramesOut * 4); }
-static AudioDriver g_uacAudioDriver = {"usb_uac2", XhciUacPlay, XhciUacAudioStop, XhciUacAudioPlaying, XhciUacAudioPosition};
+static AudioDriver g_uacAudioDriver = {"usb_uac2", XhciUacPlay, XhciUacAudioStop, XhciUacAudioPlaying, XhciUacAudioPosition,
+                                       nullptr, XhciUacTrySubmit, XhciUacProgress, XhciUacRestart};
 
 static uint32_t XhciUacCommand(const char* p, XhciText& t)
 {
@@ -4606,11 +4686,14 @@ static uint32_t XhciUacCommand(const char* p, XhciText& t)
     if (!*p || XhciArgIs(p, "status")) XhciUacStatus(t);
     else if (XhciArgIs(p, "start")) { XhciUacStart(t, 48000, false); XhciUacStatus(t); }
     else if (XhciArgIs(p, "mixer")) {
-        if (!g_uacAudioRegistered) {
+        // Stream first, so the mixer's first refresh already sees a running
+        // native clock (it latches legacy delivery otherwise).
+        XhciUacStart(t, 44100, true);
+        if (!g_uacAudioRegistered && s.active) {
             g_uacAudioRegistered = AudioRegister(&g_uacAudioDriver);
-            if (!g_uacAudioRegistered) { t.s("another audio driver is registered\n"); return t.len; }
+            if (!g_uacAudioRegistered) t.s("another audio driver is registered\n");
         }
-        XhciUacStart(t, 44100, true); XhciUacStatus(t);
+        XhciUacStatus(t);
     }
     else if (XhciArgIs(p, "stop")) { XhciUacStop(t); XhciUacStatus(t); }
     else if (XhciArgIs(p, "tone")) { XhciUacTone(t, p); XhciUacStatus(t); }
