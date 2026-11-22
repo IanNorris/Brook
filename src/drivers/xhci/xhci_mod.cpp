@@ -4632,6 +4632,22 @@ static uint32_t XhciUacCommand(const char* p, XhciText& t)
     return t.len;
 }
 
+// Desktop live stick (/etc/usb-audio-mixer): once the EVO4 is present, make
+// it the mixer sink. Volume stays at the device minimum until an explicit
+// user unmute (see the stream thread); the mixer itself starts muted when
+// /etc/audio-muted exists.
+static void XhciUacAutoStart(void*)
+{
+    uint32_t index = 0;
+    for (uint32_t i = 0; i < 60 && !XhciUacFindDevice(index); ++i) SchedulerSleepMs(500);
+    static char text[1024];
+    XhciText t{text, sizeof(text), 0};
+    XhciUacCommand("usb mixer", t);
+    text[t.len < sizeof(text) ? t.len : sizeof(text) - 1] = 0;
+    char* end = text; while (*end && *end != '\n') ++end; *end = 0;
+    KPrintf("uac: autostart (usb-audio-mixer marker): %s\n", text);
+}
+
 static int XhciModuleInit()
 {
     SerialPuts("xhci: initializing USB 3.0 host controller driver\n");
@@ -4695,6 +4711,10 @@ static int XhciModuleInit()
         // their boot-time-only enumeration.
         UsbStatusSetProvider(XhciStatusText);
         DebugUsbCommandSetHandler(XhciUsbCommand);
+        if (auto* marker = VfsOpen("/etc/usb-audio-mixer")) {
+            VfsClose(marker);
+            if (!KernelWorkerStart("uac_auto", XhciUacAutoStart, nullptr)) KPuts("uac: autostart worker queue full\n");
+        }
         (void)PlatformPowerAddQuiesce(XhciQuiesceForReset);
         bool hotplug = false;
         static const char* const markers[] = {"/etc/usb-hotplug", "/etc/boot-status"};

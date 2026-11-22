@@ -72,7 +72,20 @@ I219_STAGES = {'probe': (), 'attach': ('i219-attach',), 'reset': ('i219-reset',)
 MARKERS = ('usb-read-only', 'audio-muted', 'hw-inventory', 'boot-status', 'boot-stick-update')
 # Exact /etc contents allowed in the initrd (lower-case FAT names).
 ETC_ALLOWED = {*MARKERS, 'i219-attach', 'i219-reset', 'hardware-payload-id', 'resolv.conf', 'machine-id', 'ssl',
-               'bridge-v3-operators', 'rtx-update-signer'}
+               'bridge-v3-operators', 'rtx-update-signer',
+               # --session desktop only
+               'live-store', 'volatile-desktop', 'hardware-bulk', 'usb-audio-mixer'}
+# Desktop live stick (--session desktop): the VMware RC session over the RAM
+# store, plus the RTX status helper. If the store does not mount, the services
+# fail to start and the kernel console, bridge and remote update stay usable.
+DESKTOP_RC = b'''set wm
+set vfb none
+sched eevdf
+run --service --once --console --uid 1000 /nix/profile/bin/hardware-dbus
+run --service --once --console --uid 1000 /nix/profile/bin/hardware-message
+run --service --once --console /nix/profile/bin/waylandd
+run --service --once --console /boot/HWSTATUS.ELF
+'''
 # Guest helpers in /boot: the boot-stick update receiver and the payload-ID reporter.
 HELPERS = {'HWRTXUP.ELF': 'tools/hardware_rtx_update.c', 'HWSTATUS.ELF': 'tools/hardware_status.c'}
 INIT_RC = b'set wm\nset vfb none\nkconsole\n'
@@ -155,6 +168,46 @@ def build_helpers(build_root, initrd, policy_file, signer_hex):
     return digests
 
 
+def fat_write(image, path, data):
+    subprocess.run(['mcopy', '-o', '-i', str(image), '-', '::/' + path], input=data, check=True)
+    if subprocess.check_output(['mtype', '-i', str(image), '::/' + path]) != data:
+        raise SystemExit('FAT readback mismatch for ' + path)
+
+
+def desktop_payload(args, initrd):
+    """Desktop session additions (as make_vmware_image.make_initrds), the
+    /etc/live-store record, and the EVO4 mixer autostart marker."""
+    if not args.live_store:
+        raise SystemExit('--session desktop needs --live-store')
+    sys.path.insert(0, str(ROOT / 'scripts'))
+    from stage_clearwater_shell import add_clearwater_start, embed_clearwater_executables, embed_terminal_shortcut
+    from make_vmware_image import wallpaper_raw, check_wallpaper
+    store = json.loads(args.live_store.read_text())
+    if store.get('format') != 'brook-rtx-live-store/1' or not re.fullmatch(
+            r'guid=[0-9a-f]{32} bytes=\d+ sha256=[0-9a-f]{64}\n', store['record']):
+        raise SystemExit('unexpected live store manifest')
+    profile = Path(store['profile'])
+    for directory in ('::/BOOT/BIN', '::/DATA', '::/NIX'):
+        if subprocess.run(['mdir', '-i', str(initrd), directory], capture_output=True).returncode:
+            run(['mmd', '-i', initrd, directory])
+    supervisor = Path(subprocess.check_output(['nix-build', '--no-out-link',
+        str(ROOT / 'tools/vulkan-compositor-pkg/clearwater-supervisor.nix')], text=True).strip())
+    shell = Path(subprocess.check_output(['nix-build', '--no-out-link',
+        str(ROOT / 'tools/clearwater-shell-pkg/default.nix')], text=True).strip())
+    embed_clearwater_executables(initrd, supervisor / 'bin/CWSUP.ELF', shell / 'bin/CWSHELL.ELF')
+    embed_terminal_shortcut(initrd)
+    fat_write(initrd, 'ETC/volatile-desktop', b'1\n')
+    fat_write(initrd, 'ETC/hardware-bulk', b'1\n')
+    fat_write(initrd, 'ETC/usb-audio-mixer', b'1\n')
+    fat_write(initrd, 'ETC/live-store', store['record'].encode())
+    fat_write(initrd, 'BOOT/BIN/BASH', (profile / 'bin/bash').read_bytes())
+    wallpaper = wallpaper_raw()
+    check_wallpaper(wallpaper)
+    fat_write(initrd, 'BOOT/WALLPAPER.RAW', wallpaper)
+    live = {k: store[k] for k in ('bytes', 'sha256', 'partition_guid', 'partition_name', 'profile')}
+    return add_clearwater_start(DESKTOP_RC), live
+
+
 def etc_listing(image):
     out = subprocess.check_output(['mdir', '-a', '-b', '-i', str(image), '::/ETC'], text=True)
     return sorted(line.rstrip('/').rsplit('/', 1)[-1].lower() for line in out.splitlines() if line.startswith('::/'))
@@ -214,13 +267,19 @@ def build(args):
     markers = (*MARKERS, *I219_STAGES[args.i219_stage])
     env = dict(os.environ, BROOK_BUILD_DIR=str(stage), BROOK_INITRD_MARKERS=','.join(markers),
                BROOK_HARDWARE_PAYLOAD_ID=payload_id)
+    if args.session == 'desktop':
+        env['BROOK_INITRD_KIB'] = '24576'
     env.pop('BROOK_PROVIDER_PAYLOAD', None)
     run(['bash', ROOT / 'scripts/make_initrd.sh', '--release'], env=env)
     initrd = stage / 'esp/INITRD.IMG'
     run(['mmd', '-i', initrd, '::BOOT'])
     init_rc = args.build_root / 'INIT.RC'
-    init_rc.write_bytes(INIT_RC)
-    run(['mcopy', '-i', initrd, init_rc, '::BOOT/INIT.RC'])
+    init_rc_bytes = INIT_RC
+    live = None
+    if args.session == 'desktop':
+        init_rc_bytes, live = desktop_payload(args, initrd)
+    init_rc.write_bytes(init_rc_bytes)
+    run(['mcopy', '-o', '-i', initrd, init_rc, '::BOOT/INIT.RC'])
     helpers = build_helpers(args.build_root, initrd, operators, signer_hex)
     etc = etc_listing(initrd)
     unexpected = sorted(set(etc) - ETC_ALLOWED)
@@ -251,7 +310,8 @@ def build(args):
         'format': FORMAT, 'commit': commit, 'dirty': dirty, 'payload_id': payload_id,
         'fat_label': FAT_LABEL, 'files': files,
         'kernel_options': KERNEL_FLAGS, 'loader_options': LOADER_FLAGS,
-        'loader_config': config.decode(), 'init_rc': INIT_RC.decode(),
+        'loader_config': config.decode(), 'init_rc': init_rc_bytes.decode(),
+        'session': args.session, 'live_store': live,
         'initrd': {'drivers': list(DRIVERS), 'etc': etc, 'markers': list(markers)},
         'i219_stage': args.i219_stage,
         'helpers': helpers,
@@ -327,6 +387,10 @@ def main():
     p.add_argument('--display-max', default='1920x1080', metavar='WxH',
                    help='GOP mode cap in BROOK.CFG (kernel supports up to 4096x2160); outside PREV/ fallback')
     p.add_argument('--allow-dirty', action='store_true')
+    p.add_argument('--session', choices=('kconsole', 'desktop'), default='kconsole',
+                   help='desktop: VMware RC desktop over the RAM live store (needs --live-store)')
+    p.add_argument('--live-store', type=Path, metavar='STORE_MANIFEST',
+                   help='store-manifest.json from build_rtx_live_store.py')
     args = p.parse_args()
     match = re.fullmatch(r'(\d{3,4})x(\d{3,4})', args.display_max)
     if not match or int(match[1]) > 4096 or int(match[2]) > 2160:
