@@ -1,4 +1,5 @@
 #include "hw_inventory.h"
+#include "boot_status.h"
 #include "core_autodump.h"
 #include "lastlog.h"
 #include "desktop_identity.h"
@@ -958,6 +959,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     //   we prefer loading it from the virtio disk for demonstration.
     brook::KsymDump();
     brook::NetConfigureBoot();
+    brook::BootStatusConfigure();
     brook::SerialPuts("module: Phase 1 — loading from /drivers (ramdisk)\n");
     brook::KLog("BOOT stage: early modules begin");
     brook::ModuleDiscoverAndLoad("/drivers");
@@ -1142,9 +1144,11 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
         // Start the NIC polling thread now that the scheduler is initialised.
 #if !defined(BROOK_SSD_GUARD_CHECK) || defined(BROOK_SSD_AUTO_RECOVERY)
-        if (brook::NetGetIf())
+        if (brook::NetGetIf() || brook::BootStatusEnabled())
             brook::NetStartPollThread();
 #endif
+        // Module workers (xHCI hotplug) and the opt-in status/DHCP thread.
+        brook::BootStatusStartThreads();
 
         // BRO-179: start the PMM quarantine drain thread (scheduler is up).
         // It returns freed frames to the allocator only after an all-CPU TLB

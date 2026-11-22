@@ -1725,7 +1725,9 @@ void NetStartPollThread()
 {
     // Called on the BSP after the synchronous DHCP/ARP boot phase returns.
     __atomic_store_n(&g_netEarlyBootPolling, false, __ATOMIC_RELEASE);
-    if (!g_netIf) return;
+    // Callers start the thread without an interface only when a later
+    // (hotplugged) NIC is expected; the loop handles an empty table.
+    if (g_netPollThread) return;
     uint32_t notStarted=0;
     if(g_irqTryLockProbe && __atomic_compare_exchange_n(&g_irqTryLockProbeState,&notStarted,3u,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)){
         Process* test=KernelThreadCreate("irq_try_test",[](void*){
@@ -1839,13 +1841,27 @@ static constexpr uint32_t DHCP_FIXED_BYTES = __builtin_offsetof(DhcpPacket, opti
 static constexpr uint16_t DHCP_SERVER_PORT = 67;
 static constexpr uint16_t DHCP_CLIENT_PORT = 68;
 
-static uint32_t g_dhcpXid = 0x42524F4B; // "BROK"
-static volatile bool g_dhcpDone = false;
-static volatile uint8_t g_dhcpState = 0; // 0=idle, 1=discovering, 2=requesting, 3=done
+// One DHCP client per registered interface. The transaction id identifies
+// the interface (base + index), so broadcast replies need no receiving NIC.
+static constexpr uint32_t DHCP_XID_BASE = 0x42524F4B; // "BROK"
+struct DhcpClient {
+    volatile uint8_t state;   // 0=idle, 1=discovering, 2=requesting, 3=bound
+    volatile bool done;
+    uint32_t attempts;        // DISCOVERs sent since the last bound state
+    uint64_t nextTick;        // background service: next retry deadline
+};
+static DhcpClient g_dhcp[NET_MAX_IFS];
 
-static void DhcpSend(uint8_t msgType, uint32_t serverIp, uint32_t requestedIp)
+static int NetIfIndexOf(const NetIf* nif)
 {
-    if (!g_netIf) return;
+    for (uint32_t i = 0; i < NET_MAX_IFS; ++i)
+        if (nif && g_netIfs[i] == nif) return static_cast<int>(i);
+    return -1;
+}
+
+static void DhcpSend(NetIf* nif, uint32_t index, uint8_t msgType, uint32_t serverIp, uint32_t requestedIp)
+{
+    if (!nif || index >= NET_MAX_IFS) return;
 
     // Build DHCP over UDP over IP over Ethernet
     alignas(16) uint8_t frame[ETH_FRAME_MAX];
@@ -1853,7 +1869,7 @@ static void DhcpSend(uint8_t msgType, uint32_t serverIp, uint32_t requestedIp)
 
     auto* eth = reinterpret_cast<EthHeader*>(frame);
     memset(eth->dst.b, 0xFF, 6); // broadcast
-    eth->src = g_netIf->mac;
+    eth->src = nif->mac;
     eth->etherType = htons(ETH_TYPE_IPV4);
 
     auto* ip = reinterpret_cast<Ipv4Header*>(frame + sizeof(EthHeader));
@@ -1882,9 +1898,9 @@ static void DhcpSend(uint8_t msgType, uint32_t serverIp, uint32_t requestedIp)
     dhcp->op    = 1; // BOOTREQUEST
     dhcp->htype = 1;
     dhcp->hlen  = 6;
-    dhcp->xid   = g_dhcpXid;
+    dhcp->xid   = DHCP_XID_BASE + index;
     dhcp->flags = htons(0x8000); // broadcast flag
-    memcpy(dhcp->chaddr, g_netIf->mac.b, 6);
+    memcpy(dhcp->chaddr, nif->mac.b, 6);
     dhcp->magic = DHCP_MAGIC;
 
     // Options
@@ -1911,19 +1927,21 @@ static void DhcpSend(uint8_t msgType, uint32_t serverIp, uint32_t requestedIp)
     *opt++ = 255;
 
     uint32_t frameLen = sizeof(EthHeader) + ipLen;
-    g_netIf->transmit(g_netIf, frame, frameLen);
+    nif->transmit(nif, frame, frameLen);
 }
 
 static bool DhcpAcquiring()
 {
-    return g_dhcpState == 1 || g_dhcpState == 2;
+    for (uint32_t i = 0; i < NET_MAX_IFS; ++i)
+        if (g_dhcp[i].state == 1 || g_dhcp[i].state == 2) return true;
+    return false;
 }
 
 static const DhcpPacket* DhcpReplyHeader(const uint8_t* data, uint32_t len)
 {
     if (len < DHCP_FIXED_BYTES) return nullptr;
     const auto* dhcp = reinterpret_cast<const DhcpPacket*>(data);
-    return dhcp->op == 2 && dhcp->xid == g_dhcpXid && dhcp->magic == DHCP_MAGIC
+    return dhcp->op == 2 && dhcp->xid - DHCP_XID_BASE < NET_MAX_IFS && dhcp->magic == DHCP_MAGIC
         ? dhcp : nullptr;
 }
 
@@ -1931,6 +1949,11 @@ static void HandleDhcpReply(const DhcpPacket& reply, uint32_t len)
 {
     const auto* dhcp = &reply;
     const auto* data = reinterpret_cast<const uint8_t*>(dhcp);
+    const uint32_t index = dhcp->xid - DHCP_XID_BASE;
+    if (index >= NET_MAX_IFS) return;
+    NetIf* nif = NetIfAt(index);
+    auto& client = g_dhcp[index];
+    if (!nif || memcmp(dhcp->chaddr, nif->mac.b, sizeof(nif->mac.b))) return;
     // Parse options
     uint8_t msgType = 0;
     uint32_t subnetMask = 0;
@@ -1957,45 +1980,46 @@ static void HandleDhcpReply(const DhcpPacket& reply, uint32_t len)
         opt += olen;
     }
 
-    if (msgType == DHCP_OFFER && g_dhcpState == 1) {
-        SerialPrintf("net: DHCP offer: %d.%d.%d.%d\n",
+    if (msgType == DHCP_OFFER && client.state == 1) {
+        SerialPrintf("net: DHCP offer if%u: %d.%d.%d.%d\n", index,
                      dhcp->yiaddr & 0xFF, (dhcp->yiaddr >> 8) & 0xFF,
                      (dhcp->yiaddr >> 16) & 0xFF, (dhcp->yiaddr >> 24) & 0xFF);
-        g_dhcpState = 2;
-        DhcpSend(DHCP_REQUEST, serverIp, dhcp->yiaddr);
-    } else if (msgType == DHCP_ACK && g_dhcpState == 2) {
+        client.state = 2;
+        DhcpSend(nif, index, DHCP_REQUEST, serverIp, dhcp->yiaddr);
+    } else if (msgType == DHCP_ACK && client.state == 2) {
         const uint64_t viewFlags=IrqSpinLockAcquire(&g_interfaceViewLock);
-        g_netIf->ipAddr  = dhcp->yiaddr;
-        g_netIf->netmask = subnetMask;
-        g_netIf->gateway = router;
-        g_netIf->dns     = dns;
+        nif->ipAddr  = dhcp->yiaddr;
+        nif->netmask = subnetMask;
+        nif->gateway = router;
+        nif->dns     = dns;
         NetInterfaceChangedLocked();
         IrqSpinLockRelease(&g_interfaceViewLock,viewFlags);
 
-        SerialPrintf("net: DHCP ACK — IP %d.%d.%d.%d mask %d.%d.%d.%d gw %d.%d.%d.%d\n",
-                     g_netIf->ipAddr & 0xFF, (g_netIf->ipAddr >> 8) & 0xFF,
-                     (g_netIf->ipAddr >> 16) & 0xFF, (g_netIf->ipAddr >> 24) & 0xFF,
+        SerialPrintf("net: DHCP ACK if%u — IP %d.%d.%d.%d mask %d.%d.%d.%d gw %d.%d.%d.%d\n", index,
+                     nif->ipAddr & 0xFF, (nif->ipAddr >> 8) & 0xFF,
+                     (nif->ipAddr >> 16) & 0xFF, (nif->ipAddr >> 24) & 0xFF,
                      subnetMask & 0xFF, (subnetMask >> 8) & 0xFF,
                      (subnetMask >> 16) & 0xFF, (subnetMask >> 24) & 0xFF,
                      router & 0xFF, (router >> 8) & 0xFF,
                      (router >> 16) & 0xFF, (router >> 24) & 0xFF);
 
         KPrintf("net: IP %d.%d.%d.%d (DHCP)\n",
-                g_netIf->ipAddr & 0xFF, (g_netIf->ipAddr >> 8) & 0xFF,
-                (g_netIf->ipAddr >> 16) & 0xFF, (g_netIf->ipAddr >> 24) & 0xFF);
+                nif->ipAddr & 0xFF, (nif->ipAddr >> 8) & 0xFF,
+                (nif->ipAddr >> 16) & 0xFF, (nif->ipAddr >> 24) & 0xFF);
 
-        g_dhcpState = 3;
-        g_dhcpDone = true;
+        client.state = 3;
+        client.done = true;
     }
 }
 
 static void HandleDhcpAcquisitionUnicast(NetIf* receiving, const Ipv4Header& ip,
                                          const uint8_t* payload, uint32_t payloadLen)
 {
-    // Only an unconfigured primary interface receiving a physical BOOTP
-    // response may claim an otherwise unassigned destination address.
+    // Only an unconfigured interface receiving a physical BOOTP response for
+    // its own transaction may claim an otherwise unassigned destination.
     const uint32_t destination = ntohl(ip.dstIp);
-    if (receiving != g_netIf || receiving->ipAddr || !DhcpAcquiring() ||
+    const int index = NetIfIndexOf(receiving);
+    if (index < 0 || receiving->ipAddr || !(g_dhcp[index].state == 1 || g_dhcp[index].state == 2) ||
         !destination || (destination >> 28) >= 0xe || (ntohs(ip.flagsFrag) & 0x3fff) ||
         payloadLen < sizeof(UdpHeader)) return;
     const auto* udp = reinterpret_cast<const UdpHeader*>(payload);
@@ -2004,10 +2028,54 @@ static void HandleDhcpAcquisitionUnicast(NetIf* receiving, const Ipv4Header& ip,
         bytes < sizeof(UdpHeader) || bytes > payloadLen) return;
 
     const auto* reply = DhcpReplyHeader(payload + sizeof(UdpHeader),bytes - sizeof(UdpHeader));
-    if (!reply || reply->htype != 1 || reply->hlen != sizeof(receiving->mac.b) ||
+    if (!reply || reply->xid != DHCP_XID_BASE + static_cast<uint32_t>(index) ||
+        reply->htype != 1 || reply->hlen != sizeof(receiving->mac.b) ||
         memcmp(reply->chaddr,receiving->mac.b,sizeof(receiving->mac.b)) ||
         reply->yiaddr != ip.dstIp) return;
     HandleDhcpReply(*reply,bytes - sizeof(UdpHeader));
+}
+
+bool DhcpIfState(uint32_t index, uint8_t* state, uint32_t* attempts)
+{
+    if (index >= NET_MAX_IFS || !NetIfAt(index)) return false;
+    if (state) *state = g_dhcp[index].state;
+    if (attempts) *attempts = g_dhcp[index].attempts;
+    return true;
+}
+
+bool DhcpService()
+{
+    // Background client: every unaddressed interface keeps retrying with
+    // exponential backoff (2 s doubling to a 30 s cap) and never gives up.
+    bool changed = false;
+    const uint64_t now = ApicTickCount();
+    const uint32_t count = NetIfCount();
+    for (uint32_t i = 0; i < count && i < NET_MAX_IFS; ++i) {
+        NetIf* nif = NetIfAt(i);
+        auto& client = g_dhcp[i];
+        if (!nif) continue;
+        if (nif->ipAddr) {
+            if (client.state != 3) { client.state = 3; changed = true; }
+            continue;
+        }
+        if (client.state == 3) { client.state = 0; client.attempts = 0; changed = true; }
+        if (client.state != 0 && now < client.nextTick) continue;
+        const uint32_t shift = client.attempts < 4 ? client.attempts : 4;
+        uint64_t backoff = 2000ull << shift;
+        if (backoff > 30000) backoff = 30000;
+        client.done = false;
+        client.state = 1;
+        ++client.attempts;
+        client.nextTick = now + backoff;
+        if (client.attempts <= 3 || (client.attempts % 10) == 0)
+            KPrintf("net: DHCP if%u discover attempt %u (retry in %lu s)\n", i, client.attempts,
+                    static_cast<unsigned long>(backoff / 1000));
+        else
+            SerialPrintf("net: DHCP if%u discover attempt %u\n", i, client.attempts);
+        DhcpSend(nif, i, DHCP_DISCOVER, 0, 0);
+        changed = true;
+    }
+    return changed;
 }
 
 // ---- Static interface config via /boot/BROOK.CFG -------------------------
@@ -2141,12 +2209,17 @@ bool NetApplyStaticConfig(NetIf* nif)
 
 bool DhcpDiscover(NetIf* nif)
 {
-    g_dhcpState = 1;
-    g_dhcpDone = false;
+    const int found = NetIfIndexOf(nif);
+    if (found < 0) return false;
+    const uint32_t index = static_cast<uint32_t>(found);
+    auto& client = g_dhcp[index];
+    client.state = 1;
+    client.done = false;
 
     for (int attempt = 0; attempt < 5; attempt++) {
         SerialPrintf("net: DHCP discover (attempt %d)\n", attempt + 1);
-        DhcpSend(DHCP_DISCOVER, 0, 0);
+        ++client.attempts;
+        DhcpSend(nif, index, DHCP_DISCOVER, 0, 0);
 
         // A loop count is not elapsed time. USB adapters may still be bringing
         // up the PHY; fast CPUs previously exhausted all retries in <1 second.
@@ -2155,11 +2228,13 @@ bool DhcpDiscover(NetIf* nif)
             // Poll the NIC for received packets (IRQ may not work during early boot)
             if (nif->poll) nif->poll(nif);
             __asm__ volatile("pause");
-            if (g_dhcpDone) return true;
+            if (client.done) return true;
         }
+        // A REQUEST that went unanswered restarts discovery next attempt.
+        if (client.state == 2) client.state = 1;
     }
 
-    g_dhcpState = 0;
+    client.state = 0;
     SerialPuts("net: DHCP failed\n");
     return false;
 }

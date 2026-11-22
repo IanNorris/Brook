@@ -2454,18 +2454,18 @@ int main() {
         offer.dhcp.op = 2;
         offer.dhcp.htype = 1;
         offer.dhcp.hlen = sizeof(primary.mac.b);
-        offer.dhcp.xid = g_dhcpXid;
+        offer.dhcp.xid = DHCP_XID_BASE; // interface index 0 (primary)
         offer.dhcp.yiaddr = lease;
         offer.dhcp.magic = DHCP_MAGIC;
         memcpy(offer.dhcp.chaddr, primary.mac.b, sizeof(primary.mac.b));
         const uint8_t options[] = {53,1,DHCP_OFFER,54,4,192,0,2,1,1,4,255,255,255,0,255};
         memcpy(offer.dhcp.options, options, sizeof(options));
         frameTransmitCalls = 0;
-        g_dhcpState = 1;
-        g_dhcpDone = false;
+        g_dhcp[0].state = 1;
+        g_dhcp[0].done = false;
         auto ignored = [&](NetIf& nic, const Wire& packet) {
             NetReceive(&nic, &packet, sizeof(packet));
-            assert(g_dhcpState == 1 && !g_dhcpDone && !primary.ipAddr && frameTransmitCalls == 0);
+            assert(g_dhcp[0].state == 1 && !g_dhcp[0].done && !primary.ipAddr && frameTransmitCalls == 0);
         };
         ignored(secondary, offer);
         auto bad = offer;
@@ -2493,31 +2493,56 @@ int main() {
             ignored(primary, bad);
         }
         HandleIpv4(reinterpret_cast<const uint8_t*>(&offer), sizeof(offer), true, 0);
-        assert(g_dhcpState == 1 && frameTransmitCalls == 0);
+        assert(g_dhcp[0].state == 1 && frameTransmitCalls == 0);
 
         for (const auto destination : {lease, 0xffffffffu}) {
             primary.ipAddr = 0;
-            g_dhcpState = 1;
-            g_dhcpDone = false;
+            g_dhcp[0].state = 1;
+            g_dhcp[0].done = false;
             frameTransmitCalls = 0;
             auto packet = offer;
             packet.ip.dstIp = destination;
             NetReceive(&primary, &packet, sizeof(packet));
-            assert(g_dhcpState == 2 && !g_dhcpDone && !primary.ipAddr && frameTransmitCalls == 1);
+            assert(g_dhcp[0].state == 2 && !g_dhcp[0].done && !primary.ipAddr && frameTransmitCalls == 1);
             packet.dhcp.options[2] = DHCP_ACK;
             NetReceive(&primary, &packet, sizeof(packet));
-            assert(g_dhcpState == 3 && g_dhcpDone && primary.ipAddr == lease);
+            assert(g_dhcp[0].state == 3 && g_dhcp[0].done && primary.ipAddr == lease);
             assert(primary.netmask == Ipv4Addr(255, 255, 255, 0));
             NetReceive(&primary, &offer, sizeof(offer));
-            assert(g_dhcpState == 3 && frameTransmitCalls == 1);
+            assert(g_dhcp[0].state == 3 && frameTransmitCalls == 1);
+        }
+
+        {   // A second interface runs its own client, keyed by xid base+1.
+            const uint32_t savedIp = secondary.ipAddr;
+            const MacAddr savedMac = secondary.mac;
+            secondary.mac = {{0x52, 0x54, 0, 0x12, 0x34, 0x57}};
+            secondary.transmit = captureFrame;
+            secondary.ipAddr = 0;
+            g_dhcp[1].state = 1; g_dhcp[1].done = false; frameTransmitCalls = 0;
+            auto packet = offer;
+            packet.eth.dst = secondary.mac;
+            packet.ip.dstIp = 0xffffffffu;
+            packet.dhcp.xid = DHCP_XID_BASE + 1;
+            memcpy(packet.dhcp.chaddr, secondary.mac.b, sizeof(secondary.mac.b));
+            auto wrong = packet; // primary's MAC under the secondary's xid is ignored
+            memcpy(wrong.dhcp.chaddr, primary.mac.b, sizeof(primary.mac.b));
+            NetReceive(&secondary, &wrong, sizeof(wrong));
+            assert(g_dhcp[1].state == 1 && frameTransmitCalls == 0);
+            NetReceive(&secondary, &packet, sizeof(packet));
+            assert(g_dhcp[1].state == 2 && frameTransmitCalls == 1 && g_dhcp[0].state == 3);
+            packet.dhcp.options[2] = DHCP_ACK;
+            NetReceive(&secondary, &packet, sizeof(packet));
+            assert(g_dhcp[1].state == 3 && g_dhcp[1].done && secondary.ipAddr == lease && primary.ipAddr == lease);
+            secondary.ipAddr = savedIp; secondary.mac = savedMac; secondary.transmit = nullptr;
+            g_dhcp[1].state = 0; g_dhcp[1].done = false;
         }
 
         primary.ipAddr = 0;
-        g_dhcpState = 0;
-        g_dhcpDone = false;
+        g_dhcp[0].state = 0;
+        g_dhcp[0].done = false;
         frameTransmitCalls = 0;
         NetReceive(&primary, &offer, sizeof(offer));
-        assert(g_dhcpState == 0 && !g_dhcpDone && frameTransmitCalls == 0);
+        assert(g_dhcp[0].state == 0 && !g_dhcp[0].done && frameTransmitCalls == 0);
         g_netIf = g_netIfs[0] = g_netIfs[1] = nullptr;
         g_netIfCount = 0;
     }

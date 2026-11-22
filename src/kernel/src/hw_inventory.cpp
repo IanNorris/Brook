@@ -31,6 +31,8 @@ uint32_t g_ecamFunctions=0,g_ecamRefused=0;
 bool g_dmarPresent=false;
 char g_cpuBrand[49];
 char g_dmarLine[160];
+char g_dmarUnits[160];
+uint64_t g_drhdBase[4];uint32_t g_drhdCount=0;
 
 HwMcfgEntry g_mcfg[8];uint32_t g_mcfgCount=0;
 uint8_t g_tableCopy[16384];
@@ -115,7 +117,15 @@ void AcpiSection() {
     } else g_out.str("mcfg absent or not unique; extended config space unavailable\n");
     bytes=0;
     const uint32_t start=g_out.length();
-    if(AcpiUniqueDmarCopy(g_tableCopy,sizeof(g_tableCopy),bytes)){g_dmarPresent=true;HwFormatDmar(g_out,g_tableCopy,bytes);}
+    if(AcpiUniqueDmarCopy(g_tableCopy,sizeof(g_tableCopy),bytes)){
+        g_dmarPresent=true;HwFormatDmar(g_out,g_tableCopy,bytes);
+        for(uint32_t o=48;o+16<=bytes && g_drhdCount<4;) {
+            const uint32_t type=uint32_t(HwLe(g_tableCopy+o,2)),length=uint32_t(HwLe(g_tableCopy+o+2,2));
+            if(length<4 || o+length>bytes)break;
+            if(type==0 && length>=16)g_drhdBase[g_drhdCount++]=HwLe(g_tableCopy+o+8,8);
+            o+=length;
+        }
+    }
     else g_out.str("dmar absent, duplicated or larger than 16KB (VT-d disabled in firmware?)\n");
     uint32_t n=0;for(uint32_t i=start;i<g_out.length() && g_text[i]!='\n' && n+1<sizeof(g_dmarLine);++i)g_dmarLine[n++]=g_text[i];
     g_dmarLine[n]=0;
@@ -151,6 +161,26 @@ void UnmapEcam() {
     // Borrowed device frame: detach without returning it to the allocator.
     (void)VmmDetachPage(KernelPageTable,g_windowVa);
     __asm__ volatile("invlpg (%0)"::"r"(g_windowVa.raw()):"memory");
+}
+
+// VT-d unit state left by firmware: version, capability and global status
+// (translation / interrupt remapping enabled?) — register reads only.
+void DmarUnitSection() {
+    HwText line(g_dmarUnits,sizeof(g_dmarUnits));
+    line.str("dmar units ");line.dec(g_drhdCount);
+    for(uint32_t i=0;i<g_drhdCount;++i) {
+        const uint64_t base=g_drhdBase[i];
+        g_out.str("dmar unit ");g_out.dec(i);g_out.str(" base ");g_out.hx(base,8);
+        if((base&0xfff) || !MapEcam(base)){g_out.str(" unmapped (not a reserved/MMIO page)");g_out.end();line.str(" ?");continue;}
+        const uint32_t version=g_window[0],capLo=g_window[2],capHi=g_window[3],gsts=g_window[0x1c/4];
+        UnmapEcam();
+        g_out.str(" ver ");g_out.hx(version&0xff,2);g_out.str(" cap ");g_out.hx((uint64_t(capHi)<<32)|capLo,16);
+        g_out.str(" gsts ");g_out.hx(gsts,8);
+        g_out.str((gsts>>31)&1?" dma-translation ON":" dma-translation off");
+        g_out.str((gsts>>25)&1?" irq-remap ON":" irq-remap off");
+        g_out.end();
+        line.str(" [");line.dec(i);line.str((gsts>>31)&1?" TES=1":" TES=0");line.str((gsts>>25)&1?" IRES=1]":" IRES=0]");
+    }
 }
 
 void PciSection() {
@@ -222,6 +252,7 @@ void HwInventoryCapture(const BootProtocol* boot) {
     CpuSection();
     MemorySection(boot);
     AcpiSection();
+    DmarUnitSection();
     PciSection();
     if(g_out.overflow())g_out.str("\ninventory truncated\n");
     CountLines();
@@ -247,6 +278,7 @@ void HwInventoryAnnounce() {
         ConsoleLines(b.begin,b.end,nvidia?48:1);
     }
     KPrintf("HWINV %s\n",g_dmarLine[0]?g_dmarLine:"dmar summary unavailable");
+    if(g_drhdCount)KPrintf("HWINV %s\n",g_dmarUnits);
     KPrintf("HWINV %u bytes / %u lines captured%s; full text: bridge hardware inventory <offset> <count>\n",
             g_out.length(),g_lines,g_out.overflow()?" (TRUNCATED)":"");
     NetIf* nif=NetGetIf();

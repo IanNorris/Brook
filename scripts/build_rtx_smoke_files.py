@@ -14,10 +14,14 @@ What the payload binds or touches (everything else is never probed):
     virtio-blk is the only built-in block driver (absent on real hardware).
     AHCI stays unbound: no /etc/ahci-* selector, no AHCI observation marker.
     There is no NVMe driver.
-  * Modules: xhci only (USB storage read-only via /etc/usb-read-only, USB
-    HID input, CDC-ECM USB Ethernet). No GPU, HDA or NIC PCI drivers.
+  * Modules: xhci only, driving every xHCI controller with USB 2/3 hubs
+    (USB storage read-only via /etc/usb-read-only, USB HID boot keyboard and
+    mouse, CDC-ECM USB Ethernet). No GPU, HDA or NIC PCI drivers.
   * /etc/hw-inventory: read-only boot inventory (CPU, memory map, ACPI table
     headers, MCFG, DMAR, PCI config space incl. ECAM extended capabilities).
+  * /etc/boot-status: end-of-boot status block (every xHCI controller, its
+    ports and devices incl. hubs, NICs, DHCP, bridge endpoint), re-printed on
+    USB/network changes, and DHCP that keeps retrying on every NIC.
   * Root is the RAM initrd; nothing is mounted from any disk.
 
 Writes only the new --output directory and --build-root. Run in nix-shell from
@@ -37,7 +41,7 @@ sys.path.insert(0, str(ROOT / 'scripts'))
 from bridge_keyless_image import require_keyless_disk, require_keyless_image  # noqa: E402
 from bridge_operator_policy import validate_operator_policy  # noqa: E402
 
-FORMAT = 'brook-rtx-smoke-v1'
+FORMAT = 'brook-rtx-smoke-v2'
 FAT_LABEL = 'BROOK_RTX'
 KERNEL_FLAGS = {
     'BROOK_BRIDGE_V3': 'ON', 'BROOK_QEMU_LEGACY_OUTBOUND_DEBUG': 'OFF',
@@ -58,7 +62,7 @@ LOADER_FLAGS = {
     'BROOK_BUILD_RECOVERY_PROBE': 'OFF',
 }
 DRIVERS = ('xhci',)
-MARKERS = ('usb-read-only', 'audio-muted', 'hw-inventory')
+MARKERS = ('usb-read-only', 'audio-muted', 'hw-inventory', 'boot-status')
 # Exact /etc contents allowed in the initrd (lower-case FAT names).
 ETC_ALLOWED = {*MARKERS, 'hardware-payload-id', 'resolv.conf', 'machine-id', 'ssl'}
 INIT_RC = b'set wm\nset vfb none\nkconsole\n'
@@ -189,7 +193,8 @@ def build(args):
             'storage': 'AHCI unbound (no selectors), no NVMe driver, USB mass storage read-only (EROFS in xhci), '
                        'built-in virtio-blk only exists in VMs',
             'firmware': 'no EFI variable writes, no firmware/flash access, no AML interpreter (uACPI off)',
-            'pci_writes': 'xHCI only (BIOS handoff, controller reset, memory+bus-master enable); '
+            'pci_writes': 'every xHCI controller only (BIOS handoff, controller reset, memory+bus-master enable, '
+                          'MSI/MSI-X); '
                           'virtio devices exist only in VMs',
             'cpu_msrs': 'volatile only: PAT, APIC, TSC_AUX, EPB 0/15->6 as Linux, MWAIT idle; reset on reboot',
             'inventory': 'read-only config reads (CF8 and MCFG ECAM mapped read-only); no BAR sizing',

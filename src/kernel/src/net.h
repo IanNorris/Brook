@@ -277,6 +277,12 @@ void ArpCacheInsert(uint32_t ip, const MacAddr& mac);
 // Perform DHCP discovery to obtain an IP address.
 // Blocks until complete or timeout. Returns true on success.
 bool DhcpDiscover(NetIf* nif);
+// Background DHCP for every interface without an address: retries forever
+// with exponential backoff. Call periodically from a kernel thread after the
+// net_poll thread runs. Returns true when any client state changed.
+bool DhcpService();
+// Per-interface client state: 0 idle, 1 discovering, 2 requesting, 3 bound.
+bool DhcpIfState(uint32_t index, uint8_t* state, uint32_t* attempts);
 
 // Read /boot/BROOK.CFG and, if NET0_MODE=static, configure the interface's
 // ipAddr/netmask/gateway/dns from NET0_IP / NET0_NETMASK / NET0_GATEWAY /

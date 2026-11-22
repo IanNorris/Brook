@@ -545,8 +545,9 @@ void SmpPrepareAPs()
     if (g_bootAdmission.Count() <= 1)
         return;
 
-    KPrintf("SMP: preparing %u APs for scheduling\n", g_bootAdmission.Count() - 1);
+    SerialPrintf("SMP: preparing %u APs for scheduling\n", g_bootAdmission.Count() - 1);
 
+    uint32_t prepared = 0;
     for (uint32_t i = 0; i < g_cpuCount && i < MAX_CPUS; ++i)
     {
         if (g_cpus[i].isBsp || !g_cpus[i].online)
@@ -581,9 +582,11 @@ void SmpPrepareAPs()
         g_apEnv[i] = env;
         SchedulerSetCpuEnv(i, env);
 
-        KPrintf("SMP: CPU %u prepared (TSS sel=0x%x, env=%p)\n",
+        SerialPrintf("SMP: CPU %u prepared (TSS sel=0x%x, env=%p)\n",
                 i, g_apTssSelector[i], reinterpret_cast<void*>(env));
+        ++prepared;
     }
+    KPrintf("SMP: %u application processors prepared (details on serial)\n", prepared);
 }
 
 void SmpActivateAPs()
