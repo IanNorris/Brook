@@ -532,9 +532,11 @@ static void* AllocDmaBuffer(uint32_t pages, uint64_t& outPhys, PmmOwner owner = 
     for(uint32_t attempt=0;attempt<2;++attempt) {
         const uint32_t request=(g_dma32 || attempt) && pages==1?2:pages;
         phys=PmmAllocPagesAccounted(request,MemTag::Device,KernelPid,owner);
-        if(!phys)return nullptr;
+        if(!phys){KPrintf("xhci: DMA allocation of %u page(s) failed (attempt %u)\n",request,attempt);return nullptr;}
         if(request!=pages)PmmFreePage(phys+uint64_t(pages)*4096);
         if(phys.raw()<limit && bytes<=limit-phys.raw())break;
+        KPrintf("xhci: DMA page(s) at %lx above the %lu GiB limit (attempt %u)\n",
+                static_cast<unsigned long>(phys.raw()),static_cast<unsigned long>(limit>>30),attempt);
         for(uint32_t i=0;i<pages;++i)PmmFreePage(phys+uint64_t(i)*4096);
         if(pages!=1 || attempt)return nullptr;
     }
@@ -4641,6 +4643,18 @@ static uint32_t XhciUacCommand(const char* p, XhciText& t)
 // it the mixer sink. Volume stays at the device minimum until an explicit
 // user unmute (see the stream thread); the mixer itself starts muted when
 // /etc/audio-muted exists.
+// Rings and buffers for the UAC stream are allocated once, at module init,
+// before large boot-time RAM images move the allocator above the DMA limit.
+static bool XhciUacPrealloc()
+{
+    auto& s = g_uac;
+    if (!s.dataRing && !XhciAllocTransferRing(s.dataRing, s.dataRingPhys, s.dataEnq, s.dataCycle)) return false;
+    if (!s.fbRing && !XhciAllocTransferRing(s.fbRing, s.fbRingPhys, s.fbEnq, s.fbCycle)) return false;
+    if (!s.dataBuf && !(s.dataBuf = static_cast<uint8_t*>(AllocDmaBuffer(8, s.dataBufPhys)))) return false;
+    if (!s.fbBuf && !(s.fbBuf = static_cast<uint8_t*>(AllocDmaBuffer(1, s.fbBufPhys)))) return false;
+    return true;
+}
+
 static void XhciUacAutoStart(void*)
 {
     uint32_t index = 0;
@@ -4716,6 +4730,7 @@ static int XhciModuleInit()
         // their boot-time-only enumeration.
         UsbStatusSetProvider(XhciStatusText);
         DebugUsbCommandSetHandler(XhciUsbCommand);
+        if (!XhciUacPrealloc()) KPuts("uac: stream buffers unavailable at init\n");
         if (auto* marker = VfsOpen("/etc/usb-audio-mixer")) {
             VfsClose(marker);
             if (!KernelWorkerStart("uac_auto", XhciUacAutoStart, nullptr)) KPuts("uac: autostart worker queue full\n");
