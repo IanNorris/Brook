@@ -1051,6 +1051,20 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         text[n]=0;
         Reply r;r.text("{\"nic_api\":1,\"text\":");r.quoted(text);r.text("}\n");r.send();return true;
     }
+    constexpr char audioPrefix[]="bridge hardware audio";
+    if(Prefix(command,audioPrefix) && (!command[sizeof(audioPrefix)-1] || command[sizeof(audioPrefix)-1]==' ')) {
+        auto* handler=__atomic_load_n(&g_usbCommand,__ATOMIC_ACQUIRE);
+        if(!handler){DebugChannelSend("{\"audio_error\":\"No USB audio handler is loaded\"}\n");return true;}
+        static char args[160];const char* rest=command+sizeof(audioPrefix)-1;
+        uint32_t n=0;for(const char* a="audio ";*a;)args[n++]=*a++;
+        while(*rest && n+1<sizeof(args))args[n++]=*rest++;
+        args[n]=0;
+        static char text[3073];
+        uint32_t len=handler(args,text,sizeof(text)-1);
+        if(len>=sizeof(text))len=sizeof(text)-1;
+        text[len]=0;
+        Reply r;r.text("{\"audio_api\":1,\"text\":");r.quoted(text);r.text("}\n");r.send();return true;
+    }
     constexpr char usbPrefix[]="bridge hardware usb";
     if(Prefix(command,usbPrefix) && (!command[sizeof(usbPrefix)-1] || command[sizeof(usbPrefix)-1]==' ')) {
         auto* handler=__atomic_load_n(&g_usbCommand,__ATOMIC_ACQUIRE);

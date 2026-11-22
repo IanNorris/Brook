@@ -29,6 +29,7 @@
 #include "xhci_msi.h"
 #include "xhci_completion_queue.h"
 #include "usb_hub_logic.h"
+#include "usb_uac2.h"
 #include "boot_status.h"
 #include "debug_hardware.h"
 #include "scheduler.h"
@@ -73,6 +74,8 @@ MODULE_IMPORT_SYMBOL(UsbBootReportReset);
 MODULE_IMPORT_SYMBOL(KPrintf);
 MODULE_IMPORT_SYMBOL(KPuts);
 MODULE_IMPORT_SYMBOL(DebugUsbCommandSetHandler);
+MODULE_IMPORT_SYMBOL(KernelWorkerStart);
+MODULE_IMPORT_SYMBOL(SchedulerSleepMs);
 MODULE_IMPORT_SYMBOL(PlatformPowerAddQuiesce);
 MODULE_IMPORT_SYMBOL(PciQuiesceFunctionForReset);
 MODULE_IMPORT_SYMBOL(VmmAllocPages);
@@ -1887,6 +1890,8 @@ static volatile uint32_t g_mouseReports;
 static void XhciProcessMouseReport(const uint8_t* report, XhciHidFn& fn);
 static void XhciEndHid(XhciHidFn& fn, bool keyboard);
 static int XhciMatchTransferEvent(const XhciController& ctrl, const Trb& evt);
+static bool XhciUacEventHit(const XhciController& ctrl, const Trb& event);
+static void XhciUacEvent(const Trb& event);
 
 // Drain the shared event ring for IRQs and both HID input queues.
 static bool XhciHidRingHit(const XhciHidFn& fn, const Trb& event, uint32_t slot, uint32_t slotId)
@@ -1917,6 +1922,7 @@ static void XhciDrainController(XhciController& ctrl,bool& wakeNetwork)
         const uint32_t type=event.control&TRB_TYPE_MASK;
         if(type!=TRB_TYPE_TRANSFER_EVENT && type!=TRB_TYPE_CMD_COMPLETION)continue;
         bool handled=false;
+        if(type==TRB_TYPE_TRANSFER_EVENT && XhciUacEventHit(ctrl,event)){XhciUacEvent(event);continue;}
         if(type==TRB_TYPE_TRANSFER_EVENT) {
             const int index=XhciMatchTransferEvent(ctrl,event);
             if(index>=0) {
@@ -4028,6 +4034,8 @@ static bool XhciArgIs(const char*& p, const char* word)
     if (*q && *q != ' ') return false;
     p = q; return true;
 }
+struct XhciText;
+static uint32_t XhciUacCommand(const char* p, XhciText& t);
 static uint32_t XhciUsbCommand(const char* args, char* out, uint32_t cap)
 {
     XhciText t{out, cap, 0};
@@ -4046,6 +4054,7 @@ static uint32_t XhciUsbCommand(const char* args, char* out, uint32_t cap)
         }
         return t.len;
     }
+    if (XhciArgIs(p, "audio")) return XhciUacCommand(p, t);
     uint32_t index = 0;
     if (XhciArgIs(p, "desc")) {
         uint32_t offset = 0;
@@ -4085,6 +4094,383 @@ static uint32_t XhciUsbCommand(const char* args, char* out, uint32_t cap)
         return t.len;
     }
     t.s("usage: bridge hardware usb [list|desc <i> [off]|get <i> <bmRT> <bReq> <wValue> <wIndex> <wLength>]");
+    return t.len;
+}
+
+
+// ---- UAC2 playback (EVO4-class devices): bridge hardware audio ---------------
+// Started only by an explicit "bridge hardware audio usb start". Streams 48 kHz
+// 16-bit silence through the isochronous OUT endpoint with explicit feedback;
+// "tone <dB> audible" raises the feature-unit volume for one 1 s 440 Hz tone and
+// then returns it to the device minimum. Capture and DFU interfaces are never
+// touched.
+struct XhciUacStream {
+    XhciController* ctrl = nullptr;
+    uint32_t device = 0, slotId = 0, dataDci = 0, fbDci = 0, frameBytes = 0;
+    Uac2Playback desc{};
+    Trb* dataRing = nullptr; uint64_t dataRingPhys = 0; uint32_t dataEnq = 0; bool dataCycle = true;
+    Trb* fbRing = nullptr; uint64_t fbRingPhys = 0; uint32_t fbEnq = 0; bool fbCycle = true;
+    uint8_t* dataBuf = nullptr; uint64_t dataBufPhys = 0;
+    uint8_t* fbBuf = nullptr; uint64_t fbBufPhys = 0;
+    uint64_t dataSeq[XFER_RING_SIZE]{}, fbSeq[XFER_RING_SIZE]{};
+    volatile uint64_t completedHw = 0; // only from transfer events: bounds ring occupancy
+    volatile uint64_t produced = 0, completed = 0, fbProduced = 0, fbCompleted = 0, framesSent = 0;
+    volatile uint32_t dataEvents = 0, fbEvents = 0, underruns = 0, missed = 0, resyncs = 0, fbValues = 0;
+    volatile uint32_t lastFbRaw = 0, lastFbBytes = 0, lastBadCc = 0;
+    volatile uint32_t ccCount[32]{};
+    volatile bool active = false, running = false, stopRequested = false, resync = false;
+    volatile bool toneRequested = false, toneDone = false;
+    volatile uint64_t toneStartTick = 0, toneEndTick = 0;
+    Uac2FeedbackPacer pacer{};
+    Uac2Tone tone{};
+    int16_t volumeMin = 0, volumeMax = 0;
+    uint32_t rate = 0, rateReadback = 0;
+};
+static XhciUacStream g_uac;
+static constexpr uint32_t UAC_DATA_SLOT = 128, UAC_DATA_LEAD = 160, UAC_FB_LEAD = 16, UAC_IOC_EVERY = 8;
+
+static bool XhciUacEventHit(const XhciController& ctrl, const Trb& event)
+{
+    if (!__atomic_load_n(&g_uac.active, __ATOMIC_ACQUIRE) || &ctrl != g_uac.ctrl) return false;
+    const uint32_t slot = event.control >> 24, dci = (event.control >> 16) & 31;
+    return slot == g_uac.slotId && (dci == g_uac.dataDci || dci == g_uac.fbDci);
+}
+
+static uint64_t XhciUacSeqFor(const Trb* ring, uint64_t ringPhys, const uint64_t* seq, uint64_t param, bool& ok)
+{
+    (void)ring;
+    ok = param >= ringPhys && param < ringPhys + (XFER_RING_SIZE - 1) * sizeof(Trb) && !((param - ringPhys) % sizeof(Trb));
+    return ok ? seq[(param - ringPhys) / sizeof(Trb)] : 0;
+}
+
+// Event ring context (IRQ or poll, g_eventRingLock held): bookkeeping only.
+static void XhciUacEvent(const Trb& event)
+{
+    auto& s = g_uac;
+    const uint32_t cc = event.status >> 24, dci = (event.control >> 16) & 31;
+    bool ok = false;
+    if (dci == s.dataDci) {
+        __atomic_fetch_add(&s.dataEvents, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&s.ccCount[cc & 31], 1, __ATOMIC_RELAXED);
+        if (cc == 14 || cc == 15) { __atomic_fetch_add(&s.underruns, 1, __ATOMIC_RELAXED); s.resync = true; return; }
+        if (cc == 23) __atomic_fetch_add(&s.missed, 1, __ATOMIC_RELAXED);
+        else if (cc != TRB_CC_SUCCESS && cc != TRB_CC_SHORT_PACKET) s.lastBadCc = cc;
+        const uint64_t seq = XhciUacSeqFor(s.dataRing, s.dataRingPhys, s.dataSeq, event.param, ok);
+        if (ok && seq + 1 > s.completedHw) __atomic_store_n(&s.completedHw, seq + 1, __ATOMIC_RELEASE);
+        if (ok && seq + 1 > s.completed) __atomic_store_n(&s.completed, seq + 1, __ATOMIC_RELEASE);
+        return;
+    }
+    __atomic_fetch_add(&s.fbEvents, 1, __ATOMIC_RELAXED);
+    const uint64_t seq = XhciUacSeqFor(s.fbRing, s.fbRingPhys, s.fbSeq, event.param, ok);
+    if (!ok) return;
+    if (seq + 1 > s.fbCompleted) __atomic_store_n(&s.fbCompleted, seq + 1, __ATOMIC_RELEASE);
+    if (cc != TRB_CC_SUCCESS && cc != TRB_CC_SHORT_PACKET) { s.lastBadCc = cc; return; }
+    const uint32_t residue = event.status & 0xffffff;
+    const uint32_t bytes = residue <= 4 ? 4 - residue : 0;
+    const uint8_t* p = s.fbBuf + ((event.param - s.fbRingPhys) / sizeof(Trb)) * 16;
+    if (bytes >= 3) {
+        s.lastFbRaw = uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 | (bytes > 3 ? uint32_t(p[3]) << 24 : 0);
+        s.lastFbBytes = bytes;
+        __atomic_fetch_add(&s.fbValues, 1, __ATOMIC_RELEASE);
+    }
+}
+
+// Producer side (stream thread only). One TRB per TD; Link TRBs wrap the ring.
+static Trb& XhciUacSlot(Trb* ring, uint32_t& enq, bool& cycle, uint32_t& index)
+{
+    if (enq >= XFER_RING_SIZE - 1) {
+        ring[XFER_RING_SIZE - 1].control = TRB_TYPE_LINK | TRB_TC | (cycle ? TRB_CYCLE : 0);
+        cycle = !cycle; enq = 0;
+    }
+    index = enq++;
+    return ring[index];
+}
+
+static void XhciUacQueueData()
+{
+    auto& s = g_uac;
+    uint32_t index = 0;
+    Trb& trb = XhciUacSlot(s.dataRing, s.dataEnq, s.dataCycle, index);
+    const uint32_t frames = s.pacer.Next();
+    uint8_t* out = s.dataBuf + index * UAC_DATA_SLOT;
+    for (uint32_t f = 0; f < frames; ++f) {
+        const int16_t v = s.tone.Active() ? s.tone.NextSample() : 0;
+        for (uint32_t c = 0; c < s.desc.channels; ++c) {
+            const int16_t sample = c < 2 ? v : 0;
+            uint8_t* q = out + f * s.frameBytes + c * s.desc.subslot;
+            q[0] = uint8_t(sample); q[1] = uint8_t(uint16_t(sample) >> 8);
+        }
+    }
+    const uint64_t seq = s.produced;
+    s.dataSeq[index] = seq;
+    trb.param = s.dataBufPhys + index * UAC_DATA_SLOT;
+    trb.status = XhciIsochStatus(frames * s.frameBytes);
+    __atomic_store_n(&trb.control, XhciIsochControl(s.dataCycle, seq % UAC_IOC_EVERY == UAC_IOC_EVERY - 1, true),
+                     __ATOMIC_RELEASE);
+    s.framesSent += frames;
+    __atomic_store_n(&s.produced, seq + 1, __ATOMIC_RELEASE);
+}
+
+static void XhciUacQueueFeedback()
+{
+    auto& s = g_uac;
+    uint32_t index = 0;
+    Trb& trb = XhciUacSlot(s.fbRing, s.fbEnq, s.fbCycle, index);
+    const uint64_t seq = s.fbProduced;
+    s.fbSeq[index] = seq;
+    trb.param = s.fbBufPhys + index * 16;
+    trb.status = XhciIsochStatus(s.desc.feedbackMaxPacket & 0x7ff);
+    __atomic_store_n(&trb.control, XhciIsochControl(s.fbCycle, true, true), __ATOMIC_RELEASE);
+    __atomic_store_n(&s.fbProduced, seq + 1, __ATOMIC_RELEASE);
+}
+
+static void XhciUacThread(void*)
+{
+    auto& s = g_uac;
+    uint32_t seenFb = 0;
+    s.running = true;
+    while (!s.stopRequested && !g_devices[s.device].gone) {
+        if (s.resync) {
+            s.resync = false; ++s.resyncs;
+            __atomic_store_n(&s.completed, s.produced, __ATOMIC_RELEASE);
+        }
+        const uint32_t values = __atomic_load_n(&s.fbValues, __ATOMIC_ACQUIRE);
+        if (values != seenFb) { seenFb = values; (void)s.pacer.Feed(s.lastFbRaw, s.lastFbBytes); }
+        if (s.toneRequested && !s.tone.Active() && !s.toneStartTick) {
+            s.tone.Start(440, s.rate, s.rate, s.rate / 100, 8192); // 1 s, 10 ms fades, -12 dBFS
+            s.toneStartTick = ApicTickCount();
+        }
+        bool fb = false, data = false;
+        while (s.fbProduced - __atomic_load_n(&s.fbCompleted, __ATOMIC_ACQUIRE) < UAC_FB_LEAD) { XhciUacQueueFeedback(); fb = true; }
+        // A resync after an underrun trusts the ring is empty; the event-only
+        // bound keeps a stale underrun report from overrunning queued TDs.
+        while (s.produced - __atomic_load_n(&s.completed, __ATOMIC_ACQUIRE) < UAC_DATA_LEAD &&
+               s.produced - __atomic_load_n(&s.completedHw, __ATOMIC_ACQUIRE) < XFER_RING_SIZE - 16) { XhciUacQueueData(); data = true; }
+        __asm__ volatile("mfence" ::: "memory");
+        if (fb) XhciRingDoorbell(*s.ctrl, s.slotId, s.fbDci);
+        if (data) XhciRingDoorbell(*s.ctrl, s.slotId, s.dataDci);
+        if (s.toneStartTick && !s.toneEndTick && !s.tone.Active()) { s.toneEndTick = ApicTickCount(); s.toneDone = true; }
+        SchedulerSleepMs(1);
+    }
+    s.running = false;
+}
+
+static bool XhciUacControl(XhciDevice& dev, uint8_t type, uint8_t request, uint16_t value, uint16_t index,
+                           const void* out, uint32_t length, void* in = nullptr)
+{
+    UsbSetupPacket setup{};
+    setup.bmRequestType = type; setup.bRequest = request; setup.wValue = value; setup.wIndex = index;
+    setup.wLength = uint16_t(length);
+    if (length && out) memcpy(dev.scratch, out, length);
+    const bool ok = XhciControlTransfer(*dev.ctrl, dev, setup, length ? dev.scratch : nullptr, length,
+                                        length ? dev.scratchPhys : 0, length ? ((type & 0x80) ? 3 : 2) : 0);
+    if (ok && in && length) memcpy(in, dev.scratch, length);
+    return ok;
+}
+
+static bool XhciUacSetVolume(XhciDevice& dev, int16_t q8)
+{
+    auto& s = g_uac;
+    bool ok = true;
+    for (uint32_t ch = 0; ch <= s.desc.featureChannels && ch < 32; ++ch) {
+        if (!(s.desc.featureVolumeMask & (1u << ch))) continue;
+        ok &= XhciUacControl(dev, 0x21, 1, uint16_t(0x0200 | ch), uint16_t(s.desc.featureId << 8 | s.desc.controlInterface),
+                             &q8, 2);
+    }
+    return ok;
+}
+
+// Configure Endpoint adding (or dropping) the data and feedback endpoints.
+static uint32_t XhciUacConfigureEndpoints(XhciController& ctrl, XhciDevice& dev, bool add)
+{
+    auto& s = g_uac;
+    const uint32_t ctxSize = CtxEntrySize(ctrl);
+    auto* input = static_cast<uint8_t*>(dev.inputCtx);
+    memset(input, 0, ctxSize * 33);
+    auto* icc = reinterpret_cast<uint32_t*>(input);
+    const uint32_t flags = (1u << s.dataDci) | (1u << s.fbDci);
+    if (add) icc[1] = 1u | flags; else { icc[0] = flags; icc[1] = 1u; }
+    auto* slotCtx = reinterpret_cast<uint32_t*>(input + ctxSize);
+    const auto* outSlot = reinterpret_cast<const uint32_t*>(dev.outputCtx);
+    for (int i = 0; i < 4; ++i) slotCtx[i] = outSlot[i];
+    const uint32_t maxDci = s.dataDci > s.fbDci ? s.dataDci : s.fbDci;
+    if (add && maxDci > ((slotCtx[0] >> 27) & 31)) slotCtx[0] = (slotCtx[0] & ~(0x1Fu << 27)) | (maxDci << 27);
+    if (add) {
+        struct { uint32_t dci; bool in; uint8_t interval; uint16_t packet; uint32_t average; uint64_t ring; } eps[2] = {
+            {s.dataDci, false, s.desc.dataInterval, s.desc.dataMaxPacket, 6u * s.frameBytes, s.dataRingPhys},
+            {s.fbDci, true, s.desc.feedbackInterval, s.desc.feedbackMaxPacket, 4u, s.fbRingPhys}};
+        for (const auto& e : eps) {
+            auto* ep = reinterpret_cast<uint32_t*>(input + ctxSize * (e.dci + 1));
+            const auto words = XhciIsochContext(e.in, e.interval, e.packet, e.average);
+            ep[0] = words.dw0; ep[1] = words.dw1;
+            ep[2] = uint32_t(e.ring | 1); ep[3] = uint32_t(e.ring >> 32); ep[4] = words.dw4;
+        }
+    }
+    __asm__ volatile("mfence" ::: "memory");
+    return XhciSlotCommand(ctrl, dev.inputCtxPhys, TRB_TYPE_CONFIG_EP | (dev.slotId << 24), 2000);
+}
+
+static uint32_t XhciUacEpState(uint32_t dci)
+{
+    auto& dev = g_devices[g_uac.device];
+    if (!g_uac.ctrl || !dev.outputCtx) return 0;
+    const auto* ep = reinterpret_cast<const volatile uint32_t*>(static_cast<uint8_t*>(dev.outputCtx) +
+                                                               CtxEntrySize(*g_uac.ctrl) * dci);
+    return ep[0] & 7;
+}
+
+static void XhciUacStatus(XhciText& t)
+{
+    auto& s = g_uac;
+    t.s("uac active="); t.u(s.active); t.s(" running="); t.u(s.running);
+    if (!s.ctrl) { t.nl(); return; }
+    t.s(" dev="); t.u(s.device); t.s(" slot="); t.u(s.slotId); t.s(" if="); t.u(s.desc.streamInterface);
+    t.s(" alt="); t.u(s.desc.alternate); t.s(" rate="); t.u(s.rate); t.s(" readback="); t.u(s.rateReadback);
+    t.s(" ep_state data="); t.u(XhciUacEpState(s.dataDci)); t.s(" fb="); t.u(XhciUacEpState(s.fbDci)); t.nl();
+    t.s("data produced="); t.u(s.produced); t.s(" completed="); t.u(s.completed); t.s(" events="); t.u(s.dataEvents);
+    t.s(" frames="); t.u(s.framesSent); t.s(" underruns="); t.u(s.underruns); t.s(" missed="); t.u(s.missed);
+    t.s(" resyncs="); t.u(s.resyncs); t.s(" last_bad_cc="); t.u(s.lastBadCc); t.s(" cc:");
+    for (uint32_t i = 0; i < 32; ++i) if (s.ccCount[i]) { t.c(' '); t.u(i); t.c('='); t.u(s.ccCount[i]); }
+    t.nl();
+    t.s("feedback produced="); t.u(s.fbProduced); t.s(" completed="); t.u(s.fbCompleted); t.s(" events="); t.u(s.fbEvents);
+    t.s(" values="); t.u(s.fbValues); t.s(" raw="); t.x(s.lastFbRaw, 8); t.s(" bytes="); t.u(s.lastFbBytes);
+    t.s(" pacer="); t.x(s.pacer.current, 8); t.s(" nominal="); t.x(s.pacer.nominal, 8);
+    t.s(" accepted="); t.u(s.pacer.accepted); t.s(" rejected="); t.u(s.pacer.rejected); t.nl();
+    t.s("tone start_tick="); t.u(s.toneStartTick); t.s(" end_tick="); t.u(s.toneEndTick);
+    t.s(" now="); t.u(ApicTickCount()); t.nl();
+}
+
+static bool XhciUacFindDevice(uint32_t& index)
+{
+    const uint32_t count = __atomic_load_n(&g_deviceCount, __ATOMIC_ACQUIRE);
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto& d = g_devices[i];
+        if (!d.gone && d.ctrl && d.rawConfig && d.scratch && !d.isHub && !d.isKeyboard && !d.isMouse &&
+            !d.isMassStorage && !d.ecm.value && d.vendorId == 0x2708 && d.productId == 0x0006) { index = i; return true; }
+    }
+    return false;
+}
+
+static void XhciUacStart(XhciText& t)
+{
+    auto& s = g_uac;
+    if (s.active) { t.s("already active\n"); return; }
+    uint32_t index = 0;
+    if (!XhciUacFindDevice(index)) { t.s("no EVO4 (2708:0006) present\n"); return; }
+    auto& dev = g_devices[index];
+    Uac2Playback desc{};
+    if (!Uac2ParsePlayback(dev.rawConfig, dev.rawConfigLen, 16, desc)) { t.s("no 16-bit UAC2 playback alternate\n"); return; }
+    if (!s.dataRing && !XhciAllocTransferRing(s.dataRing, s.dataRingPhys, s.dataEnq, s.dataCycle)) { t.s("ring alloc\n"); return; }
+    if (!s.fbRing && !XhciAllocTransferRing(s.fbRing, s.fbRingPhys, s.fbEnq, s.fbCycle)) { t.s("ring alloc\n"); return; }
+    if (!s.dataBuf && !(s.dataBuf = static_cast<uint8_t*>(AllocDmaBuffer(8, s.dataBufPhys)))) { t.s("buffer alloc\n"); return; }
+    if (!s.fbBuf && !(s.fbBuf = static_cast<uint8_t*>(AllocDmaBuffer(1, s.fbBufPhys)))) { t.s("buffer alloc\n"); return; }
+    // Fresh rings each start: zero, re-link, producer cycle one.
+    memset(s.dataRing, 0, XFER_RING_SIZE * sizeof(Trb)); XhciInitializeLink(s.dataRing[XFER_RING_SIZE - 1], s.dataRingPhys);
+    memset(s.fbRing, 0, XFER_RING_SIZE * sizeof(Trb)); XhciInitializeLink(s.fbRing[XFER_RING_SIZE - 1], s.fbRingPhys);
+    s.dataEnq = s.fbEnq = 0; s.dataCycle = s.fbCycle = true;
+    s.ctrl = dev.ctrl; s.device = index; s.slotId = dev.slotId; s.desc = desc;
+    s.dataDci = (desc.dataEp & 15) * 2; s.fbDci = (desc.feedbackEp & 15) * 2 + 1;
+    s.frameBytes = uint32_t(desc.channels) * desc.subslot;
+    s.completedHw = 0;
+    s.produced = s.completed = s.fbProduced = s.fbCompleted = s.framesSent = 0;
+    s.dataEvents = s.fbEvents = s.underruns = s.missed = s.resyncs = s.fbValues = s.lastBadCc = 0;
+    for (auto& c : s.ccCount) c = 0;
+    s.stopRequested = s.resync = s.toneRequested = s.toneDone = false; s.toneStartTick = s.toneEndTick = 0;
+    s.rate = 48000;
+
+    // Playback volume range (feature unit), then the clock rate.
+    uint8_t range[8]{};
+    const uint16_t fuIndex = uint16_t(desc.featureId << 8 | desc.controlInterface);
+    if (!XhciUacControl(dev, 0xa1, 2, 0x0201, fuIndex, nullptr, 8, range)) { t.s("volume range read failed\n"); return; }
+    s.volumeMin = int16_t(range[2] | range[3] << 8); s.volumeMax = int16_t(range[4] | range[5] << 8);
+    if (!XhciUacSetVolume(dev, s.volumeMin)) { t.s("volume set (minimum) failed\n"); return; }
+    const uint16_t clockIndex = uint16_t(desc.clockId << 8 | desc.controlInterface);
+    const uint32_t rate = s.rate; uint32_t readback = 0;
+    if (!XhciUacControl(dev, 0x21, 1, 0x0100, clockIndex, &rate, 4)) { t.s("SET_CUR sample rate failed\n"); return; }
+    (void)XhciUacControl(dev, 0xa1, 1, 0x0100, clockIndex, nullptr, 4, &readback);
+    s.rateReadback = readback;
+    s.pacer.Start(s.rate, 8000, (desc.dataMaxPacket & 0x7ff) / s.frameBytes);
+
+    const uint32_t cc = XhciUacConfigureEndpoints(*dev.ctrl, dev, true);
+    if (cc != TRB_CC_SUCCESS) { t.s("Configure Endpoint failed cc="); t.u(cc); t.nl(); return; }
+    if (!XhciUacControl(dev, 0x01, 11, desc.alternate, desc.streamInterface, nullptr, 0)) {
+        (void)XhciUacConfigureEndpoints(*dev.ctrl, dev, false); t.s("SET_INTERFACE failed\n"); return;
+    }
+    __atomic_store_n(&s.active, true, __ATOMIC_RELEASE);
+    if (!KernelWorkerStart("uac_stream", XhciUacThread, nullptr)) {
+        s.active = false;
+        (void)XhciUacControl(dev, 0x01, 11, 0, desc.streamInterface, nullptr, 0);
+        (void)XhciUacConfigureEndpoints(*dev.ctrl, dev, false);
+        t.s("worker queue full\n"); return;
+    }
+    KPrintf("uac: EVO4 stream started if%u alt%u %u Hz (readback %u) volume min %d/256 dB\n", desc.streamInterface,
+            desc.alternate, s.rate, readback, int(s.volumeMin));
+    t.s("started\n");
+}
+
+static void XhciUacStop(XhciText& t)
+{
+    auto& s = g_uac;
+    if (!s.active) { t.s("not active\n"); return; }
+    s.stopRequested = true;
+    for (uint32_t i = 0; i < 200 && s.running; ++i) SchedulerSleepMs(1);
+    auto& dev = g_devices[s.device];
+    if (!dev.gone) {
+        (void)XhciUacSetVolume(dev, s.volumeMin);
+        (void)XhciUacControl(dev, 0x01, 11, 0, s.desc.streamInterface, nullptr, 0);
+        const uint32_t dcis[2] = {s.dataDci, s.fbDci};
+        for (uint32_t dci : dcis)
+            (void)XhciSlotCommand(*s.ctrl, 0, TRB_TYPE_STOP_EP | (s.slotId << 24) | (dci << 16));
+        const uint32_t cc = XhciUacConfigureEndpoints(*s.ctrl, dev, false);
+        t.s("drop cc="); t.u(cc); t.nl();
+    }
+    __atomic_store_n(&s.active, false, __ATOMIC_RELEASE);
+    KPrintf("uac: EVO4 stream stopped (produced %u, underruns %u, missed %u)\n", unsigned(s.produced),
+            unsigned(s.underruns), unsigned(s.missed));
+    t.s("stopped\n");
+}
+
+static void XhciUacTone(XhciText& t, const char* p)
+{
+    auto& s = g_uac;
+    if (!s.active || !s.running) { t.s("stream not running\n"); return; }
+    while (*p == ' ') ++p;
+    bool negative = false; if (*p == '-') { negative = true; ++p; }
+    int dB = 0; while (*p >= '0' && *p <= '9') dB = dB * 10 + (*p++ - '0');
+    if (negative) dB = -dB;
+    while (*p == ' ') ++p;
+    const bool audible = XhciArgIs(p, "audible");
+    bool muted = false;
+    if (auto* marker = VfsOpen("/etc/audio-muted")) { VfsClose(marker); muted = true; }
+    if (dB > -20 || dB < -90) { t.s("refused: level must be -90..-20 dB\n"); return; }
+    if (muted && !audible) { t.s("refused: audio-muted marker present; append 'audible'\n"); return; }
+    auto& dev = g_devices[s.device];
+    const int16_t level = Uac2VolumeQ8(dB, s.volumeMin, s.volumeMax);
+    s.toneStartTick = s.toneEndTick = 0; s.toneDone = false;
+    const uint64_t volumeTick = ApicTickCount();
+    if (!XhciUacSetVolume(dev, level)) { (void)XhciUacSetVolume(dev, s.volumeMin); t.s("volume set failed\n"); return; }
+    KPrintf("uac: EVO4 volume %d dB at tick %u; 440 Hz tone for 1 s\n", dB, unsigned(volumeTick));
+    s.toneRequested = true;
+    for (uint32_t i = 0; i < 2500 && !s.toneDone; ++i) SchedulerSleepMs(1);
+    s.toneRequested = false;
+    SchedulerSleepMs(30); // let the queued tail (stream lead ~12 ms) drain
+    const bool restored = XhciUacSetVolume(dev, s.volumeMin);
+    const uint64_t restoreTick = ApicTickCount();
+    KPrintf("uac: EVO4 tone generated ticks %u..%u, volume back to minimum at %u (%s)\n", unsigned(s.toneStartTick),
+            unsigned(s.toneEndTick), unsigned(restoreTick), restored ? "ok" : "FAILED");
+    t.s("tone volume_tick="); t.u(volumeTick); t.s(" start="); t.u(s.toneStartTick); t.s(" end="); t.u(s.toneEndTick);
+    t.s(" restore="); t.u(restoreTick); t.s(restored ? " restored\n" : " RESTORE FAILED\n");
+}
+
+static uint32_t XhciUacCommand(const char* p, XhciText& t)
+{
+    while (*p == ' ') ++p;
+    if (XhciArgIs(p, "usb")) while (*p == ' ') ++p;
+    if (!*p || XhciArgIs(p, "status")) XhciUacStatus(t);
+    else if (XhciArgIs(p, "start")) { XhciUacStart(t); XhciUacStatus(t); }
+    else if (XhciArgIs(p, "stop")) { XhciUacStop(t); XhciUacStatus(t); }
+    else if (XhciArgIs(p, "tone")) { XhciUacTone(t, p); XhciUacStatus(t); }
+    else t.s("usage: bridge hardware audio usb [status|start|stop|tone <dB> audible]");
     return t.len;
 }
 
