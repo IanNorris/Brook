@@ -4117,6 +4117,8 @@ struct XhciUacStream {
     volatile uint64_t produced = 0, completed = 0, fbProduced = 0, fbCompleted = 0, framesSent = 0;
     volatile uint32_t dataEvents = 0, fbEvents = 0, underruns = 0, missed = 0, resyncs = 0, fbValues = 0;
     volatile uint32_t lastFbRaw = 0, lastFbBytes = 0, lastBadCc = 0;
+    volatile uint64_t underrunTick[4]{};
+    volatile uint64_t maxLoopGap = 0, lastLoop = 0;
     volatile uint32_t ccCount[32]{};
     volatile bool active = false, running = false, stopRequested = false, resync = false;
     volatile bool toneRequested = false, toneDone = false;
@@ -4128,7 +4130,7 @@ struct XhciUacStream {
     uint32_t rate = 0, rateReadback = 0;
 };
 static XhciUacStream g_uac;
-static constexpr uint32_t UAC_DATA_SLOT = 128, UAC_DATA_LEAD = 160, UAC_FB_LEAD = 16, UAC_IOC_EVERY = 8;
+static constexpr uint32_t UAC_DATA_SLOT = 128, UAC_DATA_LEAD = 224, UAC_FB_LEAD = 16, UAC_IOC_EVERY = 8;
 
 static bool XhciUacEventHit(const XhciController& ctrl, const Trb& event)
 {
@@ -4153,7 +4155,10 @@ static void XhciUacEvent(const Trb& event)
     if (dci == s.dataDci) {
         __atomic_fetch_add(&s.dataEvents, 1, __ATOMIC_RELAXED);
         __atomic_fetch_add(&s.ccCount[cc & 31], 1, __ATOMIC_RELAXED);
-        if (cc == 14 || cc == 15) { __atomic_fetch_add(&s.underruns, 1, __ATOMIC_RELAXED); s.resync = true; return; }
+        if (cc == 14 || cc == 15) {
+            const uint32_t n = __atomic_fetch_add(&s.underruns, 1, __ATOMIC_RELAXED);
+            s.underrunTick[n & 3] = ApicTickCount(); s.resync = true; return;
+        }
         if (cc == 23) __atomic_fetch_add(&s.missed, 1, __ATOMIC_RELAXED);
         else if (cc != TRB_CC_SUCCESS && cc != TRB_CC_SHORT_PACKET) s.lastBadCc = cc;
         const uint64_t seq = XhciUacSeqFor(s.dataRing, s.dataRingPhys, s.dataSeq, event.param, ok);
@@ -4251,6 +4256,9 @@ static void XhciUacThread(void*)
         if (fb) XhciRingDoorbell(*s.ctrl, s.slotId, s.fbDci);
         if (data) XhciRingDoorbell(*s.ctrl, s.slotId, s.dataDci);
         if (s.toneStartTick && !s.toneEndTick && !s.tone.Active()) { s.toneEndTick = ApicTickCount(); s.toneDone = true; }
+        const uint64_t now = ApicTickCount();
+        if (s.lastLoop && now - s.lastLoop > s.maxLoopGap) s.maxLoopGap = now - s.lastLoop;
+        s.lastLoop = now;
         SchedulerSleepMs(1);
     }
     s.running = false;
@@ -4337,7 +4345,8 @@ static void XhciUacStatus(XhciText& t)
     t.s(" ep_state data="); t.u(XhciUacEpState(s.dataDci)); t.s(" fb="); t.u(XhciUacEpState(s.fbDci)); t.nl();
     t.s("data produced="); t.u(s.produced); t.s(" completed="); t.u(s.completed); t.s(" events="); t.u(s.dataEvents);
     t.s(" frames="); t.u(s.framesSent); t.s(" underruns="); t.u(s.underruns); t.s(" missed="); t.u(s.missed);
-    t.s(" resyncs="); t.u(s.resyncs); t.s(" last_bad_cc="); t.u(s.lastBadCc); t.s(" cc:");
+    t.s(" resyncs="); t.u(s.resyncs); t.s(" max_loop_gap_ms="); t.u(s.maxLoopGap); t.s(" underrun_ticks=");
+    for (uint32_t i = 0; i < 4; ++i) { if (i) t.c(','); t.u(s.underrunTick[i]); } t.s(" last_bad_cc="); t.u(s.lastBadCc); t.s(" cc:");
     for (uint32_t i = 0; i < 32; ++i) if (s.ccCount[i]) { t.c(' '); t.u(i); t.c('='); t.u(s.ccCount[i]); }
     t.nl();
     t.s("feedback produced="); t.u(s.fbProduced); t.s(" completed="); t.u(s.fbCompleted); t.s(" events="); t.u(s.fbEvents);
@@ -4385,6 +4394,8 @@ static void XhciUacStart(XhciText& t)
     s.produced = s.completed = s.fbProduced = s.fbCompleted = s.framesSent = 0;
     s.dataEvents = s.fbEvents = s.underruns = s.missed = s.resyncs = s.fbValues = s.lastBadCc = 0;
     for (auto& c : s.ccCount) c = 0;
+    for (auto& u : s.underrunTick) u = 0;
+    s.maxLoopGap = s.lastLoop = 0;
     s.stopRequested = s.resync = s.toneRequested = s.toneDone = false; s.toneStartTick = s.toneEndTick = 0;
     s.rate = 48000;
 
