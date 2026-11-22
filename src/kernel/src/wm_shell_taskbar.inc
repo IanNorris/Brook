@@ -763,6 +763,13 @@ static bool WmTrayFlyoutLive(TaskbarPopup popup)
     return ThermalReadSnapshot(snap) && snap.latest.pkgC >= 0;
 }
 
+// Temperature flyout power rows; depends only on per-boot facts (RAPL
+// reported, balance compiled in), so the flyout height stays fixed.
+static unsigned WmTrayFlyoutPowerRows(TaskbarPopup popup)
+{
+    return popup == TaskbarPopup::Network ? 0 : ChromePowerRows(WmPowerModel());
+}
+
 static DesktopRect WmTrayFlyoutLayout(uint32_t sw, uint32_t sh, TaskbarPopup popup)
 {
     if (popup == TaskbarPopup::None || WmTaskbarHidden()) return {};
@@ -776,7 +783,8 @@ static DesktopRect WmTrayFlyoutLayout(uint32_t sw, uint32_t sh, TaskbarPopup pop
     if (!anchor.w && g_taskbarPopupPin.Is(popup))
         anchor = {int(sw) - int(WmMetric(16)), l.y, int(WmMetric(16)), 1};
     const int gap = WmMetric(ChromeShellMetrics::PanelMargin);
-    const int h = ChromeTrayFlyoutHeight(WmChromeStyle(), popup == TaskbarPopup::Network, WmTrayFlyoutLive(popup));
+    const int h = ChromeTrayFlyoutHeight(WmChromeStyle(), popup == TaskbarPopup::Network, WmTrayFlyoutLive(popup),
+                                         WmTrayFlyoutPowerRows(popup));
     if (!anchor.w || l.y < h + 2 * gap || sw < WmMetric(180)) return {};
     // 304 wide, centred on its tray target and kept 8 px from the screen
     // edge and the taskbar (as the prototype's fly()).
@@ -1104,7 +1112,15 @@ static void WmCaptureTrayFlyout(const WmShellSurface& surface, uint32_t sw, uint
     snapshot.network = network;
     snapshot.networkConnected = address != 0;
     const auto source = WmTelemetryModel(false, !network);
-    if (!network) WmCaptureThermal(snapshot.telemetry, source, true);
+    if (!network) {
+        WmCaptureThermal(snapshot.telemetry, source, true);
+        // Rows the rect was not sized for (PL1 first published after the
+        // layout ran) wait for the next frame rather than overflow the panel.
+        const auto power = WmPowerModel();
+        if (snapshot.telemetry.thermal &&
+            ChromeTrayFlyoutHeight(WmChromeStyle(), false, true, ChromePowerRows(power)) == rect.h)
+            snapshot.telemetry.power = power;
+    }
     else if (snapshot.networkConnected) {
         snapshot.telemetry.stats.downBytesPerSecond = WmShellRate(source.stats.downBytesPerSecond);
         snapshot.telemetry.stats.upBytesPerSecond = WmShellRate(source.stats.upBytesPerSecond);

@@ -41,9 +41,17 @@ int main() {
     const auto disabled = ThermalDecodeRaplPackageLimits(0, 0);
     assert(!disabled.pl1.enabled && !disabled.pl2.enabled && !disabled.locked);
     assert(!disabled.pl1.powerUw && !disabled.pl1.clamp && disabled.pl1.timeWindowUs == 1000000);
+    // Flyout publication: enabled limits in mW, disabled halves read 0.
+    const uint64_t packed = ThermalPackRaplLimitsMw(limits);
+    assert(uint32_t(packed) == 15000 && uint32_t(packed >> 32) == 25000);
+    assert(ThermalPackRaplLimitsMw(disabled) == 0);
+    auto pl2Off = limits;
+    pl2Off.pl2.enabled = false;
+    assert(ThermalPackRaplLimitsMw(pl2Off) == 15000);
     const auto longest = ThermalDecodeRaplPackageLimits(0, 0x00ffffff);
     assert(longest.pl1.powerUw == 32767000000ull);
     assert(longest.pl1.timeWindowUs == (1750000ull << 31));
+    assert(uint32_t(ThermalPackRaplLimitsMw(longest)) == 32767000u);
 
     // Frequency and C0 residency.
     assert(ThermalMhz(3000, 2000, 2200) == 3300);

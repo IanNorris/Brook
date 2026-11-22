@@ -159,6 +159,7 @@ void ShellServiceQueueTrayInput(const TrayInput& event) {
     fixtureLastTrayInput = event;
 }
 bool ThermalReadSnapshot(ThermalSnapshot&) { return false; }
+ThermalBalanceStatus ThermalBalanceRead() { return {}; }
 static uint32_t fixtureDiskVolumes;
 void DesktopDiskWorkerStart() {}
 static uint32_t fixtureCpuCount = 4;

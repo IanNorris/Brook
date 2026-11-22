@@ -77,6 +77,15 @@ inline ThermalRaplPackageLimits ThermalDecodeRaplPackageLimits(uint64_t unitMsr,
             ThermalDecodeRaplLimit(uint32_t(limitMsr >> 32), units), (limitMsr >> 63) != 0};
 }
 
+// Enabled PL1 | PL2 << 32 in mW for one atomic publication (0 = disabled).
+inline uint64_t ThermalPackRaplLimitsMw(const ThermalRaplPackageLimits& l) {
+    auto mw = [](const ThermalRaplLimit& v) -> uint64_t {
+        const uint64_t m = v.enabled ? v.powerUw / 1000 : 0;
+        return m > 0xffffffffull ? 0xffffffffull : m;
+    };
+    return mw(l.pl1) | (mw(l.pl2) << 32);
+}
+
 // Average frequency while in C0 = base * dAPERF / dMPERF.
 inline uint32_t ThermalMhz(uint64_t daperf, uint64_t dmperf, uint32_t baseMhz) {
     if (!dmperf || !baseMhz) return 0;

@@ -130,6 +130,35 @@ static void WmCaptureThermal(ChromeShellTelemetry& out, const ChromeTelemetryMod
     } else if (out.rapl) out.latest.pkgMw = source.latest.pkgMw / 100 * 100;
 }
 
+// Temperature flyout power rows: RAPL limits and the balance controller's
+// current caps. Copies owned values only (the shell draws the snapshot).
+static ChromePowerModel WmPowerModel() {
+    ChromePowerModel out{};
+    ThermalSnapshot snap{};
+    if (ThermalReadSnapshot(snap) && snap.rapl) { out.pl1Mw = snap.pl1Mw; out.pl2Mw = snap.pl2Mw; }
+    const auto b = ThermalBalanceRead();
+    if (!b.available) return out;
+    using M = ChromeBalanceMode;
+    const auto& st = b.state;
+    out.mode = b.enabled ? (!b.ownerActive ? M::Starting : st.mode == BalanceMode::Heavy ? M::Heavy :
+                            st.idle ? M::Idle : M::Light)
+                         : b.autoState.optedOut ? M::OptedOut : M::Off;
+    out.gpuMhz = snap.latest.gpuMhz;
+    if (!b.enabled) return out;
+    out.targetMw = b.config.pkgLimitMw;
+    out.capRatio = static_cast<uint8_t>(b.appliedCap > 0xff ? 0xff : b.appliedCap);
+    if (b.ownerActive && b.lastSampleAt) {
+        const auto& l = b.limits;
+        uint32_t top = l.gpuBaseMhz;
+        if (out.mode == M::Heavy)
+            top = st.gpuCeilingMhz && st.gpuCeilingMhz < l.gpuMaxMhz
+                ? (st.gpuCeilingMhz > l.gpuBaseMhz ? st.gpuCeilingMhz : l.gpuBaseMhz) : l.gpuMaxMhz;
+        else if (out.mode == M::Idle && l.gpuIdleMhz) top = l.gpuIdleMhz;
+        out.gpuTopMhz = static_cast<uint16_t>(top > 0xffff ? 0xffff : top);
+    }
+    return out;
+}
+
 static void WmCaptureHudCadence(ChromeShellTelemetry& out, const ChromePerformanceHudModel& hud) {
     out.hasCompositor = out.hasApp = true;
     WmCaptureCadence(out.compositor, *hud.telemetry.compositor, hud.tick);

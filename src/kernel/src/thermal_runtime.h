@@ -46,6 +46,9 @@ ThermalBalanceStatus ThermalBalanceRead();
 struct ThermalSnapshot {
     bool available = false, rapl = false, aperf = false;
     uint32_t tjmax = 0, baseMhz = 0, cpuCount = 0;
+    // RAPL package limits (MSR 0x610, re-read each package sample): PL1
+    // sustained and PL2 burst in mW; 0 = not reported or disabled.
+    uint32_t pl1Mw = 0, pl2Mw = 0;
     uint64_t samples = 0, misplaced = 0; // misplaced = per-CPU reads skipped off their CPU
     ThermalSample latest{};
     ThermalMaxima maxima{};

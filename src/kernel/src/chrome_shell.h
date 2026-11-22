@@ -92,6 +92,22 @@ struct ChromeTaskbarButton {
     bool hasWindow = false;
 };
 
+// Power and clock limits for the Temperature flyout (owned values).
+enum class ChromeBalanceMode : uint8_t { Unavailable, Off, OptedOut, Starting, Light, Heavy, Idle };
+struct ChromePowerModel {
+    uint32_t pl1Mw, pl2Mw;    // RAPL package sustained/burst limits (0 = not reported)
+    uint32_t targetMw;        // balance package budget while it runs (0 = none)
+    ChromeBalanceMode mode;   // Unavailable: no balance controller in this kernel
+    uint8_t capRatio;         // applied CPU ratio cap (x100 MHz, 0 = released)
+    uint16_t gpuMhz;          // render clock a recent job saw (0 = idle)
+    uint16_t gpuTopMhz;       // the controller's current render ceiling (0 = unknown)
+};
+// Rows the flyout adds for `power`; fixed for a boot, so the height is stable.
+inline unsigned ChromePowerRows(const ChromePowerModel& p)
+{
+    return (p.pl1Mw ? 1u : 0u) + (p.mode != ChromeBalanceMode::Unavailable ? 3u : 0u);
+}
+
 struct ChromeTelemetryModel {
     DesktopTelemetry stats;
     const DesktopIntervals<>* compositor; // COMP cadence (borrowed)
@@ -102,6 +118,7 @@ struct ChromeTelemetryModel {
     ThermalSample latest;
     const ThermalSample* points;          // 1 s graph points (borrowed)
     uint32_t pointCount;
+    ChromePowerModel power;               // Temperature flyout only
 };
 
 struct ChromeTaskbarModel {
@@ -251,7 +268,8 @@ struct ChromeTrayFlyoutModel {
 };
 DesktopRect ChromeTrayFlyoutPinRect(const ChromeStyle&, DesktopRect);
 // live: the network is connected, or a package temperature is available.
-int ChromeTrayFlyoutHeight(const ChromeStyle& style, bool network, bool live);
+// powerRows: ChromePowerRows() of the Temperature flyout's power model.
+int ChromeTrayFlyoutHeight(const ChromeStyle& style, bool network, bool live, unsigned powerRows = 0);
 void ChromeBuildTrayFlyout(const ChromeTrayFlyoutModel&, const ChromeStyle&, ChromeDisplayList&);
 
 struct ChromeDiskPopupLayout {

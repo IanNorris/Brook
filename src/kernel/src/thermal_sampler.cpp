@@ -73,6 +73,7 @@ ThermalRing<ThermalGraphHistory> g_graph;
 ThermalGraphAccumulator g_accumulator;
 ThermalMaxima g_maxima;
 uint64_t g_samples = 0, g_misplaced = 0;
+uint64_t g_pkgLimits = 0; // atomic: PL1 mW | PL2 mW << 32 (0 = disabled)
 
 bool EpbTrialEligible();
 
@@ -239,6 +240,8 @@ void Publish(PkgPrev& prev) {
             s.gtMw = ThermalEnergyMw(prev.pp1, pp1, unit, us);
         }
         prev.pkg = pkg; prev.pp0 = pp0; prev.pp1 = pp1; prev.tsc = tsc; prev.unit = unit; prev.primed = true;
+        __atomic_store_n(&g_pkgLimits, ThermalPackRaplLimitsMw(ThermalDecodeRaplPackageLimits(unit, ReadMsr(0x610))),
+                         __ATOMIC_RELEASE);
     }
     if (CpuIdleBudgetActive()) {
         CpuBudgetSample b{};
@@ -451,6 +454,9 @@ bool ThermalReadSnapshot(ThermalSnapshot& out) {
     out.samples = g_samples;
     IrqSpinLockRelease(&g_lock, flags);
     out.misplaced = __atomic_load_n(&g_misplaced, __ATOMIC_RELAXED);
+    const uint64_t limits = __atomic_load_n(&g_pkgLimits, __ATOMIC_ACQUIRE);
+    out.pl1Mw = uint32_t(limits);
+    out.pl2Mw = uint32_t(limits >> 32);
     return true;
 }
 
