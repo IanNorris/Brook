@@ -47,19 +47,39 @@ python3 scripts/make_vmware_image.py \
   --recovery-checkers-from /path/to/recovery/INITRD.IMG.gz
 ```
 
-Use `--network nat` if the guest needs external network access. The default
-is host-only. The private operator seed stays on the host. Attach with the
-bridge's explicit `--auth-mode v3` and the matching operator seed. This bridge
-suite authenticates the operator to the guest.
+The persistent image uses NAT by default so the guest can reach external
+networks. For an isolated Workstation acceptance run, build with
+`--network hostonly`. The private operator seed stays on the host. Attach with
+the bridge's explicit `--auth-mode v3` and the matching operator seed. This
+bridge suite authenticates the operator to the guest.
+
+The generated VM has 4 vCPUs on one socket and 8 GiB of memory. Override
+them with `--cpus` and `--memory-mib` (also accepted by
+`scripts/brook_image.py --target vmware`); `manifest.json` records both.
+
+The default app set is Qalculate! (the calculator), Chromium, Files, App
+Gallery and Mousepad, plus the Vim command-line package. Settings, Task
+Manager and Terminal are built into every desktop. Firefox is left out of the
+default image to keep the disk smaller; select it with
+`scripts/brook_image.py --target vmware --apps ...` if needed.
 
 Open the generated `Brook.vmx` in Workstation. It connects one SATA disk and
-an e1000e adapter through a PCIe root port. The disk has a guarded EFI System
-Partition, two desktop slots, recovery boot files and an ext2 data partition.
+an e1000e adapter through a PCIe root port. It also enables the virtual HD
+Audio device for stereo playback through the Brook mixer. The virtual driver
+uses the codec connection lists to find an analog output. The mixer keeps its
+44.1 kHz, 16-bit stereo format, and the controller supports direct 48 kHz,
+16-bit stereo PCM. The disk has a guarded EFI System Partition, two desktop
+slots, recovery boot files and an ext2 data partition.
 Brook admits writes only after checking the virtual disk's pinned GPT and
-ext2 identities and geometry. The manifest records those identities and the
-hashes of the disk, boot files and public operator policy. Back up the VMDK
-while the guest is off. A clean guest shutdown flushes pending writes. A dirty
-volume goes through the guarded recovery check before the desktop mounts it.
+ext2 identities and geometry. The manifest records those identities, the
+network mode, and hashes of the disk, boot files and public operator policy.
+Back up the VMDK while the guest is off. A clean guest shutdown flushes pending
+writes. A dirty volume goes through the guarded recovery check before the
+desktop mounts it.
+
+Framebuffer console text can be incomplete during a mode change or concurrent
+console writes. Use the VM's COM1 `serial.log` as the diagnostic record,
+including for a panic during a display handoff.
 
 The image pins one SATA disk at its original capacity with 512-byte logical
 and physical sectors. Keep its geometry and leave other SATA ports unused.
@@ -77,6 +97,31 @@ in-place system and recovery tools require the physical-machine write policy
 and refuse the VM profile. Save a powered-off copy and plan to migrate user
 files before replacing the disk.
 
+## VMware Tools integration
+
+When exact VMware CPUID detection succeeds, the kernel runs a small
+`vmware-tools` thread that acts as the guest "toolbox" service over the
+GuestRPC backdoor (TCLO for host commands, RPCI for reports). It registers a
+guest-managed tools version (`tools.set.version 2147483647`, as distribution
+open-vm-tools does) and the `statechange` and `softpowerop_retry`
+capabilities, so Workstation reports Tools as running. It reports the
+DHCP address through `SetGuestInfo` and `guestinfo.ip`, and again whenever
+the address changes or the host sets `broadcastIP`.
+
+**VM > Power > Shut Down Guest** and **Restart Guest** send `OS_Halt` and
+`OS_Reboot`. Brook accepts them only when the checked shutdown path is idle
+and the platform offers ACPI S5 or reset. It then replies, reports
+`tools.os.statechange.status`, and starts the same checked desktop shutdown
+or restart as the launcher power menu. Apps with unsaved changes can still
+hold the shutdown at their save prompts. `OS_PowerOn`, `OS_Resume` and
+`OS_Suspend` are acknowledged without guest scripts.
+
+With `--autofit`, the SVGA driver registers host resize hints through the
+same session. The thread polls every 100 ms, each poll is a bounded number of
+backdoor calls, and a transport error closes the session and retries after
+two seconds. It never blocks boot. On QEMU, other hypervisors and physical
+machines, it performs no backdoor I/O.
+
 ## Persistent image validation
 
 The exact VMDK booted in headless QEMU with e1000e behind a PCIe root
@@ -85,6 +130,22 @@ a 1920×1080 frame. The user's saved file survived a clean shutdown and an
 interrupted boot followed by automatic ext2 recovery. A disk with a changed
 GPT data partition ID was refused before any writes. Workstation acceptance
 of the persistent image is a separate test.
+
+## Pointer input
+
+Brook checks for VMMouse automatically on VMware. In QEMU, select
+`BROOK_POINTER_DEVICE=vmmouse` in the Brook launcher, or use
+`-machine q35,vmport=on -fw_cfg name=opt/brook/vmmouse,string=1`. On success, the guest reports `MOUSE: VMMouse absolute pointer ready` and maps
+host pointer positions to the guest display, independent of desktop scaling.
+Mouse buttons and vertical wheel events use the same desktop input path as
+PS/2. When a Brook app captures relative motion, VMMouse switches modes at the
+next auxiliary interrupt. Releasing the capture returns to absolute motion.
+If device probing or queue validation fails, Brook uses the PS/2 mouse.
+
+For a Workstation input check, move the pointer into and out of the console
+without clicking to grab it. Check keyboard input, all three mouse buttons,
+wheel scrolling and relative capture in a test application. Use a disposable
+guest and retain its serial log if input fails.
 
 ## Probe timing and portability
 

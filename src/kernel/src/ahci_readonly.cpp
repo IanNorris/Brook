@@ -65,6 +65,7 @@ struct NormalIoGuard {
 bool published=false;
 bool writeEnabled=false; // immutable after registration, even if quarantined
 bool exportEnabled=false; // immutable boot-only opt-in
+bool staleTaskBusyLogged=false; // serialized by the ordinary or panic owner
 #if defined(BROOK_AHCI_PANIC_TEST) || defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_AUTO_RECOVERY)
 bool panicTestReady=false,panicTestFat=false,panicIoMode=false;
 bool panicReservationRequested=false;
@@ -146,6 +147,17 @@ static_assert(sizeof(Prdt)==16,"AHCI PRDT size");
 
 struct PortIo {
     volatile uint32_t* regs=nullptr;
+    uint32_t lastCompletionFis=0;
+    bool allowStaleTaskBusy=false;
+    bool postedWithStaleTaskBusy=false;
+    bool lastDmaCompletedWithStaleTaskBusy=false;
+    bool lastCommandCompletedOk=false;
+    uint32_t receivedRegisterFis() {
+        return *reinterpret_cast<volatile const uint32_t*>(dma+fisOffset+0x40);
+    }
+    void clearReceivedRegisterFis() {
+        *reinterpret_cast<volatile uint32_t*>(dma+fisOffset+0x40)=0;
+    }
     uint32_t read(uint32_t offset) { return regs[offset/4]; }
     void write(uint32_t offset,uint32_t value) { regs[offset/4]=value; }
     void fence() { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
@@ -313,6 +325,38 @@ void Quarantine(const char* reason) {
     (void)Quiesce(io);
 }
 
+const char* CommandFailure(Result result) {
+    switch (result) {
+    case Result::Busy: return "slot-active";
+    case Result::DeviceBusy: return "preissue-task-busy";
+    case Result::Timeout: return "timeout";
+    case Result::DeviceError: return "device-error";
+    case Result::CompletionUnconfirmed: return "completion-unconfirmed";
+    case Result::ShortTransfer: return "short-transfer";
+    case Result::MediaChanged: return "media-change";
+    default: return "unexpected-result";
+    }
+}
+
+void ReportCommandFailure(const AhciReadPlan& plan, uint32_t expected, const char* reason) {
+    // Capture the controller state before Quiesce changes PxCMD or hides the
+    // first error behind later block-device refusals. This does not ack it.
+    const uint32_t intr=io.read(IS), task=io.read(TFD), serr=io.read(SERR);
+    const uint32_t ci=io.read(CI), sact=io.read(SACT), cmd=io.read(CMD);
+    const uint32_t ssts=io.read(SSTS), sctl=io.read(SCTL), sig=io.read(SIG);
+    const auto* fis=plan.fis;
+    const uint64_t lba=uint64_t(fis[4]) | (uint64_t(fis[5])<<8) | (uint64_t(fis[6])<<16) |
+        (uint64_t(fis[8])<<24) | (uint64_t(fis[9])<<32) | (uint64_t(fis[10])<<40);
+    const uint32_t sectors=uint32_t(fis[12]) | (uint32_t(fis[13])<<8);
+    const auto* d2h=reinterpret_cast<volatile const uint8_t*>(dma+fisOffset+0x40);
+    SerialPrintf("AHCI_FAIL port=%u slot=0 op=0x%x lba=%lu sectors=%u expected=%u prdbc=%u reason=%s "
+                 "pxis=0x%x pxtfd=0x%x pxserr=0x%x pxci=0x%x pxsact=0x%x pxcmd=0x%x "
+                 "pxssts=0x%x pxsctl=0x%x pxsig=0x%x d2h=0x%x:0x%x:0x%x\n",
+                 status.port, unsigned(fis[2]), lba, sectors, expected, io.transferred(), reason,
+                 intr, task, serr, ci, sact, cmd, ssts, sctl, sig,
+                 unsigned(d2h[0]), unsigned(d2h[2]), unsigned(d2h[3]));
+}
+
 bool Run(const AhciReadPlan& plan, uint32_t expected) {
 #if defined(BROOK_AHCI_PANIC_TEST) || defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_AUTO_RECOVERY)
     // Let the normal owner unwind after its current command instead of
@@ -330,6 +374,7 @@ bool Run(const AhciReadPlan& plan, uint32_t expected) {
         return false;
     // Do not alter descriptors if hardware unexpectedly owns any slot.
     if (io.read(CI) != 0 || io.read(SACT) != 0) {
+        ReportCommandFailure(plan,expected,CommandFailure(Result::Busy));
         Quarantine("AHCI command slot unexpectedly active");
         return false;
     }
@@ -344,11 +389,16 @@ bool Run(const AhciReadPlan& plan, uint32_t expected) {
     }
     const auto result=isFlush ? SubmitNoData(io) : Submit(io,expected);
     if(result!=Result::Ok) {
-        Quarantine(result==Result::MediaChanged ? "AHCI SATA media changed" : "AHCI command failed or timed out");
+        ReportCommandFailure(plan,expected,CommandFailure(result));
+        if(NeedsQuarantine(result))
+            Quarantine(result==Result::MediaChanged ? "AHCI SATA media changed" : "AHCI command failed or timed out");
         return false;
     }
-    const uint8_t* d2h=dma+fisOffset+0x40;
-    if(d2h[0]==0x34 && (d2h[2]&1u)) { Quarantine("ATA device reported an error");return false; }
+    if((io.postedWithStaleTaskBusy || io.lastDmaCompletedWithStaleTaskBusy) && !staleTaskBusyLogged && !PanicIo()) {
+        staleTaskBusyLogged=true;
+        SerialPrintf("ahci: VMware stale task status recovered port=%u op=0x%x bytes=%u\n",
+                     status.port,unsigned(plan.fis[2]),expected);
+    }
     StorageIoAccount(uint32_t(StorageIoSource::Ahci),isFlush?2:plan.fis[2]==0x35?1:0,expected);
     return true;
 }
@@ -633,6 +683,7 @@ void AhciReadOnlyInit() {
         PciCommand(original);status.reason="AHCI bus mastering could not be disabled";return;
     }
     status.port=selected;portRegs=hba+(0x100+selected*0x80)/4;io.regs=portRegs;dma64=(cap&(1u<<31))!=0;
+    io.allowStaleTaskBusy=pci.vendorId==0x15ad && pci.deviceId==0x07e0;
     const auto phys=PmmAllocPagesAccounted(pages,MemTag::Device,KernelPid,PmmOwner::AhciDma);
     if(!phys){PciCommand(original);status.reason="AHCI DMA allocation failed";return;}
     dmaPhys=phys.raw();

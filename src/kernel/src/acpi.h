@@ -36,6 +36,7 @@ struct MemoryDescriptor;
 bool AcpiInit(uint64_t rsdpPhysical,const MemoryDescriptor* memoryMap,uint32_t memoryMapCount);
 // Frozen descriptor only; discovery never writes hardware registers.
 const AcpiResetInfo& AcpiGetResetInfo();
+AcpiS5Info AcpiGetS5Info();
 const AcpiPmTimerInfo& AcpiGetPmTimerInfo();
 // Validated legacy ACPI descriptors. Discovery performs no register I/O.
 const AcpiLegacyPowerInfo& AcpiGetLegacyPowerInfo();

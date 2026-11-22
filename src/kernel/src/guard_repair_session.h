@@ -7,6 +7,12 @@ struct Device;struct Process;struct Vnode;struct ChildWaitSnapshot;
 inline int GuardRepairRejectedOutcome(bool quiescent) {
     return quiescent?-5:-115;
 }
+// A zero poll result at the budget limit is a timeout. Preserve a
+// scheduler error when drained, but keep the busy-adapter sentinel.
+inline int GuardRepairWaitFailureOutcome(int pollResult,bool quiescent) {
+    if(!quiescent)return -115;
+    return pollResult<0?pollResult:-110;
+}
 // A preen session followed by a distinct read-only verifier, on the
 // boot-reserved data adapter.
 bool GuardRepairBegin(Device*,const Process*,bool writable);

@@ -69,6 +69,7 @@ add_host_test(test_guard_fat_profile "${BROOK_ROOT}/src/kernel/src/guard_fat_pro
 add_test(NAME test_analyze_gpu_wait_profile COMMAND python3 "${BROOK_ROOT}/scripts/test_analyze_gpu_wait_profile.py")
 add_test(NAME test_kernel_capabilities COMMAND python3 "${BROOK_ROOT}/scripts/test_kernel_capabilities.py")
 add_test(NAME test_selected_qemu COMMAND python3 "${BROOK_ROOT}/scripts/test_selected_qemu.py")
+add_test(NAME test_vmware_network COMMAND python3 "${BROOK_ROOT}/scripts/test_vmware_network.py")
 add_test(NAME test_stage_selected_launchers
     COMMAND python3 "${BROOK_ROOT}/tools/nix-install/test_stage_selected_launchers.py")
 add_test(NAME test_stage_selected_profile
@@ -1039,6 +1040,15 @@ add_host_test(test_cpu_memory_type_batch)
 add_host_test(test_cpu_execute_disable)
 target_compile_options(test_cpu_execute_disable PRIVATE -UNDEBUG)
 add_host_test(test_vmware_clock)
+add_host_test(test_tty_framebuffer_gate)
+target_compile_options(test_tty_framebuffer_gate PRIVATE -UNDEBUG)
+set_tests_properties(test_tty_framebuffer_gate PROPERTIES TIMEOUT 10)
+add_host_test(test_vmware_svga)
+target_compile_options(test_vmware_svga PRIVATE -UNDEBUG)
+add_host_test(test_vmware_rpc)
+target_compile_options(test_vmware_rpc PRIVATE -UNDEBUG)
+add_host_test(test_vmmouse)
+target_compile_options(test_vmmouse PRIVATE -UNDEBUG)
 add_host_test(test_native_tsc_policy)
 add_host_test(test_native_tsc_pit)
 add_host_test(test_native_tsc_observe "${BROOK_ROOT}/src/kernel/src/native_tsc_observe.cpp")
@@ -1088,6 +1098,9 @@ add_host_test(test_acpi_tables "${BROOK_ROOT}/src/kernel/src/acpi.cpp")
 target_compile_options(test_acpi_tables PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src"
     "-iquote${BROOK_ROOT}/src/shared/boot_protocol" "-iquote${BROOK_ROOT}/src/shared"
     "-iquote${BROOK_ROOT}/src/shared/inc_km")
+
+add_host_test(test_acpi_s5_aml)
+target_compile_options(test_acpi_s5_aml PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 
 add_host_test(test_platform_power "${BROOK_ROOT}/src/kernel/src/platform_power.cpp")
 target_compile_options(test_platform_power PRIVATE -UNDEBUG -DBROOK_HOST_TEST -ffunction-sections -fdata-sections

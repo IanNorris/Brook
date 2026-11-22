@@ -1,5 +1,6 @@
 #include "acpi.h"
 #include "acpi_tables.h"
+#include "acpi_s5_aml.h"
 #include "boot_timing.h"
 #include "boot_resource_map.h"
 #include "boot_protocol/boot_protocol.h"
@@ -206,6 +207,57 @@ bool AcpiInit(uint64_t rsdp,const MemoryDescriptor* map,uint32_t count)
 }
 const MadtInfo& AcpiGetMadt(){return g_madt;}
 const AcpiResetInfo& AcpiGetResetInfo(){return g_reset;}
+AcpiS5Info AcpiGetS5Info()
+{
+    auto refuse=[](const char* reason) -> AcpiS5Info {return {{},0,0,reason};};
+    if(!g_acpiReady)return refuse("S5: ACPI tables were not initialized");
+    const char* controlReason=nullptr;
+    const auto controls=g_tables.SleepControls(&controlReason);
+    if(!controls.pm1a)return refuse(controlReason);
+    AcpiSdtHeader dsdt{};
+    const auto address=g_tables.Dsdt(&dsdt);
+    if(!address)return refuse("S5: no valid DSDT from FADT");
+    if(g_tables.RootEntryCount()>64)return refuse("S5: too many ACPI root entries");
+    uint8_t typeA=0,typeB=0;
+    auto readStatic=[](uint64_t at,const AcpiSdtHeader& header,uint32_t index,uint8_t& a,uint8_t& b,
+                       bool* usedRegionReferences=nullptr){
+        uint32_t offset=0;
+        const auto result=AcpiReadStaticS5(reinterpret_cast<const uint8_t*>(at+sizeof(header)),
+                                          header.length-sizeof(header),a,b,&offset,usedRegionReferences);
+        if(result==AcpiS5Result::Unsupported)
+            SerialPrintf("ACPI: S5 rejected AML in inventory table %u at table offset 0x%x\n",
+                         index,offset+uint32_t(sizeof(header)));
+        return result;
+    };
+    bool dsdtRegionReferences=false;
+    const auto root=readStatic(address,dsdt,0,typeA,typeB,&dsdtRegionReferences);
+    if(root==AcpiS5Result::Unsupported)return refuse("S5: unsupported DSDT AML");
+    bool found=root==AcpiS5Result::Found;
+    for(uint32_t i=0;i<g_tables.RootEntryCount();++i){
+        AcpiSdtHeader table{};
+        const auto extension=g_tables.RootEntry(i,&table);
+        if(!extension) {
+            SerialPrintf("ACPI: S5 invalid root entry at inventory index %u\n",i+1);
+            return refuse("S5: invalid ACPI root entry");
+        }
+        const auto* sig=table.signature;
+        const bool definition=sig[1]=='S' && sig[2]=='D' && sig[3]=='T';
+        const bool ssdt=definition && sig[0]=='S';
+        if(dsdtRegionReferences && definition && (ssdt || sig[0]=='P' || sig[0]=='D'))
+            return refuse("S5: DSDT region references with other definition tables");
+        if(!ssdt)continue;
+        uint8_t a=0,b=0;
+        const auto result=readStatic(extension,table,i+1,a,b);
+        if(result==AcpiS5Result::Unsupported)return refuse("S5: unsupported SSDT AML");
+        if(result==AcpiS5Result::Found && found) {
+            SerialPrintf("ACPI: S5 duplicate definition in inventory table %u\n",i+1);
+            return refuse("S5: duplicate root definition");
+        }
+        if(result==AcpiS5Result::Found){found=true;typeA=a;typeB=b;}
+    }
+    if(!found)return refuse("S5: no root definition in DSDT or SSDTs");
+    return {controls,typeA,typeB,"Validated FADT PM1 and static ACPI S5"};
+}
 const AcpiPmTimerInfo& AcpiGetPmTimerInfo(){return g_pmTimer;}
 const AcpiLegacyPowerInfo& AcpiGetLegacyPowerInfo(){return g_legacyPower;}
 const AcpiSciRoute& AcpiGetSciRoute(){return g_sciRoute;}
@@ -355,11 +407,12 @@ bool AcpiInventoryRead(uint32_t index,uint32_t offset,void* out,uint32_t bytes,A
     const uint64_t address=index?g_tables.RootEntry(index-1,&header):g_tables.Dsdt(&header);
     if(!address || offset>header.length || bytes>header.length-offset)return false;
     // Firmware tables such as MSDM can contain product keys. Expose only AML
-    // and fixed DMA-remapping/watchdog description tables, never arbitrary
+    // and fixed control, DMA-remapping and watchdog description tables, never arbitrary
     // ACPI tables. Copying WDAT does not execute its register instructions.
     const char* s=header.signature;
     if(!((s[0]=='D' && s[1]=='S' && s[2]=='D' && s[3]=='T') ||
          (s[0]=='S' && s[1]=='S' && s[2]=='D' && s[3]=='T') ||
+         (s[0]=='F' && s[1]=='A' && s[2]=='C' && s[3]=='P') ||
          (s[0]=='D' && s[1]=='M' && s[2]=='A' && s[3]=='R') ||
          (s[0]=='W' && s[1]=='D' && s[2]=='A' && s[3]=='T')))return false;
     return !bytes || g_tables.CopyTable(address,offset,out,bytes);

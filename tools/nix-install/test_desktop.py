@@ -82,7 +82,7 @@ class DesktopTests(unittest.TestCase):
                 self.assertIn(f'{program}\t--uid 1000 {runtime} {program} --argument\t',collect())
                 desktop.write_text(desktop.read_text()+'Terminal=true\n')
                 self.assertNotIn(f'{program}\t',collect())
-            for program in ('mousepad','brook-settings','wayland-calc','brook-gallery','brook-task-manager'):
+            for program in ('mousepad','brook-settings','brook-gallery','brook-task-manager'):
                 executable=root/'profile/bin'/program
                 executable.write_text('#!/bin/sh\n');executable.chmod(0o755)
                 desktop=root/'profile/share/applications'/f'{program}.desktop'

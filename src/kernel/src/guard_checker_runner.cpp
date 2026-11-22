@@ -191,14 +191,24 @@ int RunExt2Checker(Device* device,bool writable) {
     bool drained=false;
     if(waited==1)drained=GuardRepairConsumeCompletion(device,writable);else GuardRepairAbort();
     if(waited!=1) {
+        const int failedWait=waited;
         auto* process=SchedulerFindProcessReference(pid);
         if(process) {if(process->incarnation==incarnation)SchedulerRequestFatalSignal(process,9);ProcessUnref(process);}
         for(unsigned i=0;i<3000 && waited==0;++i) {
             SchedulerSleepMs(10);waited=SchedulerWaitChild(ProcessCurrent(),1,pid,4,&result);
         }
-        return GuardRepairQuiescent()?-110:-115;
+        const bool quiet=GuardRepairQuiescent();
+        KPrintf("GUARD_EXT2_CHECKER_WAIT phase=%s pid=%u reason=%s poll=%d cleanup=%d quiescent=%u\n",
+                writable?"preen":"verify",pid,failedWait<0?"wait-error":"timeout",
+                failedWait,waited,quiet?1u:0u);
+        return GuardRepairWaitFailureOutcome(failedWait,quiet);
     }
-    if(!drained)return GuardRepairRejectedOutcome(GuardRepairQuiescent());
+    if(!drained) {
+        const bool quiet=GuardRepairQuiescent();
+        KPrintf("GUARD_EXT2_CHECKER_REJECTED phase=%s pid=%u code=%d wait_status=%d quiescent=%u\n",
+                writable?"preen":"verify",pid,result.code,result.status,quiet?1u:0u);
+        return GuardRepairRejectedOutcome(quiet);
+    }
     if(result.code!=1)return -5;
     return result.status>>8;
 }
@@ -694,7 +704,9 @@ void Worker(void* arg) {
     KPrintf("GUARD_EXT2_PREEN exit=%d\n",preen);
     if((preen!=0 && preen!=1) || !AhciSystemGuardTestDataVerify(data)) {
         if(preen!=-115)AhciSystemGuardTestDataFinish(data);
-        KPuts("GUARD_EXT2_INCOMPLETE preen\n");return;
+        KPuts("GUARD_EXT2_INCOMPLETE preen\n");
+        KPrintf("GUARD_EXT2_RECOVERY_ONLY phase=preen status=%d desktop=blocked restart=withheld\n",preen);
+        return;
     }
     const int verification=RunExt2Checker(data,false);
     const bool identityOk=verification==0 && AhciSystemGuardTestDataIdentityValid(data);

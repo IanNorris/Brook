@@ -938,10 +938,12 @@ static int root_callbacks_due(const struct brook_surface *root,const struct broo
         g_now_us()-root->pace_callback_us>=XWAYLAND_FRAME_MIN_US;
 }
 static struct wl_event_source *g_frame_timer;
+static void output_refresh_due(uint32_t now);
 static int frame_clock_tick(void *unused) {
     (void)unused;
     intel_pending_poll();
     uint32_t now = g_now_ms();
+    output_refresh_due(now);
     if (g_trace_frames) {
         if (g_trace_ticks && now - g_trace_last_tick > g_trace_tick_max_ms)
             g_trace_tick_max_ms = now - g_trace_last_tick;
@@ -2279,6 +2281,9 @@ struct brook_output {
     struct brook_output *next;
 };
 static struct brook_output *g_outputs = NULL;
+static uint32_t g_output_width = 1920, g_output_height = 1080;
+static uint32_t g_output_checked_ms;
+enum { OUTPUT_CHECK_INTERVAL_MS = 250 };
 
 static void output_resource_destroyed(struct wl_listener *l, void *data) {
     (void)data;
@@ -2310,40 +2315,62 @@ static void output_release(struct wl_client *c, struct wl_resource *r) {
 static const struct wl_output_interface output_impl = {
     .release = output_release,
 };
+static void output_send_size(struct wl_resource *r) {
+    /* wl_output.mode uses device pixels for every client. Xwayland binds
+     * at scale 1; its millimetre dimensions still reflect Brook's DPI. */
+    const uint32_t mm_scale = wl_resource_get_client(r) == g_xwayland_client ? g_output_scale : 1;
+    const int32_t mm_width = (int32_t)(((uint64_t)g_output_width * 254 + 480) / 960 / mm_scale);
+    const int32_t mm_height = (int32_t)(((uint64_t)g_output_height * 254 + 480) / 960 / mm_scale);
+    wl_output_send_geometry(r, 0, 0, mm_width, mm_height,
+        WL_OUTPUT_SUBPIXEL_UNKNOWN, "Brook", "vfb-0", WL_OUTPUT_TRANSFORM_NORMAL);
+    wl_output_send_mode(r, WL_OUTPUT_MODE_CURRENT | WL_OUTPUT_MODE_PREFERRED,
+                        (int32_t)g_output_width, (int32_t)g_output_height, 60000);
+}
+
+static void output_refresh(uint32_t now) {
+    g_output_checked_ms = now;
+    uint32_t width, height;
+    if (wm_get_screen_info(&width, &height) || !width || !height ||
+        width > INT32_MAX || height > INT32_MAX ||
+        (width == g_output_width && height == g_output_height)) return;
+
+    g_output_width = width;
+    g_output_height = height;
+    for (struct brook_output *o = g_outputs; o; o = o->next) {
+        output_send_size(o->resource);
+        if (wl_resource_get_version(o->resource) >= 2)
+            wl_output_send_done(o->resource);
+    }
+}
+
+static void output_refresh_due(uint32_t now) {
+    /* The kernel has a size snapshot but no display-change event. Reuse the
+     * frame tick, sampling only while an output is bound. */
+    if (g_outputs && now - g_output_checked_ms >= OUTPUT_CHECK_INTERVAL_MS)
+        output_refresh(now);
+}
+
 static void output_bind(struct wl_client *client, void *data,
                         uint32_t version, uint32_t id) {
     (void)data;
+    struct brook_output *o = calloc(1, sizeof(*o));
+    if (!o) { wl_client_post_no_memory(client); return; }
     struct wl_resource *r = wl_resource_create(client, &wl_output_interface,
                                                 (int)version, id);
-    if (!r) { wl_client_post_no_memory(client); return; }
+    if (!r) { free(o); wl_client_post_no_memory(client); return; }
     wl_resource_set_implementation(r, &output_impl, NULL, NULL);
     fprintf(stderr, "[waylandd] wl_output bind v=%u id=%u client=%p\n",
             version, id, (void*)client);
-    struct brook_output *o = calloc(1, sizeof(*o));
-    if (o) {
-        o->resource = r;
-        o->destroy.notify = output_resource_destroyed;
-        wl_resource_add_destroy_listener(r, &o->destroy);
-        o->next = g_outputs;
-        g_outputs = o;
-    }
-    int w = 1920, h = 1080;
-    {
-        uint32_t sw = 0, sh = 0;
-        if (wm_get_screen_info(&sw, &sh) == 0 && sw > 0 && sh > 0) {
-            w = (int)sw; h = (int)sh;
-        }
-    }
-    /* Millimetres at 96 dpi per output-scale unit. Xwayland's X screen is in
-     * device pixels, so its RandR size reports 96 * scale dpi, matching the
-     * Xft.dpi brook-xwm publishes; other clients see logical 96 dpi. */
-    const int mm_scale = client == g_xwayland_client ? (int)g_output_scale : 1;
-    wl_output_send_geometry(r, 0, 0,
-        (int)((w * 254 + 480) / 960) / mm_scale, (int)((h * 254 + 480) / 960) / mm_scale,
-        WL_OUTPUT_SUBPIXEL_UNKNOWN, "Brook", "vfb-0",
-        WL_OUTPUT_TRANSFORM_NORMAL);
-    wl_output_send_mode(r, WL_OUTPUT_MODE_CURRENT | WL_OUTPUT_MODE_PREFERRED,
-                        w, h, 60000);
+
+    /* Update older bindings first if this bind notices a new output size. */
+    output_refresh(g_now_ms());
+    o->resource = r;
+    o->destroy.notify = output_resource_destroyed;
+    wl_resource_add_destroy_listener(r, &o->destroy);
+    o->next = g_outputs;
+    g_outputs = o;
+
+    output_send_size(r);
     if (version >= 2) {
         wl_output_send_scale(r, client==g_xwayland_client?1:g_output_scale);
         if (version >= 4) {

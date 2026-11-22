@@ -35,10 +35,14 @@ enum class Phase { Empty,Closing,Services,Cleanup,Syncing,Ready,Committing,Faile
 struct Operation {
     char id[33];Phase phase;bool restart,automatic,cancel,commit,acLoss;
     bool forceRequested,forceDispatched;
+    // syncFailed: Failed came from the final sync (an explicit retry may
+    // repeat it). retry/forced: the explicit desktop actions after Failed.
+    bool syncFailed,retry,forced;
     int error;
 };
 Operation operations[64]{};int current=-1;SpinLock lock{};
 bool workerStarted=false,powerOff=false,powerRestart=false,irreversible=false;
+uint32_t failureGeneration=0;
 UsbBootRecoveryPolicy usbBootRecovery{};
 constexpr uint64_t AcSampleFreshMs=2000;
 constexpr uint64_t AcSampleIntervalMs=1000;
@@ -104,9 +108,28 @@ bool CanForceAppsLocked(const Operation& op) {
 }
 bool Active(Phase phase) {return phase!=Phase::Empty&&phase!=Phase::Failed&&phase!=Phase::Cancelled;}
 void SetPhase(int index,Phase phase,int error=0) {
-    SpinLockAcquire(&lock);operations[index].phase=phase;operations[index].error=error;SpinLockRelease(&lock);
+    SpinLockAcquire(&lock);operations[index].phase=phase;operations[index].error=error;
+    if(phase==Phase::Failed)++failureGeneration;SpinLockRelease(&lock);
     SerialPrintf("shutdown: request=%s phase=%s result=%d\n",operations[index].id,Name(phase),error);
     CompositorMarkDirty();CompositorWake();
+}
+// Every fallible final write. Writeback is stopped and device writes are
+// closed first; an explicit retry after failure repeats only this step.
+int FinalSync() {
+    int error=VfsSync(nullptr);
+#if defined(BROOK_SSD_INSTALLER)
+    if(!error)error=AhciPhysicalBlockToolsFinalSync();
+#endif
+    if(!error)error=AhciSystemDirectFinalSync();
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+    if(!error)error=AhciSystemQemuLargeDataFinalSync();
+#endif
+    if(!error)error=WritableDesktopFinalSync();
+    return error;
+}
+void FinishSync(int index,int error) {
+    SpinLockAcquire(&lock);operations[index].syncFailed=error!=0;operations[index].retry=false;SpinLockRelease(&lock);
+    SetPhase(index,error?Phase::Failed:Phase::Ready,error);
 }
 uint32_t Census(uint32_t* applications) {
     uint32_t total=0;uint64_t begin=0,end=0;
@@ -380,17 +403,18 @@ void Worker(void*) {
 #endif
                 if(!DeviceCloseWrites()){SchedulerSleepMs(25);continue;}
                 SetPhase(selected,Phase::Syncing);AudioPrepareShutdown();AudioStop();HdaRuntimeShutdown();
-                int error=VfsSync(nullptr);
-#if defined(BROOK_SSD_INSTALLER)
-                if(!error)error=AhciPhysicalBlockToolsFinalSync();
-#endif
-                if(!error)error=AhciSystemDirectFinalSync();
-#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
-                if(!error)error=AhciSystemQemuLargeDataFinalSync();
-#endif
-                if(!error)error=WritableDesktopFinalSync();
-                SetPhase(selected,error?Phase::Failed:Phase::Ready,error);
+                FinishSync(selected,FinalSync());
             }
+        }else if(op.phase==Phase::Syncing&&op.retry) {
+            KLog("shutdown: retrying final sync after failure");
+            FinishSync(selected,FinalSync());
+        }else if(op.phase==Phase::Committing&&op.forced) {
+            // Explicit user choice after a failed checked shutdown: data the
+            // failed sync could not write is lost. Services are already stopped.
+            KLog("shutdown: forced power off after failed shutdown");
+            SchedulerSleepMs(500);
+            if(PlatformPowerIssue(false))SchedulerSleepMs(1000);
+            SetPhase(selected,Phase::Failed,-5);
         }else if(op.phase==Phase::Ready&&(op.automatic||op.commit)&&(op.restart?powerRestart:powerOff)) {
             SetPhase(selected,Phase::Committing);
             // Allow the UART reply and a final progress frame to be delivered.
@@ -506,7 +530,8 @@ void HandleShutdownCommand(const char* id,const char* verb,char state[24],int* e
             forceCandidateCount=approvedAppCount=0;
             windowless.Reset();memset(&blockerReport,0,sizeof(blockerReport));
         }
-    }else if(!start&&!forceApps&&strcmp(verb,"power_status")&&strcmp(verb,"cancel")&&strcmp(verb,"commit")){result="unsupported";*error=-95;}
+    }else if(!start&&!forceApps&&strcmp(verb,"power_status")&&strcmp(verb,"cancel")&&strcmp(verb,"commit")&&
+             strcmp(verb,"retry")&&strcmp(verb,"force_power_off")){result="unsupported";*error=-95;}
     if(!result&&found<0){result="missing";*error=-2;}
     if(!result) {
         auto& op=operations[found];
@@ -519,6 +544,16 @@ void HandleShutdownCommand(const char* id,const char* verb,char state[24],int* e
             }
         }
         if(!strcmp(verb,"cancel")) {if(op.phase==Phase::Closing)op.cancel=true;else if(op.phase!=Phase::Cancelled){result="too_late";*error=-16;}}
+        // After a failed checked shutdown the services are gone and the
+        // write barrier stays closed; only these explicit actions remain.
+        if(!strcmp(verb,"retry")) {
+            if(current==found&&op.phase==Phase::Failed&&op.syncFailed&&irreversible){op.phase=Phase::Syncing;op.retry=true;op.error=0;}
+            else {result="not_ready";*error=-16;}
+        }
+        if(!strcmp(verb,"force_power_off")) {
+            if(current==found&&op.phase==Phase::Failed&&irreversible&&powerOff){op.phase=Phase::Committing;op.forced=true;op.error=0;}
+            else {result="not_ready";*error=-16;}
+        }
         if(!strcmp(verb,"commit")) {if(op.phase==Phase::Ready||op.phase==Phase::Committing) {
                 if(op.restart?powerRestart:powerOff)op.commit=true;
                 else {result="ready";*error=-95;}
@@ -552,6 +587,26 @@ void ShutdownDesktopForceApps() {
     char id[33]{};SpinLockAcquire(&lock);if(current>=0)memcpy(id,operations[current].id,33);SpinLockRelease(&lock);
     if(id[0]){char state[24];int error;ShutdownCommand(id,"force_apps",state,&error);}
 }
+void ShutdownDesktopRetry() {
+    char id[33]{};SpinLockAcquire(&lock);if(current>=0)memcpy(id,operations[current].id,33);SpinLockRelease(&lock);
+    if(id[0]){char state[24];int error;ShutdownCommand(id,"retry",state,&error);
+        if(!error)SerialPrintf("shutdown: request=%s retry requested\n",id);}
+}
+void ShutdownDesktopForcePowerOff() {
+    char id[33]{};SpinLockAcquire(&lock);if(current>=0)memcpy(id,operations[current].id,33);SpinLockRelease(&lock);
+    if(id[0]){char state[24];int error;ShutdownCommand(id,"force_power_off",state,&error);
+        if(!error)SerialPrintf("shutdown: request=%s forced power off requested\n",id);}
+}
+ShutdownFailureActions ShutdownDesktopFailureActions() {
+    SpinLockAcquire(&lock);ShutdownFailureActions actions{};
+    if(current>=0&&operations[current].phase==Phase::Failed&&irreversible) {
+        actions.failed=true;actions.retry=operations[current].syncFailed;actions.forcePowerOff=powerOff;
+    }
+    SpinLockRelease(&lock);return actions;
+}
+uint32_t ShutdownFailureGeneration() {
+    return __atomic_load_n(&failureGeneration,__ATOMIC_ACQUIRE);
+}
 bool ShutdownCanForceApps(const char* id) {
     SpinLockAcquire(&lock);
     const bool result=current>=0 && (!id || !strcmp(operations[current].id,id)) &&
@@ -559,7 +614,20 @@ bool ShutdownCanForceApps(const char* id) {
     SpinLockRelease(&lock);
     return result;
 }
-static const char* DescribePhase(Phase phase,bool restart,bool live=false,bool cancelling=false) {
+// Failed: what the user can still do. Strings stay within the launcher
+// notice and the shell model's 128-byte status text.
+static const char* DescribeFailure(bool restart,bool syncFailed,int error) {
+    if(!syncFailed)return powerOff?"Power off did not complete. Force power off, or power off manually.":
+        restart?"Restart did not complete. Reset or power off manually.":"Power off did not complete. Power off manually.";
+    if(powerOff)return error==-5?(restart?"Restart failed: could not save data (I/O error). Retry or force power off.":
+                                      "Shutdown failed: could not save data (I/O error). Retry or force power off."):
+        restart?"Restart failed: could not save data. Retry or force power off.":"Shutdown failed: could not save data. Retry or force power off.";
+    return error==-5?(restart?"Restart failed: could not save data (I/O error). Retry or power off manually.":
+                          "Shutdown failed: could not save data (I/O error). Retry or power off manually."):
+        restart?"Restart failed: could not save data. Retry or power off manually.":"Shutdown failed: could not save data. Retry or power off manually.";
+}
+static const char* DescribePhase(Phase phase,bool restart,bool live=false,bool cancelling=false,
+                                 bool syncFailed=false,int error=0) {
     // live: this is the current request, so the worker's detailed status applies.
     if(phase==Phase::Closing&&cancelling)return "Cancelling - reopening the desktop";
     if(live&&(phase==Phase::Closing||phase==Phase::Services||phase==Phase::Cleanup)&&blockerReport.status[0])return blockerReport.status;
@@ -570,28 +638,28 @@ static const char* DescribePhase(Phase phase,bool restart,bool live=false,bool c
     case Phase::Syncing:return "Saving filesystem changes";
     case Phase::Ready:return restart?"Ready to restart":powerOff?"Ready to power off":"Safe to power off manually";
     case Phase::Committing:return "Power transition";
-    case Phase::Failed:return "Shutdown failed - inspect lifecycle status";
+    case Phase::Failed:return DescribeFailure(restart,syncFailed,error);
     case Phase::Cancelled:return "Shutdown cancelled";
     default:return "Unknown shutdown request";
     }
 }
 const char* ShutdownRequestStatus(const char* id) {
-    Phase phase=Phase::Empty;bool restart=false,live=false,cancelling=false;
+    Phase phase=Phase::Empty;bool restart=false,live=false,cancelling=false,syncFailed=false;int error=0;
     SpinLockAcquire(&lock);
-    for(int i=0;i<64;++i){const auto& op=operations[i];if(op.id[0]&&!strcmp(op.id,id)){phase=op.phase;restart=op.restart;live=i==current;cancelling=op.cancel;break;}}
-    SpinLockRelease(&lock);return DescribePhase(phase,restart,live,cancelling);
+    for(int i=0;i<64;++i){const auto& op=operations[i];if(op.id[0]&&!strcmp(op.id,id)){phase=op.phase;restart=op.restart;live=i==current;cancelling=op.cancel;syncFailed=op.syncFailed;error=op.error;break;}}
+    SpinLockRelease(&lock);return DescribePhase(phase,restart,live,cancelling,syncFailed,error);
 }
 void ShutdownRequestBlockers(const char* id,ShutdownBlockerReport* out) {
     memset(out,0,sizeof(*out));
-    Phase phase=Phase::Empty;bool restart=false,live=false,cancelling=false;
+    Phase phase=Phase::Empty;bool restart=false,live=false,cancelling=false,syncFailed=false;int error=0;
     SpinLockAcquire(&lock);
-    for(int i=0;i<64;++i){const auto& op=operations[i];if(op.id[0]&&!strcmp(op.id,id)){phase=op.phase;restart=op.restart;live=i==current;cancelling=op.cancel;break;}}
+    for(int i=0;i<64;++i){const auto& op=operations[i];if(op.id[0]&&!strcmp(op.id,id)){phase=op.phase;restart=op.restart;live=i==current;cancelling=op.cancel;syncFailed=op.syncFailed;error=op.error;break;}}
     const bool detailed=live&&!cancelling&&(phase==Phase::Closing||phase==Phase::Services||phase==Phase::Cleanup)&&blockerReport.status[0];
     if(detailed)memcpy(out,&blockerReport,sizeof(*out));
     else {
         const char* stage=phase==Phase::Closing&&cancelling?"cancelling":Name(phase);
         unsigned i=0;while(stage[i]&&i+1<sizeof(out->stage)){out->stage[i]=stage[i];++i;}
-        const char* text=DescribePhase(phase,restart,false,cancelling);
+        const char* text=DescribePhase(phase,restart,false,cancelling,syncFailed,error);
         i=0;while(text[i]&&i+1<sizeof(out->status)){out->status[i]=text[i];++i;}
     }
     out->status[sizeof(out->status)-1]=0;
@@ -599,9 +667,17 @@ void ShutdownRequestBlockers(const char* id,ShutdownBlockerReport* out) {
 }
 const char* ShutdownDesktopStatus() {
     SpinLockAcquire(&lock);const auto phase=current<0?Phase::Empty:operations[current].phase;
-    const bool restart=current>=0&&operations[current].restart,cancelling=current>=0&&operations[current].cancel;SpinLockRelease(&lock);
-    if(phase!=Phase::Empty&&phase!=Phase::Cancelled)return DescribePhase(phase,restart,true,cancelling);
+    const bool restart=current>=0&&operations[current].restart,cancelling=current>=0&&operations[current].cancel;
+    const bool syncFailed=current>=0&&operations[current].syncFailed;const int error=current>=0?operations[current].error:0;SpinLockRelease(&lock);
+    if(phase!=Phase::Empty&&phase!=Phase::Cancelled)return DescribePhase(phase,restart,true,cancelling,syncFailed,error);
     const auto* notice=__atomic_load_n(&desktopNotice,__ATOMIC_ACQUIRE);return notice?notice:"Applications";
+}
+bool ShutdownReadyForManualPowerOff() {
+    SpinLockAcquire(&lock);
+    const bool ready = current >= 0 && operations[current].phase == Phase::Ready &&
+                       !operations[current].restart && !powerOff;
+    SpinLockRelease(&lock);
+    return ready;
 }
 void ShutdownCompositorPoll() {
     SpinLockAcquire(&lock);const int selected=current;const bool closing=selected>=0&&operations[selected].phase==Phase::Closing&&!operations[selected].cancel&&admissionReady;

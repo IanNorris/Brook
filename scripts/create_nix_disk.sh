@@ -46,7 +46,6 @@ if [ ${#PACKAGES[@]} -eq 0 ]; then
         "${ROOT_DIR}/tools/wayland-smoke-pkg"  # Wayland client smoke test
         "${ROOT_DIR}/tools/wayland-shm-smoke-pkg"  # Wayland shm round-trip smoke test
         "${ROOT_DIR}/tools/wayland-xdg-smoke-pkg"  # Wayland xdg-shell smoke test
-        "${ROOT_DIR}/tools/wayland-calc-pkg"  # Brook-native xdg-shell calculator demo
         "${ROOT_DIR}/tools/weston-flower-pkg"  # weston-flower demo bundle (RPATH-locked)
         "${ROOT_DIR}/tools/weston-presentation-shm-pkg"  # libtoytoolkit-free SHM client (no cursor → no crash)
         "${ROOT_DIR}/tools/weston-eventdemo-pkg"  # weston-eventdemo (toytoolkit pointer/keyboard event display)
@@ -284,9 +283,6 @@ if [ "${FUSE}" -eq 1 ]; then
                 [ -x "$p/bin/waylandd" ] && cp "$p/bin/waylandd" "${MOUNT_DIR}/bin/waylandd"
                 [ -x "$p/bin/brook-xwm" ] && cp "$p/bin/brook-xwm" "${MOUNT_DIR}/bin/brook-xwm"
                 ;;
-            *-wayland-calc-brook-*)
-                [ -x "$p/bin/wayland-calc" ] && cp "$p/bin/wayland-calc" "${MOUNT_DIR}/bin/wayland-calc"
-                ;;
             *-gimp-*)
                 if [ -x "$p/bin/gimp" ]; then
                     ln -sf "../store/$(basename "$p")/bin/gimp" "${MOUNT_DIR}/bin/gimp"
@@ -390,9 +386,6 @@ else
             *-waylandd-brook-*)
                 [ -x "$p/bin/waylandd" ] && write_to_disk "${DISK_IMG}" "$p/bin/waylandd" "bin/waylandd"
                 [ -x "$p/bin/brook-xwm" ] && write_to_disk "${DISK_IMG}" "$p/bin/brook-xwm" "bin/brook-xwm"
-                ;;
-            *-wayland-calc-brook-*)
-                [ -x "$p/bin/wayland-calc" ] && write_to_disk "${DISK_IMG}" "$p/bin/wayland-calc" "bin/wayland-calc"
                 ;;
             *-gimp-*)
                 if [ -x "$p/bin/gimp" ]; then

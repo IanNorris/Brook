@@ -39,8 +39,10 @@ extern "C" uint64_t AudioClockNowNs()
     // Bare metal: the invariant TSC is calibrated and cross-CPU consistent
     // (tsc_clock.cpp). Without it, diagnostics/controls report an invalid clock.
     if (TscClockAvailable()) return TscClockReadNs();
-#endif
+    return ApicReadVmwareElapsedNs();
+#else
     return 0;
+#endif
 }
 
 static SpinLock g_dspProducerLock;
@@ -97,6 +99,7 @@ extern "C" void AudioDeliveryTimingRecord(uint64_t token,const AudioDeliveryEven
 }
 
 static const AudioDriver* g_audioDriver = nullptr;
+static bool (*g_hdaStatus)(AudioHdaStatus&) = nullptr;
 static uint32_t g_outputControl = BROOK_AUDIO_DEFAULT;
 uint32_t AudioOutputControlSnapshot(){return __atomic_load_n(&g_outputControl,__ATOMIC_ACQUIRE);}
 extern "C" uint32_t AudioOutputControlState(){return AudioOutputControlSnapshot();}
@@ -441,6 +444,21 @@ bool AudioMixerStagingSetFrameLimit(uint32_t frames) {
     SpinLockRelease(&g_mixerLock);return true;
 }
 uint32_t AudioMixerStagingFrameLimit(){return __atomic_load_n(&g_stagingFrameLimit,__ATOMIC_ACQUIRE);}
+extern "C" bool AudioMixerRequestDefaultStaging(uint32_t frames) {
+#ifndef BROOK_HOST_TEST
+    if (Vnode* marker=VfsOpen("/etc/audio-staging-off",0)) {
+        VfsClose(marker);
+        SerialPuts("audio: /etc/audio-staging-off; downstream allowance stays off\n");
+        return AudioMixerStagingEnabled();
+    }
+#endif
+    // A boot option that already enabled staging keeps its own limit.
+    if(AudioMixerStagingEnabled())return true;
+    if(!AudioMixerStagingSetFrameLimit(frames))return false;
+    AudioMixerStagingEnable(true);
+    SerialPrintf("audio: driver default downstream allowance %u frames\n",frames);
+    return true;
+}
 void AudioMixerConfigureBoot() {
 #ifndef BROOK_HOST_TEST
     // Set before driver registration: a hardware bring-up image never starts
@@ -1019,6 +1037,19 @@ extern "C" bool AudioRegister(const AudioDriver* drv)
     g_audioDriver = drv;
     KPrintf("audio: registered driver '%s'\n", drv->name);
     return true;
+}
+
+extern "C" bool AudioRegisterWithHdaStatus(const AudioDriver* drv, bool (*read)(AudioHdaStatus&))
+{
+    if (!AudioRegister(drv)) return false;
+    __atomic_store_n(&g_hdaStatus,read,__ATOMIC_RELEASE);
+    return true;
+}
+
+bool AudioReadHdaStatus(AudioHdaStatus& status)
+{
+    const auto read=__atomic_load_n(&g_hdaStatus,__ATOMIC_ACQUIRE);
+    return read && read(status);
 }
 
 bool AudioAvailable()

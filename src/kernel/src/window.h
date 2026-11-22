@@ -31,6 +31,7 @@ uint32_t WmGetAppliedScale();
 bool WmSetScale(uint32_t percent);
 // Called by the compositor after old-frame input and before new-frame drawing.
 bool WmApplyScalePending();
+void WmApplyDisplaySize(uint32_t width, uint32_t height);
 
 // Window manager constants. Frame and taskbar sizes come from DesktopMetrics.
 static constexpr uint32_t WM_TITLE_BAR_HEIGHT = DesktopMetrics::TitleBase;

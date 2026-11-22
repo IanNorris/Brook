@@ -3,7 +3,6 @@
 let
   files = import ./desktop-files.nix { inherit pkgs; };
   waylandd = import ../tools/waylandd-pkg {};
-  calc = import ../tools/wayland-calc-pkg {};
   player = import ../tools/brook-player-pkg {};
   gallery = import ../tools/brook-gallery-pkg { inherit pkgs; };
   settings = import ../tools/brook-settings-pkg { inherit pkgs; };
@@ -73,7 +72,7 @@ let
     chmod +x $out/bin/*
   '';
 in {
-  inherit yquake yquakeSoft openal player waylandd calc launchers;
+  inherit yquake yquakeSoft openal player waylandd launchers;
   profile = pkgs.buildEnv {
     name = "brook-experiment-profile";
     paths = [
@@ -82,7 +81,7 @@ in {
       pkgs.libreoffice pkgs.gimp pkgs.qalculate-gtk pkgs.xfce.mousepad
       pkgs.kdePackages.breeze-icons (import ./desktop-settings.nix { inherit pkgs; inherit (files) nautilus; })
       firefox chromium
-      waylandd calc player files.integration files.gvfs settings message gallery fonts cursors launchers session
+      waylandd player files.integration files.gvfs settings message gallery fonts cursors launchers session
     ];
     ignoreCollisions = true;
   };

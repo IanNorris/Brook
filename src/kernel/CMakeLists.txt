@@ -360,6 +360,7 @@ add_executable(kernel
     src/rtc.cpp
     src/kvmclock.cpp
     src/vmware_clock.cpp
+    src/vmware_tools.cpp
     src/tsc_clock.cpp
     src/vdso.cpp
     src/display.cpp

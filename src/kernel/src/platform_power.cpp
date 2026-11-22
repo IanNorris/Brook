@@ -75,6 +75,7 @@ bool EfiTestOff(void*,uint64_t entry) {
 #endif
 bool Write8(void*,uint16_t port,uint8_t value){outb(port,value);return true;}
 bool Write16(void*,uint16_t port,uint16_t value){outw(port,value);return true;}
+bool Read16(void*,uint16_t port,uint16_t& value){value=inw(port);return true;}
 }
 void PlatformPowerConfigure() {
     plan={};plan.firmwareReset=AcpiGetResetInfo();
@@ -84,6 +85,16 @@ void PlatformPowerConfigure() {
 #if defined(BROOK_EFI_SHUTDOWN_TEST)
     else if(bytes==8 && !memcmp(mode,"efi-test",8))plan.efiEntry=efiTestCandidate;
 #endif
+    if(!plan.q35Off && !plan.efiEntry) {
+        plan.acpiS5=AcpiGetS5Info();
+        if(plan.acpiS5.Available()) {
+            uint16_t control=0;
+            if(!Read16(nullptr,plan.acpiS5.controls.pm1a,control) || control==0xffff || !(control&1)) {
+                plan.acpiS5={};
+                plan.acpiS5.reason="Firmware ACPI mode is unavailable";
+            }
+        }
+    }
     SerialPrintf("power: reset=%s poweroff=%s reason=%s\n",plan.ResetMethod(),plan.PowerOffMethod(),plan.PowerOffReason());
 #if !defined(BROOK_HOST_TEST)
     if(plan.firmwareReset.available)
@@ -106,11 +117,13 @@ bool PlatformPowerIssue(bool restart){
     // (possibly recovery) kernel; a no-op unless a flip path was activated.
     BdwScanoutPanicRestore();
 #endif
-    return plan.Issue(restart,{nullptr,Write8,Write16
+    return plan.Issue(restart,{nullptr,Write8,Write16,
 #if !defined(BROOK_HOST_TEST)
-    ,EfiTestOff
+    EfiTestOff,
+#else
+    nullptr,
 #endif
-});}
+    Read16});}
 #if !defined(BROOK_HOST_TEST)
 void PlatformPowerSetEfiCandidate(const BootProtocol* boot){
     const auto inventory=InspectEfiRuntime(boot);

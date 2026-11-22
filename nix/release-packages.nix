@@ -9,7 +9,7 @@ let
   graphics = import ./runtime-graphics.nix { inherit pkgs; };
   native = map (name: let f = import (../tools + "/${name}"); in
     f (if builtins.hasAttr "pkgs" (builtins.functionArgs f) then { inherit pkgs; } else {})) [
-    "waylandd-pkg" "wayland-calc-pkg" "brook-player-pkg"
+    "waylandd-pkg" "brook-player-pkg"
     "brook-gallery-pkg" "brook-settings-pkg" "brook-message-pkg" "brook-session-pkg" "locale-brook-pkg"
     "brook-task-manager-pkg"
   ];
