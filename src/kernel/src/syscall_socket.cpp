@@ -445,11 +445,12 @@ int64_t sys_recvfrom(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
     if (fde && fde->type == FdType::UnixSocket) {
         auto* usd = static_cast<UnixSocketData*>(fde->handle);
         if(usd && usd->socketType==5) {
-            if(flagsVal&~(0x40ULL|0x20ULL|0x4000ULL))return -95;
+            if(flagsVal&~(0x2ULL|0x40ULL|0x20ULL|0x4000ULL))return -95;
             if(lenVal && !UserBufferWritable(bufVal,lenVal))return -EFAULT;
             UnixFdSnap descriptors[UNIX_FD_QUEUE_CAP];int received=0;uint64_t size=0;
             auto result=UnixSocketReadSome(usd,(flagsVal&0x40)||(FdStatus(fde)&0x800),
-                reinterpret_cast<char*>(bufVal),lenVal,descriptors,received,nullptr,&size);
+                reinterpret_cast<char*>(bufVal),lenVal,descriptors,received,nullptr,&size,nullptr,
+                (flagsVal&0x2)!=0);
             for(int i=0;i<received;++i)UnixFdSnapRelease(&descriptors[i]);
             // The peer is unnamed: report a zero-length address.
             const uint32_t unnamed=0;
@@ -460,6 +461,20 @@ int64_t sys_recvfrom(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
         UserAccessScope addressAccess(proc);
         if(srcVal && addrLenVal &&
            !UserBufferWritable(addrLenVal,sizeof(uint32_t)))return -EFAULT;
+        if(usd && (flagsVal&0x2)) {
+            // MSG_PEEK must leave the bytes queued. .NET's zero-byte receive
+            // (used by Tmds.DBus and other async socket readers) is a
+            // one-byte peek; consuming it corrupted D-Bus message framing.
+            if(lenVal && !UserBufferWritable(bufVal,lenVal))return -EFAULT;
+            UnixFdSnap descriptors[UNIX_FD_QUEUE_CAP];int received=0;
+            const int64_t peeked=UnixSocketReadSome(usd,(flagsVal&0x40)||(FdStatus(fde)&0x800),
+                reinterpret_cast<char*>(bufVal),lenVal,descriptors,received,nullptr,nullptr,nullptr,true);
+            for(int i=0;i<received;++i)UnixFdSnapRelease(&descriptors[i]);
+            const uint32_t unnamed = 0;
+            if (peeked >= 0 && srcVal && addrLenVal && !CopyToUser(addrLenVal, &unnamed, sizeof(unnamed)))
+                return -EFAULT;
+            return peeked;
+        }
         bool oldNonblock = usd ? usd->nonblock : false;
         if (usd && (flagsVal & 0x40)) // MSG_DONTWAIT
             usd->nonblock = true;
@@ -1368,7 +1383,8 @@ int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
         // MSG_NOSIGNAL is also accepted on receive by Linux. Receives never
         // generate SIGPIPE; audio IPC uses it with MSG_CMSG_CLOEXEC.
         const bool record=usd->socketType==5;
-        if(flagsVal&~(0x40ULL|0x4000ULL|0x40000000ULL|(record?0x20ULL:0)))return -95;
+        if(flagsVal&~(0x2ULL|0x40ULL|0x4000ULL|0x40000000ULL|(record?0x20ULL:0)))return -95;
+        const bool peek=(flagsVal&0x2)!=0;
         if(msg->msg_controllen && !UserBufferWritable(reinterpret_cast<uint64_t>(msg->msg_control),msg->msg_controllen))return -EFAULT;
         const uint64_t capacity=msg->msg_controllen;
         UnixFdSnap descriptors[UNIX_FD_QUEUE_CAP];int received=0;
@@ -1380,7 +1396,7 @@ int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
             UnixRecordVector stage;
             if(int error=stage.Init(reinterpret_cast<uint64_t>(msg->msg_iov),msg->msg_iovlen,false))return error;
             total=UnixSocketReadSome(usd,dontwait || (FdStatus(fde)&0x800),stage.bytes,stage.capacity,
-                descriptors,received,passCredentials?&sender:nullptr,&messageLength,&consumed);
+                descriptors,received,passCredentials?&sender:nullptr,&messageLength,&consumed,peek);
             if(total<0)return total;
             if(int error=stage.Scatter(total)) {
                 for(int j=0;j<received;++j)UnixFdSnapRelease(&descriptors[j]);
@@ -1394,11 +1410,13 @@ int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
             }
             int count=0;
             auto n=UnixSocketReadSome(usd,dontwait || total>0 || (FdStatus(fde)&0x800),
-                static_cast<char*>(iov.iov_base),iov.iov_len,descriptors,count,passCredentials ? &sender : nullptr);
+                static_cast<char*>(iov.iov_base),iov.iov_len,descriptors,count,passCredentials ? &sender : nullptr,
+                nullptr,nullptr,peek);
             received=count;
             if(n<0 && !total)return n;
             if(n>0)total+=n;
-            if(n<=0 || static_cast<uint64_t>(n)<iov.iov_len || received || passCredentials)break;
+            // A peek fills only the first buffer; later iovecs would see the same bytes.
+            if(n<=0 || static_cast<uint64_t>(n)<iov.iov_len || received || passCredentials || peek)break;
         }
         msg->msg_flags=record && messageLength>static_cast<uint64_t>(total)?0x20:0;
         msg->msg_controllen=0;msg->msg_namelen=0;

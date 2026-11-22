@@ -1,7 +1,7 @@
 /*
  * nix-search: Search the Brook Nix package index
  *
- * Reads /nix/index/packages.idx (TSV: name\tversion\tstore_name\tdescription)
+ * Reads /nix/index/packages.idx (TSV: name\tversion\tstore_name\tdescription[\tmain_program])
  * and searches for matching packages by name or description.
  *
  * Usage: nix-search <query> [--name-only] [--limit N]
@@ -101,6 +101,9 @@ int main(int argc, char *argv[]) {
         char *description = strchr(store_name, '\t');
         if (!description) continue;
         *description++ = '\0';
+        /* Optional fifth column: meta.mainProgram. */
+        char *main_program = strchr(description, '\t');
+        if (main_program) *main_program = '\0';
 
         /* Match query against name (and optionally description) */
         int match = 0;
