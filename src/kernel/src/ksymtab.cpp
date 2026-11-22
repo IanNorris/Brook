@@ -45,6 +45,8 @@ extern "C" brook::KernelSymbol __stop_ksymtab[];
 #include "usb_boot_health.h"
 #include "boot_status.h"
 #include "debug_hardware.h"
+#include "pci_quiesce.h"
+#include "platform_power.h"
 
 // Bring all brook:: names into scope so EXPORT_SYMBOL(fn) resolves correctly.
 using namespace brook;
