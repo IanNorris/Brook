@@ -65,6 +65,7 @@ struct TestWorker {brook::Process* process=nullptr;brook::KernelThreadFn fn=null
 TestWorker testWorkers[16]{};bool failWorkerCreate=false;
 std::atomic<bool> pauseWorkerCreate{false},workerCreating{false},releaseWorkerCreate{false};
 std::atomic<bool> pauseWorkerDetach{false},workerDetached{false},releaseWorkerDetach{false};
+unsigned icmpSent=0;uint32_t icmpSource=0,icmpDestination=0;uint8_t icmpType=0xff;
 uint8_t capturedFrame[brook::ETH_FRAME_MAX]{};
 uint32_t capturedFrameLength=0;
 int frameTransmitResult=0;
@@ -196,6 +197,11 @@ extern "C" void KPrintf(const char*, ...) {}
 namespace brook {
 int SocketLifetimeTestTransmit(uint32_t src, uint32_t dst, uint8_t proto,
                                const void* data, uint32_t len) {
+    if (proto == IP_PROTO_ICMP) {
+        ++icmpSent; icmpSource = src; icmpDestination = dst;
+        icmpType = static_cast<const IcmpHeader*>(data)->type;
+        return 0;
+    }
     assert(proto == IP_PROTO_TCP);
     const auto* tcp = static_cast<const TcpHeader*>(data);
     if (tcp->flags & TCP_FIN) { ++sentFins; lastFinSequence=ntohl(tcp->seqNum); }
@@ -2414,6 +2420,28 @@ int main() {
         ip.srcIp = custom.sin_addr;
         HandleIpv4(wire, sizeof(wire), false, 0);
         assert(SockRecvFrom(socket, &byte, sizeof(byte), &source) == 1 && source.sin_addr == custom.sin_addr);
+
+        // An echo request to the second address is answered from that
+        // address, so the reply leaves via the interface that owns it.
+        struct EchoWire { EthHeader eth; Ipv4Header ip; IcmpHeader icmp; uint8_t data[4]; } echo{};
+        echo.eth.etherType = htons(ETH_TYPE_IPV4);
+        echo.ip.verIhl = 0x45;
+        echo.ip.totalLen = htons(sizeof(EchoWire) - sizeof(EthHeader));
+        echo.ip.protocol = IP_PROTO_ICMP;
+        echo.ip.srcIp = custom.sin_addr;
+        echo.icmp.type = ICMP_ECHO_REQUEST;
+        for (uint32_t target : {second.ipAddr, first.ipAddr}) {
+            echo.ip.dstIp = target;
+            icmpSent = 0; icmpSource = 0; icmpType = 0xff;
+            HandleIpv4(reinterpret_cast<const uint8_t*>(&echo), sizeof(echo), false, 0);
+            assert(icmpSent == 1 && icmpType == ICMP_ECHO_REPLY);
+            assert(icmpSource == target && icmpDestination == custom.sin_addr);
+            assert(NetIfForSourceDst(icmpSource, custom.sin_addr) == NetFindOwnInterface(target));
+        }
+        echo.ip.dstIp = broadcast.sin_addr;
+        icmpSent = 0;
+        HandleIpv4(reinterpret_cast<const uint8_t*>(&echo), sizeof(echo), false, 0);
+        assert(icmpSent == 1 && icmpSource == 0); // unbound: normal source selection
         SockClose(socket);
         g_netIf = g_netIfs[0] = g_netIfs[1] = nullptr;
         g_netIfCount = 0;

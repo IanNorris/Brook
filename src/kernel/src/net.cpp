@@ -1336,7 +1336,11 @@ static void HandleIcmp(const Ipv4Header* ip, const uint8_t* payload, uint32_t pa
         replyIcmp->checksum = 0;
         replyIcmp->checksum = InetChecksum(reply, payloadLen);
 
-        NetSendIpv4From(0,ip->srcIp,IP_PROTO_ICMP,reply,payloadLen,scope);
+        // Reply from the address the request was sent to, so it leaves via
+        // the interface that owns it (as TCP replies do). Broadcast and
+        // scoped loopback requests keep normal source selection.
+        const uint32_t source = !scope && NetFindOwnInterface(ip->dstIp) ? ip->dstIp : 0;
+        NetSendIpv4From(source,ip->srcIp,IP_PROTO_ICMP,reply,payloadLen,scope);
     }
 }
 
