@@ -22,7 +22,7 @@ display none, user-mode network restricted to a localhost forward.
 The operator seed is passed by path to the bridge client for the attach, and
 read here once only to prove it occurs in none of the published files.
 """
-import argparse, hashlib, json, os, selectors, shutil, socket, subprocess, sys, tempfile, time, uuid
+import argparse, hashlib, json, os, re, selectors, shutil, socket, subprocess, sys, tempfile, time, uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -267,7 +267,8 @@ def run_one(args, base, topology):
         for needle in ('8086:10d3 ', ' pci-bridge ', '  window mem 0x', '  window pref64 ', ' pcie id 10 ',
                        ' root-port ', '  ecap 100 aer id 0001', ' dsn id 0003'):
             assert needle in inventory, f'PCIe inventory lacks {needle!r}'
-        assert 'e1000' not in text.lower().replace('8086:10d3', ''), 'Intel NIC must stay unbound'
+        # Word match: DMA addresses such as 0x30e1000 are not the driver.
+        assert not re.search(r'\be1000', text.lower().replace('8086:10d3', '')), 'Intel NIC must stay unbound'
         results['inventory'] = {'bytes': info['bytes'], 'lines': info['lines'],
                                 'pci_summary': [l for l in inventory.splitlines() if l.startswith('pci functions')]}
         pci = rpc.tool('hw_command', {'session': session, 'command': 'bridge hardware pci 0 16'})
