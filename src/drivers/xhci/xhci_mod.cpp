@@ -521,7 +521,39 @@ static volatile bool  g_irqActive = false;  // true once ISR is registered
 // ASM1142/2142/3242, which Linux limits to 32-bit DMA). Every later xHCI
 // allocation then comes from the first-fit run allocator below 4 GiB.
 static bool g_dma32=false;
+// Low-memory reserve for allocations after boot (hot-plug enumeration).
+// Once a large RAM image (the live store) is resident, nothing below the
+// 4 GiB DMA32 limit may be free, and every late enumeration failed at its
+// first allocation ("scratch allocation failed"). Taken once at module
+// init; bump-allocated, not recycled (gone devices keep their buffers).
+static uint8_t* g_dmaReserve=nullptr;
+static uint64_t g_dmaReservePhys=0;
+static uint32_t g_dmaReservePages=0,g_dmaReserveUsed=0;
+static SpinLock g_dmaReserveLock;
+static void* AllocDmaReserve(uint32_t pages, uint64_t& outPhys)
+{
+    SpinLockAcquire(&g_dmaReserveLock);
+    void* ptr=nullptr;
+    if(g_dmaReserve && pages<=g_dmaReservePages-g_dmaReserveUsed){
+        outPhys=g_dmaReservePhys+uint64_t(g_dmaReserveUsed)*4096;
+        ptr=g_dmaReserve+uint64_t(g_dmaReserveUsed)*4096;
+        g_dmaReserveUsed+=pages;
+    }
+    const uint32_t used=g_dmaReserveUsed,total=g_dmaReservePages;
+    SpinLockRelease(&g_dmaReserveLock);
+    if(ptr){memset(ptr,0,uint64_t(pages)*4096);
+        if(used%64<pages||total-used<64)KPrintf("xhci: DMA reserve %u/%u pages used\n",used,total);}
+    else KPrintf("xhci: DMA reserve exhausted (%u/%u pages, need %u)\n",used,total,pages);
+    return ptr;
+}
+static void* AllocDmaBufferDirect(uint32_t pages, uint64_t& outPhys, PmmOwner owner);
 static void* AllocDmaBuffer(uint32_t pages, uint64_t& outPhys, PmmOwner owner = PmmOwner::XhciDma)
+{
+    if(void* ptr=AllocDmaBufferDirect(pages,outPhys,owner))return ptr;
+    if(!g_dmaReserve || !pages || pages>16384)return nullptr;
+    return AllocDmaReserve(pages,outPhys);
+}
+static void* AllocDmaBufferDirect(uint32_t pages, uint64_t& outPhys, PmmOwner owner)
 {
     if(!pages || pages>16384) return nullptr;
     // Multi-page requests scan from physical zero; a single page uses the
@@ -4882,6 +4914,17 @@ static int XhciModuleInit()
         UsbStatusSetProvider(XhciStatusText);
         DebugUsbCommandSetHandler(XhciUsbCommand);
         if (!XhciUacPrealloc()) KPuts("uac: stream buffers unavailable at init\n");
+        // Late-enumeration reserve (see AllocDmaReserve): 8 MiB, else 2 MiB.
+        static const uint32_t reserveSizes[] = {2048u, 512u};
+        for (uint32_t pages : reserveSizes) {
+            uint64_t phys = 0;
+            if (auto* r = static_cast<uint8_t*>(AllocDmaBufferDirect(pages, phys, PmmOwner::XhciDma))) {
+                g_dmaReservePhys = phys; g_dmaReservePages = pages; g_dmaReserve = r;
+                KPrintf("xhci: DMA reserve %u pages at %lx for hot-plug enumeration\n", pages,
+                        static_cast<unsigned long>(phys));
+                break;
+            }
+        }
         if (auto* marker = VfsOpen("/etc/usb-audio-mixer")) {
             VfsClose(marker);
             if (!KernelWorkerStart("uac_auto", XhciUacAutoStart, nullptr)) KPuts("uac: autostart worker queue full\n");
