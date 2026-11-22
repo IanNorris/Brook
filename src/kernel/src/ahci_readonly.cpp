@@ -151,6 +151,7 @@ struct PortIo {
     bool allowStaleTaskBusy=false;
     bool postedWithStaleTaskBusy=false;
     bool lastDmaCompletedWithStaleTaskBusy=false;
+    bool lastCommandCompletedOk=false;
     uint32_t receivedRegisterFis() {
         return *reinterpret_cast<volatile const uint32_t*>(dma+fisOffset+0x40);
     }

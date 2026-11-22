@@ -32,6 +32,18 @@ inline bool StaleBusyShadow(uint32_t task, uint32_t interruptStatus, uint32_t fi
     return task==0xc0u && (interruptStatus&D2H_REGISTER_IRQ) &&
         CleanRegisterFis(fis) && !(fis>>24);
 }
+// AHCI 1.3.1 §3.3.5: DHRS, PSS, DSS, SDBS and DPS report ordinary command
+// progress. Every other PxIS bit is an error, link or hotplug event.
+static constexpr uint32_t BENIGN_COMMAND_IRQ=0x2fu;
+// Workstation may retire a command (CI clear, completion accepted) and leave
+// PxTFD at exactly BSY|DRDY with no received FIS at all. Accept that shadow
+// before the next issue only after this port's previous command completed
+// successfully and the port shows no error, link or exchange evidence.
+inline bool EmptyFisBusyShadow(uint32_t task, uint32_t interruptStatus, uint32_t serr,
+                               uint32_t fis, bool previousCompletedOk) {
+    return previousCompletedOk && task==0xc0u && !fis && !serr &&
+        !(interruptStatus&~BENIGN_COMMAND_IRQ);
+}
 inline bool NeedsQuarantine(Result result) {
     // Never reuse a slot that might still DMA, and never proceed after an
     // explicit controller, device or media error. A retired but unconfirmed
@@ -104,12 +116,18 @@ template<class Io> Result ArmCommand(Io& io) {
             // may supply its late, clean FIS during this pre-issue wait.
             postWithBusyShadow=StaleBusyShadow(task,pending,fis) &&
                 (fis==io.lastCompletionFis || io.lastDmaCompletedWithStaleTaskBusy);
+            // The previous completion's FIS may never arrive (or was cleared
+            // before that command's issue). Its accepted completion, clean
+            // PxIS/PxSERR and the exact shadow still prove an idle device.
+            postWithBusyShadow=postWithBusyShadow ||
+                EmptyFisBusyShadow(task,pending,io.read(SERR),fis,io.lastCommandCompletedOk);
         }
         if((task&TASK_ACTIVE) && !postWithBusyShadow)return Result::DeviceBusy;
     }
     if(io.read(CI) || io.read(SACT))return Result::Busy;
     io.lastCompletionFis=0;
     io.lastDmaCompletedWithStaleTaskBusy=false;
+    io.lastCommandCompletedOk=false;
     io.clearReceivedRegisterFis();
     // Preserve error and hotplug latches even if one asserts during W1C.
     io.write(IS,~(MEDIA_CHANGE_IRQ|ERROR_MASK));io.fence();
@@ -223,6 +241,8 @@ template<class Io> Result CompleteCommand(Io& io, uint32_t expectedBytes) {
     if(io.transferred()!=expectedBytes)return Result::ShortTransfer;
     if(cleanFis)io.lastCompletionFis=fis;
     io.lastDmaCompletedWithStaleTaskBusy=delayedFis;
+    // The only successful return for both DMA and no-data commands.
+    io.lastCommandCompletedOk=true;
     return Result::Ok;
 }
 

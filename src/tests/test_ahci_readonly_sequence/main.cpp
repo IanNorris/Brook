@@ -11,6 +11,7 @@ struct Mock {
     uint32_t taskOnCompletion=0xffffffffu;
     uint32_t taskOnSettle=0, fisOnSettle=0xffffffffu;
     bool allowStaleTaskBusy=false, postedWithStaleTaskBusy=false, lastDmaCompletedWithStaleTaskBusy=false;
+    bool lastCommandCompletedOk=false;
     unsigned fisClears=0;
     uint32_t settleLink=0x133, isOnPause=0, serrOnPause=0, linkOnCompletion=0;
     uint64_t now=0, stepNs=1000000;
@@ -108,7 +109,7 @@ int main(){
 
     Mock physical=workstation();physical.allowStaleTaskBusy=false;
     assert(Submit(physical,512)==Result::DeviceBusy && physical.commandIssues==1);
-    Mock unverified=workstation();unverified.lastCompletionFis=0;
+    Mock unverified=workstation();unverified.lastCompletionFis=0;unverified.lastCommandCompletedOk=false;
     assert(Submit(unverified,512)==Result::DeviceBusy && unverified.commandIssues==1);
     Mock changedFis=workstation();changedFis.receivedFis=0x00504034;
     assert(Submit(changedFis,512)==Result::DeviceBusy && changedFis.commandIssues==1);
@@ -167,6 +168,102 @@ int main(){
         assert(Submit(exchange,bytes)==Result::MediaChanged && exchange.polls==1);
         Mock stalled=lagged;stalled.stepNs=0;
         assert(Submit(stalled,bytes)==Result::Ok && stalled.polls==TASK_SETTLE_POLLS);
+    }
+    // quickwins-25f0ea6a: after an accepted completion Workstation kept
+    // PxTFD=0xc0 with DHRS set, CI/SACT clear and an empty received FIS
+    // through the whole pre-issue wait; the port was quarantined.
+    {
+        const auto vm=[] {
+            Mock io;io.allowStaleTaskBusy=true;
+            io.regs[CMD/4]=0x4c017;io.regs[SCTL/4]=0x300;
+            io.injectIs=D2H_REGISTER_IRQ;io.stepNs=1000;
+            return io;
+        };
+        const auto expectStalePost=[](Mock& io, bool noData) {
+            const unsigned issues=io.commandIssues;const uint64_t began=io.now;
+            io.injectFis=0x00404034;io.taskOnCompletion=0x40;
+            assert((noData?SubmitNoData(io):Submit(io,512))==Result::Ok);
+            assert(io.commandIssues==issues+1 && io.postedWithStaleTaskBusy && io.lastCommandCompletedOk);
+            // The bounded pre-issue wait ran before the shadow was accepted.
+            assert(io.now-began>=TASK_SETTLE_NS);
+        };
+        // DMA completion accepted on DHRS + PRDBC with no FIS; FIS never lands.
+        Mock neverFis=vm();neverFis.injectFis=0;neverFis.taskOnCompletion=0xc0;
+        assert(Submit(neverFis,512)==Result::Ok && neverFis.lastDmaCompletedWithStaleTaskBusy);
+        assert(neverFis.lastCommandCompletedOk && neverFis.receivedFis==0);
+        expectStalePost(neverFis,false);
+        // DMA completion accepted with TFD idle and no FIS; the shadow returns later.
+        Mock idleThenShadow=vm();idleThenShadow.injectFis=0;idleThenShadow.taskOnCompletion=0x40;
+        assert(Submit(idleThenShadow,512)==Result::Ok && !idleThenShadow.lastDmaCompletedWithStaleTaskBusy);
+        assert(idleThenShadow.lastCompletionFis==0);
+        idleThenShadow.regs[TFD/4]=0xc0;
+        expectStalePost(idleThenShadow,false);
+        // Clean DMA completion whose FIS was then cleared (ArmCommand) and not reposted.
+        Mock clearedFis=vm();clearedFis.injectFis=0x00404034;
+        assert(Submit(clearedFis,512)==Result::Ok && clearedFis.lastCompletionFis==0x00404034);
+        clearedFis.receivedFis=0;clearedFis.regs[TFD/4]=0xc0;
+        expectStalePost(clearedFis,false);
+        // No-data FLUSH completion, then an empty FIS and the busy shadow.
+        Mock flushed=vm();flushed.injectFis=0x00404034;flushed.transferredBytes=0;
+        assert(SubmitNoData(flushed)==Result::Ok && flushed.lastCommandCompletedOk);
+        flushed.receivedFis=0;flushed.regs[TFD/4]=0xc0;flushed.transferredBytes=512;
+        expectStalePost(flushed,false);
+        // ...and a flush posted over the same shadow.
+        Mock beforeFlush=vm();beforeFlush.injectFis=0;beforeFlush.taskOnCompletion=0xc0;
+        assert(Submit(beforeFlush,512)==Result::Ok);
+        beforeFlush.transferredBytes=0;
+        expectStalePost(beforeFlush,true);
+
+        const auto shadow=[&] {
+            Mock io=vm();io.injectFis=0;io.taskOnCompletion=0xc0;
+            assert(Submit(io,512)==Result::Ok && io.commandIssues==1);
+            return io;
+        };
+        // Real errors still fail; unexplained state still refuses to issue.
+        Mock taskErr=shadow();taskErr.regs[TFD/4]=0xc1;
+        assert(Submit(taskErr,512)==Result::DeviceError && taskErr.commandIssues==1);
+        Mock tfes=shadow();tfes.regs[IS/4]|=1u<<30;
+        assert(Submit(tfes,512)==Result::DeviceError && tfes.commandIssues==1);
+        Mock ifs=shadow();ifs.isOnPause=1u<<27;
+        assert(Submit(ifs,512)==Result::DeviceError && ifs.commandIssues==1);
+        Mock serrCmd=shadow();serrCmd.regs[SERR/4]=1u<<10;
+        assert(Submit(serrCmd,512)==Result::DeviceError && serrCmd.commandIssues==1);
+        Mock serrRecovered=shadow();serrRecovered.regs[SERR/4]=1u<<1;
+        assert(Submit(serrRecovered,512)==Result::DeviceBusy && serrRecovered.commandIssues==1);
+        Mock linkEvent=shadow();linkEvent.regs[IS/4]|=1u<<22;
+        assert(Submit(linkEvent,512)==Result::DeviceBusy && linkEvent.commandIssues==1);
+        Mock drqShadow=shadow();drqShadow.regs[TFD/4]=0xc8;
+        assert(Submit(drqShadow,512)==Result::DeviceBusy && drqShadow.commandIssues==1);
+        Mock bsyOnly=shadow();bsyOnly.regs[TFD/4]=0x80;
+        assert(Submit(bsyOnly,512)==Result::DeviceBusy && bsyOnly.commandIssues==1);
+        Mock busyFisShadow=shadow();busyFisShadow.receivedFis=0x00c04034;
+        assert(Submit(busyFisShadow,512)==Result::DeviceBusy && busyFisShadow.commandIssues==1);
+        Mock priorFailed=shadow();priorFailed.lastCommandCompletedOk=false;
+        assert(Submit(priorFailed,512)==Result::DeviceBusy && priorFailed.commandIssues==1);
+        // A failed completion clears the evidence for the next issue.
+        Mock failedThenShadow=shadow();failedThenShadow.transferredBytes=511;
+        failedThenShadow.taskOnCompletion=0x40;
+        assert(Submit(failedThenShadow,512)==Result::ShortTransfer && !failedThenShadow.lastCommandCompletedOk);
+        failedThenShadow.regs[TFD/4]=0xc0;failedThenShadow.transferredBytes=512;
+        assert(Submit(failedThenShadow,512)==Result::DeviceBusy && failedThenShadow.commandIssues==2);
+        // A shadow that clears inside the wait issues normally.
+        Mock clears=shadow();clears.settleAfter=clears.polls+2;clears.taskOnSettle=0x40;
+        clears.taskOnCompletion=0x40;clears.injectFis=0x00404034;
+        assert(Submit(clears,512)==Result::Ok && clears.commandIssues==2 && !clears.postedWithStaleTaskBusy);
+
+        // Generic (non-VMware) HBAs: identical refusal, polls and register
+        // writes whether or not the previous command completed.
+        for(bool completedOk:{false,true}) for(bool noData:{false,true}) {
+            Mock generic=shadow();
+            generic.allowStaleTaskBusy=false;generic.lastCommandCompletedOk=completedOk;
+            Mock reference=generic;reference.lastCommandCompletedOk=!completedOk;
+            const auto a=noData?SubmitNoData(generic):Submit(generic,512);
+            const auto b=noData?SubmitNoData(reference):Submit(reference,512);
+            assert(a==Result::DeviceBusy && b==a);
+            assert(generic.commandIssues==1 && generic.writes==reference.writes);
+            assert(generic.polls==reference.polls && generic.fences==reference.fences);
+            assert(generic.regs[IS/4]==reference.regs[IS/4] && generic.receivedFis==reference.receivedFis);
+        }
     }
     Mock lostFis=workstation();lostFis.injectIs=0;lostFis.injectFis=0;
     assert(Submit(lostFis,512)==Result::CompletionUnconfirmed && lostFis.commandIssues==2);
