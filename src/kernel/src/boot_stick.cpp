@@ -107,7 +107,7 @@ bool HashFile(const char* path, uint64_t expectedBytes, uint8_t out[32])
 
 // The pair the loader booted must be on the volume, byte for byte, as the
 // root set or as PREV/ (after an update the running set lives in PREV/).
-bool SetMatches(bool prev)
+[[maybe_unused]] bool SetMatches(bool prev)
 {
     char path[64];
     auto join = [&](const char* tail) {

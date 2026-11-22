@@ -76,8 +76,16 @@ ETC_ALLOWED = {*MARKERS, 'i219-attach', 'i219-reset', 'hardware-payload-id', 're
 # Guest helpers in /boot: the boot-stick update receiver and the payload-ID reporter.
 HELPERS = {'HWRTXUP.ELF': 'tools/hardware_rtx_update.c', 'HWSTATUS.ELF': 'tools/hardware_status.c'}
 INIT_RC = b'set wm\nset vfb none\nkconsole\n'
-LOADER_CONFIG = (b'TARGET=KERNEL\\BROOK.ELF\nDEBUG_TEXT=1\nLOG_MEMORY=0\nLOG_INTERRUPTS=0\n'
-                 b'UPDATE_SLOTS=0\nRECOVERY_MENU=0\nSTICK_SETS=1\nDISPLAY_WIDTH=1920\nDISPLAY_HEIGHT=1080\n')
+def loader_config(width=1920, height=1080):
+    """BROOK.CFG. DISPLAY_* is the loader's GOP cap: it picks the largest
+    firmware mode that fits. BROOK.CFG is not part of PREV/: a cap that broke
+    the boot would break the fallback too, so raise it only deliberately."""
+    return (b'TARGET=KERNEL\\BROOK.ELF\nDEBUG_TEXT=1\nLOG_MEMORY=0\nLOG_INTERRUPTS=0\n'
+            b'UPDATE_SLOTS=0\nRECOVERY_MENU=0\nSTICK_SETS=1\n' +
+            f'DISPLAY_WIDTH={width}\nDISPLAY_HEIGHT={height}\n'.encode())
+
+
+LOADER_CONFIG = loader_config()
 README = '''Brook desktop smoke test (RAM only)
 
 Boot once from the firmware boot menu (UEFI entry for this stick).
@@ -228,7 +236,8 @@ def build(args):
     for name, src in sources.items():
         (staged / name).parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(src, staged / name)
-    (staged / 'BROOK.CFG').write_bytes(LOADER_CONFIG)
+    config = loader_config(*args.display_max)
+    (staged / 'BROOK.CFG').write_bytes(config)
     (staged / 'README.TXT').write_text(README)
     (staged / 'SET.BIN').write_bytes(stick_set((staged / 'KERNEL/BROOK.ELF').read_bytes(),
                                                (staged / 'INITRD.IMG').read_bytes(), payload_id))
@@ -242,7 +251,7 @@ def build(args):
         'format': FORMAT, 'commit': commit, 'dirty': dirty, 'payload_id': payload_id,
         'fat_label': FAT_LABEL, 'files': files,
         'kernel_options': KERNEL_FLAGS, 'loader_options': LOADER_FLAGS,
-        'loader_config': LOADER_CONFIG.decode(), 'init_rc': INIT_RC.decode(),
+        'loader_config': config.decode(), 'init_rc': INIT_RC.decode(),
         'initrd': {'drivers': list(DRIVERS), 'etc': etc, 'markers': list(markers)},
         'i219_stage': args.i219_stage,
         'helpers': helpers,
@@ -315,8 +324,14 @@ def main():
     p.add_argument('--image', type=Path, help='also write a raw GPT/FAT32 disk image here')
     p.add_argument('--i219-stage', choices=sorted(I219_STAGES), default='probe',
                    help='I219-V bring-up stage at boot (default probe: read-only)')
+    p.add_argument('--display-max', default='1920x1080', metavar='WxH',
+                   help='GOP mode cap in BROOK.CFG (kernel supports up to 4096x2160); outside PREV/ fallback')
     p.add_argument('--allow-dirty', action='store_true')
     args = p.parse_args()
+    match = re.fullmatch(r'(\d{3,4})x(\d{3,4})', args.display_max)
+    if not match or int(match[1]) > 4096 or int(match[2]) > 2160:
+        p.error('--display-max: WxH up to 4096x2160')
+    args.display_max = (int(match[1]), int(match[2]))
     args.output = args.output.absolute()
     args.build_root = args.build_root.absolute()
     args.image = args.image.absolute() if args.image else None
