@@ -44,5 +44,7 @@ Device* PartitionParentDevice(Device* partition);
 // extent in 512-byte LBAs. False for MBR or non-partition devices.
 bool PartitionGptIdentity(Device* partition, uint8_t guid[16], uint32_t* entryNumber,
                           uint64_t* firstLba, uint64_t* sectors);
+// GPT partition name (printable ASCII; other UTF-16 units become '?').
+bool PartitionGptName(Device* partition, char out[37]);
 
 } // namespace brook

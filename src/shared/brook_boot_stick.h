@@ -13,10 +13,11 @@ enum { BROOK_IOCTL_BOOT_STICK_ARM = 0xb2f0, BROOK_IOCTL_BOOT_STICK_DISARM = 0xb2
        BROOK_IOCTL_BOOT_STICK_STATUS = 0xb2f2 };
 enum { BROOK_BOOT_STICK_RO = 1, BROOK_BOOT_STICK_RW = 2 };
 /* Live-store slot writes (network store updates). STORE_OPEN validates the
- * running set like ARM, then opens a USB write window over one raw extent of
- * the boot stick's disk that is either exactly a GPT partition other than the
- * boot volume, or entirely unpartitioned; never the GPT areas, never the boot
- * volume and never the extent the running /etc/live-store record names.
+ * running set like ARM, then opens a USB write window over one extent of the
+ * boot stick's disk that is exactly a GPT partition named BROOK_STORE_A or
+ * BROOK_STORE_B (created by the operator on the host); never unallocated
+ * space, never the boot volume and never the slot the running
+ * /etc/live-store record names.
  * STORE_WRITE copies one chunk (<= 4 MiB) to an offset inside it, STORE_HASH
  * re-reads its first N bytes from the device and returns their SHA-256,
  * STORE_CLOSE flushes and closes the window. The running store and record are

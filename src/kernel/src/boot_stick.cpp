@@ -18,6 +18,7 @@
 #include "kprintf.h"
 #include "fatfs_glue.h"
 #include "vfs.h"
+#include "string.h"
 #include "../../shared/brook_boot_stick.h"
 #include "../../shared/update/payload.h"
 #include "../../shared/update/stick_set.h"
@@ -242,7 +243,7 @@ struct Range { uint64_t first, sectors; };
 bool Overlaps(Range a, Range b) { return a.first < b.first + b.sectors && b.first < a.first + a.sectors; }
 
 // Partition ranges (LBA) of the disk holding the boot volume, by GPT entry.
-unsigned DiskPartitions(Device* disk, Range* out, uint8_t (*guids)[16], unsigned capacity)
+unsigned DiskPartitions(Device* disk, Range* out, uint8_t (*guids)[16], unsigned capacity, bool* storeSlot = nullptr)
 {
     unsigned n = 0;
     if (!disk || !disk->name) return 0;
@@ -254,6 +255,11 @@ unsigned DiskPartitions(Device* disk, Range* out, uint8_t (*guids)[16], unsigned
         if (!dev || PartitionParentDevice(dev) != disk) continue;
         uint32_t entry = 0; uint64_t first = 0, sectors = 0;
         if (!PartitionGptIdentity(dev, guids[n], &entry, &first, &sectors)) continue;
+        if (storeSlot) {
+            char label[37]{};
+            storeSlot[n] = PartitionGptName(dev, label) &&
+                (!strcmp(label, "BROOK_STORE_A") || !strcmp(label, "BROOK_STORE_B"));
+        }
         out[n++] = {first, sectors};
     }
     return n;
@@ -306,13 +312,14 @@ int StoreOpenLocked(const BrookStoreExtent& extent)
     const Range running = RunningStore(disk);
     if (running.sectors && Overlaps(want, running))
         return Refuse(BROOK_BOOT_STICK_REFUSED_EXTENT, "store slot overlaps the running store");
-    Range ranges[9]; uint8_t guids[9][16];
-    const unsigned count = DiskPartitions(disk, ranges, guids, 9);
-    for (unsigned i = 0; i < count; ++i) {
-        if (!Overlaps(want, ranges[i])) continue;
-        if (ranges[i].first == want.first && ranges[i].sectors == want.sectors) continue; // exactly a partition
-        return Refuse(BROOK_BOOT_STICK_REFUSED_EXTENT, "store slot straddles a partition");
-    }
+    // Only a GPT partition the operator created and named as a store slot
+    // (BROOK_STORE_A / BROOK_STORE_B), exactly; never unallocated space.
+    Range ranges[9]; uint8_t guids[9][16]; bool slot[9]{};
+    const unsigned count = DiskPartitions(disk, ranges, guids, 9, slot);
+    bool named = false;
+    for (unsigned i = 0; i < count; ++i)
+        if (slot[i] && ranges[i].first == want.first && ranges[i].sectors == want.sectors) named = true;
+    if (!named) return Refuse(BROOK_BOOT_STICK_REFUSED_EXTENT, "store slot is not a BROOK_STORE_A/B partition");
     if (!g_storeBuffer) {
         auto base = VmmAllocPages(BROOK_STORE_WRITE_MAX / 4096, VMM_WRITABLE | VMM_NO_EXEC, MemTag::Device, KernelPid);
         if (!base) return Refuse(BROOK_BOOT_STICK_REFUSED_MOUNT, "no store buffer");
