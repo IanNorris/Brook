@@ -128,6 +128,10 @@ def main():
             '-device', 'ide-hd,bus=sata.0,drive=ahci0',
             '-drive', f'if=none,id=nvme0,format=raw,file={disks["nvme"]}', '-device', 'nvme,serial=brooksmoke,drive=nvme0',
             '-drive', f'if=none,id=vd0,format=raw,file={disks["virtio"]}', '-device', 'virtio-blk-pci,drive=vd0',
+            # PCIe root port + Intel e1000e behind it: bridge windows, extended caps,
+            # and an onboard-style Intel NIC that must stay unbound.
+            '-device', 'pcie-root-port,id=rp1,chassis=1,slot=1', '-device', 'e1000e,bus=rp1,netdev=lan',
+            '-netdev', 'user,id=lan,restrict=on',
             '-display', 'none', '-serial', 'file:' + str(base / 'serial.log'),
             '-qmp', 'unix:' + str(qmp_path) + ',server=on,wait=off', '-no-reboot']
     (base / 'argv.json').write_text(json.dumps(qemu, indent=2) + '\n')
@@ -184,6 +188,10 @@ def main():
                        ' usb ', ' sata ', ' nvme ', 'gop framebuffer', 'pci functions'):
             assert needle in inventory, f'inventory lacks {needle!r}'
         assert 'ecam_read 0 ' not in inventory and 'ecam_refused 0' in inventory, 'ECAM extended space not read'
+        for needle in ('8086:10d3 ', ' pci-bridge ', '  window mem 0x', '  window pref64 ', ' pcie id 10 ',
+                       ' root-port ', '  ecap 100 aer id 0001', ' dsn id 0003'):
+            assert needle in inventory, f'PCIe inventory lacks {needle!r}'
+        assert 'e1000' not in text.lower().replace('8086:10d3', ''), 'Intel NIC must stay unbound'
         results['inventory'] = {'bytes': info['bytes'], 'lines': info['lines'],
                                 'pci_summary': [l for l in inventory.splitlines() if l.startswith('pci functions')]}
         pci = rpc.tool('hw_command', {'session': session, 'command': 'bridge hardware pci 0 16'})
