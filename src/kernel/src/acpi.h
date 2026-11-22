@@ -77,6 +77,10 @@ uint32_t AcpiInventoryCount();
 bool AcpiInventoryRead(uint32_t index,uint32_t offset,void* out,uint32_t bytes,AcpiSdtHeader& header);
 // Copy exactly one checksum-validated DMAR into caller-owned memory. Rejects
 // duplicate or unreadable root entries and never follows addresses in DMAR.
+// Header of inventory entry index (0 = DSDT); any signature, header only.
+bool AcpiInventoryHeader(uint32_t index,AcpiSdtHeader& header);
+// Copy one unique checksum-validated MCFG or DMAR; other signatures refused.
+bool AcpiUniqueTableCopy(const char* signature,void* out,uint32_t capacity,uint32_t& bytes);
 bool AcpiUniqueDmarCopy(void* out,uint32_t capacity,uint32_t& bytes);
 
 } // namespace brook

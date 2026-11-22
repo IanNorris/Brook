@@ -365,6 +365,7 @@ add_executable(kernel
     src/display.cpp
     src/display_power.cpp
     src/ahci_observe.cpp
+    src/hw_inventory.cpp
     src/hda_observe.cpp
     src/native_tsc_observe.cpp
     src/ahci_readonly.cpp

@@ -1,3 +1,4 @@
+#include "hw_inventory.h"
 #include "core_autodump.h"
 #include "lastlog.h"
 #include "desktop_identity.h"
@@ -841,6 +842,8 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     // If found, the drive is mounted at that path automatically.
     // Drives without BROOK.MNT are registered but not auto-mounted.
     brook::PciScanPrint();
+    // Opt-in read-only inventory before observers or modules touch devices.
+    brook::HwInventoryCapture(bootProtocol);
     brook::DellGpuVtdObserveConfigure();
     // One-shot HDA observation executes on the BSP before AP scheduler entry
     // and before audio modules can claim the controller.
@@ -1109,6 +1112,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     }
 
     brook::KLog("BOOT stage: network configuration complete");
+    brook::HwInventoryAnnounce();
     ConfigureResolverFile();
 
     // ---- Syscall table ----

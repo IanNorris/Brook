@@ -524,7 +524,7 @@ static void DebugTcpThread(void* /*arg*/)
         return;
     }
 
-    SerialPrintf("DEBUG_TCP: listening on port %u\n", DEBUG_TCP_PORT);
+    KPrintf("DEBUG_TCP: listening on port %u\n", DEBUG_TCP_PORT);
 
     // Accept loop — handle one client at a time
     for (;;)

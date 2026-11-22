@@ -21,6 +21,7 @@
 #include "writable_desktop.h"
 #include "ssd_install_qemu.h"
 #include "acpi.h"
+#include "hw_inventory.h"
 #include "dell_audio_probe.h"
 #include "dell_i2c_probe.h"
 #include "intel_vtd_observe.h"
@@ -1035,6 +1036,29 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
             r.text(",\"protected_memory_sampled\":");r.text(s.status.protectedMemorySampled?"true":"false");
             if(s.status.protectedMemorySampled){r.text(",");r.field("protected_memory",s.status.protectedMemory);}}
         r.text("}\n");r.send();return true;
+    }
+    if(!strcmp(command,"bridge hardware inventory-info")) {
+        Reply r;r.text("{\"hw_inventory_api\":1,\"captured\":");r.text(HwInventoryCaptured()?"true":"false");
+        r.text(",");r.field("bytes",HwInventoryBytes());r.text(",");r.field("lines",HwInventoryLines());
+        r.text(",\"truncated\":");r.text(HwInventoryOverflow()?"true":"false");
+        r.text(",\"max_chunk\":4096}\n");r.send();return true;
+    }
+    constexpr char inventoryPrefix[]="bridge hardware inventory ";
+    if(Prefix(command,inventoryPrefix)) {
+        const char* p=command+sizeof(inventoryPrefix)-1;uint32_t offset=0,count=0;
+        if(!Decimal(p,offset) || *p++!=' ' || !Decimal(p,count) || *p || !count || count>4096) {
+            DebugChannelSend("{\"hw_inventory_error\":\"Expected byte offset and count 1..4096\"}\n");return true;
+        }
+        if(!HwInventoryCaptured()) {
+            DebugChannelSend("{\"hw_inventory_error\":\"Inventory not captured (no /etc/hw-inventory marker)\"}\n");return true;
+        }
+        static char chunk[4097];
+        const uint32_t total=HwInventoryBytes();
+        if(offset>total){DebugChannelSend("{\"hw_inventory_error\":\"Offset beyond inventory\"}\n");return true;}
+        const uint32_t n=HwInventoryRead(offset,chunk,count+1);
+        Reply r;r.text("{\"hw_inventory_api\":1,");r.field("offset",offset);r.text(",");r.field("bytes",n);
+        r.text(",");r.field("total",total);r.text(",");r.field("next_offset",offset+n);
+        r.text(",\"more\":");r.text(offset+n<total?"true":"false");r.text(",\"text\":");r.quoted(chunk);r.text("}\n");r.send();return true;
     }
     if(!strcmp(command,"bridge hardware acpi-info")) {
         Reply r;r.text("{\"acpi_api\":1,");r.field("tables",AcpiInventoryCount());r.text("}\n");r.send();return true;

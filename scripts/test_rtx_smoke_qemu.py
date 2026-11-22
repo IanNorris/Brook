@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""Boot the exact desktop-smoke USB image headless in QEMU and prove its scope.
+
+q35 + OVMF + KVM, qemu-xhci with the image as a *writable* usb-storage stick and
+usb-net (CDC-ECM), plus writable sacrificial AHCI, NVMe and virtio-blk disks.
+Checks: console/serial lines, DHCP, BRIDGE_V3_LOCAL ready=1, v3 attach through
+tools/vm_bridge with the operator key, PCI inventory over the bridge, orderly
+shutdown, and that no attached disk (including the stick) changed. Host-only:
+display none, user-mode network restricted to a localhost forward.
+
+The operator seed is passed by path to the bridge client for the attach, and
+read here once only to prove it occurs in none of the published files.
+"""
+import argparse, hashlib, json, os, selectors, shutil, socket, subprocess, sys, tempfile, time, uuid
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def sha(path):
+    h = hashlib.sha256()
+    with Path(path).open('rb') as s:
+        for chunk in iter(lambda: s.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+class Qmp:
+    def __init__(self, path):
+        self.s = socket.socket(socket.AF_UNIX); self.s.settimeout(10); self.s.connect(str(path))
+        self.f = self.s.makefile('rwb', buffering=0); self.f.readline(); self.call('qmp_capabilities')
+
+    def call(self, cmd, **args):
+        self.f.write((json.dumps({'execute': cmd, 'arguments': args}) + '\n').encode())
+        while True:
+            r = json.loads(self.f.readline())
+            if 'return' in r: return r['return']
+            if 'error' in r: raise RuntimeError(r)
+
+
+class Rpc:
+    def __init__(self, base):
+        env = dict(os.environ, BROOK_ROOT=str(ROOT), BROOK_HARDWARE_REGISTRY=str(base / 'hardware-registry'),
+                   BROOK_VM_REGISTRY=str(base / 'absent-vm-registry'))
+        self.log = (base / 'bridge-server.log').open('x')
+        self.owner = subprocess.Popen([sys.executable, str(ROOT / 'tools/vm_bridge/server.py')], stdin=subprocess.PIPE,
+                                      stdout=subprocess.PIPE, stderr=self.log, env=env)
+        self.id = 0; self.select = selectors.DefaultSelector(); self.select.register(self.owner.stdout, selectors.EVENT_READ)
+
+    def request(self, method, params=None):
+        self.id += 1
+        self.owner.stdin.write((json.dumps({'jsonrpc': '2.0', 'id': self.id, 'method': method, 'params': params or {}}) + '\n').encode())
+        self.owner.stdin.flush()
+        assert self.select.select(60), 'MCP response timed out'
+        r = json.loads(self.owner.stdout.readline()); assert r.get('id') == self.id and 'error' not in r, r
+        return r['result']
+
+    def tool(self, name, arguments=None):
+        r = self.request('tools/call', {'name': name, 'arguments': arguments or {}})
+        text = ''.join(i['text'] for i in r['content'] if i['type'] == 'text')
+        if r.get('isError'): raise RuntimeError(f'{name}: {text}')
+        return json.loads(text)
+
+    def close(self):
+        self.owner.stdin.close()
+        try: self.owner.wait(timeout=15)
+        except subprocess.TimeoutExpired: self.owner.terminate(); self.owner.wait(timeout=10)
+        self.log.close()
+
+
+def make_fixture_disks(base):
+    """Random-content disks; the AHCI one also carries a GPT + FAT32 'internal' volume."""
+    disks = {}
+    for name, mib in (('ahci', 64), ('nvme', 32), ('virtio', 32)):
+        path = base / f'{name}.img'
+        with path.open('xb') as f:
+            f.write(os.urandom(mib << 20))
+        disks[name] = path
+    ahci = disks['ahci']; esp = base / 'ahci-part.img'
+    with esp.open('xb') as f: f.truncate(60 << 20)
+    subprocess.run(['mkfs.fat', '-F', '32', '-n', 'WINDOWS', str(esp)], check=True, stdout=subprocess.DEVNULL)
+    marker = base / 'BROOK.MNT'; marker.write_text('/data\n')
+    subprocess.run(['mcopy', '-i', str(esp), str(marker), '::/BROOK.MNT'], check=True)
+    subprocess.run(['sfdisk', '--no-reread', '--no-tell-kernel', str(ahci)], check=True, text=True, stdout=subprocess.DEVNULL,
+                   input='label: gpt\nunit: sectors\n\nstart=2048,size=122880,type=U,name="Internal"\n')
+    with ahci.open('r+b') as dst, esp.open('rb') as src:
+        dst.seek(1 << 20); shutil.copyfileobj(src, dst)
+    esp.unlink(); marker.unlink()
+    return disks
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--files', type=Path, required=True, help='published file set with manifest.json')
+    ap.add_argument('--image', type=Path, required=True, help='raw GPT/FAT32 image built from --files')
+    ap.add_argument('--operator-seed', type=Path, required=True)
+    ap.add_argument('--output', type=Path, required=True)
+    ap.add_argument('--scan', type=Path, action='append', default=[], help='extra published paths to check for seed bytes')
+    args = ap.parse_args()
+    if subprocess.run(['pgrep', '-x', 'vmware-vmx'], stdout=subprocess.DEVNULL).returncode == 0:
+        raise SystemExit('VMware is running; QEMU proof skipped')
+    for key in ('OVMF_CODE', 'OVMF_VARS'):
+        if not os.environ.get(key): raise SystemExit('Run inside nix-shell (OVMF paths)')
+    base = args.output.absolute(); base.mkdir(parents=True, exist_ok=False)
+    manifest = json.loads((args.files / 'manifest.json').read_text())
+    for name, row in manifest['files'].items():
+        assert sha(args.files / name) == row['sha256'], name
+        data = subprocess.check_output(['mtype', '-i', f'{args.image}@@1048576', '::/' + name])
+        assert hashlib.sha256(data).hexdigest() == row['sha256'], f'image differs from file set: {name}'
+    stick = base / 'stick.raw'; shutil.copyfile(args.image, stick)
+    disks = make_fixture_disks(base)
+    before = {name: sha(p) for name, p in {**disks, 'stick': stick}.items()}
+    variables = base / 'VARS.fd'; shutil.copy2(os.environ['OVMF_VARS'], variables); variables.chmod(0o600)
+    vars_before = sha(variables)
+    with socket.socket() as s:
+        s.bind(('127.0.0.1', 0)); port = s.getsockname()[1]
+    # AF_UNIX paths are limited to 108 bytes; keep QMP in a short private directory.
+    qmp_dir = Path(tempfile.mkdtemp(prefix='rtxq-')); qmp_path = qmp_dir / 'qmp.sock'
+    qemu = ['qemu-system-x86_64', '-machine', 'q35', '-accel', 'kvm', '-cpu', 'host', '-smp', '4', '-m', '2048', '-nodefaults',
+            '-drive', 'if=pflash,format=raw,readonly=on,file=' + os.environ['OVMF_CODE'],
+            '-drive', 'if=pflash,format=raw,file=' + str(variables),
+            '-device', 'VGA', '-device', 'qemu-xhci,id=usbc',
+            '-drive', f'if=none,id=stick,format=raw,file={stick}',
+            '-device', 'usb-storage,bus=usbc.0,port=1,drive=stick,bootindex=1',
+            '-device', 'usb-net,bus=usbc.0,port=2,netdev=network',
+            '-netdev', f'user,id=network,restrict=on,hostfwd=tcp:127.0.0.1:{port}-:1234',
+            '-device', 'ahci,id=sata', '-drive', f'if=none,id=ahci0,format=raw,file={disks["ahci"]}',
+            '-device', 'ide-hd,bus=sata.0,drive=ahci0',
+            '-drive', f'if=none,id=nvme0,format=raw,file={disks["nvme"]}', '-device', 'nvme,serial=brooksmoke,drive=nvme0',
+            '-drive', f'if=none,id=vd0,format=raw,file={disks["virtio"]}', '-device', 'virtio-blk-pci,drive=vd0',
+            '-display', 'none', '-serial', 'file:' + str(base / 'serial.log'),
+            '-qmp', 'unix:' + str(qmp_path) + ',server=on,wait=off', '-no-reboot']
+    (base / 'argv.json').write_text(json.dumps(qemu, indent=2) + '\n')
+    log = (base / 'qemu.log').open('x'); owner = subprocess.Popen(qemu, stdout=log, stderr=subprocess.STDOUT)
+    rpc = None; results = {'port_forward': port}
+    serial_path = base / 'serial.log'
+
+    def serial():
+        return serial_path.read_text(errors='replace') if serial_path.exists() else ''
+
+    def wait_for(needle, timeout=120):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            assert owner.poll() is None, 'QEMU ended early\n' + serial()[-3000:]
+            text = serial()
+            assert 'PANIC_HEX:' not in text, text[-3000:]
+            if needle in text: return text
+            time.sleep(0.1)
+        raise TimeoutError(f'{needle!r} not seen\n' + serial()[-3000:])
+
+    try:
+        wait_for('DEBUG_TCP: listening on port 1234')
+        text = serial()
+        required = ['HWINV_BEGIN', 'HWINV_END', 'net: IP 10.0.2.15 (DHCP)', 'BRIDGE endpoint tcp 10.0.2.15:1234',
+                    'BRIDGE_V3_LOCAL build=', 'operators=1 ready=1', 'xhci: physical storage probe is read-only',
+                    'xhci: CDC-ECM network interface ready', 'HWINV CPU ', 'HWINV pci ']
+        missing = [r for r in required if r not in text]
+        assert not missing, f'missing serial lines: {missing}'
+        assert text.count('BRIDGE_V3_LOCAL policy_sha256=' + manifest['bridge_v3']['policy_sha256']) >= 2
+        for forbidden in ('AHCI_', 'ahci: ', 'mounted at /data', 'ext2: mounted'):
+            assert forbidden not in text, f'unexpected storage activity: {forbidden}'
+        results['serial_ok'] = required
+        rpc = Rpc(base); rpc.request('initialize', {'protocolVersion': '2025-06-18'})
+        attached = rpc.tool('hw_attach', {'host': '127.0.0.1', 'port': port, 'auth_mode': 'v3',
+                                          'operator_key_file': str(args.operator_seed.absolute())})
+        session = attached['session']
+        assert attached['auth_mode'] == 'v3' and attached['guest']['auth_ready'] is True
+        assert attached['guest']['operator_policy_sha256'] == manifest['bridge_v3']['policy_sha256']
+        assert attached['guest']['initrd_sha256'] == manifest['files']['INITRD.IMG']['sha256']
+        results['attach'] = {k: attached['guest'].get(k) for k in ('auth_version', 'auth_ready', 'operator_keys', 'build_id',
+                                                                    'payload_id', 'initrd_sha256', 'operator_policy_sha256')}
+        info = rpc.tool('hw_command', {'session': session, 'command': 'bridge hardware inventory-info'})
+        assert info['captured'] and info['bytes'] > 0 and not info['truncated'], info
+        chunks = []; offset = 0
+        while True:
+            part = rpc.tool('hw_command', {'session': session, 'command': f'bridge hardware inventory {offset} 4096'})
+            chunks.append(part['text']); offset = part['next_offset']
+            if not part['more']: break
+        inventory = ''.join(chunks); (base / 'inventory.txt').write_text(inventory)
+        assert len(inventory) == info['bytes']
+        start = text.index('HWINV_BEGIN\n') + len('HWINV_BEGIN\n'); end = text.index('HWINV_END')
+        assert text[start:end] == inventory, 'bridge inventory differs from serial copy'
+        for needle in ('cpu vendor ', 'memmap total free', 'acpi [0] DSDT', 'mcfg segment 0', 'pci 00:00.0 8086:29c0',
+                       ' usb ', ' sata ', ' nvme ', 'gop framebuffer', 'pci functions'):
+            assert needle in inventory, f'inventory lacks {needle!r}'
+        assert 'ecam_read 0 ' not in inventory and 'ecam_refused 0' in inventory, 'ECAM extended space not read'
+        results['inventory'] = {'bytes': info['bytes'], 'lines': info['lines'],
+                                'pci_summary': [l for l in inventory.splitlines() if l.startswith('pci functions')]}
+        pci = rpc.tool('hw_command', {'session': session, 'command': 'bridge hardware pci 0 16'})
+        assert pci['pci_inventory_api'] == 1 and pci['devices'], pci
+        results['legacy_pci_inventory_total'] = pci['total']
+        logs = rpc.tool('hw_logs', {'session': session, 'limit': 64})
+        assert logs['logs_api'] == 1
+        request = uuid.uuid4().hex
+        power = rpc.tool('hw_power', {'session': session, 'request_id': request, 'operation': 'restart'})
+        results['power_request'] = power.get('state')
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and owner.poll() is None:
+            try:
+                status = rpc.tool('hw_power', {'session': session, 'request_id': request, 'operation': 'status'})
+                results.setdefault('power_states', []).append(status.get('state'))
+                if status.get('state') == 'ready':
+                    rpc.tool('hw_power', {'session': session, 'request_id': request, 'operation': 'commit'})
+            except RuntimeError:
+                pass
+            time.sleep(1)
+        # -no-reboot turns the committed ACPI reset into a QEMU exit.
+        results['orderly_restart_exit'] = owner.poll() is not None
+        if owner.poll() is None:
+            Qmp(qmp_path).call('quit')
+    finally:
+        if rpc: rpc.close()
+        if owner.poll() is None:
+            try: Qmp(qmp_path).call('quit')
+            except Exception: owner.terminate()
+        owner.wait(timeout=30); log.close()
+        shutil.rmtree(qmp_dir, ignore_errors=True)
+    after = {name: sha(p) for name, p in {**disks, 'stick': stick}.items()}
+    results['disks'] = {name: {'before': before[name], 'after': after[name], 'unchanged': before[name] == after[name]}
+                        for name in before}
+    results['ovmf_vars_unchanged'] = sha(variables) == vars_before
+    seed = args.operator_seed.read_bytes()
+    leaks = []
+    for root in [args.files, args.image, *args.scan]:
+        for path in ([root] if Path(root).is_file() else sorted(Path(root).rglob('*'))):
+            if path.is_file():
+                data = path.read_bytes()
+                if seed in data or seed.hex().encode() in data or seed.hex().upper().encode() in data:
+                    leaks.append(str(path))
+    results['seed_absent_from_outputs'] = not leaks
+    (base / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
+    print(json.dumps(results, indent=2))
+    assert not leaks, leaks
+    assert all(row['unchanged'] for row in results['disks'].values()), results['disks']
+    print('RTX_SMOKE_QEMU_PASS')
+
+
+if __name__ == '__main__':
+    main()
