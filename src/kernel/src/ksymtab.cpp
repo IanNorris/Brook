@@ -226,6 +226,7 @@ EXPORT_SYMBOL(NetWakePollThread);
 
 // Audio
 EXPORT_SYMBOL(AudioRegister);
+EXPORT_SYMBOL(AudioOutputControlState);
 EXPORT_SYMBOL(AudioClockNowNs);
 EXPORT_SYMBOL(AudioDeliveryTimingToken);
 EXPORT_SYMBOL(AudioDeliveryTimingRecord);

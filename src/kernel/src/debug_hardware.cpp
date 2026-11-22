@@ -6,6 +6,8 @@
 #include "build_info.h"
 #include "desktop_build_info.h"
 #include "audio.h"
+#include "../../drivers/xhci/usb_uac2.h"
+#include "scheduler.h"
 #include "smp.h"
 #include "shutdown.h"
 #include "usb_boot_health.h"
@@ -1051,6 +1053,52 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         text[n]=0;
         Reply r;r.text("{\"nic_api\":1,\"text\":");r.quoted(text);r.text("}\n");r.send();return true;
     }
+#if !defined(BROOK_HOST_TEST)
+    // End-to-end mixer proof on a USB audio sink: an explicit feature-unit
+    // level (same gating as "audio usb override"), mixer output unmuted at
+    // 100% for the duration, one 1 s 440 Hz -12 dBFS tone submitted as an
+    // ordinary mixer stream, then the previous control and minimum restored.
+    constexpr char mixerTonePrefix[]="bridge hardware audio mixer-tone ";
+    if(Prefix(command,mixerTonePrefix)) {
+        auto* handler=__atomic_load_n(&g_usbCommand,__ATOMIC_ACQUIRE);
+        if(!handler){DebugChannelSend("{\"audio_error\":\"No USB audio handler is loaded\"}\n");return true;}
+        static char args[160],text[3073];
+        auto call=[&](const char* a,const char* b)->uint32_t{
+            uint32_t n=0;for(const char* q=a;*q && n+1<sizeof(args);)args[n++]=*q++;
+            for(const char* q=b;q && *q && n+1<sizeof(args);)args[n++]=*q++;args[n]=0;
+            uint32_t len=handler(args,text,sizeof(text)-1);if(len>=sizeof(text))len=sizeof(text)-1;text[len]=0;return len;};
+        call("audio usb override ",command+sizeof(mixerTonePrefix)-1);
+        bool overrideOn=false;for(uint32_t i=0;text[i];++i)if(!strncmp(text+i,"override on",11)){overrideOn=true;break;}
+        if(!overrideOn){Reply r;r.text("{\"audio_api\":1,\"text\":");r.quoted(text);r.text("}\n");r.send();return true;}
+        const uint32_t previous=AudioOutputControlSnapshot()&~AudioUserUnmuteBit;
+        (void)AudioSetOutputControl(BROOK_AUDIO_DEFAULT);
+        const uint64_t start=ApicTickCount();
+        const AudioStreamId stream=AudioMixerOpen();
+        uint32_t submitted=0;
+        if(stream) {
+            Uac2Tone tone;tone.Start(440,44100,44100,441,8192);
+            static int16_t chunk[441*2];
+            uint32_t pending=0,offset=0;
+            while((tone.Active() || pending) && ApicTickCount()-start<3000) {
+                if(!pending){pending=0;while(pending<441 && tone.Active()){const int16_t v=tone.NextSample();chunk[pending*2]=v;chunk[pending*2+1]=v;++pending;}offset=0;}
+                const uint32_t accepted=AudioMixerSubmit(chunk+offset*2,pending,stream);
+                submitted+=accepted;offset+=accepted;pending-=accepted;
+                if(pending){SchedulerSleepMs(5);}
+            }
+        }
+        const uint64_t submittedTick=ApicTickCount();
+        SchedulerSleepMs(400); // mixer batches, the sink ring and the stream lead drain
+        if(stream)(void)AudioMixerClose(stream);
+        (void)AudioSetOutputControl(previous);
+        KPrintf("audio: mixer-tone %u frames submitted ticks %u..%u, control restored %x\n",submitted,
+                unsigned(start),unsigned(submittedTick),previous);
+        call("audio usb override off","");
+        call("audio usb status","");
+        Reply r;r.text("{\"audio_api\":1,");r.field("stream",stream?1u:0u);r.text(",");r.field("submitted_frames",submitted);
+        r.text(",");r.field("start_tick",start);r.text(",");r.field("submitted_tick",submittedTick);
+        r.text(",\"text\":");r.quoted(text);r.text("}\n");r.send();return true;
+    }
+#endif
     constexpr char audioPrefix[]="bridge hardware audio";
     if(Prefix(command,audioPrefix) && (!command[sizeof(audioPrefix)-1] || command[sizeof(audioPrefix)-1]==' ')) {
         auto* handler=__atomic_load_n(&g_usbCommand,__ATOMIC_ACQUIRE);

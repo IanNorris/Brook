@@ -30,6 +30,7 @@
 #include "xhci_completion_queue.h"
 #include "usb_hub_logic.h"
 #include "usb_uac2.h"
+#include "audio.h"
 #include "boot_status.h"
 #include "debug_hardware.h"
 #include "scheduler.h"
@@ -75,6 +76,8 @@ MODULE_IMPORT_SYMBOL(KPrintf);
 MODULE_IMPORT_SYMBOL(KPuts);
 MODULE_IMPORT_SYMBOL(DebugUsbCommandSetHandler);
 MODULE_IMPORT_SYMBOL(KernelWorkerStart);
+MODULE_IMPORT_SYMBOL(AudioRegister);
+MODULE_IMPORT_SYMBOL(AudioOutputControlState);
 MODULE_IMPORT_SYMBOL(SchedulerSleepMs);
 MODULE_IMPORT_SYMBOL(PlatformPowerAddQuiesce);
 MODULE_IMPORT_SYMBOL(PciQuiesceFunctionForReset);
@@ -4127,9 +4130,24 @@ struct XhciUacStream {
     Uac2Tone tone{};
     int16_t volumeMin = 0, volumeMax = 0;
     bool volumeControl = false;
+    uint32_t volumeSkip = 0;            // channels whose SET_CUR stalls (best-effort)
+    // Feature-unit level: owned by the stream thread once it runs.
+    volatile bool fuOverride = false;   // explicit command level (tone, mixer-tone)
+    volatile int16_t fuOverrideQ8 = 0;
+    volatile int16_t unmutedQ8 = -20 * 256; // mixer mode, after an explicit user unmute
+    volatile int16_t fuCurrentQ8 = 0;
+    volatile bool fuKnown = false;
+    // Mixer mode: the kernel mixer (44.1 kHz stereo S16) feeds channels 1-2.
+    volatile bool mixerMode = false, primed = false, flushRequested = false;
+    volatile uint32_t mixWrite = 0, mixRead = 0; // frame counters (SPSC)
+    volatile uint64_t mixFramesIn = 0, mixFramesOut = 0, mixUnderflows = 0, mixDropped = 0;
     uint32_t rate = 0, rateReadback = 0;
 };
 static XhciUacStream g_uac;
+static constexpr uint32_t UAC_MIX_FRAMES = 8192, UAC_MIX_PRIME = 1764; // 186 ms ring, 40 ms prime
+static int16_t g_uacMix[UAC_MIX_FRAMES * 2];
+static bool g_uacAudioRegistered = false;
+static bool XhciUacSetVolume(XhciDevice& dev, int16_t q8);
 static constexpr uint32_t UAC_DATA_SLOT = 128, UAC_DATA_LEAD = 224, UAC_FB_LEAD = 16, UAC_IOC_EVERY = 8;
 
 static bool XhciUacEventHit(const XhciController& ctrl, const Trb& event)
@@ -4199,10 +4217,24 @@ static void XhciUacQueueData()
     Trb& trb = XhciUacSlot(s.dataRing, s.dataEnq, s.dataCycle, index);
     const uint32_t frames = s.pacer.Next();
     uint8_t* out = s.dataBuf + index * UAC_DATA_SLOT;
+    if (s.flushRequested) { s.mixRead = s.mixWrite; s.primed = false; s.flushRequested = false; }
     for (uint32_t f = 0; f < frames; ++f) {
-        const int16_t v = s.tone.Active() ? s.tone.NextSample() : 0;
+        int32_t left = 0, right = 0;
+        if (s.mixerMode) {
+            const uint32_t level = __atomic_load_n(&s.mixWrite, __ATOMIC_ACQUIRE) - s.mixRead;
+            if (!s.primed && level >= UAC_MIX_PRIME) s.primed = true;
+            if (s.primed && level) {
+                const uint32_t at = (s.mixRead % UAC_MIX_FRAMES) * 2;
+                left = g_uacMix[at]; right = g_uacMix[at + 1];
+                __atomic_store_n(&s.mixRead, s.mixRead + 1, __ATOMIC_RELEASE);
+                ++s.mixFramesOut;
+            } else if (s.primed) { s.primed = false; ++s.mixUnderflows; }
+        }
+        if (s.tone.Active()) { const int16_t v = s.tone.NextSample(); left += v; right += v; }
+        if (left > 32767) left = 32767; else if (left < -32768) left = -32768;
+        if (right > 32767) right = 32767; else if (right < -32768) right = -32768;
         for (uint32_t c = 0; c < s.desc.channels; ++c) {
-            const int16_t sample = c < 2 ? v : 0;
+            const int16_t sample = int16_t(c == 0 ? left : c == 1 ? right : 0);
             uint8_t* q = out + f * s.frameBytes + c * s.desc.subslot;
             q[0] = uint8_t(sample); q[1] = uint8_t(uint16_t(sample) >> 8);
         }
@@ -4242,6 +4274,19 @@ static void XhciUacThread(void*)
         }
         const uint32_t values = __atomic_load_n(&s.fbValues, __ATOMIC_ACQUIRE);
         if (values != seenFb) { seenFb = values; (void)s.pacer.Feed(s.lastFbRaw, s.lastFbBytes); }
+        // Feature-unit level: explicit override, else (mixer mode) the user's
+        // explicit unmute of an unmuted mixer, else the device minimum.
+        const uint32_t control = AudioOutputControlState();
+        const bool userUnmuted = (control & AudioUserUnmuteBit) && !(control & BROOK_AUDIO_MUTED);
+        const int16_t want = s.fuOverride ? s.fuOverrideQ8 : (s.mixerMode && userUnmuted) ? s.unmutedQ8 : s.volumeMin;
+        if (s.volumeControl && (!s.fuKnown || want != s.fuCurrentQ8)) {
+            auto& dev = g_devices[s.device];
+            const bool ok = XhciUacSetVolume(dev, want);
+            s.fuCurrentQ8 = want; s.fuKnown = ok;
+            KPrintf("uac: EVO4 volume %d/256 dB at tick %u (%s%s)\n", int(want), unsigned(ApicTickCount()),
+                    s.fuOverride ? "command" : want != s.volumeMin ? "user unmute" : "minimum", ok ? "" : ", FAILED");
+            if (!ok) SchedulerSleepMs(100); // do not hammer a failing control
+        }
         if (s.toneRequested && !s.tone.Active() && !s.toneStartTick) {
             s.tone.Start(440, s.rate, s.rate, s.rate / 100, 8192); // 1 s, 10 ms fades, -12 dBFS
             s.toneStartTick = ApicTickCount();
@@ -4286,7 +4331,7 @@ static bool XhciUacSetVolume(XhciDevice& dev, int16_t q8)
     auto& s = g_uac;
     uint32_t failed = 0;
     for (uint32_t ch = 0; ch <= s.desc.featureChannels && ch < 32; ++ch) {
-        if (!(s.desc.featureVolumeMask & (1u << ch))) continue;
+        if (!(s.desc.featureVolumeMask & (1u << ch)) || (s.volumeSkip & (1u << ch))) continue;
         if (!XhciUacControl(dev, 0x21, 1, uint16_t(0x0200 | ch), uint16_t(s.desc.featureId << 8 | s.desc.controlInterface),
                             &q8, 2)) { failed |= 1u << ch; g_uacVolumeFailCc = dev.lastCc; }
     }
@@ -4353,6 +4398,13 @@ static void XhciUacStatus(XhciText& t)
     t.s(" values="); t.u(s.fbValues); t.s(" raw="); t.x(s.lastFbRaw, 8); t.s(" bytes="); t.u(s.lastFbBytes);
     t.s(" pacer="); t.x(s.pacer.current, 8); t.s(" nominal="); t.x(s.pacer.nominal, 8);
     t.s(" accepted="); t.u(s.pacer.accepted); t.s(" rejected="); t.u(s.pacer.rejected); t.nl();
+    t.s("mixer mode="); t.u(s.mixerMode); t.s(" primed="); t.u(s.primed); t.s(" level=");
+    t.u(s.mixWrite - s.mixRead); t.s(" in="); t.u(s.mixFramesIn); t.s(" out="); t.u(s.mixFramesOut);
+    t.s(" underflows="); t.u(s.mixUnderflows); t.s(" dropped="); t.u(s.mixDropped);
+    t.s(" registered="); t.u(g_uacAudioRegistered); t.nl();
+    t.s("fu current="); t.u(uint16_t(s.fuCurrentQ8)); t.s(" known="); t.u(s.fuKnown); t.s(" override=");
+    t.u(s.fuOverride); t.s(" unmuted_level="); t.u(uint16_t(s.unmutedQ8)); t.s(" skip="); t.x(s.volumeSkip, 2);
+    t.s(" mixer_control="); t.x(AudioOutputControlState(), 5); t.nl();
     t.s("volume fail_mask="); t.x(g_uacVolumeFailMask, 2); t.s(" fail_cc="); t.u(g_uacVolumeFailCc);
     t.s(" min="); t.u(uint16_t(s.volumeMin)); t.s(" max="); t.u(uint16_t(s.volumeMax)); t.nl();
     t.s("tone start_tick="); t.u(s.toneStartTick); t.s(" end_tick="); t.u(s.toneEndTick);
@@ -4370,7 +4422,7 @@ static bool XhciUacFindDevice(uint32_t& index)
     return false;
 }
 
-static void XhciUacStart(XhciText& t)
+static void XhciUacStart(XhciText& t, uint32_t rate, bool mixer)
 {
     auto& s = g_uac;
     if (s.active) { t.s("already active\n"); return; }
@@ -4397,7 +4449,10 @@ static void XhciUacStart(XhciText& t)
     for (auto& u : s.underrunTick) u = 0;
     s.maxLoopGap = s.lastLoop = 0;
     s.stopRequested = s.resync = s.toneRequested = s.toneDone = false; s.toneStartTick = s.toneEndTick = 0;
-    s.rate = 48000;
+    s.rate = rate;
+    s.mixerMode = mixer; s.primed = s.flushRequested = false; s.mixRead = s.mixWrite = 0;
+    s.mixFramesIn = s.mixFramesOut = s.mixUnderflows = 0;
+    s.fuOverride = false; s.fuKnown = false; s.volumeSkip = 0;
 
     // Playback volume range (feature unit), then the clock rate.
     uint8_t range[8]{};
@@ -4406,9 +4461,11 @@ static void XhciUacStart(XhciText& t)
     s.volumeMin = int16_t(range[2] | range[3] << 8); s.volumeMax = int16_t(range[4] | range[5] << 8);
     // Silence is streamed either way; a failed minimum is reported and blocks tones.
     s.volumeControl = XhciUacSetVolume(dev, s.volumeMin);
+    s.volumeSkip = g_uacVolumeFailMask & ~0x6u; // stalled extra channels are not retried
+    s.fuCurrentQ8 = s.volumeMin; s.fuKnown = s.volumeControl;
     if (!s.volumeControl) t.s("warning: volume SET_CUR (minimum) failed on channel 1/2; tones disabled\n");
     const uint16_t clockIndex = uint16_t(desc.clockId << 8 | desc.controlInterface);
-    const uint32_t rate = s.rate; uint32_t readback = 0;
+    uint32_t readback = 0;
     if (!XhciUacControl(dev, 0x21, 1, 0x0100, clockIndex, &rate, 4)) { t.s("SET_CUR sample rate failed\n"); return; }
     (void)XhciUacControl(dev, 0xa1, 1, 0x0100, clockIndex, nullptr, 4, &readback);
     s.rateReadback = readback;
@@ -4426,8 +4483,8 @@ static void XhciUacStart(XhciText& t)
         (void)XhciUacConfigureEndpoints(*dev.ctrl, dev, false);
         t.s("worker queue full\n"); return;
     }
-    KPrintf("uac: EVO4 stream started if%u alt%u %u Hz (readback %u) volume min %d/256 dB\n", desc.streamInterface,
-            desc.alternate, s.rate, readback, int(s.volumeMin));
+    KPrintf("uac: EVO4 %s stream started if%u alt%u %u Hz (readback %u) volume min %d/256 dB\n", mixer ? "mixer" : "test",
+            desc.streamInterface, desc.alternate, s.rate, readback, int(s.volumeMin));
     t.s("started\n");
 }
 
@@ -4453,48 +4510,118 @@ static void XhciUacStop(XhciText& t)
     t.s("stopped\n");
 }
 
-static void XhciUacTone(XhciText& t, const char* p)
+// Parse "<dB> [audible]"; enforce the range and the audio-muted marker.
+static bool XhciUacLevelArg(XhciText& t, const char*& p, int minimum, int maximum, int& dB)
 {
-    auto& s = g_uac;
-    if (!s.active || !s.running) { t.s("stream not running\n"); return; }
     while (*p == ' ') ++p;
     bool negative = false; if (*p == '-') { negative = true; ++p; }
-    int dB = 0; while (*p >= '0' && *p <= '9') dB = dB * 10 + (*p++ - '0');
+    if (*p < '0' || *p > '9') { t.s("expected a level in dB\n"); return false; }
+    dB = 0; while (*p >= '0' && *p <= '9') dB = dB * 10 + (*p++ - '0');
     if (negative) dB = -dB;
     while (*p == ' ') ++p;
     const bool audible = XhciArgIs(p, "audible");
     bool muted = false;
     if (auto* marker = VfsOpen("/etc/audio-muted")) { VfsClose(marker); muted = true; }
-    if (dB > -20 || dB < -90) { t.s("refused: level must be -90..-20 dB\n"); return; }
-    if (muted && !audible) { t.s("refused: audio-muted marker present; append 'audible'\n"); return; }
-    if (!s.volumeControl) { t.s("refused: volume control unavailable (minimum could not be set)\n"); return; }
-    auto& dev = g_devices[s.device];
-    const int16_t level = Uac2VolumeQ8(dB, s.volumeMin, s.volumeMax);
+    if (dB > maximum || dB < minimum) { t.s("refused: level out of range\n"); return false; }
+    if (muted && !audible) { t.s("refused: audio-muted marker present; append 'audible'\n"); return false; }
+    if (!g_uac.volumeControl) { t.s("refused: volume control unavailable\n"); return false; }
+    return true;
+}
+
+// Hand the feature unit to an explicit level and wait (<=300 ms) until the
+// stream thread has applied it.
+static bool XhciUacApplyOverride(bool on, int16_t q8)
+{
+    auto& s = g_uac;
+    s.fuOverrideQ8 = q8; s.fuOverride = on;
+    const int16_t want = on ? q8 : s.volumeMin;
+    for (uint32_t i = 0; i < 300; ++i) {
+        if (s.fuKnown && s.fuCurrentQ8 == want) return true;
+        SchedulerSleepMs(1);
+    }
+    return false;
+}
+
+static void XhciUacTone(XhciText& t, const char* p)
+{
+    auto& s = g_uac;
+    if (!s.active || !s.running) { t.s("stream not running\n"); return; }
+    int dB = 0;
+    if (!XhciUacLevelArg(t, p, -90, -20, dB)) return;
     s.toneStartTick = s.toneEndTick = 0; s.toneDone = false;
     const uint64_t volumeTick = ApicTickCount();
-    if (!XhciUacSetVolume(dev, level)) { (void)XhciUacSetVolume(dev, s.volumeMin); t.s("volume set failed\n"); return; }
-    KPrintf("uac: EVO4 volume %d dB at tick %u; 440 Hz tone for 1 s\n", dB, unsigned(volumeTick));
+    if (!XhciUacApplyOverride(true, Uac2VolumeQ8(dB, s.volumeMin, s.volumeMax))) {
+        (void)XhciUacApplyOverride(false, 0); t.s("volume set failed\n"); return;
+    }
+    KPrintf("uac: EVO4 volume %d dB from tick %u; 440 Hz tone for 1 s\n", dB, unsigned(volumeTick));
     s.toneRequested = true;
     for (uint32_t i = 0; i < 2500 && !s.toneDone; ++i) SchedulerSleepMs(1);
     s.toneRequested = false;
-    SchedulerSleepMs(30); // let the queued tail (stream lead ~12 ms) drain
-    const bool restored = XhciUacSetVolume(dev, s.volumeMin);
+    SchedulerSleepMs(40); // let the queued tail (stream lead 28 ms) drain
+    const bool restored = XhciUacApplyOverride(false, 0);
     const uint64_t restoreTick = ApicTickCount();
-    KPrintf("uac: EVO4 tone generated ticks %u..%u, volume back to minimum at %u (%s)\n", unsigned(s.toneStartTick),
+    KPrintf("uac: EVO4 tone generated ticks %u..%u, level released at %u (%s)\n", unsigned(s.toneStartTick),
             unsigned(s.toneEndTick), unsigned(restoreTick), restored ? "ok" : "FAILED");
     t.s("tone volume_tick="); t.u(volumeTick); t.s(" start="); t.u(s.toneStartTick); t.s(" end="); t.u(s.toneEndTick);
-    t.s(" restore="); t.u(restoreTick); t.s(restored ? " restored\n" : " RESTORE FAILED\n");
+    t.s(" restore="); t.u(restoreTick); t.s(restored ? " released\n" : " RELEASE FAILED\n");
 }
+
+// Kernel mixer sink (legacy play contract: 44.1 kHz stereo S16, partial
+// acceptance, never blocks). Without a mixer-mode stream, data is discarded
+// so mixer clients never stall on an absent device.
+static int XhciUacPlay(const void* samples, uint32_t bytes, uint32_t rate, uint8_t channels, uint8_t bits, bool)
+{
+    auto& s = g_uac;
+    if (rate != 44100 || channels != 2 || bits != 16 || (bytes & 3)) return -22;
+    if (!s.active || !s.mixerMode || !s.running) { s.mixDropped += bytes / 4; return int(bytes); }
+    const uint32_t used = s.mixWrite - __atomic_load_n(&s.mixRead, __ATOMIC_ACQUIRE);
+    uint32_t frames = bytes / 4, space = UAC_MIX_FRAMES - used;
+    if (frames > space) frames = space;
+    const auto* in = static_cast<const int16_t*>(samples);
+    for (uint32_t i = 0; i < frames; ++i) {
+        const uint32_t at = ((s.mixWrite + i) % UAC_MIX_FRAMES) * 2;
+        g_uacMix[at] = in[i * 2]; g_uacMix[at + 1] = in[i * 2 + 1];
+    }
+    __atomic_store_n(&s.mixWrite, s.mixWrite + frames, __ATOMIC_RELEASE);
+    s.mixFramesIn += frames;
+    return int(frames * 4);
+}
+static void XhciUacAudioStop() { g_uac.flushRequested = true; }
+static bool XhciUacAudioPlaying() { return g_uac.active && g_uac.mixerMode && g_uac.mixWrite != g_uac.mixRead; }
+static uint32_t XhciUacAudioPosition() { return uint32_t(g_uac.mixFramesOut * 4); }
+static AudioDriver g_uacAudioDriver = {"usb_uac2", XhciUacPlay, XhciUacAudioStop, XhciUacAudioPlaying, XhciUacAudioPosition};
 
 static uint32_t XhciUacCommand(const char* p, XhciText& t)
 {
+    auto& s = g_uac;
     while (*p == ' ') ++p;
     if (XhciArgIs(p, "usb")) while (*p == ' ') ++p;
     if (!*p || XhciArgIs(p, "status")) XhciUacStatus(t);
-    else if (XhciArgIs(p, "start")) { XhciUacStart(t); XhciUacStatus(t); }
+    else if (XhciArgIs(p, "start")) { XhciUacStart(t, 48000, false); XhciUacStatus(t); }
+    else if (XhciArgIs(p, "mixer")) {
+        if (!g_uacAudioRegistered) {
+            g_uacAudioRegistered = AudioRegister(&g_uacAudioDriver);
+            if (!g_uacAudioRegistered) { t.s("another audio driver is registered\n"); return t.len; }
+        }
+        XhciUacStart(t, 44100, true); XhciUacStatus(t);
+    }
     else if (XhciArgIs(p, "stop")) { XhciUacStop(t); XhciUacStatus(t); }
     else if (XhciArgIs(p, "tone")) { XhciUacTone(t, p); XhciUacStatus(t); }
-    else t.s("usage: bridge hardware audio usb [status|start|stop|tone <dB> audible]");
+    else if (XhciArgIs(p, "level")) {
+        int dB = 0;
+        if (XhciUacLevelArg(t, p, -90, 0, dB)) {
+            s.unmutedQ8 = Uac2VolumeQ8(dB, s.volumeMin, s.volumeMax);
+            t.s("unmuted level set (applies after an explicit user unmute)\n");
+        }
+        XhciUacStatus(t);
+    }
+    else if (XhciArgIs(p, "override")) {
+        while (*p == ' ') ++p;
+        if (XhciArgIs(p, "off")) t.s(XhciUacApplyOverride(false, 0) ? "override off\n" : "override off: not applied\n");
+        else { int dB = 0; if (s.running && XhciUacLevelArg(t, p, -90, -20, dB))
+            t.s(XhciUacApplyOverride(true, Uac2VolumeQ8(dB, s.volumeMin, s.volumeMax)) ? "override on\n" : "override: not applied\n"); }
+    }
+    else t.s("usage: bridge hardware audio usb [status|start|mixer|stop|tone <dB> audible|level <dB> audible|override <dB> audible|off]");
     return t.len;
 }
 
