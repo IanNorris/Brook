@@ -39,8 +39,15 @@ bool LiveStoreIsStorePartition(Device* partition)
     if (!partition || !ReadRecord(record, true)) return false;
     uint8_t guid[16]; uint32_t entry = 0; uint64_t first = 0, sectors = 0;
     if (!PartitionGptIdentity(partition, guid, &entry, &first, &sectors)) return false;
-    for (unsigned i = 0; i < 16; ++i) if (guid[i] != record.guid[i]) return false;
-    return true;
+    bool same = true;
+    for (unsigned i = 0; i < 16; ++i) same &= guid[i] == record.guid[i];
+    if (same) return true;
+    // Store slots (current or previous) on the boot stick are never mounted
+    // directly: only the boot volume (entry 1) is left to the USB probe.
+    const int disk = BootStickDiskIndex();
+    const char* name = partition->name;
+    return disk >= 0 && name && name[0] == 'u' && name[1] == 's' && name[2] == 'b' &&
+           name[3] == char('0' + disk) && name[4] == 'p' && entry != 1;
 }
 
 bool LiveStoreBoot(uint8_t* nextDrive)

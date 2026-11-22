@@ -1047,7 +1047,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
                 brook::Device* pd = brook::DeviceFind(pname);
                 if (!pd) continue;
                 if (brook::LiveStoreIsStorePartition(pd)) {
-                    brook::KPrintf("usb-gpt: %s is the live store; copied to RAM later, not mounted\n", pname);
+                    brook::KPrintf("usb-gpt: %s is a live-store slot; not mounted (the store is copied to RAM)\n", pname);
                     continue;
                 }
 
