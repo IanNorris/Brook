@@ -168,6 +168,12 @@ struct NetDriverSnapshot {
     uint32_t rxDepth, rxOutstanding, rxQueued, rxQueueHighWater;
     uint32_t txDepth;
     bool failed;
+    // Diagnostics (status block): cumulative RX TDs posted and completed,
+    // TX frames submitted, error completions, link notification state and
+    // the first fatal completion (TRB status word and endpoint DCI).
+    uint64_t rxPosted, rxCompletions, rxErrors, txSubmitted, txErrors, notifications;
+    uint32_t faultStatus, faultDci;
+    bool linkKnown, linkUp;
 };
 
 struct NetIf {

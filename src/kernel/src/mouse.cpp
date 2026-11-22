@@ -30,16 +30,28 @@ uint32_t WmGetAppliedScale();
 // Wait for the 8042 input buffer to be empty (ready to accept a command).
 static void WaitWrite()
 {
-    for (int i = 0; i < 100000; i++)
+    const uint64_t start = ApicTickCount();
+    for (int i = 0; i < 100000; i++) {
         if ((inb(0x64) & 0x02) == 0) return;
+        if ((i & 63) == 63 && ApicTickCount() - start >= 50) return;
+    }
 }
 
-// Wait for the 8042 output buffer to have data.
-static void WaitRead()
+// Wait for the 8042 output buffer to have data. Bounded by both an
+// iteration count (the historic bound, valid even without a running clock)
+// and elapsed time: where firmware emulates the 8042 in SMM (USB legacy
+// support on desktop boards), one status read can take several microseconds,
+// so 100000 reads were ~0.5 s per wait with no mouse attached.
+static bool WaitReadMs(uint64_t ms)
 {
-    for (int i = 0; i < 100000; i++)
-        if (inb(0x64) & 0x01) return;
+    const uint64_t start = ApicTickCount();
+    for (int i = 0; i < 100000; i++) {
+        if (inb(0x64) & 0x01) return true;
+        if ((i & 63) == 63 && ApicTickCount() - start >= ms) return false;
+    }
+    return false;
 }
+static void WaitRead() { (void)WaitReadMs(100); }
 
 // Send a command byte to the PS/2 auxiliary (mouse) port.
 static void MouseCmd(uint8_t cmd)
@@ -601,6 +613,10 @@ void MouseInit()
     }
 
     SerialPuts("MOUSE: initialising PS/2 auxiliary device\n");
+    if (inb(0x64) == 0xff) {
+        KPuts("MOUSE: no PS/2 controller (status 0xff); mouse unavailable\n");
+        return;
+    }
 
     // Flush any stale bytes
     for (unsigned i=0;i<32 && (inb(0x64)&1);++i) (void)inb(0x60);
@@ -622,13 +638,27 @@ void MouseInit()
     // Reset mouse — sends 0xFF via auxiliary port.
     // Response: 0xFA (ACK) + 0xAA (self-test) + 0x00 (device ID)
     // MouseCmd already consumes the ACK; read the remaining two bytes.
-    MouseCmd(0xFF);
+    // A device ACKs within 25 ms (PS/2); with no byte at all after 200 ms
+    // there is no auxiliary device, so skip the self-test wait.
+    WaitWrite();
+    outb(0x64, 0xD4);
+    WaitWrite();
+    outb(0x60, 0xFF);
+    if (!WaitReadMs(200)) {
+        SerialPuts("MOUSE: no reply to reset, aborting\n");
+        KPrintf("MOUSE: no PS/2 auxiliary device (no reset reply); mouse unavailable\n");
+        return;
+    }
+    (void)inb(0x60);     // ACK (0xFA)
 
-    // The self-test response can take up to 500ms. Retry reads.
+    // The self-test response can take up to 500ms. Retry reads, bounded
+    // to one second in total.
     uint8_t selfTest = 0;
+    const uint64_t selfTestStart = ApicTickCount();
     for (int retry = 0; retry < 10; retry++)
     {
-        WaitRead();
+        const uint64_t spent = ApicTickCount() - selfTestStart;
+        if (spent >= 1000 || !WaitReadMs(1000 - spent)) break;
         uint8_t b = inb(0x60);
         if (b == 0xAA) { selfTest = b; break; }
         if (b == 0xFC) { selfTest = b; break; } // self-test failed

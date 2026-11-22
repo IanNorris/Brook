@@ -553,11 +553,14 @@ void SmpPrepareAPs()
         if (g_cpus[i].isBsp || !g_cpus[i].online)
             continue;
 
+        const uint64_t t0 = ApicTickCount();
         // Allocate per-CPU GDT/TSS.
         g_apTssSelector[i] = GdtInitAp(i);
+        const uint64_t tGdt = ApicTickCount();
 
         // Create per-CPU idle process.
         SchedulerInitApIdle(i);
+        const uint64_t tIdle = ApicTickCount();
 
         // Allocate per-CPU KernelCpuEnv + syscall stack.
         auto* env = static_cast<KernelCpuEnv*>(kmalloc(sizeof(KernelCpuEnv)));
@@ -582,8 +585,11 @@ void SmpPrepareAPs()
         g_apEnv[i] = env;
         SchedulerSetCpuEnv(i, env);
 
-        SerialPrintf("SMP: CPU %u prepared (TSS sel=0x%x, env=%p)\n",
-                i, g_apTssSelector[i], reinterpret_cast<void*>(env));
+        const uint64_t tEnd = ApicTickCount();
+        SerialPrintf("SMP: CPU %u prepared (TSS sel=0x%x, env=%p) gdt=%lums idle=%lums env=%lums\n",
+                i, g_apTssSelector[i], reinterpret_cast<void*>(env),
+                static_cast<unsigned long>(tGdt - t0), static_cast<unsigned long>(tIdle - tGdt),
+                static_cast<unsigned long>(tEnd - tIdle));
         ++prepared;
     }
     KPrintf("SMP: %u application processors prepared (details on serial)\n", prepared);

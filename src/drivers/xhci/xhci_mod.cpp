@@ -1084,6 +1084,7 @@ struct UsbEcmState {
     uint64_t dropped,received,transmitted,txBusy;uint32_t queueHighWater;bool failed;
     UsbEcmRxPressure rxPressure;uint64_t rxDispatchBusy;
     uint32_t faultStatus,faultDci;uint64_t faultToken;
+    uint64_t rxPosted,rxCompletions,rxErrors,txSubmitted,txErrors;
 };
 static bool g_networkProbe=false;
 static bool XhciEcmCompletion(XhciDevice&,const Trb&);
@@ -2202,7 +2203,7 @@ static bool XhciEcmArmSlot(UsbEcmState& net,unsigned slot)
 {
     if(!net.rxCredits.CanArm(slot,net.rxDepth,net.tail-net.head))return false;
     const auto token=XhciEcmTrb(*net.device,true,net.rxPhysical+slot*ECM_RX_BYTES,ECM_RX_BYTES,false,false);
-    net.rxCredits.Arm(slot,token);
+    net.rxCredits.Arm(slot,token);++net.rxPosted;
     auto& head=net.device->bulkInRing[(token-net.device->bulkInRingPhys)/sizeof(Trb)];
     __atomic_fetch_xor(&head.control,TRB_CYCLE,__ATOMIC_RELEASE);
     return true;
@@ -2240,7 +2241,7 @@ static bool XhciEcmCompletion(XhciDevice& dev,const Trb& event){
     if(net.failed && (dci==dev.intDci || dci==dev.bulkInDci || dci==dev.bulkOutDci))return true;
     if(dci==dev.intDci){
         if(net.failed)return true;
-        if(event.param!=net.notificationToken || (cc!=TRB_CC_SUCCESS && cc!=TRB_CC_SHORT_PACKET) || residue>dev.ecm.notifyPacket){fail();return true;}
+        if(event.param!=net.notificationToken || (cc!=TRB_CC_SUCCESS && cc!=TRB_CC_SHORT_PACKET) || residue>dev.ecm.notifyPacket){++net.rxErrors;fail();return true;}
         const auto bytes=dev.ecm.notifyPacket-residue;
         if(net.notifications<16){
             const auto length=bytes<16?bytes:16;
@@ -2257,8 +2258,9 @@ static bool XhciEcmCompletion(XhciDevice& dev,const Trb& event){
     }
     if(dci==dev.bulkInDci){
         if(net.failed)return true;
+        ++net.rxCompletions;
         const int rxSlot=net.rxCredits.CompletedSlot(event.param,cc,residue);
-        if(rxSlot<0){fail();return true;}
+        if(rxSlot<0){++net.rxErrors;fail();return true;}
         net.rxCredits.Complete(static_cast<unsigned>(rxSlot));
         const unsigned bytes=ECM_RX_BYTES-residue;
         if(bytes>=14 && bytes<=1514){
@@ -2275,7 +2277,7 @@ static bool XhciEcmCompletion(XhciDevice& dev,const Trb& event){
     if(dci==dev.bulkOutDci){
         auto result=net.sends.Complete(event.param,cc,residue);
         if(result==UsbEcmTxSlots::Result::Finished)++net.transmitted;
-        else if(result!=UsbEcmTxSlots::Result::Intermediate)fail();
+        else if(result!=UsbEcmTxSlots::Result::Intermediate){++net.txErrors;fail();}
         return true;
     }
     return false;
@@ -2297,7 +2299,7 @@ static int XhciEcmTransmitImpl(NetIf* nif,const void* frame,uint32_t bytes,bool 
         // Termination needs its own zero-length TD and completion ownership.
         const auto first=XhciEcmTrb(dev,false,physical,bytes,false,!terminate);
         const auto final=terminate?XhciEcmTrb(dev,false,physical,0,false):first;
-        net.sends.Reserve(i,first,final);
+        net.sends.Reserve(i,first,final);++net.txSubmitted;
         if(terminate){
             auto& head=dev.bulkOutRing[(first-dev.bulkOutRingPhys)/sizeof(Trb)];
             __atomic_fetch_xor(&head.control,TRB_CYCLE,__ATOMIC_RELEASE);
@@ -2321,7 +2323,9 @@ static bool XhciEcmSnapshot(NetIf* nif,NetDriverSnapshot* out){
     *out={net.received,net.transmitted,net.dropped,net.txBusy,
           net.rxPressure.entries,net.rxPressure.zeroEntries,net.rxDispatchBusy,net.rxDepth,
           net.rxCredits.outstanding,net.tail-net.head,net.queueHighWater,net.txDepth,
-          net.failed || net.controller->completionFailed};
+          net.failed || net.controller->completionFailed,
+          net.rxPosted,net.rxCompletions,net.rxErrors,net.txSubmitted,net.txErrors,net.notifications,
+          net.faultStatus,net.faultDci,net.linkKnown,net.linkUp};
     IrqSpinLockRelease(&g_eventRingLock,saved);return true;
 }
 static void XhciEcmPoll(NetIf* nif){
