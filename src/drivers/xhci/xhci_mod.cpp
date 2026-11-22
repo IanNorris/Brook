@@ -37,6 +37,8 @@
 #include "sync/kmutex.h"
 #include "vfs.h"
 #include "pci.h"
+#include "pci_quiesce.h"
+#include "platform_power.h"
 #include "serial.h"
 #include "kprintf.h"
 #include "idt.h"
@@ -71,6 +73,8 @@ MODULE_IMPORT_SYMBOL(UsbBootReportReset);
 MODULE_IMPORT_SYMBOL(KPrintf);
 MODULE_IMPORT_SYMBOL(KPuts);
 MODULE_IMPORT_SYMBOL(DebugUsbCommandSetHandler);
+MODULE_IMPORT_SYMBOL(PlatformPowerAddQuiesce);
+MODULE_IMPORT_SYMBOL(PciQuiesceFunctionForReset);
 MODULE_IMPORT_SYMBOL(VmmAllocPages);
 MODULE_IMPORT_SYMBOL(VmmVirtToPhys);
 MODULE_IMPORT_SYMBOL(VmmMapPage);
@@ -3974,6 +3978,30 @@ static void XhciSetupInterrupts(XhciController& ctrl)
 }
 
 
+// Pre-reset quiesce (Linux xhci_shutdown + pci_disable_device): clear Run/Stop
+// and interrupt enable, wait a bounded time for HCHalted, then drop bus
+// mastering and MSI/MSI-X. Never blocks the reset: at most ~20 ms/controller.
+static void XhciQuiesceForReset()
+{
+    const uint32_t count = __atomic_load_n(&g_controllerCount, __ATOMIC_ACQUIRE);
+    for (uint32_t i = 0; i < count; ++i) {
+        auto& ctrl = g_controllers[i];
+        if (!ctrl.initialized || !ctrl.opBase) continue;
+        const uint32_t cmd = xhci_read32(ctrl.opBase, XHCI_OP_USBCMD);
+        if (cmd != 0xffffffffu) {
+            xhci_write32(ctrl.opBase, XHCI_OP_USBCMD, cmd & ~(USBCMD_RS | USBCMD_INTE | USBCMD_HSEE));
+            const uint64_t start = ApicTickCount();
+            for (uint32_t spin = 0; spin < 200000u; ++spin) {
+                const uint32_t sts = xhci_read32(ctrl.opBase, XHCI_OP_USBSTS);
+                if (sts == 0xffffffffu || (sts & USBSTS_HCH)) break;
+                if (ApicTickCount() - start > 20) break;
+                __asm__ volatile("pause");
+            }
+        }
+        (void)PciQuiesceFunctionForReset(ctrl.pciDev.bus, ctrl.pciDev.dev, ctrl.pciDev.fn);
+    }
+}
+
 // ---- Read-only diagnostics: bridge hardware usb ------------------------------
 // "list", "desc <i> [offset]" (raw device + configuration descriptors as hex),
 // "get <i> <bmRequestType> <bRequest> <wValue> <wIndex> <wLength>" (hex fields;
@@ -4123,6 +4151,7 @@ static int XhciModuleInit()
         // their boot-time-only enumeration.
         UsbStatusSetProvider(XhciStatusText);
         DebugUsbCommandSetHandler(XhciUsbCommand);
+        (void)PlatformPowerAddQuiesce(XhciQuiesceForReset);
         bool hotplug = false;
         static const char* const markers[] = {"/etc/usb-hotplug", "/etc/boot-status"};
         for (const char* path : markers)

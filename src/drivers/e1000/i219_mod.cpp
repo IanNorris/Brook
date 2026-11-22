@@ -24,6 +24,8 @@
 #include "module_abi.h"
 #include "net.h"
 #include "pci.h"
+#include "pci_quiesce.h"
+#include "platform_power.h"
 #include "scheduler.h"
 #include "serial.h"
 #include "spinlock.h"
@@ -37,6 +39,8 @@
 MODULE_IMPORT_SYMBOL(ApicTickCount);
 MODULE_IMPORT_SYMBOL(BootStatusAddProvider);
 MODULE_IMPORT_SYMBOL(DebugNicCommandSetHandler);
+MODULE_IMPORT_SYMBOL(PlatformPowerAddQuiesce);
+MODULE_IMPORT_SYMBOL(PciQuiesceFunctionForReset);
 MODULE_IMPORT_SYMBOL(KernelWorkerStart);
 MODULE_IMPORT_SYMBOL(KPrintf);
 MODULE_IMPORT_SYMBOL(NetReceive);
@@ -846,6 +850,21 @@ uint32_t Command(const char* args, char* out, uint32_t cap)
     return t.n;
 }
 
+// Pre-reset quiesce (e1000e shutdown order): mask interrupts, stop receive
+// and transmit, then drop bus mastering so no descriptor DMA is in flight
+// when the platform reset lands. Bounded: register writes only, no waits
+// beyond one short flush spin.
+void QuiesceForReset()
+{
+    if (!g_regs) return;
+    Write(Imc, ~0u);
+    Write(Rctl, Read(Rctl) & ~RxEnable);
+    Write(Tctl, Read(Tctl) & ~TxEnable);
+    Flush();
+    for (volatile uint32_t spin = 0; spin < 20000; ++spin) __asm__ volatile("pause");
+    (void)PciQuiesceFunctionForReset(g_device.bus, g_device.dev, g_device.fn);
+}
+
 int ModuleInit()
 {
     if (!PciFindDevice(0x8086, 0x15b8, g_device)) return -1;
@@ -862,6 +881,7 @@ int ModuleInit()
     if (!MapMmio(g_bar)) { g_failure = "MMIO map"; return -1; }
     (void)BootStatusAddProvider(StatusText);
     DebugNicCommandSetHandler(Command);
+    (void)PlatformPowerAddQuiesce(QuiesceForReset);
 
     static char probe[4096];
     Text t{probe, sizeof(probe)};

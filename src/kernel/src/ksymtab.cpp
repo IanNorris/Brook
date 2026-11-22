@@ -132,6 +132,8 @@ EXPORT_SYMBOL(PciConfigRead16);
 EXPORT_SYMBOL(PciConfigRead8);
 EXPORT_SYMBOL(PciConfigWrite16);
 EXPORT_SYMBOL(PciConfigWrite32);
+EXPORT_SYMBOL(PciQuiesceFunctionForReset);
+EXPORT_SYMBOL(PlatformPowerAddQuiesce);
 
 // Display
 EXPORT_SYMBOL(DisplayRegister);

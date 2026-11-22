@@ -6,6 +6,9 @@
 #include "fw_cfg.h"
 #include "portio.h"
 #include "serial.h"
+#if !defined(BROOK_HOST_TEST)
+#include "kprintf.h"
+#endif
 #include <stddef.h>
 #if !defined(BROOK_HOST_TEST)
 #include "efi_runtime_mapping.h"
@@ -22,6 +25,7 @@
 namespace brook {
 namespace {
 PlatformPowerPlan plan;
+PowerQuiesceList quiesce;
 #if !defined(BROOK_HOST_TEST)
 uint64_t efiTestCandidate=0;
 MemoryDescriptor efiTestMap[4096]{};
@@ -81,9 +85,22 @@ void PlatformPowerConfigure() {
     else if(bytes==8 && !memcmp(mode,"efi-test",8))plan.efiEntry=efiTestCandidate;
 #endif
     SerialPrintf("power: reset=%s poweroff=%s reason=%s\n",plan.ResetMethod(),plan.PowerOffMethod(),plan.PowerOffReason());
+#if !defined(BROOK_HOST_TEST)
+    if(plan.firmwareReset.available)
+        KPrintf("power: FADT reset register io 0x%x value 0x%x\n",plan.firmwareReset.port,plan.firmwareReset.value);
+    else KPrintf("power: reset=%s (%s)\n",plan.ResetMethod(),plan.ResetReason());
+#endif
 }
 const PlatformPowerPlan& PlatformPowerGetPlan(){return plan;}
+bool PlatformPowerAddQuiesce(PowerQuiesceFn fn){return quiesce.Add(fn);}
+unsigned PlatformPowerRunQuiesce(){return quiesce.Run();}
 bool PlatformPowerIssue(bool restart){
+    // Stop device DMA first: a reset that lands while xHCI/NIC bus masters
+    // are running has been seen to hang the desktop firmware in POST.
+    if(restart?plan.CanReset():plan.CanPowerOff()){
+        const unsigned hooks=PlatformPowerRunQuiesce();
+        SerialPrintf("power: %u quiesce hook%s ran before %s\n",hooks,hooks==1?"":"s",restart?"reset":"power-off");
+    }
 #if !defined(BROOK_HOST_TEST)
     // Leave plane A on the firmware GOP surface for firmware and the next
     // (possibly recovery) kernel; a no-op unless a flip path was activated.

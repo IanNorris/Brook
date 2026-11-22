@@ -31,6 +31,31 @@ struct PlatformPowerPlan {
         return false;
     }
 };
+// Best-effort device quiesce hooks run just before the selected reset or
+// power-off write (bus-master DMA stopped, controllers halted). Each hook must
+// be bounded; none can veto the transition. Registration is append-only.
+using PowerQuiesceFn = void (*)();
+struct PowerQuiesceList {
+    static constexpr unsigned Capacity = 8;
+    PowerQuiesceFn hooks[Capacity]{};
+    unsigned count = 0;
+    bool Add(PowerQuiesceFn fn) {
+        if (!fn) return false;
+        for (unsigned i = 0; i < count; ++i) if (hooks[i] == fn) return true;
+        if (count >= Capacity) return false;
+        hooks[count] = fn;
+        __atomic_store_n(&count, count + 1, __ATOMIC_RELEASE);
+        return true;
+    }
+    // Reverse registration order, as device shutdown runs children first.
+    unsigned Run() const {
+        const unsigned n = __atomic_load_n(&count, __ATOMIC_ACQUIRE);
+        for (unsigned i = n; i-- > 0;) hooks[i]();
+        return n;
+    }
+};
+extern "C" bool PlatformPowerAddQuiesce(PowerQuiesceFn fn);
+unsigned PlatformPowerRunQuiesce();
 void PlatformPowerConfigure(); // boot-time discovery and explicit emulator opt-in
 const PlatformPowerPlan& PlatformPowerGetPlan();
 // True means the selected write was issued, not proof that hardware reset/off
