@@ -355,6 +355,7 @@ namespace {
 // lock serialises AUX and SOR access. A silent caller gets the JSON reply in
 // its own buffer instead of the debug channel.
 SpinLock g_nvAuxLock;
+bool g_nvMapDone=false;
 char* g_nvAuxOut=nullptr;uint32_t g_nvAuxCap=0,g_nvAuxLen=0;
 void NvAuxSend(const char* t){
     if(!g_nvAuxOut){DebugChannelSend(t);return;}
@@ -362,6 +363,39 @@ void NvAuxSend(const char* t){
     g_nvAuxOut[g_nvAuxLen]=0;
 }
 using AuxReply=BridgeReplyBuffer<NvAuxSend>;
+// BAR0 windows (AUX 0xd000, SOR 0x61c000, ARM state 0x688000, read-only) are
+// mapped once, outside g_nvAuxLock, by whichever caller gets there first.
+VirtualAddress g_nvAuxWin{},g_nvSorWin{},g_nvArmWin{};
+SpinLock g_nvMapLock;
+VirtualAddress NvMapOne(uint64_t physical,bool writable){
+    auto va=VmmAllocPages(1,VMM_WRITABLE|VMM_NO_EXEC,MemTag::Device,KernelPid);
+    if(!va)return va;
+    const auto leaf=VmmDetachPage(KernelPageTable,va);if(leaf)PmmFreePage(VmmLeafPhysical(leaf));
+    __asm__ volatile("invlpg (%0)"::"r"(va.raw()):"memory");
+    if(!VmmMapPage(KernelPageTable,va,PhysicalAddress(physical),
+        (writable?VMM_WRITABLE:0)|VMM_NO_EXEC|VMM_CACHE_DISABLE|VMM_WRITE_THRU,MemTag::Device,KernelPid))return VirtualAddress{};
+    return va;
+}
+bool NvAuxMapWindows(){
+    if(__atomic_load_n(&g_nvMapDone,__ATOMIC_ACQUIRE))return true;
+    PciDevice gpu{};bool found=false;
+    for(uint32_t i=0;i<PciBootInventoryCount() && !found;++i){PciBootEntry e{};
+        if(PciBootInventoryRead(i,&e) && e.device.vendorId==0x10de && e.device.classCode==0x03 && e.device.fn==0){gpu=e.device;found=true;}}
+    if(!found)return false;
+    const uint32_t bar0=PciConfigRead32(gpu.bus,gpu.dev,gpu.fn,0x10);
+    if((bar0&1)||!(PciConfigRead16(gpu.bus,gpu.dev,gpu.fn,4)&2))return false;
+    const uint64_t base=bar0&~uint64_t(15);
+    // One mapper at a time; the VMM calls are made with no spinlock held by
+    // this thread other than this try-lock, and losers simply retry later.
+    if(!SpinLockTryAcquire(&g_nvMapLock))return false;
+    if(!g_nvAuxWin)g_nvAuxWin=NvMapOne(base+0xd000,true);
+    if(!g_nvSorWin)g_nvSorWin=NvMapOne(base+0x61c000,true);
+    if(!g_nvArmWin)g_nvArmWin=NvMapOne(base+0x688000,false);
+    const bool ok=g_nvAuxWin&&g_nvSorWin&&g_nvArmWin;
+    if(ok)__atomic_store_n(&g_nvMapDone,true,__ATOMIC_RELEASE);
+    SpinLockRelease(&g_nvMapLock);
+    return ok;
+}
 bool NvAuxHandleLocked(const char* command){
     constexpr char auxPrefix[]="bridge hardware nv-aux ";
     if(Prefix(command,auxPrefix)) {
@@ -384,14 +418,9 @@ bool NvAuxHandleLocked(const char* command){
             if(PciBootInventoryRead(i,&e) && e.device.vendorId==0x10de && e.device.classCode==0x03 && e.device.fn==0){gpu=e.device;found=true;}}
         const uint32_t bar0=found?PciConfigRead32(gpu.bus,gpu.dev,gpu.fn,0x10):0;
         if(!found||(bar0&1)||!(PciConfigRead16(gpu.bus,gpu.dev,gpu.fn,4)&2)){NvAuxSend("{\"aux_error\":\"no GPU BAR0\"}\n");return true;}
-        static VirtualAddress auxWin{};
-        if(!auxWin){auxWin=VmmAllocPages(1,VMM_WRITABLE|VMM_NO_EXEC,MemTag::Device,KernelPid);
-            const auto leaf=VmmDetachPage(KernelPageTable,auxWin);if(leaf)PmmFreePage(VmmLeafPhysical(leaf));
-            __asm__ volatile("invlpg (%0)"::"r"(auxWin.raw()):"memory");
-            if(!VmmMapPage(KernelPageTable,auxWin,PhysicalAddress((bar0&~uint64_t(15))+0xd000),
-                VMM_WRITABLE|VMM_NO_EXEC|VMM_CACHE_DISABLE|VMM_WRITE_THRU,MemTag::Device,KernelPid)){auxWin=VirtualAddress{};
-                NvAuxSend("{\"aux_error\":\"map\"}\n");return true;}}
-        volatile uint32_t* reg=reinterpret_cast<volatile uint32_t*>(auxWin.raw());
+        (void)bar0;
+        if(!g_nvAuxWin){NvAuxSend("{\"aux_error\":\"map\"}\n");return true;}
+        volatile uint32_t* reg=reinterpret_cast<volatile uint32_t*>(g_nvAuxWin.raw());
         const uint32_t base=ch*0x50;
         auto R=[&](uint32_t off)->uint32_t{return reg[(off-0xd000)/4];};
         auto Wr=[&](uint32_t off,uint32_t v){reg[(off-0xd000)/4]=v;};
@@ -440,19 +469,7 @@ bool NvAuxHandleLocked(const char* command){
             // clock, lane enables, power and drive stay as programmed; only
             // the SOR training pattern and the sink's DPCD training registers
             // change. Requires the SOR's ARM state to be DP and on a head.
-            static VirtualAddress sorWin{};
-            const uint64_t barBase=bar0&~uint64_t(15);
-            if(!sorWin){sorWin=VmmAllocPages(1,VMM_WRITABLE|VMM_NO_EXEC,MemTag::Device,KernelPid);
-                const auto leaf=VmmDetachPage(KernelPageTable,sorWin);if(leaf)PmmFreePage(VmmLeafPhysical(leaf));
-                __asm__ volatile("invlpg (%0)"::"r"(sorWin.raw()):"memory");
-                if(!VmmMapPage(KernelPageTable,sorWin,PhysicalAddress(barBase+0x61c000),
-                    VMM_WRITABLE|VMM_NO_EXEC|VMM_CACHE_DISABLE|VMM_WRITE_THRU,MemTag::Device,KernelPid))sorWin=VirtualAddress{};}
-            static VirtualAddress roWin{};
-            if(!roWin){roWin=VmmAllocPages(1,VMM_WRITABLE|VMM_NO_EXEC,MemTag::Device,KernelPid);
-                const auto leaf=VmmDetachPage(KernelPageTable,roWin);if(leaf)PmmFreePage(VmmLeafPhysical(leaf));
-                __asm__ volatile("invlpg (%0)"::"r"(roWin.raw()):"memory");
-                if(!VmmMapPage(KernelPageTable,roWin,PhysicalAddress(barBase+0x688000),
-                    VMM_NO_EXEC|VMM_CACHE_DISABLE|VMM_WRITE_THRU,MemTag::Device,KernelPid))roWin=VirtualAddress{};}
+            const VirtualAddress sorWin=g_nvSorWin,roWin=g_nvArmWin;
             if(!sorWin||!roWin){rc=-12;strcpy(err,"map");}
             else{
                 volatile uint32_t* sr=reinterpret_cast<volatile uint32_t*>(sorWin.raw());
@@ -468,6 +485,7 @@ bool NvAuxHandleLocked(const char* command){
                     auto pattern=[&](uint32_t pat){static const uint32_t d[]={0x10101010,0x01010101,0x02020202,0x03030303};
                         sr[patReg/4]=(sr[patReg/4]&~0x1f1f1f1fu)|d[pat];};
                     const uint32_t lanes=__builtin_popcount((dpctrl>>16)&0xf);
+                    KPrintf("nv-aux: retrain start SOR%u link %u dpctrl %08x pat %08x\n",sor,link,dpctrl,patOrig);
                     uint8_t caps[16]{};uint32_t n=16;rc=xfer(0x9,0x000,caps,n);
                     uint8_t conf[4]{};n=4;if(!rc)rc=xfer(0x9,0x103,conf,n);
                     uint8_t lc[2]={caps[1],uint8_t(lanes|((dpctrl&0x4000)?0x80:0))};n=2;
@@ -477,6 +495,7 @@ bool NvAuxHandleLocked(const char* command){
                     uint8_t st[6]{};bool cr=false,eq=false;
                     if(!rc){pattern(1);uint8_t tp=0x21;n=1;rc=xfer(0x8,0x102,&tp,n);n=4;if(!rc)rc=xfer(0x8,0x103,conf,n);}
                     for(int t=0;!rc&&t<5&&!cr;++t){spin(100);rc=status(st);cr=!rc&&lanesOk(st,0x1);}
+                    KPrintf("nv-aux: retrain cr=%d rc=%d %02x %02x\n",cr,rc,st[0],st[1]);
                     const bool tps3=(caps[2]&0x40)!=0;
                     if(!rc&&cr){pattern(tps3?3:2);uint8_t tp=uint8_t(0x20|(tps3?3:2));n=1;rc=xfer(0x8,0x102,&tp,n);}
                     for(int t=0;!rc&&cr&&t<6&&!eq;++t){spin(400);rc=status(st);eq=!rc&&lanesOk(st,0x7)&&(st[2]&1);}
@@ -501,6 +520,7 @@ bool NvAuxHandleLocked(const char* command){
 }
 bool NvAuxHandle(const char* command,char* out,uint32_t cap){
     if(!Prefix(command,"bridge hardware nv-aux "))return false;
+    (void)NvAuxMapWindows();
     SpinLockAcquire(&g_nvAuxLock);
     g_nvAuxOut=out;g_nvAuxCap=cap;g_nvAuxLen=0;if(out&&cap)out[0]=0;
     const bool handled=NvAuxHandleLocked(command);
@@ -517,7 +537,7 @@ bool NvAuxHandle(const char* command,char* out,uint32_t cap){
 // dark without another attempt.
 struct DpIdleState{
     uint32_t seconds=0,ch=3,sor=1,link=2;
-    bool blanked=false,threadStarted=false,wakeRequested=false;
+    bool blanked=false,threadStarted=false,wakeRequested=false,handTest=false;
     uint64_t seq=0,lastActivityMs=0,lastWakeTryMs=0;
     uint32_t blanks=0,wakes=0,wakeFails=0;
     char lastReply[320]{};
@@ -544,20 +564,26 @@ bool DpIdleAux(const char* verb,uint32_t a,int b=-1,int c=-1,const char* tail=nu
 // AUX work runs outside g_dpIdleLock (it sleeps); only the worker acts on
 // the sink, the command only changes configuration and requests.
 bool DpIdleBlank(uint32_t ch){
+    KPrintf("dp-idle: blank: D3 on aux %u\n",ch);
     if(DpIdleAux("power",ch,-1,-1,"d3")&&Find(g_dpIdle.lastReply,"\"dpcd600\":2")){
         KPrintf("dp-idle: sink on aux %u -> D3\n",ch);return true;}
     KPrintf("dp-idle: D3 failed: %s\n",g_dpIdle.lastReply);return false;
 }
 bool DpIdleWake(uint32_t ch,uint32_t sor,uint32_t link){
     for(int attempt=0;attempt<3;++attempt){
+        KPrintf("dp-idle: wake attempt %d: D0\n",attempt+1);
         (void)DpIdleAux("power",ch,-1,-1,"d0");
-        SchedulerSleepMs(attempt?50:5);
+        KPrintf("dp-idle: D0 reply %s\n",g_dpIdle.lastReply);
+        SchedulerSleepMs(200);
+        KPrintf("dp-idle: retrain\n");
         if(DpIdleAux("retrain",ch,int(sor),int(link))&&JsonOne(g_dpIdle.lastReply,"\"eq\"")){
             KPrintf("dp-idle: sink on aux %u woke (attempt %d)\n",ch,attempt+1);return true;}
     }
     KPrintf("dp-idle: wake failed: %s\n",g_dpIdle.lastReply);return false;
 }
 void DpIdleWorker(void*){
+    for(int i=0;i<10&&!NvAuxMapWindows();++i)SchedulerSleepMs(100);
+    KPrintf("dp-idle: worker up, windows %s\n",g_nvMapDone?"mapped":"NOT mapped");
     // Marker autostart: wait for the root filesystem, read it once.
     for(int i=0;i<120&&!g_dpIdle.seconds;++i){
         if(auto* file=VfsOpen("/etc/dp-idle-seconds",VFS_O_STREAM)){
@@ -586,7 +612,8 @@ void DpIdleWorker(void*){
         const uint64_t now=ApicTickCount(),seq=InputLatestSequence();
         if(seq!=g_dpIdle.seq){g_dpIdle.seq=seq;g_dpIdle.lastActivityMs=now;if(g_dpIdle.blanked)g_dpIdle.wakeRequested=true;}
         int action=0;
-        if(g_dpIdle.blanked&&(g_dpIdle.wakeRequested||!g_dpIdle.seconds)){
+        if(g_dpIdle.handTest){}
+        else if(g_dpIdle.blanked&&(g_dpIdle.wakeRequested||!g_dpIdle.seconds)){
             if(!g_dpIdle.wakeFails||now-g_dpIdle.lastWakeTryMs>=1000){action=2;g_dpIdle.lastWakeTryMs=now;}}
         else if(!g_dpIdle.blanked&&g_dpIdle.seconds&&now-g_dpIdle.lastActivityMs>=uint64_t(g_dpIdle.seconds)*1000)action=1;
         const uint32_t ch=g_dpIdle.ch,sor=g_dpIdle.sor,link=g_dpIdle.link;
@@ -608,6 +635,17 @@ void DpIdleCommand(const char* p){
     if(!strcmp(p,"status")){}
     else if(!strcmp(p,"off")){g_dpIdle.seconds=0;if(g_dpIdle.blanked)g_dpIdle.wakeRequested=true;}
     else if(!strcmp(p,"wake")){if(g_dpIdle.blanked)g_dpIdle.wakeRequested=true;}
+    else if(!strcmp(p,"test-blank")||!strcmp(p,"test-wake")){
+        // Hand-driven: run the worker's own blank/wake functions on the bridge
+        // thread (worker must be idle: seconds 0 and nothing pending).
+        const bool blank=p[5]=='b';
+        if(g_dpIdle.seconds||g_dpIdle.wakeRequested){ok=false;}
+        else{const uint32_t tch=g_dpIdle.ch,tsor=g_dpIdle.sor,tlink=g_dpIdle.link;
+            g_dpIdle.handTest=true;SpinLockRelease(&g_dpIdleLock);
+            const bool done=blank?DpIdleBlank(tch):DpIdleWake(tch,tsor,tlink);
+            SpinLockAcquire(&g_dpIdleLock);g_dpIdle.handTest=false;ok=done;
+            if(done){g_dpIdle.blanked=blank;if(blank)++g_dpIdle.blanks;else ++g_dpIdle.wakes;}}
+    }
     else if(Prefix(p,"set ")){p+=4;
         ok=Decimal(p,secs)&&secs>=10&&secs<=86400;while(ok&&*p==' ')++p;
         ok=ok&&Decimal(p,ch)&&ch<=7;while(ok&&*p==' ')++p;
