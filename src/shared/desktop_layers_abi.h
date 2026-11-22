@@ -63,6 +63,18 @@
 // otherwise it copies as usual. A client write the producer has not yet
 // published is not reflected, exactly as with the CPU compositor.
 #define BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED_KEEP 13
+// Bounds (all client-layer ops): a layer's stride and height are at most
+// the scene maximum (16384). There is no fixed total; a query never fails
+// for the sum of sizes. A capture fails with E2BIG only when the bytes it
+// would actually copy (excluding skipped, kept and occluded layers) exceed
+// BROOK_DESKTOP_LAYER_LIMIT whole outputs; the caller then skips (drops)
+// layers and retries rather than retrying the same request.
+// c = BROOK_DESKTOP_LAYERS_CULL_OCCLUDED (keep op only; older kernels return
+// EINVAL): a layer whose content rectangle is covered by a legacy-opaque
+// layer above it at full opacity is not copied and returns
+// BROOK_DESKTOP_LAYER_OCCLUDED. Its destination is still required and left
+// as it was; the caller must not draw it from the buffer nor keep it.
+#define BROOK_DESKTOP_LAYERS_CULL_OCCLUDED 1
 // Renderer report for the taskbar APP cadence: it composited a GPU-source
 // client frame. address=0, size=0, a=window, b=window incarnation (layer
 // incarnation), c=client commit. Diagnostic only; the kernel counts each new
@@ -197,6 +209,8 @@ struct BrookDesktopOverlaySurfaces {
 #define BROOK_DESKTOP_LAYER_OPACITY_MASK (255u<<BROOK_DESKTOP_LAYER_OPACITY_SHIFT)
 // Output only (CAPTURE_TRACKED_KEEP): the caller's held pixels are current.
 #define BROOK_DESKTOP_LAYER_KEPT (1u<<16)
+// Output only (BROOK_DESKTOP_LAYERS_CULL_OCCLUDED): not copied, hidden.
+#define BROOK_DESKTOP_LAYER_OCCLUDED (1u<<17)
 struct BrookDesktopLayer {
     uint64_t pixels,capacity,incarnation,generation,bytes;
     uint32_t window,width,height,stride,clientWidth,clientHeight;

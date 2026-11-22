@@ -22,6 +22,9 @@ int main(void){
     struct AsyncWindowSource mapped[2]={direct,cpu};unsigned indices[2]={2,1};uint8_t used[3]={1,0,1};
     assert(async_sources_mark_omitted(mapped,2,indices,used,3) && !mapped[0].omitted && mapped[1].omitted);
     indices[1]=3;assert(!async_sources_mark_omitted(mapped,2,indices,used,3) && !mapped[0].omitted && mapped[1].omitted);
+    /* A window drawn from no scene layer (occluded or dropped) is omitted. */
+    indices[1]=ASYNC_SOURCE_NOT_DRAWN;mapped[1].omitted=0;
+    assert(async_sources_mark_omitted(mapped,2,indices,used,3) && !mapped[0].omitted && mapped[1].omitted);
     direct.commit=24;assert(!async_sources_presentable(b,&direct,1));direct.commit=26;
     cpu.generation=1;cpu.incarnation=8;assert(async_sources_presentable(b,&cpu,1));
     direct.incarnation=8;direct.generation=1;direct.commit=27;async_sources_committed(b,&direct,1);

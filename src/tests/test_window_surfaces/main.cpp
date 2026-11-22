@@ -1,6 +1,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <initializer_list>
+#include <utility>
 #include "../../kernel/src/window.cpp"
 #include "../../kernel/src/chrome_raster.cpp"
 #include "../../kernel/src/chrome_frame.cpp"
@@ -174,8 +175,127 @@ extern "C" void CompositorGetPhysDims(uint32_t* w,uint32_t* h) { if(w)*w=testScr
 }
 extern "C" void KernelPanic(const char*,...) { std::abort(); }
 
+// 22 Nov (Dell int88): six large windows (69.2 MB of client buffers) made
+// every per-frame query fail with E2BIG under the old fixed 64 MiB total, so
+// the renderer retried forever. Synthetic layers; the sink counts bytes and
+// never dereferences the fake destinations.
+static void FillBudgetLayers(brook::WmDesktopLayers& layers) {
+    static const uint32_t sizes[][2]={{880,1360},{1600,1200},{1502,1332},{1776,1376},{2896,1378},{3200,1800}};
+    layers={};layers.count=6;
+    for(uint32_t i=0;i<6;++i){auto& l=layers.layers[i];
+        l.window=i+1;l.incarnation=100+i;l.generation=7;l.width=l.stride=l.clientWidth=sizes[i][0];
+        l.height=l.clientHeight=sizes[i][1];l.bytes=uint64_t(l.stride)*l.height*4;l.upscale=1;l.opacity=255;
+        l.clientX=int32_t(40*i);l.clientY=int32_t(30*i);}
+    // Quake II: fullscreen at the origin, topmost.
+    layers.layers[5].clientX=layers.layers[5].clientY=0;
+}
+static void BudgetDestinations(const brook::WmDesktopLayers& layers,BrookDesktopLayers& wire) {
+    uint64_t next=0x100000000ull;
+    for(uint32_t i=0;i<layers.count;++i){wire.layers[i].pixels=next;wire.layers[i].capacity=layers.layers[i].bytes;
+        next+=(layers.layers[i].bytes+0xfffff)&~0xfffffull;}
+}
+static void TestDesktopLayerBudget() {
+    using namespace brook;
+    static WmDesktopLayers layers;FillBudgetLayers(layers);
+    uint64_t total=0;for(uint32_t i=0;i<layers.count;++i)total+=layers.layers[i].bytes;
+    CHECK(total>64ull*1024*1024 && total<70000000ull);          // the 69.2 MB of the report
+    BrookDesktopLayers wire{};wire.version=BROOK_DESKTOP_LAYERS_VERSION;
+    uint64_t copied=0;uint32_t touched=0;
+    auto counting=[&](const WmDesktopLayer& l,uint64_t,uint64_t,uint64_t bytes){copied+=bytes;touched|=1u<<(l.window-1);return true;};
+    auto alwaysCurrent=[](const WmDesktopLayers&){return true;};
+    CHECK(!ExportDesktopLayers(layers,wire,false,counting,alwaysCurrent,65536) && wire.count==6 && !copied);
+    BudgetDestinations(layers,wire);
+    CHECK(!ExportDesktopLayers(layers,wire,true,counting,alwaysCurrent,65536) && copied==total && touched==0x3f);
+    // The bound scales with the output: 32 whole 3200x1800 outputs.
+    CHECK(DesktopLayerCopyLimit(3200,1800)==3200ull*1800*4*32 && DesktopLayerCopyLimit(0,0)==4096ull*2160*4*32);
+    CHECK(DesktopLayerCopyLimit(3200,1800)>10*total);
+    const BrookDesktopLayers held=wire;
+    // Only copied bytes count: under a 30 MB budget a full copy is E2BIG
+    // (nothing copied), while keeping the five idle windows copies only
+    // Quake II's 23 MB and succeeds.
+    DesktopLayerExportOptions tight{};tight.copyLimit=30000000ull;
+    DesktopCaptureCounters counters{};copied=touched=0;
+    CHECK(ExportDesktopLayers(layers,wire,true,counting,alwaysCurrent,65536,0,0,&counters,tight)==-7 && !copied && !counters.calls);
+    wire=held;
+    CHECK(!ExportDesktopLayers(layers,wire,true,counting,alwaysCurrent,65536,0,0x1f,&counters,tight));
+    CHECK(copied==layers.layers[5].bytes && touched==0x20 && counters.keeps==5 && counters.captures==1);
+    CHECK(counters.bytesKept==total-layers.layers[5].bytes);
+    for(uint32_t i=0;i<5;++i)CHECK(wire.layers[i].flags&BROOK_DESKTOP_LAYER_KEPT);
+    // Skipped layers (the renderer's degrade path) do not count either.
+    wire=held;for(uint32_t i=0;i<5;++i)wire.layers[i].pixels=wire.layers[i].capacity=0;copied=0;
+    CHECK(!ExportDesktopLayers(layers,wire,true,counting,alwaysCurrent,65536,0x1f,0,nullptr,tight) && copied==layers.layers[5].bytes);
+    // A kept layer that published again is copied and counts.
+    wire=held;++layers.layers[0].generation;copied=0;
+    CHECK(!ExportDesktopLayers(layers,wire,true,counting,alwaysCurrent,65536,0,0x1f,nullptr,tight));
+    CHECK(copied==layers.layers[5].bytes+layers.layers[0].bytes && !(wire.layers[0].flags&BROOK_DESKTOP_LAYER_KEPT));
+    --layers.layers[0].generation;
+    // Corrupt sizes: beyond the scene maximum, or larger than the backing.
+    wire=held;layers.layers[2].stride=GPU_SCENE_MAX_DIMENSION+1;layers.layers[2].bytes=~uint64_t{0}>>8;
+    CHECK(ExportDesktopLayers(layers,wire,false,counting,alwaysCurrent,65536)==-7);
+    layers.layers[2].stride=layers.layers[2].width;layers.layers[2].height=GPU_SCENE_MAX_DIMENSION+1;
+    CHECK(ExportDesktopLayers(layers,wire,false,counting,alwaysCurrent,65536)==-7);
+    FillBudgetLayers(layers);layers.layers[3].bytes-=4;
+    CHECK(ExportDesktopLayers(layers,wire,false,counting,alwaysCurrent,65536)==-7);
+    // The largest legal layer (16384x16384) is accepted by a query.
+    FillBudgetLayers(layers);layers.layers[0].width=layers.layers[0].stride=layers.layers[0].height=GPU_SCENE_MAX_DIMENSION;
+    layers.layers[0].bytes=DesktopLayerMaxBytes;wire=held;
+    CHECK(!ExportDesktopLayers(layers,wire,false,counting,alwaysCurrent,65536) && wire.layers[0].bytes==DesktopLayerMaxBytes);
+    std::puts("WINDOW_SURFACES PASS: 69.2 MB desktop layer export, kept/skipped accounting, corrupt sizes");
+}
+static void TestDesktopLayerOcclusion() {
+    using namespace brook;
+    static WmDesktopLayers layers;FillBudgetLayers(layers);
+    BrookDesktopLayers wire{};wire.version=BROOK_DESKTOP_LAYERS_VERSION;
+    auto alwaysCurrent=[](const WmDesktopLayers&){return true;};
+    uint32_t touched=0;
+    auto counting=[&](const WmDesktopLayer& l,uint64_t,uint64_t,uint64_t){touched|=1u<<(l.window-1);return true;};
+    CHECK(!ExportDesktopLayers(layers,wire,false,counting,alwaysCurrent,65536));
+    BudgetDestinations(layers,wire);const BrookDesktopLayers request=wire;
+    DesktopLayerExportOptions cull{};cull.cullOccluded=true;
+    // A native fullscreen window (Quake II) has straight alpha: never occludes.
+    CHECK(!ExportDesktopLayers(layers,wire,true,counting,alwaysCurrent,65536,0,0,nullptr,cull) && touched==0x3f);
+    for(uint32_t i=0;i<6;++i)CHECK(!(wire.layers[i].flags&BROOK_DESKTOP_LAYER_OCCLUDED));
+    // A legacy (always opaque) 1600x900 framebuffer upscaled 2x to cover the
+    // 3200x1800 output: every layer beneath is occluded, not copied, not kept.
+    auto& top=layers.layers[5];top.legacyOpaque=1;top.width=top.stride=1600;top.height=900;top.upscale=2;
+    top.bytes=uint64_t(top.stride)*top.height*4;
+    wire=request;wire.layers[5].capacity=top.bytes;touched=0;DesktopCaptureCounters counters{};
+    CHECK(!ExportDesktopLayers(layers,wire,true,counting,alwaysCurrent,65536,0,0,&counters,cull) && touched==0x20);
+    for(uint32_t i=0;i<5;++i)CHECK((wire.layers[i].flags&BROOK_DESKTOP_LAYER_OCCLUDED) && !(wire.layers[i].flags&BROOK_DESKTOP_LAYER_KEPT));
+    CHECK(!(wire.layers[5].flags&BROOK_DESKTOP_LAYER_OCCLUDED) && counters.occluded==5 && counters.captures==1);
+    // Occluded is reported instead of KEPT even for a keepable layer.
+    const BrookDesktopLayers occludedReply=wire;
+    CHECK(!ExportDesktopLayers(layers,wire,true,counting,alwaysCurrent,65536,0,0x1f,nullptr,cull));
+    for(uint32_t i=0;i<5;++i)CHECK(wire.layers[i].flags==BROOK_DESKTOP_LAYER_OCCLUDED);
+    // Without the option nothing is culled (older renderers).
+    wire=request;wire.layers[5].capacity=top.bytes;touched=0;
+    CHECK(!ExportDesktopLayers(layers,wire,true,counting,alwaysCurrent,65536) && touched==0x3f);
+    CHECK(ExportDesktopLayers(layers,wire,false,counting,alwaysCurrent,65536,0,0,nullptr,cull)==-22);
+    // Partial cover: a window extending past the occluder is copied.
+    wire=occludedReply;layers.layers[3].clientX=3200-100;touched=0;
+    CHECK(!ExportDesktopLayers(layers,wire,true,counting,alwaysCurrent,65536,0,0,nullptr,cull) && touched==(0x20|0x08));
+    CHECK(!(wire.layers[3].flags&BROOK_DESKTOP_LAYER_OCCLUDED) && (wire.layers[2].flags&BROOK_DESKTOP_LAYER_OCCLUDED));
+    layers.layers[3].clientX=120;
+    // Translucent or not upscaled to cover: no occlusion.
+    top.opacity=254;wire=occludedReply;touched=0;
+    CHECK(!ExportDesktopLayers(layers,wire,true,counting,alwaysCurrent,65536,0,0,nullptr,cull) && touched==0x3f);
+    top.opacity=255;top.upscale=1;wire=occludedReply;touched=0;
+    CHECK(!ExportDesktopLayers(layers,wire,true,counting,alwaysCurrent,65536,0,0,nullptr,cull) && touched==0x3f);
+    // Content wider than the client rectangle is clipped before the test:
+    // a 2x buffer clipped to a 1000x1400 client covers only that.
+    top.upscale=2;top.clientWidth=1000;top.clientHeight=1400;wire=occludedReply;touched=0;
+    CHECK(!ExportDesktopLayers(layers,wire,true,counting,alwaysCurrent,65536,0,0,nullptr,cull));
+    CHECK((wire.layers[0].flags&BROOK_DESKTOP_LAYER_OCCLUDED) && !(wire.layers[4].flags&BROOK_DESKTOP_LAYER_OCCLUDED));
+    // Only layers above can occlude.
+    std::swap(layers.layers[0],layers.layers[5]);wire=request;BudgetDestinations(layers,wire);touched=0;
+    CHECK(!ExportDesktopLayers(layers,wire,true,counting,alwaysCurrent,65536,0,0,nullptr,cull) && touched==0x3f);
+    std::puts("WINDOW_SURFACES PASS: occluded desktop layers");
+}
+
 int main() {
     using namespace brook;
+    TestDesktopLayerBudget();
+    TestDesktopLayerOcclusion();
     for(auto& glyph:badgeGlyphs)glyph={0,0,2,2,0,2,3};
     const uint64_t initialStyle=WmBackdropStyleVersion();
     SetWmActiveLocked(true);CHECK(WmBackdropStyleVersion()==initialStyle+2);
