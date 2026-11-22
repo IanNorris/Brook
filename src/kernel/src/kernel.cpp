@@ -1032,6 +1032,10 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
                 brook::Device* pd = brook::DeviceFind(pname);
                 if (!pd) continue;
+                if (brook::LiveStoreIsStorePartition(pd)) {
+                    brook::KPrintf("usb-gpt: %s is the live store; copied to RAM later, not mounted\n", pname);
+                    continue;
+                }
 
                 char label[24] = "usb-gpt: ";
                 for (uint32_t j = 0; pname[j] && j < 12; ++j) label[9 + j] = pname[j];

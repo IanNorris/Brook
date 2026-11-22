@@ -16,17 +16,36 @@ namespace brook {
 namespace {
 constexpr uint64_t ChunkBytes = 4ull << 20;
 constexpr uint64_t RamHeadroom = 4ull << 30; // keep this much free after the copy
-}
 
-bool LiveStoreBoot(uint8_t* nextDrive)
+bool ReadRecord(LiveStoreRecord& record, bool quiet)
 {
     Vnode* node = VfsOpen("/etc/live-store", VFS_O_STREAM);
     if (!node) return false;
     char text[200]{}; uint64_t offset = 0;
     const int n = VfsRead(node, text, sizeof(text) - 1, &offset);
     VfsClose(node);
+    if (n <= 0 || !LiveStoreParse(text, uint32_t(n), record)) {
+        if (!quiet) KPuts("live store: invalid /etc/live-store\n");
+        return false;
+    }
+    return true;
+}
+}
+
+bool LiveStoreIsStorePartition(Device* partition)
+{
     LiveStoreRecord record{};
-    if (n <= 0 || !LiveStoreParse(text, uint32_t(n), record)) { KPuts("live store: invalid /etc/live-store\n"); return false; }
+    if (!partition || !ReadRecord(record, true)) return false;
+    uint8_t guid[16]; uint32_t entry = 0; uint64_t first = 0, sectors = 0;
+    if (!PartitionGptIdentity(partition, guid, &entry, &first, &sectors)) return false;
+    for (unsigned i = 0; i < 16; ++i) if (guid[i] != record.guid[i]) return false;
+    return true;
+}
+
+bool LiveStoreBoot(uint8_t* nextDrive)
+{
+    LiveStoreRecord record{};
+    if (!ReadRecord(record, false)) return false;
     const int disk = BootStickDiskIndex();
     if (disk < 0 || disk > 9) { KPuts("live store: boot stick disk not identified; kconsole session\n"); return false; }
     Device* part = nullptr;
