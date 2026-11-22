@@ -1071,12 +1071,15 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         auto hex=[&](uint32_t& v)->bool{unsigned n=0;v=0;while(*p==' ')++p;
             while((*p>='0'&&*p<='9')||(*p>='a'&&*p<='f')){v=v*16+uint32_t(*p<='9'?*p-'0':*p-'a'+10);++p;if(++n>8)return false;}while(*p==' ')++p;return n>0;};
         const bool rdMode=word("read"),edMode=!rdMode&&word("edid"),pwMode=!rdMode&&!edMode&&word("power");
+        const bool rtMode=!rdMode&&!edMode&&!pwMode&&word("retrain");
         uint32_t ch=0,addr=0,len=0;
-        if((!rdMode&&!edMode&&!pwMode)||!hex(ch)||ch>7){DebugChannelSend("{\"aux_error\":\"usage: nv-aux read <ch> <addr> <len>|edid <ch> <block>|power <ch> d0|d3\"}\n");return true;}
+        if((!rdMode&&!edMode&&!pwMode&&!rtMode)||!hex(ch)||ch>7){DebugChannelSend("{\"aux_error\":\"usage: nv-aux read <ch> <addr> <len>|edid <ch> <block>|power <ch> d0|d3\"}\n");return true;}
         uint8_t powerValue=0;
         if(rdMode&&(!hex(addr)||!hex(len)||!len||len>16||addr>0xfffff)){DebugChannelSend("{\"aux_error\":\"bad read args\"}\n");return true;}
         if(edMode&&(!hex(addr)||addr>3)){DebugChannelSend("{\"aux_error\":\"block 0..3\"}\n");return true;}
         if(pwMode){if(word("d0"))powerValue=1;else if(word("d3"))powerValue=2;else{DebugChannelSend("{\"aux_error\":\"d0|d3\"}\n");return true;}}
+        uint32_t sor=0,link=0;
+        if(rtMode&&(!hex(sor)||sor>3||!hex(link)||(link!=1&&link!=2))){DebugChannelSend("{\"aux_error\":\"retrain <ch> <sor 0-3> <link 1|2>\"}\n");return true;}
         PciDevice gpu{};bool found=false;
         for(uint32_t i=0;i<PciBootInventoryCount() && !found;++i){PciBootEntry e{};
             if(PciBootInventoryRead(i,&e) && e.device.vendorId==0x10de && e.device.classCode==0x03 && e.device.fn==0){gpu=e.device;found=true;}}
@@ -1132,6 +1135,59 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
             uint8_t off=uint8_t(addr*128);uint32_t one=1;rc=xfer(0x4,0x50,&off,one);         // I2C write MOT: offset
             for(uint32_t i=0;!rc&&i<128;i+=16){uint32_t n=16;rc=xfer(0x5,0x50,buf+i,n);if(!rc&&n!=16)rc=-5;got=i+n;} // I2C read MOT
             uint32_t z=0;(void)xfer(0x1,0x50,nullptr,z);                                    // stop (no MOT)
+        }
+        else if(ok&&rtMode){
+            // Retrain the GOP's own DP link in place (nouveau retrain path):
+            // clock, lane enables, power and drive stay as programmed; only
+            // the SOR training pattern and the sink's DPCD training registers
+            // change. Requires the SOR's ARM state to be DP and on a head.
+            static VirtualAddress sorWin{};
+            const uint64_t barBase=bar0&~uint64_t(15);
+            if(!sorWin){sorWin=VmmAllocPages(1,VMM_WRITABLE|VMM_NO_EXEC,MemTag::Device,KernelPid);
+                const auto leaf=VmmDetachPage(KernelPageTable,sorWin);if(leaf)PmmFreePage(VmmLeafPhysical(leaf));
+                __asm__ volatile("invlpg (%0)"::"r"(sorWin.raw()):"memory");
+                if(!VmmMapPage(KernelPageTable,sorWin,PhysicalAddress(barBase+0x61c000),
+                    VMM_WRITABLE|VMM_NO_EXEC|VMM_CACHE_DISABLE|VMM_WRITE_THRU,MemTag::Device,KernelPid))sorWin=VirtualAddress{};}
+            static VirtualAddress roWin{};
+            if(!roWin){roWin=VmmAllocPages(1,VMM_WRITABLE|VMM_NO_EXEC,MemTag::Device,KernelPid);
+                const auto leaf=VmmDetachPage(KernelPageTable,roWin);if(leaf)PmmFreePage(VmmLeafPhysical(leaf));
+                __asm__ volatile("invlpg (%0)"::"r"(roWin.raw()):"memory");
+                if(!VmmMapPage(KernelPageTable,roWin,PhysicalAddress(barBase+0x688000),
+                    VMM_NO_EXEC|VMM_CACHE_DISABLE|VMM_WRITE_THRU,MemTag::Device,KernelPid))roWin=VirtualAddress{};}
+            if(!sorWin||!roWin){rc=-12;strcpy(err,"map");}
+            else{
+                volatile uint32_t* sr=reinterpret_cast<volatile uint32_t*>(sorWin.raw());
+                const volatile uint32_t* arm=reinterpret_cast<const volatile uint32_t*>(roWin.raw());
+                const uint32_t sorCtl=arm[(0x300+sor*0x20)/4]; // 0x688300 + sor*0x20 (ARM)
+                const uint32_t proto=(sorCtl>>8)&0xf;
+                const uint32_t soff=sor*0x800,loff=soff+(link==2?0x80:0);
+                const uint32_t dpctrl=sr[(0x10c+loff)/4];
+                if(!(sorCtl&0xff)||(proto!=8&&proto!=9)||(link==2)!=(proto==9)||!(dpctrl&0x000f0000)){rc=-22;strcpy(err,"SOR not an active DP link");}
+                else{
+                    const uint32_t patReg=(link&1)?0x110+soff:0x12c+soff; // gm107_sor_dp_pattern
+                    const uint32_t patOrig=sr[patReg/4];
+                    auto pattern=[&](uint32_t pat){static const uint32_t d[]={0x10101010,0x01010101,0x02020202,0x03030303};
+                        sr[patReg/4]=(sr[patReg/4]&~0x1f1f1f1fu)|d[pat];};
+                    const uint32_t lanes=__builtin_popcount((dpctrl>>16)&0xf);
+                    uint8_t caps[16]{};uint32_t n=16;rc=xfer(0x9,0x000,caps,n);
+                    uint8_t conf[4]{};n=4;if(!rc)rc=xfer(0x9,0x103,conf,n);
+                    uint8_t lc[2]={caps[1],uint8_t(lanes|((dpctrl&0x4000)?0x80:0))};n=2;
+                    if(!rc)rc=xfer(0x8,0x100,lc,n);
+                    auto status=[&](uint8_t* st)->int{uint32_t m=6;return xfer(0x9,0x202,st,m);};
+                    auto lanesOk=[&](const uint8_t* st,uint8_t mask)->bool{for(uint32_t i=0;i<lanes;++i)if(((st[i>>1]>>((i&1)*4))&mask)!=mask)return false;return true;};
+                    uint8_t st[6]{};bool cr=false,eq=false;
+                    if(!rc){pattern(1);uint8_t tp=0x21;n=1;rc=xfer(0x8,0x102,&tp,n);n=4;if(!rc)rc=xfer(0x8,0x103,conf,n);}
+                    for(int t=0;!rc&&t<5&&!cr;++t){spin(100);rc=status(st);cr=!rc&&lanesOk(st,0x1);}
+                    const bool tps3=(caps[2]&0x40)!=0;
+                    if(!rc&&cr){pattern(tps3?3:2);uint8_t tp=uint8_t(0x20|(tps3?3:2));n=1;rc=xfer(0x8,0x102,&tp,n);}
+                    for(int t=0;!rc&&cr&&t<6&&!eq;++t){spin(400);rc=status(st);eq=!rc&&lanesOk(st,0x7)&&(st[2]&1);}
+                    sr[patReg/4]=patOrig; uint8_t tp0=0;n=1;(void)xfer(0x8,0x102,&tp0,n);
+                    spin(1000);(void)status(st);
+                    r.field("cr",cr?1u:0u);r.text(",");r.field("eq",eq?1u:0u);r.text(",");
+                    r.field("lane01",st[0]);r.text(",");r.field("lane23",st[1]);r.text(",");r.field("align",st[2]);r.text(",");
+                    KPrintf("nv-aux: retrain SOR%u link %u ch %u cr=%d eq=%d status %02x %02x %02x\n",sor,link,ch,cr,eq,st[0],st[1],st[2]);
+                }
+            }
         }
         else if(ok&&pwMode){uint32_t one=1;rc=xfer(0x8,0x600,&powerValue,one);
             uint32_t n=1;uint8_t back=0;if(!rc&&!xfer(0x9,0x600,&back,n)){r.field("dpcd600",back);r.text(",");}
