@@ -235,7 +235,7 @@ int main(int argc, char** argv) {
         fputs("HWRTXUP_AUTH_REFUSED version=3\n", stderr);
         result = 10; goto out;
     }
-    deadline = BridgeV3PosixDeadline(600000);
+    deadline = BridgeV3PosixDeadline(1800000); /* slow real-stick writes; host bounds its wait by size */
     result = receive(argv[1], argv[2]);
     if (result && !replied) {
         char error[96];

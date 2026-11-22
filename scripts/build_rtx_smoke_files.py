@@ -14,9 +14,12 @@ What the payload binds or touches (everything else is never probed):
     virtio-blk is the only built-in block driver (absent on real hardware).
     AHCI stays unbound: no /etc/ahci-* selector, no AHCI observation marker.
     There is no NVMe driver.
-  * Modules: xhci only, driving every xHCI controller with USB 2/3 hubs
+  * Modules: xhci, driving every xHCI controller with USB 2/3 hubs
     (USB storage read-only via /etc/usb-read-only, USB HID boot keyboard and
-    mouse, CDC-ECM USB Ethernet). No GPU, HDA or NIC PCI drivers.
+    mouse, CDC-ECM USB Ethernet), and i219: the onboard Intel I219-V
+    (8086:15b8 only). It probes read-only at load; it attaches (rings, link,
+    DHCP as a second interface) only with --i219-stage attach|reset or the
+    operator's `bridge hardware nic attach|reset`. No GPU or HDA drivers.
   * /etc/hw-inventory: read-only boot inventory (CPU, memory map, ACPI table
     headers, MCFG, DMAR, PCI config space incl. ECAM extended capabilities).
   * /etc/boot-status: end-of-boot status block (every xHCI controller, its
@@ -64,10 +67,11 @@ LOADER_FLAGS = {
     'BROOK_GUARD_CHECK_DATA': 'OFF', 'BROOK_GUARD_ALTERNATE_RECOVERY': 'OFF',
     'BROOK_BUILD_RECOVERY_PROBE': 'OFF',
 }
-DRIVERS = ('xhci',)
+DRIVERS = ('xhci', 'i219')
+I219_STAGES = {'probe': (), 'attach': ('i219-attach',), 'reset': ('i219-reset',)}
 MARKERS = ('usb-read-only', 'audio-muted', 'hw-inventory', 'boot-status', 'boot-stick-update')
 # Exact /etc contents allowed in the initrd (lower-case FAT names).
-ETC_ALLOWED = {*MARKERS, 'hardware-payload-id', 'resolv.conf', 'machine-id', 'ssl',
+ETC_ALLOWED = {*MARKERS, 'i219-attach', 'i219-reset', 'hardware-payload-id', 'resolv.conf', 'machine-id', 'ssl',
                'bridge-v3-operators', 'rtx-update-signer'}
 # Guest helpers in /boot: the boot-stick update receiver and the payload-ID reporter.
 HELPERS = {'HWRTXUP.ELF': 'tools/hardware_rtx_update.c', 'HWSTATUS.ELF': 'tools/hardware_status.c'}
@@ -199,7 +203,8 @@ def build(args):
         shutil.copy2(kernel_build / 'drivers' / f'{name}.mod', stage / 'kernel/drivers' / f'{name}.mod')
     short = commit[:8] + ('-dirty' if dirty else '')
     payload_id = f'brook-rtx-smoke-{short}' + (f'-{args.payload_tag}' if args.payload_tag else '')
-    env = dict(os.environ, BROOK_BUILD_DIR=str(stage), BROOK_INITRD_MARKERS=','.join(MARKERS),
+    markers = (*MARKERS, *I219_STAGES[args.i219_stage])
+    env = dict(os.environ, BROOK_BUILD_DIR=str(stage), BROOK_INITRD_MARKERS=','.join(markers),
                BROOK_HARDWARE_PAYLOAD_ID=payload_id)
     env.pop('BROOK_PROVIDER_PAYLOAD', None)
     run(['bash', ROOT / 'scripts/make_initrd.sh', '--release'], env=env)
@@ -238,7 +243,8 @@ def build(args):
         'fat_label': FAT_LABEL, 'files': files,
         'kernel_options': KERNEL_FLAGS, 'loader_options': LOADER_FLAGS,
         'loader_config': LOADER_CONFIG.decode(), 'init_rc': INIT_RC.decode(),
-        'initrd': {'drivers': list(DRIVERS), 'etc': etc, 'markers': list(MARKERS)},
+        'initrd': {'drivers': list(DRIVERS), 'etc': etc, 'markers': list(markers)},
+        'i219_stage': args.i219_stage,
         'helpers': helpers,
         'update_signer_public': signer_hex,
         'bridge_v3': {'operator_keys': len(keys), 'policy_sha256': hashlib.sha256(policy).hexdigest()},
@@ -248,8 +254,9 @@ def build(args):
                        'except a write window over the boot-stick partition during a signed authenticated update, '
                        'built-in virtio-blk only exists in VMs',
             'firmware': 'no EFI variable writes, no firmware/flash access, no AML interpreter (uACPI off)',
-            'pci_writes': 'every xHCI controller only (BIOS handoff, controller reset, memory+bus-master enable, '
-                          'MSI/MSI-X); '
+            'pci_writes': 'every xHCI controller (BIOS handoff, controller reset, memory+bus-master enable, '
+                          'MSI/MSI-X); the I219-V 8086:15b8 command register (memory, bus master, INTx off) '
+                          'and its MAC/PHY registers once attached (never NVM/flash cycles); '
                           'virtio devices exist only in VMs',
             'cpu_msrs': 'volatile only: PAT, APIC, TSC_AUX, EPB 0/15->6 as Linux, MWAIT idle; reset on reboot',
             'inventory': 'read-only config reads (CF8 and MCFG ECAM mapped read-only); no BAR sizing',
@@ -306,6 +313,8 @@ def main():
                    help='file with the boot-stick update Ed25519 public key (hex); see scripts/rtx_smoke_update.py signer-public')
     p.add_argument('--payload-tag', help='suffix for the payload ID (a trivially different set for update tests)')
     p.add_argument('--image', type=Path, help='also write a raw GPT/FAT32 disk image here')
+    p.add_argument('--i219-stage', choices=sorted(I219_STAGES), default='probe',
+                   help='I219-V bring-up stage at boot (default probe: read-only)')
     p.add_argument('--allow-dirty', action='store_true')
     args = p.parse_args()
     args.output = args.output.absolute()

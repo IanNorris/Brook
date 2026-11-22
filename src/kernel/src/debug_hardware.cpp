@@ -340,6 +340,7 @@ bool DebugHardwareAutoInitializeIntel(){
     return false;
 #endif
 }
+static uint32_t (*volatile g_nicCommand)(const char*,char*,uint32_t)=nullptr;
 bool DebugHardwareHandleCommand(const char* command,uint32_t length){
     constexpr const char* guard="bridge guard ";
     if(Prefix(command,guard)){
@@ -1037,6 +1038,18 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
             if(s.status.protectedMemorySampled){r.text(",");r.field("protected_memory",s.status.protectedMemory);}}
         r.text("}\n");r.send();return true;
     }
+    constexpr char nicPrefix[]="bridge hardware nic";
+    if(Prefix(command,nicPrefix) && (!command[sizeof(nicPrefix)-1] || command[sizeof(nicPrefix)-1]==' ')) {
+        auto* handler=__atomic_load_n(&g_nicCommand,__ATOMIC_ACQUIRE);
+        if(!handler){DebugChannelSend("{\"nic_error\":\"No PCI NIC diagnostic handler is loaded\"}\n");return true;}
+        const char* args=command+sizeof(nicPrefix)-1;
+        while(*args==' ')++args;
+        static char text[3073];
+        uint32_t n=handler(args,text,sizeof(text)-1);
+        if(n>=sizeof(text))n=sizeof(text)-1;
+        text[n]=0;
+        Reply r;r.text("{\"nic_api\":1,\"text\":");r.quoted(text);r.text("}\n");r.send();return true;
+    }
     if(!strcmp(command,"bridge hardware inventory-info")) {
         Reply r;r.text("{\"hw_inventory_api\":1,\"captured\":");r.text(HwInventoryCaptured()?"true":"false");
         r.text(",");r.field("bytes",HwInventoryBytes());r.text(",");r.field("lines",HwInventoryLines());
@@ -1365,4 +1378,9 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
     for(int i=0;i<count;++i){if(i)r.text(",");r.quoted(lines[i]);}
     r.text("],\"more\":");r.text(cursor<total?"true":"false");r.text("}\n");r.send();return true;
 }
+}
+
+extern "C" void DebugNicCommandSetHandler(uint32_t (*handler)(const char* args, char* out, uint32_t capacity))
+{
+    __atomic_store_n(&brook::g_nicCommand, handler, __ATOMIC_RELEASE);
 }

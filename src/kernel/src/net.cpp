@@ -1121,6 +1121,19 @@ static int NetSendIpv4Resolved(NetIf* nif, const MacAddr& dstMac,
     if (submissionDeadline && ApicTickCount() >= submissionDeadline) return -110;
     return tryOnly ? nif->tryTransmit(nif,frame,frameLen) : nif->transmit(nif,frame,frameLen);
 }
+static NetIf* NetFindOwnInterface(uint32_t ip);
+// A bound source address leaves through the interface that owns it when that
+// interface can reach dstIp (same subnet, or it has a gateway). With two NICs
+// on one subnet, replies then follow the address the peer connected to rather
+// than whichever NIC registered first. Otherwise: subnet/default routing.
+static NetIf* NetIfForSourceDst(uint32_t source, uint32_t dstIp)
+{
+    NetIf* owner = NetFindOwnInterface(source);
+    if (owner && owner->netmask &&
+        ((dstIp & owner->netmask) == (owner->ipAddr & owner->netmask) || owner->gateway))
+        return owner;
+    return NetIfForDst(dstIp);
+}
 static NetIf* NetFindOwnInterface(uint32_t ip)
 {
     if (!ip) return nullptr;
@@ -1203,7 +1216,7 @@ static int NetSendIpv4From(uint32_t source, uint32_t dstIp, uint8_t proto,
 #endif
 
     const bool local = loopback || own;
-    NetIf* nif = own ? own : scope ? nullptr : NetIfForDst(dstIp);
+    NetIf* nif = own ? own : scope ? nullptr : NetIfForSourceDst(source, dstIp);
     source = Ipv4Source(source, dstIp, own ? dstIp : nif ? nif->ipAddr : 0);
     if (!source || (!local && (!nif || !nif->ipAddr || Ipv4IsLoopback(source)))) return -1;
 

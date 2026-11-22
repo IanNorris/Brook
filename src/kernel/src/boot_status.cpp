@@ -22,6 +22,7 @@ volatile uint64_t g_usbGeneration = 0;
 IrqSpinLock g_usbLock;
 uint32_t (*volatile g_usbProvider)(char*, uint32_t) = nullptr;
 SpinLock g_printLock;
+uint32_t (*volatile g_extraProviders[4])(char*, uint32_t) = {};
 bool g_enabled = false;
 bool g_threadsStarted = false;
 
@@ -145,6 +146,19 @@ extern "C" void UsbStatusSetProvider(uint32_t (*provider)(char* out, uint32_t ca
     __atomic_fetch_add(&g_usbGeneration, 1, __ATOMIC_RELEASE);
 }
 
+extern "C" bool BootStatusAddProvider(uint32_t (*provider)(char* out, uint32_t capacity))
+{
+    if (!provider) return false;
+    for (auto& slot : g_extraProviders) {
+        uint32_t (*expected)(char*, uint32_t) = nullptr;
+        if (__atomic_compare_exchange_n(&slot, &expected, provider, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            __atomic_fetch_add(&g_usbGeneration, 1, __ATOMIC_RELEASE);
+            return true;
+        }
+    }
+    return false;
+}
+
 extern "C" void UsbStatusChanged()
 {
     __atomic_fetch_add(&g_usbGeneration, 1, __ATOMIC_RELEASE);
@@ -178,9 +192,23 @@ extern "C" void BootStatusPrint(const char* reason)
             line = more ? end + 1 : end;
         }
     } else KPrintf("USB no xHCI status published (driver absent or failed to load)\n");
+    for (auto* provider : g_extraProviders) {
+        if (!provider) continue;
+        const uint32_t length = provider(copy, UsbTextCapacity);
+        copy[length < UsbTextCapacity ? length : UsbTextCapacity - 1] = 0;
+        char* line = copy;
+        while (*line) {
+            char* end = line;
+            while (*end && *end != '\n') ++end;
+            const bool more = *end == '\n';
+            *end = 0;
+            KPrintf("%s\n", line);
+            line = more ? end + 1 : end;
+        }
+    }
     const uint32_t count = NetIfCount();
     if (!count) KPrintf("NET no network interface yet (DHCP starts when a NIC appears)\n");
-    uint32_t bridgeIp = 0;
+    uint32_t bridgeIps = 0;
     for (uint32_t i = 0; i < count; ++i) {
         const NetIf* nif = NetIfAt(i);
         if (!nif) continue;
@@ -193,7 +221,7 @@ extern "C" void BootStatusPrint(const char* reason)
             PrintIp(" IP ", nif->ipAddr);
             KPrintf("/%u", PrefixLength(nif->netmask));
             if (nif->gateway) PrintIp(" gw ", nif->gateway);
-            if (!bridgeIp) bridgeIp = nif->ipAddr;
+            ++bridgeIps;
         }
         KPrintf("\n");
         // Traffic counters: IP stack frames, then the driver's USB view (RX TDs
@@ -216,10 +244,14 @@ extern "C" void BootStatusPrint(const char* reason)
         }
         KPrintf("\n");
     }
-    if (bridgeIp) {
-        PrintIp("BRIDGE endpoint tcp ", bridgeIp);
-        KPrintf(":1234 (v3 operator auth)\n");
-    } else KPrintf("BRIDGE no IPv4 address yet; DHCP keeps retrying\n");
+    // The listener binds every interface: print one endpoint per address.
+    for (uint32_t i = 0; i < count; ++i) {
+        const NetIf* nif = NetIfAt(i);
+        if (!nif || !nif->ipAddr) continue;
+        PrintIp("BRIDGE endpoint tcp ", nif->ipAddr);
+        KPrintf(":1234 (v3 operator auth) via if%u\n", i);
+    }
+    if (!bridgeIps) KPrintf("BRIDGE no IPv4 address yet; DHCP keeps retrying\n");
 #if defined(BROOK_BRIDGE_V3)
     DebugBridgeV3LogBoot();
 #endif

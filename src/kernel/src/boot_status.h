@@ -24,6 +24,9 @@ extern "C" void UsbStatusSetProvider(uint32_t (*provider)(char* out, uint32_t ca
 extern "C" void UsbStatusChanged();
 // Print the whole block now (no-op unless enabled). Reason is a short tag.
 extern "C" void BootStatusPrint(const char* reason);
+// A PCI NIC driver's live status text (multi-line, '\n' separated), called at
+// print time after the USB section. Up to four providers; false when full.
+extern "C" bool BootStatusAddProvider(uint32_t (*provider)(char* out, uint32_t capacity));
 // Run fn(arg) on its own kernel thread once the scheduler runs (immediately
 // if it already does). Returns false when the queue is full.
 extern "C" bool KernelWorkerStart(const char* name, void (*fn)(void*), void* arg);

@@ -90,10 +90,26 @@ def line(stream):
     raise ValueError('oversize receiver line')
 
 
-def stream_set(host, port, operator, boot, tx, manifest, signature, blobs, *, tamper=None):
-    """One upload; tamper is for negative tests only ('signature' or 'file')."""
+def install_timeout(blobs):
+    """Seconds to wait for the final 'updated' line after ACTIVATE.
+
+    On the real stick (xHCI bulk writes, PREV/ rebuild, read-back and a fresh
+    read-only verify) a ~10 MB set took longer than the old fixed 180 s. Bound
+    it by size at a pessimistic 50 KB/s for the ~3x bytes the guest writes and
+    reads back, never below 300 s; the guest's own deadline is the upper limit.
+    """
+    total = sum(len(b) for b in blobs)
+    return max(300, min(1800, 60 + (3 * total) // 50_000))
+
+
+def stream_set(host, port, operator, boot, tx, manifest, signature, blobs, *, tamper=None, replies=None,
+               final_timeout=300):
+    """One upload; tamper is for negative tests only ('signature' or 'file').
+
+    replies is filled in place so a caller keeps the lines received before a
+    timeout or disconnect."""
     from binary_bridge import binary_stream, finish_request, require_response_end
-    replies = []
+    replies = [] if replies is None else replies
     with socket.create_connection((host, port), timeout=30) as connection:
         connection.settimeout(180)
         stream, _ = binary_stream(connection, operator, UPDATE, STICK, boot, tx)
@@ -116,6 +132,7 @@ def stream_set(host, port, operator, boot, tx, manifest, signature, blobs, *, ta
             return replies
         stream.sendall(b'ACTIVATE')
         finish_request(stream)
+        stream.settimeout(final_timeout)
         replies.append(line(stream))
         require_response_end(stream)
     return replies
@@ -232,24 +249,49 @@ class Run:
             time.sleep(0.1)
         self.save(state='receiver_listening')
         replies = []
+        final_timeout = install_timeout(blobs)
+        started = time.monotonic()
         try:
-            replies = stream_set(data['host'], upload_port, operator, boot, tx, binary, signature, blobs, tamper=tamper)
+            stream_set(data['host'], upload_port, operator, boot, tx, binary, signature, blobs, tamper=tamper,
+                       replies=replies, final_timeout=final_timeout)
         except (OSError, ConnectionError, ValueError, RuntimeError) as error:
             self.save(upload_error=str(error))
-        self.save(state='upload_finished', replies=replies)
-        end = time.monotonic() + 120
+        self.save(state='upload_finished', replies=replies, upload_seconds=round(time.monotonic() - started, 1),
+                  final_timeout_s=final_timeout)
+        # The guest job outlives a lost upload reply: it may still be writing.
+        # Wait for it (its own deadline is 600 s from start) before judging.
+        end = time.monotonic() + final_timeout + 120
         while True:
             job = self.bridge.job(session, ident, wait_s=2)
             if job.get('state') in ('completed', 'failed', 'rejected', 'lost') or time.monotonic() > end:
                 break
-        self.save(job={'state': job.get('state'), 'exit': job.get('exit'), 'stdout': job.get('stdout', {}).get('text'),
-                       'stderr': job.get('stderr', {}).get('text')})
+        stdout = job.get('stdout', {}).get('text') or ''
+        self.save(job={'state': job.get('state'), 'exit': job.get('exit'), 'stdout': stdout,
+                       'stderr': job.get('stderr', {}).get('text')}, job_seconds=round(time.monotonic() - started, 1))
         final = replies[-1] if replies else {}
-        ok = final.get('state') == 'updated' and job.get('exit', {}).get('code') == 0 and \
-            f'HWRTXUP_UPDATED payload={payload_id} ' in (job.get('stdout', {}).get('text') or '')
-        self.save(after=self.status(session))
+        after = self.status(session)
+        self.save(after=after)
+        job_updated = job.get('state') == 'completed' and job.get('exit', {}).get('code') == 0 and \
+            f'HWRTXUP_UPDATED payload={payload_id} ' in stdout
+        if job_updated and final.get('state') != 'updated':
+            # The 'updated' line was lost (slow writes or a dropped stream), but
+            # the guest job finished its verified install. Accept it only when
+            # the stick now reports the new root payload with a pending trial.
+            recovered = after.get('root_payload') == payload_id and 'B' in (after.get('markers') or '') and \
+                after.get('exit') == 0
+            self.save(receipt_recovered=recovered)
+            if recovered:
+                match = re.search(r'HWRTXUP_UPDATED (.*)', stdout)
+                final = {'state': 'updated', 'recovered_from_job': True,
+                         **dict(re.findall(r'(\w+)=(\S+)', match[1] if match else ''))}
+        ok = final.get('state') == 'updated' and job_updated
         if not ok:
-            self.save(state='refused' if not final.get('storage_modified') else 'needs_inspection')
+            # 'refused' promises an unmodified stick: never claim it when the
+            # job reports an install or the stick's root payload changed.
+            modified = final.get('storage_modified') or job_updated or \
+                after.get('root_payload') != (self.receipt.get('before') or {}).get('root_payload') or \
+                job.get('state') != 'completed'
+            self.save(state='needs_inspection' if modified else 'refused')
             return self.receipt
         self.save(state='updated', update=final)
         if not restart:

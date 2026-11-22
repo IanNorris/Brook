@@ -11,3 +11,8 @@ bool HardwareBuildProvenanceRead(DesktopBuildProvenance& provenance);
 // A failed or uncertain attempt is never automatically replayed in this boot.
 bool DebugHardwareAutoInitializeIntel();
 }
+
+// A PCI NIC module's diagnostic command: "bridge hardware nic <args>" calls
+// handler(args, out, capacity); the returned text goes back JSON-quoted.
+// The handler runs on the debug command thread; nullptr unregisters.
+extern "C" void DebugNicCommandSetHandler(uint32_t (*handler)(const char* args, char* out, uint32_t capacity));
