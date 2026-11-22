@@ -50,6 +50,17 @@ bool LiveStoreBoot(uint8_t* nextDrive)
     const int disk = BootStickDiskIndex();
     if (disk < 0 || disk > 9) { KPuts("live store: boot stick disk not identified; kconsole session\n"); return false; }
     Device* part = nullptr;
+    uint64_t base0 = 0; // byte offset of the store on 'part'
+    if (record.extent) {
+        // A network-written slot: a raw extent of the boot stick's own disk.
+        char name[5] = {'u', 's', 'b', char('0' + disk), 0};
+        Device* whole = DeviceFind(name);
+        const uint64_t diskSectors = whole ? DeviceBlockCount(whole) * (DeviceBlockSize(whole) / 512) : 0;
+        if (!whole || record.firstLba > diskSectors || record.sectors > diskSectors - record.firstLba) {
+            KPuts("live store: store extent outside the boot stick; kconsole session\n"); return false;
+        }
+        part = whole; base0 = record.firstLba * 512;
+    }
     for (unsigned p = 1; p <= 9 && !part; ++p) {
         char name[8] = {'u', 's', 'b', char('0' + disk), 'p', char('0' + p), 0};
         Device* dev = DeviceFind(name);
@@ -67,13 +78,13 @@ bool LiveStoreBoot(uint8_t* nextDrive)
     auto base = VmmAllocPages(pages, VMM_WRITABLE | VMM_NO_EXEC, MemTag::Device, KernelPid);
     if (!base) { KPuts("live store: allocation failed; kconsole session\n"); return false; }
     auto* memory = reinterpret_cast<uint8_t*>(base.raw());
-    KPrintf("live store: reading %s %lu MiB into RAM\n", part->name, static_cast<unsigned long>(record.bytes >> 20));
+    KPrintf("live store: reading %s (offset %lu) %lu MiB into RAM\n", part->name, static_cast<unsigned long>(base0), static_cast<unsigned long>(record.bytes >> 20));
     BrookSha256 hash; BrookShaInit(&hash);
     const uint64_t start = ApicTickCount();
     uint64_t lastReport = 0;
     for (uint64_t at = 0; at < record.bytes; at += ChunkBytes) {
         const uint64_t len = record.bytes - at < ChunkBytes ? record.bytes - at : ChunkBytes;
-        const int got = part->ops->read(part, at, memory + at, len);
+        const int got = part->ops->read(part, base0 + at, memory + at, len);
         if (got != int(len)) {
             KPrintf("live store: read failed at %lu (%d); kconsole session\n", static_cast<unsigned long>(at), got);
             VmmFreePages(base, pages); return false;

@@ -42,7 +42,7 @@ bool AhciSystemVolumeOwnsRoot(Vnode* node) { return node==g_espRoot; }
 BootGuardSlot BootTimingHandoffSlot() { return g_bootSlot; }
 uint32_t BootTimingHandoffFlags() { return g_bootFlags; }
 // The boot-stick gate is inert here (no /etc/boot-stick-update): no such device.
-int BootStickIoctl(uint32_t, uint64_t, bool (*)(uint64_t, const void*, uint64_t)) { return -19; }
+int BootStickIoctl(uint32_t, uint64_t, bool (*)(uint64_t, const void*, uint64_t), bool (*)(void*, uint64_t, uint64_t)) { return -19; }
 int GuardedDesktopCheckGuardIdentity(const uint8_t (&digest)[32]) {
     ++g_guardDigestCalls;
     if(!g_guardIdentityReady)return -11;

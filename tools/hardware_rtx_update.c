@@ -201,6 +201,78 @@ done:
     return result;
 }
 
+/* Live-store slot write (BOOT TX --store): one signed store manifest, then the
+ * raw image streamed into a store slot through the kernel gate, which decides
+ * whether the slot is acceptable (boot-stick disk, not the boot volume, not
+ * the running store). Readback SHA-256 by the kernel before success. The
+ * running store and /etc/live-store are never modified here. */
+#define STORE_MANIFEST_BYTES 112u
+#define STORE_SIGN_DOMAIN "BROOK-RTX-STORE-MANIFEST-V1"
+#define STORE_SIGN_DOMAIN_BYTES 28u
+static uint64_t get64(const uint8_t* p) { uint64_t v = 0; for (int i = 7; i >= 0; --i) v = v << 8 | p[i]; return v; }
+static int receive_store(const char* boot, const char* tx) {
+    uint8_t header[72];
+    if (BridgeV3PosixRead(&transport, header, sizeof(header), deadline) || memcmp(header, "BRRTXST1", 8) ||
+        memcmp(header + 8, boot, 32) || memcmp(header + 40, tx, 32)) return 10;
+    if (send_line("{\"state\":\"ready\",\"mode\":\"store\"}\n")) return 13;
+    uint8_t manifest[STORE_MANIFEST_BYTES], signature[64], signer[32];
+    if (BridgeV3PosixRead(&transport, manifest, sizeof(manifest), deadline) ||
+        BridgeV3PosixRead(&transport, signature, 64, deadline)) return 14;
+    if (read_signer(signer)) return 15;
+    uint8_t message[STORE_SIGN_DOMAIN_BYTES + STORE_MANIFEST_BYTES];
+    memcpy(message, STORE_SIGN_DOMAIN, STORE_SIGN_DOMAIN_BYTES);
+    memcpy(message + STORE_SIGN_DOMAIN_BYTES, manifest, sizeof(manifest));
+    if (crypto_ed25519_check(signature, signer, message, sizeof(message))) {
+        fputs("HWRTXUP_STORE_SIGNATURE_REFUSED\n", stderr); return RTX_E_SIGNATURE;
+    }
+    if (memcmp(manifest, "BRKSTOR1", 8)) return 16;
+    BrookStoreExtent extent = {get64(manifest + 8), get64(manifest + 16)};
+    const uint64_t bytes = get64(manifest + 24);
+    const uint8_t* want = manifest + 32;
+    char id[49] = {0}; memcpy(id, manifest + 64, 48);
+    if (!bytes || bytes % 4096 || bytes > extent.sectors * 512) return 16;
+    if (ioctl(gate, BROOK_IOCTL_BOOT_STICK_STORE_OPEN, &extent)) {
+        BrookBootStickStatus status; gate_status(&status);
+        char line[160];
+        snprintf(line, sizeof(line), "{\"state\":\"failed\",\"code\":23,\"gate_refusal\":%d,\"storage_modified\":false}\n",
+                 status.last_refusal);
+        (void)send_line(line);
+        return 23;
+    }
+    char line[256];
+    snprintf(line, sizeof(line), "{\"state\":\"open\",\"store\":\"%s\",\"first_lba\":%" PRIu64 ",\"sectors\":%" PRIu64 "}\n",
+             id, extent.first_lba, extent.sectors);
+    int result = send_line(line) ? 13 : 0;
+    uint8_t* chunk = result ? NULL : malloc(BROOK_STORE_WRITE_MAX);
+    if (!result && !chunk) result = 17;
+    uint64_t done = 0;
+    while (!result && done < bytes) {
+        const uint32_t n = bytes - done < BROOK_STORE_WRITE_MAX ? (uint32_t)(bytes - done) : BROOK_STORE_WRITE_MAX;
+        if (BridgeV3PosixRead(&transport, chunk, n, deadline)) { result = 18; break; }
+        BrookStoreWrite w = {done, (uint64_t)(uintptr_t)chunk, n, 0};
+        if (ioctl(gate, BROOK_IOCTL_BOOT_STICK_STORE_WRITE, &w)) { result = 24; break; }
+        done += n;
+    }
+    free(chunk);
+    BrookStoreHash h = {bytes, {0}};
+    if (!result && ioctl(gate, BROOK_IOCTL_BOOT_STICK_STORE_HASH, &h)) result = 25;
+    if (!result && memcmp(h.sha256, want, 32)) result = 26;
+    const int closed = ioctl(gate, BROOK_IOCTL_BOOT_STICK_STORE_CLOSE, 0);
+    if (!result && closed) result = 27;
+    if (result) {
+        snprintf(line, sizeof(line), "{\"state\":\"failed\",\"code\":%d,\"written\":%" PRIu64 ",\"slot_modified\":%s}\n",
+                 result, done, done ? "true" : "false");
+        (void)send_line(line);
+        return result;
+    }
+    snprintf(line, sizeof(line), "{\"state\":\"updated\",\"mode\":\"store\",\"store\":\"%s\",\"bytes\":%" PRIu64 ",\"verified\":true}\n",
+             id, bytes);
+    (void)send_line(line);
+    printf("HWRTXUP_STORE_WRITTEN store=%s first_lba=%" PRIu64 " sectors=%" PRIu64 " bytes=%" PRIu64 " verified=1\n",
+           id, extent.first_lba, extent.sectors, bytes);
+    return 0;
+}
+
 static int hex32(const char* p) {
     if (strlen(p) != 32) return 0;
     for (unsigned i = 0; i < 32; i++) if (!((p[i] >= '0' && p[i] <= '9') || (p[i] >= 'a' && p[i] <= 'f'))) return 0;
@@ -213,8 +285,9 @@ int main(int argc, char** argv) {
     if (argc == 2 && !strcmp(argv[1], "--status")) return status_main();
     if (geteuid() != 0) return 3;
     if (argc == 2 && !strcmp(argv[1], "--confirm")) return confirm_main();
-    if (argc != 3 || !hex32(argv[1]) || !hex32(argv[2])) {
-        fputs("usage: HWRTXUP.ELF --status | --confirm | BOOT_ID32 TRANSACTION_ID32\n", stderr);
+    const int store = argc == 4 && !strcmp(argv[3], "--store");
+    if ((argc != 3 && !store) || !hex32(argv[1]) || !hex32(argv[2])) {
+        fputs("usage: HWRTXUP.ELF --status | --confirm | BOOT_ID32 TRANSACTION_ID32 [--store]\n", stderr);
         return 2;
     }
     const int lock = open("/tmp/hardware-update.lock", O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
@@ -235,8 +308,8 @@ int main(int argc, char** argv) {
         fputs("HWRTXUP_AUTH_REFUSED version=3\n", stderr);
         result = 10; goto out;
     }
-    deadline = BridgeV3PosixDeadline(1800000); /* slow real-stick writes; host bounds its wait by size */
-    result = receive(argv[1], argv[2]);
+    deadline = BridgeV3PosixDeadline(store ? 3600000 : 1800000); /* host bounds its wait by size */
+    result = store ? receive_store(argv[1], argv[2]) : receive(argv[1], argv[2]);
     if (result && !replied) {
         char error[96];
         snprintf(error, sizeof(error), "{\"state\":\"failed\",\"code\":%d,\"storage_modified\":false}\n", result);

@@ -24,5 +24,13 @@ int main()
     assert(bad("guid=00112233445566778899aabbccddeeff bytes= sha256=" + std::string(64, '0')));
     assert(bad("guid=00112233445566778899aabbccddeeff bytes=1234567890123456 sha256=" + std::string(64, '0')));
     assert(bad("bytes=4096 guid=00112233445566778899aabbccddeeff sha256=" + std::string(64, '0')));
+    // Extent form (network-written slot).
+    const std::string ext = "lba=33554432 sectors=13187072 bytes=5678039040 sha256=" + std::string(64, 'a') + "\n";
+    assert(LiveStoreParse(ext.data(), ext.size(), r) && r.extent && r.firstLba == 33554432 &&
+           r.sectors == 13187072 && r.bytes == 5678039040ull && r.sha256[0] == 0xaa);
+    assert(bad("lba=1024 sectors=13187072 bytes=4096 sha256=" + std::string(64, 'a')));     // inside the GPT/p1 lead
+    assert(bad("lba=33554432 sectors=8 bytes=8192 sha256=" + std::string(64, 'a')));        // bytes beyond the extent
+    assert(bad("lba=33554432 sectors=0 bytes=4096 sha256=" + std::string(64, 'a')));
+    assert(bad("lba=33554432 bytes=4096 sha256=" + std::string(64, 'a')));                  // no sectors
     std::puts("live store record: PASS");
 }

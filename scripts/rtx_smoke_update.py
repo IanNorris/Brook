@@ -78,6 +78,17 @@ def sign(key, manifest):
     return key.sign(DOMAIN + manifest).signature
 
 
+STORE_DOMAIN = b'BROOK-RTX-STORE-MANIFEST-V1\0'
+
+
+def store_manifest(first_lba, sectors, size, digest_hex, store_id):
+    """BRKSTOR1 store-slot manifest (tools/hardware_rtx_update.c receive_store)."""
+    ident = store_id.encode()
+    if not 0 < len(ident) <= 48 or size % 4096 or size > sectors * 512 or first_lba < 2048:
+        raise ValueError('bad store manifest fields')
+    return b'BRKSTOR1' + struct.pack('<QQQ', first_lba, sectors, size) + bytes.fromhex(digest_hex) + ident.ljust(48, b'\0')
+
+
 def line(stream):
     raw = bytearray()
     while len(raw) < 1024:
@@ -214,6 +225,74 @@ class Run:
             time.sleep(1)
         raise TimeoutError('no new boot observed; inspect power request ' + power_id + ' (Ian: press reset; PREV/ boots)')
 
+    def store(self, session, store_dir, key_file, first_lba, sectors, upload_port):
+        """Write a store image into a slot over the network; the running store
+        and record stay untouched (a later signed set switches the record)."""
+        meta = json.loads((Path(store_dir) / 'store-manifest.json').read_text())
+        image = Path(store_dir) / 'profile/STORE.IMG'
+        size = image.stat().st_size
+        if meta.get('format') != 'brook-rtx-live-store/1' or size != meta['bytes']:
+            raise RuntimeError('store manifest does not match STORE.IMG')
+        store_id = 'store-' + meta['sha256'][:16]
+        binary = store_manifest(first_lba, sectors, size, meta['sha256'], store_id)
+        signature = signing_key(key_file).sign(STORE_DOMAIN + binary).signature
+        data = self.bridge.load_session(session)
+        if data.get('auth_mode') != 'v3':
+            raise RuntimeError('store updates require a v3 session')
+        from binary_bridge import receiver_key, binary_stream, finish_request, require_response_end
+        operator = receiver_key(data, None)
+        boot = data['guest_boot_id']
+        if self.output:
+            self.output.mkdir(parents=True, exist_ok=False, mode=0o700)
+        tx = uuid.uuid4().hex
+        record = f"lba={first_lba} sectors={sectors} bytes={size} sha256={meta['sha256']}\n"
+        self.save(state='prepared', mode='store', session=session, guest_boot_id=boot, transaction_id=tx,
+                  store=str(Path(store_dir).resolve()), bytes=size, sha256=meta['sha256'], first_lba=first_lba,
+                  sectors=sectors, record=record)
+        self.bridge.guest_run(session, tx, ['/boot/HWRTXUP.ELF', boot, tx, '--store'], cwd='/tmp', uid=0, wait_s=2)
+        end = time.monotonic() + 60
+        while 'HWUPDATE_LISTENING' not in self.bridge.job(session, tx, wait_s=2).get('stdout', {}).get('text', ''):
+            if time.monotonic() > end:
+                raise RuntimeError('receiver did not listen')
+            time.sleep(0.1)
+        replies = []
+        started = time.monotonic()
+        try:
+            with socket.create_connection((data['host'], upload_port), timeout=30) as connection:
+                connection.settimeout(300)
+                stream, _ = binary_stream(connection, operator, UPDATE, STICK, boot, tx)
+                stream.sendall(b'BRRTXST1' + boot.encode() + tx.encode())
+                replies.append(line(stream))
+                stream.sendall(binary + signature)
+                replies.append(line(stream))
+                self.save(replies=replies)
+                if replies[-1].get('state') != 'open':
+                    self.save(state='refused'); return self.receipt
+                sent = 0
+                with image.open('rb') as f:
+                    for chunk in iter(lambda: f.read(4 << 20), b''):
+                        stream.sendall(chunk); sent += len(chunk)
+                        if sent % (512 << 20) < len(chunk):
+                            self.save(sent=sent, send_seconds=round(time.monotonic() - started, 1))
+                finish_request(stream)
+                stream.settimeout(max(600, size // (5 << 20)))
+                replies.append(line(stream))
+                require_response_end(stream)
+        except (OSError, ConnectionError, ValueError, RuntimeError) as error:
+            self.save(upload_error=str(error))
+        self.save(replies=replies, seconds=round(time.monotonic() - started, 1))
+        job = self.bridge.job(session, tx, wait_s=5)
+        final = replies[-1] if replies else {}
+        ok = final.get('state') == 'updated' and final.get('verified') is True
+        out = None
+        if ok:
+            meta2 = dict(meta, record=record, slot={'first_lba': first_lba, 'sectors': sectors})
+            out = Path(self.output or store_dir) / 'store-manifest-slot.json'
+            out.write_text(json.dumps(meta2, indent=2) + '\n')
+        self.save(state='stored' if ok else 'needs_inspection', job_stdout=(job.get('stdout') or {}).get('text'),
+                  slot_manifest=str(out) if out else None)
+        return self.receipt
+
     def push(self, session, files, key_file, upload_port, restart, confirm, boot_timeout, tamper=None):
         blobs, manifest = load_set(files)
         payload_id = manifest['payload_id']
@@ -318,6 +397,11 @@ def main():
     s = sub.add_parser('signer-public'); s.add_argument('--key', type=Path, required=True)
     for name in ('status', 'confirm'):
         s = sub.add_parser(name); s.add_argument('--session', required=True)
+    s = sub.add_parser('store', help='write a live-store image into a store slot over the network')
+    s.add_argument('--session', required=True); s.add_argument('--store', type=Path, required=True)
+    s.add_argument('--key', type=Path, required=True); s.add_argument('--output', type=Path, required=True)
+    s.add_argument('--first-lba', type=int, required=True); s.add_argument('--sectors', type=int, required=True)
+    s.add_argument('--upload-port', type=int, default=1235)
     s = sub.add_parser('push')
     s.add_argument('--session', required=True); s.add_argument('--files', type=Path, required=True)
     s.add_argument('--key', type=Path, required=True); s.add_argument('--output', type=Path, required=True)
@@ -335,6 +419,10 @@ def main():
         print(json.dumps(run.status(a.session), indent=2)); return
     if a.command == 'confirm':
         code, text = run.confirm(a.session); print(text); sys.exit(code or 0)
+    if a.command == 'store':
+        receipt = run.store(a.session, a.store, a.key, a.first_lba, a.sectors, a.upload_port)
+        print(json.dumps({k: receipt.get(k) for k in ('state', 'seconds', 'replies', 'slot_manifest', 'upload_error')}, indent=2))
+        sys.exit(0 if receipt.get('state') == 'stored' else 1)
     if a.confirm and not a.restart:
         p.error('--confirm needs --restart (confirm a set only after it booted)')
     try:

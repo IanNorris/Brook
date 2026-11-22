@@ -5,6 +5,8 @@
 // grants is a USB write window over the one partition the firmware loaded
 // this boot from, and only between ARM(RW) and DISARM.
 #include "boot_stick.h"
+#include "live_store_record.h"
+#include "memory/virtual_memory.h"
 #include "boot_timing_runtime.h"
 #include "boot_protocol/boot_protocol.h"
 #include "device.h"
@@ -231,6 +233,126 @@ int ArmLocked(uint32_t mode)
     return 0;
 }
 
+// ---- Live-store slot writes -------------------------------------------------
+Device* g_storeDisk = nullptr;
+uint64_t g_storeFirst = 0, g_storeSectors = 0;
+uint8_t* g_storeBuffer = nullptr; // 4 MiB kernel bounce, allocated once
+
+struct Range { uint64_t first, sectors; };
+bool Overlaps(Range a, Range b) { return a.first < b.first + b.sectors && b.first < a.first + a.sectors; }
+
+// Partition ranges (LBA) of the disk holding the boot volume, by GPT entry.
+unsigned DiskPartitions(Device* disk, Range* out, uint8_t (*guids)[16], unsigned capacity)
+{
+    unsigned n = 0;
+    if (!disk || !disk->name) return 0;
+    for (unsigned part = 1; part <= 9 && n < capacity; ++part) {
+        char name[16]; unsigned k = 0;
+        for (const char* c = disk->name; *c && k < 12; ++c) name[k++] = *c;
+        name[k++] = 'p'; name[k++] = char('0' + part); name[k] = 0;
+        Device* dev = DeviceFind(name);
+        if (!dev || PartitionParentDevice(dev) != disk) continue;
+        uint32_t entry = 0; uint64_t first = 0, sectors = 0;
+        if (!PartitionGptIdentity(dev, guids[n], &entry, &first, &sectors)) continue;
+        out[n++] = {first, sectors};
+    }
+    return n;
+}
+
+// The extent the running /etc/live-store record names (none: {0,0}).
+Range RunningStore(Device* disk)
+{
+    Vnode* node = VfsOpen("/etc/live-store", VFS_O_STREAM);
+    if (!node) return {0, 0};
+    char text[200]{}; uint64_t offset = 0;
+    const int n = VfsRead(node, text, sizeof(text) - 1, &offset);
+    VfsClose(node);
+    LiveStoreRecord record{};
+    if (n <= 0 || !LiveStoreParse(text, uint32_t(n), record)) return {0, 0};
+    if (record.extent) return {record.firstLba, record.sectors};
+    Range ranges[9]; uint8_t guids[9][16];
+    const unsigned count = DiskPartitions(disk, ranges, guids, 9);
+    for (unsigned i = 0; i < count; ++i) if (BrookUpdateEqual(guids[i], record.guid, 16)) return ranges[i];
+    return {0, 0};
+}
+
+int StoreCloseLocked()
+{
+    if (!g_storeDisk) return 0;
+    int result = DeviceFlush(g_storeDisk) != 0 ? -5 : 0;
+    DeviceWriteWindow window{};
+    if (g_storeDisk->ops->ioctl(g_storeDisk, DEVICE_IOCTL_WRITE_WINDOW, &window) != 0) result = -5;
+    KPrintf("STICK: store slot LBA %lu+%lu closed (%s)\n", static_cast<unsigned long>(g_storeFirst),
+            static_cast<unsigned long>(g_storeSectors), result ? "with errors" : "clean");
+    g_storeDisk = nullptr; g_storeFirst = g_storeSectors = 0;
+    return result;
+}
+
+int StoreOpenLocked(const BrookStoreExtent& extent)
+{
+    if (g_storeDisk) return Refuse(BROOK_BOOT_STICK_REFUSED_BUSY, "store slot already open");
+    // Same identity and running-set proof as ARM (read-only), then release.
+    if (const int armed = ArmLocked(BROOK_BOOT_STICK_RO)) return armed;
+    Device* disk = PartitionParentDevice(g_partition);
+    const Range boot{g_stick.firstLba, g_stick.sectors};
+    DisarmLocked();
+    if (!disk || !disk->ops || !disk->ops->write || !disk->ops->ioctl)
+        return Refuse(BROOK_BOOT_STICK_REFUSED_NO_DEVICE, "boot disk not writable");
+    const uint64_t diskSectors = DeviceBlockCount(disk) * (DeviceBlockSize(disk) / 512);
+    const Range want{extent.first_lba, extent.sectors};
+    if (!want.sectors || want.first < 2048 || want.first > diskSectors || want.sectors > diskSectors - 34 - want.first)
+        return Refuse(BROOK_BOOT_STICK_REFUSED_EXTENT, "store slot outside the usable disk");
+    if (Overlaps(want, boot)) return Refuse(BROOK_BOOT_STICK_REFUSED_EXTENT, "store slot overlaps the boot volume");
+    const Range running = RunningStore(disk);
+    if (running.sectors && Overlaps(want, running))
+        return Refuse(BROOK_BOOT_STICK_REFUSED_EXTENT, "store slot overlaps the running store");
+    Range ranges[9]; uint8_t guids[9][16];
+    const unsigned count = DiskPartitions(disk, ranges, guids, 9);
+    for (unsigned i = 0; i < count; ++i) {
+        if (!Overlaps(want, ranges[i])) continue;
+        if (ranges[i].first == want.first && ranges[i].sectors == want.sectors) continue; // exactly a partition
+        return Refuse(BROOK_BOOT_STICK_REFUSED_EXTENT, "store slot straddles a partition");
+    }
+    if (!g_storeBuffer) {
+        auto base = VmmAllocPages(BROOK_STORE_WRITE_MAX / 4096, VMM_WRITABLE | VMM_NO_EXEC, MemTag::Device, KernelPid);
+        if (!base) return Refuse(BROOK_BOOT_STICK_REFUSED_MOUNT, "no store buffer");
+        g_storeBuffer = reinterpret_cast<uint8_t*>(base.raw());
+    }
+    DeviceWriteWindow window{want.first * 512, want.sectors * 512};
+    if (disk->ops->ioctl(disk, DEVICE_IOCTL_WRITE_WINDOW, &window) != 0)
+        return Refuse(BROOK_BOOT_STICK_REFUSED_MOUNT, "USB write window refused");
+    g_storeDisk = disk; g_storeFirst = want.first; g_storeSectors = want.sectors;
+    g_lastRefusal = 0;
+    KPrintf("STICK: store slot LBA %lu+%lu open on %s\n", static_cast<unsigned long>(want.first),
+            static_cast<unsigned long>(want.sectors), disk->name);
+    return 0;
+}
+
+int StoreWriteLocked(const BrookStoreWrite& w, bool (*copyIn)(void*, uint64_t, uint64_t))
+{
+    if (!g_storeDisk) return -9;
+    const uint64_t limit = g_storeSectors * 512;
+    if (!w.length || w.length > BROOK_STORE_WRITE_MAX || w.offset > limit || w.length > limit - w.offset) return -22;
+    if (!copyIn(g_storeBuffer, w.data, w.length)) return -14;
+    const int written = DeviceWrite(g_storeDisk, g_storeFirst * 512 + w.offset, g_storeBuffer, w.length);
+    return written == int(w.length) ? 0 : -5;
+}
+
+int StoreHashLocked(BrookStoreHash& h)
+{
+    if (!g_storeDisk) return -9;
+    if (!h.bytes || h.bytes > g_storeSectors * 512) return -22;
+    if (DeviceFlush(g_storeDisk) != 0) return -5;
+    BrookSha256 hash; BrookShaInit(&hash);
+    for (uint64_t at = 0; at < h.bytes; at += BROOK_STORE_WRITE_MAX) {
+        const uint64_t len = h.bytes - at < BROOK_STORE_WRITE_MAX ? h.bytes - at : BROOK_STORE_WRITE_MAX;
+        if (g_storeDisk->ops->read(g_storeDisk, g_storeFirst * 512 + at, g_storeBuffer, len) != int(len)) return -5;
+        BrookShaAdd(&hash, g_storeBuffer, static_cast<BrookUpdateSize>(len));
+    }
+    BrookShaFinish(&hash, h.sha256);
+    return 0;
+}
+
 const char* SetName(uint32_t set) { return set == BROOK_STICK_ROOT ? "root" : set == BROOK_STICK_PREV ? "PREV" : "legacy"; }
 const char* TrialName(uint32_t trial)
 {
@@ -277,7 +399,8 @@ void BootStickStatusLine()
             g_stickPresent && g_stick.volumeValid ? "remote" : "disabled", g_armed);
 }
 
-int BootStickIoctl(uint32_t cmd, uint64_t arg, bool (*copyOut)(uint64_t, const void*, uint64_t))
+int BootStickIoctl(uint32_t cmd, uint64_t arg, bool (*copyOut)(uint64_t, const void*, uint64_t),
+                   bool (*copyIn)(void*, uint64_t, uint64_t))
 {
     KMutexLock(&g_lock);
     int result = -25;
@@ -285,6 +408,18 @@ int BootStickIoctl(uint32_t cmd, uint64_t arg, bool (*copyOut)(uint64_t, const v
         result = (arg == BROOK_BOOT_STICK_RO || arg == BROOK_BOOT_STICK_RW) ? ArmLocked(uint32_t(arg)) : -22;
     } else if (cmd == BROOK_IOCTL_BOOT_STICK_DISARM) {
         result = DisarmLocked();
+    } else if (cmd == BROOK_IOCTL_BOOT_STICK_STORE_OPEN) {
+        BrookStoreExtent extent{};
+        result = !copyIn(&extent, arg, sizeof(extent)) ? -14 : StoreOpenLocked(extent);
+    } else if (cmd == BROOK_IOCTL_BOOT_STICK_STORE_WRITE) {
+        BrookStoreWrite w{};
+        result = !copyIn(&w, arg, sizeof(w)) ? -14 : StoreWriteLocked(w, copyIn);
+    } else if (cmd == BROOK_IOCTL_BOOT_STICK_STORE_HASH) {
+        BrookStoreHash h{};
+        if (!copyIn(&h, arg, sizeof(h))) result = -14;
+        else { result = StoreHashLocked(h); if (!result && !copyOut(arg, &h, sizeof(h))) result = -14; }
+    } else if (cmd == BROOK_IOCTL_BOOT_STICK_STORE_CLOSE) {
+        result = StoreCloseLocked();
     } else if (cmd == BROOK_IOCTL_BOOT_STICK_STATUS) {
         BrookBootStickStatus status{};
         status.version = 1; status.armed = g_armed; status.set = g_stick.set; status.trial = g_stick.trial;

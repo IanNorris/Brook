@@ -12,6 +12,21 @@
 enum { BROOK_IOCTL_BOOT_STICK_ARM = 0xb2f0, BROOK_IOCTL_BOOT_STICK_DISARM = 0xb2f1,
        BROOK_IOCTL_BOOT_STICK_STATUS = 0xb2f2 };
 enum { BROOK_BOOT_STICK_RO = 1, BROOK_BOOT_STICK_RW = 2 };
+/* Live-store slot writes (network store updates). STORE_OPEN validates the
+ * running set like ARM, then opens a USB write window over one raw extent of
+ * the boot stick's disk that is either exactly a GPT partition other than the
+ * boot volume, or entirely unpartitioned; never the GPT areas, never the boot
+ * volume and never the extent the running /etc/live-store record names.
+ * STORE_WRITE copies one chunk (<= 4 MiB) to an offset inside it, STORE_HASH
+ * re-reads its first N bytes from the device and returns their SHA-256,
+ * STORE_CLOSE flushes and closes the window. The running store and record are
+ * untouched: a signed set update switches /etc/live-store afterwards. */
+enum { BROOK_IOCTL_BOOT_STICK_STORE_OPEN = 0xb2f3, BROOK_IOCTL_BOOT_STICK_STORE_WRITE = 0xb2f4,
+       BROOK_IOCTL_BOOT_STICK_STORE_HASH = 0xb2f5, BROOK_IOCTL_BOOT_STICK_STORE_CLOSE = 0xb2f6 };
+typedef struct BrookStoreExtent { uint64_t first_lba, sectors; } BrookStoreExtent;
+typedef struct BrookStoreWrite { uint64_t offset, data; uint32_t length, reserved; } BrookStoreWrite;
+typedef struct BrookStoreHash { uint64_t bytes; uint8_t sha256[32]; } BrookStoreHash;
+#define BROOK_STORE_WRITE_MAX (4u << 20)
 #define BROOK_BOOT_STICK_MOUNT "/media/bootstick"
 typedef struct BrookBootStickStatus {
     uint32_t version;        /* 1 */
@@ -28,4 +43,4 @@ enum { BROOK_BOOT_STICK_REFUSED_DISABLED = 1, BROOK_BOOT_STICK_REFUSED_NO_LOADER
        BROOK_BOOT_STICK_REFUSED_NO_DEVICE = 3, BROOK_BOOT_STICK_REFUSED_AMBIGUOUS = 4,
        BROOK_BOOT_STICK_REFUSED_LABEL = 5, BROOK_BOOT_STICK_REFUSED_PAYLOAD = 6,
        BROOK_BOOT_STICK_REFUSED_BUSY = 7, BROOK_BOOT_STICK_REFUSED_MOUNT = 8,
-       BROOK_BOOT_STICK_REFUSED_LEGACY_SET = 9 };
+       BROOK_BOOT_STICK_REFUSED_LEGACY_SET = 9, BROOK_BOOT_STICK_REFUSED_EXTENT = 10 };

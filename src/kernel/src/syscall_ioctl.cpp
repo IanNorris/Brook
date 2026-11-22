@@ -189,10 +189,12 @@ int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
     if (!fde || fde->type==FdType::Path) return -EBADF;
 
     if (cmd == BROOK_IOCTL_BOOT_STICK_ARM || cmd == BROOK_IOCTL_BOOT_STICK_DISARM ||
-        cmd == BROOK_IOCTL_BOOT_STICK_STATUS) {
+        cmd == BROOK_IOCTL_BOOT_STICK_STATUS || (cmd >= BROOK_IOCTL_BOOT_STICK_STORE_OPEN &&
+        cmd <= BROOK_IOCTL_BOOT_STICK_STORE_CLOSE)) {
         if (!ProcessCapable(proc, nullptr, CapSysAdmin)) return -EPERM;
         return BootStickIoctl(static_cast<uint32_t>(cmd), arg,
-            [](uint64_t to, const void* from, uint64_t n) { return CopyToUser(to, from, n); });
+            [](uint64_t to, const void* from, uint64_t n) { return CopyToUser(to, from, n); },
+            [](void* to, uint64_t from, uint64_t n) { return CopyFromUser(to, from, n); });
     }
 
     if (cmd == BROOK_IOCTL_GET_SYSTEM_ESP_BOOT_SLOT) {
