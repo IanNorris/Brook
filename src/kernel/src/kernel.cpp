@@ -106,11 +106,13 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
 // Keep resolver reads, metadata and container binds on the same real initrd
 // file. The initrd seeds it so this only needs an existing-file write.
+static uint32_t g_resolverDns=0; // network-order DNS last written (0: fallback)
 static void ConfigureResolverFile()
 {
     char text[128];unsigned length=0;
     auto append=[&](const char* value){while(*value)text[length++]=*value++;};
     const auto* network=brook::NetGetIf();
+    g_resolverDns=network?network->dns:0;
     const uint32_t address=network && network->dns?brook::ntohl(network->dns):0x0a000203u;
     append("nameserver ");
     for(int shift=24;shift>=0;shift-=8) {
@@ -128,6 +130,18 @@ static void ConfigureResolverFile()
     if(written!=static_cast<int>(length))
         brook::SerialPrintf("net: resolver file update failed (%d); rebuild initrd if missing\n",written);
     else brook::SerialPrintf("net: retained resolver configuration ready (%u bytes)\n",length);
+}
+
+// DHCP may bind after the boot-time write (background DHCP on hardware):
+// rewrite the resolver whenever the primary interface's DNS appears/changes.
+static void ResolverRefreshWorker(void*)
+{
+    for(;;) {
+        const auto* network=brook::NetGetIf();
+        const uint32_t dns=network?network->dns:0;
+        if(dns && dns!=g_resolverDns)ConfigureResolverFile();
+        brook::SchedulerSleepMs(1000);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1140,6 +1154,8 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     brook::KLog("BOOT stage: network configuration complete");
     brook::HwInventoryAnnounce();
     ConfigureResolverFile();
+    if(!KernelWorkerStart("resolver",ResolverRefreshWorker,nullptr))
+        brook::SerialPuts("net: resolver refresh worker unavailable\n");
 
     // ---- Syscall table ----
     brook::BootLogoProgress(80, "Syscalls");

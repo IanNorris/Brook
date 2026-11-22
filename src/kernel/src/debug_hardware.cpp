@@ -1093,7 +1093,9 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         call("audio usb override ",command+sizeof(mixerTonePrefix)-1);
         bool overrideOn=false;for(uint32_t i=0;text[i];++i)if(!strncmp(text+i,"override on",11)){overrideOn=true;break;}
         if(!overrideOn){Reply r;r.text("{\"audio_api\":1,\"text\":");r.quoted(text);r.text("}\n");r.send();return true;}
-        const uint32_t previous=AudioOutputControlSnapshot()&~AudioUserUnmuteBit;
+        const uint32_t snapshot=AudioOutputControlSnapshot();
+        const uint32_t previous=snapshot&~AudioUserUnmuteBit;
+        const bool userUnmuted=(snapshot&AudioUserUnmuteBit)!=0;
         (void)AudioSetOutputControl(BROOK_AUDIO_DEFAULT);
         const uint64_t start=ApicTickCount();
         const AudioStreamId stream=AudioMixerOpen();
@@ -1113,7 +1115,9 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         SchedulerSleepMs(60); // last mixer batch reaches the sink
         call("audio usb drain","");
         if(stream)(void)AudioMixerClose(stream);
-        (void)AudioSetOutputControl(previous);
+        // Restore exactly, including the user's explicit unmute authorization.
+        if(userUnmuted)(void)AudioSetUserOutputControl(previous,true);
+        else (void)AudioSetOutputControl(previous);
         KPrintf("audio: mixer-tone %u frames submitted ticks %u..%u, control restored %x\n",submitted,
                 unsigned(start),unsigned(submittedTick),previous);
         call("audio usb override off","");
