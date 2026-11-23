@@ -36,8 +36,8 @@ struct RunState{
     bool paused=false;
     bool hooked=false;        // quiesce hook registered
     bool firstFlipOk=false;
-    uint32_t cursor=0,stopAt=~0u,failAt=~0u,runs=0,aborts=0;
-    uint32_t nflips=0,holdMs=0;Stage stage=Stage::A;bool observer=false;
+    uint32_t cursor=0,stopAt=~0u,failAt=~0u,runs=0,aborts=0,done=0; // done: runs that reached teardown's end
+    uint32_t nflips=0,holdMs=0;Stage stage=Stage::A;bool observer=false,dump=false;
 };
 
 // Backend: uint32_t rd(uint32_t); void wr(uint32_t,uint32_t); uint32_t vrd(uint64_t);
@@ -57,7 +57,7 @@ template<typename B> struct Runner{
     };
     static const char* OpName(Op o){
         static const char* n[]={"WR","MASK","EXPECT","POLL","POLLSOFT","ACK","VCOPY","VWR","VEXPECT","VPOLL","VPOLLANY","ACKEXC",
-            "PRAMIN","FENCE","KICK","EXPNOT","LOG","COPY","ASSYARM","PAUSE","DELAY","ANDNIF","COPYMASK","CALL","FILL"};
+            "PRAMIN","FENCE","KICK","EXPNOT","LOG","COPY","ASSYARM","PAUSE","DELAY","ANDNIF","COPYMASK","CALL","FILL","PRAMINR","DUMP"};
         return uint32_t(o)<sizeof(n)/sizeof(n[0])?n[uint32_t(o)]:"?";
     }
     Phase PhaseOf(uint32_t i)const{Phase ph=Phase::Preflight;
@@ -91,6 +91,10 @@ template<typename B> struct Runner{
             Line l;l.raw("{\"nv_disp_diff\":\"");l.hex(m);l.raw("\",\"assy\":\"");l.hex(a);l.raw("\",\"arm\":\"");l.hex(c);
             l.raw("\",\"rewritten\":");l.dec(r.plan.Rewritten(m)?1:0);l.raw("}\n");r.b->emit(l.t);}
         void pause(const char*){}
+        void dump(uint32_t addr,const uint32_t* w,uint32_t n){
+            Line l;l.raw("{\"nv_disp_dump\":\"");l.hex(addr);l.raw("\",\"w\":[");
+            for(uint32_t i=0;i<n;++i){if(i)l.raw(",");l.raw("\"");l.hex(w[i]);l.raw("\"");}
+            l.raw("]}\n");r.b->emit(l.t);}
         bool call(uint32_t){return false;} // no dynamic steps in step 3
         void log(uint32_t i,const Step& s,uint32_t got,bool ok){
             Line l;l.raw("{\"nv_disp_step\":");l.dec(i);l.raw(",\"list\":\"");l.s(tag);l.raw("\",\"op\":\"");l.s(OpName(s.op));
@@ -101,7 +105,8 @@ template<typename B> struct Runner{
 
     // ---- building
     bool Build(Stage stage,uint32_t nflips,uint32_t holdMs,bool observer){
-        cfg=base;cfg.coreChannel=stage==Stage::B;cfg.feEnable=stage==Stage::A2;cfg.capsCopy=false;cfg.pauseForObserver=observer;
+        cfg=base;cfg.dumpAfterConnect=st.dump;cfg.coreChannel=stage==Stage::B;cfg.feEnable=stage==Stage::A2;cfg.capsCopy=false;cfg.pauseForObserver=observer;
+        if(b)ReadReplay(cfg,[&](uint32_t r){return b->rd(r);}); // GOP window state from ARM
         pushes=Pushes{};plan=Plan{};
         const Err e=BuildPlan(cfg,img,pushes,plan,nflips,holdMs);
         if(e!=Err::Ok){Msg("error","plan build failed (layout/bounds)");return false;}
@@ -137,6 +142,8 @@ template<typename B> struct Runner{
     void Start(Stage stage,uint32_t nflips,uint32_t holdMs,bool observer,uint32_t stopAt){
         if(!st.preflightOk){Msg("refused","run preflight first (this boot)");return;}
         if(st.live||st.paused){Msg("refused","a run is live; continue or abort it");return;}
+        if(stage==Stage::B)Msg("WARNING","STAGE B: the core channel ends ALLOCATE-only (0x01, not the GOP's 0x21) until reboot; "
+            "nv-disp head1 (step 4) will refuse until then. Prefer stage a / a2.");
         if(!Build(stage,nflips,holdMs,observer))return;
         st.stage=stage;st.nflips=nflips;st.holdMs=holdMs;st.observer=observer;st.stopAt=stopAt;
         st.cursor=0;st.failAt=~0u;st.firstFlipOk=false;st.preflightOk=false;++st.runs;
@@ -162,7 +169,7 @@ template<typename B> struct Runner{
             if(brook::nvdisp::Run(plan,i,i+1,io)!=i+1){st.failAt=i;Fail(i);return;}
             if(i+1==plan.phaseBegin[uint32_t(Phase::Flip)])st.firstFlipOk=true;
         }
-        st.live=false;Msg("done","teardown complete; run preflight again before the next run");Status();
+        st.live=false;++st.done;Msg("done","teardown complete; run preflight again before the next run");Status();
     }
     // On failure: when a flip had already worked, try the restore submission
     // first (so the GOP surface is on screen), then the abort list.
@@ -207,17 +214,18 @@ template<typename B> struct Runner{
         bool isPlan=false,isNoop=false,isFlip=false;
         if(Word(p,"plan"))isPlan=true;else if(Word(p,"noop"))isNoop=true;else if(Word(p,"flip"))isFlip=true;
         else{Msg("usage","nv-disp plan|preflight|noop|flip <n> <ms>|continue|abort [force]|status");return;}
-        uint32_t n=0,ms=0,stop=~0u;Stage stage=Stage::A;bool observer=false;
+        uint32_t n=0,ms=0,stop=~0u;Stage stage=Stage::A;bool observer=false;st.dump=false;
         if(isFlip&&(!Num(p,n)||!Num(p,ms)||!n||n>kMaxFlips||ms>5000)){Msg("usage","flip <1..16> <0..5000 ms>");return;}
         for(;;){
             while(*p==' ')++p;if(!*p)break;
             if(Word(p,"a"))stage=Stage::A;else if(Word(p,"a2"))stage=Stage::A2;else if(Word(p,"b"))stage=Stage::B;
             else if(Word(p,"pause"))observer=true;
+            else if(Word(p,"dump-after-connect"))st.dump=true;
             else if(isPlan&&Word(p,"flips")){if(!Num(p,n)||n>kMaxFlips){Msg("usage","flips 0..16");return;}}
             else if(Word(p,"stop")){if(!Num(p,stop)){Msg("usage","stop <step>");return;}}
             else{Msg("usage","unknown argument");return;}
         }
-        if(isPlan){PrintPlan(stage,n);return;}
+        if(isPlan){if(stage==Stage::B)Msg("WARNING","stage B blocks nv-disp head1 until reboot");PrintPlan(stage,n);return;}
         Start(stage,isNoop?0:n,ms,observer,stop);
     }
 };

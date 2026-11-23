@@ -30,7 +30,7 @@ struct Fake{
     std::set<uint32_t> written;std::vector<std::string> trace;
     uint32_t wndwCur=0;          // HW fetch pointer, bytes
     bool idleOnConnect=true,breakRamht=false;
-    uint32_t exceptions=0,flips=0;int failUpdateAt=-1;
+    uint32_t exceptions=0,flips=0;int failUpdateAt=-1;bool resetOnConnect=true;
     uint32_t& R(uint32_t a){return reg[a];}
     uint8_t* V(uint64_t a){auto& p=pages[a&~0xfffull];if(p.empty())p.assign(4096,0);return p.data()+(a&0xfff);}
     uint32_t vrd(uint64_t a){uint32_t v;memcpy(&v,V(a),4);return v;}
@@ -48,7 +48,7 @@ struct Fake{
         // Non-default GOP window state the survey saw (0x690000+), mirrored in ARM.
         for(uint32_t base:{RegAssy(ch,0),RegArm(ch,0)}){
             R(base+0x2a8)=0x11;R(base+0x2ec)=0x10000;R(base+0x2f4)=1;R(base+0x360)=1;R(base+0x364)=0x1300;
-            R(base+0x368)=2;R(base+0x370)=1;R(base+0x374)=1;}
+            R(base+0x368)=2;R(base+0x370)=1;R(base+0x374)=1;R(base+0x460)=0x10000;R(base+0x4c0)=0x460d0;}
         for(uint32_t c2:{0u,ch}){R(RegPbLo(c2))=g.pbLo;R(RegPbHi(c2))=g.pbHi;R(RegPbValid(c2))=g.pbValid;R(RegPbClient(c2))=g.pbClient;}
         R(RegArm(ch,c57e::UPDATE))=0xacf3fbfb;R(RegAssy(ch,0x208))=0x554; // live 058a8cd8: UPDATE slot, GET_LINE
         R(kRegFeEnable)=g.feEnable;
@@ -123,6 +123,8 @@ struct Fake{
                     assert((R(kRegInstTarget)&8)&&R(kRegInstAddr));     // instmem before connect
                     assert(R(RegPbLo(ch))>1);                            // our pushbuffer, not the GOP's
                     if(idleOnConnect)R(RegChnStatus(ch))=ch==0?0x000b0000:0x04040100;
+                    if(ch&&resetOnConnect){ // live 23 Nov: connect re-initialises ASSY (0x22c -> 0xe9)
+                        R(RegAssy(ch,0x22c))=0xe9;R(RegAssy(ch,0x2ec))=0;R(RegAssy(ch,0x460))=0;R(RegAssy(ch,0x360))=0;}
                     R(RegGet(ch))=0;wndwCur=0;}
                 if(!(v&kCtlConnect)&&(old&kCtlConnect))R(RegChnStatus(ch))=ch==0?0x00080000:0x01010100;
                 return;}
@@ -150,6 +152,7 @@ struct Fake{
     bool verbose=false;uint32_t diffs=0,pauses=0;
     void diff(uint32_t m,uint32_t a,uint32_t b){++diffs;if(verbose)printf("  diff %03x assy %08x arm %08x\n",m,a,b);}
     void pause(const char*){++pauses;}
+    uint32_t dumped=0;void dump(uint32_t,const uint32_t*,uint32_t n){dumped+=n;}
     void udelay(uint32_t){}
     bool call(uint32_t){return true;}
     void log(uint32_t i,const Step& s,uint32_t got,bool ok){

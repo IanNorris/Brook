@@ -122,10 +122,13 @@ static void FixPramin(Plan& p,const InstImage& img){
 static void TestPlanRun(bool core,bool a2=false){
     Config c=DellConfig();c.coreChannel=core;c.feEnable=a2;c.capsCopy=a2;c.pauseForObserver=true;
     static InstImage img;static Pushes pushes;static Plan plan;pushes=Pushes{};plan=Plan{};
-    assert(BuildPlan(c,img,pushes,plan)==Err::Ok);FixPramin(plan,img);
     Fake f;f.img=&img;f.push=&pushes;f.Gop(c);
+    ReadReplay(c,[&](uint32_t r){return f.rd(r);});                     // GOP window state from ARM
+    assert(BuildPlan(c,img,pushes,plan)==Err::Ok);FixPramin(plan,img);
     assert(Run(plan,0,plan.count,f)==plan.count);
-    assert(f.flips==3&&f.exceptions==0&&f.pauses==1&&f.diffs==0);
+    // Connect reset 0x22c/0x2ec/0x460 (logged as diffs, all rewritten); 0x360 is skipped.
+    assert(f.flips==3&&f.exceptions==0&&f.pauses==1&&f.diffs==3);
+    assert(f.R(RegArm(1,0x22c))==0xcf&&f.R(RegArm(1,0x2ec))==0x10000&&f.R(RegArm(1,0x460))==0x10000&&f.R(RegArm(1,0x4c0))==0x460d0);
     const uint32_t ch=ChidWndw(0);
     // Final state == the GOP state the survey recorded (except core CHNCTL in stage B).
     assert(f.R(kRegInstTarget)==1&&f.R(kRegInstAddr)==0&&f.R(kRegPraminBase)==0x1fff0);
@@ -145,10 +148,19 @@ static void TestPlanRun(bool core,bool a2=false){
     // Phase markers are monotonic and cover the list.
     for(uint32_t i=0;i<uint32_t(Phase::Count);++i)assert(plan.phaseBegin[i]<=plan.phaseBegin[i+1]);
     // Every pushbuffer word and instmem object is read back through PRAMIN before instmem goes live.
-    uint32_t pr=0;for(uint32_t i=0;i<plan.count;++i)if(plan.steps[i].op==Op::PraminExpect){++pr;
+    uint32_t pr=0;for(uint32_t i=0;i<plan.count;++i)if(plan.steps[i].op==Op::PraminRange){pr+=plan.steps[i].value;
         assert(i<plan.phaseBegin[uint32_t(Phase::Instmem)]);}
-    assert(pr==3*2+3*6+pushes.wndw.count+(core?2:0));
-    assert(pushes.end[0]==25*4&&pushes.end[1]==pushes.end[0]+19*4&&pushes.end[2]==pushes.end[1]+19*4);
+    assert(pr==3*2+3*kCtxDmaBytes/4+pushes.wndw.count+(core?2:0));
+    // A corrupted VRAM word is caught by the range check before instmem goes live.
+    {Fake g;g.img=&img;g.push=&pushes;g.Gop(c);
+     static Plan q;q=plan;
+     for(uint32_t i=0;i<q.count;++i)if(q.steps[i].op==Op::VramCopy&&q.steps[i].reg==uint32_t(Blob::WndwPush)){
+        q.steps[i].mask=8;break;}                               // copy only 2 words of the pushbuffer
+     const uint32_t at=Run(q,0,q.count,g);
+     assert(q.steps[at].op==Op::PraminRange&&g.written.count(kRegInstTarget)==0);}
+    uint32_t runs=1;for(uint32_t i=1;i<kReplayCount;++i)if(kReplayMthds[i]!=kReplayMthds[i-1]+4)++runs;
+    assert(runs==20);
+    assert(pushes.end[0]==(25+kReplayCount+runs)*4&&pushes.end[1]==pushes.end[0]+19*4&&pushes.end[2]==pushes.end[1]+19*4);
 }
 static void TestPreflightRefuses(){
     Config c=DellConfig();static InstImage img;static Pushes pushes;static Plan plan;pushes=Pushes{};plan=Plan{};
@@ -158,19 +170,31 @@ static void TestPreflightRefuses(){
     assert(at<plan.phaseBegin[uint32_t(Phase::Vram)]&&f.written.empty()); // nothing written
 }
 // The UPDATE promotes the whole ASSY block: a differing word that submission 1
-// does not rewrite (composition 0x2ec) refuses; one it rewrites (0x308) passes.
+// does not rewrite (the data port 0x2ac) refuses; one it rewrites (0x308) passes.
 static void TestAssyArmDiff(){
     for(int rewritten=0;rewritten<2;++rewritten){
         Config c=DellConfig();static InstImage img;static Pushes pushes;static Plan plan;pushes=Pushes{};plan=Plan{};
         assert(BuildPlan(c,img,pushes,plan)==Err::Ok);
         Fake f;f.img=&img;f.push=&pushes;f.Gop(c);
-        f.R(RegAssy(1,rewritten?0x308:0x2ec))=0x5;
+        f.R(RegAssy(1,rewritten?0x308:0x2ac))=0x5;   // 0x2ac: data port, never pushed
         const uint32_t end=plan.phaseBegin[uint32_t(Phase::Vram)];
         const uint32_t at=Run(plan,0,end,f);
         assert(f.diffs==1&&f.written.empty());
         assert(rewritten?at==end:at<end);
-        assert(plan.Rewritten(0x308)&&plan.Rewritten(0x224)&&!plan.Rewritten(0x2ec)&&!plan.Rewritten(0x2a8));
+        assert(plan.Rewritten(0x308)&&plan.Rewritten(0x224)&&plan.Rewritten(0x2ec)&&plan.Rewritten(0x460)&&!plan.Rewritten(0x2ac)&&!plan.Rewritten(0x360));
     }
+}
+// Without the replay, a connect-reset method the first submission does not set
+// (composition 0x2ec) fails the post-connect diff and aborts before any UPDATE.
+static void TestConnectResetWithoutReplay(){
+    Config c=DellConfig();c.replay=false;
+    static InstImage img;static Pushes pushes;static Plan plan,abort;pushes=Pushes{};plan=Plan{};abort=Plan{};
+    assert(BuildPlan(c,img,pushes,plan)==Err::Ok);
+    Fake f;f.img=&img;f.push=&pushes;f.Gop(c);
+    const uint32_t at=Run(plan,0,plan.count,f);
+    assert(at>=plan.phaseBegin[uint32_t(Phase::Window)]&&at<plan.phaseBegin[uint32_t(Phase::FirstFlip)]&&f.flips==0);
+    BuildAbort(c,Phase::Window,abort);(void)Run(abort,0,abort.count,f,true);
+    assert(f.R(RegArm(1,c57e::SET_CONTEXT_DMA_ISO0))==kHandleGop&&f.R(kRegInstTarget)==1);
 }
 static void TestAbortWindowNeverIdle(){
     Config c=DellConfig();static InstImage img;static Pushes pushes;static Plan plan,abort;pushes=Pushes{};plan=Plan{};abort=Plan{};
@@ -228,7 +252,7 @@ static void Dump(bool core){
     Config c=DellConfig();c.coreChannel=core;c.pauseForObserver=true;
     static InstImage img;static Pushes pushes;static Plan plan;pushes=Pushes{};plan=Plan{};
     assert(BuildPlan(c,img,pushes,plan)==Err::Ok);FixPramin(plan,img);
-    static const char* op[]={"WR","MASK","EXPECT","POLL","POLLSOFT","ACK","VCOPY","VWR","VEXPECT","VPOLL","VPOLLANY","ACKEXC","PRAMIN","FENCE","KICK","EXPNOT","LOG","COPY","ASSYARM","PAUSE","DELAY","ANDNIF","COPYMASK","CALL","FILL"};
+    static const char* op[]={"WR","MASK","EXPECT","POLL","POLLSOFT","ACK","VCOPY","VWR","VEXPECT","VPOLL","VPOLLANY","ACKEXC","PRAMIN","FENCE","KICK","EXPNOT","LOG","COPY","ASSYARM","PAUSE","DELAY","ANDNIF","COPYMASK","CALL","FILL","PRAMINR","DUMP"};
     uint32_t ph=0;
     for(uint32_t i=0;i<plan.count;++i){
         while(ph<uint32_t(Phase::Count)&&plan.phaseBegin[ph]<=i&&(ph+1>=uint32_t(Phase::Count)||plan.phaseBegin[ph+1]<=i))++ph;
@@ -256,7 +280,7 @@ int main(int argc,char** argv){
     TestHashFix();
     TestPush();TestInst();
     TestPlanRun(false);TestPlanRun(true);TestPlanRun(false,true);TestAssyArmDiff();
-    TestPreflightRefuses();TestAbortWindowNeverIdle();TestAbortUnresolvableHandle();
+    TestPreflightRefuses();TestConnectResetWithoutReplay();TestAbortWindowNeverIdle();TestAbortUnresolvableHandle();
     TestValidate();TestRingWrap();
     TestHash();
     puts("test_nv_disp_plan: ok");return 0;

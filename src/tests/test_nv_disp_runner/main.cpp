@@ -84,8 +84,9 @@ static void TestObserverPauseAndContinue(){
 }
 static void TestStopThenQuiesce(){
     Rig g;g.r->Command("preflight");
-    const uint32_t stop=140; // inside the first flip
-    g.r->Command("noop stop 140");
+    g.r->Build(Stage::A,0,0,false);
+    const uint32_t stop=g.r->plan.phaseBegin[uint32_t(Phase::FirstFlip)]+3; // inside the first flip
+    g.r->Command(("noop stop "+std::to_string(stop)).c_str());
     assert(g.r->st.paused&&g.r->st.cursor==stop&&g.r->st.live);
     g.r->Quiesce();                                        // pre-reset hook path
     assert(!g.r->st.live&&!g.r->st.paused&&g.r->st.aborts==1);
@@ -120,8 +121,17 @@ static void TestRestoreAttemptOnFlipFailure(){
 }
 static void TestStageB(){
     Rig g;g.r->Command("preflight");g.r->Command("noop b");
+    assert(g.b.Count("\"nv_disp\":\"WARNING\"")==1&&g.b.Count("head1 (step 4) will refuse")==1);
     assert(g.b.Count("\"nv_disp\":\"done\"")==1&&g.f.flips==2);
     assert((g.f.R(RegChnCtl(0))&0x6013)==0x01);            // stage B leaves the core ALLOCATE only
+}
+static void TestDumpAndBigFlip(){
+    Rig g;g.r->Command("preflight");g.r->Command("noop dump-after-connect");
+    assert(g.b.Count("\"nv_disp\":\"done\"")==1&&g.b.Count("nv_disp_dump")==2*0x180/8);
+    assert(g.b.Count("nv_disp_diff")==3);                  // connect reset 0x22c/0x2ec/0x460, all rewritten
+    Rig h;h.r->Command("preflight");h.r->Command("flip 16 0");
+    assert(h.b.Count("\"nv_disp\":\"done\"")==1&&h.f.flips==18&&h.b.Count("nv_disp_dump")==0);
+    h.GopState();
 }
 static void TestAbortVerb(){
     Rig g;g.r->Command("abort");assert(g.b.Count("nothing live")==1&&g.f.written.empty());
@@ -132,6 +142,6 @@ static void TestAbortVerb(){
 }
 int main(){
     TestLayout();TestGate();TestNoop();TestObserverPauseAndContinue();TestStopThenQuiesce();
-    TestFlip();TestAutoAbortAtConnect();TestRestoreAttemptOnFlipFailure();TestStageB();TestAbortVerb();
+    TestFlip();TestAutoAbortAtConnect();TestRestoreAttemptOnFlipFailure();TestStageB();TestDumpAndBigFlip();TestAbortVerb();
     puts("test_nv_disp_runner: ok");return 0;
 }
