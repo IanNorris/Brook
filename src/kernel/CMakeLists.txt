@@ -791,6 +791,15 @@ target_link_options(kernel PRIVATE
     -static
     -z max-page-size=0x1000
 )
+# Section garbage collection: drops functions and data nothing references.
+# linker.ld KEEPs the sections reached only through start/stop symbols
+# (.ksymtab: module imports; .syscall_table). Modules resolve kernel symbols
+# only through .ksymtab. Add --print-gc-sections to list what is dropped.
+option(BROOK_KERNEL_GC_SECTIONS "Link the kernel with -ffunction-sections -fdata-sections --gc-sections" ON)
+if(BROOK_KERNEL_GC_SECTIONS)
+    target_compile_options(kernel PRIVATE -ffunction-sections -fdata-sections)
+    target_link_options(kernel PRIVATE --gc-sections)
+endif()
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL "" FORCE)
 
