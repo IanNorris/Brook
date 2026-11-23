@@ -617,7 +617,7 @@ inline Err BuildHeadPlan(HeadConfig c,InstImage& img,HeadPushes& pushes,Plan& p)
     AddChannelInit(p,kChidCore,c.base.corePushVram);
     B(HPhase::CoreCheck);
     p.Add(Op::Expect,RegArm(kChidCore,c57d::HeadRasterSize(0)),~0u,g.headRaster,0,"head 0 ARM survived connect");
-    AddCoreDiff(p,"after core connect (logged; reset methods are replayed next)");
+    AddCoreDiff(p,"after core connect (log only; reset methods are replayed next)",2);
     p.Add(Op::Kick,RegPut(kChidCore),~0u,pushes.replayEnd,0,"core PUT: replay ARM state (methods only, no UPDATE)");
     p.Add(Op::PollOr,RegGet(kChidCore),~0xfffff003u|0xffc,pushes.replayEnd,kTimeoutMs,"core GET == PUT (replay fetched)",0,RegGet(kChidCore),kRegExcOther,1);
     AddCoreDiff(p,"after replay: ASSY == ARM (strict)",1);

@@ -305,7 +305,7 @@ struct Core{
         return DpTrain(io,l,tr);
     }
     bool verbose=false;
-    void log(uint32_t i,const Step& s,uint32_t got,bool ok){if(verbose||!ok)printf("  %3u %-5s %s got %08x\n",i,ok?"ok":"FAIL",s.what,got);}
+    void log(uint32_t i,const Step& s,uint32_t got,bool ok){if(verbose||!ok)fprintf(stderr,"  %3u %-5s %s got %08x\n",i,ok?"ok":"FAIL",s.what,got);}
 };
 
 static Rom g_rom;
@@ -349,6 +349,9 @@ static void TestHeadPlan(){
         assert(!(a>=0x616540&&a<0x616570));                           // head-0 SF block
     }
 }
+
+// Head 0 dirtied after the last strict diff: every stage still finishes with the
+// head-1 work (sticky flag, never an abort), VPLL1 is programmed, then disable.
 static uint32_t KickIndex(const Plan& p,uint32_t put){
     for(uint32_t i=0;i<p.count;++i)if(p.steps[i].op==Op::Kick&&p.steps[i].value==put)return i;
     assert(false);return 0;}
@@ -363,8 +366,20 @@ static void TestRefusesWhenHead0Pending(){
     Setup(d,i2,h2,p2,v2);d.R(0x680000+0x2068)=0x0004001e;
     assert(Run(p2,0,p2.count,d)==p2.count&&d.flags==0&&d.R(0x68a068)==d.R(0x682068));
 }
-// Head 0 dirtied after the last strict diff: every stage still finishes with the
-// head-1 work (sticky flag, never an abort), VPLL1 is programmed, then disable.
+// An undocumented method the core connect resets cannot be replayed: the diffs log it
+// without failing, and if it matters the rung UPDATE raises a supervisor, so the run
+// stops there, before any head-1 state, and the abort flushes the stages cleanly.
+static void TestUndocumentedResetLogged(){
+    Core c;static InstImage img;static HeadPushes hp;static Plan p,ab;Vbios v;img=InstImage{};hp=HeadPushes{};p=Plan{};ab=Plan{};
+    Setup(c,img,hp,p,v);
+    const uint32_t k=p.phaseBegin[uint32_t(HPhase::CoreCheck)];
+    assert(Run(p,0,k,c)==k);c.R(0x680000+0x2038)=9;                   // as if the connect reset it
+    const uint32_t at=Run(p,k,p.count,c);
+    assert(at==KickIndex(p,hp.rungEnd)+1&&c.diffs>=2&&c.stage==1);     // logged twice, then stuck at the rung
+    BuildHeadAbort(c.cfg,HPhase::CoreCheck,hp,ab,100,Kicked::Rung);
+    (void)Run(ab,0,ab.count,c,true);
+    assert(c.stage==0&&c.supers==3&&(c.R(RegChnCtl(0))&0x13)==0x01&&c.R(kRegInstTarget)==1&&(c.R(0x688340)&0xff)==0);
+}
 static void TestHead0FlagFinishesStages(){
     Core c;static InstImage img;static HeadPushes hp;static Plan p;Vbios v;img=InstImage{};hp=HeadPushes{};p=Plan{};
     Setup(c,img,hp,p,v);
@@ -547,7 +562,7 @@ int main(int argc,char** argv){
     if(argc>1&&!strcmp(argv[1],"--dump")){Dump();return 0;}
     TestAux();TestHeadRunner();
     TestVbios();TestRealVbios();TestPllAndSf();TestCoreWords();
-    TestHeadPlan();TestRefusesWhenHead0Pending();TestHead0FlagFinishesStages();TestAbortUnkicked();
+    TestHeadPlan();TestRefusesWhenHead0Pending();TestUndocumentedResetLogged();TestHead0FlagFinishesStages();TestAbortUnkicked();
     TestStagesFromEventStatus();TestCoreExceptionAtModeset();TestVpll0Gate();TestTrainingFailure();
     puts("test_nv_disp_head: ok");return 0;
 }

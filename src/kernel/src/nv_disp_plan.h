@@ -736,7 +736,8 @@ template<typename Io> uint32_t Run(const Plan& p,uint32_t begin,uint32_t end,Io&
                 if(s.reg==kChidCore&&m>=0x220&&m<0x240)continue;          // core GET_RG_SCAN_LINE (live)
                 const uint32_t a=io.rd(RegAssy(s.reg,m)),b=io.rd(RegArm(s.reg,m));
                 if(a!=b){io.diff(m,a,b);
-                    const bool bad=s.x?(Plan::Has(p.known,m)&&!Plan::Has(p.ours,m)):!p.Rewritten(m);
+                    // x: 0 = fail unless rewritten, 1 = strict (known and not ours), 2 = log only
+                    const bool bad=s.x==2?false:s.x?(Plan::Has(p.known,m)&&!Plan::Has(p.ours,m)):!p.Rewritten(m);
                     if(bad){ok=false;if(!got)got=m;}}
             }
             break;
