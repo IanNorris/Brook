@@ -1185,7 +1185,14 @@ static int PowerRows(ChromeDisplayList& dl, const ChromeStyle& s, int x, int y, 
         }
         y = PanelRowFit(dl, s, x, y, w, "Power limit", t, 3);
     }
-    if (p.mode == M::Unavailable) return y;
+    if (p.mode == M::Unavailable) {
+        // No balance controller (e.g. a desktop): the CPU's own limit only.
+        if (!p.cpuMaxMhz) return y;
+        FlyoutText cpu[2];
+        cpu[0].Add("Turbo " BROOK_CHROME_DOT " base ").Ghz(p.cpuMaxMhz / 100);
+        cpu[1].Add("Base ").Ghz(p.cpuMaxMhz / 100);
+        return PanelRowFit(dl, s, x, y, w, "CPU limit", cpu, 2);
+    }
     const bool capping = p.mode == M::Light || p.mode == M::Heavy || p.mode == M::Idle;
     // Longest first; the first that leaves room after the key is drawn.
     // With the max non-turbo clock first, then with "(balance)" alone, then bare.

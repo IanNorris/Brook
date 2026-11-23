@@ -39,6 +39,9 @@
 #include "tsc_clock.h"
 #include "kprintf.h"
 #include "spinlock.h"
+#include "platform_power.h"
+extern "C" void NvDisplayMarkWritten(); // debug_hardware.cpp: pre-reset GPU reset trigger
+#include "nv_disp_live.h"
 #include "nv_aux_reply.h"
 #include "input.h"
 #include "process.h"
@@ -490,6 +493,7 @@ bool NvAuxHandleLocked(const char* command){
                     auto pattern=[&](uint32_t pat){static const uint32_t d[]={0x10101010,0x01010101,0x02020202,0x03030303};
                         sr[patReg/4]=(sr[patReg/4]&~0x1f1f1f1fu)|d[pat];};
                     const uint32_t lanes=__builtin_popcount((dpctrl>>16)&0xf);
+                    NvDisplayMarkWritten();
                     KPrintf("nv-aux: retrain start SOR%u link %u dpctrl %08x pat %08x\n",sor,link,dpctrl,patOrig);
                     uint8_t caps[16]{};uint32_t n=16;rc=xfer(0x9,0x000,caps,n);
                     uint8_t conf[4]{};n=4;if(!rc)rc=xfer(0x9,0x103,conf,n);
@@ -549,7 +553,7 @@ struct DpIdleState{
     // Link watch (part of the wake path): after a hot-plug edge or on input,
     // retrain the GOP's link if the head is active but the link is down
     // (KVM switch-back, monitor replug). Rate-limited, capped retries.
-    bool watch=false,sinkPresent=false,linkCheckPending=false,linkCheckLog=false;
+    bool watch=false,sinkPresent=false,linkCheckPending=false,linkCheckLog=false,linkCheckForce=false;
     uint64_t lastLinkCheckMs=0,edgeMs=0;
     uint8_t recheckStage=3; // after a hotplug edge: re-checks at +1 s, +3 s, +10 s
     uint32_t linkRetrains=0,linkFails=0,hotplugs=0;
@@ -655,15 +659,17 @@ void DpIdleWorker(void*){
             static const uint32_t recheck[3]={1000,3000,10000};
             if(sink&&!g_dpIdle.blanked){
                 if(g_dpIdle.recheckStage<3&&now-g_dpIdle.edgeMs>=recheck[g_dpIdle.recheckStage]){
-                    ++g_dpIdle.recheckStage;g_dpIdle.linkCheckPending=true;g_dpIdle.linkCheckLog=true;}
+                    ++g_dpIdle.recheckStage;g_dpIdle.linkCheckPending=true;g_dpIdle.linkCheckLog=true;
+                    g_dpIdle.linkCheckForce=true;} // post-edge re-checks skip the 2 s rate limit
                 else if(now-g_dpIdle.lastLinkCheckMs>=5000)g_dpIdle.linkCheckPending=true;
             }}
         int action=0;
         // Link watch: at most every 2 s; after 5 failed retrains in a row, every 30 s.
         const uint64_t linkGap=g_dpIdle.linkFails>=5?30000:2000;
         if(g_dpIdle.handTest){}
-        else if(!g_dpIdle.blanked&&g_dpIdle.linkCheckPending&&g_dpIdle.sinkPresent&&now-g_dpIdle.lastLinkCheckMs>=linkGap){
-            action=3;g_dpIdle.linkCheckPending=false;g_dpIdle.lastLinkCheckMs=now;}
+        else if(!g_dpIdle.blanked&&g_dpIdle.linkCheckPending&&g_dpIdle.sinkPresent&&
+                ((g_dpIdle.linkCheckForce&&g_dpIdle.linkFails<5)||now-g_dpIdle.lastLinkCheckMs>=linkGap)){
+            action=3;g_dpIdle.linkCheckPending=false;g_dpIdle.linkCheckForce=false;g_dpIdle.lastLinkCheckMs=now;}
         const bool logCheck=action==3&&g_dpIdle.linkCheckLog;if(action==3)g_dpIdle.linkCheckLog=false;
         else if(g_dpIdle.blanked&&(g_dpIdle.wakeRequested||!g_dpIdle.seconds)){
             if(!g_dpIdle.wakeFails||now-g_dpIdle.lastWakeTryMs>=1000){action=2;g_dpIdle.lastWakeTryMs=now;}}
@@ -743,12 +749,63 @@ void DpIdleCommand(const char* p){
     r.send();
 }
 }
+SpinLock* NvAuxSharedLock(){return &g_nvAuxLock;}
+// nv-disp head1 sessions suspend dp-idle (idle-off and link watch) and restore it.
+// Plain atomic stores, no g_dpIdleLock: the caller already holds the nv-aux lock.
+void DpIdleSuspendForDisplay(bool suspend){
+    static uint32_t savedSecs=0;static bool savedWatch=false;
+    if(suspend){savedSecs=__atomic_load_n(&g_dpIdle.seconds,__ATOMIC_RELAXED);savedWatch=__atomic_load_n(&g_dpIdle.watch,__ATOMIC_RELAXED);
+        __atomic_store_n(&g_dpIdle.seconds,0u,__ATOMIC_RELEASE);__atomic_store_n(&g_dpIdle.watch,false,__ATOMIC_RELEASE);}
+    else{__atomic_store_n(&g_dpIdle.lastActivityMs,ApicTickCount(),__ATOMIC_RELEASE);
+        __atomic_store_n(&g_dpIdle.watch,savedWatch,__ATOMIC_RELEASE);__atomic_store_n(&g_dpIdle.seconds,savedSecs,__ATOMIC_RELEASE);}
+}
+// Pre-reset GPU reset. A warm reset does not reset the display engine, and
+// after nv-disp / nv-aux display writes the next POST hung with no video.
+// If such a write happened this boot, the last quiesce step resets the GPU:
+// FLR on fn0 when DevCap advertises it, else a Secondary Bus Reset on the
+// upstream port. Registered at boot so it runs after nv-disp's own abort.
+static volatile bool g_nvDisplayWritten=false;
+extern "C" void NvDisplayMarkWritten(){__atomic_store_n(&g_nvDisplayWritten,true,__ATOMIC_RELEASE);}
+static void NvDelayUs(uint32_t us){
+    if(TscClockAvailable()){const uint64_t end=TscClockReadNs()+uint64_t(us)*1000;while(TscClockReadNs()<end)__asm__ volatile("pause");}
+    else{const uint64_t end=ApicTickCount()+us/1000+1;while(ApicTickCount()<end)__asm__ volatile("pause");}
+}
+static void NvGpuResetQuiesce(){
+    if(!__atomic_load_n(&g_nvDisplayWritten,__ATOMIC_ACQUIRE))return;
+    PciDevice gpu{};bool found=false;
+    for(uint32_t i=0;i<PciBootInventoryCount()&&!found;++i){PciBootEntry e{};
+        if(PciBootInventoryRead(i,&e)&&e.device.vendorId==0x10de&&e.device.classCode==0x03&&e.device.fn==0){gpu=e.device;found=true;}}
+    if(!found)return;
+    // PCIe capability (id 0x10) on fn0.
+    uint8_t cap=uint8_t(PciConfigRead32(gpu.bus,gpu.dev,0,0x34)&0xfc);
+    for(int n=0;cap&&n<48;++n){const uint32_t h=PciConfigRead32(gpu.bus,gpu.dev,0,cap);if((h&0xff)==0x10)break;cap=uint8_t((h>>8)&0xfc);}
+    if(cap&&(PciConfigRead32(gpu.bus,gpu.dev,0,uint8_t(cap+4))&(1u<<28))){
+        KPrintf("power: GPU %02x:%02x.0 display was written this boot; FLR before reset\n",gpu.bus,gpu.dev);
+        PciConfigWrite16(gpu.bus,gpu.dev,0,uint8_t(cap+8),uint16_t(PciConfigRead16(gpu.bus,gpu.dev,0,uint8_t(cap+8))|0x8000));
+        NvDelayUs(100000);
+        KPrintf("power: GPU FLR done\n");return;
+    }
+    for(uint32_t i=0;i<PciBootInventoryCount();++i){PciBootEntry e{};
+        if(!PciBootInventoryRead(i,&e)||(e.headerType&0x7f)!=1)continue;
+        const auto& b=e.device;
+        if(((PciConfigRead32(b.bus,b.dev,b.fn,0x18)>>8)&0xff)!=gpu.bus)continue;
+        KPrintf("power: GPU %02x:%02x.0 display was written this boot; SBR on %02x:%02x.%u before reset\n",
+                gpu.bus,gpu.dev,b.bus,b.dev,b.fn);
+        const uint16_t bc=PciConfigRead16(b.bus,b.dev,b.fn,0x3e);
+        PciConfigWrite16(b.bus,b.dev,b.fn,0x3e,uint16_t(bc|0x40));
+        NvDelayUs(2000); // hold the reset >= 1 ms
+        PciConfigWrite16(b.bus,b.dev,b.fn,0x3e,uint16_t(bc&~0x40));
+        KPrintf("power: GPU SBR done\n");return;
+    }
+    KPrintf("power: GPU reset skipped (no FLR, no upstream bridge found)\n");
+}
 void DpIdleStart(){
     if(g_dpIdle.threadStarted)return;
     bool nvidia=false;
     for(uint32_t i=0;i<PciBootInventoryCount()&&!nvidia;++i){PciBootEntry e{};
         if(PciBootInventoryRead(i,&e)&&e.device.vendorId==0x10de&&e.device.classCode==0x03)nvidia=true;}
     if(!nvidia)return;
+    (void)PlatformPowerAddQuiesce(NvGpuResetQuiesce);
     Process* t=KernelThreadCreate("dp_idle",DpIdleWorker,nullptr,3);
     if(!t){KPrintf("dp-idle: thread start failed\n");return;}
     g_dpIdle.threadStarted=true;SchedulerAddProcess(t);
@@ -1475,6 +1532,7 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
     //   nv-aux edid <ch> <block>                   128-byte EDID block via I2C-over-AUX (0x50)
     //   nv-aux power <ch> d0|d3                     DPCD 0x600 write (sink power state)
     if(NvAuxHandle(command,nullptr,0))return true;
+    if(NvDispHandle(command))return true;          // RTX step 3 flips (nv_disp_live.cpp), gated
     constexpr char dpIdlePrefix[]="bridge hardware dp-idle ";
     if(Prefix(command,dpIdlePrefix)){DpIdleCommand(command+sizeof(dpIdlePrefix)-1);return true;}
     // GPU link ASPM L1 (runtime, volatile; a reset restores firmware state):
@@ -1562,7 +1620,8 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
             {0x022500,0x022600},{0x00d000,0x00e000},{0x088000,0x088100},{0x08a100,0x08a200},{0x300000,0x400000},{0x610000,0x700000},
             // rtx-disp probes: VRAM size, BAR1/BAR2 block, PRAMIN window contents (reads only;
             // the 0x1700 window base is never written here).
-            {0x100c00,0x100d00},{0xb80f00,0xb81000},{0x700000,0x800000}};
+            {0x100c00,0x100d00},{0xb80f00,0xb81000},{0x700000,0x800000},
+            {0x00ea00,0x00f000}}; // VPLL (0xef00-0xef5c, 0xea80)
         const uint32_t end=offset+count*4;bool ok=false;
         for(const auto& a:allowed)if(offset>=a.begin && end<=a.end)ok=true;
         if(!ok){DebugChannelSend("{\"nv_error\":\"Range not in the read-only allow-list\"}\n");return true;}

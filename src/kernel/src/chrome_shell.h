@@ -106,7 +106,10 @@ struct ChromePowerModel {
 // Rows the flyout adds for `power`; fixed for a boot, so the height is stable.
 inline unsigned ChromePowerRows(const ChromePowerModel& p)
 {
-    return (p.pl1Mw ? 1u : 0u) + (p.mode != ChromeBalanceMode::Unavailable ? 3u : 0u);
+    // Without a balance controller (desktop), only a CPU limit row with the
+    // max non-turbo clock follows the RAPL limits.
+    return (p.pl1Mw ? 1u : 0u) +
+           (p.mode != ChromeBalanceMode::Unavailable ? 3u : (p.cpuMaxMhz ? 1u : 0u));
 }
 
 struct ChromeTelemetryModel {

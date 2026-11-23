@@ -1,4 +1,5 @@
 #include "platform_power.h"
+#include "apic.h"
 #if !defined(BROOK_HOST_TEST)
 #include "intel_bdw_scanout_target.h"
 #endif
@@ -104,11 +105,33 @@ void PlatformPowerConfigure() {
 }
 const PlatformPowerPlan& PlatformPowerGetPlan(){return plan;}
 bool PlatformPowerAddQuiesce(PowerQuiesceFn fn){return quiesce.Add(fn);}
-unsigned PlatformPowerRunQuiesce(){return quiesce.Run();}
+// Each hook is logged with its address and duration, so a reset that never
+// lands shows (on serial / the bridge log) which device quiesce stopped in.
+unsigned PlatformPowerRunQuiesce(){
+    const unsigned n=__atomic_load_n(&quiesce.count,__ATOMIC_ACQUIRE);
+    for(unsigned i=n;i-->0;){
+        const uint64_t start=ApicTickCount();
+        SerialPrintf("power: quiesce %u/%u at %p\n",n-i,n,reinterpret_cast<void*>(quiesce.hooks[i]));
+        quiesce.hooks[i]();
+        SerialPrintf("power: quiesce %u/%u done in %lu ms\n",n-i,n,static_cast<unsigned long>(ApicTickCount()-start));
+    }
+    return n;
+}
+// Reset watchdog: armed before the quiesce hooks run; if the reset has not
+// been issued by the deadline (a hook hung), the timer tick forces it.
+static volatile uint64_t resetDeadline=0;
+extern "C" void PlatformPowerResetWatchdogTick(uint64_t now){
+    const uint64_t deadline=__atomic_load_n(&resetDeadline,__ATOMIC_ACQUIRE);
+    if(!deadline || now<deadline)return;
+    if(!__atomic_compare_exchange_n(&resetDeadline,const_cast<uint64_t*>(&deadline),0,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))return;
+    SerialPuts("power: quiesce watchdog expired; forcing reset\n");
+    (void)plan.Issue(true,{nullptr,Write8,Write16,nullptr,Read16});
+}
 bool PlatformPowerIssue(bool restart){
     // Stop device DMA first: a reset that lands while xHCI/NIC bus masters
     // are running has been seen to hang the desktop firmware in POST.
     if(restart?plan.CanReset():plan.CanPowerOff()){
+        if(restart && plan.CanReset())__atomic_store_n(&resetDeadline,ApicTickCount()+5000,__ATOMIC_RELEASE);
         const unsigned hooks=PlatformPowerRunQuiesce();
         SerialPrintf("power: %u quiesce hook%s ran before %s\n",hooks,hooks==1?"":"s",restart?"reset":"power-off");
     }

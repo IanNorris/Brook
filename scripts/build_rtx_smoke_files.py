@@ -174,6 +174,13 @@ def fat_write(image, path, data):
         raise SystemExit('FAT readback mismatch for ' + path)
 
 
+def gc_root(path, root):
+    """Register an indirect GC root so the host's periodic nix-gc cannot
+    delete store paths this set (or its live store) depends on."""
+    root.parent.mkdir(parents=True, exist_ok=True)
+    run(['nix-store', '--add-root', str(root), '--indirect', '--realise', str(path)], stdout=subprocess.DEVNULL)
+
+
 def desktop_payload(args, initrd):
     """Desktop session additions (as make_vmware_image.make_initrds), the
     /etc/live-store record, and the EVO4 mixer autostart marker."""
@@ -187,12 +194,17 @@ def desktop_payload(args, initrd):
             r'(guid=[0-9a-f]{32}|lba=\d+ sectors=\d+) bytes=\d+ sha256=[0-9a-f]{64}\n', store['record']):
         raise SystemExit('unexpected live store manifest')
     profile = Path(store['profile'])
+    if not (profile / 'bin/bash').exists():
+        raise SystemExit(f'live-store profile {profile} is missing from the host store (garbage-collected?); '
+                         'realise it again (scripts/image_profile.py) before building')
+    roots = args.build_root / 'gcroots'
+    gc_root(profile, roots / 'live-store-profile')
     for directory in ('::/BOOT/BIN', '::/DATA', '::/NIX'):
         if subprocess.run(['mdir', '-i', str(initrd), directory], capture_output=True).returncode:
             run(['mmd', '-i', initrd, directory])
-    supervisor = Path(subprocess.check_output(['nix-build', '--no-out-link',
+    supervisor = Path(subprocess.check_output(['nix-build', '-o', str(roots / 'clearwater-supervisor'),
         str(ROOT / 'tools/vulkan-compositor-pkg/clearwater-supervisor.nix')], text=True).strip())
-    shell = Path(subprocess.check_output(['nix-build', '--no-out-link',
+    shell = Path(subprocess.check_output(['nix-build', '-o', str(roots / 'clearwater-shell'),
         str(ROOT / 'tools/clearwater-shell-pkg/default.nix')], text=True).strip())
     embed_clearwater_executables(initrd, supervisor / 'bin/CWSUP.ELF', shell / 'bin/CWSHELL.ELF')
     embed_terminal_shortcut(initrd)

@@ -1,5 +1,6 @@
 #include "ioapic_route_policy.h"
 #include "apic.h"
+extern "C" void PlatformPowerResetWatchdogTick(uint64_t now);
 #include "boot_timing.h"
 #include "idt.h"
 #include "gs_paranoid.h"
@@ -502,6 +503,9 @@ extern "C" void LapicTimerHandlerInner(uint64_t interruptedRip, uint64_t interru
             if (now >= tapDeadline) MouseTouchpadTapPoll(now);
         }
     }
+
+    // A restart whose device quiesce hung is forced after a bounded wait.
+    PlatformPowerResetWatchdogTick(ApicTickCount());
 
     // Record a profiler sample (fast no-op when profiling is disabled).
     ProfilerSample(interruptedRip, interruptedCs, interruptedRbp);

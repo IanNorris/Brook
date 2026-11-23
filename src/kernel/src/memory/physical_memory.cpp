@@ -53,7 +53,17 @@ static uint64_t g_bitmap[BITMAP_WORDS]; // in BSS, starts zeroed
 static uint64_t g_totalPages = 0;       // highest tracked page index
 static uint64_t g_freePages  = 0;
 static uint64_t g_ramPages = 0;
-static uint64_t g_nextHint   = 0;       // search hint for fast sequential alloc
+static uint64_t g_nextHint   = 0;       // search hint for fast sequential alloc (above 4 GiB)
+static uint64_t g_lowHint    = 0;       // search hint for DMA-class owners (below 4 GiB)
+static constexpr uint64_t Dma32Pages = (4ULL << 30) / 4096;
+static bool DmaClassOwner(PmmOwner owner)
+{
+    switch (owner) {
+    case PmmOwner::XhciDma: case PmmOwner::AhciDma: case PmmOwner::HdaDma: case PmmOwner::NetworkDma:
+    case PmmOwner::DriverDma: case PmmOwner::Scanout: case PmmOwner::GpuBuffer: return true;
+    default: return false;
+    }
+}
 
 
 // SMP lock protecting the bitmap, free count, and page descriptors.
@@ -448,7 +458,8 @@ static inline void ReleaseFrameLocked(uint32_t idx)
 {
     SetFree(idx);
     g_freePages++;
-    if (idx < g_nextHint) g_nextHint = idx;
+    if (idx < Dma32Pages) { if (idx < g_lowHint) g_lowHint = idx; }
+    else if (idx < g_nextHint) g_nextHint = idx;
 }
 
 // Caller MUST hold g_pmmLock. Retire a frame that reached refcount 0 (descriptor
@@ -712,6 +723,7 @@ void PmmInit(const BootProtocol* proto)
     g_totalPages = 0;
     g_ramPages = 0;
     g_nextHint   = 0;
+    g_lowHint    = 0;
 
     // Step 2: Determine total tracked page count from the HIGHEST conventional
     // memory address. Skip MMIO entries — they live at high physical addresses
@@ -800,32 +812,46 @@ PhysicalAddress PmmAllocPageAccounted(MemTag tag, uint16_t pid, PmmOwner owner)
         const auto free=g_freePages;IrqSpinLockRelease(&g_pmmLock,pmmFlags);
         ReportAllocationFailure(1,free,false);return PhysicalAddress{};
     }
-    // Search from hint forward, then wrap around once.
-    uint64_t startWord = g_nextHint / 64;
-    uint64_t endWord   = (g_totalPages + 63) / 64;
-
-    for (int pass = 0; pass < 2; pass++)
+    // ZONE_DMA32-like placement: device/DMA owners search below 4 GiB first,
+    // everything else (heap, caches, user, the live-store image) searches
+    // above 4 GiB first. Low memory then stays available for 32-bit DMA
+    // engines (xHCI behind ASMedia, rings allocated after boot).
+    const uint64_t endWord = (g_totalPages + 63) / 64;
+    const uint64_t splitWord = (g_totalPages > Dma32Pages) ? Dma32Pages / 64 : endWord;
+    // Without memory above 4 GiB, everything uses the single next-fit hint.
+    const bool lowFirst = DmaClassOwner(owner) || splitWord == endWord;
+    uint64_t& hint = lowFirst ? g_lowHint : g_nextHint;
+    // Scan [w0, w1) words; returns a page index or ~0.
+    auto scan = [&](uint64_t w0, uint64_t w1) -> uint64_t {
+        for (uint64_t w = w0; w < w1; w++) {
+            if (g_bitmap[w] == ~0ULL) continue;
+            const uint64_t idx = w * 64 + static_cast<uint64_t>(__builtin_ctzll(~g_bitmap[w]));
+            if (idx >= g_totalPages) return ~0ULL;
+            return idx;
+        }
+        return ~0ULL;
+    };
+    uint64_t idx = ~0ULL;
+    if (lowFirst) {
+        uint64_t h = hint / 64; if (h >= splitWord) h = 0;
+        idx = scan(h, splitWord);
+        if (idx == ~0ULL) idx = scan(0, h);
+        if (idx == ~0ULL) idx = scan(splitWord, endWord);
+    } else {
+        uint64_t h = hint / 64; if (h < splitWord || h >= endWord) h = splitWord;
+        idx = scan(h, endWord);
+        if (idx == ~0ULL) idx = scan(splitWord, h);
+        if (idx == ~0ULL) idx = scan(0, splitWord);
+    }
+    if (idx != ~0ULL)
     {
-        uint64_t wStart = (pass == 0) ? startWord : 0;
-        uint64_t wEnd   = (pass == 0) ? endWord   : startWord;
-
-        for (uint64_t w = wStart; w < wEnd; w++)
-        {
-            if (g_bitmap[w] == ~0ULL) continue; // all used
-
-            // Find first free bit in this word.
-            int bit = __builtin_ctzll(~g_bitmap[w]);
-            uint64_t idx = w * 64 + static_cast<uint64_t>(bit);
-            if (idx >= g_totalPages) { IrqSpinLockRelease(&g_pmmLock, pmmFlags); return PhysicalAddress{}; }
-
             SetUsed(idx);
             g_freePages--;
-            g_nextHint = idx + 1;
+            hint = idx + 1;
             TrackAlloc(static_cast<uint32_t>(idx), tag, pid, owner);
             IrqSpinLockRelease(&g_pmmLock, pmmFlags);
 
             return PhysicalAddress(idx * PAGE_SIZE);
-        }
     }
     const uint64_t freeAtFailure = g_freePages;
     const uint64_t totalAtFailure = g_totalPages;

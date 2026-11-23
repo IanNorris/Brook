@@ -32,6 +32,11 @@ def main():
     out.mkdir(parents=True, exist_ok=False, mode=0o700)
     selection = evaluate(config)
     profile = realize(config, selection)
+    # GC root beside the store image: the host's periodic nix-gc must not
+    # delete the profile a live stick (and every set built for it) needs.
+    (out / 'gcroots').mkdir(exist_ok=True)
+    subprocess.run(['nix-store', '--add-root', str(out / 'gcroots/profile'), '--indirect', '--realise', str(profile)],
+                   check=True, cwd=ROOT, stdout=subprocess.DEVNULL)
     closure = closure_receipt(profile)
     mib = data_size_mib(closure['nar_bytes'], None, 1024, 32768, a.free_mib)
     selection_path = out / 'profile-selection.json'
