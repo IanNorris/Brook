@@ -456,6 +456,9 @@ void WmLauncherScroll(int delta120, uint32_t, uint32_t)
     if (!g_launcherOpen || !delta120 || g_launcherModel.EditorOpen()) return;
     int32_t mx, my;
     MouseGetPosition(&mx, &my);
+    // The launcher is laid out on the shell output.
+    OutputRect shellOutput{};
+    if (CompositorGetOutputRect(WmShellOutput(), &shellOutput)) { mx -= shellOutput.x; my -= shellOutput.y; }
     if (g_launcherFrame.rail.contains(mx, my)) {
         static int railRemainder = 0;
         const int total = delta120 + railRemainder;

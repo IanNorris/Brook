@@ -48,19 +48,27 @@ static uint32_t DockDesktopHeight(const DesktopMetrics& m, uint32_t screenH)
     return screenH > static_cast<uint32_t>(m.taskbar()) ? screenH - m.taskbar() : 0;
 }
 
-static WmRect WorkAreaFor(const DesktopMetrics& m, uint32_t screenW, uint32_t screenH)
+// An output's work area: the output minus its own taskbar, and on the
+// primary output minus a pinned dock.
+static WmRect WorkAreaForOutput(const DesktopMetrics& m, const OutputRect& out, bool primary)
 {
-    const uint32_t desktopH = DockDesktopHeight(m, screenH);
-    WmRect area{0, 0, static_cast<int>(screenW), static_cast<int>(desktopH)};
-    if (DockReserves()) {
-        const DesktopRect side = ChromeDockSidebar(m, screenW, desktopH, DockPlacement());
+    const uint32_t desktopH = DockDesktopHeight(m, out.h);
+    WmRect area{out.x, out.y, static_cast<int>(out.w), static_cast<int>(desktopH)};
+    if (primary && DockReserves()) {
+        const DesktopRect side = ChromeDockSidebar(m, out.w, desktopH, DockPlacement());
         if (g_dock.right) area.w = side.x;
         else {
-            area.x = side.x + side.w;
-            area.w = static_cast<int>(screenW) - area.x;
+            area.x = out.x + side.x + side.w;
+            area.w = static_cast<int>(out.w) - (side.x + side.w);
         }
     }
     return area;
+}
+
+// The primary output's work area, with the primary at 0,0.
+static WmRect WorkAreaFor(const DesktopMetrics& m, uint32_t screenW, uint32_t screenH)
+{
+    return WorkAreaForOutput(m, {0, 0, screenW, screenH}, true);
 }
 
 WmRect WmWorkArea(uint32_t screenW, uint32_t screenH) { return WorkAreaFor(WmDesktopMetrics(), screenW, screenH); }
@@ -98,8 +106,14 @@ static bool DockDropZoneLocked(const DesktopMetrics& m, int32_t mx, int32_t my, 
 static bool DockKeepOutLocked(Window& w)
 {
     if (!DockReserves() || w.docked || !w.focusable || w.fullscreen || w.state != WindowState::Normal) return false;
+    {
+        // The dock is on the primary output; windows elsewhere are not under it.
+        OutputLayout layout;
+        CompositorGetOutputs(layout);
+        if (layout.count > 1 && WindowOutputIndex(layout, w) != 0) return false;
+    }
     uint32_t sw = 0, sh = 0;
-    CompositorGetPhysDims(&sw, &sh);
+    DockOutputDims(&sw, &sh);
     const WmRect area = WorkAreaFor(w.desktopMetrics(), sw, sh);
     if (g_dock.right) {
         const int right = area.x + area.w, outer = static_cast<int>(w.outerWidth());
@@ -142,12 +156,12 @@ static bool DockPlaceLocked(int idx, const DesktopMetrics& m, uint32_t screenW, 
 static void DockReflowLocked()
 {
     uint32_t sw = 0, sh = 0;
-    CompositorGetPhysDims(&sw, &sh);
+    DockOutputDims(&sw, &sh);
     if (!sw || !sh) return;
     for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i) {
         Window& w = g_windows[i];
         if (!w.proc || w.docked) continue;
-        const WmRect area = WorkAreaFor(w.desktopMetrics(), sw, sh);
+        const WmRect area = WorkAreaForWindow(w);
         if (w.fullscreen) {
             // Leaving fullscreen restores a maximised window at the new area.
             if (w.fsState == WindowState::Maximized) {
@@ -251,7 +265,7 @@ static bool DockWindowLocked(int idx)
     Window& w = g_windows[idx];
     if (!w.proc || !w.visible || !w.focusable || w.docked || g_dock.count >= ChromeDockEntryLimit) return false;
     uint32_t sw = 0, sh = 0;
-    CompositorGetPhysDims(&sw, &sh);
+    DockOutputDims(&sw, &sh);
     if (!sw || !sh) return false;
     if (w.fullscreen && !SetFullscreenLocked(idx, false)) return false;
     if (w.minimized) { w.minimized = false; }
@@ -299,7 +313,7 @@ static bool DockReturnLocked(int idx, bool focus)
     // The work area without this entry (it may have been the last one).
     DockSyncWorkAreaLocked();
     uint32_t sw = 0, sh = 0;
-    CompositorGetPhysDims(&sw, &sh);
+    DockOutputDims(&sw, &sh);
     uint16_t width = w.dkW, height = w.dkH;
     if (w.dkState == WindowState::Maximized) {
         // Maximised again at today's work area; savedX..H still hold the
@@ -347,7 +361,7 @@ static void DockQueueSave() { ++g_dockSaveEpoch; }
 static void DockRelayoutLocked()
 {
     uint32_t sw = 0, sh = 0;
-    CompositorGetPhysDims(&sw, &sh);
+    DockOutputDims(&sw, &sh);
     if (!sw || !sh) return;
     for (uint32_t i = 0; i < g_dock.count; ++i) {
         const int idx = g_dock.entries[i];
@@ -389,7 +403,7 @@ static void DockDragLocked(int32_t mx, bool down)
 {
     if (!g_dock.resizing) return;
     uint32_t sw = 0, sh = 0;
-    CompositorGetPhysDims(&sw, &sh);
+    DockOutputDims(&sw, &sh);
     const DesktopMetrics m = WmDesktopMetrics();
     const int px = g_dock.dragWidth + (g_dock.right ? g_dock.dragX - mx : mx - g_dock.dragX);
     const int width = ChromeDockWidthFor(m, sw, px);
@@ -448,7 +462,7 @@ void WmDockWindowDrag(int idx, int32_t mx, int32_t my)
 {
     VfbGuard guard;
     uint32_t sw = 0, sh = 0;
-    CompositorGetPhysDims(&sw, &sh);
+    DockOutputDims(&sw, &sh);
     const bool drop = g_wmActive && !WmTaskbarHidden() && DockDropEligible(idx) &&
                       DockDropZoneLocked(WmDesktopMetrics(), mx, my, sw, sh);
     if (drop == g_dock.drop) return;
@@ -469,7 +483,7 @@ bool WmDockWindowDrop(int idx, int32_t mx, int32_t my, int16_t startX, int16_t s
 {
     VfbGuard guard;
     uint32_t sw = 0, sh = 0;
-    CompositorGetPhysDims(&sw, &sh);
+    DockOutputDims(&sw, &sh);
     const bool drop = g_dock.drop && DockDropEligible(idx) && DockDropZoneLocked(WmDesktopMetrics(), mx, my, sw, sh);
     g_dock.drop = false;
     CompositorMarkDirty();

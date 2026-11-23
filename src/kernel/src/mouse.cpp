@@ -126,9 +126,10 @@ static volatile int32_t  g_mouseY   = 0;
 static volatile uint32_t g_maxX     = 1920;
 static volatile uint32_t g_maxY     = 1080;
 // The pointer stays on an output: g_maxX/g_maxY bound the desktop union and
-// the rectangles below hold its outputs. Guarded by g_pointerPositionLock.
-static brook::OutputRect g_pointerOutputs[brook::OutputMax] = {{0, 0, 1920, 1080}};
-static uint32_t g_pointerOutputCount = 1;
+// the rectangles below hold its outputs (none: the union is the one rect).
+// Zero-initialised (.bss). Guarded by g_pointerPositionLock.
+static brook::OutputRect g_pointerOutputs[brook::OutputMax];
+static uint32_t g_pointerOutputCount;
 static void ClampPointerToOutputsLocked()
 {
     int32_t x = g_mouseX, y = g_mouseY;

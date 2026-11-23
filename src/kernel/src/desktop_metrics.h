@@ -103,8 +103,11 @@ inline DesktopRect DesktopCaptionOverlayRect(const DesktopWindowGeometry& g,cons
 // Preserve client pixels and origin while changing native decorations. Keep the
 // caption reachable when a larger title would otherwise extend above the screen.
 // Saved restore geometry can use clamp=false, then clamp when it is restored.
-inline DesktopWindowGeometry ReframeDesktopWindow(DesktopWindowGeometry g,
-        const DesktopMetrics& before,const DesktopMetrics& after,int screenW,int desktopH,bool clamp=true) {
+// The clamp keeps the window on one output: the screenW x desktopH area
+// at originX,originY (an output minus its taskbar).
+inline DesktopWindowGeometry ReframeDesktopWindowOn(DesktopWindowGeometry g,
+        const DesktopMetrics& before,const DesktopMetrics& after,int originX,int originY,
+        int screenW,int desktopH,bool clamp=true) {
     if(!g.clientDecorated) {
         g.x+=before.border()-after.border();
         g.y+=before.border()+before.title()-after.border()-after.title();
@@ -114,15 +117,19 @@ inline DesktopWindowGeometry ReframeDesktopWindow(DesktopWindowGeometry g,
         if(visible>screenW) visible=screenW;
         if(visible<1) visible=1;
         const int outerW=g.clientW+(g.clientDecorated?0:2*after.border());
-        if(outerW>screenW) g.x=screenW-outerW; // Keep right-side caption controls reachable.
+        if(outerW>screenW) g.x=originX+screenW-outerW; // Keep right-side caption controls reachable.
         else {
-            if(g.x<0)g.x=0;
-            if(g.x>screenW-outerW)g.x=screenW-outerW;
+            if(g.x<originX)g.x=originX;
+            if(g.x>originX+screenW-outerW)g.x=originX+screenW-outerW;
         }
-        const int maxY=desktopH-(g.clientDecorated?visible:after.title()+2*after.border());
+        const int maxY=originY+desktopH-(g.clientDecorated?visible:after.title()+2*after.border());
         if(g.y>maxY)g.y=maxY;
-        if(g.y<0)g.y=0;
+        if(g.y<originY)g.y=originY;
     }
     return g;
+}
+inline DesktopWindowGeometry ReframeDesktopWindow(DesktopWindowGeometry g,
+        const DesktopMetrics& before,const DesktopMetrics& after,int screenW,int desktopH,bool clamp=true) {
+    return ReframeDesktopWindowOn(g,before,after,0,0,screenW,desktopH,clamp);
 }
 }

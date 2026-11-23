@@ -213,7 +213,8 @@ public:
     }
     // Any change of an output's geometry, mode, scale or presence.
     void NotifyChanged() { __atomic_add_fetch(&generation_, 1, __ATOMIC_ACQ_REL); }
-    uint64_t Generation() const { return __atomic_load_n(&generation_, __ATOMIC_ACQUIRE); }
+    // Never 0, while the registry itself stays zero-initialised (.bss).
+    uint64_t Generation() const { return __atomic_load_n(&generation_, __ATOMIC_ACQUIRE) + 1; }
     uint32_t BackendCount() const { return __atomic_load_n(&count_, __ATOMIC_ACQUIRE); }
 
     // Connected outputs in backend registration order, with ids renumbered
@@ -240,7 +241,7 @@ public:
 private:
     const OutputBackendOps* backends_[OutputBackendMax]{};
     uint32_t count_ = 0;
-    uint64_t generation_ = 1;
+    uint64_t generation_ = 0;
 };
 
 // Bounding rectangle of the enabled outputs (empty when none).
