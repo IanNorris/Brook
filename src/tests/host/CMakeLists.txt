@@ -801,6 +801,8 @@ add_host_test(test_cursor_composition)
 target_compile_options(test_cursor_composition PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 
 add_host_test(test_desktop_metrics)
+add_host_test(test_display_output)
+target_compile_options(test_display_output PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_desktop_overlay_regions)
 add_host_test(test_desktop_overlay_surfaces)
 add_host_test(test_global_shortcuts)
