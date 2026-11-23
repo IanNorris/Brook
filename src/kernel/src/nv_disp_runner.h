@@ -36,7 +36,7 @@ struct RunState{
     bool paused=false;
     bool hooked=false;        // quiesce hook registered
     bool firstFlipOk=false;
-    uint32_t cursor=0,stopAt=~0u,failAt=~0u,runs=0,aborts=0;
+    uint32_t cursor=0,stopAt=~0u,failAt=~0u,runs=0,aborts=0,done=0; // done: runs that reached teardown's end
     uint32_t nflips=0,holdMs=0;Stage stage=Stage::A;bool observer=false;
 };
 
@@ -162,7 +162,7 @@ template<typename B> struct Runner{
             if(brook::nvdisp::Run(plan,i,i+1,io)!=i+1){st.failAt=i;Fail(i);return;}
             if(i+1==plan.phaseBegin[uint32_t(Phase::Flip)])st.firstFlipOk=true;
         }
-        st.live=false;Msg("done","teardown complete; run preflight again before the next run");Status();
+        st.live=false;++st.done;Msg("done","teardown complete; run preflight again before the next run");Status();
     }
     // On failure: when a flip had already worked, try the restore submission
     // first (so the GOP surface is on screen), then the abort list.

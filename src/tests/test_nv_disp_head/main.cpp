@@ -17,6 +17,7 @@
 #include <string>
 #include "nv_disp_head.h"
 #include "nv_disp_runner.h" // GopFlipConfig
+#include "nv_disp_head_runner.h"
 using namespace brook::nvdisp;
 
 // ------------------------------------------------------------ synthetic VBIOS
@@ -168,7 +169,7 @@ struct Core{
             R(base+0x1004)=g.coreFmtUsage;R(base+0x1010)=g.coreUsage;
             for(uint32_t h=1;h<4;++h)R(base+0x2064+h*0x400)=0x00050008; // idle 8x5 raster
         }
-        R(RegPbLo(0))=1;R(RegPbValid(0))=1;R(0x612508)=0x603;R(0x61d004)=0x10000000;
+        R(RegPbLo(0))=1;R(RegPbValid(0))=1;R(0x612508)=0x603;R(0x61d004)=0x10000000;R(0x611cf0)=0x1ff;
     }
     bool Lookup(uint32_t handle,uint32_t chid,uint64_t& base){
         const uint64_t inst=uint64_t(R(kRegInstAddr))<<16;
@@ -209,13 +210,39 @@ struct Core{
         }
         if(!stage)R(RegGet(0))=put;
     }
+    // ---- AUX controller model (auxgm200 register layout), channel 4 only
+    uint32_t auxDefers=0,auxNack=0,auxXfers=0;bool auxSink=true;
+    static constexpr uint32_t kAux=0xd950+4*0x50;
+    bool AuxReg(uint32_t a)const{return a>=0xd930&&a<0xd930+8*0x50;}
+    uint32_t AuxRd(uint32_t a){
+        if(a<0xd930+4*0x50||a>=0xd930+5*0x50)return 0; // other channels: idle, no sink
+        if(a==kAux+0x08)return (R(a)&~0x10000000u)|(auxSink?0x10000000u:0);
+        return R(a);}
+    void AuxWr(uint32_t a,uint32_t v){
+        if(a==kAux+0x04){ // ctrl
+            uint32_t c=v;if((c&0x00700000)==0x00100000)c=(c&~0x07000000u)|0x01000000u; // grant
+            if(!(c&0x00700000))c&=~0x07000000u;
+            if(c&0x00010000){ // transaction
+                ++auxXfers;const uint32_t type=(c>>12)&0xf,size=(c&0x1ff)==0x100?0:(c&0xf)+1,addr=R(kAux);
+                uint32_t st=0x10000000u;
+                if(auxDefers){--auxDefers;st|=0x2u<<16;}
+                else if(auxNack){--auxNack;st|=0x1u<<16;}
+                else if(type==brook::kAuxNativeRead){sink.Update();uint8_t buf[16]{};memcpy(buf,sink.dpcd+addr,size);
+                    for(uint32_t i=0;i<16;i+=4){uint32_t w;memcpy(&w,buf+i,4);R(kAux-0x10+i)=w;}st|=size;}
+                else if(type==brook::kAuxNativeWrite){for(uint32_t i=0;i<size;++i)sink.dpcd[addr+i]=uint8_t(R(kAux-0x20+(i&~3u))>>(8*(i&3)));}
+                R(kAux+0x08)=st;c&=~0x00010000u;}
+            R(a)=c;return;}
+        if(a==kAux+0x08){R(a)&=~v;return;} // W1C
+        R(a)=v;}
     uint32_t rd(uint32_t a){
+        if(AuxReg(a))return AuxRd(a);
         if(a>=kPramin&&a<kPramin+0x100000)return vrd((uint64_t(R(kRegPraminBase))<<16)+(a-kPramin));
         if(a==0x612508){const uint32_t v=R(a);return (v&~0x80u)|((((v>>8)&0xf)>6)?0x80:0);} // pad-cal comparator: target 6
         return R(a);
     }
     void wr(uint32_t a,uint32_t v){
         written.insert(a);
+        if(AuxReg(a)){AuxWr(a,v);return;}
         if(a==kRegBar1Flush){R(a)=0;return;}
         if(a==kRegInstTarget&&(v&8))assert(R(kRegInstAddr)!=0);
         if(a==0x61d004||a==0x61d034){R(a)=v&~0x80000000u;return;}   // sequencers complete at once
@@ -324,7 +351,99 @@ static void TestTrainingFailure(){
     BuildHeadAbort(c.cfg,HPhase::DpTrain,hp,ab);(void)Run(ab,0,ab.count,c,true);
     assert((c.R(RegChnCtl(0))&0x13)==0x01&&(c.R(0x61d130)&0xf)==0&&c.R(kRegInstTarget)==1);
 }
-int main(){
+// ---- AUX transfer (nv_aux_xfer.h) against the controller model
+static void TestAux(){
+    Core c;struct Io{Core& c;uint32_t rd(uint32_t a){return c.rd(a);} void wr(uint32_t a,uint32_t v){c.wr(a,v);} void udelay(uint32_t){}} io{c};
+    brook::NvAux<Io> ax{io,4};
+    assert(ax.Acquire()==0&&(c.R(Core::kAux+4)&0x07000000)==0x01000000);
+    uint8_t caps[16]{};assert(ax.Dpcd(true,0,caps,16)==0&&caps[0]==0x12&&caps[1]==0x14&&caps[2]==0xc4);
+    c.auxDefers=2;uint8_t one=0;assert(ax.Dpcd(true,1,&one,1)==0&&one==0x14);      // DEFER retried
+    c.auxNack=1;assert(ax.Dpcd(true,1,&one,1)==-6);                                // NACK reported
+    uint8_t lc[2]={0x14,0x84};assert(ax.Dpcd(false,0x100,lc,2)==0&&c.sink.dpcd[0x100]==0x14&&c.sink.dpcd[0x101]==0x84);
+    uint8_t big[20]{};assert(ax.Dpcd(true,0,big,20)==0&&big[0]==0x12);              // two chunks
+    ax.Release();assert(!(c.R(Core::kAux+4)&0x00710000));
+    c.auxSink=false;assert(ax.Dpcd(true,0,caps,1)==-6);                             // no sink detected
+    brook::NvAux<Io> other{io,3};uint8_t x;assert(other.Dpcd(true,0,&x,1)==-6);
+}
+// ---- head-1 runner against the fake core, AUX controller and sink
+struct HBackend{
+    Core& c;uint64_t t=0;uint32_t hooks=0;bool s3busy=false,s3ok=false;std::vector<std::string> lines;
+    explicit HBackend(Core& core):c(core){}
+    uint32_t rd(uint32_t a){t+=1;return c.rd(a);} void wr(uint32_t a,uint32_t v){t+=1;c.wr(a,v);}
+    uint32_t vrd(uint64_t a){return c.vrd(a);} void vwr(uint64_t a,uint32_t v){c.vwr(a,v);}
+    void fill(uint64_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t){}
+    void fence(){} uint64_t nowUs(){return t+=5;} void relax(){}
+    void emit(const char* l){lines.push_back(l);} void hookQuiesce(){++hooks;}
+    bool step3Busy(){return s3busy;} bool step3Succeeded(){return s3ok;}
+    size_t Count(const char* n)const{size_t k=0;for(auto& l:lines)if(l.find(n)!=std::string::npos)++k;return k;}
+};
+struct HRig{
+    Core c;HBackend b{c};HeadRunner<HBackend>* r;
+    HRig(){
+        g_rom=MakeRom();
+        r=new HeadRunner<HBackend>();r->b=&b;r->vb=g_rom.V();
+        r->cfg.base=GopFlipConfig(3840,2160,16384,0xcf,256ull<<20);
+        r->resolved=ResolveHeadConfig(r->vb,4,r->cfg,r->dpout);assert(r->resolved);
+        c.cfg=r->cfg;c.vb=&r->vb;c.dpout=r->dpout;c.img=&r->img;c.hp=&r->pushes;c.Gop();
+    }
+    ~HRig(){delete r;}
+};
+static void TestHeadRunner(){
+    {HRig g;g.r->Command("enable");assert(g.b.Count("\"nv_head1\":\"refused\"")==1&&g.c.written.empty());
+     g.r->Command("preflight");assert(g.r->st.preflightOk&&g.c.written.empty());
+     g.r->Command("enable");assert(g.b.Count("step-3 noop/flip must succeed")==1&&g.c.written.empty());
+     g.b.s3busy=true;g.r->Command("enable");assert(g.b.Count("a step-3 run is live")==1);g.b.s3busy=false;
+     g.b.s3ok=true;g.r->Command("enable");
+     assert(g.r->st.enabled&&g.r->st.live&&g.b.Count("\"nv_head1\":\"enabled\"")==1&&g.b.hooks==1);
+     assert(g.b.Count("\"nv_head1_dp\":1,\"cr\":1,\"eq\":1")==1&&g.c.auxXfers>10);
+     assert(g.c.R(0x68a464)==g.r->cfg.mode.rasterSize&&(g.c.R(0x688340)&0xff)==2);  // head 1 ARMed on SOR2
+     assert(g.c.R(0x68a064)==g.r->cfg.base.gop.headRaster&&g.c.R(0x688320)==0x901);  // head 0 / SOR1 untouched
+     g.r->Command("enable");assert(g.b.Count("a head-1 run is live")==1);
+     g.r->Command("disable");
+     assert(!g.r->st.live&&!g.r->st.enabled&&g.b.Count("\"nv_head1\":\"done\"")==1&&g.r->st.guardHits==0);
+     assert((g.c.R(0x688340)&0xff)==0&&(g.c.R(RegChnCtl(0))&0x6013)==0x01&&g.c.R(kRegInstTarget)==1);
+     g.r->Command("enable skip-step3");assert(g.b.Count("run head1 preflight first")==2);}
+    {HRig g;g.r->Command("preflight");g.r->Command("enable skip-step3");assert(g.r->st.enabled);
+     g.r->Quiesce();                                                                  // reset while lit
+     assert(!g.r->st.live&&g.r->st.aborts==1&&(g.c.R(0x688340)&0xff)==0&&(g.c.R(kRegCtrlDisp)&7)==0);
+     assert((g.c.R(RegChnCtl(0))&0x13)==0x01&&g.c.R(kRegInstTarget)==1&&(g.c.R(0x61d130)&0xf)==0);}
+    {HRig g;g.c.sink.deadCr=true;g.r->Command("preflight");g.r->Command("enable skip-step3");
+     assert(!g.r->st.live&&g.r->st.aborts==1&&g.b.Count("\"nv_head1_dp\":1,\"cr\":0")==1&&g.c.updates==0);}
+    {HRig g;g.r->Command("preflight");g.r->Command("enable skip-step3 stop 20");     // stop in the VRAM phase
+     assert(g.r->st.paused&&g.r->st.cursor==20);g.r->Command("continue");assert(g.r->st.enabled);
+     g.r->Command("abort");assert(!g.r->st.live&&(g.c.R(0x688340)&0xff)==0);}
+    {HRig g;HeadRunner<HBackend>::RegIo io{*g.r};                                     // the write guard
+     for(uint32_t a:{0x61c804u,0xef04u,0x616540u,0x612488u,0x612b00u,0x6104e4u,0x690000u}){
+        io.violation=false;io.wr(a,1);assert(io.violation&&!g.c.written.count(a));}
+     io.violation=false;io.wr(0x61d004,0x80000001);assert(!io.violation&&g.c.written.count(0x61d004));
+     HeadPushes hp;BuildHeadPushes(g.r->cfg,hp);assert(!PushTouchesHead0(hp.core,hp.core.count));
+     Push bad;bad.Mthd(0x2064,1u);assert(PushTouchesHead0(bad,bad.count));}
+}
+static void Dump(){
+    static InstImage img;static HeadPushes hp;static Plan p,ab;
+    g_rom=MakeRom();Vbios v=g_rom.V();HeadConfig c;c.base=GopFlipConfig(3840,2160,16384,0xcf,256ull<<20);DpOut d{};
+    assert(ResolveHeadConfig(v,4,c,d));c.pauseAfterModeset=false;assert(BuildHeadPlan(c,img,hp,p)==Err::Ok);
+    static const char* op[]={"WR","MASK","EXPECT","POLL","POLLSOFT","ACK","VCOPY","VWR","VEXPECT","VPOLL","VPOLLANY","ACKEXC",
+        "PRAMIN","FENCE","KICK","EXPNOT","LOG","COPY","ASSYARM","PAUSE","DELAY","ANDNIF","COPYMASK","CALL","FILL"};
+    auto line=[&](uint32_t i,const Step& s){
+        if(s.op==Op::VramCopy||s.op==Op::VramWrite||s.op==Op::VramPoll)printf("%3u %-8s vram %08llx val %08x %s\n",i,op[uint32_t(s.op)],(unsigned long long)s.vram,s.value,s.what);
+        else if(s.op==Op::AssyArmDiff)printf("%3u %-8s chid %u mthd %04x..%04x %s\n",i,op[uint32_t(s.op)],s.reg,s.mask,s.value-4,s.what);
+        else if(s.op==Op::CopyMask)printf("%3u %-8s %06x&%08x -> %06x (keep %08x)%s %s\n",i,op[uint32_t(s.op)],s.reg,s.mask,s.value,s.x,s.y?" if cond":"",s.what);
+        else if(s.op==Op::Delay)printf("%3u %-8s %u us\n",i,op[uint32_t(s.op)],s.value);
+        else printf("%3u %-8s %06x mask %08x val %08x%s %s\n",i,op[uint32_t(s.op)],s.reg,s.mask,s.value,s.timeoutMs?" (2000 ms)":"",s.what);};
+    uint32_t ph=0;
+    for(uint32_t i=0;i<p.count;++i){
+        while(ph<uint32_t(HPhase::Count)&&p.phaseBegin[ph]==i){printf("## %s\n",HPhaseName(HPhase(ph)));++ph;}
+        while(ph<uint32_t(HPhase::Count)&&p.phaseBegin[ph]<i)++ph;
+        line(i,p.steps[i]);}
+    printf("## core pushbuffer (%u words; enable ends at %u, disable at %u bytes)\n",hp.core.count,hp.enableEnd,hp.disableEnd);
+    for(uint32_t i=0;i<hp.core.count;++i)printf("%s%08x%s",i%8?"":"  ",hp.core.words[i],i%8==7||i+1==hp.core.count?"\n":" ");
+    BuildHeadAbort(c,HPhase::Modeset,hp,ab);printf("## abort (from modeset or later)\n");
+    for(uint32_t i=0;i<ab.count;++i)line(i,ab.steps[i]);
+}
+int main(int argc,char** argv){
+    if(argc>1&&!strcmp(argv[1],"--dump")){Dump();return 0;}
+    TestAux();TestHeadRunner();
     TestVbios();TestRealVbios();TestPllAndSf();TestCoreWords();
     TestHeadPlan();TestRefusesWhenHead0Pending();TestSupervisorGuardAndAbort();TestTrainingFailure();
     puts("test_nv_disp_head: ok");return 0;

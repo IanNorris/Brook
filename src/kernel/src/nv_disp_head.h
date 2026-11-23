@@ -475,6 +475,11 @@ inline Err BuildHeadPlan(HeadConfig c,InstImage& img,HeadPushes& pushes,Plan& p)
     p.Add(Op::Expect,RegChnCtl(kChidCore),0xffff,g.ctlCore,0,"core CHNCTL as left by GOP");
     p.Add(Op::Expect,RegChnStatus(kChidCore),kCoreStateMask,kCoreEfiOperation,0,"core STATE EFI_OPERATION (7)");
     p.Add(Op::Expect,kRegCtrlDisp,0x187,0,0,"no supervisor/error/awaken pending");
+    // RM_INTR_STAT latches with EN=0 when MSK routes the bit (survey: 0x611c00 = 7 with
+    // 0x611d80 = 0), so polling CTRL_DISP needs the supervisor bits in its MSK (GOP: 0x1ff).
+    p.Add(Op::Expect,0x611cf0,0x7,0x7,0,"CTRL_DISP MSK routes supervisors 1-3 (0x611c30 latches)");
+    p.Add(Op::Log,0x611db0,0,0,0,"CTRL_DISP EN (expected 0: polled, no interrupt)");
+    p.Add(Op::Log,0x611860,0,0,0,"supervisor event status before");
     p.Add(Op::Expect,RegArm(kChidCore,c57d::SorSetControl(c.sor)),0xff,0,0,"SOR2 owns no head");
     for(uint32_t s=0;s<4;++s)p.Add(Op::Expect,RegArm(kChidCore,c57d::SorSetControl(s)),1u<<h,0,0,"no SOR drives head 1");
     p.Add(Op::Expect,RegArm(kChidCore,c57d::SorSetControl(g.sor)),~0u,g.sorCtl,0,"SOR1 still DP-B on head 0");

@@ -7,6 +7,7 @@
 // nv-aux lock (serialised with nv-aux and dp-idle) and busy-waits on the TSC.
 #include "nv_disp_live.h"
 #include "nv_disp_runner.h"
+#include "nv_disp_head_runner.h"
 #include "pci.h"
 #include "acpi.h"
 #include "boot_resource_map.h"
@@ -64,11 +65,17 @@ struct LiveBackend{
     void relax(){__asm__ volatile("pause");}
     void emit(const char* line){if(toSerial)SerialPuts(line);else DebugChannelSend(line);}
     void hookQuiesce();
+    bool step3Busy();
+    bool step3Succeeded();
 };
 
 [[clang::require_constant_initialization]] LiveBackend g_backend{};
 [[clang::require_constant_initialization]] nvdisp::Runner<LiveBackend> g_runner{};
+[[clang::require_constant_initialization]] nvdisp::HeadRunner<LiveBackend> g_head{};
 bool g_configured=false;
+uint8_t g_vbios[128*1024];bool g_vbiosRead=false;
+bool LiveBackend::step3Busy(){return g_runner.st.live||g_runner.st.paused;}
+bool LiveBackend::step3Succeeded(){return g_runner.st.done>0;}
 
 void NvDispQuiesceForReset(){
     // Pre-reset: abort a live run (the runner does nothing otherwise). Try the
@@ -78,6 +85,7 @@ void NvDispQuiesceForReset(){
     while(!(held=SpinLockTryAcquire(lock))&&g_backend.nowUs()<end)__asm__ volatile("pause");
     g_backend.toSerial=true;
     g_runner.Quiesce();
+    g_head.Quiesce();
     g_backend.toSerial=false;
     if(held)SpinLockRelease(lock);
 }
@@ -115,6 +123,26 @@ bool Configure(){
         (unsigned long)bar0,(unsigned long)bar1,(unsigned long)(size>>20),wsize&0xffff,wsize>>16,(planar&0x1fff)<<6,params&0xff);
     return true;
 }
+// Step 4: the VBIOS image (PROM window, read-only), head-1 mode copied from
+// head 0's ARM state (same monitor model on both DP outputs), table resolve.
+bool ConfigureHead(){
+    if(!g_vbiosRead){
+        if((g_backend.rd(0x300000)&0xffff)!=0xaa55){DebugChannelSend("{\"nv_head1\":\"error\",\"msg\":\"no VBIOS at PROM 0x300000\"}\n");return false;}
+        for(uint32_t i=0;i<sizeof(g_vbios);i+=4){const uint32_t w=g_backend.rd(0x300000+i);memcpy(g_vbios+i,&w,4);}
+        g_vbiosRead=true;
+    }
+    nvdisp::HeadConfig c{};c.base=g_runner.base;
+    nvdisp::HeadMode& m=c.mode;
+    m.outputResource=g_backend.rd(0x68a004);m.pclkHz=g_backend.rd(0x68a00c);m.outputScaler=g_backend.rd(0x68a014);
+    m.dither=g_backend.rd(0x68a018);m.maxOutputScale=g_backend.rd(0x68a02c);m.usageBounds=g_backend.rd(0x68a030);
+    m.stallLock=g_backend.rd(0x68a034);m.viewport=g_backend.rd(0x68a04c);
+    m.rasterSize=g_backend.rd(0x68a064);m.syncEnd=g_backend.rd(0x68a068);m.blankEnd=g_backend.rd(0x68a06c);
+    m.blankStart=g_backend.rd(0x68a070);m.vertBlank2=g_backend.rd(0x68a074);
+    g_head.vb=nvdisp::Vbios{g_vbios,sizeof(g_vbios)};g_head.cfg=c;g_head.auxCh=4;
+    g_head.resolved=nvdisp::ResolveHeadConfig(g_head.vb,4,g_head.cfg,g_head.dpout);
+    g_head.b=&g_backend;
+    return true;
+}
 } // namespace
 
 bool NvDispHandle(const char* command){
@@ -124,8 +152,15 @@ bool NvDispHandle(const char* command){
     SpinLock* lock=NvAuxSharedLock();
     SpinLockAcquire(lock);
     // Configure lazily (PCI config reads + a few window-state reads) unless a run is live.
-    if(!g_configured||(!g_runner.st.live&&!g_runner.st.paused)){if(!Configure()){SpinLockRelease(lock);return true;}}
-    g_runner.Command(command+n);
+    const bool headLive=g_head.st.live||g_head.st.paused;
+    if(!g_configured||(!g_runner.st.live&&!g_runner.st.paused&&!headLive)){if(!Configure()){SpinLockRelease(lock);return true;}}
+    const char* rest=command+n;while(*rest==' ')++rest;
+    if(strncmp(rest,"head1",5)==0&&(rest[5]==0||rest[5]==' ')){
+        if(!headLive&&!ConfigureHead()){SpinLockRelease(lock);return true;}
+        g_head.Command(rest+5);
+    }else if(headLive&&strncmp(rest,"status",6)!=0){
+        DebugChannelSend("{\"nv_disp\":\"refused\",\"msg\":\"a head-1 run is live\"}\n");
+    }else g_runner.Command(rest);
     SpinLockRelease(lock);
     return true;
 }
