@@ -431,7 +431,6 @@ add_executable(kernel
     src/debug_epoch.cpp
     src/debug_presence.cpp
     src/debug_hardware.cpp
-    src/nv_disp_live.cpp
     src/debug_jobs.cpp
     src/debug_ui.cpp
     src/tcp.cpp
@@ -682,6 +681,14 @@ if(BROOK_SSD_GUARDED_DESKTOP_RESET_TEST)
 endif()
 if(BROOK_SSD_GUARDED_DESKTOP_RESET)
     target_compile_definitions(kernel PRIVATE BROOK_SSD_GUARDED_DESKTOP_RESET=1)
+endif()
+# NVIDIA desktop display support (RTX desktop images): nv-aux, nv-disp step 3 /
+# head 1 / resident driver, dp-idle and link watch, the pre-reset GPU reset.
+# Off by default so other kernels (the Dell pair) carry none of it.
+option(BROOK_NV_DISPLAY "Build the NVIDIA desktop display code (RTX desktop images)" OFF)
+if(BROOK_NV_DISPLAY)
+    target_sources(kernel PRIVATE src/nv_disp_live.cpp)
+    target_compile_definitions(kernel PRIVATE BROOK_NV_DISPLAY=1)
 endif()
 set(BROOK_PANIC_INGEST_URL "" CACHE STRING "Panic scanner URL shown as a QR code on panic screens (empty: built-in default)")
 if(BROOK_PANIC_INGEST_URL)

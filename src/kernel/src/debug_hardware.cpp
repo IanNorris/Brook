@@ -354,7 +354,10 @@ bool DebugHardwareAutoInitializeIntel(){
     return false;
 #endif
 }
-#if !defined(BROOK_HOST_TEST)
+// NVIDIA desktop display (nv-aux, dp-idle/link watch, pre-reset GPU reset):
+// built only with BROOK_NV_DISPLAY (RTX desktop images), so it costs other
+// kernels (the Dell pair's 8 MiB update limit) nothing.
+#if !defined(BROOK_HOST_TEST) && defined(BROOK_NV_DISPLAY)
 namespace {
 // nv-aux runs from the debug command thread and from the dp-idle worker; one
 // lock serialises AUX and SOR access. A silent caller gets the JSON reply in
@@ -1531,10 +1534,12 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
     //   nv-aux read <ch> <dpcd-hex> <len 1..16>    native DPCD read
     //   nv-aux edid <ch> <block>                   128-byte EDID block via I2C-over-AUX (0x50)
     //   nv-aux power <ch> d0|d3                     DPCD 0x600 write (sink power state)
+#if defined(BROOK_NV_DISPLAY)
     if(NvAuxHandle(command,nullptr,0))return true;
     if(NvDispHandle(command))return true;          // RTX step 3 flips (nv_disp_live.cpp), gated
     constexpr char dpIdlePrefix[]="bridge hardware dp-idle ";
     if(Prefix(command,dpIdlePrefix)){DpIdleCommand(command+sizeof(dpIdlePrefix)-1);return true;}
+#endif
     // GPU link ASPM L1 (runtime, volatile; a reset restores firmware state):
     // the first 10de display function (fn0 only; HDA/USB-C/UCSI functions are
     // left as they are) and the root port above it. L1 only, never L0s; only
