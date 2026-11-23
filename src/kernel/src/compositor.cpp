@@ -2127,27 +2127,25 @@ static uint32_t ShellHiddenMask(const OutputLayout& layout)
         if (WmTaskbarHiddenOn(i)) mask |= 1u << i;
     return mask;
 }
+// The output's view, or the primary's when it is not enabled.
+static ShellView ShellViewFor(uint32_t output)
+{
+    OutputRect r{};
+    if (!CompositorGetOutputRect(output, &r)) { output = 0; (void)CompositorGetOutputRect(0, &r); }
+    return {output, r.x, r.y, r.w, r.h};
+}
 // The shell output: the launcher and the taskbar popups are shown there.
-static ShellView ShellOwnerView()
-{
-    OutputLayout layout;
-    CompositorGetOutputs(layout);
-    return ShellViewOf(layout, WmShellOutput());
-}
+static ShellView ShellOwnerView() { return ShellViewFor(OutputMultiSupported ? WmShellOutput() : 0); }
 // The side dock is on the primary output.
-static ShellView ShellPrimaryView()
-{
-    OutputLayout layout;
-    CompositorGetOutputs(layout);
-    return ShellViewOf(layout, 0);
-}
+static ShellView ShellPrimaryView() { return ShellViewFor(0); }
 // The output whose taskbar holds the pointer, else the shell output. A
 // press (select) on another output's taskbar moves the shell there.
 static ShellView ShellPointerView(int32_t mx, int32_t my, bool select)
 {
+    if constexpr (!OutputMultiSupported) return ShellViewFor(0);
     OutputLayout layout;
     CompositorGetOutputs(layout);
-    if (layout.count > 1) {
+    if (layout.multi()) {
         const auto hit = ShellTaskbarAt(layout, WmMetric(WM_TASKBAR_HEIGHT), ShellHiddenMask(layout), mx, my);
         if (hit.output >= 0) {
             if (select) WmShellSelectOutput(uint32_t(hit.output));
@@ -2159,9 +2157,10 @@ static ShellView ShellPointerView(int32_t mx, int32_t my, bool select)
 // `my >= WmTaskbarTop(screenH)` per output: the pointer is on a taskbar.
 static bool ShellTaskbarBand(int32_t mx, int32_t my)
 {
+    if constexpr (!OutputMultiSupported) return my >= static_cast<int32_t>(WmTaskbarTop(g_physFbHeight));
     OutputLayout layout;
     CompositorGetOutputs(layout);
-    if (layout.count <= 1) return my >= static_cast<int32_t>(WmTaskbarTop(g_physFbHeight));
+    if (!layout.multi()) return my >= static_cast<int32_t>(WmTaskbarTop(g_physFbHeight));
     return ShellTaskbarAt(layout, WmMetric(WM_TASKBAR_HEIGHT), ShellHiddenMask(layout), mx, my).output >= 0;
 }
 
@@ -2194,7 +2193,7 @@ static ShellFrame CaptureShellFrame(uint32_t width, uint32_t height, uint64_t no
     }
     OutputLayout outputs;
     CompositorGetOutputs(outputs);
-    const bool multi = outputs.count > 1;
+    const bool multi = outputs.multi();
     // The shell output carries every surface; other outputs only their own
     // taskbar (and the primary its dock).
     const ShellView owner = multi ? ShellViewOf(outputs, WmShellOutput()) : ShellView{0, 0, 0, width, height};
@@ -2279,7 +2278,7 @@ static ShellFrame CaptureShellFrame(uint32_t width, uint32_t height, uint64_t no
 static void DrawShellFrameSurface(const ShellFrame& frame, uint32_t i, uint32_t* pixels, uint32_t stride)
 {
     const auto& surface = frame.surfaces[i];
-    const auto& view = frame.views[i];
+    const ShellView view = OutputMultiSupported ? frame.views[i] : ShellView{0, 0, 0, frame.width, frame.height};
     if (view.x < 0 || view.y < 0 || uint64_t(view.x) + view.w > frame.width || uint64_t(view.y) + view.h > frame.height)
         return;
     uint32_t* base = pixels + uint64_t(view.y) * stride + uint32_t(view.x);
@@ -2322,8 +2321,12 @@ static DesktopOverlaySurfacePlan RasterShellLayer(uint32_t* pixels, uint32_t str
             if (!local) ++g_idleStats.overlaySurfaceKeeps;
             continue;
         }
+        // Desktop coordinates: the slot (with one output, the surface itself).
         const auto& placed = frame.slots[i].rect;
-        const struct { int32_t x, y; uint32_t w, h; } s{placed.x, placed.y, placed.width, placed.height};
+        const auto& own = frame.surfaces[i];
+        struct SurfaceRect { int32_t x, y; uint32_t w, h; };
+        const SurfaceRect s = OutputMultiSupported ? SurfaceRect{placed.x, placed.y, placed.width, placed.height}
+                                                   : SurfaceRect{own.x, own.y, own.w, own.h};
         DrawShellFrameSurface(frame, i, pixels, stride);
         const auto& record = frame.records[i];
         const ChromeAlphaRect rect{s.x, s.y, s.w, s.h};
@@ -4471,11 +4474,12 @@ static bool GopShadowEnsure()
 // allocated (GopShadowEnsure) for this frame.
 static bool g_gopPresentShadow=false;
 static uint32_t GopOutputCount() { return g_physFbWidth && g_physFbHeight ? 1u : 0u; }
+// dst is zeroed by the caller; the last byte stays NUL. Kept a plain loop:
+// unrolled copies cost more than a 16-byte name is worth.
 static void CopyOutputName(char (&dst)[16], const char* src)
 {
-    uint32_t i=0;
-    for(;src && src[i] && i+1<sizeof(dst);++i)dst[i]=src[i];
-    for(;i<sizeof(dst);++i)dst[i]=0;
+#pragma clang loop unroll(disable) vectorize(disable)
+    for(uint32_t i=0;src[i] && i+1<sizeof(dst);++i)dst[i]=src[i];
 }
 static bool GopOutputInfo(uint32_t id, OutputInfo* out)
 {
@@ -4542,7 +4546,7 @@ static const OutputBackendOps g_gopOutputOps={
     GopOutputPresent,GopOutputPoll,nullptr,nullptr,nullptr,GopOutputPanicPresent,
 };
 
-void CompositorGetOutputs(OutputLayout& out)
+__attribute__((noinline)) void CompositorGetOutputs(OutputLayout& out)
 {
     OutputEnumerate(out);
     bool any=false;
@@ -4567,16 +4571,31 @@ static void CompositorRegisterOutputs() { (void)OutputRegisterBackend(&g_gopOutp
 // The pointer moves over the union of the enabled outputs.
 static void CompositorSyncPointerOutputs()
 {
-    OutputLayout layout;
-    CompositorGetOutputs(layout);
-    OutputRect rects[OutputMax];
-    uint32_t n=0;
-    for(uint32_t i=0;i<layout.count;++i)if(layout.enabled(i))rects[n++]=layout.rect(i);
-    MouseSetOutputBounds(rects,n);
+    if constexpr (!OutputMultiSupported) {
+        // The one output is the framebuffer at 0,0.
+        uint32_t w=0,h=0;
+        CompositorSnapshotPhysDims(&w,&h);
+        MouseSetBounds(w && h ? w : 0, w && h ? h : 0);
+    } else {
+        OutputLayout layout;
+        CompositorGetOutputs(layout);
+        OutputRect rects[OutputMax];
+        uint32_t n=0;
+        for(uint32_t i=0;i<layout.count;++i)if(layout.enabled(i))rects[n++]=layout.rect(i);
+        MouseSetOutputBounds(rects,n);
+    }
 }
 
-bool CompositorGetOutputRect(uint32_t index, OutputRect* rect)
+__attribute__((noinline)) bool CompositorGetOutputRect(uint32_t index, OutputRect* rect)
 {
+    if constexpr (!OutputMultiSupported) {
+        // The registry keeps one output: the framebuffer at 0,0.
+        uint32_t w=0,h=0;
+        CompositorSnapshotPhysDims(&w,&h);
+        if(index || !w || !h)return false;
+        if(rect)*rect={0,0,w,h};
+        return true;
+    }
     OutputLayout layout;
     CompositorGetOutputs(layout);
     if(!layout.enabled(index))return false;
@@ -4586,9 +4605,9 @@ bool CompositorGetOutputRect(uint32_t index, OutputRect* rect)
 
 OutputRect CompositorPrimaryOutputRect()
 {
-    OutputLayout layout;
-    CompositorGetOutputs(layout);
-    return layout.rect(0);
+    OutputRect rect{};
+    (void)CompositorGetOutputRect(0,&rect);
+    return rect;
 }
 
 static bool CompositorFlipSoftware(bool clientFrame = false, bool hardwareCursor = false)
@@ -4637,6 +4656,11 @@ static bool CompositorFlipSoftware(bool clientFrame = false, bool hardwareCursor
     g_gopPresentShadow=shadow;
     const DamageRects damage=full ? DamageRects::Full(g_physFbWidth,g_physFbHeight) : DamageRects::Rows(minY,maxY,g_physFbWidth);
     bool flushed=false;
+    if constexpr (!OutputMultiSupported) {
+        // The one output is the GOP adapter at 0,0: the damage needs no clip.
+        OutputBuffer buffer{};
+        if(GopOutputAcquire(0,&buffer))flushed=GopOutputPresent(0,buffer,damage)>0;
+    } else {
     OutputLayout outputs;
     CompositorGetOutputs(outputs);
     bool presentedAny=false;
@@ -4656,6 +4680,7 @@ static bool CompositorFlipSoftware(bool clientFrame = false, bool hardwareCursor
     if(!presentedAny && !outputs.backends[0]){
         OutputBuffer buffer{};
         if(GopOutputAcquire(0,&buffer))flushed=GopOutputPresent(0,buffer,damage)>0;
+    }
     }
     // Cursor, chrome and kernel-console redraws cannot establish app health.
     if (flushed && clientFrame) CompositorRecordDesktopPresent();

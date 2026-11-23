@@ -474,6 +474,7 @@ static uint32_t WindowOutputIndex(const OutputLayout& layout, const Window& w)
 }
 static OutputRect WindowOutputRect(const Window& w)
 {
+    if constexpr (!OutputMultiSupported) return CompositorPrimaryOutputRect();
     OutputLayout layout;
     CompositorGetOutputs(layout);
     return OutputRectOrPrimary(layout, WindowOutputIndex(layout, w));
@@ -481,6 +482,7 @@ static OutputRect WindowOutputRect(const Window& w)
 // The output holding a client rect's outer frame (saved/restore geometry).
 static OutputRect GeometryOutputRect(int x, int y, int clientW, int clientH, bool noChrome, const DesktopMetrics& m)
 {
+    if constexpr (!OutputMultiSupported) return CompositorPrimaryOutputRect();
     OutputLayout layout;
     CompositorGetOutputs(layout);
     const int border = noChrome ? 0 : m.border(), title = noChrome ? 0 : m.title();
@@ -490,6 +492,7 @@ static OutputRect GeometryOutputRect(int x, int y, int clientW, int clientH, boo
 }
 static WmRect WorkAreaForWindow(const Window& w)
 {
+    if constexpr (!OutputMultiSupported) return WorkAreaForOutput(w.desktopMetrics(), CompositorPrimaryOutputRect(), true);
     OutputLayout layout;
     CompositorGetOutputs(layout);
     const uint32_t index = WindowOutputIndex(layout, w);
@@ -1729,14 +1732,20 @@ bool WmTaskbarHiddenOn(uint32_t output)
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return false;
     const Window& w = g_windows[idx];
     if (!w.proc || !w.visible || w.minimized) return false;
-    OutputLayout layout;
-    CompositorGetOutputs(layout);
-    if (layout.count > 1 && WindowOutputIndex(layout, w) != output) return false;
-    if (w.fullscreen) return true;
+    OutputRect out{};
+    if constexpr (!OutputMultiSupported) {
+        if (w.fullscreen) return true;
+        out = CompositorPrimaryOutputRect();
+    } else {
+        OutputLayout layout;
+        CompositorGetOutputs(layout);
+        if (layout.multi() && WindowOutputIndex(layout, w) != output) return false;
+        if (w.fullscreen) return true;
+        out = OutputRectOrPrimary(layout, output);
+    }
     // A chrome-less window placed over the whole output is fullscreen too:
     // the Xwayland WM shipped before WM_SET_FULLSCREEN sizes EWMH fullscreen
     // windows this way. Maximized windows stop at the taskbar, so never match.
-    const OutputRect out = OutputRectOrPrimary(layout, output);
     return w.noChrome && out.w && out.h && w.x <= out.x && w.y <= out.y &&
            int64_t(w.x) + w.clientW >= out.right() && int64_t(w.y) + w.clientH >= out.bottom();
 }
@@ -1876,7 +1885,7 @@ static void ReframeDesktopWindowsLocked(const DesktopMetrics* next,
     // Each window is laid out on its own output (with one output: sw x sh).
     OutputLayout layout;
     CompositorGetOutputs(layout);
-    const bool multi=layout.count>1;
+    const bool multi=layout.multi();
     const uint32_t dockW=multi?layout.rect(0).w:sw,dockH=multi?layout.rect(0).h:sh;
     for (auto& w:g_windows) {
         if (!w.proc) continue;

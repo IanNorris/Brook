@@ -16,8 +16,16 @@
 
 #include <stdint.h>
 
+// BROOK_MULTI_OUTPUT=0 (the kernel CMake option, OFF on single-output
+// machines) keeps the first output only and compiles the multi-output
+// branches out. One output behaves the same either way.
+#ifndef BROOK_MULTI_OUTPUT
+#define BROOK_MULTI_OUTPUT 1
+#endif
+
 namespace brook {
 
+inline constexpr bool OutputMultiSupported = BROOK_MULTI_OUTPUT != 0;
 inline constexpr uint32_t OutputMax = 4;
 inline constexpr uint32_t OutputBackendMax = 4;
 // DRM fourcc 'XR24': the only format the compositor produces.
@@ -116,12 +124,12 @@ struct DamageRects {
     // compositor's row span expressed as a rect list.
     static DamageRects Rows(uint32_t minY, uint32_t maxY, uint32_t width) {
         DamageRects d;
-        d.Add({0, int32_t(minY), int32_t(width), int32_t(maxY)});
+        d.rects[0] = {0, int32_t(minY), int32_t(width), int32_t(maxY)};
+        d.count = d.rects[0].empty() ? 0 : 1;
         return d;
     }
     static DamageRects Full(uint32_t width, uint32_t height) {
-        DamageRects d;
-        d.Add({0, 0, int32_t(width), int32_t(height)});
+        DamageRects d = Rows(0, height, width);
         d.full = d.count != 0;
         return d;
     }
@@ -181,6 +189,8 @@ struct OutputLayout {
         return i < count && outputs[i].connected && outputs[i].enabled && !outputs[i].rect().empty();
     }
     constexpr OutputRect rect(uint32_t i) const { return enabled(i) ? outputs[i].rect() : OutputRect{}; }
+    // More than one output: the multi-output paths apply.
+    constexpr bool multi() const { return OutputMultiSupported && count > 1; }
 };
 
 // Backend list with a generation counter. Readers may enumerate without a
@@ -222,11 +232,11 @@ public:
     void Enumerate(OutputLayout& out) const {
         out = OutputLayout{};
         out.generation = Generation();
-        const uint32_t n = BackendCount();
-        for (uint32_t b = 0; b < n && out.count < OutputMax; ++b) {
+        const uint32_t n = BackendCount(), limit = OutputMultiSupported ? OutputMax : 1;
+        for (uint32_t b = 0; b < n && out.count < limit; ++b) {
             const OutputBackendOps* ops = backends_[b];
             const uint32_t outputs = ops->Count();
-            for (uint32_t id = 0; id < outputs && out.count < OutputMax; ++id) {
+            for (uint32_t id = 0; id < outputs && out.count < limit; ++id) {
                 OutputInfo info{};
                 if (!ops->Info(id, &info) || !info.connected) continue;
                 info.id = uint8_t(out.count);
@@ -283,6 +293,8 @@ inline int OutputIndexForPoint(const OutputLayout& layout, int64_t px, int64_t p
 // centre, else the one it overlaps most, else the primary output.
 inline uint32_t OutputIndexForRect(const OutputLayout& layout, const OutputRect& r)
 {
+    // One output: every rect belongs to it (centre, overlap or fallback).
+    if (!layout.multi()) return 0;
     const int found = OutputIndexForPoint(layout, int64_t(r.x) + r.w / 2, int64_t(r.y) + r.h / 2);
     if (found >= 0) return uint32_t(found);
     uint32_t best = 0;
@@ -309,7 +321,6 @@ inline OutputRect OutputRectOrPrimary(const OutputLayout& layout, uint32_t index
 // Kernel registry (display_output.cpp). The compositor registers the GOP /
 // DisplayOps adapter as the first backend, so its output is the primary.
 bool OutputRegisterBackend(const OutputBackendOps* ops);
-bool OutputUnregisterBackend(const OutputBackendOps* ops);
 void OutputNotifyChanged();
 uint64_t OutputGeneration();
 void OutputEnumerate(OutputLayout& out);
