@@ -152,6 +152,7 @@ struct Fake{
     bool verbose=false;uint32_t diffs=0,pauses=0;
     void diff(uint32_t m,uint32_t a,uint32_t b){++diffs;if(verbose)printf("  diff %03x assy %08x arm %08x\n",m,a,b);}
     void pause(const char*){++pauses;}
+    uint32_t flags=0;void flag(uint32_t,const Step&,uint32_t){++flags;} void note(const char*,uint32_t){}
     uint32_t dumped=0;void dump(uint32_t,const uint32_t*,uint32_t n){dumped+=n;}
     void udelay(uint32_t){}
     bool call(uint32_t){return true;}

@@ -746,6 +746,15 @@ void DpIdleCommand(const char* p){
 }
 }
 SpinLock* NvAuxSharedLock(){return &g_nvAuxLock;}
+// nv-disp head1 sessions suspend dp-idle (idle-off and link watch) and restore it.
+// Plain atomic stores, no g_dpIdleLock: the caller already holds the nv-aux lock.
+void DpIdleSuspendForDisplay(bool suspend){
+    static uint32_t savedSecs=0;static bool savedWatch=false;
+    if(suspend){savedSecs=__atomic_load_n(&g_dpIdle.seconds,__ATOMIC_RELAXED);savedWatch=__atomic_load_n(&g_dpIdle.watch,__ATOMIC_RELAXED);
+        __atomic_store_n(&g_dpIdle.seconds,0u,__ATOMIC_RELEASE);__atomic_store_n(&g_dpIdle.watch,false,__ATOMIC_RELEASE);}
+    else{__atomic_store_n(&g_dpIdle.lastActivityMs,ApicTickCount(),__ATOMIC_RELEASE);
+        __atomic_store_n(&g_dpIdle.watch,savedWatch,__ATOMIC_RELEASE);__atomic_store_n(&g_dpIdle.seconds,savedSecs,__ATOMIC_RELEASE);}
+}
 void DpIdleStart(){
     if(g_dpIdle.threadStarted)return;
     bool nvidia=false;
