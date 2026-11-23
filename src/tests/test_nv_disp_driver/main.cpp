@@ -75,7 +75,9 @@ static void TestBothOutputs(){
      g.d->Command("bench 0 30");assert(g.b.Count("\"completed\":30")==1);
      g.d->Command("bench 1 30");assert(g.b.Count("\"completed\":30")==2);
      g.d->Command("flip 9 0");assert(g.b.Count("\"usage\"")==1);
-     g.d->Command("down all");assert(!g.d->AnyLive());g.Gop0();}
+     g.d->Command("down all");assert(!g.d->AnyLive());g.Gop0();
+     for(auto& l:g.b.lines)assert(l.size()<318&&l.back()=='\n');              // no truncated status lines
+     assert(g.b.Count("\"nv_driver_out\":1")>=1);}
 }
 static void TestFailures(){
     // A wedged window 0: the flip times out, the restore cannot land, the abort runs and

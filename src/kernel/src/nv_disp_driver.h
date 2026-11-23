@@ -152,15 +152,16 @@ template<typename B> struct NvDisplayDriver{
     }
 
     // ---- bridge verbs (debug / manual control on top of the same driver)
+    // One line per output: a single line overflowed the 320-byte Line (live a087416d).
     void Status(){
-        Line l;l.raw("{\"nv_driver_status\":1");
+        Line h;h.raw("{\"nv_driver_status\":1,\"outputs\":");h.dec(kDriverOutputs);h.raw(",\"invariant_fails\":");h.dec(invariantFails);
+        h.raw("}\n");b->emit(h.t);
         for(uint32_t o=0;o<kDriverOutputs;++o){
-            l.raw(o?",\"out1\":{":",\"out0\":{");l.raw("\"state\":");l.dec(uint32_t(out[o]));l.raw(",\"flip\":");l.dec(uint32_t(f[o].state));
+            Line l;l.raw("{\"nv_driver_out\":");l.dec(o);l.raw(",\"state\":");l.dec(uint32_t(out[o]));l.raw(",\"flip\":");l.dec(uint32_t(f[o].state));
             l.raw(",\"front\":");l.dec(uint32_t(f[o].front));l.raw(",\"presents\":");l.dec(f[o].st.presents);l.raw(",\"completes\":");l.dec(f[o].st.completes);
             l.raw(",\"replaced\":");l.dec(f[o].st.replaced);l.raw(",\"wraps\":");l.dec(f[o].st.wraps);l.raw(",\"lat_us\":");l.dec(f[o].st.lastLatUs);
             l.raw(",\"max_lat_us\":");l.dec(f[o].st.maxLatUs);l.raw(",\"vblanks\":");l.dec(f[o].st.vblanks);l.raw(",\"fail\":");l.dec(uint32_t(f[o].fail));
-            l.raw(",\"ups\":");l.dec(ups[o]);l.raw(",\"downs\":");l.dec(downs[o]);l.raw(",\"failures\":");l.dec(failures[o]);l.raw("}");}
-        l.raw(",\"invariant_fails\":");l.dec(invariantFails);l.raw("}\n");b->emit(l.t);
+            l.raw(",\"ups\":");l.dec(ups[o]);l.raw(",\"downs\":");l.dec(downs[o]);l.raw(",\"failures\":");l.dec(failures[o]);l.raw("}\n");b->emit(l.t);}
     }
     // n flips alternating the back buffer, each waited for; reports latency.
     void Bench(uint32_t o,uint32_t n){
