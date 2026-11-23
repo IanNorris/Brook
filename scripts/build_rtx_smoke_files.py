@@ -74,7 +74,7 @@ MARKERS = ('usb-read-only', 'audio-muted', 'hw-inventory', 'boot-status', 'boot-
 ETC_ALLOWED = {*MARKERS, 'i219-attach', 'i219-reset', 'hardware-payload-id', 'resolv.conf', 'machine-id', 'ssl',
                'bridge-v3-operators', 'rtx-update-signer',
                # --session desktop only
-               'live-store', 'volatile-desktop', 'hardware-bulk', 'usb-audio-mixer', 'dp-idle-seconds', 'chromium-alsa-device'}
+               'live-store', 'volatile-desktop', 'hardware-bulk', 'usb-audio-mixer', 'dp-idle-seconds', 'nv-display', 'chromium-alsa-device'}
 # Desktop live stick (--session desktop): the VMware RC session over the RAM
 # store, plus the RTX status helper. If the store does not mount, the services
 # fail to start and the kernel console, bridge and remote update stay usable.
@@ -213,6 +213,8 @@ def desktop_payload(args, initrd):
     fat_write(initrd, 'ETC/usb-audio-mixer', b'1\n')
     # RTX DP sink idle-off: 5 min, AUX ch 3 / SOR1 link B (the GOP's lit head on this desktop).
     fat_write(initrd, 'ETC/dp-idle-seconds', b'300 3 1 2\n')
+    if args.nv_display:  # desktop presents by flipping head 0 (D2); GOP copy otherwise
+        fat_write(initrd, 'ETC/nv-display', b'1\n')
     fat_write(initrd, 'ETC/chromium-alsa-device', b'default\n')  # read by the store's brook-chromium
     fat_write(initrd, 'ETC/live-store', store['record'].encode())
     fat_write(initrd, 'BOOT/BIN/BASH', (profile / 'bin/bash').read_bytes())
@@ -406,6 +408,8 @@ def main():
     p.add_argument('--display-max', default='1920x1080', metavar='WxH',
                    help='GOP mode cap in BROOK.CFG (kernel supports up to 4096x2160); outside PREV/ fallback')
     p.add_argument('--allow-dirty', action='store_true')
+    p.add_argument('--nv-display', action='store_true',
+                   help='desktop image: /etc/nv-display = 1 (RTX head-0 flip presentation at desktop start)')
     p.add_argument('--panic-ingest-url-file', type=Path,
                    default=Path('/data/Programming/Brook/shared/dell/panic-ingest-url'),
                    help='file holding the panic scanner URL for the panic QR (same as the Dell build); '
