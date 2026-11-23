@@ -242,11 +242,13 @@ inline void PushWindowImage(Push& p,const Surface& s,uint32_t handle,uint32_t in
     p.Mthd(c57e::SET_SIZE_IN,SurfSize(s));
     p.Mthd(c57e::SET_SIZE_OUT,SurfSize(s));
 }
-// Flip: only the address changes (format/size are already ARMed).
-inline void PushWindowFlip(Push& p,uint64_t offset,uint32_t handle,uint32_t interval=1){
+// Flip: address plus size/storage/params/pitch on every flip, as nvkms does
+// (nvkms-evo3.c EvoFlipC3Common; decision 23 Nov: 5 words removes an unknown).
+inline void PushWindowFlip(Push& p,const Surface& s,uint32_t handle,uint32_t interval=1){
     p.Mthd(c57e::SET_PRESENT_CONTROL,interval&0xf);
+    p.Mthd(c57e::SET_SIZE,SurfSize(s),c57e::LAYOUT_PITCH<<4,s.format&0xff,(s.pitch>>6)&0x1fff);
     p.Mthd(c57e::SET_CONTEXT_DMA_ISO0,handle);
-    p.Mthd(c57e::SET_OFFSET0,uint32_t(offset>>8));
+    p.Mthd(c57e::SET_OFFSET0,uint32_t(s.vram>>8));
 }
 // wndwc37e_update (N7 270-287): no core/cursor interlock, window interlock = self.
 inline void PushWindowUpdate(Push& p,uint32_t window,uint32_t coreInterlock=0){
@@ -348,7 +350,7 @@ inline uint32_t RingAppend(Push& ring,Ring& r,const Push& p){
 // Runtime flip: notifier slot `parity`, address-only state, update.
 inline uint32_t BuildFlip(Push& ring,Ring& r,const Config& c,const Surface& s,uint32_t parity,uint32_t handle=kHandleIsoPitch){
     Push p;PushWindowNtfy(p,WindowNtfyOffset(c.window,parity));
-    PushWindowFlip(p,s.vram,handle);PushWindowUpdate(p,c.window);
+    PushWindowFlip(p,s,handle);PushWindowUpdate(p,c.window);
     return RingAppend(ring,r,p);
 }
 inline uint32_t BuildFirstFlip(Push& ring,Ring& r,const Config& c){

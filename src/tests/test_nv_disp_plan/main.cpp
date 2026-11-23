@@ -280,7 +280,7 @@ static void TestPlanRun(bool core,bool a2=false){
     uint32_t pr=0;for(uint32_t i=0;i<plan.count;++i)if(plan.steps[i].op==Op::PraminExpect){++pr;
         assert(i<plan.phaseBegin[uint32_t(Phase::Instmem)]);}
     assert(pr==3*2+3*6+pushes.wndw.count+(core?2:0));
-    assert(pushes.end[0]==25*4&&pushes.end[1]==pushes.end[0]+14*4&&pushes.end[2]==pushes.end[1]+14*4);
+    assert(pushes.end[0]==25*4&&pushes.end[1]==pushes.end[0]+19*4&&pushes.end[2]==pushes.end[1]+19*4);
 }
 static void TestPreflightRefuses(){
     Config c=DellConfig();static InstImage img;static Pushes pushes;static Plan plan;pushes=Pushes{};plan=Plan{};
