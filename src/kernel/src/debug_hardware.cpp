@@ -1561,7 +1561,8 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
             {0x022500,0x022600},{0x00d000,0x00e000},{0x088000,0x088100},{0x08a100,0x08a200},{0x300000,0x400000},{0x610000,0x700000},
             // rtx-disp probes: VRAM size, BAR1/BAR2 block, PRAMIN window contents (reads only;
             // the 0x1700 window base is never written here).
-            {0x100c00,0x100d00},{0xb80f00,0xb81000},{0x700000,0x800000}};
+            {0x100c00,0x100d00},{0xb80f00,0xb81000},{0x700000,0x800000},
+            {0x00ea00,0x00f000}}; // VPLL (0xef00-0xef5c, 0xea80)
         const uint32_t end=offset+count*4;bool ok=false;
         for(const auto& a:allowed)if(offset>=a.begin && end<=a.end)ok=true;
         if(!ok){DebugChannelSend("{\"nv_error\":\"Range not in the read-only allow-list\"}\n");return true;}
