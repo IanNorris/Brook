@@ -255,6 +255,7 @@ def main():
     ap.add_argument('--output', type=Path, required=True)
     ap.add_argument('--topology', action='append', choices=sorted(TOPOLOGIES), help='repeatable; default all')
     ap.add_argument('--scan', type=Path, action='append', default=[], help='extra published paths to check for seed bytes')
+    ap.add_argument('--memory', type=int, default=2048, help='guest RAM in MiB (above 4096 exercises high-memory-first placement)')
     args = ap.parse_args()
     if subprocess.run(['pgrep', '-x', 'vmware-vmx'], stdout=subprocess.DEVNULL).returncode == 0:
         raise SystemExit('VMware is running; QEMU proof skipped')
@@ -285,7 +286,7 @@ def run_one(args, base, topology):
         s.bind(('127.0.0.1', 0)); port = s.getsockname()[1]
     # AF_UNIX paths are limited to 108 bytes; keep QMP in a short private directory.
     qmp_dir = Path(tempfile.mkdtemp(prefix='rtxq-')); qmp_path = qmp_dir / 'qmp.sock'
-    qemu = ['qemu-system-x86_64', '-machine', 'q35,i8042=off', '-accel', 'kvm', '-cpu', 'host', '-smp', '4', '-m', '2048', '-nodefaults',
+    qemu = ['qemu-system-x86_64', '-machine', 'q35,i8042=off', '-accel', 'kvm', '-cpu', 'host', '-smp', '4', '-m', str(args.memory), '-nodefaults',
             '-drive', 'if=pflash,format=raw,readonly=on,file=' + os.environ['OVMF_CODE'],
             '-drive', 'if=pflash,format=raw,file=' + str(variables),
             '-device', 'VGA,id=video0', '-device', 'qemu-xhci,id=usbc',

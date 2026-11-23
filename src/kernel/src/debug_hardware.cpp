@@ -548,7 +548,7 @@ struct DpIdleState{
     // Link watch (part of the wake path): after a hot-plug edge or on input,
     // retrain the GOP's link if the head is active but the link is down
     // (KVM switch-back, monitor replug). Rate-limited, capped retries.
-    bool watch=false,sinkPresent=false,linkCheckPending=false,linkCheckLog=false;
+    bool watch=false,sinkPresent=false,linkCheckPending=false,linkCheckLog=false,linkCheckForce=false;
     uint64_t lastLinkCheckMs=0,edgeMs=0;
     uint8_t recheckStage=3; // after a hotplug edge: re-checks at +1 s, +3 s, +10 s
     uint32_t linkRetrains=0,linkFails=0,hotplugs=0;
@@ -654,15 +654,17 @@ void DpIdleWorker(void*){
             static const uint32_t recheck[3]={1000,3000,10000};
             if(sink&&!g_dpIdle.blanked){
                 if(g_dpIdle.recheckStage<3&&now-g_dpIdle.edgeMs>=recheck[g_dpIdle.recheckStage]){
-                    ++g_dpIdle.recheckStage;g_dpIdle.linkCheckPending=true;g_dpIdle.linkCheckLog=true;}
+                    ++g_dpIdle.recheckStage;g_dpIdle.linkCheckPending=true;g_dpIdle.linkCheckLog=true;
+                    g_dpIdle.linkCheckForce=true;} // post-edge re-checks skip the 2 s rate limit
                 else if(now-g_dpIdle.lastLinkCheckMs>=5000)g_dpIdle.linkCheckPending=true;
             }}
         int action=0;
         // Link watch: at most every 2 s; after 5 failed retrains in a row, every 30 s.
         const uint64_t linkGap=g_dpIdle.linkFails>=5?30000:2000;
         if(g_dpIdle.handTest){}
-        else if(!g_dpIdle.blanked&&g_dpIdle.linkCheckPending&&g_dpIdle.sinkPresent&&now-g_dpIdle.lastLinkCheckMs>=linkGap){
-            action=3;g_dpIdle.linkCheckPending=false;g_dpIdle.lastLinkCheckMs=now;}
+        else if(!g_dpIdle.blanked&&g_dpIdle.linkCheckPending&&g_dpIdle.sinkPresent&&
+                ((g_dpIdle.linkCheckForce&&g_dpIdle.linkFails<5)||now-g_dpIdle.lastLinkCheckMs>=linkGap)){
+            action=3;g_dpIdle.linkCheckPending=false;g_dpIdle.linkCheckForce=false;g_dpIdle.lastLinkCheckMs=now;}
         const bool logCheck=action==3&&g_dpIdle.linkCheckLog;if(action==3)g_dpIdle.linkCheckLog=false;
         else if(g_dpIdle.blanked&&(g_dpIdle.wakeRequested||!g_dpIdle.seconds)){
             if(!g_dpIdle.wakeFails||now-g_dpIdle.lastWakeTryMs>=1000){action=2;g_dpIdle.lastWakeTryMs=now;}}

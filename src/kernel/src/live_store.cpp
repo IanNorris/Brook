@@ -82,7 +82,9 @@ bool LiveStoreBoot(uint8_t* nextDrive)
     if (!part) { KPuts("live store: store partition absent on the boot stick; kconsole session\n"); return false; }
     const uint64_t pages = record.bytes / 4096;
     if (PmmGetFreePageCount() < pages + RamHeadroom / 4096) { KPuts("live store: not enough RAM; kconsole session\n"); return false; }
-    auto base = VmmAllocPages(pages, VMM_WRITABLE | VMM_NO_EXEC, MemTag::Device, KernelPid);
+    // Not device memory: KernelData places the image above 4 GiB first,
+    // keeping low memory for 32-bit DMA engines (see PmmAllocPageAccounted).
+    auto base = VmmAllocPages(pages, VMM_WRITABLE | VMM_NO_EXEC, MemTag::KernelData, KernelPid);
     if (!base) { KPuts("live store: allocation failed; kconsole session\n"); return false; }
     auto* memory = reinterpret_cast<uint8_t*>(base.raw());
     KPrintf("live store: reading %s (offset %lu) %lu MiB into RAM\n", part->name, static_cast<unsigned long>(base0), static_cast<unsigned long>(record.bytes >> 20));
