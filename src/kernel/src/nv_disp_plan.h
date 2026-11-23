@@ -544,6 +544,15 @@ inline void AddExceptionCheck(Plan& p,uint32_t window){
     p.Add(Op::Expect,kRegExcWin,1u<<window,0,0,"no window exception");
     p.Add(Op::Expect,kRegExcOther,1,0,0,"no core exception (0x611854 bit0)");
 }
+// Before a kick: read back through BAR1 the submission's first word, the first word of
+// every 128-byte line it touches and its last word, against the ring image (live
+// flip_4_1000 stalled at a 0x80 line never fetched before). The ring is written once at
+// setup through UC BAR1 pages; each kick still does sfence + the 0x070000 flush.
+inline void AddPushReadback(Plan& p,const Config& c,const Push& ring,uint32_t from,uint32_t put){
+    for(uint32_t off=from;off<put;off=(off|0x7f)+1)
+        p.Add(Op::VramExpect,0,~0u,ring.words[off/4],0,"pushbuffer word visible in VRAM (line start)",c.wndwPushVram+off);
+    if(put>from)p.Add(Op::VramExpect,0,~0u,ring.words[put/4-1],0,"pushbuffer last word visible in VRAM",c.wndwPushVram+put-4);
+}
 inline void AddKickAndWait(Plan& p,const Config& c,uint32_t putBytes,uint32_t handle,uint64_t offset,uint32_t ntfy){
     const uint32_t ch=ChidWndw(c.window);
     if(ntfy!=kNoNtfy)p.Add(Op::VramWrite,0,~0u,kNtfyNotBegun,0,"notifier slot reset NOT_BEGUN",c.syncVram+ntfy);
@@ -673,6 +682,7 @@ inline Err BuildPlan(const Config& c,InstImage& img,Pushes& pushes,Plan& p,uint3
     p.Add(Op::Expect,RegArm(ch,c57e::SET_CONTEXT_DMA_ISO0),~0u,g.winIso,0,"ARM unchanged by connect");
     AddExceptionCheck(p,w);
     p.Begin(Phase::FirstFlip);
+    AddPushReadback(p,c,pushes.wndw,0,pushes.end[0]);
     AddKickAndWait(p,c,pushes.end[0],pushes.handle[0],pushes.offset[0],pushes.ntfy[0]);
     p.Add(Op::Expect,RegArm(ch,c57e::SET_SIZE),~0u,g.winSize,0,"ARM size unchanged");
     p.Add(Op::Expect,RegArm(ch,c57e::SET_PARAMS),~0u,g.winParams,0,"ARM format unchanged");
@@ -683,11 +693,12 @@ inline Err BuildPlan(const Config& c,InstImage& img,Pushes& pushes,Plan& p,uint3
         p.Add(Op::Fence,0,0,0,0,"sfence");
     }
     for(uint32_t i=1;i<=nflips;++i){
+        AddPushReadback(p,c,pushes.wndw,pushes.end[i-1],pushes.end[i]);
         AddKickAndWait(p,c,pushes.end[i],pushes.handle[i],pushes.offset[i],pushes.ntfy[i]);
         if(holdMs)p.Add(Op::Delay,0,0,holdMs*1000,0,"hold");
     }
     p.Begin(Phase::Restore);
-    {const uint32_t k=nflips+1;AddKickAndWait(p,c,pushes.end[k],pushes.handle[k],pushes.offset[k],pushes.ntfy[k]);}
+    {const uint32_t k=nflips+1;AddPushReadback(p,c,pushes.wndw,pushes.end[k-1],pushes.end[k]);AddKickAndWait(p,c,pushes.end[k],pushes.handle[k],pushes.offset[k],pushes.ntfy[k]);}
     p.Add(Op::Expect,RegArm(ch,c57e::SET_CONTEXT_DMA_NOTIFIER),~0u,RestoreVal(c,c57e::SET_CONTEXT_DMA_NOTIFIER),0,"ARM notifier ctxdma = GOP value");
     p.Add(Op::Expect,RegArm(ch,c57e::SET_PRESENT_CONTROL),~0u,RestoreVal(c,c57e::SET_PRESENT_CONTROL),0,"ARM present control = GOP value");
     p.Begin(Phase::Teardown);

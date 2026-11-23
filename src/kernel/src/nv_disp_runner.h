@@ -188,6 +188,8 @@ template<typename B> struct Runner{
         if(st.firstFlipOk&&ph>=Phase::Flip&&ph<=Phase::Teardown&&pushes.count){
             Plan rp;const uint32_t k=pushes.count-1;
             rp.Add(Op::AckException,ch,1u<<cfg.window,0,0,"ack window exception before restore");
+            rp.Add(Op::Write,kRegBar1Flush,~0u,1,0,"BAR1 write flush before the restore kick");
+            rp.Add(Op::PollSoft,kRegBar1Flush,0x2,0,100,"flush done");
             rp.Add(Op::Kick,RegPut(ch),~0u,pushes.end[k],0,"restore submission");
             // Wait for the restore to be fetched AND latched before the abort list trashes
             // the channel (flip_4_1000: the trash discarded a pending restore).
