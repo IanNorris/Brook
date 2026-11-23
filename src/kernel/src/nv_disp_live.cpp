@@ -80,6 +80,10 @@ struct LiveBackend{
 // .bss and construct them on first use (an nv-disp command, under the AUX lock).
 using RunnerT=nvdisp::Runner<LiveBackend>;
 using HeadT=nvdisp::HeadRunner<LiveBackend>;
+// Resident driver (D1): bridge-driven for now (`nv-disp driver ...`); D2/D3 wire it to the
+// compositor and the desktop-start markers. Same .bss + lazy construction as the runners.
+using DriverT=nvdisp::NvDisplayDriver<LiveBackend>;
+alignas(DriverT) uint8_t g_driverStorage[sizeof(DriverT)];
 alignas(RunnerT) uint8_t g_runnerStorage[sizeof(RunnerT)];
 alignas(HeadT) uint8_t g_headStorage[sizeof(HeadT)];
 bool g_runnersBuilt=false;
@@ -87,13 +91,12 @@ void EnsureRunners(){
     if(g_runnersBuilt)return;
     new(g_runnerStorage) RunnerT{};
     new(g_headStorage) HeadT{};
+    new(g_driverStorage) DriverT{};
     g_runnersBuilt=true;
 }
 #define g_runner (*reinterpret_cast<RunnerT*>(g_runnerStorage))
 #define g_head (*reinterpret_cast<HeadT*>(g_headStorage))
-// Resident driver (D1): bridge-driven for now (`nv-disp driver ...`); D2/D3 wire it to the
-// compositor and the desktop-start markers.
-[[clang::require_constant_initialization]] nvdisp::NvDisplayDriver<LiveBackend> g_driver{};
+#define g_driver (*reinterpret_cast<DriverT*>(g_driverStorage))
 bool g_configured=false;
 uint8_t g_vbios[128*1024];bool g_vbiosRead=false;
 constexpr uint32_t kVbiosHash=0xbb33ca0a; // FNV-1a of the first 128 KiB of PROM (offline dump)
