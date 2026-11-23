@@ -21,6 +21,7 @@
 #include "keyboard.h"
 #include "synaptics_touchpad.h"
 #include "synaptics_tap.h"
+#include "ps2_aux_reset.h"
 
 namespace brook {
 uint32_t WmGetAppliedScale();
@@ -695,48 +696,28 @@ void MouseInit()
     WaitWrite();
     outb(0x60, cfg);
 
-    // Reset mouse — sends 0xFF via auxiliary port.
-    // Response: 0xFA (ACK) + 0xAA (self-test) + 0x00 (device ID)
-    // MouseCmd already consumes the ACK; read the remaining two bytes.
-    // A device ACKs within 25 ms (PS/2); with no byte at all after 200 ms
-    // there is no auxiliary device, so skip the self-test wait.
-    WaitWrite();
-    outb(0x64, 0xD4);
-    WaitWrite();
-    outb(0x60, 0xFF);
-    if (!WaitReadMs(200)) {
-        SerialPuts("MOUSE: no reply to reset, aborting\n");
+    // Reset mouse: 0xFF via the auxiliary port; the device answers 0xFA (ACK),
+    // then 0xAA (self-test passed) and 0x00 (device ID). No byte within
+    // 200 ms means no auxiliary device; the self-test itself may take
+    // seconds on a touchpad (bounded by time, ps2_aux_reset.h).
+    struct KernelPs2Io {
+        uint8_t In(uint16_t port) { return inb(port); }
+        void Out(uint16_t port, uint8_t value) { outb(port, value); }
+        uint64_t NowMs() { return ApicTickCount(); }
+        void Pause() { __asm__ volatile("pause"); }
+    } io;
+    const Ps2AuxResetOutcome reset = Ps2AuxResetDevice(io);
+    SerialPrintf("MOUSE: reset response: result=%u self-test=0x%x id=0x%x\n",
+                 static_cast<unsigned>(reset.result), reset.selfTest, reset.deviceId);
+    if (reset.result == Ps2AuxReset::NoDevice) {
+        Ps2AuxDisable(io);
         KPrintf("MOUSE: no PS/2 auxiliary device (no reset reply); mouse unavailable\n");
         return;
     }
-    (void)inb(0x60);     // ACK (0xFA)
-
-    // The self-test response can take up to 500ms. Retry reads, bounded
-    // to one second in total.
-    uint8_t selfTest = 0;
-    const uint64_t selfTestStart = ApicTickCount();
-    for (int retry = 0; retry < 10; retry++)
-    {
-        const uint64_t spent = ApicTickCount() - selfTestStart;
-        if (spent >= 1000 || !WaitReadMs(1000 - spent)) break;
-        uint8_t b = inb(0x60);
-        if (b == 0xAA) { selfTest = b; break; }
-        if (b == 0xFC) { selfTest = b; break; } // self-test failed
-        // 0xFA is a late ACK — skip it
-    }
-
-    uint8_t devId = 0;
-    if (selfTest == 0xAA)
-    {
-        WaitRead();
-        devId = inb(0x60);
-    }
-
-    SerialPrintf("MOUSE: reset response: self-test=0x%x id=0x%x\n", selfTest, devId);
-
-    if (selfTest != 0xAA) {
-        SerialPuts("MOUSE: self-test failed, aborting\n");
-        KPrintf("MOUSE: self-test failed (response=0x%x); mouse unavailable\n", selfTest);
+    if (reset.result != Ps2AuxReset::Ok) {
+        Ps2AuxDisable(io);
+        KPrintf("MOUSE: self-test failed (response=0x%x%s); mouse unavailable\n",
+                reset.selfTest, reset.result == Ps2AuxReset::Timeout ? ", timeout" : "");
         return;
     }
 
