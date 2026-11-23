@@ -46,6 +46,7 @@
 #include "idt.h"
 #include "apic.h"
 #include "spinlock.h"
+#include "xhci_dma_reserve.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 #include "memory/address.h"
@@ -528,23 +529,38 @@ static bool g_dma32=false;
 // init; bump-allocated, not recycled (gone devices keep their buffers).
 static uint8_t* g_dmaReserve=nullptr;
 static uint64_t g_dmaReservePhys=0;
-static uint32_t g_dmaReservePages=0,g_dmaReserveUsed=0;
+static uint32_t g_dmaReservePages=0;
+static XhciDmaReserve<2048> g_dmaReserveMap;
 static SpinLock g_dmaReserveLock;
 static void* AllocDmaReserve(uint32_t pages, uint64_t& outPhys)
 {
     SpinLockAcquire(&g_dmaReserveLock);
     void* ptr=nullptr;
-    if(g_dmaReserve && pages<=g_dmaReservePages-g_dmaReserveUsed){
-        outPhys=g_dmaReservePhys+uint64_t(g_dmaReserveUsed)*4096;
-        ptr=g_dmaReserve+uint64_t(g_dmaReserveUsed)*4096;
-        g_dmaReserveUsed+=pages;
+    const int first=g_dmaReserve?g_dmaReserveMap.alloc(pages):-1;
+    if(first>=0){
+        outPhys=g_dmaReservePhys+uint64_t(first)*4096;
+        ptr=g_dmaReserve+uint64_t(first)*4096;
     }
-    const uint32_t used=g_dmaReserveUsed,total=g_dmaReservePages;
+    const uint32_t used=g_dmaReserveMap.inUse,total=g_dmaReservePages;
     SpinLockRelease(&g_dmaReserveLock);
     if(ptr){memset(ptr,0,uint64_t(pages)*4096);
-        if(used%64<pages||total-used<64)KPrintf("xhci: DMA reserve %u/%u pages used\n",used,total);}
+        if(used%64<pages||total-used<64)KPrintf("xhci: DMA reserve %u/%u pages in use\n",used,total);}
     else KPrintf("xhci: DMA reserve exhausted (%u/%u pages, need %u)\n",used,total,pages);
     return ptr;
+}
+// Return a DMA buffer: reserve pages go back to the reserve map, others to
+// the PMM. Only for buffers the controller no longer references.
+static void FreeDmaBuffer(uint64_t phys, uint32_t pages)
+{
+    if(!phys||!pages)return;
+    if(g_dmaReserve&&phys>=g_dmaReservePhys&&phys<g_dmaReservePhys+uint64_t(g_dmaReservePages)*4096){
+        SpinLockAcquire(&g_dmaReserveLock);
+        const bool ok=g_dmaReserveMap.release(uint32_t((phys-g_dmaReservePhys)/4096),pages);
+        SpinLockRelease(&g_dmaReserveLock);
+        if(!ok)KPrintf("xhci: DMA reserve release refused at %lx (%u pages)\n",static_cast<unsigned long>(phys),pages);
+        return;
+    }
+    for(uint32_t i=0;i<pages;++i)PmmFreePage(PhysicalAddress(phys+uint64_t(i)*4096));
 }
 static void* AllocDmaBufferDirect(uint32_t pages, uint64_t& outPhys, PmmOwner owner);
 static void* AllocDmaBuffer(uint32_t pages, uint64_t& outPhys, PmmOwner owner = PmmOwner::XhciDma)
@@ -1213,13 +1229,14 @@ static int XhciEnableSlot(XhciController& ctrl)
     return static_cast<int>(slotId);
 }
 
-static void XhciDisableSlot(XhciController& ctrl, uint32_t slotId)
+static bool XhciDisableSlot(XhciController& ctrl, uint32_t slotId)
 {
-    if (!slotId) return;
+    if (!slotId) return false;
     const auto token = XhciSubmitCommand(ctrl, 0, 0, TRB_TYPE_DISABLE_SLOT | (slotId << 24));
     Trb completion;
-    if (XhciWaitForEvent(ctrl, TRB_TYPE_CMD_COMPLETION, 1000, &completion, token))
-        ctrl.dcbaa[slotId] = 0;
+    if (!XhciWaitForEvent(ctrl, TRB_TYPE_CMD_COMPLETION, 1000, &completion, token)) return false;
+    ctrl.dcbaa[slotId] = 0;
+    return true;
 }
 
 // Generic command with slot/endpoint fields; returns the completion code.
@@ -3088,6 +3105,36 @@ static const char* XhciDeviceKind(const XhciDevice& dev)
     return "device";
 }
 
+// Detach: return the device's own DMA buffers (contexts, EP0 ring, scratch,
+// HID rings/report buffers) once its slot is disabled, so hot-plug does not
+// exhaust low memory or the reserve. HID rings are unhooked first so the
+// event path can never match a freed page.
+static void XhciReleaseDeviceDma(XhciDevice& dev)
+{
+    const uint32_t ctxSize = CtxEntrySize(*dev.ctrl);
+    const uint32_t inputPages = (ctxSize * 33 + 4095) / 4096, outputPages = (ctxSize * 32 + 4095) / 4096;
+    XhciHidFn* fns[2] = {&dev.kbd, &dev.mouse};
+    const auto saved = IrqSpinLockAcquire(&g_eventRingLock);
+    uint64_t hidRing[2] = {}, hidReport[2] = {};
+    for (unsigned i = 0; i < 2; ++i) {
+        hidRing[i] = fns[i]->ringPhys; hidReport[i] = fns[i]->reportPhys;
+        fns[i]->ring = nullptr; fns[i]->ringPhys = 0; fns[i]->report = nullptr; fns[i]->reportPhys = 0;
+    }
+    IrqSpinLockRelease(&g_eventRingLock, saved);
+    for (unsigned i = 0; i < 2; ++i) { FreeDmaBuffer(hidRing[i], 1); FreeDmaBuffer(hidReport[i], 1); }
+    FreeDmaBuffer(dev.ep0RingPhys, 1); dev.ep0Ring = nullptr; dev.ep0RingPhys = 0;
+    FreeDmaBuffer(dev.inputCtxPhys, inputPages); dev.inputCtx = nullptr; dev.inputCtxPhys = 0;
+    FreeDmaBuffer(dev.outputCtxPhys, outputPages); dev.outputCtx = nullptr; dev.outputCtxPhys = 0;
+    FreeDmaBuffer(dev.scratchPhys, 1); dev.scratch = nullptr; dev.scratchPhys = 0;
+}
+static bool XhciUacOwnsDevice(uint32_t index);
+// Devices other threads may still touch keep their buffers (rare on hot-plug).
+static bool XhciDeviceDmaReleasable(uint32_t index)
+{
+    const auto& d = g_devices[index];
+    return !d.network && !d.isMassStorage && !d.ecm.value && !XhciUacOwnsDevice(index);
+}
+
 static void XhciDeviceGone(uint32_t index)
 {
     auto& dev = g_devices[index];
@@ -3112,7 +3159,7 @@ static void XhciDeviceGone(uint32_t index)
     char path[24]; XhciPathText(dev, path, sizeof(path));
     KPrintf("xhci: c%u p%s %s %04x:%04x disconnected (slot %u)\n", dev.ctrl->index, path,
             XhciDeviceKind(dev), dev.vendorId, dev.productId, dev.slotId);
-    XhciDisableSlot(*dev.ctrl, dev.slotId);
+    if (XhciDisableSlot(*dev.ctrl, dev.slotId) && XhciDeviceDmaReleasable(index)) XhciReleaseDeviceDma(dev);
 }
 
 // ---- HID ------------------------------------------------------------------
@@ -3219,7 +3266,8 @@ static int XhciEnumerate(XhciController& ctrl, int parent, uint8_t port, uint32_
     else if (!XhciConfigureDevice(ctrl, dev)) stage = "configuration";
     if (stage) {
         result.stage = stage; result.cc = dev.lastCc;
-        XhciDisableSlot(ctrl, dev.slotId);
+        // Not yet published: no other thread can reach this device's buffers.
+        if (XhciDisableSlot(ctrl, dev.slotId) || !dev.slotId) XhciReleaseDeviceDma(dev);
         dev.slotId = 0;
         return -1;
     }
@@ -4221,6 +4269,7 @@ struct XhciUacStream {
     uint32_t rate = 0, rateReadback = 0;
 };
 static XhciUacStream g_uac;
+static bool XhciUacOwnsDevice(uint32_t index) { return g_uac.device == index && (g_uac.active || g_uac.running); }
 static constexpr uint32_t UAC_MIX_FRAMES = 8192, UAC_MIX_PRIME = 441; // 186 ms ring, 10 ms prime
 static int16_t g_uacMix[UAC_MIX_FRAMES * 2];
 static bool g_uacAudioRegistered = false;
@@ -4919,7 +4968,7 @@ static int XhciModuleInit()
         for (uint32_t pages : reserveSizes) {
             uint64_t phys = 0;
             if (auto* r = static_cast<uint8_t*>(AllocDmaBufferDirect(pages, phys, PmmOwner::XhciDma))) {
-                g_dmaReservePhys = phys; g_dmaReservePages = pages; g_dmaReserve = r;
+                g_dmaReservePhys = phys; g_dmaReservePages = pages; g_dmaReserveMap.init(pages); g_dmaReserve = r;
                 KPrintf("xhci: DMA reserve %u pages at %lx for hot-plug enumeration\n", pages,
                         static_cast<unsigned long>(phys));
                 break;
