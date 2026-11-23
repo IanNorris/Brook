@@ -92,6 +92,10 @@ template<typename B> struct HeadRunner{
             Line l;l.raw("{\"nv_head1_diff\":\"");l.hex(m);l.raw("\",\"assy\":\"");l.hex(a);l.raw("\",\"arm\":\"");l.hex(c);
             l.raw("\",\"ours\":");l.dec(r.plan.Rewritten(m)?1:0);l.raw("}\n");r.b->emit(l.t);}
         void pause(const char*){}
+        void dump(uint32_t addr,const uint32_t* w,uint32_t n){
+            Line l;l.raw("{\"nv_head1_dump\":\"");l.hex(addr);l.raw("\",\"w\":[");
+            for(uint32_t i=0;i<n;++i){if(i)l.raw(",");l.raw("\"");l.hex(w[i]);l.raw("\"");}
+            l.raw("]}\n");r.b->emit(l.t);}
         bool call(uint32_t id){return id==kCallDpTrain&&r.Train(reg);}
         void log(uint32_t i,const Step& s,uint32_t got,bool ok){
             Line l;l.raw("{\"nv_head1_step\":");l.dec(i);l.raw(",\"list\":\"");l.s(tag);l.raw("\",\"ph\":\"");l.s(HPhaseName(r.PhaseOf(i)));

@@ -268,6 +268,7 @@ struct Core{
     void fence(){} bool expired(uint32_t ms,uint32_t& t){return ++t>ms;}
     void except(uint32_t,uint32_t,uint32_t,uint32_t){} void diff(uint32_t,uint32_t,uint32_t){++diffs;}
     void pause(const char*){++pauses;} void udelay(uint32_t){}
+    void dump(uint32_t,const uint32_t*,uint32_t){}
     void fill(uint64_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t){}
     bool call(uint32_t id){
         if(id!=kCallDpTrain)return false;
@@ -389,6 +390,11 @@ struct HRig{
     ~HRig(){delete r;}
 };
 static void TestHeadRunner(){
+    auto phaseStart=[](HPhase ph){ // stop points from the plan itself
+        static InstImage i2;static HeadPushes h2;static Plan p2;i2=InstImage{};h2=HeadPushes{};p2=Plan{};
+        static Rom own;own=MakeRom();Vbios v=own.V();HeadConfig c;c.base=GopFlipConfig(3840,2160,16384,0xcf,256ull<<20);DpOut d{};
+        assert(ResolveHeadConfig(v,4,c,d));c.pauseAfterModeset=false;assert(BuildHeadPlan(c,i2,h2,p2)==Err::Ok);
+        return p2.phaseBegin[uint32_t(ph)];};
     {HRig g;g.r->Command("enable");assert(g.b.Count("\"nv_head1\":\"refused\"")==1&&g.c.written.empty());
      g.r->Command("preflight");assert(g.r->st.preflightOk&&g.c.written.empty());
      g.r->Command("enable");assert(g.b.Count("step-3 noop/flip must succeed")==1&&g.c.written.empty());
@@ -410,10 +416,14 @@ static void TestHeadRunner(){
      assert((g.c.R(RegChnCtl(0))&0x13)==0x01&&g.c.R(kRegInstTarget)==1&&(g.c.R(0x61d130)&0xf)==0);}
     {HRig g;g.c.sink.deadCr=true;g.r->Command("preflight");g.r->Command("enable skip-step3");
      assert(!g.r->st.live&&g.r->st.aborts==1&&g.b.Count("\"nv_head1_dp\":1,\"cr\":0")==1&&g.c.updates==0);}
-    {HRig g;g.r->Command("preflight");g.r->Command("enable skip-step3 stop 20");     // stop in the VRAM phase
-     assert(g.r->st.paused&&g.r->st.cursor==20);g.r->Command("continue");assert(g.r->st.enabled);
+    {HRig g;g.r->Command("preflight");const uint32_t vs=phaseStart(HPhase::Vram)+1;
+     g.r->Command(("enable skip-step3 stop "+std::to_string(vs)).c_str());           // stop in the VRAM phase
+     assert(g.r->st.paused&&g.r->st.cursor==vs);g.r->Command("continue");assert(g.r->st.enabled);
      g.r->Command("abort");assert(!g.r->st.live&&(g.c.R(0x688340)&0xff)==0);}
-    {HRig g;g.r->Command("preflight");g.r->Command("enable skip-step3 stop 173");  // stop before the modeset kick
+
+    {HRig g;g.r->Command("preflight");
+     const std::string cmd="enable skip-step3 stop "+std::to_string(phaseStart(HPhase::Modeset));
+     g.r->Command(cmd.c_str());                                                       // stop before the modeset kick
      assert(g.r->st.paused);g.c.R(0x680000+0x2068)=0x0004001e;                      // head 0 dirtied behind our back
      g.r->Command("continue");
      assert(g.b.Count("SUPERVISOR FLAGGED HEAD 0")==1&&g.r->st.aborts==1&&!g.r->st.live);
@@ -430,7 +440,7 @@ static void Dump(){
     g_rom=MakeRom();Vbios v=g_rom.V();HeadConfig c;c.base=GopFlipConfig(3840,2160,16384,0xcf,256ull<<20);DpOut d{};
     assert(ResolveHeadConfig(v,4,c,d));c.pauseAfterModeset=false;assert(BuildHeadPlan(c,img,hp,p)==Err::Ok);
     static const char* op[]={"WR","MASK","EXPECT","POLL","POLLSOFT","ACK","VCOPY","VWR","VEXPECT","VPOLL","VPOLLANY","ACKEXC",
-        "PRAMIN","FENCE","KICK","EXPNOT","LOG","COPY","ASSYARM","PAUSE","DELAY","ANDNIF","COPYMASK","CALL","FILL"};
+        "PRAMIN","FENCE","KICK","EXPNOT","LOG","COPY","ASSYARM","PAUSE","DELAY","ANDNIF","COPYMASK","CALL","FILL","PRAMINR","DUMP"};
     auto line=[&](uint32_t i,const Step& s){
         if(s.op==Op::VramCopy||s.op==Op::VramWrite||s.op==Op::VramPoll)printf("%3u %-8s vram %08llx val %08x %s\n",i,op[uint32_t(s.op)],(unsigned long long)s.vram,s.value,s.what);
         else if(s.op==Op::AssyArmDiff)printf("%3u %-8s chid %u mthd %04x..%04x %s\n",i,op[uint32_t(s.op)],s.reg,s.mask,s.value-4,s.what);

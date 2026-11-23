@@ -498,12 +498,10 @@ inline Err BuildHeadPlan(HeadConfig c,InstImage& img,HeadPushes& pushes,Plan& p)
     p.Add(Op::Poll,kRegBar1Flush,0x2,0,kTimeoutMs,"flush done");
     if(c.base.praminCheck){
         p.Add(Op::Write,kRegPraminBase,~0u,uint32_t(c.base.instVram>>16),0,"PRAMIN -> instmem");
-        for(uint32_t s=0;s<kHashEntries;++s)if(img.words[s*2+1]){
-            p.Add(Op::PraminExpect,s*8,uint32_t(Blob::Inst),img.words[s*2],0,"RAMHT handle");
-            p.Add(Op::PraminExpect,s*8+4,uint32_t(Blob::Inst),img.words[s*2+1],0,"RAMHT context");}
-        for(uint32_t k=0;k<6;++k)p.Add(Op::PraminExpect,ObjOffset(0)+k*4,uint32_t(Blob::Inst),img.words[ObjOffset(0)/4+k],0,"sync ctxdma");
-        const uint32_t pb=uint32_t(c.base.corePushVram-c.base.instVram);
-        for(uint32_t k=0;k<pushes.core.count;++k)p.Add(Op::PraminExpect,pb+k*4,uint32_t(Blob::CorePush),pushes.core.words[k],0,"core push word");
+        for(uint32_t s=0;s<kHashEntries;++s)if(img.words[s*2+1])
+            p.Add(Op::PraminRange,s*8,uint32_t(Blob::Inst),2,0,"RAMHT entry",0,s*8);
+        p.Add(Op::PraminRange,ObjOffset(0),uint32_t(Blob::Inst),6,0,"sync ctxdma",0,ObjOffset(0));
+        p.Add(Op::PraminRange,uint32_t(c.base.corePushVram-c.base.instVram),uint32_t(Blob::CorePush),pushes.core.count,0,"core push words",0,0);
         p.Add(Op::Write,kRegPraminBase,~0u,c.base.praminRestore,0,"PRAMIN restored");
     }
     B(HPhase::Instmem);

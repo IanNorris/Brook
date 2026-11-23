@@ -147,6 +147,30 @@ struct RamhtUse{uint32_t chid,handle,objIndex;};
 
 // --------------------------------------------------------------- the plan
 struct Surface{uint64_t vram;uint32_t width,height,pitch,format;};
+// Window state that connecting the channel may reset in ASSY (live 23 Nov: SET_PARAMS
+// read 0xe9 = A1R5G5B5 right after connect, GOP ARM 0xcf). Submission 1 replays every
+// documented C57E method it does not otherwise set, with the value read from ARM when
+// the plan is built, so the first UPDATE re-arms exactly the GOP's state. Data ports
+// (INPUT_SCALER_COEFF_VALUE 0x2ac, EXT_PACKET_DATA 0x39c, CSC0LUT_ENTRY 0x4a8,
+// CSC1LUT_ENTRY 0x588) are excluded; 0x350-0x36c are not in clc57e.h (software
+// methods, never pushed; skipped by the diff).
+constexpr uint16_t kReplayMthds[]={
+    0x20c,0x210,0x214,0x218,                                    // semaphore control/acquire/release/ctxdma
+    0x234,0x238,0x244,0x248,0x24c,0x250,0x254,                  // planes 1-2 pitch, ISO 1-5
+    0x264,0x268,0x26c,0x270,0x274,0x294,                        // OFFSET 1-5, POINT_IN 1
+    0x2a8,0x2ec,0x2f0,0x2f4,0x2f8,0x2fc,0x300,0x304,            // scaler, composition, keys
+    0x340,0x344,0x348,0x34c,0x398,                              // timestamps, ext packet control
+    0x400,0x404,0x408,0x40c,0x410,0x414,0x418,0x41c,0x420,0x424,0x428,0x42c, // FMT coefficients
+    0x440,0x444,0x448,                                          // ILUT
+    0x45c,0x460,0x464,0x468,0x46c,0x470,0x474,0x478,0x47c,0x480,0x484,0x488,0x48c, // CSC00
+    0x4a0,0x4a4,                                                // CSC0LUT control/segment
+    0x4bc,0x4c0,0x4c4,0x4c8,0x4cc,0x4d0,0x4d4,0x4d8,0x4dc,0x4e0,0x4e4,0x4e8,0x4ec, // CSC01
+    0x500,0x508,0x50c,0x510,0x514,0x518,0x51c,0x528,0x52c,      // TMO
+    0x53c,0x540,0x544,0x548,0x54c,0x550,0x554,0x558,0x55c,0x560,0x564,0x568,0x56c, // CSC10
+    0x580,0x584,                                                // CSC1LUT control/segment
+    0x59c,0x5a0,0x5a4,0x5a8,0x5ac,0x5b0,0x5b4,0x5b8,0x5bc,0x5c0,0x5c4,0x5c8,0x5cc, // CSC11
+    0x5d0};                                                     // CLAMP_RANGE
+constexpr uint32_t kReplayCount=sizeof(kReplayMthds)/sizeof(kReplayMthds[0]);
 // Live state the GOP left (survey 4d60b483 / 555a7dbd); preflight checks these.
 struct GopState{
     uint32_t instTarget=0x1, instAddr=0;
@@ -171,6 +195,9 @@ struct Config{
     bool feEnable=false;        // stage A2: 0x610078 |= 1 like tu102_disp_init 240 (restored to 0)
     bool capsCopy=false;        // stage A2: tu102_disp_init caps copies into FE_SW 0x640000 (not restored)
     bool pauseForObserver=false;// first live noop: Pause between window disconnect and instmem off
+    bool replay=true;           // submission 1 replays kReplayMthds with replayVal (ARM values)
+    bool dumpAfterConnect=false;// log the whole window ASSY and ARM blocks right after connect
+    uint32_t replayVal[kReplayCount]{};
     GopState gop{};
 };
 
@@ -312,6 +339,8 @@ enum class Op:uint8_t{
     CopyMask,   // if (!y || (rd(y) & z) == 0): reg `value` = (rd(value) & x) | (rd(reg) & mask) (COPY_NV_REG)
     Call,       // io.call(reg) runs a dynamic step (DP link training); false aborts
     SurfFill,   // io.fill(vram, bytes=value, pitch=mask, colour x, marker colour y, marker lines z)
+    PraminRange,// value words at BAR0 kPramin+reg == blob(mask) words from byte x; got = first bad index
+    Dump,       // read value words from reg and hand them to io.dump (diagnostics; never fails)
 };
 enum class Blob:uint32_t{Inst,WndwPush,CorePush,SyncInit};
 struct Step{Op op;uint32_t reg,mask,value,timeoutMs;uint64_t vram;const char* what;uint32_t x,y,z;};
@@ -363,8 +392,20 @@ inline uint32_t BuildFlip(Push& ring,Ring& r,const Config& c,const Surface& s,ui
     PushWindowFlip(p,s,handle);PushWindowUpdate(p,c.window);
     return RingAppend(ring,r,p);
 }
+// Replay as few headers as possible: consecutive methods share one.
+inline void PushReplay(Push& p,const Config& c){
+    for(uint32_t i=0;i<kReplayCount;){
+        uint32_t j=i+1;while(j<kReplayCount&&kReplayMthds[j]==kReplayMthds[j-1]+4)++j;
+        p.Put(PushHeader(kReplayMthds[i],j-i));for(uint32_t k=i;k<j;++k)p.Put(c.replayVal[k]);
+        i=j;
+    }
+}
+template<typename Rd> inline void ReadReplay(Config& c,Rd rd){
+    for(uint32_t i=0;i<kReplayCount;++i)c.replayVal[i]=rd(RegArm(ChidWndw(c.window),kReplayMthds[i]));
+}
 inline uint32_t BuildFirstFlip(Push& ring,Ring& r,const Config& c){
     Push p;PushWindowNtfy(p,WindowNtfyOffset(c.window,0));
+    if(c.replay)PushReplay(p,c);
     PushWindowImage(p,c.surf[0],kHandleIsoPitch);PushWindowUpdate(p,c.window);
     return RingAppend(ring,r,p);
 }
@@ -526,14 +567,10 @@ inline Err BuildPlan(const Config& c,InstImage& img,Pushes& pushes,Plan& p,uint3
     p.Add(Op::Poll,kRegBar1Flush,0x2,0,kTimeoutMs,"flush done");
     if(c.praminCheck){
         p.Add(Op::Write,kRegPraminBase,~0u,uint32_t(c.instVram>>16),0,"PRAMIN window -> instmem (BAR1 identity check)");
-        for(uint32_t s=0;s<kHashEntries;++s)if(img.words[s*2+1]){
-            p.Add(Op::PraminExpect,s*8,uint32_t(Blob::Inst),img.words[s*2],0,"RAMHT handle word at its VRAM address");
-            p.Add(Op::PraminExpect,s*8+4,uint32_t(Blob::Inst),img.words[s*2+1],0,"RAMHT context word");}
-        for(uint32_t o=0;o<img.objCount;++o)for(uint32_t k=0;k<6;++k)
-            p.Add(Op::PraminExpect,ObjOffset(o)+k*4,uint32_t(Blob::Inst),img.words[ObjOffset(o)/4+k],0,"ctxdma word");
-        const uint32_t pbOff=uint32_t(c.wndwPushVram-c.instVram);
-        for(uint32_t k=0;k<pushes.wndw.count;++k)
-            p.Add(Op::PraminExpect,pbOff+k*4,uint32_t(Blob::WndwPush),pushes.wndw.words[k],0,"pushbuffer word");
+        for(uint32_t s=0;s<kHashEntries;++s)if(img.words[s*2+1])
+            p.Add(Op::PraminRange,s*8,uint32_t(Blob::Inst),2,0,"RAMHT entry (handle, context) at its VRAM address",0,s*8);
+        p.Add(Op::PraminRange,kObjBase,uint32_t(Blob::Inst),img.objCount*kCtxDmaBytes/4,0,"ctxdma objects",0,kObjBase);
+        p.Add(Op::PraminRange,uint32_t(c.wndwPushVram-c.instVram),uint32_t(Blob::WndwPush),pushes.wndw.count,0,"window pushbuffer words",0,0);
         p.Add(Op::Write,kRegPraminBase,~0u,c.praminRestore,0,"PRAMIN window restored");
     }
     p.Begin(Phase::Instmem);
@@ -552,7 +589,12 @@ inline Err BuildPlan(const Config& c,InstImage& img,Pushes& pushes,Plan& p,uint3
     }
     p.Begin(Phase::Window);
     AddChannelInit(p,ch,c.wndwPushVram);
-    p.Add(Op::Expect,RegAssy(ch,c57e::SET_PARAMS),~0u,g.winParams,0,"ASSY kept the GOP window state");
+    // Connect may reset ASSY (live 23 Nov: 0x22c read 0xe9). Every diff is logged;
+    // only methods submission 1 does not rewrite fail the run.
+    if(c.dumpAfterConnect){
+        p.Add(Op::Dump,RegAssy(ch,0x200),0,0x180,0,"window ASSY 0x200-0x7fc after connect");
+        p.Add(Op::Dump,RegArm(ch,0x200),0,0x180,0,"window ARM 0x200-0x7fc after connect");}
+    p.Add(Op::AssyArmDiff,ch,0x200,0x800,0,"after connect: ASSY == ARM, or rewritten by submission 1");
     p.Add(Op::Expect,RegArm(ch,c57e::SET_CONTEXT_DMA_ISO0),~0u,g.winIso,0,"ARM unchanged by connect");
     AddExceptionCheck(p,w);
     p.Begin(Phase::FirstFlip);
@@ -628,7 +670,7 @@ inline void BuildAbort(const Config& c,Phase reached,Plan& p,uint32_t ms=100){
 //   uint32_t blob(Blob b,uint32_t byteOffset); void fence(); bool expired(uint32_t ms,uint32_t& state);
 //   void log(uint32_t index,const Step&,uint32_t got,bool ok);
 //   void diff(uint32_t mthd,uint32_t assy,uint32_t arm); void pause(const char* what);
-//   void udelay(uint32_t us); bool call(uint32_t id);
+//   void udelay(uint32_t us); bool call(uint32_t id); void dump(uint32_t addr,const uint32_t* w,uint32_t n);
 //   void fill(uint64_t vram,uint32_t bytes,uint32_t pitch,uint32_t colour,uint32_t marker,uint32_t lines);
 // Returns `end` on success, else the index of the (first) failing step.
 // bestEffort (abort/quiesce lists) logs a failure and carries on.
@@ -667,6 +709,7 @@ template<typename Io> uint32_t Run(const Plan& p,uint32_t begin,uint32_t end,Io&
             for(uint32_t m=s.mask;m<s.value;m+=4){
                 if(m==0x200)continue;                                     // UPDATE trigger
                 if(s.reg!=kChidCore&&m==0x208)continue;                   // window GET_LINE (live)
+                if(s.reg!=kChidCore&&m>=0x350&&m<0x370)continue;          // window: not in clc57e.h (SW methods)
                 if(s.reg==kChidCore&&m>=0x220&&m<0x240)continue;          // core GET_RG_SCAN_LINE (live)
                 const uint32_t a=io.rd(RegAssy(s.reg,m)),b=io.rd(RegArm(s.reg,m));
                 if(a!=b){io.diff(m,a,b);if(!p.Rewritten(m)){ok=false;if(!got)got=m;}}
@@ -680,6 +723,13 @@ template<typename Io> uint32_t Run(const Plan& p,uint32_t begin,uint32_t end,Io&
             break;
         case Op::Call:ok=io.call(s.reg);break;
         case Op::SurfFill:io.fill(s.vram,s.value,s.mask,s.x,s.y,s.z);break;
+        case Op::PraminRange:
+            for(uint32_t k=0;k<s.value;++k)if(io.rd(kPramin+s.reg+k*4)!=io.blob(Blob(s.mask),s.x+k*4)){ok=false;got=k;break;}
+            break;
+        case Op::Dump:{uint32_t w[8];
+            for(uint32_t k=0;k<s.value;k+=8){const uint32_t n=s.value-k<8?s.value-k:8;
+                for(uint32_t j=0;j<n;++j)w[j]=io.rd(s.reg+(k+j)*4);io.dump(s.reg+k*4,w,n);}
+            break;}
         }
         io.log(i,s,got,ok);
         if(!ok){if(!bestEffort)return i;if(firstFail==end)firstFail=i;}
