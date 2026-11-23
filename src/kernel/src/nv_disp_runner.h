@@ -46,6 +46,10 @@ struct RunState{
 // Constant-initialisable (kernel globals have no .init_array): set `b` before use.
 template<typename B> struct Runner{
     B* b=nullptr;Config base{};RunState st{};
+    // Resident driver mode (nv_disp_driver.h): quiet = only failures are emitted (the
+    // driver keeps counts); externalRing = the driver's flipper owns the window ring, so
+    // the auto-abort must not kick the plan's prebuilt restore offset.
+    bool quiet=false,externalRing=false;uint32_t quietSteps=0,quietDiffs=0;
     InstImage img{};Pushes pushes{};Plan plan{},abort{};Config cfg{};
 
     // ---- JSON helpers (fixed buffer, no allocation)
@@ -94,7 +98,7 @@ template<typename B> struct Runner{
             Line l;l.raw("{\"nv_disp_exc\":1,\"chid\":");l.dec(chid);l.raw(",\"stat\":\"");l.hex(s);l.raw("\",\"data\":\"");
             l.hex(d);l.raw("\",\"code\":\"");l.hex(c);l.raw("\",\"mthd\":\"");l.hex((s&0xfff)<<2);l.raw("\",\"type\":");l.dec((s>>12)&7);
             l.raw("}\n");r.b->emit(l.t);}
-        void diff(uint32_t m,uint32_t a,uint32_t c){
+        void diff(uint32_t m,uint32_t a,uint32_t c){if(r.quiet){++r.quietDiffs;return;}
             Line l;l.raw("{\"nv_disp_diff\":\"");l.hex(m);l.raw("\",\"assy\":\"");l.hex(a);l.raw("\",\"arm\":\"");l.hex(c);
             l.raw("\",\"rewritten\":");l.dec(r.plan.Rewritten(m)?1:0);l.raw("}\n");r.b->emit(l.t);}
         void pause(const char*){}
@@ -106,6 +110,7 @@ template<typename B> struct Runner{
             l.raw("]}\n");r.b->emit(l.t);}
         bool call(uint32_t,uint32_t){return false;} // no dynamic steps in step 3
         void log(uint32_t i,const Step& s,uint32_t got,bool ok){
+            if(r.quiet&&ok){++r.quietSteps;pollUs=0;return;}
             Line l;l.raw("{\"nv_disp_step\":");l.dec(i);l.raw(",\"list\":\"");l.s(tag);l.raw("\",\"op\":\"");l.s(OpName(s.op));
             l.raw("\",\"reg\":\"");l.hex(s.op==Op::VramCopy||s.op==Op::VramWrite||s.op==Op::VramPoll||s.op==Op::VramPollAny||s.op==Op::SurfFill?s.vram:s.reg);
             l.raw("\",\"exp\":\"");l.hex(s.value);l.raw("\",\"got\":\"");l.hex(got);l.raw("\",\"ok\":");l.dec(ok?1:0);
@@ -192,7 +197,7 @@ template<typename B> struct Runner{
             abort=Plan{};AddGetStallDiag(abort,cfg,PrevPut(i),fs.value);abort.End(); // RunAbort rebuilds it
             Io io{*this,abort,"diag"};(void)brook::nvdisp::Run(abort,0,abort.count,io,true);
         }
-        if(st.firstFlipOk&&ph>=Phase::Flip&&ph<=Phase::Teardown&&pushes.count){
+        if(!externalRing&&st.firstFlipOk&&ph>=Phase::Flip&&ph<=Phase::Teardown&&pushes.count){
             Plan rp;const uint32_t k=pushes.count-1;
             rp.Add(Op::AckException,ch,1u<<cfg.window,0,0,"ack window exception before restore");
             rp.Add(Op::Write,kRegBar1Flush,~0u,1,0,"BAR1 write flush before the restore kick");

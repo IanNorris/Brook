@@ -36,6 +36,9 @@ template<typename B> struct HeadRunner{
     B* b=nullptr;
     HeadConfig cfg{};DpOut dpout{};Vbios vb{};uint32_t auxCh=4;bool resolved=false;
     InstImage img{};HeadPushes pushes{};Plan plan{},abort{};HeadState st{};DpTrainResult tr{};HeadWindow win{};
+    // Resident driver mode: quiet = only failures emitted; coexist = enable while step 3 is
+    // live (shared instmem); winExternal = the driver's flipper owns window 2's ring.
+    bool quiet=false,coexist=false,winExternal=false;uint32_t quietSteps=0,quietDiffs=0;
 
     struct Line{char t[320];uint32_t n=0;
         void s(const char* x){while(*x&&n+2<sizeof(t)){char ch=*x++;t[n++]=ch=='"'||ch=='\\'?'\'':ch;}t[n]=0;}
@@ -77,7 +80,7 @@ template<typename B> struct HeadRunner{
             Line l;l.raw("{\"nv_head1_exc\":1,\"chid\":");l.dec(chid);l.raw(",\"stat\":\"");l.hex(es);l.raw("\",\"data\":\"");l.hex(d);
             l.raw("\",\"code\":\"");l.hex(c);l.raw("\",\"mthd\":\"");l.hex((es&0xfff)<<2);l.raw("\",\"type\":");l.dec((es>>12)&7);
             l.raw("}\n");r.b->emit(l.t);}
-        void diff(uint32_t m,uint32_t a,uint32_t c){
+        void diff(uint32_t m,uint32_t a,uint32_t c){if(r.quiet){++r.quietDiffs;return;}
             Line l;l.raw("{\"nv_head1_diff\":\"");l.hex(m);l.raw("\",\"assy\":\"");l.hex(a);l.raw("\",\"arm\":\"");l.hex(c);
             l.raw("\",\"ours\":");l.dec(r.plan.Rewritten(m)?1:0);l.raw("}\n");r.b->emit(l.t);}
         void pause(const char*){}
@@ -98,6 +101,7 @@ template<typename B> struct HeadRunner{
                 (void)SupervisorFlush(*this,r.cfg,id==kCallSuperFlushVpll,ms?ms:100,r.st.openStage);return true;}
             return false;}
         void log(uint32_t i,const Step& s,uint32_t got,bool ok){
+            if(r.quiet&&ok){++r.quietSteps;return;}
             Line l;l.raw("{\"nv_head1_step\":");l.dec(i);l.raw(",\"list\":\"");l.s(tag);l.raw("\",\"ph\":\"");l.s(HPhaseName(r.PhaseOf(i)));
             l.raw("\",\"reg\":\"");l.hex(s.op==Op::VramCopy||s.op==Op::VramWrite||s.op==Op::VramPoll?s.vram:s.reg);
             l.raw("\",\"exp\":\"");l.hex(s.value);l.raw("\",\"got\":\"");l.hex(got);l.raw("\",\"ok\":");l.dec(ok?1:0);
@@ -143,7 +147,7 @@ template<typename B> struct HeadRunner{
         return put==pushes.replayEnd?Kicked::Replay:put==pushes.rungEnd?Kicked::Rung:put==pushes.enableEnd?Kicked::Enable:
                put==pushes.disableEnd?Kicked::Disable:Kicked::None;}
     void DpIdle(bool suspend){if(suspend!=st.dpIdleHeld){b->dpIdleSuspend(suspend);st.dpIdleHeld=suspend;}}
-    static bool ReadOnly(Op o){return o==Op::Expect||o==Op::ExpectNot||o==Op::Log||o==Op::AssyArmDiff||o==Op::ExpectVpll||o==Op::ExpectSoft;}
+    static bool ReadOnly(Op o){return o==Op::Expect||o==Op::ExpectOr||o==Op::ExpectNot||o==Op::Log||o==Op::AssyArmDiff||o==Op::ExpectVpll||o==Op::ExpectSoft;}
     void Status(){
         Line l;l.raw("{\"nv_head1_status\":1,\"preflight_ok\":");l.dec(st.preflightOk);l.raw(",\"live\":");l.dec(st.live);
         l.raw(",\"enabled\":");l.dec(st.enabled);l.raw(",\"soft_warnings\":");l.dec(st.softWarnings);l.raw(",\"window\":");l.dec(st.windowLive);l.raw(",\"paused\":");l.dec(st.paused);l.raw(",\"cursor\":");l.dec(st.cursor);
@@ -152,7 +156,7 @@ template<typename B> struct HeadRunner{
         l.raw("\",\"watermark\":");l.dec(cfg.sf.watermark);l.raw("}\n");b->emit(l.t);
     }
     bool Busy(){if(st.live||st.paused){Msg("refused","a head-1 run is live");return true;}
-        if(b->step3Busy()){Msg("refused","a step-3 run is live");return true;}return false;}
+        if(!coexist&&b->step3Busy()){Msg("refused","a step-3 run is live");return true;}return false;}
     void Preflight(){
         if(Busy()||!Build())return;
         const uint32_t end=plan.phaseBegin[uint32_t(HPhase::Vram)];
@@ -238,7 +242,7 @@ template<typename B> struct HeadRunner{
         const uint32_t ch=ChidWndw(cfg.window);
         win.initCtl=b->rd(RegChnCtl(ch));
         win.initPb[0]=b->rd(RegPbLo(ch));win.initPb[1]=b->rd(RegPbHi(ch));win.initPb[2]=b->rd(RegPbValid(ch));win.initPb[3]=b->rd(RegPbClient(ch));
-        win.win0Iso=b->rd(RegArm(ChidWndw(0),c57e::SET_CONTEXT_DMA_ISO0));
+        win.win0Iso=b->rd(RegArm(ChidWndw(0),c57e::SET_CONTEXT_DMA_ISO0));win.checkWin0Iso=!coexist;
         for(uint32_t i=0;i<kReplayCount;++i)win.replayVal[i]=b->rd(RegArm(ChidWndw(0),kReplayMthds[i])); // GOP's working window state
         BuildHeadWindowPushes(cfg,win);
         if(win.ring.overflow){Msg("error","window push overflow");return;}
@@ -257,9 +261,17 @@ template<typename B> struct HeadRunner{
         if(at!=abort.count||io.reg.violation){Msg("failed","hide: window abort");WindowAbort(2000);return st.windowLive==false;}
         st.windowLive=false;Msg("hidden","window 2 off, channel restored; head 1 still enabled");Status();return true;
     }
+    // Driver: the flipper already pushed ISO 0; disconnect and restore the channel.
+    bool WindowFini(){
+        if(!st.windowLive)return true;
+        abort=Plan{};BuildHeadWindowHide(cfg,win,abort,false);
+        Io io{*this,"window-fini"};const uint32_t at=Run(abort,0,abort.count,io);
+        if(at!=abort.count||io.reg.violation){Msg("failed","window fini: window abort");WindowAbort(2000);return false;}
+        st.windowLive=false;return true;
+    }
     void WindowAbort(uint32_t ms){
         if(!st.windowLive)return;
-        abort=Plan{};BuildHeadWindowAbort(cfg,win,abort,ms);
+        abort=Plan{};BuildHeadWindowAbort(cfg,win,abort,ms,!winExternal);
         Io io{*this,"window-abort"};(void)Run(abort,0,abort.count,io,true);
         st.windowLive=false;
     }

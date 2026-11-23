@@ -8,6 +8,7 @@
 #include "nv_disp_live.h"
 #include "nv_disp_runner.h"
 #include "nv_disp_head_runner.h"
+#include "nv_disp_driver.h"
 #include "pci.h"
 #include "acpi.h"
 #include "boot_resource_map.h"
@@ -73,6 +74,9 @@ struct LiveBackend{
 [[clang::require_constant_initialization]] LiveBackend g_backend{};
 [[clang::require_constant_initialization]] nvdisp::Runner<LiveBackend> g_runner{};
 [[clang::require_constant_initialization]] nvdisp::HeadRunner<LiveBackend> g_head{};
+// Resident driver (D1): bridge-driven for now (`nv-disp driver ...`); D2/D3 wire it to the
+// compositor and the desktop-start markers.
+[[clang::require_constant_initialization]] nvdisp::NvDisplayDriver<LiveBackend> g_driver{};
 bool g_configured=false;
 uint8_t g_vbios[128*1024];bool g_vbiosRead=false;
 constexpr uint32_t kVbiosHash=0xbb33ca0a; // FNV-1a of the first 128 KiB of PROM (offline dump)
@@ -86,6 +90,7 @@ void NvDispQuiesceForReset(){
     const uint64_t end=g_backend.nowUs()+100000;
     while(!(held=SpinLockTryAcquire(lock))&&g_backend.nowUs()<end)__asm__ volatile("pause");
     g_backend.toSerial=true;
+    if(g_driver.b)g_driver.Quiesce();   // flipped outputs back to the GOP state first
     g_runner.Quiesce();
     g_head.Quiesce();
     g_backend.toSerial=false;
@@ -159,6 +164,16 @@ bool NvDispHandle(const char* command){
     const bool headLive=g_head.st.live||g_head.st.paused;
     if(!g_configured||(!g_runner.st.live&&!g_runner.st.paused&&!headLive)){if(!Configure()){SpinLockRelease(lock);return true;}}
     const char* rest=command+n;while(*rest==' ')++rest;
+    if(strncmp(rest,"driver",6)==0&&(rest[6]==0||rest[6]==' ')){
+        g_driver.b=&g_backend;g_driver.r0=&g_runner;g_driver.r1=&g_head;
+        if(!headLive&&!g_driver.Live(1)&&!ConfigureHead()){SpinLockRelease(lock);return true;}
+        g_driver.Command(rest+6);
+        SpinLockRelease(lock);return true;
+    }
+    if(g_driver.AnyLive()&&strncmp(rest,"status",6)!=0&&strncmp(rest,"head1 status",12)!=0){
+        DebugChannelSend("{\"nv_disp\":\"refused\",\"msg\":\"the resident driver owns the display (nv-disp driver down)\"}\n");
+        SpinLockRelease(lock);return true;
+    }
     if(strncmp(rest,"head1",5)==0&&(rest[5]==0||rest[5]==' ')){
         if(!headLive&&!ConfigureHead()){SpinLockRelease(lock);return true;}
         g_head.Command(rest+5);
