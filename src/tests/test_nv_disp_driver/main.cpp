@@ -24,7 +24,7 @@ struct DRig{
         assert((c.R(RegChnCtl(1))&0x13)==0x01&&c.R(RegPbLo(1))==1);
         assert(c.R(RegArm(kChidCore,c57d::HeadRasterSize(0)))==r0->base.gop.headRaster);}
     void Flip(uint32_t o,uint32_t n){for(uint32_t i=0;i<n;++i){const int8_t bb=d->Back(o);assert(bb>=0&&d->Present(o,bb)>=0);
-        for(int k=0;k<100&&(d->f[o].state==FlipState::Armed||d->f[o].queued>=0);++k)d->Tick();
+        for(int k=0;k<5000&&(d->f[o].state==FlipState::Armed||d->f[o].queued>=0);++k)d->Tick();
         assert(d->f[o].state==FlipState::Idle&&d->f[o].front==bb);}}
 };
 static uint32_t Errors(const HBackend& b){return uint32_t(b.Count("\"ok\":0"));}
@@ -75,6 +75,9 @@ static void TestBothOutputs(){
     {DRig g;g.d->Command("up both");assert(g.d->AnyLive()&&g.b.Count("\"nv_driver_status\"")==1);
      g.d->Command("bench 0 30");assert(g.b.Count("\"completed\":30")==1);
      g.d->Command("bench 1 30");assert(g.b.Count("\"completed\":30")==2);
+     g.d->Command("probe 1 8");assert(g.b.Count("\"nv_driver_probe\":1")==8&&g.b.Count("\"nv_driver_hist\":1")>=1);
+     assert(g.d->f[1].st.latHist[0]+g.d->f[1].st.latHist[1]+g.d->f[1].st.latHist[2]+g.d->f[1].st.latHist[3]+g.d->f[1].st.latHist[4]+
+            g.d->f[1].st.latHist[5]+g.d->f[1].st.latHist[6]==g.d->f[1].st.completes);
      g.d->Command("flip 9 0");assert(g.b.Count("\"usage\"")==1);
      g.d->Command("down all");assert(!g.d->AnyLive());g.Gop0();
      for(auto& l:g.b.lines)assert(l.size()<318&&l.back()=='\n');              // no truncated status lines
@@ -125,6 +128,14 @@ static void TestPacing(){
 }
 // D2 age repair: B is stale at bring-up (full copy); afterwards each buffer gets this
 // frame's damage plus the previous frame's.
+// Completion waits for the LOADV counter (the armed state reaching the scanout); a
+// counter that never moves falls back to armed-state completion and is flagged.
+static void TestLoadv(){
+    {DRig g;assert(g.d->Up0());g.Flip(0,10);assert(g.d->f[0].loadvLive&&g.d->f[0].st.completes==10);assert(g.d->Down0());}
+    {DRig g;g.c.loadvFrozen=true;assert(g.d->Up0());g.d->f[0].paced=false;g.Flip(0,1);
+     for(int k=0;k<200000&&g.d->f[0].state==FlipState::Armed;++k)g.d->Tick();
+     g.Flip(0,3);assert(!g.d->f[0].loadvLive&&g.d->f[0].loadvStuck==1&&g.d->f[0].fail==FlipFail::None);assert(g.d->Down0());}
+}
 static void TestAgeRepair(){
     AgeRepair a;a.Reset();std::vector<brook::DamageRect> got;
     auto cp=[&](const brook::DamageRect& r){got.push_back(r);};
@@ -145,6 +156,6 @@ static void TestVblankCounter(){
     assert(g.d->Down0());
 }
 int main(){
-    TestOutput0();TestBothOutputs();TestFailures();TestPacing();TestAgeRepair();TestVblankCounter();
+    TestOutput0();TestBothOutputs();TestFailures();TestPacing();TestLoadv();TestAgeRepair();TestVblankCounter();
     puts("test_nv_disp_driver: ok");return 0;
 }

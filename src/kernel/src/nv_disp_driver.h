@@ -166,7 +166,7 @@ template<typename B> struct NvDisplayDriver{
             l.raw(",\"replaced\":");l.dec(f[o].st.replaced);l.raw(",\"wraps\":");l.dec(f[o].st.wraps);l.raw(",\"lat_us\":");l.dec(f[o].st.lastLatUs);
             l.raw(",\"max_lat_us\":");l.dec(f[o].st.maxLatUs);l.raw(",\"vblanks\":");l.dec(f[o].st.vblanks);l.raw(",\"frames\":");l.dec(f[o].st.frames);
             l.raw(",\"latch_blank\":");l.dec(f[o].st.latchBlank);l.raw(",\"latch_active\":");l.dec(f[o].st.latchActive);
-            l.raw(",\"paced\":");l.dec(f[o].st.paced);l.raw(",\"interval\":");l.dec(f[o].interval);l.raw(",\"fail\":");l.dec(uint32_t(f[o].fail));
+            l.raw(",\"paced\":");l.dec(f[o].st.paced);l.raw(",\"interval\":");l.dec(f[o].interval);l.raw(",\"loadv\":");l.dec(f[o].loadvLive?1:0);l.raw(",\"fail\":");l.dec(uint32_t(f[o].fail));
             l.raw(",\"ups\":");l.dec(ups[o]);l.raw(",\"downs\":");l.dec(downs[o]);l.raw(",\"failures\":");l.dec(failures[o]);l.raw("}\n");b->emit(l.t);}
     }
     // n flips alternating the back buffer, each waited for (paced: one per frame unless
@@ -184,7 +184,25 @@ template<typename B> struct NvDisplayDriver{
         l.raw(",\"ms\":");l.dec(uint32_t((b->nowUs()-tb)/1000));
         l.raw(",\"last_lat_us\":");l.dec(f[o].st.lastLatUs);l.raw(",\"max_lat_us\":");l.dec(f[o].st.maxLatUs);l.raw(",\"frames\":");l.dec(f[o].st.frames);
         l.raw(",\"latch_blank\":");l.dec(f[o].st.latchBlank);l.raw(",\"latch_active\":");l.dec(f[o].st.latchActive);l.raw("}\n");b->emit(l.t);
-        Status();
+        Hist(o);Status();
+    }
+    void Hist(uint32_t o){
+        const auto& s=f[o].st;Line l;l.raw("{\"nv_driver_hist\":");l.dec(o);
+        l.raw(",\"vtotal\":");l.dec(f[o].vtotal);l.raw(",\"vblank_end\":");l.dec(f[o].vblankEnd);l.raw(",\"vblank_start\":");l.dec(f[o].vblankStart);
+        l.raw(",\"lat_avg_us\":");l.dec(s.completes?uint32_t(s.latSumUs/s.completes):0);
+        l.raw(",\"lat\":[");for(uint32_t i=0;i<7;++i){if(i)l.raw(",");l.dec(s.latHist[i]);}
+        l.raw("],\"line\":[");for(uint32_t i=0;i<8;++i){if(i)l.raw(",");l.dec(s.lineHist[i]);}l.raw("]}\n");b->emit(l.t);
+    }
+    // n flips (<= 32) with raw samples: scanline at arm and at completion, latency, and the
+    // head-timing event bits at completion (LOADV/LAST_DATA bits 0-1, VBLANK bit 2).
+    void Probe(uint32_t o,uint32_t n){
+        if(!Live(o)){Msg("refused","output not live");return;}
+        auto& fl=f[o];fl.probeCount=0;fl.probeWant=n>fl.kProbeMax?fl.kProbeMax:n;
+        Bench(o,fl.probeWant);
+        for(uint32_t i=0;i<fl.probeCount;++i){const auto& s=fl.probe[i];
+            Line l;l.raw("{\"nv_driver_probe\":");l.dec(o);l.raw(",\"i\":");l.dec(i);l.raw(",\"arm_line\":");l.dec(s.armLine);
+            l.raw(",\"done_line\":");l.dec(s.doneLine);l.raw(",\"lat_us\":");l.dec(s.latUs);l.raw(",\"evt\":\"");l.hex(s.evtAfter);l.raw("\"}\n");b->emit(l.t);}
+        fl.probeWant=0;
     }
     static bool Word(const char*& p,const char* w){
         while(*p==' ')++p;const char* q=p;while(*w){if(*q!=*w)return false;++q;++w;}
@@ -209,6 +227,10 @@ template<typename B> struct NvDisplayDriver{
             if(o==0&&out0External){Msg("refused","the desktop presents on output 0");return;}
             Bench(o,v);return;}
         if(Word(p,"tick")){Tick();Status();return;}
+        if(Word(p,"probe")){if(!Num(p,o)||!Num(p,v)||o>=kDriverOutputs||!v){Msg("usage","probe <o> <1..32>");return;}
+            if(o==0&&out0External){Msg("refused","the desktop presents on output 0");return;}
+            Probe(o,v);return;}
+        if(Word(p,"hist")){if(!Num(p,o)||o>=kDriverOutputs){Msg("usage","hist <o>");return;}Hist(o);return;}
         // Experiments (design §7): pacing on/off, MIN_PRESENT_INTERVAL, acking all head-timing
         // event bits. Try `interval 1 1` on head 1 first: a hung MPI wait only loses head 1.
         if(Word(p,"pace")){if(!Num(p,o)||!Num(p,v)||o>=kDriverOutputs||v>1){Msg("usage","pace <o> <0|1>");return;}f[o].paced=v;Status();return;}

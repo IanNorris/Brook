@@ -20,12 +20,23 @@ enum class FlipFail:uint8_t{None,Guard,Exception,Timeout,Flush,Bounds};
 // seen (live a087416d: only 5 over 300 flips, so it does not latch every frame unserviced).
 // latchBlank/latchActive: the scanline when a completion was first seen, inside the
 // vertical blank (>= active height) or in the active area (tear test).
+// latHist: completion latency (arm -> ARM shows the submission), bins <100us, <1ms, <4ms,
+// <8ms, <12ms, <17ms, >=17ms. "ARM" is the armed state; whether the scanout swaps then or
+// at the next LOADV is what the latency and line histograms show. lineHist: the scanline
+// at completion in 8 bins of the vertical total. Blank = outside [blank end, blank start]
+// (HEAD_SET_RASTER_BLANK_END/START, ARM), as drm/nouveau classify scanout position.
 struct FlipStats{uint32_t presents=0,completes=0,replaced=0,wraps=0,lastLatUs=0,maxLatUs=0,latchBlank=0,latchActive=0,lastLatchLine=0,paced=0;
-                 uint64_t vblanks=0,frames=0;};
+                 uint64_t vblanks=0,frames=0,latSumUs=0;uint32_t latHist[7]{},lineHist[8]{};};
 
 constexpr uint32_t RegHeadTimingEvt(uint32_t h){return 0x611800+h*4;} // EVT_STAT_HEAD_TIMING, bit 2 VBLANK (W1C)
 constexpr uint32_t kEvtVblank=0x4;
 constexpr uint32_t RegRgPos(uint32_t h){return 0x616330+h*0x800;} // vline 15:0 (gv100_head_rgpos)
+// NV_PDISP_POSTCOMP_HEAD_LOADV_COUNTER (dev_disp.h v03_00): counts LOADV, the vblank-time
+// load of the ARMED state (0x690800+ is ARMED_BASEADR, not active) into the active state.
+// Live 11b0ec05: ARM matched the submission in microseconds (latch_active 120/120), which
+// is the armed state; the scanout switches at the next LOADV. Completion therefore waits
+// for this counter to move past its value at arm time.
+constexpr uint32_t RegLoadvCounter(uint32_t h){return 0x61611c+h*0x800;}
 
 // Backend: rd, wr, vrd, vwr, fence, nowUs, relax (as the runners' backends).
 template<typename B> struct NvWindowFlipper{
@@ -44,11 +55,18 @@ template<typename B> struct NvWindowFlipper{
     bool paced=true;         // at most one completed flip per scanned frame
     bool ackAllEvt=false;    // experiment: also W1C LOADV / LAST_DATA (bits 0-1) when polling
     uint32_t lastVline=0;uint64_t latchFrame=~0ull;
+    uint32_t vtotal=0,vblankEnd=0,vblankStart=0;     // from the head's ARM raster (Init)
+    // probe: per-flip raw samples for the latch question (driver `probe`).
+    struct Sample{uint32_t armLine,doneLine,latUs,evtAfter;};
+    static constexpr uint32_t kProbeMax=32;Sample probe[kProbeMax]{};uint32_t probeCount=0,probeWant=0;
 
     void Init(B* backend,uint32_t window_,uint32_t head_,uint64_t ringVram,uint32_t putBytes,const Surface& a,const Surface& bb,int8_t frontBuf){
         b=backend;window=window_;chid=ChidWndw(window_);head=head_;ring=ringVram;put=putBytes;
         surf[0]=a;surf[1]=bb;front=frontBuf;armed=queued=-1;state=FlipState::Idle;fail=FlipFail::None;st=FlipStats{};
-        lastVline=0;latchFrame=~0ull;}
+        lastVline=0;latchFrame=~0ull;probeCount=probeWant=0;
+        vtotal=b->rd(RegArm(kChidCore,0x2064+head_*0x400))>>16;
+        vblankEnd=b->rd(RegArm(kChidCore,0x206c+head_*0x400))>>16;vblankStart=b->rd(RegArm(kChidCore,0x2070+head_*0x400))>>16;}
+    bool InBlank(uint32_t v)const{return vblankStart>vblankEnd?(v<vblankEnd||v>vblankStart):v>=surf[0].height;}
     bool Live()const{return state==FlipState::Idle||state==FlipState::Armed;}
     bool Allowed(uint32_t a)const{return a==RegPut(chid)||a==kRegBar1Flush||a==RegHeadTimingEvt(head);}
     void Fail(FlipFail f){if(state!=FlipState::Failed){fail=f;state=FlipState::Failed;}}
@@ -81,8 +99,13 @@ template<typename B> struct NvWindowFlipper{
         put+=bytes;Wr(RegPut(chid),put);
         return state!=FlipState::Failed;
     }
+    uint32_t armLine=0,armLoadv=0;
+    bool loadvLive=true;   // false if the counter never moves (then: armed-state completion, flagged)
+    uint32_t loadvStuck=0;
     bool ArmWords(const uint32_t* w,uint32_t n,uint32_t iso,uint32_t offset){
+        armLoadv=b->rd(RegLoadvCounter(head));
         if(!Kick(w,n))return false;
+        armLine=b->rd(RegRgPos(head))&0xffff;
         armedIso=iso;armedTarget=offset;armedAtUs=b->nowUs();state=FlipState::Armed;return true;}
     void Arm(int8_t buf){
         Push p;PushWindowFlip(p,surf[buf],handle,interval);PushWindowUpdate(p,window);
@@ -98,20 +121,32 @@ template<typename B> struct NvWindowFlipper{
         if(state==FlipState::Armed){++st.presents;if(queued>=0)++st.replaced;queued=buf;return 1;}
         return -1;
     }
+    bool Armed()const{return true;}
     bool Complete(){
-        return b->rd(RegGet(chid))==put&&b->rd(RegArm(chid,c57e::SET_OFFSET0))==armedTarget&&
+        const bool armedOk=b->rd(RegGet(chid))==put&&b->rd(RegArm(chid,c57e::SET_OFFSET0))==armedTarget&&
                b->rd(RegArm(chid,c57e::SET_CONTEXT_DMA_ISO0))==armedIso&&
-               (b->rd(RegChnStatus(chid))&(kWinMethodExecBusy|0xf00))==0x100;}
+               (b->rd(RegChnStatus(chid))&(kWinMethodExecBusy|0xf00))==0x100;
+        if(!armedOk)return false;
+        if(!loadvLive)return true;
+        if(b->rd(RegLoadvCounter(head))!=armLoadv)return true;           // loaded at a vblank: on screen
+        // A counter that never moves (>= 3 frames' time armed) is not trusted: fall back.
+        if(b->nowUs()-armedAtUs>60000){loadvLive=false;++loadvStuck;return true;}
+        return false;}
     // Non-blocking; call every compositor loop / driver tick.
     FlipState Poll(){
         if(state!=FlipState::Armed)return state;
         if(b->rd(kRegExcWin)&(1u<<window)){Fail(FlipFail::Exception);return state;}
         const uint64_t now=b->nowUs();
         if(Complete()){
-            const uint32_t lat=uint32_t(now-armedAtUs);st.lastLatUs=lat;if(lat>st.maxLatUs)st.maxLatUs=lat;++st.completes;
+            const uint32_t line=b->rd(RegRgPos(head))&0xffff;     // first, closest to the detection
+            const uint32_t evt=b->rd(RegHeadTimingEvt(head));
+            const uint32_t lat=uint32_t(now-armedAtUs);st.lastLatUs=lat;if(lat>st.maxLatUs)st.maxLatUs=lat;++st.completes;st.latSumUs+=lat;
+            ++st.latHist[lat<100?0:lat<1000?1:lat<4000?2:lat<8000?3:lat<12000?4:lat<17000?5:6];
+            if(vtotal)++st.lineHist[(uint64_t(line)*8/vtotal)>7?7:(uint64_t(line)*8/vtotal)];
+            if(probeCount<probeWant&&probeCount<kProbeMax)probe[probeCount++]=Sample{armLine,line,lat,evt};
             if(armed>=0)front=armed;armed=-1;state=FlipState::Idle;
-            const uint32_t line=b->rd(RegRgPos(head))&0xffff;st.lastLatchLine=line;
-            if(line>=surf[0].height)++st.latchBlank;else ++st.latchActive;
+            st.lastLatchLine=line;
+            if(InBlank(line))++st.latchBlank;else ++st.latchActive;
             latchFrame=st.frames;
             if(queued>=0&&!paced){const int8_t q=queued;queued=-1;Arm(q);}     // paced: TickVblank arms it next frame
             return state;}
