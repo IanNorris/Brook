@@ -564,6 +564,13 @@ inline void AddCoreKick(Plan& p,const HeadConfig& c,uint32_t put,const char* wha
     p.Add(Op::Poll,kRegBar1Flush,0x2,0,kTimeoutMs,"flush done");
     p.Add(Op::Kick,RegPut(kChidCore),~0u,put,0,what);
 }
+// Instmem back to the GOP values unless window 0's channel is connected (a live step-3 /
+// resident-driver head 0 shares this instmem image).
+inline void AddHeadInstmemOff(Plan& p,const HeadConfig& c){
+    const uint64_t w0=(uint64_t(kCtlConnect)<<32)|RegChnCtl(ChidWndw(0));
+    p.Add(Op::WriteIf,kRegInstTarget,~0u,c.base.gop.instTarget,0,"instmem invalid (unless window 0 is live)",w0,0,kRegInstTarget,0);
+    p.Add(Op::WriteIf,kRegInstAddr,~0u,c.base.gop.instAddr,0,"instmem addr 0 (unless window 0 is live)",w0,0,kRegInstTarget,0);
+}
 // Allow-list of MMIO the head plan may write (review 23 Nov issue 11).
 struct Range{uint32_t lo,hi;};
 constexpr Range kHeadAllow[]={
@@ -594,7 +601,8 @@ inline Err BuildHeadPlan(HeadConfig c,InstImage& img,HeadPushes& pushes,Plan& p)
     auto B=[&](HPhase x){p.BeginN(uint32_t(x));};
     B(HPhase::Preflight);
     p.Add(Op::Expect,kRegDispOwner,0x2,0,0,"VBIOS ownership bit clear");
-    p.Add(Op::Expect,kRegInstTarget,~0u,g.instTarget,0,"no display instmem (GOP)");
+    if(c.base.allowSharedInstmem)p.Add(Op::ExpectOr,kRegInstTarget,~0u,g.instTarget,0,"instmem GOP (none) or ours (shared with step 3)",0,0x9);
+    else p.Add(Op::Expect,kRegInstTarget,~0u,g.instTarget,0,"no display instmem (GOP)");
     p.Add(Op::Expect,RegChnCtl(kChidCore),0xffff,g.ctlCore,0,"core CHNCTL as left by GOP");
     p.Add(Op::Expect,RegChnStatus(kChidCore),kCoreStateMask,kCoreEfiOperation,0,"core STATE EFI_OPERATION (7)");
     p.Add(Op::Expect,kRegCtrlDisp,0x187,0,0,"no supervisor/error/awaken pending");
@@ -708,8 +716,7 @@ inline Err BuildHeadPlan(HeadConfig c,InstImage& img,HeadPushes& pushes,Plan& p)
     AddChannelFini(p,kChidCore,kTimeoutMs);
     AddPbRestore(p,kChidCore,g);
     if(c.base.feEnable)p.Add(Op::Write,kRegFeEnable,~0u,g.feEnable,0,"0x610078 = GOP value");
-    p.Add(Op::Write,kRegInstTarget,~0u,g.instTarget,0,"instmem invalid");
-    p.Add(Op::Write,kRegInstAddr,~0u,g.instAddr,0,"instmem addr 0");
+    AddHeadInstmemOff(p,c);
     p.Add(Op::Expect,RegArm(kChidCore,c57d::HeadRasterSize(0)),~0u,g.headRaster,0,"head 0 still the GOP mode");
     p.EndN(uint32_t(HPhase::Count));
     return p.overflow?Err::TooManyOps:Err::Ok;
@@ -721,7 +728,8 @@ inline Err BuildHeadPlan(HeadConfig c,InstImage& img,HeadPushes& pushes,Plan& p)
 constexpr uint32_t kHeadWindowPushOff=0x13000;               // from instVram (after the sync page)
 constexpr uint32_t kHeadFill=0xff1060a0,kHeadMarker=0xffffffff,kHeadMarkerLines=216; // blue, white bar
 struct HeadWindow{Push ring;uint32_t showEnd=0,hideEnd=0;Surface surf{};uint64_t pushVram=0;
-    uint32_t replayVal[kReplayCount]{};uint32_t initCtl=0,initPb[4]{};uint32_t win0Iso=0;};
+    uint32_t replayVal[kReplayCount]{};uint32_t initCtl=0,initPb[4]{};uint32_t win0Iso=0;
+    bool checkWin0Iso=true;};   // false under the resident driver: head 0 flips window 0 meanwhile
 inline Surface HeadSurface(const HeadConfig& c){
     const Surface& b=c.base.surf[1];const uint64_t bytes=uint64_t(b.pitch)*b.height,two=2ull<<20;
     return Surface{b.vram+((bytes+two-1)&~(two-1)),b.width,b.height,b.pitch,b.format};}
@@ -751,7 +759,7 @@ inline void AddHeadWindowGuards(Plan& p,const HeadConfig& c,const HeadWindow& w)
     const auto& g=c.base.gop;
     p.Add(Op::Expect,RegArm(kChidCore,c57d::HeadRasterSize(0)),~0u,g.headRaster,0,"head 0 raster unchanged");
     p.Add(Op::Expect,RegArm(kChidCore,c57d::WindowSetControl(0)),0xf,0,0,"window 0 still owned by head 0");
-    p.Add(Op::Expect,RegArm(ChidWndw(0),c57e::SET_CONTEXT_DMA_ISO0),~0u,w.win0Iso,0,"window 0 ARM ISO unchanged");
+    if(w.checkWin0Iso)p.Add(Op::Expect,RegArm(ChidWndw(0),c57e::SET_CONTEXT_DMA_ISO0),~0u,w.win0Iso,0,"window 0 ARM ISO unchanged");
 }
 inline void BuildHeadWindowShow(const HeadConfig& c,const HeadWindow& w,Plan& p){
     const uint32_t ch=ChidWndw(c.window),h=c.head;
@@ -781,14 +789,17 @@ inline void BuildHeadWindowShow(const HeadConfig& c,const HeadWindow& w,Plan& p)
     AddHeadWindowGuards(p,c,w);
     p.EndN(1);
 }
-inline void BuildHeadWindowHide(const HeadConfig& c,const HeadWindow& w,Plan& p){
+// kick=false: the window is already off (the driver's flipper pushed ISO 0); fini only.
+inline void BuildHeadWindowHide(const HeadConfig& c,const HeadWindow& w,Plan& p,bool kick=true){
     const uint32_t ch=ChidWndw(c.window);
     p.BeginN(0);
+    if(kick){
     p.Add(Op::VramWrite,0,~0u,kNtfyNotBegun,0,"window notifier NOT_BEGUN",c.base.syncVram+WindowNtfyOffset(c.window,1));
     p.Add(Op::Kick,RegPut(ch),~0u,w.hideEnd,0,"window PUT: ISO 0 + UPDATE (wndwc37e_image_clr)");
     p.Add(Op::Poll,RegGet(ch),~0u,w.hideEnd,kTimeoutMs,"window GET == PUT");
     p.Add(Op::Poll,RegArm(ch,c57e::SET_CONTEXT_DMA_ISO0),~0u,0,kTimeoutMs,"window ARM ISO = 0 (window off)");
-    p.Add(Op::Poll,RegChnStatus(ch),kWinMethodExecBusy|0xf00,0x100,kTimeoutMs,"window METHOD_EXEC idle, UPD_STATE IDLE");
+    p.Add(Op::Poll,RegChnStatus(ch),kWinMethodExecBusy|0xf00,0x100,kTimeoutMs,"window METHOD_EXEC idle, UPD_STATE IDLE");}
+    else p.Add(Op::Expect,RegArm(ch,c57e::SET_CONTEXT_DMA_ISO0),~0u,0,0,"window ARM ISO = 0 (window off)");
     AddChannelFini(p,ch,kTimeoutMs);
     AddHeadWindowPbRestore(p,ch,w);
     p.Add(Op::Write,RegChnCtl(ch),~0u,w.initCtl,0,"window CHNCTL = value before show");
@@ -797,11 +808,11 @@ inline void BuildHeadWindowHide(const HeadConfig& c,const HeadWindow& w,Plan& p)
 }
 // Best effort, from any partial state: try the hide UPDATE, then trash-and-abort like the
 // step-3 abort (RM kdispSetChannelTrashAndAbortAccel), disconnect, restore.
-inline void BuildHeadWindowAbort(const HeadConfig& c,const HeadWindow& w,Plan& p,uint32_t ms){
+inline void BuildHeadWindowAbort(const HeadConfig& c,const HeadWindow& w,Plan& p,uint32_t ms,bool kick=true){
     const uint32_t ch=ChidWndw(c.window);
     p.BeginN(0);
-    p.Add(Op::Kick,RegPut(ch),~0u,w.hideEnd,0,"window PUT: hide (best effort)");
-    p.Add(Op::PollSoft,RegArm(ch,c57e::SET_CONTEXT_DMA_ISO0),~0u,0,ms,"window ARM ISO = 0");
+    if(kick){p.Add(Op::Kick,RegPut(ch),~0u,w.hideEnd,0,"window PUT: hide (best effort)");
+    p.Add(Op::PollSoft,RegArm(ch,c57e::SET_CONTEXT_DMA_ISO0),~0u,0,ms,"window ARM ISO = 0");}
     p.Add(Op::Mask,RegChnCtl(ch),kCtlTrashAbort,kCtlTrashAbort,0,"TRASH_AND_ABORT pending methods");
     p.Add(Op::AckException,ch,1u<<c.window,0,0,"log + W1C 0x61184c + ack 0x90000000");
     p.Add(Op::PollSoft,RegChnStatus(ch),kWinMethodExecBusy,0,ms,"METHOD_EXEC idle");
@@ -833,8 +844,7 @@ inline void BuildHeadAbort(const HeadConfig& c,HPhase reached,const HeadPushes& 
     if(reached>=HPhase::Core){AddChannelFini(p,kChidCore,ms,false);AddPbRestore(p,kChidCore,c.base.gop);}
     if(reached>=HPhase::Instmem){
         if(c.base.feEnable)p.Add(Op::Write,kRegFeEnable,~0u,c.base.gop.feEnable,0,"0x610078 = GOP value");
-        p.Add(Op::Write,kRegInstTarget,~0u,c.base.gop.instTarget,0,"instmem invalid");
-        p.Add(Op::Write,kRegInstAddr,~0u,c.base.gop.instAddr,0,"instmem addr 0");}
+        AddHeadInstmemOff(p,c);}
     if(reached>=HPhase::Vram&&c.base.praminCheck)p.Add(Op::Write,kRegPraminBase,~0u,c.base.praminRestore,0,"PRAMIN restored");
     {const uint32_t regs[]={RegArm(kChidCore,c57d::HeadRasterSize(0)),RegChnStatus(kChidCore),kRegCtrlDisp,kRegSuperAck,kRegSuperStat,kRegExcOther};
      for(uint32_t r:regs)p.Add(Op::Log,r,0,0,0,"final state");}
