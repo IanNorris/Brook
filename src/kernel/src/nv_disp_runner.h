@@ -80,9 +80,15 @@ template<typename B> struct Runner{
         void vcopy(uint64_t vram,Blob k,uint32_t bytes){for(uint32_t i=0;i<bytes;i+=4)r.b->vwr(vram+i,blob(k,i));}
         void fill(uint64_t vram,uint32_t bytes,uint32_t pitch,uint32_t c,uint32_t m,uint32_t lines){r.b->fill(vram,bytes,pitch,c,m,lines);}
         void fence(){__atomic_thread_fence(__ATOMIC_SEQ_CST);r.b->fence();}
-        bool expired(uint32_t ms,uint32_t& t){ // t = low 32 bits of the start time in us, 0 = unset
+        // t = low 32 bits of the start time in us | 1 (0 = unset). The |1 can put t one us
+        // AHEAD of the next read: uint32 now - t then wrapped to ~4e9 and the poll "expired"
+        // on its second read (live e82b3ebb flip_16_50: GET poll failed at once, GET == PUT
+        // in the diag right after). Elapsed is clamped instead.
+        uint32_t pollUs=0;  // last poll's elapsed time, logged as "us" (fetch latency)
+        bool expired(uint32_t ms,uint32_t& t){
             const uint64_t now=r.b->nowUs();if(!t){t=uint32_t(now)|1;return false;}
-            r.b->relax();return uint32_t(now)-t>uint64_t(ms)*1000;}
+            uint32_t el=uint32_t(now)-t;if(el>0x80000000u)el=0;pollUs=el;
+            r.b->relax();return el>uint64_t(ms)*1000;}
         void udelay(uint32_t us){const uint64_t end=r.b->nowUs()+us;while(r.b->nowUs()<end)r.b->relax();}
         void except(uint32_t chid,uint32_t s,uint32_t d,uint32_t c){
             Line l;l.raw("{\"nv_disp_exc\":1,\"chid\":");l.dec(chid);l.raw(",\"stat\":\"");l.hex(s);l.raw("\",\"data\":\"");
@@ -103,6 +109,7 @@ template<typename B> struct Runner{
             Line l;l.raw("{\"nv_disp_step\":");l.dec(i);l.raw(",\"list\":\"");l.s(tag);l.raw("\",\"op\":\"");l.s(OpName(s.op));
             l.raw("\",\"reg\":\"");l.hex(s.op==Op::VramCopy||s.op==Op::VramWrite||s.op==Op::VramPoll||s.op==Op::VramPollAny||s.op==Op::SurfFill?s.vram:s.reg);
             l.raw("\",\"exp\":\"");l.hex(s.value);l.raw("\",\"got\":\"");l.hex(got);l.raw("\",\"ok\":");l.dec(ok?1:0);
+            if(s.op==Op::Poll||s.op==Op::PollSoft||s.op==Op::VramPoll||s.op==Op::VramPollAny){l.raw(",\"us\":");l.dec(pollUs);pollUs=0;}
             l.raw(",\"what\":\"");l.s(s.what);l.raw("\"}\n");r.b->emit(l.t);}
     };
 

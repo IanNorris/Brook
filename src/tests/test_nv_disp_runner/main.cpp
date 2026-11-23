@@ -15,7 +15,7 @@ struct Backend{
     void vwr(uint64_t a,uint32_t v){f.vwr(a,v);}
     void fill(uint64_t v,uint32_t b,uint32_t p,uint32_t c,uint32_t m,uint32_t l){f.fill(v,b,p,c,m,l);}
     void fence(){}
-    uint64_t nowUs(){return t+=10;}
+    bool frozen=false;uint64_t nowUs(){return frozen?t:(t+=10);}
     void relax(){}
     void emit(const char* l){lines.push_back(l);if(!quiet)fputs(l,stdout);}
     void hookQuiesce(){++hooks;}
@@ -167,8 +167,15 @@ static void TestPreflightAfterHead1(){
      g.r->Command("flip 2 10");assert(g.b.Count("\"nv_disp\":\"done\"")==1);g.GopState();}
     {Rig g;g.f.R(RegChnCtl(0))=0x13;g.r->Command("preflight");assert(!g.r->st.preflightOk);}
 }
+// e82b3ebb flip_16_50: the start stamp t|1 sat 1 us ahead of an unchanged clock and the
+// poll expired on its second read. A frozen (even) clock must not expire.
+static void TestPollExpiryNoWrap(){
+    Rig g;g.b.t=1000;g.b.frozen=true;Runner<Backend>::Io io{*g.r,g.r->plan,"t"};uint32_t t=0;
+    assert(!io.expired(100,t)&&!io.expired(100,t)&&!io.expired(100,t));
+    g.b.frozen=false;g.b.t+=200000;assert(io.expired(100,t));
+}
 int main(){
     TestLayout();TestGate();TestNoop();TestObserverPauseAndContinue();TestStopThenQuiesce();
-    TestFlip();TestAutoAbortAtConnect();TestRestoreAttemptOnFlipFailure();TestStageB();TestDumpAndBigFlip();TestAbortVerb();TestGetStallRestoreLands();TestGetStallRestoreStuck();TestPreflightAfterHead1();
+    TestFlip();TestAutoAbortAtConnect();TestRestoreAttemptOnFlipFailure();TestStageB();TestDumpAndBigFlip();TestAbortVerb();TestGetStallRestoreLands();TestGetStallRestoreStuck();TestPreflightAfterHead1();TestPollExpiryNoWrap();
     puts("test_nv_disp_runner: ok");return 0;
 }

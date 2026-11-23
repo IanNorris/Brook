@@ -65,7 +65,8 @@ template<typename B> struct HeadRunner{
         void fill(uint64_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t){}
         void fence(){__atomic_thread_fence(__ATOMIC_SEQ_CST);r.b->fence();}
         bool expired(uint32_t ms,uint32_t& t){const uint64_t now=r.b->nowUs();if(!t){t=uint32_t(now)|1;return false;}
-            r.b->relax();return uint32_t(now)-t>uint64_t(ms)*1000;}
+            uint32_t el=uint32_t(now)-t;if(el>0x80000000u)el=0;  // t|1 may be 1 us ahead (step-3 runner note)
+            r.b->relax();return el>uint64_t(ms)*1000;}
         void udelay(uint32_t us){reg.udelay(us);}
         void except(uint32_t chid,uint32_t es,uint32_t d,uint32_t c){ // review N3
             Line l;l.raw("{\"nv_head1_exc\":1,\"chid\":");l.dec(chid);l.raw(",\"stat\":\"");l.hex(es);l.raw("\",\"data\":\"");l.hex(d);
