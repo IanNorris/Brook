@@ -118,7 +118,7 @@ static void TestPacing(){
     DRig g;assert(g.d->Up0());
     g.Flip(0,40);
     const auto& st=g.d->f[0].st;
-    assert(st.completes==40&&st.frames>=39&&st.paced>0&&st.latchBlank+st.latchActive==40);
+    assert(st.completes==40&&st.latchBlank+st.latchActive==40&&g.d->f[0].loadvLive); // LOADV paces; the scanline gate is only the fallback
     g.d->f[0].paced=false;const uint64_t fr=st.frames;g.Flip(0,40);   // unpaced: no per-frame gate
     assert(st.completes==80&&st.frames-fr<40);
     g.d->Command("interval 0 1");assert(g.d->f[0].interval==1);g.Flip(0,1);
@@ -139,15 +139,31 @@ static void TestLoadv(){
 static void TestAgeRepair(){
     AgeRepair a;a.Reset();std::vector<brook::DamageRect> got;
     auto cp=[&](const brook::DamageRect& r){got.push_back(r);};
-    brook::DamageRects d1;d1.Add({10,10,20,20});
-    assert(a.Apply(1,d1,3840,2160,cp)==1&&got[0]==(brook::DamageRect{0,0,3840,2160}));got.clear();   // B stale: full
-    brook::DamageRects d2;d2.Add({100,100,110,110});
-    assert(a.Apply(0,d2,3840,2160,cp)==2&&got[0]==d2.rects[0]&&got[1]==d1.rects[0]);got.clear();      // A: d2 + d1
-    brook::DamageRects d3;d3.Add({5,5,6,6});
-    assert(a.Apply(1,d3,3840,2160,cp)==2&&got[0]==d3.rects[0]&&got[1]==d2.rects[0]);got.clear();      // B: d3 + d2
-    const brook::DamageRects f=brook::DamageRects::Full(3840,2160);
-    assert(a.Apply(0,f,3840,2160,cp)==1);got.clear();
-    assert(a.Apply(9,d1,3840,2160,cp)==0);
+    const brook::DamageRect full{0,0,3840,2160};
+    brook::DamageRects d[6];for(int i=1;i<6;++i)d[i].Add({i*10,i*10,i*10+5,i*10+5});
+    assert(a.Apply(1,d[1],3840,2160,cp)==1&&got[0]==full);got.clear();                 // B stale: full
+    assert(a.Apply(0,d[2],3840,2160,cp)==2&&got[0]==d[1].rects[0]&&got[1]==d[2].rects[0]);got.clear(); // A: frames 1..2
+    assert(a.Apply(2,d[3],3840,2160,cp)==1&&got[0]==full);got.clear();                 // third stale: full
+    assert(a.Apply(1,d[4],3840,2160,cp)==3&&got[0]==d[2].rects[0]&&got[2]==d[4].rects[0]);got.clear(); // B: frames 2..4
+    assert(a.Apply(0,d[5],3840,2160,cp)==3&&got[0]==d[3].rects[0]&&got[2]==d[5].rects[0]);got.clear(); // A: frames 3..5
+    for(int k=0;k<4;++k)(void)a.Apply(1,d[1],3840,2160,cp);got.clear();
+    assert(a.Apply(2,d[1],3840,2160,cp)==1&&got[0]==full);got.clear();                 // older than the history: full
+    assert(a.Apply(0,brook::DamageRects::Full(3840,2160),3840,2160,cp)==1);
+    assert(a.Apply(9,d[1],3840,2160,cp)==0);
+}
+// Mailbox with three buffers: never blocks; a reclaimed queued buffer is reused.
+static void TestTripleMailbox(){
+    DRig g;assert(g.d->Up0());auto& f=g.d->f[0];
+    Surface t=g.d->HeadZeroThird();assert(t.vram==0x8800000);f.SetThird(t);
+    g.c.wstall.insert(1);
+    int8_t b1=f.Back();assert(f.Present(b1)==0);                       // armed (engine stalled: stays armed)
+    int8_t b2=f.Back();assert(b2>=0&&b2!=b1&&b2!=f.front&&f.Present(b2)==1);
+    int8_t b3=f.Back();assert(b3==b2&&f.st.replaced==1);               // all three taken: the queued one is reclaimed
+    assert(f.Present(b3)==1&&f.queued==b3);
+    g.c.wstall.erase(1);g.c.ExecuteW(1,f.put);
+    for(int k=0;k<5000&&(f.state==FlipState::Armed||f.queued>=0);++k)g.d->Tick();
+    assert(f.state==FlipState::Idle&&f.front==b3);
+    assert(g.d->Down0());
 }
 static void TestVblankCounter(){
     DRig g;assert(g.d->Up0());
@@ -156,6 +172,6 @@ static void TestVblankCounter(){
     assert(g.d->Down0());
 }
 int main(){
-    TestOutput0();TestBothOutputs();TestFailures();TestPacing();TestLoadv();TestAgeRepair();TestVblankCounter();
+    TestOutput0();TestBothOutputs();TestFailures();TestPacing();TestLoadv();TestAgeRepair();TestTripleMailbox();TestVblankCounter();
     puts("test_nv_disp_driver: ok");return 0;
 }

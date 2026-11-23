@@ -47,6 +47,10 @@ template<typename B> struct NvDisplayDriver{
         r0->base.bindCore=true;r0->base.extraWindowChid=ChidWndw(kDriverWindow[1]);r0->base.allowSharedInstmem=true;
         r1->cfg.base.allowSharedInstmem=true;r1->cfg.base.bindCore=true;r1->cfg.window=kDriverWindow[1];
     }
+    // Head 0's third buffer (desktop triple buffering): after head 1's C/D, i.e. A + 4 slots
+    // (0x8800000 for 4K); refused when it would reach the instmem region.
+    Surface HeadZeroThird()const{const Surface& a=r0->cfg.surf[0];const uint64_t bytes=uint64_t(a.pitch)*a.height,two=2ull<<20;
+        Surface t=a;t.vram=a.vram+4*((bytes+two-1)&~(two-1));if(t.vram+bytes>r0->cfg.instVram)t.vram=0;return t;}
     static Surface Second(const Surface& s){const uint64_t bytes=uint64_t(s.pitch)*s.height,two=2ull<<20;
         Surface t=s;t.vram=s.vram+((bytes+two-1)&~(two-1));return t;}
 
@@ -123,7 +127,7 @@ template<typename B> struct NvDisplayDriver{
 
     // ---- presentation
     int Present(uint32_t o,int8_t buf){return Live(o)?f[o].Present(buf):-1;}
-    int8_t Back(uint32_t o)const{return Live(o)?f[o].Back():-1;}
+    int8_t Back(uint32_t o){return Live(o)?f[o].Back():-1;}
     // Non-blocking tick: vblank count, flip completion, failure handling, invariants.
     void Tick(){
         for(uint32_t o=0;o<kDriverOutputs;++o){

@@ -40,7 +40,8 @@ constexpr uint32_t RegLoadvCounter(uint32_t h){return 0x61611c+h*0x800;}
 
 // Backend: rd, wr, vrd, vwr, fence, nowUs, relax (as the runners' backends).
 template<typename B> struct NvWindowFlipper{
-    static constexpr uint32_t kMaxBuffers=2;
+    static constexpr uint32_t kMaxBuffers=3;    // triple buffering for the desktop (D2); bench uses 2
+    uint32_t nbuf=2;
     static constexpr uint32_t kWatchdogUs=250000;   // >> 3 frames at 60 Hz
     static constexpr uint32_t kRingBytes=kPushBytes;
     B* b=nullptr;
@@ -60,9 +61,10 @@ template<typename B> struct NvWindowFlipper{
     struct Sample{uint32_t armLine,doneLine,latUs,evtAfter;};
     static constexpr uint32_t kProbeMax=32;Sample probe[kProbeMax]{};uint32_t probeCount=0,probeWant=0;
 
+    void SetThird(const Surface& c){surf[2]=c;nbuf=3;}
     void Init(B* backend,uint32_t window_,uint32_t head_,uint64_t ringVram,uint32_t putBytes,const Surface& a,const Surface& bb,int8_t frontBuf){
         b=backend;window=window_;chid=ChidWndw(window_);head=head_;ring=ringVram;put=putBytes;
-        surf[0]=a;surf[1]=bb;front=frontBuf;armed=queued=-1;state=FlipState::Idle;fail=FlipFail::None;st=FlipStats{};
+        surf[0]=a;surf[1]=bb;surf[2]=Surface{};nbuf=2;front=frontBuf;armed=queued=-1;state=FlipState::Idle;fail=FlipFail::None;st=FlipStats{};
         lastVline=0;latchFrame=~0ull;probeCount=probeWant=0;
         vtotal=b->rd(RegArm(kChidCore,0x2064+head_*0x400))>>16;
         vblankEnd=b->rd(RegArm(kChidCore,0x206c+head_*0x400))>>16;vblankStart=b->rd(RegArm(kChidCore,0x2070+head_*0x400))>>16;}
@@ -114,9 +116,11 @@ template<typename B> struct NvWindowFlipper{
     // Present buffer `buf` at the next vblank. 0 = armed now, 1 = queued (mailbox:
     // replaces an older queued frame), -1 = not live.
     int Present(int8_t buf){
-        if(buf<0||buf>=int8_t(kMaxBuffers))return -1;
+        if(buf<0||buf>=int8_t(nbuf))return -1;
         if(state==FlipState::Idle){++st.presents;
-            if(paced&&st.frames==latchFrame){queued=buf;++st.paced;return 1;}   // one flip per frame: next frame
+            // With LOADV completion an armed flip shows at the next vblank anyway, so only
+            // the scanline fallback needs the one-per-frame gate.
+            if(paced&&!loadvLive&&st.frames==latchFrame){queued=buf;++st.paced;return 1;}
             Arm(buf);return state==FlipState::Armed?0:-1;}
         if(state==FlipState::Armed){++st.presents;if(queued>=0)++st.replaced;queued=buf;return 1;}
         return -1;
@@ -148,13 +152,18 @@ template<typename B> struct NvWindowFlipper{
             st.lastLatchLine=line;
             if(InBlank(line))++st.latchBlank;else ++st.latchActive;
             latchFrame=st.frames;
-            if(queued>=0&&!paced){const int8_t q=queued;queued=-1;Arm(q);}     // paced: TickVblank arms it next frame
+            if(queued>=0&&(!paced||loadvLive)){const int8_t q=queued;queued=-1;Arm(q);} // newest frame -> next vblank
             return state;}
         if(now-armedAtUs>kWatchdogUs)Fail(FlipFail::Timeout);
         return state;
     }
     // Back buffer for the compositor: the one neither on screen nor armed.
-    int8_t Back()const{for(int8_t i=0;i<int8_t(kMaxBuffers);++i)if(i!=front&&i!=armed)return i;return -1;}
+    // Mailbox: a buffer neither on screen nor armed nor queued; with all taken, the queued
+    // (not yet kicked) one is reclaimed for the newer frame.
+    int8_t Back(){
+        for(int8_t i=0;i<int8_t(nbuf);++i)if(i!=front&&i!=armed&&i!=queued)return i;
+        if(queued>=0){const int8_t q=queued;queued=-1;++st.replaced;return q;}
+        return -1;}
     // Synchronous submission for teardown (restore / hide): waits for anything in
     // flight, kicks the words, waits until ARM shows (iso, offset). Bounded.
     bool SubmitWait(const uint32_t* w,uint32_t n,uint32_t iso,uint32_t offset,uint32_t timeoutUs){
@@ -171,16 +180,23 @@ template<typename B> struct NvWindowFlipper{
 // Two-buffer age repair (D2): buffer bb was last written two frames ago, so it lacks the
 // previous frame's damage (which went to the other buffer) plus this frame's. A stale
 // buffer (never written: B at bring-up) or `full` damage gets the whole area.
+// N-buffer age repair: a buffer last written at frame k lacks the damage of frames
+// k+1..n (n = this frame). A short history covers triple buffering; an older or never
+// written buffer (stale) gets the whole area.
 struct AgeRepair{
-    brook::DamageRects prev{};bool stale[2]{false,true};
-    void Reset(){prev=brook::DamageRects{};stale[0]=false;stale[1]=true;}
+    static constexpr uint32_t kBufs=3,kHist=4;
+    brook::DamageRects hist[kHist]{};uint64_t frame=0;int64_t last[kBufs]{0,-1,-1};
+    void Reset(){for(auto& h:hist)h=brook::DamageRects{};frame=0;last[0]=0;last[1]=last[2]=-1;} // buffer 0 (A) holds the last GOP frame
     template<typename F> uint32_t Apply(int8_t bb,const brook::DamageRects& d,uint32_t w,uint32_t h,F copy){
+        if(bb<0||bb>=int8_t(kBufs))return 0;
+        ++frame;hist[frame%kHist]=d;
         uint32_t n=0;
-        if(bb<0||bb>1)return 0;
-        if(stale[bb]||d.full){copy(brook::DamageRect{0,0,int32_t(w),int32_t(h)});n=1;}
-        else{for(uint32_t i=0;i<d.count;++i){copy(d.rects[i]);++n;}
-             for(uint32_t i=0;i<prev.count;++i){copy(prev.rects[i]);++n;}}
-        prev=d;stale[bb]=false;return n;
+        const int64_t lb=last[bb];
+        if(lb<0||d.full||frame-uint64_t(lb)>kHist-1){copy(brook::DamageRect{0,0,int32_t(w),int32_t(h)});n=1;}
+        else for(uint64_t k=uint64_t(lb)+1;k<=frame;++k){const auto& r=hist[k%kHist];
+            if(r.full){copy(brook::DamageRect{0,0,int32_t(w),int32_t(h)});n=1;break;}
+            for(uint32_t i=0;i<r.count;++i){copy(r.rects[i]);++n;}}
+        last[bb]=int64_t(frame);return n;
     }
 };
 } // namespace brook::nvdisp
