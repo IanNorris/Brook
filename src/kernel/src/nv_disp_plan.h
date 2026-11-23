@@ -553,6 +553,18 @@ inline void AddPushReadback(Plan& p,const Config& c,const Push& ring,uint32_t fr
         p.Add(Op::VramExpect,0,~0u,ring.words[off/4],0,"pushbuffer word visible in VRAM (line start)",c.wndwPushVram+off);
     if(put>from)p.Add(Op::VramExpect,0,~0u,ring.words[put/4-1],0,"pushbuffer last word visible in VRAM",c.wndwPushVram+put-4);
 }
+// Before the next submission: the previous flip must be complete (its notifier FINISHED),
+// as nvkms waits for STATUS_FINISHED (nvEvoWaitForCompNotifierC3). Live 35265134 flip_4_100:
+// the next flip's SET_CONTEXT_DMA_NOTIFIER sat unexecuted (GET 0x2c0, ASSY 0x220 still the
+// previous slot, METHOD_EXEC busy) for over 2 s while the previous flip was only BEGUN; it
+// drained without a kick. Generous timeout: the present latency seen live is seconds.
+constexpr uint32_t kFinishTimeoutMs=5000;
+inline void AddWaitFinished(Plan& p,const Config& c,uint32_t prevNtfy){
+    if(prevNtfy==kNoNtfy)return;
+    p.Add(Op::VramPoll,0,3u<<kNtfyStatusShift,kNtfyFinished<<kNtfyStatusShift,kFinishTimeoutMs,
+          "previous flip FINISHED before the next submission",c.syncVram+prevNtfy);
+    p.Add(Op::Poll,RegChnStatus(ChidWndw(c.window)),kWinMethodExecBusy,0,kFinishTimeoutMs,"window METHOD_EXEC idle before the next submission");
+}
 inline void AddKickAndWait(Plan& p,const Config& c,uint32_t putBytes,uint32_t handle,uint64_t offset,uint32_t ntfy){
     const uint32_t ch=ChidWndw(c.window);
     if(ntfy!=kNoNtfy)p.Add(Op::VramWrite,0,~0u,kNtfyNotBegun,0,"notifier slot reset NOT_BEGUN",c.syncVram+ntfy);
@@ -693,12 +705,13 @@ inline Err BuildPlan(const Config& c,InstImage& img,Pushes& pushes,Plan& p,uint3
         p.Add(Op::Fence,0,0,0,0,"sfence");
     }
     for(uint32_t i=1;i<=nflips;++i){
+        AddWaitFinished(p,c,pushes.ntfy[i-1]);
         AddPushReadback(p,c,pushes.wndw,pushes.end[i-1],pushes.end[i]);
         AddKickAndWait(p,c,pushes.end[i],pushes.handle[i],pushes.offset[i],pushes.ntfy[i]);
         if(holdMs)p.Add(Op::Delay,0,0,holdMs*1000,0,"hold");
     }
     p.Begin(Phase::Restore);
-    {const uint32_t k=nflips+1;AddPushReadback(p,c,pushes.wndw,pushes.end[k-1],pushes.end[k]);AddKickAndWait(p,c,pushes.end[k],pushes.handle[k],pushes.offset[k],pushes.ntfy[k]);}
+    {const uint32_t k=nflips+1;AddWaitFinished(p,c,pushes.ntfy[k-1]);AddPushReadback(p,c,pushes.wndw,pushes.end[k-1],pushes.end[k]);AddKickAndWait(p,c,pushes.end[k],pushes.handle[k],pushes.offset[k],pushes.ntfy[k]);}
     p.Add(Op::Expect,RegArm(ch,c57e::SET_CONTEXT_DMA_NOTIFIER),~0u,RestoreVal(c,c57e::SET_CONTEXT_DMA_NOTIFIER),0,"ARM notifier ctxdma = GOP value");
     p.Add(Op::Expect,RegArm(ch,c57e::SET_PRESENT_CONTROL),~0u,RestoreVal(c,c57e::SET_PRESENT_CONTROL),0,"ARM present control = GOP value");
     p.Begin(Phase::Teardown);

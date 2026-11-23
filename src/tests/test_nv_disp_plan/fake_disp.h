@@ -105,7 +105,7 @@ struct Fake{
                     assert(R(RegAssy(chid,c57e::SET_INTERLOCK_FLAGS))==0); // no core interlock in step 3
                     for(uint32_t x=0x200;x<0x800;x+=4)if(reg.count(RegAssy(chid,x)))R(RegArm(chid,x))=R(RegAssy(chid,x));
                     if(nh){const uint32_t ntfy=R(RegAssy(chid,c57e::SET_NOTIFIER_CONTROL))&0xff0;
-                        assert(nb+ntfy+15<=nl);vwr(nb+ntfy,kNtfyBegun<<kNtfyStatusShift);}
+                        assert(nb+ntfy+15<=nl);vwr(nb+ntfy,kNtfyFinished<<kNtfyStatusShift);}
                     ++flips;
                 }
             }

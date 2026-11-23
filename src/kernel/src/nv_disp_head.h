@@ -393,10 +393,17 @@ constexpr uint16_t kCoreHeadMthds[]={ // clc57d.h HEAD_SET_* offsets for head 0 
     0x314,0x318,0x31c,0x320,0x324,0x328,0x32c,0x330,0x334,0x338,0x33c,0x340,0x344,0x348,0x34c,0x350,0x354,0x358,
     0x35c,0x360};
 constexpr uint32_t kCoreHeadCount=sizeof(kCoreHeadMthds)/sizeof(kCoreHeadMthds[0]);
-constexpr uint32_t kCoreReplayCount=3+4*4+8*5+4*kCoreHeadCount;
+// Globals: interlock flags, plus SET_GET_BLANKING_CTRL(0..3) (0x240-0x24c; BLANK 0:0,
+// UNBLANK 1:1, 0 = NO_CHANGE). Live 35265134: the GOP leaves them pending in ASSY as
+// 2/1/1/1 (unblank head 0, blank heads 1-3) with ARM 0, on a fresh boot too. No driver
+// pushes them (nouveau, nvkms). Promoting them on our first UPDATE could blank head 1
+// (and touch head 0), so the replay writes the ARM value (NO_CHANGE) into ASSY. If they are
+// status read-backs instead, the strict post-replay diff fails before any UPDATE.
+constexpr uint32_t kCoreGlobCount=7;
+constexpr uint32_t kCoreReplayCount=kCoreGlobCount+4*4+8*5+4*kCoreHeadCount;
 inline uint32_t CoreReplayMthd(uint32_t i){
-    static constexpr uint16_t glob[]={0x210,0x218,0x21c};
-    if(i<3)return glob[i];i-=3;
+    static constexpr uint16_t glob[kCoreGlobCount]={0x210,0x218,0x21c,0x240,0x244,0x248,0x24c};
+    if(i<kCoreGlobCount)return glob[i];i-=kCoreGlobCount;
     if(i<16)return 0x300+(i/4)*0x20+(i%4)*4;i-=16;
     if(i<40)return 0x1000+(i/5)*0x80+(i%5)*4;i-=40;
     return 0x2000+(i/kCoreHeadCount)*0x400+kCoreHeadMthds[i%kCoreHeadCount];

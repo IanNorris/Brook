@@ -121,7 +121,7 @@ static void TestCoreWords(){
     assert(hp.core.words[0]==PushHeader(0x208,1)&&hp.core.words[1]==kHandleSync);  // ours, first
     // replay: every documented core method once, in runs; then the rung (corec37d_update + ntfy)
     {uint32_t n=0;for(uint32_t i=2;i<hp.replayEnd/4;){const uint32_t k=(hp.core.words[i]>>18)&0x3ff;n+=k;i+=1+k;}
-     assert(n==kCoreReplayCount&&kCoreReplayCount==3+16+40+4*111);}
+     assert(n==kCoreReplayCount&&kCoreReplayCount==7+16+40+4*111);}
     {const uint32_t* r=hp.core.words+hp.replayEnd/4;const uint32_t g[]={0x0004020c,0x1000,0x00080218,0,0,0x00040200,1,0x0004020c,0};
      assert(hp.rungEnd-hp.replayEnd==sizeof(g)&&!memcmp(r,g,sizeof(g)));}
     assert(hp.core.count<=kPushMaxWords);
@@ -185,6 +185,7 @@ struct Core{
         R(0xef04)=0x00033a01;R(0xef10)=0x18000000;                       // GOP VPLL0 = 533.25 MHz
         R(0x612200)=0x00800040;R(0x612b00)=0x03d10040;
         for(uint32_t base:{0x682000u,0x68a000u}){R(base+0x38)=1;R(base+0x3c)=5;R(base+0x74)=1;R(base+0x20c)=1;} // probes2 non-zero head-0 values
+        R(0x680240)=2;R(0x680244)=1;R(0x680248)=1;R(0x68024c)=1;        // live 35265134: GOP-pending blanking ctrl (ARM 0)
     }
     bool Lookup(uint32_t handle,uint32_t chid,uint64_t& base){
         const uint64_t inst=uint64_t(R(kRegInstAddr))<<16;
@@ -338,6 +339,7 @@ static void TestHeadPlan(){
     // Pad calibration converged on the comparator's target and was copied.
     assert(((c.R(0x612508)>>8)&0xf)==6&&((c.R(0x612588)>>8)&0xf)==6);
     // Head 0 never changed; head 1 was ARMed and detached again.
+    assert(c.R(0x688240)==0&&c.R(0x688244)==0&&c.R(0x680240)==0); // blanking ctrl replayed as ARM (NO_CHANGE), never promoted
     assert(c.R(0x68a064)==c.cfg.base.gop.headRaster&&c.R(0x68a00c)==c.cfg.base.gop.headPclk&&c.R(0x688320)==0x901);
     assert(c.R(0x68a464)==c.cfg.mode.rasterSize&&(c.R(0x688340)&0xff)==0&&(c.R(0x689100)&0xf)==0xf);
     assert((c.R(0x616d40)&1)==0);                                    // OffInt2 cleared the head SF enable
@@ -362,7 +364,7 @@ static void TestRefusesWhenHead0Pending(){
     Setup(c,img,hp,p,v);
     c.R(0x680000+0x2038)=7;                                            // undocumented head-0 method: cannot be replayed
     const uint32_t at=Run(p,0,p.count,c);
-    assert(at<p.phaseBegin[uint32_t(HPhase::Vram)]&&c.written.empty()&&c.diffs==1);
+    assert(at<p.phaseBegin[uint32_t(HPhase::Vram)]&&c.written.empty()&&c.diffs==5); // + the 4 GOP-pending blanking ctrls (logged, replayed)
     // A documented one is simply replayed with its ARM value: no refusal.
     Core d;static InstImage i2;static HeadPushes h2;static Plan p2;Vbios v2;i2=InstImage{};h2=HeadPushes{};p2=Plan{};
     Setup(d,i2,h2,p2,v2);d.R(0x680000+0x2068)=0x0004001e;
