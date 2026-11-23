@@ -155,7 +155,7 @@ struct Fake{
     uint32_t flags=0;void flag(uint32_t,const Step&,uint32_t){++flags;} void note(const char*,uint32_t){}
     uint32_t dumped=0;void dump(uint32_t,const uint32_t*,uint32_t n){dumped+=n;}
     void udelay(uint32_t){}
-    bool call(uint32_t){return true;}
+    bool call(uint32_t,uint32_t){return true;}
     void log(uint32_t i,const Step& s,uint32_t got,bool ok){
         if(verbose||!ok)printf("  %3u %-12s %s got %08x\n",i,ok?"ok":"FAIL",s.what,got);}
 };

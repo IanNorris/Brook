@@ -121,7 +121,7 @@ static void TestCoreWords(){
     assert(hp.core.words[0]==PushHeader(0x208,1)&&hp.core.words[1]==kHandleSync);  // ours, first
     // replay: every documented core method once, in runs; then the rung (corec37d_update + ntfy)
     {uint32_t n=0;for(uint32_t i=2;i<hp.replayEnd/4;){const uint32_t k=(hp.core.words[i]>>18)&0x3ff;n+=k;i+=1+k;}
-     assert(n==kCoreReplayCount&&kCoreReplayCount==3+16+40+4*110);}
+     assert(n==kCoreReplayCount&&kCoreReplayCount==3+16+40+4*111);}
     {const uint32_t* r=hp.core.words+hp.replayEnd/4;const uint32_t g[]={0x0004020c,0x1000,0x00080218,0,0,0x00040200,1,0x0004020c,0};
      assert(hp.rungEnd-hp.replayEnd==sizeof(g)&&!memcmp(r,g,sizeof(g)));}
     assert(hp.core.count<=kPushMaxWords);
@@ -184,6 +184,7 @@ struct Core{
         R(RegPbLo(0))=1;R(RegPbValid(0))=1;R(0x612508)=0x603;R(0x61d004)=0x10000000;R(0x611cf0)=0x1ff;
         R(0xef04)=0x00033a01;R(0xef10)=0x18000000;                       // GOP VPLL0 = 533.25 MHz
         R(0x612200)=0x00800040;R(0x612b00)=0x03d10040;
+        for(uint32_t base:{0x682000u,0x68a000u}){R(base+0x38)=1;R(base+0x3c)=5;R(base+0x74)=1;R(base+0x20c)=1;} // probes2 non-zero head-0 values
     }
     bool Lookup(uint32_t handle,uint32_t chid,uint64_t& base){
         const uint64_t inst=uint64_t(R(kRegInstAddr))<<16;
@@ -200,7 +201,7 @@ struct Core{
             if(a!=b&&(((a|b)&0xff)>>h)&1)m|=0x1000;}
         return m;
     }
-    bool hideCtrlDisp=false,exceptOnModeset=false,resetOnConnect=true;uint32_t evt=0,flags=0,notes=0;
+    bool hideCtrlDisp=false,exceptOnModeset=false,resetOnConnect=true;uint32_t evt=0,flags=0,notes=0,openStage=0;
     void Raise(uint32_t st){stage=st;if(!hideCtrlDisp)R(kRegCtrlDisp)|=1u<<(st-1);evt|=1u<<(st-1);++supers;
         for(uint32_t h=0;h<4;++h){R(RegSuperHead(h))=HeadMask(h);if(h==0&&R(RegSuperHead(0)))superOnHead0=true;}}
     void Finish(){
@@ -266,12 +267,13 @@ struct Core{
         if(a==RegChnCtl(0)){const uint32_t old=R(a);R(a)=v;
             if((v&kCtlRunning)==kCtlRunning&&!(old&kCtlConnect)){assert((R(RegPbLo(0))>>8)&&R(RegPbClient(0))==kClientId);
                 R(RegChnStatus(0))=0x000b0000;R(RegGet(0))=0;cur=0;
-                if(resetOnConnect){R(0x682068)=0;R(0x680320)=0x100;R(0x681004)=0;R(0x682404)=0x123;}} // connect resets core ASSY
+                if(resetOnConnect){R(0x682068)=0;R(0x680320)=0x100;R(0x681004)=0;R(0x682404)=0x123;R(0x682074)=0;}} // connect resets core ASSY
             return;}
         if(a==RegPut(0)&&(R(RegChnCtl(0))&kCtlRunning)==kCtlRunning){R(a)=v;Execute(v);return;}
-        if(a==kRegSuperAck){R(kRegCtrlDisp)&=~v;evt&=~v;return;}
+        if(a==kRegSuperAck){R(kRegCtrlDisp)&=~v;evt&=~v;openStage=v&7;return;}
         if(a==kRegExcOther){R(a)&=~v;return;}
         if(a==0x611020&&v==kExceptAck){R(a)=0;return;}
+        if(a==kRegSuperStat&&v==kSuperRelease)openStage=0;
         if(a==kRegSuperStat&&v==kSuperRelease&&stage){
             assert(!(evt&(1u<<(stage-1))));                         // acked before release
             if(stage==2&&R(RegSuperHead(1))==0){}                    // masks cleared by the plan
@@ -291,8 +293,8 @@ struct Core{
     void flag(uint32_t,const Step&,uint32_t){++flags;} void note(const char*,uint32_t){++notes;}
     void dump(uint32_t,const uint32_t*,uint32_t){}
     void fill(uint64_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t){}
-    bool call(uint32_t id){
-        if(id==kCallSuperFlush||id==kCallSuperFlushVpll){(void)SupervisorFlush(*this,cfg,id==kCallSuperFlushVpll,100);return true;}
+    bool call(uint32_t id,uint32_t ms){
+        if(id==kCallSuperFlush||id==kCallSuperFlushVpll){(void)SupervisorFlush(*this,cfg,id==kCallSuperFlushVpll,ms?ms:100,openStage);return true;}
         if(id!=kCallDpTrain)return false;
         DpLink l=cfg.dp;memcpy(l.dpcd,sink.dpcd,16);
         struct TIo{Core& c;
@@ -366,19 +368,45 @@ static void TestRefusesWhenHead0Pending(){
     Setup(d,i2,h2,p2,v2);d.R(0x680000+0x2068)=0x0004001e;
     assert(Run(p2,0,p2.count,d)==p2.count&&d.flags==0&&d.R(0x68a068)==d.R(0x682068));
 }
-// An undocumented method the core connect resets cannot be replayed: the diffs log it
-// without failing, and if it matters the rung UPDATE raises a supervisor, so the run
-// stops there, before any head-1 state, and the abort flushes the stages cleanly.
+static uint32_t StrictIndex(const Plan& p){
+    for(uint32_t i=0;i<p.count;++i)if(p.steps[i].op==Op::AssyArmDiff&&p.steps[i].x==1)return i;
+    assert(false);return 0;}
+// N2: an undocumented method the core connect resets cannot be replayed, so the strict
+// post-replay diff fails on it (any difference not ours), before the first UPDATE.
 static void TestUndocumentedResetLogged(){
     Core c;static InstImage img;static HeadPushes hp;static Plan p,ab;Vbios v;img=InstImage{};hp=HeadPushes{};p=Plan{};ab=Plan{};
     Setup(c,img,hp,p,v);
     const uint32_t k=p.phaseBegin[uint32_t(HPhase::CoreCheck)];
     assert(Run(p,0,k,c)==k);c.R(0x680000+0x2038)=9;                   // as if the connect reset it
     const uint32_t at=Run(p,k,p.count,c);
-    assert(at==KickIndex(p,hp.rungEnd)+1&&c.diffs>=2&&c.stage==1);     // logged twice, then stuck at the rung
-    BuildHeadAbort(c.cfg,HPhase::CoreCheck,hp,ab,100,Kicked::Rung);
+    assert(at>=StrictIndex(p)&&at<=StrictIndex(p)+2&&p.steps[at].op==Op::AssyArmDiff&&c.updates==0);
+    BuildHeadAbort(c.cfg,HPhase::CoreCheck,hp,ab,100,Kicked::Replay);
+    for(uint32_t i=0;i<ab.count;++i)assert(ab.steps[i].op!=Op::Kick&&ab.steps[i].op!=Op::Call);
     (void)Run(ab,0,ab.count,c,true);
-    assert(c.stage==0&&c.supers==3&&(c.R(RegChnCtl(0))&0x13)==0x01&&c.R(kRegInstTarget)==1&&(c.R(0x688340)&0xff)==0);
+    assert(c.updates==0&&(c.R(RegChnCtl(0))&0x13)==0x01&&c.R(kRegInstTarget)==1);
+    // 0x2074 is replayed (nouveau pushes it raw): its connect reset (the fake resets it) is repaired.
+    assert(c.R(0x682074)==1);
+}
+// N4: a supervisor during the rung fails its wait at once (no 2 s timeout); the abort flushes it.
+static void TestRungSupervisorFailsFast(){
+    Core c;static InstImage img;static HeadPushes hp;static Plan p,ab;Vbios v;img=InstImage{};hp=HeadPushes{};p=Plan{};ab=Plan{};
+    Setup(c,img,hp,p,v);
+    const uint32_t k=KickIndex(p,hp.rungEnd);
+    assert(Run(p,0,k,c)==k);c.R(0x680000+0x2068)=0x0004001e;          // head 0 dirtied after the strict diff
+    const uint32_t at=Run(p,k,p.count,c);
+    assert(at==k+1&&c.supers==1&&c.stage==1);
+    BuildHeadAbort(c.cfg,HPhase::CoreCheck,hp,ab,100,Kicked::Rung);(void)Run(ab,0,ab.count,c,true);
+    assert(c.stage==0&&c.supers==3&&(c.R(RegChnCtl(0))&0x13)==0x01);
+}
+// N1: a stop right after the stage-2 ack (the stage is open: acked, not released) and an
+// abort: the flush treats the open stage as seen, does the stage-2 work (VPLL1) and releases it.
+static void TestOpenStageReleased(){
+    Core c;static InstImage img;static HeadPushes hp;static Plan p,ab;Vbios v;img=InstImage{};hp=HeadPushes{};p=Plan{};ab=Plan{};
+    Setup(c,img,hp,p,v);
+    uint32_t ack2=0;for(uint32_t i=0;i<p.count;++i)if(p.steps[i].op==Op::Write&&p.steps[i].reg==kRegSuperAck&&p.steps[i].value==2){ack2=i;break;}
+    assert(ack2&&Run(p,0,ack2+1,c)==ack2+1&&c.openStage==2&&c.stage==2&&!(c.evt&2));
+    BuildHeadAbort(c.cfg,HPhase::Modeset,hp,ab,100,Kicked::Enable);(void)Run(ab,0,ab.count,c,true);
+    assert(c.R(0xef44)==0x00033a01&&c.R(0xef50)==0x18000000&&c.stage==0&&c.openStage==0&&(c.R(0x688340)&0xff)==0);
 }
 static void TestHead0FlagFinishesStages(){
     Core c;static InstImage img;static HeadPushes hp;static Plan p;Vbios v;img=InstImage{};hp=HeadPushes{};p=Plan{};
@@ -526,6 +554,12 @@ static void TestHeadRunner(){
      g.r->Command(("enable skip-step3 stop "+std::to_string(kickStart())).c_str());
      g.r->Command("abort");                                                          // unkicked enable: no flush, no detach
      assert(g.c.updates==1&&g.c.stage==0&&g.r->st.aborts==1&&g.b.Count("supervisor flush")==0&&g.b.dpIdle==0);}
+    {HRig g;g.r->Command("preflight");g.r->Command("enable skip-step3 stop rung");    // the truncated run (needs no sink)
+     assert(g.r->st.paused&&g.r->st.kicked==Kicked::Replay&&g.c.updates==0&&g.b.Count("nv_head1_diff")>=1);
+     g.r->Command("abort");
+     assert(!g.r->st.live&&g.r->st.aborts==1&&g.c.updates==0&&g.b.Count("supervisor flush")==0);
+     assert((g.c.R(RegChnCtl(0))&0x6013)==0x01&&g.c.R(RegPbLo(0))==1&&g.c.R(kRegInstTarget)==1&&g.c.R(kRegPraminBase)==0x1fff0);
+     assert(g.c.R(0x68a064)==g.r->cfg.base.gop.headRaster&&g.c.auxXfers==0&&g.r->st.guardHits==0&&g.b.dpIdle==0);}
     {HRig g;HeadRunner<HBackend>::RegIo io{*g.r};                                     // the write guard
      for(uint32_t a:{0x61c804u,0xef04u,0x616540u,0x612488u,0x612b00u,0x6104e4u,0x690000u}){
         io.violation=false;io.wr(a,1);assert(io.violation&&!g.c.written.count(a));}
@@ -562,7 +596,7 @@ int main(int argc,char** argv){
     if(argc>1&&!strcmp(argv[1],"--dump")){Dump();return 0;}
     TestAux();TestHeadRunner();
     TestVbios();TestRealVbios();TestPllAndSf();TestCoreWords();
-    TestHeadPlan();TestRefusesWhenHead0Pending();TestUndocumentedResetLogged();TestHead0FlagFinishesStages();TestAbortUnkicked();
+    TestHeadPlan();TestRefusesWhenHead0Pending();TestUndocumentedResetLogged();TestRungSupervisorFailsFast();TestOpenStageReleased();TestHead0FlagFinishesStages();TestAbortUnkicked();
     TestStagesFromEventStatus();TestCoreExceptionAtModeset();TestVpll0Gate();TestTrainingFailure();
     puts("test_nv_disp_head: ok");return 0;
 }

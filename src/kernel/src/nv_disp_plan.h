@@ -341,7 +341,8 @@ enum class Op:uint8_t{
     SurfFill,   // io.fill(vram, bytes=value, pitch=mask, colour x, marker colour y, marker lines z)
     PraminRange,// value words at BAR0 kPramin+reg == blob(mask) words from byte x; got = first bad index
     Dump,       // read value words from reg and hand them to io.dump (diagnostics; never fails)
-    PollOr,     // until ((reg | x) & mask) == value; fails at once if y && (y & z) (exception), else on timeout
+    PollOr,     // until ((reg | x) & mask) == value; fails at once if y && (y & z), or if vram != 0 and
+                // (rd(low32(vram)) & high32(vram)) (e.g. a supervisor during the rung), else on timeout
     ExpectSoft, // (reg & mask) == value, else io.flag(step, got): a sticky warning, never fails
     ExpectVpll, // VPLL at reg (+4 P|N|M, +0x10 fN<<16) runs at value kHz +- mask with refclk x kHz
 };
@@ -681,7 +682,7 @@ inline void BuildAbort(const Config& c,Phase reached,Plan& p,uint32_t ms=100){
 //   uint32_t blob(Blob b,uint32_t byteOffset); void fence(); bool expired(uint32_t ms,uint32_t& state);
 //   void log(uint32_t index,const Step&,uint32_t got,bool ok);
 //   void diff(uint32_t mthd,uint32_t assy,uint32_t arm); void pause(const char* what);
-//   void udelay(uint32_t us); bool call(uint32_t id); void dump(uint32_t addr,const uint32_t* w,uint32_t n);
+//   void udelay(uint32_t us); bool call(uint32_t id,uint32_t ms); void dump(uint32_t addr,const uint32_t* w,uint32_t n);
 //   void flag(uint32_t index,const Step&,uint32_t got);
 //   void fill(uint64_t vram,uint32_t bytes,uint32_t pitch,uint32_t colour,uint32_t marker,uint32_t lines);
 // Returns `end` on success, else the index of the (first) failing step.
@@ -705,6 +706,7 @@ template<typename Io> uint32_t Run(const Plan& p,uint32_t begin,uint32_t end,Io&
         case Op::PollOr:{uint32_t t=0;
             for(;;){got=io.rd(s.reg)|io.rd(s.x);if((got&s.mask)==s.value)break;
                 if(s.y&&(io.rd(s.y)&s.z)){ok=false;got=0xe0000000u|io.rd(s.y);break;}
+                if(s.vram&&(io.rd(uint32_t(s.vram))&uint32_t(s.vram>>32))){ok=false;got=0xd0000000u|io.rd(uint32_t(s.vram));break;}
                 if(io.expired(s.timeoutMs,t)){ok=false;break;}}
             break;}
         case Op::ExpectSoft:got=io.rd(s.reg);if((got&s.mask)!=s.value)io.flag(i,s,got);break;
@@ -736,8 +738,9 @@ template<typename Io> uint32_t Run(const Plan& p,uint32_t begin,uint32_t end,Io&
                 if(s.reg==kChidCore&&m>=0x220&&m<0x240)continue;          // core GET_RG_SCAN_LINE (live)
                 const uint32_t a=io.rd(RegAssy(s.reg,m)),b=io.rd(RegArm(s.reg,m));
                 if(a!=b){io.diff(m,a,b);
-                    // x: 0 = fail unless rewritten, 1 = strict (known and not ours), 2 = log only
-                    const bool bad=s.x==2?false:s.x?(Plan::Has(p.known,m)&&!Plan::Has(p.ours,m)):!p.Rewritten(m);
+                    // x: 0 = fail unless rewritten, 1 = strict (any difference that is not ours,
+                    // documented or not), 2 = log only
+                    const bool bad=s.x==2?false:s.x==1?!Plan::Has(p.ours,m):!p.Rewritten(m);
                     if(bad){ok=false;if(!got)got=m;}}
             }
             break;
@@ -747,7 +750,7 @@ template<typename Io> uint32_t Run(const Plan& p,uint32_t begin,uint32_t end,Io&
         case Op::CopyMask:
             if(!s.y||(io.rd(s.y)&s.z)==0){got=io.rd(s.reg)&s.mask;io.wr(s.value,(io.rd(s.value)&s.x)|got);}
             break;
-        case Op::Call:ok=io.call(s.reg);break;
+        case Op::Call:ok=io.call(s.reg,s.timeoutMs);break;
         case Op::SurfFill:io.fill(s.vram,s.value,s.mask,s.x,s.y,s.z);break;
         case Op::PraminRange:
             for(uint32_t k=0;k<s.value;++k)if(io.rd(kPramin+s.reg+k*4)!=io.blob(Blob(s.mask),s.x+k*4)){ok=false;got=k;break;}

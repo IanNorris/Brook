@@ -86,7 +86,8 @@ template<typename B> struct Runner{
         void udelay(uint32_t us){const uint64_t end=r.b->nowUs()+us;while(r.b->nowUs()<end)r.b->relax();}
         void except(uint32_t chid,uint32_t s,uint32_t d,uint32_t c){
             Line l;l.raw("{\"nv_disp_exc\":1,\"chid\":");l.dec(chid);l.raw(",\"stat\":\"");l.hex(s);l.raw("\",\"data\":\"");
-            l.hex(d);l.raw("\",\"code\":\"");l.hex(c);l.raw("\"}\n");r.b->emit(l.t);}
+            l.hex(d);l.raw("\",\"code\":\"");l.hex(c);l.raw("\",\"mthd\":\"");l.hex((s&0xfff)<<2);l.raw("\",\"type\":");l.dec((s>>12)&7);
+            l.raw("}\n");r.b->emit(l.t);}
         void diff(uint32_t m,uint32_t a,uint32_t c){
             Line l;l.raw("{\"nv_disp_diff\":\"");l.hex(m);l.raw("\",\"assy\":\"");l.hex(a);l.raw("\",\"arm\":\"");l.hex(c);
             l.raw("\",\"rewritten\":");l.dec(r.plan.Rewritten(m)?1:0);l.raw("}\n");r.b->emit(l.t);}
@@ -97,7 +98,7 @@ template<typename B> struct Runner{
             Line l;l.raw("{\"nv_disp_dump\":\"");l.hex(addr);l.raw("\",\"w\":[");
             for(uint32_t i=0;i<n;++i){if(i)l.raw(",");l.raw("\"");l.hex(w[i]);l.raw("\"");}
             l.raw("]}\n");r.b->emit(l.t);}
-        bool call(uint32_t){return false;} // no dynamic steps in step 3
+        bool call(uint32_t,uint32_t){return false;} // no dynamic steps in step 3
         void log(uint32_t i,const Step& s,uint32_t got,bool ok){
             Line l;l.raw("{\"nv_disp_step\":");l.dec(i);l.raw(",\"list\":\"");l.s(tag);l.raw("\",\"op\":\"");l.s(OpName(s.op));
             l.raw("\",\"reg\":\"");l.hex(s.op==Op::VramCopy||s.op==Op::VramWrite||s.op==Op::VramPoll||s.op==Op::VramPollAny||s.op==Op::SurfFill?s.vram:s.reg);
