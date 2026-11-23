@@ -195,13 +195,14 @@ template<typename Io> struct DpTrainer{
         r.pc2conf[0]=r.pc2conf[1]=0;++r.drives;
         for(uint32_t i=0;i<l.nr;++i){
             const uint8_t lane=uint8_t((r.stat[4+(i>>1)]>>((i&1)*4))&0xf);
-            uint8_t lpc2=uint8_t((pc2stat>>(i*2))&3),lpre=uint8_t((lane&0x0c)>>2),lvsw=uint8_t(lane&3),hivs=uint8_t(3-lpre);
-            if(lpc2>=3)lpc2=3|0x4;
+            // Post-cursor2 forced to 0 (review 23 Nov): drive strictly from the VBIOS pc=0 table.
+            uint8_t lpc2=0,lpre=uint8_t((lane&0x0c)>>2),lvsw=uint8_t(lane&3),hivs=uint8_t(3-lpre);
+            (void)pc2stat;
             if(lpre>=3){lpre=3|0x4;lvsw=hivs=uint8_t(3-(lpre&3));}
             else if(lvsw>=hivs)lvsw=hivs|0x4;
             r.conf[i]=uint8_t((lpre<<3)|lvsw);
             r.pc2conf[i>>1]|=uint8_t(lpc2<<((i&1)*4));
-            DpCfg c{};if(!io.drive(i,uint8_t(lpc2&3),uint8_t(lvsw&3),uint8_t(lpre&3),c))continue;
+            DpCfg c{};if(!io.drive(i,uint8_t(lpc2&3),uint8_t(lvsw&3),uint8_t(lpre&3),c)){r.err=-7;return -1;} // no table entry: fail
             const uint32_t sh=i*8,lo=l.Loff();
             const uint32_t pu=c.pu&0xf;
             uint32_t d0=io.rd(0x61c118+lo)&~(0xffu<<sh),d1=io.rd(0x61c120+lo)&~(0xffu<<sh),d2=io.rd(0x61c130+lo);
@@ -250,8 +251,16 @@ template<typename Io> struct DpTrainer{
         return eq;
     }
     bool Run(){ // nvkm_dp_train_link (H7 312-366), sink only (no LTTPRs on this path)
+        // The plan programs EF and skips the ASSR branch: refuse sinks that differ.
+        if(!(l.dpcd[2]&0x80)){r.err=-8;return false;}            // DPCD 0x002 bit7 ENHANCED_FRAME_CAP
+        if(l.dpcd[0x0d]&1){r.err=-9;return false;}               // DPCD 0x00d bit0 ASSR (eDP) not handled
         uint8_t d0=1;if(io.aux(false,kDpcdPower,&d0,1)){r.err=-6;return false;}
         io.udelay(1000);
+        // Spread: mirror only the sink's MSA downspread bit (DPCD 0x107 bit4) to the
+        // source state the GOP left in 0x00ea80 bit4; never write 0xea80.
+        {uint8_t ds=0;if(io.aux(true,0x107,&ds,1)){r.err=-6;return false;}
+         const bool on=(io.rd(0x00ea80)>>4)&1&&(l.dpcd[3]&1);ds=uint8_t((ds&~0x10)|(on?0x10:0));
+         if(io.aux(false,0x107,&ds,1)){r.err=-6;return false;}}
         uint8_t sink[2]={uint8_t(l.bw),uint8_t(l.nr|(l.ef?0x80:0))};
         if(io.aux(false,kDpcdLinkBw,sink,2)){r.err=-6;return false;}
         r.cr=Cr();if(r.cr)r.eq=Eq();
@@ -366,6 +375,32 @@ inline void PushHeadEnable(Push& p,uint32_t h,const HeadMode& m){
     p.Mthd(HeadM(h,0x058),m.viewport);                               // VIEWPORT_SIZE_OUT
     p.Mthd(HeadM(h,0x064),m.rasterSize,m.syncEnd,m.blankEnd,m.blankStart,m.vertBlank2);
 }
+// Core state a core UPDATE promotes and that connecting the channel may reset
+// (the window connect did, live 23 Nov). The replay segment re-pushes every
+// documented core method with its ARM value before any UPDATE: global, 4 SORs,
+// 8 windows, 4 heads. Left out: UPDATE, the notifier pair (ours), the GET ports
+// (GET_RG_SCAN_LINE 0x220-0x23c, SET_GET_BLANKING_CTRL 0x240-0x25c) and the head
+// data port OUTPUT_SCALER_COEFF_VALUE (+0x214). Head context-DMA methods (CRC
+// +0x180, OLUT +0x288) are replayed only as 0 (preflight requires ARM 0).
+constexpr uint16_t kCoreHeadMthds[]={ // clc57d.h HEAD_SET_* offsets for head 0
+    0x000,0x004,0x008,0x00c,0x010,0x014,0x018,0x01c,0x028,0x02c,0x030,0x034,0x040,0x044,0x048,0x04c,0x058,0x05c,
+    0x064,0x068,0x06c,0x070,0x078,0x07c,0x080,0x098,0x09c,0x0a0,0x180,0x184,0x18c,0x194,0x198,0x19c,0x1a0,0x1a8,
+    0x218,0x220,0x224,0x228,0x22c,0x238,0x23c,0x240,0x244,0x248,0x24c,0x250,0x254,0x258,0x25c,0x260,0x264,0x268,
+    0x26c,0x270,0x280,0x284,0x288,0x28c,0x29c,0x2a0,0x2a4,0x2a8,0x2ac,0x2b0,0x2b4,0x2b8,0x2bc,0x2c0,0x2c4,0x2c8,
+    0x2cc,0x2d0,0x2d4,0x2d8,0x2dc,0x2e0,0x2e4,0x2e8,0x2ec,0x2f0,0x2f4,0x2f8,0x2fc,0x300,0x304,0x308,0x30c,0x310,
+    0x314,0x318,0x31c,0x320,0x324,0x328,0x32c,0x330,0x334,0x338,0x33c,0x340,0x344,0x348,0x34c,0x350,0x354,0x358,
+    0x35c,0x360};
+constexpr uint32_t kCoreHeadCount=sizeof(kCoreHeadMthds)/sizeof(kCoreHeadMthds[0]);
+constexpr uint32_t kCoreReplayCount=3+4*4+8*5+4*kCoreHeadCount;
+inline uint32_t CoreReplayMthd(uint32_t i){
+    static constexpr uint16_t glob[]={0x210,0x218,0x21c};
+    if(i<3)return glob[i];i-=3;
+    if(i<16)return 0x300+(i/4)*0x20+(i%4)*4;i-=16;
+    if(i<40)return 0x1000+(i/5)*0x80+(i%5)*4;i-=40;
+    return 0x2000+(i/kCoreHeadCount)*0x400+kCoreHeadMthds[i%kCoreHeadCount];
+}
+inline bool CoreHeadCtxDma(uint32_t m){const uint32_t o=(m-0x2000)%0x400;return m>=0x2000&&m<0x3000&&(o==0x180||o==0x288);}
+
 struct HeadConfig{
     Config base{};                 // step-3 layout (instmem, core pushbuffer, sync) and GOP state; coreChannel forced on
     uint32_t head=1, sor=2, window=2;
@@ -373,20 +408,34 @@ struct HeadConfig{
     DpLink dp{};
     HeadMode mode{};
     PllCoef vpll{};
+    PllLimits vpll0{};             // VBIOS limits of VPLL0, for the VPLL0 frequency gate
     DpSf sf{};
     uint32_t windowFmtUsage=0xf, windowUsage=0x00117fff; // corec57d_init values
     uint32_t routeRestore=0x03;    // 0x612508[4:0] the VBIOS left (probe 058a8cd8: 0x603 -> SOR2, already routed)
     int32_t watermarkOverride=0x15;// GOP's head-0 DP watermark for the identical mode/link (0x616550 = 0x08000015);
                                    // nouveau's formula gives 18 ("close to vbios numbers, but not right", nv50.c 1252). -1 = formula
     bool pauseAfterModeset=true;
+    uint32_t coreReplayVal[kCoreReplayCount]{}; // ARM values of CoreReplayMthd(i), read when the plan is built
 };
-struct HeadPushes{Push core;uint32_t enableEnd=0,disableEnd=0;};
+template<typename Rd> inline void ReadCoreReplay(HeadConfig& c,Rd rd){
+    for(uint32_t i=0;i<kCoreReplayCount;++i){const uint32_t m=CoreReplayMthd(i);c.coreReplayVal[i]=rd(RegArm(kChidCore,m));}
+}
+// Core ring segments: [replay] [rung: notifier-only UPDATE] [enable] [disable].
+struct HeadPushes{Push core;uint32_t replayEnd=0,rungEnd=0,enableEnd=0,disableEnd=0;};
 inline uint32_t SorCtl(const HeadConfig& c){
     return (1u<<c.head)|((c.dp.link==2?c57d::SOR_PROTOCOL_DP_B:c57d::SOR_PROTOCOL_DP_A)<<8);}
-// Core push 1 (enable) then push 2 (disable), back to back in the core ring.
 inline void BuildHeadPushes(const HeadConfig& c,HeadPushes& out){
     Push& p=out.core;
-    p.Mthd(c57d::SET_CONTEXT_DMA_NOTIFIER,kHandleSync);                // corec57d_init 40
+    p.Mthd(c57d::SET_CONTEXT_DMA_NOTIFIER,kHandleSync);                // ours (corec57d_init 40)
+    for(uint32_t i=0;i<kCoreReplayCount;){                            // replay, consecutive methods share a header
+        uint32_t j=i+1;while(j<kCoreReplayCount&&CoreReplayMthd(j)==CoreReplayMthd(j-1)+4)++j;
+        p.Put(PushHeader(CoreReplayMthd(i),j-i));
+        for(uint32_t k=i;k<j;++k)p.Put(CoreHeadCtxDma(CoreReplayMthd(k))?0u:c.coreReplayVal[k]);
+        i=j;
+    }
+    out.replayEnd=p.count*4;
+    PushCoreUpdate(p,0,0,true);                                       // rung: nothing changes, notifier only
+    out.rungEnd=p.count*4;
     p.Mthd(c57d::SorSetControl(c.sor),SorCtl(c));                    // sorc37d_ctrl
     PushHeadEnable(p,c.head,c.mode);
     p.Mthd(c57d::WindowSetControl(c.window),c.head);                 // window -> head
@@ -399,37 +448,55 @@ inline void BuildHeadPushes(const HeadConfig& c,HeadPushes& out){
     PushCoreUpdate(p,0,0,true);
     out.disableEnd=p.count*4;
 }
+// Head-0 / SOR1 / window-0 core methods may appear only with their ARM value (the replay).
+inline bool Head0MethodRange(uint32_t m){return (m>=0x2000&&m<0x2400)||(m>=0x320&&m<0x340)||(m>=0x1000&&m<0x1080);}
+inline bool PushHead0MatchesArm(const HeadConfig& c,const Push& p){
+    for(uint32_t i=0;i<p.count;){const uint32_t hdr=p.words[i++];if(hdr>>29)continue;
+        const uint32_t n=(hdr>>18)&0x3ff,m=hdr&0x3ffc;
+        for(uint32_t k=0;k<n&&i<p.count;++k,++i){const uint32_t mm=m+k*4;if(!Head0MethodRange(mm))continue;
+            bool found=false;
+            for(uint32_t r=0;r<kCoreReplayCount;++r)if(CoreReplayMthd(r)==mm){
+                found=true;if(p.words[i]!=(CoreHeadCtxDma(mm)?0u:c.coreReplayVal[r]))return false;}
+            if(!found)return false;}
+    }
+    return true;
+}
 
 // ----------------------------------------------------------- supervisor
 constexpr uint32_t kRegSuperAck=0x611860, kRegSuperStat=0x6107a8, kSuperRelease=0x80000000;
 constexpr uint32_t RegSuperHead(uint32_t h){return 0x6107ac+h*4;}
-enum CallId:uint32_t{kCallDpTrain=1};
-// One supervisor stage (gv100_disp_super 835-891 + intr_ctrl_disp 942-947):
-// wait CTRL_DISP bit, ack it, require head 0's mask clear, work, clear masks, release.
+enum CallId:uint32_t{kCallDpTrain=1,kCallSuperFlush=2,kCallSuperFlushVpll=3};
+// Stage-2 head-1 work (2.1 VPLL with readback, 2.2 OnInt2/rgclk/DP SF/SOR clock).
+inline void AddStage2Work(Plan& p,const HeadConfig& c){
+    const uint32_t h=c.head,hoff=h*0x800,s=c.sor*0x800,lo=c.dp.Loff();
+    p.Add(Op::Expect,RegAssy(kChidCore,c57d::HeadM(h,0x00c)),~0u,c.mode.pclkHz,0,"2.1: ASSY head pclk as planned");
+    AddVpll(p,h,c.vpll);
+    p.Add(Op::Expect,RegVpll(h,0x04),~0u,(c.vpll.P<<16)|(c.vpll.N<<8)|c.vpll.M,0,"2.1: VPLL coefficients read back");
+    p.Add(Op::Expect,RegVpll(h,0x10),~0u,c.vpll.fN<<16,0,"2.1: VPLL fN read back");
+    p.Add(Op::CopyMask,0x61c10c+lo,0x40ff4001,0x616540+hoff,0,"2.2 OnInt2: head SF <- dpctrl (IEDT[11])",0,0xbf00bffe);
+    p.Add(Op::Mask,0x612200+hoff,0xf,0,0,"2.2 rgclk div 0 (gf119_head_rgclk)");
+    p.Add(Op::Mask,0x616568+hoff,0xffff,c.sf.h,0,"2.2 DP audio sym h (gv100.c 66)");
+    p.Add(Op::Mask,0x61656c+hoff,0xffffff,c.sf.v,0,"2.2 DP audio sym v (gv100.c 67)");
+    p.Add(Op::Mask,0x616550+hoff,0x0c00003f,0x08000000|c.sf.watermark,0,"2.2 DP watermark (gv100.c 58)");
+    p.Add(Op::Mask,0x612300+s,0x707,0,0,"2.2 SOR clock div (gf119_sor_clock, DP link A)");
+}
+// One stage (gv100_disp_super 835-891, intr_ctrl_disp 942-947): pending in CTRL_DISP
+// 0x611c30 or the event status 0x611860; a core exception (0x611854 bit0) fails the
+// wait at once. Head 0 flagged is a sticky warning: the stage still finishes.
 template<typename F> inline void AddSuper(Plan& p,uint32_t stage,const char* name,F work){
     const uint32_t bit=1u<<(stage-1);
-    p.Add(Op::Poll,kRegCtrlDisp,bit,bit,kTimeoutMs,name);
+    p.Add(Op::PollOr,kRegCtrlDisp,bit,bit,kTimeoutMs,name,0,kRegSuperAck,kRegExcOther,1);
     p.Add(Op::Write,kRegSuperAck,~0u,bit,0,"ack supervisor (0x611860)");
     p.Add(Op::Log,kRegSuperStat,0,0,0,"supervisor status 0x6107a8");
     p.Add(Op::Log,RegSuperHead(1),0,0,0,"head 1 supervisor mask");
-    p.Add(Op::Expect,RegSuperHead(0),0x00011000,0,0,"head 0 untouched (no OR/pclk work)");
+    p.Add(Op::ExpectSoft,RegSuperHead(0),0x00011000,0,0,"HEAD 0 FLAGGED by supervisor (sticky warning; stage still completes)");
     work();
     for(uint32_t h=0;h<4;++h)p.Add(Op::Write,RegSuperHead(h),~0u,0,0,"clear head mask");
     p.Add(Op::Write,kRegSuperStat,~0u,kSuperRelease,0,"release supervisor");
 }
 inline void AddSupervisorsEnable(Plan& p,const HeadConfig& c){
-    const uint32_t h=c.head,hoff=h*0x800,s=c.sor*0x800,lo=c.dp.Loff();
     AddSuper(p,1,"supervisor 1",[&]{ /* 1.0 OffInt1: nothing ARMed on head 1 */ });
-    AddSuper(p,2,"supervisor 2",[&]{
-        p.Add(Op::Expect,RegAssy(kChidCore,c57d::HeadM(h,0x00c)),~0u,c.mode.pclkHz,0,"2.1: ASSY head pclk as planned");
-        AddVpll(p,h,c.vpll);                                                       // 2.1
-        p.Add(Op::CopyMask,0x61c10c+lo,0x40ff4001,0x616540+hoff,0,"2.2 OnInt2: head SF <- dpctrl (IEDT[11])",0,0xbf00bffe);
-        p.Add(Op::Mask,0x612200+hoff,0xf,0,0,"2.2 rgclk div 0 (gf119_head_rgclk)");
-        p.Add(Op::Mask,0x616568+hoff,0xffff,c.sf.h,0,"2.2 DP audio sym h (gv100.c 66)");
-        p.Add(Op::Mask,0x61656c+hoff,0xffffff,c.sf.v,0,"2.2 DP audio sym v (gv100.c 67)");
-        p.Add(Op::Mask,0x616550+hoff,0x0c00003f,0x08000000|c.sf.watermark,0,"2.2 DP watermark (gv100.c 58)");
-        p.Add(Op::Mask,0x612300+s,0x707,0,0,"2.2 SOR clock div (gf119_sor_clock, DP link A)");
-    });
+    AddSuper(p,2,"supervisor 2",[&]{AddStage2Work(p,c);});
     AddSuper(p,3,"supervisor 3",[&]{ /* 3.0 OnInt3: empty for IEDT[11] */ });
 }
 inline void AddSupervisorsDisable(Plan& p,const HeadConfig& c){
@@ -439,14 +506,26 @@ inline void AddSupervisorsDisable(Plan& p,const HeadConfig& c){
         p.Add(Op::Mask,0x616540+hoff,0x1,0,0,"2.0 OffInt2: head SF enable off (IEDT[11])");});
     AddSuper(p,3,"supervisor 3 (disable)",[&]{});
 }
-// Best effort: ack anything pending so the core channel cannot stay wedged.
-inline void AddSupervisorFlush(Plan& p,uint32_t ms){
-    for(uint32_t i=0;i<3;++i){
-        p.Add(Op::PollSoft,kRegCtrlDisp,0x7,0x7,ms,"pending supervisor? (soft)");
-        p.Add(Op::CopyMask,kRegCtrlDisp,0x7,kRegSuperAck,0,"ack pending supervisor bits",0,0);
-        for(uint32_t h=0;h<4;++h)p.Add(Op::Write,RegSuperHead(h),~0u,0,0,"clear head mask");
-        p.Add(Op::Write,kRegSuperStat,~0u,kSuperRelease,0,"release supervisor");
+// Abort flush (dynamic; called through Op::Call): up to 3 rounds, each waits for
+// any stage pending in 0x611c30 | 0x611860, then acks and releases only the stages
+// seen. Stage 2 during an enable gets the head-1 stage-2 work (VPLL1 included).
+// Io: rd, wr, udelay, log(const char*,uint32_t).
+template<typename Io> inline uint32_t SupervisorFlush(Io& io,const HeadConfig& c,bool stage2Work,uint32_t ms){
+    uint32_t handled=0;
+    for(uint32_t round=0;round<3;++round){
+        uint32_t bits=0;
+        for(uint32_t t=0;t<ms*10;++t){bits=(io.rd(kRegCtrlDisp)|io.rd(kRegSuperAck))&7;if(bits)break;io.udelay(100);}
+        if(!bits){io.note("supervisor flush: nothing pending; 0x6107a8",io.rd(kRegSuperStat));break;}
+        for(uint32_t bit=1;bit<=4;bit<<=1){
+            if(!(bits&bit))continue;
+            io.wr(kRegSuperAck,bit);io.note("supervisor flush: acked stage",bit);
+            if(io.rd(RegSuperHead(0))&0x11000)io.note("supervisor flush: HEAD 0 FLAGGED",io.rd(RegSuperHead(0)));
+            if(bit==2&&stage2Work){Plan w;AddStage2Work(w,c);(void)Run(w,0,w.count,io,true);}
+            for(uint32_t h=0;h<4;++h)io.wr(RegSuperHead(h),0);
+            io.wr(kRegSuperStat,kSuperRelease);++handled;
+        }
     }
+    return handled;
 }
 
 // ----------------------------------------------------------------- plan
@@ -455,18 +534,38 @@ inline const char* HPhaseName(HPhase p){
     static const char* n[]={"preflight","vram","instmem","core","core-check","sor","dp-pre","dp-train","dp-post","modeset","verify","disable","dp-off","core-off"};
     return n[uint32_t(p)];}
 // Every core method a core UPDATE promotes: global, SORs, windows, heads.
-inline void AddCoreDiff(Plan& p,const char* when){
-    p.Add(Op::AssyArmDiff,kChidCore,0x200,0x400,0,when);
-    p.Add(Op::AssyArmDiff,kChidCore,0x1000,0x1400,0,when);
-    p.Add(Op::AssyArmDiff,kChidCore,0x2000,0x3000,0,when);
+// strict=1: fail on any known method that differs (except ours); unknown ones are logged.
+inline void AddCoreDiff(Plan& p,const char* when,uint32_t strict=0){
+    p.Add(Op::AssyArmDiff,kChidCore,0x200,0x400,0,when,0,strict);
+    p.Add(Op::AssyArmDiff,kChidCore,0x1000,0x1400,0,when,0,strict);
+    p.Add(Op::AssyArmDiff,kChidCore,0x2000,0x3000,0,when,0,strict);
 }
+inline void AddCoreKick(Plan& p,const HeadConfig& c,uint32_t put,const char* what){
+    p.Add(Op::VramWrite,0,~0u,kNtfyNotBegun,0,"core notifier NOT_BEGUN",c.base.syncVram+0);
+    p.Add(Op::Kick,RegPut(kChidCore),~0u,put,0,what);
+}
+// Allow-list of MMIO the head plan may write (review 23 Nov issue 11).
+struct Range{uint32_t lo,hi;};
+constexpr Range kHeadAllow[]={
+    {0x001700,0x001704},{0x070000,0x070004},{0x610010,0x610018},{0x610078,0x61007c},
+    {0x6104e0,0x6104e4},{0x610b20,0x610b30},{0x680000,0x680004},                  // instmem, FE, core channel
+    {0x611020,0x611024},{0x611854,0x611858},{0x611860,0x611864},{0x6107a8,0x6107bc}, // core exception, supervisors
+    {0x00ef40,0x00ef60},{0x612a00,0x612a04},{0x616d40,0x616d44},{0x616d50,0x616d54},{0x616d68,0x616d70}, // head 1
+    {0x612508,0x61250c},{0x612588,0x61258c},{0x613300,0x613304},{0x61d000,0x61d800}, // SOR2, macro 2
+    {0x00da70,0x00dac0},                                                           // AUX ch 4 (0xd930 + 4*0x50)
+};
+inline bool HeadAllowed(uint32_t a){for(const auto& r:kHeadAllow)if(a>=r.lo&&a<r.hi)return true;return false;}
+
 inline Err BuildHeadPlan(HeadConfig c,InstImage& img,HeadPushes& pushes,Plan& p){
     c.base.coreChannel=true;
     if(c.head==0||c.head>3||c.sor>3||c.window>7||c.dp.nr<1||c.dp.nr>4)return Err::Bounds;
     if(Err e=Validate(c.base);e!=Err::Ok)return e;
     if(Err e=BuildInstImage(c.base,img);e!=Err::Ok)return e;
     BuildHeadPushes(c,pushes);if(pushes.core.overflow)return Err::PushFull;
+    if(!PushHead0MatchesArm(c,pushes.core))return Err::Usage;
     p.MarkRewritten(pushes.core.words,pushes.enableEnd/4);
+    for(uint32_t i=0;i<kCoreReplayCount;++i)Plan::Set(p.known,CoreReplayMthd(i));
+    Plan::Set(p.known,0x208);Plan::Set(p.ours,0x208);Plan::Set(p.known,0x20c);Plan::Set(p.ours,0x20c);
     const auto& g=c.base.gop;const uint32_t h=c.head;
     auto B=[&](HPhase x){p.BeginN(uint32_t(x));};
     B(HPhase::Preflight);
@@ -475,24 +574,30 @@ inline Err BuildHeadPlan(HeadConfig c,InstImage& img,HeadPushes& pushes,Plan& p)
     p.Add(Op::Expect,RegChnCtl(kChidCore),0xffff,g.ctlCore,0,"core CHNCTL as left by GOP");
     p.Add(Op::Expect,RegChnStatus(kChidCore),kCoreStateMask,kCoreEfiOperation,0,"core STATE EFI_OPERATION (7)");
     p.Add(Op::Expect,kRegCtrlDisp,0x187,0,0,"no supervisor/error/awaken pending");
+    p.Add(Op::Expect,kRegSuperAck,0x7,0,0,"no supervisor event pending (0x611860)");
     // RM_INTR_STAT latches with EN=0 when MSK routes the bit (survey: 0x611c00 = 7 with
     // 0x611d80 = 0), so polling CTRL_DISP needs the supervisor bits in its MSK (GOP: 0x1ff).
     p.Add(Op::Expect,0x611cf0,0x7,0x7,0,"CTRL_DISP MSK routes supervisors 1-3 (0x611c30 latches)");
     p.Add(Op::Log,0x611db0,0,0,0,"CTRL_DISP EN (expected 0: polled, no interrupt)");
-    p.Add(Op::Log,0x611860,0,0,0,"supervisor event status before");
+    p.Add(Op::Expect,kRegExcOther,1,0,0,"no core exception latched");
     p.Add(Op::Expect,RegArm(kChidCore,c57d::SorSetControl(c.sor)),0xff,0,0,"SOR2 owns no head");
     for(uint32_t s=0;s<4;++s)p.Add(Op::Expect,RegArm(kChidCore,c57d::SorSetControl(s)),1u<<h,0,0,"no SOR drives head 1");
     p.Add(Op::Expect,RegArm(kChidCore,c57d::SorSetControl(g.sor)),~0u,g.sorCtl,0,"SOR1 still DP-B on head 0");
     p.Add(Op::Expect,RegArm(kChidCore,c57d::WindowSetControl(c.window)),0xf,c57d::OWNER_NONE,0,"window owned by no head");
     p.Add(Op::Expect,RegArm(kChidCore,c57d::HeadRasterSize(0)),~0u,g.headRaster,0,"head 0 raster (GOP)");
+    for(uint32_t hh=0;hh<4;++hh){
+        p.Add(Op::Expect,RegArm(kChidCore,c57d::HeadM(hh,0x180)),~0u,0,0,"head CRC ctxdma 0 (replayed as 0)");
+        p.Add(Op::Expect,RegArm(kChidCore,c57d::HeadM(hh,0x288)),~0u,0,0,"head OLUT ctxdma 0 (replayed as 0)");}
+    if(c.vpll0.refclk)p.Add(Op::ExpectVpll,RegVpll(0,0),1,c.mode.pclkHz/1000,0,"VPLL0 runs head 0's pclk (our PLL encoding)",0,c.vpll0.refclk);
     p.Add(Op::Log,RegRoute(c.dcb.orMask,c.dcb.link),0,0,0,"route register before");
-    p.Add(Op::Log,RegVpll(h,0),0,0,0,"VPLL before");
-    AddCoreDiff(p,"core ASSY == ARM (heads, SORs, windows), or our own methods");
+    {const uint32_t regs[]={RegVpll(h,0),RegVpll(h,4),RegVpll(h,0x10),0x610078u,0x625488u,0x61d004u,0x612a00u,0x612200u,0x612b00u,0x613300u,0x00ea80u};
+     for(uint32_t r:regs)p.Add(Op::Log,r,0,0,0,"baseline");}
+    AddCoreDiff(p,"core ASSY == ARM (heads, SORs, windows), or replayed");
     AddExceptionCheck(p,0);
     B(HPhase::Vram);
     p.Add(Op::VramCopy,uint32_t(Blob::Inst),kInstBytes,0,0,"instmem image",c.base.instVram);
     p.Add(Op::VramCopy,uint32_t(Blob::SyncInit),0x1000,0,0,"sync page zeroed",c.base.syncVram);
-    p.Add(Op::VramCopy,uint32_t(Blob::CorePush),kPushBytes,0,0,"core pushbuffer (enable + disable)",c.base.corePushVram);
+    p.Add(Op::VramCopy,uint32_t(Blob::CorePush),kPushBytes,0,0,"core pushbuffer (replay, rung, enable, disable)",c.base.corePushVram);
     p.Add(Op::Fence,0,0,0,0,"sfence");
     p.Add(Op::Write,kRegBar1Flush,~0u,1,0,"BAR1 write flush");
     p.Add(Op::Poll,kRegBar1Flush,0x2,0,kTimeoutMs,"flush done");
@@ -507,11 +612,24 @@ inline Err BuildHeadPlan(HeadConfig c,InstImage& img,HeadPushes& pushes,Plan& p)
     B(HPhase::Instmem);
     p.Add(Op::Write,kRegInstAddr,~0u,uint32_t(c.base.instVram>>16),0,"instmem addr first");
     p.Add(Op::Write,kRegInstTarget,~0u,0x9,0,"instmem valid, VRAM");
+    if(c.base.feEnable)p.Add(Op::Mask,kRegFeEnable,1,1,0,"fallback rung: 0x610078 |= 1 (tu102.c 240)");
     B(HPhase::Core);
     AddChannelInit(p,kChidCore,c.base.corePushVram);
     B(HPhase::CoreCheck);
-    AddCoreDiff(p,"after core connect: ASSY still == ARM (decisive)");
     p.Add(Op::Expect,RegArm(kChidCore,c57d::HeadRasterSize(0)),~0u,g.headRaster,0,"head 0 ARM survived connect");
+    AddCoreDiff(p,"after core connect (logged; reset methods are replayed next)");
+    p.Add(Op::Kick,RegPut(kChidCore),~0u,pushes.replayEnd,0,"core PUT: replay ARM state (methods only, no UPDATE)");
+    p.Add(Op::PollOr,RegGet(kChidCore),~0xfffff003u|0xffc,pushes.replayEnd,kTimeoutMs,"core GET == PUT (replay fetched)",0,RegGet(kChidCore),kRegExcOther,1);
+    AddCoreDiff(p,"after replay: ASSY == ARM (strict)",1);
+    AddCoreKick(p,c,pushes.rungEnd,"core PUT: rung, notifier-only UPDATE");
+    p.Add(Op::PollOr,RegGet(kChidCore),~0u,pushes.rungEnd,kTimeoutMs,"core GET == PUT (rung)",0,RegGet(kChidCore),kRegExcOther,1);
+    p.Add(Op::VramPoll,0,3u<<kNtfyStatusShift,kNtfyFinished<<kNtfyStatusShift,kTimeoutMs,"rung notifier FINISHED",c.base.syncVram+0);
+    p.Add(Op::Expect,kRegCtrlDisp,0x7,0,0,"rung raised no supervisor");
+    p.Add(Op::Expect,kRegSuperAck,0x7,0,0,"rung raised no supervisor event");
+    p.Add(Op::Expect,kRegExcOther,1,0,0,"rung raised no core exception");
+    p.Add(Op::Expect,RegArm(kChidCore,c57d::HeadRasterSize(0)),~0u,g.headRaster,0,"head 0 raster unchanged by the rung");
+    p.Add(Op::Expect,RegArm(kChidCore,c57d::HeadPixelClock(0)),~0u,g.headPclk,0,"head 0 pclk unchanged by the rung");
+    p.Add(Op::Expect,RegArm(kChidCore,c57d::SorSetControl(g.sor)),~0u,g.sorCtl,0,"SOR1 unchanged by the rung");
     B(HPhase::Sor);
     AddSorPower(p,c.sor);
     AddRoute(p,c.dcb,RouteValue(c.sor),"route macro -> SOR (gm200_sor_route_set)");
@@ -524,12 +642,14 @@ inline Err BuildHeadPlan(HeadConfig c,InstImage& img,HeadPushes& pushes,Plan& p)
     AddAfterLt(p,c.dp);
     p.Add(Op::Expect,0x61c10c+c.dp.Loff(),0x001f4001,(((1u<<c.dp.nr)-1)<<16)|(c.dp.ef?0x4000u:0)|1,0,"dpctrl: lanes, EF, enabled");
     B(HPhase::Modeset);
-    p.Add(Op::VramWrite,0,~0u,kNtfyNotBegun,0,"core notifier NOT_BEGUN",c.base.syncVram+0);
-    p.Add(Op::Kick,RegPut(kChidCore),~0u,pushes.enableEnd,0,"core PUT: head 1 + SOR2 + window owner + UPDATE");
+    AddCoreDiff(p,"right before the modeset kick: ASSY == ARM (strict)",1);
+    AddCoreKick(p,c,pushes.enableEnd,"core PUT: head 1 + SOR2 + window owner + UPDATE");
     AddSupervisorsEnable(p,c);
-    p.Add(Op::Poll,RegGet(kChidCore),~0u,pushes.enableEnd,kTimeoutMs,"core GET == PUT");
+    p.Add(Op::PollOr,RegGet(kChidCore),~0u,pushes.enableEnd,kTimeoutMs,"core GET == PUT",0,RegGet(kChidCore),kRegExcOther,1);
     p.Add(Op::VramPoll,0,3u<<kNtfyStatusShift,kNtfyFinished<<kNtfyStatusShift,kTimeoutMs,"core notifier FINISHED",c.base.syncVram+0);
     p.Add(Op::Expect,kRegExcOther,1,0,0,"no core exception");
+    {const uint32_t regs[]={0x612a00u,0x613300u,0x612200u,0x612b00u};
+     for(uint32_t r:regs)p.Add(Op::Log,r,0,0,0,"after modeset (head-0 0x612200 / 0x612b00 must equal baseline)");}
     B(HPhase::Verify);
     p.Add(Op::Expect,RegArm(kChidCore,c57d::HeadRasterSize(0)),~0u,g.headRaster,0,"head 0 raster unchanged");
     p.Add(Op::Expect,RegArm(kChidCore,c57d::HeadPixelClock(0)),~0u,g.headPclk,0,"head 0 pclk unchanged");
@@ -540,10 +660,9 @@ inline Err BuildHeadPlan(HeadConfig c,InstImage& img,HeadPushes& pushes,Plan& p)
     p.Add(Op::Log,0x616330+h*0x800,0,0,0,"head 1 RG position (moving = scanning)");
     if(c.pauseAfterModeset)p.Add(Op::Pause,0,0,0,0,"observer: monitor on conn2 shows a (black) 4K60 signal, conn0 unchanged?");
     B(HPhase::Disable);
-    p.Add(Op::VramWrite,0,~0u,kNtfyNotBegun,0,"core notifier NOT_BEGUN",c.base.syncVram+0);
-    p.Add(Op::Kick,RegPut(kChidCore),~0u,pushes.disableEnd,0,"core PUT: detach SOR2, window owner none, UPDATE");
+    AddCoreKick(p,c,pushes.disableEnd,"core PUT: detach SOR2, window owner none, UPDATE");
     AddSupervisorsDisable(p,c);
-    p.Add(Op::Poll,RegGet(kChidCore),~0u,pushes.disableEnd,kTimeoutMs,"core GET == PUT");
+    p.Add(Op::PollOr,RegGet(kChidCore),~0u,pushes.disableEnd,kTimeoutMs,"core GET == PUT",0,RegGet(kChidCore),kRegExcOther,1);
     p.Add(Op::VramPoll,0,3u<<kNtfyStatusShift,kNtfyFinished<<kNtfyStatusShift,kTimeoutMs,"core notifier FINISHED",c.base.syncVram+0);
     B(HPhase::DpOff);
     AddDisableLt(p,c.dp);
@@ -551,38 +670,54 @@ inline Err BuildHeadPlan(HeadConfig c,InstImage& img,HeadPushes& pushes,Plan& p)
     B(HPhase::CoreOff);
     AddChannelFini(p,kChidCore,kTimeoutMs);
     AddPbRestore(p,kChidCore,g);
+    if(c.base.feEnable)p.Add(Op::Write,kRegFeEnable,~0u,g.feEnable,0,"0x610078 = GOP value");
     p.Add(Op::Write,kRegInstTarget,~0u,g.instTarget,0,"instmem invalid");
     p.Add(Op::Write,kRegInstAddr,~0u,g.instAddr,0,"instmem addr 0");
     p.Add(Op::Expect,RegArm(kChidCore,c57d::HeadRasterSize(0)),~0u,g.headRaster,0,"head 0 still the GOP mode");
     p.EndN(uint32_t(HPhase::Count));
     return p.overflow?Err::TooManyOps:Err::Ok;
 }
-// Abort for the head plan (best effort): flush supervisors, detach via the
-// disable push if the core is connected, DisableLT, core fini, instmem off.
-inline void BuildHeadAbort(const HeadConfig& c,HPhase reached,const HeadPushes& pushes,Plan& p,uint32_t ms=100){
+// Which core UPDATEs had been kicked when a run stopped (review issue 2).
+enum class Kicked:uint8_t{None,Replay,Rung,Enable,Disable};
+// Abort (best effort): log and ack a core exception; flush supervisors only if an
+// UPDATE was kicked (stage-2 work with VPLL1 when it was the enable); detach only
+// if the enable was kicked; then DisableLT, route restore, core fini, instmem off.
+inline void BuildHeadAbort(const HeadConfig& c,HPhase reached,const HeadPushes& pushes,Plan& p,uint32_t ms=100,Kicked kicked=Kicked::Enable){
     p.BeginN(0);
-    if(reached>=HPhase::Modeset){
-        AddSupervisorFlush(p,ms);
+    p.Add(Op::AckException,kChidCore,1,0,0,"log 0x611020/24/28, W1C 0x611854, ack 0x90000000 (gv100.c 992-994, 932)",0,kRegExcOther);
+    const bool update=kicked==Kicked::Rung||kicked==Kicked::Enable||kicked==Kicked::Disable;
+    if(update)p.Add(Op::Call,kicked==Kicked::Enable?kCallSuperFlushVpll:kCallSuperFlush,0,0,ms,"supervisor flush (stages seen only)");
+    if(kicked==Kicked::Enable){
         p.Add(Op::Kick,RegPut(kChidCore),~0u,pushes.disableEnd,0,"core PUT: disable push");
-        AddSupervisorFlush(p,ms);
-    }
+        p.Add(Op::Call,kCallSuperFlush,0,0,ms,"supervisor flush after detach");}
     if(reached>=HPhase::DpPre){AddDisableLt(p,c.dp);}
     if(reached>=HPhase::Sor)AddRoute(p,c.dcb,c.routeRestore,"route restored to the VBIOS value");
     if(reached>=HPhase::Core){AddChannelFini(p,kChidCore,ms,false);AddPbRestore(p,kChidCore,c.base.gop);}
     if(reached>=HPhase::Instmem){
+        if(c.base.feEnable)p.Add(Op::Write,kRegFeEnable,~0u,c.base.gop.feEnable,0,"0x610078 = GOP value");
         p.Add(Op::Write,kRegInstTarget,~0u,c.base.gop.instTarget,0,"instmem invalid");
         p.Add(Op::Write,kRegInstAddr,~0u,c.base.gop.instAddr,0,"instmem addr 0");}
     if(reached>=HPhase::Vram&&c.base.praminCheck)p.Add(Op::Write,kRegPraminBase,~0u,c.base.praminRestore,0,"PRAMIN restored");
-    p.Add(Op::Log,RegArm(kChidCore,c57d::HeadRasterSize(0)),0,0,0,"final head 0 raster");
-    p.Add(Op::Log,RegChnStatus(kChidCore),0,0,0,"final core CHNSTATUS");
-    p.Add(Op::Log,kRegCtrlDisp,0,0,0,"final CTRL_DISP");
+    {const uint32_t regs[]={RegArm(kChidCore,c57d::HeadRasterSize(0)),RegChnStatus(kChidCore),kRegCtrlDisp,kRegSuperAck,kRegSuperStat,kRegExcOther};
+     for(uint32_t r:regs)p.Add(Op::Log,r,0,0,0,"final state");}
     p.EndN(1);
 }
-// Fill dcb/dp/vpll/sf from a VBIOS and the planned mode. False if any table is missing.
-inline bool ResolveHeadConfig(const Vbios& v,uint32_t dcbIndex,HeadConfig& c,DpOut& dpout){
+// FNV-1a over the VBIOS image the scripts were disassembled from (128 KiB PROM read).
+inline uint32_t VbiosHash(const Vbios& v){uint32_t h=2166136261u;for(uint32_t i=0;i<v.n;++i){h^=v.d[i];h*=16777619u;}return h;}
+// HBR2 lnkcmp script (dp.c 400-416, v0x30+): skip while bw < entry rate.
+inline uint32_t LnkcmpScript(const Vbios& v,uint32_t lnkcmp,uint32_t bw){
+    if(!lnkcmp)return 0;for(uint32_t n=0;n<16&&bw<v.r8(lnkcmp);++n)lnkcmp+=3;return v.r16(lnkcmp+1);}
+// Fill dcb/dp/vpll/sf from a VBIOS and the planned mode. False if any table is
+// missing or the hard-coded scripts do not match this VBIOS (review issue 7).
+// expectedHash: FNV-1a of the image (0 = skip, synthetic test images).
+inline bool ResolveHeadConfig(const Vbios& v,uint32_t dcbIndex,HeadConfig& c,DpOut& dpout,uint32_t expectedHash=0){
+    if(expectedHash&&VbiosHash(v)!=expectedHash)return false;
     if(!ParseDcb(v,dcbIndex,c.dcb)||c.dcb.type!=6||!(c.dcb.orMask&(1u<<c.sor)))return false;
     if(!FindDpOut(v,c.dcb.hasht,c.dcb.hashm,dpout))return false;
+    if(dpout.beforeLt!=0x611f||dpout.afterLt!=0x5bec||dpout.disableLt!=0x5c55)return false;
+    if(LnkcmpScript(v,dpout.lnkcmp,c.dp.bw)!=0x617b)return false;
     PllLimits lim{};if(!ParsePll(v,uint8_t(kPllVpll0+c.head),lim))return false;
+    if(!ParsePll(v,kPllVpll0,c.vpll0))return false;
     if(!Gt215PllCalc(lim,c.mode.pclkHz/1000,c.vpll))return false;
     c.dp.sor=c.sor;c.dp.link=c.dcb.link==2?2:1;
     if(!DpSymbols(c.mode,c.dp.bw,c.dp.nr,c.dp.ef,c.sf))return false;

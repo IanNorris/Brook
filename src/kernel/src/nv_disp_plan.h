@@ -341,6 +341,9 @@ enum class Op:uint8_t{
     SurfFill,   // io.fill(vram, bytes=value, pitch=mask, colour x, marker colour y, marker lines z)
     PraminRange,// value words at BAR0 kPramin+reg == blob(mask) words from byte x; got = first bad index
     Dump,       // read value words from reg and hand them to io.dump (diagnostics; never fails)
+    PollOr,     // until ((reg | x) & mask) == value; fails at once if y && (y & z) (exception), else on timeout
+    ExpectSoft, // (reg & mask) == value, else io.flag(step, got): a sticky warning, never fails
+    ExpectVpll, // VPLL at reg (+4 P|N|M, +0x10 fN<<16) runs at value kHz +- mask with refclk x kHz
 };
 enum class Blob:uint32_t{Inst,WndwPush,CorePush,SyncInit};
 struct Step{Op op;uint32_t reg,mask,value,timeoutMs;uint64_t vram;const char* what;uint32_t x,y,z;};
@@ -358,6 +361,11 @@ struct Plan{
             const uint32_t cnt=(hdr>>18)&0x3ff,m=hdr&0x3ffc;
             for(uint32_t k=0;k<cnt&&i<n;++k,++i){const uint32_t mm=(m+k*4)/4;if(mm<kMthds)rewritten[mm/32]|=1u<<(mm%32);}}}
     bool Rewritten(uint32_t mthd)const{const uint32_t mm=mthd/4;return mm<kMthds&&(rewritten[mm/32]>>(mm%32))&1;}
+    // Strict diffs (AssyArmDiff with x=1): fail on any difference in a known method
+    // except our own (ours); differences in methods not known are only logged.
+    uint32_t ours[kMthds/32]{},known[kMthds/32]{};
+    static void Set(uint32_t* b,uint32_t m){const uint32_t mm=m/4;if(mm<kMthds)b[mm/32]|=1u<<(mm%32);}
+    static bool Has(const uint32_t* b,uint32_t m){const uint32_t mm=m/4;return mm<kMthds&&(b[mm/32]>>(mm%32))&1;}
     uint32_t phaseBegin[kPhases+1]{};
     void Begin(Phase p){phaseBegin[uint32_t(p)]=count;}
     void BeginN(uint32_t p){phaseBegin[p]=count;}
@@ -502,6 +510,7 @@ inline void AddCapsCopy(Plan& p){
 inline void AddExceptionCheck(Plan& p,uint32_t window){
     p.Add(Op::Expect,kRegIntrDispatch,0x1e00,0,0,"no EXC_WIN/WINIM/OTHER/CTRL_DISP pending");
     p.Add(Op::Expect,kRegExcWin,1u<<window,0,0,"no window exception");
+    p.Add(Op::Expect,kRegExcOther,1,0,0,"no core exception (0x611854 bit0)");
 }
 inline void AddKickAndWait(Plan& p,const Config& c,uint32_t putBytes,uint32_t handle,uint64_t offset,uint32_t ntfy){
     const uint32_t ch=ChidWndw(c.window);
@@ -648,7 +657,9 @@ inline void BuildAbort(const Config& c,Phase reached,Plan& p,uint32_t ms=100){
         p.Add(Op::Expect,RegChnCtl(ch),0x6013,0x0001,0,"CHNCTL == ALLOCATE only");
         AddPbRestore(p,ch,c.gop);
     }
-    if(reached>=Phase::Core&&c.coreChannel){AddChannelFini(p,kChidCore,ms);AddPbRestore(p,kChidCore,c.gop);}
+    if(reached>=Phase::Core&&c.coreChannel){
+        p.Add(Op::AckException,kChidCore,1,0,0,"log 0x611020/24/28, W1C 0x611854, ack 0x90000000 (gv100.c 992-994)",0,kRegExcOther);
+        AddChannelFini(p,kChidCore,ms);AddPbRestore(p,kChidCore,c.gop);}
     if(reached>=Phase::Instmem){
         if(c.feEnable)p.Add(Op::Write,kRegFeEnable,~0u,c.gop.feEnable,0,"0x610078 = GOP value");
         p.Add(Op::Write,kRegInstTarget,~0u,c.gop.instTarget,0,"instmem invalid");
@@ -671,6 +682,7 @@ inline void BuildAbort(const Config& c,Phase reached,Plan& p,uint32_t ms=100){
 //   void log(uint32_t index,const Step&,uint32_t got,bool ok);
 //   void diff(uint32_t mthd,uint32_t assy,uint32_t arm); void pause(const char* what);
 //   void udelay(uint32_t us); bool call(uint32_t id); void dump(uint32_t addr,const uint32_t* w,uint32_t n);
+//   void flag(uint32_t index,const Step&,uint32_t got);
 //   void fill(uint64_t vram,uint32_t bytes,uint32_t pitch,uint32_t colour,uint32_t marker,uint32_t lines);
 // Returns `end` on success, else the index of the (first) failing step.
 // bestEffort (abort/quiesce lists) logs a failure and carries on.
@@ -686,10 +698,21 @@ template<typename Io> uint32_t Run(const Plan& p,uint32_t begin,uint32_t end,Io&
             while(((got=io.rd(s.reg))&s.mask)!=s.value)if(io.expired(s.timeoutMs,t)){ok=s.op==Op::PollSoft;break;}
             break;}
         case Op::AckIfSet:got=io.rd(s.reg)&s.mask;if(got)io.wr(s.reg,got);break;
-        case Op::AckException:got=io.rd(kRegExcWin)&s.mask;
+        case Op::AckException:{const uint32_t st=s.x?s.x:kRegExcWin;got=io.rd(st)&s.mask; // x: status reg override (core: 0x611854)
             if(got){io.except(s.reg,io.rd(RegExcept(s.reg)),io.rd(RegExcept(s.reg)+4),io.rd(RegExcept(s.reg)+8));
-                io.wr(kRegExcWin,got);io.wr(RegExcept(s.reg),kExceptAck);}
-            break;
+                io.wr(st,got);io.wr(RegExcept(s.reg),kExceptAck);}
+            break;}
+        case Op::PollOr:{uint32_t t=0;
+            for(;;){got=io.rd(s.reg)|io.rd(s.x);if((got&s.mask)==s.value)break;
+                if(s.y&&(io.rd(s.y)&s.z)){ok=false;got=0xe0000000u|io.rd(s.y);break;}
+                if(io.expired(s.timeoutMs,t)){ok=false;break;}}
+            break;}
+        case Op::ExpectSoft:got=io.rd(s.reg);if((got&s.mask)!=s.value)io.flag(i,s,got);break;
+        case Op::ExpectVpll:{const uint32_t c=io.rd(s.reg+4),f=io.rd(s.reg+0x10);
+            const uint32_t P=(c>>16)&0x3f,N=(c>>8)&0xff,M=c&0xff;const int32_t fN=int16_t(f>>16);
+            if(!P||!M){ok=false;got=0;break;}
+            const uint64_t khz=uint64_t(s.x)*(uint64_t(N)*8192+uint64_t(fN+4096))/8192/(uint64_t(M)*P);
+            got=uint32_t(khz);ok=(khz>s.value?khz-s.value:s.value-khz)<=s.mask;break;}
         case Op::VramWrite:io.vwr(s.vram,s.value);break;
         case Op::VramCopy:io.vcopy(s.vram,Blob(s.reg),s.mask);break;
         case Op::VramExpect:got=io.vrd(s.vram);ok=(got&s.mask)==s.value;break;
@@ -712,7 +735,9 @@ template<typename Io> uint32_t Run(const Plan& p,uint32_t begin,uint32_t end,Io&
                 if(s.reg!=kChidCore&&m>=0x350&&m<0x370)continue;          // window: not in clc57e.h (SW methods)
                 if(s.reg==kChidCore&&m>=0x220&&m<0x240)continue;          // core GET_RG_SCAN_LINE (live)
                 const uint32_t a=io.rd(RegAssy(s.reg,m)),b=io.rd(RegArm(s.reg,m));
-                if(a!=b){io.diff(m,a,b);if(!p.Rewritten(m)){ok=false;if(!got)got=m;}}
+                if(a!=b){io.diff(m,a,b);
+                    const bool bad=s.x?(Plan::Has(p.known,m)&&!Plan::Has(p.ours,m)):!p.Rewritten(m);
+                    if(bad){ok=false;if(!got)got=m;}}
             }
             break;
         case Op::Pause:io.pause(s.what);break;

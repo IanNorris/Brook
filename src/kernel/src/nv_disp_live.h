@@ -8,4 +8,6 @@ namespace brook {
 bool NvDispHandle(const char* command);
 // The nv-aux lock (debug_hardware.cpp): serialises nv-disp with nv-aux and dp-idle.
 SpinLock* NvAuxSharedLock();
+// Suspend/restore dp-idle (idle-off, link watch) around a head-1 session.
+void DpIdleSuspendForDisplay(bool suspend);
 }

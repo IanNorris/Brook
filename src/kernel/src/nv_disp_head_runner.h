@@ -20,36 +20,14 @@
 
 namespace brook::nvdisp {
 
-// Registers the head-1 plan must never write (head 0, its OR SOR1, VPLL0, window 0).
-struct Range{uint32_t lo,hi;};
-constexpr Range kHead0Guard[]={
-    {0x00ef00,0x00ef40},   // VPLL0
-    {0x612200,0x612300},   // head 0 rgclk block
-    {0x612400,0x612500},   // route macro 1 (SOR1)
-    {0x612b00,0x612c00},   // SOR1 clock
-    {0x616000,0x616800},   // head 0 RG/SF block
-    {0x61c800,0x61d000},   // SOR1
-    {0x682000,0x682400},{0x68a000,0x68a400}, // head-0 core ASSY/ARM (MMIO)
-    {0x6104e4,0x6104e8},{0x610b30,0x610b40},{0x690000,0x691000}, // window 0 channel
-};
-inline bool Head0Guarded(uint32_t a){for(const auto& r:kHead0Guard)if(a>=r.lo&&a<r.hi)return true;return false;}
-// Core methods that would touch head 0 / SOR1 / window 0 if pushed.
-inline bool Head0Method(uint32_t m){return (m>=0x2000&&m<0x2400)||(m>=0x320&&m<0x340)||(m>=0x1000&&m<0x1080);}
-inline bool PushTouchesHead0(const Push& p,uint32_t words){
-    for(uint32_t i=0;i<words;){const uint32_t hdr=p.words[i++];if(hdr>>29){continue;}
-        const uint32_t n=(hdr>>18)&0x3ff,m=hdr&0x3ffc;
-        for(uint32_t k=0;k<n;++k)if(Head0Method(m+k*4))return true;
-        i+=n;}
-    return false;
-}
-
 struct HeadState{
-    bool preflightOk=false,live=false,enabled=false,paused=false,hooked=false;
+    bool preflightOk=false,live=false,enabled=false,paused=false,hooked=false,head0Flagged=false,fe=false,dpIdleHeld=false;
+    Kicked kicked=Kicked::None;
     uint32_t cursor=0,stopAt=~0u,failAt=~0u,runs=0,aborts=0,guardHits=0;
 };
 
 // Backend: as Runner's (rd, wr, vrd, vwr, fill, fence, nowUs, relax, emit, hookQuiesce)
-// plus bool step3Busy(), bool step3Succeeded().
+// plus bool step3Busy(), bool step3Succeeded(), void dpIdleSuspend(bool).
 template<typename B> struct HeadRunner{
     B* b=nullptr;
     HeadConfig cfg{};DpOut dpout{};Vbios vb{};uint32_t auxCh=4;bool resolved=false;
@@ -68,7 +46,7 @@ template<typename B> struct HeadRunner{
     // Register Io with the head-0 write guard.
     struct RegIo{HeadRunner& r;bool violation=false;
         uint32_t rd(uint32_t a){return r.b->rd(a);}
-        void wr(uint32_t a,uint32_t v){if(Head0Guarded(a)){violation=true;++r.st.guardHits;r.Guard(a,v);return;}r.b->wr(a,v);}
+        void wr(uint32_t a,uint32_t v){if(!HeadAllowed(a)){violation=true;++r.st.guardHits;r.Guard(a,v);return;}r.b->wr(a,v);}
         void udelay(uint32_t us){const uint64_t end=r.b->nowUs()+us;while(r.b->nowUs()<end)r.b->relax();}
     };
     void Guard(uint32_t a,uint32_t v){Line l;l.raw("{\"nv_head1_guard\":\"");l.hex(a);l.raw("\",\"value\":\"");l.hex(v);l.raw("\"}\n");b->emit(l.t);}
@@ -96,7 +74,14 @@ template<typename B> struct HeadRunner{
             Line l;l.raw("{\"nv_head1_dump\":\"");l.hex(addr);l.raw("\",\"w\":[");
             for(uint32_t i=0;i<n;++i){if(i)l.raw(",");l.raw("\"");l.hex(w[i]);l.raw("\"");}
             l.raw("]}\n");r.b->emit(l.t);}
-        bool call(uint32_t id){return id==kCallDpTrain&&r.Train(reg);}
+        void flag(uint32_t i,const Step& s,uint32_t got){
+            r.st.head0Flagged=true;Line l;l.raw("{\"nv_head1\":\"WARNING\",\"step\":");l.dec(i);l.raw(",\"what\":\"");l.s(s.what);
+            l.raw("\",\"got\":\"");l.hex(got);l.raw("\"}\n");r.b->emit(l.t);}
+        void note(const char* what,uint32_t v){Line l;l.raw("{\"nv_head1_note\":\"");l.s(what);l.raw("\",\"v\":\"");l.hex(v);l.raw("\"}\n");r.b->emit(l.t);}
+        bool call(uint32_t id){
+            if(id==kCallDpTrain)return r.Train(reg);
+            if(id==kCallSuperFlush||id==kCallSuperFlushVpll){(void)SupervisorFlush(*this,r.cfg,id==kCallSuperFlushVpll,100);return true;}
+            return false;}
         void log(uint32_t i,const Step& s,uint32_t got,bool ok){
             Line l;l.raw("{\"nv_head1_step\":");l.dec(i);l.raw(",\"list\":\"");l.s(tag);l.raw("\",\"ph\":\"");l.s(HPhaseName(r.PhaseOf(i)));
             l.raw("\",\"reg\":\"");l.hex(s.op==Op::VramCopy||s.op==Op::VramWrite||s.op==Op::VramPoll?s.vram:s.reg);
@@ -128,14 +113,21 @@ template<typename B> struct HeadRunner{
     }
 
     bool Build(){
-        if(!resolved){Msg("error","VBIOS tables not resolved (DCB[4]/DP table/PLL)");return false;}
+        if(!resolved){Msg("error","VBIOS tables/scripts/hash not matched (DCB[4], DP table, PLL, script pointers)");return false;}
         cfg.pauseAfterModeset=false; // "enabled" is the observer point
+        cfg.base.feEnable=st.fe;
+        if(b)ReadCoreReplay(cfg,[&](uint32_t a){return b->rd(a);}); // replay = ARM values now
         img=InstImage{};pushes=HeadPushes{};plan=Plan{};
-        if(BuildHeadPlan(cfg,img,pushes,plan)!=Err::Ok){Msg("error","head plan build failed");return false;}
-        if(PushTouchesHead0(pushes.core,pushes.core.count)){Msg("error","core push touches head 0 / SOR1 / window 0");return false;}
+        const Err e=BuildHeadPlan(cfg,img,pushes,plan);
+        if(e==Err::Usage){Msg("error","core push would change a head-0 / SOR1 / window-0 method");return false;}
+        if(e!=Err::Ok){Msg("error","head plan build failed");return false;}
         return true;
     }
-    static bool ReadOnly(Op o){return o==Op::Expect||o==Op::ExpectNot||o==Op::Log||o==Op::AssyArmDiff;}
+    Kicked KickOf(uint32_t put)const{
+        return put==pushes.replayEnd?Kicked::Replay:put==pushes.rungEnd?Kicked::Rung:put==pushes.enableEnd?Kicked::Enable:
+               put==pushes.disableEnd?Kicked::Disable:Kicked::None;}
+    void DpIdle(bool suspend){if(suspend!=st.dpIdleHeld){b->dpIdleSuspend(suspend);st.dpIdleHeld=suspend;}}
+    static bool ReadOnly(Op o){return o==Op::Expect||o==Op::ExpectNot||o==Op::Log||o==Op::AssyArmDiff||o==Op::ExpectVpll||o==Op::ExpectSoft;}
     void Status(){
         Line l;l.raw("{\"nv_head1_status\":1,\"preflight_ok\":");l.dec(st.preflightOk);l.raw(",\"live\":");l.dec(st.live);
         l.raw(",\"enabled\":");l.dec(st.enabled);l.raw(",\"paused\":");l.dec(st.paused);l.raw(",\"cursor\":");l.dec(st.cursor);
@@ -153,12 +145,14 @@ template<typename B> struct HeadRunner{
         st.preflightOk=Run(plan,0,end,io)==end;
         Msg(st.preflightOk?"preflight":"preflight-failed",st.preflightOk?"ok: head1 enable armed for this boot":"mismatch: nothing armed");
     }
-    void Enable(bool skipStep3,uint32_t stopAt){
+    void Enable(bool skipStep3,uint32_t stopAt,bool fe){
         if(Busy())return;
         if(!st.preflightOk){Msg("refused","run head1 preflight first (this boot)");return;}
         if(!skipStep3&&!b->step3Succeeded()){Msg("refused","a step-3 noop/flip must succeed first this boot (or skip-step3)");return;}
-        if(!Build())return;
-        st.cursor=0;st.stopAt=stopAt;st.failAt=~0u;st.preflightOk=false;st.enabled=false;++st.runs;
+        st.fe=fe;if(!Build())return;
+        st.cursor=0;st.stopAt=stopAt;st.failAt=~0u;st.preflightOk=false;st.enabled=false;st.head0Flagged=false;
+        st.kicked=Kicked::None;++st.runs;
+        DpIdle(true); // dp-idle idle-off and link watch suspended for the session
         RunTo(plan.phaseBegin[uint32_t(HPhase::Disable)],true);
     }
     void Disable(){
@@ -173,27 +167,33 @@ template<typename B> struct HeadRunner{
         bool resume=!fresh;st.paused=false;
         const uint32_t vramBegin=plan.phaseBegin[uint32_t(HPhase::Vram)];
         for(;st.cursor<end;++st.cursor){
+            // Head 0 flagged during the modeset: all stages were finished with the head-1
+            // work; skip verify and run a normal disable (review issue 3).
+            if(st.head0Flagged&&st.cursor==plan.phaseBegin[uint32_t(HPhase::Verify)]){
+                Msg("WARNING","head 0 was flagged by a supervisor: skipping verify, running a normal disable");
+                st.cursor=plan.phaseBegin[uint32_t(HPhase::Disable)];end=plan.count;resume=true;
+                if(st.cursor>=end)break;}
             const uint32_t i=st.cursor;const Step& s=plan.steps[i];
             if(resume)resume=false;
             else if(i==st.stopAt||s.op==Op::Pause){st.paused=true;Msg("paused",s.op==Op::Pause?s.what:"stop point");Status();return;}
             if(s.op==Op::Pause)continue;
             if(i>=vramBegin&&!st.live){st.live=true;if(!st.hooked){b->hookQuiesce();st.hooked=true;}}
+            if(s.op==Op::Kick){const Kicked k=KickOf(s.value);if(k!=Kicked::None)st.kicked=k;}
             Io io{*this,"run"};
             const bool ok=Run(plan,i,i+1,io)==i+1&&!io.reg.violation;
+            if(ok&&s.op==Op::VramPoll&&st.kicked==Kicked::Rung)st.kicked=Kicked::None; // rung UPDATE completed: nothing to flush
             if(!ok){st.failAt=i;
-                const bool superHead0=s.op==Op::Expect&&s.reg==RegSuperHead(0);
-                Msg("failed",io.reg.violation?"head-0 write guard":superHead0?
-                    "SUPERVISOR FLAGGED HEAD 0: aborting now; pending stages are acked without head-0 work (conn0 may need a reboot)":"auto-abort");
+                Msg("failed",io.reg.violation?"write outside the head-1 allow-list":"auto-abort");
                 RunAbort(PhaseOf(i),100);return;}
         }
-        if(end==plan.count){st.live=false;Msg("done","head 1 detached (VPLL1 left running and head-1 raster ARMed until reset); run head1 preflight again before the next enable");}
+        if(end==plan.count){st.live=false;DpIdle(false);Msg("done","head 1 detached (VPLL1 left running and head-1 raster ARMed until reset); run head1 preflight again before the next enable");}
         else{st.enabled=true;Msg("enabled","head 1 lit on conn2; head1 disable when done");}
         Status();
     }
     void RunAbort(HPhase reached,uint32_t ms){
-        abort=Plan{};BuildHeadAbort(cfg,reached,pushes,abort,ms);
+        abort=Plan{};BuildHeadAbort(cfg,reached,pushes,abort,ms,st.kicked);
         Io io{*this,"abort"};(void)Run(abort,0,abort.count,io,true);
-        st.live=st.enabled=st.paused=st.preflightOk=false;++st.aborts;
+        st.live=st.enabled=st.paused=st.preflightOk=false;++st.aborts;DpIdle(false);
         Msg("aborted","head abort list ran");Status();
     }
     void Abort(bool force){
@@ -222,13 +222,14 @@ template<typename B> struct HeadRunner{
         if(Word(p,"continue")){Continue();return;}
         if(Word(p,"abort")){Abort(Word(p,"force"));return;}
         if(Word(p,"enable")){
-            bool skip=false;uint32_t stop=~0u;
+            bool skip=false,fe=false;uint32_t stop=~0u;
             for(;;){while(*p==' ')++p;if(!*p)break;
                 if(Word(p,"skip-step3"))skip=true;
+                else if(Word(p,"fe"))fe=true;
                 else if(Word(p,"stop")){if(!Num(p,stop)){Msg("usage","stop <step>");return;}}
                 else{Msg("usage","unknown argument");return;}}
-            Enable(skip,stop);return;}
-        Msg("usage","nv-disp head1 plan|preflight|enable [skip-step3] [stop N]|disable|continue|abort [force]|status");
+            Enable(skip,stop,fe);return;}
+        Msg("usage","nv-disp head1 plan|preflight|enable [skip-step3] [fe] [stop N]|disable|continue|abort [force]|status");
     }
 };
 } // namespace brook::nvdisp

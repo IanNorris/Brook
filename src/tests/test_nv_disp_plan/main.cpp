@@ -252,7 +252,7 @@ static void Dump(bool core){
     Config c=DellConfig();c.coreChannel=core;c.pauseForObserver=true;
     static InstImage img;static Pushes pushes;static Plan plan;pushes=Pushes{};plan=Plan{};
     assert(BuildPlan(c,img,pushes,plan)==Err::Ok);FixPramin(plan,img);
-    static const char* op[]={"WR","MASK","EXPECT","POLL","POLLSOFT","ACK","VCOPY","VWR","VEXPECT","VPOLL","VPOLLANY","ACKEXC","PRAMIN","FENCE","KICK","EXPNOT","LOG","COPY","ASSYARM","PAUSE","DELAY","ANDNIF","COPYMASK","CALL","FILL","PRAMINR","DUMP"};
+    static const char* op[]={"WR","MASK","EXPECT","POLL","POLLSOFT","ACK","VCOPY","VWR","VEXPECT","VPOLL","VPOLLANY","ACKEXC","PRAMIN","FENCE","KICK","EXPNOT","LOG","COPY","ASSYARM","PAUSE","DELAY","ANDNIF","COPYMASK","CALL","FILL","PRAMINR","DUMP","POLLOR","EXPSOFT","EXPVPLL"};
     uint32_t ph=0;
     for(uint32_t i=0;i<plan.count;++i){
         while(ph<uint32_t(Phase::Count)&&plan.phaseBegin[ph]<=i&&(ph+1>=uint32_t(Phase::Count)||plan.phaseBegin[ph+1]<=i))++ph;

@@ -67,6 +67,7 @@ struct LiveBackend{
     void hookQuiesce();
     bool step3Busy();
     bool step3Succeeded();
+    void dpIdleSuspend(bool s){DpIdleSuspendForDisplay(s);}
 };
 
 [[clang::require_constant_initialization]] LiveBackend g_backend{};
@@ -74,6 +75,7 @@ struct LiveBackend{
 [[clang::require_constant_initialization]] nvdisp::HeadRunner<LiveBackend> g_head{};
 bool g_configured=false;
 uint8_t g_vbios[128*1024];bool g_vbiosRead=false;
+constexpr uint32_t kVbiosHash=0xbb33ca0a; // FNV-1a of the first 128 KiB of PROM (offline dump)
 bool LiveBackend::step3Busy(){return g_runner.st.live||g_runner.st.paused;}
 bool LiveBackend::step3Succeeded(){return g_runner.st.done>0;}
 
@@ -139,7 +141,8 @@ bool ConfigureHead(){
     m.rasterSize=g_backend.rd(0x68a064);m.syncEnd=g_backend.rd(0x68a068);m.blankEnd=g_backend.rd(0x68a06c);
     m.blankStart=g_backend.rd(0x68a070);m.vertBlank2=g_backend.rd(0x68a074);
     g_head.vb=nvdisp::Vbios{g_vbios,sizeof(g_vbios)};g_head.cfg=c;g_head.auxCh=4;
-    g_head.resolved=nvdisp::ResolveHeadConfig(g_head.vb,4,g_head.cfg,g_head.dpout);
+    // The hard-coded DP/IED scripts were disassembled from this exact image (90.04.0b.00.86).
+    g_head.resolved=nvdisp::ResolveHeadConfig(g_head.vb,4,g_head.cfg,g_head.dpout,kVbiosHash);
     g_head.b=&g_backend;
     return true;
 }

@@ -59,6 +59,8 @@ static Rom MakeRom(){
     auto entry=[&](uint32_t i,uint32_t conn,uint32_t conf){r.w32(dcb+0x23+i*8,conn);r.w32(dcb+0x23+i*8+4,conf);};
     entry(0,0x02000f66,0x0f400020);              // SOR1 (or 2), conn 0, CCB 6, DP, link B
     entry(4,0x04002f76,0x0f400010);              // SOR2 (or 4), conn 2, heads f, CCB 7, DP, link A, 5.4 G x4
+    const uint8_t rates[]={0x1e,0x14,0x0a,0x06};const uint16_t scripts[]={0x616a,0x617b,0x618c,0x619d}; // dpout lnkcmp list
+    for(uint32_t i=0;i<4;++i){r.w8(0x6107+i*3,rates[i]);r.w16(0x6108+i*3,scripts[i]);}
     return r;
 }
 
@@ -95,7 +97,9 @@ static void TestRealVbios(){
     DpOut dp{};assert(FindDpOut(v,o.hasht,o.hashm,dp)&&dp.entry==0x60e1&&dp.beforeLt==0x611f&&dp.disableLt==0x5c55);
     DpCfg c{};assert(DpDrive(v,dp,0,0,0,c)&&c.dc==0x15&&c.pe==0x01&&c.pu==0x2);
     HeadConfig hc;hc.base=GopFlipConfig(3840,2160,16384,0xcf,256ull<<20);DpOut out{};
-    assert(ResolveHeadConfig(v,4,hc,out)&&hc.vpll.N==58&&hc.vpll.fN==0x1800&&hc.vpll.P==3);
+    assert(VbiosHash(Vbios{d.data(),131072})==0xbb33ca0a);                        // the image the scripts came from
+    assert(ResolveHeadConfig(Vbios{d.data(),131072},4,hc,out,0xbb33ca0a)&&hc.vpll.N==58&&hc.vpll.fN==0x1800&&hc.vpll.P==3);
+    assert(LnkcmpScript(v,out.lnkcmp,0x14)==0x617b&&hc.vpll0.refclk==27000);
     printf("test_nv_disp_head: real VBIOS checks passed\n");
 }
 static void TestPllAndSf(){
@@ -114,15 +118,23 @@ static void TestPllAndSf(){
 }
 static void TestCoreWords(){
     HeadConfig c;HeadPushes hp;BuildHeadPushes(c,hp);
-    const uint32_t* w=hp.core.words;
-    assert(w[0]==PushHeader(0x208,1)&&w[1]==kHandleSync);
-    assert(w[2]==PushHeader(0x340,1)&&w[3]==0x802);                 // SOR2: owner head 1, DP_A
-    assert(w[4]==PushHeader(0x2400,4)&&w[5]==0&&w[6]==0xfc000040&&w[7]==0&&w[8]==533250000);
+    assert(hp.core.words[0]==PushHeader(0x208,1)&&hp.core.words[1]==kHandleSync);  // ours, first
+    // replay: every documented core method once, in runs; then the rung (corec37d_update + ntfy)
+    {uint32_t n=0;for(uint32_t i=2;i<hp.replayEnd/4;){const uint32_t k=(hp.core.words[i]>>18)&0x3ff;n+=k;i+=1+k;}
+     assert(n==kCoreReplayCount&&kCoreReplayCount==3+16+40+4*110);}
+    {const uint32_t* r=hp.core.words+hp.replayEnd/4;const uint32_t g[]={0x0004020c,0x1000,0x00080218,0,0,0x00040200,1,0x0004020c,0};
+     assert(hp.rungEnd-hp.replayEnd==sizeof(g)&&!memcmp(r,g,sizeof(g)));}
+    assert(hp.core.count<=kPushMaxWords);
+    const uint32_t* w=hp.core.words+hp.rungEnd/4;
+    assert(w[0]==PushHeader(0x340,1)&&w[1]==0x802);                 // SOR2: owner head 1, DP_A
+    w+=2;
+    assert(w[0]==PushHeader(0x2400,4)&&w[1]==0&&w[2]==0xfc000040&&w[3]==0&&w[4]==533250000);
     // raster block at 0x2464: 4000x2222 total, sync end 31/4, blank end 111/58, blank start 3951/2218
-    uint32_t i=0;while(i<hp.core.count&&hp.core.words[i]!=PushHeader(0x2464,5))++i;
-    assert(i<hp.core.count&&w[i+1]==0x08ae0fa0&&w[i+2]==0x0004001f&&w[i+3]==0x003a006f&&w[i+4]==0x08aa0f6f&&w[i+5]==1);
-    while(i<hp.core.count&&hp.core.words[i]!=PushHeader(0x1100,1))++i;
-    assert(w[i+1]==1);                                              // window 2 -> head 1
+    const uint32_t* q=hp.core.words;uint32_t i=hp.rungEnd/4;
+    while(i<hp.core.count&&q[i]!=PushHeader(0x2464,5))++i;
+    assert(i<hp.enableEnd/4&&q[i+1]==0x08ae0fa0&&q[i+2]==0x0004001f&&q[i+3]==0x003a006f&&q[i+4]==0x08aa0f6f&&q[i+5]==1);
+    while(i<hp.core.count&&q[i]!=PushHeader(0x1100,1))++i;
+    assert(i<hp.enableEnd/4&&q[i+1]==1);                            // window 2 -> head 1
     assert(hp.enableEnd&&hp.disableEnd>hp.enableEnd);
 }
 
@@ -170,6 +182,8 @@ struct Core{
             for(uint32_t h=1;h<4;++h)R(base+0x2064+h*0x400)=0x00050008; // idle 8x5 raster
         }
         R(RegPbLo(0))=1;R(RegPbValid(0))=1;R(0x612508)=0x603;R(0x61d004)=0x10000000;R(0x611cf0)=0x1ff;
+        R(0xef04)=0x00033a01;R(0xef10)=0x18000000;                       // GOP VPLL0 = 533.25 MHz
+        R(0x612200)=0x00800040;R(0x612b00)=0x03d10040;
     }
     bool Lookup(uint32_t handle,uint32_t chid,uint64_t& base){
         const uint64_t inst=uint64_t(R(kRegInstAddr))<<16;
@@ -186,7 +200,8 @@ struct Core{
             if(a!=b&&(((a|b)&0xff)>>h)&1)m|=0x1000;}
         return m;
     }
-    void Raise(uint32_t st){stage=st;R(kRegCtrlDisp)|=1u<<(st-1);++supers;
+    bool hideCtrlDisp=false,exceptOnModeset=false,resetOnConnect=true;uint32_t evt=0,flags=0,notes=0;
+    void Raise(uint32_t st){stage=st;if(!hideCtrlDisp)R(kRegCtrlDisp)|=1u<<(st-1);evt|=1u<<(st-1);++supers;
         for(uint32_t h=0;h<4;++h){R(RegSuperHead(h))=HeadMask(h);if(h==0&&R(RegSuperHead(0)))superOnHead0=true;}}
     void Finish(){
         for(auto& kv:std::map<uint32_t,uint32_t>(reg))if(kv.first>=0x680200&&kv.first<0x683000)R(kv.first+0x8000)=kv.second;
@@ -200,10 +215,11 @@ struct Core{
             if((hdr>>29)==1){cur=hdr&0xffc;continue;}
             const uint32_t n=(hdr>>18)&0x3ff,m=hdr&0x3ffc;
             for(uint32_t i=0;i<n;++i){const uint32_t d=vrd(pb+cur);cur+=4;const uint32_t mm=m+i*4;
-                assert(!(mm>=0x2000&&mm<0x2400));                    // the plan never writes head-0 methods
+                if(mm>=0x2000&&mm<0x2400)assert(d==R(0x688000+mm));  // head-0 methods only as their ARM value (replay)
                 R(0x680000+mm)=d;
                 if(mm==c57d::SET_NOTIFIER_CONTROL&&(d&0x1000))ntfyOff=d&0xff0;
                 if(mm==c57d::UPDATE){++updates;pendingPut=put;
+                    if(exceptOnModeset&&R(0x680340)==0x802){R(kRegExcOther)|=1;R(0x611020)=0x80004080;exceptOnModeset=false;return;}
                     bool any=false;for(uint32_t h=0;h<4;++h)if(HeadMask(h))any=true;
                     if(any){Raise(1);return;} Finish();}
             }
@@ -237,6 +253,7 @@ struct Core{
     uint32_t rd(uint32_t a){
         if(AuxReg(a))return AuxRd(a);
         if(a>=kPramin&&a<kPramin+0x100000)return vrd((uint64_t(R(kRegPraminBase))<<16)+(a-kPramin));
+        if(a==kRegSuperAck)return evt;
         if(a==0x612508){const uint32_t v=R(a);return (v&~0x80u)|((((v>>8)&0xf)>6)?0x80:0);} // pad-cal comparator: target 6
         return R(a);
     }
@@ -248,12 +265,15 @@ struct Core{
         if(a==0x61d004||a==0x61d034){R(a)=v&~0x80000000u;return;}   // sequencers complete at once
         if(a==RegChnCtl(0)){const uint32_t old=R(a);R(a)=v;
             if((v&kCtlRunning)==kCtlRunning&&!(old&kCtlConnect)){assert((R(RegPbLo(0))>>8)&&R(RegPbClient(0))==kClientId);
-                R(RegChnStatus(0))=0x000b0000;R(RegGet(0))=0;cur=0;}
+                R(RegChnStatus(0))=0x000b0000;R(RegGet(0))=0;cur=0;
+                if(resetOnConnect){R(0x682068)=0;R(0x680320)=0x100;R(0x681004)=0;R(0x682404)=0x123;}} // connect resets core ASSY
             return;}
         if(a==RegPut(0)&&(R(RegChnCtl(0))&kCtlRunning)==kCtlRunning){R(a)=v;Execute(v);return;}
-        if(a==kRegSuperAck){R(kRegCtrlDisp)&=~v;return;}
+        if(a==kRegSuperAck){R(kRegCtrlDisp)&=~v;evt&=~v;return;}
+        if(a==kRegExcOther){R(a)&=~v;return;}
+        if(a==0x611020&&v==kExceptAck){R(a)=0;return;}
         if(a==kRegSuperStat&&v==kSuperRelease&&stage){
-            assert(!(R(kRegCtrlDisp)&(1u<<(stage-1))));              // acked before release
+            assert(!(evt&(1u<<(stage-1))));                         // acked before release
             if(stage==2&&R(RegSuperHead(1))==0){}                    // masks cleared by the plan
             if(stage<3)Raise(stage+1);else Finish();
             return;}
@@ -268,9 +288,11 @@ struct Core{
     void fence(){} bool expired(uint32_t ms,uint32_t& t){return ++t>ms;}
     void except(uint32_t,uint32_t,uint32_t,uint32_t){} void diff(uint32_t,uint32_t,uint32_t){++diffs;}
     void pause(const char*){++pauses;} void udelay(uint32_t){}
+    void flag(uint32_t,const Step&,uint32_t){++flags;} void note(const char*,uint32_t){++notes;}
     void dump(uint32_t,const uint32_t*,uint32_t){}
     void fill(uint64_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t){}
     bool call(uint32_t id){
+        if(id==kCallSuperFlush||id==kCallSuperFlushVpll){(void)SupervisorFlush(*this,cfg,id==kCallSuperFlushVpll,100);return true;}
         if(id!=kCallDpTrain)return false;
         DpLink l=cfg.dp;memcpy(l.dpcd,sink.dpcd,16);
         struct TIo{Core& c;
@@ -293,13 +315,17 @@ static void Setup(Core& c,InstImage& img,HeadPushes& hp,Plan& p,Vbios& v){
     assert(ResolveHeadConfig(v,4,c.cfg,c.dpout));
     assert(c.cfg.sf.watermark==0x15&&c.cfg.sf.h==148);             // GOP's watermark by default
     c.vb=&v;c.img=&img;c.hp=&hp;c.Gop();
+    ReadCoreReplay(c.cfg,[&](uint32_t a){return c.rd(a);});
     assert(BuildHeadPlan(c.cfg,img,hp,p)==Err::Ok);
 }
 static void TestHeadPlan(){
     Core c;static InstImage img;static HeadPushes hp;static Plan p;Vbios v;img=InstImage{};hp=HeadPushes{};p=Plan{};
     Setup(c,img,hp,p,v);
     assert(Run(p,0,p.count,c)==p.count);
-    assert(c.tr.cr&&c.tr.eq&&c.updates==2&&c.supers==6&&!c.superOnHead0&&c.pauses==1);
+    assert(c.tr.cr&&c.tr.eq&&c.updates==3&&c.supers==6&&!c.superOnHead0&&c.pauses==1&&c.flags==0);
+    // The core connect reset head-0/SOR1/window-0 ASSY; the replay restored it before any UPDATE.
+    assert(c.R(0x682068)==c.R(0x68a068)&&c.R(0x680320)==0x901&&c.R(0x681004)==c.R(0x689004));
+    assert(c.R(kRegExcOther)==0&&c.R(0x612b00)==0x03d10040&&c.R(0x612200)==0x00800040); // head-0 clock regs untouched
     // Training ended on the drive the sink asked for, from the VBIOS table.
     assert((c.tr.conf[0]&3)==2&&((c.tr.conf[0]>>3)&3)==1);
     assert((c.R(0x61d118)&0xff)==CfgDc(8)&&(c.R(0x61d120)&0xff)==CfgPe(8));
@@ -323,34 +349,80 @@ static void TestHeadPlan(){
         assert(!(a>=0x616540&&a<0x616570));                           // head-0 SF block
     }
 }
+static uint32_t KickIndex(const Plan& p,uint32_t put){
+    for(uint32_t i=0;i<p.count;++i)if(p.steps[i].op==Op::Kick&&p.steps[i].value==put)return i;
+    assert(false);return 0;}
 static void TestRefusesWhenHead0Pending(){
     Core c;static InstImage img;static HeadPushes hp;static Plan p;Vbios v;img=InstImage{};hp=HeadPushes{};p=Plan{};
     Setup(c,img,hp,p,v);
-    c.R(0x680000+0x2068)=0x0004001e;                                  // head-0 ASSY differs from ARM
+    c.R(0x680000+0x2038)=7;                                            // undocumented head-0 method: cannot be replayed
     const uint32_t at=Run(p,0,p.count,c);
     assert(at<p.phaseBegin[uint32_t(HPhase::Vram)]&&c.written.empty()&&c.diffs==1);
+    // A documented one is simply replayed with its ARM value: no refusal.
+    Core d;static InstImage i2;static HeadPushes h2;static Plan p2;Vbios v2;i2=InstImage{};h2=HeadPushes{};p2=Plan{};
+    Setup(d,i2,h2,p2,v2);d.R(0x680000+0x2068)=0x0004001e;
+    assert(Run(p2,0,p2.count,d)==p2.count&&d.flags==0&&d.R(0x68a068)==d.R(0x682068));
 }
-static void TestSupervisorGuardAndAbort(){
+// Head 0 dirtied after the last strict diff: every stage still finishes with the
+// head-1 work (sticky flag, never an abort), VPLL1 is programmed, then disable.
+static void TestHead0FlagFinishesStages(){
+    Core c;static InstImage img;static HeadPushes hp;static Plan p;Vbios v;img=InstImage{};hp=HeadPushes{};p=Plan{};
+    Setup(c,img,hp,p,v);
+    const uint32_t k=KickIndex(p,hp.enableEnd);
+    assert(Run(p,0,k,c)==k);
+    c.R(0x680000+0x2068)=0x0004001e;
+    assert(Run(p,k,p.count,c)==p.count);
+    assert(c.superOnHead0&&c.flags>=3&&c.supers==6&&c.R(0xef44)==0x00033a01&&(c.R(0x688340)&0xff)==0);
+}
+// Abort from a stop before the enable kick: no supervisor flush, no disable kick.
+static void TestAbortUnkicked(){
     Core c;static InstImage img;static HeadPushes hp;static Plan p,ab;Vbios v;img=InstImage{};hp=HeadPushes{};p=Plan{};ab=Plan{};
     Setup(c,img,hp,p,v);
-    // Pass preflight and the post-connect check, then make head 0 dirty just before the modeset.
-    const uint32_t ms=p.phaseBegin[uint32_t(HPhase::Modeset)];
-    assert(Run(p,0,ms,c)==ms);
-    c.R(0x680000+0x2068)=0x0004001e;
-    const uint32_t at=Run(p,ms,p.count,c);
-    assert(at>ms&&at<p.phaseBegin[uint32_t(HPhase::Verify)]&&c.superOnHead0);
-    BuildHeadAbort(c.cfg,HPhase::Modeset,hp,ab);
+    const uint32_t k=KickIndex(p,hp.enableEnd);
+    assert(Run(p,0,k,c)==k&&c.updates==1);                             // the rung only
+    BuildHeadAbort(c.cfg,HPhase::Modeset,hp,ab,100,Kicked::Rung);
+    for(uint32_t i=0;i<ab.count;++i)assert(!(ab.steps[i].op==Op::Kick));
     (void)Run(ab,0,ab.count,c,true);
-    assert(c.stage==0&&(c.R(kRegCtrlDisp)&7)==0);                     // no supervisor left pending
-    assert((c.R(RegChnCtl(0))&0x13)==0x01&&c.R(kRegInstTarget)==1);
+    assert(c.updates==1&&c.stage==0&&(c.R(RegChnCtl(0))&0x13)==0x01&&c.R(kRegInstTarget)==1);
+}
+// Stages visible only in the event status 0x611860 are still serviced.
+static void TestStagesFromEventStatus(){
+    Core c;static InstImage img;static HeadPushes hp;static Plan p;Vbios v;img=InstImage{};hp=HeadPushes{};p=Plan{};
+    Setup(c,img,hp,p,v);c.hideCtrlDisp=true;
+    assert(Run(p,0,p.count,c)==p.count&&c.supers==6);
+}
+// A core exception on the modeset UPDATE fails the supervisor-1 wait at once; the
+// abort logs/acks it (0x611854, 0x611020) and the flush + detach still complete.
+static void TestCoreExceptionAtModeset(){
+    Core c;static InstImage img;static HeadPushes hp;static Plan p,ab;Vbios v;img=InstImage{};hp=HeadPushes{};p=Plan{};ab=Plan{};
+    Setup(c,img,hp,p,v);c.exceptOnModeset=true;
+    const uint32_t at=Run(p,0,p.count,c);
+    assert(p.steps[at].op==Op::PollOr&&p.steps[at].reg==kRegCtrlDisp&&(c.R(kRegExcOther)&1));
+    BuildHeadAbort(c.cfg,HPhase::Modeset,hp,ab,100,Kicked::Enable);
+    (void)Run(ab,0,ab.count,c,true);
+    assert(!(c.R(kRegExcOther)&1)&&c.R(0x611020)==0&&c.stage==0&&(c.R(0x688340)&0xff)==0);
+}
+// The VPLL0 frequency gate refuses a PLL encoding that does not give head 0's clock.
+static void TestVpll0Gate(){
+    Core c;static InstImage img;static HeadPushes hp;static Plan p;Vbios v;img=InstImage{};hp=HeadPushes{};p=Plan{};
+    Setup(c,img,hp,p,v);c.R(0xef04)=0x00033a02;                       // M=2: half the clock
+    const uint32_t at=Run(p,0,p.count,c);
+    assert(p.steps[at].op==Op::ExpectVpll&&c.written.empty());
 }
 static void TestTrainingFailure(){
     Core c;static InstImage img;static HeadPushes hp;static Plan p,ab;Vbios v;img=InstImage{};hp=HeadPushes{};p=Plan{};ab=Plan{};
     Setup(c,img,hp,p,v);c.sink.deadCr=true;
     const uint32_t at=Run(p,0,p.count,c);
-    assert(at==p.phaseBegin[uint32_t(HPhase::DpTrain)]&&!c.tr.cr&&c.tr.crTries>=4&&c.updates==0);
-    BuildHeadAbort(c.cfg,HPhase::DpTrain,hp,ab);(void)Run(ab,0,ab.count,c,true);
+    assert(at==p.phaseBegin[uint32_t(HPhase::DpTrain)]&&!c.tr.cr&&c.tr.crTries>=4&&c.updates==1);
+    BuildHeadAbort(c.cfg,HPhase::DpTrain,hp,ab,100,Kicked::Rung);(void)Run(ab,0,ab.count,c,true);
     assert((c.R(RegChnCtl(0))&0x13)==0x01&&(c.R(0x61d130)&0xf)==0&&c.R(kRegInstTarget)==1);
+    // Sinks the plan does not handle are refused by the trainer before any link write.
+    Core d;static InstImage i2;static HeadPushes h2;static Plan p2;Vbios v2;i2=InstImage{};h2=HeadPushes{};p2=Plan{};
+    Setup(d,i2,h2,p2,v2);d.sink.dpcd[2]&=0x7f;                       // no enhanced framing
+    assert(Run(p2,0,p2.count,d)==p2.phaseBegin[uint32_t(HPhase::DpTrain)]&&d.tr.err==-8);
+    Core e;static InstImage i3;static HeadPushes h3;static Plan p3;Vbios v3;i3=InstImage{};h3=HeadPushes{};p3=Plan{};
+    Setup(e,i3,h3,p3,v3);e.sink.dpcd[0x0d]=1;                        // ASSR (eDP)
+    assert(Run(p3,0,p3.count,e)==p3.phaseBegin[uint32_t(HPhase::DpTrain)]&&e.tr.err==-9);
 }
 // ---- AUX transfer (nv_aux_xfer.h) against the controller model
 static void TestAux(){
@@ -370,11 +442,12 @@ static void TestAux(){
 struct HBackend{
     Core& c;uint64_t t=0;uint32_t hooks=0;bool s3busy=false,s3ok=false;std::vector<std::string> lines;
     explicit HBackend(Core& core):c(core){}
+    int dpIdle=0;void dpIdleSuspend(bool s){dpIdle+=s?1:-1;assert(dpIdle==0||dpIdle==1);}
     uint32_t rd(uint32_t a){t+=1;return c.rd(a);} void wr(uint32_t a,uint32_t v){t+=1;c.wr(a,v);}
     uint32_t vrd(uint64_t a){return c.vrd(a);} void vwr(uint64_t a,uint32_t v){c.vwr(a,v);}
     void fill(uint64_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t){}
     void fence(){} uint64_t nowUs(){return t+=5;} void relax(){}
-    void emit(const char* l){lines.push_back(l);} void hookQuiesce(){++hooks;}
+    void emit(const char* l){lines.push_back(l);if(getenv("NV_HEAD_VERBOSE"))fputs(l,stderr);} void hookQuiesce(){++hooks;}
     bool step3Busy(){return s3busy;} bool step3Succeeded(){return s3ok;}
     size_t Count(const char* n)const{size_t k=0;for(auto& l:lines)if(l.find(n)!=std::string::npos)++k;return k;}
 };
@@ -385,6 +458,7 @@ struct HRig{
         r=new HeadRunner<HBackend>();r->b=&b;r->vb=g_rom.V();
         r->cfg.base=GopFlipConfig(3840,2160,16384,0xcf,256ull<<20);
         r->resolved=ResolveHeadConfig(r->vb,4,r->cfg,r->dpout);assert(r->resolved);
+        {HeadConfig t=r->cfg;DpOut d{};assert(!ResolveHeadConfig(r->vb,4,t,d,0x12345678));} // wrong image hash refused
         c.cfg=r->cfg;c.vb=&r->vb;c.dpout=r->dpout;c.img=&r->img;c.hp=&r->pushes;c.Gop();
     }
     ~HRig(){delete r;}
@@ -399,14 +473,14 @@ static void TestHeadRunner(){
      g.r->Command("preflight");assert(g.r->st.preflightOk&&g.c.written.empty());
      g.r->Command("enable");assert(g.b.Count("step-3 noop/flip must succeed")==1&&g.c.written.empty());
      g.b.s3busy=true;g.r->Command("enable");assert(g.b.Count("a step-3 run is live")==1);g.b.s3busy=false;
-     g.b.s3ok=true;g.r->Command("enable");
+     g.b.s3ok=true;g.r->Command("enable");assert(g.b.dpIdle==1);
      assert(g.r->st.enabled&&g.r->st.live&&g.b.Count("\"nv_head1\":\"enabled\"")==1&&g.b.hooks==1);
      assert(g.b.Count("\"nv_head1_dp\":1,\"cr\":1,\"eq\":1")==1&&g.c.auxXfers>10);
      assert(g.c.R(0x68a464)==g.r->cfg.mode.rasterSize&&(g.c.R(0x688340)&0xff)==2);  // head 1 ARMed on SOR2
      assert(g.c.R(0x68a064)==g.r->cfg.base.gop.headRaster&&g.c.R(0x688320)==0x901);  // head 0 / SOR1 untouched
      g.r->Command("enable");assert(g.b.Count("a head-1 run is live")==1);
      g.r->Command("disable");
-     assert(!g.r->st.live&&!g.r->st.enabled&&g.b.Count("\"nv_head1\":\"done\"")==1&&g.r->st.guardHits==0);
+     assert(!g.r->st.live&&!g.r->st.enabled&&g.b.Count("\"nv_head1\":\"done\"")==1&&g.r->st.guardHits==0&&g.b.dpIdle==0);
      assert(g.b.Count("VPLL1 left running")==1);
      assert((g.c.R(0x688340)&0xff)==0&&(g.c.R(RegChnCtl(0))&0x6013)==0x01&&g.c.R(kRegInstTarget)==1);
      g.r->Command("enable skip-step3");assert(g.b.Count("run head1 preflight first")==2);}
@@ -415,32 +489,44 @@ static void TestHeadRunner(){
      assert(!g.r->st.live&&g.r->st.aborts==1&&(g.c.R(0x688340)&0xff)==0&&(g.c.R(kRegCtrlDisp)&7)==0);
      assert((g.c.R(RegChnCtl(0))&0x13)==0x01&&g.c.R(kRegInstTarget)==1&&(g.c.R(0x61d130)&0xf)==0);}
     {HRig g;g.c.sink.deadCr=true;g.r->Command("preflight");g.r->Command("enable skip-step3");
-     assert(!g.r->st.live&&g.r->st.aborts==1&&g.b.Count("\"nv_head1_dp\":1,\"cr\":0")==1&&g.c.updates==0);}
+     assert(!g.r->st.live&&g.r->st.aborts==1&&g.b.Count("\"nv_head1_dp\":1,\"cr\":0")==1&&g.c.updates==1);}
     {HRig g;g.r->Command("preflight");const uint32_t vs=phaseStart(HPhase::Vram)+1;
      g.r->Command(("enable skip-step3 stop "+std::to_string(vs)).c_str());           // stop in the VRAM phase
      assert(g.r->st.paused&&g.r->st.cursor==vs);g.r->Command("continue");assert(g.r->st.enabled);
      g.r->Command("abort");assert(!g.r->st.live&&(g.c.R(0x688340)&0xff)==0);}
 
+    auto kickStart=[](){ // index of the enable kick in the runner's plan
+        static InstImage i2;static HeadPushes h2;static Plan p2;i2=InstImage{};h2=HeadPushes{};p2=Plan{};
+        static Rom own;own=MakeRom();Vbios v=own.V();HeadConfig c;c.base=GopFlipConfig(3840,2160,16384,0xcf,256ull<<20);DpOut d{};
+        assert(ResolveHeadConfig(v,4,c,d));c.pauseAfterModeset=false;assert(BuildHeadPlan(c,i2,h2,p2)==Err::Ok);
+        return KickIndex(p2,h2.enableEnd);};
     {HRig g;g.r->Command("preflight");
-     const std::string cmd="enable skip-step3 stop "+std::to_string(phaseStart(HPhase::Modeset));
-     g.r->Command(cmd.c_str());                                                       // stop before the modeset kick
-     assert(g.r->st.paused);g.c.R(0x680000+0x2068)=0x0004001e;                      // head 0 dirtied behind our back
+     g.r->Command(("enable skip-step3 stop "+std::to_string(kickStart())).c_str());   // stop at the enable kick
+     assert(g.r->st.paused&&g.r->st.kicked==Kicked::None);g.c.R(0x680000+0x2068)=0x0004001e; // head 0 dirtied behind our back
      g.r->Command("continue");
-     assert(g.b.Count("SUPERVISOR FLAGGED HEAD 0")==1&&g.r->st.aborts==1&&!g.r->st.live);
-     assert(g.c.stage==0&&(g.c.R(kRegCtrlDisp)&7)==0);}                              // no stage left pending
+     assert(g.r->st.head0Flagged&&g.b.Count("\"nv_head1\":\"WARNING\"")>=4&&g.r->st.aborts==0);
+     assert(g.b.Count("skipping verify")==1&&g.b.Count("\"nv_head1\":\"done\"")==1&&!g.r->st.live);
+     assert(g.c.supers==6&&g.c.R(0xef44)==0x00033a01&&(g.c.R(0x688340)&0xff)==0&&g.b.dpIdle==0);}
+    {HRig g;g.r->Command("preflight");
+     g.r->Command(("enable skip-step3 stop "+std::to_string(kickStart())).c_str());
+     g.r->Command("abort");                                                          // unkicked enable: no flush, no detach
+     assert(g.c.updates==1&&g.c.stage==0&&g.r->st.aborts==1&&g.b.Count("supervisor flush")==0&&g.b.dpIdle==0);}
     {HRig g;HeadRunner<HBackend>::RegIo io{*g.r};                                     // the write guard
      for(uint32_t a:{0x61c804u,0xef04u,0x616540u,0x612488u,0x612b00u,0x6104e4u,0x690000u}){
         io.violation=false;io.wr(a,1);assert(io.violation&&!g.c.written.count(a));}
      io.violation=false;io.wr(0x61d004,0x80000001);assert(!io.violation&&g.c.written.count(0x61d004));
-     HeadPushes hp;BuildHeadPushes(g.r->cfg,hp);assert(!PushTouchesHead0(hp.core,hp.core.count));
-     Push bad;bad.Mthd(0x2064,1u);assert(PushTouchesHead0(bad,bad.count));}
+     HeadPushes hp;ReadCoreReplay(g.r->cfg,[&](uint32_t a){return g.c.rd(a);});BuildHeadPushes(g.r->cfg,hp);
+     assert(PushHead0MatchesArm(g.r->cfg,hp.core));
+     Push bad;bad.Mthd(0x2064,1u);assert(!PushHead0MatchesArm(g.r->cfg,bad));         // head-0 raster != ARM
+     Push ok;ok.Mthd(0x2064,g.c.R(0x68a064));assert(PushHead0MatchesArm(g.r->cfg,ok));
+     Push undoc;undoc.Mthd(0x2038,1u);assert(!PushHead0MatchesArm(g.r->cfg,undoc));}  // not a replayable method
 }
 static void Dump(){
     static InstImage img;static HeadPushes hp;static Plan p,ab;
     g_rom=MakeRom();Vbios v=g_rom.V();HeadConfig c;c.base=GopFlipConfig(3840,2160,16384,0xcf,256ull<<20);DpOut d{};
     assert(ResolveHeadConfig(v,4,c,d));c.pauseAfterModeset=false;assert(BuildHeadPlan(c,img,hp,p)==Err::Ok);
     static const char* op[]={"WR","MASK","EXPECT","POLL","POLLSOFT","ACK","VCOPY","VWR","VEXPECT","VPOLL","VPOLLANY","ACKEXC",
-        "PRAMIN","FENCE","KICK","EXPNOT","LOG","COPY","ASSYARM","PAUSE","DELAY","ANDNIF","COPYMASK","CALL","FILL","PRAMINR","DUMP"};
+        "PRAMIN","FENCE","KICK","EXPNOT","LOG","COPY","ASSYARM","PAUSE","DELAY","ANDNIF","COPYMASK","CALL","FILL","PRAMINR","DUMP","POLLOR","EXPSOFT","EXPVPLL"};
     auto line=[&](uint32_t i,const Step& s){
         if(s.op==Op::VramCopy||s.op==Op::VramWrite||s.op==Op::VramPoll)printf("%3u %-8s vram %08llx val %08x %s\n",i,op[uint32_t(s.op)],(unsigned long long)s.vram,s.value,s.what);
         else if(s.op==Op::AssyArmDiff)printf("%3u %-8s chid %u mthd %04x..%04x %s\n",i,op[uint32_t(s.op)],s.reg,s.mask,s.value-4,s.what);
@@ -461,6 +547,7 @@ int main(int argc,char** argv){
     if(argc>1&&!strcmp(argv[1],"--dump")){Dump();return 0;}
     TestAux();TestHeadRunner();
     TestVbios();TestRealVbios();TestPllAndSf();TestCoreWords();
-    TestHeadPlan();TestRefusesWhenHead0Pending();TestSupervisorGuardAndAbort();TestTrainingFailure();
+    TestHeadPlan();TestRefusesWhenHead0Pending();TestHead0FlagFinishesStages();TestAbortUnkicked();
+    TestStagesFromEventStatus();TestCoreExceptionAtModeset();TestVpll0Gate();TestTrainingFailure();
     puts("test_nv_disp_head: ok");return 0;
 }
