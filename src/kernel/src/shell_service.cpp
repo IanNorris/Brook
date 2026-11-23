@@ -481,7 +481,25 @@ uint64_t ShellServiceCaptureDetached(uint32_t slot, const WmShellSurface& surfac
     d->geometry = geometry;
     d->styleKey = styleKey;
     d->list.Clear();
-    BuildShellModel(d->model, d->config.Style(Fonts(config.metrics.percent), d->material), d->list);
+    // Taskbars only: BuildShellModel would link every shell builder (and
+    // their assets) into the kernel image.
+    if (d->model.kind != ChromeShellKind::Taskbar) { d->built = false; return 0; }
+    {
+        const ChromeShellModel& model = d->model;
+        const ChromeStyle style = d->config.Style(Fonts(config.metrics.percent), d->material);
+        ChromeTaskbarButton buttons[ChromeTaskbarButtonLimit];
+        for (int i = 0; i < model.taskbar.count; ++i) {
+            const auto& entry = model.entries[i];
+            buttons[i] = {model.icons[i].View(), entry.label, entry.active, entry.minimized, entry.launch, entry.busy,
+                          entry.initial, entry.color, entry.hasWindow};
+        }
+        ChromeBuildTaskbar({&model.taskbar, buttons, model.launcherOpen, model.icons[ChromeShellModel::AppsIcon].View(),
+                           model.networkConnected, model.volumeControl, model.volumeAvailable, model.agentShown,
+                           model.agentStale, model.telemetry.View(), model.uptimeMs, model.mouseX, model.mouseY,
+                           &model.tray}, style, d->list);
+        if (model.taskbar.hud.w > 0)
+            ChromeBuildCompactHud({model.taskbar.hud, model.compactTelemetry.View(), model.hudTick}, style, d->list);
+    }
     d->built = !d->list.Overflowed();
     d->key = d->built ? ChromeListKey(d->list, styleKey ^ (uint64_t(width) << 32 | height)) : 0;
     return d->key;
