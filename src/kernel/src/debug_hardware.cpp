@@ -38,6 +38,7 @@
 #include "tsc_clock.h"
 #include "kprintf.h"
 #include "spinlock.h"
+#include "nv_disp_live.h"
 #include "nv_aux_reply.h"
 #include "input.h"
 #include "process.h"
@@ -744,6 +745,7 @@ void DpIdleCommand(const char* p){
     r.send();
 }
 }
+SpinLock* NvAuxSharedLock(){return &g_nvAuxLock;}
 void DpIdleStart(){
     if(g_dpIdle.threadStarted)return;
     bool nvidia=false;
@@ -1476,6 +1478,7 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
     //   nv-aux edid <ch> <block>                   128-byte EDID block via I2C-over-AUX (0x50)
     //   nv-aux power <ch> d0|d3                     DPCD 0x600 write (sink power state)
     if(NvAuxHandle(command,nullptr,0))return true;
+    if(NvDispHandle(command))return true;          // RTX step 3 flips (nv_disp_live.cpp), gated
     constexpr char dpIdlePrefix[]="bridge hardware dp-idle ";
     if(Prefix(command,dpIdlePrefix)){DpIdleCommand(command+sizeof(dpIdlePrefix)-1);return true;}
     // GPU link ASPM L1 (runtime, volatile; a reset restores firmware state):

@@ -431,6 +431,7 @@ add_executable(kernel
     src/debug_epoch.cpp
     src/debug_presence.cpp
     src/debug_hardware.cpp
+    src/nv_disp_live.cpp
     src/debug_jobs.cpp
     src/debug_ui.cpp
     src/tcp.cpp

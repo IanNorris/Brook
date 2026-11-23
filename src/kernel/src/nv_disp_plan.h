@@ -311,6 +311,7 @@ enum class Op:uint8_t{
     AndNotIf,   // if ((reg & x) == x) reg &= ~mask (VBIOS CONDITION + ANDN_REG)
     CopyMask,   // if (!y || (rd(y) & z) == 0): reg `value` = (rd(value) & x) | (rd(reg) & mask) (COPY_NV_REG)
     Call,       // io.call(reg) runs a dynamic step (DP link training); false aborts
+    SurfFill,   // io.fill(vram, bytes=value, pitch=mask, colour x, marker colour y, marker lines z)
 };
 enum class Blob:uint32_t{Inst,WndwPush,CorePush,SyncInit};
 struct Step{Op op;uint32_t reg,mask,value,timeoutMs;uint64_t vram;const char* what;uint32_t x,y,z;};
@@ -345,7 +346,9 @@ constexpr uint32_t kTimeoutMs=2000; // every nouveau poll in N1/N6 is 2000 ms
 //   [1] flip to surf[1] (address only)
 //   [2] restore: surf[0] under the GOP's own "DAVE" handle when bound.
 struct Ring{uint32_t put=0;}; // byte offset of the next free word
-struct Pushes{Push wndw;Push core;uint32_t end[3]{};uint32_t ntfy[3]{};uint32_t handle[3]{};uint64_t offset[3]{};};
+// Submissions: [0] first flip, [1..nflips] flips B/A/B..., [nflips+1] restore.
+constexpr uint32_t kMaxFlips=16,kMaxSub=kMaxFlips+2;
+struct Pushes{Push wndw;Push core;uint32_t count=0;uint32_t end[kMaxSub]{};uint32_t ntfy[kMaxSub]{};uint32_t handle[kMaxSub]{};uint64_t offset[kMaxSub]{};};
 inline uint32_t RingAppend(Push& ring,Ring& r,const Push& p){
     uint32_t at=r.put/4;
     if(at+p.count+1>kPushMaxWords){ring.words[at]=PushJump(0);at=0;} // caller waits GET>0 (N6 173-186)
@@ -366,14 +369,17 @@ inline uint32_t BuildFirstFlip(Push& ring,Ring& r,const Config& c){
     return RingAppend(ring,r,p);
 }
 inline uint32_t RestoreHandle(const Config& c){return c.gopHandle?kHandleGop:kHandleIsoPitch;}
-inline void BuildPushes(const Config& c,Pushes& out){
-    Ring r;
+inline void BuildPushes(const Config& c,Pushes& out,uint32_t nflips=1){
+    Ring r;if(nflips>kMaxFlips)nflips=kMaxFlips;
+    out.count=nflips+2;
     out.end[0]=BuildFirstFlip(out.wndw,r,c);out.ntfy[0]=WindowNtfyOffset(c.window,0);
     out.handle[0]=kHandleIsoPitch;out.offset[0]=c.surf[0].vram;
-    out.end[1]=BuildFlip(out.wndw,r,c,c.surf[1],1);out.ntfy[1]=WindowNtfyOffset(c.window,1);
-    out.handle[1]=kHandleIsoPitch;out.offset[1]=c.surf[1].vram;
-    out.end[2]=BuildFlip(out.wndw,r,c,c.surf[0],0,RestoreHandle(c));out.ntfy[2]=WindowNtfyOffset(c.window,0);
-    out.handle[2]=RestoreHandle(c);out.offset[2]=c.surf[0].vram;
+    for(uint32_t i=1;i<=nflips;++i){const Surface& s=c.surf[i&1];
+        out.end[i]=BuildFlip(out.wndw,r,c,s,i&1);out.ntfy[i]=WindowNtfyOffset(c.window,i&1);
+        out.handle[i]=kHandleIsoPitch;out.offset[i]=s.vram;}
+    const uint32_t k=nflips+1;
+    out.end[k]=BuildFlip(out.wndw,r,c,c.surf[0],k&1,RestoreHandle(c));out.ntfy[k]=WindowNtfyOffset(c.window,k&1);
+    out.handle[k]=RestoreHandle(c);out.offset[k]=c.surf[0].vram;
 }
 
 inline uint64_t SurfBytes(const Surface& s){return uint64_t(s.pitch)*s.height;}
@@ -473,10 +479,14 @@ inline void AddKickAndWait(Plan& p,const Config& c,uint32_t putBytes,uint32_t ha
 // The whole step-3 dry run in execution order: preflight, VRAM objects,
 // instmem, (core), window channel, first flip (no visible change), flip to
 // surf[1], restore to the GOP surface, teardown back to the GOP state.
-inline Err BuildPlan(const Config& c,InstImage& img,Pushes& pushes,Plan& p){
+// B's contents before the first flip to it: a fast pattern fill (UC reads of A
+// over BAR1 would take seconds): dark grey with an orange marker bar on top.
+constexpr uint32_t kFillGrey=0xff303030,kFillMarker=0xffff8000,kFillMarkerLines=120;
+inline Err BuildPlan(const Config& c,InstImage& img,Pushes& pushes,Plan& p,uint32_t nflips=1,uint32_t holdMs=0){
     if(Err e=Validate(c);e!=Err::Ok)return e;
     if(Err e=BuildInstImage(c,img);e!=Err::Ok)return e;
-    BuildPushes(c,pushes);
+    if(nflips>kMaxFlips||holdMs>5000)return Err::Bounds;
+    BuildPushes(c,pushes,nflips);
     if(pushes.wndw.overflow)return Err::PushFull;
     const auto& g=c.gop;const uint32_t ch=ChidWndw(c.window),w=c.window,h=c.head;
     p.Begin(Phase::Preflight);
@@ -550,9 +560,17 @@ inline Err BuildPlan(const Config& c,InstImage& img,Pushes& pushes,Plan& p){
     p.Add(Op::Expect,RegArm(ch,c57e::SET_SIZE),~0u,g.winSize,0,"ARM size unchanged");
     p.Add(Op::Expect,RegArm(ch,c57e::SET_PARAMS),~0u,g.winParams,0,"ARM format unchanged");
     p.Begin(Phase::Flip);
-    AddKickAndWait(p,c,pushes.end[1],pushes.handle[1],pushes.offset[1],pushes.ntfy[1]);
+    if(nflips){
+        p.Add(Op::SurfFill,0,c.surf[1].pitch,uint32_t(SurfBytes(c.surf[1])),0,"surface B: grey + marker bar (BAR1)",c.surf[1].vram,
+              kFillGrey,kFillMarker,kFillMarkerLines);
+        p.Add(Op::Fence,0,0,0,0,"sfence");
+    }
+    for(uint32_t i=1;i<=nflips;++i){
+        AddKickAndWait(p,c,pushes.end[i],pushes.handle[i],pushes.offset[i],pushes.ntfy[i]);
+        if(holdMs)p.Add(Op::Delay,0,0,holdMs*1000,0,"hold");
+    }
     p.Begin(Phase::Restore);
-    AddKickAndWait(p,c,pushes.end[2],pushes.handle[2],pushes.offset[2],pushes.ntfy[2]);
+    {const uint32_t k=nflips+1;AddKickAndWait(p,c,pushes.end[k],pushes.handle[k],pushes.offset[k],pushes.ntfy[k]);}
     p.Begin(Phase::Teardown);
     AddChannelFini(p,ch,kTimeoutMs);
     AddPbRestore(p,ch,g);
@@ -611,6 +629,7 @@ inline void BuildAbort(const Config& c,Phase reached,Plan& p,uint32_t ms=100){
 //   void log(uint32_t index,const Step&,uint32_t got,bool ok);
 //   void diff(uint32_t mthd,uint32_t assy,uint32_t arm); void pause(const char* what);
 //   void udelay(uint32_t us); bool call(uint32_t id);
+//   void fill(uint64_t vram,uint32_t bytes,uint32_t pitch,uint32_t colour,uint32_t marker,uint32_t lines);
 // Returns `end` on success, else the index of the (first) failing step.
 // bestEffort (abort/quiesce lists) logs a failure and carries on.
 template<typename Io> uint32_t Run(const Plan& p,uint32_t begin,uint32_t end,Io& io,bool bestEffort=false){
@@ -660,6 +679,7 @@ template<typename Io> uint32_t Run(const Plan& p,uint32_t begin,uint32_t end,Io&
             if(!s.y||(io.rd(s.y)&s.z)==0){got=io.rd(s.reg)&s.mask;io.wr(s.value,(io.rd(s.value)&s.x)|got);}
             break;
         case Op::Call:ok=io.call(s.reg);break;
+        case Op::SurfFill:io.fill(s.vram,s.value,s.mask,s.x,s.y,s.z);break;
         }
         io.log(i,s,got,ok);
         if(!ok){if(!bestEffort)return i;if(firstFail==end)firstFail=i;}
