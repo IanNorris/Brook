@@ -850,8 +850,9 @@ template<typename Io> uint32_t Run(const Plan& p,uint32_t begin,uint32_t end,Io&
             break;}
         case Op::ExpectOr:got=io.rd(s.reg);ok=(got&s.mask)==s.value||(got&s.mask)==s.x;break;
         case Op::WriteIf:{got=io.rd(s.y);bool go=(got&s.z)==s.x;
-            if(go&&s.vram){const uint32_t g2=io.rd(uint32_t(s.vram));if(g2&uint32_t(s.vram>>32)){go=false;got=g2;}}
-            if(go)io.wr(s.reg,s.value);else io.flag(i,s,got);break;}
+            bool other=false;  // second condition: the other output still uses it (expected; a note, not a warning)
+            if(go&&s.vram){const uint32_t g2=io.rd(uint32_t(s.vram));if(g2&uint32_t(s.vram>>32)){go=false;other=true;got=g2;}}
+            if(go)io.wr(s.reg,s.value);else if(!other)io.flag(i,s,got);break;}
         case Op::ExpectVpll:{const uint32_t c=io.rd(s.reg+4),f=io.rd(s.reg+0x10);
             const uint32_t P=(c>>16)&0x3f,N=(c>>8)&0xff,M=c&0xff;const int32_t fN=int16_t(f>>16);
             if(!P||!M){ok=false;got=0;break;}

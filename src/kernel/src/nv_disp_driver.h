@@ -22,6 +22,7 @@ namespace brook::nvdisp {
 enum class OutState:uint8_t{Off,Live,Failed};
 constexpr uint32_t kDriverOutputs=2;
 constexpr uint32_t kDriverWindow[kDriverOutputs]={0,2};
+constexpr uint32_t kFillD=0xffe07010,kFillDMarker=0xff000000;
 
 template<typename B> struct NvDisplayDriver{
     B* b=nullptr;Runner<B>* r0=nullptr;HeadRunner<B>* r1=nullptr;
@@ -95,8 +96,10 @@ template<typename B> struct NvDisplayDriver{
         r1->Show();
         if(!r1->st.windowLive){Msg("up1","window 2 attach failed; disabling head 1");r1->Disable();out[1]=OutState::Failed;++failures[1];return false;}
         r1->winExternal=true;
-        const Surface c=r1->win.surf;
-        f[1].Init(b,kDriverWindow[1],1,r1->win.pushVram,r1->win.showEnd,c,Second(c),0);
+        const Surface c=r1->win.surf,dd=Second(c);
+        // D gets a different pattern from C (orange, black bar) so head-1 flips are visible.
+        b->fill(dd.vram,uint32_t(uint64_t(dd.pitch)*dd.height),dd.pitch,kFillD,kFillDMarker,kHeadMarkerLines);
+        f[1].Init(b,kDriverWindow[1],1,r1->win.pushVram,r1->win.showEnd,c,dd,0);
         out[1]=OutState::Live;++ups[1];Msg("up1","head 1 flips live (window 2, buffers C, D)");return true;
     }
     bool Down1(){
@@ -160,21 +163,26 @@ template<typename B> struct NvDisplayDriver{
             Line l;l.raw("{\"nv_driver_out\":");l.dec(o);l.raw(",\"state\":");l.dec(uint32_t(out[o]));l.raw(",\"flip\":");l.dec(uint32_t(f[o].state));
             l.raw(",\"front\":");l.dec(uint32_t(f[o].front));l.raw(",\"presents\":");l.dec(f[o].st.presents);l.raw(",\"completes\":");l.dec(f[o].st.completes);
             l.raw(",\"replaced\":");l.dec(f[o].st.replaced);l.raw(",\"wraps\":");l.dec(f[o].st.wraps);l.raw(",\"lat_us\":");l.dec(f[o].st.lastLatUs);
-            l.raw(",\"max_lat_us\":");l.dec(f[o].st.maxLatUs);l.raw(",\"vblanks\":");l.dec(f[o].st.vblanks);l.raw(",\"fail\":");l.dec(uint32_t(f[o].fail));
+            l.raw(",\"max_lat_us\":");l.dec(f[o].st.maxLatUs);l.raw(",\"vblanks\":");l.dec(f[o].st.vblanks);l.raw(",\"frames\":");l.dec(f[o].st.frames);
+            l.raw(",\"latch_blank\":");l.dec(f[o].st.latchBlank);l.raw(",\"latch_active\":");l.dec(f[o].st.latchActive);
+            l.raw(",\"paced\":");l.dec(f[o].st.paced);l.raw(",\"interval\":");l.dec(f[o].interval);l.raw(",\"fail\":");l.dec(uint32_t(f[o].fail));
             l.raw(",\"ups\":");l.dec(ups[o]);l.raw(",\"downs\":");l.dec(downs[o]);l.raw(",\"failures\":");l.dec(failures[o]);l.raw("}\n");b->emit(l.t);}
     }
-    // n flips alternating the back buffer, each waited for; reports latency.
+    // n flips alternating the back buffer, each waited for (paced: one per frame unless
+    // `pace <o> 0`); reports latency, frames and where completions landed (tear test).
     void Bench(uint32_t o,uint32_t n){
         if(!Live(o)){Msg("refused","output not live");return;}
-        uint32_t done=0;
+        uint32_t done=0;const uint64_t tb=b->nowUs();
         for(uint32_t i=0;i<n&&Live(o);++i){
             const int8_t bb=f[o].Back();if(bb<0||Present(o,bb)<0)break;
             const uint64_t t0=b->nowUs();
-            while(Live(o)&&f[o].state==FlipState::Armed&&b->nowUs()-t0<500000){Tick();b->relax();}
+            while(Live(o)&&(f[o].state==FlipState::Armed||f[o].queued>=0)&&b->nowUs()-t0<500000){Tick();b->relax();}
             if(Live(o)&&f[o].state==FlipState::Idle)++done;else break;
         }
         Line l;l.raw("{\"nv_driver\":\"bench\",\"output\":");l.dec(o);l.raw(",\"requested\":");l.dec(n);l.raw(",\"completed\":");l.dec(done);
-        l.raw(",\"last_lat_us\":");l.dec(f[o].st.lastLatUs);l.raw(",\"max_lat_us\":");l.dec(f[o].st.maxLatUs);l.raw(",\"vblanks\":");l.dec(f[o].st.vblanks);l.raw("}\n");b->emit(l.t);
+        l.raw(",\"ms\":");l.dec(uint32_t((b->nowUs()-tb)/1000));
+        l.raw(",\"last_lat_us\":");l.dec(f[o].st.lastLatUs);l.raw(",\"max_lat_us\":");l.dec(f[o].st.maxLatUs);l.raw(",\"frames\":");l.dec(f[o].st.frames);
+        l.raw(",\"latch_blank\":");l.dec(f[o].st.latchBlank);l.raw(",\"latch_active\":");l.dec(f[o].st.latchActive);l.raw("}\n");b->emit(l.t);
         Status();
     }
     static bool Word(const char*& p,const char* w){
@@ -198,7 +206,12 @@ template<typename B> struct NvDisplayDriver{
         if(Word(p,"bench")){if(!Num(p,o)||!Num(p,v)||o>=kDriverOutputs||!v||v>3600){Msg("usage","bench <0|1> <1..3600>");return;}
             Bench(o,v);return;}
         if(Word(p,"tick")){Tick();Status();return;}
-        Msg("usage","nv-disp driver up [0|1|both]|down [0|1|all]|flip <o> <buf>|bench <o> <n>|tick|status");
+        // Experiments (design §7): pacing on/off, MIN_PRESENT_INTERVAL, acking all head-timing
+        // event bits. Try `interval 1 1` on head 1 first: a hung MPI wait only loses head 1.
+        if(Word(p,"pace")){if(!Num(p,o)||!Num(p,v)||o>=kDriverOutputs||v>1){Msg("usage","pace <o> <0|1>");return;}f[o].paced=v;Status();return;}
+        if(Word(p,"interval")){if(!Num(p,o)||!Num(p,v)||o>=kDriverOutputs||v>1){Msg("usage","interval <o> <0|1>");return;}f[o].interval=v;Status();return;}
+        if(Word(p,"ackevt")){if(!Num(p,o)||!Num(p,v)||o>=kDriverOutputs||v>1){Msg("usage","ackevt <o> <0|1>");return;}f[o].ackAllEvt=v;Status();return;}
+        Msg("usage","nv-disp driver up [0|1|both]|down [0|1|all]|flip <o> <buf>|bench <o> <n>|pace|interval|ackevt <o> <0|1>|tick|status");
     }
 };
 } // namespace brook::nvdisp

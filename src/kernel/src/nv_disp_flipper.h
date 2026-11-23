@@ -15,10 +15,16 @@ namespace brook::nvdisp {
 
 enum class FlipState:uint8_t{Off,Idle,Armed,Failed};
 enum class FlipFail:uint8_t{None,Guard,Exception,Timeout,Flush,Bounds};
-struct FlipStats{uint32_t presents=0,completes=0,replaced=0,wraps=0,lastLatUs=0,maxLatUs=0;uint64_t vblanks=0;};
+// frames: RG scanline wraps seen by Tick (vline decreased); vblanks: EVT_STAT VBLANK bits
+// seen (live a087416d: only 5 over 300 flips, so it does not latch every frame unserviced).
+// latchBlank/latchActive: the scanline when a completion was first seen, inside the
+// vertical blank (>= active height) or in the active area (tear test).
+struct FlipStats{uint32_t presents=0,completes=0,replaced=0,wraps=0,lastLatUs=0,maxLatUs=0,latchBlank=0,latchActive=0,lastLatchLine=0,paced=0;
+                 uint64_t vblanks=0,frames=0;};
 
 constexpr uint32_t RegHeadTimingEvt(uint32_t h){return 0x611800+h*4;} // EVT_STAT_HEAD_TIMING, bit 2 VBLANK (W1C)
 constexpr uint32_t kEvtVblank=0x4;
+constexpr uint32_t RegRgPos(uint32_t h){return 0x616330+h*0x800;} // vline 15:0 (gv100_head_rgpos)
 
 // Backend: rd, wr, vrd, vwr, fence, nowUs, relax (as the runners' backends).
 template<typename B> struct NvWindowFlipper{
@@ -33,17 +39,32 @@ template<typename B> struct NvWindowFlipper{
     int8_t front=0,armed=-1,queued=-1;
     uint64_t armedAtUs=0;uint32_t armedTarget=0,armedIso=0;
     FlipStats st{};
+    uint32_t interval=0;     // MIN_PRESENT_INTERVAL (0 = GOP value; 1 waits on MPI, see design §7)
+    bool paced=true;         // at most one completed flip per scanned frame
+    bool ackAllEvt=false;    // experiment: also W1C LOADV / LAST_DATA (bits 0-1) when polling
+    uint32_t lastVline=0;uint64_t latchFrame=~0ull;
 
     void Init(B* backend,uint32_t window_,uint32_t head_,uint64_t ringVram,uint32_t putBytes,const Surface& a,const Surface& bb,int8_t frontBuf){
         b=backend;window=window_;chid=ChidWndw(window_);head=head_;ring=ringVram;put=putBytes;
-        surf[0]=a;surf[1]=bb;front=frontBuf;armed=queued=-1;state=FlipState::Idle;fail=FlipFail::None;st=FlipStats{};}
+        surf[0]=a;surf[1]=bb;front=frontBuf;armed=queued=-1;state=FlipState::Idle;fail=FlipFail::None;st=FlipStats{};
+        lastVline=0;latchFrame=~0ull;}
     bool Live()const{return state==FlipState::Idle||state==FlipState::Armed;}
     bool Allowed(uint32_t a)const{return a==RegPut(chid)||a==kRegBar1Flush||a==RegHeadTimingEvt(head);}
     void Fail(FlipFail f){if(state!=FlipState::Failed){fail=f;state=FlipState::Failed;}}
     void Wr(uint32_t a,uint32_t v){if(!Allowed(a)){Fail(FlipFail::Guard);return;}b->wr(a,v);}
 
     // Vblank counter from the latched event bit (polled; the IRQ path comes later).
-    void TickVblank(){if(b->rd(RegHeadTimingEvt(head))&kEvtVblank){Wr(RegHeadTimingEvt(head),kEvtVblank);++st.vblanks;}}
+    void TickVblank(){
+        const uint32_t e=b->rd(RegHeadTimingEvt(head));
+        const uint32_t ack=e&(ackAllEvt?0x7u:kEvtVblank);
+        if(e&kEvtVblank)++st.vblanks;
+        if(ack)Wr(RegHeadTimingEvt(head),ack);
+        const uint32_t v=b->rd(RegRgPos(head))&0xffff;
+        if(v<lastVline)++st.frames;
+        lastVline=v;
+        // A paced present waiting for the next frame goes out now.
+        if(state==FlipState::Idle&&queued>=0&&(!paced||st.frames!=latchFrame)){const int8_t q=queued;queued=-1;Arm(q);}
+    }
 
     // Copy n words into the ring at PUT (JUMP 0 first if they do not fit), flush, kick.
     // Only called with nothing in flight (GET == PUT), so the JUMP is safe.
@@ -63,14 +84,16 @@ template<typename B> struct NvWindowFlipper{
         if(!Kick(w,n))return false;
         armedIso=iso;armedTarget=offset;armedAtUs=b->nowUs();state=FlipState::Armed;return true;}
     void Arm(int8_t buf){
-        Push p;PushWindowFlip(p,surf[buf],handle,0);PushWindowUpdate(p,window);
+        Push p;PushWindowFlip(p,surf[buf],handle,interval);PushWindowUpdate(p,window);
         if(ArmWords(p.words,p.count,handle,uint32_t(surf[buf].vram>>8)))armed=buf;
     }
     // Present buffer `buf` at the next vblank. 0 = armed now, 1 = queued (mailbox:
     // replaces an older queued frame), -1 = not live.
     int Present(int8_t buf){
         if(buf<0||buf>=int8_t(kMaxBuffers))return -1;
-        if(state==FlipState::Idle){++st.presents;Arm(buf);return state==FlipState::Armed?0:-1;}
+        if(state==FlipState::Idle){++st.presents;
+            if(paced&&st.frames==latchFrame){queued=buf;++st.paced;return 1;}   // one flip per frame: next frame
+            Arm(buf);return state==FlipState::Armed?0:-1;}
         if(state==FlipState::Armed){++st.presents;if(queued>=0)++st.replaced;queued=buf;return 1;}
         return -1;
     }
@@ -86,7 +109,10 @@ template<typename B> struct NvWindowFlipper{
         if(Complete()){
             const uint32_t lat=uint32_t(now-armedAtUs);st.lastLatUs=lat;if(lat>st.maxLatUs)st.maxLatUs=lat;++st.completes;
             if(armed>=0)front=armed;armed=-1;state=FlipState::Idle;
-            if(queued>=0){const int8_t q=queued;queued=-1;Arm(q);}
+            const uint32_t line=b->rd(RegRgPos(head))&0xffff;st.lastLatchLine=line;
+            if(line>=surf[0].height)++st.latchBlank;else ++st.latchActive;
+            latchFrame=st.frames;
+            if(queued>=0&&!paced){const int8_t q=queued;queued=-1;Arm(q);}     // paced: TickVblank arms it next frame
             return state;}
         if(now-armedAtUs>kWatchdogUs)Fail(FlipFail::Timeout);
         return state;
