@@ -307,28 +307,35 @@ enum class Op:uint8_t{
     AssyArmDiff,// chid `reg`: every method mask..value-4 must have ASSY == ARM unless the
                 // first submission rewrites it (Plan::rewritten); diffs go to io.diff
     Pause,      // live: wait for the operator (io.pause); dry run: no-op
+    Delay,      // io.udelay(value) (VBIOS TIME)
+    AndNotIf,   // if ((reg & x) == x) reg &= ~mask (VBIOS CONDITION + ANDN_REG)
+    CopyMask,   // if (!y || (rd(y) & z) == 0): reg `value` = (rd(value) & x) | (rd(reg) & mask) (COPY_NV_REG)
+    Call,       // io.call(reg) runs a dynamic step (DP link training); false aborts
 };
 enum class Blob:uint32_t{Inst,WndwPush,CorePush,SyncInit};
-struct Step{Op op;uint32_t reg,mask,value,timeoutMs;uint64_t vram;const char* what;};
+struct Step{Op op;uint32_t reg,mask,value,timeoutMs;uint64_t vram;const char* what;uint32_t x,y,z;};
 enum class Phase:uint8_t{Preflight,Vram,Instmem,Core,Window,FirstFlip,Flip,Restore,Teardown,Quiesce,Count};
 inline const char* PhaseName(Phase p){
     static const char* n[]={"preflight","vram","instmem","core","window","first-flip","flip","restore","teardown","quiesce"};
     return n[uint32_t(p)];
 }
 struct Plan{
-    static constexpr uint32_t kMax=512;
+    static constexpr uint32_t kMax=768,kPhases=16,kMthds=0x4000/4;
     Step steps[kMax];uint32_t count=0;bool overflow=false;
-    uint32_t rewritten[0x800/4/32]{}; // window methods the first submission sets
+    uint32_t rewritten[kMthds/32]{}; // methods the plan's own pushbuffer sets (excluded from AssyArmDiff)
     void MarkRewritten(const uint32_t* w,uint32_t n){
         for(uint32_t i=0;i<n;){const uint32_t hdr=w[i++];if(hdr>>29)continue;
             const uint32_t cnt=(hdr>>18)&0x3ff,m=hdr&0x3ffc;
-            for(uint32_t k=0;k<cnt&&i<n;++k,++i){const uint32_t mm=(m+k*4)/4;if(mm<0x200)rewritten[mm/32]|=1u<<(mm%32);}}}
-    bool Rewritten(uint32_t mthd)const{const uint32_t mm=mthd/4;return mm<0x200&&(rewritten[mm/32]>>(mm%32))&1;}
-    uint32_t phaseBegin[uint32_t(Phase::Count)+1]{};
+            for(uint32_t k=0;k<cnt&&i<n;++k,++i){const uint32_t mm=(m+k*4)/4;if(mm<kMthds)rewritten[mm/32]|=1u<<(mm%32);}}}
+    bool Rewritten(uint32_t mthd)const{const uint32_t mm=mthd/4;return mm<kMthds&&(rewritten[mm/32]>>(mm%32))&1;}
+    uint32_t phaseBegin[kPhases+1]{};
     void Begin(Phase p){phaseBegin[uint32_t(p)]=count;}
+    void BeginN(uint32_t p){phaseBegin[p]=count;}
     void End(){phaseBegin[uint32_t(Phase::Count)]=count;}
-    void Add(Op op,uint32_t reg,uint32_t mask,uint32_t value,uint32_t ms,const char* what,uint64_t vram=0){
-        if(count<kMax)steps[count++]={op,reg,mask,value,ms,vram,what};else overflow=true;}
+    void EndN(uint32_t n){phaseBegin[n]=count;}
+    void Add(Op op,uint32_t reg,uint32_t mask,uint32_t value,uint32_t ms,const char* what,uint64_t vram=0,
+             uint32_t x=0,uint32_t y=0,uint32_t z=0){
+        if(count<kMax)steps[count++]={op,reg,mask,value,ms,vram,what,x,y,z};else overflow=true;}
 };
 constexpr uint32_t kTimeoutMs=2000; // every nouveau poll in N1/N6 is 2000 ms
 
@@ -603,6 +610,7 @@ inline void BuildAbort(const Config& c,Phase reached,Plan& p,uint32_t ms=100){
 //   uint32_t blob(Blob b,uint32_t byteOffset); void fence(); bool expired(uint32_t ms,uint32_t& state);
 //   void log(uint32_t index,const Step&,uint32_t got,bool ok);
 //   void diff(uint32_t mthd,uint32_t assy,uint32_t arm); void pause(const char* what);
+//   void udelay(uint32_t us); bool call(uint32_t id);
 // Returns `end` on success, else the index of the (first) failing step.
 // bestEffort (abort/quiesce lists) logs a failure and carries on.
 template<typename Io> uint32_t Run(const Plan& p,uint32_t begin,uint32_t end,Io& io,bool bestEffort=false){
@@ -638,12 +646,20 @@ template<typename Io> uint32_t Run(const Plan& p,uint32_t begin,uint32_t end,Io&
         case Op::Copy:got=io.rd(s.reg);io.wr(s.value,got);break;
         case Op::AssyArmDiff:
             for(uint32_t m=s.mask;m<s.value;m+=4){
-                if(m==c57e::UPDATE||m==0x208)continue; // UPDATE trigger, GET_LINE (live)
+                if(m==0x200)continue;                                     // UPDATE trigger
+                if(s.reg!=kChidCore&&m==0x208)continue;                   // window GET_LINE (live)
+                if(s.reg==kChidCore&&m>=0x220&&m<0x240)continue;          // core GET_RG_SCAN_LINE (live)
                 const uint32_t a=io.rd(RegAssy(s.reg,m)),b=io.rd(RegArm(s.reg,m));
                 if(a!=b){io.diff(m,a,b);if(!p.Rewritten(m)){ok=false;if(!got)got=m;}}
             }
             break;
         case Op::Pause:io.pause(s.what);break;
+        case Op::Delay:io.udelay(s.value);break;
+        case Op::AndNotIf:got=io.rd(s.reg);if((got&s.x)==s.x)io.wr(s.reg,got&~s.mask);break;
+        case Op::CopyMask:
+            if(!s.y||(io.rd(s.y)&s.z)==0){got=io.rd(s.reg)&s.mask;io.wr(s.value,(io.rd(s.value)&s.x)|got);}
+            break;
+        case Op::Call:ok=io.call(s.reg);break;
         }
         io.log(i,s,got,ok);
         if(!ok){if(!bestEffort)return i;if(firstFail==end)firstFail=i;}

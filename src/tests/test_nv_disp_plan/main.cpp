@@ -242,6 +242,8 @@ struct Fake{
     bool verbose=false;uint32_t diffs=0,pauses=0;
     void diff(uint32_t m,uint32_t a,uint32_t b){++diffs;if(verbose)printf("  diff %03x assy %08x arm %08x\n",m,a,b);}
     void pause(const char*){++pauses;}
+    void udelay(uint32_t){}
+    bool call(uint32_t){return true;}
     void log(uint32_t i,const Step& s,uint32_t got,bool ok){
         if(verbose||!ok)printf("  %3u %-12s %s got %08x\n",i,ok?"ok":"FAIL",s.what,got);}
 };
@@ -360,7 +362,7 @@ static void Dump(bool core){
     Config c=DellConfig();c.coreChannel=core;c.pauseForObserver=true;
     static InstImage img;static Pushes pushes;static Plan plan;pushes=Pushes{};plan=Plan{};
     assert(BuildPlan(c,img,pushes,plan)==Err::Ok);FixPramin(plan,img);
-    static const char* op[]={"WR","MASK","EXPECT","POLL","POLLSOFT","ACK","VCOPY","VWR","VEXPECT","VPOLL","VPOLLANY","ACKEXC","PRAMIN","FENCE","KICK","EXPNOT","LOG","COPY","ASSYARM","PAUSE"};
+    static const char* op[]={"WR","MASK","EXPECT","POLL","POLLSOFT","ACK","VCOPY","VWR","VEXPECT","VPOLL","VPOLLANY","ACKEXC","PRAMIN","FENCE","KICK","EXPNOT","LOG","COPY","ASSYARM","PAUSE","DELAY","ANDNIF","COPYMASK","CALL"};
     uint32_t ph=0;
     for(uint32_t i=0;i<plan.count;++i){
         while(ph<uint32_t(Phase::Count)&&plan.phaseBegin[ph]<=i&&(ph+1>=uint32_t(Phase::Count)||plan.phaseBegin[ph+1]<=i))++ph;
