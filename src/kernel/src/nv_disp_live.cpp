@@ -91,7 +91,8 @@ void NvDispQuiesceForReset(){
     g_backend.toSerial=false;
     if(held)SpinLockRelease(lock);
 }
-void LiveBackend::hookQuiesce(){(void)PlatformPowerAddQuiesce(NvDispQuiesceForReset);}
+extern "C" void NvDisplayMarkWritten();
+void LiveBackend::hookQuiesce(){NvDisplayMarkWritten();(void)PlatformPowerAddQuiesce(NvDispQuiesceForReset);}
 
 bool FindGpu(PciDevice& gpu){
     for(uint32_t i=0;i<PciBootInventoryCount();++i){PciBootEntry e{};

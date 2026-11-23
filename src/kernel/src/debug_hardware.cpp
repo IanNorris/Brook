@@ -38,6 +38,7 @@
 #include "tsc_clock.h"
 #include "kprintf.h"
 #include "spinlock.h"
+#include "platform_power.h"
 #include "nv_disp_live.h"
 #include "nv_aux_reply.h"
 #include "input.h"
@@ -490,6 +491,7 @@ bool NvAuxHandleLocked(const char* command){
                     auto pattern=[&](uint32_t pat){static const uint32_t d[]={0x10101010,0x01010101,0x02020202,0x03030303};
                         sr[patReg/4]=(sr[patReg/4]&~0x1f1f1f1fu)|d[pat];};
                     const uint32_t lanes=__builtin_popcount((dpctrl>>16)&0xf);
+                    NvDisplayMarkWritten();
                     KPrintf("nv-aux: retrain start SOR%u link %u dpctrl %08x pat %08x\n",sor,link,dpctrl,patOrig);
                     uint8_t caps[16]{};uint32_t n=16;rc=xfer(0x9,0x000,caps,n);
                     uint8_t conf[4]{};n=4;if(!rc)rc=xfer(0x9,0x103,conf,n);
@@ -755,12 +757,53 @@ void DpIdleSuspendForDisplay(bool suspend){
     else{__atomic_store_n(&g_dpIdle.lastActivityMs,ApicTickCount(),__ATOMIC_RELEASE);
         __atomic_store_n(&g_dpIdle.watch,savedWatch,__ATOMIC_RELEASE);__atomic_store_n(&g_dpIdle.seconds,savedSecs,__ATOMIC_RELEASE);}
 }
+// Pre-reset GPU reset. A warm reset does not reset the display engine, and
+// after nv-disp / nv-aux display writes the next POST hung with no video.
+// If such a write happened this boot, the last quiesce step resets the GPU:
+// FLR on fn0 when DevCap advertises it, else a Secondary Bus Reset on the
+// upstream port. Registered at boot so it runs after nv-disp's own abort.
+static volatile bool g_nvDisplayWritten=false;
+extern "C" void NvDisplayMarkWritten(){__atomic_store_n(&g_nvDisplayWritten,true,__ATOMIC_RELEASE);}
+static void NvDelayUs(uint32_t us){
+    if(TscClockAvailable()){const uint64_t end=TscClockReadNs()+uint64_t(us)*1000;while(TscClockReadNs()<end)__asm__ volatile("pause");}
+    else{const uint64_t end=ApicTickCount()+us/1000+1;while(ApicTickCount()<end)__asm__ volatile("pause");}
+}
+static void NvGpuResetQuiesce(){
+    if(!__atomic_load_n(&g_nvDisplayWritten,__ATOMIC_ACQUIRE))return;
+    PciDevice gpu{};bool found=false;
+    for(uint32_t i=0;i<PciBootInventoryCount()&&!found;++i){PciBootEntry e{};
+        if(PciBootInventoryRead(i,&e)&&e.device.vendorId==0x10de&&e.device.classCode==0x03&&e.device.fn==0){gpu=e.device;found=true;}}
+    if(!found)return;
+    // PCIe capability (id 0x10) on fn0.
+    uint8_t cap=uint8_t(PciConfigRead32(gpu.bus,gpu.dev,0,0x34)&0xfc);
+    for(int n=0;cap&&n<48;++n){const uint32_t h=PciConfigRead32(gpu.bus,gpu.dev,0,cap);if((h&0xff)==0x10)break;cap=uint8_t((h>>8)&0xfc);}
+    if(cap&&(PciConfigRead32(gpu.bus,gpu.dev,0,uint8_t(cap+4))&(1u<<28))){
+        KPrintf("power: GPU %02x:%02x.0 display was written this boot; FLR before reset\n",gpu.bus,gpu.dev);
+        PciConfigWrite16(gpu.bus,gpu.dev,0,uint8_t(cap+8),uint16_t(PciConfigRead16(gpu.bus,gpu.dev,0,uint8_t(cap+8))|0x8000));
+        NvDelayUs(100000);
+        KPrintf("power: GPU FLR done\n");return;
+    }
+    for(uint32_t i=0;i<PciBootInventoryCount();++i){PciBootEntry e{};
+        if(!PciBootInventoryRead(i,&e)||(e.headerType&0x7f)!=1)continue;
+        const auto& b=e.device;
+        if(((PciConfigRead32(b.bus,b.dev,b.fn,0x18)>>8)&0xff)!=gpu.bus)continue;
+        KPrintf("power: GPU %02x:%02x.0 display was written this boot; SBR on %02x:%02x.%u before reset\n",
+                gpu.bus,gpu.dev,b.bus,b.dev,b.fn);
+        const uint16_t bc=PciConfigRead16(b.bus,b.dev,b.fn,0x3e);
+        PciConfigWrite16(b.bus,b.dev,b.fn,0x3e,uint16_t(bc|0x40));
+        NvDelayUs(2000); // hold the reset >= 1 ms
+        PciConfigWrite16(b.bus,b.dev,b.fn,0x3e,uint16_t(bc&~0x40));
+        KPrintf("power: GPU SBR done\n");return;
+    }
+    KPrintf("power: GPU reset skipped (no FLR, no upstream bridge found)\n");
+}
 void DpIdleStart(){
     if(g_dpIdle.threadStarted)return;
     bool nvidia=false;
     for(uint32_t i=0;i<PciBootInventoryCount()&&!nvidia;++i){PciBootEntry e{};
         if(PciBootInventoryRead(i,&e)&&e.device.vendorId==0x10de&&e.device.classCode==0x03)nvidia=true;}
     if(!nvidia)return;
+    (void)PlatformPowerAddQuiesce(NvGpuResetQuiesce);
     Process* t=KernelThreadCreate("dp_idle",DpIdleWorker,nullptr,3);
     if(!t){KPrintf("dp-idle: thread start failed\n");return;}
     g_dpIdle.threadStarted=true;SchedulerAddProcess(t);
