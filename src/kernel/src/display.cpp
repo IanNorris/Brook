@@ -215,8 +215,11 @@ void DisplayFlush(uint32_t minY, uint32_t maxY)
     DisplayGetActive()->Flush(minY, maxY);
 }
 
+static void (*volatile g_displayPanicHook)()=nullptr;
+void DisplaySetPanicHook(void (*hook)()) { g_displayPanicHook=hook; }
 void DisplayPanicPresent()
 {
+    if (auto* hook=g_displayPanicHook) hook();
     DisplayPowerPanicRestore();
     FramebufferWriteFence();
     if (const auto* active=DisplayGetActive(); active && active->PanicPresent)

@@ -1,5 +1,8 @@
 #include "hw_inventory.h"
 #include "debug_hardware.h"
+#if defined(BROOK_NV_DISPLAY)
+#include "nv_disp_live.h"
+#endif
 #include "boot_status.h"
 #include "boot_stick.h"
 #include "live_store.h"
@@ -1291,6 +1294,10 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
         // RTX DP sink idle-off (gated by /etc/dp-idle-seconds or bridge command).
         brook::DpIdleStart();
+#if defined(BROOK_NV_DISPLAY)
+        // RTX head-0 flip presentation (gated by /etc/nv-display).
+        brook::NvDisplayDesktopStart();
+#endif
 
         // Start debug channel kernel thread (connects asynchronously).
 #if !defined(BROOK_SSD_GUARD_CHECK)

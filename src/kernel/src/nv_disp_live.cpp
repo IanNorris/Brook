@@ -19,6 +19,12 @@
 #include "tsc_clock.h"
 #include "platform_power.h"
 #include "string.h"
+#include "compositor.h"
+#include "display.h"
+#include "display_output.h"
+#include "vfs.h"
+#include "process.h"
+#include "scheduler.h"
 #include <serial.h>
 
 inline void* operator new(size_t, void* storage) noexcept { return storage; }
@@ -26,13 +32,18 @@ inline void* operator new(size_t, void* storage) noexcept { return storage; }
 namespace brook {
 namespace {
 
-// Small cache of single-page UC mappings (BAR0 registers, BAR1 VRAM pages).
-struct PageCache{
-    static constexpr uint32_t kSlots=24;
+// Small caches of single-page UC mappings (BAR0 registers, BAR1 VRAM pages).
+// Pinned caches never remap a slot: the resident driver's flips run on the compositor
+// thread, and a remapped slot would leave a stale TLB entry on another CPU (invlpg is
+// local). Registers and the driver's VRAM region (instmem, pushbuffers, sync) use pinned
+// caches; only bulk surface fills (bridge/driver thread) use the evicting one.
+template<uint32_t Slots,bool Evict> struct PageCacheT{
+    static constexpr uint32_t kSlots=Slots;
     VirtualAddress va[kSlots]{};uint64_t phys[kSlots]{};uint32_t next=0;
     volatile uint32_t* Map(uint64_t address){
         const uint64_t page=address&~0xfffull;
         for(uint32_t i=0;i<kSlots;++i)if(va[i]&&phys[i]==page)return reinterpret_cast<volatile uint32_t*>(va[i].raw()+(address&0xfff));
+        if(!Evict&&next>=kSlots)return nullptr;          // pinned cache full: refuse rather than remap
         const uint32_t s=next++%kSlots;
         if(!va[s]){
             va[s]=VmmAllocPages(1,VMM_WRITABLE|VMM_NO_EXEC,MemTag::Device,KernelPid);
@@ -47,14 +58,19 @@ struct PageCache{
         return reinterpret_cast<volatile uint32_t*>(va[s].raw()+(address&0xfff));
     }
 };
+using PinnedRegs=PageCacheT<192,false>;   // BAR0: registers, PRAMIN, the PROM (VBIOS read)
+using PinnedVram=PageCacheT<64,false>;
+using PageCache=PageCacheT<24,true>;
 
 struct LiveBackend{
     uint64_t bar0=0,bar1=0,bar1Size=0;bool ok=false,toSerial=false;
-    PageCache regs{},vram{};
+    PinnedRegs regs{};PinnedVram vramTop{};PageCache vram{};
+    // The top 1 MiB of the aperture (instmem, pushbuffers, sync page) is pinned.
+    volatile uint32_t* VramMap(uint64_t a){return a+(1ull<<20)>=bar1Size?vramTop.Map(bar1+a):vram.Map(bar1+a);}
     uint32_t rd(uint32_t a){volatile uint32_t* p=regs.Map(bar0+a);return p?*p:0xffffffffu;}
     void wr(uint32_t a,uint32_t v){volatile uint32_t* p=regs.Map(bar0+a);if(p)*p=v;}
-    uint32_t vrd(uint64_t a){if(a+4>bar1Size)return 0xffffffffu;volatile uint32_t* p=vram.Map(bar1+a);return p?*p:0xffffffffu;}
-    void vwr(uint64_t a,uint32_t v){if(a+4>bar1Size)return;volatile uint32_t* p=vram.Map(bar1+a);if(p)*p=v;}
+    uint32_t vrd(uint64_t a){if(a+4>bar1Size)return 0xffffffffu;volatile uint32_t* p=VramMap(a);return p?*p:0xffffffffu;}
+    void vwr(uint64_t a,uint32_t v){if(a+4>bar1Size)return;volatile uint32_t* p=VramMap(a);if(p)*p=v;}
     void fill(uint64_t v,uint32_t bytes,uint32_t pitch,uint32_t colour,uint32_t marker,uint32_t lines){
         if(v+bytes>bar1Size||!pitch)return;
         const uint64_t markerEnd=uint64_t(lines)*pitch;
@@ -173,6 +189,106 @@ bool ConfigureHead(){
     g_head.b=&g_backend;
     return true;
 }
+
+// ---- D2: the desktop presents into head 0's flipped buffers (A = GOP surface, B).
+// The compositor hands the damage and its back buffer to NvPrimaryPresent (compositor
+// thread, g_scanoutMappingLock held); it copies the damage plus the previous frame's
+// damage (the other buffer's age) into the back buffer through a WC alias and flips.
+// Any failure: the driver has already put A/"DAVE" back on screen, so returning <0
+// lets the GOP copy take over.
+struct NvPresenterState{
+    bool active=false;uint32_t* px[2]{};uint32_t pitchPx=0,width=0,height=0;
+    nvdisp::AgeRepair age{};uint32_t frames=0,busy=0,waitMaxUs=0;
+};
+NvPresenterState g_presenter{};
+// A kernel alias of `bytes` of BAR1 at `vram`, write-combining when PAT slot 4 is WC
+// (the GOP framebuffer setup), else uncached.
+uint32_t* MapBar1Surface(uint64_t vram,uint64_t bytes){
+    const uint64_t pages=(bytes+4095)/4096,phys=g_backend.bar1+vram;
+    if(vram+bytes>g_backend.bar1Size)return nullptr;
+    const uint64_t cache=VmmFramebufferWriteCombining()?VMM_LEAF_PAT:(VMM_CACHE_DISABLE|VMM_WRITE_THRU);
+    const VirtualAddress va=VmmAllocPages(pages,VMM_WRITABLE|VMM_NO_EXEC,MemTag::Device,KernelPid);
+    if(!va)return nullptr;
+    for(uint64_t i=0;i<pages;++i){
+        const VirtualAddress v(va.raw()+i*4096);
+        const PhysicalAddress old=VmmVirtToPhys(KernelPageTable,v);
+        VmmUnmapPage(KernelPageTable,v);if(old)PmmFreePage(old);
+        if(!VmmMapPage(KernelPageTable,v,PhysicalAddress(phys+i*4096),VMM_WRITABLE|VMM_NO_EXEC|cache,MemTag::Device,KernelPid))return nullptr;
+    }
+    return reinterpret_cast<uint32_t*>(va.raw());
+}
+int NvPrimaryPresent(const uint32_t* src,uint32_t srcStride,uint32_t width,uint32_t height,const DamageRects& damage){
+    SpinLock* lock=NvAuxSharedLock();
+    if(!SpinLockTryAcquire(lock)){++g_presenter.busy;return kPresenterBusy;}
+    auto& f=g_driver.f[0];
+    if(!g_presenter.active||!g_driver.Live(0)||width!=g_presenter.width||height!=g_presenter.height){
+        g_presenter.active=false;g_driver.out0External=false;SpinLockRelease(lock);return -1;}
+    // One frame in flight: wait (bounded) for the previous flip before reusing a buffer.
+    const uint64_t t0=g_backend.nowUs();
+    while(g_driver.Live(0)&&(f.state==nvdisp::FlipState::Armed||f.queued>=0)&&g_backend.nowUs()-t0<50000){g_driver.Tick();g_backend.relax();}
+    const uint32_t waited=uint32_t(g_backend.nowUs()-t0);if(waited>g_presenter.waitMaxUs)g_presenter.waitMaxUs=waited;
+    if(!g_driver.Live(0)){g_presenter.active=false;g_driver.out0External=false;SpinLockRelease(lock);return -1;}
+    if(f.state!=nvdisp::FlipState::Idle||f.queued>=0){++g_presenter.busy;SpinLockRelease(lock);return kPresenterBusy;}
+    const int8_t bb=f.Back();
+    if(bb<0){SpinLockRelease(lock);return kPresenterBusy;}
+    uint32_t* dst=g_presenter.px[bb];const uint32_t pitch=g_presenter.pitchPx;
+    auto copy=[&](const DamageRect& r){
+        const int32_t x0=r.x0<0?0:r.x0,y0=r.y0<0?0:r.y0;
+        const int32_t x1=r.x1>int32_t(width)?int32_t(width):r.x1,y1=r.y1>int32_t(height)?int32_t(height):r.y1;
+        if(x1<=x0||y1<=y0)return;
+        for(int32_t y=y0;y<y1;++y)__builtin_memcpy(dst+uint64_t(y)*pitch+x0,src+uint64_t(y)*srcStride+x0,uint64_t(x1-x0)*4);
+    };
+    (void)g_presenter.age.Apply(bb,damage,width,height,copy);
+    __asm__ volatile("sfence":::"memory");
+    if(f.Present(bb)<0){g_driver.Tick();SpinLockRelease(lock);return g_driver.Live(0)?kPresenterBusy:-1;}
+    ++g_presenter.frames;
+    SpinLockRelease(lock);
+    return 1;
+}
+const CompositorPrimaryPresenter g_presenterOps{NvPrimaryPresent};
+// Panic: put A back on screen without waiting or locking (best effort).
+void NvPanicHook(){
+    if(!g_runnersBuilt||!g_presenter.active||!g_driver.Live(0))return;
+    auto& f=g_driver.f[0];
+    if(f.front==0&&f.armed<0)return;
+    f.state=nvdisp::FlipState::Idle;f.queued=-1;f.armed=-1;f.paced=false;(void)f.Present(0);
+}
+// Called with the nv-aux lock held.
+bool PresenterOnLocked(){
+    if(g_presenter.active)return true;
+    if(!g_driver.Up0())return false;
+    const nvdisp::Surface& a=g_driver.f[0].surf[0];const nvdisp::Surface& b=g_driver.f[0].surf[1];
+    const uint64_t bytes=uint64_t(a.pitch)*a.height;
+    if(!g_presenter.px[0]){g_presenter.px[0]=MapBar1Surface(a.vram,bytes);g_presenter.px[1]=MapBar1Surface(b.vram,bytes);}
+    if(!g_presenter.px[0]||!g_presenter.px[1]){KPrintf("nv-display: BAR1 surface mapping failed\n");(void)g_driver.Down0();return false;}
+    g_presenter.pitchPx=a.pitch/4;g_presenter.width=a.width;g_presenter.height=a.height;
+    g_presenter.age.Reset();   // A holds the last GOP frame; B is stale
+    g_presenter.active=true;g_driver.out0External=true;
+    DisplaySetPanicHook(NvPanicHook);
+    KPrintf("nv-display: head 0 presents by flipping (A=GOP surface, B), WC=%d\n",VmmFramebufferWriteCombining()?1:0);
+    return true;
+}
+void PresenterStatus(){
+    nvdisp::NvDisplayDriver<LiveBackend>::Line l;
+    l.raw("{\"nv_display\":\"presenter\",\"active\":");l.dec(g_presenter.active?1:0);l.raw(",\"frames\":");l.dec(g_presenter.frames);
+    l.raw(",\"busy\":");l.dec(g_presenter.busy);l.raw(",\"wait_max_us\":");l.dec(g_presenter.waitMaxUs);l.raw("}\n");
+    DebugChannelSend(l.t);
+}
+// Marker files hold "1\n" (as the Intel opt-ins).
+bool MarkerSet(const char* path){auto* f=VfsOpen(path,VFS_O_STREAM);if(!f)return false;
+    VnodeStat st{};uint64_t offset=0;char t[2]{};bool ok=!VfsStat(f,&st)&&!st.isDir&&!st.isSymlink&&st.size==2&&
+        VfsRead(f,t,2,&offset)==2&&t[0]=='1'&&t[1]=='\n';VfsRelease(f);return ok;}
+void DesktopStartThread(void*){
+    SpinLock* lock=NvAuxSharedLock();
+    SpinLockAcquire(lock);
+    EnsureRunners();
+    bool ok=Configure();
+    if(ok){g_driver.b=&g_backend;g_driver.r0=&g_runner;g_driver.r1=&g_head;ok=PresenterOnLocked();}
+    SpinLockRelease(lock);
+    if(ok)CompositorSetPrimaryPresenter(&g_presenterOps);
+    else KPrintf("nv-display: bring-up failed; the desktop stays on the GOP framebuffer\n");
+}
+
 } // namespace
 
 bool NvDispHandle(const char* command){
@@ -188,6 +304,13 @@ bool NvDispHandle(const char* command){
     const char* rest=command+n;while(*rest==' ')++rest;
     if(strncmp(rest,"driver",6)==0&&(rest[6]==0||rest[6]==' ')){
         g_driver.b=&g_backend;g_driver.r0=&g_runner;g_driver.r1=&g_head;
+        const char* v=rest+6;while(*v==' ')++v;
+        // `driver desktop on|off|status`: the compositor presents into head 0's flips (D2).
+        if(strncmp(v,"desktop",7)==0){v+=7;while(*v==' ')++v;
+            if(strncmp(v,"on",2)==0){const bool ok=PresenterOnLocked();SpinLockRelease(lock);if(ok)CompositorSetPrimaryPresenter(&g_presenterOps);PresenterStatus();return true;}
+            if(strncmp(v,"off",3)==0){g_presenter.active=false;SpinLockRelease(lock);CompositorSetPrimaryPresenter(nullptr);
+                SpinLockAcquire(lock);g_driver.out0External=false;(void)g_driver.Down0();SpinLockRelease(lock);PresenterStatus();return true;}
+            PresenterStatus();SpinLockRelease(lock);return true;}
         if(!headLive&&!g_driver.Live(1)&&!ConfigureHead()){SpinLockRelease(lock);return true;}
         g_driver.Command(rest+6);
         SpinLockRelease(lock);return true;
@@ -204,5 +327,12 @@ bool NvDispHandle(const char* command){
     }else g_runner.Command(rest);
     SpinLockRelease(lock);
     return true;
+}
+// Desktop start (kernel.cpp, after the compositor thread): with /etc/nv-display = "1\n",
+// bring head-0 flips up in a short-lived thread and hand the compositor the presenter.
+void NvDisplayDesktopStart(){
+    if(!MarkerSet("/etc/nv-display"))return;
+    Process* t=KernelThreadCreate("nv_display",DesktopStartThread,nullptr,3);
+    if(t)SchedulerAddProcess(t);else KPrintf("nv-display: thread start failed\n");
 }
 } // namespace brook

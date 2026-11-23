@@ -10,6 +10,7 @@
 // register and its head's EVT_STAT_HEAD_TIMING (W1C of VBLANK), and VRAM inside its
 // own ring. Anything else is refused and fails the flipper.
 #include "nv_disp_plan.h"
+#include "display_output.h"
 
 namespace brook::nvdisp {
 
@@ -130,6 +131,21 @@ template<typename B> struct NvWindowFlipper{
         while(state==FlipState::Armed&&b->nowUs()-t0<timeoutUs){(void)Poll();b->relax();}
         armed=-1;
         return state==FlipState::Idle;
+    }
+};
+// Two-buffer age repair (D2): buffer bb was last written two frames ago, so it lacks the
+// previous frame's damage (which went to the other buffer) plus this frame's. A stale
+// buffer (never written: B at bring-up) or `full` damage gets the whole area.
+struct AgeRepair{
+    brook::DamageRects prev{};bool stale[2]{false,true};
+    void Reset(){prev=brook::DamageRects{};stale[0]=false;stale[1]=true;}
+    template<typename F> uint32_t Apply(int8_t bb,const brook::DamageRects& d,uint32_t w,uint32_t h,F copy){
+        uint32_t n=0;
+        if(bb<0||bb>1)return 0;
+        if(stale[bb]||d.full){copy(brook::DamageRect{0,0,int32_t(w),int32_t(h)});n=1;}
+        else{for(uint32_t i=0;i<d.count;++i){copy(d.rects[i]);++n;}
+             for(uint32_t i=0;i<prev.count;++i){copy(prev.rects[i]);++n;}}
+        prev=d;stale[bb]=false;return n;
     }
 };
 } // namespace brook::nvdisp

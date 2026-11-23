@@ -123,6 +123,9 @@ void DisplayFlush(uint32_t minY, uint32_t maxY);
 // Emergency full-screen present from the panic handler (best-effort). No-op if
 // the active display has no PanicPresent op (direct-mapped linear FBs).
 void DisplayPanicPresent();
+// Called first by DisplayPanicPresent (no locks, best effort): a flip backend puts the
+// firmware framebuffer back on screen so the panic screen is visible.
+void DisplaySetPanicHook(void (*hook)());
 
 // 3D-acceleration status. A display driver that has proven a live host 3D
 // (virgl/Venus) command path — e.g. the virtio-gpu driver's GPU-clear

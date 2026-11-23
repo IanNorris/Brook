@@ -123,6 +123,21 @@ static void TestPacing(){
     g.d->Command("interval 0 0");g.Flip(0,1);
     assert(g.d->Down0());
 }
+// D2 age repair: B is stale at bring-up (full copy); afterwards each buffer gets this
+// frame's damage plus the previous frame's.
+static void TestAgeRepair(){
+    AgeRepair a;a.Reset();std::vector<brook::DamageRect> got;
+    auto cp=[&](const brook::DamageRect& r){got.push_back(r);};
+    brook::DamageRects d1;d1.Add({10,10,20,20});
+    assert(a.Apply(1,d1,3840,2160,cp)==1&&got[0]==(brook::DamageRect{0,0,3840,2160}));got.clear();   // B stale: full
+    brook::DamageRects d2;d2.Add({100,100,110,110});
+    assert(a.Apply(0,d2,3840,2160,cp)==2&&got[0]==d2.rects[0]&&got[1]==d1.rects[0]);got.clear();      // A: d2 + d1
+    brook::DamageRects d3;d3.Add({5,5,6,6});
+    assert(a.Apply(1,d3,3840,2160,cp)==2&&got[0]==d3.rects[0]&&got[1]==d2.rects[0]);got.clear();      // B: d3 + d2
+    const brook::DamageRects f=brook::DamageRects::Full(3840,2160);
+    assert(a.Apply(0,f,3840,2160,cp)==1);got.clear();
+    assert(a.Apply(9,d1,3840,2160,cp)==0);
+}
 static void TestVblankCounter(){
     DRig g;assert(g.d->Up0());
     g.c.R(0x611800)=0x4;g.d->Tick();assert(g.d->f[0].st.vblanks==1&&g.c.R(0x611800)==0);
@@ -130,6 +145,6 @@ static void TestVblankCounter(){
     assert(g.d->Down0());
 }
 int main(){
-    TestOutput0();TestBothOutputs();TestFailures();TestPacing();TestVblankCounter();
+    TestOutput0();TestBothOutputs();TestFailures();TestPacing();TestAgeRepair();TestVblankCounter();
     puts("test_nv_disp_driver: ok");return 0;
 }

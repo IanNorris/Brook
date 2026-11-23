@@ -92,6 +92,20 @@ void CompositorGetOutputs(OutputLayout& out);
 bool CompositorGetOutputRect(uint32_t index, OutputRect* rect);
 OutputRect CompositorPrimaryOutputRect();
 
+// Primary-output presenter override (D2: the NVIDIA window-0 flip backend). While set,
+// the primary output's present hands the damage (desktop coordinates; output 0 is at
+// 0,0) and the compositor back buffer to `present` instead of copying into the GOP
+// framebuffer. Return >0 = presented, 0 = nothing changed, kPresenterBusy = try again
+// next frame (the compositor repaints fully), <0 = failed: the override is dropped and
+// the GOP copy takes over with a full frame (the presenter has put the GOP surface back
+// on screen). The forced periodic full repaint is skipped while it is set.
+struct DamageRects;
+struct CompositorPrimaryPresenter {
+    int (*present)(const uint32_t* src, uint32_t srcStride, uint32_t width, uint32_t height, const DamageRects& damage);
+};
+inline constexpr int kPresenterBusy = -1000;
+void CompositorSetPrimaryPresenter(const CompositorPrimaryPresenter* presenter);
+
 // Get physical framebuffer pointer and stride (for kernel threads that
 // need direct FB access, e.g. clock overlay).
 volatile uint32_t* CompositorGetPhysFb(uint32_t* stride);

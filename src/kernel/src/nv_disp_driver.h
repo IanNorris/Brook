@@ -30,6 +30,7 @@ template<typename B> struct NvDisplayDriver{
     OutState out[kDriverOutputs]{};
     uint32_t ups[kDriverOutputs]{},downs[kDriverOutputs]{},failures[kDriverOutputs]{};
     uint64_t lastCheckUs=0;uint32_t invariantFails=0;
+    bool out0External=false;   // the compositor presents on output 0 (D2): no bridge flips/bench there
 
     struct Line{char t[320];uint32_t n=0;
         void raw(const char* x){while(*x&&n+2<sizeof(t))t[n++]=*x++;t[n]=0;}
@@ -202,8 +203,10 @@ template<typename B> struct NvDisplayDriver{
             if(Word(p,"0"))(void)Down0();else if(Word(p,"1"))(void)Down1();else{(void)Word(p,"all");Quiesce();}
             Status();return;}
         if(Word(p,"flip")){if(!Num(p,o)||!Num(p,v)||o>=kDriverOutputs||v>1){Msg("usage","flip <0|1> <0|1>");return;}
+            if(o==0&&out0External){Msg("refused","the desktop presents on output 0");return;}
             Msg("flip",Present(o,int8_t(v))<0?"refused (not live)":"presented");return;}
         if(Word(p,"bench")){if(!Num(p,o)||!Num(p,v)||o>=kDriverOutputs||!v||v>3600){Msg("usage","bench <0|1> <1..3600>");return;}
+            if(o==0&&out0External){Msg("refused","the desktop presents on output 0");return;}
             Bench(o,v);return;}
         if(Word(p,"tick")){Tick();Status();return;}
         // Experiments (design §7): pacing on/off, MIN_PRESENT_INTERVAL, acking all head-timing

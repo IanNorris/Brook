@@ -89,6 +89,8 @@ static uint32_t g_leasedFrameMode=BROOK_DEBUG_FRAME_PRESENT_NONE;
 // A released/expired lease leaves its last complete image on screen until the
 // software flip. A failed or partial probe must not be reported as a frame.
 static bool g_scanoutContainsLeasedFrame=false, g_scanoutNeedsRepair=false;
+// D2 flip presenter for the primary output (CompositorSetPrimaryPresenter).
+static const CompositorPrimaryPresenter* volatile g_primaryPresenter=nullptr;
 static CompositorSoftwareTakeoverStats g_softwareTakeover{};
 // Zero means generation tracking has exhausted its unique identifiers.
 // Protected by g_scanoutMappingLock, together with the display mapping.
@@ -2604,7 +2606,9 @@ static void CompositorLoopWM(bool& clientFrame)
     bool sceneRepair=false;
     if(skipCpuScene){cpuSceneStale=true;++g_idleStats.cpuSceneSkips;}
     else if(cpuSceneStale){cpuSceneStale=false;sceneRepair=true;}
-    bool forceAll = !CompositorGpuActive() && !rendererLeased && (sceneRepair || now - g_lastForceBlitTick >= FORCE_BLIT_INTERVAL_MS);
+    // A flip presenter owns private buffers nothing else writes: no periodic full repaint.
+    bool forceAll = !CompositorGpuActive() && !rendererLeased &&
+                    (sceneRepair || (!g_primaryPresenter && now - g_lastForceBlitTick >= FORCE_BLIT_INTERVAL_MS));
     if (forceAll) g_lastForceBlitTick = now;
 
     // Determine if we need a full scene repaint (wallpaper + all windows)
@@ -4508,6 +4512,15 @@ static int GopOutputPresent(uint32_t id, const OutputBuffer& buffer, const Damag
     DamageRect bounds{};
     if(id || !buffer.cpu || !g_backBuffer)return -1;
     if(!damage.Bounds(&bounds))return 0;
+    if(const auto* presenter=g_primaryPresenter){
+        const int r=presenter->present(g_backBuffer,g_backBufStride,g_physFbWidth,g_physFbHeight,damage);
+        if(r==kPresenterBusy){g_scanoutNeedsRepair=true;return 0;}
+        if(r>=0)return r;
+        // The flip backend failed and put the GOP surface back: copy a full frame there.
+        g_primaryPresenter=nullptr;
+        if(g_gopShadowValid)GopShadowInvalidate();
+        return GopOutputPresent(id,buffer,DamageRects::Full(g_physFbWidth,g_physFbHeight));
+    }
     const bool full=damage.full,shadow=g_gopPresentShadow;
     const uint32_t minY=static_cast<uint32_t>(bounds.y0),maxY=static_cast<uint32_t>(bounds.y1);
     auto* framebuffer=reinterpret_cast<uint32_t*>(buffer.cpu);
@@ -4563,6 +4576,16 @@ void CompositorGetOutputs(OutputLayout& out)
 }
 
 static void CompositorRegisterOutputs() { (void)OutputRegisterBackend(&g_gopOutputOps); }
+
+void CompositorSetPrimaryPresenter(const CompositorPrimaryPresenter* presenter)
+{
+    CompositorMutexGuard geometry(&g_scanoutMappingLock);
+    g_primaryPresenter=presenter;
+    // Whichever side takes over gets one complete frame.
+    g_scanoutNeedsRepair=true;
+    if(g_gopShadowValid)GopShadowInvalidate();
+    CompositorWake();
+}
 
 // The pointer moves over the union of the enabled outputs.
 static void CompositorSyncPointerOutputs()
