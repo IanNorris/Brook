@@ -125,6 +125,18 @@ static volatile int32_t  g_mouseX   = 0;
 static volatile int32_t  g_mouseY   = 0;
 static volatile uint32_t g_maxX     = 1920;
 static volatile uint32_t g_maxY     = 1080;
+// The pointer stays on an output: g_maxX/g_maxY bound the desktop union and
+// the rectangles below hold its outputs. Guarded by g_pointerPositionLock.
+static brook::OutputRect g_pointerOutputs[brook::OutputMax] = {{0, 0, 1920, 1080}};
+static uint32_t g_pointerOutputCount = 1;
+static void ClampPointerToOutputsLocked()
+{
+    int32_t x = g_mouseX, y = g_mouseY;
+    const uint32_t moved = brook::DesktopClampToOutputs(g_pointerOutputs, g_pointerOutputCount, x, y);
+    if (moved & 1u) g_fractionX = 0;
+    if (moved & 2u) g_fractionY = 0;
+    g_mouseX = x; g_mouseY = y;
+}
 static volatile uint8_t  g_buttons  = 0;
 static volatile uint8_t  g_prevButtons = 0;
 static bool              g_mouseInit = false;
@@ -238,8 +250,9 @@ static vmmouse::Reply VmMouseCall(uint32_t command, uint32_t argument)
 static bool SetNormalizedPosition(uint32_t x, uint32_t y)
 {
     const auto flags = IrqSpinLockAcquire(&g_pointerPositionLock);
-    const int32_t newX = vmmouse::Pixel(x, g_maxX);
-    const int32_t newY = vmmouse::Pixel(y, g_maxY);
+    int32_t newX = vmmouse::Pixel(x, g_maxX);
+    int32_t newY = vmmouse::Pixel(y, g_maxY);
+    brook::DesktopClampToOutputs(g_pointerOutputs, g_pointerOutputCount, newX, newY);
     const bool changed = newX != g_mouseX || newY != g_mouseY;
     g_mouseX = newX;
     g_mouseY = newY;
@@ -777,8 +790,36 @@ void MouseSetBounds(uint32_t maxX, uint32_t maxY)
 {
     const auto flags=IrqSpinLockAcquire(&g_pointerPositionLock);
     g_maxX=maxX?maxX:1;g_maxY=maxY?maxY:1;
+    g_pointerOutputs[0]={0,0,g_maxX,g_maxY};g_pointerOutputCount=1;
     if(g_mouseX>=static_cast<int32_t>(g_maxX))g_mouseX=static_cast<int32_t>(g_maxX)-1;
     if(g_mouseY>=static_cast<int32_t>(g_maxY))g_mouseY=static_cast<int32_t>(g_maxY)-1;
+    g_fractionX=g_fractionY=0;
+    IrqSpinLockRelease(&g_pointerPositionLock,flags);
+}
+
+void MouseSetOutputBounds(const brook::OutputRect* rects, uint32_t count)
+{
+    uint32_t n=0;
+    brook::OutputRect kept[brook::OutputMax]={};
+    int64_t right=0,bottom=0;
+    for(uint32_t i=0;i<count && n<brook::OutputMax;++i){
+        if(rects[i].empty() || rects[i].x<0 || rects[i].y<0)continue;
+        kept[n++]=rects[i];
+        if(rects[i].right()>right)right=rects[i].right();
+        if(rects[i].bottom()>bottom)bottom=rects[i].bottom();
+    }
+    if(!n || right>0x7fffffff || bottom>0x7fffffff){
+        MouseSetBounds(n?uint32_t(right):0,n?uint32_t(bottom):0);
+        return;
+    }
+    const auto flags=IrqSpinLockAcquire(&g_pointerPositionLock);
+    g_maxX=uint32_t(right);g_maxY=uint32_t(bottom);
+    for(uint32_t i=0;i<n;++i)g_pointerOutputs[i]=kept[i];
+    g_pointerOutputCount=n;
+    if(g_mouseX>=static_cast<int32_t>(g_maxX))g_mouseX=static_cast<int32_t>(g_maxX)-1;
+    if(g_mouseY>=static_cast<int32_t>(g_maxY))g_mouseY=static_cast<int32_t>(g_maxY)-1;
+    g_fractionX=g_fractionY=0;
+    ClampPointerToOutputsLocked();
     g_fractionX=g_fractionY=0;
     IrqSpinLockRelease(&g_pointerPositionLock,flags);
 }
@@ -790,6 +831,7 @@ void MouseMoveRelative(int32_t dx,int32_t dy)
     if(g_motionScale!=percent){g_fractionX=g_fractionY=0;g_motionScale=percent;}
     g_mouseX=AdvanceDesktopPointer(g_mouseX,dx,g_maxX,percent,g_fractionX);
     g_mouseY=AdvanceDesktopPointer(g_mouseY,dy,g_maxY,percent,g_fractionY);
+    ClampPointerToOutputsLocked();
     IrqSpinLockRelease(&g_pointerPositionLock,flags);
 }
 
@@ -806,6 +848,7 @@ void MouseSetPosition(int32_t x, int32_t y)
     if (x >= static_cast<int32_t>(g_maxX)) x = static_cast<int32_t>(g_maxX) - 1;
     if (y >= static_cast<int32_t>(g_maxY)) y = static_cast<int32_t>(g_maxY) - 1;
     g_mouseX = x;g_mouseY = y;
+    ClampPointerToOutputsLocked();
     g_fractionX=g_fractionY=0;
     IrqSpinLockRelease(&g_pointerPositionLock,flags);
 }

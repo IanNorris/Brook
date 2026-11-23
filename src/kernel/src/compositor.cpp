@@ -46,6 +46,8 @@
 #include "net.h"
 #include "display.h"
 #include "display_power.h"
+#include "display_output.h"
+#include "shell_output_layout.h"
 #if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
 #include "intel_bdw_scanout_target.h"
 #endif
@@ -1134,6 +1136,9 @@ static void PublishPhysDims(uint32_t width, uint32_t height)
     __atomic_store_n(&g_publishedPhysDims, packed, __ATOMIC_RELEASE);
 }
 
+static void CompositorRegisterOutputs();
+static void CompositorSyncPointerOutputs();
+
 void CompositorInit()
 {
     // Get the physical framebuffer address so we can map the real MMIO,
@@ -1189,8 +1194,10 @@ void CompositorInit()
         SerialPuts("COMPOSITOR: WARNING — backbuffer alloc failed, direct MMIO path\n");
     }
 
+    // The framebuffer is the first (primary) output.
+    CompositorRegisterOutputs();
     // Set mouse cursor bounds to match screen resolution.
-    MouseSetBounds(w, h);
+    CompositorSyncPointerOutputs();
 
     SerialPrintf("COMPOSITOR: initialised, %ux%u stride=%u\n",
                  g_physFbWidth, g_physFbHeight, g_physFbStride);
@@ -2584,7 +2591,7 @@ static void CompositorLoopWM(bool& clientFrame)
     {
         // In headless boots the mouse bounds may be unset (no pointer device),
         // which would clamp the warp to (-1,-1); set them to the display size.
-        MouseSetBounds(g_physFbWidth, g_physFbHeight);
+        CompositorSyncPointerOutputs();
         MouseSetPosition(g_gpuMouseDemoX, g_gpuMouseDemoY);
         g_gpuMouseDemo = false;
     }
@@ -4332,6 +4339,137 @@ static bool GopShadowEnsure()
     g_gopShadowWidth=g_physFbWidth;g_gopShadowHeight=g_physFbHeight;
     return true;
 }
+// ---------------------------------------------------------------------------
+// GOP / DisplayOps output adapter (display_output.h). The active DisplayOps
+// (GOP, bochs, vmware, virtio, or a managed linear driver) is one output at
+// the desktop origin with the compositor's framebuffer geometry. It has no
+// back buffers: AcquireBack hands out the live framebuffer and Present is
+// the front-buffer row copy the software flip always did.
+// ---------------------------------------------------------------------------
+// Set by CompositorFlipSoftware before Present: whether the row shadow is
+// allocated (GopShadowEnsure) for this frame.
+static bool g_gopPresentShadow=false;
+static uint32_t GopOutputCount() { return g_physFbWidth && g_physFbHeight ? 1u : 0u; }
+static void CopyOutputName(char (&dst)[16], const char* src)
+{
+    uint32_t i=0;
+    for(;src && src[i] && i+1<sizeof(dst);++i)dst[i]=src[i];
+    for(;i<sizeof(dst);++i)dst[i]=0;
+}
+static bool GopOutputInfo(uint32_t id, OutputInfo* out)
+{
+    const uint64_t packed=__atomic_load_n(&g_publishedPhysDims,__ATOMIC_ACQUIRE);
+    const uint32_t w=static_cast<uint32_t>(packed),h=static_cast<uint32_t>(packed>>32);
+    if(id || !out || !w || !h)return false;
+    *out=OutputInfo{};
+    out->id=0;out->connected=true;out->enabled=true;
+    out->x=0;out->y=0;out->w=w;out->h=h;
+    out->stride=g_physFbStride*4;out->format=OutputFormatXrgb8888;
+    out->refreshMhz=OutputNominalRefreshMhz;
+    out->scalePercent=WmGetAppliedScale();
+    CopyOutputName(out->name,"BROOK-1");
+    const DisplayOps* display=DisplayGetActive();
+    CopyOutputName(out->make,display && display->name ? display->name : "display");
+    return true;
+}
+static int GopOutputEnable(uint32_t id) { return id ? -1 : 0; }
+static int GopOutputDisable(uint32_t) { return -1; }
+static bool GopOutputAcquire(uint32_t id, OutputBuffer* out)
+{
+    if(id || !out || !g_physFb)return false;
+    *out={reinterpret_cast<uint8_t*>(const_cast<uint32_t*>(g_physFb)),0,g_physFbStride*4,0};
+    return true;
+}
+// Called with g_scanoutMappingLock held, from CompositorFlipSoftware. The
+// output is at 0,0, so its local damage rows are back-buffer rows.
+static int GopOutputPresent(uint32_t id, const OutputBuffer& buffer, const DamageRects& damage)
+{
+    DamageRect bounds{};
+    if(id || !buffer.cpu || !g_backBuffer)return -1;
+    if(!damage.Bounds(&bounds))return 0;
+    const bool full=damage.full,shadow=g_gopPresentShadow;
+    const uint32_t minY=static_cast<uint32_t>(bounds.y0),maxY=static_cast<uint32_t>(bounds.y1);
+    auto* framebuffer=reinterpret_cast<uint32_t*>(buffer.cpu);
+    const uint32_t framebufferStride=buffer.stride/4;
+    const uint64_t rowBytes=uint64_t(g_physFbWidth)*4;
+    auto copyRow=[&](uint32_t y){
+        __builtin_memcpy(framebuffer+y*framebufferStride,g_backBuffer+y*g_backBufStride,rowBytes);
+    };
+    uint32_t flushMin=minY,flushMax=maxY;
+    if(shadow){
+        const auto r=GopRowFilterCopy(g_backBuffer,g_backBufStride,g_gopShadow,g_physFbWidth,g_physFbWidth,
+                                      minY,maxY,!full,copyRow);
+        g_idleStats.rowsCopied+=r.copied;g_idleStats.rowsSkipped+=r.skipped;g_idleStats.bytesCopied+=r.copied*rowBytes;
+        flushMin=r.minY;flushMax=r.maxY;
+        if(full && minY==0 && maxY==g_physFbHeight)g_gopShadowValid=true;
+    }else{
+        for(uint32_t y=minY;y<maxY;++y)copyRow(y);
+        g_idleStats.rowsCopied+=maxY-minY;g_idleStats.bytesCopied+=(maxY-minY)*rowBytes;
+    }
+#if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
+    // The GOP now holds the complete software frame; arm it (latched at vblank).
+    if(full && minY==0 && maxY==g_physFbHeight)brook::BdwScanoutFlipReturnToGop();
+#endif
+    if(flushMin>=flushMax)return 0;
+    brook::DisplayFlush(flushMin,flushMax);
+    return 1;
+}
+static uint32_t GopOutputPoll(uint32_t) { return uint32_t(OutputFlipState::Idle); }
+static void GopOutputPanicPresent(uint32_t id, const uint8_t*, uint32_t) { if(!id)DisplayPanicPresent(); }
+static const OutputBackendOps g_gopOutputOps={
+    "display",GopOutputCount,GopOutputInfo,GopOutputEnable,GopOutputDisable,GopOutputAcquire,
+    GopOutputPresent,GopOutputPoll,nullptr,nullptr,nullptr,GopOutputPanicPresent,
+};
+
+void CompositorGetOutputs(OutputLayout& out)
+{
+    OutputEnumerate(out);
+    bool any=false;
+    for(uint32_t i=0;i<out.count;++i)any|=out.enabled(i);
+    if(any)return;
+    // Before the adapter is registered: the framebuffer is the one output.
+    uint32_t w=0,h=0;
+    CompositorSnapshotPhysDims(&w,&h);
+    const uint64_t generation=out.generation;
+    out=OutputLayout{};
+    out.generation=generation;
+    if(!w || !h)return;
+    out.count=1;
+    out.outputs[0].connected=out.outputs[0].enabled=true;
+    out.outputs[0].w=w;out.outputs[0].h=h;
+    out.outputs[0].refreshMhz=OutputNominalRefreshMhz;out.outputs[0].scalePercent=100;
+    CopyOutputName(out.outputs[0].name,"BROOK-1");
+}
+
+static void CompositorRegisterOutputs() { (void)OutputRegisterBackend(&g_gopOutputOps); }
+
+// The pointer moves over the union of the enabled outputs.
+static void CompositorSyncPointerOutputs()
+{
+    OutputLayout layout;
+    CompositorGetOutputs(layout);
+    OutputRect rects[OutputMax];
+    uint32_t n=0;
+    for(uint32_t i=0;i<layout.count;++i)if(layout.enabled(i))rects[n++]=layout.rect(i);
+    MouseSetOutputBounds(rects,n);
+}
+
+bool CompositorGetOutputRect(uint32_t index, OutputRect* rect)
+{
+    OutputLayout layout;
+    CompositorGetOutputs(layout);
+    if(!layout.enabled(index))return false;
+    if(rect)*rect=layout.rect(index);
+    return true;
+}
+
+OutputRect CompositorPrimaryOutputRect()
+{
+    OutputLayout layout;
+    CompositorGetOutputs(layout);
+    return layout.rect(0);
+}
+
 static bool CompositorFlipSoftware(bool clientFrame = false, bool hardwareCursor = false)
 {
     CompositorMutexGuard geometry(&g_scanoutMappingLock);
@@ -4372,31 +4510,34 @@ static bool CompositorFlipSoftware(bool clientFrame = false, bool hardwareCursor
     if(minY>=maxY)return false;
     ++g_idleStats.softwareFlips;g_idleStats.rowsDirty+=maxY-minY;
     if(g_rendererCapsOwner)++g_cpuFramesOverRenderer; // a CPU frame while a renderer is registered
-    const uint64_t rowBytes=uint64_t(g_physFbWidth)*4;
-    auto copyRow=[&](uint32_t y){
-        __builtin_memcpy(const_cast<uint32_t*>(g_physFb+y*g_physFbStride),g_backBuffer+y*g_backBufStride,rowBytes);
-    };
-    uint32_t flushMin=minY,flushMax=maxY;
-    if(shadow){
-        const auto r=GopRowFilterCopy(g_backBuffer,g_backBufStride,g_gopShadow,g_physFbWidth,g_physFbWidth,
-                                      minY,maxY,!full,copyRow);
-        g_idleStats.rowsCopied+=r.copied;g_idleStats.rowsSkipped+=r.skipped;g_idleStats.bytesCopied+=r.copied*rowBytes;
-        flushMin=r.minY;flushMax=r.maxY;
-        if(full && minY==0 && maxY==g_physFbHeight)g_gopShadowValid=true;
-    }else{
-        for(uint32_t y=minY;y<maxY;++y)copyRow(y);
-        g_idleStats.rowsCopied+=maxY-minY;g_idleStats.bytesCopied+=(maxY-minY)*rowBytes;
-    }
     if(full)++g_idleStats.fullFlips;
-#if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
-    // The GOP now holds the complete software frame; arm it (latched at vblank).
-    if(full && minY==0 && maxY==g_physFbHeight)brook::BdwScanoutFlipReturnToGop();
-#endif
-    if (flushMin < flushMax) {
-        brook::DisplayFlush(flushMin, flushMax);
-        // Cursor, chrome and kernel-console redraws cannot establish app health.
-        if (clientFrame) CompositorRecordDesktopPresent();
+    // Present the damage to every output, clipped to its rectangle. The row
+    // span is the damage: full-width rows of the desktop.
+    g_gopPresentShadow=shadow;
+    const DamageRects damage=full ? DamageRects::Full(g_physFbWidth,g_physFbHeight) : DamageRects::Rows(minY,maxY,g_physFbWidth);
+    bool flushed=false;
+    OutputLayout outputs;
+    CompositorGetOutputs(outputs);
+    bool presentedAny=false;
+    for(uint32_t i=0;i<outputs.count;++i){
+        const auto* backend=outputs.backends[i];
+        if(!outputs.enabled(i) || !backend || !backend->Present)continue;
+        const DamageRects local=DamageClipToOutput(damage,outputs.rect(i));
+        if(local.empty())continue;
+        OutputBuffer buffer{};
+        const uint32_t id=outputs.backendIds[i];
+        if(backend->AcquireBack && !backend->AcquireBack(id,&buffer))continue;
+        presentedAny=true;
+        flushed|=backend->Present(id,buffer,local)>0;
     }
+    // No registered output (the layout fell back to the framebuffer size):
+    // the framebuffer itself is the one output.
+    if(!presentedAny && !outputs.backends[0]){
+        OutputBuffer buffer{};
+        if(GopOutputAcquire(0,&buffer))flushed=GopOutputPresent(0,buffer,damage)>0;
+    }
+    // Cursor, chrome and kernel-console redraws cannot establish app health.
+    if (flushed && clientFrame) CompositorRecordDesktopPresent();
     if(g_scanoutContainsLeasedFrame){
         ++g_softwareTakeover.count;
         g_softwareTakeover.lastAgeMs=tick-g_leasedFrameTick;
@@ -5227,9 +5368,10 @@ static bool ReplaceCompositorFramebuffer(uint64_t fbPhys, uint32_t w, uint32_t h
     }
     if(g_displayGeneration)++g_displayGeneration;
     PublishPhysDims(w, h);
+    OutputNotifyChanged();
     CompositorUnlockScanoutForDisplayChange();
     if (retiredPages) VmmFreePages(retired, retiredPages);
-    MouseSetBounds(w,h);MarkAllDirty();
+    CompositorSyncPointerOutputs();MarkAllDirty();
     if (replaceTty && WmIsActive()) WmApplyDisplaySize(w,h);
     if (replaceTty || cancelled) { CompositorMarkDirty(); CompositorWake(); }
     SerialPrintf("COMPOSITOR: remapped to %ux%u stride=%u\n",w,h,stridePixels);
