@@ -18,6 +18,7 @@ inline void* operator new(__SIZE_TYPE__,void* pointer) noexcept { return pointer
 #include "procfs.h"
 #include "memory/heap.h"
 #include "serial.h"
+#include "kprintf.h"
 #include "memory/virtual_memory.h"
 #include "sync/krwlock.h"
 #include "path_walk.h"
@@ -1376,16 +1377,22 @@ int VfsSync(Vnode* vn)
     // Try every mount even after a failure, but never acknowledge a failed
     // filesystem/device flush as successful to sync(2) or the VM bridge.
     int result = FileObjectWritebackAll();
+    // Failures go to the kernel log ring too, so a failed shutdown sync is
+    // diagnosable over the bridge (the serial tail is not persisted then).
+    if (result) KPrintf("vfs: sync: file writeback failed (%d)\n", result);
     FileMutationGuard mutation;
     VfsCollectRetiredMountsLocked();
     for(auto* backing=g_backings;backing;) {
         auto* next=backing->next;
         if(backing->fsOps->sync) {
             int error=backing->fsOps->sync(backing->mountPriv);
+            if(error)KPrintf("vfs: sync: backing pdrv=%u sync=%p failed (%d)\n",unsigned(backing->pdrv),
+                             reinterpret_cast<void*>(backing->fsOps->sync),error);
             if(!result && error)result=error<0?error:-5;
         }
         if(!backing->references) {
             int error=VfsBackingUnmountLocked(backing);
+            if(error)KPrintf("vfs: sync: unmount of retired backing pdrv=%u failed (%d)\n",unsigned(backing->pdrv),error);
             if(!error)VfsBackingFreeLocked(backing);
             else if(!result)result=error;
         }

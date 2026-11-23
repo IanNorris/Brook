@@ -293,8 +293,9 @@ class Hardware:
 
     def power(self,session,request_id,operation,**_):
         validate_id(request_id)
-        verbs={'shutdown':'shutdown','restart':'restart','status':'power_status','cancel':'cancel','commit':'commit','force_apps':'force_apps'}
-        if not isinstance(operation,str) or operation not in verbs:raise ValueError('Expected shutdown, restart, status, cancel, commit or force_apps')
+        verbs={'shutdown':'shutdown','restart':'restart','status':'power_status','cancel':'cancel','commit':'commit','force_apps':'force_apps',
+               'retry':'retry','force_power_off':'force_power_off'}
+        if not isinstance(operation,str) or operation not in verbs:raise ValueError('Expected shutdown, restart, status, cancel, commit, force_apps, retry or force_power_off')
         with self.session_lock(session) as data:
             result=self.guest(data,f"bridge hardware power {request_id} {verbs[operation]} {data['guest_boot_id']}")
         if 'power_error' in result:raise GuestJobError(result['power_error'])

@@ -18,6 +18,7 @@
 #include "apic.h"
 #include "compositor.h"
 #include "klog.h"
+#include "kprintf.h"
 #include "serial.h"
 #include "string.h"
 #include "shutdown_service_escalation.h"
@@ -115,16 +116,19 @@ void SetPhase(int index,Phase phase,int error=0) {
 }
 // Every fallible final write. Writeback is stopped and device writes are
 // closed first; an explicit retry after failure repeats only this step.
+// Each step's result goes to the kernel log ring (bridge-visible), so a
+// failed checked shutdown names the step that failed.
 int FinalSync() {
     int error=VfsSync(nullptr);
+    KPrintf("shutdown: final sync vfs=%d\n",error);
 #if defined(BROOK_SSD_INSTALLER)
-    if(!error)error=AhciPhysicalBlockToolsFinalSync();
+    if(!error){error=AhciPhysicalBlockToolsFinalSync();KPrintf("shutdown: final sync block-tools=%d\n",error);}
 #endif
-    if(!error)error=AhciSystemDirectFinalSync();
+    if(!error){error=AhciSystemDirectFinalSync();KPrintf("shutdown: final sync ahci-direct=%d\n",error);}
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
-    if(!error)error=AhciSystemQemuLargeDataFinalSync();
+    if(!error){error=AhciSystemQemuLargeDataFinalSync();KPrintf("shutdown: final sync qemu-large=%d\n",error);}
 #endif
-    if(!error)error=WritableDesktopFinalSync();
+    if(!error){error=WritableDesktopFinalSync();KPrintf("shutdown: final sync writable-desktop=%d\n",error);}
     return error;
 }
 void FinishSync(int index,int error) {

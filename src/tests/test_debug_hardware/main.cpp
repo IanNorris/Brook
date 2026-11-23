@@ -414,6 +414,9 @@ int main(){
     assert(handle("bridge hardware power "+request+" force_apps "+boot) && powerCalls==2 && powerVerb=="force_apps");
     assert(reply.find("\"force_apps_available\":false")!=std::string::npos);
     assert(handle("bridge hardware power "+request+" commit "+boot) && powerCalls==3 && reply.find("\"error\":-95")!=std::string::npos);
+    assert(handle("bridge hardware power "+request+" retry "+boot) && powerCalls==4 && powerVerb=="retry");
+    assert(handle("bridge hardware power "+request+" force_power_off "+boot) && powerCalls==5 && powerVerb=="force_power_off");
+    powerCalls=3;
     for(const auto& bad : {"bridge hardware power short shutdown "+boot,"bridge hardware power "+request+" exec "+boot,"bridge hardware power "+request+" restart "+std::string(32,'b'),"bridge hardware power "+request+" restart "+boot+" more"}){
         assert(handle(bad) && powerCalls==3);
     }
