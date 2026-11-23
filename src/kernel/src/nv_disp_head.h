@@ -396,8 +396,8 @@ constexpr uint32_t kCoreHeadCount=sizeof(kCoreHeadMthds)/sizeof(kCoreHeadMthds[0
 // Globals: interlock flags. Not SET_GET_BLANKING_CTRL(0..3) (0x240-0x24c): live bc9cbf9e,
 // replaying ARM's 0 left ASSY at 2/1/1/1, i.e. ASSY reads back the current blanking
 // state (head 0 unblanked, heads 1-3 blanked), not a pending request. They are skipped
-// by the diffs like GET_RG_SCAN_LINE and only logged; `unblank` pushes UNBLANK for the
-// new head in the enable UPDATE (opt-in: neither nouveau nor nvkms use the method).
+// by the diffs like GET_RG_SCAN_LINE and only logged. `head1 unblank` pushes UNBLANK for
+// head 1 in its own UPDATE while head 1 runs (neither nouveau nor nvkms use the method).
 constexpr uint32_t kCoreGlobCount=3;
 constexpr uint32_t kCoreReplayCount=kCoreGlobCount+4*4+8*5+4*kCoreHeadCount;
 inline uint32_t CoreReplayMthd(uint32_t i){
@@ -423,14 +423,14 @@ struct HeadConfig{
     int32_t watermarkOverride=0x15;// GOP's head-0 DP watermark for the identical mode/link (0x616550 = 0x08000015);
                                    // nouveau's formula gives 18 ("close to vbios numbers, but not right", nv50.c 1252). -1 = formula
     bool pauseAfterModeset=true;
-    bool unblank=false;            // enable UPDATE also pushes SET_GET_BLANKING_CTRL(head) = UNBLANK (opt-in)
     uint32_t coreReplayVal[kCoreReplayCount]{}; // ARM values of CoreReplayMthd(i), read when the plan is built
 };
 template<typename Rd> inline void ReadCoreReplay(HeadConfig& c,Rd rd){
     for(uint32_t i=0;i<kCoreReplayCount;++i){const uint32_t m=CoreReplayMthd(i);c.coreReplayVal[i]=rd(RegArm(kChidCore,m));}
 }
 // Core ring segments: [replay] [rung: notifier-only UPDATE] [enable] [disable].
-struct HeadPushes{Push core;uint32_t replayEnd=0,rungEnd=0,enableEnd=0,disableEnd=0;};
+constexpr uint32_t kReplaySkipWord=2; // core ring: [0,1] SET_CONTEXT_DMA_NOTIFIER, [2] first replay header
+struct HeadPushes{Push core;uint32_t replayEnd=0,rungEnd=0,enableEnd=0,unblankEnd=0,disableEnd=0;};
 inline uint32_t SorCtl(const HeadConfig& c){
     return (1u<<c.head)|((c.dp.link==2?c57d::SOR_PROTOCOL_DP_B:c57d::SOR_PROTOCOL_DP_A)<<8);}
 inline void BuildHeadPushes(const HeadConfig& c,HeadPushes& out){
@@ -450,9 +450,13 @@ inline void BuildHeadPushes(const HeadConfig& c,HeadPushes& out){
     p.Mthd(c57d::WindowSetControl(c.window),c.head);                 // window -> head
     p.Mthd(c57d::WindowFormatUsage(c.window),c.windowFmtUsage,0u);
     p.Mthd(c57d::WindowUsage(c.window),c.windowUsage);
-    if(c.unblank)p.Mthd(0x240+c.head*4,0x2u);                         // SET_GET_BLANKING_CTRL(head) UNBLANK
     PushCoreUpdate(p,0,0,true);                                       // corec37d_update, notifier at 0
     out.enableEnd=p.count*4;
+    // `head1 unblank` segment: SET_GET_BLANKING_CTRL(head) = UNBLANK in its own UPDATE, while
+    // head 1 runs. The disable kick writes a JUMP over it first (harmless if it already ran).
+    p.Mthd(0x240+c.head*4,0x2u);
+    PushCoreUpdate(p,0,0,true);
+    out.unblankEnd=p.count*4;
     p.Mthd(c57d::SorSetControl(c.sor),0u);                           // detach OR
     p.Mthd(c57d::WindowSetControl(c.window),c57d::OWNER_NONE);
     PushCoreUpdate(p,0,0,true);
@@ -556,6 +560,8 @@ inline void AddCoreDiff(Plan& p,const char* when,uint32_t strict=0){
 }
 inline void AddCoreKick(Plan& p,const HeadConfig& c,uint32_t put,const char* what){
     p.Add(Op::VramWrite,0,~0u,kNtfyNotBegun,0,"core notifier NOT_BEGUN",c.base.syncVram+0);
+    p.Add(Op::Write,kRegBar1Flush,~0u,1,0,"BAR1 write flush (core pushbuffer)");
+    p.Add(Op::Poll,kRegBar1Flush,0x2,0,kTimeoutMs,"flush done");
     p.Add(Op::Kick,RegPut(kChidCore),~0u,put,0,what);
 }
 // Allow-list of MMIO the head plan may write (review 23 Nov issue 11).
@@ -580,6 +586,7 @@ inline Err BuildHeadPlan(HeadConfig c,InstImage& img,HeadPushes& pushes,Plan& p)
     p.MarkRewritten(pushes.core.words,pushes.enableEnd/4);
     for(uint32_t i=0;i<kCoreReplayCount;++i)Plan::Set(p.known,CoreReplayMthd(i));
     Plan::Set(p.known,0x208);Plan::Set(p.ours,0x208);Plan::Set(p.known,0x20c);Plan::Set(p.ours,0x20c);
+    Plan::Set(p.ours,0x218);Plan::Set(p.ours,0x21c); // interlock flags: the rung UPDATE sets them (third review)
     const auto& g=c.base.gop;const uint32_t h=c.head;
     auto B=[&](HPhase x){p.BeginN(uint32_t(x));};
     B(HPhase::Preflight);
@@ -632,14 +639,20 @@ inline Err BuildHeadPlan(HeadConfig c,InstImage& img,HeadPushes& pushes,Plan& p)
     B(HPhase::CoreCheck);
     p.Add(Op::Expect,RegArm(kChidCore,c57d::HeadRasterSize(0)),~0u,g.headRaster,0,"head 0 ARM survived connect");
     AddCoreDiff(p,"after core connect (log only; reset methods are replayed next)",2);
-    p.Add(Op::Kick,RegPut(kChidCore),~0u,pushes.replayEnd,0,"core PUT: replay ARM state (methods only, no UPDATE)");
+    // Third review: when the connect reset nothing (live bc9cbf9e), JUMP over the replay so
+    // no head-0 method is re-pushed at all; otherwise the replay runs as before.
+    p.Add(Op::ReplaySkip,kChidCore,0,PushJump(pushes.replayEnd),0,"post-connect diff clean: JUMP over the replay (got 0 = skipped, else first diff)",
+          c.base.corePushVram+kReplaySkipWord*4);
+    p.Add(Op::Write,kRegBar1Flush,~0u,1,0,"BAR1 write flush (core pushbuffer)");
+    p.Add(Op::Poll,kRegBar1Flush,0x2,0,kTimeoutMs,"flush done");
+    p.Add(Op::Kick,RegPut(kChidCore),~0u,pushes.replayEnd,0,"core PUT: replay ARM state (methods only, no UPDATE), or the JUMP over it");
     p.Add(Op::PollOr,RegGet(kChidCore),0xffc,pushes.replayEnd,kTimeoutMs,"core GET == PUT (replay fetched)",0,RegGet(kChidCore),kRegExcOther,1);
     p.Add(Op::Poll,RegChnStatus(kChidCore),kCoreStateMask,kCoreIdle,kTimeoutMs,"core STATE == IDLE (replay executed)");
     AddCoreDiff(p,"after replay: ASSY == ARM, any difference not ours fails (strict)",1);
     AddCoreKick(p,c,pushes.rungEnd,"core PUT: rung, notifier-only UPDATE");
     // A supervisor during the rung fails the wait at once (event status 0x611860), as does a core exception.
     p.Add(Op::PollOr,RegGet(kChidCore),~0u,pushes.rungEnd,kTimeoutMs,"core GET == PUT (rung; fails at once on a supervisor)",
-          (uint64_t(7)<<32)|kRegSuperAck,RegGet(kChidCore),kRegExcOther,1);
+          (uint64_t(7)<<48)|(uint64_t(kRegCtrlDisp)<<24)|kRegSuperAck,RegGet(kChidCore),kRegExcOther,1);
     p.Add(Op::Poll,RegChnStatus(kChidCore),kCoreStateMask,kCoreIdle,kTimeoutMs,"core STATE == IDLE (rung)");
     p.Add(Op::VramPoll,0,3u<<kNtfyStatusShift,kNtfyFinished<<kNtfyStatusShift,kTimeoutMs,"rung notifier FINISHED",c.base.syncVram+0);
     p.Add(Op::Expect,kRegCtrlDisp,0x7,0,0,"rung raised no supervisor");
@@ -668,7 +681,8 @@ inline Err BuildHeadPlan(HeadConfig c,InstImage& img,HeadPushes& pushes,Plan& p)
     p.Add(Op::Expect,kRegExcOther,1,0,0,"no core exception");
     {const uint32_t regs[]={0x612a00u,0x613300u,0x612200u,0x612b00u};
      for(uint32_t r:regs)p.Add(Op::Log,r,0,0,0,"after modeset (head-0 0x612200 / 0x612b00 must equal baseline)");}
-    for(uint32_t hh=0;hh<4;++hh)p.Add(Op::Log,RegAssy(kChidCore,0x240+hh*4),0,0,0,"after modeset: SET_GET_BLANKING_CTRL(head) read-back (2 unblanked, 1 blanked)");
+    for(uint32_t hh=0;hh<4;++hh)if(hh!=h)p.Add(Op::Log,RegAssy(kChidCore,0x240+hh*4),0,0,0,"after modeset: SET_GET_BLANKING_CTRL(head) read-back (2 unblanked, 1 blanked)");
+    p.Add(Op::Log,RegAssy(kChidCore,0x240+h*4),0,0,0,"HEAD 1 BLANKING (0x680244): 2 = unblanked, 1 = blanked -> if 1, run `head1 unblank`");
     B(HPhase::Verify);
     p.Add(Op::Expect,RegArm(kChidCore,c57d::HeadRasterSize(0)),~0u,g.headRaster,0,"head 0 raster unchanged");
     p.Add(Op::Expect,RegArm(kChidCore,c57d::HeadPixelClock(0)),~0u,g.headPclk,0,"head 0 pclk unchanged");
@@ -679,6 +693,7 @@ inline Err BuildHeadPlan(HeadConfig c,InstImage& img,HeadPushes& pushes,Plan& p)
     p.Add(Op::Log,0x616330+h*0x800,0,0,0,"head 1 RG position (moving = scanning)");
     if(c.pauseAfterModeset)p.Add(Op::Pause,0,0,0,0,"observer: monitor on conn2 shows a (black) 4K60 signal, conn0 unchanged?");
     B(HPhase::Disable);
+    p.Add(Op::VramWrite,0,~0u,PushJump(pushes.unblankEnd),0,"JUMP over the unblank segment (no-op if it already ran)",c.base.corePushVram+pushes.enableEnd);
     AddCoreKick(p,c,pushes.disableEnd,"core PUT: detach SOR2, window owner none, UPDATE");
     AddSupervisorsDisable(p,c);
     p.Add(Op::PollOr,RegGet(kChidCore),~0u,pushes.disableEnd,kTimeoutMs,"core GET == PUT",0,RegGet(kChidCore),kRegExcOther,1);
@@ -707,6 +722,9 @@ inline void BuildHeadAbort(const HeadConfig& c,HPhase reached,const HeadPushes& 
     const bool update=kicked==Kicked::Rung||kicked==Kicked::Enable||kicked==Kicked::Disable;
     if(update)p.Add(Op::Call,kicked==Kicked::Enable?kCallSuperFlushVpll:kCallSuperFlush,0,0,ms,"supervisor flush (stages seen only)");
     if(kicked==Kicked::Enable){
+        p.Add(Op::VramWrite,0,~0u,PushJump(pushes.unblankEnd),0,"JUMP over the unblank segment (no-op if it already ran)",c.base.corePushVram+pushes.enableEnd);
+        p.Add(Op::Write,kRegBar1Flush,~0u,1,0,"BAR1 write flush (core pushbuffer)");
+        p.Add(Op::PollSoft,kRegBar1Flush,0x2,0,ms,"flush done");
         p.Add(Op::Kick,RegPut(kChidCore),~0u,pushes.disableEnd,0,"core PUT: disable push");
         p.Add(Op::Call,kCallSuperFlush,0,0,ms,"supervisor flush after detach");}
     if(reached>=HPhase::DpPre){AddDisableLt(p,c.dp);}

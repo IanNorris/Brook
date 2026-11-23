@@ -21,7 +21,7 @@
 namespace brook::nvdisp {
 
 struct HeadState{
-    bool preflightOk=false,live=false,enabled=false,paused=false,hooked=false,head0Flagged=false,fe=false,unblank=false,dpIdleHeld=false;
+    bool preflightOk=false,live=false,enabled=false,paused=false,hooked=false,head0Flagged=false,fe=false,dpIdleHeld=false;uint32_t softWarnings=0;
     Kicked kicked=Kicked::None;uint32_t openStage=0; // a supervisor stage acked by the plan and not yet released
     uint32_t cursor=0,stopAt=~0u,failAt=~0u,runs=0,aborts=0,guardHits=0;
 };
@@ -80,7 +80,10 @@ template<typename B> struct HeadRunner{
             for(uint32_t i=0;i<n;++i){if(i)l.raw(",");l.raw("\"");l.hex(w[i]);l.raw("\"");}
             l.raw("]}\n");r.b->emit(l.t);}
         void flag(uint32_t i,const Step& s,uint32_t got){
-            r.st.head0Flagged=true;Line l;l.raw("{\"nv_head1\":\"WARNING\",\"step\":");l.dec(i);l.raw(",\"what\":\"");l.s(s.what);
+            // Only the supervisor head-0 check means "head 0 flagged"; other soft checks
+            // (pclk / VPLL read-backs, guarded writes) are plain warnings (third review).
+            if(s.op==Op::ExpectSoft&&s.reg==RegSuperHead(0))r.st.head0Flagged=true;else ++r.st.softWarnings;
+            Line l;l.raw("{\"nv_head1\":\"WARNING\",\"step\":");l.dec(i);l.raw(",\"what\":\"");l.s(s.what);
             l.raw("\",\"got\":\"");l.hex(got);l.raw("\"}\n");r.b->emit(l.t);}
         void note(const char* what,uint32_t v){Line l;l.raw("{\"nv_head1_note\":\"");l.s(what);l.raw("\",\"v\":\"");l.hex(v);l.raw("\"}\n");r.b->emit(l.t);}
         bool call(uint32_t id,uint32_t ms){
@@ -122,7 +125,7 @@ template<typename B> struct HeadRunner{
     bool Build(){
         if(!resolved){Msg("error","VBIOS tables/scripts/hash not matched (DCB[4], DP table, PLL, script pointers)");return false;}
         cfg.pauseAfterModeset=false; // "enabled" is the observer point
-        cfg.base.feEnable=st.fe;cfg.unblank=st.unblank;
+        cfg.base.feEnable=st.fe;
         if(b)ReadCoreReplay(cfg,[&](uint32_t a){return b->rd(a);}); // replay = ARM values now
         img=InstImage{};pushes=HeadPushes{};plan=Plan{};
         const Err e=BuildHeadPlan(cfg,img,pushes,plan);
@@ -137,7 +140,7 @@ template<typename B> struct HeadRunner{
     static bool ReadOnly(Op o){return o==Op::Expect||o==Op::ExpectNot||o==Op::Log||o==Op::AssyArmDiff||o==Op::ExpectVpll||o==Op::ExpectSoft;}
     void Status(){
         Line l;l.raw("{\"nv_head1_status\":1,\"preflight_ok\":");l.dec(st.preflightOk);l.raw(",\"live\":");l.dec(st.live);
-        l.raw(",\"enabled\":");l.dec(st.enabled);l.raw(",\"paused\":");l.dec(st.paused);l.raw(",\"cursor\":");l.dec(st.cursor);
+        l.raw(",\"enabled\":");l.dec(st.enabled);l.raw(",\"soft_warnings\":");l.dec(st.softWarnings);l.raw(",\"paused\":");l.dec(st.paused);l.raw(",\"cursor\":");l.dec(st.cursor);
         l.raw(",\"runs\":");l.dec(st.runs);l.raw(",\"aborts\":");l.dec(st.aborts);l.raw(",\"guard_hits\":");l.dec(st.guardHits);
         l.raw(",\"vpll\":\"");l.hex((cfg.vpll.P<<16)|(cfg.vpll.N<<8)|cfg.vpll.M);l.raw("\",\"fN\":\"");l.hex(cfg.vpll.fN);
         l.raw("\",\"watermark\":");l.dec(cfg.sf.watermark);l.raw("}\n");b->emit(l.t);
@@ -204,6 +207,23 @@ template<typename B> struct HeadRunner{
         else{st.enabled=true;Msg("enabled","head 1 lit on conn2; head1 disable when done");}
         Status();
     }
+    // Separate UNBLANK of head 1 while it runs (only if the post-modeset read-back says 1).
+    void Unblank(){
+        if(!st.enabled||!st.live){Msg("refused","head 1 is not enabled");return;}
+        abort=Plan{};
+        AddCoreKick(abort,cfg,pushes.unblankEnd,"core PUT: SET_GET_BLANKING_CTRL(1) = UNBLANK, UPDATE");
+        abort.Add(Op::PollOr,RegGet(kChidCore),~0u,pushes.unblankEnd,kTimeoutMs,"core GET == PUT (fails at once on a supervisor)",
+                  (uint64_t(7)<<48)|(uint64_t(kRegCtrlDisp)<<24)|kRegSuperAck,RegGet(kChidCore),kRegExcOther,1);
+        abort.Add(Op::VramPoll,0,3u<<kNtfyStatusShift,kNtfyFinished<<kNtfyStatusShift,kTimeoutMs,"core notifier FINISHED",cfg.base.syncVram+0);
+        abort.Add(Op::Expect,kRegExcOther,1,0,0,"no core exception");
+        abort.Add(Op::Expect,RegArm(kChidCore,c57d::HeadRasterSize(0)),~0u,cfg.base.gop.headRaster,0,"head 0 raster unchanged");
+        abort.Add(Op::Log,RegAssy(kChidCore,0x240+cfg.head*4),0,0,0,"HEAD 1 BLANKING (0x680244) after unblank: 2 = unblanked");
+        abort.End();
+        st.kicked=Kicked::Enable;
+        Io io{*this,"unblank"};const bool ok=Run(abort,0,abort.count,io)==abort.count&&!io.reg.violation;
+        if(!ok){Msg("failed","unblank: auto-abort");RunAbort(HPhase::Disable,2000);return;}
+        Msg("unblanked","head 1 UNBLANK pushed; head1 disable when done");Status();
+    }
     void RunAbort(HPhase reached,uint32_t ms){
         abort=Plan{};BuildHeadAbort(cfg,reached,pushes,abort,ms,st.kicked);
         Io io{*this,"abort"};(void)Run(abort,0,abort.count,io,true);
@@ -233,19 +253,19 @@ template<typename B> struct HeadRunner{
         if(Word(p,"plan")){PrintPlan();return;}
         if(Word(p,"preflight")){Preflight();return;}
         if(Word(p,"disable")){Disable();return;}
+        if(Word(p,"unblank")){Unblank();return;}
         if(Word(p,"continue")){Continue();return;}
         if(Word(p,"abort")){Abort(Word(p,"force"));return;}
         if(Word(p,"enable")){
-            bool skip=false,fe=false;uint32_t stop=~0u,named=0;st.unblank=false;
+            bool skip=false,fe=false;uint32_t stop=~0u,named=0;
             for(;;){while(*p==' ')++p;if(!*p)break;
                 if(Word(p,"skip-step3"))skip=true;
                 else if(Word(p,"fe"))fe=true;
-                else if(Word(p,"unblank"))st.unblank=true;
                 else if(Word(p,"stop")){if(Word(p,"rung"))named=1;else if(Word(p,"kick"))named=2;
                     else if(!Num(p,stop)){Msg("usage","stop <step>|rung|kick");return;}}
                 else{Msg("usage","unknown argument");return;}}
             Enable(skip,stop,fe,named);return;}
-        Msg("usage","nv-disp head1 plan|preflight|enable [skip-step3] [fe] [unblank] [stop N|rung|kick]|disable|continue|abort [force]|status");
+        Msg("usage","nv-disp head1 plan|preflight|enable [skip-step3] [fe] [stop N|rung|kick]|unblank|disable|continue|abort [force]|status");
     }
 };
 } // namespace brook::nvdisp

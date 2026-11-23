@@ -57,7 +57,7 @@ template<typename B> struct Runner{
     };
     static const char* OpName(Op o){
         static const char* n[]={"WR","MASK","EXPECT","POLL","POLLSOFT","ACK","VCOPY","VWR","VEXPECT","VPOLL","VPOLLANY","ACKEXC",
-            "PRAMIN","FENCE","KICK","EXPNOT","LOG","COPY","ASSYARM","PAUSE","DELAY","ANDNIF","COPYMASK","CALL","FILL","PRAMINR","DUMP","POLLOR","EXPSOFT","EXPVPLL","WRITEIF","EXPOR"};
+            "PRAMIN","FENCE","KICK","EXPNOT","LOG","COPY","ASSYARM","PAUSE","DELAY","ANDNIF","COPYMASK","CALL","FILL","PRAMINR","DUMP","POLLOR","EXPSOFT","EXPVPLL","WRITEIF","EXPOR","REPLAYSKIP"};
         return uint32_t(o)<sizeof(n)/sizeof(n[0])?n[uint32_t(o)]:"?";
     }
     Phase PhaseOf(uint32_t i)const{Phase ph=Phase::Preflight;

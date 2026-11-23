@@ -116,12 +116,12 @@ static void TestPllAndSf(){
     assert(s.h==148&&s.v==2149&&s.watermark==18);                  // nouveau's formula
     assert(!DpSymbols(m,0x06,1,true,s));                            // 4K60 does not fit RBR x1
 }
-static void TestUnblankOptIn(){
-    HeadConfig c;c.unblank=true;HeadPushes hp;BuildHeadPushes(c,hp);bool seen=false;
-    for(uint32_t i=hp.rungEnd/4;i<hp.enableEnd/4;){const uint32_t w=hp.core.words[i],n=(w>>18)&0x3ff,m=w&0x3ffc;
-        if(m==0x240+c.head*4&&n==1){assert(hp.core.words[i+1]==2);seen=true;}
-        assert(!(m==0x240));i+=1+n;}                                    // never head 0's
-    assert(seen);
+static void TestUnblankSegment(){
+    HeadConfig c;HeadPushes hp;BuildHeadPushes(c,hp);
+    const uint32_t* w=hp.core.words+hp.enableEnd/4;
+    assert(w[0]==PushHeader(0x240+c.head*4,1)&&w[1]==2&&hp.unblankEnd>hp.enableEnd&&hp.disableEnd>hp.unblankEnd);
+    for(uint32_t i=0;i<hp.enableEnd/4;){const uint32_t x=hp.core.words[i],n=(x>>18)&0x3ff,m=x&0x3ffc;
+        assert(!(m<0x250&&m+n*4>0x240));i+=1+n;}                       // nothing before it touches blanking ctrl
 }
 static void TestCoreWords(){
     HeadConfig c;HeadPushes hp;BuildHeadPushes(c,hp);
@@ -537,6 +537,15 @@ static void TestHeadRunner(){
      assert(g.b.Count("VPLL1 left running")==1);
      assert((g.c.R(0x688340)&0xff)==0&&(g.c.R(RegChnCtl(0))&0x6013)==0x01&&g.c.R(kRegInstTarget)==1);
      g.r->Command("enable skip-step3");assert(g.b.Count("run head1 preflight first")==2);}
+    {HRig g;g.c.resetOnConnect=false;g.r->Command("preflight");g.r->Command("enable skip-step3");   // clean connect: replay skipped
+     assert(g.r->st.enabled&&g.c.vrd(g.r->cfg.base.corePushVram+kReplaySkipWord*4)==PushJump(g.r->pushes.replayEnd));
+     const uint32_t u0=g.c.updates;g.r->Command("unblank");
+     assert(g.b.Count("\"nv_head1\":\"unblanked\"")==1&&g.c.updates==u0+1&&g.c.R(0x680244)==2&&g.r->st.enabled);
+     g.r->Command("disable");assert(!g.r->st.live&&g.r->st.aborts==0&&g.r->st.softWarnings==0&&g.r->st.guardHits==0);}
+    {HRig g;g.r->Command("preflight");g.r->Command("enable skip-step3");assert(g.r->st.enabled);  // connect resets: replay runs
+     assert(g.c.vrd(g.r->cfg.base.corePushVram+kReplaySkipWord*4)!=PushJump(g.r->pushes.replayEnd));
+     g.r->Command("disable");assert(!g.r->st.live&&g.r->st.aborts==0);}
+    {HRig g;g.r->Command("unblank");assert(g.b.Count("head 1 is not enabled")==1&&g.c.written.empty());}
     {HRig g;g.r->Command("preflight");g.r->Command("enable skip-step3");assert(g.r->st.enabled);
      g.r->Quiesce();                                                                  // reset while lit
      assert(!g.r->st.live&&g.r->st.aborts==1&&(g.c.R(0x688340)&0xff)==0&&(g.c.R(kRegCtrlDisp)&7)==0);
@@ -585,7 +594,7 @@ static void Dump(){
     g_rom=MakeRom();Vbios v=g_rom.V();HeadConfig c;c.base=GopFlipConfig(3840,2160,16384,0xcf,256ull<<20);DpOut d{};
     assert(ResolveHeadConfig(v,4,c,d));c.pauseAfterModeset=false;assert(BuildHeadPlan(c,img,hp,p)==Err::Ok);
     static const char* op[]={"WR","MASK","EXPECT","POLL","POLLSOFT","ACK","VCOPY","VWR","VEXPECT","VPOLL","VPOLLANY","ACKEXC",
-        "PRAMIN","FENCE","KICK","EXPNOT","LOG","COPY","ASSYARM","PAUSE","DELAY","ANDNIF","COPYMASK","CALL","FILL","PRAMINR","DUMP","POLLOR","EXPSOFT","EXPVPLL","WRITEIF","EXPOR"};
+        "PRAMIN","FENCE","KICK","EXPNOT","LOG","COPY","ASSYARM","PAUSE","DELAY","ANDNIF","COPYMASK","CALL","FILL","PRAMINR","DUMP","POLLOR","EXPSOFT","EXPVPLL","WRITEIF","EXPOR","REPLAYSKIP"};
     auto line=[&](uint32_t i,const Step& s){
         if(s.op==Op::VramCopy||s.op==Op::VramWrite||s.op==Op::VramPoll)printf("%3u %-8s vram %08llx val %08x %s\n",i,op[uint32_t(s.op)],(unsigned long long)s.vram,s.value,s.what);
         else if(s.op==Op::AssyArmDiff)printf("%3u %-8s chid %u mthd %04x..%04x %s\n",i,op[uint32_t(s.op)],s.reg,s.mask,s.value-4,s.what);
@@ -606,7 +615,7 @@ int main(int argc,char** argv){
     if(argc>1&&!strcmp(argv[1],"--dump")){Dump();return 0;}
     TestAux();TestHeadRunner();
     TestVbios();TestRealVbios();TestPllAndSf();TestCoreWords();
-    TestUnblankOptIn();TestHeadPlan();TestRefusesWhenHead0Pending();TestUndocumentedResetLogged();TestRungSupervisorFailsFast();TestOpenStageReleased();TestHead0FlagFinishesStages();TestAbortUnkicked();
+    TestUnblankSegment();TestHeadPlan();TestRefusesWhenHead0Pending();TestUndocumentedResetLogged();TestRungSupervisorFailsFast();TestOpenStageReleased();TestHead0FlagFinishesStages();TestAbortUnkicked();
     TestStagesFromEventStatus();TestCoreExceptionAtModeset();TestVpll0Gate();TestTrainingFailure();
     puts("test_nv_disp_head: ok");return 0;
 }

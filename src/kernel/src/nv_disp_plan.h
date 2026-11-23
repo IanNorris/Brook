@@ -355,13 +355,23 @@ enum class Op:uint8_t{
     SurfFill,   // io.fill(vram, bytes=value, pitch=mask, colour x, marker colour y, marker lines z)
     PraminRange,// value words at BAR0 kPramin+reg == blob(mask) words from byte x; got = first bad index
     Dump,       // read value words from reg and hand them to io.dump (diagnostics; never fails)
-    PollOr,     // until ((reg | x) & mask) == value; fails at once if y && (y & z), or if vram != 0 and
-                // (rd(low32(vram)) & high32(vram)) (e.g. a supervisor during the rung), else on timeout
+    PollOr,     // until ((reg | x) & mask) == value; fails at once if y && (rd(y) & z), or if vram != 0 and
+                // rd(A) & M or rd(B) & M, vram = M<<48 | B<<24 | A (a supervisor during the rung), else on timeout
     ExpectSoft, // (reg & mask) == value, else io.flag(step, got): a sticky warning, never fails
     ExpectVpll, // VPLL at reg (+4 P|N|M, +0x10 fN<<16) runs at value kHz +- mask with refclk x kHz
     WriteIf,    // reg = value only if (rd(y) & z) == x; else skipped (got = rd(y), logged as not ok, never fails)
     ExpectOr,   // (reg & mask) == value or == x, else abort
+    ReplaySkip, // core chid `reg`: if no ASSY != ARM outside `ours` (diff skip rules) in 0x200-0x3fc,
+                // 0x1000-0x13fc, 0x2000-0x2ffc: vram32 = value (a JUMP over the replay); got = first diff or 0
 };
+// Methods the diffs never compare (UPDATE trigger, live status read-backs, SW methods).
+inline bool DiffSkipped(uint32_t chid,uint32_t m){
+    if(m==0x200)return true;                                      // UPDATE trigger
+    if(chid!=0&&m==0x208)return true;                             // window GET_LINE (live)
+    if(chid!=0&&m>=0x350&&m<0x370)return true;                    // window: not in clc57e.h (SW methods)
+    if(chid==0&&m>=0x220&&m<0x250)return true;                    // core GET_RG_SCAN_LINE, SET_GET_BLANKING_CTRL (live status)
+    return false;
+}
 enum class Blob:uint32_t{Inst,WndwPush,CorePush,SyncInit};
 struct Step{Op op;uint32_t reg,mask,value,timeoutMs;uint64_t vram;const char* what;uint32_t x,y,z;};
 enum class Phase:uint8_t{Preflight,Vram,Instmem,Core,Window,FirstFlip,Flip,Restore,Teardown,Quiesce,Count};
@@ -811,10 +821,17 @@ template<typename Io> uint32_t Run(const Plan& p,uint32_t begin,uint32_t end,Io&
         case Op::PollOr:{uint32_t t=0;
             for(;;){got=io.rd(s.reg)|io.rd(s.x);if((got&s.mask)==s.value)break;
                 if(s.y&&(io.rd(s.y)&s.z)){ok=false;got=0xe0000000u|io.rd(s.y);break;}
-                if(s.vram&&(io.rd(uint32_t(s.vram))&uint32_t(s.vram>>32))){ok=false;got=0xd0000000u|io.rd(uint32_t(s.vram));break;}
+                if(s.vram){const uint32_t m=uint32_t(s.vram>>48)&0xff,a=uint32_t(s.vram)&0xffffff,b2=uint32_t(s.vram>>24)&0xffffff;
+                    if(io.rd(a)&m){ok=false;got=0xd0000000u|io.rd(a);break;}
+                    if(b2&&(io.rd(b2)&m)){ok=false;got=0xc0000000u|io.rd(b2);break;}}
                 if(io.expired(s.timeoutMs,t)){ok=false;break;}}
             break;}
         case Op::ExpectSoft:got=io.rd(s.reg);if((got&s.mask)!=s.value)io.flag(i,s,got);break;
+        case Op::ReplaySkip:{const uint32_t r[3][2]={{0x200,0x400},{0x1000,0x1400},{0x2000,0x3000}};
+            for(const auto& q:r)for(uint32_t m=q[0];m<q[1]&&!got;m+=4)
+                if(!DiffSkipped(s.reg,m)&&!Plan::Has(p.ours,m)&&io.rd(RegAssy(s.reg,m))!=io.rd(RegArm(s.reg,m)))got=m;
+            if(!got)io.vwr(s.vram,s.value);
+            break;}
         case Op::ExpectOr:got=io.rd(s.reg);ok=(got&s.mask)==s.value||(got&s.mask)==s.x;break;
         case Op::WriteIf:got=io.rd(s.y);if((got&s.z)==s.x)io.wr(s.reg,s.value);else io.flag(i,s,got);break;
         case Op::ExpectVpll:{const uint32_t c=io.rd(s.reg+4),f=io.rd(s.reg+0x10);
@@ -839,10 +856,7 @@ template<typename Io> uint32_t Run(const Plan& p,uint32_t begin,uint32_t end,Io&
         case Op::Copy:got=io.rd(s.reg);io.wr(s.value,got);break;
         case Op::AssyArmDiff:
             for(uint32_t m=s.mask;m<s.value;m+=4){
-                if(m==0x200)continue;                                     // UPDATE trigger
-                if(s.reg!=kChidCore&&m==0x208)continue;                   // window GET_LINE (live)
-                if(s.reg!=kChidCore&&m>=0x350&&m<0x370)continue;          // window: not in clc57e.h (SW methods)
-                if(s.reg==kChidCore&&m>=0x220&&m<0x250)continue;          // core GET_RG_SCAN_LINE, SET_GET_BLANKING_CTRL (live status)
+                if(DiffSkipped(s.reg,m))continue;
                 const uint32_t a=io.rd(RegAssy(s.reg,m)),b=io.rd(RegArm(s.reg,m));
                 if(a!=b){io.diff(m,a,b);
                     // x: 0 = fail unless rewritten, 1 = strict (any difference that is not ours,
