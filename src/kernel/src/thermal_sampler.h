@@ -12,7 +12,7 @@
 
 namespace brook {
 
-constexpr uint32_t ThermalMaxCpus = 8;
+constexpr uint32_t ThermalMaxCpus = 16; // i7-8086K: 12 logical CPUs
 constexpr uint32_t ThermalPeriodMs = 250;
 constexpr uint32_t ThermalHistory = 240;      // 60 s of 250 ms samples
 constexpr uint32_t ThermalGraphHistory = 120; // 2 min of 1 s points for the taskbar

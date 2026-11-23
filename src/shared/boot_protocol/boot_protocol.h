@@ -99,6 +99,7 @@ constexpr uint32_t BootTimingWaitKey    = 1u << 2; // a recovery key ended the w
 constexpr uint32_t BootTimingRecovery   = 1u << 3; // recovery pair selected (key or guard)
 constexpr uint32_t BootTimingGuardSlot  = 1u << 4; // verified A/B selector metadata follows timing
 constexpr uint32_t BootTimingGuardEmergency = 1u << 5; // journal required recovery, but no recovery pair verified
+constexpr uint32_t BootTimingBootStick = 1u << 6; // bootStick (volume identity + file set) follows guardSlot
 
 struct BootTiming
 {
@@ -119,6 +120,19 @@ struct BootGuardSlot
     uint32_t slot;
     uint32_t reserved;
     uint8_t selectorDigest[32]; // SHA-256 of the entire verified selector
+};
+
+// Boot volume and file set chosen by a STICK_SETS=1 loader (smoke stick).
+struct BootStick
+{
+    uint32_t volumeValid;        // 1: the fields below came from a GPT HD device-path node
+    uint32_t partitionNumber;    // GPT entry number (1-based)
+    uint64_t firstLba, sectors;  // partition extent in 512-byte LBAs
+    uint8_t  partitionGuid[16];  // GPT unique partition GUID (on-disk byte order)
+    uint32_t set;                // 0 legacy files, 1 root SET.BIN, 2 PREV/SET.BIN
+    uint32_t trial;              // BROOK_STICK_TRIAL_* (stick_set.h)
+    uint8_t  kernelSha256[32];   // digest of the kernel file the loader verified
+    uint8_t  initrdSha256[32];
 };
 
 struct BootProtocol
@@ -164,6 +178,8 @@ struct BootProtocol
     // The original timing extent stays intact for installed kernels.
     // Read this field only when the loader advertises BootTimingGuardSlot.
     BootGuardSlot guardSlot;
+    // Read only when timing.flags has BootTimingBootStick.
+    BootStick bootStick;
 };
 
 // Size of the handoff every version-5 loader provides; never read past it
@@ -174,6 +190,11 @@ static_assert(BootProtocolV5Size == 152, "version-5 BootProtocol layout changed 
 inline bool BootHasTiming(const BootProtocol* p)
 {
     return p && p->version >= 5 && p->extensions == BootExtensionTimingMagic;
+}
+
+inline bool BootHasBootStick(const BootProtocol* p)
+{
+    return BootHasTiming(p) && (p->timing.flags & BootTimingBootStick);
 }
 
 inline bool BootHasGuardSlot(const BootProtocol* p)

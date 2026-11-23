@@ -214,10 +214,13 @@ static void LauncherNoteLayout(bool firstCatalog)
 
 // Open config directories relative to the actual home attachment. Create
 // only the two launcher config ancestors, leaving existing ownership alone.
+static constexpr int LauncherNoPersistentHome = 1;
 static int LauncherConfigDir(const VfsPath& root, VfsPath* out)
 {
     VfsPath directory{};
     int error = VfsPathResolve(root, root, "/data/home", &directory);
+    // RAM-only payloads have no persistent home: saving is a silent no-op.
+    if (error == -2) return LauncherNoPersistentHome;
     const char* parts[] = {".config", "brook"};
     for (const char* part : parts) {
         if (error) break;
@@ -309,7 +312,9 @@ static LauncherPersistenceResult StoreDesktopLayout(const char* text, uint32_t b
     VfsPath root{}, directory{};
     LauncherPersistenceResult result;
     if (const int error = VfsPathRoot(&root)) result = {"root", error};
-    else if (const int dirError = LauncherConfigDir(root, &directory)) result = {"directory", dirError};
+    else if (const int dirError = LauncherConfigDir(root, &directory))
+        result = dirError == LauncherNoPersistentHome ? LauncherPersistenceResult{"no-store", 0} :
+                                                        LauncherPersistenceResult{"directory", dirError};
     else result = LauncherWriteLayout(root, directory, text, bytes, temporary, name);
     VfsPathRelease(directory);
     VfsPathRelease(root);
@@ -370,7 +375,8 @@ static void LauncherSaveLayout()
     SpinLockRelease(&g_launcherSaveLock);
     if (result.error && newResult)
         KLogCatConsole(LogCat::Wm, LogLevel::Warn, "launcher: save failed stage=%s errno=%d", result.stage, -result.error);
-    if (!result.error) KLOG_INFO(Wm, "launcher: layout saved epoch=%u bytes=%u", epoch, bytes);
+    if (!result.error && strcmp(result.stage, "no-store"))
+        KLOG_INFO(Wm, "launcher: layout saved epoch=%u bytes=%u", epoch, bytes);
 }
 
 static ChromeLauncherChrome LauncherChrome(int32_t mouseX, int32_t mouseY)

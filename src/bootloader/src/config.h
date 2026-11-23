@@ -11,6 +11,7 @@ struct BootConfig {
     uint32_t displayHeight;
     bool updateSlots;      // opt-in paired A/B maintenance payloads
     bool recoveryMenu;     // opt-in F5 selection of an SSD recovery pair
+    bool stickSets;        // STICK_SETS: root/PREV file sets with a trial marker (smoke stick)
     uint32_t recoveryMenuMs; // RECOVERY_MENU_MS: F5 wait length, default 500
     bool debugText;
     bool logMemory;

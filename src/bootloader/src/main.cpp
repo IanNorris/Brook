@@ -10,6 +10,7 @@
 #include "elf_loader.h"
 #include "fs.h"
 #include "update_slots.h"
+#include "stick_sets.h"
 #include "paging.h"
 #include "boot_protocol/boot_protocol.h"
 #if defined(BROOK_EFI_BOOT_INVENTORY)
@@ -159,6 +160,13 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
             ConsoleSetQuiet(!g_bootConfig.debugText);
         }
     }
+    brook::BootStick bootStick{};
+    bool stickSet = false;
+    if (!recoveryRequested && !updatePair && g_bootConfig.stickSets) {
+        stickSet = updatePair = LoadStickSet(imageHandle, systemTable->BootServices,
+            kernelData, kernelFileSize, initrdData, initrdFileSize, bootStick);
+        ConsoleSetQuiet(!g_bootConfig.debugText);
+    }
     if (recoveryRequested) {
         ConsoleSetQuiet(false);
 #if defined(BROOK_RECOVERY_GUARD_REQUIRED)
@@ -297,6 +305,12 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
     if (selectedSlot.generation) {
         timing.flags |= brook::BootTimingGuardSlot;
         bootProtocol.guardSlot = selectedSlot;
+    }
+    if (g_bootConfig.stickSets) {
+        // Volume identity is reported even for a legacy-file boot.
+        (void)stickSet;
+        timing.flags |= brook::BootTimingBootStick;
+        bootProtocol.bootStick = bootStick;
     }
     timing.kernelJumpTsc = ReadTsc();
     bootProtocol.timing = timing;

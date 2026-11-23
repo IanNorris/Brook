@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "debug_hardware.h"
 #include "bridge_reply.h"
 #include "shutdown.h"
@@ -83,6 +84,16 @@ bool DellAudioProbeRead(DellAudioFirmwareSnapshot& out,const char*& reason){
     reason=audioProbePresent?"ok":"not provisioned";out.i2cBase0=0xfe103000;out.i2cBase1=0xfe104000;return audioProbePresent;
 }
 uint32_t AcpiInventoryCount(){return 1;}
+std::string inventoryText;bool inventoryCaptured=false;
+bool HwInventoryCaptured(){return inventoryCaptured;}
+uint32_t HwInventoryBytes(){return inventoryCaptured?uint32_t(inventoryText.size()):0;}
+uint32_t HwInventoryLines(){return 2;}
+bool HwInventoryOverflow(){return false;}
+uint32_t HwInventoryRead(uint32_t offset,char* out,uint32_t count){
+    out[0]=0;if(!inventoryCaptured || offset>=inventoryText.size())return 0;
+    const uint32_t n=std::min<uint32_t>(uint32_t(inventoryText.size())-offset,count-1);
+    std::memcpy(out,inventoryText.data()+offset,n);out[n]=0;return n;
+}
 bool AcpiMmioMapValid(){return true;}
 bool AcpiMmioContains(uint64_t address,uint32_t bytes){return address==0xfe103000 && bytes==4096;}
 uint64_t classifiedAddress=0;uint32_t classifiedBytes=0;
@@ -317,6 +328,18 @@ int main(){
         assert(handle(std::string("bridge hardware pci ")+bad));assert(reply.find("pci_error")!=std::string::npos);
     }
     assert(handle("bridge hardware acpi-info") && reply.find("\"tables\":1")!=std::string::npos);
+    assert(handle("bridge hardware inventory-info") && reply.find("\"captured\":false,\"bytes\":0")!=std::string::npos);
+    assert(handle("bridge hardware inventory 0 16") && reply.find("hw_inventory_error")!=std::string::npos);
+    brook::inventoryCaptured=true;brook::inventoryText="pci 00:00.0 \"x\"\nline2\n";
+    assert(handle("bridge hardware inventory-info") && reply.find("\"bytes\":22,\"lines\":2")!=std::string::npos);
+    assert(handle("bridge hardware inventory 0 4096") && reply.find("\"text\":\"pci 00:00.0 \\\"x\\\"\\u000aline2\\u000a\"")!=std::string::npos);
+    assert(reply.find("\"more\":false")!=std::string::npos && reply.find("\"next_offset\":22")!=std::string::npos);
+    assert(handle("bridge hardware inventory 4 3") && reply.find("\"text\":\"00:\"")!=std::string::npos && reply.find("\"more\":true")!=std::string::npos);
+    assert(handle("bridge hardware inventory 22 1") && reply.find("\"bytes\":0")!=std::string::npos);
+    for(const auto* bad:{"0 0","0 4097","23 1","0","0 1 x"}){
+        assert(handle(std::string("bridge hardware inventory ")+bad));assert(reply.find("hw_inventory_error")!=std::string::npos);
+    }
+    brook::inventoryCaptured=false;
     assert(handle("bridge hardware dell-i2c-id start") && reply.find("\"result\":\"disabled\"")!=std::string::npos);
     assert(handle("bridge hardware dell-i2c-id status") && reply.find("\"started\":false")!=std::string::npos);
     assert(handle("bridge hardware dell-audio-firmware") && reply.find("\"ok\":false")!=std::string::npos);

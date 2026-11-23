@@ -323,6 +323,39 @@ WritableDesktopBoot WritableDesktopBootMount(uint8_t* nextDrive,WritableDesktopS
     KPrintf("writable desktop: ready bytes=%lu drive=%u home=/data/home (persistent)\n",info.bytes,info.drive);
     return WritableDesktopBoot::Ready;
 }
+WritableDesktopBoot WritableDesktopLiveMount(uint8_t* nextDrive,Device* ram,uint64_t bytes) {
+    if(attempted || !ram)return WritableDesktopBoot::Maintenance;
+    attempted=true;fallbackAllowed=true;info.configured=true;info.bytes=bytes;
+    info.stage="namespace";
+    if(const auto ns=NamespaceFailure();ns.status){
+        KPrintf("writable desktop: live namespace refused (%s %s)\n",ns.path,ns.check);return Fail(ns.status);
+    }
+    info.stage="drive-slot";
+    if(!nextDrive || !Ext2DriveAvailable(*nextDrive))return Fail(-16);
+    info.stage="home-target";
+    if(int error=PrepareTarget())return Fail(error);
+    info.stage="register";
+    if(!DeviceRegister(ram))return Fail(-12);
+    info.stage="bind";
+    if(!Ext2BindDevice(*nextDrive,ram))return Fail(-16);
+    info.drive=*nextDrive; ++*nextDrive;
+    info.stage="mount";
+    if(!VfsMountConfigured("/nix","ext2",info.drive,6))return Fail(-5,false,true);
+    info.stage="payload";
+    if(const auto payload=PayloadFailure();payload.status){
+        KPrintf("writable desktop: live payload refused (%s %s %d)\n",payload.path,payload.check,payload.status);
+        return Fail(-22,true);
+    }
+    info.stage="home-bind";
+    VfsPath root{};int error=VfsPathRoot(&root);
+    if(!error)error=VfsMountNamespaceBindAt(VfsMountNamespaceInitial(),root,root,"/nix/home/brook","/data/home");
+    VfsPathRelease(root);
+    if(error)return Fail(error,true);
+    directStore=true; // RAM image: no final-sync session
+    info.ready=true;info.pinned=true;info.stage="ready";
+    KPrintf("writable desktop: live RAM store ready bytes=%lu drive=%u (not persistent)\n",info.bytes,info.drive);
+    return WritableDesktopBoot::Ready;
+}
 WritableDesktopInfo WritableDesktopRead() {
     auto out=info;out.clean=__atomic_load_n(&finalClean,__ATOMIC_ACQUIRE);
     out.dirty=info.dirty && !out.clean;

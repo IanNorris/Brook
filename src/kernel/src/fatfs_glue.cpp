@@ -128,6 +128,18 @@ static bool BindDrive(uint8_t pdrv, Device* dev, bool exclusive, bool bootReadOn
     return true;
 }
 bool FatFsBindDrive(uint8_t pdrv, Device* dev) {return BindDrive(pdrv,dev,false);}
+bool FatFsSetBootStickWritable(uint8_t pdrv, Device* dev, bool writable)
+{
+    if (pdrv >= FATFS_MAX_DRIVES || !dev) return false;
+    const auto flags = IrqSpinLockAcquire(&g_driveLock);
+    const bool ok = g_fatfsDrives[pdrv] == dev && !g_driveMounted[pdrv] && !g_driveExclusive[pdrv];
+    if (ok) {
+        g_driveReadOnly[pdrv] = !writable;
+        __atomic_store_n(&g_fatfsWriteErrors[pdrv], 0, __ATOMIC_RELAXED);
+    }
+    IrqSpinLockRelease(&g_driveLock, flags);
+    return ok;
+}
 bool FatFsBindBootReadOnlyDrive(uint8_t pdrv, Device* dev) {return BindDrive(pdrv,dev,false,true);}
 bool FatFsBindExclusiveDrive(uint8_t pdrv, Device* dev) {return BindDrive(pdrv,dev,true);}
 

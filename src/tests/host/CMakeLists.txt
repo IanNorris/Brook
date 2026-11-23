@@ -102,6 +102,14 @@ add_host_test(test_recovery_firmware_discovery "${BROOK_ROOT}/src/bootloader/src
 target_include_directories(test_recovery_firmware_discovery PRIVATE
     "${BROOK_ROOT}/vendor/uefi-headers/Include" "${BROOK_ROOT}/vendor/uefi-headers/Include/X64"
     "${BROOK_ROOT}/src/bootloader/src")
+add_host_test(test_boot_status_text)
+target_compile_options(test_boot_status_text PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared")
+add_host_test(test_live_store_record)
+target_compile_options(test_live_store_record PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
+add_host_test(test_nv_aux_reply)
+target_compile_options(test_nv_aux_reply PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
+add_host_test(test_usb_uac2)
+target_compile_options(test_usb_uac2 PRIVATE "-iquote${BROOK_ROOT}/src/drivers/xhci")
 add_host_test(test_usb_ecm_descriptors)
 add_host_test(test_usb_ecm_rx_credits)
 target_compile_options(test_usb_ecm_rx_credits PRIVATE "-iquote${BROOK_ROOT}/src/drivers/xhci")
@@ -110,9 +118,14 @@ target_compile_options(test_usb_ecm_trb_ring PRIVATE "-iquote${BROOK_ROOT}/src/d
 add_host_test(test_tcp_send_queue)
 target_compile_options(test_tcp_send_queue PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_xhci_completion_queue)
+add_host_test(test_usb_hub_logic)
+target_compile_options(test_usb_hub_logic PRIVATE "-iquote${BROOK_ROOT}/src/drivers/xhci")
+add_host_test(test_usb_boot_keyboard)
+target_compile_options(test_usb_boot_keyboard PRIVATE "-iquote${BROOK_ROOT}/src/drivers/xhci")
 add_host_test(test_partition_bounds)
 add_host_test(test_strict_gpt_inventory)
 add_host_test(test_ahci_observe)
+add_host_test(test_hw_inventory_format)
 add_host_test(test_ahci_firmware_handoff)
 add_host_test(test_ahci_read_plan)
 add_host_test(test_ahci_write_plan)
@@ -1227,3 +1240,9 @@ target_compile_options(test_debug_bridge_v3_listener PRIVATE "-iquote${BROOK_ROO
 target_include_directories(test_debug_bridge_v3_listener PRIVATE
     "${BROOK_ROOT}/src/tests/test_debug_bridge_v3_listener" "${BROOK_ROOT}/src/third_party/monocypher")
 target_link_libraries(test_debug_bridge_v3_listener PRIVATE bridge_v3_interop)
+
+# Boot-stick self-update core (tools/rtx_stick_update.h) and loader set choice.
+add_host_test(test_rtx_stick_update
+    "${BROOK_ROOT}/src/third_party/monocypher/monocypher.c"
+    "${BROOK_ROOT}/src/third_party/monocypher/monocypher-ed25519.c")
+target_include_directories(test_rtx_stick_update PRIVATE "${BROOK_ROOT}/src/third_party/monocypher")

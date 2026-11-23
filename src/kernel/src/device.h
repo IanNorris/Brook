@@ -31,6 +31,12 @@ static constexpr uint32_t DEVICE_IOCTL_FLUSH = 0x42460001;
 // Stable for the lifetime of this registered device: 1 means all aliases reject
 // writes, 0 means writable, negative errno means the guarantee is unavailable.
 static constexpr uint32_t DEVICE_IOCTL_READ_ONLY = 0x42460002;
+// Boot-stick update gate only (boot_stick.cpp): on a read-only USB storage
+// device, admit writes and flushes inside one byte range of the whole device
+// while an authenticated update is active. Arg: DeviceWriteWindow*; length 0
+// closes the window. READ_ONLY keeps reporting 1: no other alias may write.
+struct DeviceWriteWindow { uint64_t start, length; };
+static constexpr uint32_t DEVICE_IOCTL_WRITE_WINDOW = 0x42460003;
 
 // ---- Generic device operations ----
 struct DeviceOps {

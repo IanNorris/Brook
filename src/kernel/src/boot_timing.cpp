@@ -12,6 +12,8 @@ namespace brook {
 namespace {
 BootTimingInputs g_inputs{};
 BootGuardSlot g_selectedSlot{};
+BootStick g_bootStick{};
+bool g_bootStickPresent = false;
 BootTimingSummary g_summary{};
 bool g_ready = false;
 
@@ -33,7 +35,10 @@ void BootTimingCaptureHandoff(const BootProtocol* protocol)
     g_inputs.loaderTimingPresent = BootHasTiming(protocol);
     if (g_inputs.loaderTimingPresent) g_inputs.loader = protocol->timing;
     if (BootHasGuardSlot(protocol)) g_selectedSlot = protocol->guardSlot;
+    if (BootHasBootStick(protocol)) { g_bootStick = protocol->bootStick; g_bootStickPresent = true; }
 }
+
+bool BootTimingHandoffStick(BootStick* out) { if (g_bootStickPresent && out) *out = g_bootStick; return g_bootStickPresent; }
 
 uint32_t BootTimingHandoffFlags() { return g_inputs.loader.flags; }
 BootGuardSlot BootTimingHandoffSlot() { return g_selectedSlot; }

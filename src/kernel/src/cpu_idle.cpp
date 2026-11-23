@@ -39,6 +39,9 @@ CpuIdlePerCpu g_cpu[CpuIdleMaxCpus];
 volatile int64_t g_choice = -1;            // (ecx << 32) | (uint32_t)hint, or -1
 volatile uint32_t g_requested = 0;          // CpuIdleState
 volatile uint64_t g_epbGen = 0;
+// Package C-state limit (MSR_PKG_CST_CONFIG_CONTROL bits 3:0), runtime only.
+volatile uint64_t g_pkgLimitGen = 0;
+volatile uint32_t g_pkgLimit = 0;
 volatile uint32_t g_epbValue = 0;
 IrqSpinLock g_epbLock;
 CpuEpbTrial g_epbTrial;
@@ -101,8 +104,11 @@ const Platform& Plat() {
             p.caps.arat = (a6 & (1u << 2)) != 0;
             p.epb = (c6 & (1u << 3)) != 0;
         }
-        // Core/package residency MSRs: Broadwell client (0x3d U/Y, 0x47 H).
-        p.residency = p.bareIntel && (model == 0x3d || model == 0x47);
+        // Core/package residency MSRs (0x3f8-0x3fa, 0x60d, 0x3fc-0x3fe):
+        // Broadwell (0x3d, 0x47), Skylake (0x4e, 0x5e), Kaby/Coffee Lake
+        // (0x8e, 0x9e: the i7-8086K), Comet Lake (0xa5, 0xa6) client parts.
+        p.residency = p.bareIntel && (model == 0x3d || model == 0x47 || model == 0x4e || model == 0x5e ||
+                                      model == 0x8e || model == 0x9e || model == 0xa5 || model == 0xa6);
         if (p.bareIntel && p.epb) {
             p.epbFirmware = int32_t(ReadMsr(0x1b0) & 0xfu);
             // Linux behaviour: firmware 0 (performance) or 15 becomes 6 (normal).
@@ -142,6 +148,12 @@ void CpuIdleEnter(uint32_t cpu) {
                 __atomic_store_n(&pc->epbGen,current,__ATOMIC_RELEASE);
             }
             IrqSpinLockRelease(&g_epbLock,flags);
+        }
+        const uint64_t lg = __atomic_load_n(&g_pkgLimitGen, __ATOMIC_ACQUIRE);
+        if (plat.residency && lg != pc->pkgLimitGen) {
+            const uint64_t v = ReadMsr(0xe2);
+            if (!(v & (1ull << 15))) WriteMsr(0xe2, (v & ~0xfull) | (__atomic_load_n(&g_pkgLimit, __ATOMIC_RELAXED) & 0xfu));
+            pc->pkgLimitGen = lg;
         }
         const uint64_t sg = __atomic_load_n(&g_sampleGen, __ATOMIC_ACQUIRE);
         if (sg != pc->sampleGen) {
@@ -209,6 +221,16 @@ CpuIdleChoice CpuIdleRequest(CpuIdleState state) {
     // Wake idle CPUs parked in MWAIT so they pick up the new hint promptly.
     for (uint32_t i = 0; i < CpuIdleMaxCpus; ++i) __atomic_add_fetch(&g_monitor[i].word, 1, __ATOMIC_RELEASE);
     return choice;
+}
+
+int CpuIdleRequestPackageLimit(uint32_t limit) {
+    const auto& plat = Plat();
+    if (!plat.residency) return -95;
+    if (limit > 8) return -22;
+    if (ReadMsr(0xe2) & (1ull << 15)) return -1; // locked by firmware
+    __atomic_store_n(&g_pkgLimit, limit, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&g_pkgLimitGen, 1, __ATOMIC_RELEASE);
+    return 0;
 }
 
 void CpuIdleRequestAuto() {

@@ -72,8 +72,22 @@ if [ -n "${BROOK_CHROMIUM_VAAPI:-}" ] && [ -n "${gpu[*]}" ] && [ -d "${BROOK_VAA
          --disable-features=Vulkan,UseChromeOSDirectVideoDecoder
          --render-node-override="${BROOK_VAAPI_NODE:-/dev/dri/renderD129}")
 fi
+# Opt-in per image: an explicit ALSA output device (the RTX desktop image
+# ships /etc/chromium-alsa-device = "default"). Chromium's automatic device
+# selection otherwise never opens the packaged clocked-OSS "default" PCM; the
+# Dell/VMware images rely on Brook's audio extension instead (backlog:
+# evaluate this as its replacement there).
+audio=()
+alsa_device=${BROOK_CHROMIUM_ALSA_DEVICE:-}
+if [ -z "$alsa_device" ] && [ -r /etc/chromium-alsa-device ]; then
+  IFS= read -r alsa_device < /etc/chromium-alsa-device || true
+fi
+case "$alsa_device" in
+  ''|*[!A-Za-z0-9_:,.=-]*) ;;
+  *) audio=(--alsa-output-device="$alsa_device") ;;
+esac
 exec /nix/profile/bin/brook-run "${gpu[@]}" /nix/profile/bin/chromium \
-  --disable-setuid-sandbox "${flags[@]}" --disable-background-networking \
+  --disable-setuid-sandbox "${flags[@]}" "${audio[@]}" --disable-background-networking \
   --disable-component-update --renderer-process-limit=2 \
   --disable-crash-reporter --no-first-run --no-default-browser-check \
   --ozone-platform=wayland --user-data-dir="$profile" "$@"

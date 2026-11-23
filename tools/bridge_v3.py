@@ -95,7 +95,7 @@ def _client_hello(protocol: int, operation: int, boot: bytes, transaction: bytes
         raise ValueError("boot and transaction IDs must be 16 bytes")
     is_status = protocol == COMMAND and operation == 0
     if (
-        operation not in {COMMAND: (0, 1), UPDATE: (1, 2), BULK: (1, 2, 3, 4, 5, 6), STORE: (1,)}.get(protocol, ())
+        operation not in {COMMAND: (0, 1), UPDATE: (1, 2, 3), BULK: (1, 2, 3, 4, 5, 6), STORE: (1,)}.get(protocol, ())
         or (not is_status and (boot == ZERO_ID or transaction == ZERO_ID))
         or len(public_key) != 32 or len(nonce) != 32 or len(ephemeral) != 32
         or not any(nonce) or not any(ephemeral)

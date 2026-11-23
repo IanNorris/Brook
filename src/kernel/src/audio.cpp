@@ -102,6 +102,7 @@ static const AudioDriver* g_audioDriver = nullptr;
 static bool (*g_hdaStatus)(AudioHdaStatus&) = nullptr;
 static uint32_t g_outputControl = BROOK_AUDIO_DEFAULT;
 uint32_t AudioOutputControlSnapshot(){return __atomic_load_n(&g_outputControl,__ATOMIC_ACQUIRE);}
+extern "C" uint32_t AudioOutputControlState(){return AudioOutputControlSnapshot();}
 static const uint16_t* g_hardwareVolumeResidual=nullptr;
 void AudioSetHardwareVolumeResidual(const uint16_t* table){__atomic_store_n(&g_hardwareVolumeResidual,table,__ATOMIC_RELEASE);}
 const uint16_t* AudioHardwareVolumeResidual(){return __atomic_load_n(&g_hardwareVolumeResidual,__ATOMIC_ACQUIRE);}

@@ -1,3 +1,8 @@
+#include "hw_inventory.h"
+#include "debug_hardware.h"
+#include "boot_status.h"
+#include "boot_stick.h"
+#include "live_store.h"
 #include "core_autodump.h"
 #include "lastlog.h"
 #include "desktop_identity.h"
@@ -102,11 +107,13 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
 // Keep resolver reads, metadata and container binds on the same real initrd
 // file. The initrd seeds it so this only needs an existing-file write.
+static uint32_t g_resolverDns=0; // network-order DNS last written (0: fallback)
 static void ConfigureResolverFile()
 {
     char text[128];unsigned length=0;
     auto append=[&](const char* value){while(*value)text[length++]=*value++;};
     const auto* network=brook::NetGetIf();
+    g_resolverDns=network?network->dns:0;
     const uint32_t address=network && network->dns?brook::ntohl(network->dns):0x0a000203u;
     append("nameserver ");
     for(int shift=24;shift>=0;shift-=8) {
@@ -124,6 +131,18 @@ static void ConfigureResolverFile()
     if(written!=static_cast<int>(length))
         brook::SerialPrintf("net: resolver file update failed (%d); rebuild initrd if missing\n",written);
     else brook::SerialPrintf("net: retained resolver configuration ready (%u bytes)\n",length);
+}
+
+// DHCP may bind after the boot-time write (background DHCP on hardware):
+// rewrite the resolver whenever the primary interface's DNS appears/changes.
+static void ResolverRefreshWorker(void*)
+{
+    for(;;) {
+        const auto* network=brook::NetGetIf();
+        const uint32_t dns=network?network->dns:0;
+        if(dns && dns!=g_resolverDns)ConfigureResolverFile();
+        brook::SchedulerSleepMs(1000);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -265,6 +284,14 @@ static void PrepareDesktopHome()
 #if defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_GUARDED_DESKTOP)
 namespace brook { void GuardTestPrepareDesktopHome() { PrepareDesktopHome(); } }
 #endif
+
+// Serial-only boot step timing: elapsed ms since the previous step.
+[[maybe_unused]] static void BootStepTime(const char* step, uint64_t& since)
+{
+    const uint64_t now = brook::ApicTickCount();
+    brook::SerialPrintf("BOOT step %s %lu ms\n", step, static_cast<unsigned long>(now - since));
+    since = now;
+}
 
 // Probe a block device for a filesystem (FAT, ext4, or ext2), read BROOK.MNT,
 // and mount at the specified path.  Returns true if mounted.
@@ -842,6 +869,8 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     // If found, the drive is mounted at that path automatically.
     // Drives without BROOK.MNT are registered but not auto-mounted.
     brook::PciScanPrint();
+    // Opt-in read-only inventory before observers or modules touch devices.
+    brook::HwInventoryCapture(bootProtocol);
     brook::DellGpuVtdObserveConfigure();
     // One-shot HDA observation executes on the BSP before AP scheduler entry
     // and before audio modules can claim the controller.
@@ -956,6 +985,8 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     //   we prefer loading it from the virtio disk for demonstration.
     brook::KsymDump();
     brook::NetConfigureBoot();
+    brook::BootStatusConfigure();
+    brook::BootStickConfigure();
     brook::SerialPuts("module: Phase 1 — loading from /drivers (ramdisk)\n");
     brook::KLog("BOOT stage: early modules begin");
     brook::ModuleDiscoverAndLoad("/drivers");
@@ -1016,6 +1047,10 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
                 brook::Device* pd = brook::DeviceFind(pname);
                 if (!pd) continue;
+                if (brook::LiveStoreIsStorePartition(pd)) {
+                    brook::KPrintf("usb-gpt: %s is a live-store slot; not mounted (the store is copied to RAM)\n", pname);
+                    continue;
+                }
 
                 char label[24] = "usb-gpt: ";
                 for (uint32_t j = 0; pname[j] && j < 12; ++j) label[9 + j] = pname[j];
@@ -1034,6 +1069,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
     brook::KLog("BOOT stage: USB filesystem probing complete");
     brook::KLog("BOOT stage: application image mount begin");
+#if !defined(BROOK_SSD_GUARD_CHECK)
+    (void)brook::LiveStoreBoot(&nextPdrv); // desktop live stick; WritableDesktopBootMount then reports Ready
+#endif
     const bool productionDirectRequested=brook::AhciSystemDirectRequested();
     bool productionDirectReady=false;
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
@@ -1084,7 +1122,12 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         brook::BootLogoProgress(75, "Network");
         brook::NetIf* nif = brook::NetGetIf();
         bool configured = brook::NetApplyStaticConfig(nif);
-        if (!configured) {
+        if (!configured && brook::BootStatusEnabled()) {
+            // The background client (boot_status) retries DHCP forever on
+            // every NIC; do not hold boot for the first lease. The status
+            // block reprints the bridge endpoint once the lease arrives.
+            brook::KPuts("net: DHCP continues in the background (boot not held)\n");
+        } else if (!configured) {
             configured = brook::DhcpDiscover(nif);
         }
         if (configured) {
@@ -1110,7 +1153,10 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     }
 
     brook::KLog("BOOT stage: network configuration complete");
+    brook::HwInventoryAnnounce();
     ConfigureResolverFile();
+    if(!KernelWorkerStart("resolver",ResolverRefreshWorker,nullptr))
+        brook::SerialPuts("net: resolver refresh worker unavailable\n");
 
     // ---- Syscall table ----
     brook::BootLogoProgress(80, "Syscalls");
@@ -1129,8 +1175,11 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     // then run the boot script and enter the interactive shell.
     {
         brook::BootLogoProgress(90, "Scheduler");
+        uint64_t stepStart = brook::ApicTickCount();
         brook::SchedulerInit();
+        BootStepTime("SchedulerInit", stepStart);
         brook::CompositorInit();
+        BootStepTime("CompositorInit", stepStart);
         brook::LifecycleChannelStart();
 #ifdef BROOK_DELL_ACPI_MONITOR
         brook::DellAcpiMonitorConfigure();
@@ -1139,9 +1188,11 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
         // Start the NIC polling thread now that the scheduler is initialised.
 #if !defined(BROOK_SSD_GUARD_CHECK) || defined(BROOK_SSD_AUTO_RECOVERY)
-        if (brook::NetGetIf())
+        if (brook::NetGetIf() || brook::BootStatusEnabled())
             brook::NetStartPollThread();
 #endif
+        // Module workers (xHCI hotplug) and the opt-in status/DHCP thread.
+        brook::BootStatusStartThreads();
 
         // BRO-179: start the PMM quarantine drain thread (scheduler is up).
         // It returns freed frames to the allocator only after an all-CPU TLB
@@ -1162,11 +1213,13 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         // poison with the freeing PID + a callstack-ring seq.
         brook::HeapArmForensicPoison();
 
+        BootStepTime("kernel workers", stepStart);
         // If keyboard module wasn't loaded, fall back to direct init.
         if (acpiOk && !brook::KbdIsAvailable())
         {
             brook::KPuts("KBD: ps2_kbd module not loaded — falling back to direct init\n");
             brook::KbdInit();
+            BootStepTime("KbdInit", stepStart);
         }
 
         // If mouse module wasn't loaded, fall back to direct init.
@@ -1174,12 +1227,14 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         {
             brook::KPuts("MOUSE: ps2_mouse module not loaded — falling back to direct init\n");
             brook::MouseInit();
+            BootStepTime("MouseInit", stepStart);
         }
 
         // Prepare APs — allocate per-CPU resources while BSP has no contention.
         // Activation is deferred until just before SchedulerStart so APs don't
         // contend on serial/heap locks while BSP finishes boot.
         brook::SmpPrepareAPs();
+        BootStepTime("SmpPrepareAPs", stepStart);
         brook::KLog("SMP: all APs prepared");
 
         brook::BootLogoProgress(92, "Desktop services");
@@ -1233,6 +1288,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
         // CPU/GPU temperature and power sampler (bare-metal Intel only).
         brook::ThermalSamplerStart();
+
+        // RTX DP sink idle-off (gated by /etc/dp-idle-seconds or bridge command).
+        brook::DpIdleStart();
 
         // Start debug channel kernel thread (connects asynchronously).
 #if !defined(BROOK_SSD_GUARD_CHECK)

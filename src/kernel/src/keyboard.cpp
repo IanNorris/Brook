@@ -630,13 +630,23 @@ void KbdInit()
         InterruptGuard() { __asm__ volatile("pushfq; pop %0; cli":"=r"(flags)::"memory"); }
         ~InterruptGuard() { if(flags & (1ull<<9)) __asm__ volatile("sti":::"memory"); }
     } guard;
+    // No 8042 at all (legacy-free boards): the status port floats to 0xff.
+    // Every wait below would otherwise run to its full bound.
+    if (inb(0x64) == 0xff) { KPuts("KBD: no PS/2 controller (status 0xff)\n"); return; }
+    // Waits are bounded by iterations and by elapsed time: where firmware
+    // emulates the 8042 in SMM, one status read can cost microseconds.
     struct Controller {
-        bool waitWrite() { for(unsigned i=0;i<100000;++i) { if(!(inb(0x64)&2)) return true; __asm__ volatile("pause"); } return false; }
+        uint64_t start = 0;
+        bool expired(unsigned i, uint64_t ms) {
+            if (!i) start = ApicTickCount();
+            return (i & 63) == 63 && ApicTickCount() - start >= ms;
+        }
+        bool waitWrite() { for(unsigned i=0;i<100000 && !expired(i,50);++i) { if(!(inb(0x64)&2)) return true; __asm__ volatile("pause"); } return false; }
         void command(uint8_t b) { outb(0x64,b); }
         void data(uint8_t b) { outb(0x60,b); }
         void drain() { for(unsigned i=0;i<32 && (inb(0x64)&1);++i) (void)inb(0x60); }
         bool readController(uint8_t& b) {
-            for(unsigned i=0;i<100000;++i) {
+            for(unsigned i=0;i<100000 && !expired(i,100);++i) {
                 const auto status=inb(0x64);
                 if(status&1) { const auto value=inb(0x60); if(!(status&0x20)) { b=value; return true; } }
                 __asm__ volatile("pause");

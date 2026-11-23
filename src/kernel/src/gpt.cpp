@@ -46,6 +46,9 @@ struct PartitionPriv {
     uint64_t startByte;
     uint64_t lengthBytes;
     char     name[16];   // "usb0p1", etc.
+    uint8_t  uniqueGuid[16]; // GPT unique partition GUID (zero for MBR)
+    uint32_t entryNumber;    // 1-based GPT entry index (0 for MBR)
+    char     gptName[37];    // GPT partition name, ASCII subset of UTF-16LE (else '?')
 };
 
 // We statically allocate up to GPT_MAX_PARTITIONS * MAX_DEVICES worth of
@@ -110,6 +113,24 @@ Device* PartitionParentDevice(Device* partition) {
         return parent && DeviceIsRegistered(parent)?parent:nullptr;
     }
     return nullptr;
+}
+
+bool PartitionGptName(Device* partition, char out[37]) {
+    if(!PartitionParentDevice(partition))return false;
+    auto* pp=static_cast<PartitionPriv*>(partition->priv);
+    if(!pp->entryNumber)return false;
+    __builtin_memcpy(out,pp->gptName,37);
+    return true;
+}
+
+bool PartitionGptIdentity(Device* partition, uint8_t guid[16], uint32_t* entryNumber,
+                          uint64_t* firstLba, uint64_t* sectors) {
+    if(!PartitionParentDevice(partition))return false;
+    auto* pp=static_cast<PartitionPriv*>(partition->priv);
+    if(!pp->entryNumber)return false;
+    __builtin_memcpy(guid,pp->uniqueGuid,16);
+    *entryNumber=pp->entryNumber;*firstLba=pp->startByte/512;*sectors=pp->lengthBytes/512;
+    return true;
 }
 
 static bool GuidIsZero(const GptGuid& g)
@@ -194,6 +215,14 @@ uint32_t GptProbeDevice(Device* parentDev,bool includeEsp)
         pp.parent      = parentDev;
         pp.startByte   = startByte;
         pp.lengthBytes = endByte - startByte;
+        __builtin_memcpy(pp.uniqueGuid, &entry->uniqueGuid, 16);
+        pp.entryNumber = i + 1;
+        for (uint32_t c = 0; c < 36; ++c) {
+            const uint16_t u = entry->name[c];
+            pp.gptName[c] = u == 0 ? 0 : (u >= 0x20 && u < 0x7f) ? char(u) : '?';
+            if (!u) break;
+        }
+        pp.gptName[36] = 0;
 
         // Name: "<parent>p<N>"
         const char* pn = parentDev->name;

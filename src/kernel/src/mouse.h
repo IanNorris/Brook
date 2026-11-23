@@ -47,6 +47,8 @@ extern "C" void MouseSetPosition(int32_t x, int32_t y);
 extern "C" void MouseSetButtons(uint8_t buttons);
 
 // Mark the mouse subsystem as available (called by non-PS/2 mouse drivers).
+extern "C" void MouseSetUsbButtons(uint8_t buttons);
+extern "C" void MouseSetUsbAvailable(bool available);
 extern "C" void MouseSetAvailable(bool available);
 
 } // namespace brook

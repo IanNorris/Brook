@@ -28,11 +28,19 @@
 #include "xhci_intel_routing.h"
 #include "xhci_msi.h"
 #include "xhci_completion_queue.h"
+#include "usb_hub_logic.h"
+#include "usb_uac2.h"
+#include "audio.h"
+#include "boot_status.h"
+#include "debug_hardware.h"
+#include "scheduler.h"
 #include "usb_scsi_cache.h"
 #include "usb_bot_recovery.h"
 #include "sync/kmutex.h"
 #include "vfs.h"
 #include "pci.h"
+#include "pci_quiesce.h"
+#include "platform_power.h"
 #include "serial.h"
 #include "kprintf.h"
 #include "idt.h"
@@ -43,6 +51,8 @@
 #include "memory/address.h"
 #include "mem_tag.h"
 #include "input.h"
+#include "compositor.h"
+#include "usb_boot_keyboard.h"
 #include "keyboard.h"
 #include "device.h"
 #include "storage_io_stats.h"
@@ -64,6 +74,14 @@ MODULE_IMPORT_SYMBOL(SerialPuts);
 MODULE_IMPORT_SYMBOL(UsbBootReportReset);
 MODULE_IMPORT_SYMBOL(KPrintf);
 MODULE_IMPORT_SYMBOL(KPuts);
+MODULE_IMPORT_SYMBOL(DebugUsbCommandSetHandler);
+MODULE_IMPORT_SYMBOL(KernelWorkerStart);
+MODULE_IMPORT_SYMBOL(AudioRegister);
+MODULE_IMPORT_SYMBOL(AudioClockNowNs);
+MODULE_IMPORT_SYMBOL(AudioOutputControlState);
+MODULE_IMPORT_SYMBOL(SchedulerSleepMs);
+MODULE_IMPORT_SYMBOL(PlatformPowerAddQuiesce);
+MODULE_IMPORT_SYMBOL(PciQuiesceFunctionForReset);
 MODULE_IMPORT_SYMBOL(VmmAllocPages);
 MODULE_IMPORT_SYMBOL(VmmVirtToPhys);
 MODULE_IMPORT_SYMBOL(VmmMapPage);
@@ -74,6 +92,7 @@ MODULE_IMPORT_SYMBOL(ApicGetId);
 MODULE_IMPORT_SYMBOL(IdtInstallHandler);
 MODULE_IMPORT_SYMBOL(InputRegister);
 MODULE_IMPORT_SYMBOL(InputWakeWaiters);
+MODULE_IMPORT_SYMBOL(CompositorWake);
 MODULE_IMPORT_SYMBOL(InputNextSequence);
 MODULE_IMPORT_SYMBOL(KbdPushChar);
 MODULE_IMPORT_SYMBOL(kmalloc);
@@ -374,8 +393,11 @@ static constexpr uint8_t USB_REQ_SET_PROTOCOL     = 11;
 static constexpr uint32_t CMD_RING_SIZE   = 256;  // TRBs in command ring
 static constexpr uint32_t EVT_RING_SIZE   = 256;  // TRBs in event ring
 static constexpr uint32_t XFER_RING_SIZE  = 256;  // TRBs per transfer ring
-static constexpr uint32_t MAX_DEVICES     = 16;   // max USB devices tracked
-static constexpr uint32_t MAX_CONTROLLERS = 2;    // max xHCI controllers
+static constexpr uint32_t MAX_DEVICES     = 48;   // max USB devices tracked (all controllers)
+static constexpr uint32_t MAX_CONTROLLERS = 4;    // max xHCI controllers
+static constexpr uint32_t MAX_SLOTS_PER_CONTROLLER = 32; // MaxSlotsEn
+static constexpr uint32_t XHCI_MAX_ROOT_PORTS = 64;
+static constexpr uint32_t XHCI_HUB_MAX_PORTS = 15;
 static constexpr uint8_t  XHCI_IRQ_VECTOR = 49;   // IDT vector for xHCI interrupt
 
 // ---------------------------------------------------------------------------
@@ -405,6 +427,7 @@ static inline void xhci_write64(volatile uint8_t* base, uint32_t off, uint64_t v
 struct XhciController {
     PciDevice    pciDev;
     volatile uint8_t* capBase;     // capability registers
+    uint32_t mapBytes;             // bytes of BAR0 mapped at capBase
     volatile uint8_t* opBase;      // operational registers (capBase + capLength)
     volatile uint8_t* rtBase;      // runtime registers
     volatile uint8_t* dbBase;      // doorbell registers
@@ -448,9 +471,41 @@ struct XhciController {
     XhciCompletionQueue<Trb> completions;
     bool completionFailed;
     bool     initialized;
+
+    // Bring-up record for the status block.
+    uint32_t index;
+    bool dma32;                 // DMA must stay below 4 GiB
+    const char* handoffText;
+    char resetText[72];
+    const char* runText;
+    const char* irqText;
+    const char* failure;        // why the controller is not driven
+    uint8_t portMajor[XHCI_MAX_ROOT_PORTS]; // Supported Protocol major revision
+    struct PortState {
+        uint8_t device;         // device index + 1 (0 = none)
+        uint8_t tries, waits, cc;
+        const char* error;
+        uint32_t portsc;
+        uint32_t logged;        // last PORTSC logged (state bits only)
+        uint64_t lastTryMs;     // last enumeration attempt (retry back-off)
+    } ports[XHCI_MAX_ROOT_PORTS];
 };
 
 static XhciController g_controllers[MAX_CONTROLLERS];
+
+// Bounded text builder for the status block and bring-up records.
+struct XhciText {
+    char* out; uint32_t cap, len;
+    void c(char ch) { if (len + 1 < cap) out[len++] = ch; }
+    void s(const char* text) { while (text && *text) c(*text++); }
+    void u(uint64_t v) { char d[24]; uint32_t n = 0; do { d[n++] = char('0' + v % 10); v /= 10; } while (v); while (n) c(d[--n]); }
+    void x(uint64_t v, uint32_t width) {
+        static const char hex[] = "0123456789abcdef";
+        for (uint32_t i = width; i-- > 0;) c(hex[(v >> (i * 4)) & 15u]);
+    }
+    void nl() { c('\n'); }
+};
+
 static uint32_t       g_controllerCount = 0;
 static IrqSpinLock g_eventRingLock;
 static IrqSpinLock g_commandRingLock;
@@ -462,15 +517,63 @@ static volatile bool  g_irqActive = false;  // true once ISR is registered
 
 // Allocates 'pages' physically contiguous pages, returns both virtual and
 // physical addresses. Memory is zeroed. Returns nullptr on failure.
+// Set once any driven controller needs 32-bit DMA (no AC64, or ASMedia
+// ASM1142/2142/3242, which Linux limits to 32-bit DMA). Every later xHCI
+// allocation then comes from the first-fit run allocator below 4 GiB.
+static bool g_dma32=false;
+// Low-memory reserve for allocations after boot (hot-plug enumeration).
+// Once a large RAM image (the live store) is resident, nothing below the
+// 4 GiB DMA32 limit may be free, and every late enumeration failed at its
+// first allocation ("scratch allocation failed"). Taken once at module
+// init; bump-allocated, not recycled (gone devices keep their buffers).
+static uint8_t* g_dmaReserve=nullptr;
+static uint64_t g_dmaReservePhys=0;
+static uint32_t g_dmaReservePages=0,g_dmaReserveUsed=0;
+static SpinLock g_dmaReserveLock;
+static void* AllocDmaReserve(uint32_t pages, uint64_t& outPhys)
+{
+    SpinLockAcquire(&g_dmaReserveLock);
+    void* ptr=nullptr;
+    if(g_dmaReserve && pages<=g_dmaReservePages-g_dmaReserveUsed){
+        outPhys=g_dmaReservePhys+uint64_t(g_dmaReserveUsed)*4096;
+        ptr=g_dmaReserve+uint64_t(g_dmaReserveUsed)*4096;
+        g_dmaReserveUsed+=pages;
+    }
+    const uint32_t used=g_dmaReserveUsed,total=g_dmaReservePages;
+    SpinLockRelease(&g_dmaReserveLock);
+    if(ptr){memset(ptr,0,uint64_t(pages)*4096);
+        if(used%64<pages||total-used<64)KPrintf("xhci: DMA reserve %u/%u pages used\n",used,total);}
+    else KPrintf("xhci: DMA reserve exhausted (%u/%u pages, need %u)\n",used,total,pages);
+    return ptr;
+}
+static void* AllocDmaBufferDirect(uint32_t pages, uint64_t& outPhys, PmmOwner owner);
 static void* AllocDmaBuffer(uint32_t pages, uint64_t& outPhys, PmmOwner owner = PmmOwner::XhciDma)
 {
+    if(void* ptr=AllocDmaBufferDirect(pages,outPhys,owner))return ptr;
+    if(!g_dmaReserve || !pages || pages>16384)return nullptr;
+    return AllocDmaReserve(pages,outPhys);
+}
+static void* AllocDmaBufferDirect(uint32_t pages, uint64_t& outPhys, PmmOwner owner)
+{
     if(!pages || pages>16384) return nullptr;
-    auto phys=PmmAllocPagesAccounted(pages,MemTag::Device,KernelPid,owner);
-    if(!phys)return nullptr;
+    // Multi-page requests scan from physical zero; a single page uses the
+    // next-fit hint and may land high, so ask for two and return the spare.
     const uint64_t bytes=uint64_t(pages)*4096;
-    if(phys.raw()>=(16ull<<30) || bytes>(16ull<<30)-phys.raw()) {
+    const uint64_t limit=g_dma32?(4ull<<30):(16ull<<30);
+    // A single page uses the next-fit hint and can land above the DMA limit
+    // once a large RAM image (the live-stick store) has been allocated; a
+    // two-page request scans from physical zero, so retry low once.
+    PhysicalAddress phys{};
+    for(uint32_t attempt=0;attempt<2;++attempt) {
+        const uint32_t request=(g_dma32 || attempt) && pages==1?2:pages;
+        phys=PmmAllocPagesAccounted(request,MemTag::Device,KernelPid,owner);
+        if(!phys){KPrintf("xhci: DMA allocation of %u page(s) failed (attempt %u)\n",request,attempt);return nullptr;}
+        if(request!=pages)PmmFreePage(phys+uint64_t(pages)*4096);
+        if(phys.raw()<limit && bytes<=limit-phys.raw())break;
+        KPrintf("xhci: DMA page(s) at %lx above the %lu GiB limit (attempt %u)\n",
+                static_cast<unsigned long>(phys.raw()),static_cast<unsigned long>(limit>>30),attempt);
         for(uint32_t i=0;i<pages;++i)PmmFreePage(phys+uint64_t(i)*4096);
-        return nullptr;
+        if(pages!=1 || attempt)return nullptr;
     }
     outPhys=phys.raw();
     auto* ptr=reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
@@ -515,65 +618,65 @@ static volatile uint8_t* MapBar64(const PciDevice& dev, uint32_t barIdx,
     return reinterpret_cast<volatile uint8_t*>(vaddr.raw());
 }
 
-static bool XhciPciDetect(XhciController& ctrl)
+// Every xHCI function (class 0c/03/30) in bus order, bounded.
+static uint32_t XhciFindControllers(PciDevice* out, uint32_t capacity)
 {
-    // First try QEMU's specific vendor/device ID
-    PciDevice dev;
-    bool found = PciFindDevice(XHCI_VENDOR_QEMU, XHCI_DEVICE_QEMU, dev);
-
-    if (!found) {
-        // Scan all PCI devices for xHCI class code
-        for (uint16_t bus = 0; bus < 256 && !found; bus++) {
-            for (uint8_t d = 0; d < 32 && !found; d++) {
-                for (uint8_t f = 0; f < 8 && !found; f++) {
-                    uint32_t reg0 = PciConfigRead32(bus, d, f, 0);
-                    if ((reg0 & 0xFFFF) == 0xFFFF) continue;
-                    uint32_t reg8 = PciConfigRead32(bus, d, f, 8);
-                    uint8_t cls = (reg8 >> 24) & 0xFF;
-                    uint8_t sub = (reg8 >> 16) & 0xFF;
-                    uint8_t pi  = (reg8 >> 8) & 0xFF;
-                    if (cls == PCI_CLASS_SERIAL_BUS &&
-                        sub == PCI_SUBCLASS_USB &&
-                        pi  == PCI_PROGIF_XHCI) {
-                        dev.bus = bus;
-                        dev.dev = d;
-                        dev.fn = f;
-                        dev.vendorId = reg0 & 0xFFFF;
-                        dev.deviceId = (reg0 >> 16) & 0xFFFF;
-                        dev.classCode = cls;
-                        dev.subclass = sub;
-                        dev.progIf = pi;
-                        for (int i = 0; i < 6; i++)
-                            dev.bar[i] = PciConfigRead32(bus, d, f, 0x10 + i * 4);
-                        found = true;
-                    }
+    uint32_t count = 0;
+    for (uint16_t bus = 0; bus < 256 && count < capacity; bus++) {
+        for (uint8_t d = 0; d < 32 && count < capacity; d++) {
+            for (uint8_t f = 0; f < 8 && count < capacity; f++) {
+                uint32_t reg0 = PciConfigRead32(bus, d, f, 0);
+                if ((reg0 & 0xFFFF) == 0xFFFF) { if (f == 0) break; continue; }
+                uint32_t reg8 = PciConfigRead32(bus, d, f, 8);
+                uint8_t cls = (reg8 >> 24) & 0xFF;
+                uint8_t sub = (reg8 >> 16) & 0xFF;
+                uint8_t pi  = (reg8 >> 8) & 0xFF;
+                if (cls == PCI_CLASS_SERIAL_BUS && sub == PCI_SUBCLASS_USB && pi == PCI_PROGIF_XHCI) {
+                    PciDevice dev{};
+                    dev.bus = static_cast<uint8_t>(bus);
+                    dev.dev = d;
+                    dev.fn = f;
+                    dev.vendorId = reg0 & 0xFFFF;
+                    dev.deviceId = (reg0 >> 16) & 0xFFFF;
+                    dev.classCode = cls;
+                    dev.subclass = sub;
+                    dev.progIf = pi;
+                    for (int i = 0; i < 6; i++)
+                        dev.bar[i] = PciConfigRead32(bus, d, f, 0x10 + i * 4);
+                    out[count++] = dev;
                 }
+                if (f == 0 && !(PciConfigRead8(bus, d, 0, 0x0E) & 0x80)) break; // single-function
             }
         }
     }
+    return count;
+}
 
-    if (!found) {
-        SerialPuts("xhci: no xHCI controller found on PCI bus\n");
-        return false;
-    }
-
+static bool XhciPciDetect(XhciController& ctrl, const PciDevice& dev)
+{
     ctrl.pciDev = dev;
-    SerialPrintf("xhci: found controller %04x:%04x at PCI %u:%u.%u\n",
+    KPrintf("xhci: c%u controller %04x:%04x at PCI %02x:%02x.%u\n", ctrl.index,
                  dev.vendorId, dev.deviceId, dev.bus, dev.dev, dev.fn);
+    if (!(dev.bar[0] & ~0xFu) && !(PciBarIs64(dev.bar[0]) && dev.bar[1])) {
+        ctrl.failure = "BAR0 unassigned"; return false;
+    }
 
     // Enable PCI bus master and memory space
     PciEnableMemSpace(dev);
 
     // Map BAR0 (64-bit MMIO) — map a generous region to cover all register spaces
-    ctrl.capBase = MapBar64(dev, 0, 64 * 1024);
+    ctrl.mapBytes = 64 * 1024;
+    ctrl.capBase = MapBar64(dev, 0, ctrl.mapBytes);
     if (!ctrl.capBase) {
         SerialPuts("xhci: failed to map BAR0\n");
+        ctrl.failure = "BAR0 map failed";
         return false;
     }
 
     // Read capability registers
     ctrl.capLength  = xhci_read8(ctrl.capBase, XHCI_CAP_CAPLENGTH);
-    ctrl.hciVersion = xhci_read16(ctrl.capBase, XHCI_CAP_HCIVERSION);
+    // Dword read: some controllers (QEMU) do not decode 16-bit capability reads.
+    ctrl.hciVersion = static_cast<uint16_t>(xhci_read32(ctrl.capBase, 0) >> 16);
 
     uint32_t hcsParams1 = xhci_read32(ctrl.capBase, XHCI_CAP_HCSPARAMS1);
     ctrl.maxSlots = hcsParams1 & 0xFF;
@@ -585,25 +688,51 @@ static bool XhciPciDetect(XhciController& ctrl)
 
     uint32_t hccParams1 = xhci_read32(ctrl.capBase, XHCI_CAP_HCCPARAMS1);
     ctrl.ctx64 = (hccParams1 & HCC_CSZ) != 0;
-    if(!(hccParams1&HCC_AC64)) {
-        SerialPuts("xhci: 32-bit DMA controller unsupported by this probe\n");return false;
+    if(!(hccParams1&HCC_AC64) || (dev.vendorId==0x1b21 && (dev.deviceId==0x1142 || dev.deviceId==0x2142 || dev.deviceId==0x3242))) {
+        // Keep every later xHCI DMA buffer below 4 GiB for this controller.
+        ctrl.dma32=true;g_dma32=true;
+        KPrintf("xhci: c%u uses 32-bit DMA (%s)\n",ctrl.index,(hccParams1&HCC_AC64)?"ASMedia quirk":"no AC64");
+    }
+
+    // Doorbell offset
+    uint32_t dboff = xhci_read32(ctrl.capBase, XHCI_CAP_DBOFF) & ~0x3;
+    uint32_t rtsoff = xhci_read32(ctrl.capBase, XHCI_CAP_RTSOFF) & ~0x1F;
+    // The register spaces need not fit in 64 KiB (the RTX 20xx USB-C xHCI,
+    // 10de:1ad8, places them higher in its BAR). The capability registers
+    // define the extent; map that much (bounded) instead of assuming 64 KiB.
+    {
+        uint64_t needed = uint64_t(ctrl.capLength) + XHCI_OP_PORTSC_BASE + uint64_t(ctrl.maxPorts) * 16;
+        const uint64_t doorbells = uint64_t(dboff) + (uint64_t(ctrl.maxSlots) + 1) * 4;
+        const uint64_t runtime = uint64_t(rtsoff) + 0x20 + uint64_t(ctrl.maxIntrs ? ctrl.maxIntrs : 1) * 32;
+        const uint64_t extended = uint64_t(hccParams1 >> 16) * 4 + 16;
+        if (doorbells > needed) needed = doorbells;
+        if (runtime > needed) needed = runtime;
+        if (extended > needed) needed = extended;
+        needed = (needed + 4095) & ~uint64_t(4095);
+        if (needed > ctrl.mapBytes && needed <= 4u * 1024 * 1024) {
+            auto* wider = MapBar64(dev, 0, static_cast<uint32_t>(needed));
+            if (wider) {
+                // The first window stays mapped (a few pages of VA); harmless.
+                ctrl.capBase = wider;
+                ctrl.mapBytes = static_cast<uint32_t>(needed);
+                KPrintf("xhci: c%u register window %u KiB (dboff=0x%x rtsoff=0x%x)\n", ctrl.index,
+                        ctrl.mapBytes / 1024, dboff, rtsoff);
+            }
+        }
     }
 
     // Operational registers are at capBase + capLength
     ctrl.opBase = ctrl.capBase + ctrl.capLength;
-
-    // Doorbell offset
-    uint32_t dboff = xhci_read32(ctrl.capBase, XHCI_CAP_DBOFF) & ~0x3;
-    if(ctrl.capLength<0x20 || uint32_t(ctrl.capLength)+XHCI_OP_PORTSC_BASE+ctrl.maxPorts*16>65536 ||
-       dboff>65536-(ctrl.maxSlots+1)*4) {
-        SerialPuts("xhci: invalid operational/doorbell register bounds\n");return false;
+    const uint32_t window = ctrl.mapBytes;
+    if(ctrl.capLength<0x20 || uint32_t(ctrl.capLength)+XHCI_OP_PORTSC_BASE+ctrl.maxPorts*16>window ||
+       dboff>window-(ctrl.maxSlots+1)*4) {
+        SerialPuts("xhci: invalid operational/doorbell register bounds\n");ctrl.failure="register bounds";return false;
     }
     ctrl.dbBase = ctrl.capBase + dboff;
 
     // Runtime register offset
-    uint32_t rtsoff = xhci_read32(ctrl.capBase, XHCI_CAP_RTSOFF) & ~0x1F;
-    if(rtsoff>65536-0x40 || !ctrl.maxSlots || !ctrl.maxPorts || !ctrl.maxIntrs) {
-        SerialPuts("xhci: invalid runtime/capability bounds\n");return false;
+    if(rtsoff>window-0x40 || !ctrl.maxSlots || !ctrl.maxPorts || !ctrl.maxIntrs) {
+        SerialPuts("xhci: invalid runtime/capability bounds\n");ctrl.failure="capability bounds";return false;
     }
     ctrl.rtBase = ctrl.capBase + rtsoff;
 
@@ -638,6 +767,19 @@ static bool XhciReset(XhciController& ctrl)
     UsbBootReportReset(ctrl.pciDev.vendorId,ctrl.pciDev.deviceId,
         static_cast<uint32_t>(result.phase),static_cast<uint32_t>(result.error),
         result.command,result.status,statusNow,sampleStatus && statusNow!=0xffffffffu,ApicTickCount()-started);
+    {
+        XhciText t{ctrl.resetText,sizeof(ctrl.resetText),0};
+        if(result.error==XhciResetError::None) t.s("ok");
+        else {
+            static const char* const phases[]={"initial","halt","intel-quiet","reset","ready","complete",
+                "initial-quiet","initial-ready","existing-reset","existing-ready"};
+            static const char* const errors[]={"none","inaccessible","timeout","clock-stopped","not-ready"};
+            const auto phase=static_cast<unsigned>(result.phase),error=static_cast<unsigned>(result.error);
+            t.s("FAIL("); t.s(phase<10?phases[phase]:"?"); t.c(' '); t.s(error<5?errors[error]:"?");
+            t.s(" cmd="); t.x(result.command,8); t.s(" sts="); t.x(result.status,8); t.c(')');
+        }
+        ctrl.resetText[t.len]=0;
+    }
     if (result.error != XhciResetError::None) {
         // The wait may have sampled only USBCMD; label its last status and
         // take a fresh status sample after the bounded wait for diagnostics.
@@ -740,7 +882,7 @@ static bool XhciStartController(XhciController& ctrl)
 
     // Set max device slots enabled
     uint32_t maxSlots = ctrl.maxSlots;
-    if (maxSlots > MAX_DEVICES) maxSlots = MAX_DEVICES;
+    if (maxSlots > MAX_SLOTS_PER_CONTROLLER) maxSlots = MAX_SLOTS_PER_CONTROLLER;
     xhci_write32(ctrl.opBase, XHCI_OP_CONFIG, maxSlots);
 
     // Program Interrupter 0
@@ -767,12 +909,14 @@ static bool XhciStartController(XhciController& ctrl)
         uint32_t sts = xhci_read32(ctrl.opBase, XHCI_OP_USBSTS);
         if (!(sts & USBSTS_HCH)) {
             SerialPuts("xhci: controller started (R/S=1)\n");
+            ctrl.runText = (sts & USBSTS_HSE) ? "running+HSE" : "ok";
             return true;
         }
         for (volatile int d = 0; d < 100000; d++);
     }
 
     SerialPuts("xhci: controller failed to start!\n");
+    ctrl.runText = "FAIL(HCH stuck)";
     return false;
 }
 
@@ -884,7 +1028,35 @@ static uint32_t XhciSlotSpeed(uint32_t speed)
 // ---------------------------------------------------------------------------
 
 struct UsbEcmState;
+// One boot-protocol HID function (keyboard or mouse) with its own ring.
+struct XhciHidFn {
+    uint8_t iface, ep, interval;
+    uint16_t packet;            // wMaxPacketSize
+    Trb*     ring;
+    uint64_t ringPhys;
+    uint32_t enqueue;
+    bool     cycle;
+    uint32_t dci;
+    uint8_t* report;
+    uint64_t reportPhys;
+    uint32_t length;            // bytes requested per report
+    uint8_t  previous[8];       // per-interface keys or buttons
+    bool     active;
+    uint8_t  errorCc;
+};
 struct XhciDevice {
+    XhciController* ctrl;
+    UsbTopology topo;
+    uint8_t parent;             // parent hub device index + 1 (0 = root port)
+    uint8_t parentPort;         // port on the parent hub (1-based)
+    uint16_t ep0Packet;
+    uint16_t bcdUsb;
+    uint8_t lastCc;             // last failing completion code (255 = timeout)
+    bool gone;
+    const char* note;           // function setup problem for the status block
+    uint8_t* scratch;           // one DMA page for descriptors and hub requests
+    uint64_t scratchPhys;
+    XhciHidFn kbd, mouse;
     UsbEcmConfiguration ecm;
     UsbEcmState* network;
     uint32_t slotId;
@@ -963,15 +1135,19 @@ struct XhciDevice {
     uint32_t mscBlockSize;      // bytes per sector (usually 512)
 
     // Hub state
-    uint8_t  hubNumPorts;       // number of downstream ports
-    uint16_t hubCharacteristics;
-    uint8_t  hubPwrOnDelay;     // bPwrOn2PwrGood * 2ms units
-    uint32_t routeString;       // xHCI route string to this device
-    uint32_t parentSlotId;      // parent hub's slot (0 = root hub)
-    uint8_t  parentPortNum;     // port on parent hub (1-based)
-    uint8_t  hubTier;           // 0 = directly on root hub
+    bool     hubReady, hubSuper, hubMulti;
+    uint8_t  hubPortCount, hubThink;
+    uint8_t  hubChild[XHCI_HUB_MAX_PORTS];    // device index + 1
+    uint8_t  hubTries[XHCI_HUB_MAX_PORTS], hubCc[XHCI_HUB_MAX_PORTS];
+    uint16_t hubPortStatus[XHCI_HUB_MAX_PORTS];
+    const char* hubError[XHCI_HUB_MAX_PORTS];
 
     void*    priv;          // driver-private (DMA report buffer for HID)
+
+    // Raw descriptors kept for read-only diagnostics (bridge hardware usb).
+    uint8_t  rawDevice[18];
+    uint8_t* rawConfig;     // kmalloc'd copy of the selected configuration
+    uint16_t rawConfigLen;
 };
 
 static constexpr unsigned ECM_RX_PACKETS=UsbEcmRxCredits::Capacity;
@@ -996,6 +1172,7 @@ struct UsbEcmState {
     uint64_t dropped,received,transmitted,txBusy;uint32_t queueHighWater;bool failed;
     UsbEcmRxPressure rxPressure;uint64_t rxDispatchBusy;
     uint32_t faultStatus,faultDci;uint64_t faultToken;
+    uint64_t rxPosted,rxCompletions,rxErrors,txSubmitted,txErrors;
 };
 static bool g_networkProbe=false;
 static bool XhciEcmCompletion(XhciDevice&,const Trb&);
@@ -1003,15 +1180,18 @@ static bool XhciInitEcm(XhciController&,XhciDevice&);
 
 static XhciDevice g_devices[MAX_DEVICES];
 static uint32_t   g_deviceCount = 0;
-static bool        g_mousePresent = false; // set when a mouse is successfully configured
 
 // ---------------------------------------------------------------------------
-// Phase 4: Enable Slot
+// Phase 4: Enable / Disable Slot
 // ---------------------------------------------------------------------------
+
+static constexpr uint32_t TRB_TYPE_STOP_EP    = (15 << TRB_TYPE_SHIFT);
+static constexpr uint32_t TRB_TYPE_SET_TR_DEQ = (16 << TRB_TYPE_SHIFT);
+static constexpr uint32_t TRB_CC_STALL = 6;
+static constexpr uint32_t TRB_CC_CONTEXT_STATE = 19;
 
 static int XhciEnableSlot(XhciController& ctrl)
 {
-    SerialPuts("xhci: sending Enable Slot command\n");
     const auto commandToken=XhciSubmitCommand(ctrl, 0, 0, TRB_TYPE_ENABLE_SLOT);
 
     Trb completion;
@@ -1024,13 +1204,31 @@ static int XhciEnableSlot(XhciController& ctrl)
     uint32_t cc = (evt->status >> TRB_CC_SHIFT) & 0xFF;
     uint32_t slotId = (evt->control >> 24) & 0xFF;
 
-    if (cc != TRB_CC_SUCCESS) {
-        SerialPrintf("xhci: Enable Slot failed (cc=%u)\n", cc);
+    if (cc != TRB_CC_SUCCESS || !slotId || slotId > MAX_SLOTS_PER_CONTROLLER) {
+        SerialPrintf("xhci: Enable Slot failed (cc=%u slot=%u)\n", cc, slotId);
         return -1;
     }
 
     SerialPrintf("xhci: slot %u enabled\n", slotId);
     return static_cast<int>(slotId);
+}
+
+static void XhciDisableSlot(XhciController& ctrl, uint32_t slotId)
+{
+    if (!slotId) return;
+    const auto token = XhciSubmitCommand(ctrl, 0, 0, TRB_TYPE_DISABLE_SLOT | (slotId << 24));
+    Trb completion;
+    if (XhciWaitForEvent(ctrl, TRB_TYPE_CMD_COMPLETION, 1000, &completion, token))
+        ctrl.dcbaa[slotId] = 0;
+}
+
+// Generic command with slot/endpoint fields; returns the completion code.
+static uint32_t XhciSlotCommand(XhciController& ctrl, uint64_t param, uint32_t control, uint32_t timeoutMs = 1000)
+{
+    const auto token = XhciSubmitCommand(ctrl, param, 0, control);
+    Trb completion;
+    Trb* evt = XhciWaitForEvent(ctrl, TRB_TYPE_CMD_COMPLETION, timeoutMs, &completion, token);
+    return evt ? (evt->status >> TRB_CC_SHIFT) & 0xFF : 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1066,13 +1264,11 @@ static uint32_t CtxEntrySize(XhciController& ctrl) { return ctrl.ctx64 ? 64 : 32
 //   [0]: Input Control Context (32 or 64 bytes)
 //   [1]: Slot Context
 //   [2]: EP0 Context (Endpoint Context Index 1 = DCI 1)
-//   Total: 3 entries minimum for Address Device
 static bool XhciAddressDevice(XhciController& ctrl, XhciDevice& dev)
 {
     uint32_t ctxSize = CtxEntrySize(ctrl);
 
-    // Allocate input context — needs at least 33 entries (control + slot + 31 EPs)
-    // but we only fill control + slot + EP0
+    // Input context: control + slot + 31 endpoint contexts.
     uint32_t inputPages = (ctxSize * 33 + 4095) / 4096;
     dev.inputCtx = AllocDmaBuffer(inputPages, dev.inputCtxPhys);
     if (!dev.inputCtx) {
@@ -1099,56 +1295,32 @@ static bool XhciAddressDevice(XhciController& ctrl, XhciDevice& dev)
         return false;
     }
 
-    // Fill Input Control Context
-    // Bits 1:0 of Add Context Flags: bit 0 = Slot, bit 1 = EP0
-    auto* icc = reinterpret_cast<uint32_t*>(
-        static_cast<uint8_t*>(dev.inputCtx));
+    auto* icc = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(dev.inputCtx));
     icc[1] = 0x3; // Add Slot Context (A0) + EP0 Context (A1)
 
-    // Fill Slot Context (entry 1 in input context)
-    auto* slotCtx = reinterpret_cast<uint32_t*>(
-        static_cast<uint8_t*>(dev.inputCtx) + ctxSize);
+    // Slot context: route string, speed, root port and, for LS/FS devices
+    // behind a high-speed hub, the TT hub slot/port (xHCI 1.2 §4.3.3).
+    auto* slotCtx = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(dev.inputCtx) + ctxSize);
+    const auto words = UsbSlotContext(dev.topo, 1, false, 0, 0, false);
+    slotCtx[0] = words.dw0;
+    slotCtx[1] = words.dw1;
+    slotCtx[2] = words.dw2;
 
-    // Slot Context DW0: Route String, Speed, Context Entries (1 = just EP0)
-    uint32_t speed = XhciSlotSpeed(dev.portSpeed);
-    slotCtx[0] = (1 << 27) |           // Context Entries = 1
-                 (speed << 20) |        // Speed
-                 (dev.routeString & 0xFFFFF); // Route String (bits 19:0)
-
-    // Slot Context DW1: Root Hub Port Number (1-based)
-    slotCtx[1] = (dev.portNum << 16); // Root Hub Port Number
-
-    // For devices behind a hub, set the parent hub slot and port
-    if (dev.parentSlotId != 0) {
-        // DW2 bits 7:0 = Parent Hub Slot ID, bits 15:8 = Parent Port Number
-        slotCtx[2] = (dev.parentSlotId & 0xFF) |
-                     ((static_cast<uint32_t>(dev.parentPortNum) & 0xFF) << 8);
-    }
-
-    // Fill EP0 Context (entry 2 in input context)
-    auto* ep0Ctx = reinterpret_cast<uint32_t*>(
-        static_cast<uint8_t*>(dev.inputCtx) + ctxSize * 2);
-
-    uint32_t maxPacket = XhciEp0MaxPacket(dev.portSpeed);
-
-    // EP0 DW1: EP Type = Control (4), Max Packet Size, CErr = 3
+    auto* ep0Ctx = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(dev.inputCtx) + ctxSize * 2);
+    dev.ep0Packet = static_cast<uint16_t>(UsbDefaultEp0Packet(dev.portSpeed));
     ep0Ctx[1] = (3 << 1)  | // CErr = 3
                 (4 << 3)  | // EP Type = Control Bidirectional
-                (maxPacket << 16);
-
-    // EP0 DW2-3: TR Dequeue Pointer (physical, with DCS=1)
-    uint64_t trDqp = dev.ep0RingPhys | 1; // DCS = 1 (cycle state)
+                (uint32_t(dev.ep0Packet) << 16);
+    uint64_t trDqp = dev.ep0RingPhys | 1; // DCS = 1
     ep0Ctx[2] = static_cast<uint32_t>(trDqp);
     ep0Ctx[3] = static_cast<uint32_t>(trDqp >> 32);
-
-    // EP0 DW4: Average TRB length (8 for control setup packets)
-    ep0Ctx[4] = 8;
+    ep0Ctx[4] = 8; // average TRB length for control
 
     __asm__ volatile("mfence" ::: "memory");
 
-    // Submit Address Device command (slot ID in bits 31:24 of control)
-    SerialPrintf("xhci: addressing device on slot %u (port %u, speed=%s)\n",
-                 dev.slotId, dev.portNum, XhciSpeedString(dev.portSpeed));
+    SerialPrintf("xhci: addressing slot %u root=%u route=0x%05x depth=%u speed=%s tt=%u/%u\n",
+                 dev.slotId, dev.topo.rootPort, dev.topo.route, dev.topo.depth,
+                 UsbSpeedName(dev.portSpeed), dev.topo.ttSlot, dev.topo.ttPort);
 
     const auto commandToken=XhciSubmitCommand(ctrl, dev.inputCtxPhys, 0,
                       TRB_TYPE_ADDRESS_DEV | (dev.slotId << 24));
@@ -1163,6 +1335,7 @@ static bool XhciAddressDevice(XhciController& ctrl, XhciDevice& dev)
     uint32_t cc = (evt->status >> TRB_CC_SHIFT) & 0xFF;
     if (cc != TRB_CC_SUCCESS) {
         SerialPrintf("xhci: Address Device failed (cc=%u)\n", cc);
+        dev.lastCc = static_cast<uint8_t>(cc);
         return false;
     }
 
@@ -1170,23 +1343,81 @@ static bool XhciAddressDevice(XhciController& ctrl, XhciDevice& dev)
     return true;
 }
 
+// Update EP0 max packet once bMaxPacketSize0 is known (xHCI 1.2 §4.6.7).
+static bool XhciEvaluateEp0(XhciController& ctrl, XhciDevice& dev, uint32_t packet)
+{
+    const uint32_t ctxSize = CtxEntrySize(ctrl);
+    auto* input = static_cast<uint8_t*>(dev.inputCtx);
+    memset(input, 0, ctxSize * 33);
+    reinterpret_cast<uint32_t*>(input)[1] = 1u << 1; // A1: EP0
+    auto* ep0 = reinterpret_cast<uint32_t*>(input + ctxSize * 2);
+    const auto* out = reinterpret_cast<const uint32_t*>(static_cast<uint8_t*>(dev.outputCtx) + ctxSize);
+    for (unsigned i = 0; i < 5; ++i) ep0[i] = out[i];
+    ep0[0] &= ~7u; // EP state is xHC-owned
+    ep0[1] = (ep0[1] & 0xffffu) | (packet << 16);
+    __asm__ volatile("mfence" ::: "memory");
+    const uint32_t cc = XhciSlotCommand(ctrl, dev.inputCtxPhys, TRB_TYPE_EVAL_CTX | (dev.slotId << 24));
+    if (cc != TRB_CC_SUCCESS) {
+        SerialPrintf("xhci: Evaluate Context (EP0 mps=%u) failed cc=%u\n", packet, cc);
+        return false;
+    }
+    dev.ep0Packet = static_cast<uint16_t>(packet);
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Phase 4-5: Control Transfer (EP0)
 // ---------------------------------------------------------------------------
 
+// A halted or timed-out control endpoint is reset and its dequeue pointer
+// moved past the abandoned TD, so one stalled request (an unsupported
+// descriptor, a hub class probe) does not disable the device.
+static bool XhciRecoverEp0(XhciController& ctrl, XhciDevice& dev, bool halted,
+                           const uint64_t* stale, unsigned staleCount)
+{
+    const uint32_t target = (dev.slotId << 24) | (1u << 16);
+    uint32_t cc = XhciSlotCommand(ctrl, 0, (halted ? TRB_TYPE_RESET_EP : TRB_TYPE_STOP_EP) | target);
+    if (!halted && cc == TRB_CC_CONTEXT_STATE) {
+        // Stop on a Halted EP0 fails; the output context says which state.
+        const auto* ep0 = reinterpret_cast<const volatile uint32_t*>(
+            static_cast<uint8_t*>(dev.outputCtx) + CtxEntrySize(ctrl));
+        if ((ep0[0] & 7u) == 2) { halted = true; cc = XhciSlotCommand(ctrl, 0, TRB_TYPE_RESET_EP | target); }
+    }
+    if (cc != TRB_CC_SUCCESS && cc != TRB_CC_CONTEXT_STATE) {
+        SerialPrintf("xhci: EP0 %s failed slot=%u cc=%u\n", halted ? "reset" : "stop", dev.slotId, cc);
+        return false;
+    }
+    const uint64_t dequeue = (dev.ep0RingPhys + uint64_t(dev.ep0Enqueue) * sizeof(Trb)) | (dev.ep0Cycle ? 1u : 0u);
+    cc = XhciSlotCommand(ctrl, dequeue, TRB_TYPE_SET_TR_DEQ | target);
+    if (cc != TRB_CC_SUCCESS) {
+        SerialPrintf("xhci: EP0 set dequeue failed slot=%u cc=%u\n", dev.slotId, cc);
+        return false;
+    }
+    // Drop completions that still name the abandoned TD.
+    const auto saved = IrqSpinLockAcquire(&g_eventRingLock);
+    Trb discarded;
+    for (unsigned i = 0; i < staleCount; ++i)
+        while (stale[i] && ctrl.completions.Take(TRB_TYPE_TRANSFER_EVENT, stale[i], discarded)) {}
+    IrqSpinLockRelease(&g_eventRingLock, saved);
+    return true;
+}
+
 // Submit a Setup+Data+Status control transfer on EP0 and wait for completion.
 // dataDir: 0 = no data, 2 = OUT (host→device), 3 = IN (device→host)
+// With 'actual', a short IN data stage succeeds and reports its length;
+// without it, only an exact-length transfer succeeds.
 static bool XhciControlTransfer(XhciController& ctrl, XhciDevice& dev,
                                  const UsbSetupPacket& setup,
                                  void* data, uint32_t dataLen,
-                                 uint64_t dataPhys, uint32_t dataDir)
+                                 uint64_t dataPhys, uint32_t dataDir,
+                                 uint32_t* actual = nullptr)
 {
     struct ControlGuard {
         KMutex* mutex;
         explicit ControlGuard(KMutex* m):mutex(m){KMutexLock(mutex);}
         ~ControlGuard(){KMutexUnlock(mutex);}
     } guard(&dev.controlLock);
-    if(dev.controlQuarantined || dataLen>65536 || (dataLen && (!data || !dataDir)) ||
+    if(dev.controlQuarantined || dev.gone || dataLen>65536 || (dataLen && (!data || !dataDir)) ||
        dataLen!=setup.wLength || dataLen>65536-(dataPhys&65535))return false;
     uint64_t dataToken=0;
     // 1. Setup TRB (Immediate Data)
@@ -1196,9 +1427,8 @@ static bool XhciControlTransfer(XhciController& ctrl, XhciDevice& dev,
         dev.ep0Cycle=!dev.ep0Cycle;idx=0;
     }
 
-    // Setup stage: 8 bytes of setup packet in param field (IDT)
+    const auto setupToken=dev.ep0RingPhys+idx*sizeof(Trb);
     Trb& setupTrb = dev.ep0Ring[idx];
-    // Copy setup packet into param
     uint64_t setupData;
     __builtin_memcpy(&setupData, &setup, 8);
     setupTrb.param = setupData;
@@ -1212,7 +1442,6 @@ static bool XhciControlTransfer(XhciController& ctrl, XhciDevice& dev,
     // 2. Data TRB (if there's a data stage)
     if (dataLen > 0 && dataDir != 0) {
         if (idx >= XFER_RING_SIZE - 1) {
-            // Wrap with link TRB
             dev.ep0Ring[XFER_RING_SIZE - 1].control =
                 TRB_TYPE_LINK | TRB_TC | (dev.ep0Cycle ? TRB_CYCLE : 0);
             dev.ep0Cycle = !dev.ep0Cycle;
@@ -1223,7 +1452,6 @@ static bool XhciControlTransfer(XhciController& ctrl, XhciDevice& dev,
         Trb& dataTrb = dev.ep0Ring[idx];
         dataTrb.param = dataPhys;
         dataTrb.status = dataLen;
-        // DIR bit (bit 16): 0 = OUT, 1 = IN
         uint32_t dirBit = (dataDir == 3) ? (1 << 16) : 0;
         dataTrb.control = TRB_TYPE_DATA | dirBit | TRB_IOC |
                           (dev.ep0Cycle ? TRB_CYCLE : 0);
@@ -1242,7 +1470,6 @@ static bool XhciControlTransfer(XhciController& ctrl, XhciDevice& dev,
     Trb& statusTrb = dev.ep0Ring[idx];
     statusTrb.param = 0;
     statusTrb.status = 0;
-    // Direction of status is opposite of data (or IN for no-data)
     uint32_t statusDir = (dataDir == 3) ? 0 : (1 << 16);
     statusTrb.control = TRB_TYPE_STATUS | TRB_IOC | statusDir |
                         (dev.ep0Cycle ? TRB_CYCLE : 0);
@@ -1252,35 +1479,44 @@ static bool XhciControlTransfer(XhciController& ctrl, XhciDevice& dev,
 
     __asm__ volatile("mfence" ::: "memory");
 
-    // Ring doorbell for this slot, target = 1 (EP0 = DCI 1)
     XhciRingDoorbell(ctrl, dev.slotId, 1);
 
-    bool exact=true;
+    uint32_t received=dataLen;bool halted=false,timedOut=false;uint32_t failCc=0;
     if(dataLen) {
         Trb dataCompletion;
-        const auto* event=XhciWaitForEvent(ctrl,TRB_TYPE_TRANSFER_EVENT,2000,&dataCompletion,dataToken);
-        if(!event || ((event->status>>24)!=TRB_CC_SUCCESS && (event->status>>24)!=TRB_CC_SHORT_PACKET)) {
-            dev.controlQuarantined=true;return false;
+        // An error on the Setup stage names the Setup TRB (it has no IOC).
+        const uint64_t tokens[2]={setupToken,dataToken};
+        const auto* event=XhciWaitForEvent(ctrl,TRB_TYPE_TRANSFER_EVENT,2000,&dataCompletion,0,tokens,2);
+        if(!event)timedOut=true;
+        else {
+            const uint32_t cc=event->status>>24;
+            if(event->param==setupToken){halted=true;failCc=cc;}
+            else if(cc==TRB_CC_SUCCESS || cc==TRB_CC_SHORT_PACKET) {
+                const uint32_t residue=event->status&0xffffff;
+                received=residue<=dataLen?dataLen-residue:0;
+            } else {halted=true;failCc=cc;}
         }
-        exact=(event->status&0xffffff)==0;
     }
-    // Wait for transfer event
-    Trb completion;
-    Trb* evt = XhciWaitForEvent(ctrl, TRB_TYPE_TRANSFER_EVENT, 2000,&completion,statusToken);
-    if (!evt) {
-        dev.controlQuarantined=true;
-        SerialPuts("xhci: control transfer timeout\n");
+    if(!timedOut && !halted) {
+        Trb completion;
+        const uint64_t tokens[2]={setupToken,statusToken};
+        Trb* evt = XhciWaitForEvent(ctrl, TRB_TYPE_TRANSFER_EVENT, 2000,&completion,0,tokens,2);
+        if (!evt) timedOut=true;
+        else {
+            const uint32_t cc = (evt->status >> TRB_CC_SHIFT) & 0xFF;
+            if (cc != TRB_CC_SUCCESS || evt->param==setupToken) {halted=true;failCc=cc;}
+        }
+    }
+    if(timedOut || halted) {
+        dev.lastCc=static_cast<uint8_t>(timedOut?255u:failCc);
+        SerialPrintf("xhci: control req=%02x/%02x slot=%u %s cc=%u\n",setup.bmRequestType,setup.bRequest,
+                     dev.slotId,timedOut?"timeout":"halted",failCc);
+        const uint64_t stale[3]={setupToken,dataToken,statusToken};
+        if(!XhciRecoverEp0(ctrl,dev,halted,stale,3))dev.controlQuarantined=true;
         return false;
     }
-
-    uint32_t cc = (evt->status >> TRB_CC_SHIFT) & 0xFF;
-    if (cc != TRB_CC_SUCCESS) {
-        dev.controlQuarantined=true;
-        SerialPrintf("xhci: control transfer failed (cc=%u)\n", cc);
-        return false;
-    }
-
-    return exact;
+    if(actual){*actual=received;return true;}
+    return received==dataLen;
 }
 
 // ---------------------------------------------------------------------------
@@ -1289,18 +1525,29 @@ static bool XhciControlTransfer(XhciController& ctrl, XhciDevice& dev,
 
 static bool XhciGetDeviceDescriptor(XhciController& ctrl, XhciDevice& dev)
 {
-    // Allocate a DMA-accessible buffer for the descriptor
-    uint64_t bufPhys;
-    auto* buf = static_cast<uint8_t*>(AllocDmaBuffer(1, bufPhys));
-    if (!buf) return false;
+    auto* buf = dev.scratch;
+    const uint64_t bufPhys = dev.scratchPhys;
 
     UsbSetupPacket setup = {};
     setup.bmRequestType = 0x80; // Device-to-Host, Standard, Device
     setup.bRequest = USB_REQ_GET_DESCRIPTOR;
-    setup.wValue = (USB_DESC_DEVICE << 8) | 0; // Descriptor Type + Index
-    setup.wIndex = 0;
-    setup.wLength = sizeof(UsbDeviceDescriptor);
+    setup.wValue = (USB_DESC_DEVICE << 8) | 0;
+    setup.wLength = 8;
+    // The first eight bytes carry bMaxPacketSize0; full-speed devices may
+    // use 8..64, so fix EP0 before reading the whole descriptor.
+    uint32_t got = 0;
+    if (!XhciControlTransfer(ctrl, dev, setup, buf, 8, bufPhys, 3, &got) || got < 8) {
+        SerialPuts("xhci: GET_DESCRIPTOR(device, 8) failed\n");
+        return false;
+    }
+    const uint32_t packet = UsbEp0PacketFromDescriptor(dev.portSpeed, buf[7]);
+    if (!packet) {
+        SerialPrintf("xhci: invalid bMaxPacketSize0=%u\n", buf[7]);
+        return false;
+    }
+    if (packet != dev.ep0Packet && !XhciEvaluateEp0(ctrl, dev, packet)) return false;
 
+    setup.wLength = sizeof(UsbDeviceDescriptor);
     if (!XhciControlTransfer(ctrl, dev, setup, buf, sizeof(UsbDeviceDescriptor),
                               bufPhys, 3 /* IN */)) {
         SerialPuts("xhci: GET_DEVICE_DESCRIPTOR failed\n");
@@ -1308,8 +1555,10 @@ static bool XhciGetDeviceDescriptor(XhciController& ctrl, XhciDevice& dev)
     }
 
     auto* desc = reinterpret_cast<UsbDeviceDescriptor*>(buf);
+    memcpy(dev.rawDevice, buf, sizeof(dev.rawDevice));
     dev.vendorId = desc->idVendor;
     dev.productId = desc->idProduct;
+    dev.bcdUsb = desc->bcdUSB;
     dev.deviceClass = desc->bDeviceClass;
     dev.deviceSubClass = desc->bDeviceSubClass;
     dev.deviceProtocol = desc->bDeviceProtocol;
@@ -1332,10 +1581,8 @@ static bool XhciGetDeviceDescriptor(XhciController& ctrl, XhciDevice& dev)
 
 static bool XhciConfigureDevice(XhciController& ctrl, XhciDevice& dev)
 {
-    // First read just the config descriptor header to get wTotalLength
-    uint64_t bufPhys;
-    auto* buf = static_cast<uint8_t*>(AllocDmaBuffer(1, bufPhys));
-    if (!buf) return false;
+    auto* buf = dev.scratch;
+    const uint64_t bufPhys = dev.scratchPhys;
 
     // ECM may be an alternate configuration (Realtek config 2; QEMU's
     // config value 1 is also its second descriptor). Never select by index.
@@ -1348,7 +1595,7 @@ static bool XhciConfigureDevice(XhciController& ctrl, XhciDevice& dev)
         probe.wLength=bytes;
         if(!XhciControlTransfer(ctrl,dev,probe,buf,bytes,bufPhys,3))return false;
         UsbEcmConfiguration ecm{};
-        if(!UsbEcmParse(buf,bytes,dev.portSpeed==PORT_SPEED_SUPER,ecm))continue;
+        if(!UsbEcmParse(buf,bytes,UsbSpeedIsSuper(dev.portSpeed),ecm))continue;
         UsbSetupPacket select{};select.bRequest=USB_REQ_SET_CONFIG;select.wValue=ecm.value;
         if(!XhciControlTransfer(ctrl,dev,select,nullptr,0,0,0))return false;
         select={};select.bmRequestType=1;select.bRequest=11;select.wValue=ecm.alternate;select.wIndex=ecm.data;
@@ -1382,56 +1629,61 @@ static bool XhciConfigureDevice(XhciController& ctrl, XhciDevice& dev)
     SerialPrintf("xhci: config descriptor: totalLen=%u numIfaces=%u cfgVal=%u\n",
                  totalLen, cfgHdr->bNumInterfaces, cfgValue);
 
+    if (totalLen < sizeof(UsbConfigDescriptor)) return false;
     if (totalLen > 4096) totalLen = 4096;
 
-    // Read the full configuration descriptor tree
     setup.wLength = totalLen;
     if (!XhciControlTransfer(ctrl, dev, setup, buf, totalLen, bufPhys, 3)) {
         SerialPuts("xhci: GET_CONFIG_DESCRIPTOR (full) failed\n");
         return false;
     }
 
-    // Parse interface and endpoint descriptors
+    // Parse interface and endpoint descriptors. Endpoints belong to the
+    // interface (alternate setting 0) that precedes them, so a composite
+    // keyboard keeps its boot keyboard endpoint and a separate mouse
+    // interface keeps its own.
+    enum class Owner { None, Keyboard, Mouse, Storage, Hub };
+    Owner owner = Owner::None;
     uint16_t offset = cfgHdr->bLength;
     while (offset + 2 <= totalLen) {
         uint8_t dLen  = buf[offset];
         uint8_t dType = buf[offset + 1];
-        if (dLen < 2) break;
+        if (dLen < 2 || offset + dLen > totalLen) break;
 
         if (dType == USB_DESC_INTERFACE && dLen >= sizeof(UsbInterfaceDescriptor)) {
             auto* iface = reinterpret_cast<UsbInterfaceDescriptor*>(buf + offset);
-            dev.ifaceClass = iface->bInterfaceClass;
-            dev.ifaceSubClass = iface->bInterfaceSubClass;
-            dev.ifaceProtocol = iface->bInterfaceProtocol;
-
-            SerialPrintf("xhci:   interface %u: class=%u/%u/%u endpoints=%u\n",
-                         iface->bInterfaceNumber,
+            owner = Owner::None;
+            SerialPrintf("xhci:   interface %u alt %u: class=%u/%u/%u endpoints=%u\n",
+                         iface->bInterfaceNumber, iface->bAlternateSetting,
                          iface->bInterfaceClass, iface->bInterfaceSubClass,
                          iface->bInterfaceProtocol, iface->bNumEndpoints);
-
-            if (iface->bInterfaceClass == USB_CLASS_HID) {
-                if (iface->bInterfaceProtocol == USB_HID_PROTOCOL_KEYBOARD)
-                    dev.isKeyboard = true;
-                if (iface->bInterfaceProtocol == USB_HID_PROTOCOL_MOUSE)
-                    dev.isMouse = true;
-            }
-
-            if (iface->bInterfaceClass == USB_CLASS_MASS_STORAGE &&
-                iface->bInterfaceSubClass == USB_MSC_SUBCLASS_SCSI &&
-                iface->bInterfaceProtocol == USB_MSC_PROTOCOL_BBB) {
-                dev.isMassStorage = true;
-            }
-
-            // Hub devices: class 9 at device level or interface level
-            if (iface->bInterfaceClass == USB_CLASS_HUB ||
-                dev.deviceClass == USB_CLASS_HUB) {
-                dev.isHub = true;
+            if (iface->bAlternateSetting == 0) {
+                if (!dev.ifaceClass) {
+                    dev.ifaceClass = iface->bInterfaceClass;
+                    dev.ifaceSubClass = iface->bInterfaceSubClass;
+                    dev.ifaceProtocol = iface->bInterfaceProtocol;
+                }
+                if (iface->bInterfaceClass == USB_CLASS_HID &&
+                    iface->bInterfaceSubClass == USB_HID_SUBCLASS_BOOT) {
+                    if (iface->bInterfaceProtocol == USB_HID_PROTOCOL_KEYBOARD && !dev.kbd.ep) {
+                        owner = Owner::Keyboard; dev.kbd.iface = iface->bInterfaceNumber;
+                    } else if (iface->bInterfaceProtocol == USB_HID_PROTOCOL_MOUSE && !dev.mouse.ep) {
+                        owner = Owner::Mouse; dev.mouse.iface = iface->bInterfaceNumber;
+                    }
+                }
+                if (iface->bInterfaceClass == USB_CLASS_MASS_STORAGE &&
+                    iface->bInterfaceSubClass == USB_MSC_SUBCLASS_SCSI &&
+                    iface->bInterfaceProtocol == USB_MSC_PROTOCOL_BBB && !dev.isMassStorage) {
+                    dev.isMassStorage = true; owner = Owner::Storage;
+                }
+                if (iface->bInterfaceClass == USB_CLASS_HUB || dev.deviceClass == USB_CLASS_HUB) {
+                    dev.isHub = true; owner = Owner::Hub;
+                }
             }
         }
 
         if (dType == USB_DESC_ENDPOINT && dLen >= sizeof(UsbEndpointDescriptor)) {
             auto* ep = reinterpret_cast<UsbEndpointDescriptor*>(buf + offset);
-
             uint8_t epAddr = ep->bEndpointAddress;
             uint8_t epType = ep->bmAttributes & 0x3;
             bool    isIn   = (epAddr & 0x80) != 0;
@@ -1440,35 +1692,30 @@ static bool XhciConfigureDevice(XhciController& ctrl, XhciDevice& dev)
                          epAddr, epType, isIn ? "IN" : "OUT",
                          ep->wMaxPacketSize, ep->bInterval);
 
-            // Remember interrupt IN endpoint for HID
-            if (epType == 3 && isIn) { // Interrupt IN
-                dev.interruptEpAddr = epAddr;
-                dev.interruptMaxPacket = ep->wMaxPacketSize;
-                dev.interruptInterval = ep->bInterval;
+            XhciHidFn* fn = owner == Owner::Keyboard ? &dev.kbd : owner == Owner::Mouse ? &dev.mouse : nullptr;
+            if (fn && epType == 3 && isIn && !fn->ep) {
+                fn->ep = epAddr; fn->packet = ep->wMaxPacketSize; fn->interval = ep->bInterval;
             }
-
-            // Remember bulk endpoints for mass storage
-            if (epType == 2) { // Bulk
-                if (isIn) {
-                    dev.bulkInAddr = epAddr;
-                    dev.bulkInMaxPacket = ep->wMaxPacketSize;
-                } else {
-                    dev.bulkOutAddr = epAddr;
-                    dev.bulkOutMaxPacket = ep->wMaxPacketSize;
+            if (owner == Owner::Storage && epType == 2) {
+                if (isIn && !dev.bulkInAddr) {
+                    dev.bulkInAddr = epAddr; dev.bulkInMaxPacket = ep->wMaxPacketSize;
+                } else if (!isIn && !dev.bulkOutAddr) {
+                    dev.bulkOutAddr = epAddr; dev.bulkOutMaxPacket = ep->wMaxPacketSize;
                 }
             }
         }
 
         offset += dLen;
     }
+    dev.isKeyboard = dev.kbd.ep != 0;
+    dev.isMouse = dev.mouse.ep != 0;
+    if (!dev.rawConfig) dev.rawConfig = static_cast<uint8_t*>(kmalloc(totalLen));
+    if (dev.rawConfig) { memcpy(dev.rawConfig, buf, totalLen); dev.rawConfigLen = totalLen; }
 
-    // SET_CONFIGURATION
     UsbSetupPacket setCfg = {};
     setCfg.bmRequestType = 0x00; // Host-to-Device, Standard, Device
     setCfg.bRequest = USB_REQ_SET_CONFIG;
     setCfg.wValue = cfgValue;
-    setCfg.wIndex = 0;
-    setCfg.wLength = 0;
 
     if (!XhciControlTransfer(ctrl, dev, setCfg, nullptr, 0, 0, 0)) {
         SerialPuts("xhci: SET_CONFIGURATION failed\n");
@@ -1481,377 +1728,101 @@ static bool XhciConfigureDevice(XhciController& ctrl, XhciDevice& dev)
 }
 
 // ---------------------------------------------------------------------------
-// Phase 9: USB Hub support
+// Phase 6: Configure an interrupt IN endpoint (HID reports, ECM notify)
 // ---------------------------------------------------------------------------
 
-// Forward declare for hub downstream enumeration
-static void XhciEnumeratePort(XhciController& ctrl, uint32_t portNum,
-                               uint32_t portSpeed);
-static void XhciEnumerateHubDevice(XhciController& ctrl, XhciDevice& hub,
-                                    uint8_t hubPort, uint32_t speed);
-static bool XhciConfigureInterruptEndpoint(XhciController& ctrl, XhciDevice& dev);
-static bool XhciSetBootProtocol(XhciController& ctrl, XhciDevice& dev);
-static bool XhciInitMassStorage(XhciController& ctrl, XhciDevice& dev, uint32_t devIndex);
-
-// Read the hub descriptor and initialize hub state
-static bool XhciHubInit(XhciController& ctrl, XhciDevice& dev)
+static bool XhciConfigureIntIn(XhciController& ctrl, XhciDevice& dev, uint8_t epAddr,
+                               uint16_t wMaxPacket, uint8_t bInterval,
+                               Trb*& ring, uint64_t& ringPhys, uint32_t& enqueue,
+                               bool& cycle, uint32_t& dci)
 {
-    uint64_t bufPhys;
-    auto* buf = static_cast<uint8_t*>(AllocDmaBuffer(1, bufPhys));
-    if (!buf) return false;
-
-    // GET_DESCRIPTOR(HUB) — class-specific request to device
-    UsbSetupPacket setup = {};
-    setup.bmRequestType = 0xA0; // Device-to-Host, Class, Device
-    setup.bRequest = USB_HUB_REQ_GET_DESCRIPTOR;
-    setup.wValue = (USB_DESC_HUB_USB2 << 8) | 0;
-    setup.wIndex = 0;
-    setup.wLength = sizeof(UsbHubDescriptor);
-
-    if (!XhciControlTransfer(ctrl, dev, setup, buf, sizeof(UsbHubDescriptor),
-                              bufPhys, 3)) {
-        // Try USB3 hub descriptor type
-        setup.wValue = (USB_DESC_HUB_USB3 << 8) | 0;
-        if (!XhciControlTransfer(ctrl, dev, setup, buf, sizeof(UsbHubDescriptor),
-                                  bufPhys, 3)) {
-            SerialPuts("xhci: GET_HUB_DESCRIPTOR failed\n");
-            return false;
-        }
+    if (!epAddr || !(epAddr & 0x80)) return false;
+    dci = (epAddr & 0x0F) * 2 + 1;
+    uint32_t interval = 0;
+    if (!UsbXhciInterval(dev.portSpeed, bInterval, interval)) {
+        SerialPrintf("xhci: interrupt EP 0x%02x invalid interval %u\n", epAddr, bInterval);
+        return false;
     }
+    const uint32_t packet = wMaxPacket & 0x7ffu;
+    const uint32_t burst = dev.portSpeed == UsbSpeedHigh ? (wMaxPacket >> 11) & 3u : 0u;
+    if (!packet) return false;
 
-    auto* hubDesc = reinterpret_cast<UsbHubDescriptor*>(buf);
-    dev.hubNumPorts = hubDesc->bNbrPorts;
-    dev.hubCharacteristics = hubDesc->wHubCharacteristics;
-    dev.hubPwrOnDelay = hubDesc->bPwrOn2PwrGood;
+    SerialPrintf("xhci: configuring interrupt EP 0x%02x (DCI %u) mps=%u interval=%u\n",
+                 epAddr, dci, packet, interval);
 
-    SerialPrintf("xhci: hub has %u ports, pwrOn=%ums, char=0x%04x\n",
-                 dev.hubNumPorts, dev.hubPwrOnDelay * 2, dev.hubCharacteristics);
-
-    if (dev.hubNumPorts > 15) dev.hubNumPorts = 15;
-
-    // Power on each downstream port
-    for (uint8_t p = 1; p <= dev.hubNumPorts; p++) {
-        UsbSetupPacket pwr = {};
-        pwr.bmRequestType = 0x23; // Host-to-Device, Class, Other (port)
-        pwr.bRequest = USB_HUB_REQ_SET_FEATURE;
-        pwr.wValue = USB_PORT_FEAT_POWER;
-        pwr.wIndex = p;
-        pwr.wLength = 0;
-
-        XhciControlTransfer(ctrl, dev, pwr, nullptr, 0, 0, 0);
-    }
-
-    // Wait for power-good (bPwrOn2PwrGood * 2ms)
-    // Simple busy-wait using LAPIC tick count (~1ms per tick)
-    uint32_t delayMs = dev.hubPwrOnDelay * 2;
-    if (delayMs < 100) delayMs = 100; // minimum 100ms for safety
-    uint64_t start = brook::ApicTickCount();
-    while ((brook::ApicTickCount() - start) < delayMs) {
-        __asm__ volatile("pause");
-    }
-
-    SerialPuts("xhci: hub ports powered\n");
-    return true;
-}
-
-// Get port status from a hub
-static bool XhciHubGetPortStatus(XhciController& ctrl, XhciDevice& hub,
-                                  uint8_t port, uint16_t* status, uint16_t* change)
-{
-    uint64_t bufPhys;
-    auto* buf = static_cast<uint8_t*>(AllocDmaBuffer(1, bufPhys));
-    if (!buf) return false;
-
-    UsbSetupPacket setup = {};
-    setup.bmRequestType = 0xA3; // Device-to-Host, Class, Other (port)
-    setup.bRequest = USB_HUB_REQ_GET_STATUS;
-    setup.wValue = 0;
-    setup.wIndex = port;
-    setup.wLength = 4;
-
-    if (!XhciControlTransfer(ctrl, hub, setup, buf, 4, bufPhys, 3)) {
-        SerialPrintf("xhci: GET_PORT_STATUS(port %u) failed\n", port);
+    if (!XhciAllocTransferRing(ring, ringPhys, enqueue, cycle)) {
+        SerialPuts("xhci: failed to allocate interrupt transfer ring\n");
         return false;
     }
 
-    *status = buf[0] | (buf[1] << 8);
-    *change = buf[2] | (buf[3] << 8);
+    uint32_t ctxSize = CtxEntrySize(ctrl);
+    auto* input = static_cast<uint8_t*>(dev.inputCtx);
+    memset(input, 0, ctxSize * 33);
+
+    auto* icc = reinterpret_cast<uint32_t*>(input);
+    icc[1] = (1 << 0) | (1 << dci); // Add Slot + EP
+
+    auto* slotCtx = reinterpret_cast<uint32_t*>(input + ctxSize);
+    auto* outSlot = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(dev.outputCtx));
+    slotCtx[0] = outSlot[0];
+    slotCtx[1] = outSlot[1];
+    slotCtx[2] = outSlot[2];
+    slotCtx[3] = outSlot[3];
+    if(dci>((slotCtx[0]>>27)&31))slotCtx[0] = (slotCtx[0] & ~(0x1Fu << 27)) | (dci << 27);
+
+    auto* epCtx = reinterpret_cast<uint32_t*>(input + ctxSize * (dci + 1));
+    const uint32_t esit = packet * (burst + 1);
+    epCtx[0] = interval << 16;
+    epCtx[1] = (3 << 1) |      // CErr = 3
+               (7 << 3) |      // EP Type = Interrupt IN
+               (burst << 8) |
+               (packet << 16);
+    uint64_t trDqp = ringPhys | 1;
+    epCtx[2] = static_cast<uint32_t>(trDqp);
+    epCtx[3] = static_cast<uint32_t>(trDqp >> 32);
+    epCtx[4] = esit | (esit << 16); // average TRB length, max ESIT payload
+
+    __asm__ volatile("mfence" ::: "memory");
+
+    const uint32_t cc = XhciSlotCommand(ctrl, dev.inputCtxPhys, TRB_TYPE_CONFIG_EP | (dev.slotId << 24), 2000);
+    if (cc != TRB_CC_SUCCESS) {
+        SerialPrintf("xhci: Configure Endpoint (interrupt) failed (cc=%u)\n", cc);
+        return false;
+    }
+    SerialPrintf("xhci: interrupt endpoint configured (DCI %u) ring=0x%lx\n", dci, ringPhys);
     return true;
 }
 
-// Clear a port feature on a hub
-static bool XhciHubClearPortFeature(XhciController& ctrl, XhciDevice& hub,
-                                     uint8_t port, uint16_t feature)
-{
-    UsbSetupPacket setup = {};
-    setup.bmRequestType = 0x23; // Host-to-Device, Class, Other (port)
-    setup.bRequest = USB_HUB_REQ_CLEAR_FEATURE;
-    setup.wValue = feature;
-    setup.wIndex = port;
-    setup.wLength = 0;
-
-    return XhciControlTransfer(ctrl, hub, setup, nullptr, 0, 0, 0);
-}
-
-// Set a port feature on a hub
-static bool XhciHubSetPortFeature(XhciController& ctrl, XhciDevice& hub,
-                                    uint8_t port, uint16_t feature)
-{
-    UsbSetupPacket setup = {};
-    setup.bmRequestType = 0x23; // Host-to-Device, Class, Other (port)
-    setup.bRequest = USB_HUB_REQ_SET_FEATURE;
-    setup.wValue = feature;
-    setup.wIndex = port;
-    setup.wLength = 0;
-
-    return XhciControlTransfer(ctrl, hub, setup, nullptr, 0, 0, 0);
-}
-
-// Poll hub ports for newly connected devices
-static void XhciHubPollPorts(XhciController& ctrl, XhciDevice& hub)
-{
-    for (uint8_t p = 1; p <= hub.hubNumPorts; p++) {
-        uint16_t status = 0, change = 0;
-        if (!XhciHubGetPortStatus(ctrl, hub, p, &status, &change))
-            continue;
-
-        // Check for connection status change
-        if (!(change & USB_PORT_STAT_CONNECTION))
-            continue;
-
-        // Clear the change bit
-        XhciHubClearPortFeature(ctrl, hub, p, USB_PORT_FEAT_C_CONNECTION);
-
-        if (status & USB_PORT_STAT_CONNECTION) {
-            // New device connected — reset the port
-            SerialPrintf("xhci: hub port %u: device connected, resetting\n", p);
-            XhciHubSetPortFeature(ctrl, hub, p, USB_PORT_FEAT_RESET);
-
-            // Wait for reset complete (~50ms)
-            uint64_t start = brook::ApicTickCount();
-            while ((brook::ApicTickCount() - start) < 50) {
-                __asm__ volatile("pause");
-            }
-
-            // Clear reset change
-            XhciHubClearPortFeature(ctrl, hub, p, USB_PORT_FEAT_C_RESET);
-
-            // Check port is now enabled
-            uint16_t newStatus = 0, newChange = 0;
-            if (!XhciHubGetPortStatus(ctrl, hub, p, &newStatus, &newChange))
-                continue;
-
-            if (!(newStatus & USB_PORT_STAT_ENABLE)) {
-                SerialPrintf("xhci: hub port %u: reset failed (not enabled)\n", p);
-                continue;
-            }
-
-            // Determine speed from port status (bits 9-10 for USB 2.0)
-            uint32_t speed = (newStatus >> 9) & 0x3;
-            // Map hub port speed encoding to xHCI speed:
-            // 0=full, 1=low, 2=high; xHCI: 1=full, 2=low, 3=high, 4=super
-            uint32_t xhciSpeed;
-            switch (speed) {
-                case 0: xhciSpeed = 1; break; // Full Speed
-                case 1: xhciSpeed = 2; break; // Low Speed
-                case 2: xhciSpeed = 3; break; // High Speed
-                default: xhciSpeed = 4; break; // Super Speed
-            }
-
-            SerialPrintf("xhci: hub port %u: enabled, speed=%u\n", p, xhciSpeed);
-
-            // Enumerate the downstream device
-            XhciEnumerateHubDevice(ctrl, hub, p, xhciSpeed);
-        } else {
-            // Device disconnected
-            SerialPrintf("xhci: hub port %u: device disconnected\n", p);
-            // TODO: find and clean up the device slot
-        }
-    }
-}
-
-// Enumerate a device connected through a hub
-static void XhciEnumerateHubDevice(XhciController& ctrl, XhciDevice& hub,
-                                    uint8_t hubPort, uint32_t speed)
-{
-    if (g_deviceCount >= MAX_DEVICES) {
-        SerialPuts("xhci: max devices reached\n");
-        return;
-    }
-
-    int slotId = XhciEnableSlot(ctrl);
-    if (slotId < 0) return;
-
-    XhciDevice& dev = g_devices[g_deviceCount];
-    dev = {};
-    dev.slotId = static_cast<uint32_t>(slotId);
-    dev.portNum = hub.portNum; // root hub port number (for xHCI slot context)
-    dev.portSpeed = speed;
-    dev.ep0Cycle = true;
-    dev.intCycle = true;
-    dev.parentSlotId = hub.slotId;
-    dev.parentPortNum = hubPort;
-    dev.hubTier = hub.hubTier + 1;
-
-    // Build route string: append hubPort to parent's route string
-    // Route string: 4 bits per tier, tier 0 in bits 3:0
-    dev.routeString = hub.routeString | (static_cast<uint32_t>(hubPort) << (hub.hubTier * 4));
-
-    SerialPrintf("xhci: enumerating hub device: rootPort=%u, route=0x%05x, tier=%u\n",
-                 dev.portNum, dev.routeString, dev.hubTier);
-
-    if (!XhciAddressDevice(ctrl, dev)) return;
-    if (!XhciGetDeviceDescriptor(ctrl, dev)) return;
-    if (!XhciConfigureDevice(ctrl, dev)) return;
-
-    g_deviceCount++;
-
-    // Handle device type same as root port devices
-    if (dev.isKeyboard && dev.interruptEpAddr) {
-        SerialPrintf("xhci: USB keyboard via hub (slot %u)\n", dev.slotId);
-        XhciSetBootProtocol(ctrl, dev);
-        XhciConfigureInterruptEndpoint(ctrl, dev);
-    }
-
-    if (dev.isMouse && dev.interruptEpAddr) {
-        SerialPrintf("xhci: USB mouse via hub (slot %u)\n", dev.slotId);
-        XhciSetBootProtocol(ctrl, dev);
-        if (XhciConfigureInterruptEndpoint(ctrl, dev))
-            g_mousePresent = true;
-    }
-
-    if(dev.ecm.value)XhciInitEcm(ctrl,dev);
-    if (dev.isMassStorage && dev.bulkInAddr && dev.bulkOutAddr) {
-        SerialPrintf("xhci: USB mass storage via hub (slot %u)\n", dev.slotId);
-        XhciInitMassStorage(ctrl, dev, g_deviceCount - 1);
-    }
-
-    if (dev.isHub) {
-        SerialPrintf("xhci: nested hub detected (slot %u)\n", dev.slotId);
-        if (dev.hubTier < 5) {
-            XhciHubInit(ctrl, dev);
-            XhciHubPollPorts(ctrl, dev);
-        } else {
-            SerialPuts("xhci: max hub tier depth reached\n");
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Phase 6: Configure interrupt endpoint in xHCI (for HID polling)
-// ---------------------------------------------------------------------------
-
+// ECM notification endpoint (generic per-device interrupt ring).
 static bool XhciConfigureInterruptEndpoint(XhciController& ctrl, XhciDevice& dev)
 {
     if (!dev.interruptEpAddr) {
         SerialPuts("xhci: no interrupt endpoint found\n");
         return false;
     }
-
-    // EP address: bit 7 = direction (1=IN), bits 3:0 = EP number
-    uint8_t epNum = dev.interruptEpAddr & 0x0F;
-    bool isIn = (dev.interruptEpAddr & 0x80) != 0;
-
-    // Device Context Index: DCI = 2*epNum + (isIn ? 1 : 0)
-    // EP0 IN/OUT = DCI 1, EP1 OUT = DCI 2, EP1 IN = DCI 3, etc.
-    dev.intDci = epNum * 2 + (isIn ? 1 : 0);
-
-    SerialPrintf("xhci: configuring interrupt EP 0x%02x (DCI %u)\n",
-                 dev.interruptEpAddr, dev.intDci);
-
-    // Allocate transfer ring for the interrupt endpoint
-    if (!XhciAllocTransferRing(dev.intRing, dev.intRingPhys,
-                                dev.intEnqueue, dev.intCycle)) {
-        SerialPuts("xhci: failed to allocate interrupt transfer ring\n");
-        return false;
-    }
-
-    uint32_t ctxSize = CtxEntrySize(ctrl);
-
-    // Reuse the input context — zero it first
-    auto* input = static_cast<uint8_t*>(dev.inputCtx);
-    memset(input, 0, ctxSize * 33);
-
-    // Input Control Context: add slot + the interrupt endpoint
-    auto* icc = reinterpret_cast<uint32_t*>(input);
-    icc[1] = (1 << 0) | (1 << dev.intDci); // Add Slot + EP
-
-    // Slot Context: update Context Entries to include the new EP
-    auto* slotCtx = reinterpret_cast<uint32_t*>(input + ctxSize);
-    // Read current slot context from output context
-    auto* outSlot = reinterpret_cast<uint32_t*>(
-        static_cast<uint8_t*>(dev.outputCtx));
-    slotCtx[0] = outSlot[0];
-    slotCtx[1] = outSlot[1];
-    slotCtx[2] = outSlot[2];
-    slotCtx[3] = outSlot[3];
-    // Update Context Entries to max DCI
-    if(dev.intDci>((slotCtx[0]>>27)&31))slotCtx[0] = (slotCtx[0] & ~(0x1F << 27)) | (dev.intDci << 27);
-
-    // Endpoint Context for the interrupt IN endpoint
-    auto* epCtx = reinterpret_cast<uint32_t*>(input + ctxSize * (dev.intDci + 1));
-
-    unsigned interval=dev.interruptInterval;
-    if(!interval)return false;
-    if(dev.portSpeed==PORT_SPEED_HIGH || dev.portSpeed==PORT_SPEED_SUPER){if(interval>16)return false;--interval;}
-    else{unsigned exponent=0;while(interval>1){interval>>=1;++exponent;}interval=exponent+3;}
-    epCtx[0]=interval<<16;
-    // EP DW1: CErr=3, EP Type=7 (Interrupt IN), Max Packet Size
-    epCtx[1] = (3 << 1) |      // CErr = 3
-               (7 << 3) |      // EP Type = Interrupt IN
-               (dev.interruptMaxPacket << 16);
-
-    // EP DW2-3: TR Dequeue Pointer with DCS=1
-    uint64_t trDqp = dev.intRingPhys | 1;
-    epCtx[2] = static_cast<uint32_t>(trDqp);
-    epCtx[3] = static_cast<uint32_t>(trDqp >> 32);
-
-    // EP DW4: Average TRB Length (8 for keyboard), Max ESIT Payload (8)
-    epCtx[4] = dev.interruptMaxPacket | (uint32_t(dev.interruptMaxPacket) << 16);
-
-    __asm__ volatile("mfence" ::: "memory");
-
-    // Submit Configure Endpoint command
-    const auto commandToken=XhciSubmitCommand(ctrl, dev.inputCtxPhys, 0,
-                      TRB_TYPE_CONFIG_EP | (dev.slotId << 24));
-
-    Trb completion;
-    Trb* evt = XhciWaitForEvent(ctrl, TRB_TYPE_CMD_COMPLETION, 2000,&completion,commandToken);
-    if (!evt) {
-        SerialPuts("xhci: Configure Endpoint timeout\n");
-        return false;
-    }
-
-    uint32_t cc = (evt->status >> TRB_CC_SHIFT) & 0xFF;
-    if (cc != TRB_CC_SUCCESS) {
-        SerialPrintf("xhci: Configure Endpoint failed (cc=%u)\n", cc);
-        return false;
-    }
-
-    SerialPrintf("xhci: interrupt endpoint configured (DCI %u) ring=0x%lx\n",
-                 dev.intDci, dev.intRingPhys);
-    return true;
+    return XhciConfigureIntIn(ctrl, dev, dev.interruptEpAddr, dev.interruptMaxPacket,
+                              dev.interruptInterval, dev.intRing, dev.intRingPhys,
+                              dev.intEnqueue, dev.intCycle, dev.intDci);
 }
 
 // ---------------------------------------------------------------------------
 // Phase 6: Set HID boot protocol
 // ---------------------------------------------------------------------------
 
-static bool XhciSetBootProtocol(XhciController& ctrl, XhciDevice& dev)
+static bool XhciSetBootProtocol(XhciController& ctrl, XhciDevice& dev, uint8_t iface)
 {
     UsbSetupPacket setup = {};
     setup.bmRequestType = 0x21; // Host-to-Device, Class, Interface
     setup.bRequest = USB_REQ_SET_PROTOCOL;
     setup.wValue = 0; // 0 = Boot Protocol
-    setup.wIndex = 0; // Interface 0
+    setup.wIndex = iface;
     setup.wLength = 0;
 
     if (!XhciControlTransfer(ctrl, dev, setup, nullptr, 0, 0, 0)) {
         SerialPuts("xhci: SET_PROTOCOL (boot) failed\n");
         return false;
     }
-
-    SerialPuts("xhci: HID boot protocol set\n");
+    SerialPrintf("xhci: HID boot protocol set (interface %u)\n", iface);
     return true;
 }
 
@@ -1894,43 +1865,11 @@ static bool XhciQueueInterruptIn(XhciController& ctrl, XhciDevice& dev,
 // Byte 1: reserved
 // Bytes 2-7: up to 6 simultaneous key codes
 
-static constexpr uint8_t MOD_LEFT_CTRL   = 0x01;
-static constexpr uint8_t MOD_LEFT_SHIFT  = 0x02;
-static constexpr uint8_t MOD_LEFT_ALT    = 0x04;
-static constexpr uint8_t MOD_LEFT_GUI    = 0x08;
-static constexpr uint8_t MOD_RIGHT_CTRL  = 0x10;
-static constexpr uint8_t MOD_RIGHT_SHIFT = 0x20;
-static constexpr uint8_t MOD_RIGHT_ALT   = 0x40;
-static constexpr uint8_t MOD_RIGHT_GUI   = 0x80;
-
-// USB HID usage ID → Linux input event code (KEY_* from linux/input-event-codes.h)
-// Only covers the basic alphanumeric + common keys
-// These map to PS/2 scan code set 1 values used by Brook's input subsystem
-static const uint8_t g_hidToScancode[128] = {
-    0,   0,   0,   0,   30,  48,  46,  32,  // 0x00-0x07: None,None,None,None, A,B,C,D
-    18,  33,  34,  35,  23,  36,  37,  38,  // 0x08-0x0F: E,F,G,H, I,J,K,L
-    50,  49,  24,  25,  16,  19,  31,  20,  // 0x10-0x17: M,N,O,P, Q,R,S,T
-    22,  47,  17,  45,  21,  44,  2,   3,   // 0x18-0x1F: U,V,W,X, Y,Z,1,2
-    4,   5,   6,   7,   8,   9,   10,  11,  // 0x20-0x27: 3,4,5,6, 7,8,9,0
-    28,  1,   14,  15,  57,  12,  13,  26,  // 0x28-0x2F: Enter,Esc,Bksp,Tab, Space,-,=,[
-    27,  43,  43,  39,  40,  41,  51,  52,  // 0x30-0x37: ],\,\,;, ',`,,,. 
-    53,  58,  59,  60,  61,  62,  63,  64,  // 0x38-0x3F: /,CapsLk,F1,F2, F3,F4,F5,F6
-    65,  66,  67,  68,  87,  88,  99,  70,  // 0x40-0x47: F7,F8,F9,F10, F11,F12,PrtSc,ScrLk
-    119, 110, 102, 104, 111, 107, 109, 106, // 0x48-0x4F: Pause,Ins,Home,PgUp, Del,End,PgDn,Right
-    105, 108, 103, 69,  98,  55,  74,  78,  // 0x50-0x57: Left,Down,Up,NumLk, KP/,KP*,KP-,KP+
-    96,  79,  80,  81,  75,  76,  77,  71,  // 0x58-0x5F: KPEnt,KP1,KP2,KP3, KP4,KP5,KP6,KP7
-    72,  73,  82,  83,  0,   0,   0,   0,   // 0x60-0x67: KP8,KP9,KP0,KP., unused...
-    0,   0,   0,   0,   0,   0,   0,   0,   // 0x68-0x6F
-    0,   0,   0,   0,   0,   0,   0,   0,   // 0x70-0x77
-    0,   0,   0,   0,   0,   0,   0,   0,   // 0x78-0x7F
-};
-
 // USB keyboard input device
 static InputDevice g_usbKbdDev;
 static InputDeviceOps g_usbKbdOps = { "usb_kbd", nullptr };
 
 // Track previous report for key up/down detection
-static uint8_t g_prevReport[8] = {};
 
 // PS/2 scancode set 1 → ASCII (US layout, unshifted)
 // Matches keyboard.cpp g_scancodeToAscii_US for the common range.
@@ -1955,8 +1894,16 @@ static const char g_sc1ToAsciiShift[128] = {
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0            // 0x54-0x7F
 };
 
+// Key presses seen (any USB keyboard) and the latest scancodes, reported
+// from the hotplug worker so typing is visible on the console.
+static volatile uint32_t g_keyPresses = 0;
+static volatile uint8_t g_keyRecent[16];
 static void XhciPushKey(uint8_t scancode, bool pressed, uint8_t modifiers)
 {
+    if (pressed) {
+        const uint32_t n = __atomic_fetch_add(&g_keyPresses, 1, __ATOMIC_RELAXED);
+        g_keyRecent[n % 16] = scancode;
+    }
     InputEvent ev{};
     ev.type = pressed ? InputEventType::KeyPress : InputEventType::KeyRelease;
     ev.scanCode = scancode;
@@ -1965,12 +1912,11 @@ static void XhciPushKey(uint8_t scancode, bool pressed, uint8_t modifiers)
     // Translate scancode → ASCII so the compositor/terminal can use it
     ev.ascii = 0;
     if (pressed && scancode < 128) {
-        bool shifted = (modifiers & (INPUT_MOD_LSHIFT | INPUT_MOD_RSHIFT)) != 0;
-        bool capsLock = false; // TODO: track caps lock state
-        char c = shifted ? g_sc1ToAsciiShift[scancode] : g_sc1ToAscii[scancode];
-        // CapsLock inverts letter case
-        if (capsLock && c >= 'A' && c <= 'Z' && !shifted)
-            c = g_sc1ToAscii[scancode]; // already lowercase
+        bool shifted = (modifiers & INPUT_MOD_SHIFT) != 0;
+        const char base = g_sc1ToAscii[scancode];
+        if ((modifiers & INPUT_MOD_CAPSLOCK) && base >= 'a' && base <= 'z')
+            shifted = !shifted;
+        const char c = shifted ? g_sc1ToAsciiShift[scancode] : base;
         ev.ascii = static_cast<uint8_t>(c);
     }
 
@@ -1982,94 +1928,31 @@ static void XhciPushKey(uint8_t scancode, bool pressed, uint8_t modifiers)
         KbdPushChar(static_cast<char>(ev.ascii));
 }
 
-static void XhciProcessKeyboardReport(const uint8_t* report)
+static UsbBootKeyboard g_bootKeyboard;
+static uint32_t g_activeUsbMice;
+static volatile uint32_t g_mouseReports;
+
+static void XhciProcessMouseReport(const uint8_t* report, XhciHidFn& fn);
+static void XhciEndHid(XhciHidFn& fn, bool keyboard);
+static int XhciMatchTransferEvent(const XhciController& ctrl, const Trb& evt);
+static bool XhciUacEventHit(const XhciController& ctrl, const Trb& event);
+static void XhciUacEvent(const Trb& event);
+
+// Drain the shared event ring for IRQs and both HID input queues.
+static bool XhciHidRingHit(const XhciHidFn& fn, const Trb& event, uint32_t slot, uint32_t slotId)
 {
-    uint8_t mods = report[0];
-    uint8_t prevMods = g_prevReport[0];
-
-    // Build Brook modifier bitmask
-    uint8_t brookMods = 0;
-    if (mods & MOD_LEFT_SHIFT)  brookMods |= INPUT_MOD_LSHIFT;
-    if (mods & MOD_RIGHT_SHIFT) brookMods |= INPUT_MOD_RSHIFT;
-    if (mods & (MOD_LEFT_CTRL | MOD_RIGHT_CTRL)) brookMods |= INPUT_MOD_CTRL;
-    if (mods & (MOD_LEFT_ALT | MOD_RIGHT_ALT))   brookMods |= INPUT_MOD_ALT;
-    if (mods & (MOD_LEFT_GUI | MOD_RIGHT_GUI))   brookMods |= INPUT_MOD_SUPER;
-
-    // Check each modifier for press/release
-    struct { uint8_t mask; uint8_t sc; } modMap[] = {
-        { MOD_LEFT_CTRL,   29 },  // KEY_LEFTCTRL
-        { MOD_LEFT_SHIFT,  42 },  // KEY_LEFTSHIFT
-        { MOD_LEFT_ALT,    56 },  // KEY_LEFTALT
-        { MOD_RIGHT_CTRL,  97 },  // KEY_RIGHTCTRL
-        { MOD_RIGHT_SHIFT, 54 },  // KEY_RIGHTSHIFT
-        { MOD_RIGHT_ALT,   100 }, // KEY_RIGHTALT
-        { MOD_LEFT_GUI,    SC_LSUPER }, // KEY_LEFTMETA
-        { MOD_RIGHT_GUI,   SC_RSUPER }, // KEY_RIGHTMETA
-    };
-
-    for (auto& m : modMap) {
-        bool now  = (mods & m.mask) != 0;
-        bool prev = (prevMods & m.mask) != 0;
-        if (now != prev)
-            XhciPushKey(m.sc, now, brookMods);
-    }
-
-    // Regular keys (bytes 2-7): detect releases then presses
-    for (int i = 2; i < 8; i++) {
-        uint8_t key = g_prevReport[i];
-        if (key < 4 || key >= 128) continue;
-        bool found = false;
-        for (int j = 2; j < 8; j++)
-            if (report[j] == key) { found = true; break; }
-        if (!found) {
-            uint8_t sc = g_hidToScancode[key];
-            if (sc) XhciPushKey(sc, false, brookMods);
-        }
-    }
-
-    for (int i = 2; i < 8; i++) {
-        uint8_t key = report[i];
-        if (key < 4 || key >= 128) continue;
-        bool found = false;
-        for (int j = 2; j < 8; j++)
-            if (g_prevReport[j] == key) { found = true; break; }
-        if (!found) {
-            uint8_t sc = g_hidToScancode[key];
-            if (sc) XhciPushKey(sc, true, brookMods);
-        }
-    }
-
-    __builtin_memcpy(g_prevReport, report, 8);
-    InputWakeWaiters();
+    const uint32_t dci=(event.control>>16)&31;
+    return fn.ringPhys && event.param>=fn.ringPhys && event.param<fn.ringPhys+XFER_RING_SIZE*sizeof(Trb) &&
+           dci==fn.dci && slot==slotId;
 }
 
-// ---------------------------------------------------------------------------
-// Keyboard polling state
-// ---------------------------------------------------------------------------
+static void XhciQueueHidIn(XhciController& ctrl, XhciDevice& dev, XhciHidFn& fn);
 
-static uint64_t g_kbdReportBufPhys = 0;
-static uint32_t g_kbdDevIndex = 0;
-static uint64_t g_mouseReportBufPhys = 0;
-static uint32_t g_mouseDevIndex = 0;
-
-// Forward declarations — defined later in this file
-static int XhciMatchTransferEvent(const Trb& evt);
-static void XhciProcessMouseReport(const uint8_t* report);
-
-// Poll for USB keyboard events — called by the input subsystem.
-// In interrupt-driven mode (g_irqActive), the ISR handles reports
-// directly, so this is a no-op. In polling mode, it checks for events.
-
-// Unified event drain — processes all pending events on the event ring
-// and routes transfer completions to the correct device. Called from
-// both keyboard and mouse poll paths.
-static void XhciProcessMouseReport(const uint8_t* report);
-static void XhciPollDrainEvents()
+static void XhciDrainController(XhciController& ctrl,bool& wakeNetwork)
 {
-    if(!g_controllerCount)return;
-    auto& ctrl=g_controllers[0];if(!ctrl.initialized)return;
     const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
-    unsigned processed=0;bool wakeNetwork=false;
+    unsigned processed=0;
+    bool wakeInput=false;
     while(processed<EVT_RING_SIZE) {
         const auto& source=ctrl.evtRing[ctrl.evtDequeue];
         if(bool(source.control&TRB_CYCLE)!=ctrl.evtCycle)break;
@@ -2084,27 +1967,41 @@ static void XhciPollDrainEvents()
         const uint32_t type=event.control&TRB_TYPE_MASK;
         if(type!=TRB_TYPE_TRANSFER_EVENT && type!=TRB_TYPE_CMD_COMPLETION)continue;
         bool handled=false;
+        if(type==TRB_TYPE_TRANSFER_EVENT && XhciUacEventHit(ctrl,event)){XhciUacEvent(event);continue;}
         if(type==TRB_TYPE_TRANSFER_EVENT) {
-            const int index=XhciMatchTransferEvent(event);
+            const int index=XhciMatchTransferEvent(ctrl,event);
             if(index>=0) {
                 auto& dev=g_devices[index];
-                const uint32_t dci=(event.control>>16)&31,slot=event.control>>24;
+                const uint32_t slot=event.control>>24;
                 const uint32_t cc=event.status>>24;
-                const bool interrupt=dev.intRingPhys && event.param>=dev.intRingPhys &&
-                    event.param<dev.intRingPhys+XFER_RING_SIZE*sizeof(Trb) && dci==dev.intDci && slot==dev.slotId;
-                if(dev.network && XhciEcmCompletion(dev,event)){handled=true;wakeNetwork=true;}
-                if(interrupt && (dev.isKeyboard || dev.isMouse)) {
+                if(dev.network && !dev.gone && XhciEcmCompletion(dev,event)){handled=true;wakeNetwork=true;}
+                for(int which=0;which<2 && !handled;++which) {
+                    auto& fn=which?dev.mouse:dev.kbd;
+                    if(!XhciHidRingHit(fn,event,slot,dev.slotId))continue;
                     handled=true;
-                    if((cc==TRB_CC_SUCCESS || cc==TRB_CC_SHORT_PACKET) && dev.priv) {
-                        const uint32_t residue=event.status&0xffffff;
-                        if(dev.isKeyboard && !residue)XhciProcessKeyboardReport(static_cast<uint8_t*>(dev.priv));
-                        else if(dev.isMouse && residue<=1) {
-                            if(residue)static_cast<uint8_t*>(dev.priv)[3]=0;
-                            XhciProcessMouseReport(static_cast<uint8_t*>(dev.priv));
-                        }
-                        XhciQueueInterruptIn(ctrl,dev,dev.priv,dev.isKeyboard?g_kbdReportBufPhys:g_mouseReportBufPhys,dev.isKeyboard?8:4);
+                    if(!fn.active || dev.gone)break;
+                    if(cc!=TRB_CC_SUCCESS && cc!=TRB_CC_SHORT_PACKET) {
+                        fn.errorCc=static_cast<uint8_t>(cc);
+                        XhciEndHid(fn,!which);
+                        wakeInput=true;
+                        break;
                     }
+                    const uint32_t residue=event.status&0xffffff;
+                    const uint32_t bytes=residue<=fn.length?fn.length-residue:0;
+                    if(!which && bytes>=3) {
+                        for(uint32_t i=bytes;i<8;++i)fn.report[i]=0;
+                        g_bootKeyboard.Update(fn.report,fn.previous,XhciPushKey);
+                        wakeInput=true;
+                    } else if(which && bytes>=3) {
+                        if(bytes<4)fn.report[3]=0;
+                        XhciProcessMouseReport(fn.report,fn);
+                        __atomic_fetch_add(&g_mouseReports,1,__ATOMIC_RELAXED);
+                        wakeInput=true;
+                    }
+                    XhciQueueHidIn(ctrl,dev,fn);
                 }
+                // Completions for a disconnected device have no waiter.
+                if(!handled && dev.gone)handled=true;
             }
         }
         if(!handled && !ctrl.completions.Push(event))ctrl.completionFailed=true;
@@ -2117,6 +2014,20 @@ static void XhciPollDrainEvents()
         xhci_write32(ctrl.rtBase,XHCI_RT_IMAN,iman|1); // ack IP, preserve interrupt enable
     }
     IrqSpinLockRelease(&g_eventRingLock,saved);
+    if(wakeInput) {
+        CompositorWake();
+        InputWakeWaiters();
+    }
+}
+
+static void XhciPollDrainEvents()
+{
+    bool wakeNetwork=false;
+    const uint32_t count=__atomic_load_n(&g_controllerCount,__ATOMIC_ACQUIRE);
+    for(uint32_t c=0;c<count;++c) {
+        auto& ctrl=g_controllers[c];
+        if(__atomic_load_n(&ctrl.initialized,__ATOMIC_ACQUIRE))XhciDrainController(ctrl,wakeNetwork);
+    }
     if(wakeNetwork)NetWakePollThread();
 }
 
@@ -2135,57 +2046,75 @@ static void XhciKeyboardPoll(InputDevice* /*dev*/)
 // Byte 2: Y displacement (signed int8)
 
 MODULE_IMPORT_SYMBOL(MouseMoveRelative);
-MODULE_IMPORT_SYMBOL(MouseSetButtons);
-MODULE_IMPORT_SYMBOL(MouseSetAvailable);
+MODULE_IMPORT_SYMBOL(MouseSetUsbButtons);
+MODULE_IMPORT_SYMBOL(MouseSetUsbAvailable);
 
 extern "C" void MouseMoveRelative(int32_t dx, int32_t dy);
-extern "C" void MouseSetButtons(uint8_t buttons);
-extern "C" void MouseSetAvailable(bool available);
+extern "C" void MouseSetUsbButtons(uint8_t buttons);
+extern "C" void MouseSetUsbAvailable(bool available);
 
 static InputDevice g_usbMouseDev;
 static InputDeviceOps g_usbMouseOps = { "usb_mouse", nullptr };
 
-static void XhciProcessMouseReport(const uint8_t* report)
+static uint8_t g_usbButtons;
+static uint8_t g_usbButtonHolders[3];
+
+static void XhciProcessMouseReport(const uint8_t* report, XhciHidFn& fn)
 {
-    uint8_t buttons = report[0] & 0x07;
-    int8_t  dx = static_cast<int8_t>(report[1]);
-    int8_t  dy = static_cast<int8_t>(report[2]);
+    const uint8_t buttons = report[0] & 0x07;
+    const uint8_t previous = g_usbButtons;
+    for (unsigned bit = 0; bit < 3; ++bit) {
+        const uint8_t mask = 1u << bit;
+        if (!((buttons ^ fn.previous[0]) & mask)) continue;
+        if (buttons & mask) ++g_usbButtonHolders[bit];
+        else --g_usbButtonHolders[bit];
+        if (g_usbButtonHolders[bit]) g_usbButtons |= mask;
+        else g_usbButtons &= ~mask;
+    }
+    fn.previous[0] = buttons;
+    MouseSetUsbButtons(g_usbButtons);
 
-    // Update global mouse position via the kernel mouse API
-    if (dx != 0 || dy != 0) {
-        // Physical desktop gain is separate from the raw event payload.
+    const int8_t dx = static_cast<int8_t>(report[1]);
+    const int8_t dy = static_cast<int8_t>(report[2]);
+    const int8_t wheel = static_cast<int8_t>(report[3]);
+    if (dx || dy) {
         MouseMoveRelative(dx, dy);
-
         InputEvent ev{};
-        ev.type     = InputEventType::MouseRelativeMove;
+        ev.type = InputEventType::MouseRelativeMove;
+        ev.scanCode = g_usbButtons;
         ev.deltaX = dx;
         ev.deltaY = dy;
-        ev.scanCode = buttons;
-        ev.ascii    = 0;
-        ev.modifiers = 0;
         InputDevicePush(&g_usbMouseDev, ev);
     }
-
-    // Update buttons through the kernel mouse API
-    MouseSetButtons(buttons);
-
-    // Push button change events
-    static uint8_t prevButtons = 0;
-    for (int btn = 0; btn < 3; btn++) {
-        bool now  = (buttons & (1 << btn)) != 0;
-        bool prev = (prevButtons & (1 << btn)) != 0;
-        if (now != prev) {
-            InputEvent ev{};
-            ev.type = now ? InputEventType::MouseButtonDown : InputEventType::MouseButtonUp;
-            ev.scanCode = static_cast<uint8_t>(btn);
-            ev.ascii = 0;
-            ev.modifiers = 0;
-            InputDevicePush(&g_usbMouseDev, ev);
-        }
+    if (wheel) {
+        InputEvent ev{};
+        ev.type = InputEventType::MouseScroll;
+        ev.scanCode = static_cast<uint8_t>(wheel);
+        ev.modifiers = g_usbButtons;
+        ev.deltaY = int32_t(wheel) * 120;
+        InputDevicePush(&g_usbMouseDev, ev);
     }
-    prevButtons = buttons;
+    for (unsigned bit = 0; bit < 3; ++bit) {
+        const uint8_t mask = 1u << bit;
+        if (!((previous ^ g_usbButtons) & mask)) continue;
+        InputEvent ev{};
+        ev.type = (g_usbButtons & mask) ? InputEventType::MouseButtonDown : InputEventType::MouseButtonUp;
+        ev.scanCode = bit;
+        ev.modifiers = g_usbButtons;
+        InputDevicePush(&g_usbMouseDev, ev);
+    }
+}
 
-    InputWakeWaiters();
+static void XhciEndHid(XhciHidFn& fn, bool keyboard)
+{
+    if (!fn.active) return;
+    fn.active = false;
+    const uint8_t empty[8]{};
+    if (keyboard) g_bootKeyboard.Update(empty,fn.previous,XhciPushKey);
+    else {
+        XhciProcessMouseReport(empty,fn);
+        MouseSetUsbAvailable(--g_activeUsbMice != 0);
+    }
 }
 
 static void XhciMousePoll(InputDevice* /*dev*/)
@@ -2295,7 +2224,7 @@ static bool XhciEcmArmSlot(UsbEcmState& net,unsigned slot)
 {
     if(!net.rxCredits.CanArm(slot,net.rxDepth,net.tail-net.head))return false;
     const auto token=XhciEcmTrb(*net.device,true,net.rxPhysical+slot*ECM_RX_BYTES,ECM_RX_BYTES,false,false);
-    net.rxCredits.Arm(slot,token);
+    net.rxCredits.Arm(slot,token);++net.rxPosted;
     auto& head=net.device->bulkInRing[(token-net.device->bulkInRingPhys)/sizeof(Trb)];
     __atomic_fetch_xor(&head.control,TRB_CYCLE,__ATOMIC_RELEASE);
     return true;
@@ -2333,7 +2262,7 @@ static bool XhciEcmCompletion(XhciDevice& dev,const Trb& event){
     if(net.failed && (dci==dev.intDci || dci==dev.bulkInDci || dci==dev.bulkOutDci))return true;
     if(dci==dev.intDci){
         if(net.failed)return true;
-        if(event.param!=net.notificationToken || (cc!=TRB_CC_SUCCESS && cc!=TRB_CC_SHORT_PACKET) || residue>dev.ecm.notifyPacket){fail();return true;}
+        if(event.param!=net.notificationToken || (cc!=TRB_CC_SUCCESS && cc!=TRB_CC_SHORT_PACKET) || residue>dev.ecm.notifyPacket){++net.rxErrors;fail();return true;}
         const auto bytes=dev.ecm.notifyPacket-residue;
         if(net.notifications<16){
             const auto length=bytes<16?bytes:16;
@@ -2350,8 +2279,9 @@ static bool XhciEcmCompletion(XhciDevice& dev,const Trb& event){
     }
     if(dci==dev.bulkInDci){
         if(net.failed)return true;
+        ++net.rxCompletions;
         const int rxSlot=net.rxCredits.CompletedSlot(event.param,cc,residue);
-        if(rxSlot<0){fail();return true;}
+        if(rxSlot<0){++net.rxErrors;fail();return true;}
         net.rxCredits.Complete(static_cast<unsigned>(rxSlot));
         const unsigned bytes=ECM_RX_BYTES-residue;
         if(bytes>=14 && bytes<=1514){
@@ -2368,7 +2298,7 @@ static bool XhciEcmCompletion(XhciDevice& dev,const Trb& event){
     if(dci==dev.bulkOutDci){
         auto result=net.sends.Complete(event.param,cc,residue);
         if(result==UsbEcmTxSlots::Result::Finished)++net.transmitted;
-        else if(result!=UsbEcmTxSlots::Result::Intermediate)fail();
+        else if(result!=UsbEcmTxSlots::Result::Intermediate){++net.txErrors;fail();}
         return true;
     }
     return false;
@@ -2390,7 +2320,7 @@ static int XhciEcmTransmitImpl(NetIf* nif,const void* frame,uint32_t bytes,bool 
         // Termination needs its own zero-length TD and completion ownership.
         const auto first=XhciEcmTrb(dev,false,physical,bytes,false,!terminate);
         const auto final=terminate?XhciEcmTrb(dev,false,physical,0,false):first;
-        net.sends.Reserve(i,first,final);
+        net.sends.Reserve(i,first,final);++net.txSubmitted;
         if(terminate){
             auto& head=dev.bulkOutRing[(first-dev.bulkOutRingPhys)/sizeof(Trb)];
             __atomic_fetch_xor(&head.control,TRB_CYCLE,__ATOMIC_RELEASE);
@@ -2414,7 +2344,9 @@ static bool XhciEcmSnapshot(NetIf* nif,NetDriverSnapshot* out){
     *out={net.received,net.transmitted,net.dropped,net.txBusy,
           net.rxPressure.entries,net.rxPressure.zeroEntries,net.rxDispatchBusy,net.rxDepth,
           net.rxCredits.outstanding,net.tail-net.head,net.queueHighWater,net.txDepth,
-          net.failed || net.controller->completionFailed};
+          net.failed || net.controller->completionFailed,
+          net.rxPosted,net.rxCompletions,net.rxErrors,net.txSubmitted,net.txErrors,net.notifications,
+          net.faultStatus,net.faultDci,net.linkKnown,net.linkUp};
     IrqSpinLockRelease(&g_eventRingLock,saved);return true;
 }
 static void XhciEcmPoll(NetIf* nif){
@@ -2919,6 +2851,8 @@ struct UsbMscState {
     uint8_t* bounce;
     uint64_t bouncePhys;
     char name[16];
+    // Boot-stick update window (DEVICE_IOCTL_WRITE_WINDOW); zero length = closed.
+    uint64_t windowStart, windowLength;
 };
 
 static const BlockDeviceOps g_usbMscOps = {
@@ -2961,19 +2895,38 @@ static int UsbMscRead(Device* dev,uint64_t offset,void* buf,uint64_t len) {
     if(!io.usable())return -5;
     return UsbBlockReadBytes(io,offset,buf,len);
 }
+static bool UsbMscWindowAdmits(const UsbMscState* st,uint64_t offset,uint64_t len) {
+    const uint64_t start=__atomic_load_n(&st->windowStart,__ATOMIC_ACQUIRE);
+    const uint64_t length=__atomic_load_n(&st->windowLength,__ATOMIC_ACQUIRE);
+    return length && len && offset>=start && len<=length && offset-start<=length-len;
+}
 static int UsbMscWrite(Device* dev,uint64_t offset,const void* buf,uint64_t len) {
-    if(g_storageReadOnly)return -30;
+    if(g_storageReadOnly && !UsbMscWindowAdmits(static_cast<UsbMscState*>(dev->priv),offset,len))return -30;
     MscIoGuard guard;
     UsbMscByteTransport io{static_cast<UsbMscState*>(dev->priv)};
     if(!io.usable())return -5;
     return UsbBlockWriteBytes(io,offset,buf,len);
 }
 
-static int UsbMscIoctl(Device* dev, uint32_t cmd, void* /*arg*/)
+static int UsbMscIoctl(Device* dev, uint32_t cmd, void* arg)
 {
     if (cmd == DEVICE_IOCTL_READ_ONLY) return g_storageReadOnly ? 1 : 0;
+    if (cmd == DEVICE_IOCTL_WRITE_WINDOW) {
+        // Only meaningful under the read-only policy; the kernel gate is the
+        // sole caller and has already proven this is the boot stick.
+        auto* st = static_cast<UsbMscState*>(dev->priv);
+        const auto* w = static_cast<const DeviceWriteWindow*>(arg);
+        if (!g_storageReadOnly || !w) return -22;
+        const uint64_t bytes = uint64_t(g_devices[st->devIndex].mscSectorCount) * g_devices[st->devIndex].mscBlockSize;
+        if (w->length && (w->start > bytes || w->length > bytes - w->start)) return -22;
+        __atomic_store_n(&st->windowLength, uint64_t{0}, __ATOMIC_RELEASE);
+        __atomic_store_n(&st->windowStart, w->start, __ATOMIC_RELEASE);
+        __atomic_store_n(&st->windowLength, w->length, __ATOMIC_RELEASE);
+        KPrintf("xhci: %s write window %s\n", st->name, w->length ? "open (boot-stick update)" : "closed");
+        return 0;
+    }
     if (cmd != DEVICE_IOCTL_FLUSH) return -95;
-    if(g_storageReadOnly)return 0;
+    if(g_storageReadOnly && !__atomic_load_n(&static_cast<UsbMscState*>(dev->priv)->windowLength,__ATOMIC_ACQUIRE))return 0;
     MscIoGuard ioGuard;
     MscCommandGuard commandGuard;
     auto* st = static_cast<UsbMscState*>(dev->priv);
@@ -3062,6 +3015,7 @@ static bool XhciInitMassStorage(XhciController& ctrl, XhciDevice& dev,
     if (!state) return false;
     state->ctrl = &ctrl;
     state->devIndex = devIndex;
+    state->windowStart = state->windowLength = 0;
     state->bounce=static_cast<uint8_t*>(AllocDmaBuffer(16,state->bouncePhys));
     if(!state->bounce){kfree(state);return false;}
 
@@ -3090,157 +3044,693 @@ static bool XhciInitMassStorage(XhciController& ctrl, XhciDevice& dev,
 }
 
 // ---------------------------------------------------------------------------
-// Phase 3+4+5+6 combined: enumerate and configure a connected port
+// Topology: enumeration, hubs, root ports, hotplug and the status text
 // ---------------------------------------------------------------------------
 
-static void XhciEnumeratePort(XhciController& ctrl, uint32_t portNum,
-                               uint32_t portSpeed)
+static bool g_threadContext = false; // true on the hotplug worker (may sleep)
+
+static void XhciDelayMs(uint32_t ms)
 {
-    if (g_deviceCount >= MAX_DEVICES) {
-        SerialPuts("xhci: max devices reached\n");
-        return;
-    }
-
-    // Enable a slot
-    int slotId = XhciEnableSlot(ctrl);
-    if (slotId < 0) return;
-
-    XhciDevice& dev = g_devices[g_deviceCount];
-    dev = {}; // zero-init
-    dev.slotId = static_cast<uint32_t>(slotId);
-    dev.portNum = portNum;
-    dev.portSpeed = portSpeed;
-    dev.ep0Cycle = true;
-    dev.intCycle = true;
-
-    // Address device
-    if (!XhciAddressDevice(ctrl, dev)) return;
-
-    // Get device descriptor
-    if (!XhciGetDeviceDescriptor(ctrl, dev)) return;
-
-    // Get config descriptor, parse interfaces, SET_CONFIGURATION
-    if (!XhciConfigureDevice(ctrl, dev)) return;
-
-    g_deviceCount++;
-
-    // If it's a HID keyboard, set boot protocol and start polling
-    if (dev.isKeyboard && dev.interruptEpAddr) {
-        SerialPrintf("xhci: USB keyboard detected on port %u (slot %u)\n",
-                     portNum, dev.slotId);
-
-        XhciSetBootProtocol(ctrl, dev);
-
-        if (XhciConfigureInterruptEndpoint(ctrl, dev)) {
-            SerialPuts("xhci: keyboard interrupt endpoint ready\n");
-        }
-    }
-
-    if (dev.isMouse && dev.interruptEpAddr) {
-        SerialPrintf("xhci: USB mouse detected on port %u (slot %u)\n",
-                     portNum, dev.slotId);
-
-        XhciSetBootProtocol(ctrl, dev);
-
-        if (XhciConfigureInterruptEndpoint(ctrl, dev)) {
-            SerialPuts("xhci: mouse interrupt endpoint ready\n");
-            g_mousePresent = true;
-        }
-    }
-
-    // If it's a mass storage device, initialize SCSI and register block device
-    if(dev.ecm.value)XhciInitEcm(ctrl,dev);
-    if (dev.isMassStorage && dev.bulkInAddr && dev.bulkOutAddr) {
-        SerialPrintf("xhci: USB mass storage detected on port %u (slot %u)\n",
-                     portNum, dev.slotId);
-        XhciInitMassStorage(ctrl, dev, g_deviceCount - 1);
-    }
-
-    // If it's a hub, initialize and enumerate downstream devices
-    if (dev.isHub) {
-        SerialPrintf("xhci: USB hub detected on port %u (slot %u)\n",
-                     portNum, dev.slotId);
-        dev.hubTier = 0; // directly on root hub
-        if (XhciHubInit(ctrl, dev)) {
-            XhciHubPollPorts(ctrl, dev);
-        }
-    }
+    if (g_threadContext) { SchedulerSleepMs(ms); return; }
+    const uint64_t start = ApicTickCount();
+    while (ApicTickCount() - start < ms) __asm__ volatile("pause");
 }
 
-// ---------------------------------------------------------------------------
-// Port scanning with device enumeration
-// ---------------------------------------------------------------------------
-
-static void XhciScanPorts(XhciController& ctrl)
+static void XhciPathText(const XhciDevice& dev, char* out, uint32_t cap)
 {
-    KPrintf("xhci: scanning %u root ports (PCI %x:%x)...\n",ctrl.maxPorts,
-        ctrl.pciDev.vendorId,ctrl.pciDev.deviceId);
-    // Firmware is no longer responsible for powering the root hub. Power all
-    // ports first, then allow connection/debounce/link training to settle once.
-    for(uint32_t port=0;port<ctrl.maxPorts;++port) {
-        const auto offset=XHCI_OP_PORTSC_BASE+port*0x10;
-        const auto state=xhci_read32(ctrl.opBase,offset);
-        KPrintf("xhci: port %u before power PORTSC=0x%08x\n",port+1,state);
-        if(state==0xffffffffu){KPuts("xhci: root port registers inaccessible\n");return;}
-        if(!(state&PORTSC_PP)) {
-            xhci_write32(ctrl.opBase,offset,XhciPortPersistent(state)|PORTSC_PP);
-            (void)xhci_read32(ctrl.opBase,offset); // flush posted MMIO write
+    // Root port first, then each hub port: "3", "3.2", "3.2.4".
+    uint8_t ports[UsbMaxRouteDepth + 1]; uint32_t n = 0;
+    const XhciDevice* cur = &dev;
+    while (cur && n <= UsbMaxRouteDepth) {
+        ports[n++] = cur->parent ? cur->parentPort : static_cast<uint8_t>(cur->topo.rootPort);
+        cur = cur->parent ? &g_devices[cur->parent - 1] : nullptr;
+    }
+    uint32_t len = 0;
+    for (uint32_t i = n; i-- > 0;) {
+        if (len + 5 >= cap) break;
+        uint32_t v = ports[i];
+        if (v >= 100) out[len++] = char('0' + v / 100);
+        if (v >= 10) out[len++] = char('0' + (v / 10) % 10);
+        out[len++] = char('0' + v % 10);
+        if (i) out[len++] = '.';
+    }
+    out[len] = 0;
+}
+
+static const char* XhciDeviceKind(const XhciDevice& dev)
+{
+    if (dev.isHub) return "hub";
+    if (dev.network || dev.ecm.value) return "net";
+    if (dev.isKeyboard && dev.isMouse) return "kbd+mouse";
+    if (dev.isKeyboard) return "kbd";
+    if (dev.isMouse) return "mouse";
+    if (dev.isMassStorage) return "storage";
+    return "device";
+}
+
+static void XhciDeviceGone(uint32_t index)
+{
+    auto& dev = g_devices[index];
+    if (dev.gone) return;
+    if (dev.isHub) {
+        for (uint32_t p = 0; p < dev.hubPortCount; ++p) {
+            if (dev.hubChild[p]) XhciDeviceGone(dev.hubChild[p] - 1u);
+            dev.hubChild[p] = 0;
         }
     }
-    const auto settle=ApicTickCount();
-    while(ApicTickCount()-settle<250)__asm__ volatile("pause");
+    const auto saved = IrqSpinLockAcquire(&g_eventRingLock);
+    dev.gone = true;
+    const bool hadHid = dev.kbd.active || dev.mouse.active;
+    XhciEndHid(dev.kbd,true);
+    XhciEndHid(dev.mouse,false);
+    if (dev.network) dev.network->failed = true;
+    IrqSpinLockRelease(&g_eventRingLock, saved);
+    if (hadHid) {
+        CompositorWake();
+        InputWakeWaiters();
+    }
+    char path[24]; XhciPathText(dev, path, sizeof(path));
+    KPrintf("xhci: c%u p%s %s %04x:%04x disconnected (slot %u)\n", dev.ctrl->index, path,
+            XhciDeviceKind(dev), dev.vendorId, dev.productId, dev.slotId);
+    XhciDisableSlot(*dev.ctrl, dev.slotId);
+}
 
-    for (uint32_t port = 0; port < ctrl.maxPorts; port++) {
-        uint32_t portsc = xhci_read32(ctrl.opBase,
-                                       XHCI_OP_PORTSC_BASE + port * 0x10);
+// ---- HID ------------------------------------------------------------------
 
-        bool connected = (portsc & PORTSC_CCS) != 0;
-        bool enabled   = (portsc & PORTSC_PED) != 0;
-        bool powered   = (portsc & PORTSC_PP) != 0;
-        uint32_t speed = (portsc >> 10) & 0xF;
+static void XhciKeyboardPoll(InputDevice* /*dev*/);
+static void XhciMousePoll(InputDevice* /*dev*/);
+static bool g_kbdRegistered = false, g_mouseRegistered = false;
 
-        KPrintf("xhci: port %u: %s %s %s speed=%s (PORTSC=0x%08x)\n",
-                     port + 1,
-                     connected ? "CONNECTED" : "disconnected",
-                     enabled ? "enabled" : "disabled",
-                     powered ? "powered" : "unpowered",
-                     XhciSpeedString(speed),
-                     portsc);
+static void XhciQueueHidIn(XhciController& ctrl, XhciDevice& dev, XhciHidFn& fn)
+{
+    uint32_t idx = fn.enqueue;
+    if (idx >= XFER_RING_SIZE - 1) {
+        fn.ring[XFER_RING_SIZE - 1].control = TRB_TYPE_LINK | TRB_TC | (fn.cycle ? TRB_CYCLE : 0);
+        fn.cycle = !fn.cycle;
+        idx = 0;
+    }
+    Trb& trb = fn.ring[idx];
+    trb.param = fn.reportPhys;
+    trb.status = fn.length;
+    trb.control = TRB_TYPE_NORMAL | TRB_IOC | TRB_ISP | (fn.cycle ? TRB_CYCLE : 0);
+    fn.enqueue = idx + 1;
+    __asm__ volatile("mfence" ::: "memory");
+    XhciRingDoorbell(ctrl, dev.slotId, fn.dci);
+}
 
-        if (connected && enabled) {
-            // USB 3.0 (SuperSpeed) ports are auto-enabled — enumerate directly
-            SerialPrintf("xhci: port %u already enabled, enumerating\n", port + 1);
-            XhciEnumeratePort(ctrl, port + 1, speed);
+static bool XhciStartHid(XhciController& ctrl, XhciDevice& dev, XhciHidFn& fn, bool keyboard)
+{
+    XhciSetBootProtocol(ctrl, dev, fn.iface); // a stall here is recovered; keep going
+    if (!XhciConfigureIntIn(ctrl, dev, fn.ep, fn.packet, fn.interval, fn.ring, fn.ringPhys,
+                            fn.enqueue, fn.cycle, fn.dci)) return false;
+    fn.report = static_cast<uint8_t*>(AllocDmaBuffer(1, fn.reportPhys));
+    if (!fn.report) return false;
+    const uint32_t packet = fn.packet & 0x7ffu;
+    fn.length = keyboard ? 8u : (packet < 8 ? packet : 8u);
+    if (keyboard && !g_kbdRegistered) {
+        g_usbKbdOps.poll = XhciKeyboardPoll;
+        g_usbKbdDev.ops = &g_usbKbdOps;
+        g_usbKbdDev.head = 0;
+        g_usbKbdDev.tail = 0;
+        if (!InputRegister(&g_usbKbdDev)) return false;
+        g_kbdRegistered = true;
+        SerialPuts("xhci: USB keyboard registered as input device\n");
+    }
+    if (!keyboard && !g_mouseRegistered) {
+        g_usbMouseOps.poll = XhciMousePoll;
+        g_usbMouseDev.ops = &g_usbMouseOps;
+        g_usbMouseDev.head = 0;
+        g_usbMouseDev.tail = 0;
+        if (!InputRegister(&g_usbMouseDev)) return false;
+        g_mouseRegistered = true;
+        SerialPuts("xhci: USB mouse registered as input device\n");
+    }
+    const auto saved = IrqSpinLockAcquire(&g_eventRingLock);
+    fn.active = true;
+    if (!keyboard && ++g_activeUsbMice == 1) MouseSetUsbAvailable(true);
+    XhciQueueHidIn(ctrl, dev, fn);
+    IrqSpinLockRelease(&g_eventRingLock, saved);
+    return true;
+}
+
+// ---- Enumeration ----------------------------------------------------------
+
+struct XhciEnumResult { const char* stage; uint8_t cc; };
+static bool XhciHubSetup(XhciController& ctrl, uint32_t index);
+static bool XhciHubScan(XhciController& ctrl, uint32_t index, bool initial);
+
+// Enumerate one device on a root port (parent < 0) or a hub port. Returns the
+// device index, or -1 with the failing stage in 'result'.
+static int XhciEnumerate(XhciController& ctrl, int parent, uint8_t port, uint32_t speed,
+                         XhciEnumResult& result)
+{
+    result = {nullptr, 0};
+    if (g_deviceCount >= MAX_DEVICES) { result.stage = "device table full"; return -1; }
+    if (speed < UsbSpeedFull || speed > UsbSpeedSuperPlus) { result.stage = "unknown speed"; return -1; }
+    UsbTopology topo;
+    if (parent < 0) topo = UsbRootTopology(port, speed);
+    else {
+        const auto& hub = g_devices[parent];
+        if (!UsbChildTopology(hub.topo, static_cast<uint8_t>(hub.slotId), hub.hubMulti, port, speed, topo)) {
+            result.stage = "hub tier limit"; return -1;
         }
-        else if (connected && !enabled) {
-            if(speed>=4) {
-                KPrintf("xhci: port %u disabled SuperSpeed link PLS=%u; warm recovery not attempted\n",port+1,(portsc>>5)&15);
-                continue;
-            }
-            // Reset the port to enable it
-            SerialPrintf("xhci: resetting port %u...\n", port + 1);
+    }
+    const int slot = XhciEnableSlot(ctrl);
+    if (slot < 0) { result.stage = "enable slot"; return -1; }
 
+    const uint32_t index = g_deviceCount;
+    XhciDevice& dev = g_devices[index];
+    dev = {};
+    dev.ctrl = &ctrl;
+    dev.slotId = static_cast<uint32_t>(slot);
+    dev.portNum = topo.rootPort;
+    dev.portSpeed = speed;
+    dev.topo = topo;
+    dev.parent = static_cast<uint8_t>(parent + 1);
+    dev.parentPort = port;
+    dev.ep0Cycle = true;
+    dev.intCycle = true;
+    dev.scratch = static_cast<uint8_t*>(AllocDmaBuffer(1, dev.scratchPhys));
+
+    const char* stage = nullptr;
+    if (!dev.scratch) stage = "scratch allocation";
+    else if (!XhciAddressDevice(ctrl, dev)) stage = "address device";
+    else if (!XhciGetDeviceDescriptor(ctrl, dev)) stage = "device descriptor";
+    else if (!XhciConfigureDevice(ctrl, dev)) stage = "configuration";
+    if (stage) {
+        result.stage = stage; result.cc = dev.lastCc;
+        XhciDisableSlot(ctrl, dev.slotId);
+        dev.slotId = 0;
+        return -1;
+    }
+    __atomic_store_n(&g_deviceCount, index + 1, __ATOMIC_RELEASE);
+
+    char path[24]; XhciPathText(dev, path, sizeof(path));
+    KPrintf("xhci: c%u p%s %s %04x:%04x %s (slot %u)\n", ctrl.index, path, UsbSpeedName(speed),
+            dev.vendorId, dev.productId, XhciDeviceKind(dev), dev.slotId);
+
+    if (dev.isKeyboard && !XhciStartHid(ctrl, dev, dev.kbd, true)) dev.note = "keyboard setup failed";
+    if (dev.isMouse && !XhciStartHid(ctrl, dev, dev.mouse, false)) dev.note = "mouse setup failed";
+    if (dev.ecm.value && !XhciInitEcm(ctrl, dev)) dev.note = "ECM setup failed";
+    if (dev.isMassStorage && dev.bulkInAddr && dev.bulkOutAddr &&
+        !XhciInitMassStorage(ctrl, dev, index)) dev.note = "storage setup failed";
+    if (dev.isHub && XhciHubSetup(ctrl, index)) XhciHubScan(ctrl, index, true);
+    return static_cast<int>(index);
+}
+
+// ---- Hubs -------------------------------------------------------------------
+
+static bool XhciHubRequest(XhciController& ctrl, XhciDevice& hub, uint8_t type, uint8_t request,
+                           uint16_t value, uint16_t index)
+{
+    UsbSetupPacket setup{};
+    setup.bmRequestType = type; setup.bRequest = request; setup.wValue = value; setup.wIndex = index;
+    return XhciControlTransfer(ctrl, hub, setup, nullptr, 0, 0, 0);
+}
+
+static bool XhciHubPortStatus(XhciController& ctrl, XhciDevice& hub, uint8_t port,
+                              uint16_t& status, uint16_t& change)
+{
+    UsbSetupPacket setup{};
+    setup.bmRequestType = 0xA3; setup.bRequest = USB_HUB_REQ_GET_STATUS; setup.wIndex = port; setup.wLength = 4;
+    if (!XhciControlTransfer(ctrl, hub, setup, hub.scratch, 4, hub.scratchPhys, 3)) return false;
+    status = static_cast<uint16_t>(hub.scratch[0] | (hub.scratch[1] << 8));
+    change = static_cast<uint16_t>(hub.scratch[2] | (hub.scratch[3] << 8));
+    return true;
+}
+
+static void XhciHubAck(XhciController& ctrl, XhciDevice& hub, uint8_t port, uint16_t change)
+{
+    uint16_t features[8];
+    const uint32_t n = UsbHubChangeFeatures(change, hub.hubSuper, features, 8);
+    for (uint32_t i = 0; i < n; ++i)
+        XhciHubRequest(ctrl, hub, 0x23, USB_HUB_REQ_CLEAR_FEATURE, features[i], port);
+}
+
+// Reset one hub port and wait for C_PORT_RESET (or C_BH_PORT_RESET).
+static bool XhciHubPortReset(XhciController& ctrl, XhciDevice& hub, uint8_t port, bool warm,
+                             uint16_t& status)
+{
+    if (!XhciHubRequest(ctrl, hub, 0x23, USB_HUB_REQ_SET_FEATURE,
+                        warm ? UsbHubFeatBhPortReset : UsbHubFeatPortReset, port)) return false;
+    const uint16_t done = warm ? 0x20 : 0x10;
+    for (uint32_t waited = 0; waited < 1000; waited += 10) {
+        XhciDelayMs(10);
+        uint16_t change = 0;
+        if (!XhciHubPortStatus(ctrl, hub, port, status, change)) return false;
+        if ((change & done) && !(status & 0x10)) {
+            XhciHubAck(ctrl, hub, port, change);
+            return XhciHubPortStatus(ctrl, hub, port, status, change);
+        }
+    }
+    return false;
+}
+
+static bool XhciHubSetup(XhciController& ctrl, uint32_t index)
+{
+    auto& hub = g_devices[index];
+    hub.hubSuper = UsbSpeedIsSuper(hub.portSpeed);
+    if (hub.topo.depth >= UsbMaxRouteDepth) { hub.note = "hub beyond tier limit"; return false; }
+    // USB 3.2 §10.16.2.9: a SuperSpeed hub must learn its depth first.
+    if (hub.hubSuper && !XhciHubRequest(ctrl, hub, 0x20, 12 /* SET_HUB_DEPTH */, hub.topo.depth, 0)) {
+        hub.note = "SET_HUB_DEPTH failed"; return false;
+    }
+    UsbSetupPacket setup{};
+    setup.bmRequestType = 0xA0; setup.bRequest = USB_HUB_REQ_GET_DESCRIPTOR;
+    setup.wValue = static_cast<uint16_t>((hub.hubSuper ? USB_DESC_HUB_USB3 : USB_DESC_HUB_USB2) << 8);
+    setup.wLength = 16;
+    uint32_t got = 0;
+    if (!XhciControlTransfer(ctrl, hub, setup, hub.scratch, 16, hub.scratchPhys, 3, &got) || got < 7) {
+        hub.note = "hub descriptor failed"; return false;
+    }
+    uint8_t ports = hub.scratch[2];
+    const uint16_t characteristics = static_cast<uint16_t>(hub.scratch[3] | (hub.scratch[4] << 8));
+    const uint32_t powerDelay = hub.scratch[5] * 2u;
+    if (!ports) { hub.note = "hub reports no ports"; return false; }
+    if (ports > XHCI_HUB_MAX_PORTS) ports = XHCI_HUB_MAX_PORTS;
+    hub.hubPortCount = ports;
+    hub.hubThink = static_cast<uint8_t>((characteristics >> 5) & 3u);
+    hub.hubMulti = false; // interface alternate 0 runs single-TT
+
+    // Mark the slot as a hub (Hub, Number of Ports, TTT) so the xHC can
+    // address and schedule devices behind it (xHCI 1.2 §4.6.6/§6.2.2).
+    const uint32_t ctxSize = CtxEntrySize(ctrl);
+    auto* input = static_cast<uint8_t*>(hub.inputCtx);
+    const auto* out = reinterpret_cast<const uint32_t*>(hub.outputCtx);
+    memset(input, 0, ctxSize * 33);
+    reinterpret_cast<uint32_t*>(input)[1] = 1u; // A0: slot
+    uint32_t entries = (out[0] >> 27) & 31u;
+    if (!entries) entries = 1;
+    const auto words = UsbSlotContext(hub.topo, entries, true, ports, hub.hubThink, hub.hubMulti);
+    auto* slot = reinterpret_cast<uint32_t*>(input + ctxSize);
+    slot[0] = words.dw0; slot[1] = words.dw1; slot[2] = words.dw2; slot[3] = 0; // dw3 is xHC-owned
+    __asm__ volatile("mfence" ::: "memory");
+    // Hub, MTT, Number of Ports and TTT are evaluated by Configure Endpoint
+    // with A0 (xHCI 1.2 §4.6.6, §6.2.2.2); Evaluate Context only on 0.95
+    // hosts (as Linux xhci_update_hub_device). Fall back to the other one.
+    const uint32_t firstCommand = ctrl.hciVersion > 0x95 ? TRB_TYPE_CONFIG_EP : TRB_TYPE_EVAL_CTX;
+    const uint32_t otherCommand = ctrl.hciVersion > 0x95 ? TRB_TYPE_EVAL_CTX : TRB_TYPE_CONFIG_EP;
+    uint32_t cc = XhciSlotCommand(ctrl, hub.inputCtxPhys, firstCommand | (hub.slotId << 24), 2000);
+    if (cc != TRB_CC_SUCCESS) {
+        const uint32_t first = cc;
+        cc = XhciSlotCommand(ctrl, hub.inputCtxPhys, otherCommand | (hub.slotId << 24), 2000);
+        if (cc != TRB_CC_SUCCESS) {
+            SerialPrintf("xhci: hub slot %u context update failed cc=%u/%u\n", hub.slotId, first, cc);
+            hub.note = "hub slot context not accepted";
+        }
+    }
+
+    for (uint8_t p = 1; p <= ports; ++p)
+        XhciHubRequest(ctrl, hub, 0x23, USB_HUB_REQ_SET_FEATURE, UsbHubFeatPortPower, p);
+    // Power-on to power-good, then the 100 ms connect debounce.
+    XhciDelayMs((powerDelay > 100 ? powerDelay : 100) + 100);
+    hub.hubReady = true;
+    SerialPrintf("xhci: hub slot %u %s %u ports think=%u ready\n", hub.slotId,
+                 hub.hubSuper ? "SuperSpeed" : "USB2", ports, hub.hubThink);
+    return true;
+}
+
+static const char* const kHubPortStatusFailed = "port status failed";
+static bool XhciHubScan(XhciController& ctrl, uint32_t index, bool initial)
+{
+    auto& hub = g_devices[index];
+    if (!hub.hubReady || hub.gone || hub.controlQuarantined) return false;
+    bool changed = false;
+    for (uint8_t p = 1; p <= hub.hubPortCount; ++p) {
+        const uint32_t i = p - 1u;
+        uint16_t status = 0, change = 0;
+        if (!XhciHubPortStatus(ctrl, hub, p, status, change)) {
+            if (hub.hubError[i] != kHubPortStatusFailed) changed = true;
+            hub.hubError[i] = kHubPortStatusFailed;
+            if (hub.controlQuarantined) { hub.note = "hub control endpoint failed"; return true; }
+            continue;
+        }
+        if (change) XhciHubAck(ctrl, hub, p, change);
+        hub.hubPortStatus[i] = status;
+        auto state = UsbHubDecodePort(status, hub.hubSuper);
+        if (hub.hubChild[i] && (!state.connected || (change & 1u))) {
+            XhciDeviceGone(hub.hubChild[i] - 1u);
+            hub.hubChild[i] = 0; changed = true;
+        }
+        if (!state.connected) {
+            if (hub.hubError[i] || hub.hubTries[i]) changed = true;
+            hub.hubError[i] = nullptr; hub.hubTries[i] = 0; hub.hubCc[i] = 0;
+            continue;
+        }
+        if (hub.hubChild[i] || hub.hubTries[i] >= 3) continue;
+        ++hub.hubTries[i]; changed = true;
+        if (!initial && (change & 1u)) XhciDelayMs(100); // connect debounce
+        // A SuperSpeed hub port may still be training; give it ~1 s.
+        for (uint32_t waited = 0; hub.hubSuper && !state.enabled && waited < 1000 &&
+             (state.linkState == 5 || state.linkState == 7 || state.linkState == 8 || state.linkState == 9);
+             waited += 50) {
+            XhciDelayMs(50);
+            uint16_t again = 0;
+            if (!XhciHubPortStatus(ctrl, hub, p, status, again)) break;
+            if (again) XhciHubAck(ctrl, hub, p, again);
+            state = UsbHubDecodePort(status, hub.hubSuper);
+        }
+        hub.hubPortStatus[i] = status;
+        const bool warm = hub.hubSuper && (state.linkState == 6 || state.linkState == 10);
+        if (!hub.hubSuper || !state.enabled || warm) {
+            if (!XhciHubPortReset(ctrl, hub, p, warm, status)) {
+                hub.hubError[i] = "port reset failed"; continue;
+            }
+            hub.hubPortStatus[i] = status;
+            state = UsbHubDecodePort(status, hub.hubSuper);
+        }
+        if (!state.connected || !state.enabled) { hub.hubError[i] = "not enabled after reset"; continue; }
+        XhciDelayMs(10); // reset recovery (USB 2.0 §7.1.7.5)
+        XhciEnumResult result;
+        const int child = XhciEnumerate(ctrl, static_cast<int>(index), p, state.speed, result);
+        if (child >= 0) {
+            hub.hubChild[i] = static_cast<uint8_t>(child + 1);
+            hub.hubError[i] = nullptr; hub.hubTries[i] = 0; hub.hubCc[i] = 0;
+        } else {
+            hub.hubError[i] = result.stage; hub.hubCc[i] = result.cc;
+            KPrintf("xhci: c%u hub slot %u port %u: %s failed cc=%u (try %u/3)\n", ctrl.index,
+                    hub.slotId, p, result.stage, result.cc, hub.hubTries[i]);
+        }
+    }
+    return changed;
+}
+
+// ---- Root ports ---------------------------------------------------------------
+
+static constexpr uint32_t PORTSC_WRC = 1u << 19;
+static constexpr uint32_t PORTSC_WPR = 1u << 31;
+static constexpr uint32_t PORTSC_CHANGES = (1u << 17) | (1u << 18) | (1u << 19) | (1u << 20) |
+                                           (1u << 21) | (1u << 22) | (1u << 23);
+
+static uint32_t XhciPortRead(XhciController& ctrl, uint32_t port0)
+{
+    return xhci_read32(ctrl.opBase, XHCI_OP_PORTSC_BASE + port0 * 0x10);
+}
+static void XhciPortWrite(XhciController& ctrl, uint32_t port0, uint32_t value)
+{
+    xhci_write32(ctrl.opBase, XHCI_OP_PORTSC_BASE + port0 * 0x10, value);
+}
+
+static bool XhciWarmResetRootPort(XhciController& ctrl, uint32_t port0)
+{
+    const uint32_t before = XhciPortRead(ctrl, port0);
+    if (before == 0xffffffffu) return false;
+    XhciPortWrite(ctrl, port0, XhciPortPersistent(before) | PORTSC_WPR);
+    for (uint32_t waited = 0; waited < 1000; waited += 5) {
+        XhciDelayMs(5);
+        const uint32_t state = XhciPortRead(ctrl, port0);
+        if (state == 0xffffffffu) return false;
+        if ((state & (PORTSC_WRC | PORTSC_PRC)) && !(state & PORTSC_PR)) {
+            XhciPortWrite(ctrl, port0, XhciPortPersistent(state) | (state & (PORTSC_WRC | PORTSC_PRC)));
+            const uint32_t after = XhciPortRead(ctrl, port0);
+            return (after & (PORTSC_CCS | PORTSC_PED)) == (PORTSC_CCS | PORTSC_PED);
+        }
+    }
+    return false;
+}
+
+static bool XhciPortIsUsb3(const XhciController& ctrl, uint32_t port0, uint32_t portsc)
+{
+    if (port0 < XHCI_MAX_ROOT_PORTS && ctrl.portMajor[port0]) return ctrl.portMajor[port0] >= 3;
+    return ((portsc >> 10) & 15u) >= UsbSpeedSuper;
+}
+
+// One pass over the root ports. Returns true when the topology or a port's
+// error changed. 'waiting' reports ports still training.
+static bool XhciRootScan(XhciController& ctrl, bool initial, bool* waiting = nullptr)
+{
+    bool changed = false;
+    const uint32_t ports = ctrl.maxPorts < XHCI_MAX_ROOT_PORTS ? ctrl.maxPorts : XHCI_MAX_ROOT_PORTS;
+    for (uint32_t port0 = 0; port0 < ports; ++port0) {
+        auto& st = ctrl.ports[port0];
+        uint32_t v = XhciPortRead(ctrl, port0);
+        if (v == 0xffffffffu) { st.error = "registers inaccessible"; continue; }
+        const uint32_t changes = v & PORTSC_CHANGES;
+        // Instrumentation: every root-port state transition (CCS, PED, PR,
+        // PLS, PP, speed) and any change bits, once per transition.
+        const uint32_t stateBits = v & (PORTSC_CCS | PORTSC_PED | PORTSC_PR | PORTSC_PLS_MASK | PORTSC_PP | PORTSC_SPEED_MASK);
+        if (!initial && (stateBits != st.logged || changes))
+            KPrintf("xhci: c%u port %u PORTSC %08x -> %08x (CCS=%u PED=%u PP=%u PLS=%s chg=%05x dev=%u tries=%u)\n",
+                    ctrl.index, port0 + 1, st.portsc, v, v & 1u, (v >> 1) & 1u, (v >> 9) & 1u,
+                    XhciLinkStateName((v >> 5) & 15u), changes >> 17, st.device, st.tries);
+        st.logged = stateBits;
+        if (changes) XhciPortWrite(ctrl, port0, XhciPortPersistent(v) | changes);
+        st.portsc = v;
+        // Port power must stay on: a port that lost PP (over-current, a
+        // firmware hand-back or a controller quirk) can never see a connect,
+        // and a bus-powered hub tree behind it stays dark.
+        if (!initial && !(v & PORTSC_PP)) {
+            XhciPortWrite(ctrl, port0, XhciPortPersistent(v) | PORTSC_PP);
+            KPrintf("xhci: c%u port %u lost port power; PP restored\n", ctrl.index, port0 + 1);
+            st.tries = 0; st.waits = 0; st.error = nullptr;
+            continue; // re-read after the port powers up (next pass)
+        }
+        // A new physical connect always gets a fresh set of tries.
+        if ((changes & PORTSC_CSC) && (v & PORTSC_CCS)) { st.tries = 0; st.waits = 0; st.error = nullptr; }
+        const bool usb3 = XhciPortIsUsb3(ctrl, port0, v);
+        if (st.device) {
+            if ((v & PORTSC_CCS) && !(changes & PORTSC_CSC)) continue;
+            XhciDeviceGone(st.device - 1u);
+            st.device = 0; changed = true;
+            if (!(v & PORTSC_CCS)) continue;
+        }
+        auto action = XhciRootPortAction(v, usb3);
+        const uint32_t pls = (v >> 5) & 15u;
+        if (action == XhciRootAction::Idle) {
+            if (pls != 6 && pls != 10 && (st.error || st.tries || st.waits)) {
+                st.error = nullptr; st.tries = 0; st.waits = 0; st.cc = 0; changed = true;
+            }
+            continue;
+        }
+        if (action == XhciRootAction::Wait) {
+            if (++st.waits <= 8) { if (waiting) *waiting = true; continue; }
+            action = usb3 ? XhciRootAction::WarmReset : XhciRootAction::Reset;
+            st.waits = 0;
+        }
+        // Three tries, then retry every 5 s while something stays connected
+        // (a KVM switch-back can bounce the connect through several failures).
+        if (st.tries >= 3) {
+            if (initial || ApicTickCount() - st.lastTryMs < 5000) continue;
+            KPrintf("xhci: c%u port %u retrying enumeration after back-off (%s)\n", ctrl.index, port0 + 1,
+                    st.error ? st.error : "?");
+            st.tries = 0;
+        }
+        ++st.tries; changed = true; st.lastTryMs = ApicTickCount();
+        if (action == XhciRootAction::Reset) {
             struct PortIo {
                 XhciController& controller;uint32_t offset;
                 uint32_t read(){return xhci_read32(controller.opBase,offset);}
                 void write(uint32_t value){xhci_write32(controller.opBase,offset,value);}
                 uint64_t now(){return ApicTickCount();}
                 bool wait(){__asm__ volatile("pause");return true;}
-            } io{ctrl,XHCI_OP_PORTSC_BASE+port*0x10};
-            const bool resetOk=XhciResetRootPort(io,1000);
+            } io{ctrl,XHCI_OP_PORTSC_BASE+port0*0x10};
+            if (!XhciResetRootPort(io, 1000)) { st.error = "port reset failed"; st.portsc = XhciPortRead(ctrl, port0); continue; }
+        } else if (action == XhciRootAction::WarmReset) {
+            if (!XhciWarmResetRootPort(ctrl, port0)) { st.error = "warm reset failed"; st.portsc = XhciPortRead(ctrl, port0); continue; }
+        }
+        if (action != XhciRootAction::Enumerate) XhciDelayMs(10); // reset recovery
+        v = XhciPortRead(ctrl, port0);
+        st.portsc = v;
+        SerialPrintf("xhci: c%u port %u %s PORTSC=0x%08x\n", ctrl.index, port0 + 1,
+                     action == XhciRootAction::Enumerate ? "enabled" : "after reset", v);
+        if ((v & (PORTSC_CCS | PORTSC_PED)) != (PORTSC_CCS | PORTSC_PED)) {
+            st.error = "not enabled after reset"; continue;
+        }
+        XhciEnumResult result;
+        const int index = XhciEnumerate(ctrl, -1, static_cast<uint8_t>(port0 + 1), (v >> 10) & 15u, result);
+        if (index >= 0) { st.device = static_cast<uint8_t>(index + 1); st.error = nullptr; st.tries = 0; st.cc = 0; }
+        else {
+            st.error = result.stage; st.cc = result.cc;
+            KPrintf("xhci: c%u port %u: %s failed cc=%u (try %u/3)\n", ctrl.index, port0 + 1,
+                    result.stage, result.cc, st.tries);
+        }
+    }
+    return changed;
+}
 
-            portsc = xhci_read32(ctrl.opBase,
-                                  XHCI_OP_PORTSC_BASE + port * 0x10);
-            speed = (portsc >> 10) & 0xF;
-            KPrintf("xhci: port %u after reset: %s speed=%s PORTSC=0x%08x\n",
-                         port + 1,
-                         (portsc & PORTSC_PED) ? "ENABLED" : "disabled",
-                         XhciSpeedString(speed),portsc);
+static void XhciInitialRootScan(XhciController& ctrl)
+{
+    // Firmware is no longer responsible for powering the root hub. Power all
+    // ports first, then allow connection/debounce/link training to settle.
+    const uint32_t ports = ctrl.maxPorts < XHCI_MAX_ROOT_PORTS ? ctrl.maxPorts : XHCI_MAX_ROOT_PORTS;
+    KPrintf("xhci: c%u scanning %u root ports (%04x:%04x)\n", ctrl.index, ports,
+            ctrl.pciDev.vendorId, ctrl.pciDev.deviceId);
+    for (uint32_t port0 = 0; port0 < ports; ++port0) {
+        const uint32_t state = XhciPortRead(ctrl, port0);
+        SerialPrintf("xhci: c%u port %u before power PORTSC=0x%08x major=%u\n", ctrl.index, port0 + 1,
+                     state, ctrl.portMajor[port0]);
+        if (state == 0xffffffffu) { KPuts("xhci: root port registers inaccessible\n"); return; }
+        if (!(state & PORTSC_PP)) {
+            XhciPortWrite(ctrl, port0, XhciPortPersistent(state) | PORTSC_PP);
+            (void)XhciPortRead(ctrl, port0); // flush posted MMIO write
+        }
+    }
+    XhciDelayMs(250);
+    // SuperSpeed links can still be training; give them up to ~1.5 s.
+    for (uint32_t pass = 0; pass < 6; ++pass) {
+        bool waiting = false;
+        XhciRootScan(ctrl, true, &waiting);
+        if (!waiting) break;
+        XhciDelayMs(250);
+    }
+}
 
-            // If enabled, enumerate the device
-            if (resetOk && (portsc & PORTSC_PED)) {
-                XhciEnumeratePort(ctrl, port + 1, speed);
+// ---- Status text ----------------------------------------------------------------
+
+static void XhciStatusPrefix(XhciText& t, const XhciController& ctrl)
+{
+    t.s("USB xhci"); t.u(ctrl.index); t.c(' ');
+}
+
+static void XhciStatusDevice(XhciText& t, const XhciController& ctrl, uint32_t index)
+{
+    const auto& dev = g_devices[index];
+    char path[24]; XhciPathText(dev, path, sizeof(path));
+    XhciStatusPrefix(t, ctrl);
+    for (uint32_t i = 0; i < dev.topo.depth; ++i) t.s("  ");
+    t.c('p'); t.s(path); t.c(' '); t.s(UsbSpeedName(dev.portSpeed)); t.c(' ');
+    t.s(XhciDeviceKind(dev)); t.c(' ');
+    t.x(dev.vendorId, 4); t.c(':'); t.x(dev.productId, 4);
+    t.s(" slot "); t.u(dev.slotId);
+    if (dev.isHub) { t.c(' '); t.u(dev.hubPortCount); t.s(dev.hubSuper ? " ports SS" : " ports"); }
+    if (dev.network) {
+        t.s(" MAC ");
+        for (uint32_t i = 0; i < 6; ++i) { if (i) t.c(':'); t.x(dev.network->interface.mac.b[i], 2); }
+        if (dev.network->failed) t.s(" FAILED");
+    }
+    if (dev.isKeyboard) { t.s(dev.kbd.active ? " kbd=on" : " kbd=off"); if (dev.kbd.errorCc) { t.s(" kbd_cc="); t.u(dev.kbd.errorCc); } }
+    if (dev.isMouse) t.s(dev.mouse.active ? " mouse=on" : " mouse=off");
+    if (dev.note) { t.s(" note="); t.s(dev.note); }
+    if (dev.gone) t.s(" GONE");
+    t.nl();
+    if (!dev.isHub || dev.gone) return;
+    for (uint32_t p = 0; p < dev.hubPortCount; ++p) {
+        if (dev.hubChild[p]) { XhciStatusDevice(t, ctrl, dev.hubChild[p] - 1u); continue; }
+        const auto state = UsbHubDecodePort(dev.hubPortStatus[p], dev.hubSuper);
+        if (!state.connected && !dev.hubError[p]) continue;
+        XhciStatusPrefix(t, ctrl);
+        for (uint32_t i = 0; i <= dev.topo.depth; ++i) t.s("  ");
+        t.c('p'); t.s(path); t.c('.'); t.u(p + 1);
+        t.s(state.connected ? " connected" : " empty"); t.s(state.enabled ? " enabled" : " disabled");
+        t.s(" st="); t.x(dev.hubPortStatus[p], 4);
+        if (dev.hubError[p]) { t.s(" err="); t.s(dev.hubError[p]); t.s(" cc="); t.u(dev.hubCc[p]);
+                               t.s(" tries="); t.u(dev.hubTries[p]); }
+        t.nl();
+    }
+}
+
+static uint32_t XhciStatusText(char* out, uint32_t cap)
+{
+    XhciText t{out, cap, 0};
+    uint32_t up = 0, devices = 0, hubs = 0, kbd = 0, mouse = 0, net = 0, storage = 0;
+    for (uint32_t c = 0; c < g_controllerCount; ++c) {
+        auto& ctrl = g_controllers[c];
+        const auto& pci = ctrl.pciDev;
+        XhciStatusPrefix(t, ctrl);
+        t.x(pci.vendorId, 4); t.c(':'); t.x(pci.deviceId, 4); t.c(' ');
+        t.x(pci.bus, 2); t.c(':'); t.x(pci.dev, 2); t.c('.'); t.u(pci.fn);
+        if (ctrl.capBase) { t.s(" hci="); t.x(ctrl.hciVersion >> 8, 1); t.c('.'); t.x(ctrl.hciVersion & 0xff, 2); }
+        t.s(" ports="); t.u(ctrl.maxPorts);
+        t.s(" handoff="); t.s(ctrl.handoffText ? ctrl.handoffText : "-");
+        t.s(" reset="); t.s(ctrl.resetText[0] ? ctrl.resetText : "-");
+        t.s(" run="); t.s(ctrl.runText ? ctrl.runText : "-");
+        if (ctrl.initialized) {
+            t.s(" sts="); t.x(xhci_read32(ctrl.opBase, XHCI_OP_USBSTS), 8);
+            t.s(" irq="); t.s(ctrl.irqText ? ctrl.irqText : "poll");
+            t.s(ctrl.dma32 ? " dma=32" : " dma=64");
+        }
+        t.nl();
+        if (!ctrl.initialized) {
+            XhciStatusPrefix(t, ctrl); t.s("NOT DRIVEN: "); t.s(ctrl.failure ? ctrl.failure : "unknown"); t.nl();
+            continue;
+        }
+        ++up;
+        const uint32_t ports = ctrl.maxPorts < XHCI_MAX_ROOT_PORTS ? ctrl.maxPorts : XHCI_MAX_ROOT_PORTS;
+        // Raw PORTSC of every root port, six per line.
+        for (uint32_t port0 = 0; port0 < ports; ++port0) {
+            if (port0 % 6 == 0) { if (port0) t.nl(); XhciStatusPrefix(t, ctrl); t.s("PORTSC"); }
+            t.c(' '); t.u(port0 + 1); t.c(ctrl.portMajor[port0] >= 3 ? 's' : 'h'); t.c(':');
+            t.x(XhciPortRead(ctrl, port0), 8);
+        }
+        if (ports) t.nl();
+        for (uint32_t port0 = 0; port0 < ports; ++port0) {
+            const auto& st = ctrl.ports[port0];
+            const uint32_t v = XhciPortRead(ctrl, port0);
+            if (st.device) { XhciStatusDevice(t, ctrl, st.device - 1u); continue; }
+            if (!(v & PORTSC_CCS) && !st.error) continue;
+            XhciStatusPrefix(t, ctrl);
+            t.c('p'); t.u(port0 + 1); t.s(XhciPortIsUsb3(ctrl, port0, v) ? " usb3" : " usb2");
+            t.s((v & PORTSC_CCS) ? " CCS" : " -"); t.s((v & PORTSC_PED) ? " PED" : " !PED");
+            t.c(' '); t.s(XhciLinkStateName((v >> 5) & 15u));
+            t.s(" speed="); t.u((v >> 10) & 15u);
+            if (st.error) { t.s(" err="); t.s(st.error); t.s(" cc="); t.u(st.cc); t.s(" tries="); t.u(st.tries); }
+            else if (st.waits) t.s(" waiting (link training)");
+            t.nl();
+        }
+    }
+    for (uint32_t i = 0; i < g_deviceCount; ++i) {
+        const auto& dev = g_devices[i];
+        if (dev.gone) continue;
+        ++devices;
+        hubs += dev.isHub; kbd += dev.kbd.active; mouse += dev.mouse.active;
+        net += dev.network && !dev.network->failed; storage += dev.isMassStorage;
+    }
+    if (!g_controllerCount) { t.s("USB no xHCI controller found on PCI"); t.nl(); }
+    t.s("USB summary: controllers="); t.u(g_controllerCount); t.s(" driven="); t.u(up);
+    t.s(" devices="); t.u(devices); t.s(" hubs="); t.u(hubs); t.s(" kbd="); t.u(kbd);
+    t.s(" mouse="); t.u(mouse); t.s(" net="); t.u(net); t.s(" storage="); t.u(storage);
+    t.s(" keys="); t.u(__atomic_load_n(&g_keyPresses, __ATOMIC_RELAXED));
+    t.nl();
+    out[t.len] = 0;
+    return t.len;
+}
+
+// ---- Hotplug worker ---------------------------------------------------------------
+
+static void XhciUacHotplugTick();
+
+static void XhciHotplugThread(void*)
+{
+    g_threadContext = true;
+    uint32_t tick = 0;
+    for (;;) {
+        SchedulerSleepMs(500);
+        ++tick;
+        bool changed = false;
+        for (uint32_t c = 0; c < g_controllerCount; ++c) {
+            auto& ctrl = g_controllers[c];
+            if (ctrl.initialized) changed |= XhciRootScan(ctrl, false);
+        }
+        // Hubs: GET_PORT_STATUS once a second (the status-change endpoint is not used).
+        if (tick % 2 == 0) {
+            const uint32_t count = __atomic_load_n(&g_deviceCount, __ATOMIC_ACQUIRE);
+            for (uint32_t i = 0; i < count; ++i) {
+                auto& dev = g_devices[i];
+                if (dev.isHub && dev.hubReady && !dev.gone) changed |= XhciHubScan(*dev.ctrl, i, false);
             }
+        }
+        if (changed) UsbStatusChanged();
+        XhciUacHotplugTick();
+        // Echo the first keyboard input on the console (bounded).
+        static uint32_t reported = 0;
+        const uint32_t keys = __atomic_load_n(&g_keyPresses, __ATOMIC_RELAXED);
+        if (keys != reported && reported < 64) {
+            char text[80]; XhciText t{text, sizeof(text), 0};
+            uint32_t first = keys >= 8 ? keys - 8 : 0;
+            if (reported > first) first = reported;
+            for (uint32_t k = first; k < keys; ++k) {
+                t.s(" 0x"); t.x(g_keyRecent[k % 16], 2);
+            }
+            text[t.len] = 0;
+            KPrintf("xhci: USB keyboard input: %u key presses (scancodes%s)%s\n", keys, text,
+                    keys >= 64 ? "; further key logging suppressed" : "");
+            reported = keys;
+        }
+        static uint32_t mouseReported = 0;
+        const uint32_t moves = __atomic_load_n(&g_mouseReports, __ATOMIC_RELAXED);
+        if (moves != mouseReported && mouseReported < 16) {
+            KPrintf("xhci: USB mouse input: %u reports%s\n", moves, moves >= 16 ? "; further mouse logging suppressed" : "");
+            mouseReported = moves;
         }
     }
 }
@@ -3252,39 +3742,19 @@ static void XhciScanPorts(XhciController& ctrl)
 // Match a transfer event's TRB pointer to a device. The event ring's param
 // field holds the physical address of the completed TRB. We check each
 // device's interrupt and bulk transfer ring physical address ranges.
-static int XhciMatchTransferEvent(const Trb& evt)
+static int XhciMatchTransferEvent(const XhciController& ctrl, const Trb& evt)
 {
-    uint64_t trbPhys = evt.param;
-    uint32_t ringBytes = XFER_RING_SIZE * sizeof(Trb);
-
-    for (uint32_t i = 0; i < g_deviceCount; i++) {
-        XhciDevice& dev = g_devices[i];
-
-        // Check interrupt endpoint ring
-        if (dev.intRingPhys &&
-            trbPhys >= dev.intRingPhys &&
-            trbPhys < dev.intRingPhys + ringBytes)
-            return static_cast<int>(i);
-
-        // Check bulk IN ring
-        if (dev.bulkInRingPhys &&
-            trbPhys >= dev.bulkInRingPhys &&
-            trbPhys < dev.bulkInRingPhys + ringBytes)
-            return static_cast<int>(i);
-
-        // Check bulk OUT ring
-        if (dev.bulkOutRingPhys &&
-            trbPhys >= dev.bulkOutRingPhys &&
-            trbPhys < dev.bulkOutRingPhys + ringBytes)
-            return static_cast<int>(i);
-
-        // Check EP0 ring (control transfers during enumeration)
-        if (dev.ep0RingPhys &&
-            trbPhys >= dev.ep0RingPhys &&
-            trbPhys < dev.ep0RingPhys + ringBytes)
+    const uint64_t trbPhys = evt.param;
+    const uint32_t ringBytes = XFER_RING_SIZE * sizeof(Trb);
+    auto in = [&](uint64_t base) { return base && trbPhys >= base && trbPhys < base + ringBytes; };
+    const uint32_t count = __atomic_load_n(&g_deviceCount, __ATOMIC_ACQUIRE);
+    for (uint32_t i = 0; i < count; i++) {
+        const XhciDevice& dev = g_devices[i];
+        if (dev.ctrl != &ctrl) continue;
+        if (in(dev.intRingPhys) || in(dev.bulkInRingPhys) || in(dev.bulkOutRingPhys) ||
+            in(dev.ep0RingPhys) || in(dev.kbd.ringPhys) || in(dev.mouse.ringPhys))
             return static_cast<int>(i);
     }
-
     return -1; // unknown device
 }
 
@@ -3334,26 +3804,33 @@ static void XhciLogPciState(const PciDevice& dev,const char* stage)
             stage,command,status,valid?1u:0u,found?1u:0u,pmcsr);
 }
 
-static int XhciModuleInit()
+static void XhciParseProtocols(XhciController& ctrl)
 {
-    SerialPuts("xhci: initializing USB 3.0 host controller driver\n");
-    if(auto* marker=VfsOpen("/etc/usb-read-only")) {
-        g_storageReadOnly=true;VfsClose(marker);KPuts("xhci: physical storage probe is read-only\n");
+    // Supported Protocol capabilities (ID 2) map root ports to USB2/USB3.
+    uint32_t offset=(xhci_read32(ctrl.capBase,XHCI_CAP_HCCPARAMS1)>>16)*4;
+    for(unsigned hops=0;offset && offset<=ctrl.mapBytes-16 && !(offset&3) && hops<256;++hops) {
+        const uint32_t header=xhci_read32(ctrl.capBase,offset);
+        if(header==0xffffffffu)break;
+        if((header&255)==2) {
+            const uint32_t major=header>>24;
+            const uint32_t ports=xhci_read32(ctrl.capBase,offset+8);
+            const uint32_t first=ports&255,count=(ports>>8)&255;
+            for(uint32_t p=first;p && p<first+count && p<=XHCI_MAX_ROOT_PORTS;++p)ctrl.portMajor[p-1]=static_cast<uint8_t>(major);
+            SerialPrintf("xhci: c%u protocol USB%u ports %u-%u\n",ctrl.index,major,first,first+count-1);
+        }
+        const uint32_t next=((header>>8)&255)*4;
+        if(!next)break;
+        offset+=next;
     }
-    if(auto* marker=VfsOpen("/etc/usb-msc-page-chunks")) {
-        g_storagePageChunks=true;VfsClose(marker);
-        KPuts("xhci: diagnostic MSC limit=4096 bytes (single data TRB)\n");
-    }
+}
 
-    // Detect xHCI controllers on PCI bus
-    XhciController& ctrl = g_controllers[0];
-
-    if (!XhciPciDetect(ctrl)) {
-        SerialPuts("xhci: no controller detected, module inactive\n");
-        return 0; // not an error — just no hardware present
+static bool XhciBringUp(XhciController& ctrl)
+{
+    if (!XhciPciDetect(ctrl, ctrl.pciDev)) {
+        if (!ctrl.failure) ctrl.failure = "register discovery failed";
+        return false;
     }
     XhciLogPciState(ctrl.pciDev,"before-handoff");
-
     struct OwnershipIo {
         XhciController& ctrl;uint64_t deadline;
         uint32_t read(uint32_t offset){return xhci_read32(ctrl.capBase,offset);}
@@ -3363,10 +3840,12 @@ static int XhciModuleInit()
     } ownership{ctrl,ApicTickCount()+1000};
     uint32_t legacy=0;
     const auto extended=(xhci_read32(ctrl.capBase,XHCI_CAP_HCCPARAMS1)>>16)*4;
-    if(!XhciAcquireFirmwareOwnership(ownership,extended,65536,legacy)) {
-        KPuts("xhci: firmware ownership handoff failed; controller untouched\n");return -1;
+    if(!XhciAcquireFirmwareOwnership(ownership,extended,ctrl.mapBytes,legacy)) {
+        KPrintf("xhci: c%u firmware ownership handoff failed; controller untouched\n",ctrl.index);
+        ctrl.handoffText="FAIL(BIOS owned)";ctrl.failure="firmware handoff failed; controller untouched";return false;
     }
-    KPrintf("xhci: firmware handoff complete legacy=0x%x\n",legacy);
+    KPrintf("xhci: c%u firmware handoff complete legacy=0x%x\n",ctrl.index,legacy);
+    ctrl.handoffText=legacy?"ok":"ok(no-legacy-cap)";
     if(legacy)KPrintf("xhci: ownership after handoff sem=0x%x ctl=0x%x\n",
                        ownership.read(legacy),ownership.read(legacy+4));
     XhciLogPciState(ctrl.pciDev,"after-handoff");
@@ -3379,17 +3858,22 @@ static int XhciModuleInit()
                 PciConfigRead32(dev.bus,dev.dev,dev.fn,0xdc));
     }
     // Reset only after firmware releases ownership and halt is observed.
-    if (!XhciReset(ctrl)) {KPuts("xhci: controller reset failed; USB storage/network unavailable\n");return -1;}
+    if (!XhciReset(ctrl)) {KPrintf("xhci: c%u controller reset failed; controller not driven\n",ctrl.index);ctrl.failure="controller reset failed";return false;}
     PciEnableBusMaster(ctrl.pciDev);
 
-    // Allocate command/event rings and DCBAA
-    if (!XhciAllocRings(ctrl)) {KPuts("xhci: ring allocation failed; USB storage/network unavailable\n");return -1;}
+    if(ctrl.pciDev.vendorId==0x8086 && ctrl.pciDev.deviceId!=0x9cb1) {
+        // Read-only diagnostics: 100/200-series PCHs have no EHCI routing,
+        // but record the legacy routing words in case a board uses them.
+        const auto& dev=ctrl.pciDev;
+        SerialPrintf("xhci: c%u intel cfg d0=%08x d4=%08x d8=%08x dc=%08x\n",ctrl.index,
+                PciConfigRead32(dev.bus,dev.dev,dev.fn,0xd0),PciConfigRead32(dev.bus,dev.dev,dev.fn,0xd4),
+                PciConfigRead32(dev.bus,dev.dev,dev.fn,0xd8),PciConfigRead32(dev.bus,dev.dev,dev.fn,0xdc));
+    }
 
-    // Start the controller
-    if (!XhciStartController(ctrl)) {KPuts("xhci: controller start failed; USB storage/network unavailable\n");return -1;}
-
-    ctrl.initialized = true;
-    g_controllerCount = 1;
+    if (!XhciAllocRings(ctrl)) {KPrintf("xhci: c%u ring allocation failed\n",ctrl.index);ctrl.failure="ring allocation failed";return false;}
+    if (!XhciStartController(ctrl)) {KPrintf("xhci: c%u controller start failed\n",ctrl.index);ctrl.failure="controller start failed (HCH)";return false;}
+    XhciParseProtocols(ctrl);
+    __atomic_store_n(&ctrl.initialized,true,__ATOMIC_RELEASE);
 
     struct RoutingIo {
         const PciDevice& device;
@@ -3410,17 +3894,11 @@ static int XhciModuleInit()
 
     // Small delay for port status to settle
     for (volatile int d = 0; d < 1000000; d++);
+    return true;
+}
 
-    // Scan ports and enumerate connected devices
-    XhciScanPorts(ctrl);
-    if(g_storageReadOnly)KPrintf("xhci: initial port scan found %u USB devices\n",g_deviceCount);
-
-    // Process any pending port status change events
-    while (true) {
-        Trb* evt = XhciWaitForEvent(ctrl, 0, 50);
-        if (!evt) break;
-    }
-
+static void XhciSetupInterrupts(XhciController& ctrl)
+{
     // Clear any stale interrupt state from polling phase.  The controller
     // won't generate new MSI-X messages while IMAN.IP or USBSTS.EINT are set.
     {
@@ -3432,16 +3910,17 @@ static int XhciModuleInit()
         xhci_write32(ctrl.rtBase, XHCI_RT_IMAN, iman | 0x3); // W1C IP, keep IE
 
         // Write ERDP with EHB=1 to clear Event Handler Busy
+        const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
         uint64_t erdpPhys = ctrl.evtRingPhys + ctrl.evtDequeue * sizeof(Trb);
         xhci_write64(ctrl.rtBase, XHCI_RT_ERDP, erdpPhys | (1ULL << 3));
+        IrqSpinLockRelease(&g_eventRingLock,saved);
     }
-
-    // --- Phase 8: Register IRQ handler for interrupt-driven event processing ---
 
     // Set up MSI-X for interrupt delivery.  QEMU's qemu-xhci uses MSI-X and
     // does not support legacy INTx fallback, so we must program the MSI-X
     // table directly.  We configure a single entry (interrupter 0) to deliver
-    // our chosen vector to the BSP's LAPIC.
+    // our chosen vector to the BSP's LAPIC. Every controller shares the
+    // vector; the handler drains all of them.
     ctrl.completionFailed=false;
     bool msixConfigured = false;
     {
@@ -3572,62 +4051,894 @@ static int XhciModuleInit()
         }
     }
 
-    g_irqActive = msixConfigured || msiConfigured || ctrl.irqVector;
+    ctrl.irqText = msixConfigured ? "msix" : msiConfigured ? "msi" : ctrl.irqVector ? "intx" : "poll";
+    if (msixConfigured || msiConfigured || ctrl.irqVector) g_irqActive = true;
     SerialPrintf("xhci: interrupt-driven mode active (MSI-X=%s)\n",
                  msixConfigured ? "yes" : "no");
+}
 
-    // Register USB keyboard input device if a keyboard was found
-    for (uint32_t i = 0; i < g_deviceCount; i++) {
-        if (g_devices[i].isKeyboard) {
-            g_usbKbdOps.poll = XhciKeyboardPoll;
-            g_usbKbdDev.ops = &g_usbKbdOps;
-            g_usbKbdDev.head = 0;
-            g_usbKbdDev.tail = 0;
-            InputRegister(&g_usbKbdDev);
 
-            // Allocate DMA buffer for keyboard reports and queue first transfer
-            uint64_t kbdBufPhys;
-            auto* kbdBuf = static_cast<uint8_t*>(AllocDmaBuffer(1, kbdBufPhys));
-            if (kbdBuf) {
-                g_devices[i].priv = kbdBuf;
-                g_kbdReportBufPhys = kbdBufPhys;
-                g_kbdDevIndex = i;
-                XhciQueueInterruptIn(ctrl, g_devices[i], kbdBuf, kbdBufPhys, 8);
+// Pre-reset quiesce (Linux xhci_shutdown + pci_disable_device): clear Run/Stop
+// and interrupt enable, wait a bounded time for HCHalted, then drop bus
+// mastering and MSI/MSI-X. Never blocks the reset: at most ~20 ms/controller.
+static void XhciQuiesceForReset()
+{
+    const uint32_t count = __atomic_load_n(&g_controllerCount, __ATOMIC_ACQUIRE);
+    for (uint32_t i = 0; i < count; ++i) {
+        auto& ctrl = g_controllers[i];
+        if (!ctrl.initialized || !ctrl.opBase) continue;
+        const uint32_t cmd = xhci_read32(ctrl.opBase, XHCI_OP_USBCMD);
+        if (cmd != 0xffffffffu) {
+            xhci_write32(ctrl.opBase, XHCI_OP_USBCMD, cmd & ~(USBCMD_RS | USBCMD_INTE | USBCMD_HSEE));
+            const uint64_t start = ApicTickCount();
+            for (uint32_t spin = 0; spin < 200000u; ++spin) {
+                const uint32_t sts = xhci_read32(ctrl.opBase, XHCI_OP_USBSTS);
+                if (sts == 0xffffffffu || (sts & USBSTS_HCH)) break;
+                if (ApicTickCount() - start > 20) break;
+                __asm__ volatile("pause");
             }
+        }
+        (void)PciQuiesceFunctionForReset(ctrl.pciDev.bus, ctrl.pciDev.dev, ctrl.pciDev.fn);
+    }
+}
 
-            SerialPuts("xhci: USB keyboard registered as input device\n");
-            break;
+// ---- Read-only diagnostics: bridge hardware usb ------------------------------
+// "list", "desc <i> [offset]" (raw device + configuration descriptors as hex),
+// "get <i> <bmRequestType> <bRequest> <wValue> <wIndex> <wLength>" (hex fields;
+// device-to-host requests only, and only on devices no Brook function owns).
+static bool XhciArgHex(const char*& p, uint32_t& v)
+{
+    while (*p == ' ') ++p;
+    uint32_t n = 0; v = 0;
+    while (true) {
+        const char ch = *p; uint32_t d;
+        if (ch >= '0' && ch <= '9') d = uint32_t(ch - '0');
+        else if (ch >= 'a' && ch <= 'f') d = uint32_t(ch - 'a' + 10);
+        else if (ch >= 'A' && ch <= 'F') d = uint32_t(ch - 'A' + 10);
+        else break;
+        if (++n > 8) return false;
+        v = (v << 4) | d; ++p;
+    }
+    return n != 0;
+}
+static bool XhciArgIs(const char*& p, const char* word)
+{
+    const char* q = p;
+    while (*word) if (*q++ != *word++) return false;
+    if (*q && *q != ' ') return false;
+    p = q; return true;
+}
+struct XhciText;
+static uint32_t XhciUacCommand(const char* p, XhciText& t);
+static uint32_t XhciUsbCommand(const char* args, char* out, uint32_t cap)
+{
+    XhciText t{out, cap, 0};
+    const char* p = args;
+    const uint32_t count = __atomic_load_n(&g_deviceCount, __ATOMIC_ACQUIRE);
+    if (!*p || XhciArgIs(p, "list")) {
+        for (uint32_t i = 0; i < count; ++i) {
+            const auto& dev = g_devices[i];
+            char path[24]; XhciPathText(dev, path, sizeof(path));
+            t.u(i); t.s(" c"); t.u(dev.ctrl ? dev.ctrl->index : 0); t.s(" p"); t.s(path);
+            t.c(' '); t.s(UsbSpeedName(dev.portSpeed)); t.c(' ');
+            t.x(dev.vendorId, 4); t.c(':'); t.x(dev.productId, 4); t.c(' '); t.s(XhciDeviceKind(dev));
+            t.s(" slot="); t.u(dev.slotId); t.s(" cfg="); t.u(dev.rawConfigLen);
+            if (dev.gone) t.s(" gone");
+            t.nl();
+        }
+        return t.len;
+    }
+    if (XhciArgIs(p, "audio")) return XhciUacCommand(p, t);
+    uint32_t index = 0;
+    if (XhciArgIs(p, "desc")) {
+        uint32_t offset = 0;
+        if (!XhciArgHex(p, index) || index >= count) { t.s("bad device index"); return t.len; }
+        if (*p) (void)XhciArgHex(p, offset);
+        const auto& dev = g_devices[index];
+        t.s("dev "); for (uint8_t b : dev.rawDevice) t.x(b, 2); t.nl();
+        t.s("cfg len="); t.u(dev.rawConfigLen); t.s(" off="); t.x(offset, 4); t.nl();
+        for (uint32_t o = offset; o < dev.rawConfigLen && o < offset + 1024; ++o) {
+            t.x(dev.rawConfig[o], 2);
+            if ((o - offset) % 32 == 31) t.nl();
+        }
+        t.nl();
+        return t.len;
+    }
+    if (XhciArgIs(p, "get")) {
+        uint32_t f[5];
+        if (!XhciArgHex(p, index) || index >= count) { t.s("bad device index"); return t.len; }
+        for (auto& v : f) if (!XhciArgHex(p, v)) { t.s("usage: get <i> <bmRT> <bReq> <wValue> <wIndex> <wLength>"); return t.len; }
+        auto& dev = g_devices[index];
+        if (!(f[0] & 0x80) || f[0] > 0xff || f[1] > 0xff || f[2] > 0xffff || f[3] > 0xffff || !f[4] || f[4] > 512) {
+            t.s("refused: device-to-host requests of 1..512 bytes only"); return t.len;
+        }
+        if (dev.gone || !dev.ctrl || !dev.scratch || dev.isHub || dev.isKeyboard || dev.isMouse ||
+            dev.isMassStorage || dev.ecm.value) { t.s("refused: device gone or owned by a driver"); return t.len; }
+        UsbSetupPacket setup{};
+        setup.bmRequestType = uint8_t(f[0]); setup.bRequest = uint8_t(f[1]);
+        setup.wValue = uint16_t(f[2]); setup.wIndex = uint16_t(f[3]); setup.wLength = uint16_t(f[4]);
+        uint32_t got = 0;
+        memset(dev.scratch, 0, f[4]);
+        if (!XhciControlTransfer(*dev.ctrl, dev, setup, dev.scratch, f[4], dev.scratchPhys, 3, &got)) {
+            t.s("failed cc="); t.u(dev.lastCc); return t.len;
+        }
+        t.s("ok len="); t.u(got); t.nl();
+        for (uint32_t o = 0; o < got; ++o) { t.x(dev.scratch[o], 2); if (o % 32 == 31) t.nl(); }
+        t.nl();
+        return t.len;
+    }
+    t.s("usage: bridge hardware usb [list|desc <i> [off]|get <i> <bmRT> <bReq> <wValue> <wIndex> <wLength>]");
+    return t.len;
+}
+
+
+// ---- UAC2 playback (EVO4-class devices): bridge hardware audio ---------------
+// Started only by an explicit "bridge hardware audio usb start". Streams 48 kHz
+// 16-bit silence through the isochronous OUT endpoint with explicit feedback;
+// "tone <dB> audible" raises the feature-unit volume for one 1 s 440 Hz tone and
+// then returns it to the device minimum. Capture and DFU interfaces are never
+// touched.
+struct XhciUacStream {
+    XhciController* ctrl = nullptr;
+    uint32_t device = 0, slotId = 0, dataDci = 0, fbDci = 0, frameBytes = 0;
+    Uac2Playback desc{};
+    Trb* dataRing = nullptr; uint64_t dataRingPhys = 0; uint32_t dataEnq = 0; bool dataCycle = true;
+    Trb* fbRing = nullptr; uint64_t fbRingPhys = 0; uint32_t fbEnq = 0; bool fbCycle = true;
+    uint8_t* dataBuf = nullptr; uint64_t dataBufPhys = 0;
+    uint8_t* fbBuf = nullptr; uint64_t fbBufPhys = 0;
+    uint64_t dataSeq[XFER_RING_SIZE]{}, fbSeq[XFER_RING_SIZE]{};
+    volatile uint64_t completedHw = 0; // only from transfer events: bounds ring occupancy
+    volatile uint64_t produced = 0, completed = 0, fbProduced = 0, fbCompleted = 0, framesSent = 0;
+    volatile uint32_t dataEvents = 0, fbEvents = 0, underruns = 0, missed = 0, resyncs = 0, fbValues = 0;
+    volatile uint32_t lastFbRaw = 0, lastFbBytes = 0, lastBadCc = 0;
+    volatile uint64_t underrunTick[4]{};
+    volatile uint64_t maxLoopGap = 0, lastLoop = 0;
+    volatile uint32_t ccCount[32]{};
+    volatile bool active = false, running = false, stopRequested = false, resync = false;
+    volatile bool toneRequested = false, toneDone = false;
+    volatile uint64_t toneStartTick = 0, toneEndTick = 0;
+    Uac2FeedbackPacer pacer{};
+    Uac2Tone tone{};
+    int16_t volumeMin = 0, volumeMax = 0;
+    bool volumeControl = false;
+    uint32_t volumeSkip = 0;            // channels whose SET_CUR stalls (best-effort)
+    // Feature-unit level: owned by the stream thread once it runs.
+    volatile bool fuOverride = false;   // explicit command level (tone, mixer-tone)
+    volatile int16_t fuOverrideQ8 = 0;
+    volatile int16_t unmutedQ8 = -20 * 256; // mixer mode, after an explicit user unmute
+    volatile int16_t fuCurrentQ8 = 0;
+    volatile bool fuKnown = false;
+    // Mixer mode: the kernel mixer (44.1 kHz stereo S16) feeds channels 1-2.
+    volatile bool mixerMode = false, primed = false, flushRequested = false;
+    uint32_t primeWait = 0;
+    // Native clocked contract (AudioDriver trySubmit/progress/restart): byte
+    // watermarks of 44.1 kHz stereo S16 in this epoch; completion is frames
+    // the stream has taken from the ring into isochronous packets.
+    volatile uint64_t nativeEpoch = 1, nativeSubmitted = 0, nativeOutBase = 0;
+    volatile bool nativeDiscontinuity = false;
+    volatile uint32_t mixWrite = 0, mixRead = 0; // frame counters (SPSC)
+    volatile uint64_t mixFramesIn = 0, mixFramesOut = 0, mixUnderflows = 0, mixDropped = 0;
+    uint32_t rate = 0, rateReadback = 0;
+};
+static XhciUacStream g_uac;
+static constexpr uint32_t UAC_MIX_FRAMES = 8192, UAC_MIX_PRIME = 441; // 186 ms ring, 10 ms prime
+static int16_t g_uacMix[UAC_MIX_FRAMES * 2];
+static bool g_uacAudioRegistered = false;
+static bool XhciUacSetVolume(XhciDevice& dev, int16_t q8);
+static constexpr uint32_t UAC_DATA_SLOT = 128, UAC_DATA_LEAD = 224, UAC_FB_LEAD = 16, UAC_IOC_EVERY = 8;
+
+static bool XhciUacEventHit(const XhciController& ctrl, const Trb& event)
+{
+    if (!__atomic_load_n(&g_uac.active, __ATOMIC_ACQUIRE) || &ctrl != g_uac.ctrl) return false;
+    const uint32_t slot = event.control >> 24, dci = (event.control >> 16) & 31;
+    return slot == g_uac.slotId && (dci == g_uac.dataDci || dci == g_uac.fbDci);
+}
+
+static uint64_t XhciUacSeqFor(const Trb* ring, uint64_t ringPhys, const uint64_t* seq, uint64_t param, bool& ok)
+{
+    (void)ring;
+    ok = param >= ringPhys && param < ringPhys + (XFER_RING_SIZE - 1) * sizeof(Trb) && !((param - ringPhys) % sizeof(Trb));
+    return ok ? seq[(param - ringPhys) / sizeof(Trb)] : 0;
+}
+
+// Event ring context (IRQ or poll, g_eventRingLock held): bookkeeping only.
+static void XhciUacEvent(const Trb& event)
+{
+    auto& s = g_uac;
+    const uint32_t cc = event.status >> 24, dci = (event.control >> 16) & 31;
+    bool ok = false;
+    if (dci == s.dataDci) {
+        __atomic_fetch_add(&s.dataEvents, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&s.ccCount[cc & 31], 1, __ATOMIC_RELAXED);
+        if (cc == 14 || cc == 15) {
+            const uint32_t n = __atomic_fetch_add(&s.underruns, 1, __ATOMIC_RELAXED);
+            s.underrunTick[n & 3] = ApicTickCount(); s.resync = true; return;
+        }
+        if (cc == 23) __atomic_fetch_add(&s.missed, 1, __ATOMIC_RELAXED);
+        else if (cc != TRB_CC_SUCCESS && cc != TRB_CC_SHORT_PACKET) s.lastBadCc = cc;
+        const uint64_t seq = XhciUacSeqFor(s.dataRing, s.dataRingPhys, s.dataSeq, event.param, ok);
+        if (ok && seq + 1 > s.completedHw) __atomic_store_n(&s.completedHw, seq + 1, __ATOMIC_RELEASE);
+        if (ok && seq + 1 > s.completed) __atomic_store_n(&s.completed, seq + 1, __ATOMIC_RELEASE);
+        return;
+    }
+    __atomic_fetch_add(&s.fbEvents, 1, __ATOMIC_RELAXED);
+    const uint64_t seq = XhciUacSeqFor(s.fbRing, s.fbRingPhys, s.fbSeq, event.param, ok);
+    if (!ok) return;
+    if (seq + 1 > s.fbCompleted) __atomic_store_n(&s.fbCompleted, seq + 1, __ATOMIC_RELEASE);
+    if (cc != TRB_CC_SUCCESS && cc != TRB_CC_SHORT_PACKET) { s.lastBadCc = cc; return; }
+    const uint32_t residue = event.status & 0xffffff;
+    const uint32_t bytes = residue <= 4 ? 4 - residue : 0;
+    const uint8_t* p = s.fbBuf + ((event.param - s.fbRingPhys) / sizeof(Trb)) * 16;
+    if (bytes >= 3) {
+        s.lastFbRaw = uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 | (bytes > 3 ? uint32_t(p[3]) << 24 : 0);
+        s.lastFbBytes = bytes;
+        __atomic_fetch_add(&s.fbValues, 1, __ATOMIC_RELEASE);
+    }
+}
+
+// Producer side (stream thread only). One TRB per TD; Link TRBs wrap the ring.
+static Trb& XhciUacSlot(Trb* ring, uint32_t& enq, bool& cycle, uint32_t& index)
+{
+    if (enq >= XFER_RING_SIZE - 1) {
+        ring[XFER_RING_SIZE - 1].control = TRB_TYPE_LINK | TRB_TC | (cycle ? TRB_CYCLE : 0);
+        cycle = !cycle; enq = 0;
+    }
+    index = enq++;
+    return ring[index];
+}
+
+static void XhciUacQueueData()
+{
+    auto& s = g_uac;
+    uint32_t index = 0;
+    Trb& trb = XhciUacSlot(s.dataRing, s.dataEnq, s.dataCycle, index);
+    const uint32_t frames = s.pacer.Next();
+    uint8_t* out = s.dataBuf + index * UAC_DATA_SLOT;
+    if (s.flushRequested) { s.mixRead = s.mixWrite; s.primed = false; s.flushRequested = false; }
+    for (uint32_t f = 0; f < frames; ++f) {
+        int32_t left = 0, right = 0;
+        if (s.mixerMode) {
+            const uint32_t level = __atomic_load_n(&s.mixWrite, __ATOMIC_ACQUIRE) - s.mixRead;
+            if (!level) s.primeWait = 0;
+            else if (!s.primed && ++s.primeWait >= 160 * 6) s.primed = true; // ~20 ms of frames waiting
+            if (!s.primed && level >= UAC_MIX_PRIME) s.primed = true;
+            if (s.primed && level) {
+                const uint32_t at = (s.mixRead % UAC_MIX_FRAMES) * 2;
+                left = g_uacMix[at]; right = g_uacMix[at + 1];
+                __atomic_store_n(&s.mixRead, s.mixRead + 1, __ATOMIC_RELEASE);
+                ++s.mixFramesOut;
+            } else if (s.primed) { s.primed = false; ++s.mixUnderflows; }
+        }
+        if (s.tone.Active()) { const int16_t v = s.tone.NextSample(); left += v; right += v; }
+        if (left > 32767) left = 32767; else if (left < -32768) left = -32768;
+        if (right > 32767) right = 32767; else if (right < -32768) right = -32768;
+        for (uint32_t c = 0; c < s.desc.channels; ++c) {
+            const int16_t sample = int16_t(c == 0 ? left : c == 1 ? right : 0);
+            uint8_t* q = out + f * s.frameBytes + c * s.desc.subslot;
+            q[0] = uint8_t(sample); q[1] = uint8_t(uint16_t(sample) >> 8);
         }
     }
+    const uint64_t seq = s.produced;
+    s.dataSeq[index] = seq;
+    trb.param = s.dataBufPhys + index * UAC_DATA_SLOT;
+    trb.status = XhciIsochStatus(frames * s.frameBytes);
+    __atomic_store_n(&trb.control, XhciIsochControl(s.dataCycle, seq % UAC_IOC_EVERY == UAC_IOC_EVERY - 1, true),
+                     __ATOMIC_RELEASE);
+    s.framesSent += frames;
+    __atomic_store_n(&s.produced, seq + 1, __ATOMIC_RELEASE);
+}
 
-    // Register USB mouse input device if a mouse was found
-    for (uint32_t i = 0; i < g_deviceCount; i++) {
-        if (g_devices[i].isMouse && g_devices[i].intRing) {
-            g_usbMouseOps.poll = XhciMousePoll;
-            g_usbMouseDev.ops = &g_usbMouseOps;
-            g_usbMouseDev.head = 0;
-            g_usbMouseDev.tail = 0;
-            InputRegister(&g_usbMouseDev);
+static void XhciUacQueueFeedback()
+{
+    auto& s = g_uac;
+    uint32_t index = 0;
+    Trb& trb = XhciUacSlot(s.fbRing, s.fbEnq, s.fbCycle, index);
+    const uint64_t seq = s.fbProduced;
+    s.fbSeq[index] = seq;
+    trb.param = s.fbBufPhys + index * 16;
+    trb.status = XhciIsochStatus(s.desc.feedbackMaxPacket & 0x7ff);
+    __atomic_store_n(&trb.control, XhciIsochControl(s.fbCycle, true, true), __ATOMIC_RELEASE);
+    __atomic_store_n(&s.fbProduced, seq + 1, __ATOMIC_RELEASE);
+}
 
-            uint64_t mouseBufPhys;
-            auto* mouseBuf = static_cast<uint8_t*>(AllocDmaBuffer(1, mouseBufPhys));
-            if (mouseBuf) {
-                g_devices[i].priv = mouseBuf;
-                g_mouseReportBufPhys = mouseBufPhys;
-                g_mouseDevIndex = i;
-                XhciQueueInterruptIn(g_controllers[0], g_devices[i],
-                                      mouseBuf, mouseBufPhys, 4);
-            }
+static void XhciUacThread(void*)
+{
+    auto& s = g_uac;
+    uint32_t seenFb = 0;
+    s.running = true;
+    while (!s.stopRequested && !g_devices[s.device].gone) {
+        if (s.resync) {
+            s.resync = false; ++s.resyncs;
+            __atomic_store_n(&s.completed, s.produced, __ATOMIC_RELEASE);
+        }
+        const uint32_t values = __atomic_load_n(&s.fbValues, __ATOMIC_ACQUIRE);
+        if (values != seenFb) { seenFb = values; (void)s.pacer.Feed(s.lastFbRaw, s.lastFbBytes); }
+        if (s.toneRequested && !s.tone.Active() && !s.toneStartTick) {
+            s.tone.Start(440, s.rate, s.rate, s.rate / 100, 8192); // 1 s, 10 ms fades, -12 dBFS
+            s.toneStartTick = ApicTickCount();
+        }
+        bool fb = false, data = false;
+        while (s.fbProduced - __atomic_load_n(&s.fbCompleted, __ATOMIC_ACQUIRE) < UAC_FB_LEAD) { XhciUacQueueFeedback(); fb = true; }
+        // A resync after an underrun trusts the ring is empty; the event-only
+        // bound keeps a stale underrun report from overrunning queued TDs.
+        while (s.produced - __atomic_load_n(&s.completed, __ATOMIC_ACQUIRE) < UAC_DATA_LEAD &&
+               s.produced - __atomic_load_n(&s.completedHw, __ATOMIC_ACQUIRE) < XFER_RING_SIZE - 16) { XhciUacQueueData(); data = true; }
+        __asm__ volatile("mfence" ::: "memory");
+        if (fb) XhciRingDoorbell(*s.ctrl, s.slotId, s.fbDci);
+        if (data) XhciRingDoorbell(*s.ctrl, s.slotId, s.dataDci);
+        if (s.toneStartTick && !s.toneEndTick && !s.tone.Active()) { s.toneEndTick = ApicTickCount(); s.toneDone = true; }
+        const uint64_t now = ApicTickCount();
+        if (s.lastLoop && now - s.lastLoop > s.maxLoopGap) s.maxLoopGap = now - s.lastLoop;
+        s.lastLoop = now;
+        SchedulerSleepMs(1);
+    }
+    s.running = false;
+}
 
-            SerialPuts("xhci: USB mouse registered as input device\n");
-            break;
+// Feature-unit level, on its own worker so a slow or failing control
+// endpoint can never stall the isochronous refill: explicit override, else
+// (mixer mode) the user's explicit unmute of an unmuted mixer, else minimum.
+// Failures back off from 200 ms to 5 s.
+static volatile bool g_uacControlRunning = false;
+static void XhciUacControlThread(void*)
+{
+    auto& s = g_uac;
+    uint64_t retryAt = 0; uint32_t backoff = 200;
+    while (s.active && !s.stopRequested && !g_devices[s.device].gone) {
+        const uint32_t control = AudioOutputControlState();
+        const bool userUnmuted = (control & AudioUserUnmuteBit) && !(control & BROOK_AUDIO_MUTED);
+        const int16_t want = s.fuOverride ? s.fuOverrideQ8 : (s.mixerMode && userUnmuted) ? s.unmutedQ8 : s.volumeMin;
+        const uint64_t now = ApicTickCount();
+        if (s.volumeControl && (!s.fuKnown || want != s.fuCurrentQ8) && now >= retryAt) {
+            auto& dev = g_devices[s.device];
+            const bool ok = XhciUacSetVolume(dev, want);
+            s.fuCurrentQ8 = want; s.fuKnown = ok;
+            KPrintf("uac: EVO4 volume %d/256 dB at tick %u (%s%s)\n", int(want), unsigned(now),
+                    s.fuOverride ? "command" : want != s.volumeMin ? "user unmute" : "minimum", ok ? "" : ", FAILED");
+            if (ok) backoff = 200;
+            else { retryAt = now + backoff; if (backoff < 5000) backoff *= 2; }
+        }
+        SchedulerSleepMs(20);
+    }
+    g_uacControlRunning = false;
+}
+
+static bool XhciUacControl(XhciDevice& dev, uint8_t type, uint8_t request, uint16_t value, uint16_t index,
+                           const void* out, uint32_t length, void* in = nullptr)
+{
+    UsbSetupPacket setup{};
+    setup.bmRequestType = type; setup.bRequest = request; setup.wValue = value; setup.wIndex = index;
+    setup.wLength = uint16_t(length);
+    if (length && out) memcpy(dev.scratch, out, length);
+    const bool ok = XhciControlTransfer(*dev.ctrl, dev, setup, length ? dev.scratch : nullptr, length,
+                                        length ? dev.scratchPhys : 0, length ? ((type & 0x80) ? 3 : 2) : 0);
+    if (ok && in && length) memcpy(in, dev.scratch, length);
+    return ok;
+}
+
+// Returns a mask of channels whose SET_CUR failed. Channels 1 and 2 carry the
+// stream (the others stay silent) and must succeed; the rest are best-effort.
+static volatile uint32_t g_uacVolumeFailMask = 0;
+static volatile uint8_t g_uacVolumeFailCc = 0;
+static bool XhciUacSetVolume(XhciDevice& dev, int16_t q8)
+{
+    auto& s = g_uac;
+    uint32_t failed = 0;
+    for (uint32_t ch = 0; ch <= s.desc.featureChannels && ch < 32; ++ch) {
+        if (!(s.desc.featureVolumeMask & (1u << ch)) || (s.volumeSkip & (1u << ch))) continue;
+        if (!XhciUacControl(dev, 0x21, 1, uint16_t(0x0200 | ch), uint16_t(s.desc.featureId << 8 | s.desc.controlInterface),
+                            &q8, 2)) { failed |= 1u << ch; g_uacVolumeFailCc = dev.lastCc; }
+    }
+    g_uacVolumeFailMask = failed;
+    if (failed) KPrintf("uac: volume %d/256 dB SET_CUR failed on channel mask %x (cc %u)\n", int(q8), failed,
+                        unsigned(g_uacVolumeFailCc));
+    return !(failed & 0x6u);
+}
+
+// Configure Endpoint adding (or dropping) the data and feedback endpoints.
+static uint32_t XhciUacConfigureEndpoints(XhciController& ctrl, XhciDevice& dev, bool add)
+{
+    auto& s = g_uac;
+    const uint32_t ctxSize = CtxEntrySize(ctrl);
+    auto* input = static_cast<uint8_t*>(dev.inputCtx);
+    memset(input, 0, ctxSize * 33);
+    auto* icc = reinterpret_cast<uint32_t*>(input);
+    const uint32_t flags = (1u << s.dataDci) | (1u << s.fbDci);
+    if (add) icc[1] = 1u | flags; else { icc[0] = flags; icc[1] = 1u; }
+    auto* slotCtx = reinterpret_cast<uint32_t*>(input + ctxSize);
+    const auto* outSlot = reinterpret_cast<const uint32_t*>(dev.outputCtx);
+    for (int i = 0; i < 4; ++i) slotCtx[i] = outSlot[i];
+    const uint32_t maxDci = s.dataDci > s.fbDci ? s.dataDci : s.fbDci;
+    if (add && maxDci > ((slotCtx[0] >> 27) & 31)) slotCtx[0] = (slotCtx[0] & ~(0x1Fu << 27)) | (maxDci << 27);
+    if (add) {
+        struct { uint32_t dci; bool in; uint8_t interval; uint16_t packet; uint32_t average; uint64_t ring; } eps[2] = {
+            {s.dataDci, false, s.desc.dataInterval, s.desc.dataMaxPacket, 6u * s.frameBytes, s.dataRingPhys},
+            {s.fbDci, true, s.desc.feedbackInterval, s.desc.feedbackMaxPacket, 4u, s.fbRingPhys}};
+        for (const auto& e : eps) {
+            auto* ep = reinterpret_cast<uint32_t*>(input + ctxSize * (e.dci + 1));
+            const auto words = XhciIsochContext(e.in, e.interval, e.packet, e.average);
+            ep[0] = words.dw0; ep[1] = words.dw1;
+            ep[2] = uint32_t(e.ring | 1); ep[3] = uint32_t(e.ring >> 32); ep[4] = words.dw4;
         }
     }
+    __asm__ volatile("mfence" ::: "memory");
+    return XhciSlotCommand(ctrl, dev.inputCtxPhys, TRB_TYPE_CONFIG_EP | (dev.slotId << 24), 2000);
+}
 
-    KPrintf("xhci: driver initialized (%u controller%s, %u device%s)\n",
-                 g_controllerCount, g_controllerCount > 1 ? "s" : "",
-                 g_deviceCount, g_deviceCount > 1 ? "s" : "");
-    return 0;
+static uint32_t XhciUacEpState(uint32_t dci)
+{
+    auto& dev = g_devices[g_uac.device];
+    if (!g_uac.ctrl || !dev.outputCtx) return 0;
+    const auto* ep = reinterpret_cast<const volatile uint32_t*>(static_cast<uint8_t*>(dev.outputCtx) +
+                                                               CtxEntrySize(*g_uac.ctrl) * dci);
+    return ep[0] & 7;
+}
+
+static void XhciUacStatus(XhciText& t)
+{
+    auto& s = g_uac;
+    t.s("uac active="); t.u(s.active); t.s(" running="); t.u(s.running);
+    if (!s.ctrl) { t.nl(); return; }
+    t.s(" dev="); t.u(s.device); t.s(" slot="); t.u(s.slotId); t.s(" if="); t.u(s.desc.streamInterface);
+    t.s(" alt="); t.u(s.desc.alternate); t.s(" rate="); t.u(s.rate); t.s(" readback="); t.u(s.rateReadback);
+    t.s(" ep_state data="); t.u(XhciUacEpState(s.dataDci)); t.s(" fb="); t.u(XhciUacEpState(s.fbDci)); t.nl();
+    t.s("data produced="); t.u(s.produced); t.s(" completed="); t.u(s.completed); t.s(" events="); t.u(s.dataEvents);
+    t.s(" frames="); t.u(s.framesSent); t.s(" underruns="); t.u(s.underruns); t.s(" missed="); t.u(s.missed);
+    t.s(" resyncs="); t.u(s.resyncs); t.s(" max_loop_gap_ms="); t.u(s.maxLoopGap); t.s(" underrun_ticks=");
+    for (uint32_t i = 0; i < 4; ++i) { if (i) t.c(','); t.u(s.underrunTick[i]); } t.s(" last_bad_cc="); t.u(s.lastBadCc); t.s(" cc:");
+    for (uint32_t i = 0; i < 32; ++i) if (s.ccCount[i]) { t.c(' '); t.u(i); t.c('='); t.u(s.ccCount[i]); }
+    t.nl();
+    t.s("feedback produced="); t.u(s.fbProduced); t.s(" completed="); t.u(s.fbCompleted); t.s(" events="); t.u(s.fbEvents);
+    t.s(" values="); t.u(s.fbValues); t.s(" raw="); t.x(s.lastFbRaw, 8); t.s(" bytes="); t.u(s.lastFbBytes);
+    t.s(" pacer="); t.x(s.pacer.current, 8); t.s(" nominal="); t.x(s.pacer.nominal, 8);
+    t.s(" accepted="); t.u(s.pacer.accepted); t.s(" rejected="); t.u(s.pacer.rejected); t.nl();
+    t.s("mixer mode="); t.u(s.mixerMode); t.s(" primed="); t.u(s.primed); t.s(" level=");
+    t.u(s.mixWrite - s.mixRead); t.s(" in="); t.u(s.mixFramesIn); t.s(" out="); t.u(s.mixFramesOut);
+    t.s(" underflows="); t.u(s.mixUnderflows); t.s(" dropped="); t.u(s.mixDropped);
+    t.s(" registered="); t.u(g_uacAudioRegistered); t.s(" native epoch="); t.u(s.nativeEpoch);
+    t.s(" submitted="); t.u(s.nativeSubmitted); t.s(" discontinuity="); t.u(s.nativeDiscontinuity);
+    t.s(" clock_ns="); t.u(AudioClockNowNs()); t.nl();
+    t.s("fu current="); t.u(uint16_t(s.fuCurrentQ8)); t.s(" known="); t.u(s.fuKnown); t.s(" override=");
+    t.u(s.fuOverride); t.s(" unmuted_level="); t.u(uint16_t(s.unmutedQ8)); t.s(" skip="); t.x(s.volumeSkip, 2);
+    t.s(" mixer_control="); t.x(AudioOutputControlState(), 5); t.nl();
+    t.s("volume fail_mask="); t.x(g_uacVolumeFailMask, 2); t.s(" fail_cc="); t.u(g_uacVolumeFailCc);
+    t.s(" min="); t.u(uint16_t(s.volumeMin)); t.s(" max="); t.u(uint16_t(s.volumeMax)); t.nl();
+    t.s("tone start_tick="); t.u(s.toneStartTick); t.s(" end_tick="); t.u(s.toneEndTick);
+    t.s(" now="); t.u(ApicTickCount()); t.nl();
+}
+
+static bool XhciUacFindDevice(uint32_t& index)
+{
+    const uint32_t count = __atomic_load_n(&g_deviceCount, __ATOMIC_ACQUIRE);
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto& d = g_devices[i];
+        if (!d.gone && d.ctrl && d.rawConfig && d.scratch && !d.isHub && !d.isKeyboard && !d.isMouse &&
+            !d.isMassStorage && !d.ecm.value && d.vendorId == 0x2708 && d.productId == 0x0006) { index = i; return true; }
+    }
+    return false;
+}
+
+static void XhciUacStart(XhciText& t, uint32_t rate, bool mixer)
+{
+    auto& s = g_uac;
+    if (s.active) { t.s("already active\n"); return; }
+    uint32_t index = 0;
+    if (!XhciUacFindDevice(index)) { t.s("no EVO4 (2708:0006) present\n"); return; }
+    auto& dev = g_devices[index];
+    Uac2Playback desc{};
+    if (!Uac2ParsePlayback(dev.rawConfig, dev.rawConfigLen, 16, desc)) { t.s("no 16-bit UAC2 playback alternate\n"); return; }
+    if (!s.dataRing && !XhciAllocTransferRing(s.dataRing, s.dataRingPhys, s.dataEnq, s.dataCycle)) { t.s("ring alloc\n"); return; }
+    if (!s.fbRing && !XhciAllocTransferRing(s.fbRing, s.fbRingPhys, s.fbEnq, s.fbCycle)) { t.s("ring alloc\n"); return; }
+    if (!s.dataBuf && !(s.dataBuf = static_cast<uint8_t*>(AllocDmaBuffer(8, s.dataBufPhys)))) { t.s("buffer alloc\n"); return; }
+    if (!s.fbBuf && !(s.fbBuf = static_cast<uint8_t*>(AllocDmaBuffer(1, s.fbBufPhys)))) { t.s("buffer alloc\n"); return; }
+    // Fresh rings each start: zero, re-link, producer cycle one.
+    memset(s.dataRing, 0, XFER_RING_SIZE * sizeof(Trb)); XhciInitializeLink(s.dataRing[XFER_RING_SIZE - 1], s.dataRingPhys);
+    memset(s.fbRing, 0, XFER_RING_SIZE * sizeof(Trb)); XhciInitializeLink(s.fbRing[XFER_RING_SIZE - 1], s.fbRingPhys);
+    s.dataEnq = s.fbEnq = 0; s.dataCycle = s.fbCycle = true;
+    s.ctrl = dev.ctrl; s.device = index; s.slotId = dev.slotId; s.desc = desc;
+    s.dataDci = (desc.dataEp & 15) * 2; s.fbDci = (desc.feedbackEp & 15) * 2 + 1;
+    s.frameBytes = uint32_t(desc.channels) * desc.subslot;
+    s.completedHw = 0;
+    s.produced = s.completed = s.fbProduced = s.fbCompleted = s.framesSent = 0;
+    s.dataEvents = s.fbEvents = s.underruns = s.missed = s.resyncs = s.fbValues = s.lastBadCc = 0;
+    for (auto& c : s.ccCount) c = 0;
+    for (auto& u : s.underrunTick) u = 0;
+    s.maxLoopGap = s.lastLoop = 0;
+    s.stopRequested = s.resync = s.toneRequested = s.toneDone = false; s.toneStartTick = s.toneEndTick = 0;
+    s.rate = rate;
+    s.mixerMode = mixer; s.primed = s.flushRequested = false; s.mixRead = s.mixWrite = 0;
+    s.mixFramesIn = s.mixFramesOut = s.mixUnderflows = 0;
+    s.primeWait = 0; s.nativeOutBase = 0; s.nativeSubmitted = 0;
+    // A stream restarted under an already registered mixer driver is a new
+    // epoch (the mixer sees the discontinuity and calls restart()).
+    s.nativeDiscontinuity = g_uacAudioRegistered;
+    s.fuOverride = false; s.fuKnown = false; s.volumeSkip = 0;
+
+    // Playback volume range (feature unit), then the clock rate.
+    uint8_t range[8]{};
+    const uint16_t fuIndex = uint16_t(desc.featureId << 8 | desc.controlInterface);
+    if (!XhciUacControl(dev, 0xa1, 2, 0x0201, fuIndex, nullptr, 8, range)) { t.s("volume range read failed\n"); return; }
+    s.volumeMin = int16_t(range[2] | range[3] << 8); s.volumeMax = int16_t(range[4] | range[5] << 8);
+    // Silence is streamed either way; a failed minimum is reported and blocks tones.
+    s.volumeControl = XhciUacSetVolume(dev, s.volumeMin);
+    s.volumeSkip = g_uacVolumeFailMask & ~0x6u; // stalled extra channels are not retried
+    s.fuCurrentQ8 = s.volumeMin; s.fuKnown = s.volumeControl;
+    if (!s.volumeControl) t.s("warning: volume SET_CUR (minimum) failed on channel 1/2; tones disabled\n");
+    const uint16_t clockIndex = uint16_t(desc.clockId << 8 | desc.controlInterface);
+    uint32_t readback = 0;
+    if (!XhciUacControl(dev, 0x21, 1, 0x0100, clockIndex, &rate, 4)) { t.s("SET_CUR sample rate failed\n"); return; }
+    (void)XhciUacControl(dev, 0xa1, 1, 0x0100, clockIndex, nullptr, 4, &readback);
+    s.rateReadback = readback;
+    s.pacer.Start(s.rate, 8000, (desc.dataMaxPacket & 0x7ff) / s.frameBytes);
+
+    const uint32_t cc = XhciUacConfigureEndpoints(*dev.ctrl, dev, true);
+    if (cc != TRB_CC_SUCCESS) { t.s("Configure Endpoint failed cc="); t.u(cc); t.nl(); return; }
+    if (!XhciUacControl(dev, 0x01, 11, desc.alternate, desc.streamInterface, nullptr, 0)) {
+        (void)XhciUacConfigureEndpoints(*dev.ctrl, dev, false); t.s("SET_INTERFACE failed\n"); return;
+    }
+    __atomic_store_n(&s.active, true, __ATOMIC_RELEASE);
+    if (!g_uacControlRunning) {
+        g_uacControlRunning = true;
+        if (!KernelWorkerStart("uac_control", XhciUacControlThread, nullptr)) g_uacControlRunning = false;
+    }
+    if (!KernelWorkerStart("uac_stream", XhciUacThread, nullptr)) {
+        s.active = false;
+        (void)XhciUacControl(dev, 0x01, 11, 0, desc.streamInterface, nullptr, 0);
+        (void)XhciUacConfigureEndpoints(*dev.ctrl, dev, false);
+        t.s("worker queue full\n"); return;
+    }
+    KPrintf("uac: EVO4 %s stream started if%u alt%u %u Hz (readback %u) volume min %d/256 dB\n", mixer ? "mixer" : "test",
+            desc.streamInterface, desc.alternate, s.rate, readback, int(s.volumeMin));
+    t.s("started\n");
+}
+
+static void XhciUacStop(XhciText& t)
+{
+    auto& s = g_uac;
+    if (!s.active) { t.s("not active\n"); return; }
+    s.stopRequested = true;
+    for (uint32_t i = 0; i < 200 && s.running; ++i) SchedulerSleepMs(1);
+    auto& dev = g_devices[s.device];
+    if (!dev.gone) {
+        (void)XhciUacSetVolume(dev, s.volumeMin);
+        (void)XhciUacControl(dev, 0x01, 11, 0, s.desc.streamInterface, nullptr, 0);
+        const uint32_t dcis[2] = {s.dataDci, s.fbDci};
+        for (uint32_t dci : dcis)
+            (void)XhciSlotCommand(*s.ctrl, 0, TRB_TYPE_STOP_EP | (s.slotId << 24) | (dci << 16));
+        const uint32_t cc = XhciUacConfigureEndpoints(*s.ctrl, dev, false);
+        t.s("drop cc="); t.u(cc); t.nl();
+    }
+    __atomic_store_n(&s.active, false, __ATOMIC_RELEASE);
+    KPrintf("uac: EVO4 stream stopped (produced %u, underruns %u, missed %u)\n", unsigned(s.produced),
+            unsigned(s.underruns), unsigned(s.missed));
+    t.s("stopped\n");
+}
+
+// Parse "<dB> [audible]"; enforce the range and the audio-muted marker.
+static bool XhciUacLevelArg(XhciText& t, const char*& p, int minimum, int maximum, int& dB)
+{
+    while (*p == ' ') ++p;
+    bool negative = false; if (*p == '-') { negative = true; ++p; }
+    if (*p < '0' || *p > '9') { t.s("expected a level in dB\n"); return false; }
+    dB = 0; while (*p >= '0' && *p <= '9') dB = dB * 10 + (*p++ - '0');
+    if (negative) dB = -dB;
+    while (*p == ' ') ++p;
+    const bool audible = XhciArgIs(p, "audible");
+    bool muted = false;
+    if (auto* marker = VfsOpen("/etc/audio-muted")) { VfsClose(marker); muted = true; }
+    if (dB > maximum || dB < minimum) { t.s("refused: level out of range\n"); return false; }
+    if (muted && !audible) { t.s("refused: audio-muted marker present; append 'audible'\n"); return false; }
+    if (!g_uac.volumeControl) { t.s("refused: volume control unavailable\n"); return false; }
+    return true;
+}
+
+// Hand the feature unit to an explicit level and wait (<=300 ms) until the
+// stream thread has applied it.
+static bool XhciUacApplyOverride(bool on, int16_t q8)
+{
+    auto& s = g_uac;
+    s.fuOverrideQ8 = q8; s.fuOverride = on;
+    const int16_t want = on ? q8 : s.volumeMin;
+    for (uint32_t i = 0; i < 300; ++i) {
+        if (s.fuKnown && s.fuCurrentQ8 == want) return true;
+        SchedulerSleepMs(1);
+    }
+    return false;
+}
+
+static void XhciUacTone(XhciText& t, const char* p)
+{
+    auto& s = g_uac;
+    if (!s.active || !s.running) { t.s("stream not running\n"); return; }
+    int dB = 0;
+    if (!XhciUacLevelArg(t, p, -90, -20, dB)) return;
+    s.toneStartTick = s.toneEndTick = 0; s.toneDone = false;
+    const uint64_t volumeTick = ApicTickCount();
+    if (!XhciUacApplyOverride(true, Uac2VolumeQ8(dB, s.volumeMin, s.volumeMax))) {
+        (void)XhciUacApplyOverride(false, 0); t.s("volume set failed\n"); return;
+    }
+    KPrintf("uac: EVO4 volume %d dB from tick %u; 440 Hz tone for 1 s\n", dB, unsigned(volumeTick));
+    s.toneRequested = true;
+    for (uint32_t i = 0; i < 2500 && !s.toneDone; ++i) SchedulerSleepMs(1);
+    s.toneRequested = false;
+    SchedulerSleepMs(40); // let the queued tail (stream lead 28 ms) drain
+    const bool restored = XhciUacApplyOverride(false, 0);
+    const uint64_t restoreTick = ApicTickCount();
+    KPrintf("uac: EVO4 tone generated ticks %u..%u, level released at %u (%s)\n", unsigned(s.toneStartTick),
+            unsigned(s.toneEndTick), unsigned(restoreTick), restored ? "ok" : "FAILED");
+    t.s("tone volume_tick="); t.u(volumeTick); t.s(" start="); t.u(s.toneStartTick); t.s(" end="); t.u(s.toneEndTick);
+    t.s(" restore="); t.u(restoreTick); t.s(restored ? " released\n" : " RELEASE FAILED\n");
+}
+
+// Kernel mixer sink (legacy play contract: 44.1 kHz stereo S16, partial
+// acceptance, never blocks). Without a mixer-mode stream, data is discarded
+// so mixer clients never stall on an absent device.
+static int XhciUacPlay(const void* samples, uint32_t bytes, uint32_t rate, uint8_t channels, uint8_t bits, bool)
+{
+    auto& s = g_uac;
+    if (rate != 44100 || channels != 2 || bits != 16 || (bytes & 3)) return -22;
+    if (!s.active || !s.mixerMode || !s.running) { s.mixDropped += bytes / 4; return int(bytes); }
+    const uint32_t used = s.mixWrite - __atomic_load_n(&s.mixRead, __ATOMIC_ACQUIRE);
+    uint32_t frames = bytes / 4, space = UAC_MIX_FRAMES - used;
+    if (frames > space) frames = space;
+    const auto* in = static_cast<const int16_t*>(samples);
+    for (uint32_t i = 0; i < frames; ++i) {
+        const uint32_t at = ((s.mixWrite + i) % UAC_MIX_FRAMES) * 2;
+        g_uacMix[at] = in[i * 2]; g_uacMix[at + 1] = in[i * 2 + 1];
+    }
+    __atomic_store_n(&s.mixWrite, s.mixWrite + frames, __ATOMIC_RELEASE);
+    s.mixFramesIn += frames;
+    return int(frames * 4);
+}
+static void XhciUacAudioStop() { g_uac.flushRequested = true; }
+static bool XhciUacStreaming() { return g_uac.active && g_uac.mixerMode && g_uac.running && !g_devices[g_uac.device].gone; }
+static bool XhciUacProgress(AudioDeviceProgress* result)
+{
+    auto& s = g_uac;
+    if (!result || !AudioClockNowNs()) return false;
+    if (!XhciUacStreaming()) s.nativeDiscontinuity = true;
+    const uint64_t out = (__atomic_load_n(&s.mixFramesOut, __ATOMIC_ACQUIRE) - s.nativeOutBase) * 4;
+    const uint64_t submitted = s.nativeSubmitted;
+    // Capacity is the publication lead the mixer may keep queued (12 KiB, as
+    // intel_hda's native target), well inside the 32 KiB sink ring.
+    *result = {s.nativeEpoch, submitted, out < submitted ? out : submitted, 12288,
+               XhciUacStreaming(), s.nativeDiscontinuity};
+    return true;
+}
+static AudioSubmitReceipt XhciUacTrySubmit(const void* samples, uint32_t bytes)
+{
+    auto& s = g_uac;
+    AudioSubmitReceipt receipt{s.nativeEpoch, s.nativeSubmitted, 0, 0};
+    if (!samples || !bytes || (bytes & 3)) { receipt.error = -22; return receipt; }
+    if (!AudioClockNowNs()) { receipt.error = -95; return receipt; }
+    if (s.nativeDiscontinuity || !XhciUacStreaming()) { s.nativeDiscontinuity = true; receipt.error = -32; return receipt; }
+    const uint32_t used = s.mixWrite - __atomic_load_n(&s.mixRead, __ATOMIC_ACQUIRE);
+    uint32_t frames = bytes / 4, space = UAC_MIX_FRAMES - used;
+    if (frames > space) frames = space;
+    const auto* in = static_cast<const int16_t*>(samples);
+    for (uint32_t i = 0; i < frames; ++i) {
+        const uint32_t at = ((s.mixWrite + i) % UAC_MIX_FRAMES) * 2;
+        g_uacMix[at] = in[i * 2]; g_uacMix[at + 1] = in[i * 2 + 1];
+    }
+    __atomic_store_n(&s.mixWrite, s.mixWrite + frames, __ATOMIC_RELEASE);
+    s.mixFramesIn += frames;
+    s.nativeSubmitted += frames * 4;
+    receipt.accepted = frames * 4;
+    return receipt;
+}
+static bool XhciUacRestart(uint64_t expectedEpoch)
+{
+    auto& s = g_uac;
+    if (!s.nativeDiscontinuity || expectedEpoch != s.nativeEpoch || !XhciUacStreaming()) return false;
+    s.flushRequested = true;
+    for (uint32_t i = 0; i < 50 && s.flushRequested; ++i) SchedulerSleepMs(1);
+    s.nativeOutBase = s.mixFramesOut; s.nativeSubmitted = 0;
+    s.nativeDiscontinuity = false; ++s.nativeEpoch;
+    return true;
+}
+static bool XhciUacAudioPlaying() { return g_uac.active && g_uac.mixerMode && g_uac.mixWrite != g_uac.mixRead; }
+static uint32_t XhciUacAudioPosition() { return uint32_t(g_uac.mixFramesOut * 4); }
+static AudioDriver g_uacAudioDriver = {"usb_uac2", XhciUacPlay, XhciUacAudioStop, XhciUacAudioPlaying, XhciUacAudioPosition,
+                                       nullptr, XhciUacTrySubmit, XhciUacProgress, XhciUacRestart};
+
+static uint32_t XhciUacCommand(const char* p, XhciText& t)
+{
+    auto& s = g_uac;
+    while (*p == ' ') ++p;
+    if (XhciArgIs(p, "usb")) while (*p == ' ') ++p;
+    if (!*p || XhciArgIs(p, "status")) XhciUacStatus(t);
+    else if (XhciArgIs(p, "start")) { XhciUacStart(t, 48000, false); XhciUacStatus(t); }
+    else if (XhciArgIs(p, "mixer")) {
+        // Stream first, so the mixer's first refresh already sees a running
+        // native clock (it latches legacy delivery otherwise).
+        XhciUacStart(t, 44100, true);
+        if (!g_uacAudioRegistered && s.active) {
+            g_uacAudioRegistered = AudioRegister(&g_uacAudioDriver);
+            if (!g_uacAudioRegistered) t.s("another audio driver is registered\n");
+        }
+        XhciUacStatus(t);
+    }
+    else if (XhciArgIs(p, "stop")) { XhciUacStop(t); XhciUacStatus(t); }
+    else if (XhciArgIs(p, "tone")) { XhciUacTone(t, p); XhciUacStatus(t); }
+    else if (XhciArgIs(p, "level")) {
+        int dB = 0;
+        if (XhciUacLevelArg(t, p, -90, 0, dB)) {
+            s.unmutedQ8 = Uac2VolumeQ8(dB, s.volumeMin, s.volumeMax);
+            t.s("unmuted level set (applies after an explicit user unmute)\n");
+        }
+        XhciUacStatus(t);
+    }
+    else if (XhciArgIs(p, "drain")) {
+        // Wait (<=2 s) until the mixer sink ring is empty, plus the stream lead.
+        uint32_t waited = 0;
+        while (s.active && s.mixerMode && s.mixWrite != s.mixRead && waited < 2000) { SchedulerSleepMs(1); ++waited; }
+        SchedulerSleepMs(40);
+        t.s("drained after "); t.u(waited); t.s(" ms\n");
+    }
+    else if (XhciArgIs(p, "override")) {
+        while (*p == ' ') ++p;
+        if (XhciArgIs(p, "off")) t.s(XhciUacApplyOverride(false, 0) ? "override off\n" : "override off: not applied\n");
+        else { int dB = 0; if (s.running && XhciUacLevelArg(t, p, -90, -20, dB))
+            t.s(XhciUacApplyOverride(true, Uac2VolumeQ8(dB, s.volumeMin, s.volumeMax)) ? "override on\n" : "override: not applied\n"); }
+    }
+    else t.s("usage: bridge hardware audio usb [status|start|mixer|stop|tone <dB> audible|level <dB> audible|override <dB> audible|off]");
+    return t.len;
+}
+
+// Desktop live stick (/etc/usb-audio-mixer): once the EVO4 is present, make
+// it the mixer sink. Volume stays at the device minimum until an explicit
+// user unmute (see the stream thread); the mixer itself starts muted when
+// /etc/audio-muted exists.
+// Rings and buffers for the UAC stream are allocated once, at module init,
+// before large boot-time RAM images move the allocator above the DMA limit.
+static bool XhciUacPrealloc()
+{
+    auto& s = g_uac;
+    if (!s.dataRing && !XhciAllocTransferRing(s.dataRing, s.dataRingPhys, s.dataEnq, s.dataCycle)) return false;
+    if (!s.fbRing && !XhciAllocTransferRing(s.fbRing, s.fbRingPhys, s.fbEnq, s.fbCycle)) return false;
+    if (!s.dataBuf && !(s.dataBuf = static_cast<uint8_t*>(AllocDmaBuffer(8, s.dataBufPhys)))) return false;
+    if (!s.fbBuf && !(s.fbBuf = static_cast<uint8_t*>(AllocDmaBuffer(1, s.fbBufPhys)))) return false;
+    return true;
+}
+
+// Set once the /etc/usb-audio-mixer autostart ran: the hotplug worker then
+// keeps the EVO4 as the mixer sink across detach/attach (KVM switch).
+static volatile bool g_uacAutoMixer = false;
+static void XhciUacAutoStart(void*)
+{
+    g_uacAutoMixer = true;
+    uint32_t index = 0;
+    for (uint32_t i = 0; i < 60 && !XhciUacFindDevice(index); ++i) SchedulerSleepMs(500);
+    static char text[1024];
+    XhciText t{text, sizeof(text), 0};
+    XhciUacCommand("usb mixer", t);
+    text[t.len < sizeof(text) ? t.len : sizeof(text) - 1] = 0;
+    char* end = text; while (*end && *end != '\n') ++end; *end = 0;
+    KPrintf("uac: autostart (usb-audio-mixer marker): %s\n", text);
+}
+
+// EVO4 detach/attach: the stream thread exits when its device is gone; clear
+// the stream so a re-attached EVO4 (new slot) can be brought up again as the
+// mixer sink. The mixer driver stays registered; the restart is a new epoch
+// (discontinuity), so mixer clients carry on.
+static void XhciUacHotplugTick()
+{
+    static uint64_t nextTryMs = 0;
+    static uint32_t fails = 0;
+    auto& s = g_uac;
+    if (s.active && g_devices[s.device].gone) {
+        s.stopRequested = true;
+        for (uint32_t i = 0; i < 200 && s.running; ++i) SchedulerSleepMs(1);
+        if (s.running) return; // stream thread still unwinding; next tick
+        __atomic_store_n(&s.active, false, __ATOMIC_RELEASE);
+        KPrintf("uac: EVO4 detached; stream cleared (produced %u, underruns %u)\n",
+                unsigned(s.produced), unsigned(s.underruns));
+        nextTryMs = 0; fails = 0;
+    }
+    if (!g_uacAutoMixer || s.active) return;
+    uint32_t index = 0;
+    if (!XhciUacFindDevice(index)) return;
+    const uint64_t now = ApicTickCount();
+    if (now < nextTryMs) return;
+    static char text[256];
+    XhciText t{text, sizeof(text), 0};
+    XhciUacCommand("usb mixer", t); // same path as the boot autostart
+    text[t.len < sizeof(text) ? t.len : sizeof(text) - 1] = 0;
+    char* end = text; while (*end && *end != '\n') ++end; *end = 0;
+    if (s.active) { fails = 0; KPrintf("uac: EVO4 re-attached; mixer stream restarted: %s\n", text); return; }
+    ++fails; nextTryMs = now + (fails >= 5 ? 30000 : 2000);
+    KPrintf("uac: EVO4 re-attach start failed (%u): %s\n", fails, text);
+}
+
+static int XhciModuleInit()
+{
+    SerialPuts("xhci: initializing USB 3.0 host controller driver\n");
+    if(auto* marker=VfsOpen("/etc/usb-read-only")) {
+        g_storageReadOnly=true;VfsClose(marker);KPuts("xhci: physical storage probe is read-only\n");
+    }
+    if(auto* marker=VfsOpen("/etc/usb-msc-page-chunks")) {
+        g_storagePageChunks=true;VfsClose(marker);
+        KPuts("xhci: diagnostic MSC limit=4096 bytes (single data TRB)\n");
+    }
+
+    // Drive every xHCI function: chipset and add-in controllers alike.
+    PciDevice found[MAX_CONTROLLERS];
+    const uint32_t count = XhciFindControllers(found, MAX_CONTROLLERS);
+    if (!count) {
+        SerialPuts("xhci: no controller detected, module inactive\n");
+        static char none[128];
+        const uint32_t length = XhciStatusText(none, sizeof(none));
+        UsbStatusPublish(none, length);
+        return 0; // not an error — just no hardware present
+    }
+    uint32_t up = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        auto& ctrl = g_controllers[i];
+        ctrl.index = i;
+        ctrl.pciDev = found[i];
+        __atomic_store_n(&g_controllerCount, i + 1, __ATOMIC_RELEASE);
+        if (XhciBringUp(ctrl)) ++up;
+        else KPrintf("xhci: c%u %04x:%04x not driven: %s\n", i, found[i].vendorId, found[i].deviceId,
+                     ctrl.failure ? ctrl.failure : "unknown");
+    }
+
+    // Scan ports and enumerate connected devices, hubs included.
+    for (uint32_t i = 0; i < count; ++i) {
+        auto& ctrl = g_controllers[i];
+        if (!ctrl.initialized) continue;
+        XhciInitialRootScan(ctrl);
+        // Process any pending port status change events
+        while (XhciWaitForEvent(ctrl, 0, 50)) {}
+    }
+    if(g_storageReadOnly)KPrintf("xhci: initial port scan found %u USB devices\n",g_deviceCount);
+
+    for (uint32_t i = 0; i < count; ++i) {
+        auto& ctrl = g_controllers[i];
+        if (!ctrl.initialized) continue;
+        ctrl.completionFailed = false;
+        XhciSetupInterrupts(ctrl);
+    }
+
+    KPrintf("xhci: driver initialized (%u of %u controller%s, %u device%s)\n",
+                 up, count, count > 1 ? "s" : "",
+                 g_deviceCount, g_deviceCount != 1 ? "s" : "");
+
+    static char text[6144];
+    const uint32_t length = XhciStatusText(text, sizeof(text));
+    UsbStatusPublish(text, length);
+    if (up) {
+        // The provider and worker live in this module: register them only
+        // when init succeeds, because a failed module is unloaded. Hotplug
+        // (root and hub port polling) is opt-in so existing payloads keep
+        // their boot-time-only enumeration.
+        UsbStatusSetProvider(XhciStatusText);
+        DebugUsbCommandSetHandler(XhciUsbCommand);
+        if (!XhciUacPrealloc()) KPuts("uac: stream buffers unavailable at init\n");
+        // Late-enumeration reserve (see AllocDmaReserve): 8 MiB, else 2 MiB.
+        static const uint32_t reserveSizes[] = {2048u, 512u};
+        for (uint32_t pages : reserveSizes) {
+            uint64_t phys = 0;
+            if (auto* r = static_cast<uint8_t*>(AllocDmaBufferDirect(pages, phys, PmmOwner::XhciDma))) {
+                g_dmaReservePhys = phys; g_dmaReservePages = pages; g_dmaReserve = r;
+                KPrintf("xhci: DMA reserve %u pages at %lx for hot-plug enumeration\n", pages,
+                        static_cast<unsigned long>(phys));
+                break;
+            }
+        }
+        if (auto* marker = VfsOpen("/etc/usb-audio-mixer")) {
+            VfsClose(marker);
+            if (!KernelWorkerStart("uac_auto", XhciUacAutoStart, nullptr)) KPuts("uac: autostart worker queue full\n");
+        }
+        (void)PlatformPowerAddQuiesce(XhciQuiesceForReset);
+        bool hotplug = false;
+        static const char* const markers[] = {"/etc/usb-hotplug", "/etc/boot-status"};
+        for (const char* path : markers)
+            if (auto* marker = VfsOpen(path)) { VfsClose(marker); hotplug = true; }
+        if (hotplug && !KernelWorkerStart("xhci_hotplug", XhciHotplugThread, nullptr))
+            KPuts("xhci: hotplug worker unavailable (no late devices)\n");
+    }
+    BootStatusPrint("xhci init");
+    return up ? 0 : -1;
 }
 
 static void XhciModuleExit()

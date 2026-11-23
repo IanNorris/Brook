@@ -1,4 +1,5 @@
 #include "pci.h"
+#include "pci_quiesce.h"
 #include "portio.h"
 #include "serial.h"
 #include "spinlock.h"
@@ -59,6 +60,17 @@ void PciConfigWrite32(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t offset, uint
 void PciConfigWrite16(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t offset, uint16_t val)
 {
     PciConfigAccess<ConfigLock,ConfigIo>(configLock,configIo).Write16(bus,dev,fn,offset,val);
+}
+
+uint32_t PciQuiesceFunctionForReset(uint8_t bus, uint8_t dev, uint8_t fn)
+{
+    struct Config {
+        uint8_t b, d, f;
+        uint8_t read8(uint8_t o) { return PciConfigRead8(b, d, f, o); }
+        uint16_t read16(uint8_t o) { return PciConfigRead16(b, d, f, o); }
+        void write16(uint8_t o, uint16_t v) { PciConfigWrite16(b, d, f, o, v); }
+    } config{bus, dev, fn};
+    return PciQuiesceForReset(config);
 }
 
 // ---- Device scan helpers ----

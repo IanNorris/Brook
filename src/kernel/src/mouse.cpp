@@ -33,16 +33,28 @@ bool WmPointerCaptureActive();
 // Wait for the 8042 input buffer to be empty (ready to accept a command).
 static void WaitWrite()
 {
-    for (int i = 0; i < 100000; i++)
+    const uint64_t start = ApicTickCount();
+    for (int i = 0; i < 100000; i++) {
         if ((inb(0x64) & 0x02) == 0) return;
+        if ((i & 63) == 63 && ApicTickCount() - start >= 50) return;
+    }
 }
 
-// Wait for the 8042 output buffer to have data.
-static void WaitRead()
+// Wait for the 8042 output buffer to have data. Bounded by both an
+// iteration count (the historic bound, valid even without a running clock)
+// and elapsed time: where firmware emulates the 8042 in SMM (USB legacy
+// support on desktop boards), one status read can take several microseconds,
+// so 100000 reads were ~0.5 s per wait with no mouse attached.
+static bool WaitReadMs(uint64_t ms)
 {
-    for (int i = 0; i < 100000; i++)
-        if (inb(0x64) & 0x01) return;
+    const uint64_t start = ApicTickCount();
+    for (int i = 0; i < 100000; i++) {
+        if (inb(0x64) & 0x01) return true;
+        if ((i & 63) == 63 && ApicTickCount() - start >= ms) return false;
+    }
+    return false;
 }
+static void WaitRead() { (void)WaitReadMs(100); }
 
 // Send a command byte to the PS/2 auxiliary (mouse) port.
 static void MouseCmd(uint8_t cmd)
@@ -115,6 +127,8 @@ static volatile uint32_t g_maxY     = 1080;
 static volatile uint8_t  g_buttons  = 0;
 static volatile uint8_t  g_prevButtons = 0;
 static bool              g_mouseInit = false;
+static bool              g_usbMouseAvailable = false;
+static uint8_t           g_usbMouseButtons = 0;
 static uint8_t           g_mouseId   = 0;   // 0=3-byte legacy, 3=IntelliMouse wheel, 4=Explorer (5 btn + H wheel)
 static uint8_t           g_packetLen = 3;
 static bool              g_vmmouseActive = false;
@@ -659,6 +673,10 @@ void MouseInit()
         VmMouseCall(vmmouse::Command, vmmouse::Disable);
 
     SerialPuts("MOUSE: initialising PS/2 auxiliary device\n");
+    if (inb(0x64) == 0xff) {
+        KPuts("MOUSE: no PS/2 controller (status 0xff); mouse unavailable\n");
+        return;
+    }
 
     // Flush any stale bytes
     for (unsigned i=0;i<32 && (inb(0x64)&1);++i) (void)inb(0x60);
@@ -680,13 +698,27 @@ void MouseInit()
     // Reset mouse — sends 0xFF via auxiliary port.
     // Response: 0xFA (ACK) + 0xAA (self-test) + 0x00 (device ID)
     // MouseCmd already consumes the ACK; read the remaining two bytes.
-    MouseCmd(0xFF);
+    // A device ACKs within 25 ms (PS/2); with no byte at all after 200 ms
+    // there is no auxiliary device, so skip the self-test wait.
+    WaitWrite();
+    outb(0x64, 0xD4);
+    WaitWrite();
+    outb(0x60, 0xFF);
+    if (!WaitReadMs(200)) {
+        SerialPuts("MOUSE: no reply to reset, aborting\n");
+        KPrintf("MOUSE: no PS/2 auxiliary device (no reset reply); mouse unavailable\n");
+        return;
+    }
+    (void)inb(0x60);     // ACK (0xFA)
 
-    // The self-test response can take up to 500ms. Retry reads.
+    // The self-test response can take up to 500ms. Retry reads, bounded
+    // to one second in total.
     uint8_t selfTest = 0;
+    const uint64_t selfTestStart = ApicTickCount();
     for (int retry = 0; retry < 10; retry++)
     {
-        WaitRead();
+        const uint64_t spent = ApicTickCount() - selfTestStart;
+        if (spent >= 1000 || !WaitReadMs(1000 - spent)) break;
         uint8_t b = inb(0x60);
         if (b == 0xAA) { selfTest = b; break; }
         if (b == 0xFC) { selfTest = b; break; } // self-test failed
@@ -749,7 +781,7 @@ void MouseInit()
 
 bool MouseIsAvailable()
 {
-    return g_mouseInit;
+    return g_mouseInit || __atomic_load_n(&g_usbMouseAvailable, __ATOMIC_ACQUIRE);
 }
 
 void MouseGetPosition(int32_t* x, int32_t* y)
@@ -782,7 +814,7 @@ void MouseMoveRelative(int32_t dx,int32_t dy)
 
 uint8_t MouseGetButtons()
 {
-    return g_buttons;
+    return g_buttons | __atomic_load_n(&g_usbMouseButtons, __ATOMIC_ACQUIRE);
 }
 
 void MouseSetPosition(int32_t x, int32_t y)
@@ -800,6 +832,16 @@ void MouseSetPosition(int32_t x, int32_t y)
 void MouseSetButtons(uint8_t buttons)
 {
     g_buttons = buttons;
+}
+
+void MouseSetUsbButtons(uint8_t buttons)
+{
+    __atomic_store_n(&g_usbMouseButtons, buttons, __ATOMIC_RELEASE);
+}
+
+void MouseSetUsbAvailable(bool available)
+{
+    __atomic_store_n(&g_usbMouseAvailable, available, __ATOMIC_RELEASE);
 }
 
 void MouseSetAvailable(bool available)

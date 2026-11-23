@@ -28,6 +28,9 @@ struct WritableDesktopInfo {
 // Serialized boot only. System must be passed only after a separately verified
 // system volume is mounted; this never falls back between the two sources.
 WritableDesktopBoot WritableDesktopBootMount(uint8_t* nextDrive,WritableDesktopSource source=WritableDesktopSource::Usb);
+// Live stick: a verified RAM image (ext2) mounted read-write at /nix with the
+// usual payload checks and /data/home bind; RAM only, nothing to finalize.
+WritableDesktopBoot WritableDesktopLiveMount(uint8_t* nextDrive,Device* ram,uint64_t bytes);
 WritableDesktopInfo WritableDesktopRead();
 // Shutdown worker only, after successful global VFS sync with write admission
 // closed/drained and still owned by this thread. Failed admission is never armed.

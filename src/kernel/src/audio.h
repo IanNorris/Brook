@@ -118,6 +118,8 @@ uint32_t AudioUserOutputControlSerial();
 // One atomic snapshot: control in low bits, explicit user authorization bit.
 static constexpr uint32_t AudioUserUnmuteBit=1u<<16;
 uint32_t AudioOutputControlSnapshot();
+// Module-visible snapshot (same value), for drivers that gate hardware gain.
+extern "C" uint32_t AudioOutputControlState();
 
 // --- Mixer API ---
 // All samples must be 44100 Hz, stereo, 16-bit signed LE before submission.

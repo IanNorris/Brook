@@ -2,6 +2,8 @@
 #include <cstring>
 #include <string>
 #include "platform_power.h"
+#include "pci_quiesce.h"
+#include <vector>
 namespace {brook::AcpiResetInfo firmware;std::string mode;}
 namespace brook {
 const AcpiResetInfo& AcpiGetResetInfo(){return firmware;}
@@ -16,6 +18,36 @@ struct Trace {
     static bool efi(void* p,uint64_t entry){auto& t=*static_cast<Trace*>(p);++t.count;t.width=64;t.value=entry;return t.accept;}
     brook::PowerIo io(){return {this,byte,word};}
 };
+namespace quiesce {
+std::vector<int> order;
+void a(){order.push_back(1);} void b(){order.push_back(2);}
+struct Config {
+    uint8_t space[256]{};std::vector<std::pair<uint8_t,uint16_t>> writes;
+    uint8_t read8(uint8_t o){return space[o];}
+    uint16_t read16(uint8_t o){return uint16_t(space[o]|space[o+1]<<8);}
+    void write16(uint8_t o,uint16_t v){writes.push_back({o,v});space[o]=uint8_t(v);space[o+1]=uint8_t(v>>8);}
+    void set16(uint8_t o,uint16_t v){space[o]=uint8_t(v);space[o+1]=uint8_t(v>>8);}
+};
+void Test(){
+    using namespace brook;
+    PowerQuiesceList list;
+    assert(!list.Add(nullptr) && list.Add(a) && list.Add(b) && list.Add(a) && list.count==2);
+    assert(list.Run()==2 && order==std::vector<int>({2,1})); // reverse registration order
+    for(unsigned i=list.count;i<PowerQuiesceList::Capacity;++i)assert(list.Add(reinterpret_cast<PowerQuiesceFn>(uintptr_t(0x1000+i))));
+    assert(!list.Add(reinterpret_cast<PowerQuiesceFn>(uintptr_t(0x2000))));
+    // Bus master on, MSI enabled at 0x50, MSI-X enabled at 0x70, a PM cap first.
+    Config c;c.set16(0,0x8086);c.set16(4,0x0006);c.set16(6,0x0010);c.space[0x34]=0x40;
+    c.space[0x40]=0x01;c.space[0x41]=0x50;c.space[0x50]=0x05;c.space[0x51]=0x70;c.set16(0x52,0x0081);
+    c.space[0x70]=0x11;c.space[0x71]=0x00;c.set16(0x72,0x8003);
+    assert(PciQuiesceForReset(c)==3);
+    assert(c.read16(4)==0x0402 && c.read16(0x52)==0x0080 && c.read16(0x72)==0x0003);
+    assert(PciQuiesceForReset(c)==0 && c.writes.size()==3); // idempotent
+    Config gone;gone.set16(0,0xffff);assert(PciQuiesceForReset(gone)==0 && gone.writes.empty());
+    Config loop;loop.set16(0,0x10de);loop.set16(4,0x0406);loop.set16(6,0x0010);loop.space[0x34]=0x40;
+    loop.space[0x40]=0x09;loop.space[0x41]=0x40; // self-referencing list stays bounded
+    assert(PciQuiesceForReset(loop)==1 && loop.read16(4)==0x0402);
+}
+}
 struct SleepTrace {
     struct Write {uint16_t port,value;};
     Write writes[4]{};
@@ -64,6 +96,7 @@ void TestedSleep()
 
 int main(){
     using namespace brook;Trace trace;
+    quiesce::Test();
     TestedSleep();
     PlatformPowerConfigure();auto plan=PlatformPowerGetPlan();assert(!plan.CanReset() && !plan.CanPowerOff());
     assert(!plan.Issue(true,trace.io()) && !plan.Issue(false,trace.io()) && !trace.count);

@@ -44,6 +44,10 @@ extern "C" brook::KernelSymbol __stop_ksymtab[];
 #include "sync/kmutex.h"
 #include "kvmclock.h"
 #include "usb_boot_health.h"
+#include "boot_status.h"
+#include "debug_hardware.h"
+#include "pci_quiesce.h"
+#include "platform_power.h"
 
 // Bring all brook:: names into scope so EXPORT_SYMBOL(fn) resolves correctly.
 using namespace brook;
@@ -66,6 +70,14 @@ EXPORT_SYMBOL(SerialPrintf);
 EXPORT_SYMBOL(SerialVPrintf);
 EXPORT_SYMBOL(SerialPuts);
 EXPORT_SYMBOL(UsbBootReportReset);
+EXPORT_SYMBOL(UsbStatusPublish);
+EXPORT_SYMBOL(UsbStatusSetProvider);
+EXPORT_SYMBOL(UsbStatusChanged);
+EXPORT_SYMBOL(BootStatusPrint);
+EXPORT_SYMBOL(KernelWorkerStart);
+EXPORT_SYMBOL(BootStatusAddProvider);
+EXPORT_SYMBOL(DebugNicCommandSetHandler);
+EXPORT_SYMBOL(DebugUsbCommandSetHandler);
 
 // Physical memory
 EXPORT_SYMBOL(PmmAllocPage);
@@ -123,6 +135,8 @@ EXPORT_SYMBOL(PciConfigRead16);
 EXPORT_SYMBOL(PciConfigRead8);
 EXPORT_SYMBOL(PciConfigWrite16);
 EXPORT_SYMBOL(PciConfigWrite32);
+EXPORT_SYMBOL(PciQuiesceFunctionForReset);
+EXPORT_SYMBOL(PlatformPowerAddQuiesce);
 
 // Display
 EXPORT_SYMBOL(DisplayRegister);
@@ -162,6 +176,8 @@ EXPORT_SYMBOL(MouseSetPosition);
 EXPORT_SYMBOL(MouseMoveRelative);
 EXPORT_SYMBOL(MouseSetButtons);
 EXPORT_SYMBOL(MouseSetAvailable);
+EXPORT_SYMBOL(MouseSetUsbAvailable);
+EXPORT_SYMBOL(MouseSetUsbButtons);
 
 // virtio-blk
 EXPORT_SYMBOL(VirtioBlkInitAll);
@@ -219,6 +235,7 @@ EXPORT_SYMBOL(NetWakePollThread);
 
 // Audio
 EXPORT_SYMBOL(AudioRegister);
+EXPORT_SYMBOL(AudioOutputControlState);
 EXPORT_SYMBOL(AudioRegisterWithHdaStatus);
 EXPORT_SYMBOL(AudioMixerRequestDefaultStaging);
 EXPORT_SYMBOL(AudioClockNowNs);

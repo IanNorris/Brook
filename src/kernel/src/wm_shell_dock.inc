@@ -724,7 +724,9 @@ static void DockSaveState()
     VfsPath root{}, directory{};
     LauncherPersistenceResult result;
     if (const int error = VfsPathRoot(&root)) result = {"root", error};
-    else if (const int dirError = LauncherConfigDir(root, &directory)) result = {"directory", dirError};
+    else if (const int dirError = LauncherConfigDir(root, &directory))
+        result = dirError == LauncherNoPersistentHome ? LauncherPersistenceResult{"no-store", 0} :
+                                                        LauncherPersistenceResult{"directory", dirError};
     else result = LauncherWriteLayout(root, directory, text, bytes, DockStateTemp, DockStateName);
     VfsPathRelease(directory);
     VfsPathRelease(root);
