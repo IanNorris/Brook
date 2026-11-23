@@ -42,7 +42,9 @@ class SchedLockStats {
         LockStatSite site[LockStatSiteSlots]{};
     };
     uint32_t enabled_=0;
-    uint64_t epoch_=1;
+    // Epoch 0 matches the zeroed rows, so the global stays in .bss; Reset
+    // bumps it and writers clear their own row on first use.
+    uint64_t epoch_=0;
     Cpu cpu_[LockStatCpus]{};
     static uint64_t Load(const uint64_t& v){return __atomic_load_n(&v,__ATOMIC_RELAXED);}
     static void Store(uint64_t& v,uint64_t x){__atomic_store_n(&v,x,__ATOMIC_RELAXED);}

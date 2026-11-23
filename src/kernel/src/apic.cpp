@@ -26,6 +26,10 @@ extern "C" void PlatformPowerResetWatchdogTick(uint64_t now);
 // Declared at global scope in idt.cpp
 void IdtInstallHandler(uint8_t vector, void* handler);
 
+// Tagged placement new (freestanding: no <new>) for the timer IRQ slots.
+struct BrookTimerSlotPlace{};
+inline void* operator new(__SIZE_TYPE__,void* storage,BrookTimerSlotPlace) noexcept {return storage;}
+
 namespace brook {
 
 // Per-CPU lock diagnostics — indexed by CPU index.
@@ -335,10 +339,23 @@ static SpinLock g_timerIrqControlLock;
 struct alignas(64) TimerIrqArrivalSlot {
     SpinLock lock;TimerIrqArrivalModel model;uint64_t dropped=0;
 };
-static TimerIrqArrivalSlot g_timerIrqSlots[MAX_CPUS];
+// The arrival model has non-zero sentinels; as a constant-initialised array it
+// sat in .data (~230 KB). Raw .bss storage, constructed by
+// TimerIrqArrivalSlotsInit() at the start of ApicInit (BSP, before the LAPIC
+// timer runs). Every path checks g_timerIrqSlotsReady; samples need an odd
+// epoch, which only TimerIrqArrivalsChange (after init) publishes.
+alignas(TimerIrqArrivalSlot) static uint8_t g_timerIrqSlotStorage[sizeof(TimerIrqArrivalSlot)*MAX_CPUS];
+static bool g_timerIrqSlotsReady=false;
+#define g_timerIrqSlots (reinterpret_cast<TimerIrqArrivalSlot*>(g_timerIrqSlotStorage))
+static void TimerIrqArrivalSlotsInit(){
+    if(__atomic_load_n(&g_timerIrqSlotsReady,__ATOMIC_ACQUIRE))return;
+    for(unsigned cpu=0;cpu<MAX_CPUS;++cpu)new(&g_timerIrqSlots[cpu],BrookTimerSlotPlace{}) TimerIrqArrivalSlot{};
+    __atomic_store_n(&g_timerIrqSlotsReady,true,__ATOMIC_RELEASE);
+}
 static uint64_t g_timerIrqEpoch=0;
 static bool g_timerIrqExhausted=false;
 static void TimerIrqArrivalsChange(bool enabled,bool clear){
+    if(!__atomic_load_n(&g_timerIrqSlotsReady,__ATOMIC_ACQUIRE))return;
     // Caller holds control lock. Publish off before resetting individual CPU
     // slots; a delayed old IRQ sample is rejected by the slot's new epoch.
     const auto old=__atomic_load_n(&g_timerIrqEpoch,__ATOMIC_ACQUIRE);
@@ -363,7 +380,7 @@ void TimerIrqArrivalsReset(){
 uint64_t TimerIrqArrivalsEpoch(){return __atomic_load_n(&g_timerIrqEpoch,__ATOMIC_ACQUIRE);}
 unsigned TimerIrqArrivalsCpuCapacity(){return MAX_CPUS;}
 TimerIrqArrivalSnapshot TimerIrqArrivalsRead(unsigned cpu){
-    if(cpu>=MAX_CPUS)return {};
+    if(cpu>=MAX_CPUS || !__atomic_load_n(&g_timerIrqSlotsReady,__ATOMIC_ACQUIRE))return {};
     SpinLockAcquire(&g_timerIrqSlots[cpu].lock);auto s=g_timerIrqSlots[cpu].model.Snapshot();SpinLockRelease(&g_timerIrqSlots[cpu].lock);
     s.contended=__atomic_load_n(&g_timerIrqSlots[cpu].dropped,__ATOMIC_RELAXED);return s;
 }
@@ -706,6 +723,7 @@ bool ApicInit(uint64_t localApicPhysical)
         return false;
     }
 
+    TimerIrqArrivalSlotsInit();
     DisablePic();
 
     if (!EnableLapicMsr())   return false;

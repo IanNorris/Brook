@@ -464,7 +464,6 @@ add_executable(kernel
     "${FONT_ATLAS_CPP}"
     "${VDSO_CPP}"
     ${DESKTOP_FONT_SOURCES}
-    "${FAT_IMAGE_CPP}"
     "${BROOK_ROOT}/src/shared/src_km/serial.cpp"
     # FatFS (C source — compiled from a build-dir copy so our ffconf.h overlay
     # is found naturally by #include "ffconf.h" in ff.c / ff.h).
@@ -681,6 +680,14 @@ if(BROOK_SSD_GUARDED_DESKTOP_RESET_TEST)
 endif()
 if(BROOK_SSD_GUARDED_DESKTOP_RESET)
     target_compile_definitions(kernel PRIVATE BROOK_SSD_GUARDED_DESKTOP_RESET=1)
+endif()
+# Embedded FAT16 test image (~360 KB .rodata), mounted as / only when the
+# loader supplies no initrd. Every current boot path supplies one, so it is
+# off by default.
+option(BROOK_EMBEDDED_FAT_IMAGE "Embed the FAT16 test image used as / when no initrd is supplied" OFF)
+if(BROOK_EMBEDDED_FAT_IMAGE)
+    target_sources(kernel PRIVATE "${FAT_IMAGE_CPP}")
+    target_compile_definitions(kernel PRIVATE BROOK_EMBEDDED_FAT_IMAGE=1)
 endif()
 # NVIDIA desktop display support (RTX desktop images): nv-aux, nv-disp step 3 /
 # head 1 / resident driver, dp-idle and link watch, the pre-reset GPU reset.

@@ -48,6 +48,9 @@ struct ArpNeighborStats {
 template<unsigned Capacity,unsigned QueueSlots,unsigned PerNeighbor,unsigned FrameMax>
 class ArpNeighborTable {
     static_assert(Capacity>0 && QueueSlots>0 && PerNeighbor>0 && FrameMax>=6,"invalid ARP table shape");
+    uint64_t RetryMs() const { return timing_.retryMs ? timing_.retryMs : ArpNeighborTiming{}.retryMs; }
+    uint32_t MaxProbes() const { return timing_.maxProbes ? timing_.maxProbes : ArpNeighborTiming{}.maxProbes; }
+    uint64_t RefreshMs() const { return timing_.refreshMs ? timing_.refreshMs : ArpNeighborTiming{}.refreshMs; }
 public:
     enum class State : uint8_t { Free, Incomplete, Valid };
     enum class Result : uint8_t { Found, Pending, Failed };
@@ -58,7 +61,10 @@ public:
     };
 
     // constexpr: kernel globals must be constant-initialized (no .init_array).
-    constexpr explicit ArpNeighborTable(ArpNeighborTiming timing={}) : timing_(timing) {}
+    // A zero timing field means its ArpNeighborTiming default, so the default
+    // table is all-zero and the kernel global stays in .bss.
+    constexpr ArpNeighborTable() : timing_{0,0,0} {}
+    constexpr explicit ArpNeighborTable(ArpNeighborTiming timing) : timing_(timing) {}
 
     // Look up ip. A Valid entry returns Found (and may ask for a refresh
     // probe). Otherwise, when create is true, an Incomplete entry is created
@@ -68,15 +74,15 @@ public:
         Entry* e=Find(ip);
         if(e && e->state==State::Valid){
             e->used=now;
-            if(now-e->confirmed<timing_.refreshMs){Copy(out.mac,e->mac);out.result=Result::Found;return out;}
-            if(e->probes>=timing_.maxProbes && now>=e->nextProbe){
+            if(now-e->confirmed<RefreshMs()){Copy(out.mac,e->mac);out.result=Result::Found;return out;}
+            if(e->probes>=MaxProbes() && now>=e->nextProbe){
                 // Refresh requests went unanswered: the neighbor is gone or
                 // changed address. Resolve again from scratch.
                 ++stats_.refreshFailures;Restart(*e,now);
             } else {
                 Copy(out.mac,e->mac);out.result=Result::Found;
-                if(now>=e->nextProbe && e->probes<timing_.maxProbes){
-                    ++e->probes;e->nextProbe=now+timing_.retryMs;out.sendRequest=true;++stats_.refreshProbes;
+                if(now>=e->nextProbe && e->probes<MaxProbes()){
+                    ++e->probes;e->nextProbe=now+RetryMs();out.sendRequest=true;++stats_.refreshProbes;
                 }
                 return out;
             }
@@ -85,10 +91,10 @@ public:
             if(!create){out.result=Result::Failed;return out;}
             e=Allocate(ip,now);Restart(*e,now);
         }
-        if(e->probes>=timing_.maxProbes && now>=e->nextProbe){
+        if(e->probes>=MaxProbes() && now>=e->nextProbe){
             ++stats_.failures;Release(*e);out.result=Result::Failed;return out;
         }
-        if(now>=e->nextProbe){++e->probes;e->nextProbe=now+timing_.retryMs;out.sendRequest=true;++stats_.requests;}
+        if(now>=e->nextProbe){++e->probes;e->nextProbe=now+RetryMs();out.sendRequest=true;++stats_.requests;}
         out.result=Result::Pending;return out;
     }
 
@@ -156,12 +162,12 @@ public:
         for(unsigned n=0;n<Capacity;++n){
             auto& e=entries_[(cursor_+n)%Capacity];
             if(e.state!=State::Incomplete)continue;
-            if(e.probes>=timing_.maxProbes){
+            if(e.probes>=MaxProbes()){
                 if(now>=e.nextProbe){++stats_.failures;Release(e);}
                 continue;
             }
             if(now<e.nextProbe)continue;
-            ++e.probes;e.nextProbe=now+timing_.retryMs;++stats_.requests;
+            ++e.probes;e.nextProbe=now+RetryMs();++stats_.requests;
             cursor_=(cursor_+n+1)%Capacity;if(ip)*ip=e.ip;return true;
         }
         return false;
