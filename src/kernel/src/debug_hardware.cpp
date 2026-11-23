@@ -40,6 +40,7 @@
 #include "kprintf.h"
 #include "spinlock.h"
 #include "platform_power.h"
+extern "C" void NvDisplayMarkWritten(); // debug_hardware.cpp: pre-reset GPU reset trigger
 #include "nv_disp_live.h"
 #include "nv_aux_reply.h"
 #include "input.h"
