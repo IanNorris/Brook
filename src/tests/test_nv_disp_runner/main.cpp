@@ -120,6 +120,7 @@ static void TestRestoreAttemptOnFlipFailure(){
 }
 static void TestStageB(){
     Rig g;g.r->Command("preflight");g.r->Command("noop b");
+    assert(g.b.Count("\"nv_disp\":\"WARNING\"")==1&&g.b.Count("head1 (step 4) will refuse")==1);
     assert(g.b.Count("\"nv_disp\":\"done\"")==1&&g.f.flips==2);
     assert((g.f.R(RegChnCtl(0))&0x6013)==0x01);            // stage B leaves the core ALLOCATE only
 }

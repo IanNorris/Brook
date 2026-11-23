@@ -137,6 +137,8 @@ template<typename B> struct Runner{
     void Start(Stage stage,uint32_t nflips,uint32_t holdMs,bool observer,uint32_t stopAt){
         if(!st.preflightOk){Msg("refused","run preflight first (this boot)");return;}
         if(st.live||st.paused){Msg("refused","a run is live; continue or abort it");return;}
+        if(stage==Stage::B)Msg("WARNING","STAGE B: the core channel ends ALLOCATE-only (0x01, not the GOP's 0x21) until reboot; "
+            "nv-disp head1 (step 4) will refuse until then. Prefer stage a / a2.");
         if(!Build(stage,nflips,holdMs,observer))return;
         st.stage=stage;st.nflips=nflips;st.holdMs=holdMs;st.observer=observer;st.stopAt=stopAt;
         st.cursor=0;st.failAt=~0u;st.firstFlipOk=false;st.preflightOk=false;++st.runs;
@@ -217,7 +219,7 @@ template<typename B> struct Runner{
             else if(Word(p,"stop")){if(!Num(p,stop)){Msg("usage","stop <step>");return;}}
             else{Msg("usage","unknown argument");return;}
         }
-        if(isPlan){PrintPlan(stage,n);return;}
+        if(isPlan){if(stage==Stage::B)Msg("WARNING","stage B blocks nv-disp head1 until reboot");PrintPlan(stage,n);return;}
         Start(stage,isNoop?0:n,ms,observer,stop);
     }
 };

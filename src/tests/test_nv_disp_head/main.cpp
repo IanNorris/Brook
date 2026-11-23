@@ -401,6 +401,7 @@ static void TestHeadRunner(){
      g.r->Command("enable");assert(g.b.Count("a head-1 run is live")==1);
      g.r->Command("disable");
      assert(!g.r->st.live&&!g.r->st.enabled&&g.b.Count("\"nv_head1\":\"done\"")==1&&g.r->st.guardHits==0);
+     assert(g.b.Count("VPLL1 left running")==1);
      assert((g.c.R(0x688340)&0xff)==0&&(g.c.R(RegChnCtl(0))&0x6013)==0x01&&g.c.R(kRegInstTarget)==1);
      g.r->Command("enable skip-step3");assert(g.b.Count("run head1 preflight first")==2);}
     {HRig g;g.r->Command("preflight");g.r->Command("enable skip-step3");assert(g.r->st.enabled);
@@ -412,6 +413,11 @@ static void TestHeadRunner(){
     {HRig g;g.r->Command("preflight");g.r->Command("enable skip-step3 stop 20");     // stop in the VRAM phase
      assert(g.r->st.paused&&g.r->st.cursor==20);g.r->Command("continue");assert(g.r->st.enabled);
      g.r->Command("abort");assert(!g.r->st.live&&(g.c.R(0x688340)&0xff)==0);}
+    {HRig g;g.r->Command("preflight");g.r->Command("enable skip-step3 stop 173");  // stop before the modeset kick
+     assert(g.r->st.paused);g.c.R(0x680000+0x2068)=0x0004001e;                      // head 0 dirtied behind our back
+     g.r->Command("continue");
+     assert(g.b.Count("SUPERVISOR FLAGGED HEAD 0")==1&&g.r->st.aborts==1&&!g.r->st.live);
+     assert(g.c.stage==0&&(g.c.R(kRegCtrlDisp)&7)==0);}                              // no stage left pending
     {HRig g;HeadRunner<HBackend>::RegIo io{*g.r};                                     // the write guard
      for(uint32_t a:{0x61c804u,0xef04u,0x616540u,0x612488u,0x612b00u,0x6104e4u,0x690000u}){
         io.violation=false;io.wr(a,1);assert(io.violation&&!g.c.written.count(a));}

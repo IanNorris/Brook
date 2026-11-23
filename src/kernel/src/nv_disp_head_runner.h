@@ -176,9 +176,13 @@ template<typename B> struct HeadRunner{
             if(i>=vramBegin&&!st.live){st.live=true;if(!st.hooked){b->hookQuiesce();st.hooked=true;}}
             Io io{*this,"run"};
             const bool ok=Run(plan,i,i+1,io)==i+1&&!io.reg.violation;
-            if(!ok){st.failAt=i;Msg("failed",io.reg.violation?"head-0 write guard":"auto-abort");RunAbort(PhaseOf(i),100);return;}
+            if(!ok){st.failAt=i;
+                const bool superHead0=s.op==Op::Expect&&s.reg==RegSuperHead(0);
+                Msg("failed",io.reg.violation?"head-0 write guard":superHead0?
+                    "SUPERVISOR FLAGGED HEAD 0: aborting now; pending stages are acked without head-0 work (conn0 may need a reboot)":"auto-abort");
+                RunAbort(PhaseOf(i),100);return;}
         }
-        if(end==plan.count){st.live=false;Msg("done","head 1 disabled; run head1 preflight again before the next enable");}
+        if(end==plan.count){st.live=false;Msg("done","head 1 detached (VPLL1 left running and head-1 raster ARMed until reset); run head1 preflight again before the next enable");}
         else{st.enabled=true;Msg("enabled","head 1 lit on conn2; head1 disable when done");}
         Status();
     }
