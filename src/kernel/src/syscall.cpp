@@ -4,6 +4,7 @@
 #include "chrome_shell_wire.h"
 #include "shell_service.h"
 #include "../../shared/brook_pointer.h"
+#include "../../shared/brook_outputs.h"
 // syscall.cpp -- SYSCALL/SYSRET dispatcher, syscall table, and user-mode entry.
 //
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
@@ -574,6 +575,7 @@ void SyscallTableInit()
     g_syscallTable[514]                  = sys_brook_wm_move_relative;
     g_syscallTable[515]                  = sys_brook_wm_set_maximized;
     g_syscallTable[526]                  = sys_brook_wm_set_fullscreen;
+    g_syscallTable[BROOK_SYS_WM_GET_OUTPUTS] = sys_brook_wm_get_outputs;
     g_syscallTable[516]                  = sys_brook_wm_set_minimized;
     g_syscallTable[517]                  = sys_brook_wm_begin_resize;
     g_syscallTable[518]                  = sys_brook_wm_set_cursor_visible;
