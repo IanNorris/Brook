@@ -21,6 +21,8 @@
 #include "string.h"
 #include <serial.h>
 
+inline void* operator new(size_t, void* storage) noexcept { return storage; }
+
 namespace brook {
 namespace {
 
@@ -72,16 +74,31 @@ struct LiveBackend{
 };
 
 [[clang::require_constant_initialization]] LiveBackend g_backend{};
-[[clang::require_constant_initialization]] nvdisp::Runner<LiveBackend> g_runner{};
-[[clang::require_constant_initialization]] nvdisp::HeadRunner<LiveBackend> g_head{};
+// The runners are ~160 KiB each with non-zero member defaults; as constant-
+// initialised globals they sat in .data and pushed the Dell kernel ELF past
+// the installed loader's 8 MiB BROOK_UPDATE_KERNEL_MAX. Keep their storage in
+// .bss and construct them on first use (an nv-disp command, under the AUX lock).
+using RunnerT=nvdisp::Runner<LiveBackend>;
+using HeadT=nvdisp::HeadRunner<LiveBackend>;
+alignas(RunnerT) uint8_t g_runnerStorage[sizeof(RunnerT)];
+alignas(HeadT) uint8_t g_headStorage[sizeof(HeadT)];
+bool g_runnersBuilt=false;
+void EnsureRunners(){
+    if(g_runnersBuilt)return;
+    new(g_runnerStorage) RunnerT{};
+    new(g_headStorage) HeadT{};
+    g_runnersBuilt=true;
+}
+#define g_runner (*reinterpret_cast<RunnerT*>(g_runnerStorage))
+#define g_head (*reinterpret_cast<HeadT*>(g_headStorage))
 // Resident driver (D1): bridge-driven for now (`nv-disp driver ...`); D2/D3 wire it to the
 // compositor and the desktop-start markers.
 [[clang::require_constant_initialization]] nvdisp::NvDisplayDriver<LiveBackend> g_driver{};
 bool g_configured=false;
 uint8_t g_vbios[128*1024];bool g_vbiosRead=false;
 constexpr uint32_t kVbiosHash=0xbb33ca0a; // FNV-1a of the first 128 KiB of PROM (offline dump)
-bool LiveBackend::step3Busy(){return g_runner.st.live||g_runner.st.paused;}
-bool LiveBackend::step3Succeeded(){return g_runner.st.done>0;}
+bool LiveBackend::step3Busy(){return g_runnersBuilt&&(g_runner.st.live||g_runner.st.paused);}
+bool LiveBackend::step3Succeeded(){return g_runnersBuilt&&g_runner.st.done>0;}
 
 void NvDispQuiesceForReset(){
     // Pre-reset: abort a live run (the runner does nothing otherwise). Try the
@@ -89,6 +106,7 @@ void NvDispQuiesceForReset(){
     SpinLock* lock=NvAuxSharedLock();bool held=false;
     const uint64_t end=g_backend.nowUs()+100000;
     while(!(held=SpinLockTryAcquire(lock))&&g_backend.nowUs()<end)__asm__ volatile("pause");
+    if(!g_runnersBuilt){if(held)SpinLockRelease(lock);return;}
     g_backend.toSerial=true;
     if(g_driver.b)g_driver.Quiesce();   // flipped outputs back to the GOP state first
     g_runner.Quiesce();
@@ -160,6 +178,7 @@ bool NvDispHandle(const char* command){
     if(strncmp(command,prefix,n)!=0||(command[n]&&command[n]!=' '))return false;
     SpinLock* lock=NvAuxSharedLock();
     SpinLockAcquire(lock);
+    EnsureRunners();
     // Configure lazily (PCI config reads + a few window-state reads) unless a run is live.
     const bool headLive=g_head.st.live||g_head.st.paused;
     if(!g_configured||(!g_runner.st.live&&!g_runner.st.paused&&!headLive)){if(!Configure()){SpinLockRelease(lock);return true;}}
