@@ -430,6 +430,7 @@ static uint64_t CaptureModel(const WmShellSurface& surface, uint32_t width, uint
            slot.active->scale == config.metrics.percent ? slot.active->key : 0;
 }
 
+#if !defined(BROOK_MULTI_OUTPUT) || BROOK_MULTI_OUTPUT
 namespace {
 struct DetachedShell {
     ChromeShellModel model;
@@ -516,6 +517,8 @@ void ShellServiceDrawDetached(uint32_t slot, const WmShellSurface& surface, uint
     ChromeExecute(d->list, {pixels + uint64_t(surface.y) * stride + surface.x, stride, surface.w, surface.h,
                             surface.x - surface.popupShiftX, surface.y}, Fonts(d->config.metrics.percent));
 }
+
+#endif // BROOK_MULTI_OUTPUT
 
 uint64_t ShellServiceCapture(const WmShellSurface& surface, uint32_t width, uint32_t height,
                              uint64_t now, int32_t mx, int32_t my)

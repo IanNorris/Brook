@@ -86,7 +86,7 @@ struct Core{
     HeadConfig cfg;DpOut dpout{};Sink sink;DpTrainResult tr;
     std::set<uint32_t> written;std::vector<std::string> trace;
     uint32_t cur=0,stage=0,supers=0,diffs=0,pauses=0,updates=0;uint32_t pendingPut=0;bool superOnHead0=false;
-    uint32_t ntfyOff=0;uint32_t rgpos[2]{};
+    uint32_t ntfyOff=0;uint32_t rgpos[2]{},loadvReads[2]{};bool loadvFrozen=false;
     uint32_t& R(uint32_t a){return reg[a];}
     uint8_t* V(uint64_t a){auto& p=pages[a&~0xfffull];if(p.empty())p.assign(4096,0);return p.data()+(a&0xfff);}
     uint32_t vrd(uint64_t a){uint32_t v;memcpy(&v,V(a),4);return v;}
@@ -211,6 +211,7 @@ struct Core{
         if(a>=kPramin&&a<kPramin+0x100000)return vrd((uint64_t(R(kRegPraminBase))<<16)+(a-kPramin));
         if(a==kRegSuperAck)return evt;
         if(a==0x616330||a==0x616b30){uint32_t& v=rgpos[a==0x616b30];v=(v+97)%2222;return v;} // RG scanline moves per read
+        if(a==0x61611c||a==0x61691c){uint32_t& n=loadvReads[a==0x61691c];++n;return loadvFrozen?7u:n/4;} // LOADV every 4th read
         if(a==0x612508){const uint32_t v=R(a);return (v&~0x80u)|((((v>>8)&0xf)>6)?0x80:0);} // pad-cal comparator: target 6
         return R(a);
     }

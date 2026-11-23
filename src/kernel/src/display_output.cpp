@@ -19,14 +19,6 @@ bool OutputRegisterBackend(const OutputBackendOps* ops)
     return ok;
 }
 
-bool OutputUnregisterBackend(const OutputBackendOps* ops)
-{
-    SpinLockAcquire(&g_outputRegisterLock);
-    const bool ok = g_outputs.Unregister(ops);
-    SpinLockRelease(&g_outputRegisterLock);
-    return ok;
-}
-
 void OutputNotifyChanged() { g_outputs.NotifyChanged(); }
 uint64_t OutputGeneration() { return g_outputs.Generation(); }
 void OutputEnumerate(OutputLayout& out) { g_outputs.Enumerate(out); }
