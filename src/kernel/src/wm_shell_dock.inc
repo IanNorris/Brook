@@ -106,11 +106,11 @@ static bool DockDropZoneLocked(const DesktopMetrics& m, int32_t mx, int32_t my, 
 static bool DockKeepOutLocked(Window& w)
 {
     if (!DockReserves() || w.docked || !w.focusable || w.fullscreen || w.state != WindowState::Normal) return false;
-    {
+    if constexpr (OutputMultiSupported) {
         // The dock is on the primary output; windows elsewhere are not under it.
         OutputLayout layout;
         CompositorGetOutputs(layout);
-        if (layout.count > 1 && WindowOutputIndex(layout, w) != 0) return false;
+        if (layout.multi() && WindowOutputIndex(layout, w) != 0) return false;
     }
     uint32_t sw = 0, sh = 0;
     DockOutputDims(&sw, &sh);

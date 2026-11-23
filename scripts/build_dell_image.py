@@ -37,6 +37,8 @@ KERNEL_OPTIONS = {
     'BROOK_SSD_GUARDED_DESKTOP': 'ON', 'BROOK_SSD_GUARDED_DESKTOP_RESET': 'ON',
     'BROOK_DELL_ACPI_MONITOR': 'ON', 'BROOK_BDW_COHERENT_RENDER': 'ON',
     'BROOK_BDW_RPS_TRIAL': 'ON', 'BROOK_GPU_SUBMISSION_TIMING': 'ON',
+    # The Dell has one panel: leave the multi-output desktop paths out.
+    'BROOK_MULTI_OUTPUT': 'OFF',
 }
 # Options accepted by --kernel-option, mapped to the verifier flag each needs (None = none needed).
 VERIFY_ALLOW = {

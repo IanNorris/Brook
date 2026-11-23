@@ -65,7 +65,7 @@ struct ShellOutputPoint {
 inline ShellOutputPoint ShellTaskbarAt(const OutputLayout& layout, uint32_t taskbarH, uint32_t hiddenMask,
                                        int32_t px, int32_t py)
 {
-    if (layout.count <= 1) {
+    if (!layout.multi()) {
         const OutputRect out = layout.rect(0);
         const int64_t top = int64_t(out.y) + ShellTaskbarTop(out.h, taskbarH, hiddenMask & 1u);
         if (py >= top) return {0, int32_t(int64_t(px) - out.x), int32_t(int64_t(py) - out.y)};
