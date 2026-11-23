@@ -11,6 +11,15 @@ struct BdwPpgttPage { uint64_t dma; uint8_t* cpu; };
 // tables). 512 tables map at least 1 GiB densely (65,536 pages need about
 // 130); sparser or larger sets are refused, never truncated.
 constexpr uint32_t BdwPpgttMaxTables=512;
+// Largest buffer set (in 4 KiB pages) one submission may map: 1 GiB. Linux
+// i915 bounds an execbuffer only by memory and the 48-bit PPGTT, and iris
+// never splits a batch by aperture size (aperture_space is diagnostic only),
+// so a scene whose textures and render targets exceed the former 256 MiB
+// limit was refused outright. The 512-table limit still applies: a dense
+// 1 GiB set needs 515 tables, so in practice slightly less than 1 GiB fits,
+// and a sparser set fewer. The per-page mapping workspace is 24 bytes/page
+// (6 MiB at the limit).
+constexpr uint32_t BdwExecMaxPages=262144;
 enum class BdwPpgttCache : uint8_t { WriteBack, Uncached };
 struct BdwPpgttMapping {
     uint64_t address, dma;
@@ -59,7 +68,7 @@ inline bool BdwBuildPpgttImage(const BdwPpgttPage (&scratch)[4],
                                const BdwPpgttMapping* maps,uint32_t mapCount,bool sorted=false,
                                const BdwPpgttLeaf* leaves=nullptr,uint32_t leafCount=0) {
     constexpr uint64_t gpuLimit=uint64_t{1}<<48, dmaLimit=uint64_t{1}<<39;
-    constexpr uint32_t maxTables=BdwPpgttMaxTables,maxUnsortedMappings=1024,maxSortedMappings=65536;
+    constexpr uint32_t maxTables=BdwPpgttMaxTables,maxUnsortedMappings=1024,maxSortedMappings=BdwExecMaxPages;
     if(!tables || !tableCount || tableCount>maxTables || !maps || !mapCount ||
        mapCount>(sorted?maxSortedMappings:maxUnsortedMappings) ||
        (leafCount && !leaves) || leafCount>BdwPpgttMaxLeaves)return false;

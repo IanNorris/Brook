@@ -74,12 +74,15 @@ void CpuIdleCancelRatioTrial();
 CpuEpbTrial CpuIdleReadRatioTrial();
 // Closed-loop PERF_CTL power budget; shares ownership of PERF_CTL with the
 // ratio trial (only one runs at a time). Set starts it when off, retargets it
-// when running. -16 busy, -22 invalid.
+// when running. -16 busy (incl. the other kind running), -22 invalid.
 int CpuIdleSetBudget(uint64_t now, unsigned count, const CpuBudgetConfig& config, unsigned minRatio, unsigned maxNonTurbo);
 bool CpuIdleBudgetActive();
 void CpuIdleTickBudget(unsigned cpu, uint64_t now, bool eligible);
 void CpuIdleBudgetControl(uint64_t now, const CpuBudgetSample& sample);
-void CpuIdleCancelBudget();
+// External mode (config.external): the thermal balance controller sets the cap.
+void CpuIdleBudgetSetCap(uint64_t now, unsigned cap);
+// Cancels only a budget of the matching kind (built-in law vs external).
+void CpuIdleCancelBudget(bool external = false);
 CpuPowerBudget CpuIdleReadBudget();
 // Ask idle loops to sample core residency, then read everything.
 void CpuIdleRequestSample();

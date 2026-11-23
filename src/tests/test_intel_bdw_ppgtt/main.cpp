@@ -115,6 +115,22 @@ static void WideShapeTests() {
         for(uint32_t i=0;i<512;++i)many[i]={0x400000000ull+uint64_t(i)*128*4096,dma.data()+i*128,128,true,false};
         assert(BuildShape(many,512,65536)==1+1+1+128);
     }
+    {
+        // Above the former 65,536-page limit (STK Cornfield Crossing, int88):
+        // 768 MiB as three 256 MiB objects builds with 387 tables; the full
+        // BdwExecMaxPages (1 GiB) densely needs 515 > 512 tables and is
+        // refused by the count, never truncated.
+        constexpr uint32_t per=65536,total=3*per+1;static std::vector<uint64_t> dma(BdwExecMaxPages+1);
+        for(uint32_t j=0;j<dma.size();++j)dma[j]=0x300000000ull+uint64_t(j)*4096;
+        static BdwExecMemoryObject three[4];
+        for(uint32_t i=0;i<3;++i)three[i]={0x100000000ull+uint64_t(i)*per*4096,dma.data()+i*per,per,true,false};
+        three[3]={0x100000000ull+uint64_t(3)*per*4096,dma.data()+3*per,1,false,false};
+        assert(BuildShape(three,4,total)==1+1+1+385);
+        const BdwExecMemoryObject full{0x100000000ull,dma.data(),BdwExecMaxPages,true,false};
+        uint32_t count=0;assert(!BdwExecAddressSpaceTableCount(&full,1,count));
+        const BdwExecMemoryObject over{0x100000000ull,dma.data(),BdwExecMaxPages+1,true,false};
+        assert(!BdwExecAddressSpaceTableCount(&over,1,count));
+    }
 }
 int main() {
     WideShapeTests();

@@ -1126,13 +1126,96 @@ DesktopRect ChromeTrayFlyoutPinRect(const ChromeStyle& s, DesktopRect panel)
     return TaskbarPopupPinRect(*s.metrics, panel, Px(s, FlyoutPad), PanelHeaderHeight(s));
 }
 
-int ChromeTrayFlyoutHeight(const ChromeStyle& s, bool network, bool live)
+int ChromeTrayFlyoutHeight(const ChromeStyle& s, bool network, bool live, unsigned powerRows)
 {
     const int row = s.Line(CF::Label), rowGap = Px(s, 5);
     int h = 2 * Px(s, FlyoutPad) + PanelHeaderHeight(s) + Px(s, FlyoutGap);
     if (!live) return h + row;
     if (network) return h + 3 * row + 2 * rowGap;
-    return h + s.Line(CF::Hero) + Px(s, FlyoutGap) + Px(s, FlyoutGraph) + Px(s, FlyoutGap) + 2 * row + rowGap;
+    const int rows = 2 + static_cast<int>(powerRows);
+    return h + s.Line(CF::Hero) + Px(s, FlyoutGap) + Px(s, FlyoutGraph) + Px(s, FlyoutGap) + rows * row + (rows - 1) * rowGap;
+}
+
+namespace {
+// Bounded text builder for the flyout's power rows.
+struct FlyoutText {
+    char text[48]{};
+    unsigned used = 0;
+    FlyoutText& Add(const char* v) { while (*v && used + 1 < sizeof(text)) text[used++] = *v++; text[used] = 0; return *this; }
+    FlyoutText& Number(unsigned v) { char n[12]; DesktopNumber(n, v); return Add(n); }
+    // "15 W", "12.5 W": tenths only when they are not zero.
+    FlyoutText& Watts(uint32_t mw) {
+        const uint32_t tenths = (mw + 50) / 100;
+        Number(tenths / 10);
+        if (tenths % 10) { const char d[3] = {'.', static_cast<char>('0' + tenths % 10), 0}; Add(d); }
+        return Add(" W");
+    }
+    // A PERF_CTL ratio (x100 MHz) as "1.8 GHz".
+    FlyoutText& Ghz(unsigned ratio) {
+        Number(ratio / 10);
+        const char d[3] = {'.', static_cast<char>('0' + ratio % 10), 0};
+        return Add(d).Add(" GHz");
+    }
+};
+} // namespace
+
+// A PanelRow drawing the first value (longest first) that leaves room after the key.
+static int PanelRowFit(ChromeDisplayList& dl, const ChromeStyle& s, int x, int y, int w, const char* key,
+                       const FlyoutText* values, unsigned count)
+{
+    const int room = w - s.TextWidth(key, CF::Label) - Px(s, 12);
+    unsigned pick = 0;
+    while (pick + 1 < count && s.TextWidth(values[pick].text, CF::Label) > room) ++pick;
+    return PanelRow(dl, s, x, y, w, key, values[pick].text);
+}
+
+// Sensor/Throttles-at continuation: RAPL limits, then the balance controller.
+static int PowerRows(ChromeDisplayList& dl, const ChromeStyle& s, int x, int y, int w, const ChromePowerModel& p)
+{
+    using M = ChromeBalanceMode;
+    if (p.pl1Mw) {
+        FlyoutText t[3];
+        t[0].Watts(p.pl1Mw).Add(" sustained");
+        t[1].Watts(p.pl1Mw);
+        t[2].Watts(p.pl1Mw);
+        if (p.pl2Mw) {
+            t[0].Add(" " BROOK_CHROME_DOT " ").Watts(p.pl2Mw).Add(" burst");
+            t[1].Add(" " BROOK_CHROME_DOT " ").Watts(p.pl2Mw).Add(" burst");
+            t[2].Add(" / ").Watts(p.pl2Mw);
+        }
+        y = PanelRowFit(dl, s, x, y, w, "Power limit", t, 3);
+    }
+    if (p.mode == M::Unavailable) return y;
+    const bool capping = p.mode == M::Light || p.mode == M::Heavy || p.mode == M::Idle;
+    // Longest first; the first that leaves room after the key is drawn.
+    // With the max non-turbo clock first, then with "(balance)" alone, then bare.
+    FlyoutText cpu[4];
+    const bool idleCap = capping && p.capRatio && p.mode == M::Idle, balanceCap = capping && p.capRatio && !idleCap;
+    for (unsigned i = 0; i < 4; ++i) {
+        if (idleCap) cpu[i].Add("Idle " BROOK_CHROME_DOT " ").Ghz(p.capRatio);
+        else if (balanceCap) cpu[i].Ghz(p.capRatio).Add(i == 0 || i == 2 ? " (balance)" : "");
+        else cpu[i].Add("Turbo");
+        if (p.cpuMaxMhz && i < 2) cpu[i].Add(" " BROOK_CHROME_DOT " max ").Ghz(p.cpuMaxMhz / 100);
+    }
+    y = PanelRowFit(dl, s, x, y, w, "CPU limit", cpu, 4);
+    FlyoutText gpu;
+    if (p.gpuMhz) gpu.Number(p.gpuMhz).Add(" MHz");
+    else gpu.Add("Idle");
+    // The unit once: "900 MHz · max 950", "Idle · max 450 MHz".
+    if (p.gpuTopMhz) gpu.Add(" " BROOK_CHROME_DOT " max ").Number(p.gpuTopMhz).Add(p.gpuMhz ? "" : " MHz");
+    y = PanelRow(dl, s, x, y, w, "GPU clock", gpu.text);
+    FlyoutText ctl;
+    const char* phase = p.mode == M::Heavy ? "heavy" : p.mode == M::Idle ? "idle" :
+                        p.mode == M::Light ? "light" : p.mode == M::Starting ? "starting" : nullptr;
+    if (phase) ctl.Add("Balance " BROOK_CHROME_DOT " ").Add(phase);
+    else ctl.Add(p.mode == M::OptedOut ? "Opted out" : "Off");
+    // The package budget; drop the word, then the budget, when crowded.
+    FlyoutText c[3] = {ctl, ctl, ctl};
+    if (phase && p.targetMw) {
+        c[0].Add(" " BROOK_CHROME_DOT " ").Watts(p.targetMw).Add(" target");
+        c[1].Add(" " BROOK_CHROME_DOT " ").Watts(p.targetMw);
+    }
+    return PanelRowFit(dl, s, x, y, w, "Controller", c, 3);
 }
 
 void ChromeBuildTrayFlyout(const ChromeTrayFlyoutModel& m, const ChromeStyle& s, ChromeDisplayList& dl)
@@ -1184,7 +1267,8 @@ void ChromeBuildTrayFlyout(const ChromeTrayFlyoutModel& m, const ChromeStyle& s,
     y = PanelRow(dl, s, x, y, w, "Sensor", "CPU package");
     char limit[24];
     ThermalText(limit, static_cast<int32_t>(t.tjmax ? t.tjmax : 100), true);
-    PanelRow(dl, s, x, y, w, "Throttles at", limit);
+    y = PanelRow(dl, s, x, y, w, "Throttles at", limit);
+    PowerRows(dl, s, x, y, w, t.power);
 }
 
 ChromeDiskPopupLayout ChromeDiskPopupLayoutFor(const ChromeStyle& s, DesktopRect anchor, int screenW,

@@ -98,6 +98,12 @@ struct DisplayIdlePolicy {
     void Reset(uint64_t now,uint64_t sequence) {
         initialized=true;lastActivityMs=now;lastInput=sequence;restoreAtMs=0;
     }
+    // An active idle inhibitor counts as continuous activity: the timeout
+    // restarts in full once the last inhibitor goes. It never wakes a panel
+    // that is already off (only input or a timed restore does that).
+    void Hold(uint64_t now) {
+        if(initialized && now>=lastActivityMs)lastActivityMs=now;
+    }
     bool Expired(uint64_t now) const {
         return initialized && timeoutSeconds && now>=lastActivityMs &&
             now-lastActivityMs>=uint64_t(timeoutSeconds)*1000;
@@ -116,13 +122,14 @@ struct DisplayBacklightController {
         if(seconds>86400 || !pwm.SetOn(io,true))return false;
         idle.timeoutSeconds=seconds;idle.Reset(now,sequence);return true;
     }
-    void Tick(const BacklightIo& io,uint64_t now,uint64_t sequence) {
+    void Tick(const BacklightIo& io,uint64_t now,uint64_t sequence,bool inhibited=false) {
         if(!pwm.ready)return;
         const bool wake=idle.Observe(now,sequence);
         if(wake || pwm.uncertain){
             if(pwm.uncertain)idle.timeoutSeconds=0;
             if(pwm.SetOn(io,true))idle.Reset(now,sequence);
-        } else if(pwm.on && idle.Expired(now))pwm.SetOn(io,false);
+        } else if(inhibited)idle.Hold(now);
+        else if(pwm.on && idle.Expired(now))pwm.SetOn(io,false);
     }
 };
 }

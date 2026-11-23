@@ -63,6 +63,12 @@ inline void BdwClockConfigure(uint32_t mhz){
     else BdwClockSetAuto(runtime.state);
     SpinLockRelease(&runtime.lock);
 }
+inline void BdwClockConfigureBalance(uint32_t mhz){
+    auto& runtime=BdwClockRuntimeState();
+    SpinLockAcquire(&runtime.lock);
+    BdwClockSetBalance(runtime.state,mhz);
+    SpinLockRelease(&runtime.lock);
+}
 inline void BdwClockRecordCaps(uint32_t caps){
     if(!caps || caps==0xffffffffu)return;
     auto& runtime=BdwClockRuntimeState();

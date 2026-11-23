@@ -16,6 +16,10 @@
 #include "klog.h"
 #include "tsc_clock.h"
 #include "intel_bdw_worker_stats.h"
+#if defined(BROOK_BDW_RPS_TRIAL)
+#include "intel_bdw_render_clock_runtime.h"
+#include "vfs.h"
+#endif
 
 namespace brook {
 namespace {
@@ -73,6 +77,130 @@ ThermalRing<ThermalGraphHistory> g_graph;
 ThermalGraphAccumulator g_accumulator;
 ThermalMaxima g_maxima;
 uint64_t g_samples = 0, g_misplaced = 0;
+uint64_t g_pkgLimits = 0; // atomic: PL1 mW | PL2 mW << 32 (0 = disabled)
+
+bool EpbTrialEligible();
+
+// Balance controller runtime. Lock order: g_balanceLock (IRQ) -> g_ratioLock
+// (IRQ, cpu idle). The render clock lock is a plain preemptible spinlock the
+// GPU worker holds with interrupts on, so it is never taken under
+// g_balanceLock: the overlay is published to g_balanceOverlay and applied
+// afterwards under g_balanceApplyLock (which re-checks g_balanceOn, so a
+// stale apply can never follow `off`).
+IrqSpinLock g_balanceLock;
+ThermalBalanceStatus g_balance;
+BalanceAuto g_balanceAuto;     // under g_balanceLock
+
+#if defined(BROOK_BDW_RPS_TRIAL)
+BalanceBusyMeter g_balanceMeter;
+bool g_balanceOn = false;      // atomic fast-path flag for the sampler
+uint32_t g_balanceOverlay = 0; // atomic: wanted render clock overlay
+SpinLock g_balanceApplyLock;
+
+void BalanceApplyOverlay() {
+    SpinLockAcquire(&g_balanceApplyLock);
+    const uint32_t want = __atomic_load_n(&g_balanceOn, __ATOMIC_ACQUIRE)
+        ? __atomic_load_n(&g_balanceOverlay, __ATOMIC_ACQUIRE) : 0;
+    BdwClockConfigureBalance(want);
+    SpinLockRelease(&g_balanceApplyLock);
+}
+
+// Called with g_balanceLock held. Turns the controller off and undoes both outputs.
+void BalanceStopLocked(ThermalBalanceOutcome why) {
+    g_balance.enabled = false;
+    g_balance.ownerActive = false;
+    g_balance.outcome = why;
+    if (why == ThermalBalanceOutcome::OwnerLost) g_balanceAuto.armed = false;
+    g_balance.state.mode = BalanceMode::Light;
+    g_balance.appliedCap = 0;
+    g_balance.appliedGpuMhz = 0;
+    __atomic_store_n(&g_balanceOverlay, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_balanceOn, false, __ATOMIC_RELEASE);
+    CpuIdleCancelBudget(true);
+    // The caller runs BalanceApplyOverlay() after dropping g_balanceLock.
+}
+
+void BalanceStep(const ThermalSample& s, bool powerValid, bool tempValid) {
+    if (!__atomic_load_n(&g_balanceOn, __ATOMIC_ACQUIRE)) return;
+    const bool eligible = EpbTrialEligible();
+    BdwWorkerStats ws{};
+    const bool wsOk = BdwWorkerStatsRead(ws);
+    const auto clock = BdwClockReadStatus(); // plain lock: before g_balanceLock
+    const uint64_t tsc = Rdtsc();
+    const uint64_t flags = IrqSpinLockAcquire(&g_balanceLock);
+    auto& b = g_balance;
+    if (!b.enabled) { IrqSpinLockRelease(&g_balanceLock, flags); return; }
+    const auto owner = CpuIdleReadBudget();
+    const bool ownerLive = owner.config.external &&
+        (owner.phase == CpuPowerBudget::Phase::Snapshot || owner.phase == CpuPowerBudget::Phase::Active);
+    b.ownerActive = owner.config.external && owner.phase == CpuPowerBudget::Phase::Active;
+    if (!eligible || !ownerLive) {
+        BalanceStopLocked(eligible ? ThermalBalanceOutcome::OwnerLost : ThermalBalanceOutcome::Ineligible);
+        IrqSpinLockRelease(&g_balanceLock, flags);
+        BalanceApplyOverlay();
+        KLog("thermal balance: stopped (%s); PERF_CTL restored, render clock back to its default request",
+             eligible ? "PERF_CTL owner lost" : "ineligible / AC lost");
+        return;
+    }
+    if (!b.ownerActive) { IrqSpinLockRelease(&g_balanceLock, flags); return; } // all CPUs still snapshotting
+    const auto caps = BdwClockDecodeCaps(clock.lastCaps);
+    const uint32_t rp0 = caps.valid ? caps.rp0 * BdwClockBinMhz : BdwClockBootMhz;
+    const uint32_t rpn = caps.valid ? caps.rpn * BdwClockBinMhz : 0;
+    const auto limits = BalanceMakeLimits(owner.limits.minRatio, owner.limits.capTop, BdwClockBootMhz, rp0, rpn);
+    if (!b.lastSampleAt) b.state.Reset(limits);
+    b.limits = limits;
+    BalanceSample in{};
+    in.tempValid = tempValid;
+    in.pkgC = s.pkgC;
+    in.powerValid = powerValid;
+    in.pkgMw = s.pkgMw;
+    in.gtMw = s.gtMw;
+    in.c0Pct = s.c0Percent;
+    in.gpuTripped = clock.tripped != 0;
+    const uint64_t render = ws.classes[BdwWorkerApplication].ticks + ws.classes[BdwWorkerCompositor].ticks;
+    in.loadValid = wsOk && g_balanceMeter.Update(render, ws.resets, tsc, in.gpuBusyPermille);
+    b.last = in;
+    b.lastSampleAt = s.tick;
+    b.gpuActualMhz = s.gpuMhz;
+    BalanceDecide(b.config, b.limits, b.state, in, s.tick);
+    const unsigned cap = b.state.cap;
+    const uint32_t overlay = b.state.GpuOverlay(b.limits);
+    if (cap != b.appliedCap) { CpuIdleBudgetSetCap(s.tick, cap); b.appliedCap = cap; }
+    const bool overlayChanged = overlay != b.appliedGpuMhz;
+    if (overlayChanged) { b.appliedGpuMhz = overlay; __atomic_store_n(&g_balanceOverlay, overlay, __ATOMIC_RELEASE); }
+    IrqSpinLockRelease(&g_balanceLock, flags);
+    if (overlayChanged) BalanceApplyOverlay();
+}
+
+int BalanceEnable(bool manual);
+
+// Default-on: (re)enable while armed and eligible (CPU 0 sampler, after BalanceStep).
+void BalanceAutoTick(uint64_t now, bool eligible) {
+    uint64_t flags = IrqSpinLockAcquire(&g_balanceLock);
+    const bool due = g_balanceAuto.Due(g_balance.enabled, eligible, now);
+    if (due) g_balanceAuto.lastTryMs = now ? now : 1; // claim the attempt
+    IrqSpinLockRelease(&g_balanceLock, flags);
+    if (!due) return;
+    const int result = BalanceEnable(false);
+    flags = IrqSpinLockAcquire(&g_balanceLock);
+    const bool first = !g_balanceAuto.enables && !g_balanceAuto.failures;
+    g_balanceAuto.Note(result, now);
+    IrqSpinLockRelease(&g_balanceLock, flags);
+    if (!result || first) KLog("thermal balance: default-on enable %s (errno %d)", result ? "refused" : "ok", -result);
+}
+
+bool MarkerSet(const char* path) {
+    auto* f = VfsOpen(path, VFS_O_STREAM);
+    if (!f) return false;
+    VnodeStat st{};
+    uint64_t offset = 0;
+    char t[2]{};
+    const bool ok = !VfsStat(f, &st) && !st.isDir && !st.isSymlink && st.size == 2 &&
+                    VfsRead(f, t, 2, &offset) == 2 && t[0] == '1' && t[1] == '\n';
+    VfsRelease(f);
+    return ok;
+}
+#endif
 
 struct CpuPrev { uint64_t aperf = 0, mperf = 0, tsc = 0; bool primed = false; };
 struct PkgPrev { uint32_t pkg = 0, pp0 = 0, pp1 = 0; uint64_t tsc = 0, unit = 0; bool primed = false; uint64_t gpuSeq = 0, gpuTick = 0; };
@@ -116,6 +244,8 @@ void Publish(PkgPrev& prev) {
             s.gtMw = ThermalEnergyMw(prev.pp1, pp1, unit, us);
         }
         prev.pkg = pkg; prev.pp0 = pp0; prev.pp1 = pp1; prev.tsc = tsc; prev.unit = unit; prev.primed = true;
+        __atomic_store_n(&g_pkgLimits, ThermalPackRaplLimitsMw(ThermalDecodeRaplPackageLimits(unit, ReadMsr(0x610))),
+                         __ATOMIC_RELEASE);
     }
     if (CpuIdleBudgetActive()) {
         CpuBudgetSample b{};
@@ -130,6 +260,11 @@ void Publish(PkgPrev& prev) {
     if (gpuSeq != prev.gpuSeq) { prev.gpuSeq = gpuSeq; prev.gpuTick = s.tick; }
     if (prev.gpuTick && s.tick - prev.gpuTick < 2000)
         s.gpuMhz = uint16_t(__atomic_load_n(&BdwLastGpuMhz(), __ATOMIC_RELAXED));
+#if defined(BROOK_BDW_RPS_TRIAL)
+    BalanceStep(s, powerValid, p.pkgDts && s.pkgC > 0);
+    if (__atomic_load_n(&g_balanceAuto.armed, __ATOMIC_ACQUIRE) && !__atomic_load_n(&g_balanceOn, __ATOMIC_ACQUIRE))
+        BalanceAutoTick(s.tick, EpbTrialEligible());
+#endif
     const uint64_t flags = IrqSpinLockAcquire(&g_lock);
     g_history.Push(s);
     g_maxima.Note(s);
@@ -177,6 +312,19 @@ void ThermalSamplerStart() {
         SchedulerAddProcess(t);
     }
     KLog("thermal: sampler on %u cpus, TjMax %u C, base %u MHz, rapl %d", n, p.tjmax, p.baseMhz, p.rapl ? 1 : 0);
+#if defined(BROOK_BDW_RPS_TRIAL)
+    // `thermal balance` is on by default since int89 (int88 A/B: 20.2 -> 24.2
+    // fps, package max 88 -> 76 C; 20 min mixed soak, no trips). The sampler
+    // enables it once eligible (AC online, Broadwell-U). /etc/dell-thermal-no-balance
+    // ("1\n") keeps the int88 behaviour (off until `thermal balance on`).
+    const bool optOut = MarkerSet("/etc/dell-thermal-no-balance");
+    const uint64_t flags = IrqSpinLockAcquire(&g_balanceLock);
+    g_balanceAuto.optedOut = optOut;
+    g_balanceAuto.decided = true;
+    __atomic_store_n(&g_balanceAuto.armed, !optOut, __ATOMIC_RELEASE);
+    IrqSpinLockRelease(&g_balanceLock, flags);
+    KLog("thermal balance: default %s%s", optOut ? "off" : "on", optOut ? " (/etc/dell-thermal-no-balance)" : "");
+#endif
 }
 
 int ThermalStartEpbTrial(unsigned bias,unsigned seconds)
@@ -212,6 +360,87 @@ int ThermalSetCpuBudget(uint32_t coresMw,int32_t tempC)
     return CpuIdleSetBudget(ApicTickCount(),SmpGetCpuCount(),config,minRatio,maxNonTurbo);
 }
 
+#if defined(BROOK_BDW_RPS_TRIAL)
+namespace {
+int BalanceEnable(bool manual)
+{
+    if (manual) {
+        // `on` (re)arms the default-on retry for this boot.
+        const uint64_t f = IrqSpinLockAcquire(&g_balanceLock);
+        __atomic_store_n(&g_balanceAuto.armed, true, __ATOMIC_RELEASE);
+        IrqSpinLockRelease(&g_balanceLock, f);
+    }
+    if (!EpbTrialEligible()) return -95;
+    const uint64_t info=ReadMsr(0xce);
+    const unsigned maxNonTurbo=unsigned((info>>8)&0xff),minRatio=unsigned((info>>40)&0xff);
+    if (!minRatio || maxNonTurbo<=minRatio) return -95;
+    const uint64_t flags = IrqSpinLockAcquire(&g_balanceLock);
+    int result = 0;
+    if (!g_balance.enabled) {
+        CpuBudgetConfig owner{};
+        owner.external = true;
+        result = CpuIdleSetBudget(ApicTickCount(),SmpGetCpuCount(),owner,minRatio,maxNonTurbo);
+        if (!result) {
+            const auto config = g_balance.config;
+            g_balance = {};
+            g_balance.available = true;
+            g_balance.config = config;
+            g_balance.enabled = true;
+            g_balance.outcome = ThermalBalanceOutcome::Running;
+            g_balance.startedAt = ApicTickCount();
+            g_balanceMeter = {};
+            __atomic_store_n(&g_balanceOverlay, 0u, __ATOMIC_RELEASE);
+            __atomic_store_n(&g_balanceOn, true, __ATOMIC_RELEASE);
+        }
+    }
+    IrqSpinLockRelease(&g_balanceLock, flags);
+    return result;
+}
+} // namespace
+#endif
+
+int ThermalBalanceEnable()
+{
+#if defined(BROOK_BDW_RPS_TRIAL)
+    return BalanceEnable(true);
+#else
+    return -95;
+#endif
+}
+
+void ThermalBalanceDisable()
+{
+#if defined(BROOK_BDW_RPS_TRIAL)
+    const uint64_t flags = IrqSpinLockAcquire(&g_balanceLock);
+    // `off` also disarms the default-on retry for the rest of this boot.
+    __atomic_store_n(&g_balanceAuto.armed, false, __ATOMIC_RELEASE);
+    if (g_balance.enabled) BalanceStopLocked(ThermalBalanceOutcome::Disabled);
+    IrqSpinLockRelease(&g_balanceLock, flags);
+    BalanceApplyOverlay();
+#endif
+}
+
+int ThermalBalanceConfigure(const BalanceConfig& config)
+{
+    if (!BalanceConfigValid(config)) return -22;
+    const uint64_t flags = IrqSpinLockAcquire(&g_balanceLock);
+    g_balance.config = config;
+    IrqSpinLockRelease(&g_balanceLock, flags);
+    return 0;
+}
+
+ThermalBalanceStatus ThermalBalanceRead()
+{
+    const uint64_t flags = IrqSpinLockAcquire(&g_balanceLock);
+    auto out = g_balance;
+    out.autoState = g_balanceAuto;
+    IrqSpinLockRelease(&g_balanceLock, flags);
+#if defined(BROOK_BDW_RPS_TRIAL)
+    out.available = true;
+#endif
+    return out;
+}
+
 bool ThermalReadSnapshot(ThermalSnapshot& out) {
     const Platform& p = Plat();
     out = {};
@@ -229,6 +458,9 @@ bool ThermalReadSnapshot(ThermalSnapshot& out) {
     out.samples = g_samples;
     IrqSpinLockRelease(&g_lock, flags);
     out.misplaced = __atomic_load_n(&g_misplaced, __ATOMIC_RELAXED);
+    const uint64_t limits = __atomic_load_n(&g_pkgLimits, __ATOMIC_ACQUIRE);
+    out.pl1Mw = uint32_t(limits);
+    out.pl2Mw = uint32_t(limits >> 32);
     return true;
 }
 

@@ -9,6 +9,7 @@
 #include "memory/mapping_transaction.h"
 #include "compositor.h"
 #include "window.h"
+#include "idle_inhibit.h"
 #include "desktop_identity.h"
 #include "shell_service.h"
 #include "gpu_compositor.h"
@@ -529,6 +530,20 @@ int64_t sys_brook_wm_begin_move(uint64_t wmId, uint64_t,
     if (!w) return -EINVAL;
     int idx = static_cast<int>(wmId) - 1;
     return brook::CompositorBeginWindowMove(idx) ? 0 : -EINVAL;
+}
+
+// 0xB27: WM_SET_IDLE_INHIBIT(wmId, count)
+//   waylandd's live zwp_idle_inhibitor_v1 count for one owned window (its
+//   surface tree). Replaces the previous count; destroying the window clears
+//   it. Visibility is decided here (idle_inhibit.h), not by the caller.
+int64_t sys_brook_wm_set_idle_inhibit(uint64_t wmId, uint64_t count,
+                                      uint64_t, uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    if (wmId == 0 || wmId > 0xFFFFu || count > brook::IdleInhibitMaxPerWindow) return -EINVAL;
+    return brook::WmSetOwnedIdleInhibit(proc, static_cast<uint32_t>(wmId),
+                                        static_cast<uint32_t>(count)) ? 0 : -EINVAL;
 }
 
 // 0xB25: WM_SHOW_WINDOW_MENU(wmId, x, y)

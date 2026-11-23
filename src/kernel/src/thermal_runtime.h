@@ -2,6 +2,7 @@
 // Kernel thermal/power sampler API (implementation: thermal_sampler.cpp).
 #include <stdint.h>
 #include "thermal_sampler.h"
+#include "thermal_balance.h"
 
 namespace brook {
 
@@ -17,9 +18,37 @@ int ThermalStartRatioTrial(unsigned ratio,unsigned seconds);
 // retargets when running; both zero turns it off. See cpu_power_budget.h.
 int ThermalSetCpuBudget(uint32_t coresMw,int32_t tempC);
 
+// Combined CPU + GPU balance controller (thermal_balance.h). On by default in
+// BROOK_BDW_RPS_TRIAL (Dell) kernels unless /etc/dell-thermal-no-balance; the
+// sampler enables it once eligible. `off` disarms that for the boot, `on` re-arms.
+// Enable: same AC-only Broadwell-U admission as the budget (-95 otherwise),
+// takes the PERF_CTL owner in external mode (-16 if the budget or ratio trial
+// holds it). Disable, AC loss or ineligibility restore PERF_CTL on every CPU
+// and remove the render clock overlay (back to the fixed/auto request).
+enum class ThermalBalanceOutcome : uint8_t { None, Running, Disabled, Ineligible, OwnerLost, Unsupported };
+struct ThermalBalanceStatus {
+    bool available = false, enabled = false, ownerActive = false;
+    ThermalBalanceOutcome outcome = ThermalBalanceOutcome::None;
+    BalanceConfig config{};
+    BalanceLimits limits{};
+    BalanceState state{};
+    BalanceSample last{};
+    uint32_t appliedCap = 0, appliedGpuMhz = 0, gpuActualMhz = 0;
+    uint64_t startedAt = 0, lastSampleAt = 0;
+    BalanceAuto autoState{}; // default-on arming (copied out by ThermalBalanceRead)
+};
+int ThermalBalanceEnable();
+void ThermalBalanceDisable();
+// Retargets live when on; kept for the next enable when off. -22 invalid.
+int ThermalBalanceConfigure(const BalanceConfig& config);
+ThermalBalanceStatus ThermalBalanceRead();
+
 struct ThermalSnapshot {
     bool available = false, rapl = false, aperf = false;
     uint32_t tjmax = 0, baseMhz = 0, cpuCount = 0;
+    // RAPL package limits (MSR 0x610, re-read each package sample): PL1
+    // sustained and PL2 burst in mW; 0 = not reported or disabled.
+    uint32_t pl1Mw = 0, pl2Mw = 0;
     uint64_t samples = 0, misplaced = 0; // misplaced = per-CPU reads skipped off their CPU
     ThermalSample latest{};
     ThermalMaxima maxima{};

@@ -244,7 +244,7 @@ def main():
         parser.error('Specify --profile or --profile-selection')
     index = args.index.resolve(strict=True)
     index_metadata = json.loads(Path(str(index)+'.json').read_text())
-    if (index_metadata.get('format') != 1 or
+    if (index_metadata.get('format') not in (1, 2) or
         index_metadata.get('index_sha256') != digest(index) or
         index_metadata.get('nixpkgs_import_sha256') != digest(ROOT/'nix/nixpkgs.nix') or
         index_metadata.get('system') != 'x86_64-linux' or

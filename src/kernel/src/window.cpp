@@ -10,6 +10,7 @@
 // blitting client areas to draw the window decorations.
 
 #include "window.h"
+#include "idle_inhibit.h"
 #include "../../shared/brook_pointer.h"
 #include "../../shared/brook_experience_config.h"
 #include "mouse.h"
@@ -1093,6 +1094,7 @@ static int CreateWindowLocked(Process* proc, int16_t x, int16_t y,
     w.pointerEngageSerial = 0;
     w.pointerDisengaged = false;
     w.fineScroll = false;
+    w.idleInhibitors = 0;
     w.publicationGeneration=w.publishedGeneration=1;
     w.clientPid=proc?(proc->tgid?proc->tgid:proc->pid):0;
     w.clientIncarnation=proc?(proc->isThread?proc->leaderIncarnation:proc->incarnation):0;
@@ -1198,6 +1200,8 @@ static void DestroyWindowLocked(int idx)
     }
     w.externalCaptured = false;
     w.externalW = w.externalH = 0;
+    if (w.idleInhibitors) SerialPrintf("WM: window %d idle inhibitors %u -> 0 (destroyed)\n", idx, w.idleInhibitors);
+    w.idleInhibitors = 0;
     w.wmId = 0;
     w.proc = nullptr;
     w.visible = false;
@@ -1477,6 +1481,32 @@ bool WmSetOwnedWindowProperties(Process* proc, uint32_t wmId, uint32_t mask,
     if (!WmFindWindowById(proc, wmId)) return false;
     SetWindowPropertiesLocked(static_cast<int>(wmId) - 1, mask, opacity, blurRadius);
     return true;
+}
+
+bool WmSetOwnedIdleInhibit(Process* proc, uint32_t wmId, uint32_t count)
+{
+    if (count > IdleInhibitMaxPerWindow) return false;
+    VfbGuard guard;
+    Window* w = WmFindWindowById(proc, wmId);
+    if (!w) return false;
+    if (w->idleInhibitors != count)
+        SerialPrintf("WM: window %u idle inhibitors %u -> %u pid=%u app='%s'\n",
+                     wmId, w->idleInhibitors, count, w->clientPid, w->appId);
+    w->idleInhibitors = static_cast<uint16_t>(count);
+    return true;
+}
+
+bool WmIdleInhibitActive()
+{
+    VfbGuard guard;
+    return IdleInhibitAny(g_windows, WM_MAX_WINDOWS);
+}
+
+void WmIdleInhibitRead(IdleInhibitSnapshot* out)
+{
+    if (!out) return;
+    VfbGuard guard;
+    IdleInhibitCollect(g_windows, WM_MAX_WINDOWS, *out);
 }
 
 uint32_t WmWindowCount()

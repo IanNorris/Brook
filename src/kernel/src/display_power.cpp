@@ -9,6 +9,7 @@
 #include "spinlock.h"
 #include "serial.h"
 #include "vfs.h"
+#include "window.h"
 
 namespace brook {
 namespace {
@@ -18,6 +19,8 @@ auto& policy=controller.idle;
 SpinLock lock;
 volatile uint32_t* cpuPage=nullptr;
 volatile uint32_t* pchPage=nullptr;
+bool inhibited=false,inhibitChecked=false;
+uint64_t inhibitCheckedMs=0;
 uint32_t Read(void*,uint32_t offset) {
     auto* page=offset<0xc0000?cpuPage:pchPage;
     return page[(offset&4095)/4];
@@ -89,8 +92,8 @@ void DisplayPowerConfigure(const BootProtocol* boot) {
 }
 DisplayPowerStatus DisplayPowerRead() {
     SpinLockAcquire(&lock);
-    DisplayPowerStatus out{bool(cpuPage&&pchPage),backlight.ready,backlight.on,backlight.uncertain,policy.timeoutSeconds,
-        policy.lastActivityMs,policy.restoreAtMs,backlight.reason,backlight.original,{}};
+    DisplayPowerStatus out{bool(cpuPage&&pchPage),backlight.ready,backlight.on,backlight.uncertain,inhibited,inhibitCheckedMs,
+        policy.timeoutSeconds,policy.lastActivityMs,policy.restoreAtMs,backlight.reason,backlight.original,{}};
     if(out.mapped)out.current=backlight.Read(io);
     SpinLockRelease(&lock);return out;
 }
@@ -106,8 +109,17 @@ bool DisplayPowerSetIdle(uint32_t seconds) {
 }
 void DisplayPowerTick(uint64_t now,uint64_t inputSequence) {
     if(!backlight.ready)return;
+    // Only the compositor thread ticks. The WM mutex is taken here, outside
+    // the display-power spinlock, and at most once a second.
+    const bool poll=!inhibitChecked || now<inhibitCheckedMs || now-inhibitCheckedMs>=1000;
+    const bool active=poll?WmIdleInhibitActive():inhibited;
     SpinLockAcquire(&lock);
-    controller.Tick(io,now,inputSequence);
+    if(poll){
+        if(active!=inhibited)
+            SerialPrintf("backlight: idle inhibit %s\n",active?"active":"released");
+        inhibited=active;inhibitChecked=true;inhibitCheckedMs=now;
+    }
+    controller.Tick(io,now,inputSequence,inhibited);
     SpinLockRelease(&lock);
 }
 // Every panic and exception path calls this before drawing: first re-arm the

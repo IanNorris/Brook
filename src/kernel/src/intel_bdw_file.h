@@ -48,7 +48,11 @@ BdwGpuBuffer* BdwGpuFileGetBuffer(BdwGpuFile* file,uint32_t handle);
 // Resolve a copied handle array atomically under the file lock. On success
 // every output owns one buffer reference; on failure outputs are unchanged.
 // Input and output must be disjoint kernel-owned arrays.
-bool BdwGpuFileResolveBuffers(BdwGpuFile* file,const uint32_t* handles,uint32_t count,BdwGpuBuffer** out);
+// On failure, failedIndex (optional) names the first offending entry and
+// duplicate (optional) whether it repeats an earlier handle.
+bool BdwGpuFileResolveBuffers(BdwGpuFile* file,const uint32_t* handles,uint32_t count,BdwGpuBuffer** out,
+                              uint32_t* failedIndex=nullptr,bool* duplicate=nullptr);
+uint32_t BdwGpuFileMaxHandles();
 uint64_t BdwGpuFileMapToken(BdwGpuFile* file,uint32_t handle);
 BdwGpuBuffer* BdwGpuFileGetMapping(BdwGpuFile* file,uint64_t offset,uint64_t length,uint64_t& bufferOffset);
 }

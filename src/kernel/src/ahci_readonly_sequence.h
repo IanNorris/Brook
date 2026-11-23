@@ -248,11 +248,14 @@ template<class Io> Result CompleteCommand(Io& io, uint32_t expectedBytes) {
 
 // The caller prepared slot zero and holds its sleepable serialization lock.
 // Io::transferred reads PRDBC after the completion fence.
-template<class Io> Result Submit(Io& io, uint32_t expectedBytes) {
+template<bool LongTimeout = false, class Io> Result Submit(Io& io, uint32_t expectedBytes) {
     if(!expectedBytes || io.read(CI) || io.read(SACT))return Result::Busy;
     const auto armed=ArmCommand(io);
     if(armed!=Result::Ok)return armed;
-    if(!io.waitClear(CI,1))return Result::Timeout;
+    // TRIM (DSM) may take far longer than sector I/O: the flush wait bound.
+    if constexpr (LongTimeout) {
+        if(!io.waitClearFlush(CI,1))return Result::Timeout;
+    } else if(!io.waitClear(CI,1))return Result::Timeout;
     return CompleteCommand(io,expectedBytes);
 }
 

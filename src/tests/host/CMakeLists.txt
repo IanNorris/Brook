@@ -53,6 +53,10 @@ function(add_host_test TEST_NAME)
 endfunction()
 
 enable_testing()
+add_host_test(test_ssd_trim_plan)
+target_compile_options(test_ssd_trim_plan PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
+add_host_test(test_ssd_trim_log)
+target_compile_options(test_ssd_trim_log PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_immutable_image_snapshot)
 add_host_test(test_ramdisk "${BROOK_ROOT}/src/kernel/src/ramdisk.cpp")
 target_include_directories(test_ramdisk PRIVATE "${BROOK_ROOT}/src/shared/inc_km")
@@ -76,6 +80,12 @@ add_test(NAME test_stage_selected_profile
     COMMAND python3 "${BROOK_ROOT}/scripts/test_stage_selected_profile.py")
 add_test(NAME test_brook_profile
     COMMAND nix-instantiate --eval --strict --expr "import ./nix/test-brook-profile.nix {}")
+# Gallery/installer compatibility: package classification, launcher export
+# and the package index join (x86_64-linux only).
+add_test(NAME test_nix_classify COMMAND python3 "${BROOK_ROOT}/tools/nix-install/test_classify.py")
+add_test(NAME test_nix_desktop COMMAND python3 "${BROOK_ROOT}/tools/nix-install/test_desktop.py")
+add_test(NAME test_nix_install_links COMMAND python3 "${BROOK_ROOT}/tools/nix-install/test_install_links.py")
+add_test(NAME test_gen_nix_index COMMAND python3 "${BROOK_ROOT}/tools/nix-index/test_gen_nix_index.py")
 set_tests_properties(test_stage_selected_launchers test_stage_selected_profile test_brook_profile
     PROPERTIES LABELS nix WORKING_DIRECTORY "${BROOK_ROOT}")
 set_tests_properties(test_stage_selected_launchers PROPERTIES SKIP_REGULAR_EXPRESSION "OK [()]skipped=")
@@ -1212,6 +1222,8 @@ target_compile_options(test_boot_timing PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/s
 add_host_test(test_intel_bdw_node_cache)
 add_host_test(test_cpu_idle)
 target_compile_options(test_cpu_idle PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
+add_host_test(test_thermal_balance)
+target_compile_options(test_thermal_balance PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 
 add_host_test(test_arp_neighbor)
 target_compile_options(test_arp_neighbor PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")

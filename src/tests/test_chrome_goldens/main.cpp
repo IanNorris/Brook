@@ -764,13 +764,44 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
     telemetry.latest = telemetry.points[telemetry.pointCount - 1];
     model.networkConnected = true;
     std::strcpy(model.text, "192.168.1.35");
+    // The Dell's live limits: RAPL 15/25 W, balance heavy at ratio 22.
+    telemetry.power = {15000, 25000, 13000, ChromeBalanceMode::Heavy, 22, 900, 950, 2400};
     for (const bool network : {true, false}) {
         model.network = network;
-        const DesktopRect flyout{0, 0, int(s.M(304)), ChromeTrayFlyoutHeight(s, network, true)};
+        const unsigned rows = network ? 0 : ChromePowerRows(telemetry.power);
+        const DesktopRect flyout{0, 0, int(s.M(304)), ChromeTrayFlyoutHeight(s, network, true, rows)};
         model.rect = flyout;
         ChromeDisplayList list = ChromeListOn(storage);
         RenderSnapshot(model, s, list);
         Check(prefix + (network ? "network-flyout" : "temperature-flyout"), list, s, flyout.x, flyout.y, flyout.w, flyout.h);
+    }
+    if (prefix == "glass-100-" || prefix == "opaque-light-150-" || prefix == "opaque-dark-200-") {
+        // Idle floor (render clock parked), then opted out and no balance at all.
+        const ChromePowerModel variants[] = {
+            {15000, 25000, 13000, ChromeBalanceMode::Idle, 8, 0, 450, 2400},
+            {15000, 25000, 0, ChromeBalanceMode::OptedOut, 0, 600, 0, 2400},
+            {0, 0, 0, ChromeBalanceMode::Unavailable, 0, 0, 0, 0},
+        };
+        const char* names[] = {"temperature-flyout-idle", "temperature-flyout-opted-out", "temperature-flyout-plain"};
+        model.network = false;
+        for (unsigned i = 0; i < 3; ++i) {
+            telemetry.power = variants[i];
+            const DesktopRect flyout{0, 0, int(s.M(304)), ChromeTrayFlyoutHeight(s, false, true, ChromePowerRows(variants[i]))};
+            model.rect = flyout;
+            ChromeDisplayList list = ChromeListOn(storage);
+            RenderSnapshot(model, s, list);
+            Check(prefix + names[i], list, s, flyout.x, flyout.y, flyout.w, flyout.h);
+        }
+        if (prefix == "glass-100-") {
+            // A narrow output: the CPU and Controller rows fall back to shorter text.
+            telemetry.power = {15000, 25000, 13000, ChromeBalanceMode::Heavy, 22, 900, 950, 2400};
+            const DesktopRect flyout{0, 0, int(s.M(232)), ChromeTrayFlyoutHeight(s, false, true, 4)};
+            model.rect = flyout;
+            ChromeDisplayList list = ChromeListOn(storage);
+            RenderSnapshot(model, s, list);
+            Check(prefix + "temperature-flyout-narrow", list, s, flyout.x, flyout.y, flyout.w, flyout.h);
+        }
+        telemetry.power = {};
     }
     if (prefix == "glass-100-" || prefix == "opaque-light-150-" || prefix == "opaque-dark-200-") {
         model.diskPopup = true;

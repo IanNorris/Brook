@@ -56,6 +56,7 @@ from hardware_update_protocol import record
 from guarded_bridge_v3_qa import (
     INTEL_NIC_DEVICE_IDS, NIC_PASS_MARKER, PASS_MARKER as BRIDGE_V3_PASS_MARKER, make_nic_disk,
 )
+from test_guard_repair_handoff_qemu import DATA_FIRST, TRIM_DATA_SECTORS
 
 DEFAULT_SHARED = Path('/data/Programming/Brook/shared/dell')
 IMAGE = ('qemu-check/guard-efi-fixture-20261103.raw.gz',
@@ -132,7 +133,10 @@ def main():
                    help='Run v3 QA with one emulated Intel NIC, checked PCI ID, desktop job and real frame')
     p.add_argument('--bridge-v3-nic-accel', choices=('kvm','tcg'),
                    help='Intel NIC QA accelerator (default KVM when accessible, otherwise TCG)')
+    p.add_argument('--ssd-trim', choices=('dry-run', 'run'), help='also test TRIM in the disposable fixture')
     a = p.parse_args()
+    if a.ssd_trim and a.efi:
+        p.error('--ssd-trim builds a loader for the enlarged fixture')
     if a.bridge_v3_nic and not a.bridge_v3_qa:
         p.error('--bridge-v3-nic requires --bridge-v3-qa')
     if a.bridge_v3_nic_accel and not a.bridge_v3_nic:
@@ -232,6 +236,22 @@ def main():
             verdict['intel_nic'] = {'model': a.bridge_v3_nic, 'accelerator': accelerator,
                                     'module_sha256': bridge_manifest['intel_nic_module_sha256']}
 
+        if a.ssd_trim:
+            options = scratch / 'trim-loader-options'
+            options.mkdir(mode=0o700)
+            config = options / 'guard-loader-options.txt'
+            config.write_text(
+                f'BROOK_GUARD_IDENTITY:STRING={rmanifest["guard_identity"]}\n'
+                f'BROOK_GUARD_DATA_FIRST:STRING={DATA_FIRST}\n'
+                f'BROOK_GUARD_DATA_SECTORS:STRING={TRIM_DATA_SECTORS}\n')
+            config.chmod(0o600)
+            loader = scratch / 'trim-loader'
+            subprocess.run([sys.executable, ROOT / 'scripts/build_dell_loader.py',
+                            '--shared', options, '--output', loader, '--allow-dirty'], check=True)
+            efi = loader / 'BROOKGUARD.efi'
+            verdict['trim_fixture'] = {'data_sectors': TRIM_DATA_SECTORS,
+                                       'efi_sha256': sha(efi), 'mode': a.ssd_trim}
+
         # 1. QEMU-only desktop pair: exact kernel and initrd, fixture identity.
         desktop = scratch / 'desktop-pair'
         desktop.mkdir()
@@ -266,6 +286,8 @@ def main():
                     '--image', str(image), '--efi', str(efi), '--firmware', str(firmware),
                     '--desktop-pair', str(desktop), '--recovery-pair', str(recovery),
                     '--output', str(run_dir), '--identity', rmanifest['guard_identity'], *mode_flags]
+            if a.ssd_trim:
+                argv += ['--ssd-trim', a.ssd_trim]
             print('+', ' '.join(argv), flush=True)
             start = time.monotonic()
             with log_path.open('w') as log:

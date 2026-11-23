@@ -1,4 +1,5 @@
 #include "intel_bdw_exec_snapshot.h"
+#include "intel_bdw_refusal.h"
 #include "intel_bdw_submission_timing.h"
 #include "intel_bdw_buffer.h"
 #include "intel_bdw_file.h"
@@ -240,27 +241,38 @@ BdwExecSnapshot* BdwExecSnapshotCreate(BdwGpuFile* file,const BdwExecObjectInput
     // ASYNC is advisory: the single worker still serializes all requests.
     // CAPTURE is a best-effort debug hint; no capture support is advertised.
     constexpr uint64_t limit=uint64_t{1}<<48,allowed=4|8|16|64|128;
-    if(!file || !inputs || !count || count>8192 || batchIndex>=count || (batchStart&7))return nullptr;
-    auto* s=static_cast<BdwExecSnapshot*>(kmalloc(sizeof(BdwExecSnapshot)));if(!s)return nullptr;
+    using R=BdwExecReject;
+    // Every refusal below records the failed check, its value and limit.
+    if(!file || !inputs || !count || count>BdwGpuFileMaxHandles()){BdwNoteExecReject(R::ObjectCount,count,BdwGpuFileMaxHandles());return nullptr;}
+    if(batchIndex>=count){BdwNoteExecReject(R::BatchRange,batchIndex,count);return nullptr;}
+    if(batchStart&7){BdwNoteExecReject(R::BatchAlignment,batchStart,8);return nullptr;}
+    auto* s=static_cast<BdwExecSnapshot*>(kmalloc(sizeof(BdwExecSnapshot)));if(!s){BdwNoteExecReject(R::NoMemory,sizeof(BdwExecSnapshot));return nullptr;}
     *s={};s->file=file;
     s->buffers=static_cast<BdwGpuBuffer**>(kmalloc(uint64_t(count)*sizeof(*s->buffers)));
     s->objects=static_cast<BdwExecMemoryObject*>(kmalloc(uint64_t(count)*sizeof(*s->objects)));
     auto* handles=static_cast<uint32_t*>(kmalloc(uint64_t(count)*sizeof(uint32_t)));
-    if(!s->buffers || !s->objects || !handles){kfree(handles);Release(s);return nullptr;}
+    if(!s->buffers || !s->objects || !handles){kfree(handles);Release(s);BdwNoteExecReject(R::NoMemory,count);return nullptr;}
     for(uint32_t i=0;i<count;++i){s->buffers[i]=nullptr;handles[i]=inputs[i].handle;}
-    if(!BdwGpuFileResolveBuffers(file,handles,count,s->buffers)){kfree(handles);Release(s);return nullptr;}
+    {uint32_t failed=BdwRefusalNoObject;bool duplicate=false;
+        if(!BdwGpuFileResolveBuffers(file,handles,count,s->buffers,&failed,&duplicate)){
+            BdwNoteExecReject(duplicate?R::HandleDuplicate:R::HandleInvalid,failed<count?handles[failed]:0,BdwGpuFileMaxHandles(),failed);
+            kfree(handles);Release(s);return nullptr;}}
     s->count=count;s->batchIndex=batchIndex;s->batchOffset=batchStart;kfree(handles);
     for(uint32_t i=0;i<count;++i){const auto& in=inputs[i];
         const uint64_t upper=in.address>>48,low=in.address&(limit-1);
-        if((in.flags&~allowed) || !(in.flags&16) || (upper && (upper!=0xffff || !(low&(uint64_t{1}<<47)))) ||
-           (low&4095) || (in.alignment && (in.alignment<4096 || (in.alignment&(in.alignment-1)) || (low&(in.alignment-1))))) {
-            Release(s);return nullptr;
-        }
+        auto reject=[&](R r,uint64_t value,uint64_t bound){BdwNoteExecReject(r,value,bound,i);Release(s);return nullptr;};
+        if(in.flags&~allowed)return reject(R::ObjectFlags,in.flags,allowed);
+        if(!(in.flags&16))return reject(R::ObjectNotPinned,in.flags,16);
+        if(upper && (upper!=0xffff || !(low&(uint64_t{1}<<47))))return reject(R::ObjectAddress,in.address,limit);
+        if(in.alignment && (in.alignment<4096 || (in.alignment&(in.alignment-1))))return reject(R::ObjectAlignment,in.alignment,4096);
+        if((low&4095) || (in.alignment && (low&(in.alignment-1))))return reject(R::ObjectAddressAlignment,in.address,in.alignment?in.alignment:4096);
         uint32_t pages=0;const auto* dma=BdwGpuBufferPages(s->buffers[i],pages);
         const uint64_t size=BdwGpuBufferBytes(s->buffers[i]);
-        if(!dma || !pages || pages>65536-s->pages || size>limit-low || (!(in.flags&8) && low+size>(uint64_t{1}<<32))) {
-            Release(s);return nullptr;
-        }
+        if(!dma || !pages)return reject(R::ObjectBacking,size,0);
+        // value: pages needed including this object; limit: BdwExecMaxPages.
+        if(pages>BdwExecMaxPages-s->pages)return reject(R::PageLimit,uint64_t(s->pages)+pages,BdwExecMaxPages);
+        if(size>limit-low)return reject(R::ObjectBeyond48,low+size,limit);
+        if(!(in.flags&8) && low+size>(uint64_t{1}<<32))return reject(R::ObjectBeyond4G,low+size,uint64_t{1}<<32);
         // ASYNC opts out of implicit object synchronization; it does not
         // declare the object read-only. Explicitly synchronized clients
         // such as HasVK may write it without setting EXEC_OBJECT_WRITE.
@@ -273,15 +285,17 @@ BdwExecSnapshot* BdwExecSnapshotCreate(BdwGpuFile* file,const BdwExecObjectInput
         if(in.flags&128){++s->captureRequested;if(s->captureCount<4 && BdwGpuBufferAllowsUserMapping(s->buffers[i])){
             s->captureIndices[s->captureCount]=i;s->captureAddresses[s->captureCount]=low;++s->captureCount;}}
         if(i==batchIndex){
-            if(!BdwGpuBufferAllowsUserMapping(s->buffers[i]) || (in.flags&4) || batchStart>=size ||
-               (batchLength && batchLength>size-batchStart)) {Release(s);return nullptr;}
+            if(!BdwGpuBufferAllowsUserMapping(s->buffers[i]) || (in.flags&4))return reject(R::BatchProtected,in.flags,0);
+            if(batchStart>=size || (batchLength && batchLength>size-batchStart))
+                return reject(R::BatchRange,uint64_t(batchStart)+batchLength,size);
             s->batchAddress=low+batchStart;s->batchLength=batchLength?batchLength:size-batchStart;
         }
     }
     SortObjects(s->objects,count);
-    for(uint32_t i=1;i<count;++i){const auto& prev=s->objects[i-1];
-        if(s->objects[i].address<prev.address+uint64_t(prev.pageCount)*4096){Release(s);return nullptr;}}
-    s->completionFence=BdwFenceCreate();if(!s->completionFence){Release(s);return nullptr;}
+    for(uint32_t i=1;i<count;++i){const auto& prev=s->objects[i-1];const uint64_t end=prev.address+uint64_t(prev.pageCount)*4096;
+        // Sorted order: the object index is not the exec-list index here.
+        if(s->objects[i].address<end){BdwNoteExecReject(R::ObjectOverlap,s->objects[i].address,end);Release(s);return nullptr;}}
+    s->completionFence=BdwFenceCreate();if(!s->completionFence){BdwNoteExecReject(R::NoMemory,0);Release(s);return nullptr;}
     SampleBatch(s);return s;
 }
 uint64_t BdwExecSnapshotBatchAddress(const BdwExecSnapshot* s){return s?s->batchAddress:0;}
@@ -408,7 +422,7 @@ bool BdwExecSnapshotBuildRenderImage(BdwExecSnapshot* s,const BdwPpgttPage (&scr
                                     uint64_t completion,uint32_t nonce,bool gt3,uint32_t (&ring)[56]){
     if(!Preparing(s))return false;
     s->preparedFlags&=~1u;
-    if(!tables || !tableCount || tableCount>BdwPpgttMaxTables || !workspace || !workspaceCount || workspaceCount>65536)return false;
+    if(!tables || !tableCount || tableCount>BdwPpgttMaxTables || !workspace || !workspaceCount || workspaceCount>BdwExecMaxPages)return false;
     const uintptr_t start=reinterpret_cast<uintptr_t>(ring);
     auto overlaps=[&](uintptr_t address,uint64_t size){
         return start>~uintptr_t{0}-sizeof(ring) || address>~uintptr_t{0}-size ||

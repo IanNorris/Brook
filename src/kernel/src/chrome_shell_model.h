@@ -37,10 +37,11 @@ struct ChromeShellTelemetry {
     ThermalSample latest, points[ThermalGraphHistory];
     uint32_t tjmax, pointCount;
     bool thermal, rapl, hasCompositor, hasApp;
+    ChromePowerModel power;
 
     ChromeTelemetryModel View() const {
         return {stats, hasCompositor ? &compositor : nullptr, hasApp ? &app : nullptr,
-                thermal, rapl, tjmax, latest, points, pointCount};
+                thermal, rapl, tjmax, latest, points, pointCount, power};
     }
 };
 

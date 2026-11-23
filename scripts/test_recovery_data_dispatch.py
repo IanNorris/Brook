@@ -28,10 +28,10 @@ def outside_esp_hash(path):
         for block in iter(lambda:stream.read(1024*1024),b''):digest.update(block)
     return digest.hexdigest()
 
-def metadata_hash(path):
+def metadata_hash(path, data_end=260096):
     digest=hashlib.sha256()
     with path.open('rb') as stream:
-        digest.update(stream.read(2048*512));stream.seek(260096*512)
+        digest.update(stream.read(2048*512));stream.seek(data_end*512)
         for block in iter(lambda:stream.read(1024*1024),b''):digest.update(block)
     return digest.hexdigest()
 

@@ -366,7 +366,7 @@ int CpuIdleSetBudget(uint64_t now,unsigned count,const CpuBudgetConfig& config,u
     const auto flags=IrqSpinLockAcquire(&g_ratioLock);
     int result=-16;
     if (g_budget.phase==CpuPowerBudget::Phase::Snapshot || g_budget.phase==CpuPowerBudget::Phase::Active)
-        result=g_budget.SetConfig(config)?0:-22;
+        result=g_budget.config.external!=config.external?-16:g_budget.SetConfig(config)?0:-22;
     else if (g_budget.phase==CpuPowerBudget::Phase::Off && g_ratioTrial.phase==CpuEpbTrial::Phase::Off)
         result=g_budget.Start(now,count,config,minRatio,maxNonTurbo)?0:-22;
     __atomic_store_n(&g_budgetActive,g_budget.phase!=CpuPowerBudget::Phase::Off,__ATOMIC_RELEASE);
@@ -394,10 +394,17 @@ void CpuIdleBudgetControl(uint64_t now,const CpuBudgetSample& sample)
     IrqSpinLockRelease(&g_ratioLock,flags);
 }
 
-void CpuIdleCancelBudget()
+void CpuIdleBudgetSetCap(uint64_t now,unsigned cap)
 {
     const auto flags=IrqSpinLockAcquire(&g_ratioLock);
-    g_budget.Cancel();
+    g_budget.SetCap(now,cap);
+    IrqSpinLockRelease(&g_ratioLock,flags);
+}
+
+void CpuIdleCancelBudget(bool external)
+{
+    const auto flags=IrqSpinLockAcquire(&g_ratioLock);
+    if (g_budget.config.external==external) g_budget.Cancel();
     __atomic_store_n(&g_budgetActive,g_budget.phase!=CpuPowerBudget::Phase::Off,__ATOMIC_RELEASE);
     IrqSpinLockRelease(&g_ratioLock,flags);
 }
