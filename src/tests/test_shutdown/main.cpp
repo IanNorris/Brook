@@ -381,3 +381,4 @@ step();assert(!signals&&!syncs&&!gate);
     // Never execute the host's actual power I/O from this native fixture.
     std::puts("SHUTDOWN_COORDINATOR PASS");
 }
+extern "C" void KPrintf(const char*,...){}

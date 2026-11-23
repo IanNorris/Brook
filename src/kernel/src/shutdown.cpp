@@ -31,6 +31,11 @@
 #endif
 
 namespace brook {
+// Strong definition of vfs.cpp's weak sync failure hook: bridge-visible.
+void VfsSyncFailureLog(int stage, uint8_t pdrv, const void* callback, int error) {
+    static const char* const names[]={"file writeback","backing sync","retired unmount"};
+    KPrintf("vfs: sync: %s failed pdrv=%u callback=%p (%d)\n",names[stage>=0&&stage<3?stage:0],unsigned(pdrv),callback,error);
+}
 namespace {
 enum class Phase { Empty,Closing,Services,Cleanup,Syncing,Ready,Committing,Failed,Cancelled };
 struct Operation {

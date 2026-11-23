@@ -18,7 +18,6 @@ inline void* operator new(__SIZE_TYPE__,void* pointer) noexcept { return pointer
 #include "procfs.h"
 #include "memory/heap.h"
 #include "serial.h"
-#include "kprintf.h"
 #include "memory/virtual_memory.h"
 #include "sync/krwlock.h"
 #include "path_walk.h"
@@ -1371,6 +1370,12 @@ int VfsSetTimesPath(const char* path, const VnodeTime* times, bool nofollow)
     return mount->backing->fsOps->set_times(mount->backing->mountPriv, mount->backing->pdrv, relPath, times, nofollow);
 }
 
+// Sync failure report (stage 0 = file writeback, 1 = a backing's sync
+// callback, 2 = unmount of a retired backing). The kernel's strong
+// definition (shutdown.cpp) writes it to the log ring; standalone tests
+// that link vfs.cpp alone keep this no-op.
+__attribute__((weak)) void VfsSyncFailureLog(int, uint8_t, const void*, int) {}
+
 int VfsSync(Vnode* vn)
 {
     if (vn) return VfsFsync(vn);
@@ -1379,20 +1384,19 @@ int VfsSync(Vnode* vn)
     int result = FileObjectWritebackAll();
     // Failures go to the kernel log ring too, so a failed shutdown sync is
     // diagnosable over the bridge (the serial tail is not persisted then).
-    if (result) KPrintf("vfs: sync: file writeback failed (%d)\n", result);
+    if (result) VfsSyncFailureLog(0, 0, nullptr, result);
     FileMutationGuard mutation;
     VfsCollectRetiredMountsLocked();
     for(auto* backing=g_backings;backing;) {
         auto* next=backing->next;
         if(backing->fsOps->sync) {
             int error=backing->fsOps->sync(backing->mountPriv);
-            if(error)KPrintf("vfs: sync: backing pdrv=%u sync=%p failed (%d)\n",unsigned(backing->pdrv),
-                             reinterpret_cast<void*>(backing->fsOps->sync),error);
+            if(error)VfsSyncFailureLog(1,backing->pdrv,reinterpret_cast<const void*>(backing->fsOps->sync),error);
             if(!result && error)result=error<0?error:-5;
         }
         if(!backing->references) {
             int error=VfsBackingUnmountLocked(backing);
-            if(error)KPrintf("vfs: sync: unmount of retired backing pdrv=%u failed (%d)\n",unsigned(backing->pdrv),error);
+            if(error)VfsSyncFailureLog(2,backing->pdrv,nullptr,error);
             if(!error)VfsBackingFreeLocked(backing);
             else if(!result)result=error;
         }
