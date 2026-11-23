@@ -143,7 +143,14 @@ struct Fake{
         for(uint32_t base:{RegAssy(ch,0),RegArm(ch,0)}){
             R(base+c57e::SET_SIZE)=g.winSize;R(base+c57e::SET_STORAGE)=g.winStorage;R(base+c57e::SET_PARAMS)=g.winParams;
             R(base+c57e::SET_PLANAR_STORAGE0)=g.winPlanar;R(base+c57e::SET_CONTEXT_DMA_ISO0)=g.winIso;R(base+c57e::SET_OFFSET0)=g.winOffset;}
-        R(RegPut(ch))=0x80000000;
+        // Non-default GOP window state the survey saw (0x690000+), mirrored in ARM.
+        for(uint32_t base:{RegAssy(ch,0),RegArm(ch,0)}){
+            R(base+0x2a8)=0x11;R(base+0x2ec)=0x10000;R(base+0x2f4)=1;R(base+0x360)=1;R(base+0x364)=0x1300;
+            R(base+0x368)=2;R(base+0x370)=1;R(base+0x374)=1;}
+        for(uint32_t c2:{0u,ch}){R(RegPbLo(c2))=g.pbLo;R(RegPbHi(c2))=g.pbHi;R(RegPbValid(c2))=g.pbValid;R(RegPbClient(c2))=g.pbClient;}
+        R(RegArm(ch,c57e::UPDATE))=0xacf3fbfb;R(RegAssy(ch,0x208))=0x554; // live 058a8cd8: UPDATE slot, GET_LINE
+        R(kRegFeEnable)=g.feEnable;
+        R(RegPut(ch))=0x80000000;R(RegGet(ch))=0x80000000;
     }
     // Hardware-style handle lookup: probe from the hash over the whole table.
     bool Lookup(uint32_t handle,uint32_t chid,uint64_t& base,uint64_t& limit){
@@ -203,6 +210,7 @@ struct Fake{
     void wr(uint32_t a,uint32_t v){
         written.insert(a);
         if(a==kRegBar1Flush){R(a)=0;return;}
+        if(a==kRegInstTarget&&(v&8))assert(R(kRegInstAddr)!=0); // never valid at VRAM 0
         if(a==kRegExcWin){R(a)&=~v;if(!R(a))R(kRegIntrDispatch)&=~0x200u;return;}
         for(uint32_t ch=0;ch<=8;++ch){
             if(a==RegChnCtl(ch)){
@@ -210,6 +218,7 @@ struct Fake{
                 if((v&kCtlRunning)==kCtlRunning&&(old&kCtlConnect)==0){
                     assert(R(RegPbLo(ch))&1);assert(R(RegPbClient(ch))==kClientId);
                     assert((R(kRegInstTarget)&8)&&R(kRegInstAddr));     // instmem before connect
+                    assert(R(RegPbLo(ch))>1);                            // our pushbuffer, not the GOP's
                     if(idleOnConnect)R(RegChnStatus(ch))=ch==0?0x000b0000:0x04040100;
                     R(RegGet(ch))=0;wndwCur=0;}
                 if(!(v&kCtlConnect)&&(old&kCtlConnect))R(RegChnStatus(ch))=ch==0?0x00080000:0x01010100;
@@ -230,22 +239,25 @@ struct Fake{
     void fence(){}
     bool expired(uint32_t ms,uint32_t& t){return ++t>ms;}
     void except(uint32_t chid,uint32_t s,uint32_t d,uint32_t c){trace.push_back("exception chid "+std::to_string(chid));(void)s;(void)d;(void)c;}
-    bool verbose=false;
+    bool verbose=false;uint32_t diffs=0,pauses=0;
+    void diff(uint32_t m,uint32_t a,uint32_t b){++diffs;if(verbose)printf("  diff %03x assy %08x arm %08x\n",m,a,b);}
+    void pause(const char*){++pauses;}
     void log(uint32_t i,const Step& s,uint32_t got,bool ok){
         if(verbose||!ok)printf("  %3u %-12s %s got %08x\n",i,ok?"ok":"FAIL",s.what,got);}
 };
 // PraminExpect values must be the image words at those offsets.
 static void FixPramin(Plan& p,const InstImage& img){
-    for(uint32_t i=0;i<p.count;++i)if(p.steps[i].op==Op::PraminExpect)assert(p.steps[i].value==img.words[p.steps[i].reg/4]);
+    for(uint32_t i=0;i<p.count;++i)if(p.steps[i].op==Op::PraminExpect&&p.steps[i].mask==uint32_t(Blob::Inst))
+        assert(p.steps[i].value==img.words[p.steps[i].reg/4]);
 }
 
-static void TestPlanRun(bool core){
-    Config c=DellConfig();c.coreChannel=core;
+static void TestPlanRun(bool core,bool a2=false){
+    Config c=DellConfig();c.coreChannel=core;c.feEnable=a2;c.capsCopy=a2;c.pauseForObserver=true;
     static InstImage img;static Pushes pushes;static Plan plan;pushes=Pushes{};plan=Plan{};
     assert(BuildPlan(c,img,pushes,plan)==Err::Ok);FixPramin(plan,img);
     Fake f;f.img=&img;f.push=&pushes;f.Gop(c);
     assert(Run(plan,0,plan.count,f)==plan.count);
-    assert(f.flips==3&&f.exceptions==0);
+    assert(f.flips==3&&f.exceptions==0&&f.pauses==1&&f.diffs==0);
     const uint32_t ch=ChidWndw(0);
     // Final state == the GOP state the survey recorded (except core CHNCTL in stage B).
     assert(f.R(kRegInstTarget)==1&&f.R(kRegInstAddr)==0&&f.R(kRegPraminBase)==0x1fff0);
@@ -253,13 +265,21 @@ static void TestPlanRun(bool core){
     assert(f.R(RegArm(ch,c57e::SET_CONTEXT_DMA_ISO0))==kHandleGop&&f.R(RegArm(ch,c57e::SET_OFFSET0))==0);
     assert(f.R(RegArm(ch,c57e::SET_SIZE))==0x08700f00&&f.R(RegArm(ch,c57e::SET_PARAMS))==0xcf);
     if(!core)assert(f.R(RegChnCtl(0))==0x21);
+    assert(f.R(RegPbLo(ch))==1&&f.R(RegPbHi(ch))==0&&f.R(RegPbValid(ch))==1&&f.R(RegPbClient(ch))==0);
+    assert(f.R(kRegFeEnable)==0);
     // Registers the plan may write: nothing in head/SOR/core method space.
     std::set<uint32_t> allowed={kRegBar1Flush,kRegPraminBase,kRegInstTarget,kRegInstAddr,
         RegPbLo(ch),RegPbHi(ch),RegPbValid(ch),RegPbClient(ch),RegChnCtl(ch),RegPut(ch)};
     if(core)for(uint32_t r:{RegPbLo(0),RegPbHi(0),RegPbValid(0),RegPbClient(0),RegChnCtl(0),RegPut(0)})allowed.insert(r);
-    for(uint32_t a:f.written){if(!allowed.count(a)){printf("unexpected write %06x\n",a);assert(false);}}
+    if(a2)allowed.insert(kRegFeEnable);
+    for(uint32_t a:f.written){if(a2&&a>=0x640000&&a<0x641000)continue; // FE_SW caps page (dev_disp.h)
+        if(!allowed.count(a)){printf("unexpected write %06x\n",a);assert(false);}}
     // Phase markers are monotonic and cover the list.
     for(uint32_t i=0;i<uint32_t(Phase::Count);++i)assert(plan.phaseBegin[i]<=plan.phaseBegin[i+1]);
+    // Every pushbuffer word and instmem object is read back through PRAMIN before instmem goes live.
+    uint32_t pr=0;for(uint32_t i=0;i<plan.count;++i)if(plan.steps[i].op==Op::PraminExpect){++pr;
+        assert(i<plan.phaseBegin[uint32_t(Phase::Instmem)]);}
+    assert(pr==3*2+3*6+pushes.wndw.count+(core?2:0));
     assert(pushes.end[0]==25*4&&pushes.end[1]==pushes.end[0]+14*4&&pushes.end[2]==pushes.end[1]+14*4);
 }
 static void TestPreflightRefuses(){
@@ -268,6 +288,21 @@ static void TestPreflightRefuses(){
     Fake f;f.img=&img;f.push=&pushes;f.Gop(c);f.R(kRegInstTarget)=0x9; // someone already owns instmem
     const uint32_t at=Run(plan,0,plan.count,f);
     assert(at<plan.phaseBegin[uint32_t(Phase::Vram)]&&f.written.empty()); // nothing written
+}
+// The UPDATE promotes the whole ASSY block: a differing word that submission 1
+// does not rewrite (composition 0x2ec) refuses; one it rewrites (0x308) passes.
+static void TestAssyArmDiff(){
+    for(int rewritten=0;rewritten<2;++rewritten){
+        Config c=DellConfig();static InstImage img;static Pushes pushes;static Plan plan;pushes=Pushes{};plan=Plan{};
+        assert(BuildPlan(c,img,pushes,plan)==Err::Ok);
+        Fake f;f.img=&img;f.push=&pushes;f.Gop(c);
+        f.R(RegAssy(1,rewritten?0x308:0x2ec))=0x5;
+        const uint32_t end=plan.phaseBegin[uint32_t(Phase::Vram)];
+        const uint32_t at=Run(plan,0,end,f);
+        assert(f.diffs==1&&f.written.empty());
+        assert(rewritten?at==end:at<end);
+        assert(plan.Rewritten(0x308)&&plan.Rewritten(0x224)&&!plan.Rewritten(0x2ec)&&!plan.Rewritten(0x2a8));
+    }
 }
 static void TestAbortWindowNeverIdle(){
     Config c=DellConfig();static InstImage img;static Pushes pushes;static Plan plan,abort;pushes=Pushes{};plan=Plan{};abort=Plan{};
@@ -291,6 +326,12 @@ static void TestAbortUnresolvableHandle(){
     assert(f.exceptions==1&&(f.R(kRegIntrDispatch)&0x200));
     BuildAbort(c,Phase::FirstFlip,abort);assert(Run(abort,0,abort.count,f,true)==abort.count);
     assert(f.trace.size()==1&&!(f.R(kRegExcWin)&1)&&!(f.R(kRegIntrDispatch)&0x200));
+    // Trash is set before the exception ack (review item 1).
+    uint32_t trash=~0u,ack=~0u;for(uint32_t i=0;i<abort.count;++i){
+        if(abort.steps[i].op==Op::Mask&&abort.steps[i].value==kCtlTrashAbort&&trash==~0u)trash=i;
+        if(abort.steps[i].op==Op::AckException)ack=i;}
+    assert(trash<ack);
+    assert(f.R(RegPbLo(1))==1&&f.R(RegPbClient(1))==0);
     assert((f.R(RegChnCtl(1))&0x6013)==0x01&&f.R(kRegInstTarget)==1);
     assert(f.R(RegArm(1,c57e::SET_CONTEXT_DMA_ISO0))==kHandleGop);
 }
@@ -316,10 +357,10 @@ static void TestRingWrap(){
 }
 
 static void Dump(bool core){
-    Config c=DellConfig();c.coreChannel=core;
+    Config c=DellConfig();c.coreChannel=core;c.pauseForObserver=true;
     static InstImage img;static Pushes pushes;static Plan plan;pushes=Pushes{};plan=Plan{};
     assert(BuildPlan(c,img,pushes,plan)==Err::Ok);FixPramin(plan,img);
-    static const char* op[]={"WR","MASK","EXPECT","POLL","POLLSOFT","ACK","VCOPY","VWR","VEXPECT","VPOLL","VPOLLANY","ACKEXC","PRAMIN","FENCE","KICK"};
+    static const char* op[]={"WR","MASK","EXPECT","POLL","POLLSOFT","ACK","VCOPY","VWR","VEXPECT","VPOLL","VPOLLANY","ACKEXC","PRAMIN","FENCE","KICK","EXPNOT","LOG","COPY","ASSYARM","PAUSE"};
     uint32_t ph=0;
     for(uint32_t i=0;i<plan.count;++i){
         while(ph<uint32_t(Phase::Count)&&plan.phaseBegin[ph]<=i&&(ph+1>=uint32_t(Phase::Count)||plan.phaseBegin[ph+1]<=i))++ph;
@@ -346,7 +387,7 @@ int main(int argc,char** argv){
     if(argc>1&&!strcmp(argv[1],"--dump")){Dump(argc>2&&!strcmp(argv[2],"core"));return 0;}
     TestHashFix();
     TestPush();TestInst();
-    TestPlanRun(false);TestPlanRun(true);
+    TestPlanRun(false);TestPlanRun(true);TestPlanRun(false,true);TestAssyArmDiff();
     TestPreflightRefuses();TestAbortWindowNeverIdle();TestAbortUnresolvableHandle();
     TestValidate();TestRingWrap();
     TestHash();

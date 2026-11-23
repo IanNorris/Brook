@@ -44,6 +44,7 @@ constexpr uint32_t kPramin         =0x700000;
 constexpr uint32_t kRegDispOwner   =0x6254e8; // bit1 = VBIOS owns display (N2 189)
 constexpr uint32_t kRegInstTarget  =0x610010; // 0x8 valid | target (1 VRAM)
 constexpr uint32_t kRegInstAddr    =0x610014; // inst >> 16
+constexpr uint32_t kRegFeEnable    =0x610078; // nouveau |= 1 after the caps copies (N2 240)
 constexpr uint32_t kRegIntrDispatch=0x611ec0; // bits 0-7 head timing, 9 EXC_WIN, 10 EXC_WINIM, 11 EXC_OTHER, 12 CTRL_DISP
 constexpr uint32_t kRegExcWin      =0x61184c; // per window, W1C (N1 1037-1049)
 constexpr uint32_t kRegExcWinim    =0x611850;
@@ -154,6 +155,8 @@ struct GopState{
              winIso=kHandleGop, winOffset=0;
     uint32_t coreWinCtl=0, coreFmtUsage=0x3b7, coreRotUsage=0, coreMaxScale=0x04000400, coreUsage=0x110f00;
     uint32_t headRaster=0x08ae0fa0, headPclk=0x1fc8bfd0, sorCtl=0x901; uint32_t sor=1;
+    uint32_t pbLo=0x1, pbHi=0, pbValid=0x1, pbClient=0; // 0x610b20.. per channel (555a7dbd)
+    uint32_t feEnable=0;                                // 0x610078
 };
 struct Config{
     uint32_t window=0, head=0;
@@ -165,6 +168,9 @@ struct Config{
     bool mirrorRmHash=false;    // duplicate every RAMHT entry at the RM-hash slot too
     bool praminCheck=true;      // verify BAR1 == VRAM identity through PRAMIN before enabling
     uint32_t praminRestore=0x1fff0; // 0x1700 value the firmware left
+    bool feEnable=false;        // stage A2: 0x610078 |= 1 like tu102_disp_init 240 (restored to 0)
+    bool capsCopy=false;        // stage A2: tu102_disp_init caps copies into FE_SW 0x640000 (not restored)
+    bool pauseForObserver=false;// first live noop: Pause between window disconnect and instmem off
     GopState gop{};
 };
 
@@ -293,6 +299,12 @@ enum class Op:uint8_t{
     PraminExpect,// (BAR0 kPramin + reg) == word `value` of blob `mask`, see PraminCheck
     Fence,      // sfence before PUT (R3 54)
     Kick,       // reg (PUT) = value, after Fence; GET must reach it next
+    ExpectNot,  // (reg & mask) != value, else abort
+    Log,        // read reg and log it; never fails
+    Copy,       // reg `value` = read reg (caps copies, tu102_disp_init)
+    AssyArmDiff,// chid `reg`: every method mask..value-4 must have ASSY == ARM unless the
+                // first submission rewrites it (Plan::rewritten); diffs go to io.diff
+    Pause,      // live: wait for the operator (io.pause); dry run: no-op
 };
 enum class Blob:uint32_t{Inst,WndwPush,CorePush,SyncInit};
 struct Step{Op op;uint32_t reg,mask,value,timeoutMs;uint64_t vram;const char* what;};
@@ -302,8 +314,14 @@ inline const char* PhaseName(Phase p){
     return n[uint32_t(p)];
 }
 struct Plan{
-    static constexpr uint32_t kMax=192;
+    static constexpr uint32_t kMax=512;
     Step steps[kMax];uint32_t count=0;bool overflow=false;
+    uint32_t rewritten[0x800/4/32]{}; // window methods the first submission sets
+    void MarkRewritten(const uint32_t* w,uint32_t n){
+        for(uint32_t i=0;i<n;){const uint32_t hdr=w[i++];if(hdr>>29)continue;
+            const uint32_t cnt=(hdr>>18)&0x3ff,m=hdr&0x3ffc;
+            for(uint32_t k=0;k<cnt&&i<n;++k,++i){const uint32_t mm=(m+k*4)/4;if(mm<0x200)rewritten[mm/32]|=1u<<(mm%32);}}}
+    bool Rewritten(uint32_t mthd)const{const uint32_t mm=mthd/4;return mm<0x200&&(rewritten[mm/32]>>(mm%32))&1;}
     uint32_t phaseBegin[uint32_t(Phase::Count)+1]{};
     void Begin(Phase p){phaseBegin[uint32_t(p)]=count;}
     void End(){phaseBegin[uint32_t(Phase::Count)]=count;}
@@ -362,7 +380,7 @@ inline Err Validate(const Config& c){
         if(((s.pitch>>6)&0x1fff)!=c.gop.winPlanar)return Err::Usage;
     }
     if((c.instVram&0xffff)||(c.corePushVram&0xfff)||(c.wndwPushVram&0xfff)||(c.syncVram&0xfff))return Err::Align;
-    if(c.praminCheck&&(c.instVram&0xfffff))return Err::Align;      // PRAMIN window is 1 MiB
+    if(c.praminCheck&&((c.instVram&0xfffff)||((c.wndwPushVram^c.instVram)>>20)))return Err::Align; // one 1 MiB PRAMIN window
     struct R{uint64_t a,b;}r[6];uint32_t n=0;
     r[n++]={c.surf[0].vram,c.surf[0].vram+SurfBytes(c.surf[0])};
     r[n++]={c.surf[1].vram,c.surf[1].vram+SurfBytes(c.surf[1])};
@@ -391,7 +409,7 @@ inline void AddChannelInit(Plan& p,uint32_t chid,uint64_t pushVram){
     p.Add(Op::Write,RegChnCtl(chid),~0u,kCtlRunning,0,"CHNCTL = ALLOCATE|CONNECT|PUTPTR_WRITE");
     if(chid==kChidCore)p.Add(Op::Poll,RegChnStatus(chid),kCoreStateMask,kCoreIdle,kTimeoutMs,"core STATE == IDLE (0xb)");
     else p.Add(Op::Poll,RegChnStatus(chid),kWinStateMask,kWinIdle,kTimeoutMs,"window STATE == IDLE (4)");
-    p.Add(Op::Expect,RegGet(chid),~0u,0,0,"GET == 0");
+    p.Add(Op::Expect,RegGet(chid),0xffc,0,0,"GET == 0 (masked: reads 0x80000000 unconnected)");
 }
 // gv100_disp_dmac_fini / core_fini (N1 361-370, 750-757), plus RM's
 // UNCONNECTED wait (kern_disp_channel_0300.c 408-418) for windows.
@@ -402,6 +420,28 @@ inline void AddChannelFini(Plan& p,uint32_t chid,uint32_t ms,bool check=true){
     p.Add(Op::Mask,RegChnCtl(chid),kCtlConnect,0,0,"CHNCTL &= ~CONNECT");
     if(chid!=kChidCore)p.Add(Op::PollSoft,RegChnStatus(chid),kWinStateMask,kWinUnconnected,ms,"window UNCONNECTED (1)");
     if(check)p.Add(Op::Expect,RegChnCtl(chid),0x6013,0x0001,0,"CHNCTL == ALLOCATE only");
+}
+// Pushbuffer registers back to what the GOP left (hi 0, lo 1, valid 1, client 0).
+inline void AddPbRestore(Plan& p,uint32_t chid,const GopState& g){
+    p.Add(Op::Write,RegPbLo(chid),~0u,g.pbLo,0,"pushbuffer lo = GOP value");
+    p.Add(Op::Write,RegPbHi(chid),~0u,g.pbHi,0,"pushbuffer hi = GOP value");
+    p.Add(Op::Write,RegPbValid(chid),~0u,g.pbValid,0,"pushbuffer valid = GOP value");
+    p.Add(Op::Write,RegPbClient(chid),~0u,g.pbClient,0,"pushbuffer client = GOP value");
+}
+// tu102_disp_init caps copies (N2 198-240) into the FE_SW caps page.
+inline void AddCapsCopy(Plan& p){
+    p.Add(Op::Write,0x640008,~0u,0x21,0,"caps: lock pins (tu102.c 199-200)");
+    for(uint32_t i=0;i<4;++i){
+        p.Add(Op::Mask,0x640000,0x100u<<i,0x100u<<i,0,"caps: SOR present");
+        p.Add(Op::Copy,0x61c000+i*0x800,0,0x640144+i*8,0,"caps: SOR cap");}
+    for(uint32_t h=0;h<4;++h){
+        p.Add(Op::Copy,0x616300+h*0x800,0,0x640048+h*0x20,0,"caps: head RG");
+        for(uint32_t j=0;j<20;j+=4)p.Add(Op::Copy,0x616140+h*0x800+j,0,0x640680+h*0x20+j,0,"caps: head POSTCOMP");}
+    for(uint32_t w=0;w<8;++w){
+        p.Add(Op::Mask,0x640004,1u<<w,1u<<w,0,"caps: window present");
+        for(uint32_t j=0;j<24;j+=4)p.Add(Op::Copy,0x630100+w*0x800+j,0,0x640780+w*0x20+j,0,"caps: window cap");
+        p.Add(Op::Mask,0x64000c,0x100,0x100,0,"caps: window caps valid");}
+    for(uint32_t i=0;i<3;++i)p.Add(Op::Copy,0x62e000+i*4,0,0x640010+i*4,0,"caps: IHUB");
 }
 inline void AddExceptionCheck(Plan& p,uint32_t window){
     p.Add(Op::Expect,kRegIntrDispatch,0x1e00,0,0,"no EXC_WIN/WINIM/OTHER/CTRL_DISP pending");
@@ -415,6 +455,7 @@ inline void AddKickAndWait(Plan& p,const Config& c,uint32_t putBytes,uint32_t ha
     p.Add(Op::Kick,RegPut(ch),~0u,putBytes,0,"sfence; PUT = byte offset of push end");
     p.Add(Op::Poll,RegGet(ch),~0u,putBytes,kTimeoutMs,"GET == PUT (methods fetched)");
     AddExceptionCheck(p,c.window);
+    p.Add(Op::ExpectNot,RegChnStatus(ch),0xf00,0xb00,0,"UPD_STATE != EXCEPTION (0xb)");
     p.Add(Op::VramPollAny,0,3u<<kNtfyStatusShift,0,kTimeoutMs,"notifier BEGUN/FINISHED (flip latched)",c.syncVram+ntfy);
     p.Add(Op::Poll,RegArm(ch,c57e::SET_CONTEXT_DMA_ISO0),~0u,handle,kTimeoutMs,"ARM ISO handle");
     p.Add(Op::Poll,RegArm(ch,c57e::SET_OFFSET0),~0u,uint32_t(offset>>8),kTimeoutMs,"ARM SET_OFFSET");
@@ -450,6 +491,11 @@ inline Err BuildPlan(const Config& c,InstImage& img,Pushes& pushes,Plan& p){
     p.Add(Op::Expect,RegAssy(ch,c57e::SET_CONTEXT_DMA_ISO0),~0u,g.winIso,0,"window ISO handle");
     p.Add(Op::Expect,RegArm(ch,c57e::SET_CONTEXT_DMA_ISO0),~0u,g.winIso,0,"window ARM ISO handle");
     p.Add(Op::Expect,RegArm(ch,c57e::SET_OFFSET0),~0u,g.winOffset,0,"window ARM offset");
+    p.MarkRewritten(pushes.wndw.words,pushes.end[0]/4);
+    p.Add(Op::AssyArmDiff,ch,0x200,0x800,0,"window ASSY 0x200-0x7fc == ARM, or rewritten by submission 1");
+    p.Add(Op::Log,RegArm(kChidCore,0x2288+h*0x400),0,0,0,"head OLUT ctxdma (non-zero: firmware LUT in VRAM)");
+    p.Add(Op::Log,RegArm(kChidCore,0x228c+h*0x400),0,0,0,"head OLUT offset");
+    p.Add(Op::Expect,kRegFeEnable,~0u,g.feEnable,0,"0x610078 as left by GOP");
     AddExceptionCheck(p,w);
     p.Begin(Phase::Vram);
     p.Add(Op::VramCopy,uint32_t(Blob::Inst),kInstBytes,0,0,"instmem image (RAMHT + ctxdmas)",c.instVram);
@@ -461,17 +507,24 @@ inline Err BuildPlan(const Config& c,InstImage& img,Pushes& pushes,Plan& p){
     p.Add(Op::Poll,kRegBar1Flush,0x2,0,kTimeoutMs,"flush done");
     if(c.praminCheck){
         p.Add(Op::Write,kRegPraminBase,~0u,uint32_t(c.instVram>>16),0,"PRAMIN window -> instmem (BAR1 identity check)");
-        const RamhtUse& u=img.use[0];
-        p.Add(Op::PraminExpect,RamhtHash(u.handle,u.chid)*8,uint32_t(Blob::Inst),u.handle,0,"RAMHT entry seen at its VRAM address");
-        p.Add(Op::PraminExpect,ObjOffset(1)+4,uint32_t(Blob::Inst),uint32_t(img.obj[1].base>>8),0,"ISO ctxdma base word");
-        p.Add(Op::PraminExpect,ObjOffset(1)+12,uint32_t(Blob::Inst),uint32_t(img.obj[1].limit>>8),0,"ISO ctxdma limit word");
+        for(uint32_t s=0;s<kHashEntries;++s)if(img.words[s*2+1]){
+            p.Add(Op::PraminExpect,s*8,uint32_t(Blob::Inst),img.words[s*2],0,"RAMHT handle word at its VRAM address");
+            p.Add(Op::PraminExpect,s*8+4,uint32_t(Blob::Inst),img.words[s*2+1],0,"RAMHT context word");}
+        for(uint32_t o=0;o<img.objCount;++o)for(uint32_t k=0;k<6;++k)
+            p.Add(Op::PraminExpect,ObjOffset(o)+k*4,uint32_t(Blob::Inst),img.words[ObjOffset(o)/4+k],0,"ctxdma word");
+        const uint32_t pbOff=uint32_t(c.wndwPushVram-c.instVram);
+        for(uint32_t k=0;k<pushes.wndw.count;++k)
+            p.Add(Op::PraminExpect,pbOff+k*4,uint32_t(Blob::WndwPush),pushes.wndw.words[k],0,"pushbuffer word");
         p.Add(Op::Write,kRegPraminBase,~0u,c.praminRestore,0,"PRAMIN window restored");
     }
     p.Begin(Phase::Instmem);
-    p.Add(Op::Write,kRegInstTarget,~0u,0x8|0x1,0,"instmem valid, VRAM (N2 250)");
+    // Address first, so instmem never points at VRAM 0 (the GOP surface) while valid.
     p.Add(Op::Write,kRegInstAddr,~0u,uint32_t(c.instVram>>16),0,"instmem addr >> 16 (N2 251)");
+    p.Add(Op::Write,kRegInstTarget,~0u,0x8|0x1,0,"instmem valid, VRAM (N2 250)");
     p.Add(Op::Expect,kRegInstTarget,~0u,0x9,0,"readback");
     p.Add(Op::Expect,kRegInstAddr,~0u,uint32_t(c.instVram>>16),0,"readback");
+    if(c.capsCopy)AddCapsCopy(p);
+    if(c.feEnable)p.Add(Op::Mask,kRegFeEnable,1,1,0,"0x610078 |= 1 (N2 240)");
     p.Begin(Phase::Core);
     if(c.coreChannel){ // stage B: connect only; no core methods, no core UPDATE
         AddChannelInit(p,kChidCore,c.corePushVram);
@@ -493,8 +546,11 @@ inline Err BuildPlan(const Config& c,InstImage& img,Pushes& pushes,Plan& p){
     AddKickAndWait(p,c,pushes.end[2],pushes.handle[2],pushes.offset[2],pushes.ntfy[2]);
     p.Begin(Phase::Teardown);
     AddChannelFini(p,ch,kTimeoutMs);
-    if(c.coreChannel)AddChannelFini(p,kChidCore,kTimeoutMs);
-    p.Add(Op::Write,kRegInstTarget,~0u,g.instTarget,0,"instmem invalid (GOP value)");
+    AddPbRestore(p,ch,g);
+    if(c.coreChannel){AddChannelFini(p,kChidCore,kTimeoutMs);AddPbRestore(p,kChidCore,g);}
+    if(c.pauseForObserver)p.Add(Op::Pause,0,0,0,0,"observer: screen unchanged with the window disconnected?");
+    if(c.feEnable)p.Add(Op::Write,kRegFeEnable,~0u,g.feEnable,0,"0x610078 = GOP value");
+    p.Add(Op::Write,kRegInstTarget,~0u,g.instTarget,0,"instmem invalid (GOP value) before the address");
     p.Add(Op::Write,kRegInstAddr,~0u,g.instAddr,0,"instmem addr (GOP value)");
     p.Add(Op::Expect,RegArm(ch,c57e::SET_CONTEXT_DMA_ISO0),~0u,RestoreHandle(c),0,"scanout handle is the GOP's");
     p.Add(Op::Expect,RegArm(ch,c57e::SET_OFFSET0),~0u,uint32_t(c.surf[0].vram>>8),0,"scanout is the GOP surface");
@@ -513,19 +569,28 @@ inline void BuildAbort(const Config& c,Phase reached,Plan& p,uint32_t ms=100){
     const uint32_t ch=ChidWndw(c.window);
     p.Begin(Phase::Quiesce);
     if(reached>=Phase::Window){
-        p.Add(Op::AckException,ch,1u<<c.window,0,0,"log + ack window exception (N1 1040-1043, 932)");
+        // Trash first so nothing behind the faulting method runs once the
+        // exception is acked (review 23 Nov; RM kdispSetChannelTrashAndAbortAccel).
         p.Add(Op::Mask,RegChnCtl(ch),kCtlTrashAbort,kCtlTrashAbort,0,"TRASH_AND_ABORT pending methods");
+        p.Add(Op::AckException,ch,1u<<c.window,0,0,"log + W1C 0x61184c + ack 0x90000000 (N1 1040-1043, 932)");
         p.Add(Op::PollSoft,RegChnStatus(ch),kWinMethodExecBusy,0,ms,"METHOD_EXEC idle");
         AddChannelFini(p,ch,ms,false);
         p.Add(Op::Mask,RegChnCtl(ch),kCtlTrashAbort,0,0,"TRASH_MODE off");
         p.Add(Op::Expect,RegChnCtl(ch),0x6013,0x0001,0,"CHNCTL == ALLOCATE only");
+        AddPbRestore(p,ch,c.gop);
     }
-    if(reached>=Phase::Core&&c.coreChannel)AddChannelFini(p,kChidCore,ms);
+    if(reached>=Phase::Core&&c.coreChannel){AddChannelFini(p,kChidCore,ms);AddPbRestore(p,kChidCore,c.gop);}
     if(reached>=Phase::Instmem){
+        if(c.feEnable)p.Add(Op::Write,kRegFeEnable,~0u,c.gop.feEnable,0,"0x610078 = GOP value");
         p.Add(Op::Write,kRegInstTarget,~0u,c.gop.instTarget,0,"instmem invalid");
         p.Add(Op::Write,kRegInstAddr,~0u,c.gop.instAddr,0,"instmem addr 0");
     }
     if(reached>=Phase::Vram&&c.praminCheck)p.Add(Op::Write,kRegPraminBase,~0u,c.praminRestore,0,"PRAMIN window restored");
+    p.Add(Op::Log,RegArm(ch,c57e::SET_CONTEXT_DMA_ISO0),0,0,0,"final ARM ISO handle (on screen)");
+    p.Add(Op::Log,RegArm(ch,c57e::SET_OFFSET0),0,0,0,"final ARM SET_OFFSET");
+    p.Add(Op::Log,RegChnStatus(ch),0,0,0,"final window CHNSTATUS (STATE 19:16, UPD_STATE 11:8)");
+    p.Add(Op::Log,RegChnStatus(kChidCore),0,0,0,"final core CHNSTATUS");
+    p.Add(Op::Log,kRegIntrDispatch,0,0,0,"final 0x611ec0");
     p.End();
 }
 
@@ -535,6 +600,7 @@ inline void BuildAbort(const Config& c,Phase reached,Plan& p,uint32_t ms=100){
 //   void vcopy(uint64_t vram,Blob b,uint32_t bytes); void except(uint32_t chid,stat,data,code);
 //   uint32_t blob(Blob b,uint32_t byteOffset); void fence(); bool expired(uint32_t ms,uint32_t& state);
 //   void log(uint32_t index,const Step&,uint32_t got,bool ok);
+//   void diff(uint32_t mthd,uint32_t assy,uint32_t arm); void pause(const char* what);
 // Returns `end` on success, else the index of the (first) failing step.
 // bestEffort (abort/quiesce lists) logs a failure and carries on.
 template<typename Io> uint32_t Run(const Plan& p,uint32_t begin,uint32_t end,Io& io,bool bestEffort=false){
@@ -565,6 +631,17 @@ template<typename Io> uint32_t Run(const Plan& p,uint32_t begin,uint32_t end,Io&
         case Op::PraminExpect:got=io.rd(kPramin+s.reg);ok=got==s.value;break;
         case Op::Fence:io.fence();break;
         case Op::Kick:io.fence();io.wr(s.reg,s.value);break;
+        case Op::ExpectNot:got=io.rd(s.reg);ok=(got&s.mask)!=s.value;break;
+        case Op::Log:got=io.rd(s.reg);break;
+        case Op::Copy:got=io.rd(s.reg);io.wr(s.value,got);break;
+        case Op::AssyArmDiff:
+            for(uint32_t m=s.mask;m<s.value;m+=4){
+                if(m==c57e::UPDATE||m==0x208)continue; // UPDATE trigger, GET_LINE (live)
+                const uint32_t a=io.rd(RegAssy(s.reg,m)),b=io.rd(RegArm(s.reg,m));
+                if(a!=b){io.diff(m,a,b);if(!p.Rewritten(m)){ok=false;if(!got)got=m;}}
+            }
+            break;
+        case Op::Pause:io.pause(s.what);break;
         }
         io.log(i,s,got,ok);
         if(!ok){if(!bestEffort)return i;if(firstFail==end)firstFail=i;}
