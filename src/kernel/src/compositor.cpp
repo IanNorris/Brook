@@ -46,6 +46,8 @@
 #include "net.h"
 #include "display.h"
 #include "display_power.h"
+#include "display_output.h"
+#include "shell_output_layout.h"
 #if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
 #include "intel_bdw_scanout_target.h"
 #endif
@@ -1134,6 +1136,9 @@ static void PublishPhysDims(uint32_t width, uint32_t height)
     __atomic_store_n(&g_publishedPhysDims, packed, __ATOMIC_RELEASE);
 }
 
+static void CompositorRegisterOutputs();
+static void CompositorSyncPointerOutputs();
+
 void CompositorInit()
 {
     // Get the physical framebuffer address so we can map the real MMIO,
@@ -1189,8 +1194,10 @@ void CompositorInit()
         SerialPuts("COMPOSITOR: WARNING — backbuffer alloc failed, direct MMIO path\n");
     }
 
+    // The framebuffer is the first (primary) output.
+    CompositorRegisterOutputs();
     // Set mouse cursor bounds to match screen resolution.
-    MouseSetBounds(w, h);
+    CompositorSyncPointerOutputs();
 
     SerialPrintf("COMPOSITOR: initialised, %ux%u stride=%u\n",
                  g_physFbWidth, g_physFbHeight, g_physFbStride);
@@ -2103,12 +2110,72 @@ static void OverlayZeroRect(uint32_t* pixels,uint32_t stride,uint32_t width,uint
         __builtin_memset(pixels+uint64_t(row)*stride+left,0,size_t(right-left)*4);
 }
 
+// The shell lays out one output at a time in that output's coordinates
+// (shell_output_layout.h). A view is the output's desktop origin and size;
+// with one output it is the whole screen at 0,0.
+struct ShellView { uint32_t output; int32_t x, y; uint32_t w, h; };
+static ShellView ShellViewOf(const OutputLayout& layout, uint32_t output)
+{
+    const uint32_t index = layout.enabled(output) ? output : 0;
+    const OutputRect r = layout.rect(index);
+    return {index, r.x, r.y, r.w, r.h};
+}
+static uint32_t ShellHiddenMask(const OutputLayout& layout)
+{
+    uint32_t mask = 0;
+    for (uint32_t i = 0; i < layout.count; ++i)
+        if (WmTaskbarHiddenOn(i)) mask |= 1u << i;
+    return mask;
+}
+// The shell output: the launcher and the taskbar popups are shown there.
+static ShellView ShellOwnerView()
+{
+    OutputLayout layout;
+    CompositorGetOutputs(layout);
+    return ShellViewOf(layout, WmShellOutput());
+}
+// The side dock is on the primary output.
+static ShellView ShellPrimaryView()
+{
+    OutputLayout layout;
+    CompositorGetOutputs(layout);
+    return ShellViewOf(layout, 0);
+}
+// The output whose taskbar holds the pointer, else the shell output. A
+// press (select) on another output's taskbar moves the shell there.
+static ShellView ShellPointerView(int32_t mx, int32_t my, bool select)
+{
+    OutputLayout layout;
+    CompositorGetOutputs(layout);
+    if (layout.count > 1) {
+        const auto hit = ShellTaskbarAt(layout, WmMetric(WM_TASKBAR_HEIGHT), ShellHiddenMask(layout), mx, my);
+        if (hit.output >= 0) {
+            if (select) WmShellSelectOutput(uint32_t(hit.output));
+            return ShellViewOf(layout, uint32_t(hit.output));
+        }
+    }
+    return ShellViewOf(layout, WmShellOutput());
+}
+// `my >= WmTaskbarTop(screenH)` per output: the pointer is on a taskbar.
+static bool ShellTaskbarBand(int32_t mx, int32_t my)
+{
+    OutputLayout layout;
+    CompositorGetOutputs(layout);
+    if (layout.count <= 1) return my >= static_cast<int32_t>(WmTaskbarTop(g_physFbHeight));
+    return ShellTaskbarAt(layout, WmMetric(WM_TASKBAR_HEIGHT), ShellHiddenMask(layout), mx, my).output >= 0;
+}
+
 // One compositor-thread snapshot feeds the local layer and renderer capture.
+// surfaces[] are in their view's (output's) coordinates; slots and records
+// carry desktop coordinates.
 struct ShellFrame {
     uint32_t width, height, count = 0, fallbackColor = 0;
     WmShellSurface surfaces[WM_SHELL_SURFACE_LIMIT];
     BrookDesktopSurface records[WM_SHELL_SURFACE_LIMIT];
     DesktopOverlaySurfaceSlot slots[DESKTOP_OVERLAY_SURFACE_LIMIT];
+    ShellView views[WM_SHELL_SURFACE_LIMIT];
+    // 0: the shell service's list; n: kernel-built taskbar slot n-1.
+    uint8_t detached[WM_SHELL_SURFACE_LIMIT];
     uint32_t fallbackMask = 0;
 };
 
@@ -2125,29 +2192,34 @@ static ShellFrame CaptureShellFrame(uint32_t width, uint32_t height, uint64_t no
         ShellServiceEndCapture(0);
         return frame;
     }
+    OutputLayout outputs;
+    CompositorGetOutputs(outputs);
+    const bool multi = outputs.count > 1;
+    // The shell output carries every surface; other outputs only their own
+    // taskbar (and the primary its dock).
+    const ShellView owner = multi ? ShellViewOf(outputs, WmShellOutput()) : ShellView{0, 0, 0, width, height};
+    const int32_t ownerMx = int32_t(int64_t(mx) - owner.x), ownerMy = int32_t(int64_t(my) - owner.y);
     WmShellSurface surfaces[WM_SHELL_SURFACE_LIMIT];
     WmShellTrayGeometry tray{};
-    WmGetShellTrayGeometry(width, height, mx, my, tray);
-    const uint32_t count = WmShellSurfaces(width, height, mx, my, surfaces, tray.popup, tray.menu, tray.notice, tray.windowMenu);
+    WmGetShellTrayGeometry(owner.w, owner.h, ownerMx, ownerMy, tray);
+    const uint32_t count = WmShellSurfaces(owner.w, owner.h, ownerMx, ownerMy, surfaces, tray.popup, tray.menu, tray.notice, tray.windowMenu);
     uint32_t kindMask = 0;
     bool diskVisible = false;
     auto statsPanel = DesktopStatsPanel::None;
-    for (uint32_t i = 0; i < count; ++i) {
-        auto surface = surfaces[i];
-        kindMask |= 1u << uint32_t(surface.kind);
-        diskVisible |= surface.kind == WmShellSurfaceKind::DiskFlyout;
-        if (surface.kind == WmShellSurfaceKind::CpuMemoryFlyout)
-            statsPanel = DesktopStatsPanel::CpuMemory;
-        uint64_t key = ShellServiceCapture(surface, width, height, now, mx, my);
+    auto append = [&](WmShellSurface surface, const ShellView& view, uint64_t key, uint8_t detached) {
+        if (frame.count >= WM_SHELL_SURFACE_LIMIT) return;
         const bool fallback = !key;
         if (fallback) {
-            if (surface.kind != WmShellSurfaceKind::Taskbar) continue;
+            if (surface.kind != WmShellSurfaceKind::Taskbar) return;
             frame.fallbackMask |= 1u << frame.count;
             frame.fallbackColor = WmCurrentPalette().taskbar | 0xff000000u;
             key = frame.fallbackColor;
             surface.material = false;
         }
-        auto record = WmShellSurfaceRecord(surface, key);
+        WmShellSurface placed = surface;
+        placed.x = int32_t(int64_t(surface.x) + view.x);
+        placed.y = int32_t(int64_t(surface.y) + view.y);
+        auto record = WmShellSurfaceRecord(placed, key);
         // The renderer's generation also covers composition metadata. The
         // cached layer applies alpha and corner coverage after list playback.
         constexpr uint64_t prime = 0x100000001b3ull;
@@ -2162,11 +2234,40 @@ static ShellFrame CaptureShellFrame(uint32_t width, uint32_t height, uint64_t no
         const uint32_t j = frame.count++;
         frame.surfaces[j] = surface;
         frame.records[j] = record;
-        frame.slots[j] = {uint32_t(surface.kind), {surface.x, surface.y, surface.w, surface.h}, record.key};
+        frame.slots[j] = {uint32_t(surface.kind), {placed.x, placed.y, surface.w, surface.h}, record.key};
+        frame.views[j] = view;
+        frame.detached[j] = detached;
+    };
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto& surface = surfaces[i];
+        if (multi && owner.output != 0 && surface.kind == WmShellSurfaceKind::Dock) continue;
+        kindMask |= 1u << uint32_t(surface.kind);
+        diskVisible |= surface.kind == WmShellSurfaceKind::DiskFlyout;
+        if (surface.kind == WmShellSurfaceKind::CpuMemoryFlyout)
+            statsPanel = DesktopStatsPanel::CpuMemory;
+        append(surface, owner, ShellServiceCapture(surface, owner.w, owner.h, now, ownerMx, ownerMy), 0);
+    }
+    for (uint32_t i = 0, slot = 0; multi && i < outputs.count; ++i) {
+        if (i == owner.output || !outputs.enabled(i)) continue;
+        const ShellView view = ShellViewOf(outputs, i);
+        const int32_t localMx = int32_t(int64_t(mx) - view.x), localMy = int32_t(int64_t(my) - view.y);
+        const bool hidden = WmTaskbarHiddenOn(i);
+        if (i == 0 && !hidden) {
+            WmShellSurface dock{WmShellSurfaceKind::Dock, 0, 0, 0, 0, false};
+            if (WmDockSurfaceRect(view.w, view.h, &dock.x, &dock.y, &dock.w, &dock.h, &dock.material)) {
+                kindMask |= 1u << uint32_t(WmShellSurfaceKind::Dock);
+                append(dock, view, ShellServiceCapture(dock, view.w, view.h, now, localMx, localMy), 0);
+            }
+        }
+        if (hidden || slot >= ShellServiceDetachedLimit) { ++slot; continue; }
+        const uint32_t top = WmDesktopHeight(view.h);
+        const WmShellSurface bar{WmShellSurfaceKind::Taskbar, 0, int32_t(top), view.w, view.h - top, true};
+        append(bar, view, ShellServiceCaptureDetached(slot, bar, view.w, view.h, now, localMx, localMy), uint8_t(slot + 1));
+        ++slot;
     }
     if ((kindMask & (1u << uint32_t(WmShellSurfaceKind::Taskbar))) &&
         !(kindMask & (1u << uint32_t(WmShellSurfaceKind::Launcher))) &&
-        ShellServiceWarmLauncher(width, height, now))
+        ShellServiceWarmLauncher(owner.w, owner.h, now))
         kindMask |= 1u << uint32_t(WmShellSurfaceKind::Launcher);
     DesktopDiskSetVisible(diskVisible);
     DesktopStatsSetVisible(statsPanel);
@@ -2174,16 +2275,22 @@ static ShellFrame CaptureShellFrame(uint32_t width, uint32_t height, uint64_t no
     return frame;
 }
 
+// Draws in the surface's view: pixels and stride address the desktop.
 static void DrawShellFrameSurface(const ShellFrame& frame, uint32_t i, uint32_t* pixels, uint32_t stride)
 {
     const auto& surface = frame.surfaces[i];
+    const auto& view = frame.views[i];
+    if (view.x < 0 || view.y < 0 || uint64_t(view.x) + view.w > frame.width || uint64_t(view.y) + view.h > frame.height)
+        return;
+    uint32_t* base = pixels + uint64_t(view.y) * stride + uint32_t(view.x);
     if (!(frame.fallbackMask >> i & 1u)) {
-        ShellServiceDraw(surface, pixels, stride, frame.width, frame.height);
+        if (frame.detached[i]) ShellServiceDrawDetached(frame.detached[i] - 1u, surface, base, stride, view.w, view.h);
+        else ShellServiceDraw(surface, base, stride, view.w, view.h);
         return;
     }
-    for (uint32_t y = surface.y; y < frame.height; ++y) {
-        uint32_t* row = pixels + uint64_t(y) * stride;
-        for (uint32_t x = 0; x < frame.width; ++x) row[x] = frame.fallbackColor;
+    for (uint32_t y = surface.y; y < view.h; ++y) {
+        uint32_t* row = base + uint64_t(y) * stride;
+        for (uint32_t x = 0; x < view.w; ++x) row[x] = frame.fallbackColor;
     }
 }
 
@@ -2215,7 +2322,8 @@ static DesktopOverlaySurfacePlan RasterShellLayer(uint32_t* pixels, uint32_t str
             if (!local) ++g_idleStats.overlaySurfaceKeeps;
             continue;
         }
-        const auto& s = frame.surfaces[i];
+        const auto& placed = frame.slots[i].rect;
+        const struct { int32_t x, y; uint32_t w, h; } s{placed.x, placed.y, placed.width, placed.height};
         DrawShellFrameSurface(frame, i, pixels, stride);
         const auto& record = frame.records[i];
         const ChromeAlphaRect rect{s.x, s.y, s.w, s.h};
@@ -2584,7 +2692,7 @@ static void CompositorLoopWM(bool& clientFrame)
     {
         // In headless boots the mouse bounds may be unset (no pointer device),
         // which would clamp the warp to (-1,-1); set them to the display size.
-        MouseSetBounds(g_physFbWidth, g_physFbHeight);
+        CompositorSyncPointerOutputs();
         MouseSetPosition(g_gpuMouseDemoX, g_gpuMouseDemoY);
         g_gpuMouseDemo = false;
     }
@@ -2908,19 +3016,26 @@ static void CompositorInputWM()
         bool overlay=false;
         if(pointer) {
             int32_t mx=0,my=0;MouseGetPosition(&mx,&my);
-            const bool launcher=WmLauncherVisible();
-            const bool taskbarPanel = WmTaskbarPopupPointerOwned(mx, my, g_physFbWidth, g_physFbHeight);
-            overlay=launcher || taskbarPanel || my>=static_cast<int32_t>(WmTaskbarTop(g_physFbHeight)) ||
-                    WmDockPointerOwned(mx,my,g_physFbWidth,g_physFbHeight);
-            // Shell surfaces own the pointer: no window may acquire a lock
-            // while it is over the taskbar, launcher or volume popup.
-            if(overlay)WmPointerSetHover(-1);
             const auto kind=ev.type==InputEventType::MouseButtonDown?DesktopPointerEvent::Down:
                             ev.type==InputEventType::MouseButtonUp?DesktopPointerEvent::Up:
                             ev.type==InputEventType::MouseScroll?DesktopPointerEvent::Scroll:DesktopPointerEvent::Move;
+            // The shell is laid out per output: sx,sy are the pointer in the
+            // shell view (the taskbar under it, else the shell output). A
+            // press on another output's taskbar moves the shell there.
+            const ShellView sv=ShellPointerView(mx,my,kind==DesktopPointerEvent::Down);
+            const ShellView dv=ShellPrimaryView();
+            const int32_t sx=int32_t(int64_t(mx)-sv.x),sy=int32_t(int64_t(my)-sv.y);
+            const int32_t dx=int32_t(int64_t(mx)-dv.x),dy=int32_t(int64_t(my)-dv.y);
+            const bool launcher=WmLauncherVisible();
+            const bool taskbarPanel = WmTaskbarPopupPointerOwned(sx, sy, sv.w, sv.h);
+            overlay=launcher || taskbarPanel || ShellTaskbarBand(mx,my) ||
+                    WmDockPointerOwned(dx,dy,dv.w,dv.h);
+            // Shell surfaces own the pointer: no window may acquire a lock
+            // while it is over the taskbar, launcher or volume popup.
+            if(overlay)WmPointerSetHover(-1);
             const bool statsContext = taskbarPanel && kind == DesktopPointerEvent::Down && ev.scanCode == 1 &&
-                    WmTaskbarStatsContains(mx, my, g_physFbWidth, g_physFbHeight);
-            const bool trayEvent = (!taskbarPanel || statsContext) && WmShellTrayPointer(g_physFbWidth, g_physFbHeight, mx, my,
+                    WmTaskbarStatsContains(sx, sy, sv.w, sv.h);
+            const bool trayEvent = (!taskbarPanel || statsContext) && WmShellTrayPointer(sv.w, sv.h, sx, sy,
                     kind == DesktopPointerEvent::Down, ev.scanCode,
                     kind == DesktopPointerEvent::Scroll ? LauncherScroll120(ev) : 0);
             overlay |= trayEvent;
@@ -2930,18 +3045,18 @@ static void CompositorInputWM()
                 if(ev.scanCode==0 && kind==DesktopPointerEvent::Down)g_wmBtnLatch=true;
                 if(ev.scanCode==0 && kind==DesktopPointerEvent::Up)g_wmBtnReleaseLatch=true;
                 if(kind==DesktopPointerEvent::Scroll && launcher)
-                    WmLauncherScroll(LauncherScroll120(ev),g_physFbWidth,g_physFbHeight);
+                    WmLauncherScroll(LauncherScroll120(ev),sv.w,sv.h);
                 else if(kind==DesktopPointerEvent::Scroll &&
-                        !WmDiskFlyoutScroll(mx,my,LauncherScroll120(ev),g_physFbWidth,g_physFbHeight) &&
-                        !WmStatsFlyoutScroll(mx,my,LauncherScroll120(ev),g_physFbWidth,g_physFbHeight) &&
+                        !WmDiskFlyoutScroll(sx,sy,LauncherScroll120(ev),sv.w,sv.h) &&
+                        !WmStatsFlyoutScroll(sx,sy,LauncherScroll120(ev),sv.w,sv.h) &&
                         (ev.scanCode || ev.ascii))
-                    WmVolumeScroll(mx,my,static_cast<int8_t>(ev.scanCode),g_physFbWidth,g_physFbHeight);
+                    WmVolumeScroll(sx,sy,static_cast<int8_t>(ev.scanCode),sv.w,sv.h);
                 // Right click on the volume icon (or its popup) toggles mute.
                 if(kind==DesktopPointerEvent::Down && ev.scanCode==1 && !launcher)
-                    WmVolumeToggleMuteAt(mx,my,g_physFbWidth,g_physFbHeight);
+                    WmVolumeToggleMuteAt(sx,sy,sv.w,sv.h);
                 // Right click in the launcher: an app's Pin / Uninstall menu.
                 if(kind==DesktopPointerEvent::Down && ev.scanCode==1 && launcher)
-                    WmLauncherPress(mx,my,g_physFbWidth,g_physFbHeight,true);
+                    WmLauncherPress(sx,sy,sv.w,sv.h,true);
                 if(__atomic_load_n(&g_defaultCursorVisible,__ATOMIC_ACQUIRE)==0) {
                     __atomic_store_n(&g_defaultCursorVisible,1u,__ATOMIC_RELEASE);
                     CompositorSetCursorImage(nullptr,0,0,0,0);
@@ -3067,7 +3182,8 @@ static void CompositorInputWM()
             // If launcher is open, scroll it instead of windows
             if (WmLauncherVisible())
             {
-                WmLauncherScroll(LauncherScroll120(ev), g_physFbWidth, g_physFbHeight);
+                const ShellView owner = ShellOwnerView();
+                WmLauncherScroll(LauncherScroll120(ev), owner.w, owner.h);
                 continue;
             }
 
@@ -3262,10 +3378,13 @@ static CursorShape CompositorCursorShape()
     if (g_wmDragging || !MouseIsAvailable()) return CursorShape::Arrow;
     int32_t mx = 0, my = 0;
     MouseGetPosition(&mx, &my);
-    if (WmDockGripAt(mx, my, g_physFbWidth, g_physFbHeight)) return CursorShape::ResizeH;
-    if (WmLauncherVisible() || WmTaskbarPopupPointerOwned(mx, my, g_physFbWidth, g_physFbHeight) || WmWindowMenuOpen() ||
-        my >= static_cast<int32_t>(WmTaskbarTop(g_physFbHeight)) ||
-        WmDockPointerOwned(mx, my, g_physFbWidth, g_physFbHeight))
+    const ShellView sv = ShellPointerView(mx, my, false), dv = ShellPrimaryView();
+    const int32_t sx = int32_t(int64_t(mx) - sv.x), sy = int32_t(int64_t(my) - sv.y);
+    const int32_t dockX = int32_t(int64_t(mx) - dv.x), dockY = int32_t(int64_t(my) - dv.y);
+    if (WmDockGripAt(dockX, dockY, dv.w, dv.h)) return CursorShape::ResizeH;
+    if (WmLauncherVisible() || WmTaskbarPopupPointerOwned(sx, sy, sv.w, sv.h) || WmWindowMenuOpen() ||
+        ShellTaskbarBand(mx, my) ||
+        WmDockPointerOwned(dockX, dockY, dv.w, dv.h))
         return CursorShape::Arrow;
     return CursorShapeForEdges(WmHitZoneResizeEdges(WmHitTest(mx, my).zone));
 }
@@ -3352,37 +3471,44 @@ static void CompositorHandleMouseWM()
         g_wmBtnReleaseLatch = false;
     }
 
-    if (WmLauncherGesture(mx, my, g_physFbWidth, g_physFbHeight, releaseLatched || !btnDown)) {
+    // Shell calls use the shell view (shell_output_layout.h): the launcher
+    // and popups are on the shell output, and a press on another output's
+    // taskbar moves the shell there first. The dock is on the primary.
+    const bool shellPress = btnDown && !g_wmLastBtnDown;
+    const ShellView sv = ShellPointerView(mx, my, shellPress), dv = ShellPrimaryView();
+    const int32_t sx = int32_t(int64_t(mx) - sv.x), sy = int32_t(int64_t(my) - sv.y);
+    const int32_t dockX = int32_t(int64_t(mx) - dv.x), dockY = int32_t(int64_t(my) - dv.y);
+    if (WmLauncherGesture(sx, sy, sv.w, sv.h, releaseLatched || !btnDown)) {
         if (releaseLatched || !btnDown) g_wmPrimaryDown = g_wmLastBtnDown = false;
         return;
     }
     if (btnDown && !g_wmLastBtnDown)
     {
         const auto captionHit=WmHitTest(mx,my);
-        if(WmLauncherVisible()||my>=static_cast<int32_t>(WmTaskbarTop(g_physFbHeight))||
+        if(WmLauncherVisible()||ShellTaskbarBand(mx,my)||
            captionHit.zone!=WmHitZone::TitleBar)g_titleClicks.Reset();
         DbgPrintf("WM: click at (%d,%d)\n", mx, my);
         // Transient flyouts consume their dismissing clicks. Pinned panels
         // handle only their own controls and let desktop clicks through.
-        if (WmVolumeLeftPress(mx, my, g_physFbWidth, g_physFbHeight) ||
-            WmTrayFlyoutPress(mx, my, g_physFbWidth, g_physFbHeight) ||
-            WmPerformanceHudPress(mx, my, g_physFbWidth, g_physFbHeight))
+        if (WmVolumeLeftPress(sx, sy, sv.w, sv.h) ||
+            WmTrayFlyoutPress(sx, sy, sv.w, sv.h) ||
+            WmPerformanceHudPress(sx, sy, sv.w, sv.h))
         {
             if (releaseLatched && !polledDown) {
                 g_wmPrimaryDown = false;
                 g_wmLastBtnDown = false;
-                WmVolumeDrag(mx, false, g_physFbWidth, g_physFbHeight);
+                WmVolumeDrag(sx, false, sv.w, sv.h);
             } else g_wmLastBtnDown = btnDown;
             return;
         }
         // The dock's strip and edge tab. A press outside an open, unpinned
         // sidebar hides the dock and carries on to what lies beneath.
-        if (WmDockPress(mx, my, g_physFbWidth, g_physFbHeight))
+        if (WmDockPress(dockX, dockY, dv.w, dv.h))
         {
             if (WmLauncherVisible()) WmLauncherClose();
             if (releaseLatched && !polledDown) {
                 g_wmPrimaryDown = false; g_wmLastBtnDown = false;
-                if (WmDockDragActive()) WmDockDrag(mx, false);
+                if (WmDockDragActive()) WmDockDrag(dockX, false);
             }
             else g_wmLastBtnDown = btnDown;
             return;
@@ -3395,18 +3521,18 @@ static void CompositorHandleMouseWM()
             // Cancel on the power prompt) reads as a held button and is lost.
             const auto launcherPressDone=[&] {
                 if(releaseLatched&&!polledDown){
-                    WmLauncherGesture(mx,my,g_physFbWidth,g_physFbHeight,true);
+                    WmLauncherGesture(sx,sy,sv.w,sv.h,true);
                     g_wmPrimaryDown=false;g_wmLastBtnDown=false;
                 }
                 else g_wmLastBtnDown=btnDown;
             };
-            if (WmLauncherPress(mx, my, g_physFbWidth, g_physFbHeight, false))
+            if (WmLauncherPress(sx, sy, sv.w, sv.h, false))
             {
                 launcherPressDone();
                 return;
             }
             // Check if clicking the Apps button again (toggle off)
-            int tbIdx = WmTaskbarHitTest(mx, my, g_physFbWidth, g_physFbHeight);
+            int tbIdx = WmTaskbarHitTest(sx, sy, sv.w, sv.h);
             if (tbIdx == -3)
             {
                 WmLauncherToggle();
@@ -3420,7 +3546,7 @@ static void CompositorHandleMouseWM()
         }
 
         // Check taskbar first
-        int tbIdx = WmTaskbarHitTest(mx, my, g_physFbWidth, g_physFbHeight);
+        int tbIdx = WmTaskbarHitTest(sx, sy, sv.w, sv.h);
         if (tbIdx == -3)
         {
             // "Apps" button — toggle launcher
@@ -3454,7 +3580,7 @@ static void CompositorHandleMouseWM()
                 }
             }
         }
-        else if (my >= static_cast<int32_t>(WmTaskbarTop(g_physFbHeight)))
+        else if (ShellTaskbarBand(mx, my))
         {
             // Clicked taskbar background — do nothing
         }
@@ -3534,13 +3660,15 @@ static void CompositorHandleMouseWM()
     }
     else if (WmVolumeDragActive())
     {
-        WmVolumeDrag(mx, btnDown, g_physFbWidth, g_physFbHeight);
+        // The volume popup is on the shell output.
+        const ShellView owner = ShellOwnerView();
+        WmVolumeDrag(int32_t(int64_t(mx) - owner.x), btnDown, owner.w, owner.h);
     }
     else if (WmDockDragActive())
     {
         // A latched release ends the drag in this pass (the bottom of the
         // function clears the held state the same way).
-        WmDockDrag(mx, btnDown && !(releaseLatched && !polledDown));
+        WmDockDrag(dockX, btnDown && !(releaseLatched && !polledDown));
     }
     else if (btnDown && g_wmDragging)
     {
@@ -4332,6 +4460,137 @@ static bool GopShadowEnsure()
     g_gopShadowWidth=g_physFbWidth;g_gopShadowHeight=g_physFbHeight;
     return true;
 }
+// ---------------------------------------------------------------------------
+// GOP / DisplayOps output adapter (display_output.h). The active DisplayOps
+// (GOP, bochs, vmware, virtio, or a managed linear driver) is one output at
+// the desktop origin with the compositor's framebuffer geometry. It has no
+// back buffers: AcquireBack hands out the live framebuffer and Present is
+// the front-buffer row copy the software flip always did.
+// ---------------------------------------------------------------------------
+// Set by CompositorFlipSoftware before Present: whether the row shadow is
+// allocated (GopShadowEnsure) for this frame.
+static bool g_gopPresentShadow=false;
+static uint32_t GopOutputCount() { return g_physFbWidth && g_physFbHeight ? 1u : 0u; }
+static void CopyOutputName(char (&dst)[16], const char* src)
+{
+    uint32_t i=0;
+    for(;src && src[i] && i+1<sizeof(dst);++i)dst[i]=src[i];
+    for(;i<sizeof(dst);++i)dst[i]=0;
+}
+static bool GopOutputInfo(uint32_t id, OutputInfo* out)
+{
+    const uint64_t packed=__atomic_load_n(&g_publishedPhysDims,__ATOMIC_ACQUIRE);
+    const uint32_t w=static_cast<uint32_t>(packed),h=static_cast<uint32_t>(packed>>32);
+    if(id || !out || !w || !h)return false;
+    *out=OutputInfo{};
+    out->id=0;out->connected=true;out->enabled=true;
+    out->x=0;out->y=0;out->w=w;out->h=h;
+    out->stride=g_physFbStride*4;out->format=OutputFormatXrgb8888;
+    out->refreshMhz=OutputNominalRefreshMhz;
+    out->scalePercent=WmGetAppliedScale();
+    CopyOutputName(out->name,"BROOK-1");
+    const DisplayOps* display=DisplayGetActive();
+    CopyOutputName(out->make,display && display->name ? display->name : "display");
+    return true;
+}
+static int GopOutputEnable(uint32_t id) { return id ? -1 : 0; }
+static int GopOutputDisable(uint32_t) { return -1; }
+static bool GopOutputAcquire(uint32_t id, OutputBuffer* out)
+{
+    if(id || !out || !g_physFb)return false;
+    *out={reinterpret_cast<uint8_t*>(const_cast<uint32_t*>(g_physFb)),0,g_physFbStride*4,0};
+    return true;
+}
+// Called with g_scanoutMappingLock held, from CompositorFlipSoftware. The
+// output is at 0,0, so its local damage rows are back-buffer rows.
+static int GopOutputPresent(uint32_t id, const OutputBuffer& buffer, const DamageRects& damage)
+{
+    DamageRect bounds{};
+    if(id || !buffer.cpu || !g_backBuffer)return -1;
+    if(!damage.Bounds(&bounds))return 0;
+    const bool full=damage.full,shadow=g_gopPresentShadow;
+    const uint32_t minY=static_cast<uint32_t>(bounds.y0),maxY=static_cast<uint32_t>(bounds.y1);
+    auto* framebuffer=reinterpret_cast<uint32_t*>(buffer.cpu);
+    const uint32_t framebufferStride=buffer.stride/4;
+    const uint64_t rowBytes=uint64_t(g_physFbWidth)*4;
+    auto copyRow=[&](uint32_t y){
+        __builtin_memcpy(framebuffer+y*framebufferStride,g_backBuffer+y*g_backBufStride,rowBytes);
+    };
+    uint32_t flushMin=minY,flushMax=maxY;
+    if(shadow){
+        const auto r=GopRowFilterCopy(g_backBuffer,g_backBufStride,g_gopShadow,g_physFbWidth,g_physFbWidth,
+                                      minY,maxY,!full,copyRow);
+        g_idleStats.rowsCopied+=r.copied;g_idleStats.rowsSkipped+=r.skipped;g_idleStats.bytesCopied+=r.copied*rowBytes;
+        flushMin=r.minY;flushMax=r.maxY;
+        if(full && minY==0 && maxY==g_physFbHeight)g_gopShadowValid=true;
+    }else{
+        for(uint32_t y=minY;y<maxY;++y)copyRow(y);
+        g_idleStats.rowsCopied+=maxY-minY;g_idleStats.bytesCopied+=(maxY-minY)*rowBytes;
+    }
+#if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
+    // The GOP now holds the complete software frame; arm it (latched at vblank).
+    if(full && minY==0 && maxY==g_physFbHeight)brook::BdwScanoutFlipReturnToGop();
+#endif
+    if(flushMin>=flushMax)return 0;
+    brook::DisplayFlush(flushMin,flushMax);
+    return 1;
+}
+static uint32_t GopOutputPoll(uint32_t) { return uint32_t(OutputFlipState::Idle); }
+static void GopOutputPanicPresent(uint32_t id, const uint8_t*, uint32_t) { if(!id)DisplayPanicPresent(); }
+static const OutputBackendOps g_gopOutputOps={
+    "display",GopOutputCount,GopOutputInfo,GopOutputEnable,GopOutputDisable,GopOutputAcquire,
+    GopOutputPresent,GopOutputPoll,nullptr,nullptr,nullptr,GopOutputPanicPresent,
+};
+
+void CompositorGetOutputs(OutputLayout& out)
+{
+    OutputEnumerate(out);
+    bool any=false;
+    for(uint32_t i=0;i<out.count;++i)any|=out.enabled(i);
+    if(any)return;
+    // Before the adapter is registered: the framebuffer is the one output.
+    uint32_t w=0,h=0;
+    CompositorSnapshotPhysDims(&w,&h);
+    const uint64_t generation=out.generation;
+    out=OutputLayout{};
+    out.generation=generation;
+    if(!w || !h)return;
+    out.count=1;
+    out.outputs[0].connected=out.outputs[0].enabled=true;
+    out.outputs[0].w=w;out.outputs[0].h=h;
+    out.outputs[0].refreshMhz=OutputNominalRefreshMhz;out.outputs[0].scalePercent=100;
+    CopyOutputName(out.outputs[0].name,"BROOK-1");
+}
+
+static void CompositorRegisterOutputs() { (void)OutputRegisterBackend(&g_gopOutputOps); }
+
+// The pointer moves over the union of the enabled outputs.
+static void CompositorSyncPointerOutputs()
+{
+    OutputLayout layout;
+    CompositorGetOutputs(layout);
+    OutputRect rects[OutputMax];
+    uint32_t n=0;
+    for(uint32_t i=0;i<layout.count;++i)if(layout.enabled(i))rects[n++]=layout.rect(i);
+    MouseSetOutputBounds(rects,n);
+}
+
+bool CompositorGetOutputRect(uint32_t index, OutputRect* rect)
+{
+    OutputLayout layout;
+    CompositorGetOutputs(layout);
+    if(!layout.enabled(index))return false;
+    if(rect)*rect=layout.rect(index);
+    return true;
+}
+
+OutputRect CompositorPrimaryOutputRect()
+{
+    OutputLayout layout;
+    CompositorGetOutputs(layout);
+    return layout.rect(0);
+}
+
 static bool CompositorFlipSoftware(bool clientFrame = false, bool hardwareCursor = false)
 {
     CompositorMutexGuard geometry(&g_scanoutMappingLock);
@@ -4372,31 +4631,34 @@ static bool CompositorFlipSoftware(bool clientFrame = false, bool hardwareCursor
     if(minY>=maxY)return false;
     ++g_idleStats.softwareFlips;g_idleStats.rowsDirty+=maxY-minY;
     if(g_rendererCapsOwner)++g_cpuFramesOverRenderer; // a CPU frame while a renderer is registered
-    const uint64_t rowBytes=uint64_t(g_physFbWidth)*4;
-    auto copyRow=[&](uint32_t y){
-        __builtin_memcpy(const_cast<uint32_t*>(g_physFb+y*g_physFbStride),g_backBuffer+y*g_backBufStride,rowBytes);
-    };
-    uint32_t flushMin=minY,flushMax=maxY;
-    if(shadow){
-        const auto r=GopRowFilterCopy(g_backBuffer,g_backBufStride,g_gopShadow,g_physFbWidth,g_physFbWidth,
-                                      minY,maxY,!full,copyRow);
-        g_idleStats.rowsCopied+=r.copied;g_idleStats.rowsSkipped+=r.skipped;g_idleStats.bytesCopied+=r.copied*rowBytes;
-        flushMin=r.minY;flushMax=r.maxY;
-        if(full && minY==0 && maxY==g_physFbHeight)g_gopShadowValid=true;
-    }else{
-        for(uint32_t y=minY;y<maxY;++y)copyRow(y);
-        g_idleStats.rowsCopied+=maxY-minY;g_idleStats.bytesCopied+=(maxY-minY)*rowBytes;
-    }
     if(full)++g_idleStats.fullFlips;
-#if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
-    // The GOP now holds the complete software frame; arm it (latched at vblank).
-    if(full && minY==0 && maxY==g_physFbHeight)brook::BdwScanoutFlipReturnToGop();
-#endif
-    if (flushMin < flushMax) {
-        brook::DisplayFlush(flushMin, flushMax);
-        // Cursor, chrome and kernel-console redraws cannot establish app health.
-        if (clientFrame) CompositorRecordDesktopPresent();
+    // Present the damage to every output, clipped to its rectangle. The row
+    // span is the damage: full-width rows of the desktop.
+    g_gopPresentShadow=shadow;
+    const DamageRects damage=full ? DamageRects::Full(g_physFbWidth,g_physFbHeight) : DamageRects::Rows(minY,maxY,g_physFbWidth);
+    bool flushed=false;
+    OutputLayout outputs;
+    CompositorGetOutputs(outputs);
+    bool presentedAny=false;
+    for(uint32_t i=0;i<outputs.count;++i){
+        const auto* backend=outputs.backends[i];
+        if(!outputs.enabled(i) || !backend || !backend->Present)continue;
+        const DamageRects local=DamageClipToOutput(damage,outputs.rect(i));
+        if(local.empty())continue;
+        OutputBuffer buffer{};
+        const uint32_t id=outputs.backendIds[i];
+        if(backend->AcquireBack && !backend->AcquireBack(id,&buffer))continue;
+        presentedAny=true;
+        flushed|=backend->Present(id,buffer,local)>0;
     }
+    // No registered output (the layout fell back to the framebuffer size):
+    // the framebuffer itself is the one output.
+    if(!presentedAny && !outputs.backends[0]){
+        OutputBuffer buffer{};
+        if(GopOutputAcquire(0,&buffer))flushed=GopOutputPresent(0,buffer,damage)>0;
+    }
+    // Cursor, chrome and kernel-console redraws cannot establish app health.
+    if (flushed && clientFrame) CompositorRecordDesktopPresent();
     if(g_scanoutContainsLeasedFrame){
         ++g_softwareTakeover.count;
         g_softwareTakeover.lastAgeMs=tick-g_leasedFrameTick;
@@ -5227,9 +5489,10 @@ static bool ReplaceCompositorFramebuffer(uint64_t fbPhys, uint32_t w, uint32_t h
     }
     if(g_displayGeneration)++g_displayGeneration;
     PublishPhysDims(w, h);
+    OutputNotifyChanged();
     CompositorUnlockScanoutForDisplayChange();
     if (retiredPages) VmmFreePages(retired, retiredPages);
-    MouseSetBounds(w,h);MarkAllDirty();
+    CompositorSyncPointerOutputs();MarkAllDirty();
     if (replaceTty && WmIsActive()) WmApplyDisplaySize(w,h);
     if (replaceTty || cancelled) { CompositorMarkDirty(); CompositorWake(); }
     SerialPrintf("COMPOSITOR: remapped to %ux%u stride=%u\n",w,h,stridePixels);

@@ -430,6 +430,93 @@ static uint64_t CaptureModel(const WmShellSurface& surface, uint32_t width, uint
            slot.active->scale == config.metrics.percent ? slot.active->key : 0;
 }
 
+namespace {
+struct DetachedShell {
+    ChromeShellModel model;
+    ChromeShellConfig config;
+    ChromeShellStorage storage;
+    ChromeMaterialCache material;
+    ChromeDisplayList list;
+    Geometry geometry;
+    uint64_t key;
+    uint64_t styleKey;
+    bool built;
+    DetachedShell() : model{}, config{}, storage{}, material{},
+        list(storage.cmds, sizeof(storage.cmds) / sizeof(*storage.cmds), storage.text, sizeof(storage.text)),
+        geometry{}, key(0), styleKey(0), built(false) {}
+};
+// Allocated when an extra output first shows a taskbar.
+DetachedShell* g_detached[ShellServiceDetachedLimit] = {};
+
+uint64_t ShellStyleKey(const ChromeShellConfig& config)
+{
+    uint64_t style = (WmBackdropStyleVersion() * 0x100000001b3ull) ^
+                     (uint64_t(config.metrics.percent) << 32) ^
+                     (uint64_t(config.glass) << 16) ^ config.materialOpacity;
+    const auto* palette = reinterpret_cast<const unsigned char*>(&config.palette);
+    for (size_t i = 0; i < sizeof(config.palette); ++i) style = (style ^ palette[i]) * 0x100000001b3ull;
+    return style;
+}
+}
+
+uint64_t ShellServiceCaptureDetached(uint32_t slot, const WmShellSurface& surface, uint32_t width, uint32_t height,
+                                     uint64_t now, int32_t mx, int32_t my)
+{
+    // The model scratch belongs to the registered service's storage.
+    if (slot >= ShellServiceDetachedLimit || !__atomic_load_n(&g_registered, __ATOMIC_ACQUIRE) || !g_shell) return 0;
+    DetachedShell*& d = g_detached[slot];
+    if (!d) {
+        void* storage = kmalloc(sizeof(DetachedShell));
+        if (!storage) return 0;
+        d = new (storage) DetachedShell();
+    }
+    if (!WmCaptureShellModel(surface, width, height, now, mx, my, g_shell->capture)) return 0;
+    const auto config = WmCaptureShellConfig();
+    const uint64_t styleKey = ShellStyleKey(config);
+    const Geometry geometry{surface, width, height, styleKey};
+    if (d->built && d->styleKey == styleKey && SameGeometry(d->geometry, geometry) &&
+        !memcmp(&d->model, &g_shell->capture, sizeof(d->model))) return d->key;
+    d->model = g_shell->capture;
+    d->config = config;
+    d->geometry = geometry;
+    d->styleKey = styleKey;
+    d->list.Clear();
+    // Taskbars only: BuildShellModel would link every shell builder (and
+    // their assets) into the kernel image.
+    if (d->model.kind != ChromeShellKind::Taskbar) { d->built = false; return 0; }
+    {
+        const ChromeShellModel& model = d->model;
+        const ChromeStyle style = d->config.Style(Fonts(config.metrics.percent), d->material);
+        ChromeTaskbarButton buttons[ChromeTaskbarButtonLimit];
+        for (int i = 0; i < model.taskbar.count; ++i) {
+            const auto& entry = model.entries[i];
+            buttons[i] = {model.icons[i].View(), entry.label, entry.active, entry.minimized, entry.launch, entry.busy,
+                          entry.initial, entry.color, entry.hasWindow};
+        }
+        ChromeBuildTaskbar({&model.taskbar, buttons, model.launcherOpen, model.icons[ChromeShellModel::AppsIcon].View(),
+                           model.networkConnected, model.volumeControl, model.volumeAvailable, model.agentShown,
+                           model.agentStale, model.telemetry.View(), model.uptimeMs, model.mouseX, model.mouseY,
+                           &model.tray}, style, d->list);
+        if (model.taskbar.hud.w > 0)
+            ChromeBuildCompactHud({model.taskbar.hud, model.compactTelemetry.View(), model.hudTick}, style, d->list);
+    }
+    d->built = !d->list.Overflowed();
+    d->key = d->built ? ChromeListKey(d->list, styleKey ^ (uint64_t(width) << 32 | height)) : 0;
+    return d->key;
+}
+
+void ShellServiceDrawDetached(uint32_t slot, const WmShellSurface& surface, uint32_t* pixels, uint32_t stride,
+                              uint32_t width, uint32_t height)
+{
+    if (slot >= ShellServiceDetachedLimit) return;
+    const DetachedShell* d = g_detached[slot];
+    if (!d || !d->built || !SameGeometry(d->geometry, {surface, width, height, d->styleKey})) return;
+    if (surface.x < 0 || surface.y < 0 || uint64_t(surface.x) + surface.w > width ||
+        uint64_t(surface.y) + surface.h > height) return;
+    ChromeExecute(d->list, {pixels + uint64_t(surface.y) * stride + surface.x, stride, surface.w, surface.h,
+                            surface.x - surface.popupShiftX, surface.y}, Fonts(d->config.metrics.percent));
+}
+
 uint64_t ShellServiceCapture(const WmShellSurface& surface, uint32_t width, uint32_t height,
                              uint64_t now, int32_t mx, int32_t my)
 {

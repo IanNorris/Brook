@@ -73,6 +73,15 @@ void VmmFreePages(VirtualAddress,uint64_t) { std::abort(); }
 uint32_t WmDesktopHeight(uint32_t h) { return h-1; }
 bool taskbarHidden=false;
 bool WmTaskbarHidden() { return taskbarHidden; }
+// One output: no backend registered, so the compositor's layout falls back
+// to the framebuffer as the single output (multi-output D0).
+void OutputEnumerate(OutputLayout& out) { out = OutputLayout{}; }
+bool OutputRegisterBackend(const OutputBackendOps*) { return true; }
+void OutputNotifyChanged() {}
+uint32_t WmShellOutput() { return 0; }
+bool WmTaskbarHiddenOn(uint32_t) { return taskbarHidden; }
+uint64_t ShellServiceCaptureDetached(uint32_t, const WmShellSurface&, uint32_t, uint32_t, uint64_t, int32_t, int32_t) { std::abort(); }
+void ShellServiceDrawDetached(uint32_t, const WmShellSurface&, uint32_t*, uint32_t, uint32_t, uint32_t) { std::abort(); }
 WmPalette WmCurrentPalette() {
     static const WmPalette palette = [] { WmPalette value{}; value.taskbar = 0x00abc123; return value; }();
     return palette;

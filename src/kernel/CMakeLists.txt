@@ -365,6 +365,7 @@ add_executable(kernel
     src/vdso.cpp
     src/display.cpp
     src/display_power.cpp
+    src/display_output.cpp
     src/ahci_observe.cpp
     src/hw_inventory.cpp
     src/boot_status.cpp
