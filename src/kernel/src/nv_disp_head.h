@@ -175,7 +175,7 @@ struct DpLink{
     uint32_t Loff()const{return sor*0x800+(link==2?0x80:0);}
     bool Tps3()const{return dpcd[0]>=0x12&&(dpcd[2]&0x40);}
 };
-struct DpTrainResult{bool cr=false,eq=false;uint8_t stat[6]{},conf[4]{},pc2conf[2]{};uint32_t crTries=0,eqTries=0,drives=0;int err=0;};
+struct DpTrainResult{bool spreadNote=false;bool cr=false,eq=false;uint8_t stat[6]{},conf[4]{},pc2conf[2]{};uint32_t crTries=0,eqTries=0,drives=0;int err=0;};
 // Io for training: rd/wr (BAR0), aux(read,addr,buf,n) -> 0 ok, udelay(us),
 // and drive(lane,pc,vs,pe,DpCfg&) -> VBIOS table lookup (false = no entry).
 template<typename Io> struct DpTrainer{
@@ -259,7 +259,8 @@ template<typename Io> struct DpTrainer{
         // Spread: mirror only the sink's MSA downspread bit (DPCD 0x107 bit4) to the
         // source state the GOP left in 0x00ea80 bit4; never write 0xea80.
         {uint8_t ds=0;if(io.aux(true,0x107,&ds,1)){r.err=-6;return false;}
-         const bool on=(io.rd(0x00ea80)>>4)&1&&(l.dpcd[3]&1);ds=uint8_t((ds&~0x10)|(on?0x10:0));
+         const bool src=(io.rd(0x00ea80)>>4)&1;r.spreadNote=src&&!(l.dpcd[3]&1); // source spreads, sink cannot follow
+         const bool on=src&&(l.dpcd[3]&1);ds=uint8_t((ds&~0x10)|(on?0x10:0));
          if(io.aux(false,0x107,&ds,1)){r.err=-6;return false;}}
         uint8_t sink[2]={uint8_t(l.bw),uint8_t(l.nr|(l.ef?0x80:0))};
         if(io.aux(false,kDpcdLinkBw,sink,2)){r.err=-6;return false;}
@@ -382,9 +383,10 @@ inline void PushHeadEnable(Push& p,uint32_t h,const HeadMode& m){
 // (GET_RG_SCAN_LINE 0x220-0x23c, SET_GET_BLANKING_CTRL 0x240-0x25c) and the head
 // data port OUTPUT_SCALER_COEFF_VALUE (+0x214). Head context-DMA methods (CRC
 // +0x180, OLUT +0x288) are replayed only as 0 (preflight requires ARM 0).
-constexpr uint16_t kCoreHeadMthds[]={ // clc57d.h HEAD_SET_* offsets for head 0
+constexpr uint16_t kCoreHeadMthds[]={ // clc57d.h HEAD_SET_* offsets for head 0 (+ 0x074, see below)
+    // 0x074 is not in clc57d.h HEAD_SET_*; nouveau pushes it raw (headc57d.c 229), so it is replayed too.
     0x000,0x004,0x008,0x00c,0x010,0x014,0x018,0x01c,0x028,0x02c,0x030,0x034,0x040,0x044,0x048,0x04c,0x058,0x05c,
-    0x064,0x068,0x06c,0x070,0x078,0x07c,0x080,0x098,0x09c,0x0a0,0x180,0x184,0x18c,0x194,0x198,0x19c,0x1a0,0x1a8,
+    0x064,0x068,0x06c,0x070,0x074,0x078,0x07c,0x080,0x098,0x09c,0x0a0,0x180,0x184,0x18c,0x194,0x198,0x19c,0x1a0,0x1a8,
     0x218,0x220,0x224,0x228,0x22c,0x238,0x23c,0x240,0x244,0x248,0x24c,0x250,0x254,0x258,0x25c,0x260,0x264,0x268,
     0x26c,0x270,0x280,0x284,0x288,0x28c,0x29c,0x2a0,0x2a4,0x2a8,0x2ac,0x2b0,0x2b4,0x2b8,0x2bc,0x2c0,0x2c4,0x2c8,
     0x2cc,0x2d0,0x2d4,0x2d8,0x2dc,0x2e0,0x2e4,0x2e8,0x2ec,0x2f0,0x2f4,0x2f8,0x2fc,0x300,0x304,0x308,0x30c,0x310,
@@ -469,10 +471,12 @@ enum CallId:uint32_t{kCallDpTrain=1,kCallSuperFlush=2,kCallSuperFlushVpll=3};
 // Stage-2 head-1 work (2.1 VPLL with readback, 2.2 OnInt2/rgclk/DP SF/SOR clock).
 inline void AddStage2Work(Plan& p,const HeadConfig& c){
     const uint32_t h=c.head,hoff=h*0x800,s=c.sor*0x800,lo=c.dp.Loff();
-    p.Add(Op::Expect,RegAssy(kChidCore,c57d::HeadM(h,0x00c)),~0u,c.mode.pclkHz,0,"2.1: ASSY head pclk as planned");
+    // In-stage checks are soft (review N1): a failure here must not leave the stage acked
+    // and unreleased; they log a sticky warning and the stage completes.
+    p.Add(Op::ExpectSoft,RegAssy(kChidCore,c57d::HeadM(h,0x00c)),~0u,c.mode.pclkHz,0,"2.1: ASSY head pclk as planned");
     AddVpll(p,h,c.vpll);
-    p.Add(Op::Expect,RegVpll(h,0x04),~0u,(c.vpll.P<<16)|(c.vpll.N<<8)|c.vpll.M,0,"2.1: VPLL coefficients read back");
-    p.Add(Op::Expect,RegVpll(h,0x10),~0u,c.vpll.fN<<16,0,"2.1: VPLL fN read back");
+    p.Add(Op::ExpectSoft,RegVpll(h,0x04),0x003fffff,(c.vpll.P<<16)|(c.vpll.N<<8)|c.vpll.M,0,"2.1: VPLL P|N|M read back (fields only)");
+    p.Add(Op::ExpectSoft,RegVpll(h,0x10),0xffff0000,c.vpll.fN<<16,0,"2.1: VPLL fN read back");
     p.Add(Op::CopyMask,0x61c10c+lo,0x40ff4001,0x616540+hoff,0,"2.2 OnInt2: head SF <- dpctrl (IEDT[11])",0,0xbf00bffe);
     p.Add(Op::Mask,0x612200+hoff,0xf,0,0,"2.2 rgclk div 0 (gf119_head_rgclk)");
     p.Add(Op::Mask,0x616568+hoff,0xffff,c.sf.h,0,"2.2 DP audio sym h (gv100.c 66)");
@@ -510,15 +514,17 @@ inline void AddSupervisorsDisable(Plan& p,const HeadConfig& c){
 // any stage pending in 0x611c30 | 0x611860, then acks and releases only the stages
 // seen. Stage 2 during an enable gets the head-1 stage-2 work (VPLL1 included).
 // Io: rd, wr, udelay, log(const char*,uint32_t).
-template<typename Io> inline uint32_t SupervisorFlush(Io& io,const HeadConfig& c,bool stage2Work,uint32_t ms){
+// `open`: a stage the plan acked but did not release (review N1): its pending bits are
+// already cleared by the ack, so it counts as seen in the first round.
+template<typename Io> inline uint32_t SupervisorFlush(Io& io,const HeadConfig& c,bool stage2Work,uint32_t ms,uint32_t open=0){
     uint32_t handled=0;
     for(uint32_t round=0;round<3;++round){
-        uint32_t bits=0;
-        for(uint32_t t=0;t<ms*10;++t){bits=(io.rd(kRegCtrlDisp)|io.rd(kRegSuperAck))&7;if(bits)break;io.udelay(100);}
+        uint32_t bits=round==0?(open&7):0;
+        for(uint32_t t=0;!bits&&t<ms*10;++t){bits=(io.rd(kRegCtrlDisp)|io.rd(kRegSuperAck))&7;if(bits)break;io.udelay(100);}
         if(!bits){io.note("supervisor flush: nothing pending; 0x6107a8",io.rd(kRegSuperStat));break;}
         for(uint32_t bit=1;bit<=4;bit<<=1){
             if(!(bits&bit))continue;
-            io.wr(kRegSuperAck,bit);io.note("supervisor flush: acked stage",bit);
+            io.wr(kRegSuperAck,bit);io.note(bit&open?"supervisor flush: releasing the open stage":"supervisor flush: acked stage",bit);
             if(io.rd(RegSuperHead(0))&0x11000)io.note("supervisor flush: HEAD 0 FLAGGED",io.rd(RegSuperHead(0)));
             if(bit==2&&stage2Work){Plan w;AddStage2Work(w,c);(void)Run(w,0,w.count,io,true);}
             for(uint32_t h=0;h<4;++h)io.wr(RegSuperHead(h),0);
@@ -619,10 +625,14 @@ inline Err BuildHeadPlan(HeadConfig c,InstImage& img,HeadPushes& pushes,Plan& p)
     p.Add(Op::Expect,RegArm(kChidCore,c57d::HeadRasterSize(0)),~0u,g.headRaster,0,"head 0 ARM survived connect");
     AddCoreDiff(p,"after core connect (log only; reset methods are replayed next)",2);
     p.Add(Op::Kick,RegPut(kChidCore),~0u,pushes.replayEnd,0,"core PUT: replay ARM state (methods only, no UPDATE)");
-    p.Add(Op::PollOr,RegGet(kChidCore),~0xfffff003u|0xffc,pushes.replayEnd,kTimeoutMs,"core GET == PUT (replay fetched)",0,RegGet(kChidCore),kRegExcOther,1);
-    AddCoreDiff(p,"after replay: ASSY == ARM (strict)",1);
+    p.Add(Op::PollOr,RegGet(kChidCore),0xffc,pushes.replayEnd,kTimeoutMs,"core GET == PUT (replay fetched)",0,RegGet(kChidCore),kRegExcOther,1);
+    p.Add(Op::Poll,RegChnStatus(kChidCore),kCoreStateMask,kCoreIdle,kTimeoutMs,"core STATE == IDLE (replay executed)");
+    AddCoreDiff(p,"after replay: ASSY == ARM, any difference not ours fails (strict)",1);
     AddCoreKick(p,c,pushes.rungEnd,"core PUT: rung, notifier-only UPDATE");
-    p.Add(Op::PollOr,RegGet(kChidCore),~0u,pushes.rungEnd,kTimeoutMs,"core GET == PUT (rung)",0,RegGet(kChidCore),kRegExcOther,1);
+    // A supervisor during the rung fails the wait at once (event status 0x611860), as does a core exception.
+    p.Add(Op::PollOr,RegGet(kChidCore),~0u,pushes.rungEnd,kTimeoutMs,"core GET == PUT (rung; fails at once on a supervisor)",
+          (uint64_t(7)<<32)|kRegSuperAck,RegGet(kChidCore),kRegExcOther,1);
+    p.Add(Op::Poll,RegChnStatus(kChidCore),kCoreStateMask,kCoreIdle,kTimeoutMs,"core STATE == IDLE (rung)");
     p.Add(Op::VramPoll,0,3u<<kNtfyStatusShift,kNtfyFinished<<kNtfyStatusShift,kTimeoutMs,"rung notifier FINISHED",c.base.syncVram+0);
     p.Add(Op::Expect,kRegCtrlDisp,0x7,0,0,"rung raised no supervisor");
     p.Add(Op::Expect,kRegSuperAck,0x7,0,0,"rung raised no supervisor event");

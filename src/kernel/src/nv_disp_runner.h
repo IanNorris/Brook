@@ -57,7 +57,7 @@ template<typename B> struct Runner{
     };
     static const char* OpName(Op o){
         static const char* n[]={"WR","MASK","EXPECT","POLL","POLLSOFT","ACK","VCOPY","VWR","VEXPECT","VPOLL","VPOLLANY","ACKEXC",
-            "PRAMIN","FENCE","KICK","EXPNOT","LOG","COPY","ASSYARM","PAUSE","DELAY","ANDNIF","COPYMASK","CALL","FILL","PRAMINR","DUMP","POLLOR","EXPSOFT","EXPVPLL"};
+            "PRAMIN","FENCE","KICK","EXPNOT","LOG","COPY","ASSYARM","PAUSE","DELAY","ANDNIF","COPYMASK","CALL","FILL","PRAMINR","DUMP","POLLOR","EXPSOFT","EXPVPLL","WRITEIF"};
         return uint32_t(o)<sizeof(n)/sizeof(n[0])?n[uint32_t(o)]:"?";
     }
     Phase PhaseOf(uint32_t i)const{Phase ph=Phase::Preflight;
@@ -86,7 +86,8 @@ template<typename B> struct Runner{
         void udelay(uint32_t us){const uint64_t end=r.b->nowUs()+us;while(r.b->nowUs()<end)r.b->relax();}
         void except(uint32_t chid,uint32_t s,uint32_t d,uint32_t c){
             Line l;l.raw("{\"nv_disp_exc\":1,\"chid\":");l.dec(chid);l.raw(",\"stat\":\"");l.hex(s);l.raw("\",\"data\":\"");
-            l.hex(d);l.raw("\",\"code\":\"");l.hex(c);l.raw("\"}\n");r.b->emit(l.t);}
+            l.hex(d);l.raw("\",\"code\":\"");l.hex(c);l.raw("\",\"mthd\":\"");l.hex((s&0xfff)<<2);l.raw("\",\"type\":");l.dec((s>>12)&7);
+            l.raw("}\n");r.b->emit(l.t);}
         void diff(uint32_t m,uint32_t a,uint32_t c){
             Line l;l.raw("{\"nv_disp_diff\":\"");l.hex(m);l.raw("\",\"assy\":\"");l.hex(a);l.raw("\",\"arm\":\"");l.hex(c);
             l.raw("\",\"rewritten\":");l.dec(r.plan.Rewritten(m)?1:0);l.raw("}\n");r.b->emit(l.t);}
@@ -97,7 +98,7 @@ template<typename B> struct Runner{
             Line l;l.raw("{\"nv_disp_dump\":\"");l.hex(addr);l.raw("\",\"w\":[");
             for(uint32_t i=0;i<n;++i){if(i)l.raw(",");l.raw("\"");l.hex(w[i]);l.raw("\"");}
             l.raw("]}\n");r.b->emit(l.t);}
-        bool call(uint32_t){return false;} // no dynamic steps in step 3
+        bool call(uint32_t,uint32_t){return false;} // no dynamic steps in step 3
         void log(uint32_t i,const Step& s,uint32_t got,bool ok){
             Line l;l.raw("{\"nv_disp_step\":");l.dec(i);l.raw(",\"list\":\"");l.s(tag);l.raw("\",\"op\":\"");l.s(OpName(s.op));
             l.raw("\",\"reg\":\"");l.hex(s.op==Op::VramCopy||s.op==Op::VramWrite||s.op==Op::VramPoll||s.op==Op::VramPollAny||s.op==Op::SurfFill?s.vram:s.reg);
@@ -178,15 +179,32 @@ template<typename B> struct Runner{
     void Fail(uint32_t i){
         const Phase ph=PhaseOf(i);
         Msg("failed","auto-abort");
-        if(st.firstFlipOk&&ph>=Phase::Flip&&ph<=Phase::Restore&&pushes.count){
-            Plan rp;const uint32_t k=pushes.count-1,ch=ChidWndw(cfg.window);
+        const uint32_t ch=ChidWndw(cfg.window);
+        const Step& fs=plan.steps[i];
+        if(fs.op==Op::Poll&&fs.reg==RegGet(ch)){                   // GET stall: diagnostics first
+            abort=Plan{};AddGetStallDiag(abort,cfg,PrevPut(i),fs.value);abort.End(); // RunAbort rebuilds it
+            Io io{*this,abort,"diag"};(void)brook::nvdisp::Run(abort,0,abort.count,io,true);
+        }
+        if(st.firstFlipOk&&ph>=Phase::Flip&&ph<=Phase::Teardown&&pushes.count){
+            Plan rp;const uint32_t k=pushes.count-1;
             rp.Add(Op::AckException,ch,1u<<cfg.window,0,0,"ack window exception before restore");
             rp.Add(Op::Kick,RegPut(ch),~0u,pushes.end[k],0,"restore submission");
-            rp.Add(Op::PollSoft,RegArm(ch,c57e::SET_OFFSET0),~0u,uint32_t(cfg.surf[0].vram>>8),500,"ARM back on the GOP surface");
+            // Wait for the restore to be fetched AND latched before the abort list trashes
+            // the channel (flip_4_1000: the trash discarded a pending restore).
+            rp.Add(Op::PollSoft,RegGet(ch),~0u,pushes.end[k],2000,"restore fetched (GET == PUT)");
+            rp.Add(Op::PollSoft,RegChnStatus(ch),kWinMethodExecBusy,0,1000,"METHOD_EXEC idle");
+            rp.Add(Op::PollSoft,RegArm(ch,c57e::SET_CONTEXT_DMA_ISO0),~0u,RestoreHandle(cfg),1000,"ARM ISO handle back to the GOP's");
+            rp.Add(Op::PollSoft,RegArm(ch,c57e::SET_OFFSET0),~0u,uint32_t(cfg.surf[0].vram>>8),1000,"ARM back on the GOP surface");
+            rp.Add(Op::Log,RegArm(ch,c57e::SET_CONTEXT_DMA_NOTIFIER),0,0,0,"ARM notifier ctxdma (GOP: 0)");
             Io io{*this,rp,"restore"};(void)brook::nvdisp::Run(rp,0,rp.count,io,true);
         }
         RunAbort(ph,100);
     }
+    // PUT before the submission whose GET wait is at step i (the previous Kick's value).
+    uint32_t PrevPut(uint32_t i)const{
+        bool seen=false;
+        for(uint32_t j=i;j-->0;)if(plan.steps[j].op==Op::Kick){if(seen)return plan.steps[j].value;seen=true;}
+        return 0;}
     void RunAbort(Phase reached,uint32_t ms){
         abort=Plan{};BuildAbort(cfg,reached,abort,ms);
         Io io{*this,abort,"abort"};(void)brook::nvdisp::Run(abort,0,abort.count,io,true);

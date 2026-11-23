@@ -160,7 +160,11 @@ static void TestPlanRun(bool core,bool a2=false){
      assert(q.steps[at].op==Op::PraminRange&&g.written.count(kRegInstTarget)==0);}
     uint32_t runs=1;for(uint32_t i=1;i<kReplayCount;++i)if(kReplayMthds[i]!=kReplayMthds[i-1]+4)++runs;
     assert(runs==20);
-    assert(pushes.end[0]==(25+kReplayCount+runs)*4&&pushes.end[1]==pushes.end[0]+19*4&&pushes.end[2]==pushes.end[1]+19*4);
+    assert(pushes.end[0]==(25+kReplayCount+runs)*4&&pushes.end[1]==pushes.end[0]+19*4&&pushes.end[2]==pushes.end[1]+27*4);
+    // The restore leaves the GOP's window state: notifier off and present control as the GOP
+    // had them on ARM, the GOP's interlock flags in ASSY (ARM keeps the window-only UPDATE's).
+    assert(f.R(RegArm(ch,c57e::SET_CONTEXT_DMA_NOTIFIER))==0&&f.R(RegArm(ch,c57e::SET_PRESENT_CONTROL))==c.restoreVal[11]);
+    assert(f.R(RegAssy(ch,c57e::SET_INTERLOCK_FLAGS))==1&&f.R(RegAssy(ch,c57e::SET_WINDOW_INTERLOCK_FLAGS))==1);
 }
 static void TestPreflightRefuses(){
     Config c=DellConfig();static InstImage img;static Pushes pushes;static Plan plan;pushes=Pushes{};plan=Plan{};
@@ -252,7 +256,7 @@ static void Dump(bool core){
     Config c=DellConfig();c.coreChannel=core;c.pauseForObserver=true;
     static InstImage img;static Pushes pushes;static Plan plan;pushes=Pushes{};plan=Plan{};
     assert(BuildPlan(c,img,pushes,plan)==Err::Ok);FixPramin(plan,img);
-    static const char* op[]={"WR","MASK","EXPECT","POLL","POLLSOFT","ACK","VCOPY","VWR","VEXPECT","VPOLL","VPOLLANY","ACKEXC","PRAMIN","FENCE","KICK","EXPNOT","LOG","COPY","ASSYARM","PAUSE","DELAY","ANDNIF","COPYMASK","CALL","FILL","PRAMINR","DUMP","POLLOR","EXPSOFT","EXPVPLL"};
+    static const char* op[]={"WR","MASK","EXPECT","POLL","POLLSOFT","ACK","VCOPY","VWR","VEXPECT","VPOLL","VPOLLANY","ACKEXC","PRAMIN","FENCE","KICK","EXPNOT","LOG","COPY","ASSYARM","PAUSE","DELAY","ANDNIF","COPYMASK","CALL","FILL","PRAMINR","DUMP","POLLOR","EXPSOFT","EXPVPLL","WRITEIF"};
     uint32_t ph=0;
     for(uint32_t i=0;i<plan.count;++i){
         while(ph<uint32_t(Phase::Count)&&plan.phaseBegin[ph]<=i&&(ph+1>=uint32_t(Phase::Count)||plan.phaseBegin[ph+1]<=i))++ph;

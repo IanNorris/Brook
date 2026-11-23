@@ -22,7 +22,7 @@ namespace brook::nvdisp {
 
 struct HeadState{
     bool preflightOk=false,live=false,enabled=false,paused=false,hooked=false,head0Flagged=false,fe=false,dpIdleHeld=false;
-    Kicked kicked=Kicked::None;
+    Kicked kicked=Kicked::None;uint32_t openStage=0; // a supervisor stage acked by the plan and not yet released
     uint32_t cursor=0,stopAt=~0u,failAt=~0u,runs=0,aborts=0,guardHits=0;
 };
 
@@ -46,7 +46,9 @@ template<typename B> struct HeadRunner{
     // Register Io with the head-0 write guard.
     struct RegIo{HeadRunner& r;bool violation=false;
         uint32_t rd(uint32_t a){return r.b->rd(a);}
-        void wr(uint32_t a,uint32_t v){if(!HeadAllowed(a)){violation=true;++r.st.guardHits;r.Guard(a,v);return;}r.b->wr(a,v);}
+        void wr(uint32_t a,uint32_t v){if(!HeadAllowed(a)){violation=true;++r.st.guardHits;r.Guard(a,v);return;}r.b->wr(a,v);
+            if(a==kRegSuperAck)r.st.openStage=v&7;                       // stage acked
+            if(a==kRegSuperStat&&v==kSuperRelease)r.st.openStage=0;}     // stage released
         void udelay(uint32_t us){const uint64_t end=r.b->nowUs()+us;while(r.b->nowUs()<end)r.b->relax();}
     };
     void Guard(uint32_t a,uint32_t v){Line l;l.raw("{\"nv_head1_guard\":\"");l.hex(a);l.raw("\",\"value\":\"");l.hex(v);l.raw("\"}\n");b->emit(l.t);}
@@ -65,7 +67,10 @@ template<typename B> struct HeadRunner{
         bool expired(uint32_t ms,uint32_t& t){const uint64_t now=r.b->nowUs();if(!t){t=uint32_t(now)|1;return false;}
             r.b->relax();return uint32_t(now)-t>uint64_t(ms)*1000;}
         void udelay(uint32_t us){reg.udelay(us);}
-        void except(uint32_t,uint32_t,uint32_t,uint32_t){}
+        void except(uint32_t chid,uint32_t es,uint32_t d,uint32_t c){ // review N3
+            Line l;l.raw("{\"nv_head1_exc\":1,\"chid\":");l.dec(chid);l.raw(",\"stat\":\"");l.hex(es);l.raw("\",\"data\":\"");l.hex(d);
+            l.raw("\",\"code\":\"");l.hex(c);l.raw("\",\"mthd\":\"");l.hex((es&0xfff)<<2);l.raw("\",\"type\":");l.dec((es>>12)&7);
+            l.raw("}\n");r.b->emit(l.t);}
         void diff(uint32_t m,uint32_t a,uint32_t c){
             Line l;l.raw("{\"nv_head1_diff\":\"");l.hex(m);l.raw("\",\"assy\":\"");l.hex(a);l.raw("\",\"arm\":\"");l.hex(c);
             l.raw("\",\"ours\":");l.dec(r.plan.Rewritten(m)?1:0);l.raw("}\n");r.b->emit(l.t);}
@@ -78,9 +83,10 @@ template<typename B> struct HeadRunner{
             r.st.head0Flagged=true;Line l;l.raw("{\"nv_head1\":\"WARNING\",\"step\":");l.dec(i);l.raw(",\"what\":\"");l.s(s.what);
             l.raw("\",\"got\":\"");l.hex(got);l.raw("\"}\n");r.b->emit(l.t);}
         void note(const char* what,uint32_t v){Line l;l.raw("{\"nv_head1_note\":\"");l.s(what);l.raw("\",\"v\":\"");l.hex(v);l.raw("\"}\n");r.b->emit(l.t);}
-        bool call(uint32_t id){
+        bool call(uint32_t id,uint32_t ms){
             if(id==kCallDpTrain)return r.Train(reg);
-            if(id==kCallSuperFlush||id==kCallSuperFlushVpll){(void)SupervisorFlush(*this,r.cfg,id==kCallSuperFlushVpll,100);return true;}
+            if(id==kCallSuperFlush||id==kCallSuperFlushVpll){
+                (void)SupervisorFlush(*this,r.cfg,id==kCallSuperFlushVpll,ms?ms:100,r.st.openStage);return true;}
             return false;}
         void log(uint32_t i,const Step& s,uint32_t got,bool ok){
             Line l;l.raw("{\"nv_head1_step\":");l.dec(i);l.raw(",\"list\":\"");l.s(tag);l.raw("\",\"ph\":\"");l.s(HPhaseName(r.PhaseOf(i)));
@@ -106,6 +112,7 @@ template<typename B> struct HeadRunner{
             }
         }else Msg("dp","DPCD caps read failed");
         aux.Release();
+        if(tr.spreadNote)Msg("note","0x00ea80 bit4 (source spread) is set but the sink lacks DPCD 0x003 bit0; DPCD 0x107 bit4 left clear");
         Line m;m.raw("{\"nv_head1_dp\":1,\"cr\":");m.dec(tr.cr);m.raw(",\"eq\":");m.dec(tr.eq);m.raw(",\"cr_tries\":");m.dec(tr.crTries);
         m.raw(",\"eq_tries\":");m.dec(tr.eqTries);m.raw(",\"conf\":\"");m.hex(uint32_t(tr.conf[0])|tr.conf[1]<<8|tr.conf[2]<<16|uint32_t(tr.conf[3])<<24);
         m.raw("\",\"lanes\":\"");m.hex(uint32_t(tr.stat[0])|tr.stat[1]<<8|tr.stat[2]<<16);m.raw("\"}\n");b->emit(m.t);
@@ -145,11 +152,18 @@ template<typename B> struct HeadRunner{
         st.preflightOk=Run(plan,0,end,io)==end;
         Msg(st.preflightOk?"preflight":"preflight-failed",st.preflightOk?"ok: head1 enable armed for this boot":"mismatch: nothing armed");
     }
-    void Enable(bool skipStep3,uint32_t stopAt,bool fe){
+    // Named stop points, resolved on the built plan: "rung" = just before the rung kick
+    // (everything up to the strict post-replay diff), "kick" = just before the enable kick.
+    uint32_t NamedStop(uint32_t code)const{
+        const uint32_t put=code==1?pushes.rungEnd:pushes.enableEnd;
+        for(uint32_t i=0;i<plan.count;++i)if(plan.steps[i].op==Op::Kick&&plan.steps[i].value==put)return i>0&&plan.steps[i-1].op==Op::VramWrite?i-1:i;
+        return ~0u;}
+    void Enable(bool skipStep3,uint32_t stopAt,bool fe,uint32_t named=0){
         if(Busy())return;
         if(!st.preflightOk){Msg("refused","run head1 preflight first (this boot)");return;}
         if(!skipStep3&&!b->step3Succeeded()){Msg("refused","a step-3 noop/flip must succeed first this boot (or skip-step3)");return;}
         st.fe=fe;if(!Build())return;
+        if(named)stopAt=NamedStop(named);
         st.cursor=0;st.stopAt=stopAt;st.failAt=~0u;st.preflightOk=false;st.enabled=false;st.head0Flagged=false;
         st.kicked=Kicked::None;++st.runs;
         DpIdle(true); // dp-idle idle-off and link watch suspended for the session
@@ -184,7 +198,7 @@ template<typename B> struct HeadRunner{
             if(ok&&s.op==Op::VramPoll&&st.kicked==Kicked::Rung)st.kicked=Kicked::None; // rung UPDATE completed: nothing to flush
             if(!ok){st.failAt=i;
                 Msg("failed",io.reg.violation?"write outside the head-1 allow-list":"auto-abort");
-                RunAbort(PhaseOf(i),100);return;}
+                RunAbort(PhaseOf(i),2000);return;}
         }
         if(end==plan.count){st.live=false;DpIdle(false);Msg("done","head 1 detached (VPLL1 left running and head-1 raster ARMed until reset); run head1 preflight again before the next enable");}
         else{st.enabled=true;Msg("enabled","head 1 lit on conn2; head1 disable when done");}
@@ -199,7 +213,7 @@ template<typename B> struct HeadRunner{
     void Abort(bool force){
         if(!st.live&&!st.paused&&!force){Msg("refused","nothing live (use abort force)");return;}
         if(!plan.count&&!Build())return;
-        RunAbort(st.live||st.paused?PhaseOf(st.cursor):HPhase::Disable,100);
+        RunAbort(st.live||st.paused?PhaseOf(st.cursor):HPhase::Disable,2000); // manual abort: 2 s flush rounds (review N6)
     }
     void Quiesce(){if(st.live||st.paused)RunAbort(PhaseOf(st.cursor),50);}
     void PrintPlan(){
@@ -222,14 +236,15 @@ template<typename B> struct HeadRunner{
         if(Word(p,"continue")){Continue();return;}
         if(Word(p,"abort")){Abort(Word(p,"force"));return;}
         if(Word(p,"enable")){
-            bool skip=false,fe=false;uint32_t stop=~0u;
+            bool skip=false,fe=false;uint32_t stop=~0u,named=0;
             for(;;){while(*p==' ')++p;if(!*p)break;
                 if(Word(p,"skip-step3"))skip=true;
                 else if(Word(p,"fe"))fe=true;
-                else if(Word(p,"stop")){if(!Num(p,stop)){Msg("usage","stop <step>");return;}}
+                else if(Word(p,"stop")){if(Word(p,"rung"))named=1;else if(Word(p,"kick"))named=2;
+                    else if(!Num(p,stop)){Msg("usage","stop <step>|rung|kick");return;}}
                 else{Msg("usage","unknown argument");return;}}
-            Enable(skip,stop,fe);return;}
-        Msg("usage","nv-disp head1 plan|preflight|enable [skip-step3] [fe] [stop N]|disable|continue|abort [force]|status");
+            Enable(skip,stop,fe,named);return;}
+        Msg("usage","nv-disp head1 plan|preflight|enable [skip-step3] [fe] [stop N|rung|kick]|disable|continue|abort [force]|status");
     }
 };
 } // namespace brook::nvdisp

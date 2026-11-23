@@ -140,8 +140,28 @@ static void TestAbortVerb(){
     assert(g.f.R(kRegInstTarget)==1&&(g.f.R(RegChnCtl(1))&0x6013)==0x01);
     g.r->Command("status");assert(g.b.Count("nv_disp_status")>=1);
 }
+// flip_4_1000: GET stalls inside the 4th flip. Diagnostics run, the restore is kicked and
+// waited for (fetched and latched on ARM) before the abort trashes the channel, so the
+// GOP handle is back on ARM and only then is instmem invalidated.
+static void TestGetStallRestoreLands(){
+    Rig g;g.r->Command("plan flips 4");const uint32_t at=g.r->pushes.end[3]+12;
+    g.f.stallAt=at;g.r->Command("preflight");g.r->Command("flip 4 10");
+    assert(g.r->st.aborts==1&&g.b.Count("\"list\":\"diag\"")>10&&g.b.Count("pushbuffer word in VRAM")==(g.r->pushes.end[4]-g.r->pushes.end[3])/4);
+    assert(g.b.Count("\"list\":\"restore\"")>=5);
+    g.GopState();
+    assert(g.f.R(RegArm(1,c57e::SET_CONTEXT_DMA_NOTIFIER))==0);
+}
+// Same stall, but the channel never moves again: the restore cannot land, ARM still
+// references our ISO handle, so instmem is left valid (no invalidation under a live reference).
+static void TestGetStallRestoreStuck(){
+    Rig g;g.r->Command("plan flips 4");g.f.stallAt=g.r->pushes.end[3]+12;g.f.stallSticky=true;
+    g.r->Command("preflight");g.r->Command("flip 4 10");
+    assert(g.r->st.aborts==1&&g.f.R(RegArm(1,c57e::SET_CONTEXT_DMA_ISO0))==kHandleIsoPitch);
+    assert(g.f.R(kRegInstTarget)==9&&g.f.R(kRegInstAddr)!=0);                 // instmem kept valid
+    assert(g.b.Count("\"op\":\"WRITEIF\"")>=2);
+}
 int main(){
     TestLayout();TestGate();TestNoop();TestObserverPauseAndContinue();TestStopThenQuiesce();
-    TestFlip();TestAutoAbortAtConnect();TestRestoreAttemptOnFlipFailure();TestStageB();TestDumpAndBigFlip();TestAbortVerb();
+    TestFlip();TestAutoAbortAtConnect();TestRestoreAttemptOnFlipFailure();TestStageB();TestDumpAndBigFlip();TestAbortVerb();TestGetStallRestoreLands();TestGetStallRestoreStuck();
     puts("test_nv_disp_runner: ok");return 0;
 }
