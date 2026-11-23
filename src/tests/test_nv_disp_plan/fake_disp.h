@@ -31,6 +31,9 @@ struct Fake{
     uint32_t wndwCur=0;          // HW fetch pointer, bytes
     bool idleOnConnect=true,breakRamht=false;
     uint32_t exceptions=0,flips=0;int failUpdateAt=-1;bool resetOnConnect=true;
+    // GET stall model (flip_4_1000): fetching stops at header offset stallAt; the next PUT
+    // write resumes it (one-shot) unless stallSticky.
+    uint32_t stallAt=~0u;bool stallSticky=false;
     uint32_t& R(uint32_t a){return reg[a];}
     uint8_t* V(uint64_t a){auto& p=pages[a&~0xfffull];if(p.empty())p.assign(4096,0);return p.data()+(a&0xfff);}
     uint32_t vrd(uint64_t a){uint32_t v;memcpy(&v,V(a),4);return v;}
@@ -81,6 +84,8 @@ struct Fake{
         const uint64_t pb=(uint64_t(R(RegPbLo(chid))&~1u)<<8)|(uint64_t(R(RegPbHi(chid)))<<40);
         assert((R(RegPbLo(chid))&3)==1); // VRAM target
         while(wndwCur!=put){
+            if(wndwCur==stallAt){R(RegGet(chid))=wndwCur;if(!stallSticky)stallAt=~0u-1;return;}
+            if(stallAt==~0u-1)stallAt=~0u;
             const uint32_t hdr=vrd(pb+wndwCur);wndwCur+=4;
             if((hdr>>29)==1){wndwCur=hdr&0xffc;continue;}
             assert((hdr>>29)==0);
@@ -91,16 +96,17 @@ struct Fake{
                     if(failUpdateAt>=0&&flips==uint32_t(failUpdateAt)){failUpdateAt=-1;Except(chid,mm);return;} // one-shot
                     uint64_t ib,il,nb,nl;const uint32_t iso=R(RegAssy(chid,c57e::SET_CONTEXT_DMA_ISO0));
                     if(!Lookup(iso,chid,ib,il)){Except(chid,mm);return;}
-                    if(!Lookup(R(RegAssy(chid,c57e::SET_CONTEXT_DMA_NOTIFIER)),chid,nb,nl)){Except(chid,mm);return;}
+                    const uint32_t nh=R(RegAssy(chid,c57e::SET_CONTEXT_DMA_NOTIFIER)); // 0 = no notifier
+                    if(nh&&!Lookup(nh,chid,nb,nl)){Except(chid,mm);return;}
                     const uint64_t off=uint64_t(R(RegAssy(chid,c57e::SET_OFFSET0)))<<8;
                     const uint32_t pitch=(R(RegAssy(chid,c57e::SET_PLANAR_STORAGE0))&0x1fff)<<6;
                     const uint32_t hgt=R(RegAssy(chid,c57e::SET_SIZE))>>16;
                     assert(ib+off+uint64_t(pitch)*hgt-1<=il); // surface within ctxdma limit
                     assert(R(RegAssy(chid,c57e::SET_INTERLOCK_FLAGS))==0); // no core interlock in step 3
                     for(uint32_t x=0x200;x<0x800;x+=4)if(reg.count(RegAssy(chid,x)))R(RegArm(chid,x))=R(RegAssy(chid,x));
-                    const uint32_t ntfy=R(RegAssy(chid,c57e::SET_NOTIFIER_CONTROL))&0xff0;
-                    assert(nb+ntfy+15<=nl);
-                    vwr(nb+ntfy,kNtfyBegun<<kNtfyStatusShift);++flips;
+                    if(nh){const uint32_t ntfy=R(RegAssy(chid,c57e::SET_NOTIFIER_CONTROL))&0xff0;
+                        assert(nb+ntfy+15<=nl);vwr(nb+ntfy,kNtfyBegun<<kNtfyStatusShift);}
+                    ++flips;
                 }
             }
         }

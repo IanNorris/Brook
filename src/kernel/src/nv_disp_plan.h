@@ -171,6 +171,14 @@ constexpr uint16_t kReplayMthds[]={
     0x59c,0x5a0,0x5a4,0x5a8,0x5ac,0x5b0,0x5b4,0x5b8,0x5bc,0x5c0,0x5c4,0x5c8,0x5cc, // CSC11
     0x5d0};                                                     // CLAMP_RANGE
 constexpr uint32_t kReplayCount=sizeof(kReplayMthds)/sizeof(kReplayMthds[0]);
+// Window methods our submissions rewrite; the restore submission puts back the GOP's
+// ARM values for them (read at build time), so after teardown ASSY == the GOP's state and
+// ARM differs only in the interlock flags the restore UPDATE itself needs. Defaults are
+// the values the 058a8cd8/d923ad43 dumps show. 0x240/0x260 are forced to the restore
+// handle and surface 0. 0x370/0x374 go in after the UPDATE (ASSY only): the GOP's
+// core interlock would block a window-only UPDATE.
+constexpr uint16_t kRestoreMthds[]={0x21c,0x220,0x224,0x228,0x22c,0x230,0x240,0x260,0x290,0x298,0x2a4,0x308,0x370,0x374};
+constexpr uint32_t kRestoreCount=sizeof(kRestoreMthds)/sizeof(kRestoreMthds[0]);
 // Live state the GOP left (survey 4d60b483 / 555a7dbd); preflight checks these.
 struct GopState{
     uint32_t instTarget=0x1, instAddr=0;
@@ -198,6 +206,7 @@ struct Config{
     bool replay=true;           // submission 1 replays kReplayMthds with replayVal (ARM values)
     bool dumpAfterConnect=false;// log the whole window ASSY and ARM blocks right after connect
     uint32_t replayVal[kReplayCount]{};
+    uint32_t restoreVal[kRestoreCount]={0,0,0x08700f00,0x10,0xcf,0x100,kHandleGop,0,0,0x08700f00,0x08700f00,0,1,1};
     GopState gop{};
 };
 
@@ -345,6 +354,7 @@ enum class Op:uint8_t{
                 // (rd(low32(vram)) & high32(vram)) (e.g. a supervisor during the rung), else on timeout
     ExpectSoft, // (reg & mask) == value, else io.flag(step, got): a sticky warning, never fails
     ExpectVpll, // VPLL at reg (+4 P|N|M, +0x10 fN<<16) runs at value kHz +- mask with refclk x kHz
+    WriteIf,    // reg = value only if (rd(y) & z) == x; else skipped (got = rd(y), logged as not ok, never fails)
 };
 enum class Blob:uint32_t{Inst,WndwPush,CorePush,SyncInit};
 struct Step{Op op;uint32_t reg,mask,value,timeoutMs;uint64_t vram;const char* what;uint32_t x,y,z;};
@@ -411,6 +421,7 @@ inline void PushReplay(Push& p,const Config& c){
 }
 template<typename Rd> inline void ReadReplay(Config& c,Rd rd){
     for(uint32_t i=0;i<kReplayCount;++i)c.replayVal[i]=rd(RegArm(ChidWndw(c.window),kReplayMthds[i]));
+    for(uint32_t i=0;i<kRestoreCount;++i)c.restoreVal[i]=rd(RegArm(ChidWndw(c.window),kRestoreMthds[i]));
 }
 inline uint32_t BuildFirstFlip(Push& ring,Ring& r,const Config& c){
     Push p;PushWindowNtfy(p,WindowNtfyOffset(c.window,0));
@@ -419,6 +430,26 @@ inline uint32_t BuildFirstFlip(Push& ring,Ring& r,const Config& c){
     return RingAppend(ring,r,p);
 }
 inline uint32_t RestoreHandle(const Config& c){return c.gopHandle?kHandleGop:kHandleIsoPitch;}
+inline uint32_t RestoreVal(const Config& c,uint32_t mthd){
+    if(mthd==c57e::SET_CONTEXT_DMA_ISO0)return RestoreHandle(c);
+    if(mthd==c57e::SET_OFFSET0)return uint32_t(c.surf[0].vram>>8);
+    for(uint32_t i=0;i<kRestoreCount;++i)if(kRestoreMthds[i]==mthd)return c.restoreVal[i];
+    return 0;}
+constexpr uint32_t kNoNtfy=~0u;
+// Restore: the GOP's ARM values for every method we rewrote (notifier off, present
+// control, image state, "DAVE"), a window-only UPDATE, then the GOP's interlock flags
+// (ASSY only). No notifier: completion is checked on ARM.
+inline uint32_t BuildRestore(Push& ring,Ring& r,const Config& c){
+    Push p;
+    for(uint32_t i=0;i<kRestoreCount;){
+        if(kRestoreMthds[i]>=c57e::SET_INTERLOCK_FLAGS){++i;continue;}
+        uint32_t j=i+1;while(j<kRestoreCount&&kRestoreMthds[j]==kRestoreMthds[j-1]+4&&kRestoreMthds[j]<c57e::SET_INTERLOCK_FLAGS)++j;
+        p.Put(PushHeader(kRestoreMthds[i],j-i));for(uint32_t k=i;k<j;++k)p.Put(RestoreVal(c,kRestoreMthds[k]));
+        i=j;}
+    PushWindowUpdate(p,c.window);
+    p.Mthd(c57e::SET_INTERLOCK_FLAGS,RestoreVal(c,c57e::SET_INTERLOCK_FLAGS),RestoreVal(c,c57e::SET_WINDOW_INTERLOCK_FLAGS));
+    return RingAppend(ring,r,p);
+}
 inline void BuildPushes(const Config& c,Pushes& out,uint32_t nflips=1){
     Ring r;if(nflips>kMaxFlips)nflips=kMaxFlips;
     out.count=nflips+2;
@@ -428,7 +459,7 @@ inline void BuildPushes(const Config& c,Pushes& out,uint32_t nflips=1){
         out.end[i]=BuildFlip(out.wndw,r,c,s,i&1);out.ntfy[i]=WindowNtfyOffset(c.window,i&1);
         out.handle[i]=kHandleIsoPitch;out.offset[i]=s.vram;}
     const uint32_t k=nflips+1;
-    out.end[k]=BuildFlip(out.wndw,r,c,c.surf[0],k&1,RestoreHandle(c));out.ntfy[k]=WindowNtfyOffset(c.window,k&1);
+    out.end[k]=BuildRestore(out.wndw,r,c);out.ntfy[k]=kNoNtfy;
     out.handle[k]=RestoreHandle(c);out.offset[k]=c.surf[0].vram;
 }
 
@@ -515,18 +546,52 @@ inline void AddExceptionCheck(Plan& p,uint32_t window){
 }
 inline void AddKickAndWait(Plan& p,const Config& c,uint32_t putBytes,uint32_t handle,uint64_t offset,uint32_t ntfy){
     const uint32_t ch=ChidWndw(c.window);
-    p.Add(Op::VramWrite,0,~0u,kNtfyNotBegun,0,"notifier slot reset NOT_BEGUN",c.syncVram+ntfy);
+    if(ntfy!=kNoNtfy)p.Add(Op::VramWrite,0,~0u,kNtfyNotBegun,0,"notifier slot reset NOT_BEGUN",c.syncVram+ntfy);
     p.Add(Op::Write,kRegBar1Flush,~0u,1,0,"BAR1 write flush (VRAM pushbuffer, N6 142-148)");
     p.Add(Op::Poll,kRegBar1Flush,0x2,0,kTimeoutMs,"flush done");
     p.Add(Op::Kick,RegPut(ch),~0u,putBytes,0,"sfence; PUT = byte offset of push end");
     p.Add(Op::Poll,RegGet(ch),~0u,putBytes,kTimeoutMs,"GET == PUT (methods fetched)");
     AddExceptionCheck(p,c.window);
     p.Add(Op::ExpectNot,RegChnStatus(ch),0xf00,0xb00,0,"UPD_STATE != EXCEPTION (0xb)");
-    p.Add(Op::VramPollAny,0,3u<<kNtfyStatusShift,0,kTimeoutMs,"notifier BEGUN/FINISHED (flip latched)",c.syncVram+ntfy);
+    if(ntfy!=kNoNtfy)p.Add(Op::VramPollAny,0,3u<<kNtfyStatusShift,0,kTimeoutMs,"notifier BEGUN/FINISHED (flip latched)",c.syncVram+ntfy);
     p.Add(Op::Poll,RegArm(ch,c57e::SET_CONTEXT_DMA_ISO0),~0u,handle,kTimeoutMs,"ARM ISO handle");
     p.Add(Op::Poll,RegArm(ch,c57e::SET_OFFSET0),~0u,uint32_t(offset>>8),kTimeoutMs,"ARM SET_OFFSET");
 }
 
+// Instmem back to the GOP values, but only while window ARM references neither of our
+// handles: invalidating instmem under a live reference to our ctxdma is not allowed
+// (review 23 Nov, flip_4_1000). When the restore did not land, instmem stays valid and
+// a log line says so; the VRAM image at instVram is never overwritten by Brook.
+inline void AddInstmemOff(Plan& p,const Config& c,const char* w1,const char* w2){
+    const uint32_t arm=RegArm(ChidWndw(c.window),c57e::SET_CONTEXT_DMA_ISO0);
+    p.Add(Op::WriteIf,kRegInstTarget,~0u,c.gop.instTarget,0,w1,0,RestoreHandle(c),arm,~0u);
+    p.Add(Op::WriteIf,kRegInstAddr,~0u,c.gop.instAddr,0,w2,0,RestoreHandle(c),arm,~0u);
+}
+// GET stall diagnostics (flip_4_1000: GET stopped at 0x380, 32 bytes short of PUT 0x3a0,
+// no exception): snapshot the channel and exception state, then wait 3 s more without
+// kicking (slow vs stuck until the next PUT), then the submission's pushbuffer words as
+// VRAM holds them now (a changed word would show up against the blob).
+inline void AddGetStallDiag(Plan& p,const Config& c,uint32_t from,uint32_t put){
+    const uint32_t ch=ChidWndw(c.window);
+    p.Add(Op::Log,RegGet(ch),0,0,0,"GET at the stall");
+    p.Add(Op::Log,RegChnStatus(ch),0,0,0,"window CHNSTATUS (31 METHOD_EXEC, 19:16 STATE, 11:8 UPD_STATE)");
+    p.Add(Op::Log,RegChnCtl(ch),0,0,0,"window CHNCTL");
+    p.Add(Op::Log,kRegExcWin,0,0,0,"0x61184c window exceptions");
+    p.Add(Op::Log,RegExcept(ch),0,0,0,"exception stat (method (stat&0xfff)<<2, type 14:12)");
+    p.Add(Op::Log,RegExcept(ch)+4,0,0,0,"exception data");
+    p.Add(Op::Log,RegExcept(ch)+8,0,0,0,"exception code");
+    p.Add(Op::Log,kRegExcOther,0,0,0,"0x611854 core exception");
+    p.Add(Op::Log,kRegIntrDispatch,0,0,0,"0x611ec0 dispatch");
+    p.Add(Op::Log,0x611c30,0,0,0,"0x611c30 CTRL_DISP");
+    const uint32_t ms[]={0x21c,0x220,0x240,0x260,0x308,0x370,0x374};
+    for(uint32_t m:ms){
+        p.Add(Op::Log,RegAssy(ch,m),0,0,0,"ASSY (0x21c ntfy, 0x220, 0x240 ISO, 0x260 offset, 0x308 present, 0x370/4 interlock)");
+        p.Add(Op::Log,RegArm(ch,m),0,0,0,"ARM");}
+    p.Add(Op::PollSoft,RegGet(ch),~0u,put,3000,"GET == PUT after 3 s more, no kick (slow vs stuck)");
+    p.Add(Op::Log,RegChnStatus(ch),0,0,0,"window CHNSTATUS after the wait");
+    for(uint32_t off=from&~3u;off<put&&off<kPushBytes;off+=4)
+        p.Add(Op::VramExpect,0,0,0,0,"pushbuffer word in VRAM (got)",c.wndwPushVram+off);
+}
 // The whole step-3 dry run in execution order: preflight, VRAM objects,
 // instmem, (core), window channel, first flip (no visible change), flip to
 // surf[1], restore to the GOP surface, teardown back to the GOP state.
@@ -623,14 +688,18 @@ inline Err BuildPlan(const Config& c,InstImage& img,Pushes& pushes,Plan& p,uint3
     }
     p.Begin(Phase::Restore);
     {const uint32_t k=nflips+1;AddKickAndWait(p,c,pushes.end[k],pushes.handle[k],pushes.offset[k],pushes.ntfy[k]);}
+    p.Add(Op::Expect,RegArm(ch,c57e::SET_CONTEXT_DMA_NOTIFIER),~0u,RestoreVal(c,c57e::SET_CONTEXT_DMA_NOTIFIER),0,"ARM notifier ctxdma = GOP value");
+    p.Add(Op::Expect,RegArm(ch,c57e::SET_PRESENT_CONTROL),~0u,RestoreVal(c,c57e::SET_PRESENT_CONTROL),0,"ARM present control = GOP value");
     p.Begin(Phase::Teardown);
+    // Verify the scanout no longer references our instmem before tearing it down.
+    p.Add(Op::Expect,RegArm(ch,c57e::SET_CONTEXT_DMA_ISO0),~0u,RestoreHandle(c),0,"scanout handle is the GOP's (before teardown)");
+    p.Add(Op::Expect,RegArm(ch,c57e::SET_OFFSET0),~0u,uint32_t(c.surf[0].vram>>8),0,"scanout is the GOP surface (before teardown)");
     AddChannelFini(p,ch,kTimeoutMs);
     AddPbRestore(p,ch,g);
     if(c.coreChannel){AddChannelFini(p,kChidCore,kTimeoutMs);AddPbRestore(p,kChidCore,g);}
     if(c.pauseForObserver)p.Add(Op::Pause,0,0,0,0,"observer: screen unchanged with the window disconnected?");
     if(c.feEnable)p.Add(Op::Write,kRegFeEnable,~0u,g.feEnable,0,"0x610078 = GOP value");
-    p.Add(Op::Write,kRegInstTarget,~0u,g.instTarget,0,"instmem invalid (GOP value) before the address");
-    p.Add(Op::Write,kRegInstAddr,~0u,g.instAddr,0,"instmem addr (GOP value)");
+    AddInstmemOff(p,c,"instmem invalid (GOP value) before the address","instmem addr (GOP value)");
     p.Add(Op::Expect,RegArm(ch,c57e::SET_CONTEXT_DMA_ISO0),~0u,RestoreHandle(c),0,"scanout handle is the GOP's");
     p.Add(Op::Expect,RegArm(ch,c57e::SET_OFFSET0),~0u,uint32_t(c.surf[0].vram>>8),0,"scanout is the GOP surface");
     AddExceptionCheck(p,w);
@@ -663,8 +732,7 @@ inline void BuildAbort(const Config& c,Phase reached,Plan& p,uint32_t ms=100){
         AddChannelFini(p,kChidCore,ms);AddPbRestore(p,kChidCore,c.gop);}
     if(reached>=Phase::Instmem){
         if(c.feEnable)p.Add(Op::Write,kRegFeEnable,~0u,c.gop.feEnable,0,"0x610078 = GOP value");
-        p.Add(Op::Write,kRegInstTarget,~0u,c.gop.instTarget,0,"instmem invalid");
-        p.Add(Op::Write,kRegInstAddr,~0u,c.gop.instAddr,0,"instmem addr 0");
+        AddInstmemOff(p,c,"instmem invalid","instmem addr 0");
     }
     if(reached>=Phase::Vram&&c.praminCheck)p.Add(Op::Write,kRegPraminBase,~0u,c.praminRestore,0,"PRAMIN window restored");
     p.Add(Op::Log,RegArm(ch,c57e::SET_CONTEXT_DMA_ISO0),0,0,0,"final ARM ISO handle (on screen)");
@@ -710,6 +778,7 @@ template<typename Io> uint32_t Run(const Plan& p,uint32_t begin,uint32_t end,Io&
                 if(io.expired(s.timeoutMs,t)){ok=false;break;}}
             break;}
         case Op::ExpectSoft:got=io.rd(s.reg);if((got&s.mask)!=s.value)io.flag(i,s,got);break;
+        case Op::WriteIf:got=io.rd(s.y);if((got&s.z)==s.x)io.wr(s.reg,s.value);else io.flag(i,s,got);break;
         case Op::ExpectVpll:{const uint32_t c=io.rd(s.reg+4),f=io.rd(s.reg+0x10);
             const uint32_t P=(c>>16)&0x3f,N=(c>>8)&0xff,M=c&0xff;const int32_t fN=int16_t(f>>16);
             if(!P||!M){ok=false;got=0;break;}
