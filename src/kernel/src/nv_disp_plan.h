@@ -210,6 +210,7 @@ struct Config{
     // vsync value) the window sits in UPD_STATE WAIT_MPI (0xae050307) for seconds or for
     // ever under the GOP's head, so the next submission and the restore never execute.
     uint32_t presentInterval=0;
+    uint32_t extraWindowChid=0; // also bind sync + ISO for this window channel (head-1 window)
     uint32_t replayVal[kReplayCount]{};
     uint32_t restoreVal[kRestoreCount]={0,0,0x08700f00,0x10,0xcf,0x100,kHandleGop,0,0,0x08700f00,0x08700f00,0,1,1};
     GopState gop{};
@@ -256,6 +257,7 @@ inline Err BuildInstImage(const Config& c,InstImage& img){
     // Window channel: notifier + ISO (+ GOP handle). Core (stage B): notifier only.
     if(!bind(wch,0)||!bind(wch,1)||(c.gopHandle&&!bind(wch,2)))return Err::HashFull;
     if(c.coreChannel&&!bind(kChidCore,0))return Err::HashFull;
+    if(c.extraWindowChid&&(!bind(c.extraWindowChid,0)||!bind(c.extraWindowChid,1)))return Err::HashFull;
     return Err::Ok;
 }
 

@@ -6,7 +6,11 @@
 //   preflight               read-only phase; arms one enable this boot
 //   enable [skip-step3] [stop N]  SOR power, DP train, core UPDATE + supervisors, verify;
 //                           parks "enabled" (head 1 lit, run still live)
-//   disable                 detach, supervisors, DisableLT, core fini (from "enabled")
+//   disable                 detach, supervisors, DisableLT, core fini (from "enabled");
+//                           hides a shown window first
+//   show / hide             content on head 1 (from "enabled"): window 2 channel, a fresh
+//                           surface (blue + white bar) / window off and channel restored
+//   unblank                 separate SET_GET_BLANKING_CTRL(1) UNBLANK + UPDATE
 //   continue                resume after a stop point
 //   abort [force]           the head abort list (supervisor flush, detach, DisableLT, core fini)
 //   status
@@ -21,7 +25,7 @@
 namespace brook::nvdisp {
 
 struct HeadState{
-    bool preflightOk=false,live=false,enabled=false,paused=false,hooked=false,head0Flagged=false,fe=false,dpIdleHeld=false;uint32_t softWarnings=0;
+    bool preflightOk=false,live=false,enabled=false,paused=false,hooked=false,head0Flagged=false,fe=false,dpIdleHeld=false,windowLive=false;uint32_t softWarnings=0;
     Kicked kicked=Kicked::None;uint32_t openStage=0; // a supervisor stage acked by the plan and not yet released
     uint32_t cursor=0,stopAt=~0u,failAt=~0u,runs=0,aborts=0,guardHits=0;
 };
@@ -31,7 +35,7 @@ struct HeadState{
 template<typename B> struct HeadRunner{
     B* b=nullptr;
     HeadConfig cfg{};DpOut dpout{};Vbios vb{};uint32_t auxCh=4;bool resolved=false;
-    InstImage img{};HeadPushes pushes{};Plan plan{},abort{};HeadState st{};DpTrainResult tr{};
+    InstImage img{};HeadPushes pushes{};Plan plan{},abort{};HeadState st{};DpTrainResult tr{};HeadWindow win{};
 
     struct Line{char t[320];uint32_t n=0;
         void s(const char* x){while(*x&&n+2<sizeof(t)){char ch=*x++;t[n++]=ch=='"'||ch=='\\'?'\'':ch;}t[n]=0;}
@@ -60,9 +64,10 @@ template<typename B> struct HeadRunner{
         uint32_t blob(Blob k,uint32_t off){
             if(k==Blob::Inst)return r.img.words[off/4];
             if(k==Blob::CorePush)return off/4<r.pushes.core.count?r.pushes.core.words[off/4]:0;
+            if(k==Blob::WndwPush)return off/4<r.win.ring.count?r.win.ring.words[off/4]:0;
             return 0;}
         void vcopy(uint64_t v,Blob k,uint32_t bytes){for(uint32_t i=0;i<bytes;i+=4)r.b->vwr(v+i,blob(k,i));}
-        void fill(uint64_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t){}
+        void fill(uint64_t v,uint32_t bytes,uint32_t pitch,uint32_t c,uint32_t m,uint32_t lines){r.b->fill(v,bytes,pitch,c,m,lines);}
         void fence(){__atomic_thread_fence(__ATOMIC_SEQ_CST);r.b->fence();}
         bool expired(uint32_t ms,uint32_t& t){const uint64_t now=r.b->nowUs();if(!t){t=uint32_t(now)|1;return false;}
             uint32_t el=uint32_t(now)-t;if(el>0x80000000u)el=0;  // t|1 may be 1 us ahead (step-3 runner note)
@@ -141,7 +146,7 @@ template<typename B> struct HeadRunner{
     static bool ReadOnly(Op o){return o==Op::Expect||o==Op::ExpectNot||o==Op::Log||o==Op::AssyArmDiff||o==Op::ExpectVpll||o==Op::ExpectSoft;}
     void Status(){
         Line l;l.raw("{\"nv_head1_status\":1,\"preflight_ok\":");l.dec(st.preflightOk);l.raw(",\"live\":");l.dec(st.live);
-        l.raw(",\"enabled\":");l.dec(st.enabled);l.raw(",\"soft_warnings\":");l.dec(st.softWarnings);l.raw(",\"paused\":");l.dec(st.paused);l.raw(",\"cursor\":");l.dec(st.cursor);
+        l.raw(",\"enabled\":");l.dec(st.enabled);l.raw(",\"soft_warnings\":");l.dec(st.softWarnings);l.raw(",\"window\":");l.dec(st.windowLive);l.raw(",\"paused\":");l.dec(st.paused);l.raw(",\"cursor\":");l.dec(st.cursor);
         l.raw(",\"runs\":");l.dec(st.runs);l.raw(",\"aborts\":");l.dec(st.aborts);l.raw(",\"guard_hits\":");l.dec(st.guardHits);
         l.raw(",\"vpll\":\"");l.hex((cfg.vpll.P<<16)|(cfg.vpll.N<<8)|cfg.vpll.M);l.raw("\",\"fN\":\"");l.hex(cfg.vpll.fN);
         l.raw("\",\"watermark\":");l.dec(cfg.sf.watermark);l.raw("}\n");b->emit(l.t);
@@ -175,6 +180,7 @@ template<typename B> struct HeadRunner{
     }
     void Disable(){
         if(!st.enabled){Msg("refused","head 1 is not enabled");return;}
+        if(st.windowLive&&!Hide())return;                // window off before the core drops its owner
         st.enabled=false;RunTo(plan.count,true);
     }
     void Continue(){
@@ -225,7 +231,40 @@ template<typename B> struct HeadRunner{
         if(!ok){Msg("failed","unblank: auto-abort");RunAbort(HPhase::Disable,2000);return;}
         Msg("unblanked","head 1 UNBLANK pushed; head1 disable when done");Status();
     }
+    // Content on head 1 through window 2 (owned by head 1 since the enable UPDATE).
+    void Show(){
+        if(!st.enabled||!st.live){Msg("refused","head 1 is not enabled");return;}
+        if(st.windowLive){Msg("refused","a window is already shown on head 1");return;}
+        const uint32_t ch=ChidWndw(cfg.window);
+        win.initCtl=b->rd(RegChnCtl(ch));
+        win.initPb[0]=b->rd(RegPbLo(ch));win.initPb[1]=b->rd(RegPbHi(ch));win.initPb[2]=b->rd(RegPbValid(ch));win.initPb[3]=b->rd(RegPbClient(ch));
+        win.win0Iso=b->rd(RegArm(ChidWndw(0),c57e::SET_CONTEXT_DMA_ISO0));
+        for(uint32_t i=0;i<kReplayCount;++i)win.replayVal[i]=b->rd(RegArm(ChidWndw(0),kReplayMthds[i])); // GOP's working window state
+        BuildHeadWindowPushes(cfg,win);
+        if(win.ring.overflow){Msg("error","window push overflow");return;}
+        abort=Plan{};BuildHeadWindowShow(cfg,win,abort);
+        st.windowLive=true;                              // from here on aborts include the window
+        Io io{*this,"show"};const uint32_t at=Run(abort,0,abort.count,io);
+        if(at!=abort.count||io.reg.violation){
+            Msg("failed",io.reg.violation?"write outside the head-1 allow-list":"show: window abort (head 1 stays enabled)");
+            WindowAbort(2000);return;}
+        Msg("shown","head-1 surface on conn2 (blue, white bar at the top); head1 hide or head1 disable when done");Status();
+    }
+    bool Hide(){
+        if(!st.windowLive){Msg("refused","no window shown on head 1");return false;}
+        abort=Plan{};BuildHeadWindowHide(cfg,win,abort);
+        Io io{*this,"hide"};const uint32_t at=Run(abort,0,abort.count,io);
+        if(at!=abort.count||io.reg.violation){Msg("failed","hide: window abort");WindowAbort(2000);return st.windowLive==false;}
+        st.windowLive=false;Msg("hidden","window 2 off, channel restored; head 1 still enabled");Status();return true;
+    }
+    void WindowAbort(uint32_t ms){
+        if(!st.windowLive)return;
+        abort=Plan{};BuildHeadWindowAbort(cfg,win,abort,ms);
+        Io io{*this,"window-abort"};(void)Run(abort,0,abort.count,io,true);
+        st.windowLive=false;
+    }
     void RunAbort(HPhase reached,uint32_t ms){
+        WindowAbort(ms);                                 // window first: it scans out through head 1
         abort=Plan{};BuildHeadAbort(cfg,reached,pushes,abort,ms,st.kicked);
         Io io{*this,"abort"};(void)Run(abort,0,abort.count,io,true);
         st.live=st.enabled=st.paused=st.preflightOk=false;++st.aborts;DpIdle(false);
@@ -255,6 +294,8 @@ template<typename B> struct HeadRunner{
         if(Word(p,"preflight")){Preflight();return;}
         if(Word(p,"disable")){Disable();return;}
         if(Word(p,"unblank")){Unblank();return;}
+        if(Word(p,"show")){Show();return;}
+        if(Word(p,"hide")){(void)Hide();return;}
         if(Word(p,"continue")){Continue();return;}
         if(Word(p,"abort")){Abort(Word(p,"force"));return;}
         if(Word(p,"enable")){
@@ -266,7 +307,7 @@ template<typename B> struct HeadRunner{
                     else if(!Num(p,stop)){Msg("usage","stop <step>|rung|kick");return;}}
                 else{Msg("usage","unknown argument");return;}}
             Enable(skip,stop,fe,named);return;}
-        Msg("usage","nv-disp head1 plan|preflight|enable [skip-step3] [fe] [stop N|rung|kick]|unblank|disable|continue|abort [force]|status");
+        Msg("usage","nv-disp head1 plan|preflight|enable [skip-step3] [fe] [stop N|rung|kick]|disable|show|hide|unblank|continue|abort [force]|status");
     }
 };
 } // namespace brook::nvdisp

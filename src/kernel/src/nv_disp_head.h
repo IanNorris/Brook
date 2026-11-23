@@ -573,11 +573,14 @@ constexpr Range kHeadAllow[]={
     {0x00ef40,0x00ef60},{0x612a00,0x612a04},{0x616d40,0x616d44},{0x616d50,0x616d54},{0x616d68,0x616d70}, // head 1
     {0x612508,0x61250c},{0x612588,0x61258c},{0x613300,0x613304},{0x61d000,0x61d800}, // SOR2, macro 2
     {0x00da70,0x00dac0},                                                           // AUX ch 4 (0xd930 + 4*0x50)
+    // head-1 window (window 2 = chid 3; window 0 = chid 1 stays out): CHNCTL, pushbuffer,
+    // PUT, exception stat/ack, 0x61184c (W1C of bit 2 only, by AckException's mask)
+    {0x6104ec,0x6104f0},{0x610b50,0x610b60},{0x692000,0x692004},{0x611044,0x611050},{0x61184c,0x611850},
 };
 inline bool HeadAllowed(uint32_t a){for(const auto& r:kHeadAllow)if(a>=r.lo&&a<r.hi)return true;return false;}
 
 inline Err BuildHeadPlan(HeadConfig c,InstImage& img,HeadPushes& pushes,Plan& p){
-    c.base.coreChannel=true;
+    c.base.coreChannel=true;c.base.extraWindowChid=ChidWndw(c.window); // head-1 window: sync + ISO bound up front
     if(c.head==0||c.head>3||c.sor>3||c.window>7||c.dp.nr<1||c.dp.nr>4)return Err::Bounds;
     if(Err e=Validate(c.base);e!=Err::Ok)return e;
     if(Err e=BuildInstImage(c.base,img);e!=Err::Ok)return e;
@@ -710,6 +713,104 @@ inline Err BuildHeadPlan(HeadConfig c,InstImage& img,HeadPushes& pushes,Plan& p)
     p.Add(Op::Expect,RegArm(kChidCore,c57d::HeadRasterSize(0)),~0u,g.headRaster,0,"head 0 still the GOP mode");
     p.EndN(uint32_t(HPhase::Count));
     return p.overflow?Err::TooManyOps:Err::Ok;
+}
+// ---- Content on head 1 (`head1 show` / `hide`): window 2 (owned by head 1 since the
+// enable UPDATE) gets its own channel (chid 3), pushbuffer and a fresh surface. Reuses the
+// step-3 window machinery: notifier, window-0's ARM state replayed (the GOP's working
+// CSC / composition values), full image state, window-only UPDATE (interval 0).
+constexpr uint32_t kHeadWindowPushOff=0x13000;               // from instVram (after the sync page)
+constexpr uint32_t kHeadFill=0xff1060a0,kHeadMarker=0xffffffff,kHeadMarkerLines=216; // blue, white bar
+struct HeadWindow{Push ring;uint32_t showEnd=0,hideEnd=0;Surface surf{};uint64_t pushVram=0;
+    uint32_t replayVal[kReplayCount]{};uint32_t initCtl=0,initPb[4]{};uint32_t win0Iso=0;};
+inline Surface HeadSurface(const HeadConfig& c){
+    const Surface& b=c.base.surf[1];const uint64_t bytes=uint64_t(b.pitch)*b.height,two=2ull<<20;
+    return Surface{b.vram+((bytes+two-1)&~(two-1)),b.width,b.height,b.pitch,b.format};}
+inline void BuildHeadWindowPushes(const HeadConfig& c,HeadWindow& w){
+    w.ring=Push{};w.surf=HeadSurface(c);w.pushVram=c.base.instVram+kHeadWindowPushOff;
+    Push& p=w.ring;
+    PushWindowNtfy(p,WindowNtfyOffset(c.window,0));
+    for(uint32_t i=0;i<kReplayCount;){
+        uint32_t j=i+1;while(j<kReplayCount&&kReplayMthds[j]==kReplayMthds[j-1]+4)++j;
+        p.Put(PushHeader(kReplayMthds[i],j-i));
+        for(uint32_t k=i;k<j;++k)p.Put(kReplayMthds[k]==0x218?0u:w.replayVal[k]); // semaphore ctxdma: none
+        i=j;}
+    PushWindowImage(p,w.surf,kHandleIsoPitch,0);PushWindowUpdate(p,c.window);
+    w.showEnd=p.count*4;
+    PushWindowNtfy(p,WindowNtfyOffset(c.window,1));
+    p.Mthd(c57e::SET_PRESENT_CONTROL,0u);p.Mthd(c57e::SET_CONTEXT_DMA_ISO0,0u); // wndwc37e_image_clr
+    PushWindowUpdate(p,c.window);
+    w.hideEnd=p.count*4;
+}
+inline void AddHeadWindowPbRestore(Plan& p,uint32_t ch,const HeadWindow& w){
+    p.Add(Op::Write,RegPbLo(ch),~0u,w.initPb[0],0,"window pushbuffer lo = value before show");
+    p.Add(Op::Write,RegPbHi(ch),~0u,w.initPb[1],0,"window pushbuffer hi = value before show");
+    p.Add(Op::Write,RegPbValid(ch),~0u,w.initPb[2],0,"window pushbuffer valid = value before show");
+    p.Add(Op::Write,RegPbClient(ch),~0u,w.initPb[3],0,"window pushbuffer client = value before show");
+}
+inline void AddHeadWindowGuards(Plan& p,const HeadConfig& c,const HeadWindow& w){
+    const auto& g=c.base.gop;
+    p.Add(Op::Expect,RegArm(kChidCore,c57d::HeadRasterSize(0)),~0u,g.headRaster,0,"head 0 raster unchanged");
+    p.Add(Op::Expect,RegArm(kChidCore,c57d::WindowSetControl(0)),0xf,0,0,"window 0 still owned by head 0");
+    p.Add(Op::Expect,RegArm(ChidWndw(0),c57e::SET_CONTEXT_DMA_ISO0),~0u,w.win0Iso,0,"window 0 ARM ISO unchanged");
+}
+inline void BuildHeadWindowShow(const HeadConfig& c,const HeadWindow& w,Plan& p){
+    const uint32_t ch=ChidWndw(c.window),h=c.head;
+    p.BeginN(0);
+    p.Add(Op::Expect,RegArm(kChidCore,c57d::WindowSetControl(c.window)),0xf,h,0,"window owned by head 1 (enable UPDATE)");
+    p.Add(Op::Expect,RegChnCtl(ch),kCtlConnect|kCtlPutptrWrite,0,0,"window channel not connected");
+    p.Add(Op::ExpectOr,RegChnStatus(ch),kWinStateMask,0,0,"window STATE DEALLOC (0) or UNCONNECTED (1)",0,kWinUnconnected);
+    p.Add(Op::Expect,kRegExcWin,1u<<c.window,0,0,"no window exception latched");
+    AddHeadWindowGuards(p,c,w);
+    p.Add(Op::SurfFill,0,w.surf.pitch,uint32_t(uint64_t(w.surf.pitch)*w.surf.height),0,"head-1 surface: blue + white bar (BAR1)",w.surf.vram,
+          kHeadFill,kHeadMarker,kHeadMarkerLines);
+    p.Add(Op::VramCopy,uint32_t(Blob::WndwPush),kPushBytes,0,0,"head-1 window pushbuffer",w.pushVram);
+    p.Add(Op::VramWrite,0,~0u,kNtfyNotBegun,0,"window notifier NOT_BEGUN",c.base.syncVram+WindowNtfyOffset(c.window,0));
+    p.Add(Op::Fence,0,0,0,0,"sfence");
+    p.Add(Op::Write,kRegBar1Flush,~0u,1,0,"BAR1 write flush");
+    p.Add(Op::Poll,kRegBar1Flush,0x2,0,kTimeoutMs,"flush done");
+    p.Add(Op::VramExpect,0,~0u,w.ring.words[0],0,"pushbuffer first word visible",w.pushVram);
+    p.Add(Op::VramExpect,0,~0u,w.ring.words[w.showEnd/4-1],0,"pushbuffer last word visible",w.pushVram+w.showEnd-4);
+    AddChannelInit(p,ch,w.pushVram);
+    p.Add(Op::Kick,RegPut(ch),~0u,w.showEnd,0,"window PUT: replay + image + UPDATE");
+    p.Add(Op::Poll,RegGet(ch),~0u,w.showEnd,kTimeoutMs,"window GET == PUT");
+    p.Add(Op::Expect,kRegExcWin,1u<<c.window,0,0,"no window exception");
+    p.Add(Op::VramPollAny,0,3u<<kNtfyStatusShift,0,kTimeoutMs,"window notifier BEGUN",c.base.syncVram+WindowNtfyOffset(c.window,0));
+    p.Add(Op::Poll,RegArm(ch,c57e::SET_CONTEXT_DMA_ISO0),~0u,kHandleIsoPitch,kTimeoutMs,"window ARM ISO = ours");
+    p.Add(Op::Poll,RegArm(ch,c57e::SET_OFFSET0),~0u,uint32_t(w.surf.vram>>8),kTimeoutMs,"window ARM offset = head-1 surface");
+    p.Add(Op::Poll,RegChnStatus(ch),kWinMethodExecBusy|0xf00,0x100,kTimeoutMs,"window METHOD_EXEC idle, UPD_STATE IDLE");
+    AddHeadWindowGuards(p,c,w);
+    p.EndN(1);
+}
+inline void BuildHeadWindowHide(const HeadConfig& c,const HeadWindow& w,Plan& p){
+    const uint32_t ch=ChidWndw(c.window);
+    p.BeginN(0);
+    p.Add(Op::VramWrite,0,~0u,kNtfyNotBegun,0,"window notifier NOT_BEGUN",c.base.syncVram+WindowNtfyOffset(c.window,1));
+    p.Add(Op::Kick,RegPut(ch),~0u,w.hideEnd,0,"window PUT: ISO 0 + UPDATE (wndwc37e_image_clr)");
+    p.Add(Op::Poll,RegGet(ch),~0u,w.hideEnd,kTimeoutMs,"window GET == PUT");
+    p.Add(Op::Poll,RegArm(ch,c57e::SET_CONTEXT_DMA_ISO0),~0u,0,kTimeoutMs,"window ARM ISO = 0 (window off)");
+    p.Add(Op::Poll,RegChnStatus(ch),kWinMethodExecBusy|0xf00,0x100,kTimeoutMs,"window METHOD_EXEC idle, UPD_STATE IDLE");
+    AddChannelFini(p,ch,kTimeoutMs);
+    AddHeadWindowPbRestore(p,ch,w);
+    p.Add(Op::Write,RegChnCtl(ch),~0u,w.initCtl,0,"window CHNCTL = value before show");
+    AddHeadWindowGuards(p,c,w);
+    p.EndN(1);
+}
+// Best effort, from any partial state: try the hide UPDATE, then trash-and-abort like the
+// step-3 abort (RM kdispSetChannelTrashAndAbortAccel), disconnect, restore.
+inline void BuildHeadWindowAbort(const HeadConfig& c,const HeadWindow& w,Plan& p,uint32_t ms){
+    const uint32_t ch=ChidWndw(c.window);
+    p.BeginN(0);
+    p.Add(Op::Kick,RegPut(ch),~0u,w.hideEnd,0,"window PUT: hide (best effort)");
+    p.Add(Op::PollSoft,RegArm(ch,c57e::SET_CONTEXT_DMA_ISO0),~0u,0,ms,"window ARM ISO = 0");
+    p.Add(Op::Mask,RegChnCtl(ch),kCtlTrashAbort,kCtlTrashAbort,0,"TRASH_AND_ABORT pending methods");
+    p.Add(Op::AckException,ch,1u<<c.window,0,0,"log + W1C 0x61184c + ack 0x90000000");
+    p.Add(Op::PollSoft,RegChnStatus(ch),kWinMethodExecBusy,0,ms,"METHOD_EXEC idle");
+    AddChannelFini(p,ch,ms,false);
+    p.Add(Op::Mask,RegChnCtl(ch),kCtlTrashAbort,0,0,"TRASH_MODE off");
+    AddHeadWindowPbRestore(p,ch,w);
+    p.Add(Op::Write,RegChnCtl(ch),~0u,w.initCtl,0,"window CHNCTL = value before show");
+    p.Add(Op::Log,RegArm(ch,c57e::SET_CONTEXT_DMA_ISO0),0,0,0,"final window ARM ISO");
+    p.EndN(1);
 }
 // Which core UPDATEs had been kicked when a run stopped (review issue 2).
 enum class Kicked:uint8_t{None,Replay,Rung,Enable,Disable};

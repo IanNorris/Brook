@@ -235,6 +235,26 @@ struct Core{
         }
         if(!stage)R(RegGet(0))=put;
     }
+    // ---- window 2 channel (chid 3), for head1 show/hide
+    uint32_t wcur=0,wupdates=0;bool wexcept=false;
+    void ExecuteW(uint32_t put){
+        const uint64_t pb=(uint64_t(R(RegPbLo(3))&~1u)<<8);
+        while(wcur!=put){
+            const uint32_t hdr=vrd(pb+wcur);wcur+=4;
+            if((hdr>>29)==1){wcur=hdr&0xffc;continue;}
+            const uint32_t n=(hdr>>18)&0x3ff,m=hdr&0x3ffc;
+            for(uint32_t i=0;i<n;++i){const uint32_t d=vrd(pb+wcur);wcur+=4;const uint32_t mm=m+i*4;R(RegAssy(3,mm))=d;
+                if(mm==c57e::UPDATE){
+                    uint64_t b;const uint32_t iso=R(RegAssy(3,c57e::SET_CONTEXT_DMA_ISO0));
+                    if(wexcept||(iso&&!Lookup(iso,3,b))||!Lookup(R(RegAssy(3,c57e::SET_CONTEXT_DMA_NOTIFIER)),3,b)){
+                        R(kRegExcWin)|=4;R(RegExcept(3))=0x80000000|(mm>>2);R(RegGet(3))=wcur;return;}
+                    assert(R(0x689100)==1);                                 // window 2 owned by head 1
+                    for(uint32_t x=0x200;x<0x800;x+=4)if(reg.count(RegAssy(3,x)))R(RegArm(3,x))=R(RegAssy(3,x));
+                    vwr(b+(R(RegAssy(3,c57e::SET_NOTIFIER_CONTROL))&0xff0),kNtfyBegun<<kNtfyStatusShift);++wupdates;}
+            }
+        }
+        R(RegGet(3))=put;
+    }
     // ---- AUX controller model (auxgm200 register layout), channel 4 only
     uint32_t auxDefers=0,auxNack=0,auxXfers=0;bool auxSink=true;
     static constexpr uint32_t kAux=0xd950+4*0x50;
@@ -278,6 +298,14 @@ struct Core{
                 if(resetOnConnect){R(0x682068)=0;R(0x680320)=0x100;R(0x681004)=0;R(0x682404)=0x123;R(0x682074)=0;}} // connect resets core ASSY
             return;}
         if(a==RegPut(0)&&(R(RegChnCtl(0))&kCtlRunning)==kCtlRunning){R(a)=v;Execute(v);return;}
+        if(a==RegChnCtl(3)){const uint32_t old=R(a);R(a)=v;
+            if((v&kCtlRunning)==kCtlRunning&&!(old&kCtlConnect)){assert(R(RegPbClient(3))==kClientId&&(R(kRegInstTarget)&8));
+                R(RegChnStatus(3))=0x04040100;R(RegGet(3))=0;wcur=0;}
+            if(!(v&kCtlConnect)&&(old&kCtlConnect))R(RegChnStatus(3))=0x01010100;
+            return;}
+        if(a==RegPut(3)&&(R(RegChnCtl(3))&kCtlRunning)==kCtlRunning&&!(R(RegChnCtl(3))&kCtlTrashAbort)){R(a)=v;ExecuteW(v);return;}
+        if(a==kRegExcWin){R(a)&=~v;return;}
+        if(a==RegExcept(3)&&v==kExceptAck){R(a)=0;return;}
         if(a==kRegSuperAck){R(kRegCtrlDisp)&=~v;evt&=~v;openStage=v&7;return;}
         if(a==kRegExcOther){R(a)&=~v;return;}
         if(a==0x611020&&v==kExceptAck){R(a)=0;return;}
@@ -546,6 +574,32 @@ static void TestHeadRunner(){
      assert(g.c.vrd(g.r->cfg.base.corePushVram+kReplaySkipWord*4)!=PushJump(g.r->pushes.replayEnd));
      g.r->Command("disable");assert(!g.r->st.live&&g.r->st.aborts==0);}
     {HRig g;g.r->Command("unblank");assert(g.b.Count("head 1 is not enabled")==1&&g.c.written.empty());}
+    // head1 show / hide: window 2 on head 1 with a fresh surface; window 0 / head 0 untouched.
+    {HRig g;g.r->Command("show");assert(g.b.Count("head 1 is not enabled")==1&&g.c.written.empty());
+     g.r->Command("preflight");g.r->Command("enable skip-step3");assert(g.r->st.enabled);
+     const uint32_t win0=g.c.R(RegArm(1,c57e::SET_CONTEXT_DMA_ISO0));
+     g.r->Command("show");
+     const Surface hs=HeadSurface(g.r->cfg);
+     assert(g.b.Count("\"nv_head1\":\"shown\"")==1&&g.r->st.windowLive&&g.c.wupdates==1&&g.r->st.guardHits==0);
+     assert(g.c.R(RegArm(3,c57e::SET_CONTEXT_DMA_ISO0))==kHandleIsoPitch&&g.c.R(RegArm(3,c57e::SET_OFFSET0))==uint32_t(hs.vram>>8));
+     assert(hs.vram>=g.r->cfg.base.surf[1].vram+uint64_t(hs.pitch)*hs.height&&hs.vram+uint64_t(hs.pitch)*hs.height<=g.r->cfg.base.instVram);
+     assert(g.c.R(RegArm(1,c57e::SET_CONTEXT_DMA_ISO0))==win0&&g.c.R(0x689000)==0);
+     for(uint32_t a:g.c.written)assert(!(a>=0x690000&&a<0x691000)&&a!=RegChnCtl(1)&&!(a>=0x610b30&&a<0x610b40)); // window 0 untouched
+     g.r->Command("show");assert(g.b.Count("already shown")==1);
+     g.r->Command("hide");
+     assert(!g.r->st.windowLive&&g.c.R(RegArm(3,c57e::SET_CONTEXT_DMA_ISO0))==0&&g.c.R(RegChnCtl(3))==0&&g.c.R(RegPbLo(3))==0);
+     g.r->Command("show");assert(g.r->st.windowLive);
+     g.r->Command("disable");                                                     // hides the window first
+     assert(!g.r->st.windowLive&&!g.r->st.live&&g.r->st.aborts==0&&g.c.R(RegArm(3,c57e::SET_CONTEXT_DMA_ISO0))==0);
+     assert(g.c.R(RegChnCtl(3))==0&&(g.c.R(0x688340)&0xff)==0&&g.r->st.guardHits==0);}
+    {HRig g;g.r->Command("preflight");g.r->Command("enable skip-step3");g.r->Command("show");
+     g.r->Command("abort");                                                       // window abort, then the head abort
+     assert(!g.r->st.windowLive&&!g.r->st.live&&g.c.R(RegChnCtl(3))==0&&(g.c.R(RegChnCtl(0))&0x13)==0x01&&g.c.R(kRegInstTarget)==1);}
+    {HRig g;g.r->Command("preflight");g.r->Command("enable skip-step3");g.r->Command("show");
+     g.r->Quiesce();assert(!g.r->st.windowLive&&!g.r->st.live&&g.c.R(RegChnCtl(3))==0);}
+    {HRig g;g.r->Command("preflight");g.r->Command("enable skip-step3");g.c.wexcept=true;g.r->Command("show"); // exception on the UPDATE
+     assert(g.b.Count("show: window abort")==1&&!g.r->st.windowLive&&g.r->st.enabled&&g.c.R(RegChnCtl(3))==0&&(g.c.R(kRegExcWin)&4)==0);
+     g.r->Command("disable");assert(!g.r->st.live&&g.r->st.aborts==0);}
     {HRig g;g.r->Command("preflight");g.r->Command("enable skip-step3");assert(g.r->st.enabled);
      g.r->Quiesce();                                                                  // reset while lit
      assert(!g.r->st.live&&g.r->st.aborts==1&&(g.c.R(0x688340)&0xff)==0&&(g.c.R(kRegCtrlDisp)&7)==0);
