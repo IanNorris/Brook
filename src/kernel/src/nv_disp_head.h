@@ -393,16 +393,15 @@ constexpr uint16_t kCoreHeadMthds[]={ // clc57d.h HEAD_SET_* offsets for head 0 
     0x314,0x318,0x31c,0x320,0x324,0x328,0x32c,0x330,0x334,0x338,0x33c,0x340,0x344,0x348,0x34c,0x350,0x354,0x358,
     0x35c,0x360};
 constexpr uint32_t kCoreHeadCount=sizeof(kCoreHeadMthds)/sizeof(kCoreHeadMthds[0]);
-// Globals: interlock flags, plus SET_GET_BLANKING_CTRL(0..3) (0x240-0x24c; BLANK 0:0,
-// UNBLANK 1:1, 0 = NO_CHANGE). Live 35265134: the GOP leaves them pending in ASSY as
-// 2/1/1/1 (unblank head 0, blank heads 1-3) with ARM 0, on a fresh boot too. No driver
-// pushes them (nouveau, nvkms). Promoting them on our first UPDATE could blank head 1
-// (and touch head 0), so the replay writes the ARM value (NO_CHANGE) into ASSY. If they are
-// status read-backs instead, the strict post-replay diff fails before any UPDATE.
-constexpr uint32_t kCoreGlobCount=7;
+// Globals: interlock flags. Not SET_GET_BLANKING_CTRL(0..3) (0x240-0x24c): live bc9cbf9e,
+// replaying ARM's 0 left ASSY at 2/1/1/1, i.e. ASSY reads back the current blanking
+// state (head 0 unblanked, heads 1-3 blanked), not a pending request. They are skipped
+// by the diffs like GET_RG_SCAN_LINE and only logged; `unblank` pushes UNBLANK for the
+// new head in the enable UPDATE (opt-in: neither nouveau nor nvkms use the method).
+constexpr uint32_t kCoreGlobCount=3;
 constexpr uint32_t kCoreReplayCount=kCoreGlobCount+4*4+8*5+4*kCoreHeadCount;
 inline uint32_t CoreReplayMthd(uint32_t i){
-    static constexpr uint16_t glob[kCoreGlobCount]={0x210,0x218,0x21c,0x240,0x244,0x248,0x24c};
+    static constexpr uint16_t glob[kCoreGlobCount]={0x210,0x218,0x21c};
     if(i<kCoreGlobCount)return glob[i];i-=kCoreGlobCount;
     if(i<16)return 0x300+(i/4)*0x20+(i%4)*4;i-=16;
     if(i<40)return 0x1000+(i/5)*0x80+(i%5)*4;i-=40;
@@ -424,6 +423,7 @@ struct HeadConfig{
     int32_t watermarkOverride=0x15;// GOP's head-0 DP watermark for the identical mode/link (0x616550 = 0x08000015);
                                    // nouveau's formula gives 18 ("close to vbios numbers, but not right", nv50.c 1252). -1 = formula
     bool pauseAfterModeset=true;
+    bool unblank=false;            // enable UPDATE also pushes SET_GET_BLANKING_CTRL(head) = UNBLANK (opt-in)
     uint32_t coreReplayVal[kCoreReplayCount]{}; // ARM values of CoreReplayMthd(i), read when the plan is built
 };
 template<typename Rd> inline void ReadCoreReplay(HeadConfig& c,Rd rd){
@@ -450,6 +450,7 @@ inline void BuildHeadPushes(const HeadConfig& c,HeadPushes& out){
     p.Mthd(c57d::WindowSetControl(c.window),c.head);                 // window -> head
     p.Mthd(c57d::WindowFormatUsage(c.window),c.windowFmtUsage,0u);
     p.Mthd(c57d::WindowUsage(c.window),c.windowUsage);
+    if(c.unblank)p.Mthd(0x240+c.head*4,0x2u);                         // SET_GET_BLANKING_CTRL(head) UNBLANK
     PushCoreUpdate(p,0,0,true);                                       // corec37d_update, notifier at 0
     out.enableEnd=p.count*4;
     p.Mthd(c57d::SorSetControl(c.sor),0u);                           // detach OR
@@ -667,6 +668,7 @@ inline Err BuildHeadPlan(HeadConfig c,InstImage& img,HeadPushes& pushes,Plan& p)
     p.Add(Op::Expect,kRegExcOther,1,0,0,"no core exception");
     {const uint32_t regs[]={0x612a00u,0x613300u,0x612200u,0x612b00u};
      for(uint32_t r:regs)p.Add(Op::Log,r,0,0,0,"after modeset (head-0 0x612200 / 0x612b00 must equal baseline)");}
+    for(uint32_t hh=0;hh<4;++hh)p.Add(Op::Log,RegAssy(kChidCore,0x240+hh*4),0,0,0,"after modeset: SET_GET_BLANKING_CTRL(head) read-back (2 unblanked, 1 blanked)");
     B(HPhase::Verify);
     p.Add(Op::Expect,RegArm(kChidCore,c57d::HeadRasterSize(0)),~0u,g.headRaster,0,"head 0 raster unchanged");
     p.Add(Op::Expect,RegArm(kChidCore,c57d::HeadPixelClock(0)),~0u,g.headPclk,0,"head 0 pclk unchanged");

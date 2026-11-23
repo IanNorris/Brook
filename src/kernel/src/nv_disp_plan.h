@@ -205,6 +205,11 @@ struct Config{
     bool pauseForObserver=false;// first live noop: Pause between window disconnect and instmem off
     bool replay=true;           // submission 1 replays kReplayMthds with replayVal (ARM values)
     bool dumpAfterConnect=false;// log the whole window ASSY and ARM blocks right after connect
+    // SET_PRESENT_CONTROL MIN_PRESENT_INTERVAL. 0 = the GOP's value (BEGIN_MODE stays
+    // NON_TEARING, so the flip still latches at vblank). Live bc9cbf9e: with 1 (nouveau's
+    // vsync value) the window sits in UPD_STATE WAIT_MPI (0xae050307) for seconds or for
+    // ever under the GOP's head, so the next submission and the restore never execute.
+    uint32_t presentInterval=0;
     uint32_t replayVal[kReplayCount]{};
     uint32_t restoreVal[kRestoreCount]={0,0,0x08700f00,0x10,0xcf,0x100,kHandleGop,0,0,0x08700f00,0x08700f00,0,1,1};
     GopState gop{};
@@ -267,9 +272,9 @@ inline uint32_t SurfSize(const Surface& s){return (s.height<<16)|s.width;}
 inline void PushWindowNtfy(Push& p,uint32_t ntfyOffset){
     p.Mthd(c57e::SET_CONTEXT_DMA_NOTIFIER,kHandleSync,(ntfyOffset>>4)<<4);
 }
-// Full image state, wndwc57e_image_set order (N8 33-79). NON_TEARING, interval 1
-// (N11 153-156 for an interlocked/normal flip).
-inline void PushWindowImage(Push& p,const Surface& s,uint32_t handle,uint32_t interval=1){
+// Full image state, wndwc57e_image_set order (N8 33-79). NON_TEARING. Interval: see
+// Config::presentInterval.
+inline void PushWindowImage(Push& p,const Surface& s,uint32_t handle,uint32_t interval){
     p.Mthd(c57e::SET_PRESENT_CONTROL,interval&0xf);
     p.Mthd(c57e::SET_SIZE,SurfSize(s),c57e::LAYOUT_PITCH<<4,s.format&0xff,(s.pitch>>6)&0x1fff);
     p.Mthd(c57e::SET_CONTEXT_DMA_ISO0,handle);
@@ -280,7 +285,7 @@ inline void PushWindowImage(Push& p,const Surface& s,uint32_t handle,uint32_t in
 }
 // Flip: address plus size/storage/params/pitch on every flip, as nvkms does
 // (nvkms-evo3.c EvoFlipC3Common; decision 23 Nov: 5 words removes an unknown).
-inline void PushWindowFlip(Push& p,const Surface& s,uint32_t handle,uint32_t interval=1){
+inline void PushWindowFlip(Push& p,const Surface& s,uint32_t handle,uint32_t interval){
     p.Mthd(c57e::SET_PRESENT_CONTROL,interval&0xf);
     p.Mthd(c57e::SET_SIZE,SurfSize(s),c57e::LAYOUT_PITCH<<4,s.format&0xff,(s.pitch>>6)&0x1fff);
     p.Mthd(c57e::SET_CONTEXT_DMA_ISO0,handle);
@@ -355,6 +360,7 @@ enum class Op:uint8_t{
     ExpectSoft, // (reg & mask) == value, else io.flag(step, got): a sticky warning, never fails
     ExpectVpll, // VPLL at reg (+4 P|N|M, +0x10 fN<<16) runs at value kHz +- mask with refclk x kHz
     WriteIf,    // reg = value only if (rd(y) & z) == x; else skipped (got = rd(y), logged as not ok, never fails)
+    ExpectOr,   // (reg & mask) == value or == x, else abort
 };
 enum class Blob:uint32_t{Inst,WndwPush,CorePush,SyncInit};
 struct Step{Op op;uint32_t reg,mask,value,timeoutMs;uint64_t vram;const char* what;uint32_t x,y,z;};
@@ -408,7 +414,7 @@ inline uint32_t RingAppend(Push& ring,Ring& r,const Push& p){
 // Runtime flip: notifier slot `parity`, address-only state, update.
 inline uint32_t BuildFlip(Push& ring,Ring& r,const Config& c,const Surface& s,uint32_t parity,uint32_t handle=kHandleIsoPitch){
     Push p;PushWindowNtfy(p,WindowNtfyOffset(c.window,parity));
-    PushWindowFlip(p,s,handle);PushWindowUpdate(p,c.window);
+    PushWindowFlip(p,s,handle,c.presentInterval);PushWindowUpdate(p,c.window);
     return RingAppend(ring,r,p);
 }
 // Replay as few headers as possible: consecutive methods share one.
@@ -426,7 +432,7 @@ template<typename Rd> inline void ReadReplay(Config& c,Rd rd){
 inline uint32_t BuildFirstFlip(Push& ring,Ring& r,const Config& c){
     Push p;PushWindowNtfy(p,WindowNtfyOffset(c.window,0));
     if(c.replay)PushReplay(p,c);
-    PushWindowImage(p,c.surf[0],kHandleIsoPitch);PushWindowUpdate(p,c.window);
+    PushWindowImage(p,c.surf[0],kHandleIsoPitch,c.presentInterval);PushWindowUpdate(p,c.window);
     return RingAppend(ring,r,p);
 }
 inline uint32_t RestoreHandle(const Config& c){return c.gopHandle?kHandleGop:kHandleIsoPitch;}
@@ -553,17 +559,20 @@ inline void AddPushReadback(Plan& p,const Config& c,const Push& ring,uint32_t fr
         p.Add(Op::VramExpect,0,~0u,ring.words[off/4],0,"pushbuffer word visible in VRAM (line start)",c.wndwPushVram+off);
     if(put>from)p.Add(Op::VramExpect,0,~0u,ring.words[put/4-1],0,"pushbuffer last word visible in VRAM",c.wndwPushVram+put-4);
 }
-// Before the next submission: the previous flip must be complete (its notifier FINISHED),
-// as nvkms waits for STATUS_FINISHED (nvEvoWaitForCompNotifierC3). Live 35265134 flip_4_100:
-// the next flip's SET_CONTEXT_DMA_NOTIFIER sat unexecuted (GET 0x2c0, ASSY 0x220 still the
-// previous slot, METHOD_EXEC busy) for over 2 s while the previous flip was only BEGUN; it
-// drained without a kick. Generous timeout: the present latency seen live is seconds.
+// Before the next submission: the previous flip must be complete. Live bc9cbf9e: window
+// notifiers only ever reach BEGUN (nouveau waits for BEGUN only, base507c_ntfy_wait_begun;
+// nvkms' FINISHED wait is for core completion notifiers), so FINISHED is only logged
+// (short soft poll). The real gate: ARM shows the previous submission and the window has
+// no update in flight (METHOD_EXEC idle, UPD_STATE IDLE). Live 35265134: the next flip's
+// SET_CONTEXT_DMA_NOTIFIER waited behind a previous flip stuck in WAIT_MPI.
 constexpr uint32_t kFinishTimeoutMs=5000;
-inline void AddWaitFinished(Plan& p,const Config& c,uint32_t prevNtfy){
-    if(prevNtfy==kNoNtfy)return;
-    p.Add(Op::VramPoll,0,3u<<kNtfyStatusShift,kNtfyFinished<<kNtfyStatusShift,kFinishTimeoutMs,
-          "previous flip FINISHED before the next submission",c.syncVram+prevNtfy);
-    p.Add(Op::Poll,RegChnStatus(ChidWndw(c.window)),kWinMethodExecBusy,0,kFinishTimeoutMs,"window METHOD_EXEC idle before the next submission");
+inline void AddWaitFinished(Plan& p,const Config& c,uint32_t prevNtfy,uint32_t prevHandle,uint64_t prevOffset){
+    const uint32_t ch=ChidWndw(c.window);
+    if(prevNtfy!=kNoNtfy)
+        p.Add(Op::VramExpect,0,0,0,0,"previous flip notifier status (log; BEGUN 0x40000000, FINISHED 0x80000000)",c.syncVram+prevNtfy);
+    p.Add(Op::Poll,RegArm(ch,c57e::SET_CONTEXT_DMA_ISO0),~0u,prevHandle,kFinishTimeoutMs,"ARM ISO = previous submission");
+    p.Add(Op::Poll,RegArm(ch,c57e::SET_OFFSET0),~0u,uint32_t(prevOffset>>8),kFinishTimeoutMs,"ARM offset = previous submission");
+    p.Add(Op::Poll,RegChnStatus(ch),kWinMethodExecBusy|0xf00,0x100,kFinishTimeoutMs,"window METHOD_EXEC idle, UPD_STATE IDLE (no update in flight)");
 }
 inline void AddKickAndWait(Plan& p,const Config& c,uint32_t putBytes,uint32_t handle,uint64_t offset,uint32_t ntfy){
     const uint32_t ch=ChidWndw(c.window);
@@ -630,8 +639,12 @@ inline Err BuildPlan(const Config& c,InstImage& img,Pushes& pushes,Plan& p,uint3
     p.Add(Op::Expect,kRegDispOwner,0x2,0,0,"VBIOS ownership bit clear (else tu102_disp_init claim)");
     p.Add(Op::Expect,kRegInstTarget,~0u,g.instTarget,0,"no display instmem (GOP)");
     p.Add(Op::Expect,kRegInstAddr,~0u,g.instAddr,0,"instmem addr 0");
-    p.Add(Op::Expect,RegChnCtl(kChidCore),0xffff,g.ctlCore,0,"core CHNCTL as left by GOP");
-    p.Add(Op::Expect,RegChnStatus(kChidCore),kCoreStateMask,kCoreEfiOperation,0,"core STATE EFI_OPERATION (7)");
+    // Core as the GOP left it (CHNCTL 0x21, EFI_OPERATION), or as a head-1 run leaves it
+    // (live bc9cbf9e: after our connect/disconnect the core is ALLOCATE only, UNCONNECTED 8,
+    // and cannot return to EFI_OPERATION). Stage A does not use the core; stage B
+    // reconnects it either way.
+    p.Add(Op::ExpectOr,RegChnCtl(kChidCore),0xffff,g.ctlCore,0,"core CHNCTL as left by GOP (0x21) or by a head-1 run (0x01)",0,0x01);
+    p.Add(Op::ExpectOr,RegChnStatus(kChidCore),kCoreStateMask,kCoreEfiOperation,0,"core STATE EFI_OPERATION (7) or UNCONNECTED (8)",0,0x080000);
     p.Add(Op::Expect,RegChnCtl(ch),0xffff,g.ctlWndw,0,"window CHNCTL ALLOCATE only");
     p.Add(Op::Expect,RegChnStatus(ch),kWinStateMask,kWinUnconnected,0,"window STATE UNCONNECTED (1)");
     p.Add(Op::Expect,RegArm(kChidCore,c57d::WindowSetControl(w)),0xf,g.coreWinCtl,0,"ARM window owner = head 0");
@@ -705,13 +718,13 @@ inline Err BuildPlan(const Config& c,InstImage& img,Pushes& pushes,Plan& p,uint3
         p.Add(Op::Fence,0,0,0,0,"sfence");
     }
     for(uint32_t i=1;i<=nflips;++i){
-        AddWaitFinished(p,c,pushes.ntfy[i-1]);
+        AddWaitFinished(p,c,pushes.ntfy[i-1],pushes.handle[i-1],pushes.offset[i-1]);
         AddPushReadback(p,c,pushes.wndw,pushes.end[i-1],pushes.end[i]);
         AddKickAndWait(p,c,pushes.end[i],pushes.handle[i],pushes.offset[i],pushes.ntfy[i]);
         if(holdMs)p.Add(Op::Delay,0,0,holdMs*1000,0,"hold");
     }
     p.Begin(Phase::Restore);
-    {const uint32_t k=nflips+1;AddWaitFinished(p,c,pushes.ntfy[k-1]);AddPushReadback(p,c,pushes.wndw,pushes.end[k-1],pushes.end[k]);AddKickAndWait(p,c,pushes.end[k],pushes.handle[k],pushes.offset[k],pushes.ntfy[k]);}
+    {const uint32_t k=nflips+1;AddWaitFinished(p,c,pushes.ntfy[k-1],pushes.handle[k-1],pushes.offset[k-1]);AddPushReadback(p,c,pushes.wndw,pushes.end[k-1],pushes.end[k]);AddKickAndWait(p,c,pushes.end[k],pushes.handle[k],pushes.offset[k],pushes.ntfy[k]);}
     p.Add(Op::Expect,RegArm(ch,c57e::SET_CONTEXT_DMA_NOTIFIER),~0u,RestoreVal(c,c57e::SET_CONTEXT_DMA_NOTIFIER),0,"ARM notifier ctxdma = GOP value");
     p.Add(Op::Expect,RegArm(ch,c57e::SET_PRESENT_CONTROL),~0u,RestoreVal(c,c57e::SET_PRESENT_CONTROL),0,"ARM present control = GOP value");
     p.Begin(Phase::Teardown);
@@ -802,6 +815,7 @@ template<typename Io> uint32_t Run(const Plan& p,uint32_t begin,uint32_t end,Io&
                 if(io.expired(s.timeoutMs,t)){ok=false;break;}}
             break;}
         case Op::ExpectSoft:got=io.rd(s.reg);if((got&s.mask)!=s.value)io.flag(i,s,got);break;
+        case Op::ExpectOr:got=io.rd(s.reg);ok=(got&s.mask)==s.value||(got&s.mask)==s.x;break;
         case Op::WriteIf:got=io.rd(s.y);if((got&s.z)==s.x)io.wr(s.reg,s.value);else io.flag(i,s,got);break;
         case Op::ExpectVpll:{const uint32_t c=io.rd(s.reg+4),f=io.rd(s.reg+0x10);
             const uint32_t P=(c>>16)&0x3f,N=(c>>8)&0xff,M=c&0xff;const int32_t fN=int16_t(f>>16);
@@ -828,7 +842,7 @@ template<typename Io> uint32_t Run(const Plan& p,uint32_t begin,uint32_t end,Io&
                 if(m==0x200)continue;                                     // UPDATE trigger
                 if(s.reg!=kChidCore&&m==0x208)continue;                   // window GET_LINE (live)
                 if(s.reg!=kChidCore&&m>=0x350&&m<0x370)continue;          // window: not in clc57e.h (SW methods)
-                if(s.reg==kChidCore&&m>=0x220&&m<0x240)continue;          // core GET_RG_SCAN_LINE (live)
+                if(s.reg==kChidCore&&m>=0x220&&m<0x250)continue;          // core GET_RG_SCAN_LINE, SET_GET_BLANKING_CTRL (live status)
                 const uint32_t a=io.rd(RegAssy(s.reg,m)),b=io.rd(RegArm(s.reg,m));
                 if(a!=b){io.diff(m,a,b);
                     // x: 0 = fail unless rewritten, 1 = strict (any difference that is not ours,

@@ -160,8 +160,15 @@ static void TestGetStallRestoreStuck(){
     assert(g.f.R(kRegInstTarget)==9&&g.f.R(kRegInstAddr)!=0);                 // instmem kept valid
     assert(g.b.Count("\"op\":\"WRITEIF\"")>=2);
 }
+// After a head-1 run the core is ALLOCATE only and UNCONNECTED (live bc9cbf9e); stage A
+// preflight accepts that, and still refuses anything else.
+static void TestPreflightAfterHead1(){
+    {Rig g;g.f.R(RegChnCtl(0))=0x01;g.f.R(RegChnStatus(0))=0x00080000;g.r->Command("preflight");assert(g.r->st.preflightOk);
+     g.r->Command("flip 2 10");assert(g.b.Count("\"nv_disp\":\"done\"")==1);g.GopState();}
+    {Rig g;g.f.R(RegChnCtl(0))=0x13;g.r->Command("preflight");assert(!g.r->st.preflightOk);}
+}
 int main(){
     TestLayout();TestGate();TestNoop();TestObserverPauseAndContinue();TestStopThenQuiesce();
-    TestFlip();TestAutoAbortAtConnect();TestRestoreAttemptOnFlipFailure();TestStageB();TestDumpAndBigFlip();TestAbortVerb();TestGetStallRestoreLands();TestGetStallRestoreStuck();
+    TestFlip();TestAutoAbortAtConnect();TestRestoreAttemptOnFlipFailure();TestStageB();TestDumpAndBigFlip();TestAbortVerb();TestGetStallRestoreLands();TestGetStallRestoreStuck();TestPreflightAfterHead1();
     puts("test_nv_disp_runner: ok");return 0;
 }

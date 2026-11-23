@@ -57,7 +57,7 @@ template<typename B> struct Runner{
     };
     static const char* OpName(Op o){
         static const char* n[]={"WR","MASK","EXPECT","POLL","POLLSOFT","ACK","VCOPY","VWR","VEXPECT","VPOLL","VPOLLANY","ACKEXC",
-            "PRAMIN","FENCE","KICK","EXPNOT","LOG","COPY","ASSYARM","PAUSE","DELAY","ANDNIF","COPYMASK","CALL","FILL","PRAMINR","DUMP","POLLOR","EXPSOFT","EXPVPLL","WRITEIF"};
+            "PRAMIN","FENCE","KICK","EXPNOT","LOG","COPY","ASSYARM","PAUSE","DELAY","ANDNIF","COPYMASK","CALL","FILL","PRAMINR","DUMP","POLLOR","EXPSOFT","EXPVPLL","WRITEIF","EXPOR"};
         return uint32_t(o)<sizeof(n)/sizeof(n[0])?n[uint32_t(o)]:"?";
     }
     Phase PhaseOf(uint32_t i)const{Phase ph=Phase::Preflight;
@@ -115,7 +115,7 @@ template<typename B> struct Runner{
         if(e!=Err::Ok){Msg("error","plan build failed (layout/bounds)");return false;}
         return true;
     }
-    static bool ReadOnly(Op o){return o==Op::Expect||o==Op::ExpectNot||o==Op::Log||o==Op::AssyArmDiff||o==Op::Poll||o==Op::PollSoft;}
+    static bool ReadOnly(Op o){return o==Op::Expect||o==Op::ExpectOr||o==Op::ExpectNot||o==Op::Log||o==Op::AssyArmDiff||o==Op::Poll||o==Op::PollSoft;}
 
     // ---- verbs
     void Status(){

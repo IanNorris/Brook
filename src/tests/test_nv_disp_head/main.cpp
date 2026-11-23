@@ -116,12 +116,19 @@ static void TestPllAndSf(){
     assert(s.h==148&&s.v==2149&&s.watermark==18);                  // nouveau's formula
     assert(!DpSymbols(m,0x06,1,true,s));                            // 4K60 does not fit RBR x1
 }
+static void TestUnblankOptIn(){
+    HeadConfig c;c.unblank=true;HeadPushes hp;BuildHeadPushes(c,hp);bool seen=false;
+    for(uint32_t i=hp.rungEnd/4;i<hp.enableEnd/4;){const uint32_t w=hp.core.words[i],n=(w>>18)&0x3ff,m=w&0x3ffc;
+        if(m==0x240+c.head*4&&n==1){assert(hp.core.words[i+1]==2);seen=true;}
+        assert(!(m==0x240));i+=1+n;}                                    // never head 0's
+    assert(seen);
+}
 static void TestCoreWords(){
     HeadConfig c;HeadPushes hp;BuildHeadPushes(c,hp);
     assert(hp.core.words[0]==PushHeader(0x208,1)&&hp.core.words[1]==kHandleSync);  // ours, first
     // replay: every documented core method once, in runs; then the rung (corec37d_update + ntfy)
     {uint32_t n=0;for(uint32_t i=2;i<hp.replayEnd/4;){const uint32_t k=(hp.core.words[i]>>18)&0x3ff;n+=k;i+=1+k;}
-     assert(n==kCoreReplayCount&&kCoreReplayCount==7+16+40+4*111);}
+     assert(n==kCoreReplayCount&&kCoreReplayCount==3+16+40+4*111);}
     {const uint32_t* r=hp.core.words+hp.replayEnd/4;const uint32_t g[]={0x0004020c,0x1000,0x00080218,0,0,0x00040200,1,0x0004020c,0};
      assert(hp.rungEnd-hp.replayEnd==sizeof(g)&&!memcmp(r,g,sizeof(g)));}
     assert(hp.core.count<=kPushMaxWords);
@@ -339,7 +346,8 @@ static void TestHeadPlan(){
     // Pad calibration converged on the comparator's target and was copied.
     assert(((c.R(0x612508)>>8)&0xf)==6&&((c.R(0x612588)>>8)&0xf)==6);
     // Head 0 never changed; head 1 was ARMed and detached again.
-    assert(c.R(0x688240)==0&&c.R(0x688244)==0&&c.R(0x680240)==0); // blanking ctrl replayed as ARM (NO_CHANGE), never promoted
+    for(uint32_t i=0;i<hp.enableEnd/4;){const uint32_t w=hp.core.words[i],n=(w>>18)&0x3ff,m=w&0x3ffc; // no blanking ctrl pushed by default
+        assert(!(m<0x250&&m+n*4>0x240));i+=1+n;}
     assert(c.R(0x68a064)==c.cfg.base.gop.headRaster&&c.R(0x68a00c)==c.cfg.base.gop.headPclk&&c.R(0x688320)==0x901);
     assert(c.R(0x68a464)==c.cfg.mode.rasterSize&&(c.R(0x688340)&0xff)==0&&(c.R(0x689100)&0xf)==0xf);
     assert((c.R(0x616d40)&1)==0);                                    // OffInt2 cleared the head SF enable
@@ -364,7 +372,7 @@ static void TestRefusesWhenHead0Pending(){
     Setup(c,img,hp,p,v);
     c.R(0x680000+0x2038)=7;                                            // undocumented head-0 method: cannot be replayed
     const uint32_t at=Run(p,0,p.count,c);
-    assert(at<p.phaseBegin[uint32_t(HPhase::Vram)]&&c.written.empty()&&c.diffs==5); // + the 4 GOP-pending blanking ctrls (logged, replayed)
+    assert(at<p.phaseBegin[uint32_t(HPhase::Vram)]&&c.written.empty()&&c.diffs==1); // blanking ctrl read-backs are skipped
     // A documented one is simply replayed with its ARM value: no refusal.
     Core d;static InstImage i2;static HeadPushes h2;static Plan p2;Vbios v2;i2=InstImage{};h2=HeadPushes{};p2=Plan{};
     Setup(d,i2,h2,p2,v2);d.R(0x680000+0x2068)=0x0004001e;
@@ -577,7 +585,7 @@ static void Dump(){
     g_rom=MakeRom();Vbios v=g_rom.V();HeadConfig c;c.base=GopFlipConfig(3840,2160,16384,0xcf,256ull<<20);DpOut d{};
     assert(ResolveHeadConfig(v,4,c,d));c.pauseAfterModeset=false;assert(BuildHeadPlan(c,img,hp,p)==Err::Ok);
     static const char* op[]={"WR","MASK","EXPECT","POLL","POLLSOFT","ACK","VCOPY","VWR","VEXPECT","VPOLL","VPOLLANY","ACKEXC",
-        "PRAMIN","FENCE","KICK","EXPNOT","LOG","COPY","ASSYARM","PAUSE","DELAY","ANDNIF","COPYMASK","CALL","FILL","PRAMINR","DUMP","POLLOR","EXPSOFT","EXPVPLL","WRITEIF"};
+        "PRAMIN","FENCE","KICK","EXPNOT","LOG","COPY","ASSYARM","PAUSE","DELAY","ANDNIF","COPYMASK","CALL","FILL","PRAMINR","DUMP","POLLOR","EXPSOFT","EXPVPLL","WRITEIF","EXPOR"};
     auto line=[&](uint32_t i,const Step& s){
         if(s.op==Op::VramCopy||s.op==Op::VramWrite||s.op==Op::VramPoll)printf("%3u %-8s vram %08llx val %08x %s\n",i,op[uint32_t(s.op)],(unsigned long long)s.vram,s.value,s.what);
         else if(s.op==Op::AssyArmDiff)printf("%3u %-8s chid %u mthd %04x..%04x %s\n",i,op[uint32_t(s.op)],s.reg,s.mask,s.value-4,s.what);
@@ -598,7 +606,7 @@ int main(int argc,char** argv){
     if(argc>1&&!strcmp(argv[1],"--dump")){Dump();return 0;}
     TestAux();TestHeadRunner();
     TestVbios();TestRealVbios();TestPllAndSf();TestCoreWords();
-    TestHeadPlan();TestRefusesWhenHead0Pending();TestUndocumentedResetLogged();TestRungSupervisorFailsFast();TestOpenStageReleased();TestHead0FlagFinishesStages();TestAbortUnkicked();
+    TestUnblankOptIn();TestHeadPlan();TestRefusesWhenHead0Pending();TestUndocumentedResetLogged();TestRungSupervisorFailsFast();TestOpenStageReleased();TestHead0FlagFinishesStages();TestAbortUnkicked();
     TestStagesFromEventStatus();TestCoreExceptionAtModeset();TestVpll0Gate();TestTrainingFailure();
     puts("test_nv_disp_head: ok");return 0;
 }

@@ -21,7 +21,7 @@
 namespace brook::nvdisp {
 
 struct HeadState{
-    bool preflightOk=false,live=false,enabled=false,paused=false,hooked=false,head0Flagged=false,fe=false,dpIdleHeld=false;
+    bool preflightOk=false,live=false,enabled=false,paused=false,hooked=false,head0Flagged=false,fe=false,unblank=false,dpIdleHeld=false;
     Kicked kicked=Kicked::None;uint32_t openStage=0; // a supervisor stage acked by the plan and not yet released
     uint32_t cursor=0,stopAt=~0u,failAt=~0u,runs=0,aborts=0,guardHits=0;
 };
@@ -122,7 +122,7 @@ template<typename B> struct HeadRunner{
     bool Build(){
         if(!resolved){Msg("error","VBIOS tables/scripts/hash not matched (DCB[4], DP table, PLL, script pointers)");return false;}
         cfg.pauseAfterModeset=false; // "enabled" is the observer point
-        cfg.base.feEnable=st.fe;
+        cfg.base.feEnable=st.fe;cfg.unblank=st.unblank;
         if(b)ReadCoreReplay(cfg,[&](uint32_t a){return b->rd(a);}); // replay = ARM values now
         img=InstImage{};pushes=HeadPushes{};plan=Plan{};
         const Err e=BuildHeadPlan(cfg,img,pushes,plan);
@@ -236,15 +236,16 @@ template<typename B> struct HeadRunner{
         if(Word(p,"continue")){Continue();return;}
         if(Word(p,"abort")){Abort(Word(p,"force"));return;}
         if(Word(p,"enable")){
-            bool skip=false,fe=false;uint32_t stop=~0u,named=0;
+            bool skip=false,fe=false;uint32_t stop=~0u,named=0;st.unblank=false;
             for(;;){while(*p==' ')++p;if(!*p)break;
                 if(Word(p,"skip-step3"))skip=true;
                 else if(Word(p,"fe"))fe=true;
+                else if(Word(p,"unblank"))st.unblank=true;
                 else if(Word(p,"stop")){if(Word(p,"rung"))named=1;else if(Word(p,"kick"))named=2;
                     else if(!Num(p,stop)){Msg("usage","stop <step>|rung|kick");return;}}
                 else{Msg("usage","unknown argument");return;}}
             Enable(skip,stop,fe,named);return;}
-        Msg("usage","nv-disp head1 plan|preflight|enable [skip-step3] [fe] [stop N|rung|kick]|disable|continue|abort [force]|status");
+        Msg("usage","nv-disp head1 plan|preflight|enable [skip-step3] [fe] [unblank] [stop N|rung|kick]|disable|continue|abort [force]|status");
     }
 };
 } // namespace brook::nvdisp

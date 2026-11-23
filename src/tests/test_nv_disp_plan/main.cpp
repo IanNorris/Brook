@@ -82,12 +82,13 @@ static void TestPush(){
     assert(PushHeader(0x200,1)==0x00040200&&PushHeader(0x224,4)==0x00100224&&PushJump(0)==0x20000000);
     Config c=DellConfig();
     // wndwc57e_image_set (wndwc57e.c 33-79) reserves 17 words, all used.
-    {Push p;PushWindowImage(p,c.surf[0],kHandleIsoPitch);assert(p.count==17);
+    {Push p;PushWindowImage(p,c.surf[0],kHandleIsoPitch,1);assert(p.count==17);
      const uint32_t g[]={0x00040308,0x00000001,
         0x00100224,0x08700f00,0x00000010,0x000000cf,0x00000100,
         0x00040240,0xfb000000, 0x00040260,0x00000000, 0x00040290,0x00000000,
         0x00040298,0x08700f00, 0x000402a4,0x08700f00};
-     assert(!memcmp(p.words,g,sizeof(g)));}
+     assert(!memcmp(p.words,g,sizeof(g)));
+     assert(c.presentInterval==0);}                          // plans use the GOP's interval 0 (live WAIT_MPI)
     // wndwc37e_ntfy_set (wndwc37e.c 224-237): 3 words; offset NV50_DISP_WNDW_NTFY(0)=0x60 (disp.h 21)
     {Push p;PushWindowNtfy(p,WindowNtfyOffset(0,0));assert(p.count==3);
      assert(p.words[0]==0x0008021c&&p.words[1]==0xf0000000&&p.words[2]==0x60);
@@ -256,7 +257,7 @@ static void Dump(bool core){
     Config c=DellConfig();c.coreChannel=core;c.pauseForObserver=true;
     static InstImage img;static Pushes pushes;static Plan plan;pushes=Pushes{};plan=Plan{};
     assert(BuildPlan(c,img,pushes,plan)==Err::Ok);FixPramin(plan,img);
-    static const char* op[]={"WR","MASK","EXPECT","POLL","POLLSOFT","ACK","VCOPY","VWR","VEXPECT","VPOLL","VPOLLANY","ACKEXC","PRAMIN","FENCE","KICK","EXPNOT","LOG","COPY","ASSYARM","PAUSE","DELAY","ANDNIF","COPYMASK","CALL","FILL","PRAMINR","DUMP","POLLOR","EXPSOFT","EXPVPLL","WRITEIF"};
+    static const char* op[]={"WR","MASK","EXPECT","POLL","POLLSOFT","ACK","VCOPY","VWR","VEXPECT","VPOLL","VPOLLANY","ACKEXC","PRAMIN","FENCE","KICK","EXPNOT","LOG","COPY","ASSYARM","PAUSE","DELAY","ANDNIF","COPYMASK","CALL","FILL","PRAMINR","DUMP","POLLOR","EXPSOFT","EXPVPLL","WRITEIF","EXPOR"};
     uint32_t ph=0;
     for(uint32_t i=0;i<plan.count;++i){
         while(ph<uint32_t(Phase::Count)&&plan.phaseBegin[ph]<=i&&(ph+1>=uint32_t(Phase::Count)||plan.phaseBegin[ph+1]<=i))++ph;
