@@ -14,6 +14,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "nv_gsp_wpr.h"
+#include "nv_gmmu.h"
 
 namespace brook::nvgsp {
 
@@ -48,6 +49,13 @@ struct ChipOps {
     // layout (WPR2 carve-out and GspFwWprMeta inputs)
     bool (*compute_layout)(const FbLayoutInput&, FbLayout*);
     FirmwareFile fw[kFwCount];
+    // M2 / BAR1 handover (after INIT_DONE)
+    uint32_t reg_bar1_block, reg_bar2_block;   // BAR1/BAR2 block: bit 31 virtual, 29:28 target, 27:0 inst >> 12
+    uint32_t reg_pramin_base, pramin;          // BAR0 window: base register (addr >> 16) and the 1 MiB data window
+    uint32_t reg_fb_flush;                     // write 1, poll bit 1 clear
+    uint32_t reg_mmu_inval_pdb_lo, reg_mmu_inval_pdb_hi, reg_mmu_inval_trigger;
+    uint32_t usermode;                         // TURING_USERMODE_A BAR0 base (doorbell at +0x90)
+    const GmmuFormat* gmmu;
 };
 
 // The 570.144 TU10x set from linux-firmware (tu104/gsp and tu104/acr are
@@ -77,6 +85,15 @@ inline constexpr ChipOps kChipTu104 = {
          {0x01,0x32,0x6c,0xc9,0x97,0x71,0x6b,0xeb,0xb0,0xea,0xb9,0xfe,0x1f,0x46,0x3f,0xff,
           0xa0,0xee,0x58,0x60,0x79,0xe4,0xca,0x0e,0x5b,0xb0,0x96,0xab,0x6f,0xcf,0xed,0xab}},
     },
+    // nouveau: vfn/tu102.c (0xb80000 VF base, usermode +0x30000), mmu/vmmtu102.c
+    // tu102_vmm_flush (0xb830a0/a4/b0), bar/g84.c flush (0x070000); P4 read
+    // 0xb80f40/48 change to virtual mode at INIT_DONE.
+    0xb80f40, 0xb80f48,
+    0x001700, 0x700000,
+    0x070000,
+    0xb830a0, 0xb830a4, 0xb830b0,
+    0xbb0000,
+    &kGmmuV2,
 };
 
 inline const ChipOps* ChipForBoot0(uint32_t boot0) {

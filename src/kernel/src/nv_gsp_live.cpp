@@ -6,6 +6,14 @@
 //   bridge hardware nv-gsp p3        P3: FWSEC-FRTS alone (once per boot)
 //   bridge hardware nv-gsp fini      P3b: FWSEC-SB, then booter_unload (once per boot)
 //   bridge hardware nv-gsp trace     the BAR0 access log of the last p3/fini
+//   bridge hardware nv-gsp p4 [keep-display]   GSP-RM to INIT_DONE; with keep-display the
+//                                    nv-aux lock is held across the boot (no compositor
+//                                    BAR1 traffic) and BAR1 is identity-mapped before release
+//   bridge hardware nv-gsp static [off]        parsed GET_GSP_STATIC_INFO + 1536 raw bytes at off
+//   bridge hardware nv-gsp bar1 map [2m]|unmap|status   interim display handover (nv_gsp_bar1.h)
+//   bridge hardware nv-gsp p5        M2: RM client/device/channel, NOP + semaphore (nv_gsp_m2.h)
+// With GSP-RM up, a pre-reset quiesce hook runs the RM fini (UNLOADING_GUEST_DRIVER,
+// FWSEC-SB, booter_unload) before nv-disp's quiesce and the FLR, so WPR2 is cleared.
 //
 // Gates: built only with BROOK_NV_GSP; every verb needs /etc/nv-gsp = "1\n".
 // p3 and fini refuse before the first GPU write unless the firmware set named
@@ -19,6 +27,11 @@
 #include "nv_gsp_live.h"
 #include "nv_gsp/nv_gsp_p3.h"
 #include "nv_gsp/nv_gsp_rm.h"
+#include "nv_gsp/nv_gsp_bar1.h"
+#include "nv_gsp/nv_gsp_m2.h"
+#include "nv_disp_live.h"
+#include "platform_power.h"
+#include "serial.h"
 #include "pci.h"
 #include "acpi.h"
 #include "boot_resource_map.h"
@@ -460,32 +473,51 @@ void P3() {
     o.send();
 }
 
-RmFiniResult RmUnload();   // P4 section below
+RmFiniResult RmUnload(uint64_t budget_us);   // P4 section below
+// Everything the fini needs, prepared once (P4 caches it so the pre-reset hook
+// does no VFS reads or hashing): the checked front, booter_unload and its image buffer.
+struct FiniCtx { Front f; uint8_t* unload = nullptr; uint8_t* img = nullptr; uint32_t ubytes = 0, pages = 0; bool ready = false; };
+FiniCtx g_fc;
+bool g_bar1Mapped = false;
+bool FiniReady(Out* o) {
+    if (g_fc.ready) return true;
+    Front f; uint8_t* unload = nullptr;
+    if (!Prepare(f, true, &unload)) { if (o) { o->ks("refused", f.refuse); FrontOut(*o, f); } return false; }
+    const uint32_t ubytes = f.chip->fw[kFwBooterUnload].bytes, pages = (ubytes + 4095) / 4096;
+    VirtualAddress img = VmmAllocPages(pages, VMM_WRITABLE | VMM_NO_EXEC, MemTag::Device, KernelPid);
+    if (!img) { if (o) o->ks("refused", "no booter image buffer"); return false; }
+    g_fc.f = f; g_fc.unload = unload; g_fc.img = reinterpret_cast<uint8_t*>(img.raw()); g_fc.ubytes = ubytes; g_fc.pages = pages;
+    g_fc.ready = true;
+    return true;
+}
+struct FiniOutcome { bool rm = false; RmFiniResult rmf; FiniResult r; };
+FiniOutcome FiniCore(uint64_t rm_budget_us) {
+    FiniOutcome x;
+    x.rm = g_rmRunning;
+    if (x.rm) {   // GSP-RM is up (p4 this boot): UNLOADING_GUEST_DRIVER first, then the P3b sequence
+        g_finiDone = true;
+        x.rmf = RmUnload(rm_budget_us);
+        g_rmRunning = false;
+        g_bar1Mapped = false;    // RM unload returns BAR1 to physical mode
+    }
+    if (!(x.rm && x.rmf.status != BootStatus::Ok))
+        x.r = RunFini(g_bus, *g_fc.f.chip, g_fc.f.in, Span{g_fc.unload, g_fc.ubytes}, g_dma, g_fc.img, g_fc.pages * 4096,
+                      [&] { return Arm(g_fc.f.g, &g_finiDone); }, !x.rm);
+    return x;
+}
 void Fini() {
     Out o; o.raw("{\"nv_gsp\":\"fini\"");
     if (g_finiDone) { o.ks("refused", "already ran this boot (no retry)"); o.send(); return; }
-    Front f; uint8_t* unload = nullptr;
-    if (!Prepare(f, true, &unload)) { o.ks("refused", f.refuse); FrontOut(o, f); o.send(); return; }
-    const uint32_t ubytes = f.chip->fw[kFwBooterUnload].bytes;
-    const uint32_t pages = (ubytes + 4095) / 4096;
-    VirtualAddress img = VmmAllocPages(pages, VMM_WRITABLE | VMM_NO_EXEC, MemTag::Device, KernelPid);
-    if (!img) { o.ks("refused", "no booter image buffer"); o.send(); return; }
+    if (!FiniReady(&o)) { o.send(); return; }
+    const Front& f = g_fc.f;
     g_bus.logN = 0; g_bus.dropped = 0; g_bus.rec = true;
     KPrintf("nv-gsp: P3b fini (FWSEC-SB, booter_unload) starting\n");
-    RmFiniResult rmf;
-    const bool rm = g_rmRunning;
-    if (rm) {   // GSP-RM is up (p4 this boot): UNLOADING_GUEST_DRIVER first, then the P3b sequence
-        g_finiDone = true;
-        rmf = RmUnload();
-        g_rmRunning = false;
-    }
-    const FiniResult r = (rm && rmf.status != BootStatus::Ok) ? FiniResult{} :
-        RunFini(g_bus, *f.chip, f.in, Span{unload, ubytes}, g_dma, reinterpret_cast<uint8_t*>(img.raw()),
-                pages * 4096, [&] { return Arm(f.g, &g_finiDone); }, !rm);
+    const FiniOutcome x = FiniCore(5000000);
+    const FiniResult& r = x.r;
     g_bus.rec = false;
-    if (rm) {
-        o.k("rm_unload"); o.raw("{"); o.ks("stage", rmf.stage); o.ks("status", BootStatusName(rmf.status));
-        o.kd("q", uint32_t(rmf.q)); o.kb("halted", rmf.halted); o.kh("mbox0", rmf.mbox0_after); o.raw("}");
+    if (x.rm) {
+        o.k("rm_unload"); o.raw("{"); o.ks("stage", x.rmf.stage); o.ks("status", BootStatusName(x.rmf.status));
+        o.kd("q", uint32_t(x.rmf.q)); o.kb("halted", x.rmf.halted); o.kh("mbox0", x.rmf.mbox0_after); o.raw("}");
     }
     const uint64_t us = g_finiDone ? NowUs() - g_runUs : 0;
     o.ks("stage", r.stage); o.ks("status", BootStatusName(r.status)); o.ks("fw", FwStatusName(r.fw)); o.kb("wrote", r.wrote);
@@ -495,6 +527,7 @@ void Fini() {
     o.kh("wpr2_lo", r.sb.wpr2_lo); o.kh("wpr2_hi", r.sb.wpr2_hi); o.raw("}");
     o.k("unload"); o.raw("{"); o.ks("step", r.unload.step); o.kh("debug", r.unload.debug); o.kh("mbox0", r.unload.mbox0);
     o.kh("mbox1", r.unload.mbox1); o.kh("wpr2_lo", r.unload.wpr2_lo); o.kh("wpr2_hi", r.unload.wpr2_hi); o.raw("}");
+    o.kh("bar1_block_after", g_bus.rd32(f.chip->reg_bar1_block));
     if (r.diag_valid) Diag(o, r.diag);
     o.kd("trace_records", g_bus.logN);
     FrontOut(o, f);
@@ -502,6 +535,23 @@ void Fini() {
             r.stage, r.sb.err, r.unload.mbox0, r.wpr2_lo_before, r.wpr2_hi_before, r.unload.wpr2_lo, r.unload.wpr2_hi);
     o.send();
 }
+
+// Pre-reset quiesce (registered once GSP-RM reached INIT_DONE). Runs before
+// nv-disp's quiesce and the GPU FLR (hooks run newest first): RM fini while
+// BAR1/display are as RM left them; afterwards BAR1 is physical again, so the
+// nv-disp teardown through BAR1 works as before P4. Serial output only; no
+// VFS; skipped when a verb holds the GPU.
+void GspRmQuiesceForReset() {
+    if (!g_rmRunning || g_finiDone || !g_fc.ready) return;
+    if (__atomic_exchange_n(&g_busy, 1u, __ATOMIC_ACQUIRE)) { SerialPuts("nv-gsp: pre-reset RM fini skipped (verb busy)\n"); return; }
+    SerialPuts("nv-gsp: pre-reset RM fini (UNLOADING_GUEST_DRIVER, FWSEC-SB, booter_unload)\n");
+    g_bus.rec = false;
+    const FiniOutcome x = FiniCore(1500000);
+    SerialPrintf("nv-gsp: pre-reset RM unload %s (mbox0 %x), fini %s at %s, WPR2 %08x/%08x\n", BootStatusName(x.rmf.status),
+                 x.rmf.mbox0_after, BootStatusName(x.r.status), x.r.stage, g_bus.rd32(kRegWpr2Lo), g_bus.rd32(kRegWpr2Hi));
+    __atomic_store_n(&g_busy, 0u, __ATOMIC_RELEASE);
+}
+bool g_quiesceHooked = false;
 
 // ------------------------------------------------------------------ P4
 // GSP-RM to INIT_DONE. All sysmem comes from contiguous PMM runs (direct
@@ -548,8 +598,8 @@ struct RmWait {   // msgq poll: drop stale lines, short pause, bounded by the de
     }
 };
 RmSync g_rmSync;
-RmFiniResult RmUnload() {
-    RmWait w; g_rm->wait_deadline_us = NowUs() + 5000000;
+RmFiniResult RmUnload(uint64_t budget_us) {
+    RmWait w; g_rm->wait_deadline_us = NowUs() + budget_us;
     return RunRmUnload(g_bus, *ChipForBoot0(g_bus.rd32(0)), g_rm->ch, g_rm->rx, g_rm->rxcap, w, g_rmSync);
 }
 bool PciIdentityOf(const Gpu& g, PciIdentity* p) {
@@ -572,14 +622,101 @@ template <class T> T* NewIn(uint64_t bytes) {
     return reinterpret_cast<T*>(v.raw());
 }
 
-void P4() {
+// ------------------------------------------------- static info, BAR1 handover
+uint64_t g_bar1Phys = 0;
+StaticInfo g_static;
+uint8_t g_staticRaw[kStaticInfoBytes];
+bool g_staticValid = false;
+Bar1Map g_bar1;
+constexpr uint64_t kBar1Bytes = 256ull << 20;   // TU104 BAR1 without ReBAR (design §3.3); checked against the boot map
+void StaticJson(Out& o, const StaticInfo& s) {
+    o.k("static"); o.raw("{");
+    char u[42]; FormatUuid(s.uuid, u);
+    o.ks("uuid", s.uuid_ok ? u : "?"); o.kh("gid_flags", s.gid_flags); o.ks("name", s.name); o.ks("short_name", s.short_name);
+    o.kh("fb_length", s.fb_length); o.kd("fb_bus_width", s.fb_bus_width); o.kd("fb_ram_type", s.fb_ram_type);
+    o.kd("l2_cache", s.l2_cache); o.kh("bar1_pde", s.bar1_pde); o.kh("bar2_pde", s.bar2_pde);
+    o.kh("h_internal_client", s.h_internal_client); o.kh("h_internal_device", s.h_internal_device);
+    o.kh("h_internal_subdevice", s.h_internal_subdevice); o.kb("split_vas", s.split_vas); o.kb("uefi", s.uefi);
+    o.kb("efi_init", s.efi_init); o.kb("vbios_valid", s.vbios_valid);
+    o.kh("fw_non_wpr_heap_offset", s.fw_non_wpr_heap_offset); o.kh("fw_frts_offset", s.fw_frts_offset);
+    o.kh("usable_lo", s.usable_lo); o.kh("usable_hi", s.usable_hi);
+    o.k("fb_regions"); o.raw("[");
+    for (uint32_t i = 0; i < s.fb_regions; ++i) {
+        const FbRegion& f = s.fb[i];
+        if (i) o.raw(",");
+        o.raw("{"); o.kh("base", f.base); o.kh("limit", f.limit); o.kh("reserved", f.reserved); o.kh("perf", f.performance);
+        o.kb("comp", f.compressed); o.kb("iso", f.iso); o.kb("prot", f.prot); o.raw("}");
+    }
+    o.raw("]}");
+}
+void Bar1Json(Out& o, const Bar1Map& m) {
+    o.k("bar1"); o.raw("{"); o.ks("stage", m.stage); o.ks("status", m.status); o.kh("block", m.block); o.kh("inst", m.inst);
+    o.kh("inst_pdb_raw", m.inst_pdb_raw); o.kh("pdb", m.pdb);
+    o.k("pd3_old"); o.raw("["); for (uint32_t i = 0; i < 4; ++i) { if (i) o.raw(","); o.hex(m.pd3_old[i]); } o.raw("]");
+    o.kb("rm_tree", m.rm_tree); o.kb("rm_tree_sys", m.rm_tree_sys); o.kd("rm_valid", m.rm_valid);
+    o.k("rm_first"); o.raw("[");
+    for (uint32_t i = 0; i < m.rm_valid && i < 4; ++i) { if (i) o.raw(","); o.raw("["); o.hex(m.rm_first_va[i]); o.raw(","); o.hex(m.rm_first_pte[i]); o.raw("]"); }
+    o.raw("]"); o.kh("pd3_new", m.pd3_new); o.kd("tables", m.tables); o.kd("ptes", m.ptes); o.kd("page_shift", m.page_shift);
+    o.kb("committed", m.committed); o.kb("invalidated", m.invalidated); o.kd("probes", m.probes); o.kd("probes_equal", m.probes_equal);
+    o.k("probe"); o.raw("[");
+    for (uint32_t i = 0; i < 3; ++i) { if (i) o.raw(","); o.raw("["); o.hex(m.probe_va[i]); o.raw(","); o.hex(m.probe_pramin[i]);
+        o.raw(","); o.hex(m.probe_bar1[i]); o.raw("]"); }
+    o.raw("]}");
+}
+// One UC page of BAR1, remapped per read (never freed; the first RAM leaf is released).
+VirtualAddress g_bar1ProbeVa{};
+bool Bar1Read(uint64_t off, uint32_t* v) {
+    if (!g_bar1Phys || off + 4 > kBar1Bytes) return false;
+    if (!g_bar1ProbeVa) {
+        VirtualAddress va = VmmAllocPages(1, VMM_WRITABLE | VMM_NO_EXEC, MemTag::Device, KernelPid);
+        if (!va) return false;
+        const auto leaf = VmmDetachPage(KernelPageTable, va); if (leaf) PmmFreePage(VmmLeafPhysical(leaf));
+        g_bar1ProbeVa = va;
+    } else (void)VmmDetachPage(KernelPageTable, g_bar1ProbeVa);
+    __asm__ volatile("invlpg (%0)" ::"r"(g_bar1ProbeVa.raw()) : "memory");
+    if (!VmmMapPage(KernelPageTable, g_bar1ProbeVa, PhysicalAddress((g_bar1Phys + off) & ~0xfffull),
+                    VMM_WRITABLE | VMM_NO_EXEC | VMM_CACHE_DISABLE | VMM_WRITE_THRU, MemTag::Device, KernelPid)) return false;
+    *v = reinterpret_cast<volatile uint32_t*>(g_bar1ProbeVa.raw() + (off & 0xfff))[0];
+    return true;
+}
+struct Bar1PageAlloc {
+    bool operator()(uint64_t* bus, uint8_t** cpu) { DmaRegion d; if (!RmAlloc(0x1000, &d)) return false; *bus = d.bus; *cpu = d.cpu; return true; }
+    void flush(uint8_t* p) { FlushRange(p, 0x1000); }
+};
+// Caller holds the nv-aux lock (no compositor BAR1/PRAMIN traffic).
+bool Bar1MapLocked(uint8_t shift) {
+    if (!g_rmRunning || !g_staticValid || g_bar1Mapped) return false;
+    BootResourceClassification bc{};
+    constexpr uint32_t allowed = (1u << uint32_t(MemoryType::Reserved)) | (1u << uint32_t(MemoryType::Mmio));
+    if (!g_bar1Phys || !AcpiClassifyBootRange(g_bar1Phys, kBar1Bytes, bc) || (bc.types & ~allowed)) {
+        g_bar1 = Bar1Map{}; g_bar1.status = "BAR1 range not MMIO in the boot map"; return false;
+    }
+    Bar1PageAlloc pa;
+    const uint64_t probes[3] = {0x0, 0x4343000, 0xff13000};   // GOP surface, a back buffer, the nv-disp instmem MiB
+    g_bar1 = MapBar1Identity(g_bus, *ChipForBoot0(g_bus.rd32(0)), pa, g_static.bar1_pde, kBar1Bytes, probes, 3,
+                             [](uint64_t off, uint32_t* v) { return Bar1Read(off, v); }, shift);
+    g_bar1Mapped = g_bar1.committed;
+    KPrintf("nv-gsp: BAR1 identity map %s at %s (RM PD3[0] %lx -> %lx, %u ptes, probes %u/%u)\n", g_bar1.status, g_bar1.stage,
+            (unsigned long)g_bar1.pd3_old[0], (unsigned long)g_bar1.pd3_new, g_bar1.ptes, g_bar1.probes_equal, g_bar1.probes);
+    return g_bar1.ok();
+}
+
+void P4(bool keepDisplay) {
     Out o; o.raw("{\"nv_gsp\":\"p4\"");
     if (g_p3Done || g_p4Done || g_finiDone) { o.ks("refused", "a falcon run already happened this boot (no retry)"); o.send(); return; }
     Front f; uint8_t* unloadBlob = nullptr;
-    if (!Prepare(f, false, &unloadBlob)) { o.ks("refused", f.refuse); FrontOut(o, f); o.send(); return; }
+    if (!Prepare(f, true, &unloadBlob)) { o.ks("refused", f.refuse); FrontOut(o, f); o.send(); return; }
     const ChipOps& c = *f.chip;
     PciIdentity pci;
     if (!PciIdentityOf(f.g, &pci)) { o.ks("refused", "PCI identity/BARs"); o.send(); return; }
+    g_bar1Phys = pci.bar1;
+    if (!g_fc.ready) {   // cache the fini inputs now (the pre-reset hook must not touch the VFS)
+        const uint32_t ubytes = c.fw[kFwBooterUnload].bytes, upages = (ubytes + 4095) / 4096;
+        VirtualAddress uimg = VmmAllocPages(upages, VMM_WRITABLE | VMM_NO_EXEC, MemTag::Device, KernelPid);
+        if (!uimg) { o.ks("refused", "no booter image buffer"); o.send(); return; }
+        g_fc.f = f; g_fc.unload = unloadBlob; g_fc.img = reinterpret_cast<uint8_t*>(uimg.raw());
+        g_fc.ubytes = ubytes; g_fc.pages = upages; g_fc.ready = true;
+    }
     // firmware: the ELF (28.5 MB), the RISC-V bootloader and booter_load, hash-checked again on load
     uint8_t* elfBlob = LoadFile(c, kFwGsp);
     uint8_t* rblBlob = LoadFile(c, kFwBootloader);
@@ -618,10 +755,21 @@ void P4() {
         g_rm->wait_deadline_us = armUs + 15000000;   // INIT_DONE took ~0.9 s after booter under Linux
         return true;
     };
-    const P4Result r = RunP4(g_bus, c, f.in, g_dma, pci, booter, bimg, &g_rm->objs, g_rm->ch, g_rm->rx, g_rm->rxcap,
-                             prepare, arm, wait, g_rmSync);
+    // keep-display: no compositor/nv-disp BAR1 traffic from the boot until BAR1 is remapped
+    SpinLock* lock = keepDisplay ? NvAuxSharedLock() : nullptr;
+    if (lock) SpinLockAcquire(lock);
+    const uint64_t lockUs = NowUs();
+    static P4Result r;
+    r = RunP4(g_bus, c, f.in, g_dma, pci, booter, bimg, &g_rm->objs, g_rm->ch, g_rm->rx, g_rm->rxcap,
+              prepare, arm, wait, g_rmSync);
     g_bus.rec = false;
     g_rmRunning = r.init_done;
+    if (r.static_ok) { g_static = r.si; memcpy(g_staticRaw, r.static_raw, kStaticInfoBytes); g_staticValid = true; }
+    bool mapped = false;
+    if (lock && r.init_done && r.si.ok) mapped = Bar1MapLocked(16);
+    if (lock) SpinLockRelease(lock);
+    const uint64_t heldUs = lock ? NowUs() - lockUs : 0;
+    if (r.init_done && !g_quiesceHooked) g_quiesceHooked = PlatformPowerAddQuiesce(GspRmQuiesceForReset);
     o.ks("stage", r.stage); o.ks("status", BootStatusName(r.status)); o.kd("q", uint32_t(r.q)); o.kb("wrote", r.p3.wrote);
     o.kh("pci_cmd_before", g_cmdBefore); o.kh("pci_cmd_after", g_cmdAfter);
     Pre(o, r.p3.pre);
@@ -640,6 +788,10 @@ void P4() {
         char b[3] = {hx[r.static_head[i] >> 4], hx[r.static_head[i] & 15], 0}; o.raw(b); } o.raw("\"");
     o.kd("sysmem_kib", g_rm->objs.dma_bytes >> 10); o.kh("libos", g_rm->objs.libos.bus); o.kh("meta", g_rm->objs.meta.bus);
     o.kh("shm", g_rm->objs.shm.bus); o.raw("}");
+    if (r.si.ok) StaticJson(o, r.si);
+    o.kh("bar1_block", g_bus.rd32(c.reg_bar1_block)); o.kh("bar2_block", g_bus.rd32(c.reg_bar2_block));
+    o.kb("keep_display", keepDisplay); o.kd("lock_held_us", heldUs); o.kb("pre_reset_hook", g_quiesceHooked);
+    if (lock) { o.kb("bar1_mapped", mapped); Bar1Json(o, g_bar1); }
     o.kh("mbox0_now", g_bus.rd32(c.gsp_falcon + kFMbox0)); o.kh("riscv_cpuctl_now", g_bus.rd32(c.gsp_riscv + kRiscvCpuctl));
     if (r.diag_valid) Diag(o, r.diag);
     o.kd("trace_records", g_bus.logN); o.kd("trace_dropped", g_bus.dropped);
@@ -647,6 +799,90 @@ void P4() {
     KPrintf("nv-gsp: P4 %s at %s: booter mbox0 %x, WPR2 %08x/%08x, INIT_DONE %d at %lu us, seq %s, static %u B\n",
             BootStatusName(r.status), r.stage, r.booter.mbox0, r.booter.wpr2_lo, r.booter.wpr2_hi, r.init_done ? 1 : 0,
             (unsigned long)r.t_init_done_us, SeqStatusName(r.seq.status), r.static_len);
+    o.send();
+}
+
+// `static [off]`: the parsed reply and 1536 raw bytes from `off` (decimal).
+void StaticVerb(uint32_t off) {
+    Out o; o.raw("{\"nv_gsp\":\"static\"");
+    if (!g_staticValid || off >= kStaticInfoBytes) { o.ks("error", "no static info this boot (run p4) or offset past 0x678"); o.send(); return; }
+    o.kd("offset", off); o.kd("bytes", kStaticInfoBytes);
+    const uint32_t n = kStaticInfoBytes - off < 1536 ? kStaticInfoBytes - off : 1536;
+    o.k("hex"); o.raw("\"");
+    for (uint32_t i = 0; i < n; ++i) { const char* hx = "0123456789abcdef"; char c2[3] = {hx[g_staticRaw[off + i] >> 4], hx[g_staticRaw[off + i] & 15], 0}; o.raw(c2); }
+    o.raw("\"");
+    o.send();
+    Out p; p.raw("{\"nv_gsp\":\"static_parsed\""); StaticJson(p, g_static); p.send();
+}
+// `bar1 map|unmap|status` (mode 1/2/0).
+void Bar1Verb(int mode, uint8_t shift) {
+    Out o; o.raw("{\"nv_gsp\":\"bar1\"");
+    const ChipOps* c = ChipForBoot0(g_bus.rd32(0));
+    if (!c || !g_rmRunning) { o.ks("refused", "GSP-RM is not running this boot"); o.send(); return; }
+    SpinLock* lock = NvAuxSharedLock();
+    if (mode == 1) {
+        if (g_bar1Mapped) { o.ks("refused", "already mapped"); }
+        else { SpinLockAcquire(lock); (void)Bar1MapLocked(shift); SpinLockRelease(lock); }
+    } else if (mode == 2) {
+        if (!g_bar1Mapped) o.ks("refused", "not mapped");
+        else { SpinLockAcquire(lock); const bool ok = UnmapBar1Identity(g_bus, *c, g_bar1); SpinLockRelease(lock);
+               g_bar1Mapped = false; o.kb("unmapped", ok); }
+    }
+    o.kb("mapped", g_bar1Mapped); o.kh("bar1_block", g_bus.rd32(c->reg_bar1_block)); o.kh("bar2_block", g_bus.rd32(c->reg_bar2_block));
+    Bar1Json(o, g_bar1);
+    o.send();
+}
+
+// ------------------------------------------------------------------ P5 (M2)
+bool g_p5Done = false;
+struct PraminIo {   // VramIo over the BAR0 window (nv_gsp_bar1.h Pramin)
+    Pramin<Bar0Bus>& p;
+    uint32_t rd32(uint64_t a) { return p.rd32(a); }
+    void wr32(uint64_t a, uint32_t v) { p.wr32(a, v); }
+};
+void P5() {
+    Out o; o.raw("{\"nv_gsp\":\"p5\"");
+    const ChipOps* c = ChipForBoot0(g_bus.rd32(0));
+    if (!c || !g_rmRunning || !g_staticValid) { o.ks("refused", "GSP-RM is not running this boot"); o.send(); return; }
+    if (g_p5Done) { o.ks("refused", "already ran this boot (no retry)"); o.send(); return; }
+    M2Inputs in;
+    in.si = g_static;
+    in.vram_lo = 0x100000000ull; in.vram_hi = in.vram_lo + (1u << 20);   // 4 GiB: far from the display buffers (< 256 MiB)
+    auto sys = [](M2Sys* m) { DmaRegion d; if (!RmAlloc(0x1000, &d)) return false; m->cpu = d.cpu; m->bus = d.bus; m->bytes = d.bytes; return true; };
+    if (!sys(&in.gpfifo) || !sys(&in.push) || !sys(&in.sem)) { o.ks("refused", "no sysmem"); o.send(); return; }
+    g_p5Done = true;
+    SpinLock* lock = NvAuxSharedLock();
+    SpinLockAcquire(lock);                       // PRAMIN is shared with nv-disp
+    Pramin<Bar0Bus> pr(g_bus, *c);
+    PraminIo vio{pr};
+    RmWait wait; g_rm->wait_deadline_us = NowUs() + 5000000;
+    GspDoorbell<Bar0Bus, RmSync> bell{g_bus, *c, g_rmSync};
+    auto mthd = [](uint32_t bytes, M2Sys* m) { DmaRegion d; if (!RmAlloc(bytes, &d)) return false;
+        m->cpu = d.cpu; m->bus = d.bus; m->bytes = d.bytes; return true; };
+    const uint64_t fenceEnd = NowUs() + 2000000;
+    auto fence = [&] { FlushRange(in.sem.cpu, 64); g_bus.udelay(20); return NowUs() < fenceEnd; };
+    struct SubmitSync { M2Inputs& in; void operator()() {
+        FlushRange(in.gpfifo.cpu, 0x1000); FlushRange(in.push.cpu, 0x1000); FlushRange(in.sem.cpu, 0x1000); } } ss{in};
+    KPrintf("nv-gsp: P5 (M2 objects, NOP + semaphore) starting\n");
+    const M2Result m = RunM2(g_bus, *c, vio, in, g_rm->ch, g_rm->rx, g_rm->rxcap, wait, bell, mthd, fence, ss);
+    pr.Restore();
+    SpinLockRelease(lock);
+    o.ks("stage", m.stage); o.ks("status", m.status); o.kh("rm_status", m.rm_status); o.kh("rpc_result", m.rpc_result);
+    o.kd("q", uint32_t(m.q)); o.kh("ce_engine", m.ce_engine); o.kd("runlist", m.runlist); o.kd("devinfo_entries", m.devinfo_entries);
+    o.kh("mthdbuf_size", m.mthdbuf_size); o.kh("inst", m.inst); o.kh("userd", m.userd); o.kh("pd3", m.pd3);
+    o.kd("pt_pages", m.pt_pages); o.kd("ptes", m.ptes); o.kh("token", m.token); o.kh("token_rm", m.token_rm);
+    o.kb("token_ctrl_ok", m.token_ctrl_ok); o.kb("schedule_on_tsg", m.schedule_on_tsg);
+    o.kd("allocated", m.allocated); o.kd("freed", m.freed);
+    o.kb("fence_ok", m.fence_ok); o.kh("sem_value", m.sem_value); o.kd("fence_us", m.fence_us); o.kd("gp_get", m.gp_get);
+    o.k("events"); o.raw("{"); o.kd("total", m.ev.total); o.kd("rc", m.ev.rc); o.kd("mmu_fault", m.ev.mmu_fault);
+    o.kd("os_error", m.ev.os_error); o.kd("post_event", m.ev.post_event); o.kd("nocat", m.ev.nocat); o.kd("other", m.ev.other);
+    o.kh("last_other_fn", m.ev.last_other_fn);
+    o.k("last_rc"); o.raw("\""); for (uint32_t i = 0; i < 32; ++i) { const char* hx = "0123456789abcdef";
+        char b[3] = {hx[m.ev.last_rc[i] >> 4], hx[m.ev.last_rc[i] & 15], 0}; o.raw(b); } o.raw("\"");
+    o.raw("}");
+    o.kh("mbox0_now", g_bus.rd32(c->gsp_falcon + kFMbox0)); o.kh("riscv_cpuctl_now", g_bus.rd32(c->gsp_riscv + kRiscvCpuctl));
+    KPrintf("nv-gsp: P5 %s at %s (rm 0x%x): fence %d value %x in %lu us, ce %x runlist %u token %x\n", m.status, m.stage,
+            m.rm_status, m.fence_ok ? 1 : 0, m.sem_value, (unsigned long)m.fence_us, m.ce_engine, m.runlist, m.token);
     o.send();
 }
 
@@ -692,7 +928,17 @@ bool NvGspHandle(const char* command) {
     if (!strcmp(verb, "status")) Status();
     else if (!strcmp(verb, "p3")) P3();
     else if (!strcmp(verb, "fini")) Fini();
-    else if (!strcmp(verb, "p4")) P4();
+    else if (!strcmp(verb, "p4")) P4(false);
+    else if (!strcmp(verb, "p4 keep-display")) P4(true);
+    else if (!strncmp(verb, "static", 6) && (!verb[6] || verb[6] == ' ')) {
+        uint32_t off = 0; for (const char* p = verb + 6; *p; ++p) if (*p >= '0' && *p <= '9') off = off * 10 + uint32_t(*p - '0');
+        StaticVerb(off);
+    }
+    else if (!strcmp(verb, "bar1 map")) Bar1Verb(1, 16);
+    else if (!strcmp(verb, "bar1 map 2m")) Bar1Verb(1, 21);
+    else if (!strcmp(verb, "bar1 unmap")) Bar1Verb(2, 0);
+    else if (!strcmp(verb, "bar1 status")) Bar1Verb(0, 0);
+    else if (!strcmp(verb, "p5")) P5();
     else if (!strncmp(verb, "log ", 4)) {
         char which[8]{}; uint32_t i = 0; const char* p = verb + 4;
         while (*p && *p != ' ' && i < 7) which[i++] = *p++;
@@ -703,7 +949,7 @@ bool NvGspHandle(const char* command) {
     else if (!strncmp(verb, "trace", 5) && (!verb[5] || verb[5] == ' ')) {
         uint32_t from = 0; for (const char* p = verb + 5; *p; ++p) if (*p >= '0' && *p <= '9') from = from * 10 + uint32_t(*p - '0');
         Trace(from);
-    } else DebugChannelSend("{\"nv_gsp\":\"error\",\"msg\":\"Expected status|p3|fini|trace [from]\"}\n");
+    } else DebugChannelSend("{\"nv_gsp\":\"error\",\"msg\":\"Expected status|p3|p4 [keep-display]|fini|static [off]|bar1 map [2m]|unmap|status|p5|log|trace [from]\"}\n");
     __atomic_store_n(&g_busy, 0u, __ATOMIC_RELEASE);
     return true;
 }

@@ -130,7 +130,7 @@ set(BROOK_NV_GSP_VBIOS "" CACHE FILEPATH "Full TU104 VBIOS ROM dump (333824 B)")
 set(BROOK_NV_GSP_PCIROM "" CACHE FILEPATH "Partial PCI ROM BAR dump (55808 B), optional")
 set(_nv_gsp_env "BROOK_NV_GSP_FW_DIR=${BROOK_NV_GSP_FW_DIR}" "BROOK_NV_GSP_ACR_BL=${BROOK_NV_GSP_ACR_BL}"
     "BROOK_NV_GSP_VBIOS=${BROOK_NV_GSP_VBIOS}" "BROOK_NV_GSP_PCIROM=${BROOK_NV_GSP_PCIROM}")
-foreach(_t test_nv_gsp_fw test_nv_gsp_core test_nv_gsp_queue test_nv_gsp_boot test_nv_gsp_p3 test_nv_gsp_p4)
+foreach(_t test_nv_gsp_fw test_nv_gsp_core test_nv_gsp_queue test_nv_gsp_boot test_nv_gsp_p3 test_nv_gsp_p4 test_nv_gsp_gmmu)
     add_host_test(${_t})
     target_compile_options(${_t} PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
     set_tests_properties(${_t} PROPERTIES ENVIRONMENT "${_nv_gsp_env}")

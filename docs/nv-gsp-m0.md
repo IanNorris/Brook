@@ -184,3 +184,56 @@ mismatch.
   chains, plays the Linux message order, and answers the static-info and
   unload RPCs. With the real blobs and `BROOK_NV_GSP_SEQ` its `--record` log
   matches the reference 164/164 from fwsec_frts through cpu_sequencer.
+
+## M1 follow-up and M2 start (work/gsp-m1-p5)
+
+- **Logs.** `scripts/nv_gsp_logdecode.py` decodes LOGINIT/LOGINTR/LOGRM
+  captures. Records are `[args][metadata VA][timestamp]`; the format strings
+  live in NVIDIA's `gsp_log_tu10x.bin` (`.fwlogging_init`/`_rm`), which is not
+  in linux-firmware or the 570.144 .run, so without it the tool prints the
+  metadata pointer and arguments, resolving string arguments from the image.
+- **Static info.** `nv_gsp/nv_gsp_static.h` parses GspStaticConfigInfo
+  (0x678 B, offsets from compiling nouveau's r570 headers): FB regions
+  (client-usable = not reserved, not protected, as nouveau), bar1PdeBase /
+  bar2PdeBase, UUID (gidInfo, binary), name, RM's internal client/device/
+  subdevice handles. P4 keeps the whole reply; `nv-gsp static [off]`.
+- **BAR1 handover (interim, before M8).** At INIT_DONE RM binds BAR1 to a
+  virtual VA space whose root PD3 (bar1PdeBase) is empty; CPU writes through
+  BAR1 then fault (LOGRM: `BAR1 HUBCLIENT_HOST_CPU_NB FAULT_PDE` at the
+  nv-disp surface/instmem offsets), which is why flips time out while scanout
+  continues. A GSP client owns all BAR1 page tables (open-gpu
+  kbusPatchBar1Pdb_GSPCLIENT; nouveau r535_bar_bar1_init); there is no RM
+  object or control that maps BAR1. `nv_gsp/nv_gsp_bar1.h` checks the
+  instance block's PDB against bar1PdeBase, records RM's PD3, builds a
+  private sysmem tree identity-mapping BAR1 [0, 256 MiB) to VRAM with 64 KiB
+  pages, writes PD3[0] through PRAMIN, flushes and invalidates
+  (0xb830a0/a4/b0 = 0x80000007), and probes BAR1 against PRAMIN. nv-disp keeps
+  its BAR1 = VRAM view unchanged. `nv-gsp p4 keep-display` holds the nv-aux
+  lock from before the boot until the map is in place; `nv-gsp bar1
+  map [2m]|unmap|status` does it by hand.
+- **Display ownership.** RM leaves the running display alone at INIT_DONE
+  (scanout continued in P4): display instmem (0x610010/14) is only programmed
+  when a client sends NV2080_CTRL_CMD_INTERNAL_DISPLAY_WRITE_INST_MEM, and
+  Brook's core/window channels are unknown to RM. Allocating the display
+  class / RM display channels (M8) is where RM takes over, so M8 must tear
+  down Brook's channels first and recreate them through RM.
+- **Pre-reset hook.** Once RM reached INIT_DONE, a quiesce hook runs the RM
+  fini (UNLOADING_GUEST_DRIVER, FWSEC-SB, booter_unload) from cached inputs
+  before nv-disp's quiesce and the FLR; RM unload puts BAR1 back in physical
+  mode, so nv-disp's teardown is unchanged.
+- **M2.** `nv_gsp/nv_gsp_rmapi.h` (RM_ALLOC / RM_CONTROL / FREE RPCs, event
+  counts) and `nv_gsp/nv_gsp_m2.h` (`nv-gsp p5`): client, device,
+  subdevice; device-info table and CE fault-method-buffer size from RM's
+  internal subdevice (async copy engine + runlist); VRAM instance block, USERD
+  and GMMU v2 tables from a Brook VRAM range (4 GiB, client region) written
+  through PRAMIN; FERMI_VASPACE_A (externally owned) + SET_PAGE_DIRECTORY;
+  KEPLER_CHANNEL_GROUP_A; TURING_CHANNEL_GPFIFO_A under the TSG; BIND,
+  GPFIFO_SCHEDULE; NOP + SEM release; doorbell 0xbb0090 = runlist<<16|chid
+  (or RM's work-submit token); fence poll; teardown. `nv_gsp/nv_gmmu.h` is the
+  chip-neutral GMMU builder/walker (ChipOps.gmmu = GMMU v2).
+- **Tests.** `test_nv_gsp_gmmu` (encodings vs nouveau's formulas, 4K/64K/2M
+  maps, conflicts, random walks, 256 MiB identity, static-info parse);
+  `test_nv_gsp_p4` now also runs the BAR1 handover (fault before, identity
+  after, PRAMIN restored, RM tree detection, unmap, PDB-mismatch refusal) and
+  M2 against the fake RM (object rules, device-info, host model executing the
+  NOP and semaphore through the VAS page tables) plus its failure variants.

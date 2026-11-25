@@ -19,6 +19,8 @@
 #include <string>
 #include <vector>
 #include "nv_gsp/nv_gsp_rm.h"
+#include "nv_gsp/nv_gsp_bar1.h"
+#include "nv_gsp/nv_gsp_m2.h"
 #include "../nv_gsp_fake/fake_gpu.h"
 #include "../nv_gsp_fake/fake_rm.h"
 #include "../nv_gsp_fake/synth_fw.h"
@@ -105,6 +107,48 @@ struct Rig {
                      uint32_t(rx.size()), prepare, arm, wait, sync);
     }
     P4Result Run() { return Run([] { return true; }); }
+    // ---- after INIT_DONE: BAR1 handover and M2 against the fake RM
+    struct PageAlloc { Rig* r; bool operator()(uint64_t* bus, uint8_t** cpu) {
+        DmaRegion d; if (!r->arena(0x1000, &d)) return false; *bus = d.bus; *cpu = d.cpu; return true; }
+        void flush(uint8_t*) {} };
+    // CPU read through BAR1: the walk the BAR1 host translation does from the bound PDB.
+    struct Bar1Cpu {
+        Rig* r;
+        struct Mem { fake_gpu::FakeGpu& g;
+            uint64_t rd64(Aperture a, uint64_t x) { if (a == Aperture::Video) return g.Vram64(x);
+                const uint8_t* d = g.Dma(x, 8); uint64_t v = 0; if (d) std::memcpy(&v, d, 8); return v; } };
+        bool operator()(uint64_t off, uint32_t* v) {
+            const uint32_t blk = r->gpu.reg[0xb80f40];
+            if (!(blk & 0x80000000u)) { *v = r->gpu.Vram32(off); return true; }
+            const uint64_t pdb = r->gpu.Vram64((uint64_t(blk & 0x0fffffff) << 12) + 0x200) & ~0xfffull;
+            Mem m{r->gpu};
+            const Translation t = GmmuWalk(m, kGmmuV2, pdb, Aperture::Video, off);
+            if (!t.ok || t.aper != Aperture::Video) return false;   // a fault: write dropped / read garbage
+            *v = r->gpu.Vram32(t.pa); return true;
+        }
+    };
+    Bar1Map Bar1(uint64_t pde) {
+        PageAlloc pa{this};
+        const uint64_t probes[3] = {0x0, 0x4343000, 0xff13000};   // P4's faulting offsets (GOP surface, a surface, instmem)
+        return MapBar1Identity(gpu, kChipTu104, pa, pde, 256ull << 20, probes, 3, Bar1Cpu{this});
+    }
+    M2Result M2() {
+        struct W { Rig* r; bool operator()() { return r->Wait(); } } wait{this};
+        GspDoorbell<fake_gpu::FakeGpu, NoSync> bell{gpu, kChipTu104, sync};
+        Pramin<fake_gpu::FakeGpu> vram(gpu, kChipTu104);
+        M2Inputs in;
+        in.si = last.si;
+        in.vram_lo = 0x100000000ull; in.vram_hi = 0x100100000ull;
+        auto sys = [&](M2Sys* s) { DmaRegion d; assert(arena(0x1000, &d)); s->cpu = d.cpu; s->bus = d.bus; s->bytes = d.bytes; };
+        sys(&in.gpfifo); sys(&in.push); sys(&in.sem);
+        auto mthd = [&](uint32_t bytes, M2Sys* s) { DmaRegion d; if (!arena(bytes, &d)) return false;
+            s->cpu = d.cpu; s->bus = d.bus; s->bytes = d.bytes; return true; };
+        auto fence = [&] { return Wait(); };
+        M2Result m = RunM2(gpu, kChipTu104, vram, in, ch.get(), rx.data(), uint32_t(rx.size()), wait, bell, mthd, fence, sync);
+        vram.Restore();
+        return m;
+    }
+    P4Result last;
     RmFiniResult Unload() {
         struct W { Rig* r; bool operator()() { return r->Wait(); } } wait{this};
         return RunRmUnload(gpu, kChipTu104, ch.get(), rx.data(), uint32_t(rx.size()), wait, sync);
@@ -167,7 +211,7 @@ int main(int argc, char** argv) {
     // ---- full boot, both layouts
     for (uint32_t vga : {0x1u, 0x20e09u}) {
         Rig r(I, vga);
-        const P4Result p = r.Run();
+        const P4Result& p = (r.last = r.Run());
         if (p.status != BootStatus::Ok)
             std::fprintf(stderr, "p4 vga=%x: %s at %s (q=%d fake=%s model=%s seq=%s)\n", vga, BootStatusName(p.status), p.stage,
                          int(p.q), r.rm.error.c_str(), r.gpu.model_error.c_str(), SeqStatusName(p.seq.status));
@@ -180,6 +224,48 @@ int main(int argc, char** argv) {
         assert(Wpr2HiToEnd(p.booter.wpr2_hi) == p.p3.layout.frts.end());
         if (I.real) CheckPayloads(r.rm);
         if (record && vga == record_vga) assert(r.gpu.WriteRawLog(record));
+        // ---- static info parse (fake reply mirrors the r570 layout)
+        assert(p.si.ok && p.si.bar1_pde == fake_gpu::FakeRm::kBar1Pde && p.si.bar2_pde == fake_gpu::FakeRm::kBar2Pde);
+        assert(p.si.uuid_ok && p.si.uuid[0] == 0xa0 && p.si.fb_regions == 3 && p.si.usable_hi == 0x1f7700000ull);
+        assert(p.si.h_internal_subdevice == fake_gpu::FakeRm::kIntSubdevice && !std::strcmp(p.si.short_name, "TU104"));
+        // ---- BAR1 handover: CPU writes fault after RM's switch, the identity map restores them
+        r.rm.SetupBar1();
+        r.gpu.SetVram32(0x0, 0x11223344); r.gpu.SetVram32(0x4343000, 0x55667788); r.gpu.SetVram32(0xff13000, 0x99aabbcc);
+        { uint32_t v; assert(!Rig::Bar1Cpu{&r}(0x4343000, &v)); }
+        const size_t inv0 = r.gpu.invalidates;
+        const Bar1Map bm = r.Bar1(p.si.bar1_pde);
+        if (!bm.ok()) std::fprintf(stderr, "bar1: %s at %s\n", bm.status, bm.stage);
+        assert(bm.ok() && bm.committed && bm.invalidated && r.gpu.invalidates == inv0 + 1 && !bm.rm_tree);
+        assert(bm.probes == 3 && bm.probes_equal == 3 && bm.page_shift == 16 && bm.ptes == 4096);
+        assert(r.gpu.reg[0x1700] == 0x1fff0);                      // PRAMIN window restored
+        for (uint64_t off = 0; off < (256ull << 20); off += 0x7654321) {
+            uint32_t v; r.gpu.SetVram32(off & ~3ull, uint32_t(off)); assert(Rig::Bar1Cpu{&r}(off & ~3ull, &v) && v == uint32_t(off));
+        }
+        { Bar1Map again = r.Bar1(p.si.bar1_pde); assert(again.ok() && again.rm_tree && again.rm_tree_sys); }   // previous tree: sysmem
+        assert(UnmapBar1Identity(r.gpu, kChipTu104, bm));
+        {   // an RM-built VRAM tree with three 4 KiB pages at BAR1 0x80000 is found, counted and replaced
+            struct VMem { fake_gpu::FakeGpu& g; uint64_t next = 0x1f7600000ull;
+                bool alloc(uint64_t* a, Aperture* ap) { *a = next; next += 0x1000; *ap = Aperture::Video;
+                    for (uint32_t i = 0; i < 0x1000; i += 4) g.SetVram32(*a + i, 0); return true; }
+                uint64_t rd64(Aperture, uint64_t x) { return g.Vram64(x); }
+                void wr64(Aperture, uint64_t x, uint64_t v) { g.SetVram32(x, uint32_t(v)); g.SetVram32(x + 4, uint32_t(v >> 32)); } } vm{r.gpu};
+            GmmuBuilder<VMem> rmb{vm, kGmmuV2};
+            rmb.Adopt(p.si.bar1_pde, Aperture::Video);
+            assert(rmb.Map(0x80000, 0x1f7000000ull, 0x3000, 12, Aperture::Video));
+            const Bar1Map rb = r.Bar1(p.si.bar1_pde);
+            assert(rb.ok() && rb.rm_tree && !rb.rm_tree_sys && rb.rm_valid == 3 && rb.rm_first_va[0] == 0x80000 && rb.probes_equal == 3);
+            assert(UnmapBar1Identity(r.gpu, kChipTu104, rb));
+            assert(r.gpu.Vram64(p.si.bar1_pde) == rb.pd3_old[0]);
+            r.gpu.SetVram32(p.si.bar1_pde, 0); r.gpu.SetVram32(p.si.bar1_pde + 4, 0);
+        }
+        { uint32_t v; assert(!Rig::Bar1Cpu{&r}(0x4343000, &v)); }
+        { Bar1Map bad = r.Bar1(p.si.bar1_pde + 0x1000); assert(!bad.ok() && !bad.committed && !std::strcmp(bad.stage, "inst_pdb")); }
+        // ---- M2: objects, VRAM, GMMU, VAS, TSG, channel, NOP + semaphore
+        const M2Result m = r.M2();
+        if (!m.ok()) std::fprintf(stderr, "m2: %s at %s (rm 0x%x q %d fake=%s)\n", m.status, m.stage, m.rm_status, int(m.q), r.rm.error.c_str());
+        assert(m.ok() && m.fence_ok && m.sem_value == kM2Payload && r.rm.sem_releases == 1 && r.rm.nops == 1);
+        assert(m.ce_engine == rm570::RM_ENGINE_TYPE_COPY0 + 2 && m.runlist == 2 && m.token == 0x20000 && m.token_ctrl_ok);
+        assert(m.gp_get == 1 && m.allocated == 6 && m.freed == 6 && r.rm.objs.empty() && m.mthdbuf_size == 0x1000 && !m.schedule_on_tsg);
         // ---- RM-aware fini: unload RPC, then FWSEC-SB + booter_unload clear WPR2
         const RmFiniResult u = r.Unload();
         assert(u.status == BootStatus::Ok && u.halted && u.mbox0_after == 0x80000000 && r.rm.unload_requests == 1);
@@ -216,6 +302,27 @@ int main(int argc, char** argv) {
         Rig r(I, 0x1); r.rm.static_result = 0x56;                  // RPC error on the first RPC
         const P4Result p = r.Run();
         assert(p.init_done && p.q == QStatus::RpcError && std::strcmp(p.stage, "static_info") == 0);
+    }
+    // ---- M2 variants
+    {
+        Rig r(I, 0x1); r.last = r.Run(); assert(r.last.init_done);
+        r.rm.token_ctrl_supported = false; r.rm.channel_schedule_supported = false;
+        const M2Result m = r.M2();
+        assert(m.ok() && !m.token_ctrl_ok && m.token == 0x20000 && m.schedule_on_tsg && r.rm.objs.empty());
+    }
+    {
+        Rig r(I, 0x1); r.last = r.Run(); assert(r.last.init_done);
+        r.rm.fail_class = rm570::TURING_CHANNEL_GPFIFO_A;
+        const M2Result m = r.M2();
+        assert(!m.ok() && !std::strcmp(m.stage, "channel") && m.rm_status == 0x1f && r.rm.objs.empty() && r.rm.sem_releases == 0);
+        assert(r.gpu.doorbells.empty());
+    }
+    {
+        Rig r(I, 0x1); r.last = r.Run(); assert(r.last.init_done);
+        r.last.si.fb[0].reserved = 1;                              // M2 VRAM not client-owned: refused before any RPC
+        const uint32_t before = r.rm.rpcs;
+        const M2Result m = r.M2();
+        assert(!m.ok() && !std::strcmp(m.stage, "check") && r.rm.rpcs == before);
     }
     std::printf("test_nv_gsp_p4: OK (%s inputs%s)\n", I.real ? "real" : "synthetic", I.seq.empty() ? "" : ", real sequencer");
     return 0;

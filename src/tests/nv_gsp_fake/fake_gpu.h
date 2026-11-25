@@ -96,6 +96,25 @@ public:
         return std::fclose(f) == 0;
     }
 
+    // VRAM (sparse 4 KiB pages) behind the PRAMIN window (0x1700 base >> 16,
+    // data at 0x700000..0x7fffff); the MMU invalidate trigger 0xb830b0 and the
+    // FB flush 0x070000 complete at once; doorbell writes (0xbb0090) are kept.
+    std::map<uint64_t, std::vector<uint8_t>> vram;
+    uint32_t Vram32(uint64_t a) {
+        auto it = vram.find(a & ~0xfffull);
+        if (it == vram.end()) return 0;
+        uint32_t v; std::memcpy(&v, it->second.data() + (a & 0xfff), 4); return v;
+    }
+    void SetVram32(uint64_t a, uint32_t v) {
+        auto& pg = vram[a & ~0xfffull];
+        if (pg.empty()) pg.assign(0x1000, 0);
+        std::memcpy(pg.data() + (a & 0xfff), &v, 4);
+    }
+    uint64_t Vram64(uint64_t a) { return Vram32(a) | (uint64_t(Vram32(a + 4)) << 32); }
+    uint32_t invalidates = 0, flushes = 0;
+    std::vector<uint32_t> doorbells;
+    uint64_t PraminAddr(uint32_t off) { return (uint64_t(Get(0x1700) & 0xffffff) << 16) + (off - 0x700000); }
+
     std::map<uint32_t, uint32_t> reg;
     std::vector<Access> log;
     std::string phase = "pre", step = "probe";
@@ -144,11 +163,16 @@ private:
         }
         if (off == 0x1180f8 && resume_countdown > 0 && --resume_countdown == 0)
             reg[off] |= 0x04000000;
+        if (off >= 0x700000 && off < 0x800000) return Vram32(PraminAddr(off));
         return Get(off);
     }
 
     void Write(uint32_t off, uint32_t v) {
         Falcon* f = Fl(off);
+        if (off >= 0x700000 && off < 0x800000) { SetVram32(PraminAddr(off), v); return; }
+        if (off == 0xb830b0) { if (v & 0x80000000u) ++invalidates; reg[off] = v & 0x7fffffffu; return; }
+        if (off == 0x070000) { ++flushes; reg[off] = 0; return; }
+        if (off == 0xbb0090) { doorbells.push_back(v); reg[off] = v; return; }
         if (!f) { reg[off] = v; return; }
         const uint32_t r = off - f->base;
         switch (r) {

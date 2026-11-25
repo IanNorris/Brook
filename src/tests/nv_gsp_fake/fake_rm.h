@@ -12,10 +12,14 @@
 // (MAILBOX0 = 0x80000000 afterwards, as RM does when it has unloaded).
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
+#include <map>
 #include <string>
 #include <vector>
 #include "fake_gpu.h"
 #include "nv_gsp/nvrm_r570.h"
+#include "nv_gsp/nvrm_r570_obj.h"
+#include "nv_gsp/nv_gmmu.h"
 
 namespace fake_gpu {
 
@@ -75,8 +79,7 @@ public:
                 if (fn == 65) {
                     ++static_requests;
                     if (e.size() != 32 + 0x678) return Fail("static info request size");
-                    std::vector<uint8_t> rep(0x678);
-                    for (size_t i = 0; i < rep.size(); ++i) rep[i] = uint8_t(i * 7 + 1);
+                    std::vector<uint8_t> rep = StaticReply();
                     if (!Write(65, rep.data(), uint32_t(rep.size()), static_result)) return false;
                 } else if (fn == 47) {
                     ++unload_requests;
@@ -85,12 +88,41 @@ public:
                     g_.reg[0x110040] = 0x80000000;
                     g_.reg[0x111240] = 0;                    // RISC-V stopped
                     stage = 4;
+                } else if (fn == 103) {
+                    if (!HandleAlloc(e)) return false;
+                } else if (fn == 76) {
+                    if (!HandleControl(e)) return false;
+                } else if (fn == 10) {
+                    if (!HandleFree(e)) return false;
                 } else {
                     return Fail("unexpected rpc " + std::to_string(fn));
                 }
             }
+            if (!Host()) return false;
         }
         return true;
+    }
+
+    // ---- M2 model inputs/observations
+    static constexpr uint32_t kIntClient = 0xc1e00004, kIntDevice = 0xde1d0001, kIntSubdevice = 0x5d1d0001;
+    static constexpr uint64_t kBar1Pde = 0x1f76c3000ull, kBar2Pde = 0x1f76c4000ull, kBar1Inst = 0x1f76c0000ull;
+    bool token_ctrl_supported = true, channel_schedule_supported = true;
+    uint32_t fail_class = ~0u;                     // RM_ALLOC of this class returns NV_ERR_INVALID_ARGUMENT
+    struct Obj { uint32_t parent, cls; std::vector<uint8_t> params; };
+    std::map<uint32_t, Obj> objs;
+    std::vector<std::string> calls;                // "alloc 0xa06c", "ctrl 0x801813", "free ..."
+    uint64_t pdb = 0; uint32_t pdb_aper = 9;       // SET_PAGE_DIRECTORY
+    bool scheduled = false, bound = false;
+    uint32_t sem_releases = 0, nops = 0, frees = 0;
+    std::string host_error;
+
+    // Program BAR1 the way GSP-RM leaves it after INIT_DONE (virtual, empty PD3).
+    void SetupBar1() {
+        g_.reg[0xb80f40] = 0x80000000u | uint32_t(kBar1Inst >> 12);
+        g_.reg[0xb80f48] = 0xc0000000u | uint32_t((kBar1Inst + 0x1000) >> 12);
+        g_.SetVram32(kBar1Inst + 0x200, uint32_t(kBar1Pde) | (1u << 10) | (1u << 11));
+        g_.SetVram32(kBar1Inst + 0x204, uint32_t(kBar1Pde >> 32));
+        g_.reg[0x1700] = 0x1fff0;                  // where the firmware left PRAMIN
     }
 
 private:
@@ -202,6 +234,231 @@ private:
         W32(msgq_ + 16, (wp + count) % 63);
         return true;
     }
+    // GspStaticConfigInfo as RM 570.144 fills it on this card (fields Brook
+    // parses; everything else keeps the old filler so static_head checks hold).
+    static std::vector<uint8_t> StaticReply() {
+        namespace si = brook::nvgsp::rm570::static_info;
+        std::vector<uint8_t> r(si::kBytes);
+        for (size_t i = 0; i < r.size(); ++i) r[i] = uint8_t(i * 7 + 1);
+        auto w32 = [&](uint32_t o, uint32_t v) { std::memcpy(r.data() + o, &v, 4); };
+        auto w64 = [&](uint32_t o, uint64_t v) { std::memcpy(r.data() + o, &v, 8); };
+        w32(si::kGidInfo, 0); w32(si::kGidInfo + 4, 2); w32(si::kGidInfo + 8, 16);
+        for (uint32_t i = 0; i < 16; ++i) r[si::kGidInfo + 12 + i] = uint8_t(0xa0 + i);
+        std::memset(r.data() + si::kFbRegionInfo, 0, 0x308);
+        w32(si::kFbRegionInfo, 3);
+        struct R { uint64_t b, l, rsv; uint8_t comp, iso, prot; } regs[3] = {
+            {0x0, 0x1f76fffffull, 0, 1, 1, 0},                   // client VRAM
+            {0x1f7700000ull, 0x1f7ffffffull, 0x900000, 0, 0, 0},  // RM reserved
+            {0x1f8000000ull, 0x1ffffffffull, 0, 0, 0, 1}};        // WPR2 (protected)
+        for (uint32_t i = 0; i < 3; ++i) {
+            const uint32_t o = si::kFbRegionInfo + si::kFbRegionFirst + i * si::kFbRegionStride;
+            w64(o, regs[i].b); w64(o + 8, regs[i].l); w64(o + 16, regs[i].rsv);
+            r[o + 28] = regs[i].comp; r[o + 29] = regs[i].iso; r[o + 30] = regs[i].prot;
+        }
+        w64(si::kFbLength, 0x200000000ull);
+        std::memset(r.data() + si::kGpuName, 0, 64);
+        std::memcpy(r.data() + si::kGpuName, "NVIDIA GeForce RTX 2080", 23);
+        std::memset(r.data() + si::kGpuShortName, 0, 64);
+        std::memcpy(r.data() + si::kGpuShortName, "TU104", 5);
+        w64(si::kBar1PdeBase, kBar1Pde); w64(si::kBar2PdeBase, kBar2Pde);
+        w32(si::kInternalClient, kIntClient); w32(si::kInternalDevice, kIntDevice); w32(si::kInternalSubdevice, kIntSubdevice);
+        r[si::kSplitVas] = 0; r[si::kIsGpuUefi] = 1;
+        return r;
+    }
+
+    // ---- RM objects
+    static constexpr uint32_t kErrInvalidArgument = 0x1f, kErrInvalidObjectParent = 0x2c, kErrNotSupported = 0x56,
+                              kErrInvalidObjectHandle = 0x33;
+    bool Reply(uint32_t fn, std::vector<uint8_t>& e, uint32_t status_off, uint32_t status) {
+        W32(e.data() + 32 + status_off, status);
+        return Write(fn, e.data() + 32, uint32_t(e.size() - 32), 0);
+    }
+    bool HandleAlloc(std::vector<uint8_t>& e) {
+        namespace rm = brook::nvgsp::rm570;
+        if (e.size() < 32 + 0x20) return Fail("alloc size");
+        const uint8_t* a = e.data() + 32;
+        const uint32_t hClient = R32(a), hParent = R32(a + 4), hObject = R32(a + 8), cls = R32(a + 12), n = R32(a + 20);
+        if (e.size() != 32 + 0x20 + n) return Fail("alloc paramsSize");
+        const uint8_t* p = a + 0x20;
+        char b[48]; std::snprintf(b, sizeof(b), "alloc 0x%x", cls); calls.push_back(b);
+        uint32_t st = 0;
+        auto need = [&](uint32_t sz) { if (n != sz) st = kErrInvalidArgument; };
+        auto parent_is = [&](uint32_t c) { auto it = objs.find(hParent); if (it == objs.end() || it->second.cls != c) st = kErrInvalidObjectParent; };
+        if (objs.count(hObject)) st = kErrInvalidObjectHandle;
+        else switch (cls) {
+            case rm::NV01_ROOT: need(0x78); if (!st && (hObject != hClient || R32(p) != hClient)) { st = kErrInvalidArgument; }
+                break;
+            case rm::NV01_DEVICE_0: need(0x38); parent_is(rm::NV01_ROOT); if (!st && R32(p + 4) != hClient) { st = kErrInvalidArgument; }
+                break;
+            case rm::NV20_SUBDEVICE_0: need(4); parent_is(rm::NV01_DEVICE_0); break;
+            case rm::FERMI_VASPACE_A: need(0x30); parent_is(rm::NV01_DEVICE_0);
+                if (!st && R32(p + 4) != rm::NV_VASPACE_ALLOCATION_FLAGS_IS_EXTERNALLY_OWNED) { st = kErrInvalidArgument; }
+                break;
+            case rm::KEPLER_CHANNEL_GROUP_A: need(20); parent_is(rm::NV01_DEVICE_0);
+                if (!st && (!objs.count(R32(p + 8)) || objs[R32(p + 8)].cls != rm::FERMI_VASPACE_A)) { st = kErrInvalidArgument; }
+                break;
+            case rm::TURING_CHANNEL_GPFIFO_A: {
+                need(sizeof(rm::NV_CHANNEL_ALLOC_PARAMS)); parent_is(rm::KEPLER_CHANNEL_GROUP_A);
+                if (st) break;
+                rm::NV_CHANNEL_ALLOC_PARAMS c; std::memcpy(&c, p, sizeof(c));
+                const Obj& tsg = objs[hParent];
+                const uint32_t tsg_eng = R32(tsg.params.data() + 12);
+                if (c.hVASpace != 0 || (c.engineType && c.engineType != tsg_eng)) st = kErrInvalidArgument;
+                if (c.instanceMem.addressSpace != rm::ADDR_FBMEM || c.userdMem.addressSpace != rm::ADDR_FBMEM ||
+                    c.mthdbufMem.addressSpace != rm::ADDR_SYSMEM || !c.mthdbufMem.size || c.gpFifoEntries == 0) st = kErrInvalidArgument;
+                if (!st && !g_.Dma(c.mthdbufMem.base, size_t(c.mthdbufMem.size))) st = kErrInvalidArgument;
+                if (!st && pdb_aper == 9) st = kErrInvalidArgument;   // VAS without a page directory
+                break;
+            }
+            default: st = kErrNotSupported; break;
+        }
+        if (cls == fail_class) st = kErrInvalidArgument;
+        if (!st) objs[hObject] = Obj{hParent, cls, std::vector<uint8_t>(p, p + n)};
+        return Reply(103, e, 16, st);
+    }
+    bool HandleControl(std::vector<uint8_t>& e) {
+        namespace rm = brook::nvgsp::rm570;
+        if (e.size() < 32 + 0x18) return Fail("control size");
+        uint8_t* a = e.data() + 32;
+        const uint32_t hClient = R32(a), hObject = R32(a + 4), cmd = R32(a + 8), n = R32(a + 16);
+        if (e.size() != 32 + 0x18 + n) return Fail("control paramsSize");
+        uint8_t* p = a + 0x18;
+        char b[48]; std::snprintf(b, sizeof(b), "ctrl 0x%x", cmd); calls.push_back(b);
+        uint32_t st = 0;
+        const bool internal = hClient == kIntClient && hObject == kIntSubdevice;
+        auto obj_is = [&](uint32_t c) { auto it = objs.find(hObject); return it != objs.end() && it->second.cls == c; };
+        switch (cmd) {
+            case rm::NV2080_CTRL_CMD_FIFO_GET_DEVICE_INFO_TABLE: {
+                if (!internal || n != sizeof(rm::NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_PARAMS)) { st = kErrInvalidArgument; break; }
+                rm::NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_PARAMS t = {};
+                struct { uint32_t eng, rl; const char* name; } d[] = {
+                    {rm::RM_ENGINE_TYPE_GR0, 0, "GRAPHICS"}, {rm::RM_ENGINE_TYPE_COPY0, 0, "GRCE"},
+                    {rm::RM_ENGINE_TYPE_COPY0 + 1, 0, "GRCE"}, {rm::RM_ENGINE_TYPE_COPY0 + 2, 2, "CE2"},
+                    {rm::RM_ENGINE_TYPE_COPY0 + 3, 3, "CE3"}};
+                t.numEntries = 5;
+                for (uint32_t i = 0; i < 5; ++i) {
+                    t.entries[i].engineData[rm::ENGINE_INFO_TYPE_RM_ENGINE_TYPE] = d[i].eng;
+                    t.entries[i].engineData[rm::ENGINE_INFO_TYPE_RUNLIST] = d[i].rl;
+                    std::strncpy(t.entries[i].engineName, d[i].name, 15);
+                }
+                std::memcpy(p, &t, sizeof(t));
+                break;
+            }
+            case rm::NV2080_CTRL_CMD_CE_GET_FAULT_METHOD_BUFFER_SIZE:
+                if (!internal || n != 4) st = kErrInvalidArgument; else W32(p, 0x1000);
+                break;
+            case rm::NV0080_CTRL_CMD_DMA_SET_PAGE_DIRECTORY: {
+                if (!obj_is(rm::NV01_DEVICE_0) || n != 0x20) { st = kErrInvalidArgument; break; }
+                rm::NV0080_CTRL_DMA_SET_PAGE_DIRECTORY_PARAMS q; std::memcpy(&q, p, sizeof(q));
+                if (!objs.count(q.hVASpace) || q.numEntries != 4 || (q.physAddress & 0xfff)) { st = kErrInvalidArgument; break; }
+                pdb = q.physAddress; pdb_aper = q.flags & 3;
+                break;
+            }
+            case rm::NV0080_CTRL_CMD_DMA_UNSET_PAGE_DIRECTORY:
+                if (!obj_is(rm::NV01_DEVICE_0)) st = kErrInvalidArgument; else pdb_aper = 9;
+                break;
+            case rm::NVA06F_CTRL_CMD_BIND:
+                if (!obj_is(rm::TURING_CHANNEL_GPFIFO_A) || n != 4) st = kErrInvalidArgument; else bound = true;
+                break;
+            case rm::NVA06F_CTRL_CMD_GPFIFO_SCHEDULE:
+                if (!obj_is(rm::TURING_CHANNEL_GPFIFO_A) || !bound) st = kErrInvalidArgument;
+                else if (!channel_schedule_supported) st = kErrNotSupported;
+                else scheduled = p[0];
+                break;
+            case 0xa06c0101:
+                if (!obj_is(rm::KEPLER_CHANNEL_GROUP_A)) st = kErrInvalidArgument; else scheduled = p[0];
+                break;
+            case rm::NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN:
+                if (!obj_is(rm::TURING_CHANNEL_GPFIFO_A) || !token_ctrl_supported) st = kErrNotSupported;
+                else W32(p, (2u << 16) | 0u);
+                break;
+            default: st = kErrNotSupported; break;
+        }
+        return Reply(76, e, 12, st);
+    }
+    bool HandleFree(std::vector<uint8_t>& e) {
+        if (e.size() != 32 + 16) return Fail("free size");
+        const uint32_t hRoot = R32(e.data() + 32), hObj = R32(e.data() + 40);
+        calls.push_back("free");
+        uint32_t st = 0;
+        if (!objs.count(hObj)) st = kErrInvalidObjectHandle;
+        else {
+            // freeing removes the object and its descendants
+            std::vector<uint32_t> kill{hObj};
+            for (size_t i = 0; i < kill.size(); ++i)
+                for (auto& kv : objs) if (kv.second.parent == kill[i] && kv.first != kill[i]) kill.push_back(kv.first);
+            for (uint32_t h : kill) objs.erase(h);
+            ++frees;
+        }
+        (void)hRoot;
+        return Reply(10, e, 12, st);
+    }
+
+    // ---- Host/PBDMA model: on each doorbell, fetch GPFIFO entries
+    // GP_GET..GP_PUT (USERD in VRAM) through the VAS page tables, run host
+    // methods (NOP, SEM_* release) and advance GP_GET.
+    struct PtMem {
+        fake_gpu::FakeGpu& g;
+        uint64_t rd64(brook::nvgsp::Aperture a, uint64_t addr) {
+            if (a == brook::nvgsp::Aperture::Video) return g.Vram64(addr);
+            const uint8_t* d = g.Dma(addr, 8); uint64_t v = 0; if (d) std::memcpy(&v, d, 8); return v;
+        }
+    };
+    size_t doorbells_seen = 0;
+    bool HostFail(const std::string& s) { host_error = s; return Fail("host: " + s); }
+    uint8_t* Va(uint64_t va, size_t n) {
+        PtMem m{g_};
+        const auto t = brook::nvgsp::GmmuWalk(m, brook::nvgsp::kGmmuV2, pdb,
+                                              pdb_aper == 0 ? brook::nvgsp::Aperture::Video : brook::nvgsp::Aperture::SysCoh, va);
+        if (!t.ok || t.aper != brook::nvgsp::Aperture::SysCoh) return nullptr;
+        return Mut(t.pa, n);
+    }
+    bool Host() {
+        namespace rm = brook::nvgsp::rm570;
+        while (doorbells_seen < g_.doorbells.size()) {
+            const uint32_t token = g_.doorbells[doorbells_seen++];
+            const Obj* ch = nullptr;
+            for (auto& kv : objs) if (kv.second.cls == rm::TURING_CHANNEL_GPFIFO_A) ch = &kv.second;
+            if (!ch || !scheduled) return HostFail("doorbell without a scheduled channel");
+            if (token != ((2u << 16) | 0u)) return HostFail("doorbell token");
+            rm::NV_CHANNEL_ALLOC_PARAMS c; std::memcpy(&c, ch->params.data(), sizeof(c));
+            const uint64_t userd = c.userdMem.base;
+            uint32_t get = g_.Vram32(userd + rm::host::USERD_GP_GET);
+            const uint32_t put = g_.Vram32(userd + rm::host::USERD_GP_PUT);
+            while (get != put) {
+                const uint8_t* gp = Va(c.gpFifoOffset + get * 8ull, 8);
+                if (!gp) return HostFail("GPFIFO not mapped");
+                const uint32_t lo = R32(gp), hi = R32(gp + 4);
+                const uint64_t addr = lo | (uint64_t(hi & 0xff) << 32);
+                const uint32_t words = (hi >> 10) & 0x1fffff;
+                const uint8_t* pb = Va(addr, words * 4ull);
+                if (!pb || !words) return HostFail("push buffer not mapped");
+                uint32_t sem_lo = 0, sem_hi = 0, payload = 0;
+                for (uint32_t i = 0; i < words;) {
+                    const uint32_t h = R32(pb + 4 * i++);
+                    if ((h >> 29) != 1) return HostFail("push header");
+                    const uint32_t cnt = (h >> 16) & 0x1fff; uint32_t m = (h & 0xfff) << 2;
+                    for (uint32_t k = 0; k < cnt; ++k, m += 4) {
+                        const uint32_t d = R32(pb + 4 * i++);
+                        if (m == rm::host::NOP) ++nops;
+                        else if (m == rm::host::SEM_ADDR_LO) sem_lo = d;
+                        else if (m == rm::host::SEM_ADDR_HI) sem_hi = d;
+                        else if (m == rm::host::SEM_PAYLOAD_LO) payload = d;
+                        else if (m == rm::host::SEM_EXECUTE) {
+                            if ((d & 7) != rm::host::SEM_EXECUTE_RELEASE) return HostFail("sem op");
+                            uint8_t* sp = Va(sem_lo | (uint64_t(sem_hi & 0xff) << 32), 4);
+                            if (!sp) return HostFail("semaphore not mapped");
+                            W32(sp, payload); ++sem_releases;
+                        } else return HostFail("method");
+                    }
+                }
+                get = (get + 1) % c.gpFifoEntries;
+            }
+            g_.SetVram32(userd + rm::host::USERD_GP_GET, get);
+        }
+        return true;
+    }
+
     // Minimal sequencer: the core ops the real 570.144 payload uses.
     static std::vector<uint8_t> SynthSeq() {
         const uint32_t cmds[] = {0, 0x110604, 4, 5, 6, 7, 8};   // WRITE FBIF_TRANSCFG1=4, RESET, START, WAIT, RESUME
