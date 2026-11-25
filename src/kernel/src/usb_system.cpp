@@ -235,22 +235,37 @@ static bool BindProfileTransfer() {
     if (markerResult || marker.isDir || marker.isSymlink) return false;
     constexpr char source[] = "/nix/var/.brook-transfer";
     constexpr char target[] = "/data/.brook-transfer";
+    VfsPath root{}, nix{}, var{}, data{}, transfer{};
+    int error = VfsPathRoot(&root);
+    if (!error) error = VfsPathResolve(root, root, "/nix", &nix, false);
+    if (!error) error = VfsPathResolve(root, root, "/nix/var", &var, false);
+    if (!error) error = VfsPathResolve(root, root, "/data", &data, false);
+    if (!error && (nix.attachment == root.attachment || nix.attachment != var.attachment ||
+                   data.attachment != root.attachment)) error = -18;
+    const char* directories[] = {"/nix/var", "/data"};
+    for (const char* path : directories) {
+        VnodeStat stat{};
+        if (!error && (VfsLstatPath(path, &stat) || !stat.isDir || stat.isSymlink)) error = -20;
+    }
     const char* paths[] = {source, target};
     for (const char* path : paths) {
-        int error = VfsMkdir(path, 0755);
-        if (error && error != -17) return false;
+        if (error) break;
+        const int created = VfsMkdir(path, 0755);
+        if (created && created != -17) {
+            error = created;
+            break;
+        }
         VnodeStat stat{};
         if (VfsLstatPath(path, &stat) || !stat.isDir || stat.isSymlink ||
-            stat.uid != 0 || (stat.mode & 0022)) return false;
+            stat.uid != 0 || (stat.mode & 0022)) error = -13;
     }
-    VfsPath root{}, nix{}, transfer{};
-    int error = VfsPathRoot(&root);
-    if (!error) error = VfsPathResolve(root, root, "/nix", &nix);
     if (!error) error = VfsPathResolve(root, root, source, &transfer, false);
     if (!error && nix.attachment != transfer.attachment) error = -18;
     if (!error)
         error = VfsMountNamespaceBindAt(VfsMountNamespaceInitial(), root, root, source, target);
     VfsPathRelease(transfer);
+    VfsPathRelease(data);
+    VfsPathRelease(var);
     VfsPathRelease(nix);
     VfsPathRelease(root);
     return !error;

@@ -249,6 +249,7 @@ boot_key=/etc/usb-profile-plan.pub
 house=/nix/etc/brook
 key=$house/stage-plan.pub
 [[ -s $boot_key && -d /data/.brook-transfer && ! -L /data/.brook-transfer ]]
+[[ -d /nix/etc && ! -L /nix/etc ]]
 mkdir -p -- "$house"
 [[ ! -L $house ]]
 if [[ ! -e $key && ! -L $key ]]; then

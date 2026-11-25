@@ -41,6 +41,33 @@ def profile_stdout(bridge, session, job, status):
         status = bridge.job(session, job, stdout_offset=offset, output_limit=16384)
 
 
+def usb_store_diff(bridge, journal, session, capabilities, closure):
+    capacity = capabilities.get('selected_store', {})
+    if capacity.get('transfer_shares_space') is not True:
+        raise ValueError('USB profile uploads must share the admitted /nix filesystem')
+    if not isinstance(capacity.get('store_names'), list):
+        raise ValueError('USB profile helper did not supply a store inventory')
+    present = set(capacity['store_names']) & closure.keys()
+    if not capacity.get('store_inventory_complete'):
+        # A large existing store can exceed the capability job's output ring.
+        # Query just the remaining signed names in bounded read-only jobs.
+        names = sorted(set(closure) - present)
+        script = 'for path; do if [[ -e /nix/store/$path || -L /nix/store/$path ]]; then printf "%s\n" "$path"; fi; done'
+        for i in range(0, len(names), 24):
+            batch = names[i:i + 24]
+            job = uuid.uuid4().hex
+            bridge.guest_run(session, job, ['/boot/bin/bash', '-c', script, 'store-inventory', *batch],
+                             cwd='/tmp', uid=1000, wait_s=2)
+            status = journal.wait_job(session, job, lambda reply: reply.get('state') == 'completed',
+                                      timeout=60)
+            reported = set(profile_stdout(bridge, session, job, status).splitlines())
+            if status.get('exit', {}).get('code') or not reported <= set(batch):
+                raise ValueError('Invalid USB profile store inventory')
+            present.update(reported)
+        capacity['store_names'] = sorted(present)
+    return set(closure) - present
+
+
 def stage_profile(args, *, bridge=None, bulk_port=1236, usb_system=False):
     a = args
     sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools/vm_bridge')]
@@ -111,10 +138,7 @@ def stage_profile(args, *, bridge=None, bulk_port=1236, usb_system=False):
                         prefix='.cache-bundles-', dir=journal.output)))
                     pack_options = {}
                     if usb_system:
-                        capacity = capabilities.get('selected_store', {})
-                        if not capacity.get('store_inventory_complete') or not capacity.get('transfer_shares_space'):
-                            raise ValueError('USB profile staging requires complete inventory and transfers on /nix')
-                        missing = set(plan['closure']) - set(capacity['store_names'])
+                        missing = usb_store_diff(bridge, journal, a.session, capabilities, plan['closure'])
                         pack_options['missing'] = missing
                         journal.save(missing_store_paths=sorted(missing))
                     bundles = list(pack_cache(a.profile_plan / 'cache', plan, work, **pack_options))

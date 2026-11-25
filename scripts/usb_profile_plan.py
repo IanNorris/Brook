@@ -41,4 +41,10 @@ def checked_plan(directory, public_key):
     validate_plan({**plan, 'format': 2})
     validate_usage(plan)
     validate_launcher_ids(plan['profile']['launcherIds'])
+    profile = Path('/nix/store') / plan['profile']['root']
+    for name in ('bash', 'brook-chromium', 'brook-gallery', 'hardware-dbus',
+                 'hardware-message', 'waylandd', 'brook-stage-profile'):
+        binary = profile / 'bin' / name
+        if not binary.is_file() or not binary.stat().st_mode & 0o111:
+            raise ValueError(f'Selected profile must provide {name} for USB desktop boot')
     return plan, hashlib.sha256(document).hexdigest(), key_bytes
