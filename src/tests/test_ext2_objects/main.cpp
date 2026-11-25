@@ -155,6 +155,55 @@ struct BackendProvider {
     int Parent(brook::VfsObject* o,brook::VfsObject*,brook::VfsObject*& out){return o->ops->parent(o,&out,false);}
     int Readlink(brook::VfsObject* o,char* out,uint32_t cap){return o->ops->readlink(o,out,cap);}
 };
+static void TestBatchedIndirectReads()
+{
+    using namespace brook;
+    constexpr uint32_t size = 1024;
+    constexpr uint32_t pointers = size / sizeof(uint32_t);
+    std::vector<unsigned char> blocks(12 * size);
+    auto pointer = [&](uint32_t block, uint32_t index, uint32_t target) {
+        std::memcpy(blocks.data() + block * size + index * sizeof(target), &target, sizeof(target));
+    };
+    pointer(1, 0, 4);
+    pointer(1, 1, 5);
+    pointer(1, 2, 7); // The batch must stop at this gap.
+    pointer(4, 0, 8);
+    pointer(5, 0, 9);
+    pointer(7, 0, 10);
+    unsigned reads = 0;
+    struct Reader {
+        std::vector<unsigned char>& blocks;
+        unsigned& reads;
+    } reader{blocks, reads};
+    const DeviceOps ops = {nullptr, nullptr,
+        [](Device* dev, uint32_t cmd, void* arg) -> int {
+            if (cmd != DEVICE_IOCTL_USB_TAGGED_READ) return 0;
+            const auto& read = *static_cast<const UsbTaggedRead*>(arg);
+            auto& fixture = *static_cast<Reader*>(dev->priv);
+            assert(read.source == UsbReadSource::Indirect);
+            ++fixture.reads;
+            if (read.offset == 4 * size) assert(read.bytes == 2 * size);
+            std::memcpy(read.data, fixture.blocks.data() + read.offset, read.bytes);
+            return read.bytes;
+        }, nullptr};
+    Device device{&ops, "indirect-batch-test", DeviceType::Block, &reader};
+    Ext2Mount mount{};
+    mount.dev = &device;
+    mount.taggedReads = true;
+    mount.blockSize = size;
+    mount.blockShift = 10;
+    mount.totalBlocks = 12;
+    Ext2Inode inode{};
+    inode.i_block[13] = 1;
+    assert(Ext2BlockMap(&mount, &inode, 12 + pointers).block == 8);
+    assert(reads == 2);
+    assert(Ext2BlockMap(&mount, &inode, 12 + 2 * pointers).block == 9);
+    assert(reads == 2);
+    assert(Ext2BlockMap(&mount, &inode, 12 + 3 * pointers).block == 10);
+    assert(reads == 3);
+    for (auto* page : mount.indCacheData) if (page) kfree(page);
+}
+
 static void TestFailedIndirectReads()
 {
     using namespace brook;
@@ -290,6 +339,7 @@ int main(int argc,char** argv){
         indirectCheckLock=nullptr;
         for(auto* buffer:fixture.indCacheData)if(buffer)kfree(buffer);
     }
+    TestBatchedIndirectReads();
     TestFailedIndirectReads();
     g_ext2Devices[0]=&device;void* mount=nullptr;assert(Ext2FsMount(0,&mount));
     auto* m=static_cast<Ext2Mount*>(mount);
