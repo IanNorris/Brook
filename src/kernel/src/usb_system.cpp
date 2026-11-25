@@ -122,13 +122,13 @@ int MaybeTrim(uint8_t* gdt,uint32_t gdtCapacity) {
     SsdTrimRequest request{};
     if(!valid || !SsdTrimParseRequest(mode,uint32_t(stat.size),request) ||
        (request.run && !request.maximumMiB)) {
-        SerialPuts("USB_SYSTEM_TRIM {\"state\":\"invalid-marker\"}\n");
+        KPrintf("USB_SYSTEM_TRIM {\"state\":\"invalid-marker\"}\n");
         return 0;
     }
     UsbUnmapLimits limits{};
     int result=disk->ops->ioctl(disk,DEVICE_IOCTL_USB_UNMAP_LIMITS,&limits);
     if(result) {
-        SerialPrintf("USB_SYSTEM_TRIM {\"state\":\"probe\",\"error\":%d}\n",result);
+        KPrintf("USB_SYSTEM_TRIM {\"state\":\"probe\",\"error\":%d}\n",result);
         return result==-95?0:IoError(result);
     }
     UsbTrimBatchPlan plan(limits,uint64_t(request.maximumMiB)*2048);
@@ -148,7 +148,7 @@ int MaybeTrim(uint8_t* gdt,uint32_t gdtCapacity) {
             if(result)return false;
         }
         for(uint32_t i=0;i<count;++i)
-            SerialPrintf("USB_SYSTEM_TRIM_RANGE {\"mode\":\"%s\",\"lba\":%lu,\"sectors\":%lu}\n",
+            KPrintf("USB_SYSTEM_TRIM_RANGE {\"mode\":\"%s\",\"lba\":%lu,\"sectors\":%lu}\n",
                 request.run?"run":"dry-run",ranges[i].start/512,ranges[i].length/512);
         ++batches;
         return true;
@@ -165,7 +165,7 @@ int MaybeTrim(uint8_t* gdt,uint32_t gdtCapacity) {
     } else if(scanned!=Ext2TrimScanResult::Cancelled) {
         result=scanned==Ext2TrimScanResult::IoError?-5:-117;
     }
-    SerialPrintf("USB_SYSTEM_TRIM {\"state\":\"done\",\"mode\":\"%s\",\"batches\":%u,\"sectors\":%lu,\"error\":%d}\n",
+    KPrintf("USB_SYSTEM_TRIM {\"state\":\"done\",\"mode\":\"%s\",\"batches\":%u,\"sectors\":%lu,\"error\":%d}\n",
         request.run?"run":"dry-run",batches,plan.total,result);
     return !request.run && scanned==Ext2TrimScanResult::Invalid?0:result;
 }

@@ -233,8 +233,27 @@ static void TestDown1WithQueuedFrame(){
     assert(g.d->out[1]==OutState::Off&&g.d->failures[1]==0&&f.fail==FlipFail::None);
     assert(g.d->Down0());
 }
+// D3: only pixels that differ from the shadow are reported (and recorded in it).
+static void TestShadowDiff(){
+    const uint32_t W=64,H=32;std::vector<uint32_t> src(W*H,7),sh(W*H,7);
+    brook::DamageRects out;
+    assert(ShadowDiff(src.data(),W,sh.data(),W,W,H,brook::DamageRect{0,0,64,32},out)==W*H&&out.empty());   // redrawn, same pixels
+    src[5*W+9]=1;src[7*W+30]=2;
+    assert(ShadowDiff(src.data(),W,sh.data(),W,W,H,brook::DamageRect{0,0,64,32},out)==W*H);
+    assert(out.count==1&&out.rects[0]==(brook::DamageRect{9,5,31,8})&&sh[5*W+9]==1&&sh[7*W+30]==2);
+    out=brook::DamageRects{};
+    assert(ShadowDiff(src.data(),W,sh.data(),W,W,H,brook::DamageRect{0,0,64,32},out)&&out.empty());     // now recorded
+    src[0]=3;src[W*H-1]=4;                                                  // the very first and last pixel
+    assert(ShadowDiff(src.data(),W,sh.data(),W,W,H,brook::DamageRect{-5,-5,99,99},out)==W*H);           // clipped to the head
+    assert(out.count==1&&out.rects[0]==(brook::DamageRect{0,0,64,32}));
+    out=brook::DamageRects{};src[3*W+2]=9;
+    assert(ShadowDiff(src.data(),W,sh.data(),W,W,H,brook::DamageRect{10,0,20,32},out)==10*32&&out.empty()); // outside the rect: not looked at
+    // Overflowing damage merges locally: two clusters stay apart.
+    brook::DamageRects d;for(int i=0;i<20;++i)d.Add({i*2,0,i*2+1,1});d.Add({5000,0,5001,1});
+    assert(d.count<=brook::DamageRects::Max);bool far=false;for(uint32_t i=0;i<d.count;++i)far|=d.rects[i].x0==5000;assert(far);
+}
 int main(){
-    TestUsToWrap();TestHeadOneThird();TestDown1WithQueuedFrame();
+    TestShadowDiff();TestUsToWrap();TestHeadOneThird();TestDown1WithQueuedFrame();
     TestOutput0();TestBothOutputs();TestFailures();TestPacing();TestLoadv();TestAgeRepair();TestTripleMailbox();TestVblankCounter();
     TestMsToVblank();
     puts("test_nv_disp_driver: ok");return 0;
