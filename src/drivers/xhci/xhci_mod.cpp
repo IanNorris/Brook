@@ -3623,7 +3623,7 @@ static bool XhciTryUas(XhciController& ctrl,XhciDevice& dev,bool& fallback) {
     if(cc==TRB_CC_SUCCESS) {
         dev.uas=uas;
         if(XhciIdentifyStorage(ctrl,dev)) {
-            SerialPrintf("xhci: UAS ready slot=%u iface=%u alt=%u depth=%u\n",
+            KPrintf("xhci: UAS ready slot=%u iface=%u alt=%u depth=%u\n",
                 dev.slotId,parsed.interface,parsed.alternate,UsbUasDepth);
             return true;
         }
@@ -3642,7 +3642,7 @@ static bool XhciTryUas(XhciController& ctrl,XhciDevice& dev,bool& fallback) {
         __atomic_store_n(&dev.mscQuarantined,false,__ATOMIC_RELEASE);
         return true;
     });
-    SerialPrintf("xhci: UAS init failed slot=%u cc=%u BOT fallback=%u\n",
+    KPrintf("xhci: UAS init failed slot=%u cc=%u BOT fallback=%u\n",
         dev.slotId,cc,fallback?1u:0u);
     return false;
 }
