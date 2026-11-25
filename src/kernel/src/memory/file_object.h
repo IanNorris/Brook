@@ -52,7 +52,7 @@ struct FileObject {
     // Optional kernel-only path into exclusive contiguous pages. The backend
     // may retain an allocation on uncertain DMA; the caller must abandon it.
     uint32_t readBurst;
-    int (*readOwned)(Vnode*,void*,uint64_t,uint64_t*,uint64_t,bool*);
+    int (*readOwned)(Vnode*,void*,uint64_t,uint64_t*,uint64_t,bool*,bool fault);
 };
 void FileObjectInit(FileObject* object);
 // Quiescent last-inode release only: no sleeping locks or I/O; IRQ-close safe.

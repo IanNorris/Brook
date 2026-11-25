@@ -924,6 +924,24 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
                     r.text(",");r.field("last_ns",p.lastNs);r.text("}");
                 };
                 phase("cbw",timing.command);phase("data",timing.data);phase("csw",timing.status);
+                constexpr const char* roots[]={"boot","file","fault","inode","indirect","directory","bitmap","bench","other"};
+                static_assert(sizeof(roots)/sizeof(*roots)==UsbReadSourceCount);
+                r.text(",\"read_request_max_bytes\":[512,4096,16384,65536,2147483647],\"read_sources\":{");
+                for(unsigned k=0;k<UsbReadSourceCount;++k) {
+                    if(k)r.text(",");
+                    r.quoted(roots[k]);r.text(":{");
+                    r.field("bytes",timing.readsBySource[k].bytes);r.text(",\"requests\":[");
+                    for(unsigned j=0;j<UsbReadBuckets;++j) {
+                        if(j)r.text(",");
+                        r.number(timing.readsBySource[k].requests[j]);
+                    }
+                    r.text("]}");
+                }
+                r.text("},\"mount_timing_us\":{");
+                r.field("identity",timing.admissionUs);r.text(",");
+                r.field("transport",timing.transportUs);r.text(",");
+                r.field("session",timing.sessionUs);r.text(",");
+                r.field("mount",timing.mountUs);r.text("}");
                 r.text("}");
             }
             r.text("}");

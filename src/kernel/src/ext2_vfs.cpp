@@ -206,6 +206,7 @@ struct Ext2Mount {
     Device*  dev;
     bool      hasWriteFence;
     uint32_t cacheNamespace; // unique for this mount's lifetime, including remounts
+    bool taggedReads;
     uint32_t readBurst;      // maximum coalesced data read in bytes
     uint32_t blockSize;      // bytes per block
     uint32_t blockShift;     // log2(blockSize)
@@ -413,7 +414,7 @@ static void Ext2RemoveOpenLocked(Ext2OpenInode* inode)
 }
 
 static int Ext2FileReadKernel(Vnode* vn,void* buf,uint64_t len,uint64_t* offset,
-                              uint64_t physical=0,bool* retain=nullptr);
+                              uint64_t physical=0,bool* retain=nullptr,bool fault=false);
 
 // Called with the filesystem lock held, before publishing a vnode.
 static Ext2OpenInode* Ext2HoldInode(Ext2Mount* mnt, uint32_t inode)
@@ -543,7 +544,13 @@ void Ext2ForceUnlockForPid(uint32_t pid)
 // This backend bypasses the queue: drains must never enqueue recursively.
 struct Ext2RawBackend {
     Ext2Mount* mnt;
+    UsbReadSource source=UsbReadSource::Other;
     bool Read(uint64_t offset,void* buffer,uint64_t length) {
+        if(mnt->taggedReads) {
+            UsbTaggedRead request{offset,buffer,length,source};
+            const int result=mnt->dev->ops->ioctl(mnt->dev,DEVICE_IOCTL_USB_TAGGED_READ,&request);
+            if(result!=-95)return result==static_cast<int>(length);
+        }
         return mnt->dev->ops->read(mnt->dev,offset,buffer,length)==static_cast<int>(length);
     }
     bool Write(uint64_t offset,const void* buffer,uint64_t length) {
@@ -562,14 +569,14 @@ struct Ext2RawBackend {
     bool Flush(){return DeviceFlush(mnt->dev)==0;}
 };
 static bool Ext2DevRead(Ext2Mount* mnt,uint64_t offset,void* buffer,uint64_t length,
-                        uint64_t physical=0,bool* retain=nullptr) {
+                        uint64_t physical=0,bool* retain=nullptr,UsbReadSource source=UsbReadSource::Other) {
     if(physical && !mnt->writeback.count && !mnt->writeback.retry && mnt->dev->ops->ioctl) {
-        UsbDmaRead request{offset,physical,uint32_t(length),false};
+        UsbDmaRead request{offset,physical,uint32_t(length),false,source};
         const int result=mnt->dev->ops->ioctl(mnt->dev,DEVICE_IOCTL_USB_READ_DMA,&request);
         if(retain && request.retain)*retain=true;
         if(result!=-95)return result==int(length);
     }
-    Ext2RawBackend io{mnt};
+    Ext2RawBackend io{mnt,source};
     const bool ok=mnt->writeback.bytes?mnt->writeback.Read(io,offset,buffer,length):io.Read(offset,buffer,length);
     if(!ok)SerialPrintf("ext2: DevRead FAIL off=%lu len=%lu\n",offset,length);
     return ok;
@@ -580,14 +587,15 @@ static bool Ext2BlockCacheLookup(Ext2Mount* mnt, uint32_t blockNum, void* buf);
 static void Ext2BlockCachePut(Ext2Mount* mnt, uint32_t blockNum, const void* buf);
 
 // Read a single block into buf. Checks the data block cache first.
-static bool Ext2ReadBlock(Ext2Mount* mnt, uint32_t blockNum, void* buf)
+static bool Ext2ReadBlock(Ext2Mount* mnt, uint32_t blockNum, void* buf,
+                          UsbReadSource source=UsbReadSource::Other)
 {
     if (blockNum == 0) return false;
     // Fast path: serve from cache
     if (Ext2BlockCacheLookup(mnt, blockNum, buf)) return true;
     // Cache miss: read from disk
     uint64_t off = static_cast<uint64_t>(blockNum) << mnt->blockShift;
-    if (!Ext2DevRead(mnt, off, buf, mnt->blockSize)) return false;
+    if (!Ext2DevRead(mnt,off,buf,mnt->blockSize,0,nullptr,source)) return false;
     // Populate cache with the freshly read block
     Ext2BlockCachePut(mnt, blockNum, buf);
     return true;
@@ -605,7 +613,7 @@ struct Ext2BlockLookup {
 static Ext2BlockLookup Ext2BlockMap(Ext2Mount* mnt, const Ext2Inode* ino, uint32_t fileBlock);
 static int Ext2ReadInodeData(Ext2Mount* mnt, const Ext2Inode* ino,
                              void* buf, uint64_t len, uint64_t offset,
-                             uint64_t physical=0,bool* retain=nullptr);
+                             uint64_t physical=0,bool* retain=nullptr,bool fault=false);
 static uint32_t Ext2DirLookup(Ext2Mount* mnt, uint32_t parentIno, const Ext2Inode* dirIno, const char* name, int* error=nullptr);
 static uint32_t Ext2ResolvePath(Ext2Mount* mnt, uint32_t startIno,
                                 const char* path, int symlinkDepth, int* error=nullptr);
@@ -866,7 +874,7 @@ static uint8_t* Ext2GetBlockBitmap(Ext2Mount* mnt, uint32_t group)
 
     auto* bm = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
     if (!bm) return nullptr;
-    if (!Ext2ReadBlock(mnt, mnt->bgdt[group].bg_block_bitmap, bm)) {
+    if (!Ext2ReadBlock(mnt, mnt->bgdt[group].bg_block_bitmap, bm,UsbReadSource::Bitmap)) {
         kfree(bm); return nullptr;
     }
     mnt->blockBitmapCache[group] = bm;
@@ -881,7 +889,7 @@ static uint8_t* Ext2GetInodeBitmap(Ext2Mount* mnt, uint32_t group)
 
     auto* bm = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
     if (!bm) return nullptr;
-    if (!Ext2ReadBlock(mnt, mnt->bgdt[group].bg_inode_bitmap, bm)) {
+    if (!Ext2ReadBlock(mnt, mnt->bgdt[group].bg_inode_bitmap, bm,UsbReadSource::Bitmap)) {
         kfree(bm); return nullptr;
     }
     mnt->inodeBitmapCache[group] = bm;
@@ -1935,7 +1943,7 @@ static bool Ext2ReadInode(Ext2Mount* mnt, uint32_t ino, Ext2Inode* out)
     uint64_t tableOff = static_cast<uint64_t>(mnt->bgdt[group].bg_inode_table)
                         << mnt->blockShift;
     uint64_t inodeOff = tableOff + static_cast<uint64_t>(index) * mnt->inodeSize;
-    if (!Ext2DevRead(mnt, inodeOff, out, sizeof(Ext2Inode))) return false;
+    if (!Ext2DevRead(mnt,inodeOff,out,sizeof(Ext2Inode),0,nullptr,UsbReadSource::Inode)) return false;
     Ext2InodeCachePut(mnt, ino, out);
     return true;
 }
@@ -1970,11 +1978,11 @@ static Ext2BlockLookup Ext2ReadIndPointer(Ext2Mount* mnt, uint32_t indBlock, uin
     auto* candidate = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
     if (!candidate) {
         uint64_t off = (static_cast<uint64_t>(indBlock) << mnt->blockShift) + idx * 4;
-        if (!Ext2DevRead(mnt, off, &entry, 4)) return {0, true};
+        if (!Ext2DevRead(mnt,off,&entry,4,0,nullptr,UsbReadSource::Indirect)) return {0, true};
         return {entry};
     }
     uint64_t blockOff = static_cast<uint64_t>(indBlock) << mnt->blockShift;
-    if (!Ext2DevRead(mnt, blockOff, candidate, mnt->blockSize)) {
+    if (!Ext2DevRead(mnt,blockOff,candidate,mnt->blockSize,0,nullptr,UsbReadSource::Indirect)) {
         kfree(candidate);
         return {0, true};
     }
@@ -2037,8 +2045,10 @@ static Ext2BlockLookup Ext2BlockMap(Ext2Mount* mnt, const Ext2Inode* ino, uint32
 // per-block virtio round-trips into a single 64KB transfer.
 static int Ext2ReadInodeData(Ext2Mount* mnt, const Ext2Inode* ino,
                              void* buf, uint64_t len, uint64_t offset,
-                             uint64_t physical,bool* retain)
+                             uint64_t physical,bool* retain,bool fault)
 {
+    const auto source=(ino->i_mode&EXT2_S_IFMT)==EXT2_S_IFDIR?UsbReadSource::Directory:
+                      fault?UsbReadSource::Fault:UsbReadSource::File;
     uint64_t fileSize = Ext2InodeSize(ino);
     if (offset >= fileSize) {
         return 0;
@@ -2088,7 +2098,7 @@ static int Ext2ReadInodeData(Ext2Mount* mnt, const Ext2Inode* ino,
                 error = -12;
                 break;
             }
-            if (!Ext2ReadBlock(mnt, diskBlock, bb)) {
+            if (!Ext2ReadBlock(mnt,diskBlock,bb,source)) {
                 SerialPrintf("ext2: ReadBlock failed for diskBlock=%u (fileBlock=%u)\n",
                              diskBlock, fileBlock);
                 error = -5;
@@ -2128,7 +2138,7 @@ static int Ext2ReadInodeData(Ext2Mount* mnt, const Ext2Inode* ino,
 
         uint64_t runBytes = static_cast<uint64_t>(runBlocks) << mnt->blockShift;
         uint64_t runOff   = static_cast<uint64_t>(diskBlock) << mnt->blockShift;
-        if (!Ext2DevRead(mnt,runOff,dst+bytesRead,runBytes,physical?physical+bytesRead:0,retain)) {
+        if (!Ext2DevRead(mnt,runOff,dst+bytesRead,runBytes,physical?physical+bytesRead:0,retain,source)) {
             SerialPrintf("ext2: coalesced read failed off=%lu len=%lu\n",
                          runOff, runBytes);
             error = -5;
@@ -2173,7 +2183,7 @@ static uint32_t Ext2DirLookup(Ext2Mount* mnt, uint32_t parentIno, const Ext2Inod
     while (off < dirSize) {
         uint32_t fileBlock = static_cast<uint32_t>(off >> mnt->blockShift);
         uint32_t diskBlock = Ext2BlockMap(mnt, dirIno, fileBlock).block;
-        if (!diskBlock || !Ext2ReadBlock(mnt, diskBlock, buf)) {
+        if (!diskBlock || !Ext2ReadBlock(mnt,diskBlock,buf,UsbReadSource::Directory)) {
             if(error)*error=-5;
             break;
         }
@@ -2356,7 +2366,7 @@ static int Ext2FileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
 }
 
 static int Ext2FileReadKernel(Vnode* vn,void* buf,uint64_t len,uint64_t* offset,
-                              uint64_t physical,bool* retain)
+                              uint64_t physical,bool* retain,bool fault)
 {
     auto* fp = static_cast<Ext2FilePriv*>(vn->priv);
     KRwLockReadLock(&g_ext2Lock);
@@ -2364,7 +2374,7 @@ static int Ext2FileReadKernel(Vnode* vn,void* buf,uint64_t len,uint64_t* offset,
     if (!Ext2ReadInode(fp->mnt, fp->inode, &data)) {
         KRwLockReadUnlock(&g_ext2Lock); return -5;
     }
-    int r = Ext2ReadInodeData(fp->mnt,&data,buf,len,*offset,physical,retain);
+    int r = Ext2ReadInodeData(fp->mnt,&data,buf,len,*offset,physical,retain,fault);
     if (r > 0) *offset += r;
     KRwLockReadUnlock(&g_ext2Lock);
     // Relatime: avoid a metadata write for every read. Re-read under the
@@ -3053,6 +3063,8 @@ static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
     mnt->dev            = dev;
     mnt->hasWriteFence=dev->ops->ioctl && dev->ops->ioctl(dev,DEVICE_IOCTL_WRITE_FENCED,nullptr)>=0;
     const int preferred=dev->ops->ioctl?dev->ops->ioctl(dev,DEVICE_IOCTL_PREFERRED_READ_BYTES,nullptr):0;
+    mnt->taggedReads=dev->ops->ioctl &&
+        dev->ops->ioctl(dev,DEVICE_IOCTL_USB_TAGGED_READ,nullptr)==1;
     mnt->readBurst=preferred>=int(blockSize) && preferred<=(1<<20)?uint32_t(preferred):65536;
     mnt->blockSize      = blockSize;
     mnt->blockShift     = blockShift;

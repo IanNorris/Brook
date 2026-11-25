@@ -1,5 +1,6 @@
 #include "usb_system.h"
 #include "usb_system_layout.h"
+#include "apic.h"
 
 #include "block_write_leases.h"
 #include "boot_stick.h"
@@ -61,11 +62,26 @@ int IoError(int error) {
 bool RangeValid(uint64_t offset,uint64_t size) {
     return disk && offset<=systemWindow.length && size<=systemWindow.length-offset && size<=0x7fffffffu;
 }
-int Read(Device*,uint64_t offset,void* data,uint64_t size) {
+UsbReadHistogram sources[UsbReadSourceCount]{};
+uint64_t admissionUs,transportUs,sessionUs,mountUs;
+
+void RecordRead(UsbReadSource source,uint64_t bytes) {
+    const unsigned index=unsigned(source);
+    if(index>=UsbReadSourceCount)return;
+    const unsigned bucket=bytes<=512?0:bytes<=4096?1:bytes<=16384?2:bytes<=65536?3:4;
+    __atomic_fetch_add(&sources[index].requests[bucket],1,__ATOMIC_RELAXED);
+    __atomic_fetch_add(&sources[index].bytes,bytes,__ATOMIC_RELAXED);
+}
+
+int ReadTagged(uint64_t offset,void* data,uint64_t size,UsbReadSource source) {
     if(!RangeValid(offset,size))return -22;
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED);
+    RecordRead(source,size);
     const int result=disk->ops->read(disk,systemWindow.start+offset,data,size);
     return result==int(size)?result:IoError(result);
+}
+int Read(Device*,uint64_t offset,void* data,uint64_t size) {
+    return ReadTagged(offset,data,size,ready?UsbReadSource::Other:UsbReadSource::Boot);
 }
 int Write(Device* owner,uint64_t offset,const void* data,uint64_t size) {
     if(!RangeValid(offset,size))return -22;
@@ -79,6 +95,11 @@ int Control(Device*,uint32_t request,void* argument) {
     if(request==DEVICE_IOCTL_READ_ONLY)return 0;
     if(request==DEVICE_IOCTL_PREFERRED_READ_BYTES)
         return disk->ops->ioctl(disk,request,nullptr);
+    if(request==DEVICE_IOCTL_USB_TAGGED_READ) {
+        if(!argument)return 1;
+        const auto& read=*static_cast<const UsbTaggedRead*>(argument);
+        return ReadTagged(read.offset,read.data,read.bytes,read.source);
+    }
     if(request==DEVICE_IOCTL_USB_READ_DMA) {
         if(!argument)return -22;
         auto& relative=*static_cast<UsbDmaRead*>(argument);
@@ -89,6 +110,7 @@ int Control(Device*,uint32_t request,void* argument) {
         relative.retain=absolute.retain;
         if(result==-95)return result;
         __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED);
+        RecordRead(relative.source,relative.bytes);
         return result==int(relative.bytes)?result:IoError(result);
     }
     if(request==DEVICE_IOCTL_WRITE_FENCED)return IsUncertain()?1:0;
@@ -227,6 +249,7 @@ void UsbSystemConfigure() {
 }
 
 bool UsbSystemBoot(uint8_t* nextDrive,bool scanComplete) {
+    auto phase=ApicTickCount();
     if(!boot.parsed || !nextDrive)return Fail("record",-22);
     if(!scanComplete)return Fail("boot-volume-scan",-19);
     int refusal=0;
@@ -258,6 +281,7 @@ bool UsbSystemBoot(uint8_t* nextDrive,bool scanComplete) {
        VfsLstatPath("/nix",&target) || !target.isDir || target.isSymlink)
         return Fail("mount-target",details.status?details.status:-22);
 
+    admissionUs=(ApicTickCount()-phase)*1000;phase=ApicTickCount();
     const int transport=disk->ops->ioctl(disk,DEVICE_IOCTL_USB_SYSTEM_TRANSPORT,nullptr);
     if(transport && transport!=-95)return Fail("storage-transport",transport);
     if(!transport && (!ValidateGpt(disk,bootGuid,bootEntry,bootFirst,bootSectors) ||
@@ -265,6 +289,7 @@ bool UsbSystemBoot(uint8_t* nextDrive,bool scanComplete) {
        LargeExt2ClassifyHeader(sb,sizeof(sb),systemWindow.length,record.uuid,geometry)!=LargeExt2HeaderState::Clean))
         return Fail("storage-transport-identity",-22);
 
+    transportUs=(ApicTickCount()-phase)*1000;phase=ApicTickCount();
     constexpr uint32_t gdtCapacity=4096*32;
     auto* gdt=static_cast<uint8_t*>(kmalloc(gdtCapacity));
     if(!gdt)return Fail("descriptor-buffer",-12);
@@ -279,6 +304,7 @@ bool UsbSystemBoot(uint8_t* nextDrive,bool scanComplete) {
     }
     kfree(gdt);
     if(error)return Fail(error==-117?"needs-filesystem-check":"session-begin",error);
+    sessionUs=(ApicTickCount()-phase)*1000;phase=ApicTickCount();
     const uint8_t drive=*nextDrive;
     if(!Ext2BindDevice(drive,&dataDevice))return Fail("ext2-bind",-16);
     ++*nextDrive;
@@ -291,6 +317,7 @@ bool UsbSystemBoot(uint8_t* nextDrive,bool scanComplete) {
         return Fail(details.check,details.status);
     }
     if(!session.Arm())__builtin_trap();
+    mountUs=(ApicTickCount()-phase)*1000;
     ready=true;
     boot.mounted=true;boot.dirty=true;boot.stage="ready";
     WritableDesktopMarkDirectReady(drive,systemWindow.length);
@@ -315,11 +342,19 @@ int UsbSystemFinalSync(int syncError) {
 }
 
 bool UsbSystemTiming(UsbStorageTiming* out) {
-    return disk && disk->ops->ioctl(disk,DEVICE_IOCTL_USB_STORAGE_TIMING,out)==0;
+    if(!disk || disk->ops->ioctl(disk,DEVICE_IOCTL_USB_STORAGE_TIMING,out))return false;
+    for(unsigned i=0;i<UsbReadSourceCount;++i) {
+        for(unsigned j=0;j<UsbReadBuckets;++j)
+            out->readsBySource[i].requests[j]=__atomic_load_n(&sources[i].requests[j],__ATOMIC_RELAXED);
+        out->readsBySource[i].bytes=__atomic_load_n(&sources[i].bytes,__ATOMIC_RELAXED);
+    }
+    out->admissionUs=admissionUs;out->transportUs=transportUs;
+    out->sessionUs=sessionUs;out->mountUs=mountUs;
+    return true;
 }
 int UsbSystemBenchRead(uint64_t at,void* data,uint32_t bytes) {
     if(!ready || IsUncertain())return -19;
-    return Read(&dataDevice,at,data,bytes);
+    return ReadTagged(at,data,bytes,UsbReadSource::Bench);
 }
 
 UsbSystemStatus UsbSystemRead() {

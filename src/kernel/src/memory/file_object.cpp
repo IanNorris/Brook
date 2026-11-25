@@ -123,7 +123,7 @@ int ReadResident(FileObject* object,Vnode* vnode,void* buffer,uint64_t length,ui
     if(!length)return 0;
     if(object->mappingError)return object->mappingError;
     const int result=physical && object->readOwned?
-        object->readOwned(vnode,buffer,length,offset,physical,retain):
+        object->readOwned(vnode,buffer,length,offset,physical,retain,false):
         vnode->ops->read(vnode,buffer,length,offset);
     if(retain && *retain)return -5;
     if(result>0 && !object->pinCoherentPage)Overlay(object,begin,buffer,static_cast<uint64_t>(result),false);
@@ -230,7 +230,9 @@ static PhysicalAddress GetPageLocked(FileObject* object,Vnode* vnode,uint64_t in
     uint64_t required=stat.size-offset;if(required>4096)required=4096;
     uint64_t done=0;
     while(done<required) {
-        result=vnode->ops->read(vnode,static_cast<uint8_t*>(bytes)+done,required-done,&offset);
+        if(object->readOwned)
+            result=object->readOwned(vnode,static_cast<uint8_t*>(bytes)+done,required-done,&offset,0,nullptr,true);
+        else result=vnode->ops->read(vnode,static_cast<uint8_t*>(bytes)+done,required-done,&offset);
         if(result<=0 || static_cast<uint64_t>(result)>required-done) {
             PmmUnrefPage(physical);kfree(page);rollback();
             if(error)*error=result<0?result:-5;
@@ -289,7 +291,7 @@ static int ReadAheadLocked(FileObject* object,Vnode* vnode,uint64_t first,
     const uint64_t required=remaining<bytes?remaining:bytes;
     if(required<bytes)memset(buffer+required,0,bytes-required);
     bool retain=false;
-    const int result=object->readOwned(vnode,buffer,required,&offset,physical.raw(),&retain);
+    const int result=object->readOwned(vnode,buffer,required,&offset,physical.raw(),&retain,true);
     if(retain)return -5;
     uint32_t loaded=0;
     for(uint32_t i=0;i<count;++i) {
