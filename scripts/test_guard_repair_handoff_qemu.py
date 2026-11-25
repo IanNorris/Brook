@@ -316,8 +316,11 @@ def main():
             raise RuntimeError('RECOVERY fixture requires directory and archive bits only')
         (a.output/'recovery-directory-attributes.txt').write_text(attributes)
         normal=work/'normal.img';recovery=work/'recovery.img'
+        # Dell initrds hold ~16.6 MB of files since the desktop line's xHCI
+        # (UAS, write windows) grew xhci.mod; 24 MiB still fits the 64 MiB
+        # fixture ESP. The hardware INITRD.IMG itself is a 32 MiB image.
         compact(a.desktop_pair/'INITRD.IMG',normal,work/'normal-tree',
-                16*1024*1024 if a.auto_desktop_dell_initrd or a.auto_desktop_slot_fallback else 8*1024*1024,
+                24*1024*1024 if a.auto_desktop_dell_initrd or a.auto_desktop_slot_fallback else 8*1024*1024,
                 scrub_deployment=bool(a.auto_desktop_slot_fallback or a.bridge_local_policy_qa))
         compact(a.recovery_pair/'INITRD.IMG',recovery,work/'recovery-tree')
         data_sectors = TRIM_DATA_SECTORS if a.ssd_trim else BASE_DATA_SECTORS
