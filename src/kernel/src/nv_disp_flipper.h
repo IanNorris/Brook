@@ -57,6 +57,7 @@ template<typename B> struct NvWindowFlipper{
     bool ackAllEvt=false;    // experiment: also W1C LOADV / LAST_DATA (bits 0-1) when polling
     uint32_t lastVline=0;uint64_t latchFrame=~0ull;
     uint32_t vtotal=0,vblankEnd=0,vblankStart=0;     // from the head's ARM raster (Init)
+    uint32_t frameUs=16667;                          // htotal*vtotal/pclk from ARM (Init), else 60 Hz
     // probe: per-flip raw samples for the latch question (driver `probe`).
     struct Sample{uint32_t armLine,doneLine,latUs,evtAfter;};
     static constexpr uint32_t kProbeMax=32;Sample probe[kProbeMax]{};uint32_t probeCount=0,probeWant=0;
@@ -67,16 +68,25 @@ template<typename B> struct NvWindowFlipper{
         surf[0]=a;surf[1]=bb;surf[2]=Surface{};nbuf=2;front=frontBuf;armed=queued=-1;state=FlipState::Idle;fail=FlipFail::None;st=FlipStats{};
         lastVline=0;latchFrame=~0ull;probeCount=probeWant=0;
         vtotal=b->rd(RegArm(kChidCore,0x2064+head_*0x400))>>16;
-        vblankEnd=b->rd(RegArm(kChidCore,0x206c+head_*0x400))>>16;vblankStart=b->rd(RegArm(kChidCore,0x2070+head_*0x400))>>16;}
+        vblankEnd=b->rd(RegArm(kChidCore,0x206c+head_*0x400))>>16;vblankStart=b->rd(RegArm(kChidCore,0x2070+head_*0x400))>>16;
+        const uint32_t htotal=b->rd(RegArm(kChidCore,0x2064+head_*0x400))&0xffff,pclk=b->rd(RegArm(kChidCore,0x200c+head_*0x400))&0x7fffffff;
+        frameUs=16667;
+        if(htotal&&vtotal&&pclk>=25000000u){const uint64_t us=uint64_t(htotal)*vtotal*1000000ull/pclk;if(us>=4000&&us<=50000)frameUs=uint32_t(us);}}
+    // Microseconds from scanline `v` until the frame wraps. The LOADV that puts an armed
+    // flip on screen lands at the end of the vertical blank (live a27588f7: done_line
+    // 2219-2221 of vtotal 2222), so this is the time until the armed frame shows.
+    uint32_t UsToWrap(uint32_t v)const{
+        if(!vtotal||v>=vtotal)return 0;
+        return uint32_t(uint64_t(vtotal-v)*frameUs/vtotal);}
     bool InBlank(uint32_t v)const{return vblankStart>vblankEnd?(v<vblankEnd||v>vblankStart):v>=surf[0].height;}
     // Whole milliseconds (1..frame) until the next vblank start from scanline `v`, at
     // `frameUs` per frame, plus 1 so the waiter wakes just after the LOADV.
-    uint32_t MsToVblank(uint32_t v,uint32_t frameUs=16667)const{
+    uint32_t MsToVblank(uint32_t v,uint32_t periodUs=16667)const{
         if(!vtotal||v>=vtotal)return 1;
         const uint32_t start=vblankStart&&vblankStart<vtotal?vblankStart:surf[0].height;
         const uint32_t lines=v<start?start-v:vtotal-v+start;
-        const uint32_t ms=uint32_t(uint64_t(lines)*frameUs/vtotal/1000)+1;
-        const uint32_t cap=frameUs/1000+1;
+        const uint32_t ms=uint32_t(uint64_t(lines)*periodUs/vtotal/1000)+1;
+        const uint32_t cap=periodUs/1000+1;
         return ms>cap?cap:ms;}
     bool Live()const{return state==FlipState::Idle||state==FlipState::Armed;}
     bool Allowed(uint32_t a)const{return a==RegPut(chid)||a==kRegBar1Flush||a==RegHeadTimingEvt(head);}

@@ -103,12 +103,16 @@ struct DamageRects;
 struct CompositorPrimaryPresenter {
     int (*present)(const uint32_t* src, uint32_t srcStride, uint32_t width, uint32_t height, const DamageRects& damage);
     // Called once per compositor loop (completes flips, arms the queued frame). Returns the
-    // longest the compositor may sleep before the next call, in ms (a flip in flight wants
-    // ~1 ms so the newest frame is armed right after the vblank load).
+    // longest the compositor may sleep before the next call, in ms: the flip backend paces
+    // the loop to just after each vblank load.
     uint32_t (*poll)();
 };
 inline constexpr int kPresenterBusy = -1000;
 void CompositorSetPrimaryPresenter(const CompositorPrimaryPresenter* presenter);
+// The desktop back buffer (union of the outputs, from 0,0) and its stride in pixels. Only
+// valid inside an OutputBackendOps::Present call (compositor thread, scanout lock held):
+// a flip backend for a non-primary output copies its damage from here (D3).
+const uint32_t* CompositorPresentSource(uint32_t* stridePixels);
 
 // Get physical framebuffer pointer and stride (for kernel threads that
 // need direct FB access, e.g. clock overlay).

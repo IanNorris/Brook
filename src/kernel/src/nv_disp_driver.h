@@ -31,6 +31,8 @@ template<typename B> struct NvDisplayDriver{
     uint32_t ups[kDriverOutputs]{},downs[kDriverOutputs]{},failures[kDriverOutputs]{};
     uint64_t lastCheckUs=0;uint32_t invariantFails=0;
     bool out0External=false;   // the compositor presents on output 0 (D2): no bridge flips/bench there
+    bool out1External=false;   // ... and on output 1 (D3)
+    bool External(uint32_t o)const{return o==0?out0External:out1External;}
 
     struct Line{char t[320];uint32_t n=0;
         void raw(const char* x){while(*x&&n+2<sizeof(t))t[n++]=*x++;t[n]=0;}
@@ -51,6 +53,11 @@ template<typename B> struct NvDisplayDriver{
     // (0x8800000 for 4K); refused when it would reach the instmem region.
     Surface HeadZeroThird()const{const Surface& a=r0->cfg.surf[0];const uint64_t bytes=uint64_t(a.pitch)*a.height,two=2ull<<20;
         Surface t=a;t.vram=a.vram+4*((bytes+two-1)&~(two-1));if(t.vram+bytes>r0->cfg.instVram)t.vram=0;return t;}
+    // Head 1's third buffer: the slot after head 0's third (A + 5 slots, 0xaa00000 for 4K),
+    // with head 1's surface geometry; refused when it would reach the instmem region.
+    Surface HeadOneThird(const Surface& c)const{const Surface& a=r0->cfg.surf[0];const uint64_t bytes=uint64_t(c.pitch)*c.height,two=2ull<<20;
+        const uint64_t slot=(uint64_t(a.pitch)*a.height+two-1)&~(two-1);
+        Surface t=c;t.vram=a.vram+5*slot;if(((bytes+two-1)&~(two-1))>slot||t.vram+bytes>r0->cfg.instVram)t.vram=0;return t;}
     static Surface Second(const Surface& s){const uint64_t bytes=uint64_t(s.pitch)*s.height,two=2ull<<20;
         Surface t=s;t.vram=s.vram+((bytes+two-1)&~(two-1));return t;}
 
@@ -225,14 +232,14 @@ template<typename B> struct NvDisplayDriver{
             if(Word(p,"0"))(void)Down0();else if(Word(p,"1"))(void)Down1();else{(void)Word(p,"all");Quiesce();}
             Status();return;}
         if(Word(p,"flip")){if(!Num(p,o)||!Num(p,v)||o>=kDriverOutputs||v>1){Msg("usage","flip <0|1> <0|1>");return;}
-            if(o==0&&out0External){Msg("refused","the desktop presents on output 0");return;}
+            if(External(o)){Msg("refused","the desktop presents on this output");return;}
             Msg("flip",Present(o,int8_t(v))<0?"refused (not live)":"presented");return;}
         if(Word(p,"bench")){if(!Num(p,o)||!Num(p,v)||o>=kDriverOutputs||!v||v>3600){Msg("usage","bench <0|1> <1..3600>");return;}
-            if(o==0&&out0External){Msg("refused","the desktop presents on output 0");return;}
+            if(External(o)){Msg("refused","the desktop presents on this output");return;}
             Bench(o,v);return;}
         if(Word(p,"tick")){Tick();Status();return;}
         if(Word(p,"probe")){if(!Num(p,o)||!Num(p,v)||o>=kDriverOutputs||!v){Msg("usage","probe <o> <1..32>");return;}
-            if(o==0&&out0External){Msg("refused","the desktop presents on output 0");return;}
+            if(External(o)){Msg("refused","the desktop presents on this output");return;}
             Probe(o,v);return;}
         if(Word(p,"hist")){if(!Num(p,o)||o>=kDriverOutputs){Msg("usage","hist <o>");return;}Hist(o);return;}
         // Experiments (design §7): pacing on/off, MIN_PRESENT_INTERVAL, acking all head-timing

@@ -741,6 +741,12 @@ int64_t sys_brook_wm_get_screen_info(uint64_t outAddr, uint64_t, uint64_t,
     if (!UserBufferWritable(outAddr, 8)) return -EFAULT;
     uint32_t w = 0, h = 0;
     brook::CompositorSnapshotPhysDims(&w, &h);
+    // Until waylandd reads WM_GET_OUTPUTS (D4) it has one wl_output at 0,0: report the
+    // primary output, not the multi-output union, so clients size to one monitor.
+    if (const brook::OutputRect primary = brook::CompositorPrimaryOutputRect(); !primary.empty()) {
+        w = primary.w;
+        h = primary.h;
+    }
     uint32_t* out = reinterpret_cast<uint32_t*>(outAddr);
     out[0] = w;
     out[1] = h;
@@ -748,8 +754,8 @@ int64_t sys_brook_wm_get_screen_info(uint64_t outAddr, uint64_t, uint64_t,
 }
 
 // 527: WM_GET_OUTPUTS(header_ptr, outputs_ptr, capacity) — the display
-// outputs (shared/brook_outputs.h). WM_GET_SCREEN_INFO still returns the
-// desktop union. Returns the number of descriptors written.
+// outputs (shared/brook_outputs.h). WM_GET_SCREEN_INFO returns the primary
+// output until waylandd is multi-output (D4). Returns the number of descriptors written.
 static_assert(brook::OutputMax == BROOK_OUTPUTS_MAX, "brook_outputs.h capacity");
 int64_t sys_brook_wm_get_outputs(uint64_t headerAddr, uint64_t outputsAddr, uint64_t capacity,
                                  uint64_t, uint64_t, uint64_t)

@@ -184,7 +184,36 @@ static void TestMsToVblank(){
     f.vtotal=0;assert(f.MsToVblank(100)==1);
     assert(g.d->Down0());
 }
+// Vblank-driven wake (D3): time to the frame wrap, where the LOADV of an armed flip lands,
+// from the head's own frame period (htotal*vtotal/pclk from ARM).
+static void TestUsToWrap(){
+    DRig g;assert(g.d->Up0());auto f=g.d->f[0];
+    f.vtotal=2222;f.frameUs=16667;
+    assert(f.UsToWrap(0)==16667&&f.UsToWrap(2221)==7&&f.UsToWrap(2222)==0&&f.UsToWrap(9999)==0);
+    const uint32_t mid=f.UsToWrap(1111);assert(mid>=8330&&mid<=8340);
+    for(uint32_t v=1;v<f.vtotal;++v)assert(f.UsToWrap(v)<f.UsToWrap(v-1));   // strictly falling to the wrap
+    f.vtotal=0;assert(f.UsToWrap(5)==0);
+    // Init derives the period: 4000x2222 at 533.28 MHz = 16667 us; a bogus clock keeps 60 Hz.
+    auto& c=g.c;c.R(RegArm(kChidCore,c57d::HeadRasterSize(1)))=(2222u<<16)|4000u;c.R(RegArm(kChidCore,c57d::HeadPixelClock(1)))=533280000u;
+    NvWindowFlipper<decltype(g.b)> h;h.Init(&g.b,2,1,0x0ff10000,0,Surface{},Surface{},0);
+    assert(h.vtotal==2222&&h.frameUs>=16660&&h.frameUs<=16670);
+    c.R(RegArm(kChidCore,c57d::HeadPixelClock(1)))=1000u;h.Init(&g.b,2,1,0x0ff10000,0,Surface{},Surface{},0);assert(h.frameUs==16667);
+    assert(g.d->Down0());
+}
+// Head 1's third buffer sits after head 0's third and below instmem; none overlap.
+static void TestHeadOneThird(){
+    DRig g;assert(g.d->Up0()&&g.d->Up1());
+    const Surface t0=g.d->HeadZeroThird(),t1=g.d->HeadOneThird(g.d->f[1].surf[0]);
+    assert(t0.vram==0x8800000&&t1.vram==0xaa00000&&t1.pitch==g.d->f[1].surf[0].pitch);
+    const uint64_t bytes=uint64_t(t1.pitch)*t1.height;
+    const uint64_t starts[6]={g.d->f[0].surf[0].vram,g.d->f[0].surf[1].vram,g.d->f[1].surf[0].vram,g.d->f[1].surf[1].vram,t0.vram,t1.vram};
+    for(int i=0;i<6;++i)for(int j=i+1;j<6;++j)assert(starts[i]+bytes<=starts[j]||starts[j]+bytes<=starts[i]);
+    assert(t1.vram+bytes<=g.d->r0->cfg.instVram);
+    g.d->f[1].SetThird(t1);assert(g.d->f[1].nbuf==3);
+    g.d->Quiesce();
+}
 int main(){
+    TestUsToWrap();TestHeadOneThird();
     TestOutput0();TestBothOutputs();TestFailures();TestPacing();TestLoadv();TestAgeRepair();TestTripleMailbox();TestVblankCounter();
     TestMsToVblank();
     puts("test_nv_disp_driver: ok");return 0;

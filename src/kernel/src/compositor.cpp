@@ -115,8 +115,15 @@ void CompositorSetHardwareProbe(bool enabled) {
 static volatile uint32_t* g_physFb       = nullptr;
 static uint32_t           g_physFbWidth  = 0;
 static uint32_t           g_physFbHeight = 0;
+// The desktop: the union of the enabled outputs from 0,0, which is the back buffer's
+// extent. It is the firmware framebuffer's size until a second output joins (D3: the
+// RTX head 1 at x = primary width), when the back buffer grows to the union.
+static uint32_t           g_deskWidth  = 0;
+static uint32_t           g_deskHeight = 0;
 // Geometry-only readers need a coherent pair without waiting for scanout copies.
+// g_publishedPhysDims is the desktop; g_publishedGopDims the firmware framebuffer.
 static uint64_t           g_publishedPhysDims = 0;
+static uint64_t           g_publishedGopDims = 0;
 static uint32_t           g_physFbStride = 0; // in pixels
 
 // Double-buffer: compose into cached RAM, then bulk-copy to MMIO FB.
@@ -124,6 +131,11 @@ static uint32_t           g_physFbStride = 0; // in pixels
 // via memcpy is much faster than scattered pixel writes.
 static uint32_t* g_backBuffer     = nullptr;
 static uint32_t  g_backBufStride  = 0; // in pixels (matches physFb stride)
+// The framebuffer-sized back buffer (the TTY draws into it). While the desktop spans
+// several outputs g_backBuffer is a separate union-sized buffer and this one is idle.
+static uint32_t* g_baseBackBuffer = nullptr;
+static uint32_t* g_unionBackBuffer = nullptr;
+static uint64_t  g_unionBackBufferPages = 0;
 // Kernel-owned page span for the current managed linear backbuffer. No legacy
 // GPU raw texture or unversioned scanout map may take ownership of these pages.
 static uint64_t g_managedBackBufferPages = 0;
@@ -157,7 +169,7 @@ static inline void MarkDirtyRows(uint32_t minY, uint32_t maxY)
 static inline void MarkAllDirty()
 {
     g_dirtyMinY = 0;
-    g_dirtyMaxY = g_physFbHeight;
+    g_dirtyMaxY = g_deskHeight;
 }
 
 // Full-repaint flag: set when the scene structure changes (window moved,
@@ -1137,6 +1149,12 @@ static void PublishPhysDims(uint32_t width, uint32_t height)
     const uint64_t packed = (uint64_t(height) << 32) | width;
     __atomic_store_n(&g_publishedPhysDims, packed, __ATOMIC_RELEASE);
 }
+// The firmware framebuffer, which is also the desktop until a second output joins.
+static void PublishFramebufferDims(uint32_t width, uint32_t height)
+{
+    __atomic_store_n(&g_publishedGopDims, (uint64_t(height) << 32) | width, __ATOMIC_RELEASE);
+    PublishPhysDims(width, height);
+}
 
 static void CompositorRegisterOutputs();
 static void CompositorSyncPointerOutputs();
@@ -1155,10 +1173,10 @@ void CompositorInit()
     }
 
     g_physFb       = TtyGetFramebufferMmio();
-    g_physFbWidth  = w;
-    g_physFbHeight = h;
+    g_physFbWidth  = g_deskWidth  = w;
+    g_physFbHeight = g_deskHeight = h;
     g_physFbStride = strideBytes / 4; // convert byte stride to pixel stride
-    PublishPhysDims(w, h);
+    PublishFramebufferDims(w, h);
 
     // Allocate a cached-RAM backbuffer for double-buffering.
     g_backBufStride = g_physFbStride;
@@ -1196,13 +1214,14 @@ void CompositorInit()
         SerialPuts("COMPOSITOR: WARNING — backbuffer alloc failed, direct MMIO path\n");
     }
 
+    g_baseBackBuffer = g_backBuffer;
     // The framebuffer is the first (primary) output.
     CompositorRegisterOutputs();
     // Set mouse cursor bounds to match screen resolution.
     CompositorSyncPointerOutputs();
 
     SerialPrintf("COMPOSITOR: initialised, %ux%u stride=%u\n",
-                 g_physFbWidth, g_physFbHeight, g_physFbStride);
+                 g_deskWidth, g_deskHeight, g_physFbStride);
 
     // GPU composition opt-in: fw_cfg file opt/composite == "gpu". The GPU
     // compositor ops are registered later (when the virtio-gpu driver's 3D path
@@ -1461,8 +1480,8 @@ bool CompositorResizeVfb(Process* proc, uint32_t newWidth, uint32_t newHeight)
     if (newWidth == 0 || newHeight == 0) return false;
 
     // Clamp to physical FB so we can't allocate something that wouldn't fit.
-    if (newWidth  > g_physFbWidth)  newWidth  = g_physFbWidth;
-    if (newHeight > g_physFbHeight) newHeight = g_physFbHeight;
+    if (newWidth  > g_deskWidth)  newWidth  = g_deskWidth;
+    if (newHeight > g_deskHeight) newHeight = g_deskHeight;
 
     {
         CompositorMutexGuard snapshot(&proc->framebufferLock);
@@ -1548,10 +1567,10 @@ static bool BlitProcess(Process* proc, bool forceAll)
 
     uint32_t endDy = dstH;
     uint32_t endDx = dstW;
-    if (dstY0 + static_cast<int>(endDy) > static_cast<int>(g_physFbHeight))
-        endDy = g_physFbHeight - static_cast<uint32_t>(dstY0);
-    if (dstX0 + static_cast<int>(endDx) > static_cast<int>(g_physFbWidth))
-        endDx = g_physFbWidth - static_cast<uint32_t>(dstX0);
+    if (dstY0 + static_cast<int>(endDy) > static_cast<int>(g_deskHeight))
+        endDy = g_deskHeight - static_cast<uint32_t>(dstY0);
+    if (dstX0 + static_cast<int>(endDx) > static_cast<int>(g_deskWidth))
+        endDx = g_deskWidth - static_cast<uint32_t>(dstX0);
 
     if (startDx >= endDx || startDy >= endDy) return false;
 
@@ -1622,7 +1641,7 @@ static bool BlitProcessAt(Process* proc, int dstX0, int dstY0, bool forceAll,
     const uint32_t  dstStride = g_backBuffer ? g_backBufStride : g_physFbStride;
 
     const SceneRect clip=SceneClientBlitRect(dstX0,dstY0,srcW,srcH,clientW,clientH,
-                                             upscale,g_physFbWidth,g_physFbHeight);
+                                             upscale,g_deskWidth,g_deskHeight);
     if(clip.empty())return false;
     const uint32_t startDx=static_cast<uint32_t>(clip.left-dstX0);
     const uint32_t startDy=static_cast<uint32_t>(clip.top-dstY0);
@@ -1683,7 +1702,7 @@ static bool BlitWindowVfb(const uint32_t* src,
     const uint32_t dstStride = g_backBuffer ? g_backBufStride : g_physFbStride;
 
     const SceneRect clip=SceneClientBlitRect(dstX0,dstY0,srcW,srcH,srcW,srcH,1,
-                                           g_physFbWidth,g_physFbHeight);
+                                           g_deskWidth,g_deskHeight);
     if (clip.empty()) return false;
     const uint32_t sourceX=static_cast<uint32_t>(clip.left-static_cast<int64_t>(dstX0));
     const uint32_t rowLen=static_cast<uint32_t>(clip.right-clip.left);
@@ -1733,15 +1752,36 @@ static bool BlitWindowVfb(const uint32_t* src,
     return true;
 }
 
+// Output rectangles of a desktop that spans several outputs (CompositorApplyOutputExtent;
+// count 0 = the desktop is the framebuffer). Each output shows the wallpaper fitted to
+// itself, so a backdrop span is split at output edges into output-local spans.
+static OutputRect g_deskOutputs[OutputMax]{};
+static uint32_t g_deskOutputCount=0;
+static void DeskBackdropSpan(uint32_t* out,uint32_t left,uint32_t right,uint32_t y)
+{
+    if(!g_deskOutputCount){
+        DesktopBackdropSpan(out,left,right,y,g_deskWidth,g_deskHeight,g_wallpaper,g_wallpaperWidth,g_wallpaperHeight);
+        return;
+    }
+    for(uint32_t x=left;x<right;++x)out[x-left]=BROOK_WALLPAPER_FALLBACK;   // outside every output
+    for(uint32_t i=0;i<g_deskOutputCount;++i){
+        const OutputRect& o=g_deskOutputs[i];
+        if(int64_t(y)<o.y || int64_t(y)>=o.bottom())continue;
+        const int64_t a=int64_t(left)>o.x?int64_t(left):o.x,b=int64_t(right)<o.right()?int64_t(right):o.right();
+        if(a>=b)continue;
+        DesktopBackdropSpan(out+(a-left),uint32_t(a-o.x),uint32_t(b-o.x),uint32_t(y-o.y),o.w,o.h,
+                            g_wallpaper,g_wallpaperWidth,g_wallpaperHeight);
+    }
+}
+
 // Draw wallpaper (or solid background) into backbuffer.
 static void BlitWallpaper()
 {
     uint32_t*      dstBase   = g_backBuffer ? g_backBuffer : const_cast<uint32_t*>(g_physFb);
     const uint32_t dstStride = g_backBuffer ? g_backBufStride : g_physFbStride;
 
-    for(uint32_t y=0;y<g_physFbHeight;++y)
-        DesktopBackdropSpan(dstBase+uint64_t(y)*dstStride,0,g_physFbWidth,y,g_physFbWidth,g_physFbHeight,
-                            g_wallpaper,g_wallpaperWidth,g_wallpaperHeight);
+    for(uint32_t y=0;y<g_deskHeight;++y)
+        DeskBackdropSpan(dstBase+uint64_t(y)*dstStride,0,g_deskWidth,y);
     g_desktopTexNeedsFull=true;
     MarkAllDirty();
 }
@@ -1750,13 +1790,12 @@ static void BlitWallpaper()
 // pixels are used as the backdrop for the next translucent frame.
 static void BlitWallpaperRegion(const SceneRect& region)
 {
-    const SceneRect clip=region.clipped(g_physFbWidth,g_physFbHeight);
+    const SceneRect clip=region.clipped(g_deskWidth,g_deskHeight);
     if(clip.empty())return;
     uint32_t* dst=g_backBuffer?g_backBuffer:const_cast<uint32_t*>(g_physFb);
     const uint32_t stride=g_backBuffer?g_backBufStride:g_physFbStride;
     for(int64_t y=clip.top;y<clip.bottom;++y) {
-        DesktopBackdropSpan(dst+y*stride+clip.left,clip.left,clip.right,y,g_physFbWidth,g_physFbHeight,
-                            g_wallpaper,g_wallpaperWidth,g_wallpaperHeight);
+        DeskBackdropSpan(dst+y*stride+clip.left,uint32_t(clip.left),uint32_t(clip.right),uint32_t(y));
     }
     MarkDirtyRows(static_cast<uint32_t>(clip.top),static_cast<uint32_t>(clip.bottom));
 }
@@ -1876,11 +1915,11 @@ static void CursorSaveUnder(int32_t cx, int32_t cy)
     for (uint32_t row = 0; row < ch; row++)
     {
         int32_t sy = cy + static_cast<int32_t>(row);
-        if (sy < 0 || static_cast<uint32_t>(sy) >= g_physFbHeight) continue;
+        if (sy < 0 || static_cast<uint32_t>(sy) >= g_deskHeight) continue;
         for (uint32_t col = 0; col < cw; col++)
         {
             int32_t sx = cx + static_cast<int32_t>(col);
-            if (sx < 0 || static_cast<uint32_t>(sx) >= g_physFbWidth) continue;
+            if (sx < 0 || static_cast<uint32_t>(sx) >= g_deskWidth) continue;
             g_cursorSave[row * cw + col] = buf[sy * stride + sx];
         }
     }
@@ -1903,11 +1942,11 @@ static void CursorRestore()
     for (uint32_t row = 0; row < ch; row++)
     {
         int32_t sy = cy + static_cast<int32_t>(row);
-        if (sy < 0 || static_cast<uint32_t>(sy) >= g_physFbHeight) continue;
+        if (sy < 0 || static_cast<uint32_t>(sy) >= g_deskHeight) continue;
         for (uint32_t col = 0; col < cw; col++)
         {
             int32_t sx = cx + static_cast<int32_t>(col);
-            if (sx < 0 || static_cast<uint32_t>(sx) >= g_physFbWidth) continue;
+            if (sx < 0 || static_cast<uint32_t>(sx) >= g_deskWidth) continue;
             buf[sy * stride + sx] = g_cursorSave[row * cw + col];
         }
     }
@@ -1930,11 +1969,11 @@ static void CursorDraw(int32_t mx, int32_t my)
         for (uint32_t row = 0; row < ch; row++)
         {
             int32_t sy = cy + static_cast<int32_t>(row);
-            if (sy < 0 || static_cast<uint32_t>(sy) >= g_physFbHeight) continue;
+            if (sy < 0 || static_cast<uint32_t>(sy) >= g_deskHeight) continue;
             for (uint32_t col = 0; col < cw; col++)
             {
                 int32_t sx = cx + static_cast<int32_t>(col);
-                if (sx < 0 || static_cast<uint32_t>(sx) >= g_physFbWidth) continue;
+                if (sx < 0 || static_cast<uint32_t>(sx) >= g_deskWidth) continue;
                 uint32_t src = g_cursorFrame.pixels[row * CURSOR_MAX + col];
                 uint32_t alpha = (src >> 24) & 0xFF;
                 if (alpha == 0) continue;
@@ -1999,8 +2038,8 @@ static volatile bool g_wmBtnReleaseLatch = false;
 static bool EnsureChromeBuffer()
 {
     if (g_chromeBuffer) return true;
-    if (!g_backBuffer || !g_backBufStride || !g_physFbHeight) return false;
-    uint64_t bytes = static_cast<uint64_t>(g_backBufStride) * g_physFbHeight * 4;
+    if (!g_backBuffer || !g_backBufStride || !g_deskHeight) return false;
+    uint64_t bytes = static_cast<uint64_t>(g_backBufStride) * g_deskHeight * 4;
     uint64_t pages = (bytes + 4095) / 4096;
     VirtualAddress addr = VmmAllocPages(pages, VMM_WRITABLE, MemTag::Device, 0);
     if (!addr) return false;
@@ -2021,7 +2060,7 @@ static void SetChromeDecorAlpha(const Window& w, bool glass)
         const WmRect block = WmCaptionOverlayRect(w);
         const unsigned radius = (w.captionStyle & DesktopCaptionStyleValid) && w.state != WindowState::Maximized ?
             DesktopCaptionStyleRadius(w.captionStyle) : 0;
-        ChromeMarkCaptionBlockOpaque(g_chromeBuffer, g_backBufStride, g_physFbWidth, g_physFbHeight,
+        ChromeMarkCaptionBlockOpaque(g_chromeBuffer, g_backBufStride, g_deskWidth, g_deskHeight,
                                      {block.x, block.y, block.w, block.h}, radius);
         return;
     }
@@ -2031,12 +2070,12 @@ static void SetChromeDecorAlpha(const Window& w, bool glass)
     int cw = (int)w.clientW, ch = (int)w.clientH;
     if (!glass)
     {
-        ChromeMarkFrameOpaque(g_chromeBuffer, g_backBufStride, g_physFbWidth, g_physFbHeight,
+        ChromeMarkFrameOpaque(g_chromeBuffer, g_backBufStride, g_deskWidth, g_deskHeight,
                               {ox, oy, ow, oh}, {cx, cy, cw, ch});
         return;
     }
     if(w.state!=WindowState::Maximized && !w.blurRadius)
-        ChromeMaskFrameCorners(g_chromeBuffer,g_backBufStride,g_physFbWidth,g_physFbHeight,
+        ChromeMaskFrameCorners(g_chromeBuffer,g_backBufStride,g_deskWidth,g_deskHeight,
                                {ox,oy,ow,oh},WmChromeMaterial(),w.focused);
 }
 
@@ -2045,18 +2084,18 @@ static void SetChromeDecorAlpha(const Window& w, bool glass)
 // in the backbuffer).
 static bool EnsureOverlayBuffer()
 {
-    if (!g_backBuffer || !g_backBufStride || !g_physFbHeight) return false;
+    if (!g_backBuffer || !g_backBufStride || !g_deskHeight) return false;
     static uint32_t width, height, stride;
     static uint64_t allocatedPages;
-    const uint64_t bytes = uint64_t(g_backBufStride) * g_physFbHeight * 4;
+    const uint64_t bytes = uint64_t(g_backBufStride) * g_deskHeight * 4;
     const uint64_t pages = (bytes + 4095) / 4096;
-    if (g_overlayBuffer && width == g_physFbWidth && height == g_physFbHeight && stride == g_backBufStride)
+    if (g_overlayBuffer && width == g_deskWidth && height == g_deskHeight && stride == g_backBufStride)
         return true;
     // The GPU texture owns its original storage and geometry.
     if (g_overlayTex) return false;
     if (g_overlayBuffer && allocatedPages >= pages) {
         g_localShellCache = {};
-        width = g_physFbWidth; height = g_physFbHeight; stride = g_backBufStride;
+        width = g_deskWidth; height = g_deskHeight; stride = g_backBufStride;
         return true;
     }
     VirtualAddress addr = VmmAllocPages(pages, VMM_WRITABLE, MemTag::Device, 0);
@@ -2065,7 +2104,7 @@ static bool EnsureOverlayBuffer()
     g_overlayBuffer = reinterpret_cast<uint32_t*>(addr.raw());
     allocatedPages = pages;
     g_localShellCache = {};
-    width = g_physFbWidth; height = g_physFbHeight; stride = g_backBufStride;
+    width = g_deskWidth; height = g_deskHeight; stride = g_backBufStride;
     SerialPrintf("COMPOSITOR: overlay layer %lu KB at 0x%lx\n", bytes / 1024, addr.raw());
     return true;
 }
@@ -2076,8 +2115,8 @@ static bool ClampScreenRect(int& x, int& y, int& w, int& h)
     if (w <= 0 || h <= 0) return false;
     if (x < 0) { w += x; x = 0; }
     if (y < 0) { h += y; y = 0; }
-    if (x + w > (int)g_physFbWidth)  w = (int)g_physFbWidth  - x;
-    if (y + h > (int)g_physFbHeight) h = (int)g_physFbHeight - y;
+    if (x + w > (int)g_deskWidth)  w = (int)g_deskWidth  - x;
+    if (y + h > (int)g_deskHeight) h = (int)g_deskHeight - y;
     return (w > 0 && h > 0);
 }
 
@@ -2159,10 +2198,10 @@ static ShellView ShellPointerView(int32_t mx, int32_t my, bool select)
 // `my >= WmTaskbarTop(screenH)` per output: the pointer is on a taskbar.
 static bool ShellTaskbarBand(int32_t mx, int32_t my)
 {
-    if constexpr (!OutputMultiSupported) return my >= static_cast<int32_t>(WmTaskbarTop(g_physFbHeight));
+    if constexpr (!OutputMultiSupported) return my >= static_cast<int32_t>(WmTaskbarTop(g_deskHeight));
     OutputLayout layout;
     CompositorGetOutputs(layout);
-    if (!layout.multi()) return my >= static_cast<int32_t>(WmTaskbarTop(g_physFbHeight));
+    if (!layout.multi()) return my >= static_cast<int32_t>(WmTaskbarTop(g_deskHeight));
     return ShellTaskbarAt(layout, WmMetric(WM_TASKBAR_HEIGHT), ShellHiddenMask(layout), mx, my).output >= 0;
 }
 
@@ -2435,7 +2474,7 @@ static void CaptureDesktopOverlay(const ShellFrame& frame,uint64_t now,int32_t m
     waiter=g_debugFrameWaiter;g_debugFrameWaiter=nullptr;
     [&]{
     CompositorMutexGuard geometry(&g_scanoutMappingLock);
-    const uint32_t width=g_physFbWidth,height=g_physFbHeight;
+    const uint32_t width=g_deskWidth,height=g_deskHeight;
     if(!g_physFb || !width || !height || width>4096 || height>2160 ||
        width != frame.width || height != frame.height)return;
     uint32_t* pixels=OverlayBufferPrepare(width,height);if(!pixels)return;
@@ -2567,7 +2606,7 @@ static void CompositorLoopWM(bool& clientFrame)
     WmVolumeFeedbackTick(now);
     int32_t chromeMx = 0, chromeMy = 0;
     MouseGetPosition(&chromeMx, &chromeMy);
-    const ShellFrame shell = CaptureShellFrame(g_physFbWidth, g_physFbHeight, now, chromeMx, chromeMy);
+    const ShellFrame shell = CaptureShellFrame(g_deskWidth, g_deskHeight, now, chromeMx, chromeMy);
     // Software composition needs a full scene repaint when a shell surface
     // moves or disappears, revealing pixels beneath the old rectangle.
     {
@@ -2653,7 +2692,7 @@ static void CompositorLoopWM(bool& clientFrame)
     if (drawChromeLayer && !hadChromeLayer) fullRepaint = true;
     if (drawChromeLayer && fullRepaint){
         __builtin_memset(g_chromeBuffer, 0,
-                         static_cast<uint64_t>(g_backBufStride) * g_physFbHeight * 4);
+                         static_cast<uint64_t>(g_backBufStride) * g_deskHeight * 4);
         g_chromeTexNeedsFull=true;
     }
 
@@ -2678,7 +2717,7 @@ static void CompositorLoopWM(bool& clientFrame)
             Window* w=WmGetWindow(sorted[i]);
             if(!w || !w->proc || !w->visible || w->minimized)continue;
             layers[i]=SceneRect{w->x,w->y,static_cast<int64_t>(w->x)+w->outerWidth(),
-                                      static_cast<int64_t>(w->y)+w->outerHeight()}.clipped(g_physFbWidth,g_physFbHeight);
+                                      static_cast<int64_t>(w->y)+w->outerHeight()}.clipped(g_deskWidth,g_deskHeight);
             const bool windowBuffer=__atomic_load_n(&w->vfb,__ATOMIC_ACQUIRE)!=nullptr;
             if(windowBuffer?w->vfbDirty:w->proc->fbDirty)cpuDamage.include(layers[i]);
         }
@@ -2805,8 +2844,8 @@ static void CompositorLoopWM(bool& clientFrame)
                                 {
                                     int px = ox + static_cast<int>((cx + dx) * sc + sx);
                                     int py = oy + static_cast<int>((cy + dy) * sc + sy);
-                                    if (px >= 0 && px < static_cast<int>(g_physFbWidth) &&
-                                        py >= 0 && py < static_cast<int>(g_physFbHeight))
+                                    if (px >= 0 && px < static_cast<int>(g_deskWidth) &&
+                                        py >= 0 && py < static_cast<int>(g_deskHeight))
                                     {
                                         uint32_t& pixel = g_backBuffer[py * g_backBufStride + px];
                                         pixel ^= 0x00FFFFFF; // invert RGB
@@ -2830,7 +2869,7 @@ static void CompositorLoopWM(bool& clientFrame)
             if (cw && (!cw->noChrome || cw->captionOverlay))
             {
                 WmRenderChromeForWindow(g_chromeBuffer, g_backBufStride,
-                                         g_physFbWidth, g_physFbHeight, sorted[i],
+                                         g_deskWidth, g_deskHeight, sorted[i],
                                          chromeMx, chromeMy);
                 SetChromeDecorAlpha(*cw, CompositorGlassActive() && i+ChromeGlassWindowLimit>=wcount);
             }
@@ -2838,7 +2877,7 @@ static void CompositorLoopWM(bool& clientFrame)
         else if (g_backBuffer)
         {
             WmRenderChromeForWindow(g_backBuffer, g_backBufStride,
-                                     g_physFbWidth, g_physFbHeight, sorted[i],
+                                     g_deskWidth, g_deskHeight, sorted[i],
                                      chromeMx, chromeMy);
         }
     }
@@ -2847,7 +2886,7 @@ static void CompositorLoopWM(bool& clientFrame)
     // software, copy the opaque rectangles over the completed scene.
     if (!rendererLeased) {
         CompositorMutexGuard geometry(&g_scanoutMappingLock);
-        if (g_backBuffer && shell.width == g_physFbWidth && shell.height == g_physFbHeight) {
+        if (g_backBuffer && shell.width == g_deskWidth && shell.height == g_deskHeight) {
             const bool cacheLocalShell = EnsureOverlayBuffer();
             const bool drawOverlayLayer = CompositorGpuActive() && cacheLocalShell;
             const uint32_t count = shell.count;
@@ -3885,15 +3924,15 @@ static void CompositorDrawClock()
     constexpr uint32_t colour = 0x00FF00; // green
     uint32_t lineH = static_cast<uint32_t>(g_fontAtlas.lineHeight);
     uint32_t textW = MeasureConsoleText(buf, g_fontAtlas);
-    uint32_t x = g_physFbWidth - textW - padding;
+    uint32_t x = g_deskWidth - textW - padding;
     uint32_t y = padding;
 
     // Clear background rect
-    for (uint32_t row = y; row < y + lineH + 2 && row < g_physFbHeight; ++row)
-        for (uint32_t col = x > 2 ? x - 2 : 0; col < g_physFbWidth; ++col)
+    for (uint32_t row = y; row < y + lineH + 2 && row < g_deskHeight; ++row)
+        for (uint32_t col = x > 2 ? x - 2 : 0; col < g_deskWidth; ++col)
             dst[row * stride + col] = 0x000000;
 
-    DrawConsoleText(dst, stride, g_physFbWidth, g_physFbHeight, buf, x, y, colour, g_fontAtlas);
+    DrawConsoleText(dst, stride, g_deskWidth, g_deskHeight, buf, x, y, colour, g_fontAtlas);
     MarkDirtyRows(y, y + lineH + 2);
 }
 
@@ -3968,7 +4007,7 @@ static void DumpFullFrameOnce()
     }
     else if (g_backBuffer)
     {
-        DumpFrameBase64(g_backBuffer, g_physFbWidth, g_physFbHeight,
+        DumpFrameBase64(g_backBuffer, g_deskWidth, g_deskHeight,
                         g_backBufStride, "CPUFULL");
     }
 }
@@ -4003,9 +4042,9 @@ static void GpuComposeSrcRect(const GpuCompositorOps* gpu, GpuTexId tex,
     if (w <= 0 || h <= 0 || !tex) return;
     if (x < 0) { w += x; x = 0; }
     if (y < 0) { h += y; y = 0; }
-    if (x >= (int)g_physFbWidth || y >= (int)g_physFbHeight) return;
-    if (x + w > (int)g_physFbWidth)  w = (int)g_physFbWidth  - x;
-    if (y + h > (int)g_physFbHeight) h = (int)g_physFbHeight - y;
+    if (x >= (int)g_deskWidth || y >= (int)g_deskHeight) return;
+    if (x + w > (int)g_deskWidth)  w = (int)g_deskWidth  - x;
+    if (y + h > (int)g_deskHeight) h = (int)g_deskHeight - y;
     if (w <= 0 || h <= 0) return;
     GpuComposeLayer(gpu, tex, (uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h,
                     (uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h, alphaBlend, opacity);
@@ -4072,9 +4111,9 @@ static void GpuComposeRectBlur(const GpuCompositorOps* gpu, int x, int y, int wd
     if (!gpu->BlurBarrier) return;
     if (x < 0) { wd += x; x = 0; }
     if (y < 0) { hd += y; y = 0; }
-    if (x >= (int)g_physFbWidth || y >= (int)g_physFbHeight) return;
-    if (x + wd > (int)g_physFbWidth)  wd = (int)g_physFbWidth  - x;
-    if (y + hd > (int)g_physFbHeight) hd = (int)g_physFbHeight - y;
+    if (x >= (int)g_deskWidth || y >= (int)g_deskHeight) return;
+    if (x + wd > (int)g_deskWidth)  wd = (int)g_deskWidth  - x;
+    if (y + hd > (int)g_deskHeight) hd = (int)g_deskHeight - y;
     if (wd <= 0 || hd <= 0) return;
     gpu->DrawQuad(GPU_TEX_BLUR_BACKDROP, 0, 0, 0, 0,
                   (uint32_t)x, (uint32_t)y, (uint32_t)wd, (uint32_t)hd, 255, false);
@@ -4130,7 +4169,7 @@ static void EnsureDesktopTex(const GpuCompositorOps* gpu)
     if (g_desktopTex && g_desktopTexPtr == g_backBuffer) return;
     if (g_desktopTex) { gpu->DestroyTexture(g_desktopTex); g_desktopTex = 0; }
     if (!g_backBuffer || g_managedBackBufferPages) return;
-    g_desktopTex = gpu->CreateTexture(g_backBufStride, g_physFbHeight,
+    g_desktopTex = gpu->CreateTexture(g_backBufStride, g_deskHeight,
                                       reinterpret_cast<uint64_t>(g_backBuffer), false);
     g_desktopTexPtr = g_backBuffer;
     g_desktopTexNeedsFull = true;   // upload the whole desktop on first use
@@ -4139,7 +4178,7 @@ static void EnsureDesktopTex(const GpuCompositorOps* gpu)
 static void EnsureChromeTex(const GpuCompositorOps* gpu)
 {
     if (g_chromeTex || !g_chromeBuffer) return;
-    g_chromeTex = gpu->CreateTexture(g_backBufStride, g_physFbHeight,
+    g_chromeTex = gpu->CreateTexture(g_backBufStride, g_deskHeight,
                                      reinterpret_cast<uint64_t>(g_chromeBuffer), true);
     g_chromeTexNeedsFull = true;
 }
@@ -4147,7 +4186,7 @@ static void EnsureChromeTex(const GpuCompositorOps* gpu)
 static void EnsureOverlayTex(const GpuCompositorOps* gpu)
 {
     if (g_overlayTex || !g_overlayBuffer) return;
-    g_overlayTex = gpu->CreateTexture(g_backBufStride, g_physFbHeight,
+    g_overlayTex = gpu->CreateTexture(g_backBufStride, g_deskHeight,
                                       reinterpret_cast<uint64_t>(g_overlayBuffer), true);
     g_overlayTexNeedsFull = true;
 }
@@ -4196,14 +4235,14 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
     if (!g_desktopTex) return;
     if (g_desktopTexNeedsFull)
     {
-        UploadLayerTexture(gpu,g_desktopTex,0,0,g_physFbWidth,g_physFbHeight,0);
+        UploadLayerTexture(gpu,g_desktopTex,0,0,g_deskWidth,g_deskHeight,0);
         g_desktopTexNeedsFull = false;
     }
     else if (!WmIsActive() && dirtyMinY < dirtyMaxY)
     {
-        uint32_t maxY = dirtyMaxY > g_physFbHeight ? g_physFbHeight : dirtyMaxY;
+        uint32_t maxY = dirtyMaxY > g_deskHeight ? g_deskHeight : dirtyMaxY;
         if (maxY > dirtyMinY)
-            UploadLayerTexture(gpu,g_desktopTex,0,dirtyMinY,g_physFbWidth,maxY-dirtyMinY,0);
+            UploadLayerTexture(gpu,g_desktopTex,0,dirtyMinY,g_deskWidth,maxY-dirtyMinY,0);
     }
 
     // 1b. Chrome layer: the per-window decorations as an alpha texture, uploaded
@@ -4217,7 +4256,7 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
         {
             if (g_chromeTexNeedsFull)
             {
-                UploadLayerTexture(gpu,g_chromeTex,0,0,g_physFbWidth,g_physFbHeight,1);
+                UploadLayerTexture(gpu,g_chromeTex,0,0,g_deskWidth,g_deskHeight,1);
                 g_chromeTexNeedsFull = false;
             }
 
@@ -4236,11 +4275,11 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
         {
             if (g_overlayTexNeedsFull)
             {
-                UploadLayerTexture(gpu,g_overlayTex,0,0,g_physFbWidth,g_physFbHeight,2);
+                UploadLayerTexture(gpu,g_overlayTex,0,0,g_deskWidth,g_deskHeight,2);
                 g_overlayTexNeedsFull = false;
             }
             else if (g_shellUploadMinY < g_shellUploadMaxY)
-                UploadLayerTexture(gpu, g_overlayTex, 0, g_shellUploadMinY, g_physFbWidth,
+                UploadLayerTexture(gpu, g_overlayTex, 0, g_shellUploadMinY, g_deskWidth,
                                    g_shellUploadMaxY - g_shellUploadMinY, 2);
             g_shellUploadMinY = ~uint32_t(0);
             g_shellUploadMaxY = 0;
@@ -4321,8 +4360,8 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
     // layers composited below). Client areas show wallpaper. In legacy (non-WM)
     // mode the backbuffer carries the full legacy scene, so this one quad presents
     // it and the chrome/overlay layers are absent.
-    GpuComposeLayer(gpu, g_desktopTex, 0, 0, g_physFbWidth, g_physFbHeight,
-                    0, 0, g_physFbWidth, g_physFbHeight, false);
+    GpuComposeLayer(gpu, g_desktopTex, 0, 0, g_deskWidth, g_deskHeight,
+                    0, 0, g_deskWidth, g_deskHeight, false);
 
     // Windows back-to-front. Each window composites as a UNIT — content then its
     // chrome — at the window's opacity, so a higher window's translucent frame
@@ -4487,7 +4526,7 @@ static void CopyOutputName(char (&dst)[16], const char* src)
 }
 static bool GopOutputInfo(uint32_t id, OutputInfo* out)
 {
-    const uint64_t packed=__atomic_load_n(&g_publishedPhysDims,__ATOMIC_ACQUIRE);
+    const uint64_t packed=__atomic_load_n(&g_publishedGopDims,__ATOMIC_ACQUIRE);
     const uint32_t w=static_cast<uint32_t>(packed),h=static_cast<uint32_t>(packed>>32);
     if(id || !out || !w || !h)return false;
     *out=OutputInfo{};
@@ -4539,14 +4578,14 @@ static int GopOutputPresent(uint32_t id, const OutputBuffer& buffer, const Damag
                                       minY,maxY,!full,copyRow);
         g_idleStats.rowsCopied+=r.copied;g_idleStats.rowsSkipped+=r.skipped;g_idleStats.bytesCopied+=r.copied*rowBytes;
         flushMin=r.minY;flushMax=r.maxY;
-        if(full && minY==0 && maxY==g_physFbHeight)g_gopShadowValid=true;
+        if(full && minY==0 && maxY==g_deskHeight)g_gopShadowValid=true;
     }else{
         for(uint32_t y=minY;y<maxY;++y)copyRow(y);
         g_idleStats.rowsCopied+=maxY-minY;g_idleStats.bytesCopied+=(maxY-minY)*rowBytes;
     }
 #if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
     // The GOP now holds the complete software frame; arm it (latched at vblank).
-    if(full && minY==0 && maxY==g_physFbHeight)brook::BdwScanoutFlipReturnToGop();
+    if(full && minY==0 && maxY==g_deskHeight)brook::BdwScanoutFlipReturnToGop();
 #endif
     if(flushMin>=flushMax)return 0;
     brook::DisplayFlush(flushMin,flushMax);
@@ -4589,6 +4628,74 @@ void CompositorSetPrimaryPresenter(const CompositorPrimaryPresenter* presenter)
     g_scanoutNeedsRepair=true;
     if(g_gopShadowValid)GopShadowInvalidate();
     CompositorWake();
+}
+
+const uint32_t* CompositorPresentSource(uint32_t* stridePixels)
+{
+    if(stridePixels)*stridePixels=g_backBufStride;
+    return g_backBuffer;
+}
+
+// D3: the desktop follows the union of the enabled outputs. When an output joins or
+// leaves (registry generation), the back buffer becomes union-sized (a separate buffer;
+// the framebuffer-sized one stays the TTY's) or returns to the framebuffer-sized one,
+// then the pointer bounds, the WM layout and a full repaint follow. Compositor thread,
+// between frames. The desktop never shrinks below the firmware framebuffer.
+static void CompositorApplyOutputExtent()
+{
+    static uint64_t seen=0;
+    const uint64_t generation=OutputGeneration();
+    if(generation==seen || !g_baseBackBuffer || g_managedBackBufferPages)return;
+    seen=generation;
+    OutputLayout layout;
+    CompositorGetOutputs(layout);
+    uint32_t w=0,h=0;
+    OutputDesktopExtent(layout,&w,&h);
+    if(w<g_physFbWidth)w=g_physFbWidth;
+    if(h<g_physFbHeight)h=g_physFbHeight;
+    if(w>8192 || h>4320)return;                       // 66 MB at 7680x2160; refuse anything larger
+    const bool spans=w!=g_physFbWidth || h!=g_physFbHeight;
+    OutputRect rects[OutputMax]{};uint32_t count=0;
+    if(spans)for(uint32_t i=0;i<layout.count;++i)if(layout.enabled(i))rects[count++]=layout.rect(i);
+    if(w==g_deskWidth && h==g_deskHeight && count==g_deskOutputCount){
+        bool same=true;for(uint32_t i=0;i<count;++i)same&=rects[i]==g_deskOutputs[i];
+        if(same)return;
+    }
+    uint32_t* buffer=g_baseBackBuffer;uint32_t stride=g_physFbStride;
+    if(spans){
+        stride=(w+63)&~63u;
+        const uint64_t pages=(uint64_t(stride)*h*4+4095)/4096;
+        if(pages>g_unionBackBufferPages){
+            // The old union buffer is kept rather than freed: readers outside this thread
+            // (debug captures) may still hold it until the next frame.
+            const VirtualAddress va=VmmAllocPages(pages,VMM_WRITABLE,MemTag::Device,0);
+            if(!va){SerialPrintf("COMPOSITOR: %ux%u desktop buffer allocation failed; staying %ux%u\n",w,h,g_deskWidth,g_deskHeight);return;}
+            g_unionBackBuffer=reinterpret_cast<uint32_t*>(va.raw());g_unionBackBufferPages=pages;
+        }
+        buffer=g_unionBackBuffer;
+    }
+    {
+        CompositorMutexGuard geometry(&g_scanoutMappingLock);
+        // Keep what the primary already shows; the rest is repainted below.
+        if(buffer!=g_backBuffer && g_backBuffer){
+            const uint32_t copyW=g_deskWidth<w?g_deskWidth:w,copyH=g_deskHeight<h?g_deskHeight:h;
+            for(uint32_t y=0;y<copyH;++y)
+                memcpy(buffer+uint64_t(y)*stride,g_backBuffer+uint64_t(y)*g_backBufStride,uint64_t(copyW)*4);
+        }
+        g_backBuffer=buffer;g_backBufStride=stride;g_deskWidth=w;g_deskHeight=h;
+        for(uint32_t i=0;i<count;++i)g_deskOutputs[i]=rects[i];
+        g_deskOutputCount=count;
+        g_scanoutNeedsRepair=true;
+        if(g_gopShadowValid)GopShadowInvalidate();
+        if(g_displayGeneration)++g_displayGeneration;
+        PublishPhysDims(w,h);
+    }
+    g_needsFullRepaint=true;
+    CompositorSyncPointerOutputs();
+    MarkAllDirty();
+    if(WmIsActive())WmApplyDisplaySize(w,h);
+    CompositorMarkDirty();
+    SerialPrintf("COMPOSITOR: desktop %ux%u over %u output(s), stride=%u\n",w,h,count?count:1u,stride);
 }
 
 // The pointer moves over the union of the enabled outputs.
@@ -4670,8 +4777,8 @@ static bool CompositorFlipSoftware(bool clientFrame = false, bool hardwareCursor
     // The scanout still contains the renderer's frame if its lease expired
     // during this loop. Replace the whole frame on software takeover.
     uint32_t minY=full?0:g_dirtyMinY;
-    uint32_t maxY=full?g_physFbHeight:g_dirtyMaxY;
-    if(maxY>g_physFbHeight)maxY=g_physFbHeight;
+    uint32_t maxY=full?g_deskHeight:g_dirtyMaxY;
+    if(maxY>g_deskHeight)maxY=g_deskHeight;
     g_dirtyMinY=0xFFFFFFFFu;g_dirtyMaxY=0;
     if(minY>=maxY)return false;
     ++g_idleStats.softwareFlips;g_idleStats.rowsDirty+=maxY-minY;
@@ -4680,7 +4787,7 @@ static bool CompositorFlipSoftware(bool clientFrame = false, bool hardwareCursor
     // Present the damage to every output, clipped to its rectangle. The row
     // span is the damage: full-width rows of the desktop.
     g_gopPresentShadow=shadow;
-    const DamageRects damage=full ? DamageRects::Full(g_physFbWidth,g_physFbHeight) : DamageRects::Rows(minY,maxY,g_physFbWidth);
+    const DamageRects damage=full ? DamageRects::Full(g_deskWidth,g_deskHeight) : DamageRects::Rows(minY,maxY,g_deskWidth);
     bool flushed=false;
     if constexpr (!OutputMultiSupported) {
         // The one output is the GOP adapter at 0,0: the damage needs no clip.
@@ -4716,7 +4823,7 @@ static bool CompositorFlipSoftware(bool clientFrame = false, bool hardwareCursor
     }
     if (hardwareCursor) DisplayCommitCursor();
     g_scanoutContainsLeasedFrame=false;
-    if(minY==0 && maxY==g_physFbHeight)g_scanoutNeedsRepair=false;
+    if(minY==0 && maxY==g_deskHeight)g_scanoutNeedsRepair=false;
     return true;
 }
 
@@ -4727,7 +4834,7 @@ static bool CompositorDrawManualPowerOff()
     static constexpr char message[] = "It's now safe to turn off this computer";
     {
         CompositorMutexGuard geometry(&g_scanoutMappingLock);
-        if (!g_physFb || !g_physFbWidth || !g_physFbHeight ||
+        if (!g_physFb || !g_deskWidth || !g_deskHeight ||
             g_gopWriter || g_presentLease.Active(ApicTickCount())) return false;
         TtySuppressDisplay(true);
         DisplayPowerSetIdle(0);
@@ -4739,27 +4846,28 @@ static bool CompositorDrawManualPowerOff()
         g_cursorVisible = false;
         auto* pixels = g_backBuffer ? g_backBuffer : const_cast<uint32_t*>(g_physFb);
         const uint32_t stride = g_backBuffer ? g_backBufStride : g_physFbStride;
-        for (uint32_t y = 0; y < g_physFbHeight; ++y)
-            memset(pixels + y * stride, 0, g_physFbWidth * sizeof(*pixels));
-        const auto& font = MeasureConsoleText(message, g_desktopFont200) <= g_physFbWidth &&
-                           uint32_t(g_desktopFont200.lineHeight) <= g_physFbHeight ? g_desktopFont200 : g_fontAtlas;
+        for (uint32_t y = 0; y < g_deskHeight; ++y)
+            memset(pixels + y * stride, 0, g_deskWidth * sizeof(*pixels));
+        const auto& font = MeasureConsoleText(message, g_desktopFont200) <= g_deskWidth &&
+                           uint32_t(g_desktopFont200.lineHeight) <= g_deskHeight ? g_desktopFont200 : g_fontAtlas;
         const uint32_t width = MeasureConsoleText(message, font);
         const uint32_t height = uint32_t(font.lineHeight);
+        // Centred on the primary output (the framebuffer), not across a multi-output desktop.
         const uint32_t x = g_physFbWidth > width ? (g_physFbWidth - width) / 2 : 0;
         const uint32_t y = g_physFbHeight > height ? (g_physFbHeight - height) / 2 : 0;
-        DrawConsoleText(pixels, stride, g_physFbWidth, g_physFbHeight, message, x, y, 0xffffff, font);
+        DrawConsoleText(pixels, stride, g_deskWidth, g_deskHeight, message, x, y, 0xffffff, font);
         if (!g_backBuffer) {
 #if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
             BdwScanoutFlipReturnToGop();
 #endif
-            DisplayFlush(0, g_physFbHeight);
+            DisplayFlush(0, g_deskHeight);
             GopShadowInvalidate();
             g_scanoutContainsLeasedFrame = false;
             g_scanoutNeedsRepair = false;
             return true;
         }
         g_backBufferOverlayOmitted = false;
-        MarkDirtyRows(0, g_physFbHeight);
+        MarkDirtyRows(0, g_deskHeight);
     }
     return CompositorFlipSoftware();
 }
@@ -4812,7 +4920,7 @@ static void CompositorLoop()
             if(g_backBuffer)for(uint32_t y=0;y<g_physFbHeight;++y)
                 memcpy(const_cast<uint32_t*>(g_physFb)+y*g_physFbStride,g_backBuffer+y*g_backBufStride,g_physFbWidth*4);
             {CompositorMutexGuard geometry(&g_scanoutMappingLock);GopShadowInvalidate();}
-            DisplayFlush(0,g_physFbHeight);
+            DisplayFlush(0,g_deskHeight);
             if(!pending) SchedulerSleepMs(50);
         }
         if(pending)return;
@@ -4846,7 +4954,7 @@ static void CompositorLoop()
     if (g_cursorVisible && !CompositorGpuActive()) {
         uint32_t oldMinY = (g_cursorSaveY >= 0) ? static_cast<uint32_t>(g_cursorSaveY) : 0;
         uint32_t oldMaxY = static_cast<uint32_t>(g_cursorSaveY) + static_cast<uint32_t>(g_cursorSaveH);
-        if (oldMaxY > g_physFbHeight) oldMaxY = g_physFbHeight;
+        if (oldMaxY > g_deskHeight) oldMaxY = g_deskHeight;
         CursorRestore();
         MarkDirtyRows(oldMinY, oldMaxY);
     }
@@ -4893,19 +5001,19 @@ static void CompositorLoop()
                 for (uint32_t dy = 0; dy < dstH; ++dy)
                 {
                     int y = dstY0 + static_cast<int>(dy);
-                    if (y < 0 || static_cast<uint32_t>(y) >= g_physFbHeight) continue;
+                    if (y < 0 || static_cast<uint32_t>(y) >= g_deskHeight) continue;
                     uint32_t* row = dstBase + y * dstStride;
                     for (uint32_t dx = 0; dx < dstW; ++dx)
                     {
                         int x = dstX0 + static_cast<int>(dx);
-                        if (x < 0 || static_cast<uint32_t>(x) >= g_physFbWidth) continue;
+                        if (x < 0 || static_cast<uint32_t>(x) >= g_deskWidth) continue;
                         row[x] = exitColor;
                     }
                 }
                 __atomic_store_n(&p->fbExitColor, 0u, __ATOMIC_RELEASE);
                 uint32_t minY = (dstY0 >= 0) ? static_cast<uint32_t>(dstY0) : 0;
                 uint32_t maxY = static_cast<uint32_t>(dstY0) + dstH;
-                if (maxY > g_physFbHeight) maxY = g_physFbHeight;
+                if (maxY > g_deskHeight) maxY = g_deskHeight;
                 MarkDirtyRows(minY, maxY);
             }
             __atomic_store_n(&g_compositedProcs[i], static_cast<Process*>(nullptr), __ATOMIC_RELEASE);
@@ -5038,7 +5146,7 @@ static void CompositorLoop()
         const auto keys=KbdProbeSnapshot();
         if(++count<=4 || loopEndTick-last>=2000 || keys.bytes!=lastBytes) {
             last=loopEndTick;lastBytes=keys.bytes;
-            KPrintf("HWFRAME: %ux%u stride=%u frame=%lu\n",g_physFbWidth,g_physFbHeight,g_physFbStride,count);
+            KPrintf("HWFRAME: %ux%u stride=%u frame=%lu\n",g_deskWidth,g_deskHeight,g_physFbStride,count);
             KPrintf("HWFB: cache=%s\n",VmmFramebufferWriteCombining()?"WC":"unchanged");
             KPrintf("HWMS: draw=%lu copy=%lu period=%lu (guest clock)\n",
                     probePresentStart-loopStartTick,probePresentEnd-probePresentStart,periodMs);
@@ -5098,7 +5206,7 @@ static void CompositorThreadFn(void* /*arg*/)
 {
     __atomic_store_n(&g_compositorProcess, ProcessCurrent(), __ATOMIC_RELEASE);
     SerialPrintf("COMPOSITOR: thread started (%ux%u, %u processes)\n",
-                 g_physFbWidth, g_physFbHeight, g_compositedCount);
+                 g_deskWidth, g_deskHeight, g_compositedCount);
 
     for (;;)
     {
@@ -5112,6 +5220,7 @@ static void CompositorThreadFn(void* /*arg*/)
             // A mode hint may lock the compositor frame and replace its
             // geometry. Poll only between completed frame transactions.
             DisplayPollModeHints();
+            if constexpr (OutputMultiSupported) CompositorApplyOutputExtent();
             DisplayPowerTick(ApicTickCount(),InputLatestSequence());
             { FrameTimingScope phase(FramePhase::DeferredCaptures);DrainOwnedCaptures(); }
             { FrameTimingScope phase(FramePhase::SceneDrain);CompositorDrainScenes(); }
@@ -5141,12 +5250,14 @@ static void CompositorThreadFn(void* /*arg*/)
 #if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
         TraceDesktopCycle(FrameDesktopEnd,ApicTickCount());
 #endif
-        uint32_t waitMs=COMPOSITE_INTERVAL;
+        // A flip presenter paces the loop to its vblanks (its hint replaces the free-running
+        // 16 ms fallback, which beat against the 16.67 ms frame); a client commit still
+        // wakes the loop at once.
         if(const auto* presenter=g_primaryPresenter; presenter && presenter->poll){
-            const uint32_t hint=presenter->poll();
-            if(hint<waitMs)waitMs=hint;
+            uint32_t waitMs=presenter->poll();
+            if(waitMs>2*COMPOSITE_INTERVAL)waitMs=2*COMPOSITE_INTERVAL;
+            CompositorWaitForWorkMs(frameGeneration,waitMs?waitMs:1);
         }
-        if(waitMs<COMPOSITE_INTERVAL)CompositorWaitForWorkMs(frameGeneration,waitMs?waitMs:1);
         else CompositorWaitForWork(frameGeneration);
     }
 }
@@ -5195,8 +5306,8 @@ bool CompositorGetBackdropInfo(CompositorBackdropInfo* out)
 {
     if(!out)return false;
     CompositorMutexGuard geometry(&g_scanoutMappingLock);
-    if(!g_physFb || !g_displayGeneration || !RefreshBackdropStyle() || !g_backdropGeneration || !g_physFbWidth || !g_physFbHeight)return false;
-    *out={g_displayGeneration,g_backdropGeneration,g_physFbWidth,g_physFbHeight};return true;
+    if(!g_physFb || !g_displayGeneration || !RefreshBackdropStyle() || !g_backdropGeneration || !g_deskWidth || !g_deskHeight)return false;
+    *out={g_displayGeneration,g_backdropGeneration,g_deskWidth,g_deskHeight};return true;
 }
 
 bool CompositorReadBackdropSpan(const CompositorBackdropInfo& expected,uint32_t y,uint32_t left,uint32_t count,uint32_t* out)
@@ -5204,9 +5315,9 @@ bool CompositorReadBackdropSpan(const CompositorBackdropInfo& expected,uint32_t 
     if(!out || !count)return false;
     CompositorMutexGuard geometry(&g_scanoutMappingLock);
     if(!g_physFb || !RefreshBackdropStyle() || !expected.display || !expected.generation || expected.display!=g_displayGeneration ||
-       expected.generation!=g_backdropGeneration || expected.width!=g_physFbWidth || expected.height!=g_physFbHeight ||
-       y>=g_physFbHeight || left>=g_physFbWidth || count>g_physFbWidth-left)return false;
-    DesktopBackdropSpan(out,left,left+count,y,g_physFbWidth,g_physFbHeight,g_wallpaper,g_wallpaperWidth,g_wallpaperHeight);
+       expected.generation!=g_backdropGeneration || expected.width!=g_deskWidth || expected.height!=g_deskHeight ||
+       y>=g_deskHeight || left>=g_deskWidth || count>g_deskWidth-left)return false;
+    DesktopBackdropSpan(out,left,left+count,y,g_deskWidth,g_deskHeight,g_wallpaper,g_wallpaperWidth,g_wallpaperHeight);
     if(WmBackdropStyleVersion()!=g_backdropStyleVersion)return false;
     for(uint32_t x=0;x<count;++x)out[x]|=0xff000000u;
     return true;
@@ -5215,7 +5326,7 @@ bool CompositorReadBackdropSpan(const CompositorBackdropInfo& expected,uint32_t 
 static bool CompositorCanBlitGopLocked(){
     return DisplayUsesFirmwareFramebuffer() && g_backBuffer && g_backBuffer!=g_physFb &&
         TtyDisplaySuppressed() && !BootLogoActive() &&
-        g_physFbWidth==3200 && g_physFbHeight==1800 && g_physFbStride==3200 &&
+        g_deskWidth==3200 && g_deskHeight==1800 && g_physFbStride==3200 &&
         DisplayGetFramebufferPhys()==0xe0000000;
 }
 
@@ -5234,13 +5345,13 @@ int CompositorReserveGopWrite(CompositorGopWrite& write,const CompositorPresentR
        !g_presentLease.Active(now) || g_presentLease.owner!=owner ||
        display!=g_leasedFrameDisplay || backdrop!=g_leasedFrameBackdrop))return -116;
     if(!partial && (count!=1 || regions[0].x || regions[0].y ||
-       regions[0].width!=g_physFbWidth || regions[0].height!=g_physFbHeight))return -22;
-    uint32_t minY=g_physFbHeight,maxY=0;
+       regions[0].width!=g_deskWidth || regions[0].height!=g_deskHeight))return -22;
+    uint32_t minY=g_deskHeight,maxY=0;
     for(uint32_t i=0;i<count;++i){
         const auto& r=regions[i];
         if(!r.width || !r.height || r.stride<r.width || r.stride>16384 ||
-           r.x>=g_physFbWidth || r.y>=g_physFbHeight ||
-           r.width>g_physFbWidth-r.x || r.height>g_physFbHeight-r.y)return -22;
+           r.x>=g_deskWidth || r.y>=g_deskHeight ||
+           r.width>g_deskWidth-r.x || r.height>g_deskHeight-r.y)return -22;
         const uint64_t bytes=(uint64_t(r.height-1)*r.stride+r.width)*4;
         if(r.offset>sourceBytes || bytes>sourceBytes-r.offset)return -22;
         if(r.y<minY)minY=r.y;
@@ -5333,10 +5444,10 @@ int CompositorPresentProbe(uint32_t x,uint32_t y,uint32_t width,uint32_t height,
         if(region && (!expectedDisplay || !expectedBackdrop || !g_scanoutContainsLeasedFrame || g_scanoutNeedsRepair ||
            !g_presentLease.Active(now) || g_presentLease.owner!=leaseOwner ||
            expectedDisplay!=g_leasedFrameDisplay || expectedBackdrop!=g_leasedFrameBackdrop))return -116;
-        if(leaseOwner && !region && (!expectedDisplay || !expectedBackdrop || x || y || width!=g_physFbWidth ||
-           height!=g_physFbHeight || !g_presentLease.CanAcquire(leaseOwner,now)))return -16;
-        if(!g_physFb || CompositorGpuActive() || x>=g_physFbWidth || y>=g_physFbHeight ||
-           width>g_physFbWidth-x || height>g_physFbHeight-y)return -22;
+        if(leaseOwner && !region && (!expectedDisplay || !expectedBackdrop || x || y || width!=g_deskWidth ||
+           height!=g_deskHeight || !g_presentLease.CanAcquire(leaseOwner,now)))return -16;
+        if(!g_physFb || CompositorGpuActive() || x>=g_deskWidth || y>=g_deskHeight ||
+           width>g_deskWidth-x || height>g_deskHeight-y)return -22;
         for(uint32_t row=0;row<height;++row){
             void* dest=const_cast<uint32_t*>(g_physFb+uint64_t(y+row)*g_physFbStride+x);
             touched=true;if(g_gopShadowValid)GopShadowInvalidate();
@@ -5394,7 +5505,7 @@ int CompositorPresentRegions(const CompositorPresentRegion* regions,uint32_t cou
         for(uint32_t i=0;i<count;++i){
             const auto& r=regions[i];
             if(!r.width || !r.height || r.stride<r.width || r.stride>16384 ||
-               r.x>=g_physFbWidth || r.y>=g_physFbHeight || r.width>g_physFbWidth-r.x || r.height>g_physFbHeight-r.y)return -22;
+               r.x>=g_deskWidth || r.y>=g_deskHeight || r.width>g_deskWidth-r.x || r.height>g_deskHeight-r.y)return -22;
             const uint64_t bytes=(uint64_t(r.height-1)*r.stride+r.width)*4;
             if(r.offset>sourceBytes || bytes>sourceBytes-r.offset)return -22;
             if(r.y<minY)minY=r.y;
@@ -5539,12 +5650,12 @@ static bool ReplaceCompositorFramebuffer(uint64_t fbPhys, uint32_t w, uint32_t h
                const_cast<uint32_t*>(physical+static_cast<uint64_t>(y)*stridePixels),w*4);
     const bool cancelled=g_presentLease.Clear();
     g_scanoutContainsLeasedFrame=false;g_scanoutNeedsRepair=false;
-    const VirtualAddress retired(reinterpret_cast<uint64_t>(g_backBuffer));
+    const VirtualAddress retired(reinterpret_cast<uint64_t>(g_baseBackBuffer ? g_baseBackBuffer : g_backBuffer));
     const uint64_t retiredPages = replaceTty ? g_managedBackBufferPages : 0;
     // Keep legacy buffers: the old GPU API may hold unpinned device aliases.
     // Managed buffers have only guarded kernel readers; their former owner
     // mapping can be removed as soon as the new framebuffer is published.
-    g_physFb=physical;g_physFbWidth=w;g_physFbHeight=h;g_physFbStride=stridePixels;
+    g_physFb=physical;g_physFbWidth=g_deskWidth=w;g_physFbHeight=g_deskHeight=h;g_physFbStride=stridePixels;
     GopShadowInvalidate();
     g_backBuffer=buffer;g_backBufStride=stridePixels;
     if (replaceTty) {
@@ -5554,7 +5665,8 @@ static bool ReplaceCompositorFramebuffer(uint64_t fbPhys, uint32_t w, uint32_t h
         TtyRedirectToBackbuffer(buffer);
     }
     if(g_displayGeneration)++g_displayGeneration;
-    PublishPhysDims(w, h);
+    g_baseBackBuffer=buffer;
+    PublishFramebufferDims(w, h);
     OutputNotifyChanged();
     CompositorUnlockScanoutForDisplayChange();
     if (retiredPages) VmmFreePages(retired, retiredPages);
@@ -5613,13 +5725,13 @@ uint64_t CompositorScanoutMap(Process* proc,ScanoutMapResult* out)
 {
     CompositorMutexGuard snapshot(&g_scanoutMappingLock);
     if (!proc || !out || !g_backBuffer || g_managedBackBufferPages) return 0;
-    uint64_t bytes=static_cast<uint64_t>(g_backBufStride)*g_physFbHeight*4;
+    uint64_t bytes=static_cast<uint64_t>(g_backBufStride)*g_deskHeight*4;
     auto* backing=UserMappingBufferSnapshot(reinterpret_cast<uint64_t>(g_backBuffer),(bytes+4095)&~uint64_t{4095});
     if (!backing) return 0;
     int64_t mapped=UserMappingBufferAlias(ProcessCurrent(),proc->addressSpace,backing,3);
     MappingBackingUnref(backing);
     if (mapped<0) return 0;
-    out->userAddr=static_cast<uint64_t>(mapped);out->width=g_physFbWidth;out->height=g_physFbHeight;
+    out->userAddr=static_cast<uint64_t>(mapped);out->width=g_deskWidth;out->height=g_deskHeight;
     out->stride=g_backBufStride;out->bufferBytes=static_cast<uint32_t>(bytes);
     return out->userAddr;
 }
@@ -5630,14 +5742,14 @@ int CompositorScanoutFlip(uint32_t minY, uint32_t maxY)
     if(g_gopWriter)return -16;
     if (g_managedBackBufferPages) return -95;
     if (!g_physFb || !g_backBuffer) return -1;
-    if (minY >= g_physFbHeight) return -1;
-    if (maxY > g_physFbHeight) maxY = g_physFbHeight;
+    if (minY >= g_deskHeight) return -1;
+    if (maxY > g_deskHeight) maxY = g_deskHeight;
     if (minY >= maxY) return 0; // nothing to do
 
     GopShadowInvalidate();
     // Copy dirty rows from cached backbuffer to MMIO framebuffer.
     // This is the expensive part — MMIO writes are uncacheable.
-    uint32_t rowBytes = g_physFbWidth * 4;
+    uint32_t rowBytes = g_deskWidth * 4;
     for (uint32_t y = minY; y < maxY; y++) {
         __builtin_memcpy(
             const_cast<uint32_t*>(g_physFb + y * g_physFbStride),
