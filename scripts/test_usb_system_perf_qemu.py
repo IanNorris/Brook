@@ -27,6 +27,36 @@ def measure_job(guest, command):
             "stderr": result.get("stderr", {}).get("text", "")}
 
 
+def bench_command(guest, command):
+    for attempt in range(3):
+        try:
+            return guest.call("hw_command", command=command)
+        except RuntimeError as error:
+            if "timed out" not in str(error) or attempt == 2:
+                raise
+            # Read-only measurement. Wait for the single bridge worker to
+            # finish a possibly dispatched read before issuing a fresh one.
+            time.sleep(1 + attempt)
+
+
+def trim_evidence(guest, mode, output):
+    prefix = "USB_SYSTEM_TRIM"
+    events = []
+    for line in guest.serial.read_text(errors="replace").splitlines():
+        if line.startswith((prefix + " ", prefix + "_RANGE ")):
+            events.append(json.loads(line.split(" ", 1)[1]))
+    done = [row for row in events if row.get("state") == "done"]
+    ranges = [row for row in events if "lba" in row]
+    assert len(done) == 1 and done[0]["mode"] == mode and done[0]["error"] == 0 and ranges, events
+    assert sum(row["sectors"] for row in ranges) == done[0]["sectors"]
+    for row in ranges:
+        assert row["mode"] == mode and row["sectors"] > 0
+        assert fixture.STORE_FIRST <= row["lba"]
+        assert row["lba"] + row["sectors"] <= fixture.BACKUP_FIRST
+    (output / "trim.jsonl").write_text("".join(json.dumps(row) + "\n" for row in events))
+    return done[0]
+
+
 def browser(guest):
     catalog = guest.call("hw_apps")
     app = next((row for row in catalog["apps"]
@@ -56,6 +86,9 @@ def main():
     parser.add_argument("--accel", choices=("kvm", "tcg"), default="kvm")
     parser.add_argument("--skip-browser", action="store_true")
     parser.add_argument("--uas", action="store_true")
+    parser.add_argument("--trim-mode", choices=("dry-run", "run"))
+    parser.add_argument("--sequential-mib", type=int, choices=(4, 8, 16), default=16)
+    parser.add_argument("--random-mib", type=int, choices=(1, 2, 4), default=4)
     args = parser.parse_args()
     if not args.cold_file.startswith("/nix/store/"):
         parser.error("--cold-file must be under /nix/store")
@@ -77,12 +110,15 @@ def main():
             guest.wait_log("xhci: UAS ready")
         guest.attach()
         assert guest.status()["mounted"]
-        rows = {}
-        for mode, kib, mib in [("seq", size, 16) for size in (4, 16, 64, 256, 1024, 4096)] + [("rand", 4, 4)]:
-            row = guest.call("hw_command", command=f"bridge hardware usb-system-bench {mode} {kib} {mib}")
+        if args.trim_mode:
+            result["trim"] = trim_evidence(guest, args.trim_mode, args.output)
+        rows = result["raw"] = {}
+        sequential = [("seq", size, args.sequential_mib) for size in (4, 16, 64, 256, 1024, 4096)]
+        for mode, kib, mib in sequential + [("rand", 4, args.random_mib)]:
+            row = bench_command(guest, f"bridge hardware usb-system-bench {mode} {kib} {mib}")
             assert row["bytes"] == mib * (1 << 20) and row["errno"] == 0 and row["duration_ns"] > 0, row
             rows[f"{mode}-{kib}"] = row
-        result["raw"] = rows
+            record()
         if args.uas:
             assert guest.status()["timing"]["uas_peak_depth"] == 4
         record()

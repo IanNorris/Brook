@@ -117,11 +117,15 @@ uint64_t CopyIn(void* destination,const void* source,uint64_t length) {
     memcpy(destination,source,length);return length;
 #endif
 }
-int ReadResident(FileObject* object,Vnode* vnode,void* buffer,uint64_t length,uint64_t* offset) {
+int ReadResident(FileObject* object,Vnode* vnode,void* buffer,uint64_t length,uint64_t* offset,
+                 uint64_t physical=0,bool* retain=nullptr) {
     Gate held(object);const uint64_t begin=*offset;
     if(!length)return 0;
     if(object->mappingError)return object->mappingError;
-    int result=vnode->ops->read(vnode,buffer,length,offset);
+    const int result=physical && object->readOwned?
+        object->readOwned(vnode,buffer,length,offset,physical,retain):
+        vnode->ops->read(vnode,buffer,length,offset);
+    if(retain && *retain)return -5;
     if(result>0 && !object->pinCoherentPage)Overlay(object,begin,buffer,static_cast<uint64_t>(result),false);
     return result;
 }
@@ -170,6 +174,7 @@ void FileObjectInit(FileObject* object) {
     object->mappingRegistrations=0;object->writebackVnode=nullptr;object->writebackNext=nullptr;
     object->pageBudgetContext=nullptr;object->reservePageBytes=nullptr;object->releasePageBytes=nullptr;
     object->prepareBackingPage=nullptr;object->pinCoherentPage=nullptr;
+    object->readBurst=64*1024;object->readOwned=nullptr;
     object->releaseCoherentPage=nullptr;object->flushCoherent=nullptr;
     object->growMappedBacking=nullptr;
     for(auto& bucket:object->pages)bucket=nullptr;
@@ -263,6 +268,51 @@ int FileObjectGetPages(FileObject* object,Vnode* vnode,uint64_t index,uint32_t c
         }
     return 0;
 }
+#ifndef BROOK_HOST_TEST
+// Populate one bounded run starting at a fault. Stop at an existing canonical
+// page and publish only fully read in-size pages. Owning each PMM reference
+// separately lets the cache evict these frames through its normal path.
+static int ReadAheadLocked(FileObject* object,Vnode* vnode,uint64_t first,
+                           uint32_t capacity,uint64_t size) {
+    if(capacity<2 || !object->readOwned || object->reservePageBytes ||
+       object->pinCoherentPage || object->prepareBackingPage || Find(object,first))return 0;
+    uint32_t count=1;
+    uint64_t offset=first*4096;
+    const uint64_t remaining=size-offset;
+    while(count<capacity && uint64_t(count)*4096<remaining && !Find(object,first+count))++count;
+    if(count<2)return 0;
+
+    const auto physical=PmmAllocPagesAccounted(count,MemTag::User,KernelPid,PmmOwner::FileCache);
+    if(!physical)return 0;
+    auto* buffer=reinterpret_cast<uint8_t*>(PhysToVirt(physical).raw());
+    const uint64_t bytes=uint64_t(count)*4096;
+    const uint64_t required=remaining<bytes?remaining:bytes;
+    if(required<bytes)memset(buffer+required,0,bytes-required);
+    bool retain=false;
+    const int result=object->readOwned(vnode,buffer,required,&offset,physical.raw(),&retain);
+    if(retain)return -5;
+    uint32_t loaded=0;
+    for(uint32_t i=0;i<count;++i) {
+        const auto frame=physical+uint64_t(i)*4096;
+        uint64_t needed=uint64_t(i+1)*4096;
+        if(needed>required)needed=required;
+        if(result>=0 && uint64_t(result)>=needed && loaded==i) {
+            auto* page=static_cast<FileObjectPage*>(kmalloc(sizeof(FileObjectPage)));
+            if(page) {
+                const uint64_t index=first+i;
+                *page={index,frame,object->pages[index%64],false,nullptr};
+                object->pages[index%64]=page;
+                ++loaded;
+                continue;
+            }
+        }
+        PmmUnrefPage(frame);
+    }
+    if(loaded)return loaded;
+    return result<0?result:uint64_t(result)<(required<4096?required:4096)?-5:0;
+}
+#endif
+
 MappingFaultResult FileObjectFaultPages(FileObject* object,Vnode* vnode,uint64_t index,
                                        uint32_t capacity,PhysicalAddress* pages,bool* loaded) {
     [[maybe_unused]] Operation operation;
@@ -290,9 +340,17 @@ MappingFaultResult FileObjectFaultPages(FileObject* object,Vnode* vnode,uint64_t
     const int statResult=vnode->ops->stat(vnode,&stat);
     if(statResult)return failure(statResult==-12?MappingFaultResult::OutOfMemory:MappingFaultResult::IoError,statResult,0);
     if(index*4096>=stat.size)return failure(MappingFaultResult::EndOfFile,-6,stat.size);
+#ifndef BROOK_HOST_TEST
+    const int prefetched=ReadAheadLocked(object,vnode,index,capacity,stat.size);
+    if(prefetched<0)return failure(prefetched==-12?MappingFaultResult::OutOfMemory:
+        MappingFaultResult::IoError,prefetched,stat.size);
+#endif
     int error=0;pages[0]=GetPageLocked(object,vnode,index,true,&error,loaded,&stat);
     if(!pages[0])return failure(error==-12?MappingFaultResult::OutOfMemory:
                        MappingFaultResult::IoError,error,stat.size);
+#ifndef BROOK_HOST_TEST
+    if(prefetched>0 && loaded)*loaded=true;
+#endif
     for(uint32_t i=1;i<capacity;++i) {
         if(index+i>~uint64_t{0}/4096 || (index+i)*4096>=stat.size)break;
         if(auto* page=Find(object,index+i)) { PmmRefPage(page->physical);pages[i]=page->physical; }
@@ -303,14 +361,27 @@ int FileObjectRead(FileObject* object,Vnode* vnode,void* buffer,uint64_t length,
     [[maybe_unused]] Operation operation;
     OffsetGate offsetHeld(object);
     if(!length || !UserPointer(buffer))return ReadResident(object,vnode,buffer,length,offset);
-    constexpr uint64_t maximum=64*1024;
-    uint64_t capacity=length<maximum?length:maximum;
-    auto* bounce=static_cast<uint8_t*>(kmalloc(capacity));if(!bounce)return -12;
+    constexpr uint64_t usualBurst=64*1024;
+    uint64_t capacity=length<usualBurst?length:usualBurst;
+    PhysicalAddress physical{};
+#ifndef BROOK_HOST_TEST
+    uint32_t pages=0;
+    if(object->readOwned && length>usualBurst) {
+        const uint64_t requested=length<object->readBurst?length:object->readBurst;
+        pages=(requested+4095)/4096;
+        physical=PmmAllocPagesAccounted(pages,MemTag::KernelData,KernelPid,PmmOwner::FsBuffers);
+        if(physical)capacity=requested;
+    }
+#endif
+    auto* bounce=physical?reinterpret_cast<uint8_t*>(PhysToVirt(physical).raw()):
+        static_cast<uint8_t*>(kmalloc(capacity));
+    if(!bounce)return -12;
+    bool retain=false;
     uint64_t done=0;int result=0;
     while(done<length) {
         uint64_t count=length-done;if(count>capacity)count=capacity;
         uint64_t position=*offset;
-        result=ReadResident(object,vnode,bounce,count,&position);
+        result=ReadResident(object,vnode,bounce,count,&position,physical.raw(),&retain);
         if(result<=0)break;
         // Copyout may fault/CoW. The file gate and filesystem locks are gone.
         const uint64_t copied=CopyOut(static_cast<uint8_t*>(buffer)+done,bounce,static_cast<uint64_t>(result));
@@ -318,7 +389,13 @@ int FileObjectRead(FileObject* object,Vnode* vnode,void* buffer,uint64_t length,
         if(copied<static_cast<uint64_t>(result)) { result=-14;break; }
         if(static_cast<uint64_t>(result)<count)break;
     }
-    kfree(bounce);return done?static_cast<int>(done):result;
+#ifndef BROOK_HOST_TEST
+    if(physical) {
+        if(!retain)for(uint32_t i=0;i<pages;++i)PmmUnrefPage(physical+uint64_t(i)*4096);
+    } else
+#endif
+        kfree(bounce);
+    return done?static_cast<int>(done):result;
 }
 int FileObjectWrite(FileObject* object,Vnode* vnode,const void* buffer,uint64_t length,uint64_t* offset) {
     [[maybe_unused]] Operation operation;

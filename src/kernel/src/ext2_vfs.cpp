@@ -412,6 +412,9 @@ static void Ext2RemoveOpenLocked(Ext2OpenInode* inode)
     inode->previous=inode->next=inode->hashNext=nullptr;
 }
 
+static int Ext2FileReadKernel(Vnode* vn,void* buf,uint64_t len,uint64_t* offset,
+                              uint64_t physical=0,bool* retain=nullptr);
+
 // Called with the filesystem lock held, before publishing a vnode.
 static Ext2OpenInode* Ext2HoldInode(Ext2Mount* mnt, uint32_t inode)
 {
@@ -424,6 +427,10 @@ static Ext2OpenInode* Ext2HoldInode(Ext2Mount* mnt, uint32_t inode)
     if (!candidate) return nullptr;
     *candidate = {mnt, inode, 1, false, nullptr, {}};
     FileObjectInit(&candidate->file);
+    if(mnt->readBurst>65536) {
+        candidate->file.readBurst=mnt->readBurst;
+        candidate->file.readOwned=Ext2FileReadKernel;
+    }
     // Strict growth never prunes blocks or touches bytes below old EOF,
     // including a failed inode write. Only an invalid old tail can be zeroed.
     candidate->file.growMappedBacking=Ext2FileTruncate;
@@ -2317,9 +2324,6 @@ static uint32_t Ext2ResolvePath(Ext2Mount* mnt, uint32_t startIno,
 
 static int Ext2FileOpen(Vnode* vn, int flags) { (void)vn; (void)flags; return 0; }
 
-static int Ext2FileReadKernel(Vnode* vn,void* buf,uint64_t len,uint64_t* offset,
-                              uint64_t physical=0,bool* retain=nullptr);
-
 static int Ext2FileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
 {
     // User memory can fault even after syscall validation (notably a fork's
@@ -2328,40 +2332,23 @@ static int Ext2FileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
     // is itself waiting for those locks with interrupts disabled.
 #if !defined(BROOK_HOST_TEST) || defined(BROOK_STANDALONE_TEST)
     if (len && reinterpret_cast<uint64_t>(buf) < 0x0000800000000000ULL) {
-        constexpr uint64_t defaultBurst=64*1024;
-        const auto* fp=static_cast<const Ext2FilePriv*>(vn->priv);
-        uint64_t capacity=len<fp->mnt->readBurst?len:fp->mnt->readBurst;
-        // Only dedicated PMM pages can be held back after uncertain DMA.
-        // Stack, heap/slab and user-provided buffers stay on the copied path.
-        PhysicalAddress physical{};
-        uint32_t pages=0;
-        if(capacity>defaultBurst) {
-            pages=(capacity+4095)/4096;
-            physical=PmmAllocPagesAccounted(pages,MemTag::KernelData,KernelPid,PmmOwner::FsBuffers);
-            if(!physical)capacity=defaultBurst;
-        }
-        auto* bounce=physical?reinterpret_cast<uint8_t*>(PhysToVirt(physical).raw()):
-            static_cast<uint8_t*>(kmalloc(capacity));
-        if(!bounce)return -12;
-        bool retain=false;
+        constexpr uint64_t MAX_BOUNCE = 64 * 1024;
+        uint64_t capacity = len < MAX_BOUNCE ? len : MAX_BOUNCE;
+        auto* bounce = static_cast<uint8_t*>(kmalloc(capacity));
+        if (!bounce) return -12;
         uint64_t done = 0;
         int error = 0;
         while (done < len) {
             uint64_t chunk = len - done;
             if (chunk > capacity) chunk = capacity;
-            uint64_t next=*offset;
-            int n=Ext2FileReadKernel(vn,bounce,chunk,&next,physical.raw(),&retain);
-            if(retain) {error=-5;break;}
-            *offset=next;
+            int n = Ext2FileRead(vn, bounce, chunk, offset);
             if (n <= 0) { error = n; break; }
             // The recursive kernel-buffer read has released all FS locks.
             memcpy(static_cast<uint8_t*>(buf) + done, bounce, static_cast<uint64_t>(n));
             done += static_cast<uint64_t>(n);
             if (static_cast<uint64_t>(n) < chunk) break;
         }
-        if(physical) {
-            if(!retain)for(uint32_t i=0;i<pages;++i)PmmFreePage(physical+uint64_t(i)*4096);
-        } else kfree(bounce);
+        kfree(bounce);
         return done ? static_cast<int>(done) : error;
     }
 #endif
