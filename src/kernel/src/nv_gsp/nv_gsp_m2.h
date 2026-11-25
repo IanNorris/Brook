@@ -427,4 +427,31 @@ inline bool M2KeptSubmit(Bus& bus, const ChipOps& c, VramIo& vram, M2Keep& k, co
     }
 }
 
+// Kick without waiting: returns the semaphore payload to wait for (0 = refused).
+template <class Bus, class VramIo, class Sync>
+inline uint32_t M2KeptKick(Bus& bus, const ChipOps& c, VramIo& vram, M2Keep& k, const M2Inputs& in, const uint32_t* w,
+                           uint32_t n, Sync& sync) {
+    namespace h = rm570::host;
+    constexpr uint32_t kEntries = 0x1000 / 8;
+    if (!k.kept || n + 8 > 1024) return 0;
+    uint32_t* p = reinterpret_cast<uint32_t*>(in.push.cpu);
+    for (uint32_t i = 0; i < n; ++i) p[i] = w[i];
+    uint32_t want = ++k.payload; if (!want) want = ++k.payload;
+    uint32_t q = n;
+    p[q++] = h::IncHeader(0, h::SEM_ADDR_LO, 3);
+    p[q++] = uint32_t(kM2Va + 0x2000); p[q++] = uint32_t((kM2Va + 0x2000) >> 32); p[q++] = want;
+    p[q++] = h::IncHeader(0, h::SEM_EXECUTE, 1); p[q++] = h::SEM_EXECUTE_RELEASE | h::SEM_EXECUTE_RELEASE_WFI;
+    uint32_t* g = reinterpret_cast<uint32_t*>(in.gpfifo.cpu) + (k.gp % kEntries) * 2;
+    const uint64_t pva = kM2Va + 0x1000;
+    g[0] = uint32_t(pva); g[1] = uint32_t(pva >> 32) | (q << 10);
+    sync();
+    k.gp = (k.gp + 1) % kEntries;
+    vram.wr32(k.userd + h::USERD_GP_PUT, k.gp);
+    bus.wr32(c.usermode + h::kDoorbell, k.token);
+    return want;
+}
+inline bool M2KeptDone(const M2Keep&, const M2Inputs& in, uint32_t want) {
+    return __atomic_load_n(reinterpret_cast<const uint32_t*>(in.sem.cpu), __ATOMIC_ACQUIRE) == want;
+}
+
 } // namespace brook::nvgsp

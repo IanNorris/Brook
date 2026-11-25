@@ -462,6 +462,39 @@ int main(int argc, char** argv) {
         r.rm.host_stall = false;
         assert(r.CeFree(cp) == 7 && r.rm.objs.empty() && !cp.k.kept);
     }
+    // ---- CE present: async kick/wait and the 2 MiB fast path for a contiguous, aligned source
+    {
+        Rig r(I, 0x1); r.last = r.Run(); assert(r.last.init_done);
+        CePresent cp;
+        assert(r.CeOn(cp).ok());
+        // a 2 MiB-aligned, contiguous "shadow": the arena is contiguous; align inside it
+        const uint32_t W = 512, H = 1024;                     // exactly 2 MiB
+        DmaRegion big; assert(r.arena(4u << 20, &big));
+        const uint64_t pad = (0x200000 - (big.bus & 0x1fffff)) & 0x1fffff;
+        DmaRegion sh{big.cpu + pad, big.bus + pad, 2u << 20};
+        // align the CPU pointer too: the fake's v2p is cpu->bus linear, so pick a cpu base with the same low bits
+        uint32_t* px = reinterpret_cast<uint32_t*>(sh.cpu);
+        for (uint32_t i = 0; i < W * H; ++i) px[i] = 0x30000000u + i;
+        const NvCeRect rect[1] = {{0, 0, int32_t(W), int32_t(H)}};
+        NvCeJob job{px, W, W, H, 0x800000, W * 4, rect, 1};
+        Pramin<fake_gpu::FakeGpu> vram(r.gpu, kChipTu104);
+        // v2p reports a 2 MiB-aligned physical base for the 2 MiB-aligned kernel VA we pretend the shadow has
+        const uintptr_t kva = 0x40000000u;   // fake kernel VA, 2 MiB aligned
+        NvCeJob jv = job; jv.src = reinterpret_cast<const uint32_t*>(kva);
+        auto v2p = [&](uintptr_t a) -> uint64_t { return a >= kva && a < kva + (2u << 20) ? sh.bus + (a - kva) : 0; };
+        uint64_t bytes = 0; uint32_t ticket = 0;
+        assert(CePresentKick(r.gpu, kChipTu104, vram, cp, jv, v2p, r.sync, &bytes, &ticket) == 1 && ticket && cp.big);
+        assert(cp.inflight == ticket && bytes == uint64_t(W) * H * 4);
+        auto poll = [&] { (void)r.Wait(); };
+        assert(CePresentWait(r.gpu, cp, ticket, 0, poll) == 0);            // not yet: nothing has run the host model
+        uint32_t t2 = 0;                                                    // a second kick while one is in flight is refused
+        assert(CePresentKick(r.gpu, kChipTu104, vram, cp, jv, v2p, r.sync, &bytes, &t2) == 0);
+        assert(CePresentWait(r.gpu, cp, ticket, 50000, poll) == 1 && !cp.inflight);
+        vram.Restore();
+        assert(r.gpu.Vram32(0x800000) == 0x30000000u && r.gpu.Vram32(0x800000 + (2u << 20) - 4) == 0x30000000u + W * H - 1);
+        assert(cp.st.map_pages == 1);                                       // one 2 MiB PTE
+        assert(r.CeFree(cp) == 7 && r.rm.objs.empty());
+    }
     std::printf("test_nv_gsp_p4: OK (%s inputs%s)\n", I.real ? "real" : "synthetic", I.seq.empty() ? "" : ", real sequencer");
     return 0;
 }

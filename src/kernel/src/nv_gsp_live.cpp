@@ -963,32 +963,32 @@ void P5(uint32_t chid, bool dev, bool m3 = false) {
 
 // ------------------------------------------------------------------ CE present (head 0)
 // `ce-present on`: a kept TURING_DMA_COPY_A channel (RunM2 + CeExtra; its own VRAM arena at
-// 4 GiB + 128 MiB), then nv-disp's head-0 presents go through CePresentHook. `off` and every
+// 4 GiB + 128 MiB), then nv-disp's head-0 presents kick copies through g_ceOps (CeKickHook/CeWaitHook). `off` and every
 // RM fini (verb or pre-reset) clear the hook under the nv-aux lock first, then free the objects.
 uint32_t g_ceOnUs = 0; const char* g_ceOnStatus = "never"; const ChipOps* g_ceChip = nullptr;
 struct CeHookSync { void operator()() {
     FlushRange(g_cePresentState.in.gpfifo.cpu, 0x1000); FlushRange(g_cePresentState.in.push.cpu, 0x1000); } };
-int CePresentHook(const NvCeJob& job, uint64_t* bytes) {   // nv-aux lock held (FlipPendingLocked)
+uint64_t CeV2P(uintptr_t a) { const PhysicalAddress p = VmmVirtToPhys(KernelPageTable, VirtualAddress(a)); return p ? p.raw() : 0; }
+int CeKickHook(const NvCeJob& job, uint64_t* bytes, uint32_t* ticket) {   // nv-aux lock held
     const ChipOps* c = g_ceChip;
     if (!c || !g_rmRunning) return 0;
     Pramin<Bar0Bus> pr(g_bus, *c);
     PraminIo vio{pr};
     CeHookSync sync;
-    auto v2p = [](uintptr_t a) -> uint64_t {
-        const PhysicalAddress p = VmmVirtToPhys(KernelPageTable, VirtualAddress(a));
-        return p ? p.raw() : 0; };
-    auto poll = [] { __asm__ volatile("pause"); };
     const bool rec = g_bus.rec; g_bus.rec = false;
-    const int r = CePresentRun(g_bus, *c, vio, g_cePresentState, job, v2p, sync, poll, bytes);
+    const int r = CePresentKick(g_bus, *c, vio, g_cePresentState, job, CeV2P, sync, bytes, ticket);
     g_bus.rec = rec;
     pr.Restore();
-    if (r < 0) {
-        g_cePresentState.active = false;
-        NvDispSetCePresent(nullptr);
-        KPrintf("nv-gsp: CE present failed (%s); CPU copies from now on\n", g_cePresentState.last_error);
-    }
+    if (r < 0) { g_cePresentState.active = false; KPrintf("nv-gsp: CE present kick failed (%s)\n", g_cePresentState.last_error); }
     return r;
 }
+int CeWaitHook(uint32_t ticket, uint32_t budget_us) {   // nv-aux lock held
+    if (!g_rmRunning) return -1;
+    const int r = CePresentWait(g_bus, g_cePresentState, ticket, budget_us, [] { __asm__ volatile("pause"); });
+    if (r < 0) { g_cePresentState.active = false; KPrintf("nv-gsp: CE present wait failed (%s)\n", g_cePresentState.last_error); }
+    return r;
+}
+const NvCeOps g_ceOps{CeKickHook, CeWaitHook};
 // Clear the hook (nv-aux lock: no present is mid-submission afterwards), then free the objects
 // while RM runs. wait_lock=false (pre-reset): try the lock for 100 ms.
 bool CePresentStop(bool wait_lock, uint32_t* freed) {
@@ -998,8 +998,8 @@ bool CePresentStop(bool wait_lock, uint32_t* freed) {
     bool held = false;
     if (wait_lock) { SpinLockAcquire(lock); held = true; }
     else { const uint64_t end = NowUs() + 100000; while (!(held = SpinLockTryAcquire(lock)) && NowUs() < end) __asm__ volatile("pause"); }
-    NvDispSetCePresent(nullptr);
-    g_cePresentState.active = false;
+    if (held) NvDispSetCePresent(nullptr);   // finishes a kicked copy, then nv-disp copies with the CPU
+    g_cePresentState.active = false;         // (without the lock: kicks are refused from here on)
     if (held) SpinLockRelease(lock);
     if (g_cePresentState.k.kept && g_rmRunning && g_rm) {
         RmWait wait; g_rm->wait_deadline_us = NowUs() + 1000000;
@@ -1019,7 +1019,8 @@ void CeStatsJson(Out& o) {
     o.kd("frames", st.frames); o.kd("rects", st.rects); o.kd("bytes", st.bytes); o.kd("submits", st.submits);
     o.kd("avg_us", st.submits ? st.us_sum / st.submits : 0); o.kd("max_us", st.us_max);
     o.kd("remaps", st.remaps); o.kd("remap_us_max", st.remap_us_max); o.kd("map_pages", st.map_pages);
-    o.kd("refused", st.refused); o.kd("timeouts", st.timeouts); o.kd("slot", cp.slot);
+    o.kd("refused", st.refused); o.kd("timeouts", st.timeouts); o.kd("slot", cp.slot); o.kb("big_pages", cp.big);
+    o.kd("wait_us_sum", st.wait_us_sum); o.kd("waits_blocked", st.waits_blocked); o.kd("inflight", cp.inflight);
     o.kh("bb_lo", cp.bb_lo); o.kh("bb_hi", cp.bb_hi); o.kd("pt_pages", cp.k.pt_pages); o.kd("ptes", cp.k.ptes);
     o.kh("arena_next", cp.k.arena.next);
 }
@@ -1056,7 +1057,7 @@ void CePresentVerb(int mode) {   // 1 on, 2 off, 0 status
             // touch every BAR0 page the hook uses, so it never adds a Bar0Bus slot at present time
             (void)g_bus.rd32(c->reg_fb_flush); (void)g_bus.rd32(c->reg_mmu_inval_trigger);
             (void)g_bus.rd32(c->reg_mmu_inval_pdb_lo); (void)g_bus.rd32(c->usermode);
-            g_ceChip = c; cp.active = true; NvDispSetCePresent(CePresentHook);
+            g_ceChip = c; cp.active = true; NvDispSetCePresent(&g_ceOps);
         }
         else cp.broken = true;
         SpinLockRelease(lock);
