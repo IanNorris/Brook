@@ -1,6 +1,8 @@
 #include "../../drivers/xhci/usb_block_bytes.h"
 #include "../../drivers/xhci/usb_scsi_unmap.h"
 #include "../../drivers/xhci/usb_uas.h"
+#include "../../drivers/xhci/usb_write_windows.h"
+#include "../../kernel/src/usb_trim_batch.h"
 #include <vector>
 #include <cassert>
 #include <cstring>
@@ -65,9 +67,75 @@ static void Uas() {
     assert(!UsbUasStatus(iu,sizeof(iu),4,status,sense));
 }
 
+static void UasFlight() {
+    UsbUasFlightState flight{0b11,0b11};
+    unsigned step=0,retired=0;
+    assert(UsbUasWaitFlight(flight,[&] {
+        switch(++step) {
+        case 1: flight.Status(0,2); break; // CHECK CONDITION with no data
+        case 2: flight.Status(1,0); break; // GOOD before its data
+        case 3: flight.Data(1); break;
+        default: assert(false);
+        }
+        return true;
+    },[&] {return step>=4;},[&](unsigned mask) {retired=mask;return true;}));
+    assert(step==3 && retired==1);
+    flight={1,1};
+    step=0;retired=0;
+    assert(!UsbUasWaitFlight(flight,[&] {++step;flight.Data(0);return true;},
+        [&] {return step==2;},[&](unsigned) {assert(false);return true;}));
+    flight={1,1};
+    assert(!UsbUasWaitFlight(flight,[&] {flight.Status(0,8);return true;},
+        [] {return false;},[](unsigned mask) {assert(mask==1);return false;}));
+    assert(UsbUasRetryRead(8,false,0) && UsbUasRetryRead(0x28,false,0));
+    assert(UsbUasRetryRead(2,true,0xb) && !UsbUasRetryRead(2,true,3));
+    assert(!UsbUasRetryRead(2,false,0xb) && !UsbUasRetryRead(2,true,6));
+
+    unsigned calls=0;
+    assert(!UsbUasRestoreBot(false,true,[&] {assert(false);return true;},[&] {assert(false);return true;}));
+    assert(!UsbUasRestoreBot(true,true,[&] {++calls;return false;},[&] {assert(false);return true;}));
+    assert(UsbUasRestoreBot(true,true,[&] {assert(calls++==1);return true;},
+        [&] {assert(calls++==2);return true;}));
+    assert(!UsbUasRestoreBot(true,false,[&] {assert(calls++==3);return true;},
+        [&] {assert(false);return true;}));
+}
+
+static void TrimAndDma() {
+    UsbTrimBatchPlan plan({0xffffffffu,2},UsbUnmapMaxSectors+24);
+    uint64_t totals[3]{};
+    unsigned drains=0;
+    auto submit=[&](const DeviceWriteWindow* ranges,uint32_t count) {
+        assert(count<=2 && drains<3);
+        for(unsigned i=0;i<count;++i)totals[drains]+=ranges[i].length/512;
+        ++drains;return true;
+    };
+    assert(plan.Add({8192,UsbUnmapMaxSectors+8},submit));
+    assert(plan.Add({4u<<20,8},submit));
+    assert(plan.Add({5u<<20,80},submit) && plan.Drain(submit));
+    assert(drains==3 && totals[0]==UsbUnmapMaxSectors && totals[1]==16 && totals[2]==8);
+    assert(plan.total==UsbUnmapMaxSectors+24);
+    UsbTrimBatchPlan small({17,1},0);
+    assert(!small.Add({1024,40},[](const DeviceWriteWindow* ranges,uint32_t count) {
+        assert(count==1 && ranges[0].length==8192);return false;
+    }));
+    const DeviceWriteWindow good{16384,8192}, crossing{20480,8192}, p1{4096,4096};
+    UsbWriteWindows windows{p1,good,true};
+    assert(windows.CheckUnmap({&good,1})==0 && windows.CheckUnmap({&crossing,1})==-30);
+    assert(windows.CheckUnmap({&p1,1})==-30 && windows.CheckUnmap({nullptr,0})==-22);
+    UsbDmaRead dma{good.start,4096,4096,false};
+    assert(windows.CanReadDma(dma,512,65536,1u<<20));
+    dma.offset=p1.start;assert(!windows.CanReadDma(dma,512,65536,1u<<20));
+    dma.offset=good.start;dma.physical=(1u<<20)-1024;
+    assert(!windows.CanReadDma(dma,512,65536,1u<<20));
+    assert(UsbDmaTransferFailure(dma,true)==-5 && dma.retain);
+    assert(UsbDmaTransferFailure(dma,false)==-5 && !dma.retain);
+}
+
 int main(){
     Unmap();
     Uas();
+    UasFlight();
+    TrimAndDma();
     Disk large(4096);
     large.scratch.resize(1<<20);
     std::vector<uint8_t> largeRead((1<<20)+4096);

@@ -67,4 +67,40 @@ inline bool UsbUasStatus(const uint8_t* data,uint32_t bytes,uint16_t tag,
     senseBytes=uint16_t(data[14])<<8 | data[15];
     return senseBytes<=bytes-16;
 }
+enum class UsbUasProgress { Waiting, Retire, Complete, Timeout };
+struct UsbUasFlightState {
+    uint8_t awaitingStatus, awaitingData, rejected=0;
+    void Status(unsigned tag,uint8_t status) {
+        const uint8_t bit=1u<<tag;
+        awaitingStatus&=~bit;
+        if(status)rejected|=bit;
+    }
+    void Data(unsigned tag) { awaitingData&=~(1u<<tag); }
+    UsbUasProgress Progress(bool expired) const {
+        if(!awaitingStatus && !(awaitingData&~rejected))
+            return awaitingData?UsbUasProgress::Retire:UsbUasProgress::Complete;
+        return expired?UsbUasProgress::Timeout:UsbUasProgress::Waiting;
+    }
+};
+template<class Poll,class Expired,class Retire> bool UsbUasWaitFlight(
+    UsbUasFlightState& flight,Poll poll,Expired expired,Retire retire)
+{
+    for(;;) {
+        if(!poll())return false;
+        switch(flight.Progress(expired())) {
+        case UsbUasProgress::Complete:return true;
+        case UsbUasProgress::Retire:return retire(flight.awaitingData);
+        case UsbUasProgress::Timeout:return false;
+        case UsbUasProgress::Waiting:break;
+        }
+    }
+}
+inline bool UsbUasRetryRead(uint8_t status,bool current,uint8_t key) {
+    return status==0x08 || status==0x28 || (status==0x02 && current && key==0x0b);
+}
+
+template<class Drop,class Select> bool UsbUasRestoreBot(bool configureCompleted,bool bot,Drop drop,Select select) {
+    return configureCompleted && drop() && bot && select();
+}
+
 }

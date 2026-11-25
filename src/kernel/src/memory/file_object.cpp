@@ -274,7 +274,7 @@ int FileObjectGetPages(FileObject* object,Vnode* vnode,uint64_t index,uint32_t c
 // separately lets the cache evict these frames through its normal path.
 static int ReadAheadLocked(FileObject* object,Vnode* vnode,uint64_t first,
                            uint32_t capacity,uint64_t size) {
-    if(capacity<2 || !object->readOwned || object->reservePageBytes ||
+    if(object->mappingError || capacity<2 || !object->readOwned || object->reservePageBytes ||
        object->pinCoherentPage || object->prepareBackingPage || Find(object,first))return 0;
     uint32_t count=1;
     uint64_t offset=first*4096;
@@ -308,8 +308,7 @@ static int ReadAheadLocked(FileObject* object,Vnode* vnode,uint64_t first,
         }
         PmmUnrefPage(frame);
     }
-    if(loaded)return loaded;
-    return result<0?result:uint64_t(result)<(required<4096?required:4096)?-5:0;
+    return loaded;
 }
 #endif
 

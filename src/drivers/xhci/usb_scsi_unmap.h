@@ -21,7 +21,7 @@ inline uint32_t ScsiEncodeUnmap(uint8_t* list,const UsbUnmapLimits& limits,
         if(!range.length || ((range.start|range.length)&511) ||
            range.start>~uint64_t{0}-range.length)return 0;
         sectors+=range.length/512;
-        if(sectors>limits.maxSectors)return 0;
+        if(sectors>limits.maxSectors || sectors>UsbUnmapMaxSectors)return 0;
     }
     const uint32_t bytes=8+16*count;
     for(uint32_t i=0;i<bytes;++i)list[i]=0;

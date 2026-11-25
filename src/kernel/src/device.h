@@ -59,8 +59,10 @@ static constexpr uint32_t DEVICE_IOCTL_USB_UNMAP = 0x42460009;
 // Internal read into exclusive, contiguous PMM pages. If retain is set
 // the caller must neither read nor free the allocation until reboot.
 static constexpr uint32_t DEVICE_IOCTL_USB_READ_DMA = 0x4246000a;
+static constexpr uint32_t DEVICE_IOCTL_USB_SYSTEM_TRANSPORT = 0x4246000b;
 struct UsbDmaRead { uint64_t offset,physical;uint32_t bytes;bool retain; };
 static constexpr uint32_t UsbUnmapMaxRanges=16;
+static constexpr uint32_t UsbUnmapMaxSectors=1u<<21; // 1 GiB per command
 struct UsbUnmapLimits { uint32_t maxSectors,maxRanges; };
 struct UsbUnmapBatch { const DeviceWriteWindow* ranges;uint32_t count; };
 

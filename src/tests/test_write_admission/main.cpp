@@ -23,9 +23,13 @@ brook::Device dev{&ops,"owned-fixture",brook::DeviceType::Block,nullptr};
 int main() {
     using namespace brook;char data=0;
     assert(!DeviceFinalSyncOwner());
-    BlockDeviceOps registeredOps{nullptr,write,nullptr,nullptr,[](Device*)->uint64_t{return 1;},[](Device*)->uint32_t{return 512;}};
+    BlockDeviceOps registeredOps{nullptr,write,[](Device* disk,uint32_t command,void* data) {
+        assert(command==DEVICE_IOCTL_USB_UNMAP && data);
+        ++*static_cast<unsigned*>(disk->priv);
+        return 0;
+    },nullptr,[](Device*)->uint64_t{return 1;},[](Device*)->uint32_t{return 512;}};
     Device fixture{reinterpret_cast<DeviceOps*>(&registeredOps),"module-storage",DeviceType::Block,nullptr};
-    retainAllowed=false;assert(!DeviceRegister(&fixture) && !DeviceIsRegistered(&fixture) && retainedCount==3);
+    retainAllowed=false;assert(!DeviceRegister(&fixture) && !DeviceIsRegistered(&fixture) && retainedCount==4);
     retainAllowed=true;assert(DeviceRegister(&fixture) && DeviceIsRegistered(&fixture));assert(DeviceUnregister(&fixture));
     hold=true;std::thread writer([&]{caller=2;assert(DeviceWrite(&dev,0,&data,1)==1);});
     while(!entered)std::this_thread::yield();
@@ -52,6 +56,21 @@ int main() {
     assert(!DeviceInstallBootWriteLeases(leases,2));
     release=true;pending.join();hold=false;
     assert(DeviceInstallBootWriteLeases(leases,2));
+    unsigned trims=0;
+    parent.priv=&trims;
+    DeviceWriteWindow ranges[]={{100,20},{150,50}};
+    UsbUnmapBatch batch{ranges,2};
+    assert(DeviceUsbUnmapLeased(&parent,&owner,batch)==0 && trims==1);
+    assert(DeviceUsbUnmapLeased(&parent,&dev,batch)==-30 && trims==1);
+    ranges[1]={199,2};
+    assert(DeviceUsbUnmapLeased(&parent,&owner,batch)==-30 && trims==1);
+    ranges[1]={0,20};
+    assert(DeviceUsbUnmapLeased(&parent,&owner,batch)==-30 && trims==1);
+    ranges[1]={150,50};
+    assert(DeviceCloseWrites());
+    std::thread lateTrim([&] {caller=2;assert(DeviceUsbUnmapLeased(&parent,&owner,batch)==-30);});
+    lateTrim.join();
+    assert(trims==1 && DeviceReopenWrites());
     assert(!DeviceUnregister(&parent));assert(!DeviceUnregister(&owner));
     assert(DeviceWrite(&parent,99,&data,1)==-30);
     assert(DeviceWrite(&parent,100,&data,1)==-30);
