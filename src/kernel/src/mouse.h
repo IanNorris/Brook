@@ -34,6 +34,14 @@ extern "C" void MouseGetPosition(int32_t* x, int32_t* y);
 // Set cursor bounds (call after display mode change).
 extern "C" void MouseSetBounds(uint32_t maxX, uint32_t maxY);
 
+// Bound the pointer to the union of output rectangles (desktop coordinates,
+// at or right/below of 0,0): it moves to the nearest pixel of any output, so
+// it cannot rest where no output shows it. One rectangle {0,0,w,h} is
+// MouseSetBounds(w, h).
+// Built with BROOK_MULTI_OUTPUT only; single-output kernels use MouseSetBounds.
+struct OutputRect;
+void MouseSetOutputBounds(const OutputRect* rects, uint32_t count);
+
 // Get current button state bitmask.
 extern "C" uint8_t MouseGetButtons();
 

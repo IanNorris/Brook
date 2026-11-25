@@ -82,6 +82,58 @@ CompositorUploadStats CompositorReadUploads();
 extern "C" void CompositorGetPhysDims(uint32_t* w, uint32_t* h);
 void CompositorSnapshotPhysDims(uint32_t* w, uint32_t* h);
 
+// Display outputs (display_output.h). The physical dimensions above are the
+// desktop: the union of the enabled outputs, from 0,0. Output 0 is the
+// primary output. Before any backend registers, the framebuffer is the one
+// output.
+struct OutputLayout;
+struct OutputRect;
+void CompositorGetOutputs(OutputLayout& out);
+bool CompositorGetOutputRect(uint32_t index, OutputRect* rect);
+OutputRect CompositorPrimaryOutputRect();
+
+// Primary-output presenter override (D2: the NVIDIA window-0 flip backend). While set,
+// the primary output's present hands the damage (desktop coordinates; output 0 is at
+// 0,0) and the compositor back buffer to `present` instead of copying into the GOP
+// framebuffer. Return >0 = presented, 0 = nothing changed, kPresenterBusy = try again
+// next frame (the compositor repaints fully), <0 = failed: the override is dropped and
+// the GOP copy takes over with a full frame (the presenter has put the GOP surface back
+// on screen). The forced periodic full repaint is skipped while it is set.
+struct DamageRects;
+struct CompositorPrimaryPresenter {
+    int (*present)(const uint32_t* src, uint32_t srcStride, uint32_t width, uint32_t height, const DamageRects& damage);
+    // Called once per compositor loop (completes flips, arms the queued frame). Returns the
+    // longest the compositor may sleep before the next call, in ms: the flip backend paces
+    // the loop to just after each vblank load.
+    uint32_t (*poll)();
+};
+inline constexpr int kPresenterBusy = -1000;
+void CompositorSetPrimaryPresenter(const CompositorPrimaryPresenter* presenter);
+// The desktop back buffer (union of the outputs, from 0,0) and its stride in pixels. Only
+// valid inside an OutputBackendOps::Present call (compositor thread, scanout lock held):
+// a flip backend for a non-primary output copies its damage from here (D3).
+const uint32_t* CompositorPresentSource(uint32_t* stridePixels);
+// D3 frame cost: a window-state change (move, resize, raise, focus, decoration, title):
+// the next frame repaints only what changed instead of the whole scene.
+void CompositorMarkSceneChanged();
+// Per-frame cost and why frames escalated (bridge `nv-disp driver desktop stats`).
+// Times are compositor-thread ns; hist bins <2,<4,<8,<12,<17,>=17 ms.
+struct CompositorFrameStats {
+    uint64_t loops, composeNs, presentNs;
+    uint32_t composeMaxUs, presentMaxUs, loopMaxUs;
+    uint32_t composeHist[6], presentHist[6], loopHist[6];
+    uint64_t flips, damagePixels;
+    uint32_t fullFlips, allMarks;               // scanout repair / lease frames; whole-desktop marks
+    uint32_t fullForce, fullRequested, fullGlobal, fullGpu, fullHover, sceneUnexplained;
+    uint32_t sceneLocalized, shellLocalized, hoverLocalized;
+};
+CompositorFrameStats CompositorReadFrameStats(bool reset);
+// Drag probe: move window slot `slot` back and forth every frame (on), or put it back (off).
+bool CompositorSetDragProbe(int slot, bool on);
+// Pacing probe: a moving square on every output, redrawn each compositor frame.
+void CompositorSetPacingProbe(bool on);
+bool CompositorPacingProbe();
+
 // Get physical framebuffer pointer and stride (for kernel threads that
 // need direct FB access, e.g. clock overlay).
 volatile uint32_t* CompositorGetPhysFb(uint32_t* stride);

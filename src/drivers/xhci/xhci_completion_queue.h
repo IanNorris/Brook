@@ -33,6 +33,9 @@ template<class Event,unsigned Capacity=64> struct XhciCompletionQueue {
         }
         return false;
     }
+    template<class Predicate> void Discard(Predicate matches) {
+        for(unsigned i=0;i<Capacity;++i)if(used[i] && matches(entries[i]))used[i]=false;
+    }
     bool TakeAny(uint32_t type,const uint64_t* tokens,unsigned count,Event& result) {
         if(!tokens)return false;
         for(unsigned i=0;i<count;++i)if(Take(type,tokens[i],result))return true;

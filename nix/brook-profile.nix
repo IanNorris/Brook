@@ -9,6 +9,9 @@
 , allowUnfree ? false
 , publicRelease ? false
 , kernelCapabilities ? null
+  # RTX desktop store: the pinned GSP-RM firmware set (nix/nv-gsp-firmware.nix,
+  # unmodified, with LICENCE.nvidia) under /nix/profile/lib/firmware.
+, nvGspFirmware ? false
 }:
 let
   lib = pkgs.lib;
@@ -30,6 +33,7 @@ let
     services = [ "dbus" "message" ];
   };
   inherit (selection) selected launcherIds;
+  nvGspFirmwarePackage = import ./nv-gsp-firmware.nix { inherit pkgs; };
   cliPackageSets = [ "python3Packages" "xfce" "kdePackages" ];
   packageFor = name:
     let
@@ -95,7 +99,8 @@ let
   '';
   sessionPackages = [ (import ./closure-stage.nix { inherit pkgs; selectedProfiles = true; })
                       (lib.hiPrio launchers) fontConfig pkgs.xz.bin pkgs.zstd.bin ]
-    ++ base.packages ++ lib.concatMap (app: app.packages) selected;
+    ++ base.packages ++ lib.concatMap (app: app.packages) selected
+    ++ lib.optional nvGspFirmware nvGspFirmwarePackage;
   directPackages = lib.unique (sessionPackages ++ cliPackages);
   linkedPackages = lib.unique (sessionPackages ++ [ manifestPackage ] ++ lib.optional (cliPackages != [ ]) cli);
   packageRecord = p: {

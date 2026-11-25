@@ -16,6 +16,7 @@ option(BROOK_BDW_CACHE_PROBE "Enable a root-only disposable Broadwell cache-cohe
 option(BROOK_BDW_PERSISTENT_SCANOUT_MAP "Build the runtime-gated persistent GOP map for Broadwell BCS presents" OFF)
 option(BROOK_BDW_SCANOUT_FLIP "Build the runtime-gated Broadwell primary-plane page flip (read-only probe first)" OFF)
 option(BROOK_BDW_ZERO_COPY_SCANOUT "Build runtime-gated zero-copy scanout of renderer images (requires BROOK_BDW_SCANOUT_FLIP)" OFF)
+option(BROOK_MULTI_OUTPUT "Build the multi-output desktop paths (taskbars on extra outputs). OFF for single-output machines such as the Dell; one output behaves the same either way" ON)
 option(BROOK_BDW_VIDEO_ENGINE "Build runtime-gated Broadwell VCS0 video engine bring-up (VA-API phase 1)" OFF)
 option(BROOK_GPU_SUBMISSION_TIMING "Record bounded GPU submission timing (diagnostic kernels only)" OFF)
 option(BROOK_GPU_BLOCKED_RECOVERY_TEST "Allow synthetic pending GPU fences (test kernels only)" OFF)
@@ -365,10 +366,12 @@ add_executable(kernel
     src/vdso.cpp
     src/display.cpp
     src/display_power.cpp
+    src/display_output.cpp
     src/ahci_observe.cpp
     src/hw_inventory.cpp
     src/boot_status.cpp
     src/boot_stick.cpp
+    src/usb_system.cpp
     src/live_store.cpp
     src/hda_observe.cpp
     src/native_tsc_observe.cpp
@@ -556,6 +559,11 @@ set_source_files_properties("${BUILD_INFO_CPP}" PROPERTIES GENERATED TRUE)
 target_sources(kernel PRIVATE "${BUILD_INFO_CPP}")
 add_dependencies(kernel refresh_build_info)
 target_compile_definitions(kernel PRIVATE __BROOK_KERNEL__=1)
+if(BROOK_MULTI_OUTPUT)
+    target_compile_definitions(kernel PRIVATE BROOK_MULTI_OUTPUT=1)
+else()
+    target_compile_definitions(kernel PRIVATE BROOK_MULTI_OUTPUT=0)
+endif()
 if(BROOK_DELL_ACPI_MONITOR)
     include(FetchContent)
     find_program(BROOK_PATCH patch REQUIRED)
@@ -696,6 +704,15 @@ option(BROOK_NV_DISPLAY "Build the NVIDIA desktop display code (RTX desktop imag
 if(BROOK_NV_DISPLAY)
     target_sources(kernel PRIVATE src/nv_disp_live.cpp)
     target_compile_definitions(kernel PRIVATE BROOK_NV_DISPLAY=1)
+endif()
+# NVIDIA GSP-RM (RTX 2080 / TU104, firmware 570.144): the M0 parsers, WPR2
+# layout, radix3, cmdq/msgq, CPU sequencer and boot sequence (src/nv_gsp), and
+# the M1 bridge verbs (`nv-gsp status|p3|fini|trace`, nv_gsp_live.cpp). Nothing
+# runs at boot; the verbs need /etc/nv-gsp in the initrd.
+option(BROOK_NV_GSP "Build the NVIDIA GSP-RM bring-up (bridge verbs only, gated by /etc/nv-gsp)" OFF)
+if(BROOK_NV_GSP)
+    target_sources(kernel PRIVATE src/nv_gsp/nv_gsp_m0.cpp src/nv_gsp_live.cpp)
+    target_compile_definitions(kernel PRIVATE BROOK_NV_GSP=1)
 endif()
 set(BROOK_PANIC_INGEST_URL "" CACHE STRING "Panic scanner URL shown as a QR code on panic screens (empty: built-in default)")
 if(BROOK_PANIC_INGEST_URL)

@@ -204,6 +204,9 @@ void SerialPuts(const char*){}
 extern "C" void KernelPanic(const char*,...){std::abort();}
 int FileObjectWritebackAll(){return 0;}
 int FileObjectRead(FileObject*,Vnode*,void*,uint64_t,uint64_t*){assert(false);return -5;}
+int FileObjectReadTagged(FileObject* object,Vnode* vn,void* out,uint64_t bytes,uint64_t* offset,UsbReadSource) {
+    return FileObjectRead(object,vn,out,bytes,offset);
+}
 int FileObjectWrite(FileObject*,Vnode*,const void*,uint64_t,uint64_t*){assert(false);return -5;}
 int FileObjectAppend(FileObject*,Vnode*,const void*,uint64_t,uint64_t*){assert(false);return -5;}
 int FileObjectWriteback(FileObject*,Vnode*,uint64_t,uint64_t){assert(false);return -5;}

@@ -21,6 +21,8 @@
 #include "syscall_handlers.h"
 #include "../../shared/wm_input_abi.h"
 #include "../../shared/brook_experience_config.h"
+#include "../../shared/brook_outputs.h"
+#include "display_output.h"
 
 namespace brook {
 
@@ -739,10 +741,52 @@ int64_t sys_brook_wm_get_screen_info(uint64_t outAddr, uint64_t, uint64_t,
     if (!UserBufferWritable(outAddr, 8)) return -EFAULT;
     uint32_t w = 0, h = 0;
     brook::CompositorSnapshotPhysDims(&w, &h);
+    // Until waylandd reads WM_GET_OUTPUTS (D4) it has one wl_output at 0,0: report the
+    // primary output, not the multi-output union, so clients size to one monitor.
+    if (const brook::OutputRect primary = brook::CompositorPrimaryOutputRect(); !primary.empty()) {
+        w = primary.w;
+        h = primary.h;
+    }
     uint32_t* out = reinterpret_cast<uint32_t*>(outAddr);
     out[0] = w;
     out[1] = h;
     return 0;
+}
+
+// 527: WM_GET_OUTPUTS(header_ptr, outputs_ptr, capacity) — the display
+// outputs (shared/brook_outputs.h). WM_GET_SCREEN_INFO returns the primary
+// output until waylandd is multi-output (D4). Returns the number of descriptors written.
+static_assert(brook::OutputMax == BROOK_OUTPUTS_MAX, "brook_outputs.h capacity");
+int64_t sys_brook_wm_get_outputs(uint64_t headerAddr, uint64_t outputsAddr, uint64_t capacity,
+                                 uint64_t, uint64_t, uint64_t)
+{
+    if (!headerAddr) return -EFAULT;
+    if (capacity > 0xffffu) return -EINVAL;
+    brook::OutputLayout layout;
+    brook::CompositorGetOutputs(layout);
+    brook_outputs_header header{};
+    header.count = layout.count;
+    header.generation = layout.generation;
+    const uint32_t written = capacity < layout.count ? static_cast<uint32_t>(capacity) : layout.count;
+    if (written && !outputsAddr) return -EFAULT;
+    brook_output_desc out[BROOK_OUTPUTS_MAX]{};
+    for (uint32_t i = 0; i < written; ++i) {
+        const brook::OutputInfo& info = layout.outputs[i];
+        out[i].id = i;
+        out[i].x = info.x;
+        out[i].y = info.y;
+        out[i].width = info.w;
+        out[i].height = info.h;
+        out[i].refresh_mhz = info.refreshMhz;
+        out[i].scale_percent = info.scalePercent;
+        out[i].flags = (info.connected ? BROOK_OUTPUT_CONNECTED : 0u) |
+                       (layout.enabled(i) ? BROOK_OUTPUT_ENABLED : 0u) | (i == 0 ? BROOK_OUTPUT_PRIMARY : 0u);
+        memcpy(out[i].name, info.name, sizeof(out[i].name));
+        out[i].name[sizeof(out[i].name) - 1] = 0;
+    }
+    if (written && !CopyToUser(outputsAddr, out, uint64_t(written) * sizeof(brook_output_desc))) return -EFAULT;
+    if (!CopyToUser(headerAddr, &header, sizeof(header))) return -EFAULT;
+    return written;
 }
 
 // ---------------------------------------------------------------------------

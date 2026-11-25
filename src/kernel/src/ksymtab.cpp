@@ -1,4 +1,5 @@
 #include "ksymtab.h"
+#include "usb_system.h"
 #include "vmware_tools.h"
 #include "serial.h"
 
@@ -99,6 +100,7 @@ EXPORT_SYMBOL(VmmDetachPage);
 // Device registry
 EXPORT_SYMBOL(DeviceRegister);
 EXPORT_SYMBOL(StorageIoAccount);
+EXPORT_SYMBOL(UsbSystemRequested);
 EXPORT_SYMBOL(DeviceFlush);
 EXPORT_SYMBOL(DeviceWrite);
 EXPORT_SYMBOL(DeviceUnregister);

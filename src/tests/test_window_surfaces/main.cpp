@@ -56,6 +56,7 @@ void KMutexLock(KMutex*) { CHECK(lockDepth++ < 2); }
 void KMutexUnlock(KMutex*) { CHECK(lockDepth-- > 0); }
 extern "C" void CompositorWake() { ++wakes; }
 void CompositorMarkDirty() { ++dirty; }
+void CompositorMarkSceneChanged() { CompositorMarkDirty(); }
 // Launcher save runs the real worker step against a minimal owned home.
 static Vnode layoutFile{}, layoutDirectory{};
 static char layoutText[LauncherLayoutLimit];
@@ -179,6 +180,16 @@ uint32_t AudioOutputControl() { return BROOK_AUDIO_DEFAULT; }
 bool AudioSetUserOutputControl(uint32_t, bool) { std::abort(); }
 uint32_t testScreenW=1024,testScreenH=768;
 extern "C" void CompositorGetPhysDims(uint32_t* w,uint32_t* h) { if(w)*w=testScreenW;if(h)*h=testScreenH; }
+// Multi-output D0: the framebuffer is the one output.
+void CompositorGetOutputs(OutputLayout& out) {
+    out=OutputLayout{};uint32_t w=0,h=0;CompositorGetPhysDims(&w,&h);
+    if(!w||!h)return;
+    out.count=1;out.outputs[0].connected=out.outputs[0].enabled=true;out.outputs[0].w=w;out.outputs[0].h=h;
+}
+bool CompositorGetOutputRect(uint32_t index,OutputRect* rect) {
+    OutputLayout l;CompositorGetOutputs(l);if(!l.enabled(index))return false;if(rect)*rect=l.rect(index);return true;
+}
+OutputRect CompositorPrimaryOutputRect() { OutputLayout l;CompositorGetOutputs(l);return l.rect(0); }
 }
 extern "C" void KernelPanic(const char*,...) { std::abort(); }
 

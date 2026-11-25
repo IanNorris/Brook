@@ -37,6 +37,27 @@ inline SceneRect SceneClientBlitRect(int64_t x,int64_t y,uint32_t sourceW,uint32
     const int64_t height=scaledH<clientH?scaledH:clientH;
     return SceneRect{x,y,x+width,y+height}.clipped(screenW,screenH);
 }
+// D3: a layer that can be redrawn clipped to the damage (an opaque-or-blended client
+// surface with no server-side chrome) does not pull its whole rectangle in; only its
+// `extra` rect (the WM's caption overlay drawn over a CSD client) does, once the damage
+// reaches it. Layers with `expand` set (server-side chrome, legacy surfaces) join whole.
+inline SceneRect SceneDamageClosureLayered(SceneRect damage,const SceneRect* layers,const bool* expand,
+                                           const SceneRect* extra,uint32_t count) {
+    bool expanded;
+    do {
+        expanded=false;
+        for(uint32_t i=0;i<count;++i) {
+            if(!damage.intersects(layers[i]))continue;
+            const SceneRect add=expand[i]?layers[i]:extra[i];
+            if(add.empty() || (!expand[i] && !damage.intersects(add)))continue;
+            SceneRect before=damage;
+            damage.include(add);
+            if(before.left!=damage.left || before.top!=damage.top ||
+               before.right!=damage.right || before.bottom!=damage.bottom)expanded=true;
+        }
+    } while(expanded);
+    return damage;
+}
 inline SceneRect SceneDamageClosure(SceneRect damage,const SceneRect* layers,uint32_t count) {
     bool expanded;
     do {

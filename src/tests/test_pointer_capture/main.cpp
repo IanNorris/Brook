@@ -21,8 +21,19 @@ void KMutexLock(KMutex*) { CHECK(lockDepth++==0); }
 void KMutexUnlock(KMutex*) { CHECK(lockDepth--==1); }
 extern "C" void CompositorWake() {}
 void CompositorMarkDirty() {}
+void CompositorMarkSceneChanged() { CompositorMarkDirty(); }
 // The dock's work-area reflow is reachable from window destruction.
 extern "C" void CompositorGetPhysDims(uint32_t* w,uint32_t* h) { if(w)*w=1024;if(h)*h=768; }
+// Multi-output D0: the framebuffer is the one output.
+void CompositorGetOutputs(OutputLayout& out) {
+    out=OutputLayout{};uint32_t w=0,h=0;CompositorGetPhysDims(&w,&h);
+    if(!w||!h)return;
+    out.count=1;out.outputs[0].connected=out.outputs[0].enabled=true;out.outputs[0].w=w;out.outputs[0].h=h;
+}
+bool CompositorGetOutputRect(uint32_t index,OutputRect* rect) {
+    OutputLayout l;CompositorGetOutputs(l);if(!l.enabled(index))return false;if(rect)*rect=l.rect(index);return true;
+}
+OutputRect CompositorPrimaryOutputRect() { OutputLayout l;CompositorGetOutputs(l);return l.rect(0); }
 TerminalResizeResult TerminalResizeForProcess(uint16_t,uint64_t,uint32_t,uint32_t) { return TerminalResizeResult::NotOwned; }
 extern "C" void MouseGetPosition(int32_t* x,int32_t* y) { *x=mouseX;*y=mouseY; }
 extern "C" void MouseSetPosition(int32_t x,int32_t y) { mouseX=x;mouseY=y; }

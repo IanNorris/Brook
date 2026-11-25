@@ -6,14 +6,15 @@
 // Staged bring-up. Stage 0 (always, at load) is read-only apart from the
 // SW/FW/HW semaphore and MDIC PHY reads. Later stages run on the module's
 // worker thread, only when the initrd marker or the operator asks for them:
-//   1 "attach":  program the rings over the firmware-initialised MAC/PHY (no
-//                reset), set link up, register the interface (DHCP follows);
+//   1 "attach":  recover PHY power and link, then program rings over the
+//                firmware-initialised MAC and register the interface;
 //   2 "reset":   Linux's MAC+PHY reset path (e1000_reset_hw_ich8lan and the
 //                post-reset steps) before attaching.
 // Never touched: NVM/flash (no flash-controller cycles), ME firmware state
 // beyond the documented H2ME ULP handshake, EFI variables, PCI config space
 // other than the command register.
 #include "e1000_ring.h"
+#include "i219_recovery.h"
 
 #include "apic.h"
 #include "boot_status.h"
@@ -64,6 +65,7 @@ MODULE_IMPORT_SYMBOL(VmmVirtToPhys);
 namespace {
 using namespace brook;
 using namespace brook::e1000;
+using namespace brook::i219;
 
 enum Reg : uint32_t {
     Ctrl = 0x0000, Status = 0x0008, Strap = 0x000c, CtrlExt = 0x0018, Fextnvm6 = 0x0010,
@@ -92,8 +94,10 @@ constexpr uint32_t CtrlExtLpcd = 1u << 2, CtrlExtForceSmbus = 1u << 11, CtrlExtR
                    CtrlExtPhyPden = 1u << 20;
 constexpr uint32_t MdicReady = 1u << 28, MdicError = 1u << 30;
 constexpr uint32_t ExtcnfSwFlag = 1u << 5;
-constexpr uint32_t FwsmRspciphy = 1u << 6, FwsmUlpCfgDone = 1u << 10, FwsmFwValid = 1u << 15;
-constexpr uint32_t H2meUlp = 1u << 11, H2meEnforce = 1u << 12;
+constexpr uint32_t FwsmRspciphy = 1u << 6;
+constexpr uint32_t Fextnvm7DisableSmbPerst = 1u << 5;
+constexpr uint16_t SmbForce = 1u << 0, PhyK1Enable = 1u << 14;
+constexpr uint16_t OemLinkPowerMask = (1u << 6) | (1u << 2);
 constexpr uint32_t FextnvmSwConfigIch8m = 1u << 27;
 constexpr uint32_t RahValid = 1u << 31;
 constexpr uint32_t RxEnable = 1u << 1, RxBroadcast = 1u << 15, RxStripFcs = 1u << 26;
@@ -120,7 +124,19 @@ NetIf g_if{};
 DmaRing g_rxDma{}, g_txDma{};
 RxRing g_rx{};
 TxRing g_tx{};
-SpinLock g_rxLock{}, g_txLock{}, g_phyLock{};
+SpinLock g_rxLock{}, g_txLock{}, g_phyLock{}, g_diagnosticsLock{};
+LinkRecovery g_linkRecovery; // worker-owned
+
+struct RecoveryDiagnostics {
+    const char* ulp = "pending";
+    const char* link = "pending";
+    uint32_t fwsmBefore = 0, h2meBefore = 0, phyCtrlBefore = 0;
+    uint32_t fwsmAfter = 0, h2meAfter = 0, phyCtrlAfter = 0;
+    uint32_t ulpBefore = UnreadPhy, ulpAfter = UnreadPhy, bmcr = UnreadPhy, bmsr = UnreadPhy;
+    uint64_t linkMs = 0;
+    unsigned restarts = 0;
+};
+RecoveryDiagnostics g_diagnostics;
 volatile uint32_t g_requested = 0;   // highest stage asked for
 volatile uint32_t g_reached = 0;     // highest stage completed
 volatile bool g_registered = false, g_linkUp = false, g_autonegRequested = false;
@@ -334,6 +350,47 @@ void DescribePhy(Text& t)
     t.nl();
 }
 
+void PhyField(Text& t, const char* name, uint32_t value)
+{
+    t.c(' '); t.s(name); t.c('=');
+    if (value == UnreadPhy) t.s("err"); else t.x(value, 4);
+}
+
+void DescribeRecovery(Text& t, const RecoveryDiagnostics& d)
+{
+    t.s("i219: ulp="); t.s(d.ulp);
+    t.r("FWSM", d.fwsmBefore); t.c('/'); t.x(d.fwsmAfter, 8);
+    t.r("H2ME", d.h2meBefore); t.c('/'); t.x(d.h2meAfter, 8);
+    PhyField(t, "ULP_CFG1", d.ulpBefore); t.c('/');
+    if (d.ulpAfter == UnreadPhy) t.s("err"); else t.x(d.ulpAfter, 4);
+    t.nl();
+    t.s("i219: link="); t.s(d.link);
+    t.s(" ms="); t.u(d.linkMs);
+    t.s(" an_restarts="); t.u(d.restarts);
+    t.r("PHY_CTRL", d.phyCtrlBefore); t.c('/'); t.x(d.phyCtrlAfter, 8);
+    PhyField(t, "BMCR", d.bmcr); PhyField(t, "BMSR", d.bmsr);
+    t.nl();
+}
+
+RecoveryDiagnostics ReadRecovery()
+{
+    SpinLockAcquire(&g_diagnosticsLock);
+    const auto snapshot = g_diagnostics;
+    SpinLockRelease(&g_diagnosticsLock);
+    return snapshot;
+}
+
+void PublishRecovery(RecoveryDiagnostics& d)
+{
+    SpinLockAcquire(&g_diagnosticsLock);
+    g_diagnostics = d;
+    SpinLockRelease(&g_diagnosticsLock);
+    char out[320]{};
+    Text t{out, sizeof(out)};
+    DescribeRecovery(t, d);
+    SerialPrintf("%s", out);
+}
+
 uint32_t StatusText(char* out, uint32_t cap)
 {
     Text t{out, cap};
@@ -350,6 +407,7 @@ uint32_t StatusText(char* out, uint32_t cap)
     }
     if (g_failure) { t.s(" FAILED "); t.s(g_failure); }
     t.nl();
+    DescribeRecovery(t, ReadRecovery());
     DescribeRegisters(t);
     if (g_stepsLength) { t.s("I219 steps "); t.s(g_steps); t.nl(); }
     return t.n;
@@ -507,75 +565,175 @@ void ToggleLanPhyPc()
     SleepMs(30);
 }
 
-// Unforce SMBus in PHY and MAC once the PHY answers, when ME is not active
-// (tail of e1000_phy_is_accessible_pchlan for LPT and newer).
-void UnforceSmbusLocked()
+// Linux e1000e ich8lan.c: e1000_disable_ulp_lpt_lp(force) and the
+// PHY-access workarounds. Separate ME acknowledgement from the host-owned
+// PHY-side fallback, and hold SWFLAG for every PHY transaction.
+struct FirmwareUlpIo {
+    uint32_t readH2me() { return Read(H2me); }
+    uint32_t readFwsm() { return Read(Fwsm); }
+    void writeH2me(uint32_t value) { Write(H2me, value); Flush(); }
+    void sleepMs(uint32_t ms) { SleepMs(ms); }
+};
+
+uint32_t SamplePhyLocked(uint32_t reg)
 {
-    if (Read(Fwsm) & FwsmFwValid) return;
     uint16_t value = 0;
-    if (PhyAccessLocked(CvSmbCtrl, false, value)) {
-        value &= ~1u;
-        (void)PhyAccessLocked(CvSmbCtrl, true, value);
-    }
-    Write(CtrlExt, Read(CtrlExt) & ~CtrlExtForceSmbus);
+    return PhyAccessLocked(reg, false, value) && value != 0xffff ? value : UnreadPhy;
 }
 
-// e1000_disable_ulp_lpt_lp(force=true) and e1000_init_phy_workarounds_pchlan,
-// for an I219 whose PHY does not answer. Returns the PHY ID or 0.
-uint32_t RecoverPhyAccess()
+void SampleLink(RecoveryDiagnostics& d)
 {
-    if (Read(Fwsm) & FwsmFwValid) {
-        // ME is present: ask it to un-configure ULP (the documented H2ME
-        // handshake) and wait up to 2.5 s for ULP_CFG_DONE to clear.
-        Write(H2me, (Read(H2me) & ~H2meUlp) | H2meEnforce);
-        int i = 0;
-        while ((Read(Fwsm) & FwsmUlpCfgDone) && i++ < 250) SleepMs(10);
-        Write(H2me, Read(H2me) & ~H2meEnforce);
-        Step(i > 250 ? "ULP: ME did not clear ULP_CFG_DONE" : "ULP: ME un-configured ULP");
+    d.fwsmAfter = Read(Fwsm);
+    d.h2meAfter = Read(H2me);
+    d.phyCtrlAfter = Read(PhyCtrl);
+    d.bmcr = d.bmsr = UnreadPhy;
+    if (AcquireSwFlag()) {
+        d.bmcr = SamplePhyLocked(0);
+        (void)SamplePhyLocked(1); // BMSR link is latched low
+        d.bmsr = SamplePhyLocked(1);
+        ReleaseSwFlag();
     }
-    if (!AcquireSwFlag()) { Step("SWFLAG busy"); return 0; }
+}
+
+bool ExitHostUlpLocked()
+{
+    uint16_t smb = 0;
+    if (!PhyAccessLocked(CvSmbCtrl, false, smb) || smb == 0xffff) {
+        const uint32_t ctrlExt = Read(CtrlExt);
+        Write(CtrlExt, ctrlExt | CtrlExtForceSmbus);
+        Flush();
+        SleepMs(50);
+        if (!PhyAccessLocked(CvSmbCtrl, false, smb) || smb == 0xffff) {
+            Write(CtrlExt, ctrlExt);
+            Flush();
+            return false;
+        }
+    }
+    // The PHY can switch transports as a side effect of this write, so an
+    // MDIC error from it alone does not mean the switch failed.
+    smb &= ~SmbForce;
+    (void)PhyAccessLocked(CvSmbCtrl, true, smb);
+    Write(CtrlExt, Read(CtrlExt) & ~CtrlExtForceSmbus);
+    Flush();
+
+    uint16_t value = 0;
+    if (!PhyAccessLocked(HvPmCtrl, false, value) || value == 0xffff) return false;
+    value |= PhyK1Enable;
+    if (!PhyAccessLocked(HvPmCtrl, true, value)) return false;
+    if (!PhyAccessLocked(I218UlpConfig1, false, value) || value == 0xffff) return false;
+    value = ActiveUlpConfig(value);
+    if (!PhyAccessLocked(I218UlpConfig1, true, value)) return false;
+    value |= UlpStart;
+    if (!PhyAccessLocked(I218UlpConfig1, true, value)) return false;
+    Write(Fextnvm7, Read(Fextnvm7) & ~Fextnvm7DisableSmbPerst);
+    Flush();
+    return true;
+}
+
+void PostPhyReset();
+
+void WaitPhyConfigDone()
+{
+    uint32_t polls = 0;
+    while (!(Read(Status) & StatusLanInitDone) && polls < 150) {
+        SleepMs(1);
+        ++polls;
+    }
+    const auto status = Read(Status);
+    if (!(status & StatusLanInitDone)) Step("LAN_INIT_DONE not seen after reset");
+    Write(Status, status & ~(StatusLanInitDone | StatusPhyRa));
+}
+
+void ResetHostPhyAfterUlp()
+{
+    if (ResetBlocked() || !AcquireSwFlag()) return;
+    if (ResetBlocked() || (Read(Fwsm) & FwsmFwValid)) {
+        ReleaseSwFlag();
+        return;
+    }
+    const uint32_t ctrl = Read(Ctrl);
+    Write(Ctrl, ctrl | CtrlPhyRst);
+    Flush();
+    SleepMs(1);
+    Write(Ctrl, ctrl);
+    Flush();
+    SleepMs(1);
+    ReleaseSwFlag();
+    WaitPhyConfigDone();
+    SleepMs(50);
+    PostPhyReset();
+}
+
+uint32_t RecoverPhyAccess(RecoveryDiagnostics& d)
+{
+    d.fwsmBefore = Read(Fwsm);
+    d.h2meBefore = Read(H2me);
+    d.phyCtrlBefore = Read(PhyCtrl);
+    if (Read(Status) == 0xffffffffu) { d.ulp = "device absent"; return 0; }
+
+    if (AcquireSwFlag()) {
+        d.ulpBefore = SamplePhyLocked(I218UlpConfig1);
+        ReleaseSwFlag();
+    }
+    const bool firmware = d.fwsmBefore & FwsmFwValid;
+    FirmwareUlpIo io;
+    const bool firmwareExited = !firmware || RequestFirmwareExit(io);
+    d.ulp = firmware ? (firmwareExited ? "ME done" : "ME timeout") : "inactive";
+
+    if (!AcquireSwFlag()) { Step("ULP: SWFLAG busy"); return 0; }
     uint32_t id = PhyIdLocked();
-    if (!id) {
-        Write(CtrlExt, Read(CtrlExt) | CtrlExtForceSmbus);
+    const bool silent = !id;
+    const uint32_t ulp = id ? SamplePhyLocked(I218UlpConfig1) : UnreadPhy;
+    const auto currentFwsm = Read(Fwsm);
+    const bool hostAllowed = firmwareExited && !FirmwareUlpBusy(currentFwsm);
+    const bool hostForce = hostAllowed && !(currentFwsm & FwsmFwValid) &&
+        (HostUlpNeeded(currentFwsm, Read(H2me), ulp, silent) || (d.ulpBefore & UlpConfigMask));
+    bool toggled = false;
+    if (hostForce && !ResetBlocked()) {
+        ToggleLanPhyPc();
+        toggled = true;
+        id = PhyIdLocked();
+        Step(id ? "PHY answered after LANPHYPC toggle" : "PHY still silent after LANPHYPC toggle");
+    }
+    if (hostAllowed && !id) {
+        const uint32_t ctrlExt = Read(CtrlExt);
+        Write(CtrlExt, ctrlExt | CtrlExtForceSmbus);
+        Flush();
         SleepMs(50);
         id = PhyIdLocked();
         if (id) Step("PHY answered with MAC forced to SMBus");
-    }
-    if (!id) {
-        if (ResetBlocked()) {
-            ReleaseSwFlag();
-            Step("LANPHYPC toggle blocked by ME (FWSM.RSPCIPHY=0)");
-            return 0;
+        if (!id && !toggled && !ResetBlocked()) {
+            ToggleLanPhyPc();
+            id = PhyIdLocked();
+            Step(id ? "PHY answered after LANPHYPC toggle" : "PHY still silent after LANPHYPC toggle");
         }
-        ToggleLanPhyPc();
-        id = PhyIdLocked();
         if (!id) {
-            Write(CtrlExt, Read(CtrlExt) & ~CtrlExtForceSmbus);
+            Write(CtrlExt, ctrlExt);
+            Flush();
             id = PhyIdLocked();
         }
-        Step(id ? "PHY answered after LANPHYPC toggle" : "PHY still silent after LANPHYPC toggle");
     }
-    if (id) {
-        UnforceSmbusLocked();
-        if (!(Read(Fwsm) & FwsmFwValid)) {
-            // Rest of the non-ME ULP exit: K1 back on, ULP configuration
-            // cleared and committed, SMBus release on PERST# re-enabled.
-            uint16_t value = 0;
-            if (PhyAccessLocked(HvPmCtrl, false, value)) {
-                value |= 0x4000;
-                (void)PhyAccessLocked(HvPmCtrl, true, value);
-            }
-            if (PhyAccessLocked(I218UlpConfig1, false, value)) {
-                value &= ~uint16_t(0x0004 | 0x0010 | 0x0100 | 0x0040 | 0x0020 | 0x0400 | 0x0800 | 0x1000);
-                (void)PhyAccessLocked(I218UlpConfig1, true, value);
-                value |= 0x0001;
-                (void)PhyAccessLocked(I218UlpConfig1, true, value);
-            }
-            Write(Fextnvm7, Read(Fextnvm7) & ~0x20u);
-            Step("non-ME ULP configuration cleared");
-        }
+
+    // Firmware normally performs the PHY-side work itself. Use the locked
+    // host fallback if an acknowledged exit leaves ULP bits or forced SMBus.
+    const bool hostExit = hostAllowed && id && !FirmwareUlpBusy(Read(Fwsm)) &&
+        (hostForce || HostUlpNeeded(Read(Fwsm), Read(H2me), ulp, silent) ||
+         (Read(CtrlExt) & CtrlExtForceSmbus));
+    bool cleared = false;
+    if (hostExit) {
+        cleared = ExitHostUlpLocked();
+        d.ulp = cleared ? (firmware ? "ME+PHY done" : "PHY done") : "PHY exit failed";
     }
+    d.ulpAfter = id ? SamplePhyLocked(I218UlpConfig1) : UnreadPhy;
     ReleaseSwFlag();
+
+    if (cleared && !firmware) {
+        ResetHostPhyAfterUlp();
+        if (!AcquireSwFlag()) return 0;
+        id = PhyIdLocked();
+        d.ulpAfter = id ? SamplePhyLocked(I218UlpConfig1) : UnreadPhy;
+        ReleaseSwFlag();
+    }
     return id;
 }
 
@@ -616,12 +774,7 @@ bool ResetHardware()
     if (flag) SpinLockRelease(&g_phyLock); // the reset clears SWFLAG itself
     if (phyReset) {
         // e1000_get_cfg_done_ich8lan: LAN_INIT_DONE, then clear PHYRA.
-        uint32_t loop = 0;
-        while (!(Read(Status) & StatusLanInitDone) && loop++ < 150) SleepMs(1);
-        Write(Status, Read(Status) & ~StatusLanInitDone);
-        const uint32_t status = Read(Status);
-        if (status & StatusPhyRa) Write(Status, status & ~StatusPhyRa);
-        if (loop >= 150) Step("LAN_INIT_DONE not seen after reset");
+        WaitPhyConfigDone();
         PostPhyReset();
     }
     Write(Imc, ~0u);
@@ -719,22 +872,20 @@ bool Attach()
     }
     Write(Imc, ~0u);
     (void)Read(Icr);
-    if (!AcquireSwFlag()) { g_failure = "swflag busy"; return false; }
-    uint32_t id = PhyIdLocked();
-    ReleaseSwFlag();
-    if (!id) {
-        Step("PHY silent: recovering access (ULP/SMBus)");
-        id = RecoverPhyAccess();
-        if (!id) { g_failure = "PHY inaccessible"; return false; }
+    RecoveryDiagnostics diagnostics;
+    const uint32_t id = RecoverPhyAccess(diagnostics);
+    if (!id) diagnostics.link = "no PHY";
+    if (id && !FirmwareUlpBusy(Read(Fwsm))) {
+        // Firmware without a network stack may leave BMCR.PDOWN set.
+        uint16_t bmcr = 0;
+        if (PhyRead(0, bmcr) && bmcr != 0xffff && (bmcr & BmcrPowerDown) &&
+            PhyWrite(0, static_cast<uint16_t>(bmcr & ~BmcrPowerDown)))
+            Step("PHY powered up (BMCR.PDOWN cleared)");
     }
+    SampleLink(diagnostics);
+    PublishRecovery(diagnostics);
+    if (!id) { g_failure = "PHY inaccessible after ULP exit"; return false; }
     if (!ProgramMac(g_if.mac)) { g_failure = "RAR0 invalid (MAC not loaded)"; return false; }
-    // e1000_power_up_phy_copper: firmware without a network stack may leave
-    // the PHY powered down (BMCR.PDOWN).
-    uint16_t bmcr = 0;
-    if (PhyRead(0, bmcr) && (bmcr & (1u << 11))) {
-        (void)PhyWrite(0, static_cast<uint16_t>(bmcr & ~(1u << 11)));
-        Step("PHY powered up (BMCR.PDOWN cleared)");
-    }
     for (uint32_t i = 0; i < MtaCount; ++i) Write(Mta + i * 4, 0);
     InitHardwareBits();
 
@@ -771,7 +922,7 @@ bool Attach()
     __asm__ volatile("sfence" ::: "memory");
     Write(Rdt, RingSize - 1);
 
-    // Link: firmware autonegotiation stays in charge; set link up.
+    // Allow the existing negotiation to finish before forcing a retry.
     Write(Ctrl, (Read(Ctrl) | CtrlSlu) & ~(CtrlFrcSpd | CtrlFrcDpx));
     Flush();
 
@@ -780,6 +931,7 @@ bool Attach()
     g_if.poll = Poll;
     g_if.snapshot = Snapshot;
     g_linkUp = Read(Status) & StatusLu;
+    g_linkRecovery.Start(ApicTickCount());
     if (!g_registered) {
         if (!NetRegisterIf(&g_if)) { g_failure = "NetRegisterIf (table full)"; return false; }
         g_registered = true;
@@ -791,12 +943,48 @@ bool Attach()
     return true;
 }
 
-void RestartAutoneg()
+bool RestartAutoneg()
 {
+    if (!AcquireSwFlag()) return false;
+    if (FirmwareUlpBusy(Read(Fwsm))) {
+        ReleaseSwFlag();
+        return false;
+    }
+    Write(PhyCtrl, Read(PhyCtrl) & ~PhyLinkPowerMask);
+    Flush();
+    // The PHY can retain its own OEM copy after a Linux shutdown.
+    uint16_t oem = 0;
+    if (PhyAccessLocked(HvOemBits, false, oem) && oem != 0xffff && (oem & OemLinkPowerMask)) {
+        oem &= ~OemLinkPowerMask;
+        (void)PhyAccessLocked(HvOemBits, true, oem);
+    }
     uint16_t bmcr = 0;
-    if (PhyRead(0, bmcr) && PhyWrite(0, static_cast<uint16_t>(bmcr | (1u << 12) | (1u << 9))))
-        Step("autonegotiation restarted");
-    else Step("autonegotiation restart failed");
+    bool ok = PhyAccessLocked(0, false, bmcr) && bmcr != 0xffff;
+    if (ok) {
+        bmcr = RestartBmcr(bmcr);
+        ok = PhyAccessLocked(0, true, bmcr);
+    }
+    ReleaseSwFlag();
+    return ok;
+}
+
+void ServiceLinkRecovery()
+{
+    const uint64_t now = ApicTickCount();
+    const auto action = g_linkRecovery.Poll(now, Read(Status) & StatusLu);
+    if (action == LinkAction::None) return;
+    auto d = ReadRecovery();
+    if (action == LinkAction::Restart) {
+        d.link = RestartAutoneg() ? "AN restart" : "AN write failed";
+        g_linkRecovery.next = ApicTickCount() + LinkRecovery::WaitMs;
+    } else {
+        d.link = action == LinkAction::Up ? "up" : "timeout";
+    }
+    d.linkMs = now - g_linkRecovery.start;
+    d.restarts = g_linkRecovery.restarts;
+    SampleLink(d);
+    PublishRecovery(d);
+    UsbStatusChanged();
 }
 
 void Worker(void*)
@@ -810,8 +998,12 @@ void Worker(void*)
             if (Attach()) g_reached = requested;
             UsbStatusChanged();
         }
-        if (__atomic_exchange_n(&g_autonegRequested, false, __ATOMIC_ACQ_REL)) { RestartAutoneg(); tuned = false; }
+        if (__atomic_exchange_n(&g_autonegRequested, false, __ATOMIC_ACQ_REL)) {
+            Step(RestartAutoneg() ? "autonegotiation restarted" : "autonegotiation restart failed");
+            tuned = false;
+        }
         if (g_registered) {
+            ServiceLinkRecovery();
             const bool up = Read(Status) & StatusLu;
             if (up && !tuned) { LinkTuning(); tuned = true; Step("link tuning applied"); UsbStatusChanged(); }
             if (!up) tuned = false;

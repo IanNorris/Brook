@@ -86,6 +86,8 @@ add_test(NAME test_nix_classify COMMAND python3 "${BROOK_ROOT}/tools/nix-install
 add_test(NAME test_nix_desktop COMMAND python3 "${BROOK_ROOT}/tools/nix-install/test_desktop.py")
 add_test(NAME test_nix_install_links COMMAND python3 "${BROOK_ROOT}/tools/nix-install/test_install_links.py")
 add_test(NAME test_gen_nix_index COMMAND python3 "${BROOK_ROOT}/tools/nix-index/test_gen_nix_index.py")
+add_test(NAME test_nv_gsp_mmiotrace COMMAND python3 -I "${BROOK_ROOT}/scripts/test_nv_gsp_mmiotrace.py")
+add_test(NAME test_nv_gsp_trace_diff COMMAND python3 -I "${BROOK_ROOT}/scripts/test_nv_gsp_trace_diff.py")
 set_tests_properties(test_stage_selected_launchers test_stage_selected_profile test_brook_profile
     PROPERTIES LABELS nix WORKING_DIRECTORY "${BROOK_ROOT}")
 set_tests_properties(test_stage_selected_launchers PROPERTIES SKIP_REGULAR_EXPRESSION "OK [()]skipped=")
@@ -116,6 +118,23 @@ add_host_test(test_nv_disp_head)
 target_compile_options(test_nv_disp_head PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_xhci_dma_reserve)
 target_compile_options(test_xhci_dma_reserve PRIVATE "-iquote${BROOK_ROOT}/src/drivers/xhci")
+add_host_test(test_nv_disp_driver)
+target_compile_options(test_nv_disp_driver PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
+# NVIDIA GSP-RM M0 (src/kernel/src/nv_gsp). The real 570.144 blobs and the
+# VBIOS dump are NVIDIA-licensed and stay outside the repo: point these at
+# them to enable the real-file checks (they skip otherwise), e.g.
+#   -DBROOK_NV_GSP_FW_DIR=<linux-firmware>/lib/firmware/nvidia/tu104/gsp
+set(BROOK_NV_GSP_FW_DIR "" CACHE PATH "Directory with the 570.144 GSP/booter/bootloader blobs")
+set(BROOK_NV_GSP_ACR_BL "" CACHE FILEPATH "nvidia/tu104/acr/bl.bin (FWSEC v2 bootloader)")
+set(BROOK_NV_GSP_VBIOS "" CACHE FILEPATH "Full TU104 VBIOS ROM dump (333824 B)")
+set(BROOK_NV_GSP_PCIROM "" CACHE FILEPATH "Partial PCI ROM BAR dump (55808 B), optional")
+set(_nv_gsp_env "BROOK_NV_GSP_FW_DIR=${BROOK_NV_GSP_FW_DIR}" "BROOK_NV_GSP_ACR_BL=${BROOK_NV_GSP_ACR_BL}"
+    "BROOK_NV_GSP_VBIOS=${BROOK_NV_GSP_VBIOS}" "BROOK_NV_GSP_PCIROM=${BROOK_NV_GSP_PCIROM}")
+foreach(_t test_nv_gsp_fw test_nv_gsp_core test_nv_gsp_queue test_nv_gsp_boot test_nv_gsp_p3 test_nv_gsp_p4)
+    add_host_test(${_t})
+    target_compile_options(${_t} PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
+    set_tests_properties(${_t} PROPERTIES ENVIRONMENT "${_nv_gsp_env}")
+endforeach()
 add_host_test(test_usb_uac2)
 target_compile_options(test_usb_uac2 PRIVATE "-iquote${BROOK_ROOT}/src/drivers/xhci")
 add_host_test(test_usb_ecm_descriptors)
@@ -197,6 +216,11 @@ add_host_test(test_ata_identify)
 add_host_test(test_ahci_readonly_sequence)
 add_host_test(test_xhci_ownership)
 add_host_test(test_usb_block_bytes)
+target_compile_options(test_usb_block_bytes PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
+add_host_test(test_usb_system)
+target_sources(test_usb_system PRIVATE "${BROOK_ROOT}/src/kernel/src/gpt.cpp")
+target_compile_options(test_usb_system PRIVATE "-iquote${BROOK_ROOT}/src/drivers/xhci"
+    "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared/inc_km")
 add_host_test(test_panic_qr_layout)
 add_host_test(test_early_framebuffer_mapping)
 add_host_test(test_framebuffer_memory_type)
@@ -440,6 +464,7 @@ target_compile_options(test_virtio_net_tx PRIVATE
 )
 target_link_options(test_virtio_net_tx PRIVATE -Wl,--gc-sections)
 set_tests_properties(test_virtio_net_tx PROPERTIES TIMEOUT 15)
+add_host_test(test_i219_recovery)
 add_host_test(test_e1000)
 target_compile_options(test_e1000 PRIVATE
     -DBROOK_HOST_TEST -ffunction-sections -fdata-sections
@@ -809,6 +834,8 @@ add_host_test(test_cursor_composition)
 target_compile_options(test_cursor_composition PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 
 add_host_test(test_desktop_metrics)
+add_host_test(test_display_output)
+target_compile_options(test_display_output PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_desktop_overlay_regions)
 add_host_test(test_desktop_overlay_surfaces)
 add_host_test(test_global_shortcuts)

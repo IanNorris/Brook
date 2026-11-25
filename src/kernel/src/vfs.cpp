@@ -1,4 +1,5 @@
 #include "vfs.h"
+#include "device.h"
 #include "vfs_object.h"
 #include "vfs_path.h"
 #include "mount_namespace.h"
@@ -216,7 +217,10 @@ struct MountEntry {
     uint64_t         lockedAttributes;
 };
 static uint64_t VfsMountAttributes(const MountEntry* mount) {
-    return __atomic_load_n(&mount->attributes,__ATOMIC_ACQUIRE);
+    const auto attributes=__atomic_load_n(&mount->attributes,__ATOMIC_ACQUIRE);
+    const auto* backing=mount->backing;
+    return backing && backing->fsOps->write_fenced && backing->fsOps->write_fenced(backing->mountPriv)
+        ?attributes|MountReadOnly:attributes;
 }
 static bool VfsReadOnly(const MountEntry* mount) { return mount && (VfsMountAttributes(mount)&MountReadOnly); }
 static bool VfsNoExec(const MountEntry* mount) { return mount && (VfsMountAttributes(mount)&MountNoExec); }
@@ -1140,7 +1144,7 @@ int VfsChownPath(const char* path, uint32_t uid, uint32_t gid, bool nofollow)
     return mount->backing->fsOps->chown(mount->backing->mountPriv, mount->backing->pdrv, relPath, uid, gid, nofollow);
 }
 
-int VfsRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
+static int VfsReadWithSource(Vnode* vn,void* buf,uint64_t len,uint64_t* offset,bool executable)
 {
     if (!vn) return -1;
     // Detect use-after-free: kfree fills with 0xDF
@@ -1152,9 +1156,27 @@ int VfsRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
     }
     if(VfsSystemVnodeDenied(vn))return -13;
     if (!vn->ops->read) return -1;
-    if(vn->ops->file_object)
-        return FileObjectRead(vn->ops->file_object(vn),vn,buf,len,offset);
+    if(vn->ops->file_object) {
+        auto* object=vn->ops->file_object(vn);
+        if(executable)return FileObjectReadTagged(object,vn,buf,len,offset,UsbReadSource::Exec);
+        return FileObjectRead(object,vn,buf,len,offset);
+    }
     return vn->ops->read(vn, buf, len, offset);
+}
+
+int VfsRead(Vnode* vn,void* buf,uint64_t len,uint64_t* offset) {
+    return VfsReadWithSource(vn,buf,len,offset,false);
+}
+int VfsReadExec(Vnode* vn,void* buf,uint64_t len,uint64_t* offset) {
+    return VfsReadWithSource(vn,buf,len,offset,true);
+}
+uint32_t VfsExecReadBurst(Vnode* vn) {
+    if(vn && vn->ops->file_object) {
+        auto* object=vn->ops->file_object(vn);
+        if(object && object->readBurst>65536 && object->readBurst<=1024*1024)
+            return object->readBurst;
+    }
+    return 65536;
 }
 
 int VfsWrite(Vnode* vn, const void* buf, uint64_t len, uint64_t* offset)

@@ -24,6 +24,7 @@
 #include "ahci_observe.h"
 #include "ahci_readonly.h"
 #include "writable_desktop.h"
+#include "usb_system.h"
 #include "ssd_install_qemu.h"
 #include "acpi.h"
 #include "boot_resource_map.h"
@@ -32,6 +33,9 @@
 #include "dell_audio_probe.h"
 #include "dell_i2c_probe.h"
 #include "intel_vtd_observe.h"
+#if defined(BROOK_NV_GSP)
+#include "nv_gsp_live.h"
+#endif
 #include "intel_bdw_scanout.h"
 #include "intel_bdw_bootstrap_gate.h"
 #include "hda_observe.h"
@@ -890,6 +894,67 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",");r.field("bytes",store.bytes);r.text(",");r.field("drive",store.drive);
         auto signedNumber=[&](int value){if(value<0){r.text("-");r.number(-int64_t(value));}else r.number(value);};
         r.text(",\"error\":");signedNumber(store.error);r.text(",\"final_error\":");signedNumber(store.finalError);r.text("}");
+        const auto usb=UsbSystemRead();
+        if(usb.configured) {
+            auto boolean=[&](const char* key,bool value) {
+                r.text(",");r.quoted(key);r.text(value?":true":":false");
+            };
+            r.text(",\"usb_system\":{\"configured\":true");
+            boolean("record_valid",usb.parsed);boolean("window_open",usb.window);
+            boolean("mounted",usb.mounted);boolean("dirty",usb.dirty);boolean("clean",usb.clean);
+            boolean("profile_transfer_ready",usb.profileTransferReady);
+            boolean("uncertain",usb.uncertain);boolean("final_sync_attempted",usb.finalAttempted);
+            r.text(",\"stage\":");r.quoted(usb.stage);
+            r.text(",\"disk\":");signedNumber(usb.disk);
+            r.text(",\"error\":");signedNumber(usb.error);
+            r.text(",\"final_error\":");signedNumber(usb.finalError);
+            r.text(",\"partition_guid_gpt_hex\":");r.quoted(usb.partitionGuid);
+            r.text(",\"fs_uuid_hex\":");r.quoted(usb.fsUuid);
+            r.text(",");r.field("first_lba",usb.firstLba);r.text(",");r.field("sectors",usb.sectors);
+            r.text(",");r.field("reads",usb.reads);r.text(",");r.field("writes",usb.writes);
+            r.text(",");r.field("flushes",usb.flushes);r.text(",");r.field("errors",usb.errors);
+            UsbStorageTiming timing{};
+            if(UsbSystemTiming(&timing)) {
+                r.text(",\"timing\":{");r.field("commands",timing.commands);
+                r.text(",");r.field("errors",timing.errors);
+                r.text(",");r.field("data_bytes",timing.dataBytes);
+                r.text(",");r.field("last_bytes",timing.lastBytes);
+                r.text(",");r.field("direct_bytes",timing.directBytes);
+                r.text(",");r.field("uas_flights",timing.uasFlights);
+                r.text(",");r.field("uas_peak_depth",timing.uasPeakDepth);
+                auto phase=[&](const char* label,const UsbPhaseTiming& p) {
+                    r.text(",");r.quoted(label);r.text(":{");
+                    r.field("total_ns",p.totalNs);r.text(",");r.field("max_ns",p.maxNs);
+                    r.text(",");r.field("last_ns",p.lastNs);r.text("}");
+                };
+                phase("cbw",timing.command);phase("data",timing.data);phase("csw",timing.status);
+                constexpr const char* roots[]={"boot","file","exec","fault","inode","indirect","directory","bitmap","bench","other"};
+                static_assert(sizeof(roots)/sizeof(*roots)==UsbReadSourceCount);
+                r.text(",\"read_request_max_bytes\":[512,4096,16384,65536,2147483647],\"read_sources\":{");
+                for(unsigned k=0;k<UsbReadSourceCount;++k) {
+                    if(k)r.text(",");
+                    r.quoted(roots[k]);r.text(":{");
+                    r.field("bytes",timing.readsBySource[k].bytes);r.text(",\"requests\":[");
+                    for(unsigned j=0;j<UsbReadBuckets;++j) {
+                        if(j)r.text(",");
+                        r.number(timing.readsBySource[k].requests[j]);
+                    }
+                    r.text("]}");
+                }
+                r.text("},\"mount_timing_us\":{");
+                r.field("identity",timing.admissionUs);r.text(",");
+                r.field("transport",timing.transportUs);r.text(",");
+                r.field("transport_identity",timing.transportIdentityUs);r.text(",");
+                r.field("uas_drop_bot",timing.uasDropBotUs);r.text(",");
+                r.field("uas_set_interface",timing.uasSetInterfaceUs);r.text(",");
+                r.field("uas_configure",timing.uasConfigureUs);r.text(",");
+                r.field("uas_identify",timing.uasIdentifyUs);r.text(",");
+                r.field("session",timing.sessionUs);r.text(",");
+                r.field("mount",timing.mountUs);r.text("}");
+                r.text("}");
+            }
+            r.text("}");
+        }
 #if defined(BROOK_SSD_AUTO_RECOVERY)
 #if defined(BROOK_SSD_GUARDED_DESKTOP)
         if(GuardedDesktopBridgeEnabled()) DesktopCaps(r);
@@ -1537,6 +1602,9 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
 #if defined(BROOK_NV_DISPLAY)
     if(NvAuxHandle(command,nullptr,0))return true;
     if(NvDispHandle(command))return true;          // RTX step 3 flips (nv_disp_live.cpp), gated
+#if defined(BROOK_NV_GSP)
+    if(NvGspHandle(command))return true;           // GSP-RM M1 (nv_gsp_live.cpp), gated by /etc/nv-gsp
+#endif
     constexpr char dpIdlePrefix[]="bridge hardware dp-idle ";
     if(Prefix(command,dpIdlePrefix)){DpIdleCommand(command+sizeof(dpIdlePrefix)-1);return true;}
 #endif
@@ -1626,7 +1694,15 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
             // rtx-disp probes: VRAM size, BAR1/BAR2 block, PRAMIN window contents (reads only;
             // the 0x1700 window base is never written here).
             {0x100c00,0x100d00},{0xb80f00,0xb81000},{0x700000,0x800000},
-            {0x00ea00,0x00f000}}; // VPLL (0xef00-0xef5c, 0xea80)
+            {0x00ea00,0x00f000}, // VPLL (0xef00-0xef5c, 0xea80)
+            // GSP P1 (read-only): FWSEC/SB error scratch, strap, devinit/SEC2 boot status,
+            // WPR2 + MMU_LOCK, GSP and SEC2 falcon state words. Dword-exact spans only:
+            // the falcon IMEM/DMEM ports (0x180-0x1cc) auto-increment on read and are excluded.
+            {0x001400,0x001480},{0x101000,0x101004},{0x1180f8,0x1180fc},{0x118128,0x11812c},
+            {0x118234,0x118238},{0x1fa7c8,0x1fa7cc},{0x1fa824,0x1fa834},
+            {0x110040,0x11004c},{0x110080,0x110084},{0x110100,0x11010c},{0x11012c,0x110130},
+            {0x1103c0,0x1103c4},{0x110610,0x110614},{0x110624,0x110628},{0x111240,0x111244},
+            {0x840040,0x840048},{0x840100,0x84010c},{0x84012c,0x840130},{0x840408,0x84040c}};
         const uint32_t end=offset+count*4;bool ok=false;
         for(const auto& a:allowed)if(offset>=a.begin && end<=a.end)ok=true;
         if(!ok){DebugChannelSend("{\"nv_error\":\"Range not in the read-only allow-list\"}\n");return true;}
@@ -1647,7 +1723,7 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
             if(!window){DebugChannelSend("{\"nv_error\":\"No window\"}\n");return true;}
             const auto leaf=VmmDetachPage(KernelPageTable,window);if(leaf)PmmFreePage(VmmLeafPhysical(leaf));
             __asm__ volatile("invlpg (%0)"::"r"(window.raw()):"memory");}
-        Reply r;r.text("{\"nv_api\":1,");r.field("bar0",base);r.text(",");r.field("offset",offset);r.text(",\"values\":[");
+        Reply r;r.text("{\"nv_api\":1,");r.field("bar0",base);r.text(",");r.field("pci_cmd",cmd);r.text(",");r.field("offset",offset);r.text(",\"values\":[");
         uint32_t mappedPage=~0u;
         for(uint32_t i=0;i<count;++i){
             const uint32_t at=offset+i*4,page=at&~0xfffu;
@@ -1663,6 +1739,58 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         if(mappedPage!=~0u){(void)VmmDetachPage(KernelPageTable,window);__asm__ volatile("invlpg (%0)"::"r"(window.raw()):"memory");}
         r.text("]}\n");r.send();return true;
     }
+    constexpr char systemBenchPrefix[]="bridge hardware usb-system-bench ";
+    if(Prefix(command,systemBenchPrefix)) {
+        const char* p=command+sizeof(systemBenchPrefix)-1;
+        uint32_t kib=0,mib=0;
+        const bool random=Prefix(p,"rand ");
+        if(random)p+=5;
+        else if(Prefix(p,"seq "))p+=4;
+        else p="";
+        if(!Decimal(p,kib) || *p!=' ' || !Decimal(++p,mib) || *p ||
+           kib<4 || kib>4096 || (kib&(kib-1)) || (random && kib!=4) ||
+           !mib || mib>256 || (mib*1024)%kib) {
+            DebugChannelSend("{\"usb_system_bench_error\":\"Expected seq KiB MiB or rand 4 MiB (MiB 1..256)\"}\n");
+            return true;
+        }
+        const auto usb=UsbSystemRead();
+        const uint32_t bytes=kib*1024,pages=bytes/4096;
+        const uint64_t extent=usb.sectors*512,total=uint64_t(mib)*1024*1024;
+        if(!usb.mounted || usb.uncertain || total>extent) {
+            DebugChannelSend("{\"usb_system_bench_error\":\"No healthy mounted USB system extent\"}\n");
+            return true;
+        }
+        auto buffer=VmmAllocPages(pages);
+        if(!buffer) {DebugChannelSend("{\"usb_system_bench_error\":\"No buffer\"}\n");return true;}
+        auto now=[]()->uint64_t {const auto ns=AudioClockNowNs();return ns?ns:ApicTickCount()*1000000;};
+        UsbStorageTiming before{},after{};const bool timed=UsbSystemTiming(&before);
+        const auto start=now();
+        uint64_t done=0,maxNs=0,state=0x5e120abbdc1e600dull;
+        int error=0;
+        while(done<total) {
+            state^=state<<13;state^=state>>7;state^=state<<17;
+            const uint64_t at=random?(state%(extent/bytes))*bytes:done;
+            const auto began=now();
+            const int n=UsbSystemBenchRead(at,reinterpret_cast<void*>(buffer.raw()),bytes);
+            const auto ended=now();
+            if(ended>=began && ended-began>maxNs)maxNs=ended-began;
+            if(n!=int(bytes)){error=n<0?n:-5;break;}
+            done+=n;
+        }
+        const auto end=now();
+        VmmFreePages(buffer,pages);
+        Reply r;r.text("{\"usb_system_bench_api\":1,");
+        r.field("bytes",done);r.text(",");r.field("requests",done/bytes);r.text(",");
+        r.field("duration_ns",end>=start?end-start:0);r.text(",");r.field("max_request_ns",maxNs);
+        r.text(",\"errno\":");r.number(uint64_t(-error));
+        if(timed && UsbSystemTiming(&after)) {
+            r.text(",");r.field("commands",after.commands-before.commands);
+            r.text(",");r.field("cbw_ns",after.command.totalNs-before.command.totalNs);
+            r.text(",");r.field("data_ns",after.data.totalNs-before.data.totalNs);
+            r.text(",");r.field("csw_ns",after.status.totalNs-before.status.totalNs);
+        }
+        r.text("}\n");r.send();return true;
+    }
     // Read-only sequential read benchmark of the boot stick (whole disk from
     // LBA 0, 4 MiB requests): sizes the live-store copy. Nothing is written.
     constexpr char benchPrefix[]="bridge hardware usb-bench ";
@@ -1670,7 +1798,8 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         const char* p=command+sizeof(benchPrefix)-1;uint32_t mib=0;
         if(!Decimal(p,mib) || *p || !mib || mib>4096){DebugChannelSend("{\"usb_bench_error\":\"Expected MiB 1..4096\"}\n");return true;}
         const int disk=BootStickDiskIndex();
-        char name[5]={'u','s','b',char('0'+(disk<0?0:disk)),0};
+        char name[6];
+        BootStickUsbDiskName(disk<0?0:unsigned(disk),name);
         Device* dev=disk>=0?DeviceFind(name):nullptr;
         if(!dev || !dev->ops || !dev->ops->read){DebugChannelSend("{\"usb_bench_error\":\"Boot stick disk not found\"}\n");return true;}
         constexpr uint64_t chunk=4ull<<20;

@@ -38,6 +38,8 @@
 #include "process.h"
 #include "scheduler.h"
 #include "wayland_provider.h"
+#include "display_output.h"
+#include "shell_output_layout.h"
 #include "apic.h"
 #include "spinlock.h"
 #include "compositor.h"
@@ -456,6 +458,54 @@ static bool DockReturnLocked(int idx, bool focus);
 static bool DockActivateWindowLocked(int idx);
 static bool DockKeepOutLocked(Window& w);
 static WmRect WorkAreaFor(const DesktopMetrics& m, uint32_t screenW, uint32_t screenH);
+static WmRect WorkAreaForOutput(const DesktopMetrics& m, const OutputRect& out, bool primary);
+
+// Outputs (display_output.h). Windows belong to the output holding their
+// centre (else the primary). Every output has its own taskbar and work
+// area; the side dock and cascade start on the primary output. With one
+// output every rect below is the screen at 0,0.
+static OutputRect WindowOuterRect(const Window& w)
+{
+    return {w.x, w.y, w.outerWidth(), w.outerHeight()};
+}
+static uint32_t WindowOutputIndex(const OutputLayout& layout, const Window& w)
+{
+    return OutputIndexForRect(layout, WindowOuterRect(w));
+}
+static OutputRect WindowOutputRect(const Window& w)
+{
+    if constexpr (!OutputMultiSupported) return CompositorPrimaryOutputRect();
+    OutputLayout layout;
+    CompositorGetOutputs(layout);
+    return OutputRectOrPrimary(layout, WindowOutputIndex(layout, w));
+}
+// The output holding a client rect's outer frame (saved/restore geometry).
+static OutputRect GeometryOutputRect(int x, int y, int clientW, int clientH, bool noChrome, const DesktopMetrics& m)
+{
+    if constexpr (!OutputMultiSupported) return CompositorPrimaryOutputRect();
+    OutputLayout layout;
+    CompositorGetOutputs(layout);
+    const int border = noChrome ? 0 : m.border(), title = noChrome ? 0 : m.title();
+    const OutputRect outer{x, y, uint32_t(clientW + 2 * border > 0 ? clientW + 2 * border : 0),
+                           uint32_t(clientH + title + 2 * border > 0 ? clientH + title + 2 * border : 0)};
+    return OutputRectOrPrimary(layout, OutputIndexForRect(layout, outer));
+}
+static WmRect WorkAreaForWindow(const Window& w)
+{
+    if constexpr (!OutputMultiSupported) return WorkAreaForOutput(w.desktopMetrics(), CompositorPrimaryOutputRect(), true);
+    OutputLayout layout;
+    CompositorGetOutputs(layout);
+    const uint32_t index = WindowOutputIndex(layout, w);
+    return WorkAreaForOutput(w.desktopMetrics(), OutputRectOrPrimary(layout, index), index == 0 || !layout.enabled(index));
+}
+// The side dock lives on the primary output.
+static void DockOutputDims(uint32_t* w, uint32_t* h)
+{
+    const OutputRect primary = CompositorPrimaryOutputRect();
+    *w = primary.w;
+    *h = primary.h;
+}
+static uint32_t g_shellOutput = 0;
 static bool DockPlaceLocked(int idx, const DesktopMetrics& m, uint32_t screenW, uint32_t screenH);
 static void DockLoadState();
 static void DockSaveState();
@@ -1227,7 +1277,7 @@ static void DestroyWindowLocked(int idx)
         if (bestIdx >= 0) FocusWindowLocked(bestIdx);
     }
     extern void CompositorMarkDirty();
-    CompositorMarkDirty();
+    CompositorMarkSceneChanged();
 }
 
 void WmDestroyWindow(int idx) {
@@ -1339,7 +1389,7 @@ static void FocusWindowLocked(int idx)
     }
 
     WmPushWmEvent(&g_windows[idx], WM_EVT_FOCUS_GAINED, 0, 0);
-    CompositorMarkDirty();
+    CompositorMarkSceneChanged();
     CompositorWake();
 }
 
@@ -1381,7 +1431,7 @@ static void SendToBackLocked(int idx)
     for (uint32_t i = 0; i < count; ++i)
         g_windows[sorted[i]].zOrder = (uint8_t)(i + 1);
     g_nextZOrder = (uint8_t)(count + 1);
-    CompositorMarkDirty();
+    CompositorMarkSceneChanged();
     CompositorWake();
 }
 
@@ -1439,10 +1489,10 @@ void WmSetClientSideDecoration(int idx, bool enable, bool captionOverlay,
     w.captionInsetTop = insetTop;
     w.captionHeight = captionHeight;
     w.captionStyle = captionStyle;
-    if (!modeChanged) { extern void CompositorMarkDirty(); CompositorMarkDirty(); return; }
+    if (!modeChanged) { CompositorMarkSceneChanged(); return; }
     // Mark compositor dirty so the chrome region repaints/clears next frame.
     extern void CompositorMarkDirty();
-    CompositorMarkDirty();
+    CompositorMarkSceneChanged();
     SerialPrintf("WM: window %d CSD=%d caption_overlay=%d inset=%u,%u height=%u\n", idx, (int)enable,
                  (int)captionOverlay, insetRight, insetTop, captionHeight);
 }
@@ -1461,7 +1511,7 @@ static void SetWindowPropertiesLocked(int idx, uint32_t mask, uint8_t opacity, u
     if ((mask & WM_PROP_BLUR)    && w.blurRadius != blurRadius) { w.blurRadius = blurRadius; changed = true; }
     if (!changed) return;
     extern void CompositorMarkDirty();
-    CompositorMarkDirty();
+    CompositorMarkSceneChanged();
 }
 
 void WmToggleFocusedWindowGlass()
@@ -1531,9 +1581,6 @@ static void SetMaximizedLocked(int idx, bool enable, bool acknowledge = false)
         return;
     }
 
-    uint32_t screenW, screenH;
-    CompositorGetPhysDims(&screenW, &screenH);
-
     uint16_t newW, newH;
     const auto oldState=w.state;
     const auto oldX=w.x,oldY=w.y;
@@ -1541,7 +1588,8 @@ static void SetMaximizedLocked(int idx, bool enable, bool acknowledge = false)
     const auto savedX=w.savedX,savedY=w.savedY;
     const auto savedW=w.savedW,savedH=w.savedH;
 
-    const WmRect area = WorkAreaFor(w.desktopMetrics(), screenW, screenH);
+    // The work area of the output holding the window.
+    const WmRect area = WorkAreaForWindow(w);
     if (w.state == WindowState::Normal)
     {
         const int64_t width = static_cast<int64_t>(area.w) - (w.noChrome ? 0 : 2 * w.metric(WM_BORDER_WIDTH));
@@ -1565,10 +1613,11 @@ static void SetMaximizedLocked(int idx, bool enable, bool acknowledge = false)
     }
     else
     {
-        // Restore
-        const auto restored = ReframeDesktopWindow(
+        // Restore, kept reachable on the output the saved geometry is on.
+        const OutputRect out = GeometryOutputRect(w.savedX, w.savedY, w.savedW, w.savedH, w.noChrome, w.desktopMetrics());
+        const auto restored = ReframeDesktopWindowOn(
             {w.savedX,w.savedY,w.savedW,w.savedH,w.noChrome},
-            w.desktopMetrics(),w.desktopMetrics(),screenW,WmDesktopHeight(screenH),
+            w.desktopMetrics(),w.desktopMetrics(),out.x,out.y,int(out.w),int(WmDesktopHeight(out.h)),
             !w.noChrome && w.focusable);
         w.x = static_cast<int16_t>(restored.x);
         w.y = static_cast<int16_t>(restored.y);
@@ -1610,8 +1659,9 @@ static bool SetFullscreenLocked(int idx, bool enable)
     // A page asking for fullscreen goes back to the desktop first.
     if (enable && w.docked && !DockReturnLocked(idx, false)) return false;
     if (enable) {
-        uint32_t screenW = 0, screenH = 0;
-        CompositorGetPhysDims(&screenW, &screenH);
+        // Fullscreen covers the output holding the window.
+        const OutputRect out = WindowOutputRect(w);
+        const uint32_t screenW = out.w, screenH = out.h;
         if (screenW < WM_MIN_WIDTH || screenH < WM_MIN_HEIGHT || screenW > 32767 || screenH > 32767) return false;
         w.fsState = w.state; w.fsX = w.x; w.fsY = w.y; w.fsW = w.clientW; w.fsH = w.clientH;
         w.fsNoChrome = w.noChrome; w.fsCaptionOverlay = w.captionOverlay;
@@ -1619,7 +1669,8 @@ static bool SetFullscreenLocked(int idx, bool enable)
         w.fsCaptionHeight = w.captionHeight; w.fsCaptionStyle = w.captionStyle;
         w.noChrome = true; w.captionOverlay = false;
         w.captionInsetRight = w.captionInsetTop = w.captionHeight = 0; w.captionStyle = 0;
-        w.x = 0; w.y = 0; w.fullscreen = true; w.state = WindowState::Maximized;
+        w.x = static_cast<int16_t>(out.x); w.y = static_cast<int16_t>(out.y);
+        w.fullscreen = true; w.state = WindowState::Maximized;
         if (!ResizeWindowLocked(idx, static_cast<uint16_t>(screenW), static_cast<uint16_t>(screenH))) {
             w.fullscreen = false; w.state = w.fsState; w.x = w.fsX; w.y = w.fsY;
             w.noChrome = w.fsNoChrome; w.captionOverlay = w.fsCaptionOverlay;
@@ -1650,28 +1701,56 @@ static bool SetFullscreenLocked(int idx, bool enable)
     SerialPrintf("WM: window %d '%s' fullscreen=%d %ux%u at %d,%d\n", idx, w.title, (int)enable,
                  w.clientW, w.clientH, w.x, w.y);
     extern void CompositorMarkDirty();
-    CompositorMarkDirty();
+    CompositorMarkSceneChanged();
     return true;
 }
 
 bool WmSetFullscreen(int idx, bool enable) { VfbGuard guard; return SetFullscreenLocked(idx, enable); }
 
-bool WmTaskbarHidden()
+uint32_t WmShellOutput() { return __atomic_load_n(&g_shellOutput, __ATOMIC_ACQUIRE); }
+
+// A press on another output's taskbar moves the shell there: transient
+// popups and the launcher close on the old output first. Pinned popups
+// follow the shell to the new output.
+void WmShellSelectOutput(uint32_t output)
 {
-    if (!g_wmActive || WmLauncherVisible() || WmTaskbarSystemPopupModal()) return false;
+    if (output >= OutputMax || output == WmShellOutput()) return;
+    if (WmLauncherVisible()) WmLauncherClose();
+    WmTaskbarPopupDismiss();
+    __atomic_store_n(&g_shellOutput, output, __ATOMIC_RELEASE);
+    extern void CompositorMarkDirty();
+    CompositorMarkDirty();
+}
+
+// A focused fullscreen window hides the taskbar of its own output. The shell
+// output's launcher or a modal popup keeps that taskbar shown.
+bool WmTaskbarHiddenOn(uint32_t output)
+{
+    if (!g_wmActive) return false;
+    if (output == WmShellOutput() && (WmLauncherVisible() || WmTaskbarSystemPopupModal())) return false;
     const int idx = __atomic_load_n(&g_focusedIdx, __ATOMIC_ACQUIRE);
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return false;
     const Window& w = g_windows[idx];
     if (!w.proc || !w.visible || w.minimized) return false;
-    if (w.fullscreen) return true;
+    OutputRect out{};
+    if constexpr (!OutputMultiSupported) {
+        if (w.fullscreen) return true;
+        out = CompositorPrimaryOutputRect();
+    } else {
+        OutputLayout layout;
+        CompositorGetOutputs(layout);
+        if (layout.multi() && WindowOutputIndex(layout, w) != output) return false;
+        if (w.fullscreen) return true;
+        out = OutputRectOrPrimary(layout, output);
+    }
     // A chrome-less window placed over the whole output is fullscreen too:
     // the Xwayland WM shipped before WM_SET_FULLSCREEN sizes EWMH fullscreen
     // windows this way. Maximized windows stop at the taskbar, so never match.
-    uint32_t screenW = 0, screenH = 0;
-    CompositorGetPhysDims(&screenW, &screenH);
-    return w.noChrome && screenW && screenH && w.x <= 0 && w.y <= 0 &&
-           int64_t(w.x) + w.clientW >= int64_t(screenW) && int64_t(w.y) + w.clientH >= int64_t(screenH);
+    return w.noChrome && out.w && out.h && w.x <= out.x && w.y <= out.y &&
+           int64_t(w.x) + w.clientW >= out.right() && int64_t(w.y) + w.clientH >= out.bottom();
 }
+
+bool WmTaskbarHidden() { return WmTaskbarHiddenOn(WmShellOutput()); }
 
 uint32_t WmTaskbarTop(uint32_t screenH) { return WmTaskbarHidden() ? screenH : WmDesktopHeight(screenH); }
 
@@ -1688,7 +1767,7 @@ static void MoveWindowLocked(int idx, int16_t newX, int16_t newY)
     DockKeepOutLocked(w); // floating windows cannot be placed under a pinned dock
     w.proc->fbDestX=w.clientX();w.proc->fbDestY=w.clientY();
     extern void CompositorMarkDirty();
-    CompositorMarkDirty();
+    CompositorMarkSceneChanged();
 }
 
 void WmMoveWindow(int idx, int16_t newX, int16_t newY)
@@ -1788,7 +1867,7 @@ static bool ResizeWindowLocked(int idx, uint16_t newClientW, uint16_t newClientH
         // upscale handles it.
     }
     extern void CompositorMarkDirty();
-    CompositorMarkDirty();
+    CompositorMarkSceneChanged();
     return true;
 }
 
@@ -1803,17 +1882,26 @@ bool WmResizeWindow(int idx,uint16_t newClientW,uint16_t newClientH)
 static void ReframeDesktopWindowsLocked(const DesktopMetrics* next,
                                         uint32_t sw,uint32_t sh,bool displayChanged)
 {
-    const int desktopH=sh>static_cast<uint32_t>(next->taskbar()) ? sh-next->taskbar() : 0;
+    // Each window is laid out on its own output (with one output: sw x sh).
+    OutputLayout layout;
+    CompositorGetOutputs(layout);
+    const bool multi=layout.multi();
+    const uint32_t dockW=multi?layout.rect(0).w:sw,dockH=multi?layout.rect(0).h:sh;
     for (auto& w:g_windows) {
         if (!w.proc) continue;
+        const uint32_t outIndex=multi?WindowOutputIndex(layout,w):0;
+        const OutputRect out=multi?OutputRectOrPrimary(layout,outIndex):OutputRect{0,0,sw,sh};
+        const bool primary=outIndex==0 || !layout.enabled(outIndex);
+        const int ox=out.x,oy=out.y,ow=static_cast<int>(out.w);
+        const int desktopH=out.h>static_cast<uint32_t>(next->taskbar()) ? out.h-next->taskbar() : 0;
         const auto& before=w.desktopMetrics();
         if (w.fullscreen) {
-            const auto saved=ReframeDesktopWindow({w.fsX,w.fsY,w.fsW,w.fsH,w.fsNoChrome},before,*next,sw,desktopH,false);
+            const auto saved=ReframeDesktopWindowOn({w.fsX,w.fsY,w.fsW,w.fsH,w.fsNoChrome},before,*next,ox,oy,ow,desktopH,false);
             w.fsX=static_cast<int16_t>(saved.x);w.fsY=static_cast<int16_t>(saved.y);
             w.metrics=next;
-            if (displayChanged && sw>=WM_MIN_WIDTH && sh>=WM_MIN_HEIGHT && sw<=32767 && sh<=32767) {
+            if (displayChanged && out.w>=WM_MIN_WIDTH && out.h>=WM_MIN_HEIGHT && out.w<=32767 && out.h<=32767) {
                 if (w.fsState==WindowState::Maximized) {
-                    const auto area=WorkAreaFor(*next,sw,sh);
+                    const auto area=WorkAreaForOutput(*next,out,primary);
                     const int border=w.fsNoChrome ? 0 : next->border();
                     const int title=w.fsNoChrome ? 0 : next->title();
                     const int width=area.w-2*border,height=area.h-title-2*border;
@@ -1822,30 +1910,30 @@ static void ReframeDesktopWindowsLocked(const DesktopMetrics* next,
                         w.fsW=static_cast<uint16_t>(width);w.fsH=static_cast<uint16_t>(height);
                     }
                 }
-                (void)ResizeWindowLocked(static_cast<int>(&w-g_windows),uint16_t(sw),uint16_t(sh));
+                (void)ResizeWindowLocked(static_cast<int>(&w-g_windows),uint16_t(out.w),uint16_t(out.h));
             }
             continue;
         }
         if (w.docked) {
             // The page follows the sidebar; the floating geometry it returns
             // to is reframed for its own chrome.
-            auto saved=ReframeDesktopWindow({w.dkX,w.dkY,w.dkW,w.dkH,w.dkNoChrome},before,*next,sw,desktopH,false);
-            auto restore=ReframeDesktopWindow({w.savedX,w.savedY,w.savedW,w.savedH,w.dkNoChrome},before,*next,sw,desktopH,false);
+            auto saved=ReframeDesktopWindowOn({w.dkX,w.dkY,w.dkW,w.dkH,w.dkNoChrome},before,*next,ox,oy,ow,desktopH,false);
+            auto restore=ReframeDesktopWindowOn({w.savedX,w.savedY,w.savedW,w.savedH,w.dkNoChrome},before,*next,ox,oy,ow,desktopH,false);
             w.dkX=static_cast<int16_t>(saved.x);w.dkY=static_cast<int16_t>(saved.y);
             w.savedX=static_cast<int16_t>(restore.x);w.savedY=static_cast<int16_t>(restore.y);
             w.metrics=next;
-            DockPlaceLocked(static_cast<int>(&w-g_windows),*next,sw,sh);
+            DockPlaceLocked(static_cast<int>(&w-g_windows),*next,dockW,dockH);
             w.proc->fbDestX=w.clientX();w.proc->fbDestY=w.clientY();
             continue;
         }
-        auto rect=ReframeDesktopWindow({w.x,w.y,w.clientW,w.clientH,w.noChrome},before,*next,sw,desktopH,!w.noChrome && w.focusable);
-        auto saved=ReframeDesktopWindow({w.savedX,w.savedY,w.savedW,w.savedH,w.noChrome},before,*next,sw,desktopH,false);
+        auto rect=ReframeDesktopWindowOn({w.x,w.y,w.clientW,w.clientH,w.noChrome},before,*next,ox,oy,ow,desktopH,!w.noChrome && w.focusable);
+        auto saved=ReframeDesktopWindowOn({w.savedX,w.savedY,w.savedW,w.savedH,w.noChrome},before,*next,ox,oy,ow,desktopH,false);
         w.metrics=next;w.x=static_cast<int16_t>(rect.x);w.y=static_cast<int16_t>(rect.y);
         w.savedX=static_cast<int16_t>(saved.x);w.savedY=static_cast<int16_t>(saved.y);
         if (w.state==WindowState::Maximized) {
             const int border=w.noChrome ? 0 : next->border();
             const int title=w.noChrome ? 0 : next->title();
-            const WmRect area=WorkAreaFor(*next,sw,sh);
+            const WmRect area=WorkAreaForOutput(*next,out,primary);
             const int width=area.w-2*border,height=area.h-title-2*border;
             if (width>=static_cast<int>(WM_MIN_WIDTH) && height>=static_cast<int>(WM_MIN_HEIGHT) && width<=65535 && height<=65535 && ResizeWindowLocked(static_cast<int>(&w-g_windows),width,height)) {
                 w.x=static_cast<int16_t>(area.x);w.y=static_cast<int16_t>(area.y);
@@ -1917,7 +2005,7 @@ static void MinimizeWindowLocked(int idx)
         if (bestIdx >= 0) FocusWindowLocked(bestIdx);
     }
     extern void CompositorMarkDirty();
-    CompositorMarkDirty();
+    CompositorMarkSceneChanged();
 }
 
 static void RestoreWindowLocked(int idx)
@@ -1930,7 +2018,7 @@ static void RestoreWindowLocked(int idx)
     SerialPrintf("WM: restored window %d '%s'\n", idx, w.title);
     FocusWindowLocked(idx);
     extern void CompositorMarkDirty();
-    CompositorMarkDirty();
+    CompositorMarkSceneChanged();
 }
 
 void WmMinimizeWindow(int idx) { VfbGuard guard;MinimizeWindowLocked(idx); }
@@ -3122,9 +3210,11 @@ WmCreateWindowResult WmCreateWindowForProcess(Process* proc,
     // and X11 utility windows). Interactive chrome resize minima are separate.
 
     // Cascade placement: each new window offset 30px from the prior count.
+    // It starts on the primary output.
     static int s_cascade = 0;
-    int16_t winX = static_cast<int16_t>(40 + (s_cascade % 8) * 30);
-    int16_t winY = static_cast<int16_t>(40 + (s_cascade % 8) * 30);
+    const OutputRect primary = CompositorPrimaryOutputRect();
+    int16_t winX = static_cast<int16_t>(primary.x + 40 + (s_cascade % 8) * 30);
+    int16_t winY = static_cast<int16_t>(primary.y + 40 + (s_cascade % 8) * 30);
     s_cascade++;
 
     int idx = CreateWindowLocked(proc, winX, winY, clientW, clientH, title, 1,
@@ -3277,7 +3367,7 @@ int WmResizeVfbForProcess(Process* proc, uint32_t wmId,
     outResult->vfbStride = w->vfbStride;
     // Client-accepted sizes can differ from the WM offer. Invalidate cached
     // caption geometry along with publishing the replacement client buffer.
-    CompositorMarkDirty();CompositorWake();
+    CompositorMarkSceneChanged();CompositorWake();
     return 0;
 }
 
@@ -3758,7 +3848,7 @@ bool WmSetAppIdById(Process* proc, uint32_t wmId, const char* appId)
     WmStrCopy(w->appId, appId, sizeof(w->appId));
     LauncherReadGuard catalog;
     RefreshWebAppTitle(*w, catalog.get());
-    CompositorMarkDirty();
+    CompositorMarkSceneChanged();
     CompositorWake();
     return true;
 }
@@ -3785,7 +3875,7 @@ void WmSetTitleById(Process* proc, uint32_t wmId, const char* title)
     WmStrCopy(w->title, title, sizeof(w->title));
     LauncherReadGuard catalog;
     RefreshWebAppTitle(*w, catalog.get());
-    CompositorMarkDirty();
+    CompositorMarkSceneChanged();
     CompositorWake();
 }
 

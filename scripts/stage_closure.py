@@ -174,10 +174,13 @@ def main():
                           help="push the generated cache with dell_deploy.py, without a host HTTP server")
     parser.add_argument("--cache-key", required=True, type=Path, help="Nix binary-cache signing key")
     parser.add_argument("--plan-key", required=True, type=Path, help="Ed25519 private key in PEM format")
+    parser.add_argument("--sequence", type=int, help="Monotonic sequence for a USB selected profile")
     parser.add_argument("--mirror-upstream", action="store_true",
                         help="publish upstream paths too for a device that can reach only the build host")
     args = parser.parse_args()
 
+    if args.sequence is not None and (not args.profile_selection or not 0 < args.sequence < (1 << 63)):
+        parser.error("--sequence requires a selected profile and an integer in 1..2^63-1")
     for key in (args.cache_key, args.plan_key):
         verify_private_key(key)
     launcher_ids = None
@@ -207,6 +210,8 @@ def main():
     cache_url = args.cache_url.rstrip("/") if args.cache_url else None
     plan = generate_plan(profile, extras, cache_url, args.mirror_upstream, packages,
                          launcher_ids=launcher_ids)
+    if args.sequence is not None:
+        plan["sequence"] = args.sequence
     publish_cache(plan["closure"], output / "cache", args.cache_key.resolve(), args.mirror_upstream)
     document = output / "stage-plan.json"
     document.write_text(json.dumps(plan, sort_keys=True, separators=(",", ":")) + "\n")

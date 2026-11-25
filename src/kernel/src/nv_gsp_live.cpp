@@ -1,0 +1,711 @@
+// GSP-RM M1 live path (BROOK_NV_GSP): the gated bridge verbs that run the
+// host-tested sequences in nv_gsp/nv_gsp_p3.h on the real card.
+//
+//   bridge hardware nv-gsp status    read-only: marker, firmware hashes, VT-d,
+//                                    PCI command, preflight registers, latches
+//   bridge hardware nv-gsp p3        P3: FWSEC-FRTS alone (once per boot)
+//   bridge hardware nv-gsp fini      P3b: FWSEC-SB, then booter_unload (once per boot)
+//   bridge hardware nv-gsp trace     the BAR0 access log of the last p3/fini
+//
+// Gates: built only with BROOK_NV_GSP; every verb needs /etc/nv-gsp = "1\n".
+// p3 and fini refuse before the first GPU write unless the firmware set named
+// by /etc/nv-gsp-firmware matches the pinned sizes and SHA-256 (ChipOps), the
+// VBIOS FWSEC image read from PROM matches the one the Linux reference ran,
+// and the RunP3 checks pass. Then (in order) the DMA buffer is flushed, PCI bus
+// mastering is enabled (command 0x0003 -> 0x0007) and the falcon runs. A
+// failure is captured (CPUCTL, mailboxes, 0x1438, WPR2, TRACEPC) and never
+// retried in the same boot. The direct nv-disp path and the GOP are not
+// touched: only GSP/SEC2 falcon registers are written.
+#include "nv_gsp_live.h"
+#include "nv_gsp/nv_gsp_p3.h"
+#include "nv_gsp/nv_gsp_rm.h"
+#include "pci.h"
+#include "acpi.h"
+#include "boot_resource_map.h"
+#include "memory/virtual_memory.h"
+#include "memory/physical_memory.h"
+#include "net.h"
+#include "kprintf.h"
+#include "tsc_clock.h"
+#include "apic.h"
+#include "string.h"
+#include "vfs.h"
+#include "../../shared/update/payload.h"
+
+namespace brook {
+namespace {
+using namespace nvgsp;
+
+// ------------------------------------------------------------------ reply
+struct Out {
+    char t[6000]; uint32_t n = 0;
+    void raw(const char* s) { while (*s && n + 1 < sizeof(t)) t[n++] = *s++; t[n] = 0; }
+    void dec(uint64_t v) { char b[24]; int i = 0; do { b[i++] = char('0' + v % 10); v /= 10; } while (v);
+        while (i && n + 1 < sizeof(t)) t[n++] = b[--i]; t[n] = 0; }
+    void hex(uint64_t v) { raw("\"0x"); char b[17]; int i = 0; do { b[i++] = "0123456789abcdef"[v & 15]; v >>= 4; } while (v);
+        while (i && n + 1 < sizeof(t)) t[n++] = b[--i]; t[n] = 0; raw("\""); }
+    void str(const char* s) { raw("\""); raw(s); raw("\""); }
+    void k(const char* key) { if (n && t[n - 1] != '{' && t[n - 1] != '[') raw(","); raw("\""); raw(key); raw("\":"); }
+    void kh(const char* key, uint64_t v) { k(key); hex(v); }
+    void kd(const char* key, uint64_t v) { k(key); dec(v); }
+    void ks(const char* key, const char* s) { k(key); str(s); }
+    void kb(const char* key, bool b) { k(key); raw(b ? "true" : "false"); }
+    void send() { raw("}\n"); DebugChannelSend(t); }
+};
+
+uint64_t NowUs() { return TscClockAvailable() ? TscClockReadNs() / 1000 : ApicTickCount() * 1000; }
+
+// ------------------------------------------------------------- BAR0 bus
+// Single-page UC mappings that are never remapped (the caller may migrate
+// between CPUs; invlpg is local), plus a contiguous UC alias for the PROM.
+struct Bar0Bus {
+    static constexpr uint32_t kSlots = 48;
+    uint64_t bar0 = 0;
+    VirtualAddress va[kSlots]{};
+    uint64_t page[kSlots]{};
+    uint32_t used = 0;
+    bool failed = false;
+    const char* phase = "";
+    const char* step = "";
+    // access log for `nv-gsp trace`: consecutive identical reads collapse
+    struct Rec { char op; uint32_t off, val, count; const char* phase; const char* step; };
+    static constexpr uint32_t kLog = 1024;
+    Rec log[kLog];
+    uint32_t logN = 0, dropped = 0;
+    bool rec = false;
+    void Note(char op, uint32_t off, uint32_t v) {
+        if (!rec) return;
+        // PIO bursts (IMEMD/DMEMD ports) collapse too: count + last value
+        const uint32_t port = off & 0xfff;
+        if (op == 'W' && (port == 0x184 || port == 0x1c4) && logN && log[logN - 1].op == 'W' && log[logN - 1].off == off) {
+            ++log[logN - 1].count; log[logN - 1].val = v; return;
+        }
+        if (op == 'R' && logN && log[logN - 1].op == 'R' && log[logN - 1].off == off && log[logN - 1].val == v) {
+            ++log[logN - 1].count; return;
+        }
+        if (logN >= kLog) { ++dropped; return; }
+        log[logN++] = Rec{op, off, v, 1, phase, step};
+    }
+    volatile uint32_t* Map(uint32_t off) {
+        const uint64_t p = (bar0 + off) & ~0xfffull;
+        for (uint32_t i = 0; i < used; ++i) if (page[i] == p) return reinterpret_cast<volatile uint32_t*>(va[i].raw() + (off & 0xfff));
+        if (used >= kSlots) { failed = true; return nullptr; }
+        VirtualAddress v = VmmAllocPages(1, VMM_WRITABLE | VMM_NO_EXEC, MemTag::Device, KernelPid);
+        if (!v) { failed = true; return nullptr; }
+        const auto leaf = VmmDetachPage(KernelPageTable, v); if (leaf) PmmFreePage(VmmLeafPhysical(leaf));
+        __asm__ volatile("invlpg (%0)" ::"r"(v.raw()) : "memory");
+        if (!VmmMapPage(KernelPageTable, v, PhysicalAddress(p), VMM_WRITABLE | VMM_NO_EXEC | VMM_CACHE_DISABLE | VMM_WRITE_THRU,
+                        MemTag::Device, KernelPid)) { failed = true; return nullptr; }
+        va[used] = v; page[used] = p; ++used;
+        return reinterpret_cast<volatile uint32_t*>(v.raw() + (off & 0xfff));
+    }
+    uint32_t rd32(uint32_t off) { volatile uint32_t* r = Map(off); const uint32_t v = r ? *r : 0xffffffffu; Note('R', off, v); return v; }
+    void wr32(uint32_t off, uint32_t v) { volatile uint32_t* r = Map(off); Note('W', off, v); if (r) *r = v; }
+    void udelay(uint32_t us) { const uint64_t end = NowUs() + us; while (NowUs() < end) __asm__ volatile("pause"); }
+    uint64_t now_us() { return NowUs(); }
+    void mark(const char* p, const char* s) { phase = p; step = s; }
+};
+Bar0Bus g_bus;   // .bss
+
+// ---------------------------------------------------------- live state
+struct Gpu { uint8_t bus = 0, dev = 0, fn = 0; uint64_t bar0 = 0; bool ok = false; };
+volatile uint32_t g_busy = 0;
+bool g_p3Done = false, g_finiDone = false, g_p4Done = false;   // latched at arm (the first write)
+bool g_rmRunning = false;                    // GSP-RM reached INIT_DONE this boot
+DmaBuf g_dma;                                 // 16 contiguous pages, kept for the boot
+constexpr uint32_t kDmaPages = 16;
+uint8_t* g_rom = nullptr; uint32_t g_romBytes = 0;     // PROM copy (VMALLOC)
+constexpr uint32_t kRomMax = 512 * 1024;
+uint8_t g_romSha[32]{}; bool g_romRead = false;
+uint16_t g_cmdBefore = 0, g_cmdAfter = 0;
+uint64_t g_runUs = 0;
+// The FWSEC descriptor + ucode span of this card's VBIOS that the 25 Nov
+// Linux reference ran (vbios-nouveau.rom 0x3f500..0x4964c, 41292 B), and the
+// whole 333824-byte image (sha256 0f94b4a7...). FWSEC must match.
+constexpr uint8_t kFwsecSpanSha[32] = {
+    0xba,0x96,0xbe,0xce,0xdc,0x9a,0x48,0x23,0xd7,0xf9,0x34,0xc6,0xc0,0x89,0xf3,0x93,
+    0x61,0x6e,0x3a,0x46,0x28,0xba,0x4c,0xd9,0xe4,0x51,0xef,0x3f,0xd1,0xd0,0x37,0x91};
+constexpr uint8_t kRomSha[32] = {
+    0x0f,0x94,0xb4,0xa7,0xc7,0x46,0xdf,0x84,0x3b,0xa4,0x7e,0x6d,0xfe,0x13,0x44,0x3f,
+    0xf6,0xf6,0x0a,0xd2,0x46,0xd5,0x7f,0xa0,0x98,0x5c,0x2d,0x8d,0xc3,0xe0,0xba,0x4c};
+
+bool FindGpu(Gpu& g) {
+    for (uint32_t i = 0; i < PciBootInventoryCount(); ++i) {
+        PciBootEntry e{};
+        if (PciBootInventoryRead(i, &e) && e.device.vendorId == 0x10de && e.device.classCode == 0x03 && e.device.fn == 0) {
+            g.bus = e.device.bus; g.dev = e.device.dev; g.fn = e.device.fn;
+            const uint32_t b0 = PciConfigRead32(g.bus, g.dev, g.fn, 0x10);
+            const uint16_t cmd = PciConfigRead16(g.bus, g.dev, g.fn, 4);
+            g.bar0 = b0 & ~0xfull;
+            BootResourceClassification c{};
+            constexpr uint32_t allowed = (1u << uint32_t(MemoryType::Reserved)) | (1u << uint32_t(MemoryType::Mmio));
+            g.ok = !(b0 & 1) && g.bar0 && (cmd & 2) && AcpiClassifyBootRange(g.bar0, 16u << 20, c) && !(c.types & ~allowed);
+            return g.ok;
+        }
+    }
+    return false;
+}
+
+bool MarkerSet(const char* path) {
+    auto* f = VfsOpen(path, VFS_O_STREAM); if (!f) return false;
+    VnodeStat st{}; uint64_t off = 0; char t[2]{};
+    const bool ok = !VfsStat(f, &st) && !st.isDir && st.size == 2 && VfsRead(f, t, 2, &off) == 2 && t[0] == '1' && t[1] == '\n';
+    VfsRelease(f); return ok;
+}
+
+// ------------------------------------------------------------ firmware
+// /etc/nv-gsp-firmware: one line, the firmware root (".../lib/firmware"):
+// "/boot/nvgsp" when the set rides in the signed initrd, or a /nix/store
+// path once the desktop store carries nix/nv-gsp-firmware.nix.
+struct FwState {
+    char root[160]{};
+    bool record = false;
+    uint8_t ok[kFwCount]{};          // 1 = size + sha256 match
+    uint64_t bytes[kFwCount]{};
+    bool all = false;
+};
+FwState g_fw;
+bool ReadRecord(char* out, uint32_t cap) {
+    auto* f = VfsOpen("/etc/nv-gsp-firmware", VFS_O_STREAM); if (!f) return false;
+    uint64_t off = 0; char t[160]{};
+    const int n = VfsRead(f, t, sizeof(t) - 1, &off); VfsRelease(f);
+    if (n < 3 || t[0] != '/') return false;
+    uint32_t i = 0;
+    for (; i < uint32_t(n) && t[i] != '\n'; ++i) {
+        const char c = t[i];
+        const bool okc = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '/' || c == '.' ||
+                         c == '-' || c == '_' || c == '+';
+        if (!okc || i + 1 >= cap) return false;
+        if (c == '.' && i && t[i - 1] == '.') return false;   // no ".."
+        out[i] = c;
+    }
+    if (i == uint32_t(n) || i + 1 != uint32_t(n)) return false;   // exactly one line
+    out[i] = 0; return true;
+}
+void Join(char* out, uint32_t cap, const char* a, const char* b) {
+    uint32_t n = 0; for (const char* p = a; *p && n + 1 < cap; ++p) out[n++] = *p;
+    if (n + 1 < cap) out[n++] = '/';
+    for (const char* p = b; *p && n + 1 < cap; ++p) out[n++] = *p;
+    out[n] = 0;
+}
+// Stream-hash one file; copy it into `dst` when given (cap >= bytes).
+bool CheckFile(const ChipOps& c, uint32_t role, uint8_t* dst, uint32_t cap) {
+    char path[256]; Join(path, sizeof(path), g_fw.root, c.fw[role].path);
+    auto* f = VfsOpen(path, VFS_O_STREAM); if (!f) return false;
+    VnodeStat st{}; bool ok = !VfsStat(f, &st) && !st.isDir && st.size == c.fw[role].bytes;
+    g_fw.bytes[role] = st.size;
+    if (ok && dst && cap < c.fw[role].bytes) ok = false;
+    static uint8_t chunk[64 * 1024];
+    BrookSha256 h; BrookShaInit(&h);
+    uint64_t off = 0, total = 0;
+    while (ok) {
+        const int n = VfsRead(f, chunk, sizeof(chunk), &off);
+        if (n < 0) { ok = false; break; }
+        if (!n) break;
+        if (total + uint64_t(n) > c.fw[role].bytes) { ok = false; break; }
+        if (dst) memcpy(dst + total, chunk, uint32_t(n));
+        BrookShaAdd(&h, chunk, BrookUpdateSize(n));
+        total += uint64_t(n);
+    }
+    VfsRelease(f);
+    if (!ok || total != c.fw[role].bytes) return false;
+    uint8_t d[32]; BrookShaFinish(&h, d);
+    return BrookUpdateEqual(d, c.fw[role].sha256, 32);
+}
+bool VerifyFirmware(const ChipOps& c) {
+    g_fw = FwState{};
+    g_fw.record = ReadRecord(g_fw.root, sizeof(g_fw.root));
+    if (!g_fw.record) return false;
+    bool all = true;
+    for (uint32_t r = 0; r < kFwCount; ++r) { g_fw.ok[r] = CheckFile(c, r, nullptr, 0) ? 1 : 0; all = all && g_fw.ok[r]; }
+    g_fw.all = all;
+    return all;
+}
+uint8_t* LoadFile(const ChipOps& c, uint32_t role) {
+    const uint32_t pages = (c.fw[role].bytes + 4095) / 4096;
+    VirtualAddress v = VmmAllocPages(pages, VMM_WRITABLE | VMM_NO_EXEC, MemTag::Device, KernelPid);
+    if (!v) return nullptr;
+    uint8_t* p = reinterpret_cast<uint8_t*>(v.raw());
+    if (!CheckFile(c, role, p, pages * 4096)) { VmmFreePages(v, pages); return nullptr; }
+    return p;
+}
+
+// --------------------------------------------------------------- VBIOS
+// The full ROM from the PROM window (BAR0 0x300000, read-only, contiguous UC
+// alias), then the image walk; FWSEC must equal the reference image.
+bool ReadRom(const Gpu& g) {
+    if (g_romRead) return true;
+    constexpr uint32_t pages = kRomMax / 4096;
+    VirtualAddress alias = VmmAllocPages(pages, VMM_WRITABLE | VMM_NO_EXEC, MemTag::Device, KernelPid);
+    VirtualAddress copy = VmmAllocPages(pages, VMM_WRITABLE | VMM_NO_EXEC, MemTag::Device, KernelPid);
+    if (!alias || !copy) return false;
+    for (uint32_t i = 0; i < pages; ++i) {
+        const VirtualAddress v(alias.raw() + i * 4096ull);
+        const PhysicalAddress old = VmmVirtToPhys(KernelPageTable, v);
+        VmmUnmapPage(KernelPageTable, v); if (old) PmmFreePage(old);
+        if (!VmmMapPage(KernelPageTable, v, PhysicalAddress(g.bar0 + 0x300000 + i * 4096ull),
+                        VMM_NO_EXEC | VMM_CACHE_DISABLE | VMM_WRITE_THRU, MemTag::Device, KernelPid)) return false;
+    }
+    const volatile uint32_t* src = reinterpret_cast<const volatile uint32_t*>(alias.raw());
+    uint8_t* dst = reinterpret_cast<uint8_t*>(copy.raw());
+    for (uint32_t i = 0; i < kRomMax / 4; ++i) { const uint32_t w = src[i]; memcpy(dst + i * 4, &w, 4); }
+    if (dst[0] != 0x55 || dst[1] != 0xaa) return false;
+    // Extent = end of the last image of the walk.
+    Vbios vb;
+    if (ParseVbios(Span{dst, kRomMax}, &vb) != FwStatus::Ok || !vb.count) return false;
+    const VbiosImage& last = vb.images[vb.count - 1];
+    g_romBytes = last.base + last.size;
+    if (g_romBytes > kRomMax || g_romBytes < 0x10000) return false;
+    g_rom = dst;
+    BrookSha256 h; BrookShaInit(&h); BrookShaAdd(&h, dst, g_romBytes); BrookShaFinish(&h, g_romSha);
+    g_romRead = true;
+    return true;
+}
+bool FwsecMatches(const FwsecImage& f) {
+    const uint8_t* a = g_rom + f.desc_addr;
+    const uint8_t* b = f.ucode.p + f.ucode.n;
+    if (a < g_rom || b > g_rom + g_romBytes || b <= a) return false;
+    uint8_t d[32]; BrookSha256 h; BrookShaInit(&h); BrookShaAdd(&h, a, BrookUpdateSize(b - a)); BrookShaFinish(&h, d);
+    return BrookUpdateEqual(d, kFwsecSpanSha, 32);
+}
+
+// --------------------------------------------------------------- VT-d
+// Read-only: each DRHD's global status (0x1c) bit 31 = translation enabled.
+// The falcon DMAs to physical addresses, so translation must be off.
+struct Vtd { uint32_t units = 0, enabled = 0, unread = 0; bool table = false; };
+Vtd ReadVtd() {
+    Vtd v;
+    static uint8_t dmar[4096];
+    uint32_t bytes = 0;
+    if (!AcpiUniqueDmarCopy(dmar, sizeof(dmar), bytes) || bytes < 48) return v;
+    v.table = true;
+    for (uint32_t o = 48; o + 4 <= bytes;) {
+        uint16_t type, len; memcpy(&type, dmar + o, 2); memcpy(&len, dmar + o + 2, 2);
+        if (len < 4 || o + len > bytes) break;
+        if (type == 0 && len >= 16) {
+            uint64_t base; memcpy(&base, dmar + o + 8, 8);
+            ++v.units;
+            BootResourceClassification c{};
+            constexpr uint32_t allowed = (1u << uint32_t(MemoryType::Reserved)) | (1u << uint32_t(MemoryType::Mmio));
+            if (!base || (base & 0xfff) || !AcpiClassifyBootRange(base, 4096, c) || !c.types || (c.types & ~allowed)) { ++v.unread; }
+            else {
+                VirtualAddress w = VmmAllocPages(1, VMM_WRITABLE | VMM_NO_EXEC, MemTag::Device, KernelPid);
+                if (!w) { ++v.unread; }
+                else {
+                    const auto leaf = VmmDetachPage(KernelPageTable, w); if (leaf) PmmFreePage(VmmLeafPhysical(leaf));
+                    __asm__ volatile("invlpg (%0)" ::"r"(w.raw()) : "memory");
+                    if (VmmMapPage(KernelPageTable, w, PhysicalAddress(base), VMM_NO_EXEC | VMM_CACHE_DISABLE | VMM_WRITE_THRU,
+                                   MemTag::Device, KernelPid)) {
+                        const uint32_t gsts = reinterpret_cast<volatile uint32_t*>(w.raw())[0x1c / 4];
+                        if (gsts & 0x80000000u) ++v.enabled;
+                        (void)VmmDetachPage(KernelPageTable, w);
+                        __asm__ volatile("invlpg (%0)" ::"r"(w.raw()) : "memory");
+                    } else ++v.unread;
+                }
+            }
+        }
+        o += len;
+    }
+    return v;
+}
+
+// ---------------------------------------------------------------- DMA
+bool EnsureDma() {
+    if (g_dma.cpu) return true;
+    const PhysicalAddress p = PmmAllocPages(kDmaPages, MemTag::Device, KernelPid);
+    if (!p) return false;
+    // FBIF PHYS_SYS_NCOH: physical addresses; keep well inside the falcon's reach.
+    if (p.raw() + kDmaPages * 4096ull > (1ull << 39)) return false;   // leaked on purpose (never)
+    g_dma.cpu = reinterpret_cast<uint8_t*>(PhysToVirt(p).raw());
+    g_dma.bus = p.raw();
+    g_dma.bytes = kDmaPages * 4096;
+    memset(g_dma.cpu, 0, g_dma.bytes);
+    return true;
+}
+// Non-coherent DMA: write the patched image back to memory before the falcon reads it.
+void FlushDma() {
+    for (size_t o = 0; o < g_dma.bytes; o += 64) __asm__ volatile("clflush (%0)" ::"r"(g_dma.cpu + o) : "memory");
+    __asm__ volatile("mfence" ::: "memory");
+}
+
+// ----------------------------------------------------------- reporting
+void Diag(Out& o, const FalconDiag& d) {
+    o.k("diag"); o.raw("{");
+    o.kh("cpuctl", d.cpuctl); o.kh("mbox0", d.mbox0); o.kh("mbox1", d.mbox1); o.kh("sctl", d.sctl);
+    o.kh("dmactl", d.dmactl); o.kh("hwcfg", d.hwcfg); o.kh("frts_err_1438", d.frts_err); o.kh("sb_err_1454", d.sb_err);
+    o.kh("wpr2_lo", d.wpr2_lo); o.kh("wpr2_hi", d.wpr2_hi); o.kh("riscv_cpuctl", d.riscv_cpuctl); o.kh("tidx", d.tidx);
+    o.k("tracepc"); o.raw("[");
+    for (uint32_t i = 0; i < d.trace_n; ++i) { if (i) o.raw(","); o.hex(d.trace[i]); }
+    o.raw("]}");
+}
+void Pre(Out& o, const Preflight& p) {
+    o.k("pre"); o.raw("{");
+    o.kh("boot0", p.boot0); o.kh("devinit", p.devinit); o.kh("devinit_scratch", p.devinit_scratch);
+    o.kh("vga_625f04", p.vga_ws); o.kh("fb_100ce0", p.fb_size_reg); o.kh("wpr2_lo", p.wpr2_lo); o.kh("wpr2_hi", p.wpr2_hi);
+    o.kh("gsp_cpuctl", p.gsp_cpuctl); o.kh("sec2_cpuctl", p.sec2_cpuctl); o.kh("riscv_cpuctl", p.gsp_riscv_cpuctl);
+    o.ks("status", BootStatusName(p.status));
+    o.raw("}");
+}
+void Layout(Out& o, const FbLayout& L) {
+    o.k("layout"); o.raw("{");
+    o.kh("fb", L.fb_size); o.kh("vga", L.vga_workspace.addr); o.kh("frts", L.frts.addr); o.kh("frts_size", L.frts.size);
+    o.kh("boot", L.boot.addr); o.kh("elf", L.elf.addr); o.kh("heap", L.heap.addr); o.kh("wpr2", L.wpr2.addr);
+    o.kh("non_wpr_heap", L.non_wpr_heap.addr); o.kd("reserved_mib", L.reserved_top >> 20);
+    o.kh("expect_wpr2_lo", uint32_t((L.frts.addr >> 12) << 4));
+    o.kh("expect_wpr2_hi", uint32_t(((L.frts.end() - 0x20000) >> 12) << 4));
+    o.raw("}");
+}
+void Firmware(Out& o, const ChipOps& c) {
+    o.k("firmware"); o.raw("{"); o.kb("record", g_fw.record); o.ks("root", g_fw.root); o.kb("all_ok", g_fw.all);
+    for (uint32_t r = 0; r < kFwCount; ++r) o.kb(FwRoleName(r), g_fw.ok[r]);
+    o.ks("version", c.fw_version); o.raw("}");
+}
+
+// Common front: marker, GPU, firmware, VBIOS, VT-d, DMA. Fills P3Inputs.
+struct Front { Gpu g; const ChipOps* chip = nullptr; P3Inputs in; Vtd vtd; bool fwsec_ok = false; const char* refuse = nullptr; };
+uint8_t* g_acr = nullptr;
+bool Prepare(Front& f, bool needUnload, uint8_t** unload) {
+    if (!FindGpu(f.g)) { f.refuse = "no NVIDIA display function with BAR0 decode"; return false; }
+    g_bus.bar0 = f.g.bar0;
+    f.chip = ChipForBoot0(g_bus.rd32(0));
+    if (!f.chip) { f.refuse = "unsupported chip"; return false; }
+    if (!VerifyFirmware(*f.chip)) { f.refuse = "firmware set missing or hash mismatch"; return false; }
+    if (!g_acr && !(g_acr = LoadFile(*f.chip, kFwAcrBl))) { f.refuse = "acr bl load failed"; return false; }
+    if (needUnload && !(*unload = LoadFile(*f.chip, kFwBooterUnload))) { f.refuse = "booter_unload load failed"; return false; }
+    if (!ReadRom(f.g)) { f.refuse = "PROM read or image walk failed"; return false; }
+    {
+        Vbios vb; FwsecImage fw;
+        if (ParseVbios(Span{g_rom, g_romBytes}, &vb) != FwStatus::Ok || ParseFwsec(vb, &fw) != FwStatus::Ok) {
+            f.refuse = "no FWSEC in the PROM image"; return false;
+        }
+        f.fwsec_ok = FwsecMatches(fw);
+        if (!f.fwsec_ok) { f.refuse = "FWSEC image differs from the reference VBIOS"; return false; }
+    }
+    f.vtd = ReadVtd();
+    if (f.vtd.enabled) { f.refuse = "VT-d translation enabled"; return false; }
+    if (!EnsureDma()) { f.refuse = "no low contiguous DMA buffer"; return false; }
+    f.in.vbios = Span{g_rom, g_romBytes};
+    f.in.acr_bl = Span{g_acr, f.chip->fw[kFwAcrBl].bytes};
+    // Layout below FRTS needs the ELF/bootloader sizes; P3 itself uses only FRTS.
+    f.in.elf_size = 28528288;   // gsp-570.144 .fwimage (pinned file: the M0 parser reads it in P4)
+    f.in.boot_size = 0x1000;
+    return true;
+}
+void FrontOut(Out& o, const Front& f) {
+    o.kh("bar0", f.g.bar0);
+    if (f.chip) { o.ks("chip", f.chip->name); Firmware(o, *f.chip); }
+    o.kb("rom_read", g_romRead); o.kd("rom_bytes", g_romBytes);
+    o.kb("rom_matches_reference", g_romRead && BrookUpdateEqual(g_romSha, kRomSha, 32));
+    o.kb("fwsec_matches_reference", f.fwsec_ok);
+    o.k("vtd"); o.raw("{"); o.kb("dmar", f.vtd.table); o.kd("units", f.vtd.units); o.kd("translating", f.vtd.enabled);
+    o.kd("unread", f.vtd.unread); o.raw("}");
+    if (g_dma.cpu) o.kh("dma", g_dma.bus);
+}
+// Arm: after every check, before the first write. Latch, flush, bus master.
+bool Arm(const Gpu& g, bool* latch) {
+    *latch = true;
+    FlushDma();
+    g_cmdBefore = PciConfigRead16(g.bus, g.dev, g.fn, 4);
+    if (!(g_cmdBefore & 2)) return false;
+    if (!(g_cmdBefore & 4)) PciConfigWrite16(g.bus, g.dev, g.fn, 4, uint16_t(g_cmdBefore | 4));
+    g_cmdAfter = PciConfigRead16(g.bus, g.dev, g.fn, 4);
+    g_runUs = NowUs();
+    return (g_cmdAfter & 6) == 6;
+}
+
+void Status() {
+    Out o; o.raw("{\"nv_gsp\":\"status\"");
+    Front f;
+    o.kb("marker", MarkerSet("/etc/nv-gsp"));
+    o.kb("p3_done", g_p3Done); o.kb("fini_done", g_finiDone);
+    if (FindGpu(f.g)) {
+        g_bus.bar0 = f.g.bar0;
+        o.kh("pci_cmd", PciConfigRead16(f.g.bus, f.g.dev, f.g.fn, 4));
+        f.chip = ChipForBoot0(g_bus.rd32(0));
+        if (f.chip) {
+            (void)VerifyFirmware(*f.chip);
+            const Preflight p = RunPreflight(g_bus, *f.chip);   // reads only
+            Pre(o, p);
+            o.kh("frts_err_1438", g_bus.rd32(f.chip->reg_frts_err)); o.kh("sb_err_1454", g_bus.rd32(f.chip->reg_sb_err));
+            o.kh("sec2_boot_1180f8", g_bus.rd32(f.chip->reg_booter_boot_status));
+        }
+        f.vtd = ReadVtd();
+    }
+    FrontOut(o, f);
+    o.send();
+}
+
+void P3() {
+    Out o; o.raw("{\"nv_gsp\":\"p3\"");
+    if (g_p3Done || g_finiDone) { o.ks("refused", "already ran this boot (no retry)"); o.send(); return; }
+    Front f;
+    if (!Prepare(f, false, nullptr)) { o.ks("refused", f.refuse); FrontOut(o, f); o.send(); return; }
+    g_bus.logN = 0; g_bus.dropped = 0; g_bus.rec = true;
+    KPrintf("nv-gsp: P3 FWSEC-FRTS starting (dma %lx)\n", (unsigned long)g_dma.bus);
+    const P3Result r = RunP3(g_bus, *f.chip, f.in, g_dma, [&] { return Arm(f.g, &g_p3Done); });
+    g_bus.rec = false;
+    const uint64_t us = g_p3Done ? NowUs() - g_runUs : 0;
+    o.ks("stage", r.stage); o.ks("status", BootStatusName(r.status)); o.ks("fw", FwStatusName(r.fw));
+    o.kb("wrote", r.wrote); o.kh("pci_cmd_before", g_cmdBefore); o.kh("pci_cmd_after", g_cmdAfter); o.kd("run_us", us);
+    Pre(o, r.pre);
+    if (r.layout.fb_size) Layout(o, r.layout);
+    o.kd("fwsec_version", r.fwsec.version); o.kh("fwsec_ucode_bytes", r.fwsec.ucode.n);
+    o.k("run"); o.raw("{"); o.ks("step", r.run.step); o.kh("mbox0", r.run.mbox0); o.kh("mbox1", r.run.mbox1);
+    o.kh("err", r.run.err); o.kh("wpr2_lo", r.run.wpr2_lo); o.kh("wpr2_hi", r.run.wpr2_hi); o.raw("}");
+    if (r.diag_valid) Diag(o, r.diag);
+    o.kd("trace_records", g_bus.logN); o.kd("trace_dropped", g_bus.dropped);
+    FrontOut(o, f);
+    KPrintf("nv-gsp: P3 %s at %s: mbox0 %x err %x WPR2 %08x/%08x (%lu us)\n", BootStatusName(r.status), r.stage,
+            r.run.mbox0, r.run.err, r.run.wpr2_lo, r.run.wpr2_hi, (unsigned long)us);
+    o.send();
+}
+
+RmFiniResult RmUnload();   // P4 section below
+void Fini() {
+    Out o; o.raw("{\"nv_gsp\":\"fini\"");
+    if (g_finiDone) { o.ks("refused", "already ran this boot (no retry)"); o.send(); return; }
+    Front f; uint8_t* unload = nullptr;
+    if (!Prepare(f, true, &unload)) { o.ks("refused", f.refuse); FrontOut(o, f); o.send(); return; }
+    const uint32_t ubytes = f.chip->fw[kFwBooterUnload].bytes;
+    const uint32_t pages = (ubytes + 4095) / 4096;
+    VirtualAddress img = VmmAllocPages(pages, VMM_WRITABLE | VMM_NO_EXEC, MemTag::Device, KernelPid);
+    if (!img) { o.ks("refused", "no booter image buffer"); o.send(); return; }
+    g_bus.logN = 0; g_bus.dropped = 0; g_bus.rec = true;
+    KPrintf("nv-gsp: P3b fini (FWSEC-SB, booter_unload) starting\n");
+    RmFiniResult rmf;
+    const bool rm = g_rmRunning;
+    if (rm) {   // GSP-RM is up (p4 this boot): UNLOADING_GUEST_DRIVER first, then the P3b sequence
+        g_finiDone = true;
+        rmf = RmUnload();
+        g_rmRunning = false;
+    }
+    const FiniResult r = (rm && rmf.status != BootStatus::Ok) ? FiniResult{} :
+        RunFini(g_bus, *f.chip, f.in, Span{unload, ubytes}, g_dma, reinterpret_cast<uint8_t*>(img.raw()),
+                pages * 4096, [&] { return Arm(f.g, &g_finiDone); }, !rm);
+    g_bus.rec = false;
+    if (rm) {
+        o.k("rm_unload"); o.raw("{"); o.ks("stage", rmf.stage); o.ks("status", BootStatusName(rmf.status));
+        o.kd("q", uint32_t(rmf.q)); o.kb("halted", rmf.halted); o.kh("mbox0", rmf.mbox0_after); o.raw("}");
+    }
+    const uint64_t us = g_finiDone ? NowUs() - g_runUs : 0;
+    o.ks("stage", r.stage); o.ks("status", BootStatusName(r.status)); o.ks("fw", FwStatusName(r.fw)); o.kb("wrote", r.wrote);
+    o.kh("pci_cmd_before", g_cmdBefore); o.kh("pci_cmd_after", g_cmdAfter); o.kd("run_us", us);
+    o.kh("wpr2_lo_before", r.wpr2_lo_before); o.kh("wpr2_hi_before", r.wpr2_hi_before);
+    o.k("sb"); o.raw("{"); o.ks("step", r.sb.step); o.kh("mbox0", r.sb.mbox0); o.kh("err", r.sb.err);
+    o.kh("wpr2_lo", r.sb.wpr2_lo); o.kh("wpr2_hi", r.sb.wpr2_hi); o.raw("}");
+    o.k("unload"); o.raw("{"); o.ks("step", r.unload.step); o.kh("debug", r.unload.debug); o.kh("mbox0", r.unload.mbox0);
+    o.kh("mbox1", r.unload.mbox1); o.kh("wpr2_lo", r.unload.wpr2_lo); o.kh("wpr2_hi", r.unload.wpr2_hi); o.raw("}");
+    if (r.diag_valid) Diag(o, r.diag);
+    o.kd("trace_records", g_bus.logN);
+    FrontOut(o, f);
+    KPrintf("nv-gsp: P3b %s at %s: SB err %x, unload mbox0 %x, WPR2 %08x/%08x -> %08x/%08x\n", BootStatusName(r.status),
+            r.stage, r.sb.err, r.unload.mbox0, r.wpr2_lo_before, r.wpr2_hi_before, r.unload.wpr2_lo, r.unload.wpr2_hi);
+    o.send();
+}
+
+// ------------------------------------------------------------------ P4
+// GSP-RM to INIT_DONE. All sysmem comes from contiguous PMM runs (direct
+// map, physical = bus address); nothing is freed while RM may use it.
+struct RmState {
+    RmObjects objs;
+    RpcChannel* ch = nullptr;
+    uint8_t* rx = nullptr;
+    uint32_t rxcap = 0;
+    // every region handed to the GPU, for the one-time flush after building
+    static constexpr uint32_t kMaxRegions = 8192;
+    DmaRegion regions[kMaxRegions];
+    uint32_t nregions = 0;
+    bool overflow = false;
+    uint64_t wait_deadline_us = 0;
+    uint32_t waits = 0;
+};
+RmState* g_rm = nullptr;
+bool RmAlloc(uint32_t bytes, DmaRegion* r) {
+    const uint32_t pages = (bytes + 4095) / 4096;
+    const PhysicalAddress p = PmmAllocPages(pages, MemTag::Device, KernelPid);
+    if (!p) return false;
+    if (p.raw() + uint64_t(pages) * 4096 > (1ull << 39)) return false;
+    r->cpu = reinterpret_cast<uint8_t*>(PhysToVirt(p).raw());
+    r->bus = p.raw();
+    r->bytes = pages * 4096;
+    memset(r->cpu, 0, r->bytes);
+    if (g_rm->nregions < RmState::kMaxRegions) g_rm->regions[g_rm->nregions++] = *r; else g_rm->overflow = true;
+    return true;
+}
+void FlushRange(const uint8_t* p, uint32_t n) {
+    for (uint32_t o = 0; o < n; o += 64) __asm__ volatile("clflush (%0)" ::"r"(p + o) : "memory");
+    __asm__ volatile("mfence" ::: "memory");
+}
+struct RmSync {   // CPU writes -> memory before a doorbell / boot step (cmdq region)
+    void operator()() { if (g_rm && g_rm->objs.q.base) FlushRange(g_rm->objs.q.cmdq(), kQueueBytes); }
+};
+struct RmWait {   // msgq poll: drop stale lines, short pause, bounded by the deadline
+    bool operator()() {
+        ++g_rm->waits;
+        FlushRange(g_rm->objs.q.msgq(), kQueueBytes);
+        g_bus.udelay(20);
+        return NowUs() < g_rm->wait_deadline_us;
+    }
+};
+RmSync g_rmSync;
+RmFiniResult RmUnload() {
+    RmWait w; g_rm->wait_deadline_us = NowUs() + 5000000;
+    return RunRmUnload(g_bus, *ChipForBoot0(g_bus.rd32(0)), g_rm->ch, g_rm->rx, g_rm->rxcap, w, g_rmSync);
+}
+bool PciIdentityOf(const Gpu& g, PciIdentity* p) {
+    p->bar0 = g.bar0;
+    const uint32_t b1l = PciConfigRead32(g.bus, g.dev, g.fn, 0x14), b1h = PciConfigRead32(g.bus, g.dev, g.fn, 0x18);
+    const uint32_t b3l = PciConfigRead32(g.bus, g.dev, g.fn, 0x1c), b3h = PciConfigRead32(g.bus, g.dev, g.fn, 0x20);
+    p->bar1 = (uint64_t(b1h) << 32) | (b1l & ~0xfu);
+    p->bar3 = (uint64_t(b3h) << 32) | (b3l & ~0xfu);
+    const uint32_t id = PciConfigRead32(g.bus, g.dev, g.fn, 0), ss = PciConfigRead32(g.bus, g.dev, g.fn, 0x2c);
+    p->vendor = uint16_t(id); p->device = uint16_t(id >> 16);
+    p->subvendor = uint16_t(ss); p->subdevice = uint16_t(ss >> 16);
+    p->revision = uint8_t(PciConfigRead32(g.bus, g.dev, g.fn, 8));
+    p->bus = g.bus; p->dev = g.dev; p->fn = g.fn;
+    return p->bar1 && p->bar3 && p->vendor == 0x10de;
+}
+template <class T> T* NewIn(uint64_t bytes) {
+    VirtualAddress v = VmmAllocPages((bytes + 4095) / 4096, VMM_WRITABLE | VMM_NO_EXEC, MemTag::Device, KernelPid);
+    if (!v) return nullptr;
+    memset(reinterpret_cast<void*>(v.raw()), 0, size_t(bytes));
+    return reinterpret_cast<T*>(v.raw());
+}
+
+void P4() {
+    Out o; o.raw("{\"nv_gsp\":\"p4\"");
+    if (g_p3Done || g_p4Done || g_finiDone) { o.ks("refused", "a falcon run already happened this boot (no retry)"); o.send(); return; }
+    Front f; uint8_t* unloadBlob = nullptr;
+    if (!Prepare(f, false, &unloadBlob)) { o.ks("refused", f.refuse); FrontOut(o, f); o.send(); return; }
+    const ChipOps& c = *f.chip;
+    PciIdentity pci;
+    if (!PciIdentityOf(f.g, &pci)) { o.ks("refused", "PCI identity/BARs"); o.send(); return; }
+    // firmware: the ELF (28.5 MB), the RISC-V bootloader and booter_load, hash-checked again on load
+    uint8_t* elfBlob = LoadFile(c, kFwGsp);
+    uint8_t* rblBlob = LoadFile(c, kFwBootloader);
+    uint8_t* loadBlob = LoadFile(c, kFwBooterLoad);
+    if (!elfBlob || !rblBlob || !loadBlob) { o.ks("refused", "firmware load failed"); o.send(); return; }
+    GspElf elf; RiscvBootloader rbl; BooterImage booter;
+    if (ParseGspElf(Span{elfBlob, c.fw[kFwGsp].bytes}, &elf) != FwStatus::Ok ||
+        ParseRiscvBootloader(Span{rblBlob, c.fw[kFwBootloader].bytes}, &rbl) != FwStatus::Ok ||
+        ParseBooter(Span{loadBlob, c.fw[kFwBooterLoad].bytes}, &booter) != FwStatus::Ok) {
+        o.ks("refused", "firmware parse failed"); o.send(); return;
+    }
+    uint8_t* bimg = NewIn<uint8_t>(booter.image.n);
+    if (!g_rm) g_rm = NewIn<RmState>(sizeof(RmState));
+    if (!bimg || !g_rm || !BuildBooterImage(booter, bimg, booter.image.n)) { o.ks("refused", "no memory"); o.send(); return; }
+    g_rm->ch = NewIn<RpcChannel>(sizeof(RpcChannel));
+    g_rm->rxcap = 2 * kMaxElemBytes;
+    g_rm->rx = NewIn<uint8_t>(g_rm->rxcap);
+    if (!g_rm->ch || !g_rm->rx) { o.ks("refused", "no memory"); o.send(); return; }
+    f.in.elf_size = elf.fwimage.n;
+    f.in.boot_size = rbl.payload.n;
+    auto prepare = [&](const FbLayout& L) -> const char* {
+        auto alloc = [](uint32_t bytes, DmaRegion* r) { return RmAlloc(bytes, r); };
+        if (const char* e = BuildRmObjects(alloc, elf, rbl, L, &g_rm->objs)) return e;
+        if (g_rm->overflow) return "region list overflow";
+        for (uint32_t i = 0; i < g_rm->nregions; ++i) FlushRange(g_rm->regions[i].cpu, g_rm->regions[i].bytes);
+        return nullptr;
+    };
+    g_bus.logN = 0; g_bus.dropped = 0; g_bus.rec = true;
+    KPrintf("nv-gsp: P4 GSP-RM boot starting (FWSEC-FRTS, booter_load, INIT_DONE)\n");
+    RmWait wait;
+    g_rm->wait_deadline_us = ~0ull;
+    uint64_t armUs = 0;
+    auto arm = [&] {
+        if (!Arm(f.g, &g_p4Done)) return false;
+        armUs = NowUs();
+        g_rm->wait_deadline_us = armUs + 15000000;   // INIT_DONE took ~0.9 s after booter under Linux
+        return true;
+    };
+    const P4Result r = RunP4(g_bus, c, f.in, g_dma, pci, booter, bimg, &g_rm->objs, g_rm->ch, g_rm->rx, g_rm->rxcap,
+                             prepare, arm, wait, g_rmSync);
+    g_bus.rec = false;
+    g_rmRunning = r.init_done;
+    o.ks("stage", r.stage); o.ks("status", BootStatusName(r.status)); o.kd("q", uint32_t(r.q)); o.kb("wrote", r.p3.wrote);
+    o.kh("pci_cmd_before", g_cmdBefore); o.kh("pci_cmd_after", g_cmdAfter);
+    Pre(o, r.p3.pre);
+    if (r.p3.layout.fb_size) Layout(o, r.p3.layout);
+    o.k("fwsec"); o.raw("{"); o.ks("step", r.p3.run.step); o.kh("mbox0", r.p3.run.mbox0); o.kh("err", r.p3.run.err);
+    o.kh("wpr2_lo", r.p3.run.wpr2_lo); o.kh("wpr2_hi", r.p3.run.wpr2_hi); o.raw("}");
+    o.k("booter"); o.raw("{"); o.ks("step", r.booter.step); o.kh("debug", r.booter.debug); o.kh("mbox0", r.booter.mbox0);
+    o.kh("mbox1", r.booter.mbox1); o.kh("wpr2_lo", r.booter.wpr2_lo); o.kh("wpr2_hi", r.booter.wpr2_hi);
+    o.kd("t_us", r.t_booter_us); o.raw("}");
+    o.k("rm"); o.raw("{"); o.kb("init_done", r.init_done); o.kd("t_init_done_us", r.t_init_done_us);
+    o.kd("seq_runs", r.seq_runs); o.ks("seq_status", SeqStatusName(r.seq.status)); o.kd("seq_commands", r.seq.commands);
+    o.kd("seq_fail_index", r.seq.fail_index); o.kd("events", r.events); o.kd("nocat", r.nocat);
+    o.kd("libos_print", r.libos_print); o.kd("other_events", r.other_events); o.kh("last_other_fn", r.last_other_fn);
+    o.kd("waits", g_rm->waits); o.kd("static_len", r.static_len); o.kb("static_ok", r.static_ok);
+    o.k("static_head"); o.raw("\""); for (uint32_t i = 0; i < 32; ++i) { const char* hx = "0123456789abcdef";
+        char b[3] = {hx[r.static_head[i] >> 4], hx[r.static_head[i] & 15], 0}; o.raw(b); } o.raw("\"");
+    o.kd("sysmem_kib", g_rm->objs.dma_bytes >> 10); o.kh("libos", g_rm->objs.libos.bus); o.kh("meta", g_rm->objs.meta.bus);
+    o.kh("shm", g_rm->objs.shm.bus); o.raw("}");
+    o.kh("mbox0_now", g_bus.rd32(c.gsp_falcon + kFMbox0)); o.kh("riscv_cpuctl_now", g_bus.rd32(c.gsp_riscv + kRiscvCpuctl));
+    if (r.diag_valid) Diag(o, r.diag);
+    o.kd("trace_records", g_bus.logN); o.kd("trace_dropped", g_bus.dropped);
+    FrontOut(o, f);
+    KPrintf("nv-gsp: P4 %s at %s: booter mbox0 %x, WPR2 %08x/%08x, INIT_DONE %d at %lu us, seq %s, static %u B\n",
+            BootStatusName(r.status), r.stage, r.booter.mbox0, r.booter.wpr2_lo, r.booter.wpr2_hi, r.init_done ? 1 : 0,
+            (unsigned long)r.t_init_done_us, SeqStatusName(r.seq.status), r.static_len);
+    o.send();
+}
+
+// LOGINIT/LOGINTR/LOGRM: the put pointer and 1536 raw bytes at `off`
+// (libos-encoded records; decode host-side against the ELF's log sections).
+void Log(const char* which, uint32_t off) {
+    Out o; o.raw("{\"nv_gsp\":\"log\"");
+    const int id = !strcmp(which, "init") ? kLogInit : !strcmp(which, "intr") ? kLogIntr : !strcmp(which, "rm") ? kLogRm : -1;
+    if (id < 0 || !g_rm || !g_rm->objs.log[id].cpu || off >= kLogBytes) { o.ks("error", "Expected init|intr|rm <offset> after p4"); o.send(); return; }
+    const DmaRegion& b = g_rm->objs.log[id];
+    FlushRange(b.cpu, kLogBytes);
+    uint64_t put; memcpy(&put, b.cpu, 8);
+    o.ks("buffer", which); o.kd("put", put); o.kd("offset", off);
+    const uint32_t n = kLogBytes - off < 1536 ? kLogBytes - off : 1536;
+    o.k("hex"); o.raw("\"");
+    for (uint32_t i = 0; i < n; ++i) { const char* hx = "0123456789abcdef"; char c2[3] = {hx[b.cpu[off + i] >> 4], hx[b.cpu[off + i] & 15], 0}; o.raw(c2); }
+    o.raw("\"");
+    o.send();
+}
+
+// One JSON line per record, in the M0 raw-log schema (scripts/nv_gsp_trace_diff.py
+// --brook); repeated identical reads carry "count".
+void Trace(uint32_t from) {
+    for (uint32_t i = from; i < g_bus.logN && i < from + 400; ++i) {
+        const auto& a = g_bus.log[i];
+        Out o; o.raw("{\"op\":\""); char op[2] = {a.op, 0}; o.raw(op); o.raw("\",\"off\":"); o.dec(a.off);
+        o.raw(",\"val\":"); o.dec(a.val); o.raw(",\"phase\":"); o.str(a.phase); o.raw(",\"step\":"); o.str(a.step);
+        if (a.count > 1) { o.raw(",\"count\":"); o.dec(a.count); }
+        o.send();
+    }
+    Out o; o.raw("{\"nv_gsp\":\"trace\""); o.kd("records", g_bus.logN); o.kd("from", from);
+    o.kd("dropped", g_bus.dropped); o.send();
+}
+
+}  // namespace
+
+bool NvGspHandle(const char* command) {
+    constexpr char prefix[] = "bridge hardware nv-gsp ";
+    if (strncmp(command, prefix, sizeof(prefix) - 1)) return false;
+    const char* verb = command + sizeof(prefix) - 1;
+    if (!MarkerSet("/etc/nv-gsp")) { DebugChannelSend("{\"nv_gsp\":\"error\",\"msg\":\"/etc/nv-gsp marker not set\"}\n"); return true; }
+    if (__atomic_exchange_n(&g_busy, 1u, __ATOMIC_ACQUIRE)) { DebugChannelSend("{\"nv_gsp\":\"error\",\"msg\":\"busy\"}\n"); return true; }
+    if (!strcmp(verb, "status")) Status();
+    else if (!strcmp(verb, "p3")) P3();
+    else if (!strcmp(verb, "fini")) Fini();
+    else if (!strcmp(verb, "p4")) P4();
+    else if (!strncmp(verb, "log ", 4)) {
+        char which[8]{}; uint32_t i = 0; const char* p = verb + 4;
+        while (*p && *p != ' ' && i < 7) which[i++] = *p++;
+        uint32_t off = 0; while (*p == ' ') ++p;
+        for (; (*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f'); ++p) off = off * 16 + uint32_t(*p <= '9' ? *p - '0' : *p - 'a' + 10);
+        Log(which, off);
+    }
+    else if (!strncmp(verb, "trace", 5) && (!verb[5] || verb[5] == ' ')) {
+        uint32_t from = 0; for (const char* p = verb + 5; *p; ++p) if (*p >= '0' && *p <= '9') from = from * 10 + uint32_t(*p - '0');
+        Trace(from);
+    } else DebugChannelSend("{\"nv_gsp\":\"error\",\"msg\":\"Expected status|p3|fini|trace [from]\"}\n");
+    __atomic_store_n(&g_busy, 0u, __ATOMIC_RELEASE);
+    return true;
+}
+
+}  // namespace brook

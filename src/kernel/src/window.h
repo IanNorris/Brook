@@ -397,6 +397,13 @@ bool WmSetFullscreen(int idx, bool enable);
 // True while the focused window is fullscreen and no launcher or volume popup
 // is open: the taskbar is neither drawn nor hit-tested.
 bool WmTaskbarHidden();
+// Every output has its own taskbar (shell_output_layout.h). The launcher and
+// taskbar popups are shown on one output at a time, the shell output, which
+// a press on an output's taskbar selects. WmTaskbarHidden() is
+// WmTaskbarHiddenOn(WmShellOutput()).
+bool WmTaskbarHiddenOn(uint32_t output);
+uint32_t WmShellOutput();
+void WmShellSelectOutput(uint32_t output);
 
 // Top row of the taskbar for input routing: the screen height while hidden,
 // otherwise WmDesktopHeight. Layout (maximize, work area) uses WmDesktopHeight.

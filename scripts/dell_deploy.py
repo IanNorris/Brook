@@ -12,7 +12,7 @@ provisioned independently of deployment.
 Usage (repo root, BROOK_ROOT set to the checkout holding the bridge session):
   python3 scripts/dell_deploy.py --session S --pair build/dell/pair-X --output build/dell/deploy-X
 """
-import argparse, hashlib, json, subprocess, sys, tempfile, uuid
+import argparse, hashlib, json, re, subprocess, sys, tempfile, uuid
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -24,7 +24,51 @@ def sha(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
-def stage_profile(args, *, bridge=None, bulk_port=1236):
+def profile_stdout(bridge, session, job, status):
+    """Read the complete JSON capability document within the guest's ring limit."""
+    parts = []
+    offset = 0
+    while True:
+        stream = status['stdout']
+        if stream.get('gaps') or stream.get('read_error') or stream['next_offset'] > 65536:
+            raise ValueError('Incomplete USB profile inventory reply')
+        parts.append(stream['text'])
+        if stream['eof']:
+            return ''.join(parts)
+        if stream['next_offset'] <= offset:
+            raise ValueError('USB profile inventory did not advance')
+        offset = stream['next_offset']
+        status = bridge.job(session, job, stdout_offset=offset, output_limit=16384)
+
+
+def usb_store_diff(bridge, journal, session, capabilities, closure):
+    capacity = capabilities.get('selected_store', {})
+    if capacity.get('transfer_shares_space') is not True:
+        raise ValueError('USB profile uploads must share the admitted /nix filesystem')
+    if not isinstance(capacity.get('store_names'), list):
+        raise ValueError('USB profile helper did not supply a store inventory')
+    present = set(capacity['store_names']) & closure.keys()
+    if not capacity.get('store_inventory_complete'):
+        # A large existing store can exceed the capability job's output ring.
+        # Query just the remaining signed names in bounded read-only jobs.
+        names = sorted(set(closure) - present)
+        script = 'for path; do if [[ -e /nix/store/$path || -L /nix/store/$path ]]; then printf "%s\n" "$path"; fi; done'
+        for i in range(0, len(names), 24):
+            batch = names[i:i + 24]
+            job = uuid.uuid4().hex
+            bridge.guest_run(session, job, ['/boot/bin/bash', '-c', script, 'store-inventory', *batch],
+                             cwd='/tmp', uid=1000, wait_s=2)
+            status = journal.wait_job(session, job, lambda reply: reply.get('state') == 'completed',
+                                      timeout=60)
+            reported = set(profile_stdout(bridge, session, job, status).splitlines())
+            if status.get('exit', {}).get('code') or not reported <= set(batch):
+                raise ValueError('Invalid USB profile store inventory')
+            present.update(reported)
+        capacity['store_names'] = sorted(present)
+    return set(closure) - present
+
+
+def stage_profile(args, *, bridge=None, bulk_port=1236, usb_system=False):
     a = args
     sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools/vm_bridge')]
     from hardware import Hardware
@@ -51,9 +95,12 @@ def stage_profile(args, *, bridge=None, bulk_port=1236):
     journal.save(state='prepared', action=action, profile_transaction_id=tx,
                  profile_job_id=job, session=a.session, guest_boot_id=guest['guest_boot_id'],
                  endpoint=[guest['host'], guest['port']],
-                 pair_manifest_sha256=sha(a.pair / 'build-manifest.json'),
+                 pair_manifest_sha256=None if usb_system else sha(a.pair / 'build-manifest.json'),
+                 destination='usb-system' if usb_system else 'dell',
                  profile_files={path.name: sha(path) for path in files})
-    arguments = ['/nix/bin/nix', 'stage-profile', action, tx]
+    runtime = ['/boot/bin/bash', '/boot/USBSTAGE.RC'] if usb_system else ['/nix/bin/nix', 'stage-profile']
+    arguments = [*runtime, action, tx]
+    terminal = True
     try:
         with ExitStack() as resources:
             bundles = []
@@ -62,19 +109,42 @@ def stage_profile(args, *, bridge=None, bulk_port=1236):
                 if hashlib.sha256(document).hexdigest() != journal.receipt['profile_files'][files[0].name]:
                     raise ValueError('Stage plan changed before preflight')
                 plan = json.loads(document)
+                if usb_system:
+                    from usb_profile_plan import checked_plan
+                    plan, verified, _ = checked_plan(a.profile_plan, a.profile_plan_public_key)
+                    if verified != journal.receipt['profile_files'][files[0].name]:
+                        raise ValueError('Stage plan changed before verification')
                 push_cache = a.push_profile_cache or plan['cache']['brook'] is None
                 selected = plan['format'] == 3
                 if push_cache or selected:
                     probe = uuid.uuid4().hex
                     journal.save(state='profile_cache_probe_dispatched', cache_probe_job_id=probe)
-                    bridge.guest_run(a.session, probe, ['/nix/bin/nix', 'stage-profile', 'cache-capabilities'],
+                    bridge.guest_run(a.session, probe, [*runtime, 'cache-capabilities'],
                                      cwd='/tmp', uid=1000, wait_s=2)
                     status = journal.wait_job(a.session, probe, lambda job: job.get('state') == 'completed',
-                                              timeout=60)
+                                              timeout=60, **({'output_limit': 16384} if usb_system else {}))
                     journal.save(cache_probe_job=status)
                     if status.get('exit', {}).get('code') != 0:
                         raise ValueError('Guest stage helper lacks bridge cache capability; refresh it first')
-                    capabilities = json.loads(status['stdout']['text'])
+                    capabilities = json.loads(profile_stdout(bridge, a.session, probe, status)
+                                              if usb_system else status['stdout']['text'])
+                    if usb_system:
+                        manifest = json.loads(a.boot_set_manifest.read_text())
+                        key = sha(a.profile_plan_public_key)
+                        if (capabilities.get('usb_profile_api') != 1 or
+                                manifest.get('usb_system', {}).get('plan_key_sha256') != key or
+                                capabilities.get('plan_key_sha256') != key or
+                                capabilities.get('guest_key_sha256') != key):
+                            raise ValueError('USB profile key or installed staging API differs from the boot manifest')
+                        reserve = 1 << 30
+                        capacity = capabilities['selected_store']
+                        unit = capacity['block_bytes']
+                        blocks = (reserve + unit - 1) // unit
+                        if capacity['free_blocks'] < blocks or capabilities['free_bytes'] < reserve:
+                            raise ValueError('USB staging requires its 1 GiB free-space reserve')
+                        capacity['free_blocks'] -= blocks
+                        capacity['free_bytes'] = capacity['free_blocks'] * unit
+                        capabilities['free_bytes'] -= reserve
                     if selected:
                         api = capabilities.get('selected_profile_api')
                         if type(api) is not int or api != 1:
@@ -85,7 +155,18 @@ def stage_profile(args, *, bridge=None, bulk_port=1236):
                     from profile_cache_bundle import pack_cache, validate_push_capacity
                     work = Path(resources.enter_context(tempfile.TemporaryDirectory(
                         prefix='.cache-bundles-', dir=journal.output)))
-                    bundles = list(pack_cache(a.profile_plan / 'cache', plan, work))
+                    pack_options = {}
+                    if usb_system:
+                        missing = usb_store_diff(bridge, journal, a.session, capabilities, plan['closure'])
+                        repairs = set(a.repair)
+                        if not repairs <= plan['closure'].keys():
+                            raise ValueError('Repair requested outside the signed closure')
+                        missing |= repairs
+                        capacity = capabilities['selected_store']
+                        capacity['store_names'] = sorted(set(capacity['store_names']) - repairs)
+                        pack_options['missing'] = missing
+                        journal.save(missing_store_paths=sorted(missing))
+                    bundles = list(pack_cache(a.profile_plan / 'cache', plan, work, **pack_options))
                     required = validate_push_capacity([*files, *bundles], capabilities)
                     journal.save(state='profile_cache_preflight_verified', cache_required_bytes=required,
                                  cache_capabilities=capabilities)
@@ -106,6 +187,23 @@ def stage_profile(args, *, bridge=None, bulk_port=1236):
                 transfer = receipt['transfer']
                 if transfer['sha256'] != digest:
                     raise ValueError(f'{source.name} changed during transfer')
+                if usb_system:
+                    if not re.fullmatch(r'/data/\.brook-transfer/[0-9a-f]{32}\.bin', transfer['guest_path']):
+                        raise ValueError('Unexpected USB stage transfer path')
+                    journal.save(profile_guest_files=[*journal.receipt.get('profile_guest_files', []),
+                                                      transfer['guest_path']])
+                if usb_system and not is_bundle and source.name == 'stage-plan.sig':
+                    verify = uuid.uuid4().hex
+                    terminal = False
+                    bridge.guest_run(a.session, verify, [*runtime, 'verify', tx,
+                                     *journal.receipt['profile_guest_files']],
+                                     cwd='/tmp', uid=1000, wait_s=2)
+                    result = journal.wait_job(
+                        a.session, verify,
+                        lambda item: item.get('state') in ('completed', 'failed', 'rejected'), timeout=120)
+                    terminal = True
+                    if result.get('state') != 'completed' or result.get('exit', {}).get('code') != 0:
+                        raise ValueError(f'Guest refused the signed plan: {result}')
                 if is_bundle:
                     pushed.append({'sha256': digest, 'guest_path': transfer['guest_path'],
                                    'receipt': str(bulk.output / 'receipt.json')})
@@ -113,16 +211,36 @@ def stage_profile(args, *, bridge=None, bulk_port=1236):
                     arguments.append('--cache-bundle')
                     source.unlink()
                 arguments.append(transfer['guest_path'])
+        if usb_system and a.profile_plan:
+            for name in a.repair:
+                arguments.extend(['--repair', name])
         journal.save(state='profile_job_dispatched')
+        terminal = False
         bridge.guest_run(a.session, job, arguments, cwd='/tmp', uid=1000, wait_s=2)
-        result = journal.wait_job(a.session, job, lambda status: status.get('state') == 'completed',
+        result = journal.wait_job(a.session, job, lambda status: status.get('state') in ('completed', 'failed', 'rejected'),
                                   timeout=a.profile_timeout_s)
-        if result.get('exit', {}).get('code') != 0:
+        terminal = True
+        if result.get('state') in ('failed', 'rejected') or result.get('exit', {}).get('code') != 0:
+            if usb_system:
+                damaged = re.findall(r'^USB_DAMAGED_STORE_PATH (\S+)$', result.get('stderr', {}).get('text', ''), re.MULTILINE)
+                journal.save(damaged_store_paths=damaged, profile_job=result)
             raise RuntimeError(f'Profile job failed: {result}')
         journal.save(state='profile_verified', profile_job=result)
     except Exception as error:
         journal.save(state='needs_inspection', error=str(error))
         raise
+    finally:
+        paths = journal.receipt.get('profile_guest_files', [])
+        if usb_system and terminal and paths:
+            try:
+                cleanup = uuid.uuid4().hex
+                bridge.guest_run(a.session, cleanup, ['/nix/profile/bin/rm', '-f', '--', *paths],
+                                 cwd='/tmp', uid=0, wait_s=2)
+                result = journal.wait_job(a.session, cleanup, lambda item: item.get('state') == 'completed',
+                                          timeout=120)
+                journal.save(profile_cleanup=result)
+            except (OSError, ValueError, RuntimeError) as error:
+                journal.save(profile_cleanup_error=str(error))
     return journal
 
 

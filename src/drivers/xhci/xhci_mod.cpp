@@ -16,6 +16,10 @@
 
 #include "module_abi.h"
 #include "usb_block_bytes.h"
+#include "usb_write_windows.h"
+#include "usb_scsi_unmap.h"
+#include "usb_uas.h"
+#include "usb_system.h"
 #include "usb_ecm_descriptors.h"
 #include "usb_ecm_rx_credits.h"
 #include "usb_ecm_tx_slots.h"
@@ -1044,6 +1048,16 @@ static uint32_t XhciSlotSpeed(uint32_t speed)
 // ---------------------------------------------------------------------------
 
 struct UsbEcmState;
+struct XhciUasRing { Trb* ring;uint64_t phys;uint32_t enqueue;bool cycle; };
+struct XhciUas {
+    UsbUasConfig config;
+    XhciUasRing rings[UasPipeCount][UsbUasDepth];
+    uint64_t contexts[UasPipeCount];
+    uint8_t* buffers;
+    uint64_t bufferPhys;
+};
+static bool g_storageUas=false;
+static bool g_storageUasFixture=false;
 // One boot-protocol HID function (keyboard or mouse) with its own ring.
 struct XhciHidFn {
     uint8_t iface, ep, interval;
@@ -1139,14 +1153,18 @@ struct XhciDevice {
     bool     isHub;
 
     // Mass storage state
+    XhciUas* uas;
+    uint32_t mscDiscardDcis;
     KMutex controlLock;
     bool controlQuarantined;
+    uint8_t mscInterface, mscAlternate;
     bool mscQuarantined;       // retained DMA buffers cannot be reused after transport failure
     UsbScsiCache mscCache;      // reset to Unknown with each enumerated device
     bool mscUnsupportedSync;    // only after current sense + explicit WCE=0
     uint32_t mscTag;            // CBW tag counter
     void* mscCommandBuffer;     // one persistent CBW/CSW page, serialized below
     uint64_t mscCommandBufferPhys;
+    UsbStorageTiming mscTiming; // g_mscCommandLock
     uint64_t mscSectorCount;    // total sectors
     uint32_t mscBlockSize;      // bytes per sector (usually 512)
 
@@ -1166,6 +1184,11 @@ struct XhciDevice {
     uint16_t rawConfigLen;
 };
 
+// The QEMU fixture has no BOT alternate, so firmware boots a separate
+// read-only carrier. Physical dual-alt disks are promoted after admission.
+static bool XhciUasFixture(const XhciDevice& dev) {
+    return g_storageUasFixture && dev.vendorId==0x46f4 && dev.productId==3;
+}
 static constexpr unsigned ECM_RX_PACKETS=UsbEcmRxCredits::Capacity;
 static constexpr unsigned ECM_RX_SLOTS=UsbEcmRxCredits::Slots;
 static constexpr unsigned ECM_RX_BYTES=UsbEcmRxCredits::BufferBytes;
@@ -1674,6 +1697,15 @@ static bool XhciConfigureDevice(XhciController& ctrl, XhciDevice& dev)
                          iface->bInterfaceNumber, iface->bAlternateSetting,
                          iface->bInterfaceClass, iface->bInterfaceSubClass,
                          iface->bInterfaceProtocol, iface->bNumEndpoints);
+            if (iface->bInterfaceClass == USB_CLASS_MASS_STORAGE &&
+                iface->bInterfaceSubClass == USB_MSC_SUBCLASS_SCSI &&
+                iface->bInterfaceProtocol == USB_MSC_PROTOCOL_BBB &&
+                (!dev.isMassStorage || (dev.mscAlternate && !iface->bAlternateSetting))) {
+                dev.isMassStorage = true; owner = Owner::Storage;
+                dev.mscInterface = iface->bInterfaceNumber;
+                dev.mscAlternate = iface->bAlternateSetting;
+                dev.bulkInAddr = dev.bulkOutAddr = 0;
+            }
             if (iface->bAlternateSetting == 0) {
                 if (!dev.ifaceClass) {
                     dev.ifaceClass = iface->bInterfaceClass;
@@ -1687,11 +1719,6 @@ static bool XhciConfigureDevice(XhciController& ctrl, XhciDevice& dev)
                     } else if (iface->bInterfaceProtocol == USB_HID_PROTOCOL_MOUSE && !dev.mouse.ep) {
                         owner = Owner::Mouse; dev.mouse.iface = iface->bInterfaceNumber;
                     }
-                }
-                if (iface->bInterfaceClass == USB_CLASS_MASS_STORAGE &&
-                    iface->bInterfaceSubClass == USB_MSC_SUBCLASS_SCSI &&
-                    iface->bInterfaceProtocol == USB_MSC_PROTOCOL_BBB && !dev.isMassStorage) {
-                    dev.isMassStorage = true; owner = Owner::Storage;
                 }
                 if (iface->bInterfaceClass == USB_CLASS_HUB || dev.deviceClass == USB_CLASS_HUB) {
                     dev.isHub = true; owner = Owner::Hub;
@@ -1739,6 +1766,21 @@ static bool XhciConfigureDevice(XhciController& ctrl, XhciDevice& dev)
         return false;
     }
 
+    if(dev.isMassStorage && dev.mscAlternate && dev.bulkInAddr && dev.bulkOutAddr) {
+        UsbSetupPacket setInterface{};
+        setInterface.bmRequestType=0x01;
+        setInterface.bRequest=0x0b; // SET_INTERFACE
+        setInterface.wValue=dev.mscAlternate;
+        setInterface.wIndex=dev.mscInterface;
+        if(!XhciControlTransfer(ctrl,dev,setInterface,nullptr,0,0,0)) {
+            dev.isMassStorage=false;
+            KPuts("xhci: USB storage could not select Bulk-Only alternate setting\n");
+        }
+    }
+    if(XhciUasFixture(dev) && !dev.isMassStorage && UsbSpeedIsSuper(dev.portSpeed)) {
+        UsbUasConfig config{};
+        dev.isMassStorage=UsbUasParse(dev.rawConfig,dev.rawConfigLen,-1,config);
+    }
     SerialPrintf("xhci: device configured (cfg=%u)\n", cfgValue);
     dev.configured = true;
     return true;
@@ -2018,7 +2060,8 @@ static void XhciDrainController(XhciController& ctrl,bool& wakeNetwork)
                     XhciQueueHidIn(ctrl,dev,fn);
                 }
                 // Completions for a disconnected device have no waiter.
-                if(!handled && dev.gone)handled=true;
+                const auto discard=__atomic_load_n(&dev.mscDiscardDcis,__ATOMIC_ACQUIRE);
+                if(!handled && (dev.gone || (discard&(1u<<((event.control>>16)&31)))))handled=true;
             }
         }
         if(!handled && !ctrl.completions.Push(event))ctrl.completionFailed=true;
@@ -2489,38 +2532,38 @@ static bool XhciInitEcm(XhciController& ctrl,XhciDevice& dev){
     return true;
 }
 
-// Perform a bulk transfer (IN or OUT)
-static bool XhciBulkTransfer(XhciController& ctrl, XhciDevice& dev,
-                              bool isIn, void* buf, uint64_t bufPhys,
-                              uint32_t len, uint32_t timeoutMs = 5000, uint32_t* shortInActual = nullptr,
-                              UsbBotReceive* status = nullptr)
+// Each 64 KiB DMA boundary consumes a TRB. An unaligned start and a
+// wrap across the link TRB can each add one more.
+static constexpr uint32_t USB_MSC_MAX_BULK_BYTES=1u<<20;
+struct MscBulkTd {
+    Trb* ring;
+    uint64_t ringPhys,last;
+    uint64_t tokens[USB_MSC_MAX_BULK_BYTES/65536+2];
+    unsigned tokenCount=0;
+    uint32_t dci,maxPacket;
+};
+
+static bool XhciPrepareBulkRing(XhciController& ctrl,bool isIn,Trb* ring,uint64_t ringPhys,
+    uint32_t& enqueue,bool& cycle,uint32_t dci,uint32_t maxPacket,
+    uint64_t bufPhys,uint32_t len,XhciTdPublication& publication,MscBulkTd& td)
 {
-    if(status)*status=UsbBotReceive::Failure;
-    if(shortInActual)*shortInActual=0;
-    if(shortInActual && (!isIn || len>192 || XhciDmaChunk(bufPhys,len)!=len))return false;
-    Trb*&     ring    = isIn ? dev.bulkInRing    : dev.bulkOutRing;
-    uint32_t& enqueue = isIn ? dev.bulkInEnqueue : dev.bulkOutEnqueue;
-    bool&     cycle   = isIn ? dev.bulkInCycle   : dev.bulkOutCycle;
-    uint32_t  dci     = isIn ? dev.bulkInDci     : dev.bulkOutDci;
-
-    const uint64_t ringPhys=isIn?dev.bulkInRingPhys:dev.bulkOutRingPhys;
-    if (!ring) return false;
-
-    if(!len || len>65536)return false;
-    uint64_t physical=bufPhys,token=0,tokens[3]{};unsigned tokenCount=0;uint32_t remaining=len;
-    const uint32_t maxPacket=isIn?dev.bulkInMaxPacket:dev.bulkOutMaxPacket;
-    if(!maxPacket)return false;
-    XhciTdPublication publication;
+    if(!ring || !maxPacket || !len || len>USB_MSC_MAX_BULK_BYTES)return false;
+    uint64_t physical=bufPhys;
+    uint32_t remaining=len;
+    td.ring=ring;
+    td.ringPhys=ringPhys;
+    td.dci=dci;
+    td.maxPacket=maxPacket;
     while(remaining) {
         if(enqueue>=XFER_RING_SIZE-1) {
-            tokens[tokenCount++]=ringPhys+(XFER_RING_SIZE-1)*sizeof(Trb);
+            td.tokens[td.tokenCount++]=ringPhys+(XFER_RING_SIZE-1)*sizeof(Trb);
             publication.Stage(ring[XFER_RING_SIZE-1].control,
                 XhciLinkControl(cycle,(ring[XFER_RING_SIZE-2].control&(1u<<4))!=0));
             cycle=!cycle;enqueue=0;
         }
         const auto bytes=XhciDmaChunk(physical,remaining);
-        auto& trb=ring[enqueue];token=ringPhys+enqueue*sizeof(Trb);
-        tokens[tokenCount++]=token;
+        auto& trb=ring[enqueue];td.last=ringPhys+enqueue*sizeof(Trb);
+        td.tokens[td.tokenCount++]=td.last;
         trb.param=physical;trb.status=bytes;
         if(ctrl.hciVersion>=0x100)trb.status|=XhciTdPackets(len,len-remaining+bytes,maxPacket)<<17;
         const uint32_t control=TRB_TYPE_NORMAL|(remaining>bytes?(1u<<4):TRB_IOC)|
@@ -2528,10 +2571,41 @@ static bool XhciBulkTransfer(XhciController& ctrl, XhciDevice& dev,
         publication.Stage(trb.control,control);
         ++enqueue;physical+=bytes;remaining-=bytes;
     }
+    return true;
+}
+
+static bool XhciPrepareMscBulk(XhciController& ctrl,XhciDevice& dev,bool isIn,
+    uint64_t bufPhys,uint32_t len,XhciTdPublication& publication,MscBulkTd& td)
+{
+    return XhciPrepareBulkRing(ctrl,isIn,isIn?dev.bulkInRing:dev.bulkOutRing,
+        isIn?dev.bulkInRingPhys:dev.bulkOutRingPhys,isIn?dev.bulkInEnqueue:dev.bulkOutEnqueue,
+        isIn?dev.bulkInCycle:dev.bulkOutCycle,isIn?dev.bulkInDci:dev.bulkOutDci,
+        isIn?dev.bulkInMaxPacket:dev.bulkOutMaxPacket,bufPhys,len,publication,td);
+}
+
+static bool XhciPublishMscBulk(XhciController& ctrl,XhciDevice& dev,
+    XhciTdPublication& publication,uint32_t dci)
+{
     __asm__ volatile("mfence":::"memory");
-    publication.Publish();
-    __asm__ volatile("mfence":::"memory");
-    XhciRingDoorbell(ctrl,dev.slotId,dci);
+    // Removal publishes gone under the same lock before disabling the slot.
+    const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
+    const bool live=!__atomic_load_n(&dev.gone,__ATOMIC_ACQUIRE);
+    if(live) {
+        publication.Publish();
+        __asm__ volatile("mfence":::"memory");
+        XhciRingDoorbell(ctrl,dev.slotId,dci);
+    }
+    IrqSpinLockRelease(&g_eventRingLock,saved);
+    return live;
+}
+
+static bool XhciWaitMscBulk(XhciController& ctrl,XhciDevice& dev,const MscBulkTd& td,
+    bool isIn,uint64_t bufPhys,uint32_t len,uint32_t timeoutMs,uint32_t* shortInActual,
+    UsbBotReceive* status)
+{
+    if(status)*status=UsbBotReceive::Failure;
+    if(shortInActual)*shortInActual=0;
+    const auto& [ring,ringPhys,token,tokens,tokenCount,dci,maxPacket]=td;
     Trb completion;
     Trb* evt=XhciWaitForEvent(ctrl,TRB_TYPE_TRANSFER_EVENT,timeoutMs,&completion,0,tokens,tokenCount);
 
@@ -2566,14 +2640,34 @@ static bool XhciBulkTransfer(XhciController& ctrl, XhciDevice& dev,
     return true;
 }
 
+static bool XhciBulkTransfer(XhciController& ctrl,XhciDevice& dev,
+    bool isIn,void*,uint64_t bufPhys,uint32_t len,uint32_t timeoutMs=5000,
+    uint32_t* shortInActual=nullptr,UsbBotReceive* status=nullptr)
+{
+    if(status)*status=UsbBotReceive::Failure;
+    if(shortInActual && (!isIn || len>192 || XhciDmaChunk(bufPhys,len)!=len))return false;
+    XhciTdPublication publication;
+    MscBulkTd td{};
+    return XhciPrepareMscBulk(ctrl,dev,isIn,bufPhys,len,publication,td) &&
+        XhciPublishMscBulk(ctrl,dev,publication,td.dci) &&
+        XhciWaitMscBulk(ctrl,dev,td,isIn,bufPhys,len,timeoutMs,shortInActual,status);
+}
+
 // Restore only the halted bulk-IN endpoint after an observed CSW STALL.
 // The MSC command lock guarantees no other TD is queued on these bulk rings.
 struct UsbMscCswReceive {
     XhciController& controller;XhciDevice& device;void* buffer;uint64_t physical;
     UsbBotDequeue position{};
+    const MscBulkTd* queued=nullptr;
+    uint32_t timeoutMs=5000;
     UsbBotReceive receive() {
         UsbBotReceive status;
-        XhciBulkTransfer(controller,device,true,buffer,physical,13,5000,nullptr,&status);
+        if(queued) {
+            XhciWaitMscBulk(controller,device,*queued,true,physical,13,timeoutMs,nullptr,&status);
+            queued=nullptr;
+        } else {
+            XhciBulkTransfer(controller,device,true,buffer,physical,13,timeoutMs,nullptr,&status);
+        }
         return status;
     }
     bool command(uint64_t param,uint32_t control) {
@@ -2641,24 +2735,367 @@ static constexpr uint8_t SCSI_READ_CAPACITY_10 = 0x25;
 static constexpr uint8_t SCSI_READ_10          = 0x28;
 static constexpr uint8_t SCSI_WRITE_10         = 0x2A;
 static constexpr uint8_t SCSI_SYNCHRONIZE_CACHE_10 = 0x35;
+static constexpr uint8_t SCSI_UNMAP = 0x42;
+
+static uint32_t MscTimeout(uint8_t opcode) {
+    return opcode==SCSI_UNMAP || opcode==SCSI_SYNCHRONIZE_CACHE_10 ? 30000 : 5000;
+}
 
 // Execute a SCSI command via BBB protocol
 static KMutex g_mscCommandLock{};
 static KMutex g_mscIoLock{};
 static bool g_storageReadOnly=false;
 static bool g_storagePageChunks=false;
+static bool g_storageLegacyBurst=false;
+static bool g_storagePipeline=false;
 static uint32_t g_mscDeviceCount=0;
 
 struct XhciMscResult {
     bool transport=false;uint8_t status=0;uint32_t actual=0,residue=0;UsbScsiSense sense{};
     bool success()const{return transport&&status==0;}
 };
+static uint64_t MscNowNs() {
+    const auto precise=AudioClockNowNs();
+    return precise?precise:ApicTickCount()*1000000;
+}
+
+struct MscCommandTiming {
+    UsbStorageTiming& stats;
+    uint32_t bytes;
+    uint64_t start=MscNowNs(), cbw=0, data=0, csw=0;
+    bool completed=false;
+    unsigned commands=1;
+    static void Record(UsbPhaseTiming& row,uint64_t ns) {
+        row.lastNs=ns;row.totalNs+=ns;
+        if(ns>row.maxNs)row.maxNs=ns;
+    }
+    uint64_t Lap() {
+        const auto now=MscNowNs();
+        const auto elapsed=now>=start?now-start:0;
+        start=now;
+        return elapsed;
+    }
+    ~MscCommandTiming() {
+        stats.commands+=commands;
+        if(!completed)stats.errors+=commands;
+        else stats.dataBytes+=bytes;
+        stats.lastBytes=bytes;
+        Record(stats.command,cbw);Record(stats.data,data);Record(stats.status,csw);
+    }
+};
+
 // Caller holds g_mscCommandLock through the original command and REQUEST SENSE.
+static uint32_t XhciUasDci(uint8_t address) {
+    return 2u*(address&15)+((address>>7)&1);
+}
+
+static void XhciFreeUas(XhciUas* uas) {
+    if(!uas)return;
+    for(unsigned pipe=0;pipe<UasPipeCount;++pipe) {
+        FreeDmaBuffer(uas->contexts[pipe],1);
+        for(const auto& ring:uas->rings[pipe])FreeDmaBuffer(ring.phys,1);
+    }
+    FreeDmaBuffer(uas->bufferPhys,1);
+    kfree(uas);
+}
+
+static XhciUas* XhciAllocateUas(const UsbUasConfig& config) {
+    auto* uas=static_cast<XhciUas*>(kmalloc(sizeof(XhciUas)));
+    if(!uas)return nullptr;
+    *uas={};
+    uas->config=config;
+    uas->buffers=static_cast<uint8_t*>(AllocDmaBuffer(1,uas->bufferPhys));
+    if(!uas->buffers){XhciFreeUas(uas);return nullptr;}
+    for(unsigned pipe=0;pipe<UasPipeCount;++pipe) {
+        uint64_t* contexts=nullptr;
+        if(pipe!=UasCommand) {
+            contexts=static_cast<uint64_t*>(AllocDmaBuffer(1,uas->contexts[pipe]));
+            if(!contexts){XhciFreeUas(uas);return nullptr;}
+            memset(contexts,0,4096);
+        }
+        const unsigned count=contexts?UsbUasDepth:1;
+        for(unsigned i=0;i<count;++i) {
+            auto& ring=uas->rings[pipe][i];
+            if(!XhciAllocTransferRing(ring.ring,ring.phys,ring.enqueue,ring.cycle)) {
+                XhciFreeUas(uas);
+                return nullptr;
+            }
+            if(contexts)contexts[2*(i+1)]=ring.phys|3u; // primary transfer ring, DCS 1
+        }
+    }
+    return uas;
+}
+
+static bool XhciUasCanClaim(XhciController& ctrl,XhciDevice& dev,
+    const UsbUasConfig& config,uint32_t replace=0)
+{
+    for(const auto& ep:config.pipes) {
+        const uint32_t dci=XhciUasDci(ep.address);
+        const auto* live=reinterpret_cast<const volatile uint32_t*>(
+            static_cast<const uint8_t*>(dev.outputCtx)+CtxEntrySize(ctrl)*dci);
+        if((live[0]&7u) && !(replace&(1u<<dci)))return false;
+    }
+    return true;
+}
+
+static uint32_t XhciDropStorageEndpoints(XhciController& ctrl,XhciDevice& dev,uint32_t mask) {
+    const uint32_t size=CtxEntrySize(ctrl);
+    auto* input=static_cast<uint8_t*>(dev.inputCtx);
+    memset(input,0,size*33);
+    auto* icc=reinterpret_cast<uint32_t*>(input);
+    auto* slot=reinterpret_cast<uint32_t*>(input+size);
+    memcpy(slot,dev.outputCtx,16);
+    uint32_t entries=1;
+    for(uint32_t dci=2;dci<32;++dci) {
+        const auto* live=reinterpret_cast<const volatile uint32_t*>(
+            static_cast<const uint8_t*>(dev.outputCtx)+size*dci);
+        if(!(live[0]&7u))continue;
+        if(mask&(1u<<dci))icc[0]|=1u<<dci;
+        else entries=dci;
+    }
+    if(!icc[0])return TRB_CC_SUCCESS;
+    icc[1]=1;
+    slot[0]=(slot[0]&~(31u<<27))|(entries<<27);
+    return XhciSlotCommand(ctrl,dev.inputCtxPhys,TRB_TYPE_CONFIG_EP|(dev.slotId<<24),2000);
+}
+
+static uint32_t XhciConfigureUas(XhciController& ctrl,XhciDevice& dev,XhciUas& uas) {
+    const uint32_t size=CtxEntrySize(ctrl);
+    auto* input=static_cast<uint8_t*>(dev.inputCtx);
+    memset(input,0,size*33);
+    auto* icc=reinterpret_cast<uint32_t*>(input);
+    auto* slot=reinterpret_cast<uint32_t*>(input+size);
+    memcpy(slot,dev.outputCtx,16);
+    uint32_t entries=slot[0]>>27;
+    icc[1]=1u;
+    for(unsigned pipe=0;pipe<UasPipeCount;++pipe) {
+        const auto& ep=uas.config.pipes[pipe];
+        const uint32_t dci=XhciUasDci(ep.address);
+        if(dci>entries)entries=dci;
+        icc[1]|=1u<<dci;
+        auto* ctx=reinterpret_cast<uint32_t*>(input+size*(dci+1));
+        const uint32_t type=(ep.address&0x80)?6:2;
+        const bool streams=pipe!=UasCommand;
+        ctx[0]=streams?((2u<<10)|(1u<<15)):0; // eight linear primary stream contexts
+        ctx[1]=(3u<<1)|(type<<3)|(uint32_t(ep.burst)<<8)|(uint32_t(ep.packet)<<16);
+        const uint64_t dequeue=streams?uas.contexts[pipe]:(uas.rings[pipe][0].phys|1u);
+        ctx[2]=dequeue;
+        ctx[3]=dequeue>>32;
+        ctx[4]=ep.packet;
+    }
+    slot[0]=(slot[0]&~(31u<<27))|(entries<<27);
+    return XhciSlotCommand(ctrl,dev.inputCtxPhys,TRB_TYPE_CONFIG_EP|(dev.slotId<<24),2000);
+}
+
+static bool XhciSelectStorageInterface(XhciController& ctrl,XhciDevice& dev,
+    uint8_t interface,uint8_t alternate)
+{
+    UsbSetupPacket setup{};
+    setup.bmRequestType=1;
+    setup.bRequest=0x0b;
+    setup.wIndex=interface;
+    setup.wValue=alternate;
+    return XhciControlTransfer(ctrl,dev,setup,nullptr,0,0,0);
+}
+
+struct XhciUasRequest {
+    const uint8_t* cdb;
+    uint64_t physical;
+    uint32_t size;
+    uint8_t cdbSize;
+};
+
+static bool XhciUasSubmit(XhciController& ctrl,XhciDevice& dev,unsigned pipe,unsigned index,
+    uint64_t physical,uint32_t size,MscBulkTd& td)
+{
+    auto& uas=*dev.uas;
+    const auto& ep=uas.config.pipes[pipe];
+    const uint32_t stream=pipe==UasCommand?0:index+1;
+    auto& ring=uas.rings[pipe][stream?index:0];
+    XhciTdPublication publication;
+    return XhciPrepareBulkRing(ctrl,ep.address&0x80,ring.ring,ring.phys,ring.enqueue,ring.cycle,
+        XhciUasDci(ep.address),ep.packet,physical,size,publication,td) &&
+        XhciPublishMscBulk(ctrl,dev,publication,td.dci|(stream<<16));
+}
+
+static void XhciDiscardStorageEvents(XhciController& ctrl,XhciDevice& dev,uint32_t dcis) {
+    XhciPollDrainEvents();
+    const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
+    ctrl.completions.Discard([&](const Trb& event) {
+        return (event.control&TRB_TYPE_MASK)==TRB_TYPE_TRANSFER_EVENT &&
+            (event.control>>24)==dev.slotId && (dcis&(1u<<((event.control>>16)&31)));
+    });
+    IrqSpinLockRelease(&g_eventRingLock,saved);
+}
+
+static bool XhciUasRetireData(XhciController& ctrl,XhciDevice& dev,unsigned pipe,unsigned tags) {
+    auto& uas=*dev.uas;
+    const uint32_t dci=XhciUasDci(uas.config.pipes[pipe].address);
+    const uint32_t target=(dev.slotId<<24)|(dci<<16);
+    const auto* ep=reinterpret_cast<const volatile uint32_t*>(
+        static_cast<const uint8_t*>(dev.outputCtx)+CtxEntrySize(ctrl)*dci);
+    auto cc=XhciSlotCommand(ctrl,0,TRB_TYPE_STOP_EP|target);
+    if(cc==TRB_CC_CONTEXT_STATE && (ep[0]&7u)==2) {
+        // Preserve the other streams' transfer state on a halted endpoint.
+        cc=XhciSlotCommand(ctrl,0,TRB_TYPE_RESET_EP|(1u<<9)|target);
+    }
+    if(cc!=TRB_CC_SUCCESS && !(cc==TRB_CC_CONTEXT_STATE && (ep[0]&7u)==3))return false;
+    for(unsigned i=0;i<UsbUasDepth;++i)if(tags&(1u<<i)) {
+        auto& ring=uas.rings[pipe][i];
+        const auto position=UsbBotNextDequeue(ring.phys,ring.enqueue,ring.cycle,XFER_RING_SIZE);
+        if(!position.valid)return false;
+        if(position.skipLink)
+            __atomic_store_n(&ring.ring[XFER_RING_SIZE-1].control,
+                XhciLinkControl(!position.cycle,false),__ATOMIC_RELEASE);
+        const uint64_t dequeue=position.pointer|2u; // primary transfer ring, DCS preserved
+        const auto token=XhciSubmitCommand(ctrl,dequeue,(i+1)<<16,TRB_TYPE_SET_TR_DEQ|target);
+        Trb completion;
+        if(!XhciWaitForEvent(ctrl,TRB_TYPE_CMD_COMPLETION,2000,&completion,token) ||
+           (completion.status>>24)!=TRB_CC_SUCCESS || (completion.control>>24)!=dev.slotId)return false;
+        ring.enqueue=position.index;
+        ring.cycle=position.cycle;
+    }
+    XhciDiscardStorageEvents(ctrl,dev,1u<<dci);
+    return true;
+}
+
+// The caller holds the command lock for the whole flight. Every referenced
+// DMA page is transport-owned and survives even if a command is unconfirmed.
+static XhciMscResult XhciUasExecute(XhciController& ctrl,XhciDevice& dev,
+    const XhciUasRequest* requests,unsigned count,bool in,bool allowShort=false)
+{
+    if(__atomic_load_n(&dev.mscQuarantined,__ATOMIC_ACQUIRE) ||
+       __atomic_load_n(&dev.gone,__ATOMIC_ACQUIRE))return {};
+    constexpr unsigned slotBytes=256,statusOffset=64,statusBytes=112;
+    auto& uas=*dev.uas;
+    struct Flight {
+        MscBulkTd command{},data{},status{};
+        uint32_t actual=0;
+    } flight[UsbUasDepth]{};
+    auto run=[&]() -> XhciMscResult {
+        if(!count || count>UsbUasDepth)return {};
+        uint32_t total=0;
+        for(unsigned i=0;i<count;++i) {
+            const auto& req=requests[i];
+            uint8_t* buffer=uas.buffers+i*slotBytes;
+            const uint64_t physical=uas.bufferPhys+i*slotBytes;
+            if(!req.cdbSize || req.cdbSize>16)return {};
+            memset(buffer,0,slotBytes);
+            buffer[0]=1; // Command IU, SIMPLE task attribute, LUN 0.
+            buffer[3]=i+1;
+            memcpy(buffer+16,req.cdb,req.cdbSize);
+            if(!XhciUasSubmit(ctrl,dev,UasStatus,i,physical+statusOffset,statusBytes,flight[i].status) ||
+               (req.size && !XhciUasSubmit(ctrl,dev,in?UasDataIn:UasDataOut,i,
+                   req.physical,req.size,flight[i].data)))return {};
+            total+=req.size;
+        }
+        MscCommandTiming timing{dev.mscTiming,total};
+        timing.commands=count;
+        ++dev.mscTiming.uasFlights;
+        if(count>dev.mscTiming.uasPeakDepth)dev.mscTiming.uasPeakDepth=count;
+        for(unsigned i=0;i<count;++i)
+            if(!XhciUasSubmit(ctrl,dev,UasCommand,i,uas.bufferPhys+i*slotBytes,32,flight[i].command))return {};
+        for(unsigned i=0;i<count;++i)
+            if(!XhciWaitMscBulk(ctrl,dev,flight[i].command,false,uas.bufferPhys+i*slotBytes,
+                32,5000,nullptr,nullptr))return {};
+        timing.cbw=timing.Lap();
+        UsbUasFlightState pending{uint8_t((1u<<count)-1),0};
+        uint32_t budget=5000;
+        for(unsigned i=0;i<count;++i) {
+            if(requests[i].size)pending.awaitingData|=1u<<i;
+            const auto timeout=MscTimeout(requests[i].cdb[0]);
+            if(timeout>budget)budget=timeout;
+        }
+        const auto start=ApicTickCount();
+        uint8_t status[UsbUasDepth]{};
+        UsbScsiSense sense[UsbUasDepth]{};
+        bool badData[UsbUasDepth]{};
+        const unsigned dataPipe=in?UasDataIn:UasDataOut;
+        bool queueFailed=false;
+        auto take=[&](const MscBulkTd& td,Trb& out) {
+            const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
+            queueFailed=ctrl.completionFailed;
+            const bool found=!queueFailed && ctrl.completions.TakeAny(TRB_TYPE_TRANSFER_EVENT,td.tokens,td.tokenCount,out);
+            IrqSpinLockRelease(&g_eventRingLock,saved);
+            return found;
+        };
+        auto identity=[&](const Trb& event,const MscBulkTd& td) {
+            return ((event.control>>16)&31)==td.dci && (event.control>>24)==dev.slotId;
+        };
+        auto poll=[&]() -> bool {
+            XhciPollDrainEvents();
+            if(__atomic_load_n(&dev.gone,__ATOMIC_ACQUIRE))return false;
+            for(unsigned i=0;i<count;++i) {
+                Trb event;
+                const unsigned bit=1u<<i;
+                if((pending.awaitingStatus&bit) && take(flight[i].status,event)) {
+                    const uint32_t residue=event.status&0xffffff;
+                    const auto* buffer=uas.buffers+i*slotBytes+statusOffset;
+                    uint32_t senseBytes=0;
+                    if(!identity(event,flight[i].status) || event.param!=flight[i].status.last ||
+                       !UsbScsiShortInCompletion(true,true,true,statusBytes,event.status>>24,residue) ||
+                       !UsbUasStatus(buffer,statusBytes-residue,i+1,status[i],senseBytes))return false;
+                    sense[i]=UsbScsiParseSense(buffer+16,senseBytes);
+                    pending.Status(i,status[i]);
+                }
+                if((pending.awaitingData&bit) && !badData[i] && take(flight[i].data,event)) {
+                    const auto& req=requests[i];
+                    const uint32_t cc=event.status>>24,residue=event.status&0xffffff;
+                    if(!identity(event,flight[i].data))return false;
+                    if(event.param==flight[i].data.last &&
+                       UsbScsiShortInCompletion(in,XhciDmaChunk(req.physical,req.size)==req.size,
+                           allowShort || (pending.rejected&bit),req.size,cc,residue)) {
+                        flight[i].actual=req.size-residue;
+                        pending.Data(i);
+                    } else {
+                        // A short or halted data TD can precede the final Sense IU.
+                        // With GOOD status this remains a transfer error.
+                        if(cc!=TRB_CC_SHORT_PACKET && cc!=TRB_CC_STALL)return false;
+                        badData[i]=true;
+                    }
+                }
+                if(badData[i] && !(pending.awaitingStatus&bit) && !status[i])return false;
+            }
+            __asm__ volatile("pause");
+            return !queueFailed;
+        };
+        if(!UsbUasWaitFlight(pending,poll,[&] {return ApicTickCount()-start>=budget;},
+            [&](unsigned tags) {return XhciUasRetireData(ctrl,dev,dataPipe,tags);}))return {};
+        timing.data=timing.Lap();
+        XhciMscResult result{true,0,0,0,{}};
+        for(unsigned i=0;i<count;++i) {
+            // Prefer permanent errors over a retryable result elsewhere in the flight.
+            if(status[i] && (!result.status ||
+               UsbUasRetryRead(result.status,result.sense.current,result.sense.key))) {
+                result.status=status[i];
+                result.sense=sense[i];
+            }
+            result.actual+=flight[i].actual;
+            result.residue+=requests[i].size-flight[i].actual;
+        }
+        timing.csw=timing.Lap();
+        timing.completed=result.success();
+        timing.bytes=result.actual;
+        return result;
+    };
+    auto result=run();
+    if(!result.transport) {
+        uint32_t dcis=0;
+        for(const auto& pipe:uas.config.pipes)dcis|=1u<<XhciUasDci(pipe.address);
+        __atomic_store_n(&dev.mscDiscardDcis,dcis,__ATOMIC_RELEASE);
+        XhciDiscardStorageEvents(ctrl,dev,dcis);
+        __atomic_store_n(&dev.mscQuarantined,true,__ATOMIC_RELEASE);
+        KPrintf("xhci: UAS incomplete flight depth=%u; transport quarantined\n",count);
+    }
+    return result;
+}
+
 static XhciMscResult XhciMscCommandLocked(XhciController& ctrl,XhciDevice& dev,
     const uint8_t* cdb,uint8_t cdbLen,void* data,uint64_t dataPhys,uint32_t dataLen,
     bool dataIn,bool allowShort=false)
 {
-    if(__atomic_load_n(&dev.mscQuarantined,__ATOMIC_ACQUIRE))return {};
+    if(__atomic_load_n(&dev.gone,__ATOMIC_ACQUIRE) ||
+       __atomic_load_n(&dev.mscQuarantined,__ATOMIC_ACQUIRE))return {};
     if (!dev.mscCommandBuffer)
         dev.mscCommandBuffer = AllocDmaBuffer(1, dev.mscCommandBufferPhys);
     if (!dev.mscCommandBuffer) return {};
@@ -2678,17 +3115,43 @@ static XhciMscResult XhciMscCommandLocked(XhciController& ctrl,XhciDevice& dev,
 
     __asm__ volatile("mfence" ::: "memory");
 
+    const uint32_t timeout=MscTimeout(cdb[0]);
+    MscCommandTiming timing{dev.mscTiming,dataLen};
     // 1. Send CBW via Bulk OUT
-    if (!XhciBulkTransfer(ctrl, dev, false, cbw, cbwPhys, sizeof(UsbMscCbw))) {
+    const bool sent=XhciBulkTransfer(ctrl, dev, false, cbw, cbwPhys, sizeof(UsbMscCbw));
+    timing.cbw=timing.Lap();
+    if (!sent) {
         __atomic_store_n(&dev.mscQuarantined,true,__ATOMIC_RELEASE);
         KPrintf("xhci: MSC CBW failed opcode=%x bytes=%u; transport quarantined\n",unsigned(cdb[0]),dataLen);
         return {};
     }
 
+    uint64_t cswPhys=dev.mscCommandBufferPhys+64;
+    auto* csw=reinterpret_cast<UsbMscCsw*>(static_cast<uint8_t*>(dev.mscCommandBuffer)+64);
+    memset(csw,0,sizeof(*csw));
+
+    // Both TDs use the same IN ring, so the status cannot overtake the
+    // data. Keep short/variable transfers and OUT data on separate phases.
+    const bool queueStatus=g_storagePipeline && dataIn && dataLen && data && !allowShort &&
+        cdb[0]==SCSI_READ_10;
+    MscBulkTd statusTd{};
     // 2. Data phase (if any)
     uint32_t actual=dataLen;
     if (dataLen > 0 && data) {
-        if (!XhciBulkTransfer(ctrl, dev, dataIn, data, dataPhys, dataLen,5000,allowShort?&actual:nullptr)) {
+        bool transferred;
+        if(queueStatus) {
+            XhciTdPublication publication;
+            MscBulkTd dataTd{};
+            transferred=XhciPrepareMscBulk(ctrl,dev,true,dataPhys,dataLen,publication,dataTd) &&
+                XhciPrepareMscBulk(ctrl,dev,true,cswPhys,sizeof(*csw),publication,statusTd) &&
+                XhciPublishMscBulk(ctrl,dev,publication,dataTd.dci) &&
+                XhciWaitMscBulk(ctrl,dev,dataTd,true,dataPhys,dataLen,timeout,nullptr,nullptr);
+        } else {
+            transferred=XhciBulkTransfer(ctrl,dev,dataIn,data,dataPhys,dataLen,timeout,
+                allowShort?&actual:nullptr);
+        }
+        timing.data=timing.Lap();
+        if (!transferred) {
             __atomic_store_n(&dev.mscQuarantined,true,__ATOMIC_RELEASE);
             const uint32_t lba=cdbLen>=10?(uint32_t(cdb[2])<<24)|(uint32_t(cdb[3])<<16)|(uint32_t(cdb[4])<<8)|cdb[5]:0;
             KPrintf("xhci: MSC data %s failed opcode=%x bytes=%u tag=%u lba=%u; transport quarantined\n",dataIn?"IN":"OUT",unsigned(cdb[0]),dataLen,cbw->dCBWTag,lba);
@@ -2697,14 +3160,10 @@ static XhciMscResult XhciMscCommandLocked(XhciController& ctrl,XhciDevice& dev,
     }
 
     // 3. Receive CSW via Bulk IN
-    uint64_t cswPhys = dev.mscCommandBufferPhys + 64;
-    auto* csw = reinterpret_cast<UsbMscCsw*>(
-        static_cast<uint8_t*>(dev.mscCommandBuffer) + 64);
-
-    memset(csw, 0, sizeof(UsbMscCsw));
-
-    UsbMscCswReceive receive{ctrl,dev,csw,cswPhys};
-    if (!UsbBotReceiveCsw(receive)) {
+    UsbMscCswReceive receive{ctrl,dev,csw,cswPhys,{},queueStatus?&statusTd:nullptr,timeout};
+    const bool received=UsbBotReceiveCsw(receive);
+    timing.csw=timing.Lap();
+    if (!received) {
         __atomic_store_n(&dev.mscQuarantined,true,__ATOMIC_RELEASE);
         KPrintf("xhci: MSC CSW failed opcode=%x bytes=%u; transport quarantined\n",unsigned(cdb[0]),dataLen);
         return {};
@@ -2723,13 +3182,19 @@ static XhciMscResult XhciMscCommandLocked(XhciController& ctrl,XhciDevice& dev,
             unsigned(cdb[0]),csw->bCSWStatus,csw->dCSWDataResidue,actual,dataLen);
         return {};
     }
-    return {true,csw->bCSWStatus,dataLen-csw->dCSWDataResidue,csw->dCSWDataResidue,{}};
+    timing.completed=csw->bCSWStatus==0;
+    timing.bytes=dataLen-csw->dCSWDataResidue;
+    return {true,csw->bCSWStatus,timing.bytes,csw->dCSWDataResidue,{}};
 }
 
 static XhciMscResult XhciMscExecuteLocked(XhciController& ctrl,XhciDevice& dev,
     const uint8_t* cdb,uint8_t cdbLen,void* data,uint64_t dataPhys,uint32_t dataLen,
     bool dataIn,bool allowShort=false)
 {
+    if(dev.uas) {
+        const XhciUasRequest request{cdb,dataPhys,dataLen,cdbLen};
+        return XhciUasExecute(ctrl,dev,&request,1,dataIn,allowShort);
+    }
     auto result=XhciMscCommandLocked(ctrl,dev,cdb,cdbLen,data,dataPhys,dataLen,dataIn,allowShort);
     if(!result.transport||result.status==0)return result;
     const uint8_t opcode=cdb[0];
@@ -2867,9 +3332,12 @@ struct UsbMscState {
     uint32_t devIndex;   // index into g_devices
     uint8_t* bounce;
     uint64_t bouncePhys;
+    uint32_t bounceCapacity;
+    uint32_t botMaxBytes;
+    UsbUnmapLimits unmapLimits;
     char name[16];
-    // Boot-stick update window (DEVICE_IOCTL_WRITE_WINDOW); zero length = closed.
-    uint64_t windowStart, windowLength;
+    UsbWriteWindows windows;
+    bool systemFailed;
 };
 
 static const BlockDeviceOps g_usbMscOps = {
@@ -2885,19 +3353,69 @@ struct UsbMscByteTransport {
     UsbMscState* state;
     uint32_t blockSize() {return g_devices[state->devIndex].mscBlockSize;}
     uint64_t blockCount() {return g_devices[state->devIndex].mscSectorCount;}
-    uint32_t bounceBytes() {return g_storagePageChunks?4096:65536;}
+    uint32_t bounceBytes() {
+        const uint32_t preferred=g_storagePageChunks?4096:state->bounceCapacity;
+        return !g_devices[state->devIndex].uas && state->botMaxBytes && state->botMaxBytes<preferred
+            ?state->botMaxBytes:preferred;
+    }
     uint8_t* bounce() {return state->bounce;}
-    bool usable() {return !__atomic_load_n(&g_devices[state->devIndex].mscQuarantined,__ATOMIC_ACQUIRE);}
-    bool transfer(uint64_t lba,uint32_t count,bool read) {
+    bool usable() {
+        const auto& dev=g_devices[state->devIndex];
+        return !__atomic_load_n(&dev.gone,__ATOMIC_ACQUIRE) &&
+            !__atomic_load_n(&dev.mscQuarantined,__ATOMIC_ACQUIRE);
+    }
+    bool transfer(uint64_t lba,uint32_t count,bool read,uint64_t physical=0) {
         if(!usable())return false;
         uint8_t cdb[10]{};cdb[0]=read?SCSI_READ_10:SCSI_WRITE_10;
         cdb[2]=lba>>24;cdb[3]=lba>>16;cdb[4]=lba>>8;cdb[5]=lba;
         cdb[7]=count>>8;cdb[8]=count;
         const uint64_t bytes=uint64_t(count)*blockSize();
-        const bool ok=XhciMscCommand(*state->ctrl,g_devices[state->devIndex],cdb,10,
-            state->bounce,state->bouncePhys,uint32_t(bytes),read);
-        if(ok)StorageIoAccount(uint32_t(StorageIoSource::Usb),read?0:1,bytes);
-        return ok;
+        auto& dev=g_devices[state->devIndex];
+        const bool direct=physical!=0;
+        if(!physical)physical=state->bouncePhys;
+        auto* buffer=direct?reinterpret_cast<uint8_t*>(PhysToVirt(PhysicalAddress(physical)).raw()):state->bounce;
+        MscCommandGuard guard;
+        if(dev.uas && count>=128 && bytes>=256*1024) {
+            uint8_t commands[UsbUasDepth][10]{};
+            XhciUasRequest requests[UsbUasDepth]{};
+            uint32_t queued=0;
+            for(unsigned i=0;i<UsbUasDepth;++i) {
+                const uint64_t at=lba+queued;
+                const uint32_t blocks=(count-queued)/(UsbUasDepth-i);
+                if(!read && g_storageReadOnly &&
+                   !state->windows.Allows(at*blockSize(),uint64_t(blocks)*blockSize()))return false;
+                auto* command=commands[i];
+                command[0]=cdb[0];
+                command[2]=at>>24;command[3]=at>>16;command[4]=at>>8;command[5]=at;
+                command[7]=blocks>>8;command[8]=blocks;
+                requests[i]={command,physical+uint64_t(queued)*blockSize(),blocks*blockSize(),10};
+                queued+=blocks;
+            }
+            auto result=XhciUasExecute(*state->ctrl,dev,requests,UsbUasDepth,read);
+            if(read && result.transport && UsbUasRetryRead(result.status,result.sense.current,result.sense.key))
+                result=XhciUasExecute(*state->ctrl,dev,requests,UsbUasDepth,read);
+            const bool ok=result.success();
+            if(ok) {
+                StorageIoAccount(uint32_t(StorageIoSource::Usb),read?0:1,bytes);
+                if(direct)dev.mscTiming.directBytes+=bytes;
+            }
+            return ok;
+        }
+        auto execute=[&] {
+            return XhciMscExecuteLocked(*state->ctrl,dev,cdb,10,
+                buffer,physical,uint32_t(bytes),read);
+        };
+        auto result=execute();
+        // Retry only reads with a fully retired exchange.
+        if(read && usable() && result.transport &&
+           (dev.uas?UsbUasRetryRead(result.status,result.sense.current,result.sense.key):
+            (state->windows.system.length && result.status==1 && result.sense.current && result.sense.key==0xb)))
+            result=execute();
+        if(result.success()) {
+            StorageIoAccount(uint32_t(StorageIoSource::Usb),read?0:1,bytes);
+            if(direct)dev.mscTiming.directBytes+=bytes;
+        }
+        return result.success();
     }
     bool readBlocks(uint64_t lba,uint32_t count) {return transfer(lba,count,true);}
     bool writeBlocks(uint64_t lba,uint32_t count) {return transfer(lba,count,false);}
@@ -2906,55 +3424,145 @@ struct MscIoGuard {
     MscIoGuard(){KMutexLock(&g_mscIoLock);}
     ~MscIoGuard(){KMutexUnlock(&g_mscIoLock);}
 };
+static void UsbMscFenceSystem(UsbMscState& state) {
+    if(state.windows.system.length) {
+        state.windows.system={};
+        __atomic_store_n(&state.systemFailed,true,__ATOMIC_RELEASE);
+    }
+}
 static int UsbMscRead(Device* dev,uint64_t offset,void* buf,uint64_t len) {
     MscIoGuard guard;
-    UsbMscByteTransport io{static_cast<UsbMscState*>(dev->priv)};
-    if(!io.usable())return -5;
-    return UsbBlockReadBytes(io,offset,buf,len);
-}
-static bool UsbMscWindowAdmits(const UsbMscState* st,uint64_t offset,uint64_t len) {
-    const uint64_t start=__atomic_load_n(&st->windowStart,__ATOMIC_ACQUIRE);
-    const uint64_t length=__atomic_load_n(&st->windowLength,__ATOMIC_ACQUIRE);
-    return length && len && offset>=start && len<=length && offset-start<=length-len;
+    auto* state=static_cast<UsbMscState*>(dev->priv);
+    UsbMscByteTransport io{state};
+    const int result=UsbBlockReadBytes(io,offset,buf,len);
+    if(result==-5 || (result>=0 && uint64_t(result)!=len &&
+        UsbWriteWindows::Contains(state->windows.system,offset,len)))UsbMscFenceSystem(*state);
+    return result;
 }
 static int UsbMscWrite(Device* dev,uint64_t offset,const void* buf,uint64_t len) {
-    if(g_storageReadOnly && !UsbMscWindowAdmits(static_cast<UsbMscState*>(dev->priv),offset,len))return -30;
     MscIoGuard guard;
-    UsbMscByteTransport io{static_cast<UsbMscState*>(dev->priv)};
-    if(!io.usable())return -5;
-    return UsbBlockWriteBytes(io,offset,buf,len);
+    auto* state=static_cast<UsbMscState*>(dev->priv);
+    if(__atomic_load_n(&state->systemFailed,__ATOMIC_ACQUIRE) ||
+       (g_storageReadOnly && !state->windows.Allows(offset,len)))return -30;
+    UsbMscByteTransport io{state};
+    const int result=UsbBlockWriteBytes(io,offset,buf,len);
+    if(result==-5 || (result>=0 && uint64_t(result)!=len))UsbMscFenceSystem(*state);
+    return result;
 }
+
+static int UsbMscReadDma(UsbMscState& state,XhciDevice& device,UsbDmaRead& request) {
+    MscIoGuard guard;
+    UsbMscByteTransport io{&state};
+    const uint32_t block=io.blockSize();
+    const uint64_t limit=g_dma32?(4ull<<30):(16ull<<30);
+    if(!state.windows.CanReadDma(request,block,io.bounceBytes(),limit))return -95;
+    if(!io.usable() || __atomic_load_n(&state.systemFailed,__ATOMIC_ACQUIRE))return -95;
+    if(io.transfer(request.offset/block,request.bytes/block,true,request.physical))return request.bytes;
+    // A transport failure may leave the xHC holding a pointer into the
+    // caller's allocation. Neither the allocator nor the caller may reuse it.
+    UsbMscFenceSystem(state);
+    return UsbDmaTransferFailure(request,__atomic_load_n(&device.mscQuarantined,__ATOMIC_ACQUIRE));
+}
+
+static int UsbMscUnmapLimits(UsbMscState& state,XhciDevice& dev) {
+    auto* data=state.bounce;
+    UsbMscByteTransport io{&state};
+    auto page=[&](uint8_t code,uint8_t bytes,uint8_t needed) {
+        uint8_t cdb[6]={SCSI_INQUIRY,1,code,0,bytes,0};
+        memset(data,0,bytes);
+        const auto result=XhciMscExecuteLocked(*state.ctrl,dev,cdb,sizeof(cdb),
+            data,state.bouncePhys,bytes,true,true);
+        return result.success() && ScsiUnmapVpd(data,result.actual,code,needed);
+    };
+    // Read the exact B2 minimum and allow standard short responses.
+    if(!page(0xb2,8,6) || !(data[5]&0x80) || !page(0xb0,64,28))
+        return io.usable()?-95:-5;
+    const uint32_t sectors=ScsiUnmapBe32(data+20);
+    state.unmapLimits={sectors>UsbUnmapMaxSectors?UsbUnmapMaxSectors:sectors,ScsiUnmapBe32(data+24)};
+    return state.unmapLimits.maxSectors && state.unmapLimits.maxRanges?0:-95;
+}
+
+static int UsbMscUnmap(UsbMscState& state,XhciDevice& dev,uint32_t request,void* arg) {
+    if(!arg)return -22;
+    MscIoGuard ioGuard;
+    UsbMscByteTransport io{&state};
+    if(!state.windows.system.length || !g_storageReadOnly || io.blockSize()!=512)return -30;
+    if(!io.usable() || __atomic_load_n(&state.systemFailed,__ATOMIC_ACQUIRE))return -5;
+    MscCommandGuard commandGuard;
+    if(request==DEVICE_IOCTL_USB_UNMAP_LIMITS) {
+        const int result=UsbMscUnmapLimits(state,dev);
+        if(!result)*static_cast<UsbUnmapLimits*>(arg)=state.unmapLimits;
+        else if(result==-5)UsbMscFenceSystem(state);
+        return result;
+    }
+    const auto& batch=*static_cast<const UsbUnmapBatch*>(arg);
+    const int admission=state.windows.CheckUnmap(batch);
+    if(admission)return admission;
+    const uint32_t bytes=ScsiEncodeUnmap(state.bounce,state.unmapLimits,batch.ranges,batch.count);
+    if(!bytes)return -22;
+    const uint8_t cdb[10]={0x42,0,0,0,0,0,0,uint8_t(bytes>>8),uint8_t(bytes),0};
+    const auto result=XhciMscExecuteLocked(*state.ctrl,dev,cdb,sizeof(cdb),
+        state.bounce,state.bouncePhys,bytes,false);
+    if(result.success())return 0;
+    UsbMscFenceSystem(state);
+    return -5;
+}
+
+static int XhciPromoteSystemStorage(UsbMscState& state);
 
 static int UsbMscIoctl(Device* dev, uint32_t cmd, void* arg)
 {
     if (cmd == DEVICE_IOCTL_READ_ONLY) return g_storageReadOnly ? 1 : 0;
-    if (cmd == DEVICE_IOCTL_WRITE_WINDOW) {
-        // Only meaningful under the read-only policy; the kernel gate is the
-        // sole caller and has already proven this is the boot stick.
-        auto* st = static_cast<UsbMscState*>(dev->priv);
-        const auto* w = static_cast<const DeviceWriteWindow*>(arg);
-        if (!g_storageReadOnly || !w) return -22;
-        const uint64_t bytes = uint64_t(g_devices[st->devIndex].mscSectorCount) * g_devices[st->devIndex].mscBlockSize;
-        if (w->length && (w->start > bytes || w->length > bytes - w->start)) return -22;
-        __atomic_store_n(&st->windowLength, uint64_t{0}, __ATOMIC_RELEASE);
-        __atomic_store_n(&st->windowStart, w->start, __ATOMIC_RELEASE);
-        __atomic_store_n(&st->windowLength, w->length, __ATOMIC_RELEASE);
-        KPrintf("xhci: %s write window %s\n", st->name, w->length ? "open (boot-stick update)" : "closed");
+    auto* st=static_cast<UsbMscState*>(dev->priv);
+    if (cmd == DEVICE_IOCTL_USB_STORAGE_TIMING) {
+        if(!arg)return -22;
+        MscCommandGuard commandGuard;
+        *static_cast<UsbStorageTiming*>(arg)=g_devices[st->devIndex].mscTiming;
+        return 0;
+    }
+    if(cmd==DEVICE_IOCTL_USB_SYSTEM_TRANSPORT)return XhciPromoteSystemStorage(*st);
+    if(cmd==DEVICE_IOCTL_USB_READ_DMA)
+        return arg?UsbMscReadDma(*st,g_devices[st->devIndex],*static_cast<UsbDmaRead*>(arg)):-22;
+    if(cmd==DEVICE_IOCTL_USB_UNMAP_LIMITS || cmd==DEVICE_IOCTL_USB_UNMAP)
+        return UsbMscUnmap(*st,g_devices[st->devIndex],cmd,arg);
+    if (cmd == DEVICE_IOCTL_PREFERRED_READ_BYTES) return UsbMscByteTransport{st}.bounceBytes();
+    if (cmd == DEVICE_IOCTL_WRITE_FENCED) {
+        const auto& device=g_devices[st->devIndex];
+        return __atomic_load_n(&st->systemFailed,__ATOMIC_ACQUIRE) ||
+            __atomic_load_n(&device.gone,__ATOMIC_ACQUIRE) ||
+            __atomic_load_n(&device.mscQuarantined,__ATOMIC_ACQUIRE);
+    }
+    if (cmd == DEVICE_IOCTL_WRITE_WINDOW || cmd == DEVICE_IOCTL_USB_SYSTEM_WINDOW) {
+        const auto* window=static_cast<const DeviceWriteWindow*>(arg);
+        const bool persistent=cmd==DEVICE_IOCTL_USB_SYSTEM_WINDOW;
+        if(!g_storageReadOnly || !window || (persistent && !UsbSystemRequested()))return -22;
+        MscIoGuard guard;
+        if(window->length && !persistent && !st->windows.CanOpenUpdate(UsbSystemRequested()))return -30;
+        UsbMscByteTransport io{st};
+        const auto block=io.blockSize();
+        if(window->length && (!io.usable() || __atomic_load_n(&st->systemFailed,__ATOMIC_ACQUIRE) ||
+                               (persistent && block!=512)))return -5;
+        if(!st->windows.Set(persistent,*window,io.blockCount()*block,block))return -22;
+        KPrintf("xhci: %s %s write window %s\n",st->name,
+            persistent?"USB system":"boot-stick update",window->length?"open":"closed");
         return 0;
     }
     if (cmd != DEVICE_IOCTL_FLUSH) return -95;
-    if(g_storageReadOnly && !__atomic_load_n(&static_cast<UsbMscState*>(dev->priv)->windowLength,__ATOMIC_ACQUIRE))return 0;
     MscIoGuard ioGuard;
+    if(__atomic_load_n(&st->systemFailed,__ATOMIC_ACQUIRE))return -5;
+    const bool system=st->windows.system.length!=0;
+    if(g_storageReadOnly && !system && !st->windows.update.length)return 0;
+    UsbMscByteTransport io{st};
+    if(!io.usable()){UsbMscFenceSystem(*st);return -5;}
     MscCommandGuard commandGuard;
-    auto* st = static_cast<UsbMscState*>(dev->priv);
-    XhciDevice& udev = g_devices[st->devIndex];
-    if(__atomic_load_n(&udev.mscQuarantined,__ATOMIC_ACQUIRE))return -5;
-    if(udev.mscUnsupportedSync&&(udev.mscCache==UsbScsiCache::WriteThrough||udev.mscCache==UsbScsiCache::AssumedWriteThrough))return 0;
+    XhciDevice& udev=g_devices[st->devIndex];
+    if(!system && udev.mscUnsupportedSync &&
+       (udev.mscCache==UsbScsiCache::WriteThrough||udev.mscCache==UsbScsiCache::AssumedWriteThrough))return 0;
     // IMMED=0, LBA=0 and length=0: wait for the entire device cache.
     uint8_t cdb[10] = {};cdb[0] = SCSI_SYNCHRONIZE_CACHE_10;
     auto result=XhciMscExecuteLocked(*st->ctrl,udev,cdb,sizeof(cdb),nullptr,0,0,false);
     if(result.success()){StorageIoAccount(uint32_t(StorageIoSource::Usb),2,0);return 0;}
-    if(UsbScsiUnsupportedSync(result.sense)) {
+    if(!system && UsbScsiUnsupportedSync(result.sense)) {
         if(udev.mscCache==UsbScsiCache::Unknown)udev.mscCache=XhciMscCacheLocked(*st->ctrl,udev);
         if(!__atomic_load_n(&udev.mscQuarantined,__ATOMIC_ACQUIRE)&&UsbScsiWriteThroughFlush(udev.mscCache,result.sense)) {
             udev.mscUnsupportedSync=true;
@@ -2964,6 +3572,7 @@ static int UsbMscIoctl(Device* dev, uint32_t cmd, void* arg)
             return 0;
         }
     }
+    UsbMscFenceSystem(*st);
     return -5;
 }
 
@@ -2981,50 +3590,145 @@ static uint32_t UsbMscBlockSize(Device* dev)
     return g_devices[st->devIndex].mscBlockSize;
 }
 
-// Initialize a USB mass storage device after enumeration
-static bool XhciInitMassStorage(XhciController& ctrl, XhciDevice& dev,
-                                 uint32_t devIndex)
-{
-    SerialPuts("xhci: initializing mass storage device\n");
+static void XhciDelayMs(uint32_t ms);
 
-    // Configure bulk IN endpoint
-    if (dev.bulkInAddr) {
-        if (!XhciConfigureBulkEndpoint(ctrl, dev, dev.bulkInAddr,
-                                        dev.bulkInMaxPacket,
-                                        dev.bulkInRing, dev.bulkInRingPhys,
-                                        dev.bulkInEnqueue, dev.bulkInCycle,
-                                        dev.bulkInDci)) {
-            SerialPuts("xhci: failed to configure bulk IN\n");
-            return false;
-        }
+static bool XhciIdentifyStorage(XhciController& ctrl,XhciDevice& dev) {
+    XhciMscInquiry(ctrl,dev);
+    for(int retry=0;retry<3;++retry) {
+        if(XhciMscTestUnitReady(ctrl,dev))break;
+        XhciDelayMs(10);
     }
+    return XhciMscReadCapacity(ctrl,dev);
+}
 
-    // Configure bulk OUT endpoint
-    if (dev.bulkOutAddr) {
-        if (!XhciConfigureBulkEndpoint(ctrl, dev, dev.bulkOutAddr,
-                                        dev.bulkOutMaxPacket,
-                                        dev.bulkOutRing, dev.bulkOutRingPhys,
-                                        dev.bulkOutEnqueue, dev.bulkOutCycle,
-                                        dev.bulkOutDci)) {
-            SerialPuts("xhci: failed to configure bulk OUT\n");
-            return false;
-        }
-    }
-
-    // SCSI INQUIRY
-    XhciMscInquiry(ctrl, dev);
-
-    // TEST UNIT READY (may need retries for slow devices)
-    for (int retry = 0; retry < 3; retry++) {
-        if (XhciMscTestUnitReady(ctrl, dev)) break;
-        // Brief delay between retries
-        for (volatile int d = 0; d < 1000000; d++) {}
-    }
-
-    // READ CAPACITY
-    if (!XhciMscReadCapacity(ctrl, dev)) {
-        SerialPuts("xhci: READ CAPACITY failed\n");
+// Try UAS before the device is registered and before any write lease exists.
+// On a refused init, retire every UAS endpoint and select BOT again. A lost
+// Configure Endpoint completion leaves ownership unknown and forbids fallback.
+static bool XhciTryUas(XhciController& ctrl,XhciDevice& dev,bool& fallback) {
+    const bool bot=dev.bulkInAddr && dev.bulkOutAddr;
+    fallback=bot;
+    if(!UsbSpeedIsSuper(dev.portSpeed) ||
+       ((xhci_read32(ctrl.capBase,XHCI_CAP_HCCPARAMS1)>>12)&15)<2)return false;
+    UsbUasConfig parsed{};
+    if(!UsbUasParse(dev.rawConfig,dev.rawConfigLen,bot?int(dev.mscInterface):-1,parsed) ||
+       !XhciUasCanClaim(ctrl,dev,parsed))return false;
+    auto* uas=XhciAllocateUas(parsed);
+    if(!uas)return false;
+    const auto selectStart=MscNowNs();
+    const bool selected=!parsed.alternate ||
+        XhciSelectStorageInterface(ctrl,dev,parsed.interface,parsed.alternate);
+    dev.mscTiming.uasSetInterfaceUs=(MscNowNs()-selectStart)/1000;
+    if(!selected) {
+        if(bot)fallback=XhciSelectStorageInterface(ctrl,dev,dev.mscInterface,dev.mscAlternate);
+        XhciFreeUas(uas);
         return false;
+    }
+    const auto configureStart=MscNowNs();
+    const uint32_t cc=XhciConfigureUas(ctrl,dev,*uas);
+    dev.mscTiming.uasConfigureUs=(MscNowNs()-configureStart)/1000;
+    if(cc==TRB_CC_SUCCESS) {
+        dev.uas=uas;
+        const auto identifyStart=MscNowNs();
+        const bool identified=XhciIdentifyStorage(ctrl,dev);
+        dev.mscTiming.uasIdentifyUs=(MscNowNs()-identifyStart)/1000;
+        if(identified) {
+            KPrintf("xhci: UAS ready slot=%u iface=%u alt=%u depth=%u\n",
+                dev.slotId,parsed.interface,parsed.alternate,UsbUasDepth);
+            return true;
+        }
+    }
+    uint32_t mask=0;
+    for(const auto& ep:parsed.pipes)mask|=1u<<XhciUasDci(ep.address);
+    fallback=UsbUasRestoreBot(cc!=0,bot,[&] {
+        if(XhciDropStorageEndpoints(ctrl,dev,mask)!=TRB_CC_SUCCESS)return false;
+        XhciDiscardStorageEvents(ctrl,dev,mask);
+        dev.uas=nullptr;
+        XhciFreeUas(uas);
+        return true;
+    },[&] {
+        if(!XhciSelectStorageInterface(ctrl,dev,dev.mscInterface,dev.mscAlternate))return false;
+        __atomic_store_n(&dev.mscDiscardDcis,0,__ATOMIC_RELEASE);
+        __atomic_store_n(&dev.mscQuarantined,false,__ATOMIC_RELEASE);
+        return true;
+    });
+    KPrintf("xhci: UAS init failed slot=%u cc=%u BOT fallback=%u\n",
+        dev.slotId,cc,fallback?1u:0u);
+    return false;
+}
+
+static bool XhciStartBot(XhciController& ctrl,XhciDevice& dev) {
+    return XhciConfigureBulkEndpoint(ctrl,dev,dev.bulkInAddr,dev.bulkInMaxPacket,
+           dev.bulkInRing,dev.bulkInRingPhys,dev.bulkInEnqueue,dev.bulkInCycle,dev.bulkInDci) &&
+       XhciConfigureBulkEndpoint(ctrl,dev,dev.bulkOutAddr,dev.bulkOutMaxPacket,
+           dev.bulkOutRing,dev.bulkOutRingPhys,dev.bulkOutEnqueue,dev.bulkOutCycle,dev.bulkOutDci) &&
+       XhciIdentifyStorage(ctrl,dev);
+}
+
+static void XhciProbeBotLimit(UsbMscState& storage,XhciDevice& dev) {
+    auto* state=&storage;
+    auto& ctrl=*state->ctrl;
+    MscCommandGuard guard;
+    auto inquiryPage=[&](uint8_t page) {
+        constexpr uint8_t length=64;
+        const uint8_t cdb[6]={SCSI_INQUIRY,1,page,0,length,0};
+        memset(state->bounce,0,length);
+        return XhciMscExecuteLocked(ctrl,dev,cdb,sizeof(cdb),state->bounce,
+            state->bouncePhys,length,true,true);
+    };
+    const auto supported=inquiryPage(0);
+    auto* data=state->bounce;
+    if(supported.success() && ScsiUnmapVpd(data,supported.actual,0,4)) {
+        const uint32_t length=uint32_t(data[2])<<8|data[3];
+        bool hasLimits=false;
+        for(uint32_t i=0;i<length && i<supported.actual-4;++i)hasLimits|=data[4+i]==0xb0;
+        if(hasLimits) {
+            const auto limits=inquiryPage(0xb0);
+            if(limits.success() && ScsiUnmapVpd(data,limits.actual,0xb0,12)) {
+                const uint64_t maximum=uint64_t(ScsiUnmapBe32(data+8))*dev.mscBlockSize;
+                if(maximum && maximum<state->bounceCapacity)state->botMaxBytes=maximum;
+            }
+        }
+    }
+}
+
+static int XhciPromoteSystemStorage(UsbMscState& state) {
+    MscIoGuard guard;
+    auto& ctrl=*state.ctrl;
+    auto& dev=g_devices[state.devIndex];
+    if(dev.uas)return 0;
+    if(state.windows.heldSystem || !UsbMscByteTransport{&state}.usable())return -5;
+    const uint32_t mask=(1u<<dev.bulkInDci)|(1u<<dev.bulkOutDci);
+    UsbUasConfig parsed{};
+    if(!g_storageUas || !UsbSpeedIsSuper(dev.portSpeed) ||
+       ((xhci_read32(ctrl.capBase,XHCI_CAP_HCCPARAMS1)>>12)&15)<2 ||
+       !UsbUasParse(dev.rawConfig,dev.rawConfigLen,dev.mscInterface,parsed) ||
+       !XhciUasCanClaim(ctrl,dev,parsed,mask)) {
+        XhciProbeBotLimit(state,dev);
+        return UsbMscByteTransport{&state}.usable()?-95:-5;
+    }
+    const auto block=dev.mscBlockSize;
+    const auto sectors=dev.mscSectorCount;
+    const auto dropStart=MscNowNs();
+    if(XhciDropStorageEndpoints(ctrl,dev,mask)!=TRB_CC_SUCCESS)return -5;
+    XhciDiscardStorageEvents(ctrl,dev,mask);
+    FreeDmaBuffer(dev.bulkInRingPhys,1);
+    FreeDmaBuffer(dev.bulkOutRingPhys,1);
+    dev.bulkInRing=nullptr;dev.bulkOutRing=nullptr;
+    dev.bulkInRingPhys=0;dev.bulkOutRingPhys=0;
+    dev.mscTiming.uasDropBotUs=(MscNowNs()-dropStart)/1000;
+    bool fallback=false;
+    const bool attached=XhciTryUas(ctrl,dev,fallback) || (fallback && XhciStartBot(ctrl,dev));
+    if(attached && !dev.uas)XhciProbeBotLimit(state,dev);
+    return attached && UsbMscByteTransport{&state}.usable() && dev.mscBlockSize==block && dev.mscSectorCount==sectors?0:-5;
+}
+
+static bool XhciInitMassStorage(XhciController& ctrl,XhciDevice& dev,uint32_t devIndex) {
+    SerialPuts("xhci: initializing mass storage device\n");
+    if(dev.bulkInAddr && dev.bulkOutAddr) {
+        if(!XhciStartBot(ctrl,dev))return false;
+    } else {
+        bool fallback=false;
+        if(!XhciUasFixture(dev) || !XhciTryUas(ctrl,dev,fallback))return false;
     }
 
     // Register as block device
@@ -3032,8 +3736,18 @@ static bool XhciInitMassStorage(XhciController& ctrl, XhciDevice& dev,
     if (!state) return false;
     state->ctrl = &ctrl;
     state->devIndex = devIndex;
-    state->windowStart = state->windowLength = 0;
-    state->bounce=static_cast<uint8_t*>(AllocDmaBuffer(16,state->bouncePhys));
+    state->windows={};
+    state->systemFailed=false;
+    state->unmapLimits={};
+    state->botMaxBytes=0;
+    state->bounceCapacity=65536;
+    state->bounce=nullptr;
+    if(UsbSystemRequested() && !g_storagePageChunks && !g_storageLegacyBurst) {
+        state->bounce=static_cast<uint8_t*>(AllocDmaBuffer(USB_MSC_MAX_BULK_BYTES/4096,state->bouncePhys));
+        if(state->bounce)state->bounceCapacity=USB_MSC_MAX_BULK_BYTES;
+    }
+    if(!state->bounce)
+        state->bounce=static_cast<uint8_t*>(AllocDmaBuffer(state->bounceCapacity/4096,state->bouncePhys));
     if(!state->bounce){kfree(state);return false;}
 
     auto* blkDev = static_cast<Device*>(kmalloc(sizeof(Device)));
@@ -3146,7 +3860,7 @@ static void XhciDeviceGone(uint32_t index)
         }
     }
     const auto saved = IrqSpinLockAcquire(&g_eventRingLock);
-    dev.gone = true;
+    __atomic_store_n(&dev.gone,true,__ATOMIC_RELEASE);
     const bool hadHid = dev.kbd.active || dev.mouse.active;
     XhciEndHid(dev.kbd,true);
     XhciEndHid(dev.mouse,false);
@@ -3280,8 +3994,7 @@ static int XhciEnumerate(XhciController& ctrl, int parent, uint8_t port, uint32_
     if (dev.isKeyboard && !XhciStartHid(ctrl, dev, dev.kbd, true)) dev.note = "keyboard setup failed";
     if (dev.isMouse && !XhciStartHid(ctrl, dev, dev.mouse, false)) dev.note = "mouse setup failed";
     if (dev.ecm.value && !XhciInitEcm(ctrl, dev)) dev.note = "ECM setup failed";
-    if (dev.isMassStorage && dev.bulkInAddr && dev.bulkOutAddr &&
-        !XhciInitMassStorage(ctrl, dev, index)) dev.note = "storage setup failed";
+    if(dev.isMassStorage && !XhciInitMassStorage(ctrl,dev,index))dev.note="storage setup failed";
     if (dev.isHub && XhciHubSetup(ctrl, index)) XhciHubScan(ctrl, index, true);
     return static_cast<int>(index);
 }
@@ -3799,6 +4512,11 @@ static int XhciMatchTransferEvent(const XhciController& ctrl, const Trb& evt)
     for (uint32_t i = 0; i < count; i++) {
         const XhciDevice& dev = g_devices[i];
         if (dev.ctrl != &ctrl) continue;
+        // A quarantined UAS ring is identified by slot and endpoint, including
+        // aborted events with no usable transfer TRB pointer.
+        if(!dev.gone && dev.slotId==(evt.control>>24) &&
+           (__atomic_load_n(&dev.mscDiscardDcis,__ATOMIC_ACQUIRE)&(1u<<((evt.control>>16)&31))))
+            return static_cast<int>(i);
         if (in(dev.intRingPhys) || in(dev.bulkInRingPhys) || in(dev.bulkOutRingPhys) ||
             in(dev.ep0RingPhys) || in(dev.kbd.ringPhys) || in(dev.mouse.ringPhys))
             return static_cast<int>(i);
@@ -4902,12 +5620,34 @@ static void XhciUacHotplugTick()
 static int XhciModuleInit()
 {
     SerialPuts("xhci: initializing USB 3.0 host controller driver\n");
+    g_storageReadOnly=UsbSystemRequested();
     if(auto* marker=VfsOpen("/etc/usb-read-only")) {
         g_storageReadOnly=true;VfsClose(marker);KPuts("xhci: physical storage probe is read-only\n");
     }
     if(auto* marker=VfsOpen("/etc/usb-msc-page-chunks")) {
         g_storagePageChunks=true;VfsClose(marker);
         KPuts("xhci: diagnostic MSC limit=4096 bytes (single data TRB)\n");
+    }
+
+    if(UsbSystemRequested()) {
+        if(auto* marker=VfsOpen("/etc/usb-uas")) {
+            g_storageUas=true;
+            VfsClose(marker);
+            if(auto* fixture=VfsOpen("/etc/usb-uas-fixture")) {
+                uint32_t eax=1,ecx=0,ebx,edx;
+                __asm__ volatile("cpuid":"+a"(eax),"=b"(ebx),"+c"(ecx),"=d"(edx));
+                g_storageUasFixture=(ecx>>31)!=0;
+                VfsClose(fixture);
+            }
+        }
+        if(auto* marker=VfsOpen("/etc/usb-bot-legacy")) {
+            g_storageLegacyBurst=true;
+            VfsClose(marker);
+        }
+        if(auto* marker=VfsOpen("/etc/usb-bot-pipeline")) {
+            g_storagePipeline=!g_storageLegacyBurst;
+            VfsClose(marker);
+        }
     }
 
     // Drive every xHCI function: chipset and add-in controllers alike.

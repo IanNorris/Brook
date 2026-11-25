@@ -551,6 +551,8 @@ int64_t sys_brook_wm_set_cursor_image(uint64_t pixelsAddr, uint64_t w,
                                        uint64_t hotY, uint64_t);
 int64_t sys_brook_wm_get_screen_info(uint64_t outAddr, uint64_t, uint64_t,
                                       uint64_t, uint64_t, uint64_t);
+int64_t sys_brook_wm_get_outputs(uint64_t headerAddr, uint64_t outputsAddr, uint64_t capacity,
+                                 uint64_t, uint64_t, uint64_t);
 int64_t sys_brook_wm_scanout_map(uint64_t outAddr, uint64_t, uint64_t,
                                   uint64_t, uint64_t, uint64_t);
 int64_t sys_brook_wm_scanout_flip(uint64_t minY, uint64_t maxY, uint64_t,

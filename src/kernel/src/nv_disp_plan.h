@@ -211,6 +211,9 @@ struct Config{
     // ever under the GOP's head, so the next submission and the restore never execute.
     uint32_t presentInterval=0;
     uint32_t extraWindowChid=0; // also bind sync + ISO for this window channel (head-1 window)
+    // Resident driver (nv_disp_driver.h): step 3 and the head-1 plan share one instmem image.
+    bool bindCore=false;           // bind the core sync ctxdma even when the core is not connected
+    bool allowSharedInstmem=false; // preflight accepts instmem already valid at instVram (the other output's)
     uint32_t replayVal[kReplayCount]{};
     uint32_t restoreVal[kRestoreCount]={0,0,0x08700f00,0x10,0xcf,0x100,kHandleGop,0,0,0x08700f00,0x08700f00,0,1,1};
     GopState gop{};
@@ -256,7 +259,7 @@ inline Err BuildInstImage(const Config& c,InstImage& img){
     };
     // Window channel: notifier + ISO (+ GOP handle). Core (stage B): notifier only.
     if(!bind(wch,0)||!bind(wch,1)||(c.gopHandle&&!bind(wch,2)))return Err::HashFull;
-    if(c.coreChannel&&!bind(kChidCore,0))return Err::HashFull;
+    if((c.coreChannel||c.bindCore)&&!bind(kChidCore,0))return Err::HashFull;
     if(c.extraWindowChid&&(!bind(c.extraWindowChid,0)||!bind(c.extraWindowChid,1)))return Err::HashFull;
     return Err::Ok;
 }
@@ -361,7 +364,8 @@ enum class Op:uint8_t{
                 // rd(A) & M or rd(B) & M, vram = M<<48 | B<<24 | A (a supervisor during the rung), else on timeout
     ExpectSoft, // (reg & mask) == value, else io.flag(step, got): a sticky warning, never fails
     ExpectVpll, // VPLL at reg (+4 P|N|M, +0x10 fN<<16) runs at value kHz +- mask with refclk x kHz
-    WriteIf,    // reg = value only if (rd(y) & z) == x; else skipped (got = rd(y), logged as not ok, never fails)
+    WriteIf,    // reg = value only if (rd(y) & z) == x and, if vram != 0, (rd(low32(vram)) & high32(vram)) == 0;
+                // else skipped (got = the failing read, logged as not ok, never fails)
     ExpectOr,   // (reg & mask) == value or == x, else abort
     ReplaySkip, // core chid `reg`: if no ASSY != ARM outside `ours` (diff skip rules) in 0x200-0x3fc,
                 // 0x1000-0x13fc, 0x2000-0x2ffc: vram32 = value (a JUMP over the replay); got = first diff or 0
@@ -606,8 +610,10 @@ inline void AddKickAndWait(Plan& p,const Config& c,uint32_t putBytes,uint32_t ha
 // a log line says so; the VRAM image at instVram is never overwritten by Brook.
 inline void AddInstmemOff(Plan& p,const Config& c,const char* w1,const char* w2){
     const uint32_t arm=RegArm(ChidWndw(c.window),c57e::SET_CONTEXT_DMA_ISO0);
-    p.Add(Op::WriteIf,kRegInstTarget,~0u,c.gop.instTarget,0,w1,0,RestoreHandle(c),arm,~0u);
-    p.Add(Op::WriteIf,kRegInstAddr,~0u,c.gop.instAddr,0,w2,0,RestoreHandle(c),arm,~0u);
+    // Second condition: the core is not connected (a live head-1 run shares this instmem).
+    const uint64_t core=(uint64_t(kCtlConnect)<<32)|RegChnCtl(kChidCore);
+    p.Add(Op::WriteIf,kRegInstTarget,~0u,c.gop.instTarget,0,w1,core,RestoreHandle(c),arm,~0u);
+    p.Add(Op::WriteIf,kRegInstAddr,~0u,c.gop.instAddr,0,w2,core,RestoreHandle(c),arm,~0u);
 }
 // GET stall diagnostics (flip_4_1000: GET stopped at 0x380, 32 bytes short of PUT 0x3a0,
 // no exception): snapshot the channel and exception state, then wait 3 s more without
@@ -649,14 +655,22 @@ inline Err BuildPlan(const Config& c,InstImage& img,Pushes& pushes,Plan& p,uint3
     const auto& g=c.gop;const uint32_t ch=ChidWndw(c.window),w=c.window,h=c.head;
     p.Begin(Phase::Preflight);
     p.Add(Op::Expect,kRegDispOwner,0x2,0,0,"VBIOS ownership bit clear (else tu102_disp_init claim)");
+    if(c.allowSharedInstmem){
+        p.Add(Op::ExpectOr,kRegInstTarget,~0u,g.instTarget,0,"instmem GOP (none) or ours (shared with head 1)",0,0x9);
+        p.Add(Op::ExpectOr,kRegInstAddr,~0u,g.instAddr,0,"instmem addr 0 or ours",0,uint32_t(c.instVram>>16));
+    }else{
     p.Add(Op::Expect,kRegInstTarget,~0u,g.instTarget,0,"no display instmem (GOP)");
-    p.Add(Op::Expect,kRegInstAddr,~0u,g.instAddr,0,"instmem addr 0");
+    p.Add(Op::Expect,kRegInstAddr,~0u,g.instAddr,0,"instmem addr 0");}
     // Core as the GOP left it (CHNCTL 0x21, EFI_OPERATION), or as a head-1 run leaves it
     // (live bc9cbf9e: after our connect/disconnect the core is ALLOCATE only, UNCONNECTED 8,
     // and cannot return to EFI_OPERATION). Stage A does not use the core; stage B
     // reconnects it either way.
+    if(c.allowSharedInstmem&&!c.coreChannel){ // resident driver: head 1 may own the core (running); stage A never touches it
+        p.Add(Op::Log,RegChnCtl(kChidCore),0,0,0,"core CHNCTL (head 1 may own the core)");
+        p.Add(Op::Log,RegChnStatus(kChidCore),0,0,0,"core CHNSTATUS");
+    }else{
     p.Add(Op::ExpectOr,RegChnCtl(kChidCore),0xffff,g.ctlCore,0,"core CHNCTL as left by GOP (0x21) or by a head-1 run (0x01)",0,0x01);
-    p.Add(Op::ExpectOr,RegChnStatus(kChidCore),kCoreStateMask,kCoreEfiOperation,0,"core STATE EFI_OPERATION (7) or UNCONNECTED (8)",0,0x080000);
+    p.Add(Op::ExpectOr,RegChnStatus(kChidCore),kCoreStateMask,kCoreEfiOperation,0,"core STATE EFI_OPERATION (7) or UNCONNECTED (8)",0,0x080000);}
     p.Add(Op::Expect,RegChnCtl(ch),0xffff,g.ctlWndw,0,"window CHNCTL ALLOCATE only");
     p.Add(Op::Expect,RegChnStatus(ch),kWinStateMask,kWinUnconnected,0,"window STATE UNCONNECTED (1)");
     p.Add(Op::Expect,RegArm(kChidCore,c57d::WindowSetControl(w)),0xf,g.coreWinCtl,0,"ARM window owner = head 0");
@@ -835,7 +849,10 @@ template<typename Io> uint32_t Run(const Plan& p,uint32_t begin,uint32_t end,Io&
             if(!got)io.vwr(s.vram,s.value);
             break;}
         case Op::ExpectOr:got=io.rd(s.reg);ok=(got&s.mask)==s.value||(got&s.mask)==s.x;break;
-        case Op::WriteIf:got=io.rd(s.y);if((got&s.z)==s.x)io.wr(s.reg,s.value);else io.flag(i,s,got);break;
+        case Op::WriteIf:{got=io.rd(s.y);bool go=(got&s.z)==s.x;
+            bool other=false;  // second condition: the other output still uses it (expected; a note, not a warning)
+            if(go&&s.vram){const uint32_t g2=io.rd(uint32_t(s.vram));if(g2&uint32_t(s.vram>>32)){go=false;other=true;got=g2;}}
+            if(go)io.wr(s.reg,s.value);else if(!other)io.flag(i,s,got);break;}
         case Op::ExpectVpll:{const uint32_t c=io.rd(s.reg+4),f=io.rd(s.reg+0x10);
             const uint32_t P=(c>>16)&0x3f,N=(c>>8)&0xff,M=c&0xff;const int32_t fN=int16_t(f>>16);
             if(!P||!M){ok=false;got=0;break;}

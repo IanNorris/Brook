@@ -23,11 +23,16 @@ def main():
     p.add_argument('--output', type=Path, required=True, help='new directory')
     p.add_argument('--free-mib', type=int, default=2048, help='ext2 headroom for RAM-only installs/home')
     p.add_argument('--selection-config', type=Path, help='profile selection JSON (default: VMware RC apps)')
+    p.add_argument('--nv-gsp-firmware', action='store_true',
+                   help='add nix/nv-gsp-firmware.nix (RTX 2080 GSP-RM 570.144 set + licence) to the profile; '
+                        'build_rtx_smoke_files.py --nv-gsp-firmware-store then names it in /etc/nv-gsp-firmware')
     a = p.parse_args()
     from image_profile import closure_receipt, data_size_mib, evaluate, realize
     config = {'target': 'vmware', 'apps': list(DEFAULT_APPS), 'extraPackageNames': ['vim']}
     if a.selection_config:
         config = json.loads(a.selection_config.read_text())
+    if a.nv_gsp_firmware:
+        config = dict(config, nvGspFirmware=True)
     out = a.output.resolve()
     out.mkdir(parents=True, exist_ok=False, mode=0o700)
     selection = evaluate(config)
@@ -59,6 +64,12 @@ def main():
         'partition_name': 'BROOK_STORE', 'profile': str(profile), 'closure': closure, 'config': config,
         'record': f'guid={part.bytes_le.hex()} bytes={size} sha256={digest.hexdigest()}\n',
     }
+    if a.nv_gsp_firmware:
+        fw = subprocess.check_output(['nix-build', '--no-out-link', str(ROOT / 'nix/nv-gsp-firmware.nix')],
+                                     cwd=ROOT, text=True).strip()
+        if fw not in (out / 'profile/closure.txt').read_text().split():
+            raise SystemExit(f'{fw} is not in the store closure')
+        manifest['nv_gsp_firmware'] = fw
     (out / 'store-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     print(json.dumps({k: manifest[k] for k in ('bytes', 'sha256', 'partition_guid')}, indent=2))
 

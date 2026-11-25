@@ -39,6 +39,7 @@ import re
 import shutil
 import struct
 import subprocess
+import uuid
 import sys
 import zlib
 
@@ -74,7 +75,9 @@ MARKERS = ('usb-read-only', 'audio-muted', 'hw-inventory', 'boot-status', 'boot-
 ETC_ALLOWED = {*MARKERS, 'i219-attach', 'i219-reset', 'hardware-payload-id', 'resolv.conf', 'machine-id', 'ssl',
                'bridge-v3-operators', 'rtx-update-signer',
                # --session desktop only
-               'live-store', 'volatile-desktop', 'hardware-bulk', 'usb-audio-mixer', 'dp-idle-seconds', 'chromium-alsa-device'}
+               'live-store', 'usb-system', 'usb-profile-plan.pub', 'usb-system-trim', 'usb-bot-legacy', 'usb-bot-pipeline', 'usb-uas', 'usb-uas-fixture', 'volatile-desktop', 'hardware-bulk', 'usb-audio-mixer', 'dp-idle-seconds', 'nv-display', 'chromium-alsa-device',
+               # --nv-gsp (GSP-RM M1 bridge verbs) and its firmware record
+               'nv-gsp', 'nv-gsp-firmware'}
 # Desktop live stick (--session desktop): the VMware RC session over the RAM
 # store, plus the RTX status helper. If the store does not mount, the services
 # fail to start and the kernel console, bridge and remote update stay usable.
@@ -143,7 +146,7 @@ def stick_set(kernel, initrd, payload_id):
     return raw + struct.pack('<I', zlib.crc32(raw))
 
 
-def build_helpers(build_root, initrd, policy_file, signer_hex):
+def build_helpers(build_root, initrd, policy_file, signer_hex, *, usb_profiles=False):
     """Static musl helpers with the v3 policy digest; the signer public key."""
     vendor = ROOT / 'src/third_party/monocypher'
     objects = []
@@ -158,9 +161,13 @@ def build_helpers(build_root, initrd, policy_file, signer_hex):
     signer.write_text(signer_hex + '\n')
     run(['mcopy', '-o', '-i', initrd, signer, '::/ETC/rtx-update-signer'])
     digests = {}
-    for name, source in HELPERS.items():
+    helpers = dict(HELPERS)
+    if usb_profiles:
+        helpers['HWBULK.ELF'] = 'tools/hardware_bulk.c'
+    for name, source in helpers.items():
         binary = build_root / name
-        run([os.environ['MUSL_CC'], *flags, ROOT / source, *objects, '-o', binary])
+        definitions = ['-DBROOK_BULK_USB_PROFILE'] if name == 'HWBULK.ELF' else []
+        run([os.environ['MUSL_CC'], *flags, *definitions, ROOT / source, *objects, '-o', binary])
         run(['mcopy', '-o', '-i', initrd, binary, '::/BOOT/' + name])
         if subprocess.check_output(['mtype', '-i', initrd, '::/BOOT/' + name]) != binary.read_bytes():
             raise SystemExit(name + ' readback mismatch')
@@ -174,6 +181,54 @@ def fat_write(image, path, data):
         raise SystemExit('FAT readback mismatch for ' + path)
 
 
+# The GSP-RM firmware set (nix/nv-gsp-firmware.nix output). Every listed file
+# must be in its SHA256SUMS; the kernel re-checks its own pinned hashes.
+NV_GSP_FIRMWARE_FILES = ('lib/firmware/nvidia/tu104/gsp/gsp-570.144.bin',
+                         'lib/firmware/nvidia/tu104/gsp/booter_load-570.144.bin',
+                         'lib/firmware/nvidia/tu104/gsp/booter_unload-570.144.bin',
+                         'lib/firmware/nvidia/tu104/gsp/bootloader-570.144.bin',
+                         'lib/firmware/nvidia/tu104/acr/bl.bin')
+NV_GSP_LICENCE_FILES = ('share/licenses/nv-gsp-firmware/LICENCE.nvidia',
+                        'share/licenses/nv-gsp-firmware/WHENCE.nouveau')
+NV_GSP_INITRD_ROOT = '/boot/nvgsp'
+
+
+def nv_gsp_firmware_sums(root):
+    sums = {}
+    for row in (root / 'SHA256SUMS').read_text().splitlines():
+        digest, name = row.split('  ', 1)
+        sums[name] = digest
+    if sorted(sums) != sorted(NV_GSP_FIRMWARE_FILES):
+        raise SystemExit(f'{root}: unexpected SHA256SUMS entries')
+    for name, digest in sums.items():
+        if sha(root / name) != digest:
+            raise SystemExit(f'{root}/{name}: sha256 mismatch')
+    for name in NV_GSP_LICENCE_FILES:
+        if not (root / name).is_file():
+            raise SystemExit(f'{root}/{name}: missing licence file')
+    return sums
+
+
+def embed_nv_gsp_firmware(initrd, root):
+    """Copy the firmware set and its licence into the initrd under
+    /boot/nvgsp (paths as below lib/firmware), read back byte for byte."""
+    sums = nv_gsp_firmware_sums(root)
+    made = set()
+    for name in (*NV_GSP_FIRMWARE_FILES, *NV_GSP_LICENCE_FILES):
+        rel = name.removeprefix('lib/firmware/')
+        parts = ('BOOT/NVGSP/' + rel).split('/')
+        for i in range(1, len(parts)):
+            d = '::/' + '/'.join(parts[:i])
+            if d not in made and subprocess.run(['mdir', '-i', str(initrd), d], capture_output=True).returncode:
+                run(['mmd', '-i', initrd, d])
+            made.add(d)
+        run(['mcopy', '-o', '-i', initrd, root / name, '::/' + '/'.join(parts)])
+        if subprocess.check_output(['mtype', '-i', str(initrd), '::/' + '/'.join(parts)]) != (root / name).read_bytes():
+            raise SystemExit('FAT readback mismatch for ' + name)
+    fat_write(initrd, 'ETC/nv-gsp-firmware', (NV_GSP_INITRD_ROOT + '\n').encode())
+    return {'root': NV_GSP_INITRD_ROOT, 'source': str(root), 'sha256': sums}
+
+
 def gc_root(path, root):
     """Register an indirect GC root so the host's periodic nix-gc cannot
     delete store paths this set (or its live store) depends on."""
@@ -181,24 +236,54 @@ def gc_root(path, root):
     run(['nix-store', '--add-root', str(root), '--indirect', '--realise', str(path)], stdout=subprocess.DEVNULL)
 
 
+def embed_usb_profile_runtime(args, initrd, profile):
+    import shlex
+    import zipfile
+
+    helper = (profile / 'bin/brook-stage-profile').resolve(strict=True)
+    lines = helper.read_text().strip().splitlines()
+    if len(lines) != 3 or not lines[1].startswith('export BROOK_STAGE_OPENSSL='):
+        raise ValueError('Unexpected selected-profile launcher')
+    openssl = lines[1].split('=', 1)[1]
+    command = shlex.split(lines[2])
+    if len(command) != 7 or command[0] != 'exec' or command[2:5] != ['-B', '-E', '-s'] or command[6] != '$@':
+        raise ValueError('Unexpected selected-profile runtime command')
+    python, support = command[1], Path(command[5]).parent
+    for path in (helper, openssl, python, support):
+        if not re.fullmatch(r'/nix/store/[A-Za-z0-9+._/=-]+', str(path)) or '..' in Path(path).parts:
+            raise ValueError('Selected-profile runtime is outside the Nix store')
+    payload = args.build_root / 'usb-stage.pyz'
+    with zipfile.ZipFile(payload, 'x', compression=zipfile.ZIP_STORED) as archive:
+        archive.write(ROOT / 'tools/nix-install/stage_usb_profile.py', '__main__.py')
+    fat_write(initrd, 'BOOT/USBSTAGE.PYZ', payload.read_bytes())
+    launcher = (f'export BROOK_STAGE_OPENSSL={shlex.quote(openssl)}\n'
+                f'exec {shlex.quote(python)} -B -E -s /boot/USBSTAGE.PYZ '
+                f'{shlex.quote(str(support))} {shlex.quote(str(helper))} {sha(helper)} "$@"\n')
+    fat_write(initrd, 'BOOT/USBSTAGE.RC', launcher.encode())
+
+
 def desktop_payload(args, initrd):
-    """Desktop session additions (as make_vmware_image.make_initrds), the
-    /etc/live-store record, and the EVO4 mixer autostart marker."""
-    if not args.live_store:
-        raise SystemExit('--session desktop needs --live-store')
-    sys.path.insert(0, str(ROOT / 'scripts'))
+    """Embed desktop boot assets from a signed plan or the fallback RAM store."""
     from stage_clearwater_shell import add_clearwater_start, embed_clearwater_executables, embed_terminal_shortcut
     from make_vmware_image import wallpaper_raw, check_wallpaper
-    store = json.loads(args.live_store.read_text())
-    if store.get('format') != 'brook-rtx-live-store/1' or not re.fullmatch(
-            r'(guid=[0-9a-f]{32}|lba=\d+ sectors=\d+) bytes=\d+ sha256=[0-9a-f]{64}\n', store['record']):
-        raise SystemExit('unexpected live store manifest')
-    profile = Path(store['profile'])
-    if not (profile / 'bin/bash').exists():
-        raise SystemExit(f'live-store profile {profile} is missing from the host store (garbage-collected?); '
-                         'realise it again (scripts/image_profile.py) before building')
     roots = args.build_root / 'gcroots'
-    gc_root(profile, roots / 'live-store-profile')
+    store = None
+    if args.usb_system:
+        plan, plan_hash, key_bytes = args.checked_profile_plan
+        profile = Path('/nix/store') / plan['profile']['root']
+        fat_write(initrd, 'ETC/usb-profile-plan.pub', key_bytes)
+        embed_usb_profile_runtime(args, initrd, profile)
+    else:
+        if not args.live_store:
+            raise SystemExit('Fallback desktop requires --live-store')
+        store = json.loads(args.live_store.read_text())
+        if store.get('format') != 'brook-rtx-live-store/1' or not re.fullmatch(
+                r'(guid=[0-9a-f]{32}|lba=\d+ sectors=\d+) bytes=\d+ sha256=[0-9a-f]{64}\n', store['record']):
+            raise SystemExit('Unexpected live-store manifest')
+        profile = Path(store['profile'])
+    if not (profile / 'bin/bash').is_file():
+        raise SystemExit(f'Profile {profile} is missing the boot shell. Realise it on the host first.')
+    gc_root(profile, roots / 'desktop-profile')
     for directory in ('::/BOOT/BIN', '::/DATA', '::/NIX'):
         if subprocess.run(['mdir', '-i', str(initrd), directory], capture_output=True).returncode:
             run(['mmd', '-i', initrd, directory])
@@ -213,15 +298,44 @@ def desktop_payload(args, initrd):
     fat_write(initrd, 'ETC/usb-audio-mixer', b'1\n')
     # RTX DP sink idle-off: 5 min, AUX ch 3 / SOR1 link B (the GOP's lit head on this desktop).
     fat_write(initrd, 'ETC/dp-idle-seconds', b'300 3 1 2\n')
+    if args.nv_gsp:  # GSP-RM M1 bridge verbs (nv-gsp status|p3|fini|trace); nothing at boot
+        fat_write(initrd, 'ETC/nv-gsp', b'1\n')
+    if args.nv_display:  # desktop presents by flipping head 0 (D2); GOP copy otherwise
+        fat_write(initrd, 'ETC/nv-display', b'1\n')
     fat_write(initrd, 'ETC/chromium-alsa-device', b'default\n')  # read by the store's brook-chromium
-    fat_write(initrd, 'ETC/live-store', store['record'].encode())
+    if args.usb_system:
+        # Persistent /nix on the SSD's BROOK_SYSTEM partition (usb_system.cpp)
+        # The volume identity stays fixed across signed profile generations.
+        ssd = json.loads(args.usb_system.read_text())
+        if ssd.get('format') != 'brook-ssd-system/1' or ssd.get('partition_name') != 'BROOK_SYSTEM' or \
+                ssd.get('partition_entry') != 2 or ssd.get('fs_type') != 'ext2':
+            raise SystemExit('unexpected ssd-system.json')
+        record = (f"BRKUSB1\n{uuid.UUID(ssd['partition_guid']).bytes_le.hex()}\n"
+                  f"{int(ssd['first_lba'])},{int(ssd['sectors'])}\n{uuid.UUID(ssd['fs_uuid']).hex}\n")
+        fat_write(initrd, 'ETC/usb-system', record.encode())
+        if args.usb_uas:
+            fat_write(initrd, 'ETC/usb-uas', b'1\n')
+            if args.usb_uas_fixture:
+                fat_write(initrd, 'ETC/usb-uas-fixture', b'1\n')
+        if args.usb_bot != 'default':
+            fat_write(initrd, 'ETC/usb-bot-' + args.usb_bot, b'1\n')
+        if args.usb_system_trim:
+            fat_write(initrd, 'ETC/usb-system-trim', (args.usb_system_trim + '\n').encode())
+    else:
+        fat_write(initrd, 'ETC/live-store', store['record'].encode())
     fat_write(initrd, 'BOOT/BIN/BASH', (profile / 'bin/bash').read_bytes())
     wallpaper = wallpaper_raw()
     check_wallpaper(wallpaper)
     fat_write(initrd, 'BOOT/WALLPAPER.RAW', wallpaper)
-    live = {k: store[k] for k in ('bytes', 'sha256', 'partition_guid', 'partition_name', 'profile', 'record', 'slot')
-            if k in store}
-    return add_clearwater_start(DESKTOP_RC), live
+    if args.usb_system:
+        storage = {'record': record, 'profile': str(profile), 'plan_sha256': plan_hash,
+                   'plan_key_sha256': hashlib.sha256(key_bytes).hexdigest()}
+    else:
+        storage = {k: store[k] for k in
+                   ('bytes', 'sha256', 'partition_guid', 'partition_name', 'profile', 'record', 'slot')
+                   if k in store}
+    return add_clearwater_start(DESKTOP_RC), storage
+
 
 
 def etc_listing(image):
@@ -240,6 +354,9 @@ def build(args):
             raise SystemExit(f'{path} must not exist')
     if args.image is not None and os.path.lexists(args.image):
         raise SystemExit(f'{args.image} must not exist')
+    if args.usb_system:
+        from usb_profile_plan import checked_plan
+        args.checked_profile_plan = checked_plan(args.profile_plan, args.profile_plan_public_key)
     if args.operators.name.endswith('.seed'):
         raise SystemExit('--operators takes the public key file, never a seed')
     signer_hex = args.update_signer.read_text().strip()
@@ -256,6 +373,8 @@ def build(args):
     if dirty and not args.allow_dirty:
         raise SystemExit('Commit tracked changes first (or --allow-dirty for a throwaway build)')
 
+    if args.nv_gsp:
+        KERNEL_FLAGS['BROOK_NV_GSP'] = 'ON'
     args.build_root.mkdir(mode=0o700, parents=True)
     operators = args.build_root / 'operators.pub'
     operators.write_bytes(policy)
@@ -287,7 +406,8 @@ def build(args):
     env = dict(os.environ, BROOK_BUILD_DIR=str(stage), BROOK_INITRD_MARKERS=','.join(markers),
                BROOK_HARDWARE_PAYLOAD_ID=payload_id)
     if args.session == 'desktop':
-        env['BROOK_INITRD_KIB'] = '24576'
+        # +32 MiB for the 28.7 MB GSP firmware set when it rides in the initrd
+        env['BROOK_INITRD_KIB'] = '57344' if args.nv_gsp_firmware else '24576'
     env.pop('BROOK_PROVIDER_PAYLOAD', None)
     run(['bash', ROOT / 'scripts/make_initrd.sh', '--release'], env=env)
     initrd = stage / 'esp/INITRD.IMG'
@@ -297,9 +417,17 @@ def build(args):
     live = None
     if args.session == 'desktop':
         init_rc_bytes, live = desktop_payload(args, initrd)
+    nv_gsp_fw = embed_nv_gsp_firmware(initrd, args.nv_gsp_firmware) if args.nv_gsp_firmware else None
+    if args.nv_gsp_firmware_store:
+        # The desktop store already carries the set (build_rtx_live_store.py --nv-gsp-firmware).
+        store = json.loads(args.nv_gsp_firmware_store.read_text())
+        fw = Path(store['nv_gsp_firmware'])
+        nv_gsp_firmware_sums(fw)
+        fat_write(initrd, 'ETC/nv-gsp-firmware', f'{fw}/lib/firmware\n'.encode())
+        nv_gsp_fw = {'root': f'{fw}/lib/firmware', 'source': 'store', 'store_sha256': store['sha256']}
     init_rc.write_bytes(init_rc_bytes)
     run(['mcopy', '-o', '-i', initrd, init_rc, '::BOOT/INIT.RC'])
-    helpers = build_helpers(args.build_root, initrd, operators, signer_hex)
+    helpers = build_helpers(args.build_root, initrd, operators, signer_hex, usb_profiles=bool(args.usb_system))
     etc = etc_listing(initrd)
     unexpected = sorted(set(etc) - ETC_ALLOWED)
     if unexpected or not set(MARKERS) <= set(etc):
@@ -330,17 +458,20 @@ def build(args):
         'fat_label': FAT_LABEL, 'files': files,
         'kernel_options': KERNEL_FLAGS, 'loader_options': LOADER_FLAGS,
         'loader_config': config.decode(), 'init_rc': init_rc_bytes.decode(),
-        'session': args.session, 'live_store': live,
+        'session': args.session, 'live_store': live if not args.usb_system else None,
+        'usb_system': live if args.usb_system else None,
         'initrd': {'drivers': list(DRIVERS), 'etc': etc, 'markers': list(markers)},
         'i219_stage': args.i219_stage,
+        'nv_gsp': {'verbs': bool(args.nv_gsp), 'firmware': nv_gsp_fw},
         'helpers': helpers,
         'update_signer_public': signer_hex,
         'bridge_v3': {'operator_keys': len(keys), 'policy_sha256': hashlib.sha256(policy).hexdigest()},
         'hardware_scope': {
-            'root': 'RAM initrd only; no disk is mounted',
+            'root': 'RAM initrd; /nix on BROOK_SYSTEM' if args.usb_system else 'RAM initrd',
             'storage': 'AHCI unbound (no selectors), no NVMe driver, USB mass storage read-only (EROFS in xhci) '
                        'except a write window over the boot-stick partition during a signed authenticated update, '
-                       'built-in virtio-blk only exists in VMs',
+                       'built-in virtio-blk only exists in VMs'
+                       + (', persistent writes restricted to BROOK_SYSTEM by its lease' if args.usb_system else ''),
             'firmware': 'no EFI variable writes, no firmware/flash access, no AML interpreter (uACPI off)',
             'pci_writes': 'every xHCI controller (BIOS handoff, controller reset, memory+bus-master enable, '
                           'MSI/MSI-X); the I219-V 8086:15b8 command register (memory, bus master, INTx off) '
@@ -351,6 +482,11 @@ def build(args):
             'display': 'firmware GOP framebuffer only',
         },
     }
+    if args.nv_gsp:
+        manifest['hardware_scope']['gsp'] = (
+            'only on explicit bridge calls (nv-gsp p3|fini, each at most once per boot): GPU fn0 PCI command '
+            'bus-master enable and GSP/SEC2 falcon registers (FWSEC from the card VBIOS, booter_unload from the '
+            'pinned 570.144 set); PROM read-only; no VBIOS/flash writes, no clock/fan/voltage changes')
     staged_manifest = staged / 'manifest.json'
     staged_manifest.write_text(json.dumps(manifest, indent=2) + '\n')
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -406,15 +542,58 @@ def main():
     p.add_argument('--display-max', default='1920x1080', metavar='WxH',
                    help='GOP mode cap in BROOK.CFG (kernel supports up to 4096x2160); outside PREV/ fallback')
     p.add_argument('--allow-dirty', action='store_true')
+    p.add_argument('--nv-display', action='store_true',
+                   help='desktop image: /etc/nv-display = 1 (RTX head-0 flip presentation at desktop start)')
     p.add_argument('--panic-ingest-url-file', type=Path,
                    default=Path('/data/Programming/Brook/shared/dell/panic-ingest-url'),
                    help='file holding the panic scanner URL for the panic QR (same as the Dell build); '
                         'BROOK_PANIC_INGEST_URL overrides; missing file keeps the built-in default')
     p.add_argument('--session', choices=('kconsole', 'desktop'), default='kconsole',
-                   help='desktop: VMware RC desktop over the RAM live store (needs --live-store)')
+                   help='desktop with a persistent USB system or a fallback live store')
     p.add_argument('--live-store', type=Path, metavar='STORE_MANIFEST',
                    help='store-manifest.json from build_rtx_live_store.py')
+    p.add_argument('--usb-system', type=Path, metavar='SSD_SYSTEM_JSON',
+                   help='desktop image: boot /nix persistently from the SSD BROOK_SYSTEM partition described by '
+                        'write-brook-ssd-system.sh\'s ssd-system.json (writes /etc/usb-system, not /etc/live-store)')
+    p.add_argument('--profile-plan', type=Path, help='signed selected profile plan directory for --usb-system')
+    p.add_argument('--profile-plan-public-key', type=Path, help='Ed25519 public key admitted by the USB set')
+    p.add_argument('--usb-uas', action='store_true', help='try tagged USB Attached SCSI in SuperSpeed')
+    p.add_argument('--usb-uas-fixture', action='store_true', help='permit QEMU UAS-only boot fixture discovery')
+    p.add_argument('--usb-bot', choices=('default', 'legacy', 'pipeline'), default='default',
+                   help='USB system BOT test mode: legacy 64 KiB or experimental read data/status pipelining')
+    p.add_argument('--usb-system-trim', metavar="'dry-run|run [MIN_MIB [MAX_MIB]]'",
+                   help="scan clean ext2 free extents before mount; send UNMAP only with 'run'")
+    p.add_argument('--nv-gsp', action='store_true',
+                   help='desktop image: BROOK_NV_GSP kernel and /etc/nv-gsp (GSP-RM bridge verbs; nothing runs at boot)')
+    p.add_argument('--nv-gsp-firmware', type=Path, metavar='NIX_OUT',
+                   help='nix/nv-gsp-firmware.nix output to carry in the signed initrd (/boot/nvgsp, /etc/nv-gsp-firmware)')
+    p.add_argument('--nv-gsp-firmware-store', type=Path, metavar='STORE_MANIFEST',
+                   help='store-manifest.json of a store built with --nv-gsp-firmware: /etc/nv-gsp-firmware names '
+                        'the store copy (the store itself must be the one this set boots)')
     args = p.parse_args()
+    if args.nv_gsp_firmware and args.nv_gsp_firmware_store:
+        p.error('--nv-gsp-firmware and --nv-gsp-firmware-store are alternatives')
+    if args.nv_gsp_firmware_store and not args.nv_gsp:
+        p.error('--nv-gsp-firmware-store needs --nv-gsp')
+    if args.nv_gsp_firmware and not (args.nv_gsp and args.session == 'desktop'):
+        p.error('--nv-gsp-firmware needs --nv-gsp and --session desktop')
+    if args.nv_gsp and args.session != 'desktop':
+        p.error('--nv-gsp needs --session desktop')
+    if args.usb_system:
+        if args.session != 'desktop' or not args.profile_plan or not args.profile_plan_public_key or args.live_store:
+            p.error('--usb-system needs --session desktop, --profile-plan and --profile-plan-public-key')
+    elif args.profile_plan or args.profile_plan_public_key:
+        p.error('Profile plans require --usb-system')
+    if args.usb_uas_fixture and not args.usb_uas:
+        p.error("--usb-uas-fixture needs --usb-uas")
+    if args.usb_uas and not args.usb_system:
+        p.error("--usb-uas needs --usb-system")
+    if args.usb_bot != "default" and not args.usb_system:
+        p.error("--usb-bot needs --usb-system")
+    if args.usb_system_trim and (not args.usb_system or not re.fullmatch(
+            r'(dry-run|run)( [0-9]+){0,2}', args.usb_system_trim)):
+        p.error("--usb-system-trim needs --usb-system and 'dry-run' or 'run' with optional MiB limits")
+
     match = re.fullmatch(r'(\d{3,4})x(\d{3,4})', args.display_max)
     if not match or int(match[1]) > 4096 or int(match[2]) > 2160:
         p.error('--display-max: WxH up to 4096x2160')
@@ -422,6 +601,11 @@ def main():
     args.output = args.output.absolute()
     args.build_root = args.build_root.absolute()
     args.image = args.image.absolute() if args.image else None
+    args.nv_gsp_firmware = args.nv_gsp_firmware.resolve() if args.nv_gsp_firmware else None
+    if args.usb_system_trim and args.usb_system_trim.split()[0] == "run":
+        fields = args.usb_system_trim.split()
+        if len(fields) != 3 or not 0 < int(fields[1]) <= int(fields[2]) <= 524288:
+            p.error("--usb-system-trim run requires positive MIN_MIB and MAX_MIB")
     build(args)
 
 

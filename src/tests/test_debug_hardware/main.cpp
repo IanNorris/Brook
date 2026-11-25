@@ -9,6 +9,7 @@
 #include "display_power.h"
 #include "idle_inhibit.h"
 #include "writable_desktop.h"
+#include "usb_system.h"
 #include "ahci_readonly.h"
 #include "ahci_observe.h"
 #include "acpi.h"
@@ -113,6 +114,9 @@ bool AcpiInventoryRead(uint32_t index,uint32_t offset,void* out,uint32_t bytes,A
 AppSnapshotBootInfo snapshot;
 WritableDesktopInfo writable;
 WritableDesktopInfo WritableDesktopRead(){return writable;}
+UsbSystemStatus UsbSystemRead(){return {};}
+bool UsbSystemTiming(UsbStorageTiming*){return false;}
+int UsbSystemBenchRead(uint64_t,void*,uint32_t){return -19;}
 AhciReadOnlyStatus ahciStatus{};
 AhciPortRegisters ahciRegisters{};
 AhciObservation ahciObservation{};
