@@ -208,6 +208,7 @@ struct NvPresenterState{
     uint64_t cpuNs=0;uint32_t cpuMaxUs=0;   // inside the present (lock, copy, flip)
     // RAM copy of what this head shows (ShadowDiff); invalid until the first full present.
     uint32_t* shadow=nullptr;bool shadowValid=false;
+    DamageRects pending{};uint32_t deferred=0;   // changed (shadow updated) but not yet in VRAM
     uint64_t compared=0,copiedBytes=0,diffNs=0,copyNs=0;uint32_t unchanged=0,fullDiffs=0,copyMaxUs=0;
 };
 NvPresenterState g_presenter[nvdisp::kDriverOutputs]{};
@@ -250,6 +251,38 @@ void NoteCpu(NvPresenterState& p,uint64_t t0){
 // reclaim the queued one), arm it if nothing is in flight, else it waits as the queued
 // frame and the poll hook arms it right after the next LOADV. `src` is the output's
 // top-left pixel in the compositor back buffer; `damageIn` is output-local.
+// nv-aux lock held, flip idle: copy what the back buffer `bb` lacks (its missed damage plus
+// the pending changes) and flip it. 1 = flipped, 0 = no free buffer (pending kept), -1 = dead.
+int FlipPendingLocked(uint32_t o,const uint32_t* src,uint32_t srcStride){
+    auto& p=g_presenter[o];auto& f=g_driver.f[o];
+    const int8_t bb=f.Back();
+    if(bb<0){++p.noBuffer;return 0;}
+    const uint32_t width=p.width,height=p.height;
+    uint32_t* dst=p.px[bb];const uint32_t pitch=p.pitchPx;
+    uint64_t bytes=0;const uint64_t c0=PresentNowNs();
+    auto copy=[&](const DamageRect& r){
+        const int32_t x0=r.x0<0?0:r.x0,y0=r.y0<0?0:r.y0;
+        const int32_t x1=r.x1>int32_t(width)?int32_t(width):r.x1,y1=r.y1>int32_t(height)?int32_t(height):r.y1;
+        if(x1<=x0||y1<=y0)return;
+        for(int32_t y=y0;y<y1;++y)__builtin_memcpy(dst+uint64_t(y)*pitch+x0,src+uint64_t(y)*srcStride+x0,uint64_t(x1-x0)*4);
+        bytes+=uint64_t(x1-x0)*4*uint32_t(y1-y0);
+    };
+    (void)p.age.Apply(bb,p.pending,width,height,copy);
+    p.pending=DamageRects{};
+    __asm__ volatile("sfence":::"memory");
+    {const uint64_t c1=PresentNowNs();p.copyNs+=c1-c0;p.copiedBytes+=bytes;if((c1-c0)/1000>p.copyMaxUs)p.copyMaxUs=uint32_t((c1-c0)/1000);}
+    if(f.Present(bb)<0){g_driver.Tick();return g_driver.Live(o)?0:-1;}
+    ++p.frames;NoteFrame(p);
+    return 1;
+}
+// Never blocks on a flip. The damage is first diffed against the head's shadow; what
+// really changed joins the head's pending changes. With nothing in flight they are copied
+// and flipped now (shown at the next vblank); with a flip still armed (a client commit
+// woke the loop mid-frame) they wait, and the poll after the LOADV flips them, so each
+// vblank costs at most one copy, always into the buffer that missed the fewest frames
+// (D2's mailbox rendered such frames into the third buffer, which then needed the whole
+// drag history: 10-16 ms copies). `src` is the output's top-left pixel in the
+// compositor back buffer; `damageIn` is output-local.
 int PresentOutput(uint32_t o,const uint32_t* src,uint32_t srcStride,const DamageRects& damageIn){
     const uint64_t t0=PresentNowNs();
     auto& p=g_presenter[o];
@@ -259,8 +292,6 @@ int PresentOutput(uint32_t o,const uint32_t* src,uint32_t srcStride,const Damage
     if(!p.active||!g_driver.Live(o)){SpinLockRelease(lock);return -1;}
     g_driver.Tick();
     if(!g_driver.Live(o)){SpinLockRelease(lock);return -1;}
-    const int8_t bb=f.Back();
-    if(bb<0){++p.noBuffer;SpinLockRelease(lock);return kPresenterBusy;}
     const uint32_t width=p.width,height=p.height;
     DamageRects input=damageIn;
     if(p.needFull){input=DamageRects::Full(width,height);p.needFull=false;}
@@ -274,26 +305,15 @@ int PresentOutput(uint32_t o,const uint32_t* src,uint32_t srcStride,const Damage
         if(input.full){input=DamageRects::Rows(0,height,width);++p.fullDiffs;}
         for(uint32_t i=0;i<input.count;++i)p.compared+=nvdisp::ShadowDiff(src,srcStride,p.shadow,width,width,height,input.rects[i],changed);
     }
-    const uint64_t d1=PresentNowNs();p.diffNs+=d1-d0;
-    if(changed.empty()){++p.unchanged;SpinLockRelease(lock);NoteCpu(p,t0);return 0;}
-    const DamageRects* damage=&changed;
-    uint32_t* dst=p.px[bb];const uint32_t pitch=p.pitchPx;
-    uint64_t bytes=0;
-    auto copy=[&](const DamageRect& r){
-        const int32_t x0=r.x0<0?0:r.x0,y0=r.y0<0?0:r.y0;
-        const int32_t x1=r.x1>int32_t(width)?int32_t(width):r.x1,y1=r.y1>int32_t(height)?int32_t(height):r.y1;
-        if(x1<=x0||y1<=y0)return;
-        for(int32_t y=y0;y<y1;++y)__builtin_memcpy(dst+uint64_t(y)*pitch+x0,src+uint64_t(y)*srcStride+x0,uint64_t(x1-x0)*4);
-        bytes+=uint64_t(x1-x0)*4*uint32_t(y1-y0);
-    };
-    (void)p.age.Apply(bb,*damage,width,height,copy);
-    __asm__ volatile("sfence":::"memory");
-    {const uint64_t d2=PresentNowNs();p.copyNs+=d2-d1;p.copiedBytes+=bytes;if((d2-d1)/1000>p.copyMaxUs)p.copyMaxUs=uint32_t((d2-d1)/1000);}
-    if(f.Present(bb)<0){g_driver.Tick();const bool live=g_driver.Live(o);SpinLockRelease(lock);return live?kPresenterBusy:-1;}
-    ++p.frames;NoteFrame(p);
+    p.diffNs+=PresentNowNs()-d0;
+    p.pending.AddAll(changed);
+    if(p.pending.empty()&&!p.pending.full){++p.unchanged;SpinLockRelease(lock);NoteCpu(p,t0);return 0;}
+    if(changed.empty()&&!changed.full)++p.unchanged;
+    if(f.state==nvdisp::FlipState::Armed){++p.deferred;SpinLockRelease(lock);NoteCpu(p,t0);return 1;}
+    const int r=FlipPendingLocked(o,src,srcStride);
     SpinLockRelease(lock);
     NoteCpu(p,t0);
-    return 1;
+    return r;
 }
 uint64_t g_wakeAtUs=0;uint32_t g_wakePeriodUs=16667;
 void NoteLoopPresent(){
@@ -399,6 +419,16 @@ uint32_t NvPrimaryPoll(){
     uint32_t ms=16;bool lost1=false;
     if(g_presenter[0].active&&g_driver.Live(0)){
         g_driver.Tick();
+        // Changes held back while a flip was armed go out once it has landed. The back
+        // buffer equals the shadow here (between frames), so it is the copy source.
+        for(uint32_t o=0;o<2;++o){
+            auto& p=g_presenter[o];
+            if(!p.active||!g_driver.Live(o)||(p.pending.empty()&&!p.pending.full)||g_driver.f[o].state!=nvdisp::FlipState::Idle)continue;
+            uint32_t stride=0;const uint32_t* src=CompositorPresentSource(&stride);
+            const uint32_t x=o?uint32_t(__atomic_load_n(&g_head1Rect,__ATOMIC_ACQUIRE)&0xffff):0;
+            if(!src||(o&&!x)||stride<x+p.width)continue;
+            (void)FlipPendingLocked(o,src+x,stride);
+        }
         if(g_driver.Live(0))ms=WakeMsLocked();
     }
     if(g_presenter[1].active&&!g_driver.Live(1)){g_presenter[1].active=false;g_driver.out1External=false;lost1=true;}
@@ -427,6 +457,7 @@ bool MapPresenter(NvPresenterState& p,nvdisp::NvWindowFlipper<LiveBackend>& f,co
     if(!p.shadow){const VirtualAddress va=VmmAllocPages((uint64_t(a.width)*a.height*4+4095)/4096,VMM_WRITABLE|VMM_NO_EXEC,MemTag::Device,KernelPid);
         p.shadow=va?reinterpret_cast<uint32_t*>(va.raw()):nullptr;}
     p.shadowValid=false;   // the first present copies (and records) the whole head
+    p.pending=DamageRects{};
     return true;
 }
 // Called with the nv-aux lock held.
@@ -500,7 +531,7 @@ StatsMark TakeMark(){
 void PresenterStats(bool reset){
     const StatsMark now=TakeMark();
     const bool zero=reset||!g_mark.us;
-    if(zero){g_mark=now;g_pollMaxUs=0;for(auto& p:g_presenter){p.cpuMaxUs=0;p.compared=p.copiedBytes=p.diffNs=p.copyNs=0;p.unchanged=p.fullDiffs=p.copyMaxUs=0;}
+    if(zero){g_mark=now;g_pollMaxUs=0;for(auto& p:g_presenter){p.cpuMaxUs=0;p.compared=p.copiedBytes=p.diffNs=p.copyNs=0;p.unchanged=p.fullDiffs=p.copyMaxUs=p.deferred=0;}
         for(auto& v:g_wakeHist)v=0;for(auto& v:g_armLineHist)v=0;for(auto& v:g_busyHist)v=0;}
     const StatsMark& a=g_mark;
     const uint64_t us=now.us-a.us;
@@ -520,7 +551,7 @@ void PresenterStats(bool reset){
         nvdisp::NvDisplayDriver<LiveBackend>::Line c;const auto& p=g_presenter[o];
         c.raw("{\"nv_display\":\"stats_copy\",\"output\":");c.dec(o);c.raw(",\"compared_px\":");c.dec(p.compared);
         c.raw(",\"copied_bytes\":");c.dec(p.copiedBytes);c.raw(",\"diff_us\":");c.dec(p.diffNs/1000);c.raw(",\"copy_us\":");c.dec(p.copyNs/1000);
-        c.raw(",\"copy_max_us\":");c.dec(p.copyMaxUs);c.raw(",\"unchanged\":");c.dec(p.unchanged);c.raw(",\"full_diffs\":");c.dec(p.fullDiffs);
+        c.raw(",\"copy_max_us\":");c.dec(p.copyMaxUs);c.raw(",\"unchanged\":");c.dec(p.unchanged);c.raw(",\"full_diffs\":");c.dec(p.fullDiffs);c.raw(",\"deferred\":");c.dec(p.deferred);
         c.raw(",\"busy\":");c.dec(p.busy);c.raw(",\"no_buffer\":");c.dec(p.noBuffer);c.raw("}\n");DebugChannelSend(c.t);
     }
     {   // compositor frame cost and escalations (zeroed with the window)
