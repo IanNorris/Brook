@@ -1664,7 +1664,15 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
             // rtx-disp probes: VRAM size, BAR1/BAR2 block, PRAMIN window contents (reads only;
             // the 0x1700 window base is never written here).
             {0x100c00,0x100d00},{0xb80f00,0xb81000},{0x700000,0x800000},
-            {0x00ea00,0x00f000}}; // VPLL (0xef00-0xef5c, 0xea80)
+            {0x00ea00,0x00f000}, // VPLL (0xef00-0xef5c, 0xea80)
+            // GSP P1 (read-only): FWSEC/SB error scratch, strap, devinit/SEC2 boot status,
+            // WPR2 + MMU_LOCK, GSP and SEC2 falcon state words. Dword-exact spans only:
+            // the falcon IMEM/DMEM ports (0x180-0x1cc) auto-increment on read and are excluded.
+            {0x001400,0x001480},{0x101000,0x101004},{0x1180f8,0x1180fc},{0x118128,0x11812c},
+            {0x118234,0x118238},{0x1fa7c8,0x1fa7cc},{0x1fa824,0x1fa834},
+            {0x110040,0x11004c},{0x110080,0x110084},{0x110100,0x11010c},{0x11012c,0x110130},
+            {0x1103c0,0x1103c4},{0x110610,0x110614},{0x110624,0x110628},{0x111240,0x111244},
+            {0x840040,0x840048},{0x840100,0x84010c},{0x84012c,0x840130},{0x840408,0x84040c}};
         const uint32_t end=offset+count*4;bool ok=false;
         for(const auto& a:allowed)if(offset>=a.begin && end<=a.end)ok=true;
         if(!ok){DebugChannelSend("{\"nv_error\":\"Range not in the read-only allow-list\"}\n");return true;}
@@ -1685,7 +1693,7 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
             if(!window){DebugChannelSend("{\"nv_error\":\"No window\"}\n");return true;}
             const auto leaf=VmmDetachPage(KernelPageTable,window);if(leaf)PmmFreePage(VmmLeafPhysical(leaf));
             __asm__ volatile("invlpg (%0)"::"r"(window.raw()):"memory");}
-        Reply r;r.text("{\"nv_api\":1,");r.field("bar0",base);r.text(",");r.field("offset",offset);r.text(",\"values\":[");
+        Reply r;r.text("{\"nv_api\":1,");r.field("bar0",base);r.text(",");r.field("pci_cmd",cmd);r.text(",");r.field("offset",offset);r.text(",\"values\":[");
         uint32_t mappedPage=~0u;
         for(uint32_t i=0;i<count;++i){
             const uint32_t at=offset+i*4,page=at&~0xfffu;
