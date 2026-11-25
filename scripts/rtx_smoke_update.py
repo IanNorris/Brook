@@ -241,29 +241,8 @@ class Run:
     def profile_bootstrap(self, session):
         self.profile_target(session)
         self.output.mkdir(parents=True, exist_ok=False, mode=0o700)
-        # This is an explicit maintenance job. The accepted key comes from
-        # the signed boot set, never from the network plan being applied.
-        script = r"""
-set -eu
-export PATH=/nix/profile/bin
-boot_key=/etc/usb-profile-plan.pub
-house=/nix/etc/brook
-key=$house/stage-plan.pub
-[[ -s $boot_key && -d /data/.brook-transfer && ! -L /data/.brook-transfer ]]
-[[ -d /nix/etc && ! -L /nix/etc ]]
-mkdir -p -- "$house"
-[[ ! -L $house ]]
-if [[ ! -e $key && ! -L $key ]]; then
-    scratch=$(mktemp "$house/.usb-plan-key.XXXXXXXX")
-    trap 'rm -f -- "$scratch"' EXIT
-    install -m 0644 -- "$boot_key" "$scratch"
-    ln -T -- "$scratch" "$key"
-    sync
-fi
-[[ -f $key && ! -L $key && $(<"$key") == $(<"$boot_key") ]]
-/nix/bin/brook-stage-profile initialize
-"""
-        _, job = self.job(session, ['/boot/bin/bash', '-c', script], timeout=120, name='profile_bootstrap')
+        _, job = self.job(session, ['/boot/bin/bash', '/boot/USBPROF.RC'],
+                          timeout=180, name='profile_bootstrap')
         self.save(profile_job=job)
         if job.get('exit', {}).get('code') != 0:
             raise RuntimeError(f'Profile bootstrap failed: {job}')

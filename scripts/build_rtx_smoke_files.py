@@ -196,6 +196,7 @@ def desktop_payload(args, initrd):
         plan, plan_hash, key_bytes = args.checked_profile_plan
         profile = Path('/nix/store') / plan['profile']['root']
         fat_write(initrd, 'ETC/usb-profile-plan.pub', key_bytes)
+        fat_write(initrd, 'BOOT/USBPROF.RC', (ROOT / 'data/scripts/usb_profile_bootstrap.sh').read_bytes())
     else:
         if not args.live_store:
             raise SystemExit('Fallback desktop requires --live-store')
