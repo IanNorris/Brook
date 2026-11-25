@@ -89,6 +89,7 @@ def main():
     try:
         guest.wait_log("USB_SYSTEM_READY")
         guest.wait_log("BOOT: desktop presented")
+        guest.wait_log("CLEARWATER_SHELL_READY")
         guest.attach()
         request=uuid.uuid4().hex
         started=power(guest,"restart",request,reason="boot_update")
@@ -96,7 +97,7 @@ def main():
         click_not_now(guest)
         rejected=power(guest,"status",request)
         assert rejected["state"]=="rejected" and rejected["prompt_state"]=="rejected", rejected
-        assert guest.process.poll() is None
+        assert rejected["restart_pending"] and guest.process.poll() is None
         proof["not_now"]=[started,rejected]
         request=uuid.uuid4().hex
         when=time.monotonic()

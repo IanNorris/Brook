@@ -98,7 +98,8 @@ int AhciSystemQemuLargeDataFinalSync(){assert(writebackStopped && canFreeze && !
 int UsbSystemFinalSync(int error){return error;}
 int WritableDesktopFinalSync(){assert(writebackStopped && canFreeze && !syncError);++finalCalls;return finalError;}
 static bool promptDesktop;
-bool WmIsActive(){return promptDesktop;}
+bool WmIsActive(){return true;}
+bool ShellServiceHasSession(){return promptDesktop;}
 volatile uint32_t* CompositorGetPhysFb(uint32_t*){static uint32_t pixel;return promptDesktop?&pixel:nullptr;}
 void CompositorMarkDirty(){}
 void CompositorWake(){}

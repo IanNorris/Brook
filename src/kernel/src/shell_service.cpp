@@ -326,6 +326,11 @@ int64_t TrayNextInput(const Process& proc, uint64_t address)
 
 } // namespace
 
+bool ShellServiceHasSession()
+{
+    return __atomic_load_n(&g_registered,__ATOMIC_ACQUIRE);
+}
+
 bool ShellServiceAllowsWindowCapture(const Process& proc)
 {
     if (proc.isThread || proc.euid || proc.userNamespace || !IsShellExecutable(proc)) return false;

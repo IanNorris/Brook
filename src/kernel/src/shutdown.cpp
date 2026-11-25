@@ -18,6 +18,7 @@
 #include "usb_boot_recovery.h"
 #include "apic.h"
 #include "compositor.h"
+#include "shell_service.h"
 #include "klog.h"
 #include "kprintf.h"
 #include "serial.h"
@@ -559,7 +560,7 @@ void HandleShutdownCommand(const char* id,const char* verb,char state[24],int* e
     const bool start=!strcmp(verb,"shutdown") || restart;
     const RestartReason reason=bootUpdate ? RestartReason::BootUpdate :
         softwareUpdate ? RestartReason::SoftwareUpdate : desktopReason;
-    const bool desktop=restart && WmIsActive() && CompositorGetPhysFb(nullptr);
+    const bool desktop=restart && WmIsActive() && ShellServiceHasSession() && CompositorGetPhysFb(nullptr);
     SpinLockAcquire(&lock);
     for(int i=0;i<64;++i){if(operations[i].id[0]&&!strcmp(operations[i].id,id))found=i;else if(!operations[i].id[0]&&empty<0)empty=i;}
     const bool forceApps=!strcmp(verb,"force_apps");

@@ -8,6 +8,7 @@ struct ChromeTrayState;
 struct TrayInput;
 const ChromeTrayState& ShellServiceTrayState();
 void ShellServiceQueueTrayInput(const TrayInput&);
+bool ShellServiceHasSession();
 bool ShellServiceAllowsWindowCapture(const Process&);
 
 void ShellServiceBeginFrame(uint64_t now);
