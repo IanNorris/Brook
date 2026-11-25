@@ -237,3 +237,43 @@ mismatch.
   after, PRAMIN restored, RM tree detection, unmap, PDB-mismatch refusal) and
   M2 against the fake RM (object rules, device-info, host model executing the
   NOP and semaphore through the VAS page tables) plus its failure variants.
+
+## Pre-reset GPU reset and M3 (work/gsp-m1-p5, 26 Nov)
+
+- **Post-P5 POST hang.** The platform warm reset does not reset this GPU
+  (the nv-disp history: POST hung after display writes until Brook added a
+  pre-reset FLR). After P5's copy-engine channel and a clean fini, the bare
+  FLR (bus master still on, engines as RM left them, 100 ms, then the ACPI
+  reset, no check) was followed by a POST hang. After RM unload PMC_ENABLE
+  still shows PGRAPH and bit 25 on (0x42001101, against 0x40000101 at boot).
+- **Fix: `nv_gpu_reset.h`**, RM's TU102 full-chip reset order
+  (kbifDoSecondaryBusResetOrFunctionLevelReset_TU102): PMC_ENABLE engine
+  reset when GSP-RM ran this boot, bus master off and TransactionsPending
+  drained, FLR, header restore, vendor-ID check, wait for GFW boot
+  (0x118128 bit 0 and 0x118234[7:0] == 0xff; the healthy card reads
+  0xffffff8f / 0x3ff), and a Secondary Bus Reset on the root port
+  (00:01.1) if the FLR did not take. Linux for comparison: nvidia.ko only
+  clears bus master at shutdown; nouveau (7.x) runs a full suspend and puts
+  fn0 in D3hot. The GSP-RM fini hook still runs first when fini has not.
+  `bridge hardware gpu-reset status` is the read-only view. Host test
+  `test_nv_gpu_reset`.
+- **M3: `nv-gsp p5 m3`** (`nv_gsp/nv_gsp_m3.h`, RunM2's extra hook):
+  TURING_DMA_COPY_A under the P5 channel, SET_OBJECT on subchannel 4,
+  pitch-linear virtual copies with a host semaphore release after WFI.
+  Buffers: two 2 MiB-aligned sysmem surfaces and two VRAM surfaces at
+  4 GiB + 16/64 MiB, all mapped before SET_PAGE_DIRECTORY.
+- **Hardware (gsp5, 3840x2160x4 = 33.2 MB):**
+  - Measured rates:
+
+    | Copy | Bytes | Time | Rate |
+    |---|---|---|---|
+    | sysmem->VRAM | 33.2 MB | 5.15 ms | 6.44 GB/s |
+    | VRAM->sysmem | 33.2 MB | 4.91 ms | 6.76 GB/s |
+    | VRAM->VRAM | 33.2 MB | 0.78 ms | 42.8 GB/s |
+    | 1600x900 VRAM rectangle | 5.8 MB | 140 us | 41 GB/s |
+    | 3840x1400 sysmem->VRAM rectangle (the video damage) | 21.5 MB | 3.34 ms | 6.44 GB/s |
+
+  - Both read-backs verified, and there were no RC or MMU events. The CPU
+    present copy through BAR1 manages about 1.4 GB/s (13-21 ms a frame).
+  - The idle link reads 2.5 GT/s x8. The CE rate shows the link trains up
+    under DMA load.
