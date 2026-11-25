@@ -1,4 +1,5 @@
 #include "../../drivers/xhci/usb_block_bytes.h"
+#include "../../drivers/xhci/usb_scsi_unmap.h"
 #include <vector>
 #include <cassert>
 #include <cstring>
@@ -15,7 +16,37 @@ struct Disk {
     bool readBlocks(uint64_t lba,uint32_t count){assert(count*block<=scratch.size());if(++reads==failAt){quarantined=true;return false;}memcpy(scratch.data(),disk.data()+lba*block,count*block);return true;}
     bool writeBlocks(uint64_t lba,uint32_t count){assert(count*block<=scratch.size());if(++writes==failWriteAt){quarantined=true;return false;}memcpy(disk.data()+lba*block,scratch.data(),count*block);return true;}
 };
+static void Unmap() {
+    uint8_t vpd[28]={0,0xb0,0,24};
+    assert(ScsiUnmapVpd(vpd,sizeof(vpd),0xb0,28));
+    assert(!ScsiUnmapVpd(vpd,sizeof(vpd)-1,0xb0,28));
+    assert(!ScsiUnmapVpd(vpd,sizeof(vpd),0xb2,28));
+    vpd[3]=16;
+    assert(!ScsiUnmapVpd(vpd,sizeof(vpd),0xb0,28));
+
+    const UsbUnmapLimits limits{128,2};
+    DeviceWriteWindow ranges[]={{512ull*0x12345678,32768},{512ull*0x200000000,32768}};
+    uint8_t encoded[8+16*UsbUnmapMaxRanges];
+    assert(ScsiEncodeUnmap(encoded,limits,ranges,2)==40);
+    const uint8_t expected[]={0,38,0,32,0,0,0,0,
+        0,0,0,0,0x12,0x34,0x56,0x78,0,0,0,64,0,0,0,0,
+        0,0,0,2,0,0,0,0,0,0,0,64,0,0,0,0};
+    assert(!memcmp(encoded,expected,sizeof(expected)));
+    assert(!ScsiEncodeUnmap(encoded,{127,2},ranges,2));
+    assert(!ScsiEncodeUnmap(encoded,{128,1},ranges,2));
+    ++ranges[1].start;
+    assert(!ScsiEncodeUnmap(encoded,limits,ranges,2));
+    ranges[1].start=~uint64_t{511};
+    assert(!ScsiEncodeUnmap(encoded,limits,ranges,2));
+}
+
 int main(){
+    Unmap();
+    Disk large(4096);
+    large.scratch.resize(1<<20);
+    std::vector<uint8_t> largeRead((1<<20)+4096);
+    assert(UsbBlockReadBytes(large,0,largeRead.data(),largeRead.size())==int(largeRead.size()));
+    assert(large.reads==2 && !memcmp(largeRead.data(),large.disk.data(),largeRead.size()));
     for(unsigned capacity: {4096u,65536u})for(unsigned block: {512u,4096u}) {
         Disk d(block);d.scratch.resize(capacity);std::vector<uint8_t> out(150000);
         for(unsigned offset: {0u,1u,17u,511u,4095u,65535u})

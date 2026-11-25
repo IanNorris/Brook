@@ -52,6 +52,12 @@ struct UsbStorageTiming {
 static constexpr uint32_t DEVICE_IOCTL_USB_STORAGE_TIMING = 0x42460006;
 // Positive preferred size in bytes, or an unsupported error.
 static constexpr uint32_t DEVICE_IOCTL_PREFERRED_READ_BYTES = 0x42460007;
+static constexpr uint32_t DEVICE_IOCTL_USB_UNMAP_LIMITS = 0x42460008;
+static constexpr uint32_t DEVICE_IOCTL_USB_UNMAP = 0x42460009;
+static constexpr uint32_t UsbUnmapMaxRanges=16;
+struct UsbUnmapLimits { uint32_t maxSectors,maxRanges; };
+struct UsbUnmapBatch { const DeviceWriteWindow* ranges;uint32_t count; };
+
 
 // ---- Generic device operations ----
 struct DeviceOps {
@@ -117,6 +123,7 @@ struct BlockWriteLease;
 // DeviceWrite; a driver's direct ops->write bypasses these reservations.
 bool DeviceInstallBootWriteLeases(const BlockWriteLease* leases,uint32_t count);
 int DeviceWriteLeased(Device* parent,Device* owner,uint64_t offset,const void* data,uint64_t len);
+int DeviceUsbUnmapLeased(Device* parent,Device* owner,UsbUnmapBatch& batch);
 // Final-sync worker only; failed closure has no side effects. No sleeping I/O
 // or driver callback is executed under the admission lock.
 bool DeviceCloseWrites();

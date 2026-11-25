@@ -228,16 +228,18 @@ class Guest:
         acceleration = ["-accel", args.accel, "-cpu", "host" if args.accel == "kvm" else "max"]
         self.rpc = None
         self.output = (base / "qemu.log").open("x")
+        trace_spec = os.environ.get("BROOK_USB_SYSTEM_QEMU_TRACE")
+        trace = ["-trace", f"events={trace_spec},file={base / 'qemu-usb.trace'}"] if trace_spec else []
         self.process = subprocess.Popen(
             ["qemu-system-x86_64", "-machine", "q35,i8042=off", *acceleration, "-smp", "4", "-m", "4096",
-             "-nodefaults", "-no-reboot", "-display", "none", "-serial", f"file:{self.serial}",
+             "-nodefaults", "-no-reboot", "-display", "none", "-serial", f"file:{self.serial}", *trace,
              "-qmp", f"unix:{self.sock},server=on,wait=off",
              "-drive", f'if=pflash,format=raw,readonly=on,file={os.environ["OVMF_CODE"]}',
              "-drive", f"if=pflash,format=raw,file={variables}",
              "-device", "VGA,vgamem_mb=64", "-device", "qemu-xhci,id=usb",
              "-drive", f"if=none,format=raw,id=other,file={fallback},readonly=on",
              "-device", "usb-storage,bus=usb.0,port=1,drive=other",
-             "-drive", f"if=none,format=raw,id=system,file={system},cache=none",
+             "-drive", f"if=none,format=raw,id=system,file={system},cache=none,discard=unmap",
              "-device", "usb-storage,id=system-usb,bus=usb.0,port=2,drive=system,bootindex=1",
              "-device", "usb-net,bus=usb.0,port=3,netdev=net",
              "-netdev", f"user,id=net,restrict=on,hostfwd=tcp:127.0.0.1:{self.port}-:1234",

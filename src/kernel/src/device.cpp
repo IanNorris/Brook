@@ -32,6 +32,24 @@ int DeviceWriteLeased(Device* parent,Device* owner,uint64_t offset,const void* d
     const int result=parent->ops->write(parent,offset,data,len);
     SpinLockAcquire(&g_writeLock);g_writes.Leave();SpinLockRelease(&g_writeLock);return result;
 }
+int DeviceUsbUnmapLeased(Device* parent,Device* owner,UsbUnmapBatch& batch) {
+    if(!parent || parent->type!=DeviceType::Block || !parent->ops || !parent->ops->ioctl ||
+       !batch.count || batch.count>UsbUnmapMaxRanges || !batch.ranges)return -22;
+    const auto caller=WriteCaller();
+    SpinLockAcquire(&g_writeLock);
+    bool admitted=true;
+    for(uint32_t i=0;i<batch.count && admitted;++i) {
+        const auto& range=batch.ranges[i];
+        admitted=g_blockLeases.AllowOwner(reinterpret_cast<uintptr_t>(parent),
+            reinterpret_cast<uintptr_t>(owner),range.start,range.length);
+    }
+    admitted=admitted && g_writes.Enter(caller);
+    SpinLockRelease(&g_writeLock);
+    if(!admitted)return -30;
+    const int result=parent->ops->ioctl(parent,DEVICE_IOCTL_USB_UNMAP,&batch);
+    SpinLockAcquire(&g_writeLock);g_writes.Leave();SpinLockRelease(&g_writeLock);
+    return result;
+}
 bool DeviceCloseWrites() {
     const auto caller=WriteCaller();SpinLockAcquire(&g_writeLock);
     const bool result=g_writes.Close(caller);SpinLockRelease(&g_writeLock);return result;

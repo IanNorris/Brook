@@ -17,6 +17,7 @@
 #include "module_abi.h"
 #include "usb_block_bytes.h"
 #include "usb_write_windows.h"
+#include "usb_scsi_unmap.h"
 #include "usb_system.h"
 #include "usb_ecm_descriptors.h"
 #include "usb_ecm_rx_credits.h"
@@ -2716,6 +2717,8 @@ static KMutex g_mscCommandLock{};
 static KMutex g_mscIoLock{};
 static bool g_storageReadOnly=false;
 static bool g_storagePageChunks=false;
+static bool g_storageLegacyBurst=false;
+static bool g_storagePipeline=false;
 static uint32_t g_mscDeviceCount=0;
 
 struct XhciMscResult {
@@ -2793,7 +2796,7 @@ static XhciMscResult XhciMscCommandLocked(XhciController& ctrl,XhciDevice& dev,
 
     // Both TDs use the same IN ring, so the status cannot overtake the
     // data. Keep short/variable transfers and OUT data on separate phases.
-    const bool queueStatus=UsbSystemRequested() && dataIn && dataLen && data && !allowShort &&
+    const bool queueStatus=g_storagePipeline && dataIn && dataLen && data && !allowShort &&
         cdb[0]==SCSI_READ_10;
     MscBulkTd statusTd{};
     // 2. Data phase (if any)
@@ -2990,6 +2993,7 @@ struct UsbMscState {
     uint8_t* bounce;
     uint64_t bouncePhys;
     uint32_t bounceCapacity;
+    UsbUnmapLimits unmapLimits;
     char name[16];
     UsbWriteWindows windows;
     bool systemFailed;
@@ -3070,6 +3074,52 @@ static int UsbMscWrite(Device* dev,uint64_t offset,const void* buf,uint64_t len)
     return result;
 }
 
+static int UsbMscUnmapLimits(UsbMscState& state,XhciDevice& dev) {
+    auto* data=state.bounce;
+    UsbMscByteTransport io{&state};
+    auto page=[&](uint8_t code,uint8_t bytes,uint8_t needed) {
+        uint8_t cdb[6]={SCSI_INQUIRY,1,code,0,bytes,0};
+        memset(data,0,bytes);
+        const auto result=XhciMscExecuteLocked(*state.ctrl,dev,cdb,sizeof(cdb),
+            data,state.bouncePhys,bytes,true,true);
+        return result.success() && ScsiUnmapVpd(data,result.actual,code,needed);
+    };
+    // Read the exact B2 minimum and allow standard short responses.
+    if(!page(0xb2,8,6) || !(data[5]&0x80) || !page(0xb0,64,28))
+        return io.usable()?-95:-5;
+    state.unmapLimits={ScsiUnmapBe32(data+20),ScsiUnmapBe32(data+24)};
+    return state.unmapLimits.maxSectors && state.unmapLimits.maxRanges?0:-95;
+}
+
+static int UsbMscUnmap(UsbMscState& state,XhciDevice& dev,uint32_t request,void* arg) {
+    if(!arg)return -22;
+    MscIoGuard ioGuard;
+    UsbMscByteTransport io{&state};
+    if(!state.windows.system.length || !g_storageReadOnly || io.blockSize()!=512)return -30;
+    if(!io.usable() || __atomic_load_n(&state.systemFailed,__ATOMIC_ACQUIRE))return -5;
+    MscCommandGuard commandGuard;
+    if(request==DEVICE_IOCTL_USB_UNMAP_LIMITS) {
+        const int result=UsbMscUnmapLimits(state,dev);
+        if(!result)*static_cast<UsbUnmapLimits*>(arg)=state.unmapLimits;
+        else if(result==-5)UsbMscFenceSystem(state);
+        return result;
+    }
+    const auto& batch=*static_cast<const UsbUnmapBatch*>(arg);
+    if(!batch.ranges || !batch.count || batch.count>UsbUnmapMaxRanges)return -22;
+    for(uint32_t i=0;i<batch.count;++i) {
+        const auto& range=batch.ranges[i];
+        if(!UsbWriteWindows::Contains(state.windows.system,range.start,range.length))return -30;
+    }
+    const uint32_t bytes=ScsiEncodeUnmap(state.bounce,state.unmapLimits,batch.ranges,batch.count);
+    if(!bytes)return -22;
+    const uint8_t cdb[10]={0x42,0,0,0,0,0,0,uint8_t(bytes>>8),uint8_t(bytes),0};
+    const auto result=XhciMscExecuteLocked(*state.ctrl,dev,cdb,sizeof(cdb),
+        state.bounce,state.bouncePhys,bytes,false);
+    if(result.success())return 0;
+    UsbMscFenceSystem(state);
+    return -5;
+}
+
 static int UsbMscIoctl(Device* dev, uint32_t cmd, void* arg)
 {
     if (cmd == DEVICE_IOCTL_READ_ONLY) return g_storageReadOnly ? 1 : 0;
@@ -3080,6 +3130,8 @@ static int UsbMscIoctl(Device* dev, uint32_t cmd, void* arg)
         *static_cast<UsbStorageTiming*>(arg)=g_devices[st->devIndex].mscTiming;
         return 0;
     }
+    if(cmd==DEVICE_IOCTL_USB_UNMAP_LIMITS || cmd==DEVICE_IOCTL_USB_UNMAP)
+        return UsbMscUnmap(*st,g_devices[st->devIndex],cmd,arg);
     if (cmd == DEVICE_IOCTL_PREFERRED_READ_BYTES) return UsbMscByteTransport{st}.bounceBytes();
     if (cmd == DEVICE_IOCTL_WRITE_FENCED) {
         const auto& device=g_devices[st->devIndex];
@@ -3200,9 +3252,10 @@ static bool XhciInitMassStorage(XhciController& ctrl, XhciDevice& dev,
     state->devIndex = devIndex;
     state->windows={};
     state->systemFailed=false;
+    state->unmapLimits={};
     state->bounceCapacity=65536;
     state->bounce=nullptr;
-    if(UsbSystemRequested() && !g_storagePageChunks) {
+    if(UsbSystemRequested() && !g_storagePageChunks && !g_storageLegacyBurst) {
         state->bounce=static_cast<uint8_t*>(AllocDmaBuffer(USB_MSC_MAX_BULK_BYTES/4096,state->bouncePhys));
         if(state->bounce)state->bounceCapacity=USB_MSC_MAX_BULK_BYTES;
     }
@@ -5083,6 +5136,17 @@ static int XhciModuleInit()
     if(auto* marker=VfsOpen("/etc/usb-msc-page-chunks")) {
         g_storagePageChunks=true;VfsClose(marker);
         KPuts("xhci: diagnostic MSC limit=4096 bytes (single data TRB)\n");
+    }
+
+    if(UsbSystemRequested()) {
+        if(auto* marker=VfsOpen("/etc/usb-bot-legacy")) {
+            g_storageLegacyBurst=true;
+            VfsClose(marker);
+        }
+        if(auto* marker=VfsOpen("/etc/usb-bot-pipeline")) {
+            g_storagePipeline=!g_storageLegacyBurst;
+            VfsClose(marker);
+        }
     }
 
     // Drive every xHCI function: chipset and add-in controllers alike.

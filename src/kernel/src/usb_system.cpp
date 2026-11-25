@@ -6,6 +6,7 @@
 #include "../../shared/brook_boot_stick.h"
 #include "device.h"
 #include "ext2_vfs.h"
+#include "ext2_trim_plan.h"
 #include "gpt.h"
 #include "memory/heap.h"
 #include "mount_namespace.h"
@@ -94,6 +95,85 @@ WritableDesktopIo SessionIo() {
         [](void* p,uint64_t at,void* data,uint32_t n){return Read(static_cast<Device*>(p),at,data,n);},
         [](void* p,uint64_t at,const void* data,uint32_t n){return DeviceWrite(static_cast<Device*>(p),at,data,n);},
         [](void* p){return DeviceFlush(static_cast<Device*>(p));}};
+}
+
+int MaybeTrim(uint8_t* gdt,uint32_t gdtCapacity) {
+    auto* marker=VfsOpen("/etc/usb-system-trim",VFS_O_STREAM);
+    if(!marker)return 0;
+    VnodeStat stat{};
+    char mode[32]{};
+    uint64_t offset=0;
+    const bool valid=!VfsStat(marker,&stat) && !stat.isDir && !stat.isSymlink &&
+        stat.size<=sizeof(mode) && VfsRead(marker,mode,stat.size,&offset)==int(stat.size);
+    VfsRelease(marker);
+    SsdTrimRequest request{};
+    if(!valid || !SsdTrimParseRequest(mode,uint32_t(stat.size),request)) {
+        SerialPuts("USB_SYSTEM_TRIM {\"state\":\"invalid-marker\"}\n");
+        return 0;
+    }
+    UsbUnmapLimits limits{};
+    int result=disk->ops->ioctl(disk,DEVICE_IOCTL_USB_UNMAP_LIMITS,&limits);
+    if(result) {
+        SerialPrintf("USB_SYSTEM_TRIM {\"state\":\"probe\",\"error\":%d}\n",result);
+        return result==-95?0:IoError(result);
+    }
+    // Only issue whole ext2 blocks. Do not round a range outwards to meet
+    // a device's advertised granularity.
+    limits.maxSectors&=~7u;
+    if(!limits.maxSectors)return 0;
+    if(limits.maxRanges>UsbUnmapMaxRanges)limits.maxRanges=UsbUnmapMaxRanges;
+    auto* scan=static_cast<Ext2TrimScan*>(kmalloc(sizeof(Ext2TrimScan)));
+    if(!scan)return -12;
+    const TrimRange bounds{systemWindow.start/512,systemWindow.length/512};
+    const uint64_t cap=uint64_t(request.maximumMiB)*2048;
+    DeviceWriteWindow ranges[UsbUnmapMaxRanges]{};
+    uint32_t count=0,queuedSectors=0,batches=0;
+    uint64_t sectors=0;
+    auto submit=[&] {
+        if(!count)return true;
+        if(request.run) {
+            // The first scan pass has validated the whole bitmap and GDT.
+            // Publish the dirty marker before issuing the first discard.
+            if(!session.dirty)
+                result=session.Begin(SessionIo(),systemWindow.length,record.uuid,gdt,gdtCapacity);
+            UsbUnmapBatch batch{ranges,count};
+            if(!result)result=DeviceUsbUnmapLeased(disk,&dataDevice,batch);
+            if(result)return false;
+        }
+        for(uint32_t i=0;i<count;++i)
+            SerialPrintf("USB_SYSTEM_TRIM_RANGE {\"mode\":\"%s\",\"lba\":%lu,\"sectors\":%lu}\n",
+                request.run?"run":"dry-run",ranges[i].start/512,ranges[i].length/512);
+        ++batches;
+        count=0;
+        queuedSectors=0;
+        return true;
+    };
+    const auto scanned=Ext2TrimScanClean(bounds,record.uuid,request.minimumMiB*256,*scan,
+        [&](uint64_t at,void* data,uint32_t size) {
+            return Read(&dataDevice,at,data,size)==int(size);
+        },[&](TrimRange range) {
+            if(cap && range.sectors>cap-sectors)range.sectors=cap-sectors;
+            while(range.sectors) {
+                if((count==limits.maxRanges || queuedSectors==limits.maxSectors) && !submit())return false;
+                const uint32_t room=limits.maxSectors-queuedSectors;
+                const uint32_t take=range.sectors<room?uint32_t(range.sectors):room;
+                ranges[count++]={range.lba*512,uint64_t(take)*512};
+                queuedSectors+=take;
+                sectors+=take;
+                range.lba+=take;
+                range.sectors-=take;
+            }
+            return true;
+        });
+    kfree(scan);
+    if(scanned==Ext2TrimScanResult::Ok) {
+        if(submit() && request.run && batches)result=DeviceFlush(&dataDevice);
+    } else if(scanned!=Ext2TrimScanResult::Cancelled) {
+        result=scanned==Ext2TrimScanResult::IoError?-5:-117;
+    }
+    SerialPrintf("USB_SYSTEM_TRIM {\"state\":\"done\",\"mode\":\"%s\",\"batches\":%u,\"sectors\":%lu,\"error\":%d}\n",
+        request.run?"run":"dry-run",batches,sectors,result);
+    return result;
 }
 
 bool Fail(const char* stage,int error) {
@@ -192,7 +272,8 @@ bool UsbSystemBoot(uint8_t* nextDrive,bool scanComplete) {
     int error=-16;
     if(DeviceRegister(&dataDevice)) {
         if(!DeviceInstallBootWriteLeases(&lease,1))DeviceUnregister(&dataDevice);
-        else if(!(error=SetWindow(true)) && !(error=DeviceFlush(&dataDevice)))
+        else if(!(error=SetWindow(true)) && !(error=DeviceFlush(&dataDevice)) &&
+                !(error=MaybeTrim(gdt,gdtCapacity)) && !session.dirty)
             error=session.Begin(SessionIo(),systemWindow.length,record.uuid,gdt,gdtCapacity);
     }
     kfree(gdt);
