@@ -602,6 +602,11 @@ bool NvDispHandle(const char* command){
             // `anim on|off`: the compositor's pacing probe (a moving square on every output).
             if(strncmp(v,"anim",4)==0){v+=4;while(*v==' ')++v;SpinLockRelease(lock);CompositorSetPacingProbe(strncmp(v,"on",2)==0);
                 DebugChannelSend(CompositorPacingProbe()?"{\"nv_display\":\"anim\",\"on\":1}\n":"{\"nv_display\":\"anim\",\"on\":0}\n");return true;}
+            // `drag <slot> on|off`: the compositor's drag probe (window slot from `bridge ui windows`, id-1).
+            if(strncmp(v,"drag",4)==0){v+=4;while(*v==' ')++v;uint32_t slot=0;bool num=false;while(*v>='0'&&*v<='9'){slot=slot*10+uint32_t(*v-'0');++v;num=true;}
+                while(*v==' ')++v;const bool on=strncmp(v,"on",2)==0;SpinLockRelease(lock);
+                const bool ok=num&&slot<64&&CompositorSetDragProbe(int(slot),on);
+                DebugChannelSend(ok?"{\"nv_display\":\"drag\",\"ok\":1}\n":"{\"nv_display\":\"drag\",\"ok\":0}\n");return true;}
             if(strncmp(v,"stats",5)==0){v+=5;while(*v==' ')++v;PresenterStats(strncmp(v,"reset",5)==0);SpinLockRelease(lock);return true;}
             PresenterStatus();SpinLockRelease(lock);return true;}
         if(!headLive&&!g_driver.Live(1)&&!ConfigureHead()){SpinLockRelease(lock);return true;}

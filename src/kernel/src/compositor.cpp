@@ -2677,6 +2677,31 @@ CompositorFrameStats CompositorReadFrameStats(bool reset)
     const auto s=g_frameStats;if(reset)g_frameStats={};return s;
 }
 
+// Drag probe (bridge `nv-disp driver desktop drag <slot> on|off`): moves window `slot`
+// 12 px per compositor frame back and forth over 480 px through the WM move path, like
+// a title-bar drag, for frame-cost measurements without input injection.
+static int g_dragProbeSlot=-1;
+static int16_t g_dragProbeX=0,g_dragProbeY=0;static uint32_t g_dragProbeFrame=0;
+bool CompositorSetDragProbe(int slot,bool on)
+{
+    const int was=__atomic_load_n(&g_dragProbeSlot,__ATOMIC_ACQUIRE);
+    if(was>=0){WmMoveWindow(was,g_dragProbeX,g_dragProbeY);__atomic_store_n(&g_dragProbeSlot,-1,__ATOMIC_RELEASE);}
+    if(!on)return true;
+    const Window* w=WmGetWindow(slot);
+    if(!w || w->state==WindowState::Maximized)return false;
+    g_dragProbeX=w->x;g_dragProbeY=w->y;g_dragProbeFrame=0;
+    __atomic_store_n(&g_dragProbeSlot,slot,__ATOMIC_RELEASE);CompositorWake();
+    return true;
+}
+static void DragProbeStep()
+{
+    const int slot=__atomic_load_n(&g_dragProbeSlot,__ATOMIC_ACQUIRE);
+    if(slot<0)return;
+    const uint32_t k=g_dragProbeFrame++%80;   // 40 steps out, 40 back
+    const int off=int(k<40?k:80-k)*12;
+    WmMoveWindow(slot,int16_t(g_dragProbeX+off),g_dragProbeY);
+}
+
 static void CompositorLoopWM(bool& clientFrame)
 {
     // Apply movement/focus/resize before rendering either chrome or content.
@@ -2685,6 +2710,7 @@ static void CompositorLoopWM(bool& clientFrame)
     // open menu left by an exited tray service.
     ShellServiceBeginFrame(ApicTickCount());
     CompositorInputWM();
+    DragProbeStep();
     // Consume a worker-built launcher only after clicks against the old frame
     // are handled. One snapshot then serves geometry, render and GPU compose.
     const bool scaleChanged=!CompositorWmGestureActive() && WmApplyScalePending();

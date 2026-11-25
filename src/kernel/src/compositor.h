@@ -128,6 +128,8 @@ struct CompositorFrameStats {
     uint32_t sceneLocalized, shellLocalized, hoverLocalized;
 };
 CompositorFrameStats CompositorReadFrameStats(bool reset);
+// Drag probe: move window slot `slot` back and forth every frame (on), or put it back (off).
+bool CompositorSetDragProbe(int slot, bool on);
 // Pacing probe: a moving square on every output, redrawn each compositor frame.
 void CompositorSetPacingProbe(bool on);
 bool CompositorPacingProbe();
