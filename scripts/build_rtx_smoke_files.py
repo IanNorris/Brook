@@ -39,6 +39,7 @@ import re
 import shutil
 import struct
 import subprocess
+import uuid
 import sys
 import zlib
 
@@ -74,7 +75,7 @@ MARKERS = ('usb-read-only', 'audio-muted', 'hw-inventory', 'boot-status', 'boot-
 ETC_ALLOWED = {*MARKERS, 'i219-attach', 'i219-reset', 'hardware-payload-id', 'resolv.conf', 'machine-id', 'ssl',
                'bridge-v3-operators', 'rtx-update-signer',
                # --session desktop only
-               'live-store', 'volatile-desktop', 'hardware-bulk', 'usb-audio-mixer', 'dp-idle-seconds', 'nv-display', 'chromium-alsa-device'}
+               'live-store', 'usb-system', 'volatile-desktop', 'hardware-bulk', 'usb-audio-mixer', 'dp-idle-seconds', 'nv-display', 'chromium-alsa-device'}
 # Desktop live stick (--session desktop): the VMware RC session over the RAM
 # store, plus the RTX status helper. If the store does not mount, the services
 # fail to start and the kernel console, bridge and remote update stay usable.
@@ -216,13 +217,28 @@ def desktop_payload(args, initrd):
     if args.nv_display:  # desktop presents by flipping head 0 (D2); GOP copy otherwise
         fat_write(initrd, 'ETC/nv-display', b'1\n')
     fat_write(initrd, 'ETC/chromium-alsa-device', b'default\n')  # read by the store's brook-chromium
-    fat_write(initrd, 'ETC/live-store', store['record'].encode())
+    if args.usb_system:
+        # Persistent /nix on the SSD's BROOK_SYSTEM partition (usb_system.cpp)
+        # instead of the RAM live store; the profile must be the one written there.
+        ssd = json.loads(args.usb_system.read_text())
+        if ssd.get('format') != 'brook-ssd-system/1' or ssd.get('partition_name') != 'BROOK_SYSTEM' or \
+                ssd.get('partition_entry') != 2 or ssd.get('fs_type') != 'ext2':
+            raise SystemExit('unexpected ssd-system.json')
+        if ssd.get('store_sha256') != store['sha256']:
+            raise SystemExit('ssd-system.json was written from a different store than --live-store')
+        record = (f"BRKUSB1\n{uuid.UUID(ssd['partition_guid']).bytes_le.hex()}\n"
+                  f"{int(ssd['first_lba'])},{int(ssd['sectors'])}\n{uuid.UUID(ssd['fs_uuid']).hex}\n")
+        fat_write(initrd, 'ETC/usb-system', record.encode())
+    else:
+        fat_write(initrd, 'ETC/live-store', store['record'].encode())
     fat_write(initrd, 'BOOT/BIN/BASH', (profile / 'bin/bash').read_bytes())
     wallpaper = wallpaper_raw()
     check_wallpaper(wallpaper)
     fat_write(initrd, 'BOOT/WALLPAPER.RAW', wallpaper)
     live = {k: store[k] for k in ('bytes', 'sha256', 'partition_guid', 'partition_name', 'profile', 'record', 'slot')
             if k in store}
+    if args.usb_system:
+        live = {**live, 'usb_system': record, 'record': None}
     return add_clearwater_start(DESKTOP_RC), live
 
 
@@ -418,6 +434,9 @@ def main():
                    help='desktop: VMware RC desktop over the RAM live store (needs --live-store)')
     p.add_argument('--live-store', type=Path, metavar='STORE_MANIFEST',
                    help='store-manifest.json from build_rtx_live_store.py')
+    p.add_argument('--usb-system', type=Path, metavar='SSD_SYSTEM_JSON',
+                   help='desktop image: boot /nix persistently from the SSD BROOK_SYSTEM partition described by '
+                        'write-brook-ssd-system.sh\'s ssd-system.json (writes /etc/usb-system, not /etc/live-store)')
     args = p.parse_args()
     match = re.fullmatch(r'(\d{3,4})x(\d{3,4})', args.display_max)
     if not match or int(match[1]) > 4096 or int(match[2]) > 2160:
