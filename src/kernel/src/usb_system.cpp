@@ -226,6 +226,36 @@ void UsbSystemConfigure() {
     ShowHex(boot.fsUuid,record.uuid);
 }
 
+// The authenticated bulk helper and profile-stage capacity probe share this
+// path. Bind it to the admitted system filesystem before userspace starts.
+static bool BindProfileTransfer() {
+    VnodeStat marker{};
+    const int markerResult = VfsLstatPath("/etc/usb-profile-plan.pub", &marker);
+    if (markerResult == -2) return true;
+    if (markerResult || marker.isDir || marker.isSymlink) return false;
+    constexpr char source[] = "/nix/var/.brook-transfer";
+    constexpr char target[] = "/data/.brook-transfer";
+    const char* paths[] = {source, target};
+    for (const char* path : paths) {
+        int error = VfsMkdir(path, 0755);
+        if (error && error != -17) return false;
+        VnodeStat stat{};
+        if (VfsLstatPath(path, &stat) || !stat.isDir || stat.isSymlink ||
+            stat.uid != 0 || (stat.mode & 0022)) return false;
+    }
+    VfsPath root{}, nix{}, transfer{};
+    int error = VfsPathRoot(&root);
+    if (!error) error = VfsPathResolve(root, root, "/nix", &nix);
+    if (!error) error = VfsPathResolve(root, root, source, &transfer, false);
+    if (!error && nix.attachment != transfer.attachment) error = -18;
+    if (!error)
+        error = VfsMountNamespaceBindAt(VfsMountNamespaceInitial(), root, root, source, target);
+    VfsPathRelease(transfer);
+    VfsPathRelease(nix);
+    VfsPathRelease(root);
+    return !error;
+}
+
 bool UsbSystemBoot(uint8_t* nextDrive,bool scanComplete) {
     if(!boot.parsed || !nextDrive)return Fail("record",-22);
     if(!scanComplete)return Fail("boot-volume-scan",-19);
@@ -290,6 +320,7 @@ bool UsbSystemBoot(uint8_t* nextDrive,bool scanComplete) {
         VfsUnmount("/nix");
         return Fail(details.check,details.status);
     }
+    if (!BindProfileTransfer()) return Fail("profile-transfer-bind", -5);
     if(!session.Arm())__builtin_trap();
     ready=true;
     boot.mounted=true;boot.dirty=true;boot.stage="ready";

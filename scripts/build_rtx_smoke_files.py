@@ -75,7 +75,7 @@ MARKERS = ('usb-read-only', 'audio-muted', 'hw-inventory', 'boot-status', 'boot-
 ETC_ALLOWED = {*MARKERS, 'i219-attach', 'i219-reset', 'hardware-payload-id', 'resolv.conf', 'machine-id', 'ssl',
                'bridge-v3-operators', 'rtx-update-signer',
                # --session desktop only
-               'live-store', 'usb-system', 'usb-system-trim', 'usb-bot-legacy', 'usb-bot-pipeline', 'usb-uas', 'usb-uas-fixture', 'volatile-desktop', 'hardware-bulk', 'usb-audio-mixer', 'dp-idle-seconds', 'nv-display', 'chromium-alsa-device'}
+               'live-store', 'usb-system', 'usb-profile-plan.pub', 'usb-system-trim', 'usb-bot-legacy', 'usb-bot-pipeline', 'usb-uas', 'usb-uas-fixture', 'volatile-desktop', 'hardware-bulk', 'usb-audio-mixer', 'dp-idle-seconds', 'nv-display', 'chromium-alsa-device'}
 # Desktop live stick (--session desktop): the VMware RC session over the RAM
 # store, plus the RTX status helper. If the store does not mount, the services
 # fail to start and the kernel console, bridge and remote update stay usable.
@@ -183,23 +183,26 @@ def gc_root(path, root):
 
 
 def desktop_payload(args, initrd):
-    """Desktop session additions (as make_vmware_image.make_initrds), the
-    /etc/live-store record, and the EVO4 mixer autostart marker."""
-    if not args.live_store:
-        raise SystemExit('--session desktop needs --live-store')
-    sys.path.insert(0, str(ROOT / 'scripts'))
+    """Embed desktop boot assets from a signed plan or the fallback RAM store."""
     from stage_clearwater_shell import add_clearwater_start, embed_clearwater_executables, embed_terminal_shortcut
     from make_vmware_image import wallpaper_raw, check_wallpaper
-    store = json.loads(args.live_store.read_text())
-    if store.get('format') != 'brook-rtx-live-store/1' or not re.fullmatch(
-            r'(guid=[0-9a-f]{32}|lba=\d+ sectors=\d+) bytes=\d+ sha256=[0-9a-f]{64}\n', store['record']):
-        raise SystemExit('unexpected live store manifest')
-    profile = Path(store['profile'])
-    if not (profile / 'bin/bash').exists():
-        raise SystemExit(f'live-store profile {profile} is missing from the host store (garbage-collected?); '
-                         'realise it again (scripts/image_profile.py) before building')
     roots = args.build_root / 'gcroots'
-    gc_root(profile, roots / 'live-store-profile')
+    store = None
+    if args.usb_system:
+        plan, plan_hash, key_bytes = args.checked_profile_plan
+        profile = Path('/nix/store') / plan['profile']['root']
+        fat_write(initrd, 'ETC/usb-profile-plan.pub', key_bytes)
+    else:
+        if not args.live_store:
+            raise SystemExit('Fallback desktop requires --live-store')
+        store = json.loads(args.live_store.read_text())
+        if store.get('format') != 'brook-rtx-live-store/1' or not re.fullmatch(
+                r'(guid=[0-9a-f]{32}|lba=\d+ sectors=\d+) bytes=\d+ sha256=[0-9a-f]{64}\n', store['record']):
+            raise SystemExit('Unexpected live-store manifest')
+        profile = Path(store['profile'])
+    if not (profile / 'bin/bash').is_file():
+        raise SystemExit(f'Profile {profile} is missing the boot shell. Realise it on the host first.')
+    gc_root(profile, roots / 'desktop-profile')
     for directory in ('::/BOOT/BIN', '::/DATA', '::/NIX'):
         if subprocess.run(['mdir', '-i', str(initrd), directory], capture_output=True).returncode:
             run(['mmd', '-i', initrd, directory])
@@ -219,13 +222,11 @@ def desktop_payload(args, initrd):
     fat_write(initrd, 'ETC/chromium-alsa-device', b'default\n')  # read by the store's brook-chromium
     if args.usb_system:
         # Persistent /nix on the SSD's BROOK_SYSTEM partition (usb_system.cpp)
-        # instead of the RAM live store; the profile must be the one written there.
+        # The volume identity stays fixed across signed profile generations.
         ssd = json.loads(args.usb_system.read_text())
         if ssd.get('format') != 'brook-ssd-system/1' or ssd.get('partition_name') != 'BROOK_SYSTEM' or \
                 ssd.get('partition_entry') != 2 or ssd.get('fs_type') != 'ext2':
             raise SystemExit('unexpected ssd-system.json')
-        if ssd.get('store_sha256') != store['sha256']:
-            raise SystemExit('ssd-system.json was written from a different store than --live-store')
         record = (f"BRKUSB1\n{uuid.UUID(ssd['partition_guid']).bytes_le.hex()}\n"
                   f"{int(ssd['first_lba'])},{int(ssd['sectors'])}\n{uuid.UUID(ssd['fs_uuid']).hex}\n")
         fat_write(initrd, 'ETC/usb-system', record.encode())
@@ -243,11 +244,15 @@ def desktop_payload(args, initrd):
     wallpaper = wallpaper_raw()
     check_wallpaper(wallpaper)
     fat_write(initrd, 'BOOT/WALLPAPER.RAW', wallpaper)
-    live = {k: store[k] for k in ('bytes', 'sha256', 'partition_guid', 'partition_name', 'profile', 'record', 'slot')
-            if k in store}
     if args.usb_system:
-        live = {**live, 'usb_system': record, 'record': None}
-    return add_clearwater_start(DESKTOP_RC), live
+        storage = {'record': record, 'profile': str(profile), 'plan_sha256': plan_hash,
+                   'plan_key_sha256': hashlib.sha256(key_bytes).hexdigest()}
+    else:
+        storage = {k: store[k] for k in
+                   ('bytes', 'sha256', 'partition_guid', 'partition_name', 'profile', 'record', 'slot')
+                   if k in store}
+    return add_clearwater_start(DESKTOP_RC), storage
+
 
 
 def etc_listing(image):
@@ -266,6 +271,9 @@ def build(args):
             raise SystemExit(f'{path} must not exist')
     if args.image is not None and os.path.lexists(args.image):
         raise SystemExit(f'{args.image} must not exist')
+    if args.usb_system:
+        from usb_profile_plan import checked_plan
+        args.checked_profile_plan = checked_plan(args.profile_plan, args.profile_plan_public_key)
     if args.operators.name.endswith('.seed'):
         raise SystemExit('--operators takes the public key file, never a seed')
     signer_hex = args.update_signer.read_text().strip()
@@ -356,17 +364,19 @@ def build(args):
         'fat_label': FAT_LABEL, 'files': files,
         'kernel_options': KERNEL_FLAGS, 'loader_options': LOADER_FLAGS,
         'loader_config': config.decode(), 'init_rc': init_rc_bytes.decode(),
-        'session': args.session, 'live_store': live,
+        'session': args.session, 'live_store': live if not args.usb_system else None,
+        'usb_system': live if args.usb_system else None,
         'initrd': {'drivers': list(DRIVERS), 'etc': etc, 'markers': list(markers)},
         'i219_stage': args.i219_stage,
         'helpers': helpers,
         'update_signer_public': signer_hex,
         'bridge_v3': {'operator_keys': len(keys), 'policy_sha256': hashlib.sha256(policy).hexdigest()},
         'hardware_scope': {
-            'root': 'RAM initrd only; no disk is mounted',
+            'root': 'RAM initrd; /nix on BROOK_SYSTEM' if args.usb_system else 'RAM initrd',
             'storage': 'AHCI unbound (no selectors), no NVMe driver, USB mass storage read-only (EROFS in xhci) '
                        'except a write window over the boot-stick partition during a signed authenticated update, '
-                       'built-in virtio-blk only exists in VMs',
+                       'built-in virtio-blk only exists in VMs'
+                       + (', persistent writes restricted to BROOK_SYSTEM by its lease' if args.usb_system else ''),
             'firmware': 'no EFI variable writes, no firmware/flash access, no AML interpreter (uACPI off)',
             'pci_writes': 'every xHCI controller (BIOS handoff, controller reset, memory+bus-master enable, '
                           'MSI/MSI-X); the I219-V 8086:15b8 command register (memory, bus master, INTx off) '
@@ -439,12 +449,14 @@ def main():
                    help='file holding the panic scanner URL for the panic QR (same as the Dell build); '
                         'BROOK_PANIC_INGEST_URL overrides; missing file keeps the built-in default')
     p.add_argument('--session', choices=('kconsole', 'desktop'), default='kconsole',
-                   help='desktop: VMware RC desktop over the RAM live store (needs --live-store)')
+                   help='desktop with a persistent USB system or a fallback live store')
     p.add_argument('--live-store', type=Path, metavar='STORE_MANIFEST',
                    help='store-manifest.json from build_rtx_live_store.py')
     p.add_argument('--usb-system', type=Path, metavar='SSD_SYSTEM_JSON',
                    help='desktop image: boot /nix persistently from the SSD BROOK_SYSTEM partition described by '
                         'write-brook-ssd-system.sh\'s ssd-system.json (writes /etc/usb-system, not /etc/live-store)')
+    p.add_argument('--profile-plan', type=Path, help='signed selected profile plan directory for --usb-system')
+    p.add_argument('--profile-plan-public-key', type=Path, help='Ed25519 public key admitted by the USB set')
     p.add_argument('--usb-uas', action='store_true', help='try tagged USB Attached SCSI in SuperSpeed')
     p.add_argument('--usb-uas-fixture', action='store_true', help='permit QEMU UAS-only boot fixture discovery')
     p.add_argument('--usb-bot', choices=('default', 'legacy', 'pipeline'), default='default',
@@ -452,6 +464,11 @@ def main():
     p.add_argument('--usb-system-trim', metavar="'dry-run|run [MIN_MIB [MAX_MIB]]'",
                    help="scan clean ext2 free extents before mount; send UNMAP only with 'run'")
     args = p.parse_args()
+    if args.usb_system:
+        if args.session != 'desktop' or not args.profile_plan or not args.profile_plan_public_key or args.live_store:
+            p.error('--usb-system needs --session desktop, --profile-plan and --profile-plan-public-key')
+    elif args.profile_plan or args.profile_plan_public_key:
+        p.error('Profile plans require --usb-system')
     if args.usb_uas_fixture and not args.usb_uas:
         p.error("--usb-uas-fixture needs --usb-uas")
     if args.usb_uas and not args.usb_system:

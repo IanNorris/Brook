@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Remote self-update of the RAM-only RTX smoke stick over the v3 bridge.
+"""Remote RTX boot-set and signed desktop profile updates over the v3 bridge.
 
   signer-public --key KEY                 print the Ed25519 public key (hex) for
                                           build_rtx_smoke_files.py --update-signer
   status  --session S                     loader set/trial, gate state, PREV payload
   push    --session S --files DIR --key KEY --output NEW_DIR [--restart [--confirm]]
   confirm --session S                     mark the running root set good (drop TRIAL.RUN)
+  profile-bootstrap --session S --output DIR
+  profile --session S --profile-plan DIR --public-key FILE --output DIR
+  profile --session S --rollback-profile RECEIPT --output DIR
 
 KEY is the host-only hardware update key (shared/dell/hardware-update-key). The
 signing seed is SHA-256("brook-rtx-stick-update-signing-v1\\0" || KEY); only the
@@ -225,9 +228,72 @@ class Run:
             time.sleep(1)
         raise TimeoutError('no new boot observed; inspect power request ' + power_id + ' (Ian: press reset; PREV/ boots)')
 
+    def profile_target(self, session):
+        guest = self.bridge.load_session(session)
+        if guest.get('auth_mode') != 'v3':
+            raise RuntimeError('Profile updates require a v3 session')
+        state = self.bridge.command(session, 'bridge hardware caps').get('usb_system', {})
+        if not state.get('mounted') or not state.get('window_open') or state.get('uncertain'):
+            raise RuntimeError('Profile updates require a writable, admitted BROOK_SYSTEM')
+        return state
+
+    def profile_bootstrap(self, session):
+        self.profile_target(session)
+        self.output.mkdir(parents=True, exist_ok=False, mode=0o700)
+        # This is an explicit maintenance job. The accepted key comes from
+        # the signed boot set, never from the network plan being applied.
+        script = r"""
+set -eu
+export PATH=/nix/profile/bin
+boot_key=/etc/usb-profile-plan.pub
+house=/nix/etc/brook
+key=$house/stage-plan.pub
+[[ -s $boot_key && -d /data/.brook-transfer && ! -L /data/.brook-transfer ]]
+mkdir -p -- "$house"
+[[ ! -L $house ]]
+if [[ ! -e $key && ! -L $key ]]; then
+    scratch=$(mktemp "$house/.usb-plan-key.XXXXXXXX")
+    trap 'rm -f -- "$scratch"' EXIT
+    install -m 0644 -- "$boot_key" "$scratch"
+    ln -T -- "$scratch" "$key"
+    sync
+fi
+[[ -f $key && ! -L $key && $(<"$key") == $(<"$boot_key") ]]
+/nix/bin/brook-stage-profile initialize
+"""
+        _, job = self.job(session, ['/boot/bin/bash', '-c', script], timeout=120, name='profile_bootstrap')
+        self.save(profile_job=job)
+        if job.get('exit', {}).get('code') != 0:
+            raise RuntimeError(f'Profile bootstrap failed: {job}')
+        self.save(state='profile_initialized')
+        return self.receipt
+
+    def profile(self, args):
+        from dell_deploy import stage_profile
+        self.profile_target(args.session)
+        args.profile_plan_public_key = args.public_key
+        args.push_profile_cache = bool(args.profile_plan)
+        if args.rollback_profile:
+            previous = json.loads(args.rollback_profile.read_text())
+            if previous.get('destination') != 'usb-system':
+                raise ValueError('Expected a USB system profile receipt')
+        journal = stage_profile(args, bridge=self.bridge, bulk_port=args.bulk_port, usb_system=True)
+        # Only remove immutable receipts that this successful transaction wrote.
+        paths = journal.receipt.get('profile_guest_files', [])
+        if paths:
+            try:
+                _, result = self.job(args.session, ['/nix/profile/bin/rm', '-f', '--', *paths],
+                                     timeout=120, name='profile_cleanup')
+                journal.save(profile_cleanup=result)
+            except (OSError, RuntimeError, ValueError) as error:
+                journal.save(profile_cleanup_error=str(error))
+        return journal.receipt
+
     def store(self, session, store_dir, key_file, first_lba, sectors, upload_port):
         """Write a store image into a slot over the network; the running store
         and record stay untouched (a later signed set switches the record)."""
+        if self.bridge.command(session, 'bridge hardware caps').get('usb_system', {}).get('configured'):
+            raise RuntimeError('Store slots are only available to the fallback stick')
         meta = json.loads((Path(store_dir) / 'store-manifest.json').read_text())
         image = Path(store_dir) / 'profile/STORE.IMG'
         size = image.stat().st_size
@@ -402,6 +468,18 @@ def main():
     s.add_argument('--key', type=Path, required=True); s.add_argument('--output', type=Path, required=True)
     s.add_argument('--first-lba', type=int, required=True); s.add_argument('--sectors', type=int, required=True)
     s.add_argument('--upload-port', type=int, default=1235)
+    s = sub.add_parser('profile-bootstrap', help='initialize profile switching using the signed boot key')
+    s.add_argument('--session', required=True)
+    s.add_argument('--output', type=Path, required=True)
+    s = sub.add_parser('profile', help='apply or roll back a signed profile on BROOK_SYSTEM')
+    s.add_argument('--session', required=True)
+    s.add_argument('--output', type=Path, required=True)
+    s.add_argument('--bulk-port', type=int, default=1236)
+    s.add_argument('--profile-timeout-s', type=int, default=3600)
+    s.add_argument('--public-key', type=Path)
+    action = s.add_mutually_exclusive_group(required=True)
+    action.add_argument('--profile-plan', type=Path)
+    action.add_argument('--rollback-profile', type=Path)
     s = sub.add_parser('push')
     s.add_argument('--session', required=True); s.add_argument('--files', type=Path, required=True)
     s.add_argument('--key', type=Path, required=True); s.add_argument('--output', type=Path, required=True)
@@ -419,6 +497,15 @@ def main():
         print(json.dumps(run.status(a.session), indent=2)); return
     if a.command == 'confirm':
         code, text = run.confirm(a.session); print(text); sys.exit(code or 0)
+    if a.command in ('profile-bootstrap', 'profile'):
+        if a.command == 'profile' and bool(a.profile_plan) != bool(a.public_key):
+            p.error('--profile-plan requires --public-key')
+        try:
+            result = run.profile_bootstrap(a.session) if a.command == 'profile-bootstrap' else run.profile(a)
+        except (OSError, RuntimeError, ValueError) as error:
+            p.exit(1, f'{error}\nInspect receipts in {a.output}\n')
+        print(result['state'])
+        return
     if a.command == 'store':
         receipt = run.store(a.session, a.store, a.key, a.first_lba, a.sectors, a.upload_port)
         print(json.dumps({k: receipt.get(k) for k in ('state', 'seconds', 'replies', 'slot_manifest', 'upload_error')}, indent=2))

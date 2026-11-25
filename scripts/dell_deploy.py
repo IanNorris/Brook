@@ -12,7 +12,7 @@ provisioned independently of deployment.
 Usage (repo root, BROOK_ROOT set to the checkout holding the bridge session):
   python3 scripts/dell_deploy.py --session S --pair build/dell/pair-X --output build/dell/deploy-X
 """
-import argparse, hashlib, json, subprocess, sys, tempfile, uuid
+import argparse, hashlib, json, re, subprocess, sys, tempfile, uuid
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -24,7 +24,24 @@ def sha(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
-def stage_profile(args, *, bridge=None, bulk_port=1236):
+def profile_stdout(bridge, session, job, status):
+    """Read the complete JSON capability document within the guest's ring limit."""
+    parts = []
+    offset = 0
+    while True:
+        stream = status['stdout']
+        if stream.get('gaps') or stream.get('read_error') or stream['next_offset'] > 65536:
+            raise ValueError('Incomplete USB profile inventory reply')
+        parts.append(stream['text'])
+        if stream['eof']:
+            return ''.join(parts)
+        if stream['next_offset'] <= offset:
+            raise ValueError('USB profile inventory did not advance')
+        offset = stream['next_offset']
+        status = bridge.job(session, job, stdout_offset=offset, output_limit=16384)
+
+
+def stage_profile(args, *, bridge=None, bulk_port=1236, usb_system=False):
     a = args
     sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools/vm_bridge')]
     from hardware import Hardware
@@ -51,7 +68,8 @@ def stage_profile(args, *, bridge=None, bulk_port=1236):
     journal.save(state='prepared', action=action, profile_transaction_id=tx,
                  profile_job_id=job, session=a.session, guest_boot_id=guest['guest_boot_id'],
                  endpoint=[guest['host'], guest['port']],
-                 pair_manifest_sha256=sha(a.pair / 'build-manifest.json'),
+                 pair_manifest_sha256=None if usb_system else sha(a.pair / 'build-manifest.json'),
+                 destination='usb-system' if usb_system else 'dell',
                  profile_files={path.name: sha(path) for path in files})
     arguments = ['/nix/bin/nix', 'stage-profile', action, tx]
     try:
@@ -62,6 +80,11 @@ def stage_profile(args, *, bridge=None, bulk_port=1236):
                 if hashlib.sha256(document).hexdigest() != journal.receipt['profile_files'][files[0].name]:
                     raise ValueError('Stage plan changed before preflight')
                 plan = json.loads(document)
+                if usb_system:
+                    from usb_profile_plan import checked_plan
+                    plan, verified, _ = checked_plan(a.profile_plan, a.profile_plan_public_key)
+                    if verified != journal.receipt['profile_files'][files[0].name]:
+                        raise ValueError('Stage plan changed before verification')
                 push_cache = a.push_profile_cache or plan['cache']['brook'] is None
                 selected = plan['format'] == 3
                 if push_cache or selected:
@@ -70,11 +93,12 @@ def stage_profile(args, *, bridge=None, bulk_port=1236):
                     bridge.guest_run(a.session, probe, ['/nix/bin/nix', 'stage-profile', 'cache-capabilities'],
                                      cwd='/tmp', uid=1000, wait_s=2)
                     status = journal.wait_job(a.session, probe, lambda job: job.get('state') == 'completed',
-                                              timeout=60)
+                                              timeout=60, **({'output_limit': 16384} if usb_system else {}))
                     journal.save(cache_probe_job=status)
                     if status.get('exit', {}).get('code') != 0:
                         raise ValueError('Guest stage helper lacks bridge cache capability; refresh it first')
-                    capabilities = json.loads(status['stdout']['text'])
+                    capabilities = json.loads(profile_stdout(bridge, a.session, probe, status)
+                                              if usb_system else status['stdout']['text'])
                     if selected:
                         api = capabilities.get('selected_profile_api')
                         if type(api) is not int or api != 1:
@@ -85,7 +109,15 @@ def stage_profile(args, *, bridge=None, bulk_port=1236):
                     from profile_cache_bundle import pack_cache, validate_push_capacity
                     work = Path(resources.enter_context(tempfile.TemporaryDirectory(
                         prefix='.cache-bundles-', dir=journal.output)))
-                    bundles = list(pack_cache(a.profile_plan / 'cache', plan, work))
+                    pack_options = {}
+                    if usb_system:
+                        capacity = capabilities.get('selected_store', {})
+                        if not capacity.get('store_inventory_complete') or not capacity.get('transfer_shares_space'):
+                            raise ValueError('USB profile staging requires complete inventory and transfers on /nix')
+                        missing = set(plan['closure']) - set(capacity['store_names'])
+                        pack_options['missing'] = missing
+                        journal.save(missing_store_paths=sorted(missing))
+                    bundles = list(pack_cache(a.profile_plan / 'cache', plan, work, **pack_options))
                     required = validate_push_capacity([*files, *bundles], capabilities)
                     journal.save(state='profile_cache_preflight_verified', cache_required_bytes=required,
                                  cache_capabilities=capabilities)
@@ -106,6 +138,11 @@ def stage_profile(args, *, bridge=None, bulk_port=1236):
                 transfer = receipt['transfer']
                 if transfer['sha256'] != digest:
                     raise ValueError(f'{source.name} changed during transfer')
+                if usb_system:
+                    if not re.fullmatch(r'/data/\.brook-transfer/[0-9a-f]{32}\.bin', transfer['guest_path']):
+                        raise ValueError('Unexpected USB stage transfer path')
+                    journal.save(profile_guest_files=[*journal.receipt.get('profile_guest_files', []),
+                                                      transfer['guest_path']])
                 if is_bundle:
                     pushed.append({'sha256': digest, 'guest_path': transfer['guest_path'],
                                    'receipt': str(bulk.output / 'receipt.json')})
