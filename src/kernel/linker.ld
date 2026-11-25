@@ -18,7 +18,7 @@ SECTIONS
     /* Kernel symbol export table — bounded by __start/__stop for KsymLookup. */
     .ksymtab : ALIGN(8) {
         __start_ksymtab = .;
-        *(.ksymtab)
+        KEEP(*(.ksymtab))
         __stop_ksymtab = .;
     }
 
@@ -31,7 +31,7 @@ SECTIONS
        symbols so the runtime knows the exact page range. */
     .syscall_table : ALIGN(4096) {
         __syscall_table_start = .;
-        *(.syscall_table)
+        KEEP(*(.syscall_table))
         . = ALIGN(4096);
         __syscall_table_end = .;
     }

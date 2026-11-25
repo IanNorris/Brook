@@ -464,7 +464,6 @@ add_executable(kernel
     "${FONT_ATLAS_CPP}"
     "${VDSO_CPP}"
     ${DESKTOP_FONT_SOURCES}
-    "${FAT_IMAGE_CPP}"
     "${BROOK_ROOT}/src/shared/src_km/serial.cpp"
     # FatFS (C source — compiled from a build-dir copy so our ffconf.h overlay
     # is found naturally by #include "ffconf.h" in ff.c / ff.h).
@@ -682,6 +681,14 @@ endif()
 if(BROOK_SSD_GUARDED_DESKTOP_RESET)
     target_compile_definitions(kernel PRIVATE BROOK_SSD_GUARDED_DESKTOP_RESET=1)
 endif()
+# Embedded FAT16 test image (~360 KB .rodata), mounted as / only when the
+# loader supplies no initrd. Every current boot path supplies one, so it is
+# off by default.
+option(BROOK_EMBEDDED_FAT_IMAGE "Embed the FAT16 test image used as / when no initrd is supplied" OFF)
+if(BROOK_EMBEDDED_FAT_IMAGE)
+    target_sources(kernel PRIVATE "${FAT_IMAGE_CPP}")
+    target_compile_definitions(kernel PRIVATE BROOK_EMBEDDED_FAT_IMAGE=1)
+endif()
 # NVIDIA desktop display support (RTX desktop images): nv-aux, nv-disp step 3 /
 # head 1 / resident driver, dp-idle and link watch, the pre-reset GPU reset.
 # Off by default so other kernels (the Dell pair) carry none of it.
@@ -784,6 +791,15 @@ target_link_options(kernel PRIVATE
     -static
     -z max-page-size=0x1000
 )
+# Section garbage collection: drops functions and data nothing references.
+# linker.ld KEEPs the sections reached only through start/stop symbols
+# (.ksymtab: module imports; .syscall_table). Modules resolve kernel symbols
+# only through .ksymtab. Add --print-gc-sections to list what is dropped.
+option(BROOK_KERNEL_GC_SECTIONS "Link the kernel with -ffunction-sections -fdata-sections --gc-sections" ON)
+if(BROOK_KERNEL_GC_SECTIONS)
+    target_compile_options(kernel PRIVATE -ffunction-sections -fdata-sections)
+    target_link_options(kernel PRIVATE --gc-sections)
+endif()
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL "" FORCE)
 

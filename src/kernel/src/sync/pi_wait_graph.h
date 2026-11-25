@@ -40,7 +40,9 @@ public:
     struct Task {
         PiIdentity identity{};
         unsigned references = 0;
-        uint8_t base = 3, effective = 3;
+        // Meaningful only while referenced (AddReference sets both); zero
+        // defaults keep the kernel global in .bss.
+        uint8_t base = 0, effective = 0;
     };
 
     // A task's base rank is Brook's internal 0..3 scheduler hint, not a Linux

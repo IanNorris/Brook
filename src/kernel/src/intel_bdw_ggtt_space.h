@@ -11,7 +11,9 @@ class BdwGgttSpace {
     static constexpr uint32_t Entries=1u<<20, First=1u<<16, MaxReservations=64;
     uint64_t bitmap_[Entries/64]{};
     BdwGgttReservation reservations_[MaxReservations]{};
-    uint64_t nextToken_=1;
+    // Tokens issued so far (each reservation gets ++tokensIssued_, never 0);
+    // zero-initialised so the retained global stays in .bss.
+    uint64_t tokensIssued_=0;
     uint32_t limit_=0;
     bool used(uint32_t index) const {return (bitmap_[index/64]>>(index%64))&1;}
     void mark(uint32_t first,uint32_t count,bool value) {
@@ -38,7 +40,7 @@ public:
         return false;
     }
     bool reserve(uint32_t count,BdwGgttReservation& out) {
-        if(!limit_ || !count || count>32 || !nextToken_)return false;
+        if(!limit_ || !count || count>32 || tokensIssued_==~uint64_t(0))return false;
         unsigned entry=0;while(entry<MaxReservations && reservations_[entry].token)++entry;
         if(entry==MaxReservations)return false;
         uint32_t start=First,run=0;
@@ -49,7 +51,7 @@ public:
             if(used(i)){run=0;continue;}
             if(!run)start=i;
             if(++run==count) {
-                BdwGgttReservation next{start,count,nextToken_++};
+                BdwGgttReservation next{start,count,++tokensIssued_};
                 mark(start,count,true);reservations_[entry]=next;out=next;return true;
             }
         }
@@ -61,7 +63,7 @@ public:
     // Software exclusion does not prove hardware PTEs are free or bindable.
     bool reserveExtent(uint32_t count,uint32_t alignment,BdwGgttReservation& out) {
         if(!limit_ || !count || count>65536 || !alignment || alignment>65536 ||
-           (alignment&(alignment-1)) || !nextToken_)return false;
+           (alignment&(alignment-1)) || tokensIssued_==~uint64_t(0))return false;
         unsigned entry=0;while(entry<MaxReservations && reservations_[entry].token)++entry;
         if(entry==MaxReservations)return false;
         uint32_t start=0,run=0;
@@ -69,7 +71,7 @@ public:
             if(used(i)){run=0;continue;}
             if(!run){if(i&(alignment-1))continue;start=i;}
             if(++run==count){
-                BdwGgttReservation next{start,count,nextToken_++};
+                BdwGgttReservation next{start,count,++tokensIssued_};
                 mark(start,count,true);reservations_[entry]=next;out=next;return true;
             }
         }

@@ -84,7 +84,9 @@ namespace brook { void LifecycleChannelConfigure(); void LifecycleChannelStart()
 #include "boot_logo.h"
 #include "klog.h"
 #include "audio.h"
+#if defined(BROOK_EMBEDDED_FAT_IMAGE)
 #include "fat_test_image.h"
+#endif
 #include "fw_cfg.h"
 #include "rtc.h"
 #include "kvmclock.h"
@@ -718,6 +720,12 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
             brook::KPuts("initrd: VMM allocation failed\n");
         }
     }
+#if !defined(BROOK_EMBEDDED_FAT_IMAGE)
+    else
+    {
+        brook::KPuts("initrd: not present (no embedded FAT image: BROOK_EMBEDDED_FAT_IMAGE=OFF)\n");
+    }
+#else
     else
     {
         // Fallback: mount the embedded FAT16 test image as a ramdisk.
@@ -747,6 +755,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
             brook::KPuts("VFS: ramdisk buffer allocation failed\n");
         }
     }
+#endif
 
 #if defined(BROOK_BRIDGE_V3)
     brook::DebugBridgeV3LogBoot();

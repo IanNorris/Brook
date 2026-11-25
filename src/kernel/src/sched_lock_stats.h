@@ -42,7 +42,11 @@ class SchedLockStats {
         LockStatSite site[LockStatSiteSlots]{};
     };
     uint32_t enabled_=0;
-    uint64_t epoch_=1;
+    // Current epoch minus one: the epoch starts at 1 (never 0, so a zeroed
+    // row is never "in epoch"), while the zero default keeps the global in
+    // .bss. Reset bumps it; writers clear their own row on first use.
+    uint64_t epochBelow_=0;
+    uint64_t CurrentEpoch()const{return __atomic_load_n(&epochBelow_,__ATOMIC_ACQUIRE)+1;}
     Cpu cpu_[LockStatCpus]{};
     static uint64_t Load(const uint64_t& v){return __atomic_load_n(&v,__ATOMIC_RELAXED);}
     static void Store(uint64_t& v,uint64_t x){__atomic_store_n(&v,x,__ATOMIC_RELAXED);}
@@ -61,7 +65,7 @@ class SchedLockStats {
     }
     Cpu* Row(unsigned cpu){
         if(cpu>=LockStatCpus)return nullptr;
-        auto& c=cpu_[cpu];const auto epoch=__atomic_load_n(&epoch_,__ATOMIC_ACQUIRE);
+        auto& c=cpu_[cpu];const auto epoch=CurrentEpoch();
         if(Load(c.epoch)!=epoch){ClearRow(c);__atomic_store_n(&c.epoch,epoch,__ATOMIC_RELEASE);}
         return &c;
     }
@@ -81,10 +85,10 @@ class SchedLockStats {
     }
 public:
     bool Enabled()const{return __atomic_load_n(&enabled_,__ATOMIC_RELAXED)!=0;}
-    uint64_t Epoch()const{return __atomic_load_n(&epoch_,__ATOMIC_ACQUIRE);}
+    uint64_t Epoch()const{return CurrentEpoch();}
     // mode: -1 unchanged, 0 off, 1 on. Reset starts a new epoch.
     void Control(int mode,bool reset){
-        if(reset)__atomic_fetch_add(&epoch_,1,__ATOMIC_ACQ_REL);
+        if(reset)__atomic_fetch_add(&epochBelow_,1,__ATOMIC_ACQ_REL);
         if(mode>=0)__atomic_store_n(&enabled_,uint32_t(mode),__ATOMIC_RELEASE);
     }
     // After actual ownership. startTsc/startSteal were sampled before the
@@ -122,7 +126,7 @@ public:
         hold->valid=false;
         if(lock>=LockStatLocks || cpu!=hold->cpu || cpu>=LockStatCpus)return;
         auto& c=cpu_[cpu];
-        if(Load(c.epoch)!=__atomic_load_n(&epoch_,__ATOMIC_ACQUIRE))return;
+        if(Load(c.epoch)!=CurrentEpoch())return;
         const uint64_t held=nowTsc>hold->acquiredTsc?nowTsc-hold->acquiredTsc:0;
         const uint64_t steal=nowSteal>hold->acquiredSteal?nowSteal-hold->acquiredSteal:0;
         auto& r=c.lock[lock];
