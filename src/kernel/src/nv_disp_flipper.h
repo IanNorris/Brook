@@ -69,6 +69,15 @@ template<typename B> struct NvWindowFlipper{
         vtotal=b->rd(RegArm(kChidCore,0x2064+head_*0x400))>>16;
         vblankEnd=b->rd(RegArm(kChidCore,0x206c+head_*0x400))>>16;vblankStart=b->rd(RegArm(kChidCore,0x2070+head_*0x400))>>16;}
     bool InBlank(uint32_t v)const{return vblankStart>vblankEnd?(v<vblankEnd||v>vblankStart):v>=surf[0].height;}
+    // Whole milliseconds (1..frame) until the next vblank start from scanline `v`, at
+    // `frameUs` per frame, plus 1 so the waiter wakes just after the LOADV.
+    uint32_t MsToVblank(uint32_t v,uint32_t frameUs=16667)const{
+        if(!vtotal||v>=vtotal)return 1;
+        const uint32_t start=vblankStart&&vblankStart<vtotal?vblankStart:surf[0].height;
+        const uint32_t lines=v<start?start-v:vtotal-v+start;
+        const uint32_t ms=uint32_t(uint64_t(lines)*frameUs/vtotal/1000)+1;
+        const uint32_t cap=frameUs/1000+1;
+        return ms>cap?cap:ms;}
     bool Live()const{return state==FlipState::Idle||state==FlipState::Armed;}
     bool Allowed(uint32_t a)const{return a==RegPut(chid)||a==kRegBar1Flush||a==RegHeadTimingEvt(head);}
     void Fail(FlipFail f){if(state!=FlipState::Failed){fail=f;state=FlipState::Failed;}}

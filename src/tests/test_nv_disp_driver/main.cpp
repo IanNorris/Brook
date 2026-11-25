@@ -171,7 +171,21 @@ static void TestVblankCounter(){
     g.c.R(0x611800)=0x3;g.d->Tick();assert(g.d->f[0].st.vblanks==1&&g.c.R(0x611800)==0x3); // only VBLANK is acked
     assert(g.d->Down0());
 }
+// Poll hint while a flip is in flight: time to the next vblank start, 1..17 ms at 60 Hz.
+static void TestMsToVblank(){
+    DRig g;assert(g.d->Up0());auto f=g.d->f[0];
+    f.vtotal=2222;f.vblankStart=2218;f.vblankEnd=58;                    // 3840x2160@60 as read on the RTX
+    assert(f.MsToVblank(2217)==1);                                     // one line before: just after it
+    assert(f.MsToVblank(2218)==17);                                    // at the start: a whole frame
+    const uint32_t mid=f.MsToVblank(1109);assert(mid>=8&&mid<=10);
+    for(uint32_t v=0;v<f.vtotal;v+=37){const uint32_t ms=f.MsToVblank(v);assert(ms>=1&&ms<=17);}
+    assert(f.MsToVblank(2222)==1&&f.MsToVblank(5,0)==1);               // out of range / no frame time
+    f.vblankStart=0;assert(f.MsToVblank(2159)==1);                     // unknown start: active height
+    f.vtotal=0;assert(f.MsToVblank(100)==1);
+    assert(g.d->Down0());
+}
 int main(){
     TestOutput0();TestBothOutputs();TestFailures();TestPacing();TestLoadv();TestAgeRepair();TestTripleMailbox();TestVblankCounter();
+    TestMsToVblank();
     puts("test_nv_disp_driver: ok");return 0;
 }

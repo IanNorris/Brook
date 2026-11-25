@@ -254,8 +254,10 @@ int NvPrimaryPresent(const uint32_t* src,uint32_t srcStride,uint32_t width,uint3
     SpinLockRelease(lock);
     return 1;
 }
-// Compositor loop hook: complete flips / arm the queued frame; short sleeps while a flip
-// is in flight so the newest frame is armed just after the vblank load.
+// Compositor loop hook: complete flips / arm the queued frame. While a flip is in flight
+// sleep until just after the next vblank (the LOADV), not 1 ms: with 1 ms the loop ran
+// ~120/s on hardware, each pass presenting fresh damage that only replaced the queued
+// frame (mailbox) at ~3 W package cost. Client commits still wake the loop early.
 uint32_t NvPrimaryPoll(){
     SpinLock* lock=NvAuxSharedLock();
     if(!SpinLockTryAcquire(lock))return 2;
@@ -263,7 +265,7 @@ uint32_t NvPrimaryPoll(){
     if(g_presenter.active&&g_driver.Live(0)){
         g_driver.Tick();
         const auto& f=g_driver.f[0];
-        if(f.state==nvdisp::FlipState::Armed||f.queued>=0)ms=1;
+        if(f.state==nvdisp::FlipState::Armed||f.queued>=0)ms=f.MsToVblank(f.lastVline);
     }
     SpinLockRelease(lock);
     return ms;
