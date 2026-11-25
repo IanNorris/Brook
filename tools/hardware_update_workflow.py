@@ -39,7 +39,10 @@ def wait_restart(bridge, session, request, status, *, clock=time.monotonic, slee
         observe(status)
         state=status.get('state')
         if state=='rejected':
-            raise RestartRejected('Restart rejected on the desktop; the update remains pending')
+            message='Restart rejected on the desktop'
+            if status.get('restart_pending'):
+                message+='. The update remains pending'
+            raise RestartRejected(message)
         if state in ('failed','unsupported','cancelled','busy','full','conflict'):
             raise RuntimeError('Restart did not reach checked ready state: '+power_blocker_summary(status))
         automatic=bool(status.get('restart_automatic')) and status.get('prompt_state') in ('accepted','timeout')

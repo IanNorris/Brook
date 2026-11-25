@@ -49,7 +49,7 @@ struct Operation {
     int error;
     RestartPrompt prompt;
     RestartReason reason;
-    bool forceRestart, automaticAfterPrompt;
+    bool forceRestart;
 };
 Operation operations[64]{};int current=-1;SpinLock lock{};
 bool workerStarted=false,powerOff=false,powerRestart=false,irreversible=false;
@@ -85,7 +85,7 @@ WmDebugWindow workerWindows[WM_MAX_WINDOWS];
 // Status and blockers for the current request (under lock). The last status
 // byte is never written, so an unlocked reader always finds a terminator.
 ShutdownBlockerReport blockerReport{};
-void RequestDesktopPower(bool restart,bool acLoss,RestartReason reason=RestartReason::Agent);
+void RequestDesktopPower(bool restart,bool acLoss);
 const char* Name(Phase phase) {
     switch(phase) {
     case Phase::Prompting:return "prompting";case Phase::Rejected:return "rejected";
@@ -367,7 +367,7 @@ void Worker(void*) {
             SpinLockAcquire(&lock);
             if (current==selected && operations[selected].prompt.Tick(ApicTickCount())) {
                 operations[selected].phase=Phase::Closing;
-                operations[selected].automatic=operations[selected].automaticAfterPrompt;
+                operations[selected].automatic=true;
                 proceed=true;
             }
             SpinLockRelease(&lock);
@@ -550,17 +550,18 @@ bool ShutdownLaunchAllowed() {
 }
 namespace {
 void HandleShutdownCommand(const char* id,const char* verb,char state[24],int* error,
-                           bool automatic,bool acLoss,RestartReason desktopReason=RestartReason::Agent,
-                           bool automaticAfterPrompt=true) {
+                           bool automatic,bool acLoss,bool fromBridge=false) {
     *error=0;bool admitted=false;int found=-1,empty=-1;
     const bool forceRestart=!strcmp(verb,"restart_force");
     const bool bootUpdate=!strcmp(verb,"restart_boot");
     const bool softwareUpdate=!strcmp(verb,"restart_software");
-    const bool restart=!strcmp(verb,"restart") || forceRestart || bootUpdate || softwareUpdate;
+    const bool agentRestart=!strcmp(verb,"restart");
+    const bool restart=agentRestart || forceRestart || bootUpdate || softwareUpdate;
     const bool start=!strcmp(verb,"shutdown") || restart;
     const RestartReason reason=bootUpdate ? RestartReason::BootUpdate :
-        softwareUpdate ? RestartReason::SoftwareUpdate : desktopReason;
-    const bool desktop=restart && WmIsActive() && ShellServiceHasSession() && CompositorGetPhysFb(nullptr);
+        softwareUpdate ? RestartReason::SoftwareUpdate : fromBridge ? RestartReason::Agent : RestartReason::None;
+    const bool promptEligible=fromBridge && (agentRestart || bootUpdate);
+    const bool desktop=promptEligible && WmIsActive() && ShellServiceHasSession() && CompositorGetPhysFb(nullptr);
     SpinLockAcquire(&lock);
     for(int i=0;i<64;++i){if(operations[i].id[0]&&!strcmp(operations[i].id,id))found=i;else if(!operations[i].id[0]&&empty<0)empty=i;}
     const bool forceApps=!strcmp(verb,"force_apps");
@@ -575,10 +576,10 @@ void HandleShutdownCommand(const char* id,const char* verb,char state[24],int* e
             found=empty;auto& op=operations[found];memcpy(op.id,id,33);op.restart=restart;
             op.reason=restart ? reason : RestartReason::None;
             op.forceRestart=forceRestart;
-            op.automaticAfterPrompt=automaticAfterPrompt;
             op.prompt.Begin(ApicTickCount(),restartTimeout,desktop,forceRestart);
             op.phase=op.prompt.decision==RestartDecision::Prompting ? Phase::Prompting : Phase::Closing;
-            if (restart && reason!=RestartReason::Agent && restartPending!=RestartReason::BootUpdate) restartPending=reason;
+            if (fromBridge && (bootUpdate || softwareUpdate) && restartPending!=RestartReason::BootUpdate)
+                restartPending=reason;
             op.automatic=automatic;op.acLoss=acLoss;
             // Admission closes under the launch/job locks before the worker can
             // observe this operation. Already dispatched work is awaited.
@@ -603,7 +604,6 @@ void HandleShutdownCommand(const char* id,const char* verb,char state[24],int* e
             if(op.phase==Phase::Prompting) {
                 op.prompt.Choose(RestartDecision::Rejected);
                 op.phase=Phase::Rejected;
-                if (restartPending==RestartReason::None) restartPending=op.reason;
             } else if(op.phase==Phase::Closing) op.cancel=true;
             else if(op.phase!=Phase::Cancelled && op.phase!=Phase::Rejected){result="too_late";*error=-16;}
         }
@@ -631,10 +631,10 @@ void HandleShutdownCommand(const char* id,const char* verb,char state[24],int* e
     }
     CompositorMarkDirty();CompositorWake();
 }
-void RequestDesktopPower(bool restart,bool acLoss,RestartReason reason) {
+void RequestDesktopPower(bool restart,bool acLoss) {
     char id[33];const auto n=__atomic_add_fetch(&desktopSequence,1ULL,__ATOMIC_RELAXED);
     for(unsigned i=0;i<32;++i)id[i]=i<16?'d':"0123456789abcdef"[(n>>((31-i)*4))&15];id[32]=0;
-    char state[24];int error;HandleShutdownCommand(id,restart?"restart":"shutdown",state,&error,true,acLoss,reason);
+    char state[24];int error;HandleShutdownCommand(id,restart?"restart":"shutdown",state,&error,true,acLoss);
     if(error)__atomic_store_n(&desktopNotice,error==-95?"Requested power transition is unavailable on this machine":"Another shutdown operation is pending",__ATOMIC_RELEASE);
     else __atomic_store_n(&desktopNotice,static_cast<const char*>(nullptr),__ATOMIC_RELEASE);
 }
@@ -642,8 +642,8 @@ void RequestDesktopPower(bool restart,bool acLoss,RestartReason reason) {
 void ShutdownCommand(const char* id,const char* verb,char state[24],int* error) {
     HandleShutdownCommand(id,verb,state,error,false,false);
 }
-void ShutdownLifecycleCommand(const char* id,const char* verb,char state[24],int* error) {
-    HandleShutdownCommand(id,verb,state,error,false,false,RestartReason::Agent,false);
+void ShutdownBridgeCommand(const char* id,const char* verb,char state[24],int* error) {
+    HandleShutdownCommand(id,verb,state,error,false,false,true);
 }
 void ShutdownDesktopRequest(bool restart) {RequestDesktopPower(restart,false);}
 
@@ -676,7 +676,7 @@ void ShutdownRestartPending(RestartReason reason) {
 }
 void ShutdownRestartPendingNow() {
     SpinLockAcquire(&lock);const auto reason=restartPending;SpinLockRelease(&lock);
-    if (reason!=RestartReason::None) RequestDesktopPower(true,false,reason);
+    if (reason!=RestartReason::None) RequestDesktopPower(true,false);
 }
 void ShutdownRestartPromptChoose(uint32_t token,bool restart) {
     bool proceed=false;
@@ -687,11 +687,10 @@ void ShutdownRestartPromptChoose(uint32_t token,bool restart) {
             op.prompt.Choose(restart?RestartDecision::Accepted:RestartDecision::Rejected)) {
             if (restart) {
                 op.phase=Phase::Closing;
-                op.automatic=op.automaticAfterPrompt;
+                op.automatic=true;
                 proceed=true;
             } else {
                 op.phase=Phase::Rejected;
-                if (restartPending==RestartReason::None) restartPending=op.reason;
             }
         }
     }

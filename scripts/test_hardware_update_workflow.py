@@ -89,11 +89,16 @@ class Tests(unittest.TestCase):
             'original',self.key,self.kernel,self.initrd,activate,restart,'candidate' if restart else None)
     def receipt(self):return json.loads((self.output/'receipt.json').read_text())
     def test_prompt_rejection_stops_before_commit(self):
-        self.bridge.blocked={'state':'rejected','prompt_state':'rejected'}
+        self.bridge.blocked={'state':'rejected','prompt_state':'rejected','restart_pending':True}
         with self.assertRaisesRegex(RestartRejected,'remains pending'):
             wait_restart(self.bridge,'session','original',{'state':'prompting','prompt_seconds':60},
                          sleep=lambda _:None)
         self.assertEqual(self.bridge.calls,[('power','session','original','status')])
+
+    def test_agent_rejection_does_not_report_pending_update(self):
+        with self.assertRaisesRegex(RestartRejected, '^Restart rejected on the desktop$'):
+            wait_restart(self.bridge,'session','original',{'state':'rejected','restart_pending':False})
+        self.assertEqual(self.bridge.calls,[])
 
     def test_prompt_timeout_leaves_commit_to_guest(self):
         self.bridge.blocked={'state':'ready','prompt_state':'timeout','restart_automatic':True}

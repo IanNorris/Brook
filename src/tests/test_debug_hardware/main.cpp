@@ -174,7 +174,7 @@ void ShutdownRequestBlockers(const char*,ShutdownBlockerReport* out){
     *out={};std::strcpy(out->stage,"sigterm");std::strcpy(out->status,"Closing apps - no window: pulse\"audio pid 51; SIGKILL in 4 s, or Cancel");
     out->count=2;out->listed=1;out->nextSignalMs=3500;out->entries[0].pid=51;std::strcpy(out->entries[0].name,"pulse\"audio");}
 bool ShutdownCanForceApps(const char*){return powerVerb=="shutdown";}
-void ShutdownCommand(const char*,const char* verb,char state[24],int* error){++powerCalls;powerVerb=verb;std::strcpy(state,"ready");*error=std::strcmp(verb,"commit")?0:-95;}
+void ShutdownBridgeCommand(const char*,const char* verb,char state[24],int* error){++powerCalls;powerVerb=verb;std::strcpy(state,"ready");*error=std::strcmp(verb,"commit")?0:-95;}
 uint32_t SmpGetCpuCount(){return 4;}
 uint32_t PciBootInventoryCount(){return 2;}
 uint32_t PciBootInventorySeen(){return 2;}

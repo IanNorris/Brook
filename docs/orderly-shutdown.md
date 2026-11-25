@@ -14,11 +14,14 @@ Real-hardware ACPI power management remains unimplemented.
 
 ## Restart confirmation
 
-A restart request on a running desktop shows a countdown on the primary
-output before closing any apps. Choosing **Not now** rejects that request and
-leaves **Restart pending** in the taskbar. The taskbar menu can start a new
-request. Choosing **Restart now** or letting the countdown expire starts the
-checked shutdown. The initial timeout is 60 seconds. The boot initrd may
+An agent or boot-update restart requested through `hw_power` shows a
+countdown on a running desktop before closing any apps. **Not now** rejects
+the request. A pending boot or software update remains visible in the taskbar
+until restart. **Restart now** in the taskbar starts the checked restart
+immediately. Launcher and shell commands, guard recovery, VMware and the VM
+lifecycle channel go directly to checked shutdown. A bridge request with the
+software-update reason also goes directly to checked shutdown. Choosing
+**Restart now** in the countdown or letting it expire starts checked shutdown. The initial timeout is 60 seconds. The boot initrd may
 provide `/etc/restart-prompt-seconds` as a decimal value from 1 to 600.
 
 For a boot-pinned `hw_power` request, `state` reports `prompting` or

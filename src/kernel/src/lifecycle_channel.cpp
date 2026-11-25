@@ -40,7 +40,7 @@ void Worker(void*) {
             if(c=='\n') {
                 if(!discard) {
                     line[length]=0;char response[160];
-                    if(channel.Handle(line,response,Epoch,Sync,ShutdownLifecycleCommand))Send(response);
+                    if(channel.Handle(line,response,Epoch,Sync,ShutdownCommand))Send(response);
                 }
                 length=0;discard=false;
             }else if(c<' '||c>'~'||length+1>=sizeof(line))discard=true;

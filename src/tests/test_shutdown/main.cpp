@@ -60,7 +60,8 @@ brook::Process appTasks[3]{};int signalLog[32]{};unsigned signalPids[32]{};unsig
 brook::DebugTaskSnapshot census[4]{};unsigned censusCount=0;
 brook::WmDebugWindow window{};bool visible=false;
 void step(){try{brook::Worker(nullptr);}catch(Yield&){} }
-void command(const char* id,const char* verb,const char* expected,int expectedError=0){char state[24];int error=123;brook::ShutdownCommand(id,verb,state,&error);if(strcmp(state,expected)||error!=expectedError)std::fprintf(stderr,"power test %s: expected %s/%d got %s/%d\n",verb,expected,expectedError,state,error);assert(!strcmp(state,expected));assert(error==expectedError);}
+void command(const char* id,const char* verb,const char* expected,int expectedError=0,
+             decltype(&brook::ShutdownCommand) dispatch=brook::ShutdownCommand){char state[24];int error=123;dispatch(id,verb,state,&error);if(strcmp(state,expected)||error!=expectedError)std::fprintf(stderr,"power test %s: expected %s/%d got %s/%d\n",verb,expected,expectedError,state,error);assert(!strcmp(state,expected));assert(error==expectedError);}
 const char* id="11111111111111111111111111111111";
 const char* second="22222222222222222222222222222222";
 }
@@ -290,14 +291,14 @@ static void TestRestartPromptCoordinator() {
     const char* rejected="baaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const char* accepted="bbaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const char* timeout="bbbaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    command(rejected,"restart_boot","prompting");
+    command(rejected,"restart_boot","prompting",0,ShutdownBridgeCommand);
     const auto first=ShutdownRestartPromptStatus(rejected);
     assert(first.remainingSeconds==2&&first.reason==RestartReason::BootUpdate);
     assert(launched&&jobsAllowed&&ShutdownLaunchAllowed());
     ShutdownRestartPromptChoose(first.token,false);
     command(rejected,"power_status","rejected");
     assert(ShutdownRestartPromptStatus().pending&&launched&&jobsAllowed);
-    command(accepted,"restart_software","prompting");
+    command(accepted,"restart_boot","prompting",0,ShutdownBridgeCommand);
     ShutdownRestartPromptChoose(first.token,true); // stale click
     command(accepted,"power_status","prompting");
     ShutdownRestartPromptChoose(ShutdownRestartPromptStatus(accepted).token,true);
@@ -306,11 +307,52 @@ static void TestRestartPromptCoordinator() {
     assert(!launched&&!jobsAllowed&&ShutdownRestartPromptStatus(accepted).automatic);
     command(accepted,"cancel","closing");
     step();
-    command(timeout,"restart","prompting");
+    command(timeout,"restart","prompting",0,ShutdownBridgeCommand);
     tick+=2000;
     step();
     command(timeout,"power_status","closing");
     assert(ShutdownRestartPromptStatus(timeout).decision==RestartDecision::Timeout);
+    command(timeout,"cancel","closing");
+    step();
+
+    restartPending=RestartReason::None;
+    const char* agent="b1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    command(agent,"restart","prompting",0,ShutdownBridgeCommand);
+    ShutdownRestartPromptChoose(ShutdownRestartPromptStatus(agent).token,false);
+    command(agent,"power_status","rejected");
+    assert(!ShutdownRestartPromptStatus().pending);
+    const char* cancelled="b2aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    command(cancelled,"restart","prompting",0,ShutdownBridgeCommand);
+    command(cancelled,"cancel","rejected",0,ShutdownBridgeCommand);
+    assert(!ShutdownRestartPromptStatus().pending);
+
+    // The confirmed launcher, kconsole reboot, VMware GuestRPC and guarded
+    // recovery all call the same internal entry point.
+    ShutdownDesktopRequest(true);
+    assert(operations[current].phase==Phase::Closing && operations[current].automatic);
+    assert(operations[current].prompt.decision==RestartDecision::Bypassed);
+    ShutdownDesktopCancel();
+    step();
+
+    // COM2 lifecycle preserves checked, host-driven commit on an active desktop.
+    const char* lifecycle="b3aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    command(lifecycle,"restart","closing");
+    assert(ShutdownRestartPromptStatus(lifecycle).decision==RestartDecision::Bypassed);
+    assert(!ShutdownRestartPromptStatus(lifecycle).automatic);
+    command(lifecycle,"cancel","closing");
+    step();
+
+    const char* software="b4aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    command(software,"restart_software","closing",0,ShutdownBridgeCommand);
+    assert(ShutdownRestartPromptStatus(software).decision==RestartDecision::Bypassed);
+    assert(ShutdownRestartPromptStatus().pending);
+    command(software,"cancel","closing");
+    step();
+
+    ShutdownRestartPending(RestartReason::BootUpdate);
+    ShutdownRestartPendingNow();
+    assert(operations[current].phase==Phase::Closing && operations[current].automatic);
+    assert(operations[current].prompt.decision==RestartDecision::Bypassed);
 }
 
 int main(){

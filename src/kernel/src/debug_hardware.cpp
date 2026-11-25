@@ -2274,7 +2274,7 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         if (pendingBoot || pendingSoftware) {
             ShutdownRestartPending(pendingBoot?RestartReason::BootUpdate:RestartReason::SoftwareUpdate);
             memcpy(state,"pending",8);
-        } else ShutdownCommand(id,verb,state,&error);
+        } else ShutdownBridgeCommand(id,verb,state,&error);
         const auto prompt=ShutdownRestartPromptStatus(id);
         Reply r;r.text("{\"power_api\":1,\"request_id\":");r.quoted(id);r.text(",\"operation\":");r.quoted(verb);
         r.text(",\"state\":");r.quoted(state);r.text(",\"error\":");

@@ -101,7 +101,7 @@ def main():
         proof["not_now"]=[started,rejected]
         request=uuid.uuid4().hex
         when=time.monotonic()
-        started=power(guest,"restart",request,reason="software_update")
+        started=power(guest,"restart",request)
         assert started["state"]=="prompting", started
         proof["timeout"]=[started,*clean_exit(guest,request,automatic=True)]
         assert time.monotonic()-when >= started["prompt_seconds"]-1

@@ -22,7 +22,7 @@ void ShutdownReportAcSource(AcPowerSource source);
 ShutdownAcStatus ShutdownGetAcStatus();
 // Request/result identities are retained until reboot. Caller binds the boot.
 void ShutdownCommand(const char* id,const char* verb,char state[24],int* error);
-void ShutdownLifecycleCommand(const char* id,const char* verb,char state[24],int* error);
+void ShutdownBridgeCommand(const char* id,const char* verb,char state[24],int* error);
 void ShutdownDesktopRequest(bool restart);
 struct ShutdownRestartStatus {
     RestartReason reason;
