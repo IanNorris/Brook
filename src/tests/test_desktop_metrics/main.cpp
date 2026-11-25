@@ -31,6 +31,23 @@ static void checkSceneDamage() {
     uint32_t opaque[]={0xff112233u,0xff445566u,0xff778899u};
     CHECK(SceneRowOpaque(opaque,3));opaque[1]=0x80445566u;
     CHECK(!SceneRowOpaque(opaque,3) && SceneRowOpaque(opaque,1));
+    uint32_t visible[3]={0xdeadbeefu,0xdeadbeefu,0xdeadbeefu};
+    unsigned restored=0;
+    const auto restore=[&] {
+        ++restored;
+        for (auto& pixel:visible) pixel=0xff0000ffu;
+    };
+    const uint32_t complete[]={0xff112233u,0xff445566u,0xff778899u};
+    SceneBlitWindowRow(visible,complete,3,restore);
+    CHECK(!restored && visible[0]==complete[0] && visible[2]==complete[2]);
+    const uint32_t mixed[]={0,0x80ff0000u,0xff778899u};
+    SceneBlitWindowRow(visible,mixed,3,restore);
+    CHECK(restored==1 && visible[0]==0xff0000ffu && visible[1]==0xff80007fu && visible[2]==mixed[2]);
+    SceneBlitWindowRow(visible,mixed,3,[]{});
+    CHECK(restored==1 && visible[1]==0xffc0003fu);
+    const SceneRect client{0,0,3,6};
+    CHECK(client.covers(SceneRect{1,1,3,5}));
+    CHECK(!client.covers(SceneRect{-1,1,3,5}) && !client.covers({}));
     SceneRect native=SceneClientBlitRect(10,20,320,200,100,80,4,1920,1080);
     CHECK(native.left==10 && native.top==20 && native.right==110 && native.bottom==100);
     native=SceneClientBlitRect(-10,-20,320,200,100,80,1,1920,1080);

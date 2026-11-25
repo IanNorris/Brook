@@ -1714,12 +1714,15 @@ static bool BlitProcessAt(Process* proc, int dstX0, int dstY0, bool forceAll,
     return fresh && !proc->isKernelThread;
 }
 
+static void DeskBackdropSpan(uint32_t* out,uint32_t left,uint32_t right,uint32_t y);
+static void BlitWallpaperRegion(const SceneRect& region);
+
 // Blit a kernel-resident VFB at an explicit destination.  Used for
 // per-window VFBs (Window::vfb) — separate from the per-process
 // `BlitProcessAt` so we don't need to fake a Process struct.
 static bool BlitWindowVfb(const uint32_t* src,
                            uint32_t srcW, uint32_t srcH, uint32_t srcStride,
-                           int dstX0, int dstY0, const SceneRect* limit = nullptr)
+                           int dstX0, int dstY0, const SceneRect* limit, bool restoreBackdrop)
 {
     if (!src || srcW == 0) return false;
     uint32_t* dstBase = g_backBuffer ? g_backBuffer : const_cast<uint32_t*>(g_physFb);
@@ -1733,6 +1736,12 @@ static bool BlitWindowVfb(const uint32_t* src,
         if (limit->right < clip.right) clip.right = limit->right;
         if (limit->bottom < clip.bottom) clip.bottom = limit->bottom;
     }
+    // The first drawn window can replace the backdrop row by row only
+    // when its actual, clipped VFB covers the entire damaged region.
+    if (restoreBackdrop && !clip.covers(*limit)) {
+        BlitWallpaperRegion(*limit);
+        restoreBackdrop=false;
+    }
     if (clip.empty()) return false;
     const uint32_t sourceX=static_cast<uint32_t>(clip.left-static_cast<int64_t>(dstX0));
     const uint32_t rowLen=static_cast<uint32_t>(clip.right-clip.left);
@@ -1745,39 +1754,10 @@ static bool BlitWindowVfb(const uint32_t* src,
         uint32_t* dstRow = dstBase +
             static_cast<uint64_t>(y) * dstStride + static_cast<uint32_t>(clip.left);
 
-        // A translucent interior must not be copied merely because both
-        // endpoints are opaque. Confirm the complete row before memcpy.
-        if (SceneRowOpaque(srcRow,rowLen))
-        {
-            __builtin_memcpy(dstRow, srcRow, rowLen * 4);
-            continue;
-        }
-
-        for (uint32_t dx = 0; dx < rowLen; ++dx)
-        {
-            uint32_t sp = srcRow[dx];
-            uint32_t a = sp >> 24;
-            if (a == 0)
-                continue;
-            if (a == 255)
-            {
-                dstRow[dx] = sp;
-                continue;
-            }
-
-            uint32_t dp = dstRow[dx];
-            uint32_t inv = 255 - a;
-            uint32_t sr = (sp >> 16) & 0xff;
-            uint32_t sg = (sp >> 8) & 0xff;
-            uint32_t sb = sp & 0xff;
-            uint32_t dr = (dp >> 16) & 0xff;
-            uint32_t dg = (dp >> 8) & 0xff;
-            uint32_t db = dp & 0xff;
-            uint32_t r = (sr * a + dr * inv + 127) / 255;
-            uint32_t g = (sg * a + dg * inv + 127) / 255;
-            uint32_t b = (sb * a + db * inv + 127) / 255;
-            dstRow[dx] = 0xff000000u | (r << 16) | (g << 8) | b;
-        }
+        SceneBlitWindowRow(dstRow,srcRow,rowLen,[&] {
+            if (restoreBackdrop)
+                DeskBackdropSpan(dstRow,uint32_t(clip.left),uint32_t(clip.right),uint32_t(y));
+        });
     }
     return true;
 }
@@ -2918,8 +2898,13 @@ static void CompositorLoopWM(bool& clientFrame)
         for(uint32_t i=0;i<sceneDamage.count;++i){const auto& r=sceneDamage.rects[i];
             cpuDamage.include(SceneRect{r.x0,r.y0,r.x1,r.y1}.clipped(g_deskWidth,g_deskHeight));}
         cpuDamage=SceneDamageClosureLayered(cpuDamage,layers,layerExpand,layerOverlay,wcount);
-        BlitWallpaperRegion(cpuDamage);
     }
+    bool backdropPending=cpuPartial && !cpuDamage.empty();
+    const auto restoreBackdrop=[&] {
+        if (!backdropPending) return;
+        BlitWallpaperRegion(cpuDamage);
+        backdropPending=false;
+    };
 
     // Demo: auto-open the launcher once (opt/gpulaunch) for headless capture.
     if (g_gpuLaunchDemo && !WmLauncherVisible())
@@ -2989,7 +2974,9 @@ static void CompositorLoopWM(bool& clientFrame)
                 const bool freshClient = w->vfbDirty && !p->isKernelThread && p->state != ProcessState::Terminated;
                 if (blitW && blitH) {
                     const bool copied = BlitWindowVfb(localVfb, blitW, blitH, localStride,
-                                                      w->clientX(), w->clientY(), cpuPartial ? &cpuDamage : nullptr);
+                                                      w->clientX(), w->clientY(), cpuPartial ? &cpuDamage : nullptr,
+                                                      backdropPending);
+                    backdropPending=false;
                     clientFrame |= freshClient && copied;
                 }
                 w->vfbDirty = 0;  // single-writer (compositor thread), no race
@@ -3000,10 +2987,13 @@ static void CompositorLoopWM(bool& clientFrame)
             if (!fullRepaint && !cpuPartial && !p->fbDirty && !anyBelowBlitted)
                 continue;
             anyBelowBlitted = true;
-            if (!CompositorGpuActive())
+            if (!CompositorGpuActive()) {
+                restoreBackdrop();
                 clientFrame |= BlitProcessAt(p, w->clientX(), w->clientY(), true, w->clientW, w->clientH, w->upscale);
+            }
         }
 
+        restoreBackdrop(); // No usable VFB covered the damage before chrome.
         // Draw text cursor for terminal windows
         if (g_backBuffer)
         {
@@ -3080,6 +3070,8 @@ static void CompositorLoopWM(bool& clientFrame)
                                      chromeMx, chromeMy);
         }
     }
+
+    restoreBackdrop(); // Empty scene or damage outside every window.
 
     // The local paths use the same keyed layer as overlay capture. On
     // software, copy the opaque rectangles over the completed scene.
