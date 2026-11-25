@@ -49,6 +49,10 @@ struct FileObject {
     // below old EOF, including on an error, and never
     // shrink the file. Installed before publication; called under inode gate.
     int (*growMappedBacking)(Vnode*,uint64_t);
+    // Optional kernel-only path into exclusive contiguous pages. The backend
+    // may retain an allocation on uncertain DMA; the caller must abandon it.
+    uint32_t readBurst;
+    int (*readOwned)(Vnode*,void*,uint64_t,uint64_t*,uint64_t,bool*);
 };
 void FileObjectInit(FileObject* object);
 // Quiescent last-inode release only: no sleeping locks or I/O; IRQ-close safe.

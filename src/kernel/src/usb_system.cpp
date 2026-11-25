@@ -6,6 +6,8 @@
 #include "../../shared/brook_boot_stick.h"
 #include "device.h"
 #include "ext2_vfs.h"
+#include "ext2_trim_plan.h"
+#include "usb_trim_batch.h"
 #include "gpt.h"
 #include "memory/heap.h"
 #include "mount_namespace.h"
@@ -73,8 +75,22 @@ int Write(Device* owner,uint64_t offset,const void* data,uint64_t size) {
     const int result=DeviceWriteLeased(disk,owner,systemWindow.start+offset,data,size);
     return result==int(size)?result:IoError(result);
 }
-int Control(Device*,uint32_t request,void*) {
+int Control(Device*,uint32_t request,void* argument) {
     if(request==DEVICE_IOCTL_READ_ONLY)return 0;
+    if(request==DEVICE_IOCTL_PREFERRED_READ_BYTES)
+        return disk->ops->ioctl(disk,request,nullptr);
+    if(request==DEVICE_IOCTL_USB_READ_DMA) {
+        if(!argument)return -22;
+        auto& relative=*static_cast<UsbDmaRead*>(argument);
+        if(!RangeValid(relative.offset,relative.bytes))return -22;
+        if(IsUncertain())return -95;
+        UsbDmaRead absolute{systemWindow.start+relative.offset,relative.physical,relative.bytes,false};
+        const int result=disk->ops->ioctl(disk,request,&absolute);
+        relative.retain=absolute.retain;
+        if(result==-95)return result;
+        __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED);
+        return result==int(relative.bytes)?result:IoError(result);
+    }
     if(request==DEVICE_IOCTL_WRITE_FENCED)return IsUncertain()?1:0;
     if(request!=DEVICE_IOCTL_FLUSH)return -95;
     if(IsUncertain() || !__atomic_load_n(&open,__ATOMIC_ACQUIRE))return -5;
@@ -92,6 +108,66 @@ WritableDesktopIo SessionIo() {
         [](void* p,uint64_t at,void* data,uint32_t n){return Read(static_cast<Device*>(p),at,data,n);},
         [](void* p,uint64_t at,const void* data,uint32_t n){return DeviceWrite(static_cast<Device*>(p),at,data,n);},
         [](void* p){return DeviceFlush(static_cast<Device*>(p));}};
+}
+
+int MaybeTrim(uint8_t* gdt,uint32_t gdtCapacity) {
+    auto* marker=VfsOpen("/etc/usb-system-trim",VFS_O_STREAM);
+    if(!marker)return 0;
+    VnodeStat stat{};
+    char mode[32]{};
+    uint64_t offset=0;
+    const bool valid=!VfsStat(marker,&stat) && !stat.isDir && !stat.isSymlink &&
+        stat.size<=sizeof(mode) && VfsRead(marker,mode,stat.size,&offset)==int(stat.size);
+    VfsRelease(marker);
+    SsdTrimRequest request{};
+    if(!valid || !SsdTrimParseRequest(mode,uint32_t(stat.size),request) ||
+       (request.run && !request.maximumMiB)) {
+        SerialPuts("USB_SYSTEM_TRIM {\"state\":\"invalid-marker\"}\n");
+        return 0;
+    }
+    UsbUnmapLimits limits{};
+    int result=disk->ops->ioctl(disk,DEVICE_IOCTL_USB_UNMAP_LIMITS,&limits);
+    if(result) {
+        SerialPrintf("USB_SYSTEM_TRIM {\"state\":\"probe\",\"error\":%d}\n",result);
+        return result==-95?0:IoError(result);
+    }
+    UsbTrimBatchPlan plan(limits,uint64_t(request.maximumMiB)*2048);
+    if(!plan.maxSectors || !plan.maxRanges)return 0;
+    auto* scan=static_cast<Ext2TrimScan*>(kmalloc(sizeof(Ext2TrimScan)));
+    if(!scan)return -12;
+    const TrimRange bounds{systemWindow.start/512,systemWindow.length/512};
+    uint32_t batches=0;
+    auto submit=[&](const DeviceWriteWindow* ranges,uint32_t count) {
+        if(request.run) {
+            // The first scan pass has validated the whole bitmap and GDT.
+            // Publish the dirty marker before issuing the first discard.
+            if(!session.dirty)
+                result=session.Begin(SessionIo(),systemWindow.length,record.uuid,gdt,gdtCapacity);
+            UsbUnmapBatch batch{ranges,count};
+            if(!result)result=DeviceUsbUnmapLeased(disk,&dataDevice,batch);
+            if(result)return false;
+        }
+        for(uint32_t i=0;i<count;++i)
+            SerialPrintf("USB_SYSTEM_TRIM_RANGE {\"mode\":\"%s\",\"lba\":%lu,\"sectors\":%lu}\n",
+                request.run?"run":"dry-run",ranges[i].start/512,ranges[i].length/512);
+        ++batches;
+        return true;
+    };
+    const auto scanned=Ext2TrimScanClean(bounds,record.uuid,request.minimumMiB*256,*scan,
+        [&](uint64_t at,void* data,uint32_t size) {
+            return Read(&dataDevice,at,data,size)==int(size);
+        },[&](TrimRange range) {
+            return plan.Add(range,submit);
+        });
+    kfree(scan);
+    if(scanned==Ext2TrimScanResult::Ok) {
+        if(plan.Drain(submit) && request.run && batches)result=DeviceFlush(&dataDevice);
+    } else if(scanned!=Ext2TrimScanResult::Cancelled) {
+        result=scanned==Ext2TrimScanResult::IoError?-5:-117;
+    }
+    SerialPrintf("USB_SYSTEM_TRIM {\"state\":\"done\",\"mode\":\"%s\",\"batches\":%u,\"sectors\":%lu,\"error\":%d}\n",
+        request.run?"run":"dry-run",batches,plan.total,result);
+    return !request.run && scanned==Ext2TrimScanResult::Invalid?0:result;
 }
 
 bool Fail(const char* stage,int error) {
@@ -182,6 +258,13 @@ bool UsbSystemBoot(uint8_t* nextDrive,bool scanComplete) {
        VfsLstatPath("/nix",&target) || !target.isDir || target.isSymlink)
         return Fail("mount-target",details.status?details.status:-22);
 
+    const int transport=disk->ops->ioctl(disk,DEVICE_IOCTL_USB_SYSTEM_TRANSPORT,nullptr);
+    if(transport && transport!=-95)return Fail("storage-transport",transport);
+    if(!transport && (!ValidateGpt(disk,bootGuid,bootEntry,bootFirst,bootSectors) ||
+       !ReadExact(disk,systemWindow.start+1024,sb,sizeof(sb)) ||
+       LargeExt2ClassifyHeader(sb,sizeof(sb),systemWindow.length,record.uuid,geometry)!=LargeExt2HeaderState::Clean))
+        return Fail("storage-transport-identity",-22);
+
     constexpr uint32_t gdtCapacity=4096*32;
     auto* gdt=static_cast<uint8_t*>(kmalloc(gdtCapacity));
     if(!gdt)return Fail("descriptor-buffer",-12);
@@ -190,7 +273,8 @@ bool UsbSystemBoot(uint8_t* nextDrive,bool scanComplete) {
     int error=-16;
     if(DeviceRegister(&dataDevice)) {
         if(!DeviceInstallBootWriteLeases(&lease,1))DeviceUnregister(&dataDevice);
-        else if(!(error=SetWindow(true)) && !(error=DeviceFlush(&dataDevice)))
+        else if(!(error=SetWindow(true)) && !(error=DeviceFlush(&dataDevice)) &&
+                !(error=MaybeTrim(gdt,gdtCapacity)) && !session.dirty)
             error=session.Begin(SessionIo(),systemWindow.length,record.uuid,gdt,gdtCapacity);
     }
     kfree(gdt);
@@ -228,6 +312,14 @@ int UsbSystemFinalSync(int syncError) {
     WritableDesktopDirectFinalResult(error,session.cleanAttempted);
     SerialPrintf("USB_SYSTEM_FINAL_SYNC result=%d clean=%u\n",error,error?0u:1u);
     return error;
+}
+
+bool UsbSystemTiming(UsbStorageTiming* out) {
+    return disk && disk->ops->ioctl(disk,DEVICE_IOCTL_USB_STORAGE_TIMING,out)==0;
+}
+int UsbSystemBenchRead(uint64_t at,void* data,uint32_t bytes) {
+    if(!ready || IsUncertain())return -19;
+    return Read(&dataDevice,at,data,bytes);
 }
 
 UsbSystemStatus UsbSystemRead() {

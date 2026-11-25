@@ -206,6 +206,7 @@ struct Ext2Mount {
     Device*  dev;
     bool      hasWriteFence;
     uint32_t cacheNamespace; // unique for this mount's lifetime, including remounts
+    uint32_t readBurst;      // maximum coalesced data read in bytes
     uint32_t blockSize;      // bytes per block
     uint32_t blockShift;     // log2(blockSize)
     uint32_t inodeSize;      // bytes per inode on disk
@@ -411,6 +412,9 @@ static void Ext2RemoveOpenLocked(Ext2OpenInode* inode)
     inode->previous=inode->next=inode->hashNext=nullptr;
 }
 
+static int Ext2FileReadKernel(Vnode* vn,void* buf,uint64_t len,uint64_t* offset,
+                              uint64_t physical=0,bool* retain=nullptr);
+
 // Called with the filesystem lock held, before publishing a vnode.
 static Ext2OpenInode* Ext2HoldInode(Ext2Mount* mnt, uint32_t inode)
 {
@@ -423,6 +427,10 @@ static Ext2OpenInode* Ext2HoldInode(Ext2Mount* mnt, uint32_t inode)
     if (!candidate) return nullptr;
     *candidate = {mnt, inode, 1, false, nullptr, {}};
     FileObjectInit(&candidate->file);
+    if(mnt->readBurst>65536) {
+        candidate->file.readBurst=mnt->readBurst;
+        candidate->file.readOwned=Ext2FileReadKernel;
+    }
     // Strict growth never prunes blocks or touches bytes below old EOF,
     // including a failed inode write. Only an invalid old tail can be zeroed.
     candidate->file.growMappedBacking=Ext2FileTruncate;
@@ -553,7 +561,14 @@ struct Ext2RawBackend {
     }
     bool Flush(){return DeviceFlush(mnt->dev)==0;}
 };
-static bool Ext2DevRead(Ext2Mount* mnt,uint64_t offset,void* buffer,uint64_t length) {
+static bool Ext2DevRead(Ext2Mount* mnt,uint64_t offset,void* buffer,uint64_t length,
+                        uint64_t physical=0,bool* retain=nullptr) {
+    if(physical && !mnt->writeback.count && !mnt->writeback.retry && mnt->dev->ops->ioctl) {
+        UsbDmaRead request{offset,physical,uint32_t(length),false};
+        const int result=mnt->dev->ops->ioctl(mnt->dev,DEVICE_IOCTL_USB_READ_DMA,&request);
+        if(retain && request.retain)*retain=true;
+        if(result!=-95)return result==int(length);
+    }
     Ext2RawBackend io{mnt};
     const bool ok=mnt->writeback.bytes?mnt->writeback.Read(io,offset,buffer,length):io.Read(offset,buffer,length);
     if(!ok)SerialPrintf("ext2: DevRead FAIL off=%lu len=%lu\n",offset,length);
@@ -589,7 +604,8 @@ struct Ext2BlockLookup {
 };
 static Ext2BlockLookup Ext2BlockMap(Ext2Mount* mnt, const Ext2Inode* ino, uint32_t fileBlock);
 static int Ext2ReadInodeData(Ext2Mount* mnt, const Ext2Inode* ino,
-                             void* buf, uint64_t len, uint64_t offset);
+                             void* buf, uint64_t len, uint64_t offset,
+                             uint64_t physical=0,bool* retain=nullptr);
 static uint32_t Ext2DirLookup(Ext2Mount* mnt, uint32_t parentIno, const Ext2Inode* dirIno, const char* name, int* error=nullptr);
 static uint32_t Ext2ResolvePath(Ext2Mount* mnt, uint32_t startIno,
                                 const char* path, int symlinkDepth, int* error=nullptr);
@@ -2020,7 +2036,8 @@ static Ext2BlockLookup Ext2BlockMap(Ext2Mount* mnt, const Ext2Inode* ino, uint32
 // the run usually spans the whole request — collapsing dozens of
 // per-block virtio round-trips into a single 64KB transfer.
 static int Ext2ReadInodeData(Ext2Mount* mnt, const Ext2Inode* ino,
-                             void* buf, uint64_t len, uint64_t offset)
+                             void* buf, uint64_t len, uint64_t offset,
+                             uint64_t physical,bool* retain)
 {
     uint64_t fileSize = Ext2InodeSize(ino);
     if (offset >= fileSize) {
@@ -2032,10 +2049,6 @@ static int Ext2ReadInodeData(Ext2Mount* mnt, const Ext2Inode* ino,
     auto* dst = static_cast<uint8_t*>(buf);
     uint64_t bytesRead = 0;
     int error = 0;
-
-    // Cap run-coalesce length at the underlying device's preferred
-    // burst (matches virtio-blk's persistent 64KB DMA buffer).
-    static constexpr uint64_t MAX_RUN_BYTES = 64 * 1024;
 
     // Bounce buffer used only for unaligned head/tail partial blocks.
     uint8_t* blockBuf = nullptr;
@@ -2089,7 +2102,7 @@ static int Ext2ReadInodeData(Ext2Mount* mnt, const Ext2Inode* ino,
 
         // Aligned to a block boundary AND caller wants at least one
         // full block. Find the longest run of contiguous file-blocks
-        // mapping to contiguous disk-blocks (capped at MAX_RUN_BYTES
+        // mapping to contiguous disk-blocks (capped at the device read burst
         // and at the data still requested).
         //
         // Before hitting disk, check if the first block is cached.
@@ -2101,8 +2114,8 @@ static int Ext2ReadInodeData(Ext2Mount* mnt, const Ext2Inode* ino,
 
         uint32_t runBlocks = 1;
         uint32_t maxRun = static_cast<uint32_t>(remaining >> mnt->blockShift);
-        if (maxRun > (MAX_RUN_BYTES >> mnt->blockShift))
-            maxRun = MAX_RUN_BYTES >> mnt->blockShift;
+        if (maxRun > (mnt->readBurst >> mnt->blockShift))
+            maxRun = mnt->readBurst >> mnt->blockShift;
         while (runBlocks < maxRun) {
             const auto next = Ext2BlockMap(mnt, ino, fileBlock + runBlocks);
             if (next.failed) {
@@ -2115,7 +2128,7 @@ static int Ext2ReadInodeData(Ext2Mount* mnt, const Ext2Inode* ino,
 
         uint64_t runBytes = static_cast<uint64_t>(runBlocks) << mnt->blockShift;
         uint64_t runOff   = static_cast<uint64_t>(diskBlock) << mnt->blockShift;
-        if (!Ext2DevRead(mnt, runOff, dst + bytesRead, runBytes)) {
+        if (!Ext2DevRead(mnt,runOff,dst+bytesRead,runBytes,physical?physical+bytesRead:0,retain)) {
             SerialPrintf("ext2: coalesced read failed off=%lu len=%lu\n",
                          runOff, runBytes);
             error = -5;
@@ -2339,13 +2352,19 @@ static int Ext2FileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
         return done ? static_cast<int>(done) : error;
     }
 #endif
+    return Ext2FileReadKernel(vn,buf,len,offset);
+}
+
+static int Ext2FileReadKernel(Vnode* vn,void* buf,uint64_t len,uint64_t* offset,
+                              uint64_t physical,bool* retain)
+{
     auto* fp = static_cast<Ext2FilePriv*>(vn->priv);
     KRwLockReadLock(&g_ext2Lock);
     Ext2Inode data;
     if (!Ext2ReadInode(fp->mnt, fp->inode, &data)) {
         KRwLockReadUnlock(&g_ext2Lock); return -5;
     }
-    int r = Ext2ReadInodeData(fp->mnt, &data, buf, len, *offset);
+    int r = Ext2ReadInodeData(fp->mnt,&data,buf,len,*offset,physical,retain);
     if (r > 0) *offset += r;
     KRwLockReadUnlock(&g_ext2Lock);
     // Relatime: avoid a metadata write for every read. Re-read under the
@@ -3033,6 +3052,8 @@ static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
     mnt->cacheNamespace = static_cast<uint32_t>(cacheNamespace);
     mnt->dev            = dev;
     mnt->hasWriteFence=dev->ops->ioctl && dev->ops->ioctl(dev,DEVICE_IOCTL_WRITE_FENCED,nullptr)>=0;
+    const int preferred=dev->ops->ioctl?dev->ops->ioctl(dev,DEVICE_IOCTL_PREFERRED_READ_BYTES,nullptr):0;
+    mnt->readBurst=preferred>=int(blockSize) && preferred<=(1<<20)?uint32_t(preferred):65536;
     mnt->blockSize      = blockSize;
     mnt->blockShift     = blockShift;
     mnt->inodeSize      = inodeSize;
