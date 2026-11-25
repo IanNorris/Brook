@@ -8,6 +8,7 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
+STORE = Path("/nix/store")
 sys.path.insert(0, str(ROOT / 'tools/nix-install'))
 from stage_profile import MAX_PLAN, validate_plan
 from stage_selected_space import validate_usage
@@ -44,7 +45,7 @@ def checked_plan(directory, public_key):
     validate_plan({**plan, 'format': 2})
     validate_usage(plan)
     validate_launcher_ids(plan['profile']['launcherIds'])
-    profile = Path('/nix/store') / plan['profile']['root']
+    profile = STORE / plan['profile']['root']
     for name in ('bash', 'brook-chromium', 'brook-gallery', 'hardware-dbus',
                  'hardware-message', 'waylandd', 'brook-stage-profile'):
         binary = profile / 'bin' / name

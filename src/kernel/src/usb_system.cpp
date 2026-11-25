@@ -228,10 +228,14 @@ void UsbSystemConfigure() {
     ShowHex(boot.fsUuid,record.uuid);
 }
 
-static int PrepareProfileBoot() {
+static int PrepareProfileBoot(const VfsPath& root) {
     constexpr const char* directory = "/data/.brook-transfer";
-    auto* listing = VfsOpen(directory, VFS_O_STREAM);
-    if (!listing) return -5;
+    int openError = 0;
+    auto* listing = VfsOpenAt(root, root, directory, VFS_O_READ, 0, 0, &openError);
+    if (!listing) {
+        KPrintf("usb-system: cannot list profile transfers (%d)\n", openError);
+        return openError ? openError : -5;
+    }
     uint32_t cookie = 0;
     DirEntry entry{};
     int count;
@@ -246,18 +250,25 @@ static int PrepareProfileBoot() {
         if (!transfer) continue;
         char path[80] = "/data/.brook-transfer/";
         memcpy(path + strlen(path), entry.name, 38);
-        error = VfsUnlink(path);
+        error = VfsRemoveAt(root, root, path, false);
         if (error) break;
         cookie = 0;
     }
     VfsClose(listing);
     if (error || count < 0) return error ? error : count;
     uint8_t random[16];
-    if (!StrongRandomBytes(random, sizeof(random))) return -5;
+    if (!StrongRandomBytes(random, sizeof(random))) {
+        KPrintf("usb-system: profile boot entropy unavailable\n");
+        return -5;
+    }
     char text[33];
     ShowHex(text, random);
-    auto* writer = VfsOpenMode("/data/.brook-profile-boot", VFS_O_CREATE | VFS_O_EXCL | VFS_O_WRITE, 0644);
-    if (!writer) return -5;
+    auto* writer = VfsOpenAt(root, root, "/data/.brook-profile-boot",
+                             VFS_O_CREATE | VFS_O_EXCL | VFS_O_WRITE, 0644, 0, &openError);
+    if (!writer) {
+        KPrintf("usb-system: cannot create profile boot identity (%d)\n", openError);
+        return openError ? openError : -5;
+    }
     uint64_t offset = 0;
     const int written = VfsWrite(writer, text, 32, &offset);
     VfsClose(writer);
@@ -310,8 +321,8 @@ static int BindProfileTransfer() {
     VfsPathRelease(transfer);
     VfsPathRelease(var);
     VfsPathRelease(nix);
+    if (!error) error = PrepareProfileBoot(root);
     VfsPathRelease(root);
-    if (!error) error = PrepareProfileBoot();
     boot.profileTransferReady = !error;
     return error;
 }
