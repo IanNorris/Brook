@@ -14,6 +14,7 @@ int UsbSystemFinalSync(int syncError);
 struct UsbSystemStatus {
     const char* stage="absent";
     bool configured=false, parsed=false, window=false, mounted=false;
+    bool profileTransferReady=false;
     bool dirty=false, clean=false, uncertain=false, finalAttempted=false;
     int disk=-1, error=0, finalError=0;
     uint64_t firstLba=0, sectors=0, reads=0, writes=0, flushes=0, errors=0;

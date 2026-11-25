@@ -214,7 +214,12 @@ static int serve(int client,int directory,const char* key,const char* boot,const
         struct statvfs space;
         if(fstatvfs(directory,&space)){result=27;goto done;}
         if(!space.f_frsize||space.f_bavail>UINT64_MAX/space.f_frsize){errno=EOVERFLOW;result=27;goto done;}
-        if(bytes>(uint64_t)space.f_bavail*space.f_frsize){errno=ENOSPC;result=27;goto done;}
+        uint64_t available=(uint64_t)space.f_bavail*space.f_frsize;
+#ifdef BROOK_BULK_USB_PROFILE
+        const uint64_t reserve=UINT64_C(1)<<30;
+        available=available>reserve?available-reserve:0;
+#endif
+        if(bytes>available){errno=ENOSPC;result=27;goto done;}
         struct stat exists;
         if(!fstatat(directory,final,&exists,AT_SYMLINK_NOFOLLOW)||errno!=ENOENT){result=14;goto done;}
         fd=openat(directory,temporary,O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0644);if(fd<0){result=14;goto done;}partial=1;
@@ -318,7 +323,11 @@ static int serve(int client,int directory,const char* key,const char* boot,const
         "usb_media"
 #endif
 #else
+#ifdef BROOK_BULK_USB_PROFILE
+        "persistent_system"
+#else
         !strcmp(action,"disk")?"not_staged":"current_boot_ram"
+#endif
 #endif
     );
     /* Original job receipt disambiguates a lost final TCP reply. */
@@ -361,7 +370,7 @@ int main(int argc,char** argv){
     if(!valid || (get?(argc!=5||!valid_id(argv[4])):frame?(argc==5&&parse_frame_options(argv[4])):argc!=4))return 2;
 #endif
     const char *root=BULK_ROOT,*keypath="/etc/hardware-update-key";unsigned port=1236;
-#ifdef BROOK_BULK_INSTALL_MEDIA
+#if defined(BROOK_BULK_INSTALL_MEDIA) || defined(BROOK_BULK_USB_PROFILE)
     if(strcmp(argv[3],"put"))return 2;
 #endif
 #ifdef BROOK_BULK_TEST
@@ -370,7 +379,13 @@ int main(int argc,char** argv){
     port=(unsigned)atoi(p);if(!port||port>65535)return 2;
 #else
     if(geteuid()!=0)return 3;
-    int marker=open("/etc/hardware-maintenance",O_RDONLY|O_NOFOLLOW|O_CLOEXEC);if(marker<0)return 3;close(marker);
+#ifdef BROOK_BULK_USB_PROFILE
+    int marker=open("/etc/usb-profile-plan.pub",O_RDONLY|O_NOFOLLOW|O_CLOEXEC);
+#else
+    int marker=open("/etc/hardware-maintenance",O_RDONLY|O_NOFOLLOW|O_CLOEXEC);
+#endif
+    if(marker<0)return 3;
+    close(marker);
 #endif
     char key[33]={0};
 #ifdef BROOK_BRIDGE_V3

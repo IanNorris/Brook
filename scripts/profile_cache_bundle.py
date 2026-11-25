@@ -9,12 +9,14 @@ from stage_nar import (CACHE_BUNDLE_COUNT, CACHE_BUNDLE_LIMIT, CACHE_MEMBER_NAME
                        CACHE_METADATA_LIMIT, parse_narinfo, store_name)
 
 
-def cache_inventory(cache, plan):
+def cache_inventory(cache, plan, *, missing=None):
     if cache.is_symlink() or not cache.is_dir() or (cache / "nar").is_symlink():
         raise ValueError("Expected a local generated binary cache directory")
     paths = {}
     for name, entry in sorted(plan["closure"].items()):
         store_name("/nix/store/" + name)
+        if missing is not None and name not in missing:
+            continue
         if entry["source"] == "upstream" and not plan["cache"]["mirrorUpstream"]:
             continue
         info_name = name[:32] + ".narinfo"
@@ -34,14 +36,14 @@ def cache_inventory(cache, plan):
     return sorted(paths.items())
 
 
-def pack_cache(cache, plan, out, *, limit=CACHE_BUNDLE_LIMIT):
+def pack_cache(cache, plan, out, *, limit=CACHE_BUNDLE_LIMIT, missing=None):
     if not 4096 <= limit <= CACHE_BUNDLE_LIMIT:
         raise ValueError("Invalid cache bundle size cap")
     groups = [[]]
     # ZIP_STORED does not recompress NAR bytes. Allow room per member for
     # the local header, central directory, timestamps and ZIP64 metadata.
     used = 1024
-    for name, source in cache_inventory(cache, plan):
+    for name, source in cache_inventory(cache, plan, missing=missing):
         size = source.stat().st_size + 2 * len(name) + 256
         if 1024 + size > limit:
             raise ValueError(f"Cache member exceeds bridge bundle size: {name}")

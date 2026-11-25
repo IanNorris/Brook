@@ -16,6 +16,8 @@
 #include "kprintf.h"
 #include "large_data_session.h"
 #include "serial.h"
+#include "strong_random.h"
+#include "string.h"
 #include "vfs.h"
 #include "writable_desktop.h"
 
@@ -254,6 +256,105 @@ static uint64_t MountClockNs() {
     return precise ? precise : ApicTickCount() * 1000000;
 }
 
+static int PrepareProfileBoot(const VfsPath& root) {
+    constexpr const char* directory = "/data/.brook-transfer";
+    int openError = 0;
+    auto* listing = VfsOpenAt(root, root, directory, VFS_O_READ, 0, 0, &openError);
+    if (!listing) {
+        KPrintf("usb-system: cannot list profile transfers (%d)\n", openError);
+        return openError ? openError : -5;
+    }
+    uint32_t cookie = 0;
+    DirEntry entry{};
+    int count;
+    int error = 0;
+    while ((count = VfsReaddir(listing, &entry, &cookie)) > 0) {
+        if (entry.isDir || strlen(entry.name) != 37 || strcmp(entry.name + 32, ".part")) continue;
+        bool transfer = true;
+        for (unsigned i = 0; i < 32; ++i) {
+            const char c = entry.name[i];
+            transfer &= (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        }
+        if (!transfer) continue;
+        char path[80] = "/data/.brook-transfer/";
+        memcpy(path + strlen(path), entry.name, 38);
+        error = VfsRemoveAt(root, root, path, false);
+        if (error) break;
+        cookie = 0;
+    }
+    VfsClose(listing);
+    if (error || count < 0) return error ? error : count;
+    uint8_t random[16];
+    if (!StrongRandomBytes(random, sizeof(random))) {
+        KPrintf("usb-system: profile boot entropy unavailable\n");
+        return -5;
+    }
+    char text[33];
+    ShowHex(text, random);
+    auto* writer = VfsOpenAt(root, root, "/data/.brook-profile-boot",
+                             VFS_O_CREATE | VFS_O_EXCL | VFS_O_WRITE, 0644, 0, &openError);
+    if (!writer) {
+        KPrintf("usb-system: cannot create profile boot identity (%d)\n", openError);
+        return openError ? openError : -5;
+    }
+    uint64_t offset = 0;
+    const int written = VfsWrite(writer, text, 32, &offset);
+    VfsClose(writer);
+    return written == 32 ? 0 : -5;
+}
+
+// The authenticated bulk helper and profile-stage capacity probe share this
+// path. Bind it to the admitted system filesystem before userspace starts.
+static int BindProfileTransfer() {
+    VnodeStat marker{};
+    const int markerResult = VfsLstatPath("/etc/usb-profile-plan.pub", &marker);
+    if (markerResult == -2) return 0;
+    if (markerResult) return markerResult;
+    if (marker.isDir || marker.isSymlink) return -22;
+    constexpr char source[] = "/nix/var/.brook-transfer";
+    constexpr char target[] = "/data/.brook-transfer";
+    VfsPath root{}, nix{}, var{}, transfer{};
+    int error = VfsPathRoot(&root);
+    if (!error) error = VfsPathResolve(root, root, "/nix", &nix, false);
+    if (!error) error = VfsPathResolve(root, root, "/nix/var", &var, false);
+    if (!error && (nix.attachment == root.attachment || nix.attachment != var.attachment)) error = -18;
+    // WritableDesktopPrepareDirect already admitted /data as a tmpfs mount.
+    const char* directories[] = {"/nix/var", "/data"};
+    for (const char* path : directories) {
+        VnodeStat stat{};
+        if (!error) error = VfsStatAt(root, root, path, &stat, false);
+        if (!error && (!stat.isDir || stat.isSymlink)) error = -20;
+        if (error) {
+            KPrintf("usb-system: profile transfer parent %s (%d)\n", path, error);
+            break;
+        }
+    }
+    const char* paths[] = {source, target};
+    for (const char* path : paths) {
+        if (error) break;
+        const int created = VfsMkdirAt(root, root, path, 0755, 0);
+        if (created && created != -17) {
+            error = created;
+            break;
+        }
+        VnodeStat stat{};
+        error = VfsStatAt(root, root, path, &stat, false);
+        if (!error && (!stat.isDir || stat.isSymlink || stat.uid != 0 || (stat.mode & 0022))) error = -13;
+        if (error) KPrintf("usb-system: profile transfer directory %s (%d)\n", path, error);
+    }
+    if (!error) error = VfsPathResolve(root, root, source, &transfer, false);
+    if (!error && nix.attachment != transfer.attachment) error = -18;
+    if (!error)
+        error = VfsMountNamespaceBindAt(VfsMountNamespaceInitial(), root, root, source, target);
+    VfsPathRelease(transfer);
+    VfsPathRelease(var);
+    VfsPathRelease(nix);
+    if (!error) error = PrepareProfileBoot(root);
+    VfsPathRelease(root);
+    boot.profileTransferReady = !error;
+    return error;
+}
+
 bool UsbSystemBoot(uint8_t* nextDrive,bool scanComplete) {
     auto phase=MountClockNs();
     if(!boot.parsed || !nextDrive)return Fail("record",-22);
@@ -324,6 +425,8 @@ bool UsbSystemBoot(uint8_t* nextDrive,bool scanComplete) {
         VfsUnmount("/nix");
         return Fail(details.check,details.status);
     }
+    if (const int transferError = BindProfileTransfer())
+        KPrintf("usb-system: profile transfer unavailable (bind error %d)\n", transferError);
     if(!session.Arm())__builtin_trap();
     mountUs=(MountClockNs()-phase)/1000;
     ready=true;
