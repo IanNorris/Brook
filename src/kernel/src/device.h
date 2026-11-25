@@ -43,7 +43,7 @@ static constexpr uint32_t DEVICE_IOCTL_USB_SYSTEM_WINDOW = 0x42460004;
 // A runtime failure has fenced a previously writable filesystem backing.
 // Optional, non-blocking, implemented by the USB system adapter only.
 static constexpr uint32_t DEVICE_IOCTL_WRITE_FENCED = 0x42460005;
-enum class UsbReadSource : uint8_t { Boot, File, Fault, Inode, Indirect, Directory, Bitmap, Bench, Other, Count };
+enum class UsbReadSource : uint8_t { Boot, File, Exec, Fault, Inode, Indirect, Directory, Bitmap, Bench, Other, Count };
 constexpr unsigned UsbReadSourceCount=unsigned(UsbReadSource::Count);
 constexpr unsigned UsbReadBuckets=5;
 static constexpr uint32_t DEVICE_IOCTL_USB_TAGGED_READ = 0x4246000c;
@@ -57,7 +57,8 @@ struct UsbStorageTiming {
     uint64_t directBytes,uasFlights;
     uint32_t uasPeakDepth;
     UsbReadHistogram readsBySource[UsbReadSourceCount];
-    uint64_t admissionUs,transportUs,sessionUs,mountUs;
+    uint64_t admissionUs,transportUs,transportIdentityUs,sessionUs,mountUs;
+    uint64_t uasDropBotUs, uasSetInterfaceUs, uasConfigureUs, uasIdentifyUs;
 };
 static constexpr uint32_t DEVICE_IOCTL_USB_STORAGE_TIMING = 0x42460006;
 // Positive preferred size in bytes, or an unsupported error.

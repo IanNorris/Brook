@@ -63,7 +63,7 @@ bool RangeValid(uint64_t offset,uint64_t size) {
     return disk && offset<=systemWindow.length && size<=systemWindow.length-offset && size<=0x7fffffffu;
 }
 UsbReadHistogram sources[UsbReadSourceCount]{};
-uint64_t admissionUs,transportUs,sessionUs,mountUs;
+uint64_t admissionUs,transportUs,transportIdentityUs,sessionUs,mountUs;
 
 void RecordRead(UsbReadSource source,uint64_t bytes) {
     const unsigned index=unsigned(source);
@@ -283,12 +283,14 @@ bool UsbSystemBoot(uint8_t* nextDrive,bool scanComplete) {
 
     admissionUs=(ApicTickCount()-phase)*1000;phase=ApicTickCount();
     const int transport=disk->ops->ioctl(disk,DEVICE_IOCTL_USB_SYSTEM_TRANSPORT,nullptr);
+    const auto identifyStart=ApicTickCount();
     if(transport && transport!=-95)return Fail("storage-transport",transport);
     if(!transport && (!ValidateGpt(disk,bootGuid,bootEntry,bootFirst,bootSectors) ||
        !ReadExact(disk,systemWindow.start+1024,sb,sizeof(sb)) ||
        LargeExt2ClassifyHeader(sb,sizeof(sb),systemWindow.length,record.uuid,geometry)!=LargeExt2HeaderState::Clean))
         return Fail("storage-transport-identity",-22);
 
+    transportIdentityUs=(ApicTickCount()-identifyStart)*1000;
     transportUs=(ApicTickCount()-phase)*1000;phase=ApicTickCount();
     constexpr uint32_t gdtCapacity=4096*32;
     auto* gdt=static_cast<uint8_t*>(kmalloc(gdtCapacity));
@@ -349,6 +351,7 @@ bool UsbSystemTiming(UsbStorageTiming* out) {
         out->readsBySource[i].bytes=__atomic_load_n(&sources[i].bytes,__ATOMIC_RELAXED);
     }
     out->admissionUs=admissionUs;out->transportUs=transportUs;
+    out->transportIdentityUs=transportIdentityUs;
     out->sessionUs=sessionUs;out->mountUs=mountUs;
     return true;
 }

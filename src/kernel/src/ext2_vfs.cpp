@@ -246,13 +246,12 @@ struct Ext2Mount {
     // --- Indirect-block read cache ---
     // BlockMap() is called once per file-block during sequential reads,
     // and for every fileBlock past the first 12 it has to read
-    // indirect blocks from disk.  4 cached slots avoid thrashing when
-    // doubly/triply-indirect lookups alternate between L1 and L2 blocks.
-    static constexpr uint32_t IND_CACHE_SLOTS = 4;
+    // indirect blocks from disk. Keep a bounded direct-mapped cache across
+    // repeated reads of large images and across levels of an indirect tree.
+    static constexpr uint32_t IND_CACHE_SLOTS = 256;
     SpinLock indCacheLock;
     uint32_t indCacheBlockNum[IND_CACHE_SLOTS];  // 0 = empty
     uint8_t* indCacheData[IND_CACHE_SLOTS];      // blockSize bytes each; lazy-alloced
-    uint32_t indCacheLru;                         // next slot to evict (simple round-robin)
 
     // --- Bitmap allocation hints ---
     // Without these, Ext2AllocBlock/Ext2AllocInode rescan each bitmap from
@@ -414,7 +413,7 @@ static void Ext2RemoveOpenLocked(Ext2OpenInode* inode)
 }
 
 static int Ext2FileReadKernel(Vnode* vn,void* buf,uint64_t len,uint64_t* offset,
-                              uint64_t physical=0,bool* retain=nullptr,bool fault=false);
+                              uint64_t physical=0,bool* retain=nullptr,UsbReadSource source=UsbReadSource::File);
 
 // Called with the filesystem lock held, before publishing a vnode.
 static Ext2OpenInode* Ext2HoldInode(Ext2Mount* mnt, uint32_t inode)
@@ -613,7 +612,7 @@ struct Ext2BlockLookup {
 static Ext2BlockLookup Ext2BlockMap(Ext2Mount* mnt, const Ext2Inode* ino, uint32_t fileBlock);
 static int Ext2ReadInodeData(Ext2Mount* mnt, const Ext2Inode* ino,
                              void* buf, uint64_t len, uint64_t offset,
-                             uint64_t physical=0,bool* retain=nullptr,bool fault=false);
+                             uint64_t physical=0,bool* retain=nullptr,UsbReadSource source=UsbReadSource::File);
 static uint32_t Ext2DirLookup(Ext2Mount* mnt, uint32_t parentIno, const Ext2Inode* dirIno, const char* name, int* error=nullptr);
 static uint32_t Ext2ResolvePath(Ext2Mount* mnt, uint32_t startIno,
                                 const char* path, int symlinkDepth, int* error=nullptr);
@@ -816,21 +815,20 @@ static void Ext2BlockCacheInvalidate(Ext2Mount* mnt, uint32_t blockNum)
     SpinLockRelease(&mnt->blockCacheLock);
 }
 
+static uint32_t Ext2IndCacheSlot(uint32_t block) {
+    return (block^(block>>8))&(Ext2Mount::IND_CACHE_SLOTS-1);
+}
+
 // Write a single block from buf.
 static bool Ext2WriteBlock(Ext2Mount* mnt, uint32_t blockNum, const void* buf)
 {
     if (blockNum == 0) return false;
     // SerialPrintf("ext2: WriteBlock %u\n", blockNum);
     uint64_t off = static_cast<uint64_t>(blockNum) << mnt->blockShift;
-    // Invalidate the indirect-block read cache if we're overwriting it.
-    {
-        SpinLockAcquire(&mnt->indCacheLock);
-        for (uint32_t s = 0; s < Ext2Mount::IND_CACHE_SLOTS; ++s) {
-            if (mnt->indCacheBlockNum[s] == blockNum)
-                mnt->indCacheBlockNum[s] = 0;
-        }
-        SpinLockRelease(&mnt->indCacheLock);
-    }
+    SpinLockAcquire(&mnt->indCacheLock);
+    const uint32_t slot=Ext2IndCacheSlot(blockNum);
+    if(mnt->indCacheBlockNum[slot]==blockNum)mnt->indCacheBlockNum[slot]=0;
+    SpinLockRelease(&mnt->indCacheLock);
     // Invalidate the data block cache.
     Ext2BlockCacheInvalidate(mnt, blockNum);
     return Ext2DevWrite(mnt, off, buf, mnt->blockSize);
@@ -847,6 +845,12 @@ static bool Ext2WriteInode(Ext2Mount* mnt, uint32_t ino, const Ext2Inode* data)
     uint64_t tableOff = static_cast<uint64_t>(mnt->bgdt[group].bg_inode_table)
                         << mnt->blockShift;
     uint64_t inodeOff = tableOff + static_cast<uint64_t>(index) * mnt->inodeSize;
+    if (mnt->taggedReads) {
+        const auto first = uint32_t(inodeOff >> mnt->blockShift);
+        const auto last = uint32_t((inodeOff + sizeof(*data) - 1) >> mnt->blockShift);
+        Ext2BlockCacheInvalidate(mnt, first);
+        if (last != first) Ext2BlockCacheInvalidate(mnt, last);
+    }
     bool ok = Ext2DevWrite(mnt, inodeOff, data, sizeof(Ext2Inode));
     if (ok) Ext2InodeCachePut(mnt, ino, data);
     return ok;
@@ -1145,7 +1149,8 @@ static bool Ext2FreeInode(Ext2Mount* mnt, uint32_t ino, bool isDir)
 // Ensure inode has a block mapped at `fileBlock`. Allocates if needed.
 // Returns disk block number or 0 on failure.
 // Forward declaration: defined further down with the read path.
-static Ext2BlockLookup Ext2ReadIndPointer(Ext2Mount* mnt, uint32_t indBlock, uint32_t idx);
+static Ext2BlockLookup Ext2ReadIndPointer(Ext2Mount* mnt,uint32_t indBlock,uint32_t idx,
+                                        uint32_t batch=1,uint32_t* children=nullptr);
 
 // Legacy small writes and batched append/reclamation share indirect blocks
 // through two caches. The caller holds g_ext2Lock exclusively, so no reader
@@ -1159,12 +1164,11 @@ static bool Ext2WriteIndPointer(Ext2Mount* mnt, uint32_t block, uint32_t index,
     uint64_t offset = (static_cast<uint64_t>(block) << mnt->blockShift) + index * 4;
     bool written = Ext2DevWrite(mnt, offset, &value, sizeof(value));
     SpinLockAcquire(&mnt->indCacheLock);
-    for (uint32_t s = 0; s < Ext2Mount::IND_CACHE_SLOTS; ++s) {
-        if (mnt->indCacheBlockNum[s] != block) continue;
-        if (written && mnt->indCacheData[s])
-            *reinterpret_cast<uint32_t*>(mnt->indCacheData[s] + index * 4) = value;
-        else
-            mnt->indCacheBlockNum[s] = 0;
+    const auto slot=Ext2IndCacheSlot(block);
+    if(mnt->indCacheBlockNum[slot]==block) {
+        if(written && mnt->indCacheData[slot])
+            reinterpret_cast<uint32_t*>(mnt->indCacheData[slot])[index]=value;
+        else mnt->indCacheBlockNum[slot]=0;
     }
     SpinLockRelease(&mnt->indCacheLock);
     return written;
@@ -1943,7 +1947,33 @@ static bool Ext2ReadInode(Ext2Mount* mnt, uint32_t ino, Ext2Inode* out)
     uint64_t tableOff = static_cast<uint64_t>(mnt->bgdt[group].bg_inode_table)
                         << mnt->blockShift;
     uint64_t inodeOff = tableOff + static_cast<uint64_t>(index) * mnt->inodeSize;
-    if (!Ext2DevRead(mnt,inodeOff,out,sizeof(Ext2Inode),0,nullptr,UsbReadSource::Inode)) return false;
+    const uint32_t block=uint32_t(inodeOff>>mnt->blockShift);
+    const uint32_t within=inodeOff&(mnt->blockSize-1);
+    if(mnt->taggedReads && within+sizeof(*out)<=mnt->blockSize) {
+        // Read only within this group's inode table. Cache the table blocks
+        // through the same write-invalidation path used by full-block reads.
+        const uint64_t tableEnd=tableOff+uint64_t(mnt->inodesPerGroup)*mnt->inodeSize;
+        uint32_t run=uint32_t((tableEnd-(uint64_t(block)<<mnt->blockShift)+mnt->blockSize-1)>>mnt->blockShift);
+        if(run>4)run=4;
+        if(block>=mnt->totalBlocks)return false;
+        if(run>mnt->totalBlocks-block)run=mnt->totalBlocks-block;
+        auto* buf=static_cast<uint8_t*>(kmalloc(run*mnt->blockSize));
+        if (!buf) {
+            if (!Ext2DevRead(mnt, inodeOff, out, sizeof(*out), 0, nullptr, UsbReadSource::Inode))
+                return false;
+            Ext2InodeCachePut(mnt, ino, out);
+            return true;
+        }
+        bool ok=Ext2BlockCacheLookup(mnt,block,buf);
+        if(!ok) {
+            ok=Ext2DevRead(mnt,uint64_t(block)<<mnt->blockShift,buf,run*mnt->blockSize,
+                          0,nullptr,UsbReadSource::Inode);
+            if(ok)for(uint32_t i=0;i<run;++i)Ext2BlockCachePut(mnt,block+i,buf+i*mnt->blockSize);
+        }
+        if(ok)memcpy(out,buf+within,sizeof(*out));
+        kfree(buf);
+        if(!ok)return false;
+    } else if(!Ext2DevRead(mnt,inodeOff,out,sizeof(*out),0,nullptr,UsbReadSource::Inode))return false;
     Ext2InodeCachePut(mnt, ino, out);
     return true;
 }
@@ -1956,56 +1986,66 @@ static uint64_t Ext2InodeSize(const Ext2Inode* ino)
 // Read a 4-byte block-pointer from an indirect block, using a per-mount
 // multi-slot cache to avoid re-reading the same indirect block during
 // sequential file scans (BlockMap is called per file-block).
-static Ext2BlockLookup Ext2ReadIndPointer(Ext2Mount* mnt, uint32_t indBlock, uint32_t idx)
+static Ext2BlockLookup Ext2ReadIndPointer(Ext2Mount* mnt,uint32_t indBlock,uint32_t idx,
+                                        uint32_t batch,uint32_t* children)
 {
-    if (!indBlock) return {};
-    if (indBlock >= mnt->totalBlocks) return {0, true};
-    uint32_t entry = 0;
+    if(children)*children=1;
+    if(!indBlock)return {};
+    const uint32_t pointers=mnt->blockSize/4;
+    if(indBlock>=mnt->totalBlocks || idx>=pointers)return {0,true};
+    const auto extract=[&](const uint8_t* data) {
+        const auto* entries=reinterpret_cast<const uint32_t*>(data);
+        const uint32_t first=entries[idx];
+        if(children && mnt->taggedReads && first && first<mnt->totalBlocks) {
+            while(*children<4 && *children<pointers-idx && *children<mnt->totalBlocks-first &&
+                  entries[idx+*children]==first+*children)++*children;
+        }
+        return Ext2BlockLookup{first};
+    };
+    const auto slot=Ext2IndCacheSlot(indBlock);
     SpinLockAcquire(&mnt->indCacheLock);
-
-    // Search all cache slots
-    for (uint32_t s = 0; s < Ext2Mount::IND_CACHE_SLOTS; ++s) {
-        if (mnt->indCacheBlockNum[s] == indBlock && mnt->indCacheData[s]) {
-            entry = *reinterpret_cast<uint32_t*>(mnt->indCacheData[s] + idx * 4);
-            SpinLockRelease(&mnt->indCacheLock);
-            return {entry};
+    if(mnt->indCacheBlockNum[slot]==indBlock && mnt->indCacheData[slot]) {
+        const auto result=extract(mnt->indCacheData[slot]);
+        SpinLockRelease(&mnt->indCacheLock);
+        return result;
+    }
+    // Avoid re-reading already resident adjacent metadata.
+    for(uint32_t i=1;i<batch;++i) {
+        if(mnt->indCacheBlockNum[Ext2IndCacheSlot(indBlock+i)]==indBlock+i) {
+            batch=i;
+            break;
         }
     }
-
     SpinLockRelease(&mnt->indCacheLock);
-    // Allocation and device I/O may block. Never hold a spinlock while
-    // performing either: other CPUs could spin while the owner waits to run.
-    auto* candidate = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
-    if (!candidate) {
-        uint64_t off = (static_cast<uint64_t>(indBlock) << mnt->blockShift) + idx * 4;
-        if (!Ext2DevRead(mnt,off,&entry,4,0,nullptr,UsbReadSource::Indirect)) return {0, true};
+    const auto offset=uint64_t(indBlock)<<mnt->blockShift;
+    auto* buf=static_cast<uint8_t*>(kmalloc(batch*mnt->blockSize));
+    if(!buf) {
+        uint32_t entry=0;
+        if(!Ext2DevRead(mnt,offset+idx*4,&entry,4,0,nullptr,UsbReadSource::Indirect))return {0,true};
         return {entry};
     }
-    uint64_t blockOff = static_cast<uint64_t>(indBlock) << mnt->blockShift;
-    if (!Ext2DevRead(mnt,blockOff,candidate,mnt->blockSize,0,nullptr,UsbReadSource::Indirect)) {
-        kfree(candidate);
-        return {0, true};
+    if(!Ext2DevRead(mnt,offset,buf,batch*mnt->blockSize,0,nullptr,UsbReadSource::Indirect)) {
+        kfree(buf);
+        return {0,true};
     }
-
-    // Callers hold g_ext2Lock for reading or writing, excluding block
-    // mutation during the unlocked fill. Another reader may have filled it.
-    SpinLockAcquire(&mnt->indCacheLock);
-    for (uint32_t s = 0; s < Ext2Mount::IND_CACHE_SLOTS; ++s) {
-        if (mnt->indCacheBlockNum[s] == indBlock && mnt->indCacheData[s]) {
-            entry = *reinterpret_cast<uint32_t*>(mnt->indCacheData[s] + idx * 4);
-            SpinLockRelease(&mnt->indCacheLock);
-            kfree(candidate);
-            return {entry};
+    const auto result=extract(buf);
+    for(uint32_t i=0;i<batch;++i) {
+        auto* page=batch==1?buf:static_cast<uint8_t*>(kmalloc(mnt->blockSize));
+        if(!page)continue;
+        if(batch!=1)memcpy(page,buf+i*mnt->blockSize,mnt->blockSize);
+        const auto at=Ext2IndCacheSlot(indBlock+i);
+        SpinLockAcquire(&mnt->indCacheLock);
+        auto* evicted=page;
+        if(mnt->indCacheBlockNum[at]!=indBlock+i) {
+            evicted=mnt->indCacheData[at];
+            mnt->indCacheData[at]=page;
+            mnt->indCacheBlockNum[at]=indBlock+i;
         }
+        SpinLockRelease(&mnt->indCacheLock);
+        if(evicted)kfree(evicted);
     }
-    uint32_t victim = mnt->indCacheLru++ % Ext2Mount::IND_CACHE_SLOTS;
-    uint8_t* evicted = mnt->indCacheData[victim];
-    mnt->indCacheData[victim] = candidate;
-    mnt->indCacheBlockNum[victim] = indBlock;
-    entry = *reinterpret_cast<uint32_t*>(candidate + idx * 4);
-    SpinLockRelease(&mnt->indCacheLock);
-    if (evicted) kfree(evicted);
-    return {entry};
+    if(batch!=1)kfree(buf);
+    return result;
 }
 
 // Resolve a file-relative block index to a disk block number.
@@ -2022,17 +2062,19 @@ static Ext2BlockLookup Ext2BlockMap(Ext2Mount* mnt, const Ext2Inode* ino, uint32
 
     const uint32_t doubleSpan = ptrsPerBlock * ptrsPerBlock;
     if (fileBlock < doubleSpan) {
-        const auto leaf = Ext2ReadIndPointer(mnt, ino->i_block[13], fileBlock / ptrsPerBlock);
+        uint32_t batch=1;
+        const auto leaf=Ext2ReadIndPointer(mnt,ino->i_block[13],fileBlock/ptrsPerBlock,1,&batch);
         if (!leaf.block) return leaf;
-        return Ext2ReadIndPointer(mnt, leaf.block, fileBlock % ptrsPerBlock);
+        return Ext2ReadIndPointer(mnt,leaf.block,fileBlock%ptrsPerBlock,batch);
     }
     fileBlock -= doubleSpan;
     const auto middle = Ext2ReadIndPointer(mnt, ino->i_block[14], fileBlock / doubleSpan);
     if (!middle.block) return middle;
     const uint32_t remainder = fileBlock % doubleSpan;
-    const auto leaf = Ext2ReadIndPointer(mnt, middle.block, remainder / ptrsPerBlock);
+    uint32_t batch=1;
+    const auto leaf=Ext2ReadIndPointer(mnt,middle.block,remainder/ptrsPerBlock,1,&batch);
     if (!leaf.block) return leaf;
-    return Ext2ReadIndPointer(mnt, leaf.block, remainder % ptrsPerBlock);
+    return Ext2ReadIndPointer(mnt,leaf.block,remainder%ptrsPerBlock,batch);
 }
 
 // Read `len` bytes at `offset`. Return an error if nothing could be read.
@@ -2045,10 +2087,9 @@ static Ext2BlockLookup Ext2BlockMap(Ext2Mount* mnt, const Ext2Inode* ino, uint32
 // per-block virtio round-trips into a single 64KB transfer.
 static int Ext2ReadInodeData(Ext2Mount* mnt, const Ext2Inode* ino,
                              void* buf, uint64_t len, uint64_t offset,
-                             uint64_t physical,bool* retain,bool fault)
+                             uint64_t physical,bool* retain,UsbReadSource source)
 {
-    const auto source=(ino->i_mode&EXT2_S_IFMT)==EXT2_S_IFDIR?UsbReadSource::Directory:
-                      fault?UsbReadSource::Fault:UsbReadSource::File;
+    if((ino->i_mode&EXT2_S_IFMT)==EXT2_S_IFDIR)source=UsbReadSource::Directory;
     uint64_t fileSize = Ext2InodeSize(ino);
     if (offset >= fileSize) {
         return 0;
@@ -2366,7 +2407,7 @@ static int Ext2FileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
 }
 
 static int Ext2FileReadKernel(Vnode* vn,void* buf,uint64_t len,uint64_t* offset,
-                              uint64_t physical,bool* retain,bool fault)
+                              uint64_t physical,bool* retain,UsbReadSource source)
 {
     auto* fp = static_cast<Ext2FilePriv*>(vn->priv);
     KRwLockReadLock(&g_ext2Lock);
@@ -2374,7 +2415,7 @@ static int Ext2FileReadKernel(Vnode* vn,void* buf,uint64_t len,uint64_t* offset,
     if (!Ext2ReadInode(fp->mnt, fp->inode, &data)) {
         KRwLockReadUnlock(&g_ext2Lock); return -5;
     }
-    int r = Ext2ReadInodeData(fp->mnt,&data,buf,len,*offset,physical,retain,fault);
+    int r = Ext2ReadInodeData(fp->mnt,&data,buf,len,*offset,physical,retain,source);
     if (r > 0) *offset += r;
     KRwLockReadUnlock(&g_ext2Lock);
     // Relatime: avoid a metadata write for every read. Re-read under the
@@ -3083,7 +3124,6 @@ static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
     mnt->bgdtDirty         = false;
     mnt->pendingMetaOps    = 0;
     mnt->indCacheLock      = SpinLock{};
-    mnt->indCacheLru       = 0;
     for (uint32_t s = 0; s < Ext2Mount::IND_CACHE_SLOTS; ++s) {
         mnt->indCacheBlockNum[s] = 0;
         mnt->indCacheData[s]     = nullptr;

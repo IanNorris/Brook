@@ -6,6 +6,7 @@
 
 namespace brook {
 struct Vnode;
+enum class UsbReadSource : uint8_t;
 struct FileObjectPage;
 struct FileMappingRegistration;
 // Embedded in a filesystem's retained live-inode object, shared across opens.
@@ -52,7 +53,7 @@ struct FileObject {
     // Optional kernel-only path into exclusive contiguous pages. The backend
     // may retain an allocation on uncertain DMA; the caller must abandon it.
     uint32_t readBurst;
-    int (*readOwned)(Vnode*,void*,uint64_t,uint64_t*,uint64_t,bool*,bool fault);
+    int (*readOwned)(Vnode*,void*,uint64_t,uint64_t*,uint64_t,bool*,UsbReadSource source);
 };
 void FileObjectInit(FileObject* object);
 // Quiescent last-inode release only: no sleeping locks or I/O; IRQ-close safe.
@@ -86,8 +87,11 @@ int FileObjectGetPages(FileObject* object,Vnode* vnode,uint64_t index,uint32_t c
 // under the same inode gate as loading. All slots are cleared on entry; owned
 // references returned on success. Caller must revalidate its VMA/file epoch.
 MappingFaultResult FileObjectFaultPages(FileObject* object,Vnode* vnode,uint64_t index,
-                                       uint32_t capacity,PhysicalAddress* pages,bool* loaded=nullptr);
+                                       uint32_t capacity,PhysicalAddress* pages,bool* loaded=nullptr,
+                                       uint64_t mappedPages=0);
 int FileObjectRead(FileObject* object,Vnode* vnode,void* buffer,uint64_t length,uint64_t* offset);
+int FileObjectReadTagged(FileObject* object,Vnode* vnode,void* buffer,uint64_t length,
+                         uint64_t* offset,UsbReadSource source);
 int FileObjectWrite(FileObject* object,Vnode* vnode,const void* buffer,uint64_t length,uint64_t* offset);
 // Kernel-staged buffer only. Fresh EOF selection, backend write and resident
 // cache publication share one inode gate, including across independent opens.

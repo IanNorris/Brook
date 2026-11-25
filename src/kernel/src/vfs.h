@@ -327,6 +327,8 @@ Vnode* VfsOpenModeChecked(const char* path, int flags, uint16_t mode, int* error
 
 // Read from a file vnode.  Wrapper around vn->ops->read.
 extern "C" int VfsRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset);
+uint32_t VfsExecReadBurst(Vnode* vn);
+int VfsReadExec(Vnode* vn,void* buf,uint64_t len,uint64_t* offset);
 
 // Lazy file-mapping backing lifetime and mutation gates.
 int VfsFileMapPin(Vnode* vn);

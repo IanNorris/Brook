@@ -38,12 +38,13 @@ int ReadExecutableImage(Vnode* vnode, ExecutableImage* image)
     };
     if (!allocate(capacity)) return -12; // ENOMEM
     uint64_t offset = 0;
+    const uint32_t burst=VfsExecReadBurst(vnode);
     for (;;) {
         if (image->size == capacity) {
             if (known) return 0;
             // A full unknown-size stream needs an EOF check before growing.
             uint8_t next;
-            int result = VfsRead(vnode, &next, 1, &offset);
+            int result = VfsReadExec(vnode,&next,1,&offset);
             if (!result) return 0;
             if (result < 0) { FreeExecutableImage(image); return -5; }
             if (capacity == MAX_EXEC_IMAGE_BYTES) { FreeExecutableImage(image); return -27; }
@@ -54,8 +55,8 @@ int ReadExecutableImage(Vnode* vnode, ExecutableImage* image)
             image->data[image->size++] = next;
         }
         uint64_t count = capacity - image->size;
-        if (count > 65536) count = 65536;
-        int result = VfsRead(vnode, image->data + image->size, count, &offset);
+        if(count>burst)count=burst;
+        int result = VfsReadExec(vnode,image->data+image->size,count,&offset);
         if (result < 0 || static_cast<uint64_t>(result) > count ||
             (result == 0 && known && image->size != st.size)) {
             FreeExecutableImage(image);
