@@ -820,7 +820,9 @@ static bool      g_gpuLaunchDemo  = false;   // opt/gpulaunch: auto-open launche
 static bool      g_gpuMouseDemo   = false;   // opt/gpumouse: warp cursor once for capture
 static int32_t   g_gpuMouseDemoX  = 0;
 static int32_t   g_gpuMouseDemoY  = 0;
-static CursorImage g_cursorUploaded{};
+// Zero size (not CursorImage's 12x16 default) keeps it in .bss; it is read
+// only once g_cursorUploadValid is set.
+static CursorImage g_cursorUploaded{0, 0};
 static bool g_cursorUploadValid=false;
 static GpuTexId  g_cursorTex      = 0;       // ARGB cursor sprite
 // Per-window-slot content texture tracking (recreated when the VFB changes).
@@ -1780,7 +1782,11 @@ static constexpr uint32_t CURSOR_MAX = CursorCapacity;
 // Client updates publish only the base image. The compositor takes one bounded
 // copy per frame; both CPU save/restore and GPU upload use that same image.
 static SpinLock g_cursorSourceLock;
-static CursorImage g_cursorSource;
+// g_cursorSource is read only once g_cursorSourceReady is set (filled by
+// CursorLoadBuiltinPixels or CompositorSetCursorImage), so it starts at zero
+// size to stay in .bss. g_cursorFrame keeps the default: it is read before the
+// first CursorPrepareFrame.
+static CursorImage g_cursorSource{0, 0};
 static CursorImage g_cursorFrame;
 static bool g_cursorSourceReady = false;
 static bool g_cursorBuiltin = true;
@@ -1792,9 +1798,12 @@ static bool g_cursorBuiltin = true;
 // have pointer focus, so without this the last client cursor (Chromium's
 // resize arrow at its edge) stays on screen everywhere.
 static CursorOwnership g_cursorOwnership;
-static CursorImage g_cursorBuiltinSource;
+// Zero-size starts keep these in .bss: the builtin copy is filled before it is
+// chosen (g_cursorBuiltinReady), and the logical frame is written by
+// ComposeCursor before ScaleCursor reads it.
+static CursorImage g_cursorBuiltinSource{0, 0};
 static bool g_cursorBuiltinReady = false;
-static CursorImage g_cursorLogicalFrame;
+static CursorImage g_cursorLogicalFrame{0, 0};
 
 // Saved pixels under the cursor (for restore before re-blit)
 static uint32_t g_cursorSave[CURSOR_MAX * CURSOR_MAX];
@@ -1823,7 +1832,9 @@ static void CursorLoadBuiltinPixels()
 }
 
 static CursorShape CompositorCursorShape();
-static CursorImage g_cursorShapeSource;
+// Chosen only after CursorFillShape filled it (g_cursorShapeLoaded), so it
+// starts at zero size and stays in .bss.
+static CursorImage g_cursorShapeSource{0, 0};
 static CursorShape g_cursorShapeLoaded = CursorShape::Arrow;
 
 static void CursorPrepareFrame(bool busy, uint64_t now)
