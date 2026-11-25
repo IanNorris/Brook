@@ -51,7 +51,7 @@ def wait_restart(bridge, session, request, status, *, clock=time.monotonic, slee
         sleep(.5)
         try:
             status=bridge.power(session,request,'status')
-        except (OSError, TimeoutError, ConnectionError):
+        except (OSError, RuntimeError):
             if automatic:
                 return True  # The subsequent probe must still verify the new boot.
             raise

@@ -101,6 +101,14 @@ class Tests(unittest.TestCase):
                                      {'state':'prompting','prompt_seconds':60},sleep=lambda _:None))
         self.assertEqual(self.bridge.calls,[('power','session','original','status')])
 
+    def test_approved_restart_can_drop_its_last_reply(self):
+        approved={'state':'closing','prompt_state':'accepted','restart_automatic':True}
+        with patch.object(self.bridge,'power',side_effect=RuntimeError('Stale guest boot')):
+            self.assertTrue(wait_restart(self.bridge,'session','original',approved,sleep=lambda _:None))
+            with self.assertRaisesRegex(RuntimeError,'Stale guest boot'):
+                wait_restart(self.bridge,'session','original',{'state':'prompting','prompt_seconds':60},
+                             sleep=lambda _:None)
+
     def test_activation_without_reboot(self):
         result=self.execute();self.assertEqual(result['state'],'activated')
         self.assertFalse(any(call[0]=='power' for call in self.bridge.calls))
