@@ -1,6 +1,7 @@
 #include "usb_system.h"
 #include "usb_system_layout.h"
 #include "apic.h"
+#include "audio.h"
 
 #include "block_write_leases.h"
 #include "boot_stick.h"
@@ -248,8 +249,13 @@ void UsbSystemConfigure() {
     ShowHex(boot.fsUuid,record.uuid);
 }
 
+static uint64_t MountClockNs() {
+    const auto precise = AudioClockNowNs();
+    return precise ? precise : ApicTickCount() * 1000000;
+}
+
 bool UsbSystemBoot(uint8_t* nextDrive,bool scanComplete) {
-    auto phase=ApicTickCount();
+    auto phase=MountClockNs();
     if(!boot.parsed || !nextDrive)return Fail("record",-22);
     if(!scanComplete)return Fail("boot-volume-scan",-19);
     int refusal=0;
@@ -281,17 +287,17 @@ bool UsbSystemBoot(uint8_t* nextDrive,bool scanComplete) {
        VfsLstatPath("/nix",&target) || !target.isDir || target.isSymlink)
         return Fail("mount-target",details.status?details.status:-22);
 
-    admissionUs=(ApicTickCount()-phase)*1000;phase=ApicTickCount();
+    admissionUs=(MountClockNs()-phase)/1000;phase=MountClockNs();
     const int transport=disk->ops->ioctl(disk,DEVICE_IOCTL_USB_SYSTEM_TRANSPORT,nullptr);
-    const auto identifyStart=ApicTickCount();
+    const auto identifyStart=MountClockNs();
     if(transport && transport!=-95)return Fail("storage-transport",transport);
     if(!transport && (!ValidateGpt(disk,bootGuid,bootEntry,bootFirst,bootSectors) ||
        !ReadExact(disk,systemWindow.start+1024,sb,sizeof(sb)) ||
        LargeExt2ClassifyHeader(sb,sizeof(sb),systemWindow.length,record.uuid,geometry)!=LargeExt2HeaderState::Clean))
         return Fail("storage-transport-identity",-22);
 
-    transportIdentityUs=(ApicTickCount()-identifyStart)*1000;
-    transportUs=(ApicTickCount()-phase)*1000;phase=ApicTickCount();
+    transportIdentityUs=(MountClockNs()-identifyStart)/1000;
+    transportUs=(MountClockNs()-phase)/1000;phase=MountClockNs();
     constexpr uint32_t gdtCapacity=4096*32;
     auto* gdt=static_cast<uint8_t*>(kmalloc(gdtCapacity));
     if(!gdt)return Fail("descriptor-buffer",-12);
@@ -306,7 +312,7 @@ bool UsbSystemBoot(uint8_t* nextDrive,bool scanComplete) {
     }
     kfree(gdt);
     if(error)return Fail(error==-117?"needs-filesystem-check":"session-begin",error);
-    sessionUs=(ApicTickCount()-phase)*1000;phase=ApicTickCount();
+    sessionUs=(MountClockNs()-phase)/1000;phase=MountClockNs();
     const uint8_t drive=*nextDrive;
     if(!Ext2BindDevice(drive,&dataDevice))return Fail("ext2-bind",-16);
     ++*nextDrive;
@@ -319,7 +325,7 @@ bool UsbSystemBoot(uint8_t* nextDrive,bool scanComplete) {
         return Fail(details.check,details.status);
     }
     if(!session.Arm())__builtin_trap();
-    mountUs=(ApicTickCount()-phase)*1000;
+    mountUs=(MountClockNs()-phase)/1000;
     ready=true;
     boot.mounted=true;boot.dirty=true;boot.stage="ready";
     WritableDesktopMarkDirectReady(drive,systemWindow.length);

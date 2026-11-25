@@ -86,7 +86,14 @@ bool ProcessCapable(Process* p,UserNamespace* target,unsigned capability) {
     return p && UserNamespaceCapable({p->userNamespace,p->euid,p->egid,p->capabilities.effective},target,capability);
 }
 
-extern "C" [[noreturn]] void KernelPanic(const char*,...) {std::abort();}
+extern "C" void KernelPanic(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    std::vfprintf(stderr, fmt, args);
+    va_end(args);
+    std::fputc('\n', stderr);
+    std::abort();
+}
 extern "C" void* kmalloc(uint64_t size){
     if(failAllocation==0){failAllocation=-1;failTriggered=true;return nullptr;}
     if(failAllocation>0)--failAllocation;
@@ -103,8 +110,8 @@ void PmmFreePage(PhysicalAddress p){if(!p)return;void* memory=reinterpret_cast<v
 void KRwLockInit(KRwLock* lock){*lock={};fsLocks[lock]=std::make_unique<std::shared_mutex>();}
 void KRwLockReadLock(KRwLock* lock){fsLocks.at(lock)->lock_shared();}
 void KRwLockReadUnlock(KRwLock* lock){fsLocks.at(lock)->unlock_shared();}
-void KRwLockWriteLock(KRwLock* lock){fsLocks.at(lock)->lock();}
-void KRwLockWriteUnlock(KRwLock* lock){fsLocks.at(lock)->unlock();}
+void KRwLockWriteLock(KRwLock* lock){fsLocks.at(lock)->lock();lock->writerActive=1;}
+void KRwLockWriteUnlock(KRwLock* lock){lock->writerActive=0;fsLocks.at(lock)->unlock();}
 void FileObjectInit(FileObject* object){*object={};}
 // This backend fixture bypasses cache/coherence, which has dedicated tests.
 int FileObjectRead(FileObject*,Vnode* vn,void* out,uint64_t bytes,uint64_t* offset){return vn->ops->read(vn,out,bytes,offset);}
@@ -155,7 +162,189 @@ struct BackendProvider {
     int Parent(brook::VfsObject* o,brook::VfsObject*,brook::VfsObject*& out){return o->ops->parent(o,&out,false);}
     int Readlink(brook::VfsObject* o,char* out,uint32_t cap){return o->ops->readlink(o,out,cap);}
 };
-static void TestBatchedIndirectReads()
+static void TestTaggedInodeTable(const char* fixturePath, bool writeBehind)
+{
+    using namespace brook;
+    std::ifstream input(fixturePath, std::ios::binary);
+    assert(input);
+    std::vector<unsigned char> image{std::istreambuf_iterator<char>(input), {}};
+    uint64_t failedBatchAt = UINT64_MAX;
+    unsigned rejectedBatches = 0;
+    unsigned singleRetries = 0;
+    struct TaggedDisk {
+        std::vector<unsigned char>& image;
+        uint64_t& failedBatchAt;
+        unsigned& rejectedBatches;
+        unsigned& singleRetries;
+    } tagged{image, failedBatchAt, rejectedBatches, singleRetries};
+    const DeviceOps ops = {
+        [](Device* device, uint64_t at, void* data, uint64_t len) {
+            Device raw = *device;
+            raw.priv = &static_cast<TaggedDisk*>(device->priv)->image;
+            return readDisk(&raw, at, data, len);
+        },
+        [](Device* device, uint64_t at, const void* data, uint64_t len) {
+            Device raw = *device;
+            raw.priv = &static_cast<TaggedDisk*>(device->priv)->image;
+            return writeDisk(&raw, at, data, len);
+        },
+        [](Device* device, uint32_t cmd, void* arg) {
+            if (cmd != DEVICE_IOCTL_USB_TAGGED_READ) return 0;
+            if (!arg) return 1;
+            const auto& request = *static_cast<const UsbTaggedRead*>(arg);
+            auto& fixture = *static_cast<TaggedDisk*>(device->priv);
+            if (request.source == UsbReadSource::Inode && request.offset == fixture.failedBatchAt) {
+                if (request.bytes > 4096) {
+                    assert(request.bytes == 16384);
+                    ++fixture.rejectedBatches;
+                    return -5;
+                }
+                assert(request.bytes == 4096);
+                ++fixture.singleRetries;
+            }
+            return device->ops->read(device, request.offset, request.data, request.bytes);
+        }, nullptr,
+    };
+    constexpr uint8_t drive = 1;
+    Device device{&ops, "tagged-inode-table", DeviceType::Block, &tagged};
+    auto* savedDevice = g_ext2Devices[drive];
+    g_ext2Devices[drive] = &device;
+    auto mountDisk = [&]() {
+        g_ext2WritebackMiB = writeBehind ? 1 : 0;
+        void* priv = nullptr;
+        assert(Ext2FsMount(drive, &priv));
+        g_ext2WritebackMiB = 0;
+        auto* mnt = static_cast<Ext2Mount*>(priv);
+        assert(mnt->taggedReads && bool(mnt->writeback.bytes) == writeBehind);
+        mnt->skipPermChecks = true;
+        return mnt;
+    };
+    auto* mnt = mountDisk();
+    VfsObject* root = nullptr;
+    assert(!Ext2RootObject(mnt, drive, &root));
+    int error = 0;
+    Vnode* node = Ext2ObjectCreate(root, "tagged", VFS_O_WRITE, 0600, &error);
+    assert(node && !error);
+    const uint32_t ino = static_cast<Ext2FilePriv*>(node->priv)->inode;
+    const uint32_t inodeIndex = ino - 1;
+    const auto group = inodeIndex / mnt->inodesPerGroup;
+    const uint64_t inodeOffset = uint64_t(mnt->bgdt[group].bg_inode_table) * mnt->blockSize +
+        uint64_t(inodeIndex % mnt->inodesPerGroup) * mnt->inodeSize;
+    const uint32_t blockSize = mnt->blockSize;
+    assert(blockSize == 4096);
+    const uint32_t pointers = blockSize / sizeof(uint32_t);
+    const uint32_t firstDouble = 12 + pointers;
+    const uint32_t extent = firstDouble + pointers + 3;
+    auto rawPointer = [&](uint32_t block, uint32_t slot) {
+        if (!block) return uint32_t{0};
+        uint32_t value;
+        const uint64_t offset = uint64_t(block) * blockSize + slot * sizeof(value);
+        assert(offset + sizeof(value) <= image.size());
+        std::memcpy(&value, image.data() + offset, sizeof(value));
+        return value;
+    };
+    unsigned checkCount = 0;
+    auto check = [&]() {
+        ++checkCount;
+        // Read the table and walk cached pointers before draining write-behind.
+        // Compare against the independent raw disk walk after the drain.
+        Ext2Inode observed{};
+        std::vector<uint32_t> observedMap(extent);
+        KRwLockReadLock(&g_ext2Lock);
+        Ext2InodeCacheInvalidate(mnt, ino);
+        assert(Ext2ReadInode(mnt, ino, &observed));
+        for (uint32_t i = 0; i < extent; ++i) {
+            const auto mapped = Ext2BlockMap(mnt, &observed, i);
+            assert(!mapped.failed);
+            observedMap[i] = mapped.block;
+        }
+        KRwLockReadUnlock(&g_ext2Lock);
+        assert(!Ext2FsSync(mnt));
+        Ext2Inode raw{};
+        std::memcpy(&raw, image.data() + inodeOffset, sizeof(raw));
+        if (std::memcmp(&observed, &raw, sizeof(raw))) {
+            std::fprintf(stderr, "tagged inode mismatch at step %u (write-behind=%u)\n",
+                         checkCount, writeBehind);
+            std::abort();
+        }
+        for (uint32_t i = 0; i < extent; ++i) {
+            uint32_t block;
+            if (i < 12) block = raw.i_block[i];
+            else if (i < firstDouble) block = rawPointer(raw.i_block[12], i - 12);
+            else block = rawPointer(rawPointer(raw.i_block[13], (i - firstDouble) / pointers),
+                                    (i - firstDouble) % pointers);
+            assert(observedMap[i] == block);
+        }
+        return observed;
+    };
+
+    assert(check().i_size == 0);
+    Ext2BlockCacheInvalidate(mnt, inodeOffset / blockSize);
+    failedBatchAt = inodeOffset / blockSize * blockSize;
+    assert(check().i_size == 0);
+    assert(rejectedBatches == 1 && singleRetries == 1);
+    failedBatchAt = UINT64_MAX;
+
+    std::vector<uint8_t> payload(uint64_t(extent) * blockSize, 0x5a);
+    uint64_t position = 0;
+    for (size_t done = 0; done < payload.size();) {
+        const size_t count = std::min(size_t{65536}, payload.size() - done);
+        assert(node->ops->write(node, payload.data() + done, count, &position) == int(count));
+        if (writeBehind) assert(mnt->writeback.count);
+        done += count;
+        assert(check().i_size == done);
+    }
+    assert(check().i_block[13]);
+    assert(!node->ops->chmod(node, 0644));
+    assert((check().i_mode & 0777) == 0644);
+    const VnodeTime times[] = {{1792627101, 0}, {1792627102, 0}};
+    assert(!node->ops->set_times(node, times));
+    const auto dated = check();
+    assert(dated.i_atime == times[0].sec && dated.i_mtime == times[1].sec);
+
+    const uint64_t smaller = uint64_t(firstDouble + 1) * blockSize + 17;
+    assert(!node->ops->truncate(node, smaller));
+    assert(check().i_size == smaller);
+    assert(!node->ops->truncate(node, payload.size()));
+    assert(check().i_size == payload.size());
+    assert(!root->ops->rename(root, "tagged", root, "renamed"));
+    assert(check().i_links_count == 1);
+    closeNode(node);
+    VfsObjectRelease(root);
+    assert(Ext2FsCanUnmount(mnt) && !Ext2FsUnmount(mnt));
+
+    mnt = mountDisk();
+    assert(check().i_size == payload.size());
+    assert(!Ext2RootObject(mnt, drive, &root));
+    VfsObject* renamed = nullptr;
+    assert(!Ext2ObjectChild(root, "renamed", &renamed));
+    assert(static_cast<Ext2OpenInode*>(renamed->priv)->inode == ino);
+    assert(!root->ops->remove(root, "renamed", false));
+    assert(check().i_links_count == 0);
+    VfsObjectRelease(renamed);
+    // Sync reclaims zero-holder orphans. Compare the reclaimed inode after
+    // that transaction has run, separately from the open-unlinked check.
+    assert(!Ext2FsSync(mnt));
+    const auto freed = check();
+    assert(freed.i_size == 0 && freed.i_blocks == 0);
+    VfsObjectRelease(root);
+    assert(!Ext2FsUnmount(mnt));
+
+    mnt = mountDisk();
+    assert(check().i_links_count == 0);
+    assert(!Ext2RootObject(mnt, drive, &root));
+    renamed = nullptr;
+    assert(Ext2ObjectChild(root, "renamed", &renamed) == -2 && !renamed);
+    VfsObjectRelease(root);
+    assert(!Ext2FsUnmount(mnt));
+    g_ext2Devices[drive] = savedDevice;
+    std::ofstream result(std::string(fixturePath) + (writeBehind ? ".child-queued" : ".child-sync"),
+                         std::ios::binary);
+    result.write(reinterpret_cast<const char*>(image.data()), image.size());
+    assert(result);
+}
+
+static void TestBatchedIndirectReads(bool badNeighbor)
 {
     using namespace brook;
     constexpr uint32_t size = 1024;
@@ -174,7 +363,8 @@ static void TestBatchedIndirectReads()
     struct Reader {
         std::vector<unsigned char>& blocks;
         unsigned& reads;
-    } reader{blocks, reads};
+        bool badNeighbor;
+    } reader{blocks, reads, badNeighbor};
     const DeviceOps ops = {nullptr, nullptr,
         [](Device* dev, uint32_t cmd, void* arg) -> int {
             if (cmd != DEVICE_IOCTL_USB_TAGGED_READ) return 0;
@@ -182,7 +372,9 @@ static void TestBatchedIndirectReads()
             auto& fixture = *static_cast<Reader*>(dev->priv);
             assert(read.source == UsbReadSource::Indirect);
             ++fixture.reads;
-            if (read.offset == 4 * size) assert(read.bytes == 2 * size);
+            if (fixture.badNeighbor && read.offset <= 5 * size &&
+                read.offset + read.bytes > 5 * size) return -5;
+            if (!fixture.badNeighbor && read.offset == 4 * size) assert(read.bytes == 2 * size);
             std::memcpy(read.data, fixture.blocks.data() + read.offset, read.bytes);
             return read.bytes;
         }, nullptr};
@@ -196,11 +388,12 @@ static void TestBatchedIndirectReads()
     Ext2Inode inode{};
     inode.i_block[13] = 1;
     assert(Ext2BlockMap(&mount, &inode, 12 + pointers).block == 8);
-    assert(reads == 2);
-    assert(Ext2BlockMap(&mount, &inode, 12 + 2 * pointers).block == 9);
-    assert(reads == 2);
+    assert(reads == (badNeighbor ? 3u : 2u));
+    const auto next = Ext2BlockMap(&mount, &inode, 12 + 2 * pointers);
+    if (badNeighbor) assert(next.failed);
+    else assert(!next.failed && next.block == 9 && reads == 2);
     assert(Ext2BlockMap(&mount, &inode, 12 + 3 * pointers).block == 10);
-    assert(reads == 3);
+    assert(reads == (badNeighbor ? 5u : 3u));
     for (auto* page : mount.indCacheData) if (page) kfree(page);
 }
 
@@ -304,7 +497,7 @@ static void TestDirectoryReadFailure(brook::Ext2Mount* mount)
 }
 
 int main(int argc,char** argv){
-    assert(argc==2);std::ifstream input(argv[1],std::ios::binary);assert(input);
+    assert(argc==3);std::ifstream input(argv[1],std::ios::binary);assert(input);
     disk.assign(std::istreambuf_iterator<char>(input),{});input.close();
     using namespace brook;
     process.uid=process.euid=process.suid=1000;process.gid=process.egid=process.sgid=1000;legacyTestMask=022;
@@ -339,31 +532,53 @@ int main(int argc,char** argv){
         indirectCheckLock=nullptr;
         for(auto* buffer:fixture.indCacheData)if(buffer)kfree(buffer);
     }
-    TestBatchedIndirectReads();
+    TestBatchedIndirectReads(false);
+    TestBatchedIndirectReads(true);
+    TestTaggedInodeTable(argv[2], false);
+    TestTaggedInodeTable(argv[2], true);
     TestFailedIndirectReads();
     g_ext2Devices[0]=&device;void* mount=nullptr;assert(Ext2FsMount(0,&mount));
     auto* m=static_cast<Ext2Mount*>(mount);
     assert(m->writeError==0 && m->deferredSyncError==0);
     TestDirectoryReadFailure(m);
+    // These tests call lock-requiring backend helpers directly.
+    auto backgroundSync = [](Ext2Mount* mount, uint64_t now, bool safety) {
+        KRwLockWriteLock(&g_ext2Lock);
+        const int result = Ext2BackgroundMaybeSync(mount, now, safety);
+        KRwLockWriteUnlock(&g_ext2Lock);
+        return result;
+    };
+    auto allocateBlock = [](Ext2Mount* mount) {
+        KRwLockWriteLock(&g_ext2Lock);
+        const uint32_t block = Ext2AllocBlock(mount);
+        KRwLockWriteUnlock(&g_ext2Lock);
+        return block;
+    };
+    auto freeBlock = [](Ext2Mount* mount, uint32_t block) {
+        KRwLockWriteLock(&g_ext2Lock);
+        const bool freed = Ext2FreeBlock(mount, block);
+        KRwLockWriteUnlock(&g_ext2Lock);
+        return freed;
+    };
     // A low-volume mutation must not depend on reaching the operation-count
     // threshold. A safety pass flushes it, and idle passes do not flush again.
     assert(!Ext2FsSync(m));m->syncProbe.autoOps=4096;
-    auto periodicBlock=Ext2AllocBlock(m);assert(periodicBlock && m->pendingMetaOps);
+    auto periodicBlock=allocateBlock(m);assert(periodicBlock && m->pendingMetaOps);
     auto periodicFlushes=flushCalls;auto backgrounds=m->syncProbe.backgroundCount;
-    assert(!Ext2BackgroundMaybeSync(m,0,false) && flushCalls==periodicFlushes);
-    assert(!Ext2BackgroundMaybeSync(m,0,true));
+    assert(!backgroundSync(m,0,false) && flushCalls==periodicFlushes);
+    assert(!backgroundSync(m,0,true));
     assert(flushCalls==periodicFlushes+1 && !m->pendingMetaOps && !m->backingDirty);
     assert(m->syncProbe.backgroundCount==backgrounds+1);
-    assert(!Ext2BackgroundMaybeSync(m,0,true) && flushCalls==periodicFlushes+1);
-    assert(Ext2FreeBlock(m,periodicBlock));assert(!Ext2FsSync(m));
+    assert(!backgroundSync(m,0,true) && flushCalls==periodicFlushes+1);
+    assert(freeBlock(m,periodicBlock));assert(!Ext2FsSync(m));
     // Even a direct write with no allocation metadata must cause a flush;
     // a failed flush remains dirty and is retried while its error is retained.
     uint8_t stableBytes[512];std::memcpy(stableBytes,disk.data()+4096,sizeof(stableBytes));
     Ext2RawBackend periodicIo{m};
     assert(periodicIo.Write(4096,stableBytes,sizeof(stableBytes)) && m->backingDirty && !m->pendingMetaOps);
-    failFlush=true;assert(Ext2BackgroundMaybeSync(m,0,true)==-5 && m->backingDirty);
+    failFlush=true;assert(backgroundSync(m,0,true)==-5 && m->backingDirty);
     assert(m->deferredSyncError==-5);failFlush=false;
-    assert(!Ext2BackgroundMaybeSync(m,0,true) && !m->backingDirty);
+    assert(!backgroundSync(m,0,true) && !m->backingDirty);
     assert(Ext2FsSync(m)==-5); // report the earlier failed flush once
     // If the worker cannot start, successful writes flush synchronously.
     g_ext2SynchronousFallback=true;periodicFlushes=flushCalls;
@@ -382,26 +597,26 @@ int main(int argc,char** argv){
         const auto before=m->syncProbe.autoCount;
         const auto flushBefore=flushCalls;
         for(unsigned i=0;i<2048;++i) {
-            auto b=Ext2AllocBlock(m);assert(b);assert(Ext2FreeBlock(m,b));
+            auto b=allocateBlock(m);assert(b);assert(freeBlock(m,b));
         }
         assert(m->syncProbe.autoCount-before==4096/limit);
         assert(flushCalls-flushBefore==4096/limit);
         assert(!m->pendingMetaOps);
     }
     m->syncProbe.autoOps=1;failFlush=true;
-    auto retainedBlock=Ext2AllocBlock(m);assert(retainedBlock);
+    auto retainedBlock=allocateBlock(m);assert(retainedBlock);
     assert(m->pendingMetaOps==1 && m->bgdtDirty && m->deferredSyncError==-5);
     assert(m->syncProbe.errors==1);
     failFlush=false;
     assert(Ext2FsSync(m)==-5); // sticky automatic error is reported once
     assert(!m->pendingMetaOps && !m->bgdtDirty);
-    assert(Ext2FreeBlock(m,retainedBlock));assert(!Ext2FsSync(m));
+    assert(freeBlock(m,retainedBlock));assert(!Ext2FsSync(m));
     m->syncProbe.autoOps=4096;
-    retainedBlock=Ext2AllocBlock(m);assert(retainedBlock && m->pendingMetaOps);
+    retainedBlock=allocateBlock(m);assert(retainedBlock && m->pendingMetaOps);
     const auto fsyncBefore=m->syncProbe.fsyncCount;
     assert(!Ext2FsSyncReason(m,Ext2SyncReason::Fsync));
     assert(m->syncProbe.fsyncCount==fsyncBefore+1 && !m->pendingMetaOps);
-    assert(Ext2FreeBlock(m,retainedBlock));assert(!Ext2FsSync(m));
+    assert(freeBlock(m,retainedBlock));assert(!Ext2FsSync(m));
     m->syncProbe.autoOps=256;
     // Make ownership independent of the host account that generated fixtures.
     m->skipPermChecks=true;
@@ -437,8 +652,8 @@ int main(int argc,char** argv){
         assert(file->ops->write(file,&backgroundPatch,1,&position)==1 && cm->writeback.count);
         const uint64_t queuedAt=cm->writeback.oldestNs;
         const auto drained=cm->syncProbe.backgroundCount;
-        assert(!Ext2BackgroundMaybeSync(cm,queuedAt,false) && cm->writeback.count);
-        assert(!Ext2BackgroundMaybeSync(cm,queuedAt+uint64_t(g_ext2WritebackMs)*1000000,false));
+        assert(!backgroundSync(cm,queuedAt,false) && cm->writeback.count);
+        assert(!backgroundSync(cm,queuedAt+uint64_t(g_ext2WritebackMs)*1000000,false));
         assert(!cm->writeback.count && cm->syncProbe.backgroundCount==drained+1 && !cm->backingDirty);
         // A short OUT is sticky even after ordered replay repairs the bytes.
         const uint8_t patch=0xab;position=321;expected[position]=patch;

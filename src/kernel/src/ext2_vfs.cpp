@@ -20,6 +20,7 @@
 #include "memory/physical_memory.h"
 #include "memory/virtual_memory.h"
 #include "serial.h"
+#include "panic.h"
 #if defined(BROOK_HOST_TEST) && !defined(BROOK_STANDALONE_TEST)
 #include <cstring>
 #else
@@ -837,16 +838,39 @@ static uint32_t Ext2IndCacheSlot(Ext2Mount* mnt, uint32_t block) {
     return victim;
 }
 
+// The coalesced write paths cap a run at 64 KiB, at most 64 ext2 blocks.
+static void Ext2InvalidateIndirectRun(Ext2Mount* mnt, uint32_t first, uint32_t count) {
+    SpinLockAcquire(&mnt->indCacheLock);
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto block = first + i;
+        const auto slot = Ext2IndCacheSlot(mnt, block);
+        if (mnt->indCacheBlockNum[slot] == block) mnt->indCacheBlockNum[slot] = 0;
+    }
+    SpinLockRelease(&mnt->indCacheLock);
+}
+
+#ifndef NDEBUG
+static void Ext2AssertWriteLocked() {
+    if (!g_ext2Lock.writerActive)
+        KernelPanic("ext2: metadata write without exclusive lock");
+#ifndef BROOK_HOST_TEST
+    const auto* current = SchedulerCurrentProcess();
+    if (current && current->heldWriteLock != &g_ext2Lock)
+        KernelPanic("ext2: metadata write by non-owner");
+#endif
+}
+#endif
+
 // Write a single block from buf.
 static bool Ext2WriteBlock(Ext2Mount* mnt, uint32_t blockNum, const void* buf)
 {
+#ifndef NDEBUG
+    Ext2AssertWriteLocked();
+#endif
     if (blockNum == 0) return false;
     // SerialPrintf("ext2: WriteBlock %u\n", blockNum);
     uint64_t off = static_cast<uint64_t>(blockNum) << mnt->blockShift;
-    SpinLockAcquire(&mnt->indCacheLock);
-    const uint32_t slot=Ext2IndCacheSlot(mnt,blockNum);
-    if(mnt->indCacheBlockNum[slot]==blockNum)mnt->indCacheBlockNum[slot]=0;
-    SpinLockRelease(&mnt->indCacheLock);
+    Ext2InvalidateIndirectRun(mnt, blockNum, 1);
     // Invalidate the data block cache.
     Ext2BlockCacheInvalidate(mnt, blockNum);
     return Ext2DevWrite(mnt, off, buf, mnt->blockSize);
@@ -855,6 +879,9 @@ static bool Ext2WriteBlock(Ext2Mount* mnt, uint32_t blockNum, const void* buf)
 // Write an inode back to disk.
 static bool Ext2WriteInode(Ext2Mount* mnt, uint32_t ino, const Ext2Inode* data)
 {
+#ifndef NDEBUG
+    Ext2AssertWriteLocked();
+#endif
     if (ino == 0) return false;
     uint32_t group = (ino - 1) / mnt->inodesPerGroup;
     uint32_t index = (ino - 1) % mnt->inodesPerGroup;
@@ -863,12 +890,10 @@ static bool Ext2WriteInode(Ext2Mount* mnt, uint32_t ino, const Ext2Inode* data)
     uint64_t tableOff = static_cast<uint64_t>(mnt->bgdt[group].bg_inode_table)
                         << mnt->blockShift;
     uint64_t inodeOff = tableOff + static_cast<uint64_t>(index) * mnt->inodeSize;
-    if (mnt->taggedReads) {
-        const auto first = uint32_t(inodeOff >> mnt->blockShift);
-        const auto last = uint32_t((inodeOff + sizeof(*data) - 1) >> mnt->blockShift);
-        Ext2BlockCacheInvalidate(mnt, first);
-        if (last != first) Ext2BlockCacheInvalidate(mnt, last);
-    }
+    const auto first = uint32_t(inodeOff >> mnt->blockShift);
+    const auto last = uint32_t((inodeOff + sizeof(*data) - 1) >> mnt->blockShift);
+    Ext2BlockCacheInvalidate(mnt, first);
+    if (last != first) Ext2BlockCacheInvalidate(mnt, last);
     bool ok = Ext2DevWrite(mnt, inodeOff, data, sizeof(Ext2Inode));
     if (ok) Ext2InodeCachePut(mnt, ino, data);
     return ok;
@@ -1443,13 +1468,7 @@ static int Ext2AppendInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
                 ++run;
             for (uint32_t b = 0; b < run; ++b)
                 Ext2BlockCacheInvalidate(mnt, diskBlocks[i + b]);
-            SpinLockAcquire(&mnt->indCacheLock);
-            for (uint32_t s = 0; s < Ext2Mount::IND_CACHE_SLOTS; ++s) {
-                uint32_t block = mnt->indCacheBlockNum[s];
-                if (block >= diskBlocks[i] && block < diskBlocks[i] + run)
-                    mnt->indCacheBlockNum[s] = 0;
-            }
-            SpinLockRelease(&mnt->indCacheLock);
+            Ext2InvalidateIndirectRun(mnt, diskBlocks[i], run);
             if (!Ext2DevWrite(mnt, static_cast<uint64_t>(diskBlocks[i]) << mnt->blockShift,
                               src + done + (static_cast<uint64_t>(i) << mnt->blockShift),
                               static_cast<uint64_t>(run) << mnt->blockShift)) {
@@ -1544,14 +1563,7 @@ static int Ext2WriteInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
             for (uint32_t b = 0; b < runBlocks; ++b)
                 Ext2BlockCacheInvalidate(mnt, diskBlock + b);
 
-            // Batch-invalidate indirect-block cache entries
-            SpinLockAcquire(&mnt->indCacheLock);
-            for (uint32_t s = 0; s < Ext2Mount::IND_CACHE_SLOTS; ++s) {
-                uint32_t bn = mnt->indCacheBlockNum[s];
-                if (bn >= diskBlock && bn < diskBlock + runBlocks)
-                    mnt->indCacheBlockNum[s] = 0;
-            }
-            SpinLockRelease(&mnt->indCacheLock);
+            Ext2InvalidateIndirectRun(mnt, diskBlock, runBlocks);
 
             if (!Ext2DevWrite(mnt, runOff, src + bytesWritten, runBytes)) break;
             bytesWritten += runBytes;
@@ -1968,8 +1980,9 @@ static bool Ext2ReadInode(Ext2Mount* mnt, uint32_t ino, Ext2Inode* out)
     const uint32_t block=uint32_t(inodeOff>>mnt->blockShift);
     const uint32_t within=inodeOff&(mnt->blockSize-1);
     if(mnt->taggedReads && within+sizeof(*out)<=mnt->blockSize) {
-        // Read only within this group's inode table. Cache the table blocks
-        // through the same write-invalidation path used by full-block reads.
+        // The caller holds g_ext2Lock for reading or writing throughout
+        // the fill. Exclusive writers invalidate these table blocks before
+        // sending or queuing an inode write, so a stale fill cannot race it.
         const uint64_t tableEnd=tableOff+uint64_t(mnt->inodesPerGroup)*mnt->inodeSize;
         uint32_t run=uint32_t((tableEnd-(uint64_t(block)<<mnt->blockShift)+mnt->blockSize-1)>>mnt->blockShift);
         if(run>4)run=4;
@@ -1984,8 +1997,12 @@ static bool Ext2ReadInode(Ext2Mount* mnt, uint32_t ino, Ext2Inode* out)
         }
         bool ok=Ext2BlockCacheLookup(mnt,block,buf);
         if(!ok) {
-            ok=Ext2DevRead(mnt,uint64_t(block)<<mnt->blockShift,buf,run*mnt->blockSize,
-                          0,nullptr,UsbReadSource::Inode);
+            const uint64_t offset = uint64_t(block) << mnt->blockShift;
+            ok=Ext2DevRead(mnt,offset,buf,run*mnt->blockSize,0,nullptr,UsbReadSource::Inode);
+            if (!ok && run > 1) {
+                run = 1;
+                ok=Ext2DevRead(mnt,offset,buf,mnt->blockSize,0,nullptr,UsbReadSource::Inode);
+            }
             if(ok)for(uint32_t i=0;i<run;++i)Ext2BlockCachePut(mnt,block+i,buf+i*mnt->blockSize);
         }
         if(ok)memcpy(out,buf+within,sizeof(*out));
@@ -2044,8 +2061,11 @@ static Ext2BlockLookup Ext2ReadIndPointer(Ext2Mount* mnt,uint32_t indBlock,uint3
         return {entry};
     }
     if(!Ext2DevRead(mnt,offset,buf,batch*mnt->blockSize,0,nullptr,UsbReadSource::Indirect)) {
-        kfree(buf);
-        return {0,true};
+        if (batch == 1 || !Ext2DevRead(mnt,offset,buf,mnt->blockSize,0,nullptr,UsbReadSource::Indirect)) {
+            kfree(buf);
+            return {0,true};
+        }
+        batch = 1;
     }
     const auto result=extract(buf);
     for(uint32_t i=0;i<batch;++i) {
