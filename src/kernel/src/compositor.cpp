@@ -4876,7 +4876,7 @@ const uint32_t* CompositorPresentSource(uint32_t* stridePixels)
 // the framebuffer-sized one stays the TTY's) or returns to the framebuffer-sized one,
 // then the pointer bounds, the WM layout and a full repaint follow. Compositor thread,
 // between frames. The desktop never shrinks below the firmware framebuffer.
-static void CompositorApplyOutputExtent()
+[[maybe_unused]] static void CompositorApplyOutputExtent()
 {
     static uint64_t seen=0;
     const uint64_t generation=OutputGeneration();
