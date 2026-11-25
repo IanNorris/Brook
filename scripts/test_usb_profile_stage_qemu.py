@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Prove signed profile staging and rollback on a disposable BROOK_SYSTEM."""
 import argparse
+import errno
 import hashlib
 import json
 from pathlib import Path
@@ -108,7 +109,8 @@ def main():
                 try:
                     upload(endpoint['host'], guest.bulk_port, receiver_key(endpoint, None),
                            endpoint['guest_boot_id'], tx, args.plan / 'stage-plan.sig')
-                except (OSError, ValueError):
+                except RuntimeError as error:
+                    assert error.args[0]['errno'] == errno.ENOSPC, error
                     reply = wait(guest, bridge, tx)
                     assert reply['exit']['code'] == 27, reply
                 else:
