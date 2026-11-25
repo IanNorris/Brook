@@ -1,5 +1,5 @@
 """One boot-pinned transfer, bounded polling, no implicit mutation replay."""
-import hashlib,json,stat,uuid
+import hashlib,json,re,stat,uuid
 from pathlib import Path
 from hardware_update_workflow import UpdateRun
 from binary_bridge import receiver_key
@@ -9,6 +9,74 @@ from hardware_bulk_protocol import identifier,upload,download,disk_download,fram
 FRAME_SOURCES={1:'cpu-backbuffer',2:'gpu-present',3:'legacy-gpu',4:'gpu-present',5:'gpu-present',6:'direct-client',7:'window-buffer'}
 SCANOUT_BUFFERS={0:'unverified',1:'gop',2:'kernel-flip',3:'zero-copy',4:'direct-client',5:'unknown'}
 FRAME_CURSOR,FRAME_WINDOW_BUFFER=1,2
+
+TRANSFER_ROOT = '/data/.brook-transfer'
+# Run on the guest only. The receiver also validates the transfer directory, but
+# its lazy mkdir happens after a capture producer needs to stage its first file.
+STAGE_GUEST_FILE = """\
+import os
+import stat
+import sys
+
+source, root, name, limit = sys.argv[1:]
+limit = int(limit)
+with os.fdopen(os.open(source, os.O_RDONLY | os.O_NONBLOCK), 'rb') as capture:
+    metadata = os.fstat(capture.fileno())
+    remaining = metadata.st_size
+    if not stat.S_ISREG(metadata.st_mode) or not 0 <= remaining <= limit:
+        sys.exit('Capture must be a regular file within the bulk size limit')
+    try:
+        os.mkdir(root, 0o700)
+    except FileExistsError:
+        pass
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        metadata = os.fstat(directory)
+        if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o022:
+            sys.exit('Unsafe bulk transfer directory')
+        descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                             0o600, dir_fd=directory)
+        try:
+            with os.fdopen(descriptor, 'wb') as artifact:
+                while remaining:
+                    chunk = capture.read(min(remaining, 65536))
+                    if not chunk:
+                        sys.exit('Capture became shorter while staging')
+                    artifact.write(chunk)
+                    remaining -= len(chunk)
+                if capture.read(1):
+                    sys.exit('Capture grew while staging')
+                staged = os.fstat(artifact.fileno())
+        except BaseException:
+            os.unlink(name, dir_fd=directory)
+            raise
+    finally:
+        os.close(directory)
+print(f'{staged.st_dev}:{staged.st_ino}')
+"""
+
+REMOVE_GUEST_FILE = """\
+import os
+import stat
+import sys
+
+root, name, expected = sys.argv[1:]
+directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    metadata = os.fstat(directory)
+    if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o022:
+        sys.exit('Unsafe bulk transfer directory')
+    descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    try:
+        staged = os.fstat(descriptor)
+        if not stat.S_ISREG(staged.st_mode) or f'{staged.st_dev}:{staged.st_ino}' != expected:
+            sys.exit('Staged capture was replaced')
+        os.unlink(name, dir_fd=directory)
+    finally:
+        os.close(descriptor)
+finally:
+    os.close(directory)
+"""
 
 def describe_frame(payload):
     """Named provenance for a frame payload; older helpers report none."""
@@ -42,7 +110,45 @@ def clip_rect(rect,width,height):
     return {'x':x0,'y':y0,'width':x1-x0,'height':y1-y0}
 
 class BulkRun(UpdateRun):
-    def execute(self,session,key_file,action,source=None,artifact_id=None,port=1236,request_id=None,keep_raw=False,disk_identity=None,max_bytes=None,pace_bytes_per_second=None,frame_options=None,crop=None):
+    def stage_guest_file(self, session, boot, guest_file, artifact_id):
+        producer = uuid.uuid4().hex
+        self.save(state='producer_launch_dispatched', producer_job_id=producer)
+        args = ['/nix/profile/bin/python3', '-c', STAGE_GUEST_FILE, guest_file,
+                TRANSFER_ROOT, f'{artifact_id}.bin', str(LIMIT)]
+        self.bridge.guest_run(session, producer, args, cwd='/tmp', uid=0, wait_s=2)
+        job = self.wait_job(session, producer, lambda reply: reply.get('state') == 'completed')
+        self.save(producer_job=job)
+        job_identity = (job.get('session'), job.get('guest_boot_id'), job.get('operation_id'))
+        if job_identity != (session, boot, producer):
+            raise RuntimeError('Capture staging job belongs to a different boot or operation')
+        if job.get('exit', {}).get('code') != 0:
+            detail = job.get('stderr', {}).get('text', '').strip()
+            raise RuntimeError(f'Capture staging job failed (exit {job.get("exit")}): {detail}')
+        staged = job.get('stdout', {}).get('text', '').strip()
+        if not re.fullmatch(r'[0-9]+:[0-9]+', staged):
+            raise RuntimeError('Capture staging job did not report the staged file identity')
+        self.save(state='producer_completed', guest_artifact_identity=staged)
+        return staged
+
+    def remove_guest_file(self, session, boot, artifact_id, staged):
+        cleanup = uuid.uuid4().hex
+        self.save(guest_cleanup={'state': 'dispatched', 'job_id': cleanup})
+        try:
+            args = ['/nix/profile/bin/python3', '-c', REMOVE_GUEST_FILE,
+                    TRANSFER_ROOT, f'{artifact_id}.bin', staged]
+            self.bridge.guest_run(session, cleanup, args, cwd='/tmp', uid=0, wait_s=2)
+            job = self.wait_job(session, cleanup, lambda reply: reply.get('state') == 'completed')
+            if (job.get('session'), job.get('guest_boot_id'), job.get('operation_id')) != (session, boot, cleanup):
+                raise RuntimeError('Capture cleanup job belongs to a different boot or operation')
+            if job.get('exit', {}).get('code') != 0:
+                detail = job.get('stderr', {}).get('text', '').strip()
+                raise RuntimeError(f'Capture cleanup job failed (exit {job.get("exit")}): {detail}')
+        except Exception as error:
+            self.save(guest_cleanup={'state': 'needs_inspection', 'job_id': cleanup, 'error': str(error)})
+        else:
+            self.save(guest_cleanup={'state': 'completed', 'job_id': cleanup})
+
+    def execute(self,session,key_file,action,source=None,artifact_id=None,port=1236,request_id=None,keep_raw=False,disk_identity=None,max_bytes=None,pace_bytes_per_second=None,frame_options=None,crop=None,guest_file=None):
         if action not in ('put','get','frame','disk','getz','framez'):raise ValueError('Expected put/get/frame/disk/getz/framez')
         if action=='disk' and (disk_identity is None or max_bytes is None):raise ValueError('Disk export requires a pinned identity and explicit maximum size')
         if action!='disk' and (disk_identity is not None or max_bytes is not None):raise ValueError('Disk options require disk action')
@@ -51,6 +157,11 @@ class BulkRun(UpdateRun):
         if (action=='put')!=(source is not None):raise ValueError('Only put takes a host source path')
         if pace_bytes_per_second is not None and action!='put':raise ValueError('Pacing applies only to host uploads')
         validate_pacing(pace_bytes_per_second)
+        if guest_file is not None:
+            if (action not in ('get', 'getz') or artifact_id is not None or
+                    not isinstance(guest_file, str) or not guest_file.startswith('/') or '\0' in guest_file):
+                raise ValueError('An absolute guest file path can replace the artifact ID for get/getz')
+            artifact_id = uuid.uuid4().hex
         if (action in ('get','getz'))!=(artifact_id is not None):raise ValueError('Only get takes a guest artifact ID')
         if artifact_id:identifier(artifact_id)
         if (frame_options is not None or crop is not None) and action not in ('frame','framez'):raise ValueError('Frame options are only for frame capture')
@@ -68,7 +179,11 @@ class BulkRun(UpdateRun):
         self.output.mkdir(parents=True,exist_ok=False,mode=0o700)
         self.save(state='prepared',session=session,guest_boot_id=boot,transaction_id=tx,action=action,
             source=str(source) if source else None,artifact_id=artifact_id,pace_bytes_per_second=pace_bytes_per_second)
+        if guest_file is not None:
+            self.save(guest_file=guest_file, guest_artifact_path=f'{TRANSFER_ROOT}/{artifact_id}.bin')
         try:
+            if guest_file is not None:
+                staged = self.stage_guest_file(session, boot, guest_file, artifact_id)
             args=['/boot/HWBULKZ.ELF' if action in ('getz','framez') else '/boot/HWBULK.ELF',boot,tx,action]+([artifact_id] if artifact_id else [])+([option_argument] if option_argument else [])
             self.save(state='receiver_launch_dispatched',frame_options=option_argument)
             self.bridge.guest_run(session,tx,args,cwd='/tmp',uid=0,wait_s=2)
@@ -109,10 +224,18 @@ class BulkRun(UpdateRun):
                 with Path(png).open('rb') as image:png_hash=hashlib.file_digest(image,'sha256').hexdigest()
                 self.save(artifact_path=png,artifact_sha256=png_hash,frame=result['payload'],transfer=result)
             elif action in ('get','getz','disk'):self.save(artifact_path=result['artifact_path'])
-            self.save(state='completed');return self.receipt
+            self.save(state='completed')
         except Exception as error:
-            stage=self.receipt.get('state');self.save(state='published_needs_inspection' if stage in ('disk_published','disk_published_durability_uncertain') else 'needs_inspection',last_stage=stage,error=str(error),
-                recovery='Inspect the same transaction_id with hw_job. Do not redispatch a lost transfer under a new ID automatically.')
-            try:self.save(job_observation=self.bridge.job(session,tx,wait_s=2))
+            stage=self.receipt.get('state')
+            producer_pending = stage == 'producer_launch_dispatched'
+            observed_job = self.receipt['producer_job_id'] if producer_pending else tx
+            observed_field = 'producer_job_id' if producer_pending else 'transaction_id'
+            self.save(state='published_needs_inspection' if stage in ('disk_published','disk_published_durability_uncertain') else 'needs_inspection',last_stage=stage,error=str(error),
+                recovery=f'Inspect the same {observed_field} with hw_job. Do not redispatch under a new ID automatically.')
+            try:self.save(job_observation=self.bridge.job(session,observed_job,wait_s=2))
             except Exception as observation:self.save(job_observation_error=str(observation))
             raise
+
+        if guest_file is not None:
+            self.remove_guest_file(session, boot, artifact_id, staged)
+        return self.receipt

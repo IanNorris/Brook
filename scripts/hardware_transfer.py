@@ -8,15 +8,21 @@ from hardware_bulk_workflow import BulkRun
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--session',required=True);p.add_argument('--key-file',type=Path,required=True)
-    p.add_argument('--action',choices=['put','get','frame','disk'],required=True)
-    p.add_argument('--source',type=Path);p.add_argument('--artifact-id');p.add_argument('--request-id')
+    p.add_argument('--action',choices=['put','get','getz','frame','disk'],required=True)
+    p.add_argument('--source',type=Path);p.add_argument('--request-id')
+    guest_source = p.add_mutually_exclusive_group()
+    guest_source.add_argument('--artifact-id')
+    guest_source.add_argument('--guest-file', help='Stage an existing absolute guest file before get/getz')
     p.add_argument('--keep-raw',action='store_true',help='Retain diagnostic BGRA bytes in addition to the PNG (frame only)')
     p.add_argument('--output',type=Path,required=True);p.add_argument('--port',type=int,default=1236)
     p.add_argument('--disk-identity',type=Path,help='JSON with independently observed same-boot disk identity')
     p.add_argument('--max-bytes',type=int,help='Explicit disk export size ceiling')
     p.add_argument('--pace-bytes-per-second',type=int,help='Optional Linux TCP pacing cap for host uploads')
     a=p.parse_args();identity=json.loads(a.disk_identity.read_text()) if a.disk_identity else None
-    r=BulkRun(Hardware(),a.output).execute(a.session,a.key_file,a.action,a.source,a.artifact_id,a.port,a.request_id,a.keep_raw,identity,a.max_bytes,a.pace_bytes_per_second)
-    print(json.dumps({'state':r['state'],'transaction_id':r['transaction_id'],'receipt':str(a.output.resolve()/'receipt.json'),
-        'artifact_path':r.get('artifact_path'),'binary_phase_s':r['binary_phase_s'],'transfer':r['transfer']},indent=2))
+    r=BulkRun(Hardware(),a.output).execute(a.session,a.key_file,a.action,a.source,a.artifact_id,a.port,a.request_id,a.keep_raw,identity,a.max_bytes,a.pace_bytes_per_second,guest_file=a.guest_file)
+    result = {'state':r['state'],'transaction_id':r['transaction_id'],'receipt':str(a.output.resolve()/'receipt.json'),
+        'artifact_path':r.get('artifact_path'),'binary_phase_s':r['binary_phase_s'],'transfer':r['transfer']}
+    if 'guest_cleanup' in r:
+        result['guest_cleanup'] = r['guest_cleanup']
+    print(json.dumps(result, indent=2))
 if __name__=='__main__':main()
