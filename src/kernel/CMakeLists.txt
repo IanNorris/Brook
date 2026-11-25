@@ -698,6 +698,14 @@ if(BROOK_NV_DISPLAY)
     target_sources(kernel PRIVATE src/nv_disp_live.cpp)
     target_compile_definitions(kernel PRIVATE BROOK_NV_DISPLAY=1)
 endif()
+# NVIDIA GSP-RM (RTX 2080 / TU104, firmware 570.144) groundwork, milestone M0:
+# parsers, WPR2 layout, radix3, cmdq/msgq, CPU sequencer and the planned boot
+# register sequence (src/nv_gsp). Compile-only; nothing is wired into boot.
+option(BROOK_NV_GSP "Build the NVIDIA GSP-RM M0 groundwork (compile-only, not wired into boot)" OFF)
+if(BROOK_NV_GSP)
+    target_sources(kernel PRIVATE src/nv_gsp/nv_gsp_m0.cpp)
+    target_compile_definitions(kernel PRIVATE BROOK_NV_GSP=1)
+endif()
 set(BROOK_PANIC_INGEST_URL "" CACHE STRING "Panic scanner URL shown as a QR code on panic screens (empty: built-in default)")
 if(BROOK_PANIC_INGEST_URL)
     target_compile_definitions(kernel PRIVATE "PANIC_INGEST_URL=\"${BROOK_PANIC_INGEST_URL}\"")
