@@ -160,8 +160,9 @@ struct GmmuBuilder {
         return true;
     }
 
-    bool MapPage(uint64_t va, uint64_t pa, uint8_t shift, Aperture tgt, uint8_t kind, bool vol, bool priv = false) {
-        const uint64_t pte = gmmu::Pte(pa, tgt, kind, vol, priv);
+    bool MapPage(uint64_t va, uint64_t pa, uint8_t shift, Aperture tgt, uint8_t kind, bool vol, bool priv = false,
+                 bool ro = false) {
+        const uint64_t pte = gmmu::Pte(pa, tgt, kind, vol, priv, ro);
         uint64_t table = root; Aperture ta = root_aper;
         for (uint32_t l = 0; l < f.levels; ++l) {
             const GmmuLevel& L = f.lv[l];
@@ -195,11 +196,25 @@ struct GmmuBuilder {
 
     // Map [va, va+bytes) -> [pa, ...) with `shift`-sized pages (all aligned).
     bool Map(uint64_t va, uint64_t pa, uint64_t bytes, uint8_t shift, Aperture tgt, uint8_t kind = 0, bool vol = false,
-             bool priv = false) {
+             bool priv = false, bool ro = false) {
         const uint64_t ps = 1ull << shift;
         if ((va | pa | bytes) & (ps - 1)) { err = "alignment"; return false; }
         for (uint64_t o = 0; o < bytes; o += ps)
-            if (!MapPage(va + o, pa + o, shift, tgt, kind, vol, priv)) return false;
+            if (!MapPage(va + o, pa + o, shift, tgt, kind, vol, priv, ro)) return false;
+        return true;
+    }
+    // The directory tables on the path to `va` for levels [0, depth) (root first), created
+    // when missing; depth must stop above the dual level. For RM's COPY_SERVER_RESERVED_PDES.
+    bool Path(uint64_t va, uint32_t depth, uint64_t* out, Aperture* apers) {
+        uint64_t table = root; Aperture ta = root_aper;
+        if (depth > f.dual_level) { err = "path depth"; return false; }
+        for (uint32_t l = 0; l < depth; ++l) {
+            out[l] = table; apers[l] = ta;
+            if (l + 1 == depth) break;
+            const GmmuLevel& L = f.lv[l];
+            const uint64_t slot = ((va >> L.shift) & ((1ull << L.bits) - 1)) * L.entry_bytes;
+            if (!Child(table, ta, slot, &table, &ta)) return false;
+        }
         return true;
     }
 };

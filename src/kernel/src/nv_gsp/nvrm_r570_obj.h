@@ -232,4 +232,70 @@ inline uint32_t IncHeader(uint32_t subc, uint32_t mthd, uint32_t count) {
 }
 }  // namespace host
 
+
+// ------------------------------------------------ M4: GR (golden context, 3D/compute)
+// nouveau r570/nvrm/gr.h (r570 engine-context IDs: COUNT 0x1a), r535/nvrm/{gr.h,fifo.h,vmm.h}
+// (PROMOTE_CTX, COPY_SERVER_RESERVED_PDES), r570/nvrm/gr.h (BUG4208224 scrubber WAR).
+namespace gr {
+constexpr NvU32 NV2080_CTRL_CMD_INTERNAL_STATIC_KGR_GET_CONTEXT_BUFFERS_INFO = 0x20800a32;
+constexpr NvU32 kMaxEngines = 8, kEngineIdCount = 0x1a;
+struct ENGINE_CONTEXT_BUFFER_INFO { NvU32 size, alignment; };
+struct GET_CONTEXT_BUFFERS_INFO_PARAMS { ENGINE_CONTEXT_BUFFER_INFO engine[kMaxEngines][kEngineIdCount]; };
+static_assert(sizeof(GET_CONTEXT_BUFFERS_INFO_PARAMS) == 8 * 0x1a * 8, "");
+enum : NvU32 {   // NV0080_CTRL_FIFO_GET_ENGINE_CONTEXT_PROPERTIES_ENGINE_ID_* (r570)
+    CTX_GRAPHICS = 0x00, CTX_GRAPHICS_ZCULL = 0x08, CTX_GRAPHICS_PM = 0x09, CTX_GRAPHICS_PAGEPOOL = 0x0d,
+    CTX_GRAPHICS_PATCH = 0x10, CTX_GRAPHICS_BUNDLE_CB = 0x11, CTX_GRAPHICS_PAGEPOOL_GLOBAL = 0x12,
+    CTX_GRAPHICS_ATTRIBUTE_CB = 0x13, CTX_GRAPHICS_RTV_CB_GLOBAL = 0x14, CTX_GRAPHICS_FECS_EVENT = 0x17,
+    CTX_GRAPHICS_PRIV_ACCESS_MAP = 0x18,
+};
+enum : NvU16 {   // NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ID_*
+    BUF_MAIN = 0, BUF_PM = 1, BUF_PATCH = 2, BUF_BUNDLE_CB = 3, BUF_PAGEPOOL = 4, BUF_ATTRIBUTE_CB = 5,
+    BUF_RTV_CB_GLOBAL = 6, BUF_FECS_EVENT = 9, BUF_PRIV_ACCESS_MAP = 10, BUF_UNRESTRICTED_PRIV_ACCESS_MAP = 11,
+};
+constexpr NvU32 NV2080_CTRL_CMD_GPU_PROMOTE_CTX = 0x2080012b;
+constexpr NvU32 kPromoteMaxEntries = 16;
+struct PROMOTE_CTX_BUFFER_ENTRY {
+    NvU64 gpuPhysAddr, gpuVirtAddr, size;
+    NvU32 physAttr;
+    NvU16 bufferId;
+    NvU8 bInitialize, bNonmapped;
+};
+static_assert(sizeof(PROMOTE_CTX_BUFFER_ENTRY) == 0x20, "");
+struct PROMOTE_CTX_PARAMS {
+    NvU32 engineType;
+    NvHandle hClient;
+    NvU32 ChID;
+    NvHandle hChanClient, hObject, hVirtMemory;
+    NvU64 virtAddress, size;
+    NvU32 entryCount;
+    NvU32 pad_;
+    PROMOTE_CTX_BUFFER_ENTRY promoteEntry[kPromoteMaxEntries];
+};
+static_assert(offsetof(PROMOTE_CTX_PARAMS, virtAddress) == 0x18 && offsetof(PROMOTE_CTX_PARAMS, entryCount) == 0x28 &&
+              offsetof(PROMOTE_CTX_PARAMS, promoteEntry) == 0x30 && sizeof(PROMOTE_CTX_PARAMS) == 0x230, "");
+constexpr NvU32 kPhysAttrNouveau = 4;   // nouveau r535_gr_promote_ctx: physAttr = 4
+
+constexpr NvU64 SPLIT_VAS_SERVER_RM_MANAGED_VA_START = 0x100000000ull, SPLIT_VAS_SERVER_RM_MANAGED_VA_SIZE = 0x20000000ull;
+constexpr NvU32 NV90F1_CTRL_CMD_VASPACE_COPY_SERVER_RESERVED_PDES = 0x90f10106;
+constexpr NvU32 GMMU_FMT_MAX_LEVELS = 6;
+struct COPY_SERVER_RESERVED_PDES_PARAMS {
+    NvHandle hSubDevice;
+    NvU32 subDeviceId;
+    NvU64 pageSize, virtAddrLo, virtAddrHi;
+    NvU32 numLevelsToCopy;
+    NvU32 pad_;
+    struct Level { NvU64 physAddress, size; NvU32 aperture; NvU8 pageShift; NvU8 pad_[3]; } levels[GMMU_FMT_MAX_LEVELS];
+};
+static_assert(offsetof(COPY_SERVER_RESERVED_PDES_PARAMS, numLevelsToCopy) == 0x20 &&
+              offsetof(COPY_SERVER_RESERVED_PDES_PARAMS, levels) == 0x28 && sizeof(COPY_SERVER_RESERVED_PDES_PARAMS) == 0x28 + 6 * 0x18, "");
+
+constexpr NvU32 KGRAPHICS_SCRUBBER_HANDLE_VAS = 0xdada0042, KGRAPHICS_SCRUBBER_HANDLE_CHANNEL = 0xdada0045,
+                KGRAPHICS_SCRUBBER_HANDLE_3DOBJ = 0xdada0046;
+constexpr NvU32 NV2080_CTRL_CMD_INTERNAL_KGR_INIT_BUG4208224_WAR = 0x20800a46;
+struct INIT_BUG4208224_WAR_PARAMS { NvBool bTeardown; };
+
+constexpr NvU32 TURING_A = 0xc597, TURING_COMPUTE_A = 0xc5c0;   // nouveau tu1xx.c gr.class.threed/compute
+constexpr NvU32 RM_ENGINE_TYPE_GR0 = 0x01;
+}  // namespace gr
+
 }  // namespace brook::nvgsp::rm570
