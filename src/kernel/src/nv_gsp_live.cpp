@@ -968,7 +968,13 @@ void P5(uint32_t chid, bool dev, bool m3 = false) {
 uint32_t g_ceOnUs = 0; const char* g_ceOnStatus = "never"; const ChipOps* g_ceChip = nullptr;
 struct CeHookSync { void operator()() {
     FlushRange(g_cePresentState.in.gpfifo.cpu, 0x1000); FlushRange(g_cePresentState.in.push.cpu, 0x1000); } };
-uint64_t CeV2P(uintptr_t a) { const PhysicalAddress p = VmmVirtToPhys(KernelPageTable, VirtualAddress(a)); return p ? p.raw() : 0; }
+// Kernel VA -> physical. The direct map (2 MiB pages, where nv-disp's contiguous shadow
+// lives) is linear; VMALLOC pages go through the page tables.
+uint64_t CeV2P(uintptr_t a) {
+    if (a >= DIRECT_MAP_BASE && a < VMALLOC_BASE) return VirtToPhys(VirtualAddress(a)).raw();
+    const PhysicalAddress p = VmmVirtToPhys(KernelPageTable, VirtualAddress(a));
+    return p ? p.raw() : 0;
+}
 int CeKickHook(const NvCeJob& job, uint64_t* bytes, uint32_t* ticket) {   // nv-aux lock held
     const ChipOps* c = g_ceChip;
     if (!c || !g_rmRunning) return 0;
