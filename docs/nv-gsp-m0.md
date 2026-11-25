@@ -277,3 +277,30 @@ mismatch.
     present copy through BAR1 manages about 1.4 GB/s (13-21 ms a frame).
   - The idle link reads 2.5 GT/s x8. The CE rate shows the link trains up
     under DMA load.
+
+## CE present path and boot-time GSP-RM (26 Nov)
+
+- **`nv-gsp ce-present on|off|status`** (`nv_gsp/nv_gsp_ce_present.h`, seam
+  `nv_ce_present_api.h`).
+  - It keeps a TURING_DMA_COPY_A channel alive (RunM2 with `M2Inputs.keep`).
+  - Before the VA space is bound, it maps nv-disp's VRAM [0, 256 MiB) with 2 MiB PTEs.
+  - The source is nv-disp's head-0 shadow, allocated contiguous and 2 MiB aligned. The
+    mapper uses 2 MiB PTEs for such a source and 4 KiB PTEs otherwise, with a remap and
+    MMU invalidate when the source moves.
+  - FlipPendingLocked kicks one pitch copy per damage rectangle plus a host semaphore
+    after WFI. The flip lands in the poll hook, or before the next shadow update.
+  - A failure or a BAR1 spot-check mismatch turns the path off, and the CPU copies those
+    rectangles.
+  - Every RM fini clears the hook under the nv-aux lock first.
+- **Autostart.** With `/etc/nv-gsp` and no `/etc/nv-gsp-no-autostart` (builder
+  `--nv-gsp-no-autostart`), nv-disp's desktop-start thread runs `p4 keep-display`
+  and `ce-present on` 3 s after the heads are up. P4 takes about 1.7 s wall; the desktop
+  freezes for about 1.3 s once.
+- **Measured** (fullscreen Chromium canvas, about 31.6 MB of damage per frame): head-0
+  fps 24.0 (CPU, no RM) → 29.0 (CPU, RM up) → 33.6 (CE, synchronous) → 35.4 (CE
+  overlapped, 2 MiB source). With about 20 MB per frame: 29.8 (CPU, RM up) → 39.6 (CE).
+  YouTube 4K60 (Big Buck Bunny, watch page): 35.1 / 35.9 (CPU) → 37.6 (CE).
+- **What still limits it.** The compositor is about 92% busy: around 8–10 ms of compose
+  plus the CE wait, at about 4 GB/s for 34 MB. waylandd is about 98% busy and caps
+  commits at about 42–47/s.
+- **Idle power:** 131–138 W without GSP; 100–105 W with GSP-RM up.
