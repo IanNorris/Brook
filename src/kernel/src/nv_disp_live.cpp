@@ -10,6 +10,9 @@
 #include "nv_disp_head_runner.h"
 #include "nv_disp_driver.h"
 #include "nv_ce_present_api.h"
+#if defined(BROOK_NV_GSP)
+#include "nv_gsp_live.h"
+#endif
 #include "pci.h"
 #include "acpi.h"
 #include "boot_resource_map.h"
@@ -626,10 +629,15 @@ void PresenterStats(bool reset){
         c.raw(",\"copied_bytes\":");c.dec(p.copiedBytes);c.raw(",\"diff_us\":");c.dec(p.diffNs/1000);c.raw(",\"copy_us\":");c.dec(p.copyNs/1000);
         c.raw(",\"copy_max_us\":");c.dec(p.copyMaxUs);c.raw(",\"unchanged\":");c.dec(p.unchanged);c.raw(",\"full_diffs\":");c.dec(p.fullDiffs);c.raw(",\"deferred\":");c.dec(p.deferred);
         c.raw(",\"busy\":");c.dec(p.busy);c.raw(",\"no_buffer\":");c.dec(p.noBuffer);
-        c.raw(",\"ce\":");c.dec(g_ceOps&&o==0&&!g_ceVerifyOff?1:0);c.raw(",\"ce_kicks\":");c.dec(p.ceKicks);
-        c.raw(",\"ce_wait_us\":");c.dec(p.ceWaitNs/1000);c.raw(",\"ce_poll_flips\":");c.dec(p.ceFlipsFromPoll);c.raw(",\"shadow_contig\":");c.dec(p.shadowContig?1:0);c.raw(",\"ce_frames\":");c.dec(p.ceFrames);c.raw(",\"ce_bytes\":");c.dec(p.ceBytes);
-        c.raw(",\"ce_cpu_frames\":");c.dec(p.ceCpuFrames);c.raw(",\"ce_verified\":");c.dec(p.ceVerified);c.raw(",\"ce_mismatch\":");c.dec(p.ceMismatch);
         c.raw("}\n");DebugChannelSend(c.t);
+        if(o==0){   // CE present counters on their own line (the copy line's buffer is full)
+            nvdisp::NvDisplayDriver<LiveBackend>::Line ce;
+            ce.raw("{\"nv_display\":\"stats_ce\",\"output\":0");
+            ce.raw(",\"ce\":");ce.dec(g_ceOps&&o==0&&!g_ceVerifyOff?1:0);ce.raw(",\"ce_kicks\":");ce.dec(p.ceKicks);
+            ce.raw(",\"ce_wait_us\":");ce.dec(p.ceWaitNs/1000);ce.raw(",\"ce_poll_flips\":");ce.dec(p.ceFlipsFromPoll);ce.raw(",\"shadow_contig\":");ce.dec(p.shadowContig?1:0);ce.raw(",\"ce_frames\":");ce.dec(p.ceFrames);ce.raw(",\"ce_bytes\":");ce.dec(p.ceBytes);
+            ce.raw(",\"ce_cpu_frames\":");ce.dec(p.ceCpuFrames);ce.raw(",\"ce_verified\":");ce.dec(p.ceVerified);ce.raw(",\"ce_mismatch\":");ce.dec(p.ceMismatch);
+            ce.raw("}\n");DebugChannelSend(ce.t);
+        }
     }
     {   // compositor frame cost and escalations (zeroed with the window)
         const CompositorFrameStats cs=CompositorReadFrameStats(zero);
@@ -673,12 +681,16 @@ void DesktopStartThread(void*){
     // D3: the second monitor (conn2) joins unless /etc/nv-no-second-head exists. The head-1
     // preflight reads the sink's DPCD first and refuses without one; DP training takes
     // ~1-2 s, during which head 0 presents are deferred (try-lock busy).
-    if(FileExists("/etc/nv-no-second-head"))return;
-    SpinLockAcquire(lock);
-    const bool on1=Presenter1OnLocked();
-    SpinLockRelease(lock);
-    if(on1)Head1Publish();
-    else KPrintf("nv-display: head 1 bring-up failed or no sink; the desktop stays on head 0\n");
+    if(!FileExists("/etc/nv-no-second-head")){
+        SpinLockAcquire(lock);
+        const bool on1=Presenter1OnLocked();
+        SpinLockRelease(lock);
+        if(on1)Head1Publish();
+        else KPrintf("nv-display: head 1 bring-up failed or no sink; the desktop stays on head 0\n");
+    }
+#if defined(BROOK_NV_GSP)
+    NvGspAutostart();   // GSP-RM (p4 keep-display) + CE present, unless /etc/nv-gsp-no-autostart
+#endif
 }
 
 } // namespace

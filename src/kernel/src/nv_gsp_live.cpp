@@ -33,6 +33,7 @@
 #include "nv_gsp/nv_gsp_ce_present.h"
 #include "nv_disp_live.h"
 #include "platform_power.h"
+#include "scheduler.h"
 #include "serial.h"
 #include "pci.h"
 #include "acpi.h"
@@ -53,6 +54,7 @@ namespace {
 using namespace nvgsp;
 
 // ------------------------------------------------------------------ reply
+bool g_outQuiet = false;   // the boot-time autostart runs verbs with no bridge client
 struct Out {
     char t[6000]; uint32_t n = 0;
     void raw(const char* s) { while (*s && n + 1 < sizeof(t)) t[n++] = *s++; t[n] = 0; }
@@ -66,7 +68,7 @@ struct Out {
     void kd(const char* key, uint64_t v) { k(key); dec(v); }
     void ks(const char* key, const char* s) { k(key); str(s); }
     void kb(const char* key, bool b) { k(key); raw(b ? "true" : "false"); }
-    void send() { raw("}\n"); DebugChannelSend(t); }
+    void send() { raw("}\n"); if (!g_outQuiet) DebugChannelSend(t); }
 };
 
 uint64_t NowUs() { return TscClockAvailable() ? TscClockReadNs() / 1000 : ApicTickCount() * 1000; }
@@ -147,6 +149,9 @@ Bar0Bus g_bus;   // .bss
 // ---------------------------------------------------------- live state
 struct Gpu { uint8_t bus = 0, dev = 0, fn = 0; uint64_t bar0 = 0; bool ok = false; };
 volatile uint32_t g_busy = 0;
+bool g_ceActiveFlag = false;   // mirrors g_cePresentState.active for Status (declared later)
+struct AutostartState { const char* status = "not run"; uint64_t start_ms = 0, p4_us = 0, ce_us = 0; } g_autostart;
+bool PathExists(const char* path) { auto* f = VfsOpen(path, VFS_O_STREAM); if (!f) return false; VfsRelease(f); return true; }
 bool g_p3Done = false, g_finiDone = false, g_p4Done = false;   // latched at arm (the first write)
 bool g_rmRunning = false;                    // GSP-RM reached INIT_DONE this boot
 DmaBuf g_dma;                                 // 16 contiguous pages, kept for the boot
@@ -456,6 +461,7 @@ void Status() {
     Front f;
     o.kb("marker", MarkerSet("/etc/nv-gsp"));
     o.kb("p3_done", g_p3Done); o.kb("fini_done", g_finiDone);
+    o.ks("autostart", g_autostart.status); o.kb("rm_running", g_rmRunning); o.kb("ce_present", g_ceActiveFlag);
     if (FindGpu(f.g)) {
         g_bus.bar0 = f.g.bar0;
         o.kh("pci_cmd", PciConfigRead16(f.g.bus, f.g.dev, f.g.fn, 4));
@@ -985,13 +991,13 @@ int CeKickHook(const NvCeJob& job, uint64_t* bytes, uint32_t* ticket) {   // nv-
     const int r = CePresentKick(g_bus, *c, vio, g_cePresentState, job, CeV2P, sync, bytes, ticket);
     g_bus.rec = rec;
     pr.Restore();
-    if (r < 0) { g_cePresentState.active = false; KPrintf("nv-gsp: CE present kick failed (%s)\n", g_cePresentState.last_error); }
+    if (r < 0) { g_cePresentState.active = false; g_ceActiveFlag = false; KPrintf("nv-gsp: CE present kick failed (%s)\n", g_cePresentState.last_error); }
     return r;
 }
 int CeWaitHook(uint32_t ticket, uint32_t budget_us) {   // nv-aux lock held
     if (!g_rmRunning) return -1;
     const int r = CePresentWait(g_bus, g_cePresentState, ticket, budget_us, [] { __asm__ volatile("pause"); });
-    if (r < 0) { g_cePresentState.active = false; KPrintf("nv-gsp: CE present wait failed (%s)\n", g_cePresentState.last_error); }
+    if (r < 0) { g_cePresentState.active = false; g_ceActiveFlag = false; KPrintf("nv-gsp: CE present wait failed (%s)\n", g_cePresentState.last_error); }
     return r;
 }
 const NvCeOps g_ceOps{CeKickHook, CeWaitHook};
@@ -1005,7 +1011,7 @@ bool CePresentStop(bool wait_lock, uint32_t* freed) {
     if (wait_lock) { SpinLockAcquire(lock); held = true; }
     else { const uint64_t end = NowUs() + 100000; while (!(held = SpinLockTryAcquire(lock)) && NowUs() < end) __asm__ volatile("pause"); }
     if (held) NvDispSetCePresent(nullptr);   // finishes a kicked copy, then nv-disp copies with the CPU
-    g_cePresentState.active = false;         // (without the lock: kicks are refused from here on)
+    g_cePresentState.active = false; g_ceActiveFlag = false;         // (without the lock: kicks are refused from here on)
     if (held) SpinLockRelease(lock);
     if (g_cePresentState.k.kept && g_rmRunning && g_rm) {
         RmWait wait; g_rm->wait_deadline_us = NowUs() + 1000000;
@@ -1022,6 +1028,7 @@ void CeStatsJson(Out& o) {
     const CePresent& cp = g_cePresentState; const CeStats& st = cp.st;
     o.kb("active", cp.active); o.kb("kept", cp.k.kept); o.kb("broken", cp.broken); o.ks("last_error", cp.last_error);
     o.ks("on_status", g_ceOnStatus); o.kd("on_us", g_ceOnUs);
+    o.ks("autostart", g_autostart.status); o.kd("autostart_p4_us", g_autostart.p4_us); o.kd("autostart_ce_us", g_autostart.ce_us);
     o.kd("frames", st.frames); o.kd("rects", st.rects); o.kd("bytes", st.bytes); o.kd("submits", st.submits);
     o.kd("avg_us", st.submits ? st.us_sum / st.submits : 0); o.kd("max_us", st.us_max);
     o.kd("remaps", st.remaps); o.kd("remap_us_max", st.remap_us_max); o.kd("map_pages", st.map_pages);
@@ -1063,7 +1070,7 @@ void CePresentVerb(int mode) {   // 1 on, 2 off, 0 status
             // touch every BAR0 page the hook uses, so it never adds a Bar0Bus slot at present time
             (void)g_bus.rd32(c->reg_fb_flush); (void)g_bus.rd32(c->reg_mmu_inval_trigger);
             (void)g_bus.rd32(c->reg_mmu_inval_pdb_lo); (void)g_bus.rd32(c->usermode);
-            g_ceChip = c; cp.active = true; NvDispSetCePresent(&g_ceOps);
+            g_ceChip = c; cp.active = true; g_ceActiveFlag = true; NvDispSetCePresent(&g_ceOps);
         }
         else cp.broken = true;
         SpinLockRelease(lock);
@@ -1112,6 +1119,28 @@ void Trace(uint32_t from) {
 }
 
 }  // namespace
+
+void NvGspAutostart() {
+    if (!MarkerSet("/etc/nv-gsp")) { g_autostart.status = "no /etc/nv-gsp"; return; }
+    if (PathExists("/etc/nv-gsp-no-autostart")) { g_autostart.status = "opted out"; KPrintf("nv-gsp: autostart off (/etc/nv-gsp-no-autostart)\n"); return; }
+    SchedulerSleepMs(3000);   // let the desktop settle after the head bring-up
+    bool got = false;
+    for (int i = 0; i < 100 && !(got = !__atomic_exchange_n(&g_busy, 1u, __ATOMIC_ACQUIRE)); ++i) SchedulerSleepMs(100);
+    if (!got) { g_autostart.status = "busy (a verb held the GPU)"; return; }
+    g_autostart.start_ms = NowUs() / 1000;
+    g_outQuiet = true;
+    uint64_t t0 = NowUs();
+    P4(true);
+    g_autostart.p4_us = NowUs() - t0;
+    if (g_rmRunning && g_bar1Mapped) {
+        t0 = NowUs(); CePresentVerb(1); g_autostart.ce_us = NowUs() - t0;
+        g_autostart.status = g_cePresentState.active ? "rm + ce present" : "rm up, ce present failed (CPU copies)";
+    } else g_autostart.status = g_rmRunning ? "rm up, BAR1 not mapped (no CE)" : "p4 failed (no RM)";
+    g_outQuiet = false;
+    __atomic_store_n(&g_busy, 0u, __ATOMIC_RELEASE);
+    KPrintf("nv-gsp: autostart %s (p4 %lu us, ce %lu us)\n", g_autostart.status, (unsigned long)g_autostart.p4_us,
+            (unsigned long)g_autostart.ce_us);
+}
 
 bool NvGspHandle(const char* command) {
     constexpr char prefix[] = "bridge hardware nv-gsp ";

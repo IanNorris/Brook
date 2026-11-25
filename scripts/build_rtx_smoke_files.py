@@ -77,7 +77,7 @@ ETC_ALLOWED = {*MARKERS, 'i219-attach', 'i219-reset', 'hardware-payload-id', 're
                # --session desktop only
                'live-store', 'usb-system', 'usb-profile-plan.pub', 'usb-system-trim', 'usb-bot-legacy', 'usb-bot-pipeline', 'usb-uas', 'usb-uas-fixture', 'volatile-desktop', 'hardware-bulk', 'usb-audio-mixer', 'dp-idle-seconds', 'nv-display', 'chromium-alsa-device',
                # --nv-gsp (GSP-RM M1 bridge verbs) and its firmware record
-               'nv-gsp', 'nv-gsp-firmware'}
+               'nv-gsp', 'nv-gsp-firmware', 'nv-gsp-no-autostart'}
 # Desktop live stick (--session desktop): the VMware RC session over the RAM
 # store, plus the RTX status helper. If the store does not mount, the services
 # fail to start and the kernel console, bridge and remote update stay usable.
@@ -298,8 +298,10 @@ def desktop_payload(args, initrd):
     fat_write(initrd, 'ETC/usb-audio-mixer', b'1\n')
     # RTX DP sink idle-off: 5 min, AUX ch 3 / SOR1 link B (the GOP's lit head on this desktop).
     fat_write(initrd, 'ETC/dp-idle-seconds', b'300 3 1 2\n')
-    if args.nv_gsp:  # GSP-RM M1 bridge verbs (nv-gsp status|p3|fini|trace); nothing at boot
+    if args.nv_gsp:  # GSP-RM: bridge verbs, and at desktop start p4 keep-display + CE present
         fat_write(initrd, 'ETC/nv-gsp', b'1\n')
+        if args.nv_gsp_no_autostart:  # opt out of the boot-time GSP-RM + CE present
+            fat_write(initrd, 'ETC/nv-gsp-no-autostart', b'1\n')
     if args.nv_display:  # desktop presents by flipping head 0 (D2); GOP copy otherwise
         fat_write(initrd, 'ETC/nv-display', b'1\n')
     fat_write(initrd, 'ETC/chromium-alsa-device', b'default\n')  # read by the store's brook-chromium
@@ -484,7 +486,10 @@ def build(args):
     }
     if args.nv_gsp:
         manifest['hardware_scope']['gsp'] = (
-            'only on explicit bridge calls (nv-gsp p3|fini, each at most once per boot): GPU fn0 PCI command '
+            ('bridge calls only (nv-gsp verbs, each GPU-writing verb at most once per boot): '
+             if args.nv_gsp_no_autostart else
+             'at desktop start GSP-RM boots (p4 keep-display) and the CE present path turns on, plus the '
+             'bridge verbs (each GPU-writing verb at most once per boot): ') + 'GPU fn0 PCI command '
             'bus-master enable and GSP/SEC2 falcon registers (FWSEC from the card VBIOS, booter_unload from the '
             'pinned 570.144 set); PROM read-only; no VBIOS/flash writes, no clock/fan/voltage changes')
     staged_manifest = staged / 'manifest.json'
@@ -564,7 +569,9 @@ def main():
     p.add_argument('--usb-system-trim', metavar="'dry-run|run [MIN_MIB [MAX_MIB]]'",
                    help="scan clean ext2 free extents before mount; send UNMAP only with 'run'")
     p.add_argument('--nv-gsp', action='store_true',
-                   help='desktop image: BROOK_NV_GSP kernel and /etc/nv-gsp (GSP-RM bridge verbs; nothing runs at boot)')
+                   help='desktop image: BROOK_NV_GSP kernel and /etc/nv-gsp (GSP-RM verbs; boots GSP-RM + CE present at desktop start unless --nv-gsp-no-autostart)')
+    p.add_argument('--nv-gsp-no-autostart', action='store_true',
+                   help='with --nv-gsp: /etc/nv-gsp-no-autostart (no GSP-RM / CE present at boot; verbs only)')
     p.add_argument('--nv-gsp-firmware', type=Path, metavar='NIX_OUT',
                    help='nix/nv-gsp-firmware.nix output to carry in the signed initrd (/boot/nvgsp, /etc/nv-gsp-firmware)')
     p.add_argument('--nv-gsp-firmware-store', type=Path, metavar='STORE_MANIFEST',
