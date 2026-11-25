@@ -6,6 +6,9 @@ namespace brook {
 // Serialized by the MSC I/O lock, including all byte-to-block writes.
 struct UsbWriteWindows {
     DeviceWriteWindow update{}, system{};
+    bool heldSystem=false;
+
+    bool CanOpenUpdate(bool systemBoot) const { return !systemBoot || heldSystem; }
 
     static bool Contains(const DeviceWriteWindow& window,uint64_t start,uint64_t length) {
         return window.length && length && start>=window.start && length<=window.length &&
@@ -26,6 +29,7 @@ struct UsbWriteWindows {
                 return false;
         }
         selected=requested.length?requested:DeviceWriteWindow{};
+        if(persistent && requested.length)heldSystem=true;
         return true;
     }
 };

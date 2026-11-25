@@ -1039,7 +1039,11 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         // Only the boot partition needs a registered alias. The system
         // adapter is private and the other partitions are never probed.
         if(usbSystemRequested) {
-            if(!brook::GptProbeBootPartition(ud))usbScanComplete=false;
+            const int scanned=brook::GptProbeBootPartition(ud);
+            if(scanned<0) {
+                brook::SerialPrintf("usb-system: incomplete GPT scan on %s (%d)\n",name,scanned);
+                usbScanComplete=false;
+            }
             continue;
         }
         uint32_t parts = brook::GptProbeDevice(ud,true);

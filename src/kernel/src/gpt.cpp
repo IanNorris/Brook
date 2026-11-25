@@ -149,13 +149,13 @@ static bool GuidEquals(const GptGuid& a, const GptGuid& b)
 static int ProbeGpt(Device* parentDev,bool includeEsp,bool bootPartitionOnly)
 {
     if (!parentDev || !parentDev->ops || !parentDev->ops->read)
-        return 0;
+        return bootPartitionOnly ? -5 : 0;
 
     // Read LBA 1 (GPT header).  Assume 512-byte sectors.
     alignas(16) uint8_t headerBuf[512];
     int n = parentDev->ops->read(parentDev, 512, headerBuf, 512);
     if (n < 512)
-        return 0;
+        return bootPartitionOnly ? -5 : 0;
 
     auto* hdr = reinterpret_cast<GptHeader*>(headerBuf);
     if (hdr->signature != GPT_SIGNATURE)
@@ -163,7 +163,7 @@ static int ProbeGpt(Device* parentDev,bool includeEsp,bool bootPartitionOnly)
     if(bootPartitionOnly) {
         StrictGptHeader checked{};
         if(StrictGptCheckHeader(headerBuf,DeviceBlockSize(parentDev),DeviceBlockCount(parentDev),
-                                false,checked)!=StrictGptResult::Ok)return 0;
+                                false,checked)!=StrictGptResult::Ok)return -22;
         if(s_partPoolNext==PART_POOL_SIZE)return -16;
     }
 
@@ -191,7 +191,7 @@ static int ProbeGpt(Device* parentDev,bool includeEsp,bool bootPartitionOnly)
 
     n = parentDev->ops->read(parentDev, entryOffset, entryBuf, entryBytes);
     if (n < static_cast<int>(entrySize))
-        return 0;
+        return bootPartitionOnly ? -5 : 0;
 
     uint32_t registered = 0;
     uint32_t partIdx = 0;
@@ -265,8 +265,8 @@ uint32_t GptProbeDevice(Device* parentDev,bool includeEsp) {
     return ProbeGpt(parentDev,includeEsp,false);
 }
 
-bool GptProbeBootPartition(Device* parentDev) {
-    return ProbeGpt(parentDev,true,true)>=0;
+int GptProbeBootPartition(Device* parentDev) {
+    return ProbeGpt(parentDev,true,true);
 }
 
 uint32_t MbrProbeDevice(Device* parentDev) {

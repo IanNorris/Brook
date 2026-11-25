@@ -14,10 +14,12 @@ from pathlib import Path
 import shutil
 import socket
 import stat
+import struct
 import subprocess
 import tempfile
 import time
 import uuid
+import zlib
 
 from build_rtx_smoke_files import NAMES, fat_write, stick_set
 from test_rtx_smoke_qemu import Qmp, Rpc, sha
@@ -88,6 +90,61 @@ def digest_backup(path):
     with path.open("rb") as disk:
         disk.seek(BACKUP_FIRST * SECTOR)
         return hashlib.sha256(disk.read(BACKUP_SECTORS * SECTOR)).hexdigest()
+
+
+def digest_outside_system(path):
+    """Hash every byte before and after p2, including the backup GPT."""
+    digest = hashlib.sha256()
+    with path.open("rb") as disk:
+        size = os.fstat(disk.fileno()).st_size
+        for start, end in ((0, STORE_FIRST * SECTOR), (BACKUP_FIRST * SECTOR, size)):
+            disk.seek(start)
+            remaining = end - start
+            while remaining:
+                data = disk.read(min(MIB, remaining))
+                assert data, "short read while hashing protected sectors"
+                digest.update(data)
+                remaining -= len(data)
+    return digest.hexdigest()
+
+
+def install_test_record(args, system, record):
+    """Edit the disposable p1 only and keep the loader's set hash valid."""
+    original = args.output / "system.files"
+    initrd = args.output / "negative-INITRD.IMG"
+    shutil.copyfile(original / "INITRD.IMG", initrd)
+    if record is not None:
+        fat_write(initrd, "ETC/usb-system", record)
+    manifest = json.loads((original / "manifest.json").read_text())
+    new_set = stick_set((original / "KERNEL/BROOK.ELF").read_bytes(), initrd.read_bytes(), manifest["payload_id"])
+    volume = f"{system}@@{ESP_FIRST * SECTOR}"
+    fat_write(volume, "INITRD.IMG", initrd.read_bytes())
+    fat_write(volume, "SET.BIN", new_set)
+
+
+def write_disagreeing_backup_gpt(system):
+    """Keep the backup header and entries internally valid, with a different p2 name."""
+    with system.open("r+b") as disk:
+        header_at = os.fstat(disk.fileno()).st_size - SECTOR
+        disk.seek(header_at)
+        header = bytearray(disk.read(SECTOR))
+        assert header[:8] == b"EFI PART"
+        entries_lba, count, entry_size = struct.unpack_from("<QII", header, 72)
+        header_size, = struct.unpack_from("<I", header, 12)
+        entries_at = entries_lba * SECTOR
+        disk.seek(entries_at)
+        entries = bytearray(disk.read(count * entry_size))
+        original = (header_at, bytes(header), entries_at, bytes(entries))
+        assert entries[entry_size + 56] == ord("B"), "expected BROOK_SYSTEM in backup GPT"
+        entries[entry_size + 56] = ord("X")
+        struct.pack_into("<I", header, 88, zlib.crc32(entries))
+        struct.pack_into("<I", header, 16, 0)
+        struct.pack_into("<I", header, 16, zlib.crc32(header[:header_size]))
+        disk.seek(entries_at)
+        disk.write(entries)
+        disk.seek(header_at)
+        disk.write(header)
+    return original
 
 
 PREBUILT = None
@@ -178,10 +235,10 @@ class Guest:
              "-drive", f'if=pflash,format=raw,readonly=on,file={os.environ["OVMF_CODE"]}',
              "-drive", f"if=pflash,format=raw,file={variables}",
              "-device", "VGA,vgamem_mb=64", "-device", "qemu-xhci,id=usb",
-             "-drive", f"if=none,format=raw,id=other,file={fallback},snapshot=on",
+             "-drive", f"if=none,format=raw,id=other,file={fallback},readonly=on",
              "-device", "usb-storage,bus=usb.0,port=1,drive=other",
              "-drive", f"if=none,format=raw,id=system,file={system},cache=none",
-             "-device", "usb-storage,bus=usb.0,port=2,drive=system,bootindex=1",
+             "-device", "usb-storage,id=system-usb,bus=usb.0,port=2,drive=system,bootindex=1",
              "-device", "usb-net,bus=usb.0,port=3,netdev=net",
              "-netdev", f"user,id=net,restrict=on,hostfwd=tcp:127.0.0.1:{self.port}-:1234",
              "-device", "usb-hub,bus=usb.0,port=4,id=hub",
@@ -265,12 +322,97 @@ class Guest:
         self.sock_dir.cleanup()
 
 
+def check_refusal(args, system, fallback, case, stage, error):
+    outside_before = digest_outside_system(system)
+    guest = Guest(args, system, fallback, case)
+    try:
+        guest.wait_log(f"USB_SYSTEM_MAINTENANCE stage={stage} error={error}")
+        boot = guest.attach()
+        status = guest.status()
+        assert status["stage"] == stage and status["error"] == error
+        assert not status["window_open"] and not status["mounted"]
+        assert status["writes"] == 0
+        log = guest.serial.read_text(errors="replace")
+        assert "USB_SYSTEM_READY" not in log and "live-store: ready" not in log
+    finally:
+        guest.stop()
+    assert digest_outside_system(system) == outside_before, case
+    return boot, {**status, "outside_p2_sha256": outside_before}
+
+
+def check_refused_identities(args, system, fallback):
+    results = {}
+    record = (args.output / "usb-system.record").read_text()
+    magic, guid, extent, fs_uuid = record.splitlines()
+    records = [
+        ("wrong-record-guid", f"{magic}\n{uuid.uuid4().bytes_le.hex()}\n{extent}\n{fs_uuid}\n", "gpt-identity"),
+        ("wrong-record-extent", f"{magic}\n{guid}\n{STORE_FIRST + 8},{STORE_SECTORS - 8}\n{fs_uuid}\n", "gpt-identity"),
+        ("wrong-record-fs-uuid", f"{magic}\n{guid}\n{extent}\n{uuid.uuid4().hex}\n", "ext2-identity"),
+        ("malformed-record", f"BRKUSB0\n{guid}\n{extent}\n{fs_uuid}\n", "record"),
+    ]
+    try:
+        for case, text, stage in records:
+            install_test_record(args, system, text.encode())
+            _, results[case] = check_refusal(args, system, fallback, case, stage, -22)
+    finally:
+        install_test_record(args, system, None)
+
+    sfdisk = ("sfdisk", "--no-reread", "--no-tell-kernel")
+    linux_data = "0FC63DAF-8483-4772-8E79-3D69D8477DE4"
+    for case, option, invalid, original in [
+        ("wrong-partition-name", "--part-label", "NOT_BROOK_SYSTEM", "BROOK_SYSTEM"),
+        ("wrong-partition-type", "--part-type", "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7", linux_data),
+    ]:
+        run(*sfdisk, option, system, "2", invalid)
+        try:
+            _, results[case] = check_refusal(args, system, fallback, case, "gpt-identity", -22)
+        finally:
+            run(*sfdisk, option, system, "2", original)
+    header_at, header, entries_at, entries = write_disagreeing_backup_gpt(system)
+    try:
+        _, results["gpt-copy-disagreement"] = check_refusal(
+            args, system, fallback, "gpt-copy-disagreement", "gpt-identity", -22)
+    finally:
+        with system.open("r+b") as disk:
+            disk.seek(entries_at)
+            disk.write(entries)
+            disk.seek(header_at)
+            disk.write(header)
+    return results
+
+
+def check_live_detach(args, disk, fallback):
+    outside_before = digest_outside_system(disk)
+    guest = Guest(args, disk, fallback, "live-detach")
+    try:
+        guest.wait_log("groups=1024")
+        guest.attach()
+        assert guest.status()["window_open"]
+        Qmp(guest.sock).call("device_del", id="system-usb")
+        guest.wait_log("storage 46f4:0001 disconnected")
+        fenced = guest.status()
+        assert fenced["uncertain"] and not fenced["window_open"] and fenced["dirty"], fenced
+        request = uuid.uuid4().hex
+        guest.call("hw_power", request_id=request, operation="restart")
+        guest.wait_log("USB_SYSTEM_FINAL_SYNC result=-5 clean=0")
+        final = guest.status()
+        assert final["uncertain"] and final["final_sync_attempted"] and not final["clean"]
+        assert final["writes"] == fenced["writes"], (fenced, final)
+    finally:
+        guest.stop()
+    assert digest_outside_system(disk) == outside_before
+    _, reboot = check_refusal(args, disk, fallback, "reboot-after-detach", "needs-filesystem-check", -117)
+    assert reboot["dirty"]
+    return {"fenced": fenced, "final_sync": final, "reboot": reboot}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--files", type=Path, required=True)
     parser.add_argument("--store", type=Path, required=True)
     parser.add_argument("--operator-seed", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--exercise-detach", action="store_true", help="also unplug the SSD in a running guest")
     parser.add_argument("--accel", choices=("kvm", "tcg"), default="kvm")
     args = parser.parse_args()
     if args.accel == "kvm" and subprocess.run(["pgrep", "-x", "vmware-vmx"], capture_output=True).returncode == 0:
@@ -279,7 +421,9 @@ def main():
     adopt_prebuilt(args.files)
     system, fallback = make_disks(args)
     backup = digest_backup(system)
-    results = {"backup_sha256": backup}
+    outside = digest_outside_system(system)
+    fallback_hash = sha(fallback)
+    results = {"backup_sha256": backup, "outside_p2_sha256": outside}
     guest = Guest(args, system, fallback, "clean-boot")
     try:
         guest.wait_log("groups=1024")
@@ -298,7 +442,14 @@ def main():
         guest.restart()
     finally:
         guest.stop()
-    assert digest_backup(system) == backup
+    assert digest_outside_system(system) == outside
+    assert sha(fallback) == fallback_hash
+    if args.exercise_detach:
+        fault = args.output / "fault.raw"
+        with fault.open("xb") as f:
+            f.truncate(system.stat().st_size)
+        clone_sparse(system, fault, 0)
+        results["live_detach"] = check_live_detach(args, fault, fallback)
 
     guest = Guest(args, system, fallback, "restart-and-power-loss")
     try:
@@ -314,34 +465,26 @@ def main():
         guest.stop()
     assert digest_backup(system) == backup
 
-    guest = Guest(args, system, fallback, "dirty-boot")
-    try:
-        guest.wait_log("USB_SYSTEM_MAINTENANCE stage=needs-filesystem-check error=-117")
-        results["dirty_boot"] = guest.attach()
-        results["dirty_status"] = guest.status()
-        assert results["dirty_status"]["dirty"]
-        assert not results["dirty_status"]["window_open"] and not results["dirty_status"]["mounted"]
-        assert results["dirty_status"]["writes"] == 0
-        log = guest.serial.read_text(errors="replace")
-        assert "USB_SYSTEM_READY" not in log and "live-store: ready" not in log
-    finally:
-        guest.stop()
-    assert digest_backup(system) == backup
-    # Spoofing the loader's identity through a second attached GPT disk
-    # must stop admission even when OVMF can identify its own boot handle.
+    results["dirty_boot"], results["dirty_status"] = check_refusal(
+        args, system, fallback, "dirty-boot", "needs-filesystem-check", -117)
+    assert results["dirty_status"]["dirty"] and digest_outside_system(system) == outside
+    assert sha(fallback) == fallback_hash
+    # Duplicate only the p1 identity; the firmware still selected the SSD.
     guid = subprocess.check_output(["sfdisk", "--part-uuid", system, "1"], text=True).strip()
-    run("sfdisk", "--no-reread", "--no-tell-kernel", "--part-uuid", fallback, "1", guid)
-    guest = Guest(args, system, fallback, "duplicate-boot-volume")
-    try:
-        guest.wait_log("USB_SYSTEM_MAINTENANCE stage=boot-volume-ambiguous error=-19")
-        guest.attach()
-        results["ambiguous_status"] = guest.status()
-        assert not results["ambiguous_status"]["mounted"]
-        assert not results["ambiguous_status"]["window_open"]
-        assert results["ambiguous_status"]["writes"] == 0
-    finally:
-        guest.stop()
+    fallback_guid = subprocess.check_output(["sfdisk", "--part-uuid", fallback, "1"], text=True).strip()
+    sfdisk = ("sfdisk", "--no-reread", "--no-tell-kernel", "--part-uuid", fallback, "1")
+    run(*sfdisk, guid)
+    matching_fallback = sha(fallback)
+    _, results["ambiguous_status"] = check_refusal(
+        args, system, fallback, "duplicate-boot-volume", "boot-volume-ambiguous", -19)
+    assert digest_outside_system(system) == outside
+    assert sha(fallback) == matching_fallback
+    run(*sfdisk, fallback_guid)
+    assert sha(fallback) == fallback_hash
+
+    results["negative_identities"] = check_refused_identities(args, system, fallback)
     assert digest_backup(system) == backup
+    assert sha(fallback) == fallback_hash
     results["backup_unchanged"] = True
     (args.output / "verdict.json").write_text(json.dumps(results, indent=2) + "\n")
     print(f"PASS {args.output / 'verdict.json'}")

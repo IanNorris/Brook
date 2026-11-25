@@ -2547,9 +2547,19 @@ static bool XhciBulkTransfer(XhciController& ctrl, XhciDevice& dev,
         ++enqueue;physical+=bytes;remaining-=bytes;
     }
     __asm__ volatile("mfence":::"memory");
-    publication.Publish();
-    __asm__ volatile("mfence":::"memory");
-    XhciRingDoorbell(ctrl,dev.slotId,dci);
+    {
+        // Removal publishes gone under the same lock before disabling the
+        // slot. Never publish a new MSC TD once that transition has started.
+        const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
+        if(__atomic_load_n(&dev.gone,__ATOMIC_ACQUIRE)) {
+            IrqSpinLockRelease(&g_eventRingLock,saved);
+            return false;
+        }
+        publication.Publish();
+        __asm__ volatile("mfence":::"memory");
+        XhciRingDoorbell(ctrl,dev.slotId,dci);
+        IrqSpinLockRelease(&g_eventRingLock,saved);
+    }
     Trb completion;
     Trb* evt=XhciWaitForEvent(ctrl,TRB_TYPE_TRANSFER_EVENT,timeoutMs,&completion,0,tokens,tokenCount);
 
@@ -2676,7 +2686,8 @@ static XhciMscResult XhciMscCommandLocked(XhciController& ctrl,XhciDevice& dev,
     const uint8_t* cdb,uint8_t cdbLen,void* data,uint64_t dataPhys,uint32_t dataLen,
     bool dataIn,bool allowShort=false)
 {
-    if(__atomic_load_n(&dev.mscQuarantined,__ATOMIC_ACQUIRE))return {};
+    if(__atomic_load_n(&dev.gone,__ATOMIC_ACQUIRE) ||
+       __atomic_load_n(&dev.mscQuarantined,__ATOMIC_ACQUIRE))return {};
     if (!dev.mscCommandBuffer)
         dev.mscCommandBuffer = AllocDmaBuffer(1, dev.mscCommandBufferPhys);
     if (!dev.mscCommandBuffer) return {};
@@ -2980,6 +2991,7 @@ static int UsbMscIoctl(Device* dev, uint32_t cmd, void* arg)
         const bool persistent=cmd==DEVICE_IOCTL_USB_SYSTEM_WINDOW;
         if(!g_storageReadOnly || !window || (persistent && !UsbSystemRequested()))return -22;
         MscIoGuard guard;
+        if(window->length && !persistent && !st->windows.CanOpenUpdate(UsbSystemRequested()))return -30;
         UsbMscByteTransport io{st};
         const auto block=io.blockSize();
         if(window->length && (!io.usable() || __atomic_load_n(&st->systemFailed,__ATOMIC_ACQUIRE) ||
