@@ -158,6 +158,8 @@ VmmMapResult MappingTransaction::Publish(uint64_t index, VirtualAddress address,
     }
     auto result = VmmTryMapPage(space_->pageTable, address, fresh_[index].physical, flags, tag, pid, accessible);
     if (result == VmmMapResult::Mapped) {
+        if (range && (range->dumpFlags & MappingSecret) && range->kind!=MappingKind::Device)
+            PmmRequireScrub(fresh_[index].physical);
         fresh_[index].published = true;
         fresh_[index].publishedAt = address;
         fresh_[index].publicationEpoch = lockEpoch_;
@@ -296,6 +298,12 @@ bool MappingTransaction::ProtectMapping(uint64_t begin, uint64_t end, uint32_t p
     if (!VmmProtectRange(space_->pageTable,begin,end,protection,PrivateLeaf,this)) return false;
     if (!ranges_.Protect(space_->ranges,begin,end,protection)) KernelPanic("mapping: protection preflight changed under lock");
     Changed(); return true;
+}
+bool MappingTransaction::SetDumpExcluded(uint64_t begin,uint64_t end,bool exclude) {
+    if (!locked_ || faultScoped_) KernelPanic("mapping: dump policy without lock or in fault scope");
+    if (!ranges_.SetDumpExcluded(space_->ranges,begin,end,exclude)) return false;
+    Changed(false);
+    return true;
 }
 bool MappingTransaction::SetForkFlags(uint64_t begin, uint64_t end, uint8_t mask, uint8_t bits) {
     if (!locked_ || faultScoped_) KernelPanic("mapping: fork policy without lock or in fault scope");

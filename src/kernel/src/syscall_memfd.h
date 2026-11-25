@@ -29,6 +29,7 @@ struct MemFdData {
     volatile uint32_t lock;     // spinlock protecting pageMap allocations + grow
     volatile uint32_t refCount; // +1 per fd, +1 per live mmap VMA
     MemFdSealState seals{};     // protected by lock; one lease per mapping backing
+    uint64_t secretSpace = 0;  // creator address-space identity, or 0 for normal memfd
 };
 
 uint64_t NextMemFdInode();

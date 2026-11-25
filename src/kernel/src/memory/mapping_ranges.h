@@ -26,6 +26,7 @@ enum class MappingLeafOwnership : uint8_t { Managed, Borrowed };
 // the range out of a forked child; Wipe gives the child the range without
 // its pages (private anonymous only, so the child demand-faults zeroes).
 enum : uint8_t { MappingForkSkip = 1, MappingForkWipe = 2 };
+enum : uint8_t { MappingSecret = 1, MappingSecretFd = 2 };
 struct MappingRange {
     uint64_t begin, end, offset, identity;
     MappingBacking* backing;
@@ -34,6 +35,7 @@ struct MappingRange {
     MappingSharing sharing;
     MappingLeafOwnership leafOwnership;
     uint8_t forkFlags = 0; // MappingFork*; copied by splits, fork and exec-free paths
+    uint8_t dumpFlags = 0; // MappingSecret*; range-local, independent of fork policy.
 };
 bool MappingRangeValid(const MappingRange& range);
 struct MappingRangeNode {
@@ -112,6 +114,7 @@ public:
     bool SetForkFlags(MappingRangeTable& table, uint64_t begin, uint64_t end,
                       uint8_t mask, uint8_t bits);
     bool CanSetForkFlags(const MappingRangeTable& table, uint64_t begin, uint64_t end) const;
+    bool SetDumpExcluded(MappingRangeTable& table, uint64_t begin, uint64_t end, bool exclude);
     bool Extend(MappingRangeTable& table, uint64_t identity, uint64_t end);
     void Finish(); // after unlock + acknowledgement; idempotent
 private:

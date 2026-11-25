@@ -35,6 +35,7 @@ int64_t UserMappingAdviseFree(Process* actor, AddressSpaceState* space, uint64_t
 // MADV_DONTFORK(10)/DOFORK(11)/WIPEONFORK(18)/KEEPONFORK(19). The whole range
 // must be mapped (ENOMEM otherwise, nothing changed); WIPEONFORK requires
 // private anonymous memory and DOFORK refuses device mappings (EINVAL).
+int64_t UserMappingAdviseDump(Process* actor, AddressSpaceState* space, uint64_t address, uint64_t length, bool exclude);
 int64_t UserMappingAdviseFork(Process* actor, AddressSpaceState* space, uint64_t address,
                               uint64_t length, uint32_t advice);
 // Destination must be a fresh, unpublished user AS. Failure leaves its partial
@@ -45,7 +46,7 @@ bool UserMappingClone(Process* actor, AddressSpaceState* source, AddressSpaceSta
 // from readable user leaves while mutation prevents unmap/frame retirement.
 // Read one resident user RAM page from a retained foreign address space.
 bool UserMappingReadResidentPage(AddressSpaceState*,uint64_t address,uint64_t identity,void* out);
-uint32_t UserMappingReadArguments(AddressSpaceState* space, uint64_t offset, void* buffer, uint32_t capacity);
+uint32_t UserMappingReadArguments(AddressSpaceState* space, uint64_t offset, void* buffer, uint32_t capacity, bool forCoreDump = false);
 // Source allocation must remain owned while the snapshot translates and pins
 // its pages. The returned descriptor owns those pins independently of the source.
 MappingBacking* UserMappingBufferSnapshot(uint64_t kernelAddress,uint64_t length);

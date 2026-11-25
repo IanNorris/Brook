@@ -54,6 +54,7 @@ AddressSpaceState* AddressSpaceCreate(uint16_t pid) {
     if (!space) return nullptr;
     memset(space, 0, sizeof(*space));
     space->references = 1;
+    space->dumpable = true;
     space->identity = __atomic_add_fetch(&g_identity, 1, __ATOMIC_RELAXED);
     space->generation = 1;
     space->ranges.owner = space;

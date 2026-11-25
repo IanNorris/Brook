@@ -380,6 +380,15 @@ int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         auto* mfd=static_cast<MemFdData*>(entry->handle);
         uint32_t maximum=5u|(((flags & MAP_SHARED) && (FdStatus(entry) & 3) != 0)?2u:0u);
         MfdLock(mfd);
+        if (mfd->secretSpace) {
+            if (mfd->secretSpace!=proc->addressSpace->identity) {MfdUnlock(mfd);return -EPERM;}
+            if (!(flags&MAP_SHARED) || (prot&4) || offset>=mfd->size || length>mfd->size-offset) {
+                MfdUnlock(mfd);return -EINVAL;
+            }
+            maximum &= ~4u;
+            request.range.dumpFlags=MappingSecret|MappingSecretFd;
+            request.range.forkFlags=MappingForkSkip;
+        }
         if((flags&MAP_SHARED) && (prot&2) && (mfd->seals.bits&8)) {MfdUnlock(mfd);return -EPERM;}
         if (!MemFdGrowLocked(mfd,offset+length)) {MfdUnlock(mfd);return -ENOMEM;}
         int admitted=MemFdAdmitMapping(mfd->seals,flags&MAP_SHARED,static_cast<uint32_t>(prot),&maximum);
@@ -533,7 +542,15 @@ int64_t sys_munmap(uint64_t addr,uint64_t length,uint64_t,uint64_t,uint64_t,uint
 static int PrepareUserRemap(const MappingRange& range,uint64_t length,void*) {
     if (range.kind==MappingKind::MemFd) {
         if (range.offset>~uint64_t{0}-length) return -EINVAL;
-        return MemFdGrow(static_cast<MemFdData*>(range.backing->object),range.offset+length)?0:-ENOMEM;
+        auto* mfd=static_cast<MemFdData*>(range.backing->object);
+        // Secret backing cannot be resized after its initial truncate.
+        if (mfd->secretSpace) {
+            MfdLock(mfd);
+            const bool fits=range.offset+length<=mfd->size;
+            MfdUnlock(mfd);
+            return fits?0:-EINVAL;
+        }
+        return MemFdGrow(mfd,range.offset+length)?0:-ENOMEM;
     }
     if (range.kind==MappingKind::File && !static_cast<FileMappingBacking*>(range.backing->object)->pinned) return -95;
     return 0;
@@ -616,6 +633,8 @@ int64_t sys_madvise(uint64_t address, uint64_t length, uint64_t advice,
     if (!proc) return -EINVAL;
     if (advice==4) return UserMappingDiscardAnonymous(proc,proc->addressSpace,address,length);
     if (advice==8) return UserMappingAdviseFree(proc,proc->addressSpace,address,length);
+    if (advice==16 || advice==17)
+        return UserMappingAdviseDump(proc,proc->addressSpace,address,length,advice==16);
     if (advice==10 || advice==11 || advice==18 || advice==19)
         return UserMappingAdviseFork(proc,proc->addressSpace,address,length,uint32_t(advice));
     constexpr uint64_t limit=0x0000800000000000ULL;

@@ -60,6 +60,7 @@ int64_t sys_timerfd_gettime(uint64_t fd, uint64_t currValAddr,
                              uint64_t, uint64_t, uint64_t, uint64_t);
 
 // syscall_memfd.cpp
+int64_t sys_memfd_secret(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 int64_t sys_memfd_create(uint64_t nameAddr, uint64_t flags,
                            uint64_t, uint64_t, uint64_t, uint64_t);
 

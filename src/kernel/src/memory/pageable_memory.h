@@ -14,6 +14,7 @@ struct MappingRangeTable;
 struct UserMappingRequest;
 struct MappingBacking;
 struct MappingRange;
+bool PageableMemoryCanExcludeFromDump(const MappingRange&,uint64_t begin,uint64_t end);
 // Prepare empty replacement metadata outside AS mutation. TransferLocked moves
 // existing entry ownership only after metadata/PTE commit; no backing I/O or
 // token/reference duplication is needed. Declare before the transaction.

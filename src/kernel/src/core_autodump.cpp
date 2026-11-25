@@ -289,8 +289,9 @@ void Worker(void*)
                 KLOG_INFO(General,"core-dump: %s pid=%u truncated discarded pages=%lu/%lu/%lu file_notes=%u",
                            comm,pid,discarded.filePages,discarded.dataPages,discarded.stackHeapPages,discarded.fileNotes);
             }
-            KLOG_INFO(General,"core-dump: %s pid=%u sig=%d -> %s/%s (%lu)",
-                      comm,pid,g_job.signal,directory,name,snapshot.result.bytes);
+            KLOG_INFO(General,"core-dump: %s pid=%u sig=%d -> %s/%s (%lu) excluded_ranges=%lu excluded_pages=%lu",
+                      comm,pid,g_job.signal,directory,name,snapshot.result.bytes,
+                      discarded.secretRanges,discarded.secretPages);
         }
         __atomic_store_n(&g_started,uint64_t{0},__ATOMIC_RELAXED);
         __atomic_store_n(&g_state,Idle,__ATOMIC_RELEASE);
@@ -302,7 +303,8 @@ void Worker(void*)
 CoreAutoJob* CoreAutoClaim(const Process* target,const Process* leader,int signal)
 {
     const auto mode=static_cast<CoreAutoMode>(__atomic_load_n(&g_mode,__ATOMIC_RELAXED));
-    if(!__atomic_load_n(&g_worker,__ATOMIC_ACQUIRE) ||
+    if(!__atomic_load_n(&g_worker,__ATOMIC_ACQUIRE) || !target->addressSpace ||
+       !__atomic_load_n(&target->addressSpace->dumpable,__ATOMIC_ACQUIRE) ||
        !CoreAutoEligible(mode,target->isKernelThread,target->uid,target->euid,target->suid,
                          signal,leader->coreLimits))return nullptr;
     uint32_t idle=Idle;

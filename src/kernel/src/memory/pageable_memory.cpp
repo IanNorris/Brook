@@ -239,7 +239,7 @@ int64_t PageOut(Process* actor,uint64_t page,PhysicalAddress* handoff=nullptr,bo
         const auto* range=MappingRangeFind(space->ranges,page);
         if(space->userAccess.CoversPage(page))return -16;
         if(!range || range->kind!=MappingKind::Pageable || !range->backing ||
-           range->backing->release!=ReleaseRegion)return -95;
+           range->backing->release!=ReleaseRegion || (range->dumpFlags&MappingSecret))return -95;
         auto* region=static_cast<Region*>(range->backing->object);
         index=(range->offset+page-range->begin)/4096;if(index>=region->pages)return -22;
         auto& entry=region->entries[index];
@@ -298,7 +298,8 @@ int64_t SpillStoredPage(Process* actor,uint64_t page) {
     if(!op.LockFaultRange(page))return -12;
     MappingFaultSnapshot snapshot{};
     if(!op.CaptureRange(page,1,snapshot) || snapshot.range.kind!=MappingKind::Pageable ||
-       !snapshot.range.backing || snapshot.range.backing->release!=ReleaseRegion)return -95;
+       !snapshot.range.backing || snapshot.range.backing->release!=ReleaseRegion ||
+       (snapshot.range.dumpFlags&MappingSecret))return -95;
     auto* region=static_cast<Region*>(snapshot.range.backing->object);
     auto index=(snapshot.range.offset+page-snapshot.range.begin)/4096;
     if(index>=region->pages || region->entries[index].state!=State::Stored)return -16;
@@ -348,7 +349,7 @@ uint64_t ScanVictim(Process* actor,uint64_t excluded,bool protectRecent,bool clo
             ++visits;
             cursor=range->kind==MappingKind::Pageable?page+4096:range->end;
             space->pagingReclaimCursor=cursor;
-            if(range->kind!=MappingKind::Pageable || !range->backing ||
+            if(range->kind!=MappingKind::Pageable || !range->backing || (range->dumpFlags&MappingSecret) ||
                range->backing->release!=ReleaseRegion || page==excluded ||
                space->userAccess.CoversPage(page))continue;
             bool recent=false;
@@ -778,6 +779,20 @@ int64_t PageableHostMap(Process* actor,uint64_t bytes){return Map(actor,bytes);}
 int64_t PageableHostPageOut(Process* actor,uint64_t address){PhysicalAddress retired;auto result=PageOut(actor,address,&retired);if(retired)PmmUnrefPage(retired);return result;}
 void PageableHostFailRollback(bool enabled){injectedFailure=enabled?6:0;}
 #endif
+bool PageableMemoryCanExcludeFromDump(const MappingRange& range,uint64_t begin,uint64_t end) {
+    if (!range.backing || range.backing->release!=ReleaseRegion) return false;
+    const auto* region=static_cast<const Region*>(range.backing->object);
+    const uint64_t first=(range.offset+begin-range.begin)/4096;
+    const uint64_t last=first+(end-begin)/4096;
+    if (last>region->pages) return false;
+    for (uint64_t i=first;i<last;++i) {
+        const auto state=region->entries[i].state;
+        // A successful opt-out makes no promise about bytes already written to
+        // an experimental page store. Require the caller to fault them in first.
+        if (state!=State::Zero && state!=State::Resident) return false;
+    }
+    return true;
+}
 PageableBackingStatus PageableMemoryBackingStatus() {
     PageableBackingStatus status{};status.configured=ready;
     if(!ready || !KMutexTryLock(&storeLock))return status;

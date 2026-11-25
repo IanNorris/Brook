@@ -78,6 +78,10 @@ bool MappingRangeValid(const MappingRange& range) {
     return ValidRange(range.begin, range.end) && !(range.offset & 4095) &&
            range.offset <= ~uint64_t{0} - (range.end - range.begin) &&
            !(range.maximumProtection & ~7u) && !(range.protection & ~range.maximumProtection) &&
+           (!(range.dumpFlags & MappingSecretFd) ||
+            ((range.dumpFlags & MappingSecret) && (range.forkFlags & MappingForkSkip) &&
+             range.kind == MappingKind::MemFd && range.sharing == MappingSharing::Shared &&
+             range.leafOwnership == MappingLeafOwnership::Borrowed)) &&
            (range.leafOwnership != MappingLeafOwnership::Borrowed || range.backing) &&
            ((range.kind != MappingKind::File && range.kind != MappingKind::MemFd &&
              range.kind != MappingKind::Device && range.kind != MappingKind::Pageable) || range.backing);
@@ -252,6 +256,14 @@ bool MappingRangePlan::SetForkFlags(MappingRangeTable& table, uint64_t begin, ui
     if (!CanSetForkFlags(table,begin,end)) return false;
     SplitApply(table,begin,end,[mask,bits](MappingRange& range) {
         range.forkFlags = uint8_t((range.forkFlags & ~mask) | (bits & mask));
+    });
+    return true;
+}
+bool MappingRangePlan::SetDumpExcluded(MappingRangeTable& table, uint64_t begin, uint64_t end, bool exclude) {
+    if (!CanSetForkFlags(table,begin,end)) return false;
+    SplitApply(table,begin,end,[exclude](MappingRange& range) {
+        if (exclude) range.dumpFlags |= MappingSecret;
+        else if (!(range.dumpFlags & MappingSecretFd)) range.dumpFlags &= ~MappingSecret;
     });
     return true;
 }

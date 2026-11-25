@@ -556,6 +556,7 @@ void SyscallTableInit()
     g_syscallTable[SYS_TIMERFD_CREATE]  = sys_timerfd_create;
     g_syscallTable[SYS_TIMERFD_SETTIME] = sys_timerfd_settime;
     g_syscallTable[SYS_TIMERFD_GETTIME] = sys_timerfd_gettime;
+    g_syscallTable[SYS_MEMFD_SECRET]    = sys_memfd_secret;
     g_syscallTable[SYS_MEMFD_CREATE]    = sys_memfd_create;
 
     // Brook-specific syscalls (500+). 500 = profiler control.

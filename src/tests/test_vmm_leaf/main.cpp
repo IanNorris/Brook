@@ -41,7 +41,7 @@ void PageableHostFailRollback(bool);
 namespace {
 constexpr size_t pageSize = 4096, pageCount = 4096;
 alignas(pageSize) unsigned char frames[pageCount][pageSize];
-struct Frame { unsigned refs=0, maps=0; } records[pageCount];
+struct Frame { unsigned refs=0, maps=0; bool scrub=false; } records[pageCount];
 std::mutex frameLock;
 uint64_t aliasTestBase=0;bool aliasTestDeny=false;
 std::atomic<bool> failAllocation{false};
@@ -66,7 +66,11 @@ unsigned maps(PhysicalAddress p) {
 }
 void dropLocked(size_t i) {
     CHECK(records[i].refs>0);
-    if (!--records[i].refs) { CHECK(!records[i].maps);std::memset(frames[i],0xa5,pageSize); }
+    if (!--records[i].refs) {
+        CHECK(!records[i].maps);
+        std::memset(frames[i],records[i].scrub?0:0xa5,pageSize);
+        records[i].scrub=false;
+    }
 }
 struct Gate {
     std::mutex mutex;std::condition_variable cv;unsigned arrived=0;bool released=false;
@@ -205,6 +209,12 @@ void PmmRefPage(PhysicalAddress p) {
 }
 bool PmmRefPageIfAlive(PhysicalAddress p) {
     std::lock_guard<std::mutex> lock(frameLock);auto& r=records[indexOf(p)];if(!r.refs)return false;CHECK(r.refs<~unsigned{0});++r.refs;return true;
+}
+void PmmRequireScrub(PhysicalAddress p) {
+    std::lock_guard<std::mutex> lock(frameLock);
+    auto& record=records[indexOf(p)];
+    CHECK(record.refs);
+    record.scrub=true;
 }
 void PmmUnrefPage(PhysicalAddress p) { std::lock_guard<std::mutex> lock(frameLock);dropLocked(indexOf(p)); }
 void PmmFreePage(PhysicalAddress p) { std::lock_guard<std::mutex> lock(frameLock);CHECK(records[indexOf(p)].refs==1);dropLocked(indexOf(p)); }
@@ -1074,6 +1084,41 @@ static void failedCloneAcknowledgement() {
     AddressSpaceUnref(source);CHECK(ProcessCleanupStep());
     PmmFreePage(root.pml4);VmmHostSetKernelRoot({});empty();CHECK(heapAllocations==0);
     std::puts("LIVE FORK FAILURE PASS partial-share/OOM/delayed-parent-ACK/ref-retirement/in-place-recovery");
+}
+static void secretMappingLifecycle() {
+    auto root=table();VmmHostSetKernelRoot(root);
+    auto* space=AddressSpaceCreate(38);auto* child=AddressSpaceCreate(39);
+    CHECK(space && child && space->dumpable);
+    Process actor{};actor.addressSpace=space;
+    const uint64_t base=va.raw(),target=base+64*pageSize;
+    UserMappingRequest request{};
+    request.range=rangeRecord(0,3*pageSize,nullptr);
+    request.hint=base;request.length=3*pageSize;request.preparedPages=3;
+    request.fixed=true;request.prepare=prepareMappingPages;
+    CHECK(UserMappingCreate(&actor,space,request)==static_cast<int64_t>(base));
+    const uint64_t secret=base+pageSize;
+    auto frame=VmmLeafPhysical(VmmReadLeaf(space->pageTable,VirtualAddress(secret)));
+    auto* bytes=reinterpret_cast<unsigned char*>(PhysToVirt(frame).raw());
+    std::memset(bytes,0x91,pageSize);
+    CHECK(UserMappingAdviseDump(&actor,space,secret,1,true)==0);
+    CHECK(MappingRangeFind(space->ranges,secret)->dumpFlags==MappingSecret);
+    CHECK(!MappingRangeFind(space->ranges,base)->dumpFlags);
+    CHECK(!MappingRangeFind(space->ranges,base+2*pageSize)->dumpFlags);
+    space->dumpable=false;
+    CHECK(UserMappingClone(&actor,space,child,39));
+    CHECK(!child->dumpable);
+    CHECK(MappingRangeFind(child->ranges,secret)->dumpFlags==MappingSecret);
+    CHECK(UserMappingResize(&actor,space,secret,pageSize,pageSize,3,target,nullptr,nullptr)==static_cast<int64_t>(target));
+    CHECK(!MappingRangeFind(space->ranges,secret) && MappingRangeFind(space->ranges,target)->dumpFlags==MappingSecret);
+    CHECK(UserMappingAdviseDump(&actor,space,target,pageSize,false)==0);
+    CHECK(!MappingRangeFind(space->ranges,target)->dumpFlags);
+    CHECK(UserMappingRemove(&actor,space,target,pageSize)==0);
+    CHECK(!MappingRangeFind(space->ranges,target) && bytes[0]==0x91);
+    AddressSpaceUnref(child);CHECK(ProcessCleanupStep());
+    CHECK(!PmmGetRefCount(frame));
+    for (uint64_t i=0;i<pageSize;++i)CHECK(bytes[i]==0);
+    AddressSpaceUnref(space);CHECK(ProcessCleanupStep());
+    PmmFreePage(root.pml4);VmmHostSetKernelRoot({});empty();CHECK(heapAllocations==0);
 }
 static void sparseLiveRemap() {
     auto root=table();VmmHostSetKernelRoot(root);auto* space=AddressSpaceCreate(38);CHECK(space);
@@ -3047,6 +3092,10 @@ static void pageableOwnerRoundTrip() {
         AddressSpaceUnref(dest);
         CHECK(ProcessCleanupStep());
     };
+    CHECK(UserMappingAdviseDump(&p,as,allocated,pageSize,true)==0);
+    CHECK(PageableHostPageOut(&p,allocated)==-95);
+    CHECK(VmmLeafPhysical(VmmReadLeaf(as->pageTable,address))==phys);
+    CHECK(UserMappingAdviseDump(&p,as,allocated,pageSize,false)==0);
     CHECK(PageableHostPageOut(&p, allocated) == 4096);
     checkFork();
     CHECK(!VmmReadLeaf(as->pageTable, address));
@@ -3079,7 +3128,7 @@ int main(int argc,char** argv) {
     accessedLeafAging();competingInstallAndDetach();rejectUnrepresentableOwner();ownedRangeRetirement();ownedSingleRetirement();detachReinstall();largeLeafAndBorrowedFrame();occupiedAncestors();failureAndInPlace();
     cowRetirement(false);for(unsigned i=0;i<32;++i)cowRetirement(true);
     addressSpaceLifetime();consumingWaitCleanup();mappingTransactions();rangeTableEdits();rangeLookupCache();rangeSnapshotRetirement();rangeLeafOwnership();
-    liveMappingClone();forkAdvice();sharedMappingClone();borrowedDeviceCachePolicies();failedCloneAcknowledgement();sparseLiveRemap();preparedThreadStack();graphicsBufferMappings();
+    liveMappingClone();forkAdvice();secretMappingLifecycle();sharedMappingClone();borrowedDeviceCachePolicies();failedCloneAcknowledgement();sparseLiveRemap();preparedThreadStack();graphicsBufferMappings();
     fileMappingRegistrations();fileMappingGateOom();addressFileGateScope();targetFileInvalidation();targetPrivateRestore();privateRestoreObservedEof();
     targetQuarantineRecovery();pageAccessWithoutUnrelatedGate();pageAccessFastPath();
     anonymousIntervalIsolation();anonymousDiscard();memoryCensus();sharedFilePublicationAndSync();exactAddressNoReplace();
