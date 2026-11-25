@@ -201,9 +201,12 @@ class Run:
     def restart(self, session, data, operator_file, boot, timeout):
         state = self.bridge.command(session, 'bridge hardware caps').get('usb_system', {})
         if state.get('profile_transfer_ready'):
-            _, job = self.job(session, ['/boot/bin/bash', '-c', 'test ! -e /nix/var/.brook-profile-lock'],
-                              name='profile_status', uid=1000)
-            if job.get('exit', {}).get('code') != 0:
+            script = ('if [[ -f /boot/USBSTAGE.RC ]]; then '
+                      'exec /boot/bin/bash /boot/USBSTAGE.RC status; '
+                      'else test ! -e /nix/var/.brook-profile-lock; fi')
+            _, job = self.job(session, ['/boot/bin/bash', '-c', script], name='profile_status', uid=1000)
+            output = job.get('stdout', {}).get('text', '').strip()
+            if job.get('exit', {}).get('code') != 0 or (output and json.loads(output)['active']):
                 raise RuntimeError('Profile job lock is active or unavailable; restart refused')
         power_id = uuid.uuid4().hex
         self.save(state='restart_dispatched', power_request_id=power_id)

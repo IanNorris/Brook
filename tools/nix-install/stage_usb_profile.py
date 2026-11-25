@@ -86,13 +86,17 @@ def check_sequence(plan, fingerprint, transaction, *, active=None):
 
 @contextlib.contextmanager
 def locked():
-    LOCK.mkdir(mode=0o700)
-    try:
-        stage.durable_text(LOCK / "owner", json.dumps({"boot": boot_id(), "pid": os.getpid()}) + "\n")
-        yield
-    finally:
-        (LOCK / "owner").unlink(missing_ok=True)
-        LOCK.rmdir()
+    with tempfile.TemporaryDirectory(prefix=".brook-lock-building-", dir=LOCK.parent) as temporary:
+        candidate = Path(temporary)
+        stage.durable_text(candidate / "owner", json.dumps({"boot": boot_id(), "pid": os.getpid()}) + "\n")
+        rename_no_replace(candidate, LOCK)
+        stage.flush_directory(LOCK.parent)
+        try:
+            yield
+        finally:
+            (LOCK / "owner").unlink(missing_ok=True)
+            LOCK.rmdir()
+            stage.flush_directory(LOCK.parent)
 
 
 def save_floor(plan, fingerprint, transaction):
@@ -118,9 +122,36 @@ def remove_tree(path):
         path.unlink(missing_ok=True)
 
 
+def lock_owner():
+    if not stat.S_ISDIR(LOCK.lstat().st_mode):
+        raise ValueError("Invalid USB staging lock")
+    path = LOCK / "owner"
+    if not stat.S_ISREG(path.lstat().st_mode):
+        raise ValueError("Invalid USB staging lock owner")
+    return json.loads(path.read_text())
+
+
+def job_active():
+    if not os.path.lexists(LOCK):
+        return False
+    owner = lock_owner()
+    if owner.get("boot") != boot_id():
+        return False
+    pid = owner.get("pid")
+    if type(pid) is not int or pid <= 0:
+        raise ValueError("Invalid USB staging process identity")
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
 def recover():
     owner_path = LOCK / "owner"
-    owner = json.loads(owner_path.read_text())
+    owner = lock_owner()
     previous = owner.get("boot")
     if not isinstance(previous, str) or not ID.fullmatch(previous) or previous == boot_id():
         raise ValueError("Recovery requires a profile lock from an earlier boot")
@@ -234,7 +265,7 @@ def main():
     if os.geteuid() != expected_uid:
         raise ValueError(f"{args.action} requires UID {expected_uid}")
     if args.action == "status":
-        print(json.dumps({"active": os.path.lexists(LOCK)}))
+        print(json.dumps({"active": job_active()}))
     elif args.action == "cache-capabilities":
         result = stage.cache_capabilities(NIX)
         result.update(usb_profile_api=1, plan_key_sha256=digest(BOOT_KEY),

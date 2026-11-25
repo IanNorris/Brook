@@ -15,6 +15,7 @@
 #include "large_data_session.h"
 #include "serial.h"
 #include "strong_random.h"
+#include "string.h"
 #include "vfs.h"
 #include "writable_desktop.h"
 
