@@ -38,6 +38,9 @@ def checked_plan(directory, public_key):
     plan = json.loads(document)
     if plan['format'] != 3 or plan['cache']['brook'] is not None:
         raise ValueError('USB system requires a signed selected plan with bridge-cache delivery')
+    sequence = plan.get('sequence')
+    if type(sequence) is not int or not 0 < sequence < (1 << 63):
+        raise ValueError('USB profile plans require a positive signed sequence')
     validate_plan({**plan, 'format': 2})
     validate_usage(plan)
     validate_launcher_ids(plan['profile']['launcherIds'])

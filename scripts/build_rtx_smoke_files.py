@@ -186,6 +186,32 @@ def gc_root(path, root):
     run(['nix-store', '--add-root', str(root), '--indirect', '--realise', str(path)], stdout=subprocess.DEVNULL)
 
 
+def embed_usb_profile_runtime(args, initrd, profile):
+    import shlex
+    import zipfile
+
+    helper = (profile / 'bin/brook-stage-profile').resolve(strict=True)
+    lines = helper.read_text().splitlines()
+    if len(lines) != 3 or not lines[1].startswith('export BROOK_STAGE_OPENSSL='):
+        raise ValueError('Unexpected selected-profile launcher')
+    openssl = lines[1].split('=', 1)[1]
+    command = shlex.split(lines[2])
+    if len(command) != 7 or command[0] != 'exec' or command[2:5] != ['-B', '-E', '-s'] or command[6] != '$@':
+        raise ValueError('Unexpected selected-profile runtime command')
+    python, support = command[1], Path(command[5]).parent
+    for path in (helper, openssl, python, support):
+        if not re.fullmatch(r'/nix/store/[A-Za-z0-9+._/=-]+', str(path)) or '..' in Path(path).parts:
+            raise ValueError('Selected-profile runtime is outside the Nix store')
+    payload = args.build_root / 'usb-stage.pyz'
+    with zipfile.ZipFile(payload, 'x', compression=zipfile.ZIP_STORED) as archive:
+        archive.write(ROOT / 'tools/nix-install/stage_usb_profile.py', '__main__.py')
+    fat_write(initrd, 'BOOT/USBSTAGE.PYZ', payload.read_bytes())
+    launcher = (f'export BROOK_STAGE_OPENSSL={shlex.quote(openssl)}\n'
+                f'exec {shlex.quote(python)} -B -E -s /boot/USBSTAGE.PYZ '
+                f'{shlex.quote(str(support))} {shlex.quote(str(helper))} {sha(helper)} "$@"\n')
+    fat_write(initrd, 'BOOT/USBSTAGE.RC', launcher.encode())
+
+
 def desktop_payload(args, initrd):
     """Embed desktop boot assets from a signed plan or the fallback RAM store."""
     from stage_clearwater_shell import add_clearwater_start, embed_clearwater_executables, embed_terminal_shortcut
@@ -196,7 +222,7 @@ def desktop_payload(args, initrd):
         plan, plan_hash, key_bytes = args.checked_profile_plan
         profile = Path('/nix/store') / plan['profile']['root']
         fat_write(initrd, 'ETC/usb-profile-plan.pub', key_bytes)
-        fat_write(initrd, 'BOOT/USBPROF.RC', (ROOT / 'data/scripts/usb_profile_bootstrap.sh').read_bytes())
+        embed_usb_profile_runtime(args, initrd, profile)
     else:
         if not args.live_store:
             raise SystemExit('Fallback desktop requires --live-store')

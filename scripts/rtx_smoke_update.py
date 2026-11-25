@@ -166,10 +166,10 @@ class Run:
             json.dump(self.receipt, stream, indent=2); stream.write('\n'); stream.flush(); os.fsync(stream.fileno())
         temporary.replace(self.output / 'receipt.json')
 
-    def job(self, session, argv, predicate=lambda r: r.get('state') == 'completed', timeout=120, name='job'):
+    def job(self, session, argv, predicate=lambda r: r.get('state') == 'completed', timeout=120, name='job', uid=0):
         ident = uuid.uuid4().hex
         self.save(**{name + '_id': ident})
-        self.bridge.guest_run(session, ident, argv, cwd='/tmp', uid=0, wait_s=2)
+        self.bridge.guest_run(session, ident, argv, cwd='/tmp', uid=uid, wait_s=2)
         end = time.monotonic() + timeout
         while time.monotonic() < end:
             result = self.bridge.job(session, ident, wait_s=2)
@@ -199,6 +199,12 @@ class Run:
         return result.get('exit', {}).get('code'), result.get('stdout', {}).get('text', '').strip()
 
     def restart(self, session, data, operator_file, boot, timeout):
+        state = self.bridge.command(session, 'bridge hardware caps').get('usb_system', {})
+        if state.get('profile_transfer_ready'):
+            _, job = self.job(session, ['/boot/bin/bash', '-c', 'test ! -e /nix/var/.brook-profile-lock'],
+                              name='profile_status', uid=1000)
+            if job.get('exit', {}).get('code') != 0:
+                raise RuntimeError('Profile job lock is active or unavailable; restart refused')
         power_id = uuid.uuid4().hex
         self.save(state='restart_dispatched', power_request_id=power_id)
         status = self.bridge.power(session, power_id, 'restart')
@@ -241,7 +247,7 @@ class Run:
     def profile_bootstrap(self, session):
         self.profile_target(session)
         self.output.mkdir(parents=True, exist_ok=False, mode=0o700)
-        _, job = self.job(session, ['/boot/bin/bash', '/boot/USBPROF.RC'],
+        _, job = self.job(session, ['/boot/bin/bash', '/boot/USBSTAGE.RC', 'initialize'],
                           timeout=180, name='profile_bootstrap')
         self.save(profile_job=job)
         if job.get('exit', {}).get('code') != 0:
@@ -259,15 +265,6 @@ class Run:
             if previous.get('destination') != 'usb-system':
                 raise ValueError('Expected a USB system profile receipt')
         journal = stage_profile(args, bridge=self.bridge, bulk_port=args.bulk_port, usb_system=True)
-        # Only remove immutable receipts that this successful transaction wrote.
-        paths = journal.receipt.get('profile_guest_files', [])
-        if paths:
-            try:
-                _, result = self.job(args.session, ['/nix/profile/bin/rm', '-f', '--', *paths],
-                                     timeout=120, name='profile_cleanup')
-                journal.save(profile_cleanup=result)
-            except (OSError, RuntimeError, ValueError) as error:
-                journal.save(profile_cleanup_error=str(error))
         return journal.receipt
 
     def store(self, session, store_dir, key_file, first_lba, sectors, upload_port):
@@ -452,12 +449,17 @@ def main():
     s = sub.add_parser('profile-bootstrap', help='initialize profile switching using the signed boot key')
     s.add_argument('--session', required=True)
     s.add_argument('--output', type=Path, required=True)
+    s = sub.add_parser('profile-recover', help='clear interrupted staging from an earlier boot')
+    s.add_argument('--session', required=True)
+    s.add_argument('--output', type=Path, required=True)
     s = sub.add_parser('profile', help='apply or roll back a signed profile on BROOK_SYSTEM')
     s.add_argument('--session', required=True)
     s.add_argument('--output', type=Path, required=True)
     s.add_argument('--bulk-port', type=int, default=1236)
     s.add_argument('--profile-timeout-s', type=int, default=3600)
     s.add_argument('--public-key', type=Path)
+    s.add_argument('--boot-set-manifest', type=Path)
+    s.add_argument('--repair', action='append', default=[])
     action = s.add_mutually_exclusive_group(required=True)
     action.add_argument('--profile-plan', type=Path)
     action.add_argument('--rollback-profile', type=Path)
@@ -478,9 +480,15 @@ def main():
         print(json.dumps(run.status(a.session), indent=2)); return
     if a.command == 'confirm':
         code, text = run.confirm(a.session); print(text); sys.exit(code or 0)
+    if a.command == 'profile-recover':
+        run.profile_target(a.session)
+        run.output.mkdir(parents=True, exist_ok=False)
+        _, job = run.job(a.session, ['/boot/bin/bash', '/boot/USBSTAGE.RC', 'recover'])
+        run.save(recovery=job)
+        sys.exit(job.get('exit', {}).get('code') if job.get('exit') else 1)
     if a.command in ('profile-bootstrap', 'profile'):
-        if a.command == 'profile' and bool(a.profile_plan) != bool(a.public_key):
-            p.error('--profile-plan requires --public-key')
+        if a.command == 'profile' and a.profile_plan and not (a.public_key and a.boot_set_manifest):
+            p.error('--profile-plan requires --public-key and --boot-set-manifest')
         try:
             result = run.profile_bootstrap(a.session) if a.command == 'profile-bootstrap' else run.profile(a)
         except (OSError, RuntimeError, ValueError) as error:

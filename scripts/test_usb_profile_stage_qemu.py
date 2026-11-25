@@ -27,6 +27,8 @@ def main():
     if args.accel == 'kvm' and subprocess.run(['pgrep', '-x', 'vmware-vmx'], capture_output=True).returncode == 0:
         parser.error('Workstation is running. Use TCG or wait for the VMware window to close.')
     args.profile_transfer = True
+    args.boot_set_manifest = args.files / 'manifest.json'
+    args.repair = []
     args.fixed_port = fixture.available_port()
     args.output.mkdir(mode=0o700, parents=True)
     fixture.adopt_prebuilt(args.files)
@@ -57,6 +59,8 @@ def main():
     try:
         init = rtx.Run(bridge, args.output / 'bootstrap').profile_bootstrap(guest.session)
         assert init['state'] == 'profile_initialized', init
+        again = rtx.Run(bridge, args.output / 'bootstrap-again').profile_bootstrap(guest.session)
+        assert again['state'] == 'profile_initialized', again
         guest.job(old)
         tx = uuid.uuid4().hex
         endpoint = bridge.load_session(guest.session)

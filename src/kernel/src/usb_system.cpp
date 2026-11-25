@@ -14,6 +14,7 @@
 #include "kprintf.h"
 #include "large_data_session.h"
 #include "serial.h"
+#include "strong_random.h"
 #include "vfs.h"
 #include "writable_desktop.h"
 
@@ -226,6 +227,42 @@ void UsbSystemConfigure() {
     ShowHex(boot.fsUuid,record.uuid);
 }
 
+static int PrepareProfileBoot() {
+    constexpr const char* directory = "/data/.brook-transfer";
+    auto* listing = VfsOpen(directory, VFS_O_STREAM);
+    if (!listing) return -5;
+    uint32_t cookie = 0;
+    DirEntry entry{};
+    int count;
+    int error = 0;
+    while ((count = VfsReaddir(listing, &entry, &cookie)) > 0) {
+        if (entry.isDir || strlen(entry.name) != 37 || strcmp(entry.name + 32, ".part")) continue;
+        bool transfer = true;
+        for (unsigned i = 0; i < 32; ++i) {
+            const char c = entry.name[i];
+            transfer &= (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        }
+        if (!transfer) continue;
+        char path[80] = "/data/.brook-transfer/";
+        memcpy(path + strlen(path), entry.name, 38);
+        error = VfsUnlink(path);
+        if (error) break;
+        cookie = 0;
+    }
+    VfsClose(listing);
+    if (error || count < 0) return error ? error : count;
+    uint8_t random[16];
+    if (!StrongRandomBytes(random, sizeof(random))) return -5;
+    char text[33];
+    ShowHex(text, random);
+    auto* writer = VfsOpenMode("/data/.brook-profile-boot", VFS_O_CREATE | VFS_O_EXCL | VFS_O_WRITE, 0644);
+    if (!writer) return -5;
+    uint64_t offset = 0;
+    const int written = VfsWrite(writer, text, 32, &offset);
+    VfsClose(writer);
+    return written == 32 ? 0 : -5;
+}
+
 // The authenticated bulk helper and profile-stage capacity probe share this
 // path. Bind it to the admitted system filesystem before userspace starts.
 static int BindProfileTransfer() {
@@ -273,6 +310,7 @@ static int BindProfileTransfer() {
     VfsPathRelease(var);
     VfsPathRelease(nix);
     VfsPathRelease(root);
+    if (!error) error = PrepareProfileBoot();
     boot.profileTransferReady = !error;
     return error;
 }
