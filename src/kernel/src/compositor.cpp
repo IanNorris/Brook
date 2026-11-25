@@ -5081,6 +5081,15 @@ static void CompositorLoop()
 }
 
 #include "compositor_frame_wait.inc"
+// As CompositorWaitForWork with a shorter deadline (a flip presenter in flight).
+static void CompositorWaitForWorkMs(uint64_t frameGeneration,uint32_t ms)
+{
+    Process* self=ProcessCurrent();
+    self->wakeupTick=ApicTickCount()+ms;
+    FrameTimingEnd(self->wakeupTick);
+    if(!g_compositorWakeSequence.Changed(frameGeneration))SchedulerBlock(self);
+    else self->wakeupTick=0;
+}
 
 static void CompositorThreadFn(void* /*arg*/)
 {
@@ -5129,7 +5138,13 @@ static void CompositorThreadFn(void* /*arg*/)
 #if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
         TraceDesktopCycle(FrameDesktopEnd,ApicTickCount());
 #endif
-        CompositorWaitForWork(frameGeneration);
+        uint32_t waitMs=COMPOSITE_INTERVAL;
+        if(const auto* presenter=g_primaryPresenter; presenter && presenter->poll){
+            const uint32_t hint=presenter->poll();
+            if(hint<waitMs)waitMs=hint;
+        }
+        if(waitMs<COMPOSITE_INTERVAL)CompositorWaitForWorkMs(frameGeneration,waitMs?waitMs:1);
+        else CompositorWaitForWork(frameGeneration);
     }
 }
 

@@ -102,6 +102,10 @@ OutputRect CompositorPrimaryOutputRect();
 struct DamageRects;
 struct CompositorPrimaryPresenter {
     int (*present)(const uint32_t* src, uint32_t srcStride, uint32_t width, uint32_t height, const DamageRects& damage);
+    // Called once per compositor loop (completes flips, arms the queued frame). Returns the
+    // longest the compositor may sleep before the next call, in ms (a flip in flight wants
+    // ~1 ms so the newest frame is armed right after the vblank load).
+    uint32_t (*poll)();
 };
 inline constexpr int kPresenterBusy = -1000;
 void CompositorSetPrimaryPresenter(const CompositorPrimaryPresenter* presenter);

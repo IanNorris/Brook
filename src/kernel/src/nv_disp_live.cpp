@@ -197,8 +197,11 @@ bool ConfigureHead(){
 // Any failure: the driver has already put A/"DAVE" back on screen, so returning <0
 // lets the GOP copy take over.
 struct NvPresenterState{
-    bool active=false;uint32_t* px[2]{};uint32_t pitchPx=0,width=0,height=0;
-    nvdisp::AgeRepair age{};uint32_t frames=0,busy=0,waitMaxUs=0;
+    bool active=false;uint32_t* px[3]{};uint32_t nbuf=2,pitchPx=0,width=0,height=0;
+    nvdisp::AgeRepair age{};uint32_t frames=0,busy=0,noBuffer=0;
+    // frame time = interval between successive presents (compositor cadence): bins
+    // <18 ms (60 Hz), <35, <51, >=51; plus average and max.
+    uint64_t lastUs=0,sumUs=0;uint32_t intervals=0,maxUs=0,hist[4]{};
 };
 NvPresenterState g_presenter{};
 // A kernel alias of `bytes` of BAR1 at `vram`, write-combining when PAT slot 4 is WC
@@ -217,20 +220,26 @@ uint32_t* MapBar1Surface(uint64_t vram,uint64_t bytes){
     }
     return reinterpret_cast<uint32_t*>(va.raw());
 }
+void NoteFrame(){
+    const uint64_t now=g_backend.nowUs();
+    if(g_presenter.lastUs){const uint32_t d=uint32_t(now-g_presenter.lastUs);
+        g_presenter.sumUs+=d;++g_presenter.intervals;if(d>g_presenter.maxUs)g_presenter.maxUs=d;
+        ++g_presenter.hist[d<18000?0:d<35000?1:d<51000?2:3];}
+    g_presenter.lastUs=now;
+}
+// Never blocks on a flip (mailbox, triple buffered): render into a free buffer (or
+// reclaim the queued one), arm it if nothing is in flight, else it waits as the queued
+// frame and the poll hook arms it right after the next LOADV.
 int NvPrimaryPresent(const uint32_t* src,uint32_t srcStride,uint32_t width,uint32_t height,const DamageRects& damage){
     SpinLock* lock=NvAuxSharedLock();
     if(!SpinLockTryAcquire(lock)){++g_presenter.busy;return kPresenterBusy;}
     auto& f=g_driver.f[0];
     if(!g_presenter.active||!g_driver.Live(0)||width!=g_presenter.width||height!=g_presenter.height){
         g_presenter.active=false;g_driver.out0External=false;SpinLockRelease(lock);return -1;}
-    // One frame in flight: wait (bounded) for the previous flip before reusing a buffer.
-    const uint64_t t0=g_backend.nowUs();
-    while(g_driver.Live(0)&&(f.state==nvdisp::FlipState::Armed||f.queued>=0)&&g_backend.nowUs()-t0<50000){g_driver.Tick();g_backend.relax();}
-    const uint32_t waited=uint32_t(g_backend.nowUs()-t0);if(waited>g_presenter.waitMaxUs)g_presenter.waitMaxUs=waited;
+    g_driver.Tick();
     if(!g_driver.Live(0)){g_presenter.active=false;g_driver.out0External=false;SpinLockRelease(lock);return -1;}
-    if(f.state!=nvdisp::FlipState::Idle||f.queued>=0){++g_presenter.busy;SpinLockRelease(lock);return kPresenterBusy;}
     const int8_t bb=f.Back();
-    if(bb<0){SpinLockRelease(lock);return kPresenterBusy;}
+    if(bb<0){++g_presenter.noBuffer;SpinLockRelease(lock);return kPresenterBusy;}
     uint32_t* dst=g_presenter.px[bb];const uint32_t pitch=g_presenter.pitchPx;
     auto copy=[&](const DamageRect& r){
         const int32_t x0=r.x0<0?0:r.x0,y0=r.y0<0?0:r.y0;
@@ -241,11 +250,25 @@ int NvPrimaryPresent(const uint32_t* src,uint32_t srcStride,uint32_t width,uint3
     (void)g_presenter.age.Apply(bb,damage,width,height,copy);
     __asm__ volatile("sfence":::"memory");
     if(f.Present(bb)<0){g_driver.Tick();SpinLockRelease(lock);return g_driver.Live(0)?kPresenterBusy:-1;}
-    ++g_presenter.frames;
+    ++g_presenter.frames;NoteFrame();
     SpinLockRelease(lock);
     return 1;
 }
-const CompositorPrimaryPresenter g_presenterOps{NvPrimaryPresent};
+// Compositor loop hook: complete flips / arm the queued frame; short sleeps while a flip
+// is in flight so the newest frame is armed just after the vblank load.
+uint32_t NvPrimaryPoll(){
+    SpinLock* lock=NvAuxSharedLock();
+    if(!SpinLockTryAcquire(lock))return 2;
+    uint32_t ms=16;
+    if(g_presenter.active&&g_driver.Live(0)){
+        g_driver.Tick();
+        const auto& f=g_driver.f[0];
+        if(f.state==nvdisp::FlipState::Armed||f.queued>=0)ms=1;
+    }
+    SpinLockRelease(lock);
+    return ms;
+}
+const CompositorPrimaryPresenter g_presenterOps{NvPrimaryPresent,NvPrimaryPoll};
 // Panic: put A back on screen without waiting or locking (best effort).
 void NvPanicHook(){
     if(!g_runnersBuilt||!g_presenter.active||!g_driver.Live(0))return;
@@ -257,21 +280,29 @@ void NvPanicHook(){
 bool PresenterOnLocked(){
     if(g_presenter.active)return true;
     if(!g_driver.Up0())return false;
-    const nvdisp::Surface& a=g_driver.f[0].surf[0];const nvdisp::Surface& b=g_driver.f[0].surf[1];
+    auto& f=g_driver.f[0];
+    const nvdisp::Surface third=g_driver.HeadZeroThird();
+    const nvdisp::Surface& a=f.surf[0];
     const uint64_t bytes=uint64_t(a.pitch)*a.height;
-    if(!g_presenter.px[0]){g_presenter.px[0]=MapBar1Surface(a.vram,bytes);g_presenter.px[1]=MapBar1Surface(b.vram,bytes);}
+    if(!g_presenter.px[0]){g_presenter.px[0]=MapBar1Surface(a.vram,bytes);g_presenter.px[1]=MapBar1Surface(f.surf[1].vram,bytes);}
+    if(third.vram&&!g_presenter.px[2])g_presenter.px[2]=MapBar1Surface(third.vram,bytes);
     if(!g_presenter.px[0]||!g_presenter.px[1]){KPrintf("nv-display: BAR1 surface mapping failed\n");(void)g_driver.Down0();return false;}
+    if(third.vram&&g_presenter.px[2])f.SetThird(third);
+    g_presenter.nbuf=f.nbuf;
     g_presenter.pitchPx=a.pitch/4;g_presenter.width=a.width;g_presenter.height=a.height;
-    g_presenter.age.Reset();   // A holds the last GOP frame; B is stale
+    g_presenter.age.Reset();   // A holds the last GOP frame; B (and the third) are stale
+    g_presenter.lastUs=0;
     g_presenter.active=true;g_driver.out0External=true;
     DisplaySetPanicHook(NvPanicHook);
-    KPrintf("nv-display: head 0 presents by flipping (A=GOP surface, B), WC=%d\n",VmmFramebufferWriteCombining()?1:0);
+    KPrintf("nv-display: head 0 presents by flipping (%u buffers), WC=%d\n",g_presenter.nbuf,VmmFramebufferWriteCombining()?1:0);
     return true;
 }
 void PresenterStatus(){
-    nvdisp::NvDisplayDriver<LiveBackend>::Line l;
-    l.raw("{\"nv_display\":\"presenter\",\"active\":");l.dec(g_presenter.active?1:0);l.raw(",\"frames\":");l.dec(g_presenter.frames);
-    l.raw(",\"busy\":");l.dec(g_presenter.busy);l.raw(",\"wait_max_us\":");l.dec(g_presenter.waitMaxUs);l.raw("}\n");
+    nvdisp::NvDisplayDriver<LiveBackend>::Line l;const auto& p=g_presenter;
+    l.raw("{\"nv_display\":\"presenter\",\"active\":");l.dec(p.active?1:0);l.raw(",\"buffers\":");l.dec(p.nbuf);
+    l.raw(",\"frames\":");l.dec(p.frames);l.raw(",\"busy\":");l.dec(p.busy);l.raw(",\"no_buffer\":");l.dec(p.noBuffer);
+    l.raw(",\"frame_avg_us\":");l.dec(p.intervals?uint32_t(p.sumUs/p.intervals):0);l.raw(",\"frame_max_us\":");l.dec(p.maxUs);
+    l.raw(",\"frame_hist\":[");for(uint32_t i=0;i<4;++i){if(i)l.raw(",");l.dec(p.hist[i]);}l.raw("]}\n");
     DebugChannelSend(l.t);
 }
 // Marker files hold "1\n" (as the Intel opt-ins).
