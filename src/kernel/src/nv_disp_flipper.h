@@ -224,4 +224,39 @@ struct AgeRepair{
         return n;
     }
 };
+// D3 frame cost: the compositor's damage is conservative (a cursor or taskbar redrawn
+// with the same pixels, a whole window for every client commit, both windows of a
+// move). Before anything crosses the GPU's gen1 x8 link, each damaged rect is compared
+// with a RAM shadow of what the head shows; only the bounding box of pixels that really
+// changed is copied (and stored into the shadow). No change on a head: no flip at all.
+// Returns the pixels compared.
+// 4 pixels equal (two 64-bit loads each side; the kernel has no memcmp).
+inline bool Same4(const uint32_t* a,const uint32_t* b){
+    uint64_t a0,a1,b0,b1;__builtin_memcpy(&a0,a,8);__builtin_memcpy(&a1,a+2,8);__builtin_memcpy(&b0,b,8);__builtin_memcpy(&b1,b+2,8);
+    return ((a0^b0)|(a1^b1))==0;}
+inline uint64_t ShadowDiff(const uint32_t* src,uint32_t srcStride,uint32_t* shadow,uint32_t shadowStride,
+                           uint32_t width,uint32_t height,const brook::DamageRect& rIn,brook::DamageRects& out){
+    const int32_t x0=rIn.x0<0?0:rIn.x0,y0=rIn.y0<0?0:rIn.y0;
+    const int32_t x1=rIn.x1>int32_t(width)?int32_t(width):rIn.x1,y1=rIn.y1>int32_t(height)?int32_t(height):rIn.y1;
+    if(x1<=x0||y1<=y0)return 0;
+    int32_t bx0=x1,bx1=x0,by0=y1,by1=y0;
+    const uint32_t n=uint32_t(x1-x0);
+    for(int32_t y=y0;y<y1;++y){
+        const uint32_t* a=src+uint64_t(y)*srcStride+x0;uint32_t* b=shadow+uint64_t(y)*shadowStride+x0;
+        uint32_t i=0;
+        while(i+4<=n&&Same4(a+i,b+i))i+=4;
+        while(i<n&&a[i]==b[i])++i;
+        if(i==n)continue;
+        uint32_t j=n;
+        while(j>=i+4&&Same4(a+j-4,b+j-4))j-=4;
+        while(j>i&&a[j-1]==b[j-1])--j;
+        __builtin_memcpy(b+i,a+i,uint64_t(j-i)*4);
+        if(int32_t(x0+i)<bx0)bx0=x0+int32_t(i);
+        if(int32_t(x0+j)>bx1)bx1=x0+int32_t(j);
+        if(y<by0)by0=y;
+        by1=y+1;
+    }
+    if(bx0<bx1&&by0<by1)out.Add({bx0,by0,bx1,by1});
+    return uint64_t(n)*uint32_t(y1-y0);
+}
 } // namespace brook::nvdisp

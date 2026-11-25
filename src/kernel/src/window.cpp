@@ -1277,7 +1277,7 @@ static void DestroyWindowLocked(int idx)
         if (bestIdx >= 0) FocusWindowLocked(bestIdx);
     }
     extern void CompositorMarkDirty();
-    CompositorMarkDirty();
+    CompositorMarkSceneChanged();
 }
 
 void WmDestroyWindow(int idx) {
@@ -1389,7 +1389,7 @@ static void FocusWindowLocked(int idx)
     }
 
     WmPushWmEvent(&g_windows[idx], WM_EVT_FOCUS_GAINED, 0, 0);
-    CompositorMarkDirty();
+    CompositorMarkSceneChanged();
     CompositorWake();
 }
 
@@ -1431,7 +1431,7 @@ static void SendToBackLocked(int idx)
     for (uint32_t i = 0; i < count; ++i)
         g_windows[sorted[i]].zOrder = (uint8_t)(i + 1);
     g_nextZOrder = (uint8_t)(count + 1);
-    CompositorMarkDirty();
+    CompositorMarkSceneChanged();
     CompositorWake();
 }
 
@@ -1489,10 +1489,10 @@ void WmSetClientSideDecoration(int idx, bool enable, bool captionOverlay,
     w.captionInsetTop = insetTop;
     w.captionHeight = captionHeight;
     w.captionStyle = captionStyle;
-    if (!modeChanged) { extern void CompositorMarkDirty(); CompositorMarkDirty(); return; }
+    if (!modeChanged) { CompositorMarkSceneChanged(); return; }
     // Mark compositor dirty so the chrome region repaints/clears next frame.
     extern void CompositorMarkDirty();
-    CompositorMarkDirty();
+    CompositorMarkSceneChanged();
     SerialPrintf("WM: window %d CSD=%d caption_overlay=%d inset=%u,%u height=%u\n", idx, (int)enable,
                  (int)captionOverlay, insetRight, insetTop, captionHeight);
 }
@@ -1511,7 +1511,7 @@ static void SetWindowPropertiesLocked(int idx, uint32_t mask, uint8_t opacity, u
     if ((mask & WM_PROP_BLUR)    && w.blurRadius != blurRadius) { w.blurRadius = blurRadius; changed = true; }
     if (!changed) return;
     extern void CompositorMarkDirty();
-    CompositorMarkDirty();
+    CompositorMarkSceneChanged();
 }
 
 void WmToggleFocusedWindowGlass()
@@ -1701,7 +1701,7 @@ static bool SetFullscreenLocked(int idx, bool enable)
     SerialPrintf("WM: window %d '%s' fullscreen=%d %ux%u at %d,%d\n", idx, w.title, (int)enable,
                  w.clientW, w.clientH, w.x, w.y);
     extern void CompositorMarkDirty();
-    CompositorMarkDirty();
+    CompositorMarkSceneChanged();
     return true;
 }
 
@@ -1767,7 +1767,7 @@ static void MoveWindowLocked(int idx, int16_t newX, int16_t newY)
     DockKeepOutLocked(w); // floating windows cannot be placed under a pinned dock
     w.proc->fbDestX=w.clientX();w.proc->fbDestY=w.clientY();
     extern void CompositorMarkDirty();
-    CompositorMarkDirty();
+    CompositorMarkSceneChanged();
 }
 
 void WmMoveWindow(int idx, int16_t newX, int16_t newY)
@@ -1867,7 +1867,7 @@ static bool ResizeWindowLocked(int idx, uint16_t newClientW, uint16_t newClientH
         // upscale handles it.
     }
     extern void CompositorMarkDirty();
-    CompositorMarkDirty();
+    CompositorMarkSceneChanged();
     return true;
 }
 
@@ -2005,7 +2005,7 @@ static void MinimizeWindowLocked(int idx)
         if (bestIdx >= 0) FocusWindowLocked(bestIdx);
     }
     extern void CompositorMarkDirty();
-    CompositorMarkDirty();
+    CompositorMarkSceneChanged();
 }
 
 static void RestoreWindowLocked(int idx)
@@ -2018,7 +2018,7 @@ static void RestoreWindowLocked(int idx)
     SerialPrintf("WM: restored window %d '%s'\n", idx, w.title);
     FocusWindowLocked(idx);
     extern void CompositorMarkDirty();
-    CompositorMarkDirty();
+    CompositorMarkSceneChanged();
 }
 
 void WmMinimizeWindow(int idx) { VfbGuard guard;MinimizeWindowLocked(idx); }
@@ -3367,7 +3367,7 @@ int WmResizeVfbForProcess(Process* proc, uint32_t wmId,
     outResult->vfbStride = w->vfbStride;
     // Client-accepted sizes can differ from the WM offer. Invalidate cached
     // caption geometry along with publishing the replacement client buffer.
-    CompositorMarkDirty();CompositorWake();
+    CompositorMarkSceneChanged();CompositorWake();
     return 0;
 }
 
@@ -3848,7 +3848,7 @@ bool WmSetAppIdById(Process* proc, uint32_t wmId, const char* appId)
     WmStrCopy(w->appId, appId, sizeof(w->appId));
     LauncherReadGuard catalog;
     RefreshWebAppTitle(*w, catalog.get());
-    CompositorMarkDirty();
+    CompositorMarkSceneChanged();
     CompositorWake();
     return true;
 }
@@ -3875,7 +3875,7 @@ void WmSetTitleById(Process* proc, uint32_t wmId, const char* title)
     WmStrCopy(w->title, title, sizeof(w->title));
     LauncherReadGuard catalog;
     RefreshWebAppTitle(*w, catalog.get());
-    CompositorMarkDirty();
+    CompositorMarkSceneChanged();
     CompositorWake();
 }
 

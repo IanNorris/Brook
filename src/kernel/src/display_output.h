@@ -77,12 +77,13 @@ struct DamageRect {
     }
 };
 
-// A bounded damage list. Overflowing it collapses the list into its
-// bounding rectangle, so damage is never lost, only widened. `full` asks the
+// A bounded damage list. Overflowing it merges the closest pair of rects
+// (least added area, the new one included), so damage is never lost, only widened
+// locally (damage on two outputs stays two rectangles). `full` asks the
 // output for a complete repaint that may not trust any shadow of its
 // previous contents (the rects then cover the whole area).
 struct DamageRects {
-    static constexpr uint32_t Max = 8;
+    static constexpr uint32_t Max = 16;
     uint32_t count = 0;
     bool full = false;
     DamageRect rects[Max]{};
@@ -108,17 +109,47 @@ struct DamageRects {
             if (r.x0 >= c.x0 && r.y0 >= c.y0 && r.x1 <= c.x1 && r.y1 <= c.y1) return;
         }
         if (count == Max) {
-            DamageRect b{};
-            Bounds(&b);
-            if (r.x0 < b.x0) b.x0 = r.x0;
-            if (r.y0 < b.y0) b.y0 = r.y0;
-            if (r.x1 > b.x1) b.x1 = r.x1;
-            if (r.y1 > b.y1) b.y1 = r.y1;
-            count = 1;
-            rects[0] = b;
+            // Merge the pair (among the list and the new rect) whose union adds the least
+            // area, so a far-away rect (another output) keeps its own slot.
+            DamageRect all[Max + 1];
+            for (uint32_t i = 0; i < count; ++i) all[i] = rects[i];
+            all[count] = r;
+            const uint32_t n = count + 1;
+            uint32_t bi = 0, bj = 1;
+            int64_t best = -1;
+            for (uint32_t i = 0; i < n; ++i)
+                for (uint32_t j = i + 1; j < n; ++j) {
+                    const int64_t g = Area(Union(all[i], all[j])) - Area(all[i]) - Area(all[j]);
+                    if (best < 0 || g < best) { best = g; bi = i; bj = j; }
+                }
+            all[bi] = Union(all[bi], all[bj]);
+            count = 0;
+            for (uint32_t i = 0; i < n; ++i) {
+                if (i == bj) continue;
+                const DamageRect& c = all[i];
+                const DamageRect& m = all[bi];
+                if (i != bi && c.x0 >= m.x0 && c.y0 >= m.y0 && c.x1 <= m.x1 && c.y1 <= m.y1) continue;
+                rects[count++] = c;
+            }
             return;
         }
         rects[count++] = r;
+    }
+    void AddAll(const DamageRects& o) {
+        for (uint32_t i = 0; i < o.count; ++i) Add(o.rects[i]);
+        full = full || o.full;
+    }
+    uint64_t Pixels() const {
+        uint64_t n = 0;
+        for (uint32_t i = 0; i < count; ++i) n += uint64_t(Area(rects[i]));
+        return n;
+    }
+    static constexpr int64_t Area(const DamageRect& r) {
+        return r.empty() ? 0 : int64_t(r.x1 - r.x0) * int64_t(r.y1 - r.y0);
+    }
+    static constexpr DamageRect Union(const DamageRect& a, const DamageRect& b) {
+        return {a.x0 < b.x0 ? a.x0 : b.x0, a.y0 < b.y0 ? a.y0 : b.y0,
+                a.x1 > b.x1 ? a.x1 : b.x1, a.y1 > b.y1 ? a.y1 : b.y1};
     }
     // Damage of full-width rows [minY, maxY) of a `width` wide desktop: the
     // compositor's row span expressed as a rect list.

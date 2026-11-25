@@ -56,6 +56,7 @@ void KMutexLock(KMutex*) { CHECK(lockDepth++ < 2); }
 void KMutexUnlock(KMutex*) { CHECK(lockDepth-- > 0); }
 extern "C" void CompositorWake() { ++wakes; }
 void CompositorMarkDirty() { ++dirty; }
+void CompositorMarkSceneChanged() { CompositorMarkDirty(); }
 // Launcher save runs the real worker step against a minimal owned home.
 static Vnode layoutFile{}, layoutDirectory{};
 static char layoutText[LauncherLayoutLimit];

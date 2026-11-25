@@ -206,6 +206,9 @@ struct NvPresenterState{
     // <18 ms (60 Hz), <35, <51, >=51; plus average and max.
     uint64_t lastUs=0,sumUs=0;uint32_t intervals=0,maxUs=0,hist[4]{};
     uint64_t cpuNs=0;uint32_t cpuMaxUs=0;   // inside the present (lock, copy, flip)
+    // RAM copy of what this head shows (ShadowDiff); invalid until the first full present.
+    uint32_t* shadow=nullptr;bool shadowValid=false;
+    uint64_t compared=0,copiedBytes=0,diffNs=0,copyNs=0;uint32_t unchanged=0,fullDiffs=0,copyMaxUs=0;
 };
 NvPresenterState g_presenter[nvdisp::kDriverOutputs]{};
 // The compositor loop hook (completion, queued arms, wake time).
@@ -259,17 +262,33 @@ int PresentOutput(uint32_t o,const uint32_t* src,uint32_t srcStride,const Damage
     const int8_t bb=f.Back();
     if(bb<0){++p.noBuffer;SpinLockRelease(lock);return kPresenterBusy;}
     const uint32_t width=p.width,height=p.height;
-    DamageRects full;const DamageRects* damage=&damageIn;
-    if(p.needFull){full=DamageRects::Full(width,height);damage=&full;p.needFull=false;}
+    DamageRects input=damageIn;
+    if(p.needFull){input=DamageRects::Full(width,height);p.needFull=false;}
+    // Only what really changed against the shadow goes over the link (D3).
+    DamageRects changed;
+    const uint64_t d0=PresentNowNs();
+    if(!p.shadow||!p.shadowValid){
+        changed=DamageRects::Full(width,height);
+        if(p.shadow){for(uint32_t y=0;y<height;++y)__builtin_memcpy(p.shadow+uint64_t(y)*width,src+uint64_t(y)*srcStride,uint64_t(width)*4);p.shadowValid=true;}
+    }else{
+        if(input.full){input=DamageRects::Rows(0,height,width);++p.fullDiffs;}
+        for(uint32_t i=0;i<input.count;++i)p.compared+=nvdisp::ShadowDiff(src,srcStride,p.shadow,width,width,height,input.rects[i],changed);
+    }
+    const uint64_t d1=PresentNowNs();p.diffNs+=d1-d0;
+    if(changed.empty()){++p.unchanged;SpinLockRelease(lock);NoteCpu(p,t0);return 0;}
+    const DamageRects* damage=&changed;
     uint32_t* dst=p.px[bb];const uint32_t pitch=p.pitchPx;
+    uint64_t bytes=0;
     auto copy=[&](const DamageRect& r){
         const int32_t x0=r.x0<0?0:r.x0,y0=r.y0<0?0:r.y0;
         const int32_t x1=r.x1>int32_t(width)?int32_t(width):r.x1,y1=r.y1>int32_t(height)?int32_t(height):r.y1;
         if(x1<=x0||y1<=y0)return;
         for(int32_t y=y0;y<y1;++y)__builtin_memcpy(dst+uint64_t(y)*pitch+x0,src+uint64_t(y)*srcStride+x0,uint64_t(x1-x0)*4);
+        bytes+=uint64_t(x1-x0)*4*uint32_t(y1-y0);
     };
     (void)p.age.Apply(bb,*damage,width,height,copy);
     __asm__ volatile("sfence":::"memory");
+    {const uint64_t d2=PresentNowNs();p.copyNs+=d2-d1;p.copiedBytes+=bytes;if((d2-d1)/1000>p.copyMaxUs)p.copyMaxUs=uint32_t((d2-d1)/1000);}
     if(f.Present(bb)<0){g_driver.Tick();const bool live=g_driver.Live(o);SpinLockRelease(lock);return live?kPresenterBusy:-1;}
     ++p.frames;NoteFrame(p);
     SpinLockRelease(lock);
@@ -405,6 +424,9 @@ bool MapPresenter(NvPresenterState& p,nvdisp::NvWindowFlipper<LiveBackend>& f,co
     if(third.vram&&p.px[2])f.SetThird(third);
     p.nbuf=f.nbuf;p.pitchPx=a.pitch/4;p.width=a.width;p.height=a.height;
     p.age.Reset();p.lastUs=0;p.needFull=false;
+    if(!p.shadow){const VirtualAddress va=VmmAllocPages((uint64_t(a.width)*a.height*4+4095)/4096,VMM_WRITABLE|VMM_NO_EXEC,MemTag::Device,KernelPid);
+        p.shadow=va?reinterpret_cast<uint32_t*>(va.raw()):nullptr;}
+    p.shadowValid=false;   // the first present copies (and records) the whole head
     return true;
 }
 // Called with the nv-aux lock held.
@@ -477,7 +499,8 @@ StatsMark TakeMark(){
 }
 void PresenterStats(bool reset){
     const StatsMark now=TakeMark();
-    if(reset||!g_mark.us){g_mark=now;g_pollMaxUs=0;for(auto& p:g_presenter)p.cpuMaxUs=0;
+    const bool zero=reset||!g_mark.us;
+    if(zero){g_mark=now;g_pollMaxUs=0;for(auto& p:g_presenter){p.cpuMaxUs=0;p.compared=p.copiedBytes=p.diffNs=p.copyNs=0;p.unchanged=p.fullDiffs=p.copyMaxUs=0;}
         for(auto& v:g_wakeHist)v=0;for(auto& v:g_armLineHist)v=0;for(auto& v:g_busyHist)v=0;}
     const StatsMark& a=g_mark;
     const uint64_t us=now.us-a.us;
@@ -492,6 +515,29 @@ void PresenterStats(bool reset){
         l.raw(",\"hist\":[");for(uint32_t i=0;i<4;++i){if(i)l.raw(",");l.dec(now.hist[o][i]-a.hist[o][i]);}
         l.raw("],\"cpu_us\":");l.dec((now.cpuNs[o]-a.cpuNs[o])/1000);l.raw(",\"cpu_max_us\":");l.dec(g_presenter[o].cpuMaxUs);l.raw("}\n");
         DebugChannelSend(l.t);
+    }
+    for(uint32_t o=0;o<2;++o){
+        nvdisp::NvDisplayDriver<LiveBackend>::Line c;const auto& p=g_presenter[o];
+        c.raw("{\"nv_display\":\"stats_copy\",\"output\":");c.dec(o);c.raw(",\"compared_px\":");c.dec(p.compared);
+        c.raw(",\"copied_bytes\":");c.dec(p.copiedBytes);c.raw(",\"diff_us\":");c.dec(p.diffNs/1000);c.raw(",\"copy_us\":");c.dec(p.copyNs/1000);
+        c.raw(",\"copy_max_us\":");c.dec(p.copyMaxUs);c.raw(",\"unchanged\":");c.dec(p.unchanged);c.raw(",\"full_diffs\":");c.dec(p.fullDiffs);
+        c.raw(",\"busy\":");c.dec(p.busy);c.raw(",\"no_buffer\":");c.dec(p.noBuffer);c.raw("}\n");DebugChannelSend(c.t);
+    }
+    {   // compositor frame cost and escalations (zeroed with the window)
+        const CompositorFrameStats cs=CompositorReadFrameStats(zero);
+        nvdisp::NvDisplayDriver<LiveBackend>::Line c;
+        auto hist=[&](const char* k,const uint32_t (&h)[6]){c.raw(",\"");c.raw(k);c.raw("\":[");for(uint32_t i=0;i<6;++i){if(i)c.raw(",");c.dec(h[i]);}c.raw("]");};
+        c.raw("{\"nv_display\":\"stats_frame\",\"loops\":");c.dec(cs.loops);
+        c.raw(",\"compose_us\":");c.dec(cs.composeNs/1000);c.raw(",\"present_us\":");c.dec(cs.presentNs/1000);
+        c.raw(",\"compose_max\":");c.dec(cs.composeMaxUs);c.raw(",\"present_max\":");c.dec(cs.presentMaxUs);c.raw(",\"loop_max\":");c.dec(cs.loopMaxUs);
+        hist("compose",cs.composeHist);hist("present",cs.presentHist);hist("loop",cs.loopHist);
+        c.raw(",\"damage_mpx\":");c.dec(cs.damagePixels/1000000);c.raw("}\n");DebugChannelSend(c.t);
+        nvdisp::NvDisplayDriver<LiveBackend>::Line e;
+        e.raw("{\"nv_display\":\"stats_escalate\",\"flips\":");e.dec(cs.flips);e.raw(",\"full_flips\":");e.dec(cs.fullFlips);
+        e.raw(",\"all_marks\":");e.dec(cs.allMarks);e.raw(",\"force\":");e.dec(cs.fullForce);e.raw(",\"requested\":");e.dec(cs.fullRequested);
+        e.raw(",\"global\":");e.dec(cs.fullGlobal);e.raw(",\"gpu\":");e.dec(cs.fullGpu);e.raw(",\"hover_full\":");e.dec(cs.fullHover);
+        e.raw(",\"unexplained\":");e.dec(cs.sceneUnexplained);e.raw(",\"scene_local\":");e.dec(cs.sceneLocalized);
+        e.raw(",\"shell_local\":");e.dec(cs.shellLocalized);e.raw(",\"hover_local\":");e.dec(cs.hoverLocalized);e.raw("}\n");DebugChannelSend(e.t);
     }
     nvdisp::NvDisplayDriver<LiveBackend>::Line l;
     {nvdisp::NvDisplayDriver<LiveBackend>::Line t;t.raw("{\"nv_display\":\"stats_loop\",\"wake\":[");

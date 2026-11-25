@@ -160,16 +160,40 @@ static void GopShadowInvalidate(){g_gopShadowValid=false;++g_idleStats.shadowInv
 static uint32_t g_dirtyMinY = 0xFFFFFFFFu; // inclusive
 static uint32_t g_dirtyMaxY = 0;          // exclusive
 
+// D3: the same damage as a rectangle list (display_output.h), so a change on one output
+// does not make another output copy full-width rows, and a narrow change copies narrow
+// rects. The row span stays for the GOP row filter and the GPU path. g_dirtyAll: the whole
+// desktop (MarkAllDirty), kept as a flag rather than a rect so it never merges.
+static DamageRects g_dirtyRects{};
+static bool g_dirtyAll=false;
+static inline void MarkDirtyRect(int64_t x0, int64_t y0, int64_t x1, int64_t y1)
+{
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > int64_t(g_deskWidth)) x1 = g_deskWidth;
+    if (y1 > int64_t(g_deskHeight)) y1 = g_deskHeight;
+    if (x1 <= x0 || y1 <= y0) return;
+    if (uint32_t(y0) < g_dirtyMinY) g_dirtyMinY = uint32_t(y0);
+    if (uint32_t(y1) > g_dirtyMaxY) g_dirtyMaxY = uint32_t(y1);
+    g_dirtyRects.Add({int32_t(x0), int32_t(y0), int32_t(x1), int32_t(y1)});
+}
 static inline void MarkDirtyRows(uint32_t minY, uint32_t maxY)
 {
-    if (minY < g_dirtyMinY) g_dirtyMinY = minY;
-    if (maxY > g_dirtyMaxY) g_dirtyMaxY = maxY;
+    MarkDirtyRect(0, minY, g_deskWidth, maxY);
 }
 
 static inline void MarkAllDirty()
 {
     g_dirtyMinY = 0;
     g_dirtyMaxY = g_deskHeight;
+    g_dirtyAll = true;
+}
+static inline void ClearDirty()
+{
+    g_dirtyMinY = 0xFFFFFFFFu;
+    g_dirtyMaxY = 0;
+    g_dirtyRects = DamageRects{};
+    g_dirtyAll = false;
 }
 
 // Full-repaint flag: set when the scene structure changes (window moved,
@@ -1574,10 +1598,8 @@ static bool BlitProcess(Process* proc, bool forceAll)
 
     if (startDx >= endDx || startDy >= endDy) return false;
 
-    // Track dirty scanlines for this blit.
-    uint32_t blitMinY = static_cast<uint32_t>(dstY0) + startDy;
-    uint32_t blitMaxY = static_cast<uint32_t>(dstY0) + endDy;
-    MarkDirtyRows(blitMinY, blitMaxY);
+    // Track the dirty rectangle of this blit.
+    MarkDirtyRect(int64_t(dstX0) + startDx, int64_t(dstY0) + startDy, int64_t(dstX0) + endDx, int64_t(dstY0) + endDy);
 
     // Destination surface: backbuffer (fast cached RAM) or MMIO FB (slow).
     uint32_t*       dstBase   = g_backBuffer ? g_backBuffer : const_cast<uint32_t*>(g_physFb);
@@ -1651,8 +1673,8 @@ static bool BlitProcessAt(Process* proc, int dstX0, int dstY0, bool forceAll,
     if (upscale <= 1)
     {
         // 1:1 blit (fast path)
-        MarkDirtyRows(static_cast<uint32_t>(dstY0) + startDy,
-                      static_cast<uint32_t>(dstY0) + endDy);
+        MarkDirtyRect(int64_t(dstX0) + startDx, int64_t(dstY0) + startDy,
+                      int64_t(dstX0) + endDx, int64_t(dstY0) + endDy);
 
         uint32_t copyWidth = (endDx - startDx) * 4;
         for (uint32_t dy = startDy; dy < endDy; ++dy)
@@ -1667,8 +1689,8 @@ static bool BlitProcessAt(Process* proc, int dstX0, int dstY0, bool forceAll,
     else
     {
         // Nearest-neighbor upscale
-        MarkDirtyRows(static_cast<uint32_t>(dstY0) + startDy,
-                      static_cast<uint32_t>(dstY0) + endDy);
+        MarkDirtyRect(int64_t(dstX0) + startDx, int64_t(dstY0) + startDy,
+                      int64_t(dstX0) + endDx, int64_t(dstY0) + endDy);
 
         for (uint32_t dy = startDy; dy < endDy; ++dy)
         {
@@ -1706,7 +1728,7 @@ static bool BlitWindowVfb(const uint32_t* src,
     if (clip.empty()) return false;
     const uint32_t sourceX=static_cast<uint32_t>(clip.left-static_cast<int64_t>(dstX0));
     const uint32_t rowLen=static_cast<uint32_t>(clip.right-clip.left);
-    MarkDirtyRows(static_cast<uint32_t>(clip.top),static_cast<uint32_t>(clip.bottom));
+    MarkDirtyRect(clip.left,clip.top,clip.right,clip.bottom);
 
     for (int64_t y=clip.top; y<clip.bottom; ++y)
     {
@@ -1797,7 +1819,7 @@ static void BlitWallpaperRegion(const SceneRect& region)
     for(int64_t y=clip.top;y<clip.bottom;++y) {
         DeskBackdropSpan(dst+y*stride+clip.left,uint32_t(clip.left),uint32_t(clip.right),uint32_t(y));
     }
-    MarkDirtyRows(static_cast<uint32_t>(clip.top),static_cast<uint32_t>(clip.bottom));
+    MarkDirtyRect(clip.left,clip.top,clip.right,clip.bottom);
 }
 
 // ---------------------------------------------------------------------------
@@ -2572,6 +2594,89 @@ static void TraceDesktopCycle(FrameGpuStage stage,uint64_t tick)
         ProfilerTraceGpu(ProcessCurrent()->pid,stage,desktopTraceCycle,tick);
 }
 #endif
+// ---- D3 frame cost (stutter with windows open). A window move, resize, raise, focus or
+// decoration change used to request a full scene repaint (CompositorMarkDirty): the
+// wallpaper and every window over the whole 7680x2160 desktop, then full copies on both
+// heads. Window-state changes now call CompositorMarkSceneChanged; the loop diffs a
+// per-window snapshot (geometry and everything the chrome draws from) against the last
+// composed frame and repaints only the old and new rectangles of the windows that changed
+// (the CPU partial path: wallpaper under the region, then every intersecting layer).
+// Global state (desktop size, scale metrics, material, wallpaper, backdrop) changing, or a
+// scene request the diff cannot explain, still repaints fully. Shell-surface moves and
+// caption-hover changes are localised the same way.
+static volatile bool g_sceneChanged=false;
+void CompositorMarkSceneChanged()
+{
+    if(!WmIsActive()){CompositorMarkDirty();return;}
+    __atomic_store_n(&g_sceneChanged,true,__ATOMIC_RELEASE);
+}
+struct SceneWindowSnap{bool live;DamageRect rect;uint64_t hash;};
+static SceneWindowSnap g_sceneSnap[WM_MAX_WINDOWS]{};
+static uint64_t g_sceneGlobal=0;
+static bool g_sceneSnapValid=false;
+static inline uint64_t SceneMix(uint64_t h,uint64_t v){return (h^v)*0x100000001b3ull+(h>>29);}
+static uint64_t SceneMixText(uint64_t h,const char* t,uint32_t cap){for(uint32_t i=0;i<cap&&t[i];++i)h=SceneMix(h,uint8_t(t[i]));return h;}
+static uint64_t WindowSceneHash(const Window& w)
+{
+    uint64_t h=0xcbf29ce484222325ull;
+    h=SceneMix(h,reinterpret_cast<uintptr_t>(w.proc));h=SceneMix(h,w.creationIdentity);
+    h=SceneMix(h,reinterpret_cast<uintptr_t>(w.metrics));
+    h=SceneMix(h,uint64_t(uint16_t(w.x))|uint64_t(uint16_t(w.y))<<16|uint64_t(w.clientW)<<32|uint64_t(w.clientH)<<48);
+    h=SceneMix(h,w.zOrder);h=SceneMix(h,uint64_t(w.upscale)|uint64_t(w.opacity)<<8|uint64_t(w.blurRadius)<<16|uint64_t(w.state)<<24);
+    h=SceneMix(h,uint64_t(w.focused)|uint64_t(w.noChrome)<<1|uint64_t(w.captionOverlay)<<2|uint64_t(w.fullscreen)<<3|
+                 uint64_t(w.docked)<<4|uint64_t(w.focusable)<<5);
+    h=SceneMix(h,uint64_t(w.captionInsetRight)|uint64_t(w.captionInsetTop)<<16|uint64_t(w.captionHeight)<<32);
+    h=SceneMix(h,w.captionStyle);h=SceneMix(h,w.captionStripRevision);
+    h=SceneMixText(h,w.title,sizeof(w.title));h=SceneMixText(h,w.webAppTitle,sizeof(w.webAppTitle));
+    return h;
+}
+// Diffs the windows against the last composed frame, adding the old and new outer rects of
+// every changed window to `out`. Returns false when global state changed (or there is no
+// snapshot yet): the caller repaints fully.
+static bool SceneDiffWindows(DamageRects& out,uint32_t& changed)
+{
+    uint64_t g=0x84222325cbf29ce4ull;
+    g=SceneMix(g,uint64_t(g_deskWidth)|uint64_t(g_deskHeight)<<32);g=SceneMix(g,reinterpret_cast<uintptr_t>(&WmDesktopMetrics()));
+    g=SceneMix(g,uint64_t(__atomic_load_n(&g_materialFrame,__ATOMIC_ACQUIRE)));g=SceneMix(g,reinterpret_cast<uintptr_t>(g_wallpaper));
+    g=SceneMix(g,uint64_t(g_wallpaperWidth)|uint64_t(g_wallpaperHeight)<<32);g=SceneMix(g,g_backdropGeneration);
+    g=SceneMix(g,WmBackdropStyleVersion());g=SceneMix(g,g_deskOutputCount);
+    const bool same=g_sceneSnapValid && g==g_sceneGlobal;
+    changed=0;
+    for(uint32_t i=0;i<WM_MAX_WINDOWS;++i){
+        const Window* w=WmGetWindow(int(i));
+        SceneWindowSnap now{};
+        if(w && w->visible && !w->minimized){
+            now.live=true;now.hash=WindowSceneHash(*w);
+            const SceneRect r=SceneRect{w->x,w->y,int64_t(w->x)+w->outerWidth(),int64_t(w->y)+w->outerHeight()}.clipped(g_deskWidth,g_deskHeight);
+            now.rect={int32_t(r.left),int32_t(r.top),int32_t(r.right),int32_t(r.bottom)};
+        }
+        SceneWindowSnap& was=g_sceneSnap[i];
+        if(now.live!=was.live || now.hash!=was.hash || !(now.rect==was.rect)){
+            ++changed;
+            if(was.live)out.Add(was.rect);
+            if(now.live)out.Add(now.rect);
+        }
+        was=now;
+    }
+    g_sceneGlobal=g;g_sceneSnapValid=true;
+    return same;
+}
+// Localised shell-surface geometry changes, collected by the shell diff for this frame.
+static DamageRects g_shellSceneDamage{};
+static CompositorFrameStats g_frameStats{};
+static uint64_t FrameNowNs(){return TscClockAvailable()?TscClockReadNs():ApicTickCount()*1000000ull;}
+static inline void FrameHist(uint32_t (&h)[6],uint64_t us){++h[us<2000?0:us<4000?1:us<8000?2:us<12000?3:us<17000?4:5];}
+static void NoteFrameDamage(const DamageRects& d,bool full,bool all)
+{
+    auto& f=g_frameStats;++f.flips;f.damagePixels+=d.full?uint64_t(g_deskWidth)*g_deskHeight:d.Pixels();
+    if(full)++f.fullFlips;else if(all)++f.allMarks;
+}
+CompositorFrameStats CompositorReadFrameStats(bool reset)
+{
+    CompositorMutexGuard geometry(&g_scanoutMappingLock);
+    const auto s=g_frameStats;if(reset)g_frameStats={};return s;
+}
+
 static void CompositorLoopWM(bool& clientFrame)
 {
     // Apply movement/focus/resize before rendering either chrome or content.
@@ -2618,8 +2723,18 @@ static void CompositorLoopWM(bool& clientFrame)
             changed = !DesktopOverlaySlotEqual(shell.slots[i], previous);
         }
         if (changed) {
+            // The pixels under the old and new rectangles need the scene again (D3: only
+            // those, not a full repaint).
+            for (uint32_t i = 0; i < shown.count; ++i) {
+                const auto& r = shown.slots[i].rect;
+                g_shellSceneDamage.Add({r.x, r.y, int32_t(r.x + r.width), int32_t(r.y + r.height)});
+            }
+            for (uint32_t i = 0; i < shell.count; ++i) {
+                const auto& r = shell.slots[i].rect;
+                g_shellSceneDamage.Add({r.x, r.y, int32_t(r.x + r.width), int32_t(r.y + r.height)});
+            }
+            ++g_frameStats.shellLocalized;
             DesktopOverlayCommitSurfaces(shown, shell.slots, shell.count);
-            CompositorMarkDirty();
         }
     }
     // A renderer holding the present lease owns the screen: the back buffer is
@@ -2655,8 +2770,20 @@ static void CompositorLoopWM(bool& clientFrame)
 
     // Determine if we need a full scene repaint (wallpaper + all windows)
     // or can get away with only re-blitting windows whose VFB content changed.
-    bool fullRepaint = forceAll
-                     || __atomic_exchange_n(&g_needsFullRepaint, false, __ATOMIC_ACQ_REL);
+    const bool requested = __atomic_exchange_n(&g_needsFullRepaint, false, __ATOMIC_ACQ_REL);
+    const bool sceneRequested = __atomic_exchange_n(&g_sceneChanged, false, __ATOMIC_ACQ_REL);
+    DamageRects sceneDamage = g_shellSceneDamage;
+    g_shellSceneDamage = DamageRects{};
+    uint32_t windowsChanged = 0;
+    const bool sceneGlobalSame = SceneDiffWindows(sceneDamage, windowsChanged);
+    const bool canLocalise = !CompositorGpuActive() && !skipCpuScene;
+    bool fullRepaint = forceAll || requested;
+    if (forceAll) ++g_frameStats.fullForce;
+    else if (requested) ++g_frameStats.fullRequested;
+    else if (!sceneGlobalSame) { fullRepaint = true; ++g_frameStats.fullGlobal; }
+    else if (!canLocalise && (sceneRequested || !sceneDamage.empty())) { fullRepaint = true; ++g_frameStats.fullGpu; }
+    else if (sceneRequested && !windowsChanged && sceneDamage.empty()) { fullRepaint = true; ++g_frameStats.sceneUnexplained; }
+    else if (windowsChanged) ++g_frameStats.sceneLocalized;
 
     // Caption-button hover: when the pointer moves onto/off a titlebar button (or
     // to a different button/window), the chrome must be redrawn so the hovered
@@ -2677,8 +2804,21 @@ static void CompositorLoopWM(bool& clientFrame)
             : 0xFFFFFFFFu;
         if (sig != g_lastHoverSig)
         {
+            // Repaint the windows whose caption buttons change (old and new), not the scene.
+            const uint32_t before = g_lastHoverSig;
             g_lastHoverSig = sig;
-            fullRepaint = true;
+            bool localised = canLocalise;
+            const uint32_t sigs[2] = {before, sig};
+            for (const uint32_t v : sigs) {
+                if (v == 0xFFFFFFFFu) continue;
+                const Window* hw = WmGetWindow(int(v >> 8));
+                if (!hw) continue;
+                const SceneRect r = SceneRect{hw->x, hw->y, int64_t(hw->x) + hw->outerWidth(),
+                                              int64_t(hw->y) + hw->outerHeight()}.clipped(g_deskWidth, g_deskHeight);
+                sceneDamage.Add({int32_t(r.left), int32_t(r.top), int32_t(r.right), int32_t(r.bottom)});
+            }
+            if (localised) ++g_frameStats.hoverLocalized;
+            else { fullRepaint = true; ++g_frameStats.fullHover; }
         }
     }
 
@@ -2721,6 +2861,8 @@ static void CompositorLoopWM(bool& clientFrame)
             const bool windowBuffer=__atomic_load_n(&w->vfb,__ATOMIC_ACQUIRE)!=nullptr;
             if(windowBuffer?w->vfbDirty:w->proc->fbDirty)cpuDamage.include(layers[i]);
         }
+        for(uint32_t i=0;i<sceneDamage.count;++i){const auto& r=sceneDamage.rects[i];
+            cpuDamage.include(SceneRect{r.x0,r.y0,r.x1,r.y1}.clipped(g_deskWidth,g_deskHeight));}
         cpuDamage=SceneDamageClosure(cpuDamage,layers,wcount);
         BlitWallpaperRegion(cpuDamage);
     }
@@ -2892,7 +3034,7 @@ static void CompositorLoopWM(bool& clientFrame)
             const uint32_t count = shell.count;
             auto mark = [](const DesktopOverlayRect& r) {
                 int x = r.x, y = r.y, w = r.width, h = r.height;
-                if (ClampScreenRect(x, y, w, h)) MarkDirtyRows(y, y + h);
+                if (ClampScreenRect(x, y, w, h)) MarkDirtyRect(x, y, x + w, y + h);
             };
             DesktopOverlaySurfacePlan plan{};
             if (cacheLocalShell) {
@@ -2906,7 +3048,7 @@ static void CompositorLoopWM(bool& clientFrame)
                     if (!ClampScreenRect(x, y, w, h)) return;
                     if (uint32_t(y) < g_shellUploadMinY) g_shellUploadMinY = y;
                     if (uint32_t(y + h) > g_shellUploadMaxY) g_shellUploadMaxY = y + h;
-                    MarkDirtyRows(y, y + h);
+                    MarkDirtyRect(x, y, x + w, y + h);
                 };
                 for (unsigned i = 0; i < plan.clearCount; ++i) dirtyShell(plan.clears[i]);
                 for (unsigned i = 0; i < count; ++i)
@@ -4662,7 +4804,7 @@ static void DrawPacingProbe()
             uint32_t* row=g_backBuffer+uint64_t(y0+y)*g_backBufStride+o.x;
             for(uint32_t x=0;x<o.w;++x)row[x]=x>=sq && x<sq+rows ? 0xffffffffu : 0xff202020u;
         }
-        MarkDirtyRows(y0,y0+rows);
+        MarkDirtyRect(o.x,y0,o.right(),y0+rows);
     }
 }
 
@@ -4815,7 +4957,8 @@ static bool CompositorFlipSoftware(bool clientFrame = false, bool hardwareCursor
     uint32_t minY=full?0:g_dirtyMinY;
     uint32_t maxY=full?g_deskHeight:g_dirtyMaxY;
     if(maxY>g_deskHeight)maxY=g_deskHeight;
-    g_dirtyMinY=0xFFFFFFFFu;g_dirtyMaxY=0;
+    const DamageRects rects=g_dirtyRects;const bool all=g_dirtyAll;
+    ClearDirty();
     if(minY>=maxY)return false;
     ++g_idleStats.softwareFlips;g_idleStats.rowsDirty+=maxY-minY;
     if(g_rendererCapsOwner)++g_cpuFramesOverRenderer; // a CPU frame while a renderer is registered
@@ -4823,7 +4966,11 @@ static bool CompositorFlipSoftware(bool clientFrame = false, bool hardwareCursor
     // Present the damage to every output, clipped to its rectangle. The row
     // span is the damage: full-width rows of the desktop.
     g_gopPresentShadow=shadow;
-    const DamageRects damage=full ? DamageRects::Full(g_deskWidth,g_deskHeight) : DamageRects::Rows(minY,maxY,g_deskWidth);
+    // Rect damage (D3); a whole-desktop mark or an empty list (a writer that set only the
+    // row span) falls back to full-width rows.
+    const DamageRects damage=full ? DamageRects::Full(g_deskWidth,g_deskHeight) :
+        (all || rects.empty()) ? DamageRects::Rows(minY,maxY,g_deskWidth) : rects;
+    NoteFrameDamage(damage,full,all);
     bool flushed=false;
     if constexpr (!OutputMultiSupported) {
         // The one output is the GOP adapter at 0,0: the damage needs no clip.
@@ -4919,6 +5066,7 @@ static void CompositorLoop()
     FrameTimingScope framePhase(FramePhase::Preparation);
     if (!g_physFb)
         return;
+    const uint64_t frameStartNs=FrameNowNs();
     CompositorExpirePresentLease();
     if (ShutdownReadyForManualPowerOff()) {
         static uint64_t presentedDisplay;
@@ -4988,11 +5136,10 @@ static void CompositorLoop()
     // GPU mode — the cursor is composited as a separate GPU sprite, never drawn
     // into g_backBuffer.
     if (g_cursorVisible && !CompositorGpuActive()) {
-        uint32_t oldMinY = (g_cursorSaveY >= 0) ? static_cast<uint32_t>(g_cursorSaveY) : 0;
-        uint32_t oldMaxY = static_cast<uint32_t>(g_cursorSaveY) + static_cast<uint32_t>(g_cursorSaveH);
-        if (oldMaxY > g_deskHeight) oldMaxY = g_deskHeight;
+        const int64_t oldX = g_cursorSaveX, oldY = g_cursorSaveY;
+        const int64_t oldW = g_cursorSaveW, oldH = g_cursorSaveH;
         CursorRestore();
-        MarkDirtyRows(oldMinY, oldMaxY);
+        MarkDirtyRect(oldX, oldY, oldX + oldW, oldY + oldH);
     }
 
     // Restore used the old frame's saved bounds. Publish the complete next
@@ -5102,10 +5249,8 @@ static void CompositorLoop()
         const bool displayOwned = !g_gopWriter && !g_presentLease.Active(ApicTickCount());
         hardwareCursor = DisplayPrepareCursor(displayOwned ? &g_cursorFrame : nullptr, mx, my);
         if (!hardwareCursor) {
-            const int32_t drawY = my - g_cursorFrame.hotY;
-            const int32_t endY = drawY + static_cast<int32_t>(g_cursorFrame.height);
-            if (endY > 0) MarkDirtyRows(drawY < 0 ? 0u : static_cast<uint32_t>(drawY),
-                                        static_cast<uint32_t>(endY));
+            const int64_t drawX = int64_t(mx) - g_cursorFrame.hotX, drawY = int64_t(my) - g_cursorFrame.hotY;
+            MarkDirtyRect(drawX, drawY, drawX + g_cursorFrame.width, drawY + g_cursorFrame.height);
             CursorDraw(mx, my);
         }
     } else {
@@ -5130,8 +5275,7 @@ static void CompositorLoop()
         // animation does not appear here.
         uint32_t dMinY = g_dirtyMinY;
         uint32_t dMaxY = g_dirtyMaxY;
-        g_dirtyMinY = 0xFFFFFFFFu;
-        g_dirtyMaxY = 0;
+        ClearDirty();
         CompositorPresentGPU(dMinY, dMaxY);
 
         // Periodic thumbnail dump for in-guest visual verification.
@@ -5149,7 +5293,16 @@ static void CompositorLoop()
     else
     {
         DrawPacingProbe();
+        const uint64_t composedNs=FrameNowNs();
         CompositorFlipSoftware(clientFrame, hardwareCursor);
+        const uint64_t endNs=FrameNowNs();
+        auto& f=g_frameStats;
+        const uint64_t compose=composedNs-frameStartNs,present=endNs-composedNs,loop=endNs-frameStartNs;
+        ++f.loops;f.composeNs+=compose;f.presentNs+=present;
+        if(compose/1000>f.composeMaxUs)f.composeMaxUs=uint32_t(compose/1000);
+        if(present/1000>f.presentMaxUs)f.presentMaxUs=uint32_t(present/1000);
+        if(loop/1000>f.loopMaxUs)f.loopMaxUs=uint32_t(loop/1000);
+        FrameHist(f.composeHist,compose/1000);FrameHist(f.presentHist,present/1000);FrameHist(f.loopHist,loop/1000);
     }
 
     const uint64_t probePresentEnd=ApicTickCount();
@@ -5329,7 +5482,9 @@ void CompositorWake()
 
 void CompositorMarkDirty()
 {
-    MarkAllDirty();
+    // In WM mode the full repaint marks everything dirty itself (BlitWallpaper), on the
+    // compositor thread; legacy (console) mode relies on the rows.
+    if (!WmIsActive()) MarkAllDirty();
     __atomic_store_n(&g_needsFullRepaint, true, __ATOMIC_RELEASE);
 }
 

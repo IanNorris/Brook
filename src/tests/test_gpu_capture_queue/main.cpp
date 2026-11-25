@@ -102,6 +102,7 @@ bool WmTrayTooltipGetRect(uint32_t,uint32_t,int32_t,int32_t,int32_t*,int32_t*,ui
 bool WmVolumePopupVisible(){return volumeVisible;}
 void WmVolumePopupGetRect(uint32_t,uint32_t,int32_t* x,int32_t* y,uint32_t* w,uint32_t* h){*x=4;*y=1;*w=2;*h=2;}
 bool WmPointerCaptureActive(){return false;}
+bool WmIsActive(){return false;}
 void WmGetShellTrayGeometry(uint32_t, uint32_t, int32_t, int32_t, WmShellTrayGeometry& out) { out = {}; }
 void DesktopDiskSetVisible(bool) {}
 void DesktopStatsSetVisible(DesktopStatsPanel) {}

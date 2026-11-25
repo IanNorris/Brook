@@ -113,6 +113,21 @@ void CompositorSetPrimaryPresenter(const CompositorPrimaryPresenter* presenter);
 // valid inside an OutputBackendOps::Present call (compositor thread, scanout lock held):
 // a flip backend for a non-primary output copies its damage from here (D3).
 const uint32_t* CompositorPresentSource(uint32_t* stridePixels);
+// D3 frame cost: a window-state change (move, resize, raise, focus, decoration, title):
+// the next frame repaints only what changed instead of the whole scene.
+void CompositorMarkSceneChanged();
+// Per-frame cost and why frames escalated (bridge `nv-disp driver desktop stats`).
+// Times are compositor-thread ns; hist bins <2,<4,<8,<12,<17,>=17 ms.
+struct CompositorFrameStats {
+    uint64_t loops, composeNs, presentNs;
+    uint32_t composeMaxUs, presentMaxUs, loopMaxUs;
+    uint32_t composeHist[6], presentHist[6], loopHist[6];
+    uint64_t flips, damagePixels;
+    uint32_t fullFlips, allMarks;               // scanout repair / lease frames; whole-desktop marks
+    uint32_t fullForce, fullRequested, fullGlobal, fullGpu, fullHover, sceneUnexplained;
+    uint32_t sceneLocalized, shellLocalized, hoverLocalized;
+};
+CompositorFrameStats CompositorReadFrameStats(bool reset);
 // Pacing probe: a moving square on every output, redrawn each compositor frame.
 void CompositorSetPacingProbe(bool on);
 bool CompositorPacingProbe();
