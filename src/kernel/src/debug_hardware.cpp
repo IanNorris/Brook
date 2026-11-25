@@ -862,7 +862,7 @@ static void NvGpuResetStatus(){
         kd("bridge",t.bridge);
         if(t.bridge){kh("bridge_bus",t.bb);kh("bridge_dev",t.bd);kd("bridge_fn",t.bf);kh("bridge_ctl",cfg.brd16(0x3e));}
         kd("mmio",t.pmc&&t.aon);
-        if(t.pmc&&t.aon&&(cfg.rd16(4)&2)){kh("pmc_enable",mmio.rd32(nvreset::kPmcEnable));kh("gfw_plm",mmio.rd32(nvreset::kGfwPlm));
+        if(t.pmc&&t.aon&&(cfg.rd16(4)&2)){kh("pmc_enable",mmio.rd32(nvreset::kPmcEnable));kh("pmc_intr0",mmio.rd32(0x100));kh("pmc_intr_en0",mmio.rd32(0x140));kh("gfw_plm",mmio.rd32(nvreset::kGfwPlm));
             kh("gfw_progress",mmio.rd32(nvreset::kGfwProgress));}
     }
     o.text("}\n");o.send();

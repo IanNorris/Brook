@@ -21,6 +21,7 @@
 #include "nv_gsp/nv_gsp_rm.h"
 #include "nv_gsp/nv_gsp_bar1.h"
 #include "nv_gsp/nv_gsp_m2.h"
+#include "nv_gsp/nv_gsp_m3.h"
 #include "../nv_gsp_fake/fake_gpu.h"
 #include "../nv_gsp_fake/fake_rm.h"
 #include "../nv_gsp_fake/synth_fw.h"
@@ -146,6 +147,26 @@ struct Rig {
             s->cpu = d.cpu; s->bus = d.bus; s->bytes = d.bytes; return true; };
         auto fence = [&] { return Wait(); };
         M2Result m = RunM2(gpu, kChipTu104, vram, in, ch.get(), rx.data(), uint32_t(rx.size()), wait, bell, mthd, fence, sync);
+        vram.Restore();
+        return m;
+    }
+    // M3: P5 + the copy-engine sequence on the same channel (small surface: the arena is 8 MiB).
+    M2Result M3(M3Plan& pl, M3Result& res) {
+        struct W { Rig* r; bool operator()() { return r->Wait(); } } wait{this};
+        GspDoorbell<fake_gpu::FakeGpu, NoSync> bell{gpu, kChipTu104, sync};
+        Pramin<fake_gpu::FakeGpu> vram(gpu, kChipTu104);
+        M2Inputs in;
+        in.si = last.si;
+        in.vram_lo = 0x100000000ull; in.vram_hi = 0x100100000ull;
+        auto sys = [&](M2Sys* s) { DmaRegion d; assert(arena(0x1000, &d)); s->cpu = d.cpu; s->bus = d.bus; s->bytes = d.bytes; };
+        sys(&in.gpfifo); sys(&in.push); sys(&in.sem);
+        auto mthd = [&](uint32_t bytes, M2Sys* s) { DmaRegion d; if (!arena(bytes, &d)) return false;
+            s->cpu = d.cpu; s->bus = d.bus; s->bytes = d.bytes; return true; };
+        auto fence = [&] { return Wait(); };
+        auto flush = [](uint8_t*, uint64_t) {};
+        M3Extra<decltype(flush)> ex{pl, res, flush};
+        budget = polls + 100000000;
+        M2Result m = RunM2(gpu, kChipTu104, vram, in, ch.get(), rx.data(), uint32_t(rx.size()), wait, bell, mthd, fence, sync, ex);
         vram.Restore();
         return m;
     }
@@ -331,6 +352,38 @@ int main(int argc, char** argv) {
         const uint32_t before = r.rm.rpcs;
         const M2Result m = r.M2();
         assert(!m.ok() && !std::strcmp(m.stage, "check") && r.rm.rpcs == before);
+    }
+    // ---- M3: copy object, mappings, full/rect/present copies through the fake CE, verified
+    {
+        Rig r(I, 0x1); r.last = r.Run(); assert(r.last.init_done);
+        M3Plan pl; pl.width = 320; pl.height = 180; pl.sx = 10; pl.sy = 7; pl.dx = 200; pl.dy = 100; pl.rw = 100; pl.rh = 60;
+        pl.pw = 320; pl.ph = 50; pl.repeats = 2;
+        const uint64_t surf = uint64_t(pl.width) * 4 * pl.height;
+        DmaRegion a, b; assert(r.arena(uint32_t(surf), &a) && r.arena(uint32_t(surf), &b));
+        pl.s = {a.cpu, a.bus, a.bytes}; pl.r = {b.cpu, b.bus, b.bytes};
+        pl.v1 = 0x101000000ull; pl.v2 = 0x102000000ull;
+        M3Result res;
+        const M2Result m = r.M3(pl, res);
+        if (!m.ok()) std::printf("M3: %s at %s / %s at %s host=%s\n", m.status, m.stage, res.status, res.step, r.rm.host_error.c_str());
+        assert(m.ok() && res.ok() && res.object && res.verify_full && res.verify_rect);
+        assert(m.allocated == 7 && m.freed == 7 && r.rm.objs.empty());
+        // 4 timed kinds x 2 repeats + 1 V2->R read-back
+        assert(r.rm.ce_launches == 4 * 2 + 1 + 2);
+        assert(res.s2v.n == 2 && res.s2v.bytes == surf && res.present.bytes == uint64_t(320) * 4 * 50);
+        assert(r.rm.sem_releases == 1 + r.rm.ce_launches);
+        // V1 holds the pattern, V2's rectangle came from V1(10,7)
+        assert(r.gpu.Vram32(0x101000000ull) == M3Pattern(0));
+        assert(r.gpu.Vram32(0x102000000ull + 100ull * 1280 + 200 * 4) == M3Pattern(7ull * 320 + 10));
+    }
+    {   // the copy object is refused: P5 objects still freed, nothing launched
+        Rig r(I, 0x1); r.last = r.Run(); assert(r.last.init_done);
+        r.rm.fail_class = 0xc5b5;
+        M3Plan pl; pl.width = 64; pl.height = 32; pl.sx = pl.sy = pl.dx = pl.dy = 0; pl.rw = 8; pl.rh = 8; pl.pw = 64; pl.ph = 8;
+        DmaRegion a, b; assert(r.arena(64 * 4 * 32, &a) && r.arena(64 * 4 * 32, &b));
+        pl.s = {a.cpu, a.bus, a.bytes}; pl.r = {b.cpu, b.bus, b.bytes}; pl.v1 = 0x101000000ull; pl.v2 = 0x102000000ull;
+        M3Result res;
+        const M2Result m = r.M3(pl, res);
+        assert(!m.ok() && !res.object && r.rm.ce_launches == 0 && r.rm.objs.empty() && m.fence_ok);
     }
     std::printf("test_nv_gsp_p4: OK (%s inputs%s)\n", I.real ? "real" : "synthetic", I.seq.empty() ? "" : ", real sequencer");
     return 0;

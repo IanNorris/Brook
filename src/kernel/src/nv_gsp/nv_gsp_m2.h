@@ -104,10 +104,18 @@ struct M2Result {
 
 // `need_mthdbuf(bytes, M2Sys*)` allocates the CE fault-method buffer once its size is known.
 // `fence_wait()` is one bounded poll step (false = budget exhausted).
-template <class Bus, class VramIo, class Waiter, class Doorbell, class MthdAlloc, class FenceWait, class Sync>
+struct M2NoExtra {
+    template <class B> bool premap(B&) { return true; }          // before SET_PAGE_DIRECTORY (no TLB invalidate needed)
+    template <class Ctx> bool operator()(Ctx&) { return true; }  // on the live channel after the P5 fence
+};
+
+// `extra(ctx)` runs on the live channel after the P5 fence and before teardown (M3);
+// ctx.alloc / ctx.map / ctx.submit are tracked like P5's own objects and freed with them.
+template <class Bus, class VramIo, class Waiter, class Doorbell, class MthdAlloc, class FenceWait, class Sync,
+          class Extra = M2NoExtra>
 inline M2Result RunM2(Bus& bus, const ChipOps& c, VramIo& vram, const M2Inputs& in, RpcChannel* ch, uint8_t* rx,
                       uint32_t rxcap, Waiter& wait, Doorbell& bell, MthdAlloc need_mthdbuf, FenceWait fence_wait,
-                      Sync& sync) {
+                      Sync& sync, Extra extra = Extra{}) {
     namespace rm = rm570;
     M2Result r;
     alignas(8) static uint8_t scratch[kRmApiBuf];
@@ -120,8 +128,9 @@ inline M2Result RunM2(Bus& bus, const ChipOps& c, VramIo& vram, const M2Inputs& 
     if (!in.gpfifo.cpu || !in.push.cpu || !in.sem.cpu) { r.status = "sysmem"; return r; }
     if (!VramRangeIsClient(si, in.vram_lo, in.vram_hi)) { r.status = "M2 VRAM range not in a client FB region"; return r; }
 
-    uint32_t live[8]; uint32_t parent[8]; uint32_t nlive = 0;
+    uint32_t live[12]; uint32_t parent[12]; uint32_t nlive = 0;
     auto alloc = [&](uint32_t hParent, uint32_t h, uint32_t cls, void* p, uint32_t n) {
+        if (nlive >= 12) return fail("too many objects");
         if (!api.Alloc(m2h::kClient, hParent, h, cls, p, n)) return fail("RM_ALLOC failed");
         live[nlive] = h; parent[nlive] = hParent; ++nlive; ++r.allocated; return true;
     };
@@ -198,6 +207,7 @@ inline M2Result RunM2(Bus& bus, const ChipOps& c, VramIo& vram, const M2Inputs& 
         !b.Map(kM2Va + 0x2000, in.sem.bus, 0x1000, 12, Aperture::SysCoh, 0, true)) {
         r.status = b.err ? b.err : "gmmu"; return finish();
     }
+    if (!extra.premap(b)) { r.status = b.err ? b.err : "M3 mappings"; return finish(); }
     r.pd3 = b.root; r.pt_pages = ptm.pages; r.ptes = b.ptes;
     for (uint64_t o = 0; o < 0x3000; o += 0x1000) {
         const Translation t = GmmuWalk(ptm, *c.gmmu, b.root, b.root_aper, kM2Va + o + 8);
@@ -299,6 +309,45 @@ inline M2Result RunM2(Bus& bus, const ChipOps& c, VramIo& vram, const M2Inputs& 
         r.sem_value = __atomic_load_n(&sem[0], __ATOMIC_ACQUIRE);
         r.gp_get = vram.rd32(r.userd + h::USERD_GP_GET);
         if (!r.fence_ok) r.status = "semaphore not released";
+    }
+    if (r.fence_ok) {
+        // ---- M3 hook: more objects, mappings and submissions on the same channel
+        struct Ctx {
+            Bus& bus; const ChipOps& c; VramIo& vram; const M2Inputs& in; M2Result& r; GmmuBuilder<M2PtMem<VramIo>>& b; Sync& sync;
+            FenceWait& poll; decltype(alloc)& alloc_fn; const RmEvents& ev;
+            uint32_t gp = 1, payload = kM2Payload;
+            uint32_t ce_engine() const { return r.ce_engine; }
+            uint32_t channel() const { return m2h::kChannel; }
+            bool alloc(uint32_t hParent, uint32_t h, uint32_t cls, void* p, uint32_t n) { return alloc_fn(hParent, h, cls, p, n); }
+            // Push `n` words (+ a host semaphore release after WFI), ring, wait. us = doorbell -> semaphore.
+            bool submit(const uint32_t* w, uint32_t n, uint32_t budget_us, uint64_t* us) {
+                namespace h = rm570::host;
+                if (n + 8 > 1024 || gp + 1 >= 0x1000 / 8) return false;
+                uint32_t* p = reinterpret_cast<uint32_t*>(in.push.cpu);
+                for (uint32_t i = 0; i < n; ++i) p[i] = w[i];
+                const uint32_t want = ++payload;
+                uint32_t k = n;
+                p[k++] = h::IncHeader(0, h::SEM_ADDR_LO, 3);
+                p[k++] = uint32_t(kM2Va + 0x2000); p[k++] = uint32_t((kM2Va + 0x2000) >> 32); p[k++] = want;
+                p[k++] = h::IncHeader(0, h::SEM_EXECUTE, 1); p[k++] = h::SEM_EXECUTE_RELEASE | h::SEM_EXECUTE_RELEASE_WFI;
+                uint32_t* g = reinterpret_cast<uint32_t*>(in.gpfifo.cpu) + gp * 2;
+                const uint64_t pva = kM2Va + 0x1000;
+                g[0] = uint32_t(pva); g[1] = uint32_t(pva >> 32) | (k << 10);
+                sync();
+                ++gp;
+                uint32_t* sem = reinterpret_cast<uint32_t*>(in.sem.cpu);
+                const uint64_t t0 = bus.now_us();
+                vram.wr32(r.userd + h::USERD_GP_PUT, gp);
+                bus.wr32(c.usermode + h::kDoorbell, r.token);
+                for (;;) {
+                    if (__atomic_load_n(&sem[0], __ATOMIC_ACQUIRE) == want) { *us = bus.now_us() - t0; return true; }
+                    if (bus.now_us() - t0 > budget_us) { *us = bus.now_us() - t0; return false; }
+                    (void)poll();
+                }
+            }
+        } ctx{bus, c, vram, in, r, b, sync, fence_wait, alloc, api.ev};
+        r.stage = "extra";
+        if (!extra(ctx)) { if (r.ok()) r.status = "M3 step failed"; return finish(); }
     }
     r.stage = r.fence_ok ? "done" : r.stage;
     return finish();

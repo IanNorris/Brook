@@ -318,6 +318,15 @@ private:
                 if (!st && pdb_aper == 9) st = kErrInvalidArgument;   // VAS without a page directory
                 break;
             }
+            case 0xc5b5: {   // TURING_DMA_COPY_A under the channel, {version 1, engineType = the channel's CE}
+                need(8); parent_is(rm::TURING_CHANNEL_GPFIFO_A);
+                if (st) break;
+                rm::NV_CHANNEL_ALLOC_PARAMS c; std::memcpy(&c, objs[hParent].params.data(), sizeof(c));
+                uint32_t eng = c.engineType;
+                if (!eng) { auto g = objs.find(objs[hParent].parent); if (g != objs.end()) eng = R32(g->second.params.data() + 12); }
+                if (R32(p) != 1 || R32(p + 4) != eng) st = kErrInvalidArgument;
+                break;
+            }
             default: st = kErrNotSupported; break;
         }
         if (cls == fail_class) st = kErrInvalidArgument;
@@ -429,6 +438,51 @@ private:
         if (!t.ok || t.aper != brook::nvgsp::Aperture::SysCoh) return nullptr;
         return Mut(t.pa, n);
     }
+    // VA -> (aperture, physical); VRAM through the fake's VRAM pages, sysmem through DMA.
+    bool Xlate(uint64_t va, brook::nvgsp::Aperture* a, uint64_t* pa) {
+        PtMem m{g_};
+        const auto t = brook::nvgsp::GmmuWalk(m, brook::nvgsp::kGmmuV2, pdb,
+                                              pdb_aper == 0 ? brook::nvgsp::Aperture::Video : brook::nvgsp::Aperture::SysCoh, va);
+        if (!t.ok) return false;
+        *a = t.aper; *pa = t.pa; return true;
+    }
+    bool CeRead32(uint64_t va, uint32_t* v) {
+        brook::nvgsp::Aperture a; uint64_t pa;
+        if (!Xlate(va, &a, &pa)) return false;
+        if (a == brook::nvgsp::Aperture::Video) { *v = g_.Vram32(pa); return true; }
+        const uint8_t* d = g_.Dma(pa, 4); if (!d) return false; *v = R32(d); return true;
+    }
+    bool CeWrite32(uint64_t va, uint32_t v) {
+        brook::nvgsp::Aperture a; uint64_t pa;
+        if (!Xlate(va, &a, &pa)) return false;
+        if (a == brook::nvgsp::Aperture::Video) { g_.SetVram32(pa, v); return true; }
+        uint8_t* d = Mut(pa, 4); if (!d) return false; W32(d, v); return true;
+    }
+  public:
+    uint32_t ce_class = 0; uint32_t ce_m[8] = {}; size_t ce_launches = 0; uint64_t ce_bytes = 0;
+    bool CeMethod(uint32_t m, uint32_t d) {
+        if (m == 0) { if (d != 0xc5b5) return HostFail("SET_OBJECT class");
+            bool have = false; for (auto& kv : objs) if (kv.second.cls == 0xc5b5) have = true;
+            if (!have) return HostFail("SET_OBJECT without a copy object"); ce_class = d; return true; }
+        if (!ce_class) return HostFail("CE method before SET_OBJECT");
+        if (m >= 0x400 && m <= 0x41c) { ce_m[(m - 0x400) / 4] = d; return true; }
+        if (m != 0x300) return HostFail("CE method");
+        // LAUNCH_DMA: only the pitch-linear, virtual, non-pipelined + flush, multi-line form Brook uses
+        if (d != (2u | 4u | (1u << 7) | (1u << 8) | (1u << 9))) return HostFail("LAUNCH_DMA flags");
+        const uint64_t src = (uint64_t(ce_m[0] & 0xff) << 32) | ce_m[1], dst = (uint64_t(ce_m[2] & 0xff) << 32) | ce_m[3];
+        const uint32_t pin = ce_m[4], pout = ce_m[5], len = ce_m[6], lines = ce_m[7];
+        if (len & 3) return HostFail("line length");
+        for (uint32_t y = 0; y < lines; ++y)
+            for (uint32_t x = 0; x < len; x += 4) {
+                uint32_t v;
+                if (!CeRead32(src + uint64_t(y) * pin + x, &v) || !CeWrite32(dst + uint64_t(y) * pout + x, v)) {
+                    ++mmu_faults; return HostFail("CE address not mapped");
+                }
+            }
+        ++ce_launches; ce_bytes += uint64_t(len) * lines;
+        return true;
+    }
+    size_t mmu_faults = 0;
     bool Host() {
         namespace rm = brook::nvgsp::rm570;
         while (doorbells_seen < g_.doorbells.size()) {
@@ -454,8 +508,11 @@ private:
                     const uint32_t h = R32(pb + 4 * i++);
                     if ((h >> 29) != 1) return HostFail("push header");
                     const uint32_t cnt = (h >> 16) & 0x1fff; uint32_t m = (h & 0xfff) << 2;
+                    const uint32_t subc = (h >> 13) & 7;
                     for (uint32_t k = 0; k < cnt; ++k, m += 4) {
                         const uint32_t d = R32(pb + 4 * i++);
+                        if (subc == 4) { if (!CeMethod(m, d)) return false; continue; }
+                        if (subc != 0) return HostFail("subchannel");
                         if (m == rm::host::NOP) ++nops;
                         else if (m == rm::host::SEM_ADDR_LO) sem_lo = d;
                         else if (m == rm::host::SEM_ADDR_HI) sem_hi = d;

@@ -29,6 +29,7 @@
 #include "nv_gsp/nv_gsp_rm.h"
 #include "nv_gsp/nv_gsp_bar1.h"
 #include "nv_gsp/nv_gsp_m2.h"
+#include "nv_gsp/nv_gsp_m3.h"
 #include "nv_disp_live.h"
 #include "platform_power.h"
 #include "serial.h"
@@ -847,7 +848,22 @@ struct PraminIo {   // VramIo over the BAR0 window (nv_gsp_bar1.h Pramin)
     uint32_t rd32(uint64_t a) { return p.rd32(a); }
     void wr32(uint64_t a, uint32_t v) { p.wr32(a, v); }
 };
-void P5(uint32_t chid, bool dev) {
+// M3 buffers: contiguous, 2 MiB aligned (one PTE per 2 MiB), never freed (once per boot).
+bool M3Sys(uint64_t bytes, M3Buf* b) {
+    const uint64_t pages = (bytes + 0x1fffff) / 4096 + 512;
+    const PhysicalAddress p = PmmAllocPages(pages, MemTag::Device, KernelPid);
+    if (!p) return false;
+    const uint64_t a = (p.raw() + 0x1fffff) & ~0x1fffffull;
+    if (a + bytes > (1ull << 39)) return false;
+    b->bus = a; b->cpu = reinterpret_cast<uint8_t*>(PhysToVirt(PhysicalAddress(a)).raw());
+    b->bytes = (bytes + 0x1fffff) & ~0x1fffffull;
+    return true;
+}
+void RateJson(Out& o, const char* k, const M3Rate& r) {
+    o.k(k); o.raw("{"); o.kd("bytes", r.bytes); o.kd("best_us", r.best_us); o.kd("avg_us", r.n ? r.sum_us / r.n : 0);
+    o.kd("n", r.n); o.kd("mb_per_s", r.mbps()); o.raw("}");
+}
+void P5(uint32_t chid, bool dev, bool m3 = false) {
     Out o; o.raw("{\"nv_gsp\":\"p5\"");
     const ChipOps* c = ChipForBoot0(g_bus.rd32(0));
     if (!c || !g_rmRunning || !g_staticValid) { o.ks("refused", "GSP-RM is not running this boot"); o.send(); return; }
@@ -867,11 +883,23 @@ void P5(uint32_t chid, bool dev) {
     auto mthd = [](uint32_t bytes, M2Sys* m) { DmaRegion d; if (!RmAlloc(bytes, &d)) return false;
         m->cpu = d.cpu; m->bus = d.bus; m->bytes = d.bytes; return true; };
     const uint64_t fenceEnd = NowUs() + 2000000;
-    auto fence = [&] { FlushRange(in.sem.cpu, 64); g_bus.udelay(20); return NowUs() < fenceEnd; };
+    auto fence = [&] { FlushRange(in.sem.cpu, 64); g_bus.udelay(5); return NowUs() < fenceEnd; };
     struct SubmitSync { M2Inputs& in; void operator()() {
         FlushRange(in.gpfifo.cpu, 0x1000); FlushRange(in.push.cpu, 0x1000); FlushRange(in.sem.cpu, 0x1000); } } ss{in};
-    KPrintf("nv-gsp: P5 (M2 objects, NOP + semaphore) starting\n");
-    const M2Result m = RunM2(g_bus, *c, vio, in, g_rm->ch, g_rm->rx, g_rm->rxcap, wait, bell, mthd, fence, ss);
+    M3Plan pl; M3Result m3r;
+    if (m3) {
+        const uint64_t surf = uint64_t(pl.width) * pl.bpp * pl.height;
+        pl.v1 = 0x101000000ull; pl.v2 = 0x104000000ull;                   // 4 GiB + 16 / + 64 MiB, client FB
+        if (!M3Sys(surf, &pl.s) || !M3Sys(surf, &pl.r)) { SpinLockRelease(lock); o.ks("refused", "no M3 sysmem"); o.send(); return; }
+        if (!VramRangeIsClient(g_static, pl.v1, pl.v1 + 0x2000000) || !VramRangeIsClient(g_static, pl.v2, pl.v2 + 0x2000000)) {
+            SpinLockRelease(lock); o.ks("refused", "M3 VRAM not in a client FB region"); o.send(); return;
+        }
+    }
+    auto flush = [](uint8_t* p, uint64_t n) { FlushRange(p, uint32_t(n)); };
+    M3Extra<decltype(flush)> ex{pl, m3r, flush};
+    KPrintf("nv-gsp: P5 (M2 objects, NOP + semaphore%s) starting\n", m3 ? ", M3 copy engine" : "");
+    const M2Result m = m3 ? RunM2(g_bus, *c, vio, in, g_rm->ch, g_rm->rx, g_rm->rxcap, wait, bell, mthd, fence, ss, ex)
+                          : RunM2(g_bus, *c, vio, in, g_rm->ch, g_rm->rx, g_rm->rxcap, wait, bell, mthd, fence, ss);
     pr.Restore();
     SpinLockRelease(lock);
     // a clean failure (everything freed, no doorbell rung) may be retried with other options
@@ -890,6 +918,16 @@ void P5(uint32_t chid, bool dev) {
     o.k("last_rc"); o.raw("\""); for (uint32_t i = 0; i < 32; ++i) { const char* hx = "0123456789abcdef";
         char b[3] = {hx[m.ev.last_rc[i] >> 4], hx[m.ev.last_rc[i] & 15], 0}; o.raw(b); } o.raw("\"");
     o.raw("}");
+    if (m3) {
+        o.k("m3"); o.raw("{"); o.ks("status", m3r.status); o.ks("step", m3r.step); o.kb("object", m3r.object);
+        o.kh("rm_status", m3r.rm_status); o.kd("ptes", m3r.ptes); o.kh("s_bus", pl.s.bus); o.kh("r_bus", pl.r.bus);
+        o.kh("v1", pl.v1); o.kh("v2", pl.v2); o.kd("width", pl.width); o.kd("height", pl.height);
+        RateJson(o, "sysmem_to_vram", m3r.s2v); RateJson(o, "vram_to_sysmem", m3r.v2s); RateJson(o, "vram_to_vram", m3r.v2v);
+        RateJson(o, "vram_rect", m3r.rect); RateJson(o, "present_rect", m3r.present);
+        o.kb("verify_full", m3r.verify_full); o.kb("verify_rect", m3r.verify_rect);
+        if (m3r.mismatch_at != ~0ull) { o.kh("mismatch_at", m3r.mismatch_at); o.kh("got", m3r.mismatch_got); o.kh("want", m3r.mismatch_want); }
+        o.kd("events_rc", m3r.events_rc); o.kd("events_mmu", m3r.events_mmu); o.raw("}");
+    }
     o.kh("mbox0_now", g_bus.rd32(c->gsp_falcon + kFMbox0)); o.kh("riscv_cpuctl_now", g_bus.rd32(c->gsp_riscv + kRiscvCpuctl));
     KPrintf("nv-gsp: P5 %s at %s (rm 0x%x): fence %d value %x in %lu us, ce %x runlist %u token %x\n", m.status, m.stage,
             m.rm_status, m.fence_ok ? 1 : 0, m.sem_value, (unsigned long)m.fence_us, m.ce_engine, m.runlist, m.token);
@@ -954,8 +992,9 @@ bool NvGspHandle(const char* command) {
         const char* q = Find(verb, "chid ");
         if (q) { chid = 0; for (q += 5; *q >= '0' && *q <= '9'; ++q) chid = chid * 10 + uint32_t(*q - '0'); }
         if (Find(verb, " dev")) dev = true;
+        const bool m3 = Find(verb, " m3") != nullptr;
         if (chid < 1 || chid > 511) DebugChannelSend("{\"nv_gsp\":\"error\",\"msg\":\"chid 1..511\"}\n");
-        else P5(chid, dev);
+        else P5(chid, dev, m3);
     }
     else if (!strncmp(verb, "log ", 4)) {
         char which[8]{}; uint32_t i = 0; const char* p = verb + 4;
