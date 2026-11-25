@@ -245,19 +245,25 @@ static int BindProfileTransfer() {
     const char* directories[] = {"/nix/var", "/data"};
     for (const char* path : directories) {
         VnodeStat stat{};
-        if (!error && (VfsLstatPath(path, &stat) || !stat.isDir || stat.isSymlink)) error = -20;
+        if (!error) error = VfsStatAt(root, root, path, &stat, false);
+        if (!error && (!stat.isDir || stat.isSymlink)) error = -20;
+        if (error) {
+            KPrintf("usb-system: profile transfer parent %s (%d)\n", path, error);
+            break;
+        }
     }
     const char* paths[] = {source, target};
     for (const char* path : paths) {
         if (error) break;
-        const int created = VfsMkdir(path, 0755);
+        const int created = VfsMkdirAt(root, root, path, 0755, 0);
         if (created && created != -17) {
             error = created;
             break;
         }
         VnodeStat stat{};
-        if (VfsLstatPath(path, &stat) || !stat.isDir || stat.isSymlink ||
-            stat.uid != 0 || (stat.mode & 0022)) error = -13;
+        error = VfsStatAt(root, root, path, &stat, false);
+        if (!error && (!stat.isDir || stat.isSymlink || stat.uid != 0 || (stat.mode & 0022))) error = -13;
+        if (error) KPrintf("usb-system: profile transfer directory %s (%d)\n", path, error);
     }
     if (!error) error = VfsPathResolve(root, root, source, &transfer, false);
     if (!error && nix.attachment != transfer.attachment) error = -18;
