@@ -112,6 +112,15 @@ public:
     std::map<uint32_t, Obj> objs;
     std::vector<std::string> calls;                // "alloc 0xa06c", "ctrl 0x801813", "free ..."
     uint64_t pdb = 0; uint32_t pdb_aper = 9;       // SET_PAGE_DIRECTORY
+    // ---- M4 (GR) model: per-VAS roots, the golden context, the TU10x scrubber WAR
+    std::map<uint32_t, uint64_t> vas_root;          // SET_PAGE_DIRECTORY or COPY_SERVER_RESERVED_PDES
+    std::map<uint32_t, bool> promoted_golden;       // channel -> promoted as the golden context
+    bool golden_built = false, scrub_war = false;
+    uint32_t promotes = 0, threed_allocs = 0;
+    std::string gr_error;
+    static constexpr uint32_t kCtxSizes[0x1a] = {   // KGR context-buffer info (engine slot 0), synthetic
+        0x40000, 0, 0, 0, 0, 0, 0, 0, 0x2000, 0, 0, 0, 0, 0x80000, 0, 0, 0x8000, 0x200000, 0, 0x300000, 0x80000, 0, 0,
+        0x20000, 0x1000, 0};
     bool scheduled = false, bound = false;
     uint32_t sem_releases = 0, nops = 0, frees = 0;
     std::string host_error;
@@ -293,8 +302,18 @@ private:
                 break;
             case rm::NV20_SUBDEVICE_0: need(4); parent_is(rm::NV01_DEVICE_0); break;
             case rm::FERMI_VASPACE_A: need(0x30); parent_is(rm::NV01_DEVICE_0);
-                if (!st && R32(p + 4) != rm::NV_VASPACE_ALLOCATION_FLAGS_IS_EXTERNALLY_OWNED) { st = kErrInvalidArgument; }
+                if (!st && R32(p + 4) != rm::NV_VASPACE_ALLOCATION_FLAGS_IS_EXTERNALLY_OWNED && R32(p + 4) != 0) { st = kErrInvalidArgument; }
                 break;
+            case 0xc597: {   // TURING_A under a GR channel that was promoted; the first one builds the golden context
+                need(0); parent_is(rm::TURING_CHANNEL_GPFIFO_A);
+                if (st) break;
+                rm::NV_CHANNEL_ALLOC_PARAMS c; std::memcpy(&c, objs[hParent].params.data(), sizeof(c));
+                auto pg = promoted_golden.find(hParent);
+                if (c.engineType != 1 || pg == promoted_golden.end()) { st = kErrInvalidArgument; gr_error = "3D on an unpromoted channel"; break; }
+                if (!golden_built && !pg->second) { st = kErrInvalidArgument; gr_error = "3D before the golden context"; break; }
+                golden_built = true; ++threed_allocs;
+                break;
+            }
             case rm::KEPLER_CHANNEL_GROUP_A: need(20); parent_is(rm::NV01_DEVICE_0);
                 if (!st && (!objs.count(R32(p + 8)) || objs[R32(p + 8)].cls != rm::FERMI_VASPACE_A)) { st = kErrInvalidArgument; }
                 break;
@@ -308,14 +327,14 @@ private:
                     const uint32_t tsg_eng = R32(par->second.params.data() + 12);
                     if (c.hVASpace != 0 || (c.engineType && c.engineType != tsg_eng)) st = kErrInvalidArgument;
                 } else if (par->second.cls == rm::NV01_DEVICE_0) {
-                    if (!objs.count(c.hVASpace) || !c.engineType) st = kErrInvalidArgument;
+                    if (!objs.count(c.hVASpace) || !c.engineType || !vas_root.count(c.hVASpace)) st = kErrInvalidArgument;
                 } else { st = kErrInvalidObjectParent; break; }
                 const uint32_t chid = ((c.flags >> 12) & 0x1ff) * 8 + ((c.flags >> 8) & 7);
                 if (!st && chid < 1) st = kErrNoMemory;                     // RM keeps chid 0 (rsvd_chids = 1)
                 if (c.instanceMem.addressSpace != rm::ADDR_FBMEM || c.userdMem.addressSpace != rm::ADDR_FBMEM ||
                     c.mthdbufMem.addressSpace != rm::ADDR_SYSMEM || !c.mthdbufMem.size || c.gpFifoEntries == 0) st = kErrInvalidArgument;
                 if (!st && !g_.Dma(c.mthdbufMem.base, size_t(c.mthdbufMem.size))) st = kErrInvalidArgument;
-                if (!st && pdb_aper == 9) st = kErrInvalidArgument;   // VAS without a page directory
+                if (!st && par->second.cls == rm::KEPLER_CHANNEL_GROUP_A && pdb_aper == 9) st = kErrInvalidArgument;   // VAS without a page directory
                 break;
             }
             case 0xc5b5: {   // TURING_DMA_COPY_A under the channel, {version 1, engineType = the channel's CE}
@@ -368,7 +387,7 @@ private:
                 if (!obj_is(rm::NV01_DEVICE_0) || n != 0x20) { st = kErrInvalidArgument; break; }
                 rm::NV0080_CTRL_DMA_SET_PAGE_DIRECTORY_PARAMS q; std::memcpy(&q, p, sizeof(q));
                 if (!objs.count(q.hVASpace) || q.numEntries != 4 || (q.physAddress & 0xfff)) { st = kErrInvalidArgument; break; }
-                pdb = q.physAddress; pdb_aper = q.flags & 3;
+                pdb = q.physAddress; pdb_aper = q.flags & 3; vas_root[q.hVASpace] = q.physAddress;
                 break;
             }
             case rm::NV0080_CTRL_CMD_DMA_UNSET_PAGE_DIRECTORY:
@@ -389,6 +408,70 @@ private:
                 if (!obj_is(rm::TURING_CHANNEL_GPFIFO_A) || !token_ctrl_supported) st = kErrNotSupported;
                 else W32(p, (2u << 16) | ChannelChid());
                 break;
+            case 0x20800a32: {   // KGR context-buffer info (internal subdevice)
+                if (!internal || n != sizeof(rm::gr::GET_CONTEXT_BUFFERS_INFO_PARAMS)) { st = kErrInvalidArgument; break; }
+                rm::gr::GET_CONTEXT_BUFFERS_INFO_PARAMS q = {};
+                for (uint32_t i = 0; i < 0x1a; ++i) { q.engine[0][i].size = kCtxSizes[i]; q.engine[0][i].alignment = 0x1000; }
+                std::memcpy(p, &q, sizeof(q));
+                break;
+            }
+            case 0x90f10106: {   // COPY_SERVER_RESERVED_PDES on an RM-managed VAS
+                rm::gr::COPY_SERVER_RESERVED_PDES_PARAMS q; std::memcpy(&q, p, sizeof(q));
+                if (!obj_is(rm::FERMI_VASPACE_A) || n != sizeof(q) || R32(objs[hObject].params.data() + 4) != 0) { st = kErrInvalidArgument; break; }
+                const uint8_t shifts[3] = {47, 38, 29}; const uint64_t sizes[3] = {32, 4096, 4096};
+                bool okq = q.numLevelsToCopy == 3 && q.pageSize == (1ull << 29) && q.virtAddrLo == 0x100000000ull &&
+                           q.virtAddrHi == 0x11fffffffull;
+                for (uint32_t i = 0; okq && i < 3; ++i)
+                    okq = q.levels[i].pageShift == shifts[i] && q.levels[i].size == sizes[i] && q.levels[i].aperture == 1 &&
+                          !(q.levels[i].physAddress & 0xfff);
+                // the path must be linked: root[0] -> PD2, PD2[0] -> PD1 (4 GiB is index 0 above PD1)
+                if (okq) okq = brook::nvgsp::gmmu::FieldAddr(g_.Vram64(q.levels[0].physAddress)) == q.levels[1].physAddress &&
+                               brook::nvgsp::gmmu::FieldAddr(g_.Vram64(q.levels[1].physAddress)) == q.levels[2].physAddress;
+                if (!okq) { st = kErrInvalidArgument; gr_error = "reserved PDE levels"; break; }
+                vas_root[hObject] = q.levels[0].physAddress;
+                break;
+            }
+            case 0x2080012b: {   // PROMOTE_CTX on the channel client's subdevice
+                rm::gr::PROMOTE_CTX_PARAMS q; std::memcpy(&q, p, sizeof(q));
+                if (!obj_is(rm::NV20_SUBDEVICE_0) || n != sizeof(q) || q.engineType != 1 || !objs.count(q.hObject) ||
+                    objs[q.hObject].cls != rm::TURING_CHANNEL_GPFIFO_A || q.hChanClient != hClient || q.entryCount > 16) {
+                    st = kErrInvalidArgument; gr_error = "promote args"; break; }
+                rm::NV_CHANNEL_ALLOC_PARAMS c; std::memcpy(&c, objs[q.hObject].params.data(), sizeof(c));
+                if (c.engineType != 1 || !vas_root.count(c.hVASpace)) { st = kErrInvalidArgument; gr_error = "promote: not a GR channel"; break; }
+                const uint64_t root = vas_root[c.hVASpace];
+                uint32_t seen = 0, init = 0;
+                for (uint32_t i = 0; i < q.entryCount && !st; ++i) {
+                    const auto& en = q.promoteEntry[i];
+                    if (en.bufferId > 11 || (seen & (1u << en.bufferId))) { st = kErrInvalidArgument; gr_error = "promote: buffer id"; break; }
+                    seen |= 1u << en.bufferId;
+                    if (en.bInitialize) {
+                        init |= 1u << en.bufferId;
+                        if (!en.gpuPhysAddr || !en.size || en.physAttr != 4) { st = kErrInvalidArgument; gr_error = "promote: init entry"; break; }
+                    }
+                    if (en.bNonmapped != (en.bufferId == 10 && en.bInitialize)) { st = kErrInvalidArgument; gr_error = "promote: nonmapped"; break; }
+                    if (!en.bNonmapped) {
+                        PtMem m{g_};
+                        const auto t = brook::nvgsp::GmmuWalk(m, brook::nvgsp::kGmmuV2, root, brook::nvgsp::Aperture::Video, en.gpuVirtAddr);
+                        if (!t.ok || t.aper != brook::nvgsp::Aperture::Video || !(t.pte & brook::nvgsp::gmmu::kPriv) ||
+                            (en.bInitialize && t.pa != en.gpuPhysAddr)) { st = kErrInvalidArgument; gr_error = "promote: VA not mapped priv to the buffer"; break; }
+                        if ((en.bufferId == 10 || en.bufferId == 11) && !(t.pte & brook::nvgsp::gmmu::kRo)) { st = kErrInvalidArgument; gr_error = "promote: access map not RO"; break; }
+                    }
+                }
+                if (st) break;
+                const uint32_t all = 0xe7d;   // MAIN PATCH BUNDLE PAGEPOOL ATTRIB RTV FECS PRIV UNRESTRICTED
+                const bool golden = seen == all && init == ((1u << 0) | (1u << 2) | (1u << 9) | (1u << 10) | (1u << 11));
+                const bool channel = (seen & 0x5) == 0x5 && init == 0x5 && !(seen & (1u << 11));
+                if (!golden_built && !golden) { st = kErrInvalidArgument; gr_error = "promote: the first promote must be the golden one"; break; }
+                if (!golden && !channel) { st = kErrInvalidArgument; gr_error = "promote: per-channel entries"; break; }
+                promoted_golden[q.hObject] = golden && !golden_built; ++promotes;
+                break;
+            }
+            case 0x20800a46: {   // INIT_BUG4208224_WAR on the scrubber client's subdevice
+                if (!obj_is(rm::NV20_SUBDEVICE_0) || n != 1) { st = kErrInvalidArgument; break; }
+                if (!p[0] && (!objs.count(0xdada0045) || !objs.count(0xdada0046))) { st = kErrInvalidArgument; gr_error = "WAR without the scrubber 3D object"; break; }
+                scrub_war = !p[0];
+                break;
+            }
             default: st = kErrNotSupported; break;
         }
         return Reply(76, e, 12, st);

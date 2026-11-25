@@ -106,9 +106,9 @@ struct GrState {
     uint32_t mthdbuf_size = 0;
 };
 
-template <class Api, class VramIo>
+template <class Bus, class Api, class VramIo>
 struct GrCtx {
-    Api& api; VramIo& vram; const ChipOps& c; VramArena& arena; GrResult& r;
+    Bus& bus; Api& api; VramIo& vram; const ChipOps& c; VramArena& arena; GrResult& r;
     bool fail(const char* what) { r.status = what; r.rm_status = api.status; r.rpc_result = api.rpc_result; r.q = api.q; return false; }
     bool track(GrScope& s, uint32_t h, uint32_t parent) { if (s.nlive >= 8) return fail("too many objects");
         s.live[s.nlive] = h; s.parent[s.nlive] = parent; ++s.nlive; ++r.allocated; return true; }
@@ -229,7 +229,7 @@ struct GrCtx {
             if (e.bInitialize) { e.gpuPhysAddr = mem; e.size = b.size; e.physAttr = g::kPhysAttrNouveau; }
             ++p.entryCount;
         }
-        if (!Bar1FlushInvalidate(api_bus(), c, s.root)) return fail("MMU invalidate");
+        if (!Bar1FlushInvalidate(bus, c, s.root)) return fail("MMU invalidate");
         *entries = p.entryCount;
         if (!api.Control(s.base, s.base + grh::kSubdevice, g::NV2080_CTRL_CMD_GPU_PROMOTE_CTX, &p, sizeof(p)))
             return fail("PROMOTE_CTX");
@@ -252,9 +252,97 @@ struct GrCtx {
         r.freed += freed;
         return freed;
     }
-    // the bus is needed only for the MMU invalidate; set by RunGrGolden
-    typename Api::BusType* bus_ = nullptr;
-    typename Api::BusType& api_bus() { return *bus_; }
+    bool Threed(GrScope& s, uint32_t h) {
+        if (!alloc(s, s.h_chan, h, rm570::gr::TURING_A, nullptr, 0, "RM_ALLOC TURING_A")) return false;
+        s.h_3d = h; return true;
+    }
+    bool ScrubberWar(GrScope& s, bool teardown) {
+        rm570::gr::INIT_BUG4208224_WAR_PARAMS w = {uint8_t(teardown ? 1 : 0)};
+        if (!api.Control(s.base, s.base + grh::kSubdevice, rm570::gr::NV2080_CTRL_CMD_INTERNAL_KGR_INIT_BUG4208224_WAR, &w, sizeof(w)))
+            return fail("INIT_BUG4208224_WAR");
+        return true;
+    }
 };
+
+// Step 2: context-buffer info, golden context, scrubber. `sysalloc(bytes, M2Sys*)` gives
+// zeroed contiguous sysmem (method buffers). On success `st` keeps the global buffers and
+// the scrubber scope (GrStop frees it).
+constexpr uint32_t kGrGoldenChid = 1;   // RM 570: rsvd_chids = 1 (chid 0 is RM's); nouveau's golden channel
+constexpr uint32_t kGrScrubberChid = 3; // P5/CE present use chid 2
+template <class Bus, class Api, class VramIo, class SysAlloc>
+inline GrResult RunGrGolden(Bus& bus, const ChipOps& c, VramIo& vram, Api& api, const StaticInfo& si, uint64_t vram_lo,
+                            uint64_t vram_hi, SysAlloc sysalloc, GrState& st) {
+    namespace rm = rm570;
+    GrResult r;
+    if (st.up) { r.status = "GR already up this boot"; return r; }
+    if (!si.ok || !si.h_internal_client || !si.h_internal_subdevice) { r.status = "static info"; return r; }
+    if (!VramRangeIsClient(si, vram_lo, vram_hi)) { r.status = "GR VRAM range not in a client FB region"; return r; }
+    st.arena = VramArena{vram_lo, vram_hi, vram_lo};
+    GrCtx<Bus, Api, VramIo> x{bus, api, vram, c, st.arena, r};
+    auto done = [&]() -> GrResult& { r.ev = api.ev; r.vram_used = st.arena.next - vram_lo; return r; };
+
+    r.stage = "info";
+    {
+        rm::NV2080_CTRL_CE_GET_FAULT_METHOD_BUFFER_SIZE_PARAMS m = {};
+        if (!api.Control(si.h_internal_client, si.h_internal_subdevice, rm::NV2080_CTRL_CMD_CE_GET_FAULT_METHOD_BUFFER_SIZE,
+                         &m, sizeof(m)) || !m.size) { x.fail("method buffer size"); return done(); }
+        st.mthdbuf_size = m.size;
+        static rm::gr::GET_CONTEXT_BUFFERS_INFO_PARAMS info;
+        __builtin_memset(&info, 0, sizeof(info));
+        if (!api.Control(si.h_internal_client, si.h_internal_subdevice,
+                         rm::gr::NV2080_CTRL_CMD_INTERNAL_STATIC_KGR_GET_CONTEXT_BUFFERS_INFO, &info, sizeof(info))) {
+            x.fail("KGR context buffer info"); return done(); }
+        GrBuildBufs(info, st.bufs);
+        if (st.bufs.n < 9) { r.status = "context buffer list incomplete"; r.bufs = st.bufs; return done(); }
+    }
+
+    r.stage = "golden";
+    {
+        GrScope g; g.base = grh::kGolden; g.chid = kGrGoldenChid; g.external = false; g.priv = true;
+        g.h_vas = g.base + grh::kVaspace; g.h_chan = g.base + grh::kChannel;
+        M2Sys mb;
+        bool ok = sysalloc(st.mthdbuf_size, &mb) && mb.cpu;
+        if (!ok) r.status = "method buffer alloc";
+        ok = ok && x.Open(g, mb, st.mthdbuf_size);
+        ok = ok && x.Promote(g, st.bufs, true, &r.golden_entries);
+        ok = ok && x.Threed(g, g.base + grh::kThreed);   // RM builds and caches the golden context here
+        r.golden_ok = ok;
+        const char* keep = r.status;
+        x.Close(g);   // nouveau frees the golden channel; RM keeps the context
+        r.status = keep;
+        if (!ok) { r.bufs = st.bufs; return done(); }
+    }
+
+    r.stage = "scrubber";
+    {
+        GrScope& s = st.scrub;
+        s = GrScope{}; s.base = grh::kScrubber; s.chid = kGrScrubberChid; s.external = false; s.priv = false;
+        s.h_vas = rm::gr::KGRAPHICS_SCRUBBER_HANDLE_VAS; s.h_chan = rm::gr::KGRAPHICS_SCRUBBER_HANDLE_CHANNEL;
+        M2Sys mb;
+        bool ok = sysalloc(st.mthdbuf_size, &mb) && mb.cpu;
+        if (!ok) r.status = "method buffer alloc";
+        ok = ok && x.Open(s, mb, st.mthdbuf_size);
+        ok = ok && x.Promote(s, st.bufs, false, &r.scrubber_entries);
+        ok = ok && x.Threed(s, rm::gr::KGRAPHICS_SCRUBBER_HANDLE_3DOBJ);
+        ok = ok && x.ScrubberWar(s, false);
+        r.scrubber_ok = ok;
+        if (!ok) { const char* keep = r.status; x.Close(s); r.status = keep; r.bufs = st.bufs; return done(); }
+    }
+    st.up = true;
+    r.stage = "done";
+    r.bufs = st.bufs;
+    return done();
+}
+
+// Before RM unload (and on `gr off`): WAR teardown, then free the scrubber scope.
+template <class Bus, class Api, class VramIo>
+inline uint32_t GrStop(Bus& bus, const ChipOps& c, VramIo& vram, Api& api, GrState& st, GrResult& r) {
+    if (!st.up) return 0;
+    GrCtx<Bus, Api, VramIo> x{bus, api, vram, c, st.arena, r};
+    (void)x.ScrubberWar(st.scrub, true);
+    const uint32_t freed = x.Close(st.scrub);
+    st.up = false;
+    return freed;
+}
 
 }  // namespace brook::nvgsp

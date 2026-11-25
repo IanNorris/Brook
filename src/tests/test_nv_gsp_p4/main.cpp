@@ -23,6 +23,7 @@
 #include "nv_gsp/nv_gsp_m2.h"
 #include "nv_gsp/nv_gsp_m3.h"
 #include "nv_gsp/nv_gsp_ce_present.h"
+#include "nv_gsp/nv_gsp_m4.h"
 using brook::NvCeJob; using brook::NvCeRect;
 #include "../nv_gsp_fake/fake_gpu.h"
 #include "../nv_gsp_fake/fake_rm.h"
@@ -208,6 +209,31 @@ struct Rig {
         RmApi<W, GspDoorbell<fake_gpu::FakeGpu, NoSync>> api(ch.get(), rx.data(), uint32_t(rx.size()), wait, bell, scratch);
         cp.active = false;
         return M2FreeKept(cp.k, api);
+    }
+    // M4 step 2: golden context + scrubber against the fake RM's GR model.
+    struct GrApiW { Rig* r; bool operator()() { return r->Wait(); } };
+    using GrApi = RmApi<GrApiW, GspDoorbell<fake_gpu::FakeGpu, NoSync>>;
+    GrResult GrGolden(GrState& st) {
+        GrApiW wait{this};
+        GspDoorbell<fake_gpu::FakeGpu, NoSync> bell{gpu, kChipTu104, sync};
+        static uint8_t scratch[kRmApiBuf];
+        GrApi api(ch.get(), rx.data(), uint32_t(rx.size()), wait, bell, scratch);
+        Pramin<fake_gpu::FakeGpu> vram(gpu, kChipTu104);
+        auto sysalloc = [&](uint32_t bytes, M2Sys* s) { DmaRegion d; if (!arena(bytes, &d)) return false;
+            s->cpu = d.cpu; s->bus = d.bus; s->bytes = d.bytes; return true; };
+        GrResult g = RunGrGolden(gpu, kChipTu104, vram, api, last.si, 0x110000000ull, 0x120000000ull, sysalloc, st);
+        vram.Restore();
+        return g;
+    }
+    uint32_t GrDown(GrState& st, GrResult& g) {
+        GrApiW wait{this};
+        GspDoorbell<fake_gpu::FakeGpu, NoSync> bell{gpu, kChipTu104, sync};
+        static uint8_t scratch[kRmApiBuf];
+        GrApi api(ch.get(), rx.data(), uint32_t(rx.size()), wait, bell, scratch);
+        Pramin<fake_gpu::FakeGpu> vram(gpu, kChipTu104);
+        const uint32_t f = GrStop(gpu, kChipTu104, vram, api, st, g);
+        vram.Restore();
+        return f;
     }
     P4Result last;
     RmFiniResult Unload() {
@@ -494,6 +520,47 @@ int main(int argc, char** argv) {
         assert(r.gpu.Vram32(0x800000) == 0x30000000u && r.gpu.Vram32(0x800000 + (2u << 20) - 4) == 0x30000000u + W * H - 1);
         assert(cp.st.map_pages == 1);                                       // one 2 MiB PTE
         assert(r.CeFree(cp) == 7 && r.rm.objs.empty());
+    }
+    // ---- M4 step 2: context-buffer list, golden context, TU10x scrubber
+    {
+        // the list as nouveau builds it from the synthetic sizes
+        rm570::gr::GET_CONTEXT_BUFFERS_INFO_PARAMS info = {};
+        for (uint32_t i = 0; i < 0x1a; ++i) info.engine[0][i].size = fake_gpu::FakeRm::kCtxSizes[i];
+        GrBufs b; GrBuildBufs(info, b);
+        assert(b.n == 9 && b.b[0].id == rm570::gr::BUF_MAIN && b.b[0].size == 0x40000 + 0x40000 && b.b[0].page == 16);
+        bool attrib = false, unres = false;
+        for (uint32_t i = 0; i < b.n; ++i) {
+            if (b.b[i].id == rm570::gr::BUF_ATTRIBUTE_CB) { attrib = true; assert(b.b[i].page == 21 && b.b[i].align == 22 && b.b[i].global); }
+            if (b.b[i].id == rm570::gr::BUF_UNRESTRICTED_PRIV_ACCESS_MAP) { unres = true; assert(b.b[i].ro && b.b[i].init && b.b[i].page == 12); }
+        }
+        assert(attrib && unres);
+    }
+    {
+        Rig r(I, 0x1); r.last = r.Run(); assert(r.last.init_done);
+        GrState st;
+        GrResult g = r.GrGolden(st);
+        if (!g.ok()) std::fprintf(stderr, "GR: %s at %s (rm %x) fake: %s / %s\n", g.status, g.stage, g.rm_status, r.rm.gr_error.c_str(), r.rm.error.c_str());
+        assert(g.ok() && g.golden_ok && g.scrubber_ok && st.up);
+        assert(g.golden_entries == 9 && g.scrubber_entries == 8 && r.rm.golden_built && r.rm.scrub_war && r.rm.threed_allocs == 2);
+        assert(r.rm.objs.size() == 6);                                 // the scrubber scope stays; the golden one is gone
+        assert(st.bufs.b[1].id == rm570::gr::BUF_PAGEPOOL && st.bufs.b[1].vram && !st.bufs.b[2].vram && g.vram_used > 0x700000);   // globals kept
+        assert(r.GrDown(st, g) == 6 && r.rm.objs.empty() && !r.rm.scrub_war && !st.up);
+        GrState again; again.up = true;
+        assert(!r.GrGolden(again).ok());                                 // once per boot
+    }
+    {   // RM refuses TURING_A: the golden scope is freed, no scrubber
+        Rig r(I, 0x1); r.last = r.Run(); assert(r.last.init_done);
+        r.rm.fail_class = rm570::gr::TURING_A;
+        GrState st;
+        const GrResult g = r.GrGolden(st);
+        assert(!g.ok() && !std::strcmp(g.stage, "golden") && !g.golden_ok && !st.up && r.rm.objs.empty() && r.rm.promotes == 1);
+    }
+    {   // GR VRAM outside a client FB region: refused before any RPC
+        Rig r(I, 0x1); r.last = r.Run(); assert(r.last.init_done);
+        r.last.si.fb[0].reserved = 1;
+        const uint32_t before = r.rm.rpcs;
+        GrState st;
+        assert(!r.GrGolden(st).ok() && r.rm.rpcs == before);
     }
     std::printf("test_nv_gsp_p4: OK (%s inputs%s)\n", I.real ? "real" : "synthetic", I.seq.empty() ? "" : ", real sequencer");
     return 0;

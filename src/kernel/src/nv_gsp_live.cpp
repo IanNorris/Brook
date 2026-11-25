@@ -31,6 +31,7 @@
 #include "nv_gsp/nv_gsp_m2.h"
 #include "nv_gsp/nv_gsp_m3.h"
 #include "nv_gsp/nv_gsp_ce_present.h"
+#include "nv_gsp/nv_gsp_m4.h"
 #include "nv_disp_live.h"
 #include "platform_power.h"
 #include "scheduler.h"
@@ -523,6 +524,7 @@ bool FiniReady(Out* o) {
     return true;
 }
 bool CePresentStop(bool wait_lock, uint32_t* freed);   // CE present section below
+uint32_t GrStopLive();                                   // GR section below
 struct FiniOutcome { bool rm = false; RmFiniResult rmf; FiniResult r; };
 FiniOutcome FiniCore(uint64_t rm_budget_us) {
     FiniOutcome x;
@@ -530,6 +532,7 @@ FiniOutcome FiniCore(uint64_t rm_budget_us) {
     if (x.rm) {   // GSP-RM is up (p4 this boot): UNLOADING_GUEST_DRIVER first, then the P3b sequence
         uint32_t ceFreed = 0;
         (void)CePresentStop(rm_budget_us > 2000000, &ceFreed);   // no CE submissions once RM starts to unload
+        (void)GrStopLive();                                       // GR scrubber WAR teardown + free (nouveau order)
         g_finiDone = true;
         x.rmf = RmUnload(rm_budget_us);
         g_rmRunning = false;
@@ -1161,6 +1164,82 @@ void AutostartRun(bool display) {
 }
 }  // namespace
 
+namespace {
+// ------------------------------------------------------------------ M4: GR
+// `gr golden` (once per boot, after p4): context-buffer info, the golden context (TURING_A on
+// an RM-managed-VAS channel), the TU10x scrubber. VRAM from [4 GiB + 256 MiB, +512 MiB).
+GrState g_gr; GrResult g_grLast; bool g_grTried = false;
+using LiveRmApi = RmApi<RmWait, GspDoorbell<Bar0Bus, RmSync>>;
+uint32_t GrStopLive() {
+    if (!g_gr.up || !g_rmRunning || !g_rm) return 0;
+    const ChipOps* c = ChipForBoot0(g_bus.rd32(0));
+    SpinLock* lock = NvAuxSharedLock();
+    SpinLockAcquire(lock);
+    Pramin<Bar0Bus> pr(g_bus, *c); PraminIo vio{pr};
+    RmWait wait; g_rm->wait_deadline_us = NowUs() + 1000000;
+    GspDoorbell<Bar0Bus, RmSync> bell{g_bus, *c, g_rmSync};
+    alignas(8) static uint8_t scratch[kRmApiBuf];
+    LiveRmApi api(g_rm->ch, g_rm->rx, g_rm->rxcap, wait, bell, scratch);
+    GrResult r;
+    const uint32_t f = GrStop(g_bus, *c, vio, api, g_gr, r);
+    pr.Restore();
+    SpinLockRelease(lock);
+    return f;
+}
+void GrJson(Out& o, const GrResult& r) {
+    o.ks("stage", r.stage); o.ks("status", r.status); o.kh("rm_status", r.rm_status); o.kh("rpc_result", r.rpc_result);
+    o.kd("q", uint32_t(r.q)); o.kb("golden_ok", r.golden_ok); o.kb("scrubber_ok", r.scrubber_ok);
+    o.kd("golden_entries", r.golden_entries); o.kd("scrubber_entries", r.scrubber_entries);
+    o.kd("allocated", r.allocated); o.kd("freed", r.freed); o.kh("vram_used", r.vram_used);
+    o.kd("events_total", r.ev.total); o.kd("events_rc", r.ev.rc); o.kd("events_mmu", r.ev.mmu_fault);
+    o.kh("last_other_fn", r.ev.last_other_fn);
+    o.k("bufs"); o.raw("[");
+    for (uint32_t i = 0; i < r.bufs.n; ++i) {
+        const GrBuf& b = r.bufs.b[i];
+        if (i) o.raw(",");
+        o.raw("{"); o.kd("id", b.id); o.kh("size", b.size); o.kd("page", b.page); o.kd("align", b.align);
+        o.kb("global", b.global); o.kb("init", b.init); o.kb("ro", b.ro); o.kh("vram", b.vram); o.raw("}");
+    }
+    o.raw("]");
+    o.k("raw_sizes"); o.raw("[");
+    for (uint32_t i = 0; i < rm570::gr::kEngineIdCount; ++i) { if (i) o.raw(","); o.dec(r.bufs.raw_sizes[i]); }
+    o.raw("]");
+}
+void GrVerb(int mode) {   // 1 golden, 2 off, 0 status
+    Out o; o.raw("{\"nv_gsp\":\"gr\"");
+    const ChipOps* c = ChipForBoot0(g_bus.rd32(0));
+    if (mode == 1) {
+        if (!c || !g_rmRunning || !g_staticValid) { o.ks("refused", "GSP-RM is not running this boot"); o.send(); return; }
+        if (g_grTried) { o.ks("refused", "gr golden already ran this boot"); o.send(); return; }
+        g_grTried = true;
+        SpinLock* lock = NvAuxSharedLock();
+        SpinLockAcquire(lock);
+        Pramin<Bar0Bus> pr(g_bus, *c); PraminIo vio{pr};
+        RmWait wait; g_rm->wait_deadline_us = NowUs() + 10000000;
+        GspDoorbell<Bar0Bus, RmSync> bell{g_bus, *c, g_rmSync};
+        alignas(8) static uint8_t scratch[kRmApiBuf];
+        LiveRmApi api(g_rm->ch, g_rm->rx, g_rm->rxcap, wait, bell, scratch);
+        auto sysalloc = [](uint32_t bytes, M2Sys* m) { DmaRegion d; if (!RmAlloc(bytes, &d)) return false;
+            m->cpu = d.cpu; m->bus = d.bus; m->bytes = d.bytes; return true; };
+        const uint64_t t0 = NowUs();
+        KPrintf("nv-gsp: GR golden context + scrubber starting\n");
+        g_grLast = RunGrGolden(g_bus, *c, vio, api, g_static, 0x110000000ull, 0x130000000ull, sysalloc, g_gr);
+        const uint64_t us = NowUs() - t0;
+        pr.Restore();
+        SpinLockRelease(lock);
+        o.kd("run_us", us);
+        KPrintf("nv-gsp: GR %s at %s (rm 0x%x): golden %d scrubber %d, %lu us\n", g_grLast.status, g_grLast.stage,
+                g_grLast.rm_status, g_grLast.golden_ok ? 1 : 0, g_grLast.scrubber_ok ? 1 : 0, (unsigned long)us);
+    } else if (mode == 2) {
+        o.kd("freed", GrStopLive());
+    }
+    o.kb("up", g_gr.up);
+    GrJson(o, g_grLast);
+    o.send();
+}
+
+}  // namespace
+
 bool NvGspHandle(const char* command) {
     constexpr char prefix[] = "bridge hardware nv-gsp ";
     if (strncmp(command, prefix, sizeof(prefix) - 1)) return false;
@@ -1190,6 +1269,9 @@ bool NvGspHandle(const char* command) {
         if (chid < 1 || chid > 511) DebugChannelSend("{\"nv_gsp\":\"error\",\"msg\":\"chid 1..511\"}\n");
         else P5(chid, dev, m3);
     }
+    else if (!strcmp(verb, "gr golden")) GrVerb(1);
+    else if (!strcmp(verb, "gr off")) GrVerb(2);
+    else if (!strcmp(verb, "gr status")) GrVerb(0);
     else if (!strcmp(verb, "ce-present on")) CePresentVerb(1);
     else if (!strcmp(verb, "ce-present off")) CePresentVerb(2);
     else if (!strcmp(verb, "ce-present status")) CePresentVerb(0);
