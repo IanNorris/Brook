@@ -784,7 +784,7 @@ is not a pinned identity. A missing ping alone does not prove a bridge failure;
 the listener processes one connection at a time, so probing can briefly delay
 other bridge traffic. This diagnostic does not use discovery or reboot the target.
 
-`hw_stats`, `hw_logs`, `hw_apps` and `hw_windows` provide bounded observations.
+`hw_stats`, `hw_logs`, `hw_apps` and `hw_windows` provide bounded observations. `hw_input` sends synthetic keyboard/mouse input through the kernel `inject` commands (one boot-guarded command per action; stops at the first refusal).
 Log cursors count completed lines, report dropped retained lines, and exclude
 the current partial line. A line is capped at 160 columns. Pass `next_cursor`
 back as `cursor`; the same boot identity must remain attached.

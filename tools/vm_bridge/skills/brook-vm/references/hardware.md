@@ -1,6 +1,6 @@
 # Physical Brook bridge
 
-Use `hw_*` for the explicitly selected Brook machine. Hardware tools do not provide QMP, host input, arbitrary registers/RAM or post-panic TCP access. Current completed-frame transfer is an optional guest capability; older documentation saying all hardware screenshots are unavailable is superseded by the implementation and capability probe.
+Use `hw_*` for the explicitly selected Brook machine. Hardware tools do not provide QMP, arbitrary registers/RAM or post-panic TCP access. Synthetic keyboard and mouse input goes through `hw_input` (the kernel's `inject` debug commands: move/click in screen pixels, key/keydown/keyup scancodes, ASCII `type`, `combo` such as ctrl+a, `sleep`); it reaches clients as real input does. Current completed-frame transfer is an optional guest capability; older documentation saying all hardware screenshots are unavailable is superseded by the implementation and capability probe.
 
 ## Attach and diagnose
 

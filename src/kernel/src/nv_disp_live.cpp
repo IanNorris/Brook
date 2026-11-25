@@ -328,7 +328,7 @@ int FlipPendingLocked(uint32_t o,const uint32_t* src,uint32_t srcStride){
         (void)p.age.Apply(bb,p.pending,width,height,collect);
         uint64_t ceBytes=0;uint32_t ticket=0;int r=0;
         if(n&&!over){const NvCeJob job{p.shadow,width,width,height,p.vram[bb],pitch*4,p.ceRects,n};r=g_ceOps->kick(job,&ceBytes,&ticket);}
-        if(r==1){kicked=true;bytes+=ceBytes;++p.ceKicks;p.ceInflight=true;p.ceBb=bb;p.ceTicket=ticket;p.ceN=n;}
+        if(r==1){kicked=true;bytes+=ceBytes;p.ceBytes+=ceBytes;++p.ceKicks;p.ceInflight=true;p.ceBb=bb;p.ceTicket=ticket;p.ceN=n;}
         else{if(r<0){g_ceOps=nullptr;KPrintf("nv-display: CE present kick failed; CPU copies from now on\n");}
             if(n)++p.ceCpuFrames;for(uint32_t i=0;i<n;++i)copy(DamageRect{p.ceRects[i].x0,p.ceRects[i].y0,p.ceRects[i].x1,p.ceRects[i].y1});}
     }else (void)p.age.Apply(bb,p.pending,width,height,copy);
