@@ -47,6 +47,15 @@ static void checkSceneDamage() {
     CHECK(result.left==0 && result.right==10 && result.top==0 && result.bottom==4);
     CHECK(!result.intersects(layers[3]));
     CHECK(!SceneDamageClosure({},layers,4).intersects(layers[0]));
+    {   // D3: a clipped (CSD) layer is not pulled in whole; its caption overlay is, once reached.
+        const SceneRect big{0,0,1000,1000},win{100,100,200,200};
+        const SceneRect ls[2]={big,win};const bool expand[2]={false,true};
+        const SceneRect extra[2]={SceneRect{900,0,1000,40},SceneRect{}};
+        SceneRect r=SceneDamageClosureLayered(SceneRect{150,150,160,160},ls,expand,extra,2);
+        CHECK(r.left==100 && r.top==100 && r.right==200 && r.bottom==200);   // the chromed window, not the big client
+        r=SceneDamageClosureLayered(SceneRect{950,30,960,60},ls,expand,extra,2);
+        CHECK(r.left==900 && r.top==0 && r.right==1000 && r.bottom==60);      // reached the overlay: it joins
+    }
     CHECK(!layers[0].intersects({4,0,8,4})); // touching edges are disjoint
     SceneRect clipped=SceneRect{-20,-10,30,15}.clipped(16,8);
     CHECK(clipped.left==0 && clipped.top==0 && clipped.right==16 && clipped.bottom==8);

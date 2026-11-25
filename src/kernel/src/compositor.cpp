@@ -1717,14 +1717,20 @@ static bool BlitProcessAt(Process* proc, int dstX0, int dstY0, bool forceAll,
 // `BlitProcessAt` so we don't need to fake a Process struct.
 static bool BlitWindowVfb(const uint32_t* src,
                            uint32_t srcW, uint32_t srcH, uint32_t srcStride,
-                           int dstX0, int dstY0)
+                           int dstX0, int dstY0, const SceneRect* limit = nullptr)
 {
     if (!src || srcW == 0) return false;
     uint32_t* dstBase = g_backBuffer ? g_backBuffer : const_cast<uint32_t*>(g_physFb);
     const uint32_t dstStride = g_backBuffer ? g_backBufStride : g_physFbStride;
 
-    const SceneRect clip=SceneClientBlitRect(dstX0,dstY0,srcW,srcH,srcW,srcH,1,
+    SceneRect clip=SceneClientBlitRect(dstX0,dstY0,srcW,srcH,srcW,srcH,1,
                                            g_deskWidth,g_deskHeight);
+    if (limit) {   // a partial repaint redraws this layer only inside the repainted region
+        if (limit->left > clip.left) clip.left = limit->left;
+        if (limit->top > clip.top) clip.top = limit->top;
+        if (limit->right < clip.right) clip.right = limit->right;
+        if (limit->bottom < clip.bottom) clip.bottom = limit->bottom;
+    }
     if (clip.empty()) return false;
     const uint32_t sourceX=static_cast<uint32_t>(clip.left-static_cast<int64_t>(dstX0));
     const uint32_t rowLen=static_cast<uint32_t>(clip.right-clip.left);
@@ -2877,6 +2883,12 @@ static void CompositorLoopWM(bool& clientFrame)
 #endif
     SceneRect cpuDamage;
     const bool cpuPartial=!CompositorGpuActive() && !fullRepaint && !skipCpuScene;
+    // Partial repaint: which layers must be redrawn whole (expand) and which can be
+    // redrawn clipped to the region (a CSD client surface; its caption overlay joins
+    // whole when reached). Clipped layers keep a maximised client from making every
+    // move over it re-blit 31 MB (live f87b5864: 9-12 ms compose).
+    bool layerExpand[WM_MAX_WINDOWS]{};
+    SceneRect layerOverlay[WM_MAX_WINDOWS]{};
     if(cpuPartial) {
         SceneRect layers[WM_MAX_WINDOWS]{};
         for(uint32_t i=0;i<wcount;++i) {
@@ -2885,11 +2897,16 @@ static void CompositorLoopWM(bool& clientFrame)
             layers[i]=SceneRect{w->x,w->y,static_cast<int64_t>(w->x)+w->outerWidth(),
                                       static_cast<int64_t>(w->y)+w->outerHeight()}.clipped(g_deskWidth,g_deskHeight);
             const bool windowBuffer=__atomic_load_n(&w->vfb,__ATOMIC_ACQUIRE)!=nullptr;
+            layerExpand[i]=!windowBuffer || !w->noChrome;
+            if(windowBuffer && w->noChrome && w->captionOverlay){
+                const WmRect o=WmCaptionOverlayRect(*w);
+                layerOverlay[i]=SceneRect{o.x,o.y,int64_t(o.x)+o.w,int64_t(o.y)+o.h}.clipped(g_deskWidth,g_deskHeight);
+            }
             if(windowBuffer?w->vfbDirty:w->proc->fbDirty)cpuDamage.include(layers[i]);
         }
         for(uint32_t i=0;i<sceneDamage.count;++i){const auto& r=sceneDamage.rects[i];
             cpuDamage.include(SceneRect{r.x0,r.y0,r.x1,r.y1}.clipped(g_deskWidth,g_deskHeight));}
-        cpuDamage=SceneDamageClosure(cpuDamage,layers,wcount);
+        cpuDamage=SceneDamageClosureLayered(cpuDamage,layers,layerExpand,layerOverlay,wcount);
         BlitWallpaperRegion(cpuDamage);
     }
 
@@ -2961,7 +2978,7 @@ static void CompositorLoopWM(bool& clientFrame)
                 const bool freshClient = w->vfbDirty && !p->isKernelThread && p->state != ProcessState::Terminated;
                 if (blitW && blitH) {
                     const bool copied = BlitWindowVfb(localVfb, blitW, blitH, localStride,
-                                                      w->clientX(), w->clientY());
+                                                      w->clientX(), w->clientY(), cpuPartial ? &cpuDamage : nullptr);
                     clientFrame |= freshClient && copied;
                 }
                 w->vfbDirty = 0;  // single-writer (compositor thread), no race
@@ -3044,6 +3061,9 @@ static void CompositorLoopWM(bool& clientFrame)
         }
         else if (g_backBuffer)
         {
+            // A clipped CSD layer: its caption overlay is redrawn only when the region took
+            // it in whole (blending it again over unrepainted pixels would darken it).
+            if (cpuPartial && !layerExpand[i] && !layerOverlay[i].intersects(cpuDamage)) continue;
             WmRenderChromeForWindow(g_backBuffer, g_backBufStride,
                                      g_deskWidth, g_deskHeight, sorted[i],
                                      chromeMx, chromeMy);
