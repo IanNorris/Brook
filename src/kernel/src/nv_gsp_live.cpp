@@ -835,22 +835,26 @@ void Bar1Verb(int mode, uint8_t shift) {
 
 // ------------------------------------------------------------------ P5 (M2)
 bool g_p5Done = false;
+const char* Find(const char* h, const char* n) {
+    for (; *h; ++h) { uint32_t i = 0; while (n[i] && h[i] == n[i]) ++i; if (!n[i]) return h; }
+    return nullptr;
+}
 struct PraminIo {   // VramIo over the BAR0 window (nv_gsp_bar1.h Pramin)
     Pramin<Bar0Bus>& p;
     uint32_t rd32(uint64_t a) { return p.rd32(a); }
     void wr32(uint64_t a, uint32_t v) { p.wr32(a, v); }
 };
-void P5() {
+void P5(uint32_t chid, bool dev) {
     Out o; o.raw("{\"nv_gsp\":\"p5\"");
     const ChipOps* c = ChipForBoot0(g_bus.rd32(0));
     if (!c || !g_rmRunning || !g_staticValid) { o.ks("refused", "GSP-RM is not running this boot"); o.send(); return; }
-    if (g_p5Done) { o.ks("refused", "already ran this boot (no retry)"); o.send(); return; }
+    if (g_p5Done) { o.ks("refused", "already ran this boot (done, or objects left behind)"); o.send(); return; }
     M2Inputs in;
     in.si = g_static;
     in.vram_lo = 0x100000000ull; in.vram_hi = in.vram_lo + (1u << 20);   // 4 GiB: far from the display buffers (< 256 MiB)
+    in.chid = chid; in.parent_device = dev;
     auto sys = [](M2Sys* m) { DmaRegion d; if (!RmAlloc(0x1000, &d)) return false; m->cpu = d.cpu; m->bus = d.bus; m->bytes = d.bytes; return true; };
     if (!sys(&in.gpfifo) || !sys(&in.push) || !sys(&in.sem)) { o.ks("refused", "no sysmem"); o.send(); return; }
-    g_p5Done = true;
     SpinLock* lock = NvAuxSharedLock();
     SpinLockAcquire(lock);                       // PRAMIN is shared with nv-disp
     Pramin<Bar0Bus> pr(g_bus, *c);
@@ -867,6 +871,9 @@ void P5() {
     const M2Result m = RunM2(g_bus, *c, vio, in, g_rm->ch, g_rm->rx, g_rm->rxcap, wait, bell, mthd, fence, ss);
     pr.Restore();
     SpinLockRelease(lock);
+    // a clean failure (everything freed, no doorbell rung) may be retried with other options
+    g_p5Done = m.ok() || m.freed != m.allocated || m.token;
+    o.kd("chid", chid); o.kb("parent_device", dev); o.kb("latched", g_p5Done);
     o.ks("stage", m.stage); o.ks("status", m.status); o.kh("rm_status", m.rm_status); o.kh("rpc_result", m.rpc_result);
     o.kd("q", uint32_t(m.q)); o.kh("ce_engine", m.ce_engine); o.kd("runlist", m.runlist); o.kd("devinfo_entries", m.devinfo_entries);
     o.kh("mthdbuf_size", m.mthdbuf_size); o.kh("inst", m.inst); o.kh("userd", m.userd); o.kh("pd3", m.pd3);
@@ -938,7 +945,15 @@ bool NvGspHandle(const char* command) {
     else if (!strcmp(verb, "bar1 map 2m")) Bar1Verb(1, 21);
     else if (!strcmp(verb, "bar1 unmap")) Bar1Verb(2, 0);
     else if (!strcmp(verb, "bar1 status")) Bar1Verb(0, 0);
-    else if (!strcmp(verb, "p5")) P5();
+    else if (!strncmp(verb, "p5", 2) && (!verb[2] || verb[2] == ' ')) {
+        // p5 [chid N] [dev]
+        uint32_t chid = kM2Chid; bool dev = false;
+        const char* q = Find(verb, "chid ");
+        if (q) { chid = 0; for (q += 5; *q >= '0' && *q <= '9'; ++q) chid = chid * 10 + uint32_t(*q - '0'); }
+        if (Find(verb, " dev")) dev = true;
+        if (chid < 1 || chid > 511) DebugChannelSend("{\"nv_gsp\":\"error\",\"msg\":\"chid 1..511\"}\n");
+        else P5(chid, dev);
+    }
     else if (!strncmp(verb, "log ", 4)) {
         char which[8]{}; uint32_t i = 0; const char* p = verb + 4;
         while (*p && *p != ' ' && i < 7) which[i++] = *p++;

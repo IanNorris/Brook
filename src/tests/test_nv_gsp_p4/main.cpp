@@ -132,13 +132,14 @@ struct Rig {
         const uint64_t probes[3] = {0x0, 0x4343000, 0xff13000};   // P4's faulting offsets (GOP surface, a surface, instmem)
         return MapBar1Identity(gpu, kChipTu104, pa, pde, 256ull << 20, probes, 3, Bar1Cpu{this});
     }
-    M2Result M2() {
+    M2Result M2(uint32_t chid = kM2Chid, bool parent_device = false) {
         struct W { Rig* r; bool operator()() { return r->Wait(); } } wait{this};
         GspDoorbell<fake_gpu::FakeGpu, NoSync> bell{gpu, kChipTu104, sync};
         Pramin<fake_gpu::FakeGpu> vram(gpu, kChipTu104);
         M2Inputs in;
         in.si = last.si;
         in.vram_lo = 0x100000000ull; in.vram_hi = 0x100100000ull;
+        in.chid = chid; in.parent_device = parent_device;
         auto sys = [&](M2Sys* s) { DmaRegion d; assert(arena(0x1000, &d)); s->cpu = d.cpu; s->bus = d.bus; s->bytes = d.bytes; };
         sys(&in.gpfifo); sys(&in.push); sys(&in.sem);
         auto mthd = [&](uint32_t bytes, M2Sys* s) { DmaRegion d; if (!arena(bytes, &d)) return false;
@@ -264,7 +265,7 @@ int main(int argc, char** argv) {
         const M2Result m = r.M2();
         if (!m.ok()) std::fprintf(stderr, "m2: %s at %s (rm 0x%x q %d fake=%s)\n", m.status, m.stage, m.rm_status, int(m.q), r.rm.error.c_str());
         assert(m.ok() && m.fence_ok && m.sem_value == kM2Payload && r.rm.sem_releases == 1 && r.rm.nops == 1);
-        assert(m.ce_engine == rm570::RM_ENGINE_TYPE_COPY0 + 2 && m.runlist == 2 && m.token == 0x20000 && m.token_ctrl_ok);
+        assert(m.ce_engine == rm570::RM_ENGINE_TYPE_COPY0 + 2 && m.runlist == 2 && m.token == 0x20002 && m.token_ctrl_ok);
         assert(m.gp_get == 1 && m.allocated == 6 && m.freed == 6 && r.rm.objs.empty() && m.mthdbuf_size == 0x1000 && !m.schedule_on_tsg);
         // ---- RM-aware fini: unload RPC, then FWSEC-SB + booter_unload clear WPR2
         const RmFiniResult u = r.Unload();
@@ -308,7 +309,14 @@ int main(int argc, char** argv) {
         Rig r(I, 0x1); r.last = r.Run(); assert(r.last.init_done);
         r.rm.token_ctrl_supported = false; r.rm.channel_schedule_supported = false;
         const M2Result m = r.M2();
-        assert(m.ok() && !m.token_ctrl_ok && m.token == 0x20000 && m.schedule_on_tsg && r.rm.objs.empty());
+        assert(m.ok() && !m.token_ctrl_ok && m.token == 0x20002 && m.schedule_on_tsg && r.rm.objs.empty());
+    }
+    {   // chid 0 is RM's: NV_ERR_NO_MEMORY at the channel, as on hardware; nothing left behind
+        Rig r(I, 0x1); r.last = r.Run(); assert(r.last.init_done);
+        const M2Result m = r.M2(0);
+        assert(!m.ok() && !std::strcmp(m.stage, "channel") && m.rm_status == 0x51 && r.rm.objs.empty());
+        const M2Result again = r.M2(3, true);       // retry in the same boot, nouveau-style parent
+        assert(again.ok() && again.allocated == 5 && again.token == 0x20003 && r.rm.sem_releases == 1 && r.rm.objs.empty());
     }
     {
         Rig r(I, 0x1); r.last = r.Run(); assert(r.last.init_done);

@@ -267,6 +267,7 @@ private:
     }
 
     // ---- RM objects
+    static constexpr uint32_t kErrNoMemory = 0x51;
     static constexpr uint32_t kErrInvalidArgument = 0x1f, kErrInvalidObjectParent = 0x2c, kErrNotSupported = 0x56,
                               kErrInvalidObjectHandle = 0x33;
     bool Reply(uint32_t fn, std::vector<uint8_t>& e, uint32_t status_off, uint32_t status) {
@@ -298,12 +299,19 @@ private:
                 if (!st && (!objs.count(R32(p + 8)) || objs[R32(p + 8)].cls != rm::FERMI_VASPACE_A)) { st = kErrInvalidArgument; }
                 break;
             case rm::TURING_CHANNEL_GPFIFO_A: {
-                need(sizeof(rm::NV_CHANNEL_ALLOC_PARAMS)); parent_is(rm::KEPLER_CHANNEL_GROUP_A);
+                need(sizeof(rm::NV_CHANNEL_ALLOC_PARAMS));
                 if (st) break;
                 rm::NV_CHANNEL_ALLOC_PARAMS c; std::memcpy(&c, p, sizeof(c));
-                const Obj& tsg = objs[hParent];
-                const uint32_t tsg_eng = R32(tsg.params.data() + 12);
-                if (c.hVASpace != 0 || (c.engineType && c.engineType != tsg_eng)) st = kErrInvalidArgument;
+                auto par = objs.find(hParent);
+                if (par == objs.end()) { st = kErrInvalidObjectParent; break; }
+                if (par->second.cls == rm::KEPLER_CHANNEL_GROUP_A) {
+                    const uint32_t tsg_eng = R32(par->second.params.data() + 12);
+                    if (c.hVASpace != 0 || (c.engineType && c.engineType != tsg_eng)) st = kErrInvalidArgument;
+                } else if (par->second.cls == rm::NV01_DEVICE_0) {
+                    if (!objs.count(c.hVASpace) || !c.engineType) st = kErrInvalidArgument;
+                } else { st = kErrInvalidObjectParent; break; }
+                const uint32_t chid = ((c.flags >> 12) & 0x1ff) * 8 + ((c.flags >> 8) & 7);
+                if (!st && chid < 1) st = kErrNoMemory;                     // RM keeps chid 0 (rsvd_chids = 1)
                 if (c.instanceMem.addressSpace != rm::ADDR_FBMEM || c.userdMem.addressSpace != rm::ADDR_FBMEM ||
                     c.mthdbufMem.addressSpace != rm::ADDR_SYSMEM || !c.mthdbufMem.size || c.gpFifoEntries == 0) st = kErrInvalidArgument;
                 if (!st && !g_.Dma(c.mthdbufMem.base, size_t(c.mthdbufMem.size))) st = kErrInvalidArgument;
@@ -370,7 +378,7 @@ private:
                 break;
             case rm::NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN:
                 if (!obj_is(rm::TURING_CHANNEL_GPFIFO_A) || !token_ctrl_supported) st = kErrNotSupported;
-                else W32(p, (2u << 16) | 0u);
+                else W32(p, (2u << 16) | ChannelChid());
                 break;
             default: st = kErrNotSupported; break;
         }
@@ -404,6 +412,14 @@ private:
             const uint8_t* d = g.Dma(addr, 8); uint64_t v = 0; if (d) std::memcpy(&v, d, 8); return v;
         }
     };
+    uint32_t ChannelChid() {
+        for (auto& kv : objs)
+            if (kv.second.cls == brook::nvgsp::rm570::TURING_CHANNEL_GPFIFO_A) {
+                const uint32_t f = R32(kv.second.params.data() + 0x14);
+                return ((f >> 12) & 0x1ff) * 8 + ((f >> 8) & 7);
+            }
+        return ~0u;
+    }
     size_t doorbells_seen = 0;
     bool HostFail(const std::string& s) { host_error = s; return Fail("host: " + s); }
     uint8_t* Va(uint64_t va, size_t n) {
@@ -420,8 +436,8 @@ private:
             const Obj* ch = nullptr;
             for (auto& kv : objs) if (kv.second.cls == rm::TURING_CHANNEL_GPFIFO_A) ch = &kv.second;
             if (!ch || !scheduled) return HostFail("doorbell without a scheduled channel");
-            if (token != ((2u << 16) | 0u)) return HostFail("doorbell token");
             rm::NV_CHANNEL_ALLOC_PARAMS c; std::memcpy(&c, ch->params.data(), sizeof(c));
+            if (token != ((2u << 16) | ChannelChid())) return HostFail("doorbell token");
             const uint64_t userd = c.userdMem.base;
             uint32_t get = g_.Vram32(userd + rm::host::USERD_GP_GET);
             const uint32_t put = g_.Vram32(userd + rm::host::USERD_GP_PUT);

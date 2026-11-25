@@ -36,7 +36,10 @@ namespace brook::nvgsp {
 
 constexpr uint64_t kM2Va = 0x0000002000000000ull;     // 128 GiB: clear of 0 and RM's 4 GiB split-VAS window
 constexpr uint32_t kM2Payload = 0x5eedf00d;
-constexpr uint32_t kM2Chid = 0;                        // nouveau-style USERD page 0 / index 0
+// ChID: RM 570 reserves chid 0 (nouveau r570 fifo rsvd_chids = 1, golden
+// context on 1); P5 on 25 Nov got NV_ERR_NO_MEMORY for chid 0. USERD page =
+// chid / 8, index = chid % 8 (nouveau r535_chan_alloc).
+constexpr uint32_t kM2Chid = 2;
 
 namespace m2h {   // handles (nouveau rm/handles.h style)
 constexpr uint32_t kClient = 0xc1d0b500, kDevice = 0xde1d0000, kSubdevice = 0x5d1d0000, kVaspace = 0x90f10000,
@@ -76,6 +79,8 @@ struct M2Inputs {
     StaticInfo si;
     uint64_t vram_lo = 0, vram_hi = 0;        // VRAM reserved for M2 (inside a client-usable region)
     M2Sys gpfifo, push, sem, mthdbuf;         // sysmem pages; mthdbuf sized from RM's answer (allocated by caller later)
+    uint32_t chid = kM2Chid;
+    bool parent_device = false;               // nouveau style: channel under the device with hVASpace, no explicit TSG
 };
 
 struct M2Result {
@@ -220,7 +225,7 @@ inline M2Result RunM2(Bus& bus, const ChipOps& c, VramIo& vram, const M2Inputs& 
 
     // ---- TSG + channel
     r.stage = "tsg";
-    {
+    if (!in.parent_device) {
         rm::NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS g = {};
         g.hVASpace = m2h::kVaspace; g.engineType = r.ce_engine;
         if (!alloc(m2h::kDevice, m2h::kTsg, rm::KEPLER_CHANNEL_GROUP_A, &g, sizeof(g))) return finish();
@@ -231,9 +236,9 @@ inline M2Result RunM2(Bus& bus, const ChipOps& c, VramIo& vram, const M2Inputs& 
         __builtin_memset(&a, 0, sizeof(a));
         a.gpFifoOffset = kM2Va;
         a.gpFifoEntries = 0x1000 / 8;
-        a.flags = rm::NVOS04_PRIVILEGED_CHANNEL_TRUE | ((kM2Chid % 8) << rm::NVOS04_USERD_INDEX_VALUE_SHIFT) |
-                  ((kM2Chid / 8) << rm::NVOS04_USERD_INDEX_PAGE_VALUE_SHIFT) | rm::NVOS04_USERD_INDEX_PAGE_FIXED_TRUE;
-        a.hVASpace = 0;                                 // TSG channel: VAS comes from the TSG
+        a.flags = rm::NVOS04_PRIVILEGED_CHANNEL_TRUE | ((in.chid % 8) << rm::NVOS04_USERD_INDEX_VALUE_SHIFT) |
+                  ((in.chid / 8) << rm::NVOS04_USERD_INDEX_PAGE_VALUE_SHIFT) | rm::NVOS04_USERD_INDEX_PAGE_FIXED_TRUE;
+        a.hVASpace = in.parent_device ? m2h::kVaspace : 0;   // TSG channel: VAS comes from the TSG
         a.engineType = r.ce_engine;
         a.instanceMem = {r.inst, 0x1000, rm::ADDR_FBMEM, 1};
         a.userdMem = {r.userd, 0x200, rm::ADDR_FBMEM, 1};
@@ -241,7 +246,8 @@ inline M2Result RunM2(Bus& bus, const ChipOps& c, VramIo& vram, const M2Inputs& 
         a.mthdbufMem = {mb.bus, r.mthdbuf_size, rm::ADDR_SYSMEM, 0};
         a.internalFlags = rm::KERNELCHANNEL_PRIVILEGE_ADMIN | (rm::KERNELCHANNEL_ERROR_NOTIFIER_NONE << 2) |
                           (rm::KERNELCHANNEL_ERROR_NOTIFIER_NONE << 4);
-        if (!alloc(m2h::kTsg, m2h::kChannel, rm::TURING_CHANNEL_GPFIFO_A, &a, sizeof(a))) return finish();
+        if (!alloc(in.parent_device ? m2h::kDevice : m2h::kTsg, m2h::kChannel, rm::TURING_CHANNEL_GPFIFO_A, &a, sizeof(a)))
+            return finish();
     }
     r.stage = "bind";
     {
@@ -251,11 +257,13 @@ inline M2Result RunM2(Bus& bus, const ChipOps& c, VramIo& vram, const M2Inputs& 
         if (!api.Control(m2h::kClient, m2h::kChannel, rm::NVA06F_CTRL_CMD_GPFIFO_SCHEDULE, &sp, sizeof(sp))) {
             // a TSG channel may need the group scheduled instead (NVA06C GPFIFO_SCHEDULE 0xa06c0101)
             rm::NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS tp = {1, 0};
-            if (!api.Control(m2h::kClient, m2h::kTsg, 0xa06c0101, &tp, sizeof(tp))) { fail("GPFIFO_SCHEDULE"); return finish(); }
+            if (in.parent_device || !api.Control(m2h::kClient, m2h::kTsg, 0xa06c0101, &tp, sizeof(tp))) {
+                fail("GPFIFO_SCHEDULE"); return finish();
+            }
             r.schedule_on_tsg = true;
         }
     }
-    r.token = (r.runlist << 16) | kM2Chid;
+    r.token = (r.runlist << 16) | in.chid;
     {
         rm::NVC36F_CTRL_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS tk = {};
         r.token_ctrl_ok = api.Control(m2h::kClient, m2h::kChannel, rm::NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN, &tk, sizeof(tk));
