@@ -75,7 +75,7 @@ bool ProcessCapable(Process* p,UserNamespace* target,unsigned capability) {
     return p && UserNamespaceCapable({p->userNamespace,p->euid,p->egid,p->capabilities.effective},target,capability);
 }
 
-extern "C" [[noreturn]] void KernelPanic(const char*,...) {std::abort();}
+extern "C" void KernelPanic(const char*,...) {std::abort();}
 extern "C" void* kmalloc(uint64_t size){
     if(failAllocation==0){failAllocation=-1;failTriggered=true;return nullptr;}
     if(failAllocation>0)--failAllocation;
@@ -92,11 +92,14 @@ void PmmFreePage(PhysicalAddress p){if(!p)return;void* memory=reinterpret_cast<v
 void KRwLockInit(KRwLock* lock){*lock={};fsLocks[lock]=std::make_unique<std::shared_mutex>();}
 void KRwLockReadLock(KRwLock* lock){fsLocks.at(lock)->lock_shared();}
 void KRwLockReadUnlock(KRwLock* lock){fsLocks.at(lock)->unlock_shared();}
-void KRwLockWriteLock(KRwLock* lock){fsLocks.at(lock)->lock();}
-void KRwLockWriteUnlock(KRwLock* lock){fsLocks.at(lock)->unlock();}
+void KRwLockWriteLock(KRwLock* lock){fsLocks.at(lock)->lock();lock->writerActive=1;}
+void KRwLockWriteUnlock(KRwLock* lock){lock->writerActive=0;fsLocks.at(lock)->unlock();}
 void FileObjectInit(FileObject* object){*object={};}
 // This backend fixture bypasses cache/coherence, which has dedicated tests.
 int FileObjectRead(FileObject*,Vnode* vn,void* out,uint64_t bytes,uint64_t* offset){return vn->ops->read(vn,out,bytes,offset);}
+int FileObjectReadTagged(FileObject* object,Vnode* vn,void* out,uint64_t bytes,uint64_t* offset,UsbReadSource) {
+    return FileObjectRead(object,vn,out,bytes,offset);
+}
 int FileObjectWrite(FileObject*,Vnode* vn,const void* in,uint64_t bytes,uint64_t* offset){return vn->ops->write(vn,in,bytes,offset);}
 int FileObjectTruncateUnmapped(FileObject*,Vnode*,uint64_t){assert(false);return -95;}
 int FileObjectGrowMapped(FileObject*,Vnode*,uint64_t){assert(false);return -95;}

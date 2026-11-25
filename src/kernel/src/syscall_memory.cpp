@@ -187,7 +187,7 @@ MappingFaultResult ResolveMappingFaultForSpace(Process* actor,AddressSpaceState*
                 uint64_t remaining=(snapshot.range.end-page)/4096;
                 const uint32_t count=remaining<batch?static_cast<uint32_t>(remaining):batch;
                 bool loaded=false;
-                prepared=FileObjectFaultPages(object,file->vnode,offset/4096,count,pins.pages,&loaded);
+                prepared=FileObjectFaultPages(object,file->vnode,offset/4096,count,pins.pages,&loaded,remaining);
                 for(uint32_t i=0;i<count;++i)if(pins.pages[i]) {
                     __atomic_fetch_add(i==0&&loaded?&g_profCacheMiss:&g_profCacheHit,1,__ATOMIC_RELAXED);
                     if(!operation.StagePage(i,pins.pages[i],true))return MappingFaultResult::Unhandled;

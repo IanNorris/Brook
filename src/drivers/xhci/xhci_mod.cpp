@@ -3614,15 +3614,24 @@ static bool XhciTryUas(XhciController& ctrl,XhciDevice& dev,bool& fallback) {
        !XhciUasCanClaim(ctrl,dev,parsed))return false;
     auto* uas=XhciAllocateUas(parsed);
     if(!uas)return false;
-    if(parsed.alternate && !XhciSelectStorageInterface(ctrl,dev,parsed.interface,parsed.alternate)) {
+    const auto selectStart=MscNowNs();
+    const bool selected=!parsed.alternate ||
+        XhciSelectStorageInterface(ctrl,dev,parsed.interface,parsed.alternate);
+    dev.mscTiming.uasSetInterfaceUs=(MscNowNs()-selectStart)/1000;
+    if(!selected) {
         if(bot)fallback=XhciSelectStorageInterface(ctrl,dev,dev.mscInterface,dev.mscAlternate);
         XhciFreeUas(uas);
         return false;
     }
+    const auto configureStart=MscNowNs();
     const uint32_t cc=XhciConfigureUas(ctrl,dev,*uas);
+    dev.mscTiming.uasConfigureUs=(MscNowNs()-configureStart)/1000;
     if(cc==TRB_CC_SUCCESS) {
         dev.uas=uas;
-        if(XhciIdentifyStorage(ctrl,dev)) {
+        const auto identifyStart=MscNowNs();
+        const bool identified=XhciIdentifyStorage(ctrl,dev);
+        dev.mscTiming.uasIdentifyUs=(MscNowNs()-identifyStart)/1000;
+        if(identified) {
             KPrintf("xhci: UAS ready slot=%u iface=%u alt=%u depth=%u\n",
                 dev.slotId,parsed.interface,parsed.alternate,UsbUasDepth);
             return true;
@@ -3699,12 +3708,14 @@ static int XhciPromoteSystemStorage(UsbMscState& state) {
     }
     const auto block=dev.mscBlockSize;
     const auto sectors=dev.mscSectorCount;
+    const auto dropStart=MscNowNs();
     if(XhciDropStorageEndpoints(ctrl,dev,mask)!=TRB_CC_SUCCESS)return -5;
     XhciDiscardStorageEvents(ctrl,dev,mask);
     FreeDmaBuffer(dev.bulkInRingPhys,1);
     FreeDmaBuffer(dev.bulkOutRingPhys,1);
     dev.bulkInRing=nullptr;dev.bulkOutRing=nullptr;
     dev.bulkInRingPhys=0;dev.bulkOutRingPhys=0;
+    dev.mscTiming.uasDropBotUs=(MscNowNs()-dropStart)/1000;
     bool fallback=false;
     const bool attached=XhciTryUas(ctrl,dev,fallback) || (fallback && XhciStartBot(ctrl,dev));
     if(attached && !dev.uas)XhciProbeBotLimit(state,dev);
