@@ -75,7 +75,7 @@ MARKERS = ('usb-read-only', 'audio-muted', 'hw-inventory', 'boot-status', 'boot-
 ETC_ALLOWED = {*MARKERS, 'i219-attach', 'i219-reset', 'hardware-payload-id', 'resolv.conf', 'machine-id', 'ssl',
                'bridge-v3-operators', 'rtx-update-signer',
                # --session desktop only
-               'live-store', 'usb-system', 'usb-system-trim', 'usb-bot-legacy', 'usb-bot-pipeline', 'volatile-desktop', 'hardware-bulk', 'usb-audio-mixer', 'dp-idle-seconds', 'nv-display', 'chromium-alsa-device'}
+               'live-store', 'usb-system', 'usb-system-trim', 'usb-bot-legacy', 'usb-bot-pipeline', 'usb-uas', 'volatile-desktop', 'hardware-bulk', 'usb-audio-mixer', 'dp-idle-seconds', 'nv-display', 'chromium-alsa-device'}
 # Desktop live stick (--session desktop): the VMware RC session over the RAM
 # store, plus the RTX status helper. If the store does not mount, the services
 # fail to start and the kernel console, bridge and remote update stay usable.
@@ -229,6 +229,8 @@ def desktop_payload(args, initrd):
         record = (f"BRKUSB1\n{uuid.UUID(ssd['partition_guid']).bytes_le.hex()}\n"
                   f"{int(ssd['first_lba'])},{int(ssd['sectors'])}\n{uuid.UUID(ssd['fs_uuid']).hex}\n")
         fat_write(initrd, 'ETC/usb-system', record.encode())
+        if args.usb_uas:
+            fat_write(initrd, 'ETC/usb-uas', b'1\n')
         if args.usb_bot != 'default':
             fat_write(initrd, 'ETC/usb-bot-' + args.usb_bot, b'1\n')
         if args.usb_system_trim:
@@ -441,11 +443,14 @@ def main():
     p.add_argument('--usb-system', type=Path, metavar='SSD_SYSTEM_JSON',
                    help='desktop image: boot /nix persistently from the SSD BROOK_SYSTEM partition described by '
                         'write-brook-ssd-system.sh\'s ssd-system.json (writes /etc/usb-system, not /etc/live-store)')
+    p.add_argument('--usb-uas', action='store_true', help='try tagged USB Attached SCSI in SuperSpeed')
     p.add_argument('--usb-bot', choices=('default', 'legacy', 'pipeline'), default='default',
                    help='USB system BOT test mode: legacy 64 KiB or experimental read data/status pipelining')
     p.add_argument('--usb-system-trim', metavar="'dry-run|run [MIN_MIB [MAX_MIB]]'",
                    help="scan clean ext2 free extents before mount; send UNMAP only with 'run'")
     args = p.parse_args()
+    if args.usb_uas and not args.usb_system:
+        p.error("--usb-uas needs --usb-system")
     if args.usb_bot != "default" and not args.usb_system:
         p.error("--usb-bot needs --usb-system")
     if args.usb_system_trim and (not args.usb_system or not re.fullmatch(

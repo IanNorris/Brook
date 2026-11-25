@@ -54,6 +54,7 @@ def main():
     parser.add_argument("--cold-file", required=True, help="guest absolute regular store file with at least 64 MiB")
     parser.add_argument("--accel", choices=("kvm", "tcg"), default="kvm")
     parser.add_argument("--skip-browser", action="store_true")
+    parser.add_argument("--uas", action="store_true")
     args = parser.parse_args()
     if not args.cold_file.startswith("/nix/store/"):
         parser.error("--cold-file must be under /nix/store")
@@ -71,6 +72,8 @@ def main():
     guest = fixture.Guest(args, system, fallback, "transport-and-ext2")
     try:
         guest.wait_log("USB_SYSTEM_READY")
+        if args.uas:
+            guest.wait_log("xhci: UAS ready")
         guest.attach()
         assert guest.status()["mounted"]
         rows = {}

@@ -215,6 +215,28 @@ def available_port():
         return sock.getsockname()[1]
 
 
+def uas_boot_carrier(base, system, fallback):
+    # OVMF only has a BOT driver. Give firmware an IDE-compatible AHCI
+    # carrier with the same boot partition identity. Brook sees only the
+    # UAS device's matching USB GPT entry, just as on the physical SSD.
+    carrier = base / "firmware-boot.raw"
+    run("cp", "--reflink=auto", "--sparse=always", fallback, carrier)
+    guid = subprocess.check_output(["sfdisk", "--part-uuid", system, "1"], text=True).strip()
+    run("sfdisk", "--no-reread", "--no-tell-kernel", "--part-uuid", carrier, "1", guid)
+    with system.open("rb") as source:
+        source.seek(ESP_FIRST * SECTOR)
+        with carrier.open("r+b") as dest:
+            dest.seek(ESP_FIRST * SECTOR)
+            remaining = ESP_SECTORS * SECTOR
+            while remaining:
+                chunk = source.read(min(MIB, remaining))
+                if not chunk:
+                    raise OSError("short read from firmware boot partition")
+                dest.write(chunk)
+                remaining -= len(chunk)
+    return carrier
+
+
 class Guest:
     def __init__(self, args, system, fallback, case):
         base = args.output / case
@@ -230,6 +252,14 @@ class Guest:
         self.output = (base / "qemu.log").open("x")
         trace_spec = os.environ.get("BROOK_USB_SYSTEM_QEMU_TRACE")
         trace = ["-trace", f"events={trace_spec},file={base / 'qemu-usb.trace'}"] if trace_spec else []
+        if getattr(args, "uas", False):
+            carrier = uas_boot_carrier(base, system, fallback)
+            storage = ["-drive", f"if=none,format=raw,id=carrier,file={carrier},readonly=on",
+                       "-device", "ide-hd,bus=ide.0,drive=carrier,bootindex=1",
+                       "-device", "usb-uas,id=system-usb,bus=usb.0,port=2",
+                       "-device", "scsi-hd,bus=system-usb.0,drive=system"]
+        else:
+            storage = ["-device", "usb-storage,id=system-usb,bus=usb.0,port=2,drive=system,bootindex=1"]
         self.process = subprocess.Popen(
             ["qemu-system-x86_64", "-machine", "q35,i8042=off", *acceleration, "-smp", "4", "-m", "4096",
              "-nodefaults", "-no-reboot", "-display", "none", "-serial", f"file:{self.serial}", *trace,
@@ -240,7 +270,7 @@ class Guest:
              "-drive", f"if=none,format=raw,id=other,file={fallback},readonly=on",
              "-device", "usb-storage,bus=usb.0,port=1,drive=other",
              "-drive", f"if=none,format=raw,id=system,file={system},cache=none,discard=unmap",
-             "-device", "usb-storage,id=system-usb,bus=usb.0,port=2,drive=system,bootindex=1",
+             *storage,
              "-device", "usb-net,bus=usb.0,port=3,netdev=net",
              "-netdev", f"user,id=net,restrict=on,hostfwd=tcp:127.0.0.1:{self.port}-:1234",
              "-device", "usb-hub,bus=usb.0,port=4,id=hub",
@@ -415,6 +445,7 @@ def main():
     parser.add_argument("--operator-seed", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--exercise-detach", action="store_true", help="also unplug the SSD in a running guest")
+    parser.add_argument("--uas", action="store_true", help="use the QEMU USB Attached SCSI device")
     parser.add_argument("--accel", choices=("kvm", "tcg"), default="kvm")
     args = parser.parse_args()
     if args.accel == "kvm" and subprocess.run(["pgrep", "-x", "vmware-vmx"], capture_output=True).returncode == 0:

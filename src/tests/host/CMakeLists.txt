@@ -199,6 +199,7 @@ add_host_test(test_ata_identify)
 add_host_test(test_ahci_readonly_sequence)
 add_host_test(test_xhci_ownership)
 add_host_test(test_usb_block_bytes)
+target_compile_options(test_usb_block_bytes PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_usb_system)
 target_sources(test_usb_system PRIVATE "${BROOK_ROOT}/src/kernel/src/gpt.cpp")
 target_compile_options(test_usb_system PRIVATE "-iquote${BROOK_ROOT}/src/drivers/xhci"
