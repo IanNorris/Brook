@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include "restart_prompt.h"
 namespace brook {
 // One coordinator for the desktop and opted-in VM lifecycle channel.
 void ShutdownConfigure(); // boot-only validated firmware + explicit fw_cfg opt-in
@@ -21,7 +22,19 @@ void ShutdownReportAcSource(AcPowerSource source);
 ShutdownAcStatus ShutdownGetAcStatus();
 // Request/result identities are retained until reboot. Caller binds the boot.
 void ShutdownCommand(const char* id,const char* verb,char state[24],int* error);
+void ShutdownLifecycleCommand(const char* id,const char* verb,char state[24],int* error);
 void ShutdownDesktopRequest(bool restart);
+struct ShutdownRestartStatus {
+    RestartReason reason;
+    RestartDecision decision;
+    uint32_t remainingSeconds;
+    uint32_t token;
+    bool pending, automatic;
+};
+ShutdownRestartStatus ShutdownRestartPromptStatus(const char* requestId = nullptr);
+void ShutdownRestartPromptChoose(uint32_t token, bool restart);
+void ShutdownRestartPending(RestartReason reason);
+void ShutdownRestartPendingNow();
 void ShutdownDesktopCancel();
 void ShutdownDesktopForceApps();
 // Explicit escalation of already-prompted, still-open app windows.

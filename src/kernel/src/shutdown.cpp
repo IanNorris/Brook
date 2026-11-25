@@ -38,7 +38,7 @@ void VfsSyncFailureLog(int stage, uint8_t pdrv, const void* callback, int error)
     KPrintf("vfs: sync: %s failed pdrv=%u callback=%p (%d)\n",names[stage>=0&&stage<3?stage:0],unsigned(pdrv),callback,error);
 }
 namespace {
-enum class Phase { Empty,Closing,Services,Cleanup,Syncing,Ready,Committing,Failed,Cancelled };
+enum class Phase { Empty,Prompting,Rejected,Closing,Services,Cleanup,Syncing,Ready,Committing,Failed,Cancelled };
 struct Operation {
     char id[33];Phase phase;bool restart,automatic,cancel,commit,acLoss;
     bool forceRequested,forceDispatched;
@@ -46,10 +46,15 @@ struct Operation {
     // repeat it). retry/forced: the explicit desktop actions after Failed.
     bool syncFailed,retry,forced;
     int error;
+    RestartPrompt prompt;
+    RestartReason reason;
+    bool forceRestart, automaticAfterPrompt;
 };
 Operation operations[64]{};int current=-1;SpinLock lock{};
 bool workerStarted=false,powerOff=false,powerRestart=false,irreversible=false;
 uint32_t failureGeneration=0;
+uint32_t restartTimeout=RestartDefaultSeconds;
+RestartReason restartPending=RestartReason::None;
 UsbBootRecoveryPolicy usbBootRecovery{};
 constexpr uint64_t AcSampleFreshMs=2000;
 constexpr uint64_t AcSampleIntervalMs=1000;
@@ -79,9 +84,10 @@ WmDebugWindow workerWindows[WM_MAX_WINDOWS];
 // Status and blockers for the current request (under lock). The last status
 // byte is never written, so an unlocked reader always finds a terminator.
 ShutdownBlockerReport blockerReport{};
-void RequestDesktopPower(bool restart,bool acLoss);
+void RequestDesktopPower(bool restart,bool acLoss,RestartReason reason=RestartReason::Agent);
 const char* Name(Phase phase) {
     switch(phase) {
+    case Phase::Prompting:return "prompting";case Phase::Rejected:return "rejected";
     case Phase::Empty:return "missing";case Phase::Closing:return "closing";
     case Phase::Services:return "services";case Phase::Cleanup:return "cleanup";
     case Phase::Syncing:return "syncing";case Phase::Ready:return "ready";
@@ -113,7 +119,7 @@ Process* ReferenceForceApp(const ClientIdentity& identity) {
 bool CanForceAppsLocked(const Operation& op) {
     return op.phase==Phase::Closing && !op.cancel && !op.forceRequested && forceCandidateCount;
 }
-bool Active(Phase phase) {return phase!=Phase::Empty&&phase!=Phase::Failed&&phase!=Phase::Cancelled;}
+bool Active(Phase phase) {return phase!=Phase::Empty&&phase!=Phase::Failed&&phase!=Phase::Cancelled&&phase!=Phase::Rejected;}
 void SetPhase(int index,Phase phase,int error=0) {
     SpinLockAcquire(&lock);operations[index].phase=phase;operations[index].error=error;
     if(phase==Phase::Failed)++failureGeneration;SpinLockRelease(&lock);
@@ -355,6 +361,22 @@ void Worker(void*) {
         }
         int selected;Operation op{};bool captured,ready,polling;uint32_t windows;
         SpinLockAcquire(&lock);selected=current;if(selected>=0)op=operations[selected];captured=closeCaptured;ready=admissionReady;polling=closePolling;windows=guiRemaining;SpinLockRelease(&lock);
+        if(selected>=0 && op.phase==Phase::Prompting) {
+            bool proceed=false;
+            SpinLockAcquire(&lock);
+            if (current==selected && operations[selected].prompt.Tick(ApicTickCount())) {
+                operations[selected].phase=Phase::Closing;
+                operations[selected].automatic=operations[selected].automaticAfterPrompt;
+                proceed=true;
+            }
+            SpinLockRelease(&lock);
+            if (proceed) {
+                KLog("restart: desktop prompt timed out");
+                WmSetLaunchInhibited(true);DebugJobsSetLaunchInhibited(true);
+                SpinLockAcquire(&lock);admissionReady=true;SpinLockRelease(&lock);
+                CompositorMarkDirty();CompositorWake();
+            }
+        }
         if(selected<0||!ready||!Active(op.phase)){SchedulerSleepMs(25);continue;}
         if(op.phase==Phase::Closing) {
             if(op.cancel&&!polling) {
@@ -459,6 +481,12 @@ static bool ReadShutdownOptIn(const char* path) {
 }
 void ShutdownConfigure() {
     PlatformPowerConfigure();
+    if (auto* file=VfsOpen("/etc/restart-prompt-seconds",VFS_O_STREAM)) {
+        char text[5]{};uint64_t offset=0;
+        const int count=VfsRead(file,text,sizeof(text),&offset);
+        if (count>0) restartTimeout=RestartTimeoutSeconds(text,uint32_t(count));
+        VfsRelease(file);
+    }
 #if defined(BROOK_EFI_SHUTDOWN_TEST)
     char injection[2]{};
     if(FwCfgReadFile("opt/brook/usb-reset-inject",injection,sizeof(injection))==1 && injection[0]=='1') {
@@ -517,27 +545,43 @@ void ShutdownStart() {
     if(worker){if(PlatformPowerGetPlan().efiEntry)worker->cpuAffinity=0;workerStarted=true;SchedulerAddProcess(worker);}
 }
 bool ShutdownLaunchAllowed() {
-    SpinLockAcquire(&lock);const bool result=!irreversible&&(current<0||!Active(operations[current].phase));SpinLockRelease(&lock);return result;
+    SpinLockAcquire(&lock);const bool result=!irreversible&&(current<0||!Active(operations[current].phase)||operations[current].phase==Phase::Prompting);SpinLockRelease(&lock);return result;
 }
 namespace {
 void HandleShutdownCommand(const char* id,const char* verb,char state[24],int* error,
-                           bool automatic,bool acLoss) {
-    *error=0;bool admitted=false;SpinLockAcquire(&lock);int found=-1,empty=-1;
+                           bool automatic,bool acLoss,RestartReason desktopReason=RestartReason::Agent,
+                           bool automaticAfterPrompt=true) {
+    *error=0;bool admitted=false;int found=-1,empty=-1;
+    const bool forceRestart=!strcmp(verb,"restart_force");
+    const bool bootUpdate=!strcmp(verb,"restart_boot");
+    const bool softwareUpdate=!strcmp(verb,"restart_software");
+    const bool restart=!strcmp(verb,"restart") || forceRestart || bootUpdate || softwareUpdate;
+    const bool start=!strcmp(verb,"shutdown") || restart;
+    const RestartReason reason=bootUpdate ? RestartReason::BootUpdate :
+        softwareUpdate ? RestartReason::SoftwareUpdate : desktopReason;
+    const bool desktop=restart && WmIsActive() && CompositorGetPhysFb(nullptr);
+    SpinLockAcquire(&lock);
     for(int i=0;i<64;++i){if(operations[i].id[0]&&!strcmp(operations[i].id,id))found=i;else if(!operations[i].id[0]&&empty<0)empty=i;}
-    const bool start=!strcmp(verb,"shutdown")||!strcmp(verb,"restart");const bool restart=!strcmp(verb,"restart");
     const bool forceApps=!strcmp(verb,"force_apps");
     const char* result=nullptr;
-    if(start&&found>=0&&operations[found].restart!=restart){result="conflict";*error=-22;}
+    if(start&&found>=0&&(operations[found].restart!=restart ||
+        (restart && (operations[found].reason!=reason || operations[found].forceRestart!=forceRestart)))){result="conflict";*error=-22;}
     else if(start&&found<0) {
         if(!workerStarted||(restart&&!powerRestart)){result="unsupported";*error=-95;}
         else if(current>=0&&(Active(operations[current].phase)||irreversible)){result="busy";*error=-16;}
         else if(empty<0){result="full";*error=-28;}
         else {
-            found=empty;auto& op=operations[found];memcpy(op.id,id,33);op.phase=Phase::Closing;op.restart=restart;
+            found=empty;auto& op=operations[found];memcpy(op.id,id,33);op.restart=restart;
+            op.reason=restart ? reason : RestartReason::None;
+            op.forceRestart=forceRestart;
+            op.automaticAfterPrompt=automaticAfterPrompt;
+            op.prompt.Begin(ApicTickCount(),restartTimeout,desktop,forceRestart);
+            op.phase=op.prompt.decision==RestartDecision::Prompting ? Phase::Prompting : Phase::Closing;
+            if (restart && reason!=RestartReason::Agent && restartPending!=RestartReason::BootUpdate) restartPending=reason;
             op.automatic=automatic;op.acLoss=acLoss;
             // Admission closes under the launch/job locks before the worker can
             // observe this operation. Already dispatched work is awaited.
-            current=found;closeCaptured=false;guiRemaining=0;windowOwnerCount=0;admissionReady=false;admitted=true;
+            current=found;closeCaptured=false;guiRemaining=0;windowOwnerCount=0;admissionReady=false;admitted=op.phase==Phase::Closing;
             forceCandidateCount=approvedAppCount=0;
             windowless.Reset();memset(&blockerReport,0,sizeof(blockerReport));
         }
@@ -554,7 +598,14 @@ void HandleShutdownCommand(const char* id,const char* verb,char state[24],int* e
                 op.forceRequested=true;
             }
         }
-        if(!strcmp(verb,"cancel")) {if(op.phase==Phase::Closing)op.cancel=true;else if(op.phase!=Phase::Cancelled){result="too_late";*error=-16;}}
+        if(!strcmp(verb,"cancel")) {
+            if(op.phase==Phase::Prompting) {
+                op.prompt.Choose(RestartDecision::Rejected);
+                op.phase=Phase::Rejected;
+                if (restartPending==RestartReason::None) restartPending=op.reason;
+            } else if(op.phase==Phase::Closing) op.cancel=true;
+            else if(op.phase!=Phase::Cancelled && op.phase!=Phase::Rejected){result="too_late";*error=-16;}
+        }
         // After a failed checked shutdown the services are gone and the
         // write barrier stays closed; only these explicit actions remain.
         if(!strcmp(verb,"retry")) {
@@ -573,15 +624,16 @@ void HandleShutdownCommand(const char* id,const char* verb,char state[24],int* e
     }
     unsigned i=0;while(result[i]&&i<23){state[i]=result[i];++i;}state[i]=0;SpinLockRelease(&lock);
     if(admitted) {
+        if (forceRestart) KLog("restart: operator forced prompt bypass");
         WmSetLaunchInhibited(true);DebugJobsSetLaunchInhibited(true);
         SpinLockAcquire(&lock);admissionReady=true;SpinLockRelease(&lock);
     }
     CompositorMarkDirty();CompositorWake();
 }
-void RequestDesktopPower(bool restart,bool acLoss) {
+void RequestDesktopPower(bool restart,bool acLoss,RestartReason reason) {
     char id[33];const auto n=__atomic_add_fetch(&desktopSequence,1ULL,__ATOMIC_RELAXED);
     for(unsigned i=0;i<32;++i)id[i]=i<16?'d':"0123456789abcdef"[(n>>((31-i)*4))&15];id[32]=0;
-    char state[24];int error;HandleShutdownCommand(id,restart?"restart":"shutdown",state,&error,true,acLoss);
+    char state[24];int error;HandleShutdownCommand(id,restart?"restart":"shutdown",state,&error,true,acLoss,reason);
     if(error)__atomic_store_n(&desktopNotice,error==-95?"Requested power transition is unavailable on this machine":"Another shutdown operation is pending",__ATOMIC_RELEASE);
     else __atomic_store_n(&desktopNotice,static_cast<const char*>(nullptr),__ATOMIC_RELEASE);
 }
@@ -589,7 +641,66 @@ void RequestDesktopPower(bool restart,bool acLoss) {
 void ShutdownCommand(const char* id,const char* verb,char state[24],int* error) {
     HandleShutdownCommand(id,verb,state,error,false,false);
 }
+void ShutdownLifecycleCommand(const char* id,const char* verb,char state[24],int* error) {
+    HandleShutdownCommand(id,verb,state,error,false,false,RestartReason::Agent,false);
+}
 void ShutdownDesktopRequest(bool restart) {RequestDesktopPower(restart,false);}
+
+ShutdownRestartStatus ShutdownRestartPromptStatus(const char* requestId) {
+    SpinLockAcquire(&lock);
+    int slot=current;
+    if (requestId) {
+        slot=-1;
+        for (int i=0;i<64;++i)
+            if (operations[i].id[0] && !strcmp(operations[i].id,requestId)) {slot=i;break;}
+    }
+    ShutdownRestartStatus status{restartPending,RestartDecision::Bypassed,0,0,
+        restartPending!=RestartReason::None,false};
+    if (slot>=0 && operations[slot].restart && (requestId || operations[slot].phase==Phase::Prompting)) {
+        const auto& op=operations[slot];
+        status.reason=op.reason;
+        status.decision=op.prompt.decision;
+        status.remainingSeconds=op.prompt.Remaining(ApicTickCount());
+        status.token=uint32_t(slot)+1;
+        status.automatic=op.automatic;
+    }
+    SpinLockRelease(&lock);
+    return status;
+}
+void ShutdownRestartPending(RestartReason reason) {
+    SpinLockAcquire(&lock);
+    if (restartPending!=RestartReason::BootUpdate) restartPending=reason;
+    SpinLockRelease(&lock);
+    CompositorMarkDirty();CompositorWake();
+}
+void ShutdownRestartPendingNow() {
+    SpinLockAcquire(&lock);const auto reason=restartPending;SpinLockRelease(&lock);
+    if (reason!=RestartReason::None) RequestDesktopPower(true,false,reason);
+}
+void ShutdownRestartPromptChoose(uint32_t token,bool restart) {
+    bool proceed=false;
+    SpinLockAcquire(&lock);
+    if (current>=0 && uint32_t(current)+1==token) {
+        auto& op=operations[current];
+        if (op.phase==Phase::Prompting &&
+            op.prompt.Choose(restart?RestartDecision::Accepted:RestartDecision::Rejected)) {
+            if (restart) {
+                op.phase=Phase::Closing;
+                op.automatic=op.automaticAfterPrompt;
+                proceed=true;
+            } else {
+                op.phase=Phase::Rejected;
+                if (restartPending==RestartReason::None) restartPending=op.reason;
+            }
+        }
+    }
+    SpinLockRelease(&lock);
+    if (proceed) {
+        WmSetLaunchInhibited(true);DebugJobsSetLaunchInhibited(true);
+        SpinLockAcquire(&lock);admissionReady=true;SpinLockRelease(&lock);
+    }
+    CompositorMarkDirty();CompositorWake();
+}
 void ShutdownDesktopCancel() {
     char id[33]{};SpinLockAcquire(&lock);if(current>=0)memcpy(id,operations[current].id,33);SpinLockRelease(&lock);
     if(id[0]){char state[24];int error;ShutdownCommand(id,"cancel",state,&error);if(!error)__atomic_store_n(&desktopNotice,static_cast<const char*>(nullptr),__ATOMIC_RELEASE);}
@@ -643,6 +754,8 @@ static const char* DescribePhase(Phase phase,bool restart,bool live=false,bool c
     if(phase==Phase::Closing&&cancelling)return "Cancelling - reopening the desktop";
     if(live&&(phase==Phase::Closing||phase==Phase::Services||phase==Phase::Cleanup)&&blockerReport.status[0])return blockerReport.status;
     switch(phase) {
+    case Phase::Prompting:return "Waiting for restart confirmation";
+    case Phase::Rejected:return "Restart rejected";
     case Phase::Closing:return "Closing apps - resolve save dialogs, or Cancel";
     case Phase::Services:return "Stopping desktop services";
     case Phase::Cleanup:return "Waiting for process cleanup";
@@ -680,7 +793,7 @@ const char* ShutdownDesktopStatus() {
     SpinLockAcquire(&lock);const auto phase=current<0?Phase::Empty:operations[current].phase;
     const bool restart=current>=0&&operations[current].restart,cancelling=current>=0&&operations[current].cancel;
     const bool syncFailed=current>=0&&operations[current].syncFailed;const int error=current>=0?operations[current].error:0;SpinLockRelease(&lock);
-    if(phase!=Phase::Empty&&phase!=Phase::Cancelled)return DescribePhase(phase,restart,true,cancelling,syncFailed,error);
+    if(phase!=Phase::Empty&&phase!=Phase::Cancelled&&phase!=Phase::Rejected)return DescribePhase(phase,restart,true,cancelling,syncFailed,error);
     const auto* notice=__atomic_load_n(&desktopNotice,__ATOMIC_ACQUIRE);return notice?notice:"Applications";
 }
 bool ShutdownReadyForManualPowerOff() {

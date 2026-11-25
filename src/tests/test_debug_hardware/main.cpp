@@ -437,3 +437,8 @@ int main(){
     reply.clear();brook::BridgeReplyBuffer<brook::DebugChannelSend> r;
     const std::string longText(2000,'x');r.quoted(longText.c_str());r.send();assert(reply=='"'+longText+'"');
 }
+
+namespace brook {
+void ShutdownRestartPending(RestartReason) {}
+ShutdownRestartStatus ShutdownRestartPromptStatus(const char*) {return {};}
+}

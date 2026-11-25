@@ -15,7 +15,7 @@ namespace brook {
 enum class WmShellSurfaceKind : uint8_t {
     Taskbar, Launcher, VolumePopup, TrayTooltip, BootSummary, TrayFlyout, PerformanceHud,
     AppTrayMenu, AppTrayTooltip, Notification, Dock,
-    TemperatureFlyout, DiskFlyout, CpuMemoryFlyout, CompositorFlyout, AppFlyout, CalendarFlyout, BuildFlyout,
+    TemperatureFlyout, DiskFlyout, CpuMemoryFlyout, CompositorFlyout, AppFlyout, CalendarFlyout, BuildFlyout, RestartPrompt,
     Count
 };
 inline constexpr WmShellSurfaceKind TaskbarPopupSurfaceKinds[] = {
@@ -48,7 +48,7 @@ uint32_t WmCollectTaskbarPopupSurfaces(uint32_t sw, uint32_t sh, WmShellSurface*
 // Back to front. (mx,my) is the pointer the caller renders hover state with.
 inline uint32_t WmShellSurfaces(uint32_t screenW, uint32_t screenH, int32_t mx, int32_t my,
                                 WmShellSurface (&out)[WM_SHELL_SURFACE_LIMIT],
-                                DesktopRect trayPopup = {}, bool trayMenu = false, DesktopRect notice = {}, bool windowMenu = false)
+                                DesktopRect trayPopup = {}, bool trayMenu = false, DesktopRect notice = {}, bool windowMenu = false, bool restartVisible = false)
 {
     uint32_t count = 0;
     // A focused fullscreen window owns the whole output (WmTaskbarHidden).
@@ -56,6 +56,7 @@ inline uint32_t WmShellSurfaces(uint32_t screenW, uint32_t screenH, int32_t mx, 
         const uint32_t tbY = WmDesktopHeight(screenH);
         out[count++] = {WmShellSurfaceKind::Taskbar, 0, static_cast<int32_t>(tbY), screenW, screenH - tbY, true};
     }
+    if (restartVisible) return count;
     // The side dock: its glass strip while shown, else a flat edge tab while
     // it has entries; nothing otherwise. Fullscreen covers it.
     {

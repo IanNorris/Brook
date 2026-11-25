@@ -26,6 +26,37 @@ def power_blocker_summary(status):
     if status.get('status'):parts.append(f"status={status['status']!r}")
     return ' '.join(parts)
 
+class RestartRejected(RuntimeError):
+    pass
+
+
+def wait_restart(bridge, session, request, status, *, clock=time.monotonic, sleep=time.sleep,
+                 observe=lambda _: None):
+    """Return whether the guest owns the final reset after prompt approval."""
+    deadline=clock()+90+min(600,status.get('prompt_seconds',0))
+    automatic=False
+    while True:
+        observe(status)
+        state=status.get('state')
+        if state=='rejected':
+            raise RestartRejected('Restart rejected on the desktop; the update remains pending')
+        if state in ('failed','unsupported','cancelled','busy','full','conflict'):
+            raise RuntimeError('Restart did not reach checked ready state: '+power_blocker_summary(status))
+        automatic=bool(status.get('restart_automatic')) and status.get('prompt_state') in ('accepted','timeout')
+        if state in ('ready','committing'):
+            return automatic
+        if clock()>=deadline:
+            raise TimeoutError('Restart did not reach checked ready state: '+power_blocker_summary(status)+
+                               f'; inspect the original request {request}, cancel it, or resolve the blockers')
+        sleep(.5)
+        try:
+            status=bridge.power(session,request,'status')
+        except (OSError, TimeoutError, ConnectionError):
+            if automatic:
+                return True  # The subsequent probe must still verify the new boot.
+            raise
+
+
 def verify_v3_boot(caps, expected, kernel_sha, initrd_sha):
     if (caps.get('auth_version')!=3 or caps.get('auth_suite')!=1 or
         caps.get('operator_policy_sha256')!=expected['policy_sha256'] or
@@ -195,28 +226,27 @@ class UpdateRun:
             match=re.search(r'HWUPDATE_ACTIVATED generation=(\d+) slot=([01]) transaction=([0-9a-f]{32})\b',job.get('stdout',{}).get('text',''))
             if not match or (int(match[1]),int(match[2]),match[3])!=(result['generation'],result['slot'],tx):raise RuntimeError('Activation job/response mismatch')
             self.save(state='activated',generation=result['generation'],slot=result['slot'])
-            if not restart:return self.receipt
+            prompt=doctor.get('capabilities',{}).get('restart_prompt_api')==1
+            if not restart:
+                if prompt:
+                    self.save(power=self.bridge.power(session,power_id,'pending',reason='boot_update'))
+                return self.receipt
             self.save(state='restart_dispatched')
-            status=self.bridge.power(session,power_id,'restart');self.save(power=status)
-            # Windowless processes get a bounded SIGTERM/SIGKILL escalation in
-            # the guest (about 15 s after the last window closes); an open
-            # window, such as a save prompt, is never escalated.
-            end=self.clock()+90
-            while status.get('state')!='ready':
-                if status.get('state') in ('failed','unsupported','cancelled'):
-                    raise RuntimeError('Restart did not reach checked ready state: '+power_blocker_summary(status))
-                if self.clock()>=end:
-                    raise TimeoutError('Restart did not reach checked ready state within 90 s: '+power_blocker_summary(status)+
-                        f'; the request is still pending in the guest; cancel with hw_power {power_id} cancel or resolve the blockers')
-                # Half-second polling keeps the single-client guest bridge free for a cancel.
-                self.sleep(.5);status=self.bridge.power(session,power_id,'status');self.save(power=status)
-            self.save(state='restart_commit_dispatched')
+            status=(self.bridge.power(session,power_id,'restart',reason='boot_update') if prompt
+                    else self.bridge.power(session,power_id,'restart'))
             try:
-                committed=self.bridge.power(session,power_id,'commit');self.save(power_commit=committed)
-                if committed.get('error',0):raise RuntimeError('Restart commit was refused')
-            except (OSError,TimeoutError,ConnectionError):
-                # The reset can drop its own acknowledgement. Observe, do not replay.
-                self.save(commit_reply_missing=True)
+                automatic=wait_restart(self.bridge,session,power_id,status,clock=self.clock,
+                                       sleep=self.sleep,observe=lambda power: self.save(power=power))
+            except RestartRejected:
+                self.save(state='restart_rejected')
+                raise
+            if not automatic:
+                self.save(state='restart_commit_dispatched')
+                try:
+                    committed=self.bridge.power(session,power_id,'commit');self.save(power_commit=committed)
+                    if committed.get('error',0):raise RuntimeError('Restart commit was refused')
+                except (OSError,TimeoutError,ConnectionError):
+                    self.save(commit_reply_missing=True)
             self.save(state='awaiting_new_boot')
             end=self.clock()+boot_timeout_s;fresh=None
             while self.clock()<end:
@@ -252,6 +282,8 @@ class UpdateRun:
             if verified.get('exit',{}).get('code')!=0 or ('HARDWARE_PAYLOAD_ID '+expected_payload_id+'\n') not in verified.get('stdout',{}).get('text',''):
                 raise RuntimeError('New boot did not confirm the expected initrd payload ID')
             self.save(state='boot_verified');return self.receipt
+        except RestartRejected:
+            raise
         except Exception as error:
             prior=self.receipt.get('state');self.save(state='needs_inspection',last_stage=prior,error=str(error),
                 recovery='Inspect the same transaction_id and power_request_id. No mutation was retried.')

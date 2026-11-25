@@ -191,7 +191,7 @@ static TaskbarLayout GetTaskbarLayout(uint32_t screenW, uint32_t screenH)
     return ChromeTaskbarLayoutFor(WmChromeStyle(), screenW, screenH, clock,
                                   __atomic_load_n(&g_agentIndicatorState, __ATOMIC_ACQUIRE) != 0,
                                   WmGetTaskbarMetrics(), ids, total, focused, buildText, g_hudMode == WmHudMode::Compact,
-                                  labels, ShellServiceTrayState().itemCount);
+                                  labels, ShellServiceTrayState().itemCount, ShutdownRestartPromptStatus().pending);
 }
 
 // Network indicator. The compositor thread refreshes this cache at most once

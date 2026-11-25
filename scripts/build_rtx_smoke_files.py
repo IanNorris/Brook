@@ -73,7 +73,7 @@ I219_STAGES = {'probe': (), 'attach': ('i219-attach',), 'reset': ('i219-reset',)
 MARKERS = ('usb-read-only', 'audio-muted', 'hw-inventory', 'boot-status', 'boot-stick-update')
 # Exact /etc contents allowed in the initrd (lower-case FAT names).
 ETC_ALLOWED = {*MARKERS, 'i219-attach', 'i219-reset', 'hardware-payload-id', 'resolv.conf', 'machine-id', 'ssl',
-               'bridge-v3-operators', 'rtx-update-signer',
+               'bridge-v3-operators', 'rtx-update-signer', 'restart-prompt-seconds',
                # --session desktop only
                'live-store', 'usb-system', 'usb-profile-plan.pub', 'usb-system-trim', 'usb-bot-legacy', 'usb-bot-pipeline', 'usb-uas', 'usb-uas-fixture', 'volatile-desktop', 'hardware-bulk', 'usb-audio-mixer', 'dp-idle-seconds', 'nv-display', 'chromium-alsa-device',
                # --nv-gsp (GSP-RM M1 bridge verbs) and its firmware record
@@ -419,6 +419,8 @@ def build(args):
     live = None
     if args.session == 'desktop':
         init_rc_bytes, live = desktop_payload(args, initrd)
+    if getattr(args, 'restart_prompt_seconds', None) is not None:
+        fat_write(initrd, "ETC/restart-prompt-seconds", f"{args.restart_prompt_seconds}\n".encode())
     nv_gsp_fw = embed_nv_gsp_firmware(initrd, args.nv_gsp_firmware) if args.nv_gsp_firmware else None
     if args.nv_gsp_firmware_store:
         # The desktop store already carries the set (build_rtx_live_store.py --nv-gsp-firmware).
@@ -547,6 +549,7 @@ def main():
     p.add_argument('--display-max', default='1920x1080', metavar='WxH',
                    help='GOP mode cap in BROOK.CFG (kernel supports up to 4096x2160); outside PREV/ fallback')
     p.add_argument('--allow-dirty', action='store_true')
+    p.add_argument('--restart-prompt-seconds', type=int, choices=range(1, 601), metavar='1..600')
     p.add_argument('--nv-display', action='store_true',
                    help='desktop image: /etc/nv-display = 1 (RTX head-0 flip presentation at desktop start)')
     p.add_argument('--panic-ingest-url-file', type=Path,

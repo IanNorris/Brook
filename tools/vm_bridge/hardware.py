@@ -330,15 +330,32 @@ class Hardware:
             return {'session':session,'guest_boot_id':data['guest_boot_id'],'sequence':sequence,'bytes':size,
                     'crc32':f'{crc:08x}','sha256':hashlib.sha256(packet).hexdigest(),'artifact_path':str(path)}
 
-    def power(self,session,request_id,operation,**_):
+    def power(self,session,request_id,operation,force=False,reason=None,**_):
         validate_id(request_id)
         verbs={'shutdown':'shutdown','restart':'restart','status':'power_status','cancel':'cancel','commit':'commit','force_apps':'force_apps',
                'retry':'retry','force_power_off':'force_power_off'}
-        if not isinstance(operation,str) or operation not in verbs:raise ValueError('Expected shutdown, restart, status, cancel, commit, force_apps, retry or force_power_off')
+        reasons={'boot_update':'boot','software_update':'software'}
+        if not isinstance(force,bool) or (force and (operation!='restart' or reason is not None)):
+            raise ValueError('force is only valid on an unqualified restart')
+        if reason is not None and (reason not in reasons or operation not in ('restart','pending')):
+            raise ValueError('Use an update reason on restart or pending')
+        if not isinstance(operation,str) or (operation not in verbs and operation!='pending'):
+            raise ValueError('Expected shutdown, restart, status, cancel, commit, force_apps, retry, force_power_off or pending')
+        if operation=='pending' and reason is None:
+            raise ValueError('pending needs an update reason')
         with self.session_lock(session) as data:
-            result=self.guest(data,f"bridge hardware power {request_id} {verbs[operation]} {data['guest_boot_id']}")
+            supported=data.get('guest_capabilities',{}).get('restart_prompt_api')==1
+            verb=verbs.get(operation)
+            if force:
+                if not supported: raise ValueError('Guest does not advertise forced prompt bypass')
+                verb='restart_force'
+            elif reason is not None and supported:
+                verb=operation+'_'+reasons[reason]
+            elif operation=='pending':
+                return {'session':session,'guest_boot_id':data['guest_boot_id'],'state':'unsupported'}
+            result=self.guest(data,f"bridge hardware power {request_id} {verb} {data['guest_boot_id']}")
         if 'power_error' in result:raise GuestJobError(result['power_error'])
-        if result.get('power_api')!=1 or result.get('request_id')!=request_id or result.get('operation')!=verbs[operation]:
+        if result.get('power_api')!=1 or result.get('request_id')!=request_id or result.get('operation')!=verb:
             raise GuestJobError('Missing or mismatched power response; inspect this request ID before considering another mutation')
         return {'session':session,'guest_boot_id':data['guest_boot_id'],**result}
 

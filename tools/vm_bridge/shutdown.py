@@ -93,7 +93,7 @@ def operate(session, action, request_id=None, wait_s=10, guest=None):
                 except (OSError,RuntimeError,ValueError) as error:
                     record['observation_error']=str(error);record['completion_unknown']=True
                 write_json(path,record)
-                if record['state'] in {'cancelled','failed','stale','missing','full','unsupported','busy','conflict','too_late','not_ready'}:break
+                if record['state'] in {'cancelled','rejected','failed','stale','missing','full','unsupported','busy','conflict','too_late','not_ready'}:break
                 # A start may advance all the way to power in this call. A
                 # status lookup only observes; commit remains explicit after a
                 # start returned while save dialogs or tasks were blocking.

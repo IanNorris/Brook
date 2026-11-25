@@ -2860,6 +2860,96 @@ static int AdmitLauncherItem(const LauncherSnapshot& catalog, int itemIdx, bool 
 #include "wm_shell_launcher.inc"
 #include "wm_shell_dock.inc"
 
+namespace {
+bool restartMenuOpen;
+DesktopRect RestartPopupRect(uint32_t sw,uint32_t sh,const ShutdownRestartStatus& status) {
+    const bool prompt=status.decision==RestartDecision::Prompting;
+    if (!g_wmActive || (!prompt && (!status.pending || !restartMenuOpen)) || !sw || !sh) return {};
+    const auto style=WmChromeStyle();
+    auto rect=ChromeNoticeRect(style,sw,WmDesktopHeight(sh),prompt?2:1);
+    if (prompt) {
+        const int width=WmDesktopMetrics().pixels(500);
+        rect.w=width<int(sw)?width:int(sw);
+        rect.x=(int(sw)-rect.w)/2;
+        rect.y=(int(WmDesktopHeight(sh))-rect.h)/2;
+        if (rect.y<0) rect.y=0;
+    } else {
+        const auto target=ChromeRestartTaskbarTarget(style,GetTaskbarLayout(sw,sh));
+        rect.x=target.x+rect.w<=int(sw)?target.x:int(sw)-rect.w;
+    }
+    return rect;
+}
+}
+
+bool WmRestartPromptRect(uint32_t sw,uint32_t sh,int32_t* x,int32_t* y,uint32_t* w,uint32_t* h) {
+    const auto rect=RestartPopupRect(sw,sh,ShutdownRestartPromptStatus());
+    if (rect.w<=0 || rect.h<=0) return false;
+    *x=rect.x;*y=rect.y;*w=uint32_t(rect.w);*h=uint32_t(rect.h);
+    return true;
+}
+
+bool WmRestartPromptPress(int32_t x,int32_t y,uint32_t sw,uint32_t sh) {
+    const auto status=ShutdownRestartPromptStatus();
+    const auto rect=RestartPopupRect(sw,sh,status);
+    if (!rect.contains(x,y)) {
+        if (restartMenuOpen) {restartMenuOpen=false;CompositorMarkDirty();}
+        return false;
+    }
+    const auto style=WmChromeStyle();
+    if (status.decision==RestartDecision::Prompting) {
+        if (ChromeNoticeActionRect(style,rect,2,0).contains(x,y)) {
+            restartMenuOpen=false;
+            ShutdownRestartPromptChoose(status.token,true);
+        } else if (ChromeNoticeActionRect(style,rect,2,1).contains(x,y) ||
+                   ChromeNoticeCloseRect(style,rect).contains(x,y)) {
+            restartMenuOpen=false;
+            ShutdownRestartPromptChoose(status.token,false);
+        }
+    } else {
+        if (ChromeNoticeActionRect(style,rect,1,0).contains(x,y)) ShutdownRestartPendingNow();
+        restartMenuOpen=false;
+        CompositorMarkDirty();
+    }
+    return true;
+}
+
+bool WmRestartPendingPress(int32_t x,int32_t y,uint32_t sw,uint32_t sh) {
+    const auto status=ShutdownRestartPromptStatus();
+    if (WmTaskbarHidden() || !status.pending || status.decision==RestartDecision::Prompting) return false;
+    const auto style=WmChromeStyle();
+    if (!ChromeRestartTaskbarTarget(style,GetTaskbarLayout(sw,sh)).contains(x,y)) return false;
+    restartMenuOpen=true;
+    CompositorMarkDirty();CompositorWake();
+    return true;
+}
+
+static void WmCaptureRestartPrompt(uint32_t sw,uint32_t sh,int32_t mx,int32_t my,ChromeShellModel& model) {
+    const auto status=ShutdownRestartPromptStatus();
+    const auto rect=RestartPopupRect(sw,sh,status);
+    if (rect.w<=0 || rect.h<=0) return;
+    const bool prompt=status.decision==RestartDecision::Prompting;
+    model.kind=ChromeShellKind::Notification;
+    model.rect=rect;
+    model.mouseX=mx;model.mouseY=my;
+    auto& notice=model.tray.notice;
+    strcpy(notice.app,"Brook");
+    if (prompt) {
+        strcpy(notice.title,"Brook will restart to finish updating in ");
+        strcpy(notice.body,RestartReasonText(status.reason));
+        char* countdown=notice.title+strlen(notice.title);
+        DesktopNumber(countdown,status.remainingSeconds);
+        strcpy(countdown+strlen(countdown)," s");
+        notice.actionCount=2;
+        strcpy(notice.actions[0],"Restart now");
+        strcpy(notice.actions[1],"Not now");
+    } else {
+        strcpy(notice.title,"Restart pending");
+        strcpy(notice.body,RestartReasonText(status.reason));
+        notice.actionCount=1;
+        strcpy(notice.actions[0],"Restart now");
+    }
+}
+
 bool WmCaptureShellModel(const WmShellSurface& placed, uint32_t screenW, uint32_t screenH,
                          uint64_t uptimeMs, int32_t mx, int32_t my, ChromeShellModel& model)
 {
@@ -2886,6 +2976,7 @@ bool WmCaptureShellModel(const WmShellSurface& placed, uint32_t screenW, uint32_
         break;
     case WmShellSurfaceKind::Count: break;
     case WmShellSurfaceKind::PerformanceHud: WmCapturePerformanceHud(screenW, screenH, mx, my, model); break;
+    case WmShellSurfaceKind::RestartPrompt: WmCaptureRestartPrompt(screenW,screenH,mx,my,model); break;
     case WmShellSurfaceKind::BootSummary: WmCaptureBootSummary(screenW, screenH, model); break;
     case WmShellSurfaceKind::Dock: WmCaptureDock(screenW, screenH, mx, my, model); break;
     case WmShellSurfaceKind::AppTrayMenu:
@@ -3605,6 +3696,7 @@ BrookDesktopSurface WmShellSurfaceRecord(const WmShellSurface& surface,uint64_t 
         break;
     case WmShellSurfaceKind::Count: break;
     case WmShellSurfaceKind::PerformanceHud: kind=BROOK_DESKTOP_SURFACE_PERFORMANCE_HUD;break;
+    case WmShellSurfaceKind::RestartPrompt:
     case WmShellSurfaceKind::BootSummary: kind=BROOK_DESKTOP_SURFACE_BOOT_SUMMARY;break;
     case WmShellSurfaceKind::Dock: kind=BROOK_DESKTOP_SURFACE_DOCK;break;
     case WmShellSurfaceKind::AppTrayMenu: kind=BROOK_DESKTOP_SURFACE_TRAY_FLYOUT;break;

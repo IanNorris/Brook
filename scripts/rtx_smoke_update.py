@@ -198,7 +198,8 @@ class Run:
         _, result = self.job(session, ['/boot/HWRTXUP.ELF', '--confirm'], name='confirm_job')
         return result.get('exit', {}).get('code'), result.get('stdout', {}).get('text', '').strip()
 
-    def restart(self, session, data, operator_file, boot, timeout):
+    def restart(self, session, data, operator_file, boot, timeout, reason=None):
+        from hardware_update_workflow import RestartRejected, wait_restart
         state = self.bridge.command(session, 'bridge hardware caps').get('usb_system', {})
         if state.get('profile_transfer_ready'):
             script = ('if [[ -f /boot/USBSTAGE.RC ]]; then '
@@ -210,17 +211,18 @@ class Run:
                 raise RuntimeError('Profile job lock is active or unavailable; restart refused')
         power_id = uuid.uuid4().hex
         self.save(state='restart_dispatched', power_request_id=power_id)
-        status = self.bridge.power(session, power_id, 'restart')
-        end = time.monotonic() + 90
-        while status.get('state') != 'ready':
-            if status.get('state') in ('failed', 'unsupported', 'cancelled') or time.monotonic() > end:
-                raise RuntimeError(f'restart not ready: {status}')
-            time.sleep(0.5)
-            status = self.bridge.power(session, power_id, 'status')
+        status = self.bridge.power(session, power_id, 'restart', **({'reason':reason} if reason else {}))
         try:
-            self.save(power_commit=self.bridge.power(session, power_id, 'commit'))
-        except (OSError, TimeoutError, ConnectionError, RuntimeError):
-            self.save(commit_reply_missing=True)  # the reset may drop its own reply
+            automatic=wait_restart(self.bridge,session,power_id,status,
+                                   observe=lambda power: self.save(power=power))
+        except RestartRejected:
+            self.save(state='restart_rejected')
+            raise
+        if not automatic:
+            try:
+                self.save(power_commit=self.bridge.power(session,power_id,'commit'))
+            except (OSError,TimeoutError,ConnectionError,RuntimeError):
+                self.save(commit_reply_missing=True)
         self.save(state='awaiting_new_boot')
         end = time.monotonic() + timeout
         while time.monotonic() < end:
@@ -421,8 +423,10 @@ class Run:
             return self.receipt
         self.save(state='updated', update=final)
         if not restart:
+            if data.get('guest_capabilities', {}).get('restart_prompt_api') == 1:
+                self.save(power=self.bridge.power(session, uuid.uuid4().hex, 'pending', reason='boot_update'))
             return self.receipt
-        fresh = self.restart(session, data, data['operator_key_file'], boot, boot_timeout)
+        fresh = self.restart(session, data, data['operator_key_file'], boot, boot_timeout, reason='boot_update')
         new = fresh['session']
         observed = self.payload_id(new)
         stick = self.status(new)

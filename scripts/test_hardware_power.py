@@ -110,7 +110,9 @@ def main():
    request=uuid.uuid4().hex;power_args=dict(session=session,request_id=request)
    if operation=='q35-stop':
     refused=rpc.tool('hw_power',{**power_args,'operation':'restart'});assert refused['state']=='unsupported' and refused['error']==-95,refused
-   started=rpc.tool('hw_power',{**power_args,'operation':'restart' if operation=='restart' else 'shutdown'});assert started['state']=='closing',started
+   start_args={**power_args,'operation':'restart' if operation=='restart' else 'shutdown'}
+   if operation=='restart' and doctor['capabilities'].get('restart_prompt_api')==1:start_args['force']=True
+   started=rpc.tool('hw_power',start_args);assert started['state']=='closing',started
    # Same ID is a status observation from here, never replay the mutation.
    states=[];deadline=time.monotonic()+90
    while time.monotonic()<deadline:

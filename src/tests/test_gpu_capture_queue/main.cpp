@@ -1,3 +1,4 @@
+#include "shutdown.h"
 #include <cstdio>
 #include <cstdlib>
 #include <thread>
@@ -103,6 +104,10 @@ bool WmVolumePopupVisible(){return volumeVisible;}
 void WmVolumePopupGetRect(uint32_t,uint32_t,int32_t* x,int32_t* y,uint32_t* w,uint32_t* h){*x=4;*y=1;*w=2;*h=2;}
 bool WmPointerCaptureActive(){return false;}
 bool WmIsActive(){return false;}
+bool WmRestartPromptRect(uint32_t,uint32_t,int32_t*,int32_t*,uint32_t*,uint32_t*){return false;}
+bool WmRestartPromptPress(int32_t,int32_t,uint32_t,uint32_t){return false;}
+bool WmRestartPendingPress(int32_t,int32_t,uint32_t,uint32_t){return false;}
+ShutdownRestartStatus ShutdownRestartPromptStatus(const char*){return {};}
 void WmGetShellTrayGeometry(uint32_t, uint32_t, int32_t, int32_t, WmShellTrayGeometry& out) { out = {}; }
 void DesktopDiskSetVisible(bool) {}
 void DesktopStatsSetVisible(DesktopStatsPanel) {}

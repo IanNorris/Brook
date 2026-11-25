@@ -80,7 +80,8 @@ ChromeTaskbarLayout ChromeTaskbarLayoutFor(const ChromeStyle& s, uint32_t screen
                                            const CalendarClock& clock, bool agent, uint32_t enabledMetrics,
                                            const int* ids, int total, int focused, const char* buildText = nullptr,
                                            bool compactHud = false, const char* const* labels = nullptr,
-                                           uint32_t trayAppCount = 0);
+                                           uint32_t trayAppCount = 0, bool restartPending = false);
+DesktopRect ChromeRestartTaskbarTarget(const ChromeStyle& style, const ChromeTaskbarLayout& layout);
 
 struct ChromeTaskbarButton {
     const uint32_t* icon;   // borrowed; null: missing glyph

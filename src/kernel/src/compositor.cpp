@@ -2281,12 +2281,18 @@ static ShellFrame CaptureShellFrame(uint32_t width, uint32_t height, uint64_t no
     WmShellSurface surfaces[WM_SHELL_SURFACE_LIMIT];
     WmShellTrayGeometry tray{};
     WmGetShellTrayGeometry(owner.w, owner.h, ownerMx, ownerMy, tray);
-    const uint32_t count = WmShellSurfaces(owner.w, owner.h, ownerMx, ownerMy, surfaces, tray.popup, tray.menu, tray.notice, tray.windowMenu);
+    const ShellView primary=multi ? ShellViewOf(outputs,0) : owner;
+    WmShellSurface restart{WmShellSurfaceKind::RestartPrompt,0,0,0,0,true};
+    const bool restartVisible=WmRestartPromptRect(primary.w,primary.h,&restart.x,&restart.y,&restart.w,&restart.h);
+    const uint32_t count = WmShellSurfaces(owner.w, owner.h, ownerMx, ownerMy, surfaces, tray.popup, tray.menu,
+                                          tray.notice, tray.windowMenu, restartVisible && owner.output==0);
     uint32_t kindMask = 0;
     bool diskVisible = false;
     auto statsPanel = DesktopStatsPanel::None;
     auto append = [&](WmShellSurface surface, const ShellView& view, uint64_t key, uint8_t detached) {
-        if (frame.count >= WM_SHELL_SURFACE_LIMIT) return;
+        if (frame.count >= WM_SHELL_SURFACE_LIMIT ||
+            (restartVisible && surface.kind!=WmShellSurfaceKind::RestartPrompt &&
+             frame.count+1==WM_SHELL_SURFACE_LIMIT)) return;
         const bool fallback = !key;
         if (fallback) {
             if (surface.kind != WmShellSurfaceKind::Taskbar) return;
@@ -2331,7 +2337,7 @@ static ShellFrame CaptureShellFrame(uint32_t width, uint32_t height, uint64_t no
         const ShellView view = ShellViewOf(outputs, i);
         const int32_t localMx = int32_t(int64_t(mx) - view.x), localMy = int32_t(int64_t(my) - view.y);
         const bool hidden = WmTaskbarHiddenOn(i);
-        if (i == 0 && !hidden) {
+        if (i == 0 && !hidden && !restartVisible) {
             WmShellSurface dock{WmShellSurfaceKind::Dock, 0, 0, 0, 0, false};
             if (WmDockSurfaceRect(view.w, view.h, &dock.x, &dock.y, &dock.w, &dock.h, &dock.material)) {
                 kindMask |= 1u << uint32_t(WmShellSurfaceKind::Dock);
@@ -2343,6 +2349,11 @@ static ShellFrame CaptureShellFrame(uint32_t width, uint32_t height, uint64_t no
         const WmShellSurface bar{WmShellSurfaceKind::Taskbar, 0, int32_t(top), view.w, view.h - top, true};
         append(bar, view, ShellServiceCaptureDetached(slot, bar, view.w, view.h, now, localMx, localMy), uint8_t(slot + 1));
         ++slot;
+    }
+    if (restartVisible) {
+        const int32_t x=int32_t(int64_t(mx)-primary.x),y=int32_t(int64_t(my)-primary.y);
+        kindMask |= 1u << uint32_t(restart.kind);
+        append(restart,primary,ShellServiceCapture(restart,primary.w,primary.h,now,x,y),0);
     }
     if ((kindMask & (1u << uint32_t(WmShellSurfaceKind::Taskbar))) &&
         !(kindMask & (1u << uint32_t(WmShellSurfaceKind::Launcher))) &&
@@ -3735,7 +3746,9 @@ static void CompositorHandleMouseWM()
         DbgPrintf("WM: click at (%d,%d)\n", mx, my);
         // Transient flyouts consume their dismissing clicks. Pinned panels
         // handle only their own controls and let desktop clicks through.
-        if (WmVolumeLeftPress(sx, sy, sv.w, sv.h) ||
+        if (WmRestartPendingPress(sx, sy, sv.w, sv.h) ||
+            WmRestartPromptPress(dockX, dockY, dv.w, dv.h) ||
+            WmVolumeLeftPress(sx, sy, sv.w, sv.h) ||
             WmTrayFlyoutPress(sx, sy, sv.w, sv.h) ||
             WmPerformanceHudPress(sx, sy, sv.w, sv.h))
         {
@@ -5476,6 +5489,11 @@ static void CompositorThreadFn(void* /*arg*/)
         // Shutdown must also drain window state when there is no window
         // manager scene or rendering has been halted.
         ShutdownCompositorPoll();
+        {
+            static uint32_t restartSeconds;
+            const auto seconds=ShutdownRestartPromptStatus().remainingSeconds;
+            if (seconds!=restartSeconds) {restartSeconds=seconds;CompositorMarkDirty();}
+        }
         {
             // A failed checked shutdown must not leave a silent desktop:
             // open the launcher, which shows the failure and its actions.

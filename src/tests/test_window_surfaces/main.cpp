@@ -76,6 +76,9 @@ void ShutdownDesktopRetry() { CHECK(shutdownFailed);++retryCalls; }
 void ShutdownDesktopForcePowerOff() { CHECK(shutdownFailed);++forcePowerOffCalls; }
 void ShutdownDesktopRequest(bool) { std::abort(); }
 void ShutdownDesktopCancel() { std::abort(); }
+ShutdownRestartStatus ShutdownRestartPromptStatus(const char*) { return {}; }
+void ShutdownRestartPromptChoose(uint32_t,bool) { std::abort(); }
+void ShutdownRestartPendingNow() { std::abort(); }
 Process* KernelThreadCreate(const char*, KernelThreadFn, void*, uint8_t) { std::abort(); }
 void SchedulerAddProcess(Process*) { std::abort(); }
 extern "C" void SchedulerSleepMs(uint32_t) { std::abort(); }

@@ -4,7 +4,7 @@ import json,sys,tempfile,unittest
 from pathlib import Path
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'tools'))
-from hardware_update_workflow import UpdateRun
+from hardware_update_workflow import RestartRejected, UpdateRun, wait_restart
 from hardware_update_protocol import upload
 
 class Clock:
@@ -88,6 +88,19 @@ class Tests(unittest.TestCase):
         return UpdateRun(self.bridge,self.output,self.uploader,self.clock.time,self.clock.sleep).execute(
             'original',self.key,self.kernel,self.initrd,activate,restart,'candidate' if restart else None)
     def receipt(self):return json.loads((self.output/'receipt.json').read_text())
+    def test_prompt_rejection_stops_before_commit(self):
+        self.bridge.blocked={'state':'rejected','prompt_state':'rejected'}
+        with self.assertRaisesRegex(RestartRejected,'remains pending'):
+            wait_restart(self.bridge,'session','original',{'state':'prompting','prompt_seconds':60},
+                         sleep=lambda _:None)
+        self.assertEqual(self.bridge.calls,[('power','session','original','status')])
+
+    def test_prompt_timeout_leaves_commit_to_guest(self):
+        self.bridge.blocked={'state':'ready','prompt_state':'timeout','restart_automatic':True}
+        self.assertTrue(wait_restart(self.bridge,'session','original',
+                                     {'state':'prompting','prompt_seconds':60},sleep=lambda _:None))
+        self.assertEqual(self.bridge.calls,[('power','session','original','status')])
+
     def test_activation_without_reboot(self):
         result=self.execute();self.assertEqual(result['state'],'activated')
         self.assertFalse(any(call[0]=='power' for call in self.bridge.calls))

@@ -148,6 +148,9 @@ uint32_t WmDesktopSurfaceRecords(BrookDesktopSurface* out,uint32_t max);
 using WmRect = DesktopRect;
 // Even nonzero values identify a stable badge style; odd means an update is in progress.
 uint64_t WmBackdropStyleVersion();
+bool WmRestartPromptRect(uint32_t sw,uint32_t sh,int32_t* x,int32_t* y,uint32_t* w,uint32_t* h);
+bool WmRestartPromptPress(int32_t x,int32_t y,uint32_t sw,uint32_t sh);
+bool WmRestartPendingPress(int32_t x,int32_t y,uint32_t sw,uint32_t sh);
 bool WmBootSummaryRect(uint32_t,uint32_t,int32_t*,int32_t*,uint32_t*,uint32_t*);
 static constexpr uint8_t WM_CHROME_TITLE_ALPHA = 255;
 static constexpr int WM_BTN_RIGHT_PAD = 0;

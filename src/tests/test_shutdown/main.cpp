@@ -97,6 +97,9 @@ int AhciSystemQemuLargeDataFinalSync(){assert(writebackStopped && canFreeze && !
 #endif
 int UsbSystemFinalSync(int error){return error;}
 int WritableDesktopFinalSync(){assert(writebackStopped && canFreeze && !syncError);++finalCalls;return finalError;}
+static bool promptDesktop;
+bool WmIsActive(){return promptDesktop;}
+volatile uint32_t* CompositorGetPhysFb(uint32_t*){static uint32_t pixel;return promptDesktop?&pixel:nullptr;}
 void CompositorMarkDirty(){}
 void CompositorWake(){}
 uint32_t FwCfgReadFile(const char*,void*,uint32_t){return 0;}
@@ -257,8 +260,61 @@ void TestConfirmedForceApps() {
     censusCount=0;current=-1;irreversible=false;visible=false;
 }
 }
+static void TestRestartPromptPolicy() {
+    using namespace brook;
+    RestartPrompt prompt;
+    assert(RestartTimeoutSeconds("60\n",3)==60);
+    assert(RestartTimeoutSeconds("15\n",3)==15);
+    assert(RestartTimeoutSeconds("0",1)==60 && RestartTimeoutSeconds("601",3)==60);
+    assert(RestartTimeoutSeconds("1x",2)==60);
+    prompt.Begin(100,60,true,false);
+    assert(prompt.decision==RestartDecision::Prompting && prompt.Remaining(100)==60);
+    assert(prompt.Remaining(60099)==1 && !prompt.Tick(60099));
+    assert(prompt.Tick(60100) && prompt.decision==RestartDecision::Timeout);
+    assert(!prompt.Choose(RestartDecision::Rejected));
+    prompt.Begin(200,10,true,false);
+    assert(prompt.Choose(RestartDecision::Rejected) && !prompt.Tick(10200));
+    prompt.Begin(200,10,true,false);
+    assert(prompt.Choose(RestartDecision::Accepted) && !prompt.Tick(10200));
+    prompt.Begin(200,10,false,false);
+    assert(prompt.decision==RestartDecision::Bypassed && !prompt.Tick(20000));
+    prompt.Begin(200,10,true,true);
+    assert(prompt.decision==RestartDecision::Bypassed);
+}
+
+static void TestRestartPromptCoordinator() {
+    using namespace brook;
+    current=-1;irreversible=false;acRecovery={};powerRestart=true;
+    launched=jobsAllowed=true;promptDesktop=true;restartTimeout=2;
+    const char* rejected="baaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const char* accepted="bbaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const char* timeout="bbbaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    command(rejected,"restart_boot","prompting");
+    const auto first=ShutdownRestartPromptStatus(rejected);
+    assert(first.remainingSeconds==2&&first.reason==RestartReason::BootUpdate);
+    assert(launched&&jobsAllowed&&ShutdownLaunchAllowed());
+    ShutdownRestartPromptChoose(first.token,false);
+    command(rejected,"power_status","rejected");
+    assert(ShutdownRestartPromptStatus().pending&&launched&&jobsAllowed);
+    command(accepted,"restart_software","prompting");
+    ShutdownRestartPromptChoose(first.token,true); // stale click
+    command(accepted,"power_status","prompting");
+    ShutdownRestartPromptChoose(ShutdownRestartPromptStatus(accepted).token,true);
+    command(accepted,"power_status","closing");
+    assert(ShutdownRestartPromptStatus(accepted).decision==RestartDecision::Accepted);
+    assert(!launched&&!jobsAllowed&&ShutdownRestartPromptStatus(accepted).automatic);
+    command(accepted,"cancel","closing");
+    step();
+    command(timeout,"restart","prompting");
+    tick+=2000;
+    step();
+    command(timeout,"power_status","closing");
+    assert(ShutdownRestartPromptStatus(timeout).decision==RestartDecision::Timeout);
+}
+
 int main(){
     TestAcShutdownRecord();
+    TestRestartPromptPolicy();
     using namespace brook;workerStarted=false;
     command(id,"shutdown","unsupported",-95);assert(launched&&jobsAllowed);
     workerStarted=true;powerOff=true;powerRestart=true;
@@ -379,6 +435,7 @@ step();assert(!signals&&!syncs&&!gate);
     TestWindowlessEscalation();
     TestConfirmedForceApps();
     TestFailureRecovery();
+    TestRestartPromptCoordinator();
     // Never execute the host's actual power I/O from this native fixture.
     std::puts("SHUTDOWN_COORDINATOR PASS");
 }

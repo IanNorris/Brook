@@ -435,12 +435,12 @@ def run_one(args, base, topology):
         request = uuid.uuid4().hex
         power = rpc.tool('hw_power', {'session': session, 'request_id': request, 'operation': 'restart'})
         results['power_request'] = power.get('state')
-        deadline = time.monotonic() + 60
+        deadline = time.monotonic() + 90 + power.get('prompt_seconds', 0)
         while time.monotonic() < deadline and owner.poll() is None:
             try:
                 status = rpc.tool('hw_power', {'session': session, 'request_id': request, 'operation': 'status'})
                 results.setdefault('power_states', []).append(status.get('state'))
-                if status.get('state') == 'ready':
+                if status.get('state') == 'ready' and not status.get('restart_automatic'):
                     rpc.tool('hw_power', {'session': session, 'request_id': request, 'operation': 'commit'})
             except RuntimeError:
                 pass

@@ -299,6 +299,7 @@ class Guest:
                     "host": "127.0.0.1", "port": self.port, "auth_mode": "v3",
                     "operator_key_file": str(self.key)})
                 self.session = attached["session"]
+                self.restart_prompt_api = attached["guest"].get("restart_prompt_api") == 1
                 return attached["guest"]
             except RuntimeError:
                 if time.monotonic() >= deadline:
@@ -326,7 +327,8 @@ class Guest:
     def restart(self):
         request = uuid.uuid4().hex
         (self.base / "restart-id").write_text(request + "\n")
-        self.call("hw_power", request_id=request, operation="restart")
+        self.call("hw_power", request_id=request, operation="restart",
+                  **({"force": True} if self.restart_prompt_api else {}))
         deadline = time.monotonic() + 60
         while self.process.poll() is None and time.monotonic() < deadline:
             status = self.call("hw_power", request_id=request, operation="status")

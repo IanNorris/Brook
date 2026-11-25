@@ -311,7 +311,7 @@ void PowerCaps(Reply& r){
     r.text(",\"reset_reason\":");r.quoted(power.resetReason);r.text(",\"power_off_reason\":");r.quoted(power.powerOffReason);
 }
 void DesktopCaps(Reply& r){
-    r.text(",\"power_api\":1,\"power\":{");PowerCaps(r);r.text("}");
+    r.text(",\"power_api\":1,\"restart_prompt_api\":1,\"power\":{");PowerCaps(r);r.text("}");
 #if !defined(BROOK_SSD_GUARD_CHECK) || defined(BROOK_SSD_GUARDED_DESKTOP)
     r.text(",\"recovery_panic_api\":1");
 #endif
@@ -2251,7 +2251,7 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
     }
     constexpr char powerPrefix[]="bridge hardware power ";
     if(Prefix(command,powerPrefix)){
-        const char* p=command+sizeof(powerPrefix)-1;char id[33]{},boot[33]{},verb[16]{};
+        const char* p=command+sizeof(powerPrefix)-1;char id[33]{},boot[33]{},verb[24]{};
         bool valid=ReadId(p,id) && *p++==' ';
         unsigned bytes=0;
         if(valid){while(*p && *p!=' ' && bytes<sizeof(verb)-1)verb[bytes++]=*p++;}
@@ -2262,15 +2262,28 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         // checked shutdown; ShutdownCommand accepts them only for the current
         // operation in Failed after an irreversible stage (retry: a failed final
         // sync; force_power_off: only where power-off is supported).
-        if(strcmp(verb,"shutdown") && strcmp(verb,"restart") && strcmp(verb,"power_status") && strcmp(verb,"cancel") && strcmp(verb,"commit") && strcmp(verb,"force_apps") &&
+        const bool pendingBoot=!strcmp(verb,"pending_boot");
+        const bool pendingSoftware=!strcmp(verb,"pending_software");
+        if(!pendingBoot && !pendingSoftware && strcmp(verb,"restart_force") &&
+           strcmp(verb,"restart_boot") && strcmp(verb,"restart_software") &&
+           strcmp(verb,"shutdown") && strcmp(verb,"restart") && strcmp(verb,"power_status") && strcmp(verb,"cancel") && strcmp(verb,"commit") && strcmp(verb,"force_apps") &&
            strcmp(verb,"retry") && strcmp(verb,"force_power_off")){
             DebugChannelSend("{\"power_error\":\"Unsupported power operation\"}\n");return true;
         }
-        char state[24]{};int error=0;ShutdownCommand(id,verb,state,&error);
+        char state[24]{};int error=0;
+        if (pendingBoot || pendingSoftware) {
+            ShutdownRestartPending(pendingBoot?RestartReason::BootUpdate:RestartReason::SoftwareUpdate);
+            memcpy(state,"pending",8);
+        } else ShutdownCommand(id,verb,state,&error);
+        const auto prompt=ShutdownRestartPromptStatus(id);
         Reply r;r.text("{\"power_api\":1,\"request_id\":");r.quoted(id);r.text(",\"operation\":");r.quoted(verb);
         r.text(",\"state\":");r.quoted(state);r.text(",\"error\":");
         if(error<0){r.text("-");r.number(static_cast<uint64_t>(-int64_t(error)));}else r.number(error);
         ShutdownBlockerReport blockers{};ShutdownRequestBlockers(id,&blockers);
+        r.text(",\"prompt_state\":");r.quoted(RestartDecisionName(prompt.decision));
+        r.text(",");r.field("prompt_seconds",prompt.remainingSeconds);
+        r.text(",\"restart_pending\":");r.text(prompt.pending?"true":"false");
+        r.text(",\"restart_automatic\":");r.text(prompt.automatic?"true":"false");
         r.text(",\"status\":");r.quoted(blockers.status);
         r.text(",\"stage\":");r.quoted(blockers.stage);
         r.text(",\"force_apps_available\":");r.text(ShutdownCanForceApps(id)?"true":"false");

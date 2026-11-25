@@ -160,7 +160,8 @@ def finish_checked_shutdown(work, port, evidence, restart=False):
     if not doctor.get('identity_matches') or not doctor['capabilities'].get('hardware_power'):
         raise RuntimeError('guarded desktop is not ready for checked shutdown')
     request = uuid.uuid4().hex
-    state = bridge.power(session, request, 'restart' if restart else 'shutdown')
+    force = {'force': True} if restart and doctor['capabilities'].get('restart_prompt_api')==1 else {}
+    state = bridge.power(session, request, 'restart' if restart else 'shutdown', **force)
     deadline = time.monotonic() + 60
     while state.get('state') != 'ready':
         if state.get('state') == 'failed' or time.monotonic() >= deadline:

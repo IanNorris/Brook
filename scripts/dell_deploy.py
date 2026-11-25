@@ -226,6 +226,9 @@ def stage_profile(args, *, bridge=None, bulk_port=1236, usb_system=False):
                 journal.save(damaged_store_paths=damaged, profile_job=result)
             raise RuntimeError(f'Profile job failed: {result}')
         journal.save(state='profile_verified', profile_job=result)
+        if a.profile_plan and guest.get('guest_capabilities',{}).get('restart_prompt_api')==1:
+            journal.save(restart_pending=bridge.power(a.session,uuid.uuid4().hex,'pending',
+                                                      reason='software_update'))
     except Exception as error:
         journal.save(state='needs_inspection', error=str(error))
         raise
@@ -320,7 +323,8 @@ def main():
     receipt_path = kernel_output / 'receipt.json'
     if stage:
         stage.save(kernel_receipt=str(receipt_path.resolve()),
-                   combined_state='needs_inspection' if code else 'boot_verified')
+                   combined_state=(json.loads(receipt_path.read_text()).get('state','needs_inspection')
+                                   if code and receipt_path.exists() else 'needs_inspection' if code else 'boot_verified'))
     if code and receipt_path.exists():
         # Name the stage and the guest processes still blocking a restart rather
         # than leaving a bare needs_inspection for the caller to dig out.

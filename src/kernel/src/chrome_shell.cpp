@@ -108,7 +108,7 @@ static int ClockMaxAdvance(const ChromeStyle& s, const char* set, CF font)
 ChromeTaskbarLayout ChromeTaskbarLayoutFor(const ChromeStyle& s, uint32_t screenW, uint32_t screenH,
                                            const CalendarClock& clock, bool agent, uint32_t enabledMetrics,
                                            const int* ids, int total, int focused, const char* buildText,
-                                           bool compactHud, const char* const* labels, uint32_t trayAppCount)
+                                           bool compactHud, const char* const* labels, uint32_t trayAppCount, bool restartPending)
 {
     ChromeTaskbarLayout l = {};
     l.nextIndex = -1;
@@ -124,7 +124,9 @@ ChromeTaskbarLayout ChromeTaskbarLayoutFor(const ChromeStyle& s, uint32_t screen
     // A 1 px, 20 px high separator with 4 px either side.
     const int sepGap = Px(s, 4), sepH = Px(s, 20) < bh ? Px(s, 20) : bh;
     int x = s.M(SM::TaskbarPadding);
-    const int appsW = s.M(SM::TaskbarLauncherWidth);
+    const int launcherW = s.M(SM::TaskbarLauncherWidth);
+    const int restartW = s.TextWidth("Restart pending", CF::Label) + Px(s, 16);
+    const int appsW = launcherW + (restartPending && sw >= launcherW + restartW + Px(s, 80) ? restartW : 0);
     l.apps = {x, by, appsW, bh}; x += appsW + s.M(SM::TaskbarPadding);
     l.separators[0] = {x + sepGap, by + (bh - sepH) / 2, 1, sepH};
     x += 2 * sepGap + 1;
@@ -468,6 +470,12 @@ static void DesktopMetric(ChromeDisplayList& dl, const ChromeStyle& s, const Chr
     text(r.x, bottom, value, p.secondaryText);
 }
 
+DesktopRect ChromeRestartTaskbarTarget(const ChromeStyle& s,const ChromeTaskbarLayout& l)
+{
+    const int launcherW=s.M(SM::TaskbarLauncherWidth);
+    return {l.apps.x+launcherW,l.apps.y,l.apps.w-launcherW,l.apps.h};
+}
+
 void ChromeBuildTaskbar(const ChromeTaskbarModel& m, const ChromeStyle& s, ChromeDisplayList& dl)
 {
     const ChromeTaskbarLayout& l = *m.layout;
@@ -505,8 +513,16 @@ void ChromeBuildTaskbar(const ChromeTaskbarModel& m, const ChromeStyle& s, Chrom
     auto centeredIcon = [&](const DesktopRect& r, const uint32_t* pixels, int size) {
         if (r.w >= size && r.h >= size) ChromeIcon(dl, s, r.x + (r.w - size) / 2, r.y + (r.h - size) / 2, size, pixels);
     };
-    target(l.apps, m.launcherOpen);
-    centeredIcon(l.apps, m.appsIcon, mark);
+    auto apps=l.apps;
+    const auto restart=ChromeRestartTaskbarTarget(s,l);
+    if (restart.w>0) {
+        apps.w-=restart.w;
+        target(restart,true);
+        ChromeElidedText(dl,s,CF::Label,restart.x+Px(s,8),l.textY,"Restart pending",
+                         p.text,restart.w-Px(s,16));
+    }
+    target(apps, m.launcherOpen);
+    centeredIcon(apps, m.appsIcon, mark);
     if (m.tray) for (uint32_t i = 0; i < l.trayAppCount; ++i) {
         const auto& item = m.tray->items[i];
         const auto& r = l.trayApps[i];

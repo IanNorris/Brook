@@ -12,6 +12,24 @@ for a recognized Q35 launch with a known reboot policy and ordinary poweroff
 behavior. Custom `-no-shutdown` launches and other platforms fail closed.
 Real-hardware ACPI power management remains unimplemented.
 
+## Restart confirmation
+
+A restart request on a running desktop shows a countdown on the primary
+output before closing any apps. Choosing **Not now** rejects that request and
+leaves **Restart pending** in the taskbar. The taskbar menu can start a new
+request. Choosing **Restart now** or letting the countdown expire starts the
+checked shutdown. The initial timeout is 60 seconds. The boot initrd may
+provide `/etc/restart-prompt-seconds` as a decimal value from 1 to 600.
+
+For a boot-pinned `hw_power` request, `state` reports `prompting` or
+`rejected` and then the usual checked shutdown stages after approval.
+`prompt_state` preserves `accepted` or `timeout` through the subsequent
+stages, and `prompt_seconds` reports the remaining countdown. When the reply
+has `restart_automatic: true`, observe the reboot on the same request.
+Console and maintenance sessions follow the existing checked commit flow.
+An explicit `force: true` restart skips the prompt, writes a kernel log entry,
+and still requires normal checked sync and commit.
+
 ## Shared guest operation
 
 Use one kernel-owned state machine for launcher, local shell and opted-in VM
