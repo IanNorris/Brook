@@ -95,6 +95,7 @@ int AhciSystemDirectFinalSync(){assert(writebackStopped && canFreeze && !syncErr
 bool SsdQemuInstallCloseReady(){return true;}
 int AhciSystemQemuLargeDataFinalSync(){assert(writebackStopped && canFreeze && !syncError);++largeFinalCalls;return 0;}
 #endif
+int UsbSystemFinalSync(int error){return error;}
 int WritableDesktopFinalSync(){assert(writebackStopped && canFreeze && !syncError);++finalCalls;return finalError;}
 void CompositorMarkDirty(){}
 void CompositorWake(){}

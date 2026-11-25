@@ -16,6 +16,8 @@
 
 #include "module_abi.h"
 #include "usb_block_bytes.h"
+#include "usb_write_windows.h"
+#include "usb_system.h"
 #include "usb_ecm_descriptors.h"
 #include "usb_ecm_rx_credits.h"
 #include "usb_ecm_tx_slots.h"
@@ -1141,6 +1143,7 @@ struct XhciDevice {
     // Mass storage state
     KMutex controlLock;
     bool controlQuarantined;
+    uint8_t mscInterface, mscAlternate;
     bool mscQuarantined;       // retained DMA buffers cannot be reused after transport failure
     UsbScsiCache mscCache;      // reset to Unknown with each enumerated device
     bool mscUnsupportedSync;    // only after current sense + explicit WCE=0
@@ -1674,6 +1677,15 @@ static bool XhciConfigureDevice(XhciController& ctrl, XhciDevice& dev)
                          iface->bInterfaceNumber, iface->bAlternateSetting,
                          iface->bInterfaceClass, iface->bInterfaceSubClass,
                          iface->bInterfaceProtocol, iface->bNumEndpoints);
+            if (iface->bInterfaceClass == USB_CLASS_MASS_STORAGE &&
+                iface->bInterfaceSubClass == USB_MSC_SUBCLASS_SCSI &&
+                iface->bInterfaceProtocol == USB_MSC_PROTOCOL_BBB &&
+                (!dev.isMassStorage || (dev.mscAlternate && !iface->bAlternateSetting))) {
+                dev.isMassStorage = true; owner = Owner::Storage;
+                dev.mscInterface = iface->bInterfaceNumber;
+                dev.mscAlternate = iface->bAlternateSetting;
+                dev.bulkInAddr = dev.bulkOutAddr = 0;
+            }
             if (iface->bAlternateSetting == 0) {
                 if (!dev.ifaceClass) {
                     dev.ifaceClass = iface->bInterfaceClass;
@@ -1687,11 +1699,6 @@ static bool XhciConfigureDevice(XhciController& ctrl, XhciDevice& dev)
                     } else if (iface->bInterfaceProtocol == USB_HID_PROTOCOL_MOUSE && !dev.mouse.ep) {
                         owner = Owner::Mouse; dev.mouse.iface = iface->bInterfaceNumber;
                     }
-                }
-                if (iface->bInterfaceClass == USB_CLASS_MASS_STORAGE &&
-                    iface->bInterfaceSubClass == USB_MSC_SUBCLASS_SCSI &&
-                    iface->bInterfaceProtocol == USB_MSC_PROTOCOL_BBB && !dev.isMassStorage) {
-                    dev.isMassStorage = true; owner = Owner::Storage;
                 }
                 if (iface->bInterfaceClass == USB_CLASS_HUB || dev.deviceClass == USB_CLASS_HUB) {
                     dev.isHub = true; owner = Owner::Hub;
@@ -1739,6 +1746,17 @@ static bool XhciConfigureDevice(XhciController& ctrl, XhciDevice& dev)
         return false;
     }
 
+    if(dev.isMassStorage && dev.mscAlternate && dev.bulkInAddr && dev.bulkOutAddr) {
+        UsbSetupPacket setInterface{};
+        setInterface.bmRequestType=0x01;
+        setInterface.bRequest=0x0b; // SET_INTERFACE
+        setInterface.wValue=dev.mscAlternate;
+        setInterface.wIndex=dev.mscInterface;
+        if(!XhciControlTransfer(ctrl,dev,setInterface,nullptr,0,0,0)) {
+            dev.isMassStorage=false;
+            KPuts("xhci: USB storage could not select Bulk-Only alternate setting\n");
+        }
+    }
     SerialPrintf("xhci: device configured (cfg=%u)\n", cfgValue);
     dev.configured = true;
     return true;
@@ -2868,8 +2886,8 @@ struct UsbMscState {
     uint8_t* bounce;
     uint64_t bouncePhys;
     char name[16];
-    // Boot-stick update window (DEVICE_IOCTL_WRITE_WINDOW); zero length = closed.
-    uint64_t windowStart, windowLength;
+    UsbWriteWindows windows;
+    bool systemFailed;
 };
 
 static const BlockDeviceOps g_usbMscOps = {
@@ -2887,17 +2905,32 @@ struct UsbMscByteTransport {
     uint64_t blockCount() {return g_devices[state->devIndex].mscSectorCount;}
     uint32_t bounceBytes() {return g_storagePageChunks?4096:65536;}
     uint8_t* bounce() {return state->bounce;}
-    bool usable() {return !__atomic_load_n(&g_devices[state->devIndex].mscQuarantined,__ATOMIC_ACQUIRE);}
+    bool usable() {
+        const auto& dev=g_devices[state->devIndex];
+        return !__atomic_load_n(&dev.gone,__ATOMIC_ACQUIRE) &&
+            !__atomic_load_n(&dev.mscQuarantined,__ATOMIC_ACQUIRE);
+    }
     bool transfer(uint64_t lba,uint32_t count,bool read) {
         if(!usable())return false;
         uint8_t cdb[10]{};cdb[0]=read?SCSI_READ_10:SCSI_WRITE_10;
         cdb[2]=lba>>24;cdb[3]=lba>>16;cdb[4]=lba>>8;cdb[5]=lba;
         cdb[7]=count>>8;cdb[8]=count;
         const uint64_t bytes=uint64_t(count)*blockSize();
-        const bool ok=XhciMscCommand(*state->ctrl,g_devices[state->devIndex],cdb,10,
-            state->bounce,state->bouncePhys,uint32_t(bytes),read);
-        if(ok)StorageIoAccount(uint32_t(StorageIoSource::Usb),read?0:1,bytes);
-        return ok;
+        auto& dev=g_devices[state->devIndex];
+        MscCommandGuard guard;
+        auto execute=[&] {
+            return XhciMscExecuteLocked(*state->ctrl,dev,cdb,10,
+                state->bounce,state->bouncePhys,uint32_t(bytes),read);
+        };
+        auto result=execute();
+        // A current ABORTED COMMAND with a completed BOT exchange can
+        // retry once. Never reuse DMA after a transport fault or replay an
+        // uncertain write. Media-change sense codes are not retryable.
+        if(state->windows.system.length && read && usable() && result.transport &&
+           result.status==1 && result.sense.current && result.sense.key==0xb)
+            result=execute();
+        if(result.success())StorageIoAccount(uint32_t(StorageIoSource::Usb),read?0:1,bytes);
+        return result.success();
     }
     bool readBlocks(uint64_t lba,uint32_t count) {return transfer(lba,count,true);}
     bool writeBlocks(uint64_t lba,uint32_t count) {return transfer(lba,count,false);}
@@ -2906,55 +2939,72 @@ struct MscIoGuard {
     MscIoGuard(){KMutexLock(&g_mscIoLock);}
     ~MscIoGuard(){KMutexUnlock(&g_mscIoLock);}
 };
+static void UsbMscFenceSystem(UsbMscState& state) {
+    if(state.windows.system.length) {
+        state.windows.system={};
+        __atomic_store_n(&state.systemFailed,true,__ATOMIC_RELEASE);
+    }
+}
 static int UsbMscRead(Device* dev,uint64_t offset,void* buf,uint64_t len) {
     MscIoGuard guard;
-    UsbMscByteTransport io{static_cast<UsbMscState*>(dev->priv)};
-    if(!io.usable())return -5;
-    return UsbBlockReadBytes(io,offset,buf,len);
-}
-static bool UsbMscWindowAdmits(const UsbMscState* st,uint64_t offset,uint64_t len) {
-    const uint64_t start=__atomic_load_n(&st->windowStart,__ATOMIC_ACQUIRE);
-    const uint64_t length=__atomic_load_n(&st->windowLength,__ATOMIC_ACQUIRE);
-    return length && len && offset>=start && len<=length && offset-start<=length-len;
+    auto* state=static_cast<UsbMscState*>(dev->priv);
+    UsbMscByteTransport io{state};
+    const int result=UsbBlockReadBytes(io,offset,buf,len);
+    if(result==-5 || (result>=0 && uint64_t(result)!=len &&
+        UsbWriteWindows::Contains(state->windows.system,offset,len)))UsbMscFenceSystem(*state);
+    return result;
 }
 static int UsbMscWrite(Device* dev,uint64_t offset,const void* buf,uint64_t len) {
-    if(g_storageReadOnly && !UsbMscWindowAdmits(static_cast<UsbMscState*>(dev->priv),offset,len))return -30;
     MscIoGuard guard;
-    UsbMscByteTransport io{static_cast<UsbMscState*>(dev->priv)};
-    if(!io.usable())return -5;
-    return UsbBlockWriteBytes(io,offset,buf,len);
+    auto* state=static_cast<UsbMscState*>(dev->priv);
+    if(__atomic_load_n(&state->systemFailed,__ATOMIC_ACQUIRE) ||
+       (g_storageReadOnly && !state->windows.Allows(offset,len)))return -30;
+    UsbMscByteTransport io{state};
+    const int result=UsbBlockWriteBytes(io,offset,buf,len);
+    if(result==-5 || (result>=0 && uint64_t(result)!=len))UsbMscFenceSystem(*state);
+    return result;
 }
 
 static int UsbMscIoctl(Device* dev, uint32_t cmd, void* arg)
 {
     if (cmd == DEVICE_IOCTL_READ_ONLY) return g_storageReadOnly ? 1 : 0;
-    if (cmd == DEVICE_IOCTL_WRITE_WINDOW) {
-        // Only meaningful under the read-only policy; the kernel gate is the
-        // sole caller and has already proven this is the boot stick.
-        auto* st = static_cast<UsbMscState*>(dev->priv);
-        const auto* w = static_cast<const DeviceWriteWindow*>(arg);
-        if (!g_storageReadOnly || !w) return -22;
-        const uint64_t bytes = uint64_t(g_devices[st->devIndex].mscSectorCount) * g_devices[st->devIndex].mscBlockSize;
-        if (w->length && (w->start > bytes || w->length > bytes - w->start)) return -22;
-        __atomic_store_n(&st->windowLength, uint64_t{0}, __ATOMIC_RELEASE);
-        __atomic_store_n(&st->windowStart, w->start, __ATOMIC_RELEASE);
-        __atomic_store_n(&st->windowLength, w->length, __ATOMIC_RELEASE);
-        KPrintf("xhci: %s write window %s\n", st->name, w->length ? "open (boot-stick update)" : "closed");
+    auto* st=static_cast<UsbMscState*>(dev->priv);
+    if (cmd == DEVICE_IOCTL_WRITE_FENCED) {
+        const auto& device=g_devices[st->devIndex];
+        return __atomic_load_n(&st->systemFailed,__ATOMIC_ACQUIRE) ||
+            __atomic_load_n(&device.gone,__ATOMIC_ACQUIRE) ||
+            __atomic_load_n(&device.mscQuarantined,__ATOMIC_ACQUIRE);
+    }
+    if (cmd == DEVICE_IOCTL_WRITE_WINDOW || cmd == DEVICE_IOCTL_USB_SYSTEM_WINDOW) {
+        const auto* window=static_cast<const DeviceWriteWindow*>(arg);
+        const bool persistent=cmd==DEVICE_IOCTL_USB_SYSTEM_WINDOW;
+        if(!g_storageReadOnly || !window || (persistent && !UsbSystemRequested()))return -22;
+        MscIoGuard guard;
+        UsbMscByteTransport io{st};
+        const auto block=io.blockSize();
+        if(window->length && (!io.usable() || __atomic_load_n(&st->systemFailed,__ATOMIC_ACQUIRE) ||
+                               (persistent && block!=512)))return -5;
+        if(!st->windows.Set(persistent,*window,io.blockCount()*block,block))return -22;
+        KPrintf("xhci: %s %s write window %s\n",st->name,
+            persistent?"USB system":"boot-stick update",window->length?"open":"closed");
         return 0;
     }
     if (cmd != DEVICE_IOCTL_FLUSH) return -95;
-    if(g_storageReadOnly && !__atomic_load_n(&static_cast<UsbMscState*>(dev->priv)->windowLength,__ATOMIC_ACQUIRE))return 0;
     MscIoGuard ioGuard;
+    if(__atomic_load_n(&st->systemFailed,__ATOMIC_ACQUIRE))return -5;
+    const bool system=st->windows.system.length!=0;
+    if(g_storageReadOnly && !system && !st->windows.update.length)return 0;
+    UsbMscByteTransport io{st};
+    if(!io.usable()){UsbMscFenceSystem(*st);return -5;}
     MscCommandGuard commandGuard;
-    auto* st = static_cast<UsbMscState*>(dev->priv);
-    XhciDevice& udev = g_devices[st->devIndex];
-    if(__atomic_load_n(&udev.mscQuarantined,__ATOMIC_ACQUIRE))return -5;
-    if(udev.mscUnsupportedSync&&(udev.mscCache==UsbScsiCache::WriteThrough||udev.mscCache==UsbScsiCache::AssumedWriteThrough))return 0;
+    XhciDevice& udev=g_devices[st->devIndex];
+    if(!system && udev.mscUnsupportedSync &&
+       (udev.mscCache==UsbScsiCache::WriteThrough||udev.mscCache==UsbScsiCache::AssumedWriteThrough))return 0;
     // IMMED=0, LBA=0 and length=0: wait for the entire device cache.
     uint8_t cdb[10] = {};cdb[0] = SCSI_SYNCHRONIZE_CACHE_10;
     auto result=XhciMscExecuteLocked(*st->ctrl,udev,cdb,sizeof(cdb),nullptr,0,0,false);
     if(result.success()){StorageIoAccount(uint32_t(StorageIoSource::Usb),2,0);return 0;}
-    if(UsbScsiUnsupportedSync(result.sense)) {
+    if(!system && UsbScsiUnsupportedSync(result.sense)) {
         if(udev.mscCache==UsbScsiCache::Unknown)udev.mscCache=XhciMscCacheLocked(*st->ctrl,udev);
         if(!__atomic_load_n(&udev.mscQuarantined,__ATOMIC_ACQUIRE)&&UsbScsiWriteThroughFlush(udev.mscCache,result.sense)) {
             udev.mscUnsupportedSync=true;
@@ -2964,6 +3014,7 @@ static int UsbMscIoctl(Device* dev, uint32_t cmd, void* arg)
             return 0;
         }
     }
+    UsbMscFenceSystem(*st);
     return -5;
 }
 
@@ -2986,6 +3037,8 @@ static bool XhciInitMassStorage(XhciController& ctrl, XhciDevice& dev,
                                  uint32_t devIndex)
 {
     SerialPuts("xhci: initializing mass storage device\n");
+
+    if(!dev.bulkInAddr || !dev.bulkOutAddr)return false;
 
     // Configure bulk IN endpoint
     if (dev.bulkInAddr) {
@@ -3032,7 +3085,8 @@ static bool XhciInitMassStorage(XhciController& ctrl, XhciDevice& dev,
     if (!state) return false;
     state->ctrl = &ctrl;
     state->devIndex = devIndex;
-    state->windowStart = state->windowLength = 0;
+    state->windows={};
+    state->systemFailed=false;
     state->bounce=static_cast<uint8_t*>(AllocDmaBuffer(16,state->bouncePhys));
     if(!state->bounce){kfree(state);return false;}
 
@@ -3146,7 +3200,7 @@ static void XhciDeviceGone(uint32_t index)
         }
     }
     const auto saved = IrqSpinLockAcquire(&g_eventRingLock);
-    dev.gone = true;
+    __atomic_store_n(&dev.gone,true,__ATOMIC_RELEASE);
     const bool hadHid = dev.kbd.active || dev.mouse.active;
     XhciEndHid(dev.kbd,true);
     XhciEndHid(dev.mouse,false);
@@ -4902,6 +4956,7 @@ static void XhciUacHotplugTick()
 static int XhciModuleInit()
 {
     SerialPuts("xhci: initializing USB 3.0 host controller driver\n");
+    g_storageReadOnly=UsbSystemRequested();
     if(auto* marker=VfsOpen("/etc/usb-read-only")) {
         g_storageReadOnly=true;VfsClose(marker);KPuts("xhci: physical storage probe is read-only\n");
     }

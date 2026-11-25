@@ -5,6 +5,7 @@
 // grants is a USB write window over the one partition the firmware loaded
 // this boot from, and only between ARM(RW) and DISARM.
 #include "boot_stick.h"
+#include "usb_system.h"
 #include "live_store_record.h"
 #include "memory/virtual_memory.h"
 #include "boot_timing_runtime.h"
@@ -60,9 +61,14 @@ Device* FindPartition(int* code)
 {
     Device* found = nullptr;
     unsigned matches = 0;
-    for (unsigned disk = 0; disk < 10; ++disk) {
-        for (unsigned part = 1; part <= 9; ++part) {
-            char name[8] = {'u', 's', 'b', char('0' + disk), 'p', char('0' + part), 0};
+    const bool system=UsbSystemRequested();
+    for (unsigned disk = 0; disk < (system?100u:10u); ++disk) {
+        char name[8];
+        const unsigned end=BootStickUsbDiskName(disk,name);
+        name[end]='p';
+        name[end+2]=0;
+        for (unsigned part = 1; part <= (system?1u:9u); ++part) {
+            name[end+1]=char('0'+part);
             Device* dev = DeviceFind(name);
             if (!dev) continue;
             uint8_t guid[16]; uint32_t entry = 0; uint64_t first = 0, sectors = 0;
@@ -160,7 +166,10 @@ int SetWindow(bool open)
     Device* parent = PartitionParentDevice(g_partition);
     if (!parent || !parent->ops || !parent->ops->ioctl) return -5;
     DeviceWriteWindow window{};
-    if (open) { window.start = g_stick.firstLba * 512; window.length = g_stick.sectors * 512; }
+    if (open) {
+        window.start = g_stick.firstLba * 512; window.length = g_stick.sectors * 512;
+        if (!UsbSystemAllowsBootUpdates(parent, window.start, window.length)) return -30;
+    }
     return parent->ops->ioctl(parent, DEVICE_IOCTL_WRITE_WINDOW, &window);
 }
 
@@ -296,6 +305,7 @@ int StoreCloseLocked()
 
 int StoreOpenLocked(const BrookStoreExtent& extent)
 {
+    if (UsbSystemRequested())return Refuse(BROOK_BOOT_STICK_REFUSED_EXTENT,"USB system boot forbids store slots");
     if (g_storeDisk) return Refuse(BROOK_BOOT_STICK_REFUSED_BUSY, "store slot already open");
     // Same identity and running-set proof as ARM (read-only), then release.
     if (const int armed = ArmLocked(BROOK_BOOT_STICK_RO)) return armed;
@@ -388,14 +398,28 @@ void BootStickConfigure()
             SetName(g_stick.set), TrialName(g_stick.trial));
 }
 
+Device* BootStickPartition(int* refusal)
+{
+    int ignored=0;
+    if(!refusal)refusal=&ignored;
+    if (!g_stickPresent || !g_stick.volumeValid) {
+        *refusal=BROOK_BOOT_STICK_REFUSED_NO_DEVICE;
+        return nullptr;
+    }
+    return FindPartition(refusal);
+}
+
 int BootStickDiskIndex()
 {
-    if (!g_stickPresent || !g_stick.volumeValid) return -1;
-    int code = 0;
-    Device* dev = FindPartition(&code);
+    Device* dev = BootStickPartition();
     if (!dev || !dev->name || dev->name[0] != 'u' || dev->name[1] != 's' || dev->name[2] != 'b') return -1;
-    const char d = dev->name[3];
-    return d >= '0' && d <= '9' ? d - '0' : -1;
+    int index=0;
+    const char* p=dev->name+3;
+    for(;*p>='0' && *p<='9';++p) {
+        index=index*10+(*p-'0');
+        if(index>=100)return -1;
+    }
+    return p!=dev->name+3 && *p=='p'?index:-1;
 }
 
 void BootStickStatusLine()

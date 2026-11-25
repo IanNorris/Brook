@@ -24,6 +24,7 @@
 #include "ahci_observe.h"
 #include "ahci_readonly.h"
 #include "writable_desktop.h"
+#include "usb_system.h"
 #include "ssd_install_qemu.h"
 #include "acpi.h"
 #include "boot_resource_map.h"
@@ -890,6 +891,26 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",");r.field("bytes",store.bytes);r.text(",");r.field("drive",store.drive);
         auto signedNumber=[&](int value){if(value<0){r.text("-");r.number(-int64_t(value));}else r.number(value);};
         r.text(",\"error\":");signedNumber(store.error);r.text(",\"final_error\":");signedNumber(store.finalError);r.text("}");
+        const auto usb=UsbSystemRead();
+        if(usb.configured) {
+            auto boolean=[&](const char* key,bool value) {
+                r.text(",");r.quoted(key);r.text(value?":true":":false");
+            };
+            r.text(",\"usb_system\":{\"configured\":true");
+            boolean("record_valid",usb.parsed);boolean("window_open",usb.window);
+            boolean("mounted",usb.mounted);boolean("dirty",usb.dirty);boolean("clean",usb.clean);
+            boolean("uncertain",usb.uncertain);boolean("final_sync_attempted",usb.finalAttempted);
+            r.text(",\"stage\":");r.quoted(usb.stage);
+            r.text(",\"disk\":");signedNumber(usb.disk);
+            r.text(",\"error\":");signedNumber(usb.error);
+            r.text(",\"final_error\":");signedNumber(usb.finalError);
+            r.text(",\"partition_guid_gpt_hex\":");r.quoted(usb.partitionGuid);
+            r.text(",\"fs_uuid_hex\":");r.quoted(usb.fsUuid);
+            r.text(",");r.field("first_lba",usb.firstLba);r.text(",");r.field("sectors",usb.sectors);
+            r.text(",");r.field("reads",usb.reads);r.text(",");r.field("writes",usb.writes);
+            r.text(",");r.field("flushes",usb.flushes);r.text(",");r.field("errors",usb.errors);
+            r.text("}");
+        }
 #if defined(BROOK_SSD_AUTO_RECOVERY)
 #if defined(BROOK_SSD_GUARDED_DESKTOP)
         if(GuardedDesktopBridgeEnabled()) DesktopCaps(r);
@@ -1670,7 +1691,8 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         const char* p=command+sizeof(benchPrefix)-1;uint32_t mib=0;
         if(!Decimal(p,mib) || *p || !mib || mib>4096){DebugChannelSend("{\"usb_bench_error\":\"Expected MiB 1..4096\"}\n");return true;}
         const int disk=BootStickDiskIndex();
-        char name[5]={'u','s','b',char('0'+(disk<0?0:disk)),0};
+        char name[6];
+        BootStickUsbDiskName(disk<0?0:unsigned(disk),name);
         Device* dev=disk>=0?DeviceFind(name):nullptr;
         if(!dev || !dev->ops || !dev->ops->read){DebugChannelSend("{\"usb_bench_error\":\"Boot stick disk not found\"}\n");return true;}
         constexpr uint64_t chunk=4ull<<20;

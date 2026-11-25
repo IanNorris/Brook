@@ -1,0 +1,248 @@
+#include "usb_system.h"
+#include "usb_system_layout.h"
+
+#include "block_write_leases.h"
+#include "boot_stick.h"
+#include "../../shared/brook_boot_stick.h"
+#include "device.h"
+#include "ext2_vfs.h"
+#include "gpt.h"
+#include "memory/heap.h"
+#include "mount_namespace.h"
+#include "kprintf.h"
+#include "large_data_session.h"
+#include "serial.h"
+#include "vfs.h"
+#include "writable_desktop.h"
+
+namespace brook {
+namespace {
+UsbSystemStatus boot;
+UsbSystemRecord record;
+LargeDataSession session;
+Device* disk;
+DeviceWriteWindow bootWindow{}, systemWindow{};
+bool ready, open, uncertain, clean, finalAttempted;
+int finalError;
+uint64_t reads, writes, flushes, errors;
+
+bool ReadExact(Device* device,uint64_t at,void* data,uint32_t bytes) {
+    return device->ops->read(device,at,data,bytes)==int(bytes);
+}
+
+void ShowHex(char (&out)[33],const uint8_t (&id)[16]) {
+    constexpr char hex[]="0123456789abcdef";
+    for(unsigned i=0;i<16;++i){out[2*i]=hex[id[i]>>4];out[2*i+1]=hex[id[i]&15];}
+}
+
+int SetWindow(bool enable) {
+    DeviceWriteWindow window=enable?systemWindow:DeviceWriteWindow{};
+    const int error=disk->ops->ioctl(disk,DEVICE_IOCTL_USB_SYSTEM_WINDOW,&window);
+    if(!error)__atomic_store_n(&open,enable,__ATOMIC_RELEASE);
+    return error;
+}
+
+bool IsUncertain() {
+    return __atomic_load_n(&uncertain,__ATOMIC_ACQUIRE) ||
+        (disk && disk->ops->ioctl(disk,DEVICE_IOCTL_WRITE_FENCED,nullptr)>0);
+}
+
+int IoError(int error) {
+    __atomic_add_fetch(&errors,1,__ATOMIC_RELAXED);
+    if(!__atomic_exchange_n(&uncertain,true,__ATOMIC_ACQ_REL)) {
+        SetWindow(false);
+        KPrintf("usb-system: I/O failed (%d); write window closed, filesystem uncertain\n",error);
+    }
+    return error<0?error:-5;
+}
+
+bool RangeValid(uint64_t offset,uint64_t size) {
+    return disk && offset<=systemWindow.length && size<=systemWindow.length-offset && size<=0x7fffffffu;
+}
+int Read(Device*,uint64_t offset,void* data,uint64_t size) {
+    if(!RangeValid(offset,size))return -22;
+    __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED);
+    const int result=disk->ops->read(disk,systemWindow.start+offset,data,size);
+    return result==int(size)?result:IoError(result);
+}
+int Write(Device* owner,uint64_t offset,const void* data,uint64_t size) {
+    if(!RangeValid(offset,size))return -22;
+    if(!size)return 0;
+    if(IsUncertain() || !__atomic_load_n(&open,__ATOMIC_ACQUIRE))return -30;
+    __atomic_add_fetch(&writes,1,__ATOMIC_RELAXED);
+    const int result=DeviceWriteLeased(disk,owner,systemWindow.start+offset,data,size);
+    return result==int(size)?result:IoError(result);
+}
+int Control(Device*,uint32_t request,void*) {
+    if(request==DEVICE_IOCTL_READ_ONLY)return 0;
+    if(request==DEVICE_IOCTL_WRITE_FENCED)return IsUncertain()?1:0;
+    if(request!=DEVICE_IOCTL_FLUSH)return -95;
+    if(IsUncertain() || !__atomic_load_n(&open,__ATOMIC_ACQUIRE))return -5;
+    __atomic_add_fetch(&flushes,1,__ATOMIC_RELAXED);
+    const int result=DeviceFlush(disk);
+    return result?IoError(result):0;
+}
+uint64_t Blocks(Device*) {return systemWindow.length/512;}
+uint32_t BlockSize(Device*) {return 512;}
+const BlockDeviceOps ops{Read,Write,Control,nullptr,Blocks,BlockSize};
+Device dataDevice{reinterpret_cast<const DeviceOps*>(&ops),"usb-system",DeviceType::Block,nullptr};
+
+WritableDesktopIo SessionIo() {
+    return {&dataDevice,
+        [](void* p,uint64_t at,void* data,uint32_t n){return Read(static_cast<Device*>(p),at,data,n);},
+        [](void* p,uint64_t at,const void* data,uint32_t n){return DeviceWrite(static_cast<Device*>(p),at,data,n);},
+        [](void* p){return DeviceFlush(static_cast<Device*>(p));}};
+}
+
+bool Fail(const char* stage,int error) {
+    if(__atomic_load_n(&open,__ATOMIC_ACQUIRE))SetWindow(false);
+    boot.stage=stage;boot.error=error;boot.dirty=boot.dirty || session.dirtyAttempted;
+    SerialPrintf("USB_SYSTEM_MAINTENANCE stage=%s error=%d\n",stage,error);
+    KPrintf("usb-system: %s (%d). Desktop stopped. Check the system SSD from the host.\n",stage,error);
+    return false;
+}
+
+bool ValidateGpt(Device* parent,const uint8_t* bootGuid,uint32_t bootEntry,uint64_t first,uint64_t count) {
+    if(!parent || DeviceBlockSize(parent)!=512)return false;
+    const uint64_t sectors=DeviceBlockCount(parent);
+    if(sectors<68 || sectors>uint64_t(0xffffffffu)+1)return false;
+    uint8_t sector[512];
+    StrictGptHeader primary{},backup{};
+    if(!ReadExact(parent,0,sector,sizeof(sector)) ||
+       StrictGptProtectiveMbr(sector,sectors)!=StrictMbrResult::Protective ||
+       !ReadExact(parent,512,sector,sizeof(sector)) ||
+       StrictGptCheckHeader(sector,512,sectors,false,primary)!=StrictGptResult::Ok ||
+       !ReadExact(parent,(sectors-1)*512,sector,sizeof(sector)) ||
+       StrictGptCheckHeader(sector,512,sectors,true,backup)!=StrictGptResult::Ok ||
+       primary.count!=backup.count || primary.entrySize!=backup.entrySize)return false;
+    const uint32_t bytes=primary.count*primary.entrySize;
+    auto* entries=static_cast<uint8_t*>(kmalloc(2*bytes));
+    if(!entries)return false;
+    const bool ok=ReadExact(parent,primary.entriesLba*512,entries,bytes) &&
+        ReadExact(parent,backup.entriesLba*512,entries+bytes,bytes) &&
+        StrictGptCheckCopies(primary,entries,backup,entries+bytes,bytes)==StrictGptResult::Ok &&
+        UsbSystemEntriesMatch(primary,entries,bootEntry,bootGuid,first,count,record);
+    kfree(entries);
+    return ok;
+}
+}
+
+bool UsbSystemRequested() {return boot.configured;}
+
+void UsbSystemConfigure() {
+    VnodeStat stat{};
+    const int lookup=VfsLstatPath("/etc/usb-system",&stat);
+    if(lookup==-2)return;
+    boot.configured=true;
+    boot.stage="record";
+    if(lookup || stat.isDir || stat.isSymlink)return;
+    auto* node=VfsOpen("/etc/usb-system",VFS_O_STREAM);
+    if(!node)return;
+    char data[128];
+    uint64_t offset=0;
+    const int length=VfsRead(node,data,sizeof(data),&offset);
+    VfsClose(node);
+    boot.parsed=length>0 && length<int(sizeof(data)) && UsbSystemParse(data,length,record);
+    if(!boot.parsed)return;
+    boot.firstLba=record.first;
+    boot.sectors=record.sectors;
+    ShowHex(boot.partitionGuid,record.guid);
+    ShowHex(boot.fsUuid,record.uuid);
+}
+
+bool UsbSystemBoot(uint8_t* nextDrive,bool scanComplete) {
+    if(!boot.parsed || !nextDrive)return Fail("record",-22);
+    if(!scanComplete)return Fail("boot-volume-scan",-19);
+    int refusal=0;
+    auto* bootPartition=BootStickPartition(&refusal);
+    if(!bootPartition)return Fail(refusal==BROOK_BOOT_STICK_REFUSED_AMBIGUOUS?"boot-volume-ambiguous":"boot-volume",-19);
+    boot.disk=BootStickDiskIndex();
+    uint8_t bootGuid[16];
+    uint32_t bootEntry;
+    uint64_t bootFirst,bootSectors;
+    if(boot.disk<0 || !PartitionGptIdentity(bootPartition,bootGuid,&bootEntry,&bootFirst,&bootSectors))
+        return Fail("boot-volume",-19);
+    auto* parent=PartitionParentDevice(bootPartition);
+    if(!ValidateGpt(parent,bootGuid,bootEntry,bootFirst,bootSectors))return Fail("gpt-identity",-22);
+    disk=parent;
+    bootWindow={bootFirst*512,bootSectors*512};
+    systemWindow={record.first*512,record.sectors*512};
+    uint8_t sb[1024];
+    LargeExt2Geometry geometry{};
+    if(!ReadExact(disk,systemWindow.start+1024,sb,sizeof(sb)))return Fail("ext2-read",-5);
+    const auto state=LargeExt2ClassifyHeader(sb,sizeof(sb),systemWindow.length,record.uuid,geometry);
+    if(state==LargeExt2HeaderState::NeedsCheck) {
+        boot.dirty=true;
+        return Fail("needs-filesystem-check",-117);
+    }
+    if(state!=LargeExt2HeaderState::Clean)return Fail("ext2-identity",-22);
+    WritableDesktopFailure details{};
+    VnodeStat target{};
+    if(!Ext2DriveAvailable(*nextDrive) || !WritableDesktopPrepareDirect(&details) ||
+       VfsLstatPath("/nix",&target) || !target.isDir || target.isSymlink)
+        return Fail("mount-target",details.status?details.status:-22);
+
+    constexpr uint32_t gdtCapacity=4096*32;
+    auto* gdt=static_cast<uint8_t*>(kmalloc(gdtCapacity));
+    if(!gdt)return Fail("descriptor-buffer",-12);
+    const BlockWriteLease lease{reinterpret_cast<uintptr_t>(disk),reinterpret_cast<uintptr_t>(&dataDevice),
+        systemWindow.start,systemWindow.length};
+    int error=-16;
+    if(DeviceRegister(&dataDevice)) {
+        if(!DeviceInstallBootWriteLeases(&lease,1))DeviceUnregister(&dataDevice);
+        else if(!(error=SetWindow(true)) && !(error=DeviceFlush(&dataDevice)))
+            error=session.Begin(SessionIo(),systemWindow.length,record.uuid,gdt,gdtCapacity);
+    }
+    kfree(gdt);
+    if(error)return Fail(error==-117?"needs-filesystem-check":"session-begin",error);
+    const uint8_t drive=*nextDrive;
+    if(!Ext2BindDevice(drive,&dataDevice))return Fail("ext2-bind",-16);
+    ++*nextDrive;
+    if(!VfsMountConfigured("/nix","ext2",drive,6)) {
+        VfsDrainMountCleanup();
+        return Fail("mount",-5);
+    }
+    if(WritableDesktopPublishDirect(&details)!=WritableDesktopPublish::Ready) {
+        VfsUnmount("/nix");
+        return Fail(details.check,details.status);
+    }
+    if(!session.Arm())__builtin_trap();
+    ready=true;
+    boot.mounted=true;boot.dirty=true;boot.stage="ready";
+    WritableDesktopMarkDirectReady(drive,systemWindow.length);
+    SerialPrintf("USB_SYSTEM_READY disk=%d lba=%lu sectors=%lu groups=%u\n",
+        boot.disk,record.first,record.sectors,geometry.groups);
+    return true;
+}
+
+bool UsbSystemAllowsBootUpdates(Device* parent,uint64_t start,uint64_t length) {
+    return !boot.configured || (disk && parent==disk && start==bootWindow.start && length==bootWindow.length);
+}
+
+int UsbSystemFinalSync(int syncError) {
+    if(!ready)return syncError;
+    const int error=syncError?syncError:IsUncertain()?-5:session.Finish(SessionIo(),DeviceFinalSyncOwner());
+    __atomic_store_n(&finalError,error,__ATOMIC_RELEASE);
+    __atomic_store_n(&finalAttempted,true,__ATOMIC_RELEASE);
+    if(!error)__atomic_store_n(&clean,true,__ATOMIC_RELEASE);
+    WritableDesktopDirectFinalResult(error,session.cleanAttempted);
+    SerialPrintf("USB_SYSTEM_FINAL_SYNC result=%d clean=%u\n",error,error?0u:1u);
+    return error;
+}
+
+UsbSystemStatus UsbSystemRead() {
+    auto out=boot;
+    out.window=__atomic_load_n(&open,__ATOMIC_ACQUIRE);
+    out.uncertain=IsUncertain();
+    out.window=out.window && !out.uncertain;
+    out.finalError=__atomic_load_n(&finalError,__ATOMIC_ACQUIRE);
+    out.finalAttempted=__atomic_load_n(&finalAttempted,__ATOMIC_ACQUIRE);
+    out.clean=__atomic_load_n(&clean,__ATOMIC_ACQUIRE);
+    out.dirty=out.dirty && !out.clean;
+    out.reads=__atomic_load_n(&reads,__ATOMIC_RELAXED);
+    out.writes=__atomic_load_n(&writes,__ATOMIC_RELAXED);
+    out.flushes=__atomic_load_n(&flushes,__ATOMIC_RELAXED);
+    out.errors=__atomic_load_n(&errors,__ATOMIC_RELAXED);
+    return out;
+}
+}

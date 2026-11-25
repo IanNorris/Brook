@@ -72,6 +72,7 @@ namespace brook { void LifecycleChannelConfigure(); void LifecycleChannelStart()
 #include "fatfs_vfs.h"
 #include "writable_desktop.h"
 #include "ext2_vfs.h"
+#include "usb_system.h"
 #include "fs/compressed_vfs.h"
 #include "memory/file_page_cache.h"
 #include "ext4_vfs.h"
@@ -990,6 +991,8 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     brook::NetConfigureBoot();
     brook::BootStatusConfigure();
     brook::BootStickConfigure();
+    brook::UsbSystemConfigure();
+    const bool usbSystemRequested=brook::UsbSystemRequested();
     brook::SerialPuts("module: Phase 1 — loading from /drivers (ramdisk)\n");
     brook::KLog("BOOT stage: early modules begin");
     brook::ModuleDiscoverAndLoad("/drivers");
@@ -1025,14 +1028,20 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     // partition sub-devices (usb0p1, usb0p2, ...) for filesystems.
     brook::KLog("BOOT stage: USB filesystem probing begin");
 #if !defined(BROOK_SSD_GUARD_CHECK)
-    for (uint32_t i = 0; i < 4; ++i)
+    bool usbScanComplete=true;
+    for (uint32_t i = 0; i < (usbSystemRequested?100u:4u); ++i)
     {
-        char name[8] = "usb";
-        name[3] = static_cast<char>('0' + i);
-        name[4] = '\0';
+        char name[8];
+        brook::BootStickUsbDiskName(i,name);
         brook::Device* ud = brook::DeviceFind(name);
         if (!ud) continue;
 
+        // Only the boot partition needs a registered alias. The system
+        // adapter is private and the other partitions are never probed.
+        if(usbSystemRequested) {
+            if(!brook::GptProbeBootPartition(ud))usbScanComplete=false;
+            continue;
+        }
         uint32_t parts = brook::GptProbeDevice(ud,true);
         if(!parts)parts=brook::MbrProbeDevice(ud);
         if (parts > 0)
@@ -1073,7 +1082,10 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     brook::KLog("BOOT stage: USB filesystem probing complete");
     brook::KLog("BOOT stage: application image mount begin");
 #if !defined(BROOK_SSD_GUARD_CHECK)
-    (void)brook::LiveStoreBoot(&nextPdrv); // desktop live stick; WritableDesktopBootMount then reports Ready
+    const bool usbSystemReady=usbSystemRequested && brook::UsbSystemBoot(&nextPdrv,usbScanComplete);
+    if(!usbSystemRequested)(void)brook::LiveStoreBoot(&nextPdrv);
+#else
+    const bool usbSystemReady=false;
 #endif
     const bool productionDirectRequested=brook::AhciSystemDirectRequested();
     bool productionDirectReady=false;
@@ -1083,7 +1095,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 #if defined(BROOK_SSD_GUARD_CHECK)
     const auto systemVolume=brook::AhciSystemBoot::Maintenance;
 #else
-    const auto systemVolume=brook::AhciSystemVolumeMount(&nextPdrv);
+    const auto systemVolume=usbSystemRequested?brook::AhciSystemBoot::Maintenance:brook::AhciSystemVolumeMount(&nextPdrv);
 #endif
     if(systemVolume==brook::AhciSystemBoot::Ready) {
 #if !defined(BROOK_SSD_GUARD_CHECK)
@@ -1102,6 +1114,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 #endif
     }
     const auto writableDesktop=
+        usbSystemRequested?(usbSystemReady?brook::WritableDesktopBoot::Ready:brook::WritableDesktopBoot::Maintenance):
         productionDirectRequested?(productionDirectReady?brook::WritableDesktopBoot::Ready:brook::WritableDesktopBoot::Maintenance):
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
         directDesktopRequested?(brook::AhciSystemQemuLargeDesktopReady()?brook::WritableDesktopBoot::Ready:brook::WritableDesktopBoot::Maintenance):
@@ -1276,7 +1289,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         if(brook::NetGetIf())brook::DebugTcpSpawn();
 #endif
 #else
-        brook::ShellExecScript("/boot/INIT.RC");
+        if(usbSystemRequested && !usbSystemReady) {
+            brook::ShellExecString("set wm\nset vfb none\nkconsole\n");
+        } else brook::ShellExecScript("/boot/INIT.RC");
 #endif
 
         // Start the compositor kernel thread (blits VFBs to physical FB).

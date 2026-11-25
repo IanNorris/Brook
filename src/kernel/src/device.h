@@ -37,6 +37,12 @@ static constexpr uint32_t DEVICE_IOCTL_READ_ONLY = 0x42460002;
 // closes the window. READ_ONLY keeps reporting 1: no other alias may write.
 struct DeviceWriteWindow { uint64_t start, length; };
 static constexpr uint32_t DEVICE_IOCTL_WRITE_WINDOW = 0x42460003;
+// USB system boot only. An independent, sector-aligned extent owned by
+// usb_system.cpp; neither this nor the update ioctl opens the whole device.
+static constexpr uint32_t DEVICE_IOCTL_USB_SYSTEM_WINDOW = 0x42460004;
+// A runtime failure has fenced a previously writable filesystem backing.
+// Optional, non-blocking, implemented by the USB system adapter only.
+static constexpr uint32_t DEVICE_IOCTL_WRITE_FENCED = 0x42460005;
 
 // ---- Generic device operations ----
 struct DeviceOps {

@@ -204,6 +204,7 @@ static inline bool Ext2DirEntryValid(const Ext2DirEntry2* de, uint32_t pos,
 
 struct Ext2Mount {
     Device*  dev;
+    bool      hasWriteFence;
     uint32_t cacheNamespace; // unique for this mount's lifetime, including remounts
     uint32_t blockSize;      // bytes per block
     uint32_t blockShift;     // log2(blockSize)
@@ -593,9 +594,15 @@ static uint32_t Ext2DirLookup(Ext2Mount* mnt, uint32_t parentIno, const Ext2Inod
 static uint32_t Ext2ResolvePath(Ext2Mount* mnt, uint32_t startIno,
                                 const char* path, int symlinkDepth, int* error=nullptr);
 
+static bool Ext2WriteFenced(void* privateMount) {
+    const auto* mnt=static_cast<const Ext2Mount*>(privateMount);
+    return mnt->hasWriteFence && mnt->dev->ops->ioctl(mnt->dev,DEVICE_IOCTL_WRITE_FENCED,nullptr)>0;
+}
+
 // Write exactly `len` bytes to device at `byteOffset`.
 static bool Ext2DevWrite(Ext2Mount* mnt, uint64_t byteOffset, const void* buf, uint64_t len)
 {
+    if(Ext2WriteFenced(mnt))return false;
     Ext2RawBackend io{mnt};
     if(!mnt->writeback.bytes)return io.Write(byteOffset,buf,len);
     if(!g_ext2QueueAvailable) {
@@ -3025,6 +3032,7 @@ static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
     mnt->syncProbe.autoOps = g_ext2AutoSyncOps;
     mnt->cacheNamespace = static_cast<uint32_t>(cacheNamespace);
     mnt->dev            = dev;
+    mnt->hasWriteFence=dev->ops->ioctl && dev->ops->ioctl(dev,DEVICE_IOCTL_WRITE_FENCED,nullptr)>=0;
     mnt->blockSize      = blockSize;
     mnt->blockShift     = blockShift;
     mnt->inodeSize      = inodeSize;
@@ -4718,6 +4726,7 @@ static const VfsFsOps g_ext2FsOps = {
     .create_socket = Ext2FsCreateSocket,
     .root_object = Ext2RootObject,
     .vnode_object = Ext2ObjectFromVnode,
+    .write_fenced = Ext2WriteFenced,
 };
 
 // ---------------------------------------------------------------------------

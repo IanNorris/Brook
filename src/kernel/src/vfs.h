@@ -249,6 +249,8 @@ struct VfsFsOps {
     // object-relative contract; callers must return EOPNOTSUPP if absent.
     int (*root_object)(void* mountPriv, uint8_t pdrv, VfsObject** out) = nullptr;
     int (*vnode_object)(Vnode* vnode, VfsObject** out) = nullptr;
+    // Optional lock-free backing-wide write fence, including existing binds.
+    bool (*write_fenced)(void* mountPriv) = nullptr;
 };
 
 // Register a filesystem driver with the VFS.

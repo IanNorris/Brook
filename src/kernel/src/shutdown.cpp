@@ -10,6 +10,7 @@
 #include "memory/file_object.h"
 #include "ext2_vfs.h"
 #include "writable_desktop.h"
+#include "usb_system.h"
 #include "ahci_system_volume.h"
 #include "ahci_readonly.h"
 #include "fw_cfg.h"
@@ -125,6 +126,7 @@ int FinalSync() {
     if(!error)error=AhciSystemQemuLargeDataFinalSync();
 #endif
     if(!error)error=WritableDesktopFinalSync();
+    error=UsbSystemFinalSync(error);
     return error;
 }
 void FinishSync(int index,int error) {

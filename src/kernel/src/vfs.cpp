@@ -216,7 +216,10 @@ struct MountEntry {
     uint64_t         lockedAttributes;
 };
 static uint64_t VfsMountAttributes(const MountEntry* mount) {
-    return __atomic_load_n(&mount->attributes,__ATOMIC_ACQUIRE);
+    const auto attributes=__atomic_load_n(&mount->attributes,__ATOMIC_ACQUIRE);
+    const auto* backing=mount->backing;
+    return backing && backing->fsOps->write_fenced && backing->fsOps->write_fenced(backing->mountPriv)
+        ?attributes|MountReadOnly:attributes;
 }
 static bool VfsReadOnly(const MountEntry* mount) { return mount && (VfsMountAttributes(mount)&MountReadOnly); }
 static bool VfsNoExec(const MountEntry* mount) { return mount && (VfsMountAttributes(mount)&MountNoExec); }
