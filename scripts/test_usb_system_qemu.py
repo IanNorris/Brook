@@ -64,7 +64,7 @@ def clone_sparse(source, target, base):
 def prepare_esp(source, output, record=None):
     files = output.with_suffix(".files")
     shutil.copytree(source, files)
-    if record is not None:
+    if record is not None and not PREBUILT:
         initrd = files / "INITRD.IMG"
         run("mdel", "-i", initrd, "::/ETC/live-store")
         fat_write(initrd, "ETC/usb-system", record)
@@ -78,7 +78,7 @@ def prepare_esp(source, output, record=None):
         manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
     with output.open("xb") as out:
         out.truncate(ESP_SECTORS * SECTOR)
-    run("mkfs.fat", "-F", "32", "-n", "BROOK_RTX", output)
+    run("mkfs.fat", "-F", "32", *(("-s", "32") if PREBUILT else ()), "-n", "BROOK_RTX", output)
     run("mmd", "-i", output, "::EFI", "::EFI/BOOT", "::KERNEL")
     for name in (*NAMES, "manifest.json"):
         run("mcopy", "-i", output, files / name, "::/" + name)
@@ -88,6 +88,26 @@ def digest_backup(path):
     with path.open("rb") as disk:
         disk.seek(BACKUP_FIRST * SECTOR)
         return hashlib.sha256(disk.read(BACKUP_SECTORS * SECTOR)).hexdigest()
+
+
+PREBUILT = None
+
+
+def adopt_prebuilt(files):
+    """If the set already carries /etc/usb-system (build_rtx_smoke_files.py
+    --usb-system), use it unmodified and lay the fixture out at its extent."""
+    global PREBUILT, ESP_SECTORS, STORE_FIRST, STORE_SECTORS, BACKUP_FIRST, STORE_BYTES
+    got = subprocess.run(["mtype", "-i", files / "INITRD.IMG", "::/ETC/usb-system"], capture_output=True, text=True)
+    if got.returncode:
+        return
+    lines = got.stdout.split("\n")
+    assert lines[0] == "BRKUSB1" and len(lines) == 5 and lines[4] == "", "bad usb-system record"
+    first, sectors = (int(v) for v in lines[2].split(","))
+    PREBUILT = got.stdout
+    ESP_SECTORS = first - ESP_FIRST
+    STORE_FIRST, STORE_SECTORS = first, sectors
+    STORE_BYTES = sectors * SECTOR
+    BACKUP_FIRST = STORE_FIRST + STORE_SECTORS
 
 
 def make_disks(args):
@@ -100,6 +120,11 @@ def make_disks(args):
         fs_uuid = uuid.UUID(bytes=store.read(16))
     p2_guid = uuid.uuid4()
     record = f"BRKUSB1\n{p2_guid.bytes_le.hex()}\n{STORE_FIRST},{STORE_SECTORS}\n{fs_uuid.hex}\n"
+    if PREBUILT:  # a --usb-system production set: build the fixture around its record
+        record = PREBUILT
+        lines = record.split("\n")
+        p2_guid = uuid.UUID(bytes_le=bytes.fromhex(lines[1]))
+        assert lines[3] == fs_uuid.hex, "store image ext2 UUID differs from the set's record"
     (args.output / "usb-system.record").write_text(record)
     system = args.output / "system.raw"
     fallback = args.output / "fallback.raw"
@@ -251,6 +276,7 @@ def main():
     if args.accel == "kvm" and subprocess.run(["pgrep", "-x", "vmware-vmx"], capture_output=True).returncode == 0:
         raise SystemExit("Workstation is running. Use TCG or wait for the VMware window to close.")
     args.output.mkdir(mode=0o700, parents=True)
+    adopt_prebuilt(args.files)
     system, fallback = make_disks(args)
     backup = digest_backup(system)
     results = {"backup_sha256": backup}
