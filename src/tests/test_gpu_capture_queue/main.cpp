@@ -32,13 +32,13 @@ brook::GpuCompositorOps ops{};
 
 void CaptureOverlayAt(uint64_t now, int32_t mx, int32_t my, bool cursor) {
     using namespace brook;
-    const auto frame = CaptureShellFrame(g_physFbWidth, g_physFbHeight, now, mx, my);
+    const auto frame = CaptureShellFrame(g_deskWidth, g_deskHeight, now, mx, my);
     CaptureDesktopOverlay(frame, now, mx, my, cursor);
 }
 
 void CheckOverlayAt(uint64_t now, int32_t mx, int32_t my) {
     using namespace brook;
-    CheckDesktopOverlay(now, CaptureShellFrame(g_physFbWidth, g_physFbHeight, now, mx, my));
+    CheckDesktopOverlay(now, CaptureShellFrame(g_deskWidth, g_deskHeight, now, mx, my));
 }
 }
 namespace brook {
@@ -315,7 +315,19 @@ int main() {
     CHECK(backdrop[0]==10 && backdrop[1]==11 && backdrop[2]==12);
     DesktopBackdropSpan(backdrop,0,3,0,3,1,nullptr,0,0);
     CHECK(backdrop[0]==0x1a3a && backdrop[1]==0x1a3a && backdrop[2]==0x1a3a);
-    g_gpuComposite=false;g_physFb=framebuffer;g_physFbWidth=8;g_physFbHeight=6;g_physFbStride=8;
+    {   // D3: a desktop over two outputs fits the wallpaper to each output, split at the edge.
+        g_wallpaper=const_cast<uint32_t*>(wallpaper);g_wallpaperWidth=3;g_wallpaperHeight=2;
+        g_deskWidth=6;g_deskHeight=2;g_deskOutputs[0]={0,0,3,2};g_deskOutputs[1]={3,0,3,2};g_deskOutputCount=2;
+        DeskBackdropSpan(backdrop,0,6,1);
+        CHECK(backdrop[0]==13 && backdrop[1]==14 && backdrop[2]==15 && backdrop[3]==13 && backdrop[4]==14 && backdrop[5]==15);
+        DeskBackdropSpan(backdrop,2,5,0);
+        CHECK(backdrop[0]==12 && backdrop[1]==10 && backdrop[2]==11);
+        g_deskOutputs[1]={4,0,2,2};                   // a gap at x 3: no output there
+        DeskBackdropSpan(backdrop,2,6,0);
+        CHECK(backdrop[0]==12 && backdrop[1]==0x1a3a && backdrop[2]==10 && backdrop[3]==11);
+        g_deskOutputCount=0;
+    }
+    g_gpuComposite=false;g_physFb=framebuffer;g_physFbWidth=g_deskWidth=8;g_physFbHeight=g_deskHeight=6;g_physFbStride=8;
     g_wallpaper=const_cast<uint32_t*>(wallpaper);g_wallpaperWidth=3;g_wallpaperHeight=2;
     CompositorBackdropInfo backdropInfo{};CHECK(CompositorGetBackdropInfo(&backdropInfo));
     CHECK(CompositorReadBackdropSpan(backdropInfo,2,1,4,backdrop));
@@ -648,7 +660,7 @@ int main() {
     CHECK(CompositorReleaseDebugFrame(frame.token,77));g_debugFramePages=0;g_debugFrameBuffer=VirtualAddress{};g_backBuffer=nullptr;
     // The manual power-off frame must reach scanout even with no renderer
     // and must never draw over a still-active writer or present lease.
-    g_physFb=framebuffer;g_physFbWidth=8;g_physFbHeight=6;g_physFbStride=8;
+    g_physFb=framebuffer;g_physFbWidth=g_deskWidth=8;g_physFbHeight=g_deskHeight=6;g_physFbStride=8;
     g_backBuffer=software;g_backBufStride=8;
     const auto flushes=displayFlushes;
     g_gopWriter=1;
