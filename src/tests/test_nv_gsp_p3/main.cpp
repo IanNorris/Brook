@@ -41,6 +41,8 @@ struct Inputs {
     Bytes rom, acr, unload;
     uint64_t elf_size = 28528288, boot_size = 0x1000;
     uint32_t interface_offset = 0;
+    uint32_t fwsec_desc = 0;      // ROM offset of the FWSEC descriptor
+    size_t ucode_bytes = 0;
 };
 
 static size_t Writes(const fake_gpu::FakeGpu& g) {
@@ -106,6 +108,8 @@ int main(int argc, char** argv) {
         Vbios vb; FwsecImage f;
         assert(ParseVbios(S(I.rom), &vb) == FwStatus::Ok && ParseFwsec(vb, &f) == FwStatus::Ok);
         I.interface_offset = f.interface_offset;
+        I.fwsec_desc = f.desc_addr;
+        I.ucode_bytes = f.ucode.n;
         std::printf("fwsec: v%u desc 0x%x+0x%x ucode 0x%zx..0x%zx (rom %zu B)\n", f.version, f.desc_addr, f.desc_size,
                     size_t(f.ucode.p - I.rom.data()), size_t(f.ucode.p - I.rom.data()) + f.ucode.n, I.rom.size());
     }
@@ -170,7 +174,7 @@ int main(int argc, char** argv) {
         assert(RunP3(r.gpu, kChipTu104, r.in, r.dma).status == BootStatus::DevinitIncomplete && Writes(r.gpu) == 0);
     }
     {
-        Rig r(I, 0x1); Bytes bad = I.rom; bad.resize(0x10000);       // 64 KiB dump: no FWSEC
+        Rig r(I, 0x1); Bytes bad = I.rom; bad.resize(I.fwsec_desc + 8);  // dump cut inside FWSEC (e.g. a 128 KiB read)
         r.in.vbios = S(bad);
         const P3Result p = RunP3(r.gpu, kChipTu104, r.in, r.dma);
         assert(p.status == BootStatus::BadInput && std::strcmp(p.stage, "vbios") == 0 && Writes(r.gpu) == 0);
@@ -181,7 +185,7 @@ int main(int argc, char** argv) {
         assert(p.status == BootStatus::BadInput && std::strcmp(p.stage, "patch") == 0 && Writes(r.gpu) == 0);
     }
     {
-        Rig r(I, 0x1); r.dma.bytes = 4096;                           // too small for the ucode
+        Rig r(I, 0x1); r.dma.bytes = I.ucode_bytes - 4;              // too small for the ucode
         assert(RunP3(r.gpu, kChipTu104, r.in, r.dma).status == BootStatus::BadInput && Writes(r.gpu) == 0);
     }
 
