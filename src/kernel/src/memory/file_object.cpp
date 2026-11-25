@@ -3,6 +3,7 @@
 #include "virtual_memory.h"
 #include "heap.h"
 #include "vfs.h"
+#include "device.h"
 #include "string.h"
 #include "panic.h"
 #include "spinlock.h"
@@ -118,12 +119,12 @@ uint64_t CopyIn(void* destination,const void* source,uint64_t length) {
 #endif
 }
 int ReadResident(FileObject* object,Vnode* vnode,void* buffer,uint64_t length,uint64_t* offset,
-                 uint64_t physical=0,bool* retain=nullptr) {
+                 uint64_t physical=0,bool* retain=nullptr,UsbReadSource source=UsbReadSource::File) {
     Gate held(object);const uint64_t begin=*offset;
     if(!length)return 0;
     if(object->mappingError)return object->mappingError;
-    const int result=physical && object->readOwned?
-        object->readOwned(vnode,buffer,length,offset,physical,retain):
+    const int result=object->readOwned?
+        object->readOwned(vnode,buffer,length,offset,physical,retain,source):
         vnode->ops->read(vnode,buffer,length,offset);
     if(retain && *retain)return -5;
     if(result>0 && !object->pinCoherentPage)Overlay(object,begin,buffer,static_cast<uint64_t>(result),false);
@@ -230,7 +231,9 @@ static PhysicalAddress GetPageLocked(FileObject* object,Vnode* vnode,uint64_t in
     uint64_t required=stat.size-offset;if(required>4096)required=4096;
     uint64_t done=0;
     while(done<required) {
-        result=vnode->ops->read(vnode,static_cast<uint8_t*>(bytes)+done,required-done,&offset);
+        if(object->readOwned)
+            result=object->readOwned(vnode,static_cast<uint8_t*>(bytes)+done,required-done,&offset,0,nullptr,UsbReadSource::Fault);
+        else result=vnode->ops->read(vnode,static_cast<uint8_t*>(bytes)+done,required-done,&offset);
         if(result<=0 || static_cast<uint64_t>(result)>required-done) {
             PmmUnrefPage(physical);kfree(page);rollback();
             if(error)*error=result<0?result:-5;
@@ -289,7 +292,7 @@ static int ReadAheadLocked(FileObject* object,Vnode* vnode,uint64_t first,
     const uint64_t required=remaining<bytes?remaining:bytes;
     if(required<bytes)memset(buffer+required,0,bytes-required);
     bool retain=false;
-    const int result=object->readOwned(vnode,buffer,required,&offset,physical.raw(),&retain);
+    const int result=object->readOwned(vnode,buffer,required,&offset,physical.raw(),&retain,UsbReadSource::Fault);
     if(retain)return -5;
     uint32_t loaded=0;
     for(uint32_t i=0;i<count;++i) {
@@ -313,7 +316,7 @@ static int ReadAheadLocked(FileObject* object,Vnode* vnode,uint64_t first,
 #endif
 
 MappingFaultResult FileObjectFaultPages(FileObject* object,Vnode* vnode,uint64_t index,
-                                       uint32_t capacity,PhysicalAddress* pages,bool* loaded) {
+                                       uint32_t capacity,PhysicalAddress* pages,bool* loaded,uint64_t mappedPages) {
     [[maybe_unused]] Operation operation;
     if(loaded)*loaded=false;
     if(!pages || !capacity || capacity>FILE_OBJECT_PAGE_BATCH)return MappingFaultResult::Unhandled;
@@ -340,9 +343,13 @@ MappingFaultResult FileObjectFaultPages(FileObject* object,Vnode* vnode,uint64_t
     if(statResult)return failure(statResult==-12?MappingFaultResult::OutOfMemory:MappingFaultResult::IoError,statResult,0);
     if(index*4096>=stat.size)return failure(MappingFaultResult::EndOfFile,-6,stat.size);
 #ifndef BROOK_HOST_TEST
-    const int prefetched=ReadAheadLocked(object,vnode,index,capacity,stat.size);
+    const uint64_t limit=object->readOwned && mappedPages>capacity?mappedPages:capacity;
+    const uint32_t ahead=limit<64?uint32_t(limit):64;
+    const int prefetched=ReadAheadLocked(object,vnode,index,ahead,stat.size);
     if(prefetched<0)return failure(prefetched==-12?MappingFaultResult::OutOfMemory:
         MappingFaultResult::IoError,prefetched,stat.size);
+#else
+    (void)mappedPages;
 #endif
     int error=0;pages[0]=GetPageLocked(object,vnode,index,true,&error,loaded,&stat);
     if(!pages[0])return failure(error==-12?MappingFaultResult::OutOfMemory:
@@ -357,9 +364,13 @@ MappingFaultResult FileObjectFaultPages(FileObject* object,Vnode* vnode,uint64_t
     return MappingFaultResult::Resolved;
 }
 int FileObjectRead(FileObject* object,Vnode* vnode,void* buffer,uint64_t length,uint64_t* offset) {
+    return FileObjectReadTagged(object,vnode,buffer,length,offset,UsbReadSource::File);
+}
+int FileObjectReadTagged(FileObject* object,Vnode* vnode,void* buffer,uint64_t length,
+                         uint64_t* offset,UsbReadSource source) {
     [[maybe_unused]] Operation operation;
     OffsetGate offsetHeld(object);
-    if(!length || !UserPointer(buffer))return ReadResident(object,vnode,buffer,length,offset);
+    if(!length || !UserPointer(buffer))return ReadResident(object,vnode,buffer,length,offset,0,nullptr,source);
     constexpr uint64_t usualBurst=64*1024;
     uint64_t capacity=length<usualBurst?length:usualBurst;
     PhysicalAddress physical{};
@@ -380,7 +391,7 @@ int FileObjectRead(FileObject* object,Vnode* vnode,void* buffer,uint64_t length,
     while(done<length) {
         uint64_t count=length-done;if(count>capacity)count=capacity;
         uint64_t position=*offset;
-        result=ReadResident(object,vnode,bounce,count,&position,physical.raw(),&retain);
+        result=ReadResident(object,vnode,bounce,count,&position,physical.raw(),&retain,source);
         if(result<=0)break;
         // Copyout may fault/CoW. The file gate and filesystem locks are gone.
         const uint64_t copied=CopyOut(static_cast<uint8_t*>(buffer)+done,bounce,static_cast<uint64_t>(result));
