@@ -27,12 +27,9 @@
 #include <stddef.h>
 #include "nv_gsp_fw.h"
 #include "nv_gsp_wpr.h"
+#include "nv_gsp_chip.h"
 
 namespace brook::nvgsp {
-
-constexpr uint32_t kFalconGsp  = 0x110000;
-constexpr uint32_t kFalconSec2 = 0x840000;
-constexpr uint32_t kRiscvGsp   = 0x111000;       // falcon addr2 (+0x1000)
 
 // falcon registers (relative)
 constexpr uint32_t kFIrqMClr = 0x014, kFMbox0 = 0x040, kFMbox1 = 0x044, kFItfen = 0x048;
@@ -43,10 +40,8 @@ constexpr uint32_t kFEngReset = 0x3c0, kFSec2Debug = 0x408, kFTranscfg0 = 0x600,
 constexpr uint32_t kFQueueHead0 = 0xc00;
 constexpr uint32_t kRiscvCpuctl = 0x240;
 
-constexpr uint32_t kRegBoot0 = 0x000000, kRegDevinit = 0x118128, kRegDevinitScratch = 0x118234;
-constexpr uint32_t kRegVgaWs = 0x625f04, kRegFbSize = 0x100ce0, kRegFrtsErr = 0x001438;
-constexpr uint32_t kRegSec2BootStatus = 0x1180f8;
-constexpr uint32_t kTu104Boot0 = 0x164000a1;
+constexpr uint32_t kFTracePcIdx = 0x148, kFTracePcVal = 0x14c, kFSctl = 0x240;
+// Chip-specific bases and registers come from ChipOps (nv_gsp_chip.h).
 
 enum class BootStatus : uint8_t {
     Ok, WrongChip, DevinitIncomplete, Wpr2AlreadySet, Timeout, FalconError, FwsecError,
@@ -95,7 +90,7 @@ public:
     bool Disable() { mask(kFItfen, 3, 0); wr(kFIrqMClr, 0xffffffff); return ResetEng(); }
     bool Enable() {
         if (!ResetEng() || !WaitScrub()) return false;
-        wr(kFBoot0, bus_.rd32(kRegBoot0));
+        wr(kFBoot0, bus_.rd32(0x000000));            // PMC_BOOT_0 (all generations)
         return true;
     }
     bool Reset() { return Disable() && Enable(); }   // F4 243-252
@@ -145,29 +140,58 @@ struct Preflight {
     BootStatus status = BootStatus::Ok;
 };
 template <class Bus>
-inline Preflight RunPreflight(Bus& bus) {
+inline Preflight RunPreflight(Bus& bus, const ChipOps& c) {
     Preflight p;
     bus.mark("pre", "brook_preflight");
-    p.boot0 = bus.rd32(kRegBoot0);
-    p.devinit = bus.rd32(kRegDevinit);
-    p.devinit_scratch = bus.rd32(kRegDevinitScratch);
-    p.vga_ws = bus.rd32(kRegVgaWs);
-    p.fb_size_reg = bus.rd32(kRegFbSize);
-    p.wpr2_lo = bus.rd32(kRegWpr2Lo);
-    p.wpr2_hi = bus.rd32(kRegWpr2Hi);
-    p.gsp_cpuctl = bus.rd32(kFalconGsp + kFCpuctl);
-    p.gsp_riscv_cpuctl = bus.rd32(kRiscvGsp + kRiscvCpuctl);
-    p.sec2_cpuctl = bus.rd32(kFalconSec2 + kFCpuctl);
-    if (p.boot0 != kTu104Boot0) p.status = BootStatus::WrongChip;
+    p.boot0 = bus.rd32(c.reg_boot0);
+    p.devinit = bus.rd32(c.reg_devinit);
+    p.devinit_scratch = bus.rd32(c.reg_devinit_scratch);
+    p.vga_ws = bus.rd32(c.reg_vga_ws);
+    p.fb_size_reg = bus.rd32(c.reg_fb_size);
+    p.wpr2_lo = bus.rd32(c.reg_wpr2_lo);
+    p.wpr2_hi = bus.rd32(c.reg_wpr2_hi);
+    p.gsp_cpuctl = bus.rd32(c.gsp_falcon + kFCpuctl);
+    p.gsp_riscv_cpuctl = bus.rd32(c.gsp_riscv + kRiscvCpuctl);
+    p.sec2_cpuctl = bus.rd32(c.booter_falcon + kFCpuctl);
+    if (p.boot0 != c.boot0) p.status = BootStatus::WrongChip;
     else if (!(p.devinit & 1) || (p.devinit_scratch & 0xff) != 0xff) p.status = BootStatus::DevinitIncomplete;
     else if (p.wpr2_hi != 0) p.status = BootStatus::Wpr2AlreadySet;
     return p;
 }
 
-// ---------------------------------------------------------- FWSEC-FRTS
+// --------------------------------------------------------- failure capture
+// What P3/P4 report when a falcon step fails (no retry in the same boot):
+// CPUCTL, mailboxes, the FWSEC error scratch, WPR2 and the TRACEPC ring
+// (gm200_flcn_tracepc: TIDX 0x148 bits 23:16 = depth; write the index to
+// 0x148, read the PC at 0x14c). The index writes are the only writes.
+struct FalconDiag {
+    uint32_t cpuctl = 0, mbox0 = 0, mbox1 = 0, sctl = 0, tidx = 0, dmactl = 0, hwcfg = 0;
+    uint32_t frts_err = 0, sb_err = 0, wpr2_lo = 0, wpr2_hi = 0, riscv_cpuctl = 0;
+    uint32_t trace_n = 0;
+    uint32_t trace[32] = {};
+};
+template <class Bus>
+inline FalconDiag CaptureFalconDiag(Bus& bus, const ChipOps& c, uint32_t falcon) {
+    FalconDiag d;
+    Falcon<Bus> f(bus, falcon);
+    d.cpuctl = f.rd(kFCpuctl); d.mbox0 = f.rd(kFMbox0); d.mbox1 = f.rd(kFMbox1);
+    d.sctl = f.rd(kFSctl); d.dmactl = f.rd(kFDmactl); d.hwcfg = f.rd(kFHwcfg);
+    d.frts_err = bus.rd32(c.reg_frts_err); d.sb_err = bus.rd32(c.reg_sb_err);
+    d.wpr2_lo = bus.rd32(c.reg_wpr2_lo); d.wpr2_hi = bus.rd32(c.reg_wpr2_hi);
+    d.riscv_cpuctl = bus.rd32(c.gsp_riscv + kRiscvCpuctl);
+    d.tidx = f.rd(kFTracePcIdx);
+    uint32_t n = (d.tidx >> 16) & 0xff;
+    if (n > 32) n = 32;
+    for (uint32_t i = 0; i < n; ++i) { f.wr(kFTracePcIdx, i); d.trace[i] = f.rd(kFTracePcVal); }
+    d.trace_n = n;
+    return d;
+}
+
+// ------------------------------------------------------------ FWSEC (any command)
 struct FwsecRun {
     uint32_t mbox0 = 0, mbox1 = 0, err = 0, wpr2_lo = 0, wpr2_hi = 0;
     BootStatus status = BootStatus::Ok;
+    const char* step = "";             // last step entered (for the failure report)
 };
 // Build the flcn_bl_dmem_desc_v2 the ACR bootloader reads (G1 118-145).
 inline nvfw::FlcnBlDmemDescV2 FwsecBlDesc(const FwsecImage& f, uint64_t dma) {
@@ -182,20 +206,21 @@ inline nvfw::FlcnBlDmemDescV2 FwsecBlDesc(const FwsecImage& f, uint64_t dma) {
     return d;
 }
 
-// `ucode` is the patched FWSEC image (PatchFwsec) already copied to the
-// sysmem DMA buffer at bus address `dma` (v2 only: the ACR bootloader pulls
-// it in by DMA). v3 loads IMEM/DMEM directly from `ucode`.
+// Load and boot a patched FWSEC image on the GSP falcon in HS mode. `ucode`
+// is the patched image (PatchFwsec) already copied to the sysmem DMA buffer
+// at bus address `dma` (v2: the ACR bootloader pulls it in by DMA). v3
+// loads IMEM/DMEM directly from `ucode`. `phase` names the trace phase.
 template <class Bus>
-inline FwsecRun RunFwsecFrts(Bus& bus, const FwsecImage& f, const AcrBl* bl, const uint8_t* ucode,
-                             uint64_t dma, const FbLayout& L) {
+inline FwsecRun BootFwsec(Bus& bus, const ChipOps& c, const char* phase, const FwsecImage& f, const AcrBl* bl,
+                          const uint8_t* ucode, uint64_t dma) {
     FwsecRun r;
-    Falcon<Bus> g(bus, kFalconGsp);
-    bus.mark("fwsec_frts", "acquire");
+    Falcon<Bus> g(bus, c.gsp_falcon);
+    bus.mark(phase, r.step = "acquire");
     (void)g.rd(kFHwcfg1);
     const uint32_t limit = g.ImemLimit();
-    bus.mark("fwsec_frts", "reset");
+    bus.mark(phase, r.step = "reset");
     if (!g.Reset()) { r.status = BootStatus::Timeout; return r; }
-    bus.mark("fwsec_frts", "load");
+    bus.mark(phase, r.step = "load");
     g.mask(kFFbifCtl, 0x80, 0x80);
     g.wr(kFDmactl, 0);
     uint32_t boot_addr = f.boot_addr;
@@ -210,25 +235,48 @@ inline FwsecRun RunFwsecFrts(Bus& bus, const FwsecImage& f, const AcrBl* bl, con
         g.PioImem(f.imem_base, ucode + f.imem_base_img, f.imem_size, f.imem_base >> 8, true);
         g.PioDmem(f.dmem_base, ucode + f.dmem_base_img, f.dmem_size);
     }
-    bus.mark("fwsec_frts", "boot");
+    bus.mark(phase, r.step = "boot");
     if (!g.Boot(0, nullptr, boot_addr, &r.mbox0, &r.mbox1)) { r.status = BootStatus::Timeout; return r; }
     if (r.mbox0 != 0) { r.status = BootStatus::FalconError; return r; }
-    bus.mark("fwsec_frts", "verify");
-    r.err = bus.rd32(kRegFrtsErr) >> 16;
+    return r;
+}
+
+template <class Bus>
+inline FwsecRun RunFwsecFrts(Bus& bus, const ChipOps& c, const FwsecImage& f, const AcrBl* bl, const uint8_t* ucode,
+                             uint64_t dma, const FbLayout& L) {
+    FwsecRun r = BootFwsec(bus, c, "fwsec_frts", f, bl, ucode, dma);
+    if (r.status != BootStatus::Ok) return r;
+    bus.mark("fwsec_frts", r.step = "verify");
+    r.err = bus.rd32(c.reg_frts_err) >> 16;
     if (r.err) { r.status = BootStatus::FwsecError; return r; }
-    r.wpr2_lo = bus.rd32(kRegWpr2Lo);
-    r.wpr2_hi = bus.rd32(kRegWpr2Hi);
+    r.wpr2_lo = bus.rd32(c.reg_wpr2_lo);
+    r.wpr2_hi = bus.rd32(c.reg_wpr2_hi);
     // BROOK: check the region FWSEC locked against our FRTS placement.
     if (Wpr2RegToAddr(r.wpr2_lo) != L.frts.addr || Wpr2HiToEnd(r.wpr2_hi) != L.frts.end())
         r.status = BootStatus::Wpr2Mismatch;
     return r;
 }
 
+// FWSEC-SB (fini, tu102_gsp_fini): the falcon was reset first by the caller
+// path (BootFwsec resets it anyway); error in the SB scratch bits 15:0.
+template <class Bus>
+inline FwsecRun RunFwsecSb(Bus& bus, const ChipOps& c, const FwsecImage& f, const AcrBl* bl, const uint8_t* ucode,
+                           uint64_t dma) {
+    FwsecRun r = BootFwsec(bus, c, "fwsec_sb", f, bl, ucode, dma);
+    if (r.status != BootStatus::Ok) return r;
+    bus.mark("fwsec_sb", r.step = "verify");
+    r.err = bus.rd32(c.reg_sb_err) & 0xffff;
+    r.wpr2_lo = bus.rd32(c.reg_wpr2_lo);
+    r.wpr2_hi = bus.rd32(c.reg_wpr2_hi);
+    if (r.err) r.status = BootStatus::FwsecError;
+    return r;
+}
+
 // tu102_gsp_oneinit tail: GSP engine reset into RISC-V mode, libos args
 // address in MAILBOX0/1.
 template <class Bus>
-inline BootStatus ResetGspRiscv(Bus& bus, uint64_t libos) {
-    Falcon<Bus> g(bus, kFalconGsp);
+inline BootStatus ResetGspRiscv(Bus& bus, const ChipOps& c, uint64_t libos) {
+    Falcon<Bus> g(bus, c.gsp_falcon);
     bus.mark("gsp_riscv_reset", "reset");
     if (!g.ResetEng()) return BootStatus::Timeout;
     bus.mark("gsp_riscv_reset", "libos_args");
@@ -237,51 +285,75 @@ inline BootStatus ResetGspRiscv(Bus& bus, uint64_t libos) {
     return BootStatus::Ok;
 }
 
-// ----------------------------------------------------- booter_load (SEC2)
+// ------------------------------------------- booter_load / booter_unload
 struct BooterRun {
     uint32_t debug = 0, mbox0 = 0, mbox1 = 0, wpr2_lo = 0, wpr2_hi = 0;
     BootStatus status = BootStatus::Ok;
+    const char* step = "";
 };
 // `img` = booter image with the signature patched in (BuildBooterImage).
+// Runs on the chip's booter falcon (SEC2 on TU10x) with mbox0/1 as given.
 template <class Bus>
-inline BooterRun RunBooterLoad(Bus& bus, const BooterImage& b, const uint8_t* img, uint64_t wpr_meta) {
+inline BooterRun BootBooter(Bus& bus, const ChipOps& c, const char* phase, const BooterImage& b, const uint8_t* img,
+                            uint32_t mbox0, uint32_t mbox1) {
     BooterRun r;
-    Falcon<Bus> s(bus, kFalconSec2);
-    bus.mark("booter_load", "acquire");
+    Falcon<Bus> s(bus, c.booter_falcon);
+    bus.mark(phase, r.step = "acquire");
     (void)s.rd(kFHwcfg1);
     (void)s.rd(kFHwcfg);
     (void)s.rd(kFSec2Debug);
     // nouveau gm200_flcn_fw_signature: enable, then read the debug fuse.
-    bus.mark("booter_load", "sig_select");
+    bus.mark(phase, r.step = "sig_select");
     if (!s.Enable()) { r.status = BootStatus::Timeout; return r; }
     r.debug = s.rd(kFSec2Debug);
-    if (r.debug & 0x00100000) { r.status = BootStatus::BadInput; return r; }  // debug-fused: no dbg sig shipped
-    bus.mark("booter_load", "reset");
+    if (r.debug & c.booter_debug_fuse_bit) { r.status = BootStatus::BadInput; return r; }  // no dbg sig shipped
+    bus.mark(phase, r.step = "reset");
     if (!s.Reset()) { r.status = BootStatus::Timeout; return r; }
-    bus.mark("booter_load", "load");
+    bus.mark(phase, r.step = "load");
     s.mask(kFFbifCtl, 0x80, 0x80);
     s.wr(kFDmactl, 0);
     s.PioImem(b.nmem_base, img + b.nmem_base_img, b.nmem_size, b.nmem_base >> 8, false);
     s.PioImem(b.imem_base, img + b.imem_base_img, b.imem_size, b.imem_base >> 8, true);
     s.PioDmem(b.dmem_base, img + b.dmem_base_img, b.dmem_size);
-    bus.mark("booter_load", "boot");
-    const uint32_t hi = uint32_t(wpr_meta >> 32);
-    if (!s.Boot(uint32_t(wpr_meta), &hi, b.boot_addr, &r.mbox0, &r.mbox1)) { r.status = BootStatus::Timeout; return r; }
+    bus.mark(phase, r.step = "boot");
+    if (!s.Boot(mbox0, &mbox1, b.boot_addr, &r.mbox0, &r.mbox1)) { r.status = BootStatus::Timeout; return r; }
     if (r.mbox0 != 0) { r.status = BootStatus::BooterError; return r; }
+    return r;
+}
+template <class Bus>
+inline BooterRun RunBooterLoad(Bus& bus, const ChipOps& c, const BooterImage& b, const uint8_t* img, uint64_t wpr_meta) {
+    BooterRun r = BootBooter(bus, c, "booter_load", b, img, uint32_t(wpr_meta), uint32_t(wpr_meta >> 32));
+    if (r.status != BootStatus::Ok) return r;
     // BROOK: read back WPR2 after booter extended it (diagnostic only).
-    bus.mark("booter_load", "brook_wpr2_check");
-    r.wpr2_lo = bus.rd32(kRegWpr2Lo);
-    r.wpr2_hi = bus.rd32(kRegWpr2Hi);
+    bus.mark("booter_load", r.step = "brook_wpr2_check");
+    r.wpr2_lo = bus.rd32(c.reg_wpr2_lo);
+    r.wpr2_hi = bus.rd32(c.reg_wpr2_hi);
+    return r;
+}
+// tu102_gsp_booter_unload: skipped when WPR2_HI is already 0; mbox 0xff/0xff
+// outside suspend. Success = WPR2_HI reads 0 afterwards.
+template <class Bus>
+inline BooterRun RunBooterUnload(Bus& bus, const ChipOps& c, const BooterImage& b, const uint8_t* img) {
+    BooterRun r;
+    bus.mark("booter_unload", r.step = "wpr2_check");
+    r.wpr2_hi = bus.rd32(c.reg_wpr2_hi);
+    if (!r.wpr2_hi) { r.wpr2_lo = bus.rd32(c.reg_wpr2_lo); return r; }
+    r = BootBooter(bus, c, "booter_unload", b, img, 0xff, 0xff);
+    if (r.status != BootStatus::Ok) return r;
+    bus.mark("booter_unload", r.step = "verify");
+    r.wpr2_lo = bus.rd32(c.reg_wpr2_lo);
+    r.wpr2_hi = bus.rd32(c.reg_wpr2_hi);
+    if (r.wpr2_hi) r.status = BootStatus::Wpr2Mismatch;
     return r;
 }
 
 // r535_gsp_init head: app version to GSP OS register, RISC-V must be active.
 template <class Bus>
-inline BootStatus GspHandshake(Bus& bus, uint32_t app_version) {
+inline BootStatus GspHandshake(Bus& bus, const ChipOps& c, uint32_t app_version) {
     bus.mark("gsp_handshake", "app_version");
-    bus.wr32(kFalconGsp + kFOs, app_version);
+    bus.wr32(c.gsp_falcon + kFOs, app_version);
     bus.mark("gsp_handshake", "riscv_active");
-    return (bus.rd32(kRiscvGsp + kRiscvCpuctl) & 1) ? BootStatus::Ok : BootStatus::RiscvInactive;
+    return (bus.rd32(c.gsp_riscv + kRiscvCpuctl) & 1) ? BootStatus::Ok : BootStatus::RiscvInactive;
 }
 
 // Core operations the CPU sequencer asks for (G3 1076-1125). Plug into
@@ -289,30 +361,31 @@ inline BootStatus GspHandshake(Bus& bus, uint32_t app_version) {
 template <class Bus>
 struct GspCoreOps {
     Bus& bus;
+    const ChipOps& chip;
     uint64_t libos;
     uint32_t app_version;
     bool core_reset() {
-        Falcon<Bus> g(bus, kFalconGsp);
+        Falcon<Bus> g(bus, chip.gsp_falcon);
         if (!g.Reset()) return false;
         g.mask(kFFbifCtl, 0x80, 0x80);
         g.wr(kFDmactl, 0);
         return true;
     }
-    bool core_start() { Falcon<Bus> g(bus, kFalconGsp); g.Start(); return true; }
+    bool core_start() { Falcon<Bus> g(bus, chip.gsp_falcon); g.Start(); return true; }
     bool core_wait_halt() {
-        Falcon<Bus> g(bus, kFalconGsp);
-        return g.Poll(kFalconGsp + kFCpuctl, 0x10, 0x10, 2000000);
+        Falcon<Bus> g(bus, chip.gsp_falcon);
+        return g.Poll(chip.gsp_falcon + kFCpuctl, 0x10, 0x10, 2000000);
     }
     bool core_resume() {
-        Falcon<Bus> g(bus, kFalconGsp), s(bus, kFalconSec2);
+        Falcon<Bus> g(bus, chip.gsp_falcon), s(bus, chip.booter_falcon);
         if (!g.ResetEng()) return false;
         g.wr(kFMbox0, uint32_t(libos));
         g.wr(kFMbox1, uint32_t(libos >> 32));
         s.Start();
-        if (!g.Poll(kRegSec2BootStatus, 0x04000000, 0x04000000, 2000000)) return false;
+        if (!g.Poll(chip.reg_booter_boot_status, 0x04000000, 0x04000000, 2000000)) return false;
         if (s.rd(kFMbox0) != 0) return false;
         g.wr(kFOs, app_version);
-        return (bus.rd32(kRiscvGsp + kRiscvCpuctl) & 1) != 0;
+        return (bus.rd32(chip.gsp_riscv + kRiscvCpuctl) & 1) != 0;
     }
 };
 

@@ -131,3 +131,37 @@ mismatch.
   production-fused.
 - FWSEC v3 fuse-version selection: index 0 is used, which matches nouveau on
   TU10x.
+
+## M1 (work/gsp-m1): live P3 / P3b
+
+- **HAL.** `nv_gsp/nv_gsp_chip.h` holds everything chip-specific in one
+  `ChipOps` table: PMC_BOOT_0, the GSP/RISC-V/booter falcon bases (SEC2 on
+  TU10x), the readiness, VGA-workspace, FB-size, WPR2 and FWSEC error
+  registers, the FWSEC ucode type and FRTS size, the layout function, and the
+  firmware file set with pinned sizes and SHA-256. The boot plan
+  (`nv_gsp_boot.h`) takes a `ChipOps&`; the queue, radix3 and sequencer layers
+  never see chip constants. Only `kChipTu104` exists; GA102/AD102 add a table.
+- **Sequences.** `nv_gsp/nv_gsp_p3.h`: `RunP3` (preflight + both falcons
+  halted, VBIOS/FWSEC parse, layout, FRTS patch into the DMA buffer, an `arm`
+  hook, then FWSEC-FRTS) and `RunFini` (FWSEC-SB, then booter_unload with mbox
+  0xff/0xff). Every refusal happens before the first write; a failure after it
+  captures CPUCTL, mailboxes, 0x1438/0x1454, WPR2 and TRACEPC.
+- **Live verbs** (`nv_gsp_live.cpp`, `BROOK_NV_GSP`, gated by `/etc/nv-gsp`):
+  `bridge hardware nv-gsp status|p3|fini|trace [from]`. p3 and fini run at most
+  once per boot (latched at the first write). Before the first write: the
+  firmware set named by `/etc/nv-gsp-firmware` matches the pinned hashes, the
+  full PROM image is read and its FWSEC span equals the reference VBIOS's,
+  VT-d translation is off (DMAR GSTS), and a 64 KiB contiguous DMA buffer is
+  allocated. The arm hook then flushes the buffer (non-coherent falcon DMA)
+  and enables PCI bus mastering (0x0003 -> 0x0007).
+- **Firmware.** `nix/nv-gsp-firmware.nix` copies the five files from the
+  pinned linux-firmware *source* (WHENCE links resolved), checks the hashes,
+  and ships `LICENCE.nvidia` plus the nouveau WHENCE stanza. A store built with
+  `build_rtx_live_store.py --nv-gsp-firmware` carries it in the profile, and
+  `build_rtx_smoke_files.py --nv-gsp --nv-gsp-firmware-store` names it. Until
+  the SSD store can be rewritten, `--nv-gsp --nv-gsp-firmware <nix out>`
+  carries the set inside the signed INITRD.IMG (`/boot/nvgsp`, initrd 56 MiB).
+- **Tests.** `test_nv_gsp_p3`: both 0x625f04 encodings (0x1: FRTS 0x1ffe00000,
+  137 MiB, WPR2 0x01ffe000/0x01ffee00; 0x20e09: the reference), the refusals,
+  the failure capture and P3b. Its `--record` log diffs against the reference
+  (42/42 for 0x20e09; for 0x1 only the WPR2 read-back differs).

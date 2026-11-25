@@ -33,6 +33,9 @@
 #include "dell_audio_probe.h"
 #include "dell_i2c_probe.h"
 #include "intel_vtd_observe.h"
+#if defined(BROOK_NV_GSP)
+#include "nv_gsp_live.h"
+#endif
 #include "intel_bdw_scanout.h"
 #include "intel_bdw_bootstrap_gate.h"
 #include "hda_observe.h"
@@ -1575,6 +1578,9 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
 #if defined(BROOK_NV_DISPLAY)
     if(NvAuxHandle(command,nullptr,0))return true;
     if(NvDispHandle(command))return true;          // RTX step 3 flips (nv_disp_live.cpp), gated
+#if defined(BROOK_NV_GSP)
+    if(NvGspHandle(command))return true;           // GSP-RM M1 (nv_gsp_live.cpp), gated by /etc/nv-gsp
+#endif
     constexpr char dpIdlePrefix[]="bridge hardware dp-idle ";
     if(Prefix(command,dpIdlePrefix)){DpIdleCommand(command+sizeof(dpIdlePrefix)-1);return true;}
 #endif

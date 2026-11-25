@@ -57,7 +57,7 @@ struct SeqBus {
 struct NoWait { int n = 0; bool operator()() { return ++n < 1000; } };
 struct Doorbell {
     fake_gpu::FakeGpu& g;
-    void operator()() { g.wr32(kFalconGsp + kFQueueHead0, 0); }   // r535 rpc.c cmdq_push
+    void operator()() { g.wr32(kChipTu104.gsp_falcon + kFQueueHead0, 0); }   // r535 rpc.c cmdq_push
 };
 
 int main(int argc, char** argv) {
@@ -94,7 +94,7 @@ int main(int argc, char** argv) {
     fake_gpu::FakeGpu gpu;
 
     // ---- pre: preflight (BROOK), layout, queued RPCs
-    const Preflight pf = RunPreflight(gpu);
+    const Preflight pf = RunPreflight(gpu, kChipTu104);
     assert(pf.status == BootStatus::Ok);
     FbLayoutInput in;
     in.fb_size = FbSizeFromReg(pf.fb_size_reg);
@@ -137,16 +137,16 @@ int main(int argc, char** argv) {
     }
 
     // ---- FWSEC-FRTS
-    const FwsecRun fr = RunFwsecFrts(gpu, fwsec, &bl, fwsec_img.data(), kFwsecDma, L);
+    const FwsecRun fr = RunFwsecFrts(gpu, kChipTu104, fwsec, &bl, fwsec_img.data(), kFwsecDma, L);
     if (fr.status != BootStatus::Ok) std::fprintf(stderr, "fwsec: %s (%s)\n", BootStatusName(fr.status), gpu.model_error.c_str());
     assert(fr.status == BootStatus::Ok && gpu.fwsec_runs == 1 && gpu.model_error.empty());
     assert(Wpr2RegToAddr(fr.wpr2_lo) == L.frts.addr && Wpr2HiToEnd(fr.wpr2_hi) == L.frts.end());
 
     // ---- GSP into RISC-V mode, booter_load
-    assert(ResetGspRiscv(gpu, kLibosDma) == BootStatus::Ok);
+    assert(ResetGspRiscv(gpu, kChipTu104, kLibosDma) == BootStatus::Ok);
     std::vector<uint8_t> bimg(booter.image.n);
     assert(BuildBooterImage(booter, bimg.data(), bimg.size()));
-    const BooterRun br = RunBooterLoad(gpu, booter, bimg.data(), kMetaDma);
+    const BooterRun br = RunBooterLoad(gpu, kChipTu104, booter, bimg.data(), kMetaDma);
     if (br.status != BootStatus::Ok) std::fprintf(stderr, "booter: %s (%s)\n", BootStatusName(br.status), gpu.model_error.c_str());
     assert(br.status == BootStatus::Ok && gpu.booter_runs == 1 && br.mbox0 == 0 && br.mbox1 == uint32_t(kMetaDma >> 32));
     assert(Wpr2RegToAddr(br.wpr2_lo) == L.wpr2.addr && Wpr2HiToEnd(br.wpr2_hi) == L.frts.end());
@@ -155,15 +155,15 @@ int main(int argc, char** argv) {
     assert(gpu.sec2.dmem[booter.dmem_sign / 4] == w0);
 
     // ---- handshake
-    assert(GspHandshake(gpu, rbl.desc.appVersion) == BootStatus::Ok);
+    assert(GspHandshake(gpu, kChipTu104, rbl.desc.appVersion) == BootStatus::Ok);
 
     // ---- CPU sequencer replay (GSP-RM's RUN_CPU_SEQUENCER payload)
     if (seq_path) {
         Bytes payload;
         assert(Load(seq_path, &payload));
-        gpu.reg[kFalconGsp + kFMbox0] = 0x80000000;    // GSP-RM: "ready for the sequencer"
+        gpu.reg[kChipTu104.gsp_falcon + kFMbox0] = 0x80000000;    // GSP-RM: "ready for the sequencer"
         gpu.mark("cpu_sequencer", "seq");
-        SeqBus sb{gpu, GspCoreOps<fake_gpu::FakeGpu>{gpu, kLibosDma, rbl.desc.appVersion}};
+        SeqBus sb{gpu, GspCoreOps<fake_gpu::FakeGpu>{gpu, kChipTu104, kLibosDma, rbl.desc.appVersion}};
         const SeqResult sr = RunSequencer(sb, payload.data(), uint32_t(payload.size()));
         std::printf("sequencer: %s, %u commands (%u wr, %u poll, %u store, %u core)\n", SeqStatusName(sr.status),
                     sr.commands, sr.writes, sr.polls, sr.stores, sr.core_ops);
@@ -172,7 +172,7 @@ int main(int argc, char** argv) {
 
     // ---- postinit (r535_gsp_postinit: allow the GSP interrupt)
     gpu.mark("postinit", "intr_allow");
-    gpu.wr32(kFalconGsp + 0x004, 0x40);
+    gpu.wr32(kChipTu104.gsp_falcon + 0x004, 0x40);
 
     size_t pio = 0;
     for (auto& a : gpu.log) pio += a.op == 'W' && (a.off == 0x110184 || a.off == 0x8401c4 || a.off == 0x840184);

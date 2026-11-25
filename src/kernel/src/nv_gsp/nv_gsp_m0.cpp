@@ -4,6 +4,7 @@
 // them (-ffreestanding -fno-builtin -fno-exceptions -Wshadow -Werror).
 // The live MMIO bus, firmware loading and the bridge verbs arrive in M1.
 #include "nv_gsp/nv_gsp_boot.h"
+#include "nv_gsp/nv_gsp_p3.h"
 #include "nv_gsp/nv_gsp_queue.h"
 #include "nv_gsp/nv_gsp_radix3.h"
 #include "nv_gsp/nv_gsp_seq.h"
@@ -45,14 +46,20 @@ struct NoBell { void operator()() {} };
     in.fb_size = 8ull << 30; in.reg_625f04 = 0x20e09; in.elf_size = 28528288; in.boot_size = 0x1000;
     r += ComputeFbLayout(in, &L) ? 1 : 0;
     InertBus bus;
-    r += int(RunPreflight(bus).status);
-    r += int(RunFwsecFrts(bus, fw, nullptr, blob, 0, L).status);
-    r += int(ResetGspRiscv(bus, 0));
-    r += int(RunBooterLoad(bus, booter, blob, 0).status);
-    r += int(GspHandshake(bus, 0));
+    r += int(RunPreflight(bus, kChipTu104).status);
+    r += int(RunFwsecFrts(bus, kChipTu104, fw, nullptr, blob, 0, L).status);
+    r += int(ResetGspRiscv(bus, kChipTu104, 0));
+    r += int(RunBooterLoad(bus, kChipTu104, booter, blob, 0).status);
+    r += int(GspHandshake(bus, kChipTu104, 0));
     r += int(RunSequencer(bus, blob, uint32_t(len)).status);
-    GspCoreOps<InertBus> ops{bus, 0, 0};
+    GspCoreOps<InertBus> ops{bus, kChipTu104, 0, 0};
     r += ops.core_resume() ? 1 : 0;
+    {
+        P3Inputs pin; pin.vbios = s; pin.acr_bl = s; pin.elf_size = 1; pin.boot_size = 1;
+        DmaBuf dma;
+        r += int(RunP3(bus, kChipTu104, pin, dma).status);
+        r += int(RunFini(bus, kChipTu104, pin, s, dma, nullptr, 0).status);
+    }
     r += int(PlanRadix3(len).lvl2_pages);
     static uint8_t shm_unused[1];
     QueueShm q;

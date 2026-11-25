@@ -41,6 +41,7 @@ public:
     FakeGpu() {
         static const uint32_t kFalconInit[][2] = {
             {0x12c, 0xca101136}, {0x108, 0x40420100}, {0x048, 0x00001004}, {0x10c, 0x00000001},
+            {0x100, 0x00000010},
             {0x624, 0x00000110}, {0x600, 0x110}, {0x604, 0x110}, {0x608, 0x110}, {0x60c, 0x110},
             {0x610, 0x110}, {0x614, 0x110}, {0x618, 0x110}, {0x61c, 0x110},
         };
@@ -105,6 +106,11 @@ public:
     // table (descriptor InterfaceOffset), as ground truth from the VBIOS.
     uint32_t fwsec_interface_offset = 0;
     uint32_t fwsec_runs = 0, booter_runs = 0, seq_starts = 0, sec2_resumes = 0;
+    uint32_t fwsec_sb_runs = 0, unload_runs = 0;
+    uint32_t fwsec_frts_error = 0, fwsec_sb_error = 0;   // injected FWSEC failures
+    bool unload_clears = true;
+    uint64_t wpr2_skew = 0;                              // FWSEC locks a shifted region
+    std::vector<uint32_t> trace_pcs;                     // TRACEPC ring the falcon reports
     std::string model_error;
     int halt_reads = 3;
 
@@ -132,6 +138,8 @@ private:
                 return Get(off);
             }
             if (r == 0x1c4) { const uint32_t v = f->dmem[(f->dmemc & 0xfffc) / 4]; f->dmemc += 4; return v; }
+            if (r == 0x148) return (uint32_t(trace_pcs.size()) << 16) | (Get(off) & 0xffff);
+            if (r == 0x14c) { const uint32_t i = Get(f->base + 0x148) & 0xff; return i < trace_pcs.size() ? trace_pcs[i] : 0; }
         }
         if (off == 0x1180f8 && resume_countdown > 0 && --resume_countdown == 0)
             reg[off] |= 0x04000000;
@@ -207,11 +215,18 @@ private:
             const uint32_t init_cmd = U32(d + dm + 0x2c);
             const uint32_t cmd = U32(d + dm + 8);
             const uint8_t* c = d + cmd;
+            if (init_cmd == 0x19 && U32(c) == 1 && U32(c + 4) == 24 && U32(c + 20) == 2) {
+                ++fwsec_sb_runs;                       // FWSEC-SB: status word 0x1454 low half
+                reg[0x001454] = fwsec_sb_error;
+                reg[0x110040] = 0; reg[0x110044] = 0;
+                return;
+            }
+            if (fwsec_frts_error) { reg[0x001438] = fwsec_frts_error << 16; reg[0x110040] = 0; return; }
             if (init_cmd != 0x15 || U32(c) != 1 || U32(c + 4) != 24 || U32(c + 20) != 2 ||
                 U32(c + 24) != 1 || U32(c + 28) != 20 || U32(c + 40) != 2) {
                 model_error = "fwsec: FRTS command not patched"; Fail(); return;
             }
-            const uint64_t addr = uint64_t(U32(c + 32)) << 12, size = uint64_t(U32(c + 36)) << 12;
+            const uint64_t addr = (uint64_t(U32(c + 32)) << 12) + wpr2_skew, size = uint64_t(U32(c + 36)) << 12;
             reg[0x1fa824] = uint32_t((addr >> 12) << 4);
             reg[0x1fa828] = uint32_t(((addr + size - 0x20000) >> 12) << 4);
             reg[0x001438] = 0;
@@ -224,6 +239,12 @@ private:
     }
 
     void EmulateBooter() {
+        if (Get(0x840040) == 0xff && Get(0x840044) == 0xff) {   // booter_unload (fini, not suspend)
+            ++unload_runs;
+            if (unload_clears) { reg[0x1fa824] = 0x1ffffe00; reg[0x1fa828] = 0; }
+            reg[0x840040] = 0;
+            return;
+        }
         ++booter_runs;
         const uint64_t meta = uint64_t(Get(0x840040)) | (uint64_t(Get(0x840044)) << 32);
         const uint8_t* m = Dma(meta, 256);

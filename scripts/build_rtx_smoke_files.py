@@ -75,7 +75,9 @@ MARKERS = ('usb-read-only', 'audio-muted', 'hw-inventory', 'boot-status', 'boot-
 ETC_ALLOWED = {*MARKERS, 'i219-attach', 'i219-reset', 'hardware-payload-id', 'resolv.conf', 'machine-id', 'ssl',
                'bridge-v3-operators', 'rtx-update-signer',
                # --session desktop only
-               'live-store', 'usb-system', 'usb-system-trim', 'usb-bot-legacy', 'usb-bot-pipeline', 'usb-uas', 'usb-uas-fixture', 'volatile-desktop', 'hardware-bulk', 'usb-audio-mixer', 'dp-idle-seconds', 'nv-display', 'chromium-alsa-device'}
+               'live-store', 'usb-system', 'usb-system-trim', 'usb-bot-legacy', 'usb-bot-pipeline', 'usb-uas', 'usb-uas-fixture', 'volatile-desktop', 'hardware-bulk', 'usb-audio-mixer', 'dp-idle-seconds', 'nv-display', 'chromium-alsa-device',
+               # --nv-gsp (GSP-RM M1 bridge verbs) and its firmware record
+               'nv-gsp', 'nv-gsp-firmware'}
 # Desktop live stick (--session desktop): the VMware RC session over the RAM
 # store, plus the RTX status helper. If the store does not mount, the services
 # fail to start and the kernel console, bridge and remote update stay usable.
@@ -175,6 +177,54 @@ def fat_write(image, path, data):
         raise SystemExit('FAT readback mismatch for ' + path)
 
 
+# The GSP-RM firmware set (nix/nv-gsp-firmware.nix output). Every listed file
+# must be in its SHA256SUMS; the kernel re-checks its own pinned hashes.
+NV_GSP_FIRMWARE_FILES = ('lib/firmware/nvidia/tu104/gsp/gsp-570.144.bin',
+                         'lib/firmware/nvidia/tu104/gsp/booter_load-570.144.bin',
+                         'lib/firmware/nvidia/tu104/gsp/booter_unload-570.144.bin',
+                         'lib/firmware/nvidia/tu104/gsp/bootloader-570.144.bin',
+                         'lib/firmware/nvidia/tu104/acr/bl.bin')
+NV_GSP_LICENCE_FILES = ('share/licenses/nv-gsp-firmware/LICENCE.nvidia',
+                        'share/licenses/nv-gsp-firmware/WHENCE.nouveau')
+NV_GSP_INITRD_ROOT = '/boot/nvgsp'
+
+
+def nv_gsp_firmware_sums(root):
+    sums = {}
+    for row in (root / 'SHA256SUMS').read_text().splitlines():
+        digest, name = row.split('  ', 1)
+        sums[name] = digest
+    if sorted(sums) != sorted(NV_GSP_FIRMWARE_FILES):
+        raise SystemExit(f'{root}: unexpected SHA256SUMS entries')
+    for name, digest in sums.items():
+        if sha(root / name) != digest:
+            raise SystemExit(f'{root}/{name}: sha256 mismatch')
+    for name in NV_GSP_LICENCE_FILES:
+        if not (root / name).is_file():
+            raise SystemExit(f'{root}/{name}: missing licence file')
+    return sums
+
+
+def embed_nv_gsp_firmware(initrd, root):
+    """Copy the firmware set and its licence into the initrd under
+    /boot/nvgsp (paths as below lib/firmware), read back byte for byte."""
+    sums = nv_gsp_firmware_sums(root)
+    made = set()
+    for name in (*NV_GSP_FIRMWARE_FILES, *NV_GSP_LICENCE_FILES):
+        rel = name.removeprefix('lib/firmware/')
+        parts = ('BOOT/NVGSP/' + rel).split('/')
+        for i in range(1, len(parts)):
+            d = '::/' + '/'.join(parts[:i])
+            if d not in made and subprocess.run(['mdir', '-i', str(initrd), d], capture_output=True).returncode:
+                run(['mmd', '-i', initrd, d])
+            made.add(d)
+        run(['mcopy', '-o', '-i', initrd, root / name, '::/' + '/'.join(parts)])
+        if subprocess.check_output(['mtype', '-i', str(initrd), '::/' + '/'.join(parts)]) != (root / name).read_bytes():
+            raise SystemExit('FAT readback mismatch for ' + name)
+    fat_write(initrd, 'ETC/nv-gsp-firmware', (NV_GSP_INITRD_ROOT + '\n').encode())
+    return {'root': NV_GSP_INITRD_ROOT, 'source': str(root), 'sha256': sums}
+
+
 def gc_root(path, root):
     """Register an indirect GC root so the host's periodic nix-gc cannot
     delete store paths this set (or its live store) depends on."""
@@ -214,6 +264,8 @@ def desktop_payload(args, initrd):
     fat_write(initrd, 'ETC/usb-audio-mixer', b'1\n')
     # RTX DP sink idle-off: 5 min, AUX ch 3 / SOR1 link B (the GOP's lit head on this desktop).
     fat_write(initrd, 'ETC/dp-idle-seconds', b'300 3 1 2\n')
+    if args.nv_gsp:  # GSP-RM M1 bridge verbs (nv-gsp status|p3|fini|trace); nothing at boot
+        fat_write(initrd, 'ETC/nv-gsp', b'1\n')
     if args.nv_display:  # desktop presents by flipping head 0 (D2); GOP copy otherwise
         fat_write(initrd, 'ETC/nv-display', b'1\n')
     fat_write(initrd, 'ETC/chromium-alsa-device', b'default\n')  # read by the store's brook-chromium
@@ -282,6 +334,8 @@ def build(args):
     if dirty and not args.allow_dirty:
         raise SystemExit('Commit tracked changes first (or --allow-dirty for a throwaway build)')
 
+    if args.nv_gsp:
+        KERNEL_FLAGS['BROOK_NV_GSP'] = 'ON'
     args.build_root.mkdir(mode=0o700, parents=True)
     operators = args.build_root / 'operators.pub'
     operators.write_bytes(policy)
@@ -313,7 +367,8 @@ def build(args):
     env = dict(os.environ, BROOK_BUILD_DIR=str(stage), BROOK_INITRD_MARKERS=','.join(markers),
                BROOK_HARDWARE_PAYLOAD_ID=payload_id)
     if args.session == 'desktop':
-        env['BROOK_INITRD_KIB'] = '24576'
+        # +32 MiB for the 28.7 MB GSP firmware set when it rides in the initrd
+        env['BROOK_INITRD_KIB'] = '57344' if args.nv_gsp_firmware else '24576'
     env.pop('BROOK_PROVIDER_PAYLOAD', None)
     run(['bash', ROOT / 'scripts/make_initrd.sh', '--release'], env=env)
     initrd = stage / 'esp/INITRD.IMG'
@@ -323,6 +378,14 @@ def build(args):
     live = None
     if args.session == 'desktop':
         init_rc_bytes, live = desktop_payload(args, initrd)
+    nv_gsp_fw = embed_nv_gsp_firmware(initrd, args.nv_gsp_firmware) if args.nv_gsp_firmware else None
+    if args.nv_gsp_firmware_store:
+        # The desktop store already carries the set (build_rtx_live_store.py --nv-gsp-firmware).
+        store = json.loads(args.nv_gsp_firmware_store.read_text())
+        fw = Path(store['nv_gsp_firmware'])
+        nv_gsp_firmware_sums(fw)
+        fat_write(initrd, 'ETC/nv-gsp-firmware', f'{fw}/lib/firmware\n'.encode())
+        nv_gsp_fw = {'root': f'{fw}/lib/firmware', 'source': 'store', 'store_sha256': store['sha256']}
     init_rc.write_bytes(init_rc_bytes)
     run(['mcopy', '-o', '-i', initrd, init_rc, '::BOOT/INIT.RC'])
     helpers = build_helpers(args.build_root, initrd, operators, signer_hex)
@@ -359,6 +422,7 @@ def build(args):
         'session': args.session, 'live_store': live,
         'initrd': {'drivers': list(DRIVERS), 'etc': etc, 'markers': list(markers)},
         'i219_stage': args.i219_stage,
+        'nv_gsp': {'verbs': bool(args.nv_gsp), 'firmware': nv_gsp_fw},
         'helpers': helpers,
         'update_signer_public': signer_hex,
         'bridge_v3': {'operator_keys': len(keys), 'policy_sha256': hashlib.sha256(policy).hexdigest()},
@@ -377,6 +441,11 @@ def build(args):
             'display': 'firmware GOP framebuffer only',
         },
     }
+    if args.nv_gsp:
+        manifest['hardware_scope']['gsp'] = (
+            'only on explicit bridge calls (nv-gsp p3|fini, each at most once per boot): GPU fn0 PCI command '
+            'bus-master enable and GSP/SEC2 falcon registers (FWSEC from the card VBIOS, booter_unload from the '
+            'pinned 570.144 set); PROM read-only; no VBIOS/flash writes, no clock/fan/voltage changes')
     staged_manifest = staged / 'manifest.json'
     staged_manifest.write_text(json.dumps(manifest, indent=2) + '\n')
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -451,7 +520,22 @@ def main():
                    help='USB system BOT test mode: legacy 64 KiB or experimental read data/status pipelining')
     p.add_argument('--usb-system-trim', metavar="'dry-run|run [MIN_MIB [MAX_MIB]]'",
                    help="scan clean ext2 free extents before mount; send UNMAP only with 'run'")
+    p.add_argument('--nv-gsp', action='store_true',
+                   help='desktop image: BROOK_NV_GSP kernel and /etc/nv-gsp (GSP-RM bridge verbs; nothing runs at boot)')
+    p.add_argument('--nv-gsp-firmware', type=Path, metavar='NIX_OUT',
+                   help='nix/nv-gsp-firmware.nix output to carry in the signed initrd (/boot/nvgsp, /etc/nv-gsp-firmware)')
+    p.add_argument('--nv-gsp-firmware-store', type=Path, metavar='STORE_MANIFEST',
+                   help='store-manifest.json of a store built with --nv-gsp-firmware: /etc/nv-gsp-firmware names '
+                        'the store copy (the store itself must be the one this set boots)')
     args = p.parse_args()
+    if args.nv_gsp_firmware and args.nv_gsp_firmware_store:
+        p.error('--nv-gsp-firmware and --nv-gsp-firmware-store are alternatives')
+    if args.nv_gsp_firmware_store and not args.nv_gsp:
+        p.error('--nv-gsp-firmware-store needs --nv-gsp')
+    if args.nv_gsp_firmware and not (args.nv_gsp and args.session == 'desktop'):
+        p.error('--nv-gsp-firmware needs --nv-gsp and --session desktop')
+    if args.nv_gsp and args.session != 'desktop':
+        p.error('--nv-gsp needs --session desktop')
     if args.usb_uas_fixture and not args.usb_uas:
         p.error("--usb-uas-fixture needs --usb-uas")
     if args.usb_uas and not args.usb_system:
@@ -469,6 +553,7 @@ def main():
     args.output = args.output.absolute()
     args.build_root = args.build_root.absolute()
     args.image = args.image.absolute() if args.image else None
+    args.nv_gsp_firmware = args.nv_gsp_firmware.resolve() if args.nv_gsp_firmware else None
     if args.usb_system_trim and args.usb_system_trim.split()[0] == "run":
         fields = args.usb_system_trim.split()
         if len(fields) != 3 or not 0 < int(fields[1]) <= int(fields[2]) <= 524288:
