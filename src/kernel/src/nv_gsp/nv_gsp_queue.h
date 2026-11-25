@@ -137,6 +137,13 @@ public:
         : cmdq_{shm.cmdq(), shm.msgq() + kRxHdrOff},
           msgq_{shm.msgq(), shm.cmdq() + kRxHdrOff} {}
 
+    // (Re)bind to a freshly initialised shared region (live: the channel's
+    // 128 KiB of buffers are allocated before the queue memory exists).
+    void Attach(const QueueShm& shm) {
+        cmdq_ = Ring{shm.cmdq(), shm.msgq() + kRxHdrOff};
+        msgq_ = Ring{shm.msgq(), shm.cmdq() + kRxHdrOff};
+        cmdq_seq_ = 0; rpc_seq_ = 0;
+    }
     uint32_t cmdq_seq() const { return cmdq_seq_; }
     uint32_t rpc_seq() const { return rpc_seq_; }
 

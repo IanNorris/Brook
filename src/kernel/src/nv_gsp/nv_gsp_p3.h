@@ -49,13 +49,15 @@ struct P3Result {
 // Shared front half: preflight checks the falcons too (P3 and P4 both need
 // an idle GSP falcon); `require_unlocked` false lets P3b run with WPR2 set.
 template <class Bus>
-inline bool P3Prepare(Bus& bus, const ChipOps& c, const P3Inputs& in, P3Result* r, bool require_unlocked) {
+inline bool P3Prepare(Bus& bus, const ChipOps& c, const P3Inputs& in, P3Result* r, bool require_unlocked,
+                      bool require_idle = true) {
     r->stage = "preflight";
     r->pre = RunPreflight(bus, c);
     if (r->pre.status != BootStatus::Ok &&
         !(r->pre.status == BootStatus::Wpr2AlreadySet && !require_unlocked)) { r->status = r->pre.status; return false; }
     // BROOK: both falcons halted (CPUCTL bit 4) and GSP RISC-V inactive.
-    if (!(r->pre.gsp_cpuctl & 0x10) || !(r->pre.sec2_cpuctl & 0x10) || (r->pre.gsp_riscv_cpuctl & 1)) {
+    // (RM-aware fini skips this: GSP-RM has just unloaded and the falcon is reset first.)
+    if (require_idle && (!(r->pre.gsp_cpuctl & 0x10) || !(r->pre.sec2_cpuctl & 0x10) || (r->pre.gsp_riscv_cpuctl & 1))) {
         r->status = BootStatus::FalconError; return false;
     }
     r->stage = "vbios";
@@ -128,10 +130,10 @@ struct FiniResult {
 };
 template <class Bus, class Arm = NoArm>
 inline FiniResult RunFini(Bus& bus, const ChipOps& c, const P3Inputs& in, Span booter_unload, const DmaBuf& dma,
-                          uint8_t* booter_img, size_t booter_cap, Arm arm = Arm()) {
+                          uint8_t* booter_img, size_t booter_cap, Arm arm = Arm(), bool require_idle = true) {
     FiniResult f;
     P3Result r;
-    if (!P3Prepare(bus, c, in, &r, false)) { f.stage = r.stage; f.status = r.status; f.fw = r.fw; return f; }
+    if (!P3Prepare(bus, c, in, &r, false, require_idle)) { f.stage = r.stage; f.status = r.status; f.fw = r.fw; return f; }
     f.wpr2_lo_before = r.pre.wpr2_lo; f.wpr2_hi_before = r.pre.wpr2_hi;
     AcrBl bl;
     const AcrBl* blp = nullptr;

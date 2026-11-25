@@ -18,6 +18,7 @@
 // touched: only GSP/SEC2 falcon registers are written.
 #include "nv_gsp_live.h"
 #include "nv_gsp/nv_gsp_p3.h"
+#include "nv_gsp/nv_gsp_rm.h"
 #include "pci.h"
 #include "acpi.h"
 #include "boot_resource_map.h"
@@ -74,6 +75,11 @@ struct Bar0Bus {
     bool rec = false;
     void Note(char op, uint32_t off, uint32_t v) {
         if (!rec) return;
+        // PIO bursts (IMEMD/DMEMD ports) collapse too: count + last value
+        const uint32_t port = off & 0xfff;
+        if (op == 'W' && (port == 0x184 || port == 0x1c4) && logN && log[logN - 1].op == 'W' && log[logN - 1].off == off) {
+            ++log[logN - 1].count; log[logN - 1].val = v; return;
+        }
         if (op == 'R' && logN && log[logN - 1].op == 'R' && log[logN - 1].off == off && log[logN - 1].val == v) {
             ++log[logN - 1].count; return;
         }
@@ -104,7 +110,8 @@ Bar0Bus g_bus;   // .bss
 // ---------------------------------------------------------- live state
 struct Gpu { uint8_t bus = 0, dev = 0, fn = 0; uint64_t bar0 = 0; bool ok = false; };
 volatile uint32_t g_busy = 0;
-bool g_p3Done = false, g_finiDone = false;   // latched at arm (the first write)
+bool g_p3Done = false, g_finiDone = false, g_p4Done = false;   // latched at arm (the first write)
+bool g_rmRunning = false;                    // GSP-RM reached INIT_DONE this boot
 DmaBuf g_dma;                                 // 16 contiguous pages, kept for the boot
 constexpr uint32_t kDmaPages = 16;
 uint8_t* g_rom = nullptr; uint32_t g_romBytes = 0;     // PROM copy (VMALLOC)
@@ -453,6 +460,7 @@ void P3() {
     o.send();
 }
 
+RmFiniResult RmUnload();   // P4 section below
 void Fini() {
     Out o; o.raw("{\"nv_gsp\":\"fini\"");
     if (g_finiDone) { o.ks("refused", "already ran this boot (no retry)"); o.send(); return; }
@@ -464,9 +472,21 @@ void Fini() {
     if (!img) { o.ks("refused", "no booter image buffer"); o.send(); return; }
     g_bus.logN = 0; g_bus.dropped = 0; g_bus.rec = true;
     KPrintf("nv-gsp: P3b fini (FWSEC-SB, booter_unload) starting\n");
-    const FiniResult r = RunFini(g_bus, *f.chip, f.in, Span{unload, ubytes}, g_dma, reinterpret_cast<uint8_t*>(img.raw()),
-                                 pages * 4096, [&] { return Arm(f.g, &g_finiDone); });
+    RmFiniResult rmf;
+    const bool rm = g_rmRunning;
+    if (rm) {   // GSP-RM is up (p4 this boot): UNLOADING_GUEST_DRIVER first, then the P3b sequence
+        g_finiDone = true;
+        rmf = RmUnload();
+        g_rmRunning = false;
+    }
+    const FiniResult r = (rm && rmf.status != BootStatus::Ok) ? FiniResult{} :
+        RunFini(g_bus, *f.chip, f.in, Span{unload, ubytes}, g_dma, reinterpret_cast<uint8_t*>(img.raw()),
+                pages * 4096, [&] { return Arm(f.g, &g_finiDone); }, !rm);
     g_bus.rec = false;
+    if (rm) {
+        o.k("rm_unload"); o.raw("{"); o.ks("stage", rmf.stage); o.ks("status", BootStatusName(rmf.status));
+        o.kd("q", uint32_t(rmf.q)); o.kb("halted", rmf.halted); o.kh("mbox0", rmf.mbox0_after); o.raw("}");
+    }
     const uint64_t us = g_finiDone ? NowUs() - g_runUs : 0;
     o.ks("stage", r.stage); o.ks("status", BootStatusName(r.status)); o.ks("fw", FwStatusName(r.fw)); o.kb("wrote", r.wrote);
     o.kh("pci_cmd_before", g_cmdBefore); o.kh("pci_cmd_after", g_cmdAfter); o.kd("run_us", us);
@@ -480,6 +500,170 @@ void Fini() {
     FrontOut(o, f);
     KPrintf("nv-gsp: P3b %s at %s: SB err %x, unload mbox0 %x, WPR2 %08x/%08x -> %08x/%08x\n", BootStatusName(r.status),
             r.stage, r.sb.err, r.unload.mbox0, r.wpr2_lo_before, r.wpr2_hi_before, r.unload.wpr2_lo, r.unload.wpr2_hi);
+    o.send();
+}
+
+// ------------------------------------------------------------------ P4
+// GSP-RM to INIT_DONE. All sysmem comes from contiguous PMM runs (direct
+// map, physical = bus address); nothing is freed while RM may use it.
+struct RmState {
+    RmObjects objs;
+    RpcChannel* ch = nullptr;
+    uint8_t* rx = nullptr;
+    uint32_t rxcap = 0;
+    // every region handed to the GPU, for the one-time flush after building
+    static constexpr uint32_t kMaxRegions = 8192;
+    DmaRegion regions[kMaxRegions];
+    uint32_t nregions = 0;
+    bool overflow = false;
+    uint64_t wait_deadline_us = 0;
+    uint32_t waits = 0;
+};
+RmState* g_rm = nullptr;
+bool RmAlloc(uint32_t bytes, DmaRegion* r) {
+    const uint32_t pages = (bytes + 4095) / 4096;
+    const PhysicalAddress p = PmmAllocPages(pages, MemTag::Device, KernelPid);
+    if (!p) return false;
+    if (p.raw() + uint64_t(pages) * 4096 > (1ull << 39)) return false;
+    r->cpu = reinterpret_cast<uint8_t*>(PhysToVirt(p).raw());
+    r->bus = p.raw();
+    r->bytes = pages * 4096;
+    memset(r->cpu, 0, r->bytes);
+    if (g_rm->nregions < RmState::kMaxRegions) g_rm->regions[g_rm->nregions++] = *r; else g_rm->overflow = true;
+    return true;
+}
+void FlushRange(const uint8_t* p, uint32_t n) {
+    for (uint32_t o = 0; o < n; o += 64) __asm__ volatile("clflush (%0)" ::"r"(p + o) : "memory");
+    __asm__ volatile("mfence" ::: "memory");
+}
+struct RmSync {   // CPU writes -> memory before a doorbell / boot step (cmdq region)
+    void operator()() { if (g_rm && g_rm->objs.q.base) FlushRange(g_rm->objs.q.cmdq(), kQueueBytes); }
+};
+struct RmWait {   // msgq poll: drop stale lines, short pause, bounded by the deadline
+    bool operator()() {
+        ++g_rm->waits;
+        FlushRange(g_rm->objs.q.msgq(), kQueueBytes);
+        g_bus.udelay(20);
+        return NowUs() < g_rm->wait_deadline_us;
+    }
+};
+RmSync g_rmSync;
+RmFiniResult RmUnload() {
+    RmWait w; g_rm->wait_deadline_us = NowUs() + 5000000;
+    return RunRmUnload(g_bus, *ChipForBoot0(g_bus.rd32(0)), g_rm->ch, g_rm->rx, g_rm->rxcap, w, g_rmSync);
+}
+bool PciIdentityOf(const Gpu& g, PciIdentity* p) {
+    p->bar0 = g.bar0;
+    const uint32_t b1l = PciConfigRead32(g.bus, g.dev, g.fn, 0x14), b1h = PciConfigRead32(g.bus, g.dev, g.fn, 0x18);
+    const uint32_t b3l = PciConfigRead32(g.bus, g.dev, g.fn, 0x1c), b3h = PciConfigRead32(g.bus, g.dev, g.fn, 0x20);
+    p->bar1 = (uint64_t(b1h) << 32) | (b1l & ~0xfu);
+    p->bar3 = (uint64_t(b3h) << 32) | (b3l & ~0xfu);
+    const uint32_t id = PciConfigRead32(g.bus, g.dev, g.fn, 0), ss = PciConfigRead32(g.bus, g.dev, g.fn, 0x2c);
+    p->vendor = uint16_t(id); p->device = uint16_t(id >> 16);
+    p->subvendor = uint16_t(ss); p->subdevice = uint16_t(ss >> 16);
+    p->revision = uint8_t(PciConfigRead32(g.bus, g.dev, g.fn, 8));
+    p->bus = g.bus; p->dev = g.dev; p->fn = g.fn;
+    return p->bar1 && p->bar3 && p->vendor == 0x10de;
+}
+template <class T> T* NewIn(uint64_t bytes) {
+    VirtualAddress v = VmmAllocPages((bytes + 4095) / 4096, VMM_WRITABLE | VMM_NO_EXEC, MemTag::Device, KernelPid);
+    if (!v) return nullptr;
+    memset(reinterpret_cast<void*>(v.raw()), 0, size_t(bytes));
+    return reinterpret_cast<T*>(v.raw());
+}
+
+void P4() {
+    Out o; o.raw("{\"nv_gsp\":\"p4\"");
+    if (g_p3Done || g_p4Done || g_finiDone) { o.ks("refused", "a falcon run already happened this boot (no retry)"); o.send(); return; }
+    Front f; uint8_t* unloadBlob = nullptr;
+    if (!Prepare(f, false, &unloadBlob)) { o.ks("refused", f.refuse); FrontOut(o, f); o.send(); return; }
+    const ChipOps& c = *f.chip;
+    PciIdentity pci;
+    if (!PciIdentityOf(f.g, &pci)) { o.ks("refused", "PCI identity/BARs"); o.send(); return; }
+    // firmware: the ELF (28.5 MB), the RISC-V bootloader and booter_load, hash-checked again on load
+    uint8_t* elfBlob = LoadFile(c, kFwGsp);
+    uint8_t* rblBlob = LoadFile(c, kFwBootloader);
+    uint8_t* loadBlob = LoadFile(c, kFwBooterLoad);
+    if (!elfBlob || !rblBlob || !loadBlob) { o.ks("refused", "firmware load failed"); o.send(); return; }
+    GspElf elf; RiscvBootloader rbl; BooterImage booter;
+    if (ParseGspElf(Span{elfBlob, c.fw[kFwGsp].bytes}, &elf) != FwStatus::Ok ||
+        ParseRiscvBootloader(Span{rblBlob, c.fw[kFwBootloader].bytes}, &rbl) != FwStatus::Ok ||
+        ParseBooter(Span{loadBlob, c.fw[kFwBooterLoad].bytes}, &booter) != FwStatus::Ok) {
+        o.ks("refused", "firmware parse failed"); o.send(); return;
+    }
+    uint8_t* bimg = NewIn<uint8_t>(booter.image.n);
+    if (!g_rm) g_rm = NewIn<RmState>(sizeof(RmState));
+    if (!bimg || !g_rm || !BuildBooterImage(booter, bimg, booter.image.n)) { o.ks("refused", "no memory"); o.send(); return; }
+    g_rm->ch = NewIn<RpcChannel>(sizeof(RpcChannel));
+    g_rm->rxcap = 2 * kMaxElemBytes;
+    g_rm->rx = NewIn<uint8_t>(g_rm->rxcap);
+    if (!g_rm->ch || !g_rm->rx) { o.ks("refused", "no memory"); o.send(); return; }
+    f.in.elf_size = elf.fwimage.n;
+    f.in.boot_size = rbl.payload.n;
+    auto prepare = [&](const FbLayout& L) -> const char* {
+        auto alloc = [](uint32_t bytes, DmaRegion* r) { return RmAlloc(bytes, r); };
+        if (const char* e = BuildRmObjects(alloc, elf, rbl, L, &g_rm->objs)) return e;
+        if (g_rm->overflow) return "region list overflow";
+        for (uint32_t i = 0; i < g_rm->nregions; ++i) FlushRange(g_rm->regions[i].cpu, g_rm->regions[i].bytes);
+        return nullptr;
+    };
+    g_bus.logN = 0; g_bus.dropped = 0; g_bus.rec = true;
+    KPrintf("nv-gsp: P4 GSP-RM boot starting (FWSEC-FRTS, booter_load, INIT_DONE)\n");
+    RmWait wait;
+    g_rm->wait_deadline_us = ~0ull;
+    uint64_t armUs = 0;
+    auto arm = [&] {
+        if (!Arm(f.g, &g_p4Done)) return false;
+        armUs = NowUs();
+        g_rm->wait_deadline_us = armUs + 15000000;   // INIT_DONE took ~0.9 s after booter under Linux
+        return true;
+    };
+    const P4Result r = RunP4(g_bus, c, f.in, g_dma, pci, booter, bimg, &g_rm->objs, g_rm->ch, g_rm->rx, g_rm->rxcap,
+                             prepare, arm, wait, g_rmSync);
+    g_bus.rec = false;
+    g_rmRunning = r.init_done;
+    o.ks("stage", r.stage); o.ks("status", BootStatusName(r.status)); o.kd("q", uint32_t(r.q)); o.kb("wrote", r.p3.wrote);
+    o.kh("pci_cmd_before", g_cmdBefore); o.kh("pci_cmd_after", g_cmdAfter);
+    Pre(o, r.p3.pre);
+    if (r.p3.layout.fb_size) Layout(o, r.p3.layout);
+    o.k("fwsec"); o.raw("{"); o.ks("step", r.p3.run.step); o.kh("mbox0", r.p3.run.mbox0); o.kh("err", r.p3.run.err);
+    o.kh("wpr2_lo", r.p3.run.wpr2_lo); o.kh("wpr2_hi", r.p3.run.wpr2_hi); o.raw("}");
+    o.k("booter"); o.raw("{"); o.ks("step", r.booter.step); o.kh("debug", r.booter.debug); o.kh("mbox0", r.booter.mbox0);
+    o.kh("mbox1", r.booter.mbox1); o.kh("wpr2_lo", r.booter.wpr2_lo); o.kh("wpr2_hi", r.booter.wpr2_hi);
+    o.kd("t_us", r.t_booter_us); o.raw("}");
+    o.k("rm"); o.raw("{"); o.kb("init_done", r.init_done); o.kd("t_init_done_us", r.t_init_done_us);
+    o.kd("seq_runs", r.seq_runs); o.ks("seq_status", SeqStatusName(r.seq.status)); o.kd("seq_commands", r.seq.commands);
+    o.kd("seq_fail_index", r.seq.fail_index); o.kd("events", r.events); o.kd("nocat", r.nocat);
+    o.kd("libos_print", r.libos_print); o.kd("other_events", r.other_events); o.kh("last_other_fn", r.last_other_fn);
+    o.kd("waits", g_rm->waits); o.kd("static_len", r.static_len); o.kb("static_ok", r.static_ok);
+    o.k("static_head"); o.raw("\""); for (uint32_t i = 0; i < 32; ++i) { const char* hx = "0123456789abcdef";
+        char b[3] = {hx[r.static_head[i] >> 4], hx[r.static_head[i] & 15], 0}; o.raw(b); } o.raw("\"");
+    o.kd("sysmem_kib", g_rm->objs.dma_bytes >> 10); o.kh("libos", g_rm->objs.libos.bus); o.kh("meta", g_rm->objs.meta.bus);
+    o.kh("shm", g_rm->objs.shm.bus); o.raw("}");
+    o.kh("mbox0_now", g_bus.rd32(c.gsp_falcon + kFMbox0)); o.kh("riscv_cpuctl_now", g_bus.rd32(c.gsp_riscv + kRiscvCpuctl));
+    if (r.diag_valid) Diag(o, r.diag);
+    o.kd("trace_records", g_bus.logN); o.kd("trace_dropped", g_bus.dropped);
+    FrontOut(o, f);
+    KPrintf("nv-gsp: P4 %s at %s: booter mbox0 %x, WPR2 %08x/%08x, INIT_DONE %d at %lu us, seq %s, static %u B\n",
+            BootStatusName(r.status), r.stage, r.booter.mbox0, r.booter.wpr2_lo, r.booter.wpr2_hi, r.init_done ? 1 : 0,
+            (unsigned long)r.t_init_done_us, SeqStatusName(r.seq.status), r.static_len);
+    o.send();
+}
+
+// LOGINIT/LOGINTR/LOGRM: the put pointer and 1536 raw bytes at `off`
+// (libos-encoded records; decode host-side against the ELF's log sections).
+void Log(const char* which, uint32_t off) {
+    Out o; o.raw("{\"nv_gsp\":\"log\"");
+    const int id = !strcmp(which, "init") ? kLogInit : !strcmp(which, "intr") ? kLogIntr : !strcmp(which, "rm") ? kLogRm : -1;
+    if (id < 0 || !g_rm || !g_rm->objs.log[id].cpu || off >= kLogBytes) { o.ks("error", "Expected init|intr|rm <offset> after p4"); o.send(); return; }
+    const DmaRegion& b = g_rm->objs.log[id];
+    FlushRange(b.cpu, kLogBytes);
+    uint64_t put; memcpy(&put, b.cpu, 8);
+    o.ks("buffer", which); o.kd("put", put); o.kd("offset", off);
+    const uint32_t n = kLogBytes - off < 1536 ? kLogBytes - off : 1536;
+    o.k("hex"); o.raw("\"");
+    for (uint32_t i = 0; i < n; ++i) { const char* hx = "0123456789abcdef"; char c2[3] = {hx[b.cpu[off + i] >> 4], hx[b.cpu[off + i] & 15], 0}; o.raw(c2); }
+    o.raw("\"");
     o.send();
 }
 
@@ -508,6 +692,14 @@ bool NvGspHandle(const char* command) {
     if (!strcmp(verb, "status")) Status();
     else if (!strcmp(verb, "p3")) P3();
     else if (!strcmp(verb, "fini")) Fini();
+    else if (!strcmp(verb, "p4")) P4();
+    else if (!strncmp(verb, "log ", 4)) {
+        char which[8]{}; uint32_t i = 0; const char* p = verb + 4;
+        while (*p && *p != ' ' && i < 7) which[i++] = *p++;
+        uint32_t off = 0; while (*p == ' ') ++p;
+        for (; (*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f'); ++p) off = off * 16 + uint32_t(*p <= '9' ? *p - '0' : *p - 'a' + 10);
+        Log(which, off);
+    }
     else if (!strncmp(verb, "trace", 5) && (!verb[5] || verb[5] == ' ')) {
         uint32_t from = 0; for (const char* p = verb + 5; *p; ++p) if (*p >= '0' && *p <= '9') from = from * 10 + uint32_t(*p - '0');
         Trace(from);

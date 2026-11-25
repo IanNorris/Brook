@@ -110,6 +110,7 @@ public:
     uint32_t fwsec_frts_error = 0, fwsec_sb_error = 0;   // injected FWSEC failures
     bool unload_clears = true;
     uint64_t wpr2_skew = 0;                              // FWSEC locks a shifted region
+    uint64_t booter_meta = 0;                            // WPR meta bus address booter_load was given
     std::vector<uint32_t> trace_pcs;                     // TRACEPC ring the falcon reports
     std::string model_error;
     int halt_reads = 3;
@@ -182,7 +183,7 @@ private:
             return;
         }
         // SEC2
-        if (f.starts == 1 || !booter_done) { EmulateBooter(); return; }
+        if (f.starts == 1 || !booter_done || (Get(0x840040) == 0xff && Get(0x840044) == 0xff)) { EmulateBooter(); return; }
         ++sec2_resumes;
         resume_countdown = 3;
         reg[0x840040] = 0;
@@ -248,6 +249,7 @@ private:
         ++booter_runs;
         const uint64_t meta = uint64_t(Get(0x840040)) | (uint64_t(Get(0x840044)) << 32);
         const uint8_t* m = Dma(meta, 256);
+        booter_meta = meta;
         if (!m || U64(m) != 0xdc3aae21371a60b3ULL || U64(m + 8) != 1) {
             model_error = "booter: bad WPR meta"; reg[0x840040] = 0xbad; return;
         }

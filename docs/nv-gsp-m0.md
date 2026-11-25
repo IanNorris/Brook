@@ -165,3 +165,22 @@ mismatch.
   137 MiB, WPR2 0x01ffe000/0x01ffee00; 0x20e09: the reference), the refusals,
   the failure capture and P3b. Its `--record` log diffs against the reference
   (42/42 for 0x20e09; for 0x1 only the WPR2 read-back differs).
+
+## M1 P4 (work/gsp-m1): GSP-RM to INIT_DONE
+
+- `nv_gsp/nv_gsp_rm.h`: `BuildRmObjects` (ELF image pages + radix3,
+  signature, bootloader, GspFwWprMeta, libos LOGINIT/LOGINTR/LOGRM + RMARGS,
+  queue shared memory), `BuildSystemInfo` / `BuildRegistry` (byte-identical to
+  nouveau's 25 Nov SET_SYSTEM_INFO / SET_REGISTRY on this card apart from the
+  BARs), `RunP4` (preflight, queued RPCs, FWSEC-FRTS, RISC-V reset,
+  booter_load, handshake, RUN_CPU_SEQUENCER, INIT_DONE, GET_GSP_STATIC_INFO)
+  and `RunRmUnload` (UNLOADING_GUEST_DRIVER, MAILBOX0 = 0x80000000).
+- Live: `nv-gsp p4` (once per boot, not with p3), `nv-gsp fini` (after p4:
+  the RM unload, then FWSEC-SB and booter_unload), `nv-gsp log init|intr|rm
+  <hex offset>` (raw libos log bytes). CPU writes are clflushed before every
+  doorbell/boot step; the msgq is re-read from memory on every poll.
+- `test_nv_gsp_p4` with `fake_rm.h`: the fake GSP-RM finds every object
+  through the mailbox -> libos -> RMARGS -> queue and meta -> radix3 -> image
+  chains, plays the Linux message order, and answers the static-info and
+  unload RPCs. With the real blobs and `BROOK_NV_GSP_SEQ` its `--record` log
+  matches the reference 164/164 from fwsec_frts through cpu_sequencer.
