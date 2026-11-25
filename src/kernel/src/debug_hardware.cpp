@@ -44,6 +44,7 @@
 #include "kprintf.h"
 #include "spinlock.h"
 #include "platform_power.h"
+#include "nv_gpu_reset.h"
 extern "C" void NvDisplayMarkWritten(); // debug_hardware.cpp: pre-reset GPU reset trigger
 #include "nv_disp_live.h"
 #include "nv_aux_reply.h"
@@ -768,43 +769,103 @@ void DpIdleSuspendForDisplay(bool suspend){
 }
 // Pre-reset GPU reset. A warm reset does not reset the display engine, and
 // after nv-disp / nv-aux display writes the next POST hung with no video.
-// If such a write happened this boot, the last quiesce step resets the GPU:
-// FLR on fn0 when DevCap advertises it, else a Secondary Bus Reset on the
-// upstream port. Registered at boot so it runs after nv-disp's own abort.
-static volatile bool g_nvDisplayWritten=false;
+// If such a write happened this boot, the last quiesce step resets the GPU
+// (nv_gpu_reset.h, RM's TU102 full-chip reset order): PMC engine reset when
+// GSP-RM ran engines this boot, bus master off + TransactionsPending drain,
+// FLR on fn0, header restore, wait for the GPU's own GFW boot to complete,
+// and a Secondary Bus Reset on the upstream port if the FLR did not take.
+// Registered at boot so it runs after nv-disp's and GSP-RM's own quiesce.
+static volatile bool g_nvDisplayWritten=false,g_nvEnginesUsed=false;
 extern "C" void NvDisplayMarkWritten(){__atomic_store_n(&g_nvDisplayWritten,true,__ATOMIC_RELEASE);}
+extern "C" void NvGpuMarkEnginesUsed(){__atomic_store_n(&g_nvEnginesUsed,true,__ATOMIC_RELEASE);
+    __atomic_store_n(&g_nvDisplayWritten,true,__ATOMIC_RELEASE);}
 static void NvDelayUs(uint32_t us){
     if(TscClockAvailable()){const uint64_t end=TscClockReadNs()+uint64_t(us)*1000;while(TscClockReadNs()<end)__asm__ volatile("pause");}
     else{const uint64_t end=ApicTickCount()+us/1000+1;while(ApicTickCount()<end)__asm__ volatile("pause");}
 }
+namespace {
+struct NvResetTarget{PciDevice gpu{};bool found=false,bridge=false;uint8_t bb=0,bd=0,bf=0;
+    volatile uint32_t* pmc=nullptr;volatile uint32_t* aon=nullptr;};   // BAR0 pages 0x000000 and 0x118000, mapped at boot
+NvResetTarget g_nvReset;
+struct NvResetCfg{
+    NvResetTarget& t;
+    uint32_t rd32(uint8_t o){return PciConfigRead32(t.gpu.bus,t.gpu.dev,0,o);}
+    uint16_t rd16(uint8_t o){return PciConfigRead16(t.gpu.bus,t.gpu.dev,0,o);}
+    void wr32(uint8_t o,uint32_t v){PciConfigWrite32(t.gpu.bus,t.gpu.dev,0,o,v);}
+    void wr16(uint8_t o,uint16_t v){PciConfigWrite16(t.gpu.bus,t.gpu.dev,0,o,v);}
+    bool has_bridge(){return t.bridge;}
+    uint16_t brd16(uint8_t o){return PciConfigRead16(t.bb,t.bd,t.bf,o);}
+    void bwr16(uint8_t o,uint16_t v){PciConfigWrite16(t.bb,t.bd,t.bf,o,v);}
+};
+struct NvResetMmio{
+    NvResetTarget& t;
+    volatile uint32_t* at(uint32_t o){
+        if((o>>12)==0&&t.pmc)return t.pmc+((o&0xfff)>>2);
+        if((o>>12)==0x118&&t.aon)return t.aon+((o&0xfff)>>2);
+        return nullptr;}
+    uint32_t rd32(uint32_t o){volatile uint32_t* p=at(o);return p?*p:0xffffffffu;}
+    void wr32(uint32_t o,uint32_t v){volatile uint32_t* p=at(o);if(p)*p=v;}
+};
+struct NvResetClock{
+    uint64_t now_us(){return TscClockAvailable()?TscClockReadNs()/1000:ApicTickCount()*1000;}
+    void delay_us(uint32_t us){NvDelayUs(us);}
+};
+volatile uint32_t* NvResetMap(uint64_t phys){
+    auto va=VmmAllocPages(1,VMM_WRITABLE|VMM_NO_EXEC,MemTag::Device,KernelPid);
+    if(!va)return nullptr;
+    const auto leaf=VmmDetachPage(KernelPageTable,va);if(leaf)PmmFreePage(VmmLeafPhysical(leaf));
+    __asm__ volatile("invlpg (%0)"::"r"(va.raw()):"memory");
+    if(!VmmMapPage(KernelPageTable,va,PhysicalAddress(phys),VMM_WRITABLE|VMM_NO_EXEC|VMM_CACHE_DISABLE|VMM_WRITE_THRU,MemTag::Device,KernelPid))
+        return nullptr;
+    return reinterpret_cast<volatile uint32_t*>(va.raw());
+}
+void NvResetPrepare(){
+    auto& t=g_nvReset;
+    for(uint32_t i=0;i<PciBootInventoryCount()&&!t.found;++i){PciBootEntry e{};
+        if(PciBootInventoryRead(i,&e)&&e.device.vendorId==0x10de&&e.device.classCode==0x03&&e.device.fn==0){t.gpu=e.device;t.found=true;}}
+    if(!t.found)return;
+    for(uint32_t i=0;i<PciBootInventoryCount()&&!t.bridge;++i){PciBootEntry e{};
+        if(!PciBootInventoryRead(i,&e)||(e.headerType&0x7f)!=1)continue;
+        if(((PciConfigRead32(e.device.bus,e.device.dev,e.device.fn,0x18)>>8)&0xff)!=t.gpu.bus)continue;
+        t.bb=e.device.bus;t.bd=e.device.dev;t.bf=e.device.fn;t.bridge=true;}
+    const uint32_t b0=PciConfigRead32(t.gpu.bus,t.gpu.dev,0,0x10);
+    if(!(b0&1)&&(b0&~0xfu)){const uint64_t base=b0&~uint64_t(15);t.pmc=NvResetMap(base);t.aon=NvResetMap(base+0x118000);}
+}
+}
 static void NvGpuResetQuiesce(){
     if(!__atomic_load_n(&g_nvDisplayWritten,__ATOMIC_ACQUIRE))return;
-    PciDevice gpu{};bool found=false;
-    for(uint32_t i=0;i<PciBootInventoryCount()&&!found;++i){PciBootEntry e{};
-        if(PciBootInventoryRead(i,&e)&&e.device.vendorId==0x10de&&e.device.classCode==0x03&&e.device.fn==0){gpu=e.device;found=true;}}
-    if(!found)return;
-    // PCIe capability (id 0x10) on fn0.
-    uint8_t cap=uint8_t(PciConfigRead32(gpu.bus,gpu.dev,0,0x34)&0xfc);
-    for(int n=0;cap&&n<48;++n){const uint32_t h=PciConfigRead32(gpu.bus,gpu.dev,0,cap);if((h&0xff)==0x10)break;cap=uint8_t((h>>8)&0xfc);}
-    if(cap&&(PciConfigRead32(gpu.bus,gpu.dev,0,uint8_t(cap+4))&(1u<<28))){
-        KPrintf("power: GPU %02x:%02x.0 display was written this boot; FLR before reset\n",gpu.bus,gpu.dev);
-        PciConfigWrite16(gpu.bus,gpu.dev,0,uint8_t(cap+8),uint16_t(PciConfigRead16(gpu.bus,gpu.dev,0,uint8_t(cap+8))|0x8000));
-        NvDelayUs(100000);
-        KPrintf("power: GPU FLR done\n");return;
+    auto& t=g_nvReset;
+    if(!t.found)return;
+    PlatformPowerExtendResetWatchdog(9000);   // GFW waits + a possible SBR fit inside
+    nvreset::Plan plan;plan.engines=__atomic_load_n(&g_nvEnginesUsed,__ATOMIC_ACQUIRE);
+    KPrintf("power: GPU %02x:%02x.0 reset before platform reset (engines %u, bridge %u, mmio %u)\n",
+            t.gpu.bus,t.gpu.dev,plan.engines?1u:0u,t.bridge?1u:0u,(t.pmc&&t.aon)?1u:0u);
+    NvResetCfg cfg{t};NvResetMmio mmio{t};NvResetClock clk;
+    const nvreset::Result r=nvreset::RunGpuReset(cfg,mmio,clk,plan);
+    KPrintf("power: GPU reset %s via %s: pmc %x->%x tp %u (%u us) vendor %u gfw %u (%u us, plm %x progress %x) total %u us\n",
+            r.status,r.path,r.pmc_before,r.pmc_after,r.tp_cleared?1u:0u,r.tp_us,r.vendor_ok?1u:0u,r.gfw_ok?1u:0u,
+            r.gfw_us,r.gfw_plm,r.gfw_progress,r.total_us);
+}
+// Read-only view of what the reset hook would see (`bridge hardware gpu-reset status`).
+static void NvGpuResetStatus(){
+    auto& t=g_nvReset;Reply o;
+    o.text("{\"gpu_reset\":\"status\"");
+    auto kd=[&](const char* k,uint64_t v){o.text(",");o.field(k,v);};
+    auto kh=[&](const char* k,uint64_t v){o.text(",\"");o.text(k);o.text("\":\"0x");o.number(v,true);o.text("\"");};
+    kd("found",t.found);kd("display_written",g_nvDisplayWritten);kd("engines_used",g_nvEnginesUsed);
+    if(t.found){
+        NvResetCfg cfg{t};NvResetMmio mmio{t};
+        uint8_t cap=uint8_t(cfg.rd32(0x34)&0xfc);
+        for(int n=0;cap&&n<48;++n){const uint32_t h=cfg.rd32(cap);if((h&0xff)==0x10)break;cap=uint8_t((h>>8)&0xfc);}
+        kh("cmd",cfg.rd16(4));kd("flr_cap",cap&&(cfg.rd32(uint8_t(cap+4))&(1u<<28)));
+        if(cap){kh("devctl",cfg.rd16(uint8_t(cap+8)));kh("devsta",cfg.rd16(uint8_t(cap+0x0a)));kh("lnksta",cfg.rd16(uint8_t(cap+0x12)));}
+        kd("bridge",t.bridge);
+        if(t.bridge){kh("bridge_bus",t.bb);kh("bridge_dev",t.bd);kd("bridge_fn",t.bf);kh("bridge_ctl",cfg.brd16(0x3e));}
+        kd("mmio",t.pmc&&t.aon);
+        if(t.pmc&&t.aon&&(cfg.rd16(4)&2)){kh("pmc_enable",mmio.rd32(nvreset::kPmcEnable));kh("gfw_plm",mmio.rd32(nvreset::kGfwPlm));
+            kh("gfw_progress",mmio.rd32(nvreset::kGfwProgress));}
     }
-    for(uint32_t i=0;i<PciBootInventoryCount();++i){PciBootEntry e{};
-        if(!PciBootInventoryRead(i,&e)||(e.headerType&0x7f)!=1)continue;
-        const auto& b=e.device;
-        if(((PciConfigRead32(b.bus,b.dev,b.fn,0x18)>>8)&0xff)!=gpu.bus)continue;
-        KPrintf("power: GPU %02x:%02x.0 display was written this boot; SBR on %02x:%02x.%u before reset\n",
-                gpu.bus,gpu.dev,b.bus,b.dev,b.fn);
-        const uint16_t bc=PciConfigRead16(b.bus,b.dev,b.fn,0x3e);
-        PciConfigWrite16(b.bus,b.dev,b.fn,0x3e,uint16_t(bc|0x40));
-        NvDelayUs(2000); // hold the reset >= 1 ms
-        PciConfigWrite16(b.bus,b.dev,b.fn,0x3e,uint16_t(bc&~0x40));
-        KPrintf("power: GPU SBR done\n");return;
-    }
-    KPrintf("power: GPU reset skipped (no FLR, no upstream bridge found)\n");
+    o.text("}\n");o.send();
 }
 void DpIdleStart(){
     if(g_dpIdle.threadStarted)return;
@@ -812,6 +873,7 @@ void DpIdleStart(){
     for(uint32_t i=0;i<PciBootInventoryCount()&&!nvidia;++i){PciBootEntry e{};
         if(PciBootInventoryRead(i,&e)&&e.device.vendorId==0x10de&&e.device.classCode==0x03)nvidia=true;}
     if(!nvidia)return;
+    NvResetPrepare();
     (void)PlatformPowerAddQuiesce(NvGpuResetQuiesce);
     Process* t=KernelThreadCreate("dp_idle",DpIdleWorker,nullptr,3);
     if(!t){KPrintf("dp-idle: thread start failed\n");return;}
@@ -842,6 +904,9 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
 #endif
         DebugHandleCommand(body,length-46);return true;
     }
+#if !defined(BROOK_HOST_TEST) && defined(BROOK_NV_DISPLAY)
+    if(!strcmp(command,"bridge hardware gpu-reset status")){NvGpuResetStatus();return true;}
+#endif
     if(!strcmp(command,"bridge hardware caps")){
         char boot[33];DebugEpochCopy(boot);
         Reply r;r.text("{\"hardware_api\":1,\"boot_guard\":true,\"logs_api\":1,\"boot_id\":");r.quoted(boot);

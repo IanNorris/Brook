@@ -45,6 +45,7 @@
 #include "vfs.h"
 #include "../../shared/update/payload.h"
 
+extern "C" void NvGpuMarkEnginesUsed();
 namespace brook {
 namespace {
 using namespace nvgsp;
@@ -417,6 +418,7 @@ void FrontOut(Out& o, const Front& f) {
 // Arm: after every check, before the first write. Latch, flush, bus master.
 bool Arm(const Gpu& g, bool* latch) {
     *latch = true;
+    NvGpuMarkEnginesUsed();   // the pre-reset GPU reset adds the PMC engine reset (debug_hardware.cpp)
     FlushDma();
     g_cmdBefore = PciConfigRead16(g.bus, g.dev, g.fn, 4);
     if (!(g_cmdBefore & 2)) return false;
@@ -544,6 +546,7 @@ void Fini() {
 void GspRmQuiesceForReset() {
     if (!g_rmRunning || g_finiDone || !g_fc.ready) return;
     if (__atomic_exchange_n(&g_busy, 1u, __ATOMIC_ACQUIRE)) { SerialPuts("nv-gsp: pre-reset RM fini skipped (verb busy)\n"); return; }
+    PlatformPowerExtendResetWatchdog(5000);   // RM unload (1.5 s budget) + FWSEC-SB + booter_unload
     SerialPuts("nv-gsp: pre-reset RM fini (UNLOADING_GUEST_DRIVER, FWSEC-SB, booter_unload)\n");
     g_bus.rec = false;
     const FiniOutcome x = FiniCore(1500000);
