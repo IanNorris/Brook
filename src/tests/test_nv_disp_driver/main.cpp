@@ -218,8 +218,23 @@ static void TestHeadOneThird(){
     g.d->f[1].SetThird(t1);assert(g.d->f[1].nbuf==3);
     g.d->Quiesce();
 }
+// Down1 with a frame queued behind an armed one (the desktop's mailbox): the queued flip
+// lands while the teardown waits, so the hide must target the offset ARM shows after it
+// (live aabe56ba: the hide timed out and the head-1 abort list ran).
+static void TestDown1WithQueuedFrame(){
+    DRig g;assert(g.d->Up0()&&g.d->Up1());auto& f=g.d->f[1];
+    f.SetThird(g.d->HeadOneThird(f.surf[0]));
+    const uint32_t ch=ChidWndw(2);
+    g.c.wstall.insert(ch);
+    int8_t b1=f.Back();assert(f.Present(b1)==0);
+    int8_t b2=f.Back();assert(f.Present(b2)==1&&f.queued==b2);
+    g.c.wstall.erase(ch);g.c.ExecuteW(ch,f.put);
+    assert(g.d->Down1());
+    assert(g.d->out[1]==OutState::Off&&g.d->failures[1]==0&&f.fail==FlipFail::None);
+    assert(g.d->Down0());
+}
 int main(){
-    TestUsToWrap();TestHeadOneThird();
+    TestUsToWrap();TestHeadOneThird();TestDown1WithQueuedFrame();
     TestOutput0();TestBothOutputs();TestFailures();TestPacing();TestLoadv();TestAgeRepair();TestTripleMailbox();TestVblankCounter();
     TestMsToVblank();
     puts("test_nv_disp_driver: ok");return 0;

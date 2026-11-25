@@ -121,6 +121,11 @@ template<typename B> struct NvDisplayDriver{
         if(r1->st.windowLive){
             Push p;p.Mthd(c57e::SET_PRESENT_CONTROL,0u);p.Mthd(c57e::SET_CONTEXT_DMA_ISO0,0u);PushWindowUpdate(p,kDriverWindow[1]);
             if(f[1].state==FlipState::Failed){f[1].state=FlipState::Idle;f[1].armed=-1;}
+            // Drop a queued frame and let an armed one land first: SubmitWait would otherwise
+            // arm the queued frame while waiting, and the hide below would wait for the old
+            // ARM offset forever (live aabe56ba: timeout, then the head-1 abort list).
+            f[1].queued=-1;
+            {const uint64_t t0=b->nowUs();while(f[1].state==FlipState::Armed&&b->nowUs()-t0<500000){(void)f[1].Poll();b->relax();}}
             const uint32_t off=b->rd(RegArm(ChidWndw(kDriverWindow[1]),c57e::SET_OFFSET0));
             hidden=f[1].SubmitWait(p.words,p.count,0,off,1000000)&&r1->WindowFini();
         }else hidden=true;
