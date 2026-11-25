@@ -55,10 +55,10 @@ class UpdateRun:
         try:os.fsync(directory)
         finally:os.close(directory)
 
-    def wait_job(self,session,ident,predicate,timeout=60):
+    def wait_job(self,session,ident,predicate,timeout=60,**status_options):
         end=self.clock()+timeout
         while self.clock()<end:
-            result=self.bridge.job(session,ident,wait_s=2)
+            result=self.bridge.job(session,ident,wait_s=2,**status_options)
             if predicate(result):return result
             if result.get('state') in ('completed','failed','rejected','lost'):raise RuntimeError(result)
             self.sleep(.1)

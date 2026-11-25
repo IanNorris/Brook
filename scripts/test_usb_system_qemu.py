@@ -242,7 +242,9 @@ class Guest:
         base = args.output / case
         base.mkdir()
         self.serial = base / "serial.log"
-        self.port = available_port()
+        self.port = getattr(args, "fixed_port", None) or available_port()
+        self.bulk_port = available_port() if getattr(args, "profile_transfer", False) else None
+        bulk_forward = f",hostfwd=tcp:127.0.0.1:{self.bulk_port}-:1236" if self.bulk_port else ""
         self.sock_dir = tempfile.TemporaryDirectory(prefix="brook-usb-system-")
         self.sock = Path(self.sock_dir.name) / "qmp.sock"
         variables = base / "VARS.fd"
@@ -272,7 +274,7 @@ class Guest:
              "-drive", f"if=none,format=raw,id=system,file={system},cache=none,discard=unmap",
              *storage,
              "-device", "usb-net,bus=usb.0,port=3,netdev=net",
-             "-netdev", f"user,id=net,restrict=on,hostfwd=tcp:127.0.0.1:{self.port}-:1234",
+             "-netdev", f"user,id=net,restrict=on,hostfwd=tcp:127.0.0.1:{self.port}-:1234{bulk_forward}",
              "-device", "usb-hub,bus=usb.0,port=4,id=hub",
              "-device", "usb-kbd,bus=usb.0,port=4.2,id=kbd"],
             stdout=self.output, stderr=subprocess.STDOUT)
