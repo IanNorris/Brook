@@ -148,7 +148,11 @@ static void TestAgeRepair(){
     assert(a.Apply(0,d[5],3840,2160,cp)==3&&got[0]==d[3].rects[0]&&got[2]==d[5].rects[0]);got.clear(); // A: frames 3..5
     for(int k=0;k<4;++k)(void)a.Apply(1,d[1],3840,2160,cp);got.clear();
     assert(a.Apply(2,d[1],3840,2160,cp)==1&&got[0]==full);got.clear();                 // older than the history: full
-    assert(a.Apply(0,brook::DamageRects::Full(3840,2160),3840,2160,cp)==1);
+    assert(a.Apply(0,brook::DamageRects::Full(3840,2160),3840,2160,cp)==1);got.clear();
+    // The same rows damaged every frame (an animation) are copied once, not once per frame.
+    brook::DamageRects rows=brook::DamageRects::Rows(0,48,3840);
+    for(int k=0;k<3;++k)(void)a.Apply(int8_t(k),rows,3840,2160,cp);got.clear();
+    assert(a.Apply(0,rows,3840,2160,cp)==1&&got.size()==1&&got[0]==rows.rects[0]);got.clear();
     assert(a.Apply(9,d[1],3840,2160,cp)==0);
 }
 // Mailbox with three buffers: never blocks; a reclaimed queued buffer is reused.

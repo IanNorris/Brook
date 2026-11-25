@@ -211,10 +211,15 @@ struct AgeRepair{
         ++frame;hist[frame%kHist]=d;
         uint32_t n=0;
         const int64_t lb=last[bb];
-        if(lb<0||d.full||frame-uint64_t(lb)>kHist-1){copy(brook::DamageRect{0,0,int32_t(w),int32_t(h)});n=1;}
-        else for(uint64_t k=uint64_t(lb)+1;k<=frame;++k){const auto& r=hist[k%kHist];
-            if(r.full){copy(brook::DamageRect{0,0,int32_t(w),int32_t(h)});n=1;break;}
-            for(uint32_t i=0;i<r.count;++i){copy(r.rects[i]);++n;}}
+        bool whole=lb<0||d.full||frame-uint64_t(lb)>kHist-1;
+        // The frames' damage is merged first: an animation damages the same rows every
+        // frame, and copying them once per missed frame doubled/tripled the PCIe writes.
+        brook::DamageRects merged;
+        if(!whole)for(uint64_t k=uint64_t(lb)+1;k<=frame&&!whole;++k){const auto& r=hist[k%kHist];
+            if(r.full){whole=true;break;}
+            for(uint32_t i=0;i<r.count;++i)merged.Add(r.rects[i]);}
+        if(whole){copy(brook::DamageRect{0,0,int32_t(w),int32_t(h)});n=1;}
+        else for(uint32_t i=0;i<merged.count;++i){copy(merged.rects[i]);++n;}
         last[bb]=int64_t(frame);return n;
     }
 };

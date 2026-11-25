@@ -113,6 +113,9 @@ void CompositorSetPrimaryPresenter(const CompositorPrimaryPresenter* presenter);
 // valid inside an OutputBackendOps::Present call (compositor thread, scanout lock held):
 // a flip backend for a non-primary output copies its damage from here (D3).
 const uint32_t* CompositorPresentSource(uint32_t* stridePixels);
+// Pacing probe: a moving square on every output, redrawn each compositor frame.
+void CompositorSetPacingProbe(bool on);
+bool CompositorPacingProbe();
 
 // Get physical framebuffer pointer and stride (for kernel threads that
 // need direct FB access, e.g. clock overlay).

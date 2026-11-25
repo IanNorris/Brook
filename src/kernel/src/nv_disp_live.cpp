@@ -209,7 +209,7 @@ struct NvPresenterState{
 };
 NvPresenterState g_presenter[nvdisp::kDriverOutputs]{};
 // The compositor loop hook (completion, queued arms, wake time).
-uint64_t g_pollNs=0;uint32_t g_polls=0,g_pollMaxUs=0;
+uint64_t g_pollNs=0;uint32_t g_polls=0,g_pollMaxUs=0,g_pollBusy=0;
 // Output 1's desktop rectangle, published for lock-free Info/Count readers.
 uint64_t g_head1Rect=0;   // x | w<<16 | h<<32 | pitch<<48 (pitch in 64-byte units); 0 = not presented
 uint64_t PresentNowNs(){return TscClockAvailable()?TscClockReadNs():ApicTickCount()*1000000ull;}
@@ -331,6 +331,13 @@ bool g_head1Registered=false;
 // LOADV, never before it. With head 1 presented and its LOADV due within 5 ms after head
 // 0's, the loop waits for that one too, so neither head's flip is still armed when the
 // next frame is presented to it. Returns ms; the nv-aux lock is only try-locked.
+// The last wake target (absolute us) and head 0's frame period, for a poll that finds the
+// lock busy (dp-idle's AUX link watch): it sleeps to the same LOADV instead of polling
+// again in 2 ms, which would run an extra compositor frame inside the current one.
+uint64_t g_wakeAtUs=0;uint32_t g_wakePeriodUs=16667;
+uint32_t MsUntilUs(uint64_t atUs,uint64_t nowUs){
+    const uint32_t ms=atUs>nowUs?uint32_t((atUs-nowUs+999)/1000)+1:1;
+    return ms>g_wakePeriodUs/1000+2?g_wakePeriodUs/1000+2:ms;}
 uint32_t WakeMsLocked(){
     const auto& f0=g_driver.f[0];
     uint32_t target=f0.UsToWrap(f0.lastVline);
@@ -339,14 +346,21 @@ uint32_t WakeMsLocked(){
         if(t1>target&&t1-target<5000)target=t1;
         if(f1.state==nvdisp::FlipState::Armed&&f1.queued>=0&&t1<target)target=t1;
     }
-    const uint32_t ms=(target+300+999)/1000+1;
-    const uint32_t cap=f0.frameUs/1000+2;
-    return ms>cap?cap:ms;
+    const uint64_t now=g_backend.nowUs();
+    g_wakePeriodUs=f0.frameUs?f0.frameUs:16667;g_wakeAtUs=now+target+300;
+    return MsUntilUs(g_wakeAtUs,now);
+}
+uint32_t WakeMsUnlocked(){
+    const uint64_t now=g_backend.nowUs();
+    if(!g_wakeAtUs)return 2;
+    uint64_t at=g_wakeAtUs;
+    if(at<=now)at+=((now-at)/g_wakePeriodUs+1)*g_wakePeriodUs;   // the same phase, next frame
+    return MsUntilUs(at,now);
 }
 uint32_t NvPrimaryPoll(){
     const uint64_t t0=PresentNowNs();
     SpinLock* lock=NvAuxSharedLock();
-    if(!SpinLockTryAcquire(lock))return 2;
+    if(!SpinLockTryAcquire(lock)){++g_pollBusy;return g_presenter[0].active?WakeMsUnlocked():2;}
     uint32_t ms=16;bool lost1=false;
     if(g_presenter[0].active&&g_driver.Live(0)){
         g_driver.Tick();
@@ -464,7 +478,7 @@ void PresenterStats(bool reset){
     }
     nvdisp::NvDisplayDriver<LiveBackend>::Line l;
     l.raw("{\"nv_display\":\"stats_poll\",\"us\":");l.dec(us);l.raw(",\"polls\":");l.dec(now.polls-a.polls);
-    l.raw(",\"poll_cpu_us\":");l.dec((now.pollNs-a.pollNs)/1000);l.raw(",\"poll_max_us\":");l.dec(g_pollMaxUs);l.raw("}\n");
+    l.raw(",\"poll_busy\":");l.dec(g_pollBusy);l.raw(",\"poll_cpu_us\":");l.dec((now.pollNs-a.pollNs)/1000);l.raw(",\"poll_max_us\":");l.dec(g_pollMaxUs);l.raw("}\n");
     DebugChannelSend(l.t);
 }
 // Marker files hold "1\n" (as the Intel opt-ins).
@@ -508,7 +522,7 @@ bool NvDispHandle(const char* command){
     if(strncmp(rest,"driver",6)==0&&(rest[6]==0||rest[6]==' ')){
         g_driver.b=&g_backend;g_driver.r0=&g_runner;g_driver.r1=&g_head;
         const char* v=rest+6;while(*v==' ')++v;
-        // `driver desktop on|off|on1|off1|status|stats [reset]`: the compositor presents into
+        // `driver desktop on|off|on1|off1|status|stats [reset]|anim on|off`: the compositor presents into
         // head 0's flips (D2) and head 1's as a second output (D3). `off` takes both down.
         if(strncmp(v,"desktop",7)==0){v+=7;while(*v==' ')++v;
             if(strncmp(v,"on1",3)==0){const bool ok=Presenter1OnLocked();SpinLockRelease(lock);if(ok)Head1Publish();PresenterStatus();return true;}
@@ -518,6 +532,9 @@ bool NvDispHandle(const char* command){
                 if(g_presenter[1].active)Presenter1OffLocked();
                 g_presenter[0].active=false;SpinLockRelease(lock);Head1Unpublish();CompositorSetPrimaryPresenter(nullptr);
                 SpinLockAcquire(lock);g_driver.out0External=false;(void)g_driver.Down0();SpinLockRelease(lock);PresenterStatus();return true;}
+            // `anim on|off`: the compositor's pacing probe (a moving square on every output).
+            if(strncmp(v,"anim",4)==0){v+=4;while(*v==' ')++v;SpinLockRelease(lock);CompositorSetPacingProbe(strncmp(v,"on",2)==0);
+                DebugChannelSend(CompositorPacingProbe()?"{\"nv_display\":\"anim\",\"on\":1}\n":"{\"nv_display\":\"anim\",\"on\":0}\n");return true;}
             if(strncmp(v,"stats",5)==0){v+=5;while(*v==' ')++v;PresenterStats(strncmp(v,"reset",5)==0);SpinLockRelease(lock);return true;}
             PresenterStatus();SpinLockRelease(lock);return true;}
         if(!headLive&&!g_driver.Live(1)&&!ConfigureHead()){SpinLockRelease(lock);return true;}
