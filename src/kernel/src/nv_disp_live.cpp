@@ -9,6 +9,10 @@
 #include "nv_disp_runner.h"
 #include "nv_disp_head_runner.h"
 #include "nv_disp_driver.h"
+#include "nv_ce_present_api.h"
+#if defined(BROOK_NV_GSP)
+#include "nv_gsp_live.h"
+#endif
 #include "pci.h"
 #include "acpi.h"
 #include "boot_resource_map.h"
@@ -210,8 +214,17 @@ struct NvPresenterState{
     uint32_t* shadow=nullptr;bool shadowValid=false;
     DamageRects pending{};uint32_t deferred=0;   // changed (shadow updated) but not yet in VRAM
     uint64_t compared=0,copiedBytes=0,diffNs=0,copyNs=0;uint32_t unchanged=0,fullDiffs=0,copyMaxUs=0;
+    uint64_t vram[3]{};   // VRAM (== BAR1) offsets of px[]
+    // CE present path (head 0, `nv-gsp ce-present on`): frames the copy engine wrote, frames
+    // it gave back to the CPU, and the read-back check of sampled pixels.
+    uint64_t ceFrames=0,ceBytes=0,ceCpuFrames=0;uint32_t ceVerified=0,ceMismatch=0;
+    // A kicked copy (shadow -> px[ceBb]) not yet flipped; its rectangles for a CPU fallback.
+    bool ceInflight=false,shadowContig=false;int8_t ceBb=-1;uint32_t ceTicket=0,ceN=0;NvCeRect ceRects[100]{};
+    uint64_t ceWaitNs=0,ceKicks=0,ceFlipsFromPoll=0;
 };
 NvPresenterState g_presenter[nvdisp::kDriverOutputs]{};
+const NvCeOps* g_ceOps=nullptr;       // set/cleared under the nv-aux lock
+bool g_ceVerifyOff=false;             // a read-back mismatch turned the CE path off this boot
 // The compositor loop hook (completion, queued arms, wake time).
 uint64_t g_pollNs=0;uint32_t g_polls=0,g_pollMaxUs=0,g_pollBusy=0;
 // Loop timing (pacing diagnosis): the first head-0 present after each poll, against the
@@ -247,6 +260,42 @@ void NoteFrame(NvPresenterState& p){
 }
 void NoteCpu(NvPresenterState& p,uint64_t t0){
     const uint64_t d=PresentNowNs()-t0;p.cpuNs+=d;if(d/1000>p.cpuMaxUs)p.cpuMaxUs=uint32_t(d/1000);}
+// ---- CE present (head 0): finish the kicked copy. Waits up to budgetUs (0 = check),
+// spot-checks it through BAR1 against the shadow, CPU-copies its rectangles if the copy
+// failed, then flips. False = still running (only with a short budget).
+constexpr uint32_t kCeWaitUs=100000;
+bool CeFinishLocked(uint32_t budgetUs){
+    auto& p=g_presenter[0];
+    if(!p.ceInflight)return true;
+    auto& f=g_driver.f[0];
+    const uint64_t w0=PresentNowNs();
+    const int r=g_ceOps?g_ceOps->wait(p.ceTicket,budgetUs):-1;
+    p.ceWaitNs+=PresentNowNs()-w0;
+    if(r==0)return false;
+    uint32_t* dst=p.px[p.ceBb];const uint32_t pitch=p.pitchPx,width=p.width,height=p.height;
+    auto clip=[&](const NvCeRect& q,int32_t* x0,int32_t* y0,int32_t* x1,int32_t* y1){
+        *x0=q.x0<0?0:q.x0;*y0=q.y0<0?0:q.y0;*x1=q.x1>int32_t(width)?int32_t(width):q.x1;*y1=q.y1>int32_t(height)?int32_t(height):q.y1;
+        return *x1>*x0&&*y1>*y0;};
+    auto cpu=[&](const NvCeRect& q){int32_t x0,y0,x1,y1;if(!clip(q,&x0,&y0,&x1,&y1))return;
+        for(int32_t y=y0;y<y1;++y)__builtin_memcpy(dst+uint64_t(y)*pitch+x0,p.shadow+uint64_t(y)*width+x0,uint64_t(x1-x0)*4);};
+    if(r==1){
+        ++p.ceFrames;
+        if(p.ceFrames<=300||!(p.ceFrames&63)){
+            for(uint32_t i=0;i<p.ceN&&i<4;++i){int32_t x0,y0,x1,y1;if(!clip(p.ceRects[i],&x0,&y0,&x1,&y1))continue;
+                const int32_t xs[2]={x0,x1-1},ys[2]={y0,y1-1};
+                for(int a=0;a<2;++a)for(int b2=0;b2<2;++b2){++p.ceVerified;
+                    if(dst[uint64_t(ys[b2])*pitch+xs[a]]!=p.shadow[uint64_t(ys[b2])*width+xs[a]]){++p.ceMismatch;g_ceVerifyOff=true;}}}
+            if(g_ceVerifyOff){KPrintf("nv-display: CE present read-back mismatch; CPU copies from now on\n");
+                for(uint32_t i=0;i<p.ceN;++i)cpu(p.ceRects[i]);}
+        }
+    }else{g_ceOps=nullptr;++p.ceCpuFrames;KPrintf("nv-display: CE present copy failed; CPU copies from now on\n");
+        for(uint32_t i=0;i<p.ceN;++i)cpu(p.ceRects[i]);}
+    p.ceInflight=false;
+    __asm__ volatile("sfence":::"memory");
+    if(f.Present(p.ceBb)<0){g_driver.Tick();return true;}
+    ++p.frames;NoteFrame(p);
+    return true;
+}
 // Never blocks on a flip (mailbox, triple buffered): render into a free buffer (or
 // reclaim the queued one), arm it if nothing is in flight, else it waits as the queued
 // frame and the poll hook arms it right after the next LOADV. `src` is the output's
@@ -267,10 +316,26 @@ int FlipPendingLocked(uint32_t o,const uint32_t* src,uint32_t srcStride){
         for(int32_t y=y0;y<y1;++y)__builtin_memcpy(dst+uint64_t(y)*pitch+x0,src+uint64_t(y)*srcStride+x0,uint64_t(x1-x0)*4);
         bytes+=uint64_t(x1-x0)*4*uint32_t(y1-y0);
     };
-    (void)p.age.Apply(bb,p.pending,width,height,copy);
+    const bool ce=o==0&&g_ceOps&&!g_ceVerifyOff&&p.shadow&&p.shadowValid;
+    if(ce&&p.ceInflight){(void)CeFinishLocked(kCeWaitUs);return 1;}   // that frame flips now; pending waits for the next idle poll
+    bool kicked=false;
+    if(ce){
+        // Collect the rectangles and kick one copy from the shadow (== this frame); the flip
+        // happens when it lands, while the compositor composes the next frame. More than
+        // 100 rectangles, or a refused kick: the CPU copies them from the back buffer.
+        uint32_t n=0;bool over=false;
+        auto collect=[&](const DamageRect& r){if(n<100)p.ceRects[n++]=NvCeRect{r.x0,r.y0,r.x1,r.y1};else{over=true;copy(r);}};
+        (void)p.age.Apply(bb,p.pending,width,height,collect);
+        uint64_t ceBytes=0;uint32_t ticket=0;int r=0;
+        if(n&&!over){const NvCeJob job{p.shadow,width,width,height,p.vram[bb],pitch*4,p.ceRects,n};r=g_ceOps->kick(job,&ceBytes,&ticket);}
+        if(r==1){kicked=true;bytes+=ceBytes;p.ceBytes+=ceBytes;++p.ceKicks;p.ceInflight=true;p.ceBb=bb;p.ceTicket=ticket;p.ceN=n;}
+        else{if(r<0){g_ceOps=nullptr;KPrintf("nv-display: CE present kick failed; CPU copies from now on\n");}
+            if(n)++p.ceCpuFrames;for(uint32_t i=0;i<n;++i)copy(DamageRect{p.ceRects[i].x0,p.ceRects[i].y0,p.ceRects[i].x1,p.ceRects[i].y1});}
+    }else (void)p.age.Apply(bb,p.pending,width,height,copy);
     p.pending=DamageRects{};
     __asm__ volatile("sfence":::"memory");
     {const uint64_t c1=PresentNowNs();p.copyNs+=c1-c0;p.copiedBytes+=bytes;if((c1-c0)/1000>p.copyMaxUs)p.copyMaxUs=uint32_t((c1-c0)/1000);}
+    if(kicked)return 1;   // CeFinishLocked flips it
     if(f.Present(bb)<0){g_driver.Tick();return g_driver.Live(o)?0:-1;}
     ++p.frames;NoteFrame(p);
     return 1;
@@ -293,6 +358,7 @@ int PresentOutput(uint32_t o,const uint32_t* src,uint32_t srcStride,const Damage
     g_driver.Tick();
     if(!g_driver.Live(o)){SpinLockRelease(lock);return -1;}
     const uint32_t width=p.width,height=p.height;
+    if(o==0&&p.ceInflight)(void)CeFinishLocked(kCeWaitUs);   // the copy reads the shadow the diff is about to update
     DamageRects input=damageIn;
     if(p.needFull){input=DamageRects::Full(width,height);p.needFull=false;}
     // Only what really changed against the shadow goes over the link (D3).
@@ -419,17 +485,19 @@ uint32_t NvPrimaryPoll(){
     uint32_t ms=16;bool lost1=false;
     if(g_presenter[0].active&&g_driver.Live(0)){
         g_driver.Tick();
+        if(g_presenter[0].ceInflight&&CeFinishLocked(0))++g_presenter[0].ceFlipsFromPoll;
         // Changes held back while a flip was armed go out once it has landed. The back
         // buffer equals the shadow here (between frames), so it is the copy source.
         for(uint32_t o=0;o<2;++o){
             auto& p=g_presenter[o];
-            if(!p.active||!g_driver.Live(o)||(p.pending.empty()&&!p.pending.full)||g_driver.f[o].state!=nvdisp::FlipState::Idle)continue;
+            if(!p.active||!g_driver.Live(o)||(p.pending.empty()&&!p.pending.full)||g_driver.f[o].state!=nvdisp::FlipState::Idle||p.ceInflight)continue;
             uint32_t stride=0;const uint32_t* src=CompositorPresentSource(&stride);
             const uint32_t x=o?uint32_t(__atomic_load_n(&g_head1Rect,__ATOMIC_ACQUIRE)&0xffff):0;
             if(!src||(o&&!x)||stride<x+p.width)continue;
             (void)FlipPendingLocked(o,src+x,stride);
         }
         if(g_driver.Live(0))ms=WakeMsLocked();
+        if(g_presenter[0].ceInflight)ms=1;   // look again soon: the copy lands in a few ms
     }
     if(g_presenter[1].active&&!g_driver.Live(1)){g_presenter[1].active=false;g_driver.out1External=false;lost1=true;}
     SpinLockRelease(lock);
@@ -452,10 +520,17 @@ bool MapPresenter(NvPresenterState& p,nvdisp::NvWindowFlipper<LiveBackend>& f,co
     if(third.vram&&!p.px[2])p.px[2]=MapBar1Surface(third.vram,bytes);
     if(!p.px[0]||!p.px[1])return false;
     if(third.vram&&p.px[2])f.SetThird(third);
+    p.vram[0]=a.vram;p.vram[1]=f.surf[1].vram;p.vram[2]=third.vram;
     p.nbuf=f.nbuf;p.pitchPx=a.pitch/4;p.width=a.width;p.height=a.height;
     p.age.Reset();p.lastUs=0;p.needFull=false;
-    if(!p.shadow){const VirtualAddress va=VmmAllocPages((uint64_t(a.width)*a.height*4+4095)/4096,VMM_WRITABLE|VMM_NO_EXEC,MemTag::Device,KernelPid);
-        p.shadow=va?reinterpret_cast<uint32_t*>(va.raw()):nullptr;}
+    if(!p.shadow){
+        // Physically contiguous and 2 MiB aligned when the PMM has the run (the CE present
+        // path maps it with 2 MiB PTEs); scattered pages otherwise.
+        const uint64_t sb=uint64_t(a.width)*a.height*4,big=(sb+0x1fffff)&~0x1fffffull;
+        const PhysicalAddress ph=PmmAllocPages(big/4096+512,MemTag::Device,KernelPid);
+        if(ph){const uint64_t al=(ph.raw()+0x1fffff)&~0x1fffffull;p.shadow=reinterpret_cast<uint32_t*>(PhysToVirt(PhysicalAddress(al)).raw());p.shadowContig=true;}
+        else{const VirtualAddress va=VmmAllocPages((sb+4095)/4096,VMM_WRITABLE|VMM_NO_EXEC,MemTag::Device,KernelPid);
+            p.shadow=va?reinterpret_cast<uint32_t*>(va.raw()):nullptr;}}
     p.shadowValid=false;   // the first present copies (and records) the whole head
     p.pending=DamageRects{};
     return true;
@@ -531,7 +606,8 @@ StatsMark TakeMark(){
 void PresenterStats(bool reset){
     const StatsMark now=TakeMark();
     const bool zero=reset||!g_mark.us;
-    if(zero){g_mark=now;g_pollMaxUs=0;for(auto& p:g_presenter){p.cpuMaxUs=0;p.compared=p.copiedBytes=p.diffNs=p.copyNs=0;p.unchanged=p.fullDiffs=p.copyMaxUs=p.deferred=0;}
+    if(zero){g_mark=now;g_pollMaxUs=0;for(auto& p:g_presenter){p.cpuMaxUs=0;p.compared=p.copiedBytes=p.diffNs=p.copyNs=0;p.unchanged=p.fullDiffs=p.copyMaxUs=p.deferred=0;
+            p.ceFrames=p.ceBytes=p.ceCpuFrames=0;p.ceVerified=p.ceMismatch=0;p.ceWaitNs=p.ceKicks=p.ceFlipsFromPoll=0;}
         for(auto& v:g_wakeHist)v=0;for(auto& v:g_armLineHist)v=0;for(auto& v:g_busyHist)v=0;}
     const StatsMark& a=g_mark;
     const uint64_t us=now.us-a.us;
@@ -552,7 +628,16 @@ void PresenterStats(bool reset){
         c.raw("{\"nv_display\":\"stats_copy\",\"output\":");c.dec(o);c.raw(",\"compared_px\":");c.dec(p.compared);
         c.raw(",\"copied_bytes\":");c.dec(p.copiedBytes);c.raw(",\"diff_us\":");c.dec(p.diffNs/1000);c.raw(",\"copy_us\":");c.dec(p.copyNs/1000);
         c.raw(",\"copy_max_us\":");c.dec(p.copyMaxUs);c.raw(",\"unchanged\":");c.dec(p.unchanged);c.raw(",\"full_diffs\":");c.dec(p.fullDiffs);c.raw(",\"deferred\":");c.dec(p.deferred);
-        c.raw(",\"busy\":");c.dec(p.busy);c.raw(",\"no_buffer\":");c.dec(p.noBuffer);c.raw("}\n");DebugChannelSend(c.t);
+        c.raw(",\"busy\":");c.dec(p.busy);c.raw(",\"no_buffer\":");c.dec(p.noBuffer);
+        c.raw("}\n");DebugChannelSend(c.t);
+        if(o==0){   // CE present counters on their own line (the copy line's buffer is full)
+            nvdisp::NvDisplayDriver<LiveBackend>::Line ce;
+            ce.raw("{\"nv_display\":\"stats_ce\",\"output\":0");
+            ce.raw(",\"ce\":");ce.dec(g_ceOps&&o==0&&!g_ceVerifyOff?1:0);ce.raw(",\"ce_kicks\":");ce.dec(p.ceKicks);
+            ce.raw(",\"ce_wait_us\":");ce.dec(p.ceWaitNs/1000);ce.raw(",\"ce_poll_flips\":");ce.dec(p.ceFlipsFromPoll);ce.raw(",\"shadow_contig\":");ce.dec(p.shadowContig?1:0);ce.raw(",\"ce_frames\":");ce.dec(p.ceFrames);ce.raw(",\"ce_bytes\":");ce.dec(p.ceBytes);
+            ce.raw(",\"ce_cpu_frames\":");ce.dec(p.ceCpuFrames);ce.raw(",\"ce_verified\":");ce.dec(p.ceVerified);ce.raw(",\"ce_mismatch\":");ce.dec(p.ceMismatch);
+            ce.raw("}\n");DebugChannelSend(ce.t);
+        }
     }
     {   // compositor frame cost and escalations (zeroed with the window)
         const CompositorFrameStats cs=CompositorReadFrameStats(zero);
@@ -596,15 +681,20 @@ void DesktopStartThread(void*){
     // D3: the second monitor (conn2) joins unless /etc/nv-no-second-head exists. The head-1
     // preflight reads the sink's DPCD first and refuses without one; DP training takes
     // ~1-2 s, during which head 0 presents are deferred (try-lock busy).
-    if(FileExists("/etc/nv-no-second-head"))return;
-    SpinLockAcquire(lock);
-    const bool on1=Presenter1OnLocked();
-    SpinLockRelease(lock);
-    if(on1)Head1Publish();
-    else KPrintf("nv-display: head 1 bring-up failed or no sink; the desktop stays on head 0\n");
+    if(!FileExists("/etc/nv-no-second-head")){
+        SpinLockAcquire(lock);
+        const bool on1=Presenter1OnLocked();
+        SpinLockRelease(lock);
+        if(on1)Head1Publish();
+        else KPrintf("nv-display: head 1 bring-up failed or no sink; the desktop stays on head 0\n");
+    }
+#if defined(BROOK_NV_GSP)
+    NvGspAutostart();   // GSP-RM (p4 keep-display) + CE present, unless /etc/nv-gsp-no-autostart
+#endif
 }
 
 } // namespace
+void NvDispSetCePresent(const NvCeOps* ops){if(!ops&&g_presenter[0].ceInflight)(void)CeFinishLocked(kCeWaitUs);g_ceOps=ops;}
 
 bool NvDispHandle(const char* command){
     static const char prefix[]="bridge hardware nv-disp";

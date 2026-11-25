@@ -127,6 +127,17 @@ extern "C" void PlatformPowerResetWatchdogTick(uint64_t now){
     SerialPuts("power: quiesce watchdog expired; forcing reset\n");
     (void)plan.Issue(true,{nullptr,Write8,Write16,nullptr,Read16});
 }
+// A hook with a known long, bounded step (the GPU reset's GFW-boot waits) pushes an
+// armed deadline out to now + ms; never shortens it, never arms one.
+extern "C" void PlatformPowerExtendResetWatchdog(uint32_t ms){
+    for(;;){
+        uint64_t d=__atomic_load_n(&resetDeadline,__ATOMIC_ACQUIRE);
+        const uint64_t want=ApicTickCount()+ms;
+        if(!d||d>=want)return;
+        if(__atomic_compare_exchange_n(&resetDeadline,&d,want,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)){
+            SerialPrintf("power: reset watchdog extended by %u ms\n",ms);return;}
+    }
+}
 bool PlatformPowerIssue(bool restart){
     // Stop device DMA first: a reset that lands while xHCI/NIC bus masters
     // are running has been seen to hang the desktop firmware in POST.

@@ -1,5 +1,6 @@
 """Opt-in Brook physical-machine TCP sessions; no QEMU or host desktop APIs."""
 import contextlib
+import re
 import fcntl
 import ipaddress
 import json
@@ -210,6 +211,44 @@ class Hardware:
 
     def command(self,session,command,**_):
         with self.session_lock(session) as data:return self.guest(data,command)
+
+    # Synthetic input through the kernel's `inject` debug commands (a registered
+    # debug input device, as QEMU input reaches the same compositor queue). Each
+    # action is one boot-guarded command; stops at the first refusal.
+    INPUT_TYPES={'move','click','key','keydown','keyup','type','combo','sleep'}
+    def input(self,session,actions,**_):
+        if not isinstance(actions,list) or not 1<=len(actions)<=64:raise ValueError('actions: 1..64 entries')
+        cmds=[]
+        for a in actions:
+            if not isinstance(a,dict) or a.get('type') not in self.INPUT_TYPES:
+                raise ValueError('action type must be one of '+', '.join(sorted(self.INPUT_TYPES)))
+            t=a['type']
+            def num(k,lo,hi):
+                v=a.get(k)
+                if not isinstance(v,int) or isinstance(v,bool) or not lo<=v<=hi:raise ValueError(f'{t}.{k}: integer {lo}..{hi}')
+                return v
+            if t in('move','click'):cmds.append(f'inject {t} {num("x",0,16383)} {num("y",0,16383)}')
+            elif t in('key','keydown','keyup'):cmds.append(f'inject {t} {num("scancode",1,0x7f)}')
+            elif t=='sleep':cmds.append(f'inject sleep {num("ms",1,5000)}')
+            elif t=='type':
+                text=a.get('text')
+                if not isinstance(text,str) or not 1<=len(text)<=200 or any(not(32<=ord(c)<127) for c in text):
+                    raise ValueError('type.text: 1..200 printable ASCII characters')
+                cmds.append('inject type '+text)
+            else:
+                keys=a.get('keys')
+                if not isinstance(keys,str) or not re.fullmatch(r'(ctrl|alt|shift|super)(\+(ctrl|alt|shift|super))*\+[a-z0-9]',keys):
+                    raise ValueError('combo.keys: modifier(s)+key, e.g. ctrl+a')
+                cmds.append('inject combo '+keys)
+        results=[]
+        with self.session_lock(session) as data:
+            for c in cmds:
+                r=self.guest(data,c)
+                reply=r.get('reply','') if isinstance(r,dict) else str(r)
+                ok=isinstance(reply,str) and reply.startswith('inject:')
+                results.append({'command':c,'reply':reply,'ok':ok})
+                if not ok:break
+        return {'session':session,'completed':sum(1 for x in results if x['ok']),'requested':len(cmds),'results':results}
 
     def transfer(self,session,request_id,action,key_file,output,source=None,artifact_id=None,port=1236,keep_raw=False,
                  window=None,window_area='frame',cursor=False,**_):

@@ -19,6 +19,11 @@
 #include <string>
 #include <vector>
 #include "nv_gsp/nv_gsp_rm.h"
+#include "nv_gsp/nv_gsp_bar1.h"
+#include "nv_gsp/nv_gsp_m2.h"
+#include "nv_gsp/nv_gsp_m3.h"
+#include "nv_gsp/nv_gsp_ce_present.h"
+using brook::NvCeJob; using brook::NvCeRect;
 #include "../nv_gsp_fake/fake_gpu.h"
 #include "../nv_gsp_fake/fake_rm.h"
 #include "../nv_gsp_fake/synth_fw.h"
@@ -105,6 +110,106 @@ struct Rig {
                      uint32_t(rx.size()), prepare, arm, wait, sync);
     }
     P4Result Run() { return Run([] { return true; }); }
+    // ---- after INIT_DONE: BAR1 handover and M2 against the fake RM
+    struct PageAlloc { Rig* r; bool operator()(uint64_t* bus, uint8_t** cpu) {
+        DmaRegion d; if (!r->arena(0x1000, &d)) return false; *bus = d.bus; *cpu = d.cpu; return true; }
+        void flush(uint8_t*) {} };
+    // CPU read through BAR1: the walk the BAR1 host translation does from the bound PDB.
+    struct Bar1Cpu {
+        Rig* r;
+        struct Mem { fake_gpu::FakeGpu& g;
+            uint64_t rd64(Aperture a, uint64_t x) { if (a == Aperture::Video) return g.Vram64(x);
+                const uint8_t* d = g.Dma(x, 8); uint64_t v = 0; if (d) std::memcpy(&v, d, 8); return v; } };
+        bool operator()(uint64_t off, uint32_t* v) {
+            const uint32_t blk = r->gpu.reg[0xb80f40];
+            if (!(blk & 0x80000000u)) { *v = r->gpu.Vram32(off); return true; }
+            const uint64_t pdb = r->gpu.Vram64((uint64_t(blk & 0x0fffffff) << 12) + 0x200) & ~0xfffull;
+            Mem m{r->gpu};
+            const Translation t = GmmuWalk(m, kGmmuV2, pdb, Aperture::Video, off);
+            if (!t.ok || t.aper != Aperture::Video) return false;   // a fault: write dropped / read garbage
+            *v = r->gpu.Vram32(t.pa); return true;
+        }
+    };
+    Bar1Map Bar1(uint64_t pde) {
+        PageAlloc pa{this};
+        const uint64_t probes[3] = {0x0, 0x4343000, 0xff13000};   // P4's faulting offsets (GOP surface, a surface, instmem)
+        return MapBar1Identity(gpu, kChipTu104, pa, pde, 256ull << 20, probes, 3, Bar1Cpu{this});
+    }
+    M2Result M2(uint32_t chid = kM2Chid, bool parent_device = false) {
+        struct W { Rig* r; bool operator()() { return r->Wait(); } } wait{this};
+        GspDoorbell<fake_gpu::FakeGpu, NoSync> bell{gpu, kChipTu104, sync};
+        Pramin<fake_gpu::FakeGpu> vram(gpu, kChipTu104);
+        M2Inputs in;
+        in.si = last.si;
+        in.vram_lo = 0x100000000ull; in.vram_hi = 0x100100000ull;
+        in.chid = chid; in.parent_device = parent_device;
+        auto sys = [&](M2Sys* s) { DmaRegion d; assert(arena(0x1000, &d)); s->cpu = d.cpu; s->bus = d.bus; s->bytes = d.bytes; };
+        sys(&in.gpfifo); sys(&in.push); sys(&in.sem);
+        auto mthd = [&](uint32_t bytes, M2Sys* s) { DmaRegion d; if (!arena(bytes, &d)) return false;
+            s->cpu = d.cpu; s->bus = d.bus; s->bytes = d.bytes; return true; };
+        auto fence = [&] { return Wait(); };
+        M2Result m = RunM2(gpu, kChipTu104, vram, in, ch.get(), rx.data(), uint32_t(rx.size()), wait, bell, mthd, fence, sync);
+        vram.Restore();
+        return m;
+    }
+    // M3: P5 + the copy-engine sequence on the same channel (small surface: the arena is 8 MiB).
+    M2Result M3(M3Plan& pl, M3Result& res) {
+        struct W { Rig* r; bool operator()() { return r->Wait(); } } wait{this};
+        GspDoorbell<fake_gpu::FakeGpu, NoSync> bell{gpu, kChipTu104, sync};
+        Pramin<fake_gpu::FakeGpu> vram(gpu, kChipTu104);
+        M2Inputs in;
+        in.si = last.si;
+        in.vram_lo = 0x100000000ull; in.vram_hi = 0x100100000ull;
+        auto sys = [&](M2Sys* s) { DmaRegion d; assert(arena(0x1000, &d)); s->cpu = d.cpu; s->bus = d.bus; s->bytes = d.bytes; };
+        sys(&in.gpfifo); sys(&in.push); sys(&in.sem);
+        auto mthd = [&](uint32_t bytes, M2Sys* s) { DmaRegion d; if (!arena(bytes, &d)) return false;
+            s->cpu = d.cpu; s->bus = d.bus; s->bytes = d.bytes; return true; };
+        auto fence = [&] { return Wait(); };
+        auto flush = [](uint8_t*, uint64_t) {};
+        M3Extra<decltype(flush)> ex{pl, res, flush};
+        budget = polls + 100000000;
+        M2Result m = RunM2(gpu, kChipTu104, vram, in, ch.get(), rx.data(), uint32_t(rx.size()), wait, bell, mthd, fence, sync, ex);
+        vram.Restore();
+        return m;
+    }
+    // CE presenter: a kept channel with the copy object bound (`nv-gsp ce-present on`).
+    M2Result CeOn(CePresent& cp) {
+        struct W { Rig* r; bool operator()() { return r->Wait(); } } wait{this};
+        GspDoorbell<fake_gpu::FakeGpu, NoSync> bell{gpu, kChipTu104, sync};
+        Pramin<fake_gpu::FakeGpu> vram(gpu, kChipTu104);
+        cp.in = M2Inputs{};
+        cp.in.keep = &cp.k;
+        cp.in.si = last.si;
+        cp.in.vram_lo = 0x108000000ull; cp.in.vram_hi = 0x108800000ull;
+        auto sys = [&](M2Sys* s) { DmaRegion d; assert(arena(0x1000, &d)); s->cpu = d.cpu; s->bus = d.bus; s->bytes = d.bytes; };
+        sys(&cp.in.gpfifo); sys(&cp.in.push); sys(&cp.in.sem);
+        auto mthd = [&](uint32_t bytes, M2Sys* s) { DmaRegion d; if (!arena(bytes, &d)) return false;
+            s->cpu = d.cpu; s->bus = d.bus; s->bytes = d.bytes; return true; };
+        auto fence = [&] { return Wait(); };
+        M2Result m = RunM2(gpu, kChipTu104, vram, cp.in, ch.get(), rx.data(), uint32_t(rx.size()), wait, bell, mthd, fence, sync, CeExtra{});
+        vram.Restore();
+        cp.active = m.ok() && cp.k.kept;
+        return m;
+    }
+    int CePresentOnce(CePresent& cp, const NvCeJob& job, const DmaRegion& bb, uint64_t* bytes) {
+        Pramin<fake_gpu::FakeGpu> vram(gpu, kChipTu104);
+        auto v2p = [&](uintptr_t a) -> uint64_t {
+            const uintptr_t b = reinterpret_cast<uintptr_t>(bb.cpu);
+            return a >= b && a < b + bb.bytes ? bb.bus + (a - b) : 0; };
+        auto poll = [&] { (void)Wait(); };
+        const int r = CePresentRun(gpu, kChipTu104, vram, cp, job, v2p, sync, poll, bytes);
+        vram.Restore();
+        return r;
+    }
+    uint32_t CeFree(CePresent& cp) {
+        struct W { Rig* r; bool operator()() { return r->Wait(); } } wait{this};
+        GspDoorbell<fake_gpu::FakeGpu, NoSync> bell{gpu, kChipTu104, sync};
+        static uint8_t scratch[kRmApiBuf];
+        RmApi<W, GspDoorbell<fake_gpu::FakeGpu, NoSync>> api(ch.get(), rx.data(), uint32_t(rx.size()), wait, bell, scratch);
+        cp.active = false;
+        return M2FreeKept(cp.k, api);
+    }
+    P4Result last;
     RmFiniResult Unload() {
         struct W { Rig* r; bool operator()() { return r->Wait(); } } wait{this};
         return RunRmUnload(gpu, kChipTu104, ch.get(), rx.data(), uint32_t(rx.size()), wait, sync);
@@ -167,7 +272,7 @@ int main(int argc, char** argv) {
     // ---- full boot, both layouts
     for (uint32_t vga : {0x1u, 0x20e09u}) {
         Rig r(I, vga);
-        const P4Result p = r.Run();
+        const P4Result& p = (r.last = r.Run());
         if (p.status != BootStatus::Ok)
             std::fprintf(stderr, "p4 vga=%x: %s at %s (q=%d fake=%s model=%s seq=%s)\n", vga, BootStatusName(p.status), p.stage,
                          int(p.q), r.rm.error.c_str(), r.gpu.model_error.c_str(), SeqStatusName(p.seq.status));
@@ -180,6 +285,48 @@ int main(int argc, char** argv) {
         assert(Wpr2HiToEnd(p.booter.wpr2_hi) == p.p3.layout.frts.end());
         if (I.real) CheckPayloads(r.rm);
         if (record && vga == record_vga) assert(r.gpu.WriteRawLog(record));
+        // ---- static info parse (fake reply mirrors the r570 layout)
+        assert(p.si.ok && p.si.bar1_pde == fake_gpu::FakeRm::kBar1Pde && p.si.bar2_pde == fake_gpu::FakeRm::kBar2Pde);
+        assert(p.si.uuid_ok && p.si.uuid[0] == 0xa0 && p.si.fb_regions == 3 && p.si.usable_hi == 0x1f7700000ull);
+        assert(p.si.h_internal_subdevice == fake_gpu::FakeRm::kIntSubdevice && !std::strcmp(p.si.short_name, "TU104"));
+        // ---- BAR1 handover: CPU writes fault after RM's switch, the identity map restores them
+        r.rm.SetupBar1();
+        r.gpu.SetVram32(0x0, 0x11223344); r.gpu.SetVram32(0x4343000, 0x55667788); r.gpu.SetVram32(0xff13000, 0x99aabbcc);
+        { uint32_t v; assert(!Rig::Bar1Cpu{&r}(0x4343000, &v)); }
+        const size_t inv0 = r.gpu.invalidates;
+        const Bar1Map bm = r.Bar1(p.si.bar1_pde);
+        if (!bm.ok()) std::fprintf(stderr, "bar1: %s at %s\n", bm.status, bm.stage);
+        assert(bm.ok() && bm.committed && bm.invalidated && r.gpu.invalidates == inv0 + 1 && !bm.rm_tree);
+        assert(bm.probes == 3 && bm.probes_equal == 3 && bm.page_shift == 16 && bm.ptes == 4096);
+        assert(r.gpu.reg[0x1700] == 0x1fff0);                      // PRAMIN window restored
+        for (uint64_t off = 0; off < (256ull << 20); off += 0x7654321) {
+            uint32_t v; r.gpu.SetVram32(off & ~3ull, uint32_t(off)); assert(Rig::Bar1Cpu{&r}(off & ~3ull, &v) && v == uint32_t(off));
+        }
+        { Bar1Map again = r.Bar1(p.si.bar1_pde); assert(again.ok() && again.rm_tree && again.rm_tree_sys); }   // previous tree: sysmem
+        assert(UnmapBar1Identity(r.gpu, kChipTu104, bm));
+        {   // an RM-built VRAM tree with three 4 KiB pages at BAR1 0x80000 is found, counted and replaced
+            struct VMem { fake_gpu::FakeGpu& g; uint64_t next = 0x1f7600000ull;
+                bool alloc(uint64_t* a, Aperture* ap) { *a = next; next += 0x1000; *ap = Aperture::Video;
+                    for (uint32_t i = 0; i < 0x1000; i += 4) g.SetVram32(*a + i, 0); return true; }
+                uint64_t rd64(Aperture, uint64_t x) { return g.Vram64(x); }
+                void wr64(Aperture, uint64_t x, uint64_t v) { g.SetVram32(x, uint32_t(v)); g.SetVram32(x + 4, uint32_t(v >> 32)); } } vm{r.gpu};
+            GmmuBuilder<VMem> rmb{vm, kGmmuV2};
+            rmb.Adopt(p.si.bar1_pde, Aperture::Video);
+            assert(rmb.Map(0x80000, 0x1f7000000ull, 0x3000, 12, Aperture::Video));
+            const Bar1Map rb = r.Bar1(p.si.bar1_pde);
+            assert(rb.ok() && rb.rm_tree && !rb.rm_tree_sys && rb.rm_valid == 3 && rb.rm_first_va[0] == 0x80000 && rb.probes_equal == 3);
+            assert(UnmapBar1Identity(r.gpu, kChipTu104, rb));
+            assert(r.gpu.Vram64(p.si.bar1_pde) == rb.pd3_old[0]);
+            r.gpu.SetVram32(p.si.bar1_pde, 0); r.gpu.SetVram32(p.si.bar1_pde + 4, 0);
+        }
+        { uint32_t v; assert(!Rig::Bar1Cpu{&r}(0x4343000, &v)); }
+        { Bar1Map bad = r.Bar1(p.si.bar1_pde + 0x1000); assert(!bad.ok() && !bad.committed && !std::strcmp(bad.stage, "inst_pdb")); }
+        // ---- M2: objects, VRAM, GMMU, VAS, TSG, channel, NOP + semaphore
+        const M2Result m = r.M2();
+        if (!m.ok()) std::fprintf(stderr, "m2: %s at %s (rm 0x%x q %d fake=%s)\n", m.status, m.stage, m.rm_status, int(m.q), r.rm.error.c_str());
+        assert(m.ok() && m.fence_ok && m.sem_value == kM2Payload && r.rm.sem_releases == 1 && r.rm.nops == 1);
+        assert(m.ce_engine == rm570::RM_ENGINE_TYPE_COPY0 + 2 && m.runlist == 2 && m.token == 0x20002 && m.token_ctrl_ok);
+        assert(m.gp_get == 1 && m.allocated == 6 && m.freed == 6 && r.rm.objs.empty() && m.mthdbuf_size == 0x1000 && !m.schedule_on_tsg);
         // ---- RM-aware fini: unload RPC, then FWSEC-SB + booter_unload clear WPR2
         const RmFiniResult u = r.Unload();
         assert(u.status == BootStatus::Ok && u.halted && u.mbox0_after == 0x80000000 && r.rm.unload_requests == 1);
@@ -216,6 +363,137 @@ int main(int argc, char** argv) {
         Rig r(I, 0x1); r.rm.static_result = 0x56;                  // RPC error on the first RPC
         const P4Result p = r.Run();
         assert(p.init_done && p.q == QStatus::RpcError && std::strcmp(p.stage, "static_info") == 0);
+    }
+    // ---- M2 variants
+    {
+        Rig r(I, 0x1); r.last = r.Run(); assert(r.last.init_done);
+        r.rm.token_ctrl_supported = false; r.rm.channel_schedule_supported = false;
+        const M2Result m = r.M2();
+        assert(m.ok() && !m.token_ctrl_ok && m.token == 0x20002 && m.schedule_on_tsg && r.rm.objs.empty());
+    }
+    {   // chid 0 is RM's: NV_ERR_NO_MEMORY at the channel, as on hardware; nothing left behind
+        Rig r(I, 0x1); r.last = r.Run(); assert(r.last.init_done);
+        const M2Result m = r.M2(0);
+        assert(!m.ok() && !std::strcmp(m.stage, "channel") && m.rm_status == 0x51 && r.rm.objs.empty());
+        const M2Result again = r.M2(3, true);       // retry in the same boot, nouveau-style parent
+        assert(again.ok() && again.allocated == 5 && again.token == 0x20003 && r.rm.sem_releases == 1 && r.rm.objs.empty());
+    }
+    {
+        Rig r(I, 0x1); r.last = r.Run(); assert(r.last.init_done);
+        r.rm.fail_class = rm570::TURING_CHANNEL_GPFIFO_A;
+        const M2Result m = r.M2();
+        assert(!m.ok() && !std::strcmp(m.stage, "channel") && m.rm_status == 0x1f && r.rm.objs.empty() && r.rm.sem_releases == 0);
+        assert(r.gpu.doorbells.empty());
+    }
+    {
+        Rig r(I, 0x1); r.last = r.Run(); assert(r.last.init_done);
+        r.last.si.fb[0].reserved = 1;                              // M2 VRAM not client-owned: refused before any RPC
+        const uint32_t before = r.rm.rpcs;
+        const M2Result m = r.M2();
+        assert(!m.ok() && !std::strcmp(m.stage, "check") && r.rm.rpcs == before);
+    }
+    // ---- M3: copy object, mappings, full/rect/present copies through the fake CE, verified
+    {
+        Rig r(I, 0x1); r.last = r.Run(); assert(r.last.init_done);
+        M3Plan pl; pl.width = 320; pl.height = 180; pl.sx = 10; pl.sy = 7; pl.dx = 200; pl.dy = 100; pl.rw = 100; pl.rh = 60;
+        pl.pw = 320; pl.ph = 50; pl.repeats = 2;
+        const uint64_t surf = uint64_t(pl.width) * 4 * pl.height;
+        DmaRegion a, b; assert(r.arena(uint32_t(surf), &a) && r.arena(uint32_t(surf), &b));
+        pl.s = {a.cpu, a.bus, a.bytes}; pl.r = {b.cpu, b.bus, b.bytes};
+        pl.v1 = 0x101000000ull; pl.v2 = 0x102000000ull;
+        M3Result res;
+        const M2Result m = r.M3(pl, res);
+        if (!m.ok()) std::printf("M3: %s at %s / %s at %s host=%s\n", m.status, m.stage, res.status, res.step, r.rm.host_error.c_str());
+        assert(m.ok() && res.ok() && res.object && res.verify_full && res.verify_rect);
+        assert(m.allocated == 7 && m.freed == 7 && r.rm.objs.empty());
+        // 4 timed kinds x 2 repeats + 1 V2->R read-back
+        assert(r.rm.ce_launches == 4 * 2 + 1 + 2);
+        assert(res.s2v.n == 2 && res.s2v.bytes == surf && res.present.bytes == uint64_t(320) * 4 * 50);
+        assert(r.rm.sem_releases == 1 + r.rm.ce_launches);
+        // V1 holds the pattern, V2's rectangle came from V1(10,7)
+        assert(r.gpu.Vram32(0x101000000ull) == M3Pattern(0));
+        assert(r.gpu.Vram32(0x102000000ull + 100ull * 1280 + 200 * 4) == M3Pattern(7ull * 320 + 10));
+    }
+    {   // the copy object is refused: P5 objects still freed, nothing launched
+        Rig r(I, 0x1); r.last = r.Run(); assert(r.last.init_done);
+        r.rm.fail_class = 0xc5b5;
+        M3Plan pl; pl.width = 64; pl.height = 32; pl.sx = pl.sy = pl.dx = pl.dy = 0; pl.rw = 8; pl.rh = 8; pl.pw = 64; pl.ph = 8;
+        DmaRegion a, b; assert(r.arena(64 * 4 * 32, &a) && r.arena(64 * 4 * 32, &b));
+        pl.s = {a.cpu, a.bus, a.bytes}; pl.r = {b.cpu, b.bus, b.bytes}; pl.v1 = 0x101000000ull; pl.v2 = 0x102000000ull;
+        M3Result res;
+        const M2Result m = r.M3(pl, res);
+        assert(!m.ok() && !res.object && r.rm.ce_launches == 0 && r.rm.objs.empty() && m.fence_ok);
+    }
+    // ---- CE present: kept channel, back-buffer mapping + remap, rect copies into VRAM, timeout, teardown
+    {
+        Rig r(I, 0x1); r.last = r.Run(); assert(r.last.init_done);
+        CePresent cp;
+        const M2Result m = r.CeOn(cp);
+        if (!m.ok()) std::printf("CE on: %s at %s host=%s\n", m.status, m.stage, r.rm.host_error.c_str());
+        assert(m.ok() && !std::strcmp(m.stage, "kept") && cp.k.kept && cp.k.nlive == 7 && r.rm.objs.size() == 7);
+        assert(r.rm.ce_class == 0xc5b5 && r.rm.ce_launches == 0);
+        const uint32_t W = 256, H = 64, stride = 320;
+        DmaRegion bb; assert(r.arena(stride * H * 4, &bb));
+        uint32_t* px = reinterpret_cast<uint32_t*>(bb.cpu);
+        for (uint32_t i = 0; i < stride * H; ++i) px[i] = 0x10000000u + i;
+        const NvCeRect rects[2] = {{10, 5, 74, 21}, {200, 40, 300, 80}};   // the second is clipped to 256x64
+        NvCeJob job{px, stride, W, H, 0x400000, 1280, rects, 2};
+        uint64_t bytes = 0;
+        assert(r.CePresentOnce(cp, job, bb, &bytes) == 1);
+        assert(bytes == 64ull * 4 * 16 + 56ull * 4 * 24 && cp.st.remaps == 1 && cp.st.frames == 1 && r.rm.ce_launches == 2);
+        assert(r.gpu.Vram32(0x400000 + 5 * 1280 + 10 * 4) == 0x10000000u + 5 * stride + 10);
+        assert(r.gpu.Vram32(0x400000 + 63 * 1280 + 255 * 4) == 0x10000000u + 63 * stride + 255);
+        assert(r.gpu.Vram32(0x400000 + 4 * 1280 + 10 * 4) == 0);                         // outside the damage
+        assert(r.CePresentOnce(cp, job, bb, &bytes) == 1 && cp.st.remaps == 1);        // same buffer: no remap
+        // the compositor reallocates its back buffer: remapped at a fresh VA slot
+        DmaRegion bb2; assert(r.arena(stride * H * 4, &bb2));
+        uint32_t* px2 = reinterpret_cast<uint32_t*>(bb2.cpu);
+        for (uint32_t i = 0; i < stride * H; ++i) px2[i] = 0x20000000u + i;
+        NvCeJob job2{px2, stride, W, H, 0x600000, 1280, rects, 1};
+        assert(r.CePresentOnce(cp, job2, bb2, &bytes) == 1 && cp.st.remaps == 2 && cp.slot == 2);
+        assert(r.gpu.Vram32(0x600000 + 20 * 1280 + 73 * 4) == 0x20000000u + 20 * stride + 73);
+        // a destination past the VRAM window is refused (CPU copies)
+        NvCeJob bad{px2, stride, W, H, kCeVramBytes - 1280, 1280, rects, 1};
+        assert(r.CePresentOnce(cp, bad, bb2, &bytes) == 0 && cp.st.refused == 1);
+        // the engine stops answering: timeout -> -1, then the path stays off
+        r.rm.host_stall = true;
+        assert(r.CePresentOnce(cp, job2, bb2, &bytes) == -1 && cp.broken && cp.st.timeouts == 1);
+        assert(r.CePresentOnce(cp, job2, bb2, &bytes) == 0);
+        r.rm.host_stall = false;
+        assert(r.CeFree(cp) == 7 && r.rm.objs.empty() && !cp.k.kept);
+    }
+    // ---- CE present: async kick/wait and the 2 MiB fast path for a contiguous, aligned source
+    {
+        Rig r(I, 0x1); r.last = r.Run(); assert(r.last.init_done);
+        CePresent cp;
+        assert(r.CeOn(cp).ok());
+        // a 2 MiB-aligned, contiguous "shadow": the arena is contiguous; align inside it
+        const uint32_t W = 512, H = 1024;                     // exactly 2 MiB
+        DmaRegion big; assert(r.arena(4u << 20, &big));
+        const uint64_t pad = (0x200000 - (big.bus & 0x1fffff)) & 0x1fffff;
+        DmaRegion sh{big.cpu + pad, big.bus + pad, 2u << 20};
+        // align the CPU pointer too: the fake's v2p is cpu->bus linear, so pick a cpu base with the same low bits
+        uint32_t* px = reinterpret_cast<uint32_t*>(sh.cpu);
+        for (uint32_t i = 0; i < W * H; ++i) px[i] = 0x30000000u + i;
+        const NvCeRect rect[1] = {{0, 0, int32_t(W), int32_t(H)}};
+        NvCeJob job{px, W, W, H, 0x800000, W * 4, rect, 1};
+        Pramin<fake_gpu::FakeGpu> vram(r.gpu, kChipTu104);
+        // v2p reports a 2 MiB-aligned physical base for the 2 MiB-aligned kernel VA we pretend the shadow has
+        const uintptr_t kva = 0x40000000u;   // fake kernel VA, 2 MiB aligned
+        NvCeJob jv = job; jv.src = reinterpret_cast<const uint32_t*>(kva);
+        auto v2p = [&](uintptr_t a) -> uint64_t { return a >= kva && a < kva + (2u << 20) ? sh.bus + (a - kva) : 0; };
+        uint64_t bytes = 0; uint32_t ticket = 0;
+        assert(CePresentKick(r.gpu, kChipTu104, vram, cp, jv, v2p, r.sync, &bytes, &ticket) == 1 && ticket && cp.big);
+        assert(cp.inflight == ticket && bytes == uint64_t(W) * H * 4);
+        auto poll = [&] { (void)r.Wait(); };
+        assert(CePresentWait(r.gpu, cp, ticket, 0, poll) == 0);            // not yet: nothing has run the host model
+        uint32_t t2 = 0;                                                    // a second kick while one is in flight is refused
+        assert(CePresentKick(r.gpu, kChipTu104, vram, cp, jv, v2p, r.sync, &bytes, &t2) == 0);
+        assert(CePresentWait(r.gpu, cp, ticket, 50000, poll) == 1 && !cp.inflight);
+        vram.Restore();
+        assert(r.gpu.Vram32(0x800000) == 0x30000000u && r.gpu.Vram32(0x800000 + (2u << 20) - 4) == 0x30000000u + W * H - 1);
+        assert(cp.st.map_pages == 1);                                       // one 2 MiB PTE
+        assert(r.CeFree(cp) == 7 && r.rm.objs.empty());
     }
     std::printf("test_nv_gsp_p4: OK (%s inputs%s)\n", I.real ? "real" : "synthetic", I.seq.empty() ? "" : ", real sequencer");
     return 0;

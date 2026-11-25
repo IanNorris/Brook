@@ -184,3 +184,123 @@ mismatch.
   chains, plays the Linux message order, and answers the static-info and
   unload RPCs. With the real blobs and `BROOK_NV_GSP_SEQ` its `--record` log
   matches the reference 164/164 from fwsec_frts through cpu_sequencer.
+
+## M1 follow-up and M2 start (work/gsp-m1-p5)
+
+- **Logs.** `scripts/nv_gsp_logdecode.py` decodes LOGINIT/LOGINTR/LOGRM
+  captures. Records are `[args][metadata VA][timestamp]`; the format strings
+  live in NVIDIA's `gsp_log_tu10x.bin` (`.fwlogging_init`/`_rm`), which is not
+  in linux-firmware or the 570.144 .run, so without it the tool prints the
+  metadata pointer and arguments, resolving string arguments from the image.
+- **Static info.** `nv_gsp/nv_gsp_static.h` parses GspStaticConfigInfo
+  (0x678 B, offsets from compiling nouveau's r570 headers): FB regions
+  (client-usable = not reserved, not protected, as nouveau), bar1PdeBase /
+  bar2PdeBase, UUID (gidInfo, binary), name, RM's internal client/device/
+  subdevice handles. P4 keeps the whole reply; `nv-gsp static [off]`.
+- **BAR1 handover (interim, before M8).** At INIT_DONE RM binds BAR1 to a
+  virtual VA space whose root PD3 (bar1PdeBase) is empty; CPU writes through
+  BAR1 then fault (LOGRM: `BAR1 HUBCLIENT_HOST_CPU_NB FAULT_PDE` at the
+  nv-disp surface/instmem offsets), which is why flips time out while scanout
+  continues. A GSP client owns all BAR1 page tables (open-gpu
+  kbusPatchBar1Pdb_GSPCLIENT; nouveau r535_bar_bar1_init); there is no RM
+  object or control that maps BAR1. `nv_gsp/nv_gsp_bar1.h` checks the
+  instance block's PDB against bar1PdeBase, records RM's PD3, builds a
+  private sysmem tree identity-mapping BAR1 [0, 256 MiB) to VRAM with 64 KiB
+  pages, writes PD3[0] through PRAMIN, flushes and invalidates
+  (0xb830a0/a4/b0 = 0x80000007), and probes BAR1 against PRAMIN. nv-disp keeps
+  its BAR1 = VRAM view unchanged. `nv-gsp p4 keep-display` holds the nv-aux
+  lock from before the boot until the map is in place; `nv-gsp bar1
+  map [2m]|unmap|status` does it by hand.
+- **Display ownership.** RM leaves the running display alone at INIT_DONE
+  (scanout continued in P4): display instmem (0x610010/14) is only programmed
+  when a client sends NV2080_CTRL_CMD_INTERNAL_DISPLAY_WRITE_INST_MEM, and
+  Brook's core/window channels are unknown to RM. Allocating the display
+  class / RM display channels (M8) is where RM takes over, so M8 must tear
+  down Brook's channels first and recreate them through RM.
+- **Pre-reset hook.** Once RM reached INIT_DONE, a quiesce hook runs the RM
+  fini (UNLOADING_GUEST_DRIVER, FWSEC-SB, booter_unload) from cached inputs
+  before nv-disp's quiesce and the FLR; RM unload puts BAR1 back in physical
+  mode, so nv-disp's teardown is unchanged.
+- **M2.** `nv_gsp/nv_gsp_rmapi.h` (RM_ALLOC / RM_CONTROL / FREE RPCs, event
+  counts) and `nv_gsp/nv_gsp_m2.h` (`nv-gsp p5`): client, device,
+  subdevice; device-info table and CE fault-method-buffer size from RM's
+  internal subdevice (async copy engine + runlist); VRAM instance block, USERD
+  and GMMU v2 tables from a Brook VRAM range (4 GiB, client region) written
+  through PRAMIN; FERMI_VASPACE_A (externally owned) + SET_PAGE_DIRECTORY;
+  KEPLER_CHANNEL_GROUP_A; TURING_CHANNEL_GPFIFO_A under the TSG; BIND,
+  GPFIFO_SCHEDULE; NOP + SEM release; doorbell 0xbb0090 = runlist<<16|chid
+  (or RM's work-submit token); fence poll; teardown. `nv_gsp/nv_gmmu.h` is the
+  chip-neutral GMMU builder/walker (ChipOps.gmmu = GMMU v2).
+- **Tests.** `test_nv_gsp_gmmu` (encodings vs nouveau's formulas, 4K/64K/2M
+  maps, conflicts, random walks, 256 MiB identity, static-info parse);
+  `test_nv_gsp_p4` now also runs the BAR1 handover (fault before, identity
+  after, PRAMIN restored, RM tree detection, unmap, PDB-mismatch refusal) and
+  M2 against the fake RM (object rules, device-info, host model executing the
+  NOP and semaphore through the VAS page tables) plus its failure variants.
+
+## Pre-reset GPU reset and M3 (work/gsp-m1-p5, 26 Nov)
+
+- **Post-P5 POST hang.** The platform warm reset does not reset this GPU
+  (the nv-disp history: POST hung after display writes until Brook added a
+  pre-reset FLR). After P5's copy-engine channel and a clean fini, the bare
+  FLR (bus master still on, engines as RM left them, 100 ms, then the ACPI
+  reset, no check) was followed by a POST hang. After RM unload PMC_ENABLE
+  still shows PGRAPH and bit 25 on (0x42001101, against 0x40000101 at boot).
+- **Fix: `nv_gpu_reset.h`**, RM's TU102 full-chip reset order
+  (kbifDoSecondaryBusResetOrFunctionLevelReset_TU102): PMC_ENABLE engine
+  reset when GSP-RM ran this boot, bus master off and TransactionsPending
+  drained, FLR, header restore, vendor-ID check, wait for GFW boot
+  (0x118128 bit 0 and 0x118234[7:0] == 0xff; the healthy card reads
+  0xffffff8f / 0x3ff), and a Secondary Bus Reset on the root port
+  (00:01.1) if the FLR did not take. Linux for comparison: nvidia.ko only
+  clears bus master at shutdown; nouveau (7.x) runs a full suspend and puts
+  fn0 in D3hot. The GSP-RM fini hook still runs first when fini has not.
+  `bridge hardware gpu-reset status` is the read-only view. Host test
+  `test_nv_gpu_reset`.
+- **M3: `nv-gsp p5 m3`** (`nv_gsp/nv_gsp_m3.h`, RunM2's extra hook):
+  TURING_DMA_COPY_A under the P5 channel, SET_OBJECT on subchannel 4,
+  pitch-linear virtual copies with a host semaphore release after WFI.
+  Buffers: two 2 MiB-aligned sysmem surfaces and two VRAM surfaces at
+  4 GiB + 16/64 MiB, all mapped before SET_PAGE_DIRECTORY.
+- **Hardware (gsp5, 3840x2160x4 = 33.2 MB):**
+  - Measured rates:
+
+    | Copy | Bytes | Time | Rate |
+    |---|---|---|---|
+    | sysmem->VRAM | 33.2 MB | 5.15 ms | 6.44 GB/s |
+    | VRAM->sysmem | 33.2 MB | 4.91 ms | 6.76 GB/s |
+    | VRAM->VRAM | 33.2 MB | 0.78 ms | 42.8 GB/s |
+    | 1600x900 VRAM rectangle | 5.8 MB | 140 us | 41 GB/s |
+    | 3840x1400 sysmem->VRAM rectangle (the video damage) | 21.5 MB | 3.34 ms | 6.44 GB/s |
+
+  - Both read-backs verified, and there were no RC or MMU events. The CPU
+    present copy through BAR1 manages about 1.4 GB/s (13-21 ms a frame).
+  - The idle link reads 2.5 GT/s x8. The CE rate shows the link trains up
+    under DMA load.
+
+## CE present path and boot-time GSP-RM (26 Nov)
+
+- **`nv-gsp ce-present on|off|status`** (`nv_gsp/nv_gsp_ce_present.h`, seam
+  `nv_ce_present_api.h`).
+  - It keeps a TURING_DMA_COPY_A channel alive (RunM2 with `M2Inputs.keep`).
+  - Before the VA space is bound, it maps nv-disp's VRAM [0, 256 MiB) with 2 MiB PTEs.
+  - The source is nv-disp's head-0 shadow, allocated contiguous and 2 MiB aligned. The
+    mapper uses 2 MiB PTEs for such a source and 4 KiB PTEs otherwise, with a remap and
+    MMU invalidate when the source moves.
+  - FlipPendingLocked kicks one pitch copy per damage rectangle plus a host semaphore
+    after WFI. The flip lands in the poll hook, or before the next shadow update.
+  - A failure or a BAR1 spot-check mismatch turns the path off, and the CPU copies those
+    rectangles.
+  - Every RM fini clears the hook under the nv-aux lock first.
+- **Autostart.** With `/etc/nv-gsp` and no `/etc/nv-gsp-no-autostart` (builder
+  `--nv-gsp-no-autostart`), nv-disp's desktop-start thread runs `p4 keep-display`
+  and `ce-present on` 3 s after the heads are up. P4 takes about 1.7 s wall; the desktop
+  freezes for about 1.3 s once.
+- **Measured** (fullscreen Chromium canvas, about 31.6 MB of damage per frame): head-0
+  fps 24.0 (CPU, no RM) → 29.0 (CPU, RM up) → 33.6 (CE, synchronous) → 35.4 (CE
+  overlapped, 2 MiB source). With about 20 MB per frame: 29.8 (CPU, RM up) → 39.6 (CE).
+  YouTube 4K60 (Big Buck Bunny, watch page): 35.1 / 35.9 (CPU) → 37.6 (CE).
+- **What still limits it.** The compositor is about 92% busy: around 8–10 ms of compose
+  plus the CE wait, at about 4 GB/s for 34 MB. waylandd is about 98% busy and caps
+  commits at about 42–47/s.
+- **Idle power:** 131–138 W without GSP; 100–105 W with GSP-RM up.

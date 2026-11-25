@@ -157,6 +157,22 @@ class HardwareTests(unittest.TestCase):
         self.assertFalse(result['reachable']);self.assertIsNone(result['identity_matches'])
         self.assertEqual(result['probe_stage'],'connecting');self.assertEqual(result['errno'],errno.EHOSTUNREACH)
 
+    def test_input_maps_actions_to_inject_and_stops_at_refusal(self):
+        sent=[]
+        @contextmanager
+        def locked(_session):yield {'session':'s'}
+        def guest(_data,command,**_):
+            sent.append(command)
+            return {'reply':'unknown command' if command.startswith('inject key') else 'inject: ok'}
+        with patch.object(self.hardware,'session_lock',locked),patch.object(self.hardware,'guest',guest):
+            r=self.hardware.input('s',[{'type':'move','x':10,'y':20},{'type':'type','text':'Hi'},{'type':'combo','keys':'ctrl+a'},
+                                       {'type':'key','scancode':28},{'type':'sleep','ms':5}])
+        self.assertEqual(sent,['inject move 10 20','inject type Hi','inject combo ctrl+a','inject key 28'])
+        self.assertEqual((r['completed'],r['requested']),(3,5));self.assertFalse(r['results'][-1]['ok'])
+        for bad in ([],[{'type':'warp'}],[{'type':'move','x':-1,'y':0}],[{'type':'type','text':'a\nb'}],
+                    [{'type':'combo','keys':'a+ctrl'}],[{'type':'click','x':True,'y':1}],[{'type':'sleep','ms':10000}]):
+            with self.assertRaises(ValueError):self.hardware.input('s',bad)
+
     def test_doctor_rejects_unverified_capabilities(self):
         session=self.attach()
         for caps in ({'reply':'unsupported'}, {'hardware_api':1,'boot_guard':False,'boot_id':self.endpoint.epoch},

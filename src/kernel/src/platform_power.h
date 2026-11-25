@@ -72,6 +72,7 @@ struct PowerQuiesceList {
     }
 };
 extern "C" bool PlatformPowerAddQuiesce(PowerQuiesceFn fn);
+extern "C" void PlatformPowerExtendResetWatchdog(uint32_t ms);
 unsigned PlatformPowerRunQuiesce();
 void PlatformPowerConfigure(); // boot-time discovery and explicit emulator opt-in
 const PlatformPowerPlan& PlatformPowerGetPlan();

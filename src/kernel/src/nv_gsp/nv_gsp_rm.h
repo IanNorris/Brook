@@ -28,6 +28,7 @@
 #include "nv_gsp_queue.h"
 #include "nv_gsp_radix3.h"
 #include "nv_gsp_seq.h"
+#include "nv_gsp_static.h"
 
 namespace brook::nvgsp {
 
@@ -200,6 +201,8 @@ struct P4Result {
     uint32_t static_len = 0;
     uint8_t static_head[64] = {};
     bool static_ok = false;
+    uint8_t static_raw[kStaticInfoBytes] = {};    // the whole GspStaticConfigInfo reply payload
+    StaticInfo si;                                 // parsed (nv_gsp_static.h)
     bool diag_valid = false;
     FalconDiag diag;
 };
@@ -325,6 +328,10 @@ inline P4Result RunP4(Bus& bus, const ChipOps& c, const P3Inputs& in, const DmaB
     r.static_len = len;
     for (uint32_t i = 0; i < 64 && kRpcHdr + i < len; ++i) r.static_head[i] = rxbuf[kRpcHdr + i];
     r.static_ok = len >= kRpcHdr + kStaticInfoBytes;
+    if (r.static_ok) {
+        for (uint32_t i = 0; i < kStaticInfoBytes; ++i) r.static_raw[i] = rxbuf[kRpcHdr + i];
+        (void)ParseStaticInfo(r.static_raw, kStaticInfoBytes, &r.si);
+    }
     r.stage = "running";
     r.status = r.static_ok ? BootStatus::Ok : BootStatus::BadInput;
     return r;
