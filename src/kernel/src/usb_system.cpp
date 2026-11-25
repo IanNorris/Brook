@@ -228,20 +228,20 @@ void UsbSystemConfigure() {
 
 // The authenticated bulk helper and profile-stage capacity probe share this
 // path. Bind it to the admitted system filesystem before userspace starts.
-static bool BindProfileTransfer() {
+static int BindProfileTransfer() {
     VnodeStat marker{};
     const int markerResult = VfsLstatPath("/etc/usb-profile-plan.pub", &marker);
-    if (markerResult == -2) return true;
-    if (markerResult || marker.isDir || marker.isSymlink) return false;
+    if (markerResult == -2) return 0;
+    if (markerResult) return markerResult;
+    if (marker.isDir || marker.isSymlink) return -22;
     constexpr char source[] = "/nix/var/.brook-transfer";
     constexpr char target[] = "/data/.brook-transfer";
-    VfsPath root{}, nix{}, var{}, data{}, transfer{};
+    VfsPath root{}, nix{}, var{}, transfer{};
     int error = VfsPathRoot(&root);
     if (!error) error = VfsPathResolve(root, root, "/nix", &nix, false);
     if (!error) error = VfsPathResolve(root, root, "/nix/var", &var, false);
-    if (!error) error = VfsPathResolve(root, root, "/data", &data, false);
-    if (!error && (nix.attachment == root.attachment || nix.attachment != var.attachment ||
-                   data.attachment != root.attachment)) error = -18;
+    if (!error && (nix.attachment == root.attachment || nix.attachment != var.attachment)) error = -18;
+    // WritableDesktopPrepareDirect already admitted /data as a tmpfs mount.
     const char* directories[] = {"/nix/var", "/data"};
     for (const char* path : directories) {
         VnodeStat stat{};
@@ -264,11 +264,10 @@ static bool BindProfileTransfer() {
     if (!error)
         error = VfsMountNamespaceBindAt(VfsMountNamespaceInitial(), root, root, source, target);
     VfsPathRelease(transfer);
-    VfsPathRelease(data);
     VfsPathRelease(var);
     VfsPathRelease(nix);
     VfsPathRelease(root);
-    return !error;
+    return error;
 }
 
 bool UsbSystemBoot(uint8_t* nextDrive,bool scanComplete) {
@@ -335,7 +334,8 @@ bool UsbSystemBoot(uint8_t* nextDrive,bool scanComplete) {
         VfsUnmount("/nix");
         return Fail(details.check,details.status);
     }
-    if (!BindProfileTransfer()) return Fail("profile-transfer-bind", -5);
+    if (const int transferError = BindProfileTransfer())
+        return Fail("profile-transfer-bind", transferError);
     if(!session.Arm())__builtin_trap();
     ready=true;
     boot.mounted=true;boot.dirty=true;boot.stage="ready";
