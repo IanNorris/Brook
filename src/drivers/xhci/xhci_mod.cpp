@@ -2826,6 +2826,18 @@ static XhciUas* XhciAllocateUas(const UsbUasConfig& config) {
     return uas;
 }
 
+static bool XhciUasCanClaim(XhciController& ctrl,XhciDevice& dev,
+    const UsbUasConfig& config,uint32_t replace=0)
+{
+    for(const auto& ep:config.pipes) {
+        const uint32_t dci=XhciUasDci(ep.address);
+        const auto* live=reinterpret_cast<const volatile uint32_t*>(
+            static_cast<const uint8_t*>(dev.outputCtx)+CtxEntrySize(ctrl)*dci);
+        if((live[0]&7u) && !(replace&(1u<<dci)))return false;
+    }
+    return true;
+}
+
 static uint32_t XhciDropStorageEndpoints(XhciController& ctrl,XhciDevice& dev,uint32_t mask) {
     const uint32_t size=CtxEntrySize(ctrl);
     auto* input=static_cast<uint8_t*>(dev.inputCtx);
@@ -2930,16 +2942,18 @@ static bool XhciUasRetireData(XhciController& ctrl,XhciDevice& dev,unsigned pipe
     if(cc!=TRB_CC_SUCCESS && !(cc==TRB_CC_CONTEXT_STATE && (ep[0]&7u)==3))return false;
     for(unsigned i=0;i<UsbUasDepth;++i)if(tags&(1u<<i)) {
         auto& ring=uas.rings[pipe][i];
-        if(ring.enqueue==XFER_RING_SIZE-1) {
-            __atomic_store_n(&ring.ring[ring.enqueue].control,XhciLinkControl(!ring.cycle,false),__ATOMIC_RELEASE);
-            ring.enqueue=0;
-            ring.cycle=!ring.cycle;
-        }
-        const auto dequeue=(ring.phys+uint64_t(ring.enqueue)*sizeof(Trb))|2u|uint64_t(ring.cycle);
+        const auto position=UsbBotNextDequeue(ring.phys,ring.enqueue,ring.cycle,XFER_RING_SIZE);
+        if(!position.valid)return false;
+        if(position.skipLink)
+            __atomic_store_n(&ring.ring[XFER_RING_SIZE-1].control,
+                XhciLinkControl(!position.cycle,false),__ATOMIC_RELEASE);
+        const uint64_t dequeue=position.pointer|2u; // primary transfer ring, DCS preserved
         const auto token=XhciSubmitCommand(ctrl,dequeue,(i+1)<<16,TRB_TYPE_SET_TR_DEQ|target);
         Trb completion;
         if(!XhciWaitForEvent(ctrl,TRB_TYPE_CMD_COMPLETION,2000,&completion,token) ||
            (completion.status>>24)!=TRB_CC_SUCCESS || (completion.control>>24)!=dev.slotId)return false;
+        ring.enqueue=position.index;
+        ring.cycle=position.cycle;
     }
     XhciDiscardStorageEvents(ctrl,dev,1u<<dci);
     return true;
@@ -3596,7 +3610,8 @@ static bool XhciTryUas(XhciController& ctrl,XhciDevice& dev,bool& fallback) {
     if(!UsbSpeedIsSuper(dev.portSpeed) ||
        ((xhci_read32(ctrl.capBase,XHCI_CAP_HCCPARAMS1)>>12)&15)<2)return false;
     UsbUasConfig parsed{};
-    if(!UsbUasParse(dev.rawConfig,dev.rawConfigLen,bot?int(dev.mscInterface):-1,parsed))return false;
+    if(!UsbUasParse(dev.rawConfig,dev.rawConfigLen,bot?int(dev.mscInterface):-1,parsed) ||
+       !XhciUasCanClaim(ctrl,dev,parsed))return false;
     auto* uas=XhciAllocateUas(parsed);
     if(!uas)return false;
     if(parsed.alternate && !XhciSelectStorageInterface(ctrl,dev,parsed.interface,parsed.alternate)) {
@@ -3673,14 +3688,15 @@ static int XhciPromoteSystemStorage(UsbMscState& state) {
     auto& dev=g_devices[state.devIndex];
     if(dev.uas)return 0;
     if(state.windows.heldSystem || !UsbMscByteTransport{&state}.usable())return -5;
+    const uint32_t mask=(1u<<dev.bulkInDci)|(1u<<dev.bulkOutDci);
     UsbUasConfig parsed{};
     if(!g_storageUas || !UsbSpeedIsSuper(dev.portSpeed) ||
        ((xhci_read32(ctrl.capBase,XHCI_CAP_HCCPARAMS1)>>12)&15)<2 ||
-       !UsbUasParse(dev.rawConfig,dev.rawConfigLen,dev.mscInterface,parsed)) {
+       !UsbUasParse(dev.rawConfig,dev.rawConfigLen,dev.mscInterface,parsed) ||
+       !XhciUasCanClaim(ctrl,dev,parsed,mask)) {
         XhciProbeBotLimit(state,dev);
         return UsbMscByteTransport{&state}.usable()?-95:-5;
     }
-    const uint32_t mask=(1u<<dev.bulkInDci)|(1u<<dev.bulkOutDci);
     const auto block=dev.mscBlockSize;
     const auto sectors=dev.mscSectorCount;
     if(XhciDropStorageEndpoints(ctrl,dev,mask)!=TRB_CC_SUCCESS)return -5;
