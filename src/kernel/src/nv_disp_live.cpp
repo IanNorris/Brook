@@ -210,6 +210,11 @@ struct NvPresenterState{
 NvPresenterState g_presenter[nvdisp::kDriverOutputs]{};
 // The compositor loop hook (completion, queued arms, wake time).
 uint64_t g_pollNs=0;uint32_t g_polls=0,g_pollMaxUs=0,g_pollBusy=0;
+// Loop timing (pacing diagnosis): the first head-0 present after each poll, against the
+// wake target the poll set: early (a client commit woke the loop) or late by <1/<2/<4/<8/
+// >=8 ms; the scanline it arms at (8 bins of vtotal); and the loop's busy time, first
+// present to the next poll: <2/<4/<8/<16/>=16 ms.
+uint32_t g_wakeHist[6]{},g_armLineHist[8]{},g_busyHist[5]{};uint64_t g_loopFirstUs=0;bool g_loopPresented=false;
 // Output 1's desktop rectangle, published for lock-free Info/Count readers.
 uint64_t g_head1Rect=0;   // x | w<<16 | h<<32 | pitch<<48 (pitch in 64-byte units); 0 = not presented
 uint64_t PresentNowNs(){return TscClockAvailable()?TscClockReadNs():ApicTickCount()*1000000ull;}
@@ -271,8 +276,18 @@ int PresentOutput(uint32_t o,const uint32_t* src,uint32_t srcStride,const Damage
     NoteCpu(p,t0);
     return 1;
 }
+uint64_t g_wakeAtUs=0;uint32_t g_wakePeriodUs=16667;
+void NoteLoopPresent(){
+    if(g_loopPresented)return;
+    g_loopPresented=true;const uint64_t now=g_backend.nowUs();g_loopFirstUs=now;
+    if(g_wakeAtUs){const int64_t late=int64_t(now)-int64_t(g_wakeAtUs);
+        ++g_wakeHist[late<0?0:late<1000?1:late<2000?2:late<4000?3:late<8000?4:5];}
+    const auto& f=g_driver.f[0];
+    if(f.vtotal)++g_armLineHist[uint64_t(g_backend.rd(nvdisp::RegRgPos(0))&0xffff)*8/f.vtotal>7?7:uint64_t(g_backend.rd(nvdisp::RegRgPos(0))&0xffff)*8/f.vtotal];
+}
 int NvPrimaryPresent(const uint32_t* src,uint32_t srcStride,uint32_t width,uint32_t height,const DamageRects& damage){
     auto& p=g_presenter[0];
+    NoteLoopPresent();
     if(!p.active||width!=p.width||height!=p.height){p.active=false;g_driver.out0External=false;return -1;}
     const int r=PresentOutput(0,src,srcStride,damage);
     if(r==-1){p.active=false;g_driver.out0External=false;}
@@ -334,7 +349,6 @@ bool g_head1Registered=false;
 // The last wake target (absolute us) and head 0's frame period, for a poll that finds the
 // lock busy (dp-idle's AUX link watch): it sleeps to the same LOADV instead of polling
 // again in 2 ms, which would run an extra compositor frame inside the current one.
-uint64_t g_wakeAtUs=0;uint32_t g_wakePeriodUs=16667;
 uint32_t MsUntilUs(uint64_t atUs,uint64_t nowUs){
     const uint32_t ms=atUs>nowUs?uint32_t((atUs-nowUs+999)/1000)+1:1;
     return ms>g_wakePeriodUs/1000+2?g_wakePeriodUs/1000+2:ms;}
@@ -359,6 +373,8 @@ uint32_t WakeMsUnlocked(){
 }
 uint32_t NvPrimaryPoll(){
     const uint64_t t0=PresentNowNs();
+    if(g_loopPresented){const uint64_t busy=g_backend.nowUs()-g_loopFirstUs;
+        ++g_busyHist[busy<2000?0:busy<4000?1:busy<8000?2:busy<16000?3:4];g_loopPresented=false;}
     SpinLock* lock=NvAuxSharedLock();
     if(!SpinLockTryAcquire(lock)){++g_pollBusy;return g_presenter[0].active?WakeMsUnlocked():2;}
     uint32_t ms=16;bool lost1=false;
@@ -461,7 +477,8 @@ StatsMark TakeMark(){
 }
 void PresenterStats(bool reset){
     const StatsMark now=TakeMark();
-    if(reset||!g_mark.us){g_mark=now;g_pollMaxUs=0;for(auto& p:g_presenter)p.cpuMaxUs=0;}
+    if(reset||!g_mark.us){g_mark=now;g_pollMaxUs=0;for(auto& p:g_presenter)p.cpuMaxUs=0;
+        for(auto& v:g_wakeHist)v=0;for(auto& v:g_armLineHist)v=0;for(auto& v:g_busyHist)v=0;}
     const StatsMark& a=g_mark;
     const uint64_t us=now.us-a.us;
     for(uint32_t o=0;o<2;++o){
@@ -477,6 +494,10 @@ void PresenterStats(bool reset){
         DebugChannelSend(l.t);
     }
     nvdisp::NvDisplayDriver<LiveBackend>::Line l;
+    {nvdisp::NvDisplayDriver<LiveBackend>::Line t;t.raw("{\"nv_display\":\"stats_loop\",\"wake\":[");
+        for(uint32_t i=0;i<6;++i){if(i)t.raw(",");t.dec(g_wakeHist[i]);}t.raw("],\"arm_line\":[");
+        for(uint32_t i=0;i<8;++i){if(i)t.raw(",");t.dec(g_armLineHist[i]);}t.raw("],\"busy\":[");
+        for(uint32_t i=0;i<5;++i){if(i)t.raw(",");t.dec(g_busyHist[i]);}t.raw("]}\n");DebugChannelSend(t.t);}
     l.raw("{\"nv_display\":\"stats_poll\",\"us\":");l.dec(us);l.raw(",\"polls\":");l.dec(now.polls-a.polls);
     l.raw(",\"poll_busy\":");l.dec(g_pollBusy);l.raw(",\"poll_cpu_us\":");l.dec((now.pollNs-a.pollNs)/1000);l.raw(",\"poll_max_us\":");l.dec(g_pollMaxUs);l.raw("}\n");
     DebugChannelSend(l.t);
