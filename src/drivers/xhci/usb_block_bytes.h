@@ -19,7 +19,7 @@ template<class Io> int UsbBlockReadBytes(Io& io,uint64_t offset,void* out,uint64
         const uint32_t blocks=(head+static_cast<uint32_t>(take)+block-1)/block;
         if(offset/block>0xffffffffu || blocks>0x100000000ull-offset/block ||
            !io.readBlocks(offset/block,blocks)) return done?static_cast<int>(done):-5;
-        for(uint32_t i=0;i<take;++i)dst[done+i]=io.bounce()[head+i];
+        __builtin_memcpy(dst+done,io.bounce()+head,take);
         offset+=take;done+=take;
     }
     return static_cast<int>(done);
@@ -39,7 +39,7 @@ template<class Io> int UsbBlockWriteBytes(Io& io,uint64_t offset,const void* in,
         const uint64_t lba=offset/block;
         if(lba>0xffffffffu || blocks>0x100000000ull-lba)return done?static_cast<int>(done):-5;
         if((head || (head+take)%block) && !io.readBlocks(lba,blocks))return done?static_cast<int>(done):-5;
-        for(uint32_t i=0;i<take;++i)io.bounce()[head+i]=src[done+i];
+        __builtin_memcpy(io.bounce()+head,src+done,take);
         if(!io.writeBlocks(lba,blocks))return done?static_cast<int>(done):-5;
         offset+=take;done+=take;
     }

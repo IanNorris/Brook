@@ -2508,15 +2508,20 @@ static bool XhciInitEcm(XhciController& ctrl,XhciDevice& dev){
     return true;
 }
 
-// Perform a bulk transfer (IN or OUT)
-static bool XhciBulkTransfer(XhciController& ctrl, XhciDevice& dev,
-                              bool isIn, void* buf, uint64_t bufPhys,
-                              uint32_t len, uint32_t timeoutMs = 5000, uint32_t* shortInActual = nullptr,
-                              UsbBotReceive* status = nullptr)
+// Each 64 KiB DMA boundary consumes a TRB. An unaligned start and a
+// wrap across the link TRB can each add one more.
+static constexpr uint32_t USB_MSC_MAX_BULK_BYTES=1u<<20;
+struct MscBulkTd {
+    Trb* ring;
+    uint64_t ringPhys,last;
+    uint64_t tokens[USB_MSC_MAX_BULK_BYTES/65536+2];
+    unsigned tokenCount=0;
+    uint32_t dci,maxPacket;
+};
+
+static bool XhciPrepareMscBulk(XhciController& ctrl,XhciDevice& dev,bool isIn,
+    uint64_t bufPhys,uint32_t len,XhciTdPublication& publication,MscBulkTd& td)
 {
-    if(status)*status=UsbBotReceive::Failure;
-    if(shortInActual)*shortInActual=0;
-    if(shortInActual && (!isIn || len>192 || XhciDmaChunk(bufPhys,len)!=len))return false;
     Trb*&     ring    = isIn ? dev.bulkInRing    : dev.bulkOutRing;
     uint32_t& enqueue = isIn ? dev.bulkInEnqueue : dev.bulkOutEnqueue;
     bool&     cycle   = isIn ? dev.bulkInCycle   : dev.bulkOutCycle;
@@ -2525,21 +2530,25 @@ static bool XhciBulkTransfer(XhciController& ctrl, XhciDevice& dev,
     const uint64_t ringPhys=isIn?dev.bulkInRingPhys:dev.bulkOutRingPhys;
     if (!ring) return false;
 
-    if(!len || len>65536)return false;
-    uint64_t physical=bufPhys,token=0,tokens[3]{};unsigned tokenCount=0;uint32_t remaining=len;
+    if(!len || len>USB_MSC_MAX_BULK_BYTES)return false;
+    uint64_t physical=bufPhys;
+    uint32_t remaining=len;
     const uint32_t maxPacket=isIn?dev.bulkInMaxPacket:dev.bulkOutMaxPacket;
     if(!maxPacket)return false;
-    XhciTdPublication publication;
+    td.ring=ring;
+    td.ringPhys=ringPhys;
+    td.dci=dci;
+    td.maxPacket=maxPacket;
     while(remaining) {
         if(enqueue>=XFER_RING_SIZE-1) {
-            tokens[tokenCount++]=ringPhys+(XFER_RING_SIZE-1)*sizeof(Trb);
+            td.tokens[td.tokenCount++]=ringPhys+(XFER_RING_SIZE-1)*sizeof(Trb);
             publication.Stage(ring[XFER_RING_SIZE-1].control,
                 XhciLinkControl(cycle,(ring[XFER_RING_SIZE-2].control&(1u<<4))!=0));
             cycle=!cycle;enqueue=0;
         }
         const auto bytes=XhciDmaChunk(physical,remaining);
-        auto& trb=ring[enqueue];token=ringPhys+enqueue*sizeof(Trb);
-        tokens[tokenCount++]=token;
+        auto& trb=ring[enqueue];td.last=ringPhys+enqueue*sizeof(Trb);
+        td.tokens[td.tokenCount++]=td.last;
         trb.param=physical;trb.status=bytes;
         if(ctrl.hciVersion>=0x100)trb.status|=XhciTdPackets(len,len-remaining+bytes,maxPacket)<<17;
         const uint32_t control=TRB_TYPE_NORMAL|(remaining>bytes?(1u<<4):TRB_IOC)|
@@ -2547,20 +2556,32 @@ static bool XhciBulkTransfer(XhciController& ctrl, XhciDevice& dev,
         publication.Stage(trb.control,control);
         ++enqueue;physical+=bytes;remaining-=bytes;
     }
+    return true;
+}
+
+static bool XhciPublishMscBulk(XhciController& ctrl,XhciDevice& dev,
+    XhciTdPublication& publication,uint32_t dci)
+{
     __asm__ volatile("mfence":::"memory");
-    {
-        // Removal publishes gone under the same lock before disabling the
-        // slot. Never publish a new MSC TD once that transition has started.
-        const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
-        if(__atomic_load_n(&dev.gone,__ATOMIC_ACQUIRE)) {
-            IrqSpinLockRelease(&g_eventRingLock,saved);
-            return false;
-        }
+    // Removal publishes gone under the same lock before disabling the slot.
+    const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
+    const bool live=!__atomic_load_n(&dev.gone,__ATOMIC_ACQUIRE);
+    if(live) {
         publication.Publish();
         __asm__ volatile("mfence":::"memory");
         XhciRingDoorbell(ctrl,dev.slotId,dci);
-        IrqSpinLockRelease(&g_eventRingLock,saved);
     }
+    IrqSpinLockRelease(&g_eventRingLock,saved);
+    return live;
+}
+
+static bool XhciWaitMscBulk(XhciController& ctrl,XhciDevice& dev,const MscBulkTd& td,
+    bool isIn,uint64_t bufPhys,uint32_t len,uint32_t timeoutMs,uint32_t* shortInActual,
+    UsbBotReceive* status)
+{
+    if(status)*status=UsbBotReceive::Failure;
+    if(shortInActual)*shortInActual=0;
+    const auto& [ring,ringPhys,token,tokens,tokenCount,dci,maxPacket]=td;
     Trb completion;
     Trb* evt=XhciWaitForEvent(ctrl,TRB_TYPE_TRANSFER_EVENT,timeoutMs,&completion,0,tokens,tokenCount);
 
@@ -2595,14 +2616,33 @@ static bool XhciBulkTransfer(XhciController& ctrl, XhciDevice& dev,
     return true;
 }
 
+static bool XhciBulkTransfer(XhciController& ctrl,XhciDevice& dev,
+    bool isIn,void*,uint64_t bufPhys,uint32_t len,uint32_t timeoutMs=5000,
+    uint32_t* shortInActual=nullptr,UsbBotReceive* status=nullptr)
+{
+    if(status)*status=UsbBotReceive::Failure;
+    if(shortInActual && (!isIn || len>192 || XhciDmaChunk(bufPhys,len)!=len))return false;
+    XhciTdPublication publication;
+    MscBulkTd td{};
+    return XhciPrepareMscBulk(ctrl,dev,isIn,bufPhys,len,publication,td) &&
+        XhciPublishMscBulk(ctrl,dev,publication,td.dci) &&
+        XhciWaitMscBulk(ctrl,dev,td,isIn,bufPhys,len,timeoutMs,shortInActual,status);
+}
+
 // Restore only the halted bulk-IN endpoint after an observed CSW STALL.
 // The MSC command lock guarantees no other TD is queued on these bulk rings.
 struct UsbMscCswReceive {
     XhciController& controller;XhciDevice& device;void* buffer;uint64_t physical;
     UsbBotDequeue position{};
+    const MscBulkTd* queued=nullptr;
     UsbBotReceive receive() {
         UsbBotReceive status;
-        XhciBulkTransfer(controller,device,true,buffer,physical,13,5000,nullptr,&status);
+        if(queued) {
+            XhciWaitMscBulk(controller,device,*queued,true,physical,13,5000,nullptr,&status);
+            queued=nullptr;
+        } else {
+            XhciBulkTransfer(controller,device,true,buffer,physical,13,5000,nullptr,&status);
+        }
         return status;
     }
     bool command(uint64_t param,uint32_t control) {
@@ -2747,10 +2787,30 @@ static XhciMscResult XhciMscCommandLocked(XhciController& ctrl,XhciDevice& dev,
         return {};
     }
 
+    uint64_t cswPhys=dev.mscCommandBufferPhys+64;
+    auto* csw=reinterpret_cast<UsbMscCsw*>(static_cast<uint8_t*>(dev.mscCommandBuffer)+64);
+    memset(csw,0,sizeof(*csw));
+
+    // Both TDs use the same IN ring, so the status cannot overtake the
+    // data. Keep short/variable transfers and OUT data on separate phases.
+    const bool queueStatus=UsbSystemRequested() && dataIn && dataLen && data && !allowShort &&
+        cdb[0]==SCSI_READ_10;
+    MscBulkTd statusTd{};
     // 2. Data phase (if any)
     uint32_t actual=dataLen;
     if (dataLen > 0 && data) {
-        const bool transferred=XhciBulkTransfer(ctrl,dev,dataIn,data,dataPhys,dataLen,5000,allowShort?&actual:nullptr);
+        bool transferred;
+        if(queueStatus) {
+            XhciTdPublication publication;
+            MscBulkTd dataTd{};
+            transferred=XhciPrepareMscBulk(ctrl,dev,true,dataPhys,dataLen,publication,dataTd) &&
+                XhciPrepareMscBulk(ctrl,dev,true,cswPhys,sizeof(*csw),publication,statusTd) &&
+                XhciPublishMscBulk(ctrl,dev,publication,dataTd.dci) &&
+                XhciWaitMscBulk(ctrl,dev,dataTd,true,dataPhys,dataLen,5000,nullptr,nullptr);
+        } else {
+            transferred=XhciBulkTransfer(ctrl,dev,dataIn,data,dataPhys,dataLen,5000,
+                allowShort?&actual:nullptr);
+        }
         timing.data=timing.Lap();
         if (!transferred) {
             __atomic_store_n(&dev.mscQuarantined,true,__ATOMIC_RELEASE);
@@ -2761,13 +2821,7 @@ static XhciMscResult XhciMscCommandLocked(XhciController& ctrl,XhciDevice& dev,
     }
 
     // 3. Receive CSW via Bulk IN
-    uint64_t cswPhys = dev.mscCommandBufferPhys + 64;
-    auto* csw = reinterpret_cast<UsbMscCsw*>(
-        static_cast<uint8_t*>(dev.mscCommandBuffer) + 64);
-
-    memset(csw, 0, sizeof(UsbMscCsw));
-
-    UsbMscCswReceive receive{ctrl,dev,csw,cswPhys};
+    UsbMscCswReceive receive{ctrl,dev,csw,cswPhys,{},queueStatus?&statusTd:nullptr};
     const bool received=UsbBotReceiveCsw(receive);
     timing.csw=timing.Lap();
     if (!received) {
@@ -2935,6 +2989,7 @@ struct UsbMscState {
     uint32_t devIndex;   // index into g_devices
     uint8_t* bounce;
     uint64_t bouncePhys;
+    uint32_t bounceCapacity;
     char name[16];
     UsbWriteWindows windows;
     bool systemFailed;
@@ -2953,7 +3008,7 @@ struct UsbMscByteTransport {
     UsbMscState* state;
     uint32_t blockSize() {return g_devices[state->devIndex].mscBlockSize;}
     uint64_t blockCount() {return g_devices[state->devIndex].mscSectorCount;}
-    uint32_t bounceBytes() {return g_storagePageChunks?4096:65536;}
+    uint32_t bounceBytes() {return g_storagePageChunks?4096:state->bounceCapacity;}
     uint8_t* bounce() {return state->bounce;}
     bool usable() {
         const auto& dev=g_devices[state->devIndex];
@@ -3025,6 +3080,7 @@ static int UsbMscIoctl(Device* dev, uint32_t cmd, void* arg)
         *static_cast<UsbStorageTiming*>(arg)=g_devices[st->devIndex].mscTiming;
         return 0;
     }
+    if (cmd == DEVICE_IOCTL_PREFERRED_READ_BYTES) return UsbMscByteTransport{st}.bounceBytes();
     if (cmd == DEVICE_IOCTL_WRITE_FENCED) {
         const auto& device=g_devices[st->devIndex];
         return __atomic_load_n(&st->systemFailed,__ATOMIC_ACQUIRE) ||
@@ -3144,7 +3200,14 @@ static bool XhciInitMassStorage(XhciController& ctrl, XhciDevice& dev,
     state->devIndex = devIndex;
     state->windows={};
     state->systemFailed=false;
-    state->bounce=static_cast<uint8_t*>(AllocDmaBuffer(16,state->bouncePhys));
+    state->bounceCapacity=65536;
+    state->bounce=nullptr;
+    if(UsbSystemRequested() && !g_storagePageChunks) {
+        state->bounce=static_cast<uint8_t*>(AllocDmaBuffer(USB_MSC_MAX_BULK_BYTES/4096,state->bouncePhys));
+        if(state->bounce)state->bounceCapacity=USB_MSC_MAX_BULK_BYTES;
+    }
+    if(!state->bounce)
+        state->bounce=static_cast<uint8_t*>(AllocDmaBuffer(state->bounceCapacity/4096,state->bouncePhys));
     if(!state->bounce){kfree(state);return false;}
 
     auto* blkDev = static_cast<Device*>(kmalloc(sizeof(Device)));

@@ -75,6 +75,8 @@ int Write(Device* owner,uint64_t offset,const void* data,uint64_t size) {
 }
 int Control(Device*,uint32_t request,void*) {
     if(request==DEVICE_IOCTL_READ_ONLY)return 0;
+    if(request==DEVICE_IOCTL_PREFERRED_READ_BYTES)
+        return disk->ops->ioctl(disk,request,nullptr);
     if(request==DEVICE_IOCTL_WRITE_FENCED)return IsUncertain()?1:0;
     if(request!=DEVICE_IOCTL_FLUSH)return -95;
     if(IsUncertain() || !__atomic_load_n(&open,__ATOMIC_ACQUIRE))return -5;

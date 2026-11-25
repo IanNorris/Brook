@@ -65,6 +65,9 @@ def main():
     protected = fixture.digest_outside_system(system), fixture.sha(fallback)
     result = {"outside_p2_sha256": protected[0], "cold_file": args.cold_file}
     output = args.output / "verdict.json"
+    def record():
+        output.write_text(json.dumps(result, indent=2) + "\n")
+
     guest = fixture.Guest(args, system, fallback, "transport-and-ext2")
     try:
         guest.wait_log("USB_SYSTEM_READY")
@@ -76,18 +79,21 @@ def main():
             assert row["bytes"] == mib * (1 << 20) and row["errno"] == 0 and row["duration_ns"] > 0, row
             rows[f"{mode}-{kib}"] = row
         result["raw"] = rows
+        record()
         dd = "/nix/profile/bin/dd"
         command = f'{dd} if={shlex.quote(args.cold_file)} of=/dev/null bs=1M count=64 status=none'
         result["ext2_cold_read_64m"] = measure_job(guest, command)
         result["ext2_repeat_read_64m"] = measure_job(guest, command)
-        result["ext2_scratch_write_16m"] = measure_job(guest, f"""
-            set -eu
-            umask 077
-            scratch=$(/nix/profile/bin/mktemp -d /data/home/.usb-system-perf.XXXXXXXX)
-            trap '/nix/profile/bin/rm -f -- "$scratch/test"; /nix/profile/bin/rmdir -- "$scratch"' EXIT
-            {dd} if=/dev/zero of="$scratch/test" bs=1M count=16 conv=fsync status=none
-            test "$(/nix/profile/bin/stat -c %s "$scratch/test")" = 16777216
-        """)
+        record()
+        scratch = f"/data/home/.usbbench-{uuid.uuid4().hex[:12]}"
+        guest.job(f"umask 077; /nix/profile/bin/mkdir {scratch}")
+        try:
+            result["ext2_scratch_write_16m"] = measure_job(
+                guest, f"cd {scratch} && {dd} if=/dev/zero of=test bs=1M count=16 conv=fsync status=none")
+            guest.job(f'cd {scratch} && test "$(/nix/profile/bin/stat -c %s test)" = 16777216')
+        finally:
+            guest.job(f"cd {scratch} && /nix/profile/bin/rm -f test && cd .. && /nix/profile/bin/rmdir {scratch}")
+        record()
         guest.restart()
     finally:
         guest.stop()
@@ -106,7 +112,7 @@ def main():
             guest.stop()
         assert (fixture.digest_outside_system(system), fixture.sha(fallback)) == protected
     result["outside_p2_unchanged"] = True
-    output.write_text(json.dumps(result, indent=2) + "\n")
+    record()
     print("USB_SYSTEM_PERF_PASS", output)
 
 

@@ -206,6 +206,7 @@ struct Ext2Mount {
     Device*  dev;
     bool      hasWriteFence;
     uint32_t cacheNamespace; // unique for this mount's lifetime, including remounts
+    uint32_t readBurst;      // maximum coalesced data read in bytes
     uint32_t blockSize;      // bytes per block
     uint32_t blockShift;     // log2(blockSize)
     uint32_t inodeSize;      // bytes per inode on disk
@@ -2033,10 +2034,6 @@ static int Ext2ReadInodeData(Ext2Mount* mnt, const Ext2Inode* ino,
     uint64_t bytesRead = 0;
     int error = 0;
 
-    // Cap run-coalesce length at the underlying device's preferred
-    // burst (matches virtio-blk's persistent 64KB DMA buffer).
-    static constexpr uint64_t MAX_RUN_BYTES = 64 * 1024;
-
     // Bounce buffer used only for unaligned head/tail partial blocks.
     uint8_t* blockBuf = nullptr;
     auto getBounce = [&]() -> uint8_t* {
@@ -2089,7 +2086,7 @@ static int Ext2ReadInodeData(Ext2Mount* mnt, const Ext2Inode* ino,
 
         // Aligned to a block boundary AND caller wants at least one
         // full block. Find the longest run of contiguous file-blocks
-        // mapping to contiguous disk-blocks (capped at MAX_RUN_BYTES
+        // mapping to contiguous disk-blocks (capped at the device read burst
         // and at the data still requested).
         //
         // Before hitting disk, check if the first block is cached.
@@ -2101,8 +2098,8 @@ static int Ext2ReadInodeData(Ext2Mount* mnt, const Ext2Inode* ino,
 
         uint32_t runBlocks = 1;
         uint32_t maxRun = static_cast<uint32_t>(remaining >> mnt->blockShift);
-        if (maxRun > (MAX_RUN_BYTES >> mnt->blockShift))
-            maxRun = MAX_RUN_BYTES >> mnt->blockShift;
+        if (maxRun > (mnt->readBurst >> mnt->blockShift))
+            maxRun = mnt->readBurst >> mnt->blockShift;
         while (runBlocks < maxRun) {
             const auto next = Ext2BlockMap(mnt, ino, fileBlock + runBlocks);
             if (next.failed) {
@@ -3033,6 +3030,8 @@ static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
     mnt->cacheNamespace = static_cast<uint32_t>(cacheNamespace);
     mnt->dev            = dev;
     mnt->hasWriteFence=dev->ops->ioctl && dev->ops->ioctl(dev,DEVICE_IOCTL_WRITE_FENCED,nullptr)>=0;
+    const int preferred=dev->ops->ioctl?dev->ops->ioctl(dev,DEVICE_IOCTL_PREFERRED_READ_BYTES,nullptr):0;
+    mnt->readBurst=preferred>=int(blockSize) && preferred<=(1<<20)?uint32_t(preferred):65536;
     mnt->blockSize      = blockSize;
     mnt->blockShift     = blockShift;
     mnt->inodeSize      = inodeSize;

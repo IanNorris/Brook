@@ -50,6 +50,8 @@ struct UsbStorageTiming {
     UsbPhaseTiming command, data, status;
 };
 static constexpr uint32_t DEVICE_IOCTL_USB_STORAGE_TIMING = 0x42460006;
+// Positive preferred size in bytes, or an unsupported error.
+static constexpr uint32_t DEVICE_IOCTL_PREFERRED_READ_BYTES = 0x42460007;
 
 // ---- Generic device operations ----
 struct DeviceOps {
