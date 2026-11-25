@@ -4663,7 +4663,10 @@ static bool CompositorFlipSoftware(bool clientFrame = false, bool hardwareCursor
     if(!shadow)++g_idleStats.shadowUnavailable;
     // An untrusted shadow is refreshed by one complete frame, after which only
     // rows whose pixels changed reach the framebuffer.
-    if(shadow && !g_gopShadowValid)full=true;
+    // A flip presenter never reads or refreshes the GOP shadow (it repairs its own
+    // buffers by age), so an invalid shadow must not force every frame full there:
+    // that pushed a full 4K frame on each 16 ms fallback tick (23 ms cadence).
+    if(shadow && !g_gopShadowValid && !g_primaryPresenter)full=true;
     // The scanout still contains the renderer's frame if its lease expired
     // during this loop. Replace the whole frame on software takeover.
     uint32_t minY=full?0:g_dirtyMinY;
