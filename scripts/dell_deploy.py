@@ -194,12 +194,15 @@ def stage_profile(args, *, bridge=None, bulk_port=1236, usb_system=False):
                                                       transfer['guest_path']])
                 if usb_system and not is_bundle and source.name == 'stage-plan.sig':
                     verify = uuid.uuid4().hex
+                    terminal = False
                     bridge.guest_run(a.session, verify, [*runtime, 'verify', tx,
                                      *journal.receipt['profile_guest_files']],
                                      cwd='/tmp', uid=1000, wait_s=2)
-                    result = journal.wait_job(a.session, verify, lambda item: item.get('state') == 'completed',
-                                              timeout=120)
-                    if result.get('exit', {}).get('code') != 0:
+                    result = journal.wait_job(
+                        a.session, verify,
+                        lambda item: item.get('state') in ('completed', 'failed', 'rejected'), timeout=120)
+                    terminal = True
+                    if result.get('state') != 'completed' or result.get('exit', {}).get('code') != 0:
                         raise ValueError(f'Guest refused the signed plan: {result}')
                 if is_bundle:
                     pushed.append({'sha256': digest, 'guest_path': transfer['guest_path'],
