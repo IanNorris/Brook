@@ -230,6 +230,14 @@ int UsbSystemFinalSync(int syncError) {
     return error;
 }
 
+bool UsbSystemTiming(UsbStorageTiming* out) {
+    return disk && disk->ops->ioctl(disk,DEVICE_IOCTL_USB_STORAGE_TIMING,out)==0;
+}
+int UsbSystemBenchRead(uint64_t at,void* data,uint32_t bytes) {
+    if(!ready || IsUncertain())return -19;
+    return Read(&dataDevice,at,data,bytes);
+}
+
 UsbSystemStatus UsbSystemRead() {
     auto out=boot;
     out.window=__atomic_load_n(&open,__ATOMIC_ACQUIRE);

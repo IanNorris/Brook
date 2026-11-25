@@ -115,6 +115,8 @@ AppSnapshotBootInfo snapshot;
 WritableDesktopInfo writable;
 WritableDesktopInfo WritableDesktopRead(){return writable;}
 UsbSystemStatus UsbSystemRead(){return {};}
+bool UsbSystemTiming(UsbStorageTiming*){return false;}
+int UsbSystemBenchRead(uint64_t,void*,uint32_t){return -19;}
 AhciReadOnlyStatus ahciStatus{};
 AhciPortRegisters ahciRegisters{};
 AhciObservation ahciObservation{};

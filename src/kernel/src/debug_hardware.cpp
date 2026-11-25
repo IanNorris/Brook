@@ -909,6 +909,20 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
             r.text(",");r.field("first_lba",usb.firstLba);r.text(",");r.field("sectors",usb.sectors);
             r.text(",");r.field("reads",usb.reads);r.text(",");r.field("writes",usb.writes);
             r.text(",");r.field("flushes",usb.flushes);r.text(",");r.field("errors",usb.errors);
+            UsbStorageTiming timing{};
+            if(UsbSystemTiming(&timing)) {
+                r.text(",\"timing\":{");r.field("commands",timing.commands);
+                r.text(",");r.field("errors",timing.errors);
+                r.text(",");r.field("data_bytes",timing.dataBytes);
+                r.text(",");r.field("last_bytes",timing.lastBytes);
+                auto phase=[&](const char* label,const UsbPhaseTiming& p) {
+                    r.text(",");r.quoted(label);r.text(":{");
+                    r.field("total_ns",p.totalNs);r.text(",");r.field("max_ns",p.maxNs);
+                    r.text(",");r.field("last_ns",p.lastNs);r.text("}");
+                };
+                phase("cbw",timing.command);phase("data",timing.data);phase("csw",timing.status);
+                r.text("}");
+            }
             r.text("}");
         }
 #if defined(BROOK_SSD_AUTO_RECOVERY)
@@ -1683,6 +1697,58 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         }
         if(mappedPage!=~0u){(void)VmmDetachPage(KernelPageTable,window);__asm__ volatile("invlpg (%0)"::"r"(window.raw()):"memory");}
         r.text("]}\n");r.send();return true;
+    }
+    constexpr char systemBenchPrefix[]="bridge hardware usb-system-bench ";
+    if(Prefix(command,systemBenchPrefix)) {
+        const char* p=command+sizeof(systemBenchPrefix)-1;
+        uint32_t kib=0,mib=0;
+        const bool random=Prefix(p,"rand ");
+        if(random)p+=5;
+        else if(Prefix(p,"seq "))p+=4;
+        else p="";
+        if(!Decimal(p,kib) || *p!=' ' || !Decimal(++p,mib) || *p ||
+           kib<4 || kib>4096 || (kib&(kib-1)) || (random && kib!=4) ||
+           !mib || mib>256 || (mib*1024)%kib) {
+            DebugChannelSend("{\"usb_system_bench_error\":\"Expected seq KiB MiB or rand 4 MiB (MiB 1..256)\"}\n");
+            return true;
+        }
+        const auto usb=UsbSystemRead();
+        const uint32_t bytes=kib*1024,pages=bytes/4096;
+        const uint64_t extent=usb.sectors*512,total=uint64_t(mib)*1024*1024;
+        if(!usb.mounted || usb.uncertain || total>extent) {
+            DebugChannelSend("{\"usb_system_bench_error\":\"No healthy mounted USB system extent\"}\n");
+            return true;
+        }
+        auto buffer=VmmAllocPages(pages);
+        if(!buffer) {DebugChannelSend("{\"usb_system_bench_error\":\"No buffer\"}\n");return true;}
+        auto now=[]()->uint64_t {const auto ns=AudioClockNowNs();return ns?ns:ApicTickCount()*1000000;};
+        UsbStorageTiming before{},after{};const bool timed=UsbSystemTiming(&before);
+        const auto start=now();
+        uint64_t done=0,maxNs=0,state=0x5e120abbdc1e600dull;
+        int error=0;
+        while(done<total) {
+            state^=state<<13;state^=state>>7;state^=state<<17;
+            const uint64_t at=random?(state%(extent/bytes))*bytes:done;
+            const auto began=now();
+            const int n=UsbSystemBenchRead(at,reinterpret_cast<void*>(buffer.raw()),bytes);
+            const auto ended=now();
+            if(ended>=began && ended-began>maxNs)maxNs=ended-began;
+            if(n!=int(bytes)){error=n<0?n:-5;break;}
+            done+=n;
+        }
+        const auto end=now();
+        VmmFreePages(buffer,pages);
+        Reply r;r.text("{\"usb_system_bench_api\":1,");
+        r.field("bytes",done);r.text(",");r.field("requests",done/bytes);r.text(",");
+        r.field("duration_ns",end>=start?end-start:0);r.text(",");r.field("max_request_ns",maxNs);
+        r.text(",\"errno\":");r.number(uint64_t(-error));
+        if(timed && UsbSystemTiming(&after)) {
+            r.text(",");r.field("commands",after.commands-before.commands);
+            r.text(",");r.field("cbw_ns",after.command.totalNs-before.command.totalNs);
+            r.text(",");r.field("data_ns",after.data.totalNs-before.data.totalNs);
+            r.text(",");r.field("csw_ns",after.status.totalNs-before.status.totalNs);
+        }
+        r.text("}\n");r.send();return true;
     }
     // Read-only sequential read benchmark of the boot stick (whole disk from
     // LBA 0, 4 MiB requests): sizes the live-store copy. Nothing is written.

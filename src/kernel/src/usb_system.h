@@ -1,6 +1,6 @@
 #pragma once
 
-#include <stdint.h>
+#include "device.h"
 
 namespace brook {
 struct Device;
@@ -20,4 +20,6 @@ struct UsbSystemStatus {
     char partitionGuid[33]{}, fsUuid[33]{};
 };
 UsbSystemStatus UsbSystemRead();
+bool UsbSystemTiming(UsbStorageTiming* out);
+int UsbSystemBenchRead(uint64_t at,void* data,uint32_t bytes);
 }

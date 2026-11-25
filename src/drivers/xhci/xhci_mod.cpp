@@ -1150,6 +1150,7 @@ struct XhciDevice {
     uint32_t mscTag;            // CBW tag counter
     void* mscCommandBuffer;     // one persistent CBW/CSW page, serialized below
     uint64_t mscCommandBufferPhys;
+    UsbStorageTiming mscTiming; // g_mscCommandLock
     uint64_t mscSectorCount;    // total sectors
     uint32_t mscBlockSize;      // bytes per sector (usually 512)
 
@@ -2681,6 +2682,35 @@ struct XhciMscResult {
     bool transport=false;uint8_t status=0;uint32_t actual=0,residue=0;UsbScsiSense sense{};
     bool success()const{return transport&&status==0;}
 };
+static uint64_t MscNowNs() {
+    const auto precise=AudioClockNowNs();
+    return precise?precise:ApicTickCount()*1000000;
+}
+
+struct MscCommandTiming {
+    UsbStorageTiming& stats;
+    uint32_t bytes;
+    uint64_t start=MscNowNs(), cbw=0, data=0, csw=0;
+    bool completed=false;
+    static void Record(UsbPhaseTiming& row,uint64_t ns) {
+        row.lastNs=ns;row.totalNs+=ns;
+        if(ns>row.maxNs)row.maxNs=ns;
+    }
+    uint64_t Lap() {
+        const auto now=MscNowNs();
+        const auto elapsed=now>=start?now-start:0;
+        start=now;
+        return elapsed;
+    }
+    ~MscCommandTiming() {
+        ++stats.commands;
+        if(!completed)++stats.errors;
+        else stats.dataBytes+=bytes;
+        stats.lastBytes=bytes;
+        Record(stats.command,cbw);Record(stats.data,data);Record(stats.status,csw);
+    }
+};
+
 // Caller holds g_mscCommandLock through the original command and REQUEST SENSE.
 static XhciMscResult XhciMscCommandLocked(XhciController& ctrl,XhciDevice& dev,
     const uint8_t* cdb,uint8_t cdbLen,void* data,uint64_t dataPhys,uint32_t dataLen,
@@ -2707,8 +2737,11 @@ static XhciMscResult XhciMscCommandLocked(XhciController& ctrl,XhciDevice& dev,
 
     __asm__ volatile("mfence" ::: "memory");
 
+    MscCommandTiming timing{dev.mscTiming,dataLen};
     // 1. Send CBW via Bulk OUT
-    if (!XhciBulkTransfer(ctrl, dev, false, cbw, cbwPhys, sizeof(UsbMscCbw))) {
+    const bool sent=XhciBulkTransfer(ctrl, dev, false, cbw, cbwPhys, sizeof(UsbMscCbw));
+    timing.cbw=timing.Lap();
+    if (!sent) {
         __atomic_store_n(&dev.mscQuarantined,true,__ATOMIC_RELEASE);
         KPrintf("xhci: MSC CBW failed opcode=%x bytes=%u; transport quarantined\n",unsigned(cdb[0]),dataLen);
         return {};
@@ -2717,7 +2750,9 @@ static XhciMscResult XhciMscCommandLocked(XhciController& ctrl,XhciDevice& dev,
     // 2. Data phase (if any)
     uint32_t actual=dataLen;
     if (dataLen > 0 && data) {
-        if (!XhciBulkTransfer(ctrl, dev, dataIn, data, dataPhys, dataLen,5000,allowShort?&actual:nullptr)) {
+        const bool transferred=XhciBulkTransfer(ctrl,dev,dataIn,data,dataPhys,dataLen,5000,allowShort?&actual:nullptr);
+        timing.data=timing.Lap();
+        if (!transferred) {
             __atomic_store_n(&dev.mscQuarantined,true,__ATOMIC_RELEASE);
             const uint32_t lba=cdbLen>=10?(uint32_t(cdb[2])<<24)|(uint32_t(cdb[3])<<16)|(uint32_t(cdb[4])<<8)|cdb[5]:0;
             KPrintf("xhci: MSC data %s failed opcode=%x bytes=%u tag=%u lba=%u; transport quarantined\n",dataIn?"IN":"OUT",unsigned(cdb[0]),dataLen,cbw->dCBWTag,lba);
@@ -2733,7 +2768,9 @@ static XhciMscResult XhciMscCommandLocked(XhciController& ctrl,XhciDevice& dev,
     memset(csw, 0, sizeof(UsbMscCsw));
 
     UsbMscCswReceive receive{ctrl,dev,csw,cswPhys};
-    if (!UsbBotReceiveCsw(receive)) {
+    const bool received=UsbBotReceiveCsw(receive);
+    timing.csw=timing.Lap();
+    if (!received) {
         __atomic_store_n(&dev.mscQuarantined,true,__ATOMIC_RELEASE);
         KPrintf("xhci: MSC CSW failed opcode=%x bytes=%u; transport quarantined\n",unsigned(cdb[0]),dataLen);
         return {};
@@ -2752,7 +2789,9 @@ static XhciMscResult XhciMscCommandLocked(XhciController& ctrl,XhciDevice& dev,
             unsigned(cdb[0]),csw->bCSWStatus,csw->dCSWDataResidue,actual,dataLen);
         return {};
     }
-    return {true,csw->bCSWStatus,dataLen-csw->dCSWDataResidue,csw->dCSWDataResidue,{}};
+    timing.completed=csw->bCSWStatus==0;
+    timing.bytes=dataLen-csw->dCSWDataResidue;
+    return {true,csw->bCSWStatus,timing.bytes,csw->dCSWDataResidue,{}};
 }
 
 static XhciMscResult XhciMscExecuteLocked(XhciController& ctrl,XhciDevice& dev,
@@ -2980,6 +3019,12 @@ static int UsbMscIoctl(Device* dev, uint32_t cmd, void* arg)
 {
     if (cmd == DEVICE_IOCTL_READ_ONLY) return g_storageReadOnly ? 1 : 0;
     auto* st=static_cast<UsbMscState*>(dev->priv);
+    if (cmd == DEVICE_IOCTL_USB_STORAGE_TIMING) {
+        if(!arg)return -22;
+        MscCommandGuard commandGuard;
+        *static_cast<UsbStorageTiming*>(arg)=g_devices[st->devIndex].mscTiming;
+        return 0;
+    }
     if (cmd == DEVICE_IOCTL_WRITE_FENCED) {
         const auto& device=g_devices[st->devIndex];
         return __atomic_load_n(&st->systemFailed,__ATOMIC_ACQUIRE) ||

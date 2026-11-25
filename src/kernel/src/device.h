@@ -43,6 +43,13 @@ static constexpr uint32_t DEVICE_IOCTL_USB_SYSTEM_WINDOW = 0x42460004;
 // A runtime failure has fenced a previously writable filesystem backing.
 // Optional, non-blocking, implemented by the USB system adapter only.
 static constexpr uint32_t DEVICE_IOCTL_WRITE_FENCED = 0x42460005;
+// Snapshot transport command timings; no device I/O.
+struct UsbPhaseTiming { uint64_t totalNs, maxNs, lastNs; };
+struct UsbStorageTiming {
+    uint64_t commands, errors, dataBytes, lastBytes;
+    UsbPhaseTiming command, data, status;
+};
+static constexpr uint32_t DEVICE_IOCTL_USB_STORAGE_TIMING = 0x42460006;
 
 // ---- Generic device operations ----
 struct DeviceOps {
