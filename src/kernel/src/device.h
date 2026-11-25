@@ -48,12 +48,18 @@ struct UsbPhaseTiming { uint64_t totalNs, maxNs, lastNs; };
 struct UsbStorageTiming {
     uint64_t commands, errors, dataBytes, lastBytes;
     UsbPhaseTiming command, data, status;
+    uint64_t directBytes,uasFlights;
+    uint32_t uasPeakDepth;
 };
 static constexpr uint32_t DEVICE_IOCTL_USB_STORAGE_TIMING = 0x42460006;
 // Positive preferred size in bytes, or an unsupported error.
 static constexpr uint32_t DEVICE_IOCTL_PREFERRED_READ_BYTES = 0x42460007;
 static constexpr uint32_t DEVICE_IOCTL_USB_UNMAP_LIMITS = 0x42460008;
 static constexpr uint32_t DEVICE_IOCTL_USB_UNMAP = 0x42460009;
+// Internal read into exclusive, contiguous PMM pages. If retain is set
+// the caller must neither read nor free the allocation until reboot.
+static constexpr uint32_t DEVICE_IOCTL_USB_READ_DMA = 0x4246000a;
+struct UsbDmaRead { uint64_t offset,physical;uint32_t bytes;bool retain; };
 static constexpr uint32_t UsbUnmapMaxRanges=16;
 struct UsbUnmapLimits { uint32_t maxSectors,maxRanges; };
 struct UsbUnmapBatch { const DeviceWriteWindow* ranges;uint32_t count; };

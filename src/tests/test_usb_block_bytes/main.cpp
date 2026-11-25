@@ -1,5 +1,6 @@
 #include "../../drivers/xhci/usb_block_bytes.h"
 #include "../../drivers/xhci/usb_scsi_unmap.h"
+#include "../../drivers/xhci/usb_uas.h"
 #include <vector>
 #include <cassert>
 #include <cstring>
@@ -40,8 +41,33 @@ static void Unmap() {
     assert(!ScsiEncodeUnmap(encoded,limits,ranges,2));
 }
 
+static void Uas() {
+    std::vector<uint8_t> cfg={9,2,0,0,1,1,0,0x80,0,9,4,2,1,4,8,6,0x62,0};
+    const uint8_t endpoints[]={1,0x82,0x83,4};
+    for(uint8_t pipe=0;pipe<4;++pipe) {
+        const uint8_t block[]={7,5,endpoints[pipe],2,0,4,0,
+            6,0x30,15,uint8_t(pipe?5:0),0,0,4,0x24,uint8_t(pipe+1),0};
+        cfg.insert(cfg.end(),block,block+sizeof(block));
+    }
+    UsbUasConfig parsed{};
+    assert(UsbUasParse(cfg.data(),cfg.size(),2,parsed));
+    assert(parsed.interface==2 && parsed.alternate==1 && parsed.pipes[UasDataOut].address==4);
+    assert(!UsbUasParse(cfg.data(),cfg.size(),3,parsed));
+    assert(!UsbUasParse(cfg.data(),cfg.size()-1,2,parsed));
+    cfg[18+17+7+3]=1; // status endpoint offers only two streams
+    assert(!UsbUasParse(cfg.data(),cfg.size(),2,parsed));
+    uint8_t iu[16]={3,0,0,4};
+    uint8_t status=0;
+    uint32_t sense=0;
+    assert(UsbUasStatus(iu,sizeof(iu),4,status,sense) && !status && !sense);
+    assert(!UsbUasStatus(iu,sizeof(iu),3,status,sense));
+    iu[15]=1;
+    assert(!UsbUasStatus(iu,sizeof(iu),4,status,sense));
+}
+
 int main(){
     Unmap();
+    Uas();
     Disk large(4096);
     large.scratch.resize(1<<20);
     std::vector<uint8_t> largeRead((1<<20)+4096);

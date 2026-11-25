@@ -216,7 +216,7 @@ def available_port():
 
 
 def uas_boot_carrier(base, system, fallback):
-    # OVMF only has a BOT driver. Give firmware an IDE-compatible AHCI
+    # OVMF only has a BOT driver. Give firmware a read-only virtio
     # carrier with the same boot partition identity. Brook sees only the
     # UAS device's matching USB GPT entry, just as on the physical SSD.
     carrier = base / "firmware-boot.raw"
@@ -255,7 +255,7 @@ class Guest:
         if getattr(args, "uas", False):
             carrier = uas_boot_carrier(base, system, fallback)
             storage = ["-drive", f"if=none,format=raw,id=carrier,file={carrier},readonly=on",
-                       "-device", "ide-hd,bus=ide.0,drive=carrier,bootindex=1",
+                       "-device", "virtio-blk-pci,drive=carrier,bootindex=1",
                        "-device", "usb-uas,id=system-usb,bus=usb.0,port=2",
                        "-device", "scsi-hd,bus=system-usb.0,drive=system"]
         else:

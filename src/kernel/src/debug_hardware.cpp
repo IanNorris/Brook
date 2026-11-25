@@ -915,6 +915,9 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
                 r.text(",");r.field("errors",timing.errors);
                 r.text(",");r.field("data_bytes",timing.dataBytes);
                 r.text(",");r.field("last_bytes",timing.lastBytes);
+                r.text(",");r.field("direct_bytes",timing.directBytes);
+                r.text(",");r.field("uas_flights",timing.uasFlights);
+                r.text(",");r.field("uas_peak_depth",timing.uasPeakDepth);
                 auto phase=[&](const char* label,const UsbPhaseTiming& p) {
                     r.text(",");r.quoted(label);r.text(":{");
                     r.field("total_ns",p.totalNs);r.text(",");r.field("max_ns",p.maxNs);

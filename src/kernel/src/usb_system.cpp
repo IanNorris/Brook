@@ -74,10 +74,22 @@ int Write(Device* owner,uint64_t offset,const void* data,uint64_t size) {
     const int result=DeviceWriteLeased(disk,owner,systemWindow.start+offset,data,size);
     return result==int(size)?result:IoError(result);
 }
-int Control(Device*,uint32_t request,void*) {
+int Control(Device*,uint32_t request,void* argument) {
     if(request==DEVICE_IOCTL_READ_ONLY)return 0;
     if(request==DEVICE_IOCTL_PREFERRED_READ_BYTES)
         return disk->ops->ioctl(disk,request,nullptr);
+    if(request==DEVICE_IOCTL_USB_READ_DMA) {
+        if(!argument)return -22;
+        auto& relative=*static_cast<UsbDmaRead*>(argument);
+        if(!RangeValid(relative.offset,relative.bytes))return -22;
+        if(IsUncertain())return -5;
+        UsbDmaRead absolute{systemWindow.start+relative.offset,relative.physical,relative.bytes,false};
+        const int result=disk->ops->ioctl(disk,request,&absolute);
+        relative.retain=absolute.retain;
+        if(result==-95)return result;
+        __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED);
+        return result==int(relative.bytes)?result:IoError(result);
+    }
     if(request==DEVICE_IOCTL_WRITE_FENCED)return IsUncertain()?1:0;
     if(request!=DEVICE_IOCTL_FLUSH)return -95;
     if(IsUncertain() || !__atomic_load_n(&open,__ATOMIC_ACQUIRE))return -5;

@@ -2750,6 +2750,7 @@ struct MscCommandTiming {
     uint32_t bytes;
     uint64_t start=MscNowNs(), cbw=0, data=0, csw=0;
     bool completed=false;
+    unsigned commands=1;
     static void Record(UsbPhaseTiming& row,uint64_t ns) {
         row.lastNs=ns;row.totalNs+=ns;
         if(ns>row.maxNs)row.maxNs=ns;
@@ -2761,8 +2762,8 @@ struct MscCommandTiming {
         return elapsed;
     }
     ~MscCommandTiming() {
-        ++stats.commands;
-        if(!completed)++stats.errors;
+        stats.commands+=commands;
+        if(!completed)stats.errors+=commands;
         else stats.dataBytes+=bytes;
         stats.lastBytes=bytes;
         Record(stats.command,cbw);Record(stats.data,data);Record(stats.status,csw);
@@ -2908,6 +2909,9 @@ static XhciMscResult XhciUasExecute(XhciController& ctrl,XhciDevice& dev,
             total+=req.size;
         }
         MscCommandTiming timing{dev.mscTiming,total};
+        timing.commands=count;
+        ++dev.mscTiming.uasFlights;
+        if(count>dev.mscTiming.uasPeakDepth)dev.mscTiming.uasPeakDepth=count;
         for(unsigned i=0;i<count;++i)
             if(!XhciUasSubmit(ctrl,dev,UasCommand,i,uas.bufferPhys+i*slotBytes,32,flight[i].command))return {};
         for(unsigned i=0;i<count;++i)
@@ -3217,13 +3221,16 @@ struct UsbMscByteTransport {
         return !__atomic_load_n(&dev.gone,__ATOMIC_ACQUIRE) &&
             !__atomic_load_n(&dev.mscQuarantined,__ATOMIC_ACQUIRE);
     }
-    bool transfer(uint64_t lba,uint32_t count,bool read) {
+    bool transfer(uint64_t lba,uint32_t count,bool read,uint64_t physical=0) {
         if(!usable())return false;
         uint8_t cdb[10]{};cdb[0]=read?SCSI_READ_10:SCSI_WRITE_10;
         cdb[2]=lba>>24;cdb[3]=lba>>16;cdb[4]=lba>>8;cdb[5]=lba;
         cdb[7]=count>>8;cdb[8]=count;
         const uint64_t bytes=uint64_t(count)*blockSize();
         auto& dev=g_devices[state->devIndex];
+        const bool direct=physical!=0;
+        if(!physical)physical=state->bouncePhys;
+        auto* buffer=direct?reinterpret_cast<uint8_t*>(PhysToVirt(PhysicalAddress(physical)).raw()):state->bounce;
         MscCommandGuard guard;
         if(dev.uas && count>=128 && bytes>=256*1024) {
             uint8_t commands[UsbUasDepth][10]{};
@@ -3238,14 +3245,19 @@ struct UsbMscByteTransport {
                 command[0]=cdb[0];
                 command[2]=at>>24;command[3]=at>>16;command[4]=at>>8;command[5]=at;
                 command[7]=blocks>>8;command[8]=blocks;
-                requests[i]={command,state->bouncePhys+uint64_t(queued)*blockSize(),blocks*blockSize(),10};
+                requests[i]={command,physical+uint64_t(queued)*blockSize(),blocks*blockSize(),10};
                 queued+=blocks;
             }
-            return XhciUasExecute(*state->ctrl,dev,requests,UsbUasDepth,read).success();
+            const bool ok=XhciUasExecute(*state->ctrl,dev,requests,UsbUasDepth,read).success();
+            if(ok) {
+                StorageIoAccount(uint32_t(StorageIoSource::Usb),read?0:1,bytes);
+                if(direct)dev.mscTiming.directBytes+=bytes;
+            }
+            return ok;
         }
         auto execute=[&] {
             return XhciMscExecuteLocked(*state->ctrl,dev,cdb,10,
-                state->bounce,state->bouncePhys,uint32_t(bytes),read);
+                buffer,physical,uint32_t(bytes),read);
         };
         auto result=execute();
         // A current ABORTED COMMAND with a completed BOT exchange can
@@ -3254,7 +3266,10 @@ struct UsbMscByteTransport {
         if(state->windows.system.length && read && usable() && result.transport &&
            result.status==1 && result.sense.current && result.sense.key==0xb)
             result=execute();
-        if(result.success())StorageIoAccount(uint32_t(StorageIoSource::Usb),read?0:1,bytes);
+        if(result.success()) {
+            StorageIoAccount(uint32_t(StorageIoSource::Usb),read?0:1,bytes);
+            if(direct)dev.mscTiming.directBytes+=bytes;
+        }
         return result.success();
     }
     bool readBlocks(uint64_t lba,uint32_t count) {return transfer(lba,count,true);}
@@ -3288,6 +3303,24 @@ static int UsbMscWrite(Device* dev,uint64_t offset,const void* buf,uint64_t len)
     const int result=UsbBlockWriteBytes(io,offset,buf,len);
     if(result==-5 || (result>=0 && uint64_t(result)!=len))UsbMscFenceSystem(*state);
     return result;
+}
+
+static int UsbMscReadDma(UsbMscState& state,XhciDevice& device,UsbDmaRead& request) {
+    MscIoGuard guard;
+    UsbMscByteTransport io{&state};
+    const uint32_t block=io.blockSize();
+    const uint64_t limit=g_dma32?(4ull<<30):(16ull<<30);
+    if(!request.physical || request.physical>=limit || request.bytes>limit-request.physical ||
+       !block || request.bytes>io.bounceBytes() || request.bytes%block || request.offset%block)
+        return -95;
+    if(!UsbWriteWindows::Contains(state.windows.system,request.offset,request.bytes))return -30;
+    if(!io.usable() || __atomic_load_n(&state.systemFailed,__ATOMIC_ACQUIRE))return -5;
+    if(io.transfer(request.offset/block,request.bytes/block,true,request.physical))return request.bytes;
+    // A transport failure may leave the xHC holding a pointer into the
+    // caller's allocation. Neither the allocator nor the caller may reuse it.
+    request.retain=__atomic_load_n(&device.mscQuarantined,__ATOMIC_ACQUIRE);
+    UsbMscFenceSystem(state);
+    return -5;
 }
 
 static int UsbMscUnmapLimits(UsbMscState& state,XhciDevice& dev) {
@@ -3346,6 +3379,8 @@ static int UsbMscIoctl(Device* dev, uint32_t cmd, void* arg)
         *static_cast<UsbStorageTiming*>(arg)=g_devices[st->devIndex].mscTiming;
         return 0;
     }
+    if(cmd==DEVICE_IOCTL_USB_READ_DMA)
+        return arg?UsbMscReadDma(*st,g_devices[st->devIndex],*static_cast<UsbDmaRead*>(arg)):-22;
     if(cmd==DEVICE_IOCTL_USB_UNMAP_LIMITS || cmd==DEVICE_IOCTL_USB_UNMAP)
         return UsbMscUnmap(*st,g_devices[st->devIndex],cmd,arg);
     if (cmd == DEVICE_IOCTL_PREFERRED_READ_BYTES) return UsbMscByteTransport{st}.bounceBytes();

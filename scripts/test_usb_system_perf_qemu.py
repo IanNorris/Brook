@@ -13,7 +13,8 @@ import test_usb_system_qemu as fixture
 
 def timing_delta(before, after):
     return {key: after["timing"][key] - before["timing"][key]
-            for key in ("commands", "data_bytes", "errors")}
+            for key in ("commands", "data_bytes", "errors", "direct_bytes", "uas_flights")
+            if key in before["timing"]}
 
 
 def measure_job(guest, command):
@@ -82,6 +83,8 @@ def main():
             assert row["bytes"] == mib * (1 << 20) and row["errno"] == 0 and row["duration_ns"] > 0, row
             rows[f"{mode}-{kib}"] = row
         result["raw"] = rows
+        if args.uas:
+            assert guest.status()["timing"]["uas_peak_depth"] == 4
         record()
         dd = "/nix/profile/bin/dd"
         command = f'{dd} if={shlex.quote(args.cold_file)} of=/dev/null bs=1M count=64 status=none'

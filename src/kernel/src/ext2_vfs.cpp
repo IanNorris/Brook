@@ -554,7 +554,14 @@ struct Ext2RawBackend {
     }
     bool Flush(){return DeviceFlush(mnt->dev)==0;}
 };
-static bool Ext2DevRead(Ext2Mount* mnt,uint64_t offset,void* buffer,uint64_t length) {
+static bool Ext2DevRead(Ext2Mount* mnt,uint64_t offset,void* buffer,uint64_t length,
+                        uint64_t physical=0,bool* retain=nullptr) {
+    if(physical && !mnt->writeback.count && !mnt->writeback.retry && mnt->dev->ops->ioctl) {
+        UsbDmaRead request{offset,physical,uint32_t(length),false};
+        const int result=mnt->dev->ops->ioctl(mnt->dev,DEVICE_IOCTL_USB_READ_DMA,&request);
+        if(retain && request.retain)*retain=true;
+        if(result!=-95)return result==int(length);
+    }
     Ext2RawBackend io{mnt};
     const bool ok=mnt->writeback.bytes?mnt->writeback.Read(io,offset,buffer,length):io.Read(offset,buffer,length);
     if(!ok)SerialPrintf("ext2: DevRead FAIL off=%lu len=%lu\n",offset,length);
@@ -590,7 +597,8 @@ struct Ext2BlockLookup {
 };
 static Ext2BlockLookup Ext2BlockMap(Ext2Mount* mnt, const Ext2Inode* ino, uint32_t fileBlock);
 static int Ext2ReadInodeData(Ext2Mount* mnt, const Ext2Inode* ino,
-                             void* buf, uint64_t len, uint64_t offset);
+                             void* buf, uint64_t len, uint64_t offset,
+                             uint64_t physical=0,bool* retain=nullptr);
 static uint32_t Ext2DirLookup(Ext2Mount* mnt, uint32_t parentIno, const Ext2Inode* dirIno, const char* name, int* error=nullptr);
 static uint32_t Ext2ResolvePath(Ext2Mount* mnt, uint32_t startIno,
                                 const char* path, int symlinkDepth, int* error=nullptr);
@@ -2021,7 +2029,8 @@ static Ext2BlockLookup Ext2BlockMap(Ext2Mount* mnt, const Ext2Inode* ino, uint32
 // the run usually spans the whole request — collapsing dozens of
 // per-block virtio round-trips into a single 64KB transfer.
 static int Ext2ReadInodeData(Ext2Mount* mnt, const Ext2Inode* ino,
-                             void* buf, uint64_t len, uint64_t offset)
+                             void* buf, uint64_t len, uint64_t offset,
+                             uint64_t physical,bool* retain)
 {
     uint64_t fileSize = Ext2InodeSize(ino);
     if (offset >= fileSize) {
@@ -2112,7 +2121,7 @@ static int Ext2ReadInodeData(Ext2Mount* mnt, const Ext2Inode* ino,
 
         uint64_t runBytes = static_cast<uint64_t>(runBlocks) << mnt->blockShift;
         uint64_t runOff   = static_cast<uint64_t>(diskBlock) << mnt->blockShift;
-        if (!Ext2DevRead(mnt, runOff, dst + bytesRead, runBytes)) {
+        if (!Ext2DevRead(mnt,runOff,dst+bytesRead,runBytes,physical?physical+bytesRead:0,retain)) {
             SerialPrintf("ext2: coalesced read failed off=%lu len=%lu\n",
                          runOff, runBytes);
             error = -5;
@@ -2308,6 +2317,9 @@ static uint32_t Ext2ResolvePath(Ext2Mount* mnt, uint32_t startIno,
 
 static int Ext2FileOpen(Vnode* vn, int flags) { (void)vn; (void)flags; return 0; }
 
+static int Ext2FileReadKernel(Vnode* vn,void* buf,uint64_t len,uint64_t* offset,
+                              uint64_t physical=0,bool* retain=nullptr);
+
 static int Ext2FileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
 {
     // User memory can fault even after syscall validation (notably a fork's
@@ -2316,33 +2328,56 @@ static int Ext2FileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
     // is itself waiting for those locks with interrupts disabled.
 #if !defined(BROOK_HOST_TEST) || defined(BROOK_STANDALONE_TEST)
     if (len && reinterpret_cast<uint64_t>(buf) < 0x0000800000000000ULL) {
-        constexpr uint64_t MAX_BOUNCE = 64 * 1024;
-        uint64_t capacity = len < MAX_BOUNCE ? len : MAX_BOUNCE;
-        auto* bounce = static_cast<uint8_t*>(kmalloc(capacity));
-        if (!bounce) return -12;
+        constexpr uint64_t defaultBurst=64*1024;
+        const auto* fp=static_cast<const Ext2FilePriv*>(vn->priv);
+        uint64_t capacity=len<fp->mnt->readBurst?len:fp->mnt->readBurst;
+        // Only dedicated PMM pages can be held back after uncertain DMA.
+        // Stack, heap/slab and user-provided buffers stay on the copied path.
+        PhysicalAddress physical{};
+        uint32_t pages=0;
+        if(capacity>defaultBurst) {
+            pages=(capacity+4095)/4096;
+            physical=PmmAllocPagesAccounted(pages,MemTag::KernelData,KernelPid,PmmOwner::FsBuffers);
+            if(!physical)capacity=defaultBurst;
+        }
+        auto* bounce=physical?reinterpret_cast<uint8_t*>(PhysToVirt(physical).raw()):
+            static_cast<uint8_t*>(kmalloc(capacity));
+        if(!bounce)return -12;
+        bool retain=false;
         uint64_t done = 0;
         int error = 0;
         while (done < len) {
             uint64_t chunk = len - done;
             if (chunk > capacity) chunk = capacity;
-            int n = Ext2FileRead(vn, bounce, chunk, offset);
+            uint64_t next=*offset;
+            int n=Ext2FileReadKernel(vn,bounce,chunk,&next,physical.raw(),&retain);
+            if(retain) {error=-5;break;}
+            *offset=next;
             if (n <= 0) { error = n; break; }
             // The recursive kernel-buffer read has released all FS locks.
             memcpy(static_cast<uint8_t*>(buf) + done, bounce, static_cast<uint64_t>(n));
             done += static_cast<uint64_t>(n);
             if (static_cast<uint64_t>(n) < chunk) break;
         }
-        kfree(bounce);
+        if(physical) {
+            if(!retain)for(uint32_t i=0;i<pages;++i)PmmFreePage(physical+uint64_t(i)*4096);
+        } else kfree(bounce);
         return done ? static_cast<int>(done) : error;
     }
 #endif
+    return Ext2FileReadKernel(vn,buf,len,offset);
+}
+
+static int Ext2FileReadKernel(Vnode* vn,void* buf,uint64_t len,uint64_t* offset,
+                              uint64_t physical,bool* retain)
+{
     auto* fp = static_cast<Ext2FilePriv*>(vn->priv);
     KRwLockReadLock(&g_ext2Lock);
     Ext2Inode data;
     if (!Ext2ReadInode(fp->mnt, fp->inode, &data)) {
         KRwLockReadUnlock(&g_ext2Lock); return -5;
     }
-    int r = Ext2ReadInodeData(fp->mnt, &data, buf, len, *offset);
+    int r = Ext2ReadInodeData(fp->mnt,&data,buf,len,*offset,physical,retain);
     if (r > 0) *offset += r;
     KRwLockReadUnlock(&g_ext2Lock);
     // Relatime: avoid a metadata write for every read. Re-read under the
