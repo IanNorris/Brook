@@ -191,7 +191,7 @@ def embed_usb_profile_runtime(args, initrd, profile):
     import zipfile
 
     helper = (profile / 'bin/brook-stage-profile').resolve(strict=True)
-    lines = helper.read_text().splitlines()
+    lines = helper.read_text().strip().splitlines()
     if len(lines) != 3 or not lines[1].startswith('export BROOK_STAGE_OPENSSL='):
         raise ValueError('Unexpected selected-profile launcher')
     openssl = lines[1].split('=', 1)[1]
