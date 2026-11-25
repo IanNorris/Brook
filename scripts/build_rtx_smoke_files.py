@@ -144,7 +144,7 @@ def stick_set(kernel, initrd, payload_id):
     return raw + struct.pack('<I', zlib.crc32(raw))
 
 
-def build_helpers(build_root, initrd, policy_file, signer_hex):
+def build_helpers(build_root, initrd, policy_file, signer_hex, *, usb_profiles=False):
     """Static musl helpers with the v3 policy digest; the signer public key."""
     vendor = ROOT / 'src/third_party/monocypher'
     objects = []
@@ -159,9 +159,13 @@ def build_helpers(build_root, initrd, policy_file, signer_hex):
     signer.write_text(signer_hex + '\n')
     run(['mcopy', '-o', '-i', initrd, signer, '::/ETC/rtx-update-signer'])
     digests = {}
-    for name, source in HELPERS.items():
+    helpers = dict(HELPERS)
+    if usb_profiles:
+        helpers['HWBULK.ELF'] = 'tools/hardware_bulk.c'
+    for name, source in helpers.items():
         binary = build_root / name
-        run([os.environ['MUSL_CC'], *flags, ROOT / source, *objects, '-o', binary])
+        definitions = ['-DBROOK_BULK_USB_PROFILE'] if name == 'HWBULK.ELF' else []
+        run([os.environ['MUSL_CC'], *flags, *definitions, ROOT / source, *objects, '-o', binary])
         run(['mcopy', '-o', '-i', initrd, binary, '::/BOOT/' + name])
         if subprocess.check_output(['mtype', '-i', initrd, '::/BOOT/' + name]) != binary.read_bytes():
             raise SystemExit(name + ' readback mismatch')
@@ -333,7 +337,7 @@ def build(args):
         init_rc_bytes, live = desktop_payload(args, initrd)
     init_rc.write_bytes(init_rc_bytes)
     run(['mcopy', '-o', '-i', initrd, init_rc, '::BOOT/INIT.RC'])
-    helpers = build_helpers(args.build_root, initrd, operators, signer_hex)
+    helpers = build_helpers(args.build_root, initrd, operators, signer_hex, usb_profiles=bool(args.usb_system))
     etc = etc_listing(initrd)
     unexpected = sorted(set(etc) - ETC_ALLOWED)
     if unexpected or not set(MARKERS) <= set(etc):

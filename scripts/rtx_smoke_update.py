@@ -233,8 +233,9 @@ class Run:
         if guest.get('auth_mode') != 'v3':
             raise RuntimeError('Profile updates require a v3 session')
         state = self.bridge.command(session, 'bridge hardware caps').get('usb_system', {})
-        if not state.get('mounted') or not state.get('window_open') or state.get('uncertain'):
-            raise RuntimeError('Profile updates require a writable, admitted BROOK_SYSTEM')
+        if (not state.get('mounted') or not state.get('window_open') or state.get('uncertain')
+                or not state.get('profile_transfer_ready')):
+            raise RuntimeError('Profile updates require a writable BROOK_SYSTEM with its transfer bind active')
         return state
 
     def profile_bootstrap(self, session):

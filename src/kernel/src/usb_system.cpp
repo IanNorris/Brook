@@ -267,6 +267,7 @@ static int BindProfileTransfer() {
     VfsPathRelease(var);
     VfsPathRelease(nix);
     VfsPathRelease(root);
+    boot.profileTransferReady = !error;
     return error;
 }
 
@@ -335,7 +336,7 @@ bool UsbSystemBoot(uint8_t* nextDrive,bool scanComplete) {
         return Fail(details.check,details.status);
     }
     if (const int transferError = BindProfileTransfer())
-        return Fail("profile-transfer-bind", transferError);
+        KPrintf("usb-system: profile transfer unavailable (bind error %d)\n", transferError);
     if(!session.Arm())__builtin_trap();
     ready=true;
     boot.mounted=true;boot.dirty=true;boot.stage="ready";

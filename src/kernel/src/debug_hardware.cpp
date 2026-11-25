@@ -899,6 +899,7 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
             r.text(",\"usb_system\":{\"configured\":true");
             boolean("record_valid",usb.parsed);boolean("window_open",usb.window);
             boolean("mounted",usb.mounted);boolean("dirty",usb.dirty);boolean("clean",usb.clean);
+            boolean("profile_transfer_ready",usb.profileTransferReady);
             boolean("uncertain",usb.uncertain);boolean("final_sync_attempted",usb.finalAttempted);
             r.text(",\"stage\":");r.quoted(usb.stage);
             r.text(",\"disk\":");signedNumber(usb.disk);

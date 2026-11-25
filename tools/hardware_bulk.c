@@ -370,7 +370,13 @@ int main(int argc,char** argv){
     port=(unsigned)atoi(p);if(!port||port>65535)return 2;
 #else
     if(geteuid()!=0)return 3;
-    int marker=open("/etc/hardware-maintenance",O_RDONLY|O_NOFOLLOW|O_CLOEXEC);if(marker<0)return 3;close(marker);
+#ifdef BROOK_BULK_USB_PROFILE
+    int marker=open("/etc/usb-profile-plan.pub",O_RDONLY|O_NOFOLLOW|O_CLOEXEC);
+#else
+    int marker=open("/etc/hardware-maintenance",O_RDONLY|O_NOFOLLOW|O_CLOEXEC);
+#endif
+    if(marker<0)return 3;
+    close(marker);
 #endif
     char key[33]={0};
 #ifdef BROOK_BRIDGE_V3
