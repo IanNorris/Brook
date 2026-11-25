@@ -30,6 +30,7 @@
 #include "nv_gsp/nv_gsp_bar1.h"
 #include "nv_gsp/nv_gsp_m2.h"
 #include "nv_gsp/nv_gsp_m3.h"
+#include "nv_gsp/nv_gsp_ce_present.h"
 #include "nv_disp_live.h"
 #include "platform_power.h"
 #include "serial.h"
@@ -101,7 +102,28 @@ struct Bar0Bus {
         if (logN >= kLog) { ++dropped; return; }
         log[logN++] = Rec{op, off, v, 1, phase, step};
     }
+    // The PRAMIN window (BAR0 0x700000, 1 MiB) gets one contiguous UC alias: page tables and
+    // the CE presenter's back-buffer remaps touch far more of it than the single-page slots hold.
+    VirtualAddress pramin{}; bool praminFailed = false;
+    volatile uint32_t* MapPramin(uint32_t off) {
+        if (!pramin.raw() && !praminFailed) {
+            VirtualAddress v = VmmAllocPages(256, VMM_WRITABLE | VMM_NO_EXEC, MemTag::Device, KernelPid);
+            praminFailed = !v;
+            for (uint32_t i = 0; v && i < 256; ++i) {
+                const VirtualAddress pv(v.raw() + i * 4096ull);
+                const auto leaf = VmmDetachPage(KernelPageTable, pv); if (leaf) PmmFreePage(VmmLeafPhysical(leaf));
+                __asm__ volatile("invlpg (%0)" ::"r"(pv.raw()) : "memory");
+                if (!VmmMapPage(KernelPageTable, pv, PhysicalAddress(bar0 + 0x700000 + i * 4096ull),
+                                VMM_WRITABLE | VMM_NO_EXEC | VMM_CACHE_DISABLE | VMM_WRITE_THRU, MemTag::Device, KernelPid)) {
+                    praminFailed = true; break; }
+            }
+            if (!praminFailed) pramin = v;
+        }
+        if (!pramin.raw()) { failed = true; return nullptr; }
+        return reinterpret_cast<volatile uint32_t*>(pramin.raw() + (off - 0x700000));
+    }
     volatile uint32_t* Map(uint32_t off) {
+        if (off >= 0x700000 && off < 0x800000 && bar0) return MapPramin(off);
         const uint64_t p = (bar0 + off) & ~0xfffull;
         for (uint32_t i = 0; i < used; ++i) if (page[i] == p) return reinterpret_cast<volatile uint32_t*>(va[i].raw() + (off & 0xfff));
         if (used >= kSlots) { failed = true; return nullptr; }
@@ -493,11 +515,14 @@ bool FiniReady(Out* o) {
     g_fc.ready = true;
     return true;
 }
+bool CePresentStop(bool wait_lock, uint32_t* freed);   // CE present section below
 struct FiniOutcome { bool rm = false; RmFiniResult rmf; FiniResult r; };
 FiniOutcome FiniCore(uint64_t rm_budget_us) {
     FiniOutcome x;
     x.rm = g_rmRunning;
     if (x.rm) {   // GSP-RM is up (p4 this boot): UNLOADING_GUEST_DRIVER first, then the P3b sequence
+        uint32_t ceFreed = 0;
+        (void)CePresentStop(rm_budget_us > 2000000, &ceFreed);   // no CE submissions once RM starts to unload
         g_finiDone = true;
         x.rmf = RmUnload(rm_budget_us);
         g_rmRunning = false;
@@ -839,6 +864,7 @@ void Bar1Verb(int mode, uint8_t shift) {
 
 // ------------------------------------------------------------------ P5 (M2)
 bool g_p5Done = false;
+CePresent g_cePresentState;   // `ce-present on`: the kept CE channel
 const char* Find(const char* h, const char* n) {
     for (; *h; ++h) { uint32_t i = 0; while (n[i] && h[i] == n[i]) ++i; if (!n[i]) return h; }
     return nullptr;
@@ -868,6 +894,7 @@ void P5(uint32_t chid, bool dev, bool m3 = false) {
     const ChipOps* c = ChipForBoot0(g_bus.rd32(0));
     if (!c || !g_rmRunning || !g_staticValid) { o.ks("refused", "GSP-RM is not running this boot"); o.send(); return; }
     if (g_p5Done) { o.ks("refused", "already ran this boot (done, or objects left behind)"); o.send(); return; }
+    if (g_cePresentState.k.kept) { o.ks("refused", "ce-present holds the M2 handles (ce-present off first)"); o.send(); return; }
     M2Inputs in;
     in.si = g_static;
     in.vram_lo = 0x100000000ull; in.vram_hi = in.vram_lo + (1u << 20);   // 4 GiB: far from the display buffers (< 256 MiB)
@@ -934,6 +961,118 @@ void P5(uint32_t chid, bool dev, bool m3 = false) {
     o.send();
 }
 
+// ------------------------------------------------------------------ CE present (head 0)
+// `ce-present on`: a kept TURING_DMA_COPY_A channel (RunM2 + CeExtra; its own VRAM arena at
+// 4 GiB + 128 MiB), then nv-disp's head-0 presents go through CePresentHook. `off` and every
+// RM fini (verb or pre-reset) clear the hook under the nv-aux lock first, then free the objects.
+uint32_t g_ceOnUs = 0; const char* g_ceOnStatus = "never"; const ChipOps* g_ceChip = nullptr;
+struct CeHookSync { void operator()() {
+    FlushRange(g_cePresentState.in.gpfifo.cpu, 0x1000); FlushRange(g_cePresentState.in.push.cpu, 0x1000); } };
+int CePresentHook(const NvCeJob& job, uint64_t* bytes) {   // nv-aux lock held (FlipPendingLocked)
+    const ChipOps* c = g_ceChip;
+    if (!c || !g_rmRunning) return 0;
+    Pramin<Bar0Bus> pr(g_bus, *c);
+    PraminIo vio{pr};
+    CeHookSync sync;
+    auto v2p = [](uintptr_t a) -> uint64_t {
+        const PhysicalAddress p = VmmVirtToPhys(KernelPageTable, VirtualAddress(a));
+        return p ? p.raw() : 0; };
+    auto poll = [] { __asm__ volatile("pause"); };
+    const bool rec = g_bus.rec; g_bus.rec = false;
+    const int r = CePresentRun(g_bus, *c, vio, g_cePresentState, job, v2p, sync, poll, bytes);
+    g_bus.rec = rec;
+    pr.Restore();
+    if (r < 0) {
+        g_cePresentState.active = false;
+        NvDispSetCePresent(nullptr);
+        KPrintf("nv-gsp: CE present failed (%s); CPU copies from now on\n", g_cePresentState.last_error);
+    }
+    return r;
+}
+// Clear the hook (nv-aux lock: no present is mid-submission afterwards), then free the objects
+// while RM runs. wait_lock=false (pre-reset): try the lock for 100 ms.
+bool CePresentStop(bool wait_lock, uint32_t* freed) {
+    *freed = 0;
+    if (!g_cePresentState.k.kept && !g_cePresentState.active) return true;
+    SpinLock* lock = NvAuxSharedLock();
+    bool held = false;
+    if (wait_lock) { SpinLockAcquire(lock); held = true; }
+    else { const uint64_t end = NowUs() + 100000; while (!(held = SpinLockTryAcquire(lock)) && NowUs() < end) __asm__ volatile("pause"); }
+    NvDispSetCePresent(nullptr);
+    g_cePresentState.active = false;
+    if (held) SpinLockRelease(lock);
+    if (g_cePresentState.k.kept && g_rmRunning && g_rm) {
+        RmWait wait; g_rm->wait_deadline_us = NowUs() + 1000000;
+        const ChipOps* c = ChipForBoot0(g_bus.rd32(0));
+        GspDoorbell<Bar0Bus, RmSync> bell{g_bus, *c, g_rmSync};
+        alignas(8) static uint8_t scratch[kRmApiBuf];
+        RmApi<RmWait, GspDoorbell<Bar0Bus, RmSync>> api(g_rm->ch, g_rm->rx, g_rm->rxcap, wait, bell, scratch);
+        *freed = M2FreeKept(g_cePresentState.k, api);
+    }
+    g_cePresentState.k.kept = false;
+    return held;
+}
+void CeStatsJson(Out& o) {
+    const CePresent& cp = g_cePresentState; const CeStats& st = cp.st;
+    o.kb("active", cp.active); o.kb("kept", cp.k.kept); o.kb("broken", cp.broken); o.ks("last_error", cp.last_error);
+    o.ks("on_status", g_ceOnStatus); o.kd("on_us", g_ceOnUs);
+    o.kd("frames", st.frames); o.kd("rects", st.rects); o.kd("bytes", st.bytes); o.kd("submits", st.submits);
+    o.kd("avg_us", st.submits ? st.us_sum / st.submits : 0); o.kd("max_us", st.us_max);
+    o.kd("remaps", st.remaps); o.kd("remap_us_max", st.remap_us_max); o.kd("map_pages", st.map_pages);
+    o.kd("refused", st.refused); o.kd("timeouts", st.timeouts); o.kd("slot", cp.slot);
+    o.kh("bb_lo", cp.bb_lo); o.kh("bb_hi", cp.bb_hi); o.kd("pt_pages", cp.k.pt_pages); o.kd("ptes", cp.k.ptes);
+    o.kh("arena_next", cp.k.arena.next);
+}
+void CePresentVerb(int mode) {   // 1 on, 2 off, 0 status
+    Out o; o.raw("{\"nv_gsp\":\"ce_present\"");
+    const ChipOps* c = ChipForBoot0(g_bus.rd32(0));
+    if (mode == 1) {
+        if (!c || !g_rmRunning || !g_staticValid) { o.ks("refused", "GSP-RM is not running this boot"); o.send(); return; }
+        if (!g_bar1Mapped) { o.ks("refused", "BAR1 is not identity-mapped (p4 keep-display)"); o.send(); return; }
+        if (g_cePresentState.k.kept || g_cePresentState.broken) { o.ks("refused", "already on, or failed this boot"); o.send(); return; }
+        CePresent& cp = g_cePresentState;
+        cp.in = M2Inputs{};
+        cp.in.keep = &cp.k; cp.in.si = g_static; cp.in.chid = kM2Chid;
+        cp.in.vram_lo = 0x108000000ull; cp.in.vram_hi = cp.in.vram_lo + (8u << 20);
+        auto sys = [](M2Sys* m) { DmaRegion d; if (!RmAlloc(0x1000, &d)) return false; m->cpu = d.cpu; m->bus = d.bus; m->bytes = d.bytes; return true; };
+        if (!sys(&cp.in.gpfifo) || !sys(&cp.in.push) || !sys(&cp.in.sem)) { o.ks("refused", "no sysmem"); o.send(); return; }
+        SpinLock* lock = NvAuxSharedLock();
+        SpinLockAcquire(lock);
+        Pramin<Bar0Bus> pr(g_bus, *c);
+        PraminIo vio{pr};
+        RmWait wait; g_rm->wait_deadline_us = NowUs() + 5000000;
+        GspDoorbell<Bar0Bus, RmSync> bell{g_bus, *c, g_rmSync};
+        auto mthd = [](uint32_t bytes, M2Sys* m) { DmaRegion d; if (!RmAlloc(bytes, &d)) return false;
+            m->cpu = d.cpu; m->bus = d.bus; m->bytes = d.bytes; return true; };
+        const uint64_t fenceEnd = NowUs() + 2000000;
+        auto fence = [&] { FlushRange(cp.in.sem.cpu, 64); g_bus.udelay(5); return NowUs() < fenceEnd; };
+        CeHookSync ss;
+        const uint64_t t0 = NowUs();
+        const M2Result m = RunM2(g_bus, *c, vio, cp.in, g_rm->ch, g_rm->rx, g_rm->rxcap, wait, bell, mthd, fence, ss, CeExtra{});
+        pr.Restore();
+        g_ceOnUs = uint32_t(NowUs() - t0);
+        g_ceOnStatus = m.status;
+        if (m.ok() && cp.k.kept) {
+            // touch every BAR0 page the hook uses, so it never adds a Bar0Bus slot at present time
+            (void)g_bus.rd32(c->reg_fb_flush); (void)g_bus.rd32(c->reg_mmu_inval_trigger);
+            (void)g_bus.rd32(c->reg_mmu_inval_pdb_lo); (void)g_bus.rd32(c->usermode);
+            g_ceChip = c; cp.active = true; NvDispSetCePresent(CePresentHook);
+        }
+        else cp.broken = true;
+        SpinLockRelease(lock);
+        o.ks("stage", m.stage); o.ks("status", m.status); o.kh("rm_status", m.rm_status); o.kh("ce_engine", m.ce_engine);
+        o.kd("runlist", m.runlist); o.kh("token", m.token); o.kd("allocated", m.allocated); o.kd("freed", m.freed);
+        o.kb("fence_ok", m.fence_ok); o.kd("events_rc", m.ev.rc); o.kd("events_mmu", m.ev.mmu_fault);
+        KPrintf("nv-gsp: CE present on: %s at %s (%u us)\n", m.status, m.stage, g_ceOnUs);
+    } else if (mode == 2) {
+        uint32_t freed = 0;
+        const bool held = CePresentStop(true, &freed);
+        o.kb("lock_held", held); o.kd("freed", freed);
+    }
+    CeStatsJson(o);
+    o.send();
+}
+
 // LOGINIT/LOGINTR/LOGRM: the put pointer and 1536 raw bytes at `off`
 // (libos-encoded records; decode host-side against the ELF's log sections).
 void Log(const char* which, uint32_t off) {
@@ -996,6 +1135,9 @@ bool NvGspHandle(const char* command) {
         if (chid < 1 || chid > 511) DebugChannelSend("{\"nv_gsp\":\"error\",\"msg\":\"chid 1..511\"}\n");
         else P5(chid, dev, m3);
     }
+    else if (!strcmp(verb, "ce-present on")) CePresentVerb(1);
+    else if (!strcmp(verb, "ce-present off")) CePresentVerb(2);
+    else if (!strcmp(verb, "ce-present status")) CePresentVerb(0);
     else if (!strncmp(verb, "log ", 4)) {
         char which[8]{}; uint32_t i = 0; const char* p = verb + 4;
         while (*p && *p != ' ' && i < 7) which[i++] = *p++;

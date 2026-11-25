@@ -483,7 +483,9 @@ private:
         return true;
     }
     size_t mmu_faults = 0;
+    bool host_stall = false;   // the engine stops making progress (doorbells stay queued)
     bool Host() {
+        if (host_stall) return true;
         namespace rm = brook::nvgsp::rm570;
         while (doorbells_seen < g_.doorbells.size()) {
             const uint32_t token = g_.doorbells[doorbells_seen++];

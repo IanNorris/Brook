@@ -9,6 +9,7 @@
 #include "nv_disp_runner.h"
 #include "nv_disp_head_runner.h"
 #include "nv_disp_driver.h"
+#include "nv_ce_present_api.h"
 #include "pci.h"
 #include "acpi.h"
 #include "boot_resource_map.h"
@@ -210,8 +211,14 @@ struct NvPresenterState{
     uint32_t* shadow=nullptr;bool shadowValid=false;
     DamageRects pending{};uint32_t deferred=0;   // changed (shadow updated) but not yet in VRAM
     uint64_t compared=0,copiedBytes=0,diffNs=0,copyNs=0;uint32_t unchanged=0,fullDiffs=0,copyMaxUs=0;
+    uint64_t vram[3]{};   // VRAM (== BAR1) offsets of px[]
+    // CE present path (head 0, `nv-gsp ce-present on`): frames the copy engine wrote, frames
+    // it gave back to the CPU, and the read-back check of sampled pixels.
+    uint64_t ceFrames=0,ceBytes=0,ceCpuFrames=0;uint32_t ceVerified=0,ceMismatch=0;
 };
 NvPresenterState g_presenter[nvdisp::kDriverOutputs]{};
+NvCePresentFn g_cePresent=nullptr;    // set/cleared under the nv-aux lock
+bool g_ceVerifyOff=false;             // a read-back mismatch turned the CE path off this boot
 // The compositor loop hook (completion, queued arms, wake time).
 uint64_t g_pollNs=0;uint32_t g_polls=0,g_pollMaxUs=0,g_pollBusy=0;
 // Loop timing (pacing diagnosis): the first head-0 present after each poll, against the
@@ -267,7 +274,31 @@ int FlipPendingLocked(uint32_t o,const uint32_t* src,uint32_t srcStride){
         for(int32_t y=y0;y<y1;++y)__builtin_memcpy(dst+uint64_t(y)*pitch+x0,src+uint64_t(y)*srcStride+x0,uint64_t(x1-x0)*4);
         bytes+=uint64_t(x1-x0)*4*uint32_t(y1-y0);
     };
-    (void)p.age.Apply(bb,p.pending,width,height,copy);
+    NvCePresentFn ce=(o==0&&!g_ceVerifyOff)?g_cePresent:nullptr;
+    if(ce){
+        // Collect the rectangles; the copy engine writes them (one submission), the CPU
+        // copies them if it cannot. Copying src->dst rectangles is order-independent.
+        static NvCeRect rects[256];uint32_t n=0;
+        auto collect=[&](const DamageRect& r){if(n<256)rects[n++]=NvCeRect{r.x0,r.y0,r.x1,r.y1};else copy(r);};
+        (void)p.age.Apply(bb,p.pending,width,height,collect);
+        uint64_t ceBytes=0;
+        const NvCeJob job{src,srcStride,width,height,p.vram[bb],pitch*4,rects,n};
+        const int r=n?ce(job,&ceBytes):1;
+        if(r==1){
+            bytes+=ceBytes;++p.ceFrames;p.ceBytes+=ceBytes;
+            // Spot-check through BAR1: the first 300 CE frames, then every 64th.
+            if(n&&(p.ceFrames<=300||!(p.ceFrames&63))){
+                for(uint32_t i=0;i<n&&i<4;++i){const NvCeRect& q=rects[i];
+                    const int32_t x1=q.x1>int32_t(width)?int32_t(width):q.x1,y1=q.y1>int32_t(height)?int32_t(height):q.y1;
+                    const int32_t x0=q.x0<0?0:q.x0,y0=q.y0<0?0:q.y0;if(x1<=x0||y1<=y0)continue;
+                    const int32_t xs[2]={x0,x1-1},ys[2]={y0,y1-1};
+                    for(int a=0;a<2;++a)for(int b2=0;b2<2;++b2){++p.ceVerified;
+                        if(dst[uint64_t(ys[b2])*pitch+xs[a]]!=src[uint64_t(ys[b2])*srcStride+xs[a]]){++p.ceMismatch;g_ceVerifyOff=true;}}}
+                if(g_ceVerifyOff){KPrintf("nv-display: CE present read-back mismatch; CPU copies from now on\n");
+                    for(uint32_t i=0;i<n;++i)copy(DamageRect{rects[i].x0,rects[i].y0,rects[i].x1,rects[i].y1});}
+            }
+        }else{++p.ceCpuFrames;for(uint32_t i=0;i<n;++i)copy(DamageRect{rects[i].x0,rects[i].y0,rects[i].x1,rects[i].y1});}
+    }else (void)p.age.Apply(bb,p.pending,width,height,copy);
     p.pending=DamageRects{};
     __asm__ volatile("sfence":::"memory");
     {const uint64_t c1=PresentNowNs();p.copyNs+=c1-c0;p.copiedBytes+=bytes;if((c1-c0)/1000>p.copyMaxUs)p.copyMaxUs=uint32_t((c1-c0)/1000);}
@@ -452,6 +483,7 @@ bool MapPresenter(NvPresenterState& p,nvdisp::NvWindowFlipper<LiveBackend>& f,co
     if(third.vram&&!p.px[2])p.px[2]=MapBar1Surface(third.vram,bytes);
     if(!p.px[0]||!p.px[1])return false;
     if(third.vram&&p.px[2])f.SetThird(third);
+    p.vram[0]=a.vram;p.vram[1]=f.surf[1].vram;p.vram[2]=third.vram;
     p.nbuf=f.nbuf;p.pitchPx=a.pitch/4;p.width=a.width;p.height=a.height;
     p.age.Reset();p.lastUs=0;p.needFull=false;
     if(!p.shadow){const VirtualAddress va=VmmAllocPages((uint64_t(a.width)*a.height*4+4095)/4096,VMM_WRITABLE|VMM_NO_EXEC,MemTag::Device,KernelPid);
@@ -531,7 +563,8 @@ StatsMark TakeMark(){
 void PresenterStats(bool reset){
     const StatsMark now=TakeMark();
     const bool zero=reset||!g_mark.us;
-    if(zero){g_mark=now;g_pollMaxUs=0;for(auto& p:g_presenter){p.cpuMaxUs=0;p.compared=p.copiedBytes=p.diffNs=p.copyNs=0;p.unchanged=p.fullDiffs=p.copyMaxUs=p.deferred=0;}
+    if(zero){g_mark=now;g_pollMaxUs=0;for(auto& p:g_presenter){p.cpuMaxUs=0;p.compared=p.copiedBytes=p.diffNs=p.copyNs=0;p.unchanged=p.fullDiffs=p.copyMaxUs=p.deferred=0;
+            p.ceFrames=p.ceBytes=p.ceCpuFrames=0;p.ceVerified=p.ceMismatch=0;}
         for(auto& v:g_wakeHist)v=0;for(auto& v:g_armLineHist)v=0;for(auto& v:g_busyHist)v=0;}
     const StatsMark& a=g_mark;
     const uint64_t us=now.us-a.us;
@@ -552,7 +585,10 @@ void PresenterStats(bool reset){
         c.raw("{\"nv_display\":\"stats_copy\",\"output\":");c.dec(o);c.raw(",\"compared_px\":");c.dec(p.compared);
         c.raw(",\"copied_bytes\":");c.dec(p.copiedBytes);c.raw(",\"diff_us\":");c.dec(p.diffNs/1000);c.raw(",\"copy_us\":");c.dec(p.copyNs/1000);
         c.raw(",\"copy_max_us\":");c.dec(p.copyMaxUs);c.raw(",\"unchanged\":");c.dec(p.unchanged);c.raw(",\"full_diffs\":");c.dec(p.fullDiffs);c.raw(",\"deferred\":");c.dec(p.deferred);
-        c.raw(",\"busy\":");c.dec(p.busy);c.raw(",\"no_buffer\":");c.dec(p.noBuffer);c.raw("}\n");DebugChannelSend(c.t);
+        c.raw(",\"busy\":");c.dec(p.busy);c.raw(",\"no_buffer\":");c.dec(p.noBuffer);
+        c.raw(",\"ce\":");c.dec(g_cePresent&&o==0&&!g_ceVerifyOff?1:0);c.raw(",\"ce_frames\":");c.dec(p.ceFrames);c.raw(",\"ce_bytes\":");c.dec(p.ceBytes);
+        c.raw(",\"ce_cpu_frames\":");c.dec(p.ceCpuFrames);c.raw(",\"ce_verified\":");c.dec(p.ceVerified);c.raw(",\"ce_mismatch\":");c.dec(p.ceMismatch);
+        c.raw("}\n");DebugChannelSend(c.t);
     }
     {   // compositor frame cost and escalations (zeroed with the window)
         const CompositorFrameStats cs=CompositorReadFrameStats(zero);
@@ -605,6 +641,7 @@ void DesktopStartThread(void*){
 }
 
 } // namespace
+void NvDispSetCePresent(NvCePresentFn fn){g_cePresent=fn;}
 
 bool NvDispHandle(const char* command){
     static const char prefix[]="bridge hardware nv-disp";

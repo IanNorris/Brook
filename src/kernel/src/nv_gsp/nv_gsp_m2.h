@@ -75,7 +75,20 @@ struct M2PtMem {
     void wr64(Aperture, uint64_t a, uint64_t x) { v.wr32(a + 4, uint32_t(x >> 32)); v.wr32(a, uint32_t(x)); }
 };
 
+// A channel RunM2 leaves alive (the CE presenter): what later submissions,
+// mappings and the eventual teardown need.
+struct M2Keep {
+    bool kept = false;
+    uint32_t live[12] = {}, parent[12] = {}, nlive = 0; bool unset_pd = false;
+    uint32_t gp = 0, payload = 0, token = 0, ce_engine = 0;
+    uint64_t userd = 0, root = 0;
+    VramArena arena;
+    uint32_t pt_pages = 0, ptes = 0;
+    uint64_t lpt_page = 0; uint32_t lpt_off = 0x1000; Aperture lpt_aper = Aperture::Video;
+};
+
 struct M2Inputs {
+    M2Keep* keep = nullptr;                   // non-null: on success keep the objects (no teardown)
     StaticInfo si;
     uint64_t vram_lo = 0, vram_hi = 0;        // VRAM reserved for M2 (inside a client-usable region)
     M2Sys gpfifo, push, sem, mthdbuf;         // sysmem pages; mthdbuf sized from RM's answer (allocated by caller later)
@@ -348,9 +361,70 @@ inline M2Result RunM2(Bus& bus, const ChipOps& c, VramIo& vram, const M2Inputs& 
         } ctx{bus, c, vram, in, r, b, sync, fence_wait, alloc, api.ev};
         r.stage = "extra";
         if (!extra(ctx)) { if (r.ok()) r.status = "M3 step failed"; return finish(); }
+        if (in.keep && r.ok()) {
+            M2Keep& k = *in.keep;
+            for (uint32_t i = 0; i < nlive; ++i) { k.live[i] = live[i]; k.parent[i] = parent[i]; }
+            k.nlive = nlive; k.unset_pd = unset_pd; k.gp = ctx.gp; k.payload = ctx.payload; k.token = r.token;
+            k.ce_engine = r.ce_engine; k.userd = r.userd; k.root = b.root; k.arena = arena;
+            k.pt_pages = ptm.pages; k.ptes = b.ptes; k.lpt_page = b.lpt_page; k.lpt_off = b.lpt_off; k.lpt_aper = b.lpt_aper;
+            k.kept = true;
+            r.stage = "kept"; r.ev = api.ev;
+            return r;
+        }
     }
     r.stage = r.fence_ok ? "done" : r.stage;
     return finish();
+}
+
+// Free a kept channel's objects in reverse (as RunM2's teardown). Returns how many were freed.
+template <class Api>
+inline uint32_t M2FreeKept(M2Keep& k, Api& api) {
+    namespace rm = rm570;
+    uint32_t freed = 0;
+    while (k.nlive) {
+        --k.nlive;
+        if (k.live[k.nlive] == m2h::kVaspace && k.unset_pd) {
+            rm::NV0080_CTRL_DMA_UNSET_PAGE_DIRECTORY_PARAMS u = {m2h::kVaspace, 0};
+            (void)api.Control(m2h::kClient, m2h::kDevice, rm::NV0080_CTRL_CMD_DMA_UNSET_PAGE_DIRECTORY, &u, sizeof(u));
+        }
+        if (k.live[k.nlive] == m2h::kClient) { if (api.Free(m2h::kClient, 0, m2h::kClient)) ++freed; }
+        else if (api.Free(m2h::kClient, k.parent[k.nlive], k.live[k.nlive])) ++freed;
+    }
+    k.kept = false;
+    return freed;
+}
+
+// One submission on a kept channel: `n` words + a host semaphore release after WFI,
+// GPFIFO ring wrap, ring the doorbell, wait (each submission waits, so the push page
+// is reused from offset 0). us = doorbell -> semaphore.
+template <class Bus, class VramIo, class Sync, class Poll>
+inline bool M2KeptSubmit(Bus& bus, const ChipOps& c, VramIo& vram, M2Keep& k, const M2Inputs& in, const uint32_t* w,
+                         uint32_t n, uint32_t budget_us, uint64_t* us, Sync& sync, Poll poll) {
+    namespace h = rm570::host;
+    constexpr uint32_t kEntries = 0x1000 / 8;
+    if (!k.kept || n + 8 > 1024) return false;
+    uint32_t* p = reinterpret_cast<uint32_t*>(in.push.cpu);
+    for (uint32_t i = 0; i < n; ++i) p[i] = w[i];
+    const uint32_t want = ++k.payload;
+    uint32_t q = n;
+    p[q++] = h::IncHeader(0, h::SEM_ADDR_LO, 3);
+    p[q++] = uint32_t(kM2Va + 0x2000); p[q++] = uint32_t((kM2Va + 0x2000) >> 32); p[q++] = want;
+    p[q++] = h::IncHeader(0, h::SEM_EXECUTE, 1); p[q++] = h::SEM_EXECUTE_RELEASE | h::SEM_EXECUTE_RELEASE_WFI;
+    const uint32_t slot = k.gp % kEntries;
+    uint32_t* g = reinterpret_cast<uint32_t*>(in.gpfifo.cpu) + slot * 2;
+    const uint64_t pva = kM2Va + 0x1000;
+    g[0] = uint32_t(pva); g[1] = uint32_t(pva >> 32) | (q << 10);
+    sync();
+    k.gp = (k.gp + 1) % kEntries;
+    const uint32_t* sem = reinterpret_cast<const uint32_t*>(in.sem.cpu);
+    const uint64_t t0 = bus.now_us();
+    vram.wr32(k.userd + h::USERD_GP_PUT, k.gp);
+    bus.wr32(c.usermode + h::kDoorbell, k.token);
+    for (;;) {
+        if (__atomic_load_n(&sem[0], __ATOMIC_ACQUIRE) == want) { *us = bus.now_us() - t0; return true; }
+        if (bus.now_us() - t0 > budget_us) { *us = bus.now_us() - t0; return false; }
+        poll();
+    }
 }
 
 } // namespace brook::nvgsp

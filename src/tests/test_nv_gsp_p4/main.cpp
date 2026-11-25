@@ -22,6 +22,8 @@
 #include "nv_gsp/nv_gsp_bar1.h"
 #include "nv_gsp/nv_gsp_m2.h"
 #include "nv_gsp/nv_gsp_m3.h"
+#include "nv_gsp/nv_gsp_ce_present.h"
+using brook::NvCeJob; using brook::NvCeRect;
 #include "../nv_gsp_fake/fake_gpu.h"
 #include "../nv_gsp_fake/fake_rm.h"
 #include "../nv_gsp_fake/synth_fw.h"
@@ -169,6 +171,43 @@ struct Rig {
         M2Result m = RunM2(gpu, kChipTu104, vram, in, ch.get(), rx.data(), uint32_t(rx.size()), wait, bell, mthd, fence, sync, ex);
         vram.Restore();
         return m;
+    }
+    // CE presenter: a kept channel with the copy object bound (`nv-gsp ce-present on`).
+    M2Result CeOn(CePresent& cp) {
+        struct W { Rig* r; bool operator()() { return r->Wait(); } } wait{this};
+        GspDoorbell<fake_gpu::FakeGpu, NoSync> bell{gpu, kChipTu104, sync};
+        Pramin<fake_gpu::FakeGpu> vram(gpu, kChipTu104);
+        cp.in = M2Inputs{};
+        cp.in.keep = &cp.k;
+        cp.in.si = last.si;
+        cp.in.vram_lo = 0x108000000ull; cp.in.vram_hi = 0x108800000ull;
+        auto sys = [&](M2Sys* s) { DmaRegion d; assert(arena(0x1000, &d)); s->cpu = d.cpu; s->bus = d.bus; s->bytes = d.bytes; };
+        sys(&cp.in.gpfifo); sys(&cp.in.push); sys(&cp.in.sem);
+        auto mthd = [&](uint32_t bytes, M2Sys* s) { DmaRegion d; if (!arena(bytes, &d)) return false;
+            s->cpu = d.cpu; s->bus = d.bus; s->bytes = d.bytes; return true; };
+        auto fence = [&] { return Wait(); };
+        M2Result m = RunM2(gpu, kChipTu104, vram, cp.in, ch.get(), rx.data(), uint32_t(rx.size()), wait, bell, mthd, fence, sync, CeExtra{});
+        vram.Restore();
+        cp.active = m.ok() && cp.k.kept;
+        return m;
+    }
+    int CePresentOnce(CePresent& cp, const NvCeJob& job, const DmaRegion& bb, uint64_t* bytes) {
+        Pramin<fake_gpu::FakeGpu> vram(gpu, kChipTu104);
+        auto v2p = [&](uintptr_t a) -> uint64_t {
+            const uintptr_t b = reinterpret_cast<uintptr_t>(bb.cpu);
+            return a >= b && a < b + bb.bytes ? bb.bus + (a - b) : 0; };
+        auto poll = [&] { (void)Wait(); };
+        const int r = CePresentRun(gpu, kChipTu104, vram, cp, job, v2p, sync, poll, bytes);
+        vram.Restore();
+        return r;
+    }
+    uint32_t CeFree(CePresent& cp) {
+        struct W { Rig* r; bool operator()() { return r->Wait(); } } wait{this};
+        GspDoorbell<fake_gpu::FakeGpu, NoSync> bell{gpu, kChipTu104, sync};
+        static uint8_t scratch[kRmApiBuf];
+        RmApi<W, GspDoorbell<fake_gpu::FakeGpu, NoSync>> api(ch.get(), rx.data(), uint32_t(rx.size()), wait, bell, scratch);
+        cp.active = false;
+        return M2FreeKept(cp.k, api);
     }
     P4Result last;
     RmFiniResult Unload() {
@@ -384,6 +423,44 @@ int main(int argc, char** argv) {
         M3Result res;
         const M2Result m = r.M3(pl, res);
         assert(!m.ok() && !res.object && r.rm.ce_launches == 0 && r.rm.objs.empty() && m.fence_ok);
+    }
+    // ---- CE present: kept channel, back-buffer mapping + remap, rect copies into VRAM, timeout, teardown
+    {
+        Rig r(I, 0x1); r.last = r.Run(); assert(r.last.init_done);
+        CePresent cp;
+        const M2Result m = r.CeOn(cp);
+        if (!m.ok()) std::printf("CE on: %s at %s host=%s\n", m.status, m.stage, r.rm.host_error.c_str());
+        assert(m.ok() && !std::strcmp(m.stage, "kept") && cp.k.kept && cp.k.nlive == 7 && r.rm.objs.size() == 7);
+        assert(r.rm.ce_class == 0xc5b5 && r.rm.ce_launches == 0);
+        const uint32_t W = 256, H = 64, stride = 320;
+        DmaRegion bb; assert(r.arena(stride * H * 4, &bb));
+        uint32_t* px = reinterpret_cast<uint32_t*>(bb.cpu);
+        for (uint32_t i = 0; i < stride * H; ++i) px[i] = 0x10000000u + i;
+        const NvCeRect rects[2] = {{10, 5, 74, 21}, {200, 40, 300, 80}};   // the second is clipped to 256x64
+        NvCeJob job{px, stride, W, H, 0x400000, 1280, rects, 2};
+        uint64_t bytes = 0;
+        assert(r.CePresentOnce(cp, job, bb, &bytes) == 1);
+        assert(bytes == 64ull * 4 * 16 + 56ull * 4 * 24 && cp.st.remaps == 1 && cp.st.frames == 1 && r.rm.ce_launches == 2);
+        assert(r.gpu.Vram32(0x400000 + 5 * 1280 + 10 * 4) == 0x10000000u + 5 * stride + 10);
+        assert(r.gpu.Vram32(0x400000 + 63 * 1280 + 255 * 4) == 0x10000000u + 63 * stride + 255);
+        assert(r.gpu.Vram32(0x400000 + 4 * 1280 + 10 * 4) == 0);                         // outside the damage
+        assert(r.CePresentOnce(cp, job, bb, &bytes) == 1 && cp.st.remaps == 1);        // same buffer: no remap
+        // the compositor reallocates its back buffer: remapped at a fresh VA slot
+        DmaRegion bb2; assert(r.arena(stride * H * 4, &bb2));
+        uint32_t* px2 = reinterpret_cast<uint32_t*>(bb2.cpu);
+        for (uint32_t i = 0; i < stride * H; ++i) px2[i] = 0x20000000u + i;
+        NvCeJob job2{px2, stride, W, H, 0x600000, 1280, rects, 1};
+        assert(r.CePresentOnce(cp, job2, bb2, &bytes) == 1 && cp.st.remaps == 2 && cp.slot == 2);
+        assert(r.gpu.Vram32(0x600000 + 20 * 1280 + 73 * 4) == 0x20000000u + 20 * stride + 73);
+        // a destination past the VRAM window is refused (CPU copies)
+        NvCeJob bad{px2, stride, W, H, kCeVramBytes - 1280, 1280, rects, 1};
+        assert(r.CePresentOnce(cp, bad, bb2, &bytes) == 0 && cp.st.refused == 1);
+        // the engine stops answering: timeout -> -1, then the path stays off
+        r.rm.host_stall = true;
+        assert(r.CePresentOnce(cp, job2, bb2, &bytes) == -1 && cp.broken && cp.st.timeouts == 1);
+        assert(r.CePresentOnce(cp, job2, bb2, &bytes) == 0);
+        r.rm.host_stall = false;
+        assert(r.CeFree(cp) == 7 && r.rm.objs.empty() && !cp.k.kept);
     }
     std::printf("test_nv_gsp_p4: OK (%s inputs%s)\n", I.real ? "real" : "synthetic", I.seq.empty() ? "" : ", real sequencer");
     return 0;
