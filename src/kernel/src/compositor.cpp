@@ -4630,8 +4630,8 @@ void CompositorSetPrimaryPresenter(const CompositorPrimaryPresenter* presenter)
     CompositorWake();
 }
 
-// Pacing probe (bridge `nv-disp driver desktop anim on|off`): a 32-row strip at the top
-// of every output with a white square that moves 16 px per compositor frame, drawn over
+// Pacing probe (bridge `nv-disp driver desktop anim on|off`): a 32-row strip above the
+// taskbar of every output with a white square that moves 16 px per compositor frame, drawn over
 // the composed frame. It damages every frame on every output (a 60 fps animation for the
 // vblank pacing measurement) and shows dropped or doubled frames as visible judder.
 static bool g_pacingProbe=false;
@@ -4653,12 +4653,16 @@ static void DrawPacingProbe()
     for(uint32_t i=0;i<n;++i){
         const OutputRect& o=g_deskOutputCount?g_deskOutputs[i]:whole;
         if(o.w<=rows || o.h<rows || o.x<0 || o.y<0 || o.right()>g_deskWidth || o.bottom()>g_deskHeight)continue;
+        // Just above the taskbar: damage is one row span, and the taskbar rows already
+        // change every frame, so the probe adds 32 rows rather than spanning the screen.
+        const uint32_t top=WmDesktopHeight(o.h);
+        const uint32_t y0=uint32_t(o.y)+(top>=rows && top<=o.h ? top-rows : 0);
         const uint32_t sq=(frame*step)%(o.w-rows);
         for(uint32_t y=0;y<rows;++y){
-            uint32_t* row=g_backBuffer+uint64_t(o.y+y)*g_backBufStride+o.x;
+            uint32_t* row=g_backBuffer+uint64_t(y0+y)*g_backBufStride+o.x;
             for(uint32_t x=0;x<o.w;++x)row[x]=x>=sq && x<sq+rows ? 0xffffffffu : 0xff202020u;
         }
-        MarkDirtyRows(uint32_t(o.y),uint32_t(o.y)+rows);
+        MarkDirtyRows(y0,y0+rows);
     }
 }
 
