@@ -664,6 +664,14 @@ int64_t sys_gettid(uint64_t, uint64_t, uint64_t,
 int64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
                    uint64_t arg4, uint64_t arg5, uint64_t)
 {
+    if (option==3 || option==4) { // PR_GET/SET_DUMPABLE
+        auto* proc=ProcessCurrent();
+        if (!proc || !proc->addressSpace) return -ESRCH;
+        if (option==3) return __atomic_load_n(&proc->addressSpace->dumpable,__ATOMIC_ACQUIRE)?1:0;
+        if (arg2>1) return -EINVAL;
+        __atomic_store_n(&proc->addressSpace->dumpable,arg2!=0,__ATOMIC_RELEASE);
+        return 0;
+    }
     if(option==36 || option==37) { // PR_SET/GET_CHILD_SUBREAPER
         const int result=SchedulerChildSubreaperControl(ProcessCurrent(),option==36,arg2!=0);
         if(result<0)return result;

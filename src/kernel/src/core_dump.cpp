@@ -87,6 +87,10 @@ template<class T> struct CoreList {
         return true;
     }
 };
+constexpr uint32_t CoreNtSecretRanges=0x42524b53;
+constexpr uint32_t MaxSecretRanges=128;
+struct CoreSecretRange { uint64_t begin,end; };
+
 struct CoreFileEntry {
     uint64_t begin,end,pageOffset;
 };
@@ -168,17 +172,18 @@ int CoreDumpWriteSnapshot(CoreDumpSnapshot& snapshot,const char* path,bool full,
     CoreList<CorePageRef> selected;
     CorePageRange runs[CorePagePriorities]{};
     CoreList<CoreFileEntry> files;
+    CoreList<CoreSecretRange> secrets;
     CoreList<char> fileNames;
     if(!addresses.ptr || !page.ptr)return -12;
 
-    const uint32_t argBytes=UserMappingReadArguments(space,0,info.args,sizeof(info.args)-1);
+    const uint32_t argBytes=UserMappingReadArguments(space,0,info.args,sizeof(info.args)-1,true);
     for(uint32_t i=0;i<argBytes;++i)if(!info.args[i])info.args[i]=' ';
     if(!argBytes)CopyName(info.args,sizeof(info.args),info.name);
 
     uint32_t auxWords=0;
     uint64_t aux[AddressSpaceState::SavedAuxvWords]{};
     uint64_t notes=CoreNoteSize(sizeof(info))+uint64_t(result.threads)*CoreNoteSize(sizeof(CoreThreadNote));
-    uint64_t fileNoteBytes=0;
+    uint64_t fileNoteBytes=0,secretNoteBytes=0;
     {
         KMutexLock(&space->mutation);
         struct Unlock { KMutex* lock;~Unlock(){KMutexUnlock(lock);} } unlock{&space->mutation};
@@ -188,7 +193,7 @@ int CoreDumpWriteSnapshot(CoreDumpSnapshot& snapshot,const char* path,bool full,
         if(auxWords)notes+=CoreNoteSize(uint64_t(auxWords)*8);
         result.stage="layout";
         const auto eligible=[&](const MappingRange& range){
-            return range.kind!=MappingKind::Device && (range.protection&1) &&
+            return !(range.dumpFlags & MappingSecret) && range.kind!=MappingKind::Device && (range.protection&1) &&
                    (full || range.sharing!=MappingSharing::Shared || range.kind==MappingKind::File);
         };
         const auto filePath=[](const MappingRange& range)->const char*{
@@ -202,6 +207,13 @@ int CoreDumpWriteSnapshot(CoreDumpSnapshot& snapshot,const char* path,bool full,
         for(const auto* node=space->ranges.head;node;node=node->next){
             if(expired())return -110;
             const auto& range=node->range;
+            if(range.dumpFlags & MappingSecret){
+                ++result.discarded.secretRanges;
+                result.discarded.secretPages+=(range.end-range.begin)/CorePageSize;
+                if(secrets.size<MaxSecretRanges && secrets.reserve(secrets.size+1,MaxSecretRanges))
+                    secrets.data[secrets.size++]={range.begin,range.end};
+                continue;
+            }
             if(!eligible(range))continue;
             ++result.mappings;
             const char* name=filePath(range);
@@ -220,6 +232,10 @@ int CoreDumpWriteSnapshot(CoreDumpSnapshot& snapshot,const char* path,bool full,
         if(files.size){
             fileNoteBytes=16+uint64_t(files.size)*24+fileNames.size;
             notes+=CoreNoteSize(fileNoteBytes);
+        }
+        if(result.discarded.secretRanges){
+            secretNoteBytes=3*sizeof(uint64_t)+uint64_t(secrets.size)*sizeof(CoreSecretRange);
+            notes+=CoreNoteSize(secretNoteBytes);
         }
         if(CorePageAlign(CoreHeaderBytes(1)+notes)>byteLimit){
             result.stage="byte-budget";
@@ -339,6 +355,14 @@ int CoreDumpWriteSnapshot(CoreDumpSnapshot& snapshot,const char* path,bool full,
             if(!out.write(fileNames.data,fileNames.size))return false;
             const uint32_t zero=0;
             if(!out.write(&zero,(-fileNoteBytes)&3))return false;
+        }
+        if(secretNoteBytes){
+            const CoreNoteHeader header{6,uint32_t(secretNoteBytes),CoreNtSecretRanges};
+            const char owner[8]="BROOK";
+            const uint64_t counts[]={result.discarded.secretRanges,result.discarded.secretPages,secrets.size};
+            if(!out.write(&header,sizeof(header)) || !out.write(owner,sizeof(owner)) ||
+               !out.write(counts,sizeof(counts)) ||
+               !out.write(secrets.data,uint64_t(secrets.size)*sizeof(CoreSecretRange)))return false;
         }
         CorePageCursor pages=loads;
         for(uint32_t i=1;i<programCount;++i){

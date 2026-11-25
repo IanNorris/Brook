@@ -6603,6 +6603,8 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
                 reply.text(",");reply.field("dropped_file_pages",losses.filePages);
                 reply.text(",");reply.field("dropped_data_pages",losses.dataPages);
                 reply.text(",");reply.field("dropped_stack_heap_pages",losses.stackHeapPages);
+                reply.text(",");reply.field("excluded_secret_ranges",losses.secretRanges);
+                reply.text(",");reply.field("excluded_secret_pages",losses.secretPages);
                 reply.text(",");reply.field("dropped_file_notes",losses.fileNotes);
             }
             reply.text("}");
@@ -6643,6 +6645,10 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
                 reply.text(",");reply.field("dropped_data_pages",dump.discarded.dataPages);
                 reply.text(",");reply.field("dropped_stack_heap_pages",dump.discarded.stackHeapPages);
                 reply.text(",");reply.field("dropped_file_notes",dump.discarded.fileNotes);
+            }
+            if(dump.discarded.secretRanges){
+                reply.text(",");reply.field("excluded_secret_ranges",dump.discarded.secretRanges);
+                reply.text(",");reply.field("excluded_secret_pages",dump.discarded.secretPages);
             }
             reply.text(",\"exe\":");reply.quoted(dump.executable);
         }

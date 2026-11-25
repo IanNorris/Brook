@@ -77,6 +77,7 @@ PhysicalAddress PmmAllocPageAccounted(MemTag tag, uint16_t pid, PmmOwner owner);
 PhysicalAddress PmmAllocPagesAccounted(uint64_t count, MemTag tag, uint16_t pid, PmmOwner owner);
 
 // Free a previously allocated page frame. No-op if null.
+void PmmRequireScrub(PhysicalAddress frame);
 void PmmFreePage(PhysicalAddress physAddr);
 
 

@@ -123,6 +123,7 @@ bool UserMappingClone(Process* actor, AddressSpaceState* source, AddressSpaceSta
         destination->argumentEnd=source->argumentEnd;
         destination->membarrierPrivateRegistered=__atomic_load_n(
             &source->membarrierPrivateRegistered,__ATOMIC_ACQUIRE);
+        destination->dumpable=__atomic_load_n(&source->dumpable,__ATOMIC_ACQUIRE);
         bool copied=CloneLeaves(operation,destination,pid,paging.FailAfterCow());
         operation.Unlock();
         return copied;
@@ -134,14 +135,14 @@ bool UserMappingReadResidentPage(AddressSpaceState* space,uint64_t address,uint6
     const auto* range=MappingRangeFind(space->ranges,address);
     const uint64_t leaf=VmmReadLeaf(space->pageTable,VirtualAddress(address));
     const bool valid=range && range->identity==identity && (range->protection&1) &&
-        range->kind!=MappingKind::Device && (leaf&(VMM_PRESENT|VMM_USER))==(VMM_PRESENT|VMM_USER);
+        !(range->dumpFlags&MappingSecret) && range->kind!=MappingKind::Device && (leaf&(VMM_PRESENT|VMM_USER))==(VMM_PRESENT|VMM_USER);
     // The mapping lock stabilizes the leaf and its RAM lifetime throughout
     // the copy, including against COW replacement. No fault-in or foreign CR3.
     if(valid)memcpy(out,reinterpret_cast<const void*>(PhysToVirt(VmmLeafPhysical(leaf)).raw()),4096);
     KMutexUnlock(&space->mutation);
     return valid;
 }
-uint32_t UserMappingReadArguments(AddressSpaceState* space,uint64_t offset,void* buffer,uint32_t capacity) {
+uint32_t UserMappingReadArguments(AddressSpaceState* space,uint64_t offset,void* buffer,uint32_t capacity,bool forCoreDump) {
     if (!space || space->kernel || !buffer || !capacity) return 0;
     KMutexLock(&space->mutation);
     uint32_t copied=0;
@@ -160,7 +161,8 @@ uint32_t UserMappingReadArguments(AddressSpaceState* space,uint64_t offset,void*
         while (remaining) {
             const uint64_t leaf=VmmReadLeaf(space->pageTable,VirtualAddress(address));
             const auto* range=MappingRangeFind(space->ranges,address);
-            if (!range || range->kind==MappingKind::Device || !(range->protection&1) || !(leaf&VMM_PRESENT) || !(leaf&VMM_USER)) break;
+            if (!range || range->kind==MappingKind::Device || !(range->protection&1) || !(leaf&VMM_PRESENT) || !(leaf&VMM_USER) ||
+                (forCoreDump && (range->dumpFlags & MappingSecret))) break;
             uint64_t chunk=4096-(address&4095);if (chunk>remaining) chunk=remaining;
             const auto* source=reinterpret_cast<const uint8_t*>(PhysToVirt(VmmLeafPhysical(leaf)).raw())+(address&4095);
             memcpy(static_cast<uint8_t*>(buffer)+copied,source,chunk);
@@ -562,6 +564,37 @@ int64_t UserMappingAdviseFree(Process* actor, AddressSpaceState* space, uint64_t
     return error == -95 ? -22 : error;
 }
 
+int64_t UserMappingAdviseDump(Process* actor,AddressSpaceState* space,uint64_t address,
+                              uint64_t length,bool exclude) {
+    uint64_t end;
+    if (!actor || !space || (address & 4095)) return -22;
+    if (!length) return 0;
+    if (!UserInterval(address,length,end)) return -22;
+    MappingTransaction operation(actor,space);
+    if (!operation.PrepareRanges(2) || !operation.Lock()) return -12;
+    for (uint64_t at=address;at<end;) {
+        const auto* range=MappingRangeFind(space->ranges,at);
+        if (!range) return -12;
+        if (!exclude && (range->dumpFlags & MappingSecretFd)) return -22;
+        const uint64_t stop=range->end<end?range->end:end;
+        if (exclude && range->kind==MappingKind::Pageable &&
+            !PageableMemoryCanExcludeFromDump(*range,at,stop)) return -16;
+        uint64_t leaves=0;
+        if (exclude && range->kind!=MappingKind::Device && !operation.RangeLeafCount(at,stop,leaves))
+            return -22;
+        at=stop;
+    }
+    if (!operation.SetDumpExcluded(address,end,exclude)) return -12;
+    if (exclude) for (uint64_t at=address;at<end;) {
+        const auto* range=MappingRangeFind(space->ranges,at);
+        const uint64_t stop=range->end<end?range->end:end;
+        if (range->kind!=MappingKind::Device && !VmmRequireScrubRange(space->pageTable,at,stop))
+            KernelPanic("mapping: unsupported leaf in secret range");
+        at=stop;
+    }
+    return 0;
+}
+
 int64_t UserMappingAdviseFork(Process* actor, AddressSpaceState* space, uint64_t address,
                               uint64_t length, uint32_t advice) {
     uint64_t end;
@@ -584,7 +617,7 @@ int64_t UserMappingAdviseFork(Process* actor, AddressSpaceState* space, uint64_t
         if (!range) return -12;
         // Brook pager regions carry fork-time backing state; keep them inherited.
         if (range->kind == MappingKind::Pageable) return -22;
-        if (advice == 11 && range->kind == MappingKind::Device) return -22; // VM_IO
+        if (advice == 11 && (range->kind == MappingKind::Device || (range->dumpFlags & MappingSecretFd))) return -22; // VM_IO
         if (advice == 18 && (range->backing || range->sharing != MappingSharing::Private ||
             range->leafOwnership != MappingLeafOwnership::Managed ||
             (range->kind != MappingKind::Anonymous && range->kind != MappingKind::Heap &&
@@ -739,6 +772,9 @@ UserPageAccess UserMappingPageAccess(Process* actor, AddressSpaceState* space, u
     auto result=VmmCowResolveWrite(space->pageTable,VirtualAddress(address),space->allocationPid);
     if (result.result == VmmCowResult::OutOfMemory) return UserPageAccess::OutOfMemory;
     if (result.result != VmmCowResult::Resolved) return CheckPage(space,address,access,cow);
+    const auto* range=MappingRangeFind(space->ranges,address);
+    if (range && (range->dumpFlags & MappingSecret))
+        PmmRequireScrub(VmmLeafPhysical(VmmReadLeaf(space->pageTable,VirtualAddress(address))));
     operation.RequireShootdown();
     if (result.retired && !operation.RetireFrame(result.retired)) KernelPanic("mapping: CoW retirement preflight mismatch");
     return UserPageAccess::Ready;
@@ -764,7 +800,7 @@ int64_t UserMappingBreak(Process* actor,AddressSpaceState* space,uint64_t reques
             if (tail && tail->end==oldEnd && tail->kind==MappingKind::Heap && tail->protection==3 &&
                 tail->maximumProtection==7 && tail->leafOwnership==MappingLeafOwnership::Managed &&
                 tail->sharing==MappingSharing::Private && !tail->backing &&
-                !tail->forkFlags) extend=tail->identity; // Linux never merges differing VM_DONTCOPY/WIPEONFORK
+                !tail->forkFlags && !tail->dumpFlags) extend=tail->identity; // Linux never merges differing VM_DONTCOPY/WIPEONFORK
         } else if (!operation.RangeLeafCount(newEnd,oldEnd,retired)) return static_cast<int64_t>(previous);
         const uint64_t generation=space->generation;operation.Unlock();
         if (!operation.Prepare(growth?growth:retired,growth) || !operation.PrepareRanges(3) ||

@@ -67,6 +67,8 @@ int64_t sys_ftruncate(uint64_t fd, uint64_t length, uint64_t,
             if ((FdStatus(fde) & 3) == 0) return -EINVAL;
             auto* mfd = static_cast<MemFdData*>(fde->handle);
             MfdLock(mfd);
+            if (mfd->secretSpace && (!proc->addressSpace || mfd->secretSpace!=proc->addressSpace->identity ||
+                (mfd->size && length!=mfd->size))) {MfdUnlock(mfd);return -EPERM;}
             if(int error=MemFdSealedResize(mfd->seals,mfd->size,length)) {MfdUnlock(mfd);return error;}
             if (!MemFdGrowLocked(mfd, length)) { MfdUnlock(mfd); return -ENOMEM; }
             // Shrinking ftruncate: free pages past the new tail. (Growth is
@@ -273,6 +275,7 @@ int64_t sys_fallocate(uint64_t fd, uint64_t mode, uint64_t offset,
     uint64_t end = offset + length;
     if (end > 16ULL * 1024 * 1024 * 1024) return -27; // Existing memfd index limit.
     auto* mfd = static_cast<MemFdData*>(entry->handle);
+    if (mfd->secretSpace) return -95;
     MfdLock(mfd);
     // Linux forbids beyond-EOF reservation under GROW even with KEEP_SIZE.
     if(end>mfd->size && (mfd->seals.bits&4)) {MfdUnlock(mfd);return -EPERM;}

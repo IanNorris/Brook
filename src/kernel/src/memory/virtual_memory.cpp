@@ -832,6 +832,19 @@ bool VmmMeasureRange(PageTable pt, uint64_t begin, uint64_t end,
     return true;
 }
 
+static uint64_t RequireLeafScrub(VirtualAddress,VmmOwnedLeaf leaf,void*) {
+    if (leaf.raw) PmmRequireScrub(VmmLeafPhysical(leaf.raw));
+    return leaf.raw;
+}
+bool VmmRequireScrubRange(PageTable pt,uint64_t begin,uint64_t end) {
+    if (!ValidLeafRange(pt,begin,end)) return false;
+    const auto irq=IrqSpinLockAcquire(&g_userPtLock);
+    auto* table=reinterpret_cast<uint64_t*>(PhysToVirt(pt.pml4).raw());
+    uint64_t count=0;
+    const bool result=WalkLeafRange(table,4,0,begin,end,false,nullptr,nullptr,count,RequireLeafScrub,HostOwnerExperiment(pt));
+    IrqSpinLockRelease(&g_userPtLock,irq);
+    return result;
+}
 bool VmmCountRangeLeaves(PageTable pt, uint64_t begin, uint64_t end, uint64_t* count)
 {
     if (!count || !ValidLeafRange(pt,begin,end)) return false;

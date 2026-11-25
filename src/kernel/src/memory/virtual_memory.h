@@ -198,6 +198,7 @@ bool VmmMeasureRangeStep(PageTable pt, uint64_t begin, uint64_t end,
                          bool accountRam, VmmRangeStats* stats, uint64_t* next);
 bool VmmMeasureRange(PageTable pt, uint64_t begin, uint64_t end,
                      bool accountRam, VmmRangeStats* stats);
+bool VmmRequireScrubRange(PageTable pt, uint64_t begin, uint64_t end);
 bool VmmCountRangeLeaves(PageTable pt, uint64_t begin, uint64_t end, uint64_t* count);
 // Bounded snapshot of populated addresses; caller stabilizes AS topology.
 // Capacity failure never writes beyond the supplied array or changes leaves.

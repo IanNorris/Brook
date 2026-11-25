@@ -42,6 +42,7 @@ static_assert(sizeof(CoreProcessNote)==136);
 
 struct CoreDumpDiscarded {
     uint64_t filePages=0,dataPages=0,stackHeapPages=0;
+    uint64_t secretRanges=0,secretPages=0;
     uint32_t fileNotes=0;
     bool any() const { return filePages || dataPages || stackHeapPages || fileNotes; }
 };

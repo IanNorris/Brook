@@ -83,6 +83,7 @@ PhysicalAddress MemFdGetOrAllocPage(MemFdData* mfd, uint64_t pageIdx, uint16_t p
         if (!phys) { MfdUnlock(mfd); return PhysicalAddress(0); }
         auto* va = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
         memset(va, 0, 4096);
+        if (mfd->secretSpace) PmmRequireScrub(phys);
         raw = phys.raw();
         mfd->pageMap[pageIdx] = raw;
     }
@@ -129,6 +130,7 @@ static uint8_t* MemFdBounce(bool user, bool* failed)
 
 int64_t MemFdReadAt(MemFdData* mfd, uint64_t destination, uint64_t count, uint64_t* offset, bool user)
 {
+    if (mfd->secretSpace) return -EINVAL;
     if (!count) return 0;
     bool noMemory = false;
     uint8_t* bounce = MemFdBounce(user, &noMemory);
@@ -159,6 +161,7 @@ int64_t MemFdReadAt(MemFdData* mfd, uint64_t destination, uint64_t count, uint64
 int64_t MemFdWriteAt(MemFdData* mfd, uint64_t source, uint64_t count,
                      uint64_t* offset, bool append, bool user)
 {
+    if (mfd->secretSpace) return -EINVAL;
     if (!count) return 0;
     MfdLock(mfd);
     uint64_t pos = append ? mfd->size : *offset;
@@ -301,6 +304,25 @@ void SyscallConfigureMemfdTrace() {
     memfdTraceEnabled=value[0]=='1' && (n==1 || (n==2 && !value[1]));
 }
 
+int64_t sys_memfd_secret(uint64_t flags,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t)
+{
+    constexpr uint64_t closeOnExec=0x80000;
+    if (flags&~closeOnExec) return -EINVAL;
+    auto* process=ProcessCurrent();
+    if (!process || !process->addressSpace) return -ESRCH;
+    KernelOperationGuard operation(process);
+    auto* mfd=static_cast<MemFdData*>(kmalloc(sizeof(MemFdData)));
+    if (!mfd) return -ENOMEM;
+    *mfd={};
+    mfd->inode=NextMemFdInode();
+    if (!mfd->inode) {kfree(mfd);return -75;}
+    mfd->refCount=1;
+    mfd->secretSpace=process->addressSpace->identity;
+    mfd->seals={1,0};
+    const int fd=MemFdInstall(process,mfd,2u|static_cast<uint32_t>(flags));
+    MemFdUnref(mfd);
+    return fd;
+}
 int64_t sys_memfd_create(uint64_t nameAddr, uint64_t flags,
                            uint64_t, uint64_t, uint64_t, uint64_t)
 {
@@ -313,6 +335,7 @@ int64_t sys_memfd_create(uint64_t nameAddr, uint64_t flags,
 
     auto* mfd = static_cast<MemFdData*>(kmalloc(sizeof(MemFdData)));
     if (!mfd) return -ENOMEM;
+    *mfd={};
     mfd->inode        = NextMemFdInode();
     if(!mfd->inode) {kfree(mfd);return -75;}
     mfd->pageMap      = nullptr;

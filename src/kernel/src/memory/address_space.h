@@ -18,6 +18,8 @@ struct CompositorVfbAllocation;
 struct AddressSpaceState {
     volatile uint32_t references;
     uint64_t identity;
+    bool dumpable = true; // read and written atomically, shared by CLONE_VM threads
+
     uint64_t generation;
     KMutex mutation;
     PageTable pageTable;

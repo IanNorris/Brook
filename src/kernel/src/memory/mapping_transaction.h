@@ -77,6 +77,7 @@ public:
     bool ProtectRange(uint64_t begin, uint64_t end, uint32_t protection);
     bool ProtectMapping(uint64_t begin, uint64_t end, uint32_t protection);
     // Metadata-only madvise fork policy; no leaf or TLB change.
+    bool SetDumpExcluded(uint64_t begin, uint64_t end, bool exclude);
     bool SetForkFlags(uint64_t begin, uint64_t end, uint8_t mask, uint8_t bits);
     // Snapshot backing is retained by this transaction through retirement.
     // One snapshot pin has inline ownership so it can be captured before sizing

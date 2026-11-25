@@ -1,5 +1,6 @@
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <thread>
 #include <vector>
 #include "memory/physical_memory.h"
@@ -9,7 +10,7 @@
 #define CHECK(c) do { if (!(c)) { std::fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#c); std::exit(1); } } while (0)
 using namespace brook;
 namespace brook {
-void PmmHostTestInit(PageDescriptor*,uint32_t);
+void PmmHostTestInit(PageDescriptor*,uint32_t,uint8_t*);
 bool hostOomEnabled=false;
 uint64_t failureRequests=0,lastRequested=0,lastFree=0;
 bool lastContiguous=false;
@@ -43,7 +44,19 @@ static unsigned owned(uint16_t pid) {
     return count;
 }
 int main() {
-    PageDescriptor descriptors[2048]{}; PmmHostTestInit(descriptors,2048);
+    static uint8_t directMap[2048*4096];
+    PageDescriptor descriptors[2048]{};
+    PmmHostTestInit(descriptors,2048,directMap);
+    auto scrubbed=PmmAllocPage(MemTag::User,7);
+    CHECK(scrubbed);
+    auto* bytes=directMap+scrubbed.raw();
+    std::memset(bytes,0x7e,4096);
+    PmmRequireScrub(scrubbed);
+    PmmRefPage(scrubbed);
+    PmmUnrefPage(scrubbed);
+    CHECK(bytes[0]==0x7e && bytes[4095]==0x7e);
+    PmmUnrefPage(scrubbed);
+    for (unsigned i=0;i<4096;++i)CHECK(bytes[i]==0);
     const auto freeBefore=PmmGetFreePageCount();
     CHECK(!PmmAllocPage(MemTag::User,PMM_MAX_PIDS));
     CHECK(!PmmAllocPages(2,MemTag::User,PMM_MAX_PIDS));

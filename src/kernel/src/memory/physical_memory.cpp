@@ -5,6 +5,7 @@
 #include "panic_serial.h"
 #include "spinlock.h"
 #include "portio.h"
+#include "string.h"
 #include "../memory/virtual_memory.h"  // PhysToVirt (direct map) for frame poison
 #include "../ksym_addrs.h"             // KsymFindByAddr for callstack symbolization
 
@@ -49,6 +50,11 @@ static constexpr uint64_t MAX_PHYS_GB     = 128;
 static constexpr uint64_t MAX_PHYS_PAGES  = (MAX_PHYS_GB * 1024ULL * 1024 * 1024) / PAGE_SIZE;
 static constexpr uint64_t BITMAP_WORDS    = MAX_PHYS_PAGES / 64; // 524288 words = 4MB
 
+// Marks survive descriptor retirement until the frame is safe to recycle.
+static uint64_t g_scrubAtRelease[BITMAP_WORDS]; // under g_pmmLock, owned RAM only
+#ifdef BROOK_HOST_TEST
+static uint8_t* g_hostDirectMapForScrub;
+#endif
 static uint64_t g_bitmap[BITMAP_WORDS]; // in BSS, starts zeroed
 static uint64_t g_totalPages = 0;       // highest tracked page index
 static uint64_t g_freePages  = 0;
@@ -456,6 +462,16 @@ static inline void PoisonFrameLocked(uint32_t idx, uint16_t ownerPid, uint32_t s
 // Caller MUST hold g_pmmLock. Release a frame's bitmap bit + free accounting.
 static inline void ReleaseFrameLocked(uint32_t idx)
 {
+    auto& marks=g_scrubAtRelease[idx/64];
+    const uint64_t bit=1ULL<<(idx%64);
+    if (marks & bit) {
+        auto* bytes=reinterpret_cast<void*>(PhysToVirt(PhysicalAddress(uint64_t(idx)*PAGE_SIZE)).raw());
+#ifdef BROOK_HOST_TEST
+        if (g_hostDirectMapForScrub) bytes=g_hostDirectMapForScrub+uint64_t(idx)*PAGE_SIZE;
+#endif
+        memset(bytes,0,PAGE_SIZE);
+        marks &= ~bit;
+    }
     SetFree(idx);
     g_freePages++;
     if (idx < Dma32Pages) { if (idx < g_lowHint) g_lowHint = idx; }
@@ -920,6 +936,16 @@ PhysicalAddress PmmAllocPagesAccounted(uint64_t count, MemTag tag, uint16_t pid,
 // PmmUnrefPage). Used by the free sites below.
 extern "C" int PmmDumpFreeLog(uint64_t phys);
 static inline void MapLeakCheckLocked(uint32_t idx, const char* site);
+
+void PmmRequireScrub(PhysicalAddress frame)
+{
+    const auto idx=frame.raw()/PAGE_SIZE;
+    if (!frame || idx>=g_totalPages || !g_pageDescs) return;
+    const auto lock=IrqSpinLockAcquire(&g_pmmLock);
+    if (IsUsed(idx) && Desc(idx).refCount && Desc(idx).tag!=static_cast<uint8_t>(MemTag::Device))
+        g_scrubAtRelease[idx/64] |= 1ULL<<(idx%64);
+    IrqSpinLockRelease(&g_pmmLock,lock);
+}
 
 void PmmFreePage(PhysicalAddress physAddr)
 {
@@ -1692,14 +1718,18 @@ uint64_t PmmGetRamPageCount() { return g_ramPages; }
 namespace brook {
 // Host fixture supplies descriptor storage; allocation, ownership, reference
 // counting and bitmap transitions remain the actual PMM implementation.
-void PmmHostTestInit(PageDescriptor* descriptors, uint32_t pages) {
+void PmmHostTestInit(PageDescriptor* descriptors, uint32_t pages, uint8_t* directMapForScrub) {
+    g_hostDirectMapForScrub=directMapForScrub;
     g_totalPages = pages; g_ramPages = pages; g_freePages = 0; g_nextHint = 1;
     g_pageDescs = descriptors;
     for (auto& count : g_ownerPages) count = 0;
     g_retiredPages = 0;
     g_idleExecCachePages = 0;
     g_quarantineOn = false; g_framePoisonOn = false; g_freeLogOn = false;
-    for (uint64_t i=0;i<BITMAP_WORDS;++i) g_bitmap[i]=~uint64_t{0};
+    for (uint64_t i=0;i<BITMAP_WORDS;++i) {
+        g_bitmap[i]=~uint64_t{0};
+        g_scrubAtRelease[i]=0;
+    }
     for (uint32_t i=0;i<PMM_MAX_PIDS;++i) g_pidLists[i]={PMM_NULL_PAGE,PMM_NULL_PAGE,0,0};
     for (uint32_t i=0;i<pages;++i)
         descriptors[i]={PMM_NULL_PAGE,PMM_NULL_PAGE,0,static_cast<uint8_t>(MemTag::Free),PmmOwner::Automatic,0,0};

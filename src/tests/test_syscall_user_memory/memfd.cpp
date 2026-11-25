@@ -27,6 +27,7 @@ void PipeCopyHook(uint64_t,uint64_t,bool) { if(SpinLockHeld(g_watchedPipe->lock)
 }
 namespace brook {
 void PmmFreePage(PhysicalAddress) {}
+void PmmRequireScrub(PhysicalAddress) {}
 PhysicalAddress PmmAllocPageAccounted(MemTag tag,uint16_t pid,PmmOwner) {
     return PmmAllocPage(tag,pid);
 }
