@@ -433,7 +433,7 @@ bool Presenter1OnLocked(){
     }
     auto& f=g_driver.f[1];
     if(!MapPresenter(p,f,g_driver.HeadOneThird(f.surf[0]))){KPrintf("nv-display: head 1 BAR1 mapping failed\n");(void)g_driver.Down1();return false;}
-    p.age.last[0]=-1;   // C holds the bring-up test pattern, not a desktop frame
+    p.age.Stale(0);   // C holds the bring-up test pattern, not a desktop frame
     p.active=true;g_driver.out1External=true;
     KPrintf("nv-display: head 1 presents by flipping (%u buffers) as output 2 at x=%u\n",p.nbuf,g_presenter[0].width);
     return true;

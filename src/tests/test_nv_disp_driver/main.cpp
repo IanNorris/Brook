@@ -147,7 +147,9 @@ static void TestAgeRepair(){
     assert(a.Apply(1,d[4],3840,2160,cp)==3&&got[0]==d[2].rects[0]&&got[2]==d[4].rects[0]);got.clear(); // B: frames 2..4
     assert(a.Apply(0,d[5],3840,2160,cp)==3&&got[0]==d[3].rects[0]&&got[2]==d[5].rects[0]);got.clear(); // A: frames 3..5
     for(int k=0;k<4;++k)(void)a.Apply(1,d[1],3840,2160,cp);got.clear();
-    assert(a.Apply(2,d[1],3840,2160,cp)==1&&got[0]==full);got.clear();                 // older than the history: full
+    // The third, last written 6 frames ago, gets exactly what it missed (d4, d5, d1 merged), not a full copy.
+    assert(a.Apply(2,d[1],3840,2160,cp)==3&&got[0]==d[4].rects[0]&&got[1]==d[5].rects[0]&&got[2]==d[1].rects[0]);got.clear();
+    a.Stale(1);assert(a.Apply(1,d[2],3840,2160,cp)==1&&got[0]==full);got.clear();      // marked stale: full
     assert(a.Apply(0,brook::DamageRects::Full(3840,2160),3840,2160,cp)==1);got.clear();
     // The same rows damaged every frame (an animation) are copied once, not once per frame.
     brook::DamageRects rows=brook::DamageRects::Rows(0,48,3840);

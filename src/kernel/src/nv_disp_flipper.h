@@ -196,31 +196,32 @@ template<typename B> struct NvWindowFlipper{
         return state==FlipState::Idle;
     }
 };
-// Two-buffer age repair (D2): buffer bb was last written two frames ago, so it lacks the
-// previous frame's damage (which went to the other buffer) plus this frame's. A stale
-// buffer (never written: B at bring-up) or `full` damage gets the whole area.
-// N-buffer age repair: a buffer last written at frame k lacks the damage of frames
-// k+1..n (n = this frame). A short history covers triple buffering; an older or never
-// written buffer (stale) gets the whole area.
+// Buffer-age repair (D2/D3). Each buffer accumulates the damage of every frame presented
+// since it was last written (merged rects; an overflow widens to their bounds, never
+// loses damage), so rendering into it copies exactly what it lacks plus this frame's
+// damage. A never-written buffer (B and the third at bring-up) or `full` damage gets the
+// whole area. The D2 version kept the last 4 frames only: the third buffer, used only
+// when a flip was still armed at present time, was nearly always older than that and
+// got a full 4K copy (22 ms over the gen1 x8 link: 2-3 missed frames, live de398730).
 struct AgeRepair{
-    static constexpr uint32_t kBufs=3,kHist=4;
-    brook::DamageRects hist[kHist]{};uint64_t frame=0;int64_t last[kBufs]{0,-1,-1};
-    void Reset(){for(auto& h:hist)h=brook::DamageRects{};frame=0;last[0]=0;last[1]=last[2]=-1;} // buffer 0 (A) holds the last GOP frame
+    static constexpr uint32_t kBufs=3;
+    brook::DamageRects missing[kBufs]{};
+    void Reset(){for(auto& m:missing)m=brook::DamageRects{};missing[1].full=missing[2].full=true;} // buffer 0 (A) holds the last GOP frame
+    void Stale(int8_t bb){if(bb>=0&&bb<int8_t(kBufs)){missing[bb]=brook::DamageRects{};missing[bb].full=true;}}
     template<typename F> uint32_t Apply(int8_t bb,const brook::DamageRects& d,uint32_t w,uint32_t h,F copy){
         if(bb<0||bb>=int8_t(kBufs))return 0;
-        ++frame;hist[frame%kHist]=d;
+        brook::DamageRects& m=missing[bb];
         uint32_t n=0;
-        const int64_t lb=last[bb];
-        bool whole=lb<0||d.full||frame-uint64_t(lb)>kHist-1;
-        // The frames' damage is merged first: an animation damages the same rows every
-        // frame, and copying them once per missed frame doubled/tripled the PCIe writes.
-        brook::DamageRects merged;
-        if(!whole)for(uint64_t k=uint64_t(lb)+1;k<=frame&&!whole;++k){const auto& r=hist[k%kHist];
-            if(r.full){whole=true;break;}
-            for(uint32_t i=0;i<r.count;++i)merged.Add(r.rects[i]);}
-        if(whole){copy(brook::DamageRect{0,0,int32_t(w),int32_t(h)});n=1;}
-        else for(uint32_t i=0;i<merged.count;++i){copy(merged.rects[i]);++n;}
-        last[bb]=int64_t(frame);return n;
+        if(m.full||d.full){copy(brook::DamageRect{0,0,int32_t(w),int32_t(h)});n=1;}
+        else{for(uint32_t i=0;i<d.count;++i)m.Add(d.rects[i]);
+             for(uint32_t i=0;i<m.count;++i){copy(m.rects[i]);++n;}}
+        m=brook::DamageRects{};
+        for(int8_t i=0;i<int8_t(kBufs);++i){
+            if(i==bb||missing[i].full)continue;
+            if(d.full){missing[i]=brook::DamageRects{};missing[i].full=true;continue;}
+            for(uint32_t k=0;k<d.count;++k)missing[i].Add(d.rects[k]);
+        }
+        return n;
     }
 };
 } // namespace brook::nvdisp
