@@ -444,6 +444,7 @@ target_compile_options(test_virtio_net_tx PRIVATE
 )
 target_link_options(test_virtio_net_tx PRIVATE -Wl,--gc-sections)
 set_tests_properties(test_virtio_net_tx PROPERTIES TIMEOUT 15)
+add_host_test(test_i219_recovery)
 add_host_test(test_e1000)
 target_compile_options(test_e1000 PRIVATE
     -DBROOK_HOST_TEST -ffunction-sections -fdata-sections
