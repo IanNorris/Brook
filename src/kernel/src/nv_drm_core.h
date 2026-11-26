@@ -37,7 +37,8 @@ constexpr uint32_t NV_GETPARAM = 0x00, NV_CHANNEL_ALLOC = 0x02, NV_CHANNEL_FREE 
                    NV_VM_INIT = 0x10, NV_VM_BIND = 0x11, NV_EXEC = 0x12, NV_GEM_NEW = 0x40, NV_GEM_CPU_PREP = 0x42,
                    NV_GEM_CPU_FINI = 0x43, NV_GEM_INFO = 0x44;
 constexpr uint32_t NR_GEM_CLOSE = 0x09;
-constexpr uint32_t VM_BIND_OP_MAP = 0, VM_BIND_OP_UNMAP = 1, VM_BIND_SPARSE = 1u << 8, VM_BIND_RUN_ASYNC = 1;
+constexpr uint32_t VM_BIND_OP_MAP = 0, VM_BIND_OP_UNMAP = 1, VM_BIND_SPARSE = 1u << 8, VM_BIND_RUN_ASYNC = 1,
+                   VM_BIND_KIND_MASK = 0xff;   // nouveau_uvmm: a MAP's PTE kind is op flags & 0xff
 constexpr uint32_t SYNC_SYNCOBJ = 0, SYNC_TIMELINE_SYNCOBJ = 1, SYNC_TYPE_MASK = 0xf;
 constexpr uint32_t CPU_PREP_NOWAIT = 1, CPU_PREP_WRITE = 4;
 constexpr uint64_t kPage = 4096;
@@ -645,7 +646,7 @@ inline void EraseMapping(File& f, uint32_t i) { for (uint32_t j = i; j + 1 < f.n
 // Structural checks for a whole batch at submit (flags, alignment, handles, BO bounds).
 // VA-state checks run per op at apply time (a batch may unmap and remap the same range).
 inline int64_t BindCheck(File& f, const BindOp& o) {
-    if (o.pad || (o.flags & ~VM_BIND_SPARSE)) return kEINVAL;
+    if (o.pad || (o.flags & ~(VM_BIND_SPARSE | VM_BIND_KIND_MASK))) return kEINVAL;   // NVK passes the PTE kind in flags 7:0
     if (!VaValid(f, o.addr, o.range)) return kEINVAL;
     if (o.op == VM_BIND_OP_MAP) {
         const bool sparse = o.flags & VM_BIND_SPARSE;
@@ -680,7 +681,8 @@ inline int64_t BindApply(File& f, const BindOp& o) {
         }
         Bo* b = FindBo(f, o.handle);
         if (!b) return kENOENT;
-        if (!f.be->vas_map(f.be->ctx, f.vas, va, b->aper(), b->backing, o.bo_offset, o.range, b->kind())) return kENOMEM;
+        const uint8_t kind = uint8_t(o.flags & VM_BIND_KIND_MASK) ? uint8_t(o.flags & VM_BIND_KIND_MASK) : b->kind();   // op kind (nouveau), else the BO's tile_flags
+        if (!f.be->vas_map(f.be->ctx, f.vas, va, b->aper(), b->backing, o.bo_offset, o.range, kind)) return kENOMEM;
         ++b->refs;
         return InsertMapping(f, {va, o.range, o.bo_offset, b->handle, false}) ? 0 : kENOSPC;
     }

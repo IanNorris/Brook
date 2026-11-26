@@ -163,6 +163,13 @@ static void TestMemory(const DeviceInfo& dev) {
     assert(Bind(f, {Map(ha, 0x100000, 1 << 20)}) == 0 && g_fake.flushes == fl0 + 1 && pt.size() == 256);
     assert(pt[0x100000].aper == Aper::Vram && pt[0x100000].kind == 0x06 && pt[0x1ff000].pa == pt[0x100000].pa + 0xff000);
     assert(Bind(f, {Map(hg, 0x100000 + (512 << 10), 64 << 10)}) == kEINVAL);    // VA busy
+    {   // NVK passes the PTE kind in op flags 7:0 (nouveau_bo_map / nouveau_uvmm); it wins over the BO's
+        BindOp k = Map(hg, 0x3000000, 4096); k.flags = 0xfe;
+        assert(Bind(f, {k}) == 0 && pt[0x3000000].kind == 0xfe);
+        assert(Bind(f, {Unmap(0x3000000, 4096)}) == 0 && !pt.count(0x3000000));
+        BindOp bad = Map(hg, 0x3000000, 4096); bad.flags = 0x200;
+        assert(Bind(f, {bad}) == kEINVAL);
+    }
     assert(Bind(f, {Map(ha, 0x400000, 4096, (1 << 20) + 4096)}) == kEINVAL);     // past the BO
     assert(Bind(f, {Map(ha, 0xff00000000ull - 4096, 8192)}) == kEINVAL);         // into the kernel-managed range
     assert(Bind(f, {Map(ha, 0x400001, 4096)}) == kEINVAL);
