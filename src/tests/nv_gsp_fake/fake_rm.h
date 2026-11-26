@@ -338,8 +338,10 @@ private:
                 const uint32_t chid = ((c.flags >> 12) & 0x1ff) * 8 + ((c.flags >> 8) & 7);
                 if (!st && chid < 1) st = kErrNoMemory;                     // RM keeps chid 0 (rsvd_chids = 1)
                 if (c.instanceMem.addressSpace != rm::ADDR_FBMEM || c.userdMem.addressSpace != rm::ADDR_FBMEM ||
-                    c.mthdbufMem.addressSpace != rm::ADDR_SYSMEM || !c.mthdbufMem.size || c.gpFifoEntries == 0) st = kErrInvalidArgument;
-                if (!st && !g_.Dma(c.mthdbufMem.base, size_t(c.mthdbufMem.size))) st = kErrInvalidArgument;
+                    (c.mthdbufMem.addressSpace != rm::ADDR_SYSMEM && c.mthdbufMem.addressSpace != rm::ADDR_FBMEM) ||
+                    !c.mthdbufMem.size || c.gpFifoEntries == 0) st = kErrInvalidArgument;
+                // a sysmem method buffer must be real DMA memory; a VRAM one (Brook's default since gsp16m) is not checked
+                if (!st && c.mthdbufMem.addressSpace == rm::ADDR_SYSMEM && !g_.Dma(c.mthdbufMem.base, size_t(c.mthdbufMem.size))) st = kErrInvalidArgument;
                 if (!st && par->second.cls == rm::KEPLER_CHANNEL_GROUP_A && pdb_aper == 9) st = kErrInvalidArgument;   // VAS without a page directory
                 break;
             }
