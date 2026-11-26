@@ -406,7 +406,7 @@ private:
                 break;
             case rm::NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN:
                 if (!obj_is(rm::TURING_CHANNEL_GPFIFO_A) || !token_ctrl_supported) st = kErrNotSupported;
-                else W32(p, (2u << 16) | ChannelChid());
+                else W32(p, (2u << 16) | ChidOf(objs[hObject]));
                 break;
             case 0x20800a32: {   // KGR context-buffer info (internal subdevice)
                 if (!internal || n != sizeof(rm::gr::GET_CONTEXT_BUFFERS_INFO_PARAMS)) { st = kErrInvalidArgument; break; }
@@ -504,6 +504,10 @@ private:
             const uint8_t* d = g.Dma(addr, 8); uint64_t v = 0; if (d) std::memcpy(&v, d, 8); return v;
         }
     };
+    static uint32_t ChidOf(const Obj& o) {
+        const uint32_t f = R32(o.params.data() + 0x14);
+        return ((f >> 12) & 0x1ff) * 8 + ((f >> 8) & 7);
+    }
     uint32_t ChannelChid() {
         for (auto& kv : objs)
             if (kv.second.cls == brook::nvgsp::rm570::TURING_CHANNEL_GPFIFO_A) {
@@ -514,18 +518,20 @@ private:
     }
     size_t doorbells_seen = 0;
     bool HostFail(const std::string& s) { host_error = s; return Fail("host: " + s); }
+    uint64_t cur_root = 0; bool cur_root_set = false;   // the doorbelled channel's VAS root (else the SET_PAGE_DIRECTORY one)
+    uint64_t Root() const { return cur_root_set ? cur_root : pdb; }
+    brook::nvgsp::Aperture RootAper() const {
+        return (cur_root_set || pdb_aper == 0) ? brook::nvgsp::Aperture::Video : brook::nvgsp::Aperture::SysCoh; }
     uint8_t* Va(uint64_t va, size_t n) {
         PtMem m{g_};
-        const auto t = brook::nvgsp::GmmuWalk(m, brook::nvgsp::kGmmuV2, pdb,
-                                              pdb_aper == 0 ? brook::nvgsp::Aperture::Video : brook::nvgsp::Aperture::SysCoh, va);
+        const auto t = brook::nvgsp::GmmuWalk(m, brook::nvgsp::kGmmuV2, Root(), RootAper(), va);
         if (!t.ok || t.aper != brook::nvgsp::Aperture::SysCoh) return nullptr;
         return Mut(t.pa, n);
     }
     // VA -> (aperture, physical); VRAM through the fake's VRAM pages, sysmem through DMA.
     bool Xlate(uint64_t va, brook::nvgsp::Aperture* a, uint64_t* pa) {
         PtMem m{g_};
-        const auto t = brook::nvgsp::GmmuWalk(m, brook::nvgsp::kGmmuV2, pdb,
-                                              pdb_aper == 0 ? brook::nvgsp::Aperture::Video : brook::nvgsp::Aperture::SysCoh, va);
+        const auto t = brook::nvgsp::GmmuWalk(m, brook::nvgsp::kGmmuV2, Root(), RootAper(), va);
         if (!t.ok) return false;
         *a = t.aper; *pa = t.pa; return true;
     }
@@ -565,6 +571,40 @@ private:
         ++ce_launches; ce_bytes += uint64_t(len) * lines;
         return true;
     }
+    // ---- TURING_A model: pitch-linear colour target 0, surface clip, clear value, CLEAR_SURFACE
+    uint32_t gr_chan = 0; bool threed_bound = false;
+    uint32_t ct[8] = {}, ct_select = 0, clip_h = 0, clip_v = 0, render_enable = 1, clear_rgba[4] = {};
+    size_t clears = 0;
+    bool ThreedMethod(uint32_t m, uint32_t d) {
+        if (!threed_bound) return HostFail("3D method before SET_OBJECT");
+        if (m >= 0x800 && m < 0x820) { ct[(m - 0x800) / 4] = d; return true; }
+        if (m >= 0x0d80 && m < 0x0d90) { clear_rgba[(m - 0x0d80) / 4] = d; return true; }
+        switch (m) {
+            case 0x121c: ct_select = d; return true;
+            case 0x1538: return d == 0 ? true : HostFail("depth target");
+            case 0x0ff4: clip_h = d; return true;
+            case 0x0ff8: clip_v = d; return true;
+            case 0x0df8: case 0x0dfc: case 0x0e00: case 0x10f8: return d == 0 ? true : HostFail("window/scissor/clear control");
+            case 0x1558: render_enable = d; return true;
+            case 0x19d0: {
+                if ((d & 0x3c) != 0x3c || (d & 3) || ((d >> 6) & 15)) return HostFail("CLEAR_SURFACE mask");
+                if (ct_select != 1) return HostFail("CT_SELECT");
+                if (ct[4] != 0xcf || !(ct[5] & (1u << 12))) return HostFail("colour target format/layout");
+                if (render_enable != 1) return true;
+                const uint64_t base = (uint64_t(ct[0] & 0xff) << 32) | ct[1];
+                const uint32_t pitch = ct[2], height = ct[3];
+                const uint32_t x0 = clip_h & 0xffff, w = clip_h >> 16, y0 = clip_v & 0xffff, h = clip_v >> 16;
+                if (x0 + w > pitch / 4 || y0 + h > height) return HostFail("clip outside the target");
+                auto c8 = [](uint32_t f) { float v; std::memcpy(&v, &f, 4); if (v < 0) v = 0; if (v > 1) v = 1; return uint32_t(v * 255.0f + 0.5f); };
+                const uint32_t px = (c8(clear_rgba[3]) << 24) | (c8(clear_rgba[0]) << 16) | (c8(clear_rgba[1]) << 8) | c8(clear_rgba[2]);
+                for (uint32_t y = y0; y < y0 + h; ++y)
+                    for (uint32_t x = x0; x < x0 + w; ++x)
+                        if (!CeWrite32(base + uint64_t(y) * pitch + x * 4ull, px)) { ++mmu_faults; return HostFail("3D target not mapped"); }
+                ++clears; return true;
+            }
+            default: return HostFail("3D method");
+        }
+    }
     size_t mmu_faults = 0;
     bool host_stall = false;   // the engine stops making progress (doorbells stay queued)
     bool Host() {
@@ -572,11 +612,16 @@ private:
         namespace rm = brook::nvgsp::rm570;
         while (doorbells_seen < g_.doorbells.size()) {
             const uint32_t token = g_.doorbells[doorbells_seen++];
-            const Obj* ch = nullptr;
-            for (auto& kv : objs) if (kv.second.cls == rm::TURING_CHANNEL_GPFIFO_A) ch = &kv.second;
+            const Obj* ch = nullptr; uint32_t chh = 0;
+            for (auto& kv : objs)
+                if (kv.second.cls == rm::TURING_CHANNEL_GPFIFO_A && ChidOf(kv.second) == (token & 0xffff)) { ch = &kv.second; chh = kv.first; }
             if (!ch || !scheduled) return HostFail("doorbell without a scheduled channel");
             rm::NV_CHANNEL_ALLOC_PARAMS c; std::memcpy(&c, ch->params.data(), sizeof(c));
-            if (token != ((2u << 16) | ChannelChid())) return HostFail("doorbell token");
+            if (token != ((2u << 16) | ChidOf(*ch))) return HostFail("doorbell token");
+            // a device-parent channel walks its own VAS; a TSG channel the SET_PAGE_DIRECTORY one
+            cur_root_set = c.hVASpace && vas_root.count(c.hVASpace);
+            if (cur_root_set) cur_root = vas_root[c.hVASpace];
+            gr_chan = chh;
             const uint64_t userd = c.userdMem.base;
             uint32_t get = g_.Vram32(userd + rm::host::USERD_GP_GET);
             const uint32_t put = g_.Vram32(userd + rm::host::USERD_GP_PUT);
@@ -598,6 +643,13 @@ private:
                         const uint32_t d = R32(pb + 4 * i++);
                         if (subc == 4) { if (!CeMethod(m, d)) return false; continue; }
                         if (subc != 0) return HostFail("subchannel");
+                        if (m == 0) {   // SET_OBJECT on subchannel 0: TURING_A under this channel
+                            bool have = false;
+                            for (auto& kv : objs) if (kv.second.cls == 0xc597 && kv.second.parent == gr_chan) have = true;
+                            if (d != 0xc597 || !have) return HostFail("SET_OBJECT 3D");
+                            threed_bound = true; continue;
+                        }
+                        if (m >= 0x100) { if (!ThreedMethod(m, d)) return false; continue; }
                         if (m == rm::host::NOP) ++nops;
                         else if (m == rm::host::SEM_ADDR_LO) sem_lo = d;
                         else if (m == rm::host::SEM_ADDR_HI) sem_hi = d;

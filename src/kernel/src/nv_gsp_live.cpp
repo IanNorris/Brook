@@ -1232,6 +1232,38 @@ void GrVerb(int mode) {   // 1 golden, 2 off, 0 status
                 g_grLast.rm_status, g_grLast.golden_ok ? 1 : 0, g_grLast.scrubber_ok ? 1 : 0, (unsigned long)us);
     } else if (mode == 2) {
         o.kd("freed", GrStopLive());
+    } else if (mode == 3) {   // step 3: user GR channel, TURING_A clears of a 3840x2160 A8R8G8B8 pitch target
+        if (!c || !g_rmRunning || !g_gr.up) { o.ks("refused", "needs GSP-RM and `gr golden` this boot"); o.send(); return; }
+        static bool tried = false;
+        if (tried) { o.ks("refused", "gr clear already ran this boot"); o.send(); return; }
+        tried = true;
+        GrClearPlan pl;
+        auto sys = [](M2Sys* m, uint32_t bytes) { DmaRegion d; if (!RmAlloc(bytes, &d)) return false;
+            m->cpu = d.cpu; m->bus = d.bus; m->bytes = d.bytes; return true; };
+        if (!sys(&pl.gpfifo, 0x1000) || !sys(&pl.push, 0x1000) || !sys(&pl.sem, 0x1000) || !sys(&pl.mthdbuf, g_gr.mthdbuf_size)) {
+            o.ks("refused", "no sysmem"); o.send(); return; }
+        SpinLock* lock = NvAuxSharedLock();
+        SpinLockAcquire(lock);
+        Pramin<Bar0Bus> pr(g_bus, *c); PraminIo vio{pr};
+        RmWait wait; g_rm->wait_deadline_us = NowUs() + 10000000;
+        GspDoorbell<Bar0Bus, RmSync> bell{g_bus, *c, g_rmSync};
+        alignas(8) static uint8_t scratch[kRmApiBuf];
+        LiveRmApi api(g_rm->ch, g_rm->rx, g_rm->rxcap, wait, bell, scratch);
+        struct ClearSync { GrClearPlan& p; void operator()() { FlushRange(p.gpfifo.cpu, 0x1000); FlushRange(p.push.cpu, 0x1000); } } cs{pl};
+        GrClearResult cr;
+        const uint64_t t0 = NowUs();
+        const GrResult g = RunGrClear(g_bus, *c, vio, api, g_gr, pl, cs, [] { __asm__ volatile("pause"); }, cr);
+        pr.Restore();
+        SpinLockRelease(lock);
+        o.kd("run_us", NowUs() - t0);
+        o.k("clear"); o.raw("{"); o.ks("stage", g.stage); o.ks("status", g.status); o.kh("rm_status", g.rm_status);
+        o.kh("rt_vram", cr.rt_vram); o.kh("token", cr.token); o.kb("first_ok", cr.first_ok); o.kb("verify_ok", cr.verify_ok);
+        o.kh("sample_got", cr.sample_got); o.kh("sample_want", cr.sample_want); o.kd("first_us", cr.first_us);
+        o.kd("best_us", cr.best_us); o.kd("avg_us", cr.n ? cr.sum_us / cr.n : 0); o.kd("n", cr.n); o.kd("bytes", cr.bytes);
+        o.kd("mb_per_s", cr.best_us ? cr.bytes / cr.best_us : 0); o.kd("events_rc", cr.events_rc); o.kd("events_mmu", cr.events_mmu);
+        o.kd("allocated", g.allocated); o.kd("freed", g.freed); o.raw("}");
+        KPrintf("nv-gsp: GR clear %s at %s: first %d verify %d best %u us\n", g.status, g.stage, cr.first_ok ? 1 : 0,
+                cr.verify_ok ? 1 : 0, cr.best_us);
     }
     o.kb("up", g_gr.up);
     GrJson(o, g_grLast);
@@ -1272,6 +1304,7 @@ bool NvGspHandle(const char* command) {
     else if (!strcmp(verb, "gr golden")) GrVerb(1);
     else if (!strcmp(verb, "gr off")) GrVerb(2);
     else if (!strcmp(verb, "gr status")) GrVerb(0);
+    else if (!strcmp(verb, "gr clear")) GrVerb(3);
     else if (!strcmp(verb, "ce-present on")) CePresentVerb(1);
     else if (!strcmp(verb, "ce-present off")) CePresentVerb(2);
     else if (!strcmp(verb, "ce-present status")) CePresentVerb(0);

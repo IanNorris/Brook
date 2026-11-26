@@ -225,6 +225,19 @@ struct Rig {
         vram.Restore();
         return g;
     }
+    GrResult GrClear(GrState& st, GrClearPlan& pl, GrClearResult& cr) {
+        GrApiW wait{this};
+        GspDoorbell<fake_gpu::FakeGpu, NoSync> bell{gpu, kChipTu104, sync};
+        static uint8_t scratch[kRmApiBuf];
+        GrApi api(ch.get(), rx.data(), uint32_t(rx.size()), wait, bell, scratch);
+        Pramin<fake_gpu::FakeGpu> vram(gpu, kChipTu104);
+        auto sys = [&](M2Sys* s, uint32_t bytes) { DmaRegion d; assert(arena(bytes, &d)); s->cpu = d.cpu; s->bus = d.bus; s->bytes = d.bytes; };
+        sys(&pl.gpfifo, 0x1000); sys(&pl.push, 0x1000); sys(&pl.sem, 0x1000); sys(&pl.mthdbuf, st.mthdbuf_size);
+        auto poll = [&] { (void)Wait(); };
+        GrResult g = RunGrClear(gpu, kChipTu104, vram, api, st, pl, sync, poll, cr);
+        vram.Restore();
+        return g;
+    }
     uint32_t GrDown(GrState& st, GrResult& g) {
         GrApiW wait{this};
         GspDoorbell<fake_gpu::FakeGpu, NoSync> bell{gpu, kChipTu104, sync};
@@ -544,6 +557,14 @@ int main(int argc, char** argv) {
         assert(g.golden_entries == 9 && g.scrubber_entries == 8 && r.rm.golden_built && r.rm.scrub_war && r.rm.threed_allocs == 2);
         assert(r.rm.objs.size() == 6);                                 // the scrubber scope stays; the golden one is gone
         assert(st.bufs.b[1].id == rm570::gr::BUF_PAGEPOOL && st.bufs.b[1].vram && !st.bufs.b[2].vram && g.vram_used > 0x700000);   // globals kept
+        // ---- step 3: a user GR channel clears a pitch-linear target (small: the fake writes pixel by pixel)
+        GrClearPlan pl; pl.width = 64; pl.height = 32; pl.repeats = 3;
+        GrClearResult cr;
+        const GrResult c3 = r.GrClear(st, pl, cr);
+        if (!c3.ok()) std::fprintf(stderr, "GR clear: %s at %s (rm %x) host: %s / %s\n", c3.status, c3.stage, c3.rm_status, r.rm.host_error.c_str(), r.rm.gr_error.c_str());
+        assert(c3.ok() && cr.first_ok && cr.verify_ok && cr.n == 3 && r.rm.clears == 4 && cr.token == ((2u << 16) | kGrUserChid));
+        assert(r.gpu.Vram32(cr.rt_vram) == 0xff00ff00u && r.gpu.Vram32(cr.rt_vram + 31ull * 256 + 63 * 4) == 0xff00ff00u);
+        assert(r.rm.objs.size() == 6);                                 // the user scope is freed; the scrubber stays
         assert(r.GrDown(st, g) == 6 && r.rm.objs.empty() && !r.rm.scrub_war && !st.up);
         GrState again; again.up = true;
         assert(!r.GrGolden(again).ok());                                 // once per boot

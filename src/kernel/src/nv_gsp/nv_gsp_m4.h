@@ -81,6 +81,8 @@ struct GrScope {
     uint64_t lpt_page = 0; uint32_t lpt_off = 0x1000; Aperture lpt_aper = Aperture::Video;
     uint64_t buf_vram[16] = {}, buf_va[16] = {};
     uint32_t promoted = 0, pt_pages = 0;
+    uint64_t gpfifo_va = 0;   // 0: the channel never submits (golden, scrubber)
+    uint32_t token = 0;
 };
 
 struct GrResult {
@@ -130,6 +132,11 @@ struct GrCtx {
 
     // client, device, subdevice, VAS (+ page directory hand-over), GR0 channel
     bool Open(GrScope& s, const M2Sys& mthdbuf, uint32_t mthdbuf_size) {
+        return Open(s, mthdbuf, mthdbuf_size, [](auto&) { return true; });
+    }
+    // premap(builder): mappings made before the VA space is bound (no TLB invalidate needed)
+    template <class Premap>
+    bool Open(GrScope& s, const M2Sys& mthdbuf, uint32_t mthdbuf_size, Premap premap) {
         namespace rm = rm570;
         {
             rm::NV0000_ALLOC_PARAMETERS a = {};
@@ -143,6 +150,7 @@ struct GrCtx {
         { rm::NV2080_ALLOC_PARAMETERS sd = {};
           if (!alloc(s, s.base + grh::kDevice, s.base + grh::kSubdevice, rm::NV20_SUBDEVICE_0, &sd, sizeof(sd), "RM_ALLOC subdevice")) return false; }
         if (!builder(s, [](auto&) { return true; })) return false;
+        if (!builder(s, premap)) return false;
         {
             rm::NV_VASPACE_ALLOCATION_PARAMETERS v = {};
             v.index = rm::NV_VASPACE_ALLOCATION_INDEX_GPU_NEW;
@@ -182,7 +190,7 @@ struct GrCtx {
         zero(s.inst, 0x1000); zero(s.userd, 0x1000);
         static rm::NV_CHANNEL_ALLOC_PARAMS a;
         __builtin_memset(&a, 0, sizeof(a));
-        a.gpFifoOffset = 0; a.gpFifoEntries = 0x1000 / 8;    // nouveau: golden/scrubber never submit
+        a.gpFifoOffset = s.gpfifo_va; a.gpFifoEntries = 0x1000 / 8;    // golden/scrubber: 0, they never submit (nouveau)
         a.flags = (s.priv ? rm::NVOS04_PRIVILEGED_CHANNEL_TRUE : 0) | ((s.chid % 8) << rm::NVOS04_USERD_INDEX_VALUE_SHIFT) |
                   ((s.chid / 8) << rm::NVOS04_USERD_INDEX_PAGE_VALUE_SHIFT) | rm::NVOS04_USERD_INDEX_PAGE_FIXED_TRUE;
         a.hVASpace = s.h_vas;
@@ -332,6 +340,143 @@ inline GrResult RunGrGolden(Bus& bus, const ChipOps& c, VramIo& vram, Api& api, 
     r.stage = "done";
     r.bufs = st.bufs;
     return done();
+}
+
+// ---- Step 3: a user GR channel (externally owned VAS, like nouveau's client channels),
+// TURING_A on subchannel 0, and clears of a pitch-linear A8R8G8B8 colour target.
+namespace gr3d {   // TURING_A (NVIDIA clc597.h, MIT)
+constexpr uint32_t SET_COLOR_TARGET_A0 = 0x0800, SET_COLOR_CLEAR_VALUE0 = 0x0d80, SET_WINDOW_OFFSET_X = 0x0df8,
+                   SET_SCISSOR_ENABLE0 = 0x0e00, SET_SURFACE_CLIP_HORIZONTAL = 0x0ff4, SET_CLEAR_SURFACE_CONTROL = 0x10f8,
+                   SET_CT_SELECT = 0x121c, SET_ZT_SELECT = 0x1538, SET_RENDER_ENABLE_C = 0x1558, CLEAR_SURFACE = 0x19d0;
+constexpr uint32_t FORMAT_A8R8G8B8 = 0xcf, MEMORY_LAYOUT_PITCH = 1u << 12, CLEAR_RGBA = 0x3c, RENDER_ENABLE_TRUE = 1;
+}
+constexpr uint64_t kGrVaGp = 0x0000002800000000ull, kGrVaRt = 0x0000002900000000ull;
+constexpr uint32_t kGrUserChid = 4;
+struct GrClearPlan {
+    M2Sys gpfifo, push, sem, mthdbuf; // sysmem pages (mthdbuf: the channel's fault-method buffer, unused by GR)
+    uint32_t width = 3840, height = 2160, repeats = 8;
+};
+struct GrClearResult {
+    const char* status = "ok"; const char* step = "start";
+    uint64_t rt_vram = 0; uint32_t token = 0;
+    bool first_ok = false, verify_ok = false;
+    uint32_t sample_got = 0, sample_want = 0;
+    uint32_t first_us = 0, best_us = 0, sum_us = 0, n = 0;
+    uint32_t events_rc = 0, events_mmu = 0;
+    uint64_t bytes = 0;
+    bool ok() const { return status[0] == 'o' && status[1] == 'k' && !status[2]; }
+};
+inline uint32_t GrF(float f) { uint32_t u; __builtin_memcpy(&u, &f, 4); return u; }
+
+template <class Bus, class Api, class VramIo, class Sync, class Poll>
+inline GrResult RunGrClear(Bus& bus, const ChipOps& c, VramIo& vram, Api& api, GrState& st, const GrClearPlan& pl,
+                           Sync& sync, Poll poll, GrClearResult& cr) {
+    namespace rm = rm570;
+    namespace h = rm::host;
+    GrResult r;
+    if (!st.up) { r.status = "gr golden has not run"; return r; }
+    if (!pl.gpfifo.cpu || !pl.push.cpu || !pl.sem.cpu || !pl.mthdbuf.cpu) { r.status = "sysmem"; return r; }
+    GrCtx<Bus, Api, VramIo> x{bus, api, vram, c, st.arena, r};
+    const uint32_t pitch = pl.width * 4;
+    const uint64_t rt_bytes = (uint64_t(pitch) * pl.height + 0x1fffff) & ~0x1fffffull;
+    r.stage = "user";
+    if (!st.arena.alloc(rt_bytes, 0x200000, &cr.rt_vram)) { r.status = "VRAM arena (colour target)"; return r; }
+    GrScope u; u.base = grh::kUser; u.chid = kGrUserChid; u.external = true; u.priv = true;
+    u.h_vas = u.base + grh::kVaspace; u.h_chan = u.base + grh::kChannel; u.gpfifo_va = kGrVaGp;
+    const M2Sys& mb = pl.mthdbuf;
+    auto premap = [&](auto& b) {
+        return b.Map(kGrVaGp, pl.gpfifo.bus, 0x1000, 12, Aperture::SysCoh, 0, true) &&
+               b.Map(kGrVaGp + 0x1000, pl.push.bus, 0x1000, 12, Aperture::SysCoh, 0, true) &&
+               b.Map(kGrVaGp + 0x2000, pl.sem.bus, 0x1000, 12, Aperture::SysCoh, 0, true) &&
+               b.Map(kGrVaRt, cr.rt_vram, rt_bytes, 21, Aperture::Video);
+    };
+    auto close = [&]() -> GrResult& { const char* keep = r.status; x.Close(u); r.status = keep; r.ev = api.ev;
+        cr.events_rc = api.ev.rc; cr.events_mmu = api.ev.mmu_fault; return r; };
+    if (!x.Open(u, mb, st.mthdbuf_size, premap)) return close();
+    uint32_t entries = 0;
+    if (!x.Promote(u, st.bufs, false, &entries)) return close();
+    if (!x.Threed(u, u.base + grh::kThreed)) return close();
+    r.stage = "schedule";
+    {
+        rm::NVA06F_CTRL_BIND_PARAMS bp = {rm::gr::RM_ENGINE_TYPE_GR0};
+        if (!api.Control(u.base, u.h_chan, rm::NVA06F_CTRL_CMD_BIND, &bp, sizeof(bp))) { x.fail("BIND"); return close(); }
+        rm::NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS sp = {1, 0};
+        if (!api.Control(u.base, u.h_chan, rm::NVA06F_CTRL_CMD_GPFIFO_SCHEDULE, &sp, sizeof(sp))) { x.fail("GPFIFO_SCHEDULE"); return close(); }
+        rm::NVC36F_CTRL_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS tk = {};
+        if (!api.Control(u.base, u.h_chan, rm::NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN, &tk, sizeof(tk))) {
+            x.fail("work submit token"); return close(); }
+        cr.token = tk.workSubmitToken;
+    }
+    // submissions: words + a host semaphore release after WFI; wait (2 s)
+    uint32_t gp = 0, payload = 0x6a000000;
+    auto submit = [&](const uint32_t* w, uint32_t n, uint32_t* us) {
+        uint32_t* p = reinterpret_cast<uint32_t*>(pl.push.cpu);
+        for (uint32_t i = 0; i < n; ++i) p[i] = w[i];
+        const uint32_t want = ++payload;
+        uint32_t q = n;
+        p[q++] = h::IncHeader(0, h::SEM_ADDR_LO, 3);
+        p[q++] = uint32_t(kGrVaGp + 0x2000); p[q++] = uint32_t((kGrVaGp + 0x2000) >> 32); p[q++] = want;
+        p[q++] = h::IncHeader(0, h::SEM_EXECUTE, 1); p[q++] = h::SEM_EXECUTE_RELEASE | h::SEM_EXECUTE_RELEASE_WFI;
+        uint32_t* g = reinterpret_cast<uint32_t*>(pl.gpfifo.cpu) + (gp % 512) * 2;
+        const uint64_t pva = kGrVaGp + 0x1000;
+        g[0] = uint32_t(pva); g[1] = uint32_t(pva >> 32) | (q << 10);
+        sync();
+        gp = (gp + 1) % 512;
+        const uint32_t* sem = reinterpret_cast<const uint32_t*>(pl.sem.cpu);
+        const uint64_t t0 = bus.now_us();
+        vram.wr32(u.userd + h::USERD_GP_PUT, gp);
+        bus.wr32(c.usermode + h::kDoorbell, cr.token);
+        for (;;) {
+            if (__atomic_load_n(&sem[0], __ATOMIC_ACQUIRE) == want) { *us = uint32_t(bus.now_us() - t0); return true; }
+            if (bus.now_us() - t0 > 2000000 || api.ev.rc || api.ev.mmu_fault) { *us = uint32_t(bus.now_us() - t0); return false; }
+            poll();
+        }
+    };
+    uint32_t w[64]; uint32_t n = 0;
+    auto m1 = [&](uint32_t mthd, uint32_t v) { w[n++] = h::IncHeader(0, mthd, 1); w[n++] = v; };
+    auto clear_words = [&](float rr, float gg, float bb, float aa) {
+        w[n++] = h::IncHeader(0, gr3d::SET_COLOR_CLEAR_VALUE0, 4); w[n++] = GrF(rr); w[n++] = GrF(gg); w[n++] = GrF(bb); w[n++] = GrF(aa);
+        m1(gr3d::CLEAR_SURFACE, gr3d::CLEAR_RGBA);
+    };
+    r.stage = "first clear";
+    n = 0;
+    w[n++] = h::IncHeader(0, 0, 1); w[n++] = rm::gr::TURING_A;                          // SET_OBJECT, subchannel 0
+    w[n++] = h::IncHeader(0, gr3d::SET_COLOR_TARGET_A0, 8);
+    w[n++] = uint32_t(kGrVaRt >> 32); w[n++] = uint32_t(kGrVaRt); w[n++] = pitch; w[n++] = pl.height;
+    w[n++] = gr3d::FORMAT_A8R8G8B8; w[n++] = gr3d::MEMORY_LAYOUT_PITCH; w[n++] = 1; w[n++] = 0;
+    m1(gr3d::SET_CT_SELECT, 1);                       // one target: CT0
+    m1(gr3d::SET_ZT_SELECT, 0);                       // no depth/stencil target
+    w[n++] = h::IncHeader(0, gr3d::SET_SURFACE_CLIP_HORIZONTAL, 2); w[n++] = pl.width << 16; w[n++] = pl.height << 16;
+    w[n++] = h::IncHeader(0, gr3d::SET_WINDOW_OFFSET_X, 2); w[n++] = 0; w[n++] = 0;
+    m1(gr3d::SET_SCISSOR_ENABLE0, 0);
+    m1(gr3d::SET_CLEAR_SURFACE_CONTROL, 0);
+    m1(gr3d::SET_RENDER_ENABLE_C, gr3d::RENDER_ENABLE_TRUE);
+    clear_words(1.0f, 0.0f, 1.0f, 1.0f);              // magenta: 0xffff00ff
+    uint32_t us = 0;
+    if (!submit(w, n, &us)) { r.status = api.ev.rc ? "RC during the first clear" : api.ev.mmu_fault ? "MMU fault during the first clear" : "first clear did not complete"; return close(); }
+    cr.first_ok = true; cr.first_us = us;
+    auto check = [&](uint32_t want) {
+        const uint32_t xs[3] = {0, pl.width / 2, pl.width - 1}, ys[3] = {0, pl.height / 2, pl.height - 1};
+        for (uint32_t i = 0; i < 3; ++i) for (uint32_t j = 0; j < 3; ++j) {
+            const uint32_t got = vram.rd32(cr.rt_vram + uint64_t(ys[j]) * pitch + xs[i] * 4ull);
+            if (got != want) { cr.sample_got = got; cr.sample_want = want; return false; }
+        }
+        return true;
+    };
+    if (!check(0xffff00ffu)) { r.status = "first clear: wrong pixels"; return close(); }
+    r.stage = "clears";
+    for (uint32_t k = 0; k < pl.repeats; ++k) {
+        n = 0;
+        if (k & 1) clear_words(1.0f, 0.0f, 1.0f, 1.0f); else clear_words(0.0f, 1.0f, 0.0f, 1.0f);   // green 0xff00ff00
+        if (!submit(w, n, &us)) { r.status = "clear did not complete"; return close(); }
+        if (!cr.best_us || us < cr.best_us) cr.best_us = us;
+        cr.sum_us += us; ++cr.n;
+    }
+    cr.bytes = uint64_t(pitch) * pl.height;
+    cr.verify_ok = check((pl.repeats & 1) ? 0xff00ff00u : 0xffff00ffu) ? true : false;
+    if (!cr.verify_ok) { r.status = "last clear: wrong pixels"; return close(); }
+    r.stage = "done";
+    return close();
 }
 
 // Before RM unload (and on `gr off`): WAR teardown, then free the scrubber scope.
