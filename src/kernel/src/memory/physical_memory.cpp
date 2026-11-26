@@ -51,7 +51,7 @@ static constexpr uint64_t MAX_PHYS_PAGES  = (MAX_PHYS_GB * 1024ULL * 1024 * 1024
 static constexpr uint64_t BITMAP_WORDS    = MAX_PHYS_PAGES / 64; // 524288 words = 4MB
 
 // Marks survive descriptor retirement until the frame is safe to recycle.
-static uint64_t g_scrubAtRelease[BITMAP_WORDS]; // under g_pmmLock, owned RAM only
+static uint64_t g_scrubAtRelease[BITMAP_WORDS]; // atomic, owned RAM only
 #ifdef BROOK_HOST_TEST
 static uint8_t* g_hostDirectMapForScrub;
 #endif
@@ -459,23 +459,53 @@ static inline void PoisonFrameLocked(uint32_t idx, uint16_t ownerPid, uint32_t s
     }
 }
 
-// Caller MUST hold g_pmmLock. Release a frame's bitmap bit + free accounting.
-static inline void ReleaseFrameLocked(uint32_t idx)
+static uint64_t ScrubBit(uint32_t idx)
 {
-    auto& marks=g_scrubAtRelease[idx/64];
-    const uint64_t bit=1ULL<<(idx%64);
-    if (marks & bit) {
+    return 1ULL<<(idx%64);
+}
+
+static bool ScrubRequired(uint32_t idx)
+{
+    return __atomic_load_n(&g_scrubAtRelease[idx/64],__ATOMIC_RELAXED)&ScrubBit(idx);
+}
+
+// This list is detached, with all of its frames still reserved in the bitmap.
+// No future owner can mark or write a frame before it is returned to the pool.
+static void ScrubRetiredFrames(uint32_t head)
+{
+    for (uint32_t idx=head;idx!=PMM_NULL_PAGE;idx=Desc(idx).next) {
+        if (!ScrubRequired(idx)) continue;
         auto* bytes=reinterpret_cast<void*>(PhysToVirt(PhysicalAddress(uint64_t(idx)*PAGE_SIZE)).raw());
 #ifdef BROOK_HOST_TEST
         if (g_hostDirectMapForScrub) bytes=g_hostDirectMapForScrub+uint64_t(idx)*PAGE_SIZE;
 #endif
         memset(bytes,0,PAGE_SIZE);
-        marks &= ~bit;
+        __atomic_fetch_and(&g_scrubAtRelease[idx/64],~ScrubBit(idx),__ATOMIC_RELAXED);
     }
+}
+
+// Caller MUST hold g_pmmLock. Release a frame's bitmap bit + free accounting.
+static inline void ReleaseFrameLocked(uint32_t idx)
+{
     SetFree(idx);
     g_freePages++;
     if (idx < Dma32Pages) { if (idx < g_lowHint) g_lowHint = idx; }
     else if (idx < g_nextHint) g_nextHint = idx;
+}
+
+// Without a quarantine worker, a caller keeps its marked frames reserved
+// until it can scrub them outside the allocator lock and release them.
+static void ReleaseImmediateScrubList(uint32_t head)
+{
+    if (head==PMM_NULL_PAGE) return;
+    ScrubRetiredFrames(head);
+    const auto flags=IrqSpinLockAcquire(&g_pmmLock);
+    while (head!=PMM_NULL_PAGE) {
+        const uint32_t idx=head;
+        head=Desc(idx).next;
+        ReleaseFrameLocked(idx);
+    }
+    IrqSpinLockRelease(&g_pmmLock,flags);
 }
 
 // Caller MUST hold g_pmmLock. Retire a frame that reached refcount 0 (descriptor
@@ -484,7 +514,7 @@ static inline void ReleaseFrameLocked(uint32_t idx)
 // so the allocator skips it until the drainer puts it through an all-CPU TLB
 // barrier. `ownerPid` is the frame's owner captured BEFORE the descriptor reset,
 // used to stamp the forensic poison (the "thing that owned it originally").
-static inline void RetireFrameLocked(uint32_t idx, uint16_t ownerPid)
+static inline void RetireFrameLocked(uint32_t idx, uint16_t ownerPid,uint32_t& scrubNow)
 {
     PoisonFrameLocked(idx, ownerPid, g_freeLogSeq);
     // Pre-tracking / pre-SMP (g_pageDescs not yet allocated) OR quarantine off:
@@ -492,7 +522,10 @@ static inline void RetireFrameLocked(uint32_t idx, uint16_t ownerPid)
     // entry — the local invlpg already sufficed and immediate release is correct.
     if (!g_quarantineOn || !g_pageDescs)
     {
-        ReleaseFrameLocked(idx);
+        if (ScrubRequired(idx)) {
+            Desc(idx).next=scrubNow;
+            scrubNow=idx;
+        } else ReleaseFrameLocked(idx);
         return;
     }
     Desc(idx).next = g_quarHead;     // frame stays bitmap-USED (not allocatable)
@@ -585,6 +618,8 @@ static void PmmDrainThread(void* /*arg*/)
                 __atomic_store_n(&g_drainStats.maxBatch, n, __ATOMIC_RELAXED);
             if (virtualBatch) VmmCompleteReclaim();
 
+            // Scrub only after the barrier, with the frames still reserved.
+            ScrubRetiredFrames(head);
             // Now safe to return the batch's frames to the allocatable pool. Walk
             // the list (reading next BEFORE releasing, since release may let the
             // frame be reallocated and its descriptor reused).
@@ -943,7 +978,7 @@ void PmmRequireScrub(PhysicalAddress frame)
     if (!frame || idx>=g_totalPages || !g_pageDescs) return;
     const auto lock=IrqSpinLockAcquire(&g_pmmLock);
     if (IsUsed(idx) && Desc(idx).refCount && Desc(idx).tag!=static_cast<uint8_t>(MemTag::Device))
-        g_scrubAtRelease[idx/64] |= 1ULL<<(idx%64);
+        __atomic_fetch_or(&g_scrubAtRelease[idx/64],ScrubBit(idx),__ATOMIC_RELAXED);
     IrqSpinLockRelease(&g_pmmLock,lock);
 }
 
@@ -1013,9 +1048,10 @@ void PmmFreePage(PhysicalAddress physAddr)
 
     // Retire (quarantine then release the oldest) — defers reuse so a stale TLB
     // entry for this frame is gone before it is handed to a new owner.
-    RetireFrameLocked(static_cast<uint32_t>(idx), freedOwnerPid);
-
+    uint32_t scrubNow=PMM_NULL_PAGE;
+    RetireFrameLocked(static_cast<uint32_t>(idx), freedOwnerPid,scrubNow);
     IrqSpinLockRelease(&g_pmmLock, pmmFlags);
+    ReleaseImmediateScrubList(scrubNow);
 }
 
 MemTag PmmGetTag(PhysicalAddress physAddr)
@@ -1178,9 +1214,11 @@ void PmmUnrefPage(PhysicalAddress physAddr)
           static_cast<uint8_t>(MemTag::Free), PmmOwner::Automatic, 0, 0 };
     // Quarantine the frame (defer reuse) instead of releasing it immediately,
     // so a stale TLB entry is gone before the frame is handed to a new owner.
+    uint32_t scrubNow=PMM_NULL_PAGE;
     if (retire)
-        RetireFrameLocked(idx, freedOwnerPid);
+        RetireFrameLocked(idx, freedOwnerPid,scrubNow);
     IrqSpinLockRelease(&g_pmmLock, pmmFlags);
+    ReleaseImmediateScrubList(scrubNow);
 }
 
 // BRO-176/179 stale-mapping detector --------------------------------------------
@@ -1561,6 +1599,7 @@ void PmmKillPid(uint16_t pid)
 
     uint64_t pmmFlags = IrqSpinLockAcquire(&g_pmmLock);
 
+    uint32_t scrubNow=PMM_NULL_PAGE;
     uint32_t idx = g_pidLists[pid].head;
     [[maybe_unused]] uint32_t count = 0;
     [[maybe_unused]] uint32_t shared = 0;
@@ -1594,7 +1633,7 @@ void PmmKillPid(uint16_t pid)
             Desc(idx) = { PMM_NULL_PAGE, PMM_NULL_PAGE, 0,
                           static_cast<uint8_t>(MemTag::Free), PmmOwner::Automatic, 0, 0 };
             if (retire)
-                RetireFrameLocked(idx, pid);
+                RetireFrameLocked(idx, pid,scrubNow);
         }
         count++;
 
@@ -1604,6 +1643,7 @@ void PmmKillPid(uint16_t pid)
     g_pidLists[pid] = { PMM_NULL_PAGE, PMM_NULL_PAGE, 0, 0 };
 
     IrqSpinLockRelease(&g_pmmLock, pmmFlags);
+    ReleaseImmediateScrubList(scrubNow);
 
     DbgPrintf("PMM: PmmKillPid(%u): processed %u pages (%u shared, refcount decremented)\n",
                  static_cast<uint32_t>(pid), count, shared);
@@ -1616,6 +1656,7 @@ void PmmFreeByTag(uint16_t pid, MemTag tag)
 
     uint64_t pmmFlags = IrqSpinLockAcquire(&g_pmmLock);
 
+    uint32_t scrubNow=PMM_NULL_PAGE;
     uint32_t idx = g_pidLists[pid].head;
     uint32_t count = 0;
 
@@ -1641,7 +1682,7 @@ void PmmFreeByTag(uint16_t pid, MemTag tag)
             ChargeOwner(Desc(idx), PmmOwner::Automatic);
             Desc(idx) = { PMM_NULL_PAGE, PMM_NULL_PAGE, 0,
                           static_cast<uint8_t>(MemTag::Free), PmmOwner::Automatic, 0, 0 };
-            RetireFrameLocked(idx, pid);
+            RetireFrameLocked(idx, pid,scrubNow);
             count++;
         }
 
@@ -1649,6 +1690,7 @@ void PmmFreeByTag(uint16_t pid, MemTag tag)
     }
 
     IrqSpinLockRelease(&g_pmmLock, pmmFlags);
+    ReleaseImmediateScrubList(scrubNow);
 
     (void)count;
     DbgPrintf("PMM: PmmFreeByTag(%u, %u): freed %u pages\n",

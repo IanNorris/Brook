@@ -67,8 +67,12 @@ int64_t sys_ftruncate(uint64_t fd, uint64_t length, uint64_t,
             if ((FdStatus(fde) & 3) == 0) return -EINVAL;
             auto* mfd = static_cast<MemFdData*>(fde->handle);
             MfdLock(mfd);
-            if (mfd->secretSpace && (!proc->addressSpace || mfd->secretSpace!=proc->addressSpace->identity ||
-                (mfd->size && length!=mfd->size))) {MfdUnlock(mfd);return -EPERM;}
+            if (mfd->secretSpace) {
+                if (!proc->addressSpace || mfd->secretSpace!=proc->addressSpace->identity) {
+                    MfdUnlock(mfd);return -EPERM;
+                }
+                if (mfd->size) {MfdUnlock(mfd);return -EINVAL;}
+            }
             if(int error=MemFdSealedResize(mfd->seals,mfd->size,length)) {MfdUnlock(mfd);return error;}
             if (!MemFdGrowLocked(mfd, length)) { MfdUnlock(mfd); return -ENOMEM; }
             // Shrinking ftruncate: free pages past the new tail. (Growth is

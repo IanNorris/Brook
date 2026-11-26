@@ -162,6 +162,7 @@ uint32_t UserMappingReadArguments(AddressSpaceState* space,uint64_t offset,void*
             const uint64_t leaf=VmmReadLeaf(space->pageTable,VirtualAddress(address));
             const auto* range=MappingRangeFind(space->ranges,address);
             if (!range || range->kind==MappingKind::Device || !(range->protection&1) || !(leaf&VMM_PRESENT) || !(leaf&VMM_USER) ||
+                (range->dumpFlags & MappingSecretFd) ||
                 (forCoreDump && (range->dumpFlags & MappingSecret))) break;
             uint64_t chunk=4096-(address&4095);if (chunk>remaining) chunk=remaining;
             const auto* source=reinterpret_cast<const uint8_t*>(PhysToVirt(VmmLeafPhysical(leaf)).raw())+(address&4095);
@@ -570,6 +571,7 @@ int64_t UserMappingAdviseDump(Process* actor,AddressSpaceState* space,uint64_t a
     if (!actor || !space || (address & 4095)) return -22;
     if (!length) return 0;
     if (!UserInterval(address,length,end)) return -22;
+    PageableDumpAdviceGuard advice(exclude);
     MappingTransaction operation(actor,space);
     if (!operation.PrepareRanges(2) || !operation.Lock()) return -12;
     for (uint64_t at=address;at<end;) {
@@ -577,8 +579,6 @@ int64_t UserMappingAdviseDump(Process* actor,AddressSpaceState* space,uint64_t a
         if (!range) return -12;
         if (!exclude && (range->dumpFlags & MappingSecretFd)) return -22;
         const uint64_t stop=range->end<end?range->end:end;
-        if (exclude && range->kind==MappingKind::Pageable &&
-            !PageableMemoryCanExcludeFromDump(*range,at,stop)) return -16;
         uint64_t leaves=0;
         if (exclude && range->kind!=MappingKind::Device && !operation.RangeLeafCount(at,stop,leaves))
             return -22;
@@ -588,6 +588,7 @@ int64_t UserMappingAdviseDump(Process* actor,AddressSpaceState* space,uint64_t a
     if (exclude) for (uint64_t at=address;at<end;) {
         const auto* range=MappingRangeFind(space->ranges,at);
         const uint64_t stop=range->end<end?range->end:end;
+        if (range->kind==MappingKind::Pageable)PageableMemoryMarkDumpExcluded(*range,at,stop);
         if (range->kind!=MappingKind::Device && !VmmRequireScrubRange(space->pageTable,at,stop))
             KernelPanic("mapping: unsupported leaf in secret range");
         at=stop;

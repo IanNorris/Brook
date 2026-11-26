@@ -14,7 +14,20 @@ struct MappingRangeTable;
 struct UserMappingRequest;
 struct MappingBacking;
 struct MappingRange;
-bool PageableMemoryCanExcludeFromDump(const MappingRange&,uint64_t begin,uint64_t end);
+// Take before AS mutation. An in-flight write may finish, but later writes
+// must observe advice before touching the store.
+class PageableDumpAdviceGuard {
+public:
+    explicit PageableDumpAdviceGuard(bool enabled=true);
+    ~PageableDumpAdviceGuard();
+    PageableDumpAdviceGuard(const PageableDumpAdviceGuard&)=delete;
+    PageableDumpAdviceGuard& operator=(const PageableDumpAdviceGuard&)=delete;
+private:
+    bool held_;
+};
+// Caller holds AS mutation. Cancel unissued evictions and mark recovery
+// frames that have no published PTE.
+void PageableMemoryMarkDumpExcluded(const MappingRange&,uint64_t begin,uint64_t end);
 // Prepare empty replacement metadata outside AS mutation. TransferLocked moves
 // existing entry ownership only after metadata/PTE commit; no backing I/O or
 // token/reference duplication is needed. Declare before the transaction.

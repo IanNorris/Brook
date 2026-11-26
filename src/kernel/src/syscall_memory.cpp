@@ -231,9 +231,13 @@ MappingFaultResult ResolveMappingFaultForSpace(Process* actor,AddressSpaceState*
         } else if (kind==MappingKind::MemFd) {
             auto* backing=static_cast<MemFdData*>(snapshot.range.backing->object);
             const uint64_t offset=snapshot.range.offset+page-snapshot.range.begin;
-            if (offset>=__atomic_load_n(&backing->size,__ATOMIC_ACQUIRE)) return MappingFaultResult::Unhandled;
-            auto physical=MemFdGetOrAllocPage(backing,offset/4096,space->allocationPid);
-            if (!physical || !operation.StagePage(0,physical,false)) return MappingFaultResult::Unhandled;
+            if (offset>=__atomic_load_n(&backing->size,__ATOMIC_ACQUIRE)) {
+                if (!backing->secretSpace) return MappingFaultResult::Unhandled;
+                prepared=MappingFaultResult::EndOfFile;
+            } else {
+                auto physical=MemFdGetOrAllocPage(backing,offset/4096,space->allocationPid);
+                if (!physical || !operation.StagePage(0,physical,false)) return MappingFaultResult::Unhandled;
+            }
         } else if (!operation.PrepareZeroed(MemTag::User,operation.Space()->allocationPid)) return MappingFaultResult::Unhandled;
         if (!MappingFaultTestBarrier(operation.Space(),page,2)) return MappingFaultResult::Unhandled;
         if(!operation.LockFaultRange(page))return MappingFaultResult::OutOfMemory;
@@ -382,7 +386,7 @@ int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         MfdLock(mfd);
         if (mfd->secretSpace) {
             if (mfd->secretSpace!=proc->addressSpace->identity) {MfdUnlock(mfd);return -EPERM;}
-            if (!(flags&MAP_SHARED) || (prot&4) || offset>=mfd->size || length>mfd->size-offset) {
+            if (!(flags&MAP_SHARED) || (prot&4)) {
                 MfdUnlock(mfd);return -EINVAL;
             }
             maximum &= ~4u;
@@ -390,7 +394,7 @@ int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
             request.range.forkFlags=MappingForkSkip;
         }
         if((flags&MAP_SHARED) && (prot&2) && (mfd->seals.bits&8)) {MfdUnlock(mfd);return -EPERM;}
-        if (!MemFdGrowLocked(mfd,offset+length)) {MfdUnlock(mfd);return -ENOMEM;}
+        if (!mfd->secretSpace && !MemFdGrowLocked(mfd,offset+length)) {MfdUnlock(mfd);return -ENOMEM;}
         int admitted=MemFdAdmitMapping(mfd->seals,flags&MAP_SHARED,static_cast<uint32_t>(prot),&maximum);
         if(admitted) {MfdUnlock(mfd);return admitted;}
         MemFdRef(mfd);MfdUnlock(mfd);

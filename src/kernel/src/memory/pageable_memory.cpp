@@ -25,6 +25,7 @@ namespace brook {
 namespace {
 PageStore store;
 KMutex storeLock;
+KMutex dumpAdviceLock;
 bool ready=false;
 bool applicationClock=false;
 PageableApplicationPolicy applicationPolicy;
@@ -157,7 +158,7 @@ uint64_t forkFailureSpace=0;
 unsigned growthFailure=0;
 uint64_t growthFailureSpace=0;
 enum class State : uint8_t { Resident, Evicting, Stored, Recovery, Zero, Discarded };
-struct Entry { uint64_t slot;PhysicalAddress recovery;State state;uint16_t owner; };
+struct Entry { uint64_t slot;PhysicalAddress recovery;State state;uint16_t owner;bool cancelEviction; };
 struct Region { uint64_t pages,heldFrames;bool accountingVisited;Entry entries[1]; };
 struct Frame {
     PhysicalAddress physical;
@@ -252,7 +253,7 @@ int64_t PageOut(Process* actor,uint64_t page,PhysicalAddress* handoff=nullptr,bo
         if(PmmGetRefCount(physical)!=1 || PmmGetMapCount(physical)!=1)return -16;
         PmmRefPage(physical);frame.physical=physical;
         backing.value=range->backing;MappingBackingRef(backing.value);
-        entry.slot=token;entry.state=State::Evicting;
+        entry.slot=token;entry.state=State::Evicting;entry.cancelEviction=false;
         VmmOwnedLeaf detached{};
         if(!op.Detach(VirtualAddress(page),&detached)){entry.slot=0;entry.state=State::Resident;return -12;}
         if(!detached.raw || VmmLeafPhysical(detached.raw)!=physical)KernelPanic("paging: detached leaf changed");
@@ -260,8 +261,19 @@ int64_t PageOut(Process* actor,uint64_t page,PhysicalAddress* handoff=nullptr,bo
         slot.token=0; // region now owns the slot; local backing pin keeps it live
     } // successful detach's destructor has completed the full-AS TLB ACK
     if(detachmentAcknowledged)*detachmentAcknowledged=true;
-    int result;bool rejectRollback=false;
-    {StoreGuard guard;rejectRollback=injectedFailure==6;result=store.Store(token,reinterpret_cast<void*>(PhysToVirt(frame.physical).raw()));}
+    PageableDumpAdviceGuard advice;
+    KMutexLock(&space->mutation);
+    // Advice can mark an in-flight eviction while detach waits for its ACK.
+    // The cancellation belongs to the pinned backing, even if its VMA moves.
+    const bool secret=static_cast<Region*>(backing.value->object)->entries[index].cancelEviction;
+    KMutexUnlock(&space->mutation);
+    int result=-95;bool rejectRollback=false;
+    if(secret)PmmRequireScrub(frame.physical);
+    else {
+        StoreGuard guard;
+        rejectRollback=injectedFailure==6;
+        result=store.Store(token,reinterpret_cast<void*>(PhysToVirt(frame.physical).raw()));
+    }
     // No preparation/allocation is needed for completion. Only this dedicated
     // anonymous backing can be mutated; never enter filesystem code here.
     KMutexLock(&space->mutation);
@@ -294,6 +306,7 @@ int64_t PageOut(Process* actor,uint64_t page,PhysicalAddress* handoff=nullptr,bo
 }
 int64_t SpillStoredPage(Process* actor,uint64_t page) {
     if(page&4095)return -22;
+    PageableDumpAdviceGuard advice;
     MappingTransaction op(actor,actor->addressSpace);
     if(!op.LockFaultRange(page))return -12;
     MappingFaultSnapshot snapshot{};
@@ -497,7 +510,7 @@ void PageableMemoryGrowth::TransferLocked(const MappingRange& range) {
             if(!old->heldFrames)KernelPanic("paging: growth held-frame underflow");
             --old->heldFrames;++next->heldFrames;
         }
-        entry={0,{},State::Discarded,0};
+        entry={0,{},State::Discarded,0,false};
     }
 }
 bool PageableMemoryGrowth::DestinationDisjointLocked(const MappingRange& source,uint64_t begin,uint64_t end) const {
@@ -687,7 +700,7 @@ void PageableMemoryRetirement::Commit(bool resetToZero) {
             if(!region->heldFrames)KernelPanic("paging: retirement held-frame underflow");
             --region->heldFrames;
         }
-        *page.entry={0,{},resetToZero?State::Zero:State::Discarded,0};
+        *page.entry={0,{},resetToZero?State::Zero:State::Discarded,0,false};
     }
     committed_=true;
 }
@@ -726,7 +739,7 @@ void PageableMemoryBootInit() {
         for(unsigned i=0;i<allocated;++i)PmmUnrefPage(initial[i]);kfree(records);return;
     }
     for(auto frame:initial)if(!faultReserve.Push(frame))KernelPanic("paging: reserve initialization");
-    KMutexInit(&storeLock);AttachRamCompression();ready=true;
+    KMutexInit(&storeLock);KMutexInit(&dumpAdviceLock);AttachRamCompression();ready=true;
     char refill[2]{};auto refillSize=FwCfgReadFile("opt/page-store-refill",refill,sizeof(refill));
     if(refillSize) {
         refillEnabled=refillSize==1 && refill[0]=='1';
@@ -773,25 +786,29 @@ void PageableMemoryBootInit() {
 // A private, explicit fixture: no firmware/device configuration or guest ABI.
 bool PageableHostInitialize(const PageStoreHeader& header,uint64_t bytes,PageStoreSlot* slots,uint64_t count,PageStoreIo io) {
     if(ready || !store.Initialize(header,bytes,slots,count,io))return false;
-    KMutexInit(&storeLock);ready=true;return true;
+    KMutexInit(&storeLock);KMutexInit(&dumpAdviceLock);ready=true;return true;
 }
 int64_t PageableHostMap(Process* actor,uint64_t bytes){return Map(actor,bytes);}
 int64_t PageableHostPageOut(Process* actor,uint64_t address){PhysicalAddress retired;auto result=PageOut(actor,address,&retired);if(retired)PmmUnrefPage(retired);return result;}
 void PageableHostFailRollback(bool enabled){injectedFailure=enabled?6:0;}
+int64_t PageableHostSpill(Process* actor,uint64_t address){return SpillStoredPage(actor,address);}
 #endif
-bool PageableMemoryCanExcludeFromDump(const MappingRange& range,uint64_t begin,uint64_t end) {
-    if (!range.backing || range.backing->release!=ReleaseRegion) return false;
-    const auto* region=static_cast<const Region*>(range.backing->object);
+PageableDumpAdviceGuard::PageableDumpAdviceGuard(bool enabled):held_(enabled && ready) {
+    if(held_)KMutexLock(&dumpAdviceLock);
+}
+PageableDumpAdviceGuard::~PageableDumpAdviceGuard() {
+    if(held_)KMutexUnlock(&dumpAdviceLock);
+}
+void PageableMemoryMarkDumpExcluded(const MappingRange& range,uint64_t begin,uint64_t end) {
+    if (!range.backing || range.backing->release!=ReleaseRegion) return;
+    auto* region=static_cast<Region*>(range.backing->object);
     const uint64_t first=(range.offset+begin-range.begin)/4096;
     const uint64_t last=first+(end-begin)/4096;
-    if (last>region->pages) return false;
-    for (uint64_t i=first;i<last;++i) {
-        const auto state=region->entries[i].state;
-        // A successful opt-out makes no promise about bytes already written to
-        // an experimental page store. Require the caller to fault them in first.
-        if (state!=State::Zero && state!=State::Resident) return false;
+    for (uint64_t i=first;i<last && i<region->pages;++i) {
+        auto& entry=region->entries[i];
+        if (entry.state==State::Evicting)entry.cancelEviction=true;
+        else if (entry.state==State::Recovery)PmmRequireScrub(entry.recovery);
     }
-    return true;
 }
 PageableBackingStatus PageableMemoryBackingStatus() {
     PageableBackingStatus status{};status.configured=ready;
