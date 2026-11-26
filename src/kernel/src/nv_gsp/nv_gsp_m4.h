@@ -69,9 +69,11 @@ inline void GrBuildBufs(const rm570::gr::GET_CONTEXT_BUFFERS_INFO_PARAMS& p, GrB
     }
 }
 
-// A/B (26 Nov GR idle fault bisect): put the channel's method buffer in VRAM instead of
+// GR idle fault (26 Nov): a sysmem method buffer on a long-lived GR channel (the scrubber) leads,
+// ~1 s later, to a PCIe Engine error, PMU halt and Xid 62; in VRAM it does not. Default VRAM;
+// `gr mthdbuf sys` restores the nouveau-style sysmem buffer. Formerly: put the method buffer in VRAM instead of
 // sysmem (nouveau uses sysmem; this only tests whether a sysmem DMA is the faulting one).
-inline bool g_grMthdbufVram = false;
+inline bool g_grMthdbufVram = true;
 
 // One client scope with a GR0 channel.
 struct GrScope {
