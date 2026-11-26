@@ -1,3 +1,4 @@
+#include "fido_hidraw.h"
 // syscall_fd.cpp -- descriptor table syscalls: close/close_range/dup/lseek/fcntl and descriptor teardown.
 //
 // Split from syscall.cpp.
@@ -96,6 +97,7 @@ void FinalizeClosedFd(const FdClaimResult& c)
 
     if(c.type==FdType::NetlinkSocket && c.handle)NetlinkUnref(static_cast<NetlinkSocket*>(c.handle));
     if (c.type == FdType::SignalFd && c.handle) SignalFdUnref(static_cast<SignalFd*>(c.handle));
+    if (c.type == FdType::DevHidraw) HidrawUnref(static_cast<HidrawFile*>(c.handle));
     if (c.type == FdType::SyncFile && c.handle) SyncFileUnref(static_cast<SyncFileData*>(c.handle));
 
     if (c.type == FdType::EventFd && c.handle)
@@ -305,6 +307,8 @@ void FdBumpRefcount(const FdEntry* fde)
         break;
     case FdType::SignalFd:
         SignalFdRef(static_cast<SignalFd*>(fde->handle));break;
+    case FdType::DevHidraw:
+        HidrawRef(static_cast<HidrawFile*>(fde->handle));break;
     case FdType::SyncFile:
         SyncFileRef(static_cast<SyncFileData*>(fde->handle));break;
     case FdType::EventFd:

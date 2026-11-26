@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Prove signed profile staging and rollback on a disposable BROOK_SYSTEM."""
 import argparse
+import base64
 import errno
 import hashlib
 import json
@@ -20,6 +21,51 @@ from hardware_bulk_workflow import BulkRun
 from profile_cache_bundle import pack_cache
 from hardware_update_workflow import UpdateRun
 from binary_bridge import receiver_key
+from stage_nar import layout_digest
+from stage_selected_space import layout_usage
+
+
+def long_store_plan(output):
+    """Build a fixture NAR with a Steam-style certificate path."""
+    member = '0' * 32 + '-brook-steam-client-steamrt64-qa'
+    output_path = output / member
+    relative = Path('runtime-' + 'a' * 156) / 'ca-certificates/mozilla' / (
+        'Hellenic_Academic_and_Research_Institutions_ECC_RootCA_2015.crt')
+    file = output_path / relative
+    file.parent.mkdir(parents=True)
+    file.write_bytes(b'long Brook store path\n')
+    target = f'/nix/store/{member}/{relative}'
+    assert len(target.encode()) > 255
+    layout = {'directories': [str(path) for path in reversed(relative.parents) if path != Path('.')], 'links': {
+        str(relative): target,
+    }}
+    cache = output / 'cache'
+    (cache / 'nar').mkdir(parents=True)
+    archive = cache / 'nar' / 'long-path.nar'
+    with archive.open('wb') as stream:
+        subprocess.run(['nix-store', '--dump', output_path], stdout=stream, check=True)
+    content = archive.read_bytes()
+    entry = {
+        'source': 'brook', 'references': [], 'narSize': len(content),
+        'narHash': 'sha256-' + base64.b64encode(hashlib.sha256(content).digest()).decode('ascii'),
+        'storeInodes': len(layout['directories']) + 2,
+    }
+    (cache / (member[:32] + '.narinfo')).write_text(
+        f'StorePath: /nix/store/{member}\nURL: nar/long-path.nar\nCompression: none\n'
+        f'NarHash: {entry["narHash"]}\nNarSize: {entry["narSize"]}\nReferences: \n')
+    plan = {'format': 3, 'sequence': 1, 'roots': [member], 'packages': [],
+            'cache': {'brook': None, 'mirrorUpstream': False}, 'closure': {member: entry},
+            'profile': {'root': member, 'layoutSha256': layout_digest(layout),
+                        'launcherIds': [], 'space': layout_usage(layout)}}
+    return plan, next(pack_cache(cache, plan, output)), target
+
+
+def sign_long_store_plan(output, key, plan, sequence):
+    document = output / f'long-path-{sequence}.json'
+    signature = output / f'long-path-{sequence}.sig'
+    document.write_text(json.dumps({**plan, 'sequence': sequence}) + '\n')
+    subprocess.run(['openssl', 'pkeyutl', '-sign', '-rawin', '-inkey', key,
+                    '-in', document, '-out', signature], check=True)
 
 
 def main():
@@ -27,8 +73,13 @@ def main():
     for name in ('files', 'store', 'operator-seed', 'output', 'plan', 'public-key'):
         parser.add_argument('--' + name, type=Path, required=True)
     parser.add_argument('--canary', default='brook-ota-canary')
-    parser.add_argument('--expect-refusal', choices=('space', 'bind'))
+    case = parser.add_mutually_exclusive_group()
+    case.add_argument('--expect-refusal', choices=('space', 'bind'))
+    case.add_argument('--long-path-fixture-key', type=Path,
+                      help='test only long store paths with the disposable private plan key')
     parser.add_argument('--accel', choices=('kvm', 'tcg'), default='kvm')
+    parser.add_argument('--apply-timeout-s', type=int, default=480,
+                        help='guest apply bound; large plans (GB of new paths) need longer')
     args = parser.parse_args()
     if not re.fullmatch(r'[A-Za-z0-9_-]+', args.canary):
         parser.error('Expected a basename for the profile canary')
@@ -88,6 +139,49 @@ def main():
         result['outside_p2_unchanged'] = True
         (args.output / 'verdict.json').write_text(json.dumps(result, indent=2) + '\n')
         print(args.output / 'verdict.json')
+
+    if args.long_path_fixture_key:
+        plan, archive, target = long_store_plan(args.output)
+        for sequence in (1, 2):
+            sign_long_store_plan(args.output, args.long_path_fixture_key, plan, sequence)
+        empty_cache = args.output / 'empty-cache'
+        empty_cache.mkdir()
+        empty = next(pack_cache(args.output / 'cache', plan, empty_cache, missing=set()))
+        guest, bridge = boot('long-store')
+        try:
+            init = rtx.Run(bridge, args.output / 'bootstrap').profile_bootstrap(guest.session)
+            assert init['state'] == 'profile_initialized', init
+            usb = ['/boot/bin/bash', '/boot/USBSTAGE.RC']
+            bundle = push(guest, bridge, archive)
+            no_archives = push(guest, bridge, empty)
+            for sequence in (1, 2):
+                files = (args.output / f'long-path-{sequence}.{ext}' for ext in ('json', 'sig'))
+                paths = [push(guest, bridge, path) for path in files]
+                check = wait(guest, bridge, submit(guest, bridge, usb + ['verify', uuid.uuid4().hex, *paths]))
+                assert check['exit']['code'] == 0 and 'PROFILE_VERIFY_OK' in check['stdout']['text'], check
+                # An empty bundle makes reuse depend on hashing the installed tree.
+                command = usb + ['apply', uuid.uuid4().hex, *paths,
+                                 '--cache-bundle', bundle if sequence == 1 else no_archives]
+                answer = wait(guest, bridge, submit(guest, bridge, command))
+                assert answer['exit']['code'] == 0 and 'PROFILE_APPLY_OK' in answer['stdout']['text'], answer
+                expected = {'bridge': 1} if sequence == 1 else {'present': 1}
+                assert json.loads(answer['stdout']['text'].splitlines()[0])['closure'] == expected, answer
+                result[f'usb_sequence_{sequence}'] = expected
+            command = ['/nix/bin/nix', 'stage-profile', 'apply', uuid.uuid4().hex,
+                       *paths, '--cache-bundle', no_archives]
+            answer = wait(guest, bridge, submit(guest, bridge, command))
+            assert answer['exit']['code'] == 0 and 'PROFILE_APPLY_OK' in answer['stdout']['text'], answer
+            stdout = answer['stdout']['text'].splitlines()
+            counts = next(json.loads(line)['closure'] for line in stdout if line.startswith('{"closure":'))
+            assert counts['present'] == 1 and counts['bridge'] == 0, answer
+            result['nix_stage_profile'] = counts
+            result['store_file'] = target
+            result['store_file_bytes'] = len(target.encode())
+            guest.restart()
+        finally:
+            guest.stop()
+        finish()
+        return
 
     if args.expect_refusal:
         guest, bridge = boot('refusal')
@@ -220,7 +314,7 @@ def main():
         args.bulk_port = guest.bulk_port
         args.profile_plan = args.plan
         args.rollback_profile = None
-        args.profile_timeout_s = 480
+        args.profile_timeout_s = args.apply_timeout_s
         operator = rtx.Run(bridge, args.output / 'apply')
         receipt = operator.profile(argparse.Namespace(**{**vars(args), 'output': operator.output}))
         assert receipt['state'] == 'profile_verified' and receipt['missing_store_paths'], receipt

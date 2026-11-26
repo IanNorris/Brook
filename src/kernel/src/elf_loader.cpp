@@ -78,7 +78,7 @@ static bool ValidateElf(const uint8_t* data, uint64_t size, ElfLayout* out)
         }
         else if (p.p_type == PT_INTERP)
         {
-            if (interpSeen || p.p_filesz < 2 || p.p_filesz >= sizeof(ElfBinary{}.interpPath) ||
+            if (interpSeen || p.p_filesz < 2 || p.p_filesz > PathMax ||
                 data[p.p_offset + p.p_filesz - 1] != 0 || !data[p.p_offset]) return false;
             for (uint64_t n = 0; n + 1 < p.p_filesz; ++n)
                 if (!data[p.p_offset + n]) return false;
@@ -390,20 +390,10 @@ static bool ElfLoadImpl(const uint8_t* data, uint64_t size, ElfBinary* out,
                 return false;
             }
 
-            // Extract interpreter path from the ELF.
-            uint64_t pathLen = phdr.p_filesz;
-            if (pathLen > 0 && pathLen < sizeof(out->interpPath))
-            {
-                for (uint64_t b = 0; b < pathLen; ++b)
-                    out->interpPath[b] = static_cast<char>(data[phdr.p_offset + b]);
-                // Ensure null-termination (p_filesz includes the null byte usually)
-                out->interpPath[pathLen] = '\0';
-                // Strip trailing null if present in the stored length
-                while (pathLen > 0 && out->interpPath[pathLen - 1] == '\0')
-                    --pathLen;
-
-                DbgPrintf("ELF:   PT_INTERP '%s'\n", out->interpPath);
-            }
+            // ValidateElf has checked the size and the terminating NUL.
+            for (uint64_t b = 0; b < phdr.p_filesz; ++b)
+                out->interpPath[b] = static_cast<char>(data[phdr.p_offset + b]);
+            DbgPrintf("ELF:   PT_INTERP '%s'\n", out->interpPath);
         }
     }
 

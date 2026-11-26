@@ -33,6 +33,7 @@ stdenv.mkDerivation {
     cp ${../../src/shared/brook_caption_strip.h} "$sourceRoot/brook-caption-strip.h"
     cp ${../../src/shared/wm_input_abi.h} "$sourceRoot/wm-input-abi.h"
     cp ${../../src/shared/input_preferences.h} "$sourceRoot/input_preferences.h"
+    cp ${../../src/shared/brook_desktop_scale.h} "$sourceRoot/brook_desktop_scale.h"
     cp ${../../src/shared/wm_window_state.h} "$sourceRoot/wm-window-state.h"
     cp ${../../src/kernel/src/gpu_scene_abi.h} "$sourceRoot/gpu-scene-abi.h"
     cp ${../../src/shared/gpu_buffer_abi.h} "$sourceRoot/gpu_buffer_abi.h"
@@ -63,17 +64,17 @@ stdenv.mkDerivation {
     $CC -O2 -UNDEBUG -Wall -Wextra intel-pending-drain-test.c -o intel-pending-drain-test
     ./intel-pending-drain-test
     $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
-        display-scale-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
+        display-scale-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c fractional-scale-protocol.c \
         linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c relative-pointer-v1-protocol.c pointer-constraints-v1-protocol.c idle-inhibit-unstable-v1-protocol.c \
         -L${wayland}/lib -lwayland-server -o display-scale-test
     ./display-scale-test
     $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
-        pointer-constraints-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
+        pointer-constraints-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c fractional-scale-protocol.c \
         linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c relative-pointer-v1-protocol.c pointer-constraints-v1-protocol.c idle-inhibit-unstable-v1-protocol.c \
         -L${wayland}/lib -lwayland-server -o pointer-constraints-test
     ./pointer-constraints-test
     $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
-        idle-inhibit-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
+        idle-inhibit-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c fractional-scale-protocol.c \
         linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c relative-pointer-v1-protocol.c pointer-constraints-v1-protocol.c idle-inhibit-unstable-v1-protocol.c \
         -L${wayland}/lib -lwayland-server -o idle-inhibit-test
     ./idle-inhibit-test
@@ -82,7 +83,7 @@ stdenv.mkDerivation {
         -lxkbfile -lX11 -o keyboard-keymap-test
     ./keyboard-keymap-test ${xkbcomp}/bin/xkbcomp
     $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
-        output-identity-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
+        output-identity-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c fractional-scale-protocol.c \
         linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c relative-pointer-v1-protocol.c pointer-constraints-v1-protocol.c idle-inhibit-unstable-v1-protocol.c \
         -L${wayland}/lib -lwayland-server -o output-identity-test
     ./output-identity-test
@@ -93,69 +94,69 @@ stdenv.mkDerivation {
         -L${wayland}/lib -lwayland-server -o text-input-test
     ./text-input-test
     $CC -O2 -Wall -Wextra -I${wayland.dev}/include -I. \
-        surface-frame-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
+        surface-frame-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c fractional-scale-protocol.c \
         linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c relative-pointer-v1-protocol.c pointer-constraints-v1-protocol.c idle-inhibit-unstable-v1-protocol.c \
         -L${wayland}/lib -lwayland-server -o surface-frame-test
     ./surface-frame-test
     $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
-        retained-surface-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
+        retained-surface-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c fractional-scale-protocol.c \
         linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c relative-pointer-v1-protocol.c pointer-constraints-v1-protocol.c idle-inhibit-unstable-v1-protocol.c \
         -L${wayland}/lib -lwayland-server -o retained-surface-test
     ./retained-surface-test
     $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
-        dmabuf-import-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
+        dmabuf-import-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c fractional-scale-protocol.c \
         linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c relative-pointer-v1-protocol.c pointer-constraints-v1-protocol.c idle-inhibit-unstable-v1-protocol.c \
         -L${wayland}/lib -lwayland-server -o dmabuf-import-test
     ./dmabuf-import-test
     $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
-        dmabuf-params-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
+        dmabuf-params-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c fractional-scale-protocol.c \
         linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c relative-pointer-v1-protocol.c pointer-constraints-v1-protocol.c idle-inhibit-unstable-v1-protocol.c \
         -L${wayland}/lib -lwayland-server -o dmabuf-params-test
     ./dmabuf-params-test
     $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
-        configure-surface-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
+        configure-surface-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c fractional-scale-protocol.c \
         linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c relative-pointer-v1-protocol.c pointer-constraints-v1-protocol.c idle-inhibit-unstable-v1-protocol.c \
         -L${wayland}/lib -lwayland-server -lwayland-client -o configure-surface-test
     ./configure-surface-test
     $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
-        scene-surface-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
+        scene-surface-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c fractional-scale-protocol.c \
         linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c relative-pointer-v1-protocol.c pointer-constraints-v1-protocol.c idle-inhibit-unstable-v1-protocol.c \
         -L${wayland}/lib -lwayland-server -o scene-surface-test
     ./scene-surface-test
     $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
-        viewport-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
+        viewport-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c fractional-scale-protocol.c \
         linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c relative-pointer-v1-protocol.c pointer-constraints-v1-protocol.c idle-inhibit-unstable-v1-protocol.c \
         -L${wayland}/lib -lwayland-server -o viewport-test
     ./viewport-test
     $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
-        pointer-hit-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
+        pointer-hit-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c fractional-scale-protocol.c \
         linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c relative-pointer-v1-protocol.c pointer-constraints-v1-protocol.c idle-inhibit-unstable-v1-protocol.c \
         -L${wayland}/lib -lwayland-server -o pointer-hit-test
     ./pointer-hit-test
     $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
-        pointer-scroll-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
+        pointer-scroll-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c fractional-scale-protocol.c \
         linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c relative-pointer-v1-protocol.c pointer-constraints-v1-protocol.c idle-inhibit-unstable-v1-protocol.c \
         -L${wayland}/lib -lwayland-server -o pointer-scroll-test
     ./pointer-scroll-test
     $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
-        capture-release-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
+        capture-release-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c fractional-scale-protocol.c \
         linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c relative-pointer-v1-protocol.c pointer-constraints-v1-protocol.c idle-inhibit-unstable-v1-protocol.c \
         -L${wayland}/lib -lwayland-server -o capture-release-test
     ./capture-release-test
     ${if enableVulkanCompositor then ''
       $CC -O2 -UNDEBUG -Wall -Wextra -DBROOK_DIRECT_TEST -I${wayland.dev}/include -I. \
-          capture-release-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
+          capture-release-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c fractional-scale-protocol.c \
           linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c relative-pointer-v1-protocol.c pointer-constraints-v1-protocol.c idle-inhibit-unstable-v1-protocol.c \
           -L${wayland}/lib -lwayland-server -o direct-release-test
       ./direct-release-test
     '' else ""}
     $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
-        xwayland-shell-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
+        xwayland-shell-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c fractional-scale-protocol.c \
         linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c relative-pointer-v1-protocol.c pointer-constraints-v1-protocol.c idle-inhibit-unstable-v1-protocol.c \
         -L${wayland}/lib -lwayland-server -o xwayland-shell-test
     ./xwayland-shell-test
     $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
-        xwayland-bridge-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
+        xwayland-bridge-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c fractional-scale-protocol.c \
         linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c relative-pointer-v1-protocol.c pointer-constraints-v1-protocol.c idle-inhibit-unstable-v1-protocol.c \
         -L${wayland}/lib -lwayland-server -o xwayland-bridge-test
     ./xwayland-bridge-test
@@ -179,6 +180,7 @@ stdenv.mkDerivation {
   buildPhase = ''
     XDG_XML=${wayland-protocols}/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml
     DECO_XML=${wayland-protocols}/share/wayland-protocols/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml
+    FS_XML=${wayland-protocols}/share/wayland-protocols/staging/fractional-scale/fractional-scale-v1.xml
     VP_XML=${wayland-protocols}/share/wayland-protocols/stable/viewporter/viewporter.xml
     DMABUF_XML=${wayland-protocols}/share/wayland-protocols/unstable/linux-dmabuf/linux-dmabuf-unstable-v1.xml
     TEXT_XML=${wayland-protocols}/share/wayland-protocols/unstable/text-input/text-input-unstable-v3.xml
@@ -202,6 +204,8 @@ stdenv.mkDerivation {
     wayland-scanner private-code   $DECO_XML xdg-decoration-protocol.c
     wayland-scanner server-header  protocols/server-decoration.xml kde-server-decoration-server-protocol.h
     wayland-scanner private-code   protocols/server-decoration.xml kde-server-decoration-protocol.c
+    wayland-scanner server-header  $FS_XML   fractional-scale-server-protocol.h
+    wayland-scanner private-code   $FS_XML   fractional-scale-protocol.c
     wayland-scanner server-header  $VP_XML   viewporter-server-protocol.h
     wayland-scanner private-code   $VP_XML   viewporter-protocol.c
     wayland-scanner server-header  $DMABUF_XML linux-dmabuf-unstable-v1-server-protocol.h
@@ -237,7 +241,7 @@ stdenv.mkDerivation {
     $CC -O2 -Wall -Wextra \
         ${if enableVulkanCompositor then "-DBROOK_WAYLAND_VULKAN_COMPOSITOR renderer.c surface.c -I${vulkanHeaders}/include" else ""} \
         -I${wayland.dev}/include -I. \
-        waylandd.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
+        waylandd.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c fractional-scale-protocol.c \
         linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c relative-pointer-v1-protocol.c pointer-constraints-v1-protocol.c idle-inhibit-unstable-v1-protocol.c \
         -L${wayland}/lib -lwayland-server ${if enableVulkanCompositor then "-L${vulkanLoader}/lib -lvulkan" else ""} \
         -Wl,-rpath,${wayland}/lib:${stdenv.cc.libc}/lib${if enableVulkanCompositor then ":${vulkanLoader}/lib" else ""} \

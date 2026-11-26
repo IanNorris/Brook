@@ -1,3 +1,5 @@
+#include "syscall_user_path.h"
+#include "fido_hidraw.h"
 // syscall_stat.cpp -- stat family, statx, statfs, access/faccessat.
 //
 // Split from syscall.cpp.
@@ -38,11 +40,11 @@ static int64_t AccessAt(int dirfd, uint64_t pathAddr, uint64_t mode, uint64_t fl
     if ((mode & ~7ULL) || (flags & ~(NOFOLLOW | EACCESS | EMPTY_PATH))) return -EINVAL;
     Process* proc = ProcessCurrent();
     if (!proc) return -EBADF;
-    char path[256];
+    PathBuffer path;
     // Copy once per page instead of acquiring the mapping mutex for every
     // pathname byte. The shared copier recovers concurrent unmap faults and
     // stops at page boundaries, including a NUL in the last mapped byte.
-    int pathError=CopyUserCStringResult(pathAddr,path,sizeof(path));
+    int pathError=CopyUserPath(pathAddr, path);
     if (pathError) return pathError;
     if (!path[0]) {
         if (!(flags & EMPTY_PATH)) return -ENOENT;
@@ -409,16 +411,16 @@ static int64_t do_lstat_internal(const char* path, uint64_t statAddr,int dirfd=-
 int64_t sys_stat(uint64_t pathAddr, uint64_t statAddr, uint64_t,
                   uint64_t, uint64_t, uint64_t)
 {
-    char pathBuf[256];
-    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
+    PathBuffer pathBuf;
+    if (int error = CopyUserPath(pathAddr, pathBuf)) return error;
     return do_stat_internal(pathBuf, statAddr);
 }
 
 int64_t sys_lstat(uint64_t pathAddr, uint64_t statAddr, uint64_t,
                    uint64_t, uint64_t, uint64_t)
 {
-    char pathBuf[256];
-    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
+    PathBuffer pathBuf;
+    if (int error = CopyUserPath(pathAddr, pathBuf)) return error;
     return do_lstat_internal(pathBuf, statAddr);
 }
 
@@ -440,6 +442,12 @@ static int64_t FstatKernel(uint64_t fd,LinuxStat* st)
     }
 #endif
 
+    if (fde->type == FdType::DevHidraw) {
+        VnodeStat stat{};
+        HidrawStat(static_cast<HidrawFile*>(fde->handle), stat);
+        FillStat(st, stat);
+        return 0;
+    }
     if (IsTerminalFd(fde)) {
         auto* raw = reinterpret_cast<uint8_t*>(st);
         memset(raw, 0, sizeof(LinuxStat));
@@ -625,14 +633,13 @@ int64_t sys_newfstatat(uint64_t dirfd, uint64_t pathAddr, uint64_t statAddr,
     static constexpr uint64_t AT_EMPTY_PATH = 0x1000;
     if (flags & ~(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH))
         return -EINVAL;
-    char pathBuf[256];
+    PathBuffer pathBuf;
     // Linux 6.12 accepts NULL for its real-descriptor empty-path fast path.
     // NULL with AT_FDCWD still faults; an empty string can name the cwd.
     if (!pathAddr)
         return flags == AT_EMPTY_PATH && static_cast<int>(dirfd) != -100
             ? sys_fstat(dirfd, statAddr, 0, 0, 0, 0) : -EFAULT;
-    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf)))
-        return -EFAULT;
+    if (int error = CopyUserPath(pathAddr, pathBuf)) return error;
     const char* path = pathBuf;
     if (path[0] == '\0') {
         if (!(flags & AT_EMPTY_PATH)) return -ENOENT;
@@ -695,13 +702,13 @@ int64_t sys_statx(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
     if ((mask & 0x80000000) || (flags & AT_STATX_SYNC_TYPE) == AT_STATX_SYNC_TYPE ||
         (flags & ~(0x100 | AT_NO_AUTOMOUNT | AT_EMPTY_PATH | AT_STATX_SYNC_TYPE)))
         return -EINVAL;
-    char pathBuf[256];
+    PathBuffer pathBuf;
     if (!pathAddr) {
         if ((flags & ~(AT_NO_AUTOMOUNT | AT_STATX_SYNC_TYPE)) != AT_EMPTY_PATH ||
             static_cast<int>(dirfd) == -100)
             return -EFAULT;
-        pathBuf[0] = '\0';
-    } else if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
+        if (!pathBuf.allocate()) return -ENOMEM;
+    } else if (int error = CopyUserPath(pathAddr, pathBuf)) return error;
     if (!UserBufferWritable(bufAddr, sizeof(linux_statx))) return -EFAULT;
     const char* path = pathBuf;
     // Filled in kernel memory; copyOut writes the user buffer once.
@@ -799,8 +806,8 @@ static int64_t CopySpaceResult(uint64_t address, const VfsSpace& source)
 int64_t sys_statfs(uint64_t pathAddr, uint64_t bufAddr, uint64_t,
                     uint64_t, uint64_t, uint64_t)
 {
-    char path[512];
-    int error=CopyUserCStringResult(pathAddr,path,sizeof(path));if(error)return error;
+    PathBuffer path;
+    int error=CopyUserPath(pathAddr, path);if(error)return error;
     AtLookup at;if((error=at.Init(-100,path)))return error;
     Vnode* vn=VfsOpenAt(at.fs.root,at.start(),path,VFS_O_METADATA,0,at.fs.mask,&error);
     if (!vn) return error ? error : -ENOENT;

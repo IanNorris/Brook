@@ -8,6 +8,7 @@
 // the driver from st_rdev after the ordinary VFS open.
 
 #include "devtmpfs.h"
+#include "fido_hidraw.h"
 #include "mount_namespace.h"
 #include "serial.h"
 #include "tmpfs.h"
@@ -77,8 +78,13 @@ int DevtmpfsMountBoot()
     // This mount, and whole binds of it into containers, must not mask them.
     VfsPath mounted{};
     int alias = VfsPathResolve(root, root, "/dev", &mounted);
-    if (!alias) alias = VfsPathBrokerTransparentRegister(mounted);
-    VfsPathRelease(mounted);
+    if (!alias) {
+        alias = VfsPathBrokerTransparentRegister(mounted);
+        // Pin the device mount for kernel hotplug publication.
+        static VfsPath deviceMount{};
+        deviceMount = mounted;
+        HidrawMount(instance);
+    } else VfsPathRelease(mounted);
     VfsPathRelease(root);
     if (alias) SerialPrintf("VFS: /dev synthetic passthrough unavailable (%d)\n", alias);
     return 0;

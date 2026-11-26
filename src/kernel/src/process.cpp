@@ -1,3 +1,4 @@
+#include "path_buffer.h"
 #include "core_autodump.h"
 #include "signal_defaults.h"
 #include "signal_restart.h"
@@ -768,9 +769,11 @@ static int ReadInterpreterImage(Process* process,const char* path,ExecutableImag
 int PrepareExecInterpreter(const ExecutableImage& main,ExecutableImage* output)
 {
     if(!output)return -22;
-    *output={};char path[sizeof(ElfBinary{}.interpPath)];
-    if(!ElfMainInterpreter(main.data,main.size,path,sizeof(path)))return -8;
-    return path[0]?ReadInterpreterImage(ProcessCurrent(),path,output):0;
+    *output={};
+    PathBuffer path;
+    if (!path.allocate()) return -12;
+    if (!ElfMainInterpreter(main.data,main.size,path,path.capacity())) return -8;
+    return path.data()[0] ? ReadInterpreterImage(ProcessCurrent(),path,output) : 0;
 }
 
 static uint64_t LoadInterpreter(Process* proc,const ExecutableImage* prepared=nullptr)

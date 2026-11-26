@@ -38,11 +38,13 @@ int64_t sys_mount(uint64_t sourceAddr,uint64_t targetAddr,uint64_t fsAddr,
         if(!procMount && !memoryMount && !ptyMount && !queueMount)return -ENODEV;
     }
     auto* process=ProcessCurrent();if(!process)return -EPERM;
-    char source[512],target[512];
-    if(!CopyUserCString(targetAddr,target,sizeof(target)))return -EFAULT;
+    PathBuffer source, target;
+    if (int error = CopyUserPath(targetAddr, target)) return error;
     // Propagation has no source operand. A non-null source is still a userspace
     // string argument to mount(2), so validate it without resolving its path.
-    if((sourceAddr || (!privatePropagation && !newMount && !remount)) && !CopyUserCString(sourceAddr,source,sizeof(source)))return -EFAULT;
+    if (sourceAddr || (!privatePropagation && !newMount && !remount)) {
+        if (int error = CopyUserPath(sourceAddr, source)) return error;
+    } else if (!source.allocate()) return -ENOMEM;
     AtLookup lookup;if(int error=lookup.Init(-100,target))return error;
     auto* owner=VfsMountNamespaceUserOwnerAcquire(lookup.fs.mountNamespace);
     bool authorized=ProcessCapable(process,owner,CapSysAdmin);UserNamespaceRelease(owner);
@@ -96,7 +98,7 @@ int64_t sys_umount2(uint64_t targetAddr,uint64_t flags,uint64_t,
 {
     if(flags!=2)return -EINVAL;
     auto* process=ProcessCurrent();if(!process)return -EPERM;
-    char target[512];if(!CopyUserCString(targetAddr,target,sizeof(target)))return -EFAULT;
+    PathBuffer target;if (int error = CopyUserPath(targetAddr, target)) return error;
     AtLookup lookup;if(int error=lookup.Init(-100,target))return error;
     auto* owner=VfsMountNamespaceUserOwnerAcquire(lookup.fs.mountNamespace);
     bool authorized=ProcessCapable(process,owner,CapSysAdmin);UserNamespaceRelease(owner);
@@ -109,8 +111,9 @@ int64_t sys_umount2(uint64_t targetAddr,uint64_t flags,uint64_t,
 int64_t sys_pivot_root(uint64_t newRootAddr,uint64_t putOldAddr,uint64_t,uint64_t,uint64_t,uint64_t)
 {
     auto* process=ProcessCurrent();if(!process)return -EPERM;
-    char newName[512],oldName[512];
-    if(!CopyUserCString(newRootAddr,newName,sizeof(newName)) || !CopyUserCString(putOldAddr,oldName,sizeof(oldName)))return -EFAULT;
+    PathBuffer newName, oldName;
+    if (int error = CopyUserPath(newRootAddr, newName)) return error;
+    if (int error = CopyUserPath(putOldAddr, oldName)) return error;
     AtLookup lookup;if(int error=lookup.Init(-100,newName))return error;
     auto* owner=VfsMountNamespaceUserOwnerAcquire(lookup.fs.mountNamespace);
     bool authorized=ProcessCapable(process,owner,CapSysAdmin);UserNamespaceRelease(owner);

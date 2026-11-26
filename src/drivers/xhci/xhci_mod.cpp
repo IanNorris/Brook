@@ -59,6 +59,8 @@
 #include "boot_pointer_usb.h"
 #include "compositor.h"
 #include "usb_boot_keyboard.h"
+#include "usb_fido.h"
+#include "fido_hidraw.h"
 #include "keyboard.h"
 #include "device.h"
 #include "storage_io_stats.h"
@@ -97,6 +99,12 @@ MODULE_IMPORT_SYMBOL(IoApicUnregisterHandler);
 MODULE_IMPORT_SYMBOL(ApicGetId);
 MODULE_IMPORT_SYMBOL(IdtInstallHandler);
 MODULE_IMPORT_SYMBOL(InputRegister);
+MODULE_IMPORT_SYMBOL(HidrawAttach);
+MODULE_IMPORT_SYMBOL(HidrawActivate);
+MODULE_IMPORT_SYMBOL(HidrawDetach);
+MODULE_IMPORT_SYMBOL(HidrawReceive);
+MODULE_IMPORT_SYMBOL(HidrawOutputComplete);
+MODULE_IMPORT_SYMBOL(HidrawTransportFailed);
 MODULE_IMPORT_SYMBOL(InputMarkPointerIngress);
 extern "C" void BootTimingUsbPointer(bool, uint32_t, const char*, uint16_t, uint16_t);
 MODULE_IMPORT_SYMBOL(BootTimingUsbPointer);
@@ -1096,6 +1104,10 @@ struct XhciDevice {
     uint8_t* scratch;           // one DMA page for descriptors and hub requests
     uint64_t scratchPhys;
     XhciHidFn kbd, mouse;
+    XhciHidFn fidoIn, fidoOut;
+    uint32_t fidoIdentity;
+    uint64_t fidoTxStarted;
+    bool fidoTxPending;
     UsbEcmConfiguration ecm;
     UsbEcmState* network;
     uint32_t slotId;
@@ -1799,13 +1811,14 @@ static bool XhciConfigureDevice(XhciController& ctrl, XhciDevice& dev)
 // Phase 6: Configure an interrupt IN endpoint (HID reports, ECM notify)
 // ---------------------------------------------------------------------------
 
-static bool XhciConfigureIntIn(XhciController& ctrl, XhciDevice& dev, uint8_t epAddr,
+static bool XhciConfigureInterrupt(XhciController& ctrl, XhciDevice& dev, uint8_t epAddr,
                                uint16_t wMaxPacket, uint8_t bInterval,
                                Trb*& ring, uint64_t& ringPhys, uint32_t& enqueue,
                                bool& cycle, uint32_t& dci)
 {
-    if (!epAddr || !(epAddr & 0x80)) return false;
-    dci = (epAddr & 0x0F) * 2 + 1;
+    if (!(epAddr & 0x0f)) return false;
+    const bool inputEndpoint = epAddr & 0x80;
+    dci = (epAddr & 0x0f) * 2 + inputEndpoint;
     uint32_t interval = 0;
     if (!UsbXhciInterval(dev.portSpeed, bInterval, interval)) {
         SerialPrintf("xhci: interrupt EP 0x%02x invalid interval %u\n", epAddr, bInterval);
@@ -1842,7 +1855,7 @@ static bool XhciConfigureIntIn(XhciController& ctrl, XhciDevice& dev, uint8_t ep
     const uint32_t esit = packet * (burst + 1);
     epCtx[0] = interval << 16;
     epCtx[1] = (3 << 1) |      // CErr = 3
-               (7 << 3) |      // EP Type = Interrupt IN
+               ((inputEndpoint ? 7 : 3) << 3) | // Interrupt IN or OUT
                (burst << 8) |
                (packet << 16);
     uint64_t trDqp = ringPhys | 1;
@@ -1868,7 +1881,7 @@ static bool XhciConfigureInterruptEndpoint(XhciController& ctrl, XhciDevice& dev
         SerialPuts("xhci: no interrupt endpoint found\n");
         return false;
     }
-    return XhciConfigureIntIn(ctrl, dev, dev.interruptEpAddr, dev.interruptMaxPacket,
+    return XhciConfigureInterrupt(ctrl, dev, dev.interruptEpAddr, dev.interruptMaxPacket,
                               dev.interruptInterval, dev.intRing, dev.intRingPhys,
                               dev.intEnqueue, dev.intCycle, dev.intDci);
 }
@@ -1980,7 +1993,32 @@ static bool XhciHidRingHit(const XhciHidFn& fn, const Trb& event, uint32_t slot,
            dci==fn.dci && slot==slotId;
 }
 
-static void XhciQueueHidIn(XhciController& ctrl, XhciDevice& dev, XhciHidFn& fn);
+static void XhciQueueHidTd(XhciController& ctrl, XhciDevice& dev, XhciHidFn& fn);
+
+// Call with the controller event lock held. One TD per endpoint owns its
+// buffer until completion or slot disable, including after a transport error.
+static bool XhciFidoCompletion(XhciDevice& dev, const Trb& event)
+{
+    const uint32_t slot = event.control >> 24;
+    const bool input = XhciHidRingHit(dev.fidoIn, event, slot, dev.slotId);
+    const bool output = XhciHidRingHit(dev.fidoOut, event, slot, dev.slotId);
+    if (!input && !output) return false;
+    if (dev.gone || !dev.fidoIn.active) return true;
+    const bool success = (event.status >> 24) == TRB_CC_SUCCESS && !(event.status & 0xffffff);
+    if (output) {
+        if (!dev.fidoTxPending) return true;
+        dev.fidoTxPending = false;
+        HidrawOutputComplete(dev.fidoIdentity, success);
+        if (!success) dev.fidoIn.active = false;
+    } else if (success) {
+        HidrawReceive(dev.fidoIdentity, dev.fidoIn.report);
+        XhciQueueHidTd(*dev.ctrl, dev, dev.fidoIn);
+    } else {
+        dev.fidoIn.active = false;
+        HidrawTransportFailed(dev.fidoIdentity);
+    }
+    return true;
+}
 
 static void XhciMarkPointer(XhciHidFn& fn, UsbPointerStage stage, uint8_t cc = 0,
                             uint32_t residue = 0, UsbPointerIgnore reason = UsbPointerIgnore::None)
@@ -2018,6 +2056,7 @@ static void XhciDrainController(XhciController& ctrl,bool& wakeNetwork)
                 const uint32_t slot=event.control>>24;
                 const uint32_t cc=event.status>>24;
                 if(dev.network && !dev.gone && XhciEcmCompletion(dev,event)){handled=true;wakeNetwork=true;}
+                if (!handled) handled = XhciFidoCompletion(dev, event);
                 for(int which=0;which<2 && !handled;++which) {
                     auto& fn=which?dev.mouse:dev.kbd;
                     if(!XhciHidRingHit(fn,event,slot,dev.slotId))continue;
@@ -2056,7 +2095,7 @@ static void XhciDrainController(XhciController& ctrl,bool& wakeNetwork)
                         wakeInput=true;
                     } else if (which) XhciMarkPointer(fn, UsbPointerStage::Ignored, cc, residue,
                                                       UsbPointerIgnore::Length);
-                    XhciQueueHidIn(ctrl,dev,fn);
+                    XhciQueueHidTd(ctrl,dev,fn);
                     if (which) XhciMarkPointer(fn, UsbPointerStage::Rearm);
                 }
                 // Completions for a disconnected device have no waiter.
@@ -3832,15 +3871,16 @@ static void XhciReleaseDeviceDma(XhciDevice& dev)
 {
     const uint32_t ctxSize = CtxEntrySize(*dev.ctrl);
     const uint32_t inputPages = (ctxSize * 33 + 4095) / 4096, outputPages = (ctxSize * 32 + 4095) / 4096;
-    XhciHidFn* fns[2] = {&dev.kbd, &dev.mouse};
+    XhciHidFn* fns[] = {&dev.kbd, &dev.mouse, &dev.fidoIn, &dev.fidoOut};
+    constexpr unsigned endpointCount = sizeof(fns) / sizeof(fns[0]);
     const auto saved = IrqSpinLockAcquire(&g_eventRingLock);
-    uint64_t hidRing[2] = {}, hidReport[2] = {};
-    for (unsigned i = 0; i < 2; ++i) {
+    uint64_t hidRing[endpointCount] = {}, hidReport[endpointCount] = {};
+    for (unsigned i = 0; i < endpointCount; ++i) {
         hidRing[i] = fns[i]->ringPhys; hidReport[i] = fns[i]->reportPhys;
         fns[i]->ring = nullptr; fns[i]->ringPhys = 0; fns[i]->report = nullptr; fns[i]->reportPhys = 0;
     }
     IrqSpinLockRelease(&g_eventRingLock, saved);
-    for (unsigned i = 0; i < 2; ++i) { FreeDmaBuffer(hidRing[i], 1); FreeDmaBuffer(hidReport[i], 1); }
+    for (unsigned i = 0; i < endpointCount; ++i) { FreeDmaBuffer(hidRing[i], 1); FreeDmaBuffer(hidReport[i], 1); }
     FreeDmaBuffer(dev.ep0RingPhys, 1); dev.ep0Ring = nullptr; dev.ep0RingPhys = 0;
     FreeDmaBuffer(dev.inputCtxPhys, inputPages); dev.inputCtx = nullptr; dev.inputCtxPhys = 0;
     FreeDmaBuffer(dev.outputCtxPhys, outputPages); dev.outputCtx = nullptr; dev.outputCtxPhys = 0;
@@ -3869,8 +3909,10 @@ static void XhciDeviceGone(uint32_t index)
     const bool hadHid = dev.kbd.active || dev.mouse.active;
     XhciEndHid(dev.kbd,true);
     XhciEndHid(dev.mouse,false);
+    dev.fidoIn.active = false;
     if (dev.network) dev.network->failed = true;
     IrqSpinLockRelease(&g_eventRingLock, saved);
+    if (dev.fidoIdentity) HidrawDetach(dev.fidoIdentity);
     if (hadHid) {
         CompositorWake();
         InputWakeWaiters();
@@ -3887,7 +3929,7 @@ static void XhciKeyboardPoll(InputDevice* /*dev*/);
 static void XhciMousePoll(InputDevice* /*dev*/);
 static bool g_kbdRegistered = false, g_mouseRegistered = false;
 
-static void XhciQueueHidIn(XhciController& ctrl, XhciDevice& dev, XhciHidFn& fn)
+static void XhciQueueHidTd(XhciController& ctrl, XhciDevice& dev, XhciHidFn& fn)
 {
     uint32_t idx = fn.enqueue;
     if (idx >= XFER_RING_SIZE - 1) {
@@ -3898,7 +3940,8 @@ static void XhciQueueHidIn(XhciController& ctrl, XhciDevice& dev, XhciHidFn& fn)
     Trb& trb = fn.ring[idx];
     trb.param = fn.reportPhys;
     trb.status = fn.length;
-    trb.control = TRB_TYPE_NORMAL | TRB_IOC | TRB_ISP | (fn.cycle ? TRB_CYCLE : 0);
+    const uint32_t shortPacketEvent = (fn.dci & 1) ? TRB_ISP : 0;
+    trb.control = TRB_TYPE_NORMAL | TRB_IOC | shortPacketEvent | (fn.cycle ? TRB_CYCLE : 0);
     fn.enqueue = idx + 1;
     __asm__ volatile("mfence" ::: "memory");
     XhciRingDoorbell(ctrl, dev.slotId, fn.dci);
@@ -3907,7 +3950,7 @@ static void XhciQueueHidIn(XhciController& ctrl, XhciDevice& dev, XhciHidFn& fn)
 static bool XhciStartHid(XhciController& ctrl, XhciDevice& dev, XhciHidFn& fn, bool keyboard)
 {
     const bool bootProtocol = XhciSetBootProtocol(ctrl, dev, fn.iface); // A stall is recovered.
-    if (!XhciConfigureIntIn(ctrl, dev, fn.ep, fn.packet, fn.interval, fn.ring, fn.ringPhys,
+    if (!XhciConfigureInterrupt(ctrl, dev, fn.ep, fn.packet, fn.interval, fn.ring, fn.ringPhys,
                             fn.enqueue, fn.cycle, fn.dci)) return false;
     fn.report = static_cast<uint8_t*>(AllocDmaBuffer(1, fn.reportPhys));
     if (!fn.report) return false;
@@ -3952,10 +3995,111 @@ static bool XhciStartHid(XhciController& ctrl, XhciDevice& dev, XhciHidFn& fn, b
     const auto saved = IrqSpinLockAcquire(&g_eventRingLock);
     fn.active = true;
     if (!keyboard && ++g_activeUsbMice == 1) MouseSetUsbAvailable(true);
-    XhciQueueHidIn(ctrl, dev, fn);
+    XhciQueueHidTd(ctrl, dev, fn);
     if (!keyboard) XhciMarkPointer(fn, UsbPointerStage::Queued);
     IrqSpinLockRelease(&g_eventRingLock, saved);
     return true;
+}
+
+static int XhciFidoQueueOutput(void* cookie, uint32_t identity, const uint8_t* report)
+{
+    auto& dev = *static_cast<XhciDevice*>(cookie);
+    const auto saved = IrqSpinLockAcquire(&g_eventRingLock);
+    const bool live = !dev.gone && dev.fidoIn.active && dev.fidoIdentity == identity;
+    if (live) {
+        memcpy(dev.fidoOut.report, report, UsbFidoReportBytes);
+        dev.fidoTxPending = true;
+        dev.fidoTxStarted = ApicTickCount();
+        XhciQueueHidTd(*dev.ctrl, dev, dev.fidoOut);
+    }
+    IrqSpinLockRelease(&g_eventRingLock, saved);
+    return live ? 0 : -19;
+}
+
+static void XhciProbeFido(XhciController& ctrl, XhciDevice& dev, const char* path)
+{
+    static_assert(UsbFidoReportBytes == HidrawReportBytes);
+    static_assert(UsbFidoDescriptorLimit == HidrawDescriptorLimit);
+    UsbFidoInterface iface{};
+    unsigned first = 0;
+    while (UsbFidoFindInterface(dev.rawConfig, dev.rawConfigLen, first, iface)) {
+        first = unsigned(iface.number) + 1;
+        UsbSetupPacket setup{};
+        setup.bmRequestType = 0x81; // Standard, device to host, interface.
+        setup.bRequest = USB_REQ_GET_DESCRIPTOR;
+        setup.wValue = 0x2200;
+        setup.wIndex = iface.number;
+        setup.wLength = iface.descriptorBytes;
+        uint32_t received = 0;
+        if (!XhciControlTransfer(ctrl, dev, setup, dev.scratch, iface.descriptorBytes,
+                                 dev.scratchPhys, 3, &received) || received != iface.descriptorBytes)
+            continue;
+        const bool fido = UsbFidoReportDescriptor(dev.scratch, received);
+        if (fido || dev.vendorId == 0x1050) {
+            constexpr unsigned LogChunk = 48;
+            constexpr char digits[] = "0123456789abcdef";
+            for (unsigned offset = 0; offset < received; offset += LogChunk) {
+                char hex[2 * LogChunk + 1];
+                const unsigned count = received - offset < LogChunk ? received - offset : LogChunk;
+                for (unsigned i = 0; i < count; ++i) {
+                    const uint8_t byte = dev.scratch[offset + i];
+                    hex[i * 2] = digits[byte >> 4];
+                    hex[i * 2 + 1] = digits[byte & 15];
+                }
+                hex[count * 2] = 0;
+                KPrintf("USB_FIDO_DESCRIPTOR c=%u port=%s vid=%04x pid=%04x iface=%u in=%02x out=%02x match=%u offset=%u size=%u bytes=%s\n",
+                        ctrl.index, path, dev.vendorId, dev.productId, iface.number, iface.in, iface.out,
+                        fido, offset, received, hex);
+            }
+        }
+        if (!fido) continue;
+        auto configure = [&](XhciHidFn& endpoint, uint8_t address, uint8_t interval) {
+            endpoint.length = UsbFidoReportBytes;
+            endpoint.report = static_cast<uint8_t*>(AllocDmaBuffer(1, endpoint.reportPhys));
+            return endpoint.report &&
+                XhciConfigureInterrupt(ctrl, dev, address, UsbFidoReportBytes, interval, endpoint.ring,
+                                       endpoint.ringPhys, endpoint.enqueue, endpoint.cycle, endpoint.dci);
+        };
+        XhciHidFn input{}, output{};
+        const bool endpoints = configure(input, iface.in, iface.inInterval) &&
+                               configure(output, iface.out, iface.outInterval);
+        const auto installed = IrqSpinLockAcquire(&g_eventRingLock);
+        dev.fidoIn = input;
+        dev.fidoOut = output;
+        IrqSpinLockRelease(&g_eventRingLock, installed);
+        if (!endpoints) {
+            dev.note = "FIDO endpoint setup failed";
+            return;
+        }
+        const uint32_t identity = HidrawAttach(dev.vendorId, dev.productId, dev.scratch, received,
+                                              XhciFidoQueueOutput, &dev);
+        if (!identity) {
+            dev.note = "FIDO node capacity exhausted";
+            return;
+        }
+        const auto saved = IrqSpinLockAcquire(&g_eventRingLock);
+        dev.fidoIdentity = identity;
+        dev.fidoIn.active = true;
+        XhciQueueHidTd(ctrl, dev, dev.fidoIn);
+        IrqSpinLockRelease(&g_eventRingLock, saved);
+        HidrawActivate(identity);
+        return;
+    }
+}
+
+static void XhciFidoCheckTimeouts()
+{
+    const auto saved = IrqSpinLockAcquire(&g_eventRingLock);
+    const auto now = ApicTickCount();
+    const auto count = __atomic_load_n(&g_deviceCount, __ATOMIC_ACQUIRE);
+    for (unsigned i = 0; i < count; ++i) {
+        auto& dev = g_devices[i];
+        if (!dev.gone && dev.fidoIn.active && dev.fidoTxPending && now - dev.fidoTxStarted >= 2000) {
+            dev.fidoIn.active = false;
+            HidrawTransportFailed(dev.fidoIdentity);
+        }
+    }
+    IrqSpinLockRelease(&g_eventRingLock, saved);
 }
 
 // ---- Enumeration ----------------------------------------------------------
@@ -4023,6 +4167,7 @@ static int XhciEnumerate(XhciController& ctrl, int parent, uint8_t port, uint32_
         else
             dev.note = "mouse setup failed";
     }
+    XhciProbeFido(ctrl, dev, path);
     if (dev.ecm.value && !XhciInitEcm(ctrl, dev)) dev.note = "ECM setup failed";
     if(dev.isMassStorage && !XhciInitMassStorage(ctrl,dev,index))dev.note="storage setup failed";
     if (dev.isHub && XhciHubSetup(ctrl, index)) XhciHubScan(ctrl, index, true);
@@ -4502,6 +4647,8 @@ static void XhciHotplugThread(void*)
         }
         if (changed) UsbStatusChanged();
         XhciUacHotplugTick();
+        XhciPollDrainEvents();
+        XhciFidoCheckTimeouts();
         // Echo the first keyboard input on the console (bounded).
         static uint32_t reported = 0;
         const uint32_t keys = __atomic_load_n(&g_keyPresses, __ATOMIC_RELAXED);
@@ -4548,7 +4695,8 @@ static int XhciMatchTransferEvent(const XhciController& ctrl, const Trb& evt)
            (__atomic_load_n(&dev.mscDiscardDcis,__ATOMIC_ACQUIRE)&(1u<<((evt.control>>16)&31))))
             return static_cast<int>(i);
         if (in(dev.intRingPhys) || in(dev.bulkInRingPhys) || in(dev.bulkOutRingPhys) ||
-            in(dev.ep0RingPhys) || in(dev.kbd.ringPhys) || in(dev.mouse.ringPhys))
+            in(dev.ep0RingPhys) || in(dev.kbd.ringPhys) || in(dev.mouse.ringPhys) ||
+            in(dev.fidoIn.ringPhys) || in(dev.fidoOut.ringPhys))
             return static_cast<int>(i);
     }
     return -1; // unknown device

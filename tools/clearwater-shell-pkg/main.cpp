@@ -116,7 +116,7 @@ int main()
             return 1;
         }
         const auto scale = snapshot.config.metrics.percent;
-        const auto& fonts = scale == 200 ? g_chromeFonts200 : scale == 150 ? g_chromeFonts150 : g_chromeFonts100;
+        const auto& fonts = ChromeFontsForScale(scale);
         auto list = ChromeListOn(storage);
         BuildShellModel(snapshot.model, snapshot.config.Style(fonts, material), list);
         if (!PackShellList(list, submission)) {

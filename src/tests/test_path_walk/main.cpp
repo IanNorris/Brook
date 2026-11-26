@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "path_walk.h"
 #include <cassert>
 #include <cstring>
@@ -24,6 +25,8 @@ int main() {
     fs.nodes["/public/jump"]={false,true,true,0,"../private/deep"};
     fs.nodes["/public/absolute"]={false,true,true,0,"/private/deep"};
     fs.nodes["/public/good"]={false,true,true,0,"/public"};
+    fs.nodes["/chain"]={false,true,true,0,"/long-linked-directory"};
+    fs.nodes["/long-linked-directory"]={false,true,true,0,"/public"};
     fs.nodes["/loop"]={false,true,true,0,"/loop"};
     fs.nodes["/io"]={false,false,true,-5};
     auto check=[&](const std::string& input,int expected,const char* result="",brook::PathWalkOptions opts={}) {
@@ -37,6 +40,7 @@ int main() {
     check("/public/file/../file",-20);check("/public/file/",-20);
     check("/public/jump/../file",-13);check("/public/absolute/file",-13);
     check("/public/good/../public/file",0,"/public/file");
+    check("/chain/file",0,"/public/file");
     check("/public/good",0,"/public/good",{false});
     check("/public/good/",0,"/public",{false});
     check("/loop",-40);check("/io",-5);
@@ -51,4 +55,9 @@ int main() {
     check("/"+std::string(511,'x'),-36);
     char tiny[3];assert(brook::WalkPath<Node>("/public",tiny,sizeof(tiny),fs)==-36);
     std::puts("PATH_WALK_PASS");
+}
+
+namespace brook {
+extern "C" void* kmalloc(uint64_t size) { return std::malloc(size); }
+extern "C" void kfree(void* ptr) { std::free(ptr); }
 }

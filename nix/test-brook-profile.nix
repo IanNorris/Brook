@@ -36,8 +36,8 @@ let
   profile = overrides: import ./brook-profile.nix ({ inherit pkgs; target = "qemu"; } // overrides);
 in
 # A compatibility preset update needs a deliberate change to both pins.
-assert compat.drvPath == "/nix/store/apa4qqqwmah2axk1dx77xzch6p5d3s3r-brook-network-hardware-desktop.drv";
-assert compat.outPath == "/nix/store/1gxj92nqv5m8j5as61qkj1r2sz83zzj9-brook-network-hardware-desktop";
+assert compat.drvPath == "/nix/store/151hblz3lx6gqkjplwdqgczv0jgnjm1n-brook-network-hardware-desktop.drv";
+assert compat.outPath == "/nix/store/dcd0054kqrfmj46lfc0w6hk9y42p4244-brook-network-hardware-desktop";
 assert normalizedSelectedWrapper == wrapper false;
 assert (resolve {}).launcherIds == [ "example.Settings" "example.Demo" ];
 assert (resolve { kernelCapabilities.wayland-demo = 1; }).requiredCapabilities.wayland-demo == 1;
@@ -63,6 +63,11 @@ assert !(resolve {
 assert !(resolve { allowUnfree = true; }).redistributable;
 assert rejects (resolve { allowUnfree = true; publicRelease = true; });
 assert rejects ((profile { apps = [ "steam" ]; }).manifest);
+assert rejects ((profile { apps = [ "steam" ]; allowUnfree = true; publicRelease = true; }).manifest);
+assert rejects ((profile { extraPackageNames = [ "steam" ]; allowUnfree = true; }).manifest);
+assert !(profile { apps = [ "steam" ]; allowUnfree = true; }).manifest.redistributable;
+assert (profile { apps = [ "steam" ]; allowUnfree = true; }).manifest.launcherIds
+  == [ "brook-settings" "org.brook.TaskManager" "brook-hardware-steam" ];
 assert rejects ((profile { extraPackageNames = [ "no-such-brook-test-package" ]; }).manifest);
 assert rejects ((profile { extraPackageNames = [ "lib" ]; }).manifest);
 assert rejects ((profile { extraPackageNames = [ "pkgsCross.aarch64-multiplatform.hello" ]; }).manifest);

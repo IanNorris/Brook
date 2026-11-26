@@ -173,25 +173,9 @@ if(DEFINED ENV{BROOK_DESKTOP_FONT_TTF} AND EXISTS "$ENV{BROOK_DESKTOP_FONT_TTF}"
     set(BROOK_DESKTOP_FONT_TTF "$ENV{BROOK_DESKTOP_FONT_TTF}")
 endif()
 set(DESKTOP_FONT_SOURCES "")
-foreach(DESKTOP_SCALE IN ITEMS 100 150 200)
-    math(EXPR DESKTOP_FONT_SIZE "16 * ${DESKTOP_SCALE} / 100")
-    set(DESKTOP_FONT_CPP "${CMAKE_CURRENT_BINARY_DIR}/desktop_font_${DESKTOP_SCALE}.cpp")
-    add_custom_command(
-        OUTPUT "${DESKTOP_FONT_CPP}"
-        COMMAND ${BROOK_PYTHON3} "${BROOK_ROOT}/scripts/bake_font.py"
-                "${BROOK_DESKTOP_FONT_TTF}" "${DESKTOP_FONT_SIZE}" "${DESKTOP_FONT_CPP}"
-                "g_desktopFont${DESKTOP_SCALE}"
-        DEPENDS "${BROOK_ROOT}/scripts/bake_font.py" "${BROOK_DESKTOP_FONT_TTF}"
-        COMMENT "Baking native desktop font (${DESKTOP_SCALE}%)"
-        VERBATIM
-    )
-    list(APPEND DESKTOP_FONT_SOURCES "${DESKTOP_FONT_CPP}")
-endforeach()
-
-# Clearwater chrome type roles and icon masks (DESIGN.md "Type").
 include("${BROOK_ROOT}/cmake/ChromeFonts.cmake")
 brook_chrome_fonts(DESKTOP_FONT_SOURCES "${BROOK_PYTHON3}" "${BROOK_DESKTOP_FONT_TTF}" "${BROOK_FONT_TTF}"
-                   "${CMAKE_CURRENT_BINARY_DIR}")
+                   "${CMAKE_CURRENT_BINARY_DIR}" NATIVE)
 
 # ---------------------------------------------------------------------------
 # FAT test image baking — generates a small FAT16 ramdisk embedded in the kernel.
@@ -308,6 +292,7 @@ add_executable(kernel
     src/syscall_sysinfo.cpp
     src/compat_census.cpp
     src/devtmpfs.cpp
+    src/fido_hidraw.cpp
     src/lastlog.cpp
     src/syscall_sysv_ipc.cpp
     src/syscall_brook_system.cpp

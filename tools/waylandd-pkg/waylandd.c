@@ -53,6 +53,8 @@
 #include "xdg-decoration-server-protocol.h"
 #include "kde-server-decoration-server-protocol.h"
 #include "viewporter-server-protocol.h"
+#include "fractional-scale-server-protocol.h"
+#include "brook_desktop_scale.h"
 #include "dmabuf-layout.h"
 #include "linux-dmabuf-unstable-v1-server-protocol.h"
 #include "text-input-v3-server-protocol.h"
@@ -154,6 +156,19 @@ static uint32_t g_trace_input_max_ms, g_trace_dispatch_max_ms;
  * XSETTINGS); only windows the XWM marks BXWM_SCALED are presented at the
  * output scale (see xwayland-xwm.h). */
 static uint32_t g_output_scale=1;
+enum { BROOK_WL_SCALE_ONE=120 };
+static uint32_t g_output_scale120=BROOK_WL_SCALE_ONE;
+
+static int64_t logical_to_physical(int64_t pixels, uint32_t scale120)
+{
+    return pixels>=0 ? (pixels*scale120+60)/BROOK_WL_SCALE_ONE :
+                       -((-pixels*scale120+60)/BROOK_WL_SCALE_ONE);
+}
+
+static uint32_t physical_to_logical(uint32_t pixels, uint32_t scale120)
+{
+    return (uint64_t)pixels*BROOK_WL_SCALE_ONE/scale120;
+}
 
 static uint64_t g_now_us(void) {
     struct timespec ts;
@@ -276,17 +291,22 @@ static long wm_get_screen_info(uint32_t *w_out, uint32_t *h_out) {
     if (rc == 0) { *w_out = buf[0]; *h_out = buf[1]; }
     return rc;
 }
-static void output_scale_init(void) {
+static void output_scale_sample(int startup) {
     long percent=syscall(0xB04,2L,0L,0L,0L,0L,0L);
-    long requested=syscall(0xB04,0L,0L,0L,0L,0L,0L);
-    /* Startup preferences are restored before the provider starts, but the
-     * compositor applies them asynchronously on its first frame. Honor that
-     * pending setting rather than freezing the previous 100% at this race. */
-    if(requested>=100 && requested<=400)percent=requested;
-    /* Initial support is integer scale. Match 100/200/300/400 percent exactly;
-     * report a bounded nearest integer for intermediate desktop settings. */
-    if (percent>=100 && percent<=400) g_output_scale=(uint32_t)(percent+50)/100;
-    fprintf(stderr,"[waylandd] output scale=%u desktop_percent=%ld (fixed until provider restart)\n",g_output_scale,percent);
+    if(startup) {
+        // The first compositor frame may not yet have applied the saved value.
+        long requested=syscall(0xB04,0L,0L,0L,0L,0L,0L);
+        if(requested>=100 && requested<=200 && brook_desktop_scale_valid((unsigned)requested))
+            percent=requested;
+    }
+    if(percent<100 || percent>200 || !brook_desktop_scale_valid((unsigned)percent)) return;
+    g_output_scale120=(uint32_t)percent*BROOK_WL_SCALE_ONE/100;
+    g_output_scale=(uint32_t)(percent+50)/100;
+}
+static void output_scale_init(void) {
+    output_scale_sample(1);
+    fprintf(stderr,"[waylandd] output scale=%u/%u legacy=%u\n",
+            g_output_scale120,BROOK_WL_SCALE_ONE,g_output_scale);
 }
 
 /* ---------------- per-surface state ---------------- */
@@ -419,6 +439,7 @@ struct brook_surface {
     int scene_disabled;
     int role; /* permanent: 1=xdg, 2=subsurface, 3=cursor, 4=Xwayland */
     struct wl_resource *resource;
+    struct wl_resource *fractional_scale;
     struct pointer_region input_region,pending_input_region;
     int input_region_pending;
     /* A revoked pointer lock stays inhibited for this surface until the
@@ -649,11 +670,16 @@ static int xwayland_accept_view(struct brook_surface *,uint32_t,uint32_t);
 static uint32_t xwayland_surface_scale(const struct brook_surface *s);
 static uint32_t surface_output_scale(const struct brook_surface *s) {
     if (s->is_cursor && s->cursor_output_scale) return s->cursor_output_scale;
-    while (s->tree.parent) s=s->tree.parent->user;
-    return s->role==4?xwayland_surface_scale(s):g_output_scale;
+    bool fractional=s->fractional_scale!=NULL;
+    for (unsigned depth=0; depth<64 && (s->tree.parent || s->popup_parent); ++depth) {
+        s=s->tree.parent?s->tree.parent->user:s->popup_parent;
+        fractional|=s->fractional_scale!=NULL;
+    }
+    if (s->role==4) return xwayland_surface_scale(s)*BROOK_WL_SCALE_ONE;
+    return fractional?g_output_scale120:g_output_scale*BROOK_WL_SCALE_ONE;
 }
 static wl_fixed_t surface_pointer_fixed(const struct brook_surface *s,int32_t physical) {
-    int64_t value=(int64_t)physical*256/surface_output_scale(s);
+    int64_t value=(int64_t)physical*256*BROOK_WL_SCALE_ONE/surface_output_scale(s);
     return value<INT32_MIN?INT32_MIN:value>INT32_MAX?INT32_MAX:(wl_fixed_t)value;
 }
 static int32_t pointer_fixed_floor(wl_fixed_t value) {
@@ -772,7 +798,7 @@ static int popup_apply_position(struct brook_surface *s) {
     if (!s || !s->xdg_popup || !s->wm_id || !s->popup_parent || !s->popup_parent->wm_id)
         return 0;
     const int64_t scale=surface_output_scale(s);
-    int64_t px=(int64_t)s->popup_x*scale,py=(int64_t)s->popup_y*scale;
+    int64_t px=logical_to_physical(s->popup_x,scale),py=logical_to_physical(s->popup_y,scale);
     if (px<INT32_MIN || px>INT32_MAX || py<INT32_MIN || py>INT32_MAX) return 0;
     long rc = wm_move_relative(s->wm_id, s->popup_parent->wm_id, (int32_t)px, (int32_t)py);
     if (rc != 0) {
@@ -1128,7 +1154,7 @@ static void surface_cursor_commit(struct brook_surface *s) {
     const struct brook_geometry *g=&view->geometry;
     const struct brook_image *image=view->image;
     uint32_t scale=surface_output_scale(s);
-    uint32_t dw=g->w*scale,dh=g->h*scale;
+    uint32_t dw=logical_to_physical(g->w,scale),dh=logical_to_physical(g->h,scale);
     const uint32_t side=dw>dh?dw:dh;
     if (side>BROOK_CURSOR_PHYSICAL_MAX) {
         dw=(uint64_t)dw*BROOK_CURSOR_PHYSICAL_MAX/side;
@@ -1150,8 +1176,8 @@ static void toplevel_output_size(const struct brook_surface *s, uint32_t *width,
     *width = *height = 0;
     wm_get_screen_info(width, height);
     const uint32_t scale = surface_output_scale(s);
-    *width /= scale;
-    *height /= scale;
+    *width=physical_to_logical(*width,scale);
+    *height=physical_to_logical(*height,scale);
 }
 
 static void toplevel_send_bounds(struct brook_surface *s, uint32_t width, uint32_t height)
@@ -1413,6 +1439,10 @@ static void surface_destroy_userdata(struct wl_resource *r) {
     pointer_region_clear(&s->input_region);pointer_region_clear(&s->pending_input_region);
     xwayland_surface_detach(s);
     if (s->viewport) { wl_resource_set_user_data(s->viewport,NULL);s->viewport=NULL; }
+    if (s->fractional_scale) {
+        wl_resource_set_user_data(s->fractional_scale,NULL);
+        s->fractional_scale=NULL;
+    }
     if (s->deco_resource) { wl_resource_set_user_data(s->deco_resource,NULL);s->deco_resource=NULL; }
     strip_retry_drop(s);
     /* Scrub references to this surface from all seat clients before we free
@@ -1637,7 +1667,7 @@ static void xdg_toplevel_show_window_menu(struct wl_client *c, struct wl_resourc
     struct brook_surface *s = wl_resource_get_user_data(r);
     if (!s || !s->wm_id) return;
     const int64_t scale = surface_output_scale(s);
-    long rc = syscall(BROOK_SYS_WM_SHOW_WINDOW_MENU, (long)s->wm_id, (long)(x * scale), (long)(y * scale));
+    long rc = syscall(BROOK_SYS_WM_SHOW_WINDOW_MENU, (long)s->wm_id, (long)logical_to_physical(x,scale), (long)logical_to_physical(y,scale));
     fprintf(stderr, "[waylandd] xdg_toplevel.show_window_menu wm=%u at %d,%d rc=%ld\n", s->wm_id, x, y, rc);
 }
 static void xdg_toplevel_move(struct wl_client *c, struct wl_resource *r,
@@ -2184,7 +2214,7 @@ static void pointer_set_cursor(struct wl_client *c, struct wl_resource *r,
                 wl_resource_post_error(r,WL_POINTER_ERROR_ROLE,"surface already has a role");return;
             }
             cs->role=3;cs->is_cursor = 1;
-            cs->cursor_output_scale=sc->entered_surface?surface_output_scale(sc->entered_surface):g_output_scale;
+            cs->cursor_output_scale=sc->entered_surface?surface_output_scale(sc->entered_surface):g_output_scale*BROOK_WL_SCALE_ONE;
             cs->cursor_hot_x = hx;
             cs->cursor_hot_y = hy;
             struct brook_surface *owner = sc->entered_surface;
@@ -2437,24 +2467,39 @@ static void output_send_size(struct wl_resource *r) {
 
 static void output_refresh(uint32_t now) {
     g_output_checked_ms = now;
+    const uint32_t previous_scale=g_output_scale120;
+    const uint32_t previous_legacy=g_output_scale;
+    output_scale_sample(0);
+    const int scale_changed=previous_scale!=g_output_scale120;
     uint32_t width, height;
-    if (wm_get_screen_info(&width, &height) || !width || !height ||
-        width > INT32_MAX || height > INT32_MAX ||
-        (width == g_output_width && height == g_output_height)) return;
-
-    g_output_width = width;
-    g_output_height = height;
-    for (struct brook_output *o = g_outputs; o; o = o->next) {
+    const int size_changed=!wm_get_screen_info(&width, &height) && width && height &&
+                           width<=INT32_MAX && height<=INT32_MAX &&
+                           (width!=g_output_width || height!=g_output_height);
+    if (size_changed) {
+        g_output_width=width;
+        g_output_height=height;
+    }
+    if (!scale_changed && !size_changed) return;
+    for (struct brook_output *o=g_outputs; o; o=o->next) {
+        const bool xwayland=wl_resource_get_client(o->resource)==g_xwayland_client;
         output_send_size(o->resource);
-        if (wl_resource_get_version(o->resource) >= 2)
+        if (wl_resource_get_version(o->resource)>=2) {
+            if (previous_legacy!=g_output_scale)
+                wl_output_send_scale(o->resource,xwayland?1:g_output_scale);
             wl_output_send_done(o->resource);
+        }
+    }
+    if (scale_changed) {
+        for (struct brook_surface *surface=g_surfaces; surface; surface=surface->next)
+            if (surface->fractional_scale)
+                wp_fractional_scale_v1_send_preferred_scale(surface->fractional_scale,g_output_scale120);
     }
 }
 
 static void output_refresh_due(uint32_t now) {
     /* The kernel has a size snapshot but no display-change event. Reuse the
      * frame tick, sampling only while an output is bound. */
-    if (g_outputs && now - g_output_checked_ms >= OUTPUT_CHECK_INTERVAL_MS)
+    if ((g_outputs || g_surfaces) && now - g_output_checked_ms >= OUTPUT_CHECK_INTERVAL_MS)
         output_refresh(now);
 }
 
@@ -2818,7 +2863,7 @@ static void dispatch_surface_event(struct brook_surface *s,
          * those dimensions, ack_configure, and commit. */
         if (s->xdg_toplevel && s->xdg_surface) {
             const int32_t scale = (int32_t)surface_output_scale(s);
-            int32_t neww = e->x / scale, newh = e->y / scale;
+            int32_t neww = physical_to_logical(e->x,scale), newh = physical_to_logical(e->y,scale);
             const int was_managed = s->toplevel_maximized || s->toplevel_fullscreen;
             s->toplevel_fullscreen = (e->reserved & WM_RESIZE_FULLSCREEN) != 0;
             s->toplevel_maximized = !s->toplevel_fullscreen && (e->reserved & WM_RESIZE_MAXIMIZED) != 0;
@@ -2832,8 +2877,8 @@ static void dispatch_surface_event(struct brook_surface *s,
             } else if (!managed && s->deco_sent_mode > 0) {
                 // xdg_toplevel.configure uses window geometry. The VFB and
                 // the WM's outer client rectangle include client shadows.
-                const int32_t shadow_w = (int32_t)(s->vfb_w / scale) - s->window_geometry_w;
-                const int32_t shadow_h = (int32_t)(s->vfb_h / scale) - s->window_geometry_h;
+                const int32_t shadow_w = (int32_t)physical_to_logical(s->vfb_w,scale) - s->window_geometry_w;
+                const int32_t shadow_h = (int32_t)physical_to_logical(s->vfb_h,scale) - s->window_geometry_h;
                 if (s->window_geometry_w > 0 && shadow_w > 0 && neww > shadow_w) neww -= shadow_w;
                 if (s->window_geometry_h > 0 && shadow_h > 0 && newh > shadow_h) newh -= shadow_h;
             }
@@ -2861,8 +2906,8 @@ static void toplevel_set_activated(struct brook_surface *surface, int active) {
         surface->toplevel_activated == active) return;
     surface->toplevel_activated=active;
     surface->strip_due=3; /* Chromium redraws its strip in the (in)active colour. */
-    int32_t width=surface->window_geometry_w>0?surface->window_geometry_w:(int32_t)(surface->vfb_w/surface_output_scale(surface));
-    int32_t height=surface->window_geometry_h>0?surface->window_geometry_h:(int32_t)(surface->vfb_h/surface_output_scale(surface));
+    int32_t width=surface->window_geometry_w>0?surface->window_geometry_w:(int32_t)physical_to_logical(surface->vfb_w,surface_output_scale(surface));
+    int32_t height=surface->window_geometry_h>0?surface->window_geometry_h:(int32_t)physical_to_logical(surface->vfb_h,surface_output_scale(surface));
     if(surface->toplevel_maximized || surface->toplevel_fullscreen || surface->configure_size_pending) {
         width=surface->configure_width;height=surface->configure_height;
     }
@@ -2956,8 +3001,8 @@ static int g_caption_overlay_unsupported, g_caption_rows_unsupported;
 static uint32_t deco_caption_insets(const struct brook_surface *s) {
     if (s->window_geometry_w <= 0 || s->window_geometry_h <= 0 || !s->vfb_w) return 0;
     const int64_t scale = surface_output_scale(s);
-    int64_t right = (int64_t)s->vfb_w - ((int64_t)s->window_geometry_x + s->window_geometry_w) * scale;
-    int64_t top = (int64_t)s->window_geometry_y * scale;
+    int64_t right = (int64_t)s->vfb_w - logical_to_physical((int64_t)s->window_geometry_x+s->window_geometry_w,scale);
+    int64_t top = logical_to_physical(s->window_geometry_y,scale);
     if (right < 0) right = 0;
     if (top < 0) top = 0;
     if (right > 0xFFFF) right = 0xFFFF;
@@ -3013,12 +3058,18 @@ static uint32_t strip_majority(uint32_t a, uint32_t b, uint32_t c) {
 static int strip_sample(struct brook_surface *s, struct brook_image *im) {
     const struct brook_view *view=s->tree.current?s->tree.current->value:NULL;
     const int strip=deco_caption_overlay_app(s);
-    if (!view || !im || !view->geometry.w || s->window_geometry_w<=0 || strip<=0) return 0;
-    const uint32_t bs=im->width/view->geometry.w?im->width/view->geometry.w:1;
-    const int64_t right=((int64_t)s->window_geometry_x+s->window_geometry_w)*bs;
-    const int64_t top=(int64_t)s->window_geometry_y*bs;
-    const int64_t strip_buffer=(int64_t)strip*bs, bottom=top+strip_buffer;
-    if (right<8 || top<0 || right>(int64_t)im->width || bottom>im->height) return 0;
+    if (!view || !im || s->window_geometry_w<=0 || strip<=0) return 0;
+    const struct brook_geometry *geometry=&view->geometry;
+    if (geometry->transform || !geometry->w || !geometry->h || !geometry->sw || !geometry->sh) return 0;
+    // Use the committed viewport's mapping. Fractional clients normally
+    // attach physical-sized buffers with wl_surface.buffer_scale=1.
+    const int64_t right=(geometry->sx+
+        ((int64_t)s->window_geometry_x+s->window_geometry_w)*geometry->sw/geometry->w)/256;
+    const int64_t top=(geometry->sy+(int64_t)s->window_geometry_y*geometry->sh/geometry->h)/256;
+    const int64_t bottom=(geometry->sy+
+        ((int64_t)s->window_geometry_y+strip)*geometry->sh/geometry->h)/256;
+    const int64_t strip_buffer=bottom-top;
+    if (right<8 || top<0 || strip_buffer<=0 || right>(int64_t)im->width || bottom>im->height) return 0;
 
     struct strip_pixels pixels;
     int r=strip_pixels_open(im,(uint32_t)bottom,&pixels);
@@ -3031,21 +3082,24 @@ static int strip_sample(struct brook_surface *s, struct brook_image *im) {
         unsigned radius=0;
         const unsigned span=right>=32?32:(unsigned)right;
         while (radius<span && (strip_pixel(&pixels,right-1-radius,top)>>24)<128) ++radius;
-        unsigned physical=radius*scale/bs;
+        unsigned physical=(uint64_t)radius*scale*geometry->w*256 /
+                          ((uint64_t)BROOK_WL_SCALE_ONE*geometry->sw);
         if (physical>127) physical=127;
         s->strip_style=(colour&0xffffffu)|(1u<<24)|(physical<<25);
         s->strip.count=0;
 
-        const uint64_t physical_height=(uint64_t)strip*scale;
+        const uint64_t physical_height=logical_to_physical(strip,scale);
         if (physical_height<=BROOK_CAPTION_STRIP_MAX_ROWS) {
             long desktop_percent=syscall(0xB04,2L,0L,0L,0L,0L,0L);
             if (desktop_percent<100 || desktop_percent>200) desktop_percent=100;
             uint32_t width=(BROOK_CAPTION_BUTTON_LOGICAL_WIDTH*desktop_percent+50)/100;
             const uint32_t available=s->vfb_w-(deco_caption_insets(s)&0xffffu);
             if (width*3>available) width=available/3;
-            const int64_t edge=right-(int64_t)width*3*bs/scale;
+            const int64_t sample_offset=(uint64_t)width*3*geometry->sw*BROOK_WL_SCALE_ONE /
+                                        ((uint64_t)scale*geometry->w*256);
+            const int64_t edge=right-sample_offset;
             for (uint32_t row=0;row<physical_height;++row) {
-                const uint32_t y=(uint32_t)top+row*bs/scale;
+                const uint32_t y=(uint32_t)top+(uint64_t)row*strip_buffer/physical_height;
                 uint32_t rgb=0;
                 if (edge>=9 && edge<=right-3)
                     rgb=strip_majority(strip_pixel(&pixels,edge-1,y),
@@ -3128,7 +3182,7 @@ static void surface_sync_decoration(struct brook_surface *s, int force) {
         !g_caption_overlay_unsupported && (strip = deco_caption_overlay_app(s)) >= 0) {
         mode = 2;
         insets = deco_caption_insets(s);
-        uint64_t physical = (uint64_t)strip * surface_output_scale(s);
+        uint64_t physical = logical_to_physical(strip,surface_output_scale(s));
         height = physical > 0xFFFF ? 0xFFFF : (uint32_t)physical;
         style = s->strip_style;
     }
@@ -3343,6 +3397,59 @@ static void kde_decoration_manager_bind(struct wl_client *c, void *data,
     org_kde_kwin_server_decoration_manager_send_default_mode(r,
         ORG_KDE_KWIN_SERVER_DECORATION_MANAGER_MODE_SERVER);
     fprintf(stderr, "[waylandd] KDE decoration manager default=server\n");
+}
+
+/* ---------------- wp_fractional_scale_v1 ---------------- */
+static void fractional_destroy(struct wl_client *client,struct wl_resource *resource)
+{
+    (void)client;
+    wl_resource_destroy(resource);
+}
+
+static void fractional_resource_destroyed(struct wl_resource *resource)
+{
+    struct brook_surface *surface=wl_resource_get_user_data(resource);
+    if (surface) surface->fractional_scale=NULL;
+}
+
+static const struct wp_fractional_scale_v1_interface fractional_impl={
+    .destroy=fractional_destroy,
+};
+
+static void fractional_get(struct wl_client *client,struct wl_resource *manager,
+                           uint32_t id,struct wl_resource *surface_resource)
+{
+    struct brook_surface *surface=wl_resource_get_user_data(surface_resource);
+    if (!surface) return;
+    if (surface->fractional_scale) {
+        wl_resource_post_error(manager,WP_FRACTIONAL_SCALE_MANAGER_V1_ERROR_FRACTIONAL_SCALE_EXISTS,
+                               "fractional scale already exists for this surface");
+        return;
+    }
+    struct wl_resource *resource=wl_resource_create(client,&wp_fractional_scale_v1_interface,1,id);
+    if (!resource) {
+        wl_client_post_no_memory(client);
+        return;
+    }
+    surface->fractional_scale=resource;
+    wl_resource_set_implementation(resource,&fractional_impl,surface,fractional_resource_destroyed);
+    wp_fractional_scale_v1_send_preferred_scale(resource,g_output_scale120);
+}
+
+static const struct wp_fractional_scale_manager_v1_interface fractional_manager_impl={
+    .destroy=fractional_destroy,
+    .get_fractional_scale=fractional_get,
+};
+
+static void fractional_bind(struct wl_client *client,void *data,uint32_t version,uint32_t id)
+{
+    (void)data;
+    struct wl_resource *resource=wl_resource_create(client,&wp_fractional_scale_manager_v1_interface,version,id);
+    if (!resource) {
+        wl_client_post_no_memory(client);
+        return;
+    }
+    wl_resource_set_implementation(resource,&fractional_manager_impl,NULL,NULL);
 }
 
 /* ---------------- wp_viewporter (double-buffered surface geometry) ---------------- */
@@ -4047,10 +4154,10 @@ static int gpu_window_offer(struct brook_image *image){
      * (and can cull beneath it) instead of this provider composing it into
      * the VFB on the CPU or GPU for every frame. */
     const int exact=!g->sx && !g->sy && g->sw==(int64_t)image->width*256 && g->sh==(int64_t)image->height*256 &&
-        (uint64_t)g->w*scale==image->width && (uint64_t)g->h*scale==image->height;
+        logical_to_physical(g->w,scale)==image->width && logical_to_physical(g->h,scale)==image->height;
     const int scaled=!exact && gpu_scaled_offers_enabled() && gpu_layers_enabled() && !((g->sx|g->sy|g->sw|g->sh)&255) &&
         g->sx>=0 && g->sy>=0 && g->sw>0 && g->sh>0 && g->sx+g->sw<=(int64_t)image->width*256 && g->sy+g->sh<=(int64_t)image->height*256 &&
-        g->w>0 && g->h>0 && (uint64_t)g->w*scale<=16384 && (uint64_t)g->h*scale<=16384;
+        g->w>0 && g->h>0 && logical_to_physical(g->w,scale)<=16384 && logical_to_physical(g->h,scale)<=16384;
     const uint32_t tileFlags=db->modifier==BROOK_DRM_MOD_I915_X_TILED?BROOK_GPU_WINDOW_LAYER_TILED_X:
         db->modifier==BROOK_DRM_MOD_I915_Y_TILED?BROOK_GPU_WINDOW_LAYER_TILED_Y:0;
     if(g->transform || (!exact && !scaled) || (db->stride&3) || (db->offset&3) || (db->modifier && !tileFlags) ||
@@ -4063,7 +4170,7 @@ static int gpu_window_offer(struct brook_image *image){
     if(fstat(image->pending_fd,&st) || !st.st_ino || st.st_size<=0 || (st.st_size&3) ||
        syscall(BROOK_SYS_WM_WINDOW_STATE,(long)root->wm_id,0L,(long)&window,(long)sizeof(window),0L,0L) ||
        window.version!=BROOK_WINDOW_STATE_VERSION || window.window!=root->wm_id || !root->tree.current ||
-       root->vfb_w!=(uint64_t)g->w*scale || root->vfb_h!=(uint64_t)g->h*scale){++g_gpu_offer_metadata;return 0;}
+       root->vfb_w!=logical_to_physical(g->w,scale) || root->vfb_h!=logical_to_physical(g->h,scale)){++g_gpu_offer_metadata;return 0;}
     /* The WM client size (window.width/height) may differ from the committed
      * buffer while a resize is in flight or when the client picks its own
      * size. The renderer draws the offer exactly as it draws the VFB, 1:1
@@ -4089,7 +4196,7 @@ static int gpu_window_offer(struct brook_image *image){
             .offset=offer.offset,.stride=offer.stride,.width=offer.width,.height=offer.height,.fourcc=offer.fourcc,
             .flags=((view->opaque || db->fourcc==0x34325258)?BROOK_GPU_WINDOW_LAYER_OPAQUE:0)|tileFlags,
             .srcX=(uint32_t)(g->sx/256),.srcY=(uint32_t)(g->sy/256),.srcWidth=(uint32_t)(g->sw/256),.srcHeight=(uint32_t)(g->sh/256),
-            .dstWidth=g->w*scale,.dstHeight=g->h*scale};
+            .dstWidth=logical_to_physical(g->w,scale),.dstHeight=logical_to_physical(g->h,scale)};
         /* A tiled buffer whose size or pitch breaks the tile rules stays on
          * the CPU path rather than failing the whole channel. */
         if(tileFlags && !brook_gpu_window_layers_valid(&one)){++g_gpu_offer_geometry;return 0;}
@@ -4215,9 +4322,9 @@ static int gpu_window_offer_layers(struct brook_surface *root,const struct brook
     for(unsigned i=0;i<count;++i){
         const struct brook_view *view=draws[i].view;struct brook_image *image=view->image;const struct brook_geometry *g=&view->geometry;
         if(g->transform || ((g->sx|g->sy|g->sw|g->sh)&255) || !g->sw || !g->sh ||
-           (uint64_t)g->w*scale>16384 || (uint64_t)g->h*scale>16384 ||
-           draws[i].x*(int64_t)scale<=-16384 || draws[i].x*(int64_t)scale>=16384 ||
-           draws[i].y*(int64_t)scale<=-16384 || draws[i].y*(int64_t)scale>=16384){++g_gpu_group_skip_shape;return 0;}
+           logical_to_physical(g->w,scale)>16384 || logical_to_physical(g->h,scale)>16384 ||
+           logical_to_physical(draws[i].x,scale)<=-16384 || logical_to_physical(draws[i].x,scale)>=16384 ||
+           logical_to_physical(draws[i].y,scale)<=-16384 || logical_to_physical(draws[i].y,scale)>=16384){++g_gpu_group_skip_shape;return 0;}
         struct BrookGpuWindowLayer *l=&packet.layers[i];
         struct stat st={0};
         if(image->pending_cpu==1){
@@ -4232,7 +4339,7 @@ static int gpu_window_offer_layers(struct brook_surface *root,const struct brook
                 .offset=db->offset/4,.stride=db->stride/4,.width=image->width,.height=image->height,.fourcc=db->fourcc,
                 .flags=(view->opaque?BROOK_GPU_WINDOW_LAYER_OPAQUE:0)|tileFlags};
             if(tileFlags){struct BrookGpuWindowLayer probe=*l;probe.srcX=g->sx/256;probe.srcY=g->sy/256;probe.srcWidth=g->sw/256;
-                probe.srcHeight=g->sh/256;probe.dstWidth=g->w*scale;probe.dstHeight=g->h*scale;
+                probe.srcHeight=g->sh/256;probe.dstWidth=logical_to_physical(g->w,scale);probe.dstHeight=logical_to_physical(g->h,scale);
                 if(!brook_gpu_window_layer_valid(&probe)){++g_gpu_group_skip_buffer;return 0;}}
             buffers[i]=image->pending_fd;fences[i]=image->producer_fence;
         }else if(image->pixels && !image->pending_cpu){
@@ -4246,8 +4353,9 @@ static int gpu_window_offer_layers(struct brook_surface *root,const struct brook
         /* Source rectangle: Wayland 24.8 in transformed buffer units; with no
          * transform these are buffer pixels. */
         l->srcX=g->sx/256;l->srcY=g->sy/256;l->srcWidth=g->sw/256;l->srcHeight=g->sh/256;
-        l->dstX=(int32_t)(draws[i].x*(int64_t)scale);l->dstY=(int32_t)(draws[i].y*(int64_t)scale);
-        l->dstWidth=g->w*scale;l->dstHeight=g->h*scale;
+        l->dstX=(int32_t)(logical_to_physical(draws[i].x,scale));l->dstY=(int32_t)(logical_to_physical(draws[i].y,scale));
+        l->dstWidth=logical_to_physical(draws[i].x+g->w,scale)-l->dstX;
+        l->dstHeight=logical_to_physical(draws[i].y+g->h,scale)-l->dstY;
     }
     /* The root's committed size is the window's size, exactly as for a
      * single offer. Without this a window that resized while it had a
@@ -5148,6 +5256,7 @@ int main(int argc, char **argv)
     if (!wl_global_create(g_display, &zxdg_decoration_manager_v1_interface, 1, NULL, deco_mgr_bind)) return 1;
     if (!wl_global_create(g_display, &org_kde_kwin_server_decoration_manager_interface, 1, NULL, kde_decoration_manager_bind)) return 1;
     if (!wl_global_create(g_display, &wp_viewporter_interface, 1, NULL, viewporter_bind)) return 1;
+    if (!wl_global_create(g_display, &wp_fractional_scale_manager_v1_interface, 1, NULL, fractional_bind)) return 1;
     if (!wl_global_create(g_display, &wl_subcompositor_interface, 1, NULL, subcomp_bind)) return 1;
     if (!wl_global_create(g_display, &wl_data_device_manager_interface, 3, NULL, ddm_bind)) return 1;
     if (!wl_global_create(g_display, &zwp_linux_dmabuf_v1_interface, 4, NULL, dmabuf_bind)) return 1;

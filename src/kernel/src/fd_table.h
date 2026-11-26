@@ -67,6 +67,7 @@ enum class FdType : uint8_t
     DevZero,       // /dev/zero (1:5) — zero-filled reads, discarded writes
     DevFull,       // /dev/full (1:7) — zero-filled reads, writes fail ENOSPC
     DevNvDri,      // /dev/dri/renderD130 — nouveau uAPI on GSP-RM (M5, nv_drm.h)
+    DevHidraw,     // One open report queue for a FIDO authenticator
 };
 
 // One descriptor slot. type/handle/flags are the immutable identity of the

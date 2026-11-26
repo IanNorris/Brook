@@ -92,7 +92,7 @@ bool SameGeometry(const Geometry& a, const Geometry& b)
 
 const ChromeFontSet& Fonts(uint32_t scale)
 {
-    return scale == 200 ? g_chromeFonts200 : scale == 150 ? g_chromeFonts150 : g_chromeFonts100;
+    return ChromeFontsForScale(scale);
 }
 
 void WakeReader()

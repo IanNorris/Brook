@@ -72,6 +72,7 @@ static unsigned g_epollFrees;
 extern "C" void* kmalloc(uint64_t size) { return calloc(1, size ? size : 1); }
 extern "C" void kfree(void* p) { free(p); }
 namespace brook {
+uint32_t HidrawReady(HidrawFile*, uint32_t) { return 0; }
 extern "C" void SerialPrintf(const char*, ...) {}
 extern "C" void SerialPuts(const char*) {}
 // Each thread is its own task sharing the leader's fd table (CLONE_FILES),

@@ -1,3 +1,4 @@
+#include "fido_hidraw.h"
 #include "keyboard_layout.h"
 // syscall_rw.cpp -- read/write family: read/write/readv/writev/pread64/pwrite64/sendfile.
 //
@@ -84,6 +85,7 @@ static uint32_t StageWriteChunk(char* stage, uint32_t capacity, uint64_t address
 static int64_t WriteToPinnedFdByType(Process* proc,FdEntry* fde,uint64_t fd,
                                      uint64_t bufAddr,uint64_t count,bool userSource)
 {
+    if (fde->type == FdType::DevHidraw) return HidrawWrite(fde, bufAddr, count, userSource);
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS) || defined(BROOK_SSD_INSTALLER)
     if(fde->type==FdType::BlockDevice && fde->handle) {
         if((FdStatus(fde)&3)==0)return -EBADF;
@@ -585,6 +587,8 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
     FdRef ref(proc, static_cast<int>(fd));
     if (!ref) return -EBADF;
     FdEntry* fde = ref.get();
+
+    if (fde->type == FdType::DevHidraw) return HidrawRead(fde, bufAddr, count);
 
     // Validate user buffer up-front — every read path below ultimately
     // writes to bufAddr. If the user munmapped or never mapped the range,

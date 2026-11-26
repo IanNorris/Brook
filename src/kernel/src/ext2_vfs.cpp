@@ -1,3 +1,4 @@
+#include "path_buffer.h"
 #include "process_user_namespace.h"
 // ext2_vfs.cpp — Ext2 filesystem driver for Brook VFS (read/write).
 //
@@ -1938,6 +1939,7 @@ static uint32_t Ext2ResolveParent(Ext2Mount* mnt, const char* relPath,
         if (*q == '/') lastSlash = q;
 
     if (!lastSlash) {
+        if (end-p >= nameOutSize) { if(error)*error=-36; return 0; }
         // No slash — parent is root, name is the entire (trimmed) path
         uint32_t i = 0;
         while (p + i < end && i < nameOutSize - 1) { nameOut[i] = p[i]; ++i; }
@@ -1947,14 +1949,16 @@ static uint32_t Ext2ResolveParent(Ext2Mount* mnt, const char* relPath,
 
     // Copy parent path (everything before the last slash)
     uint32_t parentLen = static_cast<uint32_t>(lastSlash - p);
-    char parentPath[256];
-    if (parentLen >= sizeof(parentPath)) { if(error)*error=-36; return 0; }
+    if (parentLen >= PathMax) { if(error)*error=-36; return 0; }
+    PathBuffer parentPath(parentLen+1);
+    if (!parentPath.allocate()) { if(error)*error=-12; return 0; }
     for (uint32_t i = 0; i < parentLen; ++i) parentPath[i] = p[i];
     parentPath[parentLen] = '\0';
 
     // Copy name (after last slash, up to the trimmed end)
     const char* name = lastSlash + 1;
     while (name < end && *name == '/') ++name;
+    if (end-name >= nameOutSize) { if(error)*error=-36; return 0; }
     uint32_t ni = 0;
     while (name + ni < end && name[ni] && ni < nameOutSize - 1) { nameOut[ni] = name[ni]; ++ni; }
     nameOut[ni] = '\0';
@@ -2329,83 +2333,85 @@ static uint32_t Ext2ResolvePathInternal(Ext2Mount* mnt, uint32_t startIno,
     if (symlinkDepth > 8) { if(error)*error=-40; return 0; }
 
     uint32_t curIno = startIno;
+    for (;;) {
 
-    // Skip leading slashes (absolute path restarts from root)
-    while (*path == '/') { ++path; curIno = EXT2_ROOT_INO; }
-    if (*path == '\0') return curIno;
+        // Skip leading slashes (absolute path restarts from root)
+        while (*path == '/') { ++path; curIno = EXT2_ROOT_INO; }
+        if (*path == '\0') return curIno;
 
-    // Extract next path component
-    char component[256];
-    uint32_t ci = 0;
-    while (*path && *path != '/' && ci < sizeof(component) - 1)
-        component[ci++] = *path++;
-    component[ci] = '\0';
-    while (*path == '/') ++path; // skip trailing slashes
+        // Extract next path component
+        char component[256];
+        uint32_t ci = 0;
+        while (*path && *path != '/' && ci < sizeof(component) - 1)
+            component[ci++] = *path++;
+        if (*path && *path != '/') { if(error)*error=-36; return 0; }
+        component[ci] = '\0';
+        while (*path == '/') ++path; // skip trailing slashes
 
-    // Look up component in current directory
-    Ext2Inode dirIno;
-    if (!Ext2ReadInode(mnt, curIno, &dirIno)) {
-        if(error)*error=-5;
-        SerialPrintf("ext2: ReadInode %u FAILED for component '%s'\n", curIno, component);
-        return 0;
-    }
-    if ((dirIno.i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR) {
-        if(error)*error=-20;
-        return 0;
-    }
-
-    uint32_t childIno = Ext2DirLookup(mnt, curIno, &dirIno, component, error);
-    if (!childIno) return 0;
-
-    // Check if child is a symlink — follow it
-    Ext2Inode childData;
-    if (!Ext2ReadInode(mnt, childIno, &childData)) { if(error)*error=-5; return 0; }
-
-    if ((childData.i_mode & EXT2_S_IFMT) == EXT2_S_IFLNK) {
-        char* target = Ext2ReadSymlink(mnt, &childData);
-        if (!target) { if(error)*error=-5; return 0; }
-
-        // Resolve symlink target
-        uint32_t base = curIno;
-        if (target[0] == '/') base = EXT2_ROOT_INO;
-
-        // Build combined path: target + remaining path
-        uint32_t targetLen = 0;
-        for (const char* p = target; *p; ++p) ++targetLen;
-        uint32_t remainLen = 0;
-        for (const char* p = path; *p; ++p) ++remainLen;
-
-        char* combined = nullptr;
-        if (remainLen > 0) {
-            combined = static_cast<char*>(kmalloc(targetLen + 1 + remainLen + 1));
-            if (!combined) { kfree(target); if(error)*error=-12; return 0; }
-            uint32_t wi = 0;
-            for (uint32_t i = 0; i < targetLen; ++i) combined[wi++] = target[i];
-            combined[wi++] = '/';
-            for (uint32_t i = 0; i < remainLen; ++i) combined[wi++] = path[i];
-            combined[wi] = '\0';
-            kfree(target);
-            uint32_t result = Ext2ResolvePathInternal(mnt, base, combined, symlinkDepth + 1, error);
-            kfree(combined);
-            return result;
-        } else {
-            uint32_t result = Ext2ResolvePathInternal(mnt, base, target, symlinkDepth + 1, error);
-            kfree(target);
-            return result;
+        // Look up component in current directory
+        Ext2Inode dirIno;
+        if (!Ext2ReadInode(mnt, curIno, &dirIno)) {
+            if(error)*error=-5;
+            SerialPrintf("ext2: ReadInode %u FAILED for component '%s'\n", curIno, component);
+            return 0;
         }
+        if ((dirIno.i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR) {
+            if(error)*error=-20;
+            return 0;
+        }
+
+        uint32_t childIno = Ext2DirLookup(mnt, curIno, &dirIno, component, error);
+        if (!childIno) return 0;
+
+        // Check if child is a symlink — follow it
+        Ext2Inode childData;
+        if (!Ext2ReadInode(mnt, childIno, &childData)) { if(error)*error=-5; return 0; }
+
+        if ((childData.i_mode & EXT2_S_IFMT) == EXT2_S_IFLNK) {
+            char* target = Ext2ReadSymlink(mnt, &childData);
+            if (!target) { if(error)*error=-5; return 0; }
+
+            // Resolve symlink target
+            uint32_t base = curIno;
+            if (target[0] == '/') base = EXT2_ROOT_INO;
+
+            // Build combined path: target + remaining path
+            uint32_t targetLen = 0;
+            for (const char* p = target; *p; ++p) ++targetLen;
+            uint32_t remainLen = 0;
+            for (const char* p = path; *p; ++p) ++remainLen;
+
+            char* combined = nullptr;
+            if (remainLen > 0) {
+                if (targetLen+1+remainLen>=PathMax) { kfree(target); if(error)*error=-36; return 0; }
+                combined = static_cast<char*>(kmalloc(targetLen + 1 + remainLen + 1));
+                if (!combined) { kfree(target); if(error)*error=-12; return 0; }
+                uint32_t wi = 0;
+                for (uint32_t i = 0; i < targetLen; ++i) combined[wi++] = target[i];
+                combined[wi++] = '/';
+                for (uint32_t i = 0; i < remainLen; ++i) combined[wi++] = path[i];
+                combined[wi] = '\0';
+                kfree(target);
+                uint32_t result = Ext2ResolvePathInternal(mnt, base, combined, symlinkDepth + 1, error);
+                kfree(combined);
+                return result;
+            } else {
+                uint32_t result = Ext2ResolvePathInternal(mnt, base, target, symlinkDepth + 1, error);
+                kfree(target);
+                return result;
+            }
+        }
+
+        if (!*path) return childIno;
+        curIno = childIno;
     }
-
-    // Not a symlink — if more path remains, recurse
-    if (*path != '\0')
-        return Ext2ResolvePathInternal(mnt, childIno, path, symlinkDepth, error);
-
-    return childIno;
 }
 
 static uint32_t Ext2ResolvePath(Ext2Mount* mnt, uint32_t startIno,
                                 const char* path, int symlinkDepth, int* error)
 {
     if(error)*error=0;
+    if(PathLength(path)>=PathMax) { if(error)*error=-36; return 0; }
     return Ext2ResolvePathInternal(mnt, startIno, path, symlinkDepth, error);
 }
 
@@ -2953,7 +2959,7 @@ static int Ext2DirectoryPathLocked(Ext2Mount* mnt,uint32_t current,char* out,uin
     uint32_t position=capacity-1;
     out[position]=0;
     for(uint32_t depth=0;current!=EXT2_ROOT_INO;++depth) {
-        if(depth>=256)return -40;
+        if(depth>=PathMax/2)return -40;
         Ext2Inode child,parent;
         if(!Ext2ReadInode(mnt,current,&child))return -5;
         if((child.i_mode&EXT2_S_IFMT)!=EXT2_S_IFDIR || !child.i_links_count)return -2;
@@ -4152,7 +4158,8 @@ static int Ext2FsSymlinkAt(void* mountPriv,uint8_t pdrv,const char* target,const
 
     uint32_t targetLen = 0;
     for (const char* p = target; *p; ++p) ++targetLen;
-    if (targetLen == 0 || targetLen > 4096) return -22; // -EINVAL
+    if (!targetLen) return -22;
+    if (targetLen >= PathMax || targetLen >= mnt->blockSize) return -36;
 
     KRwLockWriteLock(&g_ext2Lock);
 

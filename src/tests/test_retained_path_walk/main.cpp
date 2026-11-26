@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "retained_path_walk.h"
 #include <cassert>
 #include <cstdio>
@@ -90,7 +91,25 @@ int main(){
     // Missing parent, unsupported backend, permission/stat errors and capacity.
     run(root,held,"absent/child",-2);fs.failLookup=-95;run(root,held,"marker",-95);fs.failLookup=0;
     fs.at(file).error=-5;run(root,held,"marker",-5);fs.at(file).error=0;
+    const std::string leaf(255,'x');
+    fs.add(held,leaf.c_str(),{1,10},false);
+    run(root,held,leaf,0,{1,10});
+    run(root,held,std::string(3840,'/')+leaf,-2);
+    fs.add(root,leaf.c_str(),{1,11},false);
+    const auto maxPath=std::string(3840,'/')+leaf;
+    assert(maxPath.size()==4095);
+    run(root,held,maxPath,0,{1,11});
+    run(root,held,'/'+maxPath,-36);
+    // The second expansion consumes a longer prefix than it replaces.
+    fs.link(root,"first",{1,12},"/a-longer-second-symlink");
+    fs.link(root,"a-longer-second-symlink",{1,13},"dir");
+    run(root,held,"/first/marker",0,poison);
     run(root,held,std::string(256,'x'),-36);run(root,held,std::string(512,'x'),-36);run(root,held,"",-2);
     fs.Release(held);fs.Release(root);assert(!fs.refs());
     std::puts("RETAINED_PATH_WALK_PASS identity/rename/overmount/mount-parent/root/symlinks/lifetimes/errors");
+}
+
+namespace brook {
+extern "C" void* kmalloc(uint64_t size) { return std::malloc(size); }
+extern "C" void kfree(void* ptr) { std::free(ptr); }
 }

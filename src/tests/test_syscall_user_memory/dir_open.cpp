@@ -1,5 +1,6 @@
 // H-17 getdents64 and H-18 open/openat: user pointers only, checked copies.
 #include "harness.h"
+#include <initializer_list>
 #include "syscall_open.cpp"
 #include "syscall_dir.cpp"
 
@@ -27,6 +28,19 @@ static void Open() {
     __builtin_memcpy(reinterpret_cast<void*>(UserAddress(0)),"/tmp/x",7);
     CHECK(brook::sys_open(UserAddress(0),0,0,0,0,0)==-brook::ENOENT);
     CHECK(g_snapshots==1);
+    auto* path=reinterpret_cast<char*>(UserAddress(0));
+    for (unsigned bytes : {255u, 256u, 4095u, 4096u}) {
+        __builtin_memset(path,'/',bytes);
+        path[bytes]=0;
+        const auto result=brook::sys_open(UserAddress(0),0,0,0,0,0);
+        CHECK(result==(bytes==4096 ? -36 : -brook::ENOENT));
+    }
+    CHECK(g_snapshots==4);
+    // An inaccessible page is still EFAULT, including within a large path.
+    __builtin_memset(path,'/',4096);
+    Protect(PageSize,PageSize,Access::None);
+    CHECK(brook::sys_open(UserAddress(1),0,0,0,0,0)==-brook::EFAULT);
+    CHECK(g_snapshots==4);
 }
 
 static void Getdents() {
