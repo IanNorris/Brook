@@ -37,14 +37,16 @@ struct BrookDebugFrameInfoV3 {
  * WINDOW_BUFFER copies the current client buffer of the named window
  * (unoccluded, buffer pixels, no chrome) instead of the screen; it fails
  * with -ENOENT for an unknown window and -EOPNOTSUPP without a CPU buffer.
- * CURSOR and WINDOW_BUFFER cannot be combined.
+ * CURSOR and WINDOW_BUFFER cannot be combined. WINDOW_CROP binds a screen
+ * lease to a window's identity without copying its private buffer. Both modes
+ * refuse capture-excluded windows with EACCES.
  * Op 7 fills BrookDebugFrameInfoV4 (exact length) for the same token.
  * Sources 4..7 extend the V2 source field: on Dell builds full-screen
  * captures read the surface primary plane A is fetching (DSPASURFLIVE), so
  * a renderer image, kernel flip buffer or direct client buffer replaces
  * the GOP framebuffer whenever it is the one on the panel. */
 enum { BROOK_DEBUG_FRAME_REQUEST=6, BROOK_DEBUG_FRAME_INFO_V4=7 };
-enum { BROOK_DEBUG_FRAME_FLAG_CURSOR=1, BROOK_DEBUG_FRAME_FLAG_WINDOW_BUFFER=2 };
+enum { BROOK_DEBUG_FRAME_FLAG_CURSOR=1, BROOK_DEBUG_FRAME_FLAG_WINDOW_BUFFER=2, BROOK_DEBUG_FRAME_FLAG_WINDOW_CROP=4 };
 struct BrookDebugFrameRequest {
     uint32_t flags,window_id;
     uint64_t window_incarnation;

@@ -57,9 +57,21 @@ bool KvmClockAvailable(){return true;}
 uint64_t KvmClockReadNs(){return captureClockNs;}
 bool TscClockAvailable(){return false;}
 uint64_t TscClockReadNs(){return 0;}
+bool protectedWindows;
+uint64_t WmCaptureProtectionEpoch() { return protectedWindows; }
+uint32_t WmGetCaptureMasks(CaptureMaskRect* out)
+{
+    out[0] = {2, 1, 3, 2};
+    return 1;
+}
+int WmCheckWindowCapture(uint32_t id, uint64_t incarnation)
+{
+    if (id != 9 || incarnation != 90) return -2;
+    return protectedWindows ? -13 : 0;
+}
 int WmCopyDebugWindowBuffer(uint32_t id,uint64_t incarnation,uint32_t* out,uint64_t capacity,
                             uint32_t* width,uint32_t* height,uint32_t* scale) {
-    if(id!=9 || incarnation!=90)return -2;
+    if (const int error = WmCheckWindowCapture(id, incarnation)) return error;
     *width=2;*height=1;*scale=2;
     if(out){
         CHECK(capacity>=2);out[0]=0x223344;out[1]=0x667788;
@@ -489,6 +501,20 @@ int main() {
     CHECK(CompositorPresentProbe(2,1,2,2,2,patchPixels,expireDuringCopy,samples,display,g_backdropGeneration,42,true)==-116);
     CHECK(!g_presentLease.owner && g_scanoutNeedsRepair);
     g_dirtyMinY=0;g_dirtyMaxY=6;CompositorFlipSoftware();CHECK(!g_scanoutNeedsRepair && framebuffer[10]==0xdeadbeef);
+    protectedWindows = true;
+    for (const uint32_t flags : {BROOK_DEBUG_FRAME_FLAG_WINDOW_BUFFER, BROOK_DEBUG_FRAME_FLAG_WINDOW_CROP}) {
+        const auto denied = CompositorRequestDebugFrameOptions(77, flags, 9, 90, &requestError);
+        CHECK(denied.state == DebugFrameState::Failed && requestError == -13);
+    }
+    auto protectedFrame = CompositorRequestDebugFrame(77);
+    CaptureCompletedDebugFrame(41, {g_physFb, 8, 6, 8}, false, g_captureSceneRevision - 1);
+    CHECK(CompositorDebugFrameStatus(protectedFrame.token, 77).state == DebugFrameState::Pending);
+    CaptureCompletedDebugFrame(42, {g_physFb, 8, 6, 8}, false, g_captureSceneRevision);
+    CHECK(CompositorDebugFrameStatus(protectedFrame.token, 77).state == DebugFrameState::Ready);
+    for (unsigned i = 0; i < 48; ++i)
+        CHECK(capturedPixels[i] == (i / 8 >= 1 && i / 8 < 3 && i % 8 >= 2 && i % 8 < 5 ? 0xff000000 : 0xdeadbeef));
+    CHECK(CompositorReleaseDebugFrame(protectedFrame.token, 77));
+    protectedWindows = false;
     g_backBuffer=nullptr;
     uint32_t overlayPixels[48]{};g_debugFrameBuffer=VirtualAddress(reinterpret_cast<uint64_t>(overlayPixels));g_debugFramePages=1;
     auto overlay=CompositorRequestDebugFrame(77,true);CHECK(overlay.state==DebugFrameState::Pending && overlay.token);

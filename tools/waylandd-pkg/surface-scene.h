@@ -197,6 +197,7 @@ static int surface_window(struct brook_surface *s,struct brook_view *view) {
         int csd=s->xdg_popup || s->deco_csd || (s->xdg_toplevel && !s->deco_negotiated);
         unsigned flags=(csd?BROOK_WM_CREATE_FLAG_CSD:0)|(s->xdg_popup?BROOK_WM_CREATE_FLAG_NO_FOCUS:0);
         if (xwayland) flags=xwayland_surface_flags(s);
+        if (capture_excluded(s)) flags |= BROOK_WM_CREATE_FLAG_CAPTURE_EXCLUDED;
         if (wm_create_window(width,height,s->title[0]?s->title:NULL,flags,&out) || !out.wm_id) return 0;
         s->wm_id=out.wm_id;s->scene_disabled=0;
         wm_register_client(s->wm_id,s->resource);

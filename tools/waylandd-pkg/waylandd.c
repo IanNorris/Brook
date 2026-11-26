@@ -474,6 +474,7 @@ struct brook_surface {
     int32_t popup_w, popup_h;
     int32_t popup_x, popup_y;
     struct brook_surface *popup_parent;
+    int capture_excluded;
 
     /* Requests become eligible only when their surface state is committed. */
     struct wl_list pending_frames, committed_frames, waiting_frames;
@@ -676,6 +677,7 @@ static void toplevel_apply_fullscreen(struct brook_surface *s) {
     if (rc==0) s->toplevel_fullscreen=s->want_fullscreen;
     fprintf(stderr,"[waylandd] xdg_toplevel fullscreen=%d wm=%u rc=%ld\n",s->want_fullscreen,s->wm_id,rc);
 }
+static int capture_excluded(const struct brook_surface *surface);
 #include "surface-scene.h"
 static struct brook_image *intel_dmabuf_snapshot(const struct brook_dmabuf_buffer *db,int *uncertain);
 static struct brook_image *intel_dmabuf_defer(struct brook_buffer *buffer);
@@ -1514,6 +1516,65 @@ static const struct wl_compositor_interface compositor_impl = {
     .create_surface = compositor_create_surface,
     .create_region  = compositor_create_region,
 };
+
+/* This small extension has no events or generated server marshallers.
+ * Its client bindings can be generated from protocols/brook-capture-v1.xml. */
+static const struct wl_interface *capture_request_types[] = { &wl_surface_interface };
+static const struct wl_message capture_requests[] = {
+    { "destroy", "", NULL },
+    { "exclude", "o", capture_request_types },
+};
+static const struct wl_interface brook_capture_manager_v1_interface = {
+    "brook_capture_manager_v1", 1, 2, capture_requests, 0, NULL,
+};
+
+static int capture_excluded(const struct brook_surface *surface)
+{
+    for (const struct brook_surface *s = surface; s; s = s->popup_parent)
+        if (s->capture_excluded) return 1;
+    return 0;
+}
+
+static void capture_manager_destroy(struct wl_client *client, struct wl_resource *resource)
+{
+    (void)client;
+    wl_resource_destroy(resource);
+}
+
+static void capture_manager_exclude(struct wl_client *client, struct wl_resource *manager,
+                                    struct wl_resource *surface)
+{
+    (void)client;
+    struct brook_surface *root = wl_resource_get_user_data(surface);
+    if (!root || !root->xdg_toplevel) {
+        wl_resource_post_error(manager, 0, "exclude requires an xdg_toplevel wl_surface");
+        return;
+    }
+    root->capture_excluded = 1;
+    for (struct brook_surface *s = g_surfaces; s; s = s->next) {
+        if (!s->wm_id || !capture_excluded(s)) continue;
+        if (syscall(BROOK_SYS_WM_EXCLUDE_CAPTURE, (long)s->wm_id) < 0) {
+            wl_resource_post_error(manager, 0, "WM could not exclude the surface from capture");
+            return;
+        }
+    }
+}
+
+static const struct {
+    void (*destroy)(struct wl_client*, struct wl_resource*);
+    void (*exclude)(struct wl_client*, struct wl_resource*, struct wl_resource*);
+} capture_manager_impl = { capture_manager_destroy, capture_manager_exclude };
+
+static void capture_manager_bind(struct wl_client *client, void *data, uint32_t version, uint32_t id)
+{
+    (void)data;
+    struct wl_resource *manager = wl_resource_create(client, &brook_capture_manager_v1_interface, version, id);
+    if (!manager) {
+        wl_client_post_no_memory(client);
+        return;
+    }
+    wl_resource_set_implementation(manager, &capture_manager_impl, NULL, NULL);
+}
 
 static void compositor_bind(struct wl_client *client, void *data,
                             uint32_t version, uint32_t id) {
@@ -5047,6 +5108,7 @@ int main(int argc, char **argv)
                           NULL, seat_bind)) return 1;
     if (!wl_global_create(g_display,&zwp_relative_pointer_manager_v1_interface,1,NULL,relative_manager_bind)) return 1;
     if (!wl_global_create(g_display,&zwp_pointer_constraints_v1_interface,1,NULL,pointer_constraints_bind)) return 1;
+    if (!wl_global_create(g_display, &brook_capture_manager_v1_interface, 1, NULL, capture_manager_bind)) return 1;
     if (!wl_global_create(g_display,&zwp_idle_inhibit_manager_v1_interface,1,NULL,idle_manager_bind)) return 1;
     if (!wl_global_create(g_display, &zwp_text_input_manager_v3_interface, 1, NULL, text_input_manager_bind)) return 1;
     if (!wl_global_create(g_display, &wl_output_interface, 4, NULL, output_bind)) return 1;

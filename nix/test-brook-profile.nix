@@ -36,8 +36,8 @@ let
   profile = overrides: import ./brook-profile.nix ({ inherit pkgs; target = "qemu"; } // overrides);
 in
 # A compatibility preset update needs a deliberate change to both pins.
-assert compat.drvPath == "/nix/store/0gl98jxbg1hcxvpwxghqf4b6j8g6alnl-brook-network-hardware-desktop.drv";
-assert compat.outPath == "/nix/store/fg0gyha88rm29ch5m9z1gadyai7x2dqq-brook-network-hardware-desktop";
+assert compat.drvPath == "/nix/store/v9saq1vc1hs29wndncp8fs0ycq4946ss-brook-network-hardware-desktop.drv";
+assert compat.outPath == "/nix/store/rbmwx6ranxbxqfxpvq2ilsnkm0c9jl9x-brook-network-hardware-desktop";
 assert normalizedSelectedWrapper == wrapper false;
 assert (resolve {}).launcherIds == [ "example.Settings" "example.Demo" ];
 assert (resolve { kernelCapabilities.wayland-demo = 1; }).requiredCapabilities.wayland-demo == 1;

@@ -12,6 +12,7 @@ namespace {
 struct FakeWm {
     bool exists=false;
     bool fineScroll=false;
+    bool captureExcluded=false;
     unsigned creates=0,destroys=0,titles=0,resizes=0,decorationChanges=0;
     BrookCaptionStrip captionStrip{};
     char title[64]{};
@@ -33,8 +34,8 @@ uint64_t CompositorMapWindowVfb(Process*,uint32_t) {
     CHECK(false); // An unauthorized call must never create an alias.
     return 0;
 }
-WmCreateWindowResult WmCreateWindowForProcess(Process*,uint16_t,uint16_t,const char* title,bool,bool,bool fineScroll) {
-    ++g_wm.creates;g_wm.exists=true;g_wm.fineScroll=fineScroll;
+WmCreateWindowResult WmCreateWindowForProcess(Process*,uint16_t,uint16_t,const char* title,bool,bool,bool fineScroll,bool captureExcluded) {
+    ++g_wm.creates;g_wm.exists=true;g_wm.fineScroll=fineScroll;g_wm.captureExcluded=captureExcluded;
     if(title)for(int i=0;i<64;++i)g_wm.title[i]=title[i];
     WmCreateWindowResult result{};result.wmId=3;result.vfbStride=4096;
     result.vfbUser=reinterpret_cast<void*>(0x40000000);return result;
@@ -122,8 +123,10 @@ static void CreateWindow() {
     CHECK(!g_wm.fineScroll);
     CHECK(brook::sys_brook_wm_create_window(64,64,title,out,BROOK_WM_CREATE_FLAG_FINE_SCROLL,0)==0);
     CHECK(g_wm.fineScroll);
-    CHECK(brook::sys_brook_wm_create_window(64,64,title,out,16,0)==-brook::EINVAL);
-    CHECK(g_wm.creates==2);
+    CHECK(brook::sys_brook_wm_create_window(64,64,title,out,BROOK_WM_CREATE_FLAG_CAPTURE_EXCLUDED,0)==0);
+    CHECK(g_wm.captureExcluded);
+    CHECK(brook::sys_brook_wm_create_window(64,64,title,out,32,0)==-brook::EINVAL);
+    CHECK(g_wm.creates==3);
 }
 
 static void SetTitle() {

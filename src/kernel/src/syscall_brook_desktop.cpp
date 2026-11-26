@@ -458,10 +458,13 @@ int64_t sys_brook_debug_frame(uint64_t op,uint64_t token,uint64_t destination,ui
         if(token||offset||length!=sizeof(BrookDebugFrameRequest))return -EINVAL;
         BrookDebugFrameRequest request{};
         if(!CopyFromUser(&request,destination,sizeof(request)))return -EFAULT;
-        constexpr uint32_t known=BROOK_DEBUG_FRAME_FLAG_CURSOR|BROOK_DEBUG_FRAME_FLAG_WINDOW_BUFFER;
-        const bool window=(request.flags&BROOK_DEBUG_FRAME_FLAG_WINDOW_BUFFER)!=0;
-        if((request.flags&~known) || request.flags==known || (window?(!request.window_id || !request.window_incarnation):
-           (request.window_id || request.window_incarnation)))return -EINVAL;
+        constexpr uint32_t known = BROOK_DEBUG_FRAME_FLAG_CURSOR | BROOK_DEBUG_FRAME_FLAG_WINDOW_BUFFER |
+                                   BROOK_DEBUG_FRAME_FLAG_WINDOW_CROP;
+        const bool window = (request.flags & (BROOK_DEBUG_FRAME_FLAG_WINDOW_BUFFER | BROOK_DEBUG_FRAME_FLAG_WINDOW_CROP)) != 0;
+        if ((request.flags & ~known) ||
+            ((request.flags & BROOK_DEBUG_FRAME_FLAG_WINDOW_BUFFER) && request.flags != BROOK_DEBUG_FRAME_FLAG_WINDOW_BUFFER) ||
+            (window ? (!request.window_id || !request.window_incarnation) : (request.window_id || request.window_incarnation)))
+            return -EINVAL;
         int error=0;
         const auto frame=CompositorRequestDebugFrameOptions(owner,request.flags,request.window_id,request.window_incarnation,&error);
         if(frame.state==DebugFrameState::Busy)return -16; // EBUSY

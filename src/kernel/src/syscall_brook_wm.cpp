@@ -83,7 +83,7 @@ int64_t sys_brook_wm_create_window(uint64_t cW, uint64_t cH,
         if (int64_t error = CopyWindowTitle(titlePtr, titleBuf)) return error;
     }
 
-    if (flags & ~(7ull | BROOK_WM_CREATE_FLAG_FINE_SCROLL)) return -EINVAL;
+    if (flags & ~(7ull | BROOK_WM_CREATE_FLAG_FINE_SCROLL | BROOK_WM_CREATE_FLAG_CAPTURE_EXCLUDED)) return -EINVAL;
     // Check the result buffer before creating anything; a raced unmap after
     // creation is rolled back below.
     if (!UserBufferWritable(outPtr, sizeof(BrookWmCreateOut))) return -EFAULT;
@@ -93,7 +93,8 @@ int64_t sys_brook_wm_create_window(uint64_t cW, uint64_t cH,
                                                  static_cast<uint16_t>(cH),
                                                  titlePtr ? titleBuf : nullptr,
                                                  focusable, (flags & 4u) != 0,
-                                                 (flags & BROOK_WM_CREATE_FLAG_FINE_SCROLL) != 0);
+                                                 (flags & BROOK_WM_CREATE_FLAG_FINE_SCROLL) != 0,
+                                                 (flags & BROOK_WM_CREATE_FLAG_CAPTURE_EXCLUDED) != 0);
     if (res.wmId == 0) return -ENOMEM;
     if (flags & 1u) {
         brook::WmSetClientSideDecoration(static_cast<int>(res.wmId) - 1, true);
@@ -532,6 +533,16 @@ int64_t sys_brook_wm_begin_move(uint64_t wmId, uint64_t,
     if (!w) return -EINVAL;
     int idx = static_cast<int>(wmId) - 1;
     return brook::CompositorBeginWindowMove(idx) ? 0 : -EINVAL;
+}
+
+// 0xB28: irrevocably exclude one owned window from capture.
+int64_t sys_brook_wm_exclude_capture(uint64_t wmId, uint64_t, uint64_t,
+                                     uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    if (!wmId || wmId > WM_MAX_WINDOWS) return -EINVAL;
+    return brook::WmExcludeOwnedWindowFromCapture(proc, static_cast<uint32_t>(wmId)) ? 0 : -ENOENT;
 }
 
 // 0xB27: WM_SET_IDLE_INHIBIT(wmId, count)

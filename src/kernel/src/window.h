@@ -193,6 +193,7 @@ struct Window
     WindowState state;
     bool        focused;
     bool        visible;
+    bool        captureExcluded; // latched for the lifetime of the window
     bool        minimized;      // hidden from desktop, shown in taskbar
     bool        noChrome;       // CSD: client draws own chrome; WM skips title/border
     // CSD only: the WM still draws and owns its caption buttons over the
@@ -430,6 +431,7 @@ struct WmDebugWindow {
     int32_t x,y;uint32_t width,height,outerWidth,outerHeight,bufferWidth,bufferHeight;
     bool visible,minimized,maximized,focused,focusable,apiWindow,providerKernel;
     bool fullscreen;
+    bool captureExcluded;
     char title[64],rawTitle[64],appId[128];
 };
 enum class WmDebugAction : uint32_t { Focus,Minimize,Maximize,Restore,Close };
@@ -441,6 +443,11 @@ uint32_t WmSnapshotDebugWindows(WmDebugWindow* out,uint32_t capacity,uint64_t* t
 // *width pixels; *scale is its on-screen upscale). out=nullptr only reports
 // the size. -2 unknown window, -95 no CPU buffer (GPU-published or none),
 // -11 the buffer outgrew capacityPixels since it was sized.
+struct CaptureMaskRect;
+uint64_t WmCaptureProtectionEpoch();
+int WmCheckWindowCapture(uint32_t id, uint64_t incarnation);
+uint32_t WmGetCaptureMasks(CaptureMaskRect* out);
+bool WmExcludeOwnedWindowFromCapture(Process* proc, uint32_t wmId);
 int WmCopyDebugWindowBuffer(uint32_t id,uint64_t incarnation,uint32_t* out,uint64_t capacityPixels,
                             uint32_t* width,uint32_t* height,uint32_t* scale);
 // Compositor context only. restoreTarget: 0 previous, 1 normal, 2 maximized.
@@ -660,7 +667,8 @@ WmCreateWindowResult WmCreateWindowForProcess(Process* proc,
                                                const char* title,
                                                bool focusable = true,
                                                bool nativeClient = false,
-                                               bool fineScroll = false);
+                                               bool fineScroll = false,
+                                               bool captureExcluded = false);
 
 void WmDestroyWindowById(Process* proc, uint32_t wmId);
 void WmSignalDirtyById(Process* proc, uint32_t wmId);

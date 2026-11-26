@@ -12,6 +12,7 @@
 #include "desktop_pointer_route.h"
 #include "global_shortcuts.h"
 #include "compositor.h"
+#include "wm_capture_protection.h"
 #include "pid_namespace.h"
 #include "input_grab_policy.h"
 #include "../../shared/brook_debug_frame.h"
@@ -452,6 +453,10 @@ static DebugFrameSnapshot g_debugFrame{};
 static uint32_t g_debugFrameNextToken;
 static uint64_t g_debugFrameDeadline;
 static uint64_t g_debugFrameOwner;
+static uint32_t g_debugFrameWindowId;
+static uint64_t g_debugFrameWindowIncarnation;
+static uint64_t g_debugFrameProtectionEpoch;
+static uint64_t g_captureSceneRevision=1;
 static bool g_debugFrameOverlay=false;
 static bool g_debugFrameOverlayCursor=true;
 static uint32_t g_debugFrameFlags; // BROOK_DEBUG_FRAME_FLAG_* of the pending root capture
@@ -487,7 +492,8 @@ static void ExpireDebugFrameLocked()
         g_debugFrame={};
 }
 
-DebugFrameSnapshot CompositorRequestDebugFrame(uint64_t owner,bool overlay,bool overlayCursor,uint32_t flags)
+DebugFrameSnapshot CompositorRequestDebugFrame(uint64_t owner,bool overlay,bool overlayCursor,uint32_t flags,
+                                               uint32_t windowId,uint64_t windowIncarnation)
 {
     CompositorMutexGuard guard(&g_debugFrameLock);
     ExpireDebugFrameLocked();
@@ -500,6 +506,8 @@ DebugFrameSnapshot CompositorRequestDebugFrame(uint64_t owner,bool overlay,bool 
     }
     g_debugFrame={};g_debugOverlayBands={};g_debugOverlaySurfaces={};g_debugFrame.token=++g_debugFrameNextToken;
     g_debugFrameOwner=owner;
+    g_debugFrameWindowId=windowId;
+    g_debugFrameWindowIncarnation=windowIncarnation;
     g_debugFrameOverlay=overlay;g_debugFrameOverlayCursor=overlayCursor;g_debugFrameFlags=flags;
     g_debugFrame.state=DebugFrameState::Pending;
     g_debugFrameDeadline=ApicTickCount()+DEBUG_FRAME_LEASE_MS;
@@ -523,8 +531,16 @@ DebugFrameSnapshot CompositorRequestDebugFrameOptions(uint64_t owner,uint32_t fl
                                                       uint64_t windowIncarnation,int* error)
 {
     if(error)*error=0;
-    if(!(flags&BROOK_DEBUG_FRAME_FLAG_WINDOW_BUFFER))
-        return CompositorRequestDebugFrame(owner,false,true,flags&BROOK_DEBUG_FRAME_FLAG_CURSOR);
+    if (!(flags & BROOK_DEBUG_FRAME_FLAG_WINDOW_BUFFER)) {
+        const int result = windowId ? WmCheckWindowCapture(windowId, windowIncarnation) : 0;
+        if (result) {
+            if (error) *error = result;
+            DebugFrameSnapshot failed{};
+            failed.state = DebugFrameState::Failed;
+            return failed;
+        }
+        return CompositorRequestDebugFrame(owner, false, true, flags, windowId, windowIncarnation);
+    }
     // The window's CPU buffer is copied now; the lease then behaves exactly
     // like a completed screen capture. The WM buffer lock is never taken
     // inside the capture lock: reserve the lease, copy under the WM lock
@@ -544,12 +560,15 @@ DebugFrameSnapshot CompositorRequestDebugFrameOptions(uint64_t owner,uint32_t fl
             if(error)*error=-12;return failed;
         }
         g_debugFrame={};g_debugOverlayBands={};g_debugOverlaySurfaces={};g_debugFrame.token=token=++g_debugFrameNextToken;
-        g_debugFrameOwner=owner;g_debugFrameOverlay=false;g_debugFrameOverlayCursor=false;g_debugFrameFlags=flags;
+        g_debugFrameOwner=owner;
+        g_debugFrameWindowId=windowId;g_debugFrameWindowIncarnation=windowIncarnation;
+        g_debugFrameOverlay=false;g_debugFrameOverlayCursor=false;g_debugFrameFlags=flags;
         g_debugFrame.state=DebugFrameState::Pending;g_debugFrameWindowFill=true;
         g_debugFrameDeadline=ApicTickCount()+DEBUG_FRAME_LEASE_MS;
         g_debugFrameCleanAddress=0; // overlay must clear fully next time
         pixels=reinterpret_cast<uint32_t*>(g_debugFrameBuffer.raw());capacity=g_debugFramePages*1024;
     }
+    const uint64_t protectionEpoch = WmCaptureProtectionEpoch();
     const uint64_t started=ElapsedClockNs();
     result=WmCopyDebugWindowBuffer(windowId,windowIncarnation,pixels,capacity,&width,&height,&scale);
     const uint64_t elapsed=ElapsedClockNs();
@@ -563,6 +582,7 @@ DebugFrameSnapshot CompositorRequestDebugFrameOptions(uint64_t owner,uint32_t fl
     g_debugFrame.source=BROOK_DEBUG_FRAME_SOURCE_WINDOW_BUFFER;g_debugFrame.windowId=windowId;g_debugFrame.windowScale=scale;
     g_debugFrame.copyUs=elapsed>started?uint32_t((elapsed-started)/1000):0;
     g_debugFrameDeadline=ApicTickCount()+DEBUG_FRAME_LEASE_MS;
+    g_debugFrameProtectionEpoch = protectionEpoch;
     g_debugFrame.state=DebugFrameState::Ready;
     return g_debugFrame;
 }
@@ -573,6 +593,14 @@ DebugFrameSnapshot CompositorDebugFrameStatus(uint32_t token,uint64_t owner)
     ExpireDebugFrameLocked();
     if (!token || token!=g_debugFrame.token || owner!=g_debugFrameOwner) {
         DebugFrameSnapshot expired{};expired.token=token;expired.state=DebugFrameState::Expired;return expired;
+    }
+    if (!g_debugFrameOverlay && g_debugFrame.state == DebugFrameState::Ready &&
+        (g_debugFrameProtectionEpoch != WmCaptureProtectionEpoch() ||
+         (g_debugFrameWindowId && WmCheckWindowCapture(g_debugFrameWindowId, g_debugFrameWindowIncarnation)))) {
+        DebugFrameSnapshot revoked{};
+        revoked.token = token;
+        revoked.state = DebugFrameState::Failed;
+        return revoked;
     }
     return g_debugFrame;
 }
@@ -634,6 +662,11 @@ int64_t CompositorReadDebugFrame(uint32_t token,uint64_t owner,uint64_t offset,v
     ExpireDebugFrameLocked();
     if(!token || token!=g_debugFrame.token || owner!=g_debugFrameOwner)return -116;
     if(g_debugFrame.state!=DebugFrameState::Ready)return -11;
+    if (!g_debugFrameOverlay && g_debugFrameProtectionEpoch != WmCaptureProtectionEpoch()) return -13;
+    if (g_debugFrameWindowId) {
+        const int result = WmCheckWindowCapture(g_debugFrameWindowId, g_debugFrameWindowIncarnation);
+        if (result) return result;
+    }
     const uint64_t length=uint64_t(g_debugFrame.width)*g_debugFrame.height*4;
     if(!destination || bytes>65536 || offset>length || bytes>length-offset)return -22;
     if(bytes)memcpy(destination,reinterpret_cast<const uint8_t*>(g_debugFrame.address)+offset,bytes);
@@ -648,11 +681,20 @@ struct DebugFrameGeometry {
 };
 struct BdwScanoutCaptureInfoCompat {uint32_t surface,control,stride,copyUs;};
 static void CaptureCompletedDebugFrame(uint64_t epoch,const DebugFrameGeometry& presented,
-                                       bool softwareFrame = false)
+                                       bool softwareFrame = false, uint64_t captureScene = 0)
 {
     CompositorMutexGuard guard(&g_debugFrameLock);
     ExpireDebugFrameLocked();
     if (g_debugFrame.state!=DebugFrameState::Pending || g_debugFrameOverlay || g_debugFrameWindowFill) return;
+    if (g_debugFrameWindowId &&
+        WmCheckWindowCapture(g_debugFrameWindowId, g_debugFrameWindowIncarnation)) {
+        g_debugFrame.state = DebugFrameState::Failed;
+        return;
+    }
+    const uint64_t protectionEpoch = WmCaptureProtectionEpoch();
+    const bool protectedScene = protectionEpoch != 0;
+    static CaptureMaskRect masks[WM_MAX_WINDOWS];
+    const uint32_t maskCount = protectedScene && captureScene ? WmGetCaptureMasks(masks) : 0;
     CompositorMutexGuard geometry(&g_scanoutMappingLock);
     // Reject a runtime remap since frame start rather than tagging a new,
     // unpresented buffer with this frame's epoch.
@@ -663,13 +705,17 @@ static void CaptureCompletedDebugFrame(uint64_t epoch,const DebugFrameGeometry& 
     }
     uint32_t width=presented.width,height=presented.height,stride=presented.stride;
     const bool gpuFrame = !softwareFrame && CompositorGpuActive();
+    // Hardware scanout and the leased renderer can be displaying an older
+    // scene. Without its mask metadata, never export that image.
+    if (protectedScene && (!captureScene || gpuFrame || g_scanoutContainsLeasedFrame ||
+        captureScene != __atomic_load_n(&g_captureSceneRevision, __ATOMIC_ACQUIRE))) return;
     const bool cursor=(g_debugFrameFlags&BROOK_DEBUG_FRAME_FLAG_CURSOR)!=0;
     uint32_t plane=BROOK_DEBUG_FRAME_PLANE_UNREAD,infoFlags=0;
     BdwScanoutCaptureInfoCompat planeInfo{};
 #if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
     // Read what the panel shows: zero-copy renderer images, kernel flip
     // buffers and direct client buffers replace the GOP on primary plane A.
-    if (!gpuFrame && width<=4096 && height<=2160) {
+    if (!protectedScene && !gpuFrame && width<=4096 && height<=2160) {
         if (!EnsureDebugFrameBufferLocked(uint64_t(width)*height*4)) {g_debugFrame.state=DebugFrameState::Failed;return;}
         auto* destination=reinterpret_cast<uint32_t*>(g_debugFrameBuffer.raw());
         BdwScanoutCaptureInfo live{};
@@ -688,6 +734,8 @@ static void CaptureCompletedDebugFrame(uint64_t epoch,const DebugFrameGeometry& 
             g_debugFrame.plane=plane;g_debugFrame.planeSurface=planeInfo.surface;g_debugFrame.planeControl=planeInfo.control;
             g_debugFrame.planeStride=planeInfo.stride;g_debugFrame.infoFlags=infoFlags;g_debugFrame.copyUs=planeInfo.copyUs;
             g_debugFrameDeadline=ApicTickCount()+DEBUG_FRAME_LEASE_MS;
+            if (WmCaptureProtectionEpoch()) return;
+            g_debugFrameProtectionEpoch = protectionEpoch;
             g_debugFrame.state=DebugFrameState::Ready;
             return;
         }
@@ -703,6 +751,10 @@ static void CaptureCompletedDebugFrame(uint64_t epoch,const DebugFrameGeometry& 
     // Read the presented CPU front buffer, not the mutable backbuffer (which
     // can also be written by legacy TTY/scanout aliases outside the renderer).
     const uint32_t* source=const_cast<const uint32_t*>(presented.pixels);
+    if (protectedScene) {
+        source = g_backBuffer;
+        stride = g_backBufStride;
+    }
     uint32_t sourceKind=leased?BROOK_DEBUG_FRAME_SOURCE_LEASED:BROOK_DEBUG_FRAME_SOURCE_FRONT;
     if (gpuFrame) {
         const auto* gpu=GpuCompositorGet();
@@ -723,12 +775,24 @@ static void CaptureCompletedDebugFrame(uint64_t epoch,const DebugFrameGeometry& 
 #else
     (void)cursor;
 #endif
+    if (protectedScene) {
+        for (uint32_t i = 0; i < maskCount; ++i) CaptureMaskPixels(destination, width, height, width, masks[i]);
+        if (captureScene != __atomic_load_n(&g_captureSceneRevision, __ATOMIC_ACQUIRE)) {
+            g_debugFrame.state = DebugFrameState::Pending;
+            return;
+        }
+    }
+    if (WmCaptureProtectionEpoch() != protectionEpoch) {
+        g_debugFrame.state = DebugFrameState::Pending;
+        return;
+    }
     g_debugFrame.width=width;g_debugFrame.height=height;g_debugFrame.stride=width;
     g_debugFrame.address=g_debugFrameBuffer.raw();g_debugFrame.tick=leased?g_leasedFrameTick:ApicTickCount();g_debugFrame.epoch=epoch;g_debugFrame.source=sourceKind;
     g_debugFrame.presentationMode=sourceKind==BROOK_DEBUG_FRAME_SOURCE_LEASED?g_leasedFrameMode:BROOK_DEBUG_FRAME_PRESENT_NONE;
     g_debugFrame.plane=plane;g_debugFrame.planeSurface=planeInfo.surface;g_debugFrame.planeControl=planeInfo.control;
     g_debugFrame.planeStride=planeInfo.stride;g_debugFrame.infoFlags=infoFlags;
     g_debugFrameDeadline=ApicTickCount()+DEBUG_FRAME_LEASE_MS;
+    g_debugFrameProtectionEpoch = protectionEpoch;
     g_debugFrame.state=DebugFrameState::Ready;
 }
 
@@ -2615,6 +2679,7 @@ static void TraceDesktopCycle(FrameGpuStage stage,uint64_t tick)
 static volatile bool g_sceneChanged=false;
 void CompositorMarkSceneChanged()
 {
+    __atomic_add_fetch(&g_captureSceneRevision, 1, __ATOMIC_RELEASE);
     if(!WmIsActive()){CompositorMarkDirty();return;}
     __atomic_store_n(&g_sceneChanged,true,__ATOMIC_RELEASE);
 }
@@ -2710,7 +2775,7 @@ static void DragProbeStep()
     WmMoveWindow(slot,int16_t(g_dragProbeX+off),g_dragProbeY);
 }
 
-static void CompositorLoopWM(bool& clientFrame)
+static void CompositorLoopWM(bool& clientFrame, uint64_t& captureScene)
 {
     // Apply movement/focus/resize before rendering either chrome or content.
     // GPU composition later samples chrome using the current window geometry.
@@ -2811,7 +2876,14 @@ static void CompositorLoopWM(bool& clientFrame)
     uint32_t windowsChanged = 0;
     const bool sceneGlobalSame = SceneDiffWindows(sceneDamage, windowsChanged);
     const bool canLocalise = !CompositorGpuActive() && !skipCpuScene;
-    bool fullRepaint = forceAll || requested;
+    // Capture from one freshly composed CPU frame. Repainting prevents stale
+    // protected footprints surviving a move, hide, or slot reuse.
+    if (WmCaptureProtectionEpoch() && canLocalise) {
+        CompositorMutexGuard capture(&g_debugFrameLock);
+        if (g_debugFrame.state == DebugFrameState::Pending && !g_debugFrameOverlay && !g_debugFrameWindowFill)
+            captureScene = __atomic_load_n(&g_captureSceneRevision, __ATOMIC_ACQUIRE);
+    }
+    bool fullRepaint = forceAll || requested || captureScene;
     if (forceAll) ++g_frameStats.fullForce;
     else if (requested) ++g_frameStats.fullRequested;
     else if (!sceneGlobalSame) { fullRepaint = true; ++g_frameStats.fullGlobal; }
@@ -4186,6 +4258,7 @@ static void DumpFrameBase64(const uint32_t* px, uint32_t w, uint32_t h,
 // Periodic low-res thumbnail of the GPU-composited scanout.
 static void DumpGpuThumbnail()
 {
+    if (WmCaptureProtectionEpoch()) return;
     const GpuCompositorOps* gpu = GpuCompositorGet();
     if (!gpu || !gpu->CaptureThumb) return;
     static uint32_t thumb[256 * 144];
@@ -4200,6 +4273,7 @@ static void DumpGpuThumbnail()
 // g_backBuffer directly (CPUFULL). Same encoder → directly diffable.
 static void DumpFullFrameOnce()
 {
+    if (WmCaptureProtectionEpoch()) return;
     if (CompositorGpuActive())
     {
         const GpuCompositorOps* gpu = GpuCompositorGet();
@@ -5210,10 +5284,11 @@ static void CompositorLoop()
     CursorPrepareFrame(WmIsActive() && WmLaunchBusy(), loopStartTick);
 
     bool clientFrame = false;
+    uint64_t captureScene = 0;
     // Branch: WM mode vs legacy mode
     if (WmIsActive())
     {
-        CompositorLoopWM(clientFrame);
+        CompositorLoopWM(clientFrame, captureScene);
     }
     else
     {
@@ -5369,7 +5444,7 @@ static void CompositorLoop()
 
     const uint64_t probePresentEnd=ApicTickCount();
     framePhase.Change(FramePhase::DebugCapture);
-    CaptureCompletedDebugFrame(epoch,presented);
+    CaptureCompletedDebugFrame(epoch,presented,false,captureScene);
 
     // One-shot full-resolution frame dump (parity check), once the desktop has
     // settled (~15s uptime). Works in both GPU mode (GPUFULL via scanout
