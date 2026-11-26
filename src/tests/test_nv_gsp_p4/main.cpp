@@ -113,8 +113,10 @@ struct Rig {
     }
     P4Result Run() { return Run([] { return true; }); }
     // ---- after INIT_DONE: BAR1 handover and M2 against the fake RM
-    struct PageAlloc { Rig* r; bool operator()(uint64_t* bus, uint8_t** cpu) {
-        DmaRegion d; if (!r->arena(0x1000, &d)) return false; *bus = d.bus; *cpu = d.cpu; return true; }
+    struct PageAlloc { Rig* r; bool vram = false; uint64_t next = 0x10ff00000ull;
+        bool operator()(uint64_t* bus, uint8_t** cpu) {
+            if (vram) { *bus = next; *cpu = nullptr; next += 0x1000; return true; }   // VRAM table pages (live default since 27 Nov)
+            DmaRegion d; if (!r->arena(0x1000, &d)) return false; *bus = d.bus; *cpu = d.cpu; return true; }
         void flush(uint8_t*) {} };
     // CPU read through BAR1: the walk the BAR1 host translation does from the bound PDB.
     struct Bar1Cpu {
@@ -132,8 +134,8 @@ struct Rig {
             *v = r->gpu.Vram32(t.pa); return true;
         }
     };
-    Bar1Map Bar1(uint64_t pde) {
-        PageAlloc pa{this};
+    Bar1Map Bar1(uint64_t pde, bool vram = false) {
+        PageAlloc pa{this}; pa.vram = vram;
         const uint64_t probes[3] = {0x0, 0x4343000, 0xff13000};   // P4's faulting offsets (GOP surface, a surface, instmem)
         return MapBar1Identity(gpu, kChipTu104, pa, pde, 256ull << 20, probes, 3, Bar1Cpu{this});
     }
@@ -373,6 +375,18 @@ int main(int argc, char** argv) {
             r.gpu.SetVram32(p.si.bar1_pde, 0); r.gpu.SetVram32(p.si.bar1_pde + 4, 0);
         }
         { uint32_t v; assert(!Rig::Bar1Cpu{&r}(0x4343000, &v)); }
+        {   // VRAM-resident identity tables: same view, every table page in VRAM, RM's PD3[0] restored after
+            const Bar1Map vb = r.Bar1(p.si.bar1_pde, true);
+            if (!vb.ok()) std::fprintf(stderr, "bar1 vram: %s at %s\n", vb.status, vb.stage);
+            assert(vb.ok() && vb.committed && vb.probes == 3 && vb.probes_equal == 3 && vb.ptes == 4096);
+            assert(((vb.pd3_new >> 1) & 3) == 1);                         // PD3[0] target: VRAM (GMMU v2 PDE aperture 2:1 = 1)
+            for (uint64_t off = 0; off < (256ull << 20); off += 0x7654321) {
+                uint32_t v; r.gpu.SetVram32(off & ~3ull, uint32_t(off) ^ 0x5a5a5a5au);
+                assert(Rig::Bar1Cpu{&r}(off & ~3ull, &v) && v == (uint32_t(off) ^ 0x5a5a5a5au));
+            }
+            assert(UnmapBar1Identity(r.gpu, kChipTu104, vb));
+            uint32_t v; assert(!Rig::Bar1Cpu{&r}(0x4343000, &v));
+        }
         { Bar1Map bad = r.Bar1(p.si.bar1_pde + 0x1000); assert(!bad.ok() && !bad.committed && !std::strcmp(bad.stage, "inst_pdb")); }
         // ---- M2: objects, VRAM, GMMU, VAS, TSG, channel, NOP + semaphore
         const M2Result m = r.M2();

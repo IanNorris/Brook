@@ -73,16 +73,23 @@ struct Bar1PtMem {
     uint8_t* cpu_[kMaxPages] = {};
     uint32_t n = 0;
     bool bad = false;
+    // 27 Nov: the tables go to VRAM when the allocator says so (`alloc_page.vram`), as nouveau's
+    // BAR1 VMM lives in instmem; a sysmem tree made every BAR1 translation walk host memory over
+    // PCIe, and with it present GSP-RM's PMU died after GR idle (PCIe Engine NOCAT, Xid 62).
+    bool vram() const { return alloc_page.vram; }
     bool alloc(uint64_t* addr, Aperture* aper) {
         if (n >= kMaxPages) return false;
-        uint64_t b; uint8_t* p;
-        if (!alloc_page(&b, &p) || !p || (b & 0xfff)) return false;
-        for (uint32_t i = 0; i < 4096; ++i) p[i] = 0;
+        uint64_t b; uint8_t* p = nullptr;
+        if (!alloc_page(&b, &p) || (b & 0xfff) || (!vram() && !p)) return false;
+        if (vram()) { for (uint32_t i = 0; i < 4096; i += 4) pr.wr32(b + i, 0); }
+        else for (uint32_t i = 0; i < 4096; ++i) p[i] = 0;
         bus_[n] = b; cpu_[n] = p; ++n;
-        *addr = b; *aper = Aperture::SysCoh;
+        *addr = b; *aper = vram() ? Aperture::Video : Aperture::SysCoh;
         return true;
     }
+    bool Ours(uint64_t a) const { for (uint32_t i = 0; i < n; ++i) if (a >= bus_[i] && a + 8 <= bus_[i] + 4096) return true; return false; }
     uint64_t* Sys(uint64_t a) {
+        if (vram()) return nullptr;
         for (uint32_t i = 0; i < n; ++i)
             if (a >= bus_[i] && a + 8 <= bus_[i] + 4096) return reinterpret_cast<uint64_t*>(cpu_[i] + (a - bus_[i]));
         return nullptr;
@@ -93,8 +100,9 @@ struct Bar1PtMem {
         bad = true; return 0;             // RM sysmem table: not readable here
     }
     void wr64(Aperture a, uint64_t addr, uint64_t v) {
+        if (a == Aperture::Video && vram() && Ours(addr)) { pr.wr32(addr, uint32_t(v)); pr.wr32(addr + 4, uint32_t(v >> 32)); return; }
         if (a != Aperture::Video) { if (uint64_t* p = Sys(addr)) { *p = v; return; } }
-        bad = true;                        // never written through this path
+        bad = true;                        // never written through this path (RM's own tables)
     }
 };
 
@@ -196,7 +204,7 @@ inline Bar1Map MapBar1Identity(Bus& bus, const ChipOps& c, Alloc& alloc_page, ui
         const Translation t = GmmuWalk(mem, *c.gmmu, b.root, b.root_aper, va);
         if (!t.ok || t.pa != va || t.aper != Aperture::Video) { r.status = "private tree self-check"; pr.Restore(); return r; }
     }
-    for (uint32_t i = 0; i < mem.n; ++i) alloc_page.flush(mem.cpu_[i]);
+    if (!mem.vram()) for (uint32_t i = 0; i < mem.n; ++i) alloc_page.flush(mem.cpu_[i]);
     r.stage = "commit";
     pr.wr32(r.pdb + 4, uint32_t(r.pd3_new >> 32));
     pr.wr32(r.pdb, uint32_t(r.pd3_new));

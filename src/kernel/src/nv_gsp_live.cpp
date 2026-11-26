@@ -828,8 +828,16 @@ bool Bar1Read(uint64_t off, uint32_t* v) {
     *v = reinterpret_cast<volatile uint32_t*>(g_bar1ProbeVa.raw() + (off & 0xfff))[0];
     return true;
 }
+// BAR1 page-table pages (27 Nov fix): VRAM from a client FB arena [0x10ff00000, 0x110000000) that
+// GSP-RM's static info marks client-usable (checked in Bar1MapLocked), below the GR arena; the
+// old sysmem tree stays selectable with /etc/nv-gsp-bar1-sysmem-tables for A/B.
+constexpr uint64_t kBar1PtLo = 0x10ff00000ull, kBar1PtHi = 0x110000000ull;
 struct Bar1PageAlloc {
-    bool operator()(uint64_t* bus, uint8_t** cpu) { DmaRegion d; if (!RmAlloc(0x1000, &d)) return false; *bus = d.bus; *cpu = d.cpu; return true; }
+    bool vram = true;
+    uint64_t next = kBar1PtLo;
+    bool operator()(uint64_t* bus, uint8_t** cpu) {
+        if (vram) { if (next + 0x1000 > kBar1PtHi) return false; *bus = next; *cpu = nullptr; next += 0x1000; return true; }
+        DmaRegion d; if (!RmAlloc(0x1000, &d)) return false; *bus = d.bus; *cpu = d.cpu; return true; }
     void flush(uint8_t* p) { FlushRange(p, 0x1000); }
 };
 // Caller holds the nv-aux lock (no compositor BAR1/PRAMIN traffic).
@@ -841,6 +849,11 @@ bool Bar1MapLocked(uint8_t shift) {
         g_bar1 = Bar1Map{}; g_bar1.status = "BAR1 range not MMIO in the boot map"; return false;
     }
     Bar1PageAlloc pa;
+    pa.vram = !PathExists("/etc/nv-gsp-bar1-sysmem-tables");
+    if (pa.vram && !VramRangeIsClient(g_static, kBar1PtLo, kBar1PtHi)) {
+        g_bar1 = Bar1Map{}; g_bar1.status = "BAR1 table arena not in a client FB region"; return false;
+    }
+    KPrintf("nv-gsp: BAR1 identity tables in %s\n", pa.vram ? "VRAM (client FB arena 0x10ff00000)" : "sysmem (A/B)");
     const uint64_t probes[3] = {0x0, 0x4343000, 0xff13000};   // GOP surface, a back buffer, the nv-disp instmem MiB
     g_bar1 = MapBar1Identity(g_bus, *ChipForBoot0(g_bus.rd32(0)), pa, g_static.bar1_pde, kBar1Bytes, probes, 3,
                              [](uint64_t off, uint32_t* v) { return Bar1Read(off, v); }, shift);
