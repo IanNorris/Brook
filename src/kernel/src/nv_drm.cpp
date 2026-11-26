@@ -147,10 +147,15 @@ int64_t NvDrmIoctl(NvDrmFile* f, uint64_t cmd, uint64_t arg) {
                     self->wakeupTick = ApicTickCount() + 1; SchedulerBlockInterruptible(self); return !HasPendingSignals(); }};
     // Syncobj waits sleep; everything else is short. One lock per file keeps the tables consistent.
     const uint32_t nr = nvdrm::IocNr(cmd);
-    if (nr == nvdrm::NR_SYNCOBJ_WAIT) return nvdrm::Ioctl(f->core, u, cmd, arg);   // GpuSyncTable has its own lock
-    KMutexLock(&f->lock);
-    const int64_t r = nvdrm::Ioctl(f->core, u, cmd, arg);
-    KMutexUnlock(&f->lock);
+    int64_t r;
+    if (nr == nvdrm::NR_SYNCOBJ_WAIT) r = nvdrm::Ioctl(f->core, u, cmd, arg);   // GpuSyncTable has its own lock
+    else { KMutexLock(&f->lock); r = nvdrm::Ioctl(f->core, u, cmd, arg); KMutexUnlock(&f->lock); }
+    // M5 bring-up: failing ioctls (except expected waits/busy) go to the kernel log, rate-limited.
+    static uint32_t logged = 0;
+    if (r < 0 && r != nvdrm::kETIME && r != nvdrm::kEBUSY && logged < 400) {
+        ++logged;
+        KPrintf("nv-drm: ioctl nr 0x%x size %u -> %ld\n", nr, nvdrm::IocSize(cmd), (long)r);
+    }
     return r;
 }
 }  // namespace brook

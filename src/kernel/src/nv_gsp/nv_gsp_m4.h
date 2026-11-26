@@ -112,11 +112,14 @@ struct GrState {
 template <class Bus, class Api, class VramIo>
 struct GrCtx {
     Bus& bus; Api& api; VramIo& vram; const ChipOps& c; VramArena& arena; GrResult& r;
+    void (*trace)(const char* what, uint32_t handle, uint32_t cls, uint32_t status) = nullptr;   // M5 bring-up
     bool fail(const char* what) { r.status = what; r.rm_status = api.status; r.rpc_result = api.rpc_result; r.q = api.q; return false; }
     bool track(GrScope& s, uint32_t h, uint32_t parent) { if (s.nlive >= 8) return fail("too many objects");
         s.live[s.nlive] = h; s.parent[s.nlive] = parent; ++s.nlive; ++r.allocated; return true; }
     bool alloc(GrScope& s, uint32_t parent, uint32_t h, uint32_t cls, void* p, uint32_t n, const char* what) {
-        if (!api.Alloc(s.base, parent, h, cls, p, n)) return fail(what);
+        const bool ok = api.Alloc(s.base, parent, h, cls, p, n);
+        if (trace) trace("alloc", h, cls, ok ? 0 : (api.status ? api.status : 0xffffffffu));
+        if (!ok) return fail(what);
         return track(s, h, parent);
     }
     bool zero(uint64_t a, uint64_t bytes) { for (uint64_t o = 0; o < bytes; o += 4) vram.wr32(a + o, 0); return true; }
@@ -303,8 +306,11 @@ struct GrCtx {
                 rm::NV0080_CTRL_DMA_UNSET_PAGE_DIRECTORY_PARAMS u = {s.h_vas, 0};
                 (void)api.Control(s.base, s.base + grh::kDevice, rm::NV0080_CTRL_CMD_DMA_UNSET_PAGE_DIRECTORY, &u, sizeof(u));
             }
-            if (h == s.base) { if (api.Free(s.base, 0, s.base)) ++freed; }
-            else if (api.Free(s.base, s.parent[s.nlive], h)) ++freed;
+            bool ok;
+            if (h == s.base) ok = api.Free(s.base, 0, s.base);
+            else ok = api.Free(s.base, s.parent[s.nlive], h);
+            if (ok) ++freed;
+            if (trace) trace("free", h, 0, ok ? 0 : (api.status ? api.status : 0xffffffffu));
         }
         r.freed += freed;
         return freed;

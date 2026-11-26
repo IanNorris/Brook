@@ -25,8 +25,10 @@ void Dump(const char* why, uint64_t late_ms) {
     for (uint32_t c = 0; c < MAX_CPUS; ++c) {
         const uint64_t ns = __atomic_load_n(&g_stamp[c].ns, __ATOMIC_ACQUIRE);
         if (!ns) continue;
-        KPrintf("stall-watch   cpu %u: last tick %lu ms ago, rip %lx, pid %u, ticks %u\n", c,
-                (unsigned long)((now - ns) / 1000000), (unsigned long)__atomic_load_n(&g_stamp[c].rip, __ATOMIC_RELAXED),
+        // stamps come from other CPUs' clocks: a stamp slightly ahead of `now` is age 0, not huge
+        const int64_t age = int64_t(now - ns);
+        KPrintf("stall-watch   cpu %u: last tick %ld ms ago, rip %lx, pid %u, ticks %u\n", c,
+                (long)(age > 0 ? age / 1000000 : 0), (unsigned long)__atomic_load_n(&g_stamp[c].rip, __ATOMIC_RELAXED),
                 __atomic_load_n(&g_stamp[c].pid, __ATOMIC_RELAXED), __atomic_load_n(&g_stamp[c].ticks, __ATOMIC_RELAXED));
     }
 }

@@ -1194,11 +1194,26 @@ void LogEvent(const uint8_t* m, uint32_t len) {
             ++g_liveEv.os_error;
             char text[97]; uint32_t i = 0;
             for (; i < 96 && 12 + i < n && p[12 + i]; ++i) text[i] = (p[12 + i] >= 32 && p[12 + i] < 127) ? char(p[12 + i]) : '.';
+            // (the string is 256 bytes; the first 96 are logged)
             text[i] = 0;
             KPrintf("nv-gsp: RM event at %lu ms: OS error Xid %u runlist %u chid %u: %s\n", ms, u32(0), u32(4), u32(8), text);
             break;
         }
         case rm::NV_VGPU_MSG_EVENT_UCODE_LIBOS_PRINT: ++g_liveEv.libos; break;
+        case rm::NV_VGPU_MSG_EVENT_GSP_POST_NOCAT_RECORD: {   // crash/diagnostic record: hex head + printable runs
+            ++g_liveEv.other;
+            char text[241]; uint32_t t = 0, run = 0;
+            for (uint32_t i = 0; i < n && t < 236; ++i) {
+                const uint8_t ch = p[i];
+                if (ch >= 32 && ch < 127) { text[t++] = char(ch); ++run; }
+                else { if (run && run < 4) t -= run; if (run >= 4 && t < 236) text[t++] = '|'; run = 0; }
+            }
+            if (run && run < 4) t -= run;
+            text[t] = 0;
+            KPrintf("nv-gsp: RM event at %lu ms: NOCAT %u B head %08x %08x %08x %08x %08x %08x text \"%s\"\n", ms, len,
+                    u32(0), u32(4), u32(8), u32(12), u32(16), u32(20), text);
+            break;
+        }
         default: ++g_liveEv.other; KPrintf("nv-gsp: RM event at %lu ms: function 0x%x (%u bytes)\n", ms, fn, len); break;
     }
 }
@@ -1507,6 +1522,7 @@ struct Chan {
 Vas g_vas[kMaxVas];
 Chan g_chan[kMaxChans];
 volatile bool g_dead[kChidFirst + kChidCount];
+volatile bool g_minObjects = false;   // `nv-gsp drm minobj on`: only TURING_A + COMPUTE_A on channels (Xid 62 A/B)
 nvdrm::VramHeap g_heap;
 bool g_heapInit = false;
 }  // namespace nvd
@@ -1533,6 +1549,8 @@ template <class F> bool NvdWithRm(const char* what, F f) {
     }
     if (ok) {
         GrCtx<Bar0Bus, LiveRmApi, PraminIo> x{g_bus, api, vio, *c, g_gr.arena, r};
+        x.trace = [](const char* w, uint32_t h, uint32_t cls, uint32_t st) {
+            KPrintf("nv-drm: rm %s %x class %x -> %x at %lu ms\n", w, h, cls, st, (unsigned long)(NowUs() / 1000)); };
         ok = f(x, vio, *c);
         if (!ok) KPrintf("nv-drm: %s failed: %s (rm 0x%x)\n", what, r.status, r.rm_status);
     }
@@ -1581,11 +1599,14 @@ bool NvdVasCreate(void*, uint64_t, uint64_t, uint32_t* out) {
             if (x.OpenVas(v.s)) return true;
             x.Close(v.s); return false; })) return false;
     v.used = true; *out = i;
+    KPrintf("nv-drm: VAS %u created (client %x, root %lx)\n", i, v.s.base, (unsigned long)v.s.root);
     return true;
 }
 void NvdVasDestroy(void*, uint32_t vas) {
     if (vas >= nvd::kMaxVas || !nvd::g_vas[vas].used) return;
-    (void)NvdWithRm("vaspace free", [&](auto& x, auto&, const ChipOps&) { x.Close(nvd::g_vas[vas].s); return true; });
+    KPrintf("nv-drm: VAS %u free: %u objects\n", vas, nvd::g_vas[vas].s.nlive);
+    (void)NvdWithRm("vaspace free", [&](auto& x, auto&, const ChipOps&) { const uint32_t n = x.Close(nvd::g_vas[vas].s);
+        KPrintf("nv-drm: VAS %u freed %u\n", vas, n); return true; });
     nvd::g_vas[vas].used = false;   // page tables stay in the GR arena (bump allocator) until RM unload
 }
 bool NvdVasMap(void*, uint32_t vas, uint64_t va, nvdrm::Aper aper, uint64_t backing, uint64_t off, uint64_t bytes, uint8_t kind) {
@@ -1640,8 +1661,9 @@ bool NvdChanCreate(void*, uint32_t vas, uint32_t engine, uint32_t* out) {
         v.s.lpt_page = s.lpt_page; v.s.lpt_off = s.lpt_off; v.s.lpt_aper = s.lpt_aper;
         good = good && x.alloc(s, s.h_chan, s.h_chan + 1, rm::gr::TURING_A, nullptr, 0, "RM_ALLOC TURING_A") &&
                x.alloc(s, s.h_chan, s.h_chan + 2, rm::gr::TURING_COMPUTE_A, nullptr, 0, "RM_ALLOC TURING_COMPUTE_A") &&
-               x.alloc(s, s.h_chan, s.h_chan + 3, 0x902d, nullptr, 0, "RM_ALLOC FERMI_TWOD_A") &&
-               x.alloc(s, s.h_chan, s.h_chan + 4, 0xa140, nullptr, 0, "RM_ALLOC KEPLER_INLINE_TO_MEMORY_B");
+               (nvd::g_minObjects ||
+                (x.alloc(s, s.h_chan, s.h_chan + 3, 0x902d, nullptr, 0, "RM_ALLOC FERMI_TWOD_A") &&
+                 x.alloc(s, s.h_chan, s.h_chan + 4, 0xa140, nullptr, 0, "RM_ALLOC KEPLER_INLINE_TO_MEMORY_B")));
         if (good) {
             rm::NVA06F_CTRL_BIND_PARAMS bp = {rm::gr::RM_ENGINE_TYPE_GR0};
             rm::NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS sp = {1, 0};
@@ -1662,7 +1684,9 @@ bool NvdChanCreate(void*, uint32_t vas, uint32_t engine, uint32_t* out) {
 }
 void NvdChanDestroy(void*, uint32_t chan) {
     if (chan >= nvd::kMaxChans || !nvd::g_chan[chan].used) return;
-    (void)NvdWithRm("CHANNEL_FREE", [&](auto& x, auto&, const ChipOps&) { x.Close(nvd::g_chan[chan].s); return true; });
+    KPrintf("nv-drm: channel %u free: %u objects\n", chan, nvd::g_chan[chan].s.nlive);
+    (void)NvdWithRm("CHANNEL_FREE", [&](auto& x, auto&, const ChipOps&) { const uint32_t n = x.Close(nvd::g_chan[chan].s);
+        KPrintf("nv-drm: channel %u freed %u\n", chan, n); return true; });
     nvd::g_chan[chan].used = false;   // its sysmem pages are RM-lifetime regions (freed at RM unload)
 }
 bool NvdChanSubmit(void*, uint32_t chan, const uint64_t* va, const uint32_t* dw, const uint8_t* np, uint32_t n, uint32_t seq) {
@@ -1747,6 +1771,10 @@ bool NvGspHandle(const char* command) {
     else if (!strcmp(verb, "gr clear")) GrVerb(3);
     else if (!strcmp(verb, "gr compute")) GrVerb(4);
     else if (!strcmp(verb, "gr clear bl")) GrVerb(5);
+    else if (!strcmp(verb, "drm minobj on") || !strcmp(verb, "drm minobj off")) {
+        nvd::g_minObjects = !strcmp(verb, "drm minobj on");
+        DebugChannelSend(nvd::g_minObjects ? "{\"nv_gsp\":\"drm\",\"min_objects\":true}\n" : "{\"nv_gsp\":\"drm\",\"min_objects\":false}\n");
+    }
     else if (!strcmp(verb, "perf status")) PerfVerb(0);
     else if (!strcmp(verb, "perf boost")) PerfVerb(1);
     else if (!strcmp(verb, "perf clear")) PerfVerb(2);

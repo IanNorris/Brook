@@ -166,10 +166,16 @@ def build_helpers(build_root, initrd, policy_file, signer_hex, *, usb_profiles=F
     helpers = dict(HELPERS)
     if usb_profiles:
         helpers['HWBULK.ELF'] = 'tools/hardware_bulk.c'
+    # HWBULKZ.ELF: the general bulk helper (get/put/frame + zlib), so hw_transfer frame/framez
+    # screenshots work on the desktop; HWBULK.ELF stays the profile-only receiver.
+    helpers['HWBULKZ.ELF'] = 'tools/hardware_bulk.c'
+    from build_dell_image import bridge_compression
+    zlib_flags, zlib_archive = bridge_compression()
     for name, source in helpers.items():
         binary = build_root / name
-        definitions = ['-DBROOK_BULK_USB_PROFILE'] if name == 'HWBULK.ELF' else []
-        run([os.environ['MUSL_CC'], *flags, *definitions, ROOT / source, *objects, '-o', binary])
+        definitions = ['-DBROOK_BULK_USB_PROFILE'] if name == 'HWBULK.ELF' else zlib_flags if name == 'HWBULKZ.ELF' else []
+        libraries = [zlib_archive] if name == 'HWBULKZ.ELF' else []
+        run([os.environ['MUSL_CC'], *flags, *definitions, ROOT / source, *objects, *libraries, '-o', binary])
         run(['mcopy', '-o', '-i', initrd, binary, '::/BOOT/' + name])
         if subprocess.check_output(['mtype', '-i', initrd, '::/BOOT/' + name]) != binary.read_bytes():
             raise SystemExit(name + ' readback mismatch')
