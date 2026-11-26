@@ -1186,6 +1186,7 @@ static int CreateWindowLocked(Process* proc, int16_t x, int16_t y,
     w.captionStyle = 0;
     w.captionStrip = {}; w.captionStripRevision = 0;
     w.focusable = focusable;
+    w.cooperativeClose = false;
     w.savedX = x;
     w.savedY = y;
     w.savedW = clientW;
@@ -1225,9 +1226,12 @@ static int CreateWindowLocked(Process* proc, int16_t x, int16_t y,
 }
 
 int WmCreateWindow(Process* proc,int16_t x,int16_t y,uint16_t clientW,uint16_t clientH,
-                   const char* title,uint8_t upscale,bool focusable,bool focusOnCreate) {
+                   const char* title,uint8_t upscale,bool focusable,bool focusOnCreate,
+                   bool cooperativeClose) {
     VfbGuard guard;
-    return CreateWindowLocked(proc,x,y,clientW,clientH,title,upscale,focusable,focusOnCreate);
+    const int idx=CreateWindowLocked(proc,x,y,clientW,clientH,title,upscale,focusable,focusOnCreate);
+    if (idx>=0) g_windows[idx].cooperativeClose=cooperativeClose;
+    return idx;
 }
 
 static void DestroyWindowLocked(int idx)
@@ -2039,23 +2043,7 @@ static void RestoreWindowLocked(int idx)
 void WmMinimizeWindow(int idx) { VfbGuard guard;MinimizeWindowLocked(idx); }
 void WmRestoreWindow(int idx) { VfbGuard guard;RestoreWindowLocked(idx); }
 
-static bool RequestCloseLocked(int idx,uint32_t* method)
-{
-    if (idx<0 || idx>=static_cast<int>(WM_MAX_WINDOWS)) return false;
-    auto& w=g_windows[idx];
-    if (!w.proc || !w.focusable) return false;
-    if (w.vfb) {
-        *method=1;
-        return WmPushWmEvent(&w,WM_EVT_CLOSE_REQUESTED,0,0);
-    }
-    if(w.proc->state==ProcessState::Terminated)return false;
-    TerminalGeometry terminal{};
-    const bool isTerminal=TerminalSnapshotGeometry(w.proc,&terminal);
-    *method=isTerminal?2:3;
-    // Terminal hangup is cooperative too: no hidden SIGKILL on close.
-    ProcessSendSignal(w.proc,isTerminal?1:15);
-    return true;
-}
+#include "wm_request_close.inc"
 
 bool WmRequestCloseWindow(int idx) {
     VfbGuard guard;uint32_t method=0;return RequestCloseLocked(idx,&method);
