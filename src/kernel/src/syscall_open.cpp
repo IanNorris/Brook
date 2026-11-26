@@ -1,4 +1,5 @@
 #include "syscall_user_path.h"
+#include "fido_hidraw.h"
 // syscall_open.cpp -- open/openat/creat path resolution and descriptor creation.
 //
 // Split from syscall.cpp.
@@ -130,11 +131,12 @@ static int64_t OpenTerminalDevice(Process* proc,const char* path,uint64_t flags)
 // Character device inodes (the boot /dev tmpfs, or binds of its nodes into
 // a container) select their driver by device number, never by name, as on
 // Linux. The VFS open has already applied permissions and the NODEV check.
-static int64_t OpenCharacterDevice(Process* proc,uint64_t rdev,const char* path,uint64_t flags)
+static int64_t OpenCharacterDevice(Process* proc,const VnodeStat& stat,const char* path,uint64_t flags)
 {
     if(flags&0x10000)return -ENOTDIR;
     FdType type=FdType::None;
-    switch(rdev) {
+    if (HidrawDeviceNumber(stat.rdev)) return HidrawOpen(proc, stat, static_cast<uint32_t>(flags));
+    switch(stat.rdev) {
         case 0x0103: type=FdType::DevNull;break;
         case 0x0105: type=FdType::DevZero;break;
         case 0x0107: type=FdType::DevFull;break;
@@ -576,7 +578,7 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
     if(int error=VfsStat(vn,&openedStat)) {VfsClose(vn);return error;}
     if((openedStat.mode&0170000)==0020000) {
         VfsClose(vn);
-        return OpenCharacterDevice(proc,openedStat.rdev,path,flags);
+        return OpenCharacterDevice(proc,openedStat,path,flags);
     }
     if((openedStat.mode&0170000)==0010000) {
         if(int error=NamedFifoAttach(vn,static_cast<uint32_t>(flags))) {VfsClose(vn);return error;}

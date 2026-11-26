@@ -1,3 +1,4 @@
+#include "fido_hidraw.h"
 // syscall_poll.cpp -- poll/ppoll/select/pselect6 and shared wait-deadline helpers.
 //
 // Split from syscall.cpp.
@@ -217,6 +218,11 @@ retry_poll:
             continue;
         }
 
+        if (fde->type == FdType::DevHidraw) {
+            fds[i].revents = HidrawReady(static_cast<HidrawFile*>(fde->handle), fds[i].events);
+            if (fds[i].revents) ++ready;
+            continue;
+        }
         if(fde->type==FdType::SyncFile && fde->handle) {
             fds[i].revents|=SyncFileReady(*static_cast<SyncFileData*>(fde->handle),fds[i].events);
             if(fds[i].revents)++ready;
@@ -358,6 +364,7 @@ retry_poll:
             if (!fde) continue;
             if (fde->type == FdType::TimerFd && fde->handle && (fds[i].events & POLLIN))
                 timerWaiters.add(static_cast<TimerFdData*>(fde->handle), self);
+            if (fde->type == FdType::DevHidraw && safetyMs > 5) safetyMs = 5;
             if (fde->type == FdType::DevDsp) safetyMs = 5; // Cached DMA readiness has no IRQ waiter yet.
             if (fde->type == FdType::DevKeyboard && (fds[i].events & POLLIN))
                 InputAddWaiter(self);

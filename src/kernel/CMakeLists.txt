@@ -319,6 +319,7 @@ add_executable(kernel
     src/syscall_sysinfo.cpp
     src/compat_census.cpp
     src/devtmpfs.cpp
+    src/fido_hidraw.cpp
     src/lastlog.cpp
     src/syscall_sysv_ipc.cpp
     src/syscall_brook_system.cpp

@@ -66,6 +66,7 @@ enum class FdType : uint8_t
     IntelSyncObj,  // Capability retaining an Intel DRM sync object
     DevZero,       // /dev/zero (1:5) — zero-filled reads, discarded writes
     DevFull,       // /dev/full (1:7) — zero-filled reads, writes fail ENOSPC
+    DevHidraw,     // One open report queue for a FIDO authenticator
 };
 
 // One descriptor slot. type/handle/flags are the immutable identity of the

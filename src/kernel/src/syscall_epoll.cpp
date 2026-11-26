@@ -1,3 +1,4 @@
+#include "fido_hidraw.h"
 // syscall_epoll.cpp -- epoll instances and epoll_create/ctl/wait.
 //
 // Split from syscall.cpp.
@@ -131,6 +132,7 @@ static uint32_t EpollLeafReady(FdEntry* fde, uint32_t events)
 
     if(fde->type==FdType::NetlinkSocket)return NetlinkReady(static_cast<NetlinkSocket*>(fde->handle),events);
     if(FdNamedFifo(fde))return NamedFifoReady(fde,events);
+    if (fde->type == FdType::DevHidraw) return HidrawReady(static_cast<HidrawFile*>(fde->handle), events);
     if(fde->type==FdType::SyncFile && fde->handle)return SyncFileReady(*static_cast<SyncFileData*>(fde->handle),events);
     if(fde->type==FdType::SignalFd && fde->handle)
         return SignalFdReady(ProcessCurrent(),static_cast<SignalFd*>(fde->handle),events);
@@ -635,6 +637,8 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
                     if(!pipeWaiters.add(static_cast<PipeBuffer*>(fde->handle),proc,walk->masks[wfd]|EPOLLHUP|EPOLLERR))fallbackTick=true;
                 } else if (fde->type == FdType::EventFd) {
                     if(!eventWaiters.add(static_cast<EventFdData*>(fde->handle),proc))fallbackTick=true;
+                } else if (fde->type == FdType::DevHidraw) {
+                    fallbackTick = true;
                 } else if (fde->type == FdType::SyncFile) {
                     if (walk->masks[wfd] & EPOLLIN) syncWait.Want(*static_cast<SyncFileData*>(fde->handle));
                 } else if (fde->type == FdType::TimerFd) {
