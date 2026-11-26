@@ -442,6 +442,25 @@ static int FatFileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
     return static_cast<int>(br);
 }
 
+static constexpr uint64_t FatMaxFileSize = 0xffffffffULL;
+
+// A growing FatFs seek allocates clusters without initializing their data.
+// Write zeroes before raising EOF so even a partially failed gap is safe.
+static FRESULT FatWriteZeroGap(FatOpenFile* file, uint64_t end, bool& full)
+{
+    FIL* fil = &file->fil;
+    static constexpr uint8_t zeros[4096]{};
+    FRESULT result = f_lseek(fil, f_size(fil));
+    while (result == FR_OK && f_size(fil) < end) {
+        const uint64_t remain = end - f_size(fil);
+        const UINT chunk = remain < sizeof(zeros) ? static_cast<UINT>(remain) : sizeof(zeros);
+        UINT written = 0;
+        result = f_write(fil, zeros, chunk, &written);
+        if (result == FR_OK && written != chunk) { full = true; return FR_OK; }
+    }
+    return result;
+}
+
 static int FatFileWriteAt(Vnode* vn, const void* buf, uint64_t len, uint64_t* offset, bool append)
 {
     FIL* fil = static_cast<FIL*>(vn->priv);
@@ -451,21 +470,33 @@ static int FatFileWriteAt(Vnode* vn, const void* buf, uint64_t len, uint64_t* of
     if (ready) { KMutexUnlock(&g_fatLock); return ready; }
     // Alias metadata has been synchronized; EOF and write share g_fatLock.
     uint64_t position = append ? f_size(fil) : *offset;
-    if (f_tell(fil) != position) {
-        FRESULT sres = FatCallWithPath(file->writePath, [&] { return f_lseek(fil, static_cast<FSIZE_t>(position)); });
-        if (sres != FR_OK) {
-            KMutexUnlock(&g_fatLock);
-            return FrToErrno(sres);
-        }
-        if (f_tell(fil) != position) {
-            file->mount->backgroundDirty = true;
-            PublishFatMutation(file);
-            KMutexUnlock(&g_fatLock);
-            return -28; // Full disk clipped the growing seek.
-        }
+    if (!len || position >= FatMaxFileSize) {
+        KMutexUnlock(&g_fatLock);
+        return len ? -27 : 0; // EFBIG even if the volume also happens to be full.
     }
+    const uint64_t initialSize = f_size(fil);
+    bool full = false;
+    FRESULT res = FatCallWithPath(file->writePath, [&] {
+        if (position > initialSize) {
+            const FRESULT grow = FatWriteZeroGap(file, position, full);
+            if (grow != FR_OK || full) {
+                if (f_size(fil) > initialSize) {
+                    const FRESULT seek = f_lseek(fil, static_cast<FSIZE_t>(initialSize));
+                    const FRESULT shrink = seek == FR_OK ? f_truncate(fil) : seek;
+                    if (shrink != FR_OK) return shrink;
+                }
+                return grow;
+            }
+        }
+        if (f_tell(fil) == position) return FR_OK;
+        return f_lseek(fil, static_cast<FSIZE_t>(position));
+    });
     UINT bw = 0;
-    FRESULT res = FatCallWithPath(file->writePath, [&] { return f_write(fil, buf, static_cast<UINT>(len), &bw); });
+    if (res == FR_OK && !full) {
+        const uint64_t limit = FatMaxFileSize - position;
+        const UINT count = static_cast<UINT>(len < limit ? len : limit);
+        res = FatCallWithPath(file->writePath, [&] { return f_write(fil, buf, count, &bw); });
+    }
     // Even a partial or failed write can have changed FAT buffers. A later
     // idle pass must retry both the file metadata and the device flush.
     file->mount->backgroundDirty = true;
@@ -819,7 +850,7 @@ static int CachedFileStat(Vnode* vn, VnodeStat* st)
 
 static int FatFileTruncate(Vnode* vn, uint64_t size)
 {
-    if (size > 0xffffffffULL) return -27;
+    if (size > FatMaxFileSize) return -27;
     auto* file = static_cast<FatOpenFile*>(vn->priv);
     uint8_t* zeros = static_cast<uint8_t*>(kmalloc(4096));
     if (!zeros) return -12;

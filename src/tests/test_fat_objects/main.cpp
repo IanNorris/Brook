@@ -121,6 +121,32 @@ int main(int argc,char** argv){
         uint64_t offset=0;assert(node->ops->write(node,contents,std::strlen(contents),&offset)==int(std::strlen(contents)));closeNode(node);
     };
     assert(!FatFsMkdir(mount,0,"/dir",0755));assert(!FatFsMkdir(mount,0,"/parent",0755));
+    {
+        Vnode* gap=FatFsOpen(mount,0,"/GAP.DAT",VFS_O_CREATE|VFS_O_WRITE|VFS_O_READWRITE);
+        assert(gap);
+        uint64_t offset=0;
+        assert(gap->ops->write(gap,"a",1,&offset)==1);
+        offset=4097;
+        assert(gap->ops->write(gap,"b",1,&offset)==1 && offset==4098);
+        uint8_t bytes[4098];
+        offset=0;
+        assert(gap->ops->read(gap,bytes,sizeof(bytes),&offset)==4098);
+        assert(bytes[0]=='a' && bytes[4097]=='b');
+        assert(std::all_of(bytes+1,bytes+4097,[](uint8_t byte){return byte==0;}));
+        offset=0xffffffffULL;
+        assert(gap->ops->write(gap,"z",1,&offset)==-27 && offset==0xffffffffULL);
+        offset=0x100000001ULL;
+        assert(gap->ops->write(gap,"z",1,&offset)==-27 && offset==0x100000001ULL);
+        offset=disk.size();
+        assert(gap->ops->write(gap,"z",1,&offset)==-28 && offset==disk.size());
+        VnodeStat stat{};
+        assert(!gap->ops->stat(gap,&stat) && stat.size==4098);
+        closeNode(gap);
+        Vnode* reopened=FatFsOpen(mount,0,"/GAP.DAT",VFS_O_READ);
+        assert(reopened && !reopened->ops->stat(reopened,&stat) && stat.size==4098);
+        closeNode(reopened);
+        assert(!FatFsUnlink(mount,0,"/GAP.DAT"));
+    }
     create("/dir/meaningfully-long-name.txt","original");create("/dir/empty","");
     VfsObject *root=nullptr,*held=nullptr,*file=nullptr,*empty=nullptr,*after=nullptr;
     assert(!FatRootObject(mount,0,&root));Vnode* legacyRoot=FatFsOpen(mount,0,"/",VFS_O_READ);
