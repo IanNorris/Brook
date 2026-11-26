@@ -840,6 +840,11 @@ struct Bar1PageAlloc {
         DmaRegion d; if (!RmAlloc(0x1000, &d)) return false; *bus = d.bus; *cpu = d.cpu; return true; }
     void flush(uint8_t* p) { FlushRange(p, 0x1000); }
 };
+// nv_snap PRAMIN reader (nv_disp_live.cpp); callers hold the nv-aux lock, which serialises PRAMIN.
+uint32_t DispPraminRd(uint64_t vram) {
+    const ChipOps* c = ChipForBoot0(g_bus.rd32(0)); if (!c) return 0xffffffffu;
+    Pramin<Bar0Bus> pr(g_bus, *c); const uint32_t v = pr.rd32(vram); pr.Restore(); return v;
+}
 // Caller holds the nv-aux lock (no compositor BAR1/PRAMIN traffic).
 bool Bar1MapLocked(uint8_t shift) {
     if (!g_rmRunning || !g_staticValid || g_bar1Mapped) return false;
@@ -858,6 +863,7 @@ bool Bar1MapLocked(uint8_t shift) {
     g_bar1 = MapBar1Identity(g_bus, *ChipForBoot0(g_bus.rd32(0)), pa, g_static.bar1_pde, kBar1Bytes, probes, 3,
                              [](uint64_t off, uint32_t* v) { return Bar1Read(off, v); }, shift);
     g_bar1Mapped = g_bar1.committed;
+    if (g_bar1Mapped) NvDispSetBar1Diag(DispPraminRd, g_bar1.pdb, g_bar1.pd3_new);   // nv_snap: PD3[0] + ring via PRAMIN
     KPrintf("nv-gsp: BAR1 identity map %s at %s (RM PD3[0] %lx -> %lx, %u ptes, probes %u/%u)\n", g_bar1.status, g_bar1.stage,
             (unsigned long)g_bar1.pd3_old[0], (unsigned long)g_bar1.pd3_new, g_bar1.ptes, g_bar1.probes_equal, g_bar1.probes);
     return g_bar1.ok();
@@ -1996,7 +2002,11 @@ bool NvdChanCreate(void*, uint32_t vas, uint32_t engine, uint32_t* out) {
         // the channel scope shares the VAS page tables (context buffers map into the same root)
         s.root = v.s.root; s.lpt_page = v.s.lpt_page; s.lpt_off = v.s.lpt_off; s.lpt_aper = v.s.lpt_aper;
         uint32_t entries = 0;
-        bool good = x.ChannelInVas(s, ch.mthdbuf, g_gr.mthdbuf_size) && x.Promote(s, g_gr.bufs, false, &entries);
+        NvDispSnapLocked("chan-pre");
+        bool good = x.ChannelInVas(s, ch.mthdbuf, g_gr.mthdbuf_size);
+        NvDispSnapLocked("chan-alloc");
+        good = good && x.Promote(s, g_gr.bufs, false, &entries);
+        NvDispSnapLocked("chan-promote");
         KPrintf("nv-drm: chid %u %s, PROMOTE_CTX %u entries (chanmode %u)\n", chid, s.priv ? "admin" : "user", entries, g_grChanMode);
         v.s.lpt_page = s.lpt_page; v.s.lpt_off = s.lpt_off; v.s.lpt_aper = s.lpt_aper;
         // NVK allocates TURING_DMA_COPY_A on its GR channel (nouveau_ws_3d_context_init, ENGINE_COPY)
@@ -2032,6 +2042,7 @@ bool NvdChanCreate(void*, uint32_t vas, uint32_t engine, uint32_t* out) {
         // BIND + GPFIFO_SCHEDULE + token wait for the first EXEC (NvdSchedule): a scheduled GR
         // channel left idle ~1 s preceded the RM asserts / Xid 62 seen on 26 Nov.
         (void)vio; (void)c; (void)h::kDoorbell;
+        NvDispSnapLocked("chan-objs");
         if (!good) x.Close(s);
         return good;
     });
@@ -2054,10 +2065,13 @@ bool NvdSchedule(nvd::Chan& ch) {
         rm::NVA06F_CTRL_BIND_PARAMS bp = {rm::gr::RM_ENGINE_TYPE_GR0};
         rm::NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS sp = {1, 0};
         rm::NVC36F_CTRL_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS tk = {};
+        NvDispSnapLocked("sched-pre");
         if (!x.api.Control(s.base, s.h_chan, rm::NVA06F_CTRL_CMD_BIND, &bp, sizeof(bp))) return x.fail("BIND");
+        NvDispSnapLocked("sched-bind");
         if (!x.api.Control(s.base, s.h_chan, rm::NVA06F_CTRL_CMD_GPFIFO_SCHEDULE, &sp, sizeof(sp))) return x.fail("GPFIFO_SCHEDULE");
         if (!x.api.Control(s.base, s.h_chan, rm::NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN, &tk, sizeof(tk))) return x.fail("token");
         ch.token = tk.workSubmitToken;
+        NvDispSnapLocked("sched-post");
         return true;
     });
     if (ok) { ch.scheduled = true; KPrintf("nv-drm: channel chid %u scheduled (token %x)\n", ch.chid, ch.token); }

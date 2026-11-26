@@ -155,17 +155,28 @@ template<typename B> struct NvDisplayDriver{
         const auto& g=r0->base.gop;
         return b->rd(RegArm(kChidCore,c57d::HeadRasterSize(0)))==g.headRaster&&b->rd(RegArm(kChidCore,c57d::HeadPixelClock(0)))==g.headPclk&&
                b->rd(RegArm(kChidCore,c57d::SorSetControl(g.sor)))==g.sorCtl&&(b->rd(RegArm(kChidCore,c57d::WindowSetControl(0)))&0xf)==0;}
+    // Failure diagnostics hook (live: nv_disp_live.cpp NvDispSnapLocked, BAR1 vs PRAMIN ring check).
+    void (*onFailDiag)(uint32_t o)=nullptr;
+    // Three lines: the kernel log keeps 160 characters of a line (27 Nov records ended at arm_notifier).
     void OnFailure(uint32_t o){
         ++failures[o];
-        Line l;l.raw("{\"nv_driver\":\"flip-failed\",\"output\":");l.dec(o);l.raw(",\"code\":");l.dec(uint32_t(f[o].fail));
         const uint32_t ch=ChidWndw(kDriverWindow[o]);
+        {Line l;l.raw("{\"nv_driver\":\"flip-failed\",\"output\":");l.dec(o);l.raw(",\"code\":");l.dec(uint32_t(f[o].fail));
         l.raw(",\"get\":\"");l.hex(b->rd(RegGet(ch)));l.raw("\",\"put\":\"");l.hex(f[o].put);
         l.raw("\",\"status\":\"");l.hex(b->rd(RegChnStatus(ch)));l.raw("\",\"exc\":\"");l.hex(b->rd(RegExcept(ch)));
-        l.raw("\",\"arm_offset\":\"");l.hex(b->rd(RegArm(ch,c57e::SET_OFFSET0)));
-        l.raw("\",\"arm_iso\":\"");l.hex(b->rd(RegArm(ch,c57e::SET_CONTEXT_DMA_ISO0)));
-        l.raw("\",\"arm_notifier\":\"");l.hex(b->rd(RegArm(ch,c57e::SET_CONTEXT_DMA_NOTIFIER)));
-        l.raw("\",\"front\":");l.dec(uint32_t(f[o].front));l.raw(",\"presents\":");l.dec(f[o].st.presents);
-        l.raw(",\"completes\":");l.dec(f[o].st.completes);l.raw("}\n");b->emit(l.t);
+        l.raw("\",\"exc_win\":\"");l.hex(b->rd(kRegExcWin));l.raw("\",\"exc_other\":\"");l.hex(b->rd(kRegExcOther));l.raw("\"}\n");b->emit(l.t);}
+        {Line l;l.raw("{\"nv_driver\":\"flip-failed-arm\",\"output\":");l.dec(o);
+        l.raw(",\"off\":\"");l.hex(b->rd(RegArm(ch,c57e::SET_OFFSET0)));l.raw("\",\"want\":\"");l.hex(f[o].armedTarget);
+        l.raw("\",\"iso\":\"");l.hex(b->rd(RegArm(ch,c57e::SET_CONTEXT_DMA_ISO0)));
+        l.raw("\",\"ntfy\":\"");l.hex(b->rd(RegArm(ch,c57e::SET_CONTEXT_DMA_NOTIFIER)));
+        l.raw("\",\"front\":");l.dec(uint32_t(f[o].front));l.raw(",\"armed\":");l.dec(uint32_t(uint8_t(f[o].armed)));
+        l.raw(",\"pres\":");l.dec(f[o].st.presents);l.raw(",\"comp\":");l.dec(f[o].st.completes);l.raw("}\n");b->emit(l.t);}
+        {Line l;l.raw("{\"nv_driver\":\"flip-failed-time\",\"output\":");l.dec(o);
+        l.raw(",\"age_us\":");l.dec(b->nowUs()-f[o].armedAtUs);l.raw(",\"lv\":\"");l.hex(b->rd(RegLoadvCounter(f[o].head)));
+        l.raw("\",\"lv_arm\":\"");l.hex(f[o].armLoadv);l.raw("\",\"lv_live\":");l.dec(f[o].loadvLive?1:0);
+        l.raw(",\"rg\":\"");l.hex(b->rd(RegRgPos(f[o].head)));l.raw("\",\"arm_line\":\"");l.hex(f[o].armLine);
+        l.raw("\",\"kick\":\"");l.hex(f[o].lastKickOff);l.raw("/");l.dec(f[o].lastKickN);l.raw("\"}\n");b->emit(l.t);}
+        if(onFailDiag)onFailDiag(o);
         if(o==0)(void)Down0();else(void)Down1();
         out[o]=OutState::Failed;
     }

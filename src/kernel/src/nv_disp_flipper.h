@@ -112,6 +112,7 @@ template<typename B> struct NvWindowFlipper{
         const uint32_t bytes=n*4;
         if(bytes+8>kRingBytes){Fail(FlipFail::Bounds);return false;}
         if(put+bytes+4>kRingBytes){b->vwr(ring+put,PushJump(0));put=0;++st.wraps;}
+        lastKickOff=put;lastKickN=n;
         for(uint32_t i=0;i<n;++i)b->vwr(ring+put+i*4,w[i]);
         __atomic_thread_fence(__ATOMIC_SEQ_CST);b->fence();
         Wr(kRegBar1Flush,1);
@@ -121,6 +122,7 @@ template<typename B> struct NvWindowFlipper{
         return state!=FlipState::Failed;
     }
     uint32_t armLine=0,armLoadv=0;
+    uint32_t lastKickOff=0,lastKickN=0;   // ring offset and word count of the last kick (failure diagnostics)
     bool loadvLive=true;   // false if the counter never moves (then: armed-state completion, flagged)
     uint32_t loadvStuck=0;
     bool ArmWords(const uint32_t* w,uint32_t n,uint32_t iso,uint32_t offset){
