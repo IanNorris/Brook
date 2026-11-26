@@ -208,6 +208,7 @@ struct Window
     uint64_t captionStripRevision;
     uint32_t    captionStyle;   // DesktopCaptionStyle* packing; 0 = native title style
     bool        focusable;      // popups/tooltips stay above but don't take keyboard focus
+    bool        cooperativeClose; // legacy window owner handles WM_EVT_CLOSE_REQUESTED
     char        title[64];      // original title from the client
     char        webAppTitle[64]; // display override from the active launcher catalog
     char        appId[128];     // explicit xdg app_id, independent of document title
@@ -363,7 +364,8 @@ void WmInit();
 int WmCreateWindow(Process* proc, int16_t x, int16_t y,
                    uint16_t clientW, uint16_t clientH,
                    const char* title, uint8_t upscale = 1,
-                   bool focusable = true, bool focusOnCreate = true);
+                   bool focusable = true, bool focusOnCreate = true,
+                   bool cooperativeClose = false);
 
 // Remove a window (process exited or closed).
 void WmDestroyWindow(int idx);

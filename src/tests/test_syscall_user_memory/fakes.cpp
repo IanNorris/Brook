@@ -199,7 +199,7 @@ Terminal* TerminalFindByProcess(Process*) { return nullptr; }
 bool TerminalSnapshotGeometry(Process*,TerminalGeometry* geometry) { geometry->rows=24;geometry->cols=80;return true; }
 VirtualAddress VmmAllocPages(uint64_t,uint64_t,MemTag,uint16_t) { return VirtualAddress(0); }
 void VmmFreePages(VirtualAddress,uint64_t) {}
-int WmCreateWindow(Process*,int16_t,int16_t,uint16_t,uint16_t,const char*,uint8_t,bool,bool) { return -1; }
+int WmCreateWindow(Process*,int16_t,int16_t,uint16_t,uint16_t,const char*,uint8_t,bool,bool,bool) { return -1; }
 int WmFindWindowForProcess(Process*) { return -1; }
 uint32_t WmMetric(uint32_t base) { return base; }
 const DesktopMetrics& WmDesktopMetrics() { return DesktopMetric100; } // consistent with WmMetric

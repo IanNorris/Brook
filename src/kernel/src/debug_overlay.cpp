@@ -287,7 +287,8 @@ static void KernelConsoleThread(void* /*arg*/)
     if(!initial.width || !initial.height) { SerialPuts("KCONSOLE: display too small\n"); return; }
     int consoleIdx = WmCreateWindow(self, static_cast<int16_t>(initial.x), static_cast<int16_t>(initial.y),
                    static_cast<uint16_t>(initial.width),
-                   static_cast<uint16_t>(initial.height), "Kernel Console", 1, true, false);
+                   static_cast<uint16_t>(initial.height), "Kernel Console", 1, true, false,
+                   /*cooperativeClose=*/true);
     if (consoleIdx >= 0)
         WmSendToBack(consoleIdx);
 
@@ -326,6 +327,9 @@ static void KernelConsoleThread(void* /*arg*/)
         int n=WmInputPopOwned(self,static_cast<uint32_t>(consoleIdx+1),incarnation,events,16);
         if(n<0)return;
         for(int i=0;i<n;++i) {
+            // Returning reaps this window and its VFB with the console thread.
+            // The log producer and ring are independent of the window.
+            if(events[i].type==WM_EVT_CLOSE_REQUESTED)return;
             int lines=0;
             if(events[i].type==static_cast<uint8_t>(InputEventType::MouseScroll))
                 lines=static_cast<int8_t>(events[i].scanCode)*3;
