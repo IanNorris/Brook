@@ -294,6 +294,7 @@ def desktop_payload(args, initrd):
     embed_clearwater_executables(initrd, supervisor / 'bin/CWSUP.ELF', shell / 'bin/CWSHELL.ELF')
     embed_terminal_shortcut(initrd)
     fat_write(initrd, 'ETC/volatile-desktop', b'1\n')
+    fat_write(initrd, 'ETC/keyboard-layout', (args.keyboard_layout + '\n').encode())
     fat_write(initrd, 'ETC/hardware-bulk', b'1\n')
     fat_write(initrd, 'ETC/usb-audio-mixer', b'1\n')
     # RTX DP sink idle-off: 5 min, AUX ch 3 / SOR1 link B (the GOP's lit head on this desktop).
@@ -466,6 +467,7 @@ def build(args):
         'usb_system': live if args.usb_system else None,
         'initrd': {'drivers': list(DRIVERS), 'etc': etc, 'markers': list(markers)},
         'i219_stage': args.i219_stage,
+        'keyboard_layout': args.keyboard_layout,
         'nv_gsp': {'verbs': bool(args.nv_gsp), 'firmware': nv_gsp_fw},
         'helpers': helpers,
         'update_signer_public': signer_hex,
@@ -549,6 +551,7 @@ def main():
     p.add_argument('--display-max', default='1920x1080', metavar='WxH',
                    help='GOP mode cap in BROOK.CFG (kernel supports up to 4096x2160); outside PREV/ fallback')
     p.add_argument('--allow-dirty', action='store_true')
+    p.add_argument('--keyboard-layout', choices=('gb', 'us'), default='gb')
     p.add_argument('--restart-prompt-seconds', type=int, choices=range(1, 601), metavar='1..600')
     p.add_argument('--nv-display', action='store_true',
                    help='desktop image: /etc/nv-display = 1 (RTX head-0 flip presentation at desktop start)')

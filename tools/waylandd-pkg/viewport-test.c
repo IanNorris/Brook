@@ -7,13 +7,13 @@ static long test_syscall(long,...);
 #include "waylandd.c"
 #undef main
 #undef syscall
-static uint32_t cursor_pixels[64*64],cursor_w,cursor_h;
+static uint32_t cursor_pixels[128*128],cursor_w,cursor_h;
 static int32_t cursor_x,cursor_y;
 static long test_syscall(long number,...) {
     if(number==BROOK_SYS_WM_SET_CURSOR_IMAGE) {
         va_list ap;va_start(ap,number);const uint32_t *pixels=(void *)va_arg(ap,long);
         cursor_w=va_arg(ap,long);cursor_h=va_arg(ap,long);cursor_x=va_arg(ap,long);cursor_y=va_arg(ap,long);va_end(ap);
-        assert(cursor_w<=64 && cursor_h<=64);if(pixels)memcpy(cursor_pixels,pixels,cursor_w*cursor_h*4);
+        assert(cursor_w<=128 && cursor_h<=128);if(pixels)memcpy(cursor_pixels,pixels,cursor_w*cursor_h*4);
     }
     return 0;
 }
@@ -128,10 +128,10 @@ int main(void) {
     cursor->geometry.transform=2;surface_cursor_commit(cursor);assert(cursor_w==2 && cursor_pixels[0]==grid[3]);
     surface_commit(client,cursor->resource);assert(cursor_w==3 && cursor_h==2 && cursor_pixels[0]==grid[5]);
     uint32_t wide[130];for(unsigned i=0;i<130;++i)wide[i]=0xff000000|i;
-    cursor->geometry.transform=0;cursor->geometry.destination_set=1;cursor->geometry.dw=65;cursor->geometry.dh=1;
+    cursor->geometry.transform=0;cursor->geometry.destination_set=1;cursor->geometry.dw=130;cursor->geometry.dh=1;
     commit_pixels(cursor,wide,130,1);surface_cursor_commit(cursor);
-    assert(cursor_w==64 && cursor_h==1);
-    for(unsigned x=0;x<64;++x)assert(cursor_pixels[x]==wide[(2*x+1)*130/(2*64)]);
+    assert(cursor_w==128 && cursor_h==1);
+    for(unsigned x=0;x<128;++x)assert(cursor_pixels[x]==wide[(2*x+1)*130/(2*128)]);
     surface_destroy(client,cursor->resource);
     surface_destroy(client,root->resource);assert(!g_surfaces);
     wl_client_destroy(client);wl_display_destroy(display);close(sockets[1]);

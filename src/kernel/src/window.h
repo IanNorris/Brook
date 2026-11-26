@@ -28,6 +28,8 @@ uint32_t WmMetric(uint32_t base);
 const FontAtlas& WmDesktopFont();
 uint32_t WmGetRequestedScale();
 uint32_t WmGetAppliedScale();
+uint32_t WmCursorSize();
+void WmSetCursorSize(uint32_t size);
 bool WmSetScale(uint32_t percent);
 // Called by the compositor after old-frame input and before new-frame drawing.
 bool WmApplyScalePending();

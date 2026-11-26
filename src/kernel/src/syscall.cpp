@@ -28,6 +28,8 @@
 #include "syscall_strace.h"
 #include "syscall_dispatch.h"
 #include "syscall_handlers.h"
+#include "../../shared/wm_input_abi.h"
+#include "../../shared/input_preferences.h"
 #include "seccomp.h"
 #include "compat_census.h"
 #include "compat_census_runtime.h"
@@ -599,6 +601,8 @@ void SyscallTableInit()
     g_syscallTable[0xB0A]                = sys_brook_wm_pointer_capture;
     g_syscallTable[0xB25]                = sys_brook_wm_show_window_menu;
     g_syscallTable[0xB27]                = sys_brook_wm_set_idle_inhibit;
+    g_syscallTable[BROOK_SYS_WM_POINTER_TIMELINE] = sys_brook_wm_pointer_timeline;
+    g_syscallTable[BROOK_SYS_INPUT_PREFERENCES] = sys_brook_input_preferences;
     g_syscallTable[BROOK_SYS_GPU_OUTPUT_ALLOC] = sys_brook_gpu_output_alloc;
     g_syscallTable[BROOK_SYS_GPU_BUFFER_TRY_CPU_READ] = sys_brook_gpu_buffer_try_cpu_read;
     g_syscallTable[BROOK_SYS_GPU_BUFFER_SNAPSHOT_FENCE] = sys_brook_gpu_buffer_snapshot_fence;

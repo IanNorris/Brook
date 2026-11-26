@@ -6,7 +6,7 @@
 /* What one frame shows of the desktop overlay: the captured bands of a
  * kernel content generation (0 = unknown, e.g. an older kernel, which is
  * treated as changed every frame) and the separately drawn pointer. */
-struct DesktopOverlayCursorState { uint32_t visible,width,height; int32_t x,y; uint64_t serial; };
+struct DesktopOverlayCursorState { uint32_t visible,width,height; int32_t x,y; uint64_t serial; uint32_t stride; };
 /* opaque/keys come from kernel op 9 (zero from older kernels): bit i means
  * band i is fully opaque, keys[i] identifies its pixels (0 = unknown). */
 struct DesktopOverlayFrameState {

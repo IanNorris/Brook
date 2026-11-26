@@ -41,6 +41,7 @@ struct InputEvent {
     uint8_t  modifiers;  // Bitmask of active modifiers at event time
     int32_t  deltaX, deltaY; // screen convention: right/down positive
     uint8_t scrollFlags; // MouseScroll only: BROOK_WM_SCROLL_FINGER / BROOK_WM_SCROLL_END
+    uint16_t textCodepoint; // non-ASCII decoded key text for native consumers
     uint64_t sequence; // assigned when published to the device queue
 };
 
@@ -57,6 +58,7 @@ static constexpr uint8_t INPUT_MOD_CTRL     = (1 << 2);
 static constexpr uint8_t INPUT_MOD_ALT      = (1 << 3);
 static constexpr uint8_t INPUT_MOD_CAPSLOCK = (1 << 4);
 static constexpr uint8_t INPUT_MOD_SUPER    = (1 << 5);
+static constexpr uint8_t INPUT_MOD_ALTGR    = (1 << 6);
 
 static constexpr uint8_t INPUT_MOD_SHIFT = (INPUT_MOD_LSHIFT | INPUT_MOD_RSHIFT);
 
@@ -156,6 +158,7 @@ extern "C" void InputWakeWaiters();
 
 // Also records failed publication so capture can fail safely on lost input.
 extern "C" uint64_t InputNextSequence(bool dropped);
+extern "C" void InputMarkPointerIngress(uint8_t type);
 uint64_t InputLatestSequence();
 uint64_t InputDroppedEvents();
 
@@ -172,6 +175,9 @@ inline void InputDevicePush(InputDevice* dev, const InputEvent& ev)
     }
     dev->ring[head] = ev;
     dev->ring[head].sequence = InputNextSequence(false);
+#ifndef BROOK_HOST_TEST
+    if (ev.type >= InputEventType::MouseMove) InputMarkPointerIngress(static_cast<uint8_t>(ev.type));
+#endif
     __atomic_store_n(&dev->head, next, __ATOMIC_RELEASE);
 }
 

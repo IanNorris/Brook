@@ -10,6 +10,8 @@
 // blitting client areas to draw the window decorations.
 
 #include "window.h"
+#include "keyboard.h"
+#include "../../shared/input_preferences.h"
 #include "idle_inhibit.h"
 #include "../../shared/brook_pointer.h"
 #include "../../shared/brook_experience_config.h"
@@ -93,6 +95,11 @@ static uint64_t NextPublication(Window& window) {
 }
 static const DesktopMetrics* g_desktopMetrics = &DesktopMetric100;
 static uint32_t g_requestedScale = 100;
+static uint32_t g_cursorSize = BROOK_CURSOR_SIZE_DEFAULT;
+
+uint32_t WmCursorSize() { return __atomic_load_n(&g_cursorSize, __ATOMIC_ACQUIRE); }
+void WmSetCursorSize(uint32_t size) { __atomic_store_n(&g_cursorSize, size, __ATOMIC_RELEASE); }
+
 const DesktopMetrics& WmDesktopMetrics() { return *__atomic_load_n(&g_desktopMetrics,__ATOMIC_ACQUIRE); }
 uint32_t WmMetric(uint32_t base) { return static_cast<uint32_t>(WmDesktopMetrics().pixels(static_cast<int>(base))); }
 uint32_t WmGetRequestedScale() { return __atomic_load_n(&g_requestedScale,__ATOMIC_ACQUIRE); }
@@ -353,6 +360,8 @@ static void WmRestoreTheme()
     uint32_t taskbarMetrics=BROOK_TASKBAR_DEFAULT;
     int proMode=BROOK_EXPERIENCE_PRO_MODE_DEFAULT;
     uint32_t pointerSpeed=BROOK_POINTER_SPEED_DEFAULT;
+    uint32_t keyboardLayout=KbdDefaultLayout();
+    uint32_t cursorSize=BROOK_CURSOR_SIZE_DEFAULT;
     uint32_t touchpadTap=BROOK_TOUCHPAD_TAP_DEFAULT;
     uint32_t audioControl=AudioOutputControl();
     const bool forceMuted=(audioControl&BROOK_AUDIO_MUTED)!=0;
@@ -413,6 +422,10 @@ static void WmRestoreTheme()
                     appearance=brook_appearance_setting(appearance,p);
                     taskbarMetrics=brook_taskbar_metrics_setting(taskbarMetrics,p);
                     pointerSpeed=brook_pointer_speed_setting(pointerSpeed,p);
+                    if (!strncmp(p,"keyboard_layout=",16))
+                        keyboardLayout=brook_keyboard_layout_parse(p+16,keyboardLayout);
+                    if (!strncmp(p,"cursor_size=",12))
+                        cursorSize=brook_cursor_size_parse(p+12,cursorSize);
                     touchpadTap=brook_touchpad_tap_setting(touchpadTap,p);
                 }
                 if (!more) break;
@@ -439,6 +452,8 @@ static void WmRestoreTheme()
                     (WmGetAppearance()&(BROOK_APPEARANCE_DARK|BROOK_APPEARANCE_PERFORMANCE)));
     WmSetTaskbarMetrics(taskbarMetrics);
     WmSetProMode(proMode!=0);
+    KbdSetLayout(keyboardLayout);
+    WmSetCursorSize(cursorSize);
     MouseTouchpadSetSpeed(pointerSpeed);
     MouseTouchpadSetTap(touchpadTap!=0);
     WmSetScale(selectedScale);

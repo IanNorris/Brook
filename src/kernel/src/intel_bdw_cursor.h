@@ -38,14 +38,15 @@ void BdwCursorDisable(Io& io)
 
 // Hash only pixels that affect the fixed-size ARGB plane. Hotspots are
 // position changes, and RGB values under zero alpha are never displayed.
-inline uint64_t BdwCursorImageKey(const uint32_t* pixels, uint32_t width, uint32_t height)
+inline uint64_t BdwCursorImageKey(const uint32_t* pixels, uint32_t width, uint32_t height,
+                                  uint32_t stride = BdwCursorRegs::Side)
 {
     uint64_t key = 14695981039346656037ull;
     bool hasAlpha = false;
     for (uint32_t row = 0; row < height; ++row) {
         for (uint32_t col = 0; col < width; ++col) {
             const uint32_t index = row * BdwCursorRegs::Side + col;
-            const uint32_t pixel = pixels[index];
+            const uint32_t pixel = pixels[row * stride + col];
             if (!(pixel >> 24))
                 continue;
             hasAlpha = true;

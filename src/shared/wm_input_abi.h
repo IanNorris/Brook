@@ -6,6 +6,9 @@
 // local pointer position as int16 x then y. Legacy scroll keeps x/y at 4..7
 // and the optional capture token at 8..11.
 #define BROOK_WM_CREATE_FLAG_FINE_SCROLL 8u
+#define BROOK_SYS_WM_POINTER_TIMELINE 0xB29
+#define BROOK_POINTER_TIMELINE_SEAT 0u
+#define BROOK_POINTER_TIMELINE_DELIVERY 1u
 #define BROOK_WM_SCROLL_FINE    0x20u
 #define BROOK_WM_SCROLL_FINGER  0x40u
 #define BROOK_WM_SCROLL_END     0x80u

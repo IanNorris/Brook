@@ -1,5 +1,7 @@
 // keyboard.cpp — compiled with -mgeneral-regs-only (ISR file).
 #include "keyboard.h"
+#include "keyboard_layout.h"
+#include "vfs.h"
 #include "input.h"
 #include "idt.h"
 #include "apic.h"
@@ -12,347 +14,29 @@
 
 namespace brook {
 
-// ---------------------------------------------------------------------------
-// Keyboard layout — selectable at runtime.
-// ---------------------------------------------------------------------------
+static uint32_t g_keyboardLayout = BROOK_KEYBOARD_US;
+static uint32_t g_keyboardDefault = BROOK_KEYBOARD_US;
 
-enum class KbdLayout : uint8_t { US, UK };
-static volatile KbdLayout g_kbdLayout = KbdLayout::UK; // default: UK
+uint32_t KbdLayout() { return __atomic_load_n(&g_keyboardLayout, __ATOMIC_ACQUIRE); }
+uint32_t KbdDefaultLayout() { return g_keyboardDefault; }
+void KbdSetLayout(uint32_t layout) { __atomic_store_n(&g_keyboardLayout, layout, __ATOMIC_RELEASE); }
 
-// ---------------------------------------------------------------------------
-// Scan code set 1 → ASCII tables (US QWERTY)
-//
-// Index = scan code (make code only, release codes have bit 7 set).
-// 0 = no translation (modifier, unmapped, etc.)
-// ---------------------------------------------------------------------------
+void KbdLoadDefaultLayout()
+{
+    if (auto* vnode = VfsOpen("/etc/keyboard-layout", 0)) {
+        char value[8]{};
+        uint64_t offset = 0;
+        const int size = VfsRead(vnode, value, sizeof(value) - 1, &offset);
+        VfsClose(vnode);
+        if (size > 0) g_keyboardDefault = brook_keyboard_layout_parse(value, BROOK_KEYBOARD_US);
+    }
+    KbdSetLayout(g_keyboardDefault);
+}
 
-static const char g_scancodeToAscii_US[128] = {
-    /* 0x00 */ 0,
-    /* 0x01 Esc      */ 0x1B,
-    /* 0x02 1        */ '1',
-    /* 0x03 2        */ '2',
-    /* 0x04 3        */ '3',
-    /* 0x05 4        */ '4',
-    /* 0x06 5        */ '5',
-    /* 0x07 6        */ '6',
-    /* 0x08 7        */ '7',
-    /* 0x09 8        */ '8',
-    /* 0x0A 9        */ '9',
-    /* 0x0B 0        */ '0',
-    /* 0x0C -        */ '-',
-    /* 0x0D =        */ '=',
-    /* 0x0E Bksp     */ '\b',
-    /* 0x0F Tab      */ '\t',
-    /* 0x10 Q        */ 'q',
-    /* 0x11 W        */ 'w',
-    /* 0x12 E        */ 'e',
-    /* 0x13 R        */ 'r',
-    /* 0x14 T        */ 't',
-    /* 0x15 Y        */ 'y',
-    /* 0x16 U        */ 'u',
-    /* 0x17 I        */ 'i',
-    /* 0x18 O        */ 'o',
-    /* 0x19 P        */ 'p',
-    /* 0x1A [        */ '[',
-    /* 0x1B ]        */ ']',
-    /* 0x1C Enter    */ '\n',
-    /* 0x1D L-Ctrl   */ 0,
-    /* 0x1E A        */ 'a',
-    /* 0x1F S        */ 's',
-    /* 0x20 D        */ 'd',
-    /* 0x21 F        */ 'f',
-    /* 0x22 G        */ 'g',
-    /* 0x23 H        */ 'h',
-    /* 0x24 J        */ 'j',
-    /* 0x25 K        */ 'k',
-    /* 0x26 L        */ 'l',
-    /* 0x27 ;        */ ';',
-    /* 0x28 '        */ '\'',
-    /* 0x29 `        */ '`',
-    /* 0x2A L-Shift  */ 0,
-    /* 0x2B \        */ '\\',
-    /* 0x2C Z        */ 'z',
-    /* 0x2D X        */ 'x',
-    /* 0x2E C        */ 'c',
-    /* 0x2F V        */ 'v',
-    /* 0x30 B        */ 'b',
-    /* 0x31 N        */ 'n',
-    /* 0x32 M        */ 'm',
-    /* 0x33 ,        */ ',',
-    /* 0x34 .        */ '.',
-    /* 0x35 /        */ '/',
-    /* 0x36 R-Shift  */ 0,
-    /* 0x37 *        */ '*',
-    /* 0x38 L-Alt    */ 0,
-    /* 0x39 Space    */ ' ',
-    /* 0x3A Caps     */ 0,
-    /* 0x3B F1       */ 0,
-    /* 0x3C F2       */ 0,
-    /* 0x3D F3       */ 0,
-    /* 0x3E F4       */ 0,
-    /* 0x3F F5       */ 0,
-    /* 0x40 F6       */ 0,
-    /* 0x41 F7       */ 0,
-    /* 0x42 F8       */ 0,
-    /* 0x43 F9       */ 0,
-    /* 0x44 F10      */ 0,
-    /* 0x45 NumLk    */ 0,
-    /* 0x46 ScrlLk   */ 0,
-    /* 0x47 KP7      */ '7',
-    /* 0x48 KP8 / Up */ '8',
-    /* 0x49 KP9      */ '9',
-    /* 0x4A KP-      */ '-',
-    /* 0x4B KP4      */ '4',
-    /* 0x4C KP5      */ '5',
-    /* 0x4D KP6      */ '6',
-    /* 0x4E KP+      */ '+',
-    /* 0x4F KP1      */ '1',
-    /* 0x50 KP2/Dn   */ '2',
-    /* 0x51 KP3      */ '3',
-    /* 0x52 KP0      */ '0',
-    /* 0x53 KP.      */ '.',
-    /* 0x54          */ 0,
-    /* 0x55          */ 0,
-    /* 0x56          */ 0,
-    /* 0x57 F11      */ 0,
-    /* 0x58 F12      */ 0,
-    /* 0x59–0x7F     */ 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-};
-
-static const char g_scancodeToAsciiShift_US[128] = {
-    /* 0x00 */ 0,
-    /* 0x01 Esc */ 0x1B,
-    /* 0x02 1 */ '!',
-    /* 0x03 2 */ '@',
-    /* 0x04 3 */ '#',
-    /* 0x05 4 */ '$',
-    /* 0x06 5 */ '%',
-    /* 0x07 6 */ '^',
-    /* 0x08 7 */ '&',
-    /* 0x09 8 */ '*',
-    /* 0x0A 9 */ '(',
-    /* 0x0B 0 */ ')',
-    /* 0x0C - */ '_',
-    /* 0x0D = */ '+',
-    /* 0x0E Bksp */ '\b',
-    /* 0x0F Tab  */ '\t',
-    /* 0x10 */ 'Q',
-    /* 0x11 */ 'W',
-    /* 0x12 */ 'E',
-    /* 0x13 */ 'R',
-    /* 0x14 */ 'T',
-    /* 0x15 */ 'Y',
-    /* 0x16 */ 'U',
-    /* 0x17 */ 'I',
-    /* 0x18 */ 'O',
-    /* 0x19 */ 'P',
-    /* 0x1A */ '{',
-    /* 0x1B */ '}',
-    /* 0x1C */ '\n',
-    /* 0x1D */ 0,
-    /* 0x1E */ 'A',
-    /* 0x1F */ 'S',
-    /* 0x20 */ 'D',
-    /* 0x21 */ 'F',
-    /* 0x22 */ 'G',
-    /* 0x23 */ 'H',
-    /* 0x24 */ 'J',
-    /* 0x25 */ 'K',
-    /* 0x26 */ 'L',
-    /* 0x27 */ ':',
-    /* 0x28 */ '"',
-    /* 0x29 */ '~',
-    /* 0x2A */ 0,
-    /* 0x2B */ '|',
-    /* 0x2C */ 'Z',
-    /* 0x2D */ 'X',
-    /* 0x2E */ 'C',
-    /* 0x2F */ 'V',
-    /* 0x30 */ 'B',
-    /* 0x31 */ 'N',
-    /* 0x32 */ 'M',
-    /* 0x33 */ '<',
-    /* 0x34 */ '>',
-    /* 0x35 */ '?',
-    /* 0x36 */ 0,
-    /* 0x37 */ '*',
-    /* 0x38 */ 0,
-    /* 0x39 */ ' ',
-    /* 0x3A–0x7F */ 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-};
-
-// ---------------------------------------------------------------------------
-// Scan code set 1 → ASCII tables (UK ISO)
-//
-// Differences from US:
-//   0x03 Shift+2 = "  (US: @)
-//   0x04 Shift+3 = #  (UK: £, but not ASCII — fallback to #)
-//   0x28 '/@     unshifted = '  shifted = @ (US: '/" )
-//   0x2B #/~     unshifted = #  shifted = ~ (US: \/| )
-//   0x29 `/¬     shifted stays ~ (¬ is not ASCII)
-//   0x56 ISO key  unshifted = \  shifted = | (absent on US ANSI)
-// ---------------------------------------------------------------------------
-
-static const char g_scancodeToAscii_UK[128] = {
-    /* 0x00 */ 0,
-    /* 0x01 Esc      */ 0x1B,
-    /* 0x02 1        */ '1',
-    /* 0x03 2        */ '2',
-    /* 0x04 3        */ '3',
-    /* 0x05 4        */ '4',
-    /* 0x06 5        */ '5',
-    /* 0x07 6        */ '6',
-    /* 0x08 7        */ '7',
-    /* 0x09 8        */ '8',
-    /* 0x0A 9        */ '9',
-    /* 0x0B 0        */ '0',
-    /* 0x0C -        */ '-',
-    /* 0x0D =        */ '=',
-    /* 0x0E Bksp     */ '\b',
-    /* 0x0F Tab      */ '\t',
-    /* 0x10 Q        */ 'q',
-    /* 0x11 W        */ 'w',
-    /* 0x12 E        */ 'e',
-    /* 0x13 R        */ 'r',
-    /* 0x14 T        */ 't',
-    /* 0x15 Y        */ 'y',
-    /* 0x16 U        */ 'u',
-    /* 0x17 I        */ 'i',
-    /* 0x18 O        */ 'o',
-    /* 0x19 P        */ 'p',
-    /* 0x1A [        */ '[',
-    /* 0x1B ]        */ ']',
-    /* 0x1C Enter    */ '\n',
-    /* 0x1D L-Ctrl   */ 0,
-    /* 0x1E A        */ 'a',
-    /* 0x1F S        */ 's',
-    /* 0x20 D        */ 'd',
-    /* 0x21 F        */ 'f',
-    /* 0x22 G        */ 'g',
-    /* 0x23 H        */ 'h',
-    /* 0x24 J        */ 'j',
-    /* 0x25 K        */ 'k',
-    /* 0x26 L        */ 'l',
-    /* 0x27 ;        */ ';',
-    /* 0x28 '        */ '\'',
-    /* 0x29 `        */ '`',
-    /* 0x2A L-Shift  */ 0,
-    /* 0x2B #        */ '#',
-    /* 0x2C Z        */ 'z',
-    /* 0x2D X        */ 'x',
-    /* 0x2E C        */ 'c',
-    /* 0x2F V        */ 'v',
-    /* 0x30 B        */ 'b',
-    /* 0x31 N        */ 'n',
-    /* 0x32 M        */ 'm',
-    /* 0x33 ,        */ ',',
-    /* 0x34 .        */ '.',
-    /* 0x35 /        */ '/',
-    /* 0x36 R-Shift  */ 0,
-    /* 0x37 *        */ '*',
-    /* 0x38 L-Alt    */ 0,
-    /* 0x39 Space    */ ' ',
-    /* 0x3A Caps     */ 0,
-    /* 0x3B F1       */ 0,
-    /* 0x3C F2       */ 0,
-    /* 0x3D F3       */ 0,
-    /* 0x3E F4       */ 0,
-    /* 0x3F F5       */ 0,
-    /* 0x40 F6       */ 0,
-    /* 0x41 F7       */ 0,
-    /* 0x42 F8       */ 0,
-    /* 0x43 F9       */ 0,
-    /* 0x44 F10      */ 0,
-    /* 0x45 NumLk    */ 0,
-    /* 0x46 ScrlLk   */ 0,
-    /* 0x47 KP7      */ '7',
-    /* 0x48 KP8 / Up */ '8',
-    /* 0x49 KP9      */ '9',
-    /* 0x4A KP-      */ '-',
-    /* 0x4B KP4      */ '4',
-    /* 0x4C KP5      */ '5',
-    /* 0x4D KP6      */ '6',
-    /* 0x4E KP+      */ '+',
-    /* 0x4F KP1      */ '1',
-    /* 0x50 KP2/Dn   */ '2',
-    /* 0x51 KP3      */ '3',
-    /* 0x52 KP0      */ '0',
-    /* 0x53 KP.      */ '.',
-    /* 0x54          */ 0,
-    /* 0x55          */ 0,
-    /* 0x56 ISO \    */ '\\',
-    /* 0x57 F11      */ 0,
-    /* 0x58 F12      */ 0,
-    /* 0x59–0x7F     */ 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-};
-
-static const char g_scancodeToAsciiShift_UK[128] = {
-    /* 0x00 */ 0,
-    /* 0x01 Esc */ 0x1B,
-    /* 0x02 1 */ '!',
-    /* 0x03 2 */ '"',
-    /* 0x04 3 */ '#',   // UK: £ (not ASCII, fallback to #)
-    /* 0x05 4 */ '$',
-    /* 0x06 5 */ '%',
-    /* 0x07 6 */ '^',
-    /* 0x08 7 */ '&',
-    /* 0x09 8 */ '*',
-    /* 0x0A 9 */ '(',
-    /* 0x0B 0 */ ')',
-    /* 0x0C - */ '_',
-    /* 0x0D = */ '+',
-    /* 0x0E Bksp */ '\b',
-    /* 0x0F Tab  */ '\t',
-    /* 0x10 */ 'Q',
-    /* 0x11 */ 'W',
-    /* 0x12 */ 'E',
-    /* 0x13 */ 'R',
-    /* 0x14 */ 'T',
-    /* 0x15 */ 'Y',
-    /* 0x16 */ 'U',
-    /* 0x17 */ 'I',
-    /* 0x18 */ 'O',
-    /* 0x19 */ 'P',
-    /* 0x1A */ '{',
-    /* 0x1B */ '}',
-    /* 0x1C */ '\n',
-    /* 0x1D */ 0,
-    /* 0x1E */ 'A',
-    /* 0x1F */ 'S',
-    /* 0x20 */ 'D',
-    /* 0x21 */ 'F',
-    /* 0x22 */ 'G',
-    /* 0x23 */ 'H',
-    /* 0x24 */ 'J',
-    /* 0x25 */ 'K',
-    /* 0x26 */ 'L',
-    /* 0x27 */ ':',
-    /* 0x28 ' */ '@',
-    /* 0x29 ` */ '~',
-    /* 0x2A */ 0,
-    /* 0x2B # */ '~',
-    /* 0x2C */ 'Z',
-    /* 0x2D */ 'X',
-    /* 0x2E */ 'C',
-    /* 0x2F */ 'V',
-    /* 0x30 */ 'B',
-    /* 0x31 */ 'N',
-    /* 0x32 */ 'M',
-    /* 0x33 */ '<',
-    /* 0x34 */ '>',
-    /* 0x35 */ '?',
-    /* 0x36 */ 0,
-    /* 0x37 */ '*',
-    /* 0x38 */ 0,
-    /* 0x39 */ ' ',
-    /* 0x3A Caps */ 0,
-    /* 0x3B–0x55 */ 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    /* 0x56 ISO | */ '|',
-    /* 0x57 F11 */ 0,
-    /* 0x58 F12 */ 0,
-    /* 0x59–0x7F */ 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-};
+extern "C" uint16_t KbdTranslateKey(uint8_t scan, uint8_t modifiers)
+{
+    return KeyboardCodepoint(KbdLayout(), scan, modifiers);
+}
 
 // ---------------------------------------------------------------------------
 // Ring buffer (64 chars) — written by ISR, read by KbdGetChar/KbdPeekChar.
@@ -393,6 +77,7 @@ static char BufPop()
 static volatile bool g_shiftHeld = false;
 static volatile bool g_ctrlHeld  = false;
 static volatile bool g_altHeld   = false;
+static volatile bool g_altGrHeld = false;
 static volatile bool g_superHeld = false;
 static volatile bool g_capsLock  = false;
 static volatile bool g_e0Prefix  = false; // E0-prefixed extended key pending
@@ -517,9 +202,9 @@ extern "C" void KbdIrqHandlerInner(void)
             ApicSendEoi();
             return;
         case 0x38: // R-Alt
-            g_altHeld = !release;
-            ApicSendEoi();
-            return;
+            g_altGrHeld = !release;
+            key = 100; // evdev KEY_RIGHTALT
+            break;
         case 0x5B: // Left Super (GUI)
         case 0x5C: // Right Super (GUI)
             // Published (not just tracked) so the desktop can act on a tap.
@@ -551,62 +236,22 @@ extern "C" void KbdIrqHandlerInner(void)
     uint8_t mods = 0;
     if (g_shiftHeld) mods |= INPUT_MOD_LSHIFT;
     if (g_ctrlHeld)  mods |= INPUT_MOD_CTRL;
-    if (g_altHeld)   mods |= INPUT_MOD_ALT;
+    if (g_altHeld || (g_altGrHeld && KbdLayout() == BROOK_KEYBOARD_US)) mods |= INPUT_MOD_ALT;
+    if (g_altGrHeld) mods |= INPUT_MOD_ALTGR;
     if (g_superHeld) mods |= INPUT_MOD_SUPER;
     if (g_capsLock)  mods |= INPUT_MOD_CAPSLOCK;
 
-    // Push raw scan code event to input subsystem (for userspace consumers like DOOM).
-    // All keys (including modifiers) and both press/release are forwarded.
-    {
-        InputEvent ev{};
-        ev.type = release ? InputEventType::KeyRelease : InputEventType::KeyPress;
-        ev.scanCode = key;
-        ev.modifiers = mods;
-
-        // Select layout tables
-        const char* tblNormal = (g_kbdLayout == KbdLayout::UK) ? g_scancodeToAscii_UK : g_scancodeToAscii_US;
-        const char* tblShift  = (g_kbdLayout == KbdLayout::UK) ? g_scancodeToAsciiShift_UK : g_scancodeToAsciiShift_US;
-
-        // Translate to ASCII for press events on non-modifier keys.
-        ev.ascii = 0;
-        if (!release && key < 128 && !isExtended)
-        {
-            bool shifted = g_shiftHeld ^ g_capsLock;
-            if (g_capsLock && !g_shiftHeld)
-            {
-                char c = tblShift[key];
-                ev.ascii = (c >= 'A' && c <= 'Z') ? c : tblNormal[key];
-            }
-            else
-            {
-                ev.ascii = shifted ? tblShift[key] : tblNormal[key];
-            }
-        }
-        InputDevicePush(&g_kbdInputDev, ev);
-
-        // Wake any process blocked waiting for input events.
-        InputWakeWaiters();
+    InputEvent ev{};
+    ev.type = release ? InputEventType::KeyRelease : InputEventType::KeyPress;
+    ev.scanCode = key;
+    ev.modifiers = mods;
+    if (!release && !isExtended) {
+        ev.textCodepoint = KbdTranslateKey(key, mods);
+        if (ev.textCodepoint < 128) ev.ascii = char(ev.textCodepoint);
+        KbdPushCodepoint(ev.textCodepoint);
     }
-
-    // Also push ASCII to the legacy ring buffer (for kernel shell / KbdGetChar).
-    if (!release && key < 128 && !isExtended)
-    {
-        const char* tblNormal = (g_kbdLayout == KbdLayout::UK) ? g_scancodeToAscii_UK : g_scancodeToAscii_US;
-        const char* tblShift  = (g_kbdLayout == KbdLayout::UK) ? g_scancodeToAsciiShift_UK : g_scancodeToAsciiShift_US;
-
-        bool shifted = g_shiftHeld ^ g_capsLock;
-        char c;
-        if (g_capsLock && !g_shiftHeld)
-        {
-            c = tblShift[key];
-            if (c < 'A' || c > 'Z') c = tblNormal[key];
-        }
-        else
-        {
-            c = shifted ? tblShift[key] : tblNormal[key];
-        }
-        if (c) BufPush(c);
-    }
+    InputDevicePush(&g_kbdInputDev, ev);
+    InputWakeWaiters();
 
     // Send EOI to LAPIC.
     ApicSendEoi();
@@ -698,6 +343,13 @@ char KbdGetChar()
 {
     while (BufEmpty()) { __asm__ volatile("pause"); }
     return BufPop();
+}
+
+extern "C" void KbdPushCodepoint(uint16_t cp)
+{
+    char bytes[3];
+    const unsigned count = KeyboardUtf8(cp, bytes);
+    for (unsigned i = 0; i < count; ++i) KbdPushChar(bytes[i]);
 }
 
 void KbdPushChar(char c)

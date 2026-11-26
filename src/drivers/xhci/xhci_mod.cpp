@@ -96,10 +96,15 @@ MODULE_IMPORT_SYMBOL(IoApicUnregisterHandler);
 MODULE_IMPORT_SYMBOL(ApicGetId);
 MODULE_IMPORT_SYMBOL(IdtInstallHandler);
 MODULE_IMPORT_SYMBOL(InputRegister);
+MODULE_IMPORT_SYMBOL(InputMarkPointerIngress);
+extern "C" void BootTimingUsbPointer(bool, uint32_t, const char*, uint16_t, uint16_t);
+MODULE_IMPORT_SYMBOL(BootTimingUsbPointer);
 MODULE_IMPORT_SYMBOL(InputWakeWaiters);
 MODULE_IMPORT_SYMBOL(CompositorWake);
 MODULE_IMPORT_SYMBOL(InputNextSequence);
-MODULE_IMPORT_SYMBOL(KbdPushChar);
+MODULE_IMPORT_SYMBOL(KbdPushCodepoint);
+MODULE_IMPORT_SYMBOL(KbdTranslateKey);
+MODULE_IMPORT_SYMBOL(KbdLayout);
 MODULE_IMPORT_SYMBOL(kmalloc);
 MODULE_IMPORT_SYMBOL(kfree);
 MODULE_IMPORT_SYMBOL(PmmFreePage);
@@ -1930,29 +1935,6 @@ static InputDeviceOps g_usbKbdOps = { "usb_kbd", nullptr };
 
 // Track previous report for key up/down detection
 
-// PS/2 scancode set 1 → ASCII (US layout, unshifted)
-// Matches keyboard.cpp g_scancodeToAscii_US for the common range.
-static const char g_sc1ToAscii[128] = {
-    0,0x1B,'1','2','3','4','5','6','7','8','9','0','-','=','\b','\t',  // 0x00
-    'q','w','e','r','t','y','u','i','o','p','[',']','\n',0,            // 0x10
-    'a','s','d','f','g','h','j','k','l',';','\'','`',0,'\\',           // 0x1E
-    'z','x','c','v','b','n','m',',','.','/',0,'*',0,' ',               // 0x2C
-    0,0,0,0,0,0,0,0,0,0,0,0,                                           // 0x3A (F1-F10,NumLk,ScrLk)
-    '7','8','9','-','4','5','6','+','1','2','3','0','.',                // 0x47 (KP)
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0            // 0x54-0x7F
-};
-
-// PS/2 scancode set 1 → ASCII (US layout, shifted)
-static const char g_sc1ToAsciiShift[128] = {
-    0,0x1B,'!','@','#','$','%','^','&','*','(',')','_','+','\b','\t',  // 0x00
-    'Q','W','E','R','T','Y','U','I','O','P','{','}','\n',0,            // 0x10
-    'A','S','D','F','G','H','J','K','L',':','"','~',0,'|',             // 0x1E
-    'Z','X','C','V','B','N','M','<','>','?',0,'*',0,' ',               // 0x2C
-    0,0,0,0,0,0,0,0,0,0,0,0,                                           // 0x3A
-    '7','8','9','-','4','5','6','+','1','2','3','0','.',                // 0x47
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0            // 0x54-0x7F
-};
-
 // Key presses seen (any USB keyboard) and the latest scancodes, reported
 // from the hotplug worker so typing is visible on the console.
 static volatile uint32_t g_keyPresses = 0;
@@ -1968,23 +1950,12 @@ static void XhciPushKey(uint8_t scancode, bool pressed, uint8_t modifiers)
     ev.scanCode = scancode;
     ev.modifiers = modifiers;
 
-    // Translate scancode → ASCII so the compositor/terminal can use it
-    ev.ascii = 0;
-    if (pressed && scancode < 128) {
-        bool shifted = (modifiers & INPUT_MOD_SHIFT) != 0;
-        const char base = g_sc1ToAscii[scancode];
-        if ((modifiers & INPUT_MOD_CAPSLOCK) && base >= 'a' && base <= 'z')
-            shifted = !shifted;
-        const char c = shifted ? g_sc1ToAsciiShift[scancode] : base;
-        ev.ascii = static_cast<uint8_t>(c);
+    if (pressed) {
+        ev.textCodepoint = KbdTranslateKey(scancode, modifiers);
+        if (ev.textCodepoint < 128) ev.ascii = char(ev.textCodepoint);
+        KbdPushCodepoint(ev.textCodepoint);
     }
-
     InputDevicePush(&g_usbKbdDev, ev);
-
-    // Also push to the legacy KbdGetChar ring buffer so the kernel shell
-    // (which uses KbdGetChar, not InputPollEvent) receives USB keyboard input.
-    if (pressed && ev.ascii != 0)
-        KbdPushChar(static_cast<char>(ev.ascii));
 }
 
 static UsbBootKeyboard g_bootKeyboard;
@@ -2049,7 +2020,7 @@ static void XhciDrainController(XhciController& ctrl,bool& wakeNetwork)
                     const uint32_t bytes=residue<=fn.length?fn.length-residue:0;
                     if(!which && bytes>=3) {
                         for(uint32_t i=bytes;i<8;++i)fn.report[i]=0;
-                        g_bootKeyboard.Update(fn.report,fn.previous,XhciPushKey);
+                        g_bootKeyboard.Update(fn.report,fn.previous,XhciPushKey,KbdLayout());
                         wakeInput=true;
                     } else if(which && bytes>=3) {
                         if(bytes<4)fn.report[3]=0;
@@ -2170,7 +2141,7 @@ static void XhciEndHid(XhciHidFn& fn, bool keyboard)
     if (!fn.active) return;
     fn.active = false;
     const uint8_t empty[8]{};
-    if (keyboard) g_bootKeyboard.Update(empty,fn.previous,XhciPushKey);
+    if (keyboard) g_bootKeyboard.Update(empty,fn.previous,XhciPushKey,KbdLayout());
     else {
         XhciProcessMouseReport(empty,fn);
         MouseSetUsbAvailable(--g_activeUsbMice != 0);
@@ -3992,7 +3963,13 @@ static int XhciEnumerate(XhciController& ctrl, int parent, uint8_t port, uint32_
             dev.vendorId, dev.productId, XhciDeviceKind(dev), dev.slotId);
 
     if (dev.isKeyboard && !XhciStartHid(ctrl, dev, dev.kbd, true)) dev.note = "keyboard setup failed";
-    if (dev.isMouse && !XhciStartHid(ctrl, dev, dev.mouse, false)) dev.note = "mouse setup failed";
+    if (dev.isMouse) {
+        BootTimingUsbPointer(false, ctrl.index, path, dev.vendorId, dev.productId);
+        if (XhciStartHid(ctrl, dev, dev.mouse, false))
+            BootTimingUsbPointer(true, ctrl.index, path, dev.vendorId, dev.productId);
+        else
+            dev.note = "mouse setup failed";
+    }
     if (dev.ecm.value && !XhciInitEcm(ctrl, dev)) dev.note = "ECM setup failed";
     if(dev.isMassStorage && !XhciInitMassStorage(ctrl,dev,index))dev.note="storage setup failed";
     if (dev.isHub && XhciHubSetup(ctrl, index)) XhciHubScan(ctrl, index, true);

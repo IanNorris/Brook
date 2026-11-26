@@ -164,7 +164,20 @@ void DisplayRegisterCursor(const DisplayCursorOps* ops)
 bool DisplayPrepareCursor(const CursorImage* image, int32_t x, int32_t y)
 {
     const auto* ops = __atomic_load_n(&g_cursorOps, __ATOMIC_ACQUIRE);
-    return ops && ops->display == DisplayGetActive() && ops->Prepare(image, x, y);
+    if (!ops || ops->display != DisplayGetActive()) return false;
+    if (!image || image->width > HardwareCursorCapacity || image->height > HardwareCursorCapacity) {
+        ops->Prepare(nullptr, x, y); // retire any earlier hardware cursor
+        return false;
+    }
+    HardwareCursorImage packed;
+    packed.width = image->width;
+    packed.height = image->height;
+    packed.hotX = image->hotX;
+    packed.hotY = image->hotY;
+    for (uint32_t row = 0; row < packed.height; ++row)
+        __builtin_memcpy(packed.pixels + row * HardwareCursorCapacity,
+                         image->pixels + row * CursorCapacity, packed.width * sizeof(uint32_t));
+    return ops->Prepare(&packed, x, y);
 }
 
 void DisplayCommitCursor()

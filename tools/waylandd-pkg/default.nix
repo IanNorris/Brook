@@ -32,6 +32,7 @@ stdenv.mkDerivation {
     cp ${../../src/shared/dmabuf_layout.h} "$sourceRoot/dmabuf-layout.h"
     cp ${../../src/shared/brook_caption_strip.h} "$sourceRoot/brook-caption-strip.h"
     cp ${../../src/shared/wm_input_abi.h} "$sourceRoot/wm-input-abi.h"
+    cp ${../../src/shared/input_preferences.h} "$sourceRoot/input_preferences.h"
     cp ${../../src/shared/wm_window_state.h} "$sourceRoot/wm-window-state.h"
     cp ${../../src/kernel/src/gpu_scene_abi.h} "$sourceRoot/gpu-scene-abi.h"
     cp ${../../src/shared/gpu_buffer_abi.h} "$sourceRoot/gpu_buffer_abi.h"

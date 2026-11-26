@@ -1,15 +1,20 @@
 #pragma once
 #include <stdint.h>
 #include "../../shared/brook_theme.h"
+#include "../../shared/input_preferences.h"
 #include "cursor_shapes.h"
 
 namespace brook {
-constexpr uint32_t CursorCapacity = 64;
-struct CursorImage {
+constexpr uint32_t CursorCapacity = BROOK_CURSOR_PHYSICAL_MAX;
+constexpr uint32_t HardwareCursorCapacity = 64;
+template<uint32_t Side>
+struct CursorImageStorage {
     uint32_t width = 12, height = 16;
     int32_t hotX = 0, hotY = 0;
-    uint32_t pixels[CursorCapacity * CursorCapacity]{};
+    uint32_t pixels[Side * Side]{};
 };
+using CursorImage = CursorImageStorage<CursorCapacity>;
+using HardwareCursorImage = CursorImageStorage<HardwareCursorCapacity>;
 
 inline bool CursorPixelsHaveAlpha(const uint32_t* pixels, uint32_t width, uint32_t height)
 {
@@ -79,11 +84,19 @@ struct CursorOwnership {
     }
 };
 
+inline constexpr uint32_t CursorPreferencePercent(uint32_t desktopScale, uint32_t size)
+{
+    return (desktopScale * size + BROOK_CURSOR_SIZE_DEFAULT / 2) / BROOK_CURSOR_SIZE_DEFAULT;
+}
+
 // Scale only compositor-owned logical cursors. Client images are already in
 // physical pixels and must not pass through this a second time.
 inline void ScaleCursor(const CursorImage& source,CursorImage& frame,uint32_t percent)
 {
     if (!percent) percent=100;
+    const uint32_t side = source.width > source.height ? source.width : source.height;
+    if (side && uint64_t(side) * percent > CursorCapacity * 100)
+        percent = CursorCapacity * 100 / side;
     frame={};
     frame.width=(source.width*percent+99)/100;
     frame.height=(source.height*percent+99)/100;
@@ -98,15 +111,15 @@ inline void ScaleCursor(const CursorImage& source,CursorImage& frame,uint32_t pe
 
 // Compose into a separate frame: client cursor pixels/hotspot survive busy
 // animation and are restored verbatim when the last pending launch resolves.
-inline void ComposeCursor(const CursorImage& source, CursorImage& frame,
-                          bool busy, uint64_t nowMs, uint32_t accent)
+inline void AddCursorBusy(CursorImage& frame,uint64_t nowMs,uint32_t accent)
 {
-    frame = source;
-    if (!busy) return;
     constexpr int dx[8] = {0, 3, 4, 3, 0, -3, -4, -3};
     constexpr int dy[8] = {-4, -3, 0, 3, 4, 3, 0, -3};
-    const uint32_t cx = source.width + 4 < CursorCapacity - 6 ? source.width + 4 : CursorCapacity - 6;
-    const uint32_t cy = source.height / 2 + 4 < CursorCapacity - 6 ? source.height / 2 + 4 : CursorCapacity - 6;
+    // Keep the busy dots beside the image. An image already consuming the
+    // whole width cannot carry the indicator without covering its shape.
+    if (frame.width > CursorCapacity - 10) return;
+    const uint32_t cx = frame.width + 4;
+    const uint32_t cy = frame.height / 2 + 4 < CursorCapacity - 6 ? frame.height / 2 + 4 : CursorCapacity - 6;
     if (frame.width < cx + 6) frame.width = cx + 6;
     if (frame.height < cy + 6) frame.height = cy + 6;
     const unsigned phase = (nowMs / 100) % 8;
@@ -118,5 +131,11 @@ inline void ComposeCursor(const CursorImage& source, CursorImage& frame,
             for (uint32_t xx = 0; xx < 2; ++xx)
                 frame.pixels[(y + yy) * CursorCapacity + x + xx] = color;
     }
+}
+inline void ComposeCursor(const CursorImage& source,CursorImage& frame,
+                          bool busy,uint64_t nowMs,uint32_t accent)
+{
+    frame = source;
+    if (busy) AddCursorBusy(frame, nowMs, accent);
 }
 }

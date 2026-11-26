@@ -4,7 +4,7 @@
 
 namespace brook::svga {
 
-constexpr uint32_t CursorCommandWords = 8 + CursorCapacity * (CursorCapacity + CursorCapacity / 32);
+constexpr uint32_t CursorCommandWords = 8 + HardwareCursorCapacity * (HardwareCursorCapacity + HardwareCursorCapacity / 32);
 
 enum class CursorPacket { Invalid, Hidden, Image };
 
@@ -17,22 +17,22 @@ inline uint32_t PremultiplyCursorPixel(uint32_t pixel)
     return result;
 }
 
-inline bool CursorImageMatches(const CursorImage& a, const CursorImage& b)
+inline bool CursorImageMatches(const HardwareCursorImage& a, const HardwareCursorImage& b)
 {
     if (a.width != b.width || a.height != b.height || a.hotX != b.hotX || a.hotY != b.hotY)
         return false;
     for (uint32_t y = 0; y < a.height; ++y)
         for (uint32_t x = 0; x < a.width; ++x)
-            if (a.pixels[y * CursorCapacity + x] != b.pixels[y * CursorCapacity + x])
+            if (a.pixels[y * HardwareCursorCapacity + x] != b.pixels[y * HardwareCursorCapacity + x])
                 return false;
     return true;
 }
 
-inline CursorPacket EncodeCursor(const CursorImage& image, bool alpha, uint32_t* words,
+inline CursorPacket EncodeCursor(const HardwareCursorImage& image, bool alpha, uint32_t* words,
                                  uint32_t& count)
 {
-    if (!image.width || image.width > CursorCapacity || !image.height ||
-        image.height > CursorCapacity || image.hotX < 0 || image.hotY < 0 ||
+    if (!image.width || image.width > HardwareCursorCapacity || !image.height ||
+        image.height > HardwareCursorCapacity || image.hotX < 0 || image.hotY < 0 ||
         uint32_t(image.hotX) >= image.width || uint32_t(image.hotY) >= image.height)
         return CursorPacket::Invalid;
 
@@ -61,7 +61,7 @@ inline CursorPacket EncodeCursor(const CursorImage& image, bool alpha, uint32_t*
 
     for (uint32_t y = 0; y < image.height; ++y) {
         for (uint32_t x = 0; x < width; ++x) {
-            const uint32_t pixel = x < image.width ? image.pixels[y * CursorCapacity + x] : 0;
+            const uint32_t pixel = x < image.width ? image.pixels[y * HardwareCursorCapacity + x] : 0;
             if (alpha) {
                 words[count++] = PremultiplyCursorPixel(pixel);
             } else {

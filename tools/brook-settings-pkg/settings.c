@@ -12,6 +12,7 @@
 #include "brook_gtk_appearance.h"
 #include "brook_taskbar.h"
 #include "brook_pointer.h"
+#include "input_preferences.h"
 #include "brook_user_experience.h"
 
 static GtkWidget *scale_choice,*preview,*status;
@@ -29,6 +30,8 @@ static void slider_ignore_wheel(GtkWidget *slider){
 }
 static GtkWidget *pointer_slider,*pointer_status,*tap_check;
 static long pointer_speed=-1;
+static GtkWidget *keyboard_choice, *cursor_choice;
+static const unsigned cursor_sizes[] = {24, 32, 48, 64};
 static long touchpad_tap=-1;
 static uint32_t audio_control=BROOK_AUDIO_DEFAULT;
 static int audio_supported;
@@ -237,6 +240,10 @@ static int save_appearance(uint64_t theme,unsigned scale,uint32_t appearance,
     g_key_file_set_integer(settings,"Desktop","blur",brook_appearance_blur(appearance));
     g_key_file_set_integer(settings,"Desktop","taskbar_metrics",selected_metrics);
     if(pointer_speed>0)g_key_file_set_integer(settings,"Desktop","pointer_speed",(int)pointer_speed);
+    g_key_file_set_string(settings,"Desktop","keyboard_layout",
+                          brook_keyboard_layout_name(gtk_combo_box_get_active(GTK_COMBO_BOX(keyboard_choice))));
+    g_key_file_set_integer(settings,"Desktop","cursor_size",
+                           cursor_sizes[gtk_combo_box_get_active(GTK_COMBO_BOX(cursor_choice))]);
     if(touchpad_tap>=0)g_key_file_set_integer(settings,"Desktop","touchpad_tap",(int)touchpad_tap);
     if(audio_supported)g_key_file_set_integer(settings,"Audio","output",audio_control);
     g_key_file_set_boolean(settings,BROOK_EXPERIENCE_GROUP,BROOK_EXPERIENCE_DETAILS_KEY,pro_mode);
@@ -355,7 +362,7 @@ static void apply(GtkButton *button,gpointer unused) {
     }
     GError *error=NULL;
     if(applied && save_appearance(selected_theme,selected_scale,selected_appearance,pro_mode,&error)) {
-        gtk_label_set_text(GTK_LABEL(status),"Settings applied and saved.");
+        gtk_label_set_text(GTK_LABEL(status),"Settings saved. Keyboard layout and cursor size apply after restart.");
         printf("BROOK_SETTINGS_SAVED theme=%s mode=%s accent=%s scale=%u appearance=%u\n",brook_theme_key(sel_theme()),
                brook_mode_key(sel_mode()),brook_hue_key(sel_hue()),selected_scale,selected_appearance);fflush(stdout);return;
     }
@@ -568,6 +575,45 @@ int main(int argc,char **argv) {
     gtk_combo_box_set_active(GTK_COMBO_BOX(scale_choice),scale_index);
     gtk_box_pack_end(GTK_BOX(scale_row),scale_choice,FALSE,FALSE,0);
     g_signal_connect(scale_choice,"changed",G_CALLBACK(scale_changed),NULL);
+
+    GtkWidget *input = gtk_grid_new();
+    gtk_grid_set_column_spacing(GTK_GRID(input), 16);
+    gtk_grid_set_row_spacing(GTK_GRID(input), 8);
+    GtkWidget *keyboard_label = gtk_label_new("Keyboard layout");
+    GtkWidget *cursor_label = gtk_label_new("Cursor size");
+    gtk_widget_set_halign(keyboard_label, GTK_ALIGN_START);
+    gtk_widget_set_halign(cursor_label, GTK_ALIGN_START);
+    keyboard_choice = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(keyboard_choice), "English (US)");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(keyboard_choice), "English (UK)");
+    cursor_choice = gtk_combo_box_text_new();
+    for (unsigned i = 0; i < G_N_ELEMENTS(cursor_sizes); ++i) {
+        char size[16];
+        g_snprintf(size, sizeof(size), "%u", cursor_sizes[i]);
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(cursor_choice), size);
+    }
+    long layout = syscall(BROOK_SYS_INPUT_PREFERENCES,(long)BROOK_INPUT_PREF_KEYBOARD,0L,0L,0L,0L,0L);
+    long cursor_size = syscall(BROOK_SYS_INPUT_PREFERENCES,(long)BROOK_INPUT_PREF_CURSOR,0L,0L,0L,0L,0L);
+    GKeyFile *input_settings = g_key_file_new();
+    if (g_key_file_load_from_file(input_settings, settings_path, 0, NULL)) {
+        char *name = g_key_file_get_string(input_settings, "Desktop", "keyboard_layout", NULL);
+        if (name) layout = brook_keyboard_layout_parse(name, layout);
+        g_free(name);
+        const int saved_size = g_key_file_get_integer(input_settings, "Desktop", "cursor_size", NULL);
+        if (brook_cursor_size_valid(saved_size)) cursor_size = saved_size;
+    }
+    g_key_file_unref(input_settings);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(keyboard_choice), layout == BROOK_KEYBOARD_GB ? 1 : 0);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(cursor_choice), 0);
+    for (unsigned i = 0; i < G_N_ELEMENTS(cursor_sizes); ++i)
+        if (cursor_size == cursor_sizes[i]) gtk_combo_box_set_active(GTK_COMBO_BOX(cursor_choice), i);
+    gtk_widget_set_tooltip_text(keyboard_choice, "Applies when Brook restarts.");
+    gtk_widget_set_tooltip_text(cursor_choice, "Applies when Brook restarts.");
+    gtk_grid_attach(GTK_GRID(input), keyboard_label, 0, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(input), keyboard_choice, 1, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(input), cursor_label, 0, 1, 1, 1);
+    gtk_grid_attach(GTK_GRID(input), cursor_choice, 1, 1, 1, 1);
+    gtk_box_pack_start(GTK_BOX(box), input, FALSE, FALSE, 4);
 
     GtkWidget *metrics_panel=gtk_expander_new("Taskbar statistics");
     GtkWidget *metrics_grid=gtk_grid_new();gtk_grid_set_column_spacing(GTK_GRID(metrics_grid),12);gtk_grid_set_row_spacing(GTK_GRID(metrics_grid),6);

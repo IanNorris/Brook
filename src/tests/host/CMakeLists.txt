@@ -830,6 +830,7 @@ target_compile_options(test_shutdown_service_escalation PRIVATE "-iquote${BROOK_
 add_host_test(test_launch_feedback)
 target_compile_options(test_launch_feedback PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 
+add_host_test(test_input_preferences)
 add_host_test(test_cursor_composition)
 target_compile_options(test_cursor_composition PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 

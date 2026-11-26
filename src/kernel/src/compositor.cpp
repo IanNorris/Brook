@@ -2,6 +2,7 @@
 #include "chrome_material.h"
 #include "chrome_alpha.h"
 #include "keyboard.h"
+#include "keyboard_layout.h"
 #include "kprintf.h"
 #include "compositor_wake_sequence.h"
 #include "apic.h"
@@ -1859,7 +1860,6 @@ static CursorOwnership g_cursorOwnership;
 // ComposeCursor before ScaleCursor reads it.
 static CursorImage g_cursorBuiltinSource{0, 0};
 static bool g_cursorBuiltinReady = false;
-static CursorImage g_cursorLogicalFrame{0, 0};
 
 // Saved pixels under the cursor (for restore before re-blit)
 static uint32_t g_cursorSave[CURSOR_MAX * CURSOR_MAX];
@@ -1916,10 +1916,10 @@ static void CursorPrepareFrame(bool busy, uint64_t now)
         if (g_cursorShapeLoaded == shape) chosen = &g_cursorShapeSource;
     }
     const CursorImage& source = *chosen;
-    if(builtin && WmGetAppliedScale()!=100) {
-        ComposeCursor(source,g_cursorLogicalFrame,busy,now,WmCurrentPalette().borderActive);
-        ScaleCursor(g_cursorLogicalFrame,g_cursorFrame,WmGetAppliedScale());
-    } else ComposeCursor(source,g_cursorFrame,busy,now,WmCurrentPalette().borderActive);
+    const uint32_t cursorScale = CursorPreferencePercent(WmGetAppliedScale(), WmCursorSize());
+    if (builtin && cursorScale!=100) ScaleCursor(source,g_cursorFrame,cursorScale);
+    else g_cursorFrame=source;
+    if (busy) AddCursorBusy(g_cursorFrame,now,WmCurrentPalette().borderActive);
     SpinLockRelease(&g_cursorSourceLock);
 }
 static int32_t  g_cursorSaveW = 0;
@@ -2475,19 +2475,43 @@ static void PublishOverlayCursor(uint64_t now,bool visible)
     SpinLockRelease(&g_overlayCursorLock);
 }
 
-void CompositorOverlayCursor(BrookDesktopOverlayCursor& out,uint64_t knownSerial)
+template<class Recorder, uint32_t Side>
+static void ReadOverlayCursor(Recorder& out, uint64_t knownSerial)
 {
     int32_t mx=0,my=0;MouseGetPosition(&mx,&my);
     SpinLockAcquire(&g_overlayCursorLock);
     const CursorImage& image=g_overlayCursorImage;
-    const uint32_t w=image.width<CURSOR_MAX?image.width:CURSOR_MAX,h=image.height<CURSOR_MAX?image.height:CURSOR_MAX;
+    const uint32_t largest=image.width>image.height?image.width:image.height;
+    const uint32_t denominator=largest>Side?largest:Side;
+    const uint32_t w=(image.width*Side+denominator-1)/denominator;
+    const uint32_t h=(image.height*Side+denominator-1)/denominator;
     out.visible=g_overlayCursorSerial && g_overlayCursorVisible && w && h;
-    out.width=w;out.height=h;out.stride=CURSOR_MAX;
-    out.x=int32_t(int64_t(mx)-image.hotX);out.y=int32_t(int64_t(my)-image.hotY);
+    out.width=w;out.height=h;out.stride=Side;
+    out.x=int32_t(int64_t(mx)-int64_t(image.hotX)*Side/denominator);
+    out.y=int32_t(int64_t(my)-int64_t(image.hotY)*Side/denominator);
     out.serial=g_overlayCursorSerial;
-    if(knownSerial!=g_overlayCursorSerial)
-        __builtin_memcpy(out.pixels,image.pixels,sizeof(out.pixels));
+    if(knownSerial!=g_overlayCursorSerial) {
+        if constexpr (Side==CursorCapacity) {
+            __builtin_memcpy(out.pixels,image.pixels,sizeof(out.pixels));
+        } else {
+            memset(out.pixels,0,sizeof(out.pixels));
+            for(uint32_t row=0;row<h;++row)
+                for(uint32_t col=0;col<w;++col)
+                    out.pixels[row*Side+col]=image.pixels[(row*denominator/Side)*CursorCapacity+col*denominator/Side];
+        }
+    }
     SpinLockRelease(&g_overlayCursorLock);
+}
+
+void CompositorOverlayCursor(BrookDesktopOverlayCursor& out,uint64_t knownSerial)
+{
+    ReadOverlayCursor<BrookDesktopOverlayCursor,BROOK_DESKTOP_CURSOR_MAX>(out,knownSerial);
+}
+
+void CompositorOverlayCursor(BrookDesktopOverlayCursorLarge& out,uint64_t knownSerial)
+{
+    static_assert(CursorCapacity==BROOK_DESKTOP_CURSOR_LARGE_MAX);
+    ReadOverlayCursor<BrookDesktopOverlayCursorLarge,BROOK_DESKTOP_CURSOR_LARGE_MAX>(out,knownSerial);
 }
 
 // Runs only on the compositor thread, so taskbar/launcher state is sampled at
@@ -3135,10 +3159,20 @@ static void CompositorLoopWM(bool& clientFrame)
     const bool overlayCursor=MouseIsAvailable() && !WmPointerCaptureActive() &&
         __atomic_load_n(&g_defaultCursorVisible,__ATOMIC_ACQUIRE)!=0 &&
         CursorPixelsHaveAlpha(g_cursorFrame.pixels,g_cursorFrame.width,g_cursorFrame.height);
+    // This is the visible cursor supplied to the active display path.
+    // Capture its first eligibility transition, independently of first motion.
+#ifndef BROOK_HOST_TEST
+    static uint32_t cursorTrigger = 0;
+    if (overlayCursor)
+        BootTimingPointerMark(BootPointerEvent::Cursor, cursorTrigger | (rendererLeased ? 4u : 0u));
+    else if (!MouseIsAvailable()) cursorTrigger = 1;
+    else if (WmPointerCaptureActive() || !__atomic_load_n(&g_defaultCursorVisible, __ATOMIC_ACQUIRE)) cursorTrigger = 2;
+    else cursorTrigger = 3;
+#endif
     PublishOverlayCursor(now,overlayCursor);
 #if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
     BdwCursorUpdate(cursorLeaseOwner,overlayCursor,chromeMx-g_cursorFrame.hotX,
-        chromeMy-g_cursorFrame.hotY,g_cursorFrame.pixels,g_cursorFrame.width,g_cursorFrame.height);
+        chromeMy-g_cursorFrame.hotY,g_cursorFrame.pixels,g_cursorFrame.width,g_cursorFrame.height,CURSOR_MAX);
 #endif
     CaptureDesktopOverlay(shell,now,chromeMx,chromeMy,overlayCursor);
     CheckDesktopOverlay(now,shell);
@@ -3228,6 +3262,10 @@ static void CompositorInputWM()
     InputEvent ev{};
     while (InputPollEvent(&ev))
     {
+#ifndef BROOK_HOST_TEST
+        if (ev.type >= InputEventType::MouseMove)
+            BootTimingPointerMark(BootPointerEvent::Wm, static_cast<uint8_t>(ev.type));
+#endif
         const bool fineOnly = ev.type == InputEventType::MouseScroll && !InputHasScrollTicks(ev);
         const bool captured=WmRouteCapturedPointer(ev);
         CompositorReconcilePointerCapture();
@@ -3530,10 +3568,11 @@ static void CompositorInputWM()
             {
                 // Character input comes only from presses, even if a driver
                 // happens to include translated ASCII on a release event.
-                if (ev.type == InputEventType::KeyPress && ev.ascii != 0)
+                if (ev.type == InputEventType::KeyPress && (ev.ascii || ev.textCodepoint))
                 {
-                    char ch = ev.ascii;
-                    TerminalWriteInput(static_cast<int>(ti), &ch, 1);
+                    char bytes[3];
+                    const unsigned n = KeyboardUtf8(ev.ascii ? uint8_t(ev.ascii) : ev.textCodepoint, bytes);
+                    TerminalWriteInput(static_cast<int>(ti), bytes, n);
                 }
                 else if (ev.type == InputEventType::KeyPress)
                 {
@@ -5086,7 +5125,7 @@ static bool CompositorDrawManualPowerOff()
         DisplayPrepareCursor(nullptr, 0, 0);
         DisplayCommitCursor();
 #if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
-        BdwCursorUpdate(0, false, 0, 0, nullptr, 0, 0);
+        BdwCursorUpdate(0, false, 0, 0, nullptr, 0, 0, 0);
 #endif
         g_cursorVisible = false;
         auto* pixels = g_backBuffer ? g_backBuffer : const_cast<uint32_t*>(g_physFb);
@@ -5390,6 +5429,9 @@ static void CompositorLoop()
         __atomic_store_n(&g_desktopReadyTick,now?now:1,__ATOMIC_RELEASE);
         BootLogoFinish();SerialPrintf("BOOT: desktop presented in %lu ms\n",CompositorBootDurationMs());
     }
+#ifndef BROOK_HOST_TEST
+    BootTimingPointerFlush();
+#endif
     uint64_t loopEndTick = ApicTickCount();
     uint64_t loopMs = loopEndTick - loopStartTick;
     if(__atomic_load_n(&g_hardwareProbe,__ATOMIC_ACQUIRE)) {

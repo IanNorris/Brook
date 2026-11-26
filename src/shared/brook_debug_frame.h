@@ -133,4 +133,12 @@ struct BrookDesktopOverlayCursor {
     uint64_t serial;
     uint32_t pixels[BROOK_DESKTOP_CURSOR_MAX*BROOK_DESKTOP_CURSOR_MAX];
 };
+/* Op 8 also accepts this larger record, selected by its exact byte length. */
+enum { BROOK_DESKTOP_CURSOR_LARGE_MAX=128 };
+struct BrookDesktopOverlayCursorLarge {
+    uint32_t visible,width,height,stride;
+    int32_t x,y;
+    uint64_t serial;
+    uint32_t pixels[BROOK_DESKTOP_CURSOR_LARGE_MAX*BROOK_DESKTOP_CURSOR_LARGE_MAX];
+};
 #endif

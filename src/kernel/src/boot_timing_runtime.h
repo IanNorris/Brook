@@ -22,4 +22,12 @@ void BootTimingCaptureFirmware();
 void BootTimingDesktopReady(bool fallbackValid, uint64_t fallbackMs);
 // Null until BootTimingDesktopReady has run.
 const BootTimingSummary* BootTimingRead();
+
+enum class BootPointerEvent : uint8_t {
+    Ingress, Wm, Seat, Wayland, Cursor, Desktop, Count
+};
+void BootTimingPointerMark(BootPointerEvent event, uint32_t detail = 0);
+void BootTimingPointerFlush();
+extern "C" void BootTimingUsbPointer(bool bound, uint32_t controller,
+                                     const char* path, uint16_t vendor, uint16_t product);
 }

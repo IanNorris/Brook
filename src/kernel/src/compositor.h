@@ -174,6 +174,7 @@ uint64_t CompositorOverlayGeneration();
 // Latest compositor pointer image/visibility; position is sampled live.
 // Pixels are written only when knownSerial differs from the current serial.
 void CompositorOverlayCursor(struct ::BrookDesktopOverlayCursor& out,uint64_t knownSerial);
+void CompositorOverlayCursor(struct ::BrookDesktopOverlayCursorLarge& out,uint64_t knownSerial);
 DebugFrameSnapshot CompositorDebugFrameStatus(uint32_t token,uint64_t owner=0);
 int CompositorOverlayBands(uint32_t token,uint64_t owner,DesktopOverlayBands& bands);
 // Shell surface records of the same capture lease (overlay op 10).

@@ -87,7 +87,7 @@ struct Driver {
     bool cursorBypass3 = false, alphaCursor = false;
     bool cursorUploaded = false, cursorPending = false, cursorVisible = false;
     int32_t cursorX = 0, cursorY = 0, visibleX = 0, visibleY = 0;
-    CursorImage cursorImage{};
+    HardwareCursorImage cursorImage{};
     uint32_t cursorWords[svga::CursorCommandWords]{};
 };
 
@@ -259,7 +259,7 @@ void HideCursor()
     if (g.cursorVisible) SetCursorPosition(false, g.visibleX, g.visibleY);
 }
 
-bool PrepareCursor(const CursorImage* image, int32_t x, int32_t y)
+bool PrepareCursor(const HardwareCursorImage* image, int32_t x, int32_t y)
 {
     Lock();
     bool handled = false;

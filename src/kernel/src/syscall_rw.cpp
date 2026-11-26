@@ -1,3 +1,4 @@
+#include "keyboard_layout.h"
 // syscall_rw.cpp -- read/write family: read/write/readv/writev/pread64/pwrite64/sendfile.
 //
 // Split from syscall.cpp.
@@ -899,7 +900,7 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
             {
                 if (lineLen > 0)
                 {
-                    lineLen--;
+                    do { --lineLen; } while (lineLen && (uint8_t(lineBuf[lineLen]) & 0xc0) == 0x80);
                     brook::SerialLock(); brook::SerialPutChar('\b'); brook::SerialPutChar(' '); brook::SerialPutChar('\b'); brook::SerialUnlock();
                     TtyPutChar('\b'); TtyPutChar(' '); TtyPutChar('\b');
                 }
@@ -914,6 +915,21 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                     lineBuf[lineLen++] = '\t';
                     brook::SerialLock(); brook::SerialPutChar('\t'); brook::SerialUnlock();
                     TtyPutChar('\t');
+                }
+                continue;
+            }
+
+            if (ev.textCodepoint >= 128) {
+                char bytes[3];
+                const unsigned n = KeyboardUtf8(ev.textCodepoint, bytes);
+                if (n < LINE_BUF_MAX - lineLen) {
+                    brook::SerialLock();
+                    for (unsigned i = 0; i < n; ++i) {
+                        lineBuf[lineLen++] = bytes[i];
+                        brook::SerialPutChar(bytes[i]);
+                    }
+                    brook::SerialUnlock();
+                    TtyPutChar('?'); // The emergency TTY font is ASCII.
                 }
                 continue;
             }

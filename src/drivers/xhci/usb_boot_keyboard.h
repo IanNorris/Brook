@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../../kernel/src/input.h"
+#include "../../shared/input_preferences.h"
 
 namespace brook {
 
@@ -18,7 +19,7 @@ inline constexpr uint8_t UsbBootScanCode[128] = {
     119, SC_EXT_INSERT, SC_EXT_HOME, SC_EXT_PGUP, SC_EXT_DELETE, SC_EXT_END, SC_EXT_PGDN, SC_EXT_RIGHT, // 0x48-0x4F: Pause,Ins,Home,PgUp, Del,End,PgDn,Right
     SC_EXT_LEFT, SC_EXT_DOWN, SC_EXT_UP, 69,  98,  55,  74,  78,  // 0x50-0x57: Left,Down,Up,NumLk, KP/,KP*,KP-,KP+
     96,  79,  80,  81,  75,  76,  77,  71,  // 0x58-0x5F: KPEnt,KP1,KP2,KP3, KP4,KP5,KP6,KP7
-    72,  73,  82,  83,  0,   0,   0,   0,   // 0x60-0x67: KP8,KP9,KP0,KP., unused...
+    72,  73,  82,  83,  0x56,   0,   0,   0,   // 0x60-0x67: KP8,KP9,KP0,KP., unused...
     0,   0,   0,   0,   0,   0,   0,   0,   // 0x68-0x6F
     0,   0,   0,   0,   0,   0,   0,   0,   // 0x70-0x77
     0,   0,   0,   0,   0,   0,   0,   0,   // 0x78-0x7F
@@ -31,7 +32,7 @@ public:
     // Each interface supplies its last valid report. Aggregate held keys so
     // unplugging or releasing one keyboard cannot release another's keys.
     template<typename Emit>
-    void Update(const uint8_t* report, uint8_t* previous, Emit&& emit)
+    void Update(const uint8_t* report, uint8_t* previous, Emit&& emit, uint32_t layout = BROOK_KEYBOARD_US)
     {
         for (unsigned i = 2; i < 8; ++i)
             if (report[i] && report[i] < 4) return; // rollover or report error
@@ -45,20 +46,20 @@ public:
 
         for (unsigned bit = 0; bit < 8; ++bit)
             if (modifierChanged[bit])
-                emit(UsbBootModifierScans[bit], modifiers_[bit] != 0, Modifiers());
+                emit(UsbBootModifierScans[bit], modifiers_[bit] != 0, Modifiers(layout));
 
         for (unsigned i = 2; i < 8; ++i) {
             const uint8_t key = previous[i];
             if (Mapped(key) && !Contains(previous, key, i) && !Contains(report, key) &&
                 UpdateHeld(keys_[key], false))
-                emit(UsbBootScanCode[key], false, Modifiers());
+                emit(UsbBootScanCode[key], false, Modifiers(layout));
         }
         for (unsigned i = 2; i < 8; ++i) {
             const uint8_t key = report[i];
             if (Mapped(key) && !Contains(report, key, i) && !Contains(previous, key) &&
                 UpdateHeld(keys_[key], true)) {
                 if (key == 0x39) capsLock_ = !capsLock_;
-                emit(UsbBootScanCode[key], true, Modifiers());
+                emit(UsbBootScanCode[key], true, Modifiers(layout));
             }
         }
         for (unsigned i = 0; i < 8; ++i) previous[i] = report[i];
@@ -80,12 +81,13 @@ private:
         return count && --count == 0;
     }
 
-    uint8_t Modifiers() const
+    uint8_t Modifiers(uint32_t layout) const
     {
         return (modifiers_[1] ? INPUT_MOD_LSHIFT : 0) |
                (modifiers_[5] ? INPUT_MOD_RSHIFT : 0) |
                ((modifiers_[0] || modifiers_[4]) ? INPUT_MOD_CTRL : 0) |
-               ((modifiers_[2] || modifiers_[6]) ? INPUT_MOD_ALT : 0) |
+               ((modifiers_[2] || (modifiers_[6] && layout == BROOK_KEYBOARD_US)) ? INPUT_MOD_ALT : 0) |
+               (modifiers_[6] ? INPUT_MOD_ALTGR : 0) |
                ((modifiers_[3] || modifiers_[7]) ? INPUT_MOD_SUPER : 0) |
                (capsLock_ ? INPUT_MOD_CAPSLOCK : 0);
     }

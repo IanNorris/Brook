@@ -130,6 +130,9 @@ int main()
     // software layer even while the next hardware image is still pending.
     uint32_t fallbacks=0;
     uint32_t pixels[64*64]{};
+    uint32_t wide[128*2]{}, packed[64*2]{};
+    wide[128+1]=packed[64+1]=0xff112233;
+    assert(BdwCursorImageKey(wide,2,2,128)==BdwCursorImageKey(packed,2,2));
     assert(!BdwCursorImageKey(pixels,1,1));
     pixels[0]=0x00ffffff;
     assert(!BdwCursorImageKey(pixels,1,1));

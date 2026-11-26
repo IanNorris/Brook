@@ -209,6 +209,7 @@ def main():
                    help='LF-terminated allowlist of up to two lowercase Ed25519 public keys')
     p.add_argument('--source-date-epoch', help='explicit Unix timestamp for reproducible assembly metadata; '
                    'pass the desired SOURCE_DATE_EPOCH value here')
+    p.add_argument('--keyboard-layout', choices=('gb', 'us'), default='gb')
     p.add_argument('--allow-dirty', action='store_true', help='permit uncommitted changes (recorded)')
     p.add_argument('--ssd-trim', metavar='MARKER',
                    help='one-boot maintenance pair: write /etc/ssd-trim with this marker (e.g. "dry-run", '
@@ -332,6 +333,7 @@ def main():
     # Use only the explicit argument to override the current UTC time.
     provenance, assembly = build_provenance(commit, dirty, a.source_date_epoch)
     image = a.output / 'INITRD.IMG'
+    run(['mcopy', '-o', '-i', image, '-', '::/ETC/keyboard-layout'], input=(a.keyboard_layout + '\n').encode())
     run(['mcopy', '-o', '-i', image, '-', '::/ETC/build-provenance'], input=provenance)
     if subprocess.check_output(['mtype', '-i', str(image), '::/ETC/build-provenance']) != provenance:
         sys.exit('initrd build provenance readback mismatch')
@@ -369,6 +371,7 @@ def main():
         'kernel_options': options, 'kernel_console_hidden': not a.show_kernel_console, 'kernel_sha256': sha(a.output / 'kernel.elf'),
         'initrd_sha256': sha(a.output / 'INITRD.IMG'), 'source_initrd_sha256': SOURCE_INITRD_SHA,
         'initrd_assembly': assembly, 'packages': packages,
+        'keyboard_layout': a.keyboard_layout,
         'bulk_helper': {'source': 'tools/hardware_bulk.c', 'sha256': compiled_helpers['HWBULK.ELF']},
         'update_helpers': {name: {'source': 'tools/hardware_update.c', 'sha256': compiled_helpers[name]}
                            for name in ('HWUPDATE.ELF', 'HWUPSYS.ELF')},

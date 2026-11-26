@@ -124,6 +124,7 @@ static void pointer_relative_dispatch(struct brook_surface *s,struct brook_seat_
         // event without this boundary can be overwritten by the next packet.
         if(wl_resource_get_version(p->pointer)>=5)wl_pointer_send_frame(p->pointer);
         latency_input_sent(sc->client, LATENCY_MOTION);
+        pointer_timeline_delivered(s->wm_id, event->type);
     }
 }
 static void pointer_object_destroy_req(struct wl_client *c,struct wl_resource *r) { (void)c;wl_resource_destroy(r); }
