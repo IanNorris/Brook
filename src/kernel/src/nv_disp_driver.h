@@ -161,7 +161,11 @@ template<typename B> struct NvDisplayDriver{
         const uint32_t ch=ChidWndw(kDriverWindow[o]);
         l.raw(",\"get\":\"");l.hex(b->rd(RegGet(ch)));l.raw("\",\"put\":\"");l.hex(f[o].put);
         l.raw("\",\"status\":\"");l.hex(b->rd(RegChnStatus(ch)));l.raw("\",\"exc\":\"");l.hex(b->rd(RegExcept(ch)));
-        l.raw("\",\"arm_offset\":\"");l.hex(b->rd(RegArm(ch,c57e::SET_OFFSET0)));l.raw("\"}\n");b->emit(l.t);
+        l.raw("\",\"arm_offset\":\"");l.hex(b->rd(RegArm(ch,c57e::SET_OFFSET0)));
+        l.raw("\",\"arm_iso\":\"");l.hex(b->rd(RegArm(ch,c57e::SET_CONTEXT_DMA_ISO0)));
+        l.raw("\",\"arm_notifier\":\"");l.hex(b->rd(RegArm(ch,c57e::SET_CONTEXT_DMA_NOTIFIER)));
+        l.raw("\",\"front\":");l.dec(uint32_t(f[o].front));l.raw(",\"presents\":");l.dec(f[o].st.presents);
+        l.raw(",\"completes\":");l.dec(f[o].st.completes);l.raw("}\n");b->emit(l.t);
         if(o==0)(void)Down0();else(void)Down1();
         out[o]=OutState::Failed;
     }

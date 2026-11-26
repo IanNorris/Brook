@@ -1,5 +1,6 @@
 #include "ioapic_route_policy.h"
 #include "apic.h"
+#include "stall_watch.h"
 extern "C" void PlatformPowerResetWatchdogTick(uint64_t now);
 #include "boot_timing.h"
 #include "idt.h"
@@ -466,6 +467,7 @@ extern "C" void LapicTimerHandlerInner(uint64_t interruptedRip, uint64_t interru
     const auto peerProbe=TimerIrqArrivalsObserve(interruptedRip,interruptedCs);
     const auto timerProbe=TimerWakeTimingBegin(interruptedRip,interruptedCs);
     LapicWrite(LapicReg::EOI, 0);
+    brook::StallWatchTick(interruptedRip);
 
     // BRO-179: passive TLB-epoch flush. If the quarantine drainer has bumped the
     // epoch, this CPU does its full flush here (IF=1 safe point) and publishes,

@@ -442,6 +442,7 @@ add_executable(kernel
     src/acpi.cpp
     src/boot_timing.cpp
     src/apic.cpp
+    src/stall_watch.cpp
     src/tlb_test.cpp
     src/tty.cpp
     src/sync/kmutex.cpp
@@ -745,6 +746,7 @@ set_source_files_properties(
     src/vmware_clock.cpp
     src/tsc_clock.cpp
     src/apic.cpp
+    src/stall_watch.cpp
     src/tlb_test.cpp
     src/scheduler.cpp
     "${BROOK_ROOT}/src/modules/sched_rr.cpp"

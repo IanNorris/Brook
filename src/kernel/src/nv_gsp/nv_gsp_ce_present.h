@@ -22,6 +22,13 @@ struct CeStats {
     uint64_t frames = 0, rects = 0, bytes = 0, us_sum = 0, submits = 0, wait_us_sum = 0, waits_blocked = 0;
     uint32_t us_max = 0, remaps = 0, remap_us_max = 0, map_pages = 0, refused = 0, timeouts = 0;
 };
+// Snapshot of the last semaphore timeout. poll_gap_us = time since the previous poll of this
+// ticket (or since the kick): a large gap means the CPU did not look (CPU-side stall); a small
+// one with spin_us near the budget means the GPU did not finish.
+struct CeTimeout {
+    uint64_t at_us = 0, kick_age_us = 0, poll_gap_us = 0, spin_us = 0, job_bytes = 0;
+    uint32_t sem = 0, want = 0, polls = 0;
+};
 struct CePresent {
     M2Keep k;
     M2Inputs in;                    // the kept channel's sysmem pages (gpfifo, push, sem)
@@ -31,8 +38,10 @@ struct CePresent {
     uint32_t slot = 0;
     bool big = false;              // the current source mapping uses 2 MiB PTEs
     uint32_t inflight = 0;         // payload of the kicked, not yet seen, submission (0 = none)
-    uint64_t kick_us = 0;
+    uint64_t kick_us = 0, last_poll_us = 0, job_bytes = 0;
+    uint32_t polls = 0;
     CeStats st;
+    CeTimeout last_timeout;
     const char* last_error = "";
 };
 
@@ -137,7 +146,7 @@ inline int CePresentKick(Bus& bus, const ChipOps& c, VramIo& vram, CePresent& cp
     if (!n) { *bytes_out = 0; return 0; }
     const uint32_t want = M2KeptKick(bus, c, vram, cp.k, cp.in, w, n, sync);
     if (!want) { cp.broken = true; cp.last_error = "kick"; return -1; }
-    cp.inflight = want; cp.kick_us = bus.now_us(); ++cp.st.submits;
+    cp.inflight = want; cp.kick_us = bus.now_us(); cp.last_poll_us = cp.kick_us; cp.polls = 0; cp.job_bytes = bytes; ++cp.st.submits;
     cp.st.bytes += bytes; *bytes_out = bytes; *ticket = want;
     return 1;
 }
@@ -158,7 +167,13 @@ inline int CePresentWait(Bus& bus, CePresent& cp, uint32_t ticket, uint32_t budg
             return 1;
         }
         const uint64_t now = bus.now_us();
+        const uint64_t gap = now - cp.last_poll_us;
+        cp.last_poll_us = now; ++cp.polls;
         if (now - cp.kick_us > kCeBudgetUs) {
+            CeTimeout& t = cp.last_timeout;
+            t.at_us = now; t.kick_age_us = now - cp.kick_us; t.poll_gap_us = gap; t.spin_us = now - t0;
+            t.job_bytes = cp.job_bytes; t.want = ticket; t.polls = cp.polls;
+            t.sem = __atomic_load_n(reinterpret_cast<const uint32_t*>(cp.in.sem.cpu), __ATOMIC_ACQUIRE);
             cp.last_error = "semaphore timeout"; ++cp.st.timeouts; cp.broken = true; cp.inflight = 0; return -1;
         }
         if (now - t0 >= budget_us) { cp.st.wait_us_sum += now - t0; return 0; }

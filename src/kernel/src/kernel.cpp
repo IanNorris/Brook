@@ -110,6 +110,7 @@ namespace brook { void LifecycleChannelConfigure(); void LifecycleChannelStart()
 #endif
 #include "boot_timing_runtime.h"
 #include "string.h"
+#include "stall_watch.h"
 
 // All kernel initialization and runtime — called by KernelMain after stack switch.
 __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootProtocol);
@@ -1326,6 +1327,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
         // RTX DP sink idle-off (gated by /etc/dp-idle-seconds or bridge command).
         brook::DpIdleStart();
+        brook::StallWatchStart();   // per-CPU timer stamps; dumps on a >500 ms watcher stall
 #if defined(BROOK_NV_DISPLAY)
         // RTX head-0 flip presentation (gated by /etc/nv-display). Not on a headless boot:
         // with no GOP nothing is lit and the display engine is left alone (no GSP autostart).

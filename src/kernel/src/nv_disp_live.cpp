@@ -87,7 +87,14 @@ struct LiveBackend{
     void fence(){__asm__ volatile("sfence":::"memory");}
     uint64_t nowUs(){return TscClockAvailable()?TscClockReadNs()/1000:ApicTickCount()*1000;}
     void relax(){__asm__ volatile("pause");}
-    void emit(const char* line){if(toSerial)SerialPuts(line);else DebugChannelSend(line);}
+    void emit(const char* line){
+        if(toSerial)SerialPuts(line);else DebugChannelSend(line);
+        // Driver failures also go to the kernel log (hw_logs): the debug channel copy is lost
+        // when nobody is attached (26 Nov head-0 freeze).
+        auto pre=[line](const char* p){return strncmp(line,p,strlen(p))==0;};
+        if(!toSerial&&(pre("{\"nv_driver\":\"flip-failed\"")||pre("{\"nv_driver\":\"up")||pre("{\"nv_disp\":\"aborted\"")||
+                       pre("{\"nv_driver\":\"fence")))KPuts(line);
+    }
     void hookQuiesce();
     bool step3Busy();
     bool step3Succeeded();
@@ -302,6 +309,9 @@ bool CeFinishLocked(uint32_t budgetUs){
 // top-left pixel in the compositor back buffer; `damageIn` is output-local.
 // nv-aux lock held, flip idle: copy what the back buffer `bb` lacks (its missed damage plus
 // the pending changes) and flip it. 1 = flipped, 0 = no free buffer (pending kept), -1 = dead.
+// Head-0 flip fence (26 Nov head-0 freeze: window 0 re-armed with a foreign ISO ctxdma during
+// the GSP bring-up). While set, head-0 damage is kept pending and no flip is submitted.
+volatile bool g_head0Fence=false;
 int FlipPendingLocked(uint32_t o,const uint32_t* src,uint32_t srcStride){
     auto& p=g_presenter[o];auto& f=g_driver.f[o];
     const int8_t bb=f.Back();
@@ -375,7 +385,7 @@ int PresentOutput(uint32_t o,const uint32_t* src,uint32_t srcStride,const Damage
     p.pending.AddAll(changed);
     if(p.pending.empty()&&!p.pending.full){++p.unchanged;SpinLockRelease(lock);NoteCpu(p,t0);return 0;}
     if(changed.empty()&&!changed.full)++p.unchanged;
-    if(f.state==nvdisp::FlipState::Armed){++p.deferred;SpinLockRelease(lock);NoteCpu(p,t0);return 1;}
+    if(f.state==nvdisp::FlipState::Armed||(o==0&&__atomic_load_n(&g_head0Fence,__ATOMIC_ACQUIRE))){++p.deferred;SpinLockRelease(lock);NoteCpu(p,t0);return 1;}
     const int r=FlipPendingLocked(o,src,srcStride);
     SpinLockRelease(lock);
     NoteCpu(p,t0);
@@ -491,6 +501,7 @@ uint32_t NvPrimaryPoll(){
         for(uint32_t o=0;o<2;++o){
             auto& p=g_presenter[o];
             if(!p.active||!g_driver.Live(o)||(p.pending.empty()&&!p.pending.full)||g_driver.f[o].state!=nvdisp::FlipState::Idle||p.ceInflight)continue;
+            if(o==0&&__atomic_load_n(&g_head0Fence,__ATOMIC_ACQUIRE))continue;
             uint32_t stride=0;const uint32_t* src=CompositorPresentSource(&stride);
             const uint32_t x=o?uint32_t(__atomic_load_n(&g_head1Rect,__ATOMIC_ACQUIRE)&0xffff):0;
             if(!src||(o&&!x)||stride<x+p.width)continue;
@@ -749,6 +760,37 @@ bool NvDispHandle(const char* command){
 }
 // Desktop start (kernel.cpp, after the compositor thread): with /etc/nv-display = "1\n",
 // bring head-0 flips up in a short-lived thread and hand the compositor the presenter.
+NvHead0Arm NvDispHead0Arm(){
+    NvHead0Arm a{};
+    SpinLock* lock=NvAuxSharedLock();SpinLockAcquire(lock);
+    a.live=g_driver.Live(0);a.state=uint32_t(g_driver.f[0].state);
+    if(g_configured){
+        const uint32_t ch=nvdisp::ChidWndw(nvdisp::kDriverWindow[0]);
+        a.iso=g_backend.rd(nvdisp::RegArm(ch,nvdisp::c57e::SET_CONTEXT_DMA_ISO0));
+        a.offset=g_backend.rd(nvdisp::RegArm(ch,nvdisp::c57e::SET_OFFSET0));
+    }
+    SpinLockRelease(lock);
+    return a;
+}
+NvHead0Arm NvDispHead0Fence(bool on,const char* why){
+    if(on){
+        __atomic_store_n(&g_head0Fence,true,__ATOMIC_RELEASE);
+        // let an armed flip land (the presenter's Tick moves it to Idle) before RM work starts
+        for(int i=0;i<100;++i){
+            SpinLock* lock=NvAuxSharedLock();SpinLockAcquire(lock);
+            if(g_driver.Live(0))g_driver.Tick();
+            const bool armed=g_driver.Live(0)&&g_driver.f[0].state==nvdisp::FlipState::Armed;
+            SpinLockRelease(lock);
+            if(!armed)break;
+            SchedulerSleepMs(2);
+        }
+    }
+    const NvHead0Arm a=NvDispHead0Arm();
+    KPrintf("{\"nv_driver\":\"fence\",\"on\":%d,\"why\":\"%s\",\"live\":%d,\"flip\":%u,\"arm_iso\":\"%x\",\"arm_offset\":\"%x\"}\n",
+            on?1:0,why,a.live?1:0,a.state,a.iso,a.offset);
+    if(!on)__atomic_store_n(&g_head0Fence,false,__ATOMIC_RELEASE);
+    return a;
+}
 void NvDisplayDesktopStart(){
     if(!MarkerSet("/etc/nv-display"))return;
     Process* t=KernelThreadCreate("nv_display",DesktopStartThread,nullptr,3);

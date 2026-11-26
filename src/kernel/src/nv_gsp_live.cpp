@@ -34,6 +34,7 @@
 #include "nv_gsp/nv_gsp_m4.h"
 #include "nv_gsp/nak_m4_kernel.h"
 #include "nv_disp_live.h"
+#include "stall_watch.h"
 #include "platform_power.h"
 #include "scheduler.h"
 #include "process.h"
@@ -152,6 +153,9 @@ Bar0Bus g_bus;   // .bss
 // ---------------------------------------------------------- live state
 struct Gpu { uint8_t bus = 0, dev = 0, fn = 0; uint64_t bar0 = 0; bool ok = false; };
 volatile uint32_t g_busy = 0;
+struct LiveEvents { uint32_t total = 0, rc = 0, mmu = 0, os_error = 0, libos = 0, other = 0, drains = 0;
+                    uint32_t pstate = 0, pstate_changes = 0, pstate_polls = 0, pstate_errors = 0; uint64_t last_ms = 0; };
+LiveEvents g_liveEv;
 bool g_ceActiveFlag = false;   // mirrors g_cePresentState.active for Status (declared later)
 struct AutostartState { const char* status = "not run"; uint64_t start_ms = 0, p4_us = 0, ce_us = 0; } g_autostart;
 bool PathExists(const char* path) { auto* f = VfsOpen(path, VFS_O_STREAM); if (!f) return false; VfsRelease(f); return true; }
@@ -465,6 +469,10 @@ void Status() {
     o.kb("marker", MarkerSet("/etc/nv-gsp"));
     o.kb("p3_done", g_p3Done); o.kb("fini_done", g_finiDone);
     o.ks("autostart", g_autostart.status); o.kb("rm_running", g_rmRunning); o.kb("ce_present", g_ceActiveFlag);
+    o.k("rm_events"); o.raw("{"); o.kd("total", g_liveEv.total); o.kd("rc", g_liveEv.rc); o.kd("mmu", g_liveEv.mmu);
+    o.kd("os_error", g_liveEv.os_error); o.kd("libos", g_liveEv.libos); o.kd("other", g_liveEv.other); o.kd("drains", g_liveEv.drains);
+    o.kd("last_ms", g_liveEv.last_ms); o.kh("pstate", g_liveEv.pstate); o.kd("pstate_polls", g_liveEv.pstate_polls);
+    o.kd("pstate_changes", g_liveEv.pstate_changes); o.kd("pstate_errors", g_liveEv.pstate_errors); o.raw("}");
     if (FindGpu(f.g)) {
         g_bus.bar0 = f.g.bar0;
         o.kh("pci_cmd", PciConfigRead16(f.g.bus, f.g.dev, f.g.fn, 4));
@@ -638,6 +646,7 @@ struct RmWait {   // msgq poll: drop stale lines, short pause, bounded by the de
     }
 };
 RmSync g_rmSync;
+using LiveRmApi = RmApi<RmWait, GspDoorbell<Bar0Bus, RmSync>>;
 RmFiniResult RmUnload(uint64_t budget_us) {
     RmWait w; g_rm->wait_deadline_us = NowUs() + budget_us;
     return RunRmUnload(g_bus, *ChipForBoot0(g_bus.rd32(0)), g_rm->ch, g_rm->rx, g_rm->rxcap, w, g_rmSync);
@@ -1002,7 +1011,15 @@ int CeKickHook(const NvCeJob& job, uint64_t* bytes, uint32_t* ticket) {   // nv-
 int CeWaitHook(uint32_t ticket, uint32_t budget_us) {   // nv-aux lock held
     if (!g_rmRunning) return -1;
     const int r = CePresentWait(g_bus, g_cePresentState, ticket, budget_us, [] { __asm__ volatile("pause"); });
-    if (r < 0) { g_cePresentState.active = false; g_ceActiveFlag = false; KPrintf("nv-gsp: CE present wait failed (%s)\n", g_cePresentState.last_error); }
+    if (r < 0) {
+        g_cePresentState.active = false; g_ceActiveFlag = false;
+        const CeTimeout& t = g_cePresentState.last_timeout;
+        KPrintf("nv-gsp: CE present wait failed (%s) at %lu ms: kick age %lu us, poll gap %lu us, spin %lu us, "
+                "sem 0x%x want 0x%x, %u polls, job %lu B\n", g_cePresentState.last_error, (unsigned long)(t.at_us / 1000),
+                (unsigned long)t.kick_age_us, (unsigned long)t.poll_gap_us, (unsigned long)t.spin_us, t.sem, t.want, t.polls,
+                (unsigned long)t.job_bytes);
+        StallWatchTrigger("ce timeout");
+    }
     return r;
 }
 const NvCeOps g_ceOps{CeKickHook, CeWaitHook};
@@ -1037,6 +1054,9 @@ void CeStatsJson(Out& o) {
     o.kd("frames", st.frames); o.kd("rects", st.rects); o.kd("bytes", st.bytes); o.kd("submits", st.submits);
     o.kd("avg_us", st.submits ? st.us_sum / st.submits : 0); o.kd("max_us", st.us_max);
     o.kd("remaps", st.remaps); o.kd("remap_us_max", st.remap_us_max); o.kd("map_pages", st.map_pages);
+    { const CeTimeout& t = cp.last_timeout;
+      o.k("last_timeout"); o.raw("{"); o.kd("at_ms", t.at_us / 1000); o.kd("kick_age_us", t.kick_age_us); o.kd("poll_gap_us", t.poll_gap_us);
+      o.kd("spin_us", t.spin_us); o.kh("sem", t.sem); o.kh("want", t.want); o.kd("polls", t.polls); o.kd("job_bytes", t.job_bytes); o.raw("}"); }
     o.kd("refused", st.refused); o.kd("timeouts", st.timeouts); o.kd("slot", cp.slot); o.kb("big_pages", cp.big);
     o.kd("wait_us_sum", st.wait_us_sum); o.kd("waits_blocked", st.waits_blocked); o.kd("inflight", cp.inflight);
     o.kh("bb_lo", cp.bb_lo); o.kh("bb_hi", cp.bb_hi); o.kd("pt_pages", cp.k.pt_pages); o.kd("ptes", cp.k.ptes);
@@ -1141,6 +1161,91 @@ void NvGspAutostartHeadless() {
     if (t) SchedulerAddProcess(t); else KPrintf("nv-gsp: headless autostart thread failed\n");
 }
 namespace {
+// ---- RM async events outside RPCs (26 Nov): every 500 ms, when no verb runs and the nv-aux
+// lock is free, drain the message queue and log each event with its tick. RC (exceptType =
+// Xid), MMU fault and OS error records are decoded; LIBOS prints are only counted. With
+// /etc/nv-gsp-pstate-poll, GET_CURRENT_PSTATE every 5 s on RM's internal subdevice, logged on
+// change (off by default until it is shown safe on its own).
+struct NoWait { bool operator()() { return false; } };
+void LogEvent(const uint8_t* m, uint32_t len) {
+    namespace rm = rm570;
+    const uint32_t fn = Get32(m + offsetof(rm::rpc_message_header_v, function));
+    const uint8_t* p = m + kRpcHdr;
+    const uint32_t n = len > kRpcHdr ? len - kRpcHdr : 0;
+    auto u32 = [&](uint32_t off) { return off + 4 <= n ? Get32(p + off) : 0u; };
+    const unsigned long ms = (unsigned long)(NowUs() / 1000);
+    ++g_liveEv.total; g_liveEv.last_ms = ms;
+    switch (fn) {
+        case rm::NV_VGPU_MSG_EVENT_RC_TRIGGERED:
+            ++g_liveEv.rc;
+            KPrintf("nv-gsp: RM event at %lu ms: RC Xid %u engine %u chid %u level %u scope %u fault %x:%08x type %u\n", ms,
+                    u32(16), u32(0), u32(4), u32(12), u32(20), u32(32), u32(28), u32(36));
+            StallWatchTrigger("rm rc");
+            break;
+        case rm::NV_VGPU_MSG_EVENT_MMU_FAULT_QUEUED: ++g_liveEv.mmu; KPrintf("nv-gsp: RM event at %lu ms: MMU fault queued\n", ms); break;
+        case rm::NV_VGPU_MSG_EVENT_OS_ERROR_LOG: {
+            ++g_liveEv.os_error;
+            char text[97]; uint32_t i = 0;
+            for (; i < 96 && 12 + i < n && p[12 + i]; ++i) text[i] = (p[12 + i] >= 32 && p[12 + i] < 127) ? char(p[12 + i]) : '.';
+            text[i] = 0;
+            KPrintf("nv-gsp: RM event at %lu ms: OS error Xid %u runlist %u chid %u: %s\n", ms, u32(0), u32(4), u32(8), text);
+            break;
+        }
+        case rm::NV_VGPU_MSG_EVENT_UCODE_LIBOS_PRINT: ++g_liveEv.libos; break;
+        default: ++g_liveEv.other; KPrintf("nv-gsp: RM event at %lu ms: function 0x%x (%u bytes)\n", ms, fn, len); break;
+    }
+}
+void EventThread(void*) {
+    uint32_t ticks = 0;
+    alignas(8) static uint8_t buf[kMaxRpcBytes];
+    for (;;) {
+        SchedulerSleepMs(500);
+        ++ticks;
+        if (!g_rmRunning || !g_rm || !g_rm->ch || g_finiDone) continue;
+        if (__atomic_exchange_n(&g_busy, 1u, __ATOMIC_ACQUIRE)) continue;   // a verb is talking to RM
+        SpinLock* lock = NvAuxSharedLock();
+        if (!SpinLockTryAcquire(lock)) { __atomic_store_n(&g_busy, 0u, __ATOMIC_RELEASE); continue; }
+        if (g_rmRunning) {
+            FlushRange(g_rm->objs.q.msgq(), kQueueBytes);
+            NoWait nw;
+            for (int i = 0; i < 16 && g_rm->ch->MsgPending(); ++i) {
+                uint32_t len = 0;
+                if (g_rm->ch->Recv(buf, sizeof(buf), &len, 0, nw) != QStatus::Ok) break;
+                LogEvent(buf, len);
+                FlushRange(g_rm->objs.q.msgq(), kQueueBytes);
+            }
+            ++g_liveEv.drains;
+            if (ticks % 10 == 0 && g_staticValid && PathExists("/etc/nv-gsp-pstate-poll")) {
+                const ChipOps* c = ChipForBoot0(g_bus.rd32(0));
+                RmWait wait; g_rm->wait_deadline_us = NowUs() + 1000000;
+                GspDoorbell<Bar0Bus, RmSync> bell{g_bus, *c, g_rmSync};
+                alignas(8) static uint8_t scratch[kRmApiBuf];
+                LiveRmApi api(g_rm->ch, g_rm->rx, g_rm->rxcap, wait, bell, scratch);
+                uint32_t ps = 0;
+                ++g_liveEv.pstate_polls;
+                if (api.Control(g_static.h_internal_client, g_static.h_internal_subdevice, 0x20802068u, &ps, sizeof(ps))) {
+                    if (ps != g_liveEv.pstate) {
+                        KPrintf("nv-gsp: pstate mask 0x%x -> 0x%x at %lu ms\n", g_liveEv.pstate, ps, (unsigned long)(NowUs() / 1000));
+                        g_liveEv.pstate = ps; ++g_liveEv.pstate_changes;
+                    }
+                } else ++g_liveEv.pstate_errors;
+                g_liveEv.total += api.ev.total; g_liveEv.rc += api.ev.rc; g_liveEv.mmu += api.ev.mmu_fault;
+            }
+        }
+        SpinLockRelease(lock);
+        __atomic_store_n(&g_busy, 0u, __ATOMIC_RELEASE);
+    }
+}
+void EventThreadStart() {
+    static bool started = false;
+    if (started) return;
+    started = true;
+    Process* t = KernelThreadCreate("nv_gsp_ev", EventThread, nullptr, 2);
+    if (t) SchedulerAddProcess(t); else KPrintf("nv-gsp: event thread failed\n");
+}
+}  // namespace
+
+namespace {
 void AutostartRun(bool display) {
     if (!MarkerSet("/etc/nv-gsp")) { g_autostart.status = "no /etc/nv-gsp"; return; }
     if (PathExists("/etc/nv-gsp-no-autostart")) { g_autostart.status = "opted out"; KPrintf("nv-gsp: autostart off (/etc/nv-gsp-no-autostart)\n"); return; }
@@ -1151,6 +1256,9 @@ void AutostartRun(bool display) {
     g_autostart.start_ms = NowUs() / 1000;
     g_outQuiet = true;
     uint64_t t0 = NowUs();
+    // Fence head-0 flips across the RM bring-up and CE present on (26 Nov: window 0 was re-armed
+    // with a foreign ISO ctxdma 0xfb000000 while flips ran, and head 0 died with an exception).
+    const NvHead0Arm before = display ? NvDispHead0Fence(true, "p4 start") : NvHead0Arm{};
     P4(display);   // keep-display only when heads are lit
     g_autostart.p4_us = NowUs() - t0;
     if (!display) g_autostart.status = g_rmRunning ? "rm (headless)" : "p4 failed (no RM)";
@@ -1158,10 +1266,23 @@ void AutostartRun(bool display) {
         t0 = NowUs(); CePresentVerb(1); g_autostart.ce_us = NowUs() - t0;
         g_autostart.status = g_cePresentState.active ? "rm + ce present" : "rm up, ce present failed (CPU copies)";
     } else g_autostart.status = g_rmRunning ? "rm up, BAR1 not mapped (no CE)" : "p4 failed (no RM)";
+    if (display) {
+        const NvHead0Arm after = NvDispHead0Fence(false, "rm + ce up");
+        if (before.live && (after.iso != before.iso || after.offset != before.offset || !after.live))
+            KPrintf("nv-gsp: head 0 window ARM changed across the RM bring-up: iso %x -> %x, offset %x -> %x, live %d -> %d\n",
+                    before.iso, after.iso, before.offset, after.offset, before.live ? 1 : 0, after.live ? 1 : 0);
+    }
     g_outQuiet = false;
     __atomic_store_n(&g_busy, 0u, __ATOMIC_RELEASE);
+    if (g_rmRunning) EventThreadStart();
     KPrintf("nv-gsp: autostart %s (p4 %lu us, ce %lu us)\n", g_autostart.status, (unsigned long)g_autostart.p4_us,
             (unsigned long)g_autostart.ce_us);
+    if (display) {   // a delayed re-arm (RM work after INIT_DONE) shows up here
+        const NvHead0Arm a0 = NvDispHead0Arm();
+        SchedulerSleepMs(2000);
+        const NvHead0Arm a1 = NvDispHead0Arm();
+        KPrintf("nv-gsp: head 0 check +2 s: live %d, iso %x -> %x (flips move the offset)\n", a1.live ? 1 : 0, a0.iso, a1.iso);
+    }
 }
 }  // namespace
 
@@ -1170,7 +1291,6 @@ namespace {
 // `gr golden` (once per boot, after p4): context-buffer info, the golden context (TURING_A on
 // an RM-managed-VAS channel), the TU10x scrubber. VRAM from [4 GiB + 256 MiB, +512 MiB).
 GrState g_gr; GrResult g_grLast; bool g_grTried = false;
-using LiveRmApi = RmApi<RmWait, GspDoorbell<Bar0Bus, RmSync>>;
 uint32_t GrStopLive() {
     if (!g_gr.up || !g_rmRunning || !g_rm) return 0;
     const ChipOps* c = ChipForBoot0(g_bus.rd32(0));
@@ -1207,6 +1327,7 @@ void GrJson(Out& o, const GrResult& r) {
     o.raw("]");
 }
 // `perf status|boost|clear`: RM perf controls on the scrubber scope's subdevice (needs `gr golden`).
+// status = GET_CURRENT_PSTATE only. boost is accepted by RM but did not leave P8 on 26 Nov.
 // boost = NV2080_CTRL_CMD_PERF_BOOST's GSP half (INTERNAL_PERF_BOOST_SET_2X), BOOST_TO_MAX for
 // 60 s: RM's own DVFS policy within the board's stock limits; it expires by itself, `perf clear` ends it.
 void PerfVerb(int mode) {   // 0 status, 1 boost, 2 clear
@@ -1229,25 +1350,9 @@ void PerfVerb(int mode) {   // 0 status, 1 boost, 2 clear
     uint32_t pstate = 0;
     const bool pok = api.Control(hc, hs, 0x20802068u, &pstate, sizeof(pstate));   // NV2080_CTRL_CMD_PERF_GET_CURRENT_PSTATE
     o.kb("pstate_ok", pok); o.kh("pstate_status", api.status); o.kh("pstate_mask", pstate);   // bit n = Pn
-    struct ClkInfo { uint32_t flags, domain, cur, def, min, max; };
-    struct { uint32_t level, flags; ClkInfo list[32]; uint32_t count; } lv = {};
-    static_assert(sizeof(lv) == 780, "NV2080_CTRL_PERF_GET_LEVEL_INFO_V2_PARAMS");
-    for (uint32_t i = 0; i < 32; ++i) lv.list[i].domain = 1u << i;   // probe every domain bit; RM fills what it knows
-    lv.count = 32;
-    lv.level = 0;
-    for (uint32_t i = 0; i < 32; ++i) if (pstate == (1u << i)) lv.level = i;
-    const bool lok = api.Control(hc, hs, 0x2080200bu, &lv, sizeof(lv));   // NV2080_CTRL_CMD_PERF_GET_LEVEL_INFO_V2
-    o.kb("level_ok", lok); o.kh("level_status", api.status); o.kd("level", lv.level);
-    o.k("clocks"); o.raw("[");
-    bool first = true;
-    if (lok) for (uint32_t i = 0; i < 32 && i < lv.count; ++i) {
-        const ClkInfo& k = lv.list[i];
-        if (!k.cur && !k.max) continue;
-        if (!first) o.raw(",");
-        first = false;
-        o.raw("{"); o.kh("domain", k.domain); o.kd("cur", k.cur); o.kd("def", k.def); o.kd("min", k.min); o.kd("max", k.max); o.raw("}");
-    }
-    o.raw("]");
+    // No GET_LEVEL_INFO_V2 here: on 26 Nov an all-domain-bits probe of it (rm 0x1f) was followed by
+    // every RM_ALLOC failing NV_ERR_RESET_REQUIRED (PDB_PROP_GPU_IN_FATAL_ERROR) for the rest of the
+    // boot. Clock domains are not in the open 570.144 headers; don't probe them.
     SpinLockRelease(lock);
     KPrintf("nv-gsp: perf %s: pstate mask 0x%x (rm 0x%x)\n", mode == 1 ? "boost" : mode == 2 ? "clear" : "status", pstate, api.status);
     o.send();
