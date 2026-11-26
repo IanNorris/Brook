@@ -294,10 +294,15 @@ static int VfsBackendDirectoryLocked(const VfsPath& path,char* out,uint32_t capa
 {
     if(!out || capacity<2)return -36;
     out[0]=0;if(!path.object)return -9;
-    char suffix[512];uint32_t position=sizeof(suffix)-1;suffix[position]=0;
+    PathBuffer suffix;
+    uint32_t position=PathMax-1;
+    if (VfsVirtual(path)) {
+        if (!suffix.allocate()) return -12;
+        suffix[position]=0;
+    }
     VfsPath current=path;
     for(uint32_t depth=0;VfsVirtual(current);++depth) {
-        if(depth>=256)return -40;
+        if(depth>=PathMax/2)return -40;
         auto* directory=static_cast<VfsVirtualDirectory*>(current.object->priv);
         VfsPath visible{};
         bool linked=VfsReservedVirtualLocked(directory->parent,directory->name,&visible) && VfsPathSame(visible,current);
@@ -314,14 +319,15 @@ static int VfsBackendDirectoryLocked(const VfsPath& path,char* out,uint32_t capa
         else if(!stat.isDir)return -95;
     }
     if(!report)return -95;
-    char relative[512];int error=report(current.object,relative,sizeof(relative));
+    const int error=report(current.object,out,capacity);
     if(error)return error;
-    if(relative[0]!='/')return -5;
-    uint32_t written=StrLen(relative);const uint32_t tail=sizeof(suffix)-position-1;
-    if(tail && written==1)written=0;
+    if(out[0]!='/')return -5;
+    if(!suffix.data())return 0;
+    uint32_t written=StrLen(out);
+    const uint32_t tail=PathMax-position-1;
+    if(written==1)written=0;
     if(written+tail>=capacity)return -36;
-    if(written)StrCopy(out,relative,capacity);
-    for(uint32_t i=0;i<=tail;++i)out[written+i]=suffix[position+i];
+    __builtin_memcpy(out+written,suffix.data()+position,tail+1);
     return 0;
 }
 static int VfsGlobalDirectoryLocked(const VfsPath& path,char* out,uint32_t capacity,bool anyObject=false)
@@ -337,12 +343,21 @@ static int VfsGlobalDirectoryLocked(const VfsPath& path,char* out,uint32_t capac
         int error=VfsGlobalDirectoryLocked(mount->coveredParent,out,capacity);
         return error?error:VfsAppendLeaf(out,capacity,mount->coveredName);
     }
-    char relative[512];int error=VfsBackendDirectoryLocked(path,relative,sizeof(relative),anyObject);
+    PathBuffer backingPath;
+    char* relative=out;
+    uint32_t relativeCapacity=capacity;
+    if (mount->rootObject && capacity<PathMax) {
+        if (!backingPath.allocate()) return -12;
+        relative=backingPath.data();
+        relativeCapacity=backingPath.capacity();
+    }
+    int error=VfsBackendDirectoryLocked(path,relative,relativeCapacity,anyObject);
     if(error)return error;
     if(mount->rootObject) {
-        char boundRoot[512];auto* rootObject=mount->rootObject;
+        PathBuffer boundRoot; if (!boundRoot.allocate()) return -12;
+        auto* rootObject=mount->rootObject;
         if(!rootObject->ops->directory_path)return -95;
-        if((error=rootObject->ops->directory_path(rootObject,boundRoot,sizeof(boundRoot))))return error;
+        if((error=rootObject->ops->directory_path(rootObject,boundRoot,boundRoot.capacity())))return error;
         uint32_t prefixLength=StrLen(boundRoot);
         if(prefixLength>1) {
             for(uint32_t i=0;i<prefixLength;++i)if(relative[i]!=boundRoot[i])return -2;
@@ -355,11 +370,13 @@ static int VfsGlobalDirectoryLocked(const VfsPath& path,char* out,uint32_t capac
     const bool root=prefix==1 && mount->mountPoint[0]=='/';
     const uint32_t total=root?length:prefix+(length==1?0:length);
     if(total>=capacity)return -36;
-    if(root)StrCopy(out,relative,capacity);
-    else {
+    if(!root) {
+        if(length>1)
+            for(uint32_t i=length;i;--i)out[prefix+i-1]=relative[i-1];
         for(uint32_t i=0;i<prefix;++i)out[i]=mount->mountPoint[i];
-        if(length>1)for(uint32_t i=0;i<length;++i)out[prefix+i]=relative[i];
         out[total]=0;
+    } else if (relative!=out) {
+        __builtin_memcpy(out,relative,length+1);
     }
     return 0;
 }
@@ -382,20 +399,22 @@ int VfsPathDirectoryPathInRoot(const VfsPath& root,const VfsPath& path,char* out
     if(!out || capacity<2)return -36;
     if(VfsPathSame(root,path)) {out[0]='/';out[1]=0;return 0;}
     FileMutationGuard lookup(false);
-    char rootName[512], pathName[512];
-    int error=VfsGlobalDirectoryLocked(root,rootName,sizeof(rootName));
-    if(!error)error=VfsGlobalDirectoryLocked(path,pathName,sizeof(pathName));
+    PathBuffer rootName;
+    if (!rootName.allocate()) return -12;
+    int error=VfsGlobalDirectoryLocked(root,rootName,rootName.capacity());
     if(error)return error;
-    const unsigned prefix=StrLen(rootName);
-    const char* relative=pathName;
-    if(prefix>1) {
-        for(unsigned i=0;i<prefix;++i)
-            if(pathName[i]!=rootName[i])return -2;
-        if(pathName[prefix]!='/')return -2;
-        relative+=prefix;
-    }
-    if(StrLen(relative)>=capacity)return -36;
-    StrCopy(out,relative,capacity);return 0;
+    const uint32_t prefix=StrLen(rootName);
+    if(prefix<=1)return VfsGlobalDirectoryLocked(path,out,capacity);
+    PathBuffer full;
+    if(!full.allocate())return -12;
+    if((error=VfsGlobalDirectoryLocked(path,full,full.capacity())))return error;
+    const uint32_t length=StrLen(full);
+    if(length<=prefix)return -2;
+    for(uint32_t i=0;i<prefix;++i)if(full[i]!=rootName[i])return -2;
+    if(full[prefix]!='/')return -2;
+    if(length-prefix>=capacity)return -36;
+    __builtin_memcpy(out,full.data()+prefix,length-prefix+1);
+    return 0;
 }
 static int VfsPathFromVnodeLocked(Vnode* node,VfsPath* out)
 {
@@ -579,8 +598,10 @@ int VfsPathBrokerAllowed(const VfsPath& root,const char* absolute,bool* allowed)
     for(const auto& mount:g_mounts)
         if(VfsMountPublished(mount) && mount.owner==rootMount->owner && mount.rootObject) {hasBind=true;break;}
     if(!hasBind) {*allowed=true;return 0;} // unchanged initial/copied topology
-    char prefix[512];uint32_t length=StrLen(absolute);if(length>=sizeof(prefix))return -36;
-    StrCopy(prefix,absolute,sizeof(prefix));
+    PathBuffer prefix;
+    uint32_t length=PathLength(absolute);if(length>=PathMax)return -36;
+    if(!prefix.allocate())return -12;
+    StrCopy(prefix,absolute,prefix.capacity());
     // Broker files can have entirely synthetic tails. Walk each existing
     // prefix by identity; only stop at a genuinely absent component. No name
     // is used to dispatch an ordinary filesystem operation afterward.
@@ -618,8 +639,10 @@ int VfsPathDeviceActivation(const VfsPath& root,const char* absolute)
     auto* mount=static_cast<MountEntry*>(root.attachment);
     if(!VfsMountPublished(*mount))return -2;
     uint64_t attributes=mount->attributes;
-    char prefix[512];uint32_t length=StrLen(absolute);if(length>=sizeof(prefix))return -36;
-    StrCopy(prefix,absolute,sizeof(prefix));
+    PathBuffer prefix;
+    uint32_t length=PathLength(absolute);if(length>=PathMax)return -36;
+    if(!prefix.allocate())return -12;
+    StrCopy(prefix,absolute,prefix.capacity());
     for(uint32_t end=1;end<=length;++end) {
         if(prefix[end]!='/' && prefix[end])continue;
         char saved=prefix[end];prefix[end]=0;

@@ -1,3 +1,4 @@
+#include "syscall_user_path.h"
 // syscall_mount.cpp -- mount namespace syscalls: mount/umount2/pivot_root.
 //
 // Split from syscall.cpp.

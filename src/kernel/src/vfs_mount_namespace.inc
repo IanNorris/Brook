@@ -315,8 +315,9 @@ static int VfsFreshMountRestrictionsLocked(MountNamespace* ns, const VfsFsOps* o
     const auto& root = policy.root;
     if (!policy.covers || !root.object || !root.attachment ||
         static_cast<MountEntry*>(root.attachment)->owner != ns) return -1;
-    char rootPath[512];
-    if (int error = VfsGlobalDirectoryLocked(root, rootPath, sizeof(rootPath))) return error;
+    PathBuffer rootPath;
+    if(!rootPath.allocate())return -12;
+    if (int error = VfsGlobalDirectoryLocked(root, rootPath, rootPath.capacity())) return error;
     const bool top = StrEq(rootPath, "/");
     for (auto& mount : g_mounts) {
         if (mount.owner != ns || !VfsMountPublished(mount) ||
@@ -488,8 +489,9 @@ static int VfsMountNamespaceRecursiveBindLocked(MountNamespace* ns,const VfsPath
 {
     auto* sourceMount=static_cast<MountEntry*>(source.attachment);
     if(!VfsMountPublished(*sourceMount))return -22;
-    char sourceLabel[512];
-    if(int error=VfsGlobalDirectoryLocked(source,sourceLabel,sizeof(sourceLabel)))return error;
+    PathBuffer sourceLabel;
+    if(!sourceLabel.allocate())return -12;
+    if(int error=VfsGlobalDirectoryLocked(source,sourceLabel,sourceLabel.capacity()))return error;
     VfsNamespaceCloneMap map;
     auto prepare=[&](MountEntry* original,MountEntry** out)->int {
         *out=nullptr;
@@ -546,11 +548,12 @@ static int VfsMountNamespaceRecursiveBindLocked(MountNamespace* ns,const VfsPath
         if(mount!=graft) {
             // Reporting alone uses names. New virtual ancestors are deliberately
             // unpublished, so derive their labels from the frozen old tree.
-            char oldLabel[512];
+            PathBuffer oldLabel;
+            if(!oldLabel.allocate()){error=-12;break;}
             if(entry->oldMount->coveredParent.object) {
-                error=VfsGlobalDirectoryLocked(entry->oldMount->coveredParent,oldLabel,sizeof(oldLabel));
-                if(!error)error=VfsAppendLeaf(oldLabel,sizeof(oldLabel),entry->oldMount->coveredName);
-            } else error=VfsGlobalDirectoryLocked(entry->oldMount->covered,oldLabel,sizeof(oldLabel));
+                error=VfsGlobalDirectoryLocked(entry->oldMount->coveredParent,oldLabel,oldLabel.capacity());
+                if(!error)error=VfsAppendLeaf(oldLabel,oldLabel.capacity(),entry->oldMount->coveredName);
+            } else error=VfsGlobalDirectoryLocked(entry->oldMount->covered,oldLabel,oldLabel.capacity());
             if(!error) {
                 const bool sourceRoot=StrEq(sourceLabel,"/");
                 if(!sourceRoot && !VfsComponentPrefix(sourceLabel,oldLabel))error=-2;
@@ -720,9 +723,10 @@ int VfsMountNamespaceBindAt(MountNamespace* ns,const VfsPath& root,const VfsPath
     if(targetStat.isDir)return -20;
     if(int error=VfsBindEntryLocked(source))return error;
     if(int error=VfsBindEntryLocked(target))return error;
-    char sourceLabel[512],targetLabel[512];
-    if(int error=VfsBindWalkLabelLocked(source,true,sourceLabel,sizeof(sourceLabel)))return error;
-    if(int error=VfsBindWalkLabelLocked(target,false,targetLabel,sizeof(targetLabel)))return error;
+    PathBuffer sourceLabel,targetLabel;
+    if(!sourceLabel.allocate() || !targetLabel.allocate())return -12;
+    if(int error=VfsBindWalkLabelLocked(source,true,sourceLabel,sourceLabel.capacity()))return error;
+    if(int error=VfsBindWalkLabelLocked(target,false,targetLabel,targetLabel.capacity()))return error;
     return VfsMountNamespaceBindLocked(ns,source.value.object,target.value.object,recursive,sourceLabel,targetLabel,&target.value.parent,target.value.leaf);
 }
 int VfsMountNamespacePivotRoot(MountNamespace* ns,const VfsPath& oldRoot,const VfsPath& newRoot,const VfsPath& putOld)
@@ -750,9 +754,10 @@ int VfsMountNamespacePivotRoot(MountNamespace* ns,const VfsPath& oldRoot,const V
     bool reachable=false;int error=VfsBindContainsLocked(oldRoot,newRoot,&reachable);
     if(error)return error;if(!reachable)return -22;
     error=VfsBindContainsLocked(newRoot,putOld,&reachable);if(error)return error;if(!reachable)return -22;
-    char newLabel[512],putLabel[512];
-    if((error=VfsGlobalDirectoryLocked(newRoot,newLabel,sizeof(newLabel))))return error;
-    if((error=VfsGlobalDirectoryLocked(putOld,putLabel,sizeof(putLabel))))return error;
+    PathBuffer newLabel,putLabel;
+    if(!newLabel.allocate() || !putLabel.allocate())return -12;
+    if((error=VfsGlobalDirectoryLocked(newRoot,newLabel,newLabel.capacity())))return error;
+    if((error=VfsGlobalDirectoryLocked(putOld,putLabel,putLabel.capacity())))return error;
     if(StrEq(newLabel,"/") || !VfsComponentPrefix(newLabel,putLabel))return -22;
     const char* oldPrefix=putLabel+StrLen(newLabel);if(!*oldPrefix)oldPrefix="/";
     VfsRenameLabels labels;

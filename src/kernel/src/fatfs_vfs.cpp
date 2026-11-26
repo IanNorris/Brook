@@ -1,3 +1,4 @@
+#include "path_buffer.h"
 #include "fatfs_vfs.h"
 #include "panic_journal.h"
 #if defined(BROOK_SSD_GUARD_CHECK)
@@ -311,10 +312,10 @@ static void FatDiagnosticPath(VfsObject* object, const char* leaf, char* path, u
 }
 
 // Build FatFS path: "N:rest" where N = pdrv.
-static void BuildFatPath(char* out, uint32_t maxLen,
+static bool BuildFatPath(char* out, uint32_t maxLen,
                          uint8_t pdrv, const char* relPath)
 {
-    if (maxLen < 4) return;
+    if (maxLen < 4 || PathLength(relPath)>=PathMax || strlen(relPath)+3>maxLen) return false;
     out[0] = static_cast<char>('0' + pdrv);
     out[1] = ':';
     uint32_t i = 2;
@@ -326,6 +327,7 @@ static void BuildFatPath(char* out, uint32_t maxLen,
         while (*p && i + 1 < maxLen) out[i++] = *p++;
         out[i] = '\0';
     }
+    return true;
 }
 
 // ---- File cache (for large read-only files) ----
@@ -1156,8 +1158,9 @@ static Vnode* FatFsOpen(void* mountPriv, uint8_t pdrv,
     const int mutation = VFS_O_WRITE | VFS_O_READWRITE | VFS_O_CREATE | VFS_O_TRUNC | VFS_O_APPEND;
     if ((mount->intrinsicReadOnly && (flags & mutation)) ||
         ((flags & VFS_O_STREAM) && (flags & (mutation | VFS_O_METADATA | VFS_O_EXEC)))) return nullptr;
-    char fatPath[256];
-    BuildFatPath(fatPath, sizeof(fatPath), pdrv, relPath);
+    PathBuffer fatPath(PathMax+2);
+    if(!fatPath.allocate())return nullptr;
+    if(!BuildFatPath(fatPath,fatPath.capacity(),pdrv,relPath))return nullptr;
 
     auto* file = static_cast<FatOpenFile*>(kmalloc(sizeof(FatOpenFile)));
     if (!file) return nullptr;
@@ -1172,8 +1175,9 @@ static Vnode* FatFsOpen(void* mountPriv, uint8_t pdrv,
     if (flags & VFS_O_CREATE) mode |= (flags & VFS_O_TRUNC) ? FA_CREATE_ALWAYS : FA_OPEN_ALWAYS;
     if (flags & VFS_O_TRUNC)  mode |= FA_CREATE_ALWAYS;
 
+    const bool cacheable=PathLength(fatPath,sizeof(CachedFile::path))<sizeof(CachedFile::path);
     // Check shared cache first (read-only opens).
-    if (!(flags & (VFS_O_METADATA | VFS_O_STREAM)) && !(mode & (FA_WRITE | FA_CREATE_ALWAYS | FA_OPEN_ALWAYS))) {
+    if (cacheable && !(flags & (VFS_O_METADATA | VFS_O_STREAM)) && !(mode & (FA_WRITE | FA_CREATE_ALWAYS | FA_OPEN_ALWAYS))) {
         KMutexLock(&g_fatLock);
         CachedFile* existing = FileCacheLookup(fatPath);
         if (existing && FatBootArtifactDenied(reinterpret_cast<FatOpenFile*>(existing->fil))) {
@@ -1226,7 +1230,7 @@ static Vnode* FatFsOpen(void* mountPriv, uint8_t pdrv,
     FRESULT res = FatCallWithPath(file->writePath, [&] { return f_open(fil, fatPath, mode); });
     if (res != FR_OK) {
         if (g_fatfsDebug)
-            SerialPrintf("FATFS: f_open('%s', 0x%x) failed: %d\n", fatPath, mode, res);
+            SerialPrintf("FATFS: f_open('%s', 0x%x) failed: %d\n", fatPath.data(), mode, res);
         KMutexUnlock(&g_fatLock);
     }
     if (res == FR_OK) {
@@ -1244,7 +1248,7 @@ static Vnode* FatFsOpen(void* mountPriv, uint8_t pdrv,
         static constexpr uint64_t CACHE_THRESHOLD = 64 * 1024;
         uint64_t fileSize = f_size(fil);
         const bool bootKey=FatIsBootArtifact(file);
-        if (!bootKey && !(flags & (VFS_O_METADATA | VFS_O_STREAM)) &&
+        if (cacheable && !bootKey && !(flags & (VFS_O_METADATA | VFS_O_STREAM)) &&
             !file->writable && fileSize >= CACHE_THRESHOLD) {
             file->cacheLoading = true;
             auto* placeholder = static_cast<CachedFile*>(kmalloc(sizeof(CachedFile)));
@@ -1386,8 +1390,9 @@ static int FatFsStatPath(void* mountPriv, uint8_t pdrv,
 
     bool isRoot = (relPath[0] == '/' && relPath[1] == '\0') || relPath[0] == '\0';
 
-    char fatPath[256];
-    BuildFatPath(fatPath, sizeof(fatPath), pdrv, relPath);
+    PathBuffer fatPath(PathMax+2);
+    if(!fatPath.allocate())return -12;
+    if(!BuildFatPath(fatPath,fatPath.capacity(),pdrv,relPath))return -36;
 
     FILINFO fno = {};
     VnodeStat identity = {};
@@ -1485,8 +1490,9 @@ static bool FatPathOpenLocked(FatFsMountData* mount,const char* path,bool rename
 static int FatFsUnlink(void* mountPriv, uint8_t pdrv, const char* relPath)
 {
     if (static_cast<FatFsMountData*>(mountPriv)->intrinsicReadOnly) return -30;
-    char fatPath[256];
-    BuildFatPath(fatPath, sizeof(fatPath), pdrv, relPath);
+    PathBuffer fatPath(PathMax+2);
+    if(!fatPath.allocate())return -12;
+    if(!BuildFatPath(fatPath,fatPath.capacity(),pdrv,relPath))return -36;
     KMutexLock(&g_fatLock);
     auto* mount=static_cast<FatFsMountData*>(mountPriv);
     uint64_t identity=0;
@@ -1502,8 +1508,9 @@ static int FatFsUnlink(void* mountPriv, uint8_t pdrv, const char* relPath)
 static int FatFsMkdir(void* mountPriv, uint8_t pdrv, const char* relPath, uint16_t /*mode*/)
 {
     if (static_cast<FatFsMountData*>(mountPriv)->intrinsicReadOnly) return -30;
-    char fatPath[256];
-    BuildFatPath(fatPath, sizeof(fatPath), pdrv, relPath);
+    PathBuffer fatPath(PathMax+2);
+    if(!fatPath.allocate())return -12;
+    if(!BuildFatPath(fatPath,fatPath.capacity(),pdrv,relPath))return -36;
     KMutexLock(&g_fatLock);
     FRESULT res = FatCallWithPath(fatPath + 2, [&] { return f_mkdir(fatPath); });
     KMutexUnlock(&g_fatLock);
@@ -1514,9 +1521,10 @@ static int FatFsRename(void* mountPriv, uint8_t pdrv,
                        const char* oldRelPath, const char* newRelPath)
 {
     if (static_cast<FatFsMountData*>(mountPriv)->intrinsicReadOnly) return -30;
-    char fatOld[256], fatNew[256];
-    BuildFatPath(fatOld, sizeof(fatOld), pdrv, oldRelPath);
-    BuildFatPath(fatNew, sizeof(fatNew), pdrv, newRelPath);
+    PathBuffer fatOld(PathMax+2), fatNew(PathMax+2);
+    if(!fatOld.allocate() || !fatNew.allocate())return -12;
+    if(!BuildFatPath(fatOld,fatOld.capacity(),pdrv,oldRelPath) ||
+       !BuildFatPath(fatNew,fatNew.capacity(),pdrv,newRelPath))return -36;
     KMutexLock(&g_fatLock);
     auto* mount = static_cast<FatFsMountData*>(mountPriv);
     uint64_t oldIdentity=0,newIdentity=0;
@@ -1977,7 +1985,7 @@ static int FatObjectPath(VfsObject* object,char* out,uint32_t capacity)
         position-=length;memcpy(out+position,leaf,length);out[--position]='/';current=parent;
     }
     for(uint32_t depth=0;current.object.sclust;++depth) {
-        if(depth>=256)return finish(-40);
+        if(depth>=PathMax/2)return finish(-40);
         FF_OBJECT parent{};FRESULT result=f_object_parent(&current,&parent);
         if(result!=FR_OK)return finish(FrToErrno(result));
         if(parent.object.sclust==current.object.sclust)return finish(-40);
@@ -2290,7 +2298,7 @@ using SlotSelectors = uint8_t[GuardSlotCount][BROOK_UPDATE_RECORD_BYTES];
 int OpenSlotFileLocked(FatPrivateMount* session,const char* path,FIL& file)
 {
     char fatPath[256];
-    BuildFatPath(fatPath,sizeof(fatPath),session->mount->pdrv,path);
+    if(!BuildFatPath(fatPath,sizeof(fatPath),session->mount->pdrv,path))return -36;
     const auto opened=f_open(&file,fatPath,FA_READ);
     if(opened!=FR_OK)return FrToErrno(opened);
     // Private recovery has no VFS clients. A failed desktop handoff may have
@@ -2358,7 +2366,7 @@ int FatFsPrivateRecoveryPinSlotHealth(FatPrivateMount* session, const char (&ide
     session->slotHealthInspected = true;
     constexpr auto path = "/RECOVERY/BOOTSTAT.BIN";
     char fatPath[256];
-    BuildFatPath(fatPath, sizeof(fatPath), session->mount->pdrv, path);
+    if(!BuildFatPath(fatPath,sizeof(fatPath),session->mount->pdrv,path))return -36;
     FILINFO info{};
     KMutexLock(&g_fatLock);
     const auto stat = f_stat(fatPath, &info);

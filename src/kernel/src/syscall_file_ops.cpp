@@ -1,3 +1,4 @@
+#include "syscall_user_path.h"
 // syscall_file_ops.cpp -- per-file operations: truncate, fallocate, flock, chmod/chown, utimensat, sync/fsync.
 //
 // Split from syscall.cpp.
@@ -100,8 +101,8 @@ int64_t sys_truncate(uint64_t pathAddr, uint64_t length, uint64_t,
                       uint64_t, uint64_t, uint64_t)
 {
     if (length > 0x7fffffffffffffffULL) return -EINVAL;
-    char path[256];
-    if (!CopyUserCString(pathAddr, path, sizeof(path))) return -EFAULT;
+    PathBuffer path;
+    if (int error = CopyUserPath(pathAddr, path)) return error;
     if (!path[0]) return -ENOENT;
     AtLookup lookup;if(int error=lookup.Init(-100,path))return error;
     int result=0;
@@ -132,7 +133,7 @@ int64_t sys_flock(uint64_t fd, uint64_t operation, uint64_t,
 int64_t sys_chmod(uint64_t pathAddr, uint64_t mode, uint64_t,
                    uint64_t, uint64_t, uint64_t)
 {
-    char path[512];if(!CopyUserCString(pathAddr,path,sizeof(path)))return -EFAULT;
+    PathBuffer path;if (int error = CopyUserPath(pathAddr, path)) return error;
     AtLookup lookup;if(int error=lookup.Init(-100,path))return error;
     return VfsChmodAt(lookup.fs.root,lookup.start(),path,static_cast<uint16_t>(mode&07777));
 }
@@ -150,7 +151,7 @@ int64_t sys_fchmod(uint64_t fd, uint64_t mode, uint64_t,
 int64_t sys_fchmodat(uint64_t dirfd, uint64_t pathAddr, uint64_t mode,
                       uint64_t, uint64_t, uint64_t)
 {
-    char path[512];if(!CopyUserCString(pathAddr,path,sizeof(path)))return -EFAULT;
+    PathBuffer path;if (int error = CopyUserPath(pathAddr, path)) return error;
     AtLookup lookup;if(int error=lookup.Init(static_cast<int>(dirfd),path))return error;
     return VfsChmodAt(lookup.fs.root,lookup.start(),path,static_cast<uint16_t>(mode&07777));
 }
@@ -167,7 +168,7 @@ static int64_t ChownAt(int dirfd, uint64_t pathAddr, uint32_t uid, uint32_t gid,
     Process* proc=ProcessCurrent();if(!proc)return -EPERM;
     if(uid!=0xffffffffu){uid=ProcessResolveId(proc,false,uid);if(uid==UserIdInvalid)return -EINVAL;}
     if(gid!=0xffffffffu){gid=ProcessResolveId(proc,true,gid);if(gid==UserIdInvalid)return -EINVAL;}
-    char path[512];if(!CopyUserCString(pathAddr,path,sizeof(path)))return -EFAULT;
+    PathBuffer path;if (int error = CopyUserPath(pathAddr, path)) return error;
     if(!path[0]) {
         if(!(flags&EMPTY_PATH))return -ENOENT;
         if(dirfd==-100) {
@@ -238,8 +239,8 @@ int64_t sys_utimensat(uint64_t dirfd, uint64_t pathAddr, uint64_t timesAddr,
         }
     }
     if (times[0].nsec == VFS_UTIME_OMIT && times[1].nsec == VFS_UTIME_OMIT) return 0;
-    char path[256] = {};
-    if (pathAddr && !CopyUserCString(pathAddr, path, sizeof(path))) return -EFAULT;
+    PathBuffer path;
+    if (pathAddr) { if (int error = CopyUserPath(pathAddr, path)) return error; }
     if (!pathAddr || (!path[0] && (flags & EMPTY_PATH))) {
         if (flags & NOFOLLOW) return -EINVAL;
         Process* proc = ProcessCurrent();

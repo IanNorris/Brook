@@ -1,3 +1,4 @@
+#include "path_buffer.h"
 #include "tmpfs.h"
 
 #include "memory/file_object.h"
@@ -466,31 +467,24 @@ int ObjectPath(VfsObject *o, char *out, uint32_t capacity)
     Guard g(n->fs);
     if (!n->linked)
         return -2;
-    char path[512];
-    uint32_t cursor = sizeof(path) - 1;
-    path[cursor] = 0;
+    if (!out || capacity < 2) return -36;
+    uint32_t cursor = capacity - 1;
+    out[cursor] = 0;
     // Reporting only: a hard-linked inode reports its oldest surviving name.
     for (unsigned depth = 0; n != n->fs->root; ++depth)
     {
-        if (depth >= 256)
-            return -40;
-        auto *e = n->aliases;
-        if (!n->linked || !e)
-            return -2;
-        uint32_t length = strlen(e->name);
-        if (length + 1 > cursor)
-            return -36;
+        if (depth >= PathMax / 2) return -40;
+        auto* entry = n->aliases;
+        if (!n->linked || !entry) return -2;
+        const uint32_t length = strlen(entry->name);
+        if (length + 1 > cursor) return -36;
         cursor -= length;
-        memcpy(path + cursor, e->name, length);
-        path[--cursor] = '/';
-        n = e->dir;
+        memcpy(out + cursor, entry->name, length);
+        out[--cursor] = '/';
+        n = entry->dir;
     }
-    if (cursor == sizeof(path) - 1)
-        path[--cursor] = '/';
-    uint32_t size = sizeof(path) - cursor;
-    if (size > capacity)
-        return -36;
-    memcpy(out, path + cursor, size);
+    if (cursor == capacity - 1) out[--cursor] = '/';
+    memmove(out, out + cursor, capacity - cursor);
     return 0;
 }
 int EntryParent(VfsObject *o,VfsObject **out,char *leaf,uint32_t capacity)

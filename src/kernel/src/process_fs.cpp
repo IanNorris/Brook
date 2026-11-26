@@ -90,7 +90,8 @@ int ProcessFsIsolateMounts(Process* child)
 }
 static void ProcessFsRefreshDisplay(Process* process)
 {
-    char display[256]{};ProcessFsGetcwd(process,display,sizeof(display));
+    char display[256]{};
+    if (ProcessFsGetcwd(process,display,sizeof(display))) display[0]=0;
     const uint64_t irqFlags=IrqSpinLockAcquire(&g_fsPublicationLock);
     for(uint32_t i=0;i<sizeof(display);++i)process->cwdDisplay[i]=display[i];
     IrqSpinLockRelease(&g_fsPublicationLock,irqFlags);

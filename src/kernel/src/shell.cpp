@@ -1,3 +1,4 @@
+#include "path_buffer.h"
 #include "process_fs.h"
 #include "unix_lifetime_trace.h"
 // Brook kernel shell — boot script executor and interactive command line.
@@ -513,9 +514,10 @@ static int SpawnProcess(const char* path, int argc, const char* const* argv,
     const uint32_t requestedUid=uidOverride==CredentialUnchanged?DesktopUid:uidOverride;
     if(!service && !OomRecoveryAdmitApplication(path,requestedUid))return -12;
     ExecutableImage image{};
-    char executablePath[sizeof(Process::exePath)];
+    PathBuffer executablePath;
+    if (!executablePath.allocate()) return -12;
     Vnode* vnode = nullptr;
-    int readResult = VfsOpenExecutable(path, &vnode, executablePath, sizeof(executablePath));
+    int readResult = VfsOpenExecutable(path, &vnode, executablePath, executablePath.capacity());
     if (!readResult) readResult = ReadExecutableImage(vnode, &image);
     if (vnode) VfsClose(vnode);
     if (readResult != 0)

@@ -1,3 +1,4 @@
+#include "syscall_user_path.h"
 // syscall_open.cpp -- open/openat/creat path resolution and descriptor creation.
 //
 // Split from syscall.cpp.
@@ -153,15 +154,11 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
     if (!proc) return -EBADF;
 
     UserAccessScope pathAccess(proc);
-    char pathBuf[512];
+    PathBuffer pathBuf;
     // The path is always a user pointer. There are no in-kernel callers, so
     // an upper-half address is never trusted as a kernel string.
-    if (pathAddr < 0x1000 || !CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) {
-        Process* p = ProcessCurrent();
-        SerialPrintf("sys_open: EFAULT pathAddr=0x%lx pid=%u (%s)\n",
-                     pathAddr, p ? p->pid : 0, p ? p->name : "?");
-        return -EFAULT;
-    }
+    if (pathAddr < 0x1000) return -EFAULT;
+    if (int error = CopyUserPath(pathAddr, pathBuf)) return error;
     const char* path = pathBuf;
 
     AtLookup at;if(int error=at.Init(dirfd,path))return error;
@@ -532,7 +529,7 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
             // A trailing slash has no basename. In particular, a missing Git
             // refs directory must never become the /boot/lib directory.
             if (libraryPrefix && *fname && libraryName) {
-                char libPath[256] = "/boot/lib/";
+                char libPath[NameMax + sizeof("/boot/lib/")] = "/boot/lib/";
                 uint32_t li = 10;
                 while (*fname && li + 1 < sizeof(libPath)) libPath[li++] = *fname++;
                 libPath[li] = '\0';
