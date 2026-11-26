@@ -922,6 +922,8 @@ target_compile_options(test_intel_bdw_inventory PRIVATE -UNDEBUG "-iquote${BROOK
 add_host_test(test_intel_pch_watchdog_inventory)
 target_compile_options(test_intel_pch_watchdog_inventory PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_pci_config_access)
+add_host_test(test_loader_breadcrumb)
+target_compile_options(test_loader_breadcrumb PRIVATE "-iquote${BROOK_ROOT}/src/bootloader/src")
 add_host_test(test_intel_bdw_blitter)
 target_compile_options(test_intel_bdw_blitter PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_intel_bdw_forcewake)

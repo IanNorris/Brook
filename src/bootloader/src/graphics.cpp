@@ -2,6 +2,7 @@
 #include "console.h"
 #include "config.h"
 #include "mode_selection.h"
+#include "loader_breadcrumb_efi.h"
 #include "Protocol/GraphicsOutput.h"
 
 namespace brook
@@ -17,6 +18,7 @@ bool GraphicsInit(EFI_BOOT_SERVICES* bootServices, brook::Framebuffer& outFrameb
     EFI_STATUS status = bootServices->LocateProtocol(&gopGuid, nullptr, (VOID**)&gop);
     if (EFI_ERROR(status) || gop == nullptr)
     {
+        BreadcrumbGop(false, 0, 0, 0, false, false, status);
         return false;
     }
 
@@ -49,9 +51,12 @@ bool GraphicsInit(EFI_BOOT_SERVICES* bootServices, brook::Framebuffer& outFrameb
 
     }
 
-    status = gop->SetMode(gop, bestMode);
-    if (EFI_ERROR(status))
+    // A failed SetMode keeps the firmware's current mode (it is valid: GOP reported it);
+    // halting here left the machine dark with no way to tell why.
+    const EFI_STATUS setStatus = gop->SetMode(gop, bestMode);
+    if (EFI_ERROR(setStatus) && !gop->Mode->Info)
     {
+        BreadcrumbGop(false, 0, 0, maxMode, true, true, setStatus);
         return false;
     }
 
@@ -85,6 +90,8 @@ bool GraphicsInit(EFI_BOOT_SERVICES* bootServices, brook::Framebuffer& outFrameb
     outFramebuffer.width        = modeInfo->HorizontalResolution;
     outFramebuffer.height       = modeInfo->VerticalResolution;
     outFramebuffer.stride       = modeInfo->PixelsPerScanLine * 4;
+    BreadcrumbGop(true, modeInfo->HorizontalResolution, modeInfo->VerticalResolution, maxMode, true,
+                  EFI_ERROR(setStatus), setStatus);
     outFramebuffer.format       = pixelFormat;
     outFramebuffer.bitmask      = bitmask;
 

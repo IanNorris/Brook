@@ -19,6 +19,8 @@ inline unsigned BootStickUsbDiskName(unsigned index,char* name) {
     return end;
 }
 int BootStickDiskIndex();
+// Read-only read of a small file in the loader volume root (arms RO, reads, disarms). 0 = read.
+int BootStickReadRootFile(const char* name, char* buf, uint32_t cap, uint32_t* len);
 // BROOK_IOCTL_BOOT_STICK_*; caller has checked CAP_SYS_ADMIN.
 int BootStickIoctl(uint32_t cmd, uint64_t arg, bool (*copyOut)(uint64_t, const void*, uint64_t),
                    bool (*copyIn)(void*, uint64_t, uint64_t));

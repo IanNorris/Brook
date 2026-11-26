@@ -4,6 +4,7 @@
 #include "brook_boot_logo_data.h"
 #include "config.h"
 #include "graphics.h"
+#include "loader_breadcrumb_efi.h"
 #include "memory.h"
 #include "firmware_runtime_cache.h"
 #include "acpi.h"
@@ -59,6 +60,8 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
 
     ConsoleInit(systemTable->ConOut);
     ConsoleSetQuiet(true);
+    // Breadcrumb first: a hung boot that never reaches this point hung in firmware POST.
+    BreadcrumbEntry(imageHandle, systemTable->BootServices);
 #if defined(BROOK_EFI_BOOT_INVENTORY)
     SaveBootVariableInventory(imageHandle,systemTable);
 #endif
@@ -236,6 +239,7 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
         ConsolePrintLine(u"No initrd found (optional)");
     }
 
+    BreadcrumbKernel();   // last loader write; boot services end below
     // --- Allocate page table memory (must be before ExitBootServices) ---
     // Pass kernelPhysPages so AllocatePageTables can size the kernel PT pool.
     // It also scans the UEFI memory map internally to size the identity map.

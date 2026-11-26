@@ -430,6 +430,31 @@ void BootStickStatusLine()
             g_stickPresent && g_stick.volumeValid ? "remote" : "disabled", g_armed);
 }
 
+// Read-only peek at a small root file on the loader's volume (loader breadcrumbs): arm
+// read-only, read, disarm. Refuses while the volume is armed by someone else.
+int BootStickReadRootFile(const char* name, char* buf, uint32_t cap, uint32_t* len)
+{
+    *len = 0;
+    KMutexLock(&g_lock);
+    int r = g_armed ? -16 : ArmLocked(BROOK_BOOT_STICK_RO);
+    if (!r) {
+        char path[96]; uint32_t n = 0;
+        for (const char* m = MountPath; *m && n < 80; ++m) path[n++] = *m;
+        path[n++] = '/';
+        for (const char* m = name; *m && n < 95; ++m) path[n++] = *m;
+        path[n] = 0;
+        if (auto* f = VfsOpen(path, VFS_O_STREAM)) {
+            uint64_t off = 0;
+            const int64_t got = VfsRead(f, buf, cap, &off);
+            if (got > 0) *len = uint32_t(got);
+            VfsRelease(f);
+        } else r = -2;
+        DisarmLocked();
+    }
+    KMutexUnlock(&g_lock);
+    return r;
+}
+
 int BootStickIoctl(uint32_t cmd, uint64_t arg, bool (*copyOut)(uint64_t, const void*, uint64_t),
                    bool (*copyIn)(void*, uint64_t, uint64_t))
 {

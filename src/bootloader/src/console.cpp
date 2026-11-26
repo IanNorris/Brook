@@ -1,4 +1,5 @@
 #include "console.h"
+#include "loader_breadcrumb_efi.h"
 
 namespace brook
 {
@@ -68,6 +69,7 @@ void ConsolePrintDec(UINT64 value)
 
 [[noreturn]] void Halt(EFI_STATUS status, const char16_t* message)
 {
+    BreadcrumbHalt(status, message);   // HALT.TXT + LOADER.TXT stage=halt (no-op after boot services end)
     gQuiet=false;
     ConsolePrint(u"\r\nFATAL ERROR (");
     ConsolePrintHex((UINT64)status);
