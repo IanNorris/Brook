@@ -56,6 +56,7 @@
 #include "fractional-scale-server-protocol.h"
 #include "brook_desktop_scale.h"
 #include "dmabuf-layout.h"
+#include "nv-modifiers.h"
 #include "linux-dmabuf-unstable-v1-server-protocol.h"
 #include "text-input-v3-server-protocol.h"
 #include "relative-pointer-v1-server-protocol.h"
@@ -340,6 +341,7 @@ struct brook_dmabuf_buffer {
     uint32_t gres;        /* resolved host virgl resource id (0 = unresolved) */
     uint32_t bo_handle;   /* our DRM GEM alias of the imported resource */
     uint64_t trace_device, trace_inode;  /* producer storage, never the CPU snapshot */
+    uint32_t nv_bo;       /* nv-drm (renderD130) GEM alias; 0 = not an nv-drm import */
 };
 static int is_dmabuf_buffer(struct wl_resource *buf);
 
@@ -658,6 +660,10 @@ static void latency_commit(struct brook_surface *s, struct wl_client *client) {
 
 static int g_drm_fd = -1;
 static int g_drm_intel;
+/* nv-drm dmabuf path (notes/m5/zero-copy-design.md): renderD130, opened only when no
+ * virtio/i915 node exists and BROOK_WAYLAND_NV_DMABUF=1 or /etc/waylandd-nv-dmabuf is set. */
+static int g_nv_fd = -1;
+static struct brook_image *nv_dmabuf_snapshot(const struct brook_dmabuf_buffer *db,int *uncertain);
 static int popup_apply_position(struct brook_surface *);
 static int xwayland_surface_ready(const struct brook_surface *);
 static unsigned xwayland_surface_flags(const struct brook_surface *);
@@ -1337,8 +1343,17 @@ static void surface_commit(struct wl_client *c,struct wl_resource *r) {
                                             trace_attachment, buffer->trace_cycle, trace_surface, buffer->uses, NULL);
                     buffer_release(buffer);
                 }
+            } else if (db->nv_bo) {
+                /* nv-drm: wait for the producer's implicit fence, then CPU snapshot. */
+                buffer_begin_use(buffer);
+                int uncertain=0;image=nv_dmabuf_snapshot(db,&uncertain);
+                if(uncertain)buffer->uncertain=1;
+                if (trace_attachment && (image || uncertain))
+                    buffer_trace_record(image ? BUFFER_CPU_COPY : BUFFER_UNCERTAIN, buffer->trace_serial,
+                                        trace_attachment, buffer->trace_cycle, trace_surface, buffer->uses, NULL);
+                buffer_release(buffer);
             } else image=calloc(1,sizeof(*image));
-            if (image && !g_drm_intel) {
+            if (image && !g_drm_intel && !db->nv_bo) {
                 image->refs=1;image->width=db->width;image->height=db->height;
                 image->format=db->fourcc==0x34325258?2:1;image->source=buffer;++buffer->refs;buffer_begin_use(buffer);
             }
@@ -3840,6 +3855,138 @@ static struct brook_image *intel_dmabuf_copy(const struct brook_dmabuf_buffer *d
     if(image)g_layer_readback_bytes+=(uint64_t)db->width*db->height*4;
     munmap(pixels,length);return image;
 }
+/* ---- nv-drm (renderD130) dmabufs: the RTX 2080 / NVK path ----------------------------
+ * Step 1 of notes/m5/zero-copy-design.md: NVK's Wayland WSI exports a LINEAR GART buffer
+ * (its PRIME blit target), we import it on renderD130, wait for the frame's implicit fence
+ * (Mesa imports the present semaphore's sync file into the dmabuf before commit; the
+ * kernel's GEM_CPU_PREP waits on it) and take the same CPU snapshot as a wl_shm buffer.
+ * That removes the client-side readback + memcpy of MESA_VK_WSI_DEBUG=sw; the compositor
+ * still composes on the CPU, and CE present copies its shadow to scanout as before.
+ *
+ * main_device stays 0 (no virtio/i915 node), so Mesa sees a different "GPU" and takes its
+ * cross-device path: render tiled in VRAM, blit to a linear buffer in host memory, which
+ * is what a CPU compositor can read (VRAM has no CPU window on renderD130 yet). */
+struct drm_nouveau_gem_info { uint32_t handle, domain; uint64_t size, offset, map_handle; uint32_t tile_mode, tile_flags; };
+struct drm_nouveau_gem_cpu_prep { uint32_t handle, flags; };
+#define DRM_IOCTL_NOUVEAU_GEM_INFO     DRM_IOC(0x40 + 0x44, sizeof(struct drm_nouveau_gem_info))
+#define DRM_IOCTL_NOUVEAU_GEM_CPU_PREP DRM_IOC(0x40 + 0x42, sizeof(struct drm_nouveau_gem_cpu_prep))
+#define NOUVEAU_GEM_DOMAIN_GART 4u
+#define NOUVEAU_GEM_CPU_PREP_NOWAIT 1u
+#define NV_DMABUF_WAIT_MS 1000u
+struct brook_nv_import {
+    uint32_t bo, refs;
+    uint64_t size, map_handle;
+    const uint8_t *map;   /* lazily mapped, read-only, unmapped with the last reference */
+    struct brook_nv_import *next;
+};
+static struct brook_nv_import *g_nv_imports;
+static uint64_t g_nv_imported, g_nv_refused, g_nv_snapshots, g_nv_wait_us_max;
+static int nv_dmabuf_wanted(void){
+    const char *v=getenv("BROOK_WAYLAND_NV_DMABUF");
+    if (v) return !strcmp(v,"1");
+    return access("/etc/waylandd-nv-dmabuf",F_OK)==0;
+}
+/* Block-linear NVIDIA modifiers in the format table: only for a future GPU present path.
+ * Mesa never sends them to this compositor (main_device mismatch -> LINEAR prime blit), and
+ * the CPU path refuses them. Off unless BROOK_WAYLAND_NV_MODIFIERS=1. */
+static int nv_dmabuf_block_linear_advertised(void){
+    const char *v=getenv("BROOK_WAYLAND_NV_MODIFIERS");
+    return g_nv_fd>=0 && v && !strcmp(v,"1");
+}
+static void nv_dmabuf_open(void){
+    if (g_drm_fd>=0 || g_nv_fd>=0 || !nv_dmabuf_wanted()) return;
+    g_nv_fd=open("/dev/dri/renderD130",O_RDWR|O_CLOEXEC);
+    if (g_nv_fd<0) fprintf(stderr,"[waylandd] nv dmabuf: renderD130 unavailable (%s)\n",strerror(errno));
+    else fprintf(stderr,"[waylandd] nv dmabuf: renderD130 fd=%d (LINEAR GART imports, CPU snapshot)\n",g_nv_fd);
+}
+static void nv_gem_close(uint32_t bo){
+    struct drm_gem_close gc={bo,0};
+    if (g_nv_fd>=0) ioctl(g_nv_fd,DRM_IOCTL_GEM_CLOSE,&gc);
+}
+static void nv_dmabuf_release(uint32_t bo){
+    struct brook_nv_import **link=&g_nv_imports;
+    while (*link && (*link)->bo!=bo) link=&(*link)->next;
+    if (!*link) return;
+    struct brook_nv_import *e=*link;
+    if (--e->refs) return;
+    *link=e->next;
+    if (e->map) munmap((void *)e->map,(size_t)e->size);
+    nv_gem_close(e->bo);
+    free(e);
+}
+/* PRIME_FD_TO_HANDLE + GEM_INFO: accept a GART pitch-linear BO that holds the declared
+ * layout. Repeated imports of one BO share the handle (the kernel returns the same one). */
+static int nv_dmabuf_import(int fd, struct brook_dmabuf_buffer *db){
+    db->nv_bo=0;
+    struct drm_prime_handle ph={0,0,fd};
+    if (ioctl(g_nv_fd,DRM_IOCTL_PRIME_FD_TO_HANDLE,&ph)) {
+        fprintf(stderr,"[waylandd] nv dmabuf: FD_TO_HANDLE failed: %s\n",strerror(errno));++g_nv_refused;return 0;
+    }
+    struct brook_nv_import *e=g_nv_imports;
+    while (e && e->bo!=ph.handle) e=e->next;
+    const char *why=NULL;
+    struct drm_nouveau_gem_info info={.handle=ph.handle};
+    if (!e && ioctl(g_nv_fd,DRM_IOCTL_NOUVEAU_GEM_INFO,&info)) why="GEM_INFO failed";
+    const uint64_t size=e?e->size:info.size;
+    if (!why && !e) {
+        if (!(info.domain&NOUVEAU_GEM_DOMAIN_GART)) why="VRAM BO (no CPU window; needs the GPU present path)";
+        else if (((info.tile_flags>>8)&0xff) || info.tile_mode) why="tiled BO (kind/tile_mode set) declared linear";
+        else if (!info.map_handle) why="BO not mappable";
+    }
+    if (!why && db->modifier!=BROOK_DMABUF_MOD_LINEAR && db->modifier!=BROOK_DMABUF_MOD_IMPLICIT) why="modifier";
+    if (!why) {
+        const struct BrookDmabufLayout layout={(uint32_t)db->width,(uint32_t)db->height,db->fourcc,db->stride,db->offset,0,BROOK_DMABUF_MOD_LINEAR};
+        if (BrookDmabufValidate(&layout,size,0)!=BROOK_DMABUF_LAYOUT_OK) why="layout exceeds the BO";
+    }
+    if (!why && !e) {
+        e=calloc(1,sizeof(*e));
+        if (!e) why="out of memory";
+        else { e->bo=ph.handle;e->size=info.size;e->map_handle=info.map_handle;e->next=g_nv_imports;g_nv_imports=e; }
+    }
+    if (why) {
+        fprintf(stderr,"[waylandd] nv dmabuf refused: %s (%dx%d stride=%u size=%llu)\n",why,db->width,db->height,db->stride,
+                (unsigned long long)size);
+        if (!e) nv_gem_close(ph.handle);   /* a shared handle stays with its other users */
+        ++g_nv_refused;return 0;
+    }
+    ++e->refs;db->nv_bo=e->bo;++g_nv_imported;
+    return 1;
+}
+static uint64_t nv_now_us(void){ struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return (uint64_t)t.tv_sec*1000000u+(uint64_t)t.tv_nsec/1000u; }
+/* Wait (bounded) for the producer's implicit fence, then copy the pixels. A failed or timed
+ * out wait does not prove the GPU stopped writing: *uncertain withholds wl_buffer.release. */
+static struct brook_image *nv_dmabuf_snapshot(const struct brook_dmabuf_buffer *db,int *uncertain){
+    *uncertain=0;
+    struct brook_nv_import *e=g_nv_imports;
+    while (e && e->bo!=db->nv_bo) e=e->next;
+    if (!e) return NULL;
+    const uint64_t t0=nv_now_us();
+    for (;;) {
+        struct drm_nouveau_gem_cpu_prep prep={e->bo,NOUVEAU_GEM_CPU_PREP_NOWAIT};
+        if (!ioctl(g_nv_fd,DRM_IOCTL_NOUVEAU_GEM_CPU_PREP,&prep)) break;
+        const int error=errno;
+        if (error==EINTR) continue;
+        if (error!=EBUSY || nv_now_us()-t0>NV_DMABUF_WAIT_MS*1000u) {
+            *uncertain=1;
+            fprintf(stderr,"[waylandd] nv dmabuf: producer fence %s (errno=%d); release withheld\n",
+                    error==EBUSY?"timed out":"failed",error);
+            return NULL;
+        }
+        usleep(200);
+    }
+    const uint64_t waited=nv_now_us()-t0;
+    if (waited>g_nv_wait_us_max) g_nv_wait_us_max=waited;
+    if (!e->map) {
+        void *m=mmap(NULL,(size_t)e->size,PROT_READ,MAP_SHARED,g_nv_fd,(off_t)e->map_handle);
+        if (m==MAP_FAILED) { fprintf(stderr,"[waylandd] nv dmabuf: mmap failed: %s\n",strerror(errno));return NULL; }
+        e->map=m;
+    }
+    struct brook_image *image=image_snapshot(e->map+db->offset,db->width,db->height,db->stride,
+        db->fourcc==0x34325258?WL_SHM_FORMAT_XRGB8888:WL_SHM_FORMAT_ARGB8888);
+    if (image) { g_layer_readback_bytes+=(uint64_t)db->width*db->height*4;++g_nv_snapshots; }
+    return image;
+}
+
 /* The Wayland buffer ownership contract excludes new producer writes until
  * release. Wait for submitted work and transition the backing to CPU access. */
 static struct brook_image *intel_dmabuf_snapshot(const struct brook_dmabuf_buffer *db,int *uncertain)
@@ -4625,6 +4772,7 @@ static void dmabuf_buffer_unref(struct brook_dmabuf_buffer *db)
 {
     if (db && !--db->refs) {
         if (db->bo_handle) dmabuf_release_bo(db->bo_handle);
+        if (db->nv_bo) nv_dmabuf_release(db->nv_bo);
         free(db);
     }
 }
@@ -4718,7 +4866,8 @@ params_make_buffer(struct wl_client *c, struct wl_resource *r, uint32_t id,
         db->trace_device = storage.st_dev;
         db->trace_inode = storage.st_ino;
     }
-    db->gres = dmabuf_resolve_gres(p->fd, &db->bo_handle);
+    if (g_nv_fd >= 0) db->gres = nv_dmabuf_import(p->fd, db) ? 1u : 0u;   /* no gres: a CPU-read nv-drm BO */
+    else db->gres = dmabuf_resolve_gres(p->fd, &db->bo_handle);
     close(p->fd); p->fd = -1;   /* the import cache now holds the GEM reference */
     if (!db->gres) {
         free(db);
@@ -4733,6 +4882,7 @@ params_make_buffer(struct wl_client *c, struct wl_resource *r, uint32_t id,
     struct wl_resource *buf = wl_resource_create(c, &wl_buffer_interface, 1, id);
     if (!buf) {
         if (db->bo_handle) dmabuf_release_bo(db->bo_handle);
+        if (db->nv_bo) nv_dmabuf_release(db->nv_bo);
         free(db); wl_client_post_no_memory(c); return NULL;
     }
     wl_resource_set_implementation(buf, &dmabuf_buffer_impl, db,
@@ -4819,20 +4969,27 @@ static void dmabuf_send_feedback(struct wl_resource *fb)
 {
     /* Format table: 16-byte entries { u32 format, u32 pad, u64 modifier }. */
     struct fmt_entry { uint32_t format; uint32_t pad; uint64_t modifier; };
-    static const struct fmt_entry table[] = {
-        { FMT_XRGB8888, 0, 0 /* LINEAR */ },
-        { FMT_ARGB8888, 0, 0 /* LINEAR */ },
-        { FMT_XRGB8888, 0, BROOK_DRM_MOD_I915_Y_TILED },
-        { FMT_ARGB8888, 0, BROOK_DRM_MOD_I915_Y_TILED },
-        { FMT_XRGB8888, 0, BROOK_DRM_MOD_I915_X_TILED },
-        { FMT_ARGB8888, 0, BROOK_DRM_MOD_I915_X_TILED },
-    };
-    const uint32_t n = dmabuf_tiled_for(wl_resource_get_client(fb)) ? sizeof(table) / sizeof(table[0]) : 2;
+    struct fmt_entry table[2 + 4 + 2 * BROOK_NV_MOD_COUNT];
+    uint32_t n = 0;
+    table[n++] = (struct fmt_entry){ FMT_XRGB8888, 0, 0 /* LINEAR */ };
+    table[n++] = (struct fmt_entry){ FMT_ARGB8888, 0, 0 /* LINEAR */ };
+    if (dmabuf_tiled_for(wl_resource_get_client(fb))) {
+        table[n++] = (struct fmt_entry){ FMT_XRGB8888, 0, BROOK_DRM_MOD_I915_Y_TILED };
+        table[n++] = (struct fmt_entry){ FMT_ARGB8888, 0, BROOK_DRM_MOD_I915_Y_TILED };
+        table[n++] = (struct fmt_entry){ FMT_XRGB8888, 0, BROOK_DRM_MOD_I915_X_TILED };
+        table[n++] = (struct fmt_entry){ FMT_ARGB8888, 0, BROOK_DRM_MOD_I915_X_TILED };
+    }
+    if (nv_dmabuf_block_linear_advertised())
+        for (unsigned i = 0; i < BROOK_NV_MOD_COUNT; ++i) {
+            table[n++] = (struct fmt_entry){ FMT_XRGB8888, 0, brook_nv_turing_modifier(i) };
+            table[n++] = (struct fmt_entry){ FMT_ARGB8888, 0, brook_nv_turing_modifier(i) };
+        }
+    const size_t table_bytes = n * sizeof(table[0]);
 
     int tfd = syscall(SYS_memfd_create, "brook-dmabuf-fmt", 0u);
     if (tfd >= 0) {
-        if (write(tfd, table, sizeof(table)) == (ssize_t)sizeof(table)) {
-            zwp_linux_dmabuf_feedback_v1_send_format_table(fb, tfd, sizeof(table));
+        if (write(tfd, table, table_bytes) == (ssize_t)table_bytes) {
+            zwp_linux_dmabuf_feedback_v1_send_format_table(fb, tfd, (uint32_t)table_bytes);
         }
         /* The client dup()s the fd during the format_table event; ours can close. */
     }
@@ -5275,6 +5432,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "[waylandd] dmabuf: DRM node fd=%d dev=0x%llx\n",
                 g_drm_fd, (unsigned long long)g_drm_dev);
     }
+    nv_dmabuf_open();
     fprintf(stderr, "[waylandd] globals advertised\n");
 
     signal(SIGINT,  on_sigint);

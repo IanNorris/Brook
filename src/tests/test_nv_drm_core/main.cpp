@@ -7,6 +7,7 @@
 #include "nv_drm_core.h"
 #include "nv_vram_heap.h"
 #include <vector>
+#include <new>
 #include <map>
 
 #include <cstdlib>
@@ -311,6 +312,112 @@ static void TestExec(const DeviceInfo& dev) {
     assert(g_fake.chans.empty() && g_fake.chans_destroyed == 2 && g_fake.vram_used() == 0 && g_fake.sys.empty());
 }
 
+// ---- PRIME (nv_drm_prime.h): export/import between files, ownership, implicit fences --------
+static void TestPrime(const DeviceInfo& dev) {
+    g_fake.vram.Init(0x140000000ull, 0x140000000ull + (8ull << 20));
+    static File a, b; a.Init(&dev, &kFakeBe); b.Init(&dev, &kFakeBe);
+    NvVmInit vm{0xff00000000ull, (1ull << 40) - 0xff00000000ull};
+    assert(NvIo(a, NV_VM_INIT, &vm, sizeof(vm)) == 0 && NvIo(b, NV_VM_INIT, &vm, sizeof(vm)) == 0);
+    {   DrmGetCap c{DRM_CAP_PRIME, 0}; assert(Io(a, NR_GET_CAP, c) == 0 && c.value == (DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT)); }
+    // a block-linear VRAM render target (kind 0x06, tile_mode = GOB height log2 5) and a linear GART buffer
+    GemNew vn{}; vn.info.size = 1 << 20; vn.info.domain = GEM_DOMAIN_VRAM; vn.info.tile_flags = 0x06u << 8; vn.info.tile_mode = 5;
+    assert(NvIo(a, NV_GEM_NEW, &vn, sizeof(vn)) == 0);
+    const uint32_t hv = vn.info.handle, hg = NewBo(a, 64 << 10, GEM_DOMAIN_GART);
+    const uint32_t hp = NewBo(a, 4096, GEM_DOMAIN_GART | GEM_DOMAIN_NO_SHARE);
+    assert(hv && hg && hp);
+    const uint64_t vram_used = g_fake.vram_used(); const size_t sys_used = g_fake.sys.size();
+    Shared* sv = nullptr; Shared* sg = nullptr; Shared* sx = nullptr;
+    assert(PrimeExport(a, hv, &sv) == 0 && sv && sv->refs == 2 && a.nshared == 1);   // the BO + the "fd"
+    assert(sv->aper() == Aper::Vram && sv->size == (1u << 20) && sv->kind() == 0x06 && sv->tile_mode == 5);
+    assert(PrimeExport(a, hv, &sx) == 0 && sx == sv && sv->refs == 3); SharedUnref(sx);   // second export: same object
+    assert(PrimeExport(a, hg, &sg) == 0 && sg->aper() == Aper::Sys && a.nshared == 2);
+    assert(PrimeExport(a, hp, &sx) == kEINVAL && !sx);                // NO_SHARE is VM-private
+    assert(PrimeExport(a, 999, &sx) == kENOENT);
+    // re-import into the exporter: the same handle (Linux GEM; Mesa's BO cache keys on it)
+    uint32_t h = 0; assert(PrimeImport(a, sv, &h) == 0 && h == hv && sv->refs == 2);
+    // import into another file: a new handle with the same placement, size and tiling
+    uint32_t bv = 0, bg = 0; assert(PrimeImport(b, sv, &bv) == 0 && bv && sv->refs == 3);
+    assert(PrimeImport(b, sv, &h) == 0 && h == bv && sv->refs == 3);   // again: same handle, no new reference
+    assert(PrimeImport(b, sg, &bg) == 0 && bg != bv && b.nshared == 2);
+    GemInfo gi{}; gi.handle = bv; assert(NvIo(b, NV_GEM_INFO, &gi, sizeof(gi)) == 0);
+    assert(gi.domain == GEM_DOMAIN_VRAM && gi.size == (1u << 20) && ((gi.tile_flags >> 8) & 0xff) == 0x06 && gi.tile_mode == 5 && gi.map_handle);
+    assert(FindBoByToken(b, gi.map_handle) && FindBoByToken(b, gi.map_handle)->backing == sv->backing);
+    // the importer maps it in its own VAS: same backing, the BO's kind
+    auto& pt = g_fake.vas[b.vas];
+    assert(Bind(b, {Map(bv, 0x100000, 1 << 20)}) == 0 && pt[0x100000].aper == Aper::Vram && pt[0x100000].pa == sv->backing && pt[0x100000].kind == 0x06);
+    // the exporter closes everything: the importer's handle, mapping and the fd keep the memory
+    { GemClose c{hv, 0}; assert(Io(a, NR_GEM_CLOSE, c) == 0); }
+    { GemClose c{hg, 0}; assert(Io(a, NR_GEM_CLOSE, c) == 0); }
+    assert(g_fake.vram_used() == vram_used && g_fake.sys.size() == sys_used && a.nshared == 0);
+    a.Close(); new (&a) File(); a.Init(&dev, &kFakeBe); assert(NvIo(a, NV_VM_INIT, &vm, sizeof(vm)) == 0);
+    assert(g_fake.vram_used() == vram_used && sv->refs == 2);
+    // implicit sync: a pending write fence blocks CPU_PREP (both READ and WRITE access) on every file
+    GpuFence* w1 = GpuFenceCreate(false); GpuFence* w2 = GpuFenceCreate(false);
+    assert(SharedAddFence(sv, w1, DMA_BUF_SYNC_WRITE) && SharedAddFence(sv, w2, DMA_BUF_SYNC_WRITE));   // joined
+    CpuPrep cp{bv, CPU_PREP_NOWAIT}; assert(NvIo(b, NV_GEM_CPU_PREP, &cp, sizeof(cp)) == kEBUSY);
+    GpuFence* got = nullptr; assert(SharedFence(sv, DMA_BUF_SYNC_READ, &got) && got && GpuFenceState(got) == 0);
+    assert(GpuFenceComplete(w1, true) && GpuFenceState(got) == 0 && NvIo(b, NV_GEM_CPU_PREP, &cp, sizeof(cp)) == kEBUSY);
+    assert(GpuFenceComplete(w2, true) && GpuFenceState(got) == 1 && NvIo(b, NV_GEM_CPU_PREP, &cp, sizeof(cp)) == 0);
+    GpuFenceUnref(got);
+    // readers: READ access ignores them, WRITE access waits for them
+    GpuFence* r1 = GpuFenceCreate(false); assert(SharedAddFence(sv, r1, DMA_BUF_SYNC_READ));
+    assert(NvIo(b, NV_GEM_CPU_PREP, &cp, sizeof(cp)) == 0);
+    CpuPrep cw{bv, CPU_PREP_NOWAIT | CPU_PREP_WRITE}; assert(NvIo(b, NV_GEM_CPU_PREP, &cw, sizeof(cw)) == kEBUSY);
+    assert(GpuFenceComplete(r1, true) && NvIo(b, NV_GEM_CPU_PREP, &cw, sizeof(cw)) == 0);
+    // a failed producer fence is reported (-EIO), and a later successful one replaces it only once complete
+    GpuFence* bad = GpuFenceCreate(false); assert(SharedAddFence(sv, bad, DMA_BUF_SYNC_WRITE) && GpuFenceComplete(bad, false));
+    assert(NvIo(b, NV_GEM_CPU_PREP, &cp, sizeof(cp)) == -5);
+    GpuFence* ok = GpuFenceCreate(true); assert(SharedAddFence(sv, ok, DMA_BUF_SYNC_WRITE) && NvIo(b, NV_GEM_CPU_PREP, &cp, sizeof(cp)) == -5);
+    GpuFenceUnref(ok); GpuFenceUnref(bad); GpuFenceUnref(w1); GpuFenceUnref(w2); GpuFenceUnref(r1);
+    // fallback: the GART buffer never had a write fence imported; an EXEC of a file that maps it
+    // joins its bookkeep fence (and one that does not map it does not)
+    {
+        GpuFence* e1 = GpuFenceCreate(false);
+        PrimeNoteExec(b, e1);   // b imported sg but has not mapped it
+        GpuFence* f0 = nullptr; assert(SharedFence(sg, DMA_BUF_SYNC_READ, &f0) && !f0);
+        assert(Bind(b, {Map(bg, 0x300000, 64 << 10)}) == 0);
+        PrimeNoteExec(b, e1);
+        CpuPrep cg{bg, CPU_PREP_NOWAIT}; assert(NvIo(b, NV_GEM_CPU_PREP, &cg, sizeof(cg)) == kEBUSY);
+        assert(GpuFenceComplete(e1, true) && NvIo(b, NV_GEM_CPU_PREP, &cg, sizeof(cg)) == 0);
+        // once a producer imports a write fence, EXECs stop feeding the fallback
+        GpuFence* e2 = GpuFenceCreate(false); GpuFence* done = GpuFenceCreate(true);
+        assert(SharedAddFence(sg, done, DMA_BUF_SYNC_WRITE));
+        PrimeNoteExec(b, e2); assert(NvIo(b, NV_GEM_CPU_PREP, &cg, sizeof(cg)) == 0);
+        assert(GpuFenceComplete(e2, true));
+        GpuFenceUnref(e1); GpuFenceUnref(e2); GpuFenceUnref(done);
+        assert(Bind(b, {Unmap(0x300000, 64 << 10)}) == 0);
+    }
+    // syncobj <-> sync-file fences: export the current fence, import into another syncobj
+    {
+        DrmSyncobjCreate s1{0, 0}, s2{0, 0}; assert(Io(b, NR_SYNCOBJ_CREATE, s1) == 0 && Io(b, NR_SYNCOBJ_CREATE, s2) == 0);
+        int64_t rc = 0; assert(!SyncobjExportFence(b, s1.handle, 0, &rc) && rc == kEINVAL);   // nothing submitted
+        assert(!SyncobjExportFence(b, 777, 0, &rc) && rc == kENOENT);
+        GpuFence* pend = GpuFenceCreate(false);
+        { GpuSync* s = b.syncs.Get(s1.handle); assert(GpuSyncReplace(s, pend)); GpuSyncUnref(s); }
+        GpuFence* ex = SyncobjExportFence(b, s1.handle, 0, &rc); assert(ex == pend && rc == 0);
+        assert(SyncobjImportFence(b, s2.handle, 0, ex) == 0);
+        auto wait = [&](uint32_t hh) { DrmSyncobjWait w{uint64_t(&hh), 0, 1, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, 0, 0, 0}; return Io(b, NR_SYNCOBJ_WAIT, w); };
+        assert(wait(s2.handle) == kETIME && GpuFenceComplete(pend, true) && wait(s2.handle) == 0);
+        DrmSyncobjCreate s3{0, 0}; assert(Io(b, NR_SYNCOBJ_CREATE, s3) == 0);
+        assert(SyncobjImportFence(b, s3.handle, 0, nullptr) == 0 && wait(s3.handle) == 0);   // a signalled sync file
+        assert(SyncobjImportFence(b, 777, 0, nullptr) == kENOENT);
+        GpuFenceUnref(ex); GpuFenceUnref(pend);
+    }
+    // teardown: the importer's file goes, then the last fd reference frees the backing
+    b.Close();
+    assert(sv->refs == 1 && sg->refs == 1 && g_fake.vram_used() == vram_used);
+    SharedUnref(sv); SharedUnref(sg);
+    a.Close();
+    assert(g_fake.vram_used() == 0 && g_fake.sys.empty());
+    // import of an fd from a file whose BO is gone still works (the fd owns the memory)
+    new (&a) File(); new (&b) File(); a.Init(&dev, &kFakeBe); b.Init(&dev, &kFakeBe);
+    const uint32_t h2 = NewBo(a, 8192, GEM_DOMAIN_GART); Shared* s2 = nullptr; assert(PrimeExport(a, h2, &s2) == 0);
+    a.Close();
+    uint32_t i2 = 0; assert(PrimeImport(b, s2, &i2) == 0 && g_fake.sys.size() == 1);
+    SharedUnref(s2); assert(g_fake.sys.size() == 1);
+    b.Close(); assert(g_fake.sys.empty());
+}
+
 int main() {
     TestVramHeap();
     DeviceInfo dev;
@@ -391,6 +498,7 @@ int main() {
     f.Close();
     TestMemory(dev);
     TestExec(dev);
+    TestPrime(dev);
     std::printf("test_nv_drm_core: OK\n");
     return 0;
 }
