@@ -1979,7 +1979,7 @@ bool NvdChanCreate(void*, uint32_t vas, uint32_t engine, uint32_t* out) {
     nvd::Vas& v = nvd::g_vas[vas];
     ch.va = nvd::kRingVa + uint64_t(i) * 0x10000;
     GrScope& s = ch.s;
-    s.base = v.s.base; s.chid = chid; s.external = true; s.priv = true; s.h_vas = v.s.h_vas;   // unprivileged channels hung their first RM_FREE (gsp16d/e)
+    s.base = v.s.base; s.chid = chid; s.external = true; s.priv = g_grChanMode != 2; s.h_vas = v.s.h_vas;   // unprivileged channels hung their first RM_FREE (gsp16d/e)
     s.h_chan = v.s.base + 0x100 + i * 0x10; s.gpfifo_va = ch.va; s.va_next = nvd::kCtxVa + (uint64_t(i) << 32);
     const bool ok = NvdWithRm("CHANNEL_ALLOC", [&](auto& x, auto& vio, const ChipOps& c) {
         namespace h = rm::host;
@@ -1992,6 +1992,7 @@ bool NvdChanCreate(void*, uint32_t vas, uint32_t engine, uint32_t* out) {
         s.root = v.s.root; s.lpt_page = v.s.lpt_page; s.lpt_off = v.s.lpt_off; s.lpt_aper = v.s.lpt_aper;
         uint32_t entries = 0;
         bool good = x.ChannelInVas(s, ch.mthdbuf, g_gr.mthdbuf_size) && x.Promote(s, g_gr.bufs, false, &entries);
+        KPrintf("nv-drm: chid %u %s, PROMOTE_CTX %u entries (chanmode %u)\n", chid, s.priv ? "admin" : "user", entries, g_grChanMode);
         v.s.lpt_page = s.lpt_page; v.s.lpt_off = s.lpt_off; v.s.lpt_aper = s.lpt_aper;
         // NVK allocates TURING_DMA_COPY_A on its GR channel (nouveau_ws_3d_context_init, ENGINE_COPY)
         // and uses it for fills/copies: the GR runlist's copy engine (GRCE), as nouveau's
@@ -2110,7 +2111,7 @@ const nvdrm::Backend g_nvdBackend{nullptr, NvdVramAlloc, NvdVramFree, NvdSysAllo
 // submitted through NvdChanSubmit on the last channel, then on the first. Pixels read via PRAMIN.
 void GrVas2(uint32_t nchan, bool priv = false) {
     namespace h = rm570::host;
-    Out o; o.raw("{\"nv_gsp\":\"gr clear vas2\""); o.kd("channels", nchan); o.kb("priv_reg", priv);
+    Out o; o.raw("{\"nv_gsp\":\"gr clear vas2\""); o.kd("channels", nchan); o.kb("priv_reg", priv); o.kd("chanmode", g_grChanMode);
     const ChipOps* c = ChipForBoot0(g_bus.rd32(0));
     if (!c || !g_rmRunning || !g_gr.up) { o.ks("refused", "needs GSP-RM and gr golden this boot"); o.send(); return; }
     uint32_t vas = 0, ch[2] = {~0u, ~0u}, made = 0; uint64_t rt = 0, push = 0;
@@ -2237,6 +2238,11 @@ bool NvGspHandle(const char* command) {
     else if (!strcmp(verb, "gr clear vas2") || !strcmp(verb, "gr clear vas2 2")) GrVas2(2);
     else if (!strcmp(verb, "gr clear vas2 1")) GrVas2(1);
     else if (!strcmp(verb, "gr clear vas2 priv")) GrVas2(1, true);
+    else if (!strncmp(verb, "gr chanmode ", 12) && verb[12] >= '0' && verb[12] <= '2' && !verb[13]) {
+        g_grChanMode = uint32_t(verb[12] - '0');
+        Out o; o.raw("{\"nv_gsp\":\"gr chanmode\""); o.kd("mode", g_grChanMode);
+        o.ks("meaning", g_grChanMode == 0 ? "admin, no unrestricted map" : g_grChanMode == 1 ? "admin + unrestricted map" : "user"); o.send();
+    }
     else if (!strncmp(verb, "nocat ", 6)) { uint32_t k = 0; for (const char* q = verb + 6; *q >= '0' && *q <= '9'; ++q) k = k * 10 + uint32_t(*q - '0'); NocatVerb(k); }
     else if (!strcmp(verb, "perf status")) PerfVerb(0);
     else if (!strcmp(verb, "perf boost")) PerfVerb(1);

@@ -74,6 +74,10 @@ inline void GrBuildBufs(const rm570::gr::GET_CONTEXT_BUFFERS_INFO_PARAMS& p, GrB
 // `gr mthdbuf sys` restores the nouveau-style sysmem buffer. Formerly: put the method buffer in VRAM instead of
 // sysmem (nouveau uses sysmem; this only tests whether a sysmem DMA is the faulting one).
 inline bool g_grMthdbufVram = true;
+// renderD130 GR channel privilege (27 Nov, NVK Xid 44 A/B): 0 = ADMIN channel, UNRESTRICTED_PRIV_ACCESS_MAP
+// left out of the non-golden PROMOTE_CTX (as before); 1 = ADMIN + the golden UNRESTRICTED map promoted
+// into the channel; 2 = USER channel (nouveau's user channels, nouveau_abi16 priv=false).
+inline uint32_t g_grChanMode = 0;
 // A/B (26 Nov): skip the TU10x scrubber channel (BUG4208224 WAR) after golden, as CPU-RM does with
 // RmForceGrScrubberChannel=0. Live: /etc/nv-gsp-no-scrubber.
 inline bool g_grSkipScrubber = false;
@@ -298,7 +302,7 @@ struct GrCtx {
                 if (golden && b.global) b.vram = mem;
                 if (b.id == g::BUF_PRIV_ACCESS_MAP) e.bNonmapped = 1;
             } else {
-                if (b.id == g::BUF_UNRESTRICTED_PRIV_ACCESS_MAP) continue;
+                if (b.id == g::BUF_UNRESTRICTED_PRIV_ACCESS_MAP && !(g_grChanMode == 1 && s.priv)) continue;
                 mem = b.vram;
             }
             s.buf_vram[i] = mem;
