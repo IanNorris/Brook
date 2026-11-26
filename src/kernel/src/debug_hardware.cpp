@@ -2304,6 +2304,20 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         }
         r.text("],\"more\":");r.text(end<count?"true":"false");r.text("}\n");r.send();return true;
     }
+    // Power-loss test (27 Nov, boot-time BROOK_SYSTEM repair): reset now through the platform reset
+    // (DMA quiesce hooks only) without syncing or unmounting anything, so the next boot finds the
+    // store not-clean. Bound to the current boot id like the power verbs.
+    constexpr char uncleanPrefix[]="bridge hardware unclean-reset ";
+    if(Prefix(command,uncleanPrefix)){
+        const char* p=command+sizeof(uncleanPrefix)-1;char boot[33]{};
+        if(!ReadId(p,boot) || *p){DebugChannelSend("{\"power_error\":\"Expected boot_id\"}\n");return true;}
+        if(!DebugEpochMatches(boot)){DebugChannelSend("{\"boot_error\":\"Guest boot changed; attach explicitly again\"}\n");return true;}
+        KPrintf("power: unclean reset requested (no sync, power-loss test)\n");
+        DebugChannelSend("{\"unclean_reset\":\"issuing\"}\n");
+        SchedulerSleepMs(300);
+        if(!PlatformPowerIssue(true))DebugChannelSend("{\"unclean_reset\":\"unavailable\"}\n");
+        return true;
+    }
     constexpr char powerPrefix[]="bridge hardware power ";
     if(Prefix(command,powerPrefix)){
         const char* p=command+sizeof(powerPrefix)-1;char id[33]{},boot[33]{},verb[24]{};
