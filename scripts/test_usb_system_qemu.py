@@ -92,12 +92,38 @@ def digest_backup(path):
         return hashlib.sha256(disk.read(BACKUP_SECTORS * SECTOR)).hexdigest()
 
 
-def digest_outside_system(path):
-    """Hash every byte before and after p2, including the backup GPT."""
+BREADCRUMBS = {"LOADER.TXT", "HALT.TXT"}   # the loader's own records on p1 (loader_breadcrumb.h)
+
+
+def esp_files_digest(path):
+    """p1 by file: every file's path and bytes except the loader breadcrumbs."""
+    volume = f"{path}@@{ESP_FIRST * SECTOR}"
+    names = subprocess.check_output(["mdir", "-/", "-b", "-i", volume, "::/"], text=True).split()
     digest = hashlib.sha256()
+    for name in sorted(names):
+        if name.endswith("/") or name.rsplit("/", 1)[-1].upper() in BREADCRUMBS:
+            continue
+        digest.update(name.encode() + b"\0")
+        digest.update(subprocess.check_output(["mtype", "-i", volume, name]))
+    return digest.hexdigest()
+
+
+def loader_breadcrumb(path):
+    volume = f"{path}@@{ESP_FIRST * SECTOR}"
+    try:
+        return subprocess.check_output(["mtype", "-i", volume, "::/LOADER.TXT"]).decode("ascii", "replace")
+    except subprocess.CalledProcessError:
+        return ""
+
+
+def digest_outside_system(path):
+    """Hash every byte before p1 and after p2 (GPT, backup p3, backup GPT); p1 by file,
+    ignoring only the loader's breadcrumb files."""
+    digest = hashlib.sha256()
+    digest.update(esp_files_digest(path).encode())
     with path.open("rb") as disk:
         size = os.fstat(disk.fileno()).st_size
-        for start, end in ((0, STORE_FIRST * SECTOR), (BACKUP_FIRST * SECTOR, size)):
+        for start, end in ((0, ESP_FIRST * SECTOR), (BACKUP_FIRST * SECTOR, size)):
             disk.seek(start)
             remaining = end - start
             while remaining:
@@ -501,6 +527,11 @@ def main():
     finally:
         guest.stop()
     assert digest_backup(system) == backup
+    # The loader recorded this boot on p1 (and only there): entry -> gop -> kernel.
+    crumb = loader_breadcrumb(system)
+    results["loader_breadcrumb"] = crumb.strip()
+    assert crumb.startswith("brook-loader-breadcrumb v1\n") and "\nstage=kernel\n" in crumb, crumb
+    assert int(crumb.split("entries=", 1)[1].split("\n", 1)[0]) >= 1, crumb
 
     results["dirty_boot"], results["dirty_status"] = check_refusal(
         args, system, fallback, "dirty-boot", "needs-filesystem-check", -117)
