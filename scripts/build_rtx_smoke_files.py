@@ -355,6 +355,11 @@ def desktop_payload(args, initrd):
     else:
         fat_write(initrd, 'ETC/live-store', store['record'].encode())
     fat_write(initrd, 'BOOT/BIN/BASH', (profile / 'bin/bash').read_bytes())
+    for spec in getattr(args, 'boot_bin', None) or []:   # test images: extra executables, /boot/bin/NAME
+        name, _, src = spec.partition('=')
+        if not re.fullmatch(r'[A-Z0-9]{1,8}', name) or not Path(src).is_file():
+            raise SystemExit(f'--boot-bin: expected NAME=PATH with NAME 1..8 of A-Z0-9, got {spec!r}')
+        fat_write(initrd, f'BOOT/BIN/{name}', Path(src).read_bytes())
     wallpaper = wallpaper_raw()
     check_wallpaper(wallpaper)
     fat_write(initrd, 'BOOT/WALLPAPER.RAW', wallpaper)
@@ -611,6 +616,8 @@ def main():
     p.add_argument('--usb-system-no-mount', action='store_true',
                    help='with --usb-system: identify the SSD but never mount BROOK_SYSTEM (bisect boots: a forced '
                         'hang cannot dirty the store; boot updates still allowed; desktop and lastlog stay off)')
+    p.add_argument('--boot-bin', action='append', default=[], metavar='NAME=PATH',
+                   help='test images: also ship PATH as /boot/bin/NAME (e.g. a static busybox for no-mount boots)')
     p.add_argument('--nv-gsp-primary', action='store_true', help='with --nv-gsp: SET_SYSTEM_INFO bIsPrimary=1 (A/B)')
     p.add_argument('--nv-gsp-swgen0-ack', action='store_true', help='with --nv-gsp: ack GSP SWGEN0 each drain (A/B)')
     p.add_argument('--nv-gsp-no-scrubber', action='store_true', help='with --nv-gsp: skip the TU10x GR scrubber channel (A/B)')
