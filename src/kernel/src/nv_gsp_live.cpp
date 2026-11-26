@@ -1200,18 +1200,22 @@ void LogEvent(const uint8_t* m, uint32_t len) {
             break;
         }
         case rm::NV_VGPU_MSG_EVENT_UCODE_LIBOS_PRINT: ++g_liveEv.libos; break;
-        case rm::NV_VGPU_MSG_EVENT_GSP_POST_NOCAT_RECORD: {   // crash/diagnostic record: hex head + printable runs
+        case rm::NV_VGPU_MSG_EVENT_GSP_POST_NOCAT_RECORD: {
+            // NV2080CtrlNocatJournalInsertRecord (ctrl2080nvd.h): flags@0, timestamp@8, recType@16,
+            // bugcheck@20, source[65]@24, subsystem@92, errorCode@96, faultingEngine[65]@104,
+            // tdrReason@172, diagBufferLen@176, diagBuffer[1024]@180
             ++g_liveEv.other;
-            char text[241]; uint32_t t = 0, run = 0;
-            for (uint32_t i = 0; i < n && t < 236; ++i) {
-                const uint8_t ch = p[i];
-                if (ch >= 32 && ch < 127) { text[t++] = char(ch); ++run; }
-                else { if (run && run < 4) t -= run; if (run >= 4 && t < 236) text[t++] = '|'; run = 0; }
-            }
-            if (run && run < 4) t -= run;
-            text[t] = 0;
-            KPrintf("nv-gsp: RM event at %lu ms: NOCAT %u B head %08x %08x %08x %08x %08x %08x text \"%s\"\n", ms, len,
-                    u32(0), u32(4), u32(8), u32(12), u32(16), u32(20), text);
+            auto str = [&](uint32_t off, char* out, uint32_t cap) {
+                uint32_t i = 0;
+                for (; i + 1 < cap && off + i < n && p[off + i]; ++i) out[i] = (p[off + i] >= 32 && p[off + i] < 127) ? char(p[off + i]) : '.';
+                out[i] = 0; };
+            char src[66], eng[66];
+            str(24, src, sizeof(src)); str(104, eng, sizeof(eng));
+            const uint32_t rec = n > 16 ? p[16] : 0, diag = u32(176);
+            KPrintf("nv-gsp: RM event at %lu ms: NOCAT type %u bugcheck %x source \"%s\" subsystem %u error %x:%08x engine \"%s\" tdr %u diag %u B\n",
+                    ms, rec, u32(20), src, u32(92), u32(100), u32(96), eng, u32(172), diag);
+            for (uint32_t o = 0; o < 128 && o < diag && 180 + o + 16 <= n; o += 16)
+                KPrintf("nv-gsp:   diag+%02x %08x %08x %08x %08x\n", o, u32(180 + o), u32(184 + o), u32(188 + o), u32(192 + o));
             break;
         }
         default: ++g_liveEv.other; KPrintf("nv-gsp: RM event at %lu ms: function 0x%x (%u bytes)\n", ms, fn, len); break;
