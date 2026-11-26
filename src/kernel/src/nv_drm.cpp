@@ -148,7 +148,7 @@ int64_t NvDrmIoctl(NvDrmFile* f, uint64_t cmd, uint64_t arg) {
     // Syncobj waits sleep; everything else is short. One lock per file keeps the tables consistent.
     const uint32_t nr = nvdrm::IocNr(cmd);
     int64_t r;
-    if (nr == nvdrm::NR_SYNCOBJ_WAIT) r = nvdrm::Ioctl(f->core, u, cmd, arg);   // GpuSyncTable has its own lock
+    if (nr == nvdrm::NR_SYNCOBJ_WAIT || nr == nvdrm::NR_SYNCOBJ_TIMELINE_WAIT) r = nvdrm::Ioctl(f->core, u, cmd, arg);   // waits sleep; GpuSyncTable has its own lock
     else { KMutexLock(&f->lock); r = nvdrm::Ioctl(f->core, u, cmd, arg); KMutexUnlock(&f->lock); }
     // M5 bring-up: failing ioctls (except expected waits/busy) go to the kernel log, rate-limited.
     static uint32_t logged = 0;

@@ -25,7 +25,10 @@ constexpr uint32_t kDrmCommandBase = 0x40;
 
 // generic DRM
 constexpr uint32_t NR_VERSION = 0x00, NR_GET_CAP = 0x0c, NR_SYNCOBJ_CREATE = 0xbf, NR_SYNCOBJ_DESTROY = 0xc0,
-                   NR_SYNCOBJ_WAIT = 0xc3, NR_SYNCOBJ_RESET = 0xc4, NR_SYNCOBJ_SIGNAL = 0xc5;
+                   NR_SYNCOBJ_WAIT = 0xc3, NR_SYNCOBJ_RESET = 0xc4, NR_SYNCOBJ_SIGNAL = 0xc5,
+                   NR_SYNCOBJ_TIMELINE_WAIT = 0xca, NR_SYNCOBJ_QUERY = 0xcb, NR_SYNCOBJ_TRANSFER = 0xcc,
+                   NR_SYNCOBJ_TIMELINE_SIGNAL = 0xcd;
+constexpr uint32_t DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE = 4, DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED = 1;
 constexpr uint64_t DRM_CAP_SYNCOBJ = 0x13, DRM_CAP_SYNCOBJ_TIMELINE = 0x14;
 constexpr uint32_t DRM_SYNCOBJ_CREATE_SIGNALED = 1, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL = 1,
                    DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT = 2;
@@ -213,7 +216,7 @@ inline int64_t GetCap(File&, const UserAccess& u, uint64_t arg) {
     DrmGetCap c{};
     if (!u.read(u.ctx, &c, arg, sizeof(c))) return kEFAULT;
     if (c.capability == DRM_CAP_SYNCOBJ) c.value = 1;
-    else if (c.capability == DRM_CAP_SYNCOBJ_TIMELINE) c.value = 0;   // binary only until M5.3
+    else if (c.capability == DRM_CAP_SYNCOBJ_TIMELINE) c.value = 1;
     else return kEINVAL;
     return u.write(u.ctx, arg, &c, sizeof(c)) ? 0 : kEFAULT;
 }
@@ -282,6 +285,106 @@ inline int64_t SyncobjArray(File& f, const UserAccess& u, uint64_t arg, bool sig
         if (!ok) return kEINVAL;
     }
     return 0;
+}
+
+
+// ---- timeline syncobjs (NVK passes timeline points in EXEC/VM_BIND and waits on them) ----
+struct DrmTimelineWait { uint64_t handles, points; int64_t timeout_nsec; uint32_t count_handles, flags, first_signaled, pad; uint64_t deadline_nsec; };
+static_assert(sizeof(DrmTimelineWait) == 48);
+struct DrmTimelineArray { uint64_t handles, points; uint32_t count_handles, flags; };
+static_assert(sizeof(DrmTimelineArray) == 24);
+struct DrmSyncobjTransfer { uint32_t src_handle, dst_handle; uint64_t src_point, dst_point; uint32_t flags, pad; };
+static_assert(sizeof(DrmSyncobjTransfer) == 32);
+// The fence a (handle, point) names: point 0 = the binary payload, else the earliest submitted
+// point >= `point`; nullptr when nothing is submitted for it yet. Returns a reference.
+inline GpuFence* SyncPointFence(GpuSync* s, uint64_t point) { return point ? GpuSyncFindTimeline(s, point) : GpuSyncAcquire(s); }
+// Install `fence` at (handle, point): a new timeline point after the current head, or the binary payload.
+inline bool SyncPointSignal(GpuSync* s, uint64_t point, GpuFence* fence) {
+    if (!point) return GpuSyncReplace(s, fence);
+    // A point fence resolves when its own state, its dependency (`fence`) and its predecessors
+    // have: its own state completes now, so `fence` alone gates it (failure propagates).
+    GpuFence* t = GpuSyncPrepareTimeline(s, point, fence);
+    const bool ok = t && GpuFenceComplete(t, true) && GpuSyncPublishTimeline(s, t);
+    GpuFenceUnref(t);
+    return ok;
+}
+inline int64_t TimelineWait(File& f, const UserAccess& u, uint64_t arg) {
+    DrmTimelineWait w{};
+    if (!u.read(u.ctx, &w, arg, sizeof(w))) return kEFAULT;
+    if (w.flags & ~(DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE))
+        return kEINVAL;
+    if (!w.count_handles || w.count_handles > 64) return kEINVAL;
+    uint32_t h[64]; uint64_t pt[64];
+    if (!u.read(u.ctx, h, w.handles, uint64_t(w.count_handles) * 4) || !u.read(u.ctx, pt, w.points, uint64_t(w.count_handles) * 8)) return kEFAULT;
+    GpuSync* s[64] = {};
+    for (uint32_t i = 0; i < w.count_handles; ++i)
+        if (!(s[i] = f.syncs.Get(h[i]))) { for (uint32_t j = 0; j < i; ++j) GpuSyncUnref(s[j]); return kEINVAL; }
+    const bool all = w.flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, submit = w.flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
+               avail = w.flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE;
+    int64_t rc = 0;
+    for (;;) {
+        uint32_t done = 0, first = ~0u; bool missing = false, failed = false;
+        for (uint32_t i = 0; i < w.count_handles; ++i) {
+            GpuFence* fe = SyncPointFence(s[i], pt[i]);
+            if (!fe) { missing = true; continue; }
+            const uint32_t st = avail ? 1u : GpuFenceState(fe);
+            GpuFenceUnref(fe);
+            if (st) { ++done; if (first == ~0u) first = i; if (st == 2) failed = true; }
+        }
+        if (missing && !submit && !avail) { rc = kEINVAL; break; }
+        if ((all && done == w.count_handles) || (!all && done)) { w.first_signaled = first; rc = failed ? -5 : 0; break; }
+        if (u.now_ns(u.ctx) >= uint64_t(w.timeout_nsec < 0 ? 0 : w.timeout_nsec)) { rc = kETIME; break; }
+        if (!u.sleep_tick(u.ctx)) { rc = -4; break; }
+    }
+    for (uint32_t i = 0; i < w.count_handles; ++i) GpuSyncUnref(s[i]);
+    if (rc == 0 && !u.write(u.ctx, arg, &w, sizeof(w))) return kEFAULT;
+    return rc;
+}
+inline int64_t TimelineQuery(File& f, const UserAccess& u, uint64_t arg) {
+    DrmTimelineArray a{};
+    if (!u.read(u.ctx, &a, arg, sizeof(a))) return kEFAULT;
+    if ((a.flags & ~DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED) || !a.count_handles || a.count_handles > 64) return kEINVAL;
+    uint32_t h[64]; uint64_t pt[64];
+    if (!u.read(u.ctx, h, a.handles, uint64_t(a.count_handles) * 4)) return kEFAULT;
+    for (uint32_t i = 0; i < a.count_handles; ++i) {
+        GpuSync* s = f.syncs.Get(h[i]);
+        if (!s) return kEINVAL;
+        pt[i] = GpuSyncQueryTimeline(s, a.flags & DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED);
+        GpuSyncUnref(s);
+    }
+    return u.write(u.ctx, a.points, pt, uint64_t(a.count_handles) * 8) ? 0 : kEFAULT;
+}
+inline int64_t TimelineSignal(File& f, const UserAccess& u, uint64_t arg) {
+    DrmTimelineArray a{};
+    if (!u.read(u.ctx, &a, arg, sizeof(a))) return kEFAULT;
+    if (a.flags || !a.count_handles || a.count_handles > 64) return kEINVAL;
+    uint32_t h[64]; uint64_t pt[64];
+    if (!u.read(u.ctx, h, a.handles, uint64_t(a.count_handles) * 4) || !u.read(u.ctx, pt, a.points, uint64_t(a.count_handles) * 8)) return kEFAULT;
+    for (uint32_t i = 0; i < a.count_handles; ++i) {
+        GpuSync* s = f.syncs.Get(h[i]);
+        if (!s) return kEINVAL;
+        GpuFence* fe = GpuFenceCreate(true);
+        const bool ok = fe && SyncPointSignal(s, pt[i], fe);
+        GpuFenceUnref(fe); GpuSyncUnref(s);
+        if (!ok) return kEINVAL;
+    }
+    return 0;
+}
+inline int64_t SyncobjTransfer(File& f, const UserAccess& u, uint64_t arg) {
+    DrmSyncobjTransfer t{};
+    if (!u.read(u.ctx, &t, arg, sizeof(t))) return kEFAULT;
+    if (t.pad || (t.flags & ~DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT)) return kEINVAL;
+    GpuSync* src = f.syncs.Get(t.src_handle);
+    GpuSync* dst = f.syncs.Get(t.dst_handle);
+    int64_t rc = 0;
+    if (!src || !dst) rc = kEINVAL;
+    else {
+        GpuFence* fe = SyncPointFence(src, t.src_point);
+        if (!fe) rc = kEINVAL;   // nothing submitted at the source point
+        else { if (!SyncPointSignal(dst, t.dst_point, fe)) rc = kEINVAL; GpuFenceUnref(fe); }
+    }
+    GpuSyncUnref(src); GpuSyncUnref(dst);
+    return rc;
 }
 
 inline int64_t Getparam(File& f, const UserAccess& u, uint64_t arg) {
@@ -639,7 +742,8 @@ inline int64_t ReadSyncs(File& f, const UserAccess& u, uint64_t ptr, uint32_t co
     if (count > kMaxJobSyncs) { f.why = "too many syncs"; return kEINVAL; }
     if (count && !u.read(u.ctx, out, ptr, uint64_t(count) * sizeof(SyncDesc))) return kEFAULT;
     for (uint32_t i = 0; i < count; ++i) {
-        if (out[i].flags != SYNC_SYNCOBJ) { f.why = "sync type (timeline?)"; return kEINVAL; }   // binary syncobjs only (no timeline cap yet)
+        if (out[i].flags != SYNC_SYNCOBJ && out[i].flags != SYNC_TIMELINE_SYNCOBJ) { f.why = "sync type"; return kEINVAL; }
+        if (out[i].flags == SYNC_SYNCOBJ && out[i].timeline_value) { f.why = "binary sync with a point"; return kEINVAL; }
         GpuSync* s = f.syncs.Get(out[i].handle);
         if (!s) { f.why = "sync handle"; return kEINVAL; }
         GpuSyncUnref(s);
@@ -673,13 +777,13 @@ inline int64_t VmBindIoctl(File& f, const UserAccess& u, uint64_t arg) {
     for (uint32_t i = 0; i < v.op_count; ++i) j.ops[i] = ops[i];
     for (uint32_t i = 0; i < v.wait_count; ++i) {
         GpuSync* s = f.syncs.Get(waits[i].handle);
-        GpuFence* fe = GpuSyncAcquire(s); GpuSyncUnref(s);
+        GpuFence* fe = SyncPointFence(s, waits[i].timeline_value); GpuSyncUnref(s);
         if (!fe) { for (uint32_t k = 0; k < j.nwaits; ++k) GpuFenceUnref(j.waits[k]); j = BindJob{}; return kEINVAL; }   // nothing submitted yet
         j.waits[j.nwaits++] = fe;
     }
     j.done = GpuFenceCreate(false);
     if (!j.done) { for (uint32_t k = 0; k < j.nwaits; ++k) GpuFenceUnref(j.waits[k]); j = BindJob{}; return kENOMEM; }
-    for (uint32_t i = 0; i < v.sig_count; ++i) { GpuSync* s = f.syncs.Get(sigs[i].handle); GpuSyncReplace(s, j.done); GpuSyncUnref(s); }
+    for (uint32_t i = 0; i < v.sig_count; ++i) { GpuSync* s = f.syncs.Get(sigs[i].handle); SyncPointSignal(s, sigs[i].timeline_value, j.done); GpuSyncUnref(s); }
     JobBoRefs(f, j, true);
     ++f.job_count;
     Pump(f);
@@ -755,13 +859,13 @@ inline int64_t ExecIoctl(File& f, const UserAccess& u, uint64_t arg) {
             j->push[i].va_len / 4 >= (1u << 21)) { f.why = "push va/len/flags"; kfree(j); return kEINVAL; }
     for (uint32_t i = 0; i < e.wait_count; ++i) {
         GpuSync* s = f.syncs.Get(waits[i].handle);
-        GpuFence* fe = GpuSyncAcquire(s); GpuSyncUnref(s);
+        GpuFence* fe = SyncPointFence(s, waits[i].timeline_value); GpuSyncUnref(s);
         if (!fe) { f.why = "exec wait on a syncobj with no fence"; FreeJob(j, false); return kEINVAL; }
         j->waits[j->nwaits++] = fe;
     }
     j->done = GpuFenceCreate(false);
     if (!j->done) { FreeJob(j, false); return kENOMEM; }
-    for (uint32_t i = 0; i < e.sig_count; ++i) { GpuSync* s = f.syncs.Get(sigs[i].handle); GpuSyncReplace(s, j->done); GpuSyncUnref(s); }
+    for (uint32_t i = 0; i < e.sig_count; ++i) { GpuSync* s = f.syncs.Get(sigs[i].handle); SyncPointSignal(s, sigs[i].timeline_value, j->done); GpuSyncUnref(s); }
     GpuFenceRef(j->done); GpuFenceUnref(f.last_exec); f.last_exec = j->done;
     c->jobs[(c->job_head + c->job_count) % kMaxExecJobs] = j; ++c->job_count;
     PumpChannel(f, *c);
@@ -800,6 +904,10 @@ inline int64_t Ioctl(File& f, const UserAccess& u, uint64_t cmd, uint64_t arg) {
         case NR_SYNCOBJ_WAIT: return sized(sizeof(DrmSyncobjWait)) ? SyncobjWait(f, u, arg) : kEINVAL;
         case NR_SYNCOBJ_RESET: return sized(sizeof(DrmSyncobjArray)) ? SyncobjArray(f, u, arg, false) : kEINVAL;
         case NR_SYNCOBJ_SIGNAL: return sized(sizeof(DrmSyncobjArray)) ? SyncobjArray(f, u, arg, true) : kEINVAL;
+        case NR_SYNCOBJ_TIMELINE_WAIT: return sized(sizeof(DrmTimelineWait)) ? TimelineWait(f, u, arg) : kEINVAL;
+        case NR_SYNCOBJ_QUERY: return sized(sizeof(DrmTimelineArray)) ? TimelineQuery(f, u, arg) : kEINVAL;
+        case NR_SYNCOBJ_TIMELINE_SIGNAL: return sized(sizeof(DrmTimelineArray)) ? TimelineSignal(f, u, arg) : kEINVAL;
+        case NR_SYNCOBJ_TRANSFER: return sized(sizeof(DrmSyncobjTransfer)) ? SyncobjTransfer(f, u, arg) : kEINVAL;
         case kDrmCommandBase + NV_GETPARAM: return sized(sizeof(NvGetparam)) ? Getparam(f, u, arg) : kEINVAL;
         case kDrmCommandBase + NV_VM_INIT: return sized(sizeof(NvVmInit)) ? VmInit(f, u, arg) : kEINVAL;
         case kDrmCommandBase + NV_CHANNEL_ALLOC: return sized(sizeof(NvChannelAlloc)) ? ChannelAlloc(f, u, arg) : kEINVAL;

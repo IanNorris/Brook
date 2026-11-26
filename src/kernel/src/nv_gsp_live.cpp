@@ -1220,6 +1220,10 @@ void LogEvent(const uint8_t* m, uint32_t len) {
 void EventThread(void*) {
     uint32_t ticks = 0;
     alignas(8) static uint8_t buf[kMaxRpcBytes];
+    constexpr uint32_t kPend = 16, kPendBytes = 1536;   // NOCAT records are 1244 B; RC/OS error are small
+    alignas(8) static uint8_t pend[kPend][kPendBytes];
+    static uint32_t pend_len[kPend];
+    uint32_t npend = 0;
     for (;;) {
         SchedulerSleepMs(500);
         ++ticks;
@@ -1230,10 +1234,13 @@ void EventThread(void*) {
         if (g_rmRunning) {
             FlushRange(g_rm->objs.q.msgq(), kQueueBytes);
             NoWait nw;
-            for (int i = 0; i < 16 && g_rm->ch->MsgPending(); ++i) {
+            // copy events out under the lock (bounded), log them after releasing it: serial
+            // KPrintf of long records under the spinlock stalled the system ~1 s (26 Nov)
+            for (int i = 0; i < 16 && g_rm->ch->MsgPending() && npend < kPend; ++i) {
                 uint32_t len = 0;
                 if (g_rm->ch->Recv(buf, sizeof(buf), &len, 0, nw) != QStatus::Ok) break;
-                LogEvent(buf, len);
+                const uint32_t keep = len < kPendBytes ? len : kPendBytes;
+                __builtin_memcpy(pend[npend], buf, keep); pend_len[npend] = keep; ++npend;
                 FlushRange(g_rm->objs.q.msgq(), kQueueBytes);
             }
             ++g_liveEv.drains;
@@ -1256,6 +1263,8 @@ void EventThread(void*) {
         }
         SpinLockRelease(lock);
         __atomic_store_n(&g_busy, 0u, __ATOMIC_RELEASE);
+        for (uint32_t i = 0; i < npend; ++i) LogEvent(pend[i], pend_len[i]);
+        npend = 0;
     }
 }
 void EventThreadStart() {
@@ -1646,7 +1655,7 @@ bool NvdChanCreate(void*, uint32_t vas, uint32_t engine, uint32_t* out) {
     nvd::Vas& v = nvd::g_vas[vas];
     ch.va = nvd::kRingVa + uint64_t(i) * 0x10000;
     GrScope& s = ch.s;
-    s.base = v.s.base; s.chid = chid; s.external = true; s.priv = true; s.h_vas = v.s.h_vas;
+    s.base = v.s.base; s.chid = chid; s.external = true; s.priv = false; s.h_vas = v.s.h_vas;   // user channels: unprivileged (nouveau r535)
     s.h_chan = v.s.base + 0x100 + i * 0x10; s.gpfifo_va = ch.va; s.va_next = nvd::kCtxVa + (uint64_t(i) << 32);
     const bool ok = NvdWithRm("CHANNEL_ALLOC", [&](auto& x, auto& vio, const ChipOps& c) {
         namespace h = rm::host;

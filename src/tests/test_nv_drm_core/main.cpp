@@ -253,8 +253,34 @@ static void TestExec(const DeviceInfo& dev) {
     // validation
     assert(Exe(f, ca.channel, {{0x300000, 6, 0}}) == kEINVAL && Exe(f, ca.channel, {{0x300000, 0, 0}}) == kEINVAL);
     assert(Exe(f, ca.channel, {{0x300000, 8, 2}}) == kEINVAL && Exe(f, 99, {{0x300000, 8, 0}}) == kENOENT);
+    // timeline syncobjs: EXEC signals point 5; waits, query, CPU signal and transfer by point
+    {
+        DrmSyncobjCreate tl{0, 0}; assert(Io(f, NR_SYNCOBJ_CREATE, tl) == 0);
+        const uint32_t before = uint32_t(hw.subs.size());
+        assert(Exe(f, ca.channel, {{0x500000, 8, 0}}, {}, {{SYNC_TIMELINE_SYNCOBJ, tl.handle, 5}}) == 0 && hw.subs.size() == before + 1);
+        uint32_t th = tl.handle; uint64_t p5 = 5, p3 = 3, p6 = 6;
+        DrmTimelineWait w5{uint64_t(&th), uint64_t(&p5), 0, 1, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, 0, 0, 0};
+        DrmTimelineWait w6{uint64_t(&th), uint64_t(&p6), 0, 1, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, 0, 0, 0};
+        assert(Io(f, NR_SYNCOBJ_TIMELINE_WAIT, w5) == kETIME && Io(f, NR_SYNCOBJ_TIMELINE_WAIT, w6) == kEINVAL);   // 6 not submitted
+        DrmTimelineWait wa{uint64_t(&th), uint64_t(&p5), 0, 1, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE, 0, 0, 0};
+        assert(Io(f, NR_SYNCOBJ_TIMELINE_WAIT, wa) == 0);                                                    // 5 is available
+        uint64_t q = 99; DrmTimelineArray qa{uint64_t(&th), uint64_t(&q), 1, DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED};
+        assert(Io(f, NR_SYNCOBJ_QUERY, qa) == 0 && q == 5);
+        qa.flags = 0; assert(Io(f, NR_SYNCOBJ_QUERY, qa) == 0 && q == 0);                                   // nothing signalled yet
+        hw.completed = hw.subs.back().first;
+        assert(Io(f, NR_SYNCOBJ_TIMELINE_WAIT, w5) == 0);
+        DrmTimelineWait w3{uint64_t(&th), uint64_t(&p3), 0, 1, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, 0, 0, 0};
+        assert(Io(f, NR_SYNCOBJ_TIMELINE_WAIT, w3) == 0);                                                    // earlier points are covered
+        assert(Io(f, NR_SYNCOBJ_QUERY, qa) == 0 && q == 5);
+        DrmTimelineArray sg{uint64_t(&th), uint64_t(&p6), 1, 0}; assert(Io(f, NR_SYNCOBJ_TIMELINE_SIGNAL, sg) == 0 && Io(f, NR_SYNCOBJ_TIMELINE_WAIT, w6) == 0);
+        DrmSyncobjCreate b2{0, 0}; assert(Io(f, NR_SYNCOBJ_CREATE, b2) == 0);
+        DrmSyncobjTransfer tr{tl.handle, b2.handle, 6, 0, 0, 0}; assert(Io(f, NR_SYNCOBJ_TRANSFER, tr) == 0);
+        assert(wait(b2.handle) == 0);
+        DrmSyncobjTransfer bad{tl.handle, b2.handle, 9, 0, 0, 0}; assert(Io(f, NR_SYNCOBJ_TRANSFER, bad) == kEINVAL);
+        assert(Exe(f, ca.channel, {{0x500000, 8, 0}}, {{SYNC_SYNCOBJ, tl.handle, 7}}) == kEINVAL);          // binary flag with a point
+    }
     // channel error: in-flight work fails, later EXECs are refused
-    assert(Exe(f, ca.channel, {{0x400000, 8, 0}}, {}, {{SYNC_SYNCOBJ, s1.handle, 0}}) == 0 && hw.subs.size() == 3);
+    assert(Exe(f, ca.channel, {{0x400000, 8, 0}}, {}, {{SYNC_SYNCOBJ, s1.handle, 0}}) == 0 && hw.subs.size() == 4);
     hw.error = true;
     assert(wait(s1.handle) == -5 && c->dead && Exe(f, ca.channel, {{0x400000, 8, 0}}) == -19);
     // CHANNEL_FREE and close destroy the backend channels
@@ -283,7 +309,7 @@ int main() {
     }
     {   // vk_drm_syncobj_get_type: create signalled, wait(0), destroy; timeline cap off
         DrmGetCap c{DRM_CAP_SYNCOBJ, 0}; assert(Io(f, NR_GET_CAP, c) == 0 && c.value == 1);
-        DrmGetCap t{DRM_CAP_SYNCOBJ_TIMELINE, 9}; assert(Io(f, NR_GET_CAP, t) == 0 && t.value == 0);
+        DrmGetCap t{DRM_CAP_SYNCOBJ_TIMELINE, 9}; assert(Io(f, NR_GET_CAP, t) == 0 && t.value == 1);
         DrmSyncobjCreate s{0, DRM_SYNCOBJ_CREATE_SIGNALED}; assert(Io(f, NR_SYNCOBJ_CREATE, s) == 0 && s.handle);
         uint32_t h = s.handle; DrmSyncobjWait w{uint64_t(&h), 0, 1, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, 0, 0, 0};
         assert(Io(f, NR_SYNCOBJ_WAIT, w) == 0 && w.first_signaled == 0);
