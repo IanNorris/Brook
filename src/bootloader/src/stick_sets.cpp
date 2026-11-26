@@ -3,6 +3,7 @@
 #include "stick_sets.h"
 #include "fs.h"
 #include "memory.h"
+#include "boot_payload.h"
 #include "console.h"
 #include "recovery_device_path.h"
 #include "../../shared/update/stick_set.h"
@@ -110,7 +111,9 @@ static bool LoadSet(EFI_HANDLE image, EFI_BOOT_SERVICES* bs, bool prev, uint8_t*
         initrd = kernel ? ReadFile(image, bs, prev ? u"PREV\\INITRD.IMG" : u"INITRD.IMG", &ib,
                                    BROOK_STICK_SET_INITRD_MAX) : nullptr;
         ok = kernel && initrd && BrookStickSetMatches(record, kernel, kb, initrd, ib) &&
-             BrookUpdateExecutable(kernel, kb);
+             ExpandBootPayload(bs, kernel, kb, BootPayloadKind::Kernel, BROOK_STICK_SET_KERNEL_MAX) &&
+             BrookUpdateExecutable(kernel, kb) &&
+             ExpandBootPayload(bs, initrd, ib, BootPayloadKind::Initrd, BROOK_STICK_SET_INITRD_MAX);
         if (ok) {
             for (unsigned i = 0; i < 32; ++i) {
                 out.kernelSha256[i] = BrookStickSetKernelSha(record)[i];

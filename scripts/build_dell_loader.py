@@ -58,6 +58,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--output', type=Path, required=True, help='new private directory (must not exist)')
     p.add_argument('--shared', type=Path, default=DEFAULT_SHARED)
+    p.add_argument('--boot-compression-public-key',
+                   help='enable signed compressed boot with this Ed25519 public key in lowercase hex')
     p.add_argument('--allow-dirty', action='store_true', help='permit uncommitted changes (recorded)')
     a = p.parse_args()
     out = a.output.resolve()
@@ -84,6 +86,8 @@ def main():
     configure = ['cmake', '-S', ROOT / 'src/bootloader', '-B', build, '-G', 'Ninja', '-C', cache,
                  f'-DCMAKE_TOOLCHAIN_FILE={ROOT}/cmake/toolchains/uefi-x86_64-clang.cmake']
     configure += [f'-D{k}:BOOL={v}' for k, v in sorted(PUBLIC_OPTIONS.items())]
+    if a.boot_compression_public_key:
+        configure += [f'-DBROOK_BOOT_COMPRESSION_KEY={a.boot_compression_public_key}']
     print('+ cmake configure (private guard values from initial cache)', flush=True)
     subprocess.run([str(x) for x in configure], check=True, stdout=subprocess.DEVNULL)
     print('+ cmake --build', build, flush=True)
@@ -103,6 +107,8 @@ def main():
                                (ROOT / 'src/shared/boot_protocol/boot_protocol.h').read_text().splitlines()
                                if 'BootProtocolVersion =' in line), None),
     }
+    if a.boot_compression_public_key:
+        manifest['boot_compression_public_key'] = a.boot_compression_public_key
     (out / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     print(json.dumps({k: manifest[k] for k in ('commit', 'dirty', 'sha256', 'bytes', 'boot_protocol')}, indent=2))
 

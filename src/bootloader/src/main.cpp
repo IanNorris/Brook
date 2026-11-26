@@ -9,6 +9,7 @@
 #include "firmware_runtime_cache.h"
 #include "acpi.h"
 #include "elf_loader.h"
+#include "boot_payload.h"
 #include "fs.h"
 #include "update_slots.h"
 #include "stick_sets.h"
@@ -215,8 +216,14 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
             Halt(EFI_NOT_FOUND, u"Recovery payload invalid or missing; use a recovery USB.");
         }
     }
-    if (!updatePair) kernelData = ReadFile(imageHandle, systemTable->BootServices,
-        g_bootConfig.target, &kernelFileSize);
+    if (!updatePair) {
+        kernelData = ReadFile(imageHandle, systemTable->BootServices, g_bootConfig.target, &kernelFileSize);
+        if (BootCompressed(kernelData, kernelFileSize) &&
+            (g_bootConfig.updateSlots || g_bootConfig.stickSets ||
+             !ExpandBootPayload(systemTable->BootServices, kernelData, kernelFileSize,
+                                BootPayloadKind::Kernel, BROOK_UPDATE_KERNEL_MAX)))
+            Halt(EFI_SECURITY_VIOLATION, u"Compressed kernel verification failed");
+    }
     if (kernelData == nullptr)
     {
         Halt(EFI_NOT_FOUND, u"Kernel not found");
@@ -237,8 +244,14 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
         reinterpret_cast<EFI_PHYSICAL_ADDRESS>(kernelData), kernelFileSize);
 
     // --- Load initrd (optional) ---
-    if (!updatePair) initrdData = ReadFile(imageHandle, systemTable->BootServices,
-        u"INITRD.IMG", &initrdFileSize);
+    if (!updatePair) {
+        initrdData = ReadFile(imageHandle, systemTable->BootServices, u"INITRD.IMG", &initrdFileSize);
+        if (BootCompressed(initrdData, initrdFileSize) &&
+            (g_bootConfig.updateSlots || g_bootConfig.stickSets ||
+             !ExpandBootPayload(systemTable->BootServices, initrdData, initrdFileSize,
+                                BootPayloadKind::Initrd, BROOK_UPDATE_INITRD_MAX)))
+            Halt(EFI_SECURITY_VIOLATION, u"Compressed initrd verification failed");
+    }
     if (initrdData != nullptr)
     {
         ConsolePrintLine(u"Initrd loaded");

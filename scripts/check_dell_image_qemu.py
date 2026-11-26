@@ -108,6 +108,8 @@ def main():
     p.add_argument('--pair', type=Path, required=True, help='pair directory (kernel.elf, INITRD.IMG)')
     p.add_argument('--kernel-build', type=Path, default=ROOT / 'build/dell/kernel',
                    help='kernel build directory whose BROOK.elf is the pair kernel')
+    p.add_argument('--boot-compression-seed', type=Path,
+                   help='compress and sign the fixture after applying QEMU-only initrd edits')
     p.add_argument('--kernel-build-flags', type=Path,
                    help='JSON with kernel_build_flags, for a pair whose build directory is gone')
     p.add_argument('--shared', type=Path, default=DEFAULT_SHARED)
@@ -142,6 +144,10 @@ def main():
     if a.bridge_v3_nic_accel and not a.bridge_v3_nic:
         p.error('--bridge-v3-nic-accel requires --bridge-v3-nic')
     mode_flags = list(MODE_FLAGS)
+    if a.boot_compression_seed:
+        if not a.efi:
+            p.error('compression requires --efi with the matching public key pinned')
+        mode_flags += ['--boot-compression-seed', str(a.boot_compression_seed.absolute())]
     if a.managed_profile:
         mode_flags.append('--managed-profile')
     if a.managed_profile_absolute_current:

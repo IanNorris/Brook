@@ -362,6 +362,7 @@ def build(args):
     if args.usb_system:
         from usb_profile_plan import checked_plan
         args.checked_profile_plan = checked_plan(args.profile_plan, args.profile_plan_public_key)
+    from boot_compression import INITRD, KERNEL, compress, read_signer
     if args.operators.name.endswith('.seed'):
         raise SystemExit('--operators takes the public key file, never a seed')
     signer_hex = args.update_signer.read_text().strip()
@@ -373,6 +374,16 @@ def build(args):
     keys = validate_operator_policy(policy)
     if not keys:
         raise SystemExit('At least one operator public key is required')
+    compression = None
+    if args.boot_compression_seed:
+        other_keys = (*keys, bytes.fromhex(signer_hex))
+        if args.usb_system:
+            # checked_plan already validated the DER shape as Ed25519.
+            der = subprocess.check_output(
+                ['openssl', 'pkey', '-pubin', '-outform', 'DER'],
+                input=args.checked_profile_plan[2])
+            other_keys += (der[-32:],)
+        compression = read_signer(args.boot_compression_seed, other_keys)
     commit = subprocess.check_output(['git', '-C', ROOT, 'rev-parse', 'HEAD'], text=True).strip()
     dirty = bool(subprocess.check_output(['git', '-C', ROOT, 'status', '--porcelain', '--untracked-files=no']))
     if dirty and not args.allow_dirty:
@@ -395,7 +406,9 @@ def build(args):
     run(['cmake', '--build', kernel_build])
     run(['cmake', '-S', ROOT / 'src/bootloader', '-B', loader_build, '-G', 'Ninja',
          f'-DCMAKE_TOOLCHAIN_FILE={ROOT}/cmake/toolchains/uefi-x86_64-clang.cmake',
-         *[f'-D{k}:BOOL={v}' for k, v in LOADER_FLAGS.items()]])
+         *[f'-D{k}:BOOL={v}' for k, v in LOADER_FLAGS.items()],
+         *([f'-DBROOK_BOOT_COMPRESSION_KEY={compression.verify_key.encode().hex()}']
+           if compression else [])])
     run(['cmake', '--build', loader_build, '--target', 'bootloader'])
     kernel = kernel_build / 'BROOK.elf'
     loader = loader_build / 'BOOTX64.efi'
@@ -456,13 +469,20 @@ def build(args):
     config = loader_config(*args.display_max)
     (staged / 'BROOK.CFG').write_bytes(config)
     (staged / 'README.TXT').write_text(README)
-    (staged / 'SET.BIN').write_bytes(stick_set((staged / 'KERNEL/BROOK.ELF').read_bytes(),
-                                               (staged / 'INITRD.IMG').read_bytes(), payload_id))
     if (staged / 'KERNEL/BROOK.ELF').read_bytes()[:4] != b'\x7fELF' or \
             (staged / 'EFI/BOOT/BOOTX64.EFI').read_bytes()[:2] != b'MZ':
         raise SystemExit('Unexpected kernel or loader format')
     for name in NAMES:
-        require_keyless_disk(staged / name)
+        if name != 'SET.BIN':
+            require_keyless_disk(staged / name)
+    if compression:
+        for name, kind, maximum in (('KERNEL/BROOK.ELF', KERNEL, 32 << 20),
+                                    ('INITRD.IMG', INITRD, 128 << 20)):
+            path = staged / name
+            path.write_bytes(compress(path.read_bytes(), kind, compression, maximum))
+    (staged / 'SET.BIN').write_bytes(stick_set((staged / 'KERNEL/BROOK.ELF').read_bytes(),
+                                               (staged / 'INITRD.IMG').read_bytes(), payload_id))
+    require_keyless_disk(staged / 'SET.BIN')
     files = {name: {'bytes': (staged / name).stat().st_size, 'sha256': sha(staged / name)} for name in NAMES}
     manifest = {
         'format': FORMAT, 'commit': commit, 'dirty': dirty, 'payload_id': payload_id,
@@ -502,6 +522,8 @@ def build(args):
              'bridge verbs (each GPU-writing verb at most once per boot): ') + 'GPU fn0 PCI command '
             'bus-master enable and GSP/SEC2 falcon registers (FWSEC from the card VBIOS, booter_unload from the '
             'pinned 570.144 set); PROM read-only; no VBIOS/flash writes, no clock/fan/voltage changes')
+    if compression:
+        manifest['boot_compression'] = {'codec': 'lz4', 'public_key': compression.verify_key.encode().hex()}
     staged_manifest = staged / 'manifest.json'
     staged_manifest.write_text(json.dumps(manifest, indent=2) + '\n')
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -558,6 +580,8 @@ def main():
                    help='GOP mode cap in BROOK.CFG (kernel supports up to 4096x2160); outside PREV/ fallback')
     p.add_argument('--allow-dirty', action='store_true')
     p.add_argument('--keyboard-layout', choices=('gb', 'us'), default='gb')
+    p.add_argument('--boot-compression-seed', type=Path,
+                   help='sign and enable LZ4 boot payloads with a private 32-byte Ed25519 seed')
     p.add_argument('--restart-prompt-seconds', type=int, choices=range(1, 601), metavar='1..600')
     p.add_argument('--nv-display', action='store_true',
                    help='desktop image: /etc/nv-display = 1 (RTX head-0 flip presentation at desktop start)')
