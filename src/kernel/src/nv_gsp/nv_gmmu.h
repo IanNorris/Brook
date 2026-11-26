@@ -41,8 +41,8 @@ inline constexpr GmmuFormat kGmmuV2 = {
 
 namespace gmmu {
 constexpr uint64_t kPteValid = 1ull << 0, kVol = 1ull << 3, kPriv = 1ull << 5, kRo = 1ull << 6;
-inline uint64_t AddrField(uint64_t pa) { return (pa >> 4) & 0x00fffffffffffff00ull; }
-inline uint64_t FieldAddr(uint64_t e) { return (e & 0x00fffffffffffff00ull) << 4; }
+inline uint64_t AddrField(uint64_t pa) { return (pa >> 4) & 0x00ffffffffffff00ull; }
+inline uint64_t FieldAddr(uint64_t e) { return (e & 0x00ffffffffffff00ull) << 4; }
 // PDE pointing at a table in `a` (never Peer).
 inline uint64_t Pde(uint64_t table, Aperture a) {
     const uint64_t ap = a == Aperture::Video ? 1 : a == Aperture::SysCoh ? 2 : 3;
