@@ -923,7 +923,10 @@ void P4(bool keepDisplay) {
     g_rmRunning = r.init_done;
     if (r.static_ok) { g_static = r.si; memcpy(g_staticRaw, r.static_raw, kStaticInfoBytes); g_staticValid = true; }
     bool mapped = false;
-    if (lock && r.init_done && r.si.ok) mapped = Bar1MapLocked(16);
+    // 27 Nov split: keep-display boot without patching RM's BAR1 page directory (/etc/nv-gsp-no-bar1-identity)
+    if (lock && r.init_done && r.si.ok && PathExists("/etc/nv-gsp-no-bar1-identity"))
+        KPrintf("nv-gsp: keep-display P4 without the BAR1 identity map (/etc/nv-gsp-no-bar1-identity)\n");
+    else if (lock && r.init_done && r.si.ok) mapped = Bar1MapLocked(16);
     if (lock) SpinLockRelease(lock);
     const uint64_t heldUs = lock ? NowUs() - lockUs : 0;
     if (r.init_done && !g_quiesceHooked) g_quiesceHooked = PlatformPowerAddQuiesce(GspRmQuiesceForReset);
