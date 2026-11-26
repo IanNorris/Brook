@@ -37,7 +37,11 @@ bool Busy(const nvdrm::File& f) {
     for (const auto& c : f.channels) if (c.used && (c.job_count || c.in_count)) return true;
     return false;
 }
+// 1 ms cadence while busy and for kHotMs after (a synchronous submit/wait loop goes idle between
+// frames; a 20 ms idle sleep then capped NVK at ~50 fps, offscreen vkcube 27 Nov), 20 ms when cold.
+constexpr uint64_t kHotMs = 500;
 void Poller(void*) {
+    uint64_t last_busy = 0;
     for (;;) {
         NvDrmFile* list[kMaxFiles]; uint32_t n = 0;
         KMutexLock(&g_filesLock);
@@ -50,7 +54,9 @@ void Poller(void*) {
             KMutexUnlock(&list[i]->lock);
             NvDrmFileUnref(list[i]);
         }
-        SchedulerSleepMs(busy ? 1 : 20);
+        const uint64_t now = ApicTickCount();
+        if (busy) last_busy = now;
+        SchedulerSleepMs(busy || now - last_busy < kHotMs ? 1 : 20);
     }
 }
 void Register(NvDrmFile* f, bool add) {
