@@ -38,6 +38,13 @@ constexpr uint32_t RegRgPos(uint32_t h){return 0x616330+h*0x800;} // vline 15:0 
 // for this counter to move past its value at arm time.
 constexpr uint32_t RegLoadvCounter(uint32_t h){return 0x61611c+h*0x800;}
 
+// NV_UFLUSH_L2_FLUSH_DIRTY: write 1, poll bits 1:0 clear (nouveau gf100_ltc_flush). Write-back only.
+constexpr uint32_t kRegL2FlushDirty=0x070010;
+// Kick ordering (27 Nov NVK head freeze): 0 = BAR1 flush then PUT (the D1 path); 1 = also read the
+// last word back through BAR1 before the flush; 2 = 1 + L2 flush-dirty before PUT. Default 1: with
+// GSP-RM up BAR1 is virtual (our identity tables in VRAM), so a posted ring write can wait on a
+// BAR1 page walk while the PUT (BAR0) overtakes it and the window fetches stale words. A BAR read
+// is how nouveau flushes BAR writes under GSP-RM (r535_bar_flush reads its BAR2 flush page).
 // Backend: rd, wr, vrd, vwr, fence, nowUs, relax (as the runners' backends).
 template<typename B> struct NvWindowFlipper{
     static constexpr uint32_t kMaxBuffers=3;    // triple buffering for the desktop (D2); bench uses 2
@@ -89,7 +96,7 @@ template<typename B> struct NvWindowFlipper{
         const uint32_t cap=periodUs/1000+1;
         return ms>cap?cap:ms;}
     bool Live()const{return state==FlipState::Idle||state==FlipState::Armed;}
-    bool Allowed(uint32_t a)const{return a==RegPut(chid)||a==kRegBar1Flush||a==RegHeadTimingEvt(head);}
+    bool Allowed(uint32_t a)const{return a==RegPut(chid)||a==kRegBar1Flush||a==kRegL2FlushDirty||a==RegHeadTimingEvt(head);}
     void Fail(FlipFail f){if(state!=FlipState::Failed){fail=f;state=FlipState::Failed;}}
     void Wr(uint32_t a,uint32_t v){if(!Allowed(a)){Fail(FlipFail::Guard);return;}b->wr(a,v);}
 
@@ -112,15 +119,27 @@ template<typename B> struct NvWindowFlipper{
         const uint32_t bytes=n*4;
         if(bytes+8>kRingBytes){Fail(FlipFail::Bounds);return false;}
         if(put+bytes+4>kRingBytes){b->vwr(ring+put,PushJump(0));put=0;++st.wraps;}
+        lastKickOff=put;lastKickN=n;
+        if(w!=lastW)for(uint32_t i=0;i<n&&i<kWordsMax;++i)lastW[i]=w[i];
         for(uint32_t i=0;i<n;++i)b->vwr(ring+put+i*4,w[i]);
         __atomic_thread_fence(__ATOMIC_SEQ_CST);b->fence();
+        if(kickMode>=1&&n)(void)b->vrd(ring+put+(n-1)*4);   // non-posted read: the posted ring writes landed
         Wr(kRegBar1Flush,1);
         bool flushed=false;for(uint32_t t=0;t<20000;++t)if(!(b->rd(kRegBar1Flush)&0x2)){flushed=true;break;}
         if(!flushed){Fail(FlipFail::Flush);return false;}
+        if(kickMode>=2){Wr(kRegL2FlushDirty,1);flushed=false;for(uint32_t t=0;t<20000;++t)if(!(b->rd(kRegL2FlushDirty)&0x3)){flushed=true;break;}
+            if(!flushed){Fail(FlipFail::Flush);return false;}}
         put+=bytes;Wr(RegPut(chid),put);
         return state!=FlipState::Failed;
     }
     uint32_t armLine=0,armLoadv=0;
+    uint32_t lastKickOff=0,lastKickN=0;   // ring offset and word count of the last kick (failure diagnostics)
+    uint8_t kickMode=1;
+    // Stale-fetch recovery (27 Nov): the window fetched the kick (GET == PUT, idle, no exception)
+    // but ARM kept the previous surface while LOADV moved on. The same words are kicked again
+    // (at most kMaxRekicks per flip); rekicks/rekickOk count it.
+    static constexpr uint32_t kMaxRekicks=3,kWordsMax=32;
+    uint32_t lastW[kWordsMax]{};uint32_t rekicksThis=0,rekicks=0,rekickOk=0;bool rekicked=false;
     bool loadvLive=true;   // false if the counter never moves (then: armed-state completion, flagged)
     uint32_t loadvStuck=0;
     bool ArmWords(const uint32_t* w,uint32_t n,uint32_t iso,uint32_t offset){
@@ -130,6 +149,7 @@ template<typename B> struct NvWindowFlipper{
         armedIso=iso;armedTarget=offset;armedAtUs=b->nowUs();state=FlipState::Armed;return true;}
     void Arm(int8_t buf){
         Push p;PushWindowFlip(p,surf[buf],handle,interval);PushWindowUpdate(p,window);
+        rekicksThis=0;rekicked=false;
         if(ArmWords(p.words,p.count,handle,uint32_t(surf[buf].vram>>8)))armed=buf;
     }
     // Present buffer `buf` at the next vblank. 0 = armed now, 1 = queued (mailbox:
@@ -167,12 +187,22 @@ template<typename B> struct NvWindowFlipper{
             ++st.latHist[lat<100?0:lat<1000?1:lat<4000?2:lat<8000?3:lat<12000?4:lat<17000?5:6];
             if(vtotal)++st.lineHist[(uint64_t(line)*8/vtotal)>7?7:(uint64_t(line)*8/vtotal)];
             if(probeCount<probeWant&&probeCount<kProbeMax)probe[probeCount++]=Sample{armLine,line,lat,evt};
+            if(rekicked){++rekickOk;rekicked=false;}
             if(armed>=0)front=armed;armed=-1;state=FlipState::Idle;
             st.lastLatchLine=line;
             if(InBlank(line))++st.latchBlank;else ++st.latchActive;
             latchFrame=st.frames;
             if(queued>=0&&(!paced||loadvLive)){const int8_t q=queued;queued=-1;Arm(q);} // newest frame -> next vblank
             return state;}
+        // Stale fetch: fetched and idle, ARM still not the submission, >= 2 LOADVs since the kick.
+        if(rekicksThis<kMaxRekicks&&lastKickN&&lastKickN<=kWordsMax&&now-armedAtUs>2*uint64_t(frameUs)&&
+           b->rd(RegLoadvCounter(head))-armLoadv>=2&&b->rd(RegGet(chid))==put&&
+           (b->rd(RegChnStatus(chid))&(kWinMethodExecBusy|0xf00))==0x100&&b->rd(RegArm(chid,c57e::SET_OFFSET0))!=armedTarget){
+            ++rekicksThis;++rekicks;rekicked=true;
+            const uint32_t n=lastKickN;
+            if(!ArmWords(lastW,n,armedIso,armedTarget))return state;
+            return state;
+        }
         if(now-armedAtUs>kWatchdogUs)Fail(FlipFail::Timeout);
         return state;
     }

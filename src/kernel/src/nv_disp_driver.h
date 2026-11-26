@@ -146,6 +146,10 @@ template<typename B> struct NvDisplayDriver{
             if(!Live(o))continue;
             f[o].TickVblank();
             if(f[o].Poll()==FlipState::Failed)OnFailure(o);
+            if(f[o].rekicks!=loggedRekicks[o]&&loggedRekicks[o]<64){loggedRekicks[o]=f[o].rekicks;
+                Line l;l.raw("{\"nv_driver\":\"flip-rekick\",\"output\":");l.dec(o);l.raw(",\"n\":");l.dec(f[o].rekicks);
+                l.raw(",\"ok\":");l.dec(f[o].rekickOk);l.raw(",\"kick\":\"");l.hex(f[o].lastKickOff);l.raw("\",\"want\":\"");l.hex(f[o].armedTarget);
+                l.raw("\",\"mode\":");l.dec(f[o].kickMode);l.raw("}\n");b->emit(l.t);}
         }
         const uint64_t now=b->nowUs();
         if(AnyLive()&&now-lastCheckUs>1000000){lastCheckUs=now;if(!Head0Intact()){++invariantFails;
@@ -155,17 +159,32 @@ template<typename B> struct NvDisplayDriver{
         const auto& g=r0->base.gop;
         return b->rd(RegArm(kChidCore,c57d::HeadRasterSize(0)))==g.headRaster&&b->rd(RegArm(kChidCore,c57d::HeadPixelClock(0)))==g.headPclk&&
                b->rd(RegArm(kChidCore,c57d::SorSetControl(g.sor)))==g.sorCtl&&(b->rd(RegArm(kChidCore,c57d::WindowSetControl(0)))&0xf)==0;}
+    // Failure diagnostics hook (live: nv_disp_live.cpp NvDispSnapLocked, BAR1 vs PRAMIN ring check).
+    void (*onFailDiag)(uint32_t o)=nullptr;
+    // Three lines: the kernel log keeps 160 characters of a line (27 Nov records ended at arm_notifier).
+    void Rekicks(){for(uint32_t o=0;o<kDriverOutputs;++o){Line l;l.raw("{\"nv_driver\":\"rekicks\",\"output\":");l.dec(o);
+        l.raw(",\"kickmode\":");l.dec(f[o].kickMode);l.raw(",\"rekicks\":");l.dec(f[o].rekicks);l.raw(",\"ok\":");l.dec(f[o].rekickOk);
+        l.raw(",\"comp\":");l.dec(f[o].st.completes);l.raw("}\n");b->emit(l.t);}}
+    uint32_t loggedRekicks[kDriverOutputs]{};
     void OnFailure(uint32_t o){
         ++failures[o];
-        Line l;l.raw("{\"nv_driver\":\"flip-failed\",\"output\":");l.dec(o);l.raw(",\"code\":");l.dec(uint32_t(f[o].fail));
         const uint32_t ch=ChidWndw(kDriverWindow[o]);
+        {Line l;l.raw("{\"nv_driver\":\"flip-failed\",\"output\":");l.dec(o);l.raw(",\"code\":");l.dec(uint32_t(f[o].fail));
         l.raw(",\"get\":\"");l.hex(b->rd(RegGet(ch)));l.raw("\",\"put\":\"");l.hex(f[o].put);
         l.raw("\",\"status\":\"");l.hex(b->rd(RegChnStatus(ch)));l.raw("\",\"exc\":\"");l.hex(b->rd(RegExcept(ch)));
-        l.raw("\",\"arm_offset\":\"");l.hex(b->rd(RegArm(ch,c57e::SET_OFFSET0)));
-        l.raw("\",\"arm_iso\":\"");l.hex(b->rd(RegArm(ch,c57e::SET_CONTEXT_DMA_ISO0)));
-        l.raw("\",\"arm_notifier\":\"");l.hex(b->rd(RegArm(ch,c57e::SET_CONTEXT_DMA_NOTIFIER)));
-        l.raw("\",\"front\":");l.dec(uint32_t(f[o].front));l.raw(",\"presents\":");l.dec(f[o].st.presents);
-        l.raw(",\"completes\":");l.dec(f[o].st.completes);l.raw("}\n");b->emit(l.t);
+        l.raw("\",\"exc_win\":\"");l.hex(b->rd(kRegExcWin));l.raw("\",\"exc_other\":\"");l.hex(b->rd(kRegExcOther));l.raw("\"}\n");b->emit(l.t);}
+        {Line l;l.raw("{\"nv_driver\":\"flip-failed-arm\",\"output\":");l.dec(o);
+        l.raw(",\"off\":\"");l.hex(b->rd(RegArm(ch,c57e::SET_OFFSET0)));l.raw("\",\"want\":\"");l.hex(f[o].armedTarget);
+        l.raw("\",\"iso\":\"");l.hex(b->rd(RegArm(ch,c57e::SET_CONTEXT_DMA_ISO0)));
+        l.raw("\",\"ntfy\":\"");l.hex(b->rd(RegArm(ch,c57e::SET_CONTEXT_DMA_NOTIFIER)));
+        l.raw("\",\"front\":");l.dec(uint32_t(f[o].front));l.raw(",\"armed\":");l.dec(uint32_t(uint8_t(f[o].armed)));
+        l.raw(",\"pres\":");l.dec(f[o].st.presents);l.raw(",\"comp\":");l.dec(f[o].st.completes);l.raw("}\n");b->emit(l.t);}
+        {Line l;l.raw("{\"nv_driver\":\"flip-failed-time\",\"output\":");l.dec(o);
+        l.raw(",\"age_us\":");l.dec(b->nowUs()-f[o].armedAtUs);l.raw(",\"lv\":\"");l.hex(b->rd(RegLoadvCounter(f[o].head)));
+        l.raw("\",\"lv_arm\":\"");l.hex(f[o].armLoadv);l.raw("\",\"lv_live\":");l.dec(f[o].loadvLive?1:0);
+        l.raw(",\"rg\":\"");l.hex(b->rd(RegRgPos(f[o].head)));l.raw("\",\"arm_line\":\"");l.hex(f[o].armLine);
+        l.raw("\",\"kick\":\"");l.hex(f[o].lastKickOff);l.raw("/");l.dec(f[o].lastKickN);l.raw("\"}\n");b->emit(l.t);}
+        if(onFailDiag)onFailDiag(o);
         if(o==0)(void)Down0();else(void)Down1();
         out[o]=OutState::Failed;
     }
@@ -247,6 +266,8 @@ template<typename B> struct NvDisplayDriver{
             if(External(o)){Msg("refused","the desktop presents on this output");return;}
             Bench(o,v);return;}
         if(Word(p,"tick")){Tick();Status();return;}
+        if(Word(p,"kickmode")){if(!Num(p,v)||v>2){Msg("usage","kickmode <0|1|2>");return;}for(auto& x:f)x.kickMode=uint8_t(v);Rekicks();return;}
+        if(Word(p,"rekicks")){Rekicks();return;}
         if(Word(p,"probe")){if(!Num(p,o)||!Num(p,v)||o>=kDriverOutputs||!v){Msg("usage","probe <o> <1..32>");return;}
             if(External(o)){Msg("refused","the desktop presents on this output");return;}
             Probe(o,v);return;}

@@ -16,6 +16,12 @@ void NvDisplayDesktopStart();
 struct NvHead0Arm { bool live; uint32_t state, iso, offset; };
 NvHead0Arm NvDispHead0Arm();
 NvHead0Arm NvDispHead0Fence(bool on, const char* why);
+// NVK head-freeze diagnostics (27 Nov): one kernel-log snapshot of the display state (window
+// ARM/status/LOADV, last ring kick via BAR1 vs PRAMIN, BAR1 PD3[0]). Locked = caller holds the
+// nv-aux lock. nv-gsp registers its PRAMIN reader and PD3[0] address after the BAR1 map.
+void NvDispSnapLocked(const char* why);
+void NvDispSnap(const char* why);
+void NvDispSetBar1Diag(uint32_t (*pramin)(uint64_t), uint64_t pd3Addr, uint64_t pd3Want);
 // Suspend/restore dp-idle (idle-off, link watch) around a head-1 session.
 void DpIdleSuspendForDisplay(bool suspend);
 }

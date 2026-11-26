@@ -73,9 +73,14 @@ struct LiveBackend{
     // The top 1 MiB of the aperture (instmem, pushbuffers, sync page) is pinned.
     volatile uint32_t* VramMap(uint64_t a){return a+(1ull<<20)>=bar1Size?vramTop.Map(bar1+a):vram.Map(bar1+a);}
     uint32_t rd(uint32_t a){volatile uint32_t* p=regs.Map(bar0+a);return p?*p:0xffffffffu;}
-    void wr(uint32_t a,uint32_t v){volatile uint32_t* p=regs.Map(bar0+a);if(p)*p=v;}
+    // 27 Nov NVK head freeze: a BAR1 flush (0x070000) is preceded by a BAR1 read of the last
+    // BAR1-written word, so every plan/flipper kick that flushes is ordered behind its ring writes
+    // (with GSP-RM up BAR1 is virtual and a posted write can wait on a page walk).
+    uint64_t lastVwr=~0ull;uint32_t flushReads=0;
+    void wr(uint32_t a,uint32_t v){if(a==0x070000u&&lastVwr!=~0ull){(void)vrd(lastVwr);++flushReads;}
+        volatile uint32_t* p=regs.Map(bar0+a);if(p)*p=v;}
     uint32_t vrd(uint64_t a){if(a+4>bar1Size)return 0xffffffffu;volatile uint32_t* p=VramMap(a);return p?*p:0xffffffffu;}
-    void vwr(uint64_t a,uint32_t v){if(a+4>bar1Size)return;volatile uint32_t* p=VramMap(a);if(p)*p=v;}
+    void vwr(uint64_t a,uint32_t v){if(a+4>bar1Size)return;volatile uint32_t* p=VramMap(a);if(p){*p=v;lastVwr=a;}}
     void fill(uint64_t v,uint32_t bytes,uint32_t pitch,uint32_t colour,uint32_t marker,uint32_t lines){
         if(v+bytes>bar1Size||!pitch)return;
         const uint64_t markerEnd=uint64_t(lines)*pitch;
@@ -92,7 +97,7 @@ struct LiveBackend{
         // Driver failures also go to the kernel log (hw_logs): the debug channel copy is lost
         // when nobody is attached (26 Nov head-0 freeze).
         auto pre=[line](const char* p){return strncmp(line,p,strlen(p))==0;};
-        if(!toSerial&&(pre("{\"nv_driver\":\"flip-failed\"")||pre("{\"nv_driver\":\"up")||pre("{\"nv_disp\":\"aborted\"")||
+        if(!toSerial&&(pre("{\"nv_driver\":\"flip-failed")||pre("{\"nv_driver\":\"up")||pre("{\"nv_disp\":\"aborted\"")||
                        pre("{\"nv_driver\":\"fence")))KPuts(line);
     }
     void hookQuiesce();
@@ -115,11 +120,13 @@ alignas(DriverT) uint8_t g_driverStorage[sizeof(DriverT)];
 alignas(RunnerT) uint8_t g_runnerStorage[sizeof(RunnerT)];
 alignas(HeadT) uint8_t g_headStorage[sizeof(HeadT)];
 bool g_runnersBuilt=false;
+void SnapOnFail(uint32_t o);
 void EnsureRunners(){
     if(g_runnersBuilt)return;
     new(g_runnerStorage) RunnerT{};
     new(g_headStorage) HeadT{};
     new(g_driverStorage) DriverT{};
+    reinterpret_cast<DriverT*>(g_driverStorage)->onFailDiag=SnapOnFail;
     g_runnersBuilt=true;
 }
 #define g_runner (*reinterpret_cast<RunnerT*>(g_runnerStorage))
@@ -705,6 +712,38 @@ void DesktopStartThread(void*){
 }
 
 } // namespace
+// 27 Nov NVK head freeze diagnostics: display state snapshots (window ARM/status, LOADV, the
+// last ring kick read back through BAR1 and through PRAMIN, BAR1's PD3[0] in VRAM). nv-gsp
+// registers the PRAMIN reader and the PD3[0] location once its BAR1 identity map is committed.
+namespace { uint32_t (*g_snapPramin)(uint64_t)=nullptr;uint64_t g_snapPd3=0,g_snapPd3Want=0;uint32_t g_snapSeq=0; }
+void NvDispSetBar1Diag(uint32_t (*pramin)(uint64_t),uint64_t pd3Addr,uint64_t pd3Want){g_snapPramin=pramin;g_snapPd3=pd3Addr;g_snapPd3Want=pd3Want;}
+void NvDispSnapLocked(const char* why){
+    if(!g_runnersBuilt||!g_configured||!g_backend.ok)return;
+    const uint32_t seq=++g_snapSeq;
+    uint32_t pd3lo=0,pd3hi=0;
+    if(g_snapPramin&&g_snapPd3){pd3lo=g_snapPramin(g_snapPd3);pd3hi=g_snapPramin(g_snapPd3+4);}
+    KPrintf("{\"nv_snap\":\"%s\",\"seq\":%u,\"core_st\":\"%x\",\"exc_win\":\"%x\",\"exc_other\":\"%x\",\"pd3\":\"%x%08x\",\"pd3_ok\":%d,\"b1blk\":\"%x\"}\n",
+            why,seq,g_backend.rd(nvdisp::RegChnStatus(nvdisp::kChidCore)),g_backend.rd(nvdisp::kRegExcWin),g_backend.rd(nvdisp::kRegExcOther),
+            pd3hi,pd3lo,g_snapPd3?((((uint64_t(pd3hi)<<32)|pd3lo)==g_snapPd3Want)?1:0):-1,g_backend.rd(0xb80f40));
+    for(uint32_t o=0;o<nvdisp::kDriverOutputs;++o){
+        auto& f=g_driver.f[o];
+        if(f.state==nvdisp::FlipState::Off)continue;
+        const uint32_t ch=nvdisp::ChidWndw(nvdisp::kDriverWindow[o]);
+        uint32_t same=0,n=f.lastKickN>32?32:f.lastKickN,b1=0,pm=0;bool diff=false;
+        for(uint32_t i=0;i<n&&g_snapPramin;++i){
+            const uint64_t a=f.ring+f.lastKickOff+i*4;const uint32_t x=g_backend.vrd(a),y=g_snapPramin(a);
+            if(x==y)++same;else if(!diff){diff=true;b1=x;pm=y;}
+        }
+        const uint32_t want=f.state==nvdisp::FlipState::Armed?f.armedTarget:(f.front>=0?uint32_t(f.surf[f.front].vram>>8):0);
+        KPrintf("{\"nv_snap\":%u,\"o\":%u,\"flip\":%u,\"get\":\"%x\",\"put\":\"%x\",\"st\":\"%x\",\"exc\":\"%x\",\"off\":\"%x\",\"want\":\"%x\",\"iso\":\"%x\"}\n",
+                seq,o,uint32_t(f.state),g_backend.rd(nvdisp::RegGet(ch)),f.put,g_backend.rd(nvdisp::RegChnStatus(ch)),g_backend.rd(nvdisp::RegExcept(ch)),
+                g_backend.rd(nvdisp::RegArm(ch,nvdisp::c57e::SET_OFFSET0)),want,g_backend.rd(nvdisp::RegArm(ch,nvdisp::c57e::SET_CONTEXT_DMA_ISO0)));
+        KPrintf("{\"nv_snap_r\":%u,\"o\":%u,\"lv\":\"%x\",\"rg\":\"%x\",\"kick\":\"%x\",\"ring\":\"%u/%u\",\"b1\":\"%x\",\"pm\":\"%x\"}\n",
+                seq,o,g_backend.rd(nvdisp::RegLoadvCounter(f.head)),g_backend.rd(nvdisp::RegRgPos(f.head))&0xffff,f.lastKickOff,same,n,b1,pm);
+    }
+}
+void NvDispSnap(const char* why){SpinLock* lock=NvAuxSharedLock();SpinLockAcquire(lock);NvDispSnapLocked(why);SpinLockRelease(lock);}
+namespace { void SnapOnFail(uint32_t){NvDispSnapLocked("flip-failed");} }
 void NvDispSetCePresent(const NvCeOps* ops){if(!ops&&g_presenter[0].ceInflight)(void)CeFinishLocked(kCeWaitUs);g_ceOps=ops;}
 
 bool NvDispHandle(const char* command){
@@ -745,6 +784,7 @@ bool NvDispHandle(const char* command){
         g_driver.Command(rest+6);
         SpinLockRelease(lock);return true;
     }
+    if(strncmp(rest,"snap",4)==0){NvDispSnapLocked("bridge");SpinLockRelease(lock);DebugChannelSend("{\"nv_disp\":\"snap\",\"msg\":\"see the kernel log (nv_snap lines)\"}\n");return true;}
     if(g_driver.AnyLive()&&strncmp(rest,"status",6)!=0&&strncmp(rest,"head1 status",12)!=0){
         DebugChannelSend("{\"nv_disp\":\"refused\",\"msg\":\"the resident driver owns the display (nv-disp driver down)\"}\n");
         SpinLockRelease(lock);return true;
