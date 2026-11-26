@@ -114,7 +114,8 @@ static const Backend kFakeBe{&g_fake,
         std::vector<uint64_t> v; for (uint32_t i = 0; i < n; ++i) { v.push_back(va[i]); v.push_back(dw[i]); }
         x.subs.push_back({seq, v}); return true; },
     [](void* c, uint32_t ch) { return static_cast<Fake*>(c)->chans.at(ch).completed; },
-    [](void* c, uint32_t ch) { return static_cast<Fake*>(c)->chans.at(ch).error; }};
+    [](void* c, uint32_t ch) { return static_cast<Fake*>(c)->chans.at(ch).error; },
+    true};
 
 static uint32_t NewBo(File& f, uint64_t size, uint32_t domain, uint8_t kind = 0, GemNew* out = nullptr) {
     GemNew n{}; n.info.size = size; n.info.domain = domain; n.info.tile_flags = uint32_t(kind) << 8;
@@ -148,6 +149,14 @@ static void TestMemory(const DeviceInfo& dev) {
     assert(hbig && NvIo(f, NV_GEM_INFO, &bi, sizeof(bi)) == 0 && (bi.domain & GEM_DOMAIN_GART) && g_fake.sys.size() == 2);
     assert(!NewBo(f, 16 << 20, GEM_DOMAIN_VRAM));   // no fallback without GART
     assert(!NewBo(f, 4096, 0) && !NewBo(f, 4096, GEM_DOMAIN_VRAM | 0x100));
+    {   // a backend without CPU-visible VRAM places VRAM|MAPPABLE in GART (and plain VRAM stays VRAM)
+        static Backend nomap = kFakeBe; nomap.vram_cpu_map = false;
+        static File g; g.Init(&dev, &nomap);
+        GemNew m{}; const uint32_t hm = NewBo(g, 8192, GEM_DOMAIN_VRAM | GEM_DOMAIN_MAPPABLE, 0, &m);
+        GemNew v{}; const uint32_t hv = NewBo(g, 8192, GEM_DOMAIN_VRAM, 0, &v);
+        assert(hm && m.info.domain == (GEM_DOMAIN_GART | GEM_DOMAIN_MAPPABLE) && hv && v.info.domain == GEM_DOMAIN_VRAM);
+        g.Close();
+    }
     auto& pt = g_fake.vas[f.vas];
     // sync MAP: PTEs with the BO's kind; flush once per batch
     const uint32_t fl0 = g_fake.flushes;

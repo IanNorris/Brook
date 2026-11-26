@@ -194,6 +194,23 @@ struct GmmuBuilder {
         err = "format"; return false;
     }
 
+    // M5: 4 KiB leaf for an unmap: invalid (0) or sparse (VOL only, as nouveau gp100). Missing
+    // tables: nothing to do for invalid, created for sparse. Never touches 2 MiB PTEs.
+    bool UnmapPage(uint64_t va, bool sparse) {
+        uint64_t table = root; Aperture ta = root_aper;
+        for (uint32_t l = 0; l < f.levels; ++l) {
+            const GmmuLevel& L = f.lv[l];
+            const uint64_t slot = ((va >> L.shift) & ((1ull << L.bits) - 1)) * L.entry_bytes;
+            const uint64_t at = l == f.dual_level ? slot + 8 : slot;   // the small-page half of the dual PDE
+            if (l == f.dual_level && gmmu::PteValid(m.rd64(ta, table + slot))) { err = "unmap inside a 2 MiB page"; return false; }
+            if (l + 1 == f.levels) { m.wr64(ta, table + slot, sparse ? gmmu::kVol : 0); ++ptes; return true; }
+            const uint64_t e = m.rd64(ta, table + at);
+            if (gmmu::PdeValid(e)) { table = gmmu::FieldAddr(e); ta = gmmu::PdeAperture(e); continue; }
+            if (!sparse) return true;
+            if (!Child(table, ta, at, &table, &ta)) return false;
+        }
+        err = "format"; return false;
+    }
     // Map [va, va+bytes) -> [pa, ...) with `shift`-sized pages (all aligned).
     bool Map(uint64_t va, uint64_t pa, uint64_t bytes, uint8_t shift, Aperture tgt, uint8_t kind = 0, bool vol = false,
              bool priv = false, bool ro = false) {

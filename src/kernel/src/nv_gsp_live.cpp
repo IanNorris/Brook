@@ -36,6 +36,8 @@
 #include "nv_disp_live.h"
 #include "stall_watch.h"
 #include "nv_drm.h"
+#include "nv_vram_heap.h"
+#include "memory/mapping_ranges.h"
 #include "platform_power.h"
 #include "scheduler.h"
 #include "process.h"
@@ -157,6 +159,8 @@ volatile uint32_t g_busy = 0;
 struct LiveEvents { uint32_t total = 0, rc = 0, mmu = 0, os_error = 0, libos = 0, other = 0, drains = 0;
                     uint32_t pstate = 0, pstate_changes = 0, pstate_polls = 0, pstate_errors = 0; uint64_t last_ms = 0; };
 LiveEvents g_liveEv;
+extern const nvdrm::Backend g_nvdBackend;   // M5 live backend (below)
+void NvdMarkDead(uint32_t chid);
 bool g_ceActiveFlag = false;   // mirrors g_cePresentState.active for Status (declared later)
 struct AutostartState { const char* status = "not run"; uint64_t start_ms = 0, p4_us = 0, ce_us = 0; } g_autostart;
 bool PathExists(const char* path) { auto* f = VfsOpen(path, VFS_O_STREAM); if (!f) return false; VfsRelease(f); return true; }
@@ -1182,6 +1186,7 @@ void LogEvent(const uint8_t* m, uint32_t len) {
             ++g_liveEv.rc;
             KPrintf("nv-gsp: RM event at %lu ms: RC Xid %u engine %u chid %u level %u scope %u fault %x:%08x type %u\n", ms,
                     u32(16), u32(0), u32(4), u32(12), u32(20), u32(32), u32(28), u32(36));
+            NvdMarkDead(u32(4));
             StallWatchTrigger("rm rc");
             break;
         case rm::NV_VGPU_MSG_EVENT_MMU_FAULT_QUEUED: ++g_liveEv.mmu; KPrintf("nv-gsp: RM event at %lu ms: MMU fault queued\n", ms); break;
@@ -1291,7 +1296,8 @@ void AutostartRun(bool display) {
         d.nclasses = 5;
         const char chip[] = "TU104", name[] = "NVIDIA GeForce RTX 2080";
         __builtin_memcpy(d.chip, chip, sizeof(chip)); __builtin_memcpy(d.name, name, sizeof(name));
-        NvDrmPublish(d);
+        d.bar1_bytes = 0;   // no CPU-visible VRAM window yet (BAR1 is the 256 MiB identity map): VRAM|MAPPABLE -> GART
+        NvDrmPublish(d, &g_nvdBackend);
     }
     KPrintf("nv-gsp: autostart %s (p4 %lu us, ce %lu us)\n", g_autostart.status, (unsigned long)g_autostart.p4_us,
             (unsigned long)g_autostart.ce_us);
@@ -1478,6 +1484,232 @@ void GrVerb(int mode) {   // 1 golden, 2 off, 0 status
     o.send();
 }
 
+}  // namespace
+
+
+namespace {
+// ------------------------------------------------------------- M5: renderD130 live backend
+// nv_drm_core.h's Backend on GSP-RM: one client + external VAS per file (GrCtx::OpenVas), GR0
+// channels in it (GrCtx::ChannelInVas + non-golden PROMOTE_CTX + engine objects), 4 KiB PTEs
+// through GmmuBuilder over PRAMIN with an MMU invalidate per batch, VRAM BOs from a heap above
+// Brook's fixed users, GART BOs as contiguous pinned pages. Every call runs under the nv-aux lock.
+namespace nvd {
+constexpr uint32_t kMaxVas = 16, kMaxChans = 32, kChidFirst = 8, kChidCount = 56;
+constexpr uint32_t kClientBase = 0xc1d20000;            // + vas * 0x400
+constexpr uint64_t kCtxVa = 0x0000008000000000ull;      // kernel-managed (NVK keeps [1<<39, 1<<40) for us)
+constexpr uint64_t kRingVa = 0x0000009000000000ull;     // per channel: gpfifo, kernel push, semaphore
+constexpr uint64_t kHeapLo = 0x140000000ull;            // above CE (0x108..) and GR (0x110..0x130) arenas
+struct Vas { bool used = false; GrScope s; };
+struct Chan {
+    bool used = false; uint32_t vas = 0, chid = 0, gp = 0, token = 0;
+    GrScope s; M2Sys gpfifo, kpush, sem, mthdbuf; uint64_t va = 0;
+};
+Vas g_vas[kMaxVas];
+Chan g_chan[kMaxChans];
+volatile bool g_dead[kChidFirst + kChidCount];
+nvdrm::VramHeap g_heap;
+bool g_heapInit = false;
+}  // namespace nvd
+
+template <class F> bool NvdWithRm(const char* what, F f) {
+    const ChipOps* c = ChipForBoot0(g_bus.rd32(0));
+    if (!c || !g_rmRunning || g_finiDone) return false;
+    SpinLock* lock = NvAuxSharedLock();
+    SpinLockAcquire(lock);
+    Pramin<Bar0Bus> pr(g_bus, *c); PraminIo vio{pr};
+    RmWait wait; g_rm->wait_deadline_us = NowUs() + 5000000;
+    GspDoorbell<Bar0Bus, RmSync> bell{g_bus, *c, g_rmSync};
+    alignas(8) static uint8_t scratch[kRmApiBuf];
+    LiveRmApi api(g_rm->ch, g_rm->rx, g_rm->rxcap, wait, bell, scratch);
+    GrResult r;
+    bool ok = true;
+    if (!g_gr.up) {   // first use: golden context + scrubber (as `gr golden`), which also sets the GR arena
+        auto sysalloc = [](uint32_t bytes, M2Sys* m) { DmaRegion d; if (!RmAlloc(bytes, &d)) return false;
+            m->cpu = d.cpu; m->bus = d.bus; m->bytes = d.bytes; return true; };
+        g_grTried = true;
+        g_grLast = RunGrGolden(g_bus, *c, vio, api, g_static, 0x110000000ull, 0x130000000ull, sysalloc, g_gr);
+        ok = g_gr.up;
+        if (!ok) KPrintf("nv-drm: GR golden failed: %s at %s\n", g_grLast.status, g_grLast.stage);
+    }
+    if (ok) {
+        GrCtx<Bar0Bus, LiveRmApi, PraminIo> x{g_bus, api, vio, *c, g_gr.arena, r};
+        ok = f(x, vio, *c);
+        if (!ok) KPrintf("nv-drm: %s failed: %s (rm 0x%x)\n", what, r.status, r.rm_status);
+    }
+    pr.Restore();
+    SpinLockRelease(lock);
+    return ok;
+}
+void NvdMarkDead(uint32_t chid) { if (chid >= nvd::kChidFirst && chid < nvd::kChidFirst + nvd::kChidCount) nvd::g_dead[chid] = true; }
+
+bool NvdVramAlloc(void*, uint64_t bytes, uint64_t align, uint64_t* pa) {
+    if (!nvd::g_heapInit) {
+        if (g_static.usable_hi <= nvd::kHeapLo) return false;
+        nvd::g_heap.Init(nvd::kHeapLo, g_static.usable_hi); nvd::g_heapInit = true;
+        KPrintf("nv-drm: VRAM heap %lx..%lx (%lu MiB)\n", (unsigned long)nvd::kHeapLo, (unsigned long)g_static.usable_hi,
+                (unsigned long)((g_static.usable_hi - nvd::kHeapLo) >> 20));
+    }
+    return nvd::g_heap.Alloc(bytes, align, pa);
+}
+void NvdVramFree(void*, uint64_t pa, uint64_t bytes) { (void)nvd::g_heap.Release(pa, bytes); }
+void NvdSysRelease(void* object) {
+    auto* p = static_cast<NvDrmSysPages*>(object);
+    for (uint64_t o = 0; o < p->bytes; o += 4096) PmmFreePage(PhysicalAddress(p->phys + o));
+    kfree(p);
+}
+bool NvdSysAlloc(void*, uint64_t bytes, uint64_t* cookie) {
+    const uint64_t pages = (bytes + 4095) / 4096;
+    const PhysicalAddress pa = PmmAllocPages(pages, MemTag::Device, KernelPid);
+    if (!pa) return false;
+    auto* p = static_cast<NvDrmSysPages*>(kmalloc(sizeof(NvDrmSysPages)));
+    if (!p) { for (uint64_t i = 0; i < pages; ++i) PmmFreePage(PhysicalAddress(pa.raw() + i * 4096)); return false; }
+    p->phys = pa.raw(); p->bytes = pages * 4096;
+    memset(reinterpret_cast<void*>(PhysToVirt(pa).raw()), 0, p->bytes);
+    p->life = MappingBackingCreate(p, NvdSysRelease);
+    if (!p->life || p->phys + p->bytes > (1ull << 39)) { if (p->life) MappingBackingUnref(p->life); else NvdSysRelease(p); return false; }
+    *cookie = reinterpret_cast<uint64_t>(p);
+    return true;
+}
+void NvdSysFree(void*, uint64_t cookie) { MappingBackingUnref(reinterpret_cast<NvDrmSysPages*>(cookie)->life); }
+
+bool NvdVasCreate(void*, uint64_t, uint64_t, uint32_t* out) {
+    uint32_t i = 0; while (i < nvd::kMaxVas && nvd::g_vas[i].used) ++i;
+    if (i == nvd::kMaxVas) return false;
+    nvd::Vas& v = nvd::g_vas[i];
+    v = nvd::Vas{}; v.s.base = nvd::kClientBase + i * 0x400; v.s.external = true; v.s.h_vas = v.s.base + grh::kVaspace;
+    if (!NvdWithRm("VM_INIT vaspace", [&](auto& x, auto&, const ChipOps&) {
+            if (x.OpenVas(v.s)) return true;
+            x.Close(v.s); return false; })) return false;
+    v.used = true; *out = i;
+    return true;
+}
+void NvdVasDestroy(void*, uint32_t vas) {
+    if (vas >= nvd::kMaxVas || !nvd::g_vas[vas].used) return;
+    (void)NvdWithRm("vaspace free", [&](auto& x, auto&, const ChipOps&) { x.Close(nvd::g_vas[vas].s); return true; });
+    nvd::g_vas[vas].used = false;   // page tables stay in the GR arena (bump allocator) until RM unload
+}
+bool NvdVasMap(void*, uint32_t vas, uint64_t va, nvdrm::Aper aper, uint64_t backing, uint64_t off, uint64_t bytes, uint8_t kind) {
+    if (vas >= nvd::kMaxVas || !nvd::g_vas[vas].used) return false;
+    const bool sys = aper == nvdrm::Aper::Sys;
+    const uint64_t pa = sys ? reinterpret_cast<const NvDrmSysPages*>(backing)->phys + off : backing + off;
+    return NvdWithRm("VM_BIND map", [&](auto& x, auto&, const ChipOps&) {
+        return x.builder(nvd::g_vas[vas].s, [&](auto& b) {
+            return b.Map(va, pa, bytes, 12, sys ? Aperture::SysCoh : Aperture::Video, kind, sys); }); });
+}
+bool NvdVasUnmap(void*, uint32_t vas, uint64_t va, uint64_t bytes, bool sparse) {
+    if (vas >= nvd::kMaxVas || !nvd::g_vas[vas].used) return false;
+    return NvdWithRm("VM_BIND unmap", [&](auto& x, auto&, const ChipOps&) {
+        return x.builder(nvd::g_vas[vas].s, [&](auto& b) {
+            for (uint64_t o = 0; o < bytes; o += 4096) if (!b.UnmapPage(va + o, sparse)) return false;
+            return true; }); });
+}
+bool NvdVasFlush(void*, uint32_t vas) {
+    if (vas >= nvd::kMaxVas || !nvd::g_vas[vas].used) return false;
+    return NvdWithRm("MMU invalidate", [&](auto&, auto&, const ChipOps& c) { return Bar1FlushInvalidate(g_bus, c, nvd::g_vas[vas].s.root); });
+}
+
+bool NvdChanCreate(void*, uint32_t vas, uint32_t engine, uint32_t* out) {
+    namespace rm = rm570;
+    if (vas >= nvd::kMaxVas || !nvd::g_vas[vas].used || engine != 0x01) return false;   // GR only for now
+    uint32_t i = 0; while (i < nvd::kMaxChans && nvd::g_chan[i].used) ++i;
+    uint32_t chid = 0; for (uint32_t k = 0; k < nvd::kChidCount && !chid; ++k) {
+        bool taken = false; for (auto& c : nvd::g_chan) taken |= c.used && c.chid == nvd::kChidFirst + k;
+        if (!taken) chid = nvd::kChidFirst + k; }
+    if (i == nvd::kMaxChans || !chid) return false;
+    nvd::Chan& ch = nvd::g_chan[i];
+    ch = nvd::Chan{}; ch.vas = vas; ch.chid = chid; nvd::g_dead[chid] = false;
+    auto sys = [](M2Sys* m, uint32_t bytes) { DmaRegion d; if (!RmAlloc(bytes, &d)) return false;
+        m->cpu = d.cpu; m->bus = d.bus; m->bytes = d.bytes; return true; };
+    if (!sys(&ch.gpfifo, 0x1000) || !sys(&ch.kpush, 0x1000) || !sys(&ch.sem, 0x1000) || !sys(&ch.mthdbuf, g_gr.mthdbuf_size ? g_gr.mthdbuf_size : 0x1000))
+        return false;
+    nvd::Vas& v = nvd::g_vas[vas];
+    ch.va = nvd::kRingVa + uint64_t(i) * 0x10000;
+    GrScope& s = ch.s;
+    s.base = v.s.base; s.chid = chid; s.external = true; s.priv = true; s.h_vas = v.s.h_vas;
+    s.h_chan = v.s.base + 0x100 + i * 0x10; s.gpfifo_va = ch.va; s.va_next = nvd::kCtxVa + (uint64_t(i) << 32);
+    const bool ok = NvdWithRm("CHANNEL_ALLOC", [&](auto& x, auto& vio, const ChipOps& c) {
+        namespace h = rm::host;
+        if (!x.builder(v.s, [&](auto& b) {
+                return b.Map(ch.va, ch.gpfifo.bus, 0x1000, 12, Aperture::SysCoh, 0, true) &&
+                       b.Map(ch.va + 0x1000, ch.kpush.bus, 0x1000, 12, Aperture::SysCoh, 0, true) &&
+                       b.Map(ch.va + 0x2000, ch.sem.bus, 0x1000, 12, Aperture::SysCoh, 0, true); })) return false;
+        // the channel scope shares the VAS page tables (context buffers map into the same root)
+        s.root = v.s.root; s.lpt_page = v.s.lpt_page; s.lpt_off = v.s.lpt_off; s.lpt_aper = v.s.lpt_aper;
+        uint32_t entries = 0;
+        bool good = x.ChannelInVas(s, ch.mthdbuf, g_gr.mthdbuf_size) && x.Promote(s, g_gr.bufs, false, &entries);
+        v.s.lpt_page = s.lpt_page; v.s.lpt_off = s.lpt_off; v.s.lpt_aper = s.lpt_aper;
+        good = good && x.alloc(s, s.h_chan, s.h_chan + 1, rm::gr::TURING_A, nullptr, 0, "RM_ALLOC TURING_A") &&
+               x.alloc(s, s.h_chan, s.h_chan + 2, rm::gr::TURING_COMPUTE_A, nullptr, 0, "RM_ALLOC TURING_COMPUTE_A") &&
+               x.alloc(s, s.h_chan, s.h_chan + 3, 0x902d, nullptr, 0, "RM_ALLOC FERMI_TWOD_A") &&
+               x.alloc(s, s.h_chan, s.h_chan + 4, 0xa140, nullptr, 0, "RM_ALLOC KEPLER_INLINE_TO_MEMORY_B");
+        if (good) {
+            rm::NVA06F_CTRL_BIND_PARAMS bp = {rm::gr::RM_ENGINE_TYPE_GR0};
+            rm::NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS sp = {1, 0};
+            rm::NVC36F_CTRL_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS tk = {};
+            good = x.api.Control(s.base, s.h_chan, rm::NVA06F_CTRL_CMD_BIND, &bp, sizeof(bp)) ? true : x.fail("BIND");
+            good = good && (x.api.Control(s.base, s.h_chan, rm::NVA06F_CTRL_CMD_GPFIFO_SCHEDULE, &sp, sizeof(sp)) ? true : x.fail("GPFIFO_SCHEDULE"));
+            good = good && (x.api.Control(s.base, s.h_chan, rm::NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN, &tk, sizeof(tk)) ? true : x.fail("token"));
+            ch.token = tk.workSubmitToken;
+        }
+        (void)vio; (void)c; (void)h::kDoorbell;
+        if (!good) x.Close(s);
+        return good;
+    });
+    if (!ok) return false;
+    ch.used = true; *out = i;
+    KPrintf("nv-drm: channel %u (chid %u, token %x) in VAS %u\n", i, chid, ch.token, vas);
+    return true;
+}
+void NvdChanDestroy(void*, uint32_t chan) {
+    if (chan >= nvd::kMaxChans || !nvd::g_chan[chan].used) return;
+    (void)NvdWithRm("CHANNEL_FREE", [&](auto& x, auto&, const ChipOps&) { x.Close(nvd::g_chan[chan].s); return true; });
+    nvd::g_chan[chan].used = false;   // its sysmem pages are RM-lifetime regions (freed at RM unload)
+}
+bool NvdChanSubmit(void*, uint32_t chan, const uint64_t* va, const uint32_t* dw, const uint8_t* np, uint32_t n, uint32_t seq) {
+    namespace h = rm570::host;
+    if (chan >= nvd::kMaxChans || !nvd::g_chan[chan].used) return false;
+    nvd::Chan& ch = nvd::g_chan[chan];
+    const ChipOps* c = ChipForBoot0(g_bus.rd32(0));
+    if (!c || !g_rmRunning) return false;
+    SpinLock* lock = NvAuxSharedLock();
+    SpinLockAcquire(lock);
+    Pramin<Bar0Bus> pr(g_bus, *c); PraminIo vio{pr};
+    const uint32_t get = vio.rd32(ch.s.userd + h::USERD_GP_GET) % 512;
+    const uint32_t used = (ch.gp + 512 - get) % 512;
+    bool ok = used + n + 1 < 512;
+    if (ok) {
+        uint32_t* g = reinterpret_cast<uint32_t*>(ch.gpfifo.cpu);
+        for (uint32_t i = 0; i < n; ++i) {
+            g[ch.gp * 2] = uint32_t(va[i]); g[ch.gp * 2 + 1] = uint32_t(va[i] >> 32) | (dw[i] << 10) | (np[i] ? 0x80000000u : 0);
+            ch.gp = (ch.gp + 1) % 512;
+        }
+        // kernel push: release the job's seqno after the GPU went idle on this channel (WFI)
+        const uint32_t slot = seq % 128;
+        uint32_t* p = reinterpret_cast<uint32_t*>(ch.kpush.cpu) + slot * 8;
+        const uint64_t sem_va = ch.va + 0x2000;
+        p[0] = h::IncHeader(0, h::SEM_ADDR_LO, 3); p[1] = uint32_t(sem_va); p[2] = uint32_t(sem_va >> 32); p[3] = seq;
+        p[4] = h::IncHeader(0, h::SEM_EXECUTE, 1); p[5] = h::SEM_EXECUTE_RELEASE | h::SEM_EXECUTE_RELEASE_WFI;
+        const uint64_t kva = ch.va + 0x1000 + slot * 32;
+        g[ch.gp * 2] = uint32_t(kva); g[ch.gp * 2 + 1] = uint32_t(kva >> 32) | (6u << 10);
+        ch.gp = (ch.gp + 1) % 512;
+        FlushRange(ch.gpfifo.cpu, 0x1000); FlushRange(ch.kpush.cpu, 0x1000);
+        vio.wr32(ch.s.userd + h::USERD_GP_PUT, ch.gp);
+        g_bus.wr32(c->usermode + h::kDoorbell, ch.token);
+    }
+    pr.Restore();
+    SpinLockRelease(lock);
+    return ok;
+}
+uint32_t NvdChanCompleted(void*, uint32_t chan) {
+    if (chan >= nvd::kMaxChans || !nvd::g_chan[chan].used) return 0;
+    return __atomic_load_n(reinterpret_cast<const uint32_t*>(nvd::g_chan[chan].sem.cpu), __ATOMIC_ACQUIRE);
+}
+bool NvdChanError(void*, uint32_t chan) {
+    return chan >= nvd::kMaxChans || !nvd::g_chan[chan].used || nvd::g_dead[nvd::g_chan[chan].chid] || !g_rmRunning;
+}
+const nvdrm::Backend g_nvdBackend{nullptr, NvdVramAlloc, NvdVramFree, NvdSysAlloc, NvdSysFree, NvdVasCreate, NvdVasDestroy,
+                                  NvdVasMap, NvdVasUnmap, NvdVasFlush, NvdChanCreate, NvdChanDestroy, NvdChanSubmit,
+                                  NvdChanCompleted, NvdChanError, false};
 }  // namespace
 
 bool NvGspHandle(const char* command) {

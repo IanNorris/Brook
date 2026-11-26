@@ -80,6 +80,22 @@ int main() {
         assert(!t.ok && t.fail_level == 3);
         // 16 big-page PTs share a page: 4 + 1 (64K PT page) + small PTs
         std::printf("gmmu (%s tables): %u tables, %u ptes, %u pages\n", sys ? "sys" : "vid", b.tables, b.ptes, m.allocs);
+        // M5 UnmapPage: invalid clears the leaf, sparse writes VOL-only, missing tables are
+        // created only for sparse, 2 MiB pages are refused
+        {
+            const uint32_t before = m.allocs;
+            assert(b.UnmapPage(0x2000001000ull, false));
+            Translation u = GmmuWalk(m, kGmmuV2, b.root, b.root_aper, 0x2000001000ull);
+            assert(!u.ok && GmmuWalk(m, kGmmuV2, b.root, b.root_aper, 0x2000002000ull).ok);   // neighbours stay
+            assert(b.UnmapPage(0x3000000000ull, false) && m.allocs == before);                  // nothing there, nothing allocated
+            assert(b.UnmapPage(0x3000000000ull, true) && m.allocs > before);
+            uint64_t t[4]; Aperture ap[4];
+            assert(b.Path(0x3000000000ull, 3, t, ap));
+            assert(!GmmuWalk(m, kGmmuV2, b.root, b.root_aper, 0x3000000000ull).ok);            // sparse is not a valid PTE
+            assert(!b.UnmapPage(0x100000, false));                                             // inside a 2 MiB page
+            assert(b.Map(0x2000001000ull, 0x999000, 0x1000, 12, Aperture::Video) &&
+                   GmmuWalk(m, kGmmuV2, b.root, b.root_aper, 0x2000001000ull).pa == 0x999000);  // remap after unmap
+        }
     }
     // 256 MiB BAR1 identity with 64 KiB pages: PD3+PD2+PD1+PD0 + 8 LPT pages
     {

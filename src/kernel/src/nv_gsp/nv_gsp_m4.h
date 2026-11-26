@@ -205,6 +205,54 @@ struct GrCtx {
         return alloc(s, s.base + grh::kDevice, s.h_chan, rm::TURING_CHANNEL_GPFIFO_A, &a, sizeof(a), "RM_ALLOC GR channel");
     }
 
+    // M5: the VA space alone (client, device, subdevice, external VAS + page directory), for a
+    // renderD130 file; channels join it with ChannelInVas.
+    bool OpenVas(GrScope& s) {
+        namespace rm = rm570;
+        {
+            rm::NV0000_ALLOC_PARAMETERS a = {};
+            a.hClient = s.base; a.processID = ~0u;
+            const char* n = "brook-nvk"; for (uint32_t i = 0; n[i]; ++i) a.processName[i] = n[i];
+            if (!api.Alloc(s.base, 0, s.base, rm::NV01_ROOT, &a, sizeof(a))) return fail("RM_ALLOC client");
+            if (!track(s, s.base, 0)) return false;
+        }
+        { rm::NV0080_ALLOC_PARAMETERS d = {}; d.hClientShare = s.base;
+          if (!alloc(s, s.base, s.base + grh::kDevice, rm::NV01_DEVICE_0, &d, sizeof(d), "RM_ALLOC device")) return false; }
+        { rm::NV2080_ALLOC_PARAMETERS sd = {};
+          if (!alloc(s, s.base + grh::kDevice, s.base + grh::kSubdevice, rm::NV20_SUBDEVICE_0, &sd, sizeof(sd), "RM_ALLOC subdevice")) return false; }
+        if (!builder(s, [](auto&) { return true; })) return false;
+        rm::NV_VASPACE_ALLOCATION_PARAMETERS v = {};
+        v.index = rm::NV_VASPACE_ALLOCATION_INDEX_GPU_NEW; v.flags = rm::NV_VASPACE_ALLOCATION_FLAGS_IS_EXTERNALLY_OWNED;
+        if (!alloc(s, s.base + grh::kDevice, s.h_vas, rm::FERMI_VASPACE_A, &v, sizeof(v), "RM_ALLOC vaspace")) return false;
+        rm::NV0080_CTRL_DMA_SET_PAGE_DIRECTORY_PARAMS pd = {};
+        pd.physAddress = s.root; pd.numEntries = 1u << c.gmmu->lv[0].bits;
+        pd.flags = rm::SET_PAGE_DIRECTORY_APERTURE_VIDMEM; pd.hVASpace = s.h_vas;
+        if (!api.Control(s.base, s.base + grh::kDevice, rm::NV0080_CTRL_CMD_DMA_SET_PAGE_DIRECTORY, &pd, sizeof(pd)))
+            return fail("SET_PAGE_DIRECTORY");
+        s.unset_pd = true;
+        return true;
+    }
+    // A GR0 channel in an existing VAS (s.base/h_vas/root from the VAS scope; s.h_chan, s.chid,
+    // s.gpfifo_va set by the caller). Objects allocated here are freed by Close(s).
+    bool ChannelInVas(GrScope& s, const M2Sys& mthdbuf, uint32_t mthdbuf_size) {
+        namespace rm = rm570;
+        if (!arena.alloc(0x1000, 0x1000, &s.inst) || !arena.alloc(0x1000, 0x1000, &s.userd)) return fail("VRAM arena");
+        zero(s.inst, 0x1000); zero(s.userd, 0x1000);
+        static rm::NV_CHANNEL_ALLOC_PARAMS a;
+        __builtin_memset(&a, 0, sizeof(a));
+        a.gpFifoOffset = s.gpfifo_va; a.gpFifoEntries = 0x1000 / 8;
+        a.flags = (s.priv ? rm::NVOS04_PRIVILEGED_CHANNEL_TRUE : 0) | ((s.chid % 8) << rm::NVOS04_USERD_INDEX_VALUE_SHIFT) |
+                  ((s.chid / 8) << rm::NVOS04_USERD_INDEX_PAGE_VALUE_SHIFT) | rm::NVOS04_USERD_INDEX_PAGE_FIXED_TRUE;
+        a.hVASpace = s.h_vas;
+        a.engineType = rm::gr::RM_ENGINE_TYPE_GR0;
+        a.instanceMem = {s.inst, 0x1000, rm::ADDR_FBMEM, 1};
+        a.userdMem = {s.userd, 0x200, rm::ADDR_FBMEM, 1};
+        a.ramfcMem = {s.inst, 0x200, rm::ADDR_FBMEM, 1};
+        a.mthdbufMem = {mthdbuf.bus, mthdbuf_size, rm::ADDR_SYSMEM, 0};
+        a.internalFlags = (s.priv ? rm::KERNELCHANNEL_PRIVILEGE_ADMIN : 0) | (rm::KERNELCHANNEL_ERROR_NOTIFIER_NONE << 2) |
+                          (rm::KERNELCHANNEL_ERROR_NOTIFIER_NONE << 4);
+        return alloc(s, s.base + grh::kDevice, s.h_chan, rm::TURING_CHANNEL_GPFIFO_A, &a, sizeof(a), "RM_ALLOC GR channel");
+    }
     // PROMOTE_CTX (nouveau r535_gr_promote_ctx). golden: allocate every buffer (globals kept in bufs).
     bool Promote(GrScope& s, GrBufs& bufs, bool golden, uint32_t* entries) {
         namespace g = rm570::gr;

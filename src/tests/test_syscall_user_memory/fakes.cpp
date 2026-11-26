@@ -88,6 +88,7 @@ NvDrmFile* NvDrmFileCreate() { return nullptr; }
 void NvDrmFileRef(NvDrmFile*) {}
 void NvDrmFileUnref(NvDrmFile*) {}
 int64_t NvDrmIoctl(NvDrmFile*, uint64_t, uint64_t) { return -25; }
+bool NvDrmMapGart(NvDrmFile*, uint64_t, uint64_t, uint64_t*, MappingBacking**) { return false; }
 BdwGpuFile* BdwGpuFileCreate() { return nullptr; }
 void BdwGpuFileUnref(BdwGpuFile*) {}
 void BdwGpuBufferUnref(BdwGpuBuffer*) {}

@@ -20,6 +20,7 @@
 #include "syscall_drm.h"
 #include "syscall_memory.h"
 #include "syscall_handlers.h"
+#include "nv_drm.h"
 
 namespace brook {
 
@@ -405,7 +406,8 @@ int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         request.range.backing=backing.value;
         return UserMappingCreate(proc,proc->addressSpace,request);
     }
-    if (entry->type == FdType::DevDri || entry->type == FdType::DevIntelDri || entry->type == FdType::DevFramebuf) {
+    if (entry->type == FdType::DevDri || entry->type == FdType::DevIntelDri || entry->type == FdType::DevFramebuf ||
+        entry->type == FdType::DevNvDri) {
         auto* source=static_cast<DeviceMappingBacking*>(kmalloc(sizeof(DeviceMappingBacking)));
         if (!source) return -ENOMEM;
         *source={};backing.value=MappingBackingCreate(source,ReleaseDeviceMapping);
@@ -422,6 +424,13 @@ int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
             source->intelBuffer=buffer;source->intelPageOffset=relative/4096;
             available=brook::BdwGpuBufferBytes(buffer)-relative;
             brook::BdwGpuBufferUnref(buffer);
+        } else if (entry->type == FdType::DevNvDri) {
+            // M5: GART BOs only (contiguous pinned pages; their lifetime outlives the BO while mapped).
+            if(!(flags&MAP_SHARED))return -EINVAL;
+            uint64_t physical=0;MappingBacking* life=nullptr;
+            if(!brook::NvDrmMapGart(static_cast<brook::NvDrmFile*>(entry->handle),offset,request.length,&physical,&life))return -EINVAL;
+            source->borrowedPhysical=true;source->physicalBase=physical;source->resourceLifetime=life;   // referenced by NvDrmMapGart
+            available=(request.length+4095)&~uint64_t{4095};
         } else if (entry->type == FdType::DevDri) {
             auto* context=static_cast<DrmCtx*>(entry->handle);if (!context) return -ENODEV;
             DrmMappingGuard guard(context);

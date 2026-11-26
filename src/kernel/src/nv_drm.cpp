@@ -10,10 +10,12 @@
 #include "syscall_internal.h"
 #include "syscall_time.h"
 #include "kprintf.h"
+#include "memory/mapping_ranges.h"
 
 namespace brook {
 namespace {
 nvdrm::DeviceInfo g_dev;
+const nvdrm::Backend* g_be = nullptr;
 volatile bool g_published = false;
 bool g_marker = false;   // /etc/nv-drm, read once at publish
 bool MarkerExists(const char* path) { auto* f = VfsOpen(path, VFS_O_STREAM); if (!f) return false; VfsRelease(f); return true; }
@@ -23,6 +25,43 @@ Attr g_attrs[7];
 }  // namespace
 
 struct NvDrmFile { uint32_t references; KMutex lock; nvdrm::File core; };
+
+// ---- completion poller: queued binds/execs and in-flight fences advance without an ioctl.
+namespace {
+constexpr uint32_t kMaxFiles = 32;
+NvDrmFile* g_files[kMaxFiles];
+KMutex g_filesLock;
+bool g_pollerStarted = false;
+bool Busy(const nvdrm::File& f) {
+    if (f.job_count) return true;
+    for (const auto& c : f.channels) if (c.used && (c.job_count || c.in_count)) return true;
+    return false;
+}
+void Poller(void*) {
+    for (;;) {
+        NvDrmFile* list[kMaxFiles]; uint32_t n = 0;
+        KMutexLock(&g_filesLock);
+        for (auto* f : g_files) if (f) { NvDrmFileRef(f); list[n++] = f; }
+        KMutexUnlock(&g_filesLock);
+        bool busy = false;
+        for (uint32_t i = 0; i < n; ++i) {
+            KMutexLock(&list[i]->lock);
+            if (list[i]->core.be) { nvdrm::Pump(list[i]->core); nvdrm::PumpExec(list[i]->core); busy |= Busy(list[i]->core); }
+            KMutexUnlock(&list[i]->lock);
+            NvDrmFileUnref(list[i]);
+        }
+        SchedulerSleepMs(busy ? 1 : 20);
+    }
+}
+void Register(NvDrmFile* f, bool add) {
+    KMutexLock(&g_filesLock);
+    for (auto*& slot : g_files) if (add ? !slot : slot == f) { slot = add ? f : nullptr; break; }
+    const bool start = add && !g_pollerStarted;
+    g_pollerStarted = true;
+    KMutexUnlock(&g_filesLock);
+    if (start) { Process* t = KernelThreadCreate("nv_drm_poll", Poller, nullptr, 1); if (t) SchedulerAddProcess(t); }
+}
+}  // namespace
 
 static void Hex(char* out, uint32_t v) {
     static const char d[] = "0123456789abcdef";
@@ -34,8 +73,8 @@ static void Hex(char* out, uint32_t v) {
     out[o++] = '\n'; out[o] = 0;
 }
 
-void NvDrmPublish(const nvdrm::DeviceInfo& info) {
-    g_dev = info; g_dev.valid = true;
+void NvDrmPublish(const nvdrm::DeviceInfo& info, const nvdrm::Backend* backend) {
+    g_dev = info; g_dev.valid = true; g_be = backend;
     // libdrm drmGetDevices2: literal attribute files, PCI slot of the real GPU (02:00.0).
     const char* ue = "DRIVER=nouveau\nPCI_SLOT_NAME=0000:02:00.0\n";
     uint32_t i = 0; for (; ue[i] && i < sizeof(g_attrUevent) - 1; ++i) g_attrUevent[i] = ue[i]; g_attrUevent[i] = 0;
@@ -72,12 +111,31 @@ NvDrmFile* NvDrmFileCreate() {
     if (!f) return nullptr;
     memset(f, 0, sizeof(*f));
     f->references = 1; KMutexInit(&f->lock);
-    f->core.Init(&g_dev);
+    f->core.Init(&g_dev, g_be);
+    static bool once = false; if (!once) { once = true; KMutexInit(&g_filesLock); }
+    Register(f, true);
     return f;
 }
 void NvDrmFileRef(NvDrmFile* f) { if (f) __atomic_fetch_add(&f->references, 1, __ATOMIC_RELAXED); }
 void NvDrmFileUnref(NvDrmFile* f) {
-    if (f && __atomic_fetch_sub(&f->references, 1, __ATOMIC_ACQ_REL) == 1) { f->core.Close(); kfree(f); }
+    if (f && __atomic_fetch_sub(&f->references, 1, __ATOMIC_ACQ_REL) == 1) {
+        Register(f, false);
+        KMutexLock(&f->lock); f->core.Close(); KMutexUnlock(&f->lock);
+        kfree(f);
+    }
+}
+bool NvDrmMapGart(NvDrmFile* f, uint64_t offset, uint64_t length, uint64_t* phys, MappingBacking** life) {
+    if (!f || !length) return false;
+    KMutexLock(&f->lock);
+    const uint64_t token = offset & ~0xffffffffull, rel = offset & 0xffffffffull;
+    const nvdrm::Bo* b = nvdrm::FindBoByToken(f->core, token);
+    bool ok = b && b->aper() == nvdrm::Aper::Sys && rel + length <= b->size && rel + length > rel;
+    if (ok) {
+        const auto* pages = reinterpret_cast<const NvDrmSysPages*>(b->backing);
+        *phys = pages->phys + rel; *life = pages->life; MappingBackingRef(pages->life);
+    }
+    KMutexUnlock(&f->lock);
+    return ok;
 }
 int64_t NvDrmIoctl(NvDrmFile* f, uint64_t cmd, uint64_t arg) {
     if (!f) return nvdrm::kENOTTY;

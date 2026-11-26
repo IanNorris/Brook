@@ -144,6 +144,7 @@ struct Backend {
                         uint32_t n, uint32_t seqno);
     uint32_t (*chan_completed)(void* ctx, uint32_t chan);   // last released seqno
     bool (*chan_error)(void* ctx, uint32_t chan);           // RC / MMU fault on the channel
+    bool vram_cpu_map;   // false: no CPU-visible VRAM yet, so VRAM|MAPPABLE BOs are placed in GART
 };
 
 constexpr uint32_t kMaxBos = 2048, kMaxMappings = 2048, kMaxBindJobs = 16, kMaxBindOps = 64, kMaxJobSyncs = 16;
@@ -457,10 +458,11 @@ inline int64_t GemNewIoctl(File& f, const UserAccess& u, uint64_t arg) {
     GemNew n{};
     if (!u.read(u.ctx, &n, arg, sizeof(n))) return kEFAULT;
     if (!f.be) return kENOTTY;
-    const uint32_t d = n.info.domain;
+    uint32_t d = n.info.domain;
+    if ((d & GEM_DOMAIN_VRAM) && (d & GEM_DOMAIN_MAPPABLE) && !f.be->vram_cpu_map) d = (d & ~GEM_DOMAIN_VRAM) | GEM_DOMAIN_GART;
     const bool vram = d & GEM_DOMAIN_VRAM, gart = d & GEM_DOMAIN_GART;
-    if (!n.info.size || n.info.size > (8ull << 30) || (vram == gart && !(vram && gart))) return kEINVAL;
-    if (d & ~(GEM_DOMAIN_VRAM | GEM_DOMAIN_GART | GEM_DOMAIN_MAPPABLE | GEM_DOMAIN_COHERENT | GEM_DOMAIN_NO_SHARE)) return kEINVAL;
+    if (!n.info.size || n.info.size > (8ull << 30) || (!vram && !gart)) return kEINVAL;
+    if (n.info.domain & ~(GEM_DOMAIN_VRAM | GEM_DOMAIN_GART | GEM_DOMAIN_MAPPABLE | GEM_DOMAIN_COHERENT | GEM_DOMAIN_NO_SHARE)) return kEINVAL;
     if (n.align & (n.align - 1)) return kEINVAL;
     // VRAM|GART: VRAM first, GART when VRAM is full (as TTM placement order)
     Bo* slot = nullptr; uint32_t h = 0;
