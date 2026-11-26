@@ -54,7 +54,7 @@ def main():
         ROOT / "src/tests/test_fido_hidraw_guest/main.c", "-o", guest)
     probe = output / "probe"
     run("python3", ROOT / "scripts/make_uefi_probe.py", "--build", args.build, "--output", probe,
-        "--driver", "xhci", "--usb-read-only", "--volatile-desktop",
+        "--driver", "xhci", "--usb-read-only",
         env=dict(os.environ, BROOK_INITRD_KIB="8192"))
     initrd = probe / "payload/INITRD.IMG"
     rc = output / "INIT.RC"
