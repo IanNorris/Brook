@@ -714,11 +714,15 @@ void DpIdleWorker(void*){
         SpinLockRelease(&g_dpIdleLock);
     }
 }
+static bool g_dpWatchSaved=false; // dp-idle watch off/on
 void DpIdleCommand(const char* p){
     uint32_t secs=0,ch=0,sor=0,link=0;bool ok=true;
     SpinLockAcquire(&g_dpIdleLock);
     if(!strcmp(p,"status")){}
     else if(!strcmp(p,"off")){g_dpIdle.seconds=0;if(g_dpIdle.blanked)g_dpIdle.wakeRequested=true;}
+    // GR idle-fault bisect (26 Nov): stop the link watch's periodic AUX status reads / DPCD reads
+    else if(!strcmp(p,"watch off")){static bool once=false;if(!once){g_dpWatchSaved=g_dpIdle.watch;once=true;}g_dpIdle.watch=false;}
+    else if(!strcmp(p,"watch on")){g_dpIdle.watch=g_dpWatchSaved;}
     else if(!strcmp(p,"wake")){if(g_dpIdle.blanked)g_dpIdle.wakeRequested=true;}
     else if(!strcmp(p,"test-blank")||!strcmp(p,"test-wake")){
         // Hand-driven: run the worker's own blank/wake functions on the bridge
@@ -1696,7 +1700,11 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         const char* arg=command+sizeof(aspmPrefix)-1;
         const bool all=!strcmp(arg,"l1-all");
         const bool on=!strcmp(arg,"l1")||all,off=!strcmp(arg,"off"),status=!strcmp(arg,"status");
-        if(!on && !off && !status){DebugChannelSend("{\"aspm_error\":\"Expected l1|l1-all|off|status\"}\n");return true;}
+        // GR idle-fault test (26 Nov, coordinator-approved): cap Target Link Speed (Link Control 2
+        // bits 3:0) on the root port and GPU fn0 at the current speed; no retrain is issued, so
+        // the link only stays where it is. restore writes back the values saved by the first cap.
+        const bool capSpeed=!strcmp(arg,"speed-cap"),restoreSpeed=!strcmp(arg,"speed-restore");
+        if(!on && !off && !status && !capSpeed && !restoreSpeed){DebugChannelSend("{\"aspm_error\":\"Expected l1|l1-all|off|status\"}\n");return true;}
         PciDevice gpu{};bool found=false;
         for(uint32_t i=0;i<PciBootInventoryCount() && !found;++i){PciBootEntry e{};
             if(PciBootInventoryRead(i,&e) && e.device.vendorId==0x10de && e.device.classCode==0x03 && e.device.fn==0){gpu=e.device;found=true;}}
@@ -1720,6 +1728,21 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         const uint32_t worst=exitUs(eLinkCap)>exitUs(rLinkCap)?exitUs(eLinkCap):exitUs(rLinkCap);
         const bool latencyOk=acceptUs(eDevCap)>=worst;
         const char* result="status";
+        static bool speedSaved=false;static uint16_t savedE2=0,savedR2=0;
+        if(capSpeed||restoreSpeed){
+            const uint16_t e2=PciConfigRead16(gpu.bus,gpu.dev,0,uint8_t(ec+0x30)),r2=PciConfigRead16(rb,rd,rf,uint8_t(rc+0x30));
+            if(capSpeed){
+                const uint16_t cur=uint16_t(PciConfigRead16(rb,rd,rf,uint8_t(rc+0x12))&0xf);
+                if(!cur||cur>5)result="refused: unknown current link speed";
+                else{if(!speedSaved){savedE2=e2;savedR2=r2;speedSaved=true;}
+                    PciConfigWrite16(rb,rd,rf,uint8_t(rc+0x30),uint16_t((r2&~0xfu)|cur));
+                    PciConfigWrite16(gpu.bus,gpu.dev,0,uint8_t(ec+0x30),uint16_t((e2&~0xfu)|cur));
+                    result="target link speed capped at the current speed (root port, GPU fn0)";
+                    KPrintf("pcie: target link speed capped at %u (LnkCtl2 root %x gpu %x saved)\n",cur,savedR2,savedE2);}
+            } else if(!speedSaved)result="refused: nothing saved";
+            else{PciConfigWrite16(gpu.bus,gpu.dev,0,uint8_t(ec+0x30),savedE2);PciConfigWrite16(rb,rd,rf,uint8_t(rc+0x30),savedR2);
+                result="target link speed restored";KPrintf("pcie: LnkCtl2 restored (root %x gpu %x)\n",savedR2,savedE2);}
+        }
         if(on){
             if(!l1Both)result="refused: L1 not supported on both ends";
             else if(!ccc)result="refused: common clock not configured (would need a retrain)";
@@ -1757,6 +1780,7 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",");r.field("gpu_link_cap",eLinkCap);r.text(",");r.field("root_link_cap",rLinkCap);
         r.text(",");r.field("gpu_link_ctl2_sta2",PciConfigRead32(gpu.bus,gpu.dev,0,uint8_t(ec+0x30)));
         r.text(",");r.field("root_link_ctl2_sta2",PciConfigRead32(rb,rd,rf,uint8_t(rc+0x30)));
+        r.text(",");r.field("saved_gpu_lnkctl2",savedE2);r.text(",");r.field("saved_root_lnkctl2",savedR2);
         r.text(",");r.field("root_dev_ctl",PciConfigRead16(rb,rd,rf,uint8_t(rc+0x08)));
         r.text(",");r.field("root_root_ctl",PciConfigRead16(rb,rd,rf,uint8_t(rc+0x1c)));
         r.text(",");r.field("root_root_sta",PciConfigRead32(rb,rd,rf,uint8_t(rc+0x20)));
