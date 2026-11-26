@@ -312,6 +312,7 @@ inline M2Result RunM2(Bus& bus, const ChipOps& c, VramIo& vram, const M2Inputs& 
         gp[1] = uint32_t(pva >> 32) | (n << 10);
         sync();
         vram.wr32(r.userd + h::USERD_GP_PUT, 1);
+        (void)vram.rd32(r.userd + h::USERD_GP_PUT);   // read back before the doorbell (posted-write ordering, 27 Nov)
         bus.wr32(c.usermode + h::kDoorbell, r.token);
         r.stage = "fence";
         const uint64_t t0 = bus.now_us();
@@ -351,6 +352,7 @@ inline M2Result RunM2(Bus& bus, const ChipOps& c, VramIo& vram, const M2Inputs& 
                 uint32_t* sem = reinterpret_cast<uint32_t*>(in.sem.cpu);
                 const uint64_t t0 = bus.now_us();
                 vram.wr32(r.userd + h::USERD_GP_PUT, gp);
+                (void)vram.rd32(r.userd + h::USERD_GP_PUT);   // read back before the doorbell (posted-write ordering, 27 Nov)
                 bus.wr32(c.usermode + h::kDoorbell, r.token);
                 for (;;) {
                     if (__atomic_load_n(&sem[0], __ATOMIC_ACQUIRE) == want) { *us = bus.now_us() - t0; return true; }
@@ -419,6 +421,7 @@ inline bool M2KeptSubmit(Bus& bus, const ChipOps& c, VramIo& vram, M2Keep& k, co
     const uint32_t* sem = reinterpret_cast<const uint32_t*>(in.sem.cpu);
     const uint64_t t0 = bus.now_us();
     vram.wr32(k.userd + h::USERD_GP_PUT, k.gp);
+    (void)vram.rd32(k.userd + h::USERD_GP_PUT);   // read back before the doorbell (posted-write ordering, 27 Nov)
     bus.wr32(c.usermode + h::kDoorbell, k.token);
     for (;;) {
         if (__atomic_load_n(&sem[0], __ATOMIC_ACQUIRE) == want) { *us = bus.now_us() - t0; return true; }
@@ -447,6 +450,7 @@ inline uint32_t M2KeptKick(Bus& bus, const ChipOps& c, VramIo& vram, M2Keep& k, 
     sync();
     k.gp = (k.gp + 1) % kEntries;
     vram.wr32(k.userd + h::USERD_GP_PUT, k.gp);
+    (void)vram.rd32(k.userd + h::USERD_GP_PUT);   // read back before the doorbell (posted-write ordering, 27 Nov)
     bus.wr32(c.usermode + h::kDoorbell, k.token);
     return want;
 }

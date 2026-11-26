@@ -73,9 +73,14 @@ struct LiveBackend{
     // The top 1 MiB of the aperture (instmem, pushbuffers, sync page) is pinned.
     volatile uint32_t* VramMap(uint64_t a){return a+(1ull<<20)>=bar1Size?vramTop.Map(bar1+a):vram.Map(bar1+a);}
     uint32_t rd(uint32_t a){volatile uint32_t* p=regs.Map(bar0+a);return p?*p:0xffffffffu;}
-    void wr(uint32_t a,uint32_t v){volatile uint32_t* p=regs.Map(bar0+a);if(p)*p=v;}
+    // 27 Nov NVK head freeze: a BAR1 flush (0x070000) is preceded by a BAR1 read of the last
+    // BAR1-written word, so every plan/flipper kick that flushes is ordered behind its ring writes
+    // (with GSP-RM up BAR1 is virtual and a posted write can wait on a page walk).
+    uint64_t lastVwr=~0ull;uint32_t flushReads=0;
+    void wr(uint32_t a,uint32_t v){if(a==0x070000u&&lastVwr!=~0ull){(void)vrd(lastVwr);++flushReads;}
+        volatile uint32_t* p=regs.Map(bar0+a);if(p)*p=v;}
     uint32_t vrd(uint64_t a){if(a+4>bar1Size)return 0xffffffffu;volatile uint32_t* p=VramMap(a);return p?*p:0xffffffffu;}
-    void vwr(uint64_t a,uint32_t v){if(a+4>bar1Size)return;volatile uint32_t* p=VramMap(a);if(p)*p=v;}
+    void vwr(uint64_t a,uint32_t v){if(a+4>bar1Size)return;volatile uint32_t* p=VramMap(a);if(p){*p=v;lastVwr=a;}}
     void fill(uint64_t v,uint32_t bytes,uint32_t pitch,uint32_t colour,uint32_t marker,uint32_t lines){
         if(v+bytes>bar1Size||!pitch)return;
         const uint64_t markerEnd=uint64_t(lines)*pitch;

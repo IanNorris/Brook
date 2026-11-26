@@ -2099,6 +2099,7 @@ bool NvdChanSubmit(void*, uint32_t chan, const uint64_t* va, const uint32_t* dw,
         ch.gp = (ch.gp + 1) % 512;
         FlushRange(ch.gpfifo.cpu, 0x1000); FlushRange(ch.kpush.cpu, 0x1000);
         vio.wr32(ch.s.userd + h::USERD_GP_PUT, ch.gp);
+        (void)vio.rd32(ch.s.userd + h::USERD_GP_PUT);   // read back before the doorbell (posted-write ordering, 27 Nov)
         g_bus.wr32(c->usermode + h::kDoorbell, ch.token);
     }
     pr.Restore();

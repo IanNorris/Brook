@@ -526,6 +526,7 @@ inline GrResult GrUserSession(Bus& bus, const ChipOps& c, VramIo& vram, Api& api
         const uint32_t* sem = reinterpret_cast<const uint32_t*>(pl.sem.cpu);
         const uint64_t t0 = bus.now_us();
         vram.wr32(u.userd + h::USERD_GP_PUT, gp);
+        (void)vram.rd32(u.userd + h::USERD_GP_PUT);   // read back before the doorbell (posted-write ordering, 27 Nov)
         bus.wr32(c.usermode + h::kDoorbell, *token);
         for (;;) {
             if (__atomic_load_n(&sem[0], __ATOMIC_ACQUIRE) == want) { *us = uint32_t(bus.now_us() - t0); return true; }
