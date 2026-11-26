@@ -14,6 +14,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--build', type=Path, default=ROOT / 'build/release')
+    parser.add_argument('--scale', type=int, choices=(100, 200), default=100)
     parser.add_argument('--timeout', type=float, default=90)
     args = parser.parse_args()
     if subprocess.run(['pgrep', '-x', 'vmware-vmx'], stdout=subprocess.DEVNULL).returncode == 0:
@@ -31,6 +32,9 @@ def main():
     marker = output / 'volatile-desktop'
     marker.write_text('1\n')
     subprocess.run(['mcopy', '-i', initrd, marker, '::ETC/volatile-desktop'], check=True)
+    config = output / 'desktop-defaults.ini'
+    config.write_text(f'[Desktop]\nscale={args.scale}\n')
+    subprocess.run(['mcopy', '-o', '-i', initrd, config, '::ETC/desktop-defaults.ini'], check=True)
     rc = output / 'INIT.RC'
     commands = 'set wm\nset vfb none\nrun --console --uid 0 /boot/CAPTURE.ELF'
     rc.write_text(commands + '\n')
