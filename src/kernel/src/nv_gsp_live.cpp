@@ -2108,9 +2108,9 @@ const nvdrm::Backend g_nvdBackend{nullptr, NvdVramAlloc, NvdVramFree, NvdSysAllo
 // from NvdVasCreate, N GR channels from NvdChanCreate (1 or 2, default 2; as nv-drm makes them
 // for NVK), a 256x256 pitch target and a push buffer mapped with NvdVasMap, the known-good clear
 // submitted through NvdChanSubmit on the last channel, then on the first. Pixels read via PRAMIN.
-void GrVas2(uint32_t nchan) {
+void GrVas2(uint32_t nchan, bool priv = false) {
     namespace h = rm570::host;
-    Out o; o.raw("{\"nv_gsp\":\"gr clear vas2\""); o.kd("channels", nchan);
+    Out o; o.raw("{\"nv_gsp\":\"gr clear vas2\""); o.kd("channels", nchan); o.kb("priv_reg", priv);
     const ChipOps* c = ChipForBoot0(g_bus.rd32(0));
     if (!c || !g_rmRunning || !g_gr.up) { o.ks("refused", "needs GSP-RM and gr golden this boot"); o.send(); return; }
     uint32_t vas = 0, ch[2] = {~0u, ~0u}, made = 0; uint64_t rt = 0, push = 0;
@@ -2136,6 +2136,14 @@ void GrVas2(uint32_t nchan) {
         const float col[2][4] = {{1, 0, 1, 1}, {0, 1, 1, 1}};
         const uint32_t want = pass ? 0xff00ffffu : 0xffff00ffu;
         w[n++] = h::IncHeader(0, 0, 1); w[n++] = rm570::gr::TURING_A;
+        if (priv) {   // 27 Nov NVK Xid 44 hypothesis: NVK's init SET_PRIV_REG (MME macro 22) as plain methods:
+            // WAIT_FOR_IDLE, MME scratch FALCON_0..2 = {0, value 0, mask 8}, SET_FALCON04 = 0x419ba4
+            // (FECS firmware writes the priv reg and sets scratch 0 to 1), then NOPs
+            m1(0x0110, 0);
+            w[n++] = h::IncHeader(0, 0x3400, 3); w[n++] = 0; w[n++] = 0; w[n++] = 8;
+            m1(0x2310, 0x419ba4);
+            for (int q = 0; q < 16; ++q) m1(0x0100, 0);
+        }
         w[n++] = h::IncHeader(0, gr3d::SET_COLOR_TARGET_A0, 8); w[n++] = uint32_t(va_rt >> 32); w[n++] = uint32_t(va_rt);
         w[n++] = pitch; w[n++] = H; w[n++] = gr3d::FORMAT_A8R8G8B8; w[n++] = gr3d::MEMORY_LAYOUT_PITCH; w[n++] = 1; w[n++] = 0;
         m1(gr3d::SET_CT_SELECT, 1); m1(gr3d::SET_ZT_SELECT, 0);
@@ -2228,6 +2236,7 @@ bool NvGspHandle(const char* command) {
     else if (!strcmp(verb, "fault shadow on")) FaultShadowOn();
     else if (!strcmp(verb, "gr clear vas2") || !strcmp(verb, "gr clear vas2 2")) GrVas2(2);
     else if (!strcmp(verb, "gr clear vas2 1")) GrVas2(1);
+    else if (!strcmp(verb, "gr clear vas2 priv")) GrVas2(1, true);
     else if (!strncmp(verb, "nocat ", 6)) { uint32_t k = 0; for (const char* q = verb + 6; *q >= '0' && *q <= '9'; ++q) k = k * 10 + uint32_t(*q - '0'); NocatVerb(k); }
     else if (!strcmp(verb, "perf status")) PerfVerb(0);
     else if (!strcmp(verb, "perf boost")) PerfVerb(1);
