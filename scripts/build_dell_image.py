@@ -214,6 +214,8 @@ def main():
     p.add_argument('--ssd-trim', metavar='MARKER',
                    help='one-boot maintenance pair: write /etc/ssd-trim with this marker (e.g. "dry-run", '
                         '"run 1 16"; see docs/ssd-trim.md). Never use it for the default pair')
+    p.add_argument('--boot-compression-seed', type=Path,
+                   help='also build a signed LZ4 pair for a compression-aware guarded loader')
     p.add_argument('--qemu-check', action='store_true',
                    help='then run scripts/check_dell_image_qemu.py on the pair (results in <output>/qemu-check)')
     a = p.parse_args()
@@ -388,6 +390,20 @@ def main():
         manifest['build_id'] = build_id[1]
         manifest['bridge_v3'] = {'version': 3, 'suite': 1, 'policy_sha256': sha(operator_input),
                                  'helpers_sha256': compiled_helpers}
+    if a.boot_compression_seed:
+        from boot_compression import INITRD, KERNEL, compress, read_signer
+        signer = read_signer(a.boot_compression_seed)
+        stored = a.output / 'boot-compressed'
+        stored.mkdir()
+        entries = {}
+        for name, kind, maximum in (('kernel.elf', KERNEL, 8 << 20), ('INITRD.IMG', INITRD, 64 << 20)):
+            data = compress((a.output / name).read_bytes(), kind, signer, maximum)
+            (stored / name).write_bytes(data)
+            entries[name] = {'bytes': len(data), 'sha256': sha(stored / name)}
+        manifest['boot_compression'] = {
+            'codec': 'lz4', 'directory': stored.name, 'public_key': signer.verify_key.encode().hex(),
+            'files': entries,
+        }
     (a.output / 'build-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     print(json.dumps({k: manifest[k] for k in ('payload_id', 'commit', 'dirty', 'kernel_sha256', 'initrd_sha256')}, indent=2))
 

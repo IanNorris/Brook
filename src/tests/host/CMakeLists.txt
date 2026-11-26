@@ -1283,6 +1283,8 @@ target_include_directories(test_debug_bridge_v3_listener PRIVATE
 target_link_libraries(test_debug_bridge_v3_listener PRIVATE bridge_v3_interop)
 
 # Boot-stick self-update core (tools/rtx_stick_update.h) and loader set choice.
+add_host_test(test_boot_compression ../test_boot_compression/main.cpp)
+
 add_host_test(test_rtx_stick_update
     "${BROOK_ROOT}/src/third_party/monocypher/monocypher.c"
     "${BROOK_ROOT}/src/third_party/monocypher/monocypher-ed25519.c")

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(brook-bootloader CXX)
+project(brook-bootloader C CXX)
 
 if(NOT DEFINED BROOK_ROOT)
     set(BROOK_ROOT "${CMAKE_SOURCE_DIR}/../..")
@@ -37,9 +37,33 @@ add_executable(bootloader
     src/recovery_firmware_discovery.cpp
     src/fs.cpp
     src/elf_loader.cpp
+    src/boot_payload.cpp
     src/paging.cpp
     src/runtime.cpp
 )
+
+# Configured loaders trust one build-time public key for compressed artifacts.
+# Raw payloads and the ordinary default-configured loader remain supported.
+set(BROOK_BOOT_COMPRESSION_KEY "" CACHE STRING "Ed25519 boot compression public key (hex)")
+if(BROOK_BOOT_COMPRESSION_KEY)
+    string(LENGTH "${BROOK_BOOT_COMPRESSION_KEY}" PIN_LENGTH)
+    if(NOT PIN_LENGTH EQUAL 64 OR BROOK_BOOT_COMPRESSION_KEY MATCHES "[^0-9a-f]")
+        message(FATAL_ERROR "Boot compression key must contain 64 lowercase hex digits")
+    endif()
+    set(CRYPTO "${BROOK_ROOT}/src/third_party/monocypher")
+    set(LZ4 "${BROOK_ROOT}/src/third_party/lz4/lz4.c")
+    target_sources(bootloader PRIVATE "${CRYPTO}/monocypher.c" "${CRYPTO}/monocypher-ed25519.c" "${LZ4}")
+    include_directories("${CRYPTO}")
+    if(DEFINED ENV{BROOK_CLANG_RESOURCE_DIR})
+        target_compile_options(bootloader PRIVATE "-resource-dir=$ENV{BROOK_CLANG_RESOURCE_DIR}")
+        add_compile_options("-resource-dir=$ENV{BROOK_CLANG_RESOURCE_DIR}")
+    endif()
+    add_compile_definitions(BROOK_BOOT_COMPRESSION_KEY="${BROOK_BOOT_COMPRESSION_KEY}")
+    set_source_files_properties("${LZ4}" PROPERTIES
+        COMPILE_DEFINITIONS "LZ4_FREESTANDING=1;LZ4_memcpy=__builtin_memcpy;LZ4_memset=__builtin_memset;LZ4_memmove=__builtin_memmove")
+    set_source_files_properties("${LZ4}" "${CRYPTO}/monocypher.c" "${CRYPTO}/monocypher-ed25519.c"
+        PROPERTIES COMPILE_OPTIONS "-mno-stack-arg-probe;-ffunction-sections")
+endif()
 
 target_include_directories(bootloader PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}"
