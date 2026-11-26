@@ -432,6 +432,12 @@ static int FatFileWriteAt(Vnode* vn, const void* buf, uint64_t len, uint64_t* of
             KMutexUnlock(&g_fatLock);
             return FrToErrno(sres);
         }
+        if (f_tell(fil) != position) {
+            file->mount->backgroundDirty = true;
+            PublishFatMutation(file);
+            KMutexUnlock(&g_fatLock);
+            return -28; // Full disk clipped the growing seek.
+        }
     }
     UINT bw = 0;
     FRESULT res = f_write(fil, buf, static_cast<UINT>(len), &bw);
@@ -449,7 +455,7 @@ static int FatFileWriteAt(Vnode* vn, const void* buf, uint64_t len, uint64_t* of
     if (res != FR_OK) { KMutexUnlock(&g_fatLock); return FrToErrno(res); }
     if (bw) *offset = position + bw;
     KMutexUnlock(&g_fatLock);
-    return static_cast<int>(bw);
+    return len && !bw ? -28 : static_cast<int>(bw);
 }
 
 static int FatFileWrite(Vnode* vn, const void* buf, uint64_t len, uint64_t* offset)

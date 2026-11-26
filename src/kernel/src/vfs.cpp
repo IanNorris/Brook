@@ -158,6 +158,7 @@ struct MountBacking {
     uint8_t pdrv;
     uint64_t references;
     bool systemInternal;
+    bool volatileBacking;
     bool independent; // fresh instances never participate in legacy device coalescing
     MountBacking* next;
     void RetainLocked() {
@@ -641,7 +642,8 @@ bool VfsMountConfiguredWithPublication(const char* mountPoint,const char* fsName
 {
     if(publication)*publication=0;
     const bool systemInternal=(attributes&MountSystemInternal)!=0;
-    attributes&=~MountSystemInternal;
+    const bool volatileBacking=(attributes&MountVolatileBacking)!=0;
+    attributes&=~(MountSystemInternal|MountVolatileBacking);
     if(attributes&~MountRestrictionMask)return false;
     FileMutationGuard mutation;
     if (!mountPoint || mountPoint[0]!='/' || !fsName ||
@@ -669,13 +671,15 @@ bool VfsMountConfiguredWithPublication(const char* mountPoint,const char* fsName
     if(backing) {
         // FAT's drive slots are global to its driver. Do not remount over a
         // failed retirement: its later unmount could unregister the new mount.
-        if(!backing->references || (systemInternal && !backing->systemInternal)) { kfree(slot);return false; }
+        if(!backing->references || (systemInternal && !backing->systemInternal) ||
+           (volatileBacking && !backing->volatileBacking)) { kfree(slot);return false; }
         backing->RetainLocked();
     } else {
         backing=static_cast<MountBacking*>(kmalloc(sizeof(MountBacking)));
         if(!backing) { kfree(slot);return false; }
         *backing={};backing->fsOps=ops;backing->pdrv=pdrv;backing->references=1;
         backing->systemInternal=systemInternal;
+        backing->volatileBacking=volatileBacking;
         void* privateData=nullptr;
         if(!ops->mount(pdrv,&privateData)) {
             SerialPrintf("VFS: mount failed for '%s' at '%s'\n",fsName,mountPoint);
@@ -1396,36 +1400,45 @@ int VfsSetTimesPath(const char* path, const VnodeTime* times, bool nofollow)
 // callback, 2 = unmount of a retired backing). The kernel's strong
 // definition (shutdown.cpp) writes it to the log ring; standalone tests
 // that link vfs.cpp alone keep this no-op.
-__attribute__((weak)) void VfsSyncFailureLog(int, uint8_t, const void*, int) {}
+__attribute__((weak)) void VfsSyncFailureLog(int, uint8_t, const void*, int, bool) {}
 
-int VfsSync(Vnode* vn)
+static bool PersistentVnode(const Vnode* vn)
 {
-    if (vn) return VfsFsync(vn);
+    const auto* mount=static_cast<const MountEntry*>(vn->mountOwner);
+    return !mount || !mount->backing->volatileBacking;
+}
+
+static int SyncAll(bool shutdown)
+{
     // Try every mount even after a failure, but never acknowledge a failed
     // filesystem/device flush as successful to sync(2) or the VM bridge.
-    int result = FileObjectWritebackAll();
+    int result = FileObjectWritebackAll(shutdown ? PersistentVnode : nullptr);
     // Failures go to the kernel log ring too, so a failed shutdown sync is
     // diagnosable over the bridge (the serial tail is not persisted then).
-    if (result) VfsSyncFailureLog(0, 0, nullptr, result);
+    if (result) VfsSyncFailureLog(0, 0, nullptr, result, false);
     FileMutationGuard mutation;
     VfsCollectRetiredMountsLocked();
     for(auto* backing=g_backings;backing;) {
         auto* next=backing->next;
+        const bool ignoreError=shutdown && backing->volatileBacking;
         if(backing->fsOps->sync) {
             int error=backing->fsOps->sync(backing->mountPriv);
-            if(error)VfsSyncFailureLog(1,backing->pdrv,reinterpret_cast<const void*>(backing->fsOps->sync),error);
-            if(!result && error)result=error<0?error:-5;
+            if(error)VfsSyncFailureLog(1,backing->pdrv,reinterpret_cast<const void*>(backing->fsOps->sync),error,ignoreError);
+            if(!result && error && !ignoreError)result=error<0?error:-5;
         }
         if(!backing->references) {
             int error=VfsBackingUnmountLocked(backing);
-            if(error)VfsSyncFailureLog(2,backing->pdrv,nullptr,error);
+            if(error)VfsSyncFailureLog(2,backing->pdrv,nullptr,error,ignoreError);
             if(!error)VfsBackingFreeLocked(backing);
-            else if(!result)result=error;
+            else if(!result && !ignoreError)result=error;
         }
         backing=next;
     }
     return result;
 }
+
+int VfsSync(Vnode* vn) { return vn ? VfsFsync(vn) : SyncAll(false); }
+int VfsSyncForShutdown() { return SyncAll(true); }
 
 int VfsFsync(Vnode* vn)
 {

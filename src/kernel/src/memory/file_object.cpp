@@ -546,7 +546,7 @@ int FileObjectWriteback(FileObject* object,Vnode* vnode,uint64_t begin,uint64_t 
     { Gate held(object);result=WritebackLocked(object,vnode,begin,end,snapshot); }
     kfree(snapshot);return result;
 }
-int FileObjectWritebackAll() {
+int FileObjectWritebackAll(bool (*include)(const Vnode*)) {
     [[maybe_unused]] Operation operation;
     uint64_t ceiling=0;
     uint64_t flags=IrqSpinLockAcquire(&writebackLock);
@@ -565,6 +565,7 @@ int FileObjectWritebackAll() {
         if(object) { vnode=object->writebackVnode;VfsRetain(vnode);cursor=object->orderId; }
         IrqSpinLockRelease(&writebackLock,flags);
         if(!object)break;
+        if(include && !include(vnode)){DropVnode(vnode);continue;}
         // The vnode pin retains the inode while allocation happens outside
         // every filesystem lock. One allocation serves all snapshot backends;
         // coherent tmpfs objects continue to flush even when it fails.

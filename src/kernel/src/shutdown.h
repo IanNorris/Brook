@@ -39,6 +39,7 @@ void ShutdownDesktopCancel();
 void ShutdownDesktopForceApps();
 // Explicit escalation of already-prompted, still-open app windows.
 bool ShutdownCanForceApps(const char* requestId=nullptr);
+bool ShutdownCanForceRestart(const char* requestId);
 const char* ShutdownDesktopStatus();
 // After a failed checked shutdown: the explicit retry of the final sync and
 // the forced (data-losing) power off the desktop may offer.

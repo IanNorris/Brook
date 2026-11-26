@@ -113,7 +113,7 @@ int FileObjectWriteback(FileObject* object,Vnode* vnode,uint64_t begin,uint64_t 
 // retry; other objects are still attempted. Quarantined objects report their
 // error but retire stale cache/queue ownership once every mapping is gone.
 // Quarantine requires a successful pre-attempt flush. No backend-device flush.
-int FileObjectWritebackAll();
+int FileObjectWritebackAll(bool (*include)(const Vnode*) = nullptr);
 // Kernel boot/shutdown integration. Stop waits for the active pass before
 // device write admission closes; explicit shutdown sync then performs the final
 // flush. Neither call is used by the standalone/hosted fixtures.

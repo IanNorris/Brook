@@ -387,6 +387,8 @@ extern "C" void VfsClose(Vnode* vn);
 // Flush one vnode, or all mounted filesystems when vn is nullptr. Return the
 // first error while still attempting the other mounts.
 int VfsSync(Vnode* vn);
+// Final shutdown sync ignores failures from explicitly RAM-only mount backings.
+int VfsSyncForShutdown();
 
 // Flush a single open file's data + directory entry to the backing device.
 // Filesystems may synchronize the whole mount to satisfy this request.

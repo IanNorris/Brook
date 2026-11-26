@@ -28,6 +28,7 @@ struct Node { Mount* mount;uint64_t id;bool dir;Node* parent;std::map<std::strin
 struct Mount { uint64_t identity=0;bool alive=false;std::atomic<unsigned> live{0};unsigned closed=0;Node root{}; };
 Mount mounts[8];
 unsigned mountCalls[8]{},unmountCalls[8]{},syncCalls[8]{};
+int syncError[8]{};
 bool rejectRoot[8]{},rejectUnmount[8]{};
 uint64_t rejectDirectoryReport=0;
 bool rejectProvider=false;unsigned providerCalls=0;
@@ -152,7 +153,7 @@ int legacyRename(void* priv,uint8_t,const char* oldPath,const char* newPath){
     return objectRename(&oldObject,oldText.substr(oldSlash==std::string::npos?0:oldSlash+1).c_str(),
                         &newObject,newText.substr(newSlash==std::string::npos?0:newSlash+1).c_str());
 }
-int syncBackend(void* priv){auto* m=static_cast<Mount*>(priv);assert(m->alive);++syncCalls[m-mounts];return 0;}
+int syncBackend(void* priv){auto* m=static_cast<Mount*>(priv);assert(m->alive);++syncCalls[m-mounts];return syncError[m-mounts];}
 const brook::VfsFsOps fsOps={.mount=mountBackend,.unmount=unmountBackend,.open=legacyOpen,.stat_path=legacyStat,.lstat_path=legacyStat,.unlink=nullptr,.mkdir=nullptr,.rename=legacyRename,.symlink=nullptr,.readlink=nullptr,.sync=syncBackend,.root_object=rootObject,.vnode_object=vnodeObject};
 const brook::VfsFsOps freshOps={.mount=mountBackend,.unmount=freshUnmount,.open=legacyOpen,.stat_path=legacyStat,.lstat_path=legacyStat,.unlink=nullptr,.mkdir=nullptr,.rename=legacyRename,.symlink=nullptr,.readlink=nullptr,.sync=freshSync,.root_object=freshRoot,.vnode_object=vnodeObject};
 const brook::VfsFsOps unsupportedOps={.mount=mountBackend,.unmount=unmountBackend,.open=nullptr,.stat_path=nullptr,.lstat_path=nullptr,.unlink=nullptr,.mkdir=nullptr,.rename=nullptr,.symlink=nullptr,.readlink=nullptr,.sync=nullptr};
@@ -202,7 +203,7 @@ void KRwLockWriteUnlock(KRwLock*){namespaceLock.unlock();}
 extern "C" void SerialPrintf(const char*,...){}
 void SerialPuts(const char*){}
 extern "C" void KernelPanic(const char*,...){std::abort();}
-int FileObjectWritebackAll(){return 0;}
+int FileObjectWritebackAll(bool (*)(const Vnode*)){return 0;}
 int FileObjectRead(FileObject*,Vnode*,void*,uint64_t,uint64_t*){assert(false);return -5;}
 int FileObjectReadTagged(FileObject* object,Vnode* vn,void* out,uint64_t bytes,uint64_t* offset,UsbReadSource) {
     return FileObjectRead(object,vn,out,bytes,offset);
@@ -1111,11 +1112,19 @@ int main(){
     VfsInit();rejectProvider=true;assert(!VfsRegisterFs("rejected",&fsOps));rejectProvider=false;
     assert(VfsRegisterFs("objects",&fsOps));assert(providerCalls==3);assert(VfsRegisterFs("unsupported",&unsupportedOps));
     uint64_t publication=0;
-    assert(VfsMountConfiguredWithPublication("/","objects",0,0,&publication));assert(publication!=0);
+    assert(VfsMountConfiguredWithPublication("/","objects",0,MountVolatileBacking,&publication));assert(publication!=0);
     uint64_t rejected=123;
     assert(!VfsMountConfiguredWithPublication("/","objects",1,0,&rejected));assert(rejected==0);
     Node directory{&mounts[0],2,true,&mounts[0].root,{},{}}, marker{&mounts[0],3,false,&directory,{},{}}, poison{&mounts[0],4,true,&mounts[0].root,{},{}}, file{&mounts[0],5,false,&mounts[0].root,{},{}}, link{&mounts[0],6,false,&directory,{},"/dir/marker"}, namespaceTarget{&mounts[0],900,true,&mounts[0].root,{},{}};
     mounts[0].root.children={{"dir",&directory},{"file",&file},{"namespace-target",&namespaceTarget}};directory.children={{"marker",&marker},{"absolute",&link}};
+    assert(VfsMount("/namespace-target","objects",1));
+    syncError[0]=-5;
+    assert(VfsSync(nullptr)==-5);
+    assert(VfsSyncForShutdown()==0);
+    syncError[1]=-28;
+    assert(VfsSyncForShutdown()==-28);
+    syncError[0]=syncError[1]=0;
+    assert(VfsUnmount("/namespace-target"));
     auto* rootNode=VfsOpen("/");auto* childNode=VfsOpen("/dir");
     assert(rootNode && childNode && VfsVnodeIsPublishedRoot(rootNode,publication,0));
     assert(VfsVnodeIsPublishedUserVolume(rootNode,publication,0));

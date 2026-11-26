@@ -340,7 +340,7 @@ WritableDesktopBoot WritableDesktopLiveMount(uint8_t* nextDrive,Device* ram,uint
     if(!Ext2BindDevice(*nextDrive,ram))return Fail(-16);
     info.drive=*nextDrive; ++*nextDrive;
     info.stage="mount";
-    if(!VfsMountConfigured("/nix","ext2",info.drive,6))return Fail(-5,false,true);
+    if(!VfsMountConfigured("/nix","ext2",info.drive,6|MountVolatileBacking))return Fail(-5,false,true);
     info.stage="payload";
     if(const auto payload=PayloadFailure();payload.status){
         KPrintf("writable desktop: live payload refused (%s %s %d)\n",payload.path,payload.check,payload.status);

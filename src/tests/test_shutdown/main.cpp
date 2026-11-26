@@ -90,7 +90,7 @@ bool DeviceCloseWrites(){assert(writebackStopped);++freezes;return canFreeze;}
 void AudioStop(){}
 void AudioPrepareShutdown(){}
 void HdaRuntimeShutdown(){}
-int VfsSync(Vnode*){++syncs;return syncError;}
+int VfsSyncForShutdown(){++syncs;return syncError;}
 int AhciSystemDirectFinalSync(){assert(writebackStopped && canFreeze && !syncError);++directFinalCalls;return directFinalError;}
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
 bool SsdQemuInstallCloseReady(){return true;}
@@ -172,11 +172,17 @@ void TestFailureRecovery() {
     assert(powerWrites==writesBefore+1&&!lastRestart&&operations[current].phase==Phase::Failed);
     step();assert(powerWrites==writesBefore+1);
     assert(!strcmp(ShutdownDesktopStatus(),ioText));
+    powerRestart=false;assert(!ShutdownCanForceRestart(req));command(req,"force_restart","not_ready",-16);
+    powerRestart=true;assert(ShutdownCanForceRestart(req));command(req,"force_restart","committing");
+    terminalSleeps=true;step();terminalSleeps=false;
+    assert(powerWrites==writesBefore+2&&lastRestart&&operations[current].phase==Phase::Failed);
+    step();assert(powerWrites==writesBefore+2);
     // A successful explicit retry reaches the normal ready state.
     syncError=0;command(req,"retry","syncing");step();
     command(req,"power_status","ready");assert(syncs==syncsBefore+2&&finalCalls==finalBefore+1);
     assert(!ShutdownDesktopFailureActions().failed);
     command(req,"retry","not_ready",-16);command(req,"force_power_off","not_ready",-16);
+    command(req,"force_restart","not_ready",-16);
     // A failed power transition (not a sync failure) offers no retry.
     command(req,"commit","ready");terminalSleeps=true;step();terminalSleeps=false;
     command(req,"power_status","failed",-5);

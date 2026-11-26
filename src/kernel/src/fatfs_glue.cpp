@@ -232,8 +232,10 @@ DRESULT disk_write(BYTE pdrv, const BYTE* buff, LBA_t sector, UINT count)
     uint64_t len    = static_cast<uint64_t>(count)  * SECTOR_SIZE;
 
     int ret = brook::DeviceWrite(dev, offset, buff, len);
-    if (ret != static_cast<int>(len))
-        __atomic_store_n(&brook::g_fatfsWriteErrors[pdrv], 1, __ATOMIC_RELAXED);
+    if (ret != static_cast<int>(len) &&
+        !__atomic_exchange_n(&brook::g_fatfsWriteErrors[pdrv], 1, __ATOMIC_RELAXED))
+        brook::SerialPrintf("fatfs: first sector write failure pdrv=%u sector=%lu count=%u result=%d\n",
+                           unsigned(pdrv), static_cast<unsigned long>(sector), count, ret);
     return (ret == static_cast<int>(len)) ? RES_OK : RES_ERROR;
 }
 

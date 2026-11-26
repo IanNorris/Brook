@@ -712,7 +712,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
             if (rd && brook::DeviceRegister(rd))
             {
                 if (!brook::FatFsBindDrive(0, rd)) KernelPanic("initrd: drive binding refused");
-                if (brook::VfsMount("/", "fatfs", 0))
+                if (brook::VfsMountConfigured("/", "fatfs", 0, brook::MountVolatileBacking))
                     brook::KPuts("initrd: mounted at /\n");
                 else
                     brook::KPuts("initrd: mount failed\n");
@@ -749,7 +749,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
             if (rd && brook::DeviceRegister(rd))
             {
                 if (!brook::FatFsBindDrive(0, rd)) KernelPanic("embedded initrd: drive binding refused");
-                if (!brook::VfsMount("/", "fatfs", 0))
+                if (!brook::VfsMountConfigured("/", "fatfs", 0, brook::MountVolatileBacking))
                     brook::KPuts("VFS: embedded ramdisk mount failed\n");
             }
             else
@@ -840,9 +840,11 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     // Optional read-only-media desktop: keep runtime sockets and user settings
     // on bounded tmpfs instances. No persistent disk is replaced by default.
     brook::VnodeStat volatileDesktop{};
-    if (brook::VfsStatPath("/etc/volatile-desktop", &volatileDesktop) == 0) {
+    {
+        const bool volatileData=brook::VfsStatPath("/etc/volatile-desktop", &volatileDesktop) == 0;
         const char* paths[] = {"/tmp", "/data"};
         for (const char* path : paths) {
+            if (path==paths[1] && !volatileData) continue;
             const uint16_t mode = path == paths[0] ? 01777 : 0755;
             brook::VfsPath root{}, target{};
             int error = brook::VfsPathRoot(&root);
@@ -862,8 +864,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
                 }
             }
             brook::VfsPathRelease(target);brook::VfsPathRelease(root);
-            if (error) KernelPanic("volatile desktop mount failed path=%s error=%d", path, error);
-            brook::SerialPrintf("VFS: volatile desktop %s ready (RAM only, nodev,nosuid)\n", path);
+            if (error && volatileData) KernelPanic("volatile desktop mount failed path=%s error=%d", path, error);
+            if (error) brook::SerialPrintf("VFS: /tmp tmpfs unavailable (%d); using root backing\n",error);
+            else brook::SerialPrintf("VFS: volatile desktop %s ready (RAM only, nodev,nosuid)\n", path);
         }
     }
 
