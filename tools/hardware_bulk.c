@@ -381,6 +381,8 @@ int main(int argc,char** argv){
     if(geteuid()!=0)return 3;
 #ifdef BROOK_BULK_USB_PROFILE
     int marker=open("/etc/usb-profile-plan.pub",O_RDONLY|O_NOFOLLOW|O_CLOEXEC);
+#elif defined(BROOK_BULK_MARKER)
+    int marker=open(BROOK_BULK_MARKER,O_RDONLY|O_NOFOLLOW|O_CLOEXEC);   /* RTX desktop sets: /etc/rtx-update-signer */
 #else
     int marker=open("/etc/hardware-maintenance",O_RDONLY|O_NOFOLLOW|O_CLOEXEC);
 #endif

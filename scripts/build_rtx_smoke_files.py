@@ -173,7 +173,8 @@ def build_helpers(build_root, initrd, policy_file, signer_hex, *, usb_profiles=F
     zlib_flags, zlib_archive = bridge_compression()
     for name, source in helpers.items():
         binary = build_root / name
-        definitions = ['-DBROOK_BULK_USB_PROFILE'] if name == 'HWBULK.ELF' else zlib_flags if name == 'HWBULKZ.ELF' else []
+        definitions = (['-DBROOK_BULK_USB_PROFILE'] if name == 'HWBULK.ELF' else
+                       [*zlib_flags, '-DBROOK_BULK_MARKER="/etc/rtx-update-signer"'] if name == 'HWBULKZ.ELF' else [])
         libraries = [zlib_archive] if name == 'HWBULKZ.ELF' else []
         run([os.environ['MUSL_CC'], *flags, *definitions, ROOT / source, *objects, *libraries, '-o', binary])
         run(['mcopy', '-o', '-i', initrd, binary, '::/BOOT/' + name])

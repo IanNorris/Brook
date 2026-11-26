@@ -154,7 +154,8 @@ int64_t NvDrmIoctl(NvDrmFile* f, uint64_t cmd, uint64_t arg) {
     static uint32_t logged = 0;
     if (r < 0 && r != nvdrm::kETIME && r != nvdrm::kEBUSY && logged < 400) {
         ++logged;
-        KPrintf("nv-drm: ioctl nr 0x%x size %u -> %ld\n", nr, nvdrm::IocSize(cmd), (long)r);
+        KPrintf("nv-drm: ioctl nr 0x%x size %u -> %ld (%s)\n", nr, nvdrm::IocSize(cmd), (long)r, f->core.why);
+        f->core.why = "";
     }
     return r;
 }

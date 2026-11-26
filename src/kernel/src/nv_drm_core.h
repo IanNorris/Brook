@@ -189,6 +189,7 @@ struct File {
     BindJob jobs[kMaxBindJobs];   // async VM_BIND, run in submission order
     uint32_t job_head = 0, job_count = 0;
     GpuFence* last_exec = nullptr;   // CPU_PREP waits for it (M5.3 sets it)
+    const char* why = "";            // reason for the last refusal (bring-up logging)
     void Init(const DeviceInfo* d, const Backend* b = nullptr) { dev = d; be = b; syncs.Init(); }
     void Close();
 };
@@ -635,12 +636,12 @@ inline void Pump(File& f) {
     }
 }
 inline int64_t ReadSyncs(File& f, const UserAccess& u, uint64_t ptr, uint32_t count, SyncDesc* out) {
-    if (count > kMaxJobSyncs) return kEINVAL;
+    if (count > kMaxJobSyncs) { f.why = "too many syncs"; return kEINVAL; }
     if (count && !u.read(u.ctx, out, ptr, uint64_t(count) * sizeof(SyncDesc))) return kEFAULT;
     for (uint32_t i = 0; i < count; ++i) {
-        if (out[i].flags != SYNC_SYNCOBJ) return kEINVAL;   // binary syncobjs only (no timeline cap yet)
+        if (out[i].flags != SYNC_SYNCOBJ) { f.why = "sync type (timeline?)"; return kEINVAL; }   // binary syncobjs only (no timeline cap yet)
         GpuSync* s = f.syncs.Get(out[i].handle);
-        if (!s) return kEINVAL;
+        if (!s) { f.why = "sync handle"; return kEINVAL; }
         GpuSyncUnref(s);
     }
     return 0;
@@ -738,7 +739,7 @@ inline int64_t ExecIoctl(File& f, const UserAccess& u, uint64_t arg) {
     Channel* c = FindChannel(f, e.channel);
     if (!c) return kENOENT;
     if (c->dead) return -19;   // -ENODEV as nouveau after a channel kill
-    if (e.push_count > kMaxPushes || e.wait_count > 16 || e.sig_count > 16) return kEINVAL;
+    if (e.push_count > kMaxPushes || e.wait_count > 16 || e.sig_count > 16) { f.why = "exec counts"; return kEINVAL; }
     SyncDesc waits[16], sigs[16];
     if (int64_t r = ReadSyncs(f, u, e.wait_ptr, e.wait_count, waits)) return r;
     if (int64_t r = ReadSyncs(f, u, e.sig_ptr, e.sig_count, sigs)) return r;
@@ -751,11 +752,11 @@ inline int64_t ExecIoctl(File& f, const UserAccess& u, uint64_t arg) {
     if (e.push_count && !u.read(u.ctx, j->push, e.push_ptr, uint64_t(e.push_count) * sizeof(ExecPush))) { kfree(j); return kEFAULT; }
     for (uint32_t i = 0; i < j->npush; ++i)
         if (!j->push[i].va_len || (j->push[i].va_len & 3) || (j->push[i].va & 3) || (j->push[i].flags & ~EXEC_PUSH_NO_PREFETCH) ||
-            j->push[i].va_len / 4 >= (1u << 21)) { kfree(j); return kEINVAL; }
+            j->push[i].va_len / 4 >= (1u << 21)) { f.why = "push va/len/flags"; kfree(j); return kEINVAL; }
     for (uint32_t i = 0; i < e.wait_count; ++i) {
         GpuSync* s = f.syncs.Get(waits[i].handle);
         GpuFence* fe = GpuSyncAcquire(s); GpuSyncUnref(s);
-        if (!fe) { FreeJob(j, false); return kEINVAL; }
+        if (!fe) { f.why = "exec wait on a syncobj with no fence"; FreeJob(j, false); return kEINVAL; }
         j->waits[j->nwaits++] = fe;
     }
     j->done = GpuFenceCreate(false);
