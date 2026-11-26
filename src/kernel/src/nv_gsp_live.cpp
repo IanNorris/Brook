@@ -32,6 +32,7 @@
 #include "nv_gsp/nv_gsp_m3.h"
 #include "nv_gsp/nv_gsp_ce_present.h"
 #include "nv_gsp/nv_gsp_m4.h"
+#include "nv_gsp/nak_m4_kernel.h"
 #include "nv_disp_live.h"
 #include "platform_power.h"
 #include "scheduler.h"
@@ -1205,6 +1206,52 @@ void GrJson(Out& o, const GrResult& r) {
     for (uint32_t i = 0; i < rm570::gr::kEngineIdCount; ++i) { if (i) o.raw(","); o.dec(r.bufs.raw_sizes[i]); }
     o.raw("]");
 }
+// `perf status|boost|clear`: RM perf controls on the scrubber scope's subdevice (needs `gr golden`).
+// boost = NV2080_CTRL_CMD_PERF_BOOST's GSP half (INTERNAL_PERF_BOOST_SET_2X), BOOST_TO_MAX for
+// 60 s: RM's own DVFS policy within the board's stock limits; it expires by itself, `perf clear` ends it.
+void PerfVerb(int mode) {   // 0 status, 1 boost, 2 clear
+    Out o; o.raw("{\"nv_gsp\":\"perf\"");
+    const ChipOps* c = ChipForBoot0(g_bus.rd32(0));
+    if (!c || !g_rmRunning || !g_gr.up) { o.ks("refused", "needs GSP-RM and `gr golden` this boot"); o.send(); return; }
+    SpinLock* lock = NvAuxSharedLock();
+    SpinLockAcquire(lock);
+    RmWait wait; g_rm->wait_deadline_us = NowUs() + 5000000;
+    GspDoorbell<Bar0Bus, RmSync> bell{g_bus, *c, g_rmSync};
+    alignas(8) static uint8_t scratch[kRmApiBuf];
+    LiveRmApi api(g_rm->ch, g_rm->rx, g_rm->rxcap, wait, bell, scratch);
+    const uint32_t hc = g_gr.scrub.base, hs = g_gr.scrub.base + grh::kSubdevice;
+    if (mode == 1 || mode == 2) {
+        struct { uint8_t flags; uint8_t pad[3]; uint32_t duration; } b = {uint8_t(mode == 1 ? 2 : 0), {}, mode == 1 ? 60u : 0u};
+        static_assert(sizeof(b) == 8, "INTERNAL_PERF_BOOST_SET_PARAMS_2X");
+        const bool ok = api.Control(hc, hs, 0x20800a9au, &b, sizeof(b));   // NV2080_CTRL_CMD_INTERNAL_PERF_BOOST_SET_2X
+        o.kb(mode == 1 ? "boost_ok" : "clear_ok", ok); o.kh("boost_status", api.status);
+    }
+    uint32_t pstate = 0;
+    const bool pok = api.Control(hc, hs, 0x20802068u, &pstate, sizeof(pstate));   // NV2080_CTRL_CMD_PERF_GET_CURRENT_PSTATE
+    o.kb("pstate_ok", pok); o.kh("pstate_status", api.status); o.kh("pstate_mask", pstate);   // bit n = Pn
+    struct ClkInfo { uint32_t flags, domain, cur, def, min, max; };
+    struct { uint32_t level, flags; ClkInfo list[32]; uint32_t count; } lv = {};
+    static_assert(sizeof(lv) == 780, "NV2080_CTRL_PERF_GET_LEVEL_INFO_V2_PARAMS");
+    for (uint32_t i = 0; i < 32; ++i) lv.list[i].domain = 1u << i;   // probe every domain bit; RM fills what it knows
+    lv.count = 32;
+    lv.level = 0;
+    for (uint32_t i = 0; i < 32; ++i) if (pstate == (1u << i)) lv.level = i;
+    const bool lok = api.Control(hc, hs, 0x2080200bu, &lv, sizeof(lv));   // NV2080_CTRL_CMD_PERF_GET_LEVEL_INFO_V2
+    o.kb("level_ok", lok); o.kh("level_status", api.status); o.kd("level", lv.level);
+    o.k("clocks"); o.raw("[");
+    bool first = true;
+    if (lok) for (uint32_t i = 0; i < 32 && i < lv.count; ++i) {
+        const ClkInfo& k = lv.list[i];
+        if (!k.cur && !k.max) continue;
+        if (!first) o.raw(",");
+        first = false;
+        o.raw("{"); o.kh("domain", k.domain); o.kd("cur", k.cur); o.kd("def", k.def); o.kd("min", k.min); o.kd("max", k.max); o.raw("}");
+    }
+    o.raw("]");
+    SpinLockRelease(lock);
+    KPrintf("nv-gsp: perf %s: pstate mask 0x%x (rm 0x%x)\n", mode == 1 ? "boost" : mode == 2 ? "clear" : "status", pstate, api.status);
+    o.send();
+}
 void GrVerb(int mode) {   // 1 golden, 2 off, 0 status
     Out o; o.raw("{\"nv_gsp\":\"gr\"");
     const ChipOps* c = ChipForBoot0(g_bus.rd32(0));
@@ -1232,12 +1279,13 @@ void GrVerb(int mode) {   // 1 golden, 2 off, 0 status
                 g_grLast.rm_status, g_grLast.golden_ok ? 1 : 0, g_grLast.scrubber_ok ? 1 : 0, (unsigned long)us);
     } else if (mode == 2) {
         o.kd("freed", GrStopLive());
-    } else if (mode == 3) {   // step 3: user GR channel, TURING_A clears of a 3840x2160 A8R8G8B8 pitch target
+    } else if (mode == 3 || mode == 5) {   // step 3: user GR channel, TURING_A clears of a 3840x2160 A8R8G8B8 target (5: block-linear)
         if (!c || !g_rmRunning || !g_gr.up) { o.ks("refused", "needs GSP-RM and `gr golden` this boot"); o.send(); return; }
-        static bool tried = false;
-        if (tried) { o.ks("refused", "gr clear already ran this boot"); o.send(); return; }
-        tried = true;
+        static uint32_t runs = 0;
+        if (runs >= 16) { o.ks("refused", "gr clear ran 16 times this boot"); o.send(); return; }
+        ++runs;
         GrClearPlan pl;
+        pl.block_linear = mode == 5;
         auto sys = [](M2Sys* m, uint32_t bytes) { DmaRegion d; if (!RmAlloc(bytes, &d)) return false;
             m->cpu = d.cpu; m->bus = d.bus; m->bytes = d.bytes; return true; };
         if (!sys(&pl.gpfifo, 0x1000) || !sys(&pl.push, 0x1000) || !sys(&pl.sem, 0x1000) || !sys(&pl.mthdbuf, g_gr.mthdbuf_size)) {
@@ -1256,13 +1304,50 @@ void GrVerb(int mode) {   // 1 golden, 2 off, 0 status
         pr.Restore();
         SpinLockRelease(lock);
         o.kd("run_us", NowUs() - t0);
-        o.k("clear"); o.raw("{"); o.ks("stage", g.stage); o.ks("status", g.status); o.kh("rm_status", g.rm_status);
+        o.k("clear"); o.raw("{"); o.ks("layout", pl.block_linear ? "block-linear" : "pitch"); o.ks("stage", g.stage); o.ks("status", g.status); o.kh("rm_status", g.rm_status);
         o.kh("rt_vram", cr.rt_vram); o.kh("token", cr.token); o.kb("first_ok", cr.first_ok); o.kb("verify_ok", cr.verify_ok);
         o.kh("sample_got", cr.sample_got); o.kh("sample_want", cr.sample_want); o.kd("first_us", cr.first_us);
         o.kd("best_us", cr.best_us); o.kd("avg_us", cr.n ? cr.sum_us / cr.n : 0); o.kd("n", cr.n); o.kd("bytes", cr.bytes);
         o.kd("mb_per_s", cr.best_us ? cr.bytes / cr.best_us : 0); o.kd("events_rc", cr.events_rc); o.kd("events_mmu", cr.events_mmu);
         o.kd("allocated", g.allocated); o.kd("freed", g.freed); o.raw("}");
-        KPrintf("nv-gsp: GR clear %s at %s: first %d verify %d best %u us\n", g.status, g.stage, cr.first_ok ? 1 : 0,
+        KPrintf("nv-gsp: GR clear (%s) %s at %s: first %d verify %d best %u us\n", pl.block_linear ? "bl" : "pitch", g.status,
+                g.stage, cr.first_ok ? 1 : 0, cr.verify_ok ? 1 : 0, cr.best_us);
+    } else if (mode == 4) {   // step 4: TURING_COMPUTE_A dispatch of the NAK-compiled kernel (nak_m4_kernel.h)
+        if (!c || !g_rmRunning || !g_gr.up) { o.ks("refused", "needs GSP-RM and `gr golden` this boot"); o.send(); return; }
+        static bool tried = false;
+        if (tried) { o.ks("refused", "gr compute already ran this boot"); o.send(); return; }
+        tried = true;
+        GrClearPlan pl;
+        auto sys = [](M2Sys* m, uint32_t bytes) { DmaRegion d; if (!RmAlloc(bytes, &d)) return false;
+            m->cpu = d.cpu; m->bus = d.bus; m->bytes = d.bytes; return true; };
+        if (!sys(&pl.gpfifo, 0x1000) || !sys(&pl.push, 0x1000) || !sys(&pl.sem, 0x1000) || !sys(&pl.mthdbuf, g_gr.mthdbuf_size)) {
+            o.ks("refused", "no sysmem"); o.send(); return; }
+        namespace nk = nak_m4;
+        const GrComputeKernel k{nk::kCode, uint32_t(sizeof(nk::kCode) / 4), nk::kQmd, uint32_t(sizeof(nk::kQmd) / 4),
+                                nk::kShaderVa, nk::kCb0Va, nk::kInvocations, nk::kLocalSize, nk::kStoreValue};
+        const uint32_t invocations = nk::kInvocations - nk::kLocalSize / 2 - 3;   // a partial last block: tests the OOB exit
+        SpinLock* lock = NvAuxSharedLock();
+        SpinLockAcquire(lock);
+        Pramin<Bar0Bus> pr(g_bus, *c); PraminIo vio{pr};
+        RmWait wait; g_rm->wait_deadline_us = NowUs() + 10000000;
+        GspDoorbell<Bar0Bus, RmSync> bell{g_bus, *c, g_rmSync};
+        alignas(8) static uint8_t scratch[kRmApiBuf];
+        LiveRmApi api(g_rm->ch, g_rm->rx, g_rm->rxcap, wait, bell, scratch);
+        struct CSync { GrClearPlan& p; void operator()() { FlushRange(p.gpfifo.cpu, 0x1000); FlushRange(p.push.cpu, 0x1000); } } cs{pl};
+        GrComputeResult cr;
+        const uint64_t t0 = NowUs();
+        const GrResult g = RunGrCompute(g_bus, *c, vio, api, g_gr, pl, k, invocations, cs, [] { __asm__ volatile("pause"); }, cr);
+        pr.Restore();
+        SpinLockRelease(lock);
+        o.kd("run_us", NowUs() - t0);
+        o.k("compute"); o.raw("{"); o.ks("stage", g.stage); o.ks("status", g.status); o.kh("rm_status", g.rm_status);
+        o.kh("block_vram", cr.block_vram); o.kh("token", cr.token); o.kd("code_words", k.code_words);
+        o.kd("invocations", cr.invocations); o.kd("threads", cr.threads); o.kb("first_ok", cr.first_ok); o.kb("verify_ok", cr.verify_ok);
+        o.kd("bad_index", cr.bad_index); o.kh("bad_got", cr.bad_got); o.kh("bad_want", cr.bad_want);
+        o.kd("first_us", cr.first_us); o.kd("best_us", cr.best_us); o.kd("avg_us", cr.n ? cr.sum_us / cr.n : 0); o.kd("n", cr.n);
+        o.kd("events_rc", cr.events_rc); o.kd("events_mmu", cr.events_mmu);
+        o.kd("allocated", g.allocated); o.kd("freed", g.freed); o.raw("}");
+        KPrintf("nv-gsp: GR compute %s at %s: first %d verify %d best %u us\n", g.status, g.stage, cr.first_ok ? 1 : 0,
                 cr.verify_ok ? 1 : 0, cr.best_us);
     }
     o.kb("up", g_gr.up);
@@ -1305,6 +1390,11 @@ bool NvGspHandle(const char* command) {
     else if (!strcmp(verb, "gr off")) GrVerb(2);
     else if (!strcmp(verb, "gr status")) GrVerb(0);
     else if (!strcmp(verb, "gr clear")) GrVerb(3);
+    else if (!strcmp(verb, "gr compute")) GrVerb(4);
+    else if (!strcmp(verb, "gr clear bl")) GrVerb(5);
+    else if (!strcmp(verb, "perf status")) PerfVerb(0);
+    else if (!strcmp(verb, "perf boost")) PerfVerb(1);
+    else if (!strcmp(verb, "perf clear")) PerfVerb(2);
     else if (!strcmp(verb, "ce-present on")) CePresentVerb(1);
     else if (!strcmp(verb, "ce-present off")) CePresentVerb(2);
     else if (!strcmp(verb, "ce-present status")) CePresentVerb(0);

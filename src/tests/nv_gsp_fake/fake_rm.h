@@ -314,6 +314,12 @@ private:
                 golden_built = true; ++threed_allocs;
                 break;
             }
+            case 0xc5c0: {   // TURING_COMPUTE_A under a promoted GR channel, after the golden context
+                need(0); parent_is(rm::TURING_CHANNEL_GPFIFO_A);
+                if (st) break;
+                if (!promoted_golden.count(hParent) || !golden_built) { st = kErrInvalidArgument; gr_error = "compute on an unpromoted channel"; }
+                break;
+            }
             case rm::KEPLER_CHANNEL_GROUP_A: need(20); parent_is(rm::NV01_DEVICE_0);
                 if (!st && (!objs.count(R32(p + 8)) || objs[R32(p + 8)].cls != rm::FERMI_VASPACE_A)) { st = kErrInvalidArgument; }
                 break;
@@ -589,20 +595,74 @@ private:
             case 0x19d0: {
                 if ((d & 0x3c) != 0x3c || (d & 3) || ((d >> 6) & 15)) return HostFail("CLEAR_SURFACE mask");
                 if (ct_select != 1) return HostFail("CT_SELECT");
-                if (ct[4] != 0xcf || !(ct[5] & (1u << 12))) return HostFail("colour target format/layout");
+                const bool pitch_layout = (ct[5] & (1u << 12)) != 0;
+                if (ct[4] != 0xcf || (!pitch_layout && (ct[5] & 0xfff) != 0x40)) return HostFail("colour target format/layout");
                 if (render_enable != 1) return true;
                 const uint64_t base = (uint64_t(ct[0] & 0xff) << 32) | ct[1];
-                const uint32_t pitch = ct[2], height = ct[3];
+                const uint32_t pitch = pitch_layout ? ct[2] : ct[2] * 4, height = ct[3];
                 const uint32_t x0 = clip_h & 0xffff, w = clip_h >> 16, y0 = clip_v & 0xffff, h = clip_v >> 16;
                 if (x0 + w > pitch / 4 || y0 + h > height) return HostFail("clip outside the target");
+                // block-linear (1 GOB x 16 GOBs per block): GOB bits x[5] y[2:1] x[4] y[0] x[3:0]
+                auto off = [&](uint32_t x, uint32_t y) -> uint64_t {
+                    if (pitch_layout) return uint64_t(y) * pitch + x * 4ull;
+                    const uint32_t xb = x * 4, bpr = (pitch + 63) / 64;
+                    const uint32_t g = ((xb >> 5) & 1) << 8 | ((y >> 1) & 3) << 6 | ((xb >> 4) & 1) << 5 | (y & 1) << 4 | (xb & 15);
+                    return (uint64_t(y >> 7) * bpr + (xb >> 6)) * 8192 + ((y >> 3) & 15) * 512ull + g;
+                };
                 auto c8 = [](uint32_t f) { float v; std::memcpy(&v, &f, 4); if (v < 0) v = 0; if (v > 1) v = 1; return uint32_t(v * 255.0f + 0.5f); };
                 const uint32_t px = (c8(clear_rgba[3]) << 24) | (c8(clear_rgba[0]) << 16) | (c8(clear_rgba[1]) << 8) | c8(clear_rgba[2]);
                 for (uint32_t y = y0; y < y0 + h; ++y)
                     for (uint32_t x = x0; x < x0 + w; ++x)
-                        if (!CeWrite32(base + uint64_t(y) * pitch + x * 4ull, px)) { ++mmu_faults; return HostFail("3D target not mapped"); }
+                        if (!CeWrite32(base + off(x, y), px)) { ++mmu_faults; return HostFail("3D target not mapped"); }
                 ++clears; return true;
             }
             default: return HostFail("3D method");
+        }
+    }
+    // ---- TURING_COMPUTE_A model (subchannel 1): windows, cache invalidates, SEND_PCAS_A +
+    // SEND_SIGNALING_PCAS_B launch. The launch decodes the QMD (V02_02 fields), checks the program
+    // bytes against `compute_code` and runs that kernel's semantics: thread i < cb0[3] stores
+    // `compute_store` at (cb0[1]:cb0[0]) + i * cb0[2].
+    bool compute_bound = false; uint32_t pcas_qmd = 0; size_t dispatches = 0;
+    std::vector<uint32_t> compute_code; uint32_t compute_store = 0;
+    bool ComputeMethod(uint32_t m, uint32_t d) {
+        if (m == 0) {
+            bool have = false;
+            for (auto& kv : objs) if (kv.second.cls == 0xc5c0 && kv.second.parent == gr_chan) have = true;
+            if (d != 0xc5c0 || !have) return HostFail("SET_OBJECT compute");
+            compute_bound = true; return true;
+        }
+        if (!compute_bound) return HostFail("compute method before SET_OBJECT");
+        switch (m) {
+            case 0x02a0: case 0x07b0: return d == 0 ? true : HostFail("window upper");
+            case 0x02a4: return d == 0xfe000000u ? true : HostFail("shared window");
+            case 0x07b4: return d == 0xff000000u ? true : HostFail("local window");
+            case 0x021c: case 0x0298: return true;
+            case 0x02b4: pcas_qmd = d; return true;
+            case 0x02bc: {
+                if (d != 3) return HostFail("PCAS_B");
+                uint32_t q[64];
+                for (uint32_t i = 0; i < 64; ++i)
+                    if (!CeRead32((uint64_t(pcas_qmd) << 8) + i * 4ull, &q[i])) { ++mmu_faults; return HostFail("QMD not mapped"); }
+                if ((q[18] & 0xff) != 0x22) return HostFail("QMD version");
+                const uint64_t prog = q[48] | (uint64_t(q[49] & 0x1ffff) << 32);
+                const uint64_t cb0 = q[32] | (uint64_t(q[33] & 0x1ffff) << 32);
+                if (!(q[20] & 1)) return HostFail("CB0 not valid");
+                if (compute_code.empty()) return HostFail("no kernel configured");
+                for (size_t i = 0; i < compute_code.size(); ++i) {
+                    uint32_t v;
+                    if (!CeRead32(prog + i * 4, &v)) { ++mmu_faults; return HostFail("program not mapped"); }
+                    if (v != compute_code[i]) return HostFail("program bytes");
+                }
+                uint32_t cb[4];
+                for (uint32_t i = 0; i < 4; ++i) if (!CeRead32(cb0 + i * 4, &cb[i])) { ++mmu_faults; return HostFail("CB0 not mapped"); }
+                const uint64_t data = cb[0] | (uint64_t(cb[1]) << 32);
+                const uint32_t threads = q[12] * ((q[18] >> 16) & 0xffff);
+                for (uint32_t t = 0; t < threads; ++t)
+                    if (t < cb[3] && !CeWrite32(data + uint64_t(t) * cb[2], compute_store)) { ++mmu_faults; return HostFail("data not mapped"); }
+                ++dispatches; return true;
+            }
+            default: return HostFail("compute method");
         }
     }
     size_t mmu_faults = 0;
@@ -642,6 +702,7 @@ private:
                     for (uint32_t k = 0; k < cnt; ++k, m += 4) {
                         const uint32_t d = R32(pb + 4 * i++);
                         if (subc == 4) { if (!CeMethod(m, d)) return false; continue; }
+                        if (subc == 1) { if (!ComputeMethod(m, d)) return false; continue; }
                         if (subc != 0) return HostFail("subchannel");
                         if (m == 0) {   // SET_OBJECT on subchannel 0: TURING_A under this channel
                             bool have = false;

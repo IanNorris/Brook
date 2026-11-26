@@ -19,6 +19,7 @@
 #include <string>
 #include <vector>
 #include "nv_gsp/nv_gsp_rm.h"
+#include "nv_gsp/nak_m4_kernel.h"
 #include "nv_gsp/nv_gsp_bar1.h"
 #include "nv_gsp/nv_gsp_m2.h"
 #include "nv_gsp/nv_gsp_m3.h"
@@ -235,6 +236,19 @@ struct Rig {
         sys(&pl.gpfifo, 0x1000); sys(&pl.push, 0x1000); sys(&pl.sem, 0x1000); sys(&pl.mthdbuf, st.mthdbuf_size);
         auto poll = [&] { (void)Wait(); };
         GrResult g = RunGrClear(gpu, kChipTu104, vram, api, st, pl, sync, poll, cr);
+        vram.Restore();
+        return g;
+    }
+    GrResult GrCompute(GrState& st, GrClearPlan& pl, const GrComputeKernel& k, uint32_t inv, GrComputeResult& cr) {
+        GrApiW wait{this};
+        GspDoorbell<fake_gpu::FakeGpu, NoSync> bell{gpu, kChipTu104, sync};
+        static uint8_t scratch[kRmApiBuf];
+        GrApi api(ch.get(), rx.data(), uint32_t(rx.size()), wait, bell, scratch);
+        Pramin<fake_gpu::FakeGpu> vram(gpu, kChipTu104);
+        auto sys = [&](M2Sys* s, uint32_t bytes) { DmaRegion d; assert(arena(bytes, &d)); s->cpu = d.cpu; s->bus = d.bus; s->bytes = d.bytes; };
+        sys(&pl.gpfifo, 0x1000); sys(&pl.push, 0x1000); sys(&pl.sem, 0x1000); sys(&pl.mthdbuf, st.mthdbuf_size);
+        auto poll = [&] { (void)Wait(); };
+        GrResult g = RunGrCompute(gpu, kChipTu104, vram, api, st, pl, k, inv, sync, poll, cr);
         vram.Restore();
         return g;
     }
@@ -565,6 +579,44 @@ int main(int argc, char** argv) {
         assert(c3.ok() && cr.first_ok && cr.verify_ok && cr.n == 3 && r.rm.clears == 4 && cr.token == ((2u << 16) | kGrUserChid));
         assert(r.gpu.Vram32(cr.rt_vram) == 0xff00ff00u && r.gpu.Vram32(cr.rt_vram + 31ull * 256 + 63 * 4) == 0xff00ff00u);
         assert(r.rm.objs.size() == 6);                                 // the user scope is freed; the scrubber stays
+        // block-linear variant: same target memory, GOB-swizzled (the fake swizzles independently)
+        {
+            GrClearPlan bl; bl.width = 64; bl.height = 32; bl.repeats = 2; bl.block_linear = true;
+            GrClearResult cb;
+            const GrResult c5 = r.GrClear(st, bl, cb);
+            if (!c5.ok()) std::fprintf(stderr, "GR clear bl: %s at %s host: %s got %x want %x clears %zu\n", c5.status, c5.stage, r.rm.host_error.c_str(), cb.sample_got, cb.sample_want, r.rm.clears);
+            assert(c5.ok() && cb.first_ok && cb.verify_ok && cb.rt_vram == cr.rt_vram && r.rm.clears == 7);
+            assert(GrBlOffset(0, 0, 64) == 0 && GrBlOffset(1, 0, 64) == 4 && GrBlOffset(4, 0, 64) == 32 && GrBlOffset(8, 0, 64) == 256);
+            assert(GrBlOffset(0, 1, 64) == 16 && GrBlOffset(0, 2, 64) == 64 && GrBlOffset(0, 8, 64) == 512);
+            assert(GrBlOffset(16, 0, 64) == 8192 && GrBlOffset(0, 128, 64) == 4 * 8192);
+            assert(r.rm.objs.size() == 6);
+        }
+        // ---- step 4: compute dispatch of the NAK kernel (the fake checks its bytes and runs its semantics)
+        {
+            namespace nk = nak_m4;
+            const GrComputeKernel k{nk::kCode, uint32_t(sizeof(nk::kCode) / 4), nk::kQmd, uint32_t(sizeof(nk::kQmd) / 4),
+                                    nk::kShaderVa, nk::kCb0Va, nk::kInvocations, nk::kLocalSize, nk::kStoreValue};
+            assert(!GrComputeCheck(k));
+            r.rm.compute_code.assign(nk::kCode, nk::kCode + sizeof(nk::kCode) / 4);
+            r.rm.compute_store = nk::kStoreValue;
+            GrClearPlan cp; cp.repeats = 3;
+            GrComputeResult cc;
+            const uint32_t inv = nk::kInvocations - nk::kLocalSize / 2 - 3;
+            const GrResult c4 = r.GrCompute(st, cp, k, inv, cc);
+            if (!c4.ok()) std::fprintf(stderr, "GR compute: %s at %s host: %s / %s (bad %u got %x)\n", c4.status, c4.stage,
+                                       r.rm.host_error.c_str(), r.rm.gr_error.c_str(), cc.bad_index, cc.bad_got);
+            assert(c4.ok() && cc.first_ok && cc.verify_ok && cc.n == 3 && r.rm.dispatches == 4 && cc.threads == nk::kInvocations);
+            assert(r.gpu.Vram32(cc.block_vram + GrComputeLayout::data) == nk::kStoreValue);
+            assert(r.gpu.Vram32(cc.block_vram + GrComputeLayout::data + 4ull * inv) == kGrComputeSentinel);
+            assert(r.rm.objs.size() == 6);
+            // a QMD that names another program address is refused before any RPC
+            uint32_t bad[64]; std::memcpy(bad, nk::kQmd, sizeof(bad)); bad[48] ^= 0x100;
+            GrComputeKernel kb = k; kb.qmd = bad;
+            assert(GrComputeCheck(kb) && !std::strcmp(GrComputeCheck(kb), "QMD program address"));
+            // too many invocations for the QMD grid
+            GrComputeResult c2; GrClearPlan p2;
+            assert(!r.GrCompute(st, p2, k, nk::kInvocations + 1, c2).ok());
+        }
         assert(r.GrDown(st, g) == 6 && r.rm.objs.empty() && !r.rm.scrub_war && !st.up);
         GrState again; again.up = true;
         assert(!r.GrGolden(again).ok());                                 // once per boot
