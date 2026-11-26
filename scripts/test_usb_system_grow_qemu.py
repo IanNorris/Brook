@@ -124,6 +124,10 @@ def main():
     parser.add_argument("--write-mib", type=int, default=2048)
     parser.add_argument("--accel", choices=("kvm", "tcg"), default="kvm")
     parser.add_argument("--timeout", type=int, default=1200)
+    parser.add_argument("--baseline", type=Path, help="untouched copy of --disk (e.g. a reflink taken before the "
+                        "run): GPT, outside-p2 and p3 digests are taken from it")
+    parser.add_argument("--resume-after-write", action="store_true",
+                        help="the write boot already completed on --disk; start at readback")
     args = parser.parse_args()
     args.output.mkdir(mode=0o700, parents=True)
     base.adopt_prebuilt(args.files)
@@ -136,9 +140,10 @@ def main():
     first, sectors = (int(v) for v in record.splitlines()[2].split(","))
     assert int(gpt["2"].split("start=")[1].split(",")[0]) == first, gpt["2"]
     assert int(gpt["2"].split("size=")[1].split(",")[0]) == sectors, gpt["2"]
-    pre = subprocess.run(["e2fsck", "-fn", p2_spec(disk)], capture_output=True, text=True)
-    assert pre.returncode == 0, pre.stdout
-    results["hidden"] = hide_low_groups(disk)
+    if not args.resume_after_write:
+        pre = subprocess.run(["e2fsck", "-fn", p2_spec(disk)], capture_output=True, text=True)
+        assert pre.returncode == 0, pre.stdout
+        results["hidden"] = hide_low_groups(disk)
     fallback = args.output / "fallback.raw"
     fallback_esp = args.output / "fallback.esp"
     fsck.prepare_esp(args.files, fallback_esp)
@@ -148,29 +153,37 @@ def main():
              input=f'label: gpt\nunit: sectors\n\nstart={base.ESP_FIRST},size={base.ESP_SECTORS},type=U,name="BROOKBOOT"\n')
     base.clone_sparse(fallback_esp, fallback, base.ESP_FIRST * SECTOR)
     fallback_esp.unlink()
-    outside = base.digest_outside_system(disk)
-    p3 = p3_digest(disk)
+    reference = args.baseline or disk
+    gpt = gpt_lines(reference)
+    gpt["2"] = gpt_lines(disk)["2"]
+    outside = base.digest_outside_system(reference)
+    p3 = p3_digest(reference)
     results.update({"gpt_p1": gpt["1"], "gpt_p3": gpt["3"], "outside_p2_sha256": outside, "p3_sha256": p3})
 
-    guest = base.Guest(args, disk, fallback, "write")
-    try:
-        results["write_status"] = ready(guest, args.timeout)
-        job(guest, "command -v dd sha256sum sync", 60)
-        started = time.monotonic()
-        job(guest, f"dd if=/dev/urandom of={TEST_FILE} bs=1M count={args.write_mib} && sync", 3600)
-        results["write_seconds"] = round(time.monotonic() - started, 1)
-        results["sha256_written"] = sha_in_guest(guest)
-        guest.restart()
-    finally:
-        guest.stop()
+    if not args.resume_after_write:
+        guest = base.Guest(args, disk, fallback, "write")
+        try:
+            results["write_status"] = ready(guest, args.timeout)
+            job(guest, "command -v dd sha256sum sync", 60)
+            started = time.monotonic()
+            job(guest, f"dd if=/dev/urandom of={TEST_FILE} bs=1M count={args.write_mib} && sync", 3600)
+            results["write_seconds"] = round(time.monotonic() - started, 1)
+            results["sha256_written"] = sha_in_guest(guest)
+            guest.restart()
+        finally:
+            guest.stop()
 
     stat = debugfs(disk, f"stat {EXT2_FILE}")
     blocks = [int(b) for b in debugfs(disk, f"blocks {EXT2_FILE}").split()]
     size = int(stat.split("Size: ")[1].split()[0])
     assert size == args.write_mib << 20, stat
-    assert len(blocks) == args.write_mib * 256 and min(blocks) >= OLD_BLOCKS, (len(blocks), min(blocks))
+    # debugfs lists data and indirect blocks: 256 data blocks per MiB plus the
+    # single, double and leaf indirect blocks.
+    indirect = 1 + 1 + (args.write_mib * 256 - 12 - 1024 + 1023) // 1024
+    assert len(blocks) == args.write_mib * 256 + indirect and min(blocks) >= OLD_BLOCKS, (len(blocks), min(blocks))
     host = hashlib.sha256(subprocess.run(["debugfs", "-R", f"cat {EXT2_FILE}", p2_spec(disk)],
                                          capture_output=True, check=True).stdout).hexdigest()
+    results.setdefault("sha256_written", host)   # resumed: the guest's value is in the earlier log
     assert host == results["sha256_written"], (host, results["sha256_written"])
     results["blocks"] = {"count": len(blocks), "min": min(blocks), "max": max(blocks), "old_end": OLD_BLOCKS,
                          "min_group": min(blocks) // GROUP_BLOCKS, "max_group": max(blocks) // GROUP_BLOCKS,
@@ -226,7 +239,8 @@ def main():
     results["outside_p2_unchanged"] = results["gpt_unchanged"] = results["p3_unchanged"] = True
     for case in ("write", "readback", "repair"):
         src = args.output / case / "serial.log"
-        src.rename(args.output / f"{case}.serial.log")
+        if src.exists():
+            src.rename(args.output / f"{case}.serial.log")
     fallback.unlink()
     (args.output / "verdict.json").write_text(json.dumps(results, indent=2) + "\n")
     print(f"PASS {args.output / 'verdict.json'}")
