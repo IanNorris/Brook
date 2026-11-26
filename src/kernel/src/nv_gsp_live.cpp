@@ -167,6 +167,7 @@ struct AutostartState { const char* status = "not run"; uint64_t start_ms = 0, p
 bool PathExists(const char* path) { auto* f = VfsOpen(path, VFS_O_STREAM); if (!f) return false; VfsRelease(f); return true; }
 bool g_p3Done = false, g_finiDone = false, g_p4Done = false;   // latched at arm (the first write)
 bool g_rmRunning = false;                    // GSP-RM reached INIT_DONE this boot
+uint64_t g_flushPage = 0; uint32_t g_flushRegBefore = 0, g_flushRegAfter = 0;   // SysmemFlushPageInit
 DmaBuf g_dma;                                 // 16 contiguous pages, kept for the boot
 constexpr uint32_t kDmaPages = 16;
 uint8_t* g_rom = nullptr; uint32_t g_romBytes = 0;     // PROM copy (VMALLOC)
@@ -455,6 +456,27 @@ void FrontOut(Out& o, const Front& f) {
     o.k("vtd"); o.raw("{"); o.kb("dmar", f.vtd.table); o.kd("units", f.vtd.units); o.kd("translating", f.vtd.enabled);
     o.kd("unread", f.vtd.unread); o.raw("}");
     if (g_dma.cpu) o.kh("dma", g_dma.bus);
+    o.kh("flush_page", g_flushPage); o.kh("flush_reg_before", g_flushRegBefore); o.kh("flush_reg", g_flushRegAfter);
+}
+// NV_PFB_NISO_FLUSH_SYSMEM_ADDR (0x100c10, address >> 8): the page FB/L2 flushes to sysmem
+// target. nouveau programs it before booting GSP-RM on TU102 (nvkm_fb_preinit ->
+// gf100_fb_sysmem_flush_page_init, one zeroed GFP_DMA32 page, kept for the driver's life); RM
+// does not. Left at 0 (Brook before gsp16n), sysmem flushes went to physical 0: the 26 Nov GR
+// idle fault (PCIe Engine NOCAT, PMU halt, Xid 62 ~1 s after GR work) matches that.
+void FlushRange(const uint8_t* p, uint32_t n);
+bool SysmemFlushPageInit() {
+    if (!g_flushPage) {
+        const PhysicalAddress p = PmmAllocPages(1, MemTag::Device, KernelPid);   // never freed
+        if (!p || p.raw() + 4096 > (1ull << 32)) return false;
+        memset(reinterpret_cast<void*>(PhysToVirt(p).raw()), 0, 4096);
+        FlushRange(reinterpret_cast<const uint8_t*>(PhysToVirt(p).raw()), 4096);
+        g_flushPage = p.raw();
+    }
+    g_flushRegBefore = g_bus.rd32(0x100c10);
+    g_bus.wr32(0x100c10, uint32_t(g_flushPage >> 8));
+    g_flushRegAfter = g_bus.rd32(0x100c10);
+    KPrintf("nv-gsp: sysmem flush page %lx (0x100c10 %x -> %x)\n", (unsigned long)g_flushPage, g_flushRegBefore, g_flushRegAfter);
+    return g_flushRegAfter == uint32_t(g_flushPage >> 8);
 }
 // Arm: after every check, before the first write. Latch, flush, bus master.
 bool Arm(const Gpu& g, bool* latch) {
@@ -821,6 +843,7 @@ void P4(bool keepDisplay) {
     uint64_t armUs = 0;
     auto arm = [&] {
         if (!Arm(f.g, &g_p4Done)) return false;
+        if (!SysmemFlushPageInit()) return false;
         armUs = NowUs();
         g_rm->wait_deadline_us = armUs + 15000000;   // INIT_DONE took ~0.9 s after booter under Linux
         return true;
