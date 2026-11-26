@@ -1687,7 +1687,12 @@ template <class F> bool NvdWithRm(const char* what, F f) {
         x.trace = [](const char* w, uint32_t h, uint32_t cls, uint32_t st) {
             KPrintf("nv-drm: rm %s %x class %x -> %x at %lu ms\n", w, h, cls, st, (unsigned long)(NowUs() / 1000)); };
         ok = f(x, vio, *c);
-        if (!ok) KPrintf("nv-drm: %s failed: %s (rm 0x%x)\n", what, r.status, r.rm_status);
+        if (!ok) {   // rm 0 with a queue error = the RPC itself failed (timeout, RPC error), not RM refusing
+            static const char* const qn[] = {"ok", "timeout", "too-big", "bad-element", "bad-checksum", "not-continuation", "overflow", "rpc-error"};
+            const uint32_t qi = uint32_t(r.q);
+            KPrintf("nv-drm: %s failed: %s (rm 0x%x, queue %s, rpc_result 0x%x)\n", what, r.status, r.rm_status,
+                    qi < 8 ? qn[qi] : "?", r.rpc_result);
+        }
     }
     pr.Restore();
     SpinLockRelease(lock);

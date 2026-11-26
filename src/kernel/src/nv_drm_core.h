@@ -821,7 +821,10 @@ inline void PumpChannel(File& f, Channel& c) {
             uint64_t va[kMaxPushes]; uint32_t dw[kMaxPushes]; uint8_t np[kMaxPushes];
             for (uint32_t i = 0; i < j->npush; ++i) { va[i] = j->push[i].va; dw[i] = j->push[i].va_len / 4; np[i] = (j->push[i].flags & EXEC_PUSH_NO_PREFETCH) ? 1 : 0; }
             const uint32_t seq = c.next_seqno;
-            if (!f.be->chan_submit(f.be->ctx, c.hw, va, dw, np, j->npush, seq)) return;   // ring full: later
+            if (!f.be->chan_submit(f.be->ctx, c.hw, va, dw, np, j->npush, seq)) {
+                if (!f.be->chan_error(f.be->ctx, c.hw)) return;   // ring full: later
+                c.dead = true; continue;                          // schedule/bind failed: fail this and later jobs now
+            }
             ++c.next_seqno;
             auto& x = c.inflight[(c.in_head + c.in_count) % kMaxInflight];
             x.seqno = seq; x.fence = j->done; j->done = nullptr; ++c.in_count;
@@ -890,12 +893,15 @@ inline void File::Close() {
     syncs.CloseAll();
 }
 
-inline int64_t Ioctl(File& f, const UserAccess& u, uint64_t cmd, uint64_t arg) {
+// pump=false: the caller does not hold the file lock (syncobj waits sleep unlocked), so the
+// VM_BIND queue and channel rings must not be touched (27 Nov panic: an unlocked wait's
+// PumpExec raced the poller and dereferenced a freed job slot in PumpChannel).
+inline int64_t Ioctl(File& f, const UserAccess& u, uint64_t cmd, uint64_t arg, bool pump = true) {
     if (IocType(cmd) != 'd' || !f.dev || !f.dev->valid) return kENOTTY;
     const uint32_t nr = IocNr(cmd), size = IocSize(cmd);
     auto sized = [&](uint32_t want) { return size == want; };
-    if (f.be && f.job_count) Pump(f);
-    if (f.be) PumpExec(f);
+    if (pump && f.be && f.job_count) Pump(f);
+    if (pump && f.be) PumpExec(f);
     switch (nr) {
         case NR_VERSION: return sized(sizeof(DrmVersion)) ? Version(f, u, arg) : kEINVAL;
         case NR_GET_CAP: return sized(sizeof(DrmGetCap)) ? GetCap(f, u, arg) : kEINVAL;

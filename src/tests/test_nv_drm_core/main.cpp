@@ -233,6 +233,11 @@ static void TestExec(const DeviceInfo& dev) {
     CpuPrep cp{0, CPU_PREP_NOWAIT}; { GemNew n{}; n.info.size = 4096; n.info.domain = GEM_DOMAIN_GART; assert(NvIo(f, NV_GEM_NEW, &n, sizeof(n)) == 0); cp.handle = n.info.handle; }
     assert(NvIo(f, NV_GEM_CPU_PREP, &cp, sizeof(cp)) == kEBUSY);
     hw.completed = 1;
+    {   // an unlocked (pump=false) ioctl must not touch the rings: the job stays in flight
+        DrmSyncobjWait w{uint64_t(&s1.handle), 0, 1, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, 0, 0, 0};
+        const uint64_t cmd = Cmd(NR_SYNCOBJ_WAIT, sizeof(w));
+        assert(Ioctl(f, U, cmd, uint64_t(&w), false) == kETIME && c->in_count == 1);
+    }
     assert(wait(s1.handle) == 0 && NvIo(f, NV_GEM_CPU_PREP, &cp, sizeof(cp)) == 0 && c->in_count == 0);
     // a job waiting on a pending fence is held back; the ring-full case requeues
     GpuFence* gate = GpuFenceCreate(false);
@@ -286,6 +291,15 @@ static void TestExec(const DeviceInfo& dev) {
     // CHANNEL_FREE and close destroy the backend channels
     NvChannelAlloc ce{}; ce.tt_ctxdma_handle = 0x30; assert(NvIo(f, NV_CHANNEL_ALLOC, &ce, sizeof(ce)) == 0 && g_fake.chans.size() == 2);
     NvChannelFree fr{ca.channel}; assert(NvIo(f, NV_CHANNEL_FREE, &fr, sizeof(fr)) == 0 && g_fake.chans.size() == 1);
+    {   // first-submit schedule/bind failure (27 Nov panic): the submit fails with the channel in
+        // error, so queued jobs fail at once, nothing stays half-queued, and later EXECs are refused
+        Channel* e = FindChannel(f, ce.channel); assert(e);
+        auto& eh = g_fake.chans[e->hw]; eh.full = true; eh.error = true;   // submit refused + channel error
+        DrmSyncobjCreate s3{0, 0}; assert(Io(f, NR_SYNCOBJ_CREATE, s3) == 0);
+        assert(Exe(f, ce.channel, {{0x600000, 8, 0}}, {}, {{SYNC_SYNCOBJ, s3.handle, 0}}) == 0);
+        assert(e->dead && e->job_count == 0 && e->in_count == 0 && wait(s3.handle) == -5);
+        assert(Exe(f, ce.channel, {{0x600000, 8, 0}}) == -19);
+    }
     f.Close();
     assert(g_fake.chans.empty() && g_fake.chans_destroyed == 2 && g_fake.vram_used() == 0 && g_fake.sys.empty());
 }
