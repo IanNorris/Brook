@@ -354,6 +354,8 @@ def desktop_payload(args, initrd):
             fat_write(initrd, 'ETC/nv-gsp-no-bar1-identity', b'1\n')
         if getattr(args, 'waylandd_nv_dmabuf', False):  # waylandd imports NVK dmabufs on renderD130
             fat_write(initrd, 'ETC/waylandd-nv-dmabuf', b'1\n')
+            # per-launch opt-out of the session's MESA_VK_WSI_DEBUG=sw,noshm (native Wayland only)
+            fat_write(initrd, 'BOOT/BIN/VKDIRECT', (ROOT / 'tools/vkdirect/vkdirect').read_bytes())
         if args.nv_drm_vas_invalidate:  # A/B: renderD130 VM_BIND invalidates its own PDB only
             fat_write(initrd, 'ETC/nv-drm-vas-invalidate', b'1\n')
         if args.nv_gsp_headless_p4:  # A/B: nv-disp drives the heads, GSP-RM boots headless

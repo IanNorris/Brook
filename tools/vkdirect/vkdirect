@@ -1,0 +1,21 @@
+#!/nix/profile/bin/bash
+# vkdirect [--proton] COMMAND [ARGS...] — run one native-Wayland Vulkan client with Mesa's direct
+# (linux-dmabuf) presentation on the RTX desktop.
+#
+# The kernel's desktop environment exports MESA_VK_WSI_DEBUG=sw,noshm to every process, because
+# Brook's Xwayland has no DRI3 and Mesa's X11 WSI fails without it (27 Nov: vkcube --wsi xcb
+# segfaults with the variable cleared). Native Wayland clients can present through waylandd's
+# renderD130 dmabuf import instead, so this per-launch opt-out clears it for COMMAND only.
+#
+# --proton also sets PROTON_ENABLE_WAYLAND=1, so Proton uses Wine's Wayland driver and DXVK
+# presents through Wayland rather than Xwayland. Steam launch options:
+#   /boot/bin/vkdirect --proton %command%
+set -u
+if [ "${1:-}" = "--proton" ]; then export PROTON_ENABLE_WAYLAND=1; shift; fi
+if [ $# -eq 0 ]; then echo "usage: vkdirect [--proton] COMMAND [ARGS...]" >&2; exit 2; fi
+if [ ! -e /etc/waylandd-nv-dmabuf ]; then
+    echo "vkdirect: /etc/waylandd-nv-dmabuf is not set; keeping the staged (sw) presentation" >&2
+    exec "$@"
+fi
+export MESA_VK_WSI_DEBUG= BROOK_VULKAN_PRESENTATION=direct
+exec "$@"
