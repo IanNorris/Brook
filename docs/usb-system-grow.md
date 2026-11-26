@@ -26,11 +26,14 @@ The grown store has 3759 groups of 128 MiB, which is 469.875 GiB.
 - The trim scan, statfs and allocator use 64-bit or per-group arithmetic.
   Block and inode bitmap caches are allocated per group as they are used, up
   to about 15 MiB of block bitmaps if every group is touched.
-- **Files are limited to 4 GiB - 1 bytes.** Brook's ext2 keeps a 32-bit `i_size`
-  and writes through doubly indirect blocks only. A write that reaches that
-  limit now fails with EFBIG. Before, it could store a wrapped size. Larger
-  files need `i_size_high` plus triply indirect writes. That work is open, and
-  any game file over 4 GiB fails to install until it lands.
+- **Files can be about 2 TiB** (work/ext2-large). Regular-file sizes use
+  `i_size_high`, and writes, reads and truncates go through triply indirect
+  blocks. The limit is Linux's `ext2_max_size` without HUGE_FILE: 2 TiB less
+  about 2 GiB at 4 KiB blocks, set by the 32-bit `i_blocks`. Writes stop at
+  that limit with EFBIG, and so does a truncate past it.
+  `fallocate` still returns EOPNOTSUPP on ext2 files.
+  Host proof: `test_ext2_objects`. QEMU proof:
+  `scripts/test_ext2_large_file_qemu.py`.
 
 ## Procedure (on the build host, SSD attached by USB)
 
