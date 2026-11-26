@@ -3,7 +3,7 @@
 bake_font.py — Rasterize a TrueType font into a kernel-embeddable C++ glyph atlas.
 
 Usage:
-    python3 bake_font.py <font.ttf> <size_px> <output_font_atlas.cpp> [symbol [extra]]
+    python3 bake_font.py <font.ttf> <size_px> <output_font_atlas.cpp> [symbol [extra [ascii_alias]]]
 
 extra: comma-separated hexadecimal code points baked after ASCII 126, at
 character codes 127, 128, ... (the chrome fonts add the degree sign and the
@@ -25,41 +25,39 @@ import freetype  # python-freetype / freetype-py
 FIRST_CHAR  = 32    # ASCII space
 LAST_CHAR   = 126   # ASCII ~
 NUM_CHARS   = LAST_CHAR - FIRST_CHAR + 1
-GLYPH_PAD   = 1     # pixels of padding between glyphs in atlas
 
 
-def pack_glyphs(glyphs, atlas_width):
-    """Pack rendered glyphs into rows, return (packed_list, atlas_height)."""
-    packed = []
-    cur_x = GLYPH_PAD
-    cur_y = GLYPH_PAD
-    row_height = 0
-
-    for g in glyphs:
-        gw = g['width']
-        gh = g['height']
-
-        if cur_x + gw + GLYPH_PAD > atlas_width:
-            cur_x = GLYPH_PAD
-            cur_y += row_height + GLYPH_PAD
-            row_height = 0
-
-        packed.append({**g, 'atlas_x': cur_x, 'atlas_y': cur_y})
-        cur_x += gw + GLYPH_PAD
-        if gh > row_height:
-            row_height = gh
-
-    atlas_height = cur_y + row_height + GLYPH_PAD
-
-    # Round atlas height up to a multiple of 8 for alignment.
-    atlas_height = (atlas_height + 7) & ~7
-
-    return packed, atlas_height
+def pack_glyphs(glyphs):
+    """Use compact shelves and keep the metric table in codepoint order."""
+    rows = sorted(enumerate(glyphs), key=lambda entry: -entry[1]['height'])
+    minimum = max(1, *(glyph['width'] for glyph in glyphs))
+    best = None
+    # Consumers index coverage inside the glyph rectangle without filtering,
+    # so the shelves need neither gutters nor texture alignment.
+    for width in range(minimum, max(minimum, 256) + 1):
+        x = y = shelf_height = 0
+        positions = [(0, 0)] * len(glyphs)
+        for index, glyph in rows:
+            if x + glyph['width'] > width:
+                x = 0
+                y += shelf_height
+                shelf_height = 0
+            positions[index] = (x, y)
+            x += glyph['width']
+            shelf_height = max(shelf_height, glyph['height'])
+        height = max(1, y + shelf_height)
+        if best is None or width * height < best[0] * best[1]:
+            best = width, height, positions
+    width, height, positions = best
+    return width, height, [
+        {**glyph, 'atlas_x': x, 'atlas_y': y}
+        for glyph, (x, y) in zip(glyphs, positions)
+    ]
 
 
 def main():
-    if len(sys.argv) not in (4, 5, 6):
-        print(f"Usage: {sys.argv[0]} <font.ttf> <size_px> <output.cpp> [symbol [extra]]",
+    if len(sys.argv) not in (4, 5, 6, 7):
+        print(f"Usage: {sys.argv[0]} <font.ttf> <size_px> <output.cpp> [symbol [extra [ascii_alias]]]",
               file=sys.stderr)
         sys.exit(1)
 
@@ -67,9 +65,11 @@ def main():
     size_px   = int(sys.argv[2])
     out_cpp   = sys.argv[3]
     symbol = sys.argv[4] if len(sys.argv) >= 5 else "g_fontAtlas"
-    extra = [int(v, 16) for v in sys.argv[5].split(',')] if len(sys.argv) == 6 and sys.argv[5] else []
+    extra = [int(v, 16) for v in sys.argv[5].split(',')] if len(sys.argv) >= 6 and sys.argv[5] else []
+    ascii_alias = sys.argv[6] if len(sys.argv) == 7 else None
     codes = list(range(FIRST_CHAR, LAST_CHAR + 1)) + extra
-    if not symbol.isidentifier() or not symbol.isascii():
+    symbols = (symbol, ascii_alias) if ascii_alias else (symbol,)
+    if any(not name.isidentifier() or not name.isascii() for name in symbols):
         raise SystemExit("Invalid C++ font atlas symbol")
 
     if not os.path.exists(font_path):
@@ -111,14 +111,7 @@ def main():
             'advance':   slot.advance.x >> 6,
         })
 
-    # Choose atlas width wide enough for any single glyph row.
-    atlas_width = 256
-    max_glyph_w = max((g['width'] for g in raw_glyphs), default=1)
-    if max_glyph_w + 2 * GLYPH_PAD > atlas_width:
-        atlas_width = 512
-
-    # Pack glyphs.
-    packed, atlas_height = pack_glyphs(raw_glyphs, atlas_width)
+    atlas_width, atlas_height, packed = pack_glyphs(raw_glyphs)
 
     # Compose atlas pixel array.
     atlas = bytearray(atlas_width * atlas_height)
@@ -167,18 +160,21 @@ def main():
             )
         f.write('};\n\n')
 
-        # FontAtlas instance.
-        f.write(f'extern const FontAtlas {symbol} = {{\n')
-        f.write('    s_atlasPixels,\n')
-        f.write(f'    {atlas_width},   // atlasWidth\n')
-        f.write(f'    {atlas_height},  // atlasHeight\n')
-        f.write('    s_glyphs,\n')
-        f.write(f'    {len(codes)},     // glyphCount\n')
-        f.write(f'    {FIRST_CHAR},    // firstChar\n')
-        f.write(f'    {ascent},        // ascent\n')
-        f.write(f'    {descender},     // descender\n')
-        f.write(f'    {line_height},   // lineHeight\n')
-        f.write('};\n\n')
+        # The ASCII view shares all bitmap data but retains its old lookup range.
+        for name in symbols:
+            count = NUM_CHARS if name == ascii_alias else len(codes)
+            f.write(f'extern const FontAtlas {name} = {{\n')
+            f.write('    s_atlasPixels,\n')
+            f.write(f'    {atlas_width},   // atlasWidth\n')
+            f.write(f'    {atlas_height},  // atlasHeight\n')
+            f.write('    s_glyphs,\n')
+            f.write(f'    {count},     // glyphCount\n')
+            f.write(f'    {FIRST_CHAR},    // firstChar\n')
+            f.write(f'    {ascent},        // ascent\n')
+            f.write(f'    {descender},     // descender\n')
+            f.write(f'    {line_height},   // lineHeight\n')
+            f.write('};\n\n')
+
         f.write('} // namespace brook\n')
 
     total_bytes = atlas_width * atlas_height
