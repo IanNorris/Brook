@@ -7,6 +7,7 @@
 #include "nv_drm_core.h"
 #include "nv_vram_heap.h"
 #include <vector>
+#include <map>
 
 #include <cstdlib>
 #include <thread>
@@ -75,6 +76,121 @@ static void TestVramHeap() {
     }
     for (auto& x : live) assert(h.Release(x.base, x.bytes));
     assert(h.Used() == 0 && h.Extents() == 1);
+}
+
+// ---- M5.2 against a fake backend that records PTEs --------------------------------------
+struct Pte { Aper aper; uint64_t pa; uint8_t kind; bool sparse; };
+struct Fake {
+    VramHeap vram;
+    std::map<uint64_t, uint64_t> sys;   // cookie -> bytes
+    uint64_t next_cookie = 0x1000;
+    std::map<uint32_t, std::map<uint64_t, Pte>> vas;   // vas -> page va -> pte
+    uint32_t next_vas = 1, flushes = 0, destroyed = 0;
+    uint64_t vram_used() const { return vram.Used(); }
+};
+static Fake g_fake;
+static const Backend kFakeBe{&g_fake,
+    [](void* c, uint64_t bytes, uint64_t align, uint64_t* pa) { return static_cast<Fake*>(c)->vram.Alloc(bytes, align, pa); },
+    [](void* c, uint64_t pa, uint64_t bytes) { assert(static_cast<Fake*>(c)->vram.Release(pa, bytes)); },
+    [](void* c, uint64_t bytes, uint64_t* cookie) { auto* f = static_cast<Fake*>(c); *cookie = f->next_cookie; f->next_cookie += 0x1000; f->sys[*cookie] = bytes; return true; },
+    [](void* c, uint64_t cookie) { assert(static_cast<Fake*>(c)->sys.erase(cookie) == 1); },
+    [](void* c, uint64_t, uint64_t, uint32_t* v) { auto* f = static_cast<Fake*>(c); *v = f->next_vas++; f->vas[*v]; return true; },
+    [](void* c, uint32_t v) { auto* f = static_cast<Fake*>(c); f->vas.erase(v); ++f->destroyed; },
+    [](void* c, uint32_t v, uint64_t va, Aper a, uint64_t backing, uint64_t off, uint64_t bytes, uint8_t kind) {
+        auto& t = static_cast<Fake*>(c)->vas[v];
+        for (uint64_t o = 0; o < bytes; o += kPage) t[va + o] = Pte{a, a == Aper::Vram ? backing + off + o : (backing << 20) + off + o, kind, false};
+        return true; },
+    [](void* c, uint32_t v, uint64_t va, uint64_t bytes, bool sparse) {
+        auto& t = static_cast<Fake*>(c)->vas[v];
+        for (uint64_t o = 0; o < bytes; o += kPage) { if (sparse) t[va + o] = Pte{Aper::Vram, 0, 0, true}; else t.erase(va + o); }
+        return true; },
+    [](void* c, uint32_t) { ++static_cast<Fake*>(c)->flushes; return true; }};
+
+static uint32_t NewBo(File& f, uint64_t size, uint32_t domain, uint8_t kind = 0, GemNew* out = nullptr) {
+    GemNew n{}; n.info.size = size; n.info.domain = domain; n.info.tile_flags = uint32_t(kind) << 8;
+    const int64_t r = NvIo(f, NV_GEM_NEW, &n, sizeof(n));
+    if (out) *out = n;
+    return r == 0 ? n.info.handle : 0;
+}
+static int64_t Bind(File& f, std::vector<BindOp> ops, uint32_t flags = 0, std::vector<SyncDesc> waits = {}, std::vector<SyncDesc> sigs = {}) {
+    VmBind v{}; v.op_count = uint32_t(ops.size()); v.flags = flags; v.op_ptr = uint64_t(ops.data());
+    v.wait_count = uint32_t(waits.size()); v.wait_ptr = uint64_t(waits.data()); v.sig_count = uint32_t(sigs.size()); v.sig_ptr = uint64_t(sigs.data());
+    return NvIo(f, NV_VM_BIND, &v, sizeof(v));
+}
+static BindOp Map(uint32_t h, uint64_t va, uint64_t range, uint64_t off = 0) { return BindOp{VM_BIND_OP_MAP, 0, h, 0, va, off, range}; }
+static BindOp Unmap(uint64_t va, uint64_t range, bool sparse = false) { return BindOp{VM_BIND_OP_UNMAP, sparse ? VM_BIND_SPARSE : 0u, 0, 0, va, 0, range}; }
+static BindOp Sparse(uint64_t va, uint64_t range) { return BindOp{VM_BIND_OP_MAP, VM_BIND_SPARSE, 0, 0, va, 0, range}; }
+
+static void TestMemory(const DeviceInfo& dev) {
+    g_fake.vram.Init(0x140000000ull, 0x140000000ull + (8ull << 20));   // 8 MiB of VRAM for the test
+    static File f; f.Init(&dev, &kFakeBe);
+    GemNew none{}; none.info.size = 4096; none.info.domain = GEM_DOMAIN_VRAM;
+    assert(NvIo(f, NV_GEM_NEW, &none, sizeof(none)) == 0);   // GEM works before VM_INIT
+    { GemClose c{none.info.handle, 0}; assert(Io(f, NR_GEM_CLOSE, c) == 0 && g_fake.vram_used() == 0); }
+    NvVmInit vm{0xff00000000ull, (1ull << 40) - 0xff00000000ull}; assert(NvIo(f, NV_VM_INIT, &vm, sizeof(vm)) == 0 && f.vas == 1);
+    // GEM: VRAM with a kind; GART; VRAM|GART falls back to GART when VRAM is full
+    GemNew a{}; const uint32_t ha = NewBo(f, (1 << 20) + 5, GEM_DOMAIN_VRAM | GEM_DOMAIN_MAPPABLE, 0x06, &a);
+    assert(ha && a.info.domain == (GEM_DOMAIN_VRAM | GEM_DOMAIN_MAPPABLE) && a.info.size == (1 << 20) + 4096 && a.info.map_handle);
+    GemInfo gi{}; gi.handle = ha; assert(NvIo(f, NV_GEM_INFO, &gi, sizeof(gi)) == 0 && gi.size == a.info.size && ((gi.tile_flags >> 8) & 0xff) == 0x06);
+    assert(FindBoByToken(f, gi.map_handle) && FindBoByToken(f, gi.map_handle)->handle == ha && !FindBoByToken(f, gi.map_handle + 4096));
+    const uint32_t hg = NewBo(f, 64 << 10, GEM_DOMAIN_GART | GEM_DOMAIN_COHERENT); assert(hg && g_fake.sys.size() == 1);
+    const uint32_t hbig = NewBo(f, 16 << 20, GEM_DOMAIN_VRAM | GEM_DOMAIN_GART); GemInfo bi{}; bi.handle = hbig;
+    assert(hbig && NvIo(f, NV_GEM_INFO, &bi, sizeof(bi)) == 0 && (bi.domain & GEM_DOMAIN_GART) && g_fake.sys.size() == 2);
+    assert(!NewBo(f, 16 << 20, GEM_DOMAIN_VRAM));   // no fallback without GART
+    assert(!NewBo(f, 4096, 0) && !NewBo(f, 4096, GEM_DOMAIN_VRAM | 0x100));
+    auto& pt = g_fake.vas[f.vas];
+    // sync MAP: PTEs with the BO's kind; flush once per batch
+    const uint32_t fl0 = g_fake.flushes;
+    assert(Bind(f, {Map(ha, 0x100000, 1 << 20)}) == 0 && g_fake.flushes == fl0 + 1 && pt.size() == 256);
+    assert(pt[0x100000].aper == Aper::Vram && pt[0x100000].kind == 0x06 && pt[0x1ff000].pa == pt[0x100000].pa + 0xff000);
+    assert(Bind(f, {Map(hg, 0x100000 + (512 << 10), 64 << 10)}) == kEINVAL);    // VA busy
+    assert(Bind(f, {Map(ha, 0x400000, 4096, (1 << 20) + 4096)}) == kEINVAL);     // past the BO
+    assert(Bind(f, {Map(ha, 0xff00000000ull - 4096, 8192)}) == kEINVAL);         // into the kernel-managed range
+    assert(Bind(f, {Map(ha, 0x400001, 4096)}) == kEINVAL);
+    // GEM_CLOSE while mapped keeps the memory; unmapping frees it
+    const uint64_t used = g_fake.vram_used();
+    { GemClose c{ha, 0}; assert(Io(f, NR_GEM_CLOSE, c) == 0 && g_fake.vram_used() == used); }
+    assert(Bind(f, {Map(ha, 0x800000, 4096)}) == kENOENT);                       // closed handle
+    // split: unmap the middle, the edges stay (each with a reference), then the rest frees the BO
+    assert(Bind(f, {Unmap(0x140000, 0x40000)}) == 0 && pt.size() == 192 && !pt.count(0x140000) && pt.count(0x13f000) && pt.count(0x180000));
+    assert(pt[0x180000].pa - pt[0x100000].pa == 0x80000 && f.nmaps == 2);
+    assert(Bind(f, {Unmap(0x100000, 0x40000)}) == 0 && g_fake.vram_used() == used);
+    assert(Bind(f, {Unmap(0x180000, 0x80000)}) == 0 && pt.empty() && g_fake.vram_used() == used - (1 << 20) - VramHeap::kGranule);
+    // sparse region: memory inside it, holes go back to sparse, removal needs the memory gone
+    assert(Bind(f, {Sparse(0x10000000, 16 * kPage)}) == 0 && pt.size() == 16 && pt[0x10000000].sparse);
+    assert(Bind(f, {Map(hg, 0x10002000, 2 * kPage)}) == 0 && !pt[0x10002000].sparse && pt[0x10002000].aper == Aper::Sys);
+    assert(Bind(f, {Unmap(0x10000000, 16 * kPage, true)}) == kEBUSY);
+    assert(Bind(f, {Unmap(0x10002000, 2 * kPage)}) == 0 && pt[0x10002000].sparse && pt.size() == 16);
+    assert(Bind(f, {Sparse(0x10004000, kPage)}) == kEINVAL);                    // sparse over sparse
+    assert(Bind(f, {Unmap(0x10000000, 16 * kPage, true)}) == 0 && pt.empty() && f.nmaps == 0);
+    // one batch may unmap and remap the same range (state is checked per op)
+    assert(Bind(f, {Map(hg, 0x20000000, kPage), Unmap(0x20000000, kPage), Map(hg, 0x20000000, kPage, kPage)}) == 0);
+    assert(pt[0x20000000].pa == (g_fake.sys.begin()->first << 20) + kPage);
+    // sync binds take no syncs; async binds wait for their fences, then signal
+    DrmSyncobjCreate sa{0, 0}, sb{0, 0}; assert(Io(f, NR_SYNCOBJ_CREATE, sa) == 0 && Io(f, NR_SYNCOBJ_CREATE, sb) == 0);
+    assert(Bind(f, {Unmap(0x20000000, kPage)}, 0, {}, {{SYNC_SYNCOBJ, sb.handle, 0}}) == kEINVAL);
+    assert(Bind(f, {Unmap(0x20000000, kPage)}, VM_BIND_RUN_ASYNC, {{SYNC_SYNCOBJ, sa.handle, 0}}) == kEINVAL);   // nothing submitted on A
+    GpuFence* gate = GpuFenceCreate(false);
+    { GpuSync* s = f.syncs.Get(sa.handle); assert(GpuSyncReplace(s, gate)); GpuSyncUnref(s); }
+    assert(Bind(f, {Unmap(0x20000000, kPage), Map(hbig, 0x30000000, 2 * kPage)}, VM_BIND_RUN_ASYNC,
+                {{SYNC_SYNCOBJ, sa.handle, 0}}, {{SYNC_SYNCOBJ, sb.handle, 0}}) == 0);
+    assert(f.job_count == 1 && pt.count(0x20000000) && !pt.count(0x30000000));
+    uint32_t hb = sb.handle; DrmSyncobjWait w{uint64_t(&hb), 0, 1, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, 0, 0, 0};
+    assert(Io(f, NR_SYNCOBJ_WAIT, w) == kETIME);                                  // B: the job's fence, still pending
+    { GemClose c{hbig, 0}; assert(Io(f, NR_GEM_CLOSE, c) == 0); }                // the queued job keeps the BO alive
+    assert(GpuFenceComplete(gate, true));
+    NvGetparam g{GP_PCI_DEVICE, 0}; assert(NvIo(f, NV_GETPARAM, &g, sizeof(g)) == 0);   // any ioctl pumps the queue
+    assert(f.job_count == 0 && !pt.count(0x20000000) && pt.count(0x30000000) && pt[0x30000000].aper == Aper::Sys);
+    assert(Io(f, NR_SYNCOBJ_WAIT, w) == 0);
+    GpuFenceUnref(gate);
+    // CPU_PREP: nothing submitted -> idle; a pending EXEC fence -> NOWAIT busy
+    CpuPrep cp{hg, 0}; assert(NvIo(f, NV_GEM_CPU_PREP, &cp, sizeof(cp)) == 0);
+    f.last_exec = GpuFenceCreate(false);
+    cp.flags = CPU_PREP_NOWAIT; assert(NvIo(f, NV_GEM_CPU_PREP, &cp, sizeof(cp)) == kEBUSY);
+    GpuFenceComplete(f.last_exec, true); assert(NvIo(f, NV_GEM_CPU_PREP, &cp, sizeof(cp)) == 0);
+    // close frees VRAM, sysmem and the VAS
+    f.Close();
+    assert(g_fake.vram_used() == 0 && g_fake.sys.empty() && g_fake.destroyed == 1 && !g_fake.vas.count(1));
 }
 
 int main() {
@@ -155,6 +271,7 @@ int main() {
         static File off; DeviceInfo none; off.Init(&none); assert(Io(off, NR_GET_CAP, g) == kENOTTY);   // unpublished device
     }
     f.Close();
+    TestMemory(dev);
     std::printf("test_nv_drm_core: OK\n");
     return 0;
 }

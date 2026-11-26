@@ -30,7 +30,13 @@ constexpr uint32_t DRM_SYNCOBJ_CREATE_SIGNALED = 1, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_
                    DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT = 2;
 // nouveau (DRM_COMMAND_BASE + n)
 constexpr uint32_t NV_GETPARAM = 0x00, NV_CHANNEL_ALLOC = 0x02, NV_CHANNEL_FREE = 0x03, NV_NVIF = 0x07,
-                   NV_VM_INIT = 0x10;
+                   NV_VM_INIT = 0x10, NV_VM_BIND = 0x11, NV_EXEC = 0x12, NV_GEM_NEW = 0x40, NV_GEM_CPU_PREP = 0x42,
+                   NV_GEM_CPU_FINI = 0x43, NV_GEM_INFO = 0x44;
+constexpr uint32_t NR_GEM_CLOSE = 0x09;
+constexpr uint32_t VM_BIND_OP_MAP = 0, VM_BIND_OP_UNMAP = 1, VM_BIND_SPARSE = 1u << 8, VM_BIND_RUN_ASYNC = 1;
+constexpr uint32_t SYNC_SYNCOBJ = 0, SYNC_TIMELINE_SYNCOBJ = 1, SYNC_TYPE_MASK = 0xf;
+constexpr uint32_t CPU_PREP_NOWAIT = 1, CPU_PREP_WRITE = 4;
+constexpr uint64_t kPage = 4096;
 constexpr uint64_t GP_PCI_VENDOR = 3, GP_PCI_DEVICE = 4, GP_BUS_TYPE = 5, GP_FB_SIZE = 8, GP_CHIPSET_ID = 11,
                    GP_GRAPH_UNITS = 13, GP_PTIMER_TIME = 14, GP_HAS_BO_USAGE = 15, GP_HAS_PAGEFLIP = 16,
                    GP_EXEC_PUSH_MAX = 17, GP_VRAM_BAR_SIZE = 18, GP_VRAM_USED = 19, GP_HAS_VMA_TILEMODE = 20;
@@ -96,15 +102,69 @@ constexpr uint32_t kMaxChannels = 16, kMaxObjects = 8, kMaxSyncobjs = 256;
 struct Channel { bool used = false; int32_t id = 0; uint32_t engine = 0; uint32_t nobj = 0;
                  struct { uint64_t token; uint32_t handle; int32_t oclass; } obj[kMaxObjects] = {}; };
 
+// ---- M5.2 memory: the hardware side is a backend (live: VRAM heap + PMM pages + GMMU writes
+// over PRAMIN + MMU invalidate; host test: a fake that records PTEs).
+enum class Aper : uint8_t { Vram, Sys };
+struct Backend {
+    void* ctx;
+    bool (*vram_alloc)(void* ctx, uint64_t bytes, uint64_t align, uint64_t* pa);
+    void (*vram_free)(void* ctx, uint64_t pa, uint64_t bytes);
+    bool (*sys_alloc)(void* ctx, uint64_t bytes, uint64_t* cookie);   // pinned pages; cookie names them
+    void (*sys_free)(void* ctx, uint64_t cookie);
+    bool (*vas_create)(void* ctx, uint64_t kernel_addr, uint64_t kernel_size, uint32_t* vas);
+    void (*vas_destroy)(void* ctx, uint32_t vas);
+    // Map [va, va+bytes) onto the BO backing at `offset` (VRAM: pa+offset; Sys: the cookie's pages).
+    bool (*vas_map)(void* ctx, uint32_t vas, uint64_t va, Aper aper, uint64_t backing, uint64_t offset,
+                    uint64_t bytes, uint8_t kind);
+    // Unmap; sparse=true leaves the range sparse (reads 0, writes dropped) instead of invalid.
+    bool (*vas_unmap)(void* ctx, uint32_t vas, uint64_t va, uint64_t bytes, bool sparse);
+    bool (*vas_flush)(void* ctx, uint32_t vas);   // MMU invalidate after a batch of PTE writes
+};
+
+constexpr uint32_t kMaxBos = 2048, kMaxMappings = 2048, kMaxBindJobs = 16, kMaxBindOps = 64, kMaxJobSyncs = 16;
+constexpr uint32_t GEM_DOMAIN_CPU = 1, GEM_DOMAIN_VRAM = 2, GEM_DOMAIN_GART = 4, GEM_DOMAIN_MAPPABLE = 8,
+                   GEM_DOMAIN_COHERENT = 16, GEM_DOMAIN_NO_SHARE = 32;
+struct Bo {
+    uint32_t handle = 0;    // 0 = free slot
+    uint32_t refs = 0;      // the handle (1) + each mapping
+    bool handle_open = false;
+    uint32_t domain = 0;    // VRAM or GART (+MAPPABLE/COHERENT/NO_SHARE as requested)
+    uint64_t size = 0, backing = 0;   // VRAM pa or sysmem cookie
+    uint32_t tile_mode = 0, tile_flags = 0;
+    uint64_t map_token = 0;
+    Aper aper() const { return (domain & GEM_DOMAIN_VRAM) ? Aper::Vram : Aper::Sys; }
+    uint8_t kind() const { return uint8_t((tile_flags >> 8) & 0xff); }
+};
+struct Mapping { uint64_t va, range, bo_offset; uint32_t bo; bool sparse; };   // bo = handle, 0 for a sparse region
+struct BindOp { uint32_t op, flags, handle, pad; uint64_t addr, bo_offset, range; };
+static_assert(sizeof(BindOp) == 40);
+struct SyncDesc { uint32_t flags, handle; uint64_t timeline_value; };
+static_assert(sizeof(SyncDesc) == 16);
+struct BindJob {
+    bool used = false;
+    uint32_t nops = 0, nwaits = 0;
+    BindOp ops[kMaxBindOps];
+    GpuFence* waits[kMaxJobSyncs];
+    GpuFence* done = nullptr;   // installed in the signal syncobjs at submit, completed when the ops ran
+};
+
 struct File {
     const DeviceInfo* dev = nullptr;
+    const Backend* be = nullptr;
     bool device_obj = false; uint64_t device_token = 0;
-    bool vm_init = false; uint64_t vm_kernel_addr = 0, vm_kernel_size = 0;
+    bool vm_init = false; uint64_t vm_kernel_addr = 0, vm_kernel_size = 0; uint32_t vas = 0;
     Channel channels[kMaxChannels];
     int32_t next_channel = 1;
     GpuSyncTable<kMaxSyncobjs> syncs;
-    void Init(const DeviceInfo* d) { dev = d; syncs.Init(); }
-    void Close() { syncs.CloseAll(); }
+    Bo bos[kMaxBos];
+    uint32_t next_handle = 1;
+    Mapping maps[kMaxMappings];   // sorted by va, non-overlapping
+    uint32_t nmaps = 0;
+    BindJob jobs[kMaxBindJobs];   // async VM_BIND, run in submission order
+    uint32_t job_head = 0, job_count = 0;
+    GpuFence* last_exec = nullptr;   // CPU_PREP waits for it (M5.3 sets it)
+    void Init(const DeviceInfo* d, const Backend* b = nullptr) { dev = d; be = b; syncs.Init(); }
+    void Close();
 };
 
 inline bool CopyStr(const UserAccess& u, uint64_t dst, uint64_t& len, const char* s) {
@@ -223,7 +283,9 @@ inline int64_t VmInit(File& f, const UserAccess& u, uint64_t arg) {
     NvVmInit v{};
     if (!u.read(u.ctx, &v, arg, sizeof(v))) return kEFAULT;
     if (f.vm_init) return kEBUSY;
-    if (!v.kernel_managed_size || v.kernel_managed_addr + v.kernel_managed_size > (1ull << 40)) return kEINVAL;
+    if (!v.kernel_managed_size || (v.kernel_managed_addr & (kPage - 1)) || v.kernel_managed_addr + v.kernel_managed_size > (1ull << 40))
+        return kEINVAL;
+    if (f.be && !f.be->vas_create(f.be->ctx, v.kernel_managed_addr, v.kernel_managed_size, &f.vas)) return kENOMEM;
     f.vm_init = true; f.vm_kernel_addr = v.kernel_managed_addr; f.vm_kernel_size = v.kernel_managed_size;
     return 0;
 }
@@ -337,10 +399,285 @@ inline int64_t Nvif(File& f, const UserAccess& u, uint64_t arg, uint32_t size) {
     }
 }
 
+
+// ---- M5.2: GEM objects -------------------------------------------------------------------
+struct GemInfo { uint32_t handle, domain; uint64_t size, offset, map_handle; uint32_t tile_mode, tile_flags; };
+static_assert(sizeof(GemInfo) == 40);
+struct GemNew { GemInfo info; uint32_t channel_hint, align; };
+static_assert(sizeof(GemNew) == 48);
+struct GemClose { uint32_t handle, pad; };
+struct CpuPrep { uint32_t handle, flags; };
+struct VmBind { uint32_t op_count, flags, wait_count, sig_count; uint64_t wait_ptr, sig_ptr, op_ptr; };
+static_assert(sizeof(VmBind) == 40);
+constexpr uint64_t kMapTokenBase = 1ull << 40;   // mmap offsets: kMapTokenBase + handle << 32 (page aligned, unique)
+
+inline Bo* FindBo(File& f, uint32_t handle) {
+    if (!handle || handle > kMaxBos) return nullptr;
+    Bo& b = f.bos[handle - 1];
+    return b.handle == handle ? &b : nullptr;
+}
+inline const Bo* FindBoByToken(File& f, uint64_t token) {
+    if (token < kMapTokenBase || (token & 0xffffffffull)) return nullptr;
+    Bo* b = FindBo(f, uint32_t((token - kMapTokenBase) >> 32));
+    return b && b->map_token == token && b->handle_open ? b : nullptr;
+}
+inline void BoPut(File& f, Bo& b) {
+    if (--b.refs) return;
+    if (f.be) { if (b.aper() == Aper::Vram) f.be->vram_free(f.be->ctx, b.backing, b.size); else f.be->sys_free(f.be->ctx, b.backing); }
+    b = Bo{};
+}
+inline int64_t GemNewIoctl(File& f, const UserAccess& u, uint64_t arg) {
+    GemNew n{};
+    if (!u.read(u.ctx, &n, arg, sizeof(n))) return kEFAULT;
+    if (!f.be) return kENOTTY;
+    const uint32_t d = n.info.domain;
+    const bool vram = d & GEM_DOMAIN_VRAM, gart = d & GEM_DOMAIN_GART;
+    if (!n.info.size || n.info.size > (8ull << 30) || (vram == gart && !(vram && gart))) return kEINVAL;
+    if (d & ~(GEM_DOMAIN_VRAM | GEM_DOMAIN_GART | GEM_DOMAIN_MAPPABLE | GEM_DOMAIN_COHERENT | GEM_DOMAIN_NO_SHARE)) return kEINVAL;
+    if (n.align & (n.align - 1)) return kEINVAL;
+    // VRAM|GART: VRAM first, GART when VRAM is full (as TTM placement order)
+    Bo* slot = nullptr; uint32_t h = 0;
+    for (uint32_t i = 0; i < kMaxBos; ++i) { const uint32_t k = (f.next_handle - 1 + i) % kMaxBos; if (!f.bos[k].handle) { slot = &f.bos[k]; h = k + 1; break; } }
+    if (!slot) return kENOSPC;
+    const uint64_t size = (n.info.size + kPage - 1) & ~(kPage - 1);
+    Bo b; b.handle = h; b.refs = 1; b.handle_open = true; b.size = size;
+    b.tile_mode = n.info.tile_mode; b.tile_flags = n.info.tile_flags & 0x0000ff00u;
+    const uint32_t extra = d & (GEM_DOMAIN_MAPPABLE | GEM_DOMAIN_COHERENT | GEM_DOMAIN_NO_SHARE);
+    bool ok = false;
+    if (vram) { ok = f.be->vram_alloc(f.be->ctx, size, n.align > 0x10000 ? n.align : 0x10000, &b.backing); if (ok) b.domain = GEM_DOMAIN_VRAM | extra; }
+    if (!ok && gart) { ok = f.be->sys_alloc(f.be->ctx, size, &b.backing); if (ok) b.domain = GEM_DOMAIN_GART | extra; }
+    if (!ok) return kENOMEM;
+    b.map_token = kMapTokenBase + (uint64_t(h) << 32);
+    *slot = b; f.next_handle = h % kMaxBos + 1;
+    n.info.handle = h; n.info.domain = b.domain; n.info.size = size; n.info.offset = 0; n.info.map_handle = b.map_token;
+    n.info.tile_flags = b.tile_flags;
+    if (!u.write(u.ctx, arg, &n, sizeof(n))) { slot->handle_open = false; BoPut(f, *slot); return kEFAULT; }
+    return 0;
+}
+inline int64_t GemInfoIoctl(File& f, const UserAccess& u, uint64_t arg) {
+    GemInfo i{};
+    if (!u.read(u.ctx, &i, arg, sizeof(i))) return kEFAULT;
+    Bo* b = FindBo(f, i.handle);
+    if (!b || !b->handle_open) return kENOENT;
+    i.domain = b->domain; i.size = b->size; i.offset = 0; i.map_handle = b->map_token; i.tile_mode = b->tile_mode; i.tile_flags = b->tile_flags;
+    return u.write(u.ctx, arg, &i, sizeof(i)) ? 0 : kEFAULT;
+}
+inline int64_t GemCloseIoctl(File& f, const UserAccess& u, uint64_t arg) {
+    GemClose c{};
+    if (!u.read(u.ctx, &c, arg, sizeof(c))) return kEFAULT;
+    if (c.pad) return kEINVAL;
+    Bo* b = FindBo(f, c.handle);
+    if (!b || !b->handle_open) return kEINVAL;
+    b->handle_open = false; b->map_token = 0;
+    BoPut(f, *b);   // mappings keep the memory until they are unmapped
+    return 0;
+}
+// CPU_PREP: the VM_BIND/EXEC uAPI has no per-BO busy tracking in userspace's view; nouveau
+// waits on the BO's reservation, which holds the VM's EXEC fences. Brook waits for the file's
+// last EXEC fence (conservative). CPU_FINI is a no-op.
+inline int64_t CpuPrepIoctl(File& f, const UserAccess& u, uint64_t arg) {
+    CpuPrep c{};
+    if (!u.read(u.ctx, &c, arg, sizeof(c))) return kEFAULT;
+    if (c.flags & ~(CPU_PREP_NOWAIT | CPU_PREP_WRITE)) return kEINVAL;
+    Bo* b = FindBo(f, c.handle);
+    if (!b || !b->handle_open) return kENOENT;
+    GpuFence* fe = f.last_exec;
+    if (!fe) return 0;
+    const uint64_t deadline = u.now_ns(u.ctx) + 15000000000ull;   // nouveau: 15 s, then -EBUSY
+    for (;;) {
+        const uint32_t st = GpuFenceState(fe);
+        if (st) return st == 2 ? -5 : 0;
+        if (c.flags & CPU_PREP_NOWAIT) return kEBUSY;
+        if (u.now_ns(u.ctx) >= deadline) return kEBUSY;
+        if (!u.sleep_tick(u.ctx)) return -4;
+    }
+}
+
+// ---- M5.2: the VA space ---------------------------------------------------------------------
+// User range [0, kernel_managed_addr); mappings are 4 KiB aligned. MAP needs free VA or a
+// sparse region; UNMAP splits mappings it partly covers. A memory-backed unmap inside a sparse
+// region leaves the hole sparse; UNMAP|SPARSE removes a sparse region.
+inline bool VaValid(const File& f, uint64_t va, uint64_t range) {
+    return range && !((va | range) & (kPage - 1)) && va + range > va && va + range <= f.vm_kernel_addr;
+}
+// The list is sorted by va; memory-backed mappings may lie inside sparse regions (overlap).
+inline bool Overlaps(const Mapping& m, uint64_t va, uint64_t end) { return m.va < end && m.va + m.range > va; }
+inline bool InsertMapping(File& f, const Mapping& m) {
+    if (f.nmaps >= kMaxMappings) return false;
+    uint32_t i = 0; while (i < f.nmaps && f.maps[i].va < m.va) ++i;
+    for (uint32_t j = f.nmaps; j > i; --j) f.maps[j] = f.maps[j - 1];
+    f.maps[i] = m; ++f.nmaps; return true;
+}
+inline void EraseMapping(File& f, uint32_t i) { for (uint32_t j = i; j + 1 < f.nmaps; ++j) f.maps[j] = f.maps[j + 1]; --f.nmaps; }
+// Structural checks for a whole batch at submit (flags, alignment, handles, BO bounds).
+// VA-state checks run per op at apply time (a batch may unmap and remap the same range).
+inline int64_t BindCheck(File& f, const BindOp& o) {
+    if (o.pad || (o.flags & ~VM_BIND_SPARSE)) return kEINVAL;
+    if (!VaValid(f, o.addr, o.range)) return kEINVAL;
+    if (o.op == VM_BIND_OP_MAP) {
+        const bool sparse = o.flags & VM_BIND_SPARSE;
+        if (!sparse) {
+            Bo* b = FindBo(f, o.handle);
+            if (!b || !b->handle_open) return kENOENT;
+            if ((o.bo_offset & (kPage - 1)) || o.bo_offset + o.range > b->size || o.bo_offset + o.range < o.bo_offset) return kEINVAL;
+        } else if (o.handle || o.bo_offset) return kEINVAL;
+        return 0;
+    }
+    if (o.op == VM_BIND_OP_UNMAP) return o.handle || o.bo_offset ? kEINVAL : 0;
+    return kEINVAL;
+}
+inline int64_t BindState(const File& f, const BindOp& o) {
+    const uint64_t end = o.addr + o.range;
+    const bool sparse = o.flags & VM_BIND_SPARSE;
+    if (o.op == VM_BIND_OP_MAP) {   // memory maps land in free VA or inside sparse regions; sparse regions in free VA
+        for (uint32_t i = 0; i < f.nmaps; ++i) if (Overlaps(f.maps[i], o.addr, end) && (sparse || !f.maps[i].sparse)) return kEINVAL;
+        return 0;
+    }
+    if (sparse)   // removing a sparse region: its memory mappings must go first (their PTEs would be lost)
+        for (uint32_t i = 0; i < f.nmaps; ++i) if (!f.maps[i].sparse && Overlaps(f.maps[i], o.addr, end)) return kEBUSY;
+    return 0;
+}
+inline int64_t BindApply(File& f, const BindOp& o) {
+    if (int64_t e = BindState(f, o)) return e;
+    const uint64_t va = o.addr, end = o.addr + o.range;
+    if (o.op == VM_BIND_OP_MAP) {
+        if (o.flags & VM_BIND_SPARSE) {
+            if (!f.be->vas_unmap(f.be->ctx, f.vas, va, o.range, true)) return kENOMEM;   // sparse PTEs
+            return InsertMapping(f, {va, o.range, 0, 0, true}) ? 0 : kENOSPC;
+        }
+        Bo* b = FindBo(f, o.handle);
+        if (!b) return kENOENT;
+        if (!f.be->vas_map(f.be->ctx, f.vas, va, b->aper(), b->backing, o.bo_offset, o.range, b->kind())) return kENOMEM;
+        ++b->refs;
+        return InsertMapping(f, {va, o.range, o.bo_offset, b->handle, false}) ? 0 : kENOSPC;
+    }
+    // UNMAP: one overlapped mapping of the requested kind at a time (memory-backed, or sparse
+    // regions with UNMAP|SPARSE), splitting partial overlaps; restart after each change.
+    const bool sparse_op = o.flags & VM_BIND_SPARSE;
+    for (;;) {
+        uint32_t i = 0;
+        while (i < f.nmaps && !(f.maps[i].sparse == sparse_op && Overlaps(f.maps[i], va, end))) ++i;
+        if (i == f.nmaps) return 0;
+        const Mapping m = f.maps[i];
+        const uint64_t a = m.va > va ? m.va : va, z = m.va + m.range < end ? m.va + m.range : end;
+        // a memory hole inside a sparse region goes back to sparse; anything else becomes invalid
+        bool inside_sparse = false;
+        if (!m.sparse)
+            for (uint32_t k = 0; k < f.nmaps; ++k)
+                if (f.maps[k].sparse && f.maps[k].va <= a && f.maps[k].va + f.maps[k].range >= z) inside_sparse = true;
+        if (!f.be->vas_unmap(f.be->ctx, f.vas, a, z - a, inside_sparse)) return kENOMEM;
+        EraseMapping(f, i);
+        uint32_t pieces = 0;
+        if (m.va < a) { Mapping l = m; l.range = a - m.va; if (!InsertMapping(f, l)) return kENOSPC; ++pieces; }
+        if (m.va + m.range > z) {
+            Mapping r = m; r.va = z; r.range = m.va + m.range - z; if (!m.sparse) r.bo_offset = m.bo_offset + (z - m.va);
+            if (!InsertMapping(f, r)) return kENOSPC; ++pieces;
+        }
+        if (!m.sparse) if (Bo* b = FindBo(f, m.bo)) { b->refs += pieces; BoPut(f, *b); }   // each surviving piece holds a reference
+    }
+}
+// An async job holds a reference on each BO it maps (taken at submit, dropped after it ran).
+inline void JobBoRefs(File& f, const BindJob& j, bool take) {
+    for (uint32_t i = 0; i < j.nops; ++i)
+        if (j.ops[i].op == VM_BIND_OP_MAP && !(j.ops[i].flags & VM_BIND_SPARSE))
+            if (Bo* b = FindBo(f, j.ops[i].handle)) { if (take) ++b->refs; else BoPut(f, *b); }
+}
+inline int64_t RunOps(File& f, const BindOp* ops, uint32_t n) {
+    int64_t rc = 0;
+    for (uint32_t i = 0; i < n && !rc; ++i) rc = BindApply(f, ops[i]);
+    if (!f.be->vas_flush(f.be->ctx, f.vas) && !rc) rc = -5;
+    return rc;
+}
+// Runs queued async binds whose waits have completed, in order. Called on every ioctl and by
+// the live glue's poller.
+inline void Pump(File& f) {
+    while (f.job_count) {
+        BindJob& j = f.jobs[f.job_head];
+        bool ready = true, failed = false;
+        for (uint32_t i = 0; i < j.nwaits; ++i) { const uint32_t st = GpuFenceState(j.waits[i]); ready &= st != 0; failed |= st == 2; }
+        if (!ready) return;
+        const int64_t rc = failed ? -5 : RunOps(f, j.ops, j.nops);
+        JobBoRefs(f, j, false);
+        GpuFenceComplete(j.done, rc == 0);
+        for (uint32_t i = 0; i < j.nwaits; ++i) GpuFenceUnref(j.waits[i]);
+        GpuFenceUnref(j.done);
+        j = BindJob{};
+        f.job_head = (f.job_head + 1) % kMaxBindJobs; --f.job_count;
+    }
+}
+inline int64_t ReadSyncs(File& f, const UserAccess& u, uint64_t ptr, uint32_t count, SyncDesc* out) {
+    if (count > kMaxJobSyncs) return kEINVAL;
+    if (count && !u.read(u.ctx, out, ptr, uint64_t(count) * sizeof(SyncDesc))) return kEFAULT;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (out[i].flags != SYNC_SYNCOBJ) return kEINVAL;   // binary syncobjs only (no timeline cap yet)
+        GpuSync* s = f.syncs.Get(out[i].handle);
+        if (!s) return kEINVAL;
+        GpuSyncUnref(s);
+    }
+    return 0;
+}
+inline int64_t VmBindIoctl(File& f, const UserAccess& u, uint64_t arg) {
+    VmBind v{};
+    if (!u.read(u.ctx, &v, arg, sizeof(v))) return kEFAULT;
+    if (!f.vm_init || !f.be) return kEINVAL;
+    if ((v.flags & ~VM_BIND_RUN_ASYNC) || !v.op_count || v.op_count > kMaxBindOps) return kEINVAL;
+    const bool async = v.flags & VM_BIND_RUN_ASYNC;
+    if (!async && (v.wait_count || v.sig_count)) return kEINVAL;   // sync binds take no syncs
+    BindOp ops[kMaxBindOps];
+    if (!u.read(u.ctx, ops, v.op_ptr, uint64_t(v.op_count) * sizeof(BindOp))) return kEFAULT;
+    for (uint32_t i = 0; i < v.op_count; ++i) if (int64_t e = BindCheck(f, ops[i])) return e;
+    if (!async) {   // in order: earlier async binds run first
+        const uint64_t deadline = u.now_ns(u.ctx) + 15000000000ull;
+        for (Pump(f); f.job_count; Pump(f)) {
+            if (u.now_ns(u.ctx) >= deadline) return kEBUSY;
+            if (!u.sleep_tick(u.ctx)) return -4;
+        }
+        return RunOps(f, ops, v.op_count);
+    }
+    SyncDesc waits[kMaxJobSyncs], sigs[kMaxJobSyncs];
+    if (int64_t e = ReadSyncs(f, u, v.wait_ptr, v.wait_count, waits)) return e;
+    if (int64_t e = ReadSyncs(f, u, v.sig_ptr, v.sig_count, sigs)) return e;
+    if (f.job_count == kMaxBindJobs) return kEBUSY;
+    BindJob& j = f.jobs[(f.job_head + f.job_count) % kMaxBindJobs];
+    j = BindJob{}; j.used = true; j.nops = v.op_count;
+    for (uint32_t i = 0; i < v.op_count; ++i) j.ops[i] = ops[i];
+    for (uint32_t i = 0; i < v.wait_count; ++i) {
+        GpuSync* s = f.syncs.Get(waits[i].handle);
+        GpuFence* fe = GpuSyncAcquire(s); GpuSyncUnref(s);
+        if (!fe) { for (uint32_t k = 0; k < j.nwaits; ++k) GpuFenceUnref(j.waits[k]); j = BindJob{}; return kEINVAL; }   // nothing submitted yet
+        j.waits[j.nwaits++] = fe;
+    }
+    j.done = GpuFenceCreate(false);
+    if (!j.done) { for (uint32_t k = 0; k < j.nwaits; ++k) GpuFenceUnref(j.waits[k]); j = BindJob{}; return kENOMEM; }
+    for (uint32_t i = 0; i < v.sig_count; ++i) { GpuSync* s = f.syncs.Get(sigs[i].handle); GpuSyncReplace(s, j.done); GpuSyncUnref(s); }
+    JobBoRefs(f, j, true);
+    ++f.job_count;
+    Pump(f);
+    return 0;
+}
+inline void File::Close() {
+    while (job_count) {   // drop queued binds (their fences fail)
+        BindJob& j = jobs[job_head];
+        if (be) JobBoRefs(*this, j, false);
+        GpuFenceComplete(j.done, false); GpuFenceUnref(j.done);
+        for (uint32_t i = 0; i < j.nwaits; ++i) GpuFenceUnref(j.waits[i]);
+        j = BindJob{}; job_head = (job_head + 1) % kMaxBindJobs; --job_count;
+    }
+    if (be) {
+        for (uint32_t i = 0; i < nmaps; ++i) if (!maps[i].sparse) { Bo* b = FindBo(*this, maps[i].bo); if (b) BoPut(*this, *b); }
+        nmaps = 0;
+        for (auto& b : bos) if (b.handle && b.handle_open) { b.handle_open = false; BoPut(*this, b); }
+        if (vm_init) be->vas_destroy(be->ctx, vas);
+    }
+    GpuFenceUnref(last_exec); last_exec = nullptr;
+    syncs.CloseAll();
+}
+
 inline int64_t Ioctl(File& f, const UserAccess& u, uint64_t cmd, uint64_t arg) {
     if (IocType(cmd) != 'd' || !f.dev || !f.dev->valid) return kENOTTY;
     const uint32_t nr = IocNr(cmd), size = IocSize(cmd);
     auto sized = [&](uint32_t want) { return size == want; };
+    if (f.be && f.job_count) Pump(f);
     switch (nr) {
         case NR_VERSION: return sized(sizeof(DrmVersion)) ? Version(f, u, arg) : kEINVAL;
         case NR_GET_CAP: return sized(sizeof(DrmGetCap)) ? GetCap(f, u, arg) : kEINVAL;
@@ -354,6 +691,12 @@ inline int64_t Ioctl(File& f, const UserAccess& u, uint64_t cmd, uint64_t arg) {
         case kDrmCommandBase + NV_CHANNEL_ALLOC: return sized(sizeof(NvChannelAlloc)) ? ChannelAlloc(f, u, arg) : kEINVAL;
         case kDrmCommandBase + NV_CHANNEL_FREE: return sized(sizeof(NvChannelFree)) ? ChannelFree(f, u, arg) : kEINVAL;
         case kDrmCommandBase + NV_NVIF: return Nvif(f, u, arg, size);
+        case NR_GEM_CLOSE: return sized(sizeof(GemClose)) ? GemCloseIoctl(f, u, arg) : kEINVAL;
+        case kDrmCommandBase + NV_GEM_NEW: return sized(sizeof(GemNew)) ? GemNewIoctl(f, u, arg) : kEINVAL;
+        case kDrmCommandBase + NV_GEM_INFO: return sized(sizeof(GemInfo)) ? GemInfoIoctl(f, u, arg) : kEINVAL;
+        case kDrmCommandBase + NV_GEM_CPU_PREP: return sized(sizeof(CpuPrep)) ? CpuPrepIoctl(f, u, arg) : kEINVAL;
+        case kDrmCommandBase + NV_GEM_CPU_FINI: return sized(sizeof(CpuPrep)) ? 0 : kEINVAL;
+        case kDrmCommandBase + NV_VM_BIND: return sized(sizeof(VmBind)) ? VmBindIoctl(f, u, arg) : kEINVAL;
         default: return kENOTTY;
     }
 }
