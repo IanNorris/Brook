@@ -79,6 +79,16 @@ struct Out {
 };
 
 uint64_t NowUs() { return TscClockAvailable() ? TscClockReadNs() / 1000 : ApicTickCount() * 1000; }
+// Slow BAR0/PRAMIN reads through Bar0Bus (26 Nov GR idle fault: a host read that stalls ~1 s
+// while GR is power-gated). Every read over 1 ms is kept (offset, duration); the drainer logs them.
+struct SlowRead { uint32_t off; uint32_t us; uint64_t at_ms; };
+constexpr uint32_t kSlowReads = 32;
+SlowRead g_slowRead[kSlowReads]; uint32_t g_slowReadN = 0, g_slowReadLogged = 0, g_slowReadMaxUs = 0, g_slowReadMaxOff = 0;
+inline void NoteSlowRead(uint32_t off, uint64_t us) {
+    if (us > g_slowReadMaxUs) { g_slowReadMaxUs = uint32_t(us); g_slowReadMaxOff = off; }
+    const uint32_t i = __atomic_fetch_add(&g_slowReadN, 1u, __ATOMIC_RELAXED);
+    if (i < kSlowReads) g_slowRead[i] = SlowRead{off, uint32_t(us), NowUs() / 1000};
+}
 
 // ------------------------------------------------------------- BAR0 bus
 // Single-page UC mappings that are never remapped (the caller may migrate
@@ -145,7 +155,13 @@ struct Bar0Bus {
         va[used] = v; page[used] = p; ++used;
         return reinterpret_cast<volatile uint32_t*>(v.raw() + (off & 0xfff));
     }
-    uint32_t rd32(uint32_t off) { volatile uint32_t* r = Map(off); const uint32_t v = r ? *r : 0xffffffffu; Note('R', off, v); return v; }
+    uint32_t rd32(uint32_t off) {
+        volatile uint32_t* r = Map(off);
+        const uint64_t t0 = NowUs();
+        const uint32_t v = r ? *r : 0xffffffffu;
+        const uint64_t dt = NowUs() - t0; if (dt > 1000) NoteSlowRead(off, dt);
+        Note('R', off, v); return v;
+    }
     void wr32(uint32_t off, uint32_t v) { volatile uint32_t* r = Map(off); Note('W', off, v); if (r) *r = v; }
     void udelay(uint32_t us) { const uint64_t end = NowUs() + us; while (NowUs() < end) __asm__ volatile("pause"); }
     uint64_t now_us() { return NowUs(); }
@@ -221,6 +237,35 @@ struct FwState {
     bool all = false;
 };
 FwState g_fw;
+// /etc/nv-gsp-registry: up to 16 "KEY VALUE" lines (value decimal or 0x hex), appended to the
+// three default GSP-RM registry keys at P4. Keys: [A-Za-z0-9_], up to 47 chars.
+void LoadExtraRegistry() {
+    g_extraRegN = 0;
+    auto* f = VfsOpen("/etc/nv-gsp-registry", VFS_O_STREAM); if (!f) return;
+    uint64_t off = 0; static char t[1024]; __builtin_memset(t, 0, sizeof(t));
+    const int n = VfsRead(f, t, sizeof(t) - 1, &off); VfsRelease(f);
+    if (n <= 0) return;
+    const char* p = t;
+    while (*p && g_extraRegN < kMaxExtraReg) {
+        while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t') ++p;
+        if (!*p) break;
+        if (*p == '#') { while (*p && *p != '\n') ++p; continue; }
+        char* k = g_extraRegKeys[g_extraRegN]; uint32_t kl = 0;
+        while (((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || *p == '_') && kl < 47) k[kl++] = *p++;
+        k[kl] = 0;
+        while (*p == ' ' || *p == '\t' || *p == '=') ++p;
+        uint32_t v = 0; bool any = false;
+        if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) { p += 2;
+            for (;; ++p) { const char c = *p; uint32_t d;
+                if (c >= '0' && c <= '9') d = uint32_t(c - '0'); else if (c >= 'a' && c <= 'f') d = uint32_t(c - 'a' + 10);
+                else if (c >= 'A' && c <= 'F') d = uint32_t(c - 'A' + 10); else break;
+                v = v * 16 + d; any = true; } }
+        else for (; *p >= '0' && *p <= '9'; ++p) { v = v * 10 + uint32_t(*p - '0'); any = true; }
+        if (kl && any) { g_extraReg[g_extraRegN] = {k, v}; KPrintf("nv-gsp: registry %s = 0x%x\n", k, v); ++g_extraRegN; }
+        else KPrintf("nv-gsp: /etc/nv-gsp-registry: bad line ignored\n");
+        while (*p && *p != '\n') ++p;
+    }
+}
 bool ReadRecord(char* out, uint32_t cap) {
     auto* f = VfsOpen("/etc/nv-gsp-firmware", VFS_O_STREAM); if (!f) return false;
     uint64_t off = 0; char t[160]{};
@@ -499,7 +544,7 @@ void Status() {
     o.ks("autostart", g_autostart.status); o.kb("rm_running", g_rmRunning); o.kb("ce_present", g_ceActiveFlag);
     o.k("rm_events"); o.raw("{"); o.kd("total", g_liveEv.total); o.kd("rc", g_liveEv.rc); o.kd("mmu", g_liveEv.mmu);
     o.kd("os_error", g_liveEv.os_error); o.kd("libos", g_liveEv.libos); o.kd("other", g_liveEv.other); o.kd("drains", g_liveEv.drains);
-    o.kd("last_ms", g_liveEv.last_ms); o.kd("seq_runs", g_seqRuns); o.kd("seq_fails", g_seqFails); o.kd("lost", g_evPendLost); o.kh("pstate", g_liveEv.pstate); o.kd("pstate_polls", g_liveEv.pstate_polls);
+    o.kd("last_ms", g_liveEv.last_ms); o.kd("seq_runs", g_seqRuns); o.kd("seq_fails", g_seqFails); o.kd("lost", g_evPendLost); o.kd("slow_reads", g_slowReadN); o.kd("slow_read_max_us", g_slowReadMaxUs); o.kh("slow_read_max_off", g_slowReadMaxOff); o.kh("pstate", g_liveEv.pstate); o.kd("pstate_polls", g_liveEv.pstate_polls);
     o.kd("pstate_changes", g_liveEv.pstate_changes); o.kd("pstate_errors", g_liveEv.pstate_errors); o.raw("}");
     if (FindGpu(f.g)) {
         g_bus.bar0 = f.g.bar0;
@@ -852,6 +897,9 @@ void P4(bool keepDisplay) {
     SpinLock* lock = keepDisplay ? NvAuxSharedLock() : nullptr;
     if (lock) SpinLockAcquire(lock);
     const uint64_t lockUs = NowUs();
+    LoadExtraRegistry();
+    g_grSkipScrubber = PathExists("/etc/nv-gsp-no-scrubber");
+    if (g_grSkipScrubber) KPrintf("nv-gsp: GR scrubber channel skipped (/etc/nv-gsp-no-scrubber)\n");
     static P4Result r;
     r = RunP4(g_bus, c, f.in, g_dma, pci, booter, bimg, &g_rm->objs, g_rm->ch, g_rm->rx, g_rm->rxcap,
               prepare, arm, wait, g_rmSync);
@@ -1329,6 +1377,10 @@ void EventThread(void*) {
         __atomic_store_n(&g_busy, 0u, __ATOMIC_RELEASE);
         for (uint32_t i = 0; i < npend; ++i) LogEvent(pend[i], pend_len[i]);
         npend = 0;
+        for (const uint32_t n = g_slowReadN < kSlowReads ? g_slowReadN : kSlowReads; g_slowReadLogged < n; ++g_slowReadLogged) {
+            const SlowRead& sr = g_slowRead[g_slowReadLogged];
+            KPrintf("nv-gsp: slow BAR0 read 0x%x took %u us at %lu ms\n", sr.off, sr.us, (unsigned long)sr.at_ms);
+        }
     }
 }
 void EventThreadStart() {

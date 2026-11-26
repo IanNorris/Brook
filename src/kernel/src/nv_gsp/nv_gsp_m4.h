@@ -74,6 +74,9 @@ inline void GrBuildBufs(const rm570::gr::GET_CONTEXT_BUFFERS_INFO_PARAMS& p, GrB
 // `gr mthdbuf sys` restores the nouveau-style sysmem buffer. Formerly: put the method buffer in VRAM instead of
 // sysmem (nouveau uses sysmem; this only tests whether a sysmem DMA is the faulting one).
 inline bool g_grMthdbufVram = true;
+// A/B (26 Nov): skip the TU10x scrubber channel (BUG4208224 WAR) after golden, as CPU-RM does with
+// RmForceGrScrubberChannel=0. Live: /etc/nv-gsp-no-scrubber.
+inline bool g_grSkipScrubber = false;
 
 // One client scope with a GR0 channel.
 struct GrScope {
@@ -400,7 +403,8 @@ inline GrResult RunGrGolden(Bus& bus, const ChipOps& c, VramIo& vram, Api& api, 
     }
 
     r.stage = "scrubber";
-    {
+    if (g_grSkipScrubber) { r.scrubber_ok = true; r.scrubber_entries = 0; }   // A/B: no resident idle GR context
+    else {
         GrScope& s = st.scrub;
         s = GrScope{}; s.base = grh::kScrubber; s.chid = kGrScrubberChid; s.external = false; s.priv = false;
         s.h_vas = rm::gr::KGRAPHICS_SCRUBBER_HANDLE_VAS; s.h_chan = rm::gr::KGRAPHICS_SCRUBBER_HANDLE_CHANNEL;
@@ -729,6 +733,7 @@ template <class Bus, class Api, class VramIo>
 inline uint32_t GrStop(Bus& bus, const ChipOps& c, VramIo& vram, Api& api, GrState& st, GrResult& r) {
     if (!st.up) return 0;
     GrCtx<Bus, Api, VramIo> x{bus, api, vram, c, st.arena, r};
+    if (!st.scrub.nlive) { st.up = false; return 0; }   // scrubber skipped (A/B)
     (void)x.ScrubberWar(st.scrub, true);
     const uint32_t freed = x.Close(st.scrub);
     st.up = false;

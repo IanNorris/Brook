@@ -173,6 +173,12 @@ inline void BuildSystemInfo(const PciIdentity& p, uint8_t out[kSysInfoBytes]) {
 struct RegistryDword { const char* key; uint32_t value; };
 inline const RegistryDword kDefaultRegistry[] = {
     {"RMSecBusResetEnable", 1}, {"RMForcePcieConfigSave", 1}, {"RMDevidCheckIgnore", 1}};
+// Extra DWORD keys appended after the defaults (live: /etc/nv-gsp-registry, "KEY VALUE" lines),
+// for registry A/Bs such as RMElpg=0 (26 Nov GR idle fault). Keys point into g_extraRegKeys.
+constexpr uint32_t kMaxExtraReg = 16, kRegBytes = 1024;
+inline RegistryDword g_extraReg[kMaxExtraReg] = {};
+inline uint32_t g_extraRegN = 0;
+inline char g_extraRegKeys[kMaxExtraReg][48] = {};
 inline uint32_t BuildRegistry(const RegistryDword* e, uint32_t n, uint8_t* out, uint32_t cap) {
     uint32_t str = 8 + 16 * n;
     if (str > cap) return 0;
@@ -255,7 +261,10 @@ inline P4Result RunP4(Bus& bus, const ChipOps& c, const P3Inputs& in, const DmaB
     if (const char* f = prepare_objects(p.layout)) { r.stage = f; r.status = BootStatus::BadInput; return r; }
     ch->Attach(o->q);
     uint8_t sysinfo[kSysInfoBytes]; BuildSystemInfo(pci, sysinfo);
-    uint8_t reg[256]; const uint32_t reglen = BuildRegistry(kDefaultRegistry, 3, reg, sizeof(reg));
+    RegistryDword all[3 + kMaxExtraReg];
+    for (uint32_t i = 0; i < 3; ++i) all[i] = kDefaultRegistry[i];
+    for (uint32_t i = 0; i < g_extraRegN && i < kMaxExtraReg; ++i) all[3 + i] = g_extraReg[i];
+    uint8_t reg[kRegBytes]; const uint32_t reglen = BuildRegistry(all, 3 + (g_extraRegN < kMaxExtraReg ? g_extraRegN : kMaxExtraReg), reg, sizeof(reg));
     if (!reglen) { r.stage = "registry"; r.status = BootStatus::BadInput; return r; }
     r.stage = "arm";
     if (!arm()) { r.status = BootStatus::BadInput; return r; }

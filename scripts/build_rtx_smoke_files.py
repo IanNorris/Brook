@@ -79,7 +79,7 @@ ETC_ALLOWED = {*MARKERS, 'i219-attach', 'i219-reset', 'hardware-payload-id', 're
                # --session desktop only
                'live-store', 'usb-system', 'usb-profile-plan.pub', 'usb-system-trim', 'usb-bot-legacy', 'usb-bot-pipeline', 'usb-uas', 'usb-uas-fixture', 'volatile-desktop', 'hardware-bulk', 'usb-audio-mixer', 'dp-idle-seconds', 'nv-display', 'chromium-alsa-device',
                # --nv-gsp (GSP-RM M1 bridge verbs) and its firmware record
-               'nv-gsp', 'nv-gsp-firmware', 'nv-gsp-no-autostart', 'nv-drm'}
+               'nv-gsp', 'nv-gsp-firmware', 'nv-gsp-no-autostart', 'nv-drm', 'nv-gsp-registry', 'nv-gsp-no-scrubber'}
 # Desktop live stick (--session desktop): the VMware RC session over the RAM
 # store, plus the RTX status helper. If the store does not mount, the services
 # fail to start and the kernel console, bridge and remote update stay usable.
@@ -314,6 +314,17 @@ def desktop_payload(args, initrd):
             fat_write(initrd, 'ETC/nv-gsp-no-autostart', b'1\n')
         if args.nv_drm:  # M5: /dev/dri/renderD130 (nouveau uAPI for Mesa NVK) once GSP-RM is up
             fat_write(initrd, 'ETC/nv-drm', b'1\n')
+        if args.nv_gsp_no_scrubber:  # A/B: no TU10x GR scrubber channel after golden
+            fat_write(initrd, 'ETC/nv-gsp-no-scrubber', b'1\n')
+        if args.nv_gsp_registry:  # extra GSP-RM registry DWORDs, "KEY VALUE" lines (A/B tests)
+            lines = []
+            for kv in args.nv_gsp_registry:
+                k, _, v = kv.partition('=')
+                if not k or not k.replace('_', '').isalnum() or len(k) > 47:
+                    raise SystemExit(f'--nv-gsp-registry: bad key {k!r}')
+                int(v, 0)
+                lines.append(f'{k} {v}')
+            fat_write(initrd, 'ETC/nv-gsp-registry', ('\n'.join(lines) + '\n').encode())
     if args.nv_display:  # desktop presents by flipping head 0 (D2); GOP copy otherwise
         fat_write(initrd, 'ETC/nv-display', b'1\n')
     fat_write(initrd, 'ETC/chromium-alsa-device', b'default\n')  # read by the store's brook-chromium
@@ -591,6 +602,9 @@ def main():
                    help="scan clean ext2 free extents before mount; send UNMAP only with 'run'")
     p.add_argument('--nv-gsp', action='store_true',
                    help='desktop image: BROOK_NV_GSP kernel and /etc/nv-gsp (GSP-RM verbs; boots GSP-RM + CE present at desktop start unless --nv-gsp-no-autostart)')
+    p.add_argument('--nv-gsp-no-scrubber', action='store_true', help='with --nv-gsp: skip the TU10x GR scrubber channel (A/B)')
+    p.add_argument('--nv-gsp-registry', action='append', default=[], metavar='KEY=VALUE',
+                   help='with --nv-gsp: extra GSP-RM registry DWORD (repeatable), e.g. RMElpg=0')
     p.add_argument('--nv-drm', action='store_true',
                    help='with --nv-gsp: /etc/nv-drm (M5: /dev/dri/renderD130, the nouveau uAPI subset for Mesa NVK, '
                         'published once GSP-RM is up)')
