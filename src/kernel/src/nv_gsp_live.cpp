@@ -34,6 +34,7 @@
 #include "nv_disp_live.h"
 #include "platform_power.h"
 #include "scheduler.h"
+#include "process.h"
 #include "serial.h"
 #include "pci.h"
 #include "acpi.h"
@@ -1120,19 +1121,36 @@ void Trace(uint32_t from) {
 
 }  // namespace
 
-void NvGspAutostart() {
+namespace {
+void AutostartRun(bool display);
+void AutostartHeadlessThread(void*) {
+    SchedulerSleepMs(10000);   // root filesystem, USB system and network first
+    AutostartRun(false);
+}
+}  // namespace
+void NvGspAutostart() { AutostartRun(true); }
+// Headless boot (no GOP, BootTimingHeadless): GSP-RM still boots, with a plain p4 (no heads to
+// keep) and no CE present; the GPU works without displays and RM's power management still
+// applies. Runs on its own thread so it never delays the boot.
+void NvGspAutostartHeadless() {
+    Process* t = KernelThreadCreate("nv_gsp_auto", AutostartHeadlessThread, nullptr, 3);
+    if (t) SchedulerAddProcess(t); else KPrintf("nv-gsp: headless autostart thread failed\n");
+}
+namespace {
+void AutostartRun(bool display) {
     if (!MarkerSet("/etc/nv-gsp")) { g_autostart.status = "no /etc/nv-gsp"; return; }
     if (PathExists("/etc/nv-gsp-no-autostart")) { g_autostart.status = "opted out"; KPrintf("nv-gsp: autostart off (/etc/nv-gsp-no-autostart)\n"); return; }
-    SchedulerSleepMs(3000);   // let the desktop settle after the head bring-up
+    if (display) SchedulerSleepMs(3000);   // let the desktop settle after the head bring-up
     bool got = false;
     for (int i = 0; i < 100 && !(got = !__atomic_exchange_n(&g_busy, 1u, __ATOMIC_ACQUIRE)); ++i) SchedulerSleepMs(100);
     if (!got) { g_autostart.status = "busy (a verb held the GPU)"; return; }
     g_autostart.start_ms = NowUs() / 1000;
     g_outQuiet = true;
     uint64_t t0 = NowUs();
-    P4(true);
+    P4(display);   // keep-display only when heads are lit
     g_autostart.p4_us = NowUs() - t0;
-    if (g_rmRunning && g_bar1Mapped) {
+    if (!display) g_autostart.status = g_rmRunning ? "rm (headless)" : "p4 failed (no RM)";
+    else if (g_rmRunning && g_bar1Mapped) {
         t0 = NowUs(); CePresentVerb(1); g_autostart.ce_us = NowUs() - t0;
         g_autostart.status = g_cePresentState.active ? "rm + ce present" : "rm up, ce present failed (CPU copies)";
     } else g_autostart.status = g_rmRunning ? "rm up, BAR1 not mapped (no CE)" : "p4 failed (no RM)";
@@ -1141,6 +1159,7 @@ void NvGspAutostart() {
     KPrintf("nv-gsp: autostart %s (p4 %lu us, ce %lu us)\n", g_autostart.status, (unsigned long)g_autostart.p4_us,
             (unsigned long)g_autostart.ce_us);
 }
+}  // namespace
 
 bool NvGspHandle(const char* command) {
     constexpr char prefix[] = "bridge hardware nv-gsp ";

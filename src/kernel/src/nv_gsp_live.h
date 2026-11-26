@@ -10,4 +10,6 @@ bool NvGspHandle(const char* command);
 // no /etc/nv-gsp-no-autostart, boots GSP-RM (p4 keep-display) and turns the CE present
 // path on. Any failure leaves the CPU path (and, before INIT_DONE, no RM) in place.
 void NvGspAutostart();
+// Headless boot: GSP-RM with a plain p4 (no keep-display, no CE present), on its own thread.
+void NvGspAutostartHeadless();
 }

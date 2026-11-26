@@ -2,6 +2,9 @@
 #include "debug_hardware.h"
 #if defined(BROOK_NV_DISPLAY)
 #include "nv_disp_live.h"
+#if defined(BROOK_NV_GSP)
+#include "nv_gsp_live.h"
+#endif
 #endif
 #include "boot_status.h"
 #include "boot_stick.h"
@@ -1326,8 +1329,12 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 #if defined(BROOK_NV_DISPLAY)
         // RTX head-0 flip presentation (gated by /etc/nv-display). Not on a headless boot:
         // with no GOP nothing is lit and the display engine is left alone (no GSP autostart).
-        if (brook::BootIsHeadless(bootProtocol)) brook::KPuts("BOOT: headless (no GOP at boot); display bring-up skipped\n");
-        else brook::NvDisplayDesktopStart();
+        if (brook::BootIsHeadless(bootProtocol)) {
+            brook::KPuts("BOOT: headless (no GOP at boot); display bring-up skipped\n");
+#if defined(BROOK_NV_GSP)
+            brook::NvGspAutostartHeadless();   // GSP-RM still comes up (plain p4); no CE present
+#endif
+        } else brook::NvDisplayDesktopStart();
 #endif
 
         // Start debug channel kernel thread (connects asynchronously).
