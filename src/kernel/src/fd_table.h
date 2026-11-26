@@ -66,6 +66,7 @@ enum class FdType : uint8_t
     IntelSyncObj,  // Capability retaining an Intel DRM sync object
     DevZero,       // /dev/zero (1:5) — zero-filled reads, discarded writes
     DevFull,       // /dev/full (1:7) — zero-filled reads, writes fail ENOSPC
+    DevNvDri,      // /dev/dri/renderD130 — nouveau uAPI on GSP-RM (M5, nv_drm.h)
 };
 
 // One descriptor slot. type/handle/flags are the immutable identity of the
@@ -106,6 +107,7 @@ inline void FdDiagnosticPath(const FdEntry& fd,char* out,uint32_t capacity)
         case FdType::DrmPrime: case FdType::IntelPrime: text="anon_inode:dmabuf"; break;
         case FdType::DevDri: text="/dev/dri/renderD128"; break;
         case FdType::DevIntelDri: text="/dev/dri/renderD129"; break;
+        case FdType::DevNvDri: text="/dev/dri/renderD130"; break;
         default: text=type<sizeof(names)/sizeof(names[0])?names[type]:"?"; break;
         }
     }

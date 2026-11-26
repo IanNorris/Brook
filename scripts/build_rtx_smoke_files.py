@@ -79,7 +79,7 @@ ETC_ALLOWED = {*MARKERS, 'i219-attach', 'i219-reset', 'hardware-payload-id', 're
                # --session desktop only
                'live-store', 'usb-system', 'usb-profile-plan.pub', 'usb-system-trim', 'usb-bot-legacy', 'usb-bot-pipeline', 'usb-uas', 'usb-uas-fixture', 'volatile-desktop', 'hardware-bulk', 'usb-audio-mixer', 'dp-idle-seconds', 'nv-display', 'chromium-alsa-device',
                # --nv-gsp (GSP-RM M1 bridge verbs) and its firmware record
-               'nv-gsp', 'nv-gsp-firmware', 'nv-gsp-no-autostart'}
+               'nv-gsp', 'nv-gsp-firmware', 'nv-gsp-no-autostart', 'nv-drm'}
 # Desktop live stick (--session desktop): the VMware RC session over the RAM
 # store, plus the RTX status helper. If the store does not mount, the services
 # fail to start and the kernel console, bridge and remote update stay usable.
@@ -305,6 +305,8 @@ def desktop_payload(args, initrd):
         fat_write(initrd, 'ETC/nv-gsp', b'1\n')
         if args.nv_gsp_no_autostart:  # opt out of the boot-time GSP-RM + CE present
             fat_write(initrd, 'ETC/nv-gsp-no-autostart', b'1\n')
+        if args.nv_drm:  # M5: /dev/dri/renderD130 (nouveau uAPI for Mesa NVK) once GSP-RM is up
+            fat_write(initrd, 'ETC/nv-drm', b'1\n')
     if args.nv_display:  # desktop presents by flipping head 0 (D2); GOP copy otherwise
         fat_write(initrd, 'ETC/nv-display', b'1\n')
     fat_write(initrd, 'ETC/chromium-alsa-device', b'default\n')  # read by the store's brook-chromium
@@ -582,6 +584,9 @@ def main():
                    help="scan clean ext2 free extents before mount; send UNMAP only with 'run'")
     p.add_argument('--nv-gsp', action='store_true',
                    help='desktop image: BROOK_NV_GSP kernel and /etc/nv-gsp (GSP-RM verbs; boots GSP-RM + CE present at desktop start unless --nv-gsp-no-autostart)')
+    p.add_argument('--nv-drm', action='store_true',
+                   help='with --nv-gsp: /etc/nv-drm (M5: /dev/dri/renderD130, the nouveau uAPI subset for Mesa NVK, '
+                        'published once GSP-RM is up)')
     p.add_argument('--nv-gsp-no-autostart', action='store_true',
                    help='with --nv-gsp: /etc/nv-gsp-no-autostart (no GSP-RM / CE present at boot; verbs only)')
     p.add_argument('--nv-gsp-firmware', type=Path, metavar='NIX_OUT',

@@ -21,6 +21,7 @@
 #include "syscall_handlers.h"
 #include "synthetic_system_files.h"
 #include "smp.h"
+#include "nv_drm.h"
 
 namespace brook {
 
@@ -267,6 +268,7 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
        StrEq(syntheticPath,"/dev/tty") || StrEq(syntheticPath,"/dev/console") ||
        StrEq(syntheticPath,"/dev/dri/renderD128") ||
        StrEq(syntheticPath,"/dev/dri/renderD129") ||
+       StrEq(syntheticPath,"/dev/dri/renderD130") ||
        StrEq(syntheticPath,"/dev/random") ||
        StrEq(syntheticPath,"/dev/klog") || StrEq(syntheticPath,"/dev/dsp")) {
         const char* deviceName=StrEq(syntheticPath,"keyboard")?"/dev/keyboard":syntheticPath;
@@ -306,6 +308,15 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
         const int fd=FdPublishNew(proc,owned,static_cast<uint32_t>(flags));
         if(fd<0){brook::BdwGpuFileUnref(file);return -EMFILE;}return fd;
     }
+    if(StrEq(syntheticPath,"/dev/dri/renderD130") && brook::NvDrmNodeEnabled()){
+        if((flags&0xc0)==0xc0)return -EEXIST;
+        if((flags&3)==3 || (flags&0x10000))return -EINVAL;
+        auto* file=brook::NvDrmFileCreate();if(!file)return -ENOMEM;
+        FdEntry owned{};owned.type=FdType::DevNvDri;owned.handle=file;
+        owned.fdFlags=(flags&0x80000u)?1:0;
+        const int fd=FdPublishNew(proc,owned,static_cast<uint32_t>(flags));
+        if(fd<0){brook::NvDrmFileUnref(file);return -EMFILE;}return fd;
+    }
     if (StrEq(syntheticPath, "/dev/dri/renderD128"))
     {
         if (!brook::GpuAppGet()) return -ENODEV;
@@ -326,7 +337,7 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
     // /dev/dri directory — enumerable so libdrm's drmGetDevices2 can list the
     // render node. Allocate a synthetic-directory fd (recognised by the marker
     // handle in getdents64/fstat). Only when a 3D driver is present.
-    if (StrEq(syntheticPath, "/dev/dri") && (brook::GpuAppGet() || brook::BdwIntelUserNodeEnabled()))
+    if (StrEq(syntheticPath, "/dev/dri") && (brook::GpuAppGet() || brook::BdwIntelUserNodeEnabled() || brook::NvDrmNodeEnabled()))
     {
         if (flags & 3) return -21; // EISDIR
         int fd = FdAlloc(proc, FdType::SyntheticMem,
@@ -345,6 +356,7 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
         const char* attr=IntelDrmSysAttrContent(syntheticPath);
         if(attr)return OpenSyntheticFile(proc,attr,flags);
     }
+    if(const char* attr=brook::NvDrmSysAttrContent(syntheticPath))return OpenSyntheticFile(proc,attr,flags);
 
     // /dev/null — discard writes, EOF on read
     if (StrEq(syntheticPath, "/dev/null"))

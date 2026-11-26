@@ -20,6 +20,7 @@
 #include "syscall_rw.h"
 #include "syscall_netlink.h"
 #include "syscall_handlers.h"
+#include "nv_drm.h"
 
 namespace brook {
 
@@ -240,8 +241,17 @@ static bool DrmStatFill(const char* path, LinuxStat* st)
         st->st_blksize = 4096;
         return true;
     }
-    const bool virt=brook::GpuAppGet()!=nullptr,intel=brook::BdwIntelUserNodeEnabled();
-    if(!virt && !intel)return false;
+    const bool virt=brook::GpuAppGet()!=nullptr,intel=brook::BdwIntelUserNodeEnabled(),nv=brook::NvDrmNodeEnabled();
+    if(!virt && !intel && !nv)return false;
+    if (nv && StrEq(path,"/dev/dri/renderD130"))
+    {
+        memset(st, 0, sizeof(*st));
+        st->st_mode = 0020666; // S_IFCHR | rw-rw-rw-
+        st->st_rdev = DRM_RENDER_RDEV+2;
+        st->st_nlink = 1;
+        st->st_blksize = 4096;
+        return true;
+    }
     if ((virt && StrEq(path, "/dev/dri/renderD128")) || (intel && StrEq(path,"/dev/dri/renderD129")))
     {
         memset(st, 0, sizeof(*st));
@@ -251,7 +261,7 @@ static bool DrmStatFill(const char* path, LinuxStat* st)
         st->st_blksize = 4096;
         return true;
     }
-    if (StrEq(path, "/dev/dri") || (virt && DrmSysIsDir(path)) || (intel && IntelDrmSysIsDir(path)))
+    if (StrEq(path, "/dev/dri") || (virt && DrmSysIsDir(path)) || (intel && IntelDrmSysIsDir(path)) || brook::NvDrmSysIsDir(path))
     {
         memset(st, 0, sizeof(*st));
         st->st_mode = 0040755; // S_IFDIR | rwxr-xr-x
@@ -261,6 +271,7 @@ static bool DrmStatFill(const char* path, LinuxStat* st)
     }
     const char* drmAttr = virt?DrmSysAttrContent(path):nullptr;
     if(!drmAttr && intel)drmAttr=IntelDrmSysAttrContent(path);
+    if(!drmAttr)drmAttr=brook::NvDrmSysAttrContent(path);
     if (drmAttr)
     {
         uint64_t len = 0; while (drmAttr[len]) ++len;
@@ -475,11 +486,11 @@ static int64_t FstatKernel(uint64_t fd,LinuxStat* st)
 
     // GL shim: /dev/dri/renderD128 is a char device (libdrm fstats the open fd
     // to recover major:minor for its sysfs lookups).
-    if (fde->type == FdType::DevDri || fde->type == FdType::DevIntelDri) {
+    if (fde->type == FdType::DevDri || fde->type == FdType::DevIntelDri || fde->type == FdType::DevNvDri) {
         auto* raw = reinterpret_cast<uint8_t*>(st);
         memset(raw, 0, sizeof(LinuxStat));
         st->st_mode = 0020666; // S_IFCHR | rw-rw-rw-
-        st->st_rdev = fde->type==FdType::DevIntelDri ? DRM_RENDER_RDEV+1 : DRM_RENDER_RDEV;
+        st->st_rdev = fde->type==FdType::DevIntelDri ? DRM_RENDER_RDEV+1 : fde->type==FdType::DevNvDri ? DRM_RENDER_RDEV+2 : DRM_RENDER_RDEV;
         st->st_nlink = 1;
         st->st_blksize = 4096;
         return 0;

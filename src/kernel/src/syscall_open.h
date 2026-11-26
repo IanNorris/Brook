@@ -9,6 +9,7 @@
 #include "string.h"
 #include "syscall_internal.h"
 #include "syscall_drm.h"
+#include "nv_drm.h"
 
 namespace brook {
 
@@ -30,7 +31,7 @@ struct AtLookup {
         FdRef ref(ProcessCurrent(),fd);
         if(!ref)return -EBADF;
         if(ref->type==FdType::SyntheticMem && ref->handle==g_drmDriDirTag){
-            const bool intel=brook::BdwIntelUserNodeEnabled();
+            const bool intel=brook::BdwIntelUserNodeEnabled() || brook::NvDrmNodeEnabled();
             if(!GpuAppGet() && !intel)return -ENOTDIR;
             bool allowed=false;error=VfsCanonicalDrmBrokerAllowed(fs.root,false,&allowed,!GpuAppGet() && intel);
             if(error)return error;if(!allowed)return -ENOTDIR;
@@ -47,6 +48,14 @@ struct AtLookup {
         return VfsPathFromVnode(vnode,&directory);
     }
     int BrokerAllowed(const char* absolute,bool* allowed) const {
+        if(brook::NvDrmNodeEnabled()){
+            const bool node=StrEq(absolute,"/dev/dri/renderD130");
+            const bool sysfs=brook::NvDrmSysIsDir(absolute) || brook::NvDrmSysAttrContent(absolute) ||
+                StrEq(absolute,"/sys/dev/char/226:130/device/subsystem");
+            if(node || sysfs)return VfsCanonicalDrmBrokerAllowed(fs.root,sysfs,allowed,true);
+            if(StrEq(absolute,"/dev/dri") && !GpuAppGet() && !brook::BdwIntelUserNodeEnabled())
+                return VfsCanonicalDrmBrokerAllowed(fs.root,false,allowed,true);
+        }
         if(brook::BdwIntelUserNodeEnabled()){
             const bool node=StrEq(absolute,"/dev/dri/renderD129");
             const bool sysfs=IntelDrmSysIsDir(absolute) || IntelDrmSysAttrContent(absolute) ||

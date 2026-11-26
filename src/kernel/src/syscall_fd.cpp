@@ -24,6 +24,7 @@
 #include "syscall_fd.h"
 #include "syscall_netlink.h"
 #include "syscall_handlers.h"
+#include "nv_drm.h"
 
 namespace brook {
 
@@ -155,6 +156,7 @@ void FinalizeClosedFd(const FdClaimResult& c)
         kfree(dctx);
     }
     if(c.type==FdType::DevIntelDri && c.handle)brook::BdwGpuFileUnref(static_cast<brook::BdwGpuFile*>(c.handle));
+    if(c.type==FdType::DevNvDri && c.handle)brook::NvDrmFileUnref(static_cast<brook::NvDrmFile*>(c.handle));
     if(c.type==FdType::IntelPrime && c.handle){
         auto* buffer=static_cast<brook::BdwGpuBuffer*>(c.handle);
         brook::BdwGpuBufferTrackUserRef(buffer,brook::BdwBufferUserRef::Prime,false);
@@ -313,6 +315,8 @@ void FdBumpRefcount(const FdEntry* fde)
         break;
     case FdType::DevIntelDri:
         brook::BdwGpuFileRef(static_cast<brook::BdwGpuFile*>(fde->handle));break;
+    case FdType::DevNvDri:
+        brook::NvDrmFileRef(static_cast<brook::NvDrmFile*>(fde->handle));break;
     case FdType::IntelPrime: {
         auto* buffer=static_cast<brook::BdwGpuBuffer*>(fde->handle);
         brook::BdwGpuBufferRef(buffer);

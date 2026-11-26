@@ -11,6 +11,7 @@
 #include "syscall_memfd.h"
 #include "syscall_open.h"
 #include "syscall_handlers.h"
+#include "nv_drm.h"
 
 namespace brook {
 
@@ -43,7 +44,8 @@ static int64_t DoReadlink(const char* original,uint64_t bufAddr,uint64_t bufsiz,
     // get_subsystem_type() readlinks this and matches the basename to classify
     // the bus; returning ".../pci" yields DRM_BUS_PCI for the virtio-gpu node.
     if ((StrEq(path, "/sys/dev/char/226:128/device/subsystem") && brook::GpuAppGet()) ||
-        (StrEq(path, "/sys/dev/char/226:129/device/subsystem") && brook::BdwIntelUserNodeEnabled()))
+        (StrEq(path, "/sys/dev/char/226:129/device/subsystem") && brook::BdwIntelUserNodeEnabled()) ||
+        (StrEq(path, "/sys/dev/char/226:130/device/subsystem") && brook::NvDrmNodeEnabled()))
     {
         const char* tgt = "/sys/bus/pci";
         uint64_t slen = 0; while (tgt[slen]) ++slen;

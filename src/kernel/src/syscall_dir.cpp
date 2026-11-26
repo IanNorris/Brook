@@ -8,6 +8,7 @@
 #include "user_copy.h"
 #include "syscall_drm.h"
 #include "syscall_handlers.h"
+#include "nv_drm.h"
 
 namespace brook {
 
@@ -53,9 +54,10 @@ int64_t sys_getdents64(uint64_t fd, uint64_t bufAddr, uint64_t count,
     // so libdrm's drmGetDevices2 can discover the render node.
     if (fde->type == FdType::SyntheticMem && fde->handle == g_drmDriDirTag)
     {
-        const char* driEntries[4]={".","..",nullptr,nullptr};uint32_t entries=2;
+        const char* driEntries[5]={".","..",nullptr,nullptr,nullptr};uint32_t entries=2;
         if(brook::GpuAppGet())driEntries[entries++]="renderD128";
         if(brook::BdwIntelUserNodeEnabled())driEntries[entries++]="renderD129";
+        if(brook::NvDrmNodeEnabled())driEntries[entries++]="renderD130";
         uint64_t opos = 0;
         FdPosition position(fde);
         uint32_t ck = static_cast<uint32_t>(position.value());

@@ -294,6 +294,8 @@ add_executable(kernel
     src/syscall_file_ops.cpp
     src/syscall_mount.cpp
     src/syscall_ioctl.cpp
+    src/nv_drm.cpp
+    src/gpu_sync.cpp
     src/syscall_socket.cpp
     src/syscall_process.cpp
     src/seccomp_bpf.cpp

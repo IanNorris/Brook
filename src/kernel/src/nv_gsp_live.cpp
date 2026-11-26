@@ -35,6 +35,7 @@
 #include "nv_gsp/nak_m4_kernel.h"
 #include "nv_disp_live.h"
 #include "stall_watch.h"
+#include "nv_drm.h"
 #include "platform_power.h"
 #include "scheduler.h"
 #include "process.h"
@@ -540,6 +541,7 @@ FiniOutcome FiniCore(uint64_t rm_budget_us) {
     x.rm = g_rmRunning;
     if (x.rm) {   // GSP-RM is up (p4 this boot): UNLOADING_GUEST_DRIVER first, then the P3b sequence
         uint32_t ceFreed = 0;
+        NvDrmRetract();                                           // renderD130 refuses new opens before RM goes away
         (void)CePresentStop(rm_budget_us > 2000000, &ceFreed);   // no CE submissions once RM starts to unload
         (void)GrStopLive();                                       // GR scrubber WAR teardown + free (nouveau order)
         g_finiDone = true;
@@ -1274,7 +1276,23 @@ void AutostartRun(bool display) {
     }
     g_outQuiet = false;
     __atomic_store_n(&g_busy, 0u, __ATOMIC_RELEASE);
-    if (g_rmRunning) EventThreadStart();
+    if (g_rmRunning) {
+        EventThreadStart();
+        // M5.1: publish the device for renderD130 (Mesa NVK). Classes: what nouveau lists for a
+        // TU104 channel (3D, compute, copy, 2D, inline-to-memory). GPC/TPC: RTX 2080 (6 / 46);
+        // TODO read them from RM (GR info) once a safe control is chosen.
+        nvdrm::DeviceInfo d;
+        const uint32_t boot0 = g_bus.rd32(0);
+        d.chipset = uint16_t((boot0 >> 20) & 0x1ff); d.revision = uint8_t(boot0 & 0xff); d.pci_device = 0x1e87;
+        d.vram_bytes = g_static.fb_length; d.vram_user = g_static.usable_hi > g_static.usable_lo ? g_static.usable_hi - g_static.usable_lo : 0;
+        d.bar1_bytes = kBar1Bytes; d.gpc_count = 6; d.tpc_count = 46;
+        const uint32_t cls[] = {0xc597, 0xc5c0, 0xc5b5, 0x902d, 0xa140};
+        for (uint32_t i = 0; i < 5; ++i) d.classes[i] = cls[i];
+        d.nclasses = 5;
+        const char chip[] = "TU104", name[] = "NVIDIA GeForce RTX 2080";
+        __builtin_memcpy(d.chip, chip, sizeof(chip)); __builtin_memcpy(d.name, name, sizeof(name));
+        NvDrmPublish(d);
+    }
     KPrintf("nv-gsp: autostart %s (p4 %lu us, ce %lu us)\n", g_autostart.status, (unsigned long)g_autostart.p4_us,
             (unsigned long)g_autostart.ce_us);
     if (display) {   // a delayed re-arm (RM work after INIT_DONE) shows up here

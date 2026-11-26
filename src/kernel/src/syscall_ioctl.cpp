@@ -35,6 +35,7 @@
 #include "syscall_rw.h"
 #include "syscall_netlink.h"
 #include "syscall_handlers.h"
+#include "nv_drm.h"
 
 namespace brook {
 
@@ -413,6 +414,7 @@ int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
     }
 
     if(fde->type==FdType::DevIntelDri)return IntelRenderIoctl(static_cast<brook::BdwGpuFile*>(fde->handle),cmd,arg,fd);
+    if(fde->type==FdType::DevNvDri)return brook::NvDrmIoctl(static_cast<brook::NvDrmFile*>(fde->handle),cmd,arg);
     if (fde->type == FdType::DevDri)
     {
         uint8_t type = static_cast<uint8_t>((cmd >> 8) & 0xFF);
