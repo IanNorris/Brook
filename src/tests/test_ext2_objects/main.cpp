@@ -121,7 +121,7 @@ int FileObjectReadTagged(FileObject* object,Vnode* vn,void* out,uint64_t bytes,u
     return FileObjectRead(object,vn,out,bytes,offset);
 }
 int FileObjectWrite(FileObject*,Vnode* vn,const void* in,uint64_t bytes,uint64_t* offset){return vn->ops->write(vn,in,bytes,offset);}
-int FileObjectTruncateUnmapped(FileObject*,Vnode*,uint64_t){assert(false);return -95;}
+int FileObjectTruncateUnmapped(FileObject*,Vnode* vn,uint64_t size){return vn->ops->truncate(vn,size);}
 int FileObjectGrowMapped(FileObject*,Vnode*,uint64_t){assert(false);return -95;}
 void FileObjectDispose(FileObject* object){assert(!object->mappings && !object->mappingRegistrations);for(auto* p:object->pages)assert(!p);}
 Process* ProcessCurrent(){return &process;}
@@ -771,6 +771,141 @@ static void TestLargeFiles(const char* fixturePath, bool expectLargeFileFeature)
     assert(result);
 }
 
+// fallocate on a private image: holes inside and past EOF become zeroed,
+// allocated blocks (including over freed blocks holding old data), across
+// the doubly/triply boundary on 1 KiB blocks; KEEP_SIZE keeps the size;
+// ENOSPC keeps the allocated prefix; a full write returns ENOSPC, not 0.
+// run.py checks the resulting image with e2fsck -fn.
+static void TestFallocate(const char* fixturePath)
+{
+    using namespace brook;
+    std::ifstream input(fixturePath, std::ios::binary);
+    assert(input);
+    std::vector<unsigned char> image{std::istreambuf_iterator<char>(input), {}};
+    input.close();
+    constexpr uint8_t drive = 2;
+    Device device{&diskOps, "fallocate-fixture", DeviceType::Block, &image};
+    auto* savedDevice = g_ext2Devices[drive];
+    g_ext2Devices[drive] = &device;
+    void* priv = nullptr;
+    assert(Ext2FsMount(drive, &priv));
+    auto* mnt = static_cast<Ext2Mount*>(priv);
+    mnt->skipPermChecks = true;
+    const uint64_t blockSize = mnt->blockSize, pointers = blockSize / 4;
+    VfsObject* root = nullptr;
+    assert(!Ext2RootObject(mnt, drive, &root));
+    int error = 0;
+    auto freeBlocks = [&]() {
+        uint64_t total = 0;
+        for (uint32_t g = 0; g < mnt->groupCount; ++g) total += mnt->bgdt[g].bg_free_blocks_count;
+        return total;
+    };
+    auto sizeOf = [&](Vnode* node) { VnodeStat st{}; assert(!node->ops->stat(node, &st)); return st.size; };
+    auto mapped = [&](Vnode* node, uint64_t fileBlock) {
+        Ext2Inode inode{};
+        KRwLockReadLock(&g_ext2Lock);
+        assert(Ext2ReadInode(mnt, static_cast<Ext2FilePriv*>(node->priv)->inode, &inode));
+        const auto lookup = Ext2BlockMap(mnt, &inode, uint32_t(fileBlock));
+        KRwLockReadUnlock(&g_ext2Lock);
+        assert(!lookup.failed);
+        return lookup.block;
+    };
+    auto expectBytes = [&](Vnode* node, uint64_t offset, uint64_t length, auto want) {
+        std::vector<uint8_t> data(length, 0xee);
+        uint64_t position = offset;
+        assert(node->ops->read(node, data.data(), length, &position) == int(length));
+        for (uint64_t i = 0; i < length; ++i) assert(data[i] == want(offset + i));
+    };
+
+    // Leave old data in free blocks: fallocated blocks must read as zeros.
+    Vnode* junk = Ext2ObjectCreate(root, "junk", VFS_O_WRITE, 0600, &error);
+    assert(junk && !error);
+    std::vector<uint8_t> stale(1 << 20, 0xab);
+    uint64_t position = 0;
+    assert(junk->ops->write(junk, stale.data(), stale.size(), &position) == int(stale.size()));
+    closeNode(junk);
+    assert(!root->ops->remove(root, "junk", false));
+    assert(!Ext2FsSync(mnt));
+
+    Vnode* node = Ext2ObjectCreate(root, "prealloc", VFS_O_WRITE, 0600, &error);
+    assert(node && !error);
+    const char marker[] = "keep me";
+    position = 0;
+    assert(node->ops->write(node, marker, sizeof(marker), &position) == int(sizeof(marker)));
+    assert(VfsFallocate(node, 0, 0, 0) == -22);
+    assert(VfsFallocate(node, 2, 0, 4096) == -95);
+    const uint64_t length = 3 * 1024 * 1024 + 123;
+    const uint64_t before = freeBlocks();
+    assert(!VfsFallocate(node, 0, 0, length));
+    assert(sizeOf(node) == length);
+    for (uint64_t b = 0; b * blockSize < length; ++b) assert(mapped(node, b));
+    assert(before - freeBlocks() >= (length + blockSize - 1) / blockSize);
+    expectBytes(node, 0, sizeof(marker), [&](uint64_t i) { return uint8_t(marker[i]); });
+    expectBytes(node, sizeof(marker), length - sizeof(marker), [](uint64_t) { return uint8_t(0); });
+    // Already allocated: no change. KEEP_SIZE past EOF: size unchanged and,
+    // since e2fsck rejects blocks past i_size on ext2, nothing reserved.
+    const uint64_t settled = freeBlocks();
+    assert(!VfsFallocate(node, 0, 4096, 8192) && freeBlocks() == settled);
+    assert(!VfsFallocate(node, 1, length - 10, 1 << 20));
+    assert(sizeOf(node) == length && freeBlocks() == settled);
+
+    // Fill the holes of a sparse file around existing data.
+    assert(!node->ops->truncate(node, 0));
+    assert(!node->ops->truncate(node, 6 << 20));
+    const char inside[] = "inside";
+    position = (5 << 20) + 17;
+    assert(node->ops->write(node, inside, sizeof(inside), &position) == int(sizeof(inside)));
+    assert(!VfsFallocate(node, 1, (1 << 20) + 5, 4 << 20)); // KEEP_SIZE inside EOF
+    assert(sizeOf(node) == 6 << 20);
+    for (uint64_t b = (1 << 20) / blockSize; b < (5 << 20) / blockSize; ++b) assert(mapped(node, b));
+    assert(!mapped(node, (6 << 20) / blockSize - 1) && !mapped(node, 0));
+    expectBytes(node, (5 << 20) + 17, sizeof(inside), [&](uint64_t i) { return uint8_t(inside[i - (5 << 20) - 17]); });
+    expectBytes(node, 1 << 20, 4 << 20, [](uint64_t) { return uint8_t(0); });
+
+    // Across the doubly -> triply indirect boundary (reachable on 1 KiB blocks).
+    const uint64_t tripleStart = (12 + pointers + pointers * pointers) * blockSize;
+    if (tripleStart < (256ULL << 20)) {
+        assert(!node->ops->truncate(node, 0));
+        assert(!VfsFallocate(node, 0, tripleStart - 100 * 1024, 200 * 1024));
+        assert(sizeOf(node) == tripleStart + 100 * 1024);
+        for (uint64_t b = (tripleStart - 100 * 1024) / blockSize; b < (tripleStart + 100 * 1024) / blockSize; ++b)
+            assert(mapped(node, b));
+        assert(!mapped(node, 0));
+        expectBytes(node, tripleStart - 4096, 8192, [](uint64_t) { return uint8_t(0); });
+    }
+    // EFBIG at the size limit.
+    assert(VfsFallocate(node, 0, mnt->maxFileBytes, 1) == -27);
+
+    // ENOSPC: keep the allocated prefix, size at its end; the rest is free.
+    assert(!node->ops->truncate(node, 0));
+    const uint64_t huge = 1ULL << 30;
+    assert(VfsFallocate(node, 0, 0, huge) == -28);
+    const uint64_t reached = sizeOf(node);
+    assert(reached > 0 && reached < huge && reached % blockSize == 0);
+    for (uint64_t b = 0; b * blockSize < reached; b += 7) assert(mapped(node, b));
+    assert(freeBlocks() < 64 + 8);
+    // A write that cannot allocate reports ENOSPC instead of 0.
+    Vnode* other = Ext2ObjectCreate(root, "full", VFS_O_WRITE, 0600, &error);
+    if (other) {
+        std::vector<uint8_t> data(256 * 1024, 1);
+        position = 0;
+        int result = 1;
+        while (result > 0) result = other->ops->write(other, data.data(), data.size(), &position);
+        assert(result == -28 && freeBlocks() == 0); // every block that fit was used
+        position = 1 << 30;
+        const int late = other->ops->write(other, "x", 1, &position);
+        if (late != -28) { std::fprintf(stderr, "late write %d free=%llu\n", late, (unsigned long long)freeBlocks()); std::abort(); }
+        closeNode(other);
+    } else assert(error == -28);
+    closeNode(node);
+    VfsObjectRelease(root);
+    assert(!Ext2FsUnmount(mnt));
+    g_ext2Devices[drive] = savedDevice;
+    std::ofstream result(std::string(fixturePath) + ".child-falloc", std::ios::binary | std::ios::trunc);
+    result.write(reinterpret_cast<const char*>(image.data()), image.size());
+    assert(result);
+}
+
 int main(int argc,char** argv){
     assert(argc==5);std::ifstream input(argv[1],std::ios::binary);assert(input);
     disk.assign(std::istreambuf_iterator<char>(input),{});input.close();
@@ -1286,7 +1421,7 @@ int main(int argc,char** argv){
     assert(!g_ext2OpenInodes && allocations.empty() && frames.empty());
     // Production VFS transactions with distinct backend/namespace locks and
     // independent device images, so overmount writes never share stale caches.
-    VfsInit();assert(VfsRegisterFs("ext2",&g_ext2FsOps));assert(VfsMount("/","ext2",0));
+    VfsInit();TestFallocate(argv[3]);TestFallocate(argv[4]);assert(VfsRegisterFs("ext2",&g_ext2FsOps));assert(VfsMount("/","ext2",0));
     process.uid=process.euid=process.suid=0;process.gid=process.egid=process.sgid=0;
     assert(!VfsMkdir("/container",0755));assert(!VfsMkdir("/container/context-dir",0755));
     Vnode* created=VfsOpen("/container/context-dir/value",VFS_O_CREATE|VFS_O_WRITE);assert(created);VfsClose(created);

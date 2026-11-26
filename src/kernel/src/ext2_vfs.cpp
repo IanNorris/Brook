@@ -1226,6 +1226,13 @@ static bool Ext2WriteIndPointer(Ext2Mount* mnt, uint32_t block, uint32_t index,
 
 static constexpr uint32_t EXT2_FEATURE_RO_COMPAT_LARGE_FILE = 0x0002;
 
+static bool Ext2HasFreeBlock(const Ext2Mount* mnt)
+{
+    for (uint32_t g = 0; g < mnt->groupCount; ++g)
+        if (mnt->bgdt[g].bg_free_blocks_count) return true;
+    return false;
+}
+
 // Linux ext2_max_size() for a filesystem without HUGE_FILE: the triply
 // indirect tree limit, reduced so that a dense file's data plus indirect
 // blocks stay below 2^32 512-byte sectors in i_blocks.
@@ -1462,8 +1469,9 @@ struct Ext2AppendBatch {
 };
 
 static uint32_t Ext2AppendEnsureBlock(Ext2AppendBatch& batch, Ext2Inode* ino,
-                                      uint32_t fileBlock)
+                                      uint32_t fileBlock, bool* fresh = nullptr)
 {
+    if (fresh) *fresh = false;
     Ext2BlockPath path;
     if (!Ext2FindBlockPath(batch.mnt->blockSize, fileBlock, &path)) return 0;
     uint32_t* top = &ino->i_block[path.slot];
@@ -1473,6 +1481,7 @@ static uint32_t Ext2AppendEnsureBlock(Ext2AppendBatch& batch, Ext2Inode* ino,
         if (!block || (path.depth && !batch.Get(block, true))) return 0;
         *top = block;
         Ext2ChargeBlock(batch.mnt, ino);
+        if (!path.depth && fresh) *fresh = true;
     }
     uint32_t parent = *top;
     for (unsigned level = 0; level < path.depth; ++level) {
@@ -1487,6 +1496,7 @@ static uint32_t Ext2AppendEnsureBlock(Ext2AppendBatch& batch, Ext2Inode* ino,
             entry = block;
             batch.Dirty(parent);
             Ext2ChargeBlock(batch.mnt, ino);
+            if (leaf && fresh) *fresh = true;
         }
         parent = entry;
     }
@@ -1514,7 +1524,11 @@ static int Ext2AppendInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
         uint32_t first = static_cast<uint32_t>((offset + done) >> mnt->blockShift);
         for (uint32_t i = 0; i < blocks; ++i) {
             diskBlocks[i] = Ext2AppendEnsureBlock(batch, &staged, first + i);
-            if (!diskBlocks[i]) return batch.Rollback() ? batch.error : -5;
+            if (!diskBlocks[i]) {
+                // Earlier chunks are committed: report them like a short write.
+                const int error = batch.Rollback() ? batch.error : -5;
+                return done ? static_cast<int>(done) : error;
+            }
         }
         uint32_t fullBlocks = static_cast<uint32_t>(chunk >> mnt->blockShift);
         for (uint32_t i = 0; i < fullBlocks;) {
@@ -1535,7 +1549,10 @@ static int Ext2AppendInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
         uint32_t tail = static_cast<uint32_t>(chunk & (mnt->blockSize - 1));
         if (tail) {
             uint8_t* data = batch.Tail();
-            if (!data) return batch.Rollback() ? batch.error : -5;
+            if (!data) {
+                const int error = batch.Rollback() ? batch.error : -5;
+                return done ? static_cast<int>(done) : error;
+            }
             // The append starts at a block boundary; bytes beyond its final
             // EOF are not old file contents and must not expose disk residue.
             memset(data, 0, mnt->blockSize);
@@ -1583,8 +1600,13 @@ static int Ext2WriteInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
     if (regular && !Ext2EnsureLargeFile(mnt, offset + len)) return -5;
     const uint64_t oldSize = Ext2InodeSize(ino);
     if (regular && mnt->blockSize <= 4096 && len >= 64 * 1024 &&
-        offset == oldSize && (offset & (mnt->blockSize - 1)) == 0)
-        return Ext2AppendInodeData(mnt, ino, inoNum, buf, len, offset);
+        offset == oldSize && (offset & (mnt->blockSize - 1)) == 0) {
+        // A batch allocates a whole 64 KiB chunk or nothing. When none fits,
+        // fall back to block-at-a-time so a nearly full filesystem still
+        // takes the bytes that fit before ENOSPC.
+        const int appended = Ext2AppendInodeData(mnt, ino, inoNum, buf, len, offset);
+        if (appended != -28) return appended;
+    }
 
     auto* src = static_cast<const uint8_t*>(buf);
     uint64_t bytesWritten = 0;
@@ -1593,14 +1615,20 @@ static int Ext2WriteInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
     static constexpr uint64_t MAX_RUN_BYTES = 64 * 1024;
 
     auto* blockBuf = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
-    if (!blockBuf) return -1;
+    if (!blockBuf) return -12;
 
+    // Returned only when nothing was written: a short count otherwise, so a
+    // caller never sees 0 (and retries forever) for a full filesystem.
+    int error = -5;
     while (bytesWritten < len) {
         uint32_t fileBlock = static_cast<uint32_t>((offset + bytesWritten) >> mnt->blockShift);
         uint32_t blockOff  = static_cast<uint32_t>((offset + bytesWritten) & (mnt->blockSize - 1));
         bool fresh = false;
         uint32_t diskBlock = Ext2EnsureBlock(mnt, ino, inoNum, fileBlock, &fresh);
-        if (!diskBlock) break;
+        if (!diskBlock) {
+            error = Ext2HasFreeBlock(mnt) ? -5 : -28;
+            break;
+        }
 
         uint32_t avail = mnt->blockSize - blockOff;
         uint64_t remaining = len - bytesWritten;
@@ -1663,7 +1691,7 @@ static int Ext2WriteInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
     if (bytesWritten) Ext2Touch(ino);
     Ext2WriteInode(mnt, inoNum, ino);
 
-    return static_cast<int>(bytesWritten);
+    return bytesWritten ? static_cast<int>(bytesWritten) : error;
 }
 
 // Free all data blocks of an inode (direct + indirect).
@@ -2706,6 +2734,91 @@ static int Ext2FileTruncate(Vnode* vn, uint64_t size)
     return result;
 }
 
+// Allocate and zero the holes of [offset, offset + length) inside the current
+// size. ext2 has no unwritten extents, and e2fsck rejects blocks past i_size,
+// so VfsFallocate grows the size first and KEEP_SIZE reserves nothing past
+// EOF. Works in 64-block batches: private allocation, one coalesced zero
+// write per contiguous run, leaf-before-parent pointers, then one inode
+// update. *reached is the end of the committed prefix; on ENOSPC, the
+// failing batch is rolled back and earlier batches stay allocated, as ext4
+// keeps the extents it allocated.
+static int Ext2FileFallocate(Vnode* vn, uint64_t offset, uint64_t length, uint64_t* reached)
+{
+    auto* fp = static_cast<Ext2FilePriv*>(vn->priv);
+    auto* mnt = fp->mnt;
+    *reached = offset;
+    if (mnt->blockSize > 4096) return -95; // the batch uses one page per indirect block
+    constexpr uint32_t ZERO_BYTES = 64 * 1024;
+    auto* zero = static_cast<uint8_t*>(kmalloc(ZERO_BYTES));
+    if (!zero) return -12;
+    memset(zero, 0, ZERO_BYTES);
+    KRwLockWriteLock(&g_ext2Lock);
+    int result = 0;
+    Ext2Inode inode;
+    do {
+        if (!Ext2ReadInode(mnt, fp->inode, &inode)) { result = -5; break; }
+        if ((inode.i_mode & EXT2_S_IFMT) != EXT2_S_IFREG) { result = -19; break; }
+        const uint64_t size = Ext2InodeSize(&inode);
+        const uint64_t end = length > size || offset > size - length ? size : offset + length;
+        if (offset >= end) { *reached = end > offset ? end : offset; break; }
+        const uint64_t last = (end - 1) >> mnt->blockShift;
+        uint64_t next = offset >> mnt->blockShift;
+        Ext2AppendBatch batch(mnt);
+        bool changed = false;
+        while (next <= last) {
+            batch.Reset();
+            Ext2Inode staged = inode;
+            const uint32_t count = last - next + 1 < 64 ? uint32_t(last - next + 1) : 64;
+            uint32_t disk[64];
+            bool fresh[64];
+            bool any = false;
+            uint32_t i = 0;
+            for (; i < count; ++i) {
+                disk[i] = Ext2AppendEnsureBlock(batch, &staged, uint32_t(next + i), &fresh[i]);
+                if (!disk[i]) break;
+                any |= fresh[i];
+            }
+            if (i < count) {
+                result = batch.error == -28 || !Ext2HasFreeBlock(mnt) ? -28 : batch.error;
+                if (!batch.Rollback()) result = -5;
+                break;
+            }
+            if (any) {
+                for (i = 0; i < count && !result;) {
+                    if (!fresh[i]) { ++i; continue; }
+                    uint32_t run = 1;
+                    while (i + run < count && fresh[i + run] && disk[i + run] == disk[i] + run &&
+                           (uint64_t(run + 1) << mnt->blockShift) <= ZERO_BYTES) ++run;
+                    for (uint32_t b = 0; b < run; ++b) Ext2BlockCacheInvalidate(mnt, disk[i] + b);
+                    Ext2InvalidateIndirectRun(mnt, disk[i], run);
+                    if (!Ext2DevWrite(mnt, uint64_t(disk[i]) << mnt->blockShift, zero,
+                                      uint64_t(run) << mnt->blockShift)) result = -5;
+                    i += run;
+                }
+                if (result) { batch.Rollback(); break; }
+                // As in the append path, never free blocks once pointer or
+                // inode I/O has started: some of it may be on disk.
+                if (!batch.Flush()) { result = -5; break; }
+                if (!Ext2WriteInode(mnt, fp->inode, &staged) &&
+                    !Ext2WriteInode(mnt, fp->inode, &staged)) { result = -5; break; }
+                inode = staged;
+                changed = true;
+            }
+            next += count;
+            const uint64_t done = next << mnt->blockShift;
+            *reached = done < end ? done : end;
+        }
+        if (changed) {
+            Ext2Touch(&inode);
+            if (Ext2WriteInode(mnt, fp->inode, &inode)) fp->inodeData = inode;
+            else if (!result) result = -5;
+        }
+    } while (false);
+    KRwLockWriteUnlock(&g_ext2Lock);
+    kfree(zero);
+    return result;
+}
+
 static void Ext2FileClose(Vnode* vn)
 {
     auto* fp = static_cast<Ext2FilePriv*>(vn->priv);
@@ -3086,6 +3199,7 @@ static const VnodeOps g_ext2FileOps = {
     .chown   = Ext2VnodeChown,
     .space   = Ext2Space,
     .access  = Ext2VnodeAccess,
+    .fallocate = Ext2FileFallocate,
 };
 
 // Socket pins expose metadata and permissions, never file data or mappings.

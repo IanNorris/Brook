@@ -31,7 +31,10 @@ The grown store has 3759 groups of 128 MiB, which is 469.875 GiB.
   blocks. The limit is Linux's `ext2_max_size` without HUGE_FILE: 2 TiB less
   about 2 GiB at 4 KiB blocks, set by the 32-bit `i_blocks`. Writes stop at
   that limit with EFBIG, and so does a truncate past it.
-  `fallocate` still returns EOPNOTSUPP on ext2 files.
+  `fallocate` modes 0 and KEEP_SIZE allocate and zero holes in 64-block
+  batches (6 GiB took 25 s in QEMU). ext2 has no unwritten extents, and
+  e2fsck rejects blocks past i_size, so KEEP_SIZE reserves nothing past EOF.
+  On ENOSPC the allocated prefix stays and i_size ends there, as on ext4.
   Host proof: `test_ext2_objects`. QEMU proof:
   `scripts/test_ext2_large_file_qemu.py`.
 

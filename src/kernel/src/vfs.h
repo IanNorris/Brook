@@ -73,6 +73,10 @@ struct VnodeOps {
     int (*directory_path)(Vnode* vn, char* out, uint32_t capacity) = nullptr;
     // Explicit backend policy; default preserves all existing mapping paths.
     bool deny_mapping = false;
+    // Optional: allocate (zeroed) storage for [offset, offset + length) within
+    // the current size. VfsFallocate grows the size for mode 0. *reached is
+    // the end of the allocated prefix when an error is returned.
+    int (*fallocate)(Vnode* vn, uint64_t offset, uint64_t length, uint64_t* reached) = nullptr;
 };
 
 struct Vnode {
@@ -335,6 +339,8 @@ int VfsFileMapPin(Vnode* vn);
 void VfsFileMapClone(Vnode* vn);
 void VfsFileMapUnpin(Vnode* vn);
 extern "C" int VfsTruncate(Vnode* vn, uint64_t size);
+// fallocate(2) modes 0 and FALLOC_FL_KEEP_SIZE (1) on a regular file.
+int VfsFallocate(Vnode* vn, uint32_t mode, uint64_t offset, uint64_t length);
 extern "C" int VfsWrite(Vnode* vn, const void* buf, uint64_t len, uint64_t* offset);
 // Requires a kernel-staged buffer, not a userspace pointer.
 extern "C" int VfsAppend(Vnode* vn, const void* buf, uint64_t len, uint64_t* offset);
