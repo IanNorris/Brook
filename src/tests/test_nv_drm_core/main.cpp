@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <cstring>
 #include "nv_drm_core.h"
+#include "nv_vram_heap.h"
+#include <vector>
 
 #include <cstdlib>
 #include <thread>
@@ -31,7 +33,52 @@ static uint64_t Cmd(uint32_t nr, uint32_t size) { return (3ull << 30) | (uint64_
 template <class T> static int64_t Io(File& f, uint32_t nr, T& t) { return Ioctl(f, U, Cmd(nr, sizeof(T)), uint64_t(&t)); }
 static int64_t NvIo(File& f, uint32_t nr, void* p, uint32_t n) { return Ioctl(f, U, Cmd(kDrmCommandBase + nr, n), uint64_t(p)); }
 
+
+static void TestVramHeap() {
+    static VramHeap h;
+    const uint64_t G = VramHeap::kGranule, lo = 0x140000000ull, hi = 0x140000000ull + 4096 * G;   // 256 MiB
+    h.Init(lo + 1, hi + 5);   // rounds inwards
+    assert(h.Lo() == lo + G && h.Hi() == hi && h.Free() == 4095 * G && h.Extents() == 1);
+    uint64_t a, b, c, big;
+    assert(h.Alloc(1, 0, &a) && a == lo + G && h.Used() == G);                 // rounds to a granule
+    assert(h.Alloc(2 * G, 0, &b) && b == lo + 2 * G);
+    assert(h.Alloc(1 << 20, 2 << 20, &big) && (big & ((2 << 20) - 1)) == 0);  // 2 MiB aligned: splits a hole
+    assert(h.Extents() == 2);
+    assert(h.Alloc(G, 0, &c) && c == lo + 4 * G);                             // first fit takes the hole first
+    assert(h.Release(b, 2 * G) && !h.Release(b, 2 * G));                       // double free refused
+    assert(h.Release(a, G) && h.Release(c, G) && h.Release(big, 1 << 20));
+    assert(h.Used() == 0 && h.Extents() == 1 && h.Free() == 4095 * G);        // fully coalesced
+    assert(!h.Alloc(4096 * G, 0, &a) && h.Alloc(4095 * G, 0, &a) && h.Free() == 0 && !h.Alloc(G, 0, &b));
+    assert(h.Release(a, 4095 * G));
+    // randomised against a granule bitmap
+    std::vector<uint8_t> used(4096, 0);
+    struct A { uint64_t base, bytes; };
+    std::vector<A> live;
+    uint32_t seed = 12345;
+    auto rnd = [&] { seed = seed * 1103515245u + 12345u; return seed >> 8; };
+    for (int it = 0; it < 20000; ++it) {
+        if (live.empty() || rnd() % 3) {
+            const uint64_t bytes = (1 + rnd() % 64) * G, align = (rnd() % 4 == 0) ? (2 << 20) : G;
+            uint64_t base;
+            if (!h.Alloc(bytes, align, &base)) continue;
+            assert((base & (align - 1)) == 0 && base >= h.Lo() && base + bytes <= h.Hi());
+            for (uint64_t g = (base - lo) / G; g < (base + bytes - lo) / G; ++g) { assert(!used[g]); used[g] = 1; }
+            live.push_back({base, bytes});
+        } else {
+            const size_t k = rnd() % live.size();
+            const A x = live[k]; live[k] = live.back(); live.pop_back();
+            assert(h.Release(x.base, x.bytes));
+            for (uint64_t g = (x.base - lo) / G; g < (x.base + x.bytes - lo) / G; ++g) used[g] = 0;
+        }
+        uint64_t sum = 0; for (auto& x : live) sum += x.bytes;
+        assert(h.Used() == sum);
+    }
+    for (auto& x : live) assert(h.Release(x.base, x.bytes));
+    assert(h.Used() == 0 && h.Extents() == 1);
+}
+
 int main() {
+    TestVramHeap();
     DeviceInfo dev;
     dev.valid = true; dev.chipset = 0x164; dev.revision = 0xa1; dev.pci_device = 0x1e87;
     dev.vram_bytes = 8ull << 30; dev.vram_user = 7ull << 30; dev.bar1_bytes = 256ull << 20; dev.gpc_count = 6; dev.tpc_count = 46;

@@ -4,6 +4,7 @@
 #include "syscall_internal.h"
 #include "tcp_info.h"
 #include "syscall_drm.h"
+#include "nv_drm.h"
 #include "syscall_memfd.h"
 #include "syscall_pipe.h"
 #include "syscall_poll.h"
@@ -80,6 +81,13 @@ Vnode* GuardCheckerOpenLinux(uint64_t,int* error) { *error=-13;return nullptr; }
 // Devices and GPU: absent.
 const GpuAppOps* GpuAppGet() { return harness::g_gpuApp; }
 bool BdwIntelUserNodeEnabled() { return false; }
+bool NvDrmNodeEnabled() { return false; }
+const char* NvDrmSysAttrContent(const char*) { return nullptr; }
+bool NvDrmSysIsDir(const char*) { return false; }
+NvDrmFile* NvDrmFileCreate() { return nullptr; }
+void NvDrmFileRef(NvDrmFile*) {}
+void NvDrmFileUnref(NvDrmFile*) {}
+int64_t NvDrmIoctl(NvDrmFile*, uint64_t, uint64_t) { return -25; }
 BdwGpuFile* BdwGpuFileCreate() { return nullptr; }
 void BdwGpuFileUnref(BdwGpuFile*) {}
 void BdwGpuBufferUnref(BdwGpuBuffer*) {}
