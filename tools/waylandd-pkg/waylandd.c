@@ -1125,9 +1125,16 @@ static void surface_cursor_commit(struct brook_surface *s) {
     const struct brook_geometry *g=&view->geometry;
     const struct brook_image *image=view->image;
     uint32_t scale=surface_output_scale(s);
-    uint32_t dw=g->w*scale>64?64:g->w*scale,dh=g->h*scale>64?64:g->h*scale;
+    uint32_t dw=g->w*scale,dh=g->h*scale;
+    const uint32_t side=dw>dh?dw:dh;
+    if (side>BROOK_CURSOR_PHYSICAL_MAX) {
+        dw=(uint64_t)dw*BROOK_CURSOR_PHYSICAL_MAX/side;
+        dh=(uint64_t)dh*BROOK_CURSOR_PHYSICAL_MAX/side;
+        if (!dw) dw=1;
+        if (!dh) dh=1;
+    }
     struct brook_geometry cursor=*g;cursor.w=dw;cursor.h=dh;
-    uint32_t pixels[64*64];
+    static uint32_t pixels[BROOK_CURSOR_PHYSICAL_MAX*BROOK_CURSOR_PHYSICAL_MAX];
     for (uint32_t y=0;y<dh;++y) for (uint32_t x=0;x<dw;++x) {
         uint32_t px,py;
         brook_geometry_pixel(&cursor,image->width,image->height,x,y,&px,&py);

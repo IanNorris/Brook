@@ -9,6 +9,7 @@
 #define BROOK_KEYBOARD_US 0u
 #define BROOK_KEYBOARD_GB 1u
 #define BROOK_CURSOR_SIZE_DEFAULT 24u
+#define BROOK_CURSOR_PHYSICAL_MAX 128u
 
 static inline int brook_input_tail(const char *text)
 {

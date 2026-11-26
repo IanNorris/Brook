@@ -730,7 +730,7 @@ int64_t sys_brook_wm_set_cursor_image(uint64_t pixelsAddr, uint64_t w,
         brook::CompositorSetCursorImage(nullptr, 0, 0, 0, 0);
         return 0;
     }
-    if (w > 64 || h > 64) return -EINVAL;
+    if (w > BROOK_CURSOR_PHYSICAL_MAX || h > BROOK_CURSOR_PHYSICAL_MAX) return -EINVAL;
     if (h == 0) {
         brook::CompositorSetCursorImage(nullptr, 0, 0, 0, 0);
         return 0;

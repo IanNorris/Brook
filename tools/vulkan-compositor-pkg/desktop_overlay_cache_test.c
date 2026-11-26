@@ -43,8 +43,8 @@ int main(void){
     d=(struct DesktopDamageSet){0};desktop_overlay_damage(&a,&moved,&d);CHECK(covers(&d,50,65));
     /* Pointer motion damages old and new pointer rectangles only. */
     struct DesktopOverlayFrameState p0=a,p1=a;
-    p0.cursor=(struct DesktopOverlayCursorState){1,12,16,10,10,1};
-    p1.cursor=(struct DesktopOverlayCursorState){1,12,16,40,20,1};
+    p0.cursor=(struct DesktopOverlayCursorState){1,12,16,10,10,1,64};
+    p1.cursor=(struct DesktopOverlayCursorState){1,12,16,40,20,1,64};
     d=(struct DesktopDamageSet){0};desktop_overlay_damage(&p0,&p1,&d);
     CHECK(covers(&d,11,11) && covers(&d,45,25) && !covers(&d,50,75) && !covers(&d,30,5));
     /* An image change in place (busy animation, hover cursor) damages it. */

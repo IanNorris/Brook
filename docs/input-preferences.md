@@ -11,9 +11,9 @@ in `/data/home/.config/brook/settings.ini`.
 - `cursor_size=24`, `32`, `48` or `64` selects the cursor theme size and
   scales the built-in arrow and resize cursors relative to size 24. The
   desktop scale is applied to compositor-owned shapes. Client cursor
-  surfaces already carry their own scale. The current cursor interface caps
-  physical images at 64 pixels per side, so the largest choices can
-  converge at high desktop scales.
+  surfaces already carry their own scale. The compositor accepts images up
+  to 128 pixels per side. When an image is larger than the hardware cursor
+  plane, Brook draws it in the compositor or renderer.
 
 ## Trace pointer startup
 

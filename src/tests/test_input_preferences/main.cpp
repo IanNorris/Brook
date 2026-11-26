@@ -33,5 +33,5 @@ int main()
     ScaleCursor(source, scaled, CursorPreferencePercent(200, 48));
     assert(scaled.width == 48 && scaled.height == 64);
     ScaleCursor(source, scaled, CursorPreferencePercent(200, 64));
-    assert(scaled.width == 48 && scaled.height == 64);
+    assert(scaled.width == 64 && scaled.height == 86);
 }

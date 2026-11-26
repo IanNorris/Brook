@@ -29,7 +29,7 @@ inline bool BdwCursorBaseOwned(uint32_t base){
     return false;
 }
 void BdwCursorUpdate(uint64_t leaseOwner,bool visible,int32_t x,int32_t y,
-                     const uint32_t* pixels,uint32_t width,uint32_t height);
+                     const uint32_t* pixels,uint32_t width,uint32_t height,uint32_t stride);
 
 struct BdwGpuBuffer;
 int64_t BdwClientScanoutPresent(uint64_t owner,BdwGpuBuffer*,const BdwClientScanoutLayout&,uint64_t offer);

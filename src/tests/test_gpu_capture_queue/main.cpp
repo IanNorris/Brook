@@ -192,6 +192,7 @@ void SchedulerUnblock(Process* p) {
 }
 void DisplayFlush(uint32_t first,uint32_t last) { CHECK(first<last); ++displayFlushes; }
 bool DisplayPrepareCursor(const CursorImage*, int32_t, int32_t) { return false; }
+extern "C" void MouseGetPosition(int32_t* x,int32_t* y) { *x=0; *y=0; }
 void DisplayCommitCursor() {}
 void DisplayPollModeHints() {}
 void WmApplyDisplaySize(uint32_t, uint32_t) {}
@@ -446,6 +447,19 @@ int main() {
     CHECK(CompositorPresentProbe(2,1,2,2,2,patchPixels,copy,samples,display,g_backdropGeneration,42,true)==-116);
     g_lapicTickCount=100;
     CHECK(!CompositorPresentProbe(0,0,8,6,8,fullSource,copy,samples,display,g_backdropGeneration,42));
+    g_overlayCursorImage.width=86;g_overlayCursorImage.height=96;
+    g_overlayCursorImage.pixels[80*CursorCapacity+20]=0xff443322;
+    g_overlayCursorImage.pixels[81*CursorCapacity+21]=0xff112233;
+    g_overlayCursorVisible=true;g_overlayCursorSerial=1;
+    static BrookDesktopOverlayCursorLarge wideCursor;
+    static BrookDesktopOverlayCursor legacyCursor;
+    CompositorOverlayCursor(wideCursor,0);
+    CHECK(wideCursor.visible && wideCursor.width==86 && wideCursor.height==96 &&
+          wideCursor.stride==128 && wideCursor.pixels[81*128+21]==0xff112233);
+    CompositorOverlayCursor(legacyCursor,0);
+    CHECK(legacyCursor.visible && legacyCursor.width==58 && legacyCursor.height==64 &&
+          legacyCursor.stride==64 && legacyCursor.pixels[54*64+14]==0xff112233);
+    g_overlayCursorImage={};g_overlayCursorVisible=false;g_overlayCursorSerial=0;
     uint32_t capturedPixels[48]{};g_debugFrameBuffer=VirtualAddress(reinterpret_cast<uint64_t>(capturedPixels));g_debugFramePages=1;
     int requestError=0;
     auto window=CompositorRequestDebugFrameOptions(77,BROOK_DEBUG_FRAME_FLAG_WINDOW_BUFFER,9,90,&requestError);

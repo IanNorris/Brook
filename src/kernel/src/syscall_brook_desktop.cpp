@@ -578,16 +578,24 @@ int64_t sys_brook_desktop_overlay(uint64_t op,uint64_t token,uint64_t destinatio
         return 0;
     }
     if(op==BROOK_DESKTOP_OVERLAY_CURSOR){
-        if(token || length!=sizeof(BrookDesktopOverlayCursor))return -EINVAL;
-        auto* cursor=static_cast<BrookDesktopOverlayCursor*>(kmalloc(sizeof(BrookDesktopOverlayCursor)));
+        if(token || (length!=sizeof(BrookDesktopOverlayCursor) && length!=sizeof(BrookDesktopOverlayCursorLarge)))
+            return -EINVAL;
+        const auto deliver=[&](auto* cursor) -> int64_t {
+            CompositorOverlayCursor(*cursor,offset);
+            bool suppress=false;
+            const uint64_t epoch=brook::BdwCursorRendererQuery(owner,reserved==BROOK_DESKTOP_CURSOR_PLANE_V3,suppress);
+            if(suppress)cursor->visible=0;
+            const uint64_t bytes=cursor->serial==offset?offsetof(BrookDesktopOverlayCursor,pixels):sizeof(*cursor);
+            return CopyToUser(destination,cursor,bytes)?int64_t(epoch):-EFAULT;
+        };
+        static_assert(offsetof(BrookDesktopOverlayCursor,pixels)==offsetof(BrookDesktopOverlayCursorLarge,pixels));
+        void* cursor=kmalloc(length);
         if(!cursor)return -ENOMEM;
-        CompositorOverlayCursor(*cursor,offset);
-        bool suppress=false;
-        const uint64_t epoch=brook::BdwCursorRendererQuery(owner,reserved==BROOK_DESKTOP_CURSOR_PLANE_V3,suppress);
-        if(suppress)cursor->visible=0;
-        const uint64_t bytes=cursor->serial==offset?offsetof(BrookDesktopOverlayCursor,pixels):sizeof(*cursor);
-        const bool copied=CopyToUser(destination,cursor,bytes);
-        kfree(cursor);return copied?int64_t(epoch):-EFAULT;
+        const int64_t result=length==sizeof(BrookDesktopOverlayCursorLarge)
+            ?deliver(static_cast<BrookDesktopOverlayCursorLarge*>(cursor))
+            :deliver(static_cast<BrookDesktopOverlayCursor*>(cursor));
+        kfree(cursor);
+        return result;
     }
     if(op==BROOK_DESKTOP_OVERLAY_READ_BAND){
         DesktopOverlayBands bands{};int result=CompositorOverlayBands(uint32_t(token),owner,bands);

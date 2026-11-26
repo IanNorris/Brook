@@ -5,12 +5,16 @@
 #include "cursor_shapes.h"
 
 namespace brook {
-constexpr uint32_t CursorCapacity = 64;
-struct CursorImage {
+constexpr uint32_t CursorCapacity = BROOK_CURSOR_PHYSICAL_MAX;
+constexpr uint32_t HardwareCursorCapacity = 64;
+template<uint32_t Side>
+struct CursorImageStorage {
     uint32_t width = 12, height = 16;
     int32_t hotX = 0, hotY = 0;
-    uint32_t pixels[CursorCapacity * CursorCapacity]{};
+    uint32_t pixels[Side * Side]{};
 };
+using CursorImage = CursorImageStorage<CursorCapacity>;
+using HardwareCursorImage = CursorImageStorage<HardwareCursorCapacity>;
 
 inline bool CursorPixelsHaveAlpha(const uint32_t* pixels, uint32_t width, uint32_t height)
 {

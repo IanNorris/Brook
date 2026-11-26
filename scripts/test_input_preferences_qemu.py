@@ -75,7 +75,7 @@ def screenshot(qmp, file):
         return pic.convert('RGB')
 
 
-def exercise(output, provider, client, image, layout, size, build):
+def exercise(output, provider, client, image, layout, size, scale, build):
     folder = output / f'{layout}-{size}'
     folder.mkdir()
     probe = folder / 'probe'
@@ -88,7 +88,7 @@ def exercise(output, provider, client, image, layout, size, build):
     keyboard = folder / 'keyboard-layout'
     keyboard.write_text(layout + '\n')
     config = folder / 'desktop-defaults.ini'
-    config.write_text(f'[Desktop]\ncursor_size={size}\n')
+    config.write_text(f'[Desktop]\ncursor_size={size}\nscale={scale}\n')
     rc = folder / 'INIT.RC'
     guest_provider = '/nix/store/' + provider.name + '/bin/waylandd'
     guest_client = '/nix/store/' + client.name + '/bin/input-preferences-fixture'
@@ -125,7 +125,7 @@ def exercise(output, provider, client, image, layout, size, build):
             qmp = Qmp(sock)
             # Save both cursor positions with the same static background.
             image_a = screenshot(qmp, folder / 'cursor.ppm')
-            move(qmp, 120, 90)
+            move(qmp, 220 if scale>100 else 120, 90)
             wait_for(vm, serial, 'INPUT_PREFS_CLIENT_MOTION', 12)
             image_b = screenshot(qmp, folder / 'cursor-moved.ppm')
             for chord in [('shift','2'), ('shift','3'), ('shift','apostrophe'), ('backslash',),
@@ -134,7 +134,7 @@ def exercise(output, provider, client, image, layout, size, build):
             wait_for(vm, serial, 'INPUT_PREFS_KEYS_PASS', 12)
             diff = ImageChops.difference(image_a, image_b)
             # With i8042 disabled, the relative USB cursor starts at (0, 0).
-            box = diff.crop((0, 0, 64, 64)).getbbox()
+            box = diff.crop((0, 0, 128, 128)).getbbox()
             if not box:
                 raise RuntimeError('No pointer pixels changed at the initial pointer position')
             log = wait_for(vm, serial, 'BOOT_POINTER wayland_delivered', 8)
@@ -162,6 +162,7 @@ def main():
     for name in ('output','provider','client'):
         ap.add_argument('--'+name,type=Path,required=True)
     ap.add_argument('--build',type=Path,default=ROOT/'build/release')
+    ap.add_argument('--scale',type=int,choices=(100,200),default=100)
     args=ap.parse_args()
     if subprocess.run(['pgrep','-x','vmware-vmx'],stdout=subprocess.DEVNULL).returncode == 0:
         ap.error('Workstation is running')
@@ -169,8 +170,9 @@ def main():
     output.mkdir(parents=True)
     image=make_application_image(output,args.provider,args.client)
     proof={}
-    for layout,size in [('gb',24),('us',48)]:
-        proof[layout]=exercise(output,args.provider,args.client,image,layout,size,args.build)
+    sizes = (24,48) if args.scale==100 else (48,64)
+    for layout,size in zip(('gb','us'), sizes):
+        proof[layout]=exercise(output,args.provider,args.client,image,layout,size,args.scale,args.build)
         (output/'verdict.json').write_text(json.dumps(proof,indent=2)+'\n')
     assert proof['us']['cursor_height'] > proof['gb']['cursor_height'], proof
     print('INPUT_PREFERENCES_QEMU_PASS',json.dumps(proof))

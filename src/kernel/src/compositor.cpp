@@ -2477,19 +2477,43 @@ static void PublishOverlayCursor(uint64_t now,bool visible)
     SpinLockRelease(&g_overlayCursorLock);
 }
 
-void CompositorOverlayCursor(BrookDesktopOverlayCursor& out,uint64_t knownSerial)
+template<class Recorder, uint32_t Side>
+static void ReadOverlayCursor(Recorder& out, uint64_t knownSerial)
 {
     int32_t mx=0,my=0;MouseGetPosition(&mx,&my);
     SpinLockAcquire(&g_overlayCursorLock);
     const CursorImage& image=g_overlayCursorImage;
-    const uint32_t w=image.width<CURSOR_MAX?image.width:CURSOR_MAX,h=image.height<CURSOR_MAX?image.height:CURSOR_MAX;
+    const uint32_t largest=image.width>image.height?image.width:image.height;
+    const uint32_t denominator=largest>Side?largest:Side;
+    const uint32_t w=(image.width*Side+denominator-1)/denominator;
+    const uint32_t h=(image.height*Side+denominator-1)/denominator;
     out.visible=g_overlayCursorSerial && g_overlayCursorVisible && w && h;
-    out.width=w;out.height=h;out.stride=CURSOR_MAX;
-    out.x=int32_t(int64_t(mx)-image.hotX);out.y=int32_t(int64_t(my)-image.hotY);
+    out.width=w;out.height=h;out.stride=Side;
+    out.x=int32_t(int64_t(mx)-int64_t(image.hotX)*Side/denominator);
+    out.y=int32_t(int64_t(my)-int64_t(image.hotY)*Side/denominator);
     out.serial=g_overlayCursorSerial;
-    if(knownSerial!=g_overlayCursorSerial)
-        __builtin_memcpy(out.pixels,image.pixels,sizeof(out.pixels));
+    if(knownSerial!=g_overlayCursorSerial) {
+        if constexpr (Side==CursorCapacity) {
+            __builtin_memcpy(out.pixels,image.pixels,sizeof(out.pixels));
+        } else {
+            memset(out.pixels,0,sizeof(out.pixels));
+            for(uint32_t row=0;row<h;++row)
+                for(uint32_t col=0;col<w;++col)
+                    out.pixels[row*Side+col]=image.pixels[(row*denominator/Side)*CursorCapacity+col*denominator/Side];
+        }
+    }
     SpinLockRelease(&g_overlayCursorLock);
+}
+
+void CompositorOverlayCursor(BrookDesktopOverlayCursor& out,uint64_t knownSerial)
+{
+    ReadOverlayCursor<BrookDesktopOverlayCursor,BROOK_DESKTOP_CURSOR_MAX>(out,knownSerial);
+}
+
+void CompositorOverlayCursor(BrookDesktopOverlayCursorLarge& out,uint64_t knownSerial)
+{
+    static_assert(CursorCapacity==BROOK_DESKTOP_CURSOR_LARGE_MAX);
+    ReadOverlayCursor<BrookDesktopOverlayCursorLarge,BROOK_DESKTOP_CURSOR_LARGE_MAX>(out,knownSerial);
 }
 
 // Runs only on the compositor thread, so taskbar/launcher state is sampled at
@@ -3150,7 +3174,7 @@ static void CompositorLoopWM(bool& clientFrame)
     PublishOverlayCursor(now,overlayCursor);
 #if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
     BdwCursorUpdate(cursorLeaseOwner,overlayCursor,chromeMx-g_cursorFrame.hotX,
-        chromeMy-g_cursorFrame.hotY,g_cursorFrame.pixels,g_cursorFrame.width,g_cursorFrame.height);
+        chromeMy-g_cursorFrame.hotY,g_cursorFrame.pixels,g_cursorFrame.width,g_cursorFrame.height,CURSOR_MAX);
 #endif
     CaptureDesktopOverlay(shell,now,chromeMx,chromeMy,overlayCursor);
     CheckDesktopOverlay(now,shell);
@@ -5103,7 +5127,7 @@ static bool CompositorDrawManualPowerOff()
         DisplayPrepareCursor(nullptr, 0, 0);
         DisplayCommitCursor();
 #if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
-        BdwCursorUpdate(0, false, 0, 0, nullptr, 0, 0);
+        BdwCursorUpdate(0, false, 0, 0, nullptr, 0, 0, 0);
 #endif
         g_cursorVisible = false;
         auto* pixels = g_backBuffer ? g_backBuffer : const_cast<uint32_t*>(g_physFb);

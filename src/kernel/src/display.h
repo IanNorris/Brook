@@ -10,6 +10,7 @@
 // address and dimensions.
 
 #include <stdint.h>
+#include "cursor_composition.h"
 
 namespace brook {
 
@@ -79,14 +80,13 @@ private:
     const DisplayOps* claim_ = nullptr;
 };
 
-struct CursorImage;
 
 // Optional cursor provider, kept separate from the DisplayOps module ABI.
 // Prepare returns whether the provider owns this frame's cursor. It may stage
 // a new image, but a newly visible cursor appears only after Commit.
 struct DisplayCursorOps {
     const DisplayOps* display;
-    bool (*Prepare)(const CursorImage* image, int32_t x, int32_t y);
+    bool (*Prepare)(const HardwareCursorImage* image, int32_t x, int32_t y);
     void (*Commit)();
 };
 extern "C" void DisplayRegisterCursor(const DisplayCursorOps* ops);

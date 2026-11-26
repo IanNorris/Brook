@@ -405,6 +405,7 @@ BdwCursorPlane cursorPlane;
 BdwCursorHandoff cursorHandoff;
 BdwCursorStatus cursorStatus;
 bool cursorSetupFailed=false,cursorMayBeVisible=false,zcLeavingForGop=false;
+bool cursorFitsPlane=false;
 BdwCursorImages cursorImages;
 
 void CursorOffLocked(bool failed=false) {
@@ -1724,7 +1725,7 @@ BdwCursorStatus BdwCursorReadStatus(){
 uint64_t BdwCursorRendererQuery(uint64_t owner,bool supportsHandoff,bool& suppress){
     const uint64_t f=IrqSpinLockAcquire(&lock);
     CursorPollLocked();
-    const bool eligible=supportsHandoff && owner && owner==zcOwner &&
+    const bool eligible=supportsHandoff && cursorFitsPlane && owner && owner==zcOwner &&
         cursorStatus.requested && cursorStatus.bound && zcActive && zcRequested &&
         !zcDisabled && !zcLeavingForGop;
     const uint64_t now=eligible?ApicTickCount():0;
@@ -1753,9 +1754,11 @@ bool BdwCursorBlocksSoftware(){
     return blocks;
 }
 void BdwCursorUpdate(uint64_t leaseOwner,bool visible,int32_t x,int32_t y,
-                     const uint32_t* pixels,uint32_t width,uint32_t height){
+                     const uint32_t* pixels,uint32_t width,uint32_t height,uint32_t stride){
     const uint64_t f=IrqSpinLockAcquire(&lock);
     struct Unlock {uint64_t flags;~Unlock(){IrqSpinLockRelease(&lock,flags);}} unlock{f};
+    cursorFitsPlane=!visible || (pixels && width && height && width<=BdwCursorRegs::Side &&
+                                 height<=BdwCursorRegs::Side && stride>=width);
     if(!CursorPollLocked()){
         ClientRestoreLocked(false);return;
     }
@@ -1764,7 +1767,7 @@ void BdwCursorUpdate(uint64_t leaseOwner,bool visible,int32_t x,int32_t y,
         if(visible)ClientRestoreLocked(false);
         CursorOffLocked();return;
     }
-    if(visible && (!pixels || !width || !height || width>64 || height>64)){
+    if(!cursorFitsPlane){
         ClientRestoreLocked(false);CursorOffLocked(true);return;
     }
     if(!cursorPlane.ready())return;
@@ -1782,7 +1785,7 @@ void BdwCursorUpdate(uint64_t leaseOwner,bool visible,int32_t x,int32_t y,
            !cursorHandoff.mayEnable(zcSlotSequence[front]))return;
     }
 
-    const uint64_t key=probe || !visible ? 0 : BdwCursorImageKey(pixels,width,height);
+    const uint64_t key=probe || !visible ? 0 : BdwCursorImageKey(pixels,width,height,stride);
     // Fetch a transparent image on screen to ensure the surface can latch.
     if(!key)x=y=0;
     const uint32_t slot=cursorImages.select(key,probe || activating);
@@ -1792,7 +1795,7 @@ void BdwCursorUpdate(uint64_t leaseOwner,bool visible,int32_t x,int32_t y,
         for(uint32_t row=0;row<64;++row){
             auto* dest=reinterpret_cast<uint32_t*>(image.pixels[row/16].cpu)+(row%16)*64;
             for(uint32_t col=0;col<64;++col){
-                const uint32_t argb=key && row<height && col<width ? pixels[row*64+col] : 0;
+                const uint32_t argb=key && row<height && col<width ? pixels[row*stride+col] : 0;
                 const uint32_t a=argb>>24;
                 auto scale=[&](unsigned shift){return (((argb>>shift)&255u)*a+127)/255;};
                 dest[col]=(a<<24)|(scale(16)<<16)|(scale(8)<<8)|scale(0);
@@ -1830,7 +1833,7 @@ BdwCursorStatus BdwCursorReadStatus(){return {};}
 uint64_t BdwCursorRendererQuery(uint64_t,bool,bool& suppress){suppress=false;return 0;}
 void BdwCursorRendererPresented(uint64_t,uint64_t){}
 bool BdwCursorBlocksSoftware(){return false;}
-void BdwCursorUpdate(uint64_t,bool,int32_t,int32_t,const uint32_t*,uint32_t,uint32_t){}
+void BdwCursorUpdate(uint64_t,bool,int32_t,int32_t,const uint32_t*,uint32_t,uint32_t,uint32_t){}
 #endif
 
 

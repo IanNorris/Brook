@@ -129,7 +129,8 @@ static int g_presentFrame,g_asyncPresent,g_dependentPartial;
  * otherwise the pointer stays in every per-frame overlay capture. */
 static struct DesktopOverlayFrameState g_overlayDisplayed;static uint64_t g_overlayDisplayedTicket;
 static int g_overlayTracked=-1;
-static struct BrookDesktopOverlayCursor g_cursorInfo;
+static struct BrookDesktopOverlayCursorLarge g_cursorInfo;
+static struct BrookDesktopOverlayCursor g_cursorLegacy;
 static long g_presentingTicket;
 /* Change tracking: the state of the frame on screen (valid=0: unknown),
  * the last successful present, and the idle poll / lease keepalive policy.
@@ -809,25 +810,34 @@ static int overlay_capture_deferred(int drm,struct RenderContext *ctx,uint32_t w
     }
     return 0;
 }
-/* Pointer layer state; refreshes the context's 64x64 image on a new serial. */
+/* Pointer layer state; prefer the wide record, with a fallback for older kernels. */
 static int overlay_cursor(int drm,struct RenderContext *ctx,struct DesktopOverlayCursorState *state,uint64_t *epoch){
     *epoch=0;
     *state=(struct DesktopOverlayCursorState){0};
     if(g_overlayTracked!=1)return 0;
     const uint64_t known=ctx->cursor.handle?ctx->cursorSerial:0;
     long result=syscall(BROOK_SYS_DESKTOP_OVERLAY,BROOK_DESKTOP_OVERLAY_CURSOR,0,&g_cursorInfo,sizeof(g_cursorInfo),known,BROOK_DESKTOP_CURSOR_PLANE_V3);
-    if(result<0 && errno==EINVAL)
-        result=syscall(BROOK_SYS_DESKTOP_OVERLAY,BROOK_DESKTOP_OVERLAY_CURSOR,0,&g_cursorInfo,sizeof(g_cursorInfo),known,0);
+    const uint32_t *pixels=g_cursorInfo.pixels;
+    uint32_t limit=BROOK_DESKTOP_CURSOR_LARGE_MAX;
+    if(result<0 && errno==EINVAL){
+        result=syscall(BROOK_SYS_DESKTOP_OVERLAY,BROOK_DESKTOP_OVERLAY_CURSOR,0,&g_cursorLegacy,sizeof(g_cursorLegacy),known,BROOK_DESKTOP_CURSOR_PLANE_V3);
+        if(result<0 && errno==EINVAL)
+            result=syscall(BROOK_SYS_DESKTOP_OVERLAY,BROOK_DESKTOP_OVERLAY_CURSOR,0,&g_cursorLegacy,sizeof(g_cursorLegacy),known,0);
+        g_cursorInfo.visible=g_cursorLegacy.visible;g_cursorInfo.width=g_cursorLegacy.width;
+        g_cursorInfo.height=g_cursorLegacy.height;g_cursorInfo.stride=g_cursorLegacy.stride;
+        g_cursorInfo.x=g_cursorLegacy.x;g_cursorInfo.y=g_cursorLegacy.y;g_cursorInfo.serial=g_cursorLegacy.serial;
+        pixels=g_cursorLegacy.pixels;limit=BROOK_DESKTOP_CURSOR_MAX;
+    }
     if(result<0)return -1;
     *epoch=(uint64_t)result;
-    const struct BrookDesktopOverlayCursor *c=&g_cursorInfo;
-    if(!c->visible || !c->width || !c->height || c->width>BROOK_DESKTOP_CURSOR_MAX ||
-       c->height>BROOK_DESKTOP_CURSOR_MAX || c->stride!=BROOK_DESKTOP_CURSOR_MAX)return 0;
+    const struct BrookDesktopOverlayCursorLarge *c=&g_cursorInfo;
+    if(!c->visible || !c->width || !c->height || c->width>limit || c->height>limit || c->stride!=limit)return 0;
     if(!ctx->cursor.handle || c->serial!=known){
-        if(source_ensure(drm,sizeof(c->pixels),&ctx->cursor))return -1;
-        memcpy(ctx->cursor.map,c->pixels,sizeof(c->pixels));ctx->cursorSerial=c->serial;
+        const size_t bytes=(size_t)c->stride*c->height*sizeof(*pixels);
+        if(source_ensure(drm,bytes,&ctx->cursor))return -1;
+        memcpy(ctx->cursor.map,pixels,bytes);ctx->cursorSerial=c->serial;
     }
-    *state=(struct DesktopOverlayCursorState){1,c->width,c->height,c->x,c->y,c->serial};
+    *state=(struct DesktopOverlayCursorState){1,c->width,c->height,c->x,c->y,c->serial,c->stride};
     return 0;
 }
 static void cursor_presented(uint64_t epoch){
@@ -1380,7 +1390,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
         if(push(scene,&count,sources,&overlay[i],&layer))goto done;
     }
     if(frameOverlay.cursor.visible){const struct DesktopOverlayCursorState *c=&frameOverlay.cursor;
-        struct BrookVkSceneLayer layer={0,BROOK_DESKTOP_CURSOR_MAX,c->width,c->height,0,0,c->width,c->height,
+        struct BrookVkSceneLayer layer={0,c->stride,c->width,c->height,0,0,c->width,c->height,
             c->x,c->y,c->width,c->height,0,0,width,height,255|BROOK_VK_STRAIGHT_ALPHA};
         if(push(scene,&count,sources,&ctx->cursor,&layer))goto done;
     }
