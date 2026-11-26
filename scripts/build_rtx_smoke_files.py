@@ -79,7 +79,7 @@ ETC_ALLOWED = {*MARKERS, 'i219-attach', 'i219-reset', 'hardware-payload-id', 're
                # --session desktop only
                'live-store', 'usb-system', 'usb-profile-plan.pub', 'usb-system-trim', 'usb-bot-legacy', 'usb-bot-pipeline', 'usb-uas', 'usb-uas-fixture', 'volatile-desktop', 'hardware-bulk', 'usb-audio-mixer', 'dp-idle-seconds', 'nv-display', 'chromium-alsa-device',
                # --nv-gsp (GSP-RM M1 bridge verbs) and its firmware record
-               'nv-gsp', 'nv-gsp-firmware', 'nv-gsp-no-autostart', 'nv-drm', 'nv-gsp-registry', 'nv-gsp-no-scrubber'}
+               'nv-gsp', 'nv-gsp-firmware', 'nv-gsp-no-autostart', 'nv-drm', 'nv-gsp-registry', 'nv-gsp-no-scrubber', 'usb-system-no-mount'}
 # Desktop live stick (--session desktop): the VMware RC session over the RAM
 # store, plus the RTX status helper. If the store does not mount, the services
 # fail to start and the kernel console, bridge and remote update stay usable.
@@ -344,6 +344,8 @@ def desktop_payload(args, initrd):
                 fat_write(initrd, 'ETC/usb-uas-fixture', b'1\n')
         if args.usb_bot != 'default':
             fat_write(initrd, 'ETC/usb-bot-' + args.usb_bot, b'1\n')
+        if args.usb_system_no_mount:  # GSP bisect boots: never touch BROOK_SYSTEM (no /nix, no desktop)
+            fat_write(initrd, 'ETC/usb-system-no-mount', b'1\n')
         if args.usb_system_trim:
             fat_write(initrd, 'ETC/usb-system-trim', (args.usb_system_trim + '\n').encode())
     else:
@@ -602,6 +604,9 @@ def main():
                    help="scan clean ext2 free extents before mount; send UNMAP only with 'run'")
     p.add_argument('--nv-gsp', action='store_true',
                    help='desktop image: BROOK_NV_GSP kernel and /etc/nv-gsp (GSP-RM verbs; boots GSP-RM + CE present at desktop start unless --nv-gsp-no-autostart)')
+    p.add_argument('--usb-system-no-mount', action='store_true',
+                   help='with --usb-system: identify the SSD but never mount BROOK_SYSTEM (bisect boots: a forced '
+                        'hang cannot dirty the store; boot updates still allowed; desktop and lastlog stay off)')
     p.add_argument('--nv-gsp-no-scrubber', action='store_true', help='with --nv-gsp: skip the TU10x GR scrubber channel (A/B)')
     p.add_argument('--nv-gsp-registry', action='append', default=[], metavar='KEY=VALUE',
                    help='with --nv-gsp: extra GSP-RM registry DWORD (repeatable), e.g. RMElpg=0')

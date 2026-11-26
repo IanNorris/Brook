@@ -373,6 +373,15 @@ bool UsbSystemBoot(uint8_t* nextDrive,bool scanComplete) {
     disk=parent;
     bootWindow={bootFirst*512,bootSectors*512};
     systemWindow={record.first*512,record.sectors*512};
+    // GSP bisect boots (/etc/usb-system-no-mount, builder --usb-system-no-mount): stop after the
+    // boot-volume identity (boot updates stay allowed: disk + bootWindow are set) and before any
+    // BROOK_SYSTEM access, so a forced hang and power cycle cannot leave the ext2 store dirty.
+    if(auto* nm=VfsOpen("/etc/usb-system-no-mount",VFS_O_STREAM)){
+        VfsRelease(nm);boot.stage="not-mounted-by-request";boot.error=0;
+        SerialPrintf("USB_SYSTEM_MAINTENANCE stage=not-mounted-by-request error=0\n");
+        KPrintf("usb-system: /nix not mounted by request (/etc/usb-system-no-mount); desktop stopped, boot updates allowed\n");
+        return false;
+    }
     uint8_t sb[1024];
     LargeExt2Geometry geometry{};
     if(!ReadExact(disk,systemWindow.start+1024,sb,sizeof(sb)))return Fail("ext2-read",-5);
