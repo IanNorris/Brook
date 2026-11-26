@@ -20,6 +20,10 @@ struct RmEvents {
 };
 
 constexpr uint32_t kRmApiBuf = 0x2000;
+// Runtime events that arrive while an RPC waits (or in the live drainer): the live code hooks
+// them to run RUN_CPU_SEQUENCER and to log everything (26 Nov: events inside RPC waits were
+// only counted). Called with the RPC channel lock (nv-aux) held.
+inline void (*g_rmEventHook)(const uint8_t* m, uint32_t len) = nullptr;
 
 template <class Waiter, class Doorbell>
 struct RmApi {
@@ -38,6 +42,7 @@ struct RmApi {
 
     bool OnEvent(const uint8_t* m, uint32_t len) {
         ++ev.total;
+        if (g_rmEventHook) g_rmEventHook(m, len);
         const uint32_t fn = Get32(m + offsetof(rm570::rpc_message_header_v, function));
         const uint8_t* p = m + kRpcHdr;
         const uint32_t n = len > kRpcHdr ? len - kRpcHdr : 0;

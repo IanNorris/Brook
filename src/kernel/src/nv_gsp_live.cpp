@@ -159,6 +159,7 @@ volatile uint32_t g_busy = 0;
 struct LiveEvents { uint32_t total = 0, rc = 0, mmu = 0, os_error = 0, libos = 0, other = 0, drains = 0;
                     uint32_t pstate = 0, pstate_changes = 0, pstate_polls = 0, pstate_errors = 0; uint64_t last_ms = 0; };
 LiveEvents g_liveEv;
+uint32_t g_evPendLost = 0, g_seqRuns = 0, g_seqFails = 0;   // runtime event hook counters
 extern const nvdrm::Backend g_nvdBackend;   // M5 live backend (below)
 void NvdMarkDead(uint32_t chid);
 bool g_ceActiveFlag = false;   // mirrors g_cePresentState.active for Status (declared later)
@@ -476,7 +477,7 @@ void Status() {
     o.ks("autostart", g_autostart.status); o.kb("rm_running", g_rmRunning); o.kb("ce_present", g_ceActiveFlag);
     o.k("rm_events"); o.raw("{"); o.kd("total", g_liveEv.total); o.kd("rc", g_liveEv.rc); o.kd("mmu", g_liveEv.mmu);
     o.kd("os_error", g_liveEv.os_error); o.kd("libos", g_liveEv.libos); o.kd("other", g_liveEv.other); o.kd("drains", g_liveEv.drains);
-    o.kd("last_ms", g_liveEv.last_ms); o.kh("pstate", g_liveEv.pstate); o.kd("pstate_polls", g_liveEv.pstate_polls);
+    o.kd("last_ms", g_liveEv.last_ms); o.kd("seq_runs", g_seqRuns); o.kd("seq_fails", g_seqFails); o.kd("lost", g_evPendLost); o.kh("pstate", g_liveEv.pstate); o.kd("pstate_polls", g_liveEv.pstate_polls);
     o.kd("pstate_changes", g_liveEv.pstate_changes); o.kd("pstate_errors", g_liveEv.pstate_errors); o.raw("}");
     if (FindGpu(f.g)) {
         g_bus.bar0 = f.g.bar0;
@@ -1173,6 +1174,26 @@ namespace {
 // /etc/nv-gsp-pstate-poll, GET_CURRENT_PSTATE every 5 s on RM's internal subdevice, logged on
 // change (off by default until it is shown safe on its own).
 struct NoWait { bool operator()() { return false; } };
+// Events captured under the nv-aux lock (RPC waits and the drainer), logged by the drainer later.
+constexpr uint32_t kEvPend = 16, kEvPendBytes = 1536;   // NOCAT records are 1244 B
+alignas(8) uint8_t g_evPend[kEvPend][kEvPendBytes];
+uint32_t g_evPendLen[kEvPend], g_evPendN = 0;
+void RuntimeEvent(const uint8_t* m, uint32_t len) {   // nv-aux lock held
+    const uint32_t fn = Get32(m + offsetof(rm570::rpc_message_header_v, function));
+    if (fn == rm570::NV_VGPU_MSG_EVENT_GSP_RUN_CPU_SEQUENCER && g_rm && len > kRpcHdr) {
+        // GSP-RM asks the CPU to run a register sequence (nouveau r535_gsp_msg_run_cpu_sequencer)
+        const ChipOps* c = ChipForBoot0(g_bus.rd32(0));
+        if (c) {
+            SeqBus<Bar0Bus> sb{g_bus, GspCoreOps<Bar0Bus>{g_bus, *c, g_rm->objs.libos.bus, g_rm->objs.app_version}};
+            const SeqResult r = RunSequencer(sb, m + kRpcHdr, len - kRpcHdr);
+            ++g_seqRuns; if (r.status != SeqStatus::Ok) ++g_seqFails;
+        }
+    }
+    if (fn == rm570::NV_VGPU_MSG_EVENT_UCODE_LIBOS_PRINT) { ++g_liveEv.libos; return; }
+    if (g_evPendN >= kEvPend) { ++g_evPendLost; return; }
+    const uint32_t keep = len < kEvPendBytes ? len : kEvPendBytes;
+    __builtin_memcpy(g_evPend[g_evPendN], m, keep); g_evPendLen[g_evPendN] = keep; ++g_evPendN;
+}
 void LogEvent(const uint8_t* m, uint32_t len) {
     namespace rm = rm570;
     const uint32_t fn = Get32(m + offsetof(rm::rpc_message_header_v, function));
@@ -1240,13 +1261,15 @@ void EventThread(void*) {
             NoWait nw;
             // copy events out under the lock (bounded), log them after releasing it: serial
             // KPrintf of long records under the spinlock stalled the system ~1 s (26 Nov)
-            for (int i = 0; i < 16 && g_rm->ch->MsgPending() && npend < kPend; ++i) {
+            for (int i = 0; i < 16 && g_rm->ch->MsgPending(); ++i) {
                 uint32_t len = 0;
                 if (g_rm->ch->Recv(buf, sizeof(buf), &len, 0, nw) != QStatus::Ok) break;
-                const uint32_t keep = len < kPendBytes ? len : kPendBytes;
-                __builtin_memcpy(pend[npend], buf, keep); pend_len[npend] = keep; ++npend;
+                RuntimeEvent(buf, len);
                 FlushRange(g_rm->objs.q.msgq(), kQueueBytes);
             }
+            npend = g_evPendN < kPend ? g_evPendN : kPend;
+            for (uint32_t i = 0; i < npend; ++i) { __builtin_memcpy(pend[i], g_evPend[i], g_evPendLen[i]); pend_len[i] = g_evPendLen[i]; }
+            g_evPendN = 0;
             ++g_liveEv.drains;
             if (ticks % 10 == 0 && g_staticValid && PathExists("/etc/nv-gsp-pstate-poll")) {
                 const ChipOps* c = ChipForBoot0(g_bus.rd32(0));
@@ -1310,6 +1333,7 @@ void AutostartRun(bool display) {
     g_outQuiet = false;
     __atomic_store_n(&g_busy, 0u, __ATOMIC_RELEASE);
     if (g_rmRunning) {
+        g_rmEventHook = RuntimeEvent;
         EventThreadStart();
         // M5.1: publish the device for renderD130 (Mesa NVK). Classes: what nouveau lists for a
         // TU104 channel (3D, compute, copy, 2D, inline-to-memory). GPC/TPC: RTX 2080 (6 / 46);
