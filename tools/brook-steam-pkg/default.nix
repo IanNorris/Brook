@@ -47,6 +47,26 @@ let
       license = lib.licenses.unfree;
     };
   };
+  # Profile transfers carry each store path in one bounded bundle (under
+  # 960 MiB), and the whole client is about 1.3 GB. Ship steamrt64 as its own
+  # path; the seed links it and lists it in .brook-seed-layers, so the first
+  # launch copies it as a real directory (brook_steam_seed.py).
+  clientRuntime = pkgs.runCommand "brook-steam-client-steamrt64-${source.version}" { disallowedReferences = [ client ]; } ''
+    cp -a ${client}/share/brook/steam-client/steamrt64 "$out"
+  '';
+  seed = pkgs.runCommand "brook-steam-client-seed-${source.version}" {
+    disallowedReferences = [ client ];
+  } ''
+    mkdir -p "$out/share/brook"
+    cp -a ${client}/share/brook/steam-client-source.json "$out/share/brook/"
+    mkdir "$out/share/brook/steam-client"
+    for entry in ${client}/share/brook/steam-client/* ${client}/share/brook/steam-client/.[!.]*; do
+      [ -e "$entry" ] || [ -L "$entry" ] || continue
+      [ "''${entry##*/}" = steamrt64 ] || cp -a "$entry" "$out/share/brook/steam-client/"
+    done
+    ln -s ${clientRuntime} "$out/share/brook/steam-client/steamrt64"
+    echo steamrt64 > "$out/share/brook/steam-client/.brook-seed-layers"
+  '';
   launcher = pkgs.runCommand "brook-steam-launcher-${source.version}" {} ''
     mkdir -p "$out/bin" "$out/libexec"
     install -m644 ${../../scripts/workloads/brook_steam_launcher.py} "$out/libexec/brook-steam.py"
@@ -56,7 +76,7 @@ let
     cat > "$out/bin/brook-steam" <<EOF
     #!${pkgs.bash}/bin/bash
     umask 077
-    export BROOK_STEAM_PACKAGED_SEED=${client}/share/brook/steam-client
+    export BROOK_STEAM_PACKAGED_SEED=${seed}/share/brook/steam-client
     export BROOK_STEAM_PACKAGED_VERSION=${source.version}
     export BROOK_STEAM_PROVIDER=${provider}
     export BROOK_STEAM_PULSEAUDIO=${pkgs.pulseaudio}/bin/pulseaudio
@@ -66,7 +86,7 @@ let
     chmod 755 "$out/bin/brook-steam"
   '';
 in {
-  inherit client provider launcher;
+  inherit client clientRuntime seed provider launcher;
   inherit (source) version;
   packages = [ launcher runtime.mesaRuntime pkgs.libglvnd ];
 }

@@ -8,10 +8,32 @@ import tempfile
 from bootstrap import publish
 
 
-def copy_tree(source, target):
+# A seed may be split across store paths so that each one fits a bounded
+# transfer. The file lists top-level entries that are symlinks to the other
+# parts; they are copied as real directories, never kept as store links.
+LAYERS = ".brook-seed-layers"
+
+
+def seed_layers(seed):
+    path = seed / LAYERS
+    if not path.is_file():
+        return set()
+    names = set(path.read_text().split())
+    for name in names:
+        if "/" in name or name in (".", "..") or not (seed / name).is_symlink() or not (seed / name).is_dir():
+            raise ValueError(f"Invalid Steam client seed layer: {name}")
+    return names
+
+
+def copy_tree(source, target, layers=frozenset()):
     target.mkdir(mode=0o700)
     for entry in source.iterdir():
         target_entry = target / entry.name
+        if entry.name in layers:
+            copy_tree(entry.resolve(), target_entry)
+            continue
+        if layers and entry.name == LAYERS:
+            continue
         mode = entry.lstat().st_mode
         if stat.S_ISLNK(mode):
             target_entry.symlink_to(os.readlink(entry))
@@ -39,14 +61,17 @@ def ensure_client(seed, install, version):
         raise ValueError("The packaged Steam client seed is incomplete")
     # SteamRT provisions a mutable runtime. Keep its space separate from this
     # private copy of the read-only, versioned profile payload.
-    seed_bytes = sum(path.stat().st_size for path in seed.rglob("*")
+    layers = seed_layers(seed)
+    seed_bytes = sum(path.stat().st_size
+                     for root in (seed, *(seed / name for name in sorted(layers)))
+                     for path in root.resolve().rglob("*")
                      if not path.is_symlink() and path.is_file())
     space = os.statvfs(install)
     if seed_bytes + 1024 ** 3 > space.f_bavail * space.f_frsize:
         raise ValueError("Steam requires enough home space for the pinned client plus 1 GiB of runtime workspace")
     with tempfile.TemporaryDirectory(prefix=".client-", dir=install) as directory:
         candidate = Path(directory) / "complete"
-        copy_tree(seed, candidate)
+        copy_tree(seed, candidate, layers)
         (candidate / ".brook-seed-version").write_text(version + "\n")
         try:
             publish(candidate, client)

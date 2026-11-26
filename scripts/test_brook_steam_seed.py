@@ -51,6 +51,22 @@ class SteamSeedTest(unittest.TestCase):
         self.assertEqual(login.read_bytes(), b"user login fixture")
         self.assertEqual((other / "legacy").read_text(), "previous user's installation")
 
+    def test_split_seed_layers_are_copied(self):
+        runtime = self.home / "runtime-part"
+        (self.source / "steamrt64").rename(runtime)
+        (self.source / "steamrt64").symlink_to(runtime)
+        (self.source / ".brook-seed-layers").write_text("steamrt64\n")
+        self.assertEqual(seed.ensure_client(self.source, self.install, "1"), "1")
+        self.assertFalse((self.client / "steamrt64").is_symlink())
+        self.assertEqual((self.client / "steamrt64/steam").read_bytes(), b"seed executable")
+        self.assertFalse((self.client / ".brook-seed-layers").exists())
+        self.assertEqual(os.readlink(self.client / "outer"), "steamrt64")
+
+    def test_seed_layer_must_be_a_linked_directory(self):
+        (self.source / ".brook-seed-layers").write_text("public\n")
+        with self.assertRaisesRegex(ValueError, "seed layer"):
+            seed.ensure_client(self.source, self.install, "1")
+
     def test_copy_failure_leaves_no_partial_client(self):
         with patch.object(seed.shutil, "copyfile", side_effect=OSError("write failed")):
             with self.assertRaisesRegex(OSError, "write failed"):
