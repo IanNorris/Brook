@@ -1525,7 +1525,7 @@ constexpr uint64_t kRingVa = 0x0000009000000000ull;     // per channel: gpfifo, 
 constexpr uint64_t kHeapLo = 0x140000000ull;            // above CE (0x108..) and GR (0x110..0x130) arenas
 struct Vas { bool used = false; GrScope s; };
 struct Chan {
-    bool used = false; uint32_t vas = 0, chid = 0, gp = 0, token = 0;
+    bool used = false, scheduled = false; uint32_t vas = 0, chid = 0, gp = 0, token = 0;
     GrScope s; M2Sys gpfifo, kpush, sem, mthdbuf; uint64_t va = 0;
 };
 Vas g_vas[kMaxVas];
@@ -1673,22 +1673,15 @@ bool NvdChanCreate(void*, uint32_t vas, uint32_t engine, uint32_t* out) {
                (nvd::g_minObjects ||
                 (x.alloc(s, s.h_chan, s.h_chan + 3, 0x902d, nullptr, 0, "RM_ALLOC FERMI_TWOD_A") &&
                  x.alloc(s, s.h_chan, s.h_chan + 4, 0xa140, nullptr, 0, "RM_ALLOC KEPLER_INLINE_TO_MEMORY_B")));
-        if (good) {
-            rm::NVA06F_CTRL_BIND_PARAMS bp = {rm::gr::RM_ENGINE_TYPE_GR0};
-            rm::NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS sp = {1, 0};
-            rm::NVC36F_CTRL_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS tk = {};
-            good = x.api.Control(s.base, s.h_chan, rm::NVA06F_CTRL_CMD_BIND, &bp, sizeof(bp)) ? true : x.fail("BIND");
-            good = good && (x.api.Control(s.base, s.h_chan, rm::NVA06F_CTRL_CMD_GPFIFO_SCHEDULE, &sp, sizeof(sp)) ? true : x.fail("GPFIFO_SCHEDULE"));
-            good = good && (x.api.Control(s.base, s.h_chan, rm::NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN, &tk, sizeof(tk)) ? true : x.fail("token"));
-            ch.token = tk.workSubmitToken;
-        }
+        // BIND + GPFIFO_SCHEDULE + token wait for the first EXEC (NvdSchedule): a scheduled GR
+        // channel left idle ~1 s preceded the RM asserts / Xid 62 seen on 26 Nov.
         (void)vio; (void)c; (void)h::kDoorbell;
         if (!good) x.Close(s);
         return good;
     });
     if (!ok) return false;
     ch.used = true; *out = i;
-    KPrintf("nv-drm: channel %u (chid %u, token %x) in VAS %u\n", i, chid, ch.token, vas);
+    KPrintf("nv-drm: channel %u (chid %u) in VAS %u, not scheduled until its first EXEC\n", i, chid, vas);
     return true;
 }
 void NvdChanDestroy(void*, uint32_t chan) {
@@ -1698,10 +1691,27 @@ void NvdChanDestroy(void*, uint32_t chan) {
         KPrintf("nv-drm: channel %u freed %u\n", chan, n); return true; });
     nvd::g_chan[chan].used = false;   // its sysmem pages are RM-lifetime regions (freed at RM unload)
 }
+bool NvdSchedule(nvd::Chan& ch) {
+    namespace rm = rm570;
+    GrScope& s = ch.s;
+    const bool ok = NvdWithRm("channel schedule", [&](auto& x, auto&, const ChipOps&) {
+        rm::NVA06F_CTRL_BIND_PARAMS bp = {rm::gr::RM_ENGINE_TYPE_GR0};
+        rm::NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS sp = {1, 0};
+        rm::NVC36F_CTRL_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS tk = {};
+        if (!x.api.Control(s.base, s.h_chan, rm::NVA06F_CTRL_CMD_BIND, &bp, sizeof(bp))) return x.fail("BIND");
+        if (!x.api.Control(s.base, s.h_chan, rm::NVA06F_CTRL_CMD_GPFIFO_SCHEDULE, &sp, sizeof(sp))) return x.fail("GPFIFO_SCHEDULE");
+        if (!x.api.Control(s.base, s.h_chan, rm::NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN, &tk, sizeof(tk))) return x.fail("token");
+        ch.token = tk.workSubmitToken;
+        return true;
+    });
+    if (ok) { ch.scheduled = true; KPrintf("nv-drm: channel chid %u scheduled (token %x)\n", ch.chid, ch.token); }
+    return ok;
+}
 bool NvdChanSubmit(void*, uint32_t chan, const uint64_t* va, const uint32_t* dw, const uint8_t* np, uint32_t n, uint32_t seq) {
     namespace h = rm570::host;
     if (chan >= nvd::kMaxChans || !nvd::g_chan[chan].used) return false;
     nvd::Chan& ch = nvd::g_chan[chan];
+    if (!ch.scheduled && !NvdSchedule(ch)) { nvd::g_dead[ch.chid] = true; return false; }   // chan_error then fails the job
     const ChipOps* c = ChipForBoot0(g_bus.rd32(0));
     if (!c || !g_rmRunning) return false;
     SpinLock* lock = NvAuxSharedLock();
