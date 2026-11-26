@@ -38,11 +38,11 @@ static void PollSyncFile() {
     // With prompt wakes off, the real wait registry falls back to every tick.
     CHECK(g_blockTick==brook::ApicTickCount()+1);
     // A fence that retires before the wait arms is rechecked, not slept on.
-    brook::BdwFenceComplete(fence.intelFence,true);
+    brook::BdwFenceComplete(fence.fence,true);
     g_blockTick=0;brook::g_pendingSignals=false;
     CHECK(brook::PollWait(fds,1,1000)==1 && fds[0].revents==brook::POLLIN);
     CHECK(g_blockTick==0);
-    brook::BdwFenceUnref(fence.intelFence);
+    brook::BdwFenceUnref(fence.fence);
     // The wait helper: a retirement between snapshot and arm means "recheck".
     brook::BdwPromptWakeSet(true);
     brook::SyncFileData pending{1,0,2,brook::BdwFenceCreate(false)};
@@ -55,7 +55,7 @@ static void PollSyncFile() {
         brook::SyncFileWait wait;
         CHECK(!wait.Arm() && wait.SafetyMs(50)==50); // nothing pending: unchanged
     }
-    brook::BdwFenceUnref(pending.intelFence);
+    brook::BdwFenceUnref(pending.fence);
     brook::BdwPromptWakeSet(false);
 }
 
@@ -89,7 +89,7 @@ static void PollArmedSyncFile() {
     g_wakeHook = nullptr;
     g_blockInterruptibleHook = nullptr;
     brook::BdwPromptWakeSet(false);
-    brook::BdwFenceUnref(file.intelFence);
+    brook::BdwFenceUnref(file.fence);
     brook::BdwFenceUnref(producer);
 }
 

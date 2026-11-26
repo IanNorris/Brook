@@ -501,7 +501,7 @@ static void TestSyncFileWake() {
     CHECK(g_fenceWakes == 1);
     BdwPromptWakeSet(false);
     TestClose(ep); TestClose(nested); TestClose(fd);
-    BdwFenceUnref(file.intelFence);
+    BdwFenceUnref(file.fence);
     BdwFenceUnref(producer);
 }
 

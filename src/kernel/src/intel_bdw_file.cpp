@@ -4,6 +4,7 @@
 #include "memory/heap.h"
 #include "sync/kmutex.h"
 #include "intel_bdw_fence.h"
+#include "gpu_sync.h"
 #if defined(BROOK_HOST_TEST) && !defined(BROOK_STANDALONE_TEST)
 #include <new>
 #else
@@ -28,8 +29,7 @@ struct BdwGpuFile {
     struct ContextSlot {BdwGpuContext* context;uint32_t id;} contexts[BdwMaxContexts];
     uint32_t nextContextId;
     BdwGpuContext* defaultContext;
-    struct SyncSlot {BdwGpuSync* sync;uint32_t id;} syncs[BdwMaxSyncObjects];
-    uint32_t nextSyncId;
+    GpuSyncTable<BdwMaxSyncObjects> syncs;
 };
 struct BdwFileGuard {KMutex* mutex;explicit BdwFileGuard(KMutex* m):mutex(m){KMutexLock(m);}
     ~BdwFileGuard(){KMutexUnlock(mutex);}};
@@ -37,39 +37,29 @@ BdwGpuFile* BdwGpuFileCreate(){
     auto* f=static_cast<BdwGpuFile*>(kmalloc(sizeof(BdwGpuFile)));if(!f)return nullptr;
     f->references=1;KMutexInit(&f->lock);for(auto& s:f->slots)s={};
     for(auto& c:f->contexts)c={};f->nextContextId=1;f->defaultContext=nullptr;
-    for(auto& s:f->syncs)s={};f->nextSyncId=1;return f;
+    f->syncs.Init();return f;
 }
-void BdwGpuSyncRef(BdwGpuSync* s){if(s)__atomic_fetch_add(&s->references,1,__ATOMIC_RELAXED);}
-void BdwGpuSyncUnref(BdwGpuSync* s){
+// The sync object itself is GPU-neutral (gpu_sync.h); the i915 file keeps its Bdw* API.
+GpuSync* GpuSyncCreate(bool signaled){
+    void* memory=kmalloc(sizeof(BdwGpuSync));if(!memory)return nullptr;
+    auto* s=new(memory) BdwGpuSync{};s->references=1;
+    if(!s->timeline.Init()){s->~BdwGpuSync();kfree(s);return nullptr;}
+    if(signaled){auto* fence=BdwFenceCreate(true);if(!fence){GpuSyncUnref(s);return nullptr;}
+        s->timeline.Replace(fence);BdwFenceUnref(fence);}
+    return s;
+}
+void GpuSyncRef(GpuSync* s){if(s)__atomic_fetch_add(&s->references,1,__ATOMIC_RELAXED);}
+void GpuSyncUnref(GpuSync* s){
     if(s && __atomic_fetch_sub(&s->references,1,__ATOMIC_ACQ_REL)==1){s->timeline.Close();s->~BdwGpuSync();kfree(s);}
 }
-uint32_t BdwGpuFileCreateSync(BdwGpuFile* f,bool signaled){
-    if(!f)return 0;void* memory=kmalloc(sizeof(BdwGpuSync));if(!memory)return 0;
-    auto* s=new(memory) BdwGpuSync{};s->references=1;
-    if(!s->timeline.Init()){s->~BdwGpuSync();kfree(s);return 0;}
-    if(signaled){auto* fence=BdwFenceCreate(true);if(!fence){BdwGpuSyncUnref(s);return 0;}
-        s->timeline.Replace(fence);BdwFenceUnref(fence);}
-    uint32_t id=0;{BdwFileGuard guard(&f->lock);if(f->nextSyncId)for(auto& slot:f->syncs)if(!slot.sync){
-        id=f->nextSyncId++;slot={s,id};break;}}
-    if(!id)BdwGpuSyncUnref(s);return id;
-}
-BdwGpuSync* BdwGpuFileGetSync(BdwGpuFile* f,uint32_t id){
-    if(!f || !id)return nullptr;BdwFileGuard guard(&f->lock);
-    for(auto& slot:f->syncs)if(slot.id==id && slot.sync){BdwGpuSyncRef(slot.sync);return slot.sync;}
-    return nullptr;
-}
-uint32_t BdwGpuFileImportSync(BdwGpuFile* f,BdwGpuSync* sync){
-    if(!f || !sync)return 0;BdwFileGuard guard(&f->lock);BdwGpuFile::SyncSlot* empty=nullptr;
-    for(auto& slot:f->syncs)if(!slot.sync){empty=&slot;break;}
-    if(!empty || !f->nextSyncId)return 0;
-    const uint32_t id=f->nextSyncId++;BdwGpuSyncRef(sync);*empty={sync,id};return id;
-}
-bool BdwGpuFileDestroySync(BdwGpuFile* f,uint32_t id){
-    if(!f || !id)return false;BdwGpuSync* s=nullptr;
-    {BdwFileGuard guard(&f->lock);for(auto& slot:f->syncs)if(slot.id==id && slot.sync){s=slot.sync;slot={};break;}}
-    if(!s)return false;BdwGpuSyncUnref(s);return true;
-}
+void BdwGpuSyncRef(BdwGpuSync* s){GpuSyncRef(s);}
+void BdwGpuSyncUnref(BdwGpuSync* s){GpuSyncUnref(s);}
+uint32_t BdwGpuFileCreateSync(BdwGpuFile* f,bool signaled){return f?f->syncs.Create(signaled):0;}
+BdwGpuSync* BdwGpuFileGetSync(BdwGpuFile* f,uint32_t id){return f?f->syncs.Get(id):nullptr;}
+uint32_t BdwGpuFileImportSync(BdwGpuFile* f,BdwGpuSync* sync){return f?f->syncs.Import(sync):0;}
+bool BdwGpuFileDestroySync(BdwGpuFile* f,uint32_t id){return f && f->syncs.Destroy(id);}
 BdwFence* BdwGpuSyncAcquire(BdwGpuSync* s){return s?s->timeline.Find(0):nullptr;}
+GpuFence* GpuSyncAcquire(GpuSync* s){return BdwGpuSyncAcquire(s);}
 // Publication can satisfy WAIT_FOR_SUBMIT waits and transfer waits.
 bool BdwGpuSyncReplace(BdwGpuSync* s,BdwFence* f){
     const bool ok=s && s->timeline.Replace(f);if(ok)BdwGpuEventSignal(BdwGpuEvent::Retire);return ok;}
@@ -78,6 +68,11 @@ bool BdwGpuSyncPublishTimeline(BdwGpuSync* s,BdwFence* fence){
     const bool ok=s && s->timeline.Publish(fence);if(ok)BdwGpuEventSignal(BdwGpuEvent::Retire);return ok;}
 BdwFence* BdwGpuSyncFindTimeline(BdwGpuSync* s,uint64_t point){return s?s->timeline.Find(point):nullptr;}
 uint64_t BdwGpuSyncQueryTimeline(BdwGpuSync* s,bool lastSubmitted){return s?s->timeline.Query(lastSubmitted):0;}
+bool GpuSyncReplace(GpuSync* s,GpuFence* f){return BdwGpuSyncReplace(s,f);}
+GpuFence* GpuSyncPrepareTimeline(GpuSync* s,uint64_t point,GpuFence* dependency){return BdwGpuSyncPrepareTimeline(s,point,dependency);}
+bool GpuSyncPublishTimeline(GpuSync* s,GpuFence* fence){return BdwGpuSyncPublishTimeline(s,fence);}
+GpuFence* GpuSyncFindTimeline(GpuSync* s,uint64_t point){return BdwGpuSyncFindTimeline(s,point);}
+uint64_t GpuSyncQueryTimeline(GpuSync* s,bool lastSubmitted){return BdwGpuSyncQueryTimeline(s,lastSubmitted);}
 void BdwGpuContextRef(BdwGpuContext* c){if(c)__atomic_fetch_add(&c->references,1,__ATOMIC_RELAXED);}
 void BdwGpuContextUnref(BdwGpuContext* c){
     if(c && __atomic_fetch_sub(&c->references,1,__ATOMIC_ACQ_REL)==1)kfree(c);
@@ -139,7 +134,7 @@ void BdwGpuFileUnref(BdwGpuFile* f){
     }
     for(auto& c:f->contexts)if(c.context)BdwGpuContextUnref(c.context);
     BdwGpuContextUnref(f->defaultContext);
-    for(auto& s:f->syncs)if(s.sync)BdwGpuSyncUnref(s.sync);
+    f->syncs.CloseAll();
     kfree(f);
 }
 uint32_t BdwGpuFileCreateBuffer(BdwGpuFile* f,uint64_t requested,uint64_t& rounded,

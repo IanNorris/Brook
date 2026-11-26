@@ -1,3 +1,4 @@
+#include "gpu_sync.h"
 #include "intel_bdw_video.h"
 #include "intel_bdw_buffer.h"
 #include "intel_bdw_bootstrap_gate.h"
@@ -219,7 +220,7 @@ int main(){
         assert(BdwFenceComplete(fence,true,321) && SyncFileReady(file,1)==1 && !SyncFileReady(file,4));
         SyncFileDescribe(file,info,detail);assert(info.status==1 && detail.status==1 && detail.timestampNs==321);
         BdwFenceUnref(fence);
-        fence=BdwFenceCreate();assert(fence && BdwFenceComplete(fence,false));file.intelFence=fence;
+        fence=BdwFenceCreate();assert(fence && BdwFenceComplete(fence,false));file.fence=fence;
         assert(SyncFileReady(file,1)==1);SyncFileDescribe(file,info,detail);
         assert(info.status==-5 && detail.status==-5);BdwFenceUnref(fence);
     }
@@ -235,6 +236,23 @@ int main(){
         assert(BdwFenceState(joined,&timestamp)==1 && timestamp==700);
         assert(BdwFenceState(joined,&timestamp)==1 && timestamp==700);
         BdwFenceUnref(joined);BdwFenceUnref(b);BdwFenceUnref(a);
+    }
+    {   // M5.0: the GPU-neutral sync layer (gpu_sync.h) a second backend uses
+        static GpuSyncTable<4> table;table.Init();
+        const uint32_t a=table.Create(false),b=table.Create(true);
+        assert(a==1 && b==2 && table.Create(false)==3 && table.Create(false)==4 && !table.Create(false));   // full
+        GpuSync* sa=table.Get(a);GpuSync* sb=table.Get(b);assert(sa && sb && !table.Get(9));
+        GpuFence* signaled=GpuSyncAcquire(sb);assert(signaled && GpuFenceState(signaled)==1);GpuFenceUnref(signaled);
+        GpuFence* work=GpuFenceCreate();assert(work && GpuSyncReplace(sa,work));
+        GpuFence* seen=GpuSyncAcquire(sa);assert(seen==work && GpuFenceState(seen)==0);
+        SyncFileData nv{1,0,77,seen,SyncFileDriver::Nouveau};SyncFileInfo info{};SyncFenceInfo detail{};
+        SyncFileDescribe(nv,info,detail);assert(!strcmp(info.name,"brook-nouveau") && !strcmp(detail.objectName,"nouveau-fence") && info.status==0);
+        assert(GpuFenceComplete(work,true) && GpuFenceState(seen)==1 && SyncFileReady(nv,1)==1);
+        SyncFileData intel{1,0,78,seen};SyncFileDescribe(intel,info,detail);assert(!strcmp(info.name,"brook-intel") && !strcmp(detail.objectName,"intel-fence"));
+        const uint32_t imported=[&]{assert(table.Destroy(4));return table.Import(sa);}();
+        assert(imported==5 && table.Destroy(a) && !table.Destroy(a));
+        GpuSync* again=table.Get(imported);assert(again==sa);GpuSyncUnref(again);
+        GpuFenceUnref(seen);GpuFenceUnref(work);GpuSyncUnref(sa);GpuSyncUnref(sb);table.CloseAll();assert(!table.Get(imported));
     }
     {
         auto* file=BdwGpuFileCreate();assert(file);const auto id=BdwGpuFileCreateSync(file,false);assert(id);

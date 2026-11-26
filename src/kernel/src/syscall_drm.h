@@ -102,6 +102,8 @@ DrmGemObj* DrmGemGet(DrmCtx* c, uint32_t bo_handle);
 constexpr uint8_t  DRM_IOCTL_TYPE        = 'd';   // 0x64
 int CreateCompletedSyncFile(Process* process);
 int CreateIntelSyncFile(Process* process,BdwFence* fence);
+// M5.0: the same for any backend; `driver` only changes the SYNC_FILE_INFO names.
+int CreateGpuSyncFile(Process* process,GpuFence* fence,SyncFileDriver driver);
 
 // Adopts the pin installed atomically by CreateCompletedSyncFile; no second
 // lookup/pin is allowed because a sibling may already have logically closed it.

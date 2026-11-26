@@ -32,7 +32,7 @@
 namespace brook {
 
 void SyncFileRef(SyncFileData* file) { __atomic_fetch_add(&file->references,1,__ATOMIC_RELAXED); }
-void SyncFileUnref(SyncFileData* file) { if(__atomic_fetch_sub(&file->references,1,__ATOMIC_ACQ_REL)==1){BdwFenceUnref(file->intelFence);kfree(file);} }
+void SyncFileUnref(SyncFileData* file) { if(__atomic_fetch_sub(&file->references,1,__ATOMIC_ACQ_REL)==1){BdwFenceUnref(file->fence);kfree(file);} }
 
 namespace {
 
@@ -434,6 +434,17 @@ int CreateCompletedSyncFile(Process* process) {
     auto* file=static_cast<SyncFileData*>(kmalloc(sizeof(SyncFileData)));
     if(!file)return -ENOMEM;
     *file={1,ClockNowNs(1),__atomic_add_fetch(&g_eventFdIdentity,1,__ATOMIC_RELAXED)};
+    FdEntry owned{};owned.type=FdType::SyncFile;owned.handle=file;owned.fdFlags=1;
+    const int fd=FdPublishNew(process,owned,0,true);
+    if(fd<0)SyncFileUnref(file);
+    return fd;
+}
+int CreateGpuSyncFile(Process* process,GpuFence* fence,SyncFileDriver driver) {
+    if(!process || !fence)return -EINVAL;
+    auto* file=static_cast<SyncFileData*>(kmalloc(sizeof(SyncFileData)));
+    if(!file)return -ENOMEM;
+    GpuFenceRef(fence);
+    *file={1,0,__atomic_add_fetch(&g_eventFdIdentity,1,__ATOMIC_RELAXED),fence,driver};
     FdEntry owned{};owned.type=FdType::SyncFile;owned.handle=file;owned.fdFlags=1;
     const int fd=FdPublishNew(process,owned,0,true);
     if(fd<0)SyncFileUnref(file);
@@ -1046,7 +1057,7 @@ int64_t IntelRenderIoctl(brook::BdwGpuFile* file,uint64_t cmd,uint64_t arg,uint6
             FdRef reference(proc,request.fd);auto* entry=reference.get();
             if(!entry || entry->type!=FdType::SyncFile || !entry->handle){brook::BdwGpuSyncUnref(sync);return -EINVAL;}
             auto* source=static_cast<SyncFileData*>(entry->handle);
-            BdwFence* fence=source->intelFence;
+            BdwFence* fence=source->fence;
             if(fence)BdwFenceRef(fence);else fence=BdwFenceCreate(true,nullptr,0,nullptr,source->timestampNs);
             if(!fence){brook::BdwGpuSyncUnref(sync);return -ENOMEM;}
             const bool ok=point?brook::BdwIntelSyncPointAdmitted(sync,point,fence):brook::BdwIntelSyncReplaceAdmitted(sync,fence);

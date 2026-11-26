@@ -20,7 +20,7 @@ struct SyncFileWait {
     BdwGpuWaiter waiter{};
     BdwWaitArm arm = BdwWaitArm::Full;
     bool wanted = false;
-    void Want(const SyncFileData& fence) { if (fence.intelFence && !SyncFileState(fence)) wanted = true; }
+    void Want(const SyncFileData& fence) { if (fence.fence && !SyncFileState(fence)) wanted = true; }
     bool Arm() {
         if (!wanted) return false;
         arm = BdwGpuEventArm(BdwGpuEvent::Retire, seen, waiter);
