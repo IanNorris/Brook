@@ -427,6 +427,8 @@ struct GrClearPlan {
     M2Sys gpfifo, push, sem, mthdbuf; // sysmem pages (mthdbuf: the channel's fault-method buffer, unused by GR)
     uint32_t width = 3840, height = 2160, repeats = 8;
     bool block_linear = false;
+    uint32_t hold_ms = 0;   // bisect: keep the channel alive this long before freeing it
+    bool no_work = false;   // bisect: create the channel, submit nothing
 };
 struct GrClearResult {
     const char* status = "ok"; const char* step = "start";
@@ -537,6 +539,11 @@ inline GrResult RunGrClear(Bus& bus, const ChipOps& c, VramIo& vram, Api& api, G
             w[n++] = h::IncHeader(0, gr3d::SET_COLOR_CLEAR_VALUE0, 4); w[n++] = GrF(rr); w[n++] = GrF(gg); w[n++] = GrF(bb); w[n++] = GrF(aa);
             m1(gr3d::CLEAR_SURFACE, gr3d::CLEAR_RGBA);
         };
+        auto hold = [&] {   // busy-wait (under the nv-aux lock): RM events show up on the frees afterwards
+            const uint64_t t0 = bus.now_us();
+            while (bus.now_us() - t0 < uint64_t(pl.hold_ms) * 1000) bus.udelay(1000);
+        };
+        if (pl.no_work) { r.stage = "idle hold"; hold(); r.stage = "done"; return; }
         r.stage = "first clear";
         w[n++] = h::IncHeader(0, 0, 1); w[n++] = rm::gr::TURING_A;                          // SET_OBJECT, subchannel 0
         w[n++] = h::IncHeader(0, gr3d::SET_COLOR_TARGET_A0, 8);
@@ -575,6 +582,7 @@ inline GrResult RunGrClear(Bus& bus, const ChipOps& c, VramIo& vram, Api& api, G
         cr.bytes = uint64_t(pitch) * pl.height;
         cr.verify_ok = check((pl.repeats & 1) ? 0xff00ff00u : 0xffff00ffu);
         if (!cr.verify_ok) { r.status = "last clear: wrong pixels"; return; }
+        if (pl.hold_ms) { r.stage = "hold after work"; hold(); }
         r.stage = "done";
     };
     GrResult r = GrUserSession(bus, c, vram, api, st, pl, sync, poll, false, &cr.token, extra, body);

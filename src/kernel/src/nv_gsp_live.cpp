@@ -1436,13 +1436,15 @@ void GrVerb(int mode) {   // 1 golden, 2 off, 0 status
                 g_grLast.rm_status, g_grLast.golden_ok ? 1 : 0, g_grLast.scrubber_ok ? 1 : 0, (unsigned long)us);
     } else if (mode == 2) {
         o.kd("freed", GrStopLive());
-    } else if (mode == 3 || mode == 5) {   // step 3: user GR channel, TURING_A clears of a 3840x2160 A8R8G8B8 target (5: block-linear)
+    } else if (mode == 3 || mode == 5 || mode == 6 || mode == 7) {   // step 3: user GR channel, TURING_A clears of a 3840x2160 A8R8G8B8 target (5: block-linear)
         if (!c || !g_rmRunning || !g_gr.up) { o.ks("refused", "needs GSP-RM and `gr golden` this boot"); o.send(); return; }
         static uint32_t runs = 0;
         if (runs >= 16) { o.ks("refused", "gr clear ran 16 times this boot"); o.send(); return; }
         ++runs;
         GrClearPlan pl;
         pl.block_linear = mode == 5;
+        if (mode == 6) pl.hold_ms = 3000;                     // gr clear hold: work, then 3 s alive
+        if (mode == 7) { pl.hold_ms = 3000; pl.no_work = true; }   // gr idle: no work, 3 s alive
         auto sys = [](M2Sys* m, uint32_t bytes) { DmaRegion d; if (!RmAlloc(bytes, &d)) return false;
             m->cpu = d.cpu; m->bus = d.bus; m->bytes = d.bytes; return true; };
         if (!sys(&pl.gpfifo, 0x1000) || !sys(&pl.push, 0x1000) || !sys(&pl.sem, 0x1000) || !sys(&pl.mthdbuf, g_gr.mthdbuf_size)) {
@@ -1461,7 +1463,8 @@ void GrVerb(int mode) {   // 1 golden, 2 off, 0 status
         pr.Restore();
         SpinLockRelease(lock);
         o.kd("run_us", NowUs() - t0);
-        o.k("clear"); o.raw("{"); o.ks("layout", pl.block_linear ? "block-linear" : "pitch"); o.ks("stage", g.stage); o.ks("status", g.status); o.kh("rm_status", g.rm_status);
+        o.k("clear"); o.raw("{"); o.ks("layout", pl.block_linear ? "block-linear" : "pitch"); o.kd("hold_ms", pl.hold_ms);
+        o.kb("no_work", pl.no_work); o.kd("events_total", g.ev.total); o.ks("stage", g.stage); o.ks("status", g.status); o.kh("rm_status", g.rm_status);
         o.kh("rt_vram", cr.rt_vram); o.kh("token", cr.token); o.kb("first_ok", cr.first_ok); o.kb("verify_ok", cr.verify_ok);
         o.kh("sample_got", cr.sample_got); o.kh("sample_want", cr.sample_want); o.kd("first_us", cr.first_us);
         o.kd("best_us", cr.best_us); o.kd("avg_us", cr.n ? cr.sum_us / cr.n : 0); o.kd("n", cr.n); o.kd("bytes", cr.bytes);
@@ -1806,6 +1809,8 @@ bool NvGspHandle(const char* command) {
     else if (!strcmp(verb, "gr clear")) GrVerb(3);
     else if (!strcmp(verb, "gr compute")) GrVerb(4);
     else if (!strcmp(verb, "gr clear bl")) GrVerb(5);
+    else if (!strcmp(verb, "gr clear hold")) GrVerb(6);
+    else if (!strcmp(verb, "gr idle")) GrVerb(7);
     else if (!strcmp(verb, "drm minobj on") || !strcmp(verb, "drm minobj off")) {
         nvd::g_minObjects = !strcmp(verb, "drm minobj on");
         DebugChannelSend(nvd::g_minObjects ? "{\"nv_gsp\":\"drm\",\"min_objects\":true}\n" : "{\"nv_gsp\":\"drm\",\"min_objects\":false}\n");
