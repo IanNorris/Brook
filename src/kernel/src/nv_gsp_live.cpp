@@ -1882,12 +1882,17 @@ template <class F> bool NvdWithRm(const char* what, F f) {
 }
 // Full MMU invalidate (all VA, all PDB, hub + GPC TLBs) after renderD130 PTE writes; BAR1 keeps
 // the HUB_ONLY form (Bar1FlushInvalidate). NV_PFB_PRI_MMU_INVALIDATE: ALL_VA 0, ALL_PDB 1, HUBTLB_ONLY 2, TRIGGER 31.
+// /etc/nv-drm-vas-invalidate (27 Nov A/B, head-0 flip timeouts under NVK): invalidate only this
+// VAS's PDB (PAGE_ALL only, as nouveau tu102_vmm_flush for non-BAR VMMs) instead of ALL_PDB.
+int g_nvdVasScopedInval = -1;
 bool NvdMmuInvalidate(const ChipOps& c, uint64_t pdb) {
+    if (g_nvdVasScopedInval < 0) g_nvdVasScopedInval = MarkerSet("/etc/nv-drm-vas-invalidate") ? 1 : 0;
+    const uint32_t type = g_nvdVasScopedInval ? 0x1u : 0x3u;
     g_bus.wr32(c.reg_fb_flush, 1);
     for (uint32_t i = 0; i < 2000 && (g_bus.rd32(c.reg_fb_flush) & 2); ++i) g_bus.udelay(1);
     g_bus.wr32(c.reg_mmu_inval_pdb_lo, uint32_t(pdb >> 8));
     g_bus.wr32(c.reg_mmu_inval_pdb_hi, 0);
-    g_bus.wr32(c.reg_mmu_inval_trigger, 0x80000000u | 0x3);
+    g_bus.wr32(c.reg_mmu_inval_trigger, 0x80000000u | type);
     for (uint32_t i = 0; i < 200000; ++i) { if (!(g_bus.rd32(c.reg_mmu_inval_trigger) & 0x80000000u)) return true; g_bus.udelay(10); }
     return false;
 }
