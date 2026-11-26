@@ -96,7 +96,7 @@ target_compile_options(test_profiler_write_all PRIVATE "-iquote${BROOK_ROOT}/src
 target_compile_options(test_guard_fat_profile PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared/inc_km")
 add_host_test(test_guard_repair_session "${BROOK_ROOT}/src/kernel/src/guard_repair_session.cpp")
 target_compile_options(test_guard_repair_session PRIVATE -DBROOK_SSD_GUARD_TRANSACTION "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared/inc_km")
-add_host_test(test_update_slots "${BROOK_ROOT}/src/bootloader/src/update_slots.cpp" "${BROOK_ROOT}/src/bootloader/src/config.cpp")
+add_host_test(test_update_slots "${BROOK_ROOT}/src/bootloader/src/update_slots.cpp" "${BROOK_ROOT}/src/bootloader/src/config.cpp" "${BROOK_ROOT}/src/bootloader/src/boot_payload.cpp")
 target_include_directories(test_update_slots PRIVATE
     "${BROOK_ROOT}/vendor/uefi-headers/Include" "${BROOK_ROOT}/vendor/uefi-headers/Include/X64"
     "${BROOK_ROOT}/src/shared/inc_km" "${BROOK_ROOT}/src/bootloader/src")
@@ -1283,7 +1283,8 @@ target_include_directories(test_debug_bridge_v3_listener PRIVATE
 target_link_libraries(test_debug_bridge_v3_listener PRIVATE bridge_v3_interop)
 
 # Boot-stick self-update core (tools/rtx_stick_update.h) and loader set choice.
-add_host_test(test_boot_compression ../test_boot_compression/main.cpp)
+add_host_test(test_boot_compression)
+target_compile_options(test_boot_compression PRIVATE -UNDEBUG)
 
 add_host_test(test_rtx_stick_update
     "${BROOK_ROOT}/src/third_party/monocypher/monocypher.c"
