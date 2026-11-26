@@ -177,6 +177,17 @@ struct LiveEvents { uint32_t total = 0, rc = 0, mmu = 0, os_error = 0, libos = 0
 LiveEvents g_liveEv;
 uint32_t g_evPendLost = 0, g_seqRuns = 0, g_seqFails = 0;   // runtime event hook counters
 bool g_swgen0Ack = false; uint32_t g_swgen0Acks = 0;   // /etc/nv-gsp-swgen0-ack
+constexpr uint32_t kNocatKeep = 8, kNocatBytes = 1280;
+uint8_t g_nocat[kNocatKeep][kNocatBytes]; uint32_t g_nocatLen[kNocatKeep], g_nocatN = 0;
+// `nv-gsp nocat K`: the K-th newest kept NOCAT record (0 = newest), payload hex.
+void NocatVerb(uint32_t k) {
+    Out o; o.raw("{\"nv_gsp\":\"nocat\""); o.kd("kept", g_nocatN < kNocatKeep ? g_nocatN : kNocatKeep); o.kd("total", g_nocatN);
+    if (k >= kNocatKeep || k >= g_nocatN) { o.ks("error", "no such record"); o.send(); return; }
+    const uint32_t slot = (g_nocatN - 1 - k) % kNocatKeep, n = g_nocatLen[slot];
+    o.kd("bytes", n); o.k("hex"); o.raw("\"");
+    for (uint32_t i = 0; i < n; ++i) { const char* hx = "0123456789abcdef"; char c2[3] = {hx[g_nocat[slot][i] >> 4], hx[g_nocat[slot][i] & 15], 0}; o.raw(c2); }
+    o.raw("\""); o.send();
+}
 extern const nvdrm::Backend g_nvdBackend;   // M5 live backend (below)
 void NvdMarkDead(uint32_t chid);
 bool g_ceActiveFlag = false;   // mirrors g_cePresentState.active for Status (declared later)
@@ -1327,6 +1338,10 @@ void LogEvent(const uint8_t* m, uint32_t len) {
                     ms, rec, u32(20), src, u32(92), u32(100), u32(96), eng, u32(172), diag);
             for (uint32_t o = 0; o < 128 && o < diag && 180 + o + 16 <= n; o += 16)
                 KPrintf("nv-gsp:   diag+%02x %08x %08x %08x %08x\n", o, u32(180 + o), u32(184 + o), u32(188 + o), u32(192 + o));
+            {   // keep the last 8 records whole for `nv-gsp nocat N` (diag is a protobuf register dump)
+                const uint32_t slot = g_nocatN++ % kNocatKeep, keep = n < kNocatBytes ? n : kNocatBytes;
+                __builtin_memcpy(g_nocat[slot], p, keep); g_nocatLen[slot] = keep;
+            }
             break;
         }
         default: ++g_liveEv.other; KPrintf("nv-gsp: RM event at %lu ms: function 0x%x (%u bytes)\n", ms, fn, len); break;
@@ -1988,6 +2003,7 @@ bool NvGspHandle(const char* command) {
         DebugChannelSend(nvd::g_minObjects ? "{\"nv_gsp\":\"drm\",\"min_objects\":true}\n" : "{\"nv_gsp\":\"drm\",\"min_objects\":false}\n");
     }
     else if (!strcmp(verb, "fault dump")) FaultDump();
+    else if (!strncmp(verb, "nocat ", 6)) { uint32_t k = 0; for (const char* q = verb + 6; *q >= '0' && *q <= '9'; ++q) k = k * 10 + uint32_t(*q - '0'); NocatVerb(k); }
     else if (!strcmp(verb, "perf status")) PerfVerb(0);
     else if (!strcmp(verb, "perf boost")) PerfVerb(1);
     else if (!strcmp(verb, "perf clear")) PerfVerb(2);
