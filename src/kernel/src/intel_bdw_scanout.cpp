@@ -1774,7 +1774,9 @@ bool BdwBcsScanoutEnabled(){return observation.bcsPresentRequested && observatio
 #if defined(BROOK_BDW_PERSISTENT_SCANOUT_MAP) || defined(BROOK_BDW_SCANOUT_FLIP)
 #define BROOK_BDW_SCANOUT_TARGETS 1
 #endif
-BdwScanoutStatus BdwExecuteBcsScanout(BdwGpuBuffer* source,uint64_t token,const CompositorPresentRegion* regions,uint32_t count){
+BdwScanoutStatus BdwExecuteBcsScanout(BdwGpuBuffer* source,uint64_t token,const CompositorPresentRegion* regions,
+                                      uint32_t count,const CapturePrivacy& privacy){
+    (void)privacy;
     __atomic_add_fetch(&copyStats.requested,1,__ATOMIC_RELAXED);
     auto stage=[](uint32_t value){__atomic_store_n(&copyStats.lastStage,value,__ATOMIC_RELAXED);};
     stage(1);
@@ -1800,12 +1802,12 @@ BdwScanoutStatus BdwExecuteBcsScanout(BdwGpuBuffer* source,uint64_t token,const 
 #if defined(BROOK_BDW_ZERO_COPY_SCANOUT)
     // Zero-copy: the source is a registered renderer image; arm DSPASURF to
     // it (or queue it) instead of copying. Runtime-gated off by default.
-    switch(BdwZeroCopyPresentSource(source,regions,count)){
+    switch(BdwZeroCopyPresentSource(source,regions,count,privacy)){
     case BdwZeroCopyOutcome::Presented:
 #if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
         ProfilerTraceGpu(pid,FrameBlitEnd,token,sourceId);
 #endif
-        stage(5);return BdwScanoutStatus::Completed;
+        stage(5);return BdwScanoutStatus::CompletedFlip;
     case BdwZeroCopyOutcome::RepairRequired:return BdwScanoutStatus::RepairRequired;
     case BdwZeroCopyOutcome::Deferred:return BdwScanoutStatus::Deferred;
     case BdwZeroCopyOutcome::Copy:break;
@@ -1827,7 +1829,7 @@ BdwScanoutStatus BdwExecuteBcsScanout(BdwGpuBuffer* source,uint64_t token,const 
                                             plan.destination,regions,count,reservation,scratch);
     }
     if(!prepared){
-        if(flip){(void)BdwScanoutTargetFinish(plan,false);return BdwScanoutStatus::RepairRequired;}
+        if(flip){(void)BdwScanoutTargetFinish(plan,false,privacy);return BdwScanoutStatus::RepairRequired;}
         return BdwScanoutStatus::Unavailable;
     }
 #else
@@ -1862,7 +1864,7 @@ BdwScanoutStatus BdwExecuteBcsScanout(BdwGpuBuffer* source,uint64_t token,const 
 #if defined(BROOK_BDW_SCANOUT_TARGETS)
     // Commit (and arm) a flip only after the copy retired; anything else
     // freezes the chain and asks the compositor for a full software repair.
-    if(flip && !BdwScanoutTargetFinish(plan,copied))return BdwScanoutStatus::RepairRequired;
+    if(flip && !BdwScanoutTargetFinish(plan,copied,privacy))return BdwScanoutStatus::RepairRequired;
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
     BdwWorkerStatsScanout(flip?BdwWorkerScanoutEvent::TargetFlip:plan.kind==BdwTargetKind::PersistentGop?
         BdwWorkerScanoutEvent::TargetPersistent:BdwWorkerScanoutEvent::TargetLegacy);
@@ -1881,6 +1883,9 @@ BdwScanoutStatus BdwExecuteBcsScanout(BdwGpuBuffer* source,uint64_t token,const 
     }
 #endif
     stage(5);
+#if defined(BROOK_BDW_SCANOUT_TARGETS)
+    if(flip)return BdwScanoutStatus::CompletedFlip;
+#endif
     return BdwScanoutStatus::Completed;
 }
 #endif

@@ -41,8 +41,10 @@ void BdwScanoutFairnessCounts(uint64_t&,uint64_t&,uint64_t&,uint64_t&);
 // Deferred: a healthy front is retained; the submitted frame was dropped.
 // RepairRequired: a kernel flip buffer may be live or the flip chain is no
 // longer trustworthy; the compositor must repaint the GOP in full.
-enum class BdwScanoutStatus : uint8_t {Completed,Unavailable,RepairRequired,Deferred};
-BdwScanoutStatus BdwExecuteBcsScanout(BdwGpuBuffer*,uint64_t token,const CompositorPresentRegion*,uint32_t count);
+enum class BdwScanoutStatus : uint8_t {Completed,CompletedFlip,Unavailable,RepairRequired,Deferred};
+struct CapturePrivacy;
+BdwScanoutStatus BdwExecuteBcsScanout(BdwGpuBuffer*,uint64_t token,const CompositorPresentRegion*,
+                                      uint32_t count,const CapturePrivacy&);
 #if defined(BROOK_BDW_PERSISTENT_SCANOUT_MAP) || defined(BROOK_BDW_SCANOUT_FLIP)
 struct BdwPpgttLeaf;struct BdwBlitRegion;struct BdwBlitBuffer;
 bool BdwPrepareBcsScanoutTarget(BdwGpuBuffer* source,uint64_t token,const BdwPpgttLeaf* leaves,uint32_t leafCount,

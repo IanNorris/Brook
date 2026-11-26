@@ -87,6 +87,9 @@ static CompositorPresentLease g_presentLease{};
 static uint64_t g_leasedFrameEpoch=0, g_leasedFrameTick=0;
 static uint64_t g_leasedFrameDisplay=0, g_leasedFrameBackdrop=0;
 static uint32_t g_leasedFrameMode=BROOK_DEBUG_FRAME_PRESENT_NONE;
+// Valid only for the renderer's pixels in the firmware framebuffer.
+// Flipped images carry their own record under the device scanout lock.
+static CapturePrivacy g_leasedFramePrivacy{};
 // A released/expired lease leaves its last complete image on screen until the
 // software flip. A failed or partial probe must not be reported as a frame.
 static bool g_scanoutContainsLeasedFrame=false, g_scanoutNeedsRepair=false;
@@ -670,6 +673,10 @@ int64_t CompositorReadDebugFrame(uint32_t token,uint64_t owner,uint64_t offset,v
     const uint64_t length=uint64_t(g_debugFrame.width)*g_debugFrame.height*4;
     if(!destination || bytes>65536 || offset>length || bytes>length-offset)return -22;
     if(bytes)memcpy(destination,reinterpret_cast<const uint8_t*>(g_debugFrame.address)+offset,bytes);
+    if (!g_debugFrameOverlay && g_debugFrameProtectionEpoch != WmCaptureProtectionEpoch()) {
+        if (bytes) memset(destination, 0, bytes);
+        return -13;
+    }
     return bytes;
 }
 
@@ -680,6 +687,11 @@ struct DebugFrameGeometry {
     uint32_t width,height,stride;
 };
 struct BdwScanoutCaptureInfoCompat {uint32_t surface,control,stride,copyUs;};
+static void ApplyFramePrivacy(uint32_t* destination,uint32_t width,uint32_t height,const CapturePrivacy& privacy)
+{
+    for (uint32_t i = 0; i < privacy.count; ++i)
+        CaptureMaskPixels(destination, width, height, width, privacy.masks[i]);
+}
 static void CaptureCompletedDebugFrame(uint64_t epoch,const DebugFrameGeometry& presented,
                                        bool softwareFrame = false, uint64_t captureScene = 0)
 {
@@ -693,8 +705,8 @@ static void CaptureCompletedDebugFrame(uint64_t epoch,const DebugFrameGeometry& 
     }
     const uint64_t protectionEpoch = WmCaptureProtectionEpoch();
     const bool protectedScene = protectionEpoch != 0;
-    static CaptureMaskRect masks[WM_MAX_WINDOWS];
-    const uint32_t maskCount = protectedScene && captureScene ? WmGetCaptureMasks(masks) : 0;
+    static CapturePrivacy softwarePrivacy;
+    softwarePrivacy.count = protectedScene && captureScene ? WmGetCaptureMasks(softwarePrivacy.masks) : 0;
     CompositorMutexGuard geometry(&g_scanoutMappingLock);
     // Reject a runtime remap since frame start rather than tagging a new,
     // unpresented buffer with this frame's epoch.
@@ -705,27 +717,29 @@ static void CaptureCompletedDebugFrame(uint64_t epoch,const DebugFrameGeometry& 
     }
     uint32_t width=presented.width,height=presented.height,stride=presented.stride;
     const bool gpuFrame = !softwareFrame && CompositorGpuActive();
-    // Hardware scanout and the leased renderer can be displaying an older
-    // scene. Without its mask metadata, never export that image.
-    if (protectedScene && (!captureScene || gpuFrame || g_scanoutContainsLeasedFrame ||
-        captureScene != __atomic_load_n(&g_captureSceneRevision, __ATOMIC_ACQUIRE))) return;
+    if (g_gopWriter || g_scanoutNeedsRepair) return;
+    // The legacy GPU interface cannot attest which scene is in its readback.
+    if (protectedScene && gpuFrame) return;
     const bool cursor=(g_debugFrameFlags&BROOK_DEBUG_FRAME_FLAG_CURSOR)!=0;
     uint32_t plane=BROOK_DEBUG_FRAME_PLANE_UNREAD,infoFlags=0;
     BdwScanoutCaptureInfoCompat planeInfo{};
 #if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
     // Read what the panel shows: zero-copy renderer images, kernel flip
     // buffers and direct client buffers replace the GOP on primary plane A.
-    if (!protectedScene && !gpuFrame && width<=4096 && height<=2160) {
+    if (!gpuFrame && width<=4096 && height<=2160) {
         if (!EnsureDebugFrameBufferLocked(uint64_t(width)*height*4)) {g_debugFrame.state=DebugFrameState::Failed;return;}
         auto* destination=reinterpret_cast<uint32_t*>(g_debugFrameBuffer.raw());
         BdwScanoutCaptureInfo live{};
-        const auto kind=BdwScanoutCaptureLive(destination,width,height,live);
+        const auto kind=BdwScanoutCaptureLive(destination,width,height,live,protectionEpoch);
         g_debugFrameCleanAddress=0; // full-image write: overlay must clear fully next time
         plane=live.plane;planeInfo={live.surface,live.control,live.stride,live.copyUs};infoFlags=live.flags;
         if (kind==BdwScanoutCaptureKind::Busy) return; // image left the panel mid-copy: next frame
         if (kind==BdwScanoutCaptureKind::Copied) {
             if (cursor && BdwScanoutCaptureCursor(destination,width,height))
                 infoFlags|=BROOK_DEBUG_FRAME_INFO_CURSOR_COMPOSITED|BROOK_DEBUG_FRAME_INFO_CURSOR_PLANE_VISIBLE;
+            if (!live.privacy.permits(protectionEpoch)) return;
+            if (protectedScene) ApplyFramePrivacy(destination, width, height, live.privacy);
+            if (WmCaptureProtectionEpoch() != protectionEpoch) return;
             g_debugFrame.width=width;g_debugFrame.height=height;g_debugFrame.stride=width;
             g_debugFrame.address=g_debugFrameBuffer.raw();g_debugFrame.tick=ApicTickCount();g_debugFrame.epoch=epoch;
             g_debugFrame.source=plane==BROOK_DEBUG_FRAME_PLANE_FLIP?BROOK_DEBUG_FRAME_SOURCE_FLIP:
@@ -734,24 +748,23 @@ static void CaptureCompletedDebugFrame(uint64_t epoch,const DebugFrameGeometry& 
             g_debugFrame.plane=plane;g_debugFrame.planeSurface=planeInfo.surface;g_debugFrame.planeControl=planeInfo.control;
             g_debugFrame.planeStride=planeInfo.stride;g_debugFrame.infoFlags=infoFlags;g_debugFrame.copyUs=planeInfo.copyUs;
             g_debugFrameDeadline=ApicTickCount()+DEBUG_FRAME_LEASE_MS;
-            if (WmCaptureProtectionEpoch()) return;
             g_debugFrameProtectionEpoch = protectionEpoch;
             g_debugFrame.state=DebugFrameState::Ready;
             return;
         }
-        // Gop (the GOP is on the panel) or Unsupported (report the plane,
-        // copy the GOP as before).
+        // An unrecognized live surface has no trusted mask provenance.
+        if (protectedScene && kind!=BdwScanoutCaptureKind::Gop) return;
     }
 #endif
-    // Wait for the software compositor to repair a partially written scanout.
-    if(g_gopWriter || g_scanoutNeedsRepair) return;
-    g_debugFrame.state=DebugFrameState::Failed;
     const bool leased=g_scanoutContainsLeasedFrame;
+    if (protectedScene && (leased ? !g_leasedFramePrivacy.permits(protectionEpoch) :
+        (!captureScene || captureScene != __atomic_load_n(&g_captureSceneRevision, __ATOMIC_ACQUIRE)))) return;
+    g_debugFrame.state=DebugFrameState::Failed;
     if (leased) epoch=g_leasedFrameEpoch;
     // Read the presented CPU front buffer, not the mutable backbuffer (which
     // can also be written by legacy TTY/scanout aliases outside the renderer).
     const uint32_t* source=const_cast<const uint32_t*>(presented.pixels);
-    if (protectedScene) {
+    if (protectedScene && !leased) {
         source = g_backBuffer;
         stride = g_backBufStride;
     }
@@ -776,8 +789,8 @@ static void CaptureCompletedDebugFrame(uint64_t epoch,const DebugFrameGeometry& 
     (void)cursor;
 #endif
     if (protectedScene) {
-        for (uint32_t i = 0; i < maskCount; ++i) CaptureMaskPixels(destination, width, height, width, masks[i]);
-        if (captureScene != __atomic_load_n(&g_captureSceneRevision, __ATOMIC_ACQUIRE)) {
+        ApplyFramePrivacy(destination, width, height, leased ? g_leasedFramePrivacy : softwarePrivacy);
+        if (!leased && captureScene != __atomic_load_n(&g_captureSceneRevision, __ATOMIC_ACQUIRE)) {
             g_debugFrame.state = DebugFrameState::Pending;
             return;
         }
@@ -5720,11 +5733,15 @@ void CompositorSampleGopWrite(const CompositorGopWrite& write,uint32_t samples[4
 {
     if(!write.token || !samples)return;
     const uint64_t lastRow=uint64_t(g_physFbHeight-1)*g_physFbStride;
+    for (uint32_t i = 0; i < 4; ++i) samples[i] = 0;
+    if (WmCaptureProtectionEpoch()) return;
     samples[0]=g_physFb[0];samples[1]=g_physFb[g_physFbWidth-1];
     samples[2]=g_physFb[lastRow];samples[3]=g_physFb[lastRow+g_physFbWidth-1];
+    if (WmCaptureProtectionEpoch()) for (uint32_t i = 0; i < 4; ++i) samples[i] = 0;
 }
 
-int CompositorFinishGopWrite(const CompositorGopWrite& write,int result,bool touched)
+int CompositorFinishGopWrite(const CompositorGopWrite& write,int result,bool touched,
+                             const CapturePrivacy& privacy,bool wroteGop)
 {
     {
         CompositorMutexGuard geometry(&g_scanoutMappingLock);
@@ -5733,7 +5750,8 @@ int CompositorFinishGopWrite(const CompositorGopWrite& write,int result,bool tou
         if(!result){
             if(g_gopWriterRevoked || !RefreshBackdropStyle() || write.display!=g_displayGeneration ||
                write.backdrop!=g_backdropGeneration || (write.partial &&
-               (!g_presentLease.Active(tick) || g_presentLease.owner!=write.owner)))result=-116;
+               (!g_presentLease.Active(tick) || g_presentLease.owner!=write.owner ||
+                (wroteGop && !g_leasedFramePrivacy.matches(privacy)))))result=-116;
             else if(!g_presentLease.Acquire(write.owner,tick,COMPOSITOR_PRESENT_LEASE_MS))result=-75;
             else {
                 DisplayFlush(write.minY,write.maxY);
@@ -5742,6 +5760,7 @@ int CompositorFinishGopWrite(const CompositorGopWrite& write,int result,bool tou
                 g_leasedFrameTick=tick;
                 g_leasedFrameDisplay=write.display;g_leasedFrameBackdrop=write.backdrop;
                 g_leasedFrameMode=write.partial?BROOK_DEBUG_FRAME_PRESENT_PARTIAL:BROOK_DEBUG_FRAME_PRESENT_FULL;
+                g_leasedFramePrivacy=wroteGop ? privacy : CapturePrivacy{};
                 g_scanoutContainsLeasedFrame=true;g_scanoutNeedsRepair=false;
             }
         }
@@ -5764,7 +5783,8 @@ int CompositorFinishGopWrite(const CompositorGopWrite& write,int result,bool tou
 
 int CompositorPresentProbe(uint32_t x,uint32_t y,uint32_t width,uint32_t height,uint32_t stride,
                            void* source,bool (*copy)(void*,uint64_t,void*,uint64_t),uint32_t samples[4],
-                           uint64_t expectedDisplay,uint64_t expectedBackdrop,uint64_t leaseOwner,bool region)
+                           uint64_t expectedDisplay,uint64_t expectedBackdrop,uint64_t leaseOwner,bool region,
+                           const CapturePrivacy& privacy)
 {
     if(!width || !height || width>16384 || height>16384 || stride<width || stride>16384 ||
        !source || !copy || (!samples && (!leaseOwner || region)) || (region && !leaseOwner))return -22;
@@ -5777,7 +5797,8 @@ int CompositorPresentProbe(uint32_t x,uint32_t y,uint32_t width,uint32_t height,
         const uint64_t now=ApicTickCount();
         if(region && (!expectedDisplay || !expectedBackdrop || !g_scanoutContainsLeasedFrame || g_scanoutNeedsRepair ||
            !g_presentLease.Active(now) || g_presentLease.owner!=leaseOwner ||
-           expectedDisplay!=g_leasedFrameDisplay || expectedBackdrop!=g_leasedFrameBackdrop))return -116;
+           expectedDisplay!=g_leasedFrameDisplay || expectedBackdrop!=g_leasedFrameBackdrop ||
+           !g_leasedFramePrivacy.matches(privacy)))return -116;
         if(leaseOwner && !region && (!expectedDisplay || !expectedBackdrop || x || y || width!=g_deskWidth ||
            height!=g_deskHeight || !g_presentLease.CanAcquire(leaseOwner,now)))return -16;
         if(!g_physFb || CompositorGpuActive() || x>=g_deskWidth || y>=g_deskHeight ||
@@ -5795,6 +5816,7 @@ int CompositorPresentProbe(uint32_t x,uint32_t y,uint32_t width,uint32_t height,
                 samples[1]=g_physFb[uint64_t(y)*g_physFbStride+x+width-1];
                 samples[2]=g_physFb[uint64_t(y+height-1)*g_physFbStride+x];
                 samples[3]=g_physFb[uint64_t(y+height-1)*g_physFbStride+x+width-1];
+                if (WmCaptureProtectionEpoch()) for (uint32_t i = 0; i < 4; ++i) samples[i] = 0;
             }
             DisplayFlush(y,y+height);
             if(leaseOwner) {
@@ -5804,6 +5826,7 @@ int CompositorPresentProbe(uint32_t x,uint32_t y,uint32_t width,uint32_t height,
                 else {g_leasedFrameEpoch=__atomic_load_n(&g_compositorEpoch,__ATOMIC_ACQUIRE);g_leasedFrameTick=tick;
                     g_leasedFrameDisplay=expectedDisplay;g_leasedFrameBackdrop=expectedBackdrop;
                     g_leasedFrameMode=region?BROOK_DEBUG_FRAME_PRESENT_PARTIAL:BROOK_DEBUG_FRAME_PRESENT_FULL;
+                    g_leasedFramePrivacy=privacy;
                     g_scanoutContainsLeasedFrame=true;g_scanoutNeedsRepair=false;
                     CompositorRecordDesktopPresent();}
             }
@@ -5822,7 +5845,7 @@ int CompositorPresentProbe(uint32_t x,uint32_t y,uint32_t width,uint32_t height,
 
 int CompositorPresentRegions(const CompositorPresentRegion* regions,uint32_t count,uint64_t sourceBytes,
                              void* source,bool (*copy)(void*,uint64_t,void*,uint64_t),
-                             uint64_t display,uint64_t backdrop,uint64_t owner)
+                             uint64_t display,uint64_t backdrop,uint64_t owner,const CapturePrivacy& privacy)
 {
     if(!regions || !count || count>COMPOSITOR_MAX_REGIONS || !source || !copy || !display || !backdrop || !owner)return -22;
     int result=0;bool touched=false;uint32_t minY=~uint32_t{0},maxY=0;
@@ -5832,7 +5855,8 @@ int CompositorPresentRegions(const CompositorPresentRegion* regions,uint32_t cou
         const uint64_t now=ApicTickCount();
         if(!RefreshBackdropStyle() || display!=g_displayGeneration || backdrop!=g_backdropGeneration ||
            display!=g_leasedFrameDisplay || backdrop!=g_leasedFrameBackdrop || !g_scanoutContainsLeasedFrame ||
-           g_scanoutNeedsRepair || !g_presentLease.Active(now) || g_presentLease.owner!=owner)return -116;
+           g_scanoutNeedsRepair || !g_presentLease.Active(now) || g_presentLease.owner!=owner ||
+           !g_leasedFramePrivacy.matches(privacy))return -116;
         if(!g_physFb || CompositorGpuActive())return -22;
         // Validate the whole list before the first write. The caller supplies
         // kernel-owned immutable metadata and pins the completed source.

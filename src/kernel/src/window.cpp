@@ -2138,15 +2138,20 @@ int WmCheckWindowCapture(uint32_t id, uint64_t incarnation)
     return window.captureExcluded ? -13 : 0;
 }
 
-uint32_t WmGetCaptureMasks(CaptureMaskRect* out)
+static uint32_t CaptureMasksLocked(CaptureMaskRect* out)
 {
-    VfbGuard guard;
     uint32_t count = 0;
     for (const auto& window : g_windows) {
         if (!window.proc || !window.captureExcluded || !window.visible || window.minimized) continue;
         out[count++] = {window.x, window.y, window.outerWidth(), window.outerHeight()};
     }
     return count;
+}
+
+uint32_t WmGetCaptureMasks(CaptureMaskRect* out)
+{
+    VfbGuard guard;
+    return CaptureMasksLocked(out);
 }
 
 bool WmExcludeOwnedWindowFromCapture(Process* proc, uint32_t wmId)
@@ -3305,15 +3310,27 @@ bool WmGpuSourceProviderMatches(uint32_t window,uint64_t incarnation,uint32_t pi
         (w.proc->isThread?w.proc->leaderIncarnation:w.proc->incarnation)==providerIncarnation;
 }
 
-bool WmClientScanoutWindowMatches(uint32_t window,uint64_t incarnation,uint32_t width,uint32_t height)
+bool WmClientScanoutWindowMatches(uint32_t window,uint64_t incarnation,uint32_t width,uint32_t height,
+                                  CapturePrivacy& privacy)
 {
     if(!window || window>WM_MAX_WINDOWS || !incarnation)return false;
     VfbGuard guard;
     const int idx=__atomic_load_n(&g_focusedIdx,__ATOMIC_ACQUIRE);
     if(idx!=static_cast<int>(window)-1)return false;
     const Window& w=g_windows[idx];
-    return w.proc && w.wmId==window && w.creationIdentity==incarnation && w.visible && !w.minimized &&
-        w.noChrome && !w.clientX() && !w.clientY() && w.clientW==width && w.clientH==height;
+    if (!w.proc || w.wmId != window || w.creationIdentity != incarnation || !w.visible ||
+        w.minimized || !w.noChrome || w.clientX() || w.clientY() ||
+        w.clientW != width || w.clientH != height) return false;
+    privacy = {};
+    privacy.known = true;
+    privacy.epoch = WmCaptureProtectionEpoch();
+    // The client surface alone covers the output. No underlying window pixels
+    // are present in this buffer, regardless of the rest of the WM layout.
+    if (w.captureExcluded) {
+        privacy.count = 1;
+        privacy.masks[0] = {0, 0, width, height};
+    }
+    return true;
 }
 
 bool WmSnapshotFocus(uint32_t* window, uint64_t* incarnation, uint32_t* flags)
@@ -3584,6 +3601,9 @@ bool WmAcquireDesktopLayers(WmDesktopLayers* out) {
     *out={};bool success=true;
     { VfbGuard guard;int sorted[WM_MAX_WINDOWS];const uint32_t count=WmGetZOrder(sorted,WM_MAX_WINDOWS);
       out->theme=WmGetTheme();out->appearance=WmGetAppearance();out->scale=WmGetAppliedScale();out->settingsGeneration=g_chromeSettingsEpoch;
+      out->privacy.known = true;
+      out->privacy.epoch = WmCaptureProtectionEpoch();
+      if (out->privacy.epoch) out->privacy.count = CaptureMasksLocked(out->privacy.masks);
       SpinLockAcquire(&g_launcherLock);out->launcherGeneration=g_launcherSnapshotEpoch;SpinLockRelease(&g_launcherLock);
       if(!out->launcherGeneration || !out->settingsGeneration)success=false;
       for(uint32_t i=0;success && i<count;++i){

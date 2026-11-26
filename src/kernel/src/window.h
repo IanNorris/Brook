@@ -1,4 +1,5 @@
 #pragma once
+#include "wm_capture_protection.h"
 #include "../../shared/brook_caption_strip.h"
 #include "launcher_model.h"
 
@@ -40,7 +41,7 @@ static constexpr uint32_t WM_BUTTON_WIDTH     = DesktopMetrics::CaptionButtonBas
 // Resize zone sizes: ChromeResizeMetrics (chrome_layout.h).
 static constexpr uint32_t WM_MIN_WIDTH        = 200;
 static constexpr uint32_t WM_MIN_HEIGHT       = 100;
-static constexpr uint32_t WM_MAX_WINDOWS      = 32;
+static constexpr uint32_t WM_MAX_WINDOWS      = CaptureMaskCapacity;
 
 // Retained per-window inputs for an eventual userspace desktop renderer. This
 // is only the client-content part of the desktop; chrome, cursor and overlays
@@ -61,6 +62,7 @@ struct WmDesktopLayer {
 struct WmDesktopLayers {
     uint32_t count,theme,appearance,scale;
     uint64_t launcherGeneration,settingsGeneration;
+    CapturePrivacy privacy;
     WmDesktopLayer layers[WM_MAX_WINDOWS];
 };
 // Unsupported visible content fails the entire capture, so callers can fall
@@ -443,7 +445,6 @@ uint32_t WmSnapshotDebugWindows(WmDebugWindow* out,uint32_t capacity,uint64_t* t
 // *width pixels; *scale is its on-screen upscale). out=nullptr only reports
 // the size. -2 unknown window, -95 no CPU buffer (GPU-published or none),
 // -11 the buffer outgrew capacityPixels since it was sized.
-struct CaptureMaskRect;
 uint64_t WmCaptureProtectionEpoch();
 int WmCheckWindowCapture(uint32_t id, uint64_t incarnation);
 uint32_t WmGetCaptureMasks(CaptureMaskRect* out);
@@ -719,7 +720,8 @@ Window* WmFindWindowById(Process* proc, uint32_t wmId);
 // its identity and BROOK_WINDOW_STATE_* flags (VISIBLE, FOCUSED, MINIMIZED,
 // MAXIMIZED, FULLSCREEN, CLIENT_CHROME). False when nothing is focused.
 bool WmSnapshotFocus(uint32_t* window, uint64_t* incarnation, uint32_t* flags);
-bool WmClientScanoutWindowMatches(uint32_t window,uint64_t incarnation,uint32_t width,uint32_t height);
+bool WmClientScanoutWindowMatches(uint32_t window,uint64_t incarnation,uint32_t width,uint32_t height,
+                                  CapturePrivacy& privacy);
 int WmSnapshotOwnedWindowState(Process* proc, uint32_t wmId,
                                uint64_t expectedIncarnation, BrookWindowState* out);
 int WmPlaceOwnedWindow(Process* proc, uint32_t wmId, uint64_t incarnation,

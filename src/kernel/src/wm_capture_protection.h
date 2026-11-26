@@ -64,6 +64,36 @@ inline bool CapturePolicyMatches(const char* rules, const char* appId, const cha
 struct CaptureMaskRect {
     int32_t x, y;
     uint32_t width, height;
+
+    bool operator==(const CaptureMaskRect& other) const
+    {
+        return x == other.x && y == other.y && width == other.width && height == other.height;
+    }
+};
+
+inline constexpr uint32_t CaptureMaskCapacity = 32;
+
+// Kernel-only metadata for the pixels actually published. A default record
+// makes no claim about an image once any capture exclusion has been armed.
+struct CapturePrivacy {
+    uint64_t epoch = 0;
+    uint32_t count = 0;
+    bool known = false;
+    CaptureMaskRect masks[CaptureMaskCapacity]{};
+
+    bool permits(uint64_t currentEpoch) const
+    {
+        return !currentEpoch || (known && epoch == currentEpoch && count <= CaptureMaskCapacity);
+    }
+
+    bool matches(const CapturePrivacy& other) const
+    {
+        if (epoch != other.epoch || count != other.count || count > CaptureMaskCapacity ||
+            (epoch && (!known || !other.known))) return false;
+        for (uint32_t i = 0; i < count; ++i)
+            if (!(masks[i] == other.masks[i])) return false;
+        return true;
+    }
 };
 
 inline void CaptureMaskPixels(uint32_t* pixels, uint32_t width, uint32_t height,

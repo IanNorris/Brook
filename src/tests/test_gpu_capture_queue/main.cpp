@@ -514,6 +514,40 @@ int main() {
     for (unsigned i = 0; i < 48; ++i)
         CHECK(capturedPixels[i] == (i / 8 >= 1 && i / 8 < 3 && i % 8 >= 2 && i % 8 < 5 ? 0xff000000 : 0xdeadbeef));
     CHECK(CompositorReleaseDebugFrame(protectedFrame.token, 77));
+
+    // A renderer frame can lag behind the live WM geometry. Only the
+    // retained frame's mask applies to the leased GOP, even without a
+    // completed software paint for this compositor pass.
+    const uint64_t privacyEpoch = WmCaptureProtectionEpoch();
+    CapturePrivacy renderedPrivacy{};
+    renderedPrivacy.known = true;
+    renderedPrivacy.epoch = privacyEpoch;
+    renderedPrivacy.count = 1;
+    renderedPrivacy.masks[0] = {0, 0, 2, 1};
+    CHECK(!CompositorPresentProbe(0,0,8,6,8,fullSource,copy,samples,display,g_backdropGeneration,42));
+    auto leasedCapture = CompositorRequestDebugFrame(77);
+    CaptureCompletedDebugFrame(43, {g_physFb, 8, 6, 8});
+    CHECK(CompositorDebugFrameStatus(leasedCapture.token, 77).state == DebugFrameState::Pending);
+    CHECK(!CompositorPresentProbe(0,0,8,6,8,fullSource,copy,samples,display,g_backdropGeneration,42,false,renderedPrivacy));
+    CHECK(samples[0] == 0 && samples[1] == 0 && samples[2] == 0 && samples[3] == 0);
+    CaptureCompletedDebugFrame(44, {g_physFb, 8, 6, 8});
+    CHECK(CompositorDebugFrameStatus(leasedCapture.token, 77).state == DebugFrameState::Ready);
+    for (unsigned i = 0; i < 48; ++i)
+        CHECK(capturedPixels[i] == (i < 2 ? 0xff000000 : fullSource[i]));
+    CHECK(CompositorReleaseDebugFrame(leasedCapture.token, 77));
+    CapturePrivacy movedPrivacy = renderedPrivacy;
+    movedPrivacy.masks[0].x = 3;
+    CHECK(CompositorPresentProbe(2,1,2,2,2,patchPixels,copy,samples,display,g_backdropGeneration,42,true,movedPrivacy)==-116);
+    CHECK(!CompositorPresentProbe(2,1,2,2,2,patchPixels,copy,samples,display,g_backdropGeneration,42,true,renderedPrivacy));
+    auto stalePrivacy = renderedPrivacy;
+    ++stalePrivacy.epoch;
+    CHECK(!CompositorPresentProbe(0,0,8,6,8,fullSource,copy,samples,display,g_backdropGeneration,42,false,stalePrivacy));
+    auto staleFrame = CompositorRequestDebugFrame(77);
+    CaptureCompletedDebugFrame(45, {g_physFb, 8, 6, 8});
+    CHECK(CompositorDebugFrameStatus(staleFrame.token, 77).state == DebugFrameState::Pending);
+    CHECK(CompositorReleaseDebugFrame(staleFrame.token, 77));
+    CompositorReleasePresentLease(42);
+    CompositorFlipSoftware();
     protectedWindows = false;
     g_backBuffer=nullptr;
     uint32_t overlayPixels[48]{};g_debugFrameBuffer=VirtualAddress(reinterpret_cast<uint64_t>(overlayPixels));g_debugFramePages=1;
