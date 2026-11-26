@@ -1456,7 +1456,35 @@ void AutostartRun(bool display) {
         const uint32_t boot0 = g_bus.rd32(0);
         d.chipset = uint16_t((boot0 >> 20) & 0x1ff); d.revision = uint8_t(boot0 & 0xff); d.pci_device = 0x1e87;
         d.vram_bytes = g_static.fb_length; d.vram_user = g_static.usable_hi > g_static.usable_lo ? g_static.usable_hi - g_static.usable_lo : 0;
-        d.bar1_bytes = kBar1Bytes; d.gpc_count = 6; d.tpc_count = 46;
+        d.bar1_bytes = kBar1Bytes;
+        // GR geometry from RM, as nouveau r570 does (GPU_GET_FERMI_GPC_INFO / _TPC_INFO on the internal
+        // subdevice): GRAPH_UNITS = gpcs | tpcs << 8. 27 Nov: we hard-coded 46 "TPCs"; the RTX 2080 has
+        // 46 SMs = 23 TPCs, and NVK sizes SLM and per-TPC state from this.
+        {
+            uint32_t gpcs = 0, tpcs = 0; bool ok = false;
+            const ChipOps* cc = ChipForBoot0(g_bus.rd32(0));
+            bool busy = false;
+            for (int i = 0; i < 50 && !(busy = !__atomic_exchange_n(&g_busy, 1u, __ATOMIC_ACQUIRE)); ++i) SchedulerSleepMs(10);
+            if (cc && g_staticValid && busy) {
+                SpinLock* lk = NvAuxSharedLock(); SpinLockAcquire(lk);
+                RmWait wait; g_rm->wait_deadline_us = NowUs() + 2000000;
+                GspDoorbell<Bar0Bus, RmSync> bell{g_bus, *cc, g_rmSync};
+                alignas(8) static uint8_t scratch[kRmApiBuf];
+                LiveRmApi api(g_rm->ch, g_rm->rx, g_rm->rxcap, wait, bell, scratch);
+                uint32_t gm = 0;
+                ok = api.Control(g_static.h_internal_client, g_static.h_internal_subdevice, 0x20800137u, &gm, sizeof(gm));
+                for (uint32_t g = 0; ok && g < 32; ++g) if (gm & (1u << g)) {
+                    struct { uint32_t gpcId, tpcMask; } t = {g, 0};
+                    ok = api.Control(g_static.h_internal_client, g_static.h_internal_subdevice, 0x20800138u, &t, sizeof(t));
+                    tpcs += __builtin_popcount(t.tpcMask); ++gpcs;
+                }
+                SpinLockRelease(lk);
+                if (ok) KPrintf("nv-drm: GR units from RM: gpc mask %x, %u GPC, %u TPC\n", gm, gpcs, tpcs);
+            }
+            if (busy) __atomic_store_n(&g_busy, 0u, __ATOMIC_RELEASE);
+            if (!ok || !gpcs || !tpcs) { gpcs = 6; tpcs = 23; KPrintf("nv-drm: GR units query failed; using RTX 2080 defaults 6 GPC / 23 TPC\n"); }
+            d.gpc_count = uint8_t(gpcs); d.tpc_count = uint16_t(tpcs);
+        }
         const uint32_t cls[] = {0xc597, 0xc5c0, 0xc5b5, 0x902d, 0xa140};
         for (uint32_t i = 0; i < 5; ++i) d.classes[i] = cls[i];
         d.nclasses = 5;
