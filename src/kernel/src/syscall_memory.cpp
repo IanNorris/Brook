@@ -407,7 +407,7 @@ int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         return UserMappingCreate(proc,proc->addressSpace,request);
     }
     if (entry->type == FdType::DevDri || entry->type == FdType::DevIntelDri || entry->type == FdType::DevFramebuf ||
-        entry->type == FdType::DevNvDri) {
+        entry->type == FdType::DevNvDri || entry->type == FdType::NvPrime) {
         auto* source=static_cast<DeviceMappingBacking*>(kmalloc(sizeof(DeviceMappingBacking)));
         if (!source) return -ENOMEM;
         *source={};backing.value=MappingBackingCreate(source,ReleaseDeviceMapping);
@@ -424,6 +424,13 @@ int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
             source->intelBuffer=buffer;source->intelPageOffset=relative/4096;
             available=brook::BdwGpuBufferBytes(buffer)-relative;
             brook::BdwGpuBufferUnref(buffer);
+        } else if (entry->type == FdType::NvPrime) {
+            // dmabuf mmap: GART BOs only, as renderD130's own mmap (VRAM has no CPU window yet).
+            if(!(flags&MAP_SHARED))return -EINVAL;
+            uint64_t physical=0;MappingBacking* life=nullptr;
+            if(!brook::NvPrimeMapGart(entry->handle,offset,request.length,&physical,&life))return -EINVAL;
+            source->borrowedPhysical=true;source->physicalBase=physical;source->resourceLifetime=life;
+            available=(request.length+4095)&~uint64_t{4095};
         } else if (entry->type == FdType::DevNvDri) {
             // M5: GART BOs only (contiguous pinned pages; their lifetime outlives the BO while mapped).
             if(!(flags&MAP_SHARED))return -EINVAL;
