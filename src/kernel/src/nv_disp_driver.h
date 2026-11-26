@@ -146,6 +146,10 @@ template<typename B> struct NvDisplayDriver{
             if(!Live(o))continue;
             f[o].TickVblank();
             if(f[o].Poll()==FlipState::Failed)OnFailure(o);
+            if(f[o].rekicks!=loggedRekicks[o]&&loggedRekicks[o]<64){loggedRekicks[o]=f[o].rekicks;
+                Line l;l.raw("{\"nv_driver\":\"flip-rekick\",\"output\":");l.dec(o);l.raw(",\"n\":");l.dec(f[o].rekicks);
+                l.raw(",\"ok\":");l.dec(f[o].rekickOk);l.raw(",\"kick\":\"");l.hex(f[o].lastKickOff);l.raw("\",\"want\":\"");l.hex(f[o].armedTarget);
+                l.raw("\",\"mode\":");l.dec(f[o].kickMode);l.raw("}\n");b->emit(l.t);}
         }
         const uint64_t now=b->nowUs();
         if(AnyLive()&&now-lastCheckUs>1000000){lastCheckUs=now;if(!Head0Intact()){++invariantFails;
@@ -158,6 +162,10 @@ template<typename B> struct NvDisplayDriver{
     // Failure diagnostics hook (live: nv_disp_live.cpp NvDispSnapLocked, BAR1 vs PRAMIN ring check).
     void (*onFailDiag)(uint32_t o)=nullptr;
     // Three lines: the kernel log keeps 160 characters of a line (27 Nov records ended at arm_notifier).
+    void Rekicks(){for(uint32_t o=0;o<kDriverOutputs;++o){Line l;l.raw("{\"nv_driver\":\"rekicks\",\"output\":");l.dec(o);
+        l.raw(",\"kickmode\":");l.dec(f[o].kickMode);l.raw(",\"rekicks\":");l.dec(f[o].rekicks);l.raw(",\"ok\":");l.dec(f[o].rekickOk);
+        l.raw(",\"comp\":");l.dec(f[o].st.completes);l.raw("}\n");b->emit(l.t);}}
+    uint32_t loggedRekicks[kDriverOutputs]{};
     void OnFailure(uint32_t o){
         ++failures[o];
         const uint32_t ch=ChidWndw(kDriverWindow[o]);
@@ -258,6 +266,8 @@ template<typename B> struct NvDisplayDriver{
             if(External(o)){Msg("refused","the desktop presents on this output");return;}
             Bench(o,v);return;}
         if(Word(p,"tick")){Tick();Status();return;}
+        if(Word(p,"kickmode")){if(!Num(p,v)||v>2){Msg("usage","kickmode <0|1|2>");return;}for(auto& x:f)x.kickMode=uint8_t(v);Rekicks();return;}
+        if(Word(p,"rekicks")){Rekicks();return;}
         if(Word(p,"probe")){if(!Num(p,o)||!Num(p,v)||o>=kDriverOutputs||!v){Msg("usage","probe <o> <1..32>");return;}
             if(External(o)){Msg("refused","the desktop presents on this output");return;}
             Probe(o,v);return;}
