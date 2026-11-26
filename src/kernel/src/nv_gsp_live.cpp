@@ -1503,6 +1503,50 @@ void GrJson(Out& o, const GrResult& r) {
 // status = GET_CURRENT_PSTATE only. boost is accepted by RM but did not leave P8 on 26 Nov.
 // boost = NV2080_CTRL_CMD_PERF_BOOST's GSP half (INTERNAL_PERF_BOOST_SET_2X), BOOST_TO_MAX for
 // 60 s: RM's own DVFS policy within the board's stock limits; it expires by itself, `perf clear` ends it.
+// `nv-gsp fault dump`: TU102 MMU fault state (nouveau tu102 fault regs): both fault buffers'
+// LO/HI/GET/PUT/SIZE (0xb83000 + 0x20*i), the info-fault latch (0xb83080-0xb83094), and the
+// newest non-replayable entries when that buffer is in VRAM (gv100 entry layout, 32 B).
+// Read-only; PRAMIN under the nv-aux lock.
+void FaultDump() {
+    Out o; o.raw("{\"nv_gsp\":\"fault\"");
+    const ChipOps* c = ChipForBoot0(g_bus.rd32(0));
+    if (!c) { o.ks("refused", "no GPU"); o.send(); return; }
+    SpinLock* lock = NvAuxSharedLock();
+    SpinLockAcquire(lock);
+    uint32_t b[2][5];
+    for (int i = 0; i < 2; ++i) for (int k = 0; k < 5; ++k) b[i][k] = g_bus.rd32(0xb83000 + 0x20 * i + 4 * k);
+    uint32_t info[6]; for (int k = 0; k < 6; ++k) info[k] = g_bus.rd32(0xb83080 + 4 * k);
+    struct E { uint32_t w[8]; } ent[8]; uint32_t ne = 0;
+    {   // buffer 1 = non-replayable: LO bits 1:0 aperture (0 VRAM), PUT/GET in entries
+        const uint64_t base = (uint64_t(b[1][1]) << 32) | (b[1][0] & ~0xfffu);
+        const uint32_t size = b[1][4] & 0xfffff, put = b[1][3] & 0xfffff;
+        if ((b[1][0] & 3) == 0 && base && size) {
+            Pramin<Bar0Bus> pr(g_bus, *c);
+            for (uint32_t k = 0; k < 8 && k < size; ++k) {
+                const uint32_t idx = (put + size - 1 - k) % size;
+                for (int w = 0; w < 8; ++w) ent[ne].w[w] = pr.rd32(base + uint64_t(idx) * 32 + 4 * w);
+                ++ne;
+            }
+            pr.Restore();
+        }
+    }
+    SpinLockRelease(lock);
+    for (int i = 0; i < 2; ++i) {
+        o.k(i ? "nonreplay" : "replay"); o.raw("{"); o.kh("lo", b[i][0]); o.kh("hi", b[i][1]); o.kh("get", b[i][2]);
+        o.kh("put", b[i][3]); o.kh("size", b[i][4]); o.raw("}");
+    }
+    o.k("info"); o.raw("{"); o.kh("addr_lo", info[0]); o.kh("addr_hi", info[1]); o.kh("info0", info[2]); o.kh("inst_hi", info[3]);
+    o.kh("info1", info[4]); o.kh("valid", info[5]); o.raw("}");
+    o.k("entries"); o.raw("[");
+    for (uint32_t k = 0; k < ne; ++k) {
+        const uint32_t* w = ent[k].w;
+        if (k) o.raw(",");
+        o.raw("{"); o.kh("inst", (uint64_t(w[1]) << 32) | w[0]); o.kh("addr", (uint64_t(w[3]) << 32) | w[2]);
+        o.kh("engine", w[6] & 0xff); o.kh("valid", w[7] >> 31); o.kh("gpc", (w[7] >> 24) & 0x1f); o.kh("hub", (w[7] >> 20) & 1);
+        o.kh("access", (w[7] >> 16) & 0xf); o.kh("client", (w[7] >> 8) & 0x7f); o.kh("reason", w[7] & 0x1f); o.raw("}");
+    }
+    o.raw("]"); o.send();
+}
 void PerfVerb(int mode) {   // 0 status, 1 boost, 2 clear
     Out o; o.raw("{\"nv_gsp\":\"perf\"");
     const ChipOps* c = ChipForBoot0(g_bus.rd32(0));
@@ -1943,6 +1987,7 @@ bool NvGspHandle(const char* command) {
         nvd::g_minObjects = !strcmp(verb, "drm minobj on");
         DebugChannelSend(nvd::g_minObjects ? "{\"nv_gsp\":\"drm\",\"min_objects\":true}\n" : "{\"nv_gsp\":\"drm\",\"min_objects\":false}\n");
     }
+    else if (!strcmp(verb, "fault dump")) FaultDump();
     else if (!strcmp(verb, "perf status")) PerfVerb(0);
     else if (!strcmp(verb, "perf boost")) PerfVerb(1);
     else if (!strcmp(verb, "perf clear")) PerfVerb(2);
