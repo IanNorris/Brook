@@ -907,6 +907,7 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
 #if !defined(BROOK_HOST_TEST) && defined(BROOK_NV_DISPLAY)
     if(!strcmp(command,"bridge hardware gpu-reset status")){NvGpuResetStatus();return true;}
 #endif
+#if !defined(BROOK_HOST_TEST)
     if(!strcmp(command,"bridge hardware loader-breadcrumb")){
         // LOADER.TXT / HALT.TXT from the loader volume (read-only arm). Text fields, JSON-quoted.
         static char buf[260];Reply r;r.text("{\"loader_breadcrumb\":1");
@@ -916,6 +917,7 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
             r.text(",\"");r.text(keys[i]);r.text("_rc\":");r.number(uint64_t(int64_t(rc)<0?-rc:rc));
             r.text(",\"");r.text(keys[i]);r.text("\":");r.quoted(rc?"":buf);}
         r.text("}\n");r.send();return true;}
+#endif
     if(!strcmp(command,"bridge hardware caps")){
         char boot[33];DebugEpochCopy(boot);
         Reply r;r.text("{\"hardware_api\":1,\"boot_guard\":true,\"logs_api\":1,\"boot_id\":");r.quoted(boot);
