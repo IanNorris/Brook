@@ -1295,6 +1295,7 @@ void RuntimeEvent(const uint8_t* m, uint32_t len) {   // nv-aux lock held
     const uint32_t keep = len < kEvPendBytes ? len : kEvPendBytes;
     __builtin_memcpy(g_evPend[g_evPendN], m, keep); g_evPendLen[g_evPendN] = keep; ++g_evPendN;
 }
+void FaultShadowDrain();
 void LogEvent(const uint8_t* m, uint32_t len) {
     namespace rm = rm570;
     const uint32_t fn = Get32(m + offsetof(rm::rpc_message_header_v, function));
@@ -1311,7 +1312,7 @@ void LogEvent(const uint8_t* m, uint32_t len) {
             NvdMarkDead(u32(4));
             StallWatchTrigger("rm rc");
             break;
-        case rm::NV_VGPU_MSG_EVENT_MMU_FAULT_QUEUED: ++g_liveEv.mmu; KPrintf("nv-gsp: RM event at %lu ms: MMU fault queued\n", ms); break;
+        case rm::NV_VGPU_MSG_EVENT_MMU_FAULT_QUEUED: ++g_liveEv.mmu; KPrintf("nv-gsp: RM event at %lu ms: MMU fault queued\n", ms); FaultShadowDrain(); break;
         case rm::NV_VGPU_MSG_EVENT_OS_ERROR_LOG: {
             ++g_liveEv.os_error;
             char text[97]; uint32_t i = 0;
@@ -1594,6 +1595,67 @@ void FaultDump() {
         o.kh("access", (w[7] >> 16) & 0xf); o.kh("client", (w[7] >> 8) & 0x7f); o.kh("reason", w[7] & 0x1f); o.raw("}");
     }
     o.raw("]"); o.send();
+}
+// Client shadow non-replayable fault buffer (27 Nov, NVK Xid 44 decode), as CPU-RM's
+// kgmmuClientShadowFaultBufferRegister: GMMU_GET_STATIC_INFO sizes, a Queue page (capacity @0,
+// msgSize @24, getIdx @64, putIdx @128; containers/queue.h) and the packet pages, registered with
+// INTERNAL_GMMU_REGISTER_CLIENT_SHADOW_FAULT_BUFFER. GSP-RM then copies each non-replayable fault
+// (NVC369_BUF_ENTRY, 32 B) into it and posts MMU_FAULT_QUEUED; LogEvent decodes new entries.
+uint8_t* g_fsQueue = nullptr; uint8_t* g_fsBuf = nullptr; uint32_t g_fsCap = 0;
+inline uint64_t FsGet64(const uint8_t* p) { uint64_t v; __builtin_memcpy(&v, p, 8); return v; }
+inline void FsPut64(uint8_t* p, uint64_t v) { __builtin_memcpy(p, &v, 8); }
+void FaultShadowOn() {
+    Out o; o.raw("{\"nv_gsp\":\"fault shadow\"");
+    const ChipOps* c = ChipForBoot0(g_bus.rd32(0));
+    if (!c || !g_rmRunning || !g_staticValid) { o.ks("refused", "GSP-RM not running"); o.send(); return; }
+    if (g_fsQueue) { o.ks("status", "already on"); o.send(); return; }
+    struct Sizes { uint32_t rsize, rmeta, nsize, nmeta; } sz = {};
+    struct Reg { uint64_t queuePhys; uint32_t size, metaSize; uint64_t pte[3000]; uint32_t type, pad; uint64_t sharedPhys; };
+    static Reg reg; __builtin_memset(&reg, 0, sizeof(reg));
+    static_assert(sizeof(Reg) == 24032, "REGISTER_CLIENT_SHADOW_FAULT_BUFFER_PARAMS");
+    SpinLock* lock = NvAuxSharedLock(); SpinLockAcquire(lock);
+    RmWait wait; g_rm->wait_deadline_us = NowUs() + 5000000;
+    GspDoorbell<Bar0Bus, RmSync> bell{g_bus, *c, g_rmSync};
+    alignas(8) static uint8_t scratch[32768];
+    LiveRmApi api(g_rm->ch, g_rm->rx, g_rm->rxcap, wait, bell, scratch); api.bufcap = sizeof(scratch);
+    const char* st = "ok";
+    bool ok = api.Control(g_static.h_internal_client, g_static.h_internal_subdevice, 0x20800a59u, &sz, sizeof(sz));
+    if (!ok) st = "GMMU_GET_STATIC_INFO";
+    DmaRegion q{}, b{};
+    const uint32_t pages = ((sz.nsize + 4095) / 4096) + ((sz.nmeta + 4095) / 4096);
+    if (ok && (!sz.nsize || pages > 3000)) { ok = false; st = "bad sizes"; }
+    if (ok && (!RmAlloc(4096, &q) || !RmAlloc(pages * 4096, &b))) { ok = false; st = "sysmem"; }
+    if (ok) {
+        g_fsCap = sz.nsize / 32;
+        FsPut64(q.cpu + 0, g_fsCap); FsPut64(q.cpu + 24, 32); FsPut64(q.cpu + 64, 0); FsPut64(q.cpu + 128, 0);
+        FlushRange(q.cpu, 4096); FlushRange(b.cpu, pages * 4096);
+        reg.queuePhys = q.bus; reg.size = sz.nsize; reg.metaSize = sz.nmeta; reg.type = 0;   // NON_REPLAYABLE
+        for (uint32_t i = 0; i < pages; ++i) reg.pte[i] = b.bus + uint64_t(i) * 4096;
+        ok = api.Control(g_static.h_internal_client, g_static.h_internal_subdevice, 0x20800a9du, &reg, sizeof(reg));
+        if (!ok) st = "REGISTER_CLIENT_SHADOW_FAULT_BUFFER";
+    }
+    const uint32_t rm = api.status, qs = uint32_t(api.q);
+    SpinLockRelease(lock);
+    if (ok) { g_fsQueue = q.cpu; g_fsBuf = b.cpu; }
+    o.ks("status", st); o.kh("rm_status", rm); o.kd("queue", qs); o.kd("nr_size", sz.nsize); o.kd("nr_meta", sz.nmeta);
+    o.kd("capacity", g_fsCap); o.kh("queue_phys", q.bus); o.kh("buf_phys", b.bus); o.send();
+    KPrintf("nv-gsp: client shadow fault buffer: %s (rm 0x%x), %u entries\n", st, rm, g_fsCap);
+}
+void FaultShadowDrain() {   // drainer context; sysmem only
+    if (!g_fsQueue) return;
+    FlushRange(g_fsQueue, 192);
+    uint64_t get = FsGet64(g_fsQueue + 64); const uint64_t put = FsGet64(g_fsQueue + 128);
+    for (uint32_t n = 0; get != put && n < 16; ++n) {
+        const uint8_t* e = g_fsBuf + (get % g_fsCap) * 32;
+        FlushRange(e, 32);
+        const uint32_t w0 = Get32(e), w1 = Get32(e + 4), w2 = Get32(e + 8), w3 = Get32(e + 12), w6 = Get32(e + 24), w7 = Get32(e + 28);
+        KPrintf("nv-gsp: MMU FAULT va %08x%08x inst %08x%08x (ap %u) engine 0x%x fault_type 0x%x client 0x%x access 0x%x "
+                "mmu_client_type %u gpc %u replayable %u valid %u\n",
+                w3, w2 & ~0xfffu, w1, w0 & ~0xfffu, (w0 >> 8) & 3, w6 & 0x1ff, w7 & 0x1f, (w7 >> 8) & 0x7f, (w7 >> 16) & 0xf,
+                (w7 >> 20) & 1, (w7 >> 24) & 0x1f, (w7 >> 7) & 1, w7 >> 31);
+        ++get;
+    }
+    FsPut64(g_fsQueue + 64, get); FlushRange(g_fsQueue + 64, 8);
 }
 void PerfVerb(int mode) {   // 0 status, 1 boost, 2 clear
     Out o; o.raw("{\"nv_gsp\":\"perf\"");
@@ -2136,6 +2198,7 @@ bool NvGspHandle(const char* command) {
         DebugChannelSend(nvd::g_minObjects ? "{\"nv_gsp\":\"drm\",\"min_objects\":true}\n" : "{\"nv_gsp\":\"drm\",\"min_objects\":false}\n");
     }
     else if (!strcmp(verb, "fault dump")) FaultDump();
+    else if (!strcmp(verb, "fault shadow on")) FaultShadowOn();
     else if (!strcmp(verb, "gr clear vas2") || !strcmp(verb, "gr clear vas2 2")) GrVas2(2);
     else if (!strcmp(verb, "gr clear vas2 1")) GrVas2(1);
     else if (!strncmp(verb, "nocat ", 6)) { uint32_t k = 0; for (const char* q = verb + 6; *q >= '0' && *q <= '9'; ++q) k = k * 10 + uint32_t(*q - '0'); NocatVerb(k); }

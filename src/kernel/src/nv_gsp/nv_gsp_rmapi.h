@@ -37,6 +37,7 @@ struct RmApi {
     uint32_t rpc_result = 0, status = 0;   // header rpc_result and the payload's NV_STATUS
     uint32_t calls = 0;
     uint8_t* buf;                        // kRmApiBuf bytes of request scratch (kept off the stack)
+    uint32_t bufcap = kRmApiBuf;         // callers with a bigger scratch raise it (fault shadow buffer: 24 KiB)
     RmApi(RpcChannel* c, uint8_t* r, uint32_t cap, Waiter& w, Doorbell& d, uint8_t* scratch)
         : ch(c), rx(r), rxcap(cap), wait(w), bell(d), buf(scratch) {}
 
@@ -74,7 +75,7 @@ struct RmApi {
     // RM_ALLOC; the reply's params are copied back into `params` when given.
     bool Alloc(uint32_t hClient, uint32_t hParent, uint32_t hObject, uint32_t hClass, void* params, uint32_t size) {
         constexpr uint32_t h = sizeof(rm570::rpc_gsp_rm_alloc_v03_00);
-        if (h + size > kRmApiBuf) { q = QStatus::TooBig; return false; }
+        if (h + size > bufcap) { q = QStatus::TooBig; return false; }
         rm570::rpc_gsp_rm_alloc_v03_00 a = {};
         a.hClient = hClient; a.hParent = hParent; a.hObject = hObject; a.hClass = hClass; a.paramsSize = size;
         __builtin_memcpy(buf, &a, h);
@@ -90,7 +91,7 @@ struct RmApi {
     // RM_CONTROL, params in/out.
     bool Control(uint32_t hClient, uint32_t hObject, uint32_t cmd, void* params, uint32_t size) {
         constexpr uint32_t h = sizeof(rm570::rpc_gsp_rm_control_v03_00);
-        if (h + size > kRmApiBuf) { q = QStatus::TooBig; return false; }
+        if (h + size > bufcap) { q = QStatus::TooBig; return false; }
         rm570::rpc_gsp_rm_control_v03_00 c = {};
         c.hClient = hClient; c.hObject = hObject; c.cmd = cmd; c.paramsSize = size;
         __builtin_memcpy(buf, &c, h);
