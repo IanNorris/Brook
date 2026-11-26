@@ -32,7 +32,7 @@ let
   q3data = dataDir "brook-quake3-data" quake3Data;
   alsoftConf = pkgs.writeText "brook-quake2-alsoft-oss.conf" (builtins.readFile ../data/config/alsoft-oss.conf);
 
-  # llvmpipe for EGL (SDL Wayland) and GLX (Xwayland/Xephyr) through glvnd.
+  # llvmpipe for EGL (SDL Wayland) and GLX (Xwayland) through glvnd.
   softGl = ''
     export LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe
     export LIBGL_DRIVERS_PATH=${mesa}/lib/dri GBM_BACKENDS_PATH=${mesa}/lib/gbm
@@ -118,16 +118,27 @@ let
     [ -n "$result" ]
   '';
 
-  # Steam: the pinned x86-64 client. Default is the rootless desktop Xwayland
-  # with llvmpipe; BROOK_STEAM_MODE=xephyr uses the nested software display.
+  # Steam: the pinned x86-64 client on the rootless desktop Xwayland, with
+  # llvmpipe GLX from the Xwayland wrapper below. No nested Xephyr.
   steamDesktop = script "brook-steam-soft" ''
     ${softGl}
     export BROOK_STEAM_FULL_PYTHON=${pkgs.python3}/bin/python3
-    export PATH=${pkgs.xorg-server}/bin:$PATH
-    if [ "''${BROOK_STEAM_MODE:-rootless}" = xephyr ]; then
-      exec ${steam.launcher}/bin/brook-steam --xephyr "$@"
-    fi
-    exec ${steam.launcher}/bin/brook-steam --gl software --allow-no-glx "$@"
+    exec ${steam.launcher}/bin/brook-steam --gl software "$@"
+  '';
+
+  # waylandd starts /nix/profile/bin/Xwayland with "-glamor gl". With no GPU
+  # that server has no GLX, which Steam needs. Start it the way waylandd's
+  # BROOK_XWAYLAND_SOFTWARE_GLX=1 mode does (-shm +extension GLX +iglx,
+  # llvmpipe for the server only); this was the wrapper that opened Steam on
+  # the Dell's software desktop. exec keeps the pid and inherited fds.
+  xwayland = script "Xwayland" ''
+    args=()
+    while [ $# -gt 0 ]; do
+      if [ "$1" = -glamor ]; then shift 2; continue; fi
+      args+=("$1"); shift
+    done
+    export LIBGL_DRIVERS_PATH=${mesa}/lib/dri LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe
+    exec ${baseProfile}/bin/Xwayland "''${args[@]}" -shm +extension GLX +iglx
   '';
 
   desktop = id: name: exec: icon: categories: ''
@@ -162,7 +173,7 @@ pkgs.runCommand "brook-selected-desktop-games" {
   ln -s ${quake2}/bin/brook-quake2-soft ${quake3}/bin/brook-quake3-soft \
         ${bench}/bin/brook-games-bench ${steamDesktop}/bin/brook-steam-soft "$out/bin/"
   ln -s ${steam.launcher}/bin/brook-steam "$out/bin/brook-steam"
-  ln -s ${pkgs.xorg-server}/bin/Xephyr "$out/bin/Xephyr"
+  rm "$out/bin/Xwayland"; ln -s ${xwayland}/bin/Xwayland "$out/bin/Xwayland"
   # Profile-wide llvmpipe for brook-run's defaults (LIBGL_DRIVERS_PATH, EGL vendor dir).
   ln -s ${mesa}/lib/dri "$out/lib/dri"
   ln -s ${mesa}/lib/gbm "$out/lib/gbm"

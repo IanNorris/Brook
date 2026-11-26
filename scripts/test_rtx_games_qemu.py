@@ -56,7 +56,7 @@ def main():
         bridge.guest_run(guest.session, job, argv, cwd='/tmp', uid=uid, wait_s=2)
         reply = UpdateRun(bridge, args.output).wait_job(
             guest.session, job, lambda row: row.get('state') == 'completed', timeout=timeout,
-            output_limit=65536)
+            output_limit=16384)
         return reply['exit'], reply['stdout']['text'], reply['stderr']['text']
 
     def write():
@@ -67,10 +67,33 @@ def main():
         init = rtx.Run(bridge, args.output / 'bootstrap').profile_bootstrap(guest.session)
         assert init['state'] == 'profile_initialized', init
         args.session, args.bulk_port = guest.session, guest.bulk_port
-        args.profile_plan, args.rollback_profile, args.profile_timeout_s = args.plan, None, 1800
+        args.profile_plan, args.rollback_profile, args.profile_timeout_s = args.plan, None, 5400
         operator = rtx.Run(bridge, args.output / 'profile')
         started = time.monotonic()
-        receipt = operator.profile(argparse.Namespace(**{**vars(args), 'output': operator.output}))
+        outcome = {}
+
+        def apply():
+            try:
+                outcome['receipt'] = operator.profile(argparse.Namespace(**{**vars(args), 'output': operator.output}))
+            except BaseException as error:  # reported below
+                outcome['error'] = error
+        worker = threading.Thread(target=apply, daemon=True)
+        worker.start()
+        probe = ('cd /nix/store; echo store=$(ls | wc -l); ls -d *steam* *mesa-26* *quake* 2>/dev/null | tr "\\n" " "; '
+                 'echo; for d in .brook-nar-* .*tmp* ; do [ -e "$d" ] && du -s "$d"; done 2>/dev/null; df -k /nix | tail -1')
+        with (args.output / 'apply-progress.log').open('a') as progress:
+            while worker.is_alive():
+                worker.join(timeout=120)
+                if worker.is_alive():
+                    try:
+                        _, out, err = run(guest, bridge, ['/nix/profile/bin/bash', '-c', probe], uid=0, timeout=60)
+                    except Exception as error:  # progress only
+                        out, err = '', repr(error)
+                    progress.write(f'{time.monotonic() - started:.0f}s {out} {err}\n')
+                    progress.flush()
+        if 'error' in outcome:
+            raise outcome['error']
+        receipt = outcome['receipt']
         assert receipt['state'] == 'profile_verified', receipt
         result['apply_seconds'] = round(time.monotonic() - started, 1)
         result['missing_store_paths'] = len(receipt['missing_store_paths'])

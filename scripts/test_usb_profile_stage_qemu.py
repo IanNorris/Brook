@@ -29,6 +29,8 @@ def main():
     parser.add_argument('--canary', default='brook-ota-canary')
     parser.add_argument('--expect-refusal', choices=('space', 'bind'))
     parser.add_argument('--accel', choices=('kvm', 'tcg'), default='kvm')
+    parser.add_argument('--apply-timeout-s', type=int, default=480,
+                        help='guest apply bound; large plans (GB of new paths) need longer')
     args = parser.parse_args()
     if not re.fullmatch(r'[A-Za-z0-9_-]+', args.canary):
         parser.error('Expected a basename for the profile canary')
@@ -220,7 +222,7 @@ def main():
         args.bulk_port = guest.bulk_port
         args.profile_plan = args.plan
         args.rollback_profile = None
-        args.profile_timeout_s = 480
+        args.profile_timeout_s = args.apply_timeout_s
         operator = rtx.Run(bridge, args.output / 'apply')
         receipt = operator.profile(argparse.Namespace(**{**vars(args), 'output': operator.output}))
         assert receipt['state'] == 'profile_verified' and receipt['missing_store_paths'], receipt
