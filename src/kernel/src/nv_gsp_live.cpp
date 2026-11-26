@@ -901,6 +901,8 @@ void P4(bool keepDisplay) {
     LoadExtraRegistry();
     g_grSkipScrubber = PathExists("/etc/nv-gsp-no-scrubber");
     g_swgen0Ack = PathExists("/etc/nv-gsp-swgen0-ack");
+    g_sysInfoPrimary = PathExists("/etc/nv-gsp-primary");
+    if (g_sysInfoPrimary) KPrintf("nv-gsp: SET_SYSTEM_INFO bIsPrimary=1 (/etc/nv-gsp-primary)\n");
     if (g_swgen0Ack) KPrintf("nv-gsp: SWGEN0 ack in the event drainer (/etc/nv-gsp-swgen0-ack)\n");
     if (g_grSkipScrubber) KPrintf("nv-gsp: GR scrubber channel skipped (/etc/nv-gsp-no-scrubber)\n");
     static P4Result r;

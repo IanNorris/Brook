@@ -149,6 +149,9 @@ struct PciIdentity {
 // against the 25 Nov Linux SET_SYSTEM_INFO dump (test_nv_gsp_p4). The ACPI
 // block mirrors Linux: bValid = 1 with DOD/JT/MUX method status 0xffff
 // (methods not evaluated). bIsPrimary stays 0 as on Linux.
+// GspSystemInfo.bIsPrimary (r570 offset 0x380): nouveau r570 sends video_is_primary_device().
+// A/B (27 Nov), live: /etc/nv-gsp-primary.
+inline bool g_sysInfoPrimary = false;
 inline void BuildSystemInfo(const PciIdentity& p, uint8_t out[kSysInfoBytes]) {
     ZeroBytes(out, kSysInfoBytes);
     Wr64(out + 0x00, p.bar0);                    // gpuPhysAddr
@@ -165,6 +168,7 @@ inline void BuildSystemInfo(const PciIdentity& p, uint8_t out[kSysInfoBytes]) {
     Wr32(out + 0xa4, 0xffff);                    // dodMethodData.status
     Wr32(out + 0xec, 0xffff);                    // jtMethodData.status
     Wr32(out + 0x33c, 0xffff);                   // muxMethodData... status
+    if (g_sysInfoPrimary) out[0x380] = 1;        // bIsPrimary
 }
 
 // PACKED_REGISTRY_TABLE {u32 size, u32 numEntries, entries[] {u32 nameOffset,
