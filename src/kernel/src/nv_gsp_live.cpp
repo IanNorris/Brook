@@ -1648,6 +1648,17 @@ void FaultShadowDrain() {   // drainer context; sysmem only
     if (!g_fsQueue) return;
     FlushRange(g_fsQueue, 192);
     uint64_t get = FsGet64(g_fsQueue + 64); const uint64_t put = FsGet64(g_fsQueue + 128);
+    {   // raw view (first decode of this buffer layout): queue words and any non-empty slot among the first 16
+        KPrintf("nv-gsp: shadow queue cap %lx msg %lx get %lx put %lx [8] %lx [16] %lx\n", (unsigned long)FsGet64(g_fsQueue),
+                (unsigned long)FsGet64(g_fsQueue + 24), (unsigned long)get, (unsigned long)put,
+                (unsigned long)FsGet64(g_fsQueue + 8), (unsigned long)FsGet64(g_fsQueue + 16));
+        FlushRange(g_fsBuf, 16 * 32);
+        for (uint32_t k = 0; k < 16; ++k) {
+            const uint8_t* e = g_fsBuf + k * 32; uint32_t any = 0; for (int w = 0; w < 8; ++w) any |= Get32(e + 4 * w);
+            if (any) KPrintf("nv-gsp: shadow slot %u: %08x %08x %08x %08x %08x %08x %08x %08x\n", k, Get32(e), Get32(e + 4), Get32(e + 8),
+                             Get32(e + 12), Get32(e + 16), Get32(e + 20), Get32(e + 24), Get32(e + 28));
+        }
+    }
     for (uint32_t n = 0; get != put && n < 16; ++n) {
         const uint8_t* e = g_fsBuf + (get % g_fsCap) * 32;
         FlushRange(e, 32);
