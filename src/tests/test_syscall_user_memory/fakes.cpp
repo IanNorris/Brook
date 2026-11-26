@@ -91,6 +91,12 @@ void NvDrmFileRef(NvDrmFile*) {}
 void NvDrmFileUnref(NvDrmFile*) {}
 int64_t NvDrmIoctl(NvDrmFile*, uint64_t, uint64_t) { return -25; }
 bool NvDrmMapGart(NvDrmFile*, uint64_t, uint64_t, uint64_t*, MappingBacking**) { return false; }
+void NvPrimeRef(void*) {}
+void NvPrimeUnref(void*) {}
+uint64_t NvPrimeBytes(void*) { return 0; }
+uint64_t NvPrimeIdentity(void*) { return 0; }
+int64_t NvPrimeFdIoctl(void*, uint64_t, uint64_t) { return -25; }
+bool NvPrimeMapGart(void*, uint64_t, uint64_t, uint64_t*, MappingBacking**) { return false; }
 BdwGpuFile* BdwGpuFileCreate() { return nullptr; }
 void BdwGpuFileUnref(BdwGpuFile*) {}
 void BdwGpuBufferUnref(BdwGpuBuffer*) {}

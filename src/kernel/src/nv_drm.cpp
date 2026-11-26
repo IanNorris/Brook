@@ -16,6 +16,23 @@ namespace brook {
 namespace {
 nvdrm::DeviceInfo g_dev;
 const nvdrm::Backend* g_be = nullptr;
+// PRIME: a shared BO's backing is freed by whichever file or dmabuf fd drops the last
+// reference, so allocations and frees from different files must not interleave in the
+// backend's allocator. Files see this wrapper; it serialises alloc/free under one lock.
+const nvdrm::Backend* g_raw = nullptr;
+nvdrm::Backend g_locked;
+KMutex g_allocLock;
+struct AllocGuard { AllocGuard() { KMutexLock(&g_allocLock); } ~AllocGuard() { KMutexUnlock(&g_allocLock); } };
+const nvdrm::Backend* LockedBackend(const nvdrm::Backend* raw) {
+    if (!raw) return nullptr;
+    KMutexInit(&g_allocLock);
+    g_raw = raw; g_locked = *raw;
+    g_locked.vram_alloc = [](void* c, uint64_t b, uint64_t a, uint64_t* pa) { AllocGuard g; return g_raw->vram_alloc(c, b, a, pa); };
+    g_locked.vram_free = [](void* c, uint64_t pa, uint64_t b) { AllocGuard g; g_raw->vram_free(c, pa, b); };
+    g_locked.sys_alloc = [](void* c, uint64_t b, uint64_t* k) { AllocGuard g; return g_raw->sys_alloc(c, b, k); };
+    g_locked.sys_free = [](void* c, uint64_t k) { AllocGuard g; g_raw->sys_free(c, k); };
+    return &g_locked;
+}
 volatile bool g_published = false;
 bool g_marker = false;   // /etc/nv-drm, read once at publish
 bool MarkerExists(const char* path) { auto* f = VfsOpen(path, VFS_O_STREAM); if (!f) return false; VfsRelease(f); return true; }
@@ -80,7 +97,8 @@ static void Hex(char* out, uint32_t v) {
 }
 
 void NvDrmPublish(const nvdrm::DeviceInfo& info, const nvdrm::Backend* backend) {
-    g_dev = info; g_dev.valid = true; g_be = backend;
+    g_dev = info; g_dev.valid = true;
+    if (!g_be) g_be = LockedBackend(backend);   // published once per boot (nv_gsp_live)
     // libdrm drmGetDevices2: literal attribute files, PCI slot of the real GPU (02:00.0).
     const char* ue = "DRIVER=nouveau\nPCI_SLOT_NAME=0000:02:00.0\n";
     uint32_t i = 0; for (; ue[i] && i < sizeof(g_attrUevent) - 1; ++i) g_attrUevent[i] = ue[i]; g_attrUevent[i] = 0;
@@ -143,8 +161,20 @@ bool NvDrmMapGart(NvDrmFile* f, uint64_t offset, uint64_t length, uint64_t* phys
     KMutexUnlock(&f->lock);
     return ok;
 }
+nvdrm::File* NvDrmFileLock(NvDrmFile* f) { KMutexLock(&f->lock); return f->core.be ? &f->core : nullptr; }
+void NvDrmFileUnlock(NvDrmFile* f) { KMutexUnlock(&f->lock); }
 int64_t NvDrmIoctl(NvDrmFile* f, uint64_t cmd, uint64_t arg) {
     if (!f) return nvdrm::kENOTTY;
+    // PRIME and syncobj fds need the process fd table: nv_drm_prime.cpp
+    if (nvdrm::IocType(cmd) == 'd') {
+        const uint32_t pnr = nvdrm::IocNr(cmd);
+        if (pnr == 0x2d || pnr == 0x2e || pnr == 0xc1 || pnr == 0xc2) {
+            const int64_t r = NvDrmPrimeIoctl(f, cmd, arg);
+            static uint32_t plogged = 0;
+            if (r < 0 && plogged < 100) { ++plogged; KPrintf("nv-drm: prime ioctl nr 0x%x -> %ld (%s)\n", pnr, (long)r, f->core.why); f->core.why = ""; }
+            return r;
+        }
+    }
     const nvdrm::UserAccess u{nullptr,
         [](void*, void* dst, uint64_t src, uint64_t n) { return CopyFromUser(dst, src, n); },
         [](void*, uint64_t dst, const void* src, uint64_t n) { return CopyToUser(dst, src, n); },

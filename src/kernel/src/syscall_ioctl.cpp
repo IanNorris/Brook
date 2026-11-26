@@ -319,6 +319,8 @@ int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
     }
 #endif
 
+    if(fde->type==FdType::NvPrime)return brook::NvPrimeFdIoctl(fde->handle,cmd,arg);
+
     if(fde->type==FdType::DrmPrime) {
         if(!fde->handle)return -EBADF;
         struct FenceIoctl {uint32_t flags;int32_t fd;};

@@ -67,6 +67,7 @@ enum class FdType : uint8_t
     DevZero,       // /dev/zero (1:5) — zero-filled reads, discarded writes
     DevFull,       // /dev/full (1:7) — zero-filled reads, writes fail ENOSPC
     DevNvDri,      // /dev/dri/renderD130 — nouveau uAPI on GSP-RM (M5, nv_drm.h)
+    NvPrime,       // dmabuf of one renderD130 GEM BO (nv_drm_prime.h Shared, one reference)
 };
 
 // One descriptor slot. type/handle/flags are the immutable identity of the
@@ -104,7 +105,7 @@ inline void FdDiagnosticPath(const FdEntry& fd,char* out,uint32_t capacity)
         case FdType::DevFull: text="/dev/full"; break;
         case FdType::SyncFile: text="anon_inode:sync_file"; break;
         case FdType::IntelSyncObj: text="anon_inode:syncobj_file"; break;
-        case FdType::DrmPrime: case FdType::IntelPrime: text="anon_inode:dmabuf"; break;
+        case FdType::DrmPrime: case FdType::IntelPrime: case FdType::NvPrime: text="anon_inode:dmabuf"; break;
         case FdType::DevDri: text="/dev/dri/renderD128"; break;
         case FdType::DevIntelDri: text="/dev/dri/renderD129"; break;
         case FdType::DevNvDri: text="/dev/dri/renderD130"; break;

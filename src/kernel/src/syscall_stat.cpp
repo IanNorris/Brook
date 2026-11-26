@@ -541,6 +541,16 @@ static int64_t FstatKernel(uint64_t fd,LinuxStat* st)
         return 0;
     }
 
+    if (fde->type==FdType::NvPrime && fde->handle) {
+        memset(st,0,sizeof(LinuxStat));
+        st->st_dev=0x42524b02; // boot-local nouveau PRIME identity namespace
+        st->st_ino=brook::NvPrimeIdentity(fde->handle);
+        st->st_mode=0100600;st->st_nlink=1;st->st_blksize=4096;
+        st->st_size=static_cast<int64_t>(brook::NvPrimeBytes(fde->handle));
+        st->st_blocks=(st->st_size+511)/512;
+        return 0;
+    }
+
     if (fde->type==FdType::IntelPrime && fde->handle) {
         auto* buffer=static_cast<brook::BdwGpuBuffer*>(fde->handle);
         memset(st,0,sizeof(LinuxStat));

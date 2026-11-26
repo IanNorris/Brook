@@ -157,6 +157,7 @@ void FinalizeClosedFd(const FdClaimResult& c)
     }
     if(c.type==FdType::DevIntelDri && c.handle)brook::BdwGpuFileUnref(static_cast<brook::BdwGpuFile*>(c.handle));
     if(c.type==FdType::DevNvDri && c.handle)brook::NvDrmFileUnref(static_cast<brook::NvDrmFile*>(c.handle));
+    if(c.type==FdType::NvPrime && c.handle)brook::NvPrimeUnref(c.handle);
     if(c.type==FdType::IntelPrime && c.handle){
         auto* buffer=static_cast<brook::BdwGpuBuffer*>(c.handle);
         brook::BdwGpuBufferTrackUserRef(buffer,brook::BdwBufferUserRef::Prime,false);
@@ -317,6 +318,8 @@ void FdBumpRefcount(const FdEntry* fde)
         brook::BdwGpuFileRef(static_cast<brook::BdwGpuFile*>(fde->handle));break;
     case FdType::DevNvDri:
         brook::NvDrmFileRef(static_cast<brook::NvDrmFile*>(fde->handle));break;
+    case FdType::NvPrime:
+        brook::NvPrimeRef(fde->handle);break;
     case FdType::IntelPrime: {
         auto* buffer=static_cast<brook::BdwGpuBuffer*>(fde->handle);
         brook::BdwGpuBufferRef(buffer);
@@ -476,6 +479,11 @@ int64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence,
     if(fde->type==FdType::IntelPrime) {
         if(!fde->handle || offset!=0)return -EINVAL;
         if(whence==SEEK_END)return static_cast<int64_t>(brook::BdwGpuBufferBytes(static_cast<brook::BdwGpuBuffer*>(fde->handle)));
+        return whence==SEEK_SET?0:-EINVAL;
+    }
+    if(fde->type==FdType::NvPrime) {
+        if(!fde->handle || offset!=0)return -EINVAL;
+        if(whence==SEEK_END)return static_cast<int64_t>(brook::NvPrimeBytes(fde->handle));
         return whence==SEEK_SET?0:-EINVAL;
     }
 
