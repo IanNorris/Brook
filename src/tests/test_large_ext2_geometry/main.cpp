@@ -61,6 +61,35 @@ int main(int argc, char** argv) {
     assert(LargeExt2GroupDescriptorValid(g,128,32,partial,sizeof(partial)));
     assert(LargeExt2GeometryMake(128u*32768+2,g));
     assert(!LargeExt2GroupDescriptorValid(g,128,32,partial,sizeof(partial)));
+    {
+        // BROOK_SYSTEM grown to fill the Lexar gap: 3759 whole groups, 469.875 GiB.
+        // resize2fs without resize_inode grows the descriptor table to 30 blocks,
+        // so every backup group's bitmaps must start after 1 + 30 blocks.
+        assert(LargeExt2GeometryMake(3759u*32768,g));
+        assert(g.groups==3759 && g.descriptorBytes==3759u*32 && g.descriptorBlocks==30);
+        assert(LargeExt2GroupBounds(g,0,first,end) && first==31 && end==32768);
+        assert(LargeExt2GroupBounds(g,1024,first,end) && first==1024ull*32768); // first new group
+        assert(LargeExt2HasBackup(3125) && LargeExt2HasBackup(2401) && !LargeExt2HasBackup(3126));
+        assert(LargeExt2GroupBounds(g,3125,first,end) && first==3125ull*32768+31);
+        assert(LargeExt2GroupBounds(g,3758,first,end) && end==3759ull*32768);
+        assert(!LargeExt2GroupBounds(g,3759,first,end));
+        uint8_t grown[32]{};
+        put32(grown,3125u*32768+30); put32(grown+4,3125u*32768+31); put32(grown+8,3125u*32768+32);
+        assert(!LargeExt2GroupDescriptorValid(g,3125,8384,grown,sizeof(grown))); // inside the 30-block GDT copy
+        put32(grown,3125u*32768+31); put32(grown+4,3125u*32768+32); put32(grown+8,3125u*32768+33);
+        assert(LargeExt2GroupDescriptorValid(g,3125,8384,grown,sizeof(grown)));
+        uint8_t sb[1024]{}, uuid[16]{}; uuid[0]=0xc1; std::memcpy(sb+104,uuid,16);
+        const uint32_t blocks=3759u*32768, inodes=3759u*8384;
+        const uint64_t bytes=985399296ull*512; // record sectors after the grow
+        assert(uint64_t(blocks)*4096==bytes);
+        put32(sb,inodes); put32(sb+4,blocks); put32(sb+12,blocks-100); put32(sb+16,inodes-100);
+        put32(sb+24,2); put32(sb+28,2); put32(sb+32,32768); put32(sb+36,32768);
+        put32(sb+40,8384); put16(sb+56,0xef53); put16(sb+58,1); put32(sb+76,1);
+        put32(sb+84,11); put16(sb+88,128); put32(sb+96,2); put32(sb+100,3);
+        assert(LargeExt2ClassifyHeader(sb,sizeof(sb),bytes,uuid,g)==LargeExt2HeaderState::Clean && g.groups==3759);
+        // The old 128 GiB extent no longer matches a grown superblock, and back.
+        assert(LargeExt2ClassifyHeader(sb,sizeof(sb),268435456ull*512,uuid,g)==LargeExt2HeaderState::Invalid);
+    }
     assert(LargeExt2GeometryMake(4096u*32768,g) && g.descriptorBlocks==32);
     LargeExt2Geometry forged=g; forged.descriptorBlocks=1;
     assert(!LargeExt2GroupBounds(forged,0,first,end));
