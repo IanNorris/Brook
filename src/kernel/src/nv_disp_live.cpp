@@ -792,7 +792,15 @@ NvHead0Arm NvDispHead0Fence(bool on,const char* why){
     return a;
 }
 void NvDisplayDesktopStart(){
-    if(!MarkerSet("/etc/nv-display"))return;
+    // No /etc/nv-display (builder without --nv-display): Brook leaves the display engine alone
+    // (GOP framebuffer stays as the firmware set it), but GSP-RM still comes up headless (plain
+    // p4, no keep-display, no CE present) - the 27 Nov "hands-off display" A/B.
+    if(!MarkerSet("/etc/nv-display")){
+#if defined(BROOK_NV_GSP)
+        NvGspAutostartHeadless();
+#endif
+        return;
+    }
     Process* t=KernelThreadCreate("nv_display",DesktopStartThread,nullptr,3);
     if(t)SchedulerAddProcess(t);else KPrintf("nv-display: thread start failed\n");
 }
