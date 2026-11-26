@@ -1717,6 +1717,7 @@ struct Chan {
 Vas g_vas[kMaxVas];
 Chan g_chan[kMaxChans];
 volatile bool g_dead[kChidFirst + kChidCount];
+uint32_t g_grce = 0;                  // GR runlist copy engine (RM engine type), from the device info table
 volatile bool g_minObjects = false;   // `nv-gsp drm minobj on`: only TURING_A + COMPUTE_A on channels (Xid 62 A/B)
 nvdrm::VramHeap g_heap;
 bool g_heapInit = false;
@@ -1870,11 +1871,36 @@ bool NvdChanCreate(void*, uint32_t vas, uint32_t engine, uint32_t* out) {
         uint32_t entries = 0;
         bool good = x.ChannelInVas(s, ch.mthdbuf, g_gr.mthdbuf_size) && x.Promote(s, g_gr.bufs, false, &entries);
         v.s.lpt_page = s.lpt_page; v.s.lpt_off = s.lpt_off; v.s.lpt_aper = s.lpt_aper;
+        // NVK allocates TURING_DMA_COPY_A on its GR channel (nouveau_ws_3d_context_init, ENGINE_COPY)
+        // and uses it for fills/copies: the GR runlist's copy engine (GRCE), as nouveau's
+        // r535_ce_alloc does with engineType COPY0 + inst (27 Nov: without it the first copy
+        // faulted, Xid 44 + MMU fault).
+        if (good && !nvd::g_grce) {
+            static rm::NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_PARAMS t;
+            __builtin_memset(&t, 0, sizeof(t));
+            if (x.api.Control(g_static.h_internal_client, g_static.h_internal_subdevice, rm::NV2080_CTRL_CMD_FIFO_GET_DEVICE_INFO_TABLE,
+                              &t, sizeof(t))) {
+                uint32_t gr_rl = ~0u;
+                for (uint32_t k = 0; k < t.numEntries && k < rm::kDevInfoMaxEntries; ++k)
+                    if (t.entries[k].engineData[rm::ENGINE_INFO_TYPE_RM_ENGINE_TYPE] == rm::RM_ENGINE_TYPE_GR0)
+                        gr_rl = t.entries[k].engineData[rm::ENGINE_INFO_TYPE_RUNLIST];
+                for (uint32_t k = 0; k < t.numEntries && k < rm::kDevInfoMaxEntries && !nvd::g_grce; ++k) {
+                    const uint32_t e = t.entries[k].engineData[rm::ENGINE_INFO_TYPE_RM_ENGINE_TYPE];
+                    if (e >= rm::RM_ENGINE_TYPE_COPY0 && e <= rm::RM_ENGINE_TYPE_COPY9 &&
+                        t.entries[k].engineData[rm::ENGINE_INFO_TYPE_RUNLIST] == gr_rl) nvd::g_grce = e;
+                }
+                KPrintf("nv-drm: GR runlist %u copy engine (GRCE) engine type 0x%x\n", gr_rl, nvd::g_grce);
+            }
+        }
         good = good && x.alloc(s, s.h_chan, s.h_chan + 1, rm::gr::TURING_A, nullptr, 0, "RM_ALLOC TURING_A") &&
                x.alloc(s, s.h_chan, s.h_chan + 2, rm::gr::TURING_COMPUTE_A, nullptr, 0, "RM_ALLOC TURING_COMPUTE_A") &&
                (nvd::g_minObjects ||
                 (x.alloc(s, s.h_chan, s.h_chan + 3, 0x902d, nullptr, 0, "RM_ALLOC FERMI_TWOD_A") &&
                  x.alloc(s, s.h_chan, s.h_chan + 4, 0xa140, nullptr, 0, "RM_ALLOC KEPLER_INLINE_TO_MEMORY_B")));
+        if (good && nvd::g_grce) {
+            struct { uint32_t version, engineType; } ce = {1, nvd::g_grce};   // NVC0B5_ALLOCATION_PARAMETERS
+            good = x.alloc(s, s.h_chan, s.h_chan + 5, 0xc5b5, &ce, sizeof(ce), "RM_ALLOC TURING_DMA_COPY_A (GRCE)");
+        }
         // BIND + GPFIFO_SCHEDULE + token wait for the first EXEC (NvdSchedule): a scheduled GR
         // channel left idle ~1 s preceded the RM asserts / Xid 62 seen on 26 Nov.
         (void)vio; (void)c; (void)h::kDoorbell;
