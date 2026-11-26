@@ -42,11 +42,12 @@ bool ShutdownCanForceApps(const char* requestId=nullptr);
 bool ShutdownCanForceRestart(const char* requestId);
 const char* ShutdownDesktopStatus();
 // After a failed checked shutdown: the explicit retry of the final sync and
-// the forced (data-losing) power off the desktop may offer.
-struct ShutdownFailureActions { bool failed, retry, forcePowerOff; };
+// the forced power transitions the desktop may offer.
+struct ShutdownFailureActions { bool failed, retry, forcePowerOff, forceRestart; };
 ShutdownFailureActions ShutdownDesktopFailureActions();
 void ShutdownDesktopRetry();
 void ShutdownDesktopForcePowerOff();
+void ShutdownDesktopForceRestart();
 // Increments on every transition to Failed (the compositor surfaces it).
 uint32_t ShutdownFailureGeneration();
 // True after the current shutdown is clean and the machine has no soft-off method.

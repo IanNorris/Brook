@@ -397,7 +397,7 @@ static ChromeLauncherChrome LauncherChrome(int32_t mouseX, int32_t mouseY)
     return {g_launcherModelIcon, g_launcherModel.AppCount(), "brook", build, status,
             g_launcherPower.prompt(), g_launcherPower.pending() == LauncherPowerAction::Restart,
             g_launcherPower.confirmFocused(), shutdownActive, mouseX, mouseY, ShutdownCanForceApps(),
-            failure.failed, failure.failed && failure.retry, failure.failed && failure.forcePowerOff};
+            failure.failed, failure.failed && failure.retry, failure.failed && failure.forcePowerOff, failure.failed && failure.forceRestart};
 }
 
 // The frame for the current model, with the model's viewport in step.
@@ -520,6 +520,7 @@ static void WmCaptureLauncher(uint32_t screenW, uint32_t screenH, int32_t mouseX
     snapshot.shutdownFailed = chrome.shutdownFailed;
     snapshot.retryShutdown = chrome.retryShutdown;
     snapshot.forcePowerOff = chrome.forcePowerOff;
+    snapshot.forceRestart = chrome.forceRestart;
     snapshot.prompt = chrome.prompt;
     snapshot.promptRestart = chrome.promptRestart;
     snapshot.confirmFocused = chrome.confirmFocused;
@@ -580,6 +581,7 @@ bool WmLauncherPress(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH,
     case LauncherTargetKind::ForceApps: power = LauncherPowerTarget::ForceApps; break;
     case LauncherTargetKind::RetryShutdown: power = LauncherPowerTarget::RetryShutdown; break;
     case LauncherTargetKind::ForcePowerOff: power = LauncherPowerTarget::ForcePowerOff; break;
+    case LauncherTargetKind::ForceRestart: power = LauncherPowerTarget::ForceRestart; break;
     case LauncherTargetKind::Footer: power = LauncherPowerTarget::Footer; break;
     default: break;
     }

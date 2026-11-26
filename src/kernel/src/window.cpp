@@ -3153,6 +3153,7 @@ static void LauncherPowerRun(LauncherPowerCommand command)
     case LauncherPowerCommand::ForceApps:ShutdownDesktopForceApps();break;
     case LauncherPowerCommand::RetryShutdown:SerialPuts("WM: launcher shutdown retry\n");ShutdownDesktopRetry();break;
     case LauncherPowerCommand::ForcePowerOff:SerialPuts("WM: launcher forced power off\n");ShutdownDesktopForcePowerOff();break;
+    case LauncherPowerCommand::ForceRestart:ShutdownDesktopForceRestart();break;
     }
     CompositorMarkDirty();CompositorWake();
 }

@@ -85,7 +85,8 @@ void FileObjectStopWriteback(){++writebackStops;writebackStopped=true;assert(!cl
 void Ext2StopWriteback(){assert(writebackStopped);}
 void PlatformPowerConfigure(){}
 const PlatformPowerPlan& PlatformPowerGetPlan(){return powerPlan;}
-bool PlatformPowerIssue(bool restart){assert(writebackStopped && gate && (syncError==0 || operations[current].forced));++powerWrites;lastRestart=restart;return true;}
+bool PlatformPowerIssue(bool restart, bool forceWarm){
+assert(forceWarm==(operations[current].forced && restart));assert(writebackStopped && gate && (syncError==0 || operations[current].forced));++powerWrites;lastRestart=restart;return true;}
 bool DeviceCloseWrites(){assert(writebackStopped);++freezes;return canFreeze;}
 void AudioStop(){}
 void AudioPrepareShutdown(){}
@@ -173,7 +174,8 @@ void TestFailureRecovery() {
     step();assert(powerWrites==writesBefore+1);
     assert(!strcmp(ShutdownDesktopStatus(),ioText));
     powerRestart=false;assert(!ShutdownCanForceRestart(req));command(req,"force_restart","not_ready",-16);
-    powerRestart=true;assert(ShutdownCanForceRestart(req));command(req,"force_restart","committing");
+    powerRestart=true;assert(ShutdownCanForceRestart(req) && ShutdownDesktopFailureActions().forceRestart);
+    ShutdownDesktopForceRestart();command(req,"power_status","committing");
     terminalSleeps=true;step();terminalSleeps=false;
     assert(powerWrites==writesBefore+2&&lastRestart&&operations[current].phase==Phase::Failed);
     step();assert(powerWrites==writesBefore+2);

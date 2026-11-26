@@ -115,7 +115,7 @@ struct ChromeShellModel {
     bool popupPinnable, popupPinned;
     char text[128], detail[64]; // launcher header, tooltip or flyout address
     bool forceApps;
-    bool shutdownFailed, retryShutdown, forcePowerOff;
+    bool shutdownFailed, retryShutdown, forcePowerOff, forceRestart;
 };
 
 static_assert(__is_trivially_copyable(ChromeShellModel));
@@ -149,7 +149,7 @@ inline void BuildShellModel(const ChromeShellModel& model, const ChromeStyle& st
         const ChromeLauncherChrome chrome{icons, count, "brook", ChromeShellBoot::Optional(model.launcherBuild),
             ChromeShellBoot::Optional(model.text), model.prompt, model.promptRestart, model.confirmFocused,
             model.shutdownActive, model.mouseX, model.mouseY, model.forceApps,
-            model.shutdownFailed, model.retryShutdown, model.forcePowerOff};
+            model.shutdownFailed, model.retryShutdown, model.forcePowerOff, model.forceRestart};
         ChromeBuildLauncher(model.launcherModel, chrome, model.launcherFrame, style, list);
         break;
     }

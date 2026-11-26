@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fill bounded /tmp and the RAM initrd in a disposable guest, then restart."""
+"""Fill the desktop tmpfs and the RAM initrd in a disposable guest, then restart."""
 import argparse
 import os
 from pathlib import Path
@@ -77,6 +77,9 @@ def main():
                     '--output', probe, '--display-width', '800', '--display-height', '600'],
                    env=dict(os.environ, BROOK_INITRD_KIB='8192'), check=True)
     initrd = probe / 'payload/INITRD.IMG'
+    marker = output / 'volatile-desktop'
+    marker.write_text('1\n')
+    subprocess.run(['mcopy', '-i', initrd, marker, '::/ETC/volatile-desktop'], check=True)
     startup = output / 'INIT.RC'
     startup.write_text('set wm\nset vfb none\nrun --console --uid 0 /boot/FILL.ELF\nreboot\n')
     subprocess.run(['mcopy', '-i', initrd, guest, '::/BOOT/FILL.ELF'], check=True)

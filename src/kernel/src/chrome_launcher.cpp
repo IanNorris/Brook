@@ -417,7 +417,7 @@ struct Builder {
         for (uint32_t i = 0; i < f.targetCount; ++i) {
             const auto& h = f.targets[i];
             if (((h.target.kind >= TK::Settings && h.target.kind <= TK::CancelShutdown) || h.target.kind == TK::Organise || h.target.kind == TK::ForceApps ||
-                 h.target.kind == TK::RetryShutdown || h.target.kind == TK::ForcePowerOff ||
+                 h.target.kind == TK::RetryShutdown || h.target.kind == TK::ForcePowerOff || h.target.kind == TK::ForceRestart ||
                  h.target.kind == TK::ResetOrganisation) && h.rect.x < right) right = h.rect.x;
         }
         const char* status = c.prompt && !c.shutdownActive ?
@@ -460,6 +460,7 @@ struct Builder {
             case TK::ForceApps: TextButton(h.rect, "Force close apps", true, false); break;
             case TK::RetryShutdown: TextButton(h.rect, "Retry", true, false); break;
             case TK::ForcePowerOff: TextButton(h.rect, "Force power off", false, false); break;
+            case TK::ForceRestart: TextButton(h.rect, "Restart anyway", false, false); break;
             default: break;
             }
         }
@@ -908,6 +909,7 @@ void ChromeLauncherFrameFor(const LauncherModel& m, const ChromeLauncherChrome& 
     if (c.shutdownFailed) {
         if (c.retryShutdown) textButton(TK::RetryShutdown, "Retry");
         if (c.forcePowerOff) textButton(TK::ForcePowerOff, "Force power off");
+        if (c.forceRestart) textButton(TK::ForceRestart, "Restart anyway");
     } else if (c.shutdownActive) {
         textButton(TK::CancelShutdown, "Cancel shutdown");
         if(c.forceApps)textButton(TK::ForceApps, "Force close apps");

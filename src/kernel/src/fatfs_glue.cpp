@@ -10,6 +10,7 @@
 #include "ramdisk.h"
 #include "rtc.h"
 #include "device.h"
+#include "process.h"
 #include "serial.h"
 #include "spinlock.h"
 
@@ -20,6 +21,9 @@ extern "C" {
 }
 
 namespace brook {
+
+__attribute__((weak)) Process* ProcessCurrent();
+__attribute__((weak)) const char* FatFsCurrentWritePath();
 
 static constexpr uint8_t FATFS_MAX_DRIVES = FF_VOLUMES;
 static Device* g_fatfsDrives[FATFS_MAX_DRIVES] = {};
@@ -32,7 +36,6 @@ static IrqSpinLock g_driveLock;
 // cannot establish that the lost metadata was repaired. FLUSH-only failures
 // do not set this latch and remain retryable.
 static uint32_t g_fatfsWriteErrors[FATFS_MAX_DRIVES] = {};
-
 static bool KernelPtrLooksCanonical(const void* ptr)
 {
 #ifdef BROOK_HOST_TEST
@@ -231,12 +234,27 @@ DRESULT disk_write(BYTE pdrv, const BYTE* buff, LBA_t sector, UINT count)
     uint64_t offset = static_cast<uint64_t>(sector) * SECTOR_SIZE;
     uint64_t len    = static_cast<uint64_t>(count)  * SECTOR_SIZE;
 
-    int ret = brook::DeviceWrite(dev, offset, buff, len);
-    if (ret != static_cast<int>(len) &&
-        !__atomic_exchange_n(&brook::g_fatfsWriteErrors[pdrv], 1, __ATOMIC_RELAXED))
-        brook::SerialPrintf("fatfs: first sector write failure pdrv=%u sector=%lu count=%u result=%d\n",
-                           unsigned(pdrv), static_cast<unsigned long>(sector), count, ret);
-    return (ret == static_cast<int>(len)) ? RES_OK : RES_ERROR;
+    const auto result = brook::DeviceWriteWithAdmission(dev, offset, buff, len);
+    if (result.count == static_cast<int>(len)) return RES_OK;
+    // A refused sector reached no driver, but the same FatFS operation may
+    // already have written other metadata sectors. Keep checked sync honest.
+    if (!__atomic_exchange_n(&brook::g_fatfsWriteErrors[pdrv], 1, __ATOMIC_RELAXED)) {
+        using Admission = brook::DeviceWriteAdmission;
+        const char* reason = result.count < 0 ? "device-error" : "short-transfer";
+        switch (result.admission) {
+            case Admission::NoDevice: reason = "no-device"; break;
+            case Admission::ExtentLease: reason = "extent-lease"; break;
+            case Admission::ShutdownBarrier: reason = "shutdown-barrier"; break;
+            case Admission::Admitted: break;
+        }
+        const auto* writer = brook::ProcessCurrent ? brook::ProcessCurrent() : nullptr;
+        const char* path = brook::FatFsCurrentWritePath ? brook::FatFsCurrentWritePath() : nullptr;
+        if (!path || !*path) path = "<fat-metadata>";
+        brook::SerialPrintf("fatfs: first sector write failure pdrv=%u pid=%u path=%s reason=%s sector=%lu count=%u result=%d\n",
+                           unsigned(pdrv), writer ? unsigned(writer->pid) : 0, path, reason,
+                           static_cast<unsigned long>(sector), count, result.count);
+    }
+    return RES_ERROR;
 }
 
 DRESULT disk_ioctl(BYTE pdrv, BYTE cmd, void* buff)

@@ -31,7 +31,9 @@ PowerQuiesceList quiesce;
 uint64_t efiTestCandidate=0;
 MemoryDescriptor efiTestMap[4096]{};
 BootProtocol efiTestBoot{};
-bool EfiTestOff(void*,uint64_t entry) {
+enum class EfiResetType : uint32_t { Warm = 1, Shutdown = 2 };
+
+bool EfiTestReset(uint64_t entry, EfiResetType type) {
     uint64_t cr0=0;__asm__ volatile("mov %%cr0,%0":"=r"(cr0));
     if(cr0&((1ull<<2)|(1ull<<3)))return false;
     uint64_t flags=0,cr3=0;
@@ -61,18 +63,21 @@ bool EfiTestOff(void*,uint64_t entry) {
     if((cr3&0x000ffffffffff000ull)!=VmmKernelCR3().pml4.raw() || entry!=inventory.resetSystem ||
        !mapping.complete || mapping.unavailable || mapping.wrongAddress || mapping.nonExecutable || mapping.nonWritable || !cacheMatches) {
         __asm__ volatile("pushq %0; popfq"::"r"(flags):"memory","cc");
-        SerialPuts("efi-runtime: shutdown recheck failed\n");return false;
+        SerialPuts("efi-runtime: reset system recheck failed\n");return false;
     }
     using ResetFn=void (__attribute__((ms_abi)) *)(uint32_t,uint64_t,uint64_t,void*);
     const auto reset=reinterpret_cast<ResetFn>(entry);
     uint16_t oldCw=0;uint32_t oldMxcsr=0;const uint16_t cw=0x037f;const uint32_t mxcsr=0x1f80;
-    SerialPuts("efi-runtime: shutdown call\n");
+    SerialPuts(type == EfiResetType::Warm ? "efi-runtime: warm restart call\n" : "efi-runtime: shutdown call\n");
     __asm__ volatile("fnstcw %0; stmxcsr %1; fldcw %2; ldmxcsr %3"
         :"=m"(oldCw),"=m"(oldMxcsr):"m"(cw),"m"(mxcsr):"memory");
-    reset(2,0,0,nullptr);
+    reset(static_cast<uint32_t>(type),0,0,nullptr);
     __asm__ volatile("fldcw %0; ldmxcsr %1; pushq %2; popfq"::"m"(oldCw),"m"(oldMxcsr),"r"(flags):"memory","cc");
-    SerialPuts("efi-runtime: shutdown returned\n");return false;
+    SerialPuts(type == EfiResetType::Warm ? "efi-runtime: warm restart returned\n" : "efi-runtime: shutdown returned\n");
+    return type == EfiResetType::Warm;
 }
+bool EfiTestOff(void*, uint64_t entry) { return EfiTestReset(entry, EfiResetType::Shutdown); }
+bool EfiWarmRestart(void*, uint64_t entry) { return EfiTestReset(entry, EfiResetType::Warm); }
 #endif
 bool Write8(void*,uint16_t port,uint8_t value){outb(port,value);return true;}
 bool Write16(void*,uint16_t port,uint16_t value){outw(port,value);return true;}
@@ -138,10 +143,10 @@ extern "C" void PlatformPowerExtendResetWatchdog(uint32_t ms){
             SerialPrintf("power: reset watchdog extended by %u ms\n",ms);return;}
     }
 }
-bool PlatformPowerIssue(bool restart){
+bool PlatformPowerIssue(bool restart, bool forceWarm){
     // Stop device DMA first: a reset that lands while xHCI/NIC bus masters
     // are running has been seen to hang the desktop firmware in POST.
-    if(restart?plan.CanReset():plan.CanPowerOff()){
+    if(restart?(plan.CanReset() || (forceWarm && plan.CanForceEfiRestart())):plan.CanPowerOff()){
         if(restart && plan.CanReset())__atomic_store_n(&resetDeadline,ApicTickCount()+5000,__ATOMIC_RELEASE);
         const unsigned hooks=PlatformPowerRunQuiesce();
         SerialPrintf("power: %u quiesce hook%s ran before %s\n",hooks,hooks==1?"":"s",restart?"reset":"power-off");
@@ -151,13 +156,15 @@ bool PlatformPowerIssue(bool restart){
     // (possibly recovery) kernel; a no-op unless a flip path was activated.
     BdwScanoutPanicRestore();
 #endif
-    return plan.Issue(restart,{nullptr,Write8,Write16,
+    const PowerIo io{nullptr, Write8, Write16,
 #if !defined(BROOK_HOST_TEST)
-    EfiTestOff,
+                     EfiTestOff, Read16, EfiWarmRestart
 #else
-    nullptr,
+                     nullptr, Read16, nullptr
 #endif
-    Read16});}
+    };
+    return restart && forceWarm ? plan.IssueForcedRestart(io) : plan.Issue(restart, io);
+}
 #if !defined(BROOK_HOST_TEST)
 void PlatformPowerSetEfiCandidate(const BootProtocol* boot){
     const auto inventory=InspectEfiRuntime(boot);

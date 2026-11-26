@@ -449,7 +449,7 @@ void Worker(void*) {
             KLog(op.forcedReset?"shutdown: forced restart after failed shutdown":
                                 "shutdown: forced power off after failed shutdown");
             SchedulerSleepMs(500);
-            if(PlatformPowerIssue(op.forcedReset))SchedulerSleepMs(1000);
+            if(PlatformPowerIssue(op.forcedReset, op.forcedReset))SchedulerSleepMs(1000);
             SetPhase(selected,Phase::Failed,-5);
         }else if(op.phase==Phase::Ready&&(op.automatic||op.commit)&&(op.restart?powerRestart:powerOff)) {
             SetPhase(selected,Phase::Committing);
@@ -617,7 +617,7 @@ void HandleShutdownCommand(const char* id,const char* verb,char state[24],int* e
         }
         const bool forceReset=!strcmp(verb,"force_restart");
         if(forceReset || !strcmp(verb,"force_power_off")) {
-            if(current==found&&op.phase==Phase::Failed&&irreversible&&(forceReset?powerRestart:powerOff)) {
+            if(current==found&&op.phase==Phase::Failed&&irreversible&&(forceReset?(powerRestart || PlatformPowerGetPlan().CanForceEfiRestart()):powerOff)) {
                 op.phase=Phase::Committing;op.forced=true;op.forcedReset=forceReset;op.error=0;
             }
             else {result="not_ready";*error=-16;}
@@ -724,10 +724,16 @@ void ShutdownDesktopForcePowerOff() {
     if(id[0]){char state[24];int error;ShutdownCommand(id,"force_power_off",state,&error);
         if(!error)SerialPrintf("shutdown: request=%s forced power off requested\n",id);}
 }
+void ShutdownDesktopForceRestart() {
+    char id[33]{};SpinLockAcquire(&lock);if(current>=0)memcpy(id,operations[current].id,33);SpinLockRelease(&lock);
+    if(id[0]){char state[24];int error;ShutdownCommand(id,"force_restart",state,&error);
+        if(!error)SerialPrintf("shutdown: request=%s forced restart requested\n",id);}
+}
 ShutdownFailureActions ShutdownDesktopFailureActions() {
     SpinLockAcquire(&lock);ShutdownFailureActions actions{};
     if(current>=0&&operations[current].phase==Phase::Failed&&irreversible) {
         actions.failed=true;actions.retry=operations[current].syncFailed;actions.forcePowerOff=powerOff;
+        actions.forceRestart=powerRestart || PlatformPowerGetPlan().CanForceEfiRestart();
     }
     SpinLockRelease(&lock);return actions;
 }
@@ -743,7 +749,7 @@ bool ShutdownCanForceApps(const char* id) {
 }
 bool ShutdownCanForceRestart(const char* id) {
     SpinLockAcquire(&lock);
-    const bool result=current>=0 && irreversible && powerRestart &&
+    const bool result=current>=0 && irreversible && (powerRestart || PlatformPowerGetPlan().CanForceEfiRestart()) &&
         operations[current].phase==Phase::Failed && !strcmp(operations[current].id,id);
     SpinLockRelease(&lock);
     return result;

@@ -1,19 +1,30 @@
 #include <cassert>
+#include <cstdarg>
+#include <cstdio>
+#include <cstring>
 #include <atomic>
 #include <thread>
 #include <sys/wait.h>
 #include <unistd.h>
 #include "fatfs_glue.h"
 #include "diskio.h"
-namespace {bool readOnly=true,roError=false,failWrite=false;unsigned writes=0;}
+namespace {bool readOnly=true,roError=false,failWrite=false;unsigned writes=0;bool barrier=false;char diagnosticLine[256]{};}
 namespace brook {
 extern "C" bool DeviceIsRegistered(Device* d){return d && d->priv;}
 extern "C" int DeviceFlush(Device*){return 0;}
-extern "C" int DeviceWrite(Device*,uint64_t,const void*,uint64_t n){++writes;return failWrite?-5:int(n);}
+DeviceWriteResult DeviceWriteWithAdmission(Device*,uint64_t,const void*,uint64_t n){if (barrier) return {-30, DeviceWriteAdmission::ShutdownBarrier};
+    ++writes;
+    return {failWrite?-5:int(n), DeviceWriteAdmission::Admitted};}
 uint32_t DeviceCountRaw(){return 2;}
 bool DeviceRegistryCorrupted(){return false;}
 void DeviceDumpRegistry(){}
-extern "C" void SerialPrintf(const char*,...){}
+const char* FatFsCurrentWritePath(){return "/VOLATILE.DAT";}
+extern "C" void SerialPrintf(const char* pattern,...) {
+    va_list args;
+    va_start(args,pattern);
+    std::vsnprintf(diagnosticLine,sizeof(diagnosticLine),pattern,args);
+    va_end(args);
+}
 }
 int main(){
     using namespace brook;
@@ -73,7 +84,14 @@ int main(){
     readOnly=true; // the capability was pinned when the exclusive slot bound
     assert(FatFsAcquireExclusiveDrive(2,&c,&ro) && !ro);
     FatFsReleaseDrive(2);assert(!FatFsAcquireExclusiveDrive(2,&c,&ro));
+    barrier=true;
+    unsigned before=writes;
+    assert(disk_write(0,reinterpret_cast<BYTE*>(data),0,1)==RES_ERROR && writes==before);
+    assert(std::strstr(diagnosticLine,"pdrv=0 pid=0 path=/VOLATILE.DAT reason=shutdown-barrier"));
+    barrier=false;
+    assert(FatFsFlushDrive(0)==-5);
     failWrite=true;assert(disk_write(2,reinterpret_cast<BYTE*>(data),0,1)==RES_ERROR);failWrite=false;
+    assert(std::strstr(diagnosticLine,"pdrv=2 pid=0 path=/VOLATILE.DAT reason=device-error"));
     assert(FatFsFlushDrive(2)==-5 && !FatFsBindDrive(2,&c) &&
            !FatFsBindExclusiveDrive(2,&c) && FatFsFlushDrive(2)==-5);
 }
