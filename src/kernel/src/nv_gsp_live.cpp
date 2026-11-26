@@ -1981,6 +1981,80 @@ bool NvdChanError(void*, uint32_t chan) {
 const nvdrm::Backend g_nvdBackend{nullptr, NvdVramAlloc, NvdVramFree, NvdSysAlloc, NvdSysFree, NvdVasCreate, NvdVasDestroy,
                                   NvdVasMap, NvdVasUnmap, NvdVasFlush, NvdChanCreate, NvdChanDestroy, NvdChanSubmit,
                                   NvdChanCompleted, NvdChanError, false};
+
+// `nv-gsp gr clear vas2 [1|2]` (27 Nov NVK Xid 44 A/B): NVK's kernel path without NVK. One VAS
+// from NvdVasCreate, N GR channels from NvdChanCreate (1 or 2, default 2; as nv-drm makes them
+// for NVK), a 256x256 pitch target and a push buffer mapped with NvdVasMap, the known-good clear
+// submitted through NvdChanSubmit on the last channel, then on the first. Pixels read via PRAMIN.
+void GrVas2(uint32_t nchan) {
+    namespace h = rm570::host;
+    Out o; o.raw("{\"nv_gsp\":\"gr clear vas2\""); o.kd("channels", nchan);
+    const ChipOps* c = ChipForBoot0(g_bus.rd32(0));
+    if (!c || !g_rmRunning || !g_gr.up) { o.ks("refused", "needs GSP-RM and gr golden this boot"); o.send(); return; }
+    uint32_t vas = 0, ch[2] = {~0u, ~0u}, made = 0; uint64_t rt = 0, push = 0;
+    const char* status = "ok";
+    const uint32_t W = 256, H = 256, pitch = W * 4; const uint64_t rt_bytes = 0x200000, va_rt = 0x1000000000ull, va_push = 0x1000200000ull;
+    bool rt_mapped = false, push_mapped = false, vas_ok = false;
+    uint32_t done_ok = 0, sample = 0;
+    if (!NvdVasCreate(nullptr, 0, 0, &vas)) { status = "VAS create"; goto out; }
+    vas_ok = true;
+    for (; made < nchan; ++made) if (!NvdChanCreate(nullptr, vas, 1, &ch[made])) { status = "channel create"; goto out; }
+    if (!NvdVramAlloc(nullptr, rt_bytes, rt_bytes, &rt)) { status = "VRAM"; goto out; }
+    if (!NvdVasMap(nullptr, vas, va_rt, nvdrm::Aper::Vram, rt, 0, rt_bytes, 0)) { status = "map target"; goto out; }
+    rt_mapped = true;
+    if (!NvdSysAlloc(nullptr, 0x1000, &push)) { status = "push sysmem"; goto out; }
+    if (!NvdVasMap(nullptr, vas, va_push, nvdrm::Aper::Sys, push, 0, 0x1000, 0)) { status = "map push"; goto out; }
+    push_mapped = true;
+    if (!NvdVasFlush(nullptr, vas)) { status = "flush"; goto out; }
+    for (int pass = 0; pass < int(nchan); ++pass) {
+        const uint32_t k = nchan - 1 - uint32_t(pass);   // last channel first, as NVK's chid 9
+        uint32_t* w = reinterpret_cast<uint32_t*>(PhysToVirt(PhysicalAddress(reinterpret_cast<NvDrmSysPages*>(push)->phys)).raw());
+        uint32_t n = 0;
+        auto m1 = [&](uint32_t mthd, uint32_t v) { w[n++] = h::IncHeader(0, mthd, 1); w[n++] = v; };
+        const float col[2][4] = {{1, 0, 1, 1}, {0, 1, 1, 1}};
+        const uint32_t want = pass ? 0xff00ffffu : 0xffff00ffu;
+        w[n++] = h::IncHeader(0, 0, 1); w[n++] = rm570::gr::TURING_A;
+        w[n++] = h::IncHeader(0, gr3d::SET_COLOR_TARGET_A0, 8); w[n++] = uint32_t(va_rt >> 32); w[n++] = uint32_t(va_rt);
+        w[n++] = pitch; w[n++] = H; w[n++] = gr3d::FORMAT_A8R8G8B8; w[n++] = gr3d::MEMORY_LAYOUT_PITCH; w[n++] = 1; w[n++] = 0;
+        m1(gr3d::SET_CT_SELECT, 1); m1(gr3d::SET_ZT_SELECT, 0);
+        w[n++] = h::IncHeader(0, gr3d::SET_SURFACE_CLIP_HORIZONTAL, 2); w[n++] = W << 16; w[n++] = H << 16;
+        w[n++] = h::IncHeader(0, gr3d::SET_WINDOW_OFFSET_X, 2); w[n++] = 0; w[n++] = 0;
+        m1(gr3d::SET_SCISSOR_ENABLE0, 0); m1(gr3d::SET_CLEAR_SURFACE_CONTROL, 0); m1(gr3d::SET_RENDER_ENABLE_C, gr3d::RENDER_ENABLE_TRUE);
+        w[n++] = h::IncHeader(0, gr3d::SET_COLOR_CLEAR_VALUE0, 4);
+        for (int q = 0; q < 4; ++q) w[n++] = GrF(col[pass & 1][q]);
+        m1(gr3d::CLEAR_SURFACE, gr3d::CLEAR_RGBA);
+        FlushRange(reinterpret_cast<const uint8_t*>(w), n * 4);
+        const uint64_t va = va_push; const uint32_t dw = n; const uint8_t np = 0;
+        const uint32_t seq = 1;
+        if (!NvdChanSubmit(nullptr, ch[k], &va, &dw, &np, 1, seq)) { status = "submit"; goto out; }
+        const uint64_t end = NowUs() + 2000000;
+        while (NowUs() < end && int32_t(NvdChanCompleted(nullptr, ch[k]) - seq) < 0 && !NvdChanError(nullptr, ch[k])) {
+            SchedulerSleepMs(1);
+            FlushRange(nvd::g_chan[ch[k]].sem.cpu, 64);
+        }
+        if (NvdChanError(nullptr, ch[k])) { status = pass ? "channel error (second pass)" : "channel error (first pass)"; goto out; }
+        if (int32_t(NvdChanCompleted(nullptr, ch[k]) - seq) < 0) { status = pass ? "timeout (second pass)" : "timeout (first pass)"; goto out; }
+        {
+            SpinLock* lock = NvAuxSharedLock(); SpinLockAcquire(lock);
+            Pramin<Bar0Bus> pr(g_bus, *c);
+            sample = pr.rd32(rt + uint64_t(H / 2) * pitch + (W / 2) * 4);
+            pr.Restore(); SpinLockRelease(lock);
+        }
+        if (sample != want) { status = pass ? "wrong pixels (second pass)" : "wrong pixels (first pass)"; goto out; }
+        ++done_ok;
+    }
+out:
+    o.ks("status", status); o.kd("passes_ok", done_ok); o.kh("sample", sample);
+    for (uint32_t k = 0; k < made; ++k) { o.k(k ? "chid1" : "chid0"); o.dec(nvd::g_chan[ch[k]].chid); }
+    for (uint32_t k = made; k-- > 0;) NvdChanDestroy(nullptr, ch[k]);
+    if (push_mapped) (void)NvdVasUnmap(nullptr, vas, va_push, 0x1000, false);
+    if (rt_mapped) (void)NvdVasUnmap(nullptr, vas, va_rt, rt_bytes, false);
+    if (push) NvdSysFree(nullptr, push);
+    if (rt) NvdVramFree(nullptr, rt, rt_bytes);
+    if (vas_ok) NvdVasDestroy(nullptr, vas);
+    KPrintf("nv-gsp: gr clear vas2 (%u channel(s)): %s, %u pass(es) ok\n", nchan, status, done_ok);
+    o.send();
+}
 }  // namespace
 
 bool NvGspHandle(const char* command) {
@@ -2029,6 +2103,8 @@ bool NvGspHandle(const char* command) {
         DebugChannelSend(nvd::g_minObjects ? "{\"nv_gsp\":\"drm\",\"min_objects\":true}\n" : "{\"nv_gsp\":\"drm\",\"min_objects\":false}\n");
     }
     else if (!strcmp(verb, "fault dump")) FaultDump();
+    else if (!strcmp(verb, "gr clear vas2") || !strcmp(verb, "gr clear vas2 2")) GrVas2(2);
+    else if (!strcmp(verb, "gr clear vas2 1")) GrVas2(1);
     else if (!strncmp(verb, "nocat ", 6)) { uint32_t k = 0; for (const char* q = verb + 6; *q >= '0' && *q <= '9'; ++q) k = k * 10 + uint32_t(*q - '0'); NocatVerb(k); }
     else if (!strcmp(verb, "perf status")) PerfVerb(0);
     else if (!strcmp(verb, "perf boost")) PerfVerb(1);
