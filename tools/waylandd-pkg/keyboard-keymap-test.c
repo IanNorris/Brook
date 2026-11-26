@@ -79,6 +79,9 @@ static void check_map(const char *xkbcomp, const char *keymap, int gb)
         assert(XkbKeySymEntry(map, 11, 1, 0) == XK_quotedbl);
         assert(XkbKeySymEntry(map, 12, 1, 0) == XK_sterling);
         assert(XkbKeySymEntry(map, 13, 2, 0) == XK_EuroSign);
+        assert(XkbKeySymEntry(map, 13, 3, 0) == XK_onequarter);
+        assert(XkbKeySymEntry(map, 49, 2, 0) == XK_bar);
+        assert(XkbKeySymEntry(map, 49, 3, 0) == XK_bar);
         assert(XkbKeySymEntry(map, 48, 1, 0) == XK_at);
         assert(XkbKeySymEntry(map, 51, 0, 0) == XK_numbersign);
         assert(XkbKeySymEntry(map, 51, 1, 0) == XK_asciitilde);

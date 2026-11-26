@@ -2165,9 +2165,10 @@ static void pointer_enter_if_needed(struct brook_seat_client *sc,struct brook_su
 static void pointer_timeline_delivered(uint32_t wm_id, uint32_t type)
 {
     static int reported;
-    if (!reported && syscall(BROOK_SYS_WM_POINTER_TIMELINE, (long)BROOK_POINTER_TIMELINE_DELIVERY,
-                             (long)wm_id, (long)type, 0L, 0L, 0L) == 0)
-        reported = 1;
+    if (reported) return;
+    reported = 1;
+    (void)syscall(BROOK_SYS_WM_POINTER_TIMELINE, (long)BROOK_POINTER_TIMELINE_DELIVERY,
+                  (long)wm_id, (long)type, 0L, 0L, 0L);
 }
 #include "pointer-constraints.h"
 #include "idle-inhibit.h"
@@ -2236,9 +2237,10 @@ static void seat_get_pointer(struct wl_client *c, struct wl_resource *r, uint32_
     wl_resource_set_implementation(p, &pointer_impl, sc, pointer_resource_destroy);
     if (sc) {sc->pointer = p;sc->finger_axes = 0;++sc->refs;}
     static int reported;
-    if (!reported && syscall(BROOK_SYS_WM_POINTER_TIMELINE, (long)BROOK_POINTER_TIMELINE_SEAT,
-                             0L, 0L, 0L, 0L, 0L) == 0)
+    if (!reported) {
         reported = 1;
+        (void)syscall(BROOK_SYS_WM_POINTER_TIMELINE, (long)BROOK_POINTER_TIMELINE_SEAT,0L,0L,0L,0L,0L);
+    }
 }
 static void seat_get_keyboard(struct wl_client *c, struct wl_resource *r, uint32_t id) {
     struct brook_seat_client *sc = seat_for_resource(r);

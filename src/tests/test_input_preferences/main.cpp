@@ -34,4 +34,15 @@ int main()
     assert(scaled.width == 48 && scaled.height == 64);
     ScaleCursor(source, scaled, CursorPreferencePercent(200, 64));
     assert(scaled.width == 64 && scaled.height == 86);
+    assert(KeyboardCodepoint(BROOK_KEYBOARD_GB, 0x29, INPUT_MOD_ALTGR) == '|');
+    assert(KeyboardCodepoint(BROOK_KEYBOARD_GB, 0x29, INPUT_MOD_ALTGR|INPUT_MOD_LSHIFT) == '|');
+    assert(KeyboardCodepoint(BROOK_KEYBOARD_GB, 0x05, INPUT_MOD_ALTGR|INPUT_MOD_LSHIFT) == 0x00bc);
+    source.pixels[1*CursorCapacity+1]=0xffffffff;
+    ScaleCursor(source, scaled, CursorPreferencePercent(200, 64));
+    CursorImage busy=scaled;
+    AddCursorBusy(busy,0,0xffffffff);
+    assert(busy.width > scaled.width && busy.height == scaled.height);
+    for (unsigned y=0; y<scaled.height; ++y)
+        for (unsigned x=0; x<scaled.width; ++x)
+            assert(busy.pixels[y*CursorCapacity+x] == scaled.pixels[y*CursorCapacity+x]);
 }

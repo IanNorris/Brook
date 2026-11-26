@@ -83,7 +83,7 @@
         " key <AE03> { type=\"TWO_LEVEL\", [ 3, numbersign   ] };\n"
 #endif
 #if BROOK_KEYMAP_GB
-        " key <AE04> { type=\"FOUR_LEVEL\", [ 4, dollar, EuroSign, EuroSign ] };\n"
+        " key <AE04> { type=\"FOUR_LEVEL\", [ 4, dollar, EuroSign, onequarter ] };\n"
 #else
         " key <AE04> { type=\"TWO_LEVEL\", [ 4, dollar       ] };\n"
 #endif
@@ -127,7 +127,7 @@
         " key <AC11> { type=\"TWO_LEVEL\", [ apostrophe, quotedbl ] };\n"
 #endif
 #if BROOK_KEYMAP_GB
-        " key <TLDE> { type=\"FOUR_LEVEL\", [ grave, notsign, brokenbar, NoSymbol ] };\n"
+        " key <TLDE> { type=\"FOUR_LEVEL\", [ grave, notsign, bar, bar ] };\n"
 #else
         " key <TLDE> { type=\"TWO_LEVEL\", [ grave, asciitilde ] };\n"
 #endif

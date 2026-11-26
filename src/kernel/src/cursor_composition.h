@@ -111,15 +111,15 @@ inline void ScaleCursor(const CursorImage& source,CursorImage& frame,uint32_t pe
 
 // Compose into a separate frame: client cursor pixels/hotspot survive busy
 // animation and are restored verbatim when the last pending launch resolves.
-inline void ComposeCursor(const CursorImage& source, CursorImage& frame,
-                          bool busy, uint64_t nowMs, uint32_t accent)
+inline void AddCursorBusy(CursorImage& frame,uint64_t nowMs,uint32_t accent)
 {
-    frame = source;
-    if (!busy) return;
     constexpr int dx[8] = {0, 3, 4, 3, 0, -3, -4, -3};
     constexpr int dy[8] = {-4, -3, 0, 3, 4, 3, 0, -3};
-    const uint32_t cx = source.width + 4 < CursorCapacity - 6 ? source.width + 4 : CursorCapacity - 6;
-    const uint32_t cy = source.height / 2 + 4 < CursorCapacity - 6 ? source.height / 2 + 4 : CursorCapacity - 6;
+    // Keep the busy dots beside the image. An image already consuming the
+    // whole width cannot carry the indicator without covering its shape.
+    if (frame.width > CursorCapacity - 10) return;
+    const uint32_t cx = frame.width + 4;
+    const uint32_t cy = frame.height / 2 + 4 < CursorCapacity - 6 ? frame.height / 2 + 4 : CursorCapacity - 6;
     if (frame.width < cx + 6) frame.width = cx + 6;
     if (frame.height < cy + 6) frame.height = cy + 6;
     const unsigned phase = (nowMs / 100) % 8;
@@ -131,5 +131,11 @@ inline void ComposeCursor(const CursorImage& source, CursorImage& frame,
             for (uint32_t xx = 0; xx < 2; ++xx)
                 frame.pixels[(y + yy) * CursorCapacity + x + xx] = color;
     }
+}
+inline void ComposeCursor(const CursorImage& source,CursorImage& frame,
+                          bool busy,uint64_t nowMs,uint32_t accent)
+{
+    frame = source;
+    if (busy) AddCursorBusy(frame, nowMs, accent);
 }
 }

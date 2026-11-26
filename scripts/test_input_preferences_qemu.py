@@ -129,7 +129,7 @@ def exercise(output, provider, client, image, layout, size, scale, build):
             wait_for(vm, serial, 'INPUT_PREFS_CLIENT_MOTION', 12)
             image_b = screenshot(qmp, folder / 'cursor-moved.ppm')
             for chord in [('shift','2'), ('shift','3'), ('shift','apostrophe'), ('backslash',),
-                          ('shift','backslash'), ('less',), ('shift','less'), ('alt_r','4')]:
+                          ('shift','backslash'), ('less',), ('shift','less'), ('alt_r','4'), ('alt_r','grave_accent')]:
                 send_key(qmp, *chord)
             wait_for(vm, serial, 'INPUT_PREFS_KEYS_PASS', 12)
             diff = ImageChops.difference(image_a, image_b)

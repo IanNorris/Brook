@@ -42,4 +42,14 @@ int main()
     assert(UsbBootScanCode[0x4d] == SC_EXT_END && UsbBootScanCode[0x4e] == SC_EXT_PGDN);
     assert(UsbBootScanCode[0x4f] == SC_EXT_RIGHT && UsbBootScanCode[0x51] == SC_EXT_DOWN);
     assert(UsbBootScanCode[0x52] == SC_EXT_UP);
+    const uint8_t rightAlt[8]{0x40};
+    for (uint32_t layout : {BROOK_KEYBOARD_US,BROOK_KEYBOARD_GB}) {
+        UsbBootKeyboard independent;
+        uint8_t previous[8]{};
+        independent.Update(rightAlt,previous,emit,layout);
+        assert(events.back().scan == 100 && events.back().down);
+        assert(events.back().mods == (INPUT_MOD_ALTGR | (layout==BROOK_KEYBOARD_US ? INPUT_MOD_ALT : 0)));
+        independent.Update(empty,previous,emit,layout);
+        assert(!events.back().down && !events.back().mods);
+    }
 }

@@ -1860,7 +1860,6 @@ static CursorOwnership g_cursorOwnership;
 // ComposeCursor before ScaleCursor reads it.
 static CursorImage g_cursorBuiltinSource{0, 0};
 static bool g_cursorBuiltinReady = false;
-static CursorImage g_cursorLogicalFrame{0, 0};
 
 // Saved pixels under the cursor (for restore before re-blit)
 static uint32_t g_cursorSave[CURSOR_MAX * CURSOR_MAX];
@@ -1918,10 +1917,9 @@ static void CursorPrepareFrame(bool busy, uint64_t now)
     }
     const CursorImage& source = *chosen;
     const uint32_t cursorScale = CursorPreferencePercent(WmGetAppliedScale(), WmCursorSize());
-    if(builtin && cursorScale!=100) {
-        ComposeCursor(source,g_cursorLogicalFrame,busy,now,WmCurrentPalette().borderActive);
-        ScaleCursor(g_cursorLogicalFrame,g_cursorFrame,cursorScale);
-    } else ComposeCursor(source,g_cursorFrame,busy,now,WmCurrentPalette().borderActive);
+    if (builtin && cursorScale!=100) ScaleCursor(source,g_cursorFrame,cursorScale);
+    else g_cursorFrame=source;
+    if (busy) AddCursorBusy(g_cursorFrame,now,WmCurrentPalette().borderActive);
     SpinLockRelease(&g_cursorSourceLock);
 }
 static int32_t  g_cursorSaveW = 0;

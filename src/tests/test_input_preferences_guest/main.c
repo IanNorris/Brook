@@ -17,8 +17,8 @@ static struct xdg_wm_base *shell;
 static struct wl_surface *surface;
 static struct wl_buffer *buffer;
 static struct xkb_state *state;
-static const uint32_t expected_gb[] = {'"', 0xa3, '@', '#', '~', 0x5c, '|', 0x20ac};
-static const uint32_t expected_us[] = {'@', '#', '"', 0x5c, '|', '<', '>', '4'};
+static const uint32_t expected_gb[] = {'"', 0xa3, '@', '#', '~', 0x5c, '|', 0x20ac, '|'};
+static const uint32_t expected_us[] = {'@', '#', '"', 0x5c, '|', '<', '>', '4', 0x60};
 static const uint32_t *expected;
 static unsigned count;
 
@@ -72,8 +72,8 @@ static void key(void *d,struct wl_keyboard *k,uint32_t serial,uint32_t time,uint
     const uint32_t cp = xkb_state_key_get_utf32(state, code + 8);
     if (!cp) return;
     printf("INPUT_PREFS_KEY code=%u unicode=%u\n", code, cp);
-    assert(count < 8 && cp == expected[count]);
-    if (++count == 8) puts("INPUT_PREFS_KEYS_PASS");
+    assert(count < sizeof(expected_gb)/sizeof(*expected_gb) && cp == expected[count]);
+    if (++count == sizeof(expected_gb)/sizeof(*expected_gb)) puts("INPUT_PREFS_KEYS_PASS");
 }
 static void mods(void *d,struct wl_keyboard *k,uint32_t serial,uint32_t depressed,uint32_t latched,uint32_t locked,uint32_t group)
 { (void)d;(void)k;(void)serial; if (state) xkb_state_update_mask(state,depressed,latched,locked,0,0,group); }

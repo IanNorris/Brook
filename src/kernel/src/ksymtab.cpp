@@ -193,6 +193,7 @@ EXPORT_SYMBOL(KbdIsAvailable);
 EXPORT_SYMBOL(KbdPushChar);
 EXPORT_SYMBOL(KbdPushCodepoint);
 EXPORT_SYMBOL(KbdTranslateKey);
+EXPORT_SYMBOL(KbdLayout);
 
 // Input subsystem
 EXPORT_SYMBOL(InputInit);

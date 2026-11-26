@@ -1836,7 +1836,9 @@ static int ReadInteractiveLine(char* buf, uint32_t maxLen)
         if (uint8_t(c) >= 32 && uint8_t(c) != 127)
         {
             buf[i++] = c;
-            TtyPutChar(c);
+            const auto byte=uint8_t(c);
+            if (byte < 0x80) TtyPutChar(c);
+            else if ((byte & 0xc0) != 0x80) TtyPutChar('?'); // emergency TTY uses an ASCII font
         }
     }
 

@@ -45,7 +45,7 @@ extern "C" void KbdPushCodepoint(uint16_t cp);
 extern "C" uint16_t KbdTranslateKey(uint8_t scan, uint8_t modifiers);
 
 void KbdLoadDefaultLayout();
-uint32_t KbdLayout();
+extern "C" uint32_t KbdLayout();
 uint32_t KbdDefaultLayout();
 void KbdSetLayout(uint32_t layout);
 

@@ -104,6 +104,7 @@ MODULE_IMPORT_SYMBOL(CompositorWake);
 MODULE_IMPORT_SYMBOL(InputNextSequence);
 MODULE_IMPORT_SYMBOL(KbdPushCodepoint);
 MODULE_IMPORT_SYMBOL(KbdTranslateKey);
+MODULE_IMPORT_SYMBOL(KbdLayout);
 MODULE_IMPORT_SYMBOL(kmalloc);
 MODULE_IMPORT_SYMBOL(kfree);
 MODULE_IMPORT_SYMBOL(PmmFreePage);
@@ -2019,7 +2020,7 @@ static void XhciDrainController(XhciController& ctrl,bool& wakeNetwork)
                     const uint32_t bytes=residue<=fn.length?fn.length-residue:0;
                     if(!which && bytes>=3) {
                         for(uint32_t i=bytes;i<8;++i)fn.report[i]=0;
-                        g_bootKeyboard.Update(fn.report,fn.previous,XhciPushKey);
+                        g_bootKeyboard.Update(fn.report,fn.previous,XhciPushKey,KbdLayout());
                         wakeInput=true;
                     } else if(which && bytes>=3) {
                         if(bytes<4)fn.report[3]=0;
@@ -2140,7 +2141,7 @@ static void XhciEndHid(XhciHidFn& fn, bool keyboard)
     if (!fn.active) return;
     fn.active = false;
     const uint8_t empty[8]{};
-    if (keyboard) g_bootKeyboard.Update(empty,fn.previous,XhciPushKey);
+    if (keyboard) g_bootKeyboard.Update(empty,fn.previous,XhciPushKey,KbdLayout());
     else {
         XhciProcessMouseReport(empty,fn);
         MouseSetUsbAvailable(--g_activeUsbMice != 0);
