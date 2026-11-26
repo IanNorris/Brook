@@ -6598,14 +6598,16 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             reply.text("{\"stage\":");reply.quoted(s.lastError.stage);
             reply.text(",");reply.field("pid",s.lastError.pid);
             reply.text(",");reply.field("errno",s.lastError.error);
-            if(s.lastError.discarded.any()){
-                const auto& losses=s.lastError.discarded;
+            const auto& losses=s.lastError.discarded;
+            if(losses.any()){
                 reply.text(",");reply.field("dropped_file_pages",losses.filePages);
                 reply.text(",");reply.field("dropped_data_pages",losses.dataPages);
                 reply.text(",");reply.field("dropped_stack_heap_pages",losses.stackHeapPages);
+                reply.text(",");reply.field("dropped_file_notes",losses.fileNotes);
+            }
+            if(losses.secretRanges){
                 reply.text(",");reply.field("excluded_secret_ranges",losses.secretRanges);
                 reply.text(",");reply.field("excluded_secret_pages",losses.secretPages);
-                reply.text(",");reply.field("dropped_file_notes",losses.fileNotes);
             }
             reply.text("}");
         }else reply.text("null");
@@ -6640,9 +6642,9 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             reply.text(",");reply.field("mappings",dump.mappings);
             reply.text(",");reply.field("bytes",dump.bytes);
             reply.text(",");reply.field("holes",dump.holes);
+            reply.text(",");reply.field("dropped_data_pages",dump.discarded.dataPages);
             if(dump.discarded.any()){
                 reply.text(",");reply.field("dropped_file_pages",dump.discarded.filePages);
-                reply.text(",");reply.field("dropped_data_pages",dump.discarded.dataPages);
                 reply.text(",");reply.field("dropped_stack_heap_pages",dump.discarded.stackHeapPages);
                 reply.text(",");reply.field("dropped_file_notes",dump.discarded.fileNotes);
             }

@@ -36,6 +36,7 @@ namespace brook {
 bool PageableHostInitialize(const PageStoreHeader&,uint64_t,PageStoreSlot*,uint64_t,PageStoreIo);
 int64_t PageableHostMap(Process*,uint64_t);
 int64_t PageableHostPageOut(Process*,uint64_t);
+int64_t PageableHostSpill(Process*,uint64_t);
 void PageableHostFailRollback(bool);
 }
 namespace {
@@ -1117,6 +1118,33 @@ static void secretMappingLifecycle() {
     AddressSpaceUnref(child);CHECK(ProcessCleanupStep());
     CHECK(!PmmGetRefCount(frame));
     for (uint64_t i=0;i<pageSize;++i)CHECK(bytes[i]==0);
+
+    char cmdline[8]{};
+    space->argumentStart=base;
+    space->argumentEnd=base+sizeof(cmdline);
+    CHECK(UserMappingAdviseDump(&actor,space,base,pageSize,true)==0);
+    CHECK(UserMappingReadArguments(space,0,cmdline,sizeof(cmdline))==sizeof(cmdline));
+    CHECK(UserMappingReadArguments(space,0,cmdline,sizeof(cmdline),true)==0);
+
+    CloneBacking shm{PmmAllocPage(MemTag::User,38)};
+    CHECK(shm.page);
+    auto* backing=MappingBackingCreate(&shm,releaseCloneBacking);
+    CHECK(backing);
+    request.range=rangeRecord(0,pageSize,backing);
+    request.range.kind=MappingKind::MemFd;
+    request.range.sharing=MappingSharing::Shared;
+    request.range.leafOwnership=MappingLeafOwnership::Borrowed;
+    request.range.forkFlags=MappingForkSkip;
+    request.range.dumpFlags=MappingSecret|MappingSecretFd;
+    request.hint=secret;request.length=pageSize;request.preparedPages=1;
+    request.prepare=prepareBorrowedClone;request.context=&shm;
+    CHECK(UserMappingCreate(&actor,space,request)==static_cast<int64_t>(secret));
+    MappingBackingUnref(backing);
+    std::memcpy(reinterpret_cast<void*>(PhysToVirt(shm.page).raw()),"secret",7);
+    space->argumentStart=secret;
+    space->argumentEnd=secret+7;
+    CHECK(UserMappingReadArguments(space,0,cmdline,sizeof(cmdline))==0);
+    CHECK(UserMappingReadArguments(space,0,cmdline,sizeof(cmdline),true)==0);
     AddressSpaceUnref(space);CHECK(ProcessCleanupStep());
     PmmFreePage(root.pml4);VmmHostSetKernelRoot({});empty();CHECK(heapAllocations==0);
 }
@@ -3096,7 +3124,23 @@ static void pageableOwnerRoundTrip() {
     CHECK(PageableHostPageOut(&p,allocated)==-95);
     CHECK(VmmLeafPhysical(VmmReadLeaf(as->pageTable,address))==phys);
     CHECK(UserMappingAdviseDump(&p,as,allocated,pageSize,false)==0);
+    Gate evictionAck;
+    pendingAcknowledgement=&evictionAck;
+    int64_t eviction=0;
+    std::thread evictor([&]{eviction=PageableHostPageOut(&p,allocated);});
+    evictionAck.wait(1);
+    CHECK(!VmmReadLeaf(as->pageTable,address));
+    CHECK(UserMappingAdviseDump(&p,as,allocated,pageSize,true)==0); // Evicting
+    evictionAck.release();
+    evictor.join();
+    pendingAcknowledgement=nullptr;
+    CHECK(eviction==-95 && VmmLeafPhysical(VmmReadLeaf(as->pageTable,address))==phys);
+    checkBytes(phys);
+    CHECK(UserMappingAdviseDump(&p,as,allocated,pageSize,false)==0);
     CHECK(PageableHostPageOut(&p, allocated) == 4096);
+    CHECK(UserMappingAdviseDump(&p,as,allocated,pageSize,true)==0); // Stored
+    CHECK(PageableHostSpill(&p,allocated)==-95);
+    CHECK(UserMappingAdviseDump(&p,as,allocated,pageSize,false)==0);
     checkFork();
     CHECK(!VmmReadLeaf(as->pageTable, address));
     CHECK(PageableMemoryFault(&p, as, allocated, 1, false) == MappingFaultResult::Resolved);
@@ -3109,6 +3153,8 @@ static void pageableOwnerRoundTrip() {
     CHECK(PageableHostPageOut(&p, allocated) == -5 && !VmmReadLeaf(as->pageTable, address));
     PageableHostFailRollback(false);
     badWrite = false;
+    CHECK(UserMappingAdviseDump(&p,as,allocated,pageSize,true)==0); // Recovery
+    CHECK(UserMappingAdviseDump(&p,as,allocated,pageSize,false)==0);
     checkFork();
     CHECK(PageableMemoryFault(&p, as, allocated, 1, false) == MappingFaultResult::Resolved);
     CHECK(VmmGetPagePid(as->pageTable, address) == 777);
