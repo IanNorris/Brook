@@ -15,7 +15,10 @@ pkgs.stdenv.mkDerivation {
     wayland-scanner private-code "$viewport" viewporter.c
     wayland-scanner client-header "$fractional" fractional-scale-client.h
     wayland-scanner private-code "$fractional" fractional-scale.c
-    $CC -Wall -Wextra -Werror -O2 main.c xdg-shell.c viewporter.c fractional-scale.c \
+    decoration=${pkgs.wayland-protocols}/share/wayland-protocols/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml
+    wayland-scanner client-header "$decoration" decoration-client.h
+    wayland-scanner private-code "$decoration" decoration.c
+    $CC -Wall -Wextra -Werror -O2 main.c xdg-shell.c viewporter.c fractional-scale.c decoration.c \
       $(pkg-config --cflags --libs wayland-client xkbcommon) -o input-preferences-fixture
   '';
   installPhase = ''

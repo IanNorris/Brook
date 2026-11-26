@@ -124,6 +124,7 @@ def exercise(output, provider, client, image, layout, size, scale, build):
         try:
             wait_for(vm, serial, 'INPUT_PREFS_FOCUSED')
             if fractional:
+                wait_for(vm, serial, 'INPUT_PREFS_NATIVE_CHROME')
                 units = scale * 120 // 100
                 width = (256 * units + 60) // 120
                 height = (128 * units + 60) // 120

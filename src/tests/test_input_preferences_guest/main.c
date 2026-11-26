@@ -11,12 +11,14 @@
 #include "xdg-shell-client.h"
 #include "viewporter-client.h"
 #include "fractional-scale-client.h"
+#include "decoration-client.h"
 
 static struct wl_compositor *compositor;
 static struct wl_shm *shm;
 static struct wl_seat *seat;
 static struct xdg_wm_base *shell;
 static struct wp_viewporter *viewporter;
+static struct zxdg_decoration_manager_v1 *decoration_manager;
 static struct wp_fractional_scale_manager_v1 *fractional_manager;
 static uint32_t scale120;
 static void preferred_scale(void *context,struct wp_fractional_scale_v1 *object,uint32_t scale)
@@ -41,6 +43,8 @@ static void globals(void *data, struct wl_registry *r, uint32_t id, const char *
     if (!strcmp(name, wl_shm_interface.name)) shm = wl_registry_bind(r,id,&wl_shm_interface,1);
     if (!strcmp(name, wl_seat_interface.name)) seat = wl_registry_bind(r,id,&wl_seat_interface,1);
     if (!strcmp(name, xdg_wm_base_interface.name)) shell = wl_registry_bind(r,id,&xdg_wm_base_interface,1);
+    if (!strcmp(name, zxdg_decoration_manager_v1_interface.name))
+        decoration_manager=wl_registry_bind(r,id,&zxdg_decoration_manager_v1_interface,1);
     if (!strcmp(name, wp_viewporter_interface.name)) viewporter = wl_registry_bind(r,id,&wp_viewporter_interface,1);
     if (!strcmp(name, wp_fractional_scale_manager_v1_interface.name))
         fractional_manager = wl_registry_bind(r,id,&wp_fractional_scale_manager_v1_interface,1);
@@ -57,6 +61,14 @@ static void configure(void *d, struct xdg_surface *xs, uint32_t serial)
 }
 static void top_configure(void *d,struct xdg_toplevel *top,int32_t w,int32_t h,struct wl_array *states)
 { (void)d;(void)top;(void)w;(void)h;(void)states; }
+static void decoration_configure(void *context,struct zxdg_toplevel_decoration_v1 *object,uint32_t mode)
+{
+    (void)context;
+    (void)object;
+    assert(mode==ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+    puts("INPUT_PREFS_NATIVE_CHROME");
+}
+
 static void top_close(void *d,struct xdg_toplevel *top) { (void)d;(void)top; exit(2); }
 
 static void keymap(void *d,struct wl_keyboard *k,uint32_t format,int32_t fd,uint32_t size)
@@ -164,6 +176,14 @@ int main(int argc,char **argv)
     xdg_surface_add_listener(xs,&surface_listener,NULL);
     struct xdg_toplevel *top=xdg_surface_get_toplevel(xs);
     xdg_toplevel_add_listener(top,&top_listener,NULL);
+    if (argc==4) {
+        assert(decoration_manager);
+        struct zxdg_toplevel_decoration_v1 *decoration=
+            zxdg_decoration_manager_v1_get_toplevel_decoration(decoration_manager,top);
+        static const struct zxdg_toplevel_decoration_v1_listener listener={decoration_configure};
+        zxdg_toplevel_decoration_v1_add_listener(decoration,&listener,NULL);
+        zxdg_toplevel_decoration_v1_set_mode(decoration,ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+    }
     xdg_toplevel_set_title(top,"Input preferences fixture");
     xdg_toplevel_set_app_id(top,"org.brook.InputPreferencesFixture");
     wl_surface_commit(surface);
