@@ -165,13 +165,13 @@ uint64_t InputDroppedEvents();
 // Push an event into a device's ring buffer.
 // Safe to call from ISR context.  Uses atomic stores so that the
 // consumer (on another CPU) sees a consistent head/tail.
-inline void InputDevicePush(InputDevice* dev, const InputEvent& ev)
+inline bool InputDevicePush(InputDevice* dev, const InputEvent& ev)
 {
     uint32_t head = __atomic_load_n(&dev->head, __ATOMIC_RELAXED);
     uint32_t next = (head + 1) & (INPUT_RING_SIZE - 1);
     if (next == __atomic_load_n(&dev->tail, __ATOMIC_ACQUIRE)) {
         InputNextSequence(true);
-        return;
+        return false;
     }
     dev->ring[head] = ev;
     dev->ring[head].sequence = InputNextSequence(false);
@@ -179,6 +179,7 @@ inline void InputDevicePush(InputDevice* dev, const InputEvent& ev)
     if (ev.type >= InputEventType::MouseMove) InputMarkPointerIngress(static_cast<uint8_t>(ev.type));
 #endif
     __atomic_store_n(&dev->head, next, __ATOMIC_RELEASE);
+    return true;
 }
 
 // Pop an event from a device's ring buffer.

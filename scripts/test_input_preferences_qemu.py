@@ -127,6 +127,8 @@ def exercise(output, provider, client, image, layout, size, scale, build):
             image_a = screenshot(qmp, folder / 'cursor.ppm')
             move(qmp, 220 if scale>100 else 120, 90)
             wait_for(vm, serial, 'INPUT_PREFS_CLIENT_MOTION', 12)
+            qmp.call('input-send-event', events=[{'type': 'rel', 'data': {'axis': 'x', 'value': 0}}])
+            wait_for(vm, serial, 'BOOT_POINTER usb_ignored', 8)
             image_b = screenshot(qmp, folder / 'cursor-moved.ppm')
             for chord in [('shift','2'), ('shift','3'), ('shift','apostrophe'), ('backslash',),
                           ('shift','backslash'), ('less',), ('shift','less'), ('alt_r','4'), ('alt_r','grave_accent')]:
@@ -139,12 +141,35 @@ def exercise(output, provider, client, image, layout, size, scale, build):
                 raise RuntimeError('No pointer pixels changed at the initial pointer position')
             log = wait_for(vm, serial, 'BOOT_POINTER wayland_delivered', 8)
             stamps = {}
-            for name in ('usb_enumerated','usb_bound','desktop','cursor','ingress','wm','seat_bound','wayland_delivered'):
+            usb_identity = None
+            for name in ('usb_enumerated', 'usb_queued', 'usb_bound', 'usb_complete', 'usb_report',
+                         'usb_rearm', 'usb_ignored', 'desktop', 'cursor', 'ingress', 'wm',
+                         'seat_bound', 'wayland_delivered'):
                 matches = re.findall(rf'^BOOT_POINTER {name} .*?kernel_ms=(\d+)(.*)$', log, re.MULTILINE)
                 if not matches:
                     raise RuntimeError(f'Missing boot trace {name}, see {serial}')
                 stamps[name] = int(matches[0][0])
-            assert stamps['usb_enumerated'] <= stamps['usb_bound'] <= stamps['ingress']
+                fields = dict(field.split('=', 1) for field in matches[0][1].split())
+                if name.startswith('usb_'):
+                    identity = tuple(fields[key] for key in ('controller', 'port', 'vid', 'pid'))
+                    if usb_identity is None:
+                        usb_identity = identity
+                        # QEMU maps the bus port to a controller-specific root port.
+                        assert fields['port'].endswith('.2'), fields
+                    assert identity == usb_identity, fields
+                if name == 'usb_queued':
+                    assert fields['boot_protocol'] == 'accepted', fields
+                    assert int(fields['esit_us']) > 0, fields
+                if name in ('usb_complete', 'usb_report', 'usb_ignored'):
+                    assert fields['cc'] in ('1', '13'), fields
+                    assert 3 <= int(fields['bytes']) <= int(fields['requested']), fields
+                if name == 'usb_ignored':
+                    assert fields['reason'] == 'idle', fields
+                if name in ('ingress', 'wm'):
+                    assert fields['detail'] == '6', fields
+            assert stamps['usb_enumerated'] <= stamps['usb_queued'] <= stamps['usb_bound']
+            assert stamps['usb_queued'] <= stamps['usb_complete'] <= stamps['usb_rearm']
+            assert stamps['usb_complete'] <= stamps['usb_report'] <= stamps['ingress']
             assert stamps['ingress'] <= stamps['wm'] <= stamps['wayland_delivered']
             assert stamps['seat_bound'] <= stamps['wayland_delivered']
             return {'cursor_bbox':box,'cursor_height':box[3]-box[1], 'kernel_ms':stamps}

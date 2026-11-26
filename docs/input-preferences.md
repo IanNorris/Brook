@@ -32,3 +32,25 @@ motion. The cursor marker records the first visible cursor supplied to the
 compositor or renderer and the eligibility condition that changed. The
 Wayland marker records queueing the first event to a client with a pointer
 resource. Compare its timestamp with the client's own receipt when needed.
+
+On xHCI, match the `usb_*` lines by controller and port. Once the endpoint
+is queued, the lines also include its slot and endpoint address. Keep these
+lines and the `ingress` and `wm` lines from the same boot.
+
+- `usb_enumerated`, `usb_queued` and `usb_bound` show discovery, the first
+  interrupt-IN doorbell and the end of bind. The queue line includes the
+  outcome of SET_PROTOCOL, the device speed, transaction-translator slot
+  and port, descriptor bInterval, and programmed service interval in µs.
+- `usb_complete` records when Brook first drains a matching transfer event.
+  It includes the xHCI completion code and residual length. Completed length
+  is reported for success (1) and short packet (13) with a valid residual.
+- `usb_rearm` records when Brook rings the doorbell for the next transfer.
+  A transfer error ends the endpoint and does not rearm it.
+- `usb_report` records the first boot-format report with motion, wheel
+  movement, or button activity. `usb_ignored` records the first rejected
+  completion, idle report, suppressed shared-button transition or input
+  queue overflow. It may be absent if the endpoint has none.
+
+Brook stamps these events at the xHCI driver and prints them later from the
+compositor thread. A gap before `usb_complete` includes the time the device
+spent waiting to produce a report and any delay draining the transfer event.
