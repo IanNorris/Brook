@@ -79,7 +79,7 @@ ETC_ALLOWED = {*MARKERS, 'i219-attach', 'i219-reset', 'hardware-payload-id', 're
                # --session desktop only
                'live-store', 'usb-system', 'usb-profile-plan.pub', 'usb-system-trim', 'usb-bot-legacy', 'usb-bot-pipeline', 'usb-uas', 'usb-uas-fixture', 'volatile-desktop', 'hardware-bulk', 'usb-audio-mixer', 'dp-idle-seconds', 'nv-display', 'chromium-alsa-device',
                # --nv-gsp (GSP-RM M1 bridge verbs) and its firmware record
-               'nv-gsp', 'nv-gsp-firmware', 'nv-gsp-no-autostart', 'nv-drm', 'nv-gsp-registry', 'nv-gsp-no-scrubber', 'usb-system-no-mount', 'nv-gsp-swgen0-ack', 'nv-gsp-primary', 'nv-gsp-no-ce-present'}
+               'nv-gsp', 'nv-gsp-firmware', 'nv-gsp-no-autostart', 'nv-drm', 'nv-gsp-registry', 'nv-gsp-no-scrubber', 'usb-system-no-mount', 'nv-gsp-swgen0-ack', 'nv-gsp-primary', 'nv-gsp-no-ce-present', 'nv-gsp-headless-p4'}
 # Desktop live stick (--session desktop): the VMware RC session over the RAM
 # store, plus the RTX status helper. If the store does not mount, the services
 # fail to start and the kernel console, bridge and remote update stay usable.
@@ -314,6 +314,8 @@ def desktop_payload(args, initrd):
             fat_write(initrd, 'ETC/nv-gsp-no-autostart', b'1\n')
         if args.nv_drm:  # M5: /dev/dri/renderD130 (nouveau uAPI for Mesa NVK) once GSP-RM is up
             fat_write(initrd, 'ETC/nv-drm', b'1\n')
+        if args.nv_gsp_headless_p4:  # A/B: nv-disp drives the heads, GSP-RM boots headless
+            fat_write(initrd, 'ETC/nv-gsp-headless-p4', b'1\n')
         if args.nv_gsp_no_ce_present:  # A/B: keep nv-disp, but no CE present at autostart
             fat_write(initrd, 'ETC/nv-gsp-no-ce-present', b'1\n')
         if args.nv_gsp_primary:  # A/B: GspSystemInfo.bIsPrimary=1 (nouveau r570)
@@ -620,6 +622,7 @@ def main():
                         'hang cannot dirty the store; boot updates still allowed; desktop and lastlog stay off)')
     p.add_argument('--boot-bin', action='append', default=[], metavar='NAME=PATH',
                    help='test images: also ship PATH as /boot/bin/NAME (e.g. a static busybox for no-mount boots)')
+    p.add_argument('--nv-gsp-headless-p4', action='store_true', help='with --nv-display: GSP-RM boots headless (A/B)')
     p.add_argument('--nv-gsp-no-ce-present', action='store_true', help='with --nv-gsp: autostart without CE present (A/B)')
     p.add_argument('--nv-gsp-primary', action='store_true', help='with --nv-gsp: SET_SYSTEM_INFO bIsPrimary=1 (A/B)')
     p.add_argument('--nv-gsp-swgen0-ack', action='store_true', help='with --nv-gsp: ack GSP SWGEN0 each drain (A/B)')

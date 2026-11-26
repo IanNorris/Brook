@@ -1418,6 +1418,9 @@ void EventThreadStart() {
 namespace {
 void AutostartRun(bool display) {
     if (!MarkerSet("/etc/nv-gsp")) { g_autostart.status = "no /etc/nv-gsp"; return; }
+    // 27 Nov display A/B split: nv-disp keeps driving the heads, but GSP-RM boots as if headless
+    // (plain p4: no keep-display, no BAR1 identity map, no CE present, no head-0 fence).
+    if (display && PathExists("/etc/nv-gsp-headless-p4")) { KPrintf("nv-gsp: autostart headless p4 with nv-disp running (/etc/nv-gsp-headless-p4)\n"); display = false; }
     if (PathExists("/etc/nv-gsp-no-autostart")) { g_autostart.status = "opted out"; KPrintf("nv-gsp: autostart off (/etc/nv-gsp-no-autostart)\n"); return; }
     if (display) SchedulerSleepMs(3000);   // let the desktop settle after the head bring-up
     bool got = false;
