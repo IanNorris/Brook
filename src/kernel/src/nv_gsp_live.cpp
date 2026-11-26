@@ -176,6 +176,7 @@ struct LiveEvents { uint32_t total = 0, rc = 0, mmu = 0, os_error = 0, libos = 0
                     uint32_t pstate = 0, pstate_changes = 0, pstate_polls = 0, pstate_errors = 0; uint64_t last_ms = 0; };
 LiveEvents g_liveEv;
 uint32_t g_evPendLost = 0, g_seqRuns = 0, g_seqFails = 0;   // runtime event hook counters
+bool g_swgen0Ack = false; uint32_t g_swgen0Acks = 0;   // /etc/nv-gsp-swgen0-ack
 extern const nvdrm::Backend g_nvdBackend;   // M5 live backend (below)
 void NvdMarkDead(uint32_t chid);
 bool g_ceActiveFlag = false;   // mirrors g_cePresentState.active for Status (declared later)
@@ -544,7 +545,7 @@ void Status() {
     o.ks("autostart", g_autostart.status); o.kb("rm_running", g_rmRunning); o.kb("ce_present", g_ceActiveFlag);
     o.k("rm_events"); o.raw("{"); o.kd("total", g_liveEv.total); o.kd("rc", g_liveEv.rc); o.kd("mmu", g_liveEv.mmu);
     o.kd("os_error", g_liveEv.os_error); o.kd("libos", g_liveEv.libos); o.kd("other", g_liveEv.other); o.kd("drains", g_liveEv.drains);
-    o.kd("last_ms", g_liveEv.last_ms); o.kd("seq_runs", g_seqRuns); o.kd("seq_fails", g_seqFails); o.kd("lost", g_evPendLost); o.kd("slow_reads", g_slowReadN); o.kd("slow_read_max_us", g_slowReadMaxUs); o.kh("slow_read_max_off", g_slowReadMaxOff); o.kh("pstate", g_liveEv.pstate); o.kd("pstate_polls", g_liveEv.pstate_polls);
+    o.kd("last_ms", g_liveEv.last_ms); o.kd("seq_runs", g_seqRuns); o.kd("seq_fails", g_seqFails); o.kd("lost", g_evPendLost); o.kd("swgen0_acks", g_swgen0Acks); o.kd("slow_reads", g_slowReadN); o.kd("slow_read_max_us", g_slowReadMaxUs); o.kh("slow_read_max_off", g_slowReadMaxOff); o.kh("pstate", g_liveEv.pstate); o.kd("pstate_polls", g_liveEv.pstate_polls);
     o.kd("pstate_changes", g_liveEv.pstate_changes); o.kd("pstate_errors", g_liveEv.pstate_errors); o.raw("}");
     if (FindGpu(f.g)) {
         g_bus.bar0 = f.g.bar0;
@@ -899,6 +900,8 @@ void P4(bool keepDisplay) {
     const uint64_t lockUs = NowUs();
     LoadExtraRegistry();
     g_grSkipScrubber = PathExists("/etc/nv-gsp-no-scrubber");
+    g_swgen0Ack = PathExists("/etc/nv-gsp-swgen0-ack");
+    if (g_swgen0Ack) KPrintf("nv-gsp: SWGEN0 ack in the event drainer (/etc/nv-gsp-swgen0-ack)\n");
     if (g_grSkipScrubber) KPrintf("nv-gsp: GR scrubber channel skipped (/etc/nv-gsp-no-scrubber)\n");
     static P4Result r;
     r = RunP4(g_bus, c, f.in, g_dma, pci, booter, bimg, &g_rm->objs, g_rm->ch, g_rm->rx, g_rm->rxcap,
@@ -1342,6 +1345,9 @@ void EventThread(void*) {
         SpinLock* lock = NvAuxSharedLock();
         if (!SpinLockTryAcquire(lock)) { __atomic_store_n(&g_busy, 0u, __ATOMIC_RELEASE); continue; }
         if (g_rmRunning) {
+            // A/B (/etc/nv-gsp-swgen0-ack): ack the GSP falcon's SWGEN0 "message queued" interrupt
+            // each drain, as nouveau's r535_gsp_intr does (IRQSTAT 0x110008, IRQSCLR 0x110004).
+            if (g_swgen0Ack && (g_bus.rd32(0x110008) & 0x40)) { g_bus.wr32(0x110004, 0x40); ++g_swgen0Acks; }
             FlushRange(g_rm->objs.q.msgq(), kQueueBytes);
             NoWait nw;
             // copy events out under the lock (bounded), log them after releasing it: serial
