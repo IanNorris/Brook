@@ -87,8 +87,7 @@ def main():
                  f'-DCMAKE_TOOLCHAIN_FILE={ROOT}/cmake/toolchains/uefi-x86_64-clang.cmake']
     configure += [f'-D{k}:BOOL={v}' for k, v in sorted(PUBLIC_OPTIONS.items())]
     if a.boot_compression_public_key:
-        configure += [f'-DBROOK_BOOT_COMPRESSION_KEY={a.boot_compression_public_key}',
-                      '-DCMAKE_BUILD_TYPE=Release']
+        configure += [f'-DBROOK_BOOT_COMPRESSION_KEY={a.boot_compression_public_key}']
     print('+ cmake configure (private guard values from initial cache)', flush=True)
     subprocess.run([str(x) for x in configure], check=True, stdout=subprocess.DEVNULL)
     print('+ cmake --build', build, flush=True)

@@ -54,15 +54,17 @@ if(BROOK_BOOT_COMPRESSION_KEY)
     set(LZ4 "${BROOK_ROOT}/src/third_party/lz4/lz4.c")
     target_sources(bootloader PRIVATE "${CRYPTO}/monocypher.c" "${CRYPTO}/monocypher-ed25519.c" "${LZ4}")
     include_directories("${CRYPTO}")
+    set(COMPRESS_C_OPTIONS -O2 -mno-stack-arg-probe -ffunction-sections)
     if(DEFINED ENV{BROOK_CLANG_RESOURCE_DIR})
-        target_compile_options(bootloader PRIVATE "-resource-dir=$ENV{BROOK_CLANG_RESOURCE_DIR}")
-        add_compile_options("-resource-dir=$ENV{BROOK_CLANG_RESOURCE_DIR}")
+        set(COMPRESS_RESOURCE "-resource-dir=$ENV{BROOK_CLANG_RESOURCE_DIR}")
+        list(APPEND COMPRESS_C_OPTIONS "${COMPRESS_RESOURCE}")
+        set_property(SOURCE src/boot_payload.cpp APPEND PROPERTY COMPILE_OPTIONS "${COMPRESS_RESOURCE}")
     endif()
     add_compile_definitions(BROOK_BOOT_COMPRESSION_KEY="${BROOK_BOOT_COMPRESSION_KEY}")
     set_source_files_properties("${LZ4}" PROPERTIES
         COMPILE_DEFINITIONS "LZ4_FREESTANDING=1;LZ4_memcpy=__builtin_memcpy;LZ4_memset=__builtin_memset;LZ4_memmove=__builtin_memmove")
     set_source_files_properties("${LZ4}" "${CRYPTO}/monocypher.c" "${CRYPTO}/monocypher-ed25519.c"
-        PROPERTIES COMPILE_OPTIONS "-mno-stack-arg-probe;-ffunction-sections")
+        PROPERTIES COMPILE_OPTIONS "${COMPRESS_C_OPTIONS}")
 endif()
 
 target_include_directories(bootloader PRIVATE

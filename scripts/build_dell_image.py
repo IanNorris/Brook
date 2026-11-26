@@ -263,6 +263,10 @@ def main():
         p.error('Use --bridge-v3-operators to supply the operator policy')
     else:
         options['BROOK_BRIDGE_V3'] = 'OFF'
+    signer = None
+    if a.boot_compression_seed:
+        from boot_compression import INITRD, KERNEL, compress, read_signer
+        signer = read_signer(a.boot_compression_seed, validate_operator_policy(operator_policy or b''))
     if options.get('BROOK_QEMU_LEGACY_OUTBOUND_DEBUG') == 'ON':
         p.error('Legacy outbound debugging is unavailable in guarded pairs')
     options['BROOK_QEMU_LEGACY_OUTBOUND_DEBUG'] = 'OFF'
@@ -390,9 +394,7 @@ def main():
         manifest['build_id'] = build_id[1]
         manifest['bridge_v3'] = {'version': 3, 'suite': 1, 'policy_sha256': sha(operator_input),
                                  'helpers_sha256': compiled_helpers}
-    if a.boot_compression_seed:
-        from boot_compression import INITRD, KERNEL, compress, read_signer
-        signer = read_signer(a.boot_compression_seed)
+    if signer is not None:
         stored = a.output / 'boot-compressed'
         stored.mkdir()
         entries = {}

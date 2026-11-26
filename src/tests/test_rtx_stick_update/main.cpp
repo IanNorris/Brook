@@ -201,6 +201,31 @@ int main() {
         assert(LoaderChoice(root) == "root:brook-rtx-smoke-cccc");
         assert(Get(root + "/EFI/BOOT/BOOTX64.EFI") == c.files[RTX_LOADER]);
     }
+    // A raw replacement loader cannot be assumed to retain a compressed
+    // fallback. Reject either running location before staging anything.
+    for (int running : {BROOK_STICK_ROOT, BROOK_STICK_PREV}) {
+        for (unsigned i : {RTX_KERNEL, RTX_INITRD}) {
+            const std::string root = Root();
+            Install(root, a);
+            assert(!mkdir((root + "/PREV").c_str(), 0755));
+            Bytes compressed = a.files[i];
+            memcpy(compressed.data(), BROOK_BOOT_COMPRESSED_MAGIC, BROOK_BOOT_COMPRESSED_MAGIC_BYTES);
+            const auto* names = running == BROOK_STICK_ROOT ? RTX_NAMES : RTX_PREV_NAMES;
+            Put(root + "/" + RTX_PREV_NAMES[RTX_KERNEL], a.files[RTX_KERNEL]);
+            Put(root + "/" + RTX_PREV_NAMES[RTX_INITRD], a.files[RTX_INITRD]);
+            Put(root + "/" + names[i], compressed);
+            Put(root + "/PREV/SET.BIN", a.files[RTX_SET]);
+            RtxReceipt receipt;
+            const FileSet replacement = MakeSet("brook-rtx-smoke-raw", 0x33, 2);
+            assert(Apply(root, replacement, running, &receipt) == RTX_E_PREV);
+            assert(strstr(receipt.failed_step, "compressed running set"));
+            assert(Get(root + "/" + names[i]) == compressed);
+            assert(Get(root + "/PREV/SET.BIN") == a.files[RTX_SET]);
+            assert(Get(root + "/" + RTX_NAMES[RTX_LOADER]) == a.files[RTX_LOADER]);
+            for (const char* name : RTX_NAMES) assert(!Exists(root + "/" + name + ".new"));
+            assert(!Exists(root + "/TRIAL.BIN"));
+        }
+    }
     // Failures before the swap leave the root set and loader untouched.
     for (const char* step : {"stage", "prev", "trial"}) {
         const std::string root = Root(); Install(root, a);

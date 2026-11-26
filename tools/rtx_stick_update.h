@@ -29,6 +29,7 @@
 #include <unistd.h>
 #include "../src/shared/update/payload.h"
 #include "../src/shared/update/executable.h"
+#include "../src/shared/update/boot_compression_magic.h"
 #include "../src/shared/update/stick_set.h"
 
 #define RTX_MANIFEST_HEADER 128u
@@ -114,7 +115,8 @@ static inline int RtxContentValid(const RtxManifest* m, uint8_t* const files[RTX
     if (m->bytes[RTX_LOADER] < 512 || files[RTX_LOADER][0] != 'M' || files[RTX_LOADER][1] != 'Z') return RTX_E_CONTENT;
     if (m->bytes[RTX_KERNEL] > BROOK_STICK_SET_KERNEL_MAX ||
         !BrookUpdateExecutable(files[RTX_KERNEL], (BrookUpdateSize)m->bytes[RTX_KERNEL])) return RTX_E_CONTENT;
-    if (m->bytes[RTX_INITRD] < 512 || files[RTX_INITRD][510] != 0x55 || files[RTX_INITRD][511] != 0xaa) return RTX_E_CONTENT;
+    if (m->bytes[RTX_INITRD] < 512 || BrookBootCompressed(files[RTX_INITRD], m->bytes[RTX_INITRD]) ||
+        files[RTX_INITRD][510] != 0x55 || files[RTX_INITRD][511] != 0xaa) return RTX_E_CONTENT;
     if (m->bytes[RTX_SET] != BROOK_STICK_SET_BYTES ||
         !BrookStickSetMatches(files[RTX_SET], files[RTX_KERNEL], m->bytes[RTX_KERNEL],
                               files[RTX_INITRD], m->bytes[RTX_INITRD]) ||
@@ -218,6 +220,23 @@ static inline void RtxCleanupStaged(const char* root) {
 #define RTX_FAIL(code, step) do { snprintf(receipt->failed_step, sizeof(receipt->failed_step), "%s", step); \
     result = (code); goto fail; } while (0)
 
+// Read only the discriminator. A short or unreadable running file cannot
+// establish that the replacement loader will retain a bootable fallback.
+static inline int RtxRawPayload(const char* path) {
+    uint8_t prefix[BROOK_BOOT_COMPRESSED_MAGIC_BYTES];
+    const int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return -1;
+    size_t length = 0;
+    while (length < sizeof(prefix)) {
+        const ssize_t got = read(fd, prefix + length, sizeof(prefix) - length);
+        if (got < 0 && errno == EINTR) continue;
+        if (got <= 0) break;
+        length += (size_t)got;
+    }
+    if (close(fd) || length != sizeof(prefix)) return -1;
+    return !BrookBootCompressed(prefix, length);
+}
+
 /* runningSet: BROOK_STICK_ROOT or BROOK_STICK_PREV (the set the loader booted;
  * the caller's kernel gate has proven it is on this volume). */
 static inline int RtxApply(const char* root, const RtxManifest* m, uint8_t* const files[RTX_FILE_COUNT],
@@ -227,6 +246,17 @@ static inline int RtxApply(const char* root, const RtxManifest* m, uint8_t* cons
     int changed[RTX_FILE_COUNT];
     int result = RTX_OK, swapping = 0;
     if (runningSet != BROOK_STICK_ROOT && runningSet != BROOK_STICK_PREV) return RTX_E_RUNNING;
+    /* This receiver installs raw sets and cannot attest the incoming loader's
+     * pinned key. Refuse before staging if its preserved fallback needs one. */
+    for (unsigned i = RTX_KERNEL; i <= RTX_INITRD; ++i) {
+        RtxPath(path, sizeof(path), root, runningSet == BROOK_STICK_ROOT ? RTX_NAMES[i] : RTX_PREV_NAMES[i], NULL);
+        const int raw = RtxRawPayload(path);
+        if (raw != 1) {
+            snprintf(receipt->failed_step, sizeof(receipt->failed_step), "%s",
+                     raw == 0 ? "compressed running set (offline update only)" : "read running payload prefix");
+            return RTX_E_PREV;
+        }
+    }
     /* 1. stage */
     for (unsigned i = 0; i < RTX_FILE_COUNT; ++i) {
         RtxPath(path, sizeof(path), root, RTX_NAMES[i], NULL);

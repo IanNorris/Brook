@@ -32,8 +32,14 @@ bool ExpandBootPayload(EFI_BOOT_SERVICES* bs, uint8_t*& file, UINTN& bytes,
     if (!BootCompressed(file, bytes)) return true;
 #if defined(BROOK_BOOT_COMPRESSION_KEY)
     const UINTN expanded = BootExpandedSize(file, bytes, kind, maximum);
-    if (!expanded || crypto_ed25519_check_strict(file + BootCompressedHeaderBytes, PublicKey.bytes,
-                                                 file, BootCompressedHeaderBytes) != 0) return false;
+    if (!expanded) return false;
+    uint8_t message[sizeof(BootCompressionSignDomain) + BootCompressedHeaderBytes];
+    for (unsigned i = 0; i < sizeof(BootCompressionSignDomain); ++i)
+        message[i] = static_cast<uint8_t>(BootCompressionSignDomain[i]);
+    for (unsigned i = 0; i < BootCompressedHeaderBytes; ++i)
+        message[sizeof(BootCompressionSignDomain) + i] = file[i];
+    if (crypto_ed25519_check_strict(file + BootCompressedHeaderBytes, PublicKey.bytes,
+                                   message, sizeof(message)) != 0) return false;
     const uint8_t* body = file + BootCompressedPrefixBytes;
     const UINTN stored = bytes - BootCompressedPrefixBytes;
     uint8_t digest[32];

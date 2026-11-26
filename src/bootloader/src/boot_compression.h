@@ -1,23 +1,23 @@
 #pragma once
 
 #include <stdint.h>
-#include "../../shared/update/payload.h"
+#include "../../shared/update/boot_compression_magic.h"
 
 namespace brook { namespace bootloader {
 
 enum class BootPayloadKind : uint32_t { Kernel = 1, Initrd = 2 };
 constexpr uint32_t BootCompressedHeaderBytes = 64;
 constexpr uint32_t BootCompressedPrefixBytes = BootCompressedHeaderBytes + 64;
-constexpr uint8_t BootCompressedMagic[] = {'B', 'R', 'K', 'C', 'M', 'P', '0', '1'};
+constexpr char BootCompressionSignDomain[] = "BROOK-BOOT-COMPRESSION-V1";
 
 inline bool BootCompressed(const uint8_t* file, BrookUpdateSize bytes)
 {
-    return file && bytes >= sizeof(BootCompressedMagic) &&
-           BrookUpdateEqual(file, BootCompressedMagic, sizeof(BootCompressedMagic));
+    return BrookBootCompressed(file, bytes);
 }
 
 // Header: magic, kind u32, codec u32, expanded u64, stored u64, SHA-256 of
-// the LZ4 block. The Ed25519 signature authenticates all 64 header bytes.
+// the LZ4 block. The Ed25519 message is the domain (including NUL) followed
+// by all 64 header bytes.
 inline uint64_t BootExpandedSize(const uint8_t* file, BrookUpdateSize bytes, BootPayloadKind kind, uint64_t maximum)
 {
     if (!BootCompressed(file, bytes) || bytes <= BootCompressedPrefixBytes ||

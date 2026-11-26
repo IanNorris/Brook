@@ -363,7 +363,6 @@ def build(args):
         from usb_profile_plan import checked_plan
         args.checked_profile_plan = checked_plan(args.profile_plan, args.profile_plan_public_key)
     from boot_compression import INITRD, KERNEL, compress, read_signer
-    compression = read_signer(args.boot_compression_seed) if args.boot_compression_seed else None
     if args.operators.name.endswith('.seed'):
         raise SystemExit('--operators takes the public key file, never a seed')
     signer_hex = args.update_signer.read_text().strip()
@@ -375,6 +374,16 @@ def build(args):
     keys = validate_operator_policy(policy)
     if not keys:
         raise SystemExit('At least one operator public key is required')
+    compression = None
+    if args.boot_compression_seed:
+        other_keys = (*keys, bytes.fromhex(signer_hex))
+        if args.usb_system:
+            # checked_plan already validated the DER shape as Ed25519.
+            der = subprocess.check_output(
+                ['openssl', 'pkey', '-pubin', '-outform', 'DER'],
+                input=args.checked_profile_plan[2])
+            other_keys += (der[-32:],)
+        compression = read_signer(args.boot_compression_seed, other_keys)
     commit = subprocess.check_output(['git', '-C', ROOT, 'rev-parse', 'HEAD'], text=True).strip()
     dirty = bool(subprocess.check_output(['git', '-C', ROOT, 'status', '--porcelain', '--untracked-files=no']))
     if dirty and not args.allow_dirty:
@@ -398,8 +407,8 @@ def build(args):
     run(['cmake', '-S', ROOT / 'src/bootloader', '-B', loader_build, '-G', 'Ninja',
          f'-DCMAKE_TOOLCHAIN_FILE={ROOT}/cmake/toolchains/uefi-x86_64-clang.cmake',
          *[f'-D{k}:BOOL={v}' for k, v in LOADER_FLAGS.items()],
-         *([f'-DBROOK_BOOT_COMPRESSION_KEY={compression.verify_key.encode().hex()}',
-            '-DCMAKE_BUILD_TYPE=Release'] if compression else [])])
+         *([f'-DBROOK_BOOT_COMPRESSION_KEY={compression.verify_key.encode().hex()}']
+           if compression else [])])
     run(['cmake', '--build', loader_build, '--target', 'bootloader'])
     kernel = kernel_build / 'BROOK.elf'
     loader = loader_build / 'BOOTX64.efi'

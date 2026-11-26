@@ -7,7 +7,7 @@ using namespace brook::bootloader;
 int main()
 {
     uint8_t file[BootCompressedPrefixBytes + 16]{};
-    memcpy(file, BootCompressedMagic, sizeof(BootCompressedMagic));
+    memcpy(file, BROOK_BOOT_COMPRESSED_MAGIC, BROOK_BOOT_COMPRESSED_MAGIC_BYTES);
     BrookUpdatePut32(file + 8, uint32_t(BootPayloadKind::Kernel));
     BrookUpdatePut32(file + 12, 1);
     BrookUpdatePut64(file + 16, 8u << 20);

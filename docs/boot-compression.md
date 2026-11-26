@@ -4,11 +4,15 @@ The shared UEFI loader supports signed LZ4 kernel and initrd files. Existing
 raw ELF and FAT files still boot. Guarded slots and stick sets verify their
 stored file hashes before checking the compressed envelope. The envelope's
 Ed25519 signature authenticates the role, lengths and SHA-256 of the LZ4
-bytes. The loader verifies all of those fields before allocating the output,
+bytes. Its message starts with `BROOK-BOOT-COMPRESSION-V1` and a NUL byte,
+followed by the 64-byte envelope header. The loader verifies those fields
+before allocating the output,
 then requires the decoder to produce exactly the authenticated size.
 
-The builder option is off by default. For an isolated test, provide a private
-32-byte Ed25519 seed at mode 0600.
+The builder option is off by default. Use a dedicated 32-byte Ed25519 seed in
+a private file at mode 0600. Never reuse an operator, profile-signing, stick
+update, or any other signing key. Test loaders and fixtures need their own
+disposable seed. Rebuild any prototypes signed without the domain prefix.
 
 - `build_rtx_smoke_files.py --boot-compression-seed SEED` emits the full file
   set with a matching public key pinned in BOOTX64.EFI.
@@ -21,9 +25,22 @@ The builder option is off by default. For an isolated test, provide a private
   signs its compacted initrd after all QEMU-only edits, then boots it through
   slot A. Use a fixture-only signing key.
 
-Compressed sets are for loader-aware offline assembly and QEMU. Existing
-remote receivers check raw ELF and FAT headers and require raw pairs. The
-ordinary Dell pair remains available at the root of the build output.
+Compressed sets are for loader-aware offline assembly and QEMU. The transfer
+receivers accept only raw incoming pairs. The RTX receiver refuses to stage
+an update if the running root or PREV set is compressed. An incoming loader
+could lack the public key needed to boot the preserved fallback. Update such
+a stick offline using a matched loader and set.
+
+The Dell system receiver can upload a raw pair into the inactive slot while
+running from a compressed slot selected in VERIFIED mode. It requires the
+loader's selector digest and rechecks both stored hashes before writing.
+An unverified compressed pair is ineligible for remote promotion or fallback
+inference. The ordinary raw Dell pair remains at the root of the build
+output.
+
+The first eight bytes `BRKCMP01` are reserved. A raw `INITRD.IMG` beginning
+with those bytes is treated as a signed envelope and boot fails if validation
+fails.
 
 ## Codec comparison
 
