@@ -293,6 +293,7 @@ static void PrepareDesktopHome()
 #if defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_GUARDED_DESKTOP)
 namespace brook { void GuardTestPrepareDesktopHome() { PrepareDesktopHome(); } }
 #endif
+namespace brook { void UsbSystemPrepareDesktopHome() { PrepareDesktopHome(); } }
 
 // Serial-only boot step timing: elapsed ms since the previous step.
 [[maybe_unused]] static void BootStepTime(const char* step, uint64_t& since)
@@ -1307,7 +1308,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 #endif
 #else
         if(usbSystemRequested && !usbSystemReady) {
-            brook::ShellExecString("set wm\nset vfb none\nkconsole\n");
+            // A repair thread runs e2fsck, then the boot script or console.
+            if(!brook::UsbSystemRepairPending() || !brook::UsbSystemStartRepair())
+                brook::ShellExecString("set wm\nset vfb none\nkconsole\n");
         } else brook::ShellExecScript("/boot/INIT.RC");
 #endif
 

@@ -8,6 +8,7 @@
 #include "guard_repair_session.h"
 #endif
 
+#include "usb_system_fsck.h"
 #include "user_access_scope.h"
 #include "desktop_identity.h"
 #include "user_copy.h"
@@ -170,6 +171,18 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
     const char* lookupPath=hasSyntheticName?resolvedPath:path;
     const char* syntheticPath=hasSyntheticName?resolvedPath:"";
 
+    // USB-system boot repair: only the tracked e2fsck child, only while its
+    // session is active, and only the admitted BROOK_SYSTEM extent.
+    if(StrEq(path,"/dev/brook-usb-system") && !hasSyntheticName)return -13;
+    if(StrEq(syntheticPath,"/dev/brook-usb-system")) {
+        int error=0;Vnode* node=UsbSystemFsckOpenLinux(flags,&error);
+        if(!node)return error?error:-13;
+        FdEntry entry{};entry.type=FdType::Vnode;entry.handle=node;
+        entry.fdFlags=(flags&0x80000)?1:0;
+        int fd=FdPublishNew(proc,entry,static_cast<uint32_t>(flags));
+        if(fd<0) {VfsRelease(node);return -EMFILE;}
+        return fd;
+    }
 #if defined(BROOK_SSD_GUARD_REPAIR)
     if(StrEq(path,"/dev/brook-guard-data") && !hasSyntheticName)return -13;
     if(StrEq(syntheticPath,"/dev/brook-guard-data")) {

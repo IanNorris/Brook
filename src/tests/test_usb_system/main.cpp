@@ -1,5 +1,6 @@
 #include "gpt.h"
 #include "usb_system_layout.h"
+#include "usb_system_fsck_policy.h"
 #include "usb_write_windows.h"
 
 #include <cassert>
@@ -169,8 +170,34 @@ extern "C" void KPrintf(const char*,...) {}
 extern "C" void SerialPrintf(const char*,...) {}
 }
 
+void CheckFsckPolicy() {
+    using A=UsbSystemFsckAction;
+    assert(UsbSystemFsckClassify(true,0)==A::Continue);
+    assert(UsbSystemFsckClassify(true,1)==A::Continue);
+    assert(UsbSystemFsckClassify(true,2)==A::Reboot);
+    assert(UsbSystemFsckClassify(true,3)==A::Reboot);
+    const int refused[]={4,5,8,12,16,32,128,255,-1};
+    for(int code:refused)assert(UsbSystemFsckClassify(true,code)==A::Refuse);
+    assert(UsbSystemFsckClassify(false,0)==A::Refuse);  // killed by a signal
+    uint8_t digest[32];
+    for(unsigned i=0;i<32;++i) {
+        auto nibble=[](char c){return uint8_t(c<='9'?c-'0':c-'a'+10);};
+        digest[i]=uint8_t(nibble(UsbSystemFsckSha256[2*i])<<4|nibble(UsbSystemFsckSha256[2*i+1]));
+    }
+    assert(UsbSystemFsckDigestMatches(digest));
+    for(unsigned i=0;i<32;++i) {
+        digest[i]^=1;assert(!UsbSystemFsckDigestMatches(digest));digest[i]^=1;
+    }
+    UsbSystemFsckTranscript<8> transcript;
+    transcript.Append("ab\x01\n",4);
+    assert(transcript.length==4 && !std::strcmp(transcript.text,"ab?\n") && !transcript.truncated);
+    transcript.Append("cdefg",5);
+    assert(transcript.length==7 && transcript.truncated && !std::strcmp(transcript.text,"ab?\ncde"));
+}
+
 int main() {
     CheckBootScan();
+    CheckFsckPolicy();
     UsbSystemRecord record{};
     assert(UsbSystemParse(good,sizeof(good)-1,record));
     assert(record.first==2752512 && record.sectors==268435456);

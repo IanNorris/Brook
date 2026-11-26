@@ -76,6 +76,8 @@ Vnode* VfsCreateSocketAt(const VfsPath&,const VfsPath&,const char*,uint16_t,uint
 void VfsRelease(Vnode*) {}
 int VfsStat(Vnode*,VnodeStat*) { return -ENOENT; }
 Vnode* GuardCheckerOpenLinux(uint64_t,int* error) { *error=-13;return nullptr; }
+Vnode* UsbSystemFsckOpenLinux(uint64_t,int* error) { *error=-13;return nullptr; }
+void UsbSystemFsckCapture(const Process*,const char*,uint32_t) {}
 
 // Devices and GPU: absent.
 const GpuAppOps* GpuAppGet() { return harness::g_gpuApp; }

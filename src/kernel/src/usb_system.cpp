@@ -15,6 +15,16 @@
 #include "mount_namespace.h"
 #include "kprintf.h"
 #include "large_data_session.h"
+#include "exec_image.h"
+#include "lastlog.h"
+#include "process.h"
+#include "scheduler.h"
+#include "shell.h"
+#include "shutdown.h"
+#include "usb_system_fsck.h"
+#include "usb_system_fsck_policy.h"
+#include "vfs_path.h"
+#include "../../shared/update/payload.h"
 #include "serial.h"
 #include "strong_random.h"
 #include "string.h"
@@ -355,6 +365,243 @@ static int BindProfileTransfer() {
     return error;
 }
 
+namespace {
+// Boot-time repair state (usb_system_fsck.h). The checker image is loaded and
+// verified before the scheduler starts and released once the child exists.
+ExecutableImage checker{};
+LargeExt2Geometry admitted{};
+uint8_t reservedDrive;
+bool fsckPending;
+int fsckExit=-1;
+
+void ReleaseChecker() {if(checker.data)FreeExecutableImage(&checker);checker={};}
+
+bool Refuse(const char* reason,int detail) {
+    ReleaseChecker();
+    if(!strcmp(boot.fsck,"running"))boot.fsck="refused";
+    KPrintf("usb-system: BROOK_SYSTEM was not repaired: %s (%d). Run e2fsck -f on BROOK_SYSTEM from Linux.\n",
+            reason,detail);
+    return Fail("needs-filesystem-check",-117);
+}
+
+// The checker must be the pinned static e2fsck. Anything else keeps the
+// pre-repair refusal, so a missing or replaced binary is never executed.
+bool PrepareChecker() {
+    VnodeStat marker{};
+    if(VfsLstatPath(UsbSystemFsckOptOut,&marker)!=-2) {
+        boot.fsck="disabled";
+        KPrintf("usb-system: automatic repair disabled by %s\n",UsbSystemFsckOptOut);
+        return false;
+    }
+    Vnode* node=nullptr;char resolved[256]{};VnodeStat stat{};
+    int error=VfsOpenExecutable(UsbSystemFsckPath,&node,resolved,sizeof(resolved));
+    if(!error)error=VfsStat(node,&stat);
+    if(!error && (stat.isDir || stat.isSymlink || !stat.size || stat.size>UsbSystemFsckMaxBytes))error=-8;
+    if(!error)error=ReadExecutableImage(node,&checker);
+    if(node)VfsRelease(node);
+    const char* problem=error==-2?"missing":"unreadable";
+    if(!error) {
+        uint8_t hash[32]{};char interpreter[256]{};
+        BrookUpdateHash(checker.data,checker.size,hash);
+        if(!UsbSystemFsckDigestMatches(hash)) {problem="digest mismatch";error=-8;}
+        else if(!ElfMainInterpreter(checker.data,checker.size,interpreter,sizeof(interpreter)) || interpreter[0]) {
+            problem="not a static executable";error=-8;
+        }
+    }
+    if(error) {
+        ReleaseChecker();
+        boot.fsck="unavailable";
+        KPrintf("usb-system: automatic repair unavailable: %s %s (%d)\n",UsbSystemFsckPath,problem,error);
+        return false;
+    }
+    return true;
+}
+
+LargeExt2HeaderState ReadState() {
+    uint8_t sb[1024];
+    LargeExt2Geometry geometry{};
+    if(!ReadExact(disk,systemWindow.start+1024,sb,sizeof(sb)))return LargeExt2HeaderState::Invalid;
+    const auto state=LargeExt2ClassifyHeader(sb,sizeof(sb),systemWindow.length,record.uuid,geometry);
+    if(state!=LargeExt2HeaderState::Invalid && geometry.groups!=admitted.groups)return LargeExt2HeaderState::Invalid;
+    return state;
+}
+
+// Shared by the direct boot path and the post-repair path. The adapter is
+// registered and leased; the extent's header has just been classified Clean.
+bool Activate(uint8_t drive) {
+    auto phase=MountClockNs();
+    constexpr uint32_t gdtCapacity=4096*32;
+    auto* gdt=static_cast<uint8_t*>(kmalloc(gdtCapacity));
+    if(!gdt)return Fail("descriptor-buffer",-12);
+    int error=__atomic_load_n(&open,__ATOMIC_ACQUIRE)?0:SetWindow(true);
+    if(!error)error=DeviceFlush(&dataDevice);
+    if(!error)error=MaybeTrim(gdt,gdtCapacity);
+    if(!error && !session.dirty)
+        error=session.Begin(SessionIo(),systemWindow.length,record.uuid,gdt,gdtCapacity);
+    kfree(gdt);
+    if(error)return Fail(error==-117?"needs-filesystem-check":"session-begin",error);
+    sessionUs=(MountClockNs()-phase)/1000;phase=MountClockNs();
+    if(!Ext2BindDevice(drive,&dataDevice))return Fail("ext2-bind",-16);
+    if(!VfsMountConfigured("/nix","ext2",drive,6)) {
+        VfsDrainMountCleanup();
+        return Fail("mount",-5);
+    }
+    WritableDesktopFailure details{};
+    if(WritableDesktopPublishDirect(&details)!=WritableDesktopPublish::Ready) {
+        VfsUnmount("/nix");
+        return Fail(details.check,details.status);
+    }
+    if (const int transferError = BindProfileTransfer())
+        KPrintf("usb-system: profile transfer unavailable (bind error %d)\n", transferError);
+    if(!session.Arm())__builtin_trap();
+    mountUs=(MountClockNs()-phase)/1000;
+    ready=true;
+    boot.mounted=true;boot.dirty=true;boot.stage="ready";
+    WritableDesktopMarkDirectReady(drive,systemWindow.length);
+    SerialPrintf("USB_SYSTEM_READY disk=%d lba=%lu sectors=%lu groups=%u\n",
+        boot.disk,record.first,record.sectors,admitted.groups);
+    return true;
+}
+
+// The transcript was already in the boot log as the checker wrote it. Keep a
+// copy beside lastlog and repeat it so the first lastlog record carries it.
+void PublishTranscript() {
+    uint32_t length=0;bool truncated=false;
+    const char* text=UsbSystemFsckTranscriptText(&length,&truncated);
+    KPrintf("usb-system: e2fsck exit=%d repaired BROOK_SYSTEM; transcript%s:\n",fsckExit,
+            truncated?" (truncated)":"");
+    for(uint32_t at=0;at<length;) {
+        char line[200];uint32_t n=0;
+        while(at<length && text[at]!='\n' && n<sizeof(line)-1)line[n++]=text[at++];
+        if(at<length && text[at]=='\n')++at;
+        line[n]=0;
+        KPrintf("usb-system: e2fsck| %s\n",line);
+    }
+    VfsPath root{};
+    int error=VfsPathRoot(&root);
+    const char* directories[]={"/nix/var","/nix/var/log","/nix/var/log/brook"};
+    for(const char* directory:directories) {
+        if(error)break;
+        const int made=VfsMkdirAt(root,root,directory,0755,0);
+        if(made && made!=-17)error=made;
+    }
+    Vnode* file=nullptr;
+    if(!error)file=VfsOpenAt(root,root,"/nix/var/log/brook/usb-system-fsck.log",
+                             VFS_O_WRITE|VFS_O_CREATE|VFS_O_TRUNC,0644,0,&error);
+    if(file) {
+        char header[96]="brook usb-system: e2fsck -p -f exit=";
+        int bytes=int(strlen(header));
+        const int code=fsckExit<0?0:fsckExit;
+        if(code>=100)header[bytes++]=char('0'+code/100);
+        if(code>=10)header[bytes++]=char('0'+code/10%10);
+        header[bytes++]=char('0'+code%10);
+        const char* tail=truncated?" transcript truncated\n":"\n";
+        memcpy(header+bytes,tail,strlen(tail)+1);bytes+=int(strlen(tail));
+        uint64_t offset=0;
+        int written=VfsWrite(file,header,uint32_t(bytes),&offset);
+        if(written==bytes && length)written=VfsWrite(file,text,length,&offset)==int(length)?0:-5;
+        else if(written==bytes)written=0;
+        error=written<0?written:written?-5:0;
+        if(!error)error=VfsFsync(file);
+        VfsClose(file);
+    } else if(!error) error=-5;
+    VfsPathRelease(root);
+    if(error)KPrintf("usb-system: cannot keep the e2fsck transcript (%d)\n",error);
+    else KPrintf("usb-system: e2fsck transcript kept in /nix/var/log/brook/usb-system-fsck.log\n");
+    LastLogRequestFlush();
+}
+
+// Runs e2fsck -p -f as root on /dev/brook-usb-system, the leased adapter of
+// exactly the validated extent, then mounts, reboots or refuses.
+bool Repair() {
+    KPrintf("usb-system: running %s -p -f on BROOK_SYSTEM (lba %lu, %lu sectors)\n",
+            UsbSystemFsckPath,record.first,record.sectors);
+    boot.fsck="running";
+    if(const int error=SetWindow(true))return Refuse("write window",error);
+    const char* argv[]={UsbSystemFsckPath,"-p","-f",UsbSystemFsckDevice,nullptr};
+    const char* env[]={"PATH=/boot","LANG=C",nullptr};
+    FdEntry fds[3]{};fds[0].type=FdType::DevNull;fds[1].type=fds[2].type=FdType::DebugConsole;
+    Process* child=ProcessCreateExecutable(checker,4,argv,2,env,fds,0,0);
+    ReleaseChecker();
+    if(!child)return Refuse("cannot start e2fsck",-12);
+    child->parentPid=ProcessCurrent()->tgid;
+    FdReleaseOwnedEntry(child->fds[3]);child->fds[3]={};
+    const uint16_t pid=child->pid;const uint64_t incarnation=child->incarnation;
+    if(!UsbSystemFsckSessionBegin(&dataDevice,child)) {
+        ProcessDiscardUnpublished(child);
+        return Refuse("device session",-13);
+    }
+    SchedulerAddProcess(child);child=nullptr;
+    // A large store over USB can take minutes. A hung checker must not hold
+    // the boot forever; the refusal keeps the extent for a host check.
+    constexpr unsigned limitMs=15*60*1000,pollMs=100;
+    ChildWaitSnapshot result{};int waited=0;
+    for(unsigned elapsed=0;elapsed<limitMs && !waited;elapsed+=pollMs) {
+        waited=SchedulerWaitChild(ProcessCurrent(),1,pid,4,&result);
+        if(!waited)SchedulerSleepMs(pollMs);
+    }
+    if(waited==1 && result.incarnation!=incarnation)waited=-3;
+    if(waited!=1) {
+        const int failure=waited;
+        if(auto* process=SchedulerFindProcessReference(pid)) {
+            if(process->incarnation==incarnation)SchedulerRequestFatalSignal(process,9);
+            ProcessUnref(process);
+        }
+        for(unsigned i=0;i<3000 && waited==0;++i) {
+            SchedulerSleepMs(10);waited=SchedulerWaitChild(ProcessCurrent(),1,pid,4,&result);
+        }
+        UsbSystemFsckSessionEnd();
+        return Refuse(failure?"e2fsck wait failed":"e2fsck timed out",failure);
+    }
+    // The child has been reaped, so its descriptors are closed.
+    if(!UsbSystemFsckSessionEnd())return Refuse("device view still open",-16);
+    const bool exited=result.code==1;
+    fsckExit=exited?(result.status>>8)&0xff:-1;
+    const auto action=UsbSystemFsckClassify(exited,fsckExit);
+    KPrintf("USB_SYSTEM_FSCK exit=%d signal=%d action=%s\n",fsckExit,exited?0:result.status&0x7f,
+            action==UsbSystemFsckAction::Continue?"mount":action==UsbSystemFsckAction::Reboot?"reboot":"refuse");
+    if(action==UsbSystemFsckAction::Refuse) {
+        boot.fsck="refused";
+        return Refuse(exited?"e2fsck left errors uncorrected":"e2fsck did not exit normally",
+                      exited?fsckExit:-(result.status&0x7f));
+    }
+    if(const int flushed=DeviceFlush(&dataDevice))return Refuse("flush after e2fsck",flushed);
+    // Never continue, or reboot into another check, unless the checker
+    // actually left the filesystem marked clean.
+    if(ReadState()!=LargeExt2HeaderState::Clean) {
+        boot.fsck="refused";
+        return Refuse("e2fsck left the filesystem marked not clean",fsckExit);
+    }
+    if(action==UsbSystemFsckAction::Reboot) {
+        SetWindow(false);
+        boot.fsck="reboot";boot.stage="filesystem-check-reboot";
+        const auto power=ShutdownGetPowerCapabilities();
+        if(!power.gracefulQuiescence || !power.reset || !ShutdownLaunchAllowed()) {
+            boot.fsck="refused";
+            return Refuse("e2fsck asked for a reboot, which is unavailable",fsckExit);
+        }
+        KPrintf("usb-system: e2fsck repaired BROOK_SYSTEM and asked for a reboot; restarting\n");
+        ShutdownDesktopRequest(true);
+        return false;
+    }
+    boot.fsck="repaired";
+    if(!Activate(reservedDrive))return false;
+    PublishTranscript();
+    return true;
+}
+
+void RepairWorker(void*) {
+    const bool mounted=Repair();
+    if(!mounted && !strcmp(boot.fsck,"reboot"))return;
+    if(!ShutdownLaunchAllowed())return;
+    if(mounted) {
+        UsbSystemPrepareDesktopHome();
+        const int script=ShellExecScript("/boot/INIT.RC");
+        if(script)KPrintf("usb-system: boot script failed after repair (%d)\n",script);
+    } else ShellExecString("set wm\nset vfb none\nkconsole\n");
+}
+}
+
 bool UsbSystemBoot(uint8_t* nextDrive,bool scanComplete) {
     auto phase=MountClockNs();
     if(!boot.parsed || !nextDrive)return Fail("record",-22);
@@ -374,66 +621,58 @@ bool UsbSystemBoot(uint8_t* nextDrive,bool scanComplete) {
     bootWindow={bootFirst*512,bootSectors*512};
     systemWindow={record.first*512,record.sectors*512};
     uint8_t sb[1024];
-    LargeExt2Geometry geometry{};
     if(!ReadExact(disk,systemWindow.start+1024,sb,sizeof(sb)))return Fail("ext2-read",-5);
-    const auto state=LargeExt2ClassifyHeader(sb,sizeof(sb),systemWindow.length,record.uuid,geometry);
-    if(state==LargeExt2HeaderState::NeedsCheck) {
+    const auto state=LargeExt2ClassifyHeader(sb,sizeof(sb),systemWindow.length,record.uuid,admitted);
+    const bool needsCheck=state==LargeExt2HeaderState::NeedsCheck;
+    if(needsCheck) {
         boot.dirty=true;
-        return Fail("needs-filesystem-check",-117);
-    }
-    if(state!=LargeExt2HeaderState::Clean)return Fail("ext2-identity",-22);
+        KPrintf("usb-system: BROOK_SYSTEM was not cleanly unmounted\n");
+        if(!PrepareChecker())return Fail("needs-filesystem-check",-117);
+    } else if(state!=LargeExt2HeaderState::Clean)return Fail("ext2-identity",-22);
     WritableDesktopFailure details{};
     VnodeStat target{};
     if(!Ext2DriveAvailable(*nextDrive) || !WritableDesktopPrepareDirect(&details) ||
-       VfsLstatPath("/nix",&target) || !target.isDir || target.isSymlink)
+       VfsLstatPath("/nix",&target) || !target.isDir || target.isSymlink) {
+        ReleaseChecker();
         return Fail("mount-target",details.status?details.status:-22);
+    }
 
     admissionUs=(MountClockNs()-phase)/1000;phase=MountClockNs();
     const int transport=disk->ops->ioctl(disk,DEVICE_IOCTL_USB_SYSTEM_TRANSPORT,nullptr);
     const auto identifyStart=MountClockNs();
-    if(transport && transport!=-95)return Fail("storage-transport",transport);
-    if(!transport && (!ValidateGpt(disk,bootGuid,bootEntry,bootFirst,bootSectors) ||
-       !ReadExact(disk,systemWindow.start+1024,sb,sizeof(sb)) ||
-       LargeExt2ClassifyHeader(sb,sizeof(sb),systemWindow.length,record.uuid,geometry)!=LargeExt2HeaderState::Clean))
+    if(transport && transport!=-95) {ReleaseChecker();return Fail("storage-transport",transport);}
+    // The extent must classify exactly as it did before the transport change.
+    if(!transport && (!ValidateGpt(disk,bootGuid,bootEntry,bootFirst,bootSectors) || ReadState()!=state)) {
+        ReleaseChecker();
         return Fail("storage-transport-identity",-22);
+    }
 
     transportIdentityUs=(MountClockNs()-identifyStart)/1000;
-    transportUs=(MountClockNs()-phase)/1000;phase=MountClockNs();
-    constexpr uint32_t gdtCapacity=4096*32;
-    auto* gdt=static_cast<uint8_t*>(kmalloc(gdtCapacity));
-    if(!gdt)return Fail("descriptor-buffer",-12);
+    transportUs=(MountClockNs()-phase)/1000;
     const BlockWriteLease lease{reinterpret_cast<uintptr_t>(disk),reinterpret_cast<uintptr_t>(&dataDevice),
         systemWindow.start,systemWindow.length};
-    int error=-16;
-    if(DeviceRegister(&dataDevice)) {
-        if(!DeviceInstallBootWriteLeases(&lease,1))DeviceUnregister(&dataDevice);
-        else if(!(error=SetWindow(true)) && !(error=DeviceFlush(&dataDevice)) &&
-                !(error=MaybeTrim(gdt,gdtCapacity)) && !session.dirty)
-            error=session.Begin(SessionIo(),systemWindow.length,record.uuid,gdt,gdtCapacity);
+    bool owned=DeviceRegister(&dataDevice);
+    if(owned && !DeviceInstallBootWriteLeases(&lease,1)) {DeviceUnregister(&dataDevice);owned=false;}
+    if(!owned) {ReleaseChecker();return Fail("session-begin",-16);}
+    const uint8_t drive=(*nextDrive)++;
+    if(needsCheck) {
+        // e2fsck needs the scheduler. UsbSystemStartRepair runs it, then
+        // mounts and starts the boot script, or keeps the refusal.
+        reservedDrive=drive;fsckPending=true;
+        boot.stage="filesystem-check";boot.fsck="pending";
+        return false;
     }
-    kfree(gdt);
-    if(error)return Fail(error==-117?"needs-filesystem-check":"session-begin",error);
-    sessionUs=(MountClockNs()-phase)/1000;phase=MountClockNs();
-    const uint8_t drive=*nextDrive;
-    if(!Ext2BindDevice(drive,&dataDevice))return Fail("ext2-bind",-16);
-    ++*nextDrive;
-    if(!VfsMountConfigured("/nix","ext2",drive,6)) {
-        VfsDrainMountCleanup();
-        return Fail("mount",-5);
-    }
-    if(WritableDesktopPublishDirect(&details)!=WritableDesktopPublish::Ready) {
-        VfsUnmount("/nix");
-        return Fail(details.check,details.status);
-    }
-    if (const int transferError = BindProfileTransfer())
-        KPrintf("usb-system: profile transfer unavailable (bind error %d)\n", transferError);
-    if(!session.Arm())__builtin_trap();
-    mountUs=(MountClockNs()-phase)/1000;
-    ready=true;
-    boot.mounted=true;boot.dirty=true;boot.stage="ready";
-    WritableDesktopMarkDirectReady(drive,systemWindow.length);
-    SerialPrintf("USB_SYSTEM_READY disk=%d lba=%lu sectors=%lu groups=%u\n",
-        boot.disk,record.first,record.sectors,geometry.groups);
+    return Activate(drive);
+}
+
+bool UsbSystemRepairPending() {return fsckPending;}
+
+bool UsbSystemStartRepair() {
+    if(!fsckPending || !checker.data)return false;
+    fsckPending=false;
+    auto* worker=KernelThreadCreate("usb_system_fsck",RepairWorker,nullptr);
+    if(!worker)return Refuse("cannot start the repair thread",-12);
+    SchedulerAddProcess(worker);
     return true;
 }
 
@@ -482,6 +721,7 @@ UsbSystemStatus UsbSystemRead() {
     out.writes=__atomic_load_n(&writes,__ATOMIC_RELAXED);
     out.flushes=__atomic_load_n(&flushes,__ATOMIC_RELAXED);
     out.errors=__atomic_load_n(&errors,__ATOMIC_RELAXED);
+    out.fsckExit=fsckExit;
     return out;
 }
 }
