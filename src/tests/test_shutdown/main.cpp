@@ -87,7 +87,9 @@ void PlatformPowerConfigure(){}
 const PlatformPowerPlan& PlatformPowerGetPlan(){return powerPlan;}
 bool PlatformPowerIssue(bool restart, bool forceWarm){
 assert(forceWarm==(operations[current].forced && restart));assert(writebackStopped && gate && (syncError==0 || operations[current].forced));++powerWrites;lastRestart=restart;return true;}
-bool DeviceCloseWrites(){assert(writebackStopped);++freezes;return canFreeze;}
+static bool logWritesStopped;
+void KLogStopFileWrites(){logWritesStopped=true;}
+bool DeviceCloseWrites(){assert(writebackStopped && logWritesStopped);++freezes;return canFreeze;}
 void AudioStop(){}
 void AudioPrepareShutdown(){}
 void HdaRuntimeShutdown(){}

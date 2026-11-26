@@ -9,6 +9,9 @@
 #include "vfs.h"
 #include "memory/file_object.h"
 #include "ext2_vfs.h"
+#if defined(BROOK_EFI_SHUTDOWN_TEST)
+#include "fatfs_glue.h"
+#endif
 #include "writable_desktop.h"
 #include "usb_system.h"
 #include "ahci_system_volume.h"
@@ -436,7 +439,13 @@ void Worker(void*) {
 #if defined(BROOK_SSD_GUARDED_DESKTOP)
                 GuardPrepareCheckedSlotShutdown();
 #endif
+                KLogStopFileWrites();
                 if(!DeviceCloseWrites()){SchedulerSleepMs(25);continue;}
+#if defined(BROOK_EFI_SHUTDOWN_TEST)
+                char sticky[2]{};
+                if (FwCfgReadFile("opt/brook/volatile-fat-error", sticky, sizeof(sticky)) == 1 && sticky[0] == '1')
+                    KPrintf("VOLATILE_FAT_STICKY injected=%u\n", FatFsInjectRamWriteFailureForTest() ? 1u : 0u);
+#endif
                 SetPhase(selected,Phase::Syncing);AudioPrepareShutdown();AudioStop();HdaRuntimeShutdown();
                 FinishSync(selected,FinalSync());
             }

@@ -61,6 +61,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', required=True, type=Path)
     parser.add_argument('--build', type=Path, default=ROOT / 'build/release')
+    parser.add_argument('--sticky-fat-error', action='store_true',
+                        help='Inject a RAM FAT failure using a BROOK_EFI_SHUTDOWN_TEST kernel')
     args = parser.parse_args()
     kvm = os.access('/dev/kvm', os.R_OK | os.W_OK)
     if kvm and subprocess.run(['pgrep', '-x', 'vmware-vmx']).returncode == 0:
@@ -98,6 +100,8 @@ def main():
                '-drive', f'if=none,id=stick,format=raw,readonly=on,file={disk}',
                '-device', 'usb-storage,bus=usb.0,drive=stick,bootindex=1',
                '-serial', f'file:{serial}']
+    if args.sticky_fat_error:
+        command += ['-fw_cfg', 'name=opt/brook/volatile-fat-error,string=1']
     with (output / 'qemu.log').open('w') as log:
         vm = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
         try:
@@ -105,7 +109,12 @@ def main():
             assert vm.wait(timeout=30) == 0, 'checked reset did not exit QEMU cleanly'
             boot_log = serial.read_text(errors='replace')
             assert 'volatile desktop /tmp ready' in boot_log
-            assert 'first sector write failure' not in boot_log
+            if args.sticky_fat_error:
+                assert 'VOLATILE_FAT_STICKY injected=1' in boot_log
+                assert 'pdrv=0' in boot_log and 'reason=short-transfer' in boot_log
+                assert 'ignored at shutdown (volatile backing)' in boot_log
+            else:
+                assert 'first sector write failure' not in boot_log
             assert 'shutdown: final sync vfs=0' in boot_log
             assert 'phase=ready result=0' in boot_log and 'phase=committing result=0' in boot_log
         finally:

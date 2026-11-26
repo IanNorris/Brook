@@ -8,6 +8,7 @@
 
 #include "fatfs_glue.h"
 #include "ramdisk.h"
+#include "kprintf.h"
 #include "rtc.h"
 #include "device.h"
 #include "process.h"
@@ -250,9 +251,10 @@ DRESULT disk_write(BYTE pdrv, const BYTE* buff, LBA_t sector, UINT count)
         const auto* writer = brook::ProcessCurrent ? brook::ProcessCurrent() : nullptr;
         const char* path = brook::FatFsCurrentWritePath ? brook::FatFsCurrentWritePath() : nullptr;
         if (!path || !*path) path = "<fat-metadata>";
-        brook::SerialPrintf("fatfs: first sector write failure pdrv=%u pid=%u path=%s reason=%s sector=%lu count=%u result=%d\n",
-                           unsigned(pdrv), writer ? unsigned(writer->pid) : 0, path, reason,
-                           static_cast<unsigned long>(sector), count, result.count);
+        brook::KPrintf("fatfs: first sector write failure pdrv=%u tid=%u pid=%u reason=%s sector=%lu count=%u result=%d path=%s\n",
+                           unsigned(pdrv), writer ? unsigned(writer->pid) : 0,
+                           writer ? unsigned(writer->tgid) : 0, reason,
+                           static_cast<unsigned long>(sector), count, result.count, path);
     }
     return RES_ERROR;
 }
@@ -322,3 +324,18 @@ extern "C" DWORD get_fattime(void)
     return ((yr - 1980u) << 25) | (mon << 21) | (day << 16) |
            (hr << 11) | (min << 5) | (sec / 2);
 }
+
+#if defined(BROOK_EFI_SHUTDOWN_TEST)
+#include "string.h"
+
+bool brook::FatFsInjectRamWriteFailureForTest()
+{
+    auto* device = FatFsBoundDevice(0);
+    if (!device || strcmp(device->name, "ramdisk0")) return false;
+    BYTE data[512]{};
+    // One sector past the RAM disk produces a short transfer without
+    // modifying media. Exercise the same sticky path as a real failure.
+    return disk_write(0, data, DeviceBlockCount(device), 1) == RES_ERROR &&
+           FatFsFlushDrive(0) == -5;
+}
+#endif

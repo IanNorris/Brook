@@ -40,5 +40,8 @@ void FatFsReleaseDrive(uint8_t pdrv);
 bool FatFsDriveReadOnly(uint8_t pdrv);
 // Borrowed boot-lifetime binding; caller retains the FAT mount/lease.
 Device* FatFsBoundDevice(uint8_t pdrv);
+#if defined(BROOK_EFI_SHUTDOWN_TEST)
+bool FatFsInjectRamWriteFailureForTest();
+#endif
 
 } // namespace brook
