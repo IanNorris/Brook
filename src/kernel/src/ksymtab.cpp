@@ -1,3 +1,4 @@
+#include "fido_hidraw.h"
 #include "ksymtab.h"
 #include "usb_system.h"
 #include "vmware_tools.h"
@@ -199,6 +200,12 @@ EXPORT_SYMBOL(KbdLayout);
 // Input subsystem
 EXPORT_SYMBOL(InputInit);
 EXPORT_SYMBOL(InputRegister);
+EXPORT_SYMBOL(HidrawAttach);
+EXPORT_SYMBOL(HidrawActivate);
+EXPORT_SYMBOL(HidrawDetach);
+EXPORT_SYMBOL(HidrawReceive);
+EXPORT_SYMBOL(HidrawOutputComplete);
+EXPORT_SYMBOL(HidrawTransportFailed);
 EXPORT_SYMBOL(InputPollEvent);
 EXPORT_SYMBOL(InputWaitEvent);
 EXPORT_SYMBOL(InputHasEvents);

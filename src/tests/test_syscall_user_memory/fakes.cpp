@@ -1,3 +1,4 @@
+#include "fido_hidraw.h"
 // Minimal stand-ins for subsystems underneath the handlers under test. Most
 // fail or report "absent"; the fake network stack is observable via g_net.
 #include "harness.h"
@@ -78,6 +79,12 @@ int VfsStat(Vnode*,VnodeStat*) { return -ENOENT; }
 Vnode* GuardCheckerOpenLinux(uint64_t,int* error) { *error=-13;return nullptr; }
 
 // Devices and GPU: absent.
+bool HidrawDeviceNumber(uint64_t) { return false; }
+int HidrawOpen(Process*, const VnodeStat&, uint32_t) { return -ENODEV; }
+int64_t HidrawRead(FdEntry*, uint64_t, uint64_t) { return -ENODEV; }
+int64_t HidrawWrite(FdEntry*, uint64_t, uint64_t, bool) { return -ENODEV; }
+int64_t HidrawIoctl(HidrawFile*, uint64_t, uint64_t) { return -ENODEV; }
+uint32_t HidrawReady(HidrawFile*, uint32_t) { return 0; }
 const GpuAppOps* GpuAppGet() { return harness::g_gpuApp; }
 bool BdwIntelUserNodeEnabled() { return false; }
 BdwGpuFile* BdwGpuFileCreate() { return nullptr; }

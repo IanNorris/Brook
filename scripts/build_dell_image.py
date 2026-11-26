@@ -334,6 +334,9 @@ def main():
     provenance, assembly = build_provenance(commit, dirty, a.source_date_epoch)
     image = a.output / 'INITRD.IMG'
     run(['mcopy', '-o', '-i', image, '-', '::/ETC/keyboard-layout'], input=(a.keyboard_layout + '\n').encode())
+    # The pinned Dell profile uses xHCI. Enable the existing port and hub
+    # watcher so an authenticator inserted after boot gets a device node.
+    run(['mcopy', '-o', '-i', image, '-', '::/ETC/usb-hotplug'], input=b'1\n')
     run(['mcopy', '-o', '-i', image, '-', '::/ETC/build-provenance'], input=provenance)
     if subprocess.check_output(['mtype', '-i', str(image), '::/ETC/build-provenance']) != provenance:
         sys.exit('initrd build provenance readback mismatch')

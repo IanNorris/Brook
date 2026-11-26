@@ -1417,7 +1417,8 @@ Tmpfs *TmpfsCreatePtyDirectory(uint32_t uid,uint32_t gid,UserNamespace* owner,
     if(!*error)return fs;
     TmpfsDestroy(fs);return nullptr;
 }
-int TmpfsSeedEntry(Tmpfs *fs, const char *name, uint16_t mode, uint64_t rdev, const char *target)
+int TmpfsSeedEntry(Tmpfs *fs, const char *name, uint16_t mode, uint64_t rdev, const char *target,
+                   uint32_t uid, uint32_t gid)
 {
     if (!fs || !name)
         return -22;
@@ -1435,7 +1436,7 @@ int TmpfsSeedEntry(Tmpfs *fs, const char *name, uint16_t mode, uint64_t rdev, co
     auto *parent = fs->root;
     if (*Find(parent, name))
         return -17;
-    auto *n = NewNode(fs, type == Link ? uint16_t(Link | 0777) : mode, parent->uid, parent->gid);
+    auto *n = NewNode(fs, type == Link ? uint16_t(Link | 0777) : mode, uid, gid);
     if (!n)
         return -28;
     if (type == Link)
@@ -1458,6 +1459,14 @@ int TmpfsSeedEntry(Tmpfs *fs, const char *name, uint16_t mode, uint64_t rdev, co
     }
     Publish(parent, e);
     return 0;
+}
+void TmpfsRemoveCharDevice(Tmpfs *fs, const char *name, uint64_t rdev)
+{
+    if (!fs || !fs->devices || !name || Leaf(name)) return;
+    Guard g(fs);
+    auto **slot = Find(fs->root, name);
+    if (*slot && ((*slot)->node->mode & TypeMask) == CharDevice && (*slot)->node->rdev == rdev)
+        RemoveEntry(fs->root, slot);
 }
 TmpfsUsage TmpfsGlobalUsage()
 {

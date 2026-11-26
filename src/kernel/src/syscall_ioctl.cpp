@@ -1,3 +1,4 @@
+#include "fido_hidraw.h"
 // syscall_ioctl.cpp -- ioctl dispatch for terminals, framebuffer, OSS, DRM and sockets.
 //
 // Split from syscall.cpp.
@@ -274,6 +275,8 @@ int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
     }
     if(fde->type==FdType::Vnode && fde->handle && static_cast<Vnode*>(fde->handle)->type==VnodeType::Namespace)
         return cmd==0xb703?ProcFsOpenedNamespaceType(static_cast<Vnode*>(fde->handle)):-25;
+    if (fde->type == FdType::DevHidraw)
+        return HidrawIoctl(static_cast<HidrawFile*>(fde->handle), cmd, arg);
     if(fde->type==FdType::SyncFile) {
         if(!fde->handle)return -EBADF;
         if(cmd!=SYNC_FILE_INFO_IOCTL)return -25;

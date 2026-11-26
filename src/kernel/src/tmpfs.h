@@ -38,10 +38,12 @@ Tmpfs *TmpfsCreateDeviceDirectory(int *error, uint64_t byteLimit = 64 * 1024);
 // Private device tree metadata. PTY endpoint allocation is a separate driver.
 Tmpfs *TmpfsCreatePtyDirectory(uint32_t uid,uint32_t gid,UserNamespace* owner,
                               uint16_t ptmxMode,int* error);
-// Kernel seeding of one root entry before the instance is mounted: a
+// Kernel publication of one device-directory root entry: a
 // directory, a character device (mode S_IFCHR|perm, Linux-encoded rdev) or a
 // symlink (target). Userspace mknod remains FIFO-only.
-int TmpfsSeedEntry(Tmpfs *, const char *name, uint16_t mode, uint64_t rdev = 0, const char *target = nullptr);
+int TmpfsSeedEntry(Tmpfs *, const char *name, uint16_t mode, uint64_t rdev = 0, const char *target = nullptr,
+                   uint32_t uid = 0, uint32_t gid = 0);
+void TmpfsRemoveCharDevice(Tmpfs *, const char *name, uint64_t rdev);
 struct TmpfsUsage
 {
     uint64_t bytes, inodes, mounts;

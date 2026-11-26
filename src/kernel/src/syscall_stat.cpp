@@ -1,3 +1,4 @@
+#include "fido_hidraw.h"
 // syscall_stat.cpp -- stat family, statx, statfs, access/faccessat.
 //
 // Split from syscall.cpp.
@@ -429,6 +430,12 @@ static int64_t FstatKernel(uint64_t fd,LinuxStat* st)
     }
 #endif
 
+    if (fde->type == FdType::DevHidraw) {
+        VnodeStat stat{};
+        HidrawStat(static_cast<HidrawFile*>(fde->handle), stat);
+        FillStat(st, stat);
+        return 0;
+    }
     if (IsTerminalFd(fde)) {
         auto* raw = reinterpret_cast<uint8_t*>(st);
         memset(raw, 0, sizeof(LinuxStat));

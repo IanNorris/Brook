@@ -150,6 +150,12 @@ add_host_test(test_usb_hub_logic)
 target_compile_options(test_usb_hub_logic PRIVATE "-iquote${BROOK_ROOT}/src/drivers/xhci")
 add_host_test(test_ps2_aux_reset)
 target_compile_options(test_ps2_aux_reset PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
+add_host_test(test_fido_hidraw "${BROOK_ROOT}/src/kernel/src/fido_hidraw.cpp")
+target_compile_options(test_fido_hidraw PRIVATE -DBROOK_HOST_TEST -Wno-attributes
+    "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared"
+    "-iquote${BROOK_ROOT}/src/shared/inc_km")
+add_host_test(test_usb_fido)
+target_compile_options(test_usb_fido PRIVATE "-iquote${BROOK_ROOT}/src/drivers/xhci")
 add_host_test(test_usb_boot_keyboard)
 target_compile_options(test_usb_boot_keyboard PRIVATE "-iquote${BROOK_ROOT}/src/drivers/xhci")
 add_host_test(test_partition_bounds)
