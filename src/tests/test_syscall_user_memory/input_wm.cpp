@@ -12,6 +12,9 @@ namespace {
 struct FakeWm {
     bool exists=false;
     bool fineScroll=false;
+    bool captureExcluded=false;
+    bool incompleteTitle=false;
+    uint32_t policyTitleLength=0;
     unsigned creates=0,destroys=0,titles=0,resizes=0,decorationChanges=0;
     BrookCaptionStrip captionStrip{};
     char title[64]{};
@@ -33,8 +36,8 @@ uint64_t CompositorMapWindowVfb(Process*,uint32_t) {
     CHECK(false); // An unauthorized call must never create an alias.
     return 0;
 }
-WmCreateWindowResult WmCreateWindowForProcess(Process*,uint16_t,uint16_t,const char* title,bool,bool,bool fineScroll) {
-    ++g_wm.creates;g_wm.exists=true;g_wm.fineScroll=fineScroll;
+WmCreateWindowResult WmCreateWindowForProcess(Process*,uint16_t,uint16_t,const char* title,bool,bool,bool fineScroll,bool captureExcluded) {
+    ++g_wm.creates;g_wm.exists=true;g_wm.fineScroll=fineScroll;g_wm.captureExcluded=captureExcluded;
     if(title)for(int i=0;i<64;++i)g_wm.title[i]=title[i];
     WmCreateWindowResult result{};result.wmId=3;result.vfbStride=4096;
     result.vfbUser=reinterpret_cast<void*>(0x40000000);return result;
@@ -44,7 +47,11 @@ void WmSetClientSideDecoration(int,bool,bool,uint16_t,uint16_t,uint16_t,uint32_t
     g_wm.captionStrip = strip ? *strip : BrookCaptionStrip{};
 }
 void WmDestroyWindowById(Process*,uint32_t) { ++g_wm.destroys;g_wm.exists=false; }
-void WmSetTitleById(Process*,uint32_t,const char* title) { ++g_wm.titles;for(int i=0;i<64;++i)g_wm.title[i]=title[i]; }
+void WmSetTitleById(Process*,uint32_t,const char* title,bool incomplete) {
+    ++g_wm.titles;g_wm.policyTitleLength=strlen(title);g_wm.incompleteTitle=incomplete;
+    for(int i=0;i<63;++i)g_wm.title[i]=title[i];
+    g_wm.title[63]=0;
+}
 int WmResizeVfbForProcess(Process*,uint32_t wmId,uint16_t,uint16_t,WmCreateWindowResult* out) {
     ++g_wm.resizes;out->wmId=wmId;out->vfbStride=8192;out->vfbUser=reinterpret_cast<void*>(0x50000000);return 0;
 }
@@ -122,8 +129,10 @@ static void CreateWindow() {
     CHECK(!g_wm.fineScroll);
     CHECK(brook::sys_brook_wm_create_window(64,64,title,out,BROOK_WM_CREATE_FLAG_FINE_SCROLL,0)==0);
     CHECK(g_wm.fineScroll);
-    CHECK(brook::sys_brook_wm_create_window(64,64,title,out,16,0)==-brook::EINVAL);
-    CHECK(g_wm.creates==2);
+    CHECK(brook::sys_brook_wm_create_window(64,64,title,out,BROOK_WM_CREATE_FLAG_CAPTURE_EXCLUDED,0)==0);
+    CHECK(g_wm.captureExcluded);
+    CHECK(brook::sys_brook_wm_create_window(64,64,title,out,32,0)==-brook::EINVAL);
+    CHECK(g_wm.creates==3);
 }
 
 static void SetTitle() {
@@ -144,7 +153,7 @@ static void SetTitle() {
         text[length]=0;
         CHECK(brook::sys_brook_wm_set_title(3,UserAddress(2*PageSize),0,0,0,0)==0);
         uint32_t stored=0;while(stored<64 && g_wm.title[stored])++stored;
-        CHECK(stored==63);
+        CHECK(stored==63 && g_wm.policyTitleLength==length && !g_wm.incompleteTitle);
     }
 }
 

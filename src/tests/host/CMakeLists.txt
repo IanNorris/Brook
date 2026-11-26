@@ -53,6 +53,7 @@ function(add_host_test TEST_NAME)
 endfunction()
 
 enable_testing()
+add_host_test(test_capture_policy)
 add_host_test(test_ssd_trim_plan)
 target_compile_options(test_ssd_trim_plan PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_ssd_trim_log)

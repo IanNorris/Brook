@@ -171,7 +171,7 @@ static TaskbarLayout GetTaskbarLayout(uint32_t screenW, uint32_t screenH)
         const Window& w = g_windows[i];
         if (!w.proc || !w.visible || !w.focusable || w.docked || primary[i]) continue;
         if (w.focused) focused = total;
-        labels[total] = WindowDisplayTitle(w);
+        labels[total] = CaptureShellLabel(w.captureExcluded, WindowDisplayTitle(w));
         ids[total++] = static_cast<int>(i);
     }
     SpinLockAcquire(&g_launchLock);
@@ -1217,10 +1217,10 @@ static void WmCaptureTaskbar(uint32_t screenW, uint32_t screenH, uint64_t uptime
         entry.active = window.focused && !window.minimized;
         entry.minimized = window.minimized;
         if (layout.buttons[i].w >= int(WmMetric(ChromeShellMetrics::TaskbarLabelMin)))
-            WmStrCopy(entry.label, WindowDisplayTitle(window), sizeof(entry.label));
+            WmStrCopy(entry.label, CaptureShellLabel(window.captureExcluded, WindowDisplayTitle(window)), sizeof(entry.label));
         const LauncherItem* matched = nullptr;
         WmCaptureShellIcon(icon, WindowIcon(window, icons.get(), &matched));
-        if (!icon.present) WmCaptureTaskbarInitial(entry, matched, WindowDisplayTitle(window));
+        if (!icon.present) WmCaptureTaskbarInitial(entry, matched, CaptureShellLabel(window.captureExcluded, WindowDisplayTitle(window)));
     }
     layout.nextIndex = 0;
     snapshot.launcherOpen = g_launcherOpen;
@@ -1357,7 +1357,10 @@ static bool WmTrayTooltip(uint32_t screenW, uint32_t screenH, int32_t mx, int32_
                     entry.phase == LaunchPhase::Exited ? "Exited without a window: " : "Launch failed: ", sizeof(text));
                 const size_t length = strlen(text);
                 WmStrCopy(text + length, entry.title, sizeof(text) - length);
-            } else WmStrCopy(text, WindowDisplayTitle(g_windows[index]), sizeof(text));
+            } else {
+                const auto& window = g_windows[index];
+                WmStrCopy(text, CaptureShellLabel(window.captureExcluded, WindowDisplayTitle(window)), sizeof(text));
+            }
             if (!text[0]) break;
             anchor = &l.buttons[i];
             break;

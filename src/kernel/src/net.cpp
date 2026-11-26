@@ -1,3 +1,4 @@
+#include "../../shared/brook_debug_frame.h"
 #include "core_dump.h"
 #include "core_autodump.h"
 #include "desktop_layers_export.h"
@@ -6383,21 +6384,51 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text("}}\n");r.send();return;
     }
     if (NetStrEq(cmd,"bridge frame") || NetStrEq(cmd,"bridge frame request") ||
-        StrStartsWith(cmd,"bridge frame status ")) {
+        StrStartsWith(cmd,"bridge frame status ") || StrStartsWith(cmd,"bridge frame window ")) {
         DebugFrameSnapshot frame{};
         if (StrStartsWith(cmd,"bridge frame status ")) {
             uint32_t token=0;const char* argument=cmd+20;
             int consumed=ParseUint(argument,&token);
             if (consumed<=0 || argument[consumed]) token=0;
             frame=CompositorDebugFrameStatus(token);
+        } else if (StrStartsWith(cmd, "bridge frame window ")) {
+            const char* argument = cmd + 20;
+            uint32_t id = 0;
+            const int consumed = ParseUint(argument, &id);
+            uint64_t incarnation = 0;
+            bool valid = consumed > 0 && argument[consumed] == ' ';
+            if (valid) {
+                argument += consumed + 1;
+                for (; *argument; ++argument) {
+                    if (*argument < '0' || *argument > '9' ||
+                        incarnation > (~uint64_t{0} - uint64_t(*argument - '0')) / 10) {
+                        valid = false;
+                        break;
+                    }
+                    incarnation = incarnation * 10 + uint64_t(*argument - '0');
+                }
+            }
+            if (!valid || !id || !incarnation) {
+                DebugChannelSend("{\"frame_error\":\"Invalid capture window\"}\n");
+                return;
+            }
+            int error = 0;
+            frame = CompositorRequestDebugFrameOptions(0, BROOK_DEBUG_FRAME_FLAG_WINDOW_CROP, id, incarnation, &error);
+            if (error) {
+                DebugChannelSend(error == -13 ? "{\"frame_error\":\"Window is excluded from capture\"}\n" :
+                                                "{\"frame_error\":\"Capture window no longer exists\"}\n");
+                return;
+            }
         } else frame=CompositorRequestDebugFrame();
-        uint32_t panicStride=0;
-        auto* panicFrame=CompositorGetPhysFb(&panicStride);
         BridgeReply r;r.text("{\"capture_api\":2,");r.field("token",frame.token);
         r.text(",");r.field("state",static_cast<uint32_t>(frame.state));
         r.text(",\"address\":\"0x");r.number(frame.address,true);r.text("\",");
         r.field("width",frame.width);r.text(",");r.field("height",frame.height);r.text(",");r.field("stride",frame.stride);
         r.text(",");r.field("frame_tick_ms",frame.tick);r.text(",");r.field("frame_epoch",frame.epoch);
+        // Raw panic capture can be offered only before any exclusion has
+        // been armed, because the surviving pixels have no scene metadata.
+        uint32_t panicStride=0;
+        const auto* panicFrame=WmCaptureProtectionEpoch()?nullptr:CompositorGetPhysFb(&panicStride);
         r.text(",\"panic_address\":\"0x");r.number(reinterpret_cast<uint64_t>(panicFrame),true);
         r.text("\",");r.field("panic_stride",panicStride);r.text("}\n");r.send();return;
     }

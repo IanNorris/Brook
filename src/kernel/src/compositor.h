@@ -1,4 +1,5 @@
 #pragma once
+#include "wm_capture_protection.h"
 #include "desktop_overlay_regions.h"
 #include "../../shared/brook_debug_frame.h"
 #include "../../shared/desktop_layers_abi.h"
@@ -160,7 +161,8 @@ struct DebugFrameSnapshot {
     uint32_t plane,planeSurface,planeControl,planeStride,infoFlags,windowId,windowScale,copyUs;
 };
 // An overlay request with overlayCursor=false omits the pointer image.
-DebugFrameSnapshot CompositorRequestDebugFrame(uint64_t owner=0,bool overlay=false,bool overlayCursor=true,uint32_t flags=0);
+DebugFrameSnapshot CompositorRequestDebugFrame(uint64_t owner=0,bool overlay=false,bool overlayCursor=true,uint32_t flags=0,
+                                              uint32_t windowId=0,uint64_t windowIncarnation=0);
 // Root debug capture with options (BROOK_DEBUG_FRAME_FLAG_*). A window-buffer
 // request is filled immediately from the window's CPU buffer. On failure the
 // state is Failed (or Busy) and *error is a negative errno.
@@ -235,7 +237,8 @@ struct CompositorGopWrite {
 int CompositorReserveGopWrite(CompositorGopWrite& write,const CompositorPresentRegion* regions,
                               uint32_t count,uint64_t sourceBytes,uint64_t display,uint64_t backdrop,
                               uint64_t owner,bool partial);
-int CompositorFinishGopWrite(const CompositorGopWrite& write,int result,bool touched);
+int CompositorFinishGopWrite(const CompositorGopWrite& write,int result,bool touched,
+                             const CapturePrivacy& privacy,bool wroteGop);
 int CompositorCopyGopWrite(const CompositorGopWrite& write,const CompositorPresentRegion* regions,
                            uint32_t count,void* source,bool (*copy)(void*,uint64_t,void*,uint64_t));
 void CompositorSampleGopWrite(const CompositorGopWrite& write,uint32_t samples[4]);
@@ -265,13 +268,14 @@ void CompositorLockScanoutForDisplayChange();
 void CompositorUnlockScanoutForDisplayChange();
 int CompositorPresentProbe(uint32_t x,uint32_t y,uint32_t width,uint32_t height,uint32_t stride,
                            void* source,bool (*copy)(void*,uint64_t,void*,uint64_t),uint32_t samples[4],
-                           uint64_t expectedDisplay=0,uint64_t expectedBackdrop=0,uint64_t leaseOwner=0,bool region=false);
+                           uint64_t expectedDisplay=0,uint64_t expectedBackdrop=0,uint64_t leaseOwner=0,bool region=false,
+                           const CapturePrivacy& privacy={});
 // Internal only. The caller pins a completed source and holds scene identity
 // stable. The display lock serializes the entire batch against other writers;
 // it does not guarantee tear-free physical scanout.
 int CompositorPresentRegions(const CompositorPresentRegion* regions,uint32_t count,uint64_t sourceBytes,
                              void* source,bool (*copy)(void*,uint64_t,void*,uint64_t),
-                             uint64_t display,uint64_t backdrop,uint64_t owner);
+                             uint64_t display,uint64_t backdrop,uint64_t owner,const CapturePrivacy& privacy={});
 void CompositorReleasePresentLease(uint64_t owner);
 bool CompositorRefreshClientScanoutLease(uint64_t owner);
 

@@ -8,7 +8,7 @@ from hardware_bulk_protocol import identifier,upload,download,disk_download,fram
 # Debug-frame provenance (src/shared/brook_debug_frame.h) in bridge terms.
 FRAME_SOURCES={1:'cpu-backbuffer',2:'gpu-present',3:'legacy-gpu',4:'gpu-present',5:'gpu-present',6:'direct-client',7:'window-buffer'}
 SCANOUT_BUFFERS={0:'unverified',1:'gop',2:'kernel-flip',3:'zero-copy',4:'direct-client',5:'unknown'}
-FRAME_CURSOR,FRAME_WINDOW_BUFFER=1,2
+FRAME_CURSOR, FRAME_WINDOW_BUFFER, FRAME_WINDOW_CROP = 1, 2, 4
 
 TRANSFER_ROOT = '/data/.brook-transfer'
 # Run on the guest only. The receiver also validates the transfer directory, but
@@ -97,8 +97,11 @@ def frame_option_argument(options):
     flags,window_id,incarnation=options.get('flags',0),options.get('window_id',0),options.get('incarnation',0)
     for value in (flags,window_id,incarnation):
         if isinstance(value,bool) or not isinstance(value,int) or value<0:raise ValueError('Invalid frame options')
-    if flags>FRAME_WINDOW_BUFFER or window_id>256 or incarnation>2**64-1 or \
-       (bool(flags&FRAME_WINDOW_BUFFER)!=bool(window_id and incarnation)) or (not flags&FRAME_WINDOW_BUFFER and (window_id or incarnation)):
+    window_flags = FRAME_WINDOW_BUFFER | FRAME_WINDOW_CROP
+    if (flags & ~(FRAME_CURSOR | window_flags) or window_id > 256 or incarnation > 2**64-1 or
+        (flags & FRAME_WINDOW_BUFFER and flags != FRAME_WINDOW_BUFFER) or
+        (bool(flags & window_flags) != bool(window_id and incarnation)) or
+        (not flags & window_flags and (window_id or incarnation))):
         raise ValueError('Invalid frame options')
     return f'o:{flags}:{window_id}:{incarnation}'
 

@@ -166,7 +166,7 @@ bool captureHold=false;
 constexpr uint32_t FlipBuffers=3,ExtentPages=SurfacePages+BdwFlipRegs::GuardPages;
 static_assert(FlipBuffers+1<=BdwFlipMaxSlots && (FlipBuffers+1)*LeafTables<=BdwPpgttMaxLeaves);
 struct FlipBuffer {uint64_t* dma=nullptr;uint64_t* snapshot=nullptr;Leaves leaves;BdwGgttReservation reservation{};
-    BdwGgttExtentBind bind;bool bound=false;};
+    BdwGgttExtentBind bind;bool bound=false;CapturePrivacy privacy{};};
 BdwOwnedPage takeoverScratch{};bool takeoverReady=false;
 BdwFlipGgttDiag ggttDiag{};const char* activationStep="none";
 FlipBuffer buffers[FlipBuffers];
@@ -361,7 +361,7 @@ void FlipPlan(uint32_t slot,const CompositorPresentRegion* regions,uint32_t coun
 constexpr uint32_t ZcExtentPages=SurfacePages+BdwFlipRegs::GuardPages;
 static_assert(BdwZeroCopyImageBytes==SurfaceBytes,"zero-copy images are exactly the GOP mode");
 struct ZcImage {BdwGpuBuffer* buffer=nullptr;uint64_t identity=0;uint64_t* dma=nullptr;uint64_t* snapshot=nullptr;
-    BdwGgttReservation reservation{};BdwGgttExtentBind bind;bool bound=false;};
+    BdwGgttReservation reservation{};BdwGgttExtentBind bind;bool bound=false;CapturePrivacy privacy{};};
 ZcImage zcImages[BdwZeroCopyMaxImages];
 uint32_t zcCount=0;uint64_t zcOwner=0;
 bool zcAutoArm=false;
@@ -479,6 +479,7 @@ struct ClientMapping {
     uint64_t* snapshot=nullptr;
     bool held=false;
     bool quarantined=false;
+    CapturePrivacy privacy{};
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
     uint64_t timelineSequence=0;
 #endif
@@ -493,6 +494,7 @@ struct ClientRequest {
     bool publishOnAp=false;
     BdwClientPublication publication{};
     uint64_t flushTicks=0;
+    CapturePrivacy privacy{};
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
     uint64_t timelineSequence=0;
 #endif
@@ -826,19 +828,22 @@ BdwTargetSelect BdwScanoutTargetSelect(const CompositorPresentRegion* regions,ui
 #endif
     return BdwTargetSelect::Ok;
 }
-bool BdwScanoutTargetFinish(BdwTargetPlan& plan,bool copied){
+bool BdwScanoutTargetFinish(BdwTargetPlan& plan,bool copied,const CapturePrivacy& privacy){
 #if defined(BROOK_BDW_SCANOUT_FLIP)
     if(plan.kind!=BdwTargetKind::Flip)return true;
     const uint64_t f=IrqSpinLockAcquire(&lock);
     bool ok=false,armNow=false;
     if(!copied){chain.Abandon(plan.slot);DisableLocked("copy-failed");}
     else if(!chain.Commit(plan.slot,plan.damage,armNow))DisableLocked("commit-rejected");
-    else if(armNow)ok=ArmLocked(plan.slot);
-    else {ok=true;Stat(BdwWorkerScanoutEvent::FlipQueued);}
+    else {
+        buffers[plan.slot-1].privacy=privacy;
+        if(armNow)ok=ArmLocked(plan.slot);
+        else {ok=true;Stat(BdwWorkerScanoutEvent::FlipQueued);}
+    }
     IrqSpinLockRelease(&lock,f);LogPending();
     return ok;
 #else
-    (void)plan;(void)copied;return true;
+    (void)plan;(void)copied;(void)privacy;return true;
 #endif
 }
 void BdwScanoutFlipPoll(){
@@ -1157,7 +1162,8 @@ void BdwZeroCopyPrepareScanout(BdwGpuBuffer* source,const CompositorPresentRegio
     const uint32_t slot=ZcSlotOf(source);
     if(slot)ZcFlushForScanout(source,slot,regions,count);
 }
-BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer* source,const CompositorPresentRegion* regions,uint32_t regionCount){
+BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer* source,const CompositorPresentRegion* regions,
+                                              uint32_t regionCount,const CapturePrivacy& privacy){
     (void)regions;(void)regionCount;
     bool requested=false,active=false,disabled=false;uint32_t registered=0;
     {const uint64_t f=IrqSpinLockAcquire(&lock);ZcPollLocked();
@@ -1220,6 +1226,7 @@ BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer* source,const Composito
         ZcFallback(zcRing.Uncertain()?BdwZeroCopyFallback::Uncertain:BdwZeroCopyFallback::NotWriting);
         ZcDisableLocked("image-busy");outcome=BdwZeroCopyOutcome::RepairRequired;
     }else{
+        zcImages[slot-1].privacy=privacy;
         ++zcStats.presents;
         if(adopted)++zcStats.adoptedPresents;
         {const uint64_t seq=zcRing.Sequence();auto& e=zcTimeline[seq%ZcTimelineSize];
@@ -1365,7 +1372,7 @@ void BdwZeroCopyReadStatus(BdwZeroCopyStatus& out){
 int64_t BdwZeroCopyRegister(uint64_t,BdwGpuBuffer* const*,uint32_t,const BdwZeroCopyGeometry&,BdwZeroCopyRefusal& r){r=BdwZeroCopyRefusal::None;return -38;}
 bool BdwZeroCopyOnReserve(BdwGpuBuffer*){return true;}
 void BdwZeroCopyOnRelease(BdwGpuBuffer*){}
-BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer*,const CompositorPresentRegion*,uint32_t){return BdwZeroCopyOutcome::Copy;}
+BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer*,const CompositorPresentRegion*,uint32_t,const CapturePrivacy&){return BdwZeroCopyOutcome::Copy;}
 bool BdwZeroCopyCanHoldFront(uint64_t){return false;}
 void BdwZeroCopyNoteWorkerWait(){}
 void BdwZeroCopyPrepareScanout(BdwGpuBuffer*,const CompositorPresentRegion*,uint32_t){}
@@ -1388,7 +1395,7 @@ int64_t BdwZeroCopyAdopt(uint64_t,BdwGpuBuffer**,uint32_t& count){count=0;return
 int64_t BdwZeroCopyRegister(uint64_t,BdwGpuBuffer* const*,uint32_t,const BdwZeroCopyGeometry&,BdwZeroCopyRefusal& r){r=BdwZeroCopyRefusal::None;return -38;}
 bool BdwZeroCopyOnReserve(BdwGpuBuffer*){return true;}
 void BdwZeroCopyOnRelease(BdwGpuBuffer*){}
-BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer*,const CompositorPresentRegion*,uint32_t){return BdwZeroCopyOutcome::Copy;}
+BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer*,const CompositorPresentRegion*,uint32_t,const CapturePrivacy&){return BdwZeroCopyOutcome::Copy;}
 bool BdwZeroCopyCanHoldFront(uint64_t){return false;}
 void BdwZeroCopyNoteWorkerWait(){}
 void BdwZeroCopyPrepareScanout(BdwGpuBuffer*,const CompositorPresentRegion*,uint32_t){}
@@ -1410,7 +1417,7 @@ int64_t BdwZeroCopyAdopt(uint64_t,BdwGpuBuffer**,uint32_t& count){count=0;return
 #elif defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
 // Neither option built: the default per-present BCS copy is unchanged.
 BdwTargetSelect BdwScanoutTargetSelect(const CompositorPresentRegion*,uint32_t,BdwTargetPlan& plan){plan={};return BdwTargetSelect::Ok;}
-bool BdwScanoutTargetFinish(BdwTargetPlan&,bool){return true;}
+bool BdwScanoutTargetFinish(BdwTargetPlan&,bool,const CapturePrivacy&){return true;}
 void BdwScanoutFlipPoll(){}
 bool BdwScanoutFlipAwayFromGop(){return false;}
 void BdwScanoutFlipReturnToGop(){}
@@ -1422,7 +1429,7 @@ void BdwScanoutTargetReadStatus(BdwScanoutTargetStatus& out){out={};out.reason="
 int64_t BdwZeroCopyRegister(uint64_t,BdwGpuBuffer* const*,uint32_t,const BdwZeroCopyGeometry&,BdwZeroCopyRefusal& r){r=BdwZeroCopyRefusal::None;return -38;}
 bool BdwZeroCopyOnReserve(BdwGpuBuffer*){return true;}
 void BdwZeroCopyOnRelease(BdwGpuBuffer*){}
-BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer*,const CompositorPresentRegion*,uint32_t){return BdwZeroCopyOutcome::Copy;}
+BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer*,const CompositorPresentRegion*,uint32_t,const CapturePrivacy&){return BdwZeroCopyOutcome::Copy;}
 bool BdwZeroCopyCanHoldFront(uint64_t){return false;}
 void BdwZeroCopyNoteWorkerWait(){}
 void BdwZeroCopyPrepareScanout(BdwGpuBuffer*,const CompositorPresentRegion*,uint32_t){}
@@ -1568,7 +1575,8 @@ bool BdwClientScanoutApPublication(){
     return __atomic_load_n(&clientPublishOnAp,__ATOMIC_ACQUIRE);
 }
 
-int64_t BdwClientScanoutPresent(uint64_t owner,BdwGpuBuffer* buffer,const BdwClientScanoutLayout& layout,uint64_t offer){
+int64_t BdwClientScanoutPresent(uint64_t owner,BdwGpuBuffer* buffer,const BdwClientScanoutLayout& layout,uint64_t offer,
+                                 const CapturePrivacy& privacy){
     if(!owner || !buffer || !offer || !layout.Valid() || !BdwGpuBufferAllowsUserMapping(buffer) ||
        BdwGpuBufferBytes(buffer)<uint64_t(layout.stride)*1800)return -22;
     if(!ClientOn())return -95;
@@ -1582,6 +1590,7 @@ int64_t BdwClientScanoutPresent(uint64_t owner,BdwGpuBuffer* buffer,const BdwCli
             (!cursorPlane.enabled() || cursorStatus.active) && BdwGpuBufferBeginCpuTransition(buffer)){
         BdwGpuBufferRef(buffer);
         clientRequest={buffer,layout,owner,offer,publishOnAp};
+        clientRequest.privacy=privacy;
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
         clientRequest.timelineSequence=clientTimeline.Admit(owner,offer,BdwGpuBufferIdentity(buffer),
                                                             publishOnAp,ElapsedClockNs());
@@ -1679,6 +1688,7 @@ bool BdwClientScanoutService(bool canPresent){
         }
         if(accepted){
             choice->held=true;
+            choice->privacy=request.privacy;
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
             clientArmedSequence=choice->timelineSequence=request.timelineSequence;
             clientTimeline.Armed(clientArmedSequence,ElapsedClockNs());
@@ -1818,7 +1828,7 @@ void BdwCursorUpdate(uint64_t leaseOwner,bool visible,int32_t x,int32_t y,
 }
 
 #else
-int64_t BdwClientScanoutPresent(uint64_t,BdwGpuBuffer*,const BdwClientScanoutLayout&,uint64_t){return -38;}
+int64_t BdwClientScanoutPresent(uint64_t,BdwGpuBuffer*,const BdwClientScanoutLayout&,uint64_t,const CapturePrivacy&){return -38;}
 int64_t BdwClientScanoutStatus(uint64_t,BrookGpuClientScanoutStatus&){return -38;}
 int64_t BdwClientScanoutLeave(uint64_t){return -38;}
 bool BdwClientScanoutWorkPending(){return false;}
@@ -1866,22 +1876,25 @@ bool CaptureHeldLocked(const CaptureSource& s,uint32_t surface){
     return false;
 }
 // Lock held. Matches the live surface against every surface Brook arms.
-CaptureSource CaptureFindLocked(uint32_t live){
+CaptureSource CaptureFindLocked(uint32_t live,CapturePrivacy& privacy){
     CaptureSource s{};
     for(uint32_t b=0;b<FlipBuffers;++b)
         if(buffers[b].bound && buffers[b].dma && buffers[b].reservation.first*4096==live){
+            privacy=buffers[b].privacy;
             s.plane=BROOK_DEBUG_FRAME_PLANE_FLIP;s.slot=b+1;s.dma=buffers[b].dma;s.pages=SurfacePages;return s;
         }
 #if defined(BROOK_BDW_ZERO_COPY_SCANOUT)
     for(uint32_t i=0;i<zcCount;++i)
         if(zcImages[i].bound && zcImages[i].buffer && zcImages[i].reservation.first*4096==live){
             uint32_t pages=0;(void)BdwGpuBufferPages(zcImages[i].buffer,pages); // retained for the boot
+            privacy=zcImages[i].privacy;
             s.plane=BROOK_DEBUG_FRAME_PLANE_ZERO_COPY;s.slot=i+1;s.buffer=zcImages[i].buffer;s.pages=pages;return s;
         }
     for(auto& m:clientMappings)
         if(m.buffer && m.reservation.token && m.Base()==live){
             uint32_t pages=0;(void)BdwGpuBufferPages(m.buffer,pages);
             BdwGpuBufferRef(m.buffer);
+            privacy=m.privacy;
             s.plane=BROOK_DEBUG_FRAME_PLANE_CLIENT;s.slot=live;s.buffer=m.buffer;s.pages=pages;s.referenced=true;return s;
         }
 #endif
@@ -1900,7 +1913,8 @@ void CaptureFlushPages(const CaptureSource& s,uint32_t pages){
 }
 }
 
-BdwScanoutCaptureKind BdwScanoutCaptureLive(uint32_t* destination,uint32_t width,uint32_t height,BdwScanoutCaptureInfo& info){
+BdwScanoutCaptureKind BdwScanoutCaptureLive(uint32_t* destination,uint32_t width,uint32_t height,
+                                                BdwScanoutCaptureInfo& info,uint64_t protectionEpoch){
     info={};
     if(!destination || !width || !height || width>4096 || height>2160)return BdwScanoutCaptureKind::Unsupported;
     CaptureSource source{};uint32_t live=0,control=0,stride=0,offset=0;
@@ -1915,9 +1929,10 @@ BdwScanoutCaptureKind BdwScanoutCaptureLive(uint32_t* destination,uint32_t width
         info.surface=live;info.control=control;info.stride=stride;
         if(live==0xffffffffu){IrqSpinLockRelease(&lock,f);return BdwScanoutCaptureKind::Unsupported;}
         if(!live){IrqSpinLockRelease(&lock,f);info.plane=BROOK_DEBUG_FRAME_PLANE_GOP;return BdwScanoutCaptureKind::Gop;}
-        source=CaptureFindLocked(live);
+        source=CaptureFindLocked(live,info.privacy);
         info.plane=source.plane;
-        const bool held=source.plane!=BROOK_DEBUG_FRAME_PLANE_UNKNOWN && CaptureHeldLocked(source,live);
+        const bool held=source.plane!=BROOK_DEBUG_FRAME_PLANE_UNKNOWN &&
+            info.privacy.permits(protectionEpoch) && CaptureHeldLocked(source,live);
         if(held)captureHold=true;
         IrqSpinLockRelease(&lock,f);
         if(!held){

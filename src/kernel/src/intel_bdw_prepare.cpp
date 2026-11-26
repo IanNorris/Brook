@@ -898,6 +898,7 @@ static struct {
     uint64_t token=0;
     CompositorPresentRegion regions[COMPOSITOR_MAX_REGIONS]{};
     uint32_t count=0;
+    CapturePrivacy privacy{};
     BdwScanoutStatus status=BdwScanoutStatus::Unavailable;
 } scanoutWork;
 static bool ScanoutPending(void*){
@@ -937,9 +938,11 @@ static bool ServiceScanout(void*,BdwSubmissionQueue& queue){
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
     WorkerStatsBegin(BdwWorkerPresent);
 #endif
-    scanoutWork.status=BdwExecuteBcsScanout(scanoutWork.source,scanoutWork.token,scanoutWork.regions,scanoutWork.count);
+    scanoutWork.status=BdwExecuteBcsScanout(scanoutWork.source,scanoutWork.token,scanoutWork.regions,
+                                            scanoutWork.count,scanoutWork.privacy);
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
-    if(scanoutWork.status!=BdwScanoutStatus::Completed && scanoutWork.status!=BdwScanoutStatus::Deferred &&
+    if(scanoutWork.status!=BdwScanoutStatus::Completed && scanoutWork.status!=BdwScanoutStatus::CompletedFlip &&
+       scanoutWork.status!=BdwScanoutStatus::Deferred &&
        OnWorkerStatsThread())workerStats.PresentFailed();
 #endif
     __atomic_store_n(&scanoutWork.state,ScanoutDone,__ATOMIC_RELEASE);
@@ -1101,8 +1104,9 @@ static int64_t InitApplicationWorker(){
 // offscreenMutex serializes the producer and holds the exact completed
 // source until the worker finishes. Cancellation can win only before the
 // worker claims the request.
-enum class BdwPresentCopy { Completed, Unavailable, Expired, RepairRequired, Deferred };
-static BdwPresentCopy PresentOnBcs(BdwGpuBuffer* source,uint64_t token,const CompositorPresentRegion* regions,uint32_t count,uint64_t owner){
+enum class BdwPresentCopy { Completed, CompletedFlip, Unavailable, Expired, RepairRequired, Deferred };
+static BdwPresentCopy PresentOnBcs(BdwGpuBuffer* source,uint64_t token,const CompositorPresentRegion* regions,uint32_t count,uint64_t owner,
+                                  const CapturePrivacy& privacy){
     if(!source || !token || !regions || !count || count>COMPOSITOR_MAX_REGIONS ||
        !BdwBcsScanoutEnabled() || InitApplicationWorker() ||
        __atomic_load_n(&scanoutWork.state,__ATOMIC_ACQUIRE)!=ScanoutIdle)return BdwPresentCopy::Unavailable;
@@ -1113,7 +1117,7 @@ static BdwPresentCopy PresentOnBcs(BdwGpuBuffer* source,uint64_t token,const Com
 #else
     (void)owner;
 #endif
-    scanoutWork.source=source;scanoutWork.token=token;scanoutWork.count=count;
+    scanoutWork.source=source;scanoutWork.token=token;scanoutWork.count=count;scanoutWork.privacy=privacy;
     for(uint32_t i=0;i<count;++i)scanoutWork.regions[i]=regions[i];
     __atomic_store_n(&scanoutWork.state,ScanoutQueued,__ATOMIC_RELEASE);
     applicationWorker.Wake();
@@ -1128,6 +1132,7 @@ static BdwPresentCopy PresentOnBcs(BdwGpuBuffer* source,uint64_t token,const Com
             __atomic_store_n(&scanoutWork.state,ScanoutIdle,__ATOMIC_RELEASE);
             switch(result){
             case BdwScanoutStatus::Completed:return BdwPresentCopy::Completed;
+            case BdwScanoutStatus::CompletedFlip:return BdwPresentCopy::CompletedFlip;
             case BdwScanoutStatus::RepairRequired:return BdwPresentCopy::RepairRequired;
             case BdwScanoutStatus::Deferred:return BdwPresentCopy::Deferred;
             case BdwScanoutStatus::Unavailable:return BdwPresentCopy::Unavailable;
@@ -1321,12 +1326,13 @@ static int64_t PresentGopWrite(const WmDesktopLayers& scene,const WmDesktopLayer
     const auto admitted=base?WmDesktopLayersUseIfBothPresentable(*base,scene,&admission,reserve):
                              WmDesktopLayersUseIfPresentable(scene,&admission,reserve);
     if(admitted)return admitted;
-    auto copied=PresentOnBcs(source,token,regions,count,owner);
+    auto copied=PresentOnBcs(source,token,regions,count,owner,scene.privacy);
 #if defined(BROOK_BDW_SCANOUT_FLIP)
     // With a kernel buffer live, a CPU copy into the GOP would be invisible.
     if(copied==BdwPresentCopy::Unavailable && BdwScanoutFlipAwayFromGop())copied=BdwPresentCopy::RepairRequired;
 #endif
-    bool touched=copied==BdwPresentCopy::Completed;
+    const bool wroteGop=copied!=BdwPresentCopy::CompletedFlip;
+    bool touched=copied==BdwPresentCopy::Completed || !wroteGop;
     int result=copied==BdwPresentCopy::Deferred?-11:copied==BdwPresentCopy::Expired?-62:0;
     if(copied==BdwPresentCopy::RepairRequired){
         // A kernel flip buffer may be live, or the chain is frozen: a CPU
@@ -1343,7 +1349,7 @@ static int64_t PresentGopWrite(const WmDesktopLayers& scene,const WmDesktopLayer
         else result=CompositorCopyGopWrite(admission.write,regions,count,source,CopyOffscreenBuffer);
     }
     if(!result && samples)CompositorSampleGopWrite(admission.write,samples);
-    return CompositorFinishGopWrite(admission.write,result,touched);
+    return CompositorFinishGopWrite(admission.write,result,touched,scene.privacy,wroteGop);
 }
 int64_t BdwOffscreenHandoffPresentProbe(uint64_t owner,::BrookGpuPresentProbe& probe,bool lease,bool region,bool collectSamples,
                                        bool fromQueue){
@@ -1371,8 +1377,11 @@ int64_t BdwOffscreenHandoffPresentProbe(uint64_t owner,::BrookGpuPresentProbe& p
         }
         if(!frame || frame->sceneId!=scene || frame->display!=display)return -116;
         const DesktopDependencyRect single{probe.x,probe.y,probe.width,probe.height};
+        // Patches can retain pixels from any accepted frame after the full
+        // base. Keep one mask contract for all of them until a new full frame.
         if(region && (!offscreenBaseScene || frame->fullOnly ||
-                      !DesktopDependenciesCovered(frame->dependencies,&single,1)))return -116;
+                      !DesktopDependenciesCovered(frame->dependencies,&single,1) ||
+                      !offscreenBaseScene->privacy.matches(frame->scene->privacy)))return -116;
         if(lease && !frame->backdrop)return -22;
         if(lease && frame->chromeTracking && !DesktopChromeComplete(frame->scene->count,frame->chromeMask))return -116;
         if(lease && !region && BdwBcsScanoutEnabled()){
@@ -1385,12 +1394,13 @@ int64_t BdwOffscreenHandoffPresentProbe(uint64_t owner,::BrookGpuPresentProbe& p
             }
         }
         if(!BdwGpuBufferPrepareHandoffRead(buffer,token,0,required))return -5;
-        struct PresentContext {::BrookGpuPresentProbe* probe;BdwGpuBuffer* buffer;uint64_t display,backdrop,owner;bool region,collectSamples;};
-        PresentContext context{&probe,buffer,display,frame->backdrop,lease?owner:0,region,collectSamples};
+        struct PresentContext {::BrookGpuPresentProbe* probe;BdwGpuBuffer* buffer;uint64_t display,backdrop,owner;bool region,collectSamples;
+                               const CapturePrivacy& privacy;};
+        PresentContext context{&probe,buffer,display,frame->backdrop,lease?owner:0,region,collectSamples,frame->scene->privacy};
         auto present=[](void* raw)->int64_t{
             auto& c=*static_cast<PresentContext*>(raw);auto& p=*c.probe;
             return CompositorPresentProbe(p.x,p.y,p.width,p.height,p.stride,c.buffer,CopyOffscreenBuffer,c.collectSamples?p.samples:nullptr,
-                c.display,c.backdrop,c.owner,c.region);
+                c.display,c.backdrop,c.owner,c.region,c.privacy);
         };
         const int64_t outcome=region?WmDesktopLayersUseIfBothPresentable(*offscreenBaseScene,*frame->scene,&context,present):
             (lease?WmDesktopLayersUseIfPresentable(*frame->scene,&context,present):WmDesktopLayersUseIfCurrent(*frame->scene,&context,present));
@@ -1416,7 +1426,8 @@ int64_t BdwOffscreenHandoffPresentRegions(uint64_t owner,uint64_t ticket,const C
     for(uint32_t i=0;i<count;++i)writes[i]={regions[i].x,regions[i].y,regions[i].width,regions[i].height};
     const auto result=offscreenSession.PresentProbe(owner,ticket,[&](BdwGpuBuffer* buffer,uint64_t token,uint64_t scene,uint64_t display)->int64_t{
         if(!buffer || !frame || frame->fullOnly || !offscreenBaseScene || frame->sceneId!=scene || frame->display!=display || !frame->backdrop)return -116;
-        if(!DesktopDependenciesCovered(frame->dependencies,writes,count))return -116;
+        if(!DesktopDependenciesCovered(frame->dependencies,writes,count) ||
+           !offscreenBaseScene->privacy.matches(frame->scene->privacy))return -116;
         if(frame->chromeTracking && !DesktopChromeComplete(frame->scene->count,frame->chromeMask))return -116;
         const uint64_t capacity=BdwGpuBufferBytes(buffer);
         uint64_t start=capacity,end=0;
@@ -1437,11 +1448,11 @@ int64_t BdwOffscreenHandoffPresentRegions(uint64_t owner,uint64_t ticket,const C
             }
         }
         if(!BdwGpuBufferPrepareHandoffRead(buffer,token,start,end-start))return -5;
-        struct Context {const CompositorPresentRegion* regions;uint32_t count;BdwGpuBuffer* buffer;uint64_t display,backdrop,owner;};
-        Context context{regions,count,buffer,display,frame->backdrop,owner};
+        struct Context {const CompositorPresentRegion* regions;uint32_t count;BdwGpuBuffer* buffer;uint64_t display,backdrop,owner;const CapturePrivacy& privacy;};
+        Context context{regions,count,buffer,display,frame->backdrop,owner,frame->scene->privacy};
         auto present=[](void* raw)->int64_t {auto& c=*static_cast<Context*>(raw);
             return CompositorPresentRegions(c.regions,c.count,BdwGpuBufferBytes(c.buffer),c.buffer,
-                CopyOffscreenBuffer,c.display,c.backdrop,c.owner);};
+                CopyOffscreenBuffer,c.display,c.backdrop,c.owner,c.privacy);};
         const int64_t outcome=WmDesktopLayersUseIfBothPresentable(*offscreenBaseScene,*frame->scene,&context,present);
         if(!outcome)offscreenFrameScenes.RecordAccepted(owner,ticket,writes,count,false);
         return outcome;

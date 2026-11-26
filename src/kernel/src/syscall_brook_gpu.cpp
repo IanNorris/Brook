@@ -162,7 +162,8 @@ int64_t sys_brook_gpu_handoff_ctl(uint64_t op,uint64_t arg,uint64_t a,uint64_t b
         if(!BdwOffscreenRendererOwnedBy(owner))return -EPERM;
         const auto provider=ValidateGpuWindowProvider(proc,wire.providerSocket,wire.window,wire.incarnation);
         if(provider)return provider;
-        if(!WmClientScanoutWindowMatches(wire.window,wire.incarnation,wire.width,wire.height) ||
+        CapturePrivacy privacy{};
+        if(!WmClientScanoutWindowMatches(wire.window,wire.incarnation,wire.width,wire.height,privacy) ||
            !WmTaskbarHidden())return -EPERM;
         FdRef ref(proc,wire.primeFd);
         if(!ref || ref->type!=FdType::IntelPrime || !ref->handle)return -EBADF;
@@ -171,7 +172,7 @@ int64_t sys_brook_gpu_handoff_ctl(uint64_t op,uint64_t arg,uint64_t a,uint64_t b
         BdwGpuBufferTiling(buffer,tiling,stride);
         if(tiling!=wire.tiling || (tiling && stride!=wire.stride))return -EINVAL;
         if(!CompositorRefreshClientScanoutLease(owner))return -EAGAIN;
-        return BdwClientScanoutPresent(owner,buffer,layout,wire.offer);
+        return BdwClientScanoutPresent(owner,buffer,layout,wire.offer,privacy);
     }
     if(op==BROOK_GPU_HANDOFF_CLIENT_SCANOUT_STATUS){
         BrookGpuClientScanoutStatus status{};

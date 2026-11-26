@@ -529,6 +529,8 @@ int64_t sys_brook_input_preferences(uint64_t selector, uint64_t, uint64_t,
                                    uint64_t, uint64_t, uint64_t);
 int64_t sys_brook_wm_pointer_timeline(uint64_t op, uint64_t wmId, uint64_t type,
                                       uint64_t, uint64_t, uint64_t);
+int64_t sys_brook_wm_exclude_capture(uint64_t wmId, uint64_t, uint64_t,
+                                     uint64_t, uint64_t, uint64_t);
 int64_t sys_brook_wm_set_idle_inhibit(uint64_t wmId, uint64_t count,
                                       uint64_t, uint64_t, uint64_t, uint64_t);
 int64_t sys_brook_wm_begin_move(uint64_t wmId, uint64_t,
