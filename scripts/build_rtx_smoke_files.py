@@ -381,6 +381,13 @@ def desktop_payload(args, initrd):
         if ssd.get('format') != 'brook-ssd-system/1' or ssd.get('partition_name') != 'BROOK_SYSTEM' or \
                 ssd.get('partition_entry') != 2 or ssd.get('fs_type') != 'ext2':
             raise SystemExit('unexpected ssd-system.json')
+        # usb_system.cpp admits the extent only if the ext2 fills it exactly
+        # (LargeExt2ClassifyHeader) and it ends within 32-bit LBAs. Refuse a
+        # record Brook would refuse at boot, e.g. a GPT grow without resize2fs.
+        first, sectors = int(ssd['first_lba']), int(ssd['sectors'])
+        if sectors % 8 or first + sectors > 1 << 32 or \
+                ('fs_blocks' in ssd and int(ssd['fs_blocks']) * 8 != sectors):
+            raise SystemExit('ssd-system.json: fs_blocks does not fill the partition extent')
         record = (f"BRKUSB1\n{uuid.UUID(ssd['partition_guid']).bytes_le.hex()}\n"
                   f"{int(ssd['first_lba'])},{int(ssd['sectors'])}\n{uuid.UUID(ssd['fs_uuid']).hex}\n")
         fat_write(initrd, 'ETC/usb-system', record.encode())

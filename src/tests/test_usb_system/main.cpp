@@ -211,6 +211,16 @@ int main() {
     std::memcpy(bad,good,sizeof(bad));
     bad[55]='7'; // Invalid sector alignment.
     assert(!UsbSystemParse(bad,sizeof(bad)-1,record));
+    {
+        // The grown BROOK_SYSTEM record: same GUID, start and fs UUID, 3759 groups.
+        constexpr char grown[]=
+            "BRKUSB1\n532233445566778899aabbccddeeff00\n"
+            "2752512,985399296\nc1002233445566778899aabbccddeeff\n";
+        UsbSystemRecord bigger{};
+        assert(UsbSystemParse(grown,sizeof(grown)-1,bigger));
+        assert(bigger.first==2752512 && bigger.sectors==985399296);
+        assert(std::memcmp(bigger.guid,record.guid,16)==0 && std::memcmp(bigger.uuid,record.uuid,16)==0);
+    }
     CheckRecordBounds();
     CheckLayout(record);
     CheckWindows();
