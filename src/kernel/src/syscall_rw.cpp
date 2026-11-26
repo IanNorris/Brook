@@ -613,8 +613,10 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
         if (!FdOpenForReading(fde)) return -EBADF;
         auto* vn = static_cast<Vnode*>(fde->handle);
         FdPosition position(fde);
+        // Linux caps one transfer at MAX_RW_COUNT; backends return int.
         int64_t ret = VfsRead(vn, reinterpret_cast<void*>(bufAddr),
-                              static_cast<uint32_t>(count), position.get());
+                              count < VnodeWriteLimit ? count : VnodeWriteLimit,
+                              position.get());
         // VfsRead already updates the shared offset through the pointer.
         return ret;
     }
@@ -1452,7 +1454,7 @@ int64_t sys_pread64(uint64_t fd, uint64_t bufAddr, uint64_t count,
         auto* vn = static_cast<Vnode*>(fde->handle);
         uint64_t pos = offset;
         return VfsRead(vn, reinterpret_cast<void*>(bufAddr),
-                       count, &pos);
+                       count < VnodeWriteLimit ? count : VnodeWriteLimit, &pos);
     }
 
     return -EBADF;

@@ -3,12 +3,14 @@
 // Actual Ext2 backend bodies on a private mkfs.ext2 image. Host shims supply
 // allocation, a memory disk, synchronization and a single credential identity;
 // filesystem lookup/mutation/inode lifetime/open logic is production code.
+#include <algorithm>
 #include <cassert>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <mutex>
 #include <map>
@@ -384,6 +386,7 @@ static void TestBatchedIndirectReads(bool badNeighbor)
     mount.taggedReads = true;
     mount.blockSize = size;
     mount.blockShift = 10;
+    mount.maxFileBytes = Ext2MaxFileBytes(10);
     mount.totalBlocks = 12;
     Ext2Inode inode{};
     inode.i_block[13] = 1;
@@ -416,6 +419,7 @@ static void TestFailedIndirectReads()
     fixture.dev = &source;
     fixture.blockSize = size;
     fixture.blockShift = 10;
+    fixture.maxFileBytes = Ext2MaxFileBytes(10);
     fixture.totalBlocks = 8;
     Ext2Inode inode{};
     inode.i_size = (12 + pointers + pointers * pointers + 1) * size;
@@ -496,8 +500,279 @@ static void TestDirectoryReadFailure(brook::Ext2Mount* mount)
     mount->skipPermChecks = skipPermissions;
 }
 
+
+// Byte pattern for large-file tests; depends on the high offset bits so a
+// wrapped 32-bit offset or size cannot read back as the expected data.
+static uint8_t LargePattern(uint64_t offset)
+{
+    uint64_t x = offset * 0x9e3779b97f4a7c15ULL;
+    return static_cast<uint8_t>((x >> 29) ^ (offset >> 32) ^ 0x5a);
+}
+
+// Files above 4 GiB on a private image: i_size_high, triply indirect
+// allocation/lookup/truncate, append batches across the doubly/triply
+// boundary, i_blocks accounting and the size limit. The written image is
+// checked with e2fsck -fn by run.py; a raw block-tree walk is the oracle here.
+static void TestLargeFiles(const char* fixturePath, bool expectLargeFileFeature)
+{
+    using namespace brook;
+    std::ifstream input(fixturePath, std::ios::binary);
+    assert(input);
+    std::vector<unsigned char> image{std::istreambuf_iterator<char>(input), {}};
+    input.close();
+    constexpr uint8_t drive = 2;
+    Device device{&diskOps, "large-file-fixture", DeviceType::Block, &image};
+    auto* savedDevice = g_ext2Devices[drive];
+    g_ext2Devices[drive] = &device;
+    void* priv = nullptr;
+    assert(Ext2FsMount(drive, &priv));
+    auto* mnt = static_cast<Ext2Mount*>(priv);
+    mnt->skipPermChecks = true;
+    const uint64_t blockSize = mnt->blockSize;
+    const uint64_t pointers = blockSize / 4;
+    assert(bool(mnt->roCompat & EXT2_FEATURE_RO_COMPAT_LARGE_FILE) == expectLargeFileFeature);
+    // Linux ext2_max_size values for 1 KiB (tree-limited, ~16 GiB) and
+    // 4 KiB (i_blocks-limited, ~2 TiB) blocks.
+    assert(Ext2MaxFileBytes(10) == 16843020ULL * 1024);
+    assert(Ext2MaxFileBytes(12) == 536346110ULL * 4096);
+    assert(mnt->maxFileBytes == Ext2MaxFileBytes(mnt->blockShift));
+
+    auto raw32 = [&](uint64_t offset) {
+        uint32_t value;
+        assert(offset + 4 <= image.size());
+        std::memcpy(&value, image.data() + offset, 4);
+        return value;
+    };
+    auto rawInode = [&](uint32_t ino) {
+        assert(!Ext2FsSync(mnt));
+        const uint32_t index = ino - 1, group = index / mnt->inodesPerGroup;
+        const uint64_t at = uint64_t(mnt->bgdt[group].bg_inode_table) * blockSize +
+            uint64_t(index % mnt->inodesPerGroup) * mnt->inodeSize;
+        Ext2Inode inode{};
+        std::memcpy(&inode, image.data() + at, sizeof(inode));
+        return inode;
+    };
+    // Independent walk of the on-disk block tree.
+    auto rawMap = [&](const Ext2Inode& inode, uint64_t fileBlock) -> uint32_t {
+        if (fileBlock < 12) return inode.i_block[fileBlock];
+        fileBlock -= 12;
+        uint64_t span = 1;
+        for (unsigned depth = 1; depth <= 3; ++depth) {
+            span *= pointers;
+            if (fileBlock < span) {
+                uint32_t block = inode.i_block[11 + depth];
+                for (uint64_t level = span / pointers; block; level /= pointers) {
+                    block = raw32(uint64_t(block) * blockSize + (fileBlock / level % pointers) * 4);
+                    if (level == 1) break;
+                }
+                return block;
+            }
+            fileBlock -= span;
+        }
+        assert(false);
+        return 0;
+    };
+    // Count every allocated tree block (data and indirect), as i_blocks must.
+    std::function<uint64_t(uint32_t, unsigned)> rawCount = [&](uint32_t block, unsigned depth) -> uint64_t {
+        if (!block) return 0;
+        uint64_t count = 1;
+        if (depth)
+            for (uint64_t i = 0; i < pointers; ++i)
+                count += rawCount(raw32(uint64_t(block) * blockSize + i * 4), depth - 1);
+        return count;
+    };
+    auto checkBlocks = [&](uint32_t ino) {
+        const auto inode = rawInode(ino);
+        uint64_t blocks = 0;
+        for (unsigned i = 0; i < 15; ++i) blocks += rawCount(inode.i_block[i], i < 12 ? 0 : i - 11);
+        assert(inode.i_blocks == blocks * (blockSize / 512));
+        return inode;
+    };
+    auto rawSize = [](const Ext2Inode& inode) {
+        return uint64_t(inode.i_size) | (uint64_t(inode.i_dir_acl) << 32);
+    };
+
+    VfsObject* root = nullptr;
+    assert(!Ext2RootObject(mnt, drive, &root));
+    int error = 0;
+    Vnode* node = Ext2ObjectCreate(root, "large", VFS_O_WRITE, 0600, &error);
+    assert(node && !error);
+    const uint32_t ino = static_cast<Ext2FilePriv*>(node->priv)->inode;
+    constexpr uint64_t GiB = 1ULL << 30;
+    const uint64_t tripleStart = (12 + pointers + pointers * pointers) * blockSize;
+    const uint64_t tripleMiddle = tripleStart + pointers * pointers * blockSize;
+    struct Region { uint64_t offset, length; };
+    // At least 6 GiB, and past the second triply indirect middle block.
+    const uint64_t end = std::max(6 * GiB, tripleMiddle + 64 * 1024);
+    std::vector<Region> regions = {
+        {0, 3 * blockSize + 7},
+        {4 * GiB - 1 - 2 * blockSize - 3, 4 * blockSize + 9}, // 4 GiB - 1, 4 GiB, 4 GiB + 1
+        {tripleStart - blockSize - 5, 2 * blockSize + 11},    // double -> triple
+        {tripleMiddle - 3, 7},                                // second triple middle
+        {5 * GiB, blockSize + 1},
+        {end - 2 * blockSize - 13, 2 * blockSize + 13},
+    };
+    for (const auto& region : regions) {
+        std::vector<uint8_t> data(region.length);
+        for (uint64_t i = 0; i < region.length; ++i) data[i] = LargePattern(region.offset + i);
+        uint64_t position = region.offset;
+        assert(node->ops->write(node, data.data(), data.size(), &position) == int(data.size()));
+        assert(position == region.offset + region.length);
+    }
+    VnodeStat stat{};
+    assert(!node->ops->stat(node, &stat) && stat.size == end);
+    uint64_t kept = end; // data survives below the smallest size since written
+    auto inRegion = [&](uint64_t offset, uint64_t size) {
+        if (offset >= size || offset >= kept) return false;
+        for (const auto& region : regions)
+            if (offset >= region.offset && offset < region.offset + region.length) return true;
+        return false;
+    };
+    // Read back through the backend around each region, and compare the
+    // backend's block map with the raw tree walk.
+    auto verify = [&](uint64_t size) {
+        auto inode = checkBlocks(ino);
+        assert(rawSize(inode) == size && inode.i_size == uint32_t(size));
+        for (const auto& region : regions) {
+            const uint64_t from = region.offset > 2 * blockSize ? region.offset - 2 * blockSize : 0;
+            const uint64_t length = region.length + 4 * blockSize;
+            std::vector<uint8_t> data(length, 0xee);
+            uint64_t position = from;
+            const int got = node->ops->read(node, data.data(), length, &position);
+            const uint64_t expect = from >= size ? 0 : std::min(length, size - from);
+            assert(got == int(expect));
+            for (uint64_t i = 0; i < expect; ++i)
+                if (data[i] != (inRegion(from + i, size) ? LargePattern(from + i) : 0)) {
+                    std::fprintf(stderr, "large read mismatch block=%llu size=%llu at=%llu got=%u\n",
+                                 (unsigned long long)blockSize, (unsigned long long)size,
+                                 (unsigned long long)(from + i), data[i]);
+                    std::abort();
+                }
+            for (uint64_t at = from; at < from + length; at += blockSize) {
+                const uint64_t fileBlock = at / blockSize;
+                KRwLockReadLock(&g_ext2Lock);
+                const auto mapped = Ext2BlockMap(mnt, &inode, uint32_t(fileBlock));
+                KRwLockReadUnlock(&g_ext2Lock);
+                assert(!mapped.failed && mapped.block == rawMap(inode, fileBlock));
+                if (fileBlock * blockSize >= size) assert(!mapped.block);
+                if (mapped.block)
+                    for (uint64_t i = 0; i < blockSize && fileBlock * blockSize + i < size; ++i) {
+                        const uint64_t offset = fileBlock * blockSize + i;
+                        assert(image[uint64_t(mapped.block) * blockSize + i] ==
+                               (inRegion(offset, size) ? LargePattern(offset) : 0));
+                    }
+            }
+        }
+        // A sparse 6 GiB file keeps only the touched blocks and their tree.
+        assert(inode.i_blocks < 256 * (blockSize / 512));
+        return inode;
+    };
+    auto inode = verify(end);
+    assert(inode.i_block[14] && inode.i_dir_acl == end >> 32);
+
+    // Shrink inside the triply indirect range, then below 4 GiB (and below
+    // the doubly/triply boundary), then grow sparsely again.
+    std::vector<uint64_t> sizes = {tripleMiddle + 1, 4 * GiB + GiB / 2, tripleStart + 1, 4 * GiB, 3 * GiB};
+    std::sort(sizes.rbegin(), sizes.rend());
+    for (uint64_t size : sizes) {
+        assert(size < end);
+        assert(!node->ops->truncate(node, size));
+        kept = std::min(kept, size);
+        assert(!node->ops->stat(node, &stat) && stat.size == size);
+        inode = verify(size);
+        if (size <= tripleStart) assert(!inode.i_block[14]);
+    }
+    assert(!inode.i_dir_acl);
+    assert(!node->ops->truncate(node, end));
+    verify(end);
+
+    // Size limit: write the last byte, EFBIG at the limit, never wrap.
+    const uint64_t limit = mnt->maxFileBytes;
+    uint64_t position = limit - 1;
+    const uint8_t last = 0xa5;
+    assert(node->ops->write(node, &last, 1, &position) == 1 && position == limit);
+    inode = checkBlocks(ino);
+    assert(rawSize(inode) == limit && image[uint64_t(rawMap(inode, (limit - 1) / blockSize)) *
+                                            blockSize + (limit - 1) % blockSize] == last);
+    position = limit;
+    assert(node->ops->write(node, &last, 1, &position) == -27 && position == limit);
+    position = limit - 1;
+    const uint8_t pair[2] = {1, 2};
+    assert(node->ops->write(node, pair, 2, &position) == 1);
+    assert(node->ops->truncate(node, limit + 1) == -27);
+    assert(rawSize(checkBlocks(ino)) == limit);
+    assert(!node->ops->truncate(node, 0));
+    assert(rawSize(checkBlocks(ino)) == 0 && !rawInode(ino).i_blocks);
+
+    // Batched appends (64 KiB, block aligned at EOF) across the doubly to
+    // triply indirect boundary and a triply indirect middle boundary.
+    for (uint64_t start : {tripleStart - 128 * 1024, tripleMiddle - 128 * 1024}) {
+        assert(!node->ops->truncate(node, start));
+        std::vector<uint8_t> data(64 * 1024);
+        for (unsigned chunk = 0; chunk < 4; ++chunk) {
+            position = start + chunk * data.size();
+            for (uint64_t i = 0; i < data.size(); ++i) data[i] = LargePattern(position + i);
+            assert(node->ops->write(node, data.data(), data.size(), &position) == int(data.size()));
+        }
+        inode = checkBlocks(ino);
+        assert(rawSize(inode) == start + 256 * 1024);
+        for (uint64_t at = start; at < start + 256 * 1024; at += blockSize) {
+            const uint32_t block = rawMap(inode, at / blockSize);
+            assert(block);
+            for (uint64_t i = 0; i < blockSize; i += 61)
+                assert(image[uint64_t(block) * blockSize + i] == LargePattern(at + i));
+        }
+        // Partial truncate in the middle of the appended run.
+        assert(!node->ops->truncate(node, start + 100 * 1024 + 3));
+        inode = checkBlocks(ino);
+        assert(rawSize(inode) == start + 100 * 1024 + 3);
+        assert(!rawMap(inode, (start + 104 * 1024) / blockSize));
+        assert(!node->ops->truncate(node, 0));
+    }
+    // Leave a > 4 GiB sparse file for e2fsck.
+    kept = end;
+    for (const auto& region : regions) {
+        std::vector<uint8_t> data(region.length);
+        for (uint64_t i = 0; i < region.length; ++i) data[i] = LargePattern(region.offset + i);
+        position = region.offset;
+        assert(node->ops->write(node, data.data(), data.size(), &position) == int(data.size()));
+    }
+    verify(end);
+    // The feature is set on disk by now even if mkfs omitted it.
+    assert(mnt->roCompat & EXT2_FEATURE_RO_COMPAT_LARGE_FILE);
+    assert(raw32(1024 + __builtin_offsetof(Ext2Superblock, s_feature_ro_compat)) &
+           EXT2_FEATURE_RO_COMPAT_LARGE_FILE);
+    closeNode(node);
+    VfsObjectRelease(root);
+    assert(!Ext2FsUnmount(mnt));
+
+    // Remount: the 64-bit size and data survive.
+    priv = nullptr;
+    assert(Ext2FsMount(drive, &priv));
+    mnt = static_cast<Ext2Mount*>(priv);
+    mnt->skipPermChecks = true;
+    assert(!Ext2RootObject(mnt, drive, &root));
+    VfsObject* large = nullptr;
+    assert(!Ext2ObjectChild(root, "large", &large));
+    node = Ext2ObjectOpen(large, VFS_O_READ, &error);
+    assert(node && !error);
+    VfsObjectRelease(large);
+    assert(!node->ops->stat(node, &stat) && stat.size == end);
+    std::vector<uint8_t> tail(64);
+    position = end - tail.size();
+    assert(node->ops->read(node, tail.data(), tail.size(), &position) == int(tail.size()));
+    for (uint64_t i = 0; i < tail.size(); ++i) assert(tail[i] == LargePattern(end - tail.size() + i));
+    closeNode(node);
+    VfsObjectRelease(root);
+    assert(!Ext2FsUnmount(mnt));
+    g_ext2Devices[drive] = savedDevice;
+    std::ofstream result(std::string(fixturePath) + ".child-large", std::ios::binary | std::ios::trunc);
+    result.write(reinterpret_cast<const char*>(image.data()), image.size());
+    assert(result);
+}
+
 int main(int argc,char** argv){
-    assert(argc==3);std::ifstream input(argv[1],std::ios::binary);assert(input);
+    assert(argc==5);std::ifstream input(argv[1],std::ios::binary);assert(input);
     disk.assign(std::istreambuf_iterator<char>(input),{});input.close();
     using namespace brook;
     process.uid=process.euid=process.suid=1000;process.gid=process.egid=process.sgid=1000;legacyTestMask=022;
@@ -537,21 +812,23 @@ int main(int argc,char** argv){
     TestTaggedInodeTable(argv[2], false);
     TestTaggedInodeTable(argv[2], true);
     TestFailedIndirectReads();
+    TestLargeFiles(argv[3], false);
+    TestLargeFiles(argv[4], true);
     g_ext2Devices[0]=&device;void* mount=nullptr;assert(Ext2FsMount(0,&mount));
     auto* m=static_cast<Ext2Mount*>(mount);
     assert(m->writeError==0 && m->deferredSyncError==0);
     TestDirectoryReadFailure(m);
     {
-        // Regular files stop below 4 GiB with EFBIG; i_size must never wrap.
+        // Regular files stop at the size limit with EFBIG; i_size never wraps.
         KRwLockWriteLock(&g_ext2Lock);
         const uint32_t marker=Ext2ResolvePath(m,EXT2_ROOT_INO,"dir/marker",0);
         Ext2Inode inode{};assert(marker && Ext2ReadInode(m,marker,&inode));
         const uint32_t size=inode.i_size,blocks=inode.i_blocks;
-        const char data[16]="past four GiB";
-        for(uint64_t offset:{0xffffffffULL,0x100000000ULL,0x100000000ULL+4096})
+        const char data[16]="past the limit";
+        for(uint64_t offset:{m->maxFileBytes,m->maxFileBytes+4096,uint64_t{0x7fffffffffffffffULL}})
             assert(Ext2WriteInodeData(m,&inode,marker,data,sizeof(data),offset)==-27);
-        assert(Ext2WriteInodeData(m,&inode,marker,data,0,0x100000000ULL)==0);
-        assert(inode.i_size==size && inode.i_blocks==blocks);
+        assert(Ext2WriteInodeData(m,&inode,marker,data,0,m->maxFileBytes)==0);
+        assert(inode.i_size==size && inode.i_blocks==blocks && !inode.i_dir_acl);
         Ext2Inode stored{};assert(Ext2ReadInode(m,marker,&stored) && stored.i_size==size);
         KRwLockWriteUnlock(&g_ext2Lock);
     }
