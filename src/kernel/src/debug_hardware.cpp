@@ -981,6 +981,8 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
             boolean("profile_transfer_ready",usb.profileTransferReady);
             boolean("uncertain",usb.uncertain);boolean("final_sync_attempted",usb.finalAttempted);
             r.text(",\"stage\":");r.quoted(usb.stage);
+            r.text(",\"fsck\":");r.quoted(usb.fsck);
+            r.text(",\"fsck_exit\":");signedNumber(usb.fsckExit);
             r.text(",\"disk\":");signedNumber(usb.disk);
             r.text(",\"error\":");signedNumber(usb.error);
             r.text(",\"final_error\":");signedNumber(usb.finalError);

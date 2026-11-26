@@ -425,6 +425,39 @@ def check_refusal(args, system, fallback, case, stage, error):
     return boot, {**status, "outside_p2_sha256": outside_before}
 
 
+def automatic_repair(args):
+    """Sets built since the boot-time e2fsck carry it unless --usb-system-no-fsck."""
+    manifest = json.loads((args.files / "manifest.json").read_text())
+    return bool(((manifest.get("usb_system") or {}).get("fsck") or {}).get("automatic"))
+
+
+def check_dirty_boot(args, system, fallback, case, sentinel=False):
+    """A not-clean BROOK_SYSTEM: repaired and mounted, or (opted out) refused."""
+    if not automatic_repair(args):
+        boot, status = check_refusal(args, system, fallback, case, "needs-filesystem-check", -117)
+        assert status["dirty"]
+        return boot, status
+    outside_before = digest_outside_system(system)
+    guest = Guest(args, system, fallback, case)
+    try:
+        guest.wait_log("USB_SYSTEM_FSCK exit=", timeout=900)
+        guest.wait_log("groups=1024")
+        log = guest.serial.read_text(errors="replace")
+        assert "action=mount" in log and "USB_SYSTEM_MAINTENANCE" not in log, case
+        boot = guest.attach()
+        status = guest.status()
+        assert status["stage"] == "ready" and status["fsck"] == "repaired", status
+        assert status["fsck_exit"] in (0, 1) and status["window_open"] and status["mounted"], status
+        if sentinel:
+            guest.job(f"test \"$(< /data/home/usb-system-test)\" = {SENTINEL}")
+            guest.job("grep -q 'e2fsck -p -f exit=' /nix/var/log/brook/usb-system-fsck.log")
+        guest.restart()
+    finally:
+        guest.stop()
+    assert digest_outside_system(system) == outside_before, case
+    return boot, {**status, "outside_p2_sha256": outside_before}
+
+
 def check_refused_identities(args, system, fallback):
     results = {}
     record = (args.output / "usb-system.record").read_text()
@@ -486,8 +519,7 @@ def check_live_detach(args, disk, fallback):
     finally:
         guest.stop()
     assert digest_outside_system(disk) == outside_before
-    _, reboot = check_refusal(args, disk, fallback, "reboot-after-detach", "needs-filesystem-check", -117)
-    assert reboot["dirty"]
+    _, reboot = check_dirty_boot(args, disk, fallback, "reboot-after-detach")
     return {"fenced": fenced, "final_sync": final, "reboot": reboot}
 
 
@@ -570,9 +602,9 @@ def main():
     if args.no_gop:
         assert "\ngop=none " in crumb, crumb   # booted headless, not halted
 
-    results["dirty_boot"], results["dirty_status"] = check_refusal(
-        args, system, fallback, "dirty-boot", "needs-filesystem-check", -117)
-    assert results["dirty_status"]["dirty"] and digest_outside_system(system) == outside
+    results["dirty_boot"], results["dirty_status"] = check_dirty_boot(
+        args, system, fallback, "dirty-boot", sentinel=True)
+    assert digest_outside_system(system) == outside
     assert sha(fallback) == fallback_hash
     # Duplicate only the p1 identity; the firmware still selected the SSD.
     guid = subprocess.check_output(["sfdisk", "--part-uuid", system, "1"], text=True).strip()

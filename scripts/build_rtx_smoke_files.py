@@ -77,7 +77,7 @@ ETC_ALLOWED = {*MARKERS, 'i219-attach', 'i219-reset', 'hardware-payload-id', 're
                'keyboard-layout',
                'bridge-v3-operators', 'rtx-update-signer', 'restart-prompt-seconds',
                # --session desktop only
-               'live-store', 'usb-system', 'usb-profile-plan.pub', 'usb-system-trim', 'usb-bot-legacy', 'usb-bot-pipeline', 'usb-uas', 'usb-uas-fixture', 'volatile-desktop', 'hardware-bulk', 'usb-audio-mixer', 'dp-idle-seconds', 'nv-display', 'chromium-alsa-device',
+               'live-store', 'usb-system', 'usb-system-no-fsck', 'usb-profile-plan.pub', 'usb-system-trim', 'usb-bot-legacy', 'usb-bot-pipeline', 'usb-uas', 'usb-uas-fixture', 'volatile-desktop', 'hardware-bulk', 'usb-audio-mixer', 'dp-idle-seconds', 'nv-display', 'chromium-alsa-device',
                # --nv-gsp (GSP-RM M1 bridge verbs) and its firmware record
                'nv-gsp', 'nv-gsp-firmware', 'nv-gsp-no-autostart'}
 # Desktop live stick (--session desktop): the VMware RC session over the RAM
@@ -264,6 +264,40 @@ def embed_usb_profile_runtime(args, initrd, profile):
     fat_write(initrd, 'BOOT/USBSTAGE.RC', launcher.encode())
 
 
+FSCK_PIN_HEADER = ROOT / 'src/kernel/src/usb_system_fsck_policy.h'
+FSCK_INITRD_PATH = 'BOOT/E2FSCK.ELF'
+
+
+def fsck_pin():
+    """The kernel only executes the e2fsck whose SHA-256 it pins."""
+    found = re.findall(r'UsbSystemFsckSha256\[\] =\s*"([0-9a-f]{64})";', FSCK_PIN_HEADER.read_text())
+    if len(found) != 1:
+        raise SystemExit(f'{FSCK_PIN_HEADER}: expected one UsbSystemFsckSha256 pin')
+    return found[0]
+
+
+def embed_usb_system_fsck(args, initrd, roots):
+    """Static e2fsck (pinned nixpkgs pkgsStatic.e2fsprogs) for boot repair of BROOK_SYSTEM."""
+    from hardware_recovery_fsck import validate_checker
+    out = Path(subprocess.check_output(
+        ['nix-build', '-o', str(roots / 'e2fsprogs-static'), '-E',
+         f'(import {ROOT / "nix/nixpkgs.nix"} {{}}).pkgsStatic.e2fsprogs'], text=True).strip().splitlines()[-1])
+    binary = (out / 'bin/e2fsck').resolve(strict=True)
+    info = validate_checker(binary)
+    pin = fsck_pin()
+    if info['sha256'] != pin:
+        raise SystemExit(f'{binary}: sha256 {info["sha256"]} does not match the kernel pin {pin}')
+    data = binary.read_bytes()
+    fat_write(initrd, FSCK_INITRD_PATH, data)
+    if subprocess.check_output(['mtype', '-i', str(initrd), '::/' + FSCK_INITRD_PATH]) != data:
+        raise SystemExit(FSCK_INITRD_PATH + ' readback mismatch')
+    if args.usb_system_no_fsck:
+        fat_write(initrd, 'ETC/usb-system-no-fsck', b'1\n')
+    return {'path': '/BOOT/E2FSCK.ELF', 'source': str(binary), 'bytes': info['bytes'],
+            'sha256': info['sha256'], 'command': 'e2fsck -p -f /dev/brook-usb-system',
+            'automatic': not args.usb_system_no_fsck}
+
+
 def desktop_payload(args, initrd):
     """Embed desktop boot assets from a signed plan or the fallback RAM store."""
     from stage_clearwater_shell import add_clearwater_start, embed_clearwater_executables, embed_terminal_shortcut
@@ -326,6 +360,7 @@ def desktop_payload(args, initrd):
             fat_write(initrd, 'ETC/usb-bot-' + args.usb_bot, b'1\n')
         if args.usb_system_trim:
             fat_write(initrd, 'ETC/usb-system-trim', (args.usb_system_trim + '\n').encode())
+        fsck = embed_usb_system_fsck(args, initrd, roots)
     else:
         fat_write(initrd, 'ETC/live-store', store['record'].encode())
     fat_write(initrd, 'BOOT/BIN/BASH', (profile / 'bin/bash').read_bytes())
@@ -334,7 +369,7 @@ def desktop_payload(args, initrd):
     fat_write(initrd, 'BOOT/WALLPAPER.RAW', wallpaper)
     if args.usb_system:
         storage = {'record': record, 'profile': str(profile), 'plan_sha256': plan_hash,
-                   'plan_key_sha256': hashlib.sha256(key_bytes).hexdigest()}
+                   'plan_key_sha256': hashlib.sha256(key_bytes).hexdigest(), 'fsck': fsck}
     else:
         storage = {k: store[k] for k in
                    ('bytes', 'sha256', 'partition_guid', 'partition_name', 'profile', 'record', 'slot')
@@ -604,6 +639,8 @@ def main():
                    help='USB system BOT test mode: legacy 64 KiB or experimental read data/status pipelining')
     p.add_argument('--usb-system-trim', metavar="'dry-run|run [MIN_MIB [MAX_MIB]]'",
                    help="scan clean ext2 free extents before mount; send UNMAP only with 'run'")
+    p.add_argument('--usb-system-no-fsck', action='store_true',
+                   help='write /etc/usb-system-no-fsck: a not-clean BROOK_SYSTEM is refused, not repaired at boot')
     p.add_argument('--nv-gsp', action='store_true',
                    help='desktop image: BROOK_NV_GSP kernel and /etc/nv-gsp (GSP-RM verbs; boots GSP-RM + CE present at desktop start unless --nv-gsp-no-autostart)')
     p.add_argument('--nv-gsp-no-autostart', action='store_true',
@@ -633,6 +670,8 @@ def main():
         p.error("--usb-uas needs --usb-system")
     if args.usb_bot != "default" and not args.usb_system:
         p.error("--usb-bot needs --usb-system")
+    if args.usb_system_no_fsck and not args.usb_system:
+        p.error("--usb-system-no-fsck needs --usb-system")
     if args.usb_system_trim and (not args.usb_system or not re.fullmatch(
             r'(dry-run|run)( [0-9]+){0,2}', args.usb_system_trim)):
         p.error("--usb-system-trim needs --usb-system and 'dry-run' or 'run' with optional MiB limits")

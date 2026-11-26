@@ -292,6 +292,11 @@ void LastLogStart()
     SchedulerAddProcess(thread);
 }
 
+void LastLogRequestFlush()
+{
+    __atomic_store_n(&g_flushRequested, true, __ATOMIC_RELEASE);
+}
+
 bool LastLogHandleCommand(const char* cmd)
 {
     auto prefix = [cmd](const char* p) { uint32_t i = 0; for (; p[i]; ++i) if (cmd[i] != p[i]) return false; return true; };

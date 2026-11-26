@@ -9,6 +9,7 @@
 
 #include "signal_fd.h"
 #include "user_access_scope.h"
+#include "usb_system_fsck.h"
 #include "tty.h"
 #include "compositor.h"
 #include "window.h"
@@ -112,7 +113,7 @@ static int64_t WriteToPinnedFdByType(Process* proc,FdEntry* fde,uint64_t fd,
                 if(!n)return offset?static_cast<int64_t>(offset):-EFAULT;
             } else memcpy(text,source+offset,n);
             for(uint32_t i=0;i<n;++i)if(!text[i])text[i]='?';
-            text[n]=0;brook::KPuts(text);offset+=n;
+            text[n]=0;brook::UsbSystemFsckCapture(proc,text,n);brook::KPuts(text);offset+=n;
         }
         return static_cast<int64_t>(count);
     }

@@ -357,6 +357,7 @@ add_executable(kernel
     src/boot_status.cpp
     src/boot_stick.cpp
     src/usb_system.cpp
+    src/usb_system_fsck.cpp
     src/live_store.cpp
     src/hda_observe.cpp
     src/native_tsc_observe.cpp
