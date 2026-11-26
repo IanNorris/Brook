@@ -1,6 +1,7 @@
 #include "toplevel-size.h"
 #include "latency-stats.h"
 #include "wm-input-abi.h"
+#include "input_preferences.h"
 #include "brook-caption-strip.h"
 
 #include <stddef.h>
@@ -2154,10 +2155,18 @@ static void keyboard_resource_destroy(struct wl_resource *r) {
 }
 
 static void pointer_enter_if_needed(struct brook_seat_client *sc,struct brook_surface *s,wl_fixed_t lx,wl_fixed_t ly);
+static void pointer_timeline_delivered(uint32_t wm_id, uint32_t type)
+{
+    static int reported;
+    if (!reported && syscall(BROOK_SYS_WM_POINTER_TIMELINE, (long)BROOK_POINTER_TIMELINE_DELIVERY,
+                             (long)wm_id, (long)type, 0L, 0L, 0L) == 0)
+        reported = 1;
+}
 #include "pointer-constraints.h"
 #include "idle-inhibit.h"
 
 #include "keyboard-keymap.h"
+static uint32_t g_keyboard_layout;
 
 static int make_keymap_fd(size_t *out_size) {
     /* Full US-101 xkb keymap.  evdev keycodes (= scancode + 8).
@@ -2165,8 +2174,10 @@ static int make_keymap_fd(size_t *out_size) {
      * other letter, number, and punctuation key reached the client as
      * an unmapped keycode, which xkbcommon translates to NoSymbol and
      * apps like mousepad drop.  Cover the standard typing block. */
-    const char *keymap = brook_xkb_keymap;
-    size_t len = sizeof(brook_xkb_keymap);
+    long layout = syscall(BROOK_SYS_INPUT_PREFERENCES, (long)BROOK_INPUT_PREF_KEYBOARD, 0L, 0L, 0L, 0L, 0L);
+    g_keyboard_layout = layout == BROOK_KEYBOARD_GB ? BROOK_KEYBOARD_GB : BROOK_KEYBOARD_US;
+    const char *keymap = g_keyboard_layout == BROOK_KEYBOARD_GB ? brook_xkb_keymap_gb : brook_xkb_keymap;
+    size_t len = strlen(keymap) + 1;
     int fd = syscall(SYS_memfd_create, "brook-keymap", 0u);
     if (fd < 0) { fprintf(stderr, "[waylandd] keymap: memfd_create FAILED errno=%d\n", errno); return -1; }
     if (ftruncate(fd, (off_t)len) < 0) { fprintf(stderr, "[waylandd] keymap: ftruncate FAILED\n"); close(fd); return -1; }
@@ -2217,6 +2228,10 @@ static void seat_get_pointer(struct wl_client *c, struct wl_resource *r, uint32_
     if (!p) { wl_client_post_no_memory(c); return; }
     wl_resource_set_implementation(p, &pointer_impl, sc, pointer_resource_destroy);
     if (sc) {sc->pointer = p;sc->finger_axes = 0;++sc->refs;}
+    static int reported;
+    if (!reported && syscall(BROOK_SYS_WM_POINTER_TIMELINE, (long)BROOK_POINTER_TIMELINE_SEAT,
+                             0L, 0L, 0L, 0L, 0L) == 0)
+        reported = 1;
 }
 static void seat_get_keyboard(struct wl_client *c, struct wl_resource *r, uint32_t id) {
     struct brook_seat_client *sc = seat_for_resource(r);
@@ -2537,6 +2552,7 @@ static void dispatch_surface_event(struct brook_surface *s,
         if (wl_resource_get_version(sc->pointer) >= 5)
             wl_pointer_send_frame(sc->pointer);
         latency_input_sent(sc->client, LATENCY_MOTION);
+        pointer_timeline_delivered(s->wm_id, e->type);
         pointer_constraints_refresh();
         break;
     }
@@ -2565,6 +2581,7 @@ static void dispatch_surface_event(struct brook_surface *s,
         if (wl_resource_get_version(sc->pointer) >= 5)
             wl_pointer_send_frame(sc->pointer);
         latency_input_sent(sc->client, LATENCY_BUTTON);
+        pointer_timeline_delivered(s->wm_id, e->type);
         fprintf(stderr, "[waylandd] btn wm=%u 0x%x %s at (%d,%d)\n",
                 s->wm_id, btn,
                 st == WL_POINTER_BUTTON_STATE_PRESSED ? "down" : "up",
@@ -2614,6 +2631,7 @@ static void dispatch_surface_event(struct brook_surface *s,
         pointer_send_scroll_axis(sc->pointer, now, WL_POINTER_AXIS_HORIZONTAL_SCROLL, dx_v120, dx_ticks, finger);
         if (version >= WL_POINTER_FRAME_SINCE_VERSION) wl_pointer_send_frame(sc->pointer);
         latency_input_sent(sc->client, LATENCY_AXIS);
+        pointer_timeline_delivered(s->wm_id, e->type);
         break;
     }
     case EVT_KEY_PRESS:
@@ -2630,7 +2648,10 @@ static void dispatch_surface_event(struct brook_surface *s,
         uint32_t locked    = 0;
         if (e->mods & 0x03) depressed |= (1u << 0); /* Shift */
         if (e->mods & 0x04) depressed |= (1u << 2); /* Control */
-        if (e->mods & 0x08) depressed |= (1u << 3); /* Mod1/Alt */
+        if ((e->mods & 0x08) || ((e->mods & 0x40) && g_keyboard_layout == BROOK_KEYBOARD_US))
+            depressed |= (1u << 3); /* Mod1/Alt */
+        if ((e->mods & 0x40) && g_keyboard_layout == BROOK_KEYBOARD_GB)
+            depressed |= (1u << 7); /* Mod5/AltGr */
         if (e->mods & 0x10) locked    |= (1u << 1); /* Lock/Caps */
 
         /* Send key event first — xkbcommon clients call

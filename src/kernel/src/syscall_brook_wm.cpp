@@ -10,6 +10,9 @@
 #include "compositor.h"
 #include "window.h"
 #include "idle_inhibit.h"
+#include "boot_timing_runtime.h"
+#include "keyboard.h"
+#include "../../shared/input_preferences.h"
 #include "desktop_identity.h"
 #include "shell_service.h"
 #include "gpu_compositor.h"
@@ -532,6 +535,49 @@ int64_t sys_brook_wm_begin_move(uint64_t wmId, uint64_t,
     if (!w) return -EINVAL;
     int idx = static_cast<int>(wmId) - 1;
     return brook::CompositorBeginWindowMove(idx) ? 0 : -EINVAL;
+}
+
+int64_t sys_brook_input_preferences(uint64_t selector, uint64_t a, uint64_t b,
+                                   uint64_t c, uint64_t d, uint64_t e)
+{
+    if (a || b || c || d || e) return -EINVAL;
+#ifdef BROOK_HOST_TEST
+    (void)selector;
+    return -ENOSYS;
+#else
+    if (selector == BROOK_INPUT_PREF_KEYBOARD) return KbdLayout();
+    if (selector == BROOK_INPUT_PREF_CURSOR) return WmCursorSize();
+    return -EINVAL;
+#endif
+}
+
+int64_t sys_brook_wm_pointer_timeline(uint64_t op, uint64_t wmId, uint64_t type,
+                                      uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+#ifdef BROOK_HOST_TEST
+    (void)op; (void)wmId; (void)type;
+    return -ENOSYS;
+#else
+    if (proc->userNamespace) return -EPERM;
+    if (op == BROOK_POINTER_TIMELINE_SEAT && !wmId && !type) {
+        // Diagnostic only. The fixed boot provider and the profile Wayland
+        // provider both have an executable basename from this allowlist.
+        const char* name = proc->exePath;
+        for (const char* p = name; *p; ++p) if (*p == '/') name = p + 1;
+        if (strcmp(name, "INTLWL.ELF") && strcmp(name, "waylandd")) return -EPERM;
+        BootTimingPointerMark(BootPointerEvent::Seat);
+        return 0;
+    }
+    if (op != BROOK_POINTER_TIMELINE_DELIVERY || !wmId || wmId > WM_MAX_WINDOWS ||
+        type < uint64_t(InputEventType::MouseMove) || type > uint64_t(InputEventType::MouseRelativeMove))
+        return -EINVAL;
+    BrookWindowState state{};
+    if (const int result = WmSnapshotOwnedWindowState(proc, static_cast<uint32_t>(wmId), 0, &state)) return result;
+    BootTimingPointerMark(BootPointerEvent::Wayland, static_cast<uint32_t>(type));
+    return 0;
+#endif
 }
 
 // 0xB27: WM_SET_IDLE_INHIBIT(wmId, count)

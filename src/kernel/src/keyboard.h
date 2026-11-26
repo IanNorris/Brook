@@ -41,5 +41,12 @@ extern "C" char KbdGetChar();
 // Push a character into the legacy ring buffer from an external source
 // (e.g. USB keyboard driver). This feeds KbdGetChar/KbdPeekChar.
 extern "C" void KbdPushChar(char c);
+extern "C" void KbdPushCodepoint(uint16_t cp);
+extern "C" uint16_t KbdTranslateKey(uint8_t scan, uint8_t modifiers);
+
+void KbdLoadDefaultLayout();
+uint32_t KbdLayout();
+uint32_t KbdDefaultLayout();
+void KbdSetLayout(uint32_t layout);
 
 } // namespace brook

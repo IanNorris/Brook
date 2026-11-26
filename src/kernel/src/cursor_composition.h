@@ -1,6 +1,7 @@
 #pragma once
 #include <stdint.h>
 #include "../../shared/brook_theme.h"
+#include "../../shared/input_preferences.h"
 #include "cursor_shapes.h"
 
 namespace brook {
@@ -79,11 +80,19 @@ struct CursorOwnership {
     }
 };
 
+inline constexpr uint32_t CursorPreferencePercent(uint32_t desktopScale, uint32_t size)
+{
+    return (desktopScale * size + BROOK_CURSOR_SIZE_DEFAULT / 2) / BROOK_CURSOR_SIZE_DEFAULT;
+}
+
 // Scale only compositor-owned logical cursors. Client images are already in
 // physical pixels and must not pass through this a second time.
 inline void ScaleCursor(const CursorImage& source,CursorImage& frame,uint32_t percent)
 {
     if (!percent) percent=100;
+    const uint32_t side = source.width > source.height ? source.width : source.height;
+    if (side && uint64_t(side) * percent > CursorCapacity * 100)
+        percent = CursorCapacity * 100 / side;
     frame={};
     frame.width=(source.width*percent+99)/100;
     frame.height=(source.height*percent+99)/100;

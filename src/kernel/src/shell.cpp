@@ -217,6 +217,16 @@ static constexpr const char* g_defaultEnvp[] = {
 
 // All alternatives are immutable. Concurrent launches never modify a shared
 // environment array or inherit a partially updated presentation policy.
+static const char* ShellCursorSizeEnv()
+{
+    switch (WmCursorSize()) {
+    case 32: return "XCURSOR_SIZE=32";
+    case 48: return "XCURSOR_SIZE=48";
+    case 64: return "XCURSOR_SIZE=64";
+    default: return "XCURSOR_SIZE=24";
+    }
+}
+
 static constexpr auto g_directEnvironment=DesktopBuildGpuEnvironment(g_defaultEnvp,true,true);
 static constexpr auto g_stagedEnvironment=DesktopBuildGpuEnvironment(g_defaultEnvp,true,false);
 static constexpr auto g_nonVirtioEnvironment=DesktopBuildGpuEnvironment(g_defaultEnvp,false,false);
@@ -528,12 +538,14 @@ static int SpawnProcess(const char* path, int argc, const char* const* argv,
     const uint32_t gid = gidOverride == CredentialUnchanged ? LaunchPrimaryGroup(uid) : gidOverride;
     const char* launchEnv[sizeof(g_directEnvironment.entries) / sizeof(g_directEnvironment.entries[0])];
     char userEnv[32], loginEnv[32];
+    const char* cursorSize = ShellCursorSizeEnv();
     LaunchIdentityEnvironment(userEnv, false, uid);
     LaunchIdentityEnvironment(loginEnv, true, uid);
     for (int i = 0; i <= envc; ++i) {
         launchEnv[i] = defaults[i];
         if (defaults[i] && StrEq(defaults[i], "USER=root")) launchEnv[i] = userEnv;
         if (defaults[i] && StrEq(defaults[i], "LOGNAME=root")) launchEnv[i] = loginEnv;
+        if (defaults[i] && StrEq(defaults[i], "XCURSOR_SIZE=24")) launchEnv[i] = cursorSize;
     }
     Process* proc = ProcessCreateExecutable(image, argc, argv,
                                    envc, launchEnv, nullptr, uid, gid);
@@ -1811,7 +1823,7 @@ static int ReadInteractiveLine(char* buf, uint32_t maxLen)
         {
             if (i > 0)
             {
-                --i;
+                do { --i; } while (i && (uint8_t(buf[i]) & 0xc0) == 0x80);
                 // Erase character on screen: backspace, space, backspace
                 TtyPutChar('\b');
                 TtyPutChar(' ');
@@ -1820,8 +1832,8 @@ static int ReadInteractiveLine(char* buf, uint32_t maxLen)
             continue;
         }
 
-        // Printable characters only
-        if (c >= 32 && c < 127)
+        // Printable ASCII and the UTF-8 bytes emitted by the layout.
+        if (uint8_t(c) >= 32 && uint8_t(c) != 127)
         {
             buf[i++] = c;
             TtyPutChar(c);
@@ -1884,6 +1896,7 @@ Process* ShellCreateDebugJob(int argc, const char* const* argv, const char* cwd,
         const char* value=defaults[i];
         if (StrEq(value,"USER=root")) value=user;
         if (StrEq(value,"LOGNAME=root")) value=login;
+        if (StrEq(value,"XCURSOR_SIZE=24")) value=ShellCursorSizeEnv();
         bool replaced=false;
         for (int j=0;j<envc;++j) {
             uint32_t k=0;

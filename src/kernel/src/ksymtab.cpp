@@ -27,6 +27,7 @@ extern "C" brook::KernelSymbol __stop_ksymtab[];
 #include "virtio_blk.h"
 #include "keyboard.h"
 #include "input.h"
+#include "boot_timing_runtime.h"
 #include "scheduler.h"
 #include "sched_decision_trace.h"
 #include "display.h"
@@ -190,6 +191,8 @@ EXPORT_SYMBOL(KbdGetChar);
 EXPORT_SYMBOL(KbdPeekChar);
 EXPORT_SYMBOL(KbdIsAvailable);
 EXPORT_SYMBOL(KbdPushChar);
+EXPORT_SYMBOL(KbdPushCodepoint);
+EXPORT_SYMBOL(KbdTranslateKey);
 
 // Input subsystem
 EXPORT_SYMBOL(InputInit);
@@ -199,6 +202,8 @@ EXPORT_SYMBOL(InputWaitEvent);
 EXPORT_SYMBOL(InputHasEvents);
 EXPORT_SYMBOL(InputWakeWaiters);
 EXPORT_SYMBOL(InputNextSequence);
+EXPORT_SYMBOL(InputMarkPointerIngress);
+EXPORT_SYMBOL(BootTimingUsbPointer);
 
 // Scheduler — for dynamic policy modules
 EXPORT_SYMBOL(SchedulerRegisterPolicy);

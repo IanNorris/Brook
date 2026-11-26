@@ -2,6 +2,7 @@
 #include "chrome_material.h"
 #include "chrome_alpha.h"
 #include "keyboard.h"
+#include "keyboard_layout.h"
 #include "kprintf.h"
 #include "compositor_wake_sequence.h"
 #include "apic.h"
@@ -1916,9 +1917,10 @@ static void CursorPrepareFrame(bool busy, uint64_t now)
         if (g_cursorShapeLoaded == shape) chosen = &g_cursorShapeSource;
     }
     const CursorImage& source = *chosen;
-    if(builtin && WmGetAppliedScale()!=100) {
+    const uint32_t cursorScale = CursorPreferencePercent(WmGetAppliedScale(), WmCursorSize());
+    if(builtin && cursorScale!=100) {
         ComposeCursor(source,g_cursorLogicalFrame,busy,now,WmCurrentPalette().borderActive);
-        ScaleCursor(g_cursorLogicalFrame,g_cursorFrame,WmGetAppliedScale());
+        ScaleCursor(g_cursorLogicalFrame,g_cursorFrame,cursorScale);
     } else ComposeCursor(source,g_cursorFrame,busy,now,WmCurrentPalette().borderActive);
     SpinLockRelease(&g_cursorSourceLock);
 }
@@ -3135,6 +3137,16 @@ static void CompositorLoopWM(bool& clientFrame)
     const bool overlayCursor=MouseIsAvailable() && !WmPointerCaptureActive() &&
         __atomic_load_n(&g_defaultCursorVisible,__ATOMIC_ACQUIRE)!=0 &&
         CursorPixelsHaveAlpha(g_cursorFrame.pixels,g_cursorFrame.width,g_cursorFrame.height);
+    // This is the visible cursor supplied to the active display path.
+    // Capture its first eligibility transition, independently of first motion.
+#ifndef BROOK_HOST_TEST
+    static uint32_t cursorTrigger = 0;
+    if (overlayCursor)
+        BootTimingPointerMark(BootPointerEvent::Cursor, cursorTrigger | (rendererLeased ? 4u : 0u));
+    else if (!MouseIsAvailable()) cursorTrigger = 1;
+    else if (WmPointerCaptureActive() || !__atomic_load_n(&g_defaultCursorVisible, __ATOMIC_ACQUIRE)) cursorTrigger = 2;
+    else cursorTrigger = 3;
+#endif
     PublishOverlayCursor(now,overlayCursor);
 #if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
     BdwCursorUpdate(cursorLeaseOwner,overlayCursor,chromeMx-g_cursorFrame.hotX,
@@ -3228,6 +3240,10 @@ static void CompositorInputWM()
     InputEvent ev{};
     while (InputPollEvent(&ev))
     {
+#ifndef BROOK_HOST_TEST
+        if (ev.type >= InputEventType::MouseMove)
+            BootTimingPointerMark(BootPointerEvent::Wm, static_cast<uint8_t>(ev.type));
+#endif
         const bool fineOnly = ev.type == InputEventType::MouseScroll && !InputHasScrollTicks(ev);
         const bool captured=WmRouteCapturedPointer(ev);
         CompositorReconcilePointerCapture();
@@ -3530,10 +3546,11 @@ static void CompositorInputWM()
             {
                 // Character input comes only from presses, even if a driver
                 // happens to include translated ASCII on a release event.
-                if (ev.type == InputEventType::KeyPress && ev.ascii != 0)
+                if (ev.type == InputEventType::KeyPress && (ev.ascii || ev.textCodepoint))
                 {
-                    char ch = ev.ascii;
-                    TerminalWriteInput(static_cast<int>(ti), &ch, 1);
+                    char bytes[3];
+                    const unsigned n = KeyboardUtf8(ev.ascii ? uint8_t(ev.ascii) : ev.textCodepoint, bytes);
+                    TerminalWriteInput(static_cast<int>(ti), bytes, n);
                 }
                 else if (ev.type == InputEventType::KeyPress)
                 {
@@ -5390,6 +5407,9 @@ static void CompositorLoop()
         __atomic_store_n(&g_desktopReadyTick,now?now:1,__ATOMIC_RELEASE);
         BootLogoFinish();SerialPrintf("BOOT: desktop presented in %lu ms\n",CompositorBootDurationMs());
     }
+#ifndef BROOK_HOST_TEST
+    BootTimingPointerFlush();
+#endif
     uint64_t loopEndTick = ApicTickCount();
     uint64_t loopMs = loopEndTick - loopStartTick;
     if(__atomic_load_n(&g_hardwareProbe,__ATOMIC_ACQUIRE)) {

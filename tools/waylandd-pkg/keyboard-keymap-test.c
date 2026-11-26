@@ -13,9 +13,8 @@
 #include <X11/extensions/XKM.h>
 #include "keyboard-keymap.h"
 
-int main(int argc, char **argv)
+static void check_map(const char *xkbcomp, const char *keymap, int gb)
 {
-    assert(argc == 2);
     char directory[] = "./brook-keymap-test-XXXXXX";
     assert(mkdtemp(directory));
     char source[PATH_MAX], compiled[PATH_MAX];
@@ -23,13 +22,12 @@ int main(int argc, char **argv)
     assert(snprintf(compiled, sizeof(compiled), "%s/map.xkm", directory) > 0);
     FILE *file = fopen(source, "wb");
     assert(file);
-    assert(fwrite(brook_xkb_keymap, 1, sizeof(brook_xkb_keymap) - 1, file)
-           == sizeof(brook_xkb_keymap) - 1);
+    assert(fwrite(keymap, 1, strlen(keymap), file) == strlen(keymap));
     assert(fclose(file) == 0);
     pid_t child = fork();
     assert(child >= 0);
     if (!child) {
-        execl(argv[1], argv[1], "-w", "0", "-xkm", source, compiled, (char *)NULL);
+        execl(xkbcomp, xkbcomp, "-w", "0", "-xkm", source, compiled, (char *)NULL);
         _exit(127);
     }
     int status;
@@ -77,8 +75,29 @@ int main(int argc, char **argv)
             modifier_action = 1;
     }
     assert(modifier_action);
+    if (gb) {
+        assert(XkbKeySymEntry(map, 11, 1, 0) == XK_quotedbl);
+        assert(XkbKeySymEntry(map, 12, 1, 0) == XK_sterling);
+        assert(XkbKeySymEntry(map, 13, 2, 0) == XK_EuroSign);
+        assert(XkbKeySymEntry(map, 48, 1, 0) == XK_at);
+        assert(XkbKeySymEntry(map, 51, 0, 0) == XK_numbersign);
+        assert(XkbKeySymEntry(map, 51, 1, 0) == XK_asciitilde);
+        assert(XkbKeySymEntry(map, 94, 0, 0) == XK_backslash);
+        assert(XkbKeySymEntry(map, 94, 1, 0) == XK_bar);
+        assert(XkbKeySymEntry(map, 108, 0, 0) == XK_ISO_Level3_Shift);
+        assert(map->map->modmap[108] & Mod5Mask);
+    } else {
+        assert(XkbKeySymEntry(map, 11, 1, 0) == XK_at);
+    }
     XkbFreeKeyboard(map, XkbAllComponentsMask, True);
     assert(unlink(source) == 0 && unlink(compiled) == 0 && rmdir(directory) == 0);
-    puts("KEYBOARD_KEYMAP_PASS");
+}
+
+int main(int argc, char **argv)
+{
+    assert(argc == 2);
+    check_map(argv[1], brook_xkb_keymap, 0);
+    check_map(argv[1], brook_xkb_keymap_gb, 1);
+    puts("KEYBOARD_KEYMAP_PASS layouts=us,gb");
     return 0;
 }

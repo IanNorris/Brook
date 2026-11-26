@@ -1,10 +1,16 @@
 #include "input.h"
+#include "boot_timing_runtime.h"
 #include "serial.h"
 #include "scheduler.h"
 #include "process.h"
 #include "spinlock.h"
 
 namespace brook {
+
+extern "C" void InputMarkPointerIngress(uint8_t type)
+{
+    BootTimingPointerMark(BootPointerEvent::Ingress, type);
+}
 
 static uint64_t g_inputSequence = 0, g_inputDrops = 0;
 uint64_t InputNextSequence(bool dropped) {

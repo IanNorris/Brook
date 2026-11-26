@@ -986,6 +986,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
     // Initialise input subsystem before modules so keyboard module can register.
     brook::InputInit();
+    brook::KbdLoadDefaultLayout();
 
     // Initialise the audio mixer before modules so HDA can register.
     brook::AudioMixerInit();
