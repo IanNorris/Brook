@@ -637,6 +637,16 @@ bool RmAlloc(uint32_t bytes, DmaRegion* r) {
     if (g_rm->nregions < RmState::kMaxRegions) g_rm->regions[g_rm->nregions++] = *r; else g_rm->overflow = true;
     return true;
 }
+// The channel method buffer, sysmem: optionally naturally aligned to its power-of-two size, as
+// Linux dma_alloc_coherent gives nouveau (26 Nov A/B; RmAlloc alone is only page aligned).
+bool g_mthdbufAlign = false;
+bool MthdbufAlloc(uint32_t bytes, M2Sys* m) {
+    uint32_t al = 0x1000; while (al < bytes) al <<= 1;
+    DmaRegion d;
+    if (!RmAlloc(g_mthdbufAlign ? bytes + al : bytes, &d)) return false;
+    const uint64_t bus = g_mthdbufAlign ? (d.bus + al - 1) & ~uint64_t(al - 1) : d.bus;
+    m->cpu = d.cpu + (bus - d.bus); m->bus = bus; m->bytes = bytes; return true;
+}
 void FlushRange(const uint8_t* p, uint32_t n) {
     for (uint32_t o = 0; o < n; o += 64) __asm__ volatile("clflush (%0)" ::"r"(p + o) : "memory");
     __asm__ volatile("mfence" ::: "memory");
@@ -1471,7 +1481,7 @@ void GrVerb(int mode) {   // 1 golden, 2 off, 0 status
         if (mode == 7) { pl.hold_ms = 3000; pl.no_work = true; }   // gr idle: no work, 3 s alive
         auto sys = [](M2Sys* m, uint32_t bytes) { DmaRegion d; if (!RmAlloc(bytes, &d)) return false;
             m->cpu = d.cpu; m->bus = d.bus; m->bytes = d.bytes; return true; };
-        if (!sys(&pl.gpfifo, 0x1000) || !sys(&pl.push, 0x1000) || !sys(&pl.sem, 0x1000) || !sys(&pl.mthdbuf, g_gr.mthdbuf_size)) {
+        if (!sys(&pl.gpfifo, 0x1000) || !sys(&pl.push, 0x1000) || !sys(&pl.sem, 0x1000) || !MthdbufAlloc(g_gr.mthdbuf_size, &pl.mthdbuf)) {
             o.ks("refused", "no sysmem"); o.send(); return; }
         SpinLock* lock = NvAuxSharedLock();
         SpinLockAcquire(lock);
@@ -1488,7 +1498,7 @@ void GrVerb(int mode) {   // 1 golden, 2 off, 0 status
         SpinLockRelease(lock);
         o.kd("run_us", NowUs() - t0);
         o.k("clear"); o.raw("{"); o.ks("layout", pl.block_linear ? "block-linear" : "pitch"); o.kd("hold_ms", pl.hold_ms);
-        o.kb("no_work", pl.no_work); o.kd("events_total", g.ev.total); o.ks("stage", g.stage); o.ks("status", g.status); o.kh("rm_status", g.rm_status);
+        o.kb("no_work", pl.no_work); o.kh("mthdbuf_bus", pl.mthdbuf.bus); o.kh("mthdbuf_size", g_gr.mthdbuf_size); o.kd("events_total", g.ev.total); o.ks("stage", g.stage); o.ks("status", g.status); o.kh("rm_status", g.rm_status);
         o.kh("rt_vram", cr.rt_vram); o.kh("token", cr.token); o.kb("first_ok", cr.first_ok); o.kb("verify_ok", cr.verify_ok);
         o.kh("sample_got", cr.sample_got); o.kh("sample_want", cr.sample_want); o.kd("first_us", cr.first_us);
         o.kd("best_us", cr.best_us); o.kd("avg_us", cr.n ? cr.sum_us / cr.n : 0); o.kd("n", cr.n); o.kd("bytes", cr.bytes);
@@ -1504,7 +1514,7 @@ void GrVerb(int mode) {   // 1 golden, 2 off, 0 status
         GrClearPlan pl;
         auto sys = [](M2Sys* m, uint32_t bytes) { DmaRegion d; if (!RmAlloc(bytes, &d)) return false;
             m->cpu = d.cpu; m->bus = d.bus; m->bytes = d.bytes; return true; };
-        if (!sys(&pl.gpfifo, 0x1000) || !sys(&pl.push, 0x1000) || !sys(&pl.sem, 0x1000) || !sys(&pl.mthdbuf, g_gr.mthdbuf_size)) {
+        if (!sys(&pl.gpfifo, 0x1000) || !sys(&pl.push, 0x1000) || !sys(&pl.sem, 0x1000) || !MthdbufAlloc(g_gr.mthdbuf_size, &pl.mthdbuf)) {
             o.ks("refused", "no sysmem"); o.send(); return; }
         namespace nk = nak_m4;
         const GrComputeKernel k{nk::kCode, uint32_t(sizeof(nk::kCode) / 4), nk::kQmd, uint32_t(sizeof(nk::kQmd) / 4),
@@ -1692,7 +1702,7 @@ bool NvdChanCreate(void*, uint32_t vas, uint32_t engine, uint32_t* out) {
     ch = nvd::Chan{}; ch.vas = vas; ch.chid = chid; nvd::g_dead[chid] = false;
     auto sys = [](M2Sys* m, uint32_t bytes) { DmaRegion d; if (!RmAlloc(bytes, &d)) return false;
         m->cpu = d.cpu; m->bus = d.bus; m->bytes = d.bytes; return true; };
-    if (!sys(&ch.gpfifo, 0x1000) || !sys(&ch.kpush, 0x1000) || !sys(&ch.sem, 0x1000) || !sys(&ch.mthdbuf, g_gr.mthdbuf_size ? g_gr.mthdbuf_size : 0x1000))
+    if (!sys(&ch.gpfifo, 0x1000) || !sys(&ch.kpush, 0x1000) || !sys(&ch.sem, 0x1000) || !MthdbufAlloc(g_gr.mthdbuf_size ? g_gr.mthdbuf_size : 0x1000, &ch.mthdbuf))
         return false;
     nvd::Vas& v = nvd::g_vas[vas];
     ch.va = nvd::kRingVa + uint64_t(i) * 0x10000;
@@ -1835,9 +1845,9 @@ bool NvGspHandle(const char* command) {
     else if (!strcmp(verb, "gr clear bl")) GrVerb(5);
     else if (!strcmp(verb, "gr clear hold")) GrVerb(6);
     else if (!strcmp(verb, "gr idle")) GrVerb(7);
-    else if (!strcmp(verb, "gr mthdbuf vram") || !strcmp(verb, "gr mthdbuf sys")) {
-        g_grMthdbufVram = verb[11] == 'v';
-        Out o; o.raw("{\"nv_gsp\":\"gr mthdbuf\""); o.ks("mthdbuf", g_grMthdbufVram ? "vram" : "sysmem"); o.send();
+    else if (!strcmp(verb, "gr mthdbuf vram") || !strcmp(verb, "gr mthdbuf sys") || !strcmp(verb, "gr mthdbuf sys-aligned")) {
+        g_grMthdbufVram = verb[11] == 'v'; g_mthdbufAlign = !strcmp(verb, "gr mthdbuf sys-aligned");
+        Out o; o.raw("{\"nv_gsp\":\"gr mthdbuf\""); o.ks("mthdbuf", g_grMthdbufVram ? "vram" : g_mthdbufAlign ? "sysmem, size-aligned" : "sysmem"); o.send();
     }
     else if (!strcmp(verb, "drm minobj on") || !strcmp(verb, "drm minobj off")) {
         nvd::g_minObjects = !strcmp(verb, "drm minobj on");
