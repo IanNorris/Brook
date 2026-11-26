@@ -222,7 +222,7 @@ def main():
         allowed = {'image', 'efi', 'firmware', 'desktop_pair', 'recovery_pair', 'output', 'identity',
                    'auto_desktop', 'auto_desktop_dell_initrd', 'auto_desktop_intel_provider',
                    'auto_desktop_vulkan_service', 'managed_profile', 'auto_desktop_network_module',
-                   fixture, 'bridge_v3_nic', 'bridge_v3_nic_accel'}
+                   fixture, 'bridge_v3_nic', 'bridge_v3_nic_accel', 'boot_compression_seed'}
         if (not a.auto_desktop_dell_initrd or not a.auto_desktop_network_module or
                 any(value for name, value in vars(a).items() if name not in allowed)):
             parser.error('bridge QA requires the standard guarded Dell startup fixture and matching network module')

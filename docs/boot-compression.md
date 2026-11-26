@@ -24,3 +24,25 @@ The builder option is off by default. For an isolated test, provide a private
 Compressed sets are for loader-aware offline assembly and QEMU. Existing
 remote receivers check raw ELF and FAT headers and require raw pairs. The
 ordinary Dell pair remains available at the root of the build output.
+
+## Codec comparison
+
+The OVMF benchmark used three headless QEMU/KVM boots with the same Dell
+kernel and initrd for each codec. Times are medians in milliseconds. The
+load time includes reading and decoding the file. The figures exclude signature verification
+and selector hashing.
+
+| File | Encoding | Stored bytes | Decode | Read + decode |
+|---|---|---:|---:|---:|
+| Kernel | Raw | 6,401,208 | 0 | 5.65 |
+| Kernel | LZ4 | 3,498,329 | 4.46 | 6.09 |
+| Kernel | zstd -3 | 2,504,763 | 20.30 | 21.59 |
+| Initrd | Raw | 33,554,432 | 0 | 47.50 |
+| Initrd | LZ4 | 12,086,865 | 70.55 | 74.34 |
+| Initrd | zstd -3 | 8,214,356 | 76.29 | 79.81 |
+
+LZ4 had the shortest compressed load time in this fixture and reuses the
+vendored freestanding decoder. Raw loading remained faster on QEMU's fast
+virtual disk, so the setting stays opt-in. The benchmark used the upstream
+[LZ4 block format](https://github.com/lz4/lz4/blob/v1.10.0/doc/lz4_Block_format.md)
+and the upstream [zstd single-file decoder](https://github.com/facebook/zstd/tree/v1.5.7/build/single_file_libs).
