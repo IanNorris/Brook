@@ -1,0 +1,164 @@
+{
+  "version": "1794536281",
+  "manifest": "https://client-update.steamstatic.com/steam_client_steamrt64",
+  "manifestSha256": "5516b2ff9516e39309141af4622e9cf17a06f44bf8a701c198764ec95b507568",
+  "runtime": "steamrt3c_platform_3c.0.20261103.268067",
+  "packages": [
+    {
+      "name": "tenfoot_images_all",
+      "file": "tenfoot_images_all.zip.86419c7a56c12dd107b5e0d46f50c8a9b121f3cc",
+      "bytes": 6582204,
+      "sha256": "990676bc29d01736477c6b571b5048258a6156284ef242503112fc68567cbf01"
+    },
+    {
+      "name": "steamui_websrc_all",
+      "file": "steamui_websrc_all.zip.6b12af2378a42fe50e9fc3d8b636c5679e917581",
+      "bytes": 35981544,
+      "sha256": "c4ef0ef15369de9076657e67af5b218d95d71402ed3f92a1b3d096fb06a7b69b"
+    },
+    {
+      "name": "resources_misc_all",
+      "file": "resources_misc_all.zip.99ed79ed868d732d8e9e9a45444b8f003191e3dd",
+      "bytes": 4317962,
+      "sha256": "187e562403c7544af7162e08baf7677d030ad6f60947c2cdc7dcbcbf0a7a7fe6"
+    },
+    {
+      "name": "resources_hidpi_all",
+      "file": "resources_hidpi_all.zip.a110d78e994c028dc1c412951e87a0c4e9c819f7",
+      "bytes": 98371,
+      "sha256": "5bdb97ec734f035c1d06a59b62980028b1b05b920c544ae3673b1a515d3d507e"
+    },
+    {
+      "name": "resources_all",
+      "file": "resources_all.zip.641e9eb30f1b8d771a28818779c8cbcc79e4f04b",
+      "bytes": 4302726,
+      "sha256": "711185e036f0b82efb2aa83341cfea3b2dfed511c532ae75b061b5e6d0a3d9c7"
+    },
+    {
+      "name": "strings_en_all",
+      "file": "strings_en_all.zip.feda688b91f12c45b6e576c6ca63705793617543",
+      "bytes": 114068,
+      "sha256": "920283d1b37cd256b9f9bb48a81dea72da0cf7cca86cfefcb2313d9433713146"
+    },
+    {
+      "name": "strings_all",
+      "file": "strings_all.zip.93ea36a0c61c152f06f19f63d24b61ff80bcae40",
+      "bytes": 3995770,
+      "sha256": "b0d2e3d669df3df77a005c2fad2f4e4e9f564d1b1a44ae15c3b5a0193330874e"
+    },
+    {
+      "name": "public_all",
+      "file": "public_all.zip.d42bb278ed29446f3636f529f7f779a9bfa83a97",
+      "bytes": 32358864,
+      "sha256": "0a2e5641b37e30084a457bd4e0d740f1e6c477ca779190fd6365b8f97041cb00"
+    },
+    {
+      "name": "bins_hardware_all",
+      "file": "bins_hardware_all.zip.e65a97a5ff9cc871c6eb6ce53f1b7d334ad534b6",
+      "bytes": 386536,
+      "sha256": "972b1c47706efcd9dc3bb668e9a17599d1b4300481e83697128defb97b0f5f54"
+    },
+    {
+      "name": "steamui_websrc_sounds_all",
+      "file": "steamui_websrc_sounds_all.zip.74727ca40ef88c5012bb631488fd285418dce825",
+      "bytes": 4676203,
+      "sha256": "c823bd39d234e7d9a5fdb5ec6605eae3f175e52bb847725e8826ff526a61641c"
+    },
+    {
+      "name": "steamui_websrc_movies_all",
+      "file": "steamui_websrc_movies_all.zip.40e78cdda48e9a8a74baf614e0cdc7a6b96d26d1",
+      "bytes": 10900690,
+      "sha256": "885a32533327f0fd5ea98e6c6f13552e965cab4852dad7ce9ccf3d929d726b5b"
+    },
+    {
+      "name": "bins_steamrt64",
+      "file": "bins_steamrt64.zip.3b7aed410e7a931e7accc9df1f7500be0c6d82f8",
+      "bytes": 71944568,
+      "sha256": "da0ae622e1edf52bf27337a44004b6304599305e2f5ad72713db8769a8f32a50"
+    },
+    {
+      "name": "bins_sdk_steamrt64",
+      "file": "bins_sdk_steamrt64.zip.46027cf264e6dc417a157b4affee30d5bc6b84f4",
+      "bytes": 37317236,
+      "sha256": "0d215d94d946f6c2bb7dd1beeb481977e8e2fe74e39b5ee89f46cffe25f0516f"
+    },
+    {
+      "name": "bins_codecs_steamrt64",
+      "file": "bins_codecs_steamrt64.zip.1ec7d773b8865fcdc77b55df6c8fc50de581e3a7",
+      "bytes": 17610148,
+      "sha256": "c063becb891a936503ca25b38acb3f3603ed3435136ff04d783ef265d668d64a"
+    },
+    {
+      "name": "bins_misc_steamrt64",
+      "file": "bins_misc_steamrt64.zip.1756bf75b07b75ca1a0a805a8453f8d5abd1541e",
+      "bytes": 29591060,
+      "sha256": "7a6766cbb123020a19474d45ec7d94b67862635a373ae98212f32e037b78d919"
+    },
+    {
+      "name": "bins_hardware_steamrt64",
+      "file": "bins_hardware_steamrt64.zip.da8814f3cc3788fd3789ce233dd86f107b2b244a",
+      "bytes": 10039405,
+      "sha256": "5ab880e76e725d674f877fac8728a37298903a65e7455f8fdf05a592d787e2b4"
+    },
+    {
+      "name": "miles_steamrt64",
+      "file": "miles_steamrt64.zip.2ff534200d16e16de747d01e97f3f55753839aa3",
+      "bytes": 359623,
+      "sha256": "a4ceeda568ec4336b6d7f6661cfd7e0af2956bdbcd5607359cfc93ff091c42c3"
+    },
+    {
+      "name": "sdl3_steamrt64",
+      "file": "sdl3_steamrt64.zip.fa7ba004d646c65cf35100ac870cb08fe89e311b",
+      "bytes": 16398170,
+      "sha256": "1fbcb6be71a998c7e4dcfffa68a20f60ee5380cd32a515782cb908221882aaf8"
+    },
+    {
+      "name": "steam_steamrt64",
+      "file": "steam_steamrt64.zip.8ea5134e47f09fa0112c21f401feed6c8c56f576",
+      "bytes": 4597279,
+      "sha256": "e8a89d1984cf7a8e5ab27d6311d465bd15e82f2b635f087ebac7be0c39b177ef"
+    },
+    {
+      "name": "runtime_steamrt_steamrt64",
+      "file": "runtime_steamrt_steamrt64.zip.8f4c4b537a0fa36841922b113d6d3ba93935d276",
+      "bytes": 127735561,
+      "sha256": "35d43cc145f2f2c7dfe34370f8b96e948cc0bf6c1ac79825eeca927255dc0fb2"
+    },
+    {
+      "name": "bins_steamrt_steamrt64",
+      "file": "bins_steamrt_steamrt64.zip.715133cc9027e3dc112333a3046ce884e6b303d6",
+      "bytes": 110787142,
+      "sha256": "a3e0e30239b0f24c4247379164db629729a48ab803c33bdcc9e4b508dbf9b228"
+    },
+    {
+      "name": "bins_codecs_steamrt_steamrt64",
+      "file": "bins_codecs_steamrt_steamrt64.zip.a3e8435c9a5b72d912ac0c90685c4a125f944626",
+      "bytes": 12552758,
+      "sha256": "20011077e80f243c4be9cef2434afcf98c14e0bcf4cbad84d831b1c53dfbaf82"
+    },
+    {
+      "name": "bins_misc_steamrt_steamrt64",
+      "file": "bins_misc_steamrt_steamrt64.zip.baa75862df05243875fbc0f5d9c52c6ad9ca704d",
+      "bytes": 1080650,
+      "sha256": "67b6d63efa3a70500c5668cf71d78b3bf7046133ee8700b1371c1a1680317a8a"
+    },
+    {
+      "name": "webkit_steamrt_steamrt64",
+      "file": "webkit_steamrt_steamrt64.zip.35750fdfe3ca12d3186ca7e6195a6ebc725f128e",
+      "bytes": 124952818,
+      "sha256": "3f1d0820aa994a700476dd146535fa9ec4cbc4809f6745799339bb183c49beeb"
+    },
+    {
+      "name": "sdl3_steamrt_steamrt64",
+      "file": "sdl3_steamrt_steamrt64.zip.5a8b8864d2eef2b386c6c72bb91084af257a456f",
+      "bytes": 137041,
+      "sha256": "1d96c183000638234e5c08d4af90a6e427c86ebea39b3d31041cc514cbf09f91"
+    },
+    {
+      "name": "steam_steamrt_steamrt64",
+      "file": "steam_steamrt_steamrt64.zip.77d2f4ba16eb3e03e900484d817ad0754f628193",
+      "bytes": 4734637,
+      "sha256": "8750ea51f0542a4900502e80a99865c010ba6e674009747f82a1f76ee421ba2e"
+    }
+  ]
+}

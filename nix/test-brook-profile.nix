@@ -63,6 +63,11 @@ assert !(resolve {
 assert !(resolve { allowUnfree = true; }).redistributable;
 assert rejects (resolve { allowUnfree = true; publicRelease = true; });
 assert rejects ((profile { apps = [ "steam" ]; }).manifest);
+assert rejects ((profile { apps = [ "steam" ]; allowUnfree = true; publicRelease = true; }).manifest);
+assert rejects ((profile { extraPackageNames = [ "steam" ]; allowUnfree = true; }).manifest);
+assert !(profile { apps = [ "steam" ]; allowUnfree = true; }).manifest.redistributable;
+assert (profile { apps = [ "steam" ]; allowUnfree = true; }).manifest.launcherIds
+  == [ "brook-settings" "org.brook.TaskManager" "brook-hardware-steam" ];
 assert rejects ((profile { extraPackageNames = [ "no-such-brook-test-package" ]; }).manifest);
 assert rejects ((profile { extraPackageNames = [ "lib" ]; }).manifest);
 assert rejects ((profile { extraPackageNames = [ "pkgsCross.aarch64-multiplatform.hello" ]; }).manifest);

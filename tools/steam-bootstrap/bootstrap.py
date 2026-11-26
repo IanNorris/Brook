@@ -169,6 +169,34 @@ def enable_steamrt64(client):
         pass
 
 
+def adapt_client(client, patchelf, loader):
+    """Adapt the pinned upstream client to Brook's executable paths."""
+    patched = 0
+    for path in client.rglob('*'):
+        if path.is_symlink() or not path.is_file():
+            continue
+        if has_interpreter(path):
+            subprocess.run([patchelf, '--set-interpreter', loader, str(path)], check=True)
+            patched += 1
+        else:
+            with path.open('rb') as f:
+                first = f.readline(256)
+            if first.rstrip(b'\r\n') in (b'#!/bin/bash', b'#!/usr/bin/env bash'):
+                data = path.read_bytes()
+                path.write_bytes(b'#!/nix/profile/bin/bash\n' + data[len(first):])
+    enable_steamrt64(client)
+    # These two scripts execute on Brook before SteamRT creates its own
+    # filesystem, where /bin/sh is available. Leave container scripts alone.
+    runtime = client / 'steamrt64/pv-runtime/steam-runtime-steamrt'
+    for relative in ('run', 'pressure-vessel/bin/pressure-vessel-unruntime'):
+        path = runtime / relative
+        if path.is_file() and not path.is_symlink():
+            data = path.read_bytes()
+            if data.startswith(b'#!/bin/sh\n'):
+                path.write_bytes(b'#!/nix/profile/bin/sh\n' + data[len(b'#!/bin/sh\n'):])
+    return patched
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--home', type=Path, default=Path('/data/home/steam-20261022'))
@@ -200,29 +228,7 @@ def main():
         if package.stat().st_size != size or actual != digest:
             raise ValueError('Steam package size or hash mismatch: ' + name)
         expanded, members = extract(package, client, expanded, members); package.unlink()
-    patched = 0
-    for path in client.rglob('*'):
-        if path.is_symlink() or not path.is_file():
-            continue
-        if has_interpreter(path):
-            subprocess.run([args.patchelf, '--set-interpreter', args.loader, str(path)], check=True)
-            patched += 1
-        else:
-            with path.open('rb') as f:
-                first = f.readline(256)
-            if first.rstrip(b'\r\n') in (b'#!/bin/bash', b'#!/usr/bin/env bash'):
-                data = path.read_bytes()
-                path.write_bytes(b'#!/nix/profile/bin/bash\n' + data[len(first):])
-    enable_steamrt64(client)
-    # These two scripts execute on Brook before SteamRT creates its own
-    # filesystem, where /bin/sh is available. Leave container scripts alone.
-    runtime = client / 'steamrt64/pv-runtime/steam-runtime-steamrt'
-    for relative in ('run', 'pressure-vessel/bin/pressure-vessel-unruntime'):
-        path = runtime / relative
-        if path.is_file() and not path.is_symlink():
-            data = path.read_bytes()
-            if data.startswith(b'#!/bin/sh\n'):
-                path.write_bytes(b'#!/nix/profile/bin/sh\n' + data[len(b'#!/bin/sh\n'):])
+    patched = adapt_client(client, args.patchelf, args.loader)
     hostlibs = client / 'hostlibs'; hostlibs.mkdir(exist_ok=True)
     exports = Path('/nix/profile/lib')
     if exports.is_dir():

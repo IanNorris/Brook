@@ -30,7 +30,7 @@ let
     mousepad = import ./apps/mousepad.nix { inherit pkgs; };
     qalculate = import ./apps/qalculate.nix { inherit pkgs; };
     quake2 = legacy "Quake II" "Launcher only; the engine and OpenAL come from a separately staged closure.";
-    steam = legacy "Steam" "Launcher uses the existing installation in the user's home.";
+    steam = import ./apps/steam.nix { inherit pkgs; };
     vscodium = legacy "VSCodium" "Launcher only; the application comes from a separately staged closure.";
   };
   apps = lib.mapAttrs (id: entry: defaults // entry // { inherit id; }) entries;
