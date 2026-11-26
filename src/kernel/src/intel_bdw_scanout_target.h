@@ -190,6 +190,8 @@ struct BdwZeroCopyVerify {
 };
 bool BdwZeroCopyVerifyFront(BdwZeroCopyVerify& out);
 
+#endif
+#if (defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)) || defined(BROOK_TEST_LIVE_CAPTURE)
 // Debug screenshot of what primary plane A is fetching (DSPASURFLIVE).
 // Compositor thread, inside its scanout mapping lock. Gop: the plane shows
 // the firmware GOP (or no flip path ever moved it), so read the GOP

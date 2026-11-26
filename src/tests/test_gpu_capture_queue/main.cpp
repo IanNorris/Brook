@@ -5,6 +5,7 @@
 #include <mutex>
 #include <chrono>
 #include <atomic>
+#define BROOK_TEST_LIVE_CAPTURE 1
 #include "../../kernel/src/compositor.cpp"
 #include "../../kernel/src/desktop_frame_scenes.h"
 
@@ -59,6 +60,17 @@ bool TscClockAvailable(){return false;}
 uint64_t TscClockReadNs(){return 0;}
 bool protectedWindows;
 uint64_t WmCaptureProtectionEpoch() { return protectedWindows; }
+bool fakeLivePlane = false;
+BdwScanoutCaptureKind BdwScanoutCaptureLive(uint32_t* dest, uint32_t width, uint32_t height,
+                                         BdwScanoutCaptureInfo& info, uint64_t)
+{
+    info = {};
+    if (!fakeLivePlane) return BdwScanoutCaptureKind::Gop;
+    info.plane = BROOK_DEBUG_FRAME_PLANE_CLIENT;
+    for (uint32_t i = 0; i < width * height; ++i) dest[i] = 0xff123456;
+    return BdwScanoutCaptureKind::Copied;
+}
+bool BdwScanoutCaptureCursor(uint32_t*, uint32_t, uint32_t) { return false; }
 uint32_t WmGetCaptureMasks(CaptureMaskRect* out)
 {
     out[0] = {2, 1, 3, 2};
@@ -549,6 +561,20 @@ int main() {
     CompositorReleasePresentLease(42);
     CompositorFlipSoftware();
     protectedWindows = false;
+    fakeLivePlane = true;
+    for (const bool writer : {true, false}) {
+        g_gopWriter = writer ? 1 : 0;
+        g_scanoutNeedsRepair = !writer;
+        const auto direct = CompositorRequestDebugFrame(77);
+        CaptureCompletedDebugFrame(46, {g_physFb, 8, 6, 8});
+        const auto result = CompositorDebugFrameStatus(direct.token, 77);
+        CHECK(result.state == DebugFrameState::Ready && result.source == BROOK_DEBUG_FRAME_SOURCE_DIRECT_CLIENT);
+        CHECK(capturedPixels[0] == 0xff123456);
+        CHECK(CompositorReleaseDebugFrame(direct.token, 77));
+    }
+    fakeLivePlane = false;
+    g_gopWriter = 0;
+    g_scanoutNeedsRepair = false;
     g_backBuffer=nullptr;
     uint32_t overlayPixels[48]{};g_debugFrameBuffer=VirtualAddress(reinterpret_cast<uint64_t>(overlayPixels));g_debugFramePages=1;
     auto overlay=CompositorRequestDebugFrame(77,true);CHECK(overlay.state==DebugFrameState::Pending && overlay.token);

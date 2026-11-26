@@ -196,6 +196,7 @@ struct Window
     bool        focused;
     bool        visible;
     bool        captureExcluded; // latched for the lifetime of the window
+    uint64_t    captureParent;   // creation identity of a separately published popup parent
     bool        minimized;      // hidden from desktop, shown in taskbar
     bool        noChrome;       // CSD: client draws own chrome; WM skips title/border
     // CSD only: the WM still draws and owns its caption buttons over the
@@ -699,7 +700,7 @@ WmContentSnapshot WmSnapshotContent(uint32_t slot);
 void WmAcknowledgeContent(uint32_t slot,const WmContentSnapshot& uploaded);
 bool WmSetAppIdById(Process* proc, uint32_t wmId, const char* appId);
 
-void WmSetTitleById(Process* proc, uint32_t wmId, const char* title);
+void WmSetTitleById(Process* proc, uint32_t wmId, const char* title, bool incomplete = false);
 
 // Resize an existing WM-API window's VFB to (newW × newH).  Allocates fresh
 // kernel pages, zeros them, unmaps the old user-side mapping, and maps the

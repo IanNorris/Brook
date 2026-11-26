@@ -61,6 +61,25 @@ inline bool CapturePolicyMatches(const char* rules, const char* appId, const cha
     return false;
 }
 
+// Called while the WM owns the window table. The latch makes the walk
+// bounded even if a provider supplies a cycle. Creation identities survive
+// slot reuse without accidentally binding an old popup to a new window.
+template<class WindowType, unsigned Count>
+bool LatchCaptureExclusion(WindowType (&windows)[Count], WindowType& window)
+{
+    if (window.captureExcluded) return false;
+    window.captureExcluded = true;
+    for (auto& child : windows)
+        if (child.proc && child.captureParent == window.creationIdentity)
+            LatchCaptureExclusion(windows, child);
+    return true;
+}
+
+inline const char* CaptureShellLabel(bool excluded, const char* title)
+{
+    return excluded ? "Private window" : title;
+}
+
 struct CaptureMaskRect {
     int32_t x, y;
     uint32_t width, height;

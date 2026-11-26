@@ -7,8 +7,11 @@ lasts until that surface is destroyed. Its xdg-popup descendants inherit it.
 
 Add rules to `/etc/capture-exclude.conf` with an app ID glob, a tab, and a title
 glob per line. Both patterns must match. Patterns use ASCII case-insensitive
-matching with `*` and `?`. A line starting with `#` is a comment. Restart the
-desktop to load edits. The first match latches the exclusion for the window.
+matching with `*` and `?`. A line starting with `#` is a comment. Reboot to
+load edits. The first match latches the exclusion for the window and its
+popups. Subsurface pixels inherit the root surface's protection. Titles are
+matched before shortening the display label. An oversized policy title
+latches exclusion.
 
 Built-in rules cover KeePassXC, GNOME Secrets, and browser title hints.
 Firefox's English private title can be detected when the suffix is present

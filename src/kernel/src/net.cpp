@@ -6425,8 +6425,12 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",\"address\":\"0x");r.number(frame.address,true);r.text("\",");
         r.field("width",frame.width);r.text(",");r.field("height",frame.height);r.text(",");r.field("stride",frame.stride);
         r.text(",");r.field("frame_tick_ms",frame.tick);r.text(",");r.field("frame_epoch",frame.epoch);
-        // Raw framebuffer access cannot verify which window pixels survived a panic.
-        r.text(",\"panic_address\":\"0x0\",\"panic_stride\":0}\n");r.send();return;
+        // Raw panic capture can be offered only before any exclusion has
+        // been armed, because the surviving pixels have no scene metadata.
+        uint32_t panicStride=0;
+        const auto* panicFrame=WmCaptureProtectionEpoch()?nullptr:CompositorGetPhysFb(&panicStride);
+        r.text(",\"panic_address\":\"0x");r.number(reinterpret_cast<uint64_t>(panicFrame),true);
+        r.text("\",");r.field("panic_stride",panicStride);r.text("}\n");r.send();return;
     }
     if (StrStartsWith(cmd,"bridge frame release ")) {
         uint32_t token=0;const char* argument=cmd+21;

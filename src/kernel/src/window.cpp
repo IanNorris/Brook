@@ -74,6 +74,7 @@
 #include "memory/heap.h"
 #include "mem_tag.h"
 #include "string.h"
+#include "../../shared/wm_input_abi.h"
 
 namespace brook {
 
@@ -91,32 +92,19 @@ static void LoadCapturePolicy()
 {
     Vnode* vn = VfsOpen("/etc/capture-exclude.conf", 0);
     if (!vn) return;
+    VnodeStat st{};
     uint64_t offset = 0;
-    const int size = VfsRead(vn, g_capturePolicy, sizeof(g_capturePolicy), &offset);
+    const int size = !VfsStat(vn, &st) && !st.isDir && st.size < sizeof(g_capturePolicy) ?
+        VfsRead(vn, g_capturePolicy, st.size, &offset) : -1;
     VfsClose(vn);
-    if (size < 0 || size >= static_cast<int>(sizeof(g_capturePolicy))) {
+    if (size < 0 || static_cast<uint64_t>(size) != st.size) {
         g_capturePolicy[0] = 0;
-        SerialPuts("WM: capture-exclude.conf unreadable or too large\n");
+        SerialPuts("WM: capture-exclude.conf unreadable, incomplete or too large\n");
         return;
     }
     g_capturePolicy[size] = 0;
 }
 
-static void ExcludeWindowFromCapture(Window& window)
-{
-    if (window.captureExcluded) return;
-    window.captureExcluded = true;
-    __atomic_add_fetch(&g_captureProtectionEpoch, 1, __ATOMIC_RELEASE);
-    CompositorMarkSceneChanged();
-    CompositorWake();
-}
-
-static void ApplyCapturePolicy(Window& window)
-{
-    if (CapturePolicyMatches(DefaultCapturePolicy, window.appId, window.title) ||
-        CapturePolicyMatches(g_capturePolicy, window.appId, window.title))
-        ExcludeWindowFromCapture(window);
-}
 struct VfbGuard {
     VfbGuard() { KMutexLock(&g_vfbLock); }
     ~VfbGuard() { KMutexUnlock(&g_vfbLock); }
@@ -480,6 +468,25 @@ static void WmRestoreTheme()
 }
 
 static Window   g_windows[WM_MAX_WINDOWS] = {};
+// Policy inputs are independent of the short display strings copied into
+// frame snapshots. Each slot is overwritten when a window is created.
+static char g_captureTitles[WM_MAX_WINDOWS][BROOK_WM_POLICY_TITLE_BYTES];
+
+static void ExcludeWindowFromCapture(Window& window)
+{
+    if (!LatchCaptureExclusion(g_windows, window)) return;
+    __atomic_add_fetch(&g_captureProtectionEpoch, 1, __ATOMIC_RELEASE);
+    CompositorMarkSceneChanged();
+    CompositorWake();
+}
+
+static void ApplyCapturePolicy(Window& window)
+{
+    const char* title = g_captureTitles[window.wmId - 1];
+    if (CapturePolicyMatches(DefaultCapturePolicy, window.appId, title) ||
+        CapturePolicyMatches(g_capturePolicy, window.appId, title))
+        ExcludeWindowFromCapture(window);
+}
 static bool     g_wmActive = false;
 static int      g_focusedIdx = -1;
 static uint64_t g_windowIdentity = 0;
@@ -1181,6 +1188,7 @@ static int CreateWindowLocked(Process* proc, int16_t x, int16_t y,
     w.fineScroll = false;
     w.idleInhibitors = 0;
     w.captureExcluded = false;
+    w.captureParent = 0;
     w.publicationGeneration=w.publishedGeneration=1;
     w.clientPid=proc?(proc->tgid?proc->tgid:proc->pid):0;
     w.clientIncarnation=proc?(proc->isThread?proc->leaderIncarnation:proc->incarnation):0;
@@ -1231,6 +1239,7 @@ static int CreateWindowLocked(Process* proc, int16_t x, int16_t y,
     w.inputTail = 0;
     w.inputDropCount = 0;
     WmStrCopy(w.title, title ? title : "Window", sizeof(w.title));
+    WmStrCopy(g_captureTitles[idx], title ? title : "Window", sizeof(g_captureTitles[idx]));
 
     SerialPrintf("WM: created window %d '%s' at (%d,%d) %ux%u scale=%u for pid %u\n",
                  idx, w.title, x, y, clientW, clientH, upscale, proc ? proc->pid : 0);
@@ -1819,7 +1828,9 @@ bool WmMoveWindowRelativeToParent(Process* proc, uint32_t wmId,
     VfbGuard guard;
     Window* child = WmFindWindowById(proc, wmId);
     Window* parent = WmFindWindowById(proc, parentWmId);
-    if (!child || !parent) return false;
+    if (!child || !parent || child == parent) return false;
+    child->captureParent = parent->creationIdentity;
+    if (parent->captureExcluded) ExcludeWindowFromCapture(*child);
 
     int32_t clientX = parent->clientX();
     int32_t clientY = parent->clientY();
@@ -4059,12 +4070,14 @@ bool WmRegisterClientOrigin(Process* provider,uint32_t wmId,uint16_t clientPid,
     CompositorWake();return true;
 }
 
-void WmSetTitleById(Process* proc, uint32_t wmId, const char* title)
+void WmSetTitleById(Process* proc, uint32_t wmId, const char* title, bool incomplete)
 {
     VfbGuard guard;
     Window* w = WmFindWindowById(proc, wmId);
     if (!w || !title) return;
     WmStrCopy(w->title, title, sizeof(w->title));
+    WmStrCopy(g_captureTitles[wmId - 1], title, sizeof(g_captureTitles[0]));
+    if (incomplete) ExcludeWindowFromCapture(*w);
     ApplyCapturePolicy(*w);
     LauncherReadGuard catalog;
     RefreshWebAppTitle(*w, catalog.get());

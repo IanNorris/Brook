@@ -669,7 +669,10 @@ static void WmCaptureDock(uint32_t screenW, uint32_t screenH, int32_t mouseX, in
         const int idx = g_dock.entries[i];
         WmCaptureShellIcon(snapshot.icons[i], WindowIcon(g_windows[idx], icons.get()));
     }
-    if (l.selected >= 0) WmStrCopy(snapshot.text, WindowDisplayTitle(g_windows[g_dock.entries[l.selected]]), sizeof(snapshot.text));
+    if (l.selected >= 0) {
+        const auto& window = g_windows[g_dock.entries[l.selected]];
+        WmStrCopy(snapshot.text, CaptureShellLabel(window.captureExcluded, WindowDisplayTitle(window)), sizeof(snapshot.text));
+    }
     const bool hovered = l.open && (l.strip.contains(mouseX, mouseY) || l.grip.contains(mouseX, mouseY));
     snapshot.mouseX = hovered ? mouseX : -1;
     snapshot.mouseY = hovered ? mouseY : -1;

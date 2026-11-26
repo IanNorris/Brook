@@ -13,6 +13,8 @@ struct FakeWm {
     bool exists=false;
     bool fineScroll=false;
     bool captureExcluded=false;
+    bool incompleteTitle=false;
+    uint32_t policyTitleLength=0;
     unsigned creates=0,destroys=0,titles=0,resizes=0,decorationChanges=0;
     BrookCaptionStrip captionStrip{};
     char title[64]{};
@@ -45,7 +47,11 @@ void WmSetClientSideDecoration(int,bool,bool,uint16_t,uint16_t,uint16_t,uint32_t
     g_wm.captionStrip = strip ? *strip : BrookCaptionStrip{};
 }
 void WmDestroyWindowById(Process*,uint32_t) { ++g_wm.destroys;g_wm.exists=false; }
-void WmSetTitleById(Process*,uint32_t,const char* title) { ++g_wm.titles;for(int i=0;i<64;++i)g_wm.title[i]=title[i]; }
+void WmSetTitleById(Process*,uint32_t,const char* title,bool incomplete) {
+    ++g_wm.titles;g_wm.policyTitleLength=strlen(title);g_wm.incompleteTitle=incomplete;
+    for(int i=0;i<63;++i)g_wm.title[i]=title[i];
+    g_wm.title[63]=0;
+}
 int WmResizeVfbForProcess(Process*,uint32_t wmId,uint16_t,uint16_t,WmCreateWindowResult* out) {
     ++g_wm.resizes;out->wmId=wmId;out->vfbStride=8192;out->vfbUser=reinterpret_cast<void*>(0x50000000);return 0;
 }
@@ -147,7 +153,7 @@ static void SetTitle() {
         text[length]=0;
         CHECK(brook::sys_brook_wm_set_title(3,UserAddress(2*PageSize),0,0,0,0)==0);
         uint32_t stored=0;while(stored<64 && g_wm.title[stored])++stored;
-        CHECK(stored==63);
+        CHECK(stored==63 && g_wm.policyTitleLength==length && !g_wm.incompleteTitle);
     }
 }
 

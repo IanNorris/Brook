@@ -51,13 +51,12 @@ struct BrookWmCreateOut {
     uint64_t vfbUser;
 };
 
-// Window titles are bounded at 63 bytes. A longer user string is truncated
-// (the terminated prefix is kept), as the byte loop did before; an
-// inaccessible or kernel pointer is -EFAULT.
-static int64_t CopyWindowTitle(uint64_t address, char (&title)[64])
+// Read the policy title before the WM truncates the display label.
+static int64_t CopyWindowTitle(uint64_t address, char (&title)[BROOK_WM_POLICY_TITLE_BYTES], bool& incomplete)
 {
     const int result = CopyUserCStringResult(address, title, sizeof(title));
-    return result == -36 ? 0 : result;
+    incomplete = result == -36; // ENAMETOOLONG
+    return incomplete ? 0 : result;
 }
 
 static int64_t CopyCreateOut(uint64_t outPtr, const WmCreateWindowResult& res)
@@ -78,9 +77,10 @@ int64_t sys_brook_wm_create_window(uint64_t cW, uint64_t cH,
     if (cW == 0 || cH == 0 || cW > 0xFFFF || cH > 0xFFFF) return -EINVAL;
     if (!outPtr) return -EFAULT;
 
-    char titleBuf[64] = {};
+    char titleBuf[BROOK_WM_POLICY_TITLE_BYTES] = {};
+    bool incomplete = false;
     if (titlePtr) {
-        if (int64_t error = CopyWindowTitle(titlePtr, titleBuf)) return error;
+        if (int64_t error = CopyWindowTitle(titlePtr, titleBuf, incomplete)) return error;
     }
 
     if (flags & ~(7ull | BROOK_WM_CREATE_FLAG_FINE_SCROLL | BROOK_WM_CREATE_FLAG_CAPTURE_EXCLUDED)) return -EINVAL;
@@ -94,7 +94,7 @@ int64_t sys_brook_wm_create_window(uint64_t cW, uint64_t cH,
                                                  titlePtr ? titleBuf : nullptr,
                                                  focusable, (flags & 4u) != 0,
                                                  (flags & BROOK_WM_CREATE_FLAG_FINE_SCROLL) != 0,
-                                                 (flags & BROOK_WM_CREATE_FLAG_CAPTURE_EXCLUDED) != 0);
+                                                 incomplete || (flags & BROOK_WM_CREATE_FLAG_CAPTURE_EXCLUDED));
     if (res.wmId == 0) return -ENOMEM;
     if (flags & 1u) {
         brook::WmSetClientSideDecoration(static_cast<int>(res.wmId) - 1, true);
@@ -364,21 +364,22 @@ int64_t sys_brook_wm_set_title(uint64_t wmId, uint64_t titlePtr,
     Process* proc = ProcessCurrent();
     if (!proc) return -ESRCH;
     if (wmId == 0 || !titlePtr) return -EINVAL;
-    char buf[64] = {};
-    if (int64_t error = CopyWindowTitle(titlePtr, buf)) return error;
+    char buf[BROOK_WM_POLICY_TITLE_BYTES] = {};
+    bool incomplete = false;
+    if (int64_t error = CopyWindowTitle(titlePtr, buf, incomplete)) return error;
+    brook::WmSetTitleById(proc, static_cast<uint32_t>(wmId), buf, incomplete);
     {
         extern volatile uint64_t g_blockCacheHits;
         extern volatile uint64_t g_blockCacheMisses;
-        SerialPrintf("[PROFILE] set_title t=%lums pid=%u '%s'"
+        SerialPrintf("[PROFILE] set_title t=%lums pid=%u"
                      " opens=%lu mmaps=%lu faults=%lu"
                      " cache_hit=%lu cache_miss=%lu preloaded=%lu"
                      " blkcache_hit=%lu blkcache_miss=%lu\n",
-                     ApicTickCount(), proc->pid, buf,
+                     ApicTickCount(), proc->pid,
                      g_profOpenCount, g_profMmapCount, g_profFaultCount,
                      g_profCacheHit, g_profCacheMiss, g_profPreloadPages,
                      g_blockCacheHits, g_blockCacheMisses);
     }
-    brook::WmSetTitleById(proc, static_cast<uint32_t>(wmId), buf);
     return 0;
 }
 

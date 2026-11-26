@@ -49,7 +49,7 @@
 #include "display_power.h"
 #include "display_output.h"
 #include "shell_output_layout.h"
-#if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
+#if (defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)) || defined(BROOK_TEST_LIVE_CAPTURE)
 #include "intel_bdw_scanout_target.h"
 #endif
 #include "gpu_compositor.h"
@@ -545,10 +545,9 @@ DebugFrameSnapshot CompositorRequestDebugFrameOptions(uint64_t owner,uint32_t fl
         return CompositorRequestDebugFrame(owner, false, true, flags, windowId, windowIncarnation);
     }
     // The window's CPU buffer is copied now; the lease then behaves exactly
-    // like a completed screen capture. The WM buffer lock is never taken
-    // inside the capture lock: reserve the lease, copy under the WM lock
-    // alone (the reserved lease keeps every other writer off the buffer),
-    // then publish.
+    // like a completed screen capture. When both locks are held, acquire
+    // g_debugFrameLock before the WM buffer lock. Reserve the lease first,
+    // then copy under the WM lock alone to avoid blocking frame status reads.
     DebugFrameSnapshot failed{};failed.state=DebugFrameState::Failed;
     uint32_t width=0,height=0,scale=1;
     int result=WmCopyDebugWindowBuffer(windowId,windowIncarnation,nullptr,0,&width,&height,&scale);
@@ -717,13 +716,12 @@ static void CaptureCompletedDebugFrame(uint64_t epoch,const DebugFrameGeometry& 
     }
     uint32_t width=presented.width,height=presented.height,stride=presented.stride;
     const bool gpuFrame = !softwareFrame && CompositorGpuActive();
-    if (g_gopWriter || g_scanoutNeedsRepair) return;
     // The legacy GPU interface cannot attest which scene is in its readback.
     if (protectedScene && gpuFrame) return;
     const bool cursor=(g_debugFrameFlags&BROOK_DEBUG_FRAME_FLAG_CURSOR)!=0;
     uint32_t plane=BROOK_DEBUG_FRAME_PLANE_UNREAD,infoFlags=0;
     BdwScanoutCaptureInfoCompat planeInfo{};
-#if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
+#if (defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)) || defined(BROOK_TEST_LIVE_CAPTURE)
     // Read what the panel shows: zero-copy renderer images, kernel flip
     // buffers and direct client buffers replace the GOP on primary plane A.
     if (!gpuFrame && width<=4096 && height<=2160) {
@@ -756,6 +754,9 @@ static void CaptureCompletedDebugFrame(uint64_t epoch,const DebugFrameGeometry& 
         if (protectedScene && kind!=BdwScanoutCaptureKind::Gop) return;
     }
 #endif
+    // A GOP repair or writer blocks only the GOP fallback. A pinned live
+    // hardware plane is independent and has its own capture validation.
+    if (g_gopWriter || g_scanoutNeedsRepair) return;
     const bool leased=g_scanoutContainsLeasedFrame;
     if (protectedScene && (leased ? !g_leasedFramePrivacy.permits(protectionEpoch) :
         (!captureScene || captureScene != __atomic_load_n(&g_captureSceneRevision, __ATOMIC_ACQUIRE)))) return;

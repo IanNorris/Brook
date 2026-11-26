@@ -483,7 +483,7 @@ struct brook_surface {
     uint32_t trace_request_max_ms, trace_committed_max_ms;
 
     /* Latest set_title — copied so it survives the wayland string. */
-    char title[64];
+    char title[BROOK_WM_POLICY_TITLE_BYTES];
     char app_id[128]; /* xdg identity; independent of the document/window title */
 
     /* Kernel Window backing this xdg_toplevel.  Created lazily on the
@@ -636,7 +636,7 @@ static void latency_commit(struct brook_surface *s, struct wl_client *client) {
 
 static int g_drm_fd = -1;
 static int g_drm_intel;
-static void popup_apply_position(struct brook_surface *);
+static int popup_apply_position(struct brook_surface *);
 static int xwayland_surface_ready(const struct brook_surface *);
 static unsigned xwayland_surface_flags(const struct brook_surface *);
 static void xwayland_surface_created(struct brook_surface *);
@@ -767,12 +767,12 @@ static void positioner_compute_geometry(const struct brook_positioner *p,
     *out_h = ph;
 }
 
-static void popup_apply_position(struct brook_surface *s) {
+static int popup_apply_position(struct brook_surface *s) {
     if (!s || !s->xdg_popup || !s->wm_id || !s->popup_parent || !s->popup_parent->wm_id)
-        return;
+        return 0;
     const int64_t scale=surface_output_scale(s);
     int64_t px=(int64_t)s->popup_x*scale,py=(int64_t)s->popup_y*scale;
-    if (px<INT32_MIN || px>INT32_MAX || py<INT32_MIN || py>INT32_MAX) return;
+    if (px<INT32_MIN || px>INT32_MAX || py<INT32_MIN || py>INT32_MAX) return 0;
     long rc = wm_move_relative(s->wm_id, s->popup_parent->wm_id, (int32_t)px, (int32_t)py);
     if (rc != 0) {
         fprintf(stderr, "[waylandd] WM_MOVE_RELATIVE popup=%u parent=%u at (%d,%d) failed rc=%ld errno=%d\n",
@@ -781,6 +781,7 @@ static void popup_apply_position(struct brook_surface *s) {
         fprintf(stderr, "[waylandd] WM_MOVE_RELATIVE popup=%u parent=%u at (%d,%d)\n",
                 s->wm_id, s->popup_parent->wm_id, s->popup_x, s->popup_y);
     }
+    return rc == 0;
 }
 
 static void on_sigint(int sig) { (void)sig; g_shutdown = 1; }
@@ -1599,9 +1600,11 @@ static void xdg_toplevel_set_title(struct wl_client *c, struct wl_resource *r,
     (void)c;
     struct brook_surface *s = wl_resource_get_user_data(r);
     if (!s || !title) return;
+    if (strlen(title) >= sizeof(s->title)) s->capture_excluded = 1;
     snprintf(s->title, sizeof(s->title), "%s", title);
-    if (s->wm_id) wm_set_title(s->wm_id, s->title);
-    fprintf(stderr, "[waylandd] xdg_toplevel.set_title: %s\n", s->title);
+    // Let the kernel see the original string so its bound check and
+    // privacy update happen together on an already mapped window.
+    if (s->wm_id) wm_set_title(s->wm_id, title);
 }
 static void deco_apply_mode(struct wl_resource *r, int csd);
 static int deco_force_server_side(const struct brook_surface *s);
