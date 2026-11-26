@@ -1567,6 +1567,17 @@ template <class F> bool NvdWithRm(const char* what, F f) {
     SpinLockRelease(lock);
     return ok;
 }
+// Full MMU invalidate (all VA, all PDB, hub + GPC TLBs) after renderD130 PTE writes; BAR1 keeps
+// the HUB_ONLY form (Bar1FlushInvalidate). NV_PFB_PRI_MMU_INVALIDATE: ALL_VA 0, ALL_PDB 1, HUBTLB_ONLY 2, TRIGGER 31.
+bool NvdMmuInvalidate(const ChipOps& c, uint64_t pdb) {
+    g_bus.wr32(c.reg_fb_flush, 1);
+    for (uint32_t i = 0; i < 2000 && (g_bus.rd32(c.reg_fb_flush) & 2); ++i) g_bus.udelay(1);
+    g_bus.wr32(c.reg_mmu_inval_pdb_lo, uint32_t(pdb >> 8));
+    g_bus.wr32(c.reg_mmu_inval_pdb_hi, 0);
+    g_bus.wr32(c.reg_mmu_inval_trigger, 0x80000000u | 0x3);
+    for (uint32_t i = 0; i < 200000; ++i) { if (!(g_bus.rd32(c.reg_mmu_inval_trigger) & 0x80000000u)) return true; g_bus.udelay(10); }
+    return false;
+}
 void NvdMarkDead(uint32_t chid) { if (chid >= nvd::kChidFirst && chid < nvd::kChidFirst + nvd::kChidCount) nvd::g_dead[chid] = true; }
 
 bool NvdVramAlloc(void*, uint64_t bytes, uint64_t align, uint64_t* pa) {
@@ -1635,7 +1646,7 @@ bool NvdVasUnmap(void*, uint32_t vas, uint64_t va, uint64_t bytes, bool sparse) 
 }
 bool NvdVasFlush(void*, uint32_t vas) {
     if (vas >= nvd::kMaxVas || !nvd::g_vas[vas].used) return false;
-    return NvdWithRm("MMU invalidate", [&](auto&, auto&, const ChipOps& c) { return Bar1FlushInvalidate(g_bus, c, nvd::g_vas[vas].s.root); });
+    return NvdWithRm("MMU invalidate", [&](auto&, auto&, const ChipOps& c) { return NvdMmuInvalidate(c, nvd::g_vas[vas].s.root); });
 }
 
 bool NvdChanCreate(void*, uint32_t vas, uint32_t engine, uint32_t* out) {
@@ -1655,7 +1666,7 @@ bool NvdChanCreate(void*, uint32_t vas, uint32_t engine, uint32_t* out) {
     nvd::Vas& v = nvd::g_vas[vas];
     ch.va = nvd::kRingVa + uint64_t(i) * 0x10000;
     GrScope& s = ch.s;
-    s.base = v.s.base; s.chid = chid; s.external = true; s.priv = false; s.h_vas = v.s.h_vas;   // user channels: unprivileged (nouveau r535)
+    s.base = v.s.base; s.chid = chid; s.external = true; s.priv = true; s.h_vas = v.s.h_vas;   // unprivileged channels hung their first RM_FREE (gsp16d/e)
     s.h_chan = v.s.base + 0x100 + i * 0x10; s.gpfifo_va = ch.va; s.va_next = nvd::kCtxVa + (uint64_t(i) << 32);
     const bool ok = NvdWithRm("CHANNEL_ALLOC", [&](auto& x, auto& vio, const ChipOps& c) {
         namespace h = rm::host;
@@ -1663,6 +1674,7 @@ bool NvdChanCreate(void*, uint32_t vas, uint32_t engine, uint32_t* out) {
                 return b.Map(ch.va, ch.gpfifo.bus, 0x1000, 12, Aperture::SysCoh, 0, true) &&
                        b.Map(ch.va + 0x1000, ch.kpush.bus, 0x1000, 12, Aperture::SysCoh, 0, true) &&
                        b.Map(ch.va + 0x2000, ch.sem.bus, 0x1000, 12, Aperture::SysCoh, 0, true); })) return false;
+        if (!NvdMmuInvalidate(c, v.s.root)) return x.fail("MMU invalidate (rings)");
         // the channel scope shares the VAS page tables (context buffers map into the same root)
         s.root = v.s.root; s.lpt_page = v.s.lpt_page; s.lpt_off = v.s.lpt_off; s.lpt_aper = v.s.lpt_aper;
         uint32_t entries = 0;
