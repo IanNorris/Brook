@@ -1324,8 +1324,10 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         // RTX DP sink idle-off (gated by /etc/dp-idle-seconds or bridge command).
         brook::DpIdleStart();
 #if defined(BROOK_NV_DISPLAY)
-        // RTX head-0 flip presentation (gated by /etc/nv-display).
-        brook::NvDisplayDesktopStart();
+        // RTX head-0 flip presentation (gated by /etc/nv-display). Not on a headless boot:
+        // with no GOP nothing is lit and the display engine is left alone (no GSP autostart).
+        if (brook::BootIsHeadless(bootProtocol)) brook::KPuts("BOOT: headless (no GOP at boot); display bring-up skipped\n");
+        else brook::NvDisplayDesktopStart();
 #endif
 
         // Start debug channel kernel thread (connects asynchronously).

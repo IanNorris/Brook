@@ -10,6 +10,23 @@ namespace brook
 namespace bootloader
 {
 
+// No GOP: a 1920x1080 BGRX surface in EfiReservedMemoryType pages (Reserved to the
+// kernel, never reclaimed), zeroed. Nothing scans it out.
+bool HeadlessFramebuffer(EFI_BOOT_SERVICES* bootServices, brook::Framebuffer& outFramebuffer)
+{
+    constexpr UINT32 w = 1920, h = 1080;
+    const UINTN pages = (UINTN(w) * h * 4 + 4095) / 4096;
+    EFI_PHYSICAL_ADDRESS address = 0;
+    if (EFI_ERROR(bootServices->AllocatePages(AllocateAnyPages, EfiReservedMemoryType, pages, &address)) || !address)
+        return false;
+    bootServices->SetMem(reinterpret_cast<VOID*>(address), pages * 4096, 0);
+    outFramebuffer = brook::Framebuffer{};
+    outFramebuffer.physicalBase = address;
+    outFramebuffer.width = w; outFramebuffer.height = h; outFramebuffer.stride = w * 4;
+    outFramebuffer.format = brook::PixelFormat::Bgr8;
+    return true;
+}
+
 bool GraphicsInit(EFI_BOOT_SERVICES* bootServices, brook::Framebuffer& outFramebuffer)
 {
     EFI_GUID gopGuid = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;

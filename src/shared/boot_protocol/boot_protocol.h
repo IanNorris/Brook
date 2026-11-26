@@ -100,6 +100,7 @@ constexpr uint32_t BootTimingRecovery   = 1u << 3; // recovery pair selected (ke
 constexpr uint32_t BootTimingGuardSlot  = 1u << 4; // verified A/B selector metadata follows timing
 constexpr uint32_t BootTimingGuardEmergency = 1u << 5; // journal required recovery, but no recovery pair verified
 constexpr uint32_t BootTimingBootStick = 1u << 6; // bootStick (volume identity + file set) follows guardSlot
+constexpr uint32_t BootTimingHeadless  = 1u << 7; // no GOP: framebuffer is a loader-reserved RAM surface nobody scans out
 
 struct BootTiming
 {
@@ -190,6 +191,10 @@ static_assert(BootProtocolV5Size == 152, "version-5 BootProtocol layout changed 
 inline bool BootHasTiming(const BootProtocol* p)
 {
     return p && p->version >= 5 && p->extensions == BootExtensionTimingMagic;
+}
+inline bool BootIsHeadless(const BootProtocol* p)
+{
+    return BootHasTiming(p) && (p->timing.flags & BootTimingHeadless);
 }
 
 inline bool BootHasBootStick(const BootProtocol* p)

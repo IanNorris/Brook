@@ -58,10 +58,11 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
     brook::BootTiming timing{};
     timing.loaderEntryTsc = ReadTsc();
 
+    // Breadcrumb first, before any console or display call: a hung boot that never
+    // reaches this point hung in firmware POST.
+    BreadcrumbEntry(imageHandle, systemTable->BootServices);
     ConsoleInit(systemTable->ConOut);
     ConsoleSetQuiet(true);
-    // Breadcrumb first: a hung boot that never reaches this point hung in firmware POST.
-    BreadcrumbEntry(imageHandle, systemTable->BootServices);
 #if defined(BROOK_EFI_BOOT_INVENTORY)
     SaveBootVariableInventory(imageHandle,systemTable);
 #endif
@@ -75,7 +76,13 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
     brook::Framebuffer framebuffer{};
     if (!GraphicsInit(systemTable->BootServices, framebuffer))
     {
-        Halt(EFI_UNSUPPORTED, u"No GOP framebuffer available");
+        // No display attached (e.g. the KVM is on another machine): the firmware publishes
+        // no GOP. Boot headless on a reserved RAM surface instead of halting; the kernel
+        // sees BootTimingHeadless and leaves the display engine alone.
+        if (!HeadlessFramebuffer(systemTable->BootServices, framebuffer))
+            Halt(EFI_UNSUPPORTED, u"No GOP framebuffer available");
+        timing.flags |= brook::BootTimingHeadless;
+        BreadcrumbHeadless(framebuffer.width, framebuffer.height);
     }
     auto splash=[&](unsigned percent,bool full=false){
         brook::DrawBootSplash(reinterpret_cast<uint32_t*>(framebuffer.physicalBase),

@@ -294,7 +294,7 @@ class Guest:
              "-qmp", f"unix:{self.sock},server=on,wait=off",
              "-drive", f'if=pflash,format=raw,readonly=on,file={os.environ["OVMF_CODE"]}',
              "-drive", f"if=pflash,format=raw,file={variables}",
-             "-device", "VGA,vgamem_mb=64", "-device", "qemu-xhci,id=usb",
+             *([] if getattr(args, "no_gop", False) else ["-device", "VGA,vgamem_mb=64"]), "-device", "qemu-xhci,id=usb",
              "-drive", f"if=none,format=raw,id=other,file={fallback},readonly=on",
              "-device", "usb-storage,bus=usb.0,port=1,drive=other",
              "-drive", f"if=none,format=raw,id=system,file={system},cache=none,discard=unmap",
@@ -477,6 +477,8 @@ def main():
     parser.add_argument("--exercise-detach", action="store_true", help="also unplug the SSD in a running guest")
     parser.add_argument("--uas", action="store_true", help="use the QEMU USB Attached SCSI device")
     parser.add_argument("--accel", choices=("kvm", "tcg"), default="kvm")
+    parser.add_argument("--no-gop", action="store_true",
+                        help="no display device: OVMF publishes no GOP (the RTX desktop with its KVM switched away)")
     args = parser.parse_args()
     if args.accel == "kvm" and subprocess.run(["pgrep", "-x", "vmware-vmx"], capture_output=True).returncode == 0:
         raise SystemExit("Workstation is running. Use TCG or wait for the VMware window to close.")
@@ -532,6 +534,8 @@ def main():
     results["loader_breadcrumb"] = crumb.strip()
     assert crumb.startswith("brook-loader-breadcrumb v1\n") and "\nstage=kernel\n" in crumb, crumb
     assert int(crumb.split("entries=", 1)[1].split("\n", 1)[0]) >= 1, crumb
+    if args.no_gop:
+        assert "\ngop=none " in crumb, crumb   # booted headless, not halted
 
     results["dirty_boot"], results["dirty_status"] = check_refusal(
         args, system, fallback, "dirty-boot", "needs-filesystem-check", -117)

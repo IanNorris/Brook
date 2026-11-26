@@ -13,7 +13,7 @@ void ConsoleSetQuiet(bool quiet){gQuiet=quiet;}
 void ConsoleInit(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL* conOut)
 {
     gConOut = conOut;
-    gConOut->ClearScreen(gConOut);
+    if (gConOut) gConOut->ClearScreen(gConOut);   // no console output device: ConOut may be absent
 }
 
 void ConsolePrint(const char16_t* message)

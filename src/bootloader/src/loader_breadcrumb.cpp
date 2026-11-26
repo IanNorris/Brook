@@ -72,6 +72,11 @@ void BreadcrumbGop(bool gop, uint32_t w, uint32_t h, uint32_t modes, bool setmod
     g_state.setmode_tried = setmode_tried; g_state.setmode_failed = setmode_failed; g_state.setmode_status = status;
     Commit();
 }
+void BreadcrumbHeadless(uint32_t w, uint32_t h) {
+    if (!g_enabled) return;
+    g_state.stage = "headless"; g_state.gop = false; g_state.gop_w = w; g_state.gop_h = h;
+    Commit();
+}
 void BreadcrumbKernel() {
     if (!g_enabled) return;
     g_state.stage = "kernel";
