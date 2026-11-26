@@ -58,17 +58,19 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
     brook::BootTiming timing{};
     timing.loaderEntryTsc = ReadTsc();
 
-    // Breadcrumb first, before any console or display call: a hung boot that never
-    // reaches this point hung in firmware POST.
-    BreadcrumbEntry(imageHandle, systemTable->BootServices);
+    // Config first (file reads only, no console output before ConsoleInit), then the
+    // breadcrumb before any console or display call: a hung boot that never reaches it
+    // hung in firmware POST. Breadcrumbs and the headless fallback are RTX stick-set
+    // behaviour (STICK_SETS=1); other images keep the previous loader behaviour.
+    LoadConfig(imageHandle, systemTable->BootServices);
+    if (g_bootConfig.stickSets) BreadcrumbEntry(imageHandle, systemTable->BootServices);
     ConsoleInit(systemTable->ConOut);
     ConsoleSetQuiet(true);
 #if defined(BROOK_EFI_BOOT_INVENTORY)
     SaveBootVariableInventory(imageHandle,systemTable);
 #endif
 
-    // --- Config ---
-    LoadConfig(imageHandle, systemTable->BootServices);
+    // --- Config (loaded above) ---
     ConsoleSetQuiet(!g_bootConfig.debugText);
     ConsolePrintLine(u"Brook UEFI: configuration loaded");
 
@@ -79,7 +81,7 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
         // No display attached (e.g. the KVM is on another machine): the firmware publishes
         // no GOP. Boot headless on a reserved RAM surface instead of halting; the kernel
         // sees BootTimingHeadless and leaves the display engine alone.
-        if (!HeadlessFramebuffer(systemTable->BootServices, framebuffer))
+        if (!g_bootConfig.stickSets || !HeadlessFramebuffer(systemTable->BootServices, framebuffer))
             Halt(EFI_UNSUPPORTED, u"No GOP framebuffer available");
         timing.flags |= brook::BootTimingHeadless;
         BreadcrumbHeadless(framebuffer.width, framebuffer.height);
