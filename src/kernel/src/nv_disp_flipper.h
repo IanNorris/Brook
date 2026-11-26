@@ -41,7 +41,10 @@ constexpr uint32_t RegLoadvCounter(uint32_t h){return 0x61611c+h*0x800;}
 // NV_UFLUSH_L2_FLUSH_DIRTY: write 1, poll bits 1:0 clear (nouveau gf100_ltc_flush). Write-back only.
 constexpr uint32_t kRegL2FlushDirty=0x070010;
 // Kick ordering (27 Nov NVK head freeze): 0 = BAR1 flush then PUT (the D1 path); 1 = also read the
-// last word back through BAR1 before the flush; 2 = 1 + L2 flush-dirty before PUT.
+// last word back through BAR1 before the flush; 2 = 1 + L2 flush-dirty before PUT. Default 1: with
+// GSP-RM up BAR1 is virtual (our identity tables in VRAM), so a posted ring write can wait on a
+// BAR1 page walk while the PUT (BAR0) overtakes it and the window fetches stale words. A BAR read
+// is how nouveau flushes BAR writes under GSP-RM (r535_bar_flush reads its BAR2 flush page).
 // Backend: rd, wr, vrd, vwr, fence, nowUs, relax (as the runners' backends).
 template<typename B> struct NvWindowFlipper{
     static constexpr uint32_t kMaxBuffers=3;    // triple buffering for the desktop (D2); bench uses 2
@@ -131,7 +134,7 @@ template<typename B> struct NvWindowFlipper{
     }
     uint32_t armLine=0,armLoadv=0;
     uint32_t lastKickOff=0,lastKickN=0;   // ring offset and word count of the last kick (failure diagnostics)
-    uint8_t kickMode=0;
+    uint8_t kickMode=1;
     // Stale-fetch recovery (27 Nov): the window fetched the kick (GET == PUT, idle, no exception)
     // but ARM kept the previous surface while LOADV moved on. The same words are kicked again
     // (at most kMaxRekicks per flip); rekicks/rekickOk count it.

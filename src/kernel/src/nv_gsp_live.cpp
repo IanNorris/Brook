@@ -2002,11 +2002,7 @@ bool NvdChanCreate(void*, uint32_t vas, uint32_t engine, uint32_t* out) {
         // the channel scope shares the VAS page tables (context buffers map into the same root)
         s.root = v.s.root; s.lpt_page = v.s.lpt_page; s.lpt_off = v.s.lpt_off; s.lpt_aper = v.s.lpt_aper;
         uint32_t entries = 0;
-        NvDispSnapLocked("chan-pre");
-        bool good = x.ChannelInVas(s, ch.mthdbuf, g_gr.mthdbuf_size);
-        NvDispSnapLocked("chan-alloc");
-        good = good && x.Promote(s, g_gr.bufs, false, &entries);
-        NvDispSnapLocked("chan-promote");
+        bool good = x.ChannelInVas(s, ch.mthdbuf, g_gr.mthdbuf_size) && x.Promote(s, g_gr.bufs, false, &entries);
         KPrintf("nv-drm: chid %u %s, PROMOTE_CTX %u entries (chanmode %u)\n", chid, s.priv ? "admin" : "user", entries, g_grChanMode);
         v.s.lpt_page = s.lpt_page; v.s.lpt_off = s.lpt_off; v.s.lpt_aper = s.lpt_aper;
         // NVK allocates TURING_DMA_COPY_A on its GR channel (nouveau_ws_3d_context_init, ENGINE_COPY)
@@ -2042,7 +2038,6 @@ bool NvdChanCreate(void*, uint32_t vas, uint32_t engine, uint32_t* out) {
         // BIND + GPFIFO_SCHEDULE + token wait for the first EXEC (NvdSchedule): a scheduled GR
         // channel left idle ~1 s preceded the RM asserts / Xid 62 seen on 26 Nov.
         (void)vio; (void)c; (void)h::kDoorbell;
-        NvDispSnapLocked("chan-objs");
         if (!good) x.Close(s);
         return good;
     });
@@ -2065,13 +2060,10 @@ bool NvdSchedule(nvd::Chan& ch) {
         rm::NVA06F_CTRL_BIND_PARAMS bp = {rm::gr::RM_ENGINE_TYPE_GR0};
         rm::NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS sp = {1, 0};
         rm::NVC36F_CTRL_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS tk = {};
-        NvDispSnapLocked("sched-pre");
         if (!x.api.Control(s.base, s.h_chan, rm::NVA06F_CTRL_CMD_BIND, &bp, sizeof(bp))) return x.fail("BIND");
-        NvDispSnapLocked("sched-bind");
         if (!x.api.Control(s.base, s.h_chan, rm::NVA06F_CTRL_CMD_GPFIFO_SCHEDULE, &sp, sizeof(sp))) return x.fail("GPFIFO_SCHEDULE");
         if (!x.api.Control(s.base, s.h_chan, rm::NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN, &tk, sizeof(tk))) return x.fail("token");
         ch.token = tk.workSubmitToken;
-        NvDispSnapLocked("sched-post");
         return true;
     });
     if (ok) { ch.scheduled = true; KPrintf("nv-drm: channel chid %u scheduled (token %x)\n", ch.chid, ch.token); }
