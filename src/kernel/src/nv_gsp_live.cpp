@@ -645,7 +645,11 @@ bool MthdbufAlloc(uint32_t bytes, M2Sys* m) {
     DmaRegion d;
     if (!RmAlloc(g_mthdbufAlign ? bytes + al : bytes, &d)) return false;
     const uint64_t bus = g_mthdbufAlign ? (d.bus + al - 1) & ~uint64_t(al - 1) : d.bus;
-    m->cpu = d.cpu + (bus - d.bus); m->bus = bus; m->bytes = bytes; return true;
+    m->cpu = d.cpu + (bus - d.bus); m->bus = bus; m->bytes = bytes;
+    // one PmmAllocPages run: physically contiguous by construction (frames bus, bus+0x1000, ...)
+    KPrintf("nv-gsp: method buffer %lx..%lx (%u B, %s)\n", (unsigned long)bus, (unsigned long)(bus + bytes - 1), bytes,
+            g_mthdbufAlign ? "size-aligned" : "page-aligned");
+    return true;
 }
 void FlushRange(const uint8_t* p, uint32_t n) {
     for (uint32_t o = 0; o < n; o += 64) __asm__ volatile("clflush (%0)" ::"r"(p + o) : "memory");
@@ -1457,8 +1461,7 @@ void GrVerb(int mode) {   // 1 golden, 2 off, 0 status
         GspDoorbell<Bar0Bus, RmSync> bell{g_bus, *c, g_rmSync};
         alignas(8) static uint8_t scratch[kRmApiBuf];
         LiveRmApi api(g_rm->ch, g_rm->rx, g_rm->rxcap, wait, bell, scratch);
-        auto sysalloc = [](uint32_t bytes, M2Sys* m) { DmaRegion d; if (!RmAlloc(bytes, &d)) return false;
-            m->cpu = d.cpu; m->bus = d.bus; m->bytes = d.bytes; return true; };
+        auto sysalloc = [](uint32_t bytes, M2Sys* m) { return MthdbufAlloc(bytes, m); };   // golden/scrubber method buffers
         const uint64_t t0 = NowUs();
         KPrintf("nv-gsp: GR golden context + scrubber starting\n");
         g_grLast = RunGrGolden(g_bus, *c, vio, api, g_static, 0x110000000ull, 0x130000000ull, sysalloc, g_gr);
@@ -1590,8 +1593,7 @@ template <class F> bool NvdWithRm(const char* what, F f) {
     GrResult r;
     bool ok = true;
     if (!g_gr.up) {   // first use: golden context + scrubber (as `gr golden`), which also sets the GR arena
-        auto sysalloc = [](uint32_t bytes, M2Sys* m) { DmaRegion d; if (!RmAlloc(bytes, &d)) return false;
-            m->cpu = d.cpu; m->bus = d.bus; m->bytes = d.bytes; return true; };
+        auto sysalloc = [](uint32_t bytes, M2Sys* m) { return MthdbufAlloc(bytes, m); };   // golden/scrubber method buffers
         g_grTried = true;
         g_grLast = RunGrGolden(g_bus, *c, vio, api, g_static, 0x110000000ull, 0x130000000ull, sysalloc, g_gr);
         ok = g_gr.up;
