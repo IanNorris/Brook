@@ -1690,6 +1690,83 @@ void FaultShadowDrain() {   // drainer context; sysmem only
     }
     FsPut64(g_fsQueue + 64, get); FlushRange(g_fsQueue + 64, 8);
 }
+// NV2080_CTRL_CMD_BUS_GET_INFO_V2 (0x20801823): {u32 busInfoListSize; {u32 index, data}[52]} (420 B).
+// Indices: 7 PCIE_GPU_LINK_CTRL_STATUS (speed 19:16, 1/2/3 = 2.5/5/8 GT/s; width 25:20),
+// 3 PCIE_GPU_LINK_CAPS, 0x2d PCIE_GEN_INFO.
+struct PerfBusInfo { uint32_t v[3] = {~0u, ~0u, ~0u}; };
+template <class Api> bool PerfBusInfoRead(Api& api, uint32_t hc, uint32_t hs, PerfBusInfo& out) {
+    struct { uint32_t n; struct { uint32_t index, data; } e[52]; } b;
+    static_assert(sizeof(b) == 420, "BUS_GET_INFO_V2_PARAMS");
+    __builtin_memset(&b, 0, sizeof(b));
+    b.n = 3; b.e[0].index = 7; b.e[1].index = 3; b.e[2].index = 0x2d;
+    if (!api.Control(hc, hs, 0x20801823u, &b, sizeof(b))) return false;
+    for (int i = 0; i < 3; ++i) out.v[i] = b.e[i].data;
+    return true;
+}
+// `perf watch <ms> <s>` (phase 2): a sampler thread, every <ms> (>= 100): GET_CURRENT_PSTATE +
+// BUS_GET_INFO_V2 index 7 on RM's internal subdevice, plus the GPU's PCIe LnkSta from config space
+// (no RM). Logs every change with a timestamp and a summary at the end. Read-only. Skips a sample
+// when a verb holds the GPU (g_busy) or the nv-aux lock is taken.
+struct PerfWatch { volatile bool running = false; uint32_t period_ms = 250, dur_ms = 15000;
+    uint32_t samples = 0, skipped = 0, errors = 0, changes = 0, p_counts[16] = {}, gts_counts[4] = {}; };
+PerfWatch g_perfWatch;
+uint16_t GpuLnkSta(const Gpu& g) {
+    if (!g.ok) return 0xffff;
+    if (!(PciConfigRead16(g.bus, g.dev, g.fn, 6) & 0x10)) return 0xffff;
+    uint8_t o = PciConfigRead8(g.bus, g.dev, g.fn, 0x34) & 0xfc;
+    for (unsigned k = 0; o >= 0x40 && k < 48; ++k) { if (PciConfigRead8(g.bus, g.dev, g.fn, o) == 0x10) return PciConfigRead16(g.bus, g.dev, g.fn, uint8_t(o + 0x12));
+        o = PciConfigRead8(g.bus, g.dev, g.fn, uint8_t(o + 1)) & 0xfc; }
+    return 0xffff;
+}
+void PerfWatchThread(void*) {
+    PerfWatch& w = g_perfWatch;
+    const uint64_t t0 = NowUs();
+    uint32_t lastPs = ~0u, lastLink = ~0u; uint16_t lastSta = 0xffff;
+    Gpu gpu{}; gpu.ok = FindGpu(gpu);
+    KPrintf("nv-gsp: perf watch start: every %u ms for %u ms\n", w.period_ms, w.dur_ms);
+    while (NowUs() - t0 < uint64_t(w.dur_ms) * 1000) {
+        SchedulerSleepMs(w.period_ms);
+        if (!g_rmRunning || !g_rm || g_finiDone) break;
+        const uint16_t sta = GpuLnkSta(gpu);
+        if (__atomic_exchange_n(&g_busy, 1u, __ATOMIC_ACQUIRE)) { ++w.skipped; continue; }
+        SpinLock* lock = NvAuxSharedLock();
+        if (!SpinLockTryAcquire(lock)) { __atomic_store_n(&g_busy, 0u, __ATOMIC_RELEASE); ++w.skipped; continue; }
+        const ChipOps* c = ChipForBoot0(g_bus.rd32(0));
+        RmWait wait; g_rm->wait_deadline_us = NowUs() + 1000000;
+        GspDoorbell<Bar0Bus, RmSync> bell{g_bus, *c, g_rmSync};
+        alignas(8) static uint8_t scratch[kRmApiBuf];
+        LiveRmApi api(g_rm->ch, g_rm->rx, g_rm->rxcap, wait, bell, scratch);
+        uint32_t ps = ~0u; PerfBusInfo bi;
+        const bool pok = api.Control(g_static.h_internal_client, g_static.h_internal_subdevice, 0x20802068u, &ps, sizeof(ps));
+        const bool bok = PerfBusInfoRead(api, g_static.h_internal_client, g_static.h_internal_subdevice, bi);
+        g_liveEv.total += api.ev.total; g_liveEv.rc += api.ev.rc; g_liveEv.mmu += api.ev.mmu_fault;
+        SpinLockRelease(lock);
+        __atomic_store_n(&g_busy, 0u, __ATOMIC_RELEASE);
+        ++w.samples; if (!pok || !bok) ++w.errors;
+        if (pok) for (uint32_t b = 0; b < 16; ++b) if (ps & (1u << b)) ++w.p_counts[b];
+        const uint32_t gts = (sta & 0xf) < 4 ? (sta & 0xf) : 0; ++w.gts_counts[gts];
+        const uint32_t link = bok ? bi.v[0] : ~0u;
+        if (ps != lastPs || link != lastLink || sta != lastSta) {
+            ++w.changes;
+            KPrintf("{\"perf_watch\":%lu,\"pstate\":\"%x\",\"rm_link\":\"%x\",\"lnksta\":\"%x\",\"gts\":%u,\"width\":%u,\"ok\":%d%d}\n",
+                    (unsigned long)((NowUs() - t0) / 1000), ps, link, sta, sta & 0xf, (sta >> 4) & 0x3f, pok ? 1 : 0, bok ? 1 : 0);
+            lastPs = ps; lastLink = link; lastSta = sta;
+        }
+    }
+    KPrintf("{\"perf_watch_done\":1,\"samples\":%u,\"skipped\":%u,\"errors\":%u,\"changes\":%u,\"P0\":%u,\"P5\":%u,\"P8\":%u,\"gen1\":%u,\"gen2\":%u,\"gen3\":%u}\n",
+            w.samples, w.skipped, w.errors, w.changes, w.p_counts[0], w.p_counts[5], w.p_counts[8], w.gts_counts[1], w.gts_counts[2], w.gts_counts[3]);
+    w.running = false;
+}
+void PerfWatchVerb(uint32_t ms, uint32_t secs) {
+    Out o; o.raw("{\"nv_gsp\":\"perf watch\"");
+    if (!g_rmRunning || !g_staticValid) { o.ks("refused", "GSP-RM is not running this boot"); o.send(); return; }
+    if (g_perfWatch.running) { o.ks("refused", "a perf watch is running"); o.send(); return; }
+    if (ms < 100) ms = 100; if (secs == 0 || secs > 600) secs = 15;
+    g_perfWatch = PerfWatch{}; g_perfWatch.period_ms = ms; g_perfWatch.dur_ms = secs * 1000; g_perfWatch.running = true;
+    Process* t = KernelThreadCreate("nv_perf_watch", PerfWatchThread, nullptr, 2);
+    if (t) SchedulerAddProcess(t); else { g_perfWatch.running = false; o.ks("refused", "thread start failed"); o.send(); return; }
+    o.kd("period_ms", ms); o.kd("seconds", secs); o.ks("output", "kernel log: perf_watch lines on change, perf_watch_done at the end"); o.send();
+}
 void PerfVerb(int mode) {   // 0 status, 1 boost, 2 clear
     Out o; o.raw("{\"nv_gsp\":\"perf\"");
     const ChipOps* c = ChipForBoot0(g_bus.rd32(0));
@@ -1710,6 +1787,26 @@ void PerfVerb(int mode) {   // 0 status, 1 boost, 2 clear
     uint32_t pstate = 0;
     const bool pok = api.Control(hc, hs, 0x20802068u, &pstate, sizeof(pstate));   // NV2080_CTRL_CMD_PERF_GET_CURRENT_PSTATE
     o.kb("pstate_ok", pok); o.kh("pstate_status", api.status); o.kh("pstate_mask", pstate);   // bit n = Pn
+    if (mode == 0) {   // 27 Nov perf research phase 1 (notes/m5/perf-p8-research.md §4.2): read-only, fixed size
+        PerfBusInfo bi; const bool bok = PerfBusInfoRead(api, hc, hs, bi);
+        o.kb("bus_ok", bok); o.kh("bus_status", api.status);
+        if (bok) { o.kh("link_ctrl_status", bi.v[0]); o.kd("link_gts_code", (bi.v[0] >> 16) & 0xf); o.kd("link_width", (bi.v[0] >> 20) & 0x3f);
+                   o.kh("link_caps", bi.v[1]); o.kh("gen_info", bi.v[2]); }
+        uint32_t ps = ~0u;
+        const bool psok = api.Control(hc, hs, 0x2080205au, &ps, sizeof(ps));   // PERF_GET_POWERSTATE: 0 AC, 1 battery
+        o.kb("powerstate_ok", psok); o.kh("powerstate", ps);
+        uint32_t aux = ~0u;
+        const bool aok = api.Control(g_static.h_internal_client, g_static.h_internal_subdevice, 0x20800a81u, &aux, sizeof(aux));   // INTERNAL_PERF_GET_AUX_POWER_STATE
+        o.kb("aux_ok", aok); o.kh("aux_status", api.status); o.kh("aux_power_state", aux);
+        o.k("rated_tdp"); o.raw("[");
+        for (uint32_t cl = 0; cl < 5; ++cl) {
+            struct { uint32_t client, input, vPstateType; } t = {cl, ~0u, ~0u};   // PERF_RATED_TDP_GET_CONTROL (12 B)
+            const bool tok = api.Control(hc, hs, 0x2080206eu, &t, sizeof(t));
+            if (cl) o.raw(",");
+            o.raw("["); o.dec(tok ? 1 : 0); o.raw(","); o.dec(t.input); o.raw(","); o.dec(t.vPstateType); o.raw("]");
+        }
+        o.raw("]");
+    }
     // No GET_LEVEL_INFO_V2 here: on 26 Nov an all-domain-bits probe of it (rm 0x1f) was followed by
     // every RM_ALLOC failing NV_ERR_RESET_REQUIRED (PDB_PROP_GPU_IN_FATAL_ERROR) for the rest of the
     // boot. Clock domains are not in the open 570.144 headers; don't probe them.
@@ -2257,6 +2354,11 @@ bool NvGspHandle(const char* command) {
     }
     else if (!strncmp(verb, "nocat ", 6)) { uint32_t k = 0; for (const char* q = verb + 6; *q >= '0' && *q <= '9'; ++q) k = k * 10 + uint32_t(*q - '0'); NocatVerb(k); }
     else if (!strcmp(verb, "perf status")) PerfVerb(0);
+    else if (!strncmp(verb, "perf watch", 10)) {
+        uint32_t v[2] = {250, 15}; int k = -1; const char* p = verb + 10;
+        while (*p && k < 2) { while (*p == ' ') ++p; if (*p >= '0' && *p <= '9') { ++k; if (k < 2) { v[k] = 0; while (*p >= '0' && *p <= '9') v[k] = v[k] * 10 + uint32_t(*p++ - '0'); } } else break; }
+        PerfWatchVerb(v[0], v[1]);
+    }
     else if (!strcmp(verb, "perf boost")) PerfVerb(1);
     else if (!strcmp(verb, "perf clear")) PerfVerb(2);
     else if (!strcmp(verb, "ce-present on")) CePresentVerb(1);
