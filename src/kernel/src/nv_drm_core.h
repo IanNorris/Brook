@@ -10,6 +10,7 @@
 // Every other command returns -ENOTTY; M5.2 adds GEM/VM_BIND, M5.3 EXEC.
 #include <stdint.h>
 #include "gpu_sync.h"
+#include "memory/heap.h"
 
 namespace brook::nvdrm {
 
@@ -99,8 +100,22 @@ struct UserAccess {
 };
 
 constexpr uint32_t kMaxChannels = 16, kMaxObjects = 8, kMaxSyncobjs = 256;
+constexpr uint32_t kMaxExecJobs = 16, kMaxInflight = 64, kMaxPushes = 512;
+struct ExecPush { uint64_t va; uint32_t va_len, flags; };
+static_assert(sizeof(ExecPush) == 16);
+struct ExecJob {
+    uint32_t npush = 0, nwaits = 0;
+    ExecPush push[kMaxPushes];
+    GpuFence* waits[16] = {};
+    GpuFence* done = nullptr;
+};
 struct Channel { bool used = false; int32_t id = 0; uint32_t engine = 0; uint32_t nobj = 0;
-                 struct { uint64_t token; uint32_t handle; int32_t oclass; } obj[kMaxObjects] = {}; };
+                 struct { uint64_t token; uint32_t handle; int32_t oclass; } obj[kMaxObjects] = {};
+                 uint32_t hw = 0;           // backend channel
+                 bool dead = false;         // RC / fault: every later EXEC fails
+                 uint32_t next_seqno = 1;
+                 ExecJob* jobs[kMaxExecJobs] = {}; uint32_t job_head = 0, job_count = 0;   // waiting for fences / ring room
+                 struct { uint32_t seqno; GpuFence* fence; } inflight[kMaxInflight] = {}; uint32_t in_head = 0, in_count = 0; };
 
 // ---- M5.2 memory: the hardware side is a backend (live: VRAM heap + PMM pages + GMMU writes
 // over PRAMIN + MMU invalidate; host test: a fake that records PTEs).
@@ -119,6 +134,16 @@ struct Backend {
     // Unmap; sparse=true leaves the range sparse (reads 0, writes dropped) instead of invalid.
     bool (*vas_unmap)(void* ctx, uint32_t vas, uint64_t va, uint64_t bytes, bool sparse);
     bool (*vas_flush)(void* ctx, uint32_t vas);   // MMU invalidate after a batch of PTE writes
+    // M5.3 channels: a GPFIFO channel in `vas` on the GR (0x01) or CE (0x30) runlist, with the
+    // engine objects allocated (NVK binds classes with SET_OBJECT in its pushes).
+    bool (*chan_create)(void* ctx, uint32_t vas, uint32_t engine, uint32_t* chan);
+    void (*chan_destroy)(void* ctx, uint32_t chan);
+    // Queue pushes [(va, dwords, no_prefetch)] then a kernel semaphore release of `seqno`, and
+    // ring the doorbell. False when the ring has no room (the job stays queued).
+    bool (*chan_submit)(void* ctx, uint32_t chan, const uint64_t* va, const uint32_t* dwords, const uint8_t* no_prefetch,
+                        uint32_t n, uint32_t seqno);
+    uint32_t (*chan_completed)(void* ctx, uint32_t chan);   // last released seqno
+    bool (*chan_error)(void* ctx, uint32_t chan);           // RC / MMU fault on the channel
 };
 
 constexpr uint32_t kMaxBos = 2048, kMaxMappings = 2048, kMaxBindJobs = 16, kMaxBindOps = 64, kMaxJobSyncs = 16;
@@ -304,18 +329,20 @@ inline int64_t ChannelAlloc(File& f, const UserAccess& u, uint64_t arg) {
     for (auto& x : f.channels) if (!x.used) { c = &x; break; }
     if (!c) return kENOSPC;
     *c = Channel{}; c->used = true; c->id = f.next_channel++; c->engine = engine;
+    if (f.be && !f.be->chan_create(f.be->ctx, f.vas, engine, &c->hw)) { c->used = false; return kENOMEM; }
     a.channel = c->id; a.pushbuf_domains = 0x6;   // VRAM | GART
     a.notifier_handle = 0; a.nr_subchan = 0;
     for (auto& s : a.subchan) s = {0, 0};
-    if (!u.write(u.ctx, arg, &a, sizeof(a))) { c->used = false; return kEFAULT; }
+    if (!u.write(u.ctx, arg, &a, sizeof(a))) { if (f.be) f.be->chan_destroy(f.be->ctx, c->hw); c->used = false; return kEFAULT; }
     return 0;
 }
+inline void ChannelTeardown(File& f, Channel& c);   // after the EXEC code
 inline int64_t ChannelFree(File& f, const UserAccess& u, uint64_t arg) {
     NvChannelFree r{};
     if (!u.read(u.ctx, &r, arg, sizeof(r))) return kEFAULT;
     Channel* c = FindChannel(f, r.channel);
     if (!c) return kENOENT;
-    c->used = false;
+    ChannelTeardown(f, *c);
     return 0;
 }
 
@@ -655,6 +682,88 @@ inline int64_t VmBindIoctl(File& f, const UserAccess& u, uint64_t arg) {
     Pump(f);
     return 0;
 }
+
+// ---- M5.3: EXEC ----------------------------------------------------------------------------
+struct Exec { uint32_t channel, push_count, wait_count, sig_count; uint64_t wait_ptr, sig_ptr, push_ptr; };
+static_assert(sizeof(Exec) == 40);
+constexpr uint32_t EXEC_PUSH_NO_PREFETCH = 1;
+
+inline void FreeJob(ExecJob* j, bool ok) {
+    for (uint32_t i = 0; i < j->nwaits; ++i) GpuFenceUnref(j->waits[i]);
+    if (j->done) { GpuFenceComplete(j->done, ok); GpuFenceUnref(j->done); }
+    kfree(j);
+}
+// Retire what the GPU finished; then submit queued jobs whose waits completed, in order.
+inline void PumpChannel(File& f, Channel& c) {
+    if (!c.dead && f.be->chan_error(f.be->ctx, c.hw)) c.dead = true;
+    const uint32_t done = f.be->chan_completed(f.be->ctx, c.hw);
+    while (c.in_count) {
+        auto& x = c.inflight[c.in_head];
+        if (!c.dead && int32_t(done - x.seqno) < 0) break;
+        GpuFenceComplete(x.fence, !c.dead || int32_t(done - x.seqno) >= 0);
+        GpuFenceUnref(x.fence); x = {};
+        c.in_head = (c.in_head + 1) % kMaxInflight; --c.in_count;
+    }
+    while (c.job_count) {
+        ExecJob* j = c.jobs[c.job_head];
+        bool ready = true, failed = c.dead;
+        for (uint32_t i = 0; i < j->nwaits; ++i) { const uint32_t st = GpuFenceState(j->waits[i]); ready &= st != 0; failed |= st == 2; }
+        if (!ready && !failed) return;
+        if (!failed) {
+            if (c.in_count == kMaxInflight) return;
+            uint64_t va[kMaxPushes]; uint32_t dw[kMaxPushes]; uint8_t np[kMaxPushes];
+            for (uint32_t i = 0; i < j->npush; ++i) { va[i] = j->push[i].va; dw[i] = j->push[i].va_len / 4; np[i] = (j->push[i].flags & EXEC_PUSH_NO_PREFETCH) ? 1 : 0; }
+            const uint32_t seq = c.next_seqno;
+            if (!f.be->chan_submit(f.be->ctx, c.hw, va, dw, np, j->npush, seq)) return;   // ring full: later
+            ++c.next_seqno;
+            auto& x = c.inflight[(c.in_head + c.in_count) % kMaxInflight];
+            x.seqno = seq; x.fence = j->done; j->done = nullptr; ++c.in_count;
+        }
+        FreeJob(j, false);   // a failed wait or dead channel fails its fence
+        c.jobs[c.job_head] = nullptr; c.job_head = (c.job_head + 1) % kMaxExecJobs; --c.job_count;
+    }
+}
+inline void PumpExec(File& f) { for (auto& c : f.channels) if (c.used && (c.job_count || c.in_count)) PumpChannel(f, c); }
+inline void ChannelTeardown(File& f, Channel& c) {
+    while (c.job_count) { FreeJob(c.jobs[c.job_head], false); c.jobs[c.job_head] = nullptr; c.job_head = (c.job_head + 1) % kMaxExecJobs; --c.job_count; }
+    if (f.be) { c.dead = true; PumpChannel(f, c); f.be->chan_destroy(f.be->ctx, c.hw); }   // in-flight work is abandoned with the channel
+    c.used = false;
+}
+inline int64_t ExecIoctl(File& f, const UserAccess& u, uint64_t arg) {
+    Exec e{};
+    if (!u.read(u.ctx, &e, arg, sizeof(e))) return kEFAULT;
+    if (!f.be) return kENOTTY;
+    Channel* c = FindChannel(f, e.channel);
+    if (!c) return kENOENT;
+    if (c->dead) return -19;   // -ENODEV as nouveau after a channel kill
+    if (e.push_count > kMaxPushes || e.wait_count > 16 || e.sig_count > 16) return kEINVAL;
+    SyncDesc waits[16], sigs[16];
+    if (int64_t r = ReadSyncs(f, u, e.wait_ptr, e.wait_count, waits)) return r;
+    if (int64_t r = ReadSyncs(f, u, e.sig_ptr, e.sig_count, sigs)) return r;
+    PumpChannel(f, *c);
+    if (c->job_count == kMaxExecJobs) return kEBUSY;
+    auto* j = static_cast<ExecJob*>(kmalloc(sizeof(ExecJob)));
+    if (!j) return kENOMEM;
+    __builtin_memset(j, 0, sizeof(*j));
+    j->npush = e.push_count;
+    if (e.push_count && !u.read(u.ctx, j->push, e.push_ptr, uint64_t(e.push_count) * sizeof(ExecPush))) { kfree(j); return kEFAULT; }
+    for (uint32_t i = 0; i < j->npush; ++i)
+        if (!j->push[i].va_len || (j->push[i].va_len & 3) || (j->push[i].va & 3) || (j->push[i].flags & ~EXEC_PUSH_NO_PREFETCH) ||
+            j->push[i].va_len / 4 >= (1u << 21)) { kfree(j); return kEINVAL; }
+    for (uint32_t i = 0; i < e.wait_count; ++i) {
+        GpuSync* s = f.syncs.Get(waits[i].handle);
+        GpuFence* fe = GpuSyncAcquire(s); GpuSyncUnref(s);
+        if (!fe) { FreeJob(j, false); return kEINVAL; }
+        j->waits[j->nwaits++] = fe;
+    }
+    j->done = GpuFenceCreate(false);
+    if (!j->done) { FreeJob(j, false); return kENOMEM; }
+    for (uint32_t i = 0; i < e.sig_count; ++i) { GpuSync* s = f.syncs.Get(sigs[i].handle); GpuSyncReplace(s, j->done); GpuSyncUnref(s); }
+    GpuFenceRef(j->done); GpuFenceUnref(f.last_exec); f.last_exec = j->done;
+    c->jobs[(c->job_head + c->job_count) % kMaxExecJobs] = j; ++c->job_count;
+    PumpChannel(f, *c);
+    return 0;
+}
 inline void File::Close() {
     while (job_count) {   // drop queued binds (their fences fail)
         BindJob& j = jobs[job_head];
@@ -663,6 +772,7 @@ inline void File::Close() {
         for (uint32_t i = 0; i < j.nwaits; ++i) GpuFenceUnref(j.waits[i]);
         j = BindJob{}; job_head = (job_head + 1) % kMaxBindJobs; --job_count;
     }
+    for (auto& c : channels) if (c.used) ChannelTeardown(*this, c);
     if (be) {
         for (uint32_t i = 0; i < nmaps; ++i) if (!maps[i].sparse) { Bo* b = FindBo(*this, maps[i].bo); if (b) BoPut(*this, *b); }
         nmaps = 0;
@@ -678,6 +788,7 @@ inline int64_t Ioctl(File& f, const UserAccess& u, uint64_t cmd, uint64_t arg) {
     const uint32_t nr = IocNr(cmd), size = IocSize(cmd);
     auto sized = [&](uint32_t want) { return size == want; };
     if (f.be && f.job_count) Pump(f);
+    if (f.be) PumpExec(f);
     switch (nr) {
         case NR_VERSION: return sized(sizeof(DrmVersion)) ? Version(f, u, arg) : kEINVAL;
         case NR_GET_CAP: return sized(sizeof(DrmGetCap)) ? GetCap(f, u, arg) : kEINVAL;
@@ -697,6 +808,7 @@ inline int64_t Ioctl(File& f, const UserAccess& u, uint64_t cmd, uint64_t arg) {
         case kDrmCommandBase + NV_GEM_CPU_PREP: return sized(sizeof(CpuPrep)) ? CpuPrepIoctl(f, u, arg) : kEINVAL;
         case kDrmCommandBase + NV_GEM_CPU_FINI: return sized(sizeof(CpuPrep)) ? 0 : kEINVAL;
         case kDrmCommandBase + NV_VM_BIND: return sized(sizeof(VmBind)) ? VmBindIoctl(f, u, arg) : kEINVAL;
+        case kDrmCommandBase + NV_EXEC: return sized(sizeof(Exec)) ? ExecIoctl(f, u, arg) : kEINVAL;
         default: return kENOTTY;
     }
 }

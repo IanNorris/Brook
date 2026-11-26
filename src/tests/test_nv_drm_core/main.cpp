@@ -86,6 +86,8 @@ struct Fake {
     uint64_t next_cookie = 0x1000;
     std::map<uint32_t, std::map<uint64_t, Pte>> vas;   // vas -> page va -> pte
     uint32_t next_vas = 1, flushes = 0, destroyed = 0;
+    struct Chan { uint32_t vas, engine; std::vector<std::pair<uint32_t, std::vector<uint64_t>>> subs; uint32_t completed = 0; bool error = false; bool full = false; };
+    std::map<uint32_t, Chan> chans; uint32_t next_chan = 100, chans_destroyed = 0;
     uint64_t vram_used() const { return vram.Used(); }
 };
 static Fake g_fake;
@@ -104,7 +106,15 @@ static const Backend kFakeBe{&g_fake,
         auto& t = static_cast<Fake*>(c)->vas[v];
         for (uint64_t o = 0; o < bytes; o += kPage) { if (sparse) t[va + o] = Pte{Aper::Vram, 0, 0, true}; else t.erase(va + o); }
         return true; },
-    [](void* c, uint32_t) { ++static_cast<Fake*>(c)->flushes; return true; }};
+    [](void* c, uint32_t) { ++static_cast<Fake*>(c)->flushes; return true; },
+    [](void* c, uint32_t vas, uint32_t engine, uint32_t* ch) { auto* f = static_cast<Fake*>(c); *ch = f->next_chan++; f->chans[*ch] = {vas, engine, {}}; return true; },
+    [](void* c, uint32_t ch) { auto* f = static_cast<Fake*>(c); assert(f->chans.erase(ch) == 1); ++f->chans_destroyed; },
+    [](void* c, uint32_t ch, const uint64_t* va, const uint32_t* dw, const uint8_t*, uint32_t n, uint32_t seq) {
+        auto& x = static_cast<Fake*>(c)->chans.at(ch); if (x.full) return false;
+        std::vector<uint64_t> v; for (uint32_t i = 0; i < n; ++i) { v.push_back(va[i]); v.push_back(dw[i]); }
+        x.subs.push_back({seq, v}); return true; },
+    [](void* c, uint32_t ch) { return static_cast<Fake*>(c)->chans.at(ch).completed; },
+    [](void* c, uint32_t ch) { return static_cast<Fake*>(c)->chans.at(ch).error; }};
 
 static uint32_t NewBo(File& f, uint64_t size, uint32_t domain, uint8_t kind = 0, GemNew* out = nullptr) {
     GemNew n{}; n.info.size = size; n.info.domain = domain; n.info.tile_flags = uint32_t(kind) << 8;
@@ -193,6 +203,58 @@ static void TestMemory(const DeviceInfo& dev) {
     assert(g_fake.vram_used() == 0 && g_fake.sys.empty() && g_fake.destroyed == 1 && !g_fake.vas.count(1));
 }
 
+static int64_t Exe(File& f, int32_t ch, std::vector<ExecPush> p, std::vector<SyncDesc> waits = {}, std::vector<SyncDesc> sigs = {}) {
+    Exec e{}; e.channel = uint32_t(ch); e.push_count = uint32_t(p.size()); e.push_ptr = uint64_t(p.data());
+    e.wait_count = uint32_t(waits.size()); e.wait_ptr = uint64_t(waits.data()); e.sig_count = uint32_t(sigs.size()); e.sig_ptr = uint64_t(sigs.data());
+    return NvIo(f, NV_EXEC, &e, sizeof(e));
+}
+static void TestExec(const DeviceInfo& dev) {
+    g_fake.vram.Init(0x140000000ull, 0x140000000ull + (8ull << 20));
+    static File f; f.Init(&dev, &kFakeBe);
+    NvVmInit vm{0xff00000000ull, (1ull << 40) - 0xff00000000ull}; assert(NvIo(f, NV_VM_INIT, &vm, sizeof(vm)) == 0);
+    NvChannelAlloc ca{}; ca.tt_ctxdma_handle = 0x01; assert(NvIo(f, NV_CHANNEL_ALLOC, &ca, sizeof(ca)) == 0);
+    Channel* c = FindChannel(f, ca.channel); assert(c && g_fake.chans.count(c->hw) && g_fake.chans[c->hw].vas == f.vas && g_fake.chans[c->hw].engine == 1);
+    auto& hw = g_fake.chans[c->hw];
+    DrmSyncobjCreate s1{0, 0}, s2{0, 0}; assert(Io(f, NR_SYNCOBJ_CREATE, s1) == 0 && Io(f, NR_SYNCOBJ_CREATE, s2) == 0);
+    auto wait = [&](uint32_t h) { DrmSyncobjWait w{uint64_t(&h), 0, 1, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, 0, 0, 0}; return Io(f, NR_SYNCOBJ_WAIT, w); };
+    // submit: pushes in order, then the job's seqno; fence completes when the GPU passes it
+    assert(Exe(f, ca.channel, {{0x100000, 64, 0}, {0x200000, 16, EXEC_PUSH_NO_PREFETCH}}, {}, {{SYNC_SYNCOBJ, s1.handle, 0}}) == 0);
+    assert(hw.subs.size() == 1 && hw.subs[0].first == 1 && hw.subs[0].second == (std::vector<uint64_t>{0x100000, 16, 0x200000, 4}));
+    assert(wait(s1.handle) == kETIME);
+    CpuPrep cp{0, CPU_PREP_NOWAIT}; { GemNew n{}; n.info.size = 4096; n.info.domain = GEM_DOMAIN_GART; assert(NvIo(f, NV_GEM_NEW, &n, sizeof(n)) == 0); cp.handle = n.info.handle; }
+    assert(NvIo(f, NV_GEM_CPU_PREP, &cp, sizeof(cp)) == kEBUSY);
+    hw.completed = 1;
+    assert(wait(s1.handle) == 0 && NvIo(f, NV_GEM_CPU_PREP, &cp, sizeof(cp)) == 0 && c->in_count == 0);
+    // a job waiting on a pending fence is held back; the ring-full case requeues
+    GpuFence* gate = GpuFenceCreate(false);
+    { GpuSync* s = f.syncs.Get(s2.handle); assert(GpuSyncReplace(s, gate)); GpuSyncUnref(s); }
+    assert(Exe(f, ca.channel, {{0x300000, 8, 0}}, {{SYNC_SYNCOBJ, s2.handle, 0}}, {{SYNC_SYNCOBJ, s1.handle, 0}}) == 0);
+    assert(hw.subs.size() == 1 && c->job_count == 1 && wait(s1.handle) == kETIME);
+    hw.full = true; assert(GpuFenceComplete(gate, true));
+    NvGetparam g{GP_PCI_DEVICE, 0}; assert(NvIo(f, NV_GETPARAM, &g, sizeof(g)) == 0 && hw.subs.size() == 1 && c->job_count == 1);   // no room yet
+    hw.full = false; assert(NvIo(f, NV_GETPARAM, &g, sizeof(g)) == 0 && hw.subs.size() == 2 && hw.subs[1].first == 2 && c->job_count == 0);
+    hw.completed = 2; assert(wait(s1.handle) == 0);
+    GpuFenceUnref(gate);
+    // a failed wait fence fails the job without submitting it
+    GpuFence* bad = GpuFenceCreate(false); assert(GpuFenceComplete(bad, false));
+    { GpuSync* s = f.syncs.Get(s2.handle); assert(GpuSyncReplace(s, bad)); GpuSyncUnref(s); }
+    assert(Exe(f, ca.channel, {{0x300000, 8, 0}}, {{SYNC_SYNCOBJ, s2.handle, 0}}, {{SYNC_SYNCOBJ, s1.handle, 0}}) == 0);
+    assert(hw.subs.size() == 2 && wait(s1.handle) == -5);
+    GpuFenceUnref(bad);
+    // validation
+    assert(Exe(f, ca.channel, {{0x300000, 6, 0}}) == kEINVAL && Exe(f, ca.channel, {{0x300000, 0, 0}}) == kEINVAL);
+    assert(Exe(f, ca.channel, {{0x300000, 8, 2}}) == kEINVAL && Exe(f, 99, {{0x300000, 8, 0}}) == kENOENT);
+    // channel error: in-flight work fails, later EXECs are refused
+    assert(Exe(f, ca.channel, {{0x400000, 8, 0}}, {}, {{SYNC_SYNCOBJ, s1.handle, 0}}) == 0 && hw.subs.size() == 3);
+    hw.error = true;
+    assert(wait(s1.handle) == -5 && c->dead && Exe(f, ca.channel, {{0x400000, 8, 0}}) == -19);
+    // CHANNEL_FREE and close destroy the backend channels
+    NvChannelAlloc ce{}; ce.tt_ctxdma_handle = 0x30; assert(NvIo(f, NV_CHANNEL_ALLOC, &ce, sizeof(ce)) == 0 && g_fake.chans.size() == 2);
+    NvChannelFree fr{ca.channel}; assert(NvIo(f, NV_CHANNEL_FREE, &fr, sizeof(fr)) == 0 && g_fake.chans.size() == 1);
+    f.Close();
+    assert(g_fake.chans.empty() && g_fake.chans_destroyed == 2 && g_fake.vram_used() == 0 && g_fake.sys.empty());
+}
+
 int main() {
     TestVramHeap();
     DeviceInfo dev;
@@ -266,12 +328,13 @@ int main() {
         NvChannelAlloc vp{}; vp.tt_ctxdma_handle = 0x02; assert(NvIo(f, NV_CHANNEL_ALLOC, &vp, sizeof(vp)) == kEINVAL);
     }
     {   // anything else (GEM, VM_BIND, EXEC) is not there yet; a wrong size is refused
-        uint8_t junk[64] = {}; assert(NvIo(f, 0x40, junk, 48) == kENOTTY && NvIo(f, 0x12, junk, 48) == kENOTTY);
+        uint8_t junk[64] = {}; assert(NvIo(f, 0x41, junk, 48) == kENOTTY && NvIo(f, 0x40, junk, 48) == kENOTTY);   // legacy PUSHBUF; GEM_NEW without a backend
         NvGetparam g{GP_PCI_DEVICE, 0}; assert(Ioctl(f, U, Cmd(kDrmCommandBase + NV_GETPARAM, 8), uint64_t(&g)) == kEINVAL);
         static File off; DeviceInfo none; off.Init(&none); assert(Io(off, NR_GET_CAP, g) == kENOTTY);   // unpublished device
     }
     f.Close();
     TestMemory(dev);
+    TestExec(dev);
     std::printf("test_nv_drm_core: OK\n");
     return 0;
 }
