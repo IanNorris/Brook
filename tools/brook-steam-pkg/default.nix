@@ -7,13 +7,15 @@ let
     name = "brook-steam-provider-exports";
     pathsToLink = [ "/lib" ];
     ignoreCollisions = true;
-    paths = with pkgs; [
+    # getLib: buildEnv would otherwise link a package's outputsToInstall
+    # (often bin), which left libc, libdrm, libssl, libdbus... unexported.
+    paths = map lib.getLib (with pkgs; [
       glibc stdenv.cc.cc.lib libglvnd runtime.mesaRuntime wayland libx11 libxext
       libxcb libxrandr libxi libxfixes libxcomposite libxrender libxdamage
       libxcursor libxxf86vm libxscrnsaver libdrm libgbm udev libgudev
       zlib zstd openssl gnutls nettle pulseaudio dbus libcap libseccomp
       fontconfig freetype alsa-lib
-    ];
+    ]);
   };
   loader = "${pkgs.glibc}/lib/ld-linux-x86-64.so.2";
   provider = pkgs.runCommand "brook-steam-provider" { nativeBuildInputs = [ pkgs.python3 ]; } ''
@@ -53,6 +55,29 @@ let
   # launch copies it as a real directory (brook_steam_seed.py).
   clientRuntime = pkgs.runCommand "brook-steam-client-steamrt64-${source.version}" { disallowedReferences = [ client ]; } ''
     cp -a ${client}/share/brook/steam-client/steamrt64 "$out"
+    chmod -R u+w "$out"
+    # Valve's archives carry SteamRT's soname symlinks only in usr-mtree.txt.gz;
+    # the extraction keeps regular files. Recreate the links (libexpat.so.1 ...).
+    ${pkgs.python3}/bin/python3 - "$out"/pv-runtime/steam-runtime-steamrt/steamrt3c_platform_* <<'PY'
+    import gzip, os, sys
+    for platform in sys.argv[1:]:
+        made = 0
+        with gzip.open(os.path.join(platform, 'usr-mtree.txt.gz'), 'rt') as listing:
+            for line in listing:
+                fields = line.split()
+                if 'type=link' not in fields:
+                    continue
+                link = next(f[5:] for f in fields if f.startswith('link='))
+                path = os.path.normpath(os.path.join(platform, 'files', fields[0].replace('\\040', ' ')))
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                if not os.path.lexists(path):
+                    os.symlink(link.replace('\\040', ' '), path)
+                    made += 1
+        if made < 1000:
+            raise SystemExit(f'unexpectedly few SteamRT links: {made}')
+        print('SteamRT links', made)
+    PY
+    test -L "$out"/pv-runtime/steam-runtime-steamrt/steamrt3c_platform_*/files/lib/x86_64-linux-gnu/libexpat.so.1
   '';
   seed = pkgs.runCommand "brook-steam-client-seed-${source.version}" {
     disallowedReferences = [ client ];

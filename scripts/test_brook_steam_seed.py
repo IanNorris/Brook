@@ -68,7 +68,7 @@ class SteamSeedTest(unittest.TestCase):
             seed.ensure_client(self.source, self.install, "1")
 
     def test_copy_failure_leaves_no_partial_client(self):
-        with patch.object(seed.shutil, "copyfile", side_effect=OSError("write failed")):
+        with patch.object(seed.shutil, "copyfileobj", side_effect=OSError("write failed")):
             with self.assertRaisesRegex(OSError, "write failed"):
                 seed.ensure_client(self.source, self.install, "1")
         self.assertEqual(list(self.install.iterdir()), [])

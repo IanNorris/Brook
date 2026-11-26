@@ -26,25 +26,53 @@ def seed_layers(seed):
 
 
 def copy_tree(source, target, layers=frozenset()):
+    # Work relative to open directory descriptors: SteamRT paths under the
+    # seed and the install exceed Brook's 255-byte syscall path limit.
     target.mkdir(mode=0o700)
-    for entry in source.iterdir():
-        target_entry = target / entry.name
-        if entry.name in layers:
-            copy_tree(entry.resolve(), target_entry)
+    source_fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY)
+    target_fd = os.open(target, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        _copy_entries(source_fd, target_fd, layers, source)
+    finally:
+        os.close(source_fd)
+        os.close(target_fd)
+
+
+def _copy_entries(source_fd, target_fd, layers, where):
+    for name in sorted(os.listdir(source_fd)):
+        if name in layers:
+            os.mkdir(name, 0o700, dir_fd=target_fd)
+            inner = os.open(name, os.O_RDONLY | os.O_DIRECTORY, dir_fd=source_fd)  # follows the layer link
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY, dir_fd=target_fd)
+            try:
+                _copy_entries(inner, child, frozenset(), where / name)
+            finally:
+                os.close(inner)
+                os.close(child)
             continue
-        if layers and entry.name == LAYERS:
+        if layers and name == LAYERS:
             continue
-        mode = entry.lstat().st_mode
+        mode = os.lstat(name, dir_fd=source_fd).st_mode
         if stat.S_ISLNK(mode):
-            target_entry.symlink_to(os.readlink(entry))
+            os.symlink(os.readlink(name, dir_fd=source_fd), name, dir_fd=target_fd)
         elif stat.S_ISDIR(mode):
-            copy_tree(entry, target_entry)
+            os.mkdir(name, 0o700, dir_fd=target_fd)
+            inner = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=source_fd)
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=target_fd)
+            try:
+                _copy_entries(inner, child, frozenset(), where / name)
+            finally:
+                os.close(inner)
+                os.close(child)
         elif stat.S_ISREG(mode):
-            # copy2/copystat would use xattrs, which Brook's ext2 does not have.
-            shutil.copyfile(entry, target_entry)
-            target_entry.chmod(0o700 if mode & 0o111 else 0o600)
+            # No copystat: it would use xattrs, which Brook's ext2 does not have.
+            reader = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=source_fd)
+            writer = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o700 if mode & 0o111 else 0o600, dir_fd=target_fd)
+            with open(reader, "rb") as data, open(writer, "wb") as output:
+                shutil.copyfileobj(data, output, 1 << 20)
         else:
-            raise ValueError(f"Unexpected file kind in the Steam client seed: {entry}")
+            raise ValueError(f"Unexpected file kind in the Steam client seed: {where / name}")
 
 
 def ensure_client(seed, install, version):
