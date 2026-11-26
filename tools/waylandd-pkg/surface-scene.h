@@ -190,8 +190,10 @@ static int surface_window(struct brook_surface *s,struct brook_view *view) {
     if (!(s->xdg_toplevel || s->xdg_popup || xwayland)) return 1;
     if (!xwayland && !s->xdg_acked) return 1;
     const uint32_t scale=surface_output_scale(s);
-    if (view->geometry.w>16384/scale || view->geometry.h>16384/scale) return 0;
-    const uint32_t width=view->geometry.w*scale,height=view->geometry.h*scale;
+    const uint32_t max_logical=physical_to_logical(16384,scale);
+    if (view->geometry.w>max_logical || view->geometry.h>max_logical) return 0;
+    const uint32_t width=logical_to_physical(view->geometry.w,scale);
+    const uint32_t height=logical_to_physical(view->geometry.h,scale);
     struct brook_wm_create_out out={0};
     if (!s->wm_id) {
         if (s->xdg_popup && (!s->popup_parent || !s->popup_parent->wm_id)) return 0;
@@ -354,7 +356,7 @@ static void surface_layer_trace(const struct brook_surface *root,const struct br
     const uint32_t now=g_now_ms();
     const int changed=w->wm!=root->wm_id || w->sig!=sig;
     w->wm=root->wm_id;w->count=count;w->vfb_w=root->vfb_w;w->vfb_h=root->vfb_h;w->path=path;
-    w->scale=surface_output_scale((struct brook_surface *)root);
+    w->scale=(surface_output_scale(root)+60)/BROOK_WL_SCALE_ONE;
     for(unsigned i=0;i<count && i<4;++i){const struct brook_view *v=draws[i].view;const struct brook_image *im=v->image;
         w->l[i].kind=im->pending_cpu?'p':im->source && im->source->dmabuf?'d':im->pixels?'s':'n';
         w->l[i].w=im->width;w->l[i].h=im->height;w->l[i].dw=v->geometry.w;w->l[i].dh=v->geometry.h;w->l[i].fmt=im->format;
@@ -408,7 +410,8 @@ static int surface_render(struct brook_surface *root) {
     /* Match the native scene-service bound in both backends, including
      * partially visible subsurfaces rather than only the root window. */
     for(unsigned i=0;i<count;++i)
-        if(draws[i].view->geometry.w>16384/scale || draws[i].view->geometry.h>16384/scale) return 0;
+        if(draws[i].view->geometry.w>physical_to_logical(16384,scale) ||
+           draws[i].view->geometry.h>physical_to_logical(16384,scale)) return 0;
     uint64_t writeIncarnation=0;
     int writeGuard=0;
     /* The native scene service does not yet expose a begin-write/commit tag
@@ -418,8 +421,9 @@ static int surface_render(struct brook_surface *root) {
         for (unsigned i=0;i<count;++i) {
             struct brook_draw *d=&draws[i];struct brook_view *view=d->view;
             struct brook_image *image=view->image;const struct brook_geometry *g=&view->geometry;
-            int64_t dx=d->x*scale,dy=d->y*scale;
-            uint32_t dw=g->w*scale,dh=g->h*scale;
+            int64_t dx=logical_to_physical(d->x,scale),dy=logical_to_physical(d->y,scale);
+            uint32_t dw=logical_to_physical(d->x+g->w,scale)-dx;
+            uint32_t dh=logical_to_physical(d->y+g->h,scale)-dy;
             if (dx>=root->vfb_w || dy>=root->vfb_h || dx+dw<=0 || dy+dh<=0) continue;
             if (!image_gpu(image,root->scene)) return 0;
             layers[n++]=(struct SceneLayerDesc){image->version,g->sx,g->sy,g->sw,g->sh,(int32_t)dx,(int32_t)dy,dw,dh,255,0,0,root->vfb_w,root->vfb_h,SCENE_LAYER_FIXED8|(g->transform<<SCENE_LAYER_TRANSFORM_SHIFT)};
@@ -440,7 +444,7 @@ static int surface_render(struct brook_surface *root) {
         const struct brook_image *image=view->image;
         if(image->pixels && image->format==1 && !g->transform && !g->sx && !g->sy &&
            g->sw==(int64_t)image->width*256 && g->sh==(int64_t)image->height*256 &&
-           g->w*scale==image->width && g->h*scale==image->height &&
+           logical_to_physical(g->w,scale)==image->width && logical_to_physical(g->h,scale)==image->height &&
            root->vfb_w==image->width && root->vfb_h==image->height){
             writeGuard=surface_begin_source_write(root,&writeIncarnation);if(!writeGuard)return 1;
             surface_layer_trace(root,draws,count,LAYER_PATH_SINGLE);
@@ -463,8 +467,11 @@ static int surface_render(struct brook_surface *root) {
     if (count==1 && draws[0].x==0 && draws[0].y==0) {
         const struct brook_view *view=draws[0].view;
         const struct brook_image *image=view->image;
-        const uint32_t *src=brook_native_crop(&view->geometry,image->pixels,image->width,image->height,
-                                             scale,root->vfb_w,root->vfb_h);
+        struct brook_geometry physical=view->geometry;
+        physical.w=logical_to_physical(physical.w,scale);
+        physical.h=logical_to_physical(physical.h,scale);
+        const uint32_t *src=brook_native_crop(&physical,image->pixels,image->width,image->height,
+                                             1,root->vfb_w,root->vfb_h);
         if (src) {
             writeGuard=surface_begin_source_write(root,&writeIncarnation);if(!writeGuard)return 1;
             surface_layer_trace(root,draws,count,LAYER_PATH_SINGLE);
@@ -478,8 +485,10 @@ static int surface_render(struct brook_surface *root) {
         struct brook_draw *d=&draws[i];struct brook_view *view=d->view;
             struct brook_image *image=view->image;const struct brook_geometry *g=&view->geometry;
         if (!image->pixels) return 0; // Never read back a GPU producer as a fallback.
-        int64_t dx=d->x*scale,dy=d->y*scale;
-        struct brook_geometry physical=*g;physical.w*=scale;physical.h*=scale;
+        int64_t dx=logical_to_physical(d->x,scale),dy=logical_to_physical(d->y,scale);
+        struct brook_geometry physical=*g;
+        physical.w=logical_to_physical(d->x+g->w,scale)-dx;
+        physical.h=logical_to_physical(d->y+g->h,scale)-dy;
         /* Bit-exact with pixel_over over brook_geometry_pixel samples; see
          * surface-blit.h. The first layer lands on the cleared composite. */
         unsigned flags=(image->opaque?BROOK_BLIT_OPAQUE:0)|(i==0?BROOK_BLIT_DST_CLEAR:0);

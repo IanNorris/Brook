@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include "../../shared/brook_desktop_scale.h"
 #include "../../shared/brook_caption_strip.h"
 
 namespace brook {
@@ -7,7 +8,7 @@ namespace brook {
 // Client buffers/coordinates are never implicitly scaled by these metrics.
 struct DesktopMetrics {
     uint32_t percent;
-    static constexpr bool Supported(uint32_t value) { return value==100 || value==150 || value==200; }
+    static constexpr bool Supported(uint32_t value) { return brook_desktop_scale_valid(value); }
     constexpr int pixels(int base) const {
         return base>=0 ? static_cast<int>((static_cast<int64_t>(base)*percent+50)/100)
                        : -static_cast<int>((-static_cast<int64_t>(base)*percent+50)/100);
@@ -33,10 +34,21 @@ struct DesktopMetrics {
     constexpr int clientOffsetX() const { return border(); }
     constexpr int clientOffsetY() const { return border() + title(); }
 };
-inline constexpr DesktopMetrics DesktopMetric100{100}, DesktopMetric150{150}, DesktopMetric200{200};
+struct DesktopMetricTable {
+    DesktopMetrics entries[BROOK_DESKTOP_SCALE_COUNT]{};
+    constexpr DesktopMetricTable() {
+        for (unsigned i = 0; i < BROOK_DESKTOP_SCALE_COUNT; ++i)
+            entries[i].percent = BROOK_DESKTOP_SCALE_MIN + i * BROOK_DESKTOP_SCALE_STEP;
+    }
+};
+inline constexpr DesktopMetricTable DesktopMetricsTable{};
 inline constexpr const DesktopMetrics* DesktopMetricsFor(uint32_t percent) {
-    return percent==100 ? &DesktopMetric100 : percent==150 ? &DesktopMetric150 : percent==200 ? &DesktopMetric200 : nullptr;
+    return DesktopMetrics::Supported(percent) ?
+        &DesktopMetricsTable.entries[(percent - BROOK_DESKTOP_SCALE_MIN) / BROOK_DESKTOP_SCALE_STEP] : nullptr;
 }
+inline constexpr const DesktopMetrics& DesktopMetric100 = *DesktopMetricsFor(100);
+inline constexpr const DesktopMetrics& DesktopMetric150 = *DesktopMetricsFor(150);
+inline constexpr const DesktopMetrics& DesktopMetric200 = *DesktopMetricsFor(200);
 struct DesktopRect {
     int x,y,w,h;
     bool contains(int px,int py) const {

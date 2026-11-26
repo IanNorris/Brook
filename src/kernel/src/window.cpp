@@ -128,11 +128,11 @@ uint32_t WmGetRequestedScale() { return __atomic_load_n(&g_requestedScale,__ATOM
 uint32_t WmGetAppliedScale() { return WmDesktopMetrics().percent; }
 const FontAtlas& WmDesktopFont() {
     uint32_t scale=WmGetAppliedScale();
-    return scale==200 ? g_desktopFont200 : scale==150 ? g_desktopFont150 : g_desktopFont100;
+    return DesktopFontForScale(scale);
 }
 const ChromeFontSet& WmChromeFonts() {
     uint32_t scale=WmGetAppliedScale();
-    return scale==200 ? g_chromeFonts200 : scale==150 ? g_chromeFonts150 : g_chromeFonts100;
+    return ChromeFontsForScale(scale);
 }
 bool WmSetScale(uint32_t percent) {
     if (!DesktopMetricsFor(percent)) return false;

@@ -92,8 +92,9 @@ def exercise(output, provider, client, image, layout, size, scale, build):
     rc = folder / 'INIT.RC'
     guest_provider = '/nix/store/' + provider.name + '/bin/waylandd'
     guest_client = '/nix/store/' + client.name + '/bin/input-preferences-fixture'
+    fractional = f' {scale}' if scale in (120, 135) else ''
     rc.write_text(f'set wm\nset vfb none\nrun --service --once --uid 1000 {guest_provider}\n'
-                  f'run --console --uid 1000 {guest_client} {layout} {size}\n')
+                  f'run --console --uid 1000 {guest_client} {layout} {size}{fractional}\n')
     for source, dest in ((keyboard, 'ETC/keyboard-layout'), (config, 'ETC/desktop-defaults.ini'), (rc, 'BOOT/INIT.RC')):
         run('mcopy', '-o', '-i', initrd, source, '::' + dest)
     disk = probe / 'probe.raw'
@@ -122,6 +123,15 @@ def exercise(output, provider, client, image, layout, size, scale, build):
         vm = subprocess.Popen(qemu, stdout=log, stderr=subprocess.STDOUT)
         try:
             wait_for(vm, serial, 'INPUT_PREFS_FOCUSED')
+            if fractional:
+                wait_for(vm, serial, 'INPUT_PREFS_NATIVE_CHROME')
+                units = scale * 120 // 100
+                width = (256 * units + 60) // 120
+                height = (128 * units + 60) // 120
+                log = wait_for(vm, serial, f'INPUT_PREFS_SCALE scale120={units} buffer={width}x{height}')
+                assert re.search(rf"WM: created window .*'Input preferences fixture'.* {width}x{height} ", log), serial
+            if scale != 100:
+                wait_for(vm, serial, f'WM: desktop scale applied {scale}%')
             qmp = Qmp(sock)
             # Save both cursor positions with the same static background.
             image_a = screenshot(qmp, folder / 'cursor.ppm')
@@ -187,7 +197,7 @@ def main():
     for name in ('output','provider','client'):
         ap.add_argument('--'+name,type=Path,required=True)
     ap.add_argument('--build',type=Path,default=ROOT/'build/release')
-    ap.add_argument('--scale',type=int,choices=(100,200),default=100)
+    ap.add_argument('--scale',type=int,choices=(100,120,135,200),default=100)
     args=ap.parse_args()
     if subprocess.run(['pgrep','-x','vmware-vmx'],stdout=subprocess.DEVNULL).returncode == 0:
         ap.error('Workstation is running')
@@ -195,7 +205,7 @@ def main():
     output.mkdir(parents=True)
     image=make_application_image(output,args.provider,args.client)
     proof={}
-    sizes = (24,48) if args.scale==100 else (48,64)
+    sizes = (48,64) if args.scale==200 else (24,48)
     for layout,size in zip(('gb','us'), sizes):
         proof[layout]=exercise(output,args.provider,args.client,image,layout,size,args.scale,args.build)
         (output/'verdict.json').write_text(json.dumps(proof,indent=2)+'\n')

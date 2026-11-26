@@ -51,7 +51,7 @@ static void SelectTtyFont(uint32_t width, uint32_t height)
     // High-resolution laptop panels otherwise make early recovery messages
     // unreadably small. Reuse the already-baked desktop atlas; low-resolution
     // displays retain the original console size.
-    g_ttyFont = width >= 2560 && height >= 1440 ? &g_desktopFont200 : &g_fontAtlas;
+    g_ttyFont = width >= 2560 && height >= 1440 ? &DesktopFontForScale(200) : &g_fontAtlas;
 }
 
 uint32_t TtyLineHeight()

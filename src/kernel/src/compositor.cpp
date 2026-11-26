@@ -5220,8 +5220,9 @@ static bool CompositorDrawManualPowerOff()
         const uint32_t stride = g_backBuffer ? g_backBufStride : g_physFbStride;
         for (uint32_t y = 0; y < g_deskHeight; ++y)
             memset(pixels + y * stride, 0, g_deskWidth * sizeof(*pixels));
-        const auto& font = MeasureConsoleText(message, g_desktopFont200) <= g_deskWidth &&
-                           uint32_t(g_desktopFont200.lineHeight) <= g_deskHeight ? g_desktopFont200 : g_fontAtlas;
+        const auto& largeFont = DesktopFontForScale(200);
+        const auto& font = MeasureConsoleText(message, largeFont) <= g_deskWidth &&
+                           uint32_t(largeFont.lineHeight) <= g_deskHeight ? largeFont : g_fontAtlas;
         const uint32_t width = MeasureConsoleText(message, font);
         const uint32_t height = uint32_t(font.lineHeight);
         // Centred on the primary output (the framebuffer), not across a multi-output desktop.

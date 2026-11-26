@@ -14,6 +14,7 @@ pkgs.stdenv.mkDerivation {
     cp ${../../src/shared/brook_taskbar.h} brook_taskbar.h
     cp ${../../src/shared/brook_pointer.h} brook_pointer.h
     cp ${../../src/shared/input_preferences.h} input_preferences.h
+    cp ${../../src/shared/brook_desktop_scale.h} brook_desktop_scale.h
     cp ${../../src/shared/brook_gtk_appearance.h} brook_gtk_appearance.h
   '';
   buildPhase = ''

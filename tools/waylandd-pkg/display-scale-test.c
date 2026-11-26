@@ -12,17 +12,20 @@ static unsigned long long cursor_owner;
 static uint32_t framebuffer[48],cursor_pixels[4096],cursor_width,cursor_height;
 static int32_t hotspot_x,hotspot_y;
 static uint32_t native_width,native_height,presents;
+static uint32_t expected_width=8,expected_height=6;
+static long applied_percent=100;
+
 static long test_syscall(long number,...) {
     if(number==0xB06){errno=EOPNOTSUPP;return -1;}
     va_list ap;va_start(ap,number);
-    if(number==0xB04){long op=va_arg(ap,long);va_end(ap);return op==0?200:100;}
+    if(number==0xB04){long op=va_arg(ap,long);va_end(ap);return op==0?200:applied_percent;}
     if (number==BROOK_SYS_WM_CREATE_WINDOW || number==BROOK_SYS_WM_RESIZE_VFB) {
         if (number==BROOK_SYS_WM_RESIZE_VFB) (void)va_arg(ap,long);
         native_width=va_arg(ap,long);native_height=va_arg(ap,long);
         if (number==BROOK_SYS_WM_CREATE_WINDOW) (void)va_arg(ap,long);
         struct brook_wm_create_out *out=(void *)va_arg(ap,long);
-        assert(native_width==8 && native_height==6);
-        *out=(struct brook_wm_create_out){1,8,(uintptr_t)framebuffer};
+        assert(native_width==expected_width && native_height==expected_height);
+        *out=(struct brook_wm_create_out){1,native_width,(uintptr_t)framebuffer};
     } else if (number==BROOK_SYS_WM_SET_CURSOR_IMAGE) {
         const uint32_t *px=(void *)va_arg(ap,long);
         cursor_width=va_arg(ap,long);cursor_height=va_arg(ap,long);
@@ -52,6 +55,68 @@ static void commit_pixels(struct brook_surface *s,uint32_t *pixels,int w,int h) 
     struct brook_image *image=image_snapshot((void *)pixels,w,h,w*4,WL_SHM_FORMAT_ARGB8888);assert(image);
     assert(surface_tree_commit(s,image)==1);image_unref(image);
 }
+static void test_fractional_protocol(void) {
+    int pair[2];
+    assert(!socketpair(AF_UNIX,SOCK_STREAM,0,pair));
+    struct wl_display *display=wl_display_create();
+    assert(display);
+    struct wl_client *client=wl_client_create(display,pair[0]);
+    assert(client);
+    struct brook_surface *surface=make_surface(client);
+    struct wl_resource *manager=wl_resource_create(client,&wp_fractional_scale_manager_v1_interface,1,0);
+    struct wl_resource *viewporter=wl_resource_create(client,&wp_viewporter_interface,1,0);
+    assert(manager && viewporter);
+    applied_percent=120;
+    output_scale_sample(0);
+    fractional_get(client,manager,0,surface->resource);
+    assert(surface->fractional_scale);
+    viewporter_get_viewport(client,viewporter,0,surface->resource);
+    assert(surface->viewport);
+    viewport_set_destination(client,surface->viewport,6,3);
+    surface->xdg_toplevel=wl_resource_create(client,&xdg_toplevel_interface,1,0);
+    surface->xdg_surface=wl_resource_create(client,&xdg_surface_interface,1,0);
+    surface->xdg_acked=1;
+    surface->scene_disabled=1;
+    uint32_t pixels[32];
+    for(unsigned i=0;i<32;++i)pixels[i]=0xff334400|i;
+    // One-to-one destination pixels from a fractional client viewport.
+    expected_width=7;expected_height=4;
+    commit_pixels(surface,pixels,7,4);
+    assert(surface_render(surface));
+    assert(native_width==7 && native_height==4 && framebuffer[27]==pixels[27]);
+    assert(surface_pointer_fixed(surface,6)==5*256);
+    assert(logical_to_physical(-3,144)==-4);
+    applied_percent=135;
+    output_refresh(1);
+    assert(g_output_scale120==162 && g_output_scale==1);
+    expected_width=8;expected_height=4;
+    commit_pixels(surface,pixels,8,4);
+    assert(surface_render(surface));
+    assert(native_width==8 && native_height==4 && framebuffer[31]==pixels[31]);
+    assert(surface_pointer_fixed(surface,27)==20*256);
+    wl_display_flush_clients(display);
+    uint32_t wire[512];
+    ssize_t bytes=recv(pair[1],wire,sizeof(wire),MSG_DONTWAIT);
+    assert(bytes>0);
+    const uint32_t scale_id=wl_resource_get_id(surface->fractional_scale);
+    const uint32_t expected[]={144,162};
+    unsigned count=0;
+    for(size_t i=0;i<(size_t)bytes/4;) {
+        uint32_t size=wire[i+1]>>16;
+        assert(size>=8 && i*4+size<=(size_t)bytes);
+        if(wire[i]==scale_id) {
+            assert((wire[i+1]&65535)==WP_FRACTIONAL_SCALE_V1_PREFERRED_SCALE);
+            assert(size==12 && count<2 && wire[i+2]==expected[count++]);
+        }
+        i+=size/4;
+    }
+    assert(count==2);
+    wl_client_destroy(client);
+    assert(!g_surfaces);
+    close(pair[1]);
+    wl_display_destroy(display);
+}
+
 int main(void) {
     int pair[2];assert(!socketpair(AF_UNIX,SOCK_STREAM,0,pair));
     struct wl_display *d=wl_display_create();assert(d);
@@ -83,13 +148,13 @@ int main(void) {
     assert(pointer_region_contains(&region,pointer_fixed_floor(surface_pointer_fixed(root,1)),0));
     assert(!pointer_region_contains(&region,pointer_fixed_floor(surface_pointer_fixed(root,2)),0));
     struct brook_surface x11={.role=4};surface_tree_init(&x11);
-    assert(surface_output_scale(&x11)==1 && surface_pointer_fixed(&x11,3)==3*256);
+    assert(surface_output_scale(&x11)==BROOK_WL_SCALE_ONE && surface_pointer_fixed(&x11,3)==3*256);
     cursor->is_cursor=1;cursor->role=3;cursor->cursor_hot_x=1;cursor->cursor_hot_y=1;cursor->cursor_owner_wm=1;
     surface_set_buffer_scale(client,cursor->resource,2);commit_pixels(cursor,background,8,6);
     surface_cursor_commit(cursor);
     assert(cursor_width==8 && cursor_height==6 && hotspot_x==2 && hotspot_y==2);
     assert(!memcmp(cursor_pixels,background,sizeof(background)));
-    cursor->cursor_output_scale=1;surface_cursor_commit(cursor);
+    cursor->cursor_output_scale=BROOK_WL_SCALE_ONE;surface_cursor_commit(cursor);
     assert(cursor_width==4 && cursor_height==3 && hotspot_x==1 && hotspot_y==1);
     /* Exercise the real pointer dispatcher and decode the wire, including a
      * button before motion. Raw relative motion is intentionally unscaled. */
@@ -189,6 +254,7 @@ int main(void) {
     assert(!surface_render(root) && presents==1);
     oversized->geometry.w=saved_width;
     wl_client_destroy(client);assert(!g_surfaces);close(pair[1]);wl_display_destroy(d);
-    puts("DISPLAY_SCALE_PASS 2x native buffers, exact HiDPI pixels, subsurfaces, scene rectangles, resize, fractional absolute input, negative region edges, cursors and X11 pixel contract");
+    test_fractional_protocol();
+    puts("DISPLAY_SCALE_PASS 120% and 135% preferences and exact viewport pixels; 2x native buffers, exact HiDPI pixels, subsurfaces, scene rectangles, resize, fractional absolute input, negative region edges, cursors and X11 pixel contract");
     return 0;
 }

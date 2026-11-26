@@ -1,7 +1,7 @@
 { pkgs ? import ../../nix/nixpkgs.nix {} }:
 let
   required = [
-    "chrome_display_list.h" "chrome_fonts.cpp" "chrome_material.h" "chrome_raster.cpp"
+    "chrome_display_list.h" "chrome_material.h" "chrome_raster.cpp"
     "chrome_raster.h" "chrome_tray.h" "chrome_shell.cpp" "chrome_shell.h" "chrome_shell_model.h"
     "chrome_launcher.cpp" "chrome_launcher.h" "launcher_model.cpp" "launcher_model.h"
     "chrome_shell_wire.h" "chrome_style.h" "desktop_build_info.h" "desktop_calendar.h" "desktop_disk_popup.h" "desktop_stats_popup.h" "desktop_metrics.h" "desktop_telemetry.h"

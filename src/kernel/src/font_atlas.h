@@ -41,8 +41,6 @@ struct FontAtlas
 extern const FontAtlas g_fontAtlas;
 // Native desktop fonts are baked at their final size. Terminal text continues
 // to use g_fontAtlas regardless of desktop scale.
-extern const FontAtlas g_desktopFont100;
-extern const FontAtlas g_desktopFont150;
-extern const FontAtlas g_desktopFont200;
+const FontAtlas& DesktopFontForScale(uint32_t percent);
 
 } // namespace brook
