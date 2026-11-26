@@ -985,6 +985,8 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
             boolean("profile_transfer_ready",usb.profileTransferReady);
             boolean("uncertain",usb.uncertain);boolean("final_sync_attempted",usb.finalAttempted);
             r.text(",\"stage\":");r.quoted(usb.stage);
+            r.text(",\"fsck\":");r.quoted(usb.fsck);
+            r.text(",\"fsck_exit\":");signedNumber(usb.fsckExit);
             r.text(",\"disk\":");signedNumber(usb.disk);
             r.text(",\"error\":");signedNumber(usb.error);
             r.text(",\"final_error\":");signedNumber(usb.finalError);
@@ -2311,16 +2313,14 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         valid=valid && bytes && *p++==' ' && ReadId(p,boot) && !*p;
         if(!valid){DebugChannelSend("{\"power_error\":\"Expected request_id verb boot_id\"}\n");return true;}
         if(!DebugEpochMatches(boot)){DebugChannelSend("{\"boot_error\":\"Guest boot changed; attach explicitly again\"}\n");return true;}
-        // retry / force_power_off are the desktop's own actions after a failed
-        // checked shutdown; ShutdownCommand accepts them only for the current
-        // operation in Failed after an irreversible stage (retry: a failed final
-        // sync; force_power_off: only where power-off is supported).
+        // These recovery actions apply to the current irreversible failure.
+        // A forced transition requires the corresponding platform capability.
         const bool pendingBoot=!strcmp(verb,"pending_boot");
         const bool pendingSoftware=!strcmp(verb,"pending_software");
         if(!pendingBoot && !pendingSoftware && strcmp(verb,"restart_force") &&
            strcmp(verb,"restart_boot") && strcmp(verb,"restart_software") &&
            strcmp(verb,"shutdown") && strcmp(verb,"restart") && strcmp(verb,"power_status") && strcmp(verb,"cancel") && strcmp(verb,"commit") && strcmp(verb,"force_apps") &&
-           strcmp(verb,"retry") && strcmp(verb,"force_power_off")){
+           strcmp(verb,"retry") && strcmp(verb,"force_power_off") && strcmp(verb,"force_restart")){
             DebugChannelSend("{\"power_error\":\"Unsupported power operation\"}\n");return true;
         }
         char state[24]{};int error=0;
@@ -2340,6 +2340,7 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",\"status\":");r.quoted(blockers.status);
         r.text(",\"stage\":");r.quoted(blockers.stage);
         r.text(",\"force_apps_available\":");r.text(ShutdownCanForceApps(id)?"true":"false");
+        r.text(",\"force_restart_available\":");r.text(ShutdownCanForceRestart(id)?"true":"false");
         r.text(",");r.field("blocker_count",blockers.count);
         r.text(",");r.field("next_signal_ms",blockers.nextSignalMs);
         r.text(",\"blockers\":[");

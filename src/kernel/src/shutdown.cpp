@@ -9,6 +9,9 @@
 #include "vfs.h"
 #include "memory/file_object.h"
 #include "ext2_vfs.h"
+#if defined(BROOK_EFI_SHUTDOWN_TEST)
+#include "fatfs_glue.h"
+#endif
 #include "writable_desktop.h"
 #include "usb_system.h"
 #include "ahci_system_volume.h"
@@ -34,9 +37,10 @@
 
 namespace brook {
 // Strong definition of vfs.cpp's weak sync failure hook: bridge-visible.
-void VfsSyncFailureLog(int stage, uint8_t pdrv, const void* callback, int error) {
+void VfsSyncFailureLog(int stage, uint8_t pdrv, const void* callback, int error, bool ignoredVolatile) {
     static const char* const names[]={"file writeback","backing sync","retired unmount"};
-    KPrintf("vfs: sync: %s failed pdrv=%u callback=%p (%d)\n",names[stage>=0&&stage<3?stage:0],unsigned(pdrv),callback,error);
+    KPrintf("vfs: sync: %s failed pdrv=%u callback=%p (%d)%s\n",names[stage>=0&&stage<3?stage:0],
+            unsigned(pdrv),callback,error,ignoredVolatile?" ignored at shutdown (volatile backing)":"");
 }
 namespace {
 enum class Phase { Empty,Prompting,Rejected,Closing,Services,Cleanup,Syncing,Ready,Committing,Failed,Cancelled };
@@ -45,7 +49,7 @@ struct Operation {
     bool forceRequested,forceDispatched;
     // syncFailed: Failed came from the final sync (an explicit retry may
     // repeat it). retry/forced: the explicit desktop actions after Failed.
-    bool syncFailed,retry,forced;
+    bool syncFailed,retry,forced,forcedReset;
     int error;
     RestartPrompt prompt;
     RestartReason reason;
@@ -132,7 +136,7 @@ void SetPhase(int index,Phase phase,int error=0) {
 // Each step's result goes to the kernel log ring (bridge-visible), so a
 // failed checked shutdown names the step that failed.
 int FinalSync() {
-    int error=VfsSync(nullptr);
+    int error=VfsSyncForShutdown();
     KPrintf("shutdown: final sync vfs=%d\n",error);
 #if defined(BROOK_SSD_INSTALLER)
     if(!error){error=AhciPhysicalBlockToolsFinalSync();KPrintf("shutdown: final sync block-tools=%d\n",error);}
@@ -435,7 +439,13 @@ void Worker(void*) {
 #if defined(BROOK_SSD_GUARDED_DESKTOP)
                 GuardPrepareCheckedSlotShutdown();
 #endif
+                KLogStopFileWrites();
                 if(!DeviceCloseWrites()){SchedulerSleepMs(25);continue;}
+#if defined(BROOK_EFI_SHUTDOWN_TEST)
+                char sticky[2]{};
+                if (FwCfgReadFile("opt/brook/volatile-fat-error", sticky, sizeof(sticky)) == 1 && sticky[0] == '1')
+                    KPrintf("VOLATILE_FAT_STICKY injected=%u\n", FatFsInjectRamWriteFailureForTest() ? 1u : 0u);
+#endif
                 SetPhase(selected,Phase::Syncing);AudioPrepareShutdown();AudioStop();HdaRuntimeShutdown();
                 FinishSync(selected,FinalSync());
             }
@@ -445,9 +455,10 @@ void Worker(void*) {
         }else if(op.phase==Phase::Committing&&op.forced) {
             // Explicit user choice after a failed checked shutdown: data the
             // failed sync could not write is lost. Services are already stopped.
-            KLog("shutdown: forced power off after failed shutdown");
+            KLog(op.forcedReset?"shutdown: forced restart after failed shutdown":
+                                "shutdown: forced power off after failed shutdown");
             SchedulerSleepMs(500);
-            if(PlatformPowerIssue(false))SchedulerSleepMs(1000);
+            if(PlatformPowerIssue(op.forcedReset, op.forcedReset))SchedulerSleepMs(1000);
             SetPhase(selected,Phase::Failed,-5);
         }else if(op.phase==Phase::Ready&&(op.automatic||op.commit)&&(op.restart?powerRestart:powerOff)) {
             SetPhase(selected,Phase::Committing);
@@ -588,7 +599,7 @@ void HandleShutdownCommand(const char* id,const char* verb,char state[24],int* e
             windowless.Reset();memset(&blockerReport,0,sizeof(blockerReport));
         }
     }else if(!start&&!forceApps&&strcmp(verb,"power_status")&&strcmp(verb,"cancel")&&strcmp(verb,"commit")&&
-             strcmp(verb,"retry")&&strcmp(verb,"force_power_off")){result="unsupported";*error=-95;}
+             strcmp(verb,"retry")&&strcmp(verb,"force_power_off")&&strcmp(verb,"force_restart")){result="unsupported";*error=-95;}
     if(!result&&found<0){result="missing";*error=-2;}
     if(!result) {
         auto& op=operations[found];
@@ -613,8 +624,11 @@ void HandleShutdownCommand(const char* id,const char* verb,char state[24],int* e
             if(current==found&&op.phase==Phase::Failed&&op.syncFailed&&irreversible){op.phase=Phase::Syncing;op.retry=true;op.error=0;}
             else {result="not_ready";*error=-16;}
         }
-        if(!strcmp(verb,"force_power_off")) {
-            if(current==found&&op.phase==Phase::Failed&&irreversible&&powerOff){op.phase=Phase::Committing;op.forced=true;op.error=0;}
+        const bool forceReset=!strcmp(verb,"force_restart");
+        if(forceReset || !strcmp(verb,"force_power_off")) {
+            if(current==found&&op.phase==Phase::Failed&&irreversible&&(forceReset?(powerRestart || PlatformPowerGetPlan().CanForceEfiRestart()):powerOff)) {
+                op.phase=Phase::Committing;op.forced=true;op.forcedReset=forceReset;op.error=0;
+            }
             else {result="not_ready";*error=-16;}
         }
         if(!strcmp(verb,"commit")) {if(op.phase==Phase::Ready||op.phase==Phase::Committing) {
@@ -719,10 +733,16 @@ void ShutdownDesktopForcePowerOff() {
     if(id[0]){char state[24];int error;ShutdownCommand(id,"force_power_off",state,&error);
         if(!error)SerialPrintf("shutdown: request=%s forced power off requested\n",id);}
 }
+void ShutdownDesktopForceRestart() {
+    char id[33]{};SpinLockAcquire(&lock);if(current>=0)memcpy(id,operations[current].id,33);SpinLockRelease(&lock);
+    if(id[0]){char state[24];int error;ShutdownCommand(id,"force_restart",state,&error);
+        if(!error)SerialPrintf("shutdown: request=%s forced restart requested\n",id);}
+}
 ShutdownFailureActions ShutdownDesktopFailureActions() {
     SpinLockAcquire(&lock);ShutdownFailureActions actions{};
     if(current>=0&&operations[current].phase==Phase::Failed&&irreversible) {
         actions.failed=true;actions.retry=operations[current].syncFailed;actions.forcePowerOff=powerOff;
+        actions.forceRestart=powerRestart || PlatformPowerGetPlan().CanForceEfiRestart();
     }
     SpinLockRelease(&lock);return actions;
 }
@@ -733,6 +753,13 @@ bool ShutdownCanForceApps(const char* id) {
     SpinLockAcquire(&lock);
     const bool result=current>=0 && (!id || !strcmp(operations[current].id,id)) &&
         CanForceAppsLocked(operations[current]);
+    SpinLockRelease(&lock);
+    return result;
+}
+bool ShutdownCanForceRestart(const char* id) {
+    SpinLockAcquire(&lock);
+    const bool result=current>=0 && irreversible && (powerRestart || PlatformPowerGetPlan().CanForceEfiRestart()) &&
+        operations[current].phase==Phase::Failed && !strcmp(operations[current].id,id);
     SpinLockRelease(&lock);
     return result;
 }

@@ -92,6 +92,8 @@ void KLogCatConsole(LogCat cat, LogLevel level, const char* fmt, ...);
 
 // Flush pending writes to disk.
 void KLogSync();
+// Drain and stop logging to /boot/BROOK.LOG before closing device writes.
+void KLogStopFileWrites();
 
 // Print the entire log to TTY and serial.
 void KLogDump();

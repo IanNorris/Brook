@@ -475,6 +475,7 @@ struct brook_surface {
     int32_t popup_w, popup_h;
     int32_t popup_x, popup_y;
     struct brook_surface *popup_parent;
+    int capture_excluded;
 
     /* Requests become eligible only when their surface state is committed. */
     struct wl_list pending_frames, committed_frames, waiting_frames;
@@ -483,7 +484,7 @@ struct brook_surface {
     uint32_t trace_request_max_ms, trace_committed_max_ms;
 
     /* Latest set_title — copied so it survives the wayland string. */
-    char title[64];
+    char title[BROOK_WM_POLICY_TITLE_BYTES];
     char app_id[128]; /* xdg identity; independent of the document/window title */
 
     /* Kernel Window backing this xdg_toplevel.  Created lazily on the
@@ -636,7 +637,7 @@ static void latency_commit(struct brook_surface *s, struct wl_client *client) {
 
 static int g_drm_fd = -1;
 static int g_drm_intel;
-static void popup_apply_position(struct brook_surface *);
+static int popup_apply_position(struct brook_surface *);
 static int xwayland_surface_ready(const struct brook_surface *);
 static unsigned xwayland_surface_flags(const struct brook_surface *);
 static void xwayland_surface_created(struct brook_surface *);
@@ -677,6 +678,7 @@ static void toplevel_apply_fullscreen(struct brook_surface *s) {
     if (rc==0) s->toplevel_fullscreen=s->want_fullscreen;
     fprintf(stderr,"[waylandd] xdg_toplevel fullscreen=%d wm=%u rc=%ld\n",s->want_fullscreen,s->wm_id,rc);
 }
+static int capture_excluded(const struct brook_surface *surface);
 #include "surface-scene.h"
 static struct brook_image *intel_dmabuf_snapshot(const struct brook_dmabuf_buffer *db,int *uncertain);
 static struct brook_image *intel_dmabuf_defer(struct brook_buffer *buffer);
@@ -766,12 +768,12 @@ static void positioner_compute_geometry(const struct brook_positioner *p,
     *out_h = ph;
 }
 
-static void popup_apply_position(struct brook_surface *s) {
+static int popup_apply_position(struct brook_surface *s) {
     if (!s || !s->xdg_popup || !s->wm_id || !s->popup_parent || !s->popup_parent->wm_id)
-        return;
+        return 0;
     const int64_t scale=surface_output_scale(s);
     int64_t px=(int64_t)s->popup_x*scale,py=(int64_t)s->popup_y*scale;
-    if (px<INT32_MIN || px>INT32_MAX || py<INT32_MIN || py>INT32_MAX) return;
+    if (px<INT32_MIN || px>INT32_MAX || py<INT32_MIN || py>INT32_MAX) return 0;
     long rc = wm_move_relative(s->wm_id, s->popup_parent->wm_id, (int32_t)px, (int32_t)py);
     if (rc != 0) {
         fprintf(stderr, "[waylandd] WM_MOVE_RELATIVE popup=%u parent=%u at (%d,%d) failed rc=%ld errno=%d\n",
@@ -780,6 +782,7 @@ static void popup_apply_position(struct brook_surface *s) {
         fprintf(stderr, "[waylandd] WM_MOVE_RELATIVE popup=%u parent=%u at (%d,%d)\n",
                 s->wm_id, s->popup_parent->wm_id, s->popup_x, s->popup_y);
     }
+    return rc == 0;
 }
 
 static void on_sigint(int sig) { (void)sig; g_shutdown = 1; }
@@ -1523,6 +1526,65 @@ static const struct wl_compositor_interface compositor_impl = {
     .create_region  = compositor_create_region,
 };
 
+/* This small extension has no events or generated server marshallers.
+ * Its client bindings can be generated from protocols/brook-capture-v1.xml. */
+static const struct wl_interface *capture_request_types[] = { &wl_surface_interface };
+static const struct wl_message capture_requests[] = {
+    { "destroy", "", NULL },
+    { "exclude", "o", capture_request_types },
+};
+static const struct wl_interface brook_capture_manager_v1_interface = {
+    "brook_capture_manager_v1", 1, 2, capture_requests, 0, NULL,
+};
+
+static int capture_excluded(const struct brook_surface *surface)
+{
+    for (const struct brook_surface *s = surface; s; s = s->popup_parent)
+        if (s->capture_excluded) return 1;
+    return 0;
+}
+
+static void capture_manager_destroy(struct wl_client *client, struct wl_resource *resource)
+{
+    (void)client;
+    wl_resource_destroy(resource);
+}
+
+static void capture_manager_exclude(struct wl_client *client, struct wl_resource *manager,
+                                    struct wl_resource *surface)
+{
+    (void)client;
+    struct brook_surface *root = wl_resource_get_user_data(surface);
+    if (!root || !root->xdg_toplevel) {
+        wl_resource_post_error(manager, 0, "exclude requires an xdg_toplevel wl_surface");
+        return;
+    }
+    root->capture_excluded = 1;
+    for (struct brook_surface *s = g_surfaces; s; s = s->next) {
+        if (!s->wm_id || !capture_excluded(s)) continue;
+        if (syscall(BROOK_SYS_WM_EXCLUDE_CAPTURE, (long)s->wm_id) < 0) {
+            wl_resource_post_error(manager, 0, "WM could not exclude the surface from capture");
+            return;
+        }
+    }
+}
+
+static const struct {
+    void (*destroy)(struct wl_client*, struct wl_resource*);
+    void (*exclude)(struct wl_client*, struct wl_resource*, struct wl_resource*);
+} capture_manager_impl = { capture_manager_destroy, capture_manager_exclude };
+
+static void capture_manager_bind(struct wl_client *client, void *data, uint32_t version, uint32_t id)
+{
+    (void)data;
+    struct wl_resource *manager = wl_resource_create(client, &brook_capture_manager_v1_interface, version, id);
+    if (!manager) {
+        wl_client_post_no_memory(client);
+        return;
+    }
+    wl_resource_set_implementation(manager, &capture_manager_impl, NULL, NULL);
+}
+
 static void compositor_bind(struct wl_client *client, void *data,
                             uint32_t version, uint32_t id) {
     (void)data;
@@ -1546,9 +1608,11 @@ static void xdg_toplevel_set_title(struct wl_client *c, struct wl_resource *r,
     (void)c;
     struct brook_surface *s = wl_resource_get_user_data(r);
     if (!s || !title) return;
+    if (strlen(title) >= sizeof(s->title)) s->capture_excluded = 1;
     snprintf(s->title, sizeof(s->title), "%s", title);
-    if (s->wm_id) wm_set_title(s->wm_id, s->title);
-    fprintf(stderr, "[waylandd] xdg_toplevel.set_title: %s\n", s->title);
+    // Let the kernel see the original string so its bound check and
+    // privacy update happen together on an already mapped window.
+    if (s->wm_id) wm_set_title(s->wm_id, title);
 }
 static void deco_apply_mode(struct wl_resource *r, int csd);
 static int deco_force_server_side(const struct brook_surface *s);
@@ -5077,6 +5141,7 @@ int main(int argc, char **argv)
                           NULL, seat_bind)) return 1;
     if (!wl_global_create(g_display,&zwp_relative_pointer_manager_v1_interface,1,NULL,relative_manager_bind)) return 1;
     if (!wl_global_create(g_display,&zwp_pointer_constraints_v1_interface,1,NULL,pointer_constraints_bind)) return 1;
+    if (!wl_global_create(g_display, &brook_capture_manager_v1_interface, 1, NULL, capture_manager_bind)) return 1;
     if (!wl_global_create(g_display,&zwp_idle_inhibit_manager_v1_interface,1,NULL,idle_manager_bind)) return 1;
     if (!wl_global_create(g_display, &zwp_text_input_manager_v3_interface, 1, NULL, text_input_manager_bind)) return 1;
     if (!wl_global_create(g_display, &wl_output_interface, 4, NULL, output_bind)) return 1;

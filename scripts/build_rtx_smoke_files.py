@@ -77,7 +77,7 @@ ETC_ALLOWED = {*MARKERS, 'i219-attach', 'i219-reset', 'hardware-payload-id', 're
                'keyboard-layout',
                'bridge-v3-operators', 'rtx-update-signer', 'restart-prompt-seconds',
                # --session desktop only
-               'live-store', 'usb-system', 'usb-profile-plan.pub', 'usb-system-trim', 'usb-bot-legacy', 'usb-bot-pipeline', 'usb-uas', 'usb-uas-fixture', 'volatile-desktop', 'hardware-bulk', 'usb-audio-mixer', 'dp-idle-seconds', 'nv-display', 'chromium-alsa-device',
+               'live-store', 'usb-system', 'usb-system-no-fsck', 'usb-profile-plan.pub', 'usb-system-trim', 'usb-bot-legacy', 'usb-bot-pipeline', 'usb-uas', 'usb-uas-fixture', 'volatile-desktop', 'hardware-bulk', 'usb-audio-mixer', 'dp-idle-seconds', 'nv-display', 'chromium-alsa-device',
                # --nv-gsp (GSP-RM M1 bridge verbs) and its firmware record
                'nv-gsp', 'nv-gsp-firmware', 'nv-gsp-no-autostart', 'nv-drm', 'nv-gsp-registry', 'nv-gsp-no-scrubber', 'usb-system-no-mount', 'nv-gsp-swgen0-ack', 'nv-gsp-primary', 'nv-gsp-no-ce-present', 'nv-gsp-headless-p4', 'nv-gsp-no-bar1-identity'}
 # Desktop live stick (--session desktop): the VMware RC session over the RAM
@@ -271,6 +271,40 @@ def embed_usb_profile_runtime(args, initrd, profile):
     fat_write(initrd, 'BOOT/USBSTAGE.RC', launcher.encode())
 
 
+FSCK_PIN_HEADER = ROOT / 'src/kernel/src/usb_system_fsck_policy.h'
+FSCK_INITRD_PATH = 'BOOT/E2FSCK.ELF'
+
+
+def fsck_pin():
+    """The kernel only executes the e2fsck whose SHA-256 it pins."""
+    found = re.findall(r'UsbSystemFsckSha256\[\] =\s*"([0-9a-f]{64})";', FSCK_PIN_HEADER.read_text())
+    if len(found) != 1:
+        raise SystemExit(f'{FSCK_PIN_HEADER}: expected one UsbSystemFsckSha256 pin')
+    return found[0]
+
+
+def embed_usb_system_fsck(args, initrd, roots):
+    """Static e2fsck (pinned nixpkgs pkgsStatic.e2fsprogs) for boot repair of BROOK_SYSTEM."""
+    from hardware_recovery_fsck import validate_checker
+    out = Path(subprocess.check_output(
+        ['nix-build', '-o', str(roots / 'e2fsprogs-static'), '-E',
+         f'(import {ROOT / "nix/nixpkgs.nix"} {{}}).pkgsStatic.e2fsprogs'], text=True).strip().splitlines()[-1])
+    binary = (out / 'bin/e2fsck').resolve(strict=True)
+    info = validate_checker(binary)
+    pin = fsck_pin()
+    if info['sha256'] != pin:
+        raise SystemExit(f'{binary}: sha256 {info["sha256"]} does not match the kernel pin {pin}')
+    data = binary.read_bytes()
+    fat_write(initrd, FSCK_INITRD_PATH, data)
+    if subprocess.check_output(['mtype', '-i', str(initrd), '::/' + FSCK_INITRD_PATH]) != data:
+        raise SystemExit(FSCK_INITRD_PATH + ' readback mismatch')
+    if args.usb_system_no_fsck:
+        fat_write(initrd, 'ETC/usb-system-no-fsck', b'1\n')
+    return {'path': '/BOOT/E2FSCK.ELF', 'source': str(binary), 'bytes': info['bytes'],
+            'sha256': info['sha256'], 'command': 'e2fsck -p -f /dev/brook-usb-system',
+            'automatic': not args.usb_system_no_fsck}
+
+
 def desktop_payload(args, initrd):
     """Embed desktop boot assets from a signed plan or the fallback RAM store."""
     from stage_clearwater_shell import add_clearwater_start, embed_clearwater_executables, embed_terminal_shortcut
@@ -358,6 +392,7 @@ def desktop_payload(args, initrd):
             fat_write(initrd, 'ETC/usb-system-no-mount', b'1\n')
         if args.usb_system_trim:
             fat_write(initrd, 'ETC/usb-system-trim', (args.usb_system_trim + '\n').encode())
+        fsck = embed_usb_system_fsck(args, initrd, roots)
     else:
         fat_write(initrd, 'ETC/live-store', store['record'].encode())
     fat_write(initrd, 'BOOT/BIN/BASH', (profile / 'bin/bash').read_bytes())
@@ -371,7 +406,7 @@ def desktop_payload(args, initrd):
     fat_write(initrd, 'BOOT/WALLPAPER.RAW', wallpaper)
     if args.usb_system:
         storage = {'record': record, 'profile': str(profile), 'plan_sha256': plan_hash,
-                   'plan_key_sha256': hashlib.sha256(key_bytes).hexdigest()}
+                   'plan_key_sha256': hashlib.sha256(key_bytes).hexdigest(), 'fsck': fsck}
     else:
         storage = {k: store[k] for k in
                    ('bytes', 'sha256', 'partition_guid', 'partition_name', 'profile', 'record', 'slot')
@@ -399,6 +434,7 @@ def build(args):
     if args.usb_system:
         from usb_profile_plan import checked_plan
         args.checked_profile_plan = checked_plan(args.profile_plan, args.profile_plan_public_key)
+    from boot_compression import INITRD, KERNEL, compress, read_signer
     if args.operators.name.endswith('.seed'):
         raise SystemExit('--operators takes the public key file, never a seed')
     signer_hex = args.update_signer.read_text().strip()
@@ -410,6 +446,16 @@ def build(args):
     keys = validate_operator_policy(policy)
     if not keys:
         raise SystemExit('At least one operator public key is required')
+    compression = None
+    if args.boot_compression_seed:
+        other_keys = (*keys, bytes.fromhex(signer_hex))
+        if args.usb_system:
+            # checked_plan already validated the DER shape as Ed25519.
+            der = subprocess.check_output(
+                ['openssl', 'pkey', '-pubin', '-outform', 'DER'],
+                input=args.checked_profile_plan[2])
+            other_keys += (der[-32:],)
+        compression = read_signer(args.boot_compression_seed, other_keys)
     commit = subprocess.check_output(['git', '-C', ROOT, 'rev-parse', 'HEAD'], text=True).strip()
     dirty = bool(subprocess.check_output(['git', '-C', ROOT, 'status', '--porcelain', '--untracked-files=no']))
     if dirty and not args.allow_dirty:
@@ -432,7 +478,9 @@ def build(args):
     run(['cmake', '--build', kernel_build])
     run(['cmake', '-S', ROOT / 'src/bootloader', '-B', loader_build, '-G', 'Ninja',
          f'-DCMAKE_TOOLCHAIN_FILE={ROOT}/cmake/toolchains/uefi-x86_64-clang.cmake',
-         *[f'-D{k}:BOOL={v}' for k, v in LOADER_FLAGS.items()]])
+         *[f'-D{k}:BOOL={v}' for k, v in LOADER_FLAGS.items()],
+         *([f'-DBROOK_BOOT_COMPRESSION_KEY={compression.verify_key.encode().hex()}']
+           if compression else [])])
     run(['cmake', '--build', loader_build, '--target', 'bootloader'])
     kernel = kernel_build / 'BROOK.elf'
     loader = loader_build / 'BOOTX64.efi'
@@ -493,13 +541,20 @@ def build(args):
     config = loader_config(*args.display_max)
     (staged / 'BROOK.CFG').write_bytes(config)
     (staged / 'README.TXT').write_text(README)
-    (staged / 'SET.BIN').write_bytes(stick_set((staged / 'KERNEL/BROOK.ELF').read_bytes(),
-                                               (staged / 'INITRD.IMG').read_bytes(), payload_id))
     if (staged / 'KERNEL/BROOK.ELF').read_bytes()[:4] != b'\x7fELF' or \
             (staged / 'EFI/BOOT/BOOTX64.EFI').read_bytes()[:2] != b'MZ':
         raise SystemExit('Unexpected kernel or loader format')
     for name in NAMES:
-        require_keyless_disk(staged / name)
+        if name != 'SET.BIN':
+            require_keyless_disk(staged / name)
+    if compression:
+        for name, kind, maximum in (('KERNEL/BROOK.ELF', KERNEL, 32 << 20),
+                                    ('INITRD.IMG', INITRD, 128 << 20)):
+            path = staged / name
+            path.write_bytes(compress(path.read_bytes(), kind, compression, maximum))
+    (staged / 'SET.BIN').write_bytes(stick_set((staged / 'KERNEL/BROOK.ELF').read_bytes(),
+                                               (staged / 'INITRD.IMG').read_bytes(), payload_id))
+    require_keyless_disk(staged / 'SET.BIN')
     files = {name: {'bytes': (staged / name).stat().st_size, 'sha256': sha(staged / name)} for name in NAMES}
     manifest = {
         'format': FORMAT, 'commit': commit, 'dirty': dirty, 'payload_id': payload_id,
@@ -539,6 +594,8 @@ def build(args):
              'bridge verbs (each GPU-writing verb at most once per boot): ') + 'GPU fn0 PCI command '
             'bus-master enable and GSP/SEC2 falcon registers (FWSEC from the card VBIOS, booter_unload from the '
             'pinned 570.144 set); PROM read-only; no VBIOS/flash writes, no clock/fan/voltage changes')
+    if compression:
+        manifest['boot_compression'] = {'codec': 'lz4', 'public_key': compression.verify_key.encode().hex()}
     staged_manifest = staged / 'manifest.json'
     staged_manifest.write_text(json.dumps(manifest, indent=2) + '\n')
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -595,6 +652,8 @@ def main():
                    help='GOP mode cap in BROOK.CFG (kernel supports up to 4096x2160); outside PREV/ fallback')
     p.add_argument('--allow-dirty', action='store_true')
     p.add_argument('--keyboard-layout', choices=('gb', 'us'), default='gb')
+    p.add_argument('--boot-compression-seed', type=Path,
+                   help='sign and enable LZ4 boot payloads with a private 32-byte Ed25519 seed')
     p.add_argument('--restart-prompt-seconds', type=int, choices=range(1, 601), metavar='1..600')
     p.add_argument('--nv-display', action='store_true',
                    help='desktop image: /etc/nv-display = 1 (RTX head-0 flip presentation at desktop start)')
@@ -617,6 +676,8 @@ def main():
                    help='USB system BOT test mode: legacy 64 KiB or experimental read data/status pipelining')
     p.add_argument('--usb-system-trim', metavar="'dry-run|run [MIN_MIB [MAX_MIB]]'",
                    help="scan clean ext2 free extents before mount; send UNMAP only with 'run'")
+    p.add_argument('--usb-system-no-fsck', action='store_true',
+                   help='write /etc/usb-system-no-fsck: a not-clean BROOK_SYSTEM is refused, not repaired at boot')
     p.add_argument('--nv-gsp', action='store_true',
                    help='desktop image: BROOK_NV_GSP kernel and /etc/nv-gsp (GSP-RM verbs; boots GSP-RM + CE present at desktop start unless --nv-gsp-no-autostart)')
     p.add_argument('--usb-system-no-mount', action='store_true',
@@ -662,6 +723,8 @@ def main():
         p.error("--usb-uas needs --usb-system")
     if args.usb_bot != "default" and not args.usb_system:
         p.error("--usb-bot needs --usb-system")
+    if args.usb_system_no_fsck and not args.usb_system:
+        p.error("--usb-system-no-fsck needs --usb-system")
     if args.usb_system_trim and (not args.usb_system or not re.fullmatch(
             r'(dry-run|run)( [0-9]+){0,2}', args.usb_system_trim)):
         p.error("--usb-system-trim needs --usb-system and 'dry-run' or 'run' with optional MiB limits")

@@ -294,6 +294,7 @@ static void PrepareDesktopHome()
 #if defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_GUARDED_DESKTOP)
 namespace brook { void GuardTestPrepareDesktopHome() { PrepareDesktopHome(); } }
 #endif
+namespace brook { void UsbSystemPrepareDesktopHome() { PrepareDesktopHome(); } }
 
 // Serial-only boot step timing: elapsed ms since the previous step.
 [[maybe_unused]] static void BootStepTime(const char* step, uint64_t& since)
@@ -713,7 +714,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
             if (rd && brook::DeviceRegister(rd))
             {
                 if (!brook::FatFsBindDrive(0, rd)) KernelPanic("initrd: drive binding refused");
-                if (brook::VfsMount("/", "fatfs", 0))
+                if (brook::VfsMountConfigured("/", "fatfs", 0, brook::MountVolatileBacking))
                     brook::KPuts("initrd: mounted at /\n");
                 else
                     brook::KPuts("initrd: mount failed\n");
@@ -750,7 +751,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
             if (rd && brook::DeviceRegister(rd))
             {
                 if (!brook::FatFsBindDrive(0, rd)) KernelPanic("embedded initrd: drive binding refused");
-                if (!brook::VfsMount("/", "fatfs", 0))
+                if (!brook::VfsMountConfigured("/", "fatfs", 0, brook::MountVolatileBacking))
                     brook::KPuts("VFS: embedded ramdisk mount failed\n");
             }
             else
@@ -1308,7 +1309,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 #endif
 #else
         if(usbSystemRequested && !usbSystemReady) {
-            brook::ShellExecString("set wm\nset vfb none\nkconsole\n");
+            // A repair thread runs e2fsck, then the boot script or console.
+            if(!brook::UsbSystemRepairPending() || !brook::UsbSystemStartRepair())
+                brook::ShellExecString("set wm\nset vfb none\nkconsole\n");
         } else brook::ShellExecScript("/boot/INIT.RC");
 #endif
 

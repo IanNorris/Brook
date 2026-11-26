@@ -68,12 +68,13 @@ bool ShutdownLaunchAllowed() { return !shutdownPending; }
 bool ShutdownCanForceApps(const char*) { return forceAppsOffered; }
 void ShutdownDesktopForceApps() { CHECK(forceAppsOffered);++forceCloseCalls; }
 static bool shutdownFailed=false;
-static unsigned retryCalls=0,forcePowerOffCalls=0;
+static unsigned retryCalls=0,forcePowerOffCalls=0,forceRestartCalls=0;
 static constexpr char failedStatus[]="Shutdown failed: could not save data (I/O error). Retry or force power off.";
 const char* ShutdownDesktopStatus() { return shutdownFailed?failedStatus:"Applications"; }
-ShutdownFailureActions ShutdownDesktopFailureActions() { return {shutdownFailed,shutdownFailed,shutdownFailed}; }
+ShutdownFailureActions ShutdownDesktopFailureActions() { return {shutdownFailed,shutdownFailed,shutdownFailed,shutdownFailed}; }
 void ShutdownDesktopRetry() { CHECK(shutdownFailed);++retryCalls; }
 void ShutdownDesktopForcePowerOff() { CHECK(shutdownFailed);++forcePowerOffCalls; }
+void ShutdownDesktopForceRestart() { CHECK(shutdownFailed);++forceRestartCalls; }
 void ShutdownDesktopRequest(bool) { std::abort(); }
 void ShutdownDesktopCancel() { std::abort(); }
 ShutdownRestartStatus ShutdownRestartPromptStatus(const char*) { return {}; }
@@ -1234,6 +1235,8 @@ int main() {
         }
         CHECK(press(LauncherTargetKind::RetryShutdown, 0, false) && retryCalls==1 && !forcePowerOffCalls);
         CHECK(press(LauncherTargetKind::ForcePowerOff, 0, false) && forcePowerOffCalls==1);
+        CHECK(snapshot.forceRestart);
+        CHECK(press(LauncherTargetKind::ForceRestart, 0, false) && forceRestartCalls==1);
         shutdownPending=shutdownFailed=false;
 
         testTick = 1199;

@@ -10,6 +10,8 @@ inline constexpr uint64_t MountNoDev = 4;
 inline constexpr uint64_t MountNoExec = 8;
 // Boot-internal flag. Strip it before publishing Linux-visible mount attributes.
 inline constexpr uint64_t MountSystemInternal = uint64_t{1} << 62;
+// Boot-only property of an instance whose backing cannot survive power loss.
+inline constexpr uint64_t MountVolatileBacking = uint64_t{1} << 61;
 inline constexpr uint64_t MountRestrictionMask = MountReadOnly | MountNoSuid | MountNoDev | MountNoExec;
 // Namespace handles own an active topology lease plus storage, independently
 // of task membership. Plain paths/snapshots retain storage only.

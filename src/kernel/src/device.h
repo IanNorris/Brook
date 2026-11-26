@@ -133,6 +133,9 @@ extern "C" bool DeviceIsRegistered(Device* dev);
 extern "C" int DeviceFlush(Device* dev);
 // All filesystem and partition block writes enter here, including modules.
 extern "C" int DeviceWrite(Device* dev,uint64_t offset,const void* data,uint64_t len);
+enum class DeviceWriteAdmission : uint8_t { Admitted, NoDevice, ExtentLease, ShutdownBarrier };
+struct DeviceWriteResult { int count; DeviceWriteAdmission admission; };
+DeviceWriteResult DeviceWriteWithAdmission(Device* dev, uint64_t offset, const void* data, uint64_t len);
 struct BlockWriteLease;
 // Internal boot-only interface. The caller must establish that no cache can
 // hold pending writes to these devices before installing the permanent leases.

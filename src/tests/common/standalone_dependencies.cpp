@@ -25,3 +25,5 @@ bool AcpiClassifyBootRange(uint64_t, uint32_t, BootResourceClassification& resul
 
 extern "C" bool CpuWriteCombiningReady() { return false; }
 bool CpuPrepareFramebufferWc(uint64_t, uint64_t) { return false; }
+
+namespace brook { extern "C" __attribute__((weak)) void KPrintf(const char*, ...) {} }

@@ -20,6 +20,7 @@
 #include "../src/shared/brook_system_esp.h"
 #include "../src/shared/update/payload.h"
 #include "../src/shared/update/executable.h"
+#include "../src/shared/update/boot_compression_magic.h"
 #ifdef BROOK_BRIDGE_V3
 #include "bridge_v3_posix.h"
 static BridgeV3Posix transport;
@@ -41,15 +42,21 @@ static int open_existing(unsigned index) {
 static int file_read(int fd,uint8_t* p,size_t n) {
     while(n){ssize_t got=read(fd,p,n);if(got<0&&errno==EINTR)continue;if(got<=0)return -1;p+=got;n-=(size_t)got;}return 0;
 }
-static int hash_file(unsigned index,size_t length,uint8_t out[32]) {
+static int hash_file(unsigned index,size_t length,uint8_t out[32],int* compressed) {
     int fd=open_existing(index);if(fd<0)return -1;
     BrookSha256 hash;BrookShaInit(&hash);uint8_t chunk[4096];int result=0;
-    while(length){size_t n=length<sizeof(chunk)?length:sizeof(chunk);if(file_read(fd,chunk,n)){result=-1;break;}BrookShaAdd(&hash,chunk,n);length-=n;}
+    int first=1;
+    while(length){
+        size_t n=length<sizeof(chunk)?length:sizeof(chunk);
+        if(file_read(fd,chunk,n)){result=-1;break;}
+        if(first){*compressed=BrookBootCompressed(chunk,n);first=0;}
+        BrookShaAdd(&hash,chunk,n);length-=n;
+    }
     if(close(fd))result=-1;
     if(!result)BrookShaFinish(&hash,out);
     return result;
 }
-static int pair_valid(const uint8_t* record) {
+static int pair_valid(const uint8_t* record,int verified_running) {
     if(!BrookUpdateRecordValid(record))return 0;
     unsigned slot=BrookUpdateGet32(record+16);uint8_t h[32];
     size_t kernel_size=(size_t)BrookUpdateGet64(record+24);
@@ -66,12 +73,14 @@ static int pair_valid(const uint8_t* record) {
 #endif
     if(close(fd))io=-1;
     if(io){free(kernel);return -1;}
-    valid=BrookUpdateExecutable(kernel,kernel_size);
+    valid=BrookUpdateExecutable(kernel,kernel_size) ||
+        (verified_running && BrookBootCompressed(kernel,kernel_size));
+    if(valid)BrookUpdateHash(kernel,kernel_size,h);
     free(kernel);if(!valid)return 0;
-    if(hash_file(slot*2,(size_t)BrookUpdateGet64(record+24),h))return -1;
     if(!BrookUpdateEqual(h,record+40,32))return 0;
-    if(hash_file(slot*2+1,(size_t)BrookUpdateGet64(record+32),h))return -1;
-    return BrookUpdateEqual(h,record+72,32);
+    int initrd_compressed=0;
+    if(hash_file(slot*2+1,(size_t)BrookUpdateGet64(record+32),h,&initrd_compressed))return -1;
+    return (verified_running || !initrd_compressed) && BrookUpdateEqual(h,record+72,32);
 }
 static int read_records(uint8_t record[2][128]) {
     for(unsigned i=0;i<2;i++) {
@@ -136,7 +145,9 @@ static int running_selector(const uint8_t records[2][128],int* active) {
         uint8_t hash[32];
         BrookUpdateHash(record,128,hash);
         if(!BrookUpdateEqual(hash,boot.selector_digest,sizeof(hash)))continue;
-        if(pair_valid(record)!=1)return -1;
+        // The loader already authenticated and expanded this exact selector.
+        // Keep that slot active only if both stored payload hashes still match.
+        if(pair_valid(record,1)!=1)return -1;
         *active=(int)i;
         return 0;
     }
@@ -231,7 +242,7 @@ static int serve(int client,const char* key,const char* boot,const char* transac
     if(running) {
         for(unsigned attempt=0;attempt<2;attempt++){
             int candidate=attempt?1-newest:newest;
-            int eligibility=pair_valid(records[candidate]);
+            int eligibility=pair_valid(records[candidate],0);
             if(eligibility<0)return 27; // Ambiguous media/resource failure: never pick a victim slot.
             if(eligibility==1){active=candidate;break;}
         }
@@ -244,7 +255,7 @@ static int serve(int client,const char* key,const char* boot,const char* transac
         /* Promote only a separately recorded, verified older pair. Keep its
          * existing selector untouched until the new selector is durable. */
         unsigned older=1-(unsigned)newest;
-        if((running && active!=newest) || pair_valid(records[older])!=1 ||
+        if((running && active!=newest) || pair_valid(records[older],0)!=1 ||
            BrookUpdateGet32(records[older]+16)==BrookUpdateGet32(records[newest]+16))return 28;
         uint8_t expected[128];memcpy(expected,records[older],sizeof(expected));
         BrookUpdatePut64(expected+8,generation);BrookUpdatePut32(expected+124,BrookUpdateCrc(expected,124));
@@ -257,7 +268,7 @@ static int serve(int client,const char* key,const char* boot,const char* transac
         if(!authorize_activation(client))return 22;
         if(!selectors_unchanged(records))return 30;
         if(write_file(4+(unsigned)newest,expected,sizeof(expected)))return 25;
-        if(read_records(records)||!BrookUpdateEqual(records[newest],expected,sizeof(expected))||pair_valid(expected)!=1)return 26;
+        if(read_records(records)||!BrookUpdateEqual(records[newest],expected,sizeof(expected))||pair_valid(expected,0)!=1)return 26;
         printf("HWUPDATE_PROMOTED generation=%" PRIu64 " slot=%u transaction=%s reboot_required=1\n",
                generation,BrookUpdateGet32(expected+16),transaction);fflush(stdout);
         snprintf(plan,sizeof(plan),"{\"state\":\"promoted\",\"generation\":%" PRIu64 ",\"slot\":%u,\"reboot_required\":true}\n",
@@ -277,13 +288,14 @@ static int serve(int client,const char* key,const char* boot,const char* transac
     if(network_bytes(client,kernel,kb)||network_bytes(client,initrd,ib)){result=18;goto done;}
     BrookUpdateHash(kernel,kb,h);if(!BrookUpdateEqual(h,incoming+40,32)){result=19;goto done;}
     BrookUpdateHash(initrd,ib,h);if(!BrookUpdateEqual(h,incoming+72,32)){result=19;goto done;}
-    if(!BrookUpdateExecutable(kernel,kb)||initrd[510]!=0x55||initrd[511]!=0xaa){result=20;goto done;}
+    if(!BrookUpdateExecutable(kernel,kb)||BrookBootCompressed(initrd,ib)||
+       initrd[510]!=0x55||initrd[511]!=0xaa){result=20;goto done;}
     if(reply(client,"{\"state\":\"staged\",\"storage_modified\":false}\n")){result=21;goto done;}
     if(!authorize_activation(client)){result=22;goto done;}
     if(!selectors_unchanged(records)){result=30;goto done;}
     // Only the inactive pair is modified, and selection is published last.
     if(write_file(slot*2,kernel,kb)||write_file(slot*2+1,initrd,ib)){result=23;goto done;}
-    if(pair_valid(incoming)!=1){result=24;goto done;}
+    if(pair_valid(incoming,0)!=1){result=24;goto done;}
     if(write_file(4+selector,incoming,128)){result=25;goto done;}
     // Reopen O_RDWR obtains a new FIL and bypasses FAT's whole-file RO cache.
     // Firmware independently rehashes both files before the next kernel load.

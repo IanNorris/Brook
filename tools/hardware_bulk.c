@@ -108,9 +108,10 @@ __attribute__((unused)) static int parse_frame_options(const char* text){
     if(strncmp(p,"o:",2))return -1;
     p+=2;
     if(parse_u64(&p,&flags,':')||parse_u64(&p,&id,':')||parse_u64(&p,&incarnation,0))return -1;
-    if(flags&~(uint64_t)(BROOK_DEBUG_FRAME_FLAG_CURSOR|BROOK_DEBUG_FRAME_FLAG_WINDOW_BUFFER)||id>256)return -1;
-    if(flags==(BROOK_DEBUG_FRAME_FLAG_CURSOR|BROOK_DEBUG_FRAME_FLAG_WINDOW_BUFFER))return -1;
-    if((flags&BROOK_DEBUG_FRAME_FLAG_WINDOW_BUFFER)?(!id||!incarnation):(id||incarnation))return -1;
+    const uint64_t window_flags = BROOK_DEBUG_FRAME_FLAG_WINDOW_BUFFER | BROOK_DEBUG_FRAME_FLAG_WINDOW_CROP;
+    if (flags & ~(window_flags | BROOK_DEBUG_FRAME_FLAG_CURSOR) || id > 256) return -1;
+    if ((flags & BROOK_DEBUG_FRAME_FLAG_WINDOW_BUFFER) && flags != BROOK_DEBUG_FRAME_FLAG_WINDOW_BUFFER) return -1;
+    if ((flags & window_flags) ? (!id || !incarnation) : (id || incarnation)) return -1;
     frame_request.flags=(uint32_t)flags;frame_request.window_id=(uint32_t)id;frame_request.window_incarnation=incarnation;
     frame_options=1;return 0;
 }

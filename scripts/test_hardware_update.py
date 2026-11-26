@@ -224,5 +224,29 @@ assert all(after[name]==digest for name,digest in before.items() if name.startsw
 assert (out/'SELECT0.BIN').read_bytes()==older
 assert (out/'SELECT1.BIN').read_bytes()==record(43,1,kernel,initrd)
 
+# The digest attests that the loader authenticated and decoded the exact
+# running pair. These opaque fixture bytes stand in for that stored envelope.
+# The updater accepts it only in this role, and never publishes it remotely.
+compressed_kernel=b'BRKCMP01'+kernel[8:]
+compressed_initrd=b'BRKCMP01'+initrd[8:]
+for name,data in [('KERNEL.ELF',compressed_kernel),('INITRD.IMG',compressed_initrd)]:
+    with (out/'A'/name).open('r+b') as f:f.write(data)
+compressed_record=record(41,0,compressed_kernel,compressed_initrd)
+(out/'SELECT0.BIN').write_bytes(compressed_record)
+(out/'SELECT1.BIN').write_bytes(record(42,1,kernel,initrd))
+live=boot_context(1,41,0,compressed_record)
+with (out/'A/INITRD.IMG').open('r+b') as f:f.write(b'broken!!')
+results.append(run_case('verified-compressed-byte-changed',lambda port:rejected_system(port,29),29,
+                        boot_slot=live))
+with (out/'A/INITRD.IMG').open('r+b') as f:f.write(compressed_initrd)
+results.append(run_case('recovery-does-not-promote-compressed',
+                        lambda port:rejected_promotion(port,28),28,boot_slot=boot_context(2)))
+before=hashes()
+results.append(run_case('update-while-running-verified-compressed',upload_live_fallback,0,False,boot_slot=live))
+after=hashes()
+assert all(after[name]==digest for name,digest in before.items() if name.startswith('A/'))
+assert (out/'SELECT0.BIN').read_bytes()==compressed_record
+assert (out/'SELECT1.BIN').read_bytes()==record(43,1,kernel,initrd)
+
 (out/'result.json').write_text(json.dumps({'passed':True,'cases':results},indent=2)+'\n')
 print('HARDWARE_UPDATE_HOST_PASS')

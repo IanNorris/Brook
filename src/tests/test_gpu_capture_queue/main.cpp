@@ -5,6 +5,7 @@
 #include <mutex>
 #include <chrono>
 #include <atomic>
+#define BROOK_TEST_LIVE_CAPTURE 1
 #include "../../kernel/src/compositor.cpp"
 #include "../../kernel/src/desktop_frame_scenes.h"
 
@@ -57,9 +58,32 @@ bool KvmClockAvailable(){return true;}
 uint64_t KvmClockReadNs(){return captureClockNs;}
 bool TscClockAvailable(){return false;}
 uint64_t TscClockReadNs(){return 0;}
+bool protectedWindows;
+uint64_t WmCaptureProtectionEpoch() { return protectedWindows; }
+bool fakeLivePlane = false;
+BdwScanoutCaptureKind BdwScanoutCaptureLive(uint32_t* dest, uint32_t width, uint32_t height,
+                                         BdwScanoutCaptureInfo& info, uint64_t)
+{
+    info = {};
+    if (!fakeLivePlane) return BdwScanoutCaptureKind::Gop;
+    info.plane = BROOK_DEBUG_FRAME_PLANE_CLIENT;
+    for (uint32_t i = 0; i < width * height; ++i) dest[i] = 0xff123456;
+    return BdwScanoutCaptureKind::Copied;
+}
+bool BdwScanoutCaptureCursor(uint32_t*, uint32_t, uint32_t) { return false; }
+uint32_t WmGetCaptureMasks(CaptureMaskRect* out)
+{
+    out[0] = {2, 1, 3, 2};
+    return 1;
+}
+int WmCheckWindowCapture(uint32_t id, uint64_t incarnation)
+{
+    if (id != 9 || incarnation != 90) return -2;
+    return protectedWindows ? -13 : 0;
+}
 int WmCopyDebugWindowBuffer(uint32_t id,uint64_t incarnation,uint32_t* out,uint64_t capacity,
                             uint32_t* width,uint32_t* height,uint32_t* scale) {
-    if(id!=9 || incarnation!=90)return -2;
+    if (const int error = WmCheckWindowCapture(id, incarnation)) return error;
     *width=2;*height=1;*scale=2;
     if(out){
         CHECK(capacity>=2);out[0]=0x223344;out[1]=0x667788;
@@ -503,6 +527,68 @@ int main() {
     CHECK(CompositorPresentProbe(2,1,2,2,2,patchPixels,expireDuringCopy,samples,display,g_backdropGeneration,42,true)==-116);
     CHECK(!g_presentLease.owner && g_scanoutNeedsRepair);
     g_dirtyMinY=0;g_dirtyMaxY=6;CompositorFlipSoftware();CHECK(!g_scanoutNeedsRepair && framebuffer[10]==0xdeadbeef);
+    protectedWindows = true;
+    for (const uint32_t flags : {BROOK_DEBUG_FRAME_FLAG_WINDOW_BUFFER, BROOK_DEBUG_FRAME_FLAG_WINDOW_CROP}) {
+        const auto denied = CompositorRequestDebugFrameOptions(77, flags, 9, 90, &requestError);
+        CHECK(denied.state == DebugFrameState::Failed && requestError == -13);
+    }
+    auto protectedFrame = CompositorRequestDebugFrame(77);
+    CaptureCompletedDebugFrame(41, {g_physFb, 8, 6, 8}, false, g_captureSceneRevision - 1);
+    CHECK(CompositorDebugFrameStatus(protectedFrame.token, 77).state == DebugFrameState::Pending);
+    CaptureCompletedDebugFrame(42, {g_physFb, 8, 6, 8}, false, g_captureSceneRevision);
+    CHECK(CompositorDebugFrameStatus(protectedFrame.token, 77).state == DebugFrameState::Ready);
+    for (unsigned i = 0; i < 48; ++i)
+        CHECK(capturedPixels[i] == (i / 8 >= 1 && i / 8 < 3 && i % 8 >= 2 && i % 8 < 5 ? 0xff000000 : 0xdeadbeef));
+    CHECK(CompositorReleaseDebugFrame(protectedFrame.token, 77));
+
+    // A renderer frame can lag behind the live WM geometry. Only the
+    // retained frame's mask applies to the leased GOP, even without a
+    // completed software paint for this compositor pass.
+    const uint64_t privacyEpoch = WmCaptureProtectionEpoch();
+    CapturePrivacy renderedPrivacy{};
+    renderedPrivacy.known = true;
+    renderedPrivacy.epoch = privacyEpoch;
+    renderedPrivacy.count = 1;
+    renderedPrivacy.masks[0] = {0, 0, 2, 1};
+    CHECK(!CompositorPresentProbe(0,0,8,6,8,fullSource,copy,samples,display,g_backdropGeneration,42));
+    auto leasedCapture = CompositorRequestDebugFrame(77);
+    CaptureCompletedDebugFrame(43, {g_physFb, 8, 6, 8});
+    CHECK(CompositorDebugFrameStatus(leasedCapture.token, 77).state == DebugFrameState::Pending);
+    CHECK(!CompositorPresentProbe(0,0,8,6,8,fullSource,copy,samples,display,g_backdropGeneration,42,false,renderedPrivacy));
+    CHECK(samples[0] == 0 && samples[1] == 0 && samples[2] == 0 && samples[3] == 0);
+    CaptureCompletedDebugFrame(44, {g_physFb, 8, 6, 8});
+    CHECK(CompositorDebugFrameStatus(leasedCapture.token, 77).state == DebugFrameState::Ready);
+    for (unsigned i = 0; i < 48; ++i)
+        CHECK(capturedPixels[i] == (i < 2 ? 0xff000000 : fullSource[i]));
+    CHECK(CompositorReleaseDebugFrame(leasedCapture.token, 77));
+    CapturePrivacy movedPrivacy = renderedPrivacy;
+    movedPrivacy.masks[0].x = 3;
+    CHECK(CompositorPresentProbe(2,1,2,2,2,patchPixels,copy,samples,display,g_backdropGeneration,42,true,movedPrivacy)==-116);
+    CHECK(!CompositorPresentProbe(2,1,2,2,2,patchPixels,copy,samples,display,g_backdropGeneration,42,true,renderedPrivacy));
+    auto stalePrivacy = renderedPrivacy;
+    ++stalePrivacy.epoch;
+    CHECK(!CompositorPresentProbe(0,0,8,6,8,fullSource,copy,samples,display,g_backdropGeneration,42,false,stalePrivacy));
+    auto staleFrame = CompositorRequestDebugFrame(77);
+    CaptureCompletedDebugFrame(45, {g_physFb, 8, 6, 8});
+    CHECK(CompositorDebugFrameStatus(staleFrame.token, 77).state == DebugFrameState::Pending);
+    CHECK(CompositorReleaseDebugFrame(staleFrame.token, 77));
+    CompositorReleasePresentLease(42);
+    CompositorFlipSoftware();
+    protectedWindows = false;
+    fakeLivePlane = true;
+    for (const bool writer : {true, false}) {
+        g_gopWriter = writer ? 1 : 0;
+        g_scanoutNeedsRepair = !writer;
+        const auto direct = CompositorRequestDebugFrame(77);
+        CaptureCompletedDebugFrame(46, {g_physFb, 8, 6, 8});
+        const auto result = CompositorDebugFrameStatus(direct.token, 77);
+        CHECK(result.state == DebugFrameState::Ready && result.source == BROOK_DEBUG_FRAME_SOURCE_DIRECT_CLIENT);
+        CHECK(capturedPixels[0] == 0xff123456);
+        CHECK(CompositorReleaseDebugFrame(direct.token, 77));
+    }
+    fakeLivePlane = false;
+    g_gopWriter = 0;
+    g_scanoutNeedsRepair = false;
     g_backBuffer=nullptr;
     uint32_t overlayPixels[48]{};g_debugFrameBuffer=VirtualAddress(reinterpret_cast<uint64_t>(overlayPixels));g_debugFramePages=1;
     auto overlay=CompositorRequestDebugFrame(77,true);CHECK(overlay.state==DebugFrameState::Pending && overlay.token);

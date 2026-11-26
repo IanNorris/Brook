@@ -30,6 +30,9 @@ bool FatFsSetBootStickWritable(uint8_t pdrv, Device* dev, bool writable);
 bool FatFsBindExclusiveDrive(uint8_t pdrv, Device* dev);
 bool FatFsAcquireExclusiveDrive(uint8_t pdrv, Device* expected, bool* readOnly);
 int FatFsFlushDrive(uint8_t pdrv);
+// Borrow a pathname for one synchronous FatFS operation under the filesystem
+// lock. Raw boot-time FatFS callers may have no pathname.
+const char* FatFsCurrentWritePath();
 // One actual FatFS instance per drive. Keeps the binding and its immutable
 // read-only capability stable until the last retained mount is destroyed.
 bool FatFsAcquireDrive(uint8_t pdrv, bool* readOnly);
@@ -37,5 +40,8 @@ void FatFsReleaseDrive(uint8_t pdrv);
 bool FatFsDriveReadOnly(uint8_t pdrv);
 // Borrowed boot-lifetime binding; caller retains the FAT mount/lease.
 Device* FatFsBoundDevice(uint8_t pdrv);
+#if defined(BROOK_EFI_SHUTDOWN_TEST)
+bool FatFsInjectRamWriteFailureForTest();
+#endif
 
 } // namespace brook

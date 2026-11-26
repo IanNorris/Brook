@@ -8,6 +8,11 @@
 
 #include "syscall.h"
 #include "desktop_layers_export.h"
+#include "desktop_capture_access.h"
+#include "fs_context.h"
+#include "mount_namespace.h"
+#include "process_fs.h"
+#include "string.h"
 #include "desktop_present_policy.h"
 #include "intel_bdw_scanout.h"
 #include "memory/user_mapping.h"
@@ -26,6 +31,22 @@ WmChromeCaptureStats g_chromeCaptureStats{}; // window.h / wm_chrome_key.h
 DesktopCaptureCounters g_desktopCaptureStats{}; // desktop_layers_export.h
 uint32_t g_desktopPresentPolicy=BROOK_DESKTOP_POLICY_APP_CADENCE|BROOK_DESKTOP_POLICY_DIRECT_SHADOW,g_desktopPresentDeferUs=0; // desktop_present_policy.h
 #if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
+static bool DesktopCaptureOwner(Process* proc, uint64_t owner)
+{
+    // Attach alone is also used by GPU diagnostics. Only the initrd renderer
+    // launched as a system service may read another process's window.
+    const bool service = proc->lifecycleRole == ProcessLifecycleRole::Service;
+    const bool bootRenderer = !strcmp(proc->exePath, "/boot/VKRENDER.ELF") ||
+                              !strcmp(proc->exePath, "/BOOT/VKRENDER.ELF");
+    const bool originalNamespace = !proc->userNamespace &&
+        __atomic_load_n(&proc->mountNamespaceMember, __ATOMIC_ACQUIRE) == VfsMountNamespaceInitial();
+    if (!DesktopLayerContentAllowed(service, originalNamespace, bootRenderer, true)) return false;
+    auto* fs = ProcessFsAcquire(proc);
+    const bool globalRoot = fs && FsContextHasNamespaceRoot(fs);
+    if (fs) FsContextRelease(fs);
+    return globalRoot && BdwOffscreenRendererOwnedBy(owner);
+}
+
 static int64_t CaptureDesktopChrome(uint64_t owner,uint64_t op,uint64_t address,uint64_t size)
 {
     auto* wire=static_cast<BrookDesktopLayers*>(kmalloc(sizeof(BrookDesktopLayers)));
@@ -176,6 +197,8 @@ int64_t sys_brook_desktop_layers(uint64_t op,uint64_t address,uint64_t size,uint
     auto* proc=ProcessCurrent();if(!proc)return -ESRCH;
     KernelOperationGuard operation(proc);
     if(!brook::BdwRenderExperimentEnabled())return -ENODEV;
+    const uint64_t owner=proc->leaderIncarnation?proc->leaderIncarnation:proc->incarnation;
+    if (DesktopLayerContentOperation(op) && !DesktopCaptureOwner(proc, owner)) return -EPERM;
     if(op==BROOK_DESKTOP_FOCUS_QUERY){
         if((size!=sizeof(BrookDesktopFocus) && size!=BROOK_DESKTOP_FOCUS_V1_SIZE) || a || b || c || !address ||
            address>~uint64_t{0}-size)return -EINVAL;
@@ -219,11 +242,11 @@ int64_t sys_brook_desktop_layers(uint64_t op,uint64_t address,uint64_t size,uint
         op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_KEYED || op==BROOK_DESKTOP_CHROME_TRACKED_KEEP ||
         op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_SPANS) &&
        size==sizeof(BrookDesktopLayers) && !a && !b && !c && address<=~uint64_t{0}-size)
-        return CaptureDesktopChrome(proc->leaderIncarnation?proc->leaderIncarnation:proc->incarnation,op,address,size);
+        return CaptureDesktopChrome(owner,op,address,size);
     if((op==BROOK_DESKTOP_BACKDROP_QUERY || op==BROOK_DESKTOP_BACKDROP_CAPTURE ||
         op==BROOK_DESKTOP_BACKDROP_TRACKED_CAPTURE || op==BROOK_DESKTOP_BACKDROP_TRACKED_BIND) &&
        size==sizeof(BrookDesktopLayers) && !a && !b && !c && address<=~uint64_t{0}-size)
-        return CaptureDesktopBackdrop(proc->leaderIncarnation?proc->leaderIncarnation:proc->incarnation,op,address,size);
+        return CaptureDesktopBackdrop(owner,op,address,size);
     const bool keepOp=op==BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED_KEEP;
     // c: BROOK_DESKTOP_LAYERS_CULL_OCCLUDED with the keep op only.
     const bool cull=keepOp && c==BROOK_DESKTOP_LAYERS_CULL_OCCLUDED;
@@ -268,7 +291,6 @@ int64_t sys_brook_desktop_layers(uint64_t op,uint64_t address,uint64_t size,uint
                 __atomic_add_fetch(&g.occluded,tally.occluded,__ATOMIC_RELAXED);__atomic_add_fetch(&g.bytesOccluded,tally.bytesOccluded,__ATOMIC_RELAXED);}
             bool adopted=false;
             if(!result && tracked){
-                const uint64_t owner=proc->leaderIncarnation?proc->leaderIncarnation:proc->incarnation;
                 result=brook::BdwOffscreenRegisterScene(owner,layers,&wire->reserved);adopted=!result;
             }
             if(!result && !CopyToUser(address,wire,sizeof(*wire)))result=-EFAULT;
@@ -458,10 +480,13 @@ int64_t sys_brook_debug_frame(uint64_t op,uint64_t token,uint64_t destination,ui
         if(token||offset||length!=sizeof(BrookDebugFrameRequest))return -EINVAL;
         BrookDebugFrameRequest request{};
         if(!CopyFromUser(&request,destination,sizeof(request)))return -EFAULT;
-        constexpr uint32_t known=BROOK_DEBUG_FRAME_FLAG_CURSOR|BROOK_DEBUG_FRAME_FLAG_WINDOW_BUFFER;
-        const bool window=(request.flags&BROOK_DEBUG_FRAME_FLAG_WINDOW_BUFFER)!=0;
-        if((request.flags&~known) || request.flags==known || (window?(!request.window_id || !request.window_incarnation):
-           (request.window_id || request.window_incarnation)))return -EINVAL;
+        constexpr uint32_t known = BROOK_DEBUG_FRAME_FLAG_CURSOR | BROOK_DEBUG_FRAME_FLAG_WINDOW_BUFFER |
+                                   BROOK_DEBUG_FRAME_FLAG_WINDOW_CROP;
+        const bool window = (request.flags & (BROOK_DEBUG_FRAME_FLAG_WINDOW_BUFFER | BROOK_DEBUG_FRAME_FLAG_WINDOW_CROP)) != 0;
+        if ((request.flags & ~known) ||
+            ((request.flags & BROOK_DEBUG_FRAME_FLAG_WINDOW_BUFFER) && request.flags != BROOK_DEBUG_FRAME_FLAG_WINDOW_BUFFER) ||
+            (window ? (!request.window_id || !request.window_incarnation) : (request.window_id || request.window_incarnation)))
+            return -EINVAL;
         int error=0;
         const auto frame=CompositorRequestDebugFrameOptions(owner,request.flags,request.window_id,request.window_incarnation,&error);
         if(frame.state==DebugFrameState::Busy)return -16; // EBUSY

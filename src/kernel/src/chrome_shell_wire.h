@@ -6,7 +6,7 @@
 namespace brook {
 
 inline constexpr uint64_t ShellServiceSyscall = 0xB24;
-inline constexpr uint32_t ShellServiceVersion = 16;
+inline constexpr uint32_t ShellServiceVersion = 17;
 inline constexpr uint32_t ShellCommandLimit = 1536;
 inline constexpr uint32_t ShellTextLimit = 4096;
 // One 24x24 icon per launcher row, plus room for the material gradient.

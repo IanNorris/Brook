@@ -1,19 +1,60 @@
+#include "process.h"
 #include <cassert>
+#include <cstdarg>
+#include <cstdio>
+#include <cstring>
 #include <atomic>
 #include <thread>
 #include <sys/wait.h>
 #include <unistd.h>
 #include "fatfs_glue.h"
+#include "klog.h"
+#include "vfs.h"
 #include "diskio.h"
-namespace {bool readOnly=true,roError=false,failWrite=false;unsigned writes=0;}
+namespace {bool readOnly=true,roError=false,failWrite=false;unsigned writes=0;bool barrier=false;
+bool lease=false;
+uint8_t logDrive=6;
+unsigned logAttempts=0,ringEntries=0;
+char diagnosticLine[256]{};
+brook::Process logger;
+thread_local brook::Process* current;}
 namespace brook {
 extern "C" bool DeviceIsRegistered(Device* d){return d && d->priv;}
 extern "C" int DeviceFlush(Device*){return 0;}
-extern "C" int DeviceWrite(Device*,uint64_t,const void*,uint64_t n){++writes;return failWrite?-5:int(n);}
+DeviceWriteResult DeviceWriteWithAdmission(Device*,uint64_t,const void*,uint64_t n){if (lease) return {-30, DeviceWriteAdmission::ExtentLease};
+    if (barrier) return {-30, DeviceWriteAdmission::ShutdownBarrier};
+    ++writes;
+    return {failWrite?-5:int(n), DeviceWriteAdmission::Admitted};}
 uint32_t DeviceCountRaw(){return 2;}
 bool DeviceRegistryCorrupted(){return false;}
 void DeviceDumpRegistry(){}
-extern "C" void SerialPrintf(const char*,...){}
+const char* FatFsCurrentWritePath(){return "/VOLATILE.DAT";}
+extern "C" void KPrintf(const char* pattern,...) {
+    va_list args;
+    va_start(args,pattern);
+    std::vsnprintf(diagnosticLine,sizeof(diagnosticLine),pattern,args);
+    va_end(args);
+}
+extern "C" void SerialPrintf(const char*, ...) {}
+extern "C" void SerialPuts(const char*) {}
+uint64_t ApicTickCount() { return 1; }
+bool DebugChannelConnected() { return false; }
+void DebugChannelSend(const char*) {}
+void DebugOverlayPuts(const char*) { ++ringEntries; }
+Process* ProcessCurrent() { return current; }
+extern "C" Vnode* VfsOpen(const char*, int) {
+    static Vnode vnode{};
+    return &vnode;
+}
+extern "C" int VfsWrite(Vnode*, const void*, uint64_t n, uint64_t* offset) {
+    ++logAttempts;
+    BYTE sector[512]{};
+    if (disk_write(logDrive, sector, 0, 1) != RES_OK) return -5;
+    *offset += n;
+    return int(n);
+}
+int VfsSync(Vnode*) { return FatFsFlushDrive(logDrive); }
+
 }
 int main(){
     using namespace brook;
@@ -73,7 +114,43 @@ int main(){
     readOnly=true; // the capability was pinned when the exclusive slot bound
     assert(FatFsAcquireExclusiveDrive(2,&c,&ro) && !ro);
     FatFsReleaseDrive(2);assert(!FatFsAcquireExclusiveDrive(2,&c,&ro));
+    barrier=true;
+    unsigned before=writes;
+    assert(disk_write(0,reinterpret_cast<BYTE*>(data),0,1)==RES_ERROR && writes==before);
+    assert(std::strstr(diagnosticLine,"pdrv=0 tid=0 pid=0 reason=shutdown-barrier"));
+    barrier=false;
+    assert(FatFsFlushDrive(0)==-5);
     failWrite=true;assert(disk_write(2,reinterpret_cast<BYTE*>(data),0,1)==RES_ERROR);failWrite=false;
+    assert(std::strstr(diagnosticLine,"pdrv=2 tid=0 pid=0 reason=device-error"));
     assert(FatFsFlushDrive(2)==-5 && !FatFsBindDrive(2,&c) &&
            !FatFsBindExclusiveDrive(2,&c) && FatFsFlushDrive(2)==-5);
+    readOnly=false;
+    Device control{reinterpret_cast<DeviceOps*>(&ops),"control",DeviceType::Block,&ops};
+    Device candidate{reinterpret_cast<DeviceOps*>(&ops),"candidate",DeviceType::Block,&ops};
+    Device leased{reinterpret_cast<DeviceOps*>(&ops),"leased",DeviceType::Block,&ops};
+    assert(FatFsBindDrive(6,&control) && FatFsBindDrive(7,&candidate) && FatFsBindDrive(8,&leased));
+    lease=true;assert(disk_write(8,reinterpret_cast<BYTE*>(data),0,1)==RES_ERROR);lease=false;
+    assert(std::strstr(diagnosticLine,"reason=extent-lease") && std::strstr(diagnosticLine,"path=/VOLATILE.DAT"));
+    assert(KLogInit());
+    logger.pid=51;logger.tgid=50;
+    auto lateLog=[] {
+        current=&logger;
+        KLog("late kernel log from another thread");
+        KLogCat(LogCat::General,LogLevel::Info,"late categorized kernel log");
+        KLogSync();
+    };
+    // Control: the old ordering lets a late writer enter the logger while
+    // its sector write is refused by the closed shutdown barrier.
+    barrier=true;
+    std::thread controlWriter(lateLog);controlWriter.join();
+    assert(FatFsFlushDrive(6)==-5);
+    assert(std::strstr(diagnosticLine,"pdrv=6 tid=51 pid=50 reason=shutdown-barrier"));
+    barrier=false;logDrive=7;
+    KLog("before stopping file log writes");
+    const unsigned attempts=logAttempts, ring=ringEntries;
+    KLogStopFileWrites();
+    barrier=true;
+    std::thread candidateWriter(lateLog);candidateWriter.join();
+    assert(logAttempts==attempts && ringEntries==ring+2 && FatFsFlushDrive(7)==0);
+
 }

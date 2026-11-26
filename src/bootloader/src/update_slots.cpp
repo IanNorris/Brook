@@ -1,6 +1,7 @@
 #include "update_slots.h"
 #include "fs.h"
 #include "memory.h"
+#include "boot_payload.h"
 #include "console.h"
 #include "../../shared/update/payload.h"
 #include "../../shared/update/executable.h"
@@ -25,7 +26,10 @@ static bool Pair(EFI_HANDLE image,EFI_BOOT_SERVICES* bs,const uint8_t* r,
     initrd=ReadFile(image,bs,recovery==2?u"RECOV2\\INITRD.IMG":recovery?u"RECOVERY\\INITRD.IMG":b?u"UPDATES\\B\\INITRD.IMG":u"UPDATES\\A\\INITRD.IMG",&ib,BROOK_UPDATE_INITRD_MAX,ib);
     uint8_t kh[32],ih[32];BrookUpdateHash(kernel,kb,kh);
     if(initrd)BrookUpdateHash(initrd,ib,ih);
-    if(initrd&&BrookUpdateEqual(kh,r+40,32)&&BrookUpdateEqual(ih,r+72,32)&&BrookUpdateExecutable(kernel,kb))return true;
+    if (initrd && BrookUpdateEqual(kh, r + 40, 32) && BrookUpdateEqual(ih, r + 72, 32) &&
+        ExpandBootPayload(bs, kernel, kb, BootPayloadKind::Kernel, BROOK_UPDATE_KERNEL_MAX) &&
+        BrookUpdateExecutable(kernel, kb) &&
+        ExpandBootPayload(bs, initrd, ib, BootPayloadKind::Initrd, BROOK_UPDATE_INITRD_MAX)) return true;
     if(initrd)FreePages(bs,reinterpret_cast<EFI_PHYSICAL_ADDRESS>(initrd),ib);
     FreePages(bs,reinterpret_cast<EFI_PHYSICAL_ADDRESS>(kernel),kb);
     kernel=nullptr;initrd=nullptr;return false;

@@ -53,6 +53,7 @@ function(add_host_test TEST_NAME)
 endfunction()
 
 enable_testing()
+add_host_test(test_capture_policy)
 add_host_test(test_ssd_trim_plan)
 target_compile_options(test_ssd_trim_plan PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_ssd_trim_log)
@@ -96,7 +97,7 @@ target_compile_options(test_profiler_write_all PRIVATE "-iquote${BROOK_ROOT}/src
 target_compile_options(test_guard_fat_profile PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared/inc_km")
 add_host_test(test_guard_repair_session "${BROOK_ROOT}/src/kernel/src/guard_repair_session.cpp")
 target_compile_options(test_guard_repair_session PRIVATE -DBROOK_SSD_GUARD_TRANSACTION "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared/inc_km")
-add_host_test(test_update_slots "${BROOK_ROOT}/src/bootloader/src/update_slots.cpp" "${BROOK_ROOT}/src/bootloader/src/config.cpp")
+add_host_test(test_update_slots "${BROOK_ROOT}/src/bootloader/src/update_slots.cpp" "${BROOK_ROOT}/src/bootloader/src/config.cpp" "${BROOK_ROOT}/src/bootloader/src/boot_payload.cpp")
 target_include_directories(test_update_slots PRIVATE
     "${BROOK_ROOT}/vendor/uefi-headers/Include" "${BROOK_ROOT}/vendor/uefi-headers/Include/X64"
     "${BROOK_ROOT}/src/shared/inc_km" "${BROOK_ROOT}/src/bootloader/src")
@@ -1000,7 +1001,8 @@ target_compile_options(test_fat_object_adapter PRIVATE "$<$<COMPILE_LANGUAGE:CXX
 target_compile_options(test_fat_object_adapter PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 add_test(NAME test_fat_object_adapter COMMAND python3 "${BROOK_ROOT}/src/tests/test_fat_object_adapter/run.py" "$<TARGET_FILE:test_fat_object_adapter>")
 set_tests_properties(test_fat_object_adapter PROPERTIES TIMEOUT 60)
-add_host_test(test_fat_drive "${BROOK_ROOT}/src/kernel/src/fatfs_glue.cpp")
+add_host_test(test_fat_drive "${BROOK_ROOT}/src/kernel/src/fatfs_glue.cpp"
+    "${BROOK_ROOT}/src/kernel/src/klog.cpp")
 target_include_directories(test_fat_drive PRIVATE "${FATFS_OBJECT_HOST_DIR}")
 target_compile_options(test_fat_drive PRIVATE -UNDEBUG -DBROOK_HOST_TEST -ffunction-sections -fdata-sections
     "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/src/shared/inc_km")
@@ -1286,6 +1288,9 @@ target_include_directories(test_debug_bridge_v3_listener PRIVATE
 target_link_libraries(test_debug_bridge_v3_listener PRIVATE bridge_v3_interop)
 
 # Boot-stick self-update core (tools/rtx_stick_update.h) and loader set choice.
+add_host_test(test_boot_compression)
+target_compile_options(test_boot_compression PRIVATE -UNDEBUG)
+
 add_host_test(test_rtx_stick_update
     "${BROOK_ROOT}/src/third_party/monocypher/monocypher.c"
     "${BROOK_ROOT}/src/third_party/monocypher/monocypher-ed25519.c")

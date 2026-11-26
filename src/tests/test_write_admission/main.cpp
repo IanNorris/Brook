@@ -36,7 +36,10 @@ int main() {
     assert(!DeviceCloseWrites());release=true;writer.join();hold=false;
     assert(DeviceCloseWrites());
     assert(DeviceFinalSyncOwner());
-    unsigned old=writes;std::thread late([&]{caller=2;assert(!DeviceFinalSyncOwner());for(int i=0;i<1000;++i)assert(DeviceWrite(&dev,0,&data,1)==-30);assert(!DeviceReopenWrites());});late.join();
+    unsigned old=writes;std::thread late([&]{caller=2;assert(!DeviceFinalSyncOwner());for(int i=0;i<1000;++i) {
+        const auto result=DeviceWriteWithAdmission(&dev,0,&data,1);
+        assert(result.count==-30 && result.admission==DeviceWriteAdmission::ShutdownBarrier);
+    }assert(!DeviceReopenWrites());});late.join();
     assert(writes==old);assert(DeviceWrite(&dev,0,&data,1)==1);assert(writes==old+1);
     assert(DeviceCloseWrites());assert(DeviceReopenWrites());assert(!DeviceFinalSyncOwner());assert(DeviceWrite(&dev,0,&data,1)==1);
     assert(DeviceWrite(nullptr,0,&data,1)==-19);
@@ -73,7 +76,8 @@ int main() {
     assert(trims==1 && DeviceReopenWrites());
     assert(!DeviceUnregister(&parent));assert(!DeviceUnregister(&owner));
     assert(DeviceWrite(&parent,99,&data,1)==-30);
-    assert(DeviceWrite(&parent,100,&data,1)==-30);
+    const auto refused=DeviceWriteWithAdmission(&parent,100,&data,1);
+    assert(refused.count==-30 && refused.admission==DeviceWriteAdmission::ExtentLease);
     assert(DeviceWrite(&parent,200,&data,1)==1);
     assert(DeviceWriteLeased(&parent,&owner,100,&data,1)==1);
     assert(DeviceWriteLeased(&parent,&owner,199,&data,2)==-30);

@@ -254,7 +254,7 @@ class Hardware:
                  window=None,window_area='frame',cursor=False,**_):
         # Payloads never pass through the MCP serializer. One job identity,
         # binary socket, verified artifact, metadata-only result.
-        from hardware_bulk_workflow import BulkRun,FRAME_CURSOR,FRAME_WINDOW_BUFFER
+        from hardware_bulk_workflow import BulkRun,FRAME_CURSOR,FRAME_WINDOW_BUFFER,FRAME_WINDOW_CROP
         from window_crop import AREAS,find_window,window_rect
         if not isinstance(cursor,bool):raise ValueError('cursor must be a boolean')
         if window_area not in AREAS:raise ValueError('window_area must be frame, client or buffer')
@@ -268,10 +268,14 @@ class Hardware:
             # Window geometry comes from one snapshot taken just before the
             # capture; the two reads are not atomic.
             row=find_window(self.ui.windows(session),window)
-            if window_area=='buffer':
-                options={'flags':FRAME_WINDOW_BUFFER,'window_id':window['window_id'],
-                         'incarnation':int(window['incarnation'])}
-            else:rect=window_rect(row,window_area)
+            if row.get('capture_excluded'):
+                raise PermissionError('Window is excluded from capture')
+            flags = FRAME_WINDOW_BUFFER if window_area == 'buffer' else FRAME_WINDOW_CROP
+            if cursor:
+                flags |= FRAME_CURSOR
+            options = {'flags': flags, 'window_id': window['window_id'], 'incarnation': int(window['incarnation'])}
+            if window_area != 'buffer':
+                rect = window_rect(row,window_area)
         if cursor and options is None:options={'flags':FRAME_CURSOR}
         result=BulkRun(self,output).execute(session,key_file,action,source,artifact_id,port,request_id,keep_raw,
                                             frame_options=options,crop=rect)
@@ -333,14 +337,14 @@ class Hardware:
     def power(self,session,request_id,operation,force=False,reason=None,**_):
         validate_id(request_id)
         verbs={'shutdown':'shutdown','restart':'restart','status':'power_status','cancel':'cancel','commit':'commit','force_apps':'force_apps',
-               'retry':'retry','force_power_off':'force_power_off'}
+               'retry':'retry','force_power_off':'force_power_off','force_restart':'force_restart'}
         reasons={'boot_update':'boot','software_update':'software'}
         if not isinstance(force,bool) or (force and (operation!='restart' or reason is not None)):
             raise ValueError('force is only valid on an unqualified restart')
         if reason is not None and (reason not in reasons or operation not in ('restart','pending')):
             raise ValueError('Use an update reason on restart or pending')
         if not isinstance(operation,str) or (operation not in verbs and operation!='pending'):
-            raise ValueError('Expected shutdown, restart, status, cancel, commit, force_apps, retry, force_power_off or pending')
+            raise ValueError('Expected shutdown, restart, status, cancel, commit, force_apps, retry, force_power_off, force_restart or pending')
         if operation=='pending' and reason is None:
             raise ValueError('pending needs an update reason')
         with self.session_lock(session) as data:

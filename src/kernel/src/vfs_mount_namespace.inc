@@ -415,6 +415,7 @@ static int MountFreshWithVisibility(MountNamespace* ns,const VfsPath& inputTarge
     }
     *backing={};backing->fsOps=ops;backing->mountPriv=privateData;backing->pdrv=pdrv;backing->references=1;backing->independent=true;
     backing->systemInternal=systemInternal;
+    backing->volatileBacking=StrEq(fsName,"tmpfs") || proc || devpts || mqueue;
     mount->owner=ns;mount->referenceState=1;mount->backing=backing;
     mount->rootObject=root;mount->rootIdentity=root->identity;mount->rootObjectOps=root->ops;mount->rootIdentityKnown=true;
     mount->rootDevice=stat.dev;mount->attributes=attributes;

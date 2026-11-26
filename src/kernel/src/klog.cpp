@@ -17,6 +17,7 @@ namespace brook {
 static Vnode*    g_logFile  = nullptr;
 static uint64_t  g_logOffset = 0;
 static SpinLock  g_logLock;
+static bool g_logFileStopped;
 
 // Per-category minimum log level.  Default: Info.
 static LogLevel g_catLevels[static_cast<int>(LogCat::Count)] = {
@@ -194,6 +195,23 @@ static uint32_t FormatLog(char* buf, uint32_t maxLen,
     return pos;
 }
 
+// Serialize the shutdown cutoff with both append paths and the periodic sync.
+static bool AppendLogFile(const char* line, uint32_t size)
+{
+    SpinLockAcquire(&g_logLock);
+    const bool stopped = g_logFileStopped;
+    if (g_logFile && !stopped) VfsWrite(g_logFile, line, size, &g_logOffset);
+    SpinLockRelease(&g_logLock);
+    return !stopped;
+}
+
+void KLogStopFileWrites()
+{
+    SpinLockAcquire(&g_logLock);
+    g_logFileStopped = true;
+    SpinLockRelease(&g_logLock);
+}
+
 // Internal: write a formatted log entry with optional category/level prefix.
 static void KLogWrite(LogCat cat, LogLevel level, const char* fmt, __builtin_va_list args, bool console = false)
 {
@@ -229,13 +247,9 @@ static void KLogWrite(LogCat cat, LogLevel level, const char* fmt, __builtin_va_
     line[pos++] = '\n';
     line[pos]   = '\0';
 
-    // Write to disk under lock.
-    if (g_logFile) {
-        SpinLockAcquire(&g_logLock);
-        uint64_t off = g_logOffset;
-        VfsWrite(g_logFile, line, pos, &off);
-        g_logOffset = off;
-        SpinLockRelease(&g_logLock);
+    if (!AppendLogFile(line, pos)) {
+        DebugOverlayPuts(line);
+        return;
     }
 
     // Echo to serial.
@@ -270,12 +284,10 @@ void KLog(const char* fmt, ...)
     line[pos++] = '\n';
     line[pos]   = '\0';
 
-    // Write under lock.
-    SpinLockAcquire(&g_logLock);
-    uint64_t off = g_logOffset;
-    VfsWrite(g_logFile, line, pos, &off);
-    g_logOffset = off;
-    SpinLockRelease(&g_logLock);
+    if (!AppendLogFile(line, pos)) {
+        DebugOverlayPuts(line);
+        return;
+    }
 
     // Also echo to serial and debug overlay.
     SerialPuts(line);
@@ -302,7 +314,7 @@ void KLogSync()
 {
     if (!g_logFile) return;
     SpinLockAcquire(&g_logLock);
-    VfsSync(g_logFile);
+    if (!g_logFileStopped) VfsSync(g_logFile);
     SpinLockRelease(&g_logLock);
 }
 

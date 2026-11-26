@@ -118,6 +118,14 @@ int main(){
     trace={};plan.efiEntry=0x1234;
     assert(plan.CanPowerOff() && plan.Issue(false,{&trace,Trace::byte,Trace::word,Trace::efi}) && trace.width==64 && trace.value==0x1234);
     trace={};assert(!plan.Issue(false,trace.io()) && !trace.count); // no speculative fallback
+    assert(plan.CanForceEfiRestart());
+    assert(plan.IssueForcedRestart({&trace, Trace::byte, Trace::word, nullptr, nullptr, Trace::efi}));
+    assert(trace.count==1 && trace.width==64 && trace.value==0x1234);
+    trace={};
+    assert(plan.IssueForcedRestart(trace.io()) && trace.count==1 && trace.port==0xcf9);
+    trace={};
+    plan.resetDisabledByLaunch=true;
+    assert(!plan.CanForceEfiRestart() && !plan.IssueForcedRestart(trace.io()) && !trace.count);
 
     // EFI power-off handoff: version 5 with cache and MTRR fingerprints, with or
     // without the appended timing extension. Never an exact-version match.

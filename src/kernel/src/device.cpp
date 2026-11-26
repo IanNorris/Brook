@@ -14,13 +14,28 @@ static SpinLock g_writeLock;
 static WriteAdmission g_writes;
 static BlockWriteLeases g_blockLeases;
 static uintptr_t WriteCaller() {return ProcessCurrent?reinterpret_cast<uintptr_t>(ProcessCurrent()):0;}
-int DeviceWrite(Device* dev,uint64_t offset,const void* data,uint64_t len) {
-    if(!dev || dev->type!=DeviceType::Block || !dev->ops || !dev->ops->write)return -19;
-    const auto caller=WriteCaller();
-    SpinLockAcquire(&g_writeLock);const bool admitted=g_blockLeases.AllowOrdinary(reinterpret_cast<uintptr_t>(dev),offset,len) && g_writes.Enter(caller);SpinLockRelease(&g_writeLock);
-    if(!admitted)return -30;
-    const int result=dev->ops->write(dev,offset,data,len);
-    SpinLockAcquire(&g_writeLock);g_writes.Leave();SpinLockRelease(&g_writeLock);return result;
+DeviceWriteResult DeviceWriteWithAdmission(Device* dev, uint64_t offset, const void* data, uint64_t len)
+{
+    using Admission = DeviceWriteAdmission;
+    if (!dev || dev->type != DeviceType::Block || !dev->ops || !dev->ops->write)
+        return {-19, Admission::NoDevice};
+    const auto caller = WriteCaller();
+    SpinLockAcquire(&g_writeLock);
+    const bool rangeAllowed = g_blockLeases.AllowOrdinary(reinterpret_cast<uintptr_t>(dev), offset, len);
+    const bool admitted = rangeAllowed && g_writes.Enter(caller);
+    SpinLockRelease(&g_writeLock);
+    if (!admitted)
+        return {-30, rangeAllowed ? Admission::ShutdownBarrier : Admission::ExtentLease};
+    const int result = dev->ops->write(dev, offset, data, len);
+    SpinLockAcquire(&g_writeLock);
+    g_writes.Leave();
+    SpinLockRelease(&g_writeLock);
+    return {result, Admission::Admitted};
+}
+
+int DeviceWrite(Device* dev, uint64_t offset, const void* data, uint64_t len)
+{
+    return DeviceWriteWithAdmission(dev, offset, data, len).count;
 }
 int DeviceWriteLeased(Device* parent,Device* owner,uint64_t offset,const void* data,uint64_t len) {
     if(!parent || parent->type!=DeviceType::Block || !parent->ops || !parent->ops->write)return -19;

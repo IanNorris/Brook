@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="brook_capture_v1">
+  <interface name="brook_capture_manager_v1" version="1">
+    <description summary="exclude a Brook toplevel from compositor captures">
+      Applications can exclude their own toplevels and their popups. Send
+      exclude before the first commit containing private pixels. The exclusion
+      lasts for the lifetime of the surface and survives destroying the manager.
+    </description>
+    <enum name="error">
+      <entry name="invalid_surface" value="0" summary="invalid surface or exclusion failed"/>
+    </enum>
+    <request name="destroy" type="destructor"/>
+    <request name="exclude">
+      <arg name="toplevel_surface" type="object" interface="wl_surface"/>
+    </request>
+  </interface>
+</protocol>

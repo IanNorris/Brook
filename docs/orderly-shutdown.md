@@ -99,6 +99,13 @@ and no-reboot QEMU policies and document real-hardware support separately.
 
 ## Implemented coordinator
 
+During checked shutdown, sync errors on volatile RAM filesystems are logged.
+Persistent filesystems must sync successfully before a checked transition.
+After an irreversible failure, **Restart anyway** requests an explicit reset
+without marking the storage clean. It uses EFI warm restart when the opted-in
+runtime mapping passes validation, or the advertised platform reset when EFI
+is unavailable. The local hardware control exposes this as `force_restart`.
+
 The kernel worker in `shutdown.cpp` blocks new launcher/structured command
 admission, cancels queued app launches and awaits dispatches already started.
 It requests cooperative window closure on the compositor thread. Save dialogs

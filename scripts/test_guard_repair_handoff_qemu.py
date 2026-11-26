@@ -192,6 +192,8 @@ def main():
     from guarded_bridge_v3_qa import INTEL_NIC_DEVICE_IDS
     parser.add_argument('--bridge-v3-nic',choices=INTEL_NIC_DEVICE_IDS,
                         help='Exercise guarded v3 over the selected QEMU Intel NIC')
+    parser.add_argument('--boot-compression-seed', type=Path,
+                        help='fixture-only seed for compressed normal slot payloads')
     parser.add_argument('--bridge-v3-nic-accel',choices=('kvm','tcg'),
                         help='Accelerator for the disposable Intel NIC QA boots')
     parser.add_argument('--ssd-trim', choices=('dry-run', 'run'))
@@ -220,7 +222,7 @@ def main():
         allowed = {'image', 'efi', 'firmware', 'desktop_pair', 'recovery_pair', 'output', 'identity',
                    'auto_desktop', 'auto_desktop_dell_initrd', 'auto_desktop_intel_provider',
                    'auto_desktop_vulkan_service', 'managed_profile', 'auto_desktop_network_module',
-                   fixture, 'bridge_v3_nic', 'bridge_v3_nic_accel'}
+                   fixture, 'bridge_v3_nic', 'bridge_v3_nic_accel', 'boot_compression_seed'}
         if (not a.auto_desktop_dell_initrd or not a.auto_desktop_network_module or
                 any(value for name, value in vars(a).items() if name not in allowed)):
             parser.error('bridge QA requires the standard guarded Dell startup fixture and matching network module')
@@ -428,12 +430,36 @@ def main():
             # Leave no alternate normal pair outside A/B, even if selection fails.
             for path in ('::/KERNEL/BROOK.ELF', '::/INITRD.IMG'):
                 subprocess.run(['mdel','-i',media,path],check=True)
+        elif a.boot_compression_seed:
+            from boot_compression import INITRD, KERNEL, MAGIC, compress, read_signer
+            signer = read_signer(a.boot_compression_seed)
+            k = work / 'compressed-kernel'
+            i = work / 'compressed-initrd'
+            k.write_bytes(compress((a.normal_kernel or a.desktop_pair/'KERNEL.ELF').read_bytes(), KERNEL, signer, 8 << 20))
+            i.write_bytes(compress(normal.read_bytes(), INITRD, signer, 64 << 20))
+            if not k.read_bytes().startswith(MAGIC) or not i.read_bytes().startswith(MAGIC):
+                raise ValueError('QEMU compression fixture requires both files compressed')
+            for path in ('::/KERNEL/BROOK.ELF', '::/INITRD.IMG'):
+                if not subprocess.run(['mdir','-i',media,path],capture_output=True).returncode:
+                    subprocess.run(['mdel','-i',media,path],check=True)
+            selector = work / 'compressed-select'
+            selector.write_bytes(record(1, 0, k.read_bytes(), i.read_bytes()))
+            config = subprocess.check_output(['mtype','-i',media,'::/BROOK.CFG'])
+            config_path = work / 'compressed.BROOK.CFG'
+            config_path.write_bytes(config.replace(b'UPDATE_SLOTS=0', b'UPDATE_SLOTS=1'))
+            if b'UPDATE_SLOTS=1' not in config_path.read_bytes():
+                config_path.write_bytes(config.rstrip() + b'\nUPDATE_SLOTS=1\n')
+            for path in ('::/UPDATES', '::/UPDATES/A'):
+                if subprocess.run(['mdir','-i',media,path],capture_output=True).returncode:
+                    subprocess.run(['mmd','-i',media,path],check=True)
+            boot_payloads += ((k,'::/UPDATES/A/KERNEL.ELF'), (i,'::/UPDATES/A/INITRD.IMG'),
+                              (selector,'::/UPDATES/SELECT0.BIN'), (config_path,'::/BROOK.CFG'))
         else:
             boot_payloads += ((a.normal_kernel or a.desktop_pair/'KERNEL.ELF','::/KERNEL/BROOK.ELF'),
                               (normal,'::/INITRD.IMG'))
         for src,target in boot_payloads:
             subprocess.run(['mcopy','-o','-i',media,str(src),target],check=True)
-        if a.bridge_v3_qa:
+        if a.bridge_v3_qa and not a.boot_compression_seed:
             subprocess.run(['mmd','-i',media,'::/UPDATES'],check=True)
         partition=work/'data.img'
         with disk.open('rb') as f:f.seek(DATA_FIRST*512+1024+104);fs_uuid=uuid.UUID(bytes=f.read(16))

@@ -46,6 +46,20 @@ namespace brook {
 // FatFS is NOT thread-safe — all FatFS calls are serialised by this lock.
 static KMutex g_fatLock;
 static bool   g_fatLockInit = false;
+static const char* g_writePath = nullptr;
+
+const char* FatFsCurrentWritePath() { return g_writePath; }
+
+template<typename Operation>
+static FRESULT FatCallWithPath(const char* path, Operation operation)
+{
+    // All callers hold g_fatLock through the synchronous FatFS call.
+    const char* previous = g_writePath;
+    g_writePath = path;
+    const FRESULT result = operation();
+    g_writePath = previous;
+    return result;
+}
 static constexpr uint32_t FAT_IMAGE_MAP_ENTRIES=16384;
 
 // Linux/musl errno values used to report FatFS failures honestly. The kernel
@@ -185,6 +199,7 @@ struct FatOpenFile {
     bool closing;
     bool streaming;
     FatImageLease* imageLease;
+    char writePath[256]; // Drive-relative, used only for failure diagnostics.
 };
 
 // Only live leases populate this table. Their retained vnode pins the FAT
@@ -224,6 +239,7 @@ static bool SameFatFile(const FIL* a, const FIL* b)
 }
 
 static FRESULT CheckedFatSync(FIL* fil, bool closing);
+static int FatObjectPath(VfsObject* object, char* out, uint32_t capacity);
 static bool FatBootArtifactDenied(const FatOpenFile* file);
 static bool FatBootArtifact(const FatFsMountData* mount,uint64_t identity);
 static bool FatBootArtifactDenied(const FatFsMountData* mount,uint64_t identity);
@@ -283,6 +299,15 @@ static void StrCopyLocal(char* dst, const char* src, uint32_t maxLen)
     uint32_t i = 0;
     while (i + 1 < maxLen && src[i]) { dst[i] = src[i]; ++i; }
     dst[i] = '\0';
+}
+
+static void FatDiagnosticPath(VfsObject* object, const char* leaf, char* path, uint32_t capacity)
+{
+    if (FatObjectPath(object, path, capacity)) path[0] = 0;
+    if (!leaf) return;
+    uint32_t used = strlen(path);
+    if (used && path[used - 1] != '/' && used + 1 < capacity) path[used++] = '/';
+    StrCopyLocal(path + used, leaf, capacity - used);
 }
 
 // Build FatFS path: "N:rest" where N = pdrv.
@@ -417,6 +442,25 @@ static int FatFileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
     return static_cast<int>(br);
 }
 
+static constexpr uint64_t FatMaxFileSize = 0xffffffffULL;
+
+// A growing FatFs seek allocates clusters without initializing their data.
+// Write zeroes before raising EOF so even a partially failed gap is safe.
+static FRESULT FatWriteZeroGap(FatOpenFile* file, uint64_t end, bool& full)
+{
+    FIL* fil = &file->fil;
+    static constexpr uint8_t zeros[4096]{};
+    FRESULT result = f_lseek(fil, f_size(fil));
+    while (result == FR_OK && f_size(fil) < end) {
+        const uint64_t remain = end - f_size(fil);
+        const UINT chunk = remain < sizeof(zeros) ? static_cast<UINT>(remain) : sizeof(zeros);
+        UINT written = 0;
+        result = f_write(fil, zeros, chunk, &written);
+        if (result == FR_OK && written != chunk) { full = true; return FR_OK; }
+    }
+    return result;
+}
+
 static int FatFileWriteAt(Vnode* vn, const void* buf, uint64_t len, uint64_t* offset, bool append)
 {
     FIL* fil = static_cast<FIL*>(vn->priv);
@@ -426,15 +470,33 @@ static int FatFileWriteAt(Vnode* vn, const void* buf, uint64_t len, uint64_t* of
     if (ready) { KMutexUnlock(&g_fatLock); return ready; }
     // Alias metadata has been synchronized; EOF and write share g_fatLock.
     uint64_t position = append ? f_size(fil) : *offset;
-    if (f_tell(fil) != position) {
-        FRESULT sres = f_lseek(fil, static_cast<FSIZE_t>(position));
-        if (sres != FR_OK) {
-            KMutexUnlock(&g_fatLock);
-            return FrToErrno(sres);
-        }
+    if (!len || position >= FatMaxFileSize) {
+        KMutexUnlock(&g_fatLock);
+        return len ? -27 : 0; // EFBIG even if the volume also happens to be full.
     }
+    const uint64_t initialSize = f_size(fil);
+    bool full = false;
+    FRESULT res = FatCallWithPath(file->writePath, [&] {
+        if (position > initialSize) {
+            const FRESULT grow = FatWriteZeroGap(file, position, full);
+            if (grow != FR_OK || full) {
+                if (f_size(fil) > initialSize) {
+                    const FRESULT seek = f_lseek(fil, static_cast<FSIZE_t>(initialSize));
+                    const FRESULT shrink = seek == FR_OK ? f_truncate(fil) : seek;
+                    if (shrink != FR_OK) return shrink;
+                }
+                return grow;
+            }
+        }
+        if (f_tell(fil) == position) return FR_OK;
+        return f_lseek(fil, static_cast<FSIZE_t>(position));
+    });
     UINT bw = 0;
-    FRESULT res = f_write(fil, buf, static_cast<UINT>(len), &bw);
+    if (res == FR_OK && !full) {
+        const uint64_t limit = FatMaxFileSize - position;
+        const UINT count = static_cast<UINT>(len < limit ? len : limit);
+        res = FatCallWithPath(file->writePath, [&] { return f_write(fil, buf, count, &bw); });
+    }
     // Even a partial or failed write can have changed FAT buffers. A later
     // idle pass must retry both the file metadata and the device flush.
     file->mount->backgroundDirty = true;
@@ -449,7 +511,7 @@ static int FatFileWriteAt(Vnode* vn, const void* buf, uint64_t len, uint64_t* of
     if (res != FR_OK) { KMutexUnlock(&g_fatLock); return FrToErrno(res); }
     if (bw) *offset = position + bw;
     KMutexUnlock(&g_fatLock);
-    return static_cast<int>(bw);
+    return len && !bw ? -28 : static_cast<int>(bw);
 }
 
 static int FatFileWrite(Vnode* vn, const void* buf, uint64_t len, uint64_t* offset)
@@ -496,7 +558,7 @@ static FRESULT CheckedFatSync(FIL* fil, bool closing)
     auto* file=reinterpret_cast<FatOpenFile*>(fil);
     if(file->imageLease && file->imageLease->error)return FR_DISK_ERR;
     BYTE flags = fil->flag;
-    FRESULT result = closing ? f_close(fil) : f_sync(fil);
+    FRESULT result = FatCallWithPath(file->writePath, [&] { return closing ? f_close(fil) : f_sync(fil); });
     if (result != FR_OK) {
         fil->flag |= flags;
         file->mount->backgroundDirty = true;
@@ -788,7 +850,7 @@ static int CachedFileStat(Vnode* vn, VnodeStat* st)
 
 static int FatFileTruncate(Vnode* vn, uint64_t size)
 {
-    if (size > 0xffffffffULL) return -27;
+    if (size > FatMaxFileSize) return -27;
     auto* file = static_cast<FatOpenFile*>(vn->priv);
     uint8_t* zeros = static_cast<uint8_t*>(kmalloc(4096));
     if (!zeros) return -12;
@@ -797,12 +859,15 @@ static int FatFileTruncate(Vnode* vn, uint64_t size)
     int result = PrepareFatMutation(file);
     FIL* fil = &file->fil;
     if (!result) {
-        FRESULT r = f_lseek(fil, static_cast<FSIZE_t>(size < f_size(fil) ? size : f_size(fil)));
-        if (r == FR_OK && size < f_size(fil)) r = f_truncate(fil);
+        FRESULT r = FatCallWithPath(file->writePath, [&] {
+            auto status = f_lseek(fil, static_cast<FSIZE_t>(size < f_size(fil) ? size : f_size(fil)));
+            if (status == FR_OK && size < f_size(fil)) status = f_truncate(fil);
+            return status;
+        });
         while (r == FR_OK && f_size(fil) < size) {
             UINT count = 0;
             UINT chunk = size - f_size(fil) > 4096 ? 4096 : size - f_size(fil);
-            r = f_write(fil, zeros, chunk, &count);
+            r = FatCallWithPath(file->writePath, [&] { return f_write(fil, zeros, chunk, &count); });
             if (r == FR_OK && count != chunk) { result = -28; break; }
         }
         FRESULT sync = CheckedFatSync(fil, false);
@@ -1098,6 +1163,7 @@ static Vnode* FatFsOpen(void* mountPriv, uint8_t pdrv,
     if (!file) return nullptr;
     __builtin_memset(file, 0, sizeof(*file));
     file->mount = mount;
+    StrCopyLocal(file->writePath, fatPath + 2, sizeof(file->writePath));
     file->streaming = (flags & VFS_O_STREAM) != 0;
     auto* fil = &file->fil;
 
@@ -1157,7 +1223,7 @@ static Vnode* FatFsOpen(void* mountPriv, uint8_t pdrv,
         FRESULT sync = CheckedFatSync(&writer->fil, false);
         if (sync != FR_OK) { KMutexUnlock(&g_fatLock); kfree(file); return nullptr; }
     }
-    FRESULT res = f_open(fil, fatPath, mode);
+    FRESULT res = FatCallWithPath(file->writePath, [&] { return f_open(fil, fatPath, mode); });
     if (res != FR_OK) {
         if (g_fatfsDebug)
             SerialPrintf("FATFS: f_open('%s', 0x%x) failed: %d\n", fatPath, mode, res);
@@ -1428,7 +1494,7 @@ static int FatFsUnlink(void* mountPriv, uint8_t pdrv, const char* relPath)
         KMutexUnlock(&g_fatLock);return -16;
     }
     if(identity)FatRevokeMediaPublicLocked(mount,identity);
-    FRESULT res = f_unlink(fatPath);
+    FRESULT res = FatCallWithPath(fatPath + 2, [&] { return f_unlink(fatPath); });
     KMutexUnlock(&g_fatLock);
     return res == FR_OK ? 0 : FrToErrno(res);
 }
@@ -1439,7 +1505,7 @@ static int FatFsMkdir(void* mountPriv, uint8_t pdrv, const char* relPath, uint16
     char fatPath[256];
     BuildFatPath(fatPath, sizeof(fatPath), pdrv, relPath);
     KMutexLock(&g_fatLock);
-    FRESULT res = f_mkdir(fatPath);
+    FRESULT res = FatCallWithPath(fatPath + 2, [&] { return f_mkdir(fatPath); });
     KMutexUnlock(&g_fatLock);
     return res == FR_OK ? 0 : (res == FR_EXIST ? -17 : FrToErrno(res));
 }
@@ -1463,8 +1529,8 @@ static int FatFsRename(void* mountPriv, uint8_t pdrv,
     // POSIX rename atomically replaces destination; FatFS f_rename fails if
     // destination exists.  Delete the target first (ignore errors — it may
     // not exist).
-    f_unlink(fatNew);
-    FRESULT res = f_rename(fatOld, fatNew);
+    FatCallWithPath(fatNew + 2, [&] { return f_unlink(fatNew); });
+    FRESULT res = FatCallWithPath(fatOld + 2, [&] { return f_rename(fatOld, fatNew); });
     KMutexUnlock(&g_fatLock);
     return res == FR_OK ? 0 : FrToErrno(res);
 }
@@ -1678,6 +1744,8 @@ static Vnode* FatObjectOpen(VfsObject* object,int flags,int* error)
     auto* node=static_cast<Vnode*>(kmalloc(sizeof(Vnode)));
     if(!node){*error=-12;return nullptr;}
     *node={};node->refCount=1;node->backendObject=object;
+    char writePath[256]{};
+    if (flags & VFS_O_WRITE) FatDiagnosticPath(object, nullptr, writePath, sizeof(writePath));
     KMutexLock(&g_fatLock);
     *error=FatBootArtifactDenied(retained->mount,object->identity)?-FVFS_EACCES:
         FatImageIdentityLeased(retained->mount,object->identity)?-16:FatFlushWritersLocked(retained->mount);
@@ -1694,6 +1762,7 @@ static Vnode* FatObjectOpen(VfsObject* object,int flags,int* error)
         if(!file)*error=-12;
         else {
             *file={};file->mount=retained->mount;file->streaming=(flags&VFS_O_STREAM)!=0;
+            StrCopyLocal(file->writePath, writePath, sizeof(file->writePath));
             BYTE mode=(flags&VFS_O_WRITE)?FA_WRITE:FA_READ;
             if(flags&VFS_O_READWRITE)mode|=FA_READ;
             FRESULT result=f_object_open(&retained->location,&file->fil,mode);
@@ -1726,11 +1795,14 @@ static Vnode* FatObjectCreate(VfsObject* parent,const char* name,int flags,uint1
     auto* identity=static_cast<FatPathObject*>(kmalloc(sizeof(FatPathObject)));
     if(!node||!file||!identity){kfree(node);kfree(file);kfree(identity);*error=-12;return nullptr;}
     *node={};*file={};node->refCount=1;file->mount=dir->mount;
+    FatDiagnosticPath(parent, name, file->writePath, sizeof(file->writePath));
     BYTE mode=(flags&VFS_O_WRITE)?FA_WRITE:FA_READ;if(flags&VFS_O_READWRITE)mode|=FA_READ;
     KMutexLock(&g_fatLock);
     *error=FatFlushWritersLocked(dir->mount);
     if(!*error){
-        FRESULT result=f_object_create(&dir->location,name,&file->fil,mode);
+        FRESULT result=FatCallWithPath(file->writePath, [&] {
+            return f_object_create(&dir->location, name, &file->fil, mode);
+        });
         if(result!=FR_OK)*error=result==FR_EXIST?-17:FrToErrno(result);
         else {
             dir->mount->backgroundDirty=true;
@@ -2011,9 +2083,12 @@ static int FatImageTransfer(FatImageLease* lease,uint64_t offset,void* data,uint
     int error=lease->error;
     if(!error && file->imageLease!=lease)error=-22;
     if(!error && bytes) {
-        FRESULT status=f_lseek(&file->fil,static_cast<FSIZE_t>(offset));
         UINT done=0;
-        if(status==FR_OK)status=write?f_write(&file->fil,data,bytes,&done):f_read(&file->fil,data,bytes,&done);
+        FRESULT status = FatCallWithPath(file->writePath, [&] {
+            auto seek = f_lseek(&file->fil, static_cast<FSIZE_t>(offset));
+            if (seek != FR_OK) return seek;
+            return write ? f_write(&file->fil, data, bytes, &done) : f_read(&file->fil, data, bytes, &done);
+        });
         if(status!=FR_OK)error=FrToErrno(status);
         else if(done!=bytes || f_size(&file->fil)!=lease->bytes)error=-5;
         if(error)lease->error=error;

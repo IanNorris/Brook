@@ -41,7 +41,7 @@ struct ChromeLauncherChrome {
     bool forceApps = false;
     // A failed shutdown: status is the full message (shown in a notice bar)
     // and the footer offers the still-possible explicit actions.
-    bool shutdownFailed = false, retryShutdown = false, forcePowerOff = false;
+    bool shutdownFailed = false, retryShutdown = false, forcePowerOff = false, forceRestart = false;
 };
 
 struct ChromeLauncherHit {

@@ -138,9 +138,19 @@ def install_test_record(args, system, record):
     """Edit the disposable p1 only and keep the loader's set hash valid."""
     original = args.output / "system.files"
     initrd = args.output / "negative-INITRD.IMG"
-    shutil.copyfile(original / "INITRD.IMG", initrd)
-    if record is not None:
-        fat_write(initrd, "ETC/usb-system", record)
+    from boot_compression import INITRD, MAGIC, compress, expand
+    data = (original / "INITRD.IMG").read_bytes()
+    if data.startswith(MAGIC):
+        signer = args.compression_signer
+        data = expand(data, INITRD, signer.verify_key.encode(), 128 << 20)
+        initrd.write_bytes(data)
+        if record is not None:
+            fat_write(initrd, "ETC/usb-system", record)
+        initrd.write_bytes(compress(initrd.read_bytes(), INITRD, signer, 128 << 20))
+    else:
+        initrd.write_bytes(data)
+        if record is not None:
+            fat_write(initrd, "ETC/usb-system", record)
     manifest = json.loads((original / "manifest.json").read_text())
     new_set = stick_set((original / "KERNEL/BROOK.ELF").read_bytes(), initrd.read_bytes(), manifest["payload_id"])
     volume = f"{system}@@{ESP_FIRST * SECTOR}"
@@ -180,9 +190,22 @@ def adopt_prebuilt(files):
     """If the set already carries /etc/usb-system (build_rtx_smoke_files.py
     --usb-system), use it unmodified and lay the fixture out at its extent."""
     global PREBUILT, ESP_SECTORS, STORE_FIRST, STORE_SECTORS, BACKUP_FIRST, STORE_BYTES
-    got = subprocess.run(["mtype", "-i", files / "INITRD.IMG", "::/ETC/usb-system"], capture_output=True, text=True)
-    if got.returncode:
-        return
+    from boot_compression import INITRD, MAGIC, expand
+    initrd = files / "INITRD.IMG"
+    with initrd.open("rb") as stream:
+        compressed = stream.read(len(MAGIC)) == MAGIC
+    with tempfile.TemporaryDirectory(prefix="brook-usb-initrd-") as scratch:
+        if compressed:
+            manifest = json.loads((files / "manifest.json").read_text())
+            pin = bytes.fromhex(manifest["boot_compression"]["public_key"])
+            raw = Path(scratch) / "INITRD.IMG"
+            raw.write_bytes(expand(initrd.read_bytes(), INITRD, pin, 128 << 20))
+            initrd = raw
+        got = subprocess.run(["mtype", "-i", initrd, "::/ETC/usb-system"], capture_output=True, text=True)
+        if got.returncode:
+            if compressed:
+                raise ValueError("compressed USB system fixture requires a prebuilt /etc/usb-system record")
+            return
     lines = got.stdout.split("\n")
     assert lines[0] == "BRKUSB1" and len(lines) == 5 and lines[4] == "", "bad usb-system record"
     first, sectors = (int(v) for v in lines[2].split(","))
@@ -402,6 +425,39 @@ def check_refusal(args, system, fallback, case, stage, error):
     return boot, {**status, "outside_p2_sha256": outside_before}
 
 
+def automatic_repair(args):
+    """Sets built since the boot-time e2fsck carry it unless --usb-system-no-fsck."""
+    manifest = json.loads((args.files / "manifest.json").read_text())
+    return bool(((manifest.get("usb_system") or {}).get("fsck") or {}).get("automatic"))
+
+
+def check_dirty_boot(args, system, fallback, case, sentinel=False):
+    """A not-clean BROOK_SYSTEM: repaired and mounted, or (opted out) refused."""
+    if not automatic_repair(args):
+        boot, status = check_refusal(args, system, fallback, case, "needs-filesystem-check", -117)
+        assert status["dirty"]
+        return boot, status
+    outside_before = digest_outside_system(system)
+    guest = Guest(args, system, fallback, case)
+    try:
+        guest.wait_log("USB_SYSTEM_FSCK exit=", timeout=900)
+        guest.wait_log("groups=1024")
+        log = guest.serial.read_text(errors="replace")
+        assert "action=mount" in log and "USB_SYSTEM_MAINTENANCE" not in log, case
+        boot = guest.attach()
+        status = guest.status()
+        assert status["stage"] == "ready" and status["fsck"] == "repaired", status
+        assert status["fsck_exit"] in (0, 1) and status["window_open"] and status["mounted"], status
+        if sentinel:
+            guest.job(f"test \"$(< /data/home/usb-system-test)\" = {SENTINEL}")
+            guest.job("grep -q 'e2fsck -p -f exit=' /nix/var/log/brook/usb-system-fsck.log")
+        guest.restart()
+    finally:
+        guest.stop()
+    assert digest_outside_system(system) == outside_before, case
+    return boot, {**status, "outside_p2_sha256": outside_before}
+
+
 def check_refused_identities(args, system, fallback):
     results = {}
     record = (args.output / "usb-system.record").read_text()
@@ -463,8 +519,7 @@ def check_live_detach(args, disk, fallback):
     finally:
         guest.stop()
     assert digest_outside_system(disk) == outside_before
-    _, reboot = check_refusal(args, disk, fallback, "reboot-after-detach", "needs-filesystem-check", -117)
-    assert reboot["dirty"]
+    _, reboot = check_dirty_boot(args, disk, fallback, "reboot-after-detach")
     return {"fenced": fenced, "final_sync": final, "reboot": reboot}
 
 
@@ -474,6 +529,8 @@ def main():
     parser.add_argument("--store", type=Path, required=True)
     parser.add_argument("--operator-seed", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--boot-compression-seed", type=Path,
+                        help="fixture signing seed for negative identity cases in a compressed set")
     parser.add_argument("--exercise-detach", action="store_true", help="also unplug the SSD in a running guest")
     parser.add_argument("--uas", action="store_true", help="use the QEMU USB Attached SCSI device")
     parser.add_argument("--accel", choices=("kvm", "tcg"), default="kvm")
@@ -482,6 +539,14 @@ def main():
     args = parser.parse_args()
     if args.accel == "kvm" and subprocess.run(["pgrep", "-x", "vmware-vmx"], capture_output=True).returncode == 0:
         raise SystemExit("Workstation is running. Use TCG or wait for the VMware window to close.")
+    meta = json.loads((args.files / "manifest.json").read_text()).get("boot_compression")
+    if meta:
+        from boot_compression import read_signer
+        if not args.boot_compression_seed:
+            parser.error("compressed sets require --boot-compression-seed for identity mutations")
+        args.compression_signer = read_signer(args.boot_compression_seed)
+        if args.compression_signer.verify_key.encode().hex() != meta["public_key"]:
+            parser.error("fixture signing seed does not match the loader pin")
     args.output.mkdir(mode=0o700, parents=True)
     adopt_prebuilt(args.files)
     system, fallback = make_disks(args)
@@ -537,9 +602,9 @@ def main():
     if args.no_gop:
         assert "\ngop=none " in crumb, crumb   # booted headless, not halted
 
-    results["dirty_boot"], results["dirty_status"] = check_refusal(
-        args, system, fallback, "dirty-boot", "needs-filesystem-check", -117)
-    assert results["dirty_status"]["dirty"] and digest_outside_system(system) == outside
+    results["dirty_boot"], results["dirty_status"] = check_dirty_boot(
+        args, system, fallback, "dirty-boot", sentinel=True)
+    assert digest_outside_system(system) == outside
     assert sha(fallback) == fallback_hash
     # Duplicate only the p1 identity; the firmware still selected the SSD.
     guid = subprocess.check_output(["sfdisk", "--part-uuid", system, "1"], text=True).strip()

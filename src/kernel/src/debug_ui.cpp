@@ -78,6 +78,7 @@ void SerializeWindow(Json& json,const WmDebugWindow& window) {
     json.text("{\"window_id\":");json.number(window.id);
     json.text(",\"incarnation\":\"");json.number(window.incarnation);json.text("\",\"title\":");json.string(window.title);
     json.text(",\"raw_title\":");json.string(window.rawTitle);
+    json.boolean("capture_excluded",window.captureExcluded);
     json.text(",\"app_id\":");json.string(window.appId);
     json.text(",\"provider\":");ProcessReference(json,window.providerPid,window.providerIncarnation);
     json.boolean("provider_kernel",window.providerKernel);

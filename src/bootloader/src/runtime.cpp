@@ -26,4 +26,16 @@ void* memcpy(void* dst, const void* src, UINTN n)
     return dst;
 }
 
+void* memmove(void* dst, const void* src, UINTN n)
+{
+    if (reinterpret_cast<UINTN>(dst) <= reinterpret_cast<UINTN>(src)) return memcpy(dst, src, n);
+    auto* d = static_cast<unsigned char*>(dst);
+    const auto* s = static_cast<const unsigned char*>(src);
+    while (n) {
+        --n;
+        d[n] = s[n];
+    }
+    return dst;
+}
+
 } // extern "C"

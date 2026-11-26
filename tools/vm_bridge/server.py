@@ -76,14 +76,14 @@ def png_rgb(width, height, rgb):
 
 
 @contextlib.contextmanager
-def completed_frame_source(session, data, boot_id=None):
+def completed_frame_source(session, data, boot_id=None, window=None):
     """A guest-owned immutable frame lease, never a mutable render buffer."""
     def command(suffix):
         prefix='bridge frame ' if boot_id is None else f'bridge frame guarded {boot_id} '
         result=guest(data,prefix+suffix,timeout=10)
         if 'frame_error' in result:raise RuntimeError(result['frame_error'])
         return result
-    source = command("request")
+    source = command("request" if window is None else f"window {window['window_id']} {window['incarnation']}")
     if not isinstance(source, dict) or source.get("capture_api") != 2:
         raise RuntimeError("Kernel lacks completed-frame capture; boot a current build")
     token = source.get("token")
@@ -145,7 +145,7 @@ def read_frame_bytes(session, source):
         raw_path.unlink(missing_ok=True)
 
 
-def capture(session, data, crop=None, max_width=None, boot_id=None):
+def capture(session, data, crop=None, max_width=None, boot_id=None, window=None):
     """Read a leased completed frame; panic keeps the cached physical fallback."""
     metadata_path = REGISTRY / session / "frame-source.json"
     panic = panic_state(data)
@@ -155,11 +155,13 @@ def capture(session, data, crop=None, max_width=None, boot_id=None):
         source = json.loads(metadata_path.read_text())
         if source.get("session_generation") is not None and source["session_generation"]!=data["generation"]:
             raise RuntimeError("Cached panic geometry belongs to another host generation")
+        if window is not None or int(source["panic_address"], 16) == 0:
+            raise RuntimeError("No compositor-verified frame is available after panic")
         source["address"] = source["panic_address"]
         source["stride"] = source["panic_stride"]
         raw = read_frame_bytes(session, source)
     else:
-        with completed_frame_source(session, data, boot_id) as source:
+        with completed_frame_source(session, data, boot_id, window) as source:
             raw = read_frame_bytes(session, source)
         source={**source,"session_generation":data["generation"],"guest_boot_id":boot_id}
         write_json(metadata_path, source)
@@ -387,9 +389,11 @@ def observe(session, crop=None, max_width=None, include=None, since_event_cursor
         if window_area not in ('frame','client'):raise ValueError('vm_observe window_area must be frame or client')
         ui=window_ui();ui.validate_reference(window)
         row=find_window(ui.windows(session),window)
+        if row.get('capture_excluded'):
+            raise PermissionError('Window is excluded from capture')
         x,y,w,h=window_rect(row,window_area)
         with session_lock(session) as data:
-            full=capture(session,data)
+            full=capture(session,data,window=window)
         fw,fh=full['data']['width'],full['data']['height']
         x0,y0,x1,y1=max(0,x),max(0,y),min(fw,x+w),min(fh,y+h)
         if x1<=x0 or y1<=y0:raise ValueError('Window rectangle is entirely off screen')
@@ -1016,7 +1020,7 @@ register("hw_doctor",hardware.doctor,"Report network reachability and supported 
 register("hw_stats",hardware.stats,"Memory, processes and compositor intervals from a boot-pinned physical Brook session",{**SESSION,"audio_details":{"type":"boolean"}},["session"],True)
 register("hw_thermal",hardware.thermal,"Boot-pinned CPU/GPU temperature (package, per-core, TjMax), RAPL power (package/cores/GT), CPU C0 frequency and GPU clock, with maxima since boot; optional 60 s history, 2 min graph or P-state/C-state registers; read-only",{**SESSION,"history":{"type":"boolean"},"graph":{"type":"boolean"},"power":{"type":"boolean"}},["session"],True)
 register("hw_logs",hardware.logs,"Boot-pinned bounded kernel log lines with retention loss and a next cursor",{**SESSION,"cursor":INT,"limit":INT},["session"],True)
-register("hw_power",hardware.power,"Request, observe, cancel or commit a checked hardware shutdown/reset. After status offers force_apps_available, force_apps explicitly closes still-open apps, discarding unsaved changes. After a failed checked shutdown, retry repeats only the final sync; force_power_off powers off without it (unsaved writes are lost).",{**SESSION,"request_id":STR,"operation":{"type":"string","enum":["shutdown","restart","status","cancel","commit","force_apps","retry","force_power_off","pending"]},"force":{"type":"boolean"},"reason":{"type":"string","enum":["boot_update","software_update"]}},["session","request_id","operation"])
+register("hw_power",hardware.power,"Request, observe, cancel or commit a checked hardware shutdown/reset. When force_apps is available, it closes apps and discards unsaved changes. After a failed checked shutdown, retry repeats the final sync. force_power_off and force_restart proceed without a successful final sync; pending writes may be lost.",{**SESSION,"request_id":STR,"operation":{"type":"string","enum":["shutdown","restart","status","cancel","commit","force_apps","retry","force_power_off","force_restart","pending"]},"force":{"type":"boolean"},"reason":{"type":"string","enum":["boot_update","software_update"]}},["session","request_id","operation"])
 register("hw_command",hardware.command,"Run one kernel debug command on the pinned hardware boot; no host shell, no automatic retry after uncertain delivery",{**SESSION,"command":STR},["session","command"])
 register("hw_guest_run",hardware.guest_run,"Structured guest argv with durable request identity and separate output; uses the same guarded jobs as VMs",{**SESSION,"request_id":STR,"argv":{"type":"array","items":STR},"cwd":STR,"env":{"type":"object"},"uid":INT,"wait_s":NUM,"task_limit":INT},["session","request_id","argv"])
 register("hw_job",hardware.job,"Recover or observe an existing hardware job without replaying it",{**SESSION,"operation_id":STR,"stdout_offset":INT,"stderr_offset":INT,"output_limit":INT,"wait_s":NUM},["session","operation_id"],True)

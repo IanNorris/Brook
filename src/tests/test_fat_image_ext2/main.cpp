@@ -104,7 +104,7 @@ int FileObjectWrite(FileObject*,Vnode* vn,const void* in,uint64_t bytes,uint64_t
 int FileObjectTruncateUnmapped(FileObject*,Vnode*,uint64_t){assert(false);return -95;}
 int FileObjectGrowMapped(FileObject*,Vnode*,uint64_t){assert(false);return -95;}
 int FileObjectWriteback(FileObject* object,Vnode*,uint64_t,uint64_t){for(auto* page:object->pages)assert(!page);return 0;}
-int FileObjectWritebackAll(){return 0;}
+int FileObjectWritebackAll(bool (*)(const Vnode*)){return 0;}
 void FileObjectDispose(FileObject* object){assert(!object->mappings && !object->mappingRegistrations);for(auto* p:object->pages)assert(!p);}
 Process* ProcessCurrent(){return &process;}
 int ProcessFsMask(Process*){return legacyTestMask;}

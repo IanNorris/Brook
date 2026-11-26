@@ -8,6 +8,7 @@ struct PowerIo {
     bool (*write16)(void*,uint16_t,uint16_t);
     bool (*efiOff)(void*,uint64_t)=nullptr;
     bool (*read16)(void*,uint16_t,uint16_t&)=nullptr;
+    bool (*efiWarmReset)(void*,uint64_t)=nullptr;
 };
 struct PlatformPowerPlan {
     AcpiResetInfo firmwareReset{};
@@ -15,11 +16,18 @@ struct PlatformPowerPlan {
     uint64_t efiEntry=0;
     AcpiS5Info acpiS5{};
     bool CanReset() const {return !resetDisabledByLaunch && (firmwareReset.available || q35Reset);}
+    bool CanForceEfiRestart() const { return !resetDisabledByLaunch && efiEntry != 0; }
     bool CanPowerOff() const {return q35Off || efiEntry || acpiS5.Available();}
     const char* ResetMethod() const {return resetDisabledByLaunch?"disabled":firmwareReset.available?"acpi-io8":q35Reset?"q35-io8":"unavailable";}
     const char* PowerOffMethod() const {return efiEntry?"efi-runtime":q35Off?"q35-io16":acpiS5.Available()?"acpi-s5":"manual";}
     const char* ResetReason() const {return resetDisabledByLaunch?"Reset disabled by stop-only launch policy":CanReset()?ResetMethod():firmwareReset.reason;}
     const char* PowerOffReason() const {return efiEntry?"Validated firmware runtime opt-in":q35Off?"Explicit Q35 power-off opt-in":acpiS5.reason;}
+    bool IssueForcedRestart(const PowerIo& io) const {
+        // The firmware callback returns true if it issued ResetSystem.
+        // If its runtime recheck fails before the call, use the platform reset.
+        if (CanForceEfiRestart() && io.efiWarmReset && io.efiWarmReset(io.context, efiEntry)) return true;
+        return Issue(true, io);
+    }
     // Select once. In particular, failure of the advertised register never
     // triggers a speculative alternative reset port or register width.
     bool Issue(bool restart,const PowerIo& io) const {
@@ -78,7 +86,7 @@ void PlatformPowerConfigure(); // boot-time discovery and explicit emulator opt-
 const PlatformPowerPlan& PlatformPowerGetPlan();
 // True means the selected write was issued, not proof that hardware reset/off
 // succeeded. The coordinator stays quiescent and reports a returned transition.
-bool PlatformPowerIssue(bool restart);
+bool PlatformPowerIssue(bool restart, bool forceWarm = false);
 struct BootProtocol;
 // EFI runtime power-off needs at least a version-5 handoff (cache and MTRR
 // fingerprints). Later loaders keep version 5 and append extensions, so this
