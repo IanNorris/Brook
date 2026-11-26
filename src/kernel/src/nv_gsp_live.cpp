@@ -1835,6 +1835,10 @@ bool NvGspHandle(const char* command) {
     else if (!strcmp(verb, "gr clear bl")) GrVerb(5);
     else if (!strcmp(verb, "gr clear hold")) GrVerb(6);
     else if (!strcmp(verb, "gr idle")) GrVerb(7);
+    else if (!strcmp(verb, "gr mthdbuf vram") || !strcmp(verb, "gr mthdbuf sys")) {
+        g_grMthdbufVram = verb[11] == 'v';
+        Out o; o.raw("{\"nv_gsp\":\"gr mthdbuf\""); o.ks("mthdbuf", g_grMthdbufVram ? "vram" : "sysmem"); o.send();
+    }
     else if (!strcmp(verb, "drm minobj on") || !strcmp(verb, "drm minobj off")) {
         nvd::g_minObjects = !strcmp(verb, "drm minobj on");
         DebugChannelSend(nvd::g_minObjects ? "{\"nv_gsp\":\"drm\",\"min_objects\":true}\n" : "{\"nv_gsp\":\"drm\",\"min_objects\":false}\n");

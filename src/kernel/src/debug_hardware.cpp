@@ -1748,6 +1748,18 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",");r.field("gpu_dev_sta",PciConfigRead16(gpu.bus,gpu.dev,0,uint8_t(ec+0x0a)));
         r.text(",");r.field("gpu_l1_exit_us",exitUs(eLinkCap));r.text(",");r.field("root_l1_exit_us",exitUs(rLinkCap));
         r.text(",");r.field("gpu_l1_accept_us",acceptUs(eDevCap));
+        // PCI command/status (bus master, master/target abort, SERR), root-port secondary status
+        // (received master abort 13, received SERR 14), Link Control 2/Status 2, Root Status (PME)
+        r.text(",");r.field("gpu_cmd_sta",PciConfigRead32(gpu.bus,gpu.dev,0,4));
+        r.text(",");r.field("root_cmd_sta",PciConfigRead32(rb,rd,rf,4));
+        r.text(",");r.field("root_sec_sta",PciConfigRead16(rb,rd,rf,0x1e));
+        r.text(",");r.field("root_bridge_ctl",PciConfigRead16(rb,rd,rf,0x3e));
+        r.text(",");r.field("gpu_link_cap",eLinkCap);r.text(",");r.field("root_link_cap",rLinkCap);
+        r.text(",");r.field("gpu_link_ctl2_sta2",PciConfigRead32(gpu.bus,gpu.dev,0,uint8_t(ec+0x30)));
+        r.text(",");r.field("root_link_ctl2_sta2",PciConfigRead32(rb,rd,rf,uint8_t(rc+0x30)));
+        r.text(",");r.field("root_dev_ctl",PciConfigRead16(rb,rd,rf,uint8_t(rc+0x08)));
+        r.text(",");r.field("root_root_ctl",PciConfigRead16(rb,rd,rf,uint8_t(rc+0x1c)));
+        r.text(",");r.field("root_root_sta",PciConfigRead32(rb,rd,rf,uint8_t(rc+0x20)));
         r.text(",\"fn_link_ctl\":[");for(uint8_t f=0;f<=3;++f){const uint8_t fc=capOf(gpu.bus,gpu.dev,f);if(f)r.text(",");
             r.number(fc?PciConfigRead16(gpu.bus,gpu.dev,f,uint8_t(fc+0x10)):0);}
         r.text("]}\n");r.send();return true;

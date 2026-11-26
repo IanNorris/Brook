@@ -69,6 +69,10 @@ inline void GrBuildBufs(const rm570::gr::GET_CONTEXT_BUFFERS_INFO_PARAMS& p, GrB
     }
 }
 
+// A/B (26 Nov GR idle fault bisect): put the channel's method buffer in VRAM instead of
+// sysmem (nouveau uses sysmem; this only tests whether a sysmem DMA is the faulting one).
+inline bool g_grMthdbufVram = false;
+
 // One client scope with a GR0 channel.
 struct GrScope {
     uint32_t base = 0, chid = 0;
@@ -202,7 +206,14 @@ struct GrCtx {
         a.instanceMem = {s.inst, 0x1000, rm::ADDR_FBMEM, 1};
         a.userdMem = {s.userd, 0x200, rm::ADDR_FBMEM, 1};
         a.ramfcMem = {s.inst, 0x200, rm::ADDR_FBMEM, 1};
-        a.mthdbufMem = {mthdbuf.bus, mthdbuf_size, rm::ADDR_SYSMEM, 0};
+        if (g_grMthdbufVram) {
+            uint64_t mv = 0; const uint64_t mb = (uint64_t(mthdbuf_size) + 0xfff) & ~0xfffull;
+            if (!arena.alloc(mb, 0x1000, &mv)) return fail("VRAM arena (mthdbuf)");
+            zero(mv, mb);
+            a.mthdbufMem = {mv, mthdbuf_size, rm::ADDR_FBMEM, 1};
+        } else {
+            a.mthdbufMem = {mthdbuf.bus, mthdbuf_size, rm::ADDR_SYSMEM, 0};
+        }
         a.internalFlags = (s.priv ? rm::KERNELCHANNEL_PRIVILEGE_ADMIN : 0) | (rm::KERNELCHANNEL_ERROR_NOTIFIER_NONE << 2) |
                           (rm::KERNELCHANNEL_ERROR_NOTIFIER_NONE << 4);
         return alloc(s, s.base + grh::kDevice, s.h_chan, rm::TURING_CHANNEL_GPFIFO_A, &a, sizeof(a), "RM_ALLOC GR channel");
@@ -251,7 +262,14 @@ struct GrCtx {
         a.instanceMem = {s.inst, 0x1000, rm::ADDR_FBMEM, 1};
         a.userdMem = {s.userd, 0x200, rm::ADDR_FBMEM, 1};
         a.ramfcMem = {s.inst, 0x200, rm::ADDR_FBMEM, 1};
-        a.mthdbufMem = {mthdbuf.bus, mthdbuf_size, rm::ADDR_SYSMEM, 0};
+        if (g_grMthdbufVram) {
+            uint64_t mv = 0; const uint64_t mb = (uint64_t(mthdbuf_size) + 0xfff) & ~0xfffull;
+            if (!arena.alloc(mb, 0x1000, &mv)) return fail("VRAM arena (mthdbuf)");
+            zero(mv, mb);
+            a.mthdbufMem = {mv, mthdbuf_size, rm::ADDR_FBMEM, 1};
+        } else {
+            a.mthdbufMem = {mthdbuf.bus, mthdbuf_size, rm::ADDR_SYSMEM, 0};
+        }
         a.internalFlags = (s.priv ? rm::KERNELCHANNEL_PRIVILEGE_ADMIN : 0) | (rm::KERNELCHANNEL_ERROR_NOTIFIER_NONE << 2) |
                           (rm::KERNELCHANNEL_ERROR_NOTIFIER_NONE << 4);
         return alloc(s, s.base + grh::kDevice, s.h_chan, rm::TURING_CHANNEL_GPFIFO_A, &a, sizeof(a), "RM_ALLOC GR channel");
