@@ -32,7 +32,10 @@ int ProcessReadAnonymousFdMetadata(Process* viewer, Process* target, uint32_t fd
         case FdType::SyncFile: case FdType::DevKeyboard: case FdType::DevNull:
         case FdType::DevUrandom: case FdType::DevDsp: case FdType::DevTty:
         case FdType::DevZero: case FdType::DevFull:
-        case FdType::DebugSerial: case FdType::DebugConsole: case FdType::DevFramebuf: break;
+        case FdType::DebugSerial: case FdType::DebugConsole: case FdType::DevFramebuf:
+        // DRM render nodes: Chromium's GPU sandbox fstatat()s every /proc/self/fd entry
+        // (proc_util.cc HasOpenDirectory) and CHECK-fails on EOPNOTSUPP (27 Nov, renderD130).
+        case FdType::DevDri: case FdType::DevIntelDri: case FdType::DevNvDri: break;
         default: SpinLockRelease(lock); return 0;
     }
     if (!sameGroup) { SpinLockRelease(lock); return -13; }
@@ -49,7 +52,9 @@ int ProcessReadAnonymousFdMetadata(Process* viewer, Process* target, uint32_t fd
                     type == FdType::DevFramebuf ? 0x1d00 : type == FdType::DevNull ? 0x0103 :
                     type == FdType::DevUrandom ? 0x0109 : type == FdType::DevDsp ? 0x0e03 :
                     type == FdType::DevZero ? 0x0105 : type == FdType::DevFull ? 0x0107 :
-                    type == FdType::DebugSerial ? 0x0440 : 0x0400;
+                    type == FdType::DebugSerial ? 0x0440 :
+                    type == FdType::DevDri ? 0xE280 : type == FdType::DevIntelDri ? 0xE281 :   // 226:128.. (DRM_RENDER_RDEV)
+                    type == FdType::DevNvDri ? 0xE282 : 0x0400;
     }
     return 1;
 }

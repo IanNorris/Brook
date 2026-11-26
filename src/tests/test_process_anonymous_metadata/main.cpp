@@ -65,6 +65,10 @@ int main() {
     assert(SpinLockTryAcquire(&other.replacementLock)); SpinLockRelease(&other.replacementLock);
     fds[7].flags=0; assert(ProcessReadAnonymousFdMetadata(&actor,&other,7,&st)==1 && st.mode==0010666);
     fds[7].flags=4; assert(ProcessReadAnonymousFdMetadata(&actor,&other,7,&st)==1 && st.mode==0020666 && st.rdev==0x8800);
+    // DRM render nodes (Chromium's sandbox fstatat()s each /proc/self/fd entry)
+    fds[7].type=FdType::DevNvDri; assert(ProcessReadAnonymousFdMetadata(&actor,&other,7,&st)==1 && st.mode==0020666 && st.rdev==0xE282);
+    fds[7].type=FdType::DevIntelDri; assert(ProcessReadAnonymousFdMetadata(&actor,&other,7,&st)==1 && st.rdev==0xE281);
+    fds[7].type=FdType::DevDri; assert(ProcessReadAnonymousFdMetadata(&actor,&other,7,&st)==1 && st.rdev==0xE280);
     fds[7].type=FdType::SyntheticMem; assert(ProcessReadAnonymousFdMetadata(&actor,&other,7,&st)==0);
     for (uint32_t fd : {1u, 2u, 9u}) {
         fds[fd].type = FdType::Vnode;
