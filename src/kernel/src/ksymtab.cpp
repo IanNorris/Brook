@@ -28,6 +28,7 @@ extern "C" brook::KernelSymbol __stop_ksymtab[];
 #include "keyboard.h"
 #include "input.h"
 #include "boot_timing_runtime.h"
+#include "boot_pointer_usb.h"
 #include "scheduler.h"
 #include "sched_decision_trace.h"
 #include "display.h"
@@ -205,6 +206,7 @@ EXPORT_SYMBOL(InputWakeWaiters);
 EXPORT_SYMBOL(InputNextSequence);
 EXPORT_SYMBOL(InputMarkPointerIngress);
 EXPORT_SYMBOL(BootTimingUsbPointer);
+EXPORT_SYMBOL(BootTimingUsbPointerTransfer);
 
 // Scheduler — for dynamic policy modules
 EXPORT_SYMBOL(SchedulerRegisterPolicy);

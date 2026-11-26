@@ -1,4 +1,5 @@
 #include "boot_timing_runtime.h"
+#include "boot_pointer_usb.h"
 #include "boot_timing.h"
 #include "acpi.h"
 #include "apic.h"
@@ -23,6 +24,18 @@ struct PointerStamp {
     uint64_t tsc, tick;
 };
 PointerStamp g_pointerStamps[static_cast<unsigned>(BootPointerEvent::Count)];
+
+struct UsbPointerStamp {
+    UsbPointerEndpoint endpoint;
+    UsbPointerStage stage;
+    UsbPointerIgnore reason;
+    uint8_t cc;
+    uint32_t residue;
+    uint64_t tsc, tick;
+    bool ready;
+};
+UsbPointerStamp g_usbPointerStamps[160]; // Five stages each for 32 pointer interfaces.
+uint32_t g_usbPointerCount;
 
 void PublishBootLine(const char* line)
 {
@@ -61,8 +74,74 @@ static void PointerClock(BootText& text, uint64_t tsc, uint64_t tick)
     }
 }
 
+extern "C" void BootTimingUsbPointerTransfer(const UsbPointerEndpoint& endpoint,
+    UsbPointerStage stage, uint8_t cc, uint32_t residue, UsbPointerIgnore reason)
+{
+    constexpr unsigned capacity = sizeof(g_usbPointerStamps) / sizeof(g_usbPointerStamps[0]);
+    if (__atomic_load_n(&g_usbPointerCount, __ATOMIC_RELAXED) >= capacity) return;
+    const unsigned index = __atomic_fetch_add(&g_usbPointerCount, 1, __ATOMIC_RELAXED);
+    if (index >= capacity) return;
+    auto& stamp = g_usbPointerStamps[index];
+    stamp.tsc = ReadTsc();
+    stamp.tick = ApicTickCount();
+    stamp.endpoint = endpoint;
+    stamp.stage = stage;
+    stamp.reason = reason;
+    stamp.cc = cc;
+    stamp.residue = residue;
+    __atomic_store_n(&stamp.ready, true, __ATOMIC_RELEASE);
+}
+
+static void FlushUsbPointerStamps()
+{
+    constexpr unsigned capacity = sizeof(g_usbPointerStamps) / sizeof(g_usbPointerStamps[0]);
+    static unsigned nextIndex = 0; // One consumer, the compositor thread.
+    static const char* const stages[] = {"usb_queued", "usb_complete", "usb_rearm",
+                                          "usb_report", "usb_ignored"};
+    static const char* const reasons[] = {"none", "inactive", "transfer_error",
+                                           "invalid_length", "idle", "shared_button", "input_ring_full"};
+    while (nextIndex < capacity && __atomic_load_n(&g_usbPointerStamps[nextIndex].ready, __ATOMIC_ACQUIRE)) {
+        const auto& stamp = g_usbPointerStamps[nextIndex++];
+        const auto& ep = stamp.endpoint;
+        char line[384];
+        BootText text(line, sizeof(line));
+        text.Add("BOOT_POINTER "); text.Add(stages[static_cast<unsigned>(stamp.stage)]);
+        PointerClock(text, stamp.tsc, stamp.tick);
+        text.Add(" controller="); text.Number(ep.controller);
+        text.Add(" port="); text.Add(ep.port);
+        text.Add(" vid="); text.Number(ep.vendor);
+        text.Add(" pid="); text.Number(ep.product);
+        text.Add(" slot="); text.Number(ep.slot);
+        text.Add(" ep="); text.Number(ep.endpoint);
+        text.Add(" requested="); text.Number(ep.requestedBytes);
+        if (stamp.stage == UsbPointerStage::Queued) {
+            text.Add(" speed="); text.Number(ep.speed);
+            text.Add(" tt_slot="); text.Number(ep.ttSlot);
+            text.Add(" tt_port="); text.Number(ep.ttPort);
+            text.Add(" bInterval="); text.Number(ep.interval);
+            text.Add(" esit_us="); text.Number(125u << ep.esitExponent);
+            text.Add(ep.bootProtocol ? " boot_protocol=accepted" : " boot_protocol=failed");
+        }
+        if (stamp.cc) {
+            text.Add(" cc="); text.Number(stamp.cc);
+            text.Add(" residue="); text.Number(stamp.residue);
+            if (stamp.residue <= ep.requestedBytes && (stamp.cc == 1 || stamp.cc == 13)) {
+                text.Add(" bytes="); text.Number(ep.requestedBytes - stamp.residue);
+            } else {
+                text.Add(" bytes=unknown");
+            }
+        }
+        if (stamp.reason != UsbPointerIgnore::None) {
+            text.Add(" reason="); text.Add(reasons[static_cast<unsigned>(stamp.reason)]);
+        }
+        text.Add("\n");
+        PublishBootLine(line);
+    }
+}
+
 void BootTimingPointerFlush()
 {
+    FlushUsbPointerStamps();
     static const char* const names[] = {"ingress", "wm", "seat_bound", "wayland_delivered", "cursor", "desktop"};
     static_assert(sizeof(names) / sizeof(*names) == static_cast<unsigned>(BootPointerEvent::Count));
     for (unsigned i = 0; i < static_cast<unsigned>(BootPointerEvent::Count); ++i) {

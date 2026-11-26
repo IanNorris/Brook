@@ -56,6 +56,7 @@
 #include "memory/address.h"
 #include "mem_tag.h"
 #include "input.h"
+#include "boot_pointer_usb.h"
 #include "compositor.h"
 #include "usb_boot_keyboard.h"
 #include "keyboard.h"
@@ -99,6 +100,7 @@ MODULE_IMPORT_SYMBOL(InputRegister);
 MODULE_IMPORT_SYMBOL(InputMarkPointerIngress);
 extern "C" void BootTimingUsbPointer(bool, uint32_t, const char*, uint16_t, uint16_t);
 MODULE_IMPORT_SYMBOL(BootTimingUsbPointer);
+MODULE_IMPORT_SYMBOL(BootTimingUsbPointerTransfer);
 MODULE_IMPORT_SYMBOL(InputWakeWaiters);
 MODULE_IMPORT_SYMBOL(CompositorWake);
 MODULE_IMPORT_SYMBOL(InputNextSequence);
@@ -1078,6 +1080,8 @@ struct XhciHidFn {
     uint8_t  previous[8];       // per-interface keys or buttons
     bool     active;
     uint8_t  errorCc;
+    uint8_t  pointerStages;
+    UsbPointerEndpoint pointerEndpoint;
 };
 struct XhciDevice {
     XhciController* ctrl;
@@ -1962,7 +1966,7 @@ static UsbBootKeyboard g_bootKeyboard;
 static uint32_t g_activeUsbMice;
 static volatile uint32_t g_mouseReports;
 
-static void XhciProcessMouseReport(const uint8_t* report, XhciHidFn& fn);
+static UsbPointerIgnore XhciProcessMouseReport(const uint8_t* report, XhciHidFn& fn);
 static void XhciEndHid(XhciHidFn& fn, bool keyboard);
 static int XhciMatchTransferEvent(const XhciController& ctrl, const Trb& evt);
 static bool XhciUacEventHit(const XhciController& ctrl, const Trb& event);
@@ -1977,6 +1981,15 @@ static bool XhciHidRingHit(const XhciHidFn& fn, const Trb& event, uint32_t slot,
 }
 
 static void XhciQueueHidIn(XhciController& ctrl, XhciDevice& dev, XhciHidFn& fn);
+
+static void XhciMarkPointer(XhciHidFn& fn, UsbPointerStage stage, uint8_t cc = 0,
+                            uint32_t residue = 0, UsbPointerIgnore reason = UsbPointerIgnore::None)
+{
+    const unsigned bit = 1u << static_cast<unsigned>(stage);
+    if (fn.pointerStages & bit) return;
+    fn.pointerStages |= bit;
+    BootTimingUsbPointerTransfer(fn.pointerEndpoint, stage, cc, residue, reason);
+}
 
 static void XhciDrainController(XhciController& ctrl,bool& wakeNetwork)
 {
@@ -2009,14 +2022,21 @@ static void XhciDrainController(XhciController& ctrl,bool& wakeNetwork)
                     auto& fn=which?dev.mouse:dev.kbd;
                     if(!XhciHidRingHit(fn,event,slot,dev.slotId))continue;
                     handled=true;
-                    if(!fn.active || dev.gone)break;
+                    const uint32_t residue = event.status & 0xffffff;
+                    if (which) XhciMarkPointer(fn, UsbPointerStage::Complete, cc, residue);
+                    if(!fn.active || dev.gone) {
+                        if (which) XhciMarkPointer(fn, UsbPointerStage::Ignored, cc, residue,
+                                                    UsbPointerIgnore::Inactive);
+                        break;
+                    }
                     if(cc!=TRB_CC_SUCCESS && cc!=TRB_CC_SHORT_PACKET) {
+                        if (which) XhciMarkPointer(fn, UsbPointerStage::Ignored, cc, residue,
+                                                    UsbPointerIgnore::TransferError);
                         fn.errorCc=static_cast<uint8_t>(cc);
                         XhciEndHid(fn,!which);
                         wakeInput=true;
                         break;
                     }
-                    const uint32_t residue=event.status&0xffffff;
                     const uint32_t bytes=residue<=fn.length?fn.length-residue:0;
                     if(!which && bytes>=3) {
                         for(uint32_t i=bytes;i<8;++i)fn.report[i]=0;
@@ -2024,11 +2044,20 @@ static void XhciDrainController(XhciController& ctrl,bool& wakeNetwork)
                         wakeInput=true;
                     } else if(which && bytes>=3) {
                         if(bytes<4)fn.report[3]=0;
-                        XhciProcessMouseReport(fn.report,fn);
+                        const uint8_t buttons = fn.report[0] & 7;
+                        const bool motion = fn.report[1] || fn.report[2] || fn.report[3];
+                        const bool changed = buttons != fn.previous[0];
+                        if (motion || buttons || changed)
+                            XhciMarkPointer(fn, UsbPointerStage::Report, cc, residue);
+                        const auto reason = XhciProcessMouseReport(fn.report,fn);
+                        if (reason != UsbPointerIgnore::None)
+                            XhciMarkPointer(fn, UsbPointerStage::Ignored, cc, residue, reason);
                         __atomic_fetch_add(&g_mouseReports,1,__ATOMIC_RELAXED);
                         wakeInput=true;
-                    }
+                    } else if (which) XhciMarkPointer(fn, UsbPointerStage::Ignored, cc, residue,
+                                                      UsbPointerIgnore::Length);
                     XhciQueueHidIn(ctrl,dev,fn);
+                    if (which) XhciMarkPointer(fn, UsbPointerStage::Rearm);
                 }
                 // Completions for a disconnected device have no waiter.
                 const auto discard=__atomic_load_n(&dev.mscDiscardDcis,__ATOMIC_ACQUIRE);
@@ -2090,10 +2119,11 @@ static InputDeviceOps g_usbMouseOps = { "usb_mouse", nullptr };
 static uint8_t g_usbButtons;
 static uint8_t g_usbButtonHolders[3];
 
-static void XhciProcessMouseReport(const uint8_t* report, XhciHidFn& fn)
+static UsbPointerIgnore XhciProcessMouseReport(const uint8_t* report, XhciHidFn& fn)
 {
     const uint8_t buttons = report[0] & 0x07;
     const uint8_t previous = g_usbButtons;
+    const bool changed = buttons != fn.previous[0];
     for (unsigned bit = 0; bit < 3; ++bit) {
         const uint8_t mask = 1u << bit;
         if (!((buttons ^ fn.previous[0]) & mask)) continue;
@@ -2108,6 +2138,7 @@ static void XhciProcessMouseReport(const uint8_t* report, XhciHidFn& fn)
     const int8_t dx = static_cast<int8_t>(report[1]);
     const int8_t dy = static_cast<int8_t>(report[2]);
     const int8_t wheel = static_cast<int8_t>(report[3]);
+    bool dropped = false;
     if (dx || dy) {
         MouseMoveRelative(dx, dy);
         InputEvent ev{};
@@ -2115,7 +2146,7 @@ static void XhciProcessMouseReport(const uint8_t* report, XhciHidFn& fn)
         ev.scanCode = g_usbButtons;
         ev.deltaX = dx;
         ev.deltaY = dy;
-        InputDevicePush(&g_usbMouseDev, ev);
+        dropped |= !InputDevicePush(&g_usbMouseDev, ev);
     }
     if (wheel) {
         InputEvent ev{};
@@ -2123,7 +2154,7 @@ static void XhciProcessMouseReport(const uint8_t* report, XhciHidFn& fn)
         ev.scanCode = static_cast<uint8_t>(wheel);
         ev.modifiers = g_usbButtons;
         ev.deltaY = int32_t(wheel) * 120;
-        InputDevicePush(&g_usbMouseDev, ev);
+        dropped |= !InputDevicePush(&g_usbMouseDev, ev);
     }
     for (unsigned bit = 0; bit < 3; ++bit) {
         const uint8_t mask = 1u << bit;
@@ -2132,8 +2163,11 @@ static void XhciProcessMouseReport(const uint8_t* report, XhciHidFn& fn)
         ev.type = (g_usbButtons & mask) ? InputEventType::MouseButtonDown : InputEventType::MouseButtonUp;
         ev.scanCode = bit;
         ev.modifiers = g_usbButtons;
-        InputDevicePush(&g_usbMouseDev, ev);
+        dropped |= !InputDevicePush(&g_usbMouseDev, ev);
     }
+    if (dropped) return UsbPointerIgnore::RingFull;
+    if (dx || dy || wheel || previous != g_usbButtons) return UsbPointerIgnore::None;
+    return changed ? UsbPointerIgnore::SharedButton : UsbPointerIgnore::Idle;
 }
 
 static void XhciEndHid(XhciHidFn& fn, bool keyboard)
@@ -3872,13 +3906,31 @@ static void XhciQueueHidIn(XhciController& ctrl, XhciDevice& dev, XhciHidFn& fn)
 
 static bool XhciStartHid(XhciController& ctrl, XhciDevice& dev, XhciHidFn& fn, bool keyboard)
 {
-    XhciSetBootProtocol(ctrl, dev, fn.iface); // a stall here is recovered; keep going
+    const bool bootProtocol = XhciSetBootProtocol(ctrl, dev, fn.iface); // A stall is recovered.
     if (!XhciConfigureIntIn(ctrl, dev, fn.ep, fn.packet, fn.interval, fn.ring, fn.ringPhys,
                             fn.enqueue, fn.cycle, fn.dci)) return false;
     fn.report = static_cast<uint8_t*>(AllocDmaBuffer(1, fn.reportPhys));
     if (!fn.report) return false;
     const uint32_t packet = fn.packet & 0x7ffu;
     fn.length = keyboard ? 8u : (packet < 8 ? packet : 8u);
+    if (!keyboard) {
+        auto& ep = fn.pointerEndpoint;
+        XhciPathText(dev, ep.port, sizeof(ep.port));
+        ep.vendor = dev.vendorId;
+        ep.product = dev.productId;
+        ep.controller = ctrl.index;
+        ep.slot = dev.slotId;
+        ep.endpoint = fn.ep;
+        ep.speed = dev.portSpeed;
+        ep.ttSlot = dev.topo.ttSlot;
+        ep.ttPort = dev.topo.ttPort;
+        ep.interval = fn.interval;
+        uint32_t exponent = 0;
+        UsbXhciInterval(dev.portSpeed, fn.interval, exponent);
+        ep.esitExponent = exponent;
+        ep.requestedBytes = fn.length;
+        ep.bootProtocol = bootProtocol;
+    }
     if (keyboard && !g_kbdRegistered) {
         g_usbKbdOps.poll = XhciKeyboardPoll;
         g_usbKbdDev.ops = &g_usbKbdOps;
@@ -3901,6 +3953,7 @@ static bool XhciStartHid(XhciController& ctrl, XhciDevice& dev, XhciHidFn& fn, b
     fn.active = true;
     if (!keyboard && ++g_activeUsbMice == 1) MouseSetUsbAvailable(true);
     XhciQueueHidIn(ctrl, dev, fn);
+    if (!keyboard) XhciMarkPointer(fn, UsbPointerStage::Queued);
     IrqSpinLockRelease(&g_eventRingLock, saved);
     return true;
 }
