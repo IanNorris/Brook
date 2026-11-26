@@ -2312,10 +2312,14 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         const char* p=command+sizeof(uncleanPrefix)-1;char boot[33]{};
         if(!ReadId(p,boot) || *p){DebugChannelSend("{\"power_error\":\"Expected boot_id\"}\n");return true;}
         if(!DebugEpochMatches(boot)){DebugChannelSend("{\"boot_error\":\"Guest boot changed; attach explicitly again\"}\n");return true;}
+#if !defined(BROOK_HOST_TEST)
         KPrintf("power: unclean reset requested (no sync, power-loss test)\n");
         DebugChannelSend("{\"unclean_reset\":\"issuing\"}\n");
         SchedulerSleepMs(300);
         if(!PlatformPowerIssue(true))DebugChannelSend("{\"unclean_reset\":\"unavailable\"}\n");
+#else
+        DebugChannelSend("{\"unclean_reset\":\"unavailable\"}\n");
+#endif
         return true;
     }
     constexpr char powerPrefix[]="bridge hardware power ";
