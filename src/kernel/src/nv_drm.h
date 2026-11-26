@@ -24,4 +24,17 @@ int64_t NvDrmIoctl(NvDrmFile* f, uint64_t cmd, uint64_t arg);
 // [offset, offset+length) and a referenced lifetime (the caller's mapping drops it), or false
 // (unknown token, past the BO, or a VRAM BO: no CPU-visible VRAM yet).
 bool NvDrmMapGart(NvDrmFile* f, uint64_t offset, uint64_t length, uint64_t* phys, MappingBacking** life);
+// The file's core under its lock (nullptr if the file has no backend); always unlock.
+nvdrm::File* NvDrmFileLock(NvDrmFile* f);
+void NvDrmFileUnlock(NvDrmFile* f);
+
+// PRIME (nv_drm_prime.cpp, nv_drm_prime.h). renderD130 PRIME_HANDLE_TO_FD/FD_TO_HANDLE and
+// SYNCOBJ_HANDLE_TO_FD/FD_TO_HANDLE; FdType::NvPrime descriptors hold one Shared reference.
+int64_t NvDrmPrimeIoctl(NvDrmFile* f, uint64_t cmd, uint64_t arg);
+void NvPrimeRef(void* shared);
+void NvPrimeUnref(void* shared);
+uint64_t NvPrimeBytes(void* shared);
+uint64_t NvPrimeIdentity(void* shared);
+int64_t NvPrimeFdIoctl(void* shared, uint64_t cmd, uint64_t arg);   // DMA_BUF_IOCTL_*
+bool NvPrimeMapGart(void* shared, uint64_t offset, uint64_t length, uint64_t* phys, MappingBacking** life);
 }

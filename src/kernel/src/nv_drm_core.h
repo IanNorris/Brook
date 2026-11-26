@@ -7,7 +7,8 @@
 //             at M5.3), CHANNEL_ALLOC/FREE (bookkeeping only until M5.3), NVIF device NEW, its
 //             DEVICE_INFO/TIME methods, channel SCLASS, subchannel object NEW/DEL.
 // Layouts: Mesa include/drm-uapi/nouveau_drm.h, src/nouveau/drm/nvif/{ioctl,cl0080,class}.h (MIT).
-// Every other command returns -ENOTTY; M5.2 adds GEM/VM_BIND, M5.3 EXEC.
+// Every other command returns -ENOTTY; M5.2 adds GEM/VM_BIND, M5.3 EXEC; PRIME sharing is in
+// nv_drm_prime.h (included at the end).
 #include <stdint.h>
 #include "gpu_sync.h"
 #include "memory/heap.h"
@@ -30,6 +31,7 @@ constexpr uint32_t NR_VERSION = 0x00, NR_GET_CAP = 0x0c, NR_SYNCOBJ_CREATE = 0xb
                    NR_SYNCOBJ_TIMELINE_SIGNAL = 0xcd;
 constexpr uint32_t DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE = 4, DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED = 1;
 constexpr uint64_t DRM_CAP_SYNCOBJ = 0x13, DRM_CAP_SYNCOBJ_TIMELINE = 0x14;
+constexpr uint64_t DRM_CAP_PRIME = 0x5, DRM_PRIME_CAP_IMPORT = 1, DRM_PRIME_CAP_EXPORT = 2;
 constexpr uint32_t DRM_SYNCOBJ_CREATE_SIGNALED = 1, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL = 1,
                    DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT = 2;
 // nouveau (DRM_COMMAND_BASE + n)
@@ -151,6 +153,9 @@ struct Backend {
     bool vram_cpu_map;   // false: no CPU-visible VRAM yet, so VRAM|MAPPABLE BOs are placed in GART
 };
 
+struct Shared;                    // a PRIME-shared backing (nv_drm_prime.h)
+inline void SharedUnref(Shared* s);
+inline bool SharedFence(Shared* s, uint32_t flags, GpuFence** out);
 constexpr uint32_t kMaxBos = 2048, kMaxMappings = 2048, kMaxBindJobs = 16, kMaxBindOps = 64, kMaxJobSyncs = 16;
 constexpr uint32_t GEM_DOMAIN_CPU = 1, GEM_DOMAIN_VRAM = 2, GEM_DOMAIN_GART = 4, GEM_DOMAIN_MAPPABLE = 8,
                    GEM_DOMAIN_COHERENT = 16, GEM_DOMAIN_NO_SHARE = 32;
@@ -162,6 +167,7 @@ struct Bo {
     uint64_t size = 0, backing = 0;   // VRAM pa or sysmem cookie
     uint32_t tile_mode = 0, tile_flags = 0;
     uint64_t map_token = 0;
+    Shared* shared = nullptr;   // exported or imported: the backing belongs to it
     Aper aper() const { return (domain & GEM_DOMAIN_VRAM) ? Aper::Vram : Aper::Sys; }
     uint8_t kind() const { return uint8_t((tile_flags >> 8) & 0xff); }
 };
@@ -193,6 +199,7 @@ struct File {
     BindJob jobs[kMaxBindJobs];   // async VM_BIND, run in submission order
     uint32_t job_head = 0, job_count = 0;
     GpuFence* last_exec = nullptr;   // CPU_PREP waits for it (M5.3 sets it)
+    uint32_t nshared = 0;            // BOs with a Shared backing (PRIME)
     const char* why = "";            // reason for the last refusal (bring-up logging)
     void Init(const DeviceInfo* d, const Backend* b = nullptr) { dev = d; be = b; syncs.Init(); }
     void Close();
@@ -218,6 +225,7 @@ inline int64_t GetCap(File&, const UserAccess& u, uint64_t arg) {
     if (!u.read(u.ctx, &c, arg, sizeof(c))) return kEFAULT;
     if (c.capability == DRM_CAP_SYNCOBJ) c.value = 1;
     else if (c.capability == DRM_CAP_SYNCOBJ_TIMELINE) c.value = 1;
+    else if (c.capability == DRM_CAP_PRIME) c.value = DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT;   // nv_drm_prime.h
     else return kEINVAL;
     return u.write(u.ctx, arg, &c, sizeof(c)) ? 0 : kEFAULT;
 }
@@ -556,6 +564,7 @@ inline const Bo* FindBoByToken(File& f, uint64_t token) {
 }
 inline void BoPut(File& f, Bo& b) {
     if (--b.refs) return;
+    if (b.shared) { SharedUnref(b.shared); --f.nshared; b = Bo{}; return; }   // PRIME: the Shared object frees the backing
     if (f.be) { if (b.aper() == Aper::Vram) f.be->vram_free(f.be->ctx, b.backing, b.size); else f.be->sys_free(f.be->ctx, b.backing); }
     b = Bo{};
 }
@@ -616,15 +625,20 @@ inline int64_t CpuPrepIoctl(File& f, const UserAccess& u, uint64_t arg) {
     Bo* b = FindBo(f, c.handle);
     if (!b || !b->handle_open) return kENOENT;
     GpuFence* fe = f.last_exec;
-    if (!fe) return 0;
+    GpuFence* imp = nullptr;   // a shared BO: its implicit fences too (nv_drm_prime.h)
+    if (b->shared && !SharedFence(b->shared, (c.flags & CPU_PREP_WRITE) ? 2u : 1u, &imp)) return kENOMEM;
+    if (!fe && !imp) return 0;
     const uint64_t deadline = u.now_ns(u.ctx) + 15000000000ull;   // nouveau: 15 s, then -EBUSY
+    int64_t rc;
     for (;;) {
-        const uint32_t st = GpuFenceState(fe);
-        if (st) return st == 2 ? -5 : 0;
-        if (c.flags & CPU_PREP_NOWAIT) return kEBUSY;
-        if (u.now_ns(u.ctx) >= deadline) return kEBUSY;
-        if (!u.sleep_tick(u.ctx)) return -4;
+        const uint32_t st = fe ? GpuFenceState(fe) : 1, si = imp ? GpuFenceState(imp) : 1;
+        if (st && si) { rc = st == 2 || si == 2 ? -5 : 0; break; }
+        if (c.flags & CPU_PREP_NOWAIT) { rc = kEBUSY; break; }
+        if (u.now_ns(u.ctx) >= deadline) { rc = kEBUSY; break; }
+        if (!u.sleep_tick(u.ctx)) { rc = -4; break; }
     }
+    GpuFenceUnref(imp);
+    return rc;
 }
 
 // ---- M5.2: the VA space ---------------------------------------------------------------------
@@ -841,6 +855,7 @@ inline void ChannelTeardown(File& f, Channel& c) {
     if (f.be) { c.dead = true; PumpChannel(f, c); f.be->chan_destroy(f.be->ctx, c.hw); }   // in-flight work is abandoned with the channel
     c.used = false;
 }
+inline void PrimeNoteExec(File& f, GpuFence* done);   // nv_drm_prime.h
 inline int64_t ExecIoctl(File& f, const UserAccess& u, uint64_t arg) {
     Exec e{};
     if (!u.read(u.ctx, &e, arg, sizeof(e))) return kEFAULT;
@@ -872,6 +887,7 @@ inline int64_t ExecIoctl(File& f, const UserAccess& u, uint64_t arg) {
     if (!j->done) { FreeJob(j, false); return kENOMEM; }
     for (uint32_t i = 0; i < e.sig_count; ++i) { GpuSync* s = f.syncs.Get(sigs[i].handle); SyncPointSignal(s, sigs[i].timeline_value, j->done); GpuSyncUnref(s); }
     GpuFenceRef(j->done); GpuFenceUnref(f.last_exec); f.last_exec = j->done;
+    PrimeNoteExec(f, j->done);   // implicit-sync fallback for shared BOs (nv_drm_prime.h)
     c->jobs[(c->job_head + c->job_count) % kMaxExecJobs] = j; ++c->job_count;
     PumpChannel(f, *c);
     return 0;
@@ -933,3 +949,5 @@ inline int64_t Ioctl(File& f, const UserAccess& u, uint64_t cmd, uint64_t arg, b
 }
 
 }  // namespace brook::nvdrm
+
+#include "nv_drm_prime.h"
