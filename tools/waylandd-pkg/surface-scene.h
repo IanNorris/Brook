@@ -194,14 +194,23 @@ static int surface_window(struct brook_surface *s,struct brook_view *view) {
     const uint32_t width=view->geometry.w*scale,height=view->geometry.h*scale;
     struct brook_wm_create_out out={0};
     if (!s->wm_id) {
+        if (s->xdg_popup && (!s->popup_parent || !s->popup_parent->wm_id)) return 0;
         int csd=s->xdg_popup || s->deco_csd || (s->xdg_toplevel && !s->deco_negotiated);
         unsigned flags=(csd?BROOK_WM_CREATE_FLAG_CSD:0)|(s->xdg_popup?BROOK_WM_CREATE_FLAG_NO_FOCUS:0);
         if (xwayland) flags=xwayland_surface_flags(s);
+        if (capture_excluded(s)) flags |= BROOK_WM_CREATE_FLAG_CAPTURE_EXCLUDED;
         if (wm_create_window(width,height,s->title[0]?s->title:NULL,flags,&out) || !out.wm_id) return 0;
         s->wm_id=out.wm_id;s->scene_disabled=0;
         wm_register_client(s->wm_id,s->resource);
         if (s->app_id[0]) wm_set_app_id(s->wm_id,s->app_id);
-        s->deco_pending=0;s->deco_sent_mode=csd?1:0;s->deco_sent_insets=s->deco_sent_height=s->deco_sent_style=0;popup_apply_position(s);
+        s->deco_pending=0;s->deco_sent_mode=csd?1:0;s->deco_sent_insets=s->deco_sent_height=s->deco_sent_style=0;
+        // Bind the popup's privacy ancestry before publishing any pixels.
+        // Subsurface pixels publish in this root's buffer and need no WM row.
+        if (s->xdg_popup && !popup_apply_position(s)) {
+            wm_destroy_window(s->wm_id);
+            s->wm_id=0;
+            return 0;
+        }
     } else if (s->vfb_w!=width || s->vfb_h!=height) {
         if (wm_resize_vfb(s->wm_id,width,height,&out) || !out.vfb_user) return 0;
     } else return 1;

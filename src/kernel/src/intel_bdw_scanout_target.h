@@ -1,4 +1,5 @@
 #pragma once
+#include "wm_capture_protection.h"
 #include <stdint.h>
 #include "intel_bdw_blitter.h"
 #include "intel_bdw_ppgtt.h"
@@ -32,7 +33,8 @@ void BdwCursorUpdate(uint64_t leaseOwner,bool visible,int32_t x,int32_t y,
                      const uint32_t* pixels,uint32_t width,uint32_t height,uint32_t stride);
 
 struct BdwGpuBuffer;
-int64_t BdwClientScanoutPresent(uint64_t owner,BdwGpuBuffer*,const BdwClientScanoutLayout&,uint64_t offer);
+int64_t BdwClientScanoutPresent(uint64_t owner,BdwGpuBuffer*,const BdwClientScanoutLayout&,uint64_t offer,
+                                 const CapturePrivacy&);
 int64_t BdwClientScanoutStatus(uint64_t owner,BrookGpuClientScanoutStatus&);
 int64_t BdwClientScanoutLeave(uint64_t owner);
 bool BdwClientScanoutWorkPending();
@@ -100,7 +102,7 @@ BdwTargetSelect BdwScanoutTargetSelect(const CompositorPresentRegion* regions,ui
 // After the device transaction (copied = the copy retired cleanly).
 // A flip target is committed and armed (or queued); a failure freezes the
 // chain, restores the GOP surface and requires a software repair.
-bool BdwScanoutTargetFinish(BdwTargetPlan& plan,bool copied);
+bool BdwScanoutTargetFinish(BdwTargetPlan& plan,bool copied,const CapturePrivacy&);
 // Worker idle hook: observe an armed flip's latch and arm a queued frame.
 void BdwScanoutFlipPoll();
 // Software compositor, holding the scanout mapping lock with no GPU present
@@ -140,7 +142,8 @@ void BdwZeroCopyOnRelease(BdwGpuBuffer* buffer);
 // with no copy, Deferred = keep the current front and drop this frame,
 // RepairRequired = fail the present with a software repair.
 enum class BdwZeroCopyOutcome : uint8_t {Copy,Presented,RepairRequired,Deferred};
-BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer* source,const CompositorPresentRegion* regions,uint32_t regionCount);
+BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer* source,const CompositorPresentRegion* regions,
+                                             uint32_t regionCount,const CapturePrivacy&);
 bool BdwZeroCopyCanHoldFront(uint64_t owner);
 void BdwZeroCopyNoteWorkerWait();
 // Present thread, before handing a present to the worker: in "flush" cache
@@ -187,6 +190,8 @@ struct BdwZeroCopyVerify {
 };
 bool BdwZeroCopyVerifyFront(BdwZeroCopyVerify& out);
 
+#endif
+#if (defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)) || defined(BROOK_TEST_LIVE_CAPTURE)
 // Debug screenshot of what primary plane A is fetching (DSPASURFLIVE).
 // Compositor thread, inside its scanout mapping lock. Gop: the plane shows
 // the firmware GOP (or no flip path ever moved it), so read the GOP
@@ -198,8 +203,12 @@ bool BdwZeroCopyVerifyFront(BdwZeroCopyVerify& out);
 // during the copy; retry at the next frame. Unsupported: unknown surface,
 // plane offset or pixel format.
 enum class BdwScanoutCaptureKind : uint8_t {Gop,Copied,Busy,Unsupported};
-struct BdwScanoutCaptureInfo {uint32_t plane=0,surface=0,control=0,stride=0,flags=0,copyUs=0;};
-BdwScanoutCaptureKind BdwScanoutCaptureLive(uint32_t* destination,uint32_t width,uint32_t height,BdwScanoutCaptureInfo& info);
+struct BdwScanoutCaptureInfo {
+    uint32_t plane=0,surface=0,control=0,stride=0,flags=0,copyUs=0;
+    CapturePrivacy privacy;
+};
+BdwScanoutCaptureKind BdwScanoutCaptureLive(uint32_t* destination,uint32_t width,uint32_t height,
+                                                BdwScanoutCaptureInfo& info,uint64_t protectionEpoch);
 // Composites the visible hardware cursor plane (premultiplied ARGB) over a
 // captured frame. Returns true when a cursor image was on the plane.
 bool BdwScanoutCaptureCursor(uint32_t* destination,uint32_t width,uint32_t height);

@@ -1,4 +1,5 @@
 #pragma once
+#include "wm_capture_protection.h"
 #include "../../shared/brook_caption_strip.h"
 #include "launcher_model.h"
 
@@ -42,7 +43,7 @@ static constexpr uint32_t WM_BUTTON_WIDTH     = DesktopMetrics::CaptionButtonBas
 // Resize zone sizes: ChromeResizeMetrics (chrome_layout.h).
 static constexpr uint32_t WM_MIN_WIDTH        = 200;
 static constexpr uint32_t WM_MIN_HEIGHT       = 100;
-static constexpr uint32_t WM_MAX_WINDOWS      = 32;
+static constexpr uint32_t WM_MAX_WINDOWS      = CaptureMaskCapacity;
 
 // Retained per-window inputs for an eventual userspace desktop renderer. This
 // is only the client-content part of the desktop; chrome, cursor and overlays
@@ -63,6 +64,7 @@ struct WmDesktopLayer {
 struct WmDesktopLayers {
     uint32_t count,theme,appearance,scale;
     uint64_t launcherGeneration,settingsGeneration;
+    CapturePrivacy privacy;
     WmDesktopLayer layers[WM_MAX_WINDOWS];
 };
 // Unsupported visible content fails the entire capture, so callers can fall
@@ -195,6 +197,8 @@ struct Window
     WindowState state;
     bool        focused;
     bool        visible;
+    bool        captureExcluded; // latched for the lifetime of the window
+    uint64_t    captureParent;   // creation identity of a separately published popup parent
     bool        minimized;      // hidden from desktop, shown in taskbar
     bool        noChrome;       // CSD: client draws own chrome; WM skips title/border
     // CSD only: the WM still draws and owns its caption buttons over the
@@ -432,6 +436,7 @@ struct WmDebugWindow {
     int32_t x,y;uint32_t width,height,outerWidth,outerHeight,bufferWidth,bufferHeight;
     bool visible,minimized,maximized,focused,focusable,apiWindow,providerKernel;
     bool fullscreen;
+    bool captureExcluded;
     char title[64],rawTitle[64],appId[128];
 };
 enum class WmDebugAction : uint32_t { Focus,Minimize,Maximize,Restore,Close };
@@ -443,6 +448,10 @@ uint32_t WmSnapshotDebugWindows(WmDebugWindow* out,uint32_t capacity,uint64_t* t
 // *width pixels; *scale is its on-screen upscale). out=nullptr only reports
 // the size. -2 unknown window, -95 no CPU buffer (GPU-published or none),
 // -11 the buffer outgrew capacityPixels since it was sized.
+uint64_t WmCaptureProtectionEpoch();
+int WmCheckWindowCapture(uint32_t id, uint64_t incarnation);
+uint32_t WmGetCaptureMasks(CaptureMaskRect* out);
+bool WmExcludeOwnedWindowFromCapture(Process* proc, uint32_t wmId);
 int WmCopyDebugWindowBuffer(uint32_t id,uint64_t incarnation,uint32_t* out,uint64_t capacityPixels,
                             uint32_t* width,uint32_t* height,uint32_t* scale);
 // Compositor context only. restoreTarget: 0 previous, 1 normal, 2 maximized.
@@ -662,7 +671,8 @@ WmCreateWindowResult WmCreateWindowForProcess(Process* proc,
                                                const char* title,
                                                bool focusable = true,
                                                bool nativeClient = false,
-                                               bool fineScroll = false);
+                                               bool fineScroll = false,
+                                               bool captureExcluded = false);
 
 void WmDestroyWindowById(Process* proc, uint32_t wmId);
 void WmSignalDirtyById(Process* proc, uint32_t wmId);
@@ -692,7 +702,7 @@ WmContentSnapshot WmSnapshotContent(uint32_t slot);
 void WmAcknowledgeContent(uint32_t slot,const WmContentSnapshot& uploaded);
 bool WmSetAppIdById(Process* proc, uint32_t wmId, const char* appId);
 
-void WmSetTitleById(Process* proc, uint32_t wmId, const char* title);
+void WmSetTitleById(Process* proc, uint32_t wmId, const char* title, bool incomplete = false);
 
 // Resize an existing WM-API window's VFB to (newW × newH).  Allocates fresh
 // kernel pages, zeros them, unmaps the old user-side mapping, and maps the
@@ -713,7 +723,8 @@ Window* WmFindWindowById(Process* proc, uint32_t wmId);
 // its identity and BROOK_WINDOW_STATE_* flags (VISIBLE, FOCUSED, MINIMIZED,
 // MAXIMIZED, FULLSCREEN, CLIENT_CHROME). False when nothing is focused.
 bool WmSnapshotFocus(uint32_t* window, uint64_t* incarnation, uint32_t* flags);
-bool WmClientScanoutWindowMatches(uint32_t window,uint64_t incarnation,uint32_t width,uint32_t height);
+bool WmClientScanoutWindowMatches(uint32_t window,uint64_t incarnation,uint32_t width,uint32_t height,
+                                  CapturePrivacy& privacy);
 int WmSnapshotOwnedWindowState(Process* proc, uint32_t wmId,
                                uint64_t expectedIncarnation, BrookWindowState* out);
 int WmPlaceOwnedWindow(Process* proc, uint32_t wmId, uint64_t incarnation,
