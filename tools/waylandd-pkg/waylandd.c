@@ -3893,10 +3893,15 @@ static int nv_dmabuf_block_linear_advertised(void){
     const char *v=getenv("BROOK_WAYLAND_NV_MODIFIERS");
     return g_nv_fd>=0 && v && !strcmp(v,"1");
 }
+/* renderD130 appears only after GSP-RM's autostart, seconds after waylandd starts (27 Nov
+ * hardware try: "unavailable (No such file or directory)" at startup). So the open is retried
+ * whenever a client binds zwp_linux_dmabuf_v1 or creates a dmabuf buffer, until it succeeds;
+ * a failure is logged once. */
+static int g_nv_open_logged;
 static void nv_dmabuf_open(void){
     if (g_drm_fd>=0 || g_nv_fd>=0 || !nv_dmabuf_wanted()) return;
     g_nv_fd=open("/dev/dri/renderD130",O_RDWR|O_CLOEXEC);
-    if (g_nv_fd<0) fprintf(stderr,"[waylandd] nv dmabuf: renderD130 unavailable (%s)\n",strerror(errno));
+    if (g_nv_fd<0) { if (!g_nv_open_logged++) fprintf(stderr,"[waylandd] nv dmabuf: renderD130 unavailable (%s); retrying on dmabuf use\n",strerror(errno)); }
     else fprintf(stderr,"[waylandd] nv dmabuf: renderD130 fd=%d (LINEAR GART imports, CPU snapshot)\n",g_nv_fd);
 }
 static void nv_gem_close(uint32_t bo){
@@ -4866,6 +4871,7 @@ params_make_buffer(struct wl_client *c, struct wl_resource *r, uint32_t id,
         db->trace_device = storage.st_dev;
         db->trace_inode = storage.st_ino;
     }
+    if (g_nv_fd < 0) nv_dmabuf_open();
     if (g_nv_fd >= 0) db->gres = nv_dmabuf_import(p->fd, db) ? 1u : 0u;   /* no gres: a CPU-read nv-drm BO */
     else db->gres = dmabuf_resolve_gres(p->fd, &db->bo_handle);
     close(p->fd); p->fd = -1;   /* the import cache now holds the GEM reference */
@@ -5059,6 +5065,7 @@ static void dmabuf_bind(struct wl_client *client, void *data, uint32_t version,
      * Wayland EGL platform discovers the render node (main_device). Without it
      * Mesa can't find the GPU and falls back to Zink/swrast. */
     uint32_t use = version < 4 ? version : 4;
+    nv_dmabuf_open();   /* late renderD130 (no-op once open or when not wanted) */
     struct wl_resource *r = wl_resource_create(
         client, &zwp_linux_dmabuf_v1_interface, (int)use, id);
     if (!r) { wl_client_post_no_memory(client); return; }
