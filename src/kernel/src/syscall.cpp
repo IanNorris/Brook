@@ -510,6 +510,11 @@ void SyscallTableInit()
     g_syscallTable[SYS_FCHMODAT]        = sys_fchmodat;
     g_syscallTable[SYS_UTIMENSAT]       = sys_utimensat;
     g_syscallTable[SYS_FALLOCATE]       = sys_fallocate;
+    g_syscallTable[SYS_PREADV]          = sys_preadv;
+    g_syscallTable[SYS_PWRITEV]         = sys_pwritev;
+    g_syscallTable[SYS_COPY_FILE_RANGE] = sys_copy_file_range;
+    g_syscallTable[SYS_PREADV2]         = sys_preadv2;
+    g_syscallTable[SYS_PWRITEV2]        = sys_pwritev2;
     g_syscallTable[SYS_RENAMEAT2]       = sys_renameat2;
     g_syscallTable[SYS_STATX]           = sys_statx;
     g_syscallTable[SYS_MINCORE]         = sys_mincore;

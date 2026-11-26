@@ -41,7 +41,8 @@ uint32_t SyscallCategory(uint64_t num)
     case 89: case 90: case 91: case 92: case 93: case 94:
     case 217: case 257: case 258: case 260: case 262: case 263: case 264:
     case 265: case 266: case 267: case 268: case 280: case 285:
-    case 292: case 293: case 316: case 332: case 439:
+    case 292: case 293: case 295: case 296: case 316: case 326: case 327: case 328:
+    case 332: case 439:
         return SC_FILE;
     // Memory
     case 9: case 10: case 11: case 12: case 25: case 26: case 27: case 28:
@@ -148,6 +149,9 @@ const char* SyscallNameOrNull(uint64_t num)
     case 263: return "unlinkat";  case 264: return "renameat";
     case 265: return "linkat";    case 268: return "fchmodat";
     case 280: return "utimensat"; case 285: return "fallocate";
+    case 295: return "preadv";    case 296: return "pwritev";
+    case 326: return "copy_file_range";
+    case 327: return "preadv2";   case 328: return "pwritev2";
     case 316: return "renameat2"; case 332: return "statx";
     case 435: return "clone3";
     case 18: return "pwrite64"; case 27: return "mincore";

@@ -10,6 +10,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
+#include <sys/uio.h>
+#include <time.h>
 #include <sys/sendfile.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
@@ -160,6 +163,127 @@ static void expect_size(int fd, uint64_t size, const char *step)
     check(lseek(fd, 0, SEEK_END) == (off_t)size, "SEEK_END");
 }
 
+
+static uint64_t now_ms(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000 + (uint64_t)t.tv_nsec / 1000000;
+}
+
+static uint64_t free_bytes(const char *root)
+{
+    struct statfs fs;
+    check(statfs(root, &fs) == 0, "statfs");
+    return (uint64_t)fs.f_bfree * fs.f_bsize;
+}
+
+// fallocate, preadv/pwritev(2) and copy_file_range on files above 4 GiB.
+static void falloc_phase(const char *root)
+{
+    char path[256], copy[256], fill_path[256];
+    snprintf(path, sizeof(path), "%s/prealloc", root);
+    snprintf(copy, sizeof(copy), "%s/copied", root);
+    snprintf(fill_path, sizeof(fill_path), "%s/fill", root);
+    int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0644);
+    check(fd >= 0, "create prealloc");
+    const uint64_t before = free_bytes(root);
+    uint64_t start = now_ms();
+    check(fallocate(fd, 0, 0, (off_t)(6 * GiB)) == 0, "fallocate 6 GiB");
+    uint64_t elapsed = now_ms() - start;
+    const uint64_t used = before - free_bytes(root);
+    dprintf(1, "EXT2_LARGE_FALLOC size=%llu ms=%llu used=%llu\n", (unsigned long long)(6 * GiB),
+            (unsigned long long)elapsed, (unsigned long long)used);
+    check(used >= 6 * GiB, "fallocate allocated the blocks");
+    expect_size(fd, 6 * GiB, "fallocate size");
+    const uint64_t zeros[] = {0, 4 * GiB - 1, 4 * GiB, TRIPLE_START, 6 * GiB - 1};
+    for (unsigned i = 0; i < sizeof(zeros) / sizeof(zeros[0]); ++i) {
+        uint8_t byte = 0xee;
+        check(pread(fd, &byte, 1, (off_t)zeros[i]) == 1 && byte == 0, "fallocated byte is zero");
+    }
+    // Already allocated: quick, nothing more used.
+    start = now_ms();
+    check(fallocate(fd, 0, 0, (off_t)(6 * GiB)) == 0, "fallocate again");
+    dprintf(1, "EXT2_LARGE_FALLOC_AGAIN ms=%llu\n", (unsigned long long)(now_ms() - start));
+    check(before - free_bytes(root) == used, "refallocate uses nothing");
+    // KEEP_SIZE past EOF keeps the size.
+    check(fallocate(fd, FALLOC_FL_KEEP_SIZE, (off_t)(6 * GiB - 4096), 1 << 20) == 0, "fallocate KEEP_SIZE");
+    expect_size(fd, 6 * GiB, "KEEP_SIZE size");
+    errno = 0;
+    check(fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, 4096) == -1 && errno == EOPNOTSUPP,
+          "punch hole unsupported");
+
+    // pwritev/preadv across 4 GiB, then the v2 forms with the file position.
+    static uint8_t a[3000], b[5000], c[100], ra[3000], rb[5000], rc[100];
+    const uint64_t at = 4 * GiB - 4000;
+    fill(a, at, sizeof(a)); fill(b, at + sizeof(a), sizeof(b)); fill(c, at + sizeof(a) + sizeof(b), sizeof(c));
+    struct iovec out[3] = {{a, sizeof(a)}, {b, sizeof(b)}, {c, sizeof(c)}};
+    check(pwritev(fd, out, 3, (off_t)at) == 8100, "pwritev");
+    struct iovec in[3] = {{ra, sizeof(ra)}, {rb, sizeof(rb)}, {rc, sizeof(rc)}};
+    check(preadv(fd, in, 3, (off_t)at) == 8100, "preadv");
+    check(!memcmp(a, ra, sizeof(a)) && !memcmp(b, rb, sizeof(b)) && !memcmp(c, rc, sizeof(c)), "preadv content");
+    check(lseek(fd, 0, SEEK_CUR) == (off_t)(6 * GiB), "preadv keeps position");
+    check(lseek(fd, (off_t)at, SEEK_SET) == (off_t)at, "seek for v2");
+    memset(ra, 0, sizeof(ra));
+    struct iovec one = {ra, sizeof(ra)};
+    check(preadv2(fd, &one, 1, -1, 0) == (ssize_t)sizeof(ra) && !memcmp(a, ra, sizeof(a)), "preadv2 at position");
+    check(lseek(fd, 0, SEEK_CUR) == (off_t)(at + sizeof(ra)), "preadv2 advances position");
+    struct iovec two = {c, sizeof(c)};
+    check(pwritev2(fd, &two, 1, (off_t)(5 * GiB), RWF_DSYNC) == (ssize_t)sizeof(c), "pwritev2 DSYNC");
+    check(pread(fd, rc, sizeof(rc), (off_t)(5 * GiB)) == (ssize_t)sizeof(rc) && !memcmp(c, rc, sizeof(c)),
+          "pwritev2 content");
+    errno = 0;
+    check(preadv2(fd, &one, 1, 0, RWF_NOWAIT) == -1 && errno == EOPNOTSUPP, "RWF_NOWAIT refused");
+
+    // copy_file_range from past 4 GiB.
+    int out_fd = open(copy, O_CREAT | O_RDWR | O_TRUNC, 0644);
+    check(out_fd >= 0, "create copy");
+    loff_t from = (loff_t)at, to = 10;
+    ssize_t copied = 0;
+    while (copied < 1 << 20) {
+        ssize_t n = copy_file_range(fd, &from, out_fd, &to, (size_t)(1 << 20) - copied, 0);
+        check(n > 0, "copy_file_range");
+        copied += n;
+    }
+    check(from == (loff_t)(at + (1 << 20)) && to == 10 + (1 << 20), "copy_file_range offsets");
+    check(pread(out_fd, rb, sizeof(rb), 10) == (ssize_t)sizeof(rb), "read copy");
+    for (unsigned i = 0; i < sizeof(a); ++i) check(rb[i] == a[i], "copy content");
+    for (unsigned i = sizeof(a); i < sizeof(rb); ++i) check(rb[i] == b[i - sizeof(a)], "copy content b");
+    errno = 0;
+    from = 0;
+    check(copy_file_range(fd, &from, fd, &from, 4096, 0) == -1 && errno == EINVAL, "overlap refused");
+    close(out_fd);
+    check(unlink(copy) == 0, "unlink copy");
+
+    // ENOSPC: fallocate more than is free; the allocated prefix stays.
+    int full = open(fill_path, O_CREAT | O_RDWR | O_TRUNC, 0644);
+    check(full >= 0, "create fill");
+    const uint64_t avail = free_bytes(root);
+    errno = 0;
+    start = now_ms();
+    check(fallocate(full, 0, 0, (off_t)(avail + GiB)) == -1 && errno == ENOSPC, "fallocate ENOSPC");
+    struct stat st;
+    check(fstat(full, &st) == 0, "fstat fill");
+    dprintf(1, "EXT2_LARGE_FALLOC_ENOSPC free=%llu kept=%llu left=%llu ms=%llu\n",
+            (unsigned long long)avail, (unsigned long long)st.st_size,
+            (unsigned long long)free_bytes(root), (unsigned long long)(now_ms() - start));
+    check((uint64_t)st.st_size > avail / 2 && (uint64_t)st.st_size <= avail, "ENOSPC keeps prefix");
+    // Use up the rest (fallocate rolls back its last 64-block batch), then
+    // a write must fail with ENOSPC rather than return 0.
+    check(lseek(full, 0, SEEK_END) == st.st_size, "seek fill end");
+    memset(buffer, 7, 64 * KiB);
+    ssize_t wrote;
+    while ((wrote = write(full, buffer, 64 * KiB)) > 0) {}
+    check(wrote == -1 && errno == ENOSPC, "write until ENOSPC");
+    errno = 0;
+    check(pwrite(full, "x", 1, (off_t)(avail + GiB)) == -1 && errno == ENOSPC, "write on full fs is ENOSPC");
+    check(ftruncate(full, 0) == 0, "release fill");
+    close(full);
+    check(unlink(fill_path) == 0, "unlink fill");
+    check(fsync(fd) == 0, "fsync prealloc");
+    close(fd);
+}
+
 int main(int argc, char **argv)
 {
     const char *root = argc > 1 ? argv[1] : "/bigext2";
@@ -167,6 +291,12 @@ int main(int argc, char **argv)
     make_base();
     buffer = malloc(BUFFER);
     check(buffer != 0, "buffer");
+    if (argc > 3 && !strcmp(argv[3], "falloc")) {
+        falloc_phase(root);
+        sync();
+        dprintf(1, "EXT2_LARGE_QEMU_PASS\n");
+        return 0;
+    }
     char path[256], copy[256], dense[256];
     snprintf(path, sizeof(path), "%s/sparse", root);
     snprintf(copy, sizeof(copy), "%s/sendfile-copy", root);

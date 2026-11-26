@@ -187,6 +187,11 @@ static constexpr uint64_t SYS_LINKAT          = 265;
 static constexpr uint64_t SYS_FCHMODAT        = 268;
 static constexpr uint64_t SYS_UTIMENSAT       = 280;
 static constexpr uint64_t SYS_FALLOCATE       = 285;
+static constexpr uint64_t SYS_PREADV          = 295;
+static constexpr uint64_t SYS_PWRITEV         = 296;
+static constexpr uint64_t SYS_COPY_FILE_RANGE = 326;
+static constexpr uint64_t SYS_PREADV2         = 327;
+static constexpr uint64_t SYS_PWRITEV2        = 328;
 static constexpr uint64_t SYS_RENAMEAT2       = 316;
 static constexpr uint64_t SYS_STATX           = 332;
 

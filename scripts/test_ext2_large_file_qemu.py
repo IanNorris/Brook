@@ -10,6 +10,13 @@ a dense file (default 5 GiB + 12345 bytes) and appends with O_APPEND.
 The host then checks its own model of every hash, e2fsck -fn, debugfs sizes,
 and streams both files out of the image with debugfs to hash them
 independently of Brook. The sparse image is deleted unless --keep is given.
+
+--phase falloc instead fallocates a 6 GiB file (timed), checks KEEP_SIZE,
+pwritev/preadv(2) and copy_file_range past 4 GiB, fallocates past the free
+space (ENOSPC keeps the allocated prefix) and writes on the full filesystem
+(ENOSPC, not 0). The ext2 disk uses detect-zeroes=unmap so zero fills stay
+sparse on the host. The host then runs e2fsck -fn and checks the file size
+and block count with debugfs.
 """
 
 import argparse
@@ -118,6 +125,7 @@ def main():
     parser.add_argument("--image-gib", type=int, default=8)
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument("--keep", action="store_true", help="keep the ext2 image")
+    parser.add_argument("--phase", choices=("large", "falloc"), default="large")
     args = parser.parse_args()
     if args.accel == "kvm" and subprocess.run(["pgrep", "-x", "vmware-vmx"]).returncode == 0:
         parser.error("Workstation is running")
@@ -135,7 +143,7 @@ def main():
     marker.write_text("1\n")
     startup = output / "INIT.RC"
     startup.write_text("set wm\nset vfb none\nkconsole\n"
-                       f"run --console --uid 0 /boot/BIGQA.ELF /bigext2 {args.dense_bytes}\n")
+                       f"run --console --uid 0 /boot/BIGQA.ELF /bigext2 {args.dense_bytes} {args.phase}\n")
     for path, name in ((marker, "ETC/volatile-desktop"), (startup, "BOOT/INIT.RC"),
                        (guest, "BOOT/BIGQA.ELF")):
         run("mcopy", "-o", "-i", initrd, path, f"::{name}")
@@ -166,7 +174,8 @@ def main():
         "-device", "qemu-xhci,id=usb",
         "-drive", f"if=none,id=stick,format=raw,readonly=on,file={disk}",
         "-device", "usb-storage,bus=usb.0,drive=stick,bootindex=1",
-        "-drive", f"if=none,id=ext2,format=raw,file={ext2}",
+        "-drive", f"if=none,id=ext2,format=raw,file={ext2}" +
+        (",discard=unmap,detect-zeroes=unmap" if args.phase == "falloc" else ""),
         "-device", "virtio-blk-pci,drive=ext2", "-serial", f"file:{serial}",
     ]
     started = time.monotonic()
@@ -201,6 +210,23 @@ def main():
         report = [l[l.index("EXT2_LARGE_"):] for l in lines if "EXT2_LARGE_" in l]
         print("\n".join(report))
         print(f"guest phase {guest_seconds:.0f}s")
+
+        if args.phase == "falloc":
+            fsck = subprocess.run(["e2fsck", "-fn", str(ext2)], capture_output=True, text=True)
+            print(fsck.stdout.strip().splitlines()[-1])
+            if fsck.returncode:
+                raise RuntimeError(f"e2fsck -fn failed ({fsck.returncode}):\n{fsck.stdout}{fsck.stderr}")
+            print("e2fsck -fn clean")
+            stat = subprocess.run(["debugfs", "-R", "stat /prealloc", str(ext2)], check=True,
+                                  capture_output=True, text=True).stdout
+            size = int(re.search(r"Size: (\d+)", stat).group(1))
+            sectors = int(re.search(r"Blockcount: (\d+)", stat).group(1))
+            if size != 6 * GiB or sectors < 6 * GiB // 512:
+                raise RuntimeError(f"debugfs prealloc size={size} blockcount={sectors}")
+            print(f"debugfs prealloc: size {size}, {sectors} sectors allocated")
+            print(f"image real usage {os.stat(ext2).st_blocks * 512 / GiB:.2f} GiB")
+            print("EXT2_LARGE_HOST_PASS")
+            return
 
         hashes = {}
         for line in report:
