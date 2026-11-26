@@ -32,6 +32,24 @@ static int wait_frame(long token, struct BrookDebugFrameInfo *info)
     return 0;
 }
 
+static uint64_t pixel_offset(const struct BrookWindowState *state,
+                             const struct BrookDebugFrameInfo *info)
+{
+    return (((uint64_t)state->client_y + state->height / 2) * info->stride +
+            (uint64_t)state->client_x + state->width / 2) * sizeof(uint32_t);
+}
+
+static int read_pixel(long token, const struct BrookWindowState *state,
+                      const struct BrookDebugFrameInfo *info, uint32_t *pixel)
+{
+    if (state->client_x < 0 || state->client_y < 0 ||
+        (uint64_t)state->client_x + state->width / 2 >= info->width ||
+        (uint64_t)state->client_y + state->height / 2 >= info->height)
+        return 0;
+    return syscall(BROOK_SYS_DEBUG_FRAME, 2, token, pixel, sizeof(*pixel),
+                   pixel_offset(state, info), 0) == sizeof(*pixel);
+}
+
 int main(void)
 {
     struct window secret = {0}, control = {0};
@@ -41,22 +59,41 @@ int main(void)
     struct BrookWindowState secret_state = {0}, control_state = {0};
     CHECK(syscall(BROOK_SYS_WM_WINDOW_STATE, secret.id, 0, &secret_state, sizeof(secret_state), 0, 0) == 0);
     CHECK(syscall(BROOK_SYS_WM_WINDOW_STATE, control.id, 0, &control_state, sizeof(control_state), 0, 0) == 0);
+    // Leave room for scaled chrome and keep both clients clear of the pointer.
+    CHECK(syscall(BROOK_SYS_WM_PLACE_WINDOW, secret.id, secret_state.incarnation, 200, 200, 0, 0) == 0);
+    CHECK(syscall(BROOK_SYS_WM_PLACE_WINDOW, control.id, control_state.incarnation, 400, 200, 0, 0) == 0);
+    CHECK(syscall(BROOK_SYS_WM_WINDOW_STATE, secret.id, secret_state.incarnation, &secret_state, sizeof(secret_state), 0, 0) == 0);
+    CHECK(syscall(BROOK_SYS_WM_WINDOW_STATE, control.id, control_state.incarnation, &control_state, sizeof(control_state), 0, 0) == 0);
     for (unsigned y = 0; y < 16; ++y) {
         for (unsigned x = 0; x < 16; ++x) {
-            secret.pixels[y * secret.stride + x] = 0xffff0000;
+            secret.pixels[y * secret.stride + x] = 0xffff00ff;
             control.pixels[y * control.stride + x] = 0xff00ff00;
         }
     }
     CHECK(syscall(508, secret.id, 0, 0, 0, 0, 0) == 0);
     CHECK(syscall(508, control.id, 0, 0, 0, 0, 0) == 0);
-    long before = syscall(BROOK_SYS_DEBUG_FRAME, 0, 0, 0, 0, 0, 0);
-    CHECK(before > 0);
+    long before = 0;
     struct BrookDebugFrameInfo info = {0};
-    CHECK(wait_frame(before, &info));
-    uint64_t secret_offset = ((secret_state.client_y + 8) * (uint64_t)info.stride + (secret_state.client_x + 8)) * sizeof(uint32_t);
-    uint32_t pixel = 0;
-    CHECK(syscall(BROOK_SYS_DEBUG_FRAME, 2, before, &pixel, sizeof(pixel), secret_offset, 0) == sizeof(pixel));
-    CHECK((pixel & 0x00ffffff) == 0x00ff0000);
+    uint32_t pixel = 0, visible_secret = 0, visible_control = 0;
+    // A hardware capture can initially see an older scanout. Require both
+    // sentinels in the same frame before exercising the exclusion transition.
+    for (unsigned attempt = 0; attempt < 100; ++attempt) {
+        before = syscall(BROOK_SYS_DEBUG_FRAME, 0, 0, 0, 0, 0, 0);
+        CHECK(before > 0 && wait_frame(before, &info));
+        CHECK(read_pixel(before, &secret_state, &info, &visible_secret));
+        CHECK(read_pixel(before, &control_state, &info, &visible_control));
+        if ((visible_secret & 0x00ffffff) == 0x00ff00ff &&
+            (visible_control & 0x00ffffff) == 0x0000ff00)
+            break;
+        CHECK(syscall(BROOK_SYS_DEBUG_FRAME, 3, before, 0, 0, 0, 0) == 0);
+        before = 0;
+        usleep(25000);
+    }
+    if (!before)
+        fprintf(stderr, "Capture never showed both windows: secret=%08x control=%08x\n",
+                visible_secret, visible_control);
+    CHECK(before > 0);
+    uint64_t secret_offset = pixel_offset(&secret_state, &info);
     CHECK(syscall(BROOK_SYS_WM_EXCLUDE_CAPTURE, secret.id, 0, 0, 0, 0, 0) == 0);
     CHECK(syscall(BROOK_SYS_DEBUG_FRAME, 2, before, &pixel, sizeof(pixel), secret_offset, 0) == -1 && errno == EACCES);
     CHECK(syscall(BROOK_SYS_DEBUG_FRAME, 3, before, 0, 0, 0, 0) == 0);
@@ -70,10 +107,9 @@ int main(void)
     token = syscall(BROOK_SYS_DEBUG_FRAME, 0, 0, 0, 0, 0, 0);
     CHECK(token > 0);
     CHECK(wait_frame(token, &info));
-    uint64_t control_offset = ((control_state.client_y + 8) * (uint64_t)info.stride + (control_state.client_x + 8)) * sizeof(pixel);
-    CHECK(syscall(BROOK_SYS_DEBUG_FRAME, 2, token, &pixel, sizeof(pixel), secret_offset, 0) == sizeof(pixel));
+    CHECK(read_pixel(token, &secret_state, &info, &pixel));
     CHECK(pixel == 0xff000000);
-    CHECK(syscall(BROOK_SYS_DEBUG_FRAME, 2, token, &pixel, sizeof(pixel), control_offset, 0) == sizeof(pixel));
+    CHECK(read_pixel(token, &control_state, &info, &pixel));
     CHECK((pixel & 0x00ffffff) == 0x0000ff00);
     CHECK(syscall(BROOK_SYS_DEBUG_FRAME, 3, token, 0, 0, 0, 0) == 0);
     // The parent can latch after a popup and its own child already exist.
