@@ -1517,6 +1517,12 @@ static int Ext2AppendInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
 static int Ext2WriteInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
                               const void* buf, uint64_t len, uint64_t offset)
 {
+    // i_size is kept as 32 bits (i_dir_acl/i_size_high is not maintained), and
+    // writes map at most doubly indirect blocks. Stop at 4 GiB - 1 with EFBIG,
+    // as Linux does at a file size limit, instead of wrapping i_size.
+    constexpr uint64_t maxFileBytes = 0xffffffffULL;
+    if (offset >= maxFileBytes) return len ? -27 : 0;
+    if (len > maxFileBytes - offset) len = maxFileBytes - offset;
     uint64_t pointers = mnt->blockSize / 4;
     uint64_t doubleLimit = (12 + pointers + pointers * pointers) * mnt->blockSize;
     if ((ino->i_mode & EXT2_S_IFMT) == EXT2_S_IFREG &&

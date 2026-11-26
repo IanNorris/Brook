@@ -541,6 +541,20 @@ int main(int argc,char** argv){
     auto* m=static_cast<Ext2Mount*>(mount);
     assert(m->writeError==0 && m->deferredSyncError==0);
     TestDirectoryReadFailure(m);
+    {
+        // Regular files stop below 4 GiB with EFBIG; i_size must never wrap.
+        KRwLockWriteLock(&g_ext2Lock);
+        const uint32_t marker=Ext2ResolvePath(m,EXT2_ROOT_INO,"dir/marker",0);
+        Ext2Inode inode{};assert(marker && Ext2ReadInode(m,marker,&inode));
+        const uint32_t size=inode.i_size,blocks=inode.i_blocks;
+        const char data[16]="past four GiB";
+        for(uint64_t offset:{0xffffffffULL,0x100000000ULL,0x100000000ULL+4096})
+            assert(Ext2WriteInodeData(m,&inode,marker,data,sizeof(data),offset)==-27);
+        assert(Ext2WriteInodeData(m,&inode,marker,data,0,0x100000000ULL)==0);
+        assert(inode.i_size==size && inode.i_blocks==blocks);
+        Ext2Inode stored{};assert(Ext2ReadInode(m,marker,&stored) && stored.i_size==size);
+        KRwLockWriteUnlock(&g_ext2Lock);
+    }
     // These tests call lock-requiring backend helpers directly.
     auto backgroundSync = [](Ext2Mount* mount, uint64_t now, bool safety) {
         KRwLockWriteLock(&g_ext2Lock);
