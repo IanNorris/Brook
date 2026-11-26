@@ -6,12 +6,52 @@ inline bool SceneRowOpaque(const uint32_t* pixels,uint32_t count) {
     for(uint32_t i=0;i<count;++i)if((pixels[i]>>24)!=255)return false;
     return true;
 }
+// Restore the backdrop only if this row needs it. Subsequent window layers
+// supply a no-op because the lower layers are already in the destination.
+template <typename RestoreBackdrop>
+inline void SceneBlitWindowRow(uint32_t* dstRow,const uint32_t* srcRow,uint32_t rowLen,
+                               RestoreBackdrop restoreBackdrop) {
+    if (SceneRowOpaque(srcRow,rowLen)) {
+        __builtin_memcpy(dstRow,srcRow,uint64_t(rowLen)*4);
+        return;
+    }
+    restoreBackdrop();
+    for (uint32_t dx = 0; dx < rowLen; ++dx)
+    {
+        uint32_t sp = srcRow[dx];
+        uint32_t a = sp >> 24;
+        if (a == 0)
+            continue;
+        if (a == 255)
+        {
+            dstRow[dx] = sp;
+            continue;
+        }
+
+        uint32_t dp = dstRow[dx];
+        uint32_t inv = 255 - a;
+        uint32_t sr = (sp >> 16) & 0xff;
+        uint32_t sg = (sp >> 8) & 0xff;
+        uint32_t sb = sp & 0xff;
+        uint32_t dr = (dp >> 16) & 0xff;
+        uint32_t dg = (dp >> 8) & 0xff;
+        uint32_t db = dp & 0xff;
+        uint32_t r = (sr * a + dr * inv + 127) / 255;
+        uint32_t g = (sg * a + dg * inv + 127) / 255;
+        uint32_t b = (sb * a + db * inv + 127) / 255;
+        dstRow[dx] = 0xff000000u | (r << 16) | (g << 8) | b;
+    }
+}
 // Screen-space half-open bounds. Expand a dirty region to whole intersecting
 // layers before repainting: every blended layer then sees a rebuilt backdrop.
 // Repeating closure also catches a layer encountered before a later expansion.
 struct SceneRect {
     int64_t left=0, top=0, right=0, bottom=0;
     bool empty() const { return left>=right || top>=bottom; }
+    bool covers(const SceneRect& other) const {
+        return !other.empty() && left<=other.left && top<=other.top &&
+               right>=other.right && bottom>=other.bottom;
+    }
     bool intersects(const SceneRect& other) const {
         return !empty() && !other.empty() && left<other.right && other.left<right &&
                top<other.bottom && other.top<bottom;

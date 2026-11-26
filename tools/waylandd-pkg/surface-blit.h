@@ -136,4 +136,32 @@ static void brook_straight_rows(uint32_t *dst, size_t dst_stride, const uint32_t
         }
     }
 }
+
+/* A single aligned, untransformed source crop covers the entire destination.
+ * It already supplies the final premultiplied pixels, so there is no need for
+ * a cleared composite or a second pass through that composite. */
+static inline const uint32_t *brook_native_crop(const struct brook_geometry *g,
+        const uint32_t *pixels, uint32_t bw, uint32_t bh, uint32_t scale,
+        uint32_t w, uint32_t h) {
+    if (!pixels || !w || !h || g->transform || ((g->sx | g->sy) & 255) ||
+        (uint64_t)g->w * scale != w || (uint64_t)g->h * scale != h ||
+        g->sw != (uint64_t)w * 256 || g->sh != (uint64_t)h * 256) return NULL;
+    const uint32_t x = g->sx / 256, y = g->sy / 256;
+    if (x >= bw || y >= bh || w > bw - x || h > bh - y) return NULL;
+    return pixels + (size_t)y * bw + x;
+}
+
+static inline void brook_publish_native_rows(uint32_t *dst, size_t dst_stride,
+        const uint32_t *src, size_t src_stride, uint32_t w, uint32_t h, int opaque) {
+    if (!opaque) {
+        brook_straight_rows(dst, dst_stride, src, src_stride, w, h);
+        return;
+    }
+    if (src_stride == w && dst_stride == w) {
+        memcpy(dst, src, (size_t)w * h * 4);
+        return;
+    }
+    for (uint32_t y = 0; y < h; ++y)
+        memcpy(dst + (size_t)y * dst_stride, src + (size_t)y * src_stride, (size_t)w * 4);
+}
 #endif

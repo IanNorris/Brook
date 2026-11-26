@@ -107,6 +107,37 @@ static void random_scenes(void) {
     puts("SURFACE_BLIT_RANDOM_OK");
 }
 
+static void native_crop(void) {
+    enum { W = 8, H = 6, BW = 12, BH = 9, STRIDE = W + 3 };
+    uint32_t input[BW * BH], composite[W * H], reference[STRIDE * H], output[STRIDE * H];
+    struct brook_geometry crop = {2 * 256, 3 * 256, W * 256, H * 256, W / 2, H / 2, 0};
+    const uint32_t *src = brook_native_crop(&crop, input, BW, BH, 2, W, H);
+    assert(src == input + 3 * BW + 2);
+    for (int opaque = 0; opaque <= 1; ++opaque) {
+        for (unsigned i = 0; i < BW * BH; ++i) input[i] = rnd_pixel(opaque);
+        memset(reference, 0xa5, sizeof(reference));
+        memset(output, 0xa5, sizeof(output));
+        memset(composite, 0, sizeof(composite));
+        struct brook_geometry physical = crop;
+        physical.w = W;
+        physical.h = H;
+        ref_draw(composite, W, H, &physical, input, BW, BH, 0, 0);
+        brook_straight_rows(reference, STRIDE, composite, W, W, H);
+        brook_publish_native_rows(output, STRIDE, src, BW, W, H, opaque);
+        assert(!memcmp(reference, output, sizeof(reference)));
+    }
+    ++crop.sx;
+    assert(!brook_native_crop(&crop, input, BW, BH, 2, W, H));
+    crop.sx = 6 * 256;
+    assert(!brook_native_crop(&crop, input, BW, BH, 2, W, H));
+    crop.sx = 0;
+    crop.transform = 2;
+    assert(!brook_native_crop(&crop, input, BW, BH, 2, W, H));
+    crop.transform = 0;
+    assert(!brook_native_crop(&crop, input, BW, BH, 1, W, H));
+    puts("SURFACE_BLIT_NATIVE_CROP_OK");
+}
+
 /* 3200x1800 output: an ARGB page layer at 2x (1600x900 -> 3200x1800) and an
  * opaque 1280x720 video subsurface scaled to 2560x1440, like YouTube in a
  * maximised software-rendered browser. */
@@ -183,6 +214,7 @@ static void bench(void) {
 int main(int argc, char **argv) {
     exhaustive();
     random_scenes();
+    native_crop();
     if (argc > 1 && !strcmp(argv[1], "--bench")) bench();
     return 0;
 }

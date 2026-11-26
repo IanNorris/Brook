@@ -449,6 +449,21 @@ static int surface_render(struct brook_surface *root) {
     gpuComposed=surface_vulkan_compose(root,draws,count,scale);
 #endif
     if (!gpuComposed) {
+    // The CPU fallback can also publish XRGB and aligned native crops
+    // without a staging composite. Keep Vulkan admission ahead of it.
+    if (count==1 && draws[0].x==0 && draws[0].y==0) {
+        const struct brook_view *view=draws[0].view;
+        const struct brook_image *image=view->image;
+        const uint32_t *src=brook_native_crop(&view->geometry,image->pixels,image->width,image->height,
+                                             scale,root->vfb_w,root->vfb_h);
+        if (src) {
+            writeGuard=surface_begin_source_write(root,&writeIncarnation);if(!writeGuard)return 1;
+            surface_layer_trace(root,draws,count,LAYER_PATH_SINGLE);
+            brook_publish_native_rows(root->vfb,root->vfb_stride,src,image->width,
+                                      root->vfb_w,root->vfb_h,image->opaque);
+            goto publish;
+        }
+    }
     memset(root->composite,0,pixels*4);
     for (unsigned i=0;i<count;++i) {
         struct brook_draw *d=&draws[i];struct brook_view *view=d->view;
