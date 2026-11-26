@@ -1,0 +1,72 @@
+{ pkgs, steamPkgs }:
+let
+  inherit (pkgs) lib;
+  source = builtins.fromJSON (builtins.readFile ./valve-client.json);
+  runtime = import ../../nix/runtime-graphics.nix { inherit pkgs; };
+  exports = pkgs.buildEnv {
+    name = "brook-steam-provider-exports";
+    pathsToLink = [ "/lib" ];
+    ignoreCollisions = true;
+    paths = with pkgs; [
+      glibc stdenv.cc.cc.lib libglvnd runtime.mesaRuntime wayland libx11 libxext
+      libxcb libxrandr libxi libxfixes libxcomposite libxrender libxdamage
+      libxcursor libxxf86vm libxscrnsaver libdrm libgbm udev libgudev
+      zlib zstd openssl gnutls nettle pulseaudio dbus libcap libseccomp
+      fontconfig freetype alsa-lib
+    ];
+  };
+  loader = "${pkgs.glibc}/lib/ld-linux-x86-64.so.2";
+  provider = pkgs.runCommand "brook-steam-provider" { nativeBuildInputs = [ pkgs.python3 ]; } ''
+    python3 ${../../scripts/workloads/steamrt_provider_cache.py} \
+      --ldconfig ${lib.getBin pkgs.glibc}/bin/ldconfig --loader ${loader} \
+      --exports ${exports}/lib --include-directory ${pkgs.glibc}/lib --output "$out"
+  '';
+  archives = map (entry: entry // { store = toString (pkgs.fetchurl {
+    url = "https://client-update.steamstatic.com/${entry.file}";
+    inherit (entry) sha256;
+  }); }) source.packages;
+  plan = pkgs.writeText "brook-steam-client-archive-plan.json"
+    (builtins.toJSON (source // { packages = archives; }));
+  client = steamPkgs.stdenvNoCC.mkDerivation {
+    pname = "brook-steam-client";
+    inherit (source) version;
+    dontUnpack = true;
+    dontFixup = true;
+    nativeBuildInputs = [ pkgs.python3 pkgs.patchelf ];
+    installPhase = ''
+      python3 ${./install-client.py} \
+        --bootstrap ${../steam-bootstrap}/bootstrap.py \
+        --patch-elf ${pkgs.patchelf}/bin/patchelf --loader ${loader} \
+        --output "$out/share/brook/steam-client" --plan ${plan}
+      install -Dm644 ${./valve-client.json} "$out/share/brook/steam-client-source.json"
+      ln -s ${exports}/lib "$out/share/brook/steam-client/hostlibs"
+    '';
+    meta = {
+      description = "Valve Steam x86-64 client and pinned SteamRT3c runtime";
+      platforms = [ "x86_64-linux" ];
+      license = lib.licenses.unfree;
+    };
+  };
+  launcher = pkgs.runCommand "brook-steam-launcher-${source.version}" {} ''
+    mkdir -p "$out/bin" "$out/libexec"
+    install -m644 ${../../scripts/workloads/brook_steam_launcher.py} "$out/libexec/brook-steam.py"
+    install -m644 ${../../scripts/workloads/brook_steam_seed.py} "$out/libexec/brook_steam_seed.py"
+    install -m644 ${../steam-bootstrap}/bootstrap.py "$out/libexec/bootstrap.py"
+    install -m644 ${../../scripts/workloads/steam_client_check.py} "$out/libexec/steam-client-check.py"
+    cat > "$out/bin/brook-steam" <<EOF
+    #!${pkgs.bash}/bin/bash
+    umask 077
+    export BROOK_STEAM_PACKAGED_SEED=${client}/share/brook/steam-client
+    export BROOK_STEAM_PACKAGED_VERSION=${source.version}
+    export BROOK_STEAM_PROVIDER=${provider}
+    export BROOK_STEAM_PULSEAUDIO=${pkgs.pulseaudio}/bin/pulseaudio
+    export BROOK_STEAM_PACTL=${pkgs.pulseaudio}/bin/pactl
+    exec /nix/profile/bin/brook-run ${pkgs.python3}/bin/python3 $out/libexec/brook-steam.py "\$@"
+    EOF
+    chmod 755 "$out/bin/brook-steam"
+  '';
+in {
+  inherit client provider launcher;
+  inherit (source) version;
+  packages = [ launcher runtime.mesaRuntime pkgs.libglvnd ];
+}

@@ -540,9 +540,17 @@ def socket_accepts(path):
             return False
 
 
+def pulse_executable(name):
+    variable = 'BROOK_STEAM_' + name.upper()
+    configured = os.environ.get(variable)
+    if configured:
+        return configured if os.access(configured, os.X_OK) else None
+    return shutil.which(name, path='/nix/profile/bin:' + os.environ.get('PATH', ''))
+
+
 class PulseServer:
     def __init__(self, runtime_base, output):
-        self.binary = shutil.which('pulseaudio', path='/nix/profile/bin:' + os.environ.get('PATH', ''))
+        self.binary = pulse_executable('pulseaudio')
         if not self.binary:
             raise RuntimeError('Steam needs pulseaudio in /nix/profile/bin (or pass --pulse-server/--no-pulse)')
         runtime_base.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -582,7 +590,7 @@ class PulseServer:
         log('pulse ready', server=self.server, keeper=self.process.pid, info=self.info)
 
     def _info(self):
-        pactl = shutil.which('pactl', path='/nix/profile/bin:' + os.environ.get('PATH', ''))
+        pactl = pulse_executable('pactl')
         if not pactl:
             return None
         try:
@@ -712,8 +720,13 @@ def parse_arguments(argv):
 class Steam:
     def __init__(self, args):
         self.args = args
-        self.install = Path(os.environ.get('BROOK_STEAM_INSTALL', HOME / 'steam-20261022'))
+        self.seed = os.environ.get('BROOK_STEAM_PACKAGED_SEED')
+        self.seed_version = os.environ.get('BROOK_STEAM_PACKAGED_VERSION', '')
+        default_install = BROOK / 'steam-client' if self.seed else HOME / 'steam-20261022'
+        self.install = Path(os.environ.get('BROOK_STEAM_INSTALL', default_install))
         self.client = self.install / 'client'
+        if self.seed and (args.check or args.probe) and not self.client.exists():
+            self.client = Path(self.seed)
         self.provider = Path(os.environ.get('BROOK_STEAM_PROVIDER', BROOK / 'steam-provider-20261103'))
         self.helper = Path(os.environ.get('BROOK_STEAM_HELPER',
                                           Path(os.path.abspath(__file__)).parent / 'steam-client-check.py'))
@@ -767,7 +780,7 @@ class Steam:
             if not path.is_file():
                 raise RuntimeError(f'Steam needs {path}')
         if not (self.args.no_pulse or self.args.pulse_server):
-            if not shutil.which('pulseaudio', path='/nix/profile/bin:' + os.environ.get('PATH', '')):
+            if not pulse_executable('pulseaudio'):
                 raise RuntimeError('Steam needs pulseaudio in /nix/profile/bin (or pass --pulse-server/--no-pulse)')
 
     def target_display(self):
@@ -846,7 +859,8 @@ class Steam:
                              ('/nix/profile/bin/sh', '/bin/sh'),
                              ('/nix/profile/bin/bash', '/bin/bash')):
             command += ['--bind', str(path), target]
-        command += ['--', '/nix/profile/bin/python3', str(self.helper), '--client', str(self.client),
+        python = sys.executable if self.seed else '/nix/profile/bin/python3'
+        command += ['--', python, str(self.helper), '--client', str(self.client),
                     '--home', str(self.install / 'user'), '--log-dir', str(HOME / 'steamrt-evidence'),
                     '--skip-bootstrap', '--display', self.display]
         if self.pulse_server:
@@ -1074,6 +1088,13 @@ def main(argv=None):
     if os.geteuid() == 0:
         raise RuntimeError('run Steam as the desktop user, not root')
     steam = Steam(args)
+    if steam.seed and not (args.check or args.probe):
+        from brook_steam_seed import ensure_client
+        try:
+            version = ensure_client(Path(steam.seed), steam.install, steam.seed_version)
+        except ValueError as error:
+            raise RuntimeError(str(error)) from error
+        log('packaged client available', seed_version=steam.seed_version, installed_version=version)
     steam.prerequisites()
     if args.check or args.probe:
         report = dict(prerequisites='present', version=LAUNCHER_VERSION,
