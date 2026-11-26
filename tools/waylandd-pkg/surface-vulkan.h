@@ -21,7 +21,8 @@ static int surface_vulkan_direct(struct brook_surface *root,struct brook_image *
     const struct brook_view *view=draws[0].view;const struct brook_geometry *g=&view->geometry;
     const struct brook_dmabuf_buffer *db=image->source->dmabuf;const uint32_t scale=surface_output_scale(root);
     if(g->transform || ((g->sx|g->sy|g->sw|g->sh)&255) || (db->stride&3) || (db->offset&3) || db->modifier ||
-       (db->fourcc!=0x34325241 && db->fourcc!=0x34325258) || g->w>16384/scale || g->h>16384/scale)return 0;
+       (db->fourcc!=0x34325241 && db->fourcc!=0x34325258) || g->w>physical_to_logical(16384,scale) ||
+       g->h>physical_to_logical(16384,scale))return 0;
     off_t bytes=lseek(sourceFd,0,SEEK_END);if(bytes<=0 || (bytes&3) || lseek(sourceFd,0,SEEK_SET)!=0)return 0;
     if(!surface_window(root,(struct brook_view *)view) || !root->wm_id || !root->vfb)return 0;
     struct stat source={0};BrookWindowState window={0};
@@ -36,7 +37,7 @@ static int surface_vulkan_direct(struct brook_surface *root,struct brook_image *
         root->composite=next;root->composite_pixels=pixels;}
     if(!direct){direct=brook_vk_surface_create(0);if(!direct){disabled=1;return 0;}}
     struct BrookVkSurfaceExternalLayer layer={sourceFd,syncFd,(size_t)bytes/4,db->offset/4,db->stride/4,
-        image->width,image->height,g->sx/256,g->sy/256,g->sw/256,g->sh/256,0,0,g->w*scale,g->h*scale,
+        image->width,image->height,g->sx/256,g->sy/256,g->sw/256,g->sh/256,0,0,logical_to_physical(g->w,scale),logical_to_physical(g->h,scale),
         0,0,root->vfb_w,root->vfb_h,255,db->fourcc==0x34325258?(BROOK_VK_STRAIGHT_ALPHA|BROOK_VK_OPAQUE_SOURCE):0};
     BrookVkResult result=brook_vk_surface_compose_external(direct,root->vfb_w,root->vfb_h,&layer,1,root->composite,pixels);
     if(result==BROOK_VK_UNCERTAIN){disabled=1;fprintf(stderr,"[waylandd] direct producer GPU read uncertain; release withheld\n");return -1;}
@@ -78,7 +79,7 @@ static int surface_vulkan_compose(struct brook_surface *root,const struct brook_
     for(unsigned i=0;i<count;++i){
         const struct brook_draw *d=draws+i;const struct brook_view *view=d->view;
         const struct brook_image *image=view->image;const struct brook_geometry *g=&view->geometry;
-        int64_t x=d->x*scale,y=d->y*scale;
+        int64_t x=logical_to_physical(d->x,scale),y=logical_to_physical(d->y,scale);
         if(!image->pixels || g->transform || ((g->sx|g->sy|g->sw|g->sh)&255) ||
            x<-(int64_t)16384 || x>16384 || y<-(int64_t)16384 || y>16384) {
 #ifdef BROOK_WAYLAND_VULKAN_TEST
@@ -87,7 +88,8 @@ static int surface_vulkan_compose(struct brook_surface *root,const struct brook_
             return 0;
         }
         layers[n++]=(struct BrookVkSurfaceLayer){image->pixels,image->width,image->height,
-            g->sx/256,g->sy/256,g->sw/256,g->sh/256,(int32_t)x,(int32_t)y,g->w*scale,g->h*scale};
+            g->sx/256,g->sy/256,g->sw/256,g->sh/256,(int32_t)x,(int32_t)y,
+            logical_to_physical(d->x+g->w,scale)-x,logical_to_physical(d->y+g->h,scale)-y};
     }
     BrookVkResult result=brook_vk_surface_compose(renderer,root->vfb_w,root->vfb_h,layers,n,
         root->composite,(size_t)root->vfb_w*root->vfb_h);

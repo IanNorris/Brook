@@ -104,7 +104,12 @@ static void checkSceneDamage() {
 int main() {
     checkSceneDamage();
     checkDesktopPointerRouting();
-    CHECK(!DesktopMetricsFor(0)&&!DesktopMetricsFor(125)&&!DesktopMetricsFor(201));
+    CHECK(!DesktopMetricsFor(0)&&!DesktopMetricsFor(123)&&!DesktopMetricsFor(201));
+    for (unsigned scale=100;scale<=200;scale+=5) {
+        const auto* metrics=DesktopMetricsFor(scale);
+        CHECK(metrics && metrics->percent==scale && metrics->title()==int(40*scale/100));
+    }
+    CHECK(DesktopMetricsFor(120)->taskbar()==58 && DesktopMetricsFor(135)->taskbar()==65);
     for(unsigned from:{100u,150u,200u})for(unsigned to:{100u,150u,200u}) {
         const auto& old=*DesktopMetricsFor(from);const auto& next=*DesktopMetricsFor(to);
         CHECK(next.pixels(-17)==-next.pixels(17));

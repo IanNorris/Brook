@@ -31,6 +31,8 @@ extern const FontAtlas g_desktopFont200{badgeAtlas,2,2,badgeGlyphs,95,32,2,0,4};
 extern const ChromeFontSet g_chromeFonts100 TEST_FONT_SET;
 extern const ChromeFontSet g_chromeFonts150 TEST_FONT_SET;
 extern const ChromeFontSet g_chromeFonts200 TEST_FONT_SET;
+const ChromeFontSet& ChromeFontsForScale(uint32_t) { return g_chromeFonts100; }
+const FontAtlas& DesktopFontForScale(uint32_t) { return g_desktopFont100; }
 const char* BuildGitHash(){return "test";}
 const char* BuildGitCommit(){return "0123456789abcdef0123456789abcdef01234567";}
 static BootGuardSlot fixtureSlot{};

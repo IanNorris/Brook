@@ -173,20 +173,33 @@ if(DEFINED ENV{BROOK_DESKTOP_FONT_TTF} AND EXISTS "$ENV{BROOK_DESKTOP_FONT_TTF}"
     set(BROOK_DESKTOP_FONT_TTF "$ENV{BROOK_DESKTOP_FONT_TTF}")
 endif()
 set(DESKTOP_FONT_SOURCES "")
-foreach(DESKTOP_SCALE IN ITEMS 100 150 200)
-    math(EXPR DESKTOP_FONT_SIZE "16 * ${DESKTOP_SCALE} / 100")
-    set(DESKTOP_FONT_CPP "${CMAKE_CURRENT_BINARY_DIR}/desktop_font_${DESKTOP_SCALE}.cpp")
+set(DESKTOP_FONT_TABLE "")
+set(DESKTOP_FONT_DECLARATIONS "")
+foreach(SIZE RANGE 16 32)
+    set(SYMBOL "g_desktopFontPx${SIZE}")
+    set(CPP "${CMAKE_CURRENT_BINARY_DIR}/desktop_font_px${SIZE}.cpp")
     add_custom_command(
-        OUTPUT "${DESKTOP_FONT_CPP}"
+        OUTPUT "${CPP}"
         COMMAND ${BROOK_PYTHON3} "${BROOK_ROOT}/scripts/bake_font.py"
-                "${BROOK_DESKTOP_FONT_TTF}" "${DESKTOP_FONT_SIZE}" "${DESKTOP_FONT_CPP}"
-                "g_desktopFont${DESKTOP_SCALE}"
+                "${BROOK_DESKTOP_FONT_TTF}" "${SIZE}" "${CPP}" "${SYMBOL}"
         DEPENDS "${BROOK_ROOT}/scripts/bake_font.py" "${BROOK_DESKTOP_FONT_TTF}"
-        COMMENT "Baking native desktop font (${DESKTOP_SCALE}%)"
-        VERBATIM
-    )
-    list(APPEND DESKTOP_FONT_SOURCES "${DESKTOP_FONT_CPP}")
+        COMMENT "Baking native desktop font (${SIZE}px)"
+        VERBATIM)
+    list(APPEND DESKTOP_FONT_SOURCES "${CPP}")
+    string(APPEND DESKTOP_FONT_DECLARATIONS "extern const FontAtlas ${SYMBOL};\n")
+    string(APPEND DESKTOP_FONT_TABLE "    &${SYMBOL},\n")
 endforeach()
+set(DESKTOP_FONT_REGISTRY "${CMAKE_CURRENT_BINARY_DIR}/desktop_font_registry.cpp")
+file(GENERATE OUTPUT "${DESKTOP_FONT_REGISTRY}" CONTENT
+"#include \"desktop_metrics.h\"\n#include \"font_atlas.h\"\nnamespace brook {\n${DESKTOP_FONT_DECLARATIONS}
+const FontAtlas& DesktopFontForScale(uint32_t percent) {
+    static constexpr const FontAtlas* atlases[] = {
+${DESKTOP_FONT_TABLE}    };
+    const auto* metrics = DesktopMetricsFor(percent);
+    return *atlases[metrics ? metrics->fontPixels()-16 : 0];
+}
+}\n")
+list(APPEND DESKTOP_FONT_SOURCES "${DESKTOP_FONT_REGISTRY}")
 
 # Clearwater chrome type roles and icon masks (DESIGN.md "Type").
 include("${BROOK_ROOT}/cmake/ChromeFonts.cmake")

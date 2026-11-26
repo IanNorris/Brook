@@ -8,6 +8,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #include "brook_theme.h"
+#include "brook_desktop_scale.h"
 #include "brook_audio_control.h"
 #include "brook_gtk_appearance.h"
 #include "brook_taskbar.h"
@@ -51,8 +52,7 @@ static int pro_mode_supported;
 static const char pro_mode_label[]="Pro mode";
 static const char pro_mode_tooltip[]="Show technical details where available, including system message diagnostics and detailed CPU and memory views.";
 static char *settings_path;
-static unsigned selected_scale=100;
-static const unsigned scales[]={100,150,200};
+static unsigned selected_scale=BROOK_DESKTOP_SCALE_MIN;
 static void color(cairo_t *cr,uint32_t rgb) {
     cairo_set_source_rgb(cr,((rgb>>16)&255)/255.,((rgb>>8)&255)/255.,(rgb&255)/255.);
 }
@@ -254,7 +254,8 @@ static int save_appearance(uint64_t theme,unsigned scale,uint32_t appearance,
 }
 static void scale_changed(GtkComboBox *box,gpointer unused) {
     (void)unused;int index=gtk_combo_box_get_active(box);
-    if(index>=0&&index<3)selected_scale=scales[index];
+    if(index>=0 && (unsigned)index<BROOK_DESKTOP_SCALE_COUNT)
+        selected_scale=BROOK_DESKTOP_SCALE_MIN + (unsigned)index*BROOK_DESKTOP_SCALE_STEP;
     gtk_widget_queue_draw(preview);
 }
 /* Opacity and blur; the dark and performance bits of the appearance word
@@ -428,7 +429,8 @@ int main(int argc,char **argv) {
     pro_mode_supported=brook_experience_pro_mode_valid((uint64_t)runtime_pro_mode);
     if(metrics>=0 && brook_taskbar_metrics_valid((uint32_t)metrics))selected_metrics=(uint32_t)metrics;
     long scale=syscall(0xB04L,0L,0L);
-    int scale_index=0;for(int i=0;i<3;++i)if(scale==(long)scales[i]){selected_scale=scales[i];scale_index=i;}
+    if(scale>=0 && brook_desktop_scale_valid((unsigned)scale))selected_scale=(unsigned)scale;
+    const int scale_index=(selected_scale-BROOK_DESKTOP_SCALE_MIN)/BROOK_DESKTOP_SCALE_STEP;
     GtkWidget *window=gtk_window_new(GTK_WINDOW_TOPLEVEL);gtk_window_set_title(GTK_WINDOW(window),"Settings");
     GdkRectangle area={0,0,1920,800};
     GdkMonitor *monitor=gdk_display_get_primary_monitor(gdk_display_get_default());
@@ -569,9 +571,12 @@ int main(int argc,char **argv) {
     GtkWidget *scale_label=gtk_label_new("Desktop scale");gtk_widget_set_halign(scale_label,GTK_ALIGN_START);
     gtk_box_pack_start(GTK_BOX(scale_row),scale_label,TRUE,TRUE,0);
     scale_choice=gtk_combo_box_text_new();
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(scale_choice),"100%");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(scale_choice),"150%");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(scale_choice),"200%");
+    for (unsigned choice=BROOK_DESKTOP_SCALE_MIN; choice<=BROOK_DESKTOP_SCALE_MAX;
+         choice+=BROOK_DESKTOP_SCALE_STEP) {
+        char text[8];
+        snprintf(text,sizeof(text),"%u%%",choice);
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(scale_choice),text);
+    }
     gtk_combo_box_set_active(GTK_COMBO_BOX(scale_choice),scale_index);
     gtk_box_pack_end(GTK_BOX(scale_row),scale_choice,FALSE,FALSE,0);
     g_signal_connect(scale_choice,"changed",G_CALLBACK(scale_changed),NULL);

@@ -23,8 +23,9 @@ struct ChromeFontSet {
     const FontAtlas* font[static_cast<unsigned>(ChromeFont::Count)];
     const FontAtlas& operator[](ChromeFont role) const { return *font[static_cast<unsigned>(role)]; }
 };
-// The sets the build bakes (chrome_fonts.cpp, cmake/ChromeFonts.cmake).
+// The sets the build bakes (cmake/ChromeFonts.cmake).
 extern const ChromeFontSet g_chromeFonts100, g_chromeFonts150, g_chromeFonts200;
+const ChromeFontSet& ChromeFontsForScale(uint32_t percent);
 
 // Map UTF-8 en and em dashes to their extra glyph slots. Existing text
 // uses literal byte slots for the degree and middle dot.

@@ -45,7 +45,10 @@ void CheckOverlayAt(uint64_t now, int32_t mx, int32_t my) {
 }
 namespace brook {
 const FontAtlas g_fontAtlas{lettering, 1, 1, letters, 1, 'I', 1, 0, 1};
-const FontAtlas g_desktopFont200{lettering, 1, 1, letters, 1, 'I', 1, 0, 1};
+const FontAtlas& DesktopFontForScale(uint32_t) {
+    static const FontAtlas font{lettering, 1, 1, letters, 1, 'I', 1, 0, 1};
+    return font;
+}
 uint64_t WmBackdropStyleVersion(){
     if(readsUntilStyleChange && --readsUntilStyleChange==0)backdropStyle+=2;
     return backdropStyle;
