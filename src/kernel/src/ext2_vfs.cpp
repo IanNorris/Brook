@@ -220,6 +220,12 @@ struct Ext2Mount {
     uint32_t totalInodes;    // s_inodes_count
     uint32_t totalBlocks;    // s_blocks_count
     uint32_t reservedBlocks; // s_r_blocks_count, unavailable to ordinary users
+    uint32_t revLevel;       // s_rev_level
+    uint32_t roCompat;       // s_feature_ro_compat as last read or written
+    // Largest regular-file size: the block tree limit, capped so a dense file's
+    // 32-bit i_blocks (512-byte units, data plus indirect blocks) cannot
+    // overflow, as Linux ext2_max_size does without HUGE_FILE.
+    uint64_t maxFileBytes;
     uint64_t bgdtDiskOff;    // byte offset of BGDT on disk
     Ext2BlockGroupDesc* bgdt; // block group descriptor table (heap allocated)
 
@@ -1218,100 +1224,174 @@ static bool Ext2WriteIndPointer(Ext2Mount* mnt, uint32_t block, uint32_t index,
     return written;
 }
 
-static uint32_t Ext2EnsureBlock(Ext2Mount* mnt, Ext2Inode* ino,
-                                uint32_t inoNum, uint32_t fileBlock)
+static constexpr uint32_t EXT2_FEATURE_RO_COMPAT_LARGE_FILE = 0x0002;
+
+static bool Ext2HasFreeBlock(const Ext2Mount* mnt)
 {
-    uint32_t ptrsPerBlock = mnt->blockSize / 4;
+    for (uint32_t g = 0; g < mnt->groupCount; ++g)
+        if (mnt->bgdt[g].bg_free_blocks_count) return true;
+    return false;
+}
 
-    // Direct blocks (0..11)
-    if (fileBlock < 12) {
-        if (ino->i_block[fileBlock]) return ino->i_block[fileBlock];
-        uint32_t nb = Ext2AllocBlock(mnt);
-        if (!nb) return 0;
-        ino->i_block[fileBlock] = nb;
-        ino->i_blocks += mnt->blockSize / 512;
-        // Caller must write the inode back when its overall update is done.
-        return nb;
+// Linux ext2_max_size() for a filesystem without HUGE_FILE: the triply
+// indirect tree limit, reduced so that a dense file's data plus indirect
+// blocks stay below 2^32 512-byte sectors in i_blocks.
+static uint64_t Ext2MaxFileBytes(uint32_t blockShift)
+{
+    const uint64_t ppb = 1ULL << (blockShift - 2);
+    uint64_t upper = ((1ULL << 32) - 1) >> (blockShift - 9);
+    uint64_t res = 12 + ppb + ppb * ppb + ppb * ppb * ppb;
+    uint64_t meta = 1 + (1 + ppb) + (1 + ppb + ppb * ppb);
+    if (res + meta > upper) {
+        res = upper;
+        uint64_t left = upper - 12 - ppb;
+        meta = 1;
+        if (left < ppb * ppb) {
+            meta += 1 + (left + ppb - 1) / ppb;
+        } else {
+            meta += 1 + ppb;
+            left -= ppb * ppb;
+            meta += 1 + (left + ppb - 1) / ppb + (left + ppb * ppb - 1) / (ppb * ppb);
+        }
+        res -= meta;
     }
+    constexpr uint64_t hardCap = 0x7fffffffffffffffULL; // off_t
+    return res > (hardCap >> blockShift) ? hardCap : res << blockShift;
+}
+
+// Files above 2 GiB need RO_COMPAT_LARGE_FILE. Like Linux, set it on first
+// use instead of refusing; revision 0 filesystems are capped at 2 GiB - 1.
+static bool Ext2EnsureLargeFile(Ext2Mount* mnt, uint64_t size)
+{
+    if (size <= 0x7fffffffULL || (mnt->roCompat & EXT2_FEATURE_RO_COMPAT_LARGE_FILE))
+        return true;
+    if (mnt->revLevel < 1) return false;
+    const uint32_t features = mnt->roCompat | EXT2_FEATURE_RO_COMPAT_LARGE_FILE;
+    const uint64_t offset = 1024 + __builtin_offsetof(Ext2Superblock, s_feature_ro_compat);
+    Ext2BlockCacheInvalidate(mnt, static_cast<uint32_t>(offset >> mnt->blockShift));
+    if (!Ext2DevWrite(mnt, offset, &features, sizeof(features))) return false;
+    mnt->roCompat = features;
+    return true;
+}
+
+static void Ext2SetInodeSize(Ext2Inode* ino, uint64_t size)
+{
+    ino->i_size = static_cast<uint32_t>(size);
+    if ((ino->i_mode & EXT2_S_IFMT) == EXT2_S_IFREG)
+        ino->i_dir_acl = static_cast<uint32_t>(size >> 32);
+}
+
+// Locate a file block in the inode's block tree: the i_block[] slot, the
+// tree depth below it (0 direct, 1 single, 2 double, 3 triple) and the
+// pointer index at each indirect level. False past the triply indirect range.
+struct Ext2BlockPath {
+    unsigned slot = 0;
+    unsigned depth = 0;
+    uint32_t index[3] = {};
+};
+
+static bool Ext2FindBlockPath(uint32_t blockSize, uint64_t fileBlock, Ext2BlockPath* path)
+{
+    const uint64_t pointers = blockSize / 4;
+    if (fileBlock < 12) { path->slot = static_cast<unsigned>(fileBlock); path->depth = 0; return true; }
     fileBlock -= 12;
-
-    // Singly indirect
-    if (fileBlock < ptrsPerBlock) {
-        if (!ino->i_block[12]) {
-            uint32_t nb = Ext2AllocBlock(mnt);
-            if (!nb) return 0;
-            // Zero out new indirect block
-            auto* zb = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
-            if (!zb) return 0;
-            memset(zb, 0, mnt->blockSize);
-            Ext2WriteBlock(mnt, nb, zb);
-            kfree(zb);
-            ino->i_block[12] = nb;
-            ino->i_blocks += mnt->blockSize / 512;
+    uint64_t span = 1;
+    for (unsigned depth = 1; depth <= 3; ++depth) {
+        span *= pointers;
+        if (fileBlock < span) {
+            path->slot = 11 + depth;
+            path->depth = depth;
+            for (unsigned level = depth; level > 0; --level) {
+                path->index[level - 1] = static_cast<uint32_t>(fileBlock % pointers);
+                fileBlock /= pointers;
+            }
+            return true;
         }
-        // Use the indirect-block read cache (fed by Ext2ReadIndPointer)
-        // to avoid hitting the disk every time we extend a file in
-        // indirect-block range.
-        const auto entry = Ext2ReadIndPointer(mnt, ino->i_block[12], fileBlock);
-        if (entry.failed || entry.block) return entry.block;
+        fileBlock -= span;
+    }
+    return false;
+}
+
+// Count one more filesystem block in i_blocks (512-byte units). The size
+// limit keeps a dense file below 2^32 sectors; this refuses anything else
+// (for example an external xattr block) rather than wrapping the count.
+static bool Ext2ChargeBlock(const Ext2Mount* mnt, Ext2Inode* ino)
+{
+    const uint32_t sectors = mnt->blockSize / 512;
+    if (ino->i_blocks > 0xffffffffu - sectors) return false;
+    ino->i_blocks += sectors;
+    return true;
+}
+
+static uint32_t Ext2AllocZeroedIndirect(Ext2Mount* mnt)
+{
+    uint32_t nb = Ext2AllocBlock(mnt);
+    if (!nb) return 0;
+    auto* zb = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
+    if (!zb) { Ext2FreeBlock(mnt, nb); return 0; }
+    memset(zb, 0, mnt->blockSize);
+    bool ok = Ext2WriteBlock(mnt, nb, zb);
+    kfree(zb);
+    if (!ok) { Ext2FreeBlock(mnt, nb); return 0; }
+    return nb;
+}
+
+// Ensure inode has a block mapped at `fileBlock`, allocating the data block
+// and any missing direct, singly, doubly or triply indirect blocks.
+// Returns disk block number or 0 on failure. The caller writes the inode.
+static uint32_t Ext2EnsureBlock(Ext2Mount* mnt, Ext2Inode* ino,
+                                uint32_t inoNum, uint32_t fileBlock, bool* allocated = nullptr)
+{
+    (void)inoNum;
+    if (allocated) *allocated = false;
+    Ext2BlockPath path;
+    if (!Ext2FindBlockPath(mnt->blockSize, fileBlock, &path)) return 0;
+    uint32_t* top = &ino->i_block[path.slot];
+    if (!path.depth) {
+        if (*top) return *top;
+        if (ino->i_blocks > 0xffffffffu - mnt->blockSize / 512) return 0;
         uint32_t nb = Ext2AllocBlock(mnt);
         if (!nb) return 0;
-        Ext2WriteIndPointer(mnt, ino->i_block[12], fileBlock, nb);
-        ino->i_blocks += mnt->blockSize / 512;
+        *top = nb;
+        Ext2ChargeBlock(mnt, ino);
+        if (allocated) *allocated = true;
         return nb;
     }
-    fileBlock -= ptrsPerBlock;
-
-    // Doubly indirect
-    if (fileBlock < ptrsPerBlock * ptrsPerBlock) {
-        if (!ino->i_block[13]) {
-            uint32_t nb = Ext2AllocBlock(mnt);
-            if (!nb) return 0;
-            auto* zb = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
-            if (!zb) return 0;
-            memset(zb, 0, mnt->blockSize);
-            Ext2WriteBlock(mnt, nb, zb);
-            kfree(zb);
-            ino->i_block[13] = nb;
-            ino->i_blocks += mnt->blockSize / 512;
-        }
-        uint32_t idx1 = fileBlock / ptrsPerBlock;
-        uint32_t idx2 = fileBlock % ptrsPerBlock;
-
-        // Same indirect-block cache as the singly-indirect case and the read
-        // path; Ext2WriteIndPointer/Ext2WriteBlock keep it coherent. A raw
-        // 4-byte read here cost one device command per written block.
-        const auto leaf = Ext2ReadIndPointer(mnt, ino->i_block[13], idx1);
-        if (leaf.failed) return 0;
-        uint32_t indBlock = leaf.block;
-        if (!indBlock) {
-            indBlock = Ext2AllocBlock(mnt);
-            if (!indBlock) return 0;
-            auto* zb = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
-            if (!zb) return 0;
-            memset(zb, 0, mnt->blockSize);
-            Ext2WriteBlock(mnt, indBlock, zb);
-            kfree(zb);
-            Ext2WriteIndPointer(mnt, ino->i_block[13], idx1, indBlock);
-            ino->i_blocks += mnt->blockSize / 512;
-        }
-
-        const auto entry = Ext2ReadIndPointer(mnt, indBlock, idx2);
-        if (entry.failed || entry.block) return entry.block;
-        uint32_t nb = Ext2AllocBlock(mnt);
+    if (!*top) {
+        if (ino->i_blocks > 0xffffffffu - mnt->blockSize / 512) return 0;
+        uint32_t nb = Ext2AllocZeroedIndirect(mnt);
         if (!nb) return 0;
-        Ext2WriteIndPointer(mnt, indBlock, idx2, nb);
-        ino->i_blocks += mnt->blockSize / 512;
-        return nb;
+        *top = nb;
+        Ext2ChargeBlock(mnt, ino);
     }
-
-    // Triply indirect not implemented for writes yet
-    return 0;
+    uint32_t parent = *top;
+    for (unsigned level = 0; level < path.depth; ++level) {
+        const bool leaf = level + 1 == path.depth;
+        // Use the indirect-block read cache (fed by Ext2ReadIndPointer and
+        // kept coherent by Ext2WriteIndPointer/Ext2WriteBlock). A raw 4-byte
+        // read here cost one device command per written block.
+        const auto entry = Ext2ReadIndPointer(mnt, parent, path.index[level]);
+        if (entry.failed) return 0;
+        if (entry.block) { parent = entry.block; continue; }
+        if (ino->i_blocks > 0xffffffffu - mnt->blockSize / 512) return 0;
+        uint32_t nb = leaf ? Ext2AllocBlock(mnt) : Ext2AllocZeroedIndirect(mnt);
+        if (!nb) return 0;
+        // A failed pointer write may still have reached the disk: keep the
+        // block allocated (at worst leaked) rather than reusable.
+        if (!Ext2WriteIndPointer(mnt, parent, path.index[level], nb)) return 0;
+        Ext2ChargeBlock(mnt, ino);
+        if (leaf && allocated) *allocated = true;
+        parent = nb;
+    }
+    return parent;
 }
 
 // Private metadata for one 64 KiB append chunk. With 1--4 KiB filesystem
-// blocks, a chunk touches at most three indirect pages (a parent and two
-// leaves, or the single-indirect page followed by a double-indirect tree).
+// blocks (at least 256 pointers per indirect block), 64 consecutive file
+// blocks cross at most one indirect boundary, so a chunk touches at most five
+// indirect pages: the doubly indirect root and leaf followed by a new triply
+// indirect root, middle and leaf, or a triply indirect root with two
+// middle/leaf pairs.
 // The caller holds g_ext2Lock for writing throughout the transaction.
 struct Ext2AppendBatch {
     Ext2Mount* mnt;
@@ -1319,10 +1399,10 @@ struct Ext2AppendBatch {
         PhysicalAddress phys;
         uint32_t block = 0;
         bool dirty = false;
-    } pages[3];
+    } pages[5];
     PhysicalAddress tailPage;
     uint32_t count = 0;
-    uint32_t allocated[67]; // 64 data blocks plus at most three indirect blocks
+    uint32_t allocated[69]; // 64 data blocks plus at most five indirect blocks
     uint32_t allocatedCount = 0;
     int error = -5;
 
@@ -1333,7 +1413,7 @@ struct Ext2AppendBatch {
     }
     void Reset() { count = allocatedCount = 0; error = -5; }
     uint32_t Allocate() {
-        if (allocatedCount == 67) return 0;
+        if (allocatedCount == 69) return 0;
         uint32_t block = Ext2AllocBlock(mnt);
         if (!block) { error = -28; return 0; }
         allocated[allocatedCount++] = block;
@@ -1352,7 +1432,7 @@ struct Ext2AppendBatch {
         for (uint32_t i = 0; i < count; ++i)
             if (pages[i].block == block)
                 return reinterpret_cast<uint32_t*>(PhysToVirt(pages[i].phys).raw());
-        if (count == 3) return nullptr;
+        if (count == 5) return nullptr;
         auto& page = pages[count];
         if (!page.phys) page.phys = PmmAllocPageAccounted(MemTag::KernelData,KernelPid,PmmOwner::FsBuffers);
         if (!page.phys) { error = -12; return nullptr; }
@@ -1389,54 +1469,38 @@ struct Ext2AppendBatch {
 };
 
 static uint32_t Ext2AppendEnsureBlock(Ext2AppendBatch& batch, Ext2Inode* ino,
-                                      uint32_t fileBlock)
+                                      uint32_t fileBlock, bool* fresh = nullptr)
 {
-    uint32_t sectors = batch.mnt->blockSize / 512;
-    if (fileBlock < 12) {
-        if (!ino->i_block[fileBlock]) {
-            uint32_t block = batch.Allocate();
-            if (!block) return 0;
-            ino->i_block[fileBlock] = block;
-            ino->i_blocks += sectors;
-        }
-        return ino->i_block[fileBlock];
-    }
-    uint32_t pointers = batch.mnt->blockSize / 4;
-    fileBlock -= 12;
-    uint32_t slot = fileBlock < pointers ? 12 : 13;
-    if (slot == 13) fileBlock -= pointers;
-    if (slot == 13 && fileBlock >= pointers * pointers) return 0;
-    if (!ino->i_block[slot]) {
+    if (fresh) *fresh = false;
+    Ext2BlockPath path;
+    if (!Ext2FindBlockPath(batch.mnt->blockSize, fileBlock, &path)) return 0;
+    uint32_t* top = &ino->i_block[path.slot];
+    if (!*top) {
+        if (ino->i_blocks > 0xffffffffu - batch.mnt->blockSize / 512) return 0;
         uint32_t block = batch.Allocate();
-        if (!block || !batch.Get(block, true)) return 0;
-        ino->i_block[slot] = block;
-        ino->i_blocks += sectors;
+        if (!block || (path.depth && !batch.Get(block, true))) return 0;
+        *top = block;
+        Ext2ChargeBlock(batch.mnt, ino);
+        if (!path.depth && fresh) *fresh = true;
     }
-    uint32_t indirect = ino->i_block[slot];
-    auto* entries = batch.Get(indirect);
-    if (!entries) return 0;
-    if (slot == 13) {
-        uint32_t index = fileBlock / pointers;
-        if (!entries[index]) {
-            uint32_t block = batch.Allocate();
-            if (!block || !batch.Get(block, true)) return 0;
-            entries[index] = block;
-            batch.Dirty(indirect);
-            ino->i_blocks += sectors;
-        }
-        indirect = entries[index];
-        entries = batch.Get(indirect);
+    uint32_t parent = *top;
+    for (unsigned level = 0; level < path.depth; ++level) {
+        const bool leaf = level + 1 == path.depth;
+        auto* entries = batch.Get(parent);
         if (!entries) return 0;
-        fileBlock %= pointers;
+        uint32_t& entry = entries[path.index[level]];
+        if (!entry) {
+            if (ino->i_blocks > 0xffffffffu - batch.mnt->blockSize / 512) return 0;
+            uint32_t block = batch.Allocate();
+            if (!block || (!leaf && !batch.Get(block, true))) return 0;
+            entry = block;
+            batch.Dirty(parent);
+            Ext2ChargeBlock(batch.mnt, ino);
+            if (leaf && fresh) *fresh = true;
+        }
+        parent = entry;
     }
-    if (!entries[fileBlock]) {
-        uint32_t block = batch.Allocate();
-        if (!block) return 0;
-        entries[fileBlock] = block;
-        batch.Dirty(indirect);
-        ino->i_blocks += sectors;
-    }
-    return entries[fileBlock];
+    return parent;
 }
 
 // Optimize only large, aligned EOF appends. Existing small writes and
@@ -1460,7 +1524,11 @@ static int Ext2AppendInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
         uint32_t first = static_cast<uint32_t>((offset + done) >> mnt->blockShift);
         for (uint32_t i = 0; i < blocks; ++i) {
             diskBlocks[i] = Ext2AppendEnsureBlock(batch, &staged, first + i);
-            if (!diskBlocks[i]) return batch.Rollback() ? batch.error : -5;
+            if (!diskBlocks[i]) {
+                // Earlier chunks are committed: report them like a short write.
+                const int error = batch.Rollback() ? batch.error : -5;
+                return done ? static_cast<int>(done) : error;
+            }
         }
         uint32_t fullBlocks = static_cast<uint32_t>(chunk >> mnt->blockShift);
         for (uint32_t i = 0; i < fullBlocks;) {
@@ -1481,7 +1549,10 @@ static int Ext2AppendInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
         uint32_t tail = static_cast<uint32_t>(chunk & (mnt->blockSize - 1));
         if (tail) {
             uint8_t* data = batch.Tail();
-            if (!data) return batch.Rollback() ? batch.error : -5;
+            if (!data) {
+                const int error = batch.Rollback() ? batch.error : -5;
+                return done ? static_cast<int>(done) : error;
+            }
             // The append starts at a block boundary; bytes beyond its final
             // EOF are not old file contents and must not expose disk residue.
             memset(data, 0, mnt->blockSize);
@@ -1497,7 +1568,7 @@ static int Ext2AppendInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
         // some pointers may already be persisted. This is not a journal;
         // report EIO rather than claiming success or freeing referenced data.
         if (!batch.Flush()) return -5;
-        staged.i_size = static_cast<uint32_t>(offset + done + chunk);
+        Ext2SetInodeSize(&staged, offset + done + chunk);
         Ext2Touch(&staged);
         if (!Ext2WriteInode(mnt, inoNum, &staged) &&
             !Ext2WriteInode(mnt, inoNum, &staged)) return -5;
@@ -1517,20 +1588,25 @@ static int Ext2AppendInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
 static int Ext2WriteInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
                               const void* buf, uint64_t len, uint64_t offset)
 {
-    // i_size is kept as 32 bits (i_dir_acl/i_size_high is not maintained), and
-    // writes map at most doubly indirect blocks. Stop at 4 GiB - 1 with EFBIG,
-    // as Linux does at a file size limit, instead of wrapping i_size.
-    constexpr uint64_t maxFileBytes = 0xffffffffULL;
+    // Regular files end at the mount's size limit (i_size + i_size_high,
+    // mapped through triply indirect blocks). Like Linux at s_maxbytes, write
+    // the part below the limit and return EFBIG at or past it.
+    const bool regular = (ino->i_mode & EXT2_S_IFMT) == EXT2_S_IFREG;
+    const uint64_t maxFileBytes = regular ? mnt->maxFileBytes : 0xffffffffULL;
+    if (len > 0x7fffffffULL) len = 0x7fffffffULL; // the result is an int
     if (offset >= maxFileBytes) return len ? -27 : 0;
     if (len > maxFileBytes - offset) len = maxFileBytes - offset;
-    uint64_t pointers = mnt->blockSize / 4;
-    uint64_t doubleLimit = (12 + pointers + pointers * pointers) * mnt->blockSize;
-    if ((ino->i_mode & EXT2_S_IFMT) == EXT2_S_IFREG &&
-        mnt->blockSize <= 4096 && len >= 64 * 1024 && len <= 0x7fffffffULL &&
-        offset == ino->i_size && (offset & (mnt->blockSize - 1)) == 0 &&
-        offset <= 0xffffffffULL && len <= 0xffffffffULL - offset &&
-        offset < doubleLimit && len <= doubleLimit - offset)
-        return Ext2AppendInodeData(mnt, ino, inoNum, buf, len, offset);
+    if (!len) return 0;
+    if (regular && !Ext2EnsureLargeFile(mnt, offset + len)) return -5;
+    const uint64_t oldSize = Ext2InodeSize(ino);
+    if (regular && mnt->blockSize <= 4096 && len >= 64 * 1024 &&
+        offset == oldSize && (offset & (mnt->blockSize - 1)) == 0) {
+        // A batch allocates a whole 64 KiB chunk or nothing. When none fits,
+        // fall back to block-at-a-time so a nearly full filesystem still
+        // takes the bytes that fit before ENOSPC.
+        const int appended = Ext2AppendInodeData(mnt, ino, inoNum, buf, len, offset);
+        if (appended != -28) return appended;
+    }
 
     auto* src = static_cast<const uint8_t*>(buf);
     uint64_t bytesWritten = 0;
@@ -1539,13 +1615,20 @@ static int Ext2WriteInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
     static constexpr uint64_t MAX_RUN_BYTES = 64 * 1024;
 
     auto* blockBuf = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
-    if (!blockBuf) return -1;
+    if (!blockBuf) return -12;
 
+    // Returned only when nothing was written: a short count otherwise, so a
+    // caller never sees 0 (and retries forever) for a full filesystem.
+    int error = -5;
     while (bytesWritten < len) {
         uint32_t fileBlock = static_cast<uint32_t>((offset + bytesWritten) >> mnt->blockShift);
         uint32_t blockOff  = static_cast<uint32_t>((offset + bytesWritten) & (mnt->blockSize - 1));
-        uint32_t diskBlock = Ext2EnsureBlock(mnt, ino, inoNum, fileBlock);
-        if (!diskBlock) break;
+        bool fresh = false;
+        uint32_t diskBlock = Ext2EnsureBlock(mnt, ino, inoNum, fileBlock, &fresh);
+        if (!diskBlock) {
+            error = Ext2HasFreeBlock(mnt) ? -5 : -28;
+            break;
+        }
 
         uint32_t avail = mnt->blockSize - blockOff;
         uint64_t remaining = len - bytesWritten;
@@ -1586,7 +1669,10 @@ static int Ext2WriteInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
                                   src + bytesWritten, mnt->blockSize))
                     break;
             } else {
-                Ext2ReadBlock(mnt, diskBlock, blockBuf);
+                // A newly allocated block holds whatever a previous owner
+                // left on disk: never expose that around a partial write.
+                if (fresh) memset(blockBuf, 0, mnt->blockSize);
+                else if (!Ext2ReadBlock(mnt, diskBlock, blockBuf)) break;
                 memcpy(blockBuf + blockOff, src + bytesWritten, toCopy);
                 if (!Ext2WriteBlock(mnt, diskBlock, blockBuf)) break;
             }
@@ -1601,13 +1687,11 @@ static int Ext2WriteInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
     // assigned by Ext2EnsureBlock are persisted (it no longer flushes
     // the inode itself per allocation).
     uint64_t newEnd = offset + bytesWritten;
-    if (newEnd > ino->i_size) {
-        ino->i_size = static_cast<uint32_t>(newEnd);
-    }
+    if (newEnd > oldSize) Ext2SetInodeSize(ino, newEnd);
     if (bytesWritten) Ext2Touch(ino);
     Ext2WriteInode(mnt, inoNum, ino);
 
-    return static_cast<int>(bytesWritten);
+    return bytesWritten ? static_cast<int>(bytesWritten) : error;
 }
 
 // Free all data blocks of an inode (direct + indirect).
@@ -2025,7 +2109,10 @@ static bool Ext2ReadInode(Ext2Mount* mnt, uint32_t ino, Ext2Inode* out)
 
 static uint64_t Ext2InodeSize(const Ext2Inode* ino)
 {
-    return ino->i_size; // For files >4GB we'd use i_dir_acl, but read-only ext2 is fine with 32-bit
+    // Linux ext2 keeps the upper half of a regular file's size in i_size_high
+    // (i_dir_acl) on every revision; other inode types use only i_size.
+    if ((ino->i_mode & EXT2_S_IFMT) != EXT2_S_IFREG) return ino->i_size;
+    return ino->i_size | (static_cast<uint64_t>(ino->i_dir_acl) << 32);
 }
 
 // Read a 4-byte block-pointer from an indirect block, using a per-mount
@@ -2141,6 +2228,10 @@ static int Ext2ReadInodeData(Ext2Mount* mnt, const Ext2Inode* ino,
 {
     if((ino->i_mode&EXT2_S_IFMT)==EXT2_S_IFDIR)source=UsbReadSource::Directory;
     uint64_t fileSize = Ext2InodeSize(ino);
+    // Never map past the block tree (a corrupt i_size_high would otherwise
+    // wrap the 32-bit file block index).
+    if (fileSize > mnt->maxFileBytes) fileSize = mnt->maxFileBytes;
+    if (len > 0x7fffffffULL) len = 0x7fffffffULL; // the result is an int
     if (offset >= fileSize) {
         return 0;
     }
@@ -2577,10 +2668,9 @@ static bool Ext2TruncateBlock(Ext2Mount* mnt, const Ext2Inode& inode,
 
 static int Ext2FileTruncate(Vnode* vn, uint64_t size)
 {
-    // Existing block writers use 32-bit i_size. Do not promise larger files.
-    if (size > 0xffffffffULL) return -27;
     auto* fp = static_cast<Ext2FilePriv*>(vn->priv);
     auto* mnt = fp->mnt;
+    if (size > mnt->maxFileBytes) return -27; // EFBIG, as at Linux s_maxbytes
     KRwLockWriteLock(&g_ext2Lock);
     Ext2Inode inode;
     int result = -5;
@@ -2591,6 +2681,7 @@ static int Ext2FileTruncate(Vnode* vn, uint64_t size)
         if (!Ext2ReadInode(mnt, fp->inode, &inode)) break;
         if ((inode.i_mode & EXT2_S_IFMT) != EXT2_S_IFREG) { result = -22; break; }
         uint64_t oldSize = Ext2InodeSize(&inode);
+        if (!Ext2EnsureLargeFile(mnt, size)) break;
         uint64_t keep = (size + mnt->blockSize - 1) / mnt->blockSize;
         if (size < oldSize) {
             bool ok = true;
@@ -2627,8 +2718,7 @@ static int Ext2FileTruncate(Vnode* vn, uint64_t size)
             sectors += uint64_t(batch->count) * (mnt->blockSize / 512);
         if (sectors > inode.i_blocks) break;
         inode.i_blocks -= sectors;
-        inode.i_size = static_cast<uint32_t>(size);
-        inode.i_dir_acl = 0;
+        Ext2SetInodeSize(&inode, size);
         Ext2Touch(&inode);
         if (!Ext2WriteInode(mnt, fp->inode, &inode)) break;
         fp->inodeData = inode;
@@ -2641,6 +2731,91 @@ static int Ext2FileTruncate(Vnode* vn, uint64_t size)
     while (edits) { auto* next = edits->next; kfree(edits); edits = next; }
     Ext2DisposeFreeBatch(freed);
     KRwLockWriteUnlock(&g_ext2Lock);
+    return result;
+}
+
+// Allocate and zero the holes of [offset, offset + length) inside the current
+// size. ext2 has no unwritten extents, and e2fsck rejects blocks past i_size,
+// so VfsFallocate grows the size first and KEEP_SIZE reserves nothing past
+// EOF. Works in 64-block batches: private allocation, one coalesced zero
+// write per contiguous run, leaf-before-parent pointers, then one inode
+// update. *reached is the end of the committed prefix; on ENOSPC, the
+// failing batch is rolled back and earlier batches stay allocated, as ext4
+// keeps the extents it allocated.
+static int Ext2FileFallocate(Vnode* vn, uint64_t offset, uint64_t length, uint64_t* reached)
+{
+    auto* fp = static_cast<Ext2FilePriv*>(vn->priv);
+    auto* mnt = fp->mnt;
+    *reached = offset;
+    if (mnt->blockSize > 4096) return -95; // the batch uses one page per indirect block
+    constexpr uint32_t ZERO_BYTES = 64 * 1024;
+    auto* zero = static_cast<uint8_t*>(kmalloc(ZERO_BYTES));
+    if (!zero) return -12;
+    memset(zero, 0, ZERO_BYTES);
+    KRwLockWriteLock(&g_ext2Lock);
+    int result = 0;
+    Ext2Inode inode;
+    do {
+        if (!Ext2ReadInode(mnt, fp->inode, &inode)) { result = -5; break; }
+        if ((inode.i_mode & EXT2_S_IFMT) != EXT2_S_IFREG) { result = -19; break; }
+        const uint64_t size = Ext2InodeSize(&inode);
+        const uint64_t end = length > size || offset > size - length ? size : offset + length;
+        if (offset >= end) { *reached = end > offset ? end : offset; break; }
+        const uint64_t last = (end - 1) >> mnt->blockShift;
+        uint64_t next = offset >> mnt->blockShift;
+        Ext2AppendBatch batch(mnt);
+        bool changed = false;
+        while (next <= last) {
+            batch.Reset();
+            Ext2Inode staged = inode;
+            const uint32_t count = last - next + 1 < 64 ? uint32_t(last - next + 1) : 64;
+            uint32_t disk[64];
+            bool fresh[64];
+            bool any = false;
+            uint32_t i = 0;
+            for (; i < count; ++i) {
+                disk[i] = Ext2AppendEnsureBlock(batch, &staged, uint32_t(next + i), &fresh[i]);
+                if (!disk[i]) break;
+                any |= fresh[i];
+            }
+            if (i < count) {
+                result = batch.error == -28 || !Ext2HasFreeBlock(mnt) ? -28 : batch.error;
+                if (!batch.Rollback()) result = -5;
+                break;
+            }
+            if (any) {
+                for (i = 0; i < count && !result;) {
+                    if (!fresh[i]) { ++i; continue; }
+                    uint32_t run = 1;
+                    while (i + run < count && fresh[i + run] && disk[i + run] == disk[i] + run &&
+                           (uint64_t(run + 1) << mnt->blockShift) <= ZERO_BYTES) ++run;
+                    for (uint32_t b = 0; b < run; ++b) Ext2BlockCacheInvalidate(mnt, disk[i] + b);
+                    Ext2InvalidateIndirectRun(mnt, disk[i], run);
+                    if (!Ext2DevWrite(mnt, uint64_t(disk[i]) << mnt->blockShift, zero,
+                                      uint64_t(run) << mnt->blockShift)) result = -5;
+                    i += run;
+                }
+                if (result) { batch.Rollback(); break; }
+                // As in the append path, never free blocks once pointer or
+                // inode I/O has started: some of it may be on disk.
+                if (!batch.Flush()) { result = -5; break; }
+                if (!Ext2WriteInode(mnt, fp->inode, &staged) &&
+                    !Ext2WriteInode(mnt, fp->inode, &staged)) { result = -5; break; }
+                inode = staged;
+                changed = true;
+            }
+            next += count;
+            const uint64_t done = next << mnt->blockShift;
+            *reached = done < end ? done : end;
+        }
+        if (changed) {
+            Ext2Touch(&inode);
+            if (Ext2WriteInode(mnt, fp->inode, &inode)) fp->inodeData = inode;
+            else if (!result) result = -5;
+        }
+    } while (false);
+    KRwLockWriteUnlock(&g_ext2Lock);
+    kfree(zero);
     return result;
 }
 
@@ -3024,6 +3199,7 @@ static const VnodeOps g_ext2FileOps = {
     .chown   = Ext2VnodeChown,
     .space   = Ext2Space,
     .access  = Ext2VnodeAccess,
+    .fallocate = Ext2FileFallocate,
 };
 
 // Socket pins expose metadata and permissions, never file data or mappings.
@@ -3169,6 +3345,9 @@ static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
     mnt->totalInodes    = sb.s_inodes_count;
     mnt->totalBlocks    = sb.s_blocks_count;
     mnt->reservedBlocks = sb.s_r_blocks_count;
+    mnt->revLevel       = sb.s_rev_level;
+    mnt->roCompat       = sb.s_rev_level >= 1 ? sb.s_feature_ro_compat : 0;
+    mnt->maxFileBytes   = sb.s_rev_level >= 1 ? Ext2MaxFileBytes(blockShift) : 0x7fffffffULL;
     mnt->bgdtDiskOff    = bgdtOff;
     mnt->bgdt           = bgdt;
 

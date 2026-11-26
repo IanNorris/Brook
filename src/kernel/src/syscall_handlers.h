@@ -170,6 +170,16 @@ int64_t sys_pwrite64(uint64_t fd, uint64_t bufAddr, uint64_t count,
                       uint64_t offset, uint64_t, uint64_t);
 int64_t sys_pread64(uint64_t fd, uint64_t bufAddr, uint64_t count,
                      uint64_t offset, uint64_t, uint64_t);
+int64_t sys_preadv(uint64_t fd, uint64_t iovAddr, uint64_t iovcnt,
+                   uint64_t offset, uint64_t, uint64_t);
+int64_t sys_pwritev(uint64_t fd, uint64_t iovAddr, uint64_t iovcnt,
+                    uint64_t offset, uint64_t, uint64_t);
+int64_t sys_preadv2(uint64_t fd, uint64_t iovAddr, uint64_t iovcnt,
+                    uint64_t offset, uint64_t, uint64_t flags);
+int64_t sys_pwritev2(uint64_t fd, uint64_t iovAddr, uint64_t iovcnt,
+                     uint64_t offset, uint64_t, uint64_t flags);
+int64_t sys_copy_file_range(uint64_t inFd, uint64_t inOffsetAddr, uint64_t outFd,
+                            uint64_t outOffsetAddr, uint64_t length, uint64_t flags);
 
 // syscall_stat.cpp
 int64_t sys_access(uint64_t pathAddr, uint64_t mode, uint64_t,

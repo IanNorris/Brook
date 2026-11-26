@@ -613,8 +613,10 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
         if (!FdOpenForReading(fde)) return -EBADF;
         auto* vn = static_cast<Vnode*>(fde->handle);
         FdPosition position(fde);
+        // Linux caps one transfer at MAX_RW_COUNT; backends return int.
         int64_t ret = VfsRead(vn, reinterpret_cast<void*>(bufAddr),
-                              static_cast<uint32_t>(count), position.get());
+                              count < VnodeWriteLimit ? count : VnodeWriteLimit,
+                              position.get());
         // VfsRead already updates the shared offset through the pointer.
         return ret;
     }
@@ -1452,10 +1454,167 @@ int64_t sys_pread64(uint64_t fd, uint64_t bufAddr, uint64_t count,
         auto* vn = static_cast<Vnode*>(fde->handle);
         uint64_t pos = offset;
         return VfsRead(vn, reinterpret_cast<void*>(bufAddr),
-                       count, &pos);
+                       count < VnodeWriteLimit ? count : VnodeWriteLimit, &pos);
     }
 
     return -EBADF;
+}
+
+} // namespace brook
+
+namespace brook {
+
+// ---------------------------------------------------------------------------
+// sys_preadv (295) / sys_pwritev (296) / sys_preadv2 (327) / sys_pwritev2 (328)
+// ---------------------------------------------------------------------------
+
+// One pread64/pwrite64 per iovec at an advancing offset; a short transfer
+// ends the call, as Linux does. On x86-64 pos_l carries the whole offset.
+static int64_t PositionedVectorIo(uint64_t fd, uint64_t iovAddr, uint64_t iovcnt,
+                                  uint64_t offset, bool writing)
+{
+    if (iovcnt > 1024) return -EINVAL;
+    if (offset > 0x7fffffffffffffffULL) return -EINVAL;
+    // Keep the iovec pages excluded across the nested per-iovec calls.
+    UserAccessScope vectorAccess(ProcessCurrent());
+    if (iovcnt && !UserBufferReadable(iovAddr, iovcnt * sizeof(iovec))) return -EFAULT;
+    const auto* iov = reinterpret_cast<const iovec*>(iovAddr);
+    uint64_t sum = 0;
+    for (uint64_t i = 0; i < iovcnt; ++i) {
+        const uint64_t length = iov[i].iov_len;
+        if (length > 0x7fffffffffffffffULL - sum) return -EINVAL;
+        sum += length;
+    }
+    // Zero total length still validates the descriptor and offset.
+    if (!sum) return writing ? sys_pwrite64(fd, 0, 0, offset, 0, 0) : sys_pread64(fd, 0, 0, offset, 0, 0);
+    int64_t total = 0;
+    for (uint64_t i = 0; i < iovcnt; ++i) {
+        const uint64_t base = iov[i].iov_base, length = iov[i].iov_len;
+        if (!length) continue;
+        const uint64_t at = offset + static_cast<uint64_t>(total);
+        if (at > 0x7fffffffffffffffULL) break;
+        const int64_t ret = writing ? sys_pwrite64(fd, base, length, at, 0, 0)
+                                    : sys_pread64(fd, base, length, at, 0, 0);
+        if (ret < 0) return total ? total : ret;
+        total += ret;
+        if (static_cast<uint64_t>(ret) < length) break;
+    }
+    return total;
+}
+
+int64_t sys_preadv(uint64_t fd, uint64_t iovAddr, uint64_t iovcnt,
+                   uint64_t offset, uint64_t, uint64_t)
+{
+    return PositionedVectorIo(fd, iovAddr, iovcnt, offset, false);
+}
+
+int64_t sys_pwritev(uint64_t fd, uint64_t iovAddr, uint64_t iovcnt,
+                    uint64_t offset, uint64_t, uint64_t)
+{
+    return PositionedVectorIo(fd, iovAddr, iovcnt, offset, true);
+}
+
+static constexpr uint64_t RWF_HIPRI = 1, RWF_DSYNC = 2, RWF_SYNC = 4;
+
+// Offset -1 uses (and advances) the file position, like readv/writev.
+// RWF_HIPRI is a hint; RWF_DSYNC/RWF_SYNC sync the file after a write;
+// other flags (RWF_NOWAIT, RWF_APPEND, ...) are refused with EOPNOTSUPP.
+static int64_t VectorIo2(uint64_t fd, uint64_t iovAddr, uint64_t iovcnt,
+                         uint64_t offset, uint64_t flags, bool writing)
+{
+    if (flags & ~(RWF_HIPRI | RWF_DSYNC | RWF_SYNC)) return -95;
+    int64_t result;
+    if (offset == ~uint64_t{0})
+        result = writing ? sys_writev(fd, iovAddr, iovcnt, 0, 0, 0)
+                         : sys_readv(fd, iovAddr, iovcnt, 0, 0, 0);
+    else result = PositionedVectorIo(fd, iovAddr, iovcnt, offset, writing);
+    if (writing && result > 0 && (flags & (RWF_DSYNC | RWF_SYNC))) {
+        FdRef ref(ProcessCurrent(), static_cast<int>(fd));
+        if (ref && ref->type == FdType::Vnode && ref->handle) {
+            const int error = VfsFsync(static_cast<Vnode*>(ref->handle));
+            if (error) return error;
+        }
+    }
+    return result;
+}
+
+int64_t sys_preadv2(uint64_t fd, uint64_t iovAddr, uint64_t iovcnt,
+                    uint64_t offset, uint64_t, uint64_t flags)
+{
+    return VectorIo2(fd, iovAddr, iovcnt, offset, flags, false);
+}
+
+int64_t sys_pwritev2(uint64_t fd, uint64_t iovAddr, uint64_t iovcnt,
+                     uint64_t offset, uint64_t, uint64_t flags)
+{
+    return VectorIo2(fd, iovAddr, iovcnt, offset, flags, true);
+}
+
+// ---------------------------------------------------------------------------
+// sys_copy_file_range (326) — in-kernel copy between regular vnode files
+// ---------------------------------------------------------------------------
+
+int64_t sys_copy_file_range(uint64_t inFd, uint64_t inOffsetAddr, uint64_t outFd,
+                            uint64_t outOffsetAddr, uint64_t length, uint64_t flags)
+{
+    if (flags) return -EINVAL;
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EBADF;
+    KernelOperationGuard operation(proc);
+    FdRef input(proc, static_cast<int>(static_cast<uint32_t>(inFd)));
+    FdRef output(proc, static_cast<int>(static_cast<uint32_t>(outFd)));
+    if (!input || !output) return -EBADF;
+    FdEntry* in = input.get();
+    FdEntry* out = output.get();
+    if (in->type == FdType::Path || out->type == FdType::Path) return -EBADF;
+    if (!FdOpenForReading(in) || (FdStatus(out) & 3) == 0) return -EBADF;
+    if (FdStatus(out) & 0x400u) return -EBADF; // Linux refuses O_APPEND output
+    if (in->type != FdType::Vnode || out->type != FdType::Vnode || !in->handle || !out->handle)
+        return -EINVAL;
+    auto* source = static_cast<Vnode*>(in->handle);
+    auto* target = static_cast<Vnode*>(out->handle);
+    if (source->type == VnodeType::Dir || target->type == VnodeType::Dir) return -21; // EISDIR
+    if (source->type != VnodeType::File || target->type != VnodeType::File) return -EINVAL;
+    uint64_t inOffset = OpenFileOffset(in->file), outOffset = OpenFileOffset(out->file);
+    if (inOffsetAddr && (!UserBufferWritable(inOffsetAddr, 8) || !CopyFromUser(&inOffset, inOffsetAddr, 8)))
+        return -EFAULT;
+    if (outOffsetAddr && (!UserBufferWritable(outOffsetAddr, 8) || !CopyFromUser(&outOffset, outOffsetAddr, 8)))
+        return -EFAULT;
+    if (inOffset > 0x7fffffffffffffffULL || outOffset > 0x7fffffffffffffffULL) return -EINVAL;
+    if (length > 0x7fffffffffffffffULL - inOffset || length > 0x7fffffffffffffffULL - outOffset)
+        return -EINVAL;
+    VnodeStat inStat{}, outStat{};
+    if (int error = VfsStat(source, &inStat)) return error;
+    if (int error = VfsStat(target, &outStat)) return error;
+    // Overlapping ranges of one file are refused, as on Linux.
+    if (inStat.dev == outStat.dev && inStat.ino == outStat.ino &&
+        inOffset < outOffset + length && outOffset < inOffset + length) return -EINVAL;
+    if (!length) return 0;
+    // Bound one call; callers loop on short counts.
+    constexpr uint64_t CallLimit = 64ULL << 20, Chunk = 64 * 1024;
+    if (length > CallLimit) length = CallLimit;
+    auto* bounce = static_cast<uint8_t*>(kmalloc(Chunk));
+    if (!bounce) return -ENOMEM;
+    int64_t total = 0, error = 0;
+    while (static_cast<uint64_t>(total) < length) {
+        const uint64_t want = length - total < Chunk ? length - total : Chunk;
+        uint64_t readAt = inOffset;
+        const int got = VfsRead(source, bounce, want, &readAt);
+        if (got <= 0) { error = got; break; }
+        uint64_t writeAt = outOffset;
+        const int wrote = VfsWrite(target, bounce, static_cast<uint64_t>(got), &writeAt);
+        if (wrote <= 0 || wrote > got) { error = wrote < 0 ? wrote : -EIO; break; }
+        inOffset += static_cast<uint64_t>(wrote);
+        outOffset += static_cast<uint64_t>(wrote);
+        total += wrote;
+        if (wrote < got || static_cast<uint64_t>(got) < want) break;
+    }
+    kfree(bounce);
+    if (inOffsetAddr) { if (!CopyToUser(inOffsetAddr, &inOffset, 8)) return -EFAULT; }
+    else OpenFileSetOffset(in->file, inOffset);
+    if (outOffsetAddr) { if (!CopyToUser(outOffsetAddr, &outOffset, 8)) return -EFAULT; }
+    else OpenFileSetOffset(out->file, outOffset);
+    return total ? total : error;
 }
 
 } // namespace brook

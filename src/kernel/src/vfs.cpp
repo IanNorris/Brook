@@ -1264,6 +1264,36 @@ int VfsTruncate(Vnode* vn, uint64_t size)
     return VfsTruncateLocked(vn, size);
 }
 
+int VfsFallocate(Vnode* vn, uint32_t mode, uint64_t offset, uint64_t length)
+{
+    if(VfsSystemVnodeDenied(vn))return -13;
+    if(VfsMountReadOnly(vn))return -30;
+    if (!vn) return -9;
+    if (vn->type == VnodeType::Dir) return -21;
+    if (vn->type != VnodeType::File) return -19;
+    if (!vn->ops || !vn->ops->fallocate || !vn->ops->truncate) return -95;
+    if (mode & ~1u) return -95;
+    if (!length || offset > 0x7fffffffffffffffULL - length) return -22;
+    FileMutationGuard mutation;
+    VnodeStat st;
+    int result = VfsStat(vn, &st);
+    if (result) return result;
+    const uint64_t end = offset + length;
+    // Grow first through the normal resize path (page cache and mappings
+    // stay coherent), then allocate inside the new size.
+    const bool grow = !(mode & 1u) && end > st.size;
+    if (grow && (result = VfsTruncateLocked(vn, end))) return result;
+    uint64_t reached = offset;
+    result = vn->ops->fallocate(vn, offset, length, &reached);
+    if (result && grow) {
+        // Keep the allocated prefix and drop the unallocated tail, as ext4
+        // leaves i_size at the end of the extents it managed to allocate.
+        const uint64_t keep = reached > st.size ? reached : st.size;
+        if (keep < end) VfsTruncateLocked(vn, keep);
+    }
+    return result;
+}
+
 static bool VfsMappedMutationBusy(const VnodeStat& stat)
 {
     // Match the established mutation policy: Ext2 open-inode holders preserve

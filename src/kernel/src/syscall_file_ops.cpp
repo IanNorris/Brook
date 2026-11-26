@@ -256,6 +256,7 @@ int64_t sys_utimensat(uint64_t dirfd, uint64_t pathAddr, uint64_t timesAddr,
 
 // ---------------------------------------------------------------------------
 // sys_fallocate (285) — real memfd reservation, not sparse logical growth.
+// Vnodes: backend allocation (ext2 allocates and zeroes holes; see VfsFallocate).
 // ---------------------------------------------------------------------------
 
 int64_t sys_fallocate(uint64_t fd, uint64_t mode, uint64_t offset,
@@ -274,7 +275,10 @@ int64_t sys_fallocate(uint64_t fd, uint64_t mode, uint64_t offset,
     uint32_t options = static_cast<uint32_t>(mode);
     if (options & ~1u) return -95; // EOPNOTSUPP: only KEEP_SIZE is supported.
     if (FdPipe(entry)) return -29; // ESPIPE
-    if (entry->type == FdType::Vnode) return -95; // Backends have no reservation operation.
+    if (entry->type == FdType::Vnode) {
+        if (!entry->handle) return -EBADF;
+        return VfsFallocate(static_cast<Vnode*>(entry->handle), options, offset, length);
+    }
     if (entry->type != FdType::MemFd || !entry->handle) return -ENODEV;
 
     uint64_t end = offset + length;
