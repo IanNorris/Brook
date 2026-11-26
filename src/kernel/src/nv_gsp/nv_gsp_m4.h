@@ -77,7 +77,9 @@ inline bool g_grMthdbufVram = true;
 // renderD130 GR channel privilege (27 Nov, NVK Xid 44 A/B): 0 = ADMIN channel, UNRESTRICTED_PRIV_ACCESS_MAP
 // left out of the non-golden PROMOTE_CTX (as before); 1 = ADMIN + the golden UNRESTRICTED map promoted
 // into the channel; 2 = USER channel (nouveau's user channels, nouveau_abi16 priv=false).
-inline uint32_t g_grChanMode = 0;
+// Default 1: an ADMIN channel without the unrestricted map MMU-faults (RC Xid 44) on FECS's
+// SET_FALCON04 priv-reg method, which NVK's init push uses (gsp17j A/B on hardware, 27 Nov).
+inline uint32_t g_grChanMode = 1;
 // A/B (26 Nov): skip the TU10x scrubber channel (BUG4208224 WAR) after golden, as CPU-RM does with
 // RmForceGrScrubberChannel=0. Live: /etc/nv-gsp-no-scrubber.
 inline bool g_grSkipScrubber = false;

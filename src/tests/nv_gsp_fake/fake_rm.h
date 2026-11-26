@@ -468,7 +468,10 @@ private:
                 if (st) break;
                 const uint32_t all = 0xe7d;   // MAIN PATCH BUNDLE PAGEPOOL ATTRIB RTV FECS PRIV UNRESTRICTED
                 const bool golden = seen == all && init == ((1u << 0) | (1u << 2) | (1u << 9) | (1u << 10) | (1u << 11));
-                const bool channel = (seen & 0x5) == 0x5 && init == 0x5 && !(seen & (1u << 11));
+                // per-channel: USER channels leave the unrestricted map out (nouveau); ADMIN channels need
+                // it (hardware, 27 Nov: without it FECS's SET_FALCON04 MMU-faults, RC Xid 44)
+                const bool admin = (c.internalFlags & 3u) == rm::KERNELCHANNEL_PRIVILEGE_ADMIN;
+                const bool channel = (seen & 0x5) == 0x5 && init == 0x5 && (!(seen & (1u << 11)) != admin);
                 if (!golden_built && !golden) { st = kErrInvalidArgument; gr_error = "promote: the first promote must be the golden one"; break; }
                 if (!golden && !channel) { st = kErrInvalidArgument; gr_error = "promote: per-channel entries"; break; }
                 promoted_golden[q.hObject] = golden && !golden_built; ++promotes;
