@@ -1806,6 +1806,9 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
             // rtx-disp probes: VRAM size, BAR1/BAR2 block, PRAMIN window contents (reads only;
             // the 0x1700 window base is never written here).
             {0x100c00,0x100d00},{0xb80f00,0xb81000},{0x700000,0x800000},
+            // MMU fault reporting (TU102 NV_PFB_PRI_MMU_FAULT_* / fault-buffer LO/HI/GET/PUT/SIZE,
+            // 0x100e24-0x100e60): plain status reads, no side effects (27 Nov NVK Xid 44 decode)
+            {0x100e00,0x100f00},
             {0x00ea00,0x00f000}, // VPLL (0xef00-0xef5c, 0xea80)
             // GSP P1 (read-only): FWSEC/SB error scratch, strap, devinit/SEC2 boot status,
             // WPR2 + MMU_LOCK, GSP and SEC2 falcon state words. Dword-exact spans only:
