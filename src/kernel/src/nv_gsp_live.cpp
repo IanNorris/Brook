@@ -1432,7 +1432,9 @@ void AutostartRun(bool display) {
     P4(display);   // keep-display only when heads are lit
     g_autostart.p4_us = NowUs() - t0;
     if (!display) g_autostart.status = g_rmRunning ? "rm (headless)" : "p4 failed (no RM)";
-    else if (g_rmRunning && g_bar1Mapped) {
+    else if (g_rmRunning && g_bar1Mapped && PathExists("/etc/nv-gsp-no-ce-present")) {
+        g_autostart.status = "rm up, CE present off (/etc/nv-gsp-no-ce-present)";   // 27 Nov display A/B split
+    } else if (g_rmRunning && g_bar1Mapped) {
         t0 = NowUs(); CePresentVerb(1); g_autostart.ce_us = NowUs() - t0;
         g_autostart.status = g_cePresentState.active ? "rm + ce present" : "rm up, ce present failed (CPU copies)";
     } else g_autostart.status = g_rmRunning ? "rm up, BAR1 not mapped (no CE)" : "p4 failed (no RM)";
