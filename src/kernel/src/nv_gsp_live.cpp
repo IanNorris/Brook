@@ -1767,7 +1767,7 @@ void PerfWatchVerb(uint32_t ms, uint32_t secs) {
     if (t) SchedulerAddProcess(t); else { g_perfWatch.running = false; o.ks("refused", "thread start failed"); o.send(); return; }
     o.kd("period_ms", ms); o.kd("seconds", secs); o.ks("output", "kernel log: perf_watch lines on change, perf_watch_done at the end"); o.send();
 }
-void PerfVerb(int mode) {   // 0 status, 1 boost, 2 clear
+void PerfVerb(int mode) {   // 0 status, 1 boost (internal 2X), 2 clear, 3 boost public (PERF_BOOST)
     Out o; o.raw("{\"nv_gsp\":\"perf\"");
     const ChipOps* c = ChipForBoot0(g_bus.rd32(0));
     if (!c || !g_rmRunning || !g_gr.up) { o.ks("refused", "needs GSP-RM and `gr golden` this boot"); o.send(); return; }
@@ -1778,6 +1778,11 @@ void PerfVerb(int mode) {   // 0 status, 1 boost, 2 clear
     alignas(8) static uint8_t scratch[kRmApiBuf];
     LiveRmApi api(g_rm->ch, g_rm->rx, g_rm->rxcap, wait, bell, scratch);
     const uint32_t hc = g_gr.scrub.base, hs = g_gr.scrub.base + grh::kSubdevice;
+    if (mode == 3) {   // phase 3 (Ian approved 27 Nov): public NV2080_CTRL_CMD_PERF_BOOST, BOOST_TO_MAX for 60 s (the nvidia-smi/CUDA path)
+        struct { uint32_t flags, duration; } b = {2u, 60u};
+        const bool ok = api.Control(hc, hs, 0x2080200au, &b, sizeof(b));
+        o.kb("boost_public_ok", ok); o.kh("boost_status", api.status);
+    }
     if (mode == 1 || mode == 2) {
         struct { uint8_t flags; uint8_t pad[3]; uint32_t duration; } b = {uint8_t(mode == 1 ? 2 : 0), {}, mode == 1 ? 60u : 0u};
         static_assert(sizeof(b) == 8, "INTERNAL_PERF_BOOST_SET_PARAMS_2X");
@@ -1811,7 +1816,7 @@ void PerfVerb(int mode) {   // 0 status, 1 boost, 2 clear
     // every RM_ALLOC failing NV_ERR_RESET_REQUIRED (PDB_PROP_GPU_IN_FATAL_ERROR) for the rest of the
     // boot. Clock domains are not in the open 570.144 headers; don't probe them.
     SpinLockRelease(lock);
-    KPrintf("nv-gsp: perf %s: pstate mask 0x%x (rm 0x%x)\n", mode == 1 ? "boost" : mode == 2 ? "clear" : "status", pstate, api.status);
+    KPrintf("nv-gsp: perf %s: pstate mask 0x%x (rm 0x%x)\n", mode == 1 ? "boost" : mode == 2 ? "clear" : mode == 3 ? "boost public" : "status", pstate, api.status);
     o.send();
 }
 void GrVerb(int mode) {   // 1 golden, 2 off, 0 status
@@ -2360,6 +2365,7 @@ bool NvGspHandle(const char* command) {
         PerfWatchVerb(v[0], v[1]);
     }
     else if (!strcmp(verb, "perf boost")) PerfVerb(1);
+    else if (!strcmp(verb, "perf boost public")) PerfVerb(3);
     else if (!strcmp(verb, "perf clear")) PerfVerb(2);
     else if (!strcmp(verb, "ce-present on")) CePresentVerb(1);
     else if (!strcmp(verb, "ce-present off")) CePresentVerb(2);
