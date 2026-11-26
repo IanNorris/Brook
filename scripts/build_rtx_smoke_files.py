@@ -68,6 +68,7 @@ LOADER_FLAGS = {
     'BROOK_GUARD_CHECK_DATA': 'OFF', 'BROOK_GUARD_ALTERNATE_RECOVERY': 'OFF',
     'BROOK_BUILD_RECOVERY_PROBE': 'OFF',
 }
+KERNEL_CONSOLE_SHORTCUT = 'BOOT/SHORTCUTS/KCONSOLE.RC'
 DRIVERS = ('xhci', 'i219')
 I219_STAGES = {'probe': (), 'attach': ('i219-attach',), 'reset': ('i219-reset',)}
 MARKERS = ('usb-read-only', 'audio-muted', 'hw-inventory', 'boot-status', 'boot-stick-update')
@@ -419,8 +420,12 @@ def build(args):
     init_rc = args.build_root / 'INIT.RC'
     init_rc_bytes = INIT_RC
     live = None
+    shortcuts = {}
     if args.session == 'desktop':
         init_rc_bytes, live = desktop_payload(args, initrd)
+        shortcut = (ROOT / 'data/shortcuts/kernel_console.rc').read_bytes()
+        fat_write(initrd, KERNEL_CONSOLE_SHORTCUT, shortcut)
+        shortcuts[KERNEL_CONSOLE_SHORTCUT] = hashlib.sha256(shortcut).hexdigest()
     if getattr(args, 'restart_prompt_seconds', None) is not None:
         fat_write(initrd, "ETC/restart-prompt-seconds", f"{args.restart_prompt_seconds}\n".encode())
     nv_gsp_fw = embed_nv_gsp_firmware(initrd, args.nv_gsp_firmware) if args.nv_gsp_firmware else None
@@ -466,7 +471,7 @@ def build(args):
         'loader_config': config.decode(), 'init_rc': init_rc_bytes.decode(),
         'session': args.session, 'live_store': live if not args.usb_system else None,
         'usb_system': live if args.usb_system else None,
-        'initrd': {'drivers': list(DRIVERS), 'etc': etc, 'markers': list(markers)},
+        'initrd': {'drivers': list(DRIVERS), 'etc': etc, 'markers': list(markers), 'shortcuts': shortcuts},
         'i219_stage': args.i219_stage,
         'keyboard_layout': args.keyboard_layout,
         'nv_gsp': {'verbs': bool(args.nv_gsp), 'firmware': nv_gsp_fw},
