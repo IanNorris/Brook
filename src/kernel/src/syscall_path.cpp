@@ -1,3 +1,4 @@
+#include "syscall_user_path.h"
 // syscall_path.cpp -- path namespace syscalls: cwd, mkdir, unlink, rename, link, symlink, readlink, umask.
 //
 // Split from syscall.cpp.
@@ -21,7 +22,7 @@ namespace brook {
 int64_t sys_getcwd(uint64_t bufAddr, uint64_t size, uint64_t,
                     uint64_t, uint64_t, uint64_t)
 {
-    char cwd[512];int error=ProcessFsGetcwd(ProcessCurrent(),cwd,sizeof(cwd));
+    PathBuffer cwd; if (!cwd.allocate()) return -ENOMEM;int error=ProcessFsGetcwd(ProcessCurrent(),cwd,cwd.capacity());
     if(error)return error;
     size_t bytes=strlen(cwd)+1;
     if(size<bytes)return -ERANGE;
@@ -55,8 +56,8 @@ static int64_t DoReadlink(const char* original,uint64_t bufAddr,uint64_t bufsiz,
     // Proc symlinks resolve through the attached procfs instance. A global
     // numeric lookup here would bypass the mount's PID view.
     // Try VFS readlink for real symlinks
-    char linkTarget[1024];
-    uint64_t cap = (bufsiz < sizeof(linkTarget)) ? bufsiz : sizeof(linkTarget);
+    PathBuffer linkTarget; if (!linkTarget.allocate()) return -ENOMEM;
+    uint64_t cap = (bufsiz < linkTarget.capacity()) ? bufsiz : linkTarget.capacity();
     int r=VfsReadlinkAt(at.fs.root,at.start(),original,linkTarget,static_cast<uint32_t>(cap));
     if (r >= 0 && !CopyToUser(bufAddr, linkTarget, static_cast<uint64_t>(r)))
         return -EFAULT;
@@ -68,9 +69,8 @@ int64_t sys_readlink(uint64_t pathAddr, uint64_t bufAddr, uint64_t bufsiz,
                       uint64_t, uint64_t, uint64_t)
 {
     UserAccessScope access(ProcessCurrent());
-    char path[256];
-    if (!CopyUserCString(pathAddr, path, sizeof(path)))
-        return -EFAULT;
+    PathBuffer path;
+    if (int error = CopyUserPath(pathAddr, path)) return error;
     return DoReadlink(path,bufAddr,bufsiz);
 }
 
@@ -78,17 +78,17 @@ int64_t sys_readlinkat(uint64_t dirfd, uint64_t pathAddr, uint64_t bufAddr,
                         uint64_t bufsiz, uint64_t, uint64_t)
 {
     UserAccessScope access(ProcessCurrent());
-    char path[256];
-    if (!CopyUserCString(pathAddr, path, sizeof(path)))
-        return -EFAULT;
+    PathBuffer path;
+    if (int error = CopyUserPath(pathAddr, path)) return error;
 
     if(!path[0]) {
         if(!bufsiz)return -EINVAL;
         if(static_cast<int>(dirfd)==-100)return -ENOENT;
         FdRef ref(ProcessCurrent(),static_cast<int>(dirfd));if(!ref)return -EBADF;
         if((ref->type!=FdType::Path && ref->type!=FdType::Vnode) || !ref->handle)return -EINVAL;
+        PathBuffer target; if (!target.allocate()) return -ENOMEM;
         VfsPath retained{};int error=VfsPathFromVnode(static_cast<Vnode*>(ref->handle),&retained);
-        char target[1024];uint32_t capacity=bufsiz<sizeof(target)?static_cast<uint32_t>(bufsiz):sizeof(target);
+        uint32_t capacity=bufsiz<target.capacity()?static_cast<uint32_t>(bufsiz):target.capacity();
         if(!error)error=VfsPathReadlink(retained,target,capacity);
         VfsPathRelease(retained);
         if(error>=0 && !CopyToUser(bufAddr,target,static_cast<uint64_t>(error)))return -EFAULT;
@@ -104,8 +104,9 @@ int64_t sys_readlinkat(uint64_t dirfd, uint64_t pathAddr, uint64_t bufAddr,
 int64_t sys_symlink(uint64_t targetAddr, uint64_t linkpathAddr, uint64_t,
                      uint64_t, uint64_t, uint64_t)
 {
-    char target[512],path[512];
-    if(!CopyUserCString(targetAddr,target,sizeof(target)) || !CopyUserCString(linkpathAddr,path,sizeof(path)))return -EFAULT;
+    PathBuffer target, path;
+    if (int error = CopyUserPath(targetAddr, target)) return error;
+    if (int error = CopyUserPath(linkpathAddr, path)) return error;
     AtLookup lookup;if(int error=lookup.Init(-100,path))return error;
     return VfsSymlinkAt(lookup.fs.root,lookup.start(),target,path);
 }
@@ -113,8 +114,9 @@ int64_t sys_symlink(uint64_t targetAddr, uint64_t linkpathAddr, uint64_t,
 int64_t sys_symlinkat(uint64_t targetAddr, uint64_t newdirfd, uint64_t linkpathAddr,
                        uint64_t, uint64_t, uint64_t)
 {
-    char target[512],path[512];
-    if(!CopyUserCString(targetAddr,target,sizeof(target)) || !CopyUserCString(linkpathAddr,path,sizeof(path)))return -EFAULT;
+    PathBuffer target, path;
+    if (int error = CopyUserPath(targetAddr, target)) return error;
+    if (int error = CopyUserPath(linkpathAddr, path)) return error;
     AtLookup lookup;if(int error=lookup.Init(static_cast<int>(newdirfd),path))return error;
     return VfsSymlinkAt(lookup.fs.root,lookup.start(),target,path);
 }
@@ -136,7 +138,7 @@ int64_t sys_umask(uint64_t newMask, uint64_t, uint64_t,
 
 int64_t sys_chdir(uint64_t pathAddr,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t)
 {
-    char path[512];if(!CopyUserCString(pathAddr,path,sizeof(path)))return -EFAULT;
+    PathBuffer path;if (int error = CopyUserPath(pathAddr, path)) return error;
     for(unsigned attempt=0;attempt<8;++attempt) {
         AtLookup lookup;if(int error=lookup.Init(-100,path))return error;
         VfsPath cwd{};int error=VfsPathResolve(lookup.fs.root,lookup.start(),path,&cwd);
@@ -155,7 +157,7 @@ int64_t sys_chroot(uint64_t pathAddr,uint64_t,uint64_t,uint64_t,uint64_t,uint64_
     UserNamespaceRelease(owner);
     if(!authorized)return -EPERM;
 
-    char path[512];if(!CopyUserCString(pathAddr,path,sizeof(path)))return -EFAULT;
+    PathBuffer path;if (int error = CopyUserPath(pathAddr, path)) return error;
     for(unsigned attempt=0;attempt<8;++attempt) {
         AtLookup lookup;if(int error=lookup.Init(-100,path))return error;
         VfsPath root{};int error=VfsPathResolve(lookup.fs.root,lookup.start(),path,&root);
@@ -188,8 +190,8 @@ static int64_t DoUnlink(const char* path, bool directory = false);
 int64_t sys_rmdir(uint64_t pathAddr, uint64_t, uint64_t,
                    uint64_t, uint64_t, uint64_t)
 {
-    char pathBuf[256];
-    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
+    PathBuffer pathBuf;
+    if (int error = CopyUserPath(pathAddr, pathBuf)) return error;
     return DoUnlink(pathBuf, true);
 }
 
@@ -209,8 +211,8 @@ static int64_t DoUnlink(const char* path, bool directory)
 int64_t sys_unlink(uint64_t pathAddr, uint64_t, uint64_t,
                     uint64_t, uint64_t, uint64_t)
 {
-    char pathBuf[256];
-    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
+    PathBuffer pathBuf;
+    if (int error = CopyUserPath(pathAddr, pathBuf)) return error;
     return DoUnlink(pathBuf);
 }
 
@@ -229,9 +231,9 @@ static int64_t DoRename(const char* oldBuf, const char* newBuf)
 int64_t sys_rename(uint64_t oldAddr, uint64_t newAddr, uint64_t,
                     uint64_t, uint64_t, uint64_t)
 {
-    char oldBuf[256], newBuf[256];
-    if (!CopyUserCString(oldAddr, oldBuf, sizeof(oldBuf))) return -EFAULT;
-    if (!CopyUserCString(newAddr, newBuf, sizeof(newBuf))) return -EFAULT;
+    PathBuffer oldBuf, newBuf;
+    if (int error = CopyUserPath(oldAddr, oldBuf)) return error;
+    if (int error = CopyUserPath(newAddr, newBuf)) return error;
     return DoRename(oldBuf, newBuf);
 }
 
@@ -244,8 +246,8 @@ static int64_t DoMkdir(const char* path, uint16_t mode)
 int64_t sys_mkdir(uint64_t pathAddr, uint64_t mode, uint64_t,
                    uint64_t, uint64_t, uint64_t)
 {
-    char pathBuf[256];
-    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
+    PathBuffer pathBuf;
+    if (int error = CopyUserPath(pathAddr, pathBuf)) return error;
     return DoMkdir(pathBuf,static_cast<uint16_t>(mode));
 }
 
@@ -257,7 +259,7 @@ int64_t sys_mknodat(uint64_t dirfd,uint64_t pathAddr,uint64_t mode,uint64_t devi
 {
     if((mode&0170000)!=0010000)return -95;
     if(device)return -EINVAL;
-    char path[512];if(!CopyUserCString(pathAddr,path,sizeof(path)))return -EFAULT;
+    PathBuffer path;if (int error = CopyUserPath(pathAddr, path)) return error;
     AtLookup lookup;if(int error=lookup.Init(static_cast<int>(dirfd),path))return error;
     int error=0;Vnode* node=VfsCreateFifoAt(lookup.fs.root,lookup.start(),path,static_cast<uint16_t>(mode),lookup.fs.mask,&error);
     if(!node)return error?error:-EIO;
@@ -269,7 +271,7 @@ int64_t sys_mknod(uint64_t path,uint64_t mode,uint64_t device,uint64_t,uint64_t,
 int64_t sys_mkdirat(uint64_t dirfd, uint64_t pathAddr, uint64_t mode,
                      uint64_t, uint64_t, uint64_t)
 {
-    char path[512];if(!CopyUserCString(pathAddr,path,sizeof(path)))return -EFAULT;
+    PathBuffer path;if (int error = CopyUserPath(pathAddr, path)) return error;
     AtLookup lookup;if(int error=lookup.Init(static_cast<int>(dirfd),path))return error;
     return VfsMkdirAt(lookup.fs.root,lookup.start(),path,static_cast<uint16_t>(mode),lookup.fs.mask);
 }
@@ -282,7 +284,7 @@ int64_t sys_unlinkat(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
                       uint64_t, uint64_t, uint64_t)
 {
     if(flags & ~0x200ULL)return -EINVAL;
-    char path[512];if(!CopyUserCString(pathAddr,path,sizeof(path)))return -EFAULT;
+    PathBuffer path;if (int error = CopyUserPath(pathAddr, path)) return error;
     AtLookup lookup;if(int error=lookup.Init(static_cast<int>(dirfd),path))return error;
     char synthetic[512];
     if(!(flags&0x200) && !lookup.SyntheticName(path,synthetic,sizeof(synthetic)) &&
@@ -298,8 +300,9 @@ int64_t sys_renameat(uint64_t olddirfd, uint64_t oldAddr,
                       uint64_t newdirfd, uint64_t newAddr,
                       uint64_t, uint64_t)
 {
-    char oldP[512],newP[512];
-    if(!CopyUserCString(oldAddr,oldP,sizeof(oldP)) || !CopyUserCString(newAddr,newP,sizeof(newP)))return -EFAULT;
+    PathBuffer oldP, newP;
+    if (int error = CopyUserPath(oldAddr, oldP)) return error;
+    if (int error = CopyUserPath(newAddr, newP)) return error;
     AtLookup oldLookup,newLookup;
     if(int error=oldLookup.Init(static_cast<int>(olddirfd),oldP))return error;
     if(int error=newLookup.Init(static_cast<int>(newdirfd),newP))return error;
@@ -314,8 +317,9 @@ int64_t sys_renameat2(uint64_t olddirfd, uint64_t oldAddr,
     // publication. Other atomic rename policies remain unsupported.
     if (flags & ~uint64_t{1}) return -EINVAL;
     if(!flags)return sys_renameat(olddirfd, oldAddr, newdirfd, newAddr, 0, 0);
-    char oldP[512],newP[512];
-    if(!CopyUserCString(oldAddr,oldP,sizeof(oldP)) || !CopyUserCString(newAddr,newP,sizeof(newP)))return -EFAULT;
+    PathBuffer oldP, newP;
+    if (int error = CopyUserPath(oldAddr, oldP)) return error;
+    if (int error = CopyUserPath(newAddr, newP)) return error;
     AtLookup oldLookup,newLookup;
     if(int error=oldLookup.Init(static_cast<int>(olddirfd),oldP))return error;
     if(int error=newLookup.Init(static_cast<int>(newdirfd),newP))return error;
@@ -332,9 +336,9 @@ int64_t sys_linkat(uint64_t olddirfd, uint64_t oldAddr,
 {
     constexpr uint64_t FOLLOW=0x400,EMPTY_PATH=0x1000;
     if(flags&~(FOLLOW|EMPTY_PATH))return -EINVAL;
-    char oldPath[512],newPath[512];
-    if(!CopyUserCString(oldAddr,oldPath,sizeof(oldPath)) ||
-       !CopyUserCString(newAddr,newPath,sizeof(newPath)))return -EFAULT;
+    PathBuffer oldPath, newPath;
+    if (int error = CopyUserPath(oldAddr, oldPath)) return error;
+    if (int error = CopyUserPath(newAddr, newPath)) return error;
     AtLookup destination;if(int error=destination.Init(static_cast<int>(newdirfd),newPath))return error;
     if(!oldPath[0]) {
         if(!(flags&EMPTY_PATH))return -ENOENT;

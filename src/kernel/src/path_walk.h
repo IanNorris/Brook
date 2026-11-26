@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include "path_buffer.h"
 
 namespace brook {
 
@@ -14,7 +15,7 @@ struct PathWalkOptions {
 // Provider: Stat(path, Node&), Search(path, const Node&), Readlink(path,buf,size).
 // Node supplies isDir/isSymlink. Caller must stabilize the namespace through
 // the eventual operation; the walk alone is not an authorization capability.
-// Bounded, iterative, allocation-free. Dotdot is consumed only after symlinks.
+// Bounded and iterative. Dotdot is consumed only after symlinks.
 template<class Node, class Provider>
 int WalkPath(const char* path, char* output, uint32_t capacity, Provider& fs,
              PathWalkOptions options = {})
@@ -24,9 +25,12 @@ int WalkPath(const char* path, char* output, uint32_t capacity, Provider& fs,
     if (!path || !path[0]) return -2;
     auto length = [](const char* s) { uint32_t n=0; while (s[n]) ++n; return n; };
     auto copy = [](char* to, const char* from) { while ((*to++=*from++)) {} };
-    char remaining[512], current[512] = "/";
-    if (length(path) >= sizeof(remaining)) return -36;
-    copy(remaining,path);
+    if (PathLength(path) >= PathMax) return -36;
+    PathBuffer current, expanded, target;
+    if (!current.allocate()) return -12;
+    current[0]='/';
+    current[1]=0;
+    const char* remaining=path;
     Node directory{};
     if (int e=fs.Stat(current,directory)) return e;
     uint32_t links=0;
@@ -39,13 +43,13 @@ int WalkPath(const char* path, char* output, uint32_t capacity, Provider& fs,
         }
         if (!directory.isDir) return -20;
         if (int e=fs.Search(current,directory)) return e;
-        char component[256]; uint32_t count=0;
+        char component[NameMax + 1]; uint32_t count=0;
         while (*next && *next!='/') {
             if (count+1>=sizeof(component)) return -36;
             component[count++]=*next++;
         }
         component[count]=0;
-        char tail[512]; copy(tail,next);
+        const char* tail=next;
         const char* suffix=tail; while (*suffix=='/') ++suffix;
         bool final=!*suffix;
         bool trailing=final && tail[0];
@@ -69,9 +73,9 @@ int WalkPath(const char* path, char* output, uint32_t capacity, Provider& fs,
                 current[n]=0;
                 if (int e=fs.Stat(current,directory)) return e;
             }
-            copy(remaining,tail); continue;
+            remaining=tail; continue;
         }
-        if (parentLength+slash+count>=sizeof(current)) return -36;
+        if (parentLength+slash+count>=current.capacity()) return -36;
         if (slash) current[parentLength]='/';
         copy(current+parentLength+slash,component);
         Node child{};
@@ -84,14 +88,17 @@ int WalkPath(const char* path, char* output, uint32_t capacity, Provider& fs,
         }
         if (child.isSymlink && (!final || options.followFinal || trailing)) {
             if (++links>40) return -40;
-            char target[512];
-            int bytes=fs.Readlink(current,target,sizeof(target)-1);
+            if (!target.allocate()) return -12;
+            int bytes=fs.Readlink(current,target,target.capacity());
             if (bytes<0) return bytes;
             if (!bytes) return -2;
-            if (bytes>=static_cast<int>(sizeof(target)-1)) return -36;
-            target[bytes]=0;
-            if (static_cast<uint32_t>(bytes)+length(tail)>=sizeof(remaining)) return -36;
-            copy(remaining,target); copy(remaining+bytes,tail);
+            if (bytes>=static_cast<int>(target.capacity())) return -36;
+            const uint32_t suffixBytes=length(tail)+1;
+            if (uint32_t(bytes)+suffixBytes>PathMax) return -36;
+            if (!expanded.data() && !expanded.allocate()) return -12;
+            __builtin_memmove(expanded.data()+bytes,tail,suffixBytes);
+            for (int i=0;i<bytes;++i) expanded[i]=target[i];
+            remaining=expanded;
             if (target[0]=='/') {
                 current[0]='/';current[1]=0;
                 if (int e=fs.Stat(current,directory)) return e;
@@ -100,7 +107,7 @@ int WalkPath(const char* path, char* output, uint32_t capacity, Provider& fs,
         }
         if (tail[0] && !child.isDir) return -20;
         directory=child;
-        copy(remaining,tail);
+        remaining=tail;
     }
 }
 

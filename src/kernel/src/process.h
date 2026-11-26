@@ -1,3 +1,4 @@
+#include "path_limits.h"
 #pragma once
 #include "proc_wait_info.h"
 
@@ -257,7 +258,7 @@ struct ElfBinary
     uint16_t tlsAlign;          // TLS alignment
 
     // Dynamic linking: PT_INTERP path (empty if statically linked)
-    char interpPath[128];
+    char interpPath[PathMax];
 };
 
 // ---------------------------------------------------------------------------
@@ -469,7 +470,7 @@ struct Process
     char name[32];
 
     // Absolute path of the current executable for /proc/self/exe.
-    char exePath[256];
+    char exePath[PathMax];
 
     // Advisory initial-namespace name only. Never used for lookup authority.
     char cwdDisplay[256];

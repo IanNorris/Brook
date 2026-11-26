@@ -1,3 +1,4 @@
+#include "path_limits.h"
 #pragma once
 #include "vfs_path.h"
 namespace brook {
@@ -56,7 +57,7 @@ int VfsMountNamespaceMountVisible(MountNamespace* ns,const VfsPath& target,
 // Caller holds namespace/root leases. Rows are ordered parent before child.
 struct VfsMountInfo {
     uint64_t id,parent,device,attributes;
-    char root[512],mountPoint[512],fsType[16];
+    char root[PathMax],mountPoint[PathMax],fsType[16];
     bool systemInternal;
 };
 int VfsMountNamespaceInfo(MountNamespace* ns,const VfsPath& root,VfsMountInfo** rows,uint32_t* count);

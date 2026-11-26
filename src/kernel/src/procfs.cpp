@@ -1,3 +1,4 @@
+#include "path_buffer.h"
 #include "process_user_namespace.h"
 #include "process_fs.h"
 #include "mount_namespace.h"
@@ -943,16 +944,37 @@ static Vnode* GenPidMaps(const ProcessSnapshot& proc)
     return MakeProcVnode(buf, static_cast<uint32_t>(p - buf));
 }
 
+static int ProcReadExecutableName(const ProcessSnapshot& snapshot,char* out,uint32_t capacity)
+{
+    Process* live=SchedulerFindProcessReference(snapshot.pid);
+    if(!live)return -2;
+    int result=-2;
+    if(live->incarnation==snapshot.incarnation) {
+        const uint32_t bytes=PathLength(live->exePath);
+        if(bytes>=capacity)result=-36;
+        else {
+            memcpy(out,live->exePath,bytes);
+            out[bytes]=0;
+            result=bytes;
+        }
+    }
+    ProcessUnref(live);
+    return result;
+}
+
 // /proc/[pid]/exe — symlink-like content: the executable path
 static Vnode* GenPidExe(const ProcessSnapshot& proc)
 {
-    uint32_t len = ProcStrLen(proc.exePath);
-    if (len == 0) return nullptr;
-    auto* buf = static_cast<char*>(kmalloc(len + 2));
-    if (!buf) return nullptr;
-    ProcStrCopy(buf, proc.exePath, len + 1);
-    buf[len] = '\n';
-    return MakeProcVnode(buf, len + 1);
+    PathBuffer name(PathMax+1);
+    if(!name.allocate())return nullptr;
+    const int length=ProcReadExecutableName(proc,name,PathMax);
+    if(length<=0)return nullptr;
+    auto* buf=static_cast<char*>(kmalloc(length+2));
+    if(!buf)return nullptr;
+    memcpy(buf,name,length);
+    buf[length]='\n';
+    buf[length+1]=0;
+    return MakeProcVnode(buf,length+1);
 }
 
 // /proc/[pid]/cwd — current working directory
@@ -960,8 +982,9 @@ static Vnode* GenPidCwd(const ProcessSnapshot& proc)
 {
     Process* live=SchedulerFindProcessReference(proc.pid);
     if(!live)return nullptr;
-    char cwd[512]{};
-    int error=live->incarnation==proc.incarnation?ProcessFsGetcwdFromVfsCallback(live,cwd,sizeof(cwd)):-2;
+    PathBuffer cwd;
+    if(!cwd.allocate()){ProcessUnref(live);return nullptr;}
+    int error=live->incarnation==proc.incarnation?ProcessFsGetcwdFromVfsCallback(live,cwd,cwd.capacity()):-2;
     ProcessUnref(live);
     if(error)return nullptr;
     uint32_t len=ProcStrLen(cwd);
@@ -989,8 +1012,9 @@ static int ProcAcquireFsTarget(uint16_t pid,uint64_t incarnation,uint16_t tgid,u
 static Vnode* GenPidRoot(const ProcessSnapshot& proc)
 {
     FsSnapshot fs{};int error=ProcAcquireFsTarget(proc.pid,proc.incarnation,proc.tgid,proc.groupIncarnation,&fs);
-    char root[512]{};
-    if(!error)error=VfsPathDirectoryPathFromCallback(fs.root,root,sizeof(root));
+    PathBuffer root;
+    if(!error && !root.allocate())error=-12;
+    if(!error)error=VfsPathDirectoryPathFromCallback(fs.root,root,root.capacity());
     FsSnapshotRelease(&fs);if(error)return nullptr;
     uint32_t length=ProcStrLen(root);auto* buffer=static_cast<char*>(kmalloc(length+2));
     if(!buffer)return nullptr;
@@ -1713,8 +1737,8 @@ static Vnode* GenPidUserMap(const ProcessSnapshot& snap,uint8_t kind) {
 
 Vnode* ProcFsOpen(const char* relPath, int /*flags*/)
 {
-    char resolved[256];
-    if (!ResolveProcPath(relPath, resolved, sizeof(resolved))) return nullptr;
+    PathBuffer resolved;
+    if(!resolved.allocate() || !ResolveProcPath(relPath,resolved,resolved.capacity()))return nullptr;
     if (!resolved[0]) return ProcFsOpenDir(resolved);
     for (uint32_t i = 0; i < NUM_GLOBAL; ++i)
         if (StrEqProc(resolved, g_globalEntries[i].name)) return g_globalEntries[i].gen();
@@ -1737,8 +1761,9 @@ Vnode* ProcFsOpen(const char* relPath, int /*flags*/)
 
 int ProcFsStatPath(const char* relPath, VnodeStat* st)
 {
-    char resolved[256];
-    if (!ResolveProcPath(relPath, resolved, sizeof(resolved))) return -1;
+    PathBuffer resolved;
+    if(!resolved.allocate())return -12;
+    if(!ResolveProcPath(relPath,resolved,resolved.capacity()))return -1;
     if(ProcOverflowPath(resolved)) {st->size=6;st->mode=0100444;st->isDir=false;return 0;}
     if (!resolved[0] || StrEqProc(resolved, "net") || StrEqProc(resolved,"sys") || StrEqProc(resolved,"sys/kernel"))
     { st->size = 0; st->isDir = true; st->nlink = 2; return 0; }
@@ -1770,8 +1795,8 @@ int ProcFsStatPath(const char* relPath, VnodeStat* st)
 
 Vnode* ProcFsOpenDir(const char* relPath)
 {
-    char resolved[256];
-    if (!ResolveProcPath(relPath, resolved, sizeof(resolved))) return nullptr;
+    PathBuffer resolved;
+    if(!resolved.allocate() || !ResolveProcPath(relPath,resolved,resolved.capacity()))return nullptr;
     if (!resolved[0]) return MakeProcVnode(nullptr, 0, true, &g_procRootDirOps);
     if(StrEqProc(resolved,"sys"))return MakeProcSysDirectory(false);
     if(StrEqProc(resolved,"sys/kernel"))return MakeProcSysDirectory(true);

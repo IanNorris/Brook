@@ -188,7 +188,7 @@ struct MountEntry {
     MountNamespace* owner; // borrowed only while registered; namespace registry lease pins storage
     uint64_t referenceState; // publication + path/vnode holds; high bit marks detach
     VfsObject* rootObject; // optional arbitrary bind root, independent of covered-parent paths
-    char             mountPoint[512];
+    char             mountPoint[PathMax];
     char             fsType[16];     // filesystem type name (e.g. "fatfs", "ext2")
     MountBacking*    backing;     // owned driver-mount reference
     bool             used;
@@ -212,7 +212,7 @@ struct MountEntry {
     bool             mayHaveVirtualMountAncestors;
     // Reporting metadata, never lookup authority. Prepared under the VFS
     // transaction and copied/updated atomically under the metadata view lock.
-    char             physicalRoot[512];
+    char             physicalRoot[PathMax];
     uint64_t         rootDevice;
     uint64_t         attributes;
     uint64_t         lockedAttributes;
@@ -386,7 +386,7 @@ static bool StrEq(const char* a, const char* b)
 }
 
 struct VfsRenameLabels {
-    struct Change { Change* next;MountEntry* mount;char label[512];char physicalRoot[512]; };
+    struct Change { Change* next;MountEntry* mount;char label[PathMax];char physicalRoot[PathMax]; };
     Change* head=nullptr;
     ~VfsRenameLabels() { while(head) { auto* next=head->next;kfree(head);head=next; } }
     int Add(MountEntry* mount,const char* prefix,const char* suffix,const char* physicalRoot=nullptr) {
@@ -442,15 +442,15 @@ static MountEntry* VfsLegacyMountPathLocked(MountEntry* mount,const char* suffix
     if(!suffix[0])suffix="/";
     if(!mount->rootObject) {*out=suffix;return mount;}
     if(!physical || !mount->rootObject->ops->directory_path)return nullptr;
-    if(mount->rootObject->ops->directory_path(mount->rootObject,physical,512))return nullptr;
+    if(mount->rootObject->ops->directory_path(mount->rootObject,physical,PathMax))return nullptr;
     if(physical[0]!='/')return nullptr;
     uint32_t prefix=StrLen(physical),length=StrLen(suffix);
     if(length==1 && suffix[0]=='/') {*out=physical;return mount;}
     if(prefix==1)prefix=0;
     const bool slash=suffix[0]!='/';
-    if(prefix+length+unsigned(slash)>=512)return nullptr;
+    if(prefix+length+unsigned(slash)>=PathMax)return nullptr;
     if(slash)physical[prefix++]='/';
-    StrCopy(physical+prefix,suffix,512-prefix);*out=physical;return mount;
+    StrCopy(physical+prefix,suffix,PathMax-prefix);*out=physical;return mount;
 }
 
 // Find the best (longest-prefix) mount for a given absolute path.
@@ -517,7 +517,7 @@ static int VfsLstatPathRaw(const char* path, VnodeStat* st)
     if (!path || !st) return -1;
     *st = {};
 
-    char physicalRelative[512];
+    PathBuffer physicalRelative;if(!physicalRelative.allocate()){ return -12; }
     const char* relPath = nullptr;
     MountEntry* mount   = FindMount(path, &relPath,physicalRelative);
     if (!mount || !mount->backing->fsOps) return -2;
@@ -552,7 +552,7 @@ static int VfsLstatPathRaw(const char* path, VnodeStat* st)
 static int VfsReadlinkRaw(const char* path, char* buf, uint64_t bufsiz)
 {
     if (!path || !buf || bufsiz == 0) return -22;
-    char physicalRelative[512];
+    PathBuffer physicalRelative;if(!physicalRelative.allocate()){ return -12; }
     const char* relPath = nullptr;
     MountEntry* mount = FindMount(path, &relPath,physicalRelative);
     if (!mount || !mount->backing->fsOps) return -2;
@@ -606,8 +606,8 @@ static int VfsAppendLeaf(char* path,uint32_t capacity,const char* leaf);
 
 static bool VfsLegacyMountAliasMatchesLocked(const char* path,uint32_t length,MountEntry* mount)
 {
-    if(!g_rootMount || length>=512)return false;
-    char prefix[512];for(uint32_t i=0;i<length;++i)prefix[i]=path[i];prefix[length]=0;
+    if(!g_rootMount || length>=PathMax)return false;
+    PathBuffer prefix;if(!prefix.allocate()){ return false; }for(uint32_t i=0;i<length;++i)prefix[i]=path[i];prefix[length]=0;
     VfsPath root{};if(VfsMountRootLocked(g_rootMount,&root))return false;
     VfsRetainedProvider provider{false,false};RetainedWalkResult<VfsPath> result{};
     const int error=WalkRetainedPath(root,root,prefix,&result,provider);
@@ -853,7 +853,7 @@ bool VfsUserVolumeStillPublished(const VfsMountSnapshot& expected)
     if (!expected.used || expected.systemInternal || !expected.publication || expected.mountPoint[0] != '/') return false;
     FileMutationGuard lookup(false);
     const char* relative = nullptr;
-    char physical[512];
+    PathBuffer physical;if(!physical.allocate()){ return false; }
     auto* mount = FindMount(expected.mountPoint, &relative, physical);
     return mount && mount->publication == expected.publication && mount->backing &&
            !mount->backing->systemInternal && mount->backing->pdrv == expected.drive &&
@@ -879,9 +879,9 @@ int VfsAccessPath(const char* path,uint8_t required,bool realIds,bool nofollow)
 {
     if (required & ~7u) return -22;
     FileMutationGuard lookup(false);
-    char resolved[512];
-    if (int error=VfsResolvePath(path,resolved,sizeof(resolved),{!nofollow},realIds)) return error;
-    const char* relative=nullptr;char physical[512];
+    PathBuffer resolved;if(!resolved.allocate()){ return -12; }
+    if (int error=VfsResolvePath(path,resolved,resolved.capacity(),{!nofollow},realIds)) return error;
+    const char* relative=nullptr;PathBuffer physical;if(!physical.allocate()){ return -12; }
     if((required&2) && VfsReadOnly(FindMount(resolved,&relative,physical)))return -30;
     VnodeStat st{};
     if (int error=VfsLstatPathRaw(resolved,&st)) return error;
@@ -931,7 +931,7 @@ int VfsOpenExecutable(const char* path, Vnode** vnode, char* resolved, uint32_t 
     if(retainedRoot!=-95)return retainedRoot;
     FileMutationGuard lookup(false);
     if (int error=VfsResolvePath(path,resolved,size)) return error;
-    char physicalRelative[512];
+    PathBuffer physicalRelative;if(!physicalRelative.allocate()){ return -12; }
     const char* relative=nullptr;
     MountEntry* mount=FindMount(resolved,&relative,physicalRelative);
     if (!mount || !mount->backing->fsOps) return -2;
@@ -976,10 +976,10 @@ Vnode* VfsOpenModeChecked(const char* path, int flags, uint16_t mode, int* error
     }
     if (!path || !path[0]) return nullptr;
 
-    char resolved[512];
+    PathBuffer resolved;if(!resolved.allocate()){ if(error)*error=-12;return nullptr; }
     const bool exclusive=(flags & (VFS_O_CREATE | VFS_O_EXCL))==(VFS_O_CREATE | VFS_O_EXCL);
     PathWalkOptions options{!exclusive, bool(flags & VFS_O_CREATE), false, -21};
-    if (int result=VfsResolvePath(path,resolved,sizeof(resolved),options)) {
+    if (int result=VfsResolvePath(path,resolved,resolved.capacity(),options)) {
         if (error) *error=result;
         return nullptr;
     }
@@ -993,7 +993,7 @@ Vnode* VfsOpenModeChecked(const char* path, int flags, uint16_t mode, int* error
         }
     }
 
-    char physicalRelative[512];
+    PathBuffer physicalRelative;if(!physicalRelative.allocate()){ if(error)*error=-12;return nullptr; }
     const char* relPath = nullptr;
     MountEntry* mount   = FindMount(lookup, &relPath,physicalRelative);
     if (!mount)
@@ -1071,13 +1071,13 @@ int VfsDirectoryPath(Vnode* vn,char* out,uint32_t capacity)
     }
     if(!vn->directoryPath)return -9;
     const char* path=vn->directoryPath;
-    char current[512];
     if(vn->ops && vn->ops->directory_path) {
+        PathBuffer current; if(!current.allocate())return -12;
         // The opening name can now resolve through a different overmount.
         // The retained mount, not that name, owns this backend directory.
         auto* mount=static_cast<MountEntry*>(vn->mountOwner);
         if(!mount || !mount->used)return -9;
-        int error=vn->ops->directory_path(vn,current,sizeof(current));
+        int error=vn->ops->directory_path(vn,current,current.capacity());
         if(error)return error;
         const uint32_t prefix=StrLen(mount->mountPoint),relative=StrLen(current);
         const bool root=prefix==1 && mount->mountPoint[0]=='/';
@@ -1110,10 +1110,10 @@ int VfsChmodPath(const char* path, uint16_t mode)
 {
     if (!path || !path[0]) return -2;
     FileMutationGuard mutation;
-    char resolved[512];
-    if (int error=VfsResolvePath(path,resolved,sizeof(resolved),{true})) return error;
+    PathBuffer resolved;if(!resolved.allocate()){ return -12; }
+    if (int error=VfsResolvePath(path,resolved,resolved.capacity(),{true})) return error;
     const char* lookup=resolved;
-    char physicalRelative[512];
+    PathBuffer physicalRelative;if(!physicalRelative.allocate()){ return -12; }
     const char* relPath = nullptr;
     MountEntry* mount = FindMount(lookup, &relPath,physicalRelative);
     if (!mount) return -2;
@@ -1136,10 +1136,10 @@ int VfsChownPath(const char* path, uint32_t uid, uint32_t gid, bool nofollow)
 {
     if (!path || !path[0]) return -2;
     FileMutationGuard mutation;
-    char resolved[512];
-    if (int error=VfsResolvePath(path,resolved,sizeof(resolved),{!nofollow})) return error;
+    PathBuffer resolved;if(!resolved.allocate()){ return -12; }
+    if (int error=VfsResolvePath(path,resolved,resolved.capacity(),{!nofollow})) return error;
     const char* lookup=resolved;
-    char physicalRelative[512];
+    PathBuffer physicalRelative;if(!physicalRelative.allocate()){ return -12; }
     const char* relPath = nullptr;
     MountEntry* mount = FindMount(lookup, &relPath,physicalRelative);
     if (!mount) return -2;
@@ -1356,8 +1356,8 @@ int VfsStatPath(const char* path, VnodeStat* st)
 {
     if (!st) return -22;
     *st={};FileMutationGuard lookup(false);
-    char resolved[512];
-    if (int error=VfsResolvePath(path,resolved,sizeof(resolved))) return error;
+    PathBuffer resolved;if(!resolved.allocate()){ return -12; }
+    if (int error=VfsResolvePath(path,resolved,resolved.capacity())) return error;
     return VfsLstatPathRaw(resolved,st);
 }
 
@@ -1365,8 +1365,8 @@ int VfsLstatPath(const char* path, VnodeStat* st)
 {
     if (!st) return -22;
     *st={};FileMutationGuard lookup(false);
-    char resolved[512];
-    if (int error=VfsResolvePath(path,resolved,sizeof(resolved),{false})) return error;
+    PathBuffer resolved;if(!resolved.allocate()){ return -12; }
+    if (int error=VfsResolvePath(path,resolved,resolved.capacity(),{false})) return error;
     return VfsLstatPathRaw(resolved,st);
 }
 
@@ -1384,10 +1384,10 @@ int VfsSetTimesPath(const char* path, const VnodeTime* times, bool nofollow)
 {
     if (!path || !path[0] || !times) return -22;
     FileMutationGuard mutation;
-    char resolved[512];
-    if (int error=VfsResolvePath(path,resolved,sizeof(resolved),{!nofollow})) return error;
+    PathBuffer resolved;if(!resolved.allocate()){ return -12; }
+    if (int error=VfsResolvePath(path,resolved,resolved.capacity(),{!nofollow})) return error;
     const char* lookup=resolved;
-    char physicalRelative[512];
+    PathBuffer physicalRelative;if(!physicalRelative.allocate()){ return -12; }
     const char* relPath = nullptr;
     MountEntry* mount = FindMount(lookup, &relPath,physicalRelative);
     if (!mount || !mount->backing->fsOps) return -2;
@@ -1460,15 +1460,15 @@ int VfsRemovePath(const char* path, bool directory)
 {
     FileMutationGuard mutation;
     if(int error=VfsReservedMutationLocked(path,directory))return error;
-    char resolved[512];
-    if (int error=VfsResolvePath(path,resolved,sizeof(resolved),{false,false,true})) return error;
+    PathBuffer resolved;if(!resolved.allocate()){ return -12; }
+    if (int error=VfsResolvePath(path,resolved,resolved.capacity(),{false,false,true})) return error;
     if (VfsTrailingSlash(resolved)) {
         VnodeStat st{};
         if (int error=VfsLstatPathRaw(resolved,&st)) return error;
         if (!st.isDir || st.isSymlink) return -20;
     }
     if (VfsMappedPathBusy(resolved)) return -16;
-    char physicalRelative[512];
+    PathBuffer physicalRelative;if(!physicalRelative.allocate()){ return -12; }
     const char* relative=nullptr;MountEntry* mount=FindMount(resolved,&relative,physicalRelative);
     if (!mount || !mount->backing->fsOps) return -2;
     if(VfsReadOnly(mount))return -30;
@@ -1485,9 +1485,9 @@ int VfsMkdir(const char* path,uint16_t mode)
 {
     FileMutationGuard mutation;
     if(int error=VfsReservedMutationLocked(path))return error;
-    char resolved[512];
-    if (int error=VfsResolvePath(path,resolved,sizeof(resolved),{false,true,true})) return error;
-    char physicalRelative[512];
+    PathBuffer resolved;if(!resolved.allocate()){ return -12; }
+    if (int error=VfsResolvePath(path,resolved,resolved.capacity(),{false,true,true})) return error;
+    PathBuffer physicalRelative;if(!physicalRelative.allocate()){ return -12; }
     const char* relative=nullptr;MountEntry* mount=FindMount(resolved,&relative,physicalRelative);
     if (!mount || !mount->backing->fsOps) return -2;
     if(VfsReadOnly(mount))return -30;
@@ -1501,13 +1501,13 @@ Vnode* VfsCreateSocket(const char* path, uint16_t mode, int* error)
     if (!error) error = &localError;
     *error = 0;
     if((*error=VfsReservedMutationLocked(path)))return nullptr;
-    char resolved[512];
-    if ((*error = VfsResolvePath(path, resolved, sizeof(resolved), {false, true, true})))
+    PathBuffer resolved;if(!resolved.allocate()){ if(error)*error=-12;return nullptr; }
+    if ((*error = VfsResolvePath(path, resolved, resolved.capacity(), {false, true, true})))
         return nullptr;
     VnodeStat existing{};
     int result = VfsLstatPathRaw(resolved, &existing);
     if (result != -2) { *error = result ? result : -98; return nullptr; }
-    char physicalRelative[512];
+    PathBuffer physicalRelative;if(!physicalRelative.allocate()){ if(error)*error=-12;return nullptr; }
     const char* relative = nullptr;
     MountEntry* mount = FindMount(resolved, &relative,physicalRelative);
     if (!mount || !mount->backing->fsOps) { *error = -2; return nullptr; }
@@ -1526,9 +1526,9 @@ int VfsRename(const char* oldPath,const char* newPath)
     FileMutationGuard mutation;
     if(int error=VfsReservedMutationLocked(oldPath))return error;
     if(int error=VfsReservedMutationLocked(newPath))return error;
-    char oldResolved[512],newResolved[512];
-    if (int error=VfsResolvePath(oldPath,oldResolved,sizeof(oldResolved),{false,false,true})) return error;
-    if (int error=VfsResolvePath(newPath,newResolved,sizeof(newResolved),{false,true,true})) return error;
+    PathBuffer oldResolved,newResolved;if(!oldResolved.allocate() || !newResolved.allocate()){ return -12; }
+    if (int error=VfsResolvePath(oldPath,oldResolved,oldResolved.capacity(),{false,false,true})) return error;
+    if (int error=VfsResolvePath(newPath,newResolved,newResolved.capacity(),{false,true,true})) return error;
     if(!StrEq(oldResolved,newResolved))if(int error=VfsReservedMutationLocked(newResolved,true))return error;
     if (VfsTrailingSlash(oldResolved) || VfsTrailingSlash(newResolved)) {
         VnodeStat st{};
@@ -1539,7 +1539,7 @@ int VfsRename(const char* oldPath,const char* newPath)
         if (!error && (!st.isDir || st.isSymlink)) return -20;
     }
     if (VfsMappedPathBusy(oldResolved) || VfsMappedPathBusy(newResolved)) return -16;
-    char oldPhysical[512],newPhysical[512];
+    PathBuffer oldPhysical,newPhysical;if(!oldPhysical.allocate() || !newPhysical.allocate()){ return -12; }
     const char* oldRelative=nullptr;const char* newRelative=nullptr;
     MountEntry* oldMount=FindMount(oldResolved,&oldRelative,oldPhysical);MountEntry* newMount=FindMount(newResolved,&newRelative,newPhysical);
     if (!oldMount || !newMount || !oldMount->backing->fsOps) return -2;
@@ -1567,14 +1567,14 @@ int VfsSymlink(const char* target,const char* linkPath)
     if (!target || !target[0]) return -22;
     FileMutationGuard mutation;
     if(int error=VfsReservedMutationLocked(linkPath))return error;
-    char resolved[512];
-    if (int error=VfsResolvePath(linkPath,resolved,sizeof(resolved),{false,true,true})) return error;
+    PathBuffer resolved;if(!resolved.allocate()){ return -12; }
+    if (int error=VfsResolvePath(linkPath,resolved,resolved.capacity(),{false,true,true})) return error;
     if (VfsTrailingSlash(resolved)) {
         VnodeStat st{};
         int error=VfsLstatPathRaw(resolved,&st);
         return error?error:-17;
     }
-    char physicalRelative[512];
+    PathBuffer physicalRelative;if(!physicalRelative.allocate()){ return -12; }
     const char* relative=nullptr;MountEntry* mount=FindMount(resolved,&relative,physicalRelative);
     if (!mount || !mount->backing->fsOps) return -2;
     if(VfsReadOnly(mount))return -30;
@@ -1585,8 +1585,8 @@ int VfsReadlink(const char* path,char* buf,uint64_t bufsiz)
 {
     if (!buf || !bufsiz) return -22;
     FileMutationGuard lookup(false);
-    char resolved[512];
-    if (int error=VfsResolvePath(path,resolved,sizeof(resolved),{false})) return error;
+    PathBuffer resolved;if(!resolved.allocate()){ return -12; }
+    if (int error=VfsResolvePath(path,resolved,resolved.capacity(),{false})) return error;
     return VfsReadlinkRaw(resolved,buf,bufsiz);
 }
 

@@ -830,7 +830,21 @@ static void testLongMountPaths(brook::MountNamespace* initial,const brook::VfsPa
     rows=infoRows(ns,root);std::string text(rows.size()*4600+1,'\0');uint32_t written=0;assert(!FormatMountInfo(rows.data(),rows.size(),text.data(),text.size(),&written));assert(text.find("/"+path+" ")!=std::string::npos);
     assert(!VfsMountNamespaceDetach(ns,graft));VfsPathRelease(graft);assert(!VfsMountNamespaceDetach(ns,bound));VfsPathRelease(bound);VfsPathRelease(source);VfsPathRelease(dest);
     VfsMountNamespaceLeave(ns);VfsPathRelease(root);VfsPathRelease(cwd);VfsMountNamespaceRelease(ns);VfsDrainMountCleanup();mounts[6].root.children.erase(renamed);
-    {MountEntry dummy{};VfsRenameLabels labels;std::string boundary="/"+std::string(510,'z');auto before=allocations.size();assert(labels.Add(&dummy,boundary.c_str(),"x","/")==-36 && allocations.size()==before);assert(labels.Add(&dummy,(boundary+"x").c_str(),"","/")==-36 && allocations.size()==before);assert(!labels.Add(&dummy,boundary.c_str(),"","/"));labels.Apply();assert(!std::strcmp(dummy.mountPoint,boundary.c_str()));}
+    {
+        MountEntry dummy{};
+        VfsRenameLabels labels;
+        std::string boundary;
+        while (boundary.size() + NameMax + 1 < PathMax)
+            boundary += "/" + std::string(NameMax, 'z');
+        boundary += "/" + std::string(PathMax - boundary.size() - 2, 'z');
+        assert(boundary.size() == PathMax - 1);
+        const auto before = allocations.size();
+        assert(labels.Add(&dummy, boundary.c_str(), "x", "/") == -36 && allocations.size() == before);
+        assert(labels.Add(&dummy, (boundary + "x").c_str(), "", "/") == -36 && allocations.size() == before);
+        assert(!labels.Add(&dummy, boundary.c_str(), "", "/"));
+        labels.Apply();
+        assert(dummy.mountPoint == boundary);
+    }
     assert(allocations.size()==allocated && g_mounts.count==records);
 }
 static void testNullDeviceBridge(brook::MountNamespace* initial,const brook::VfsPath& stableRoot) {

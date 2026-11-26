@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include "path_buffer.h"
 #include "path_walk.h"
 
 namespace brook {
@@ -12,7 +13,7 @@ struct RetainedNodeInfo { bool isDir=false, isSymlink=false; };
 template<class Path> struct RetainedWalkResult {
     Path object{};
     Path parent{};
-    char leaf[256]{};
+    char leaf[NameMax + 1]{};
     bool missing=false;
     bool trailing=false;
 };
@@ -43,7 +44,7 @@ int WalkRetainedPath(const Path& root, const Path& start, const char* text,
     if(!text || !text[0])return -2;
     auto length=[](const char* s) { uint32_t n=0;while(s[n])++n;return n; };
     auto copy=[](char* dst,const char* src) { while((*dst++=*src++)){} };
-    if(length(text)>=512)return -36;
+    if(PathLength(text)>=PathMax)return -36;
     struct Owned {
         Provider& fs;
         Path value{};
@@ -53,7 +54,8 @@ int WalkRetainedPath(const Path& root, const Path& start, const char* text,
         Path detach() { Path p=value;value={};return p; }
     } current{fs};
     current.reset(text[0]=='/'?root:start);
-    char remaining[512];copy(remaining,text);
+    const char* remaining=text;
+    PathBuffer expanded, target;
     uint32_t links=0;
     for(;;) {
         const char* next=remaining;
@@ -67,13 +69,13 @@ int WalkRetainedPath(const Path& root, const Path& start, const char* text,
         if(int e=fs.Stat(current.value,info))return e;
         if(!info.isDir)return -20;
         if(int e=fs.Search(current.value))return e;
-        char name[256];uint32_t count=0;
+        char name[NameMax + 1];uint32_t count=0;
         while(*next && *next!='/') {
             if(count+1>=sizeof(name))return -36;
             name[count++]=*next++;
         }
         name[count]=0;
-        char tail[512];copy(tail,next);
+        const char* tail=next;
         const char* suffix=tail;while(*suffix=='/')++suffix;
         const bool final=!*suffix, trailing=final && tail[0];
         if(options.parentOnly && final) {
@@ -89,7 +91,7 @@ int WalkRetainedPath(const Path& root, const Path& start, const char* text,
                 if(int e=fs.Parent(current.value,root,up.value))return e;
                 current.take(up);
             }
-            copy(remaining,tail);continue;
+            remaining=tail;continue;
         }
         Owned child{fs};
         const int error=fs.Lookup(current.value,name,child.value);
@@ -113,17 +115,21 @@ int WalkRetainedPath(const Path& root, const Path& start, const char* text,
                     if(int targetError=fs.Stat(magic.value,targetInfo))return targetError;
                     if(!targetInfo.isDir)return -20;
                 }
-                current.take(magic);copy(remaining,tail);continue;
+                current.take(magic);remaining=tail;continue;
             }
-            char target[512];
-            const int bytes=fs.Readlink(child.value,target,sizeof(target));
+            if(!target.allocate())return -12;
+            const int bytes=fs.Readlink(child.value,target,target.capacity());
             if(bytes<0)return bytes;
             if(!bytes)return -2;
-            if(bytes>=static_cast<int>(sizeof(target)))return -36;
+            if(bytes>=static_cast<int>(target.capacity()))return -36;
             for(int i=0;i<bytes;++i)if(!target[i])return -5;
-            target[bytes]=0;
-            if(uint32_t(bytes)+length(tail)>=sizeof(remaining))return -36;
-            copy(remaining,target);copy(remaining+bytes,tail);
+            const uint32_t suffixBytes=length(tail)+1;
+            if(uint32_t(bytes)+suffixBytes>PathMax)return -36;
+            if(!expanded.data() && !expanded.allocate())return -12;
+            // Shift first: the unconsumed suffix can already live in expanded.
+            __builtin_memmove(expanded.data()+bytes,tail,suffixBytes);
+            for(int i=0;i<bytes;++i)expanded[i]=target[i];
+            remaining=expanded;
             if(target[0]=='/')current.reset(root);
             continue;
         }
@@ -132,7 +138,7 @@ int WalkRetainedPath(const Path& root, const Path& start, const char* text,
             output->object=child.detach();output->parent=current.detach();
             copy(output->leaf,name);output->trailing=trailing;return 0;
         }
-        current.take(child);copy(remaining,tail);
+        current.take(child);remaining=tail;
     }
 }
 

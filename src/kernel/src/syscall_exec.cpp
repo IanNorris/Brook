@@ -1,3 +1,4 @@
+#include "syscall_user_path.h"
 // syscall_exec.cpp -- execve.
 //
 // Split from syscall.cpp.
@@ -73,14 +74,14 @@ int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAddr,
     if (!userPath) return -EFAULT;
 
     // --- Copy filename from user memory into kernel buffer ---
-    char kPath[256];
-    if (!CopyUserCString(pathAddr, kPath, sizeof(kPath))) return -EFAULT;
+    PathBuffer kPath;
+    if (int error = CopyUserPath(pathAddr, kPath)) return error;
 
-    DbgPrintf("sys_execve: pid=%u path='%s'\n", proc->pid, kPath);
+    DbgPrintf("sys_execve: pid=%u path='%s'\n", proc->pid, kPath.data());
     if (!g_hotLogQuiet)
     {
         SerialPrintf("[PROFILE] execve t=%lums pid=%u '%s'\n",
-                     ApicTickCount(), proc->pid, kPath);
+                     ApicTickCount(), proc->pid, kPath.data());
     }
 
     // Resolve path: try as-is, then /boot/BIN/<UPPER>, then /boot/<UPPER>
@@ -115,6 +116,7 @@ int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAddr,
     // Preserve the existing empty-argv convention, using the requested path.
     if (argc == 0) {
         argBufPos = strlen(kPath) + 1;
+        if (argBufPos > sizeof(argBuf)) return -E2BIG;
         memcpy(argBuf, kPath, argBufPos);
         kArgv[argc++] = argBuf;
     }
@@ -126,16 +128,16 @@ resolve_path:
     if(StrEq(kPath,"/proc/self/exe")) {
         if(!proc->exePath[0])return -ENOENT;
         const uint64_t bytes=strlen(proc->exePath)+1;
-        if(bytes>sizeof(kPath))return -36;
+        if(bytes>kPath.capacity())return -36;
         memcpy(kPath,proc->exePath,bytes);
     }
     AtLookup executableLookup;if(int error=executableLookup.Init(-100,kPath))return error;
-    char resolvedPath[256];
-    char newExePath[sizeof(Process::exePath)];
+    char resolvedPath[NameMax + sizeof("/boot/BIN/")];
+    PathBuffer newExePath; if (!newExePath.allocate()) return -ENOMEM;
     Vnode* vn=nullptr;
     const char* lookupPath=kPath;
     int openResult=VfsOpenExecutableAt(executableLookup.fs.root,executableLookup.start(),kPath,
-                                       &vn,newExePath,sizeof(newExePath));
+                                       &vn,newExePath,newExePath.capacity());
     if(openResult && openResult!=-ENOENT)return openResult;
     bool found=vn!=nullptr;
     char aliasName[512];
@@ -155,21 +157,22 @@ resolve_path:
         const char* baseName = kPath;
         for (const char* p = kPath; *p; ++p)
             if (*p == '/') baseName = p + 1;
+        if (strlen(baseName) > NameMax) return -36;
 
         // FAT is case-insensitive, so try the original name first, then uppercased
         const char* prefixes[] = { "/boot/BIN/", "/boot/" };
         for (int pi = 0; pi < 2 && !found; ++pi)
         {
-            char tryPath[128];
+            char tryPath[sizeof(resolvedPath)];
             uint32_t pLen = 0;
-            for (const char* s = prefixes[pi]; *s && pLen < 120; ++s)
+            for (const char* s = prefixes[pi]; *s; ++s)
                 tryPath[pLen++] = *s;
-            for (const char* s = baseName; *s && pLen < 126; ++s)
+            for (const char* s = baseName; *s; ++s)
                 tryPath[pLen++] = *s;
             tryPath[pLen] = '\0';
 
             openResult=VfsOpenExecutableAt(executableLookup.fs.root,executableLookup.fs.root,tryPath,
-                                           &vn,newExePath,sizeof(newExePath));
+                                           &vn,newExePath,newExePath.capacity());
             if(openResult && openResult!=-ENOENT)return openResult;
             if(vn)
             {
@@ -236,7 +239,7 @@ resolve_path:
             for (int i = 0; i < 4; i++)
             {
                 openResult=VfsOpenExecutableAt(executableLookup.fs.root,executableLookup.fs.root,busyboxPaths[i],
-                                               &vn,newExePath,sizeof(newExePath));
+                                               &vn,newExePath,newExePath.capacity());
                 if(openResult && openResult!=-ENOENT)return openResult;
                 if(vn)
                 {
@@ -247,7 +250,7 @@ resolve_path:
                     lookupPath = resolvedPath;
                     found = true;
                     busyboxFallback = true;
-                    DbgPrintf("sys_execve: busybox fallback for '%s'\n", kPath);
+                    DbgPrintf("sys_execve: busybox fallback for '%s'\n", kPath.data());
                     break;
                 }
             }
@@ -256,8 +259,8 @@ resolve_path:
 
     if (!found)
     {
-        DbgPrintf("sys_execve: not found: %s\n", kPath);
-        SerialPrintf("sys_execve: ENOENT path='%s' pid=%u\n", kPath,
+        DbgPrintf("sys_execve: not found: %s\n", kPath.data());
+        SerialPrintf("sys_execve: ENOENT path='%s' pid=%u\n", kPath.data(),
                      ProcessCurrent() ? ProcessCurrent()->pid : 0);
         return -ENOENT;
     }
@@ -344,12 +347,7 @@ resolve_path:
                      interpPath, interpArg, lookupPath);
 
         // Rebuild argv in-place: [interp, interpArg?, scriptPath, orig_argv[1:]]
-        // Save the script path (lookupPath may point into resolvedPath which gets
-        // overwritten on the next resolve_path iteration).
-        char scriptPath[256];
-        uint32_t spi = 0;
-        while (lookupPath[spi] && spi < 255) { scriptPath[spi] = lookupPath[spi]; spi++; }
-        scriptPath[spi] = '\0';
+        const uint32_t spi = strlen(lookupPath);
 
         // All argument strings are packed in argBuf. Move the old argv[1:]
         // tail once, then adjust its pointers from the end before replacing
@@ -374,7 +372,7 @@ resolve_path:
         };
         pushPrefix(interpPath, interpLen + 1);
         if (interpArgLen) pushPrefix(interpArg, interpArgLen + 1);
-        pushPrefix(scriptPath, spi + 1);
+        pushPrefix(lookupPath, spi + 1);
         argc += prefixCount - 1;
         argBufPos = prefixBytes + tailBytes;
 

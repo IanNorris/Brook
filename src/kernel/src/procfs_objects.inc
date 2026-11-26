@@ -292,7 +292,8 @@ static int ProcObjectReadlink(VfsObject* object,char* out,uint32_t capacity)
     if(int error=ProcObjectSnapshot(value,&snapshot))return error;
     if(value->kind==ProcObjectKind::NsLink)return ProcNamespaceReadlink(value->pid,value->incarnation,value->tgid,value->group,
         static_cast<ProcNamespaceKind>(value->index),out,capacity);
-    char target[512]{};
+    PathBuffer target;
+    if(!target.allocate())return -12;
     if(value->kind==ProcObjectKind::Self || value->kind==ProcObjectKind::ThreadSelf) {
         Process* current=ProcessCurrent();if(!current)return -2;
         const uint32_t tgid = ProcessVisibleTgid(current, value->pidView);
@@ -303,19 +304,20 @@ static int ProcObjectReadlink(VfsObject* object,char* out,uint32_t capacity)
         }
         *end=0;
     } else if(value->kind==ProcObjectKind::FdLink) {
-        VfsPath path{};int error=ProcAcquireVnodeFdPath(value,&path,target,sizeof(target),true);
-        if(!error)error=VfsPathObjectPathFromCallback(path,target,sizeof(target));
+        VfsPath path{};int error=ProcAcquireVnodeFdPath(value,&path,target,target.capacity(),true);
+        if(!error)error=VfsPathObjectPathFromCallback(path,target,target.capacity());
         VfsPathRelease(path);if(error<0)return error;
 
     } else if(value->kind==ProcObjectKind::PidFile && value->index==PROC_PID_EXE) {
-        ProcStrCopy(target,snapshot.exePath,sizeof(target));
+        const int size=ProcReadExecutableName(snapshot,target,target.capacity());
+        if(size<0)return size;
     } else if(value->kind==ProcObjectKind::PidFile && value->index==PROC_PID_CWD) {
         Process* live=SchedulerFindProcessReference(value->pid);if(!live)return -2;
-        int error=live->incarnation==value->incarnation?ProcessFsGetcwdFromVfsCallback(live,target,sizeof(target)):-2;
+        int error=live->incarnation==value->incarnation?ProcessFsGetcwdFromVfsCallback(live,target,target.capacity()):-2;
         ProcessUnref(live);if(error)return error;
     } else if(value->kind==ProcObjectKind::PidFile && value->index==PROC_PID_ROOT) {
         FsSnapshot fs{};int error=ProcAcquireFsTarget(value->pid,value->incarnation,value->tgid,value->group,&fs);
-        if(!error)error=VfsPathDirectoryPathFromCallback(fs.root,target,sizeof(target));
+        if(!error)error=VfsPathDirectoryPathFromCallback(fs.root,target,target.capacity());
         FsSnapshotRelease(&fs);if(error)return error;
     } else return -22;
     uint32_t bytes=ProcStrLen(target);if(bytes>capacity)bytes=capacity;
