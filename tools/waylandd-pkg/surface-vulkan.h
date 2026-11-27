@@ -38,7 +38,7 @@ static int surface_vulkan_direct(struct brook_surface *root,struct brook_image *
     if(!direct){direct=brook_vk_surface_create(0);if(!direct){disabled=1;return 0;}}
     struct BrookVkSurfaceExternalLayer layer={sourceFd,syncFd,(size_t)bytes/4,db->offset/4,db->stride/4,
         image->width,image->height,g->sx/256,g->sy/256,g->sw/256,g->sh/256,0,0,logical_to_physical(g->w,scale),logical_to_physical(g->h,scale),
-        0,0,root->vfb_w,root->vfb_h,255,db->fourcc==0x34325258?(BROOK_VK_STRAIGHT_ALPHA|BROOK_VK_OPAQUE_SOURCE):0};
+        0,0,root->vfb_w,root->vfb_h,255,(db->fourcc==0x34325258 || view->opaque)?(BROOK_VK_STRAIGHT_ALPHA|BROOK_VK_OPAQUE_SOURCE):0};
     BrookVkResult result=brook_vk_surface_compose_external(direct,root->vfb_w,root->vfb_h,&layer,1,root->composite,pixels);
     if(result==BROOK_VK_UNCERTAIN){disabled=1;fprintf(stderr,"[waylandd] direct producer GPU read uncertain; release withheld\n");return -1;}
     if(result!=BROOK_VK_COMPLETE)return 0;

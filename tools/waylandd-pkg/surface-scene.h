@@ -448,7 +448,8 @@ static int surface_render(struct brook_surface *root) {
            root->vfb_w==image->width && root->vfb_h==image->height){
             writeGuard=surface_begin_source_write(root,&writeIncarnation);if(!writeGuard)return 1;
             surface_layer_trace(root,draws,count,LAYER_PATH_SINGLE);
-            brook_straight_rows(root->vfb,root->vfb_stride,image->pixels,image->width,root->vfb_w,root->vfb_h);
+            brook_publish_native_rows(root->vfb,root->vfb_stride,image->pixels,image->width,root->vfb_w,root->vfb_h,
+                                      view->opaque?BROOK_BLIT_FORCE_ALPHA:0);
             goto publish;
         }
     }
@@ -476,7 +477,8 @@ static int surface_render(struct brook_surface *root) {
             writeGuard=surface_begin_source_write(root,&writeIncarnation);if(!writeGuard)return 1;
             surface_layer_trace(root,draws,count,LAYER_PATH_SINGLE);
             brook_publish_native_rows(root->vfb,root->vfb_stride,src,image->width,
-                                      root->vfb_w,root->vfb_h,image->opaque);
+                                      root->vfb_w,root->vfb_h,
+                                      image->opaque?1:view->opaque?BROOK_BLIT_FORCE_ALPHA:0);
             goto publish;
         }
     }
@@ -491,7 +493,8 @@ static int surface_render(struct brook_surface *root) {
         physical.h=logical_to_physical(d->y+g->h,scale)-dy;
         /* Bit-exact with pixel_over over brook_geometry_pixel samples; see
          * surface-blit.h. The first layer lands on the cleared composite. */
-        unsigned flags=(image->opaque?BROOK_BLIT_OPAQUE:0)|(i==0?BROOK_BLIT_DST_CLEAR:0);
+        unsigned flags=(image->opaque?BROOK_BLIT_OPAQUE:view->opaque?BROOK_BLIT_FORCE_ALPHA:0)|
+            (i==0?BROOK_BLIT_DST_CLEAR:0);
         if (!brook_blit_draw(root->composite,root->vfb_w,root->vfb_h,&physical,image->pixels,
                              image->width,image->height,dx,dy,flags)) return 0;
     }
