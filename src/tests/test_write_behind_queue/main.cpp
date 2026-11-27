@@ -1,4 +1,5 @@
 #include "../../kernel/src/fs/write_behind_queue.h"
+#include "../../kernel/src/fs/ext2_sequential_read.h"
 #include <array>
 #include <vector>
 #include <algorithm>
@@ -42,6 +43,34 @@ int main() {
         assert(read[i]==expected);
     }
     assert(f.q.Drain(f.disk)==R::Ok && f.disk.calls==1 && f.disk.flushes==1 && !f.q.count);
+    // Same-file data can expand across its pending inode update. The final
+    // inode must still come after the whole run. A different file is a barrier.
+    using K=WriteBehindQueue::Kind;
+    Fixture stream;
+    assert(stream.q.Write(stream.disk,100,a.data(),32,1,K::Data,7));
+    assert(stream.q.Write(stream.disk,600,a.data(),16,1,K::Inode,7));
+    assert(stream.q.Write(stream.disk,132,b.data(),32,1,K::Data,7));
+    assert(stream.q.Write(stream.disk,600,b.data(),16,1,K::Inode,7));
+    assert(stream.q.count==2 && stream.q.records[0].size==64);
+    assert(stream.q.Read(stream.disk,100,read.data(),64));
+    assert(std::all_of(read.begin(),read.begin()+32,[](auto byte){return byte==17;}));
+    assert(std::all_of(read.begin()+32,read.begin()+64,[](auto byte){return byte==39;}));
+    assert(stream.q.Write(stream.disk,164,a.data(),32,1,K::Data,8));
+    assert(stream.q.Drain(stream.disk)==R::Ok);
+    assert(stream.disk.order==std::vector<uint64_t>({100,600,164}));
+    assert(stream.disk.data[600]==39);
+
+    brook::Ext2SequentialRead predictor;
+    assert(predictor.Observe(0,16384)==0);
+    predictor.Complete(0,16384);
+    assert(predictor.Observe(16384,4096)==128*1024);
+    for(unsigned i=0;i<5;++i)predictor.Filled();
+    assert(predictor.Observe(16384,4096)==1024*1024);
+    assert(predictor.Observe(65536,4096)==0);
+    predictor.Complete(65536,4096);
+    assert(predictor.Observe(69632,4096)==0);
+    predictor.Complete(69632,0);
+    assert(predictor.window==128*1024 && predictor.sequential==0);
     // Descriptor pressure drains before admitting a fifth disjoint record.
     Fixture pressure;
     for(unsigned i=0;i<5;++i)assert(pressure.q.Write(pressure.disk,i*100,a.data(),8,i+1));

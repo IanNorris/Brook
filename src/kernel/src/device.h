@@ -47,6 +47,8 @@ enum class UsbReadSource : uint8_t { Boot, File, Exec, Fault, Inode, Indirect, D
 constexpr unsigned UsbReadSourceCount=unsigned(UsbReadSource::Count);
 constexpr unsigned UsbReadBuckets=5;
 static constexpr uint32_t DEVICE_IOCTL_USB_TAGGED_READ = 0x4246000c;
+// Read-only policy query on the admitted USB system adapter.
+static constexpr uint32_t DEVICE_IOCTL_EXT2_STREAM_IO = 0x4246000d;
 struct UsbTaggedRead { uint64_t offset; void* data; uint64_t bytes; UsbReadSource source; };
 struct UsbReadHistogram { uint64_t requests[UsbReadBuckets]; uint64_t bytes; };
 // Snapshot transport command timings; no device I/O.

@@ -9,6 +9,7 @@
 
 #include "ext2_vfs.h"
 #include "fs/write_behind_queue.h"
+#include "fs/ext2_sequential_read.h"
 #include "vfs.h"
 #include "vfs_object.h"
 #include "mount_namespace.h"
@@ -210,6 +211,7 @@ struct Ext2Mount {
     uint32_t cacheNamespace; // unique for this mount's lifetime, including remounts
     bool taggedReads;
     uint32_t readBurst;      // maximum coalesced data read in bytes
+    bool sequentialReads;
     uint32_t blockSize;      // bytes per block
     uint32_t blockShift;     // log2(blockSize)
     uint32_t inodeSize;      // bytes per inode on disk
@@ -305,9 +307,13 @@ struct Ext2Mount {
     // number.  Each slot stores a full block (blockSize bytes).
     // Invalidated on Ext2WriteBlock.  ~32 MB for 4KB blocks.
     static constexpr uint32_t BLOCK_CACHE_SLOTS = 8192;
+    // At most 2 GiB of cached 4 KiB frames on a large USB system.
+    static constexpr uint32_t MAX_BLOCK_CACHE_SLOTS = 524288;
+    uint32_t blockCacheSlots;
+    uint32_t blockCacheReclaimCursor;
     SpinLock blockCacheLock;
-    uint32_t* blockCacheBlockNum;  // [BLOCK_CACHE_SLOTS]; 0 = empty
-    uint8_t** blockCacheData;      // [BLOCK_CACHE_SLOTS]; lazy-alloced per slot
+    uint32_t* blockCacheBlockNum;  // [blockCacheSlots]; 0 = empty
+    uint8_t** blockCacheData;      // [blockCacheSlots]; lazy-alloced per slot
 
     // --- Access control ---
     // When true, Unix permission checks are skipped for this mount.
@@ -329,7 +335,11 @@ struct Ext2DirentCacheEntry {
 };
 
 static uint32_t g_ext2AutoSyncOps = 256;
-static uint32_t g_ext2WritebackMiB = 0; // opt-in until native acceptance
+// The sentinel selects the per-device default. A QEMU setting can supply an
+// explicit control without changing hardware defaults.
+static uint32_t g_ext2WritebackMiB = ~uint32_t{0};
+static uint32_t g_ext2SequentialReads = 2; // 0 off, 1 all, 2 opted-in direct USB
+
 static uint32_t g_ext2WritebackMs = 1000;
 static bool g_ext2QueueAvailable = true;
 static bool g_ext2SynchronousFallback = false;
@@ -521,6 +531,7 @@ struct Ext2FilePriv {
     uint32_t   inode;
     Ext2Inode  inodeData;
     Ext2OpenInode* hold;
+    Ext2SequentialRead sequential{};
 };
 
 // Per-open-dir state
@@ -634,7 +645,8 @@ static bool Ext2WriteFenced(void* privateMount) {
 }
 
 // Write exactly `len` bytes to device at `byteOffset`.
-static bool Ext2DevWrite(Ext2Mount* mnt, uint64_t byteOffset, const void* buf, uint64_t len)
+static bool Ext2DevWrite(Ext2Mount* mnt, uint64_t byteOffset, const void* buf, uint64_t len,
+                         WriteBehindQueue::Kind kind=WriteBehindQueue::Kind::Other,uint32_t file=0)
 {
     if(Ext2WriteFenced(mnt))return false;
     Ext2RawBackend io{mnt};
@@ -647,7 +659,7 @@ static bool Ext2DevWrite(Ext2Mount* mnt, uint64_t byteOffset, const void* buf, u
         return io.Write(byteOffset,buf,len);
     }
     const bool ok=mnt->writeback.Write(io,byteOffset,buf,len,
-                                     mnt->writeback.count?mnt->writeback.oldestNs:RtcNowNs());
+                                     mnt->writeback.count?mnt->writeback.oldestNs:RtcNowNs(),kind,file);
     if(!ok) {
         mnt->deferredSyncError=-5;
         if(mnt->writeback.retry && !mnt->writeback.oldestNs)mnt->writeback.oldestNs=RtcNowNs();
@@ -751,16 +763,16 @@ static void Ext2DirentCacheInvalidateParent(Ext2Mount* mnt, uint32_t parentIno)
 volatile uint64_t g_blockCacheHits;
 volatile uint64_t g_blockCacheMisses;
 
-static inline uint32_t Ext2BlockCacheSlot(uint32_t blockNum)
+static inline uint32_t Ext2BlockCacheSlot(const Ext2Mount* mnt, uint32_t blockNum)
 {
-    return blockNum & (Ext2Mount::BLOCK_CACHE_SLOTS - 1);
+    return blockNum & (mnt->blockCacheSlots - 1);
 }
 
 // Look up a cached data block. Returns true and copies into `buf` on hit.
 static bool Ext2BlockCacheLookup(Ext2Mount* mnt, uint32_t blockNum, void* buf)
 {
     if (!mnt->blockCacheBlockNum) return false;
-    uint32_t slot = Ext2BlockCacheSlot(blockNum);
+    uint32_t slot = Ext2BlockCacheSlot(mnt, blockNum);
     SpinLockAcquire(&mnt->blockCacheLock);
     if (mnt->blockCacheBlockNum[slot] == blockNum && mnt->blockCacheData[slot]) {
         memcpy(buf, mnt->blockCacheData[slot], mnt->blockSize);
@@ -777,7 +789,7 @@ static bool Ext2BlockCacheLookup(Ext2Mount* mnt, uint32_t blockNum, void* buf)
 static void Ext2BlockCachePut(Ext2Mount* mnt, uint32_t blockNum, const void* buf)
 {
     if (!mnt->blockCacheBlockNum) return;
-    uint32_t slot = Ext2BlockCacheSlot(blockNum);
+    uint32_t slot = Ext2BlockCacheSlot(mnt, blockNum);
     // Allocate outside the cache lock: allocation may reclaim or synchronize
     // memory and must never extend a cache critical section into a wait cycle.
     SpinLockAcquire(&mnt->blockCacheLock);
@@ -788,6 +800,10 @@ static void Ext2BlockCachePut(Ext2Mount* mnt, uint32_t blockNum, const void* buf
         return;
     }
     SpinLockRelease(&mnt->blockCacheLock);
+#ifndef BROOK_HOST_TEST
+    if (mnt->blockCacheSlots > Ext2Mount::BLOCK_CACHE_SLOTS &&
+        PmmGetFreePageCount() < 128 * 1024 * 1024 / 4096) return;
+#endif
     uint8_t* candidate = nullptr;
     {
         if (mnt->blockSize <= 4096) {
@@ -819,7 +835,7 @@ static void Ext2BlockCachePut(Ext2Mount* mnt, uint32_t blockNum, const void* buf
 static void Ext2BlockCacheInvalidate(Ext2Mount* mnt, uint32_t blockNum)
 {
     if (!mnt->blockCacheBlockNum) return;
-    uint32_t slot = Ext2BlockCacheSlot(blockNum);
+    uint32_t slot = Ext2BlockCacheSlot(mnt, blockNum);
     SpinLockAcquire(&mnt->blockCacheLock);
     if (mnt->blockCacheBlockNum[slot] == blockNum)
         mnt->blockCacheBlockNum[slot] = 0;
@@ -869,7 +885,7 @@ static void Ext2AssertWriteLocked() {
 #endif
 
 // Write a single block from buf.
-static bool Ext2WriteBlock(Ext2Mount* mnt, uint32_t blockNum, const void* buf)
+static bool Ext2WriteBlock(Ext2Mount* mnt, uint32_t blockNum, const void* buf,uint32_t file=0)
 {
 #ifndef NDEBUG
     Ext2AssertWriteLocked();
@@ -880,7 +896,8 @@ static bool Ext2WriteBlock(Ext2Mount* mnt, uint32_t blockNum, const void* buf)
     Ext2InvalidateIndirectRun(mnt, blockNum, 1);
     // Invalidate the data block cache.
     Ext2BlockCacheInvalidate(mnt, blockNum);
-    return Ext2DevWrite(mnt, off, buf, mnt->blockSize);
+    return Ext2DevWrite(mnt, off, buf, mnt->blockSize,
+        file?WriteBehindQueue::Kind::Data:WriteBehindQueue::Kind::Other,file);
 }
 
 // Write an inode back to disk.
@@ -901,7 +918,9 @@ static bool Ext2WriteInode(Ext2Mount* mnt, uint32_t ino, const Ext2Inode* data)
     const auto last = uint32_t((inodeOff + sizeof(*data) - 1) >> mnt->blockShift);
     Ext2BlockCacheInvalidate(mnt, first);
     if (last != first) Ext2BlockCacheInvalidate(mnt, last);
-    bool ok = Ext2DevWrite(mnt, inodeOff, data, sizeof(Ext2Inode));
+    const bool regular=(data->i_mode&EXT2_S_IFMT)==EXT2_S_IFREG;
+    bool ok = Ext2DevWrite(mnt, inodeOff, data, sizeof(Ext2Inode),
+        regular?WriteBehindQueue::Kind::Inode:WriteBehindQueue::Kind::Other,regular?ino:0);
     if (ok) Ext2InodeCachePut(mnt, ino, data);
     return ok;
 }
@@ -1503,10 +1522,9 @@ static uint32_t Ext2AppendEnsureBlock(Ext2AppendBatch& batch, Ext2Inode* ino,
     return parent;
 }
 
-// Optimize only large, aligned EOF appends. Existing small writes and
-// overwrites keep their original path and allocation behavior. Scratch frames
-// are kernel-owned and never mapped to users; they do not perturb first-fit
-// heap placement during an extraction followed by a small-file workload.
+// Append in bounded batches, publishing data before new indirect pointers
+// and the inode size. The write-behind path also batches unaligned appends.
+// Scratch frames are kernel-owned and never mapped to users.
 static int Ext2AppendInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
                                const void* buf, uint64_t len, uint64_t offset)
 {
@@ -1516,48 +1534,68 @@ static int Ext2AppendInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
     while (done < len) {
         batch.Reset();
         Ext2Inode staged = *ino;
-        uint64_t chunk = len - done;
-        if (chunk > 64 * 1024) chunk = 64 * 1024;
-        uint32_t blocks = static_cast<uint32_t>((chunk + mnt->blockSize - 1)
-                                               >> mnt->blockShift);
+        const uint32_t headOffset=uint32_t(offset+done)&(mnt->blockSize-1);
+        const uint64_t capacity=64*1024-headOffset;
+        const uint64_t chunk=len-done<capacity?len-done:capacity;
+        const uint32_t blocks=static_cast<uint32_t>((headOffset+chunk+mnt->blockSize-1)
+                                                    >>mnt->blockShift);
         uint32_t diskBlocks[64];
-        uint32_t first = static_cast<uint32_t>((offset + done) >> mnt->blockShift);
-        for (uint32_t i = 0; i < blocks; ++i) {
-            diskBlocks[i] = Ext2AppendEnsureBlock(batch, &staged, first + i);
+        const uint32_t first=static_cast<uint32_t>((offset+done)>>mnt->blockShift);
+        bool headFresh=false;
+        for (uint32_t i=0;i<blocks;++i) {
+            diskBlocks[i]=Ext2AppendEnsureBlock(batch,&staged,first+i,i?nullptr:&headFresh);
             if (!diskBlocks[i]) {
                 // Earlier chunks are committed: report them like a short write.
-                const int error = batch.Rollback() ? batch.error : -5;
-                return done ? static_cast<int>(done) : error;
+                const int error=batch.Rollback()?batch.error:-5;
+                return done?static_cast<int>(done):error;
             }
         }
-        uint32_t fullBlocks = static_cast<uint32_t>(chunk >> mnt->blockShift);
-        for (uint32_t i = 0; i < fullBlocks;) {
-            uint32_t run = 1;
-            while (i + run < fullBlocks && diskBlocks[i + run] == diskBlocks[i] + run)
-                ++run;
-            for (uint32_t b = 0; b < run; ++b)
-                Ext2BlockCacheInvalidate(mnt, diskBlocks[i + b]);
-            Ext2InvalidateIndirectRun(mnt, diskBlocks[i], run);
-            if (!Ext2DevWrite(mnt, static_cast<uint64_t>(diskBlocks[i]) << mnt->blockShift,
-                              src + done + (static_cast<uint64_t>(i) << mnt->blockShift),
-                              static_cast<uint64_t>(run) << mnt->blockShift)) {
+
+        uint32_t index=0;
+        uint64_t written=0;
+        if (headOffset) {
+            uint8_t* data=batch.Tail();
+            if (!data || (!headFresh && !Ext2ReadBlock(mnt,diskBlocks[0],data))) {
+                const int error=batch.Rollback()?batch.error:-5;
+                return done?static_cast<int>(done):error;
+            }
+            if (headFresh) memset(data,0,headOffset);
+            const uint64_t room=mnt->blockSize-headOffset;
+            written=chunk<room?chunk:room;
+            memcpy(data+headOffset,src+done,written);
+            if (written<room) memset(data+headOffset+written,0,room-written);
+            if (!Ext2WriteBlock(mnt,diskBlocks[index++],data,inoNum)) {
                 batch.Rollback();
                 return -5;
             }
-            i += run;
         }
-        uint32_t tail = static_cast<uint32_t>(chunk & (mnt->blockSize - 1));
-        if (tail) {
-            uint8_t* data = batch.Tail();
-            if (!data) {
-                const int error = batch.Rollback() ? batch.error : -5;
-                return done ? static_cast<int>(done) : error;
+
+        while (chunk-written>=mnt->blockSize) {
+            const uint32_t full=static_cast<uint32_t>((chunk-written)>>mnt->blockShift);
+            uint32_t run=1;
+            while (run<full && diskBlocks[index+run]==diskBlocks[index]+run) ++run;
+            for (uint32_t b=0;b<run;++b)
+                Ext2BlockCacheInvalidate(mnt,diskBlocks[index+b]);
+            Ext2InvalidateIndirectRun(mnt,diskBlocks[index],run);
+            const uint64_t bytes=uint64_t(run)<<mnt->blockShift;
+            if (!Ext2DevWrite(mnt,uint64_t(diskBlocks[index])<<mnt->blockShift,
+                              src+done+written,bytes,WriteBehindQueue::Kind::Data,inoNum)) {
+                batch.Rollback();
+                return -5;
             }
-            // The append starts at a block boundary; bytes beyond its final
-            // EOF are not old file contents and must not expose disk residue.
-            memset(data, 0, mnt->blockSize);
-            memcpy(data, src + done + (static_cast<uint64_t>(fullBlocks) << mnt->blockShift), tail);
-            if (!Ext2WriteBlock(mnt, diskBlocks[fullBlocks], data)) {
+            index+=run;
+            written+=bytes;
+        }
+        if (written<chunk) {
+            uint8_t* data=batch.Tail();
+            if (!data) {
+                const int error=batch.Rollback()?batch.error:-5;
+                return done?static_cast<int>(done):error;
+            }
+            // Beyond the old EOF, bytes outside the write must read as zero.
+            memset(data,0,mnt->blockSize);
+            memcpy(data,src+done+written,chunk-written);
+            if (!Ext2WriteBlock(mnt,diskBlocks[index],data,inoNum)) {
                 batch.Rollback();
                 return -5;
             }
@@ -1599,8 +1637,9 @@ static int Ext2WriteInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
     if (!len) return 0;
     if (regular && !Ext2EnsureLargeFile(mnt, offset + len)) return -5;
     const uint64_t oldSize = Ext2InodeSize(ino);
-    if (regular && mnt->blockSize <= 4096 && len >= 64 * 1024 &&
-        offset == oldSize && (offset & (mnt->blockSize - 1)) == 0) {
+    const uint32_t minimumAppend=mnt->writeback.bytes?mnt->blockSize:64*1024;
+    if (regular && mnt->blockSize <= 4096 && len >= minimumAppend &&
+        offset == oldSize && (mnt->writeback.bytes || (offset & (mnt->blockSize - 1)) == 0)) {
         // A batch allocates a whole 64 KiB chunk or nothing. When none fits,
         // fall back to block-at-a-time so a nearly full filesystem still
         // takes the bytes that fit before ENOSPC.
@@ -1610,6 +1649,9 @@ static int Ext2WriteInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
 
     auto* src = static_cast<const uint8_t*>(buf);
     uint64_t bytesWritten = 0;
+    const auto original=*ino;
+    const auto kind=regular?WriteBehindQueue::Kind::Data:WriteBehindQueue::Kind::Other;
+    const uint32_t file=regular?inoNum:0;
 
     // Cap run-coalesce length to match read path / virtio DMA buffer.
     static constexpr uint64_t MAX_RUN_BYTES = 64 * 1024;
@@ -1655,7 +1697,7 @@ static int Ext2WriteInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
 
             Ext2InvalidateIndirectRun(mnt, diskBlock, runBlocks);
 
-            if (!Ext2DevWrite(mnt, runOff, src + bytesWritten, runBytes)) break;
+            if (!Ext2DevWrite(mnt, runOff, src + bytesWritten, runBytes,kind,file)) break;
             bytesWritten += runBytes;
         } else {
             // Partial block: read-modify-write via bounce buffer.
@@ -1666,7 +1708,7 @@ static int Ext2WriteInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
                 // Full block but couldn't coalesce (shouldn't normally happen)
                 Ext2BlockCacheInvalidate(mnt, diskBlock);
                 if (!Ext2DevWrite(mnt, static_cast<uint64_t>(diskBlock) << mnt->blockShift,
-                                  src + bytesWritten, mnt->blockSize))
+                                  src + bytesWritten, mnt->blockSize,kind,file))
                     break;
             } else {
                 // A newly allocated block holds whatever a previous owner
@@ -1674,7 +1716,7 @@ static int Ext2WriteInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
                 if (fresh) memset(blockBuf, 0, mnt->blockSize);
                 else if (!Ext2ReadBlock(mnt, diskBlock, blockBuf)) break;
                 memcpy(blockBuf + blockOff, src + bytesWritten, toCopy);
-                if (!Ext2WriteBlock(mnt, diskBlock, blockBuf)) break;
+                if (!Ext2WriteBlock(mnt, diskBlock, blockBuf,file)) break;
             }
             bytesWritten += toCopy;
         }
@@ -1682,14 +1724,16 @@ static int Ext2WriteInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
 
     kfree(blockBuf);
 
-    // Update inode size if we extended the file, and unconditionally
-    // write the inode back so any newly-allocated i_block[] entries
-    // assigned by Ext2EnsureBlock are persisted (it no longer flushes
-    // the inode itself per allocation).
-    uint64_t newEnd = offset + bytesWritten;
-    if (newEnd > oldSize) Ext2SetInodeSize(ino, newEnd);
-    if (bytesWritten) Ext2Touch(ino);
-    Ext2WriteInode(mnt, inoNum, ino);
+    // An overwrite within one timestamp tick may leave the inode unchanged.
+    // Skip that record so adjacent data can coalesce. Preserve any changed
+    // block mappings even when a later allocation or write was short.
+    if (bytesWritten) {
+        const uint64_t newEnd=offset+bytesWritten;
+        if (newEnd>oldSize) Ext2SetInodeSize(ino,newEnd);
+        Ext2Touch(ino);
+    }
+    if ((!mnt->writeback.bytes || memcmp(&original,ino,sizeof(original))) &&
+        !Ext2WriteInode(mnt,inoNum,ino)) return -5;
 
     return bytesWritten ? static_cast<int>(bytesWritten) : error;
 }
@@ -2549,6 +2593,64 @@ static int Ext2FileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
     return Ext2FileReadKernel(vn,buf,len,offset);
 }
 
+// Read only the mapped extent containing the demand block. All cache
+// publication is under the filesystem read lock, excluding block reuse.
+static bool Ext2Prefetch(Ext2Mount* mnt,const Ext2Inode& inode,uint64_t offset,
+                         uint64_t requested,uint32_t window)
+{
+    const auto size=Ext2InodeSize(&inode);
+    if (!window || offset>=size || !mnt->blockCacheData) return false;
+#ifndef BROOK_HOST_TEST
+    if (PmmGetFreePageCount()<128*1024*1024/4096) return false;
+#endif
+    // Requests often start in the cached tail of the preceding request.
+    // Look for the first miss in this demand span instead of waiting for a
+    // syscall to start exactly on the next cold block.
+    if (requested>64*1024) requested=64*1024;
+    if (requested>size-offset) requested=size-offset;
+    const uint32_t last=static_cast<uint32_t>((offset+requested-1)>>mnt->blockShift);
+    uint32_t first=static_cast<uint32_t>(offset>>mnt->blockShift);
+    uint32_t diskBlock=0;
+    for (;;) {
+        const auto mapped=Ext2BlockMap(mnt,&inode,first);
+        if (mapped.failed) return false;
+        if (mapped.block) {
+            const uint32_t slot=Ext2BlockCacheSlot(mnt,mapped.block);
+            SpinLockAcquire(&mnt->blockCacheLock);
+            const bool cached=mnt->blockCacheBlockNum[slot]==mapped.block;
+            SpinLockRelease(&mnt->blockCacheLock);
+            if (!cached) {
+                diskBlock=mapped.block;
+                break;
+            }
+        }
+        if (first==last) return false;
+        ++first;
+    }
+
+    uint32_t limit=(window<mnt->readBurst?window:mnt->readBurst)>>mnt->blockShift;
+    const uint64_t available=((size-1)>>mnt->blockShift)-first+1;
+    if (limit>available) limit=static_cast<uint32_t>(available);
+    uint32_t count=1;
+    while (count<limit) {
+        const auto next=Ext2BlockMap(mnt,&inode,first+count);
+        if (next.failed || next.block!=diskBlock+count) break;
+        ++count;
+    }
+    if (count<2) return false;
+    const uint32_t bytes=count<<mnt->blockShift;
+    auto* data=static_cast<uint8_t*>(kmalloc(bytes));
+    if (!data) return false;
+    const bool read=Ext2DevRead(mnt,uint64_t(diskBlock)<<mnt->blockShift,data,bytes,
+                              0,nullptr,UsbReadSource::File);
+    if (read) {
+        for (uint32_t i=0;i<count;++i)
+            Ext2BlockCachePut(mnt,diskBlock+i,data+(i<<mnt->blockShift));
+    }
+    kfree(data);
+    return read;
+}
+
 static int Ext2FileReadKernel(Vnode* vn,void* buf,uint64_t len,uint64_t* offset,
                               uint64_t physical,bool* retain,UsbReadSource source)
 {
@@ -2558,7 +2660,24 @@ static int Ext2FileReadKernel(Vnode* vn,void* buf,uint64_t len,uint64_t* offset,
     if (!Ext2ReadInode(fp->mnt, fp->inode, &data)) {
         KRwLockReadUnlock(&g_ext2Lock); return -5;
     }
-    int r = Ext2ReadInodeData(fp->mnt,&data,buf,len,*offset,physical,retain,source);
+    auto* mount=fp->mnt;
+    const bool sequential=mount->sequentialReads && source==UsbReadSource::File &&
+        len && len<=Ext2SequentialRead::Maximum;
+    const uint64_t begin=*offset;
+    uint32_t window=0;
+    if (sequential) {
+        SpinLockAcquire(&mount->blockCacheLock);
+        window=fp->sequential.Observe(begin,static_cast<uint32_t>(len));
+        SpinLockRelease(&mount->blockCacheLock);
+    }
+    const bool filled=Ext2Prefetch(mount,data,begin,len,window);
+    int r = Ext2ReadInodeData(mount,&data,buf,len,begin,physical,retain,source);
+    if (sequential) {
+        SpinLockAcquire(&mount->blockCacheLock);
+        fp->sequential.Complete(begin,r>0?static_cast<uint32_t>(r):0);
+        if (filled) fp->sequential.Filled();
+        SpinLockRelease(&mount->blockCacheLock);
+    }
     if (r > 0) *offset += r;
     KRwLockReadUnlock(&g_ext2Lock);
     // Relatime: avoid a metadata write for every read. Re-read under the
@@ -3334,7 +3453,21 @@ static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
     const int preferred=dev->ops->ioctl?dev->ops->ioctl(dev,DEVICE_IOCTL_PREFERRED_READ_BYTES,nullptr):0;
     mnt->taggedReads=dev->ops->ioctl &&
         dev->ops->ioctl(dev,DEVICE_IOCTL_USB_TAGGED_READ,nullptr)==1;
-    mnt->readBurst=preferred>=int(blockSize) && preferred<=(1<<20)?uint32_t(preferred):65536;
+    const bool directUsb=mnt->hasWriteFence && mnt->taggedReads;
+    const bool streamIo=dev->ops->ioctl &&
+        dev->ops->ioctl(dev,DEVICE_IOCTL_EXT2_STREAM_IO,nullptr)==1;
+    mnt->sequentialReads=g_ext2SequentialReads==1 || (g_ext2SequentialReads==2 && directUsb && streamIo);
+    mnt->readBurst=preferred>=int(blockSize) && preferred<=(1<<20)?uint32_t(preferred):
+        (mnt->sequentialReads?256*1024:65536);
+    mnt->blockCacheSlots=Ext2Mount::BLOCK_CACHE_SLOTS;
+#ifndef BROOK_HOST_TEST
+    if (mnt->sequentialReads && blockSize==4096) {
+        const uint64_t budget=PmmGetFreePageCount()/4;
+        while (mnt->blockCacheSlots<Ext2Mount::MAX_BLOCK_CACHE_SLOTS &&
+               uint64_t(mnt->blockCacheSlots)*2<=budget)
+            mnt->blockCacheSlots*=2;
+    }
+#endif
     mnt->blockSize      = blockSize;
     mnt->blockShift     = blockShift;
     mnt->inodeSize      = inodeSize;
@@ -3402,32 +3535,35 @@ static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
         memset(mnt->direntCache, 0, EXT2_DIRENT_CACHE_SIZE * sizeof(Ext2DirentCacheEntry));
     }
 
-    // Data block read cache: 8192 direct-mapped slots.
-    // Pointer array ~64 KB; block buffers lazy-alloced on first use (~32 MB at full capacity).
+    // Block buffers are allocated on first use. On allocation failure,
+    // fall back to the original smaller table before giving up caching.
     mnt->blockCacheLock = SpinLock{};
-    mnt->blockCacheBlockNum = static_cast<uint32_t*>(
-        kmalloc(Ext2Mount::BLOCK_CACHE_SLOTS * sizeof(uint32_t)));
-    mnt->blockCacheData = static_cast<uint8_t**>(
-        kmalloc(Ext2Mount::BLOCK_CACHE_SLOTS * sizeof(uint8_t*)));
-    if (mnt->blockCacheBlockNum && mnt->blockCacheData) {
-        memset(mnt->blockCacheBlockNum, 0,
-               Ext2Mount::BLOCK_CACHE_SLOTS * sizeof(uint32_t));
-        memset(mnt->blockCacheData, 0,
-               Ext2Mount::BLOCK_CACHE_SLOTS * sizeof(uint8_t*));
-    } else {
-        // Non-fatal: cache just won't be used.
-        if (mnt->blockCacheBlockNum) { kfree(mnt->blockCacheBlockNum); mnt->blockCacheBlockNum = nullptr; }
-        if (mnt->blockCacheData) { kfree(mnt->blockCacheData); mnt->blockCacheData = nullptr; }
+    for (;;) {
+        const uint32_t slots=mnt->blockCacheSlots;
+        mnt->blockCacheBlockNum=static_cast<uint32_t*>(kmalloc(slots*sizeof(uint32_t)));
+        mnt->blockCacheData=static_cast<uint8_t**>(kmalloc(slots*sizeof(uint8_t*)));
+        if (mnt->blockCacheBlockNum && mnt->blockCacheData) {
+            memset(mnt->blockCacheBlockNum,0,slots*sizeof(uint32_t));
+            memset(mnt->blockCacheData,0,slots*sizeof(uint8_t*));
+            break;
+        }
+        if (mnt->blockCacheBlockNum) kfree(mnt->blockCacheBlockNum);
+        if (mnt->blockCacheData) kfree(mnt->blockCacheData);
+        mnt->blockCacheBlockNum=nullptr;
+        mnt->blockCacheData=nullptr;
+        if (slots==Ext2Mount::BLOCK_CACHE_SLOTS) break;
+        mnt->blockCacheSlots=Ext2Mount::BLOCK_CACHE_SLOTS;
     }
 
-    if(g_ext2WritebackMiB) {
+    const uint32_t writebackMiB=g_ext2WritebackMiB==~uint32_t{0}?(directUsb && streamIo?8:0):g_ext2WritebackMiB;
+    if(writebackMiB) {
         constexpr uint32_t slots=4096;
         auto* rows=static_cast<WriteBehindQueue::Record*>(kmalloc(slots*sizeof(WriteBehindQueue::Record)));
-        const uint32_t size=g_ext2WritebackMiB*1024*1024;
+        const uint32_t size=writebackMiB*1024*1024;
         auto* data=static_cast<uint8_t*>(kmalloc(size));
         if(rows && data)mnt->writeback.Init(rows,slots,data,size);
         else {if(rows)kfree(rows);if(data)kfree(data);}
-        SerialPrintf("ext2: pdrv %u write-behind %u bytes (requested %u MiB)\n",pdrv,mnt->writeback.byteCapacity,g_ext2WritebackMiB);
+        SerialPrintf("ext2: pdrv %u write-behind %u bytes (requested %u MiB)\n",pdrv,mnt->writeback.byteCapacity,writebackMiB);
     }
     *mountPriv = mnt;
     KRwLockWriteLock(&g_ext2Lock);
@@ -3482,7 +3618,7 @@ static int Ext2FsUnmount(void* mountPriv)
     if (mnt->nextFreeBlockHint) kfree(mnt->nextFreeBlockHint);
     if (mnt->nextFreeInodeHint) kfree(mnt->nextFreeInodeHint);
     if (mnt->blockCacheData) {
-        for (uint32_t slot = 0; slot < Ext2Mount::BLOCK_CACHE_SLOTS; ++slot) {
+        for (uint32_t slot = 0; slot < mnt->blockCacheSlots; ++slot) {
             auto* data = mnt->blockCacheData[slot];
             if (!data) continue;
             if (mnt->blockSize <= 4096)
@@ -3581,6 +3717,7 @@ static Vnode* Ext2VnodeFromHold(Ext2Mount* mnt,uint32_t ino,
         fp->inode = ino;
         fp->inodeData = inodeData;
         fp->hold = hold;
+        fp->sequential = {};
 
         auto* vn = static_cast<Vnode*>(kmalloc(sizeof(Vnode)));
         if (!vn) { kfree(fp); Ext2ReleaseInode(hold); return nullptr; }
@@ -5046,7 +5183,9 @@ void Ext2ConfigureAutoSync() {
     const uint32_t length=FwCfgReadFile("opt/ext2-auto-sync-ops",option,sizeof(option));
     g_ext2AutoSyncOps=Ext2ParseAutoSyncOps(option,length);
     const auto size=FwCfgReadFile("opt/ext2-writeback-mib",option,sizeof(option));
-    g_ext2WritebackMiB=Ext2ParseBounded(option,size,0,16,0);
+    g_ext2WritebackMiB=Ext2ParseBounded(option,size,0,16,~uint32_t{0});
+    const auto stream=FwCfgReadFile("opt/ext2-sequential-reads",option,sizeof(option));
+    g_ext2SequentialReads=Ext2ParseBounded(option,stream,0,2,2);
     const auto age=FwCfgReadFile("opt/ext2-writeback-ms",option,sizeof(option));
     g_ext2WritebackMs=Ext2ParseBounded(option,age,250,10000,1000);
     SerialPrintf("ext2: automatic sync every %u allocation/free operations\n",g_ext2AutoSyncOps);
@@ -5069,6 +5208,22 @@ static int Ext2BackgroundMaybeSync(Ext2Mount* mnt,uint64_t now,bool safetyPass) 
 #ifndef BROOK_HOST_TEST
 static bool g_ext2WritebackEnabled=false;
 static bool g_ext2WritebackStarted=false;
+// The worker holds the filesystem write lock here, so nobody can be
+// copying cache entries. Free only expanded-cache slots under pressure.
+static void Ext2ReclaimBlockCache(Ext2Mount* mount) {
+    if (!mount || !mount->blockCacheData || mount->blockCacheSlots==Ext2Mount::BLOCK_CACHE_SLOTS ||
+        PmmGetFreePageCount()>=128*1024*1024/4096) return;
+    for (uint32_t i=0;i<8192;++i) {
+        const uint32_t slot=mount->blockCacheReclaimCursor++ & (mount->blockCacheSlots-1);
+        auto* data=mount->blockCacheData[slot];
+        if (!data) continue;
+        mount->blockCacheData[slot]=nullptr;
+        mount->blockCacheBlockNum[slot]=0;
+        if (mount->blockSize<=4096)
+            PmmFreePage(VirtToPhys(VirtualAddress(reinterpret_cast<uint64_t>(data))));
+        else kfree(data);
+    }
+}
 static void Ext2WritebackWorker(void*) {
     uint64_t lastSafety=ApicTickCount();
     for(;;) {
@@ -5081,6 +5236,7 @@ static void Ext2WritebackWorker(void*) {
             if(safety)lastSafety=tick;
             for(uint32_t i=0;i<EXT2_MAX_MOUNTS;++i) {
                 (void)Ext2BackgroundMaybeSync(g_ext2Mounts[i],now,safety);
+                Ext2ReclaimBlockCache(g_ext2Mounts[i]);
             }
         }
         KRwLockWriteUnlock(&g_ext2Lock);

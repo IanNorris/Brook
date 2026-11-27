@@ -38,7 +38,7 @@ UsbSystemRecord record;
 LargeDataSession session;
 Device* disk;
 DeviceWriteWindow bootWindow{}, systemWindow{};
-bool ready, open, uncertain, clean, finalAttempted;
+bool ready, open, uncertain, clean, finalAttempted, ext2StreamIo;
 int finalError;
 uint64_t reads, writes, flushes, errors;
 
@@ -106,6 +106,7 @@ int Write(Device* owner,uint64_t offset,const void* data,uint64_t size) {
 }
 int Control(Device*,uint32_t request,void* argument) {
     if(request==DEVICE_IOCTL_READ_ONLY)return 0;
+    if(request==DEVICE_IOCTL_EXT2_STREAM_IO)return ext2StreamIo?1:0;
     if(request==DEVICE_IOCTL_PREFERRED_READ_BYTES)
         return disk->ops->ioctl(disk,request,nullptr);
     if(request==DEVICE_IOCTL_USB_TAGGED_READ) {
@@ -255,6 +256,9 @@ void UsbSystemConfigure() {
     VfsClose(node);
     boot.parsed=length>0 && length<int(sizeof(data)) && UsbSystemParse(data,length,record);
     if(!boot.parsed)return;
+    VnodeStat tuning{};
+    ext2StreamIo=!VfsLstatPath("/etc/ext2-stream-io",&tuning) &&
+        !tuning.isDir && !tuning.isSymlink;
     boot.firstLba=record.first;
     boot.sectors=record.sectors;
     ShowHex(boot.partitionGuid,record.guid);

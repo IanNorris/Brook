@@ -77,7 +77,7 @@ ETC_ALLOWED = {*MARKERS, 'i219-attach', 'i219-reset', 'hardware-payload-id', 're
                'keyboard-layout',
                'bridge-v3-operators', 'rtx-update-signer', 'restart-prompt-seconds',
                # --session desktop only
-               'live-store', 'usb-system', 'usb-system-no-fsck', 'usb-profile-plan.pub', 'usb-system-trim', 'usb-bot-legacy', 'usb-bot-pipeline', 'usb-uas', 'usb-uas-fixture', 'volatile-desktop', 'hardware-bulk', 'usb-audio-mixer', 'dp-idle-seconds', 'nv-display', 'chromium-alsa-device',
+               'live-store', 'usb-system', 'usb-system-no-fsck', 'ext2-stream-io', 'usb-profile-plan.pub', 'usb-system-trim', 'usb-bot-legacy', 'usb-bot-pipeline', 'usb-uas', 'usb-uas-fixture', 'volatile-desktop', 'hardware-bulk', 'usb-audio-mixer', 'dp-idle-seconds', 'nv-display', 'chromium-alsa-device',
                # --nv-gsp (GSP-RM M1 bridge verbs) and its firmware record
                'nv-gsp', 'nv-gsp-firmware', 'nv-gsp-no-autostart'}
 # Desktop live stick (--session desktop): the VMware RC session over the RAM
@@ -359,6 +359,8 @@ def desktop_payload(args, initrd):
         record = (f"BRKUSB1\n{uuid.UUID(ssd['partition_guid']).bytes_le.hex()}\n"
                   f"{int(ssd['first_lba'])},{int(ssd['sectors'])}\n{uuid.UUID(ssd['fs_uuid']).hex}\n")
         fat_write(initrd, 'ETC/usb-system', record.encode())
+        if args.ext2_stream_io:
+            fat_write(initrd, 'ETC/ext2-stream-io', b'1\n')
         if args.usb_uas:
             fat_write(initrd, 'ETC/usb-uas', b'1\n')
             if args.usb_uas_fixture:
@@ -640,6 +642,8 @@ def main():
                         'write-brook-ssd-system.sh\'s ssd-system.json (writes /etc/usb-system, not /etc/live-store)')
     p.add_argument('--profile-plan', type=Path, help='signed selected profile plan directory for --usb-system')
     p.add_argument('--profile-plan-public-key', type=Path, help='Ed25519 public key admitted by the USB set')
+    p.add_argument('--ext2-stream-io', action='store_true',
+                   help='enable sequential reads and ordered write-behind on BROOK_SYSTEM')
     p.add_argument('--usb-uas', action='store_true', help='try tagged USB Attached SCSI in SuperSpeed')
     p.add_argument('--usb-uas-fixture', action='store_true', help='permit QEMU UAS-only boot fixture discovery')
     p.add_argument('--usb-bot', choices=('default', 'legacy', 'pipeline'), default='default',
@@ -673,6 +677,8 @@ def main():
         p.error('Profile plans require --usb-system')
     if args.usb_uas_fixture and not args.usb_uas:
         p.error("--usb-uas-fixture needs --usb-uas")
+    if args.ext2_stream_io and not args.usb_system:
+        p.error("--ext2-stream-io needs --usb-system")
     if args.usb_uas and not args.usb_system:
         p.error("--usb-uas needs --usb-system")
     if args.usb_bot != "default" and not args.usb_system:

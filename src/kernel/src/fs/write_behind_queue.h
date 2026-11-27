@@ -6,7 +6,13 @@ namespace brook {
 // concurrently with other reads. All storage is supplied before use; no allocator
 // or filesystem callbacks are used here. Backend accesses the device directly.
 struct WriteBehindQueue {
-    struct Record { uint64_t offset; uint32_t size, payload; };
+    enum class Kind : uint8_t { Other, Data, Inode };
+    struct Record {
+        uint64_t offset;
+        uint32_t size, payload, file;
+        Kind kind;
+    };
+    static constexpr uint32_t MaximumDataRun=1024*1024;
     enum class Result { Ok, WriteError, FlushError };
     Record* records=nullptr;
     uint8_t* bytes=nullptr;
@@ -31,7 +37,7 @@ struct WriteBehindQueue {
         count=used=0;oldestNs=0;retry=false;return Result::Ok;
     }
     template<class Backend> bool Write(Backend& io,uint64_t offset,const void* source,
-                                       uint64_t length,uint64_t now) {
+                                       uint64_t length,uint64_t now,Kind kind=Kind::Other,uint32_t file=0) {
         if(poisoned)return false;
         if(!length)return true;
         if(length>~uint64_t{0}-offset)return false;
@@ -46,20 +52,38 @@ struct WriteBehindQueue {
             if(!ok){poisoned=true;++errors;}return ok;
         }
         if(count) {
-            auto& tail=records[count-1];const uint64_t end=offset+length;
+            auto& last=records[count-1];
+            // The only movable record is this same file's pending inode.
+            // Keeping it after newer data preserves the publication ordering.
+            // Indirect blocks, bitmaps, directories and other inodes are
+            // barriers and stay in arrival order.
+            const bool beforeInode=count>=2 && kind==Kind::Data && file &&
+                last.kind==Kind::Inode && last.file==file;
+            auto& tail=records[count-1-uint32_t(beforeInode)];
+            const uint64_t end=offset+length;
             const uint64_t tailEnd=tail.offset+tail.size;
-            if(offset<=tailEnd && end>=tail.offset) {
+            if(kind==tail.kind && tail.file==file && offset<=tailEnd && end>=tail.offset) {
                 const uint64_t start=offset<tail.offset?offset:tail.offset;
                 const uint64_t stop=end>tailEnd?end:tailEnd;
                 const uint64_t extent=stop-start;
-                // Tail is always the final arena allocation. Only its union
-                // changes; intervening record boundaries are never removed.
-                if(extent<=byteCapacity-tail.payload) {
-                    __builtin_memmove(bytes+tail.payload+(tail.offset-start),
-                                      bytes+tail.payload,tail.size);
+                const uint32_t retained=beforeInode?last.size:0;
+                // Reject aliases even though ext2 only tags allocated file
+                // data, because metadata must never overwrite a merged run.
+                const bool disjoint=!beforeInode || stop<=last.offset ||
+                    start>=last.offset+last.size;
+                if(disjoint && extent+retained<=byteCapacity-tail.payload &&
+                   (kind!=Kind::Data || extent<=MaximumDataRun)) {
+                    if(beforeInode) {
+                        const uint32_t next=tail.payload+static_cast<uint32_t>(extent);
+                        __builtin_memmove(bytes+next,bytes+last.payload,last.size);
+                        last.payload=next;
+                    }
+                    if(start!=tail.offset)
+                        __builtin_memmove(bytes+tail.payload+(tail.offset-start),
+                                          bytes+tail.payload,tail.size);
                     __builtin_memcpy(bytes+tail.payload+(offset-start),source,length);
                     tail.offset=start;tail.size=static_cast<uint32_t>(extent);
-                    used=tail.payload+tail.size;++merges;return true;
+                    used=tail.payload+tail.size+retained;++merges;return true;
                 }
             }
         }
@@ -67,7 +91,7 @@ struct WriteBehindQueue {
             ++capacityDrains;if(Drain(io)!=Result::Ok)return false;
         }
         if(!count)oldestNs=now;
-        records[count++]={offset,static_cast<uint32_t>(length),used};
+        records[count++]={offset,static_cast<uint32_t>(length),used,file,kind};
         __builtin_memcpy(bytes+used,source,length);used+=static_cast<uint32_t>(length);
         return true;
     }
