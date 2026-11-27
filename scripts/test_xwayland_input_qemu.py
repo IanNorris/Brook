@@ -70,6 +70,9 @@ def prepare_files(args):
     scratch.mkdir()
     manifest = json.loads((files / 'manifest.json').read_text())
     rc = mtype(initrd, 'BOOT/INIT.RC').decode()
+    if getattr(args, 'kernel', None):
+        shutil.copyfile(args.kernel, files / 'KERNEL/BROOK.ELF')
+        manifest['files']['KERNEL/BROOK.ELF'] = {'bytes': args.kernel.stat().st_size, 'sha256': sha(args.kernel)}
     if args.waylandd:
         mput(initrd, args.waylandd.read_bytes(), 'BOOT/BIN/WAYLANDD', scratch)
     if args.xwm:
@@ -102,6 +105,7 @@ def main():
         parser.add_argument('--' + name, type=Path, required=True)
     parser.add_argument('--waylandd', type=Path)
     parser.add_argument('--xwm', type=Path)
+    parser.add_argument('--kernel', type=Path, help='replace KERNEL/BROOK.ELF in the copied set')
     parser.add_argument('--accel', choices=('kvm', 'tcg'), default='kvm')
     parser.add_argument('--dialog-delay', type=int, default=45)
     args = parser.parse_args()
