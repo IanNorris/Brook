@@ -22,6 +22,10 @@ struct NvCeJob {
     uint64_t layer_phys = 0;       // the pixel at layer_dst's top-left
     uint32_t layer_stride = 0;     // bytes
     NvCeRect layer_dst{};
+    // Full-frame Glass output. A nonzero address selects a pitch-linear
+    // video-memory source instead of the system-memory shadow and layer.
+    uint64_t video_src = 0;        // byte address in the NVK VRAM heap
+    uint32_t video_pitch = 0;      // bytes
 };
 // kick: 1 = kicked (*ticket; the copy runs while the caller continues), 0 = not available
 //       (CPU copies), -1 = failed (CPU copies; CE now off).

@@ -292,10 +292,56 @@ static void TestExec(const DeviceInfo& dev) {
         DrmSyncobjTransfer bad{tl.handle, b2.handle, 9, 0, 0, 0}; assert(Io(f, NR_SYNCOBJ_TRANSFER, bad) == kEINVAL);
         assert(Exe(f, ca.channel, {{0x500000, 8, 0}}, {{SYNC_SYNCOBJ, tl.handle, 7}}) == kEINVAL);          // binary flag with a point
     }
+    // Blocking CPU_PREP uses a referenced snapshot. Another ioctl can replace
+    // the last EXEC while the caller sleeps; only the original EXEC is awaited.
+    {
+        CpuPrep prep{cp.handle, 0};
+        CpuPrepFences fences;
+        GpuFenceUnref(f.last_exec);
+        f.last_exec = GpuFenceCreate(false);
+        assert(SnapshotCpuPrep(f, prep, fences) == 0);
+        GpuFenceUnref(f.last_exec);
+        f.last_exec = GpuFenceCreate(false);
+        UserAccess sleeper = U;
+        sleeper.ctx = fences.exec;
+        sleeper.sleep_tick = [](void* fence) {
+            return GpuFenceComplete(static_cast<GpuFence*>(fence), true);
+        };
+        assert(WaitCpuPrep(sleeper, prep, fences) == 0);
+        assert(GpuFenceState(f.last_exec) == 0);
+    }
     // channel error: in-flight work fails, later EXECs are refused
     assert(Exe(f, ca.channel, {{0x400000, 8, 0}}, {}, {{SYNC_SYNCOBJ, s1.handle, 0}}) == 0 && hw.subs.size() == 4);
     hw.error = true;
     assert(wait(s1.handle) == -5 && c->dead && Exe(f, ca.channel, {{0x400000, 8, 0}}) == -19);
+    // A synchronous bind holds the file lock, so it must reap the same
+    // file's EXEC that an earlier async bind is waiting on.
+    {
+        NvChannelAlloc second{};
+        second.tt_ctxdma_handle = 0x01;
+        assert(NvIo(f, NV_CHANNEL_ALLOC, &second, sizeof(second)) == 0);
+        auto& secondHw = g_fake.chans[FindChannel(f, second.channel)->hw];
+        assert(Exe(f, second.channel, {{0x400000, 8, 0}}, {}, {{SYNC_SYNCOBJ, s1.handle, 0}}) == 0);
+        assert(Bind(f, {Map(cp.handle, 0x700000, 4096)}, VM_BIND_RUN_ASYNC,
+                    {{SYNC_SYNCOBJ, s1.handle, 0}}) == 0);
+        assert(f.job_count == 1);
+        BindOp op = Map(cp.handle, 0x800000, 4096);
+        VmBind bind{};
+        bind.op_count = 1;
+        bind.op_ptr = uint64_t(&op);
+        UserAccess sleeper = U;
+        sleeper.ctx = &secondHw;
+        sleeper.sleep_tick = [](void* ctx) {
+            auto& channel = *static_cast<Fake::Chan*>(ctx);
+            if (channel.completed) return false;
+            channel.completed = channel.subs.back().first;
+            return true;
+        };
+        assert(Ioctl(f, sleeper, Cmd(kDrmCommandBase + NV_VM_BIND, sizeof(bind)), uint64_t(&bind)) == 0);
+        assert(f.job_count == 0 && g_fake.vas[f.vas].count(0x700000) && g_fake.vas[f.vas].count(0x800000));
+        NvChannelFree freeSecond{second.channel};
+        assert(NvIo(f, NV_CHANNEL_FREE, &freeSecond, sizeof(freeSecond)) == 0);
+    }
     // CHANNEL_FREE and close destroy the backend channels
     NvChannelAlloc ce{}; ce.tt_ctxdma_handle = 0x30; assert(NvIo(f, NV_CHANNEL_ALLOC, &ce, sizeof(ce)) == 0 && g_fake.chans.size() == 2);
     NvChannelFree fr{ca.channel}; assert(NvIo(f, NV_CHANNEL_FREE, &fr, sizeof(fr)) == 0 && g_fake.chans.size() == 1);
@@ -309,7 +355,7 @@ static void TestExec(const DeviceInfo& dev) {
         assert(Exe(f, ce.channel, {{0x600000, 8, 0}}) == -19);
     }
     f.Close();
-    assert(g_fake.chans.empty() && g_fake.chans_destroyed == 2 && g_fake.vram_used() == 0 && g_fake.sys.empty());
+    assert(g_fake.chans.empty() && g_fake.chans_destroyed == 3 && g_fake.vram_used() == 0 && g_fake.sys.empty());
 }
 
 // ---- PRIME (nv_drm_prime.h): export/import between files, ownership, implicit fences --------

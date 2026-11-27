@@ -696,8 +696,44 @@ static void blur_bench(unsigned level)
             (unsigned long long)(after.tileRebuilds-before.tileRebuilds),(unsigned long long)(after.tileReuses-before.tileReuses));
     }
 }
+/* Source pitch need not match any natural VkImage rowPitch. A full-frame
+ * copy must preserve destination row padding. */
+static void optimal_output(void)
+{
+    enum { W=61,H=48,SOURCE_PITCH=67,SOURCE_OFFSET=3,PITCH=80 };
+    struct Gem src,out;
+    gem_new((uint64_t)(SOURCE_PITCH*H+SOURCE_OFFSET)*4,&src);
+    gem_new((uint64_t)PITCH*H*4,&out);
+    gem_cpu(&src,1);
+    gem_cpu(&out,1);
+    for(unsigned y=0;y<H;++y)for(unsigned x=0;x<W;++x)
+        src.map[SOURCE_OFFSET+y*SOURCE_PITCH+x]=0xff000000u|((y*W+x)*71237u&0xffffffu);
+    for(unsigned i=0;i<PITCH*H;++i)out.map[i]=0xdeadc0deu;
+    uint32_t scene[BROOK_VK_SCENE_HEADER+BROOK_VK_LAYER_WORDS]={W,H,1,0};
+    const struct BrookVkSceneLayer layer={SOURCE_OFFSET,SOURCE_PITCH,W,H,0,0,W,H,0,0,W,H,0,0,W,H,255};
+    memcpy(scene+BROOK_VK_SCENE_HEADER,&layer,sizeof(layer));
+    const struct BrookVkQuadSource input={{src.fd,-1,W,H,SOURCE_OFFSET,SOURCE_PITCH,src.size},1};
+    const struct BrookVkQuadSource target={{out.fd,-1,W,H,0,PITCH,out.size},0};
+    static struct QuadPlan plan;
+    const struct DesktopDamageSet partial={1,{{0,0,W,H/2}}},full={1,{{0,0,W,H}}};
+    CHECK(quad_plan_build_auto(scene,sizeof(scene)/4,NULL,&partial,1,&plan));
+    CHECK(brook_vk_quad_pass_submit(quad,scene,sizeof(scene)/4,&input,1,&target,&plan)==BROOK_VK_REJECTED);
+    CHECK(quad_plan_build_auto(scene,sizeof(scene)/4,NULL,&full,1,&plan));
+    for(unsigned frame=0;frame<2;++frame){
+        CHECK(brook_vk_quad_pass_submit(quad,scene,sizeof(scene)/4,&input,1,&target,&plan)==BROOK_VK_PENDING);
+        CHECK(brook_vk_quad_pass_wait(quad,5000000000ull)==BROOK_VK_COMPLETE);
+        gem_cpu(&out,0);
+        for(unsigned y=0;y<H;++y)for(unsigned x=0;x<PITCH;++x)
+            CHECK(out.map[y*PITCH+x]==(x<W?src.map[SOURCE_OFFSET+y*SOURCE_PITCH+x]:0xdeadc0deu));
+        gem_cpu(&src,1);
+        src.map[SOURCE_OFFSET]^=0x00345678u;
+    }
+    gem_free(&out);gem_free(&src);
+    printf("QUAD_HOST_OPTIMAL_OUTPUT_PASS\n");
+}
 int main(int argc,char **argv){
     if(argc>1 && !strcmp(argv[1],"--blur-layout")){blur_test_layout();blur_shimmer_reference();return 0;}
+    const int optimalOnly=argc>1 && !strcmp(argv[1],"--optimal-output");
     const int blurOnly=argc>1 && !strcmp(argv[1],"--blur");
     const int benchOnly=argc>1 && !strcmp(argv[1],"--blur-bench");
     const unsigned iterations=argc>1?(unsigned)strtoul(argv[1],NULL,10):300;
@@ -708,8 +744,11 @@ int main(int argc,char **argv){
     printf("QUAD_HOST_DEVICE %s\n",brook_vk_renderer_device(compute));
     VkPhysicalDevice physical;VkDevice device;VkQueue queue;uint32_t family;
     CHECK(brook_vk_renderer_graphics_context(compute,&physical,&device,&queue,&family));
-    quad=brook_vk_quad_pass_create(physical,device,queue,family);CHECK(quad);
+    quad=optimalOnly?brook_vk_quad_pass_create_optimal_output(physical,device,queue,family):
+        brook_vk_quad_pass_create(physical,device,queue,family);
+    CHECK(quad);
     brook_vk_quad_pass_set_modifiers(quad,brook_vk_renderer_modifiers(compute));
+    if(optimalOnly){optimal_output();blur_scene();goto done;}
     if(blurOnly){blur_scene();blur_shimmer_gpu();goto done;}
     if(benchOnly){for(unsigned level=2;level<=16;level*=(level==2?4:2))blur_bench(level);goto done;}
     tiled_sources();

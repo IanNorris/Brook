@@ -618,27 +618,43 @@ inline int64_t GemCloseIoctl(File& f, const UserAccess& u, uint64_t arg) {
 // CPU_PREP: the VM_BIND/EXEC uAPI has no per-BO busy tracking in userspace's view; nouveau
 // waits on the BO's reservation, which holds the VM's EXEC fences. Brook waits for the file's
 // last EXEC fence (conservative). CPU_FINI is a no-op.
-inline int64_t CpuPrepIoctl(File& f, const UserAccess& u, uint64_t arg) {
-    CpuPrep c{};
-    if (!u.read(u.ctx, &c, arg, sizeof(c))) return kEFAULT;
+struct CpuPrepFences {
+    GpuFence* exec = nullptr;
+    GpuFence* implicit = nullptr;
+
+    ~CpuPrepFences() { GpuFenceUnref(exec); GpuFenceUnref(implicit); }
+};
+
+// Snapshot the reservation and own references before dropping the file lock.
+inline int64_t SnapshotCpuPrep(File& f, const CpuPrep& c, CpuPrepFences& fences) {
     if (c.flags & ~(CPU_PREP_NOWAIT | CPU_PREP_WRITE)) return kEINVAL;
     Bo* b = FindBo(f, c.handle);
     if (!b || !b->handle_open) return kENOENT;
-    GpuFence* fe = f.last_exec;
-    GpuFence* imp = nullptr;   // a shared BO: its implicit fences too (nv_drm_prime.h)
-    if (b->shared && !SharedFence(b->shared, (c.flags & CPU_PREP_WRITE) ? 2u : 1u, &imp)) return kENOMEM;
-    if (!fe && !imp) return 0;
+    if (b->shared && !SharedFence(b->shared, (c.flags & CPU_PREP_WRITE) ? 2u : 1u,
+                                 &fences.implicit)) return kENOMEM;
+    fences.exec = f.last_exec;
+    GpuFenceRef(fences.exec);
+    return 0;
+}
+
+inline int64_t WaitCpuPrep(const UserAccess& u, const CpuPrep& c, const CpuPrepFences& fences) {
+    if (!fences.exec && !fences.implicit) return 0;
     const uint64_t deadline = u.now_ns(u.ctx) + 15000000000ull;   // nouveau: 15 s, then -EBUSY
-    int64_t rc;
     for (;;) {
-        const uint32_t st = fe ? GpuFenceState(fe) : 1, si = imp ? GpuFenceState(imp) : 1;
-        if (st && si) { rc = st == 2 || si == 2 ? -5 : 0; break; }
-        if (c.flags & CPU_PREP_NOWAIT) { rc = kEBUSY; break; }
-        if (u.now_ns(u.ctx) >= deadline) { rc = kEBUSY; break; }
-        if (!u.sleep_tick(u.ctx)) { rc = -4; break; }
+        const uint32_t exec = fences.exec ? GpuFenceState(fences.exec) : 1;
+        const uint32_t implicit = fences.implicit ? GpuFenceState(fences.implicit) : 1;
+        if (exec && implicit) return exec == 2 || implicit == 2 ? -5 : 0;
+        if ((c.flags & CPU_PREP_NOWAIT) || u.now_ns(u.ctx) >= deadline) return kEBUSY;
+        if (!u.sleep_tick(u.ctx)) return -4;
     }
-    GpuFenceUnref(imp);
-    return rc;
+}
+
+inline int64_t CpuPrepIoctl(File& f, const UserAccess& u, uint64_t arg) {
+    CpuPrep c{};
+    if (!u.read(u.ctx, &c, arg, sizeof(c))) return kEFAULT;
+    CpuPrepFences fences;
+    const int64_t rc = SnapshotCpuPrep(f, c, fences);
+    return rc ? rc : WaitCpuPrep(u, c, fences);
 }
 
 // ---- M5.2: the VA space ---------------------------------------------------------------------
@@ -739,6 +755,7 @@ inline int64_t RunOps(File& f, const BindOp* ops, uint32_t n) {
 }
 // Runs queued async binds whose waits have completed, in order. Called on every ioctl and by
 // the live glue's poller.
+inline void PumpExec(File& f);
 inline void Pump(File& f) {
     while (f.job_count) {
         BindJob& j = f.jobs[f.job_head];
@@ -778,7 +795,10 @@ inline int64_t VmBindIoctl(File& f, const UserAccess& u, uint64_t arg) {
     for (uint32_t i = 0; i < v.op_count; ++i) if (int64_t e = BindCheck(f, ops[i])) return e;
     if (!async) {   // in order: earlier async binds run first
         const uint64_t deadline = u.now_ns(u.ctx) + 15000000000ull;
-        for (Pump(f); f.job_count; Pump(f)) {
+        while (f.job_count) {
+            PumpExec(f);
+            Pump(f);
+            if (!f.job_count) break;
             if (u.now_ns(u.ctx) >= deadline) return kEBUSY;
             if (!u.sleep_tick(u.ctx)) return -4;
         }

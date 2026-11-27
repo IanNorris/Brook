@@ -26,18 +26,31 @@ static bool monotonic_ns(uint64_t *ns){
 }
 
 int main(int argc,char **argv){
-    int partial=0,asyncPartial=0,traceSource=0,pipeline=0;const char *socketPath=NULL,*renderer=NULL;
+    int partial=0,asyncPartial=0,traceSource=0,pipeline=0;
+    const char *socketPath=NULL,*renderer=NULL,*nvIcd=NULL;
     for(int i=1;i<argc;++i){
         if(!strcmp(argv[i],"--partial") && !partial && !asyncPartial)partial=1;
         else if(!strcmp(argv[i],"--async-partial") && !partial && !asyncPartial)asyncPartial=1;
         else if(!strcmp(argv[i],"--trace-gpu-source") && !traceSource)traceSource=1;
         else if(!strcmp(argv[i],"--pipeline") && !pipeline)pipeline=1;
         else if(!strcmp(argv[i],"--gpu-source") && !socketPath && i+1<argc)socketPath=argv[++i];
+        else if(!strcmp(argv[i],"--nv-glass") && !nvIcd && i+1<argc)nvIcd=argv[++i];
         else if(!renderer && argv[i][0]!='-')renderer=argv[i];
         else return 2;
     }
-    if(!renderer || renderer[0]!='/' || (socketPath && socketPath[0]!='/') || (traceSource && !socketPath) || (pipeline && !asyncPartial)){
-        fprintf(stderr,"usage: brook-desktop-supervisor [--partial | --async-partial [--pipeline]] [--gpu-source /socket] [--trace-gpu-source] /absolute/path/to/brook-desktop-renderer\n");return 2;
+    if(!renderer || renderer[0]!='/' || (socketPath && socketPath[0]!='/') || (traceSource && !socketPath) ||
+       (pipeline && !asyncPartial) || (nvIcd && (nvIcd[0]!='/' || partial || asyncPartial || socketPath))){
+        fprintf(stderr,"usage: brook-desktop-supervisor [--partial | --async-partial [--pipeline]] [--gpu-source /socket] [--trace-gpu-source] [--nv-glass /nvk-icd.json] /absolute/path/to/brook-desktop-renderer\n");return 2;
+    }
+    if(nvIcd){
+        if(access(nvIcd,R_OK)!=0){
+            fprintf(stderr,"DESKTOP_SUPERVISOR_NV_FALLBACK ICD unavailable: %s\n",nvIcd);
+            return 0;
+        }
+        if(setenv("VK_DRIVER_FILES",nvIcd,1) || setenv("BROOK_RENDER_NV_GLASS","1",1) ||
+           setenv("BROOK_RENDER_BLUR","1",0) || setenv("BROOK_RENDER_PIPELINE","1",1) ||
+           unsetenv("BROOK_RENDER_PARTIAL") || unsetenv("BROOK_RENDER_ASYNC_PARTIAL") ||
+           unsetenv("BROOK_DESKTOP_GPU_SOCKET"))return 1;
     }
 #ifdef BROOK_SUPERVISOR_DIAGNOSTIC_REUSE_BACKDROP
     if(setenv("BROOK_RENDER_REUSE_TILE_BACKDROP","1",1))return 1;
@@ -114,6 +127,11 @@ int main(int argc,char **argv){
             if(done<0){fprintf(stderr,"DESKTOP_SUPERVISOR_WAIT_FAILED errno=%d\n",errno);return 1;}
         }
         if(stopping)break;
+        if(nvIcd && pid>0 && WIFEXITED(status) && WEXITSTATUS(status)==78){
+            // Renderer rejected a permanent configuration, including dual-head.
+            fprintf(stderr,"DESKTOP_SUPERVISOR_NV_FALLBACK renderer declined this configuration\n");
+            return 0;
+        }
         const bool finished_ok=monotonic_ns(&finished_ns);
         const uint64_t runtime_ns=pid>0 && started_ok && finished_ok && finished_ns>=started_ns?
             finished_ns-started_ns:0;
