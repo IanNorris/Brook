@@ -216,6 +216,9 @@ static int refresh(struct xwm *wm,struct window *w) {
     }
     free(title);
     if (!publish(wm,w)) return 0;
+    if (newly_mapped)
+        fprintf(stderr,"[brook-xwm] map 0x%x %ux%u%+d%+d flags=0x%x parent=0x%x \"%.40s\"\n",w->state.window,
+                w->state.width,w->state.height,w->state.x,w->state.y,w->state.flags,w->state.parent,w->state.title);
     if (newly_mapped && wm->client_pids && !(w->state.flags&BXWM_OVERRIDE)) {
         uint32_t pid=client_pid(wm,w->state.window);
         if (pid) {
@@ -325,6 +328,22 @@ static int command(struct xwm *wm,const struct bxwm_message *message) {
         {
             uint32_t above=XCB_STACK_MODE_ABOVE;
             xcb_configure_window(wm->xcb,message->window,XCB_CONFIG_WINDOW_STACK_MODE,&above);
+            // Keep mapped override-redirect windows (menus, dropdowns,
+            // tooltips) above it, in their stacking order, as Brook keeps
+            // native popups above a newly focused window. The raise arrives
+            // after the click that may have opened a menu; without this the
+            // menu stays visible natively but X hit-tests its area to the
+            // raised window beneath, so the menu ignores the pointer.
+            xcb_query_tree_reply_t *tree=xcb_query_tree_reply(wm->xcb,xcb_query_tree(wm->xcb,wm->root),NULL);
+            if (tree) {
+                xcb_window_t *children=xcb_query_tree_children(tree);
+                for (int i=0;i<xcb_query_tree_children_length(tree);++i) {
+                    struct window *popup=find(wm,children[i]);
+                    if (popup && popup!=w && (popup->state.flags&(BXWM_OVERRIDE|BXWM_MAPPED))==(BXWM_OVERRIDE|BXWM_MAPPED))
+                        xcb_configure_window(wm->xcb,children[i],XCB_CONFIG_WINDOW_STACK_MODE,&above);
+                }
+                free(tree);
+            }
         }
         // Obtain an X-server timestamp asynchronously. Brook monotonic time is
         // not in the X server's clock domain, and WM_TAKE_FOCUS forbids zero.
