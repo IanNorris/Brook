@@ -335,9 +335,7 @@ struct Ext2DirentCacheEntry {
 };
 
 static uint32_t g_ext2AutoSyncOps = 256;
-// The sentinel selects the per-device default. A QEMU setting can supply an
-// explicit control without changing hardware defaults.
-static uint32_t g_ext2WritebackMiB = ~uint32_t{0};
+static uint32_t g_ext2WritebackMiB = 0; // opt-in until native acceptance
 static uint32_t g_ext2SequentialReads = 2; // 0 off, 1 all, 2 opted-in direct USB
 
 static uint32_t g_ext2WritebackMs = 1000;
@@ -3555,15 +3553,14 @@ static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
         mnt->blockCacheSlots=Ext2Mount::BLOCK_CACHE_SLOTS;
     }
 
-    const uint32_t writebackMiB=g_ext2WritebackMiB==~uint32_t{0}?(directUsb && streamIo?8:0):g_ext2WritebackMiB;
-    if(writebackMiB) {
+    if(g_ext2WritebackMiB) {
         constexpr uint32_t slots=4096;
         auto* rows=static_cast<WriteBehindQueue::Record*>(kmalloc(slots*sizeof(WriteBehindQueue::Record)));
-        const uint32_t size=writebackMiB*1024*1024;
+        const uint32_t size=g_ext2WritebackMiB*1024*1024;
         auto* data=static_cast<uint8_t*>(kmalloc(size));
         if(rows && data)mnt->writeback.Init(rows,slots,data,size);
         else {if(rows)kfree(rows);if(data)kfree(data);}
-        SerialPrintf("ext2: pdrv %u write-behind %u bytes (requested %u MiB)\n",pdrv,mnt->writeback.byteCapacity,writebackMiB);
+        SerialPrintf("ext2: pdrv %u write-behind %u bytes (requested %u MiB)\n",pdrv,mnt->writeback.byteCapacity,g_ext2WritebackMiB);
     }
     *mountPriv = mnt;
     KRwLockWriteLock(&g_ext2Lock);
@@ -5183,7 +5180,7 @@ void Ext2ConfigureAutoSync() {
     const uint32_t length=FwCfgReadFile("opt/ext2-auto-sync-ops",option,sizeof(option));
     g_ext2AutoSyncOps=Ext2ParseAutoSyncOps(option,length);
     const auto size=FwCfgReadFile("opt/ext2-writeback-mib",option,sizeof(option));
-    g_ext2WritebackMiB=Ext2ParseBounded(option,size,0,16,~uint32_t{0});
+    g_ext2WritebackMiB=Ext2ParseBounded(option,size,0,16,0);
     const auto stream=FwCfgReadFile("opt/ext2-sequential-reads",option,sizeof(option));
     g_ext2SequentialReads=Ext2ParseBounded(option,stream,0,2,2);
     const auto age=FwCfgReadFile("opt/ext2-writeback-ms",option,sizeof(option));

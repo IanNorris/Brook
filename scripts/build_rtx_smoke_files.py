@@ -643,7 +643,7 @@ def main():
     p.add_argument('--profile-plan', type=Path, help='signed selected profile plan directory for --usb-system')
     p.add_argument('--profile-plan-public-key', type=Path, help='Ed25519 public key admitted by the USB set')
     p.add_argument('--ext2-stream-io', action='store_true',
-                   help='enable sequential reads and ordered write-behind on BROOK_SYSTEM')
+                   help='enable sequential readahead and cache retention on BROOK_SYSTEM')
     p.add_argument('--usb-uas', action='store_true', help='try tagged USB Attached SCSI in SuperSpeed')
     p.add_argument('--usb-uas-fixture', action='store_true', help='permit QEMU UAS-only boot fixture discovery')
     p.add_argument('--usb-bot', choices=('default', 'legacy', 'pipeline'), default='default',
