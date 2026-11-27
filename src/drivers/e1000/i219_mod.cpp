@@ -80,7 +80,7 @@ enum Reg : uint32_t {
     Kabgtxd = 0x3004,
     Tdbal = 0x3800, Tdbah = 0x3804, Tdlen = 0x3808, Tdh = 0x3810, Tdt = 0x3818, Tidv = 0x3820,
     Txdctl0 = 0x3828, Tadv = 0x382c, Tarc0 = 0x3840, Txdctl1 = 0x3928, Tarc1 = 0x3940,
-    Mpc = 0x4010, Rnbc = 0x40a0,   // statistics: missed packets, receive no buffers (clear on read)
+    Rnbc = 0x40a0,   // statistics: receive no buffers (clear on read; Mpc below)
     Rxcsum = 0x5000, Rfctl = 0x5008, Mta = 0x5200, Ral0 = 0x5400, Rah0 = 0x5404,
     Manc = 0x5820, H2me = 0x5b50, Fwsm = 0x5b54, Fextnvm9 = 0x5bb4, Fextnvm11 = 0x5bbc,
     // Statistics (clear on read).
@@ -1064,7 +1064,7 @@ uint32_t Command(const char* args, char* out, uint32_t cap)
     }
     if (Equal(args, "autoneg")) { __atomic_store_n(&g_autonegRequested, true, __ATOMIC_RELEASE); t.s("queued"); return t.n; }
     if (Equal(args, "stats")) {
-        t.s("CRCERRS="); t.u(Read(Crcerrs)); t.s(" MPC="); t.u(Read(Mpc));
+        t.s("CRCERRS="); t.u(Read(Crcerrs)); t.s(" MPC="); t.u(g_rxMissed += Read(Mpc));
         t.s(" GPRC="); t.u(Read(Gprc)); t.s(" GPTC="); t.u(Read(Gptc)); t.s(" (clear on read)");
         return t.n;
     }
