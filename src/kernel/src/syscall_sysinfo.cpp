@@ -3,6 +3,7 @@
 // Split from syscall.cpp.
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
+#include "resource_limits.h"
 #include "pid_namespace.h"
 #include "core_autodump.h"
 #include "process_user_namespace.h"
@@ -81,12 +82,20 @@ static constexpr uint64_t RLIM_INFINITY = ~0ULL;
 // implements getrlimit through prlimit64 (V8 uses RLIMIT_DATA for sizing).
 static rlimit64 ReportedResourceLimit(uint64_t resource)
 {
-    if (resource == 7) return {MAX_FDS, MAX_FDS}; // RLIMIT_NOFILE
     if (resource == 3) return {8 * 1024 * 1024, RLIM_INFINITY}; // RLIMIT_STACK
     return {RLIM_INFINITY, RLIM_INFINITY};
 }
 
-static int64_t CoreResourceLimit(uint64_t pid,uint64_t newlimitAddr,uint64_t oldlimitAddr)
+// RLIMIT_CORE and RLIMIT_NOFILE are stored per thread group. NOFILE's soft
+// limit may be raised to its hard limit (Proton does so for esync); the
+// descriptor table itself still holds MAX_FDS slots, so allocation beyond
+// that fails with EMFILE whatever the limit says.
+static bool StoredResourceLimit(uint64_t resource)
+{
+    return resource==RlimitCore || resource==RlimitNofile;
+}
+static int64_t CoreResourceLimit(uint64_t pid,uint64_t newlimitAddr,uint64_t oldlimitAddr,
+                                 uint32_t resource=RlimitCore)
 {
     if (static_cast<int32_t>(pid) < 0) return -ESRCH;
     CoreResourceLimits requested{},previous{};
@@ -95,7 +104,7 @@ static int64_t CoreResourceLimit(uint64_t pid,uint64_t newlimitAddr,uint64_t old
     if(!caller)return -ESRCH;
     const bool privileged=ProcessCapable(caller,nullptr,24); // CAP_SYS_RESOURCE in initial namespace
     const int result=SchedulerCoreResourceLimit(caller,static_cast<uint32_t>(pid),
-                                                newlimitAddr?&requested:nullptr,previous,privileged);
+                                                newlimitAddr?&requested:nullptr,previous,privileged,resource);
     if(result)return result;
     if(oldlimitAddr && !CopyToUser(oldlimitAddr,&previous,sizeof(previous)))return -EFAULT;
     return 0;
@@ -103,9 +112,9 @@ static int64_t CoreResourceLimit(uint64_t pid,uint64_t newlimitAddr,uint64_t old
 
 int64_t sys_setrlimit(uint64_t resource,uint64_t newlimitAddr,uint64_t,uint64_t,uint64_t,uint64_t)
 {
-    if(resource!=4)return -38;
+    if(!StoredResourceLimit(resource))return -38;
     if(!newlimitAddr)return -EFAULT;
-    return CoreResourceLimit(0,newlimitAddr,0);
+    return CoreResourceLimit(0,newlimitAddr,0,static_cast<uint32_t>(resource));
 }
 
 int64_t sys_brook_core_dump(uint64_t pid,uint64_t flags,uint64_t,uint64_t,uint64_t,uint64_t)
@@ -119,7 +128,8 @@ int64_t sys_brook_core_dump(uint64_t pid,uint64_t flags,uint64_t,uint64_t,uint64
 int64_t sys_prlimit64(uint64_t pid, uint64_t resource, uint64_t newlimitAddr,
                         uint64_t oldlimitAddr, uint64_t, uint64_t)
 {
-    if(resource==4)return CoreResourceLimit(pid,newlimitAddr,oldlimitAddr);
+    if(StoredResourceLimit(resource))
+        return CoreResourceLimit(pid,newlimitAddr,oldlimitAddr,static_cast<uint32_t>(resource));
     (void)newlimitAddr;
     auto* caller = ProcessCurrent();
     if (pid && ProcessPidView(caller)) {
@@ -304,7 +314,8 @@ int64_t sys_times(uint64_t bufAddr, uint64_t, uint64_t,
 int64_t sys_getrlimit(uint64_t resource, uint64_t rlimAddr, uint64_t,
                        uint64_t, uint64_t, uint64_t)
 {
-    if(resource==4)return rlimAddr?CoreResourceLimit(0,0,rlimAddr):-EFAULT;
+    if(StoredResourceLimit(resource))
+        return rlimAddr?CoreResourceLimit(0,0,rlimAddr,static_cast<uint32_t>(resource)):-EFAULT;
     const rlimit64 limit = ReportedResourceLimit(resource);
     return CopyToUser(rlimAddr, &limit, sizeof(limit)) ? 0 : -EFAULT;
 }

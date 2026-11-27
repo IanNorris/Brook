@@ -8,7 +8,10 @@ void SchedulerCommitExecThreadIdentity(Process* proc)
     RuntimeChargeLocked(cpu,RuntimeNow(cpu));
     const uint64_t allFlags=SchedLockAcquire(g_allProcLock);
 #ifndef BROOK_HOST_TEST
-    if(const auto* leader=CoreGroupLeaderLocked(proc))proc->coreLimits=leader->coreLimits;
+    if(const auto* leader=CoreGroupLeaderLocked(proc)) {
+        proc->coreLimits=leader->coreLimits;
+        proc->nofileLimits=leader->nofileLimits;
+    }
 #endif
     TransferChildSubreaperExecLocked(proc);
     ReleaseThreadAddressSpaceLocked(proc);

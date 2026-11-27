@@ -4,6 +4,8 @@
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "futex_timeout.h"
+#include "futex_waitv.h"
+#include "panic.h"
 #include "pid_namespace.h"
 #include "profiler.h"
 #include "sync/futex_waiter_pool.h"
@@ -106,7 +108,10 @@ static FutexWaiter* FutexAllocWaiter()
 
 static void FutexFreeWaiter(FutexWaiter* w)
 {
-    g_futexWaiterPool.Free(w);
+    // futex_waitv nodes are on their waiter's kernel stack, not in the pool.
+    // Never let the pool range-check a foreign pointer: its index truncation
+    // could alias a live slot.
+    if (w && !w->multi) g_futexWaiterPool.Free(w);
 }
 
 // BRO-196 diagnostic: a small ring buffer of recent futex ops, so the hang dump
@@ -115,7 +120,7 @@ struct FutexLogEntry { uint64_t uaddr; uint64_t tick; uint32_t pid; int32_t resu
 static constexpr uint32_t FUTEX_LOG_SIZE = 512;
 static FutexLogEntry g_futexLog[FUTEX_LOG_SIZE];
 static volatile uint32_t g_futexLogIdx = 0;  // monotonic; & (SIZE-1) for slot
-// op: 0=WAIT-enqueue 1=WAIT-return 2=WAKE 3=WAKE_OP 4=REQUEUE
+// op: 0=WAIT-enqueue 1=WAIT-return 2=WAKE 3=WAKE_OP 4=REQUEUE 5=WAITV-return
 static inline void FutexLog(uint8_t op, uint64_t uaddr, uint32_t pid, int32_t result)
 {
     uint32_t i = __atomic_fetch_add(&g_futexLogIdx, 1, __ATOMIC_RELAXED) & (FUTEX_LOG_SIZE - 1);
@@ -147,14 +152,14 @@ extern "C" void FutexDumpWaiters()
     SerialPrintf("  total futex waiters: %u\n", total);
 
     // Recent futex op timeline (oldest→newest).
-    static const char* opName[] = {"WAITq", "WAITr", "WAKE ", "WAKEOP", "REQ  "};
+    static const char* opName[] = {"WAITq", "WAITr", "WAKE ", "WAKEOP", "REQ  ", "WAITV"};
     SerialPrintf("--- recent futex ops (last %u) ---\n", FUTEX_LOG_SIZE);
     uint32_t head = __atomic_load_n(&g_futexLogIdx, __ATOMIC_RELAXED);
     for (uint32_t k = 0; k < FUTEX_LOG_SIZE; ++k) {
         uint32_t i = (head + k) & (FUTEX_LOG_SIZE - 1);
         const FutexLogEntry& e = g_futexLog[i];
         if (e.uaddr == 0 && e.tick == 0) continue;
-        const char* nm = (e.op < 5) ? opName[e.op] : "?";
+        const char* nm = (e.op < 6) ? opName[e.op] : "?";
         SerialPrintf("  t=%lu %s uaddr=0x%lx pid=%u res=%d\n",
                      e.tick, nm, e.uaddr, e.pid, e.result);
     }
@@ -187,6 +192,9 @@ extern "C" int64_t FutexWake(uint64_t owner, uint64_t uaddr, uint32_t maxWake,
         if (w->uaddr == uaddr && w->owner == owner && (w->bitset & wake_bitset) != 0) {
             Process* waiter = w->proc;
             *pp = w->next;
+            w->queued = false;
+            // A futex_waitv node lives on the waiter's kernel stack and may
+            // vanish once the lock drops; FutexFreeWaiter leaves it alone.
             FutexFreeWaiter(w);
             // Unlink transfers the node's hold to this stack. Keep IF clear
             // until that hold is dropped: a killed caller never resumes.
@@ -225,8 +233,9 @@ static bool FutexRemoveWaiter(uint64_t owner, uint64_t uaddr, Process* proc)
     FutexWaiter** pp = &g_futexBuckets[bucket];
     while (*pp) {
         FutexWaiter* w = *pp;
-        if (w->uaddr == uaddr && w->owner == owner && w->proc == proc) {
+        if (w->uaddr == uaddr && w->owner == owner && w->proc == proc && !w->multi) {
             *pp = w->next;
+            w->queued = false;
             FutexFreeWaiter(w);
             IrqSpinLockRelease(&g_futexLock, fxFlags & ~0x200ULL);
             SchedulerReleaseWaitReference(proc);
@@ -248,7 +257,7 @@ static bool FutexRearmWaiter(uint64_t owner, uint64_t uaddr, Process* proc,
 {
     const uint64_t flags = IrqSpinLockAcquire(&g_futexLock);
     for (FutexWaiter* w = g_futexBuckets[FutexHash(owner, uaddr)]; w; w = w->next) {
-        if (w->owner != owner || w->uaddr != uaddr || w->proc != proc) continue;
+        if (w->owner != owner || w->uaddr != uaddr || w->proc != proc || w->multi) continue;
         const uint64_t nowNs = ClockNowNs(deadline.clockId);
         const uint64_t nowTick = ApicTickCount();
         proc->wakeupTick = deadline.wakeupTick(nowNs, nowTick);
@@ -273,6 +282,7 @@ extern "C" void FutexCancelProcess(Process* proc)
             FutexWaiter* w = *pp;
             if (w->proc != proc) { pp = &w->next; continue; }
             *pp = w->next;
+            w->queued = false;
             FutexFreeWaiter(w);
             ProcessUnref(proc); // caller's reference prevents final teardown
         }
@@ -616,6 +626,8 @@ int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
         w->owner = owner;
         w->proc = proc;
         w->bitset = waitBitset;
+        w->queued = true;
+        w->multi = false;
         uint32_t bucket = FutexHash(owner, keyAddress);
         ProcessRef(proc); // owned by linked waiter, then wake/remove/cancel
         w->next = g_futexBuckets[bucket];
@@ -676,6 +688,162 @@ int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
                      userRax, userRip, uaddrVal, val, arg4, arg5, arg6);
     }
     return -ENOSYS;
+}
+
+// ---------------------------------------------------------------------------
+// sys_futex_waitv (449) — wait on up to 128 futexes (Linux 5.16 futex2).
+// ---------------------------------------------------------------------------
+// Queue before check, as Linux does: each node is linked under the futex lock
+// before its word is read, so a store + FUTEX_WAKE racing the setup finds the
+// node queued and cannot be lost. Keys match sys_futex exactly (private TGID/VA
+// or shared memfd/file object + offset), so classic FUTEX_WAKE reaches these
+// nodes. Nodes live on this thread's kernel stack: each linked node owns one
+// process reference and the reaper requires refCount==0, so no node outlives
+// that stack; a killed waiter's nodes are unlinked by FutexCancelProcess.
+
+// Unlink every still-queued node and return the highest index a waker took
+// (Linux unqueue_multiple), or -1.
+static int32_t FutexWaitvUnqueue(Process* proc, FutexWaiter* nodes, uint32_t count)
+{
+    uint32_t released = 0;
+    const uint64_t flags = IrqSpinLockAcquire(&g_futexLock);
+    const int32_t woken = FutexWaitvWokenIndex(count, [&](uint32_t i) { return nodes[i].queued; });
+    for (uint32_t i = 0; i < count; ++i) {
+        FutexWaiter* node = &nodes[i];
+        if (!node->queued) continue;
+        for (FutexWaiter** pp = &g_futexBuckets[FutexHash(node->owner, node->uaddr)]; *pp; pp = &(*pp)->next) {
+            if (*pp != node) continue;
+            *pp = node->next;
+            node->queued = false;
+            ++released;
+            break;
+        }
+        if (node->queued) KernelPanic("futex_waitv: queued node missing from its bucket");
+    }
+    // As in FutexRemoveWaiter: keep IF clear until the node holds are dropped.
+    IrqSpinLockRelease(&g_futexLock, flags & ~0x200ULL);
+    while (released--) SchedulerReleaseWaitReference(proc);
+    if (flags & 0x200) __asm__ volatile("sti" ::: "memory");
+    return woken;
+}
+
+// Admit one validated entry under the classic WAIT's mapping transaction:
+// derive its key, link the node, then read the word while already queued.
+// Returns 0 with the node linked (matched reports the comparison), or an
+// error with the node not linked.
+static int FutexWaitvQueueOne(Process* proc, FutexWaiter* node, const FutexWaitvEntry& entry, bool& matched)
+{
+    const uint64_t address = entry.uaddr;
+    if (!UserBufferReadable(address, sizeof(uint32_t))) return -EFAULT;
+    for (unsigned attempt = 0; attempt < 4; ++attempt) {
+        uint32_t prefault = 0;
+        if (!CopyFromUser(&prefault, address, sizeof(prefault))) return -EFAULT;
+        MappingTransaction mapping(proc, proc->addressSpace);
+        if (!mapping.LockFaultRange(address)) return -ENOMEM;
+        const auto* range = MappingRangeFind(proc->addressSpace->ranges, address);
+        if (!range || !(range->protection & 1) || address > range->end || range->end - address < 4) return -EFAULT;
+        // Never fault under AS mutation or the IRQ futex lock. A remap after
+        // the prefault leaves a lazy leaf: drop the transaction and refault.
+        const uint64_t leaf = VmmReadLeaf(proc->addressSpace->pageTable, VirtualAddress(address));
+        if (!(leaf & VMM_PRESENT) || !(leaf & VMM_USER)) continue;
+        uint64_t owner = 0, key = 0;
+        if (int error = FutexMappedKey(proc, address, entry.flags & FUTEX2_PRIVATE, range, owner, key)) return error;
+        const uint64_t flags = IrqSpinLockAcquire(&g_futexLock);
+        if (PiFutexQueued(owner, key)) {
+            IrqSpinLockRelease(&g_futexLock, flags);
+            return -EINVAL;
+        }
+        node->uaddr = key;
+        node->owner = owner;
+        node->proc = proc;
+        node->bitset = FUTEX_BITSET_MATCH_ANY;
+        node->multi = true;
+        node->queued = true;
+        ProcessRef(proc); // owned by the linked node, then wake/unqueue/cancel
+        const uint32_t bucket = FutexHash(owner, key);
+        node->next = g_futexBuckets[bucket];
+        g_futexBuckets[bucket] = node;
+        matched = __atomic_load_n(reinterpret_cast<volatile uint32_t*>(address), __ATOMIC_ACQUIRE) ==
+                  static_cast<uint32_t>(entry.val);
+        IrqSpinLockRelease(&g_futexLock, flags);
+        return 0;
+    }
+    return -EAGAIN;
+}
+
+int64_t sys_futex_waitv(uint64_t waitersAddr, uint64_t count, uint64_t flags,
+                        uint64_t timeoutAddr, uint64_t clockid, uint64_t)
+{
+    if (int error = FutexWaitvCheckCall(waitersAddr, count, flags, timeoutAddr, clockid)) return error;
+    Process* proc = ProcessCurrent();
+    if (!proc || !proc->addressSpace) return -ENOSYS;
+
+    // The timeout is absolute on the selected clock, like FUTEX_WAIT_BITSET.
+    FutexWaitDeadline deadline{};
+    if (timeoutAddr) {
+        timespec request{};
+        if (!CopyFromUser(&request, timeoutAddr, sizeof(request))) return -EFAULT;
+        uint64_t valueNs = 0;
+        if (!FutexTimeoutNanoseconds(request.tv_sec, request.tv_nsec, &valueNs)) return -EINVAL;
+        const unsigned clockId = static_cast<unsigned>(clockid);
+        if (!FutexMakeDeadline(false, valueNs, ClockNowNs(clockId), clockId, &deadline)) return -EINVAL;
+    }
+
+    FutexWaitvEntry entries[FUTEX_WAITV_MAX];
+    if (!CopyFromUser(entries, waitersAddr, count * sizeof(FutexWaitvEntry))) return -EFAULT;
+    for (uint32_t i = 0; i < count; ++i)
+        if (int error = FutexWaitvCheckEntry(entries[i])) return error;
+
+    FutexWaiter nodes[FUTEX_WAITV_MAX];
+    for (uint32_t i = 0; i < count; ++i) nodes[i].queued = false;
+
+    uint32_t linked = 0;
+    int error = 0;
+    bool mismatch = false;
+    while (linked < count) {
+        bool matched = false;
+        error = FutexWaitvQueueOne(proc, &nodes[linked], entries[linked], matched);
+        if (error) break;
+        ++linked;
+        if (!matched) { mismatch = true; break; }
+    }
+    if (error || mismatch) {
+        // A wake that raced the setup wins over the mismatch, as in Linux.
+        const int32_t woken = FutexWaitvUnqueue(proc, nodes, linked);
+        if (woken >= 0) return woken;
+        return error ? error : -EAGAIN;
+    }
+
+    bool interrupted = false;
+    for (;;) {
+        // Decide under the futex lock: a wake after this check unlinks a node
+        // and latches pendingWakeup, so the block below returns at once.
+        bool ready = false;
+        {
+            const uint64_t fxFlags = IrqSpinLockAcquire(&g_futexLock);
+            const uint64_t nowNs = deadline.finite ? ClockNowNs(deadline.clockId) : 0;
+            ready = FutexWaitvWokenIndex(count, [&](uint32_t i) { return nodes[i].queued; }) >= 0 ||
+                    deadline.expired(nowNs);
+            if (!ready) {
+                __atomic_store_n(&proc->pendingWakeup, 0, __ATOMIC_RELEASE);
+                proc->wakeupTick = deadline.finite ? deadline.wakeupTick(nowNs, ApicTickCount()) : ~0ULL;
+            }
+            IrqSpinLockRelease(&g_futexLock, fxFlags);
+        }
+        if (ready) break;
+        SchedulerBlockInterruptible(proc);
+        if (HasPendingSignals()) { interrupted = true; break; }
+        // Otherwise a timer hint or spurious wake: recheck while still queued.
+    }
+
+    const int32_t woken = FutexWaitvUnqueue(proc, nodes, count);
+    FutexLog(5, entries[woken >= 0 ? woken : 0].uaddr, proc->pid, woken);
+    if (woken >= 0) return woken;
+    if (deadline.expired(deadline.finite ? ClockNowNs(deadline.clockId) : 0)) return -ETIMEDOUT;
+    // Linux returns -ERESTARTSYS: SignalSyscallMayRestart lets SA_RESTART
+    // replay it, which is exact because the timeout is absolute.
+    (void)interrupted;
+    return -EINTR;
 }
 
 } // namespace brook

@@ -136,6 +136,7 @@ const char* SyscallNameOrNull(uint64_t num)
     case 299: return "recvmmsg";  case 307: return "sendmmsg";
     case 318: return "getrandom"; case 334: return "rseq";
     case 439: return "faccessat2";
+    case 449: return "futex_waitv";
     case 73: return "flock";      case 76: return "truncate";
     case 77: return "ftruncate";  case 86: return "link";
     case 90: return "chmod";      case 91: return "fchmod";

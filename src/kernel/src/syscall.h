@@ -232,6 +232,7 @@ static constexpr uint64_t SYS_EPOLL_CREATE1   = 291;
 static constexpr uint64_t SYS_MEMFD_CREATE    = 319;
 static constexpr uint64_t SYS_PIDFD_OPEN      = 434;
 static constexpr uint64_t SYS_MEMFD_SECRET    = 447;
+static constexpr uint64_t SYS_FUTEX_WAITV     = 449;
 
 // Syscall function type -- same signature as Linux: returns int64_t,
 // up to 6 arguments via rdi, rsi, rdx, r10->rcx, r8, r9.

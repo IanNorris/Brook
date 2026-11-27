@@ -76,13 +76,13 @@ static inline const char* ProcWaitKind(bool blocked, bool stopped, bool kernelTh
         if (has("KRwLock")) return "rwlock";
         if (has("KSemaphore")) return "semaphore";
         if (has("Intel") || has("Bdw") || has("Gpu") || has("Virgl")) {
-            if (!(nr == 202 || nr == 7 || nr == 271 || nr == 232 || nr == 281 || nr == 441))
+            if (!(nr == 202 || nr == 449 || nr == 7 || nr == 271 || nr == 232 || nr == 281 || nr == 441))
                 return "gpu-wait";
         }
     }
     if (kernelThread) return "kernel";
     switch (nr) {
-    case 202: return "futex";
+    case 202: case 449: return "futex";
     case 7: case 271: return "poll";
     case 23: case 270: return "select";
     case 232: case 281: case 441: return "epoll";
