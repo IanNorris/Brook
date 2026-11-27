@@ -73,7 +73,7 @@ DRIVERS = ('xhci', 'i219')
 I219_STAGES = {'probe': (), 'attach': ('i219-attach',), 'reset': ('i219-reset',)}
 MARKERS = ('usb-read-only', 'audio-muted', 'hw-inventory', 'boot-status', 'boot-stick-update')
 # Exact /etc contents allowed in the initrd (lower-case FAT names).
-ETC_ALLOWED = {*MARKERS, 'i219-attach', 'i219-reset', 'hardware-payload-id', 'resolv.conf', 'machine-id', 'ssl',
+ETC_ALLOWED = {*MARKERS, 'i219-attach', 'i219-reset', 'i219-poll', 'hardware-payload-id', 'resolv.conf', 'machine-id', 'ssl',
                'keyboard-layout',
                'bridge-v3-operators', 'rtx-update-signer', 'restart-prompt-seconds',
                # --session desktop only
@@ -541,6 +541,8 @@ def build(args):
     short = commit[:8] + ('-dirty' if dirty else '')
     payload_id = f'brook-rtx-smoke-{short}' + (f'-{args.payload_tag}' if args.payload_tag else '')
     markers = (*MARKERS, *I219_STAGES[args.i219_stage])
+    if args.i219_poll:
+        markers += ('i219-poll',)
     env = dict(os.environ, BROOK_BUILD_DIR=str(stage), BROOK_INITRD_MARKERS=','.join(markers),
                BROOK_HARDWARE_PAYLOAD_ID=payload_id)
     if args.session == 'desktop':
@@ -613,6 +615,7 @@ def build(args):
         'usb_system': live if args.usb_system else None,
         'initrd': {'drivers': list(DRIVERS), 'etc': etc, 'markers': list(markers), 'shortcuts': shortcuts},
         'i219_stage': args.i219_stage,
+        'i219_poll': args.i219_poll,
         'keyboard_layout': args.keyboard_layout,
         'nv_gsp': {'verbs': bool(args.nv_gsp), 'firmware': nv_gsp_fw},
         'helpers': helpers,
@@ -696,6 +699,8 @@ def main():
     p.add_argument('--image', type=Path, help='also write a raw GPT/FAT32 disk image here')
     p.add_argument('--i219-stage', choices=sorted(I219_STAGES), default='probe',
                    help='I219-V bring-up stage at boot (default probe: read-only)')
+    p.add_argument('--i219-poll', action='store_true',
+                   help='keep an attached I219-V in polling mode for comparison or recovery')
     p.add_argument('--display-max', default='1920x1080', metavar='WxH',
                    help='GOP mode cap in BROOK.CFG (kernel supports up to 4096x2160); outside PREV/ fallback')
     p.add_argument('--allow-dirty', action='store_true')

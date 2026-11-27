@@ -5,6 +5,7 @@
 namespace brook::e1000 {
 
 constexpr uint16_t RingSize = 128;
+constexpr uint16_t I219RxRingSize = 4096;
 constexpr uint16_t BufferSize = 2048;
 constexpr uint16_t MinFrameSize = 14;
 constexpr uint16_t MaxFrameSize = 1514;
@@ -36,9 +37,11 @@ constexpr uint8_t DescriptorDone = 1u << 0;
 constexpr uint8_t RxEndOfPacket = 1u << 1;
 constexpr uint8_t TxCommand = (1u << 0) | (1u << 1) | (1u << 3); // EOP, IFCS, RS
 
-inline uint16_t Next(uint16_t index)
+template<uint16_t Size = RingSize>
+constexpr uint16_t Next(uint16_t index)
 {
-    return (index + 1) & (RingSize - 1);
+    static_assert(Size && (Size & (Size - 1)) == 0);
+    return (index + 1) & (Size - 1);
 }
 
 struct TxRing {

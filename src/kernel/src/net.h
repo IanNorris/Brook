@@ -309,6 +309,8 @@ bool NetEarlyBootPolling();
 // processing packets inline in IRQ context — keeping all packet processing
 // (and the socket/ARP SpinLocks it takes) in process context.
 void NetWakePollThread();
+void NetSetMsiPolling(NetIf*, bool enabled);
+void NetWakeMsiPollThread(NetIf*);
 
 // ---------------------------------------------------------------------------
 // Socket layer (kernel-side)

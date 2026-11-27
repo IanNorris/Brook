@@ -2,7 +2,7 @@
 #include "../../drivers/e1000/e1000_mod.cpp"
 
 namespace {
-unsigned failures = 0, packets = 0, wakes = 0;
+unsigned failures = 0, packets = 0, wakes = 0, msiWakes = 0, eois = 0;
 uint64_t monotonic = 0;
 uint32_t registers[MmioPages * PageSize / 4];
 TxDescriptor tx[RingSize];
@@ -31,6 +31,71 @@ MockBridge* LookupBridge(uint8_t bus, uint8_t device, uint8_t function)
     for (auto& bridge : bridges)
         if (bridge.bus == bus && bridge.device == device && bridge.function == function) return &bridge;
     return nullptr;
+}
+
+struct MsiConfigFixture {
+    uint8_t bytes[256]{};
+    unsigned writes = 0;
+    bool acceptEnable = true;
+
+    uint8_t read8(unsigned off) { return bytes[off]; }
+    uint16_t read16(unsigned off) { return bytes[off] | (uint16_t(bytes[off + 1]) << 8); }
+    uint32_t read32(unsigned off) { return read16(off) | (uint32_t(read16(off + 2)) << 16); }
+    void write16(unsigned off, uint16_t val) {
+        if (off == 0x52 && !acceptEnable) val &= ~MsiEnable;
+        bytes[off] = val;
+        bytes[off + 1] = val >> 8;
+        ++writes;
+    }
+    void write32(unsigned off, uint32_t val) {
+        write16(off, val);
+        write16(off + 2, val >> 16);
+    }
+};
+
+void ValidateMsi()
+{
+    MsiConfigFixture cfg;
+    bool installed = false;
+    auto install = [&](uint8_t vector) {
+        CHECK(vector == I219MsiVector && !(cfg.read16(0x52) & MsiEnable));
+        installed = true;
+    };
+    CHECK(!EnableMsi(cfg, 7, I219MsiVector, install) && !installed && cfg.writes == 0);
+    cfg.bytes[6] = 1 << 4;
+    cfg.bytes[0x34] = 0x50;
+    cfg.bytes[0x50] = 0x05;
+    cfg.bytes[0x51] = 0x50;
+    CHECK(!EnableMsi(cfg, 7, I219MsiVector, install) && !installed && cfg.writes == 0);
+    cfg.bytes[0x51] = 0;
+    cfg.write16(0x52, MsiMultipleEnabled | MsiEnable);
+    CHECK(EnableMsi(cfg, 7, I219MsiVector, install) == 0x50);
+    CHECK(installed && cfg.read16(0x52) == MsiEnable);
+    CHECK(cfg.read32(0x54) == 0xfee07000u && cfg.read16(0x58) == I219MsiVector);
+    DisableMsi(cfg, 0x50);
+    CHECK(!(cfg.read16(0x52) & MsiEnable));
+
+    cfg.write16(0x52, MsiAddress64 | MsiVectorMask);
+    cfg.write32(0x58, ~0u);
+    cfg.write32(0x60, ~0u);
+    CHECK(EnableMsi(cfg, 7, I219MsiVector, install) == 0x50);
+    CHECK(cfg.read32(0x58) == 0 && cfg.read16(0x5c) == I219MsiVector);
+    CHECK(cfg.read32(0x60) == ~1u);
+    cfg.acceptEnable = false;
+    CHECK(!EnableMsi(cfg, 7, I219MsiVector, install));
+
+    cfg.bytes[0x51] = 0xfc;
+    cfg.bytes[0xfc] = 0x11;
+    cfg.write16(0xfe, 0x8000);
+    const unsigned writes = cfg.writes;
+    CHECK(!EnableMsi(cfg, 7, I219MsiVector, install) && cfg.writes == writes);
+    cfg.bytes[0x34] = 0xfc;
+    cfg.bytes[0xfc] = 0x05;
+    CHECK(!EnableMsi(cfg, 7, I219MsiVector, install) && cfg.writes == writes);
+
+    static_assert(I219RxRingSize * sizeof(RxDescriptor) == 65536);
+    static_assert(Next<I219RxRingSize>(4094) == 4095);
+    static_assert(Next<I219RxRingSize>(4095) == 0);
 }
 
 void ValidateBridgePath()
@@ -127,6 +192,11 @@ void NetReceive(NetIf* nif, const void* frame, uint32_t length)
     Poll(nif); // nested stack polling must not consume the same descriptor
 }
 void NetWakePollThread() { ++wakes; }
+void NetWakeMsiPollThread(NetIf* intf) {
+    CHECK(intf == &g_interface);
+    ++msiWakes;
+}
+extern "C" void ApicSendEoi() { ++eois; }
 uint64_t ApicTickCount() { return monotonic; }
 extern "C" uint32_t PciConfigRead32(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset)
 {
@@ -167,6 +237,7 @@ int main()
     CHECK(Devices[0].id == 0x100e && !Devices[0].pcie);
     CHECK(Devices[1].id == 0x100f && !Devices[1].pcie);
     CHECK(Devices[2].id == 0x10d3 && Devices[2].pcie);
+    ValidateMsi();
     ValidateBridgePath();
     ValidateTransmit();
     ValidateReceive();
@@ -186,5 +257,12 @@ int main()
     Write(Icr, InterruptLink);
     Interrupt();
     CHECK(wakes == 2 && packets == 1);
+    Write(Icr, 0);
+    E1000eMsiInner();
+    Write(Icr, InterruptTx);
+    E1000eMsiInner();
+    Write(Icr, InterruptReceive | InterruptLsc);
+    E1000eMsiInner();
+    CHECK(msiWakes == 2 && eois == 3);
     return failures != 0;
 }
