@@ -14,10 +14,15 @@ void NvDisplayDesktopStart();
 // The authenticated renderer must keep the PRIME producer idle through this
 // synchronous CE copy. A successful call may queue the flip for next vblank.
 // The caller serializes with compositor presentation/layout changes.
+struct OutputRect;
+struct OutputBackendOps;
 bool NvGlassAvailable();
-int64_t NvGlassPresent(void* prime, uint32_t width, uint32_t height, uint32_t stride);
-// Read the last completed head-0 front, which may predate a queued flip.
-bool NvGlassReadFront(uint32_t* pixels, uint32_t width, uint32_t height);
+bool NvGlassIsSecondary(const OutputBackendOps* backend);
+int64_t NvGlassPresent(uint32_t head, void* prime, uint32_t width, uint32_t height,
+                       uint32_t stride, const OutputRect& rect, uint64_t epoch);
+// Sample the completed head-0 front, which may predate a queued flip. Set
+// the epoch when it really came from Glass. A null destination only probes it.
+bool NvGlassReadFront(uint32_t* pixels, uint32_t width, uint32_t height, uint64_t* epoch);
 // Head-0 window ARM state (ISO ctxdma handle, offset) and the flip fence: while fenced, no
 // head-0 flip is submitted (damage stays pending). Both log a "fence" line with the ARM state.
 struct NvHead0Arm { bool live; uint32_t state, iso, offset; };

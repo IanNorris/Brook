@@ -1036,7 +1036,9 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
        layers.count>BROOK_DESKTOP_LAYER_LIMIT ||
        syscall(BROOK_SYS_DESKTOP_LAYERS,BROOK_DESKTOP_BACKDROP_QUERY,&backdrop,sizeof(backdrop),0,0,0))goto done;
     uint32_t width=backdrop.layers[0].width,height=backdrop.layers[0].height;
-    if(!width || !height || width>4096 || height>2160 || (uint64_t)width*height*4>BROOK_GPU_OUTPUT_MAX_BYTES)goto done;
+    if(g_nvGlass ? !BrookGpuNvGlassFrameFits(width,height) :
+       (!width || !height || width>4096 || height>2160 ||
+        (uint64_t)width*height*4>BROOK_GPU_OUTPUT_MAX_BYTES)){errno=ENOTSUP;goto done;}
     /* Surface records (layers ABI v2): EINVAL from an older kernel turns
      * them off for good; any other failure leaves this frame without. */
     g_frameSurfaces.count=0;

@@ -150,6 +150,14 @@ struct BrookGpuPresentFrame {
 #define BROOK_GPU_HANDOFF_NV_ATTACH 40
 #define BROOK_GPU_HANDOFF_NV_PRESENT 41
 #define BROOK_GPU_HANDOFF_NV_DETACH 42
+#define BROOK_GPU_NV_GLASS_MAX_WIDTH 8192u
+#define BROOK_GPU_NV_GLASS_MAX_HEIGHT 4320u
+static inline int BrookGpuNvGlassFrameFits(uint32_t width,uint32_t height)
+{
+    return width && height && width<=BROOK_GPU_NV_GLASS_MAX_WIDTH &&
+        height<=BROOK_GPU_NV_GLASS_MAX_HEIGHT &&
+        (uint64_t)width*height*4<=BROOK_GPU_OUTPUT_MAX_BYTES;
+}
 struct BrookGpuNvPresent {
     uint64_t display;
     int32_t fd;

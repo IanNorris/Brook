@@ -603,8 +603,8 @@ int main(int argc, char** argv) {
         const uint32_t width = 8, height = 18, pitch = 4096, destPitch = 64;
         cp.in.si.usable_hi = 0x150000000ull;
         for (uint32_t y = 0; y < height; ++y)
-            for (uint32_t x = 0; x < width; ++x)
-                r.gpu.SetVram32(video + uint64_t(y) * pitch + x * 4, 0x00ab0000u + y * width + x);
+            for (uint32_t x = 0; x < 2 * width; ++x)
+                r.gpu.SetVram32(video + uint64_t(y) * pitch + x * 4, 0x00ab0000u + y * (2 * width) + x);
         NvCeJob job{};
         job.width = width; job.height = height;
         job.video_src = video; job.video_pitch = pitch;
@@ -614,7 +614,15 @@ int main(int argc, char** argv) {
         assert(cp.st.remaps == 0 && cp.st.layer_maps == 0);
         for (uint32_t y = 0; y < height; ++y)
             for (uint32_t x = 0; x < width; ++x)
-                assert(r.gpu.Vram32(job.dst_vram + uint64_t(y) * destPitch + x * 4) == 0xffab0000u + y * width + x);
+                assert(r.gpu.Vram32(job.dst_vram + uint64_t(y) * destPitch + x * 4) == 0xffab0000u + y * (2 * width) + x);
+        // The second scanout ring reads the right-hand crop of each wide row.
+        job.video_src = video + width * 4;
+        job.dst_vram = 0x4400000;
+        assert(r.CePresentOnce(cp, job, {}, &bytes) == 1 && bytes == uint64_t(width) * height * 4);
+        for (uint32_t y = 0; y < height; ++y)
+            for (uint32_t x = 0; x < width; ++x)
+                assert(r.gpu.Vram32(job.dst_vram + uint64_t(y) * destPitch + x * 4) ==
+                       0xffab0000u + y * (2 * width) + width + x);
         const uint32_t ptes = cp.k.ptes;
         assert(r.CePresentOnce(cp, job, {}, &bytes) == 1 && cp.k.ptes == ptes);
         job.video_src = cp.in.si.usable_hi - 4;

@@ -5,6 +5,7 @@
 #include "../test_nv_disp_head/head_fake.h"
 #include "nv_disp_driver.h"
 #include "nv_disp_hole.h"
+#include "nv_glass_layout.h"
 static Rom g_rom;
 
 struct DRig{
@@ -344,7 +345,33 @@ static void TestHolePresent(){
      bool allOk=true;for(auto& b:t.buf)allOk&=t.Shows(b);assert(!allOk);}   // the BO's frame lingers
     (void)before;
 }
+static void TestGlassLayoutAndLease(){
+    using namespace brook;
+    NvGlassCrop a,b;
+    constexpr uint32_t pitch=7680*4;
+    assert(NvGlassFrameCrop(7680,2160,pitch,{0,0,3840,2160},a));
+    assert(NvGlassFrameCrop(7680,2160,pitch,{3840,0,3840,2160},b));
+    assert(a.offset==0 && b.offset==3840*4 && a.end==uint64_t(pitch)*2160-3840*4);
+    assert(b.end==uint64_t(pitch)*2160);
+    assert(!NvGlassFrameCrop(7680,2160,pitch,{3840,0,3841,2160},b));
+    assert(!NvGlassFrameCrop(7680,2160,pitch,{0,-1,3840,2160},b));
+    assert(!NvGlassFrameCrop(7680,2160,pitch-4,{3840,0,3840,2160},b));
+    assert(!NvGlassFrameCrop(8192,4320,8192*4,{0,0,3840,2160},b));
+
+    NvGlassLeases leases;
+    assert(!leases.Reset(10));
+    assert(leases.heads[0].Acquire(1,100,500));
+    assert(leases.heads[1].Acquire(1,160,500));
+    assert(leases.ActiveMask(10,599)==3 && leases.ActiveMask(10,599,2)==0);
+    assert(leases.ActiveMask(10,600)==2 && !leases.heads[1].CanAcquire(2,600));
+    assert(leases.Expire(600));
+    assert(!leases.Release(2) && leases.ActiveMask(10,650)==2);
+    assert(leases.ActiveMask(11,650)==0 && leases.Reset(11));
+    assert(leases.heads[0].Acquire(1,700,500));
+    assert(leases.Release(1) && leases.ActiveMask(11,700)==0);
+}
 int main(){
+    TestGlassLayoutAndLease();
     TestSubtractRect();TestHolePresent();
     TestShadowDiff();TestUsToWrap();TestHeadOneThird();TestDown1WithQueuedFrame();
     TestOutput0();TestBothOutputs();TestFailures();TestPacing();TestLoadv();TestAgeRepair();TestTripleMailbox();TestVblankCounter();

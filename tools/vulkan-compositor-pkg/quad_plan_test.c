@@ -3,6 +3,7 @@
  * fixed-function blending) against composite.comp's per-pixel loop. */
 #include "quad_plan.h"
 #include "quad_reference.h"
+#include "gpu_output_abi.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -180,7 +181,25 @@ static int random_scene(unsigned iteration){
     return 0;
 }
 
+static int dual_4k_scene(void){
+    enum { HEAD_W=3840,W=HEAD_W*2,H=2160,LAYER_W=320,LAYER_H=240 };
+    CHECK(BrookGpuNvGlassFrameFits(W,H));
+    CHECK(!BrookGpuNvGlassFrameFits(8192,4320));
+    uint32_t scene[BROOK_VK_SCENE_HEADER+2*BROOK_VK_LAYER_WORDS]={W,H,2,0};
+    set_layer(scene,0,&(struct BrookVkSceneLayer){0,W,W,H,0,0,W,H,0,0,W,H,0,0,W,H,255});
+    set_layer(scene,1,&(struct BrookVkSceneLayer){0,LAYER_W,LAYER_W,LAYER_H,0,0,LAYER_W,LAYER_H,
+        HEAD_W-LAYER_W/2,600,LAYER_W,LAYER_H,0,0,W,H,255});
+    const struct DesktopDamageSet full={1,{{0,0,W,H}}};
+    static struct QuadPlan plan;
+    CHECK(quad_plan_build_auto(scene,sizeof(scene)/4,NULL,&full,1,&plan));
+    CHECK(plan.damagePixels==(uint64_t)W*H);
+    CHECK(layer_draws_intersect(&plan,1,(struct QuadRect){HEAD_W-1,600,HEAD_W,840}));
+    CHECK(layer_draws_intersect(&plan,1,(struct QuadRect){HEAD_W,600,HEAD_W+1,840}));
+    puts("QUAD_PLAN_DUAL_4K_PASS");
+    return 0;
+}
 int main(void){
+    if(dual_4k_scene())return 1;
     if(desktop_scene())return 1;
     if(game_over_idle())return 1;
     for(unsigned i=0;i<4000;++i)if(random_scene(i))return 1;
