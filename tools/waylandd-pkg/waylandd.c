@@ -3108,6 +3108,8 @@ static void focus_reconcile(void) {
         sc->kb_focus=focused;text_input_focus(sc,focused);
     }
     if (g_focus_reconciled_wm==focused->wm_id) return;
+    // An X window not yet paired with its X state is retried next pump.
+    if (focused->role==4 && !xwayland_surface_ready(focused)) return;
     g_focus_reconciled_wm=focused->wm_id;
     xwayland_focus_reconciled(focused);
 }

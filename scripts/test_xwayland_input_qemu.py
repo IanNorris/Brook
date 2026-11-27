@@ -198,8 +198,13 @@ def main():
                      for t, r in windows().items()}
             return [px, py, state]
 
-        if args.popups:  # let the popup storm finish before input steps
-            time.sleep(args.popups * 0.5)
+        if args.popups:  # let the popup storm finish before the input steps
+            deadline = time.monotonic() + 300
+            while time.monotonic() < deadline:
+                time.sleep(3)
+                seen = guest.call('hw_job', operation_id=probe_id, wait_s=0, output_limit=16384)
+                if 'POPUPS' in seen.get('stdout', {}).get('text', ''):
+                    break
         rows = wait_windows(PROBE_TITLES[:2])
         result['windows_initial'] = {t: window_rect(r, 'client') for t, r in rows.items()}
         steps = []
