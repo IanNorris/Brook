@@ -132,7 +132,7 @@ template<typename B> struct NvWindowFlipper{
         put+=bytes;Wr(RegPut(chid),put);
         return state!=FlipState::Failed;
     }
-    uint32_t armLine=0,armLoadv=0;
+    uint32_t armLine=0,armLoadv=0;bool armLoadvSure=false;uint32_t armLoadvUnsure=0;
     uint32_t lastKickOff=0,lastKickN=0;   // ring offset and word count of the last kick (failure diagnostics)
     uint8_t kickMode=1;
     // Stale-fetch recovery (27 Nov): the window fetched the kick (GET == PUT, idle, no exception)
@@ -145,6 +145,18 @@ template<typename B> struct NvWindowFlipper{
     bool ArmWords(const uint32_t* w,uint32_t n,uint32_t iso,uint32_t offset){
         armLoadv=b->rd(RegLoadvCounter(head));
         if(!Kick(w,n))return false;
+        // 27 Nov (one-frame bands of another frame on head 0, Ian's photo): a vblank between the
+        // sample above and the engine taking the UPDATE moves the counter without latching this
+        // flip, so Complete() reported it a frame early and the buffer still being scanned out
+        // was rewritten by the next present. Re-sample once the engine has taken the methods
+        // (GET==PUT, ARM shows the target); if that is not seen within a few us, completion
+        // needs two LOADVs instead (a frame late at worst, never early).
+        armLoadvSure=false;
+        for(uint32_t i=0;i<64;++i){
+            if(b->rd(RegGet(chid))==put&&b->rd(RegArm(chid,c57e::SET_OFFSET0))==offset){
+                armLoadv=b->rd(RegLoadvCounter(head));armLoadvSure=true;break;}
+        }
+        if(!armLoadvSure)++armLoadvUnsure;
         armLine=b->rd(RegRgPos(head))&0xffff;
         armedIso=iso;armedTarget=offset;armedAtUs=b->nowUs();state=FlipState::Armed;return true;}
     void Arm(int8_t buf){
@@ -171,7 +183,7 @@ template<typename B> struct NvWindowFlipper{
                (b->rd(RegChnStatus(chid))&(kWinMethodExecBusy|0xf00))==0x100;
         if(!armedOk)return false;
         if(!loadvLive)return true;
-        if(b->rd(RegLoadvCounter(head))!=armLoadv)return true;           // loaded at a vblank: on screen
+        if(b->rd(RegLoadvCounter(head))-armLoadv>=(armLoadvSure?1u:2u))return true;   // loaded at a vblank: on screen
         // A counter that never moves (>= 3 frames' time armed) is not trusted: fall back.
         if(b->nowUs()-armedAtUs>60000){loadvLive=false;++loadvStuck;return true;}
         return false;}
