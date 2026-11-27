@@ -77,7 +77,9 @@ extern "C" void SerialPrintf(const char*, ...) {}
 extern "C" void SerialPuts(const char*) {}
 // Each thread is its own task sharing the leader's fd table (CLONE_FILES),
 // so per-task fields such as wakeupTick are not shared between threads.
+static thread_local Process* t_forked;   // a test thread acting as a forked child (its own fd table)
 Process* ProcessCurrent() {
+    if (t_forked) return t_forked;
     static thread_local Process* task;
     if (!task) {
         task = static_cast<Process*>(calloc(1, sizeof(Process)));
@@ -113,7 +115,7 @@ void FdPut(Process* proc, int fd) {
         LockGuard g(&g_fdLock);
         auto& e = proc->fds[fd];
         if (--e.pinCount || !e.closing) return;
-        type = e.type; handle = e.handle; FdSlotClear(e);
+        type = e.type; handle = e.handle; OpenFileRelease(e.file); FdSlotClear(e);
     }
     Finalize(type, handle);
 }
@@ -123,6 +125,7 @@ int FdAlloc(Process* proc, FdType type, void* handle, uint32_t, uint8_t flags, u
         auto& e = proc->fds[i];
         if (e.type != FdType::None) continue;
         FdSlotClear(e); e.type = type; e.handle = handle; e.flags = flags; e.fdFlags = fdFlags;
+        e.file = OpenFileCreate(0);   // a new open file description per allocation
         return i;
     }
     return -EMFILE;
@@ -134,9 +137,24 @@ static void TestClose(int fd) {
         auto& e = g_proc->fds[fd];
         if (e.type == FdType::None || e.closing) return;
         if (e.pinCount) { e.closing = 1; return; } // last FdPut finalizes
-        type = e.type; handle = e.handle; FdSlotClear(e);
+        type = e.type; handle = e.handle;
+        // The object goes only with its description's last fd (dup/fork share it).
+        const bool last = !e.file || __atomic_load_n(&e.file->refs, __ATOMIC_ACQUIRE) == 1;
+        OpenFileRelease(e.file); FdSlotClear(e);
+        if (!last && type != FdType::EpollFd) return;   // epoll instances hold one reference per slot
     }
     Finalize(type, handle);
+}
+// dup(fd) into the lowest free slot: the same description (Linux dup).
+static int TestDup(Process* proc, int fd) {
+    LockGuard g(&g_fdLock);
+    for (int i = 0; i < static_cast<int>(MAX_FDS); ++i) {
+        auto& e = proc->fds[i];
+        if (e.type != FdType::None) continue;
+        e = proc->fds[fd]; e.pinCount = 0; e.closing = 0; OpenFileRetain(e.file);
+        return i;
+    }
+    return -EMFILE;
 }
 
 uint64_t CopyFromUserBytes(void* d, uint64_t s, uint64_t n) { __builtin_memcpy(d, reinterpret_cast<const void*>(s), n); return n; }
@@ -506,6 +524,77 @@ static void TestSyncFileWake() {
     BdwFenceUnref(producer);
 }
 
+
+// Linux epoll registrations are (fd number, open file description). close() of the
+// description's last fd drops it; a new description reusing the fd number must be
+// accepted by EPOLL_CTL_ADD (27 Nov: Steam's completion port asserted on EEXIST
+// after fd reuse, then its IPC pipe failed and the client shut down).
+static void TestFdReuse() {
+    const int ep = Create();
+    EpollEvent out[8];
+    // close -> reopen at the same number -> ADD
+    int a = EventFd(1);
+    CHECK(Ctl(ep, EPOLL_CTL_ADD, a, EPOLLIN, 0xa) == 0);
+    TestClose(a);
+    int b = EventFd(0);
+    CHECK(b == a);
+    CHECK(Ctl(ep, EPOLL_CTL_ADD, b, EPOLLIN, 0xb) == 0);           // not EEXIST
+    CHECK(Ctl(ep, EPOLL_CTL_ADD, b, EPOLLIN, 0xb) == -EEXIST);      // a real duplicate still is
+    CHECK(Wait(ep, out, 8, 0) == 0);                                 // the new one is not ready
+    Signal(b, 1);
+    CHECK(Wait(ep, out, 8, 0) == 1 && out[0].data.u64 == 0xb);       // and its own data is reported
+    // MOD/DEL see only the live registration
+    TestClose(b);
+    int c = EventFd(1);
+    CHECK(c == b && Ctl(ep, EPOLL_CTL_MOD, c, EPOLLIN, 0xc) == -ENOENT);
+    CHECK(Ctl(ep, EPOLL_CTL_DEL, c, 0, 0) == -ENOENT);
+    CHECK(Ctl(ep, EPOLL_CTL_ADD, c, EPOLLIN, 0xc) == 0);
+    // dup: closing one fd of a shared description keeps the object alive; the other fd
+    // registers on its own number, and the closed number can be reused and added again.
+    int d = TestDup(g_proc, c);
+    CHECK(d >= 0 && d != c);
+    CHECK(Ctl(ep, EPOLL_CTL_ADD, d, EPOLLIN, 0xd) == 0);
+    TestClose(c);
+    Signal(d, 1);
+    CHECK(Wait(ep, out, 8, 0) >= 1);
+    bool sawD = false; for (int i = 0, n = Wait(ep, out, 8, 0); i < n; ++i) sawD |= out[i].data.u64 == 0xd;
+    CHECK(sawD);
+    int e = EventFd(0);
+    CHECK(e == c && Ctl(ep, EPOLL_CTL_ADD, e, EPOLLIN, 0xe) == 0);
+    // fork: the child's copy of the table shares descriptions; its close + reopen at the
+    // same number does not disturb the parent's registrations, and its ADD is accepted.
+    Process* child = static_cast<Process*>(calloc(1, sizeof(Process)));
+    child->pid = 8; child->fds = static_cast<FdEntry*>(calloc(MAX_FDS, sizeof(FdEntry)));
+    {
+        LockGuard g(&g_fdLock);
+        for (unsigned i = 0; i < MAX_FDS; ++i) {
+            child->fds[i] = g_proc->fds[i]; child->fds[i].pinCount = 0; child->fds[i].closing = 0;
+            OpenFileRetain(child->fds[i].file);
+            if (child->fds[i].type == FdType::EpollFd) EpollFdRef(static_cast<EpollInstance*>(child->fds[i].handle));
+        }
+    }
+    bool childOk = FinishesWithin(2000, [&] {
+        t_forked = child;
+        // the child's fd d names the same description: ADD is EEXIST in the shared instance
+        CHECK(Ctl(ep, EPOLL_CTL_ADD, d, EPOLLIN, 0xd) == -EEXIST);
+        t_forked = nullptr;
+    });
+    CHECK(childOk);
+    // the epoll instance's own close frees it once nothing else refers to it
+    const unsigned freesBefore = g_epollFrees;
+    TestClose(ep);
+    CHECK(g_epollFrees == freesBefore);          // the child's copy still holds it
+    {
+        LockGuard g(&g_fdLock);
+        auto& ce = child->fds[ep];
+        if (ce.type == FdType::EpollFd && EpollFdUnref(static_cast<EpollInstance*>(ce.handle))) Inc(g_epollFrees);
+        for (unsigned i = 0; i < MAX_FDS; ++i) OpenFileRelease(child->fds[i].file);
+    }
+    CHECK(g_epollFrees == freesBefore + 1);
+    const int ep2 = Create();
+    CHECK(ep2 == ep && Ctl(ep2, EPOLL_CTL_ADD, e, EPOLLIN, 0xe) == 0);
+    TestClose(ep2); TestClose(d); TestClose(e);
+}
 int main() {
     g_proc = static_cast<Process*>(calloc(1, sizeof(Process)));
     g_proc->pid = 7;
@@ -516,6 +605,7 @@ int main() {
     TestCtlWaitStress();
     TestCloseDuringWait();
     TestSyncFileWake();
+    TestFdReuse();
     if (g_failures) { fprintf(stderr, "%u failure(s)\n", g_failures); return 1; }
     printf("test_epoll_instance_lock: all passed\n");
     return 0;

@@ -22,6 +22,7 @@ import argparse
 import glob
 import json
 import os
+import stat
 from pathlib import Path
 import re
 import shutil
@@ -1039,6 +1040,7 @@ class Steam:
             command = self.command(extra)
             child_env = dict(env, LD_LIBRARY_PATH=':'.join(
                 str(self.client / p) for p in ('hostlibs', 'steamrt64', 'ubuntu12_64')))
+            ensure_dumps_dir()
             if self.stop_requested:
                 raise RuntimeError(f'stopped by {self.stop_requested} before the client started')
             self.main = subprocess.Popen(command, env=child_env, stdin=subprocess.DEVNULL, stdout=output,
@@ -1070,6 +1072,22 @@ class Steam:
             log('stopped', reason=reason, exit=code, cleanup_s=round(time.monotonic() - started, 1),
                 leftovers=sorted(leftovers))
         return code
+
+
+def ensure_dumps_dir(path=Path('/tmp/dumps')):
+    """Steam's crash handler wants a shared /tmp/dumps (mode 1777, as on Linux). Under the
+    launcher's umask 077 it created it 01700, then reported "insufficient permissions - delete
+    and recreate" on every crash and wrote no minidump (27 Nov). Fix ours; leave others' alone."""
+    try:
+        if not path.exists():
+            path.mkdir()
+        st = path.lstat()
+        if stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and stat.S_IMODE(st.st_mode) != 0o1777:
+            os.chmod(path, 0o1777)
+        elif st.st_uid != os.getuid():
+            log('dumps dir owned by another user; Steam may not write minidumps', path=str(path), uid=st.st_uid)
+    except OSError as error:
+        log('dumps dir not prepared', path=str(path), error=str(error))
 
 
 def main(argv=None):

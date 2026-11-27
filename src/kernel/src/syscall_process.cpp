@@ -540,12 +540,16 @@ static int WaitChildEvent(Process* caller, int selector, uint32_t id,
     }
 }
 
+static constexpr uint32_t WaitAllChildren = 0x40000000u, WaitNoThread = 0x20000000u; // __WALL, __WNOTHREAD
 int64_t sys_wait4(uint64_t pidArg, uint64_t statusAddr, uint64_t rawOptions,
                   uint64_t usageAddr, uint64_t, uint64_t)
 {
     Process* parent = ProcessCurrent();
     if (!parent) return -ESRCH;
-    uint32_t options = static_cast<uint32_t>(rawOptions);
+    // __WALL and __WNOTHREAD are accepted: Brook does not track a child's exit signal, so
+    // every child already counts (__WALL), and the caller's group is the waiter. Breakpad
+    // (Steam's crash handler) waits for its clone()d dumper with __WALL; EINVAL lost the dump.
+    uint32_t options = static_cast<uint32_t>(rawOptions) & ~(WaitAllChildren | WaitNoThread);
     if (options & ~(WNOHANG | WUNTRACED | WCONTINUED)) return -EINVAL;
     if (statusAddr && !UserBufferWritable(statusAddr, sizeof(int32_t))) return -EFAULT;
     if (usageAddr && !UserBufferWritable(usageAddr, 144)) return -EFAULT;
@@ -569,7 +573,7 @@ int64_t sys_waitid(uint64_t rawSelector, uint64_t rawId, uint64_t infoAddr,
     if (!parent) return -ESRCH;
     uint32_t selector = static_cast<uint32_t>(rawSelector);
     uint32_t id = static_cast<uint32_t>(rawId);
-    uint32_t options = static_cast<uint32_t>(rawOptions);
+    uint32_t options = static_cast<uint32_t>(rawOptions) & ~(WaitAllChildren | WaitNoThread);
     if (selector > 2 || (selector == 1 && static_cast<int32_t>(id) <= 0) ||
         (selector == 2 && static_cast<int32_t>(id) < 0) ||
         (options & ~(WNOHANG | WUNTRACED | WEXITED | WCONTINUED | WNOWAIT)) ||

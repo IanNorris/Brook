@@ -14,6 +14,7 @@ struct EpollEntry {
     int      fd;      // watched fd (-1 = free)
     uint32_t events;  // requested events
     uint64_t data;    // user data (uint64)
+    uint64_t file = 0; // the open file description's identity (0 = unknown: match by fd only)
     uint64_t eventFdIdentity = 0; // zero means initial/MOD delivery is pending
     uint64_t inGeneration = 0;
     uint64_t outGeneration = 0;

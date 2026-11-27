@@ -48,7 +48,10 @@ struct OpenFile
     uint32_t statusFlags;  // access mode + O_* status flags; atomic access only
     uint64_t offset;       // file position; RMW under posLock
     KMutex   posLock;      // sleeping: held across blocking VFS I/O
+    uint64_t identity;     // never reused (epoll keys registrations by fd number + description)
 };
+inline uint64_t g_openFileIdentity = 0;
+inline uint64_t OpenFileIdentity(const OpenFile* file) { return file ? file->identity : 0; }
 
 // A new description with one reference, offset 0, and the open flags minus
 // the call-only bits. Returns nullptr when out of memory.
@@ -59,6 +62,7 @@ inline OpenFile* OpenFileCreate(uint32_t openFlags)
     file->refs = 1;
     file->statusFlags = openFlags & ~OPEN_FILE_CALL_ONLY_FLAGS;
     file->offset = 0;
+    file->identity = __atomic_add_fetch(&g_openFileIdentity, 1, __ATOMIC_RELAXED);
     KMutexInit(&file->posLock);
     return file;
 }

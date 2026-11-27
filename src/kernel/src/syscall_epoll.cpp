@@ -258,7 +258,13 @@ struct EpollWalk {
             for (int k = 0; k < n; ++k) {
                 const EpollEntry& e = buffer[k];
                 if (e.fd < 0) continue;
-                if (!pin(e.fd)) { EpollForgetClosed(ep, base + k, e.fd, generation); continue; }
+                // Linux keys a registration by (fd number, open file description) and drops it
+                // when the description's last fd closes; an entry whose fd number now names
+                // another description is stale (Steam: epoll_ctl ADD got EEXIST after close).
+                FdEntry* pinned = pin(e.fd);
+                if (!pinned || (e.file && pinned->file && OpenFileIdentity(pinned->file) != e.file)) {
+                    EpollForgetClosed(ep, base + k, e.fd, generation); continue;
+                }
                 if (visit(e, base + k)) return true;
             }
             if (n < EPOLL_SNAPSHOT_CHUNK) return false;
@@ -538,8 +544,10 @@ int64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t watchfd,
         bool exists = false;
         {
             EpollInstanceGuard guard(ep);
+            const uint64_t id = OpenFileIdentity(watchref->file);
             for (int i = 0; i < EPOLL_MAX_FDS && !exists; i++)
-                exists = ep->entries[i].fd == static_cast<int>(watchfd);
+                exists = ep->entries[i].fd == static_cast<int>(watchfd) &&
+                         (!ep->entries[i].file || !id || ep->entries[i].file == id);
         }
         if (!exists) { // EEXIST takes precedence; it is reported below.
             EpollWalkOwner state(proc);
@@ -559,11 +567,19 @@ int64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t watchfd,
     }
     EpollInstanceGuard guard(ep);
     ++ep->ctlGeneration;
-    int existing = -1, free = -1;
+    // A registration is (fd number, description). An entry for this fd number but another
+    // description was left by a close (the description's last fd) and is replaced.
+    const uint64_t fileId = OpenFileIdentity(watchref->file);
+    int existing = -1, free = -1, stale = -1;
     for (int i = 0; i < EPOLL_MAX_FDS; i++) {
-        if (ep->entries[i].fd == static_cast<int>(watchfd)) existing = i;
-        if (ep->entries[i].fd < 0 && free < 0) free = i;
+        const auto& e = ep->entries[i];
+        if (e.fd == static_cast<int>(watchfd)) {
+            if (!e.file || !fileId || e.file == fileId) existing = i;
+            else stale = i;
+        }
+        if (e.fd < 0 && free < 0) free = i;
     }
+    if (stale >= 0 && op != EPOLL_CTL_ADD) ep->entries[stale].fd = -1;
     if (op == EPOLL_CTL_DEL) {
         if (existing < 0) return -ENOENT;
         ep->entries[existing].fd = -1;
@@ -581,9 +597,10 @@ int64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t watchfd,
 #endif
         return -EEXIST;
     }
-    int slot = op == EPOLL_CTL_MOD ? existing : free;
+    int slot = op == EPOLL_CTL_MOD ? existing : (stale >= 0 ? stale : free);
     if (slot < 0) return -ENOMEM;
     ep->entries[slot] = {static_cast<int>(watchfd), ev.events, ev.data.u64};
+    ep->entries[slot].file = fileId;
 #if defined(BROOK_EPOLL_TARGET_DIAGNOSTICS)
     if(EpollDiagEnabled()) {
         ep->entries[slot].diagHandle=watchref->handle;
