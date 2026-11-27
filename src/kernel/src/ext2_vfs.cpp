@@ -8,6 +8,7 @@
 // symlink creation, and the VfsFsOps vtable.
 
 #include "ext2_vfs.h"
+#include "ext2_options.h"
 #include "fs/write_behind_queue.h"
 #include "vfs.h"
 #include "vfs_object.h"
@@ -333,16 +334,6 @@ static uint32_t g_ext2WritebackMiB = 0; // opt-in until native acceptance
 static uint32_t g_ext2WritebackMs = 1000;
 static bool g_ext2QueueAvailable = true;
 static bool g_ext2SynchronousFallback = false;
-static uint32_t Ext2ParseBounded(const char* value,uint32_t length,
-                                uint32_t low,uint32_t high,uint32_t fallback) {
-    if(!length || length>5)return fallback;
-    uint32_t result=0;
-    for(uint32_t i=0;i<length;++i) {
-        if(value[i]<'0' || value[i]>'9')return fallback;
-        result=result*10+static_cast<uint32_t>(value[i]-'0');
-    }
-    return result>=low && result<=high?result:fallback;
-}
 // Bounded experimental batching knob; zero never disables durability progress.
 static uint32_t Ext2ParseAutoSyncOps(const char* value, uint32_t length) {
     if(!length || length>5)return 256;
@@ -5045,10 +5036,23 @@ void Ext2ConfigureAutoSync() {
     char option[8]{};
     const uint32_t length=FwCfgReadFile("opt/ext2-auto-sync-ops",option,sizeof(option));
     g_ext2AutoSyncOps=Ext2ParseAutoSyncOps(option,length);
-    const auto size=FwCfgReadFile("opt/ext2-writeback-mib",option,sizeof(option));
+    // Write-behind: QEMU fw_cfg, or on hardware the initrd's /etc markers (builder
+    // --ext2-writeback-mib). 27 Nov: without it the RTX desktop's BROOK_SYSTEM wrote every
+    // block synchronously (Steam validation: 2,500 writes/s of ~1.8 KB).
+    auto option_from=[&](const char* fwcfg,const char* etc)->uint32_t {
+        uint32_t n=FwCfgReadFile(fwcfg,option,sizeof(option));
+        if(n)return n;
+        if(auto* f=VfsOpen(etc,VFS_O_STREAM)) {
+            uint64_t offset=0;const int r=VfsRead(f,option,sizeof(option),&offset);VfsRelease(f);
+            return r>0?static_cast<uint32_t>(r):0;
+        }
+        return 0;
+    };
+    const auto size=option_from("opt/ext2-writeback-mib","/etc/ext2-writeback-mib");
     g_ext2WritebackMiB=Ext2ParseBounded(option,size,0,16,0);
-    const auto age=FwCfgReadFile("opt/ext2-writeback-ms",option,sizeof(option));
+    const auto age=option_from("opt/ext2-writeback-ms","/etc/ext2-writeback-ms");
     g_ext2WritebackMs=Ext2ParseBounded(option,age,250,10000,1000);
+    if(g_ext2WritebackMiB)SerialPrintf("ext2: write-behind %u MiB, age %u ms\n",g_ext2WritebackMiB,g_ext2WritebackMs);
     SerialPrintf("ext2: automatic sync every %u allocation/free operations\n",g_ext2AutoSyncOps);
 #endif
 }

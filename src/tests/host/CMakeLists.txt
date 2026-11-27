@@ -1310,3 +1310,7 @@ target_include_directories(test_rtx_stick_update PRIVATE "${BROOK_ROOT}/src/thir
 # Debug-channel inject verbs: button / relative-motion argument parsing (net.cpp).
 add_host_test(test_inject_parse)
 target_compile_options(test_inject_parse PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
+
+# ext2 write-behind options (fw_cfg / /etc/ext2-writeback-mib).
+add_host_test(test_ext2_options)
+target_compile_options(test_ext2_options PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
