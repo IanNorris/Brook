@@ -81,7 +81,9 @@ ETC_ALLOWED = {*MARKERS, 'i219-attach', 'i219-reset', 'hardware-payload-id', 're
                # --nv-gsp (GSP-RM M1 bridge verbs) and its firmware record
                'nv-gsp', 'nv-gsp-firmware', 'nv-gsp-no-autostart', 'nv-drm', 'nv-gsp-registry', 'nv-gsp-no-scrubber', 'usb-system-no-mount', 'nv-gsp-swgen0-ack', 'nv-gsp-primary', 'nv-gsp-no-ce-present', 'nv-gsp-headless-p4', 'nv-gsp-no-bar1-identity', 'nv-drm-vas-invalidate',
                # waylandd renderD130 dmabuf import (work/nv-dmabuf)
-               'waylandd-nv-dmabuf'}
+               'waylandd-nv-dmabuf',
+               # opt-in Xwayland input tracing (waylandd key delivery, brook-xwm X routing)
+               'xwayland-input-trace'}
 # --tcp-markers: the experimental windowed TCP sender (docs/tcp-sender-pipeline-plan.md), the
 # set scripts/test_guard_repair_handoff_qemu.py exercises. The default sender is stop-and-wait
 # (one MSS per RTT: ~1.2 Mbit/s upload at a 10 ms RTT, 27 Nov desktop speed test).
@@ -368,6 +370,8 @@ def desktop_payload(args, initrd):
             fat_write(initrd, 'BOOT/BIN/VKDIRECT', (ROOT / 'tools/vkdirect/vkdirect').read_bytes())
         if args.nv_drm and getattr(args, 'steam_vk_icd', None):  # brook-steam exports it as VK_DRIVER_FILES
             fat_write(initrd, 'ETC/steam-vk-icd', (args.steam_vk_icd + '\n').encode())
+        if getattr(args, 'xwayland_input_trace', False):  # log where Xwayland input goes (diagnostic)
+            fat_write(initrd, 'ETC/xwayland-input-trace', b'1\n')
         if args.nv_drm_vas_invalidate:  # A/B: renderD130 VM_BIND invalidates its own PDB only
             fat_write(initrd, 'ETC/nv-drm-vas-invalidate', b'1\n')
         if args.nv_gsp_headless_p4:  # A/B: nv-disp drives the heads, GSP-RM boots headless
@@ -747,6 +751,8 @@ def main():
     p.add_argument('--nv-gsp-no-bar1-identity', action='store_true', help='with --nv-display: keep-display P4, no BAR1 identity map (A/B)')
     p.add_argument('--waylandd', type=Path, metavar='BIN', help='run this waylandd from /boot/bin (its closure must be on the SSD)')
     p.add_argument('--xwm', type=Path, metavar='BIN', help='with --waylandd: run this brook-xwm from /boot/bin (its closure must be on the SSD)')
+    p.add_argument('--xwayland-input-trace', action='store_true',
+                   help='/etc/xwayland-input-trace: waylandd logs key delivery, brook-xwm logs where X routes presses')
     p.add_argument('--waylandd-nv-dmabuf', action='store_true', help='with --nv-drm: /etc/waylandd-nv-dmabuf (renderD130 dmabuf import)')
     p.add_argument('--nv-drm-vas-invalidate', action='store_true', help='with --nv-drm: VAS-scoped MMU invalidate on VM_BIND (A/B)')
     p.add_argument('--nv-gsp-headless-p4', action='store_true', help='with --nv-display: GSP-RM boots headless (A/B)')

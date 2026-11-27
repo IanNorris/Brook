@@ -6,6 +6,7 @@
 #include <xcb/composite.h>
 #include <xcb/xcb_cursor.h>
 #include <xcb/res.h>
+#include <xcb/xinput.h>
 #include <poll.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -42,6 +43,10 @@ struct xwm {
      * which an older waylandd would reject as malformed. */
     int protocol;
     int client_pids; /* BROOK_XWM_CLIENT_PID=1: waylandd accepts BXWM_CLIENT_PID */
+    /* BROOK_XWM_TRACE=1 (waylandd sets it for /etc/xwayland-input-trace):
+     * log where X routes each button and key press. xi_opcode is XInput's
+     * major opcode once raw events are selected on the root. */
+    int trace;uint8_t xi_opcode;
     uint32_t scale,client_mask;
     const char *scaled_apps;
     uint32_t scaled_clients[64];
@@ -358,8 +363,38 @@ static int command(struct xwm *wm,const struct bxwm_message *message) {
     }
     return xcb_flush(wm->xcb)>0;
 }
+/* Input tracing: XI2 raw button/key presses reach the root whatever window
+ * X delivers them to. For each, log X's pointer position, the top-level
+ * under it (X's own pick) and the X input focus. */
+static void trace_select(struct xwm *wm) {
+    const xcb_query_extension_reply_t *xi=xcb_get_extension_data(wm->xcb,&xcb_input_id);
+    if (!xi || !xi->present) { fprintf(stderr,"[brook-xwm] trace: no XInput\n");return; }
+    free(xcb_input_xi_query_version_reply(wm->xcb,xcb_input_xi_query_version(wm->xcb,2,2),NULL));
+    struct { xcb_input_event_mask_t head;uint32_t mask; } mask={{XCB_INPUT_DEVICE_ALL_MASTER,1},
+        XCB_INPUT_XI_EVENT_MASK_RAW_KEY_PRESS|XCB_INPUT_XI_EVENT_MASK_RAW_BUTTON_PRESS};
+    xcb_input_xi_select_events(wm->xcb,wm->root,1,&mask.head);
+    wm->xi_opcode=xi->major_opcode;
+    xcb_get_geometry_reply_t *root=xcb_get_geometry_reply(wm->xcb,xcb_get_geometry(wm->xcb,wm->root),NULL);
+    if (root) fprintf(stderr,"[brook-xwm] trace: X root %ux%u\n",root->width,root->height);
+    free(root);
+}
+static void trace_event(struct xwm *wm,xcb_generic_event_t *generic) {
+    const xcb_ge_generic_event_t *ge=(const void *)generic;
+    if (ge->extension!=wm->xi_opcode ||
+        (ge->event_type!=XCB_INPUT_RAW_BUTTON_PRESS && ge->event_type!=XCB_INPUT_RAW_KEY_PRESS)) return;
+    const xcb_input_raw_button_press_event_t *raw=(const void *)generic;
+    xcb_query_pointer_reply_t *pointer=xcb_query_pointer_reply(wm->xcb,xcb_query_pointer(wm->xcb,wm->root),NULL);
+    xcb_get_input_focus_reply_t *focus=xcb_get_input_focus_reply(wm->xcb,xcb_get_input_focus(wm->xcb),NULL);
+    struct window *under=pointer?find(wm,pointer->child):NULL;
+    fprintf(stderr,"[brook-xwm] trace %s %u root=%d,%d under=0x%x \"%.32s\" focus=0x%x\n",
+        ge->event_type==XCB_INPUT_RAW_BUTTON_PRESS?"button":"key",raw->detail,
+        pointer?pointer->root_x:-1,pointer?pointer->root_y:-1,pointer?pointer->child:0,
+        under?under->state.title:"",focus?focus->focus:0);
+    free(pointer);free(focus);
+}
 static int event(struct xwm *wm,xcb_generic_event_t *generic) {
     unsigned type=generic->response_type&127;
+    if (type==XCB_GE_GENERIC) { if (wm->trace) trace_event(wm,generic);return 1; }
     struct window *w=NULL;
     switch (type) {
     case XCB_CREATE_NOTIFY: {
@@ -437,6 +472,7 @@ static int event(struct xwm *wm,xcb_generic_event_t *generic) {
                 if (w->state.flags&BXWM_INPUT)
                     xcb_set_input_focus(wm->xcb,XCB_INPUT_FOCUS_PARENT,focus.window,e->time);
                 if (has_protocol(wm,focus.window,wm->take_focus)) protocol_message(wm,focus.window,wm->take_focus,e->time);
+                if (wm->trace) fprintf(stderr,"[brook-xwm] trace focus 0x%x input=%d\n",focus.window,(w->state.flags&BXWM_INPUT)!=0);
                 xcb_change_property(wm->xcb,XCB_PROP_MODE_REPLACE,wm->root,wm->active,XCB_ATOM_WINDOW,32,1,&focus.window);
                 xcb_flush(wm->xcb);
             }
@@ -609,6 +645,7 @@ static int initialize(struct xwm *wm,int wm_fd) {
         sizeof(supported)/sizeof(supported[0])-(wm->protocol>=2?0:1),supported);
     if (wm->scale>1 && !publish_scale_hints(wm)) return 0;
     set_root_cursor(wm,screens.data);
+    if (wm->trace) trace_select(wm);
     xcb_flush(wm->xcb);
     struct bxwm_message ready={.version=BXWM_VERSION,.type=BXWM_READY,.generation=wm->generation,
         .window=wm->root,.width=screens.data->width_in_pixels,.height=screens.data->height_in_pixels};
@@ -630,6 +667,8 @@ int main(int argc,char **argv) {
     if (protocol && !strcmp(protocol,"2")) wm.protocol=2;
     const char *client_pids=getenv("BROOK_XWM_CLIENT_PID");
     wm.client_pids=client_pids && !strcmp(client_pids,"1");
+    const char *trace=getenv("BROOK_XWM_TRACE");
+    wm.trace=trace && !strcmp(trace,"1");
     if (scale && scale[0]>='1' && scale[0]<='4' && !scale[1]) wm.scale=(uint32_t)(scale[0]-'0');
     wm.scaled_apps=getenv("BROOK_XWAYLAND_SCALED_APPS");
     int success=initialize(&wm,(int)wm_fd);
