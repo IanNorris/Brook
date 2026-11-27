@@ -934,7 +934,15 @@ bool Attach()
     if (!rxPhys || (rxPhys & 0xfff) || VmmVirtToPhys(KernelPageTable, g_rxDma.packets).raw() != rxd[0].address) {
         g_failure = "RX ring address"; return false;
     }
-    SerialPrintf("i219: RX ring %u descriptors at phys 0x%lx\n", unsigned(RxRingSize), (unsigned long)rxPhys);
+    {   // every buffer address must be a real frame (27 Nov: a 0 base sent DMA to page 0)
+        uint64_t lo = ~0ull, hi = 0; uint32_t zero = 0;
+        for (uint32_t i = 0; i < RxRingSize; ++i) { const uint64_t a = rxd[i].address; if (!a) ++zero; if (a < lo) lo = a; if (a > hi) hi = a; }
+        for (uint32_t i = 0; i < RingSize; ++i) { const uint64_t a = txd[i].address; if (!a) ++zero; if (a < lo) lo = a; if (a > hi) hi = a; }
+        SerialPrintf("i219: RX ring %u descriptors at phys 0x%lx, TX ring at 0x%lx; buffers 0x%lx..0x%lx, zero=%u\n",
+                     unsigned(RxRingSize), (unsigned long)rxPhys, (unsigned long)VmmVirtToPhys(KernelPageTable, g_txDma.descriptors).raw(),
+                     (unsigned long)lo, (unsigned long)hi, zero);
+        if (zero || lo < 0x100000) { g_failure = "DMA buffer address"; return false; }
+    }
     const uint64_t txPhys = VmmVirtToPhys(KernelPageTable, g_txDma.descriptors).raw();
 
     // Bus mastering: firmware already enabled it (cmd 0006); keep INTx off.
