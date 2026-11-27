@@ -169,6 +169,7 @@ static NetIf* g_netIf = nullptr;
 // from their IRQ handler via NetWakePollThread() so packet processing stays in
 // process context rather than running inline in the ISR.
 static Process* g_netPollThread = nullptr;
+static uint64_t g_netPollLastRx = 0, g_netPollActiveUntil = 0, g_netPollFastWakes = 0; // net_poll 1 ms mode while RX is active
 
 // ARP neighbor table and pending-frame queue (arp_neighbor.h), guarded by
 // g_arpLock. Never held across transmit, SchedulerBlock or another lock.
@@ -1798,7 +1799,14 @@ void NetStartPollThread()
                 // require 10+ round trips; at 50ms poll interval each RT
                 // added ~25ms average latency. 5ms keeps RT latency under
                 // 3ms average while not starving other threads.
-                self->wakeupTick = ApicTickCount() + 5;
+                // 27 Nov (desktop i219, polled): while frames arrive, wake every
+                // 1 ms so a burst cannot overrun the NIC's RX ring between polls;
+                // back to 5 ms after 20 ms without RX.
+                uint64_t rx = 0;
+                for (uint32_t i = 0; i < n; i++) if (NetIf* nif = NetIfAt(i)) rx += nif->rxPackets;
+                const uint64_t tick = ApicTickCount();
+                if (rx != g_netPollLastRx) { g_netPollLastRx = rx; g_netPollActiveUntil = tick + 20; ++g_netPollFastWakes; }
+                self->wakeupTick = tick + (tick < g_netPollActiveUntil ? 1 : 5);
                 SchedulerBlock(self);
             }
         }
@@ -6298,6 +6306,9 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             r.text(",");r.field("rx_queued",s.rxQueued);
             r.text(",");r.field("rx_queue_high_water",s.rxQueueHighWater);
             r.text(",");r.field("tx_depth",s.txDepth);
+            r.text(",");r.field("rx_missed",s.rxMissed);
+            r.text(",");r.field("rx_no_buffer",s.rxNoBuffer);
+            r.text(",");r.field("net_poll_fast_wakes",g_netPollFastWakes);
             r.text(",\"failed\":");r.text(s.failed?"true":"false");r.text("}");
         }
         r.text(",");r.field("tcp_ack_submit_failures",__atomic_load_n(&g_tcpAckSubmissionFailures,__ATOMIC_RELAXED));

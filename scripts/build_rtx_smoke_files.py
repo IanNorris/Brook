@@ -82,6 +82,12 @@ ETC_ALLOWED = {*MARKERS, 'i219-attach', 'i219-reset', 'hardware-payload-id', 're
                'nv-gsp', 'nv-gsp-firmware', 'nv-gsp-no-autostart', 'nv-drm', 'nv-gsp-registry', 'nv-gsp-no-scrubber', 'usb-system-no-mount', 'nv-gsp-swgen0-ack', 'nv-gsp-primary', 'nv-gsp-no-ce-present', 'nv-gsp-headless-p4', 'nv-gsp-no-bar1-identity', 'nv-drm-vas-invalidate',
                # waylandd renderD130 dmabuf import (work/nv-dmabuf)
                'waylandd-nv-dmabuf'}
+# --tcp-markers: the experimental windowed TCP sender (docs/tcp-sender-pipeline-plan.md), the
+# set scripts/test_guard_repair_handoff_qemu.py exercises. The default sender is stop-and-wait
+# (one MSS per RTT: ~1.2 Mbit/s upload at a 10 ms RTT, 27 Nov desktop speed test).
+TCP_MARKERS = ('arp-async-probe', 'tcp-async-neighbor', 'tcp-try-transmit', 'tcp-async-send',
+               'tcp-producer-wake', 'tcp-async-retry-1ms', 'tcp-worker-waiter', 'tcp-adaptive-flight16')
+ETC_ALLOWED |= set(TCP_MARKERS)
 # Desktop live stick (--session desktop): the VMware RC session over the RAM
 # store, plus the RTX status helper. If the store does not mount, the services
 # fail to start and the kernel console, bridge and remote update stay usable.
@@ -379,6 +385,9 @@ def desktop_payload(args, initrd):
             fat_write(initrd, 'ETC/nv-gsp-registry', ('\n'.join(lines) + '\n').encode())
     if args.nv_display:  # desktop presents by flipping head 0 (D2); GOP copy otherwise
         fat_write(initrd, 'ETC/nv-display', b'1\n')
+    if args.tcp_markers:  # experimental windowed TCP sender (upload throughput)
+        for name in TCP_MARKERS:
+            fat_write(initrd, f'ETC/{name}', b'1\n')
     fat_write(initrd, 'ETC/chromium-alsa-device', b'default\n')  # read by the store's brook-chromium
     if args.usb_system:
         # Persistent /nix on the SSD's BROOK_SYSTEM partition (usb_system.cpp)
@@ -677,6 +686,8 @@ def main():
     p.add_argument('--boot-compression-seed', type=Path,
                    help='sign and enable LZ4 boot payloads with a private 32-byte Ed25519 seed')
     p.add_argument('--restart-prompt-seconds', type=int, choices=range(1, 601), metavar='1..600')
+    p.add_argument('--tcp-markers', action='store_true',
+                   help='/etc markers for the experimental windowed TCP sender (async send + adaptive 16-slot flight)')
     p.add_argument('--nv-display', action='store_true',
                    help='desktop image: /etc/nv-display = 1 (RTX head-0 flip presentation at desktop start)')
     p.add_argument('--panic-ingest-url-file', type=Path,
