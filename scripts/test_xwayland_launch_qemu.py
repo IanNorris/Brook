@@ -23,7 +23,8 @@ import test_usb_system_qemu as fixture  # noqa: E402
 from test_xwayland_input_qemu import prepare_files  # noqa: E402
 
 TITLE = 'XWL Launch Test'
-SETUP = r'''set -eu
+SETUP = r'''#!/nix/profile/bin/bash
+set -eu
 mkdir -p /data/home/.local/share/applications
 printf '%s\n' '#!/nix/profile/bin/bash' 'exec /boot/bin/XPROBE --seconds 240 --dialog-delay 999' > /data/home/xwl-launch.sh
 chmod 755 /data/home/xwl-launch.sh
@@ -45,7 +46,8 @@ def main():
     parser.add_argument('--accel', choices=('kvm', 'tcg'), default='kvm')
     args = parser.parse_args()
     args.output.mkdir(mode=0o700, parents=True)
-    args.files = prepare_files(args)
+    # The setup script travels in the set (/boot/bin/XWLSETUP): a short job argv.
+    args.files = prepare_files(args, [('BOOT/BIN/XWLSETUP', SETUP.encode())])
     fixture.adopt_prebuilt(args.files)
     system, fallback = fixture.make_disks(args)
     result = {k: str(getattr(args, k) or 'set') for k in ('kernel', 'waylandd', 'xwm')}
@@ -59,7 +61,7 @@ def main():
         guest.attach()
         setup_id = uuid.uuid4().hex
         job = guest.call('hw_guest_run', request_id=setup_id, uid=1000, cwd='/tmp',
-                         argv=['/nix/profile/bin/bash', '-c', SETUP], wait_s=4)
+                         argv=['/nix/profile/bin/bash', '/boot/bin/XWLSETUP'], wait_s=4)
         deadline = time.monotonic() + 600  # brook-apps-index scans the profile's icon themes
         while job.get('state') != 'completed' and time.monotonic() < deadline:
             # Short polls: a held session lock starves the script's staged upload.

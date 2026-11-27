@@ -27,20 +27,28 @@ CHROMIUM = '/nix/store/q2mhvi0zha12xj61xpkywxxcg3pi7vm2-chromium-brook-148.0.777
 KEYS = 'qwertyuiop'
 
 
-def body(name, colour):
-    return ('<title>%s c=0 k=</title><body style="margin:0;background:%s">'
-            '<script>let c=0,k="";function t(){document.title="%s c="+c+" k="+k}'
-            'onmousedown=()=>{c++;t()};onkeydown=e=>{k+=e.key;t()};</script>') % (name, colour, name)
+def body(name, colour, select=False):
+    """Title "<name> c=<presses> k=<keys> s=<selected> x=<clientX> y=<clientY>".
+    With select, a large <select> whose dropdown Chromium shows in an
+    override-redirect X window (like Steam's menus)."""
+    menu = ('<select style="position:fixed;left:20px;top:20px;font-size:48px" onchange="v=this.value;t()">'
+            '<option>o1</option><option>o2</option><option>o3</option><option>o4</option></select>'
+            if select else '')
+    return ('<title>%s c=0 k=</title><body style="margin:0;background:%s">%s'
+            '<script>let c=0,k="",v="",x=0,y=0;'
+            'function t(){document.title="%s c="+c+" k="+k+" s="+v+" x="+x+" y="+y}'
+            'onmousedown=e=>{c++;x=e.clientX;y=e.clientY;t()};onkeydown=e=>{k+=e.key;t()};</script>'
+            ) % (name, colour, menu, name)
 
 
 def page():
     """Window A; on load it opens B as a separate top-level popup window of
     the same Chromium process (as Steam opens its dialogs), written into an
     about:blank document (top-level data: navigation is blocked)."""
-    b = body('cw-b', '#46c').replace('\\', '\\\\').replace("'", "\\'")
+    b = body('cw-b', '#46c', select=True).replace('\\', '\\\\').replace("'", "\\'")
     html = body('cw-a', '#c44') + (
-        "<script>onload=()=>{let w=window.open('','cwb','popup,left=620,top=460,width=700,height=480');"
-        "w.document.write('%s');w.document.close();setTimeout(()=>w.moveTo(620,460),3000);}</script>" % b.replace('</script>', '<\\/script>'))
+        "<script>onload=()=>{let w=window.open('','cwb','popup,left=900,top=460,width=700,height=480');"
+        "w.document.write('%s');w.document.close();setTimeout(()=>w.moveTo(900,460),3000);}</script>" % b.replace('</script>', '<\\/script>'))
     return 'data:text/html,' + urllib.parse.quote(html)
 
 
@@ -54,7 +62,13 @@ def main():
     parser.add_argument('--accel', choices=('kvm', 'tcg'), default='kvm')
     args = parser.parse_args()
     args.output.mkdir(mode=0o700, parents=True)
-    args.files = prepare_files(args)
+    common = (f'{CHROMIUM} --ozone-platform=x11 --no-sandbox --disable-gpu --no-first-run '
+              '--user-data-dir=/tmp/xwl-chromium --password-store=basic --disable-features=Translate')
+    # The launch script travels in the set (/boot/bin/XCHROME): a short job argv.
+    script = ('#!/nix/profile/bin/bash\nexport DISPLAY=:0 HOME=/data/home; unset WAYLAND_DISPLAY\n'
+              f'{common} --disable-popup-blocking --window-position=120,140 --window-size=700,500 '
+              f'"{page()}" >/tmp/xwl-chromium.log 2>&1\n')
+    args.files = prepare_files(args, [('BOOT/BIN/XCHROME', script.encode())])
     fixture.adopt_prebuilt(args.files)
     system, fallback = fixture.make_disks(args)
     result = {'waylandd': str(args.waylandd or 'set'), 'xwm': str(args.xwm or 'profile')}
@@ -67,14 +81,9 @@ def main():
         guest.wait_log('USB_SYSTEM_READY', timeout=240)
         guest.attach()
         qmp = fixture.Qmp(guest.sock)
-        common = (f'{CHROMIUM} --ozone-platform=x11 --no-sandbox --disable-gpu --no-first-run '
-                  '--user-data-dir=/tmp/xwl-chromium --password-store=basic --disable-features=Translate')
-        script = (f'export DISPLAY=:0 HOME=/data/home; unset WAYLAND_DISPLAY; '
-                  f'{common} --disable-popup-blocking --window-position=120,140 --window-size=700,500 '
-                  f'"{page()}" >/tmp/xwl-chromium.log 2>&1; sleep 400')
         job_id = uuid.uuid4().hex
         guest.call('hw_guest_run', request_id=job_id, uid=1000, cwd='/tmp',
-                   argv=['/nix/profile/bin/bash', '-c', script], wait_s=2)
+                   argv=['/nix/profile/bin/bash', '/boot/bin/XCHROME'], wait_s=2)
 
         def windows():
             rows = guest.call('hw_windows')['windows']
@@ -145,7 +154,27 @@ def main():
             steps.append({'target': target, 'point': [px, py], 'titles': titles, 'want': want, 'ok': ok})
             write()
         result['steps'] = steps
-        result['input_ok'] = all(s['ok'] for s in steps)
+        # Dropdown (an override-redirect X window) in B, opened by the click
+        # that also activates B. Find B's page origin from the last click on
+        # B (its title records clientX/clientY), click the <select>, then the
+        # third option of the list Chromium opens below it.
+        last_b = [st for st in steps if st['target'] == 'cw-b'][-1]
+        fields = dict(f.split('=', 1) for f in last_b['titles']['cw-b'].split(' ')[1:] if '=' in f)
+        ox, oy = last_b['point'][0] - int(fields['x']), last_b['point'][1] - int(fields['y'])
+        row = windows()['cw-a']
+        x, y, w, h = window_rect(row, 'client')
+        for point in ((x + 60, y + h - 60), (ox + 90, oy + 50), (ox + 90, oy + 20 + 62 + 60 * 2 + 30)):
+            move_to(*point)
+            time.sleep(.4)
+            for down in (True, False):
+                qmp.call('input-send-event', events=[{'type': 'btn', 'data': {'button': 'left', 'down': down}}])
+                time.sleep(.15)
+            time.sleep(2.0)
+        title = windows()['cw-b']['title']
+        chosen = dict(f.split('=', 1) for f in title.split(' ')[1:] if '=' in f).get('s', '')
+        result['dropdown'] = {'origin': [ox, oy], 'title': title, 'selected': chosen,
+                              'ok': chosen in ('o2', 'o3', 'o4')}
+        result['input_ok'] = all(s['ok'] for s in steps) and result['dropdown']['ok']
         write()
     finally:
         write()

@@ -62,7 +62,7 @@ def ppm_pixel(path, x, y):
     return r << 16 | g << 8 | b
 
 
-def prepare_files(args):
+def prepare_files(args, extra=()):
     files = args.output / 'files'
     shutil.copytree(args.files, files)
     initrd = files / 'INITRD.IMG'
@@ -81,6 +81,8 @@ def prepare_files(args):
         assert line + '\n' in rc, rc
         rc = rc.replace(line + '\n', line + ' --xwayland /nix/profile/bin/Xwayland --xwm /boot/bin/BROOKXWM\n')
     mput(initrd, args.probe.read_bytes(), 'BOOT/BIN/XPROBE', scratch)
+    for name, data in extra:  # small helper files for a test's guest jobs
+        mput(initrd, data, name, scratch)
     mput(initrd, rc.encode(), 'BOOT/INIT.RC', scratch)
     record = mtype(initrd, 'ETC/usb-system').decode().split('\n')
     first = int(record[2].split(',')[0])
