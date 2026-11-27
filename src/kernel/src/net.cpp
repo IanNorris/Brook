@@ -59,6 +59,7 @@
 #include "tcp_send_queue.h"
 #include "module.h"
 #include "tcp.h"
+#include "tcp_receive.h"
 #include "epoll_diagnostics.h"
 #include "audio.h"
 #include "gpu_app.h"
@@ -570,7 +571,6 @@ static InboundSocket SelectInboundSocket(uint64_t scope, bool tcp, uint32_t loca
     return result;
 }
 
-static uint32_t TcpReceiveFree(const Socket& s);
 static constexpr uint64_t SocketRxBudget = 256ull * 1024 * 1024;
 static uint64_t g_socketRxBytes, g_socketRxDenied, g_tcpRxGrowths;
 // Fixed before networking is configured; never change the cap on live flows.
@@ -586,17 +586,7 @@ static TcpTxSnapshot CaptureTcpTxLocked(Socket& s)
     const uint32_t free = TcpReceiveFree(s);
     const uint16_t window = TcpAdvertisedWindow(free, s.tcpRcvWndScale, 0, g_tcpReceiveWindowCap);
     const uint16_t synWindow = TcpAdvertisedWindow(free, s.tcpRcvWndScale, TCP_SYN, g_tcpReceiveWindowCap);
-    if (s.tcpState == TcpState::SynSent && synWindow > s.tcpRxSynGrant) {
-        s.tcpRxSynGrant = synWindow;
-    } else if (s.tcpState != TcpState::Closed && s.tcpState != TcpState::SynSent &&
-               s.tcpState != TcpState::Listen) {
-        const uint32_t grant = s.tcpState == TcpState::SynRecv ? synWindow : uint32_t(window) << s.tcpRcvWndScale;
-        const uint32_t edge = s.tcpRcvNxt + grant;
-        if (!s.tcpRxRightEdgeValid || static_cast<int32_t>(edge - s.tcpRxRightEdge) > 0) {
-            s.tcpRxRightEdge = edge;
-            s.tcpRxRightEdgeValid = true;
-        }
-    }
+    TcpNoteReceiveGrant(s, window, synWindow);
     return {s.localIp, s.remoteIp, s.tcpRcvNxt, s.tcpSndNxt, s.tcpSndIss,
             s.ownerPid, s.localPort, s.remotePort,
             window, synWindow, s.tcpRcvWndScale};
@@ -609,9 +599,6 @@ static int TcpSendSnapshot(Socket& s, const TcpTxSnapshot& snapshot, uint32_t se
 // The caller retains a SocketBorrow across submission and retry scheduling.
 // Preserve any newer pending ACK and its earlier timer.
 static uint64_t g_tcpAckSubmissionFailures=0;
-struct TcpReceiveDiagnostics {
-    uint64_t oooArrivals,oooStored,oooOverlap,oooCapacity,clippedSegments;
-};
 static TcpReceiveDiagnostics g_tcpReceiveDiagnostics{};
 static void TcpRequeueFailedAck(Socket& s)
 {
@@ -632,7 +619,6 @@ static void TcpSendSegmentAtSeq(Socket& s, uint32_t seq, uint8_t flags,
                                 const void* data, uint32_t dataLen,
                                 const char* why,
                                 bool localOnly = false);
-static void TcpEnqueueData(Socket& s, const void* data, uint32_t len);
 
 // ---------------------------------------------------------------------------
 // Checksum helpers
@@ -2585,11 +2571,6 @@ void SockSetAcceptedOwner(int sockIdx, uint32_t uid, uint32_t gid)
 }
 
 // Include the TCP reassembly bitmap and both allocations during a resize.
-struct SocketRxStorage {
-    uint8_t* ring;
-    uint64_t* bitmap;
-    uint32_t capacity;
-};
 static uint64_t SocketRxCharge(uint32_t capacity, bool stream)
 {
     return capacity + (stream ? capacity / 8 : 0);
@@ -2794,54 +2775,6 @@ int SockSendTo(int sockIdx, const void* buf, uint32_t len,
     }
 
     return NetSendUdpFrom(source,dstIp,ntohs(sourcePort),dstPort,buf,len,s.networkScope);
-}
-
-// Copy n bytes out of a socket rx ring starting at tail (wraps once at most).
-static void SockRingRead(const Socket& s, uint32_t tail, void* out, uint32_t n)
-{
-    const uint32_t first = n < s.rxCapacity - tail ? n : s.rxCapacity - tail;
-    if (out) {
-        memcpy(out, s.rxBuf + tail, first);
-        if (n > first) memcpy(static_cast<uint8_t*>(out) + first, s.rxBuf, n - first);
-    }
-}
-
-// Rebase readable and future bytes to the new tail without changing the
-// sequence numbers represented by their ring offsets.
-static SocketRxStorage InstallSocketRxLocked(Socket& s, SocketRxStorage fresh)
-{
-    const SocketRxStorage old{s.rxBuf, s.tcpOooMap, s.rxCapacity};
-    SockRingRead(s, s.rxTail, fresh.ring, s.rxCount);
-    if (s.tcpOooBytes) {
-        for (uint32_t word = 0; word < old.capacity / 64; ++word) {
-            uint64_t bits = old.bitmap[word];
-            while (bits) {
-                const unsigned bit = __builtin_ctzll(bits);
-                const uint64_t clear = ~bits >> bit;
-                const uint32_t run = clear ? __builtin_ctzll(clear) : 64 - bit;
-                const uint32_t index = word * 64 + bit;
-                const uint32_t offset = (index - s.rxTail) & (old.capacity - 1);
-                const uint32_t first = run < old.capacity - offset ? run : old.capacity - offset;
-                memcpy(fresh.ring + offset, old.ring + index, first);
-                if (run > first) memcpy(fresh.ring, old.ring + index + first, run - first);
-                // The old ring boundary is word-aligned, so a shifted word
-                // crosses at most one destination-word boundary.
-                const uint64_t mask = first == 64 ? ~uint64_t{0} : (uint64_t{1} << first) - 1;
-                const unsigned shift = offset % 64;
-                fresh.bitmap[offset / 64] |= mask << shift;
-                if (first > 64 - shift) fresh.bitmap[offset / 64 + 1] |= mask >> (64 - shift);
-                if (run > first) fresh.bitmap[0] |= (uint64_t{1} << (run - first)) - 1;
-                const uint64_t consumed = run == 64 ? ~uint64_t{0} : ((uint64_t{1} << run) - 1) << bit;
-                bits &= ~consumed;
-            }
-        }
-    }
-    s.rxTail = 0;
-    s.rxHead = s.rxCount & (fresh.capacity - 1);
-    s.rxBuf = fresh.ring;
-    s.tcpOooMap = fresh.bitmap;
-    s.rxCapacity = fresh.capacity;
-    return old;
 }
 
 // Allocate outside the socket lock. A concurrent setter or reader can change
@@ -3426,140 +3359,9 @@ static bool TcpSeqAcked(uint32_t sndUna, uint32_t seqEnd)
     return static_cast<int32_t>(sndUna - seqEnd) >= 0;
 }
 
-static bool TcpSeqBefore(uint32_t a, uint32_t b)
-{
-    return static_cast<int32_t>(a - b) < 0;
-}
-
 static bool TcpSeqAfter(uint32_t a, uint32_t b)
 {
     return static_cast<int32_t>(a - b) > 0;
-}
-
-static uint32_t TcpReceiveFree(const Socket& s)
-{
-    // The window is a sequence span, not a count of unallocated bytes.
-    // Future bytes already occupy positions within that span. Subtracting
-    // them again moves its right edge backwards after every reordered packet.
-    const uint32_t space = s.rxCount < s.rxLimit ? s.rxLimit - s.rxCount : 0;
-    if (!s.tcpRxRightEdgeValid) return space;
-    // SO_RCVBUF must not revoke already-advertised sequence space.
-    const int32_t granted = static_cast<int32_t>(s.tcpRxRightEdge - s.tcpRcvNxt);
-    return granted > static_cast<int32_t>(space) ? static_cast<uint32_t>(granted) : space;
-}
-
-static void TcpReapOoo(Socket& s,uint64_t now)
-{
-    static constexpr uint64_t TCP_OOO_REAP_MS = 30000;
-    if(!s.tcpOooBytes || !TcpTimerElapsed(now,s.tcpOooSince,TCP_OOO_REAP_MS))return;
-    memset(s.tcpOooMap,0,s.rxCapacity / 8);
-    s.tcpOooBytes=0;
-}
-
-static uint64_t TcpOooMask(uint32_t count)
-{
-    return count==64 ? ~uint64_t{0} : (uint64_t{1}<<count)-1;
-}
-
-// The start and length are always within the same receive window. Traverse
-// ring words rather than packet descriptors, including across ring wrap.
-template<class Apply> static void TcpVisitOooWords(const Socket& s,uint32_t position,uint32_t length,Apply&& apply)
-{
-    uint32_t consumed=0;
-    while(consumed<length){
-        const uint32_t bit=position%64;
-        uint32_t count=64-bit;
-        if(count>length-consumed)count=length-consumed;
-        apply(position,bit,count,consumed);
-        position=(position+count) & (s.rxCapacity - 1);
-        consumed+=count;
-    }
-}
-
-static void TcpClearOoo(Socket& s,uint32_t position,uint32_t length)
-{
-    if(!s.tcpOooBytes)return;
-    TcpVisitOooWords(s,position,length,[&](uint32_t byte,uint32_t bit,uint32_t count,uint32_t){
-        const uint64_t mask=TcpOooMask(count)<<bit;
-        auto& word=s.tcpOooMap[byte/64];
-        // Clang lowers 64-bit popcount to a runtime helper on builds
-        // without POPCNT, so count full words and scan only partial words.
-        uint64_t occupied=word&mask;
-        if(occupied==mask)s.tcpOooBytes-=count;
-        else while(occupied){occupied&=occupied-1;--s.tcpOooBytes;}
-        word&=~mask;
-    });
-}
-
-static bool TcpStoreOoo(Socket& s,uint32_t seq,const uint8_t* data,uint32_t len,uint64_t now)
-{
-    if(!s.tcpOooMap || !data || !len)return false;
-    const uint32_t distance=seq-s.tcpRcvNxt;
-    const uint32_t window=TcpReceiveFree(s);
-    if(distance>=window){
-        __atomic_fetch_add(&g_tcpReceiveDiagnostics.oooCapacity,1,__ATOMIC_RELAXED);
-        ++s.oooDropCount;
-        return false;
-    }
-    if(len>window-distance){
-        __atomic_fetch_add(&g_tcpReceiveDiagnostics.oooCapacity,1,__ATOMIC_RELAXED);
-        len=window-distance;
-    }
-    uint32_t added=0;
-    TcpVisitOooWords(s,(s.rxHead+distance) & (s.rxCapacity - 1),len,
-        [&](uint32_t position,uint32_t bit,uint32_t count,uint32_t consumed){
-            const uint64_t mask=TcpOooMask(count)<<bit;
-            auto& word=s.tcpOooMap[position/64];
-            const uint64_t occupied=word&mask;
-            if(!occupied){
-                memcpy(s.rxBuf+position,data+consumed,count);
-                added+=count;
-            }else if(occupied!=mask){
-                uint64_t missing=(mask&~occupied)>>bit;
-                while(missing){
-                    const unsigned index=__builtin_ctzll(missing);
-                    s.rxBuf[position+index]=data[consumed+index];
-                    missing&=missing-1;
-                    ++added;
-                }
-            }
-            word|=mask;
-        });
-    if(added<len)__atomic_fetch_add(&g_tcpReceiveDiagnostics.oooOverlap,1,__ATOMIC_RELAXED);
-    if(!added)return false;
-    if(!s.tcpOooBytes)s.tcpOooSince=now;
-    s.tcpOooBytes+=added;
-    ++s.oooHeldCount;
-    __atomic_fetch_add(&g_tcpReceiveDiagnostics.oooStored,1,__ATOMIC_RELAXED);
-    return true;
-}
-
-static bool TcpDrainOoo(Socket& s)
-{
-    // FIN consumes sequence space without moving the ring write index.
-    // Discard any pre-FIN speculative data beyond that end of stream.
-    if(s.tcpFinRecv || s.tcpRstRecv){
-        if(s.tcpOooBytes)memset(s.tcpOooMap,0,s.rxCapacity / 8);
-        s.tcpOooBytes=0;
-        return false;
-    }
-    uint32_t drained=0;
-    while(s.tcpOooBytes){
-        const unsigned bit=s.rxHead%64;
-        auto& word=s.tcpOooMap[s.rxHead/64];
-        const uint64_t pending=word>>bit;
-        if(!(pending&1))break;
-        const uint64_t missing=(~pending)&TcpOooMask(64-bit);
-        const unsigned count=missing ? __builtin_ctzll(missing) : 64-bit;
-        word&=~(TcpOooMask(count)<<bit);
-        s.rxHead=(s.rxHead+count) & (s.rxCapacity - 1);
-        s.tcpOooBytes-=count;
-        drained+=count;
-    }
-    s.rxCount+=drained;
-    s.tcpRcvNxt+=drained;
-    if(drained)++s.oooDrainCount;
-    return drained!=0;
 }
 
 static int TcpSendSnapshot(Socket& s, const TcpTxSnapshot& snapshot, uint32_t seq, uint8_t flags,
@@ -3639,24 +3441,6 @@ static int TcpSendSegment(Socket& s, uint8_t flags,
     const auto snapshot = CaptureTcpTxLocked(s);
     SpinLockRelease(&s.lock);
     return TcpSendSnapshot(s, snapshot, snapshot.nextSeq, flags, data, dataLen, why);
-}
-
-// Append raw bytes to socket RX ring buffer.
-// Caller MUST hold s.lock.
-static void TcpEnqueueData(Socket& s, const void* data, uint32_t len)
-{
-    uint32_t avail = s.rxCapacity - s.rxCount;
-    if (len > avail) len = avail;
-
-    TcpClearOoo(s,s.rxHead,len);
-    const auto* bytes=static_cast<const uint8_t*>(data);
-    const uint32_t tail=s.rxCapacity-s.rxHead;
-    const uint32_t first=len<tail?len:tail;
-    memcpy(s.rxBuf+s.rxHead,bytes,first);
-    if(len>first)memcpy(s.rxBuf,bytes+first,len-first);
-    s.rxHead=(s.rxHead+len) & (s.rxCapacity - 1);
-    s.rxCount += len;
-    // Caller (HandleTcp) wakes pollWaiter after releasing the lock.
 }
 
 // Caller holds child.lock and the queue guard when changing queue ownership.
@@ -3764,6 +3548,16 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len,uint64_t 
     auto* tcp = static_cast<const TcpHeader*>(payload);
     uint32_t dataOff = ((tcp->dataOff >> 4) & 0xF) * 4;
     if (dataOff < 20 || dataOff > len) return;
+    // Nothing below this point verifies the TCP checksum: the e1000/I219
+    // drivers leave RXCSUM off and virtio-net does not negotiate checksum
+    // offload, so a corrupted segment would otherwise reach the socket.
+    // Loopback frames were built and checksummed by this stack.
+    if (!localIngress && !TcpChecksumValid(ip->srcIp, ip->dstIp, payload, len)) {
+        const uint64_t bad = __atomic_add_fetch(&g_tcpReceiveDiagnostics.checksumBad, 1, __ATOMIC_RELAXED);
+        if (bad <= 5 || bad % 1000 == 0)
+            SerialPrintf("tcp: RX checksum mismatch dropped len=%u count=%lu\n", len, bad);
+        return;
+    }
 
     uint16_t srcPort = tcp->srcPort;
     uint16_t dstPort = tcp->dstPort;
@@ -3820,51 +3614,22 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len,uint64_t 
         // maintenance (which sends ACKs) from packet processing and the send
         // primitive so it can never recurse into the egress path.
 
-        // Clamp incoming data so rcvNxt never advances past bytes we can
-        // actually store.  Only *new* bytes (past rcvNxt) consume buffer
-        // space; stale/retransmitted bytes before rcvNxt are trimmed by
-        // TcpProcessSegment and never enqueued.  The old code clamped the
-        // total segment length, which could make a partially-stale retransmit
-        // look fully stale — dropping its useful tail and stalling the
-        // connection on large downloads.
-        TcpReapOoo(s, ApicTickCount());
-        uint32_t freeSpace = TcpReceiveFree(s);
-        bool bufferWasFull = false;
-        if (dataLen > 0) {
-            uint32_t staleBytes = 0;
-            if (TcpSeqBefore(seq, s.tcpRcvNxt)) {
-                uint32_t gap = s.tcpRcvNxt - seq;
-                staleBytes = gap < dataLen ? gap : dataLen;
-            }
-            uint32_t newBytes = dataLen - staleBytes;
-            bufferWasFull = (newBytes > 0 && freeSpace == 0);
-            if (newBytes > freeSpace) {
-                __atomic_fetch_add(&g_tcpReceiveDiagnostics.clippedSegments,1,__ATOMIC_RELAXED);
-                dataLen = staleBytes + freeSpace;
-                // If we clamped data away and this segment carries FIN,
-                // strip the FIN flag.  FIN occupies the sequence position
-                // after the last data byte; accepting it when some data
-                // was dropped would advance rcvNxt past bytes never
-                // delivered to the application — causing premature EOF
-                // and a truncated download.  The server will retransmit
-                // the FIN once we ACK the data we did accept and re-open
-                // the receive window.
-                if (flags & TCP_FIN)
-                    flags &= ~TCP_FIN;
-            }
-        }
-
-        // Delegate to testable state machine
+        // Capture before the receive path so wakeups see its deltas.
         uint32_t prevRxCount = s.rxCount;
         uint32_t prevSndUna = s.tcpSndUna;
         const TcpState oldState = s.tcpState;
-        TcpAction act = TcpProcessSegment(s, seq, ack, flags, tcpData, dataLen);
+        // Window clamp, state machine, in-order append and reassembly.
+        const auto received = TcpReceiveSegmentLocked(s, seq, ack, flags, tcpData, dataLen,
+                                                      ApicTickCount(), g_tcpReceiveDiagnostics);
+        TcpAction act = received.act;
+        const bool bufferWasFull = received.bufferWasFull;
         if ((oldState == TcpState::SynSent || oldState == TcpState::SynRecv) &&
             s.tcpState == TcpState::Established) {
             const uint64_t rtt = ApicTickCount() - s.tcpRxSynTick;
             s.tcpRxRtt = rtt < 10 ? 10 : rtt <= 1000 ? static_cast<uint32_t>(rtt) : 1000;
             if (oldState == TcpState::SynSent) {
                 // A SYN offers an unscaled window before we learn the peer's ISN.
+                // SynSent never accepts data, so nothing above used this edge.
                 s.tcpRxRightEdge = seq + 1 + s.tcpRxSynGrant;
                 s.tcpRxRightEdgeValid = true;
             }
@@ -3874,16 +3639,6 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len,uint64_t 
             TcpProbeAdd(g_tcpSendProbeStats.ackWhileWorkerDisplaced);
         if (g_tcpSendProbe && s.tcpSndUna != prevSndUna)
             g_tcpSendProbeAck[i] = {s.tcpSndUna, ApicTickCount()};
-
-        if (act.enqueueData && act.dataPtr && act.dataLen > 0)
-            TcpEnqueueData(s, act.dataPtr, act.dataLen);
-        if (act.holdOooData && act.oooDataPtr && act.oooDataLen > 0) {
-            __atomic_fetch_add(&g_tcpReceiveDiagnostics.oooArrivals,1,__ATOMIC_RELAXED);
-            TcpStoreOoo(s, act.oooSeq, act.oooDataPtr,
-                        act.oooDataLen, ApicTickCount());
-        }
-        if (TcpDrainOoo(s))
-            act.sendAck = true;
 
         // CRITICAL: compute shouldWake and capture pollWaiter while still
         // holding the lock.  If we release first, SockRecv can drain the
@@ -4883,19 +4638,9 @@ int SockRecv(int sockIdx, void* buf, uint32_t len, bool dontwait)
     }
 
     // Stream read — no framing, just read bytes from the resident kernel ring.
-    uint32_t copyLen = s.rxCount < len ? s.rxCount : len;
     // Capture free space BEFORE consuming, to decide whether window was constrained.
     uint32_t freeBefore = TcpReceiveFree(s);
-    uint8_t* dst = static_cast<uint8_t*>(buf);
-    // Copy in up to two contiguous chunks (ring buffer wrap)
-    uint32_t firstChunk = s.rxCapacity - s.rxTail;
-    if (firstChunk > copyLen) firstChunk = copyLen;
-    memcpy(dst, s.rxBuf + s.rxTail, firstChunk);
-    if (copyLen > firstChunk)
-        memcpy(dst + firstChunk, s.rxBuf, copyLen - firstChunk);
-    s.rxTail = (s.rxTail + copyLen) & (s.rxCapacity - 1);
-    __asm__ volatile("mfence" ::: "memory");
-    s.rxCount -= copyLen;
+    const uint32_t copyLen = TcpConsumeReceived(s, buf, len);
     uint32_t freeAfter = TcpReceiveFree(s);
     const uint32_t growth = TcpReceiveGrowthLocked(s, copyLen, ApicTickCount());
     TcpState stateSnap = s.tcpState;
@@ -6327,7 +6072,8 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         // or slot count limit. Out-of-window data is ooo_capacity.
         r.text(",");r.field("ooo_oversize",0);
         r.text(",");r.field("ooo_full",0);
-        r.text(",");r.field("clipped_segments",__atomic_load_n(&g_tcpReceiveDiagnostics.clippedSegments,__ATOMIC_RELAXED));r.text("}");
+        r.text(",");r.field("clipped_segments",__atomic_load_n(&g_tcpReceiveDiagnostics.clippedSegments,__ATOMIC_RELAXED));
+        r.text(",");r.field("checksum_bad",__atomic_load_n(&g_tcpReceiveDiagnostics.checksumBad,__ATOMIC_RELAXED));r.text("}");
         r.text("}\n");r.send();return;
     }
     if (NetStrEq(cmd, "tcp stats")) {

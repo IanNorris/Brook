@@ -147,7 +147,12 @@ TcpAction TcpProcessSegment(Socket& s,
             uint32_t len = dataLen;
             uint32_t segEnd = dataSeq + len;
 
-            if (TcpSeqBefore(dataSeq, s.tcpRcvNxt)) {
+            // A retransmit of data we already hold may carry the FIN we have
+            // not accepted yet: the original data+FIN arrived out of order and
+            // was reassembled without it. Skip the duplicate data and let the
+            // FIN check below accept the FIN at RCV.NXT.
+            const bool duplicateBeforeFin = (flags & TCP_FIN) && segEnd == s.tcpRcvNxt;
+            if (!duplicateBeforeFin && TcpSeqBefore(dataSeq, s.tcpRcvNxt)) {
                 if (!TcpSeqAfter(segEnd, s.tcpRcvNxt)) {
                     int32_t gap = static_cast<int32_t>(dataSeq - s.tcpRcvNxt);
                     s.oooDropCount++;
@@ -168,7 +173,9 @@ TcpAction TcpProcessSegment(Socket& s,
                 dataSeq = s.tcpRcvNxt;
             }
 
-            if (dataSeq == s.tcpRcvNxt) {
+            if (duplicateBeforeFin) {
+                // Nothing to enqueue; the FIN check below sends the ACK.
+            } else if (dataSeq == s.tcpRcvNxt) {
                 act.enqueueData = true;
                 act.dataPtr     = dataPtr;
                 act.dataLen     = len;

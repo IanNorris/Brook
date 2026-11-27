@@ -406,6 +406,28 @@ static void TestChecksum()
     tcp->checksum = cksum;
     uint16_t verify = TcpChecksum(srcIp, dstIp, buf, 20);
     ASSERT_EQ(verify, 0u);
+    ASSERT_TRUE(TcpChecksumValid(srcIp, dstIp, buf, 20));
+
+    // Receive-side verification: odd and even lengths validate, and any
+    // single bit flip in header, payload or pseudo-header is rejected.
+    uint8_t seg[61] = {};
+    memcpy(seg, buf, 20);
+    for (unsigned i = 20; i < sizeof(seg); ++i) seg[i] = static_cast<uint8_t>(i * 37 + 11);
+    for (uint32_t len : {20u, 21u, 60u, 61u}) {
+        auto* h = reinterpret_cast<TcpHeader*>(seg);
+        h->checksum = 0;
+        h->checksum = TcpChecksum(srcIp, dstIp, seg, len);
+        ASSERT_TRUE(TcpChecksumValid(srcIp, dstIp, seg, len));
+        bool allRejected = true;
+        for (uint32_t bit = 0; bit < len * 8; ++bit) {
+            seg[bit / 8] ^= static_cast<uint8_t>(1u << (bit % 8));
+            allRejected &= !TcpChecksumValid(srcIp, dstIp, seg, len);
+            seg[bit / 8] ^= static_cast<uint8_t>(1u << (bit % 8));
+        }
+        ASSERT_TRUE(allRejected);
+        ASSERT_TRUE(!TcpChecksumValid(srcIp ^ htonl(1), dstIp, seg, len));
+        ASSERT_TRUE(!TcpChecksumValid(srcIp, dstIp, seg, len - 1));
+    }
     printf("  TestChecksum: OK\n");
 }
 
