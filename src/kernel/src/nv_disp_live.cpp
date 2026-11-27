@@ -11,6 +11,8 @@
 #include "nv_disp_driver.h"
 #include "nv_ce_present_api.h"
 #include "nv_disp_hole.h"
+#include "nv_glass_layout.h"
+#include "nv_drm.h"
 #include "nv_layer.h"
 #if defined(BROOK_NV_GSP)
 #include "nv_gsp_live.h"
@@ -234,17 +236,24 @@ struct NvPresenterState{
     // CE present path (head 0, `nv-gsp ce-present on`): frames the copy engine wrote, frames
     // it gave back to the CPU, and the read-back check of sampled pixels.
     uint64_t ceFrames=0,ceBytes=0,ceCpuFrames=0;uint32_t ceVerified=0,ceMismatch=0;
+    uint64_t glassFrames=0,glassBytes=0;
     // A kicked copy (shadow -> px[ceBb]) not yet flipped; its rectangles for a CPU fallback.
     bool ceInflight=false,shadowContig=false;int8_t ceBb=-1;uint32_t ceTicket=0,ceN=0;NvCeRect ceRects[100]{};
     uint64_t ceWaitNs=0,ceKicks=0,ceFlipsFromPoll=0;
+    uint64_t glassEpoch[3]{};
     // Zero-copy step 2 (head 0): the hole (output-local; empty = none) and whose layer fills it,
     // the layer frame (seq) the last flip copied, and, for the kicked copy, the layer it reads.
     DamageRect hole{};uint32_t holeSlot=0;uint64_t holeIdentity=0,holeSeqFlipped=0;bool holeFlipped=false;
     bool ceLayer=false;DamageRect ceLayerRect{};uint64_t ceLayerPhys=0;uint32_t ceLayerStride=0;
     uint64_t directFrames=0,layerCeFrames=0,layerCpuFrames=0,holeRepairs=0,layerMissing=0,layerVerified=0;
 };
+static_assert(NvGlassHeads==nvdisp::kDriverOutputs);
 NvPresenterState g_presenter[nvdisp::kDriverOutputs]{};
 const NvCeOps* g_ceOps=nullptr;       // set/cleared under the nv-aux lock
+// If the CE semaphore times out, the engine may still access both BOs.
+void* g_glassUncertainSource=nullptr; // keep a single quarantined PRIME until reboot
+int8_t g_glassUncertainDestination=-1;
+uint32_t g_glassUncertainHead=NvGlassHeads;
 bool g_ceVerifyOff=false;             // a read-back mismatch turned the CE path off this boot
 // The compositor loop hook (completion, queued arms, wake time).
 uint64_t g_pollNs=0;uint32_t g_polls=0,g_pollMaxUs=0,g_pollBusy=0;
@@ -338,8 +347,9 @@ bool CeFinishLocked(uint32_t budgetUs){
 volatile bool g_head0Fence=false;
 int FlipPendingLocked(uint32_t o,const uint32_t* src,uint32_t srcStride){
     auto& p=g_presenter[o];auto& f=g_driver.f[o];
-    const int8_t bb=f.Back();
+    const int8_t bb=f.Back(o==g_glassUncertainHead?g_glassUncertainDestination:-1);
     if(bb<0){++p.noBuffer;return 0;}
+    p.glassEpoch[bb]=0;
     const uint32_t width=p.width,height=p.height;
     uint32_t* dst=p.px[bb];const uint32_t pitch=p.pitchPx;
     uint64_t bytes=0;const uint64_t c0=PresentNowNs();
@@ -628,6 +638,7 @@ bool MapPresenter(NvPresenterState& p,nvdisp::NvWindowFlipper<LiveBackend>& f,co
     p.vram[0]=a.vram;p.vram[1]=f.surf[1].vram;p.vram[2]=third.vram;
     p.nbuf=f.nbuf;p.pitchPx=a.pitch/4;p.width=a.width;p.height=a.height;
     p.age.Reset();p.lastUs=0;p.needFull=false;
+    for(auto& epoch:p.glassEpoch)epoch=0;
     if(!p.shadow){
         // Physically contiguous and 2 MiB aligned when the PMM has the run (the CE present
         // path maps it with 2 MiB PTEs); scattered pages otherwise.
@@ -644,6 +655,8 @@ bool MapPresenter(NvPresenterState& p,nvdisp::NvWindowFlipper<LiveBackend>& f,co
 bool PresenterOnLocked(){
     auto& p=g_presenter[0];
     if(p.active)return true;
+    // An abandoned Glass destination still belongs to the old CE work.
+    if(g_glassUncertainHead==0)return false;
     if(!g_driver.Up0())return false;
     auto& f=g_driver.f[0];
     if(!MapPresenter(p,f,g_driver.HeadZeroThird())){KPrintf("nv-display: BAR1 surface mapping failed\n");(void)g_driver.Down0();return false;}
@@ -659,7 +672,7 @@ bool PresenterOnLocked(){
 bool Presenter1OnLocked(){
     auto& p=g_presenter[1];
     if(p.active)return true;
-    if(!g_presenter[0].active||!g_driver.Live(0))return false;
+    if(g_glassUncertainHead==1 || !g_presenter[0].active||!g_driver.Live(0))return false;
     if(!g_driver.Live(1)){
         if(!(g_head.st.live||g_head.st.paused)&&!ConfigureHead())return false;
         if(!g_driver.Up1())return false;
@@ -719,7 +732,7 @@ void PresenterStats(bool reset){
     const StatsMark now=TakeMark();
     const bool zero=reset||!g_mark.us;
     if(zero){g_mark=now;g_pollMaxUs=0;for(auto& p:g_presenter){p.cpuMaxUs=0;p.compared=p.copiedBytes=p.diffNs=p.copyNs=0;p.unchanged=p.fullDiffs=p.copyMaxUs=p.deferred=0;
-            p.ceFrames=p.ceBytes=p.ceCpuFrames=0;p.ceVerified=p.ceMismatch=0;p.ceWaitNs=p.ceKicks=p.ceFlipsFromPoll=0;}
+            p.ceFrames=p.ceBytes=p.ceCpuFrames=p.glassFrames=p.glassBytes=0;p.ceVerified=p.ceMismatch=0;p.ceWaitNs=p.ceKicks=p.ceFlipsFromPoll=0;}
         for(auto& v:g_wakeHist)v=0;for(auto& v:g_armLineHist)v=0;for(auto& v:g_busyHist)v=0;}
     const StatsMark& a=g_mark;
     const uint64_t us=now.us-a.us;
@@ -742,13 +755,17 @@ void PresenterStats(bool reset){
         c.raw(",\"copy_max_us\":");c.dec(p.copyMaxUs);c.raw(",\"unchanged\":");c.dec(p.unchanged);c.raw(",\"full_diffs\":");c.dec(p.fullDiffs);c.raw(",\"deferred\":");c.dec(p.deferred);
         c.raw(",\"busy\":");c.dec(p.busy);c.raw(",\"no_buffer\":");c.dec(p.noBuffer);
         c.raw("}\n");DebugChannelSend(c.t);
-        if(o==0){   // CE present counters on their own line (the copy line's buffer is full)
+        {   // CE present counters on their own line (the copy line's buffer is full)
             nvdisp::NvDisplayDriver<LiveBackend>::Line ce;
-            ce.raw("{\"nv_display\":\"stats_ce\",\"output\":0");
-            ce.raw(",\"ce\":");ce.dec(g_ceOps&&o==0&&!g_ceVerifyOff?1:0);ce.raw(",\"ce_kicks\":");ce.dec(p.ceKicks);
+            ce.raw("{\"nv_display\":\"stats_ce\",\"output\":");ce.dec(o);
+            ce.raw(",\"ce\":");ce.dec(g_ceOps&&!g_ceVerifyOff?1:0);ce.raw(",\"ce_kicks\":");ce.dec(p.ceKicks);
             ce.raw(",\"ce_wait_us\":");ce.dec(p.ceWaitNs/1000);ce.raw(",\"ce_poll_flips\":");ce.dec(p.ceFlipsFromPoll);ce.raw(",\"shadow_contig\":");ce.dec(p.shadowContig?1:0);ce.raw(",\"ce_frames\":");ce.dec(p.ceFrames);ce.raw(",\"ce_bytes\":");ce.dec(p.ceBytes);
             ce.raw(",\"ce_cpu_frames\":");ce.dec(p.ceCpuFrames);ce.raw(",\"ce_verified\":");ce.dec(p.ceVerified);ce.raw(",\"ce_mismatch\":");ce.dec(p.ceMismatch);
+            ce.raw(",\"glass_frames\":");ce.dec(p.glassFrames);ce.raw(",\"glass_bytes\":");ce.dec(p.glassBytes);
+            ce.raw(",\"glass_quarantined\":");ce.dec(g_glassUncertainHead==o?1:0);
             ce.raw("}\n");DebugChannelSend(ce.t);
+        }
+        if(o==0){
             nvdisp::NvDisplayDriver<LiveBackend>::Line zc;const NvLayerStats ls=NvLayerStatsGet();
             zc.raw("{\"nv_display\":\"stats_direct\",\"direct_frames\":");zc.dec(p.directFrames);zc.raw(",\"layer_ce\":");zc.dec(p.layerCeFrames);
             zc.raw(",\"layer_cpu\":");zc.dec(p.layerCpuFrames);zc.raw(",\"hole_repairs\":");zc.dec(p.holeRepairs);zc.raw(",\"layer_missing\":");zc.dec(p.layerMissing);
@@ -846,6 +863,114 @@ void NvDispSnap(const char* why){SpinLock* lock=NvAuxSharedLock();SpinLockAcquir
 namespace { void SnapOnFail(uint32_t){NvDispSnapLocked("flip-failed");} }
 void NvDispSetCePresent(const NvCeOps* ops){if(!ops&&g_presenter[0].ceInflight)(void)CeFinishLocked(kCeWaitUs);g_ceOps=ops;}
 
+static bool NvGlassReadyLocked(uint32_t head){
+    return head<NvGlassHeads && g_ceOps && !g_ceVerifyOff && !g_glassUncertainSource &&
+           g_presenter[head].active && g_driver.Live(head) &&
+           (head ? __atomic_load_n(&g_head1Rect,__ATOMIC_ACQUIRE)!=0 :
+              !__atomic_load_n(&g_head0Fence,__ATOMIC_ACQUIRE));
+}
+
+bool NvGlassAvailable(){
+    SpinLock* lock=NvAuxSharedLock();
+    if(!SpinLockTryAcquire(lock))return false;
+    const bool ready=NvGlassReadyLocked(0) || NvGlassReadyLocked(1);
+    SpinLockRelease(lock);
+    return ready;
+}
+
+bool NvGlassIsSecondary(const OutputBackendOps* backend){
+    return backend==&g_head1Ops;
+}
+
+int64_t NvGlassPresent(uint32_t head,void* prime,uint32_t width,uint32_t height,
+                       uint32_t stride,const OutputRect& rect,uint64_t epoch){
+    NvGlassCrop crop;
+    if(!epoch || head>=NvGlassHeads || !NvGlassFrameCrop(width,height,stride,rect,crop))return -22;
+    uint64_t video=0;
+    const uint64_t extent=uint64_t(height-1)*stride+width*4;
+    if(!NvPrimeLinearVram(prime,extent,&video) || !video ||
+       video>~uint64_t{0}-crop.offset)return -22;
+
+    SpinLock* lock=NvAuxSharedLock();
+    if(!SpinLockTryAcquire(lock))return -11;
+    const int64_t result=[&]() -> int64_t {
+        auto& p=g_presenter[head];
+        auto& f=g_driver.f[head];
+        if(!NvGlassReadyLocked(head))return -95;
+        const uint64_t second=__atomic_load_n(&g_head1Rect,__ATOMIC_ACQUIRE);
+        if(rect.w!=p.width || rect.h!=p.height || rect.y ||
+           rect.x!=int32_t(head ? second&0xffff : 0))return -116;
+        g_driver.Tick();
+        if(!g_driver.Live(head))return -95;
+        // The legacy head-0 presenter shares this CE channel.
+        if(g_presenter[0].ceInflight && !CeFinishLocked(kCeWaitUs))return -11;
+        if(!NvGlassReadyLocked(head))return -95;
+        const int8_t bb=f.Back();
+        if(bb<0)return -11;
+        NvCeJob job{};
+        job.width=rect.w;job.height=rect.h;
+        job.dst_vram=p.vram[bb];job.dst_pitch=p.pitchPx*4;
+        job.video_src=video+crop.offset;job.video_pitch=stride;
+        uint64_t bytes=0;uint32_t ticket=0;
+        const int kicked=g_ceOps->kick(job,&bytes,&ticket);
+        if(kicked<=0){
+            if(kicked<0)g_ceOps=nullptr;
+            return kicked<0?-5:-95;
+        }
+
+        // Keep the source and the exact destination pinned on an uncertain
+        // completion. The shared CE stops but the other ring can fall back.
+        ++p.ceKicks;
+        const uint64_t w0=PresentNowNs();
+        if(g_ceOps->wait(ticket,kCeWaitUs)!=1){
+            NvPrimeRef(prime);
+            g_glassUncertainSource=prime;
+            g_glassUncertainHead=head;
+            g_glassUncertainDestination=bb;
+            g_ceOps=nullptr;
+            p.needFull=true;
+            KPrintf("nv-display: Glass CE completion uncertain on head %u; quarantining its BOs\n",head);
+            return -5;
+        }
+        p.ceWaitNs+=PresentNowNs()-w0;
+        ++p.ceFrames;p.ceBytes+=bytes;
+
+        // Ages describe CPU buffers, so every buffer must be repaired on
+        // demand when that producer takes the head back.
+        p.age.Reset();p.shadowValid=false;p.needFull=true;
+        p.pending=DamageRects{};p.hole=DamageRect{};p.holeFlipped=false;
+        p.glassEpoch[bb]=epoch;
+        if(f.Present(bb)<0)return -5;
+        ++p.frames;++p.glassFrames;p.glassBytes+=bytes;NoteFrame(p);
+        return 0;
+    }();
+    SpinLockRelease(lock);
+    return result;
+}
+
+bool NvGlassReadFront(uint32_t* pixels,uint32_t width,uint32_t height,uint64_t* epoch){
+    if(!epoch || !width || !height)return false;
+    *epoch=0;
+    SpinLock* lock=NvAuxSharedLock();
+    if(!SpinLockTryAcquire(lock))return false;
+    const bool copied=[&]{
+        auto& p=g_presenter[0];
+        if(!p.active)return true;
+        if(width!=p.width || height!=p.height)return false;
+        g_driver.Tick();
+        const int8_t front=g_driver.f[0].front;
+        if(!g_driver.Live(0) || front<0 || front>=int8_t(p.nbuf) || !p.px[front])return false;
+        *epoch=p.glassEpoch[front];
+        if(!*epoch || !pixels)return true;
+        const uint32_t* src=p.px[front];
+        for(uint32_t y=0;y<height;++y)
+            __builtin_memcpy(pixels+uint64_t(y)*width,src+uint64_t(y)*p.pitchPx,uint64_t(width)*4);
+        return true;
+    }();
+    SpinLockRelease(lock);
+    return copied;
+}
+
 bool NvDispHandle(const char* command){
     static const char prefix[]="bridge hardware nv-disp";
     const uint32_t n=sizeof(prefix)-1;
@@ -880,6 +1005,12 @@ bool NvDispHandle(const char* command){
                 DebugChannelSend(ok?"{\"nv_display\":\"drag\",\"ok\":1}\n":"{\"nv_display\":\"drag\",\"ok\":0}\n");return true;}
             if(strncmp(v,"stats",5)==0){v+=5;while(*v==' ')++v;PresenterStats(strncmp(v,"reset",5)==0);SpinLockRelease(lock);return true;}
             PresenterStatus();SpinLockRelease(lock);return true;}
+        // The diagnostics can reinitialize or flip fixed scanout slots.
+        // Leave them unavailable while a Glass copy still owns one.
+        if(g_glassUncertainSource && strncmp(v,"status",6)!=0) {
+            DebugChannelSend("{\"nv_disp\":\"refused\",\"msg\":\"Glass destination quarantined\"}\n");
+            SpinLockRelease(lock);return true;
+        }
         if(!headLive&&!g_driver.Live(1)&&!ConfigureHead()){SpinLockRelease(lock);return true;}
         g_driver.Command(rest+6);
         SpinLockRelease(lock);return true;
@@ -891,7 +1022,8 @@ bool NvDispHandle(const char* command){
         DebugChannelSend(g_directOff?"{\"nv_disp\":\"direct\",\"enabled\":false}\n":"{\"nv_disp\":\"direct\",\"enabled\":true}\n");
         return true;}
     if(strncmp(rest,"snap",4)==0){NvDispSnapLocked("bridge");SpinLockRelease(lock);DebugChannelSend("{\"nv_disp\":\"snap\",\"msg\":\"see the kernel log (nv_snap lines)\"}\n");return true;}
-    if(g_driver.AnyLive()&&strncmp(rest,"status",6)!=0&&strncmp(rest,"head1 status",12)!=0){
+    if((g_driver.AnyLive()||g_glassUncertainSource)&&
+       strncmp(rest,"status",6)!=0&&strncmp(rest,"head1 status",12)!=0){
         DebugChannelSend("{\"nv_disp\":\"refused\",\"msg\":\"the resident driver owns the display (nv-disp driver down)\"}\n");
         SpinLockRelease(lock);return true;
     }

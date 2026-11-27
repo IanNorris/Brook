@@ -30,25 +30,39 @@ namespace brook {
 WmChromeCaptureStats g_chromeCaptureStats{}; // window.h / wm_chrome_key.h
 DesktopCaptureCounters g_desktopCaptureStats{}; // desktop_layers_export.h
 uint32_t g_desktopPresentPolicy=BROOK_DESKTOP_POLICY_APP_CADENCE|BROOK_DESKTOP_POLICY_DIRECT_SHADOW,g_desktopPresentDeferUs=0; // desktop_present_policy.h
-#if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
-static bool DesktopCaptureOwner(Process* proc, uint64_t owner)
+#if (defined(BROOK_SSD_AUTO_RECOVERY) || defined(BROOK_NV_DISPLAY)) && !defined(BROOK_HOST_TEST)
+static bool DesktopNvCaptureOwner(Process* proc, uint64_t owner)
 {
-    // Attach alone is also used by GPU diagnostics. Only the initrd renderer
-    // launched as a system service may read another process's window.
-    const bool service = proc->lifecycleRole == ProcessLifecycleRole::Service;
-    const bool bootRenderer = !strcmp(proc->exePath, "/boot/VKRENDER.ELF") ||
-                              !strcmp(proc->exePath, "/BOOT/VKRENDER.ELF");
-    const bool originalNamespace = !proc->userNamespace &&
-        __atomic_load_n(&proc->mountNamespaceMember, __ATOMIC_ACQUIRE) == VfsMountNamespaceInitial();
-    if (!DesktopLayerContentAllowed(service, originalNamespace, bootRenderer, true)) return false;
-    auto* fs = ProcessFsAcquire(proc);
-    const bool globalRoot = fs && FsContextHasNamespaceRoot(fs);
-    if (fs) FsContextRelease(fs);
-    return globalRoot && BdwOffscreenRendererOwnedBy(owner);
+#if defined(BROOK_NV_DISPLAY)
+    return DesktopNvRendererOwnedBy(owner) && DesktopBootRendererAuthorized(proc);
+#else
+    (void)proc;(void)owner;return false;
+#endif
 }
 
-static int64_t CaptureDesktopChrome(uint64_t owner,uint64_t op,uint64_t address,uint64_t size)
+static bool DesktopIntelCaptureOwner(Process* proc, uint64_t owner)
 {
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+    return DesktopBootRendererAuthorized(proc) && BdwOffscreenRendererOwnedBy(owner);
+#else
+    (void)proc;(void)owner;return false;
+#endif
+}
+
+static bool DesktopIntelRendererEnabled()
+{
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+    return BdwRenderExperimentEnabled();
+#else
+    return false;
+#endif
+}
+
+static int64_t CaptureDesktopChrome(uint64_t owner,uint64_t op,uint64_t address,uint64_t size,bool nv)
+{
+#if !defined(BROOK_SSD_AUTO_RECOVERY)
+    (void)owner;(void)nv;
+#endif
     auto* wire=static_cast<BrookDesktopLayers*>(kmalloc(sizeof(BrookDesktopLayers)));
     auto* snapshot=static_cast<brook::WmDesktopLayers*>(kmalloc(sizeof(brook::WmDesktopLayers)));
     if(!wire || !snapshot){kfree(wire);kfree(snapshot);return -ENOMEM;}
@@ -128,8 +142,10 @@ static int64_t CaptureDesktopChrome(uint64_t owner,uint64_t op,uint64_t address,
                     }
                 }
                 kfree(pixels);
-                if(!result && (op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE || keyed || keep))
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+                if(!nv && !result && (op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE || keyed || keep))
                     result=brook::BdwOffscreenRegisterChrome(owner,source);
+#endif
                 if(!result){
                     layer.incarnation=source.incarnation;layer.generation=source.generation;layer.bytes=bytes;
                     layer.width=layer.stride=layer.clientWidth=chrome.width;layer.height=layer.clientHeight=chrome.height;
@@ -145,8 +161,11 @@ static int64_t CaptureDesktopChrome(uint64_t owner,uint64_t op,uint64_t address,
     }
     kfree(snapshot);kfree(wire);return result;
 }
-static int64_t CaptureDesktopBackdrop(uint64_t owner,uint64_t op,uint64_t address,uint64_t size)
+static int64_t CaptureDesktopBackdrop(uint64_t owner,uint64_t op,uint64_t address,uint64_t size,bool nv)
 {
+#if !defined(BROOK_SSD_AUTO_RECOVERY)
+    (void)owner;(void)nv;
+#endif
     auto* wire=static_cast<BrookDesktopLayers*>(kmalloc(sizeof(BrookDesktopLayers)));
     auto* scratch=static_cast<uint32_t*>(kmalloc(4096));
     if(!wire || !scratch){kfree(wire);kfree(scratch);return -ENOMEM;}
@@ -161,8 +180,10 @@ static int64_t CaptureDesktopBackdrop(uint64_t owner,uint64_t op,uint64_t addres
             auto& layer=wire->layers[0];const uint64_t bytes=uint64_t(info.width)*info.height*4;
             const bool capture=op==BROOK_DESKTOP_BACKDROP_CAPTURE ||
                 op==BROOK_DESKTOP_BACKDROP_TRACKED_CAPTURE;
-            result=op==BROOK_DESKTOP_BACKDROP_TRACKED_BIND?
-                brook::BdwOffscreenRegisterBackdrop(owner,info):0;
+            result=0;
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+            if(!nv && op==BROOK_DESKTOP_BACKDROP_TRACKED_BIND)result=brook::BdwOffscreenRegisterBackdrop(owner,info);
+#endif
             if(capture && (wire->count!=1 || layer.incarnation!=info.display || layer.generation!=info.generation ||
                layer.width!=info.width || layer.height!=info.height || layer.stride!=info.width || layer.bytes!=bytes))result=-EAGAIN;
             else if(capture && (!layer.pixels || layer.capacity<bytes || layer.pixels>~uint64_t{0}-bytes ||
@@ -177,8 +198,10 @@ static int64_t CaptureDesktopBackdrop(uint64_t owner,uint64_t op,uint64_t addres
                 brook::CompositorBackdropInfo after{};
                 if(!result && (!brook::CompositorGetBackdropInfo(&after) || after.display!=info.display ||
                    after.generation!=info.generation || after.width!=info.width || after.height!=info.height))result=-EAGAIN;
-                if(!result && op==BROOK_DESKTOP_BACKDROP_TRACKED_CAPTURE)
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+                if(!nv && !result && op==BROOK_DESKTOP_BACKDROP_TRACKED_CAPTURE)
                     result=brook::BdwOffscreenRegisterBackdrop(owner,info);
+#endif
             }
             if(!result){
                 layer.incarnation=info.display;layer.generation=info.generation;layer.bytes=bytes;
@@ -193,12 +216,13 @@ static int64_t CaptureDesktopBackdrop(uint64_t owner,uint64_t op,uint64_t addres
 #endif
 int64_t sys_brook_desktop_layers(uint64_t op,uint64_t address,uint64_t size,uint64_t a,uint64_t b,uint64_t c)
 {
-#if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
+#if (defined(BROOK_SSD_AUTO_RECOVERY) || defined(BROOK_NV_DISPLAY)) && !defined(BROOK_HOST_TEST)
     auto* proc=ProcessCurrent();if(!proc)return -ESRCH;
     KernelOperationGuard operation(proc);
-    if(!brook::BdwRenderExperimentEnabled())return -ENODEV;
     const uint64_t owner=proc->leaderIncarnation?proc->leaderIncarnation:proc->incarnation;
-    if (DesktopLayerContentOperation(op) && !DesktopCaptureOwner(proc, owner)) return -EPERM;
+    const bool nv=DesktopNvCaptureOwner(proc,owner);
+    if(!nv && !DesktopIntelRendererEnabled())return -ENODEV;
+    if(!nv && DesktopLayerContentOperation(op) && !DesktopIntelCaptureOwner(proc,owner))return -EPERM;
     if(op==BROOK_DESKTOP_FOCUS_QUERY){
         if((size!=sizeof(BrookDesktopFocus) && size!=BROOK_DESKTOP_FOCUS_V1_SIZE) || a || b || c || !address ||
            address>~uint64_t{0}-size)return -EINVAL;
@@ -242,11 +266,11 @@ int64_t sys_brook_desktop_layers(uint64_t op,uint64_t address,uint64_t size,uint
         op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_KEYED || op==BROOK_DESKTOP_CHROME_TRACKED_KEEP ||
         op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_SPANS) &&
        size==sizeof(BrookDesktopLayers) && !a && !b && !c && address<=~uint64_t{0}-size)
-        return CaptureDesktopChrome(owner,op,address,size);
+        return CaptureDesktopChrome(owner,op,address,size,nv);
     if((op==BROOK_DESKTOP_BACKDROP_QUERY || op==BROOK_DESKTOP_BACKDROP_CAPTURE ||
         op==BROOK_DESKTOP_BACKDROP_TRACKED_CAPTURE || op==BROOK_DESKTOP_BACKDROP_TRACKED_BIND) &&
        size==sizeof(BrookDesktopLayers) && !a && !b && !c && address<=~uint64_t{0}-size)
-        return CaptureDesktopBackdrop(owner,op,address,size);
+        return CaptureDesktopBackdrop(owner,op,address,size,nv);
     const bool keepOp=op==BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED_KEEP;
     // c: BROOK_DESKTOP_LAYERS_CULL_OCCLUDED with the keep op only.
     const bool cull=keepOp && c==BROOK_DESKTOP_LAYERS_CULL_OCCLUDED;
@@ -290,9 +314,11 @@ int64_t sys_brook_desktop_layers(uint64_t op,uint64_t address,uint64_t size,uint
                 __atomic_add_fetch(&g.bytesCopied,tally.bytesCopied,__ATOMIC_RELAXED);__atomic_add_fetch(&g.bytesKept,tally.bytesKept,__ATOMIC_RELAXED);
                 __atomic_add_fetch(&g.occluded,tally.occluded,__ATOMIC_RELAXED);__atomic_add_fetch(&g.bytesOccluded,tally.bytesOccluded,__ATOMIC_RELAXED);}
             bool adopted=false;
-            if(!result && tracked){
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+            if(!nv && !result && tracked){
                 result=brook::BdwOffscreenRegisterScene(owner,layers,&wire->reserved);adopted=!result;
             }
+#endif
             if(!result && !CopyToUser(address,wire,sizeof(*wire)))result=-EFAULT;
             if(!adopted)brook::WmReleaseDesktopLayers(layers);
             else layers=nullptr;
@@ -521,15 +547,16 @@ int64_t sys_brook_debug_frame(uint64_t op,uint64_t token,uint64_t destination,ui
 // lease; it shares the single capture slot with root debug screenshots.
 int64_t sys_brook_desktop_overlay(uint64_t op,uint64_t token,uint64_t destination,uint64_t length,uint64_t offset,uint64_t reserved)
 {
-#if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
+#if (defined(BROOK_SSD_AUTO_RECOVERY) || defined(BROOK_NV_DISPLAY)) && !defined(BROOK_HOST_TEST)
     auto* proc=ProcessCurrent();if(!proc)return -ESRCH;
     KernelOperationGuard operation(proc);
-    if(!brook::BdwRenderExperimentEnabled())return -ENODEV;
+    const uint64_t owner=proc->leaderIncarnation?proc->leaderIncarnation:proc->incarnation;
+    const bool nv=DesktopNvCaptureOwner(proc,owner);
+    if(!nv && !DesktopIntelRendererEnabled())return -ENODEV;
     if(token>0xffffffffULL || (reserved &&
        (op!=BROOK_DESKTOP_OVERLAY_CURSOR ||
         (reserved!=BROOK_DESKTOP_CURSOR_PLANE_V1 && reserved!=BROOK_DESKTOP_CURSOR_PLANE_V2 &&
          reserved!=BROOK_DESKTOP_CURSOR_PLANE_V3))))return -EINVAL;
-    const uint64_t owner=proc->leaderIncarnation?proc->leaderIncarnation:proc->incarnation;
     if(op==0){
         if(token || destination || length || (offset & ~uint64_t(BROOK_DESKTOP_OVERLAY_NO_CURSOR)))return -EINVAL;
         const auto frame=CompositorRequestDebugFrame(owner,true,!(offset&BROOK_DESKTOP_OVERLAY_NO_CURSOR));
@@ -608,7 +635,7 @@ int64_t sys_brook_desktop_overlay(uint64_t op,uint64_t token,uint64_t destinatio
         const auto deliver=[&](auto* cursor) -> int64_t {
             CompositorOverlayCursor(*cursor,offset);
             bool suppress=false;
-            const uint64_t epoch=brook::BdwCursorRendererQuery(owner,reserved==BROOK_DESKTOP_CURSOR_PLANE_V3,suppress);
+            const uint64_t epoch=nv?0:brook::BdwCursorRendererQuery(owner,reserved==BROOK_DESKTOP_CURSOR_PLANE_V3,suppress);
             if(suppress)cursor->visible=0;
             const uint64_t bytes=cursor->serial==offset?offsetof(BrookDesktopOverlayCursor,pixels):sizeof(*cursor);
             return CopyToUser(destination,cursor,bytes)?int64_t(epoch):-EFAULT;

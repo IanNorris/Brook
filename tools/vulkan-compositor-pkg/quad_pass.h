@@ -41,6 +41,11 @@ struct BrookVkQuadStats { uint64_t imports,cacheHits,evictions,submits,targetEvi
 unsigned brook_vk_quad_pass_target_imports(const BrookVkQuadPass *,uint64_t *inodes,unsigned max);
 
 BrookVkQuadPass *brook_vk_quad_pass_create(VkPhysicalDevice,VkDevice,VkQueue,uint32_t queueFamily);
+/* Upload pitch-linear DMA-BUF sources into optimal device-local sampled
+ * images and copy the optimal render target back to a pitch-linear DMA-BUF.
+ * Requires a single region covering the full frame. The caller must hold and exclude the output from
+ * reuse until both Vulkan and the external consumer have completed. */
+BrookVkQuadPass *brook_vk_quad_pass_create_optimal_output(VkPhysicalDevice,VkDevice,VkQueue,uint32_t queueFamily);
 /* The device enabled VK_EXT_image_drm_format_modifier: sources with a
  * nonzero buffer.modifier (Intel X/Y tiled) may be imported. Default off. */
 void brook_vk_quad_pass_set_modifiers(BrookVkQuadPass *,int enabled);

@@ -41,6 +41,13 @@ void NvPrimeRef(void* h) { nvdrm::SharedRef(S(h)); }
 void NvPrimeUnref(void* h) { nvdrm::SharedUnref(S(h)); }
 uint64_t NvPrimeBytes(void* h) { return S(h)->size; }
 uint64_t NvPrimeIdentity(void* h) { return S(h)->identity; }
+bool NvPrimeLinearVram(void* h, uint64_t length, uint64_t* phys) {
+    const Shared* s = S(h);
+    if (!s || !length || !phys || s->aper() != nvdrm::Aper::Vram ||
+        s->kind() || s->tile_mode || length > s->size) return false;
+    *phys = s->backing;
+    return true;
+}
 bool NvPrimeMapGart(void* h, uint64_t offset, uint64_t length, uint64_t* phys, MappingBacking** life) {
     Shared* s = S(h);
     if (!s || !length || s->aper() != nvdrm::Aper::Sys || offset + length > s->size || offset + length < offset) return false;
