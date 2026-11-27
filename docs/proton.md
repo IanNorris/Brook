@@ -42,6 +42,13 @@ logs and audio remain under `build/workloads/proton-20261019/`.
   reservations. This remains a packaging workaround, not a loader fix.
 - `PROTON_NO_ESYNC=1`, `PROTON_NO_FSYNC=1` and `PROTON_NO_NTSYNC=1` select Wine's
   server-side synchronization. These accelerators remain unaccepted.
+  The kernel side of fsync now exists: `futex_waitv` (449) with Linux
+  semantics, keyed like `futex` so classic `FUTEX_WAKE` and shared memfd,
+  POSIX shm and `MAP_SHARED` anonymous words work across processes
+  (`scripts/test_futex_waitv_qemu.py`). `RLIMIT_NOFILE` defaults to soft 1024,
+  hard 524288 and the soft limit can be raised, but the descriptor table still
+  holds 1024 slots, so esync's eventfd-per-object use will hit `EMFILE` there.
+  Dropping `PROTON_NO_FSYNC=1` still needs a game-level acceptance run.
 - A separate `STEAM_COMPAT_DATA_PATH` holds the prefix. `UMU_ID` selects GE's
   non-Steam launch path; a Windows `Z:\...\Helltaker.exe` argument avoids the
   Unix-path helper. This uses GE's Proton script directly, not the umu runner.

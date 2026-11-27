@@ -1,0 +1,501 @@
+// QEMU guest test for futex_waitv (449) and RLIMIT_NOFILE, the two kernel
+// features Proton/Wine fsync and esync depend on. Prints FUTEX_WAITV_OK or
+// FUTEX_WAITV_FAIL on stdout (the serial log).
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#ifndef SYS_futex_waitv
+#define SYS_futex_waitv 449
+#endif
+#define FUTEX_WAIT 0
+#define FUTEX_WAKE 1
+#define FUTEX_PRIVATE_FLAG 128
+#define FUTEX2_SIZE_U8 0
+#define FUTEX2_SIZE_U16 1
+#define FUTEX2_SIZE_U32 2
+#define FUTEX2_SIZE_U64 3
+#define FUTEX2_PRIVATE 128
+
+struct waitv { uint64_t val, uaddr; uint32_t flags, reserved; };
+
+static int failures;
+#define CHECK(cond, ...) do { if (!(cond)) { ++failures; printf("FUTEX_WAITV_CHECK_FAIL line %d: %s: ", __LINE__, #cond); \
+    printf(__VA_ARGS__); printf("\n"); fflush(stdout); } } while (0)
+
+static long waitv(struct waitv* w, unsigned n, const struct timespec* abs, int clock)
+{
+    long r = syscall(SYS_futex_waitv, w, n, 0, abs, clock);
+    return r < 0 ? -errno : r;
+}
+static long fwake(volatile uint32_t* a, int n, int priv)
+{
+    long r = syscall(SYS_futex, a, FUTEX_WAKE | (priv ? FUTEX_PRIVATE_FLAG : 0), n, 0, 0, 0);
+    return r < 0 ? -errno : r;
+}
+static void setw(struct waitv* w, volatile uint32_t* a, uint32_t v, int priv)
+{
+    w->val = v; w->uaddr = (uintptr_t)a; w->flags = FUTEX2_SIZE_U32 | (priv ? FUTEX2_PRIVATE : 0); w->reserved = 0;
+}
+static uint64_t now_ns(int clock)
+{
+    struct timespec t; clock_gettime(clock, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+static struct timespec after_ms(int clock, uint64_t ms)
+{
+    uint64_t t = now_ns(clock) + ms * 1000000ull;
+    struct timespec ts = {(time_t)(t / 1000000000ull), (long)(t % 1000000000ull)};
+    return ts;
+}
+static void sleep_ms(unsigned ms) { struct timespec t = {0, (long)ms * 1000000L}; nanosleep(&t, 0); }
+
+// ---------------------------------------------------------------- argument checks
+static void test_arguments(void)
+{
+    static uint32_t word = 7;
+    struct waitv w[129];
+    for (int i = 0; i < 129; ++i) setw(&w[i], &word, 7, 1);
+    // Proton's probe: futex_waitv(NULL, 0, 0, NULL, 0) must not be ENOSYS.
+    long r = syscall(SYS_futex_waitv, 0, 0, 0, 0, 0);
+    CHECK(r == -1 && errno == EINVAL, "probe r=%ld errno=%d", r, errno);
+    CHECK(waitv(w, 0, 0, CLOCK_MONOTONIC) == -EINVAL, "count 0");
+    CHECK(waitv(w, 129, 0, CLOCK_MONOTONIC) == -EINVAL, "count 129");
+    r = syscall(SYS_futex_waitv, w, 1, 1, 0, CLOCK_MONOTONIC);
+    CHECK(r == -1 && errno == EINVAL, "flags");
+    struct timespec ts = after_ms(CLOCK_MONOTONIC, 10);
+    CHECK(waitv(w, 1, &ts, CLOCK_BOOTTIME) == -EINVAL, "clock");
+    struct timespec bad = {0, 1000000000L};
+    CHECK(waitv(w, 1, &bad, CLOCK_MONOTONIC) == -EINVAL, "bad nsec");
+    unsigned sizes[] = {FUTEX2_SIZE_U8, FUTEX2_SIZE_U16, FUTEX2_SIZE_U64};
+    for (int i = 0; i < 3; ++i) {
+        struct waitv x = w[0]; x.flags = sizes[i];
+        CHECK(waitv(&x, 1, 0, CLOCK_MONOTONIC) == -EINVAL, "size %u", sizes[i]);
+    }
+    struct waitv x = w[0]; x.reserved = 1;
+    CHECK(waitv(&x, 1, 0, CLOCK_MONOTONIC) == -EINVAL, "reserved");
+    x = w[0]; x.uaddr += 1;
+    CHECK(waitv(&x, 1, 0, CLOCK_MONOTONIC) == -EINVAL, "misaligned");
+    x = w[0]; x.val = 0x100000007ull;
+    CHECK(waitv(&x, 1, 0, CLOCK_MONOTONIC) == -EINVAL, "val > u32");
+    x = w[0]; x.uaddr = 0x10;
+    CHECK(waitv(&x, 1, 0, CLOCK_MONOTONIC) == -EFAULT, "unmapped");
+    CHECK(waitv((struct waitv*)0x10, 1, 0, CLOCK_MONOTONIC) == -EFAULT, "unmapped vector");
+    printf("FUTEX_WAITV_ARGS done\n");
+}
+
+// ---------------------------------------------------------------- EAGAIN and timeout
+static void test_mismatch_timeout(void)
+{
+    static uint32_t a[128];
+    struct waitv w[128];
+    for (int i = 0; i < 128; ++i) { a[i] = (uint32_t)i; setw(&w[i], &a[i], (uint32_t)i, i & 1); }
+    for (int k = 0; k < 128; k += 9) {
+        w[k].val = 1000;
+        long r = waitv(w, 128, 0, CLOCK_MONOTONIC);
+        CHECK(r == -EAGAIN, "mismatch at %d r=%ld", k, r);
+        w[k].val = (uint32_t)k;
+    }
+    const int clocks[] = {CLOCK_MONOTONIC, CLOCK_REALTIME};
+    for (int c = 0; c < 2; ++c) {
+        uint64_t start = now_ns(clocks[c]);
+        struct timespec ts = after_ms(clocks[c], 60);
+        long r = waitv(w, 128, &ts, clocks[c]);
+        uint64_t elapsed = now_ns(clocks[c]) - start;
+        CHECK(r == -ETIMEDOUT, "clock %d r=%ld", clocks[c], r);
+        CHECK(elapsed >= 59000000ull && elapsed < 2000000000ull, "clock %d elapsed %llu", clocks[c],
+              (unsigned long long)elapsed);
+    }
+    struct timespec past = after_ms(CLOCK_MONOTONIC, 0);
+    past.tv_sec -= 1;
+    CHECK(waitv(w, 4, &past, CLOCK_MONOTONIC) == -ETIMEDOUT, "past deadline");
+    w[2].val = 99;
+    CHECK(waitv(w, 4, &past, CLOCK_MONOTONIC) == -EAGAIN, "mismatch wins over expired");
+    printf("FUTEX_WAITV_EAGAIN_TIMEOUT done\n");
+}
+
+// ---------------------------------------------------------------- index and threads
+struct idx_arg { volatile uint32_t* words; unsigned n; int priv; volatile int ready; long result; };
+static void* idx_waiter(void* p)
+{
+    struct idx_arg* a = p;
+    struct waitv w[128];
+    for (unsigned i = 0; i < a->n; ++i) setw(&w[i], &a->words[i], 0, a->priv);
+    a->ready = 1;
+    struct timespec ts = after_ms(CLOCK_MONOTONIC, 5000);
+    a->result = waitv(w, a->n, &ts, CLOCK_MONOTONIC);
+    return 0;
+}
+static void test_index(void)
+{
+    static uint32_t words[128];
+    const unsigned counts[] = {1, 2, 8, 128};
+    for (int c = 0; c < 4; ++c) {
+        unsigned n = counts[c];
+        for (unsigned k = 0; k < n; k = k ? k * 3 + 1 : 1) {
+            for (int priv = 0; priv < 2; ++priv) {
+                memset(words, 0, sizeof(words));
+                struct idx_arg a = {words, n, priv, 0, -999};
+                pthread_t t; pthread_create(&t, 0, idx_waiter, &a);
+                while (!a.ready) sched_yield();
+                sleep_ms(2);
+                __atomic_store_n(&words[k], 1, __ATOMIC_SEQ_CST);
+                long woke = 0;
+                // The waiter may not be queued yet; it then sees EAGAIN. Wake
+                // until it leaves (classic futex wake on the same key).
+                for (int tries = 0; tries < 2000 && a.result == -999; ++tries) {
+                    long r = fwake(&words[k], 1, priv);
+                    if (r > 0) woke += r;
+                    sleep_ms(1);
+                }
+                pthread_join(t, 0);
+                CHECK(a.result == (long)k || a.result == -EAGAIN, "n=%u k=%u priv=%d result=%ld", n, k, priv, a.result);
+                CHECK(a.result != -EAGAIN || woke == 0, "EAGAIN but %ld woken", woke);
+            }
+            if (n == 1) break;
+        }
+    }
+    printf("FUTEX_WAITV_INDEX done\n");
+}
+
+// Several waiters, each on {own, shared}: one FUTEX_WAKE(shared, INT_MAX)
+// releases all of them with index 1; FUTEX_WAKE(own) releases one with 0.
+struct multi_arg { volatile uint32_t* own; volatile uint32_t* shared; volatile int* queued; long result; };
+static void* multi_waiter(void* p)
+{
+    struct multi_arg* a = p;
+    struct waitv w[2]; setw(&w[0], a->own, 0, 0); setw(&w[1], a->shared, 0, 0);
+    __atomic_fetch_add(a->queued, 1, __ATOMIC_SEQ_CST);
+    struct timespec ts = after_ms(CLOCK_MONOTONIC, 5000);
+    a->result = waitv(w, 2, &ts, CLOCK_MONOTONIC);
+    return 0;
+}
+static void test_multi_waiters(void)
+{
+    enum { N = 8 };
+    static uint32_t own[N], shared;
+    volatile int queued = 0;
+    struct multi_arg args[N]; pthread_t t[N];
+    for (int i = 0; i < N; ++i) { args[i] = (struct multi_arg){&own[i], &shared, &queued, -999}; pthread_create(&t[i], 0, multi_waiter, &args[i]); }
+    while (queued < N) sched_yield();
+    sleep_ms(20);
+    // Release waiter 0 through its own word first.
+    long r = fwake(&own[0], 1, 0);
+    CHECK(r == 1, "own wake r=%ld", r);
+    pthread_join(t[0], 0);
+    CHECK(args[0].result == 0, "own result %ld", args[0].result);
+    r = fwake(&shared, INT_MAX, 0);
+    CHECK(r == N - 1, "shared wake woke %ld", r);
+    for (int i = 1; i < N; ++i) { pthread_join(t[i], 0); CHECK(args[i].result == 1, "waiter %d result %ld", i, args[i].result); }
+    printf("FUTEX_WAITV_MULTI done\n");
+}
+
+// ---------------------------------------------------------------- signals
+static volatile int g_handled;
+static void on_usr1(int s) { (void)s; g_handled++; }
+struct sig_arg { volatile uint32_t* word; volatile int ready; long result; };
+static void* sig_waiter(void* p)
+{
+    struct sig_arg* a = p;
+    struct waitv w[3]; static uint32_t pad[2];
+    setw(&w[0], &pad[0], 0, 1); setw(&w[1], &pad[1], 0, 0); setw(&w[2], a->word, 0, 0);
+    a->ready = 1;
+    struct timespec ts = after_ms(CLOCK_MONOTONIC, 4000);
+    a->result = waitv(w, 3, &ts, CLOCK_MONOTONIC);
+    return 0;
+}
+static void test_signal(void)
+{
+    static uint32_t word;
+    for (int restart = 0; restart < 2; ++restart) {
+        struct sigaction sa; memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = on_usr1; sa.sa_flags = restart ? SA_RESTART : 0;
+        sigaction(SIGUSR1, &sa, 0);
+        g_handled = 0; word = 0;
+        struct sig_arg a = {&word, 0, -999};
+        pthread_t t; pthread_create(&t, 0, sig_waiter, &a);
+        while (!a.ready) sched_yield();
+        sleep_ms(30);
+        pthread_kill(t, SIGUSR1);
+        if (restart) {
+            sleep_ms(50);
+            CHECK(a.result == -999, "SA_RESTART returned early %ld", a.result);
+            word = 1; fwake(&word, 1, 0);
+            for (int i = 0; i < 1000 && a.result == -999; ++i) { fwake(&word, 1, 0); sleep_ms(1); }
+        }
+        pthread_join(t, 0);
+        CHECK(g_handled == 1, "handler ran %d", g_handled);
+        if (restart) CHECK(a.result == 2 || a.result == -EAGAIN, "restart result %ld", a.result);
+        else CHECK(a.result == -EINTR, "EINTR result %ld", a.result);
+    }
+    signal(SIGUSR1, SIG_DFL);
+    printf("FUTEX_WAITV_SIGNAL done\n");
+}
+
+// ---------------------------------------------------------------- cross-process
+// Shared page layout: [0] child ready, [1] parent->child word, [2] child->parent word.
+static int child_wait(volatile uint32_t* page, int index_of_target)
+{
+    static uint32_t local[4];
+    struct waitv w[4];
+    for (int i = 0; i < 4; ++i) setw(&w[i], &local[i], 0, 1);
+    setw(&w[index_of_target], &page[1], 0, 0);
+    __atomic_store_n(&page[0], 1, __ATOMIC_SEQ_CST);
+    fwake(&page[0], 1, 0);
+    struct timespec ts = after_ms(CLOCK_MONOTONIC, 5000);
+    long r;
+    do r = waitv(w, 4, &ts, CLOCK_MONOTONIC);
+    while (r == -EAGAIN && page[1] == 0);
+    if (r == -EAGAIN) r = index_of_target; // value already changed: wake raced the setup
+    // Now wake the parent waiting on page[2] in its own mapping.
+    __atomic_store_n(&page[2], 1, __ATOMIC_SEQ_CST);
+    fwake(&page[2], 1, 0);
+    return r == index_of_target ? 0 : (r < 0 ? 100 + (int)-r : 50 + (int)r);
+}
+static int parent_side(volatile uint32_t* page, pid_t child, const char* name)
+{
+    struct timespec ts = after_ms(CLOCK_MONOTONIC, 5000);
+    while (!__atomic_load_n(&page[0], __ATOMIC_SEQ_CST)) {
+        syscall(SYS_futex, &page[0], FUTEX_WAIT, 0, 0, 0, 0);
+        if (now_ns(CLOCK_MONOTONIC) > (uint64_t)ts.tv_sec * 1000000000ull) break;
+    }
+    sleep_ms(20);
+    __atomic_store_n(&page[1], 1, __ATOMIC_SEQ_CST);
+    long woke = fwake(&page[1], 1, 0);
+    // The parent waits through futex_waitv on its own (different) mapping.
+    struct waitv w[2]; static uint32_t pad;
+    setw(&w[0], &pad, 0, 1); setw(&w[1], &page[2], 0, 0);
+    long r;
+    do r = waitv(w, 2, &ts, CLOCK_MONOTONIC);
+    while (r == -EAGAIN && page[2] == 0);
+    int status = 0; waitpid(child, &status, 0);
+    int code = WIFEXITED(status) ? WEXITSTATUS(status) : 255;
+    CHECK(code == 0, "%s child exit %d (woke=%ld)", name, code, woke);
+    CHECK(r == 1 || (r == -EAGAIN && page[2] == 1), "%s parent waitv %ld", name, r);
+    return code;
+}
+static void test_cross_process(void)
+{
+    // MAP_SHARED anonymous, inherited across fork.
+    volatile uint32_t* anon = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    CHECK(anon != MAP_FAILED, "anon mmap");
+    pid_t pid = fork();
+    if (!pid) _exit(child_wait(anon, 2));
+    parent_side(anon, pid, "anon");
+
+    // memfd: the child maps it again at another address (different VA, same key).
+    int fd = memfd_create("waitv", 0);
+    CHECK(fd >= 0 && ftruncate(fd, 8192) == 0, "memfd");
+    volatile uint32_t* mem = mmap(0, 8192, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    volatile uint32_t* memPage = (volatile uint32_t*)((char*)mem + 4096);
+    pid = fork();
+    if (!pid) {
+        void* spacer = mmap(0, 65536, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0); (void)spacer;
+        volatile uint32_t* again = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 4096);
+        if (again == MAP_FAILED || again == memPage) _exit(90);
+        _exit(child_wait(again, 3));
+    }
+    parent_side(memPage, pid, "memfd");
+
+    // POSIX shm (Wine's fsync shm): each process opens the name separately.
+    char name[64];
+    snprintf(name, sizeof(name), "/brook-futex-waitv-%d", (int)getpid()); // concurrent copies
+    shm_unlink(name);
+    int sfd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+    CHECK(sfd >= 0 && ftruncate(sfd, 4096) == 0, "shm_open");
+    volatile uint32_t* shm = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, sfd, 0);
+    pid = fork();
+    if (!pid) {
+        close(sfd);
+        int cfd = shm_open(name, O_RDWR, 0);
+        void* spacer = mmap(0, 65536, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0); (void)spacer;
+        volatile uint32_t* mine = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, cfd, 0);
+        if (cfd < 0 || mine == MAP_FAILED) _exit(91);
+        _exit(child_wait(mine, 0));
+    }
+    parent_side(shm, pid, "shm");
+    shm_unlink(name);
+    printf("FUTEX_WAITV_CROSS_PROCESS done\n");
+}
+
+// A waiter killed while blocked never returns to unqueue its nodes, which
+// live on its kernel stack: process cancellation must unlink every one before
+// that stack can be reaped. Afterwards no node may remain on the shared words.
+static void* exit_group_waiter(void* p)
+{
+    volatile uint32_t* page = p;
+    struct waitv w[128];
+    for (int i = 0; i < 128; ++i) setw(&w[i], &page[64 + (i % 8)], 0, 0);
+    __atomic_fetch_add(&page[1], 1, __ATOMIC_SEQ_CST);
+    waitv(w, 128, 0, CLOCK_MONOTONIC);
+    return 0;
+}
+static void test_killed_waiters(void)
+{
+    volatile uint32_t* page = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    for (int round = 0; round < 40; ++round) {
+        memset((void*)page, 0, 4096);
+        pid_t pid = fork();
+        if (!pid) {
+            // Threads blocked in futex_waitv while the main thread exits the group
+            // (even rounds) or the parent SIGKILLs the group (odd rounds).
+            pthread_t t[3];
+            for (int i = 0; i < 3; ++i) pthread_create(&t[i], 0, exit_group_waiter, (void*)page);
+            while (page[1] < 3) sched_yield();
+            sleep_ms(5);
+            if (!(round & 1)) _exit(0);
+            exit_group_waiter((void*)page);
+            _exit(1);
+        }
+        while (page[1] < 3u + (unsigned)(round & 1)) sched_yield();
+        sleep_ms(5);
+        if (round & 1) kill(pid, SIGKILL);
+        int status = 0; waitpid(pid, &status, 0);
+        long stale = 0;
+        for (int i = 0; i < 8; ++i) { long r = fwake(&page[64 + i], INT_MAX, 0); if (r > 0) stale += r; }
+        CHECK(stale == 0, "round %d: %ld nodes left after the waiter group died", round, stale);
+    }
+    printf("FUTEX_WAITV_KILLED done\n");
+}
+
+// ---------------------------------------------------------------- lost-wakeup stress
+// Ping-pong on one turn word. The waiter side uses futex_waitv with the turn
+// word at a rotating index among decoys; the other side waits with classic
+// FUTEX_WAIT. A lost wakeup shows up as a 2 s timeout while the turn word
+// already says "your turn".
+struct pp { volatile uint32_t* turn; uint32_t iterations; int priv; long lost, errors, slept, again; };
+// Vary the hand-off delay so the wake lands before, inside and after the
+// waiter's queue-then-check window.
+static void spin(uint32_t i) { for (volatile uint32_t n = (i * 2654435761u) >> 22; n; --n) {} }
+static void* pp_classic(void* p)
+{
+    struct pp* a = p;
+    for (uint32_t i = 0; i < a->iterations; ++i) {
+        while (__atomic_load_n(a->turn, __ATOMIC_ACQUIRE) != 1) {
+            struct timespec rel = {2, 0};
+            long r = syscall(SYS_futex, a->turn, FUTEX_WAIT | (a->priv ? FUTEX_PRIVATE_FLAG : 0), 0, &rel, 0, 0);
+            if (r < 0 && errno == ETIMEDOUT && __atomic_load_n(a->turn, __ATOMIC_ACQUIRE) == 1) a->lost++;
+        }
+        spin(i);
+        __atomic_store_n(a->turn, 0, __ATOMIC_RELEASE);
+        fwake(a->turn, 1, a->priv);
+    }
+    return 0;
+}
+static void pp_waitv(struct pp* a)
+{
+    static uint32_t decoys[8];
+    struct waitv w[8];
+    for (uint32_t i = 0; i < a->iterations; ++i) {
+        const unsigned n = 1 + (i % 8), k = (i * 7) % n;
+        for (unsigned j = 0; j < n; ++j) setw(&w[j], &decoys[j], 0, j & 1);
+        setw(&w[k], a->turn, 1, a->priv);
+        while (__atomic_load_n(a->turn, __ATOMIC_ACQUIRE) != 0) {
+            struct timespec ts = after_ms(CLOCK_MONOTONIC, 2000);
+            long r = waitv(w, n, &ts, CLOCK_MONOTONIC);
+            if (r == -ETIMEDOUT && __atomic_load_n(a->turn, __ATOMIC_ACQUIRE) == 0) a->lost++;
+            else if (r >= 0 && r != (long)k) a->errors++;
+            else if (r >= 0) a->slept++;
+            else if (r == -EAGAIN) a->again++;
+            else if (r != -ETIMEDOUT) a->errors++;
+        }
+        spin(i ^ 0x5bd1e995u);
+        __atomic_store_n(a->turn, 1, __ATOMIC_RELEASE);
+        fwake(a->turn, 1, a->priv);
+    }
+}
+static void test_stress(uint32_t iterations)
+{
+    static uint32_t turn;
+    for (int priv = 0; priv < 2; ++priv) {
+        turn = 0;
+        struct pp a = {&turn, iterations / 2, priv, 0, 0, 0, 0};
+        uint64_t start = now_ns(CLOCK_MONOTONIC);
+        pthread_t t; pthread_create(&t, 0, pp_classic, &a);
+        pp_waitv(&a);
+        pthread_join(t, 0);
+        printf("FUTEX_WAITV_STRESS threads priv=%d iterations=%u slept=%ld eagain=%ld lost=%ld errors=%ld ms=%llu\n", priv,
+               a.iterations, a.slept, a.again, a.lost, a.errors,
+               (unsigned long long)((now_ns(CLOCK_MONOTONIC) - start) / 1000000ull));
+        CHECK(a.lost == 0 && a.errors == 0, "thread stress priv=%d lost=%ld errors=%ld", priv, a.lost, a.errors);
+    }
+    // Cross-process over MAP_SHARED anonymous memory.
+    volatile uint32_t* page = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    struct pp* shared = (struct pp*)((char*)page + 64);
+    *shared = (struct pp){page, iterations / 4, 0, 0, 0, 0, 0};
+    uint64_t start = now_ns(CLOCK_MONOTONIC);
+    pid_t pid = fork();
+    if (!pid) { pp_classic(shared); _exit(0); }
+    pp_waitv(shared);
+    int status = 0; waitpid(pid, &status, 0);
+    printf("FUTEX_WAITV_STRESS process iterations=%u slept=%ld eagain=%ld lost=%ld errors=%ld ms=%llu\n",
+           shared->iterations, shared->slept, shared->again, shared->lost, shared->errors,
+           (unsigned long long)((now_ns(CLOCK_MONOTONIC) - start) / 1000000ull));
+    CHECK(WIFEXITED(status) && shared->lost == 0 && shared->errors == 0, "process stress lost=%ld errors=%ld",
+          shared->lost, shared->errors);
+}
+
+// ---------------------------------------------------------------- RLIMIT_NOFILE
+static void test_nofile(void)
+{
+    struct rlimit r;
+    CHECK(getrlimit(RLIMIT_NOFILE, &r) == 0, "getrlimit");
+    printf("FUTEX_WAITV_NOFILE initial soft=%llu hard=%llu\n", (unsigned long long)r.rlim_cur, (unsigned long long)r.rlim_max);
+    CHECK(r.rlim_max >= 524288, "hard %llu", (unsigned long long)r.rlim_max);
+    pid_t pid = fork();
+    if (!pid) {
+        struct rlimit x; getrlimit(RLIMIT_NOFILE, &x);
+        x.rlim_cur = x.rlim_max;
+        if (setrlimit(RLIMIT_NOFILE, &x)) _exit(1);
+        struct rlimit y; getrlimit(RLIMIT_NOFILE, &y);
+        if (y.rlim_cur != x.rlim_max) _exit(2);
+        struct rlimit64 { uint64_t cur, max; } old, lower = {1024, 4096}, higher = {1024, 8192}, inverted = {8192, 4096};
+        if (syscall(SYS_prlimit64, 0, RLIMIT_NOFILE, &lower, &old) || old.cur != x.rlim_max) _exit(3);
+        if (syscall(SYS_prlimit64, 0, RLIMIT_NOFILE, &inverted, 0) != -1 || errno != EINVAL) _exit(4);
+        // Raising the hard limit needs CAP_SYS_RESOURCE; uid 0 test runs have it.
+        long raised = syscall(SYS_prlimit64, 0, RLIMIT_NOFILE, &higher, 0);
+        if (geteuid() != 0 && (raised != -1 || errno != EPERM)) _exit(5);
+        // Exec/fork inheritance: a grandchild sees the same limits.
+        pid_t g = fork();
+        if (!g) { struct rlimit z; getrlimit(RLIMIT_NOFILE, &z); _exit(z.rlim_cur == 1024 && z.rlim_max >= 4096 ? 0 : 6); }
+        int st = 0; waitpid(g, &st, 0);
+        _exit(WIFEXITED(st) ? WEXITSTATUS(st) : 7);
+    }
+    int status = 0; waitpid(pid, &status, 0);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0, "nofile child status %d", WEXITSTATUS(status));
+    struct rlimit after; getrlimit(RLIMIT_NOFILE, &after);
+    CHECK(after.rlim_cur == r.rlim_cur && after.rlim_max == r.rlim_max, "child changed parent limits");
+    printf("FUTEX_WAITV_NOFILE done\n");
+}
+
+int main(int argc, char** argv)
+{
+    setvbuf(stdout, 0, _IOLBF, 0);
+    uint32_t iterations = argc > 1 ? (uint32_t)strtoul(argv[1], 0, 10) : 100000;
+    test_arguments();
+    test_mismatch_timeout();
+    test_index();
+    test_multi_waiters();
+    test_signal();
+    test_cross_process();
+    test_killed_waiters();
+    test_nofile();
+    test_stress(iterations);
+    if (failures) printf("FUTEX_WAITV_FAIL failures=%d\n", failures);
+    else printf("FUTEX_WAITV_OK\n");
+    fflush(stdout);
+    return failures ? 1 : 0;
+}

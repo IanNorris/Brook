@@ -41,6 +41,10 @@ inline bool SignalSyscallMayRestart(uint64_t number, uint64_t argument1,
         const uint32_t operation = static_cast<uint32_t>(argument1) & ~(128u | 256u);
         return (operation == 0 || operation == 9) && argument3 == 0;
     }
+    case 449:
+        // futex_waitv returns -ERESTARTSYS on Linux; its timeout is absolute,
+        // so replaying it after a SA_RESTART handler never extends the wait.
+        return true;
     default:
         return false;
     }

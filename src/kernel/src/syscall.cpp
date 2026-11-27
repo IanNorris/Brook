@@ -455,6 +455,7 @@ void SyscallTableInit()
     g_syscallTable[SYS_PRCTL]           = sys_prctl;
     g_syscallTable[317]                  = SysSeccomp; // Linux x86-64 seccomp
     g_syscallTable[SYS_FUTEX]           = sys_futex;
+    g_syscallTable[SYS_FUTEX_WAITV]     = sys_futex_waitv; // Wine/Proton fsync
     g_syscallTable[SYS_SIGNALFD]        = sys_signalfd;
     g_syscallTable[SYS_SIGNALFD4]       = sys_signalfd4;
     g_syscallTable[240] = sys_mq_open;

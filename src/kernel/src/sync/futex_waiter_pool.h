@@ -18,6 +18,10 @@ struct FutexWaiter {
     uint64_t     owner;   // 0 for shared futexes; tgid for FUTEX_PRIVATE_FLAG
     Process*     proc;    // Blocked process
     uint32_t     bitset;  // Bitset accepted (FUTEX_BITSET_MATCH_ANY for plain WAIT)
+    // Linked in a hash bucket. Every unlink clears it under the futex lock;
+    // futex_waitv reads it to learn which of its stack nodes a waker took.
+    bool         queued;
+    bool         multi;   // futex_waitv stack node; never matched by (key, proc)
     FutexWaiter* next;    // Next in hash bucket chain
 };
 

@@ -635,6 +635,8 @@ target_compile_options(test_pi_dispatch PRIVATE "-iquote${BROOK_ROOT}/src/kernel
 target_compile_options(test_futex_pool PRIVATE
     "-iquote${BROOK_ROOT}/src/kernel/src"
 )
+add_host_test(test_futex_waitv)
+target_compile_options(test_futex_waitv PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_fd_table)
 # The full suite includes stress tests. For local iteration use ctest -LE stress,
 # then run the stress tests separately with ctest -L stress -j1.

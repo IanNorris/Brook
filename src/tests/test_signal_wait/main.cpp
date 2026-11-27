@@ -73,6 +73,7 @@ int main(){using namespace brook;
     for(uint64_t n:{0,1,2,16,17,18,19,20,61})CHECK(SignalSyscallMayRestart(n,0,0));
     for(uint64_t op:{0,128,9,137,393}){CHECK(SignalSyscallMayRestart(202,op,0));CHECK(!SignalSyscallMayRestart(202,op,0x1234));}
     CHECK(!SignalSyscallMayRestart(202,6,0));
+    CHECK(SignalSyscallMayRestart(449,0,0));CHECK(SignalSyscallMayRestart(449,0,0x1234)); // futex_waitv: ERESTARTSYS
     for(uint64_t op:{6,134,13,141,269,397}) {
         uint64_t rip=0x1234;int64_t result=-4;
         CHECK(SignalPrepareUnconditionalRestart(202,op,SignalRestartNoIntr,&rip,&result));

@@ -402,6 +402,8 @@ int64_t sys_set_robust_list(uint64_t head,uint64_t length,uint64_t,uint64_t,uint
 int64_t sys_get_robust_list(uint64_t pid,uint64_t headOut,uint64_t lengthOut,uint64_t,uint64_t,uint64_t);
 int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
                    uint64_t arg4, uint64_t arg5, uint64_t arg6);
+int64_t sys_futex_waitv(uint64_t waiters, uint64_t count, uint64_t flags,
+                        uint64_t timeout, uint64_t clockid, uint64_t);
 
 // syscall_cred.cpp
 int64_t sys_getuid(uint64_t, uint64_t, uint64_t,
