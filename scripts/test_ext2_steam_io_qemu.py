@@ -28,7 +28,7 @@ def main():
     parser.add_argument("--accel", choices=("kvm", "tcg"), default="tcg")
     parser.add_argument("--option", action="append", default=[], help="QEMU fw_cfg name=value")
     parser.add_argument("--keep-disks", action="store_true")
-    parser.add_argument("--usb-stream-io", action="store_true", help="enable the real boot marker")
+    parser.add_argument("--usb-stream-io", action="store_true", help="enable the BROOK_SYSTEM readahead and cache marker")
     parser.add_argument("--trace-uas", action="store_true", help="record QEMU command tags and completions")
     args = parser.parse_args()
     if args.trace_uas and args.transport != "uas":
