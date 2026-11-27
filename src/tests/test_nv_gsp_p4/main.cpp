@@ -523,7 +523,10 @@ int main(int argc, char** argv) {
             lj.layer_phys = lb.bus; lj.layer_stride = lstride; lj.layer_dst = NvCeRect{20, 8, int32_t(20 + LW), int32_t(8 + LH)};
             const size_t launches = r.rm.ce_launches;
             r.rm.ce_order.clear();
-            assert(r.CePresentOnce(cp, lj, bb, &bytes) == 1);
+            { const int k = r.CePresentOnce(cp, lj, bb, &bytes);
+              if (k != 1) std::fprintf(stderr, "layer kick %d: %s refused=%u bus=0x%llx host=%s\n", k, cp.last_error, cp.st.layer_refused,
+                                      (unsigned long long)lb.bus, r.rm.host_error.c_str());
+              assert(k == 1); }
             assert(r.rm.ce_launches == launches + 3 && r.rm.ce_remaps == 1 && cp.st.layer_copies == 1 && cp.st.layer_maps == 1);
             assert(bytes == 64ull * 4 * 16 + 56ull * 4 * 24 + uint64_t(LW) * 4 * LH);
             // the layer copy is the last launch, so it wins where it overlaps rect 0 (10,5)-(74,21)

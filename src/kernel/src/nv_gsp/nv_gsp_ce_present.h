@@ -18,7 +18,7 @@ constexpr uint32_t kCeVaBbSlots = 64;
 // Zero-copy step 2: client GART BOs (physically contiguous) are mapped at kCeVaLayer + pa,
 // 2 MiB at a time and never unmapped or changed, so a mapping made for one BO serves any
 // later BO in the same 2 MiB chunks and needs no invalidate (sysmem below kCeLayerMaxPa).
-constexpr uint64_t kCeVaLayer = 0x0000010000000000ull, kCeLayerMaxPa = 64ull << 30;
+constexpr uint64_t kCeVaLayer = 0x0000008000000000ull, kCeLayerMaxPa = 64ull << 30;   // < 1 TiB: CE VAs are 40-bit
 constexpr uint32_t kCeLayerChunks = uint32_t(kCeLayerMaxPa >> 21);
 constexpr uint32_t kCeHandle = 0xce5b0001;
 constexpr uint32_t kCeBudgetUs = 100000;
