@@ -729,6 +729,73 @@ static void test_fsync_model(void)
     printf("FUTEX_WAITV_FSYNC_MODEL done\n");
 }
 
+// /proc/<pid>/shmframes: two processes that open one tmpfs shm by name and
+// fault its untouched pages in different orders (read first / write first)
+// must map the same frame per offset, and see each other's stores.
+static int frame_tag(pid_t pid, unsigned offset, char* line, size_t cap)
+{
+    char path[64], buf[8192]; snprintf(path, sizeof(path), "/proc/%d/shmframes", (int)pid);
+    int fd = open(path, O_RDONLY); if (fd < 0) return -1;
+    ssize_t n = read(fd, buf, sizeof(buf) - 1); close(fd);
+    if (n <= 0) return -1;
+    buf[n] = 0;
+    char want[32]; snprintf(want, sizeof(want), "  +0x%x frame=", offset);
+    char* at = strstr(buf, want); if (!at) return -1;
+    char* end = strchr(at, '\n'); size_t len = end ? (size_t)(end - at) : strlen(at);
+    if (len >= cap) len = cap - 1;
+    memcpy(line, at, len); line[len] = 0;
+    return 0;
+}
+static void test_shm_frames(void)
+{
+    char name[64]; snprintf(name, sizeof(name), "/brook-frames-%d", (int)getpid());
+    shm_unlink(name);
+    int fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0644);
+    CHECK(fd >= 0 && ftruncate(fd, 65536) == 0, "shm create");
+    volatile uint32_t* mine = mmap(0, 65536, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    int toChild[2], toParent[2];
+    if (pipe(toChild) || pipe(toParent)) { CHECK(0, "pipes"); return; }
+    pid_t pid = fork();
+    if (!pid) {
+        close(fd);
+        int cfd = shm_open(name, O_RDWR, 0644);
+        void* spacer = mmap(0, 3 * 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0); (void)spacer;
+        volatile uint32_t* theirs = mmap(0, 65536, PROT_READ | PROT_WRITE, MAP_SHARED, cfd, 0);
+        char c;
+        uint32_t seen = theirs[0x2640 / 4];           // read-fault page 2 first
+        theirs[0x46a0 / 4] = 0x5150;                  // write-fault page 4 first
+        if (write(toParent[1], "1", 1) != 1) _exit(60);
+        if (read(toChild[0], &c, 1) != 1) _exit(61);  // parent stored to both pages
+        uint32_t later = theirs[0x2640 / 4];
+        if (write(toParent[1], &seen, 4) != 4 || write(toParent[1], &later, 4) != 4) _exit(62);
+        if (read(toChild[0], &c, 1) != 1) _exit(63);  // parent sampled our frames
+        _exit(0);
+    }
+    char c;
+    CHECK(read(toParent[0], &c, 1) == 1, "child ready");
+    mine[0x2640 / 4] = 0xabc;                          // write-fault page 2 second
+    uint32_t fromChild = mine[0x46a0 / 4];             // read-fault page 4 second
+    CHECK(write(toChild[1], "2", 1) == 1, "go");
+    uint32_t seen = 1, later = 0;
+    CHECK(read(toParent[0], &seen, 4) == 4 && read(toParent[0], &later, 4) == 4, "child values");
+    char a2[96] = "", b2[96] = "", a4[96] = "", b4[96] = "";
+    frame_tag(getpid(), 0x2000, a2, sizeof(a2)); frame_tag(pid, 0x2000, b2, sizeof(b2));
+    frame_tag(getpid(), 0x4000, a4, sizeof(a4)); frame_tag(pid, 0x4000, b4, sizeof(b4));
+    printf("FUTEX_WAITV_SHMFRAMES parent %s | child %s\n", a2, b2);
+    printf("FUTEX_WAITV_SHMFRAMES parent %s | child %s\n", a4, b4);
+    CHECK(write(toChild[1], "3", 1) == 1, "done");
+    int st = 0; waitpid(pid, &st, 0);
+    CHECK(WIFEXITED(st) && !WEXITSTATUS(st), "frames child %d", WEXITSTATUS(st));
+    CHECK(seen == 0 && later == 0xabc && fromChild == 0x5150, "coherence seen=%u later=%#x fromChild=%#x", seen, later, fromChild);
+    // Compare only the frame tag (rw/ro may legitimately differ).
+    CHECK(a2[0] && b2[0] && !strncmp(a2, b2, strcspn(a2, " r") > 0 ? (size_t)(strstr(a2, " r") - a2) : strlen(a2)),
+          "page 2 frames differ: %s vs %s", a2, b2);
+    CHECK(a4[0] && b4[0] && !strncmp(a4, b4, strstr(a4, " r") ? (size_t)(strstr(a4, " r") - a4) : strlen(a4)),
+          "page 4 frames differ: %s vs %s", a4, b4);
+    munmap((void*)mine, 65536); close(fd); shm_unlink(name);
+    printf("FUTEX_WAITV_SHMFRAMES done\n");
+}
+
 // ---------------------------------------------------------------- RLIMIT_NOFILE
 static void test_nofile(void)
 {
@@ -779,6 +846,7 @@ int main(int argc, char** argv)
     test_signal();
     test_cross_process();
     test_killed_waiters();
+    test_shm_frames();
     test_fsync_model();
     test_nofile();
     test_stress(iterations);

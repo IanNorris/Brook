@@ -14,6 +14,7 @@
 #include "procfs.h"
 #include "futex_waitv.h"
 extern "C" uint32_t FutexSnapshotTask(uint32_t pid, brook::FutexTaskSnapshot* out, uint32_t capacity);
+extern "C" uint32_t FutexDescribeSharedMappings(uint16_t pid, uint64_t incarnation, char* buffer, uint32_t capacity);
 #include "synthetic_system_files.h"
 #include "proc_inode.h"
 #include "vfs.h"
@@ -916,6 +917,17 @@ static Vnode* GenPidFutex(const ProcessSnapshot& proc)
     return MakeProcVnode(buf, n);
 }
 
+// /proc/[pid]/shmframes (Brook) — shared file/memfd mappings with per-page
+// frame tags; compare tags across processes for one key + offset.
+static Vnode* GenPidShmFrames(const ProcessSnapshot& proc)
+{
+    constexpr uint32_t Capacity = 32 * 1024;
+    auto* buf = static_cast<char*>(kmalloc(Capacity));
+    if (!buf) return nullptr;
+    const uint32_t n = FutexDescribeSharedMappings(proc.pid, proc.incarnation, buf, Capacity);
+    return MakeProcVnode(buf, n);
+}
+
 // /proc/[pid]/cmdline — live NUL-separated arguments, tied to PID incarnation.
 static Vnode* GenPidCmdline(const ProcessSnapshot& proc)
 {
@@ -1667,6 +1679,7 @@ static ProcPidEntry g_pidEntries[] = {
     { "syscall", GenPidSyscall },
     { "wchan",   GenPidWchan },
     { "futex",   GenPidFutex },
+    { "shmframes", GenPidShmFrames },
 };
 static constexpr uint32_t NUM_PID_ENTRIES = sizeof(g_pidEntries) / sizeof(g_pidEntries[0]);
 

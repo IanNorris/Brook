@@ -494,6 +494,88 @@ void RobustFutexCleanup(Process* target)
     __atomic_store_n(&target->robustExitState,3,__ATOMIC_RELEASE);
 }
 
+// /proc/<pid>/shmframes (diagnostic): every shared file/memfd mapping of a
+// task with its futex key identity and, per page, a frame tag and leaf state.
+// Equal tags across processes mean they map the same physical frame for that
+// object offset; different tags at one key+offset mean incoherent views. Tags
+// are a boot-keyed permutation of the frame number, never a raw address.
+namespace {
+struct TextOut {
+    char* p; char* end;
+    void Put(const char* s) { while (*s && p < end) *p++ = *s++; }
+    void Hex(uint64_t v) {
+        char tmp[16]; int n = 0;
+        do { tmp[n++] = "0123456789abcdef"[v & 15]; v >>= 4; } while (v && n < 16);
+        while (n && p < end) *p++ = tmp[--n];
+    }
+    void Dec(uint64_t v) {
+        char tmp[20]; int n = 0;
+        do { tmp[n++] = static_cast<char>('0' + v % 10); v /= 10; } while (v && n < 20);
+        while (n && p < end) *p++ = tmp[--n];
+    }
+};
+uint64_t FrameTag(uint64_t frame)
+{
+    static uint64_t key;
+    uint64_t k = __atomic_load_n(&key, __ATOMIC_RELAXED);
+    if (!k) {
+        uint64_t fresh = ApicTickCount() * 0x9e3779b97f4a7c15ull ^ 0xd1b54a32d192ed03ull;
+        fresh |= 1;
+        __atomic_compare_exchange_n(&key, &k, fresh, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+        k = __atomic_load_n(&key, __ATOMIC_RELAXED);
+    }
+    uint64_t x = (frame ^ (k >> 7)) * k; // odd multiplier: a bijection on frames
+    return (x ^ (x >> 29)) & 0xffffffffffull;
+}
+} // namespace
+
+extern "C" uint32_t FutexDescribeSharedMappings(uint16_t pid, uint64_t incarnation, char* buffer, uint32_t capacity)
+{
+    if (!buffer || capacity < 2) return 0;
+    TextOut out{buffer, buffer + capacity - 1};
+    Process* actor = ProcessCurrent();
+    Process* live = SchedulerFindProcessReference(pid);
+    if (!live) return 0;
+    AddressSpaceState* space = live->incarnation == incarnation ? live->addressSpace : nullptr;
+    if (space && !space->kernel && actor) {
+        AddressSpaceRef(space);
+        {
+            MappingTransaction mapping(actor, space);
+            if (mapping.Lock()) {
+                for (auto* node = space->ranges.head; node; node = node->next) {
+                    const MappingRange& range = node->range;
+                    if (range.sharing != MappingSharing::Shared || !range.backing ||
+                        (range.kind != MappingKind::File && range.kind != MappingKind::MemFd)) continue;
+                    uint64_t owner = 0, key = 0;
+                    if (FutexMappedKey(live, range.begin, 0, &range, owner, key)) continue;
+                    out.Put(range.kind == MappingKind::File ? "file:" : "memfd:");
+                    out.Dec(owner & ((uint64_t{1} << 62) - 1));
+                    out.Put(" va=0x"); out.Hex(range.begin); out.Put("-0x"); out.Hex(range.end);
+                    out.Put(" offset=0x"); out.Hex(range.offset);
+                    out.Put(" prot="); out.Put(range.protection & 1 ? "r" : "-");
+                    out.Put(range.protection & 2 ? "w" : "-"); out.Put("\n");
+                    const uint64_t pages = (range.end - range.begin) / 4096;
+                    for (uint64_t i = 0; i < pages && i < 32; ++i) {
+                        const uint64_t va = range.begin + i * 4096;
+                        const uint64_t leaf = VmmReadLeaf(space->pageTable, VirtualAddress(va));
+                        if (!(leaf & VMM_PRESENT)) continue;
+                        out.Put("  +0x"); out.Hex(range.offset + i * 4096);
+                        out.Put(" frame="); out.Hex(FrameTag(VmmLeafPhysical(leaf).raw() >> 12));
+                        out.Put(leaf & VMM_WRITABLE ? " rw" : " ro");
+                        if (leaf & PTE_COW_BIT) out.Put(" cow");
+                        out.Put("\n");
+                    }
+                    if (pages > 32) { out.Put("  ... "); out.Dec(pages - 32); out.Put(" more pages\n"); }
+                }
+            } else out.Put("(address space busy)\n");
+        }
+        AddressSpaceUnref(space);
+    }
+    ProcessUnref(live);
+    *out.p = 0;
+    return static_cast<uint32_t>(out.p - buffer);
+}
+
 int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
                    uint64_t arg4, uint64_t arg5, uint64_t arg6)
 {
