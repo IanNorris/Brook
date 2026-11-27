@@ -7,7 +7,8 @@
 #
 #   nix-build nix/rtx-desktop-steam6.nix --arg base '"/nix/store/...-brook-rtx-desktop-nvk"' \
 #     --arg oldLauncher '"/nix/store/...-brook-steam-launcher-<version>"'
-{ pkgs ? import ./nixpkgs.nix { config.allowUnfree = false; }, base, oldLauncher }:
+{ pkgs ? import ./nixpkgs.nix { config.allowUnfree = false; }, base, oldLauncher
+, name ? "brook-rtx-desktop-steam6" }:  # seq7: --argstr name brook-rtx-desktop-steam7 (adds the VK ICD export)
 let
   baseProfile = builtins.storePath base;
   previous = builtins.storePath oldLauncher;
@@ -26,7 +27,7 @@ let
     ! grep -q "${previous}" "$out/bin/brook-steam"
   '';
 in
-pkgs.runCommand "brook-rtx-desktop-steam6" { passthru = { inherit launcher reaper; }; } ''
+pkgs.runCommand name { passthru = { inherit launcher reaper; }; } ''
   mkdir -p "$out"
   cp -a ${baseProfile}/. "$out/"
   chmod u+w "$out" "$out/bin"
