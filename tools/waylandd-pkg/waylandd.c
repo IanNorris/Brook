@@ -74,6 +74,9 @@
 #include "intel_pending_drain.h"
 #include "wm-window-state.h"
 #include "xwm-wire.h"
+/* /etc/xwayland-input-trace (or BROOK_WAYLAND_INPUT_TRACE=1): log every key
+ * delivery and have brook-xwm log where X routes presses. Off by default. */
+static int g_input_trace;
 
 #define BROOK_SYS_WM_CREATE_WINDOW   506
 #define BROOK_SYS_WM_DESTROY_WINDOW  507
@@ -229,7 +232,9 @@ static long wm_set_app_id(uint32_t id, const char* app_id) {
 static void wm_register_client(uint32_t id, struct wl_resource* surface) {
     struct wl_client* client=wl_resource_get_client(surface);
     int fd=wl_client_get_fd(client);
-    if (syscall(BROOK_SYS_WM_SET_CLIENT_SOCKET,(long)id,(long)fd)<0)
+    // EOPNOTSUPP: not an accepted endpoint (Xwayland's inherited socketpair).
+    // X11 windows are attributed through WM_SET_CONTENT_PROCESS instead.
+    if (syscall(BROOK_SYS_WM_SET_CLIENT_SOCKET,(long)id,(long)fd)<0 && errno!=EOPNOTSUPP)
         fprintf(stderr,"[waylandd] client-origin registration wm=%u failed: %s\n",id,strerror(errno));
 }
 static long wm_pop_input(uint32_t id, struct brook_wm_event* buf, long max) {
@@ -720,6 +725,7 @@ static int capture_excluded(const struct brook_surface *surface);
 static struct brook_image *intel_dmabuf_snapshot(const struct brook_dmabuf_buffer *db,int *uncertain);
 static struct brook_image *intel_dmabuf_defer(struct brook_buffer *buffer);
 static void intel_pending_poll(void);
+static int output_global_xwayland_only(const struct wl_global *global);
 #include "xwayland-shell.h"
 #include "xwayland-xwm.h"
 
@@ -2430,19 +2436,36 @@ static void seat_bind(struct wl_client *client, void *data,
         wl_seat_send_name(r, "brook-seat");
 }
 
-/* wl_output: single output. We track every bound output resource so that
- * we can send wl_surface.enter to associate surfaces with their output —
+/* wl_output. Native clients see one output: the primary (WM_GET_SCREEN_INFO),
+ * so they size to one monitor. Xwayland additionally gets one global per
+ * further enabled output (WM_GET_OUTPUTS), each at its desktop position:
+ * its X screen is the union of its wl_outputs, and with only the primary an
+ * X window on another head (Steam Friends at x=4025 beside a 3840-wide head
+ * 0) lay outside the X root, so X clamped the pointer to the root and the
+ * window never received clicks. We track every bound output resource so
+ * that we can send wl_surface.enter to associate surfaces with their output —
  * GDK/GTK refuse to compute a sane natural size for a toplevel that
  * isn't on any monitor, and end up clamping at 65535 px. */
+#include "brook-outputs.h"
 struct brook_output {
     struct wl_resource *resource;
     struct wl_listener  destroy;
+    unsigned index;      /* 0 primary; else g_xoutputs[index] (Xwayland only) */
     struct brook_output *next;
 };
 static struct brook_output *g_outputs = NULL;
 static uint32_t g_output_width = 1920, g_output_height = 1080;
 static uint32_t g_output_checked_ms;
 enum { OUTPUT_CHECK_INTERVAL_MS = 250 };
+struct brook_xoutput { struct wl_global *global; struct brook_output_desc desc; };
+static struct brook_xoutput g_xoutputs[BROOK_OUTPUTS_MAX];
+static uint64_t g_xoutputs_generation;
+static int g_xoutputs_known;
+static int output_global_xwayland_only(const struct wl_global *global) {
+    for (unsigned i = 1; i < BROOK_OUTPUTS_MAX; ++i)
+        if (global && g_xoutputs[i].global == global) return 1;
+    return 0;
+}
 
 static void output_resource_destroyed(struct wl_listener *l, void *data) {
     (void)data;
@@ -2460,6 +2483,7 @@ void waylandd_send_enter_for_surface(struct wl_resource *surface_resource) {
     if (!surface_resource) return;
     struct wl_client *sc = wl_resource_get_client(surface_resource);
     for (struct brook_output *o = g_outputs; o; o = o->next) {
+        if (o->index) continue; /* the primary only, as before */
         if (wl_resource_get_client(o->resource) == sc) {
             wl_surface_send_enter(surface_resource, o->resource);
             fprintf(stderr, "[waylandd] wl_surface.enter sent (output res=%p)\n",
@@ -2474,20 +2498,87 @@ static void output_release(struct wl_client *c, struct wl_resource *r) {
 static const struct wl_output_interface output_impl = {
     .release = output_release,
 };
-static void output_send_size(struct wl_resource *r) {
+static void output_send_size(struct wl_resource *r, unsigned index) {
     /* wl_output.mode uses device pixels for every client. Xwayland binds
      * at scale 1; its millimetre dimensions still reflect Brook's DPI. */
     const uint32_t mm_scale = wl_resource_get_client(r) == g_xwayland_client ? g_output_scale : 1;
-    const int32_t mm_width = (int32_t)(((uint64_t)g_output_width * 254 + 480) / 960 / mm_scale);
-    const int32_t mm_height = (int32_t)(((uint64_t)g_output_height * 254 + 480) / 960 / mm_scale);
-    wl_output_send_geometry(r, 0, 0, mm_width, mm_height,
-        WL_OUTPUT_SUBPIXEL_UNKNOWN, "Brook", "vfb-0", WL_OUTPUT_TRANSFORM_NORMAL);
+    const struct brook_output_desc *d = index ? &g_xoutputs[index].desc : NULL;
+    const uint32_t width = d ? d->width : g_output_width, height = d ? d->height : g_output_height;
+    const int32_t mm_width = (int32_t)(((uint64_t)width * 254 + 480) / 960 / mm_scale);
+    const int32_t mm_height = (int32_t)(((uint64_t)height * 254 + 480) / 960 / mm_scale);
+    char model[24];snprintf(model, sizeof(model), "vfb-%u", index);
+    wl_output_send_geometry(r, d ? d->x : 0, d ? d->y : 0, mm_width, mm_height,
+        WL_OUTPUT_SUBPIXEL_UNKNOWN, "Brook", model, WL_OUTPUT_TRANSFORM_NORMAL);
     wl_output_send_mode(r, WL_OUTPUT_MODE_CURRENT | WL_OUTPUT_MODE_PREFERRED,
-                        (int32_t)g_output_width, (int32_t)g_output_height, 60000);
+                        (int32_t)width, (int32_t)height, d && d->refresh_mhz ? (int32_t)d->refresh_mhz : 60000);
+}
+
+static void output_bind_index(struct wl_client *client, uint32_t version, uint32_t id, unsigned index);
+static void output_bind_extra(struct wl_client *client, void *data, uint32_t version, uint32_t id) {
+    output_bind_index(client, version, id, (unsigned)(uintptr_t)data);
+}
+/* Xwayland's extra outputs follow WM_GET_OUTPUTS: a head that appears later
+ * (head 1 after GSP-RM starts) gets a global; a changed one is resent; a
+ * vanished one is removed. Returns 1 when anything changed. */
+static int output_sync_extra(void) {
+    struct brook_outputs_header header = {0};
+    struct brook_output_desc descs[BROOK_OUTPUTS_MAX];
+    memset(descs, 0, sizeof(descs));
+    long n = syscall(BROOK_SYS_WM_GET_OUTPUTS, (long)&header, (long)descs, (long)BROOK_OUTPUTS_MAX);
+    if (n < 0) return 0;
+    /* Test only (single-head VMs): /etc/waylandd-test-output "WxH+X+Y" adds a
+     * virtual second output for Xwayland when the kernel reports one. */
+    static int test_read; static struct brook_output_desc test_desc;
+    if (!test_read) {
+        test_read = 1;
+        FILE *f = fopen("/etc/waylandd-test-output", "r");
+        if (f) {
+            unsigned w = 0, h = 0; int x = 0, y = 0;
+            if (fscanf(f, "%ux%u%d%d", &w, &h, &x, &y) == 4 && w && h && w <= 16384 && h <= 16384) {
+                test_desc = (struct brook_output_desc){1, x, y, w, h, 60000, 100,
+                    BROOK_OUTPUT_CONNECTED | BROOK_OUTPUT_ENABLED, "BROOK-TEST"};
+                fprintf(stderr, "[waylandd] test output %ux%u%+d%+d for Xwayland\n", w, h, x, y);
+            }
+            fclose(f);
+        }
+    }
+    if (test_desc.width && n == 1) { descs[1] = test_desc; n = 2; }
+    if (g_xoutputs_known && header.generation == g_xoutputs_generation) return 0;
+    g_xoutputs_known = 1; g_xoutputs_generation = header.generation;
+    int changed = 0;
+    for (unsigned i = 1; i < BROOK_OUTPUTS_MAX; ++i) {
+        struct brook_xoutput *x = &g_xoutputs[i];
+        const int live = (long)i < n && (descs[i].flags & BROOK_OUTPUT_ENABLED) &&
+            descs[i].width && descs[i].height && descs[i].width <= INT32_MAX && descs[i].height <= INT32_MAX;
+        if (!live) {
+            if (x->global) {
+                fprintf(stderr, "[waylandd] Xwayland output %u removed\n", i);
+                wl_global_destroy(x->global); x->global = NULL; changed = 1;
+                for (struct brook_output *o = g_outputs; o; o = o->next) if (o->index == i) o->index = 0;
+            }
+            continue;
+        }
+        descs[i].name[sizeof(descs[i].name) - 1] = 0;
+        if (x->global && !memcmp(&x->desc, &descs[i], sizeof(descs[i]))) continue;
+        x->desc = descs[i]; changed = 1;
+        fprintf(stderr, "[waylandd] Xwayland output %u %ux%u%+d%+d \"%s\"\n", i,
+                descs[i].width, descs[i].height, descs[i].x, descs[i].y, descs[i].name);
+        if (!x->global) {
+            x->global = wl_global_create(g_display, &wl_output_interface, 4, (void *)(uintptr_t)i, output_bind_extra);
+            continue;
+        }
+        for (struct brook_output *o = g_outputs; o; o = o->next) {
+            if (o->index != i) continue;
+            output_send_size(o->resource, i);
+            if (wl_resource_get_version(o->resource) >= 2) wl_output_send_done(o->resource);
+        }
+    }
+    return changed;
 }
 
 static void output_refresh(uint32_t now) {
     g_output_checked_ms = now;
+    (void)output_sync_extra();
     const uint32_t previous_scale=g_output_scale120;
     const uint32_t previous_legacy=g_output_scale;
     output_scale_sample(0);
@@ -2503,7 +2594,7 @@ static void output_refresh(uint32_t now) {
     if (!scale_changed && !size_changed) return;
     for (struct brook_output *o=g_outputs; o; o=o->next) {
         const bool xwayland=wl_resource_get_client(o->resource)==g_xwayland_client;
-        output_send_size(o->resource);
+        output_send_size(o->resource, o->index);
         if (wl_resource_get_version(o->resource)>=2) {
             if (previous_legacy!=g_output_scale)
                 wl_output_send_scale(o->resource,xwayland?1:g_output_scale);
@@ -2527,28 +2618,36 @@ static void output_refresh_due(uint32_t now) {
 static void output_bind(struct wl_client *client, void *data,
                         uint32_t version, uint32_t id) {
     (void)data;
+    output_bind_index(client, version, id, 0);
+}
+static void output_bind_index(struct wl_client *client, uint32_t version, uint32_t id, unsigned index) {
+    if (index >= BROOK_OUTPUTS_MAX) index = 0;
     struct brook_output *o = calloc(1, sizeof(*o));
     if (!o) { wl_client_post_no_memory(client); return; }
     struct wl_resource *r = wl_resource_create(client, &wl_output_interface,
                                                 (int)version, id);
     if (!r) { free(o); wl_client_post_no_memory(client); return; }
     wl_resource_set_implementation(r, &output_impl, NULL, NULL);
-    fprintf(stderr, "[waylandd] wl_output bind v=%u id=%u client=%p\n",
-            version, id, (void*)client);
+    fprintf(stderr, "[waylandd] wl_output bind v=%u id=%u client=%p output=%u\n",
+            version, id, (void*)client, index);
 
     /* Update older bindings first if this bind notices a new output size. */
-    output_refresh(g_now_ms());
+    if (!index) output_refresh(g_now_ms());
     o->resource = r;
+    o->index = index;
     o->destroy.notify = output_resource_destroyed;
     wl_resource_add_destroy_listener(r, &o->destroy);
     o->next = g_outputs;
     g_outputs = o;
 
-    output_send_size(r);
+    output_send_size(r, index);
     if (version >= 2) {
         wl_output_send_scale(r, client==g_xwayland_client?1:g_output_scale);
         if (version >= 4) {
-            wl_output_send_name(r, "BROOK-1");
+            char name[24];
+            if (index) snprintf(name, sizeof(name), "%s", g_xoutputs[index].desc.name[0] ? g_xoutputs[index].desc.name : "BROOK-2");
+            else snprintf(name, sizeof(name), "BROOK-1");
+            wl_output_send_name(r, name);
             wl_output_send_description(r, "Brook virtual display");
         }
         wl_output_send_done(r);
@@ -2817,6 +2916,10 @@ static void dispatch_surface_event(struct brook_surface *s,
         uint32_t xkb_code = scancode_to_xkb(e->scan);
         wl_keyboard_send_key(sc->keyboard, next_serial(), now,
                              xkb_code, st);
+        if (g_input_trace)
+            fprintf(stderr, "[waylandd] trace key %u %s wm=%u focus_wm=%u client=%p\n", xkb_code,
+                    st == WL_KEYBOARD_KEY_STATE_PRESSED ? "down" : "up", s->wm_id,
+                    sc->kb_focus ? sc->kb_focus->wm_id : 0, (void *)sc->client);
         latency_input_sent(sc->client, LATENCY_KEY);
 
         /* Send modifiers only when they changed — avoids double-toggle
@@ -5502,6 +5605,12 @@ int main(int argc, char **argv)
     g_frame_timer = wl_event_loop_add_timer(loop, frame_clock_tick, NULL);
     if (!g_frame_timer) return 1;
     wl_event_source_timer_update(g_frame_timer, 16);
+    {
+        const char *trace=getenv("BROOK_WAYLAND_INPUT_TRACE");
+        g_input_trace=(trace && !strcmp(trace,"1")) || access("/etc/xwayland-input-trace",F_OK)==0;
+        if (g_input_trace) fprintf(stderr,"[waylandd] input trace on\n");
+    }
+    (void)output_sync_extra(); /* Xwayland's outputs exist before it starts */
     if (xwayland_server) xwayland_restart_configure(xwayland_server,xwm_helper,xdisplay);
     if (xwayland_server && !xwayland_start(xwayland_server,xwm_helper,xdisplay)) {
         fprintf(stderr,"[waylandd] owned Xwayland launch failed; native Wayland remains available\n");
