@@ -1619,10 +1619,15 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
         stage="nv_quad_submit";
         statsSubmitStart=monotonic_ns();
         status=brook_vk_quad_pass_submit_backdrop(ctx->quad,scene,words,inputs,count,&output,ctx->plan,&blur,holes);
-        if(status==BROOK_VK_PENDING)status=brook_vk_quad_pass_wait(ctx->quad,1000000000ull);
+        if(status==BROOK_VK_PENDING){
+            stage="nv_quad_wait";
+            status=brook_vk_quad_pass_wait(ctx->quad,1000000000ull);
+        }
         if(status==BROOK_VK_PENDING || status==BROOK_VK_UNCERTAIN){
             // Do not release device objects through userspace while work is uncertain.
-            fprintf(stderr,"DESKTOP_NV_GLASS_FALLBACK Vulkan work uncertain result=%d\n",brook_vk_quad_pass_last_result(ctx->quad));
+            fprintf(stderr,"DESKTOP_NV_GLASS_FALLBACK stage=%s state=%s vk_result=%d elapsed_ms=%llu\n",
+                stage,status==BROOK_VK_PENDING?"pending":"uncertain",brook_vk_quad_pass_last_result(ctx->quad),
+                (unsigned long long)((monotonic_ns()-statsSubmitStart)/1000000ull));
             _exit(78);
         }
         if(status!=BROOK_VK_COMPLETE){
@@ -2678,8 +2683,8 @@ int main(int argc,char **argv){
         }
         else {
             const int failure=errno;uint64_t now=monotonic_ns();++retries;
-            if(++failures==1){failureStart=now;fprintf(stderr,"DESKTOP_RENDERER_RETRY errno=%d\n",failure);}
-            else if(failures%100==0)fprintf(stderr,"DESKTOP_RENDERER_RETRY errno=%d\n",failure);
+            if(++failures==1){failureStart=now;fprintf(stderr,"DESKTOP_RENDERER_RETRY errno=%d stage=%s\n",failure,g_failStage);}
+            else if(failures%100==0)fprintf(stderr,"DESKTOP_RENDERER_RETRY errno=%d stage=%s\n",failure,g_failStage);
             if(g_nvGlass && (failure==ENOTSUP || failure==ENODEV || failure==EIO ||
                (failureStart && now-failureStart>=5000000000ull))){
                 fprintf(stderr,"DESKTOP_NV_GLASS_FALLBACK stage=%s errno=%d\n",g_failStage,failure);

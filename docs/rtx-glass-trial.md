@@ -55,6 +55,32 @@ two Glass flags. Use the same monitor and boot arguments for both sets.
   and `on1` controls. Check that the desktop extent and renderer recover
   after each change. Restart into the control set and verify both heads.
 
+## Fence regression rerun
+
+For a matched comparison against `glass2`, use the same profile, Mesa ICD,
+branch base, and builder flags. Select the patched kernel and rebuild
+VKRENDER from this checkout. Confirm both artifact hashes in the new
+manifest before building the signed trial set. Keep the known-good MSI
+set available for rollback. Run idle first, then native Wayland vkcube,
+Chromium, and Xwayland, in that order. Save boot logs and per-head
+`glass_frames` and CE counters after each step.
+
+`DESKTOP_RENDERER_RETRY` now includes the stage. An `nv_present` retry
+comes from the handoff after the Vulkan fence has completed. Query,
+backdrop, and layer stages can also retry when their snapshot changes.
+`DESKTOP_NV_GLASS_FALLBACK` reports the submit or wait stage, Vulkan status,
+and elapsed time. A pending wait expires after one second and leaves
+the result off scanout. The old log printed the last successful Vulkan
+result for that case.
+
+Wayland's `producer fence timed out` means its imported buffer was still
+busy at the snapshot deadline. Wayland continues to withhold its release.
+The DRM poller now skips busy file locks, and blocking CPU_PREP waits on
+fence references outside the file lock. Synchronous VM_BIND reaps earlier
+EXECs on its own file while draining its bind queue. These changes remove
+completion stalls that could affect both the renderer and a separate
+client. Only a matched RTX run can establish which failure remains.
+
 ## Handoff
 
 The boot renderer captures the existing WM scene, rasterizes quads and blur

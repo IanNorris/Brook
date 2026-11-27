@@ -47,7 +47,7 @@ struct NvDrmFile { uint32_t references; KMutex lock; nvdrm::File core; };
 namespace {
 constexpr uint32_t kMaxFiles = 32;
 NvDrmFile* g_files[kMaxFiles];
-KMutex g_filesLock;
+KMutex g_filesLock{};
 bool g_pollerStarted = false;
 bool Busy(const nvdrm::File& f) {
     if (f.job_count) return true;
@@ -57,18 +57,34 @@ bool Busy(const nvdrm::File& f) {
 // 1 ms cadence while busy and for kHotMs after (a synchronous submit/wait loop goes idle between
 // frames; a 20 ms idle sleep then capped NVK at ~50 fps, offscreen vkcube 27 Nov), 20 ms when cold.
 constexpr uint64_t kHotMs = 500;
+// The last external unref can reach zero before removing the registry entry.
+bool TryRef(NvDrmFile* f) {
+    uint32_t refs = __atomic_load_n(&f->references, __ATOMIC_RELAXED);
+    while (refs && !__atomic_compare_exchange_n(&f->references, &refs, refs + 1,
+                                                true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+    return refs != 0;
+}
 void Poller(void*) {
     uint64_t last_busy = 0;
     for (;;) {
         NvDrmFile* list[kMaxFiles]; uint32_t n = 0;
         KMutexLock(&g_filesLock);
-        for (auto* f : g_files) if (f) { NvDrmFileRef(f); list[n++] = f; }
+        for (auto* f : g_files) if (f && TryRef(f)) list[n++] = f;
         KMutexUnlock(&g_filesLock);
         bool busy = false;
         for (uint32_t i = 0; i < n; ++i) {
-            KMutexLock(&list[i]->lock);
-            if (list[i]->core.be) { nvdrm::Pump(list[i]->core); nvdrm::PumpExec(list[i]->core); busy |= Busy(list[i]->core); }
-            KMutexUnlock(&list[i]->lock);
+            // One ioctl may be waiting for work on another file. Keep visiting
+            // the other files even when this file is locked.
+            if (KMutexTryLock(&list[i]->lock)) {
+                if (list[i]->core.be) {
+                    nvdrm::Pump(list[i]->core);
+                    nvdrm::PumpExec(list[i]->core);
+                    busy |= Busy(list[i]->core);
+                }
+                KMutexUnlock(&list[i]->lock);
+            } else {
+                busy = true;
+            }
             NvDrmFileUnref(list[i]);
         }
         const uint64_t now = ApicTickCount();
@@ -76,13 +92,23 @@ void Poller(void*) {
         SchedulerSleepMs(busy || now - last_busy < kHotMs ? 1 : 20);
     }
 }
-void Register(NvDrmFile* f, bool add) {
+bool Register(NvDrmFile* f, bool add) {
     KMutexLock(&g_filesLock);
-    for (auto*& slot : g_files) if (add ? !slot : slot == f) { slot = add ? f : nullptr; break; }
-    const bool start = add && !g_pollerStarted;
-    g_pollerStarted = true;
+    bool found = false;
+    for (auto*& slot : g_files) {
+        if (add ? slot != nullptr : slot != f) continue;
+        if (add && !g_pollerStarted) {
+            Process* t = KernelThreadCreate("nv_drm_poll", Poller, nullptr);
+            if (!t) break;
+            g_pollerStarted = true;
+            SchedulerAddProcess(t);
+        }
+        slot = add ? f : nullptr;
+        found = true;
+        break;
+    }
     KMutexUnlock(&g_filesLock);
-    if (start) { Process* t = KernelThreadCreate("nv_drm_poll", Poller, nullptr, 1); if (t) SchedulerAddProcess(t); }
+    return found;
 }
 }  // namespace
 
@@ -136,8 +162,11 @@ NvDrmFile* NvDrmFileCreate() {
     memset(f, 0, sizeof(*f));
     f->references = 1; KMutexInit(&f->lock);
     f->core.Init(&g_dev, g_be);
-    static bool once = false; if (!once) { once = true; KMutexInit(&g_filesLock); }
-    Register(f, true);
+    if (!Register(f, true)) {
+        f->core.Close();
+        kfree(f);
+        return nullptr;
+    }
     return f;
 }
 void NvDrmFileRef(NvDrmFile* f) { if (f) __atomic_fetch_add(&f->references, 1, __ATOMIC_RELAXED); }
@@ -181,7 +210,7 @@ int64_t NvDrmIoctl(NvDrmFile* f, uint64_t cmd, uint64_t arg) {
         [](void*) { return ClockNowNs(1); },
         [](void*) { Process* self = ProcessCurrent(); if (!self || HasPendingSignals()) return false;
                     self->wakeupTick = ApicTickCount() + 1; SchedulerBlockInterruptible(self); return !HasPendingSignals(); }};
-    // Syncobj waits sleep; everything else is short. One lock per file keeps the tables consistent.
+    // Sleeping fence waits must release the file lock so completions can advance.
     const uint32_t nr = nvdrm::IocNr(cmd);
     int64_t r;
     if (nr == nvdrm::NR_SYNCOBJ_WAIT || nr == nvdrm::NR_SYNCOBJ_TIMELINE_WAIT) {
@@ -191,6 +220,20 @@ int64_t NvDrmIoctl(NvDrmFile* f, uint64_t cmd, uint64_t arg) {
         if (f->core.be) { if (f->core.job_count) nvdrm::Pump(f->core); nvdrm::PumpExec(f->core); }
         KMutexUnlock(&f->lock);
         r = nvdrm::Ioctl(f->core, u, cmd, arg, false);
+    }
+    else if (nvdrm::IocType(cmd) == 'd' && nr == nvdrm::kDrmCommandBase + nvdrm::NV_GEM_CPU_PREP) {
+        nvdrm::CpuPrep prep{};
+        if (nvdrm::IocSize(cmd) != sizeof(prep)) return nvdrm::kEINVAL;
+        if (!u.read(u.ctx, &prep, arg, sizeof(prep))) return nvdrm::kEFAULT;
+        nvdrm::CpuPrepFences fences;
+        KMutexLock(&f->lock);
+        if (f->core.be) {
+            nvdrm::Pump(f->core);
+            nvdrm::PumpExec(f->core);
+        }
+        r = nvdrm::SnapshotCpuPrep(f->core, prep, fences);
+        KMutexUnlock(&f->lock);
+        if (!r) r = nvdrm::WaitCpuPrep(u, prep, fences);
     }
     else { KMutexLock(&f->lock); r = nvdrm::Ioctl(f->core, u, cmd, arg); KMutexUnlock(&f->lock); }
     // M5 bring-up: failing ioctls (except expected waits/busy) go to the kernel log, rate-limited.

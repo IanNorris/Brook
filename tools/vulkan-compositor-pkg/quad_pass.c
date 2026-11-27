@@ -1084,9 +1084,10 @@ reject:
 }
 
 static BrookVkResult retire(BrookVkQuadPass *p,VkResult status){
+    p->lastResult=status;
     if(status==VK_NOT_READY || status==VK_TIMEOUT)return BROOK_VK_PENDING;
     p->pending=0;
-    if(status!=VK_SUCCESS){p->lastResult=status;p->uncertain=1;return BROOK_VK_UNCERTAIN;}
+    if(status!=VK_SUCCESS){p->uncertain=1;return BROOK_VK_UNCERTAIN;}
     if(p->timestamps){
         uint64_t ticks[2]={0};
         if(vkGetQueryPoolResults(p->device,p->timestamps,0,2,sizeof(ticks),ticks,sizeof(uint64_t),VK_QUERY_RESULT_64_BIT)==VK_SUCCESS){
