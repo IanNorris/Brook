@@ -182,7 +182,8 @@ int main(void) {
         }
         i+=size/4;
     }
-    assert(entered==1 && motion==1 && raw==1);
+    // The relative frame repeats the unchanged absolute position (Xwayland).
+    assert(entered==1 && motion==2 && raw==1);
     /* A cursor set over the window is owned by its root window, so the kernel
      * can show its own arrow once the pointer leaves that client area (the
      * client's resize cursor must not stick over the desktop). */

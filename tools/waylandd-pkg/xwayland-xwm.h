@@ -400,8 +400,14 @@ static int xwayland_control_ready(int fd,uint32_t mask,void *data) {
 static void xwayland_window_event(struct brook_surface *s,unsigned type) {
     if (!xwayland_surface_ready(s)) return;
     if (type==WM_EVT_CLOSE_REQUESTED) xwayland_send(s->xwindow,BXWM_CLOSE,NULL);
-    if (type==WM_EVT_FOCUS_GAINED) xwayland_send(s->xwindow,BXWM_FOCUS,NULL);
+    // Focus goes through focus_reconcile() after the whole pump, which sees
+    // the WM's current focus rather than the order windows were read in.
     if (type==WM_EVT_RESIZED) xwayland_native_sync(s,0);
+}
+/* The natively focused window changed (focus_reconcile): give its X window
+ * X input focus and the top of the X stack. */
+static void xwayland_focus_reconciled(struct brook_surface *s) {
+    if (s->role==4 && xwayland_surface_ready(s)) xwayland_send(s->xwindow,BXWM_FOCUS,NULL);
 }
 static void xwayland_reap(pid_t *pid) {
     if (*pid<=0) return;

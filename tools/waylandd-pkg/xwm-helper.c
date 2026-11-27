@@ -4,6 +4,7 @@
 #define _GNU_SOURCE
 #include <xcb/xcb.h>
 #include <xcb/composite.h>
+#include <xcb/xcb_cursor.h>
 #include <poll.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -496,6 +497,24 @@ static int publish_scale_hints(struct xwm *wm) {
     xcb_send_event(wm->xcb,0,wm->root,XCB_EVENT_MASK_STRUCTURE_NOTIFY,(const char *)&announce);
     return 1;
 }
+/* X windows without a cursor of their own inherit the root's, and the X
+ * server's default root cursor is the core "X" glyph: rootless Xwayland
+ * then shows it over most X11 windows. Give the root the desktop theme's
+ * arrow, as other Xwayland window managers do. libxcb-cursor reads
+ * Xcursor.theme/size from RESOURCE_MANAGER (written above for HiDPI) or
+ * XCURSOR_THEME/XCURSOR_SIZE, and XCURSOR_PATH; without a theme it falls
+ * back to the core cursor font's arrow, still not the "X". */
+static void set_root_cursor(struct xwm *wm,xcb_screen_t *screen) {
+    if (!getenv("XCURSOR_PATH")) setenv("XCURSOR_PATH","/nix/profile/share/icons",0);
+    xcb_cursor_context_t *context=NULL;
+    if (xcb_cursor_context_new(wm->xcb,screen,&context)<0 || !context) return;
+    xcb_cursor_t cursor=xcb_cursor_load_cursor(context,"left_ptr");
+    if (cursor!=XCB_CURSOR_NONE) {
+        xcb_change_window_attributes(wm->xcb,wm->root,XCB_CW_CURSOR,&cursor);
+        xcb_free_cursor(wm->xcb,cursor);
+    }
+    xcb_cursor_context_free(context);
+}
 static int initialize(struct xwm *wm,int wm_fd) {
     wm->xcb=xcb_connect_to_fd(wm_fd,NULL);
     if (!wm->xcb || xcb_connection_has_error(wm->xcb)) return 0;
@@ -539,6 +558,7 @@ static int initialize(struct xwm *wm,int wm_fd) {
     xcb_change_property(wm->xcb,XCB_PROP_MODE_REPLACE,wm->root,wm->supported,XCB_ATOM_ATOM,32,
         sizeof(supported)/sizeof(supported[0])-(wm->protocol>=2?0:1),supported);
     if (wm->scale>1 && !publish_scale_hints(wm)) return 0;
+    set_root_cursor(wm,screens.data);
     xcb_flush(wm->xcb);
     struct bxwm_message ready={.version=BXWM_VERSION,.type=BXWM_READY,.generation=wm->generation,
         .window=wm->root,.width=screens.data->width_in_pixels,.height=screens.data->height_in_pixels};

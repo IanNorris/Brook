@@ -168,7 +168,15 @@ int main(int argc,char **argv) {
     assert(xwayland_accept_message(&menu));image(popup,2,2);
     assert(popup->wm_id!=id && created==3 && (native[popup->wm_id].flags&BROOK_WINDOW_STATE_CLIENT_CHROME));
     command_from_peer(peer,&rx,BXWM_CONFIGURE);
-    xwayland_window_event(s,WM_EVT_FOCUS_GAINED);command_from_peer(peer,&rx,BXWM_FOCUS);
+    // Focus follows the WM's current focus, not queue read order: windows are
+    // pumped one after another, so s's newer GAINED can be read before the
+    // popup's older GAINED/LOST. The XWM must focus s, once.
+    struct brook_wm_event focus_event={0};
+    focus_event.type=WM_EVT_FOCUS_GAINED;dispatch_window_event(s,&focus_event,0);
+    focus_event.type=WM_EVT_FOCUS_GAINED;dispatch_window_event(popup,&focus_event,0);
+    focus_event.type=WM_EVT_FOCUS_LOST;dispatch_window_event(popup,&focus_event,0);
+    focus_reconcile();assert(command_from_peer(peer,&rx,BXWM_FOCUS).window==123);
+    focus_reconcile();no_command(peer,&rx);
     xwayland_window_event(s,WM_EVT_CLOSE_REQUESTED);command_from_peer(peer,&rx,BXWM_CLOSE);
     struct bxwm_message dead=state;dead.type=BXWM_DESTROY;dead.identity=999;
     assert(xwayland_accept_message(&dead) && s->wm_id==id);
