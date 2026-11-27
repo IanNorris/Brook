@@ -7,9 +7,25 @@
 #include <thread>
 #include <chrono>
 #include <initializer_list>
+#include <vector>
 #include "../../kernel/src/net.cpp"
 #include "../../kernel/src/arp_probe_tracker.h"
 namespace brook { int SocketLifetimeTestTransmit(uint32_t,uint32_t,uint8_t,const void*,uint32_t); }
+namespace brook {
+// Fixture segments are built without checksums; HandleTcp verifies them, so
+// fill one in as a real peer would before delivering the segment.
+static void HandleTcpChecked(const Ipv4Header* ip, const void* payload, uint32_t len,
+                             uint64_t scope = 0, bool local = false)
+{
+    std::vector<uint8_t> copy(static_cast<const uint8_t*>(payload), static_cast<const uint8_t*>(payload) + len);
+    if (len >= sizeof(TcpHeader)) {
+        auto* tcp = reinterpret_cast<TcpHeader*>(copy.data());
+        tcp->checksum = 0;
+        tcp->checksum = TcpChecksum(ip->srcIp, ip->dstIp, copy.data(), len);
+    }
+    HandleTcp(ip, copy.data(), len, scope, local);
+}
+}
 
 namespace {
 std::atomic<unsigned> allocations{0}, frees{0}, wakes{0};
@@ -165,7 +181,7 @@ void SchedulerBlock(Process* p) {
         if(idx>=0){auto& socket=g_sockets[idx];Ipv4Header ip{};ip.srcIp=socket.remoteIp;ip.dstIp=socket.localIp;
             TcpHeader ack{};ack.srcPort=socket.remotePort;ack.dstPort=socket.localPort;
             ack.seqNum=htonl(socket.tcpRcvNxt);ack.ackNum=htonl(socket.tcpSndUna);
-            ack.flags=TCP_ACK;ack.dataOff=5<<4;ack.window=htons(65535);HandleTcp(&ip,&ack,sizeof(ack));}
+            ack.flags=TCP_ACK;ack.dataOff=5<<4;ack.window=htons(65535);HandleTcpChecked(&ip,&ack,sizeof(ack));}
     }
     if (ticks.load() >= deadlineAckTick.load()) {
         int idx=deadlineAckSocket.exchange(-1);
@@ -174,9 +190,9 @@ void SchedulerBlock(Process* p) {
             TcpHeader ack{};ack.srcPort=socket.remotePort;ack.dstPort=socket.localPort;
             ack.seqNum=htonl(socket.tcpRcvNxt);const uint32_t value=deadlineAckValue.exchange(0);
             ack.ackNum=htonl(value?value:socket.tcpSndNxt);
-            ack.flags=TCP_ACK;ack.dataOff=5<<4;ack.window=htons(65535);HandleTcp(&ip,&ack,sizeof(ack));
+            ack.flags=TCP_ACK;ack.dataOff=5<<4;ack.window=htons(65535);HandleTcpChecked(&ip,&ack,sizeof(ack));
             const uint32_t second=deadlineSecondAckValue.exchange(0);
-            if(second){ticks=ticks.load()+3;ack.ackNum=htonl(second);HandleTcp(&ip,&ack,sizeof(ack));}
+            if(second){ticks=ticks.load()+3;ack.ackNum=htonl(second);HandleTcpChecked(&ip,&ack,sizeof(ack));}
         }
     }
     std::this_thread::yield();
@@ -218,7 +234,7 @@ int SocketLifetimeTestTransmit(uint32_t src, uint32_t dst, uint8_t proto,
             Ipv4Header ip{};ip.srcIp=dst;ip.dstIp=src;
             TcpHeader rst{};rst.srcPort=tcp->dstPort;rst.dstPort=tcp->srcPort;
             rst.seqNum=tcp->ackNum;rst.flags=TCP_RST;rst.dataOff=5<<4;
-            HandleTcp(&ip,&rst,sizeof(rst));return 0;
+            HandleTcpChecked(&ip,&rst,sizeof(rst));return 0;
         }
         if(index && ntohl(tcp->seqNum)==10)firstDataRetryTick=ticks.load();
         if(index && observeFlightControlSocket.load()>=0){
@@ -239,7 +255,7 @@ int SocketLifetimeTestTransmit(uint32_t src, uint32_t dst, uint8_t proto,
                 TcpHeader ack{};ack.srcPort=tcp->dstPort;ack.dstPort=tcp->srcPort;ack.seqNum=tcp->ackNum;
                 const uint32_t override=failureAckOverride.exchange(0);
                 ack.ackNum=htonl(override?override:ntohl(tcp->seqNum)+(shrink?0:len-sizeof(TcpHeader)));
-                ack.flags=TCP_ACK;ack.dataOff=5<<4;ack.window=htons(shrink?0:65535);HandleTcp(&ip,&ack,sizeof(ack));
+                ack.flags=TCP_ACK;ack.dataOff=5<<4;ack.window=htons(shrink?0:65535);HandleTcpChecked(&ip,&ack,sizeof(ack));
             }
             return -11;
         }
@@ -250,7 +266,7 @@ int SocketLifetimeTestTransmit(uint32_t src, uint32_t dst, uint8_t proto,
                 TcpHeader ack{};ack.srcPort=tcp->dstPort;ack.dstPort=tcp->srcPort;ack.seqNum=tcp->ackNum;
                 if(n!=2)ack.ackNum=htonl(ntohl(tcp->seqNum)+10);
                 else {flightRetrySeq=ntohl(tcp->seqNum);flightRetryLen=len-sizeof(TcpHeader);ack.ackNum=htonl(1082);}
-                ack.flags=TCP_ACK;ack.dataOff=5<<4;ack.window=htons(65535);HandleTcp(&ip,&ack,sizeof(ack));}
+                ack.flags=TCP_ACK;ack.dataOff=5<<4;ack.window=htons(65535);HandleTcpChecked(&ip,&ack,sizeof(ack));}
             return 0;
         }
         if(fourLossMode.load()){
@@ -258,7 +274,7 @@ int SocketLifetimeTestTransmit(uint32_t src, uint32_t dst, uint8_t proto,
             if(n!=1){Ipv4Header ip{};ip.srcIp=dst;ip.dstIp=src;
                 TcpHeader ack{};ack.srcPort=tcp->dstPort;ack.dstPort=tcp->srcPort;ack.seqNum=tcp->ackNum;
                 ack.ackNum=htonl(n==4?2154:546);ack.flags=TCP_ACK;ack.dataOff=5<<4;ack.window=htons(65535);
-                HandleTcp(&ip,&ack,sizeof(ack));}
+                HandleTcpChecked(&ip,&ack,sizeof(ack));}
             return 0;
         }
         if(signalOnDataSend.exchange(false))__atomic_store_n(&currentProcess->sigPending,1,__ATOMIC_RELEASE);
@@ -284,7 +300,7 @@ int SocketLifetimeTestTransmit(uint32_t src, uint32_t dst, uint8_t proto,
         TcpHeader ack{}; ack.srcPort = tcp->dstPort; ack.dstPort = tcp->srcPort;
         ack.seqNum = tcp->ackNum; ack.ackNum = htonl(ntohl(tcp->seqNum) + 1);
         ack.dataOff = 5 << 4; ack.flags = TCP_ACK; ack.window = htons(65535);
-        HandleTcp(&ip, &ack, sizeof(ack));
+        HandleTcpChecked(&ip, &ack, sizeof(ack));
     }
     if ((tcp->flags & TCP_PSH) && len>sizeof(TcpHeader) && skipDataAcks.load()) {
         --skipDataAcks;
@@ -295,7 +311,7 @@ int SocketLifetimeTestTransmit(uint32_t src, uint32_t dst, uint8_t proto,
         const uint32_t ackBytes=partialFirstQueueAck ? 10 : len-sizeof(TcpHeader);
         partialFirstQueueAck=false;
         ack.seqNum=tcp->ackNum;ack.ackNum=htonl(ntohl(tcp->seqNum)+ackBytes);
-        ack.flags=TCP_ACK;ack.dataOff=5<<4;ack.window=htons(dataAckWindow.load());HandleTcp(&ip,&ack,sizeof(ack));
+        ack.flags=TCP_ACK;ack.dataOff=5<<4;ack.window=htons(dataAckWindow.load());HandleTcpChecked(&ip,&ack,sizeof(ack));
     }
     assert(len >= sizeof(TcpHeader));
     return 0;
@@ -369,13 +385,13 @@ static void deliver(int i, bool fin = false) {
     packet.tcp.flags = TCP_ACK | (fin ? TCP_FIN : 0);
     packet.tcp.dataOff = 5 << 4; packet.tcp.window = htons(65535);
     packet.byte = 42;
-    HandleTcp(&ip, &packet, sizeof(TcpHeader) + 1);
+    HandleTcpChecked(&ip, &packet, sizeof(TcpHeader) + 1);
 }
 static void deliverControl(int i,uint32_t seq,uint32_t ack,uint8_t flags,uint16_t window) {
     const auto& s=g_sockets[i];Ipv4Header ip{};ip.srcIp=s.remoteIp;ip.dstIp=s.localIp;
     TcpHeader tcp{};tcp.srcPort=s.remotePort;tcp.dstPort=s.localPort;
     tcp.seqNum=htonl(seq);tcp.ackNum=htonl(ack);tcp.flags=flags;tcp.window=htons(window);tcp.dataOff=5<<4;
-    HandleTcp(&ip,&tcp,sizeof(tcp));
+    HandleTcpChecked(&ip,&tcp,sizeof(tcp));
 }
 int main() {
     for(unsigned n=0;n<MAX_SOCKETS;++n)KMutexInit(&g_tcpSendGates[n]);
@@ -1216,7 +1232,7 @@ int main() {
     TcpHeader syn{}; syn.srcPort = htons(200); syn.dstPort = htons(100);
     syn.seqNum = htonl(10); syn.dataOff = 5 << 4; syn.flags = TCP_SYN;
     pauseAllocation = true; allocating = false; releaseAllocation = false;
-    std::thread incoming([&] { HandleTcp(&ip, &syn, sizeof(syn)); });
+    std::thread incoming([&] { HandleTcpChecked(&ip, &syn, sizeof(syn)); });
     await([] { return allocating.load(); });
     closed = false;
     std::thread listenerClose([&] { SockClose(i); closed = true; });
@@ -1255,7 +1271,7 @@ int main() {
     Ipv4Header probeIp{};probeIp.srcIp=2;probeIp.dstIp=1;
     TcpHeader probeAck{};probeAck.srcPort=htons(200);probeAck.dstPort=htons(100);
     probeAck.seqNum=htonl(20);probeAck.ackNum=htonl(11);probeAck.flags=TCP_ACK;
-    probeAck.dataOff=5<<4;probeAck.window=htons(65535);HandleTcp(&probeIp,&probeAck,sizeof(probeAck));
+    probeAck.dataOff=5<<4;probeAck.window=htons(65535);HandleTcpChecked(&probeIp,&probeAck,sizeof(probeAck));
     assert(g_tcpSendProbeStats.ackWhileWorkerDisplaced==ackBefore+1);
     assert(workerProbe->pendingWakeup==0 && appProbe->pendingWakeup==1);
     assert(workerProbe->refCount==1 && appProbe->refCount==1);
@@ -1268,7 +1284,7 @@ int main() {
     appProbe=new Process{};appProbe->refCount=1;
     SpinLockAcquire(&g_sockets[i].lock);SetTcpWorkerWaiterLocked(i,workerProbe);SpinLockRelease(&g_sockets[i].lock);
     SockSetPollWaiter(i,appProbe);assert(workerProbe->refCount==2 && appProbe->refCount==2);
-    HandleTcp(&probeIp,&probeAck,sizeof(probeAck));
+    HandleTcpChecked(&probeIp,&probeAck,sizeof(probeAck));
     assert(workerProbe->pendingWakeup==1 && appProbe->pendingWakeup==1);
     assert(workerProbe->refCount==1 && appProbe->refCount==1 && !g_tcpWorkerWaiter[i]);
     // A timeout or interruption removes only the registration owned by it.
@@ -1879,7 +1895,7 @@ int main() {
         packet.tcp.srcPort=htons(200);packet.tcp.dstPort=htons(100);packet.tcp.seqNum=htonl(70);
         packet.tcp.ackNum=htonl(11);packet.tcp.flags=TCP_SYN|TCP_ACK;packet.tcp.window=htons(1234);packet.tcp.dataOff=6<<4;
         packet.option[0]=1;packet.option[1]=3;packet.option[2]=3;packet.option[3]=3;
-        HandleTcp(&packetIp,&packet,sizeof(packet));
+        HandleTcpChecked(&packetIp,&packet,sizeof(packet));
     }
     assert(g_sockets[i].tcpState==TcpState::Established && g_sockets[i].tcpSndWnd==1234 && g_sockets[i].tcpSndWndScale==3);
     deliverControl(i,71,11,TCP_ACK,30);assert(g_sockets[i].tcpSndWnd==240);
@@ -1889,7 +1905,7 @@ int main() {
     i=create();listenPort(i, 100, 4);
     {Ipv4Header packetIp{};packetIp.srcIp=2;packetIp.dstIp=1;TcpHeader packet{};
      packet.srcPort=htons(200);packet.dstPort=htons(100);packet.seqNum=htonl(70);
-     packet.flags=TCP_SYN;packet.window=htons(1234);packet.dataOff=5<<4;HandleTcp(&packetIp,&packet,sizeof(packet));}
+     packet.flags=TCP_SYN;packet.window=htons(1234);packet.dataOff=5<<4;HandleTcpChecked(&packetIp,&packet,sizeof(packet));}
     assert(g_sockets[i].acceptQueueCount==1);int child=g_sockets[i].acceptQueue[0];
     assert(g_sockets[child].tcpSndWnd==1234 && !g_sockets[child].tcpSndWlValid);
     deliverControl(child,71,g_sockets[child].tcpSndNxt,TCP_ACK,500);
@@ -1903,7 +1919,7 @@ int main() {
     {Ipv4Header packetIp{};packetIp.srcIp=2;packetIp.dstIp=1;
      struct {TcpHeader tcp;uint8_t byte;} packet{};packet.tcp.srcPort=htons(200);packet.tcp.dstPort=htons(100);
      packet.tcp.seqNum=htonl(20);packet.tcp.ackNum=htonl(10);packet.tcp.flags=TCP_ACK;
-     packet.tcp.window=htons(300);packet.tcp.dataOff=5<<4;HandleTcp(&packetIp,&packet,sizeof(TcpHeader)+1);}
+     packet.tcp.window=htons(300);packet.tcp.dataOff=5<<4;HandleTcpChecked(&packetIp,&packet,sizeof(TcpHeader)+1);}
     assert(g_sockets[i].tcpSndWnd==200);
     assert(__atomic_load_n(&g_tcpReceiveDiagnostics.clippedSegments,__ATOMIC_RELAXED)==clippedBefore+1);SockClose(i);
     // An overlapping segment is trimmed by receive processing; the window
@@ -1912,7 +1928,7 @@ int main() {
     {Ipv4Header packetIp{};packetIp.srcIp=2;packetIp.dstIp=1;
      struct {TcpHeader tcp;uint8_t bytes[2];} packet{};packet.tcp.srcPort=htons(200);packet.tcp.dstPort=htons(100);
      packet.tcp.seqNum=htonl(19);packet.tcp.ackNum=htonl(10);packet.tcp.flags=TCP_ACK;
-     packet.tcp.window=htons(400);packet.tcp.dataOff=5<<4;HandleTcp(&packetIp,&packet,sizeof(TcpHeader)+2);}
+     packet.tcp.window=htons(400);packet.tcp.dataOff=5<<4;HandleTcpChecked(&packetIp,&packet,sizeof(TcpHeader)+2);}
     assert(g_sockets[i].tcpSndWnd==400 && g_sockets[i].tcpSndWl1==19 && g_sockets[i].tcpRcvNxt==21);
     SockClose(i);
     // Diagnostic counters reflect the actual OOO admission and overlap paths.
@@ -1924,7 +1940,7 @@ int main() {
      struct {TcpHeader tcp;uint8_t byte;} packet{};packet.tcp.srcPort=htons(200);packet.tcp.dstPort=htons(100);
      packet.tcp.seqNum=htonl(21);packet.tcp.ackNum=htonl(10);packet.tcp.flags=TCP_ACK;
      packet.tcp.window=htons(400);packet.tcp.dataOff=5<<4;
-     HandleTcp(&packetIp,&packet,sizeof(TcpHeader)+1);HandleTcp(&packetIp,&packet,sizeof(TcpHeader)+1);}
+     HandleTcpChecked(&packetIp,&packet,sizeof(TcpHeader)+1);HandleTcpChecked(&packetIp,&packet,sizeof(TcpHeader)+1);}
     assert(__atomic_load_n(&g_tcpReceiveDiagnostics.oooArrivals,__ATOMIC_RELAXED)==arrivals+2);
     assert(__atomic_load_n(&g_tcpReceiveDiagnostics.oooStored,__ATOMIC_RELAXED)==held+1);
     assert(__atomic_load_n(&g_tcpReceiveDiagnostics.oooOverlap,__ATOMIC_RELAXED)==overlaps+1);
@@ -1960,12 +1976,12 @@ int main() {
             const uint32_t start=end>sizeof(packet.bytes)+1 ? end-sizeof(packet.bytes) : 1;
             packet.tcp.seqNum=htonl(sequence+start);
             for(uint32_t n=start;n<end;++n)packet.bytes[n-start]=static_cast<uint8_t>(n);
-            HandleTcp(&ip,&packet,sizeof(TcpHeader)+end-start);
+            HandleTcpChecked(&ip,&packet,sizeof(TcpHeader)+end-start);
             end=start;
         }
         assert(socket.tcpOooBytes==Socket::RX_DEFAULT-1 && socket.rxCount==0);
         packet.tcp.seqNum=htonl(sequence);packet.bytes[0]=0;
-        HandleTcp(&ip,&packet,sizeof(TcpHeader)+1);
+        HandleTcpChecked(&ip,&packet,sizeof(TcpHeader)+1);
         assert(socket.tcpOooBytes==0 && socket.tcpRcvNxt==sequence+Socket::RX_DEFAULT);
         uint8_t data[4096];
         for(uint32_t base=0;base<Socket::RX_DEFAULT;base+=sizeof(data)){
@@ -1997,8 +2013,8 @@ int main() {
     {Ipv4Header ip{};ip.srcIp=2;ip.dstIp=1;
      struct {TcpHeader tcp;uint8_t bytes[4];} packet{};packet.tcp.srcPort=htons(200);packet.tcp.dstPort=htons(100);
      packet.tcp.ackNum=htonl(10);packet.tcp.flags=TCP_ACK;packet.tcp.window=htons(400);packet.tcp.dataOff=5<<4;
-     packet.tcp.seqNum=htonl(22);packet.bytes[0]=2;HandleTcp(&ip,&packet,sizeof(TcpHeader)+1);
-     packet.tcp.seqNum=htonl(20);for(unsigned n=0;n<4;++n)packet.bytes[n]=n;HandleTcp(&ip,&packet,sizeof(TcpHeader)+4);}
+     packet.tcp.seqNum=htonl(22);packet.bytes[0]=2;HandleTcpChecked(&ip,&packet,sizeof(TcpHeader)+1);
+     packet.tcp.seqNum=htonl(20);for(unsigned n=0;n<4;++n)packet.bytes[n]=n;HandleTcpChecked(&ip,&packet,sizeof(TcpHeader)+4);}
     {uint8_t data[4]{};assert(SockRecv(i,data,sizeof(data),true)==4);for(unsigned n=0;n<4;++n)assert(data[n]==n);}
     assert(g_sockets[i].tcpOooBytes==0);
     SockClose(i);
@@ -2007,18 +2023,34 @@ int main() {
     {Ipv4Header ip{};ip.srcIp=2;ip.dstIp=1;
      struct {TcpHeader tcp;uint8_t bytes[3];} packet{};packet.tcp.srcPort=htons(200);packet.tcp.dstPort=htons(100);
      packet.tcp.ackNum=htonl(10);packet.tcp.flags=TCP_ACK;packet.tcp.window=htons(400);packet.tcp.dataOff=5<<4;
-     packet.tcp.seqNum=htonl(22);for(unsigned n=0;n<3;++n)packet.bytes[n]=n+2;HandleTcp(&ip,&packet,sizeof(TcpHeader)+3);
-     packet.tcp.seqNum=htonl(20);for(unsigned n=0;n<3;++n)packet.bytes[n]=n;HandleTcp(&ip,&packet,sizeof(TcpHeader)+3);}
+     packet.tcp.seqNum=htonl(22);for(unsigned n=0;n<3;++n)packet.bytes[n]=n+2;HandleTcpChecked(&ip,&packet,sizeof(TcpHeader)+3);
+     packet.tcp.seqNum=htonl(20);for(unsigned n=0;n<3;++n)packet.bytes[n]=n;HandleTcpChecked(&ip,&packet,sizeof(TcpHeader)+3);}
     {uint8_t data[5]{};assert(SockRecv(i,data,sizeof(data),true)==5);for(unsigned n=0;n<5;++n)assert(data[n]==n);}
     assert(g_sockets[i].tcpOooBytes==0);SockClose(i);
+    // A segment corrupted after its checksum was computed is dropped before
+    // any state change; the intact retransmission is then accepted.
+    i=create();setupTcp(i);
+    {Ipv4Header ip{};ip.srcIp=2;ip.dstIp=1;
+     struct {TcpHeader tcp;uint8_t bytes[4];} packet{};packet.tcp.srcPort=htons(200);packet.tcp.dstPort=htons(100);
+     packet.tcp.ackNum=htonl(10);packet.tcp.flags=TCP_ACK;packet.tcp.window=htons(400);packet.tcp.dataOff=5<<4;
+     packet.tcp.seqNum=htonl(20);for(unsigned n=0;n<4;++n)packet.bytes[n]=uint8_t(n+1);
+     packet.tcp.checksum=TcpChecksum(ip.srcIp,ip.dstIp,&packet,sizeof(packet));
+     const uint64_t bad=g_tcpReceiveDiagnostics.checksumBad;const uint32_t packets=g_sockets[i].rxPktCount;
+     packet.bytes[2]^=0x10;HandleTcp(&ip,&packet,sizeof(packet));
+     assert(g_tcpReceiveDiagnostics.checksumBad==bad+1);
+     assert(g_sockets[i].rxCount==0 && g_sockets[i].tcpRcvNxt==20 && g_sockets[i].rxPktCount==packets);
+     packet.bytes[2]^=0x10;HandleTcp(&ip,&packet,sizeof(packet));
+     assert(g_tcpReceiveDiagnostics.checksumBad==bad+1 && g_sockets[i].tcpRcvNxt==24);}
+    {uint8_t data[4]{};assert(SockRecv(i,data,sizeof(data),true)==4);for(unsigned n=0;n<4;++n)assert(data[n]==n+1);}
+    SockClose(i);
     // Retained data shares the RX budget, leaving room for a missing prefix.
     i=create();setupTcp(i);g_sockets[i].rxCount=Socket::RX_DEFAULT-4;
     {Ipv4Header ip{};ip.srcIp=2;ip.dstIp=1;
      struct {TcpHeader tcp;uint8_t bytes[2];} packet{};packet.tcp.srcPort=htons(200);packet.tcp.dstPort=htons(100);
      packet.tcp.ackNum=htonl(10);packet.tcp.flags=TCP_ACK;packet.tcp.window=htons(400);packet.tcp.dataOff=5<<4;
-     packet.tcp.seqNum=htonl(22);HandleTcp(&ip,&packet,sizeof(TcpHeader)+2);
+     packet.tcp.seqNum=htonl(22);HandleTcpChecked(&ip,&packet,sizeof(TcpHeader)+2);
      assert(g_sockets[i].tcpOooBytes==2 && TcpReceiveFree(g_sockets[i])==4);
-     packet.tcp.seqNum=htonl(20);HandleTcp(&ip,&packet,sizeof(TcpHeader)+2);}
+     packet.tcp.seqNum=htonl(20);HandleTcpChecked(&ip,&packet,sizeof(TcpHeader)+2);}
     assert(g_sockets[i].tcpOooBytes==0 && g_sockets[i].rxCount==Socket::RX_DEFAULT && g_sockets[i].tcpRcvNxt==24);
     SockClose(i);
     // Neighbor resolution from receive processing (Dell 2026-11-16). The
@@ -2219,7 +2251,7 @@ int main() {
         int l=create();listenPort(l, 1234, 2);
         auto syn=[&](uint16_t port){Ipv4Header ip{};ip.srcIp=2+(port-40000);ip.dstIp=1;TcpHeader t{};
             t.srcPort=htons(port);t.dstPort=htons(1234);t.seqNum=htonl(70);t.flags=TCP_SYN;
-            t.window=htons(1000);t.dataOff=5<<4;HandleTcp(&ip,&t,sizeof(t));};
+            t.window=htons(1000);t.dataOff=5<<4;HandleTcpChecked(&ip,&t,sizeof(t));};
         syn(40000);syn(40001);assert(g_sockets[l].acceptQueueCount==2);
         const auto fullDrops=g_netCounters.synQueueFull,evicted=g_netCounters.synRecvEvicted;
         syn(40002);assert(g_sockets[l].acceptQueueCount==2 && g_netCounters.synQueueFull==fullDrops+1);
@@ -2588,7 +2620,7 @@ int main() {
             packet.flags = TCP_SYN;
             packet.dataOff = 5 << 4;
             packet.window = htons(1000);
-            HandleTcp(&ip, &packet, sizeof(packet), 0, local);
+            HandleTcpChecked(&ip, &packet, sizeof(packet), 0, local);
         };
         syn(44001, true);
         assert(g_sockets[listener].acceptQueueCount == 1);

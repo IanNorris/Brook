@@ -3547,6 +3547,16 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len,uint64_t 
     auto* tcp = static_cast<const TcpHeader*>(payload);
     uint32_t dataOff = ((tcp->dataOff >> 4) & 0xF) * 4;
     if (dataOff < 20 || dataOff > len) return;
+    // Nothing below this point verifies the TCP checksum: the e1000/I219
+    // drivers leave RXCSUM off and virtio-net does not negotiate checksum
+    // offload, so a corrupted segment would otherwise reach the socket.
+    // Loopback frames were built and checksummed by this stack.
+    if (!localIngress && !TcpChecksumValid(ip->srcIp, ip->dstIp, payload, len)) {
+        const uint64_t bad = __atomic_add_fetch(&g_tcpReceiveDiagnostics.checksumBad, 1, __ATOMIC_RELAXED);
+        if (bad <= 5 || bad % 1000 == 0)
+            SerialPrintf("tcp: RX checksum mismatch dropped len=%u count=%lu\n", len, bad);
+        return;
+    }
 
     uint16_t srcPort = tcp->srcPort;
     uint16_t dstPort = tcp->dstPort;
@@ -6061,7 +6071,8 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         // or slot count limit. Out-of-window data is ooo_capacity.
         r.text(",");r.field("ooo_oversize",0);
         r.text(",");r.field("ooo_full",0);
-        r.text(",");r.field("clipped_segments",__atomic_load_n(&g_tcpReceiveDiagnostics.clippedSegments,__ATOMIC_RELAXED));r.text("}");
+        r.text(",");r.field("clipped_segments",__atomic_load_n(&g_tcpReceiveDiagnostics.clippedSegments,__ATOMIC_RELAXED));
+        r.text(",");r.field("checksum_bad",__atomic_load_n(&g_tcpReceiveDiagnostics.checksumBad,__ATOMIC_RELAXED));r.text("}");
         r.text("}\n");r.send();return;
     }
     if (NetStrEq(cmd, "tcp stats")) {

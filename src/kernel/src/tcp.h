@@ -141,4 +141,10 @@ TcpAction TcpProcessSegment(Socket& s,
 uint16_t TcpChecksum(uint32_t srcIp, uint32_t dstIp,
                      const void* tcpSeg, uint32_t tcpLen);
 
+// A received segment, checksum field included, sums to zero.
+inline bool TcpChecksumValid(uint32_t srcIp, uint32_t dstIp, const void* tcpSeg, uint32_t tcpLen)
+{
+    return TcpChecksum(srcIp, dstIp, tcpSeg, tcpLen) == 0;
+}
+
 } // namespace brook
