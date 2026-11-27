@@ -11,6 +11,7 @@ constexpr char UsbSystemFsckSha256[] =
 constexpr const char* UsbSystemFsckPath = "/boot/E2FSCK.ELF";
 constexpr const char* UsbSystemFsckDevice = "/dev/brook-usb-system";
 constexpr const char* UsbSystemFsckOptOut = "/etc/usb-system-no-fsck";
+constexpr const char* UsbSystemFsckForce = "/etc/usb-system-force-fsck";
 constexpr uint64_t UsbSystemFsckMaxBytes = 4ull << 20;
 
 enum class UsbSystemFsckAction : uint8_t { Continue, Reboot, Refuse };

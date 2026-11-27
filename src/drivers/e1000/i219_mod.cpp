@@ -51,6 +51,7 @@ MODULE_IMPORT_SYMBOL(PciConfigRead32);
 MODULE_IMPORT_SYMBOL(PciConfigWrite16);
 MODULE_IMPORT_SYMBOL(PciFindDevice);
 MODULE_IMPORT_SYMBOL(PmmFreePage);
+MODULE_IMPORT_SYMBOL(PmmAllocPagesAccounted);
 MODULE_IMPORT_SYMBOL(SchedulerSleepMs);
 MODULE_IMPORT_SYMBOL(SerialPrintf);
 MODULE_IMPORT_SYMBOL(UsbStatusChanged);
@@ -79,6 +80,7 @@ enum Reg : uint32_t {
     Kabgtxd = 0x3004,
     Tdbal = 0x3800, Tdbah = 0x3804, Tdlen = 0x3808, Tdh = 0x3810, Tdt = 0x3818, Tidv = 0x3820,
     Txdctl0 = 0x3828, Tadv = 0x382c, Tarc0 = 0x3840, Txdctl1 = 0x3928, Tarc1 = 0x3940,
+    Rnbc = 0x40a0,   // statistics: receive no buffers (clear on read; Mpc below)
     Rxcsum = 0x5000, Rfctl = 0x5008, Mta = 0x5200, Ral0 = 0x5400, Rah0 = 0x5404,
     Manc = 0x5820, H2me = 0x5b50, Fwsm = 0x5b54, Fextnvm9 = 0x5bb4, Fextnvm11 = 0x5bbc,
     // Statistics (clear on read).
@@ -107,6 +109,14 @@ constexpr uint32_t PhyAddrPage0 = 2, PhyAddrHv = 1;
 constexpr uint16_t PciMemory = 1u << 1, PciMaster = 1u << 2, PciIntDisable = 1u << 10;
 constexpr uint32_t PageSize = 4096, MmioBytes = 0x20000, MmioPages = MmioBytes / PageSize;
 constexpr uint32_t PacketPages = RingSize * BufferSize / PageSize;
+// RX ring (27 Nov, desktop download cap): 1024 descriptors, ~12 ms of 1 Gb/s line rate. The
+// driver polls (no INTx line), and a 128-entry ring overflowed between 5 ms polls (12% of
+// segments arrived out of order, the NIC's missed-packet counter took the drops). The
+// descriptors (16 KiB) are physically contiguous; TX keeps the shared 128-entry ring.
+constexpr uint16_t RxRingSize = 1024;
+static_assert((RxRingSize & (RxRingSize - 1)) == 0 && RxRingSize * 16 % 4096 == 0);
+constexpr uint32_t RxDescriptorPages = RxRingSize * 16 / PageSize, RxPacketPages = RxRingSize * BufferSize / PageSize;
+inline uint16_t NextRx(uint16_t index) { return (index + 1) & (RxRingSize - 1); }
 constexpr uint32_t MtaCount = 32; // ich8lan mta_reg_count
 
 constexpr uint32_t PhyReg(uint32_t page, uint32_t reg) { return (page << 5) | (reg & 0x1f); }
@@ -447,6 +457,27 @@ bool AllocateDma(DmaRing& dma)
     }
     return true;
 }
+uint64_t g_rxRingPhys = 0;
+// The RX ring: contiguous descriptor pages (direct map), scattered 2 KiB packet buffers.
+bool AllocateRxDma(DmaRing& dma)
+{
+    constexpr uint64_t flags = VMM_WRITABLE | VMM_NO_EXEC;
+    const PhysicalAddress ring = PmmAllocPagesAccounted(RxDescriptorPages, MemTag::Device, KernelPid, PmmOwner::NetworkDma);
+    if (!ring) return false;
+    g_rxRingPhys = ring.raw();   // the direct map is not walked by VmmVirtToPhys (2 MiB pages)
+    dma.descriptors = PhysToVirt(ring);
+    dma.packets = VmmAllocPagesAccounted(RxPacketPages, flags, MemTag::Device, KernelPid, PmmOwner::NetworkDma);
+    if (!dma.packets) return false;
+    auto* descriptors = reinterpret_cast<RxDescriptor*>(dma.descriptors.raw());
+    memset(descriptors, 0, RxRingSize * sizeof(RxDescriptor));
+    for (uint32_t i = 0; i < RxRingSize; ++i) {
+        const auto physical = VmmVirtToPhys(KernelPageTable, dma.packets + uint64_t(i) * BufferSize);
+        if (!physical) return false;
+        descriptors[i].address = physical.raw();
+    }
+    return true;
+}
+uint64_t g_rxMissed = 0, g_rxNoBuffer = 0;   // MPC / RNBC totals (sampled with the link, every 250 ms)
 
 // ---- Data path -------------------------------------------------------------
 
@@ -483,6 +514,7 @@ void Poll(NetIf* nif)
     const uint64_t now = ApicTickCount();
     if (now >= g_nextLinkSample) {
         g_nextLinkSample = now + 250;
+        g_rxMissed += Read(Mpc); g_rxNoBuffer += Read(Rnbc);
         const bool up = Read(Status) & StatusLu;
         if (up != g_linkUp) {
             g_linkUp = up;
@@ -493,7 +525,7 @@ void Poll(NetIf* nif)
     auto* descriptors = reinterpret_cast<RxDescriptor*>(g_rxDma.descriptors.raw());
     uint16_t last = g_rx.next;
     uint32_t count = 0;
-    for (; count < RingSize; ++count) {
+    for (; count < RxRingSize; ++count) {
         const uint16_t slot = g_rx.next;
         auto& descriptor = descriptors[slot];
         const uint8_t status = __atomic_load_n(&descriptor.status, __ATOMIC_ACQUIRE);
@@ -504,7 +536,7 @@ void Poll(NetIf* nif)
             NetReceive(nif, reinterpret_cast<const void*>((g_rxDma.packets + uint64_t(slot) * BufferSize).raw()), length);
         } else ++g_rxDropped;
         descriptor.status = 0;
-        g_rx.next = Next(slot);
+        g_rx.next = NextRx(slot);
         last = slot;
     }
     if (count) {
@@ -519,7 +551,8 @@ bool Snapshot(NetIf*, NetDriverSnapshot* out)
     *out = {};
     out->received = g_rxFrames; out->transmitted = g_txFrames; out->dropped = g_rxDropped; out->txBusy = g_txBusy;
     out->rxCompletions = g_rxFrames + g_rxDropped; out->txSubmitted = g_txFrames;
-    out->rxDepth = RingSize; out->txDepth = RingSize;
+    out->rxDepth = RxRingSize; out->txDepth = RingSize;
+    out->rxMissed = g_rxMissed; out->rxNoBuffer = g_rxNoBuffer;
     out->linkKnown = true; out->linkUp = g_regs && (Read(Status) & StatusLu);
     return true;
 }
@@ -889,17 +922,27 @@ bool Attach()
     for (uint32_t i = 0; i < MtaCount; ++i) Write(Mta + i * 4, 0);
     InitHardwareBits();
 
-    if (!g_rxDma.descriptors && (!AllocateDma<RxDescriptor>(g_rxDma) || !AllocateDma<TxDescriptor>(g_txDma))) {
+    if (!g_rxDma.descriptors && (!AllocateRxDma(g_rxDma) || !AllocateDma<TxDescriptor>(g_txDma))) {
         g_failure = "DMA allocation"; return false;
     }
     g_rx = {}; g_tx = {};
     auto* rxd = reinterpret_cast<RxDescriptor*>(g_rxDma.descriptors.raw());
     auto* txd = reinterpret_cast<TxDescriptor*>(g_txDma.descriptors.raw());
-    for (uint16_t i = 0; i < RingSize; ++i) {
-        rxd[i].status = 0; rxd[i].errors = 0; rxd[i].length = 0;
-        txd[i].status = DescriptorDone; txd[i].command = 0; txd[i].length = 0;
+    for (uint32_t i = 0; i < RxRingSize; ++i) { rxd[i].status = 0; rxd[i].errors = 0; rxd[i].length = 0; }
+    for (uint16_t i = 0; i < RingSize; ++i) { txd[i].status = DescriptorDone; txd[i].command = 0; txd[i].length = 0; }
+    const uint64_t rxPhys = g_rxRingPhys;
+    if (!rxPhys || (rxPhys & 0xfff) || VmmVirtToPhys(KernelPageTable, g_rxDma.packets).raw() != rxd[0].address) {
+        g_failure = "RX ring address"; return false;
     }
-    const uint64_t rxPhys = VmmVirtToPhys(KernelPageTable, g_rxDma.descriptors).raw();
+    {   // every buffer address must be a real frame (27 Nov: a 0 base sent DMA to page 0)
+        uint64_t lo = ~0ull, hi = 0; uint32_t zero = 0;
+        for (uint32_t i = 0; i < RxRingSize; ++i) { const uint64_t a = rxd[i].address; if (!a) ++zero; if (a < lo) lo = a; if (a > hi) hi = a; }
+        for (uint32_t i = 0; i < RingSize; ++i) { const uint64_t a = txd[i].address; if (!a) ++zero; if (a < lo) lo = a; if (a > hi) hi = a; }
+        SerialPrintf("i219: RX ring %u descriptors at phys 0x%lx, TX ring at 0x%lx; buffers 0x%lx..0x%lx, zero=%u\n",
+                     unsigned(RxRingSize), (unsigned long)rxPhys, (unsigned long)VmmVirtToPhys(KernelPageTable, g_txDma.descriptors).raw(),
+                     (unsigned long)lo, (unsigned long)hi, zero);
+        if (zero || lo < 0x100000) { g_failure = "DMA buffer address"; return false; }
+    }
     const uint64_t txPhys = VmmVirtToPhys(KernelPageTable, g_txDma.descriptors).raw();
 
     // Bus mastering: firmware already enabled it (cmd 0006); keep INTx off.
@@ -916,11 +959,12 @@ bool Attach()
     Write(Rctl, 0);
     Write(Rdtr, 0); Write(Radv, 0);
     Write(Rdbal, uint32_t(rxPhys)); Write(Rdbah, uint32_t(rxPhys >> 32));
-    Write(Rdlen, RingSize * sizeof(RxDescriptor)); Write(Rdh, 0); Write(Rdt, 0);
+    Write(Rdlen, RxRingSize * sizeof(RxDescriptor)); Write(Rdh, 0); Write(Rdt, 0);
+    (void)Read(Mpc); (void)Read(Rnbc);   // start the counters from this bring-up
     Write(Rxcsum, 0);
     Write(Rctl, RxEnable | RxBroadcast | RxStripFcs); // 2048-byte buffers
     __asm__ volatile("sfence" ::: "memory");
-    Write(Rdt, RingSize - 1);
+    Write(Rdt, RxRingSize - 1);
 
     // Allow the existing negotiation to finish before forcing a retry.
     Write(Ctrl, (Read(Ctrl) | CtrlSlu) & ~(CtrlFrcSpd | CtrlFrcDpx));
@@ -1034,7 +1078,7 @@ uint32_t Command(const char* args, char* out, uint32_t cap)
     }
     if (Equal(args, "autoneg")) { __atomic_store_n(&g_autonegRequested, true, __ATOMIC_RELEASE); t.s("queued"); return t.n; }
     if (Equal(args, "stats")) {
-        t.s("CRCERRS="); t.u(Read(Crcerrs)); t.s(" MPC="); t.u(Read(Mpc));
+        t.s("CRCERRS="); t.u(Read(Crcerrs)); t.s(" MPC="); t.u(g_rxMissed += Read(Mpc));
         t.s(" GPRC="); t.u(Read(Gprc)); t.s(" GPTC="); t.u(Read(Gptc)); t.s(" (clear on read)");
         return t.n;
     }

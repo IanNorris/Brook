@@ -2450,7 +2450,7 @@ static bool XhciEcmSnapshot(NetIf* nif,NetDriverSnapshot* out){
           net.rxCredits.outstanding,net.tail-net.head,net.queueHighWater,net.txDepth,
           net.failed || net.controller->completionFailed,
           net.rxPosted,net.rxCompletions,net.rxErrors,net.txSubmitted,net.txErrors,net.notifications,
-          net.faultStatus,net.faultDci,net.linkKnown,net.linkUp};
+          net.faultStatus,net.faultDci,net.linkKnown,net.linkUp,0,0};
     IrqSpinLockRelease(&g_eventRingLock,saved);return true;
 }
 static void XhciEcmPoll(NetIf* nif){

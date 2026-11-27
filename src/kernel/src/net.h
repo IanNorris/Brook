@@ -174,6 +174,8 @@ struct NetDriverSnapshot {
     uint64_t rxPosted, rxCompletions, rxErrors, txSubmitted, txErrors, notifications;
     uint32_t faultStatus, faultDci;
     bool linkKnown, linkUp;
+    // NIC hardware counters where the driver has them (i219: MPC, RNBC).
+    uint64_t rxMissed, rxNoBuffer;
 };
 
 struct NetIf {
