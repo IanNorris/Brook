@@ -83,7 +83,8 @@ def run(mode, base, original, benchmark, args):
             deadline = time.monotonic() + 100
             while time.monotonic() < deadline and guest.poll() is None:
                 boot_log = serial.read_text(errors='replace') if serial.exists() else ''
-                if 'net: IP 10.0.2.15 (DHCP)' in boot_log and '/boot/BENCH.ELF' in boot_log:
+                if ('net: IP 10.0.2.15 (DHCP)' in boot_log and '/boot/BENCH.ELF' in boot_log and
+                        'DEBUG_TCP: listening on port 1234' in boot_log):
                     break
                 time.sleep(.1)
             else:
