@@ -121,6 +121,7 @@ bool UserMappingClone(Process* actor, AddressSpaceState* source, AddressSpaceSta
         destination->savedAuxvWords=source->savedAuxvWords;
         destination->argumentStart=source->argumentStart;
         destination->argumentEnd=source->argumentEnd;
+        destination->environmentEnd=source->environmentEnd;
         destination->membarrierPrivateRegistered=__atomic_load_n(
             &source->membarrierPrivateRegistered,__ATOMIC_ACQUIRE);
         destination->dumpable=__atomic_load_n(&source->dumpable,__ATOMIC_ACQUIRE);
@@ -142,11 +143,11 @@ bool UserMappingReadResidentPage(AddressSpaceState* space,uint64_t address,uint6
     KMutexUnlock(&space->mutation);
     return valid;
 }
-uint32_t UserMappingReadArguments(AddressSpaceState* space,uint64_t offset,void* buffer,uint32_t capacity,bool forCoreDump) {
+uint32_t UserMappingReadArguments(AddressSpaceState* space,uint64_t offset,void* buffer,uint32_t capacity,bool forCoreDump,bool environment) {
     if (!space || space->kernel || !buffer || !capacity) return 0;
     KMutexLock(&space->mutation);
     uint32_t copied=0;
-    const uint64_t begin=space->argumentStart,end=space->argumentEnd;
+    const uint64_t begin=environment?space->argumentEnd:space->argumentStart,end=environment?space->environmentEnd:space->argumentEnd;
     if (begin>=VIRTUAL_NULL_GUARD && end>=begin && end<0x0000800000000000ULL &&
         end-begin<=EXEC_ARG_BYTES && offset<end-begin) {
         // Linux probes the final argument byte before reading the vector.

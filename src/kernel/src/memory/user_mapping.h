@@ -46,7 +46,9 @@ bool UserMappingClone(Process* actor, AddressSpaceState* source, AddressSpaceSta
 // from readable user leaves while mutation prevents unmap/frame retirement.
 // Read one resident user RAM page from a retained foreign address space.
 bool UserMappingReadResidentPage(AddressSpaceState*,uint64_t address,uint64_t identity,void* out);
-uint32_t UserMappingReadArguments(AddressSpaceState* space, uint64_t offset, void* buffer, uint32_t capacity, bool forCoreDump = false);
+// environment: the exec environment strings instead of the arguments (/proc/<pid>/environ).
+uint32_t UserMappingReadArguments(AddressSpaceState* space, uint64_t offset, void* buffer, uint32_t capacity, bool forCoreDump = false,
+                                  bool environment = false);
 // Source allocation must remain owned while the snapshot translates and pins
 // its pages. The returned descriptor owns those pins independently of the source.
 MappingBacking* UserMappingBufferSnapshot(uint64_t kernelAddress,uint64_t length);
