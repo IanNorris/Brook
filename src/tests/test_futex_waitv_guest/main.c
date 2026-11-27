@@ -11,8 +11,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sched.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -201,6 +204,52 @@ static void test_multi_waiters(void)
     CHECK(r == N - 1, "shared wake woke %ld", r);
     for (int i = 1; i < N; ++i) { pthread_join(t[i], 0); CHECK(args[i].result == 1, "waiter %d result %ld", i, args[i].result); }
     printf("FUTEX_WAITV_MULTI done\n");
+}
+
+// /proc/<pid>/futex shows a blocked waiter's expected and live value.
+struct proc_arg { volatile uint32_t* word; volatile int ready; volatile pid_t tid; long result; };
+static void* proc_waiter(void* p)
+{
+    struct proc_arg* a = p;
+    struct waitv w; setw(&w, a->word, 0, 0);
+    a->tid = (pid_t)syscall(SYS_gettid);
+    a->ready = 1;
+    struct timespec ts = after_ms(CLOCK_MONOTONIC, 5000);
+    a->result = waitv(&w, 1, &ts, CLOCK_MONOTONIC);
+    return 0;
+}
+static int read_proc_futex(pid_t pid, char* buf, size_t cap)
+{
+    char path[64]; snprintf(path, sizeof(path), "/proc/%d/futex", (int)pid);
+    int fd = open(path, O_RDONLY); if (fd < 0) return -errno;
+    ssize_t n = read(fd, buf, cap - 1); close(fd);
+    buf[n > 0 ? n : 0] = 0; return (int)n;
+}
+static void test_proc_futex(void)
+{
+    int fd = memfd_create("procfutex", 0);
+    CHECK(fd >= 0 && ftruncate(fd, 4096) == 0, "memfd");
+    volatile uint32_t* word = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    struct proc_arg a = {word + 3, 0, 0, -999};
+    pthread_t t; pthread_create(&t, 0, proc_waiter, &a);
+    while (!a.ready) sched_yield();
+    sleep_ms(30);
+    char buf[2048];
+    int n = read_proc_futex(a.tid, buf, sizeof(buf));
+    printf("FUTEX_WAITV_PROC before: %s", n > 0 ? buf : "(none)\n");
+    CHECK(n > 0 && strstr(buf, "waitv") && strstr(buf, "expected=0 current=0") && strstr(buf, "key=memfd:") &&
+          (strstr(buf, "+0xc") || strstr(buf, "+0xC")), "proc futex row: %s", buf);
+    __atomic_store_n(a.word, 5, __ATOMIC_SEQ_CST); // changed, deliberately not woken
+    n = read_proc_futex(getpid(), buf, sizeof(buf));  // thread-group view
+    printf("FUTEX_WAITV_PROC changed: %s", n > 0 ? buf : "(none)\n");
+    CHECK(n > 0 && strstr(buf, "expected=0 current=5"), "proc futex current: %s", buf);
+    fwake(a.word, 1, 0);
+    pthread_join(t, 0);
+    CHECK(a.result == 0, "proc waiter result %ld", a.result);
+    n = read_proc_futex(a.tid, buf, sizeof(buf));
+    CHECK(n <= 0 || !strstr(buf, "waitv"), "stale row after wake: %s", buf);
+    munmap((void*)word, 4096); close(fd);
+    printf("FUTEX_WAITV_PROC done\n");
 }
 
 // ---------------------------------------------------------------- signals
@@ -448,6 +497,238 @@ static void test_stress(uint32_t iterations)
           shared->lost, shared->errors);
 }
 
+// ---------------------------------------------------------------- Wine fsync model
+// Mirrors Proton's dlls/ntdll/unix/fsync.c + server/fsync.c: the server
+// creates "/wine-...-fsync" with shm_open(O_CREAT|O_EXCL), sizes it with
+// ftruncate one 64 KiB page at a time as object indices grow, and every
+// process maps each page lazily and separately (mmap(NULL, page, RW,
+// MAP_SHARED, fd, entry * page)). Waits are futex_waitv(nr=1, FUTEX_32,
+// non-private); wakes are non-private FUTEX_WAKE(INT_MAX). Server, waiter
+// and waker are separate exec'd programs, optionally in a mount namespace
+// where /dev/shm is a bind mount, as under Steam's pressure-vessel.
+#define FSYNC_PAGE 0x10000
+#define FSYNC_ROUNDS 240
+struct fsync_ctl { uint32_t round, idx, ready, done, failures, lost, unsignaled, woken; };
+struct fsync_map { int fd; void* pages[256]; };
+static volatile uint32_t* fsync_obj(struct fsync_map* m, uint32_t idx)
+{
+    uint32_t entry = idx * 16 / FSYNC_PAGE, offset = idx * 16 % FSYNC_PAGE;
+    if (entry >= 256) return 0;
+    if (!m->pages[entry]) {
+        void* a = mmap(0, FSYNC_PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, m->fd, (off_t)entry * FSYNC_PAGE);
+        if (a == MAP_FAILED) return 0;
+        // Separate spacing so every process maps each page at its own address.
+        void* spacer = mmap(0, 4096 * (1 + (getpid() % 7)), PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0); (void)spacer;
+        m->pages[entry] = a;
+    }
+    return (volatile uint32_t*)((char*)m->pages[entry] + offset);
+}
+static long fsync_wait_value(volatile uint32_t* word, uint32_t current, unsigned ms)
+{
+    struct waitv w; setw(&w, word, current, 0);
+    struct timespec end = after_ms(CLOCK_MONOTONIC, ms);
+    return waitv(&w, 1, &end, CLOCK_MONOTONIC);
+}
+// Wait until *word >= target, futex_waitv style. 0 or -ETIMEDOUT.
+static int fsync_wait_reach(volatile uint32_t* word, uint32_t target, unsigned ms)
+{
+    uint64_t deadline = now_ns(CLOCK_MONOTONIC) + (uint64_t)ms * 1000000ull;
+    for (;;) {
+        uint32_t v = __atomic_load_n(word, __ATOMIC_ACQUIRE);
+        if (v >= target) return 0;
+        if (now_ns(CLOCK_MONOTONIC) > deadline) return -ETIMEDOUT;
+        fsync_wait_value(word, v, 200);
+    }
+}
+static void fsync_store_wake(volatile uint32_t* word, uint32_t value)
+{
+    __atomic_store_n(word, value, __ATOMIC_SEQ_CST);
+    fwake(word, INT_MAX, 0);
+}
+static int fsync_open(struct fsync_map* m, const char* name, int create)
+{
+    memset(m, 0, sizeof(*m));
+    if (create) { shm_unlink(name); m->fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0644); }
+    else m->fd = shm_open(name, O_RDWR, 0644);
+    if (m->fd >= 0) {
+        struct stat st; fstat(m->fd, &st);
+        char path[96]; snprintf(path, sizeof(path), "/dev/shm%s", name);
+        struct stat byPath; int visible = stat(path, &byPath) == 0;
+        printf("FSYNC_MODEL open pid=%d create=%d dev=%lx ino=%lu path-visible=%d path-ino=%lu\n", (int)getpid(), create,
+               (unsigned long)st.st_dev, (unsigned long)st.st_ino, visible, visible ? (unsigned long)byPath.st_ino : 0ul);
+    }
+    return m->fd;
+}
+static int fsync_server(const char* name, int ready_fd)
+{
+    struct fsync_map m;
+    if (fsync_open(&m, name, 1) < 0) { printf("FSYNC_MODEL server shm_open errno=%d\n", errno); return 10; }
+    off_t size = FSYNC_PAGE;
+    if (ftruncate(m.fd, size)) return 11;
+    volatile struct fsync_ctl* ctl = (volatile struct fsync_ctl*)fsync_obj(&m, 0);
+    if (!ctl) return 12;
+    if (write(ready_fd, "r", 1) != 1) return 13;
+    close(ready_fd);
+    for (uint32_t r = 1; r <= FSYNC_ROUNDS; ++r) {
+        const uint32_t idx = 16 + r * 1024 + (r * 37) % 1000; // a new page every ~4 rounds
+        while ((off_t)idx * 16 >= size) { size += FSYNC_PAGE; if (ftruncate(m.fd, size)) return 14; }
+        volatile uint32_t* obj = fsync_obj(&m, idx);
+        if (!obj) return 15;
+        __atomic_store_n(&obj[0], 0, __ATOMIC_SEQ_CST);
+        ctl->idx = idx;
+        fsync_store_wake(&ctl->round, r);
+        if (r % 3 == 0) {
+            // fsync_wake_futex: the server itself signals this round's object.
+            if (fsync_wait_reach(&ctl->ready, r, 5000)) { ctl->failures++; return 16; }
+            if (!__atomic_exchange_n(&obj[0], 1, __ATOMIC_SEQ_CST)) {
+                long n = fwake(obj, INT_MAX, 0); if (n > 0) ctl->woken += (uint32_t)n;
+            }
+        }
+        if (fsync_wait_reach(&ctl->done, r, 8000)) { ctl->failures++; return 17; }
+    }
+    return 0;
+}
+static int fsync_client(const char* name, int waker)
+{
+    struct fsync_map m;
+    if (fsync_open(&m, name, 0) < 0) { printf("FSYNC_MODEL client shm_open errno=%d\n", errno); return 20; }
+    volatile struct fsync_ctl* ctl = (volatile struct fsync_ctl*)fsync_obj(&m, 0);
+    if (!ctl) return 21;
+    for (uint32_t r = 1; r <= FSYNC_ROUNDS; ++r) {
+        if (fsync_wait_reach(&ctl->round, r, 8000)) return 22;
+        volatile uint32_t* obj = fsync_obj(&m, ctl->idx);
+        if (!obj) return 23;
+        if (!waker) {
+            fsync_store_wake(&ctl->ready, r);
+            long rc;
+            do rc = fsync_wait_value(obj, 0, 3000);
+            while (rc == -EAGAIN && !__atomic_load_n(obj, __ATOMIC_ACQUIRE));
+            if (rc == -ETIMEDOUT) {
+                if (__atomic_load_n(obj, __ATOMIC_ACQUIRE)) ctl->lost++; else ctl->unsignaled++;
+                printf("FSYNC_MODEL round %u idx %u timeout signaled=%u\n", r, ctl->idx, *obj);
+            } else if (rc != 0 && rc != -EAGAIN) ctl->failures++;
+            fsync_store_wake(&ctl->done, r);
+        } else if (r % 3) {
+            if (fsync_wait_reach(&ctl->ready, r, 5000)) return 24;
+            spin(r * 977u);
+            if (!__atomic_exchange_n(obj, 1, __ATOMIC_SEQ_CST)) {
+                long n = fwake(obj, INT_MAX, 0); if (n > 0) ctl->woken += (uint32_t)n;
+            }
+        }
+    }
+    return 0;
+}
+static const char* g_self;
+static pid_t fsync_spawn(const char* role, const char* name, int fd, int isolate)
+{
+    // pressure-vessel style: bwrap clones into a private mount namespace in
+    // which /dev/shm is reached through a bind mount of the shared directory.
+    pid_t pid;
+    if (!isolate) pid = fork();
+    else {
+        pid = (pid_t)syscall(SYS_clone, CLONE_NEWNS | SIGCHLD, 0, 0, 0, 0);
+        if (pid < 0) pid = (pid_t)syscall(SYS_clone, CLONE_NEWUSER | CLONE_NEWNS | SIGCHLD, 0, 0, 0, 0);
+        if (pid < 0) { printf("FSYNC_MODEL clone errno=%d\n", errno); return -1; }
+    }
+    if (pid) return pid;
+    if (isolate) {
+        if (mount(0, "/", 0, MS_REC | MS_PRIVATE, 0)) printf("FSYNC_MODEL private errno=%d\n", errno);
+        if (mount("/dev/shm", "/dev/shm", 0, MS_BIND | MS_REC, 0)) { printf("FSYNC_MODEL bind errno=%d\n", errno); _exit(31); }
+    }
+    char fdtext[16]; snprintf(fdtext, sizeof(fdtext), "%d", fd);
+    execl(g_self, g_self, role, name, fdtext, (char*)0);
+    _exit(32);
+}
+static void test_fsync_modes(int first, int last)
+{
+    static const char* modes[] = {"plain", "all-bound", "server-outside", "waker-outside"};
+    for (int mode = first; mode <= last; ++mode) {
+        char name[64]; snprintf(name, sizeof(name), "/wine-%x%d-fsync", (unsigned)getpid(), mode);
+        int p[2]; if (pipe(p)) { CHECK(0, "pipe"); return; }
+        const int serverIn = mode == 1, waiterIn = mode == 1 || mode == 2 || mode == 3, wakerIn = mode == 1 || mode == 2;
+        pid_t server = fsync_spawn("fsync-server", name, p[1], serverIn);
+        close(p[1]);
+        char c = 0; ssize_t got = read(p[0], &c, 1); close(p[0]);
+        CHECK(got == 1, "%s: server not ready", modes[mode]);
+        pid_t waiter = fsync_spawn("fsync-waiter", name, -1, waiterIn);
+        pid_t waker = fsync_spawn("fsync-waker", name, -1, wakerIn);
+        int st[3] = {0, 0, 0};
+        waitpid(waiter, &st[0], 0); waitpid(waker, &st[1], 0); waitpid(server, &st[2], 0);
+        // Read the outcome through a mapping of our own.
+        struct fsync_map m; int fd = fsync_open(&m, name, 0);
+        struct fsync_ctl out = {0};
+        if (fd >= 0) { volatile struct fsync_ctl* ctl = (volatile struct fsync_ctl*)fsync_obj(&m, 0); if (ctl) out = *(struct fsync_ctl*)ctl; }
+        printf("FSYNC_MODEL %s exits=%d/%d/%d open=%d rounds=%u ready=%u done=%u woken=%u lost=%u unsignaled=%u failures=%u\n",
+               modes[mode], WEXITSTATUS(st[0]), WEXITSTATUS(st[1]), WEXITSTATUS(st[2]), fd >= 0, out.round, out.ready,
+               out.done, out.woken, out.lost, out.unsignaled, out.failures);
+        CHECK(WIFEXITED(st[0]) && !WEXITSTATUS(st[0]) && WIFEXITED(st[1]) && !WEXITSTATUS(st[1]) &&
+              WIFEXITED(st[2]) && !WEXITSTATUS(st[2]), "%s: exits", modes[mode]);
+        CHECK(fd >= 0 && out.done == FSYNC_ROUNDS && !out.lost && !out.unsignaled && !out.failures,
+              "%s: outcome", modes[mode]);
+        shm_unlink(name);
+    }
+}
+// Wine names the shm "/wine-<ino>-fsync": the server from fstat of its
+// config-dir fd (open(".") after chdir), clients from stat(path). Both must
+// see one inode number, also through a bind mount, or clients open a
+// different (possibly stale) segment.
+static void check_prefix_inode(const char* label, const char* path, const char* alias)
+{
+    struct stat byPath, byFd, byAlias;
+    char cwd[256]; if (!getcwd(cwd, sizeof(cwd))) strcpy(cwd, "/");
+    int ok = stat(path, &byPath) == 0 && chdir(path) == 0;
+    int fd = ok ? open(".", O_RDONLY) : -1;
+    ok = ok && fd >= 0 && fstat(fd, &byFd) == 0;
+    if (fd >= 0) close(fd);
+    if (chdir(cwd)) {}
+    int aliased = alias && stat(alias, &byAlias) == 0;
+    printf("FSYNC_MODEL prefix %s stat=%lu fstat=%lu alias=%lu\n", label, (unsigned long)byPath.st_ino,
+           ok ? (unsigned long)byFd.st_ino : 0ul, aliased ? (unsigned long)byAlias.st_ino : 0ul);
+    CHECK(ok && byPath.st_ino == byFd.st_ino && byPath.st_dev == byFd.st_dev, "%s: stat/fstat inode differ", label);
+    if (alias) CHECK(aliased && byAlias.st_ino == byPath.st_ino, "%s: bind alias inode differs", label);
+}
+static void test_prefix_inode(void)
+{
+    mkdir("/tmp/fwv-prefix", 0755); mkdir("/tmp/fwv-alias", 0755);
+    check_prefix_inode("tmp", "/tmp/fwv-prefix", 0);
+    pid_t pid = (pid_t)syscall(SYS_clone, CLONE_NEWNS | SIGCHLD, 0, 0, 0, 0);
+    if (pid < 0) pid = (pid_t)syscall(SYS_clone, CLONE_NEWUSER | CLONE_NEWNS | SIGCHLD, 0, 0, 0, 0);
+    if (!pid) {
+        mount(0, "/", 0, MS_REC | MS_PRIVATE, 0);
+        failures = 0;
+        if (mount("/tmp/fwv-prefix", "/tmp/fwv-alias", 0, MS_BIND, 0)) _exit(50);
+        check_prefix_inode("bound", "/tmp/fwv-alias", "/tmp/fwv-prefix");
+        _exit(failures ? 51 : 0);
+    }
+    int st = 0; if (pid > 0) waitpid(pid, &st, 0);
+    CHECK(pid > 0 && WIFEXITED(st) && !WEXITSTATUS(st), "bound prefix status %d", WEXITSTATUS(st));
+}
+static void test_fsync_model(void)
+{
+    test_prefix_inode();
+    test_fsync_modes(0, 3);
+    // bwrap --dev/--tmpfs style: one private mount namespace whose /dev/shm is
+    // a fresh container tmpfs; server, waiter and waker all live inside it.
+    pid_t pid = (pid_t)syscall(SYS_clone, CLONE_NEWNS | SIGCHLD, 0, 0, 0, 0);
+    if (pid < 0) pid = (pid_t)syscall(SYS_clone, CLONE_NEWUSER | CLONE_NEWNS | SIGCHLD, 0, 0, 0, 0);
+    CHECK(pid >= 0, "private tmpfs clone errno=%d", errno);
+    if (!pid) {
+        mount(0, "/", 0, MS_REC | MS_PRIVATE, 0);
+        if (mount("tmpfs", "/dev/shm", "tmpfs", MS_NODEV | MS_NOSUID, "mode=1777")) {
+            printf("FSYNC_MODEL private tmpfs mount errno=%d\n", errno); _exit(40);
+        }
+        printf("FSYNC_MODEL private-tmpfs:\n");
+        failures = 0;
+        test_fsync_modes(0, 0);
+        _exit(failures ? 41 : 0);
+    }
+    if (pid > 0) {
+        int st = 0; waitpid(pid, &st, 0);
+        CHECK(WIFEXITED(st) && !WEXITSTATUS(st), "private tmpfs model status %d", WEXITSTATUS(st));
+    }
+    printf("FUTEX_WAITV_FSYNC_MODEL done\n");
+}
+
 // ---------------------------------------------------------------- RLIMIT_NOFILE
 static void test_nofile(void)
 {
@@ -484,14 +765,21 @@ static void test_nofile(void)
 int main(int argc, char** argv)
 {
     setvbuf(stdout, 0, _IOLBF, 0);
+    g_self = argv[0];
+    if (argc == 4 && !strcmp(argv[1], "fsync-server")) return fsync_server(argv[2], atoi(argv[3]));
+    if (argc == 4 && !strcmp(argv[1], "fsync-waiter")) return fsync_client(argv[2], 0);
+    if (argc == 4 && !strcmp(argv[1], "fsync-waker")) return fsync_client(argv[2], 1);
+    if (argc == 2 && !strcmp(argv[1], "fsync")) { test_fsync_model(); printf(failures ? "FUTEX_WAITV_FAIL\n" : "FUTEX_WAITV_OK\n"); return failures != 0; }
     uint32_t iterations = argc > 1 ? (uint32_t)strtoul(argv[1], 0, 10) : 100000;
     test_arguments();
     test_mismatch_timeout();
     test_index();
     test_multi_waiters();
+    test_proc_futex();
     test_signal();
     test_cross_process();
     test_killed_waiters();
+    test_fsync_model();
     test_nofile();
     test_stress(iterations);
     if (failures) printf("FUTEX_WAITV_FAIL failures=%d\n", failures);
