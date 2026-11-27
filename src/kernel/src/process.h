@@ -588,6 +588,9 @@ struct Process
     uint32_t seccompTrap;               // synchronous SIGSYS for this syscall's return path
     PidNamespaceIds pidNamespaceIds;    // immutable after birth, owns the active view
     const PidNamespace* pidNamespaceForChildren; // owned by this task, independent of the active view
+    // RLIMIT_NOFILE soft/hard. Authoritative on the group leader under the
+    // task registry lock, like coreLimits; set explicitly at birth/fork/exec.
+    CoreResourceLimits nofileLimits;
 };
 
 // A completed producer update invalidates any copied desktop-layer snapshot.

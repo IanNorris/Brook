@@ -1,4 +1,5 @@
 #include "core_autodump.h"
+#include "resource_limits.h"
 #include "process_fs.h"
 #include "user_copy.h"
 #include "scheduler.h"
@@ -3932,7 +3933,7 @@ int SchedulerCoreAutoQueue(uint16_t pid)
 }
 
 int SchedulerCoreResourceLimit(Process* caller,uint32_t pid,const CoreResourceLimits* replace,
-                               CoreResourceLimits& previous,bool privileged)
+                               CoreResourceLimits& previous,bool privileged,uint32_t resource)
 {
     const auto lock=SchedLockAcquire(g_allProcLock);
     const Process* target = !pid ? caller : nullptr;
@@ -3952,12 +3953,12 @@ int SchedulerCoreResourceLimit(Process* caller,uint32_t pid,const CoreResourceLi
         const bool sameGroup=SnapshotTgid(caller)==SnapshotTgid(target) && SnapshotGroup(caller)==SnapshotGroup(target);
         if(!sameGroup && !privileged)result=-1;
         else {
-            previous=leader->coreLimits;
+            CoreResourceLimits& slot=resource==RlimitNofile?leader->nofileLimits:leader->coreLimits;
+            previous=slot;
             result=0;
             if(replace){
-                if(replace->soft>replace->hard)result=-22;
-                else if(!privileged && replace->hard>previous.hard)result=-1;
-                else leader->coreLimits=*replace;
+                result=ResourceLimitAdmit(resource,previous,*replace,privileged);
+                if(!result)slot=*replace;
             }
         }
     }

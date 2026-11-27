@@ -51,6 +51,7 @@
 #include "vdso.h"
 #include "process_user_namespace.h"
 #include "process_namespaces.h"
+#include "resource_limits.h"
 
 namespace brook {
 static_assert(offsetof(Process,mountNamespaceMember)+sizeof(Process::mountNamespaceMember)==offsetof(Process,fsContext),
@@ -65,8 +66,10 @@ static_assert(offsetof(Process,pidNamespaceIds)>=offsetof(Process,seccompTrap)+s
               "PID namespace identities follow seccomp state");
 static_assert(offsetof(Process,pidNamespaceForChildren)>=offsetof(Process,pidNamespaceIds)+sizeof(Process::pidNamespaceIds),
               "the future child PID namespace follows the active identities");
-static_assert(sizeof(Process)-(offsetof(Process,pidNamespaceForChildren)+sizeof(Process::pidNamespaceForChildren))<alignof(Process),
-              "PID namespace ownership ends the process tail");
+static_assert(offsetof(Process,nofileLimits)>=offsetof(Process,pidNamespaceForChildren)+sizeof(Process::pidNamespaceForChildren),
+              "descriptor limits follow PID namespace ownership");
+static_assert(sizeof(Process)-(offsetof(Process,nofileLimits)+sizeof(Process::nofileLimits))<alignof(Process),
+              "descriptor limits end the process tail");
 
 namespace {
 IrqSpinLock signalActionLock;
@@ -828,6 +831,7 @@ static Process* ProcessCreateImpl(const uint8_t* elfData, uint64_t elfSize,
     proc->sid = proc->pid;
     proc->tgid = proc->pid;         // Process is its own thread group leader
     proc->coreLimits={};
+    proc->nofileLimits=ResourceLimitDefaultNofile();
     proc->threadLeader = proc;
     proc->state = ProcessState::Ready;
     proc->runningOnCpu = -1;
@@ -1263,6 +1267,8 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     child->tgid = child->pid;         // Fork creates a new thread group
     child->coreLimits={};
     (void)SchedulerCoreResourceLimit(parent,0,nullptr,child->coreLimits,false);
+    child->nofileLimits=ResourceLimitDefaultNofile();
+    (void)SchedulerCoreResourceLimit(parent,0,nullptr,child->nofileLimits,false,RlimitNofile);
     child->threadLeader = child;
     child->isThread = false;
     child->clearChildTid = 0;

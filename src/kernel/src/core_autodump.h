@@ -32,6 +32,7 @@ struct CoreAutoStats {
 CoreAutoStats CoreAutoReadStats();
 
 int SchedulerCoreAutoQueue(uint16_t pid);
+// RLIMIT_CORE (4) or RLIMIT_NOFILE (7) of the target's thread-group leader.
 int SchedulerCoreResourceLimit(Process* caller,uint32_t pid,const CoreResourceLimits* replace,
-                               CoreResourceLimits& previous,bool privileged);
+                               CoreResourceLimits& previous,bool privileged,uint32_t resource = 4);
 }

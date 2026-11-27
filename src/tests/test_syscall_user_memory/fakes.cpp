@@ -1,4 +1,6 @@
 #include "fido_hidraw.h"
+#include "core_autodump.h"
+#include "resource_limits.h"
 // Minimal stand-ins for subsystems underneath the handlers under test. Most
 // fail or report "absent"; the fake network stack is observable via g_net.
 #include "harness.h"
@@ -197,6 +199,11 @@ uint64_t PmmGetRamPageCount() { return 2; }
 void SchedulerGetLoadAvg(uint32_t& a,uint32_t& b,uint32_t& c) { a=b=c=0; }
 void SchedulerGetProcessCounts(uint32_t& total,uint32_t& running) { total=running=1; }
 void SchedulerGetReapedTicks(uint64_t& user,uint64_t& system) { user=system=0; }
+int SchedulerCoreResourceLimit(Process*,uint32_t,const CoreResourceLimits*,CoreResourceLimits& previous,bool,uint32_t resource)
+{
+    previous=resource==RlimitNofile?ResourceLimitDefaultNofile():CoreResourceLimits{};
+    return 0;
+}
 
 // ioctl/DRM neighbours: devices, audio, windows and memory not under test.
 bool AhciSystemVolumeOwnsMember(Vnode*) { return false; }
