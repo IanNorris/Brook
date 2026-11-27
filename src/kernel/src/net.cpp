@@ -169,6 +169,9 @@ static NetIf* g_netIf = nullptr;
 // from their IRQ handler via NetWakePollThread() so packet processing stays in
 // process context rather than running inline in the ISR.
 static Process* g_netPollThread = nullptr;
+static uint32_t g_netPollMsiMask;
+static uint64_t g_netPollMsiWakes[NET_MAX_IFS];
+static uint64_t g_netPollCycles;
 static uint64_t g_netPollLastRx = 0, g_netPollActiveUntil = 0, g_netPollFastWakes = 0; // net_poll 1 ms mode while RX is active
 
 // ARP neighbor table and pending-frame queue (arp_neighbor.h), guarded by
@@ -1776,6 +1779,7 @@ void NetStartPollThread()
     // because SchedulerAddProcess requires the MLFQ to be initialised.
     Process* pollThread = KernelThreadCreate("net_poll", [](void* /*arg*/) {
         while (true) {
+            __atomic_add_fetch(&g_netPollCycles, 1, __ATOMIC_RELAXED);
             uint32_t n = NetIfCount();
             for (int burst = 0; burst < 16; burst++) {
                 for (uint32_t i = 0; i < n; i++) {
@@ -1806,13 +1810,19 @@ void NetStartPollThread()
                 for (uint32_t i = 0; i < n; i++) if (NetIf* nif = NetIfAt(i)) rx += nif->rxPackets;
                 const uint64_t tick = ApicTickCount();
                 if (rx != g_netPollLastRx) { g_netPollLastRx = rx; g_netPollActiveUntil = tick + 20; ++g_netPollFastWakes; }
-                self->wakeupTick = tick + (tick < g_netPollActiveUntil ? 1 : 5);
+                const uint32_t msi = __atomic_load_n(&g_netPollMsiMask, __ATOMIC_ACQUIRE);
+                bool irqDriven = n && (msi & ((1u << n) - 1)) == (1u << n) - 1;
+                for (uint32_t i = 0; irqDriven && i < n; ++i)
+                    irqDriven = __atomic_load_n(&g_netPollMsiWakes[i], __ATOMIC_RELAXED) != 0;
+                // Continue servicing TCP and keep a periodic RX safety net.
+                // A mixed system with a polled or USB NIC retains its old cadence.
+                self->wakeupTick = tick + (irqDriven ? 20 : (tick < g_netPollActiveUntil ? 1 : 5));
                 SchedulerBlock(self);
             }
         }
     }, nullptr, 2 /* NORMAL priority — same as user processes */);
     if (pollThread) {
-        g_netPollThread = pollThread;
+        __atomic_store_n(&g_netPollThread, pollThread, __ATOMIC_RELEASE);
         SchedulerAddProcess(pollThread);
         SerialPrintf("net: net_poll thread started (pid=%u)\n", pollThread->pid);
     }
@@ -1825,8 +1835,32 @@ void NetWakePollThread()
     // draining and SchedulerBlock (it sets pendingWakeup so the imminent block
     // returns immediately). If the thread isn't blocked yet, the 5ms timed
     // wakeup in the poll loop bounds worst-case latency.
-    if (g_netPollThread)
-        SchedulerUnblock(g_netPollThread);
+    if (Process* thread = __atomic_load_n(&g_netPollThread, __ATOMIC_ACQUIRE))
+        SchedulerUnblock(thread);
+}
+
+void NetSetMsiPolling(NetIf* interface, bool enabled)
+{
+    for (uint32_t i = 0, n = NetIfCount(); i < n; ++i) {
+        if (NetIfAt(i) != interface) continue;
+        if (enabled) {
+            __atomic_store_n(&g_netPollMsiWakes[i], 0, __ATOMIC_RELAXED);
+            __atomic_fetch_or(&g_netPollMsiMask, 1u << i, __ATOMIC_RELEASE);
+        } else {
+            __atomic_fetch_and(&g_netPollMsiMask, ~(1u << i), __ATOMIC_RELEASE);
+        }
+        return;
+    }
+}
+
+void NetWakeMsiPollThread(NetIf* interface)
+{
+    for (uint32_t i = 0, n = NetIfCount(); i < n; ++i) {
+        if (NetIfAt(i) != interface) continue;
+        __atomic_add_fetch(&g_netPollMsiWakes[i], 1, __ATOMIC_RELAXED);
+        NetWakePollThread();
+        return;
+    }
 }
 
 NetIf* NetGetIf()
@@ -6309,6 +6343,9 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             r.text(",");r.field("rx_missed",s.rxMissed);
             r.text(",");r.field("rx_no_buffer",s.rxNoBuffer);
             r.text(",");r.field("net_poll_fast_wakes",g_netPollFastWakes);
+            r.text(",");r.field("net_poll_cycles",__atomic_load_n(&g_netPollCycles,__ATOMIC_RELAXED));
+            r.text(",");r.field("msi_enabled",__atomic_load_n(&g_netPollMsiMask,__ATOMIC_ACQUIRE)&1u);
+            r.text(",");r.field("msi_wakes",__atomic_load_n(&g_netPollMsiWakes[0],__ATOMIC_RELAXED));
             r.text(",\"failed\":");r.text(s.failed?"true":"false");r.text("}");
         }
         r.text(",");r.field("tcp_ack_submit_failures",__atomic_load_n(&g_tcpAckSubmissionFailures,__ATOMIC_RELAXED));

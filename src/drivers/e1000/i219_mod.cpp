@@ -1,7 +1,7 @@
 // Intel I219-V (PCH-integrated "ich8lan" MAC, PCH_SPT class) on the Z370
 // desktop: 8086:15b8 only. Reference: Linux drivers/net/ethernet/intel/e1000e
 // (ich8lan.c, phy.c, netdev.c), board_pch_spt. One legacy RX/TX queue,
-// standard MTU, polled (the firmware leaves no INTx line).
+// standard MTU, MSI with periodic polling as a fallback.
 //
 // Staged bring-up. Stage 0 (always, at load) is read-only apart from the
 // SW/FW/HW semaphore and MDIC PHY reads. Later stages run on the module's
@@ -12,13 +12,16 @@
 //                post-reset steps) before attaching.
 // Never touched: NVM/flash (no flash-controller cycles), ME firmware state
 // beyond the documented H2ME ULP handshake, EFI variables, PCI config space
-// other than the command register.
+// other than the command register and MSI capability.
 #include "e1000_ring.h"
+#include "e1000_msi.h"
 #include "i219_recovery.h"
 
 #include "apic.h"
 #include "boot_status.h"
 #include "debug_hardware.h"
+#include "idt.h"
+#include "irq_wrapper.h"
 #include "kprintf.h"
 #include "memory/physical_memory.h"
 #include "memory/virtual_memory.h"
@@ -38,6 +41,13 @@
 #endif
 
 MODULE_IMPORT_SYMBOL(ApicTickCount);
+MODULE_IMPORT_SYMBOL(ApicGetId);
+MODULE_IMPORT_SYMBOL(ApicSendEoi);
+MODULE_IMPORT_SYMBOL(IdtInstallHandler);
+MODULE_IMPORT_SYMBOL(NetSetMsiPolling);
+MODULE_IMPORT_SYMBOL(NetWakeMsiPollThread);
+MODULE_IMPORT_SYMBOL(PciConfigWrite32);
+MODULE_IMPORT_SYMBOL(PciConfigRead8);
 MODULE_IMPORT_SYMBOL(BootStatusAddProvider);
 MODULE_IMPORT_SYMBOL(DebugNicCommandSetHandler);
 MODULE_IMPORT_SYMBOL(PlatformPowerAddQuiesce);
@@ -71,7 +81,7 @@ using namespace brook::i219;
 enum Reg : uint32_t {
     Ctrl = 0x0000, Status = 0x0008, Strap = 0x000c, CtrlExt = 0x0018, Fextnvm6 = 0x0010,
     Mdic = 0x0020, Fextnvm4 = 0x0024, Fextnvm = 0x0028, Fextnvm3 = 0x003c, Fextnvm7 = 0x00e4,
-    Icr = 0x00c0, Ims = 0x00d0, Imc = 0x00d8,
+    Icr = 0x00c0, Itr = 0x00c4, Ims = 0x00d0, Imc = 0x00d8,
     Rctl = 0x0100, Tctl = 0x0400, Tipg = 0x0410, Ledctl = 0x0e00,
     ExtcnfCtrl = 0x0f00, ExtcnfSize = 0x0f08, PhyCtrl = 0x0f10, Pcieanacfg = 0x0f18, Iosfpc = 0x0f28,
     Pba = 0x1000, Pbs = 0x1008, Pbeccsts = 0x100c,
@@ -109,14 +119,12 @@ constexpr uint32_t PhyAddrPage0 = 2, PhyAddrHv = 1;
 constexpr uint16_t PciMemory = 1u << 1, PciMaster = 1u << 2, PciIntDisable = 1u << 10;
 constexpr uint32_t PageSize = 4096, MmioBytes = 0x20000, MmioPages = MmioBytes / PageSize;
 constexpr uint32_t PacketPages = RingSize * BufferSize / PageSize;
-// RX ring (27 Nov, desktop download cap): 1024 descriptors, ~12 ms of 1 Gb/s line rate. The
-// driver polls (no INTx line), and a 128-entry ring overflowed between 5 ms polls (12% of
-// segments arrived out of order, the NIC's missed-packet counter took the drops). The
-// descriptors (16 KiB) are physically contiguous; TX keeps the shared 128-entry ring.
-constexpr uint16_t RxRingSize = 1024;
-static_assert((RxRingSize & (RxRingSize - 1)) == 0 && RxRingSize * 16 % 4096 == 0);
-constexpr uint32_t RxDescriptorPages = RxRingSize * 16 / PageSize, RxPacketPages = RxRingSize * BufferSize / PageSize;
-inline uint16_t NextRx(uint16_t index) { return (index + 1) & (RxRingSize - 1); }
+// RX descriptor DMA is contiguous; TX keeps the shared 128-entry ring.
+constexpr uint16_t RxRingSize = I219RxRingSize;
+constexpr uint16_t RxPollBurst = 256;
+static_assert((RxRingSize & (RxRingSize - 1)) == 0 && RxRingSize * sizeof(RxDescriptor) % PageSize == 0);
+constexpr uint32_t RxDescriptorPages = RxRingSize * sizeof(RxDescriptor) / PageSize;
+constexpr uint32_t RxPacketPages = RxRingSize * BufferSize / PageSize;
 constexpr uint32_t MtaCount = 32; // ich8lan mta_reg_count
 
 constexpr uint32_t PhyReg(uint32_t page, uint32_t reg) { return (page << 5) | (reg & 0x1f); }
@@ -132,6 +140,7 @@ volatile uint32_t* g_regs = nullptr;
 uint16_t g_firmwareCommand = 0;
 NetIf g_if{};
 DmaRing g_rxDma{}, g_txDma{};
+uint8_t g_msiCap;
 RxRing g_rx{};
 TxRing g_tx{};
 SpinLock g_rxLock{}, g_txLock{}, g_phyLock{}, g_diagnosticsLock{};
@@ -511,6 +520,10 @@ int TryTransmit(NetIf*, const void* frame, uint32_t length) { return Submit(fram
 void Poll(NetIf* nif)
 {
     if (!SpinLockTryAcquire(&g_rxLock)) return;
+    if (SpinLockTryAcquire(&g_txLock)) {
+        g_tx.Reap(reinterpret_cast<const TxDescriptor*>(g_txDma.descriptors.raw()));
+        SpinLockRelease(&g_txLock);
+    }
     const uint64_t now = ApicTickCount();
     if (now >= g_nextLinkSample) {
         g_nextLinkSample = now + 250;
@@ -525,7 +538,7 @@ void Poll(NetIf* nif)
     auto* descriptors = reinterpret_cast<RxDescriptor*>(g_rxDma.descriptors.raw());
     uint16_t last = g_rx.next;
     uint32_t count = 0;
-    for (; count < RxRingSize; ++count) {
+    for (; count < RxPollBurst; ++count) {
         const uint16_t slot = g_rx.next;
         auto& descriptor = descriptors[slot];
         const uint8_t status = __atomic_load_n(&descriptor.status, __ATOMIC_ACQUIRE);
@@ -536,7 +549,7 @@ void Poll(NetIf* nif)
             NetReceive(nif, reinterpret_cast<const void*>((g_rxDma.packets + uint64_t(slot) * BufferSize).raw()), length);
         } else ++g_rxDropped;
         descriptor.status = 0;
-        g_rx.next = NextRx(slot);
+        g_rx.next = Next<RxRingSize>(slot);
         last = slot;
     }
     if (count) {
@@ -544,6 +557,44 @@ void Poll(NetIf* nif)
         Write(Rdt, last);
     }
     SpinLockRelease(&g_rxLock);
+}
+
+extern "C" void I219MsiInner()
+{
+    // ICR is read-to-clear. Run the network stack only on a thread.
+    if (Read(Icr) & MsiCauses) NetWakeMsiPollThread(&g_if);
+    ApicSendEoi();
+}
+
+IRQ_NAKED_HANDLER(I219MsiIsr, I219MsiInner)
+
+bool StartMsi()
+{
+    Write(Imc, ~0u);
+    Write(CtrlExt, Read(CtrlExt) & ~InterruptAutoMask);
+    (void)Read(Icr);
+    Write(Itr, ModerationInterval);
+    (void)Read(Status);
+    PciMsiConfig config{g_device};
+    g_msiCap = EnableMsi(config, ApicGetId(), I219MsiVector, [](uint8_t vector) {
+        IdtInstallHandler(vector, reinterpret_cast<void*>(I219MsiIsr));
+    });
+    if (!g_msiCap) return false;
+    NetSetMsiPolling(&g_if, true);
+    Write(Ims, MsiCauses);
+    (void)Read(Status);
+    return true;
+}
+
+void StopMsi()
+{
+    if (!g_msiCap) return;
+    Write(Imc, ~0u);
+    (void)Read(Status);
+    PciMsiConfig config{g_device};
+    DisableMsi(config, g_msiCap);
+    NetSetMsiPolling(&g_if, false);
+    g_msiCap = 0;
 }
 
 bool Snapshot(NetIf*, NetDriverSnapshot* out)
@@ -572,6 +623,7 @@ bool DisableMaster()
 
 void StopUnits()
 {
+    StopMsi();
     Write(Imc, ~0u);
     Write(Rctl, 0);
     Write(Tctl, TxPsp);
@@ -896,8 +948,11 @@ void LinkTuning()
     Write(Fextnvm6, fextnvm6);
 }
 
+bool Marker(const char* path);
+
 bool Attach()
 {
+    StopMsi();
     // Never start DMA over a ring the firmware may still own.
     if ((Read(Rctl) & RxEnable) || (Read(Tctl) & TxEnable)) {
         Step("firmware left RX/TX enabled: stopping units");
@@ -977,9 +1032,15 @@ bool Attach()
     g_linkUp = Read(Status) & StatusLu;
     g_linkRecovery.Start(ApicTickCount());
     if (!g_registered) {
-        if (!NetRegisterIf(&g_if)) { g_failure = "NetRegisterIf (table full)"; return false; }
+        if (!NetRegisterIf(&g_if)) {
+            StopUnits();
+            g_failure = "NetRegisterIf (table full)";
+            return false;
+        }
         g_registered = true;
     }
+    const bool msi = !Marker("/etc/i219-poll") && StartMsi();
+    SerialPrintf("i219: mode=%s vector=%u\n", msi ? "msi" : "poll", msi ? I219MsiVector : 0);
     Step("rings programmed, interface registered");
     const auto& mac = g_if.mac.b;
     KPrintf("i219: ready PHY=%08x MAC=%02x:%02x:%02x:%02x:%02x:%02x link=%s\n", id,
@@ -1093,6 +1154,7 @@ uint32_t Command(const char* args, char* out, uint32_t cap)
 void QuiesceForReset()
 {
     if (!g_regs) return;
+    StopMsi();
     Write(Imc, ~0u);
     Write(Rctl, Read(Rctl) & ~RxEnable);
     Write(Tctl, Read(Tctl) & ~TxEnable);

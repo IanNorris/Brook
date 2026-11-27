@@ -249,6 +249,8 @@ EXPORT_SYMBOL(NetRegisterIf);
 EXPORT_SYMBOL(NetEarlyBootPolling);
 EXPORT_SYMBOL(NetReceive);
 EXPORT_SYMBOL(NetWakePollThread);
+EXPORT_SYMBOL(NetSetMsiPolling);
+EXPORT_SYMBOL(NetWakeMsiPollThread);
 
 // Audio
 EXPORT_SYMBOL(AudioRegister);

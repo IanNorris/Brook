@@ -1,11 +1,13 @@
 // Intel 8254x Software Developer's Manual, sections 3 and 13.
 // Intel 82574 GbE Controller Family Datasheet, chapters 7, 8 and 10.
-// One legacy RX/TX queue, standard Ethernet MTU and shared PCI INTx.
+// One legacy RX/TX queue, standard Ethernet MTU, optional 82574 MSI or shared PCI INTx.
 #include "e1000_ring.h"
+#include "e1000_msi.h"
 #include "e1000_pci_path.h"
 
 #include "apic.h"
 #include "idt.h"
+#include "irq_wrapper.h"
 #include "kprintf.h"
 #include "memory/physical_memory.h"
 #include "memory/virtual_memory.h"
@@ -22,6 +24,12 @@
 #endif
 
 MODULE_IMPORT_SYMBOL(ApicTickCount);
+MODULE_IMPORT_SYMBOL(ApicGetId);
+MODULE_IMPORT_SYMBOL(ApicSendEoi);
+MODULE_IMPORT_SYMBOL(IdtInstallHandler);
+MODULE_IMPORT_SYMBOL(NetSetMsiPolling);
+MODULE_IMPORT_SYMBOL(NetWakeMsiPollThread);
+MODULE_IMPORT_SYMBOL(PciConfigWrite32);
 MODULE_IMPORT_SYMBOL(IoApicRegisterHandler);
 MODULE_IMPORT_SYMBOL(IoApicResolvePin);
 MODULE_IMPORT_SYMBOL(IoApicUnregisterHandler);
@@ -50,8 +58,8 @@ using namespace brook;
 using namespace brook::e1000;
 
 enum Register : uint32_t {
-    Ctrl = 0x0000, Status = 0x0008, Eecd = 0x0010,
-    Icr = 0x00c0, Ims = 0x00d0, Imc = 0x00d8,
+    Ctrl = 0x0000, Status = 0x0008, Eecd = 0x0010, CtrlExt = 0x0018,
+    Icr = 0x00c0, Itr = 0x00c4, Ims = 0x00d0, Imc = 0x00d8,
     Rctl = 0x0100, Tctl = 0x0400, Tipg = 0x0410,
     Rdbal = 0x2800, Rdbah = 0x2804, Rdlen = 0x2808, Rdh = 0x2810, Rdt = 0x2818,
     Rdtr = 0x2820, Radv = 0x282c,
@@ -89,6 +97,7 @@ uint32_t g_mappedPages = 0;
 uint8_t g_irq = 0xff;
 NetIf g_interface{};
 DmaRing g_rxDma{}, g_txDma{};
+uint8_t g_msiCap;
 RxRing g_rx{};
 TxRing g_tx{};
 SpinLock g_rxLock{}, g_txLock{};
@@ -259,6 +268,10 @@ void Poll(NetIf* nif)
     // NetReceive can reenter polling via the stack. One poller owns the
     // completed buffers until delivery ends, while TX uses its own lock.
     if (!SpinLockTryAcquire(&g_rxLock)) return;
+    if (SpinLockTryAcquire(&g_txLock)) {
+        g_tx.Reap(reinterpret_cast<const TxDescriptor*>(g_txDma.descriptors.raw()));
+        SpinLockRelease(&g_txLock);
+    }
     const uint64_t now = ApicTickCount();
     if (now >= g_nextLinkSample) {
         g_nextLinkSample = now + 100;
@@ -291,6 +304,44 @@ void Poll(NetIf* nif)
     SpinLockRelease(&g_rxLock);
 }
 
+extern "C" void E1000eMsiInner()
+{
+    // ICR is read-to-clear. Run the network stack only on a thread.
+    if (Read(Icr) & MsiCauses) NetWakeMsiPollThread(&g_interface);
+    ApicSendEoi();
+}
+
+IRQ_NAKED_HANDLER(E1000eMsiIsr, E1000eMsiInner)
+
+bool StartMsi()
+{
+    Write(Imc, ~0u);
+    Write(CtrlExt, Read(CtrlExt) & ~InterruptAutoMask);
+    (void)Read(Icr);
+    Write(Itr, ModerationInterval);
+    (void)Read(Status);
+    PciMsiConfig config{g_device};
+    g_msiCap = EnableMsi(config, ApicGetId(), E1000eMsiVector, [](uint8_t vector) {
+        IdtInstallHandler(vector, reinterpret_cast<void*>(E1000eMsiIsr));
+    });
+    if (!g_msiCap) return false;
+    NetSetMsiPolling(&g_interface, true);
+    Write(Ims, MsiCauses);
+    (void)Read(Status);
+    return true;
+}
+
+void StopMsi()
+{
+    if (!g_msiCap) return;
+    Write(Imc, ~0u);
+    (void)Read(Status);
+    PciMsiConfig config{g_device};
+    DisableMsi(config, g_msiCap);
+    NetSetMsiPolling(&g_interface, false);
+    g_msiCap = 0;
+}
+
 void Interrupt()
 {
     // ICR is read-to-clear. Do not call the network stack in hard IRQ context.
@@ -313,6 +364,7 @@ void Stop()
 {
     bool drained = true;
     if (g_regs && g_mappedPages == MmioPages) {
+        StopMsi();
         Write(Imc, ~0u);
         Write(Rctl, 0);
         Write(Tctl, 0);
@@ -337,6 +389,17 @@ void Stop()
     }
     FreeMmio();
     SetPciCommand(g_pciCommand & ~PciMaster);
+}
+
+bool Snapshot(NetIf* intf, NetDriverSnapshot* out)
+{
+    *out = {};
+    out->received = intf->rxPackets;
+    out->transmitted = intf->txPackets;
+    out->rxDepth = out->txDepth = RingSize;
+    out->linkKnown = true;
+    out->linkUp = (Read(Status) & StatusLinkUp) != 0;
+    return true;
 }
 
 int ModuleInit()
@@ -394,6 +457,7 @@ int ModuleInit()
     g_interface.transmit = Transmit;
     g_interface.tryTransmit = TryTransmit;
     g_interface.poll = Poll;
+    g_interface.snapshot = Snapshot;
     const bool linkUp = Read(Status) & StatusLinkUp;
     g_linkUp = linkUp;
     if (!NetRegisterIf(&g_interface)) {
@@ -401,13 +465,20 @@ int ModuleInit()
         return -1;
     }
 
+    // Use the same MSI path as I219 when qualifying it on an 82574L.
+    if (model->pcie) {
+        if (auto* option = VfsOpen("/etc/e1000-msi")) {
+            VfsClose(option);
+            (void)StartMsi();
+        }
+    }
     // The firmware Interrupt Line is advisory. Only a fixture/operator
     // with a verified route should enable it. Never change the IOAPIC's
     // trigger or polarity based on that byte at module load time.
     if (auto* option = VfsOpen("/etc/e1000-intx")) {
         VfsClose(option);
         uint8_t pin;
-        if (firmwareLine >= 3 && firmwareLine < 16 && IoApicResolvePin(firmwareLine, pin)) {
+        if (!g_msiCap && firmwareLine >= 3 && firmwareLine < 16 && IoApicResolvePin(firmwareLine, pin)) {
             IoApicRegisterHandler(pin, 47, reinterpret_cast<void*>(Interrupt));
             g_irq = pin;
             SetPciCommand(command & ~PciIntDisable);
@@ -415,7 +486,7 @@ int ModuleInit()
         }
     }
     SerialPrintf("e1000: PCI interrupt line=%u selected_gsi=%d mode=%s\n", firmwareLine,
-                 g_irq == 0xff ? -1 : int(firmwareLine), g_irq == 0xff ? "poll" : "intx");
+                 g_irq == 0xff ? -1 : int(firmwareLine), g_msiCap ? "msi" : (g_irq == 0xff ? "poll" : "intx"));
     const auto& mac = g_interface.mac.b;
     KPrintf("e1000: %s ready, MAC=%02x:%02x:%02x:%02x:%02x:%02x link=%s irq=%u\n",
             model->name, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], linkUp ? "up" : "down", g_irq);
