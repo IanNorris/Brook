@@ -231,6 +231,12 @@ def main():
             shot = args.output / f'cursor-{name}.ppm'
             qmp.call('screendump', filename=str(shot))
             result.setdefault('cursor_shots', {})[name] = {'file': shot.name, 'pointer': [px, py]}
+        # Depth-24 window A holds pixels 0x40c04040 (alpha byte 0x40): it must
+        # appear exactly 0xc04040, not blended with the wallpaper.
+        x, y, w, h = window_rect(rows['xwl-probe-a'], 'client')
+        samples = [ppm_pixel(args.output / 'cursor-xwl-probe-b.ppm', x + 10 + i * 7, y + h - 12) for i in range(4)]
+        result['depth24_alpha'] = {'samples': [f'{v:06x}' for v in samples],
+                                   'ok': all(v == 0xc04040 for v in samples)}
         write()
         out, err, deadline = '', '', time.monotonic() + 240
         while True:
