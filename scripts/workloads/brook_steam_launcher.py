@@ -45,6 +45,10 @@ STATE = Path(os.environ.get('BROOK_STEAM_STATE', BROOK / 'steam-launcher-state.j
 PIDFILE = Path(os.environ.get('BROOK_STEAM_PIDFILE', BROOK / 'steam-launcher.pid'))
 RESOLV = Path(os.environ.get('BROOK_STEAM_RESOLV', '/etc/RESOLV.CONF'))
 PULSE_PREFIX = 'brook-steam-pulse-'
+# RTX sets name the desktop's NVK ICD here (builder --steam-vk-icd). Exporting it as
+# VK_DRIVER_FILES lets pressure-vessel import NVK into Steam's game containers; without it
+# the containers have no Vulkan driver at all (27 Nov: Bugsnax under Proton, no icd.d).
+VK_ICD_MARKER = Path(os.environ.get('BROOK_STEAM_VK_ICD_MARKER', '/etc/steam-vk-icd'))
 # Host machine-id candidates (Brook's FAT initrd root spells /ETC/MACHINE-ID).
 HOST_MACHINE_IDS = [p for p in os.environ.get('BROOK_STEAM_HOST_MACHINE_ID',
                                               '/etc/machine-id:/etc/MACHINE-ID').split(':') if p]
@@ -647,6 +651,20 @@ def desktop_scale():
     return (percent + 50) // 100 if 100 <= percent <= 400 else 1
 
 
+def vulkan_icd_environment(env, marker=VK_ICD_MARKER):
+    """Set VK_DRIVER_FILES from the set's ICD marker unless the caller chose a driver."""
+    if env.get('VK_DRIVER_FILES') or env.get('VK_ICD_FILENAMES'):
+        return None
+    try:
+        icd = marker.read_text().strip()
+    except OSError:
+        return None
+    if not icd.startswith('/nix/store/') or not icd.endswith('.json') or '\n' in icd or not Path(icd).is_file():
+        return None
+    env['VK_DRIVER_FILES'] = icd
+    return icd
+
+
 def graphics_environment(env, gl, iris, gl_debug):
     env.pop('LIBGL_ALWAYS_SOFTWARE', None)
     extra = {}
@@ -799,6 +817,9 @@ class Steam:
         else:
             env['DISPLAY'] = self.display
             extra = graphics_environment(env, self.args.gl, self.args.iris, self.args.gl_debug)
+            icd = vulkan_icd_environment(env)
+            if icd:
+                extra['vk_driver_files'] = icd
             scale = desktop_scale()
             if scale > 1:
                 # Steam's own UI; games ignore it and keep choosing their own resolution.

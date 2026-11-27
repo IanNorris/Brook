@@ -77,7 +77,7 @@ ETC_ALLOWED = {*MARKERS, 'i219-attach', 'i219-reset', 'hardware-payload-id', 're
                'keyboard-layout',
                'bridge-v3-operators', 'rtx-update-signer', 'restart-prompt-seconds',
                # --session desktop only
-               'live-store', 'usb-system', 'usb-system-no-fsck', 'usb-system-force-fsck', 'ext2-writeback-mib', 'usb-profile-plan.pub', 'usb-system-trim', 'usb-bot-legacy', 'usb-bot-pipeline', 'usb-uas', 'usb-uas-fixture', 'volatile-desktop', 'hardware-bulk', 'usb-audio-mixer', 'dp-idle-seconds', 'nv-display', 'chromium-alsa-device',
+               'live-store', 'usb-system', 'usb-system-no-fsck', 'usb-system-force-fsck', 'ext2-writeback-mib', 'usb-profile-plan.pub', 'usb-system-trim', 'usb-bot-legacy', 'usb-bot-pipeline', 'usb-uas', 'usb-uas-fixture', 'volatile-desktop', 'hardware-bulk', 'usb-audio-mixer', 'dp-idle-seconds', 'nv-display', 'chromium-alsa-device', 'steam-vk-icd',
                # --nv-gsp (GSP-RM M1 bridge verbs) and its firmware record
                'nv-gsp', 'nv-gsp-firmware', 'nv-gsp-no-autostart', 'nv-drm', 'nv-gsp-registry', 'nv-gsp-no-scrubber', 'usb-system-no-mount', 'nv-gsp-swgen0-ack', 'nv-gsp-primary', 'nv-gsp-no-ce-present', 'nv-gsp-headless-p4', 'nv-gsp-no-bar1-identity', 'nv-drm-vas-invalidate',
                # waylandd renderD130 dmabuf import (work/nv-dmabuf)
@@ -366,6 +366,8 @@ def desktop_payload(args, initrd):
             fat_write(initrd, 'ETC/waylandd-nv-dmabuf', b'1\n')
             # per-launch opt-out of the session's MESA_VK_WSI_DEBUG=sw,noshm (native Wayland only)
             fat_write(initrd, 'BOOT/BIN/VKDIRECT', (ROOT / 'tools/vkdirect/vkdirect').read_bytes())
+        if args.nv_drm and getattr(args, 'steam_vk_icd', None):  # brook-steam exports it as VK_DRIVER_FILES
+            fat_write(initrd, 'ETC/steam-vk-icd', (args.steam_vk_icd + '\n').encode())
         if args.nv_drm_vas_invalidate:  # A/B: renderD130 VM_BIND invalidates its own PDB only
             fat_write(initrd, 'ETC/nv-drm-vas-invalidate', b'1\n')
         if args.nv_gsp_headless_p4:  # A/B: nv-disp drives the heads, GSP-RM boots headless
@@ -722,6 +724,9 @@ def main():
                    help='USB system BOT test mode: legacy 64 KiB or experimental read data/status pipelining')
     p.add_argument('--usb-system-trim', metavar="'dry-run|run [MIN_MIB [MAX_MIB]]'",
                    help="scan clean ext2 free extents before mount; send UNMAP only with 'run'")
+    p.add_argument('--steam-vk-icd', metavar='NVK_ICD_JSON',
+                   help='with --nv-drm: /etc/steam-vk-icd, the /nix/store ICD JSON that brook-steam exports as '
+                        'VK_DRIVER_FILES so pressure-vessel imports NVK into game containers')
     p.add_argument('--ext2-writeback-mib', type=int, choices=range(1, 17), metavar='1..16',
                    help='/etc/ext2-writeback-mib: ext2 write-behind queue size (coalesced writes; ~1 s at risk on power loss)')
     p.add_argument('--usb-system-force-fsck', action='store_true',
@@ -764,6 +769,9 @@ def main():
         p.error('--nv-gsp-firmware-store needs --nv-gsp')
     if args.nv_gsp_firmware and not (args.nv_gsp and args.session == 'desktop'):
         p.error('--nv-gsp-firmware needs --nv-gsp and --session desktop')
+    if args.steam_vk_icd and not (args.nv_drm and args.steam_vk_icd.startswith('/nix/store/')
+                                  and args.steam_vk_icd.endswith('.json') and Path(args.steam_vk_icd).is_file()):
+        p.error('--steam-vk-icd needs --nv-drm and an existing /nix/store/.../*.json ICD')
     if args.nv_gsp and args.session != 'desktop':
         p.error('--nv-gsp needs --session desktop')
     if args.usb_system:
