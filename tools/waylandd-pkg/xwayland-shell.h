@@ -14,6 +14,7 @@ static uint64_t g_xwayland_generation, g_xwayland_last_serial;
 static void xwayland_client_destroyed(struct wl_listener *listener,void *data) {
     (void)data;
     wl_list_remove(&listener->link);wl_list_init(&listener->link);
+    fprintf(stderr,"[waylandd] Xwayland's Wayland connection closed\n");
     g_xwayland_client=NULL;g_xwayland_last_serial=0;
     xwayland_generation_lost();
     /* Resource destroy order is unspecified. Retire native windows before a
@@ -33,7 +34,8 @@ static int xwayland_attach_client(struct wl_client *client) {
 static bool xwayland_global_filter(const struct wl_client *client,
                                   const struct wl_global *global,void *data) {
     (void)data;
-    return global!=g_xwayland_shell_global || client==g_xwayland_client;
+    if (global==g_xwayland_shell_global || output_global_xwayland_only(global)) return client==g_xwayland_client;
+    return 1;
 }
 static void xwayland_object_destroy(struct wl_client *client,struct wl_resource *resource) {
     (void)client;wl_resource_destroy(resource);
