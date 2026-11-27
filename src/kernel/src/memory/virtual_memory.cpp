@@ -1144,10 +1144,28 @@ void VmmFreePages(VirtualAddress virtAddr, uint64_t pageCount)
     IrqSpinLockRelease(&g_vmmLock, saved);
 }
 
+// 2 MiB / 1 GiB leaves (the kernel direct map) resolve too: WalkToPtr stops at them, and
+// returning 0 there made a driver program a DMA ring base of 0 (27 Nov, i219 RX ring).
+static PhysicalAddress LargeLeafToPhys(PageTable pt, uint64_t va)
+{
+    const uint64_t* pml4 = reinterpret_cast<uint64_t*>(PhysToVirt(ResolvePml4(pt)).raw());
+    const uint64_t e4 = pml4[Pml4Index(va)];
+    if (!(e4 & VMM_PRESENT)) return PhysicalAddress{};
+    const uint64_t* pdpt = reinterpret_cast<uint64_t*>(PhysToVirt(PhysicalAddress(e4 & PHYS_MASK)).raw());
+    const uint64_t e3 = pdpt[PdptIndex(va)];
+    if (!(e3 & VMM_PRESENT)) return PhysicalAddress{};
+    if (e3 & (1ULL << 7)) return PhysicalAddress(VmmLeafPhys(e3, 30, va));
+    const uint64_t* pd = reinterpret_cast<uint64_t*>(PhysToVirt(PhysicalAddress(e3 & PHYS_MASK)).raw());
+    const uint64_t e2 = pd[PdIndex(va)];
+    if ((e2 & (VMM_PRESENT | (1ULL << 7))) != (VMM_PRESENT | (1ULL << 7))) return PhysicalAddress{};
+    return PhysicalAddress(VmmLeafPhys(e2, 21, va));
+}
+
 PhysicalAddress VmmVirtToPhys(PageTable pt, VirtualAddress virtAddr)
 {
     uint64_t* pte = WalkToPtr(pt, virtAddr, false);
-    if (!pte || !(*pte & VMM_PRESENT)) return PhysicalAddress{};
+    if (!pte) return LargeLeafToPhys(pt, virtAddr.raw());
+    if (!(*pte & VMM_PRESENT)) return PhysicalAddress{};
     return PhysicalAddress((*pte & PHYS_MASK) | (virtAddr.raw() & (PAGE_SIZE - 1)));
 }
 

@@ -228,6 +228,14 @@ void VmmUnmapPage(PageTable pt, VirtualAddress virtAddr);
 
 // Translate virtual → physical by walking the given page table.
 // Returns a null PhysicalAddress if unmapped.
+// The physical address `va` maps to through a leaf entry at level `shift` (12, 21 or 30): the
+// leaf's frame (bits 51..shift; a large leaf's PAT bit 12 is not address) plus va's offset.
+inline uint64_t VmmLeafPhys(uint64_t entry, unsigned shift, uint64_t va)
+{
+    const uint64_t span = (1ULL << shift) - 1;
+    return (entry & 0x000FFFFFFFFFF000ULL & ~span) | (va & span);
+}
+// Resolves 4 KiB, 2 MiB and 1 GiB leaves; 0 when unmapped.
 PhysicalAddress VmmVirtToPhys(PageTable pt, VirtualAddress virtAddr);
 
 // Return a pointer to the leaf PTE for a virtual address.

@@ -354,6 +354,14 @@ static void largeLeafAndBorrowedFrame() {
         }
         uint64_t saved=0x40000000|VMM_PRESENT|VMM_USER|VMM_WRITABLE|(1u<<7);
         *large=saved;uint64_t directoryEntry=entries[1];auto candidate=PmmAllocPage();
+        // VmmVirtToPhys resolves the large leaf (27 Nov: it returned 0, and a NIC ring base of 0
+        // was programmed from a direct-map address). A large leaf's bit 12 is PAT, not address.
+        {const uint64_t off=va.raw()&((1ULL<<(level==3?30:21))-1);
+         CHECK(VmmVirtToPhys(pt,va).raw()==0x40000000+off);
+         CHECK(VmmVirtToPhys(pt,VirtualAddress(va.raw()+0x1234)).raw()==0x40000000+off+0x1234);
+         *large=saved|(1ULL<<12);CHECK(VmmVirtToPhys(pt,va).raw()==0x40000000+off);*large=saved;
+         CHECK(VmmLeafPhys(0x1234567000ULL|VMM_PRESENT,12,0xabc)==0x1234567abcULL);
+         CHECK(VmmLeafPhys(0x40201000ULL|(1ULL<<7)|VMM_PRESENT,21,0x7fffff)==0x403fffffULL);}
         CHECK(VmmTryMapPage(pt,va,candidate,flags)==VmmMapResult::Occupied);
         VmmRangeStats census{};
         CHECK(!VmmMeasureRange(pt,va.raw(),va.raw()+4096,true,&census)&&!census.backedPages);
