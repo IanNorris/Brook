@@ -68,7 +68,7 @@ int main(void) {
     surface_commit(client,s->resource);
     assert(!s->input_region_pending && !s->input_region.infinite);
     region_add(client,rr,10,10,20,20);assert(!pointer_region_contains(&s->input_region,20,20)); // Snapshot, not live alias.
-    sc->entered_surface=s;
+    sc->entered_surface=s;sc->motion_lx=sc->motion_ly=wl_fixed_from_int(5); // client saw the pointer at 5,5
     struct brook_wm_event click={.type=EVT_MOUSE_BTN_DOWN,.x=5,.y=5};dispatch_surface_event(s,sc,&click,0);
     click.type=EVT_MOUSE_MOVE;click.x=click.y=20;dispatch_surface_event(s,sc,&click,0);
     click.type=EVT_MOUSE_BTN_UP;dispatch_surface_event(s,sc,&click,0);

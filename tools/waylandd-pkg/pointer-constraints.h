@@ -120,6 +120,14 @@ static void pointer_relative_dispatch(struct brook_surface *s,struct brook_seat_
         zwp_relative_pointer_v1_send_relative_motion(p->resource,us>>32,(uint32_t)us,
             wl_fixed_from_int(event->x),wl_fixed_from_int(event->y),
             wl_fixed_from_int(event->x),wl_fixed_from_int(event->y));
+        // Unlocked, repeat the absolute position in the same frame. Xwayland
+        // moves its sprite by relative motion as well (positionSprite runs
+        // for its raw-only relative events) and only an absolute motion in
+        // that frame puts it back; otherwise every packet pushed the X
+        // pointer past the native one and clicks landed on the wrong X
+        // window. mutter/wlroots send relative and absolute in one frame.
+        if(!event->reserved && sc->pointer==p->pointer)
+            wl_pointer_send_motion(p->pointer,(uint32_t)(us/1000u),sc->motion_lx,sc->motion_ly);
         // SDL batches its pending motion until wl_pointer.frame. A relative
         // event without this boundary can be overwritten by the next packet.
         if(wl_resource_get_version(p->pointer)>=5)wl_pointer_send_frame(p->pointer);

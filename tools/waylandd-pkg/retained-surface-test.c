@@ -57,6 +57,26 @@ int main(void) {
     }
     assert(sourceCommit==single->publish_commit && sourceTags==sourceBegins);
     surface_destroy(client,single->resource);
+    // Opaque content ignores alpha. A depth-24 X11 window reaches waylandd
+    // as XRGB8888 (Xwayland's format for depth 24), and an ARGB buffer whose
+    // opaque region covers the surface is opaque too: a GL game's alpha < 255
+    // (blood/damage blends) must never make the window see-through. Both the
+    // full-frame fast path (3x2 VFB) and the general path (4x3 VFB) apply.
+    // Without an opaque region an ARGB buffer still blends (checked above).
+    for(unsigned general=0;general<2;++general)for(unsigned kind=0;kind<2;++kind){
+        struct brook_surface *o=make_surface(client);
+        uint32_t out[12];for(unsigned i=0;i<12;++i)out[i]=0x12345678;
+        o->wm_id=1;o->vfb=out;o->vfb_w=general?4:3;o->vfb_h=general?3:2;o->vfb_stride=4;o->scene_disabled=1;
+        if(kind){o->opaque_set=1;o->opaque_x=o->opaque_y=0;o->opaque_w=3;o->opaque_h=2;}
+        uint32_t translucent[6]={0x40804020,0x00102030,0x7f7f7f7f,0x01ffffff,0xc0204060,0xfe000000};
+        struct brook_image *im=image_snapshot((uint8_t *)translucent,3,2,12,
+            kind?WL_SHM_FORMAT_ARGB8888:WL_SHM_FORMAT_XRGB8888);assert(im);
+        assert(surface_tree_commit(o,im));image_unref(im);assert(surface_repaint(o));
+        for(unsigned y=0;y<2;++y)for(unsigned x=0;x<3;++x)
+            assert(out[y*4+x]==(translucent[y*3+x]|0xff000000u));
+        if(general)assert(out[3]==0 && out[8]==0); // uncovered VFB stays clear
+        surface_destroy(client,o->resource);
+    }
     associate(client,sc,p,r);associate(client,sc,c,p);
     subsurface_set_position(client,p->subsurface_resource,1,1);
     snapshot(c,0xffff0000,1,1);snapshot(p,0xffabcdef,2,2);
@@ -96,5 +116,5 @@ int main(void) {
     assert(!p->tree.parent && !p->subsurface_parent);wl_resource_destroy(role);surface_destroy(client,p->resource);
     assert(!g_surfaces);wl_client_destroy(client);wl_display_destroy(display);close(sockets[1]);
     unsetenv("BROOK_WAYLAND_GPU_SOCKET");
-    puts("RETAINED_SURFACE_PASS exact A/B dependencies, parent stacking/position, alpha, inherited desync, NULL mapping, detach/deep lifetime");
+    puts("RETAINED_SURFACE_PASS exact A/B dependencies, parent stacking/position, alpha, opaque XRGB/opaque-region, inherited desync, NULL mapping, detach/deep lifetime");
 }

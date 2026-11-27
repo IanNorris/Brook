@@ -46,7 +46,12 @@ static inline uint32_t brook_pixel_over_fast(uint32_t src, uint32_t dst) {
     return rb | (ag << 8);
 }
 
-enum { BROOK_BLIT_OPAQUE = 1, BROOK_BLIT_DST_CLEAR = 2 };
+/* FORCE_ALPHA: an ARGB source whose opaque region covers the surface
+ * (wl_surface.set_opaque_region). Like other compositors, ignore its alpha:
+ * copy the colour channels and write alpha 255, so a client that leaves
+ * alpha < 255 in its framebuffer (a GL game's blend effects) never makes
+ * the window see-through. */
+enum { BROOK_BLIT_OPAQUE = 1, BROOK_BLIT_DST_CLEAR = 2, BROOK_BLIT_FORCE_ALPHA = 4 };
 
 /* Composite one draw into `dst` (dst_w x dst_h, stride dst_w). `physical` is
  * the view geometry with w/h already multiplied by the output scale; (dx,dy)
@@ -87,10 +92,14 @@ static int brook_blit_draw(uint32_t *dst, uint32_t dst_w, uint32_t dst_h,
         const uint32_t *src = pixels + rowOff[j];
         if (contiguous) {
             const uint32_t *s = src + colOff[0];
-            if (flags & BROOK_BLIT_OPAQUE) memcpy(out, s, cols * 4);
+            if (flags & BROOK_BLIT_FORCE_ALPHA)
+                for (size_t i = 0; i < cols; ++i) out[i] = s[i] | 0xff000000u;
+            else if (flags & BROOK_BLIT_OPAQUE) memcpy(out, s, cols * 4);
             else if (flags & BROOK_BLIT_DST_CLEAR)
                 for (size_t i = 0; i < cols; ++i) out[i] = (s[i] >> 24) ? s[i] : 0;
             else for (size_t i = 0; i < cols; ++i) out[i] = brook_pixel_over_fast(s[i], out[i]);
+        } else if (flags & BROOK_BLIT_FORCE_ALPHA) {
+            for (size_t i = 0; i < cols; ++i) out[i] = src[colOff[i]] | 0xff000000u;
         } else if (flags & BROOK_BLIT_OPAQUE) {
             for (size_t i = 0; i < cols; ++i) out[i] = src[colOff[i]];
         } else if (flags & BROOK_BLIT_DST_CLEAR) {
@@ -151,10 +160,20 @@ static inline const uint32_t *brook_native_crop(const struct brook_geometry *g,
     return pixels + (size_t)y * bw + x;
 }
 
+/* opaque: 0 converts premultiplied alpha, 1 copies (every source alpha is
+ * already 255), BROOK_BLIT_FORCE_ALPHA copies with alpha forced to 255. */
 static inline void brook_publish_native_rows(uint32_t *dst, size_t dst_stride,
         const uint32_t *src, size_t src_stride, uint32_t w, uint32_t h, int opaque) {
     if (!opaque) {
         brook_straight_rows(dst, dst_stride, src, src_stride, w, h);
+        return;
+    }
+    if (opaque == BROOK_BLIT_FORCE_ALPHA) {
+        for (uint32_t y = 0; y < h; ++y) {
+            uint32_t *out = dst + (size_t)y * dst_stride;
+            const uint32_t *in = src + (size_t)y * src_stride;
+            for (uint32_t x = 0; x < w; ++x) out[x] = in[x] | 0xff000000u;
+        }
         return;
     }
     if (src_stride == w && dst_stride == w) {

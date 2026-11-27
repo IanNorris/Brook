@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <xcb/xcb.h>
+#include <xcb/xfixes.h>
 #include "xwm-wire.h"
 static struct bxwm_stream stream;
 static xcb_window_t never_present;
@@ -69,6 +70,28 @@ static int state_has(xcb_connection_t *c,xcb_window_t window,xcb_atom_t net_stat
     for (int i=0;i<xcb_get_property_value_length(r)/4;++i) if (((xcb_atom_t *)xcb_get_property_value(r))[i]==wanted) found=1;
     free(r);return found;
 }
+/* The XWM gives the root window the theme's left_ptr; without it rootless
+ * Xwayland shows the server's "X" glyph over every X window that defines
+ * no cursor. Read the cursor shown over the bare root back through XFixes. */
+static void check_root_cursor(xcb_connection_t *c,xcb_screen_t *screen,const char *expect) {
+    unsigned width,height,xhot,yhot;
+    assert(sscanf(expect,"%ux%u+%u+%u",&width,&height,&xhot,&yhot)==4);
+    free(xcb_xfixes_query_version_reply(c,xcb_xfixes_query_version(c,4,0),NULL));
+    xcb_warp_pointer(c,XCB_WINDOW_NONE,screen->root,0,0,0,0,
+                     (int16_t)(screen->width_in_pixels-5),(int16_t)(screen->height_in_pixels-5));
+    uint64_t deadline=now()+5000;int matched=0;
+    while (!matched && now()<deadline) {
+        xcb_xfixes_get_cursor_image_reply_t *image=xcb_xfixes_get_cursor_image_reply(c,
+            xcb_xfixes_get_cursor_image(c),NULL);
+        assert(image);
+        matched=image->width==width && image->height==height && image->xhot==xhot && image->yhot==yhot &&
+            xcb_xfixes_get_cursor_image_cursor_image_length(image)==(int)(width*height) &&
+            xcb_xfixes_get_cursor_image_cursor_image(image)[0]==0xff00c000u;
+        free(image);
+        if (!matched) usleep(10000);
+    }
+    assert(matched);
+}
 int main(int argc,char **argv) {
     /* Runner supplies a newly created headless Xvfb display, never DISPLAY. */
     assert(argc==3);int control=atoi(argv[2]);
@@ -76,6 +99,7 @@ int main(int argc,char **argv) {
     xcb_connection_t *c=xcb_connect(argv[1],NULL);assert(c && !xcb_connection_has_error(c));
     xcb_screen_t *screen=xcb_setup_roots_iterator(xcb_get_setup(c)).data;
     assert(screen->root==ready.window);
+    if (getenv("BROOK_XWM_EXPECT_ROOT_CURSOR")) check_root_cursor(c,screen,getenv("BROOK_XWM_EXPECT_ROOT_CURSOR"));
     xcb_window_t input=xcb_generate_id(c);
     never_present=input;
     xcb_create_window(c,0,input,screen->root,0,0,1,1,0,XCB_WINDOW_CLASS_INPUT_ONLY,0,0,NULL);

@@ -7,6 +7,7 @@
 , libxkbfile ? (import ../../nix/nixpkgs.nix {}).xorg.libxkbfile
 , libX11 ? (import ../../nix/nixpkgs.nix {}).xorg.libX11
 , libxcb ? (import ../../nix/nixpkgs.nix {}).libxcb
+, libxcb-cursor ? (import ../../nix/nixpkgs.nix {}).libxcb-cursor
 , xorgserver ? (import ../../nix/nixpkgs.nix {}).xorg.xorgserver
 , python3 ? (import ../../nix/nixpkgs.nix {}).python3
 , enableVulkanCompositor ? false
@@ -51,7 +52,7 @@ stdenv.mkDerivation {
   '';
 
   nativeBuildInputs = [ patchelf wayland-scanner ] ++ (if enableVulkanCompositor then [ glslang python3 ] else []);
-  buildInputs = [ wayland libxcb ] ++ (if enableVulkanCompositor then [ vulkanHeaders vulkanLoader ] else []);
+  buildInputs = [ wayland libxcb libxcb-cursor ] ++ (if enableVulkanCompositor then [ vulkanHeaders vulkanLoader ] else []);
   nativeCheckInputs = [ xkbcomp xorgserver python3 ];
   checkInputs = [ libxkbfile libX11 ];
   doCheck = true;
@@ -168,13 +169,14 @@ stdenv.mkDerivation {
     $CC -O2 -UNDEBUG -Wall -Wextra xwm-wire-test.c -o xwm-wire-test
     ./xwm-wire-test
     $CC -O2 -UNDEBUG -Wall -Wextra -I${libxcb.dev}/include xwm-helper-test.c \
-        -L${libxcb}/lib -lxcb -o xwm-helper-test
+        -L${libxcb}/lib -lxcb -lxcb-xfixes -o xwm-helper-test
     BROOK_XWM_EXPECT_SYNTHETIC_REJECTION=1 python3 xwm-helper-check.py --xvfb ${xorgserver}/bin/Xvfb \
         --helper "$PWD/brook-xwm" --fixture "$PWD/xwm-helper-test"
     # Xvfb cannot generate Xwayland's direct serial event. The fixture-only
     # helper accepts SendEvent to exercise the remaining association lifecycle.
-    $CC -O2 -UNDEBUG -Wall -Wextra -DBROOK_XWM_TEST_SYNTHETIC_SERIAL -I${libxcb.dev}/include xwm-helper.c \
-        -L${libxcb}/lib -lxcb -lxcb-composite -o xwm-helper-fixture
+    $CC -O2 -UNDEBUG -Wall -Wextra -DBROOK_XWM_TEST_SYNTHETIC_SERIAL -I${libxcb.dev}/include \
+        -I${libxcb-cursor.dev}/include xwm-helper.c \
+        -L${libxcb}/lib -L${libxcb-cursor}/lib -lxcb -lxcb-composite -lxcb-cursor -o xwm-helper-fixture
     python3 xwm-helper-check.py --xvfb ${xorgserver}/bin/Xvfb \
         --helper "$PWD/xwm-helper-fixture" --fixture "$PWD/xwm-helper-test"
     BROOK_XWM_PROTOCOL=2 BROOK_XWM_SCALE=2 BROOK_XWAYLAND_SCALED_APPS="other, brook-scaled-test" \
@@ -251,8 +253,8 @@ stdenv.mkDerivation {
         -L${wayland}/lib -lwayland-server ${if enableVulkanCompositor then "-L${vulkanLoader}/lib -lvulkan" else ""} \
         -Wl,-rpath,${wayland}/lib:${stdenv.cc.libc}/lib${if enableVulkanCompositor then ":${vulkanLoader}/lib" else ""} \
         -o waylandd
-    $CC -O2 -Wall -Wextra -I${libxcb.dev}/include xwm-helper.c \
-        -L${libxcb}/lib -lxcb -lxcb-composite -o brook-xwm
+    $CC -O2 -Wall -Wextra -I${libxcb.dev}/include -I${libxcb-cursor.dev}/include xwm-helper.c \
+        -L${libxcb}/lib -L${libxcb-cursor}/lib -lxcb -lxcb-composite -lxcb-cursor -o brook-xwm
   '';
 
   installPhase = ''

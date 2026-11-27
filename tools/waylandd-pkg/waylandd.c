@@ -477,6 +477,10 @@ struct brook_surface {
     struct toplevel_size_hints size_hints,pending_size_hints;
     unsigned size_hints_pending;
     int  toplevel_activated;
+    /* Native WM focus from this window's own FOCUS_GAINED/LOST events. Each
+     * window's queue is ordered, but windows are pumped one after another,
+     * so per-event focus handling can apply an older GAINED last. */
+    int  native_focused;
     int  toplevel_maximized,toplevel_resizing;
     /* toplevel_fullscreen: the kernel window covers the output (configured
      * with the fullscreen state). want_fullscreen: the client's request,
@@ -673,6 +677,7 @@ static unsigned xwayland_surface_flags(const struct brook_surface *);
 static void xwayland_surface_created(struct brook_surface *);
 static void xwayland_surface_detach(struct brook_surface *);
 static void xwayland_native_unmapped(struct brook_surface *);
+static void xwayland_focus_reconciled(struct brook_surface *);
 static void xwayland_pair_surfaces(void);
 static void xwayland_generation_lost(void);
 static int xwayland_accept_view(struct brook_surface *,uint32_t,uint32_t);
@@ -2143,6 +2148,7 @@ struct brook_seat_client {
     int cursor_visible;                     /* policy; kernel is mechanism */
     unsigned refs;
     int32_t pointer_x,pointer_y;
+    wl_fixed_t motion_lx,motion_ly;         /* last enter/motion position sent */
     uint32_t buttons;                       /* held buttons: implicit grab */
     unsigned finger_axes;                   /* axes moved on the entered surface */
     uint32_t kb_mods_depressed;
@@ -2657,6 +2663,7 @@ static void pointer_enter_if_needed(struct brook_seat_client *sc,
     }
     if (s) {
         wl_pointer_send_enter(sc->pointer, next_serial(), s->resource, lx, ly);
+        sc->motion_lx = lx; sc->motion_ly = ly;
         if (wl_resource_get_version(sc->pointer) >= 5)
             wl_pointer_send_frame(sc->pointer);
     }
@@ -2670,6 +2677,21 @@ static void pointer_enter_if_needed(struct brook_seat_client *sc,
         wm_set_cursor_image(NULL, 0, 0, 0, 0); /* restore built-in arrow */
     }
     seat_apply_cursor_visibility(sc);
+}
+
+/* A button event acts where the client last saw the pointer.
+ * The kernel reports the press position with the press; if the last
+ * motion/enter sent differs (a move the client never saw), send a motion
+ * first. Xwayland in particular picks the X window from its own sprite
+ * position, so a stale one sends the click to another X window or the root. */
+static void pointer_sync_position(struct brook_seat_client *sc, uint32_t now,
+                                  wl_fixed_t lx, wl_fixed_t ly) {
+    if (!sc || !sc->pointer || !sc->entered_surface ||
+        (sc->motion_lx == lx && sc->motion_ly == ly)) return;
+    wl_pointer_send_motion(sc->pointer, now, lx, ly);
+    if (wl_resource_get_version(sc->pointer) >= 5)
+        wl_pointer_send_frame(sc->pointer);
+    sc->motion_lx = lx; sc->motion_ly = ly;
 }
 
 /* Pointer target within the window's surface tree. A window's input arrives
@@ -2740,6 +2762,7 @@ static void dispatch_surface_event(struct brook_surface *s,
         wl_fixed_t lx,ly;struct brook_surface *target=pointer_target(s,sc,e->x,e->y,&lx,&ly);
         pointer_enter_if_needed(sc, target, lx, ly);
         wl_pointer_send_motion(sc->pointer, now, lx, ly);
+        sc->motion_lx = lx; sc->motion_ly = ly;
         if (wl_resource_get_version(sc->pointer) >= 5)
             wl_pointer_send_frame(sc->pointer);
         latency_input_sent(sc->client, LATENCY_MOTION);
@@ -2760,6 +2783,7 @@ static void dispatch_surface_event(struct brook_surface *s,
         {
             wl_fixed_t lx,ly;struct brook_surface *target=pointer_target(s,sc,e->x,e->y,&lx,&ly);
             pointer_enter_if_needed(sc, target, lx, ly);
+            if (!pointer_surface_locked(s)) pointer_sync_position(sc, now, lx, ly);
         }
         /* scan: 0=left, 1=right, 2=middle  →  BTN_LEFT 0x110, etc. */
         uint32_t btn = 0x110 + (e->scan & 0x3);
@@ -2993,8 +3017,8 @@ static void dispatch_window_event(struct brook_surface *surface,
     xwayland_window_event(surface,event->type);
     /* Window management requests are per window. Input is per resource: GTK
      * and application libraries can independently bind the same wl_seat. */
-    if (event->type == WM_EVT_FOCUS_GAINED) toplevel_set_activated(surface, 1);
-    if (event->type == WM_EVT_FOCUS_LOST) toplevel_set_activated(surface, 0);
+    if (event->type == WM_EVT_FOCUS_GAINED) { surface->native_focused=1;toplevel_set_activated(surface, 1); }
+    if (event->type == WM_EVT_FOCUS_LOST) { surface->native_focused=0;toplevel_set_activated(surface, 0); }
     if (event->type==WM_EVT_CLOSE_REQUESTED || event->type==WM_EVT_RESIZED) {
         dispatch_surface_event(surface,NULL,event,now);
         return;
@@ -3016,11 +3040,39 @@ static void pump_input_for_surface(struct brook_surface *surface) {
     g_input_batch_us = 0;
 }
 
+/* After a pump, make keyboard focus and the X11 focus follow the window the
+ * kernel WM has focused now, whatever order the windows' queues were read in:
+ * A gained/lost then B gained, read as B then A, would otherwise leave the
+ * keyboard on no surface and give X11 focus to A (keys then reach the wrong
+ * X window, and clicking B changes nothing because B is already focused). */
+static uint32_t g_focus_reconciled_wm;
+static void focus_reconcile(void) {
+    struct brook_surface *focused=NULL;
+    for (struct brook_surface *s = g_surfaces; s; s = s->next)
+        if (s->wm_id && s->native_focused && s->resource) focused=s;
+    if (!focused) { g_focus_reconciled_wm=0;return; }
+    struct wl_client *owner=wl_resource_get_client(focused->resource);
+    for (struct brook_seat_client *sc=g_seat_clients;sc;sc=sc->next) {
+        if (sc->client!=owner || !sc->keyboard || sc->kb_focus==focused) continue;
+        if (sc->kb_focus && sc->kb_focus->resource && wl_resource_get_client(sc->kb_focus->resource)==sc->client)
+            wl_keyboard_send_leave(sc->keyboard,next_serial(),sc->kb_focus->resource);
+        struct wl_array keys; wl_array_init(&keys);
+        wl_keyboard_send_enter(sc->keyboard,next_serial(),focused->resource,&keys);
+        wl_array_release(&keys);
+        wl_keyboard_send_modifiers(sc->keyboard,next_serial(),sc->kb_mods_depressed,0u,sc->kb_mods_locked,0u);
+        sc->kb_focus=focused;text_input_focus(sc,focused);
+    }
+    if (g_focus_reconciled_wm==focused->wm_id) return;
+    g_focus_reconciled_wm=focused->wm_id;
+    xwayland_focus_reconciled(focused);
+}
+
 static void pump_input_once(void) {
     pointer_constraints_refresh();
     idle_inhibit_sync();
     for (struct brook_surface *s = g_surfaces; s; s = s->next)
         pump_input_for_surface(s);
+    focus_reconcile();
 }
 
 /* ---------------- xdg-decoration-unstable-v1 ----------------
