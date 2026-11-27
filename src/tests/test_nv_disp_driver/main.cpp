@@ -36,6 +36,11 @@ static void TestOutput0(){
     assert(g.Arm(1,c57e::SET_CONTEXT_DMA_ISO0)==kHandleIsoPitch&&g.Arm(1,c57e::SET_OFFSET0)==0); // first flip: no visible change
     assert(g.c.R(kRegInstTarget)==9&&Errors(g.b)==0&&g.r0->quietSteps>50);
     assert(g.b.Count("nv_disp_step")==0);                               // quiet: no per-step JSON
+    // A destination with unconfirmed CE completion cannot be reused.
+    assert(g.d->f[0].Back(1) == -1);
+    g.d->f[0].nbuf = 3;
+    assert(g.d->f[0].Back(1) == 2);
+    g.d->f[0].nbuf = 2;
     g.Flip(0,1);assert(g.Arm(1,c57e::SET_OFFSET0)==uint32_t(g.r0->cfg.surf[1].vram>>8));
     g.Flip(0,200);                                                      // ring wraps (16 words per flip)
     assert(g.d->f[0].st.completes==201&&g.d->f[0].st.wraps>=3&&g.d->f[0].fail==FlipFail::None);

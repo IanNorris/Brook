@@ -13,6 +13,10 @@
 #include "desktop_pointer_route.h"
 #include "global_shortcuts.h"
 #include "compositor.h"
+#if defined(BROOK_NV_DISPLAY) && !defined(BROOK_HOST_TEST)
+#include "nv_disp_live.h"
+#include "desktop_capture_access.h"
+#endif
 #include "wm_capture_protection.h"
 #include "pid_namespace.h"
 #include "input_grab_policy.h"
@@ -84,6 +88,9 @@ static KMutex g_scanoutMappingLock{};
 // protects copy-out, while scene raster also snapshots dimensions and stride.
 static KMutex g_linearDisplayFrameLock{};
 static CompositorPresentLease g_presentLease{};
+#if defined(BROOK_NV_DISPLAY) && !defined(BROOK_HOST_TEST)
+static bool g_nvGlassFrame;
+#endif
 // Compositor progress and guest time when the most recent leased image was
 // published. Protected by the scanout mapping lock, like the image itself.
 static uint64_t g_leasedFrameEpoch=0, g_leasedFrameTick=0;
@@ -789,6 +796,16 @@ static void CaptureCompletedDebugFrame(uint64_t epoch,const DebugFrameGeometry& 
     if (!EnsureDebugFrameBufferLocked(static_cast<uint64_t>(width)*height*4)) return;
     auto* destination=reinterpret_cast<uint32_t*>(g_debugFrameBuffer.raw());
     g_debugFrameCleanAddress=0; // full-image copy: overlay must clear fully next time
+#if defined(BROOK_NV_DISPLAY) && !defined(BROOK_HOST_TEST)
+    if (leased && g_nvGlassFrame) {
+        // The NVIDIA front is outside the firmware framebuffer mapping.
+        // Withhold frames until exact protected-scene provenance is carried.
+        if (protectedScene || !NvGlassReadFront(destination,width,height)) {
+            g_debugFrame.state=DebugFrameState::Pending;
+            return;
+        }
+    } else
+#endif
     for (uint32_t y=0;y<height;++y)
         memcpy(destination+static_cast<uint64_t>(y)*width,source+static_cast<uint64_t>(y)*stride,width*4);
     // A direct window's pixels are only in VRAM: read its hole back from the front buffer.
@@ -6062,6 +6079,37 @@ bool CompositorRefreshClientScanoutLease(uint64_t owner)
 }
 #endif
 
+#if defined(BROOK_NV_DISPLAY) && !defined(BROOK_HOST_TEST)
+int64_t CompositorPresentNvGlass(uint64_t owner, uint64_t display, void* prime,
+                                 uint32_t width, uint32_t height, uint32_t stride)
+{
+    CompositorMutexGuard frame(&g_linearDisplayFrameLock);
+    CompositorMutexGuard geometry(&g_scanoutMappingLock);
+    const uint64_t now=ApicTickCount();
+    if (!owner || !display || display!=g_displayGeneration ||
+        width!=g_deskWidth || height!=g_deskHeight) return -116;
+    if (!DesktopNvRendererOwnedBy(owner) || g_gopWriter || !g_presentLease.CanAcquire(owner,now))
+        return -16;
+    if (!WmIsActive() || !TtyDisplaySuppressed() || BootLogoActive() ||
+        ShutdownReadyForManualPowerOff()) return -11;
+
+    const auto result=NvGlassPresent(prime,width,height,stride);
+    if (result) return result;
+    const uint64_t tick=ApicTickCount();
+    if (!g_presentLease.Acquire(owner,tick,COMPOSITOR_PRESENT_LEASE_MS)) return -75;
+    g_scanoutContainsLeasedFrame=true;
+    g_scanoutNeedsRepair=false;
+    g_nvGlassFrame=true;
+    g_leasedFrameTick=tick;
+    g_leasedFrameEpoch=__atomic_load_n(&g_compositorEpoch,__ATOMIC_ACQUIRE);
+    g_leasedFrameDisplay=display;
+    g_leasedFrameMode=BROOK_DEBUG_FRAME_PRESENT_NONE;
+    g_leasedFramePrivacy={};
+    CompositorRecordDesktopPresent();
+    return 0;
+}
+#endif
+
 void CompositorReleasePresentLease(uint64_t owner)
 {
     bool released;
@@ -6081,6 +6129,9 @@ CompositorSoftwareTakeoverStats CompositorReadSoftwareTakeoverStats()
 void CompositorUnregisterProcess(Process* proc)
 {
     if (!proc) return;
+#if defined(BROOK_NV_DISPLAY) && !defined(BROOK_HOST_TEST)
+    if (!proc->isThread) DesktopNvRendererRevoke(proc->incarnation);
+#endif
     // If this process was the global input grabber, drop the reference so
     // we don't post-mortem push events into freed memory.
     CompositorClearInputGrabberIfMatches(proc);

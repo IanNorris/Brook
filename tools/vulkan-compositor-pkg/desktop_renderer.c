@@ -45,6 +45,11 @@
 #define IOC(n,s) ((3u<<30)|((unsigned)(s)<<16)|('d'<<8)|(n))
 enum { SCENE_HEADER=2048 };
 struct create {uint64_t size;uint32_t handle,pad;};
+struct nv_gem_info {uint32_t handle,domain;uint64_t size,offset,map_handle;uint32_t tile_mode,tile_flags;};
+struct nv_gem_new {struct nv_gem_info info;uint32_t channel_hint,align;};
+enum { NV_GEM_VRAM=2, NV_GEM_GART=4, NV_GEM_MAPPABLE=8 };
+_Static_assert(sizeof(struct nv_gem_new)==48,"Nouveau GEM_NEW ABI");
+static int g_nvGlass;
 struct map_offset {uint32_t handle,pad;uint64_t offset,flags,extensions;};
 struct prime {uint32_t handle,flags;int32_t fd;};
 struct gem_close {uint32_t handle,pad;};
@@ -225,6 +230,7 @@ static int present_full(uint64_t ticket,uint32_t width,uint32_t height){
 }
 
 static void source_close(int drm,struct Source *s);
+static int nv_source_open(int drm,uint64_t size,int upload,struct Source *out);
 /* The desktop path never parks: a GPU or handoff failure is logged and the
  * renderer exits so the supervisor restarts it. Process exit is the kernel's
  * designed recovery: it quarantines or reclaims any in-flight GPU work and
@@ -608,6 +614,13 @@ static int context_prepare(int drm,struct RenderContext *ctx,uint32_t width,uint
     context_close(drm,ctx);ctx->damage=baseline;
     if(g_scanoutImages && !scanout_ring_open(width,height)){
         ctx->scanoutCount=g_ring.count;ctx->output=g_ringFds[0];ctx->outputBytes=g_ringBytes;
+    }else if(g_nvGlass){
+        struct Source output;
+        if(nv_source_open(drm,(uint64_t)width*height*4,0,&output))return -1;
+        ctx->output=output.fd;
+        ctx->outputBytes=output.size;
+        struct gem_close closeHandle={output.handle,0};
+        if(ioctl(drm,IOC(9,sizeof(closeHandle)),&closeHandle)){context_close(drm,ctx);return -1;}
     }else{
     ctx->output=(int)syscall(BROOK_SYS_GPU_OUTPUT_ALLOC,(long)((uint64_t)width*height*4),0L,0L,0L,0L,0L);
     if(ctx->output<0)return -1;
@@ -621,7 +634,9 @@ static int context_prepare(int drm,struct RenderContext *ctx,uint32_t width,uint
     if(g_quadMode && !getenv("BROOK_RENDER_GRAPHICS_SCENE")){
         VkPhysicalDevice physical;VkDevice device;VkQueue queue;uint32_t family;
         if(brook_vk_renderer_graphics_context(ctx->renderer,&physical,&device,&queue,&family))
-            ctx->quad=brook_vk_quad_pass_create(physical,device,queue,family);
+            ctx->quad=g_nvGlass?brook_vk_quad_pass_create_optimal_output(physical,device,queue,family):
+                brook_vk_quad_pass_create(physical,device,queue,family);
+        if(g_nvGlass && !ctx->quad){context_close(drm,ctx);errno=ENOTSUP;return -1;}
         if(!ctx->quad)fprintf(stderr,"DESKTOP_QUAD_UNAVAILABLE compute fallback\n");
         else brook_vk_quad_pass_set_modifiers(ctx->quad,brook_vk_renderer_modifiers(ctx->renderer));
     }
@@ -631,7 +646,7 @@ static int context_prepare(int drm,struct RenderContext *ctx,uint32_t width,uint
             ctx->graphics=brook_vk_graphics_pass_create(physical,device,queue,family);
         if(!ctx->graphics)fprintf(stderr,"DESKTOP_GRAPHICS_UNAVAILABLE compute fallback\n");
     }
-    if(getenv("BROOK_RENDER_PARTIAL") || getenv("BROOK_RENDER_ASYNC_PARTIAL")){
+    if(!g_nvGlass && (getenv("BROOK_RENDER_PARTIAL") || getenv("BROOK_RENDER_ASYNC_PARTIAL"))){
         ctx->batchScenes=calloc((size_t)BROOK_VK_MAX_TILES*BROOK_VK_TILE_STRIDE,sizeof(uint32_t));
         ctx->batchRenderer=brook_vk_renderer_create_batch_output(BROOK_VK_MAX_TILES,0);
         if(!ctx->batchScenes || !ctx->batchRenderer){context_close(drm,ctx);return -1;}
@@ -645,7 +660,31 @@ static void source_close(int drm,struct Source *s){
     if(s->handle){struct gem_close c={s->handle,0};(void)ioctl(drm,IOC(9,sizeof(c)),&c);}
     *s=(struct Source){.fd=-1};
 }
+static int nv_source_open(int drm,uint64_t size,int upload,struct Source *out){
+    *out=(struct Source){.fd=-1};
+    if(!size || size>BROOK_GPU_OUTPUT_MAX_BYTES){errno=EINVAL;return -1;}
+    const uint32_t domain=upload?(NV_GEM_GART|NV_GEM_MAPPABLE):NV_GEM_VRAM;
+    struct nv_gem_new gem={.info={.domain=domain,.size=size}};
+    if(ioctl(drm,IOC(0x80,sizeof(gem)),&gem))return -1;
+    out->handle=gem.info.handle;
+    out->size=gem.info.size;
+    if(out->size<size || gem.info.domain!=domain){errno=EIO;goto fail;}
+    if(upload){
+        out->map=mmap(NULL,out->size,PROT_READ|PROT_WRITE,MAP_SHARED,drm,(off_t)gem.info.map_handle);
+        if(out->map==MAP_FAILED)goto fail;
+    }
+    struct prime prime={out->handle,O_CLOEXEC|O_RDWR,-1};
+    if(ioctl(drm,IOC(0x2d,sizeof(prime)),&prime))goto fail;
+    out->fd=prime.fd;
+    static uint64_t serial;
+    out->serial=++serial;
+    return 0;
+fail:
+    {int error=errno;source_close(drm,out);errno=error;}
+    return -1;
+}
 static int source_open(int drm,uint64_t size,struct Source *out){
+    if(g_nvGlass)return nv_source_open(drm,size,1,out);
     *out=(struct Source){.fd=-1};
     if(!size || size>64ull*1024*1024)return -1;
     struct create gem={size,0,0};if(ioctl(drm,IOC(0x5b,sizeof(gem)),&gem))return -1;
@@ -1009,7 +1048,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     }
     const size_t words=SCENE_HEADER;
     if(context_prepare(drm,ctx,width,height,words))goto done;
-    if(g_backdropBlur && !g_backdropUnavailable && pending && g_surfaceRecords &&
+    if(g_backdropBlur && !g_backdropUnavailable && (pending || g_nvGlass) && g_surfaceRecords &&
        !getenv("BROOK_RENDER_TEST_BLOCKED_FENCE")){
         if(brook_vk_quad_pass_enable_backdrop(ctx->quad))renderer_report_capabilities(BROOK_DESKTOP_CAP_BACKDROP_BLUR);
         else disable_backdrop();
@@ -1548,7 +1587,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
         }
     }
     BrookVkResult status=BROOK_VK_REJECTED;int testArmed=0,graphicsUsed=0,quadUsed=0;uint32_t traceLayers=count;
-    uint32_t statsDraws=0;uint64_t statsShaded=0;
+    uint32_t statsDraws=0;uint64_t statsShaded=0,statsDamage=0;
     struct BrookGpuPresentRegions regionBatch={0},kernelRegions={0};int hasKernelRegions=0;
     /* Zero-copy ring: draw into a free image; it must end up complete, so
      * the draw covers this frame's damage plus every change since the image
@@ -1563,6 +1602,44 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             goto done;
         }
         ctx->scanoutImage=ringImage;ctx->output=g_ringFds[ringImage];
+    }
+    if(g_nvGlass){
+        const struct DesktopDamageSet full={1,{{0,0,width,height}}};
+        struct BrookVkQuadSource inputs[BROOK_VK_MAX_LAYERS];
+        for(unsigned i=0;i<count;++i){
+            const uint32_t *l=scene+BROOK_VK_SCENE_HEADER+i*BROOK_VK_LAYER_WORDS;
+            inputs[i]=(struct BrookVkQuadSource){{sources[i].fd,sources[i].syncFd,l[2],l[3],l[0],l[1],
+                (uint64_t)sources[i].words*4u},!directSource[i]};
+        }
+        const struct BrookVkQuadSource output={{ctx->output,-1,width,height,0,width,ctx->outputBytes},0};
+        stage="nv_quad_plan";
+        if(!quad_plan_build_auto(scene,words,holes,&full,g_quadOcclusion,ctx->plan)){errno=ENOTSUP;goto done;}
+        stage="nv_quad_submit";
+        statsSubmitStart=monotonic_ns();
+        status=brook_vk_quad_pass_submit_backdrop(ctx->quad,scene,words,inputs,count,&output,ctx->plan,&blur,holes);
+        if(status==BROOK_VK_PENDING)status=brook_vk_quad_pass_wait(ctx->quad,1000000000ull);
+        if(status==BROOK_VK_PENDING || status==BROOK_VK_UNCERTAIN){
+            // Do not release device objects through userspace while work is uncertain.
+            fprintf(stderr,"DESKTOP_NV_GLASS_FALLBACK Vulkan work uncertain result=%d\n",brook_vk_quad_pass_last_result(ctx->quad));
+            _exit(78);
+        }
+        if(status!=BROOK_VK_COMPLETE){
+            fprintf(stderr,"DESKTOP_NV_GLASS_QUAD_REJECTED result=%d\n",brook_vk_quad_pass_last_result(ctx->quad));
+            errno=ENOTSUP;
+            goto done;
+        }
+        timing[4]=monotonic_ns();
+        stage="nv_present";
+        presentStartNs=timing[4];
+        const struct BrookGpuNvPresent request={identity.display,ctx->output,width,height,width*4u};
+        if(syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_NV_PRESENT,&request,0,0,0,0)){
+            presentFailed=1;
+            goto done;
+        }
+        graphicsUsed=1;
+        ++g_quadSubmitted;
+        statsShaded=statsDamage=(uint64_t)width*height;
+        goto presented_frame;
     }
     /* Default path: per-layer quads limited to the (16-pixel aligned)
      * damage, drawn into the full-size output; present only those regions.
@@ -1809,7 +1886,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
         }else{desktop_buffer_age_reset(&g_ring.age);ringImage=-1;} /* a non-image frame: the images missed its damage */
     }
     /* Compute shades every layer at every damaged pixel. */
-    const uint64_t statsDamage=attemptPartial?damagePixels:(uint64_t)width*height;
+    statsDamage=attemptPartial?damagePixels:(uint64_t)width*height;
     if(!quadUsed)statsShaded=statsDamage*traceLayers;
     if(pending && status==BROOK_VK_PENDING){
         desktop_stats_submitted(&g_stats,pipe && pipe->carry?1u:pipe?0u:quiescent?0u:1u,carried,
@@ -1901,6 +1978,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
         if(hasKernelRegions)kernelRegions.ticket=(uint64_t)ticket;
         if(syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_PRESENT_REGIONS,hasKernelRegions?&kernelRegions:&regionBatch,0,0,0,0)){presentFailed=1;goto done;}
     }else if(present_full((uint64_t)ticket,width,height)){presentFailed=1;goto done;}
+presented_frame:
     direct_scanout_repainted();
     if(ctx->scanoutCount)cursor_presented(cursorEpoch);
     *presentedNs=monotonic_ns();ctx->lastPresentNs=*presentedNs;timing[5]=*presentedNs;ticket=-1;*visible=layers.count;result=0;
@@ -2472,6 +2550,7 @@ int main(int argc,char **argv){
         limit=(unsigned)n;crash=!strcmp(argv[1],"--crash-after");
     }
     else {fprintf(stderr,"usage: brook-desktop-renderer --watch | --frames N | --crash-after N\n");return 2;}
+    g_nvGlass=getenv("BROOK_RENDER_NV_GLASS")!=NULL;
     unsigned depth=getenv("BROOK_RENDER_DOUBLE_BUFFER")?BROOK_GPU_HANDOFF_DEFAULT_DEPTH:0;
     const char *bufferCount=getenv("BROOK_RENDER_BUFFER_COUNT");
     if(bufferCount){
@@ -2484,10 +2563,27 @@ int main(int argc,char **argv){
     ignore_restart_signal.sa_handler=SIG_IGN;
     sigemptyset(&ignore_restart_signal.sa_mask);
     if(sigaction(BROOK_GPU_WINDOW_RESTART_SIGNAL,&ignore_restart_signal,NULL))return 1;
-    int drm=open("/dev/dri/renderD129",O_RDWR|O_CLOEXEC);if(drm<0){perror("desktop render node");return 1;}
+    int drm=-1;
+    if(g_nvGlass){
+        depth=0;
+        for(unsigned retry=0;retry<100;++retry){
+            if(drm<0)drm=open("/dev/dri/renderD130",O_RDWR|O_CLOEXEC);
+            if(drm>=0 && !syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_NV_ATTACH,0,0,0,0,0))break;
+            if(retry==99 || (drm>=0 && errno!=EAGAIN && errno!=EBUSY)){
+                fprintf(stderr,"DESKTOP_NV_GLASS_FALLBACK display or CE unavailable errno=%d\n",errno);
+                if(drm>=0)close(drm);
+                return 78;
+            }
+            usleep(100000);
+        }
+        fprintf(stderr,"DESKTOP_NV_GLASS_ATTACHED renderD130\n");
+    }else{
+        drm=open("/dev/dri/renderD129",O_RDWR|O_CLOEXEC);
+        if(drm<0){perror("desktop render node");return 1;}
+    }
     const unsigned attachDepth=depth>BROOK_GPU_HANDOFF_DEFAULT_DEPTH?depth:0;
-    if(syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_ATTACH,attachDepth,0,0,0,0)){perror("desktop attach");close(drm);return 1;}
-    const long caps=syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_PRESENT_CAPS,0,0,0,0,0);
+    if(!g_nvGlass && syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_ATTACH,attachDepth,0,0,0,0)){perror("desktop attach");close(drm);return 1;}
+    const long caps=g_nvGlass?0:syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_PRESENT_CAPS,0,0,0,0,0);
     g_presentFrame=caps>0 && (caps&BROOK_GPU_PRESENT_CAP_FRAME);
     g_clientScanoutCap=caps>0 && (caps&BROOK_GPU_PRESENT_CAP_CLIENT_SCANOUT);
     g_dependentPartial=caps>0 && (caps&BROOK_GPU_PRESENT_CAP_DEPENDENT);
@@ -2523,7 +2619,7 @@ int main(int argc,char **argv){
      * BROOK_RENDER_COMPOSE=compute keeps the compute shader. Damage is
      * change-based unless BROOK_RENDER_FOOTPRINT_DAMAGE is set. */
     const char *compose=getenv("BROOK_RENDER_COMPOSE");
-    g_quadMode=!(compose && !strcmp(compose,"compute"));
+    g_quadMode=g_nvGlass || !(compose && !strcmp(compose,"compute"));
     g_quadOcclusion=!getenv("BROOK_RENDER_QUAD_NO_OCCLUSION");
     const char *blur=getenv("BROOK_RENDER_BLUR");
     g_backdropBlur=blur && !strcmp(blur,"1");
@@ -2549,6 +2645,7 @@ int main(int argc,char **argv){
     }
     struct RenderContext ctx;context_init(&ctx);
     unsigned frames=0,failures=0,gaps=0,retries=0;uint64_t previous=0,maxInterval=0,failureStart=0;
+    int nvFailed=0;
     while(!limit || frames<limit){
         const uint64_t clientPresented=direct_scanout_poll();
         if(clientPresented){
@@ -2581,6 +2678,12 @@ int main(int argc,char **argv){
             const int failure=errno;uint64_t now=monotonic_ns();++retries;
             if(++failures==1){failureStart=now;fprintf(stderr,"DESKTOP_RENDERER_RETRY errno=%d\n",failure);}
             else if(failures%100==0)fprintf(stderr,"DESKTOP_RENDERER_RETRY errno=%d\n",failure);
+            if(g_nvGlass && (failure==ENOTSUP || failure==ENODEV || failure==EIO ||
+               (failureStart && now-failureStart>=5000000000ull))){
+                fprintf(stderr,"DESKTOP_NV_GLASS_FALLBACK stage=%s errno=%d\n",g_failStage,failure);
+                nvFailed=1;
+                break;
+            }
             if(limit && ((failureStart && now>=failureStart && now-failureStart>=5000000000ull) || failures>=500))break;
             usleep(desktop_sync_retry_delay_us(failure));
         }
@@ -2588,8 +2691,8 @@ int main(int argc,char **argv){
     direct_scanout_drain();
     context_close(drm,&ctx);stats_tick(1);
     desktop_gpu_channel_close(&g_gpuChannel);
-    (void)syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_DETACH,0,0,0,0,0);close(drm);
+    (void)syscall(BROOK_SYS_GPU_HANDOFF_CTL,g_nvGlass?BROOK_GPU_HANDOFF_NV_DETACH:BROOK_GPU_HANDOFF_DETACH,0,0,0,0,0);close(drm);
     fprintf(stderr,"DESKTOP_RENDERER_STOP frames=%u failures=%u retries=%u interval_over_250ms=%u max_interval_ms=%lu\n",frames,failures,retries,gaps,(unsigned long)maxInterval);
     if(g_gpuDirectLayers)fprintf(stderr,"DESKTOP_RENDERER_GPU_SOURCE_LAYERS=%llu\n",(unsigned long long)g_gpuDirectLayers);
-    return limit && frames!=limit?1:0;
+    return nvFailed?78:limit && frames!=limit?1:0;
 }

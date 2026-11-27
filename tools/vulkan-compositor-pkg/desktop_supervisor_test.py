@@ -166,3 +166,34 @@ with tempfile.TemporaryDirectory(prefix="brook-supervisor-kernel-restart-") as t
             proc.wait(timeout=5)
         proc.stderr.close()
 print("DESKTOP_SUPERVISOR_KERNEL_RESTART_PASS")
+
+with tempfile.TemporaryDirectory(prefix="brook-supervisor-nv-glass-") as tmp:
+    root = Path(tmp)
+    child = root / "renderer"
+    seen = root / "seen"
+    icd = root / "nouveau_icd.json"
+    icd.touch()
+    child.write_text(
+        "#!/bin/sh\n"
+        'printf "%s\\n" "$VK_DRIVER_FILES" "$BROOK_RENDER_NV_GLASS" "$BROOK_RENDER_BLUR" '
+        '"$BROOK_RENDER_PIPELINE" "$BROOK_RENDER_PARTIAL" "$BROOK_RENDER_ASYNC_PARTIAL" '
+        '"$BROOK_DESKTOP_GPU_SOCKET" >> "$BROOK_TEST_SEEN"\n'
+        "exit 78\n"
+    )
+    child.chmod(0o755)
+    env = dict(os.environ, BROOK_TEST_SEEN=str(seen), VK_DRIVER_FILES="/wrong.json",
+               BROOK_RENDER_PIPELINE="2", BROOK_RENDER_PARTIAL="1", BROOK_RENDER_ASYNC_PARTIAL="1",
+               BROOK_DESKTOP_GPU_SOCKET="/unwanted.sock")
+    env.pop("BROOK_RENDER_BLUR", None)
+    argv = [sys.argv[1], "--nv-glass", str(icd), str(child)]
+    fallback = subprocess.run(argv, env=env, capture_output=True, timeout=5, check=True)
+    assert b"DESKTOP_SUPERVISOR_NV_FALLBACK renderer declined" in fallback.stderr
+    assert seen.read_text().splitlines() == [str(icd), "1", "1", "1", "", "", ""]
+    icd.unlink()
+    unavailable = subprocess.run(argv, env=env, capture_output=True, timeout=5, check=True)
+    assert b"DESKTOP_SUPERVISOR_NV_FALLBACK ICD unavailable" in unavailable.stderr
+    assert seen.read_text().splitlines() == [str(icd), "1", "1", "1", "", "", ""]
+    for incompatible in (["--partial"], ["--async-partial"], ["--gpu-source", "/tmp/source"]):
+        bad = subprocess.run(argv + incompatible, env=env, capture_output=True, timeout=5, check=False)
+        assert bad.returncode == 2
+print("DESKTOP_SUPERVISOR_NV_GLASS_PASS")

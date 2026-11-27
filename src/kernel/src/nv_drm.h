@@ -36,5 +36,8 @@ void NvPrimeUnref(void* shared);
 uint64_t NvPrimeBytes(void* shared);
 uint64_t NvPrimeIdentity(void* shared);
 int64_t NvPrimeFdIoctl(void* shared, uint64_t cmd, uint64_t arg);   // DMA_BUF_IOCTL_*
+// Check an opaque, pitch-linear VRAM PRIME source up to length bytes. The
+// caller must hold a reference and keep its producer idle through the copy.
+bool NvPrimeLinearVram(void* shared, uint64_t length, uint64_t* phys);
 bool NvPrimeMapGart(void* shared, uint64_t offset, uint64_t length, uint64_t* phys, MappingBacking** life);
 }

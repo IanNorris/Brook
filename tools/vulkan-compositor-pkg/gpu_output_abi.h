@@ -119,3 +119,14 @@ struct BrookGpuPresentFrame {
     uint64_t ticket;
     uint32_t width,height,stride,reserved;
 };
+
+// Serial NVIDIA Glass handoff. Only the initial-namespace boot renderer
+// service can attach and present with the opt-in boot marker.
+#define BROOK_GPU_HANDOFF_NV_ATTACH 40
+#define BROOK_GPU_HANDOFF_NV_PRESENT 41
+#define BROOK_GPU_HANDOFF_NV_DETACH 42
+struct BrookGpuNvPresent {
+    uint64_t display;
+    int32_t fd;
+    uint32_t width, height, stride; // stride in bytes; packed BGRA8
+};

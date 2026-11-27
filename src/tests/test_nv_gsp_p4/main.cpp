@@ -594,6 +594,33 @@ int main(int argc, char** argv) {
         assert(cp.st.map_pages == 1);                                       // one 2 MiB PTE
         assert(r.CeFree(cp) == 7 && r.rm.objs.empty());
     }
+    // ---- Glass: pitch-linear video source outside low scanout VRAM
+    {
+        Rig r(I, 0x1); r.last = r.Run(); assert(r.last.init_done);
+        CePresent cp;
+        assert(r.CeOn(cp).ok());
+        const uint64_t video = 0x141ff0000ull;   // 64 KiB below a 2 MiB boundary
+        const uint32_t width = 8, height = 18, pitch = 4096, destPitch = 64;
+        cp.in.si.usable_hi = 0x150000000ull;
+        for (uint32_t y = 0; y < height; ++y)
+            for (uint32_t x = 0; x < width; ++x)
+                r.gpu.SetVram32(video + uint64_t(y) * pitch + x * 4, 0x00ab0000u + y * width + x);
+        NvCeJob job{};
+        job.width = width; job.height = height;
+        job.video_src = video; job.video_pitch = pitch;
+        job.dst_vram = 0x400000; job.dst_pitch = destPitch;
+        uint64_t bytes = 0;
+        assert(r.CePresentOnce(cp, job, {}, &bytes) == 1 && bytes == uint64_t(width) * height * 4);
+        assert(cp.st.remaps == 0 && cp.st.layer_maps == 0);
+        for (uint32_t y = 0; y < height; ++y)
+            for (uint32_t x = 0; x < width; ++x)
+                assert(r.gpu.Vram32(job.dst_vram + uint64_t(y) * destPitch + x * 4) == 0xffab0000u + y * width + x);
+        const uint32_t ptes = cp.k.ptes;
+        assert(r.CePresentOnce(cp, job, {}, &bytes) == 1 && cp.k.ptes == ptes);
+        job.video_src = cp.in.si.usable_hi - 4;
+        assert(r.CePresentOnce(cp, job, {}, &bytes) == 0 && !cp.broken);
+        assert(r.CeFree(cp) == 7 && r.rm.objs.empty());
+    }
     // ---- M4 step 2: context-buffer list, golden context, TU10x scrubber
     {
         // the list as nouveau builds it from the synthetic sizes

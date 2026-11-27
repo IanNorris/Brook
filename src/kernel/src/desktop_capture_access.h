@@ -4,6 +4,11 @@
 
 namespace brook {
 
+struct Process;
+bool DesktopBootRendererAuthorized(Process* proc);
+bool DesktopNvRendererOwnedBy(uint64_t owner);
+void DesktopNvRendererRevoke(uint64_t owner);
+
 inline bool DesktopLayerContentOperation(uint64_t op)
 {
     switch (op) {
