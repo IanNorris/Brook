@@ -2,7 +2,7 @@
 // every per-task operation checks the captured incarnation. No Process strong
 // reference is kept (cwd=/proc/self must not create a Process ownership cycle).
 static constexpr uint32_t PROC_PID_EXE=5,PROC_PID_CWD=6,PROC_PID_ROOT=8;
-static_assert(NUM_PID_ENTRIES==15,"Update retained proc PID entry indices when changing the catalog");
+static_assert(NUM_PID_ENTRIES==16,"Update retained proc PID entry indices when changing the catalog");
 enum class ProcObjectKind : uint8_t { Root,Net,Pid,Task,Fds,GlobalFile,NetFile,PidFile,FdLink,Self,ThreadSelf,UserMap,Sys,SysKernel,OverflowId,NsDirectory,NsLink,FdInfoDir,FdInfoFile };
 struct ProcObject {
     VfsObject object;

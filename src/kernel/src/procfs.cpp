@@ -14,6 +14,7 @@
 #include "procfs.h"
 #include "futex_waitv.h"
 extern "C" uint32_t FutexSnapshotTask(uint32_t pid, brook::FutexTaskSnapshot* out, uint32_t capacity);
+extern "C" uint32_t FutexDescribeSharedMappings(uint16_t pid, uint64_t incarnation, char* buffer, uint32_t capacity);
 #include "synthetic_system_files.h"
 #include "proc_inode.h"
 #include "vfs.h"
@@ -922,6 +923,17 @@ static Vnode* GenPidFutex(const ProcessSnapshot& proc)
     return MakeProcVnode(buf, n);
 }
 
+// /proc/[pid]/shmframes (Brook) — shared file/memfd mappings with per-page
+// frame tags; compare tags across processes for one key + offset.
+static Vnode* GenPidShmFrames(const ProcessSnapshot& proc)
+{
+    constexpr uint32_t Capacity = 32 * 1024;
+    auto* buf = static_cast<char*>(kmalloc(Capacity));
+    if (!buf) return nullptr;
+    const uint32_t n = FutexDescribeSharedMappings(proc.pid, proc.incarnation, buf, Capacity);
+    return MakeProcVnode(buf, n);
+}
+
 // /proc/[pid]/cmdline — live NUL-separated arguments, tied to PID incarnation.
 // /proc/[pid]/environ: the exec environment (NUL-separated), for root or the same uid
 // (waylandd reads BROOK_WAYLAND_NATIVE_SCALE from Wayland clients).
@@ -1685,6 +1697,7 @@ static ProcPidEntry g_pidEntries[] = {
     { "wchan",   GenPidWchan },
     { "environ", GenPidEnviron },   // appended: retained entry indices stay valid
     { "futex",   GenPidFutex },
+    { "shmframes", GenPidShmFrames },
 };
 static constexpr uint32_t NUM_PID_ENTRIES = sizeof(g_pidEntries) / sizeof(g_pidEntries[0]);
 
