@@ -433,6 +433,15 @@ def desktop_payload(args, initrd):
             raise SystemExit(f'--waylandd: {w} is not a file')
         fat_write(initrd, 'BOOT/BIN/WAYLANDD', w.read_bytes())
         rc = rc.replace(b'/nix/profile/bin/waylandd', b'/boot/bin/WAYLANDD')
+    if getattr(args, 'xwm', None):   # a brook-xwm build (closure on the SSD) instead of the profile's
+        x = Path(args.xwm)
+        if not x.is_file() or not getattr(args, 'waylandd', None):
+            raise SystemExit(f'--xwm: {x} is not a file, or --waylandd is missing')
+        fat_write(initrd, 'BOOT/BIN/BROOKXWM', x.read_bytes())
+        line = b'run --service --once --console /boot/bin/WAYLANDD\n'
+        if line not in rc:
+            raise SystemExit('--xwm: no /boot/bin/WAYLANDD service line in INIT.RC')
+        rc = rc.replace(line, line[:-1] + b' --xwayland /nix/profile/bin/Xwayland --xwm /boot/bin/BROOKXWM\n')
     return add_clearwater_start(rc), storage
 
 
@@ -709,6 +718,7 @@ def main():
                    help='test images: also ship PATH as /boot/bin/NAME (e.g. a static busybox for no-mount boots)')
     p.add_argument('--nv-gsp-no-bar1-identity', action='store_true', help='with --nv-display: keep-display P4, no BAR1 identity map (A/B)')
     p.add_argument('--waylandd', type=Path, metavar='BIN', help='run this waylandd from /boot/bin (its closure must be on the SSD)')
+    p.add_argument('--xwm', type=Path, metavar='BIN', help='with --waylandd: run this brook-xwm from /boot/bin (its closure must be on the SSD)')
     p.add_argument('--waylandd-nv-dmabuf', action='store_true', help='with --nv-drm: /etc/waylandd-nv-dmabuf (renderD130 dmabuf import)')
     p.add_argument('--nv-drm-vas-invalidate', action='store_true', help='with --nv-drm: VAS-scoped MMU invalidate on VM_BIND (A/B)')
     p.add_argument('--nv-gsp-headless-p4', action='store_true', help='with --nv-display: GSP-RM boots headless (A/B)')
